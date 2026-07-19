@@ -31,6 +31,7 @@
 use std::env;
 use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom};
+use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -64,12 +65,20 @@ const CAP: usize = 256 * 1024;
 /// runs regularly even if qemu writes ttyS0 as fast as we read it.
 const DRAIN_BUDGET: usize = 4 * 1024 * 1024;
 
+/// Disk ceiling on the on-DISK console file. The in-memory capture is trimmed to
+/// CAP, but `-serial file:` keeps appending to the file itself, so a kernel that
+/// floods ttyS0 without panicking could fill the scratch filesystem. When the file
+/// crosses this ceiling the boot is aborted (qemu killed) and reported as flooded —
+/// generous enough that a normal boot's few KiB of printk never trips it.
+const MAX_CONSOLE_BYTES: u64 = 64 * 1024 * 1024;
+
 /// How the boot loop terminated. Success is decided SOLELY by whether the marker
 /// reached the console; this only labels a FAILED boot's diagnostics.
 enum EndReason {
     MarkerSeen,
     QemuExited(ExitStatus),
     TimedOut(u64),
+    Flooded(u64),
 }
 
 /// Outcome of a boot attempt.
@@ -107,7 +116,7 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
         initramfs.display()
     );
 
-    let result = boot(&qemu, &bzimage, &initramfs)?;
+    let result = boot(&qemu, &bzimage, &initramfs, runner.scratch_dir())?;
     if !result.marker {
         return Err(format!(
             "kernel did not reach the userland marker {MARKER:?} on ttyS0 — {} \
@@ -126,7 +135,7 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
 
 /// Locate host `qemu-system-x86_64` (a control-plane test tool; see module doc).
 /// Search PATH first, then the standard host locations. Fail loudly if absent so
-/// the daily runner is known to require it rather than green-washing the boot.
+/// the tool is known to require it rather than green-washing the boot.
 fn find_qemu() -> Result<String, String> {
     const NAME: &str = "qemu-system-x86_64";
     if let Ok(path) = env::var("PATH") {
@@ -149,16 +158,21 @@ fn find_qemu() -> Result<String, String> {
         }
     }
     Err(format!(
-        "{NAME} not found on PATH or the standard host locations — the linux-x86-64 qemu boot check \
-         (daily tier) requires host qemu as a control-plane test tool"
+        "{NAME} not found on PATH or the standard host locations — the linux-x86-64 qemu boot \
+         tool requires host qemu as a control-plane test tool (run outside the sandbox)"
     ))
 }
 
 /// Wall-clock ceiling, overridable via `TD_QEMU_BOOT_TIMEOUT_SECS` (a positive
 /// integer; anything unparsable or zero falls back to the default).
 fn boot_timeout() -> Duration {
-    let secs = env::var("TD_QEMU_BOOT_TIMEOUT_SECS")
-        .ok()
+    parse_timeout(env::var("TD_QEMU_BOOT_TIMEOUT_SECS").ok())
+}
+
+/// Pure parser behind `boot_timeout` (unit-tested without mutating process env):
+/// a positive integer wins; anything unparsable, zero, or absent → the default.
+fn parse_timeout(raw: Option<String>) -> Duration {
+    let secs = raw
         .and_then(|v| v.trim().parse::<u64>().ok())
         .filter(|&s| s > 0)
         .unwrap_or(DEFAULT_BOOT_TIMEOUT_SECS);
@@ -172,17 +186,22 @@ fn boot_timeout() -> Duration {
 /// CAP bytes so a flooding boot can't balloon memory or make the poll quadratic.
 /// Kill qemu the instant the marker appears; otherwise bound it by the wall-clock
 /// ceiling or the guest's own `reboot -f`.
-fn boot(qemu: &str, bzimage: &Path, initramfs: &Path) -> Result<BootResult, String> {
-    // Per-invocation scratch dir, unique even under concurrent boots in one
-    // process (pid + a process-wide counter — pid alone collides between two
-    // simultaneous boots in the same process), and removed on EVERY exit path
-    // (success or an early `?`) by the Scratch drop guard. A fresh unpredictable
-    // directory also means the console file never pre-exists, so there is no stale
-    // marker to misread and no shared-/tmp symlink to clobber.
+fn boot(
+    qemu: &str,
+    bzimage: &Path,
+    initramfs: &Path,
+    scratch_base: &Path,
+) -> Result<BootResult, String> {
+    // Per-invocation console/diag dir created EXCLUSIVELY (mkdir, not mkdir -p)
+    // with 0700 under the runner's private scratch base — NOT world-writable
+    // `/tmp`. Exclusive creation means this process is the sole creator (a stale or
+    // attacker-planted dir at the same path fails the create and is rejected, so
+    // the console file can never pre-exist with a stale marker); the private base
+    // means no cross-user symlink can target our path in the first place. The dir
+    // is removed on EVERY exit path (success or an early `?`) by the Scratch drop
+    // guard, which is safe to remove precisely because we exclusively created it.
     static SEQ: AtomicU64 = AtomicU64::new(0);
-    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
-    let dir = env::temp_dir().join(format!("td-qemu-{}-{seq}", std::process::id()));
-    fs::create_dir_all(&dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
+    let dir = create_scratch_dir(scratch_base, &SEQ)?;
     let _scratch = Scratch { dir: dir.clone() };
     let console_path = dir.join("console.log");
     let diag_path = dir.join("diag.log");
@@ -225,7 +244,7 @@ fn boot(qemu: &str, bzimage: &Path, initramfs: &Path) -> Result<BootResult, Stri
     let mut console_file: Option<File> = None;
     let mut buf: Vec<u8> = Vec::new();
     let mut marker = false;
-    let end;
+    let mut end;
     loop {
         marker |= drain_console(&console_path, &mut console_file, &mut buf);
         if marker {
@@ -247,6 +266,17 @@ fn boot(qemu: &str, bzimage: &Path, initramfs: &Path) -> Result<BootResult, Stri
                 return Err(format!("wait on qemu: {e}"));
             }
         }
+        // Abort a guest that floods ttyS0 without panicking: the in-memory capture
+        // is trimmed to CAP, but `-serial file:` keeps appending to the file on
+        // disk, so bound the on-disk file too rather than let it fill the scratch fs.
+        if let Ok(meta) = fs::metadata(&console_path) {
+            if meta.len() > MAX_CONSOLE_BYTES {
+                let _ = child.kill();
+                let _ = child.wait();
+                end = EndReason::Flooded(meta.len());
+                break;
+            }
+        }
         if start.elapsed() >= timeout {
             let _ = child.kill();
             let _ = child.wait();
@@ -257,8 +287,12 @@ fn boot(qemu: &str, bzimage: &Path, initramfs: &Path) -> Result<BootResult, Stri
     }
 
     // Drain any final bytes qemu flushed before it was reaped (e.g. the marker
-    // line printed just before `reboot -f` made qemu exit).
-    marker |= drain_console(&console_path, &mut console_file, &mut buf);
+    // line printed just before `reboot -f` made qemu exit). If the marker only
+    // shows up in this final flush, realign `end` so it agrees with `marker`.
+    if drain_console(&console_path, &mut console_file, &mut buf) {
+        marker = true;
+        end = EndReason::MarkerSeen;
+    }
 
     let mut console = String::from_utf8_lossy(&buf).into_owned();
     if console.trim().is_empty() {
@@ -280,6 +314,10 @@ fn boot(qemu: &str, bzimage: &Path, initramfs: &Path) -> Result<BootResult, Stri
         EndReason::TimedOut(secs) => {
             format!("no marker within the {secs}s ceiling; qemu was killed")
         }
+        EndReason::Flooded(bytes) => format!(
+            "ttyS0 flooded past the {MAX_CONSOLE_BYTES}-byte console ceiling ({bytes} bytes) \
+             without reaching the marker; qemu was killed"
+        ),
     };
     Ok(BootResult {
         marker,
@@ -332,7 +370,9 @@ fn contains(haystack: &[u8], needle: &[u8]) -> bool {
 }
 
 /// Read at most the last `cap` bytes of `path`, decoded lossily — bounds memory
-/// if qemu floods its diagnostics.
+/// if qemu floods its diagnostics. A failed seek is propagated (not swallowed), and
+/// the read is itself capped at `cap`, so this can never fall through to an
+/// unbounded whole-file read.
 fn read_tail(path: &Path, cap: usize) -> Result<String, String> {
     let mut f = File::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
     let len = f
@@ -341,12 +381,38 @@ fn read_tail(path: &Path, cap: usize) -> Result<String, String> {
         .len();
     let cap64 = cap as u64;
     if len > cap64 {
-        let _ = f.seek(SeekFrom::Start(len - cap64));
+        f.seek(SeekFrom::Start(len - cap64))
+            .map_err(|e| format!("seek {}: {e}", path.display()))?;
     }
     let mut bytes = Vec::new();
-    f.read_to_end(&mut bytes)
+    // Cap the read at `cap` bytes even if the file grew since the stat, so a seek
+    // that succeeded but landed short of EOF still can't read unboundedly.
+    Read::take(&mut f, cap64)
+        .read_to_end(&mut bytes)
         .map_err(|e| format!("read {}: {e}", path.display()))?;
     Ok(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+/// Create a fresh per-boot directory under `base` with 0700 permissions using
+/// EXCLUSIVE creation (`mkdir`, which fails if the path already exists) so this
+/// process is provably the sole creator. `AlreadyExists` — a leftover from a
+/// crashed run, or a racing concurrent boot in the same process — is rejected and
+/// retried under a fresh sequence number; any other error is fatal. `base` is the
+/// runner's private scratch, already created by `setup()`.
+fn create_scratch_dir(base: &Path, seq: &AtomicU64) -> Result<PathBuf, String> {
+    for _ in 0..64 {
+        let n = seq.fetch_add(1, Ordering::Relaxed);
+        let dir = base.join(format!("qemu-boot-{n}"));
+        match fs::DirBuilder::new().mode(0o700).create(&dir) {
+            Ok(()) => return Ok(dir),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(format!("create {}: {e}", dir.display())),
+        }
+    }
+    Err(format!(
+        "could not create a fresh qemu-boot scratch dir under {} after 64 attempts",
+        base.display()
+    ))
 }
 
 /// Removes its scratch directory on drop, so `boot` leaves no temp files on ANY
@@ -367,4 +433,75 @@ fn tail(text: &str, n: usize) -> String {
     let lines: Vec<&str> = text.lines().collect();
     let start = lines.len().saturating_sub(n);
     lines.get(start..).map(|s| s.join("\n")).unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn contains_matches_substrings_and_boundaries() {
+        assert!(contains(b"boot log: TD-USERLAND-OK done", MARKER.as_bytes()));
+        assert!(contains(b"abc", b"a")); // at the very start
+        assert!(contains(b"abc", b"c")); // at the very end
+        assert!(contains(b"abc", b"abc")); // full length
+        assert!(!contains(b"abc", b"d")); // absent
+        assert!(!contains(b"ab", b"abc")); // needle longer than haystack
+        assert!(!contains(b"anything", b"")); // empty needle never matches
+    }
+
+    #[test]
+    fn contains_finds_marker_split_across_chunks() {
+        // Mirrors drain_console appending in chunks: the marker only becomes
+        // present once BOTH halves are in the rolling buffer.
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"...TD-USER");
+        assert!(!contains(&buf, MARKER.as_bytes()));
+        buf.extend_from_slice(b"LAND-OK...");
+        assert!(contains(&buf, MARKER.as_bytes()));
+    }
+
+    #[test]
+    fn tail_keeps_last_n_lines() {
+        assert_eq!(tail("a\nb\nc\nd", 2), "c\nd");
+        assert_eq!(tail("a\nb", 5), "a\nb"); // fewer lines than requested
+        assert_eq!(tail("solo", 1), "solo");
+        assert_eq!(tail("", 3), "");
+    }
+
+    #[test]
+    fn parse_timeout_prefers_valid_positive_else_default() {
+        let dflt = Duration::from_secs(DEFAULT_BOOT_TIMEOUT_SECS);
+        assert_eq!(parse_timeout(Some(" 42 ".into())), Duration::from_secs(42));
+        assert_eq!(parse_timeout(Some("0".into())), dflt); // zero → default
+        assert_eq!(parse_timeout(Some("nope".into())), dflt); // unparsable → default
+        assert_eq!(parse_timeout(Some("".into())), dflt); // empty → default
+        assert_eq!(parse_timeout(None), dflt); // unset → default
+    }
+
+    #[test]
+    fn read_tail_bounds_to_last_cap_bytes() {
+        // Isolate the test file in its own exclusively-created scratch dir.
+        let seq = AtomicU64::new(0);
+        let dir = create_scratch_dir(&env::temp_dir(), &seq).unwrap();
+        let _g = Scratch { dir: dir.clone() };
+        let path = dir.join("diag.log");
+        fs::write(&path, b"0123456789").unwrap();
+        assert_eq!(read_tail(&path, 4).unwrap(), "6789"); // only the last cap bytes
+        assert_eq!(read_tail(&path, 100).unwrap(), "0123456789"); // cap >= len → whole file
+    }
+
+    #[test]
+    fn create_scratch_dir_is_exclusive_and_fresh() {
+        let seq = AtomicU64::new(0);
+        let base = {
+            let s = AtomicU64::new(1000);
+            create_scratch_dir(&env::temp_dir(), &s).unwrap()
+        };
+        let _g = Scratch { dir: base.clone() };
+        let a = create_scratch_dir(&base, &seq).unwrap();
+        let b = create_scratch_dir(&base, &seq).unwrap();
+        assert_ne!(a, b); // distinct dirs from the shared counter
+        assert!(a.is_dir() && b.is_dir());
+    }
 }

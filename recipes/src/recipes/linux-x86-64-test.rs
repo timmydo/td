@@ -22,11 +22,14 @@ use crate::types::{CheckRunner, Recipe, RecipeCheck, Step};
 //      ships no dd) prove the boot-setup header; and the gzip magic `1f 8b 08`
 //      appears somewhere in the file, proving the CONFIG_KERNEL_GZIP payload was
 //      actually compressed and embedded — not just the raw ELF wrapped in a stub.
-//   5. initramfs.cpio is a real newc cpio (ASCII "070701" magic at offset 0) big
-//      enough to carry the static busybox (>= 64 KiB) with a `busybox` path entry
-//      — the shape check for the bootable userland. The behavioural proof that it
-//      actually boots is the host-side `td-recipe-eval qemu-boot linux-x86-64`
-//      tool (host qemu), which cannot run in this host-free BuildOnly rung.
+//   5. initramfs.cpio is a real, COMPLETE newc cpio (ASCII "070701" magic at
+//      offset 0) big enough to carry the static busybox (>= 64 KiB), with a closing
+//      `TRAILER` member (proves the stream is not truncated), a `busybox` path
+//      entry (the userland binary), and the `TD-USERLAND-OK` marker bytes of the
+//      packed /init (proves the boot script is included, not just the binary) — the
+//      shape check for the bootable userland. The behavioural proof that it actually
+//      boots is the host-side `td-recipe-eval qemu-boot linux-x86-64` tool (host
+//      qemu), which cannot run in this host-free BuildOnly rung.
 pub fn recipe() -> Recipe {
     let vmlinux = "{in:linux-x86-64}/vmlinux";
     let bzimage = "{in:linux-x86-64}/bzImage";
@@ -106,7 +109,9 @@ pub fn recipe() -> Recipe {
                      [ \"$sz\" -ge 65536 ] || {{ echo \"initramfs.cpio is implausibly small ($sz bytes) — the static busybox alone is ~1 MiB\" >&2; exit 1; }}; \
                      set -- $(od -An -tx1 -N 6 '{initramfs}'); \
                      [ \"$1$2$3$4$5$6\" = 303730373031 ] || {{ echo 'initramfs.cpio is missing the newc cpio magic 070701' >&2; exit 1; }}; \
-                     grep -q -a busybox '{initramfs}' || {{ echo 'initramfs.cpio has no busybox entry — the bootable userland is missing' >&2; exit 1; }}"
+                     grep -q -a TRAILER '{initramfs}' || {{ echo 'initramfs.cpio has no TRAILER member — the cpio stream is truncated/incomplete' >&2; exit 1; }}; \
+                     grep -q -a busybox '{initramfs}' || {{ echo 'initramfs.cpio has no busybox entry — the bootable userland is missing' >&2; exit 1; }}; \
+                     grep -q -a TD-USERLAND-OK '{initramfs}' || {{ echo 'initramfs.cpio does not pack the /init marker — the boot script is missing' >&2; exit 1; }}"
                 ),
             ],
         )

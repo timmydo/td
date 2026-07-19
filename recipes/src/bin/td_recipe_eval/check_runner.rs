@@ -458,6 +458,14 @@ impl RecipeCheckRunner {
         self.lw.with_extension("lock")
     }
 
+    /// This runner's private per-invocation scratch directory, freshly created by
+    /// `setup()` under the ladder work dir (NOT world-writable `/tmp`). The qemu
+    /// boot tool places its console/diagnostic capture here so those files live on
+    /// a private, non-shared path — no cross-user symlink pre-planting is possible.
+    pub(crate) fn scratch_dir(&self) -> &Path {
+        &self.scratch
+    }
+
     /// This ladder's dedicated build-output cache (store, db) — see `build_cache_paths`.
     fn build_cache_paths(&self) -> (PathBuf, PathBuf) {
         build_cache_paths(&self.lw)
