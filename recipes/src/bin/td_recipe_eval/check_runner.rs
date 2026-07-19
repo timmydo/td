@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, HashSet};
 use std::env;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read, Write};
+use std::io::{self, IsTerminal, Read, Write};
 use std::os::unix::fs::{symlink, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{self, Command, Stdio};
@@ -85,6 +85,53 @@ pub fn qemu_boot_cli(args: &[String]) -> Result<(), String> {
     let _lock = lock_file(&runner.lock_path())?;
     runner.setup()?;
     crate::checks::qemu_boot::run(&runner)
+}
+
+/// `td-recipe-eval run [system-x86-64]` — the interactive distro runner (re #541).
+/// Builds the `system-x86-64` initramfs (its closure pulls in the `linux-x86-64`
+/// bzImage) and boots it under host qemu with an interactive serial console. Like
+/// `qemu-boot`, this is a host-side command run OUTSIDE the daily sandbox (which
+/// has no host qemu and no terminal), never a gated check. See checks/run.rs.
+pub fn run_cli(args: &[String]) -> Result<(), String> {
+    const STEM: &str = "system-x86-64";
+    let stem = args.first().map(String::as_str).unwrap_or(STEM);
+    if stem != STEM {
+        return Err(format!(
+            "run only supports {STEM} (got '{stem}'); usage: run [{STEM}]"
+        ));
+    }
+    if args.get(1).is_some() {
+        return Err(format!("usage: run [{STEM}]"));
+    }
+    // `run` is INTERACTIVE: it hands the guest serial console to THIS terminal so an
+    // operator can use the greeter and exit the guest (`exit`/Ctrl-D at the shell powers
+    // it off, or qemu's own Ctrl-A X). With stdin not a terminal (piped, redirected, or
+    // backgrounded) qemu boots but cannot be driven, so it would hang uncontrollably.
+    // Refuse before any planning or build (re #541, Codex review); a headless pass/fail
+    // boot smoke test is the `qemu-boot` check, not this.
+    if !io::stdin().is_terminal() {
+        return Err(format!(
+            "`run {STEM}` is interactive and needs a terminal on stdin: it wires the guest \
+             serial console to this terminal so you can use the greeter and exit the guest \
+             (`exit`/Ctrl-D at the shell, or qemu Ctrl-A X). Run it directly in a terminal \
+             (not piped, redirected, or backgrounded). For a headless pass/fail boot check, \
+             use the `qemu-boot` check instead."
+        ));
+    }
+    // Provenance planning FIRST — before the runner exists, so a rejected graph
+    // spawns no subprocess at all (re #469), matching `cli`/`build_cli`/`qemu_boot`.
+    ensure_targets_provenance(&[stem])?;
+
+    let root = env::current_dir().map_err(|e| format!("current dir: {e}"))?;
+    let scratch_name = scratch_name("run", &[stem]);
+    let runner = RecipeCheckRunner::new(root, &scratch_name)?;
+    let lock = lock_file(&runner.lock_path())?;
+    runner.setup()?;
+    // The interactive boot runs unbounded (until the operator quits qemu), so hand the
+    // ladder lock to the runner: it releases it after the build, before the boot, so the
+    // whole ladder is not blocked for the entire session (re #541, Codex review). setup()
+    // above and the build inside run() still hold it.
+    crate::checks::run::run(&runner, lock)
 }
 
 pub fn build_cli(args: &[String]) -> Result<(), String> {
@@ -281,16 +328,18 @@ fn pid_is_alive(pid: u32) -> bool {
 
 /// The pid of a reapable scratch tree, or None. A tree is reapable only if it is one of
 /// OUR trees — `scratch_name` emits `build-…-<pid>` / `check-…-<pid>` / `qemu-boot-…-<pid>`
-/// — AND ends in a numeric pid. The prefix guard means a coincidental sibling such as
-/// `gcc-14` or `glibc-241` can never be reaped (belt-and-braces: this dir holds only our
-/// scratch trees anyway). The `qemu-boot-` prefix is essential: the host-side qemu-boot
-/// tool creates per-boot scratch trees here too, and without it a crashed/killed boot's
-/// tree (which can hold a multi-GiB kernel build) would leak forever. Split out so the
-/// reaper's eligibility rule is unit-testable.
+/// / `run-…-<pid>` — AND ends in a numeric pid. The prefix guard means a coincidental
+/// sibling such as `gcc-14` or `glibc-241` can never be reaped (belt-and-braces: this dir
+/// holds only our scratch trees anyway). The `qemu-boot-` and `run-` prefixes are
+/// essential: the host-side qemu-boot and interactive `run` tools create per-boot scratch
+/// trees here too, and without them a crashed/killed boot's tree (which can hold a
+/// multi-GiB kernel build) would leak forever. Split out so the reaper's eligibility rule
+/// is unit-testable.
 fn reapable_dead_pid(name: &str) -> Option<u32> {
     if !name.starts_with("build-")
         && !name.starts_with("check-")
         && !name.starts_with("qemu-boot-")
+        && !name.starts_with("run-")
     {
         return None;
     }
@@ -470,6 +519,13 @@ impl RecipeCheckRunner {
     /// a private, non-shared path — no cross-user symlink pre-planting is possible.
     pub(crate) fn scratch_dir(&self) -> &Path {
         &self.scratch
+    }
+
+    /// The ladder work dir — the tree a concurrent force-cold `setup()` wipes. The
+    /// interactive runner uses this to refuse staging boot images anywhere inside it
+    /// (a `TMPDIR` pointed into the ladder), which a wipe could delete mid-boot.
+    pub(crate) fn ladder_work_dir(&self) -> &Path {
+        &self.lw
     }
 
     /// This ladder's dedicated build-output cache (store, db) — see `build_cache_paths`.
@@ -1793,6 +1849,8 @@ mod tests {
         // ...including the host-side qemu-boot tool's per-boot scratch (a killed boot's
         // multi-GiB kernel-build tree would otherwise leak forever).
         assert_eq!(reapable_dead_pid("qemu-boot-linux-x86-64-22760"), Some(22760));
+        // ...and the interactive `run` tool's per-boot scratch (same multi-GiB leak risk).
+        assert_eq!(reapable_dead_pid("run-system-x86-64-31820"), Some(31820));
         // ...but a coincidental numeric-suffixed sibling is NEVER reaped.
         assert_eq!(reapable_dead_pid("gcc-14"), None);
         assert_eq!(reapable_dead_pid("glibc-241"), None);

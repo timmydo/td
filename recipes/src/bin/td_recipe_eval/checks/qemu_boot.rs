@@ -142,7 +142,7 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
 /// Locate host `qemu-system-x86_64` (a control-plane test tool; see module doc).
 /// Search PATH first, then the standard host locations. Fail loudly if absent so
 /// the tool is known to require it rather than green-washing the boot.
-fn find_qemu() -> Result<String, String> {
+pub(crate) fn find_qemu() -> Result<String, String> {
     const NAME: &str = "qemu-system-x86_64";
     if let Ok(path) = env::var("PATH") {
         for dir in path.split(':').filter(|d| !d.is_empty()) {
