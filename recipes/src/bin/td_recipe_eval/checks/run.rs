@@ -17,6 +17,7 @@
 //! with a root auto-login). Because it is interactive it is a host-side command, never
 //! a gated check (a gate has no terminal, and the daily sandbox has no host qemu).
 use std::fs::File;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -36,15 +37,39 @@ struct TempImages {
 }
 
 impl TempImages {
-    /// A unique per-process dir under the host temp dir (outside the ladder tree, so a
-    /// ladder wipe cannot touch it).
+    /// An EXCLUSIVELY-owned dir with an unpredictable name under the host temp dir
+    /// (outside the ladder tree, so a ladder wipe cannot touch it). `create_dir` (unlike
+    /// `create_dir_all`) fails if the path already exists, so a local attacker cannot
+    /// pre-plant a dir or symlink at our path and have us reuse it or copy image bytes
+    /// through it (CWE-377 insecure temp). The name mixes pid + a nanosecond seed + a
+    /// counter; a collision just retries, so the first success is atomically ours and
+    /// empty. We then restrict it to owner-only. `std::time` is fine here — this is
+    /// host-side runtime code, not a resume-sensitive workflow script.
     fn new() -> Result<Self, String> {
-        let dir = std::env::temp_dir().join(format!("td-run-{}", std::process::id()));
-        // Start clean in case a same-pid dir lingered from a crashed prior run.
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir)
-            .map_err(|e| format!("create boot-image temp dir {}: {e}", dir.display()))?;
-        Ok(Self { dir })
+        let base = std::env::temp_dir();
+        let pid = std::process::id();
+        let seed = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        for attempt in 0..1024u32 {
+            let dir = base.join(format!("td-run-{pid}-{seed}-{attempt}"));
+            match std::fs::create_dir(&dir) {
+                Ok(()) => {
+                    // Owner-only, so nothing can be planted inside before the copies land.
+                    let _ =
+                        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+                    return Ok(Self { dir });
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(e) => {
+                    return Err(format!("create boot-image temp dir {}: {e}", dir.display()))
+                }
+            }
+        }
+        Err("could not create a private boot-image temp dir under the system temp \
+             directory after 1024 attempts"
+            .to_string())
     }
 
     /// Copy `src` to `<dir>/<name>`, returning the destination path.
