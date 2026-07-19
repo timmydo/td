@@ -8,6 +8,7 @@ mod basic;
 // gate check. It is exposed as the host-side `td-recipe-eval qemu-boot` subcommand
 // (see check_runner::qemu_boot_cli), not dispatched from a registered check.
 pub(crate) mod qemu_boot;
+pub(crate) mod run;
 mod rust_toolchain;
 
 pub(crate) fn run(

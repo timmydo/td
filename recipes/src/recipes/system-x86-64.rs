@@ -129,7 +129,7 @@ fn build_group(sys: &SystemDef) -> String {
     let wheel: Vec<&str> = sys
         .users
         .iter()
-        .filter(|u| u.groups.iter().any(|g| *g == "wheel"))
+        .filter(|u| u.groups.contains(&"wheel"))
         .map(|u| u.name)
         .collect();
     s.push_str(&format!("wheel:x:10:{}\n", wheel.join(",")));

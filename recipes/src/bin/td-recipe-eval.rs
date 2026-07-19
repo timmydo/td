@@ -221,6 +221,12 @@ fn main() {
                 die_runner(&e);
             }
         }
+        Some("run") => {
+            let rest = args.get(2..).unwrap_or(&[]);
+            if let Err(e) = check_runner::run_cli(rest) {
+                die_runner(&e);
+            }
+        }
         Some("source-pins") => {
             if args.get(2).is_some() {
                 die("usage: source-pins");
@@ -242,7 +248,7 @@ fn main() {
                 die_runner(&e);
             }
         }
-        _ => die("usage: td-recipe-eval list|emit|check-list|check-count|check-script|check-run|build-run|qemu-boot|source-pins|source-pin|seed-digests ..."),
+        _ => die("usage: td-recipe-eval list|emit|check-list|check-count|check-script|check-run|build-run|qemu-boot|run|source-pins|source-pin|seed-digests ..."),
     }
 }
 

@@ -87,6 +87,34 @@ pub fn qemu_boot_cli(args: &[String]) -> Result<(), String> {
     crate::checks::qemu_boot::run(&runner)
 }
 
+/// `td-recipe-eval run [system-x86-64]` — the interactive distro runner (re #541).
+/// Builds the `system-x86-64` initramfs (its closure pulls in the `linux-x86-64`
+/// bzImage) and boots it under host qemu with an interactive serial console. Like
+/// `qemu-boot`, this is a host-side command run OUTSIDE the daily sandbox (which
+/// has no host qemu and no terminal), never a gated check. See checks/run.rs.
+pub fn run_cli(args: &[String]) -> Result<(), String> {
+    const STEM: &str = "system-x86-64";
+    let stem = args.first().map(String::as_str).unwrap_or(STEM);
+    if stem != STEM {
+        return Err(format!(
+            "run only supports {STEM} (got '{stem}'); usage: run [{STEM}]"
+        ));
+    }
+    if args.get(1).is_some() {
+        return Err(format!("usage: run [{STEM}]"));
+    }
+    // Provenance planning FIRST — before the runner exists, so a rejected graph
+    // spawns no subprocess at all (re #469), matching `cli`/`build_cli`/`qemu_boot`.
+    ensure_targets_provenance(&[stem])?;
+
+    let root = env::current_dir().map_err(|e| format!("current dir: {e}"))?;
+    let scratch_name = scratch_name("run", &[stem]);
+    let runner = RecipeCheckRunner::new(root, &scratch_name)?;
+    let _lock = lock_file(&runner.lock_path())?;
+    runner.setup()?;
+    crate::checks::run::run(&runner)
+}
+
 pub fn build_cli(args: &[String]) -> Result<(), String> {
     let target = args.first().ok_or_else(build_usage)?.as_str();
     if catalog::lookup(target).is_none() {
