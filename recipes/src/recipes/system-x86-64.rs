@@ -25,8 +25,10 @@ use crate::types::{Recipe, Step};
 // straight into the archive) and stamps every entry uid/gid 0 regardless of the
 // build user — so the rootfs is ROOT-owned, which busybox `cpio -o` could not
 // achieve in the unprivileged sandbox. `-t 1` pins a fixed mtime so the cpio is
-// reproducible. /dev is auto-populated at boot by the kernel's DEVTMPFS_MOUNT, so
-// the spec lists /dev only as a mountpoint (plus the console fallback node).
+// reproducible. /dev is populated at boot by init mounting devtmpfs ITSELF (the
+// inittab's first sysinit line) — CONFIG_DEVTMPFS_MOUNT does NOT auto-mount /dev on
+// an initramfs boot — so the spec lists /dev only as a mountpoint, plus a packed
+// /dev/console node that carries init's own stdio in the window BEFORE that mount.
 
 /// One account materialised into `/etc/passwd`, `/etc/group`, `/etc/shadow`, and a
 /// home directory. `passwordless` writes an EMPTY shadow password — convenient for
@@ -39,7 +41,11 @@ struct User {
     gecos: &'static str,
     home: &'static str,
     shell: &'static str,
-    /// Supplementary groups (e.g. "wheel"); the primary group is `name`.
+    /// Supplementary groups; the primary group is `name`. NOTE: `build_group` only
+    /// materialises `"wheel"` (gid 10) today; declaring any other supplementary group
+    /// would be silently dropped from `/etc/group`, so `system_def_is_self_consistent`
+    /// rejects it at `cargo test`. To support a new group, give it a gid in
+    /// `build_group` first, then it may be named here.
     groups: &'static [&'static str],
     passwordless: bool,
 }
@@ -236,8 +242,9 @@ fn build_spec(sys: &SystemDef) -> String {
             s.push_str(&format!("dir {} 0755 {} {}\n", u.home, u.uid, u.gid));
         }
     }
-    // Console fallback device node (DEVTMPFS_MOUNT provides the real one; this
-    // guarantees init has a console even if that mount is ever delayed).
+    // Packed /dev/console node: init needs a console for its OWN stdio before it can
+    // run the inittab's first sysinit line (which mounts devtmpfs on /dev, and devtmpfs
+    // then provides the real nodes). This static node carries that pre-mount window.
     s.push_str("nod /dev/console 0600 0 0 c 5 1\n");
     // The static busybox + its applet symlinks, and /init = busybox init.
     s.push_str("file /bin/busybox {in:busybox-x86-64}/bin/busybox 0755 0 0\n");
@@ -265,9 +272,9 @@ fn build_spec(sys: &SystemDef) -> String {
 /// A producer-rung shape check on the packed initramfs: real newc magic, a size
 /// floor (static busybox alone is ~1 MiB), a `busybox cpio -t` parse (reds on a
 /// truncated/corrupt stream), the presence of the key members that make it
-/// bootable, AND that busybox actually implements the applets those members
-/// symlink to (a config drift that dropped an applet would leave a dead symlink
-/// the cpio member check alone can't catch). All strings are ASCII: td-builder's
+/// bootable, AND that busybox actually implements EVERY packed APPLETS entry (a
+/// config drift or a tailoring typo that dropped/misnamed an applet would leave a
+/// dead /bin symlink the cpio member check alone can't catch). All strings are ASCII: td-builder's
 /// config reader is Latin-1, so a UTF-8 glyph here would be corrupted in the
 /// executed step. This is a build sanity assert, not a behavioural test — the boot
 /// is exercised interactively by `td-recipe-eval run`.
@@ -281,10 +288,14 @@ fn shape_check() -> String {
          printf '%s\\n' \"$list\" | grep -q -x -F \"$m\" || { echo \"rootfs.cpio: cpio member '$m' missing - the bootable userland is incomplete\" >&2; exit 1; }; \
      done; \
      applets=$('{in:busybox-x86-64}/bin/busybox' --list 2>/dev/null) || { echo 'rootfs.cpio: busybox --list failed - cannot verify applet coverage' >&2; exit 1; }; \
-     for a in sh getty login init mount umount; do \
-         printf '%s\\n' \"$applets\" | grep -q -x -F \"$a\" || { echo \"rootfs.cpio: busybox does not implement applet '$a' (config drift) - its packed symlink would be a dead link\" >&2; exit 1; }; \
+     for a in @APPLETS@; do \
+         printf '%s\\n' \"$applets\" | grep -q -x -F \"$a\" || { echo \"rootfs.cpio: busybox does not implement applet '$a' (config drift) - its packed /bin/$a symlink would be a dead link\" >&2; exit 1; }; \
      done"
-        .into()
+        // Validate EVERY packed applet, not just the greeter-critical few: build_spec
+        // links every APPLETS entry into /bin, so a typo or a disabled applet must red
+        // here rather than ship a dead symlink (re #541, Codex review). Names are all
+        // shell-safe identifiers, so a space-joined `for` list is safe unquoted.
+        .replace("@APPLETS@", &APPLETS.join(" "))
 }
 
 pub fn recipe() -> Recipe {
@@ -351,10 +362,15 @@ pub fn recipe() -> Recipe {
     steps.push(Step::run("{out}", &[SH, "-c", &shape_check()]).env("PATH", &mesboot0_path()));
 
     Recipe::mesboot("system-x86-64", "0.1")
-        // busybox: the packed userland + the `cpio -t` shape check.
-        // linux-x86-64: the EXPORTED gen_init_cpio packer.
-        // glibc-x86-64: gen_init_cpio's runtime closure (it is a dynamically-linked
-        //   HOSTCC hostprog; the kernel build ran it with the same glibc staged).
+        // busybox: the packed userland + the `cpio -t` shape check (static binary).
+        // linux-x86-64: the EXPORTED gen_init_cpio packer (verified STATICALLY linked:
+        //   `ELF 64-bit ... statically linked`).
+        // glibc-x86-64: kept as a conservative native input. No build step here links
+        //   against the native glibc — gen_init_cpio and busybox are both static, and
+        //   the shape check runs the mesboot0 userland — so this is a candidate for a
+        //   build-verified removal (re #541, Codex review). Deferred rather than dropped
+        //   unverified: trimming a build input must be proven by a system-x86-64 build,
+        //   and the per-PR tier does not build it (that is daily-backstop territory).
         .native_inputs(&["busybox-x86-64", "linux-x86-64", "glibc-x86-64"])
         .inputs_owned(mesboot0_inputs(&[]))
         .steps(steps)
@@ -376,14 +392,30 @@ mod tests {
             SYSTEM.autologin
         );
         for u in SYSTEM.users {
-            // Every login shell must be a busybox applet actually packed under /bin.
-            let shell_applet = u.shell.strip_prefix("/bin/").unwrap_or(u.shell);
+            // busybox `login` execs the shell by ABSOLUTE path (execv, no PATH search),
+            // and we only pack applets under /bin, so the shell MUST be "/bin/<applet>"
+            // with <applet> in APPLETS. A bare "sh" would pass a naive basename check yet
+            // fail at runtime (execv("sh") -> ENOENT -> login respawn-loops); reject it.
+            let packed_applet = u.shell.strip_prefix("/bin/");
             assert!(
-                APPLETS.contains(&shell_applet),
-                "user '{}' login shell '{}' is not a packed /bin applet",
+                packed_applet.is_some_and(|a| APPLETS.contains(&a)),
+                "user '{}' login shell '{}' must be \"/bin/<applet>\" with <applet> in APPLETS \
+                 (busybox login execs it by absolute path)",
                 u.name,
                 u.shell
             );
+            // build_group only materialises the `wheel` supplementary group today; any
+            // other declared group would be silently dropped from /etc/group (its
+            // membership lost), so reject it until build_group learns to emit it.
+            for g in u.groups {
+                assert!(
+                    *g == "wheel",
+                    "user '{}' declares supplementary group '{}', but build_group only \
+                     materialises \"wheel\"; give it a gid in build_group before naming it here",
+                    u.name,
+                    g
+                );
+            }
         }
     }
 

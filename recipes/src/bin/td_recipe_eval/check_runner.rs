@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, HashSet};
 use std::env;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read, Write};
+use std::io::{self, IsTerminal, Read, Write};
 use std::os::unix::fs::{symlink, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{self, Command, Stdio};
@@ -102,6 +102,19 @@ pub fn run_cli(args: &[String]) -> Result<(), String> {
     }
     if args.get(1).is_some() {
         return Err(format!("usage: run [{STEM}]"));
+    }
+    // `run` is INTERACTIVE: it hands the guest serial console to THIS terminal, and the
+    // default image's only exit is qemu's Ctrl-A X. With stdin not a terminal (piped,
+    // redirected, or backgrounded) qemu boots but cannot be driven or quit, so it would
+    // hang uncontrollably. Refuse before any planning or build (re #541, Codex review);
+    // a headless pass/fail boot smoke test is the `qemu-boot` check, not this.
+    if !io::stdin().is_terminal() {
+        return Err(format!(
+            "`run {STEM}` is interactive and needs a terminal on stdin: it wires the guest \
+             serial console to this terminal and the default image exits only via qemu Ctrl-A X. \
+             Run it directly in a terminal (not piped, redirected, or backgrounded). For a \
+             headless pass/fail boot check, use the `qemu-boot` check instead."
+        ));
     }
     // Provenance planning FIRST — before the runner exists, so a rejected graph
     // spawns no subprocess at all (re #469), matching `cli`/`build_cli`/`qemu_boot`.
