@@ -1454,34 +1454,97 @@ fn warm_td_crate_closure(root: &Path) {
 /// (`td-feed warm kernel-headers ARCH`), so a runner whose `.td-build-cache` was
 /// warmed before the seed's on-disk shape last changed (e.g. the `.tar.gz` ->
 /// `.tar` switch in PR #536) carries the stale name and none of the fresh `.tar`.
-/// Best-effort and idempotent (`warm kernel-headers` skips an already-produced
-/// `.tar`); the intern itself is the fail-closed enforcement if this could not run.
+///
+/// Robustness: `newstore_bin` selects a td-built `td-feed` by STORE HASH, so on a
+/// runner that still carries a PRE-#536 `td-feed` it can hand back one that writes
+/// the seed as `.tar.gz` — it exits 0, yet the `.tar` the intern needs never
+/// appears and the fix would silently no-op. So after warming we VERIFY the `.tar`
+/// landed and, for any arch still missing, retry once with the current
+/// source-built `feed/` (`host_cargo_bin` always reflects THIS tree). Best-effort
+/// throughout (each `warm kernel-headers` is idempotent — it skips an already-
+/// produced `.tar`); the intern is the fail-closed enforcement if a seed is still
+/// absent afterwards.
 fn warm_kernel_headers_seed(root: &Path) {
-    // Resolve ONE host td-feed binary: the gate's td-built one, else a host
-    // cargo build of feed/ — the same resolution heavy_warms uses.
-    let Some(tdfeed) = newstore_bin(root, ".td-build-cache/td-feed/sd/newstore", "td-feed")
-        .or_else(|| host_cargo_bin(root, "feed", "td-feed", None))
-    else {
+    const ARCHES: [&str; 2] = ["i386", "x86_64"];
+    // Bound a cargo fallback exactly as warm_td_crate_closure does — a hung
+    // `cargo build` of feed/ (e.g. a stale target-dir lock) must not stall cold
+    // provisioning. The warm invocation itself is already `timeout`-wrapped
+    // (warm_argv); this bounds only the host build of the fetcher.
+    let deadline = warm_timeout_secs().map(|n| Instant::now() + Duration::from_secs(n));
+
+    // Prefer the gate's td-built td-feed (fast), else a host cargo build of
+    // feed/ — the resolution heavy_warms uses. Remember which we used: only a
+    // NEWSTORE pick can be a stale `.tar.gz` producer worth retrying against the
+    // source build; a source build already IS this tree.
+    let newstore = newstore_bin(root, ".td-build-cache/td-feed/sd/newstore", "td-feed");
+    let primary = match newstore.clone() {
+        Some(p) => p,
+        None => match host_cargo_bin(root, "feed", "td-feed", deadline) {
+            Some(p) => p,
+            None => {
+                eprintln!(
+                    "td-builder check: no td-feed binary to warm the kernel-headers seed (build \
+                     feed/ with cargo) — skipping (best-effort; the loop intern enforces presence)"
+                );
+                return;
+            }
+        },
+    };
+
+    let missing = warm_kh_arches(root, &primary, &ARCHES);
+    if missing.is_empty() {
+        return;
+    }
+    if newstore.is_none() {
+        // `primary` already WAS the source build — retrying it cannot change the
+        // produced format.
         eprintln!(
-            "td-builder check: no td-feed binary to warm the kernel-headers seed (build feed/ \
-             with cargo) — skipping (best-effort; the loop intern enforces presence)"
+            "td-builder check: kernel-headers seed still absent for {} after the source-built \
+             td-feed warm — the loop intern will report it",
+            missing.join(", ")
+        );
+        return;
+    }
+    // The td-built td-feed left the `.tar` missing (most likely a pre-#536 binary
+    // that wrote `.tar.gz`). Retry the still-missing arches with the current
+    // source-built feed/.
+    let Some(fresh) = host_cargo_bin(root, "feed", "td-feed", deadline) else {
+        eprintln!(
+            "td-builder check: kernel-headers seed still absent for {} and no source-built \
+             td-feed to retry — the loop intern will report it",
+            missing.join(", ")
         );
         return;
     };
+    let missing_refs: Vec<&str> = missing.iter().map(String::as_str).collect();
+    let still = warm_kh_arches(root, &fresh, &missing_refs);
+    if !still.is_empty() {
+        eprintln!(
+            "td-builder check: kernel-headers seed still absent for {} after the source-built \
+             td-feed retry — the loop intern will report it",
+            still.join(", ")
+        );
+    }
+}
+
+/// Run `td-feed warm kernel-headers <arch>` for each arch with `tdfeed`, returning
+/// the arches whose `.tar` seed is STILL absent afterwards. A warm that exits 0 but
+/// wrote the pre-#536 `.tar.gz` leaves the `.tar` missing, so success of the warm
+/// is NOT proof the seed is present — kh_seed_present is the real check (issue #546).
+fn warm_kh_arches(root: &Path, tdfeed: &Path, arches: &[&str]) -> Vec<String> {
     let tdfeed = tdfeed.display().to_string();
     // `td-feed warm kernel-headers` reads the linux-source pin through
     // tests/recipe-eval-tool.sh, which resolves its rust/cc via
     // `$TD_BUILDER_SELF provision-{rust,cc}` — so this check's own executable must
-    // be on offer, exactly as the gate bodies export it. A missing current_exe
-    // leaves it empty (the warm then no-ops, best-effort).
-    let self_exe = std::env::current_exe()
-        .map(|p| p.display().to_string())
-        .unwrap_or_default();
-    let envs = vec![
-        (s("TD_ROOT"), root.display().to_string()),
-        (s("TD_BUILDER_SELF"), self_exe),
-    ];
-    for arch in ["i386", "x86_64"] {
+    // be on offer, exactly as the gate bodies export it. Only set it when
+    // current_exe() resolves, so a failure inherits any ambient TD_BUILDER_SELF
+    // rather than clobbering it with "" (the warm then no-ops, best-effort).
+    let mut envs = vec![(s("TD_ROOT"), root.display().to_string())];
+    if let Ok(exe) = std::env::current_exe() {
+        envs.push((s("TD_BUILDER_SELF"), exe.display().to_string()));
+    }
+    let mut missing = Vec::new();
+    for arch in arches {
         if !warm_status(
             &[tdfeed.clone(), s("warm"), s("kernel-headers"), s(arch)],
             root,
@@ -1489,10 +1552,28 @@ fn warm_kernel_headers_seed(root: &Path) {
         ) {
             eprintln!(
                 "td-builder check: kernel-headers seed warm (best-effort) failed/timed out \
-                 for {arch} — the loop intern will report if the seed is still absent"
+                 for {arch}"
             );
         }
+        if !kh_seed_present(root, arch) {
+            missing.push((*arch).to_string());
+        }
     }
+    missing
+}
+
+/// True when a produced `.tar` UAPI-header seed for `arch` is present in the
+/// sources cache. Matched by name (`linux-headers-<ver>-<arch>.tar`) so it is
+/// independent of the pinned version; a leftover `.tar.gz` is NOT a match — the
+/// intern requires the uncompressed `.tar` (PR #536), which is the whole point.
+fn kh_seed_present(root: &Path, arch: &str) -> bool {
+    let suffix = format!("-{arch}.tar");
+    std::fs::read_dir(root.join(".td-build-cache").join("sources"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|e| e.file_name().into_string().ok())
+        .any(|n| n.starts_with("linux-headers-") && n.ends_with(&suffix))
 }
 
 fn heavy_warms(root: &Path) {
@@ -2539,5 +2620,46 @@ checksum = \"b74fc6b57825be3373f7054754755f03ac3a8f5d70015f0ffa7ebd06bfeeeb67\"\
                 .all(|(n, v, s)| !n.is_empty() && !v.is_empty() && s.len() == 64),
             "malformed triplet parsed from the real lock"
         );
+    }
+
+    #[test]
+    fn kh_seed_present_matches_only_the_uncompressed_tar() {
+        // The intern requires the uncompressed `.tar` (PR #536); a leftover
+        // pre-#536 `.tar.gz` must NOT count as present — and both DO coexist on a
+        // real runner (the #546 root cause). The match is version-independent.
+        let d = scratch("kh-seed");
+        let src = d.join(".td-build-cache").join("sources");
+        std::fs::create_dir_all(&src).unwrap();
+
+        // Only the stale gzip present -> not satisfied for either arch.
+        std::fs::write(src.join("linux-headers-4.14.67-i386.tar.gz"), b"gz").unwrap();
+        std::fs::write(src.join("linux-headers-4.14.67-x86_64.tar.gz"), b"gz").unwrap();
+        assert!(!kh_seed_present(&d, "i386"));
+        assert!(!kh_seed_present(&d, "x86_64"));
+
+        // The uncompressed seed for i386 lands -> only i386 satisfied.
+        std::fs::write(src.join("linux-headers-4.14.67-i386.tar"), b"tar").unwrap();
+        assert!(kh_seed_present(&d, "i386"));
+        assert!(!kh_seed_present(&d, "x86_64"));
+
+        // A different pinned version still matches (keyed on name, not version).
+        std::fs::write(src.join("linux-headers-9.9.9-x86_64.tar"), b"tar").unwrap();
+        assert!(kh_seed_present(&d, "x86_64"));
+
+        // Arch tokens do not cross-match: an x86_64-only cache is absent for i386.
+        let e = scratch("kh-seed-arch");
+        let esrc = e.join(".td-build-cache").join("sources");
+        std::fs::create_dir_all(&esrc).unwrap();
+        std::fs::write(esrc.join("linux-headers-4.14.67-x86_64.tar"), b"tar").unwrap();
+        assert!(!kh_seed_present(&e, "i386"));
+        assert!(kh_seed_present(&e, "x86_64"));
+    }
+
+    #[test]
+    fn kh_seed_present_false_when_sources_dir_absent() {
+        // A cold runner with no sources cache at all -> not present, and no panic
+        // from the missing directory.
+        let d = scratch("kh-seed-nodir");
+        assert!(!kh_seed_present(&d, "i386"));
     }
 }
