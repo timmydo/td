@@ -874,6 +874,57 @@ impl RecipeCheckRunner {
         Ok(self.scratch.join("tdstore").join(base))
     }
 
+    /// Typed provenance databases written by every recipe step in BUILD_OUT.
+    /// A product-level follow-up build (the `td shell` Rust-userland proof)
+    /// consumes the already-built platform through these exact databases rather
+    /// than reclassifying its store trees as seeds.
+    pub(crate) fn recipe_output_dbs(&self, build_out: &Path) -> Result<Vec<PathBuf>, String> {
+        let contents = fs::read_to_string(build_out)
+            .map_err(|e| format!("read {}: {e}", build_out.display()))?;
+        let mut dbs = Vec::new();
+        let mut seen = HashSet::new();
+        for line in contents.lines() {
+            let Some(rest) = line.strip_prefix("STEP ") else {
+                continue;
+            };
+            let name = rest
+                .split_whitespace()
+                .next()
+                .ok_or_else(|| format!("malformed STEP line in {}: {line}", build_out.display()))?;
+            let db = self.scratch.join(name).join("td.db");
+            if !db.is_file() {
+                return Err(format!(
+                    "recipe step `{name}' has no output database at {}",
+                    db.display()
+                ));
+            }
+            if seen.insert(name.to_string()) {
+                dbs.push(db);
+            }
+        }
+        if dbs.is_empty() {
+            return Err(format!(
+                "build log {} recorded no recipe STEP outputs",
+                build_out.display()
+            ));
+        }
+        Ok(dbs)
+    }
+
+    pub(crate) fn tdstore_path(&self) -> PathBuf {
+        self.scratch.join("tdstore")
+    }
+
+    pub(crate) fn product_scratch(&self, name: &str) -> PathBuf {
+        self.scratch.join(name)
+    }
+
+    /// Physical control-plane builder used to enter `store-ns`. It executes
+    /// outside the namespace and is never copied into the target `/td/store`.
+    pub(crate) fn control_builder_path(&self) -> &Path {
+        &self.tb
+    }
+
     fn build_recipe_target(&self, target: &str, outputs: &[&str]) -> Result<(), String> {
         self.prepare_recipe_target(target)?;
         let build_out = self.build_plan(target)?;
@@ -914,6 +965,23 @@ impl RecipeCheckRunner {
             .env("TD_BUILDER_PATH", &self.builder_path)
             .env("TD_BUILDER_STORE", &self.builder_store)
             .env("TD_BUILDER_DB", &self.builder_db);
+        cmd
+    }
+
+    /// A host-environment-free control-plane command for product proofs. The
+    /// explicit builder provenance and daemon directory are the only inherited
+    /// authorities; package builds add their complete environment themselves.
+    pub(crate) fn clean_builder_command(&self) -> Command {
+        let mut cmd = Command::new(&self.tb);
+        cmd.current_dir(&self.root)
+            .env_clear()
+            .env("TD_STORE_DIR", TD_STORE_DIR)
+            .env("TD_BUILDER_PATH", &self.builder_path)
+            .env("TD_BUILDER_STORE", &self.builder_store)
+            .env("TD_BUILDER_DB", &self.builder_db);
+        if let Some(daemon_dir) = &self.daemon_dir {
+            cmd.env("TD_DAEMON_DIR", daemon_dir);
+        }
         cmd
     }
 }
