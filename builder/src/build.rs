@@ -1321,7 +1321,7 @@ pub fn run_rust() -> Result<(), String> {
     if let Ok(interp) = env::var("TD_RUST_STORE_INTERP") {
         if !interp.is_empty() {
             rustflags.push_str(&format!(" -Clink-arg=-Wl,--dynamic-linker,{interp}"));
-            // The source-built native GCC is static, and final Rust applications
+            // The source-built native GCC is static, and td-native Rust outputs
             // must not acquire an undeclared shared libgcc runtime edge.
             rustflags.push_str(" -Clink-arg=-static-libgcc");
             for rp in env::var("TD_RUST_STORE_RPATH").unwrap_or_default().split(':').filter(|s| !s.is_empty()) {

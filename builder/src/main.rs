@@ -5016,12 +5016,12 @@ fn parse_shell_source_pin(pins: &str) -> Result<ShellSourcePin, String> {
             continue;
         }
         let fields: Vec<&str> = line.split('\t').collect();
-        if found.is_some() {
-            return Err("td shell Rust recipe must declare exactly one fixed-output source pin".into());
-        }
         let [pin_key, url, sha256, file] = fields.as_slice() else {
             return Err(format!("malformed td shell recipe source pin: {line}"));
         };
+        if found.is_some() {
+            return Err("td shell Rust recipe must declare exactly one fixed-output source pin".into());
+        }
         let key = *pin_key;
         if key.is_empty() {
             return Err("td shell recipe source pin has an empty key".into());
@@ -5108,7 +5108,7 @@ fn recipe_toolchain_lock_body(seed_body: &str, native_lines: &str) -> Result<Str
             ));
         }
     }
-    let mut out = seed_body.trim_end_matches('\n').to_string();
+    let mut out = source_line.to_string();
     out.push('\n');
     out.push_str(native);
     out.push('\n');
@@ -8910,6 +8910,9 @@ mod tests {
         let pin = parse_shell_source_pin(pins).unwrap();
         assert_eq!(pin.key, "ripgrep-source");
         assert_eq!(pin.file, "ripgrep.crate");
+        let malformed_second = format!("{pins}not-a-tab-separated-pin\n");
+        let err = parse_shell_source_pin(&malformed_second).err().unwrap();
+        assert!(err.contains("malformed td shell recipe source pin"), "{err}");
 
         let dir = std::env::temp_dir().join(format!(
             "td-shell-source-pin-{}",
@@ -8944,6 +8947,8 @@ glibc-x86-64 /td/store/gl-glibc td-recipe-output
             assert_eq!(out.matches(nl).count(), 1);
         }
         assert!(!out.contains("/gnu/store"));
+        let padded = format!("\n{source}\n");
+        assert_eq!(recipe_toolchain_lock_body(&padded, native).unwrap(), out);
     }
 
     #[test]
