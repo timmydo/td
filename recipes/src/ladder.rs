@@ -96,15 +96,18 @@ pub const USERLAND_MARKER: &str = "TD-USERLAND-OK";
 /// carrying the bootable busybox userland. Shared by the `linux-x86-64` producer rung
 /// and the `linux-x86-64-test` rung so the two checks cannot drift.
 ///
-/// Uses `busybox cpio -t` for a REAL newc parse: it reads records to the closing
-/// `TRAILER!!!` and exits non-zero on a truncated/corrupt stream (`cpio: short read`),
-/// and its listing is exact MEMBER NAMES. Both matter — the previous payload greps
-/// (`grep -a TRAILER` / `grep -a busybox`) are satisfied by strings EMBEDDED IN THE
-/// BUSYBOX BINARY itself (it contains both "TRAILER!!!" and "busybox"), so an archive
-/// truncated after the marker but before its real trailer passed every assertion.
-/// Matching cpio member names instead defeats that, and the parse itself catches the
-/// truncation. The `{marker}` payload grep is kept because it proves the /init script's
-/// CONTENT (not just its name) is packed — cpio -t validates structure, not bytes.
+/// Uses `busybox cpio -t` for a REAL newc parse whose listing is exact MEMBER NAMES —
+/// unlike the previous payload greps (`grep -a TRAILER` / `grep -a busybox`), which are
+/// satisfied by strings EMBEDDED IN THE BUSYBOX BINARY itself (it contains both
+/// "TRAILER!!!" and "busybox"), so an archive truncated after the marker but before its
+/// real trailer passed every assertion. What actually guarantees COMPLETENESS is
+/// requiring EVERY expected member name in the listing: any truncation that drops a
+/// member (busybox, /init, …) reds on the missing name. `cpio -t`'s exit code is a
+/// secondary signal — it reds on a mid-record `short read`, but can still exit 0 on an
+/// archive truncated cleanly at a header boundary (no TRAILER), which is exactly why the
+/// member-name assertions, not the exit code, carry the load. The `{marker}` payload
+/// grep additionally proves the /init script's CONTENT (not just its name) is packed —
+/// cpio -t validates structure, not bytes.
 ///
 /// `busybox` is the absolute path to the busybox multi-call binary; `grep`/`od`/`wc`
 /// come from the mesboot0 userland, so callers keep `PATH = mesboot0_path()`.

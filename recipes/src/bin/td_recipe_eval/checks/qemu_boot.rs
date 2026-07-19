@@ -66,11 +66,12 @@ const CAP: usize = 256 * 1024;
 /// runs regularly even if qemu writes ttyS0 as fast as we read it.
 const DRAIN_BUDGET: usize = 4 * 1024 * 1024;
 
-/// Disk ceiling on the on-DISK console file. The in-memory capture is trimmed to
-/// CAP, but `-serial file:` keeps appending to the file itself, so a kernel that
-/// floods ttyS0 without panicking could fill the scratch filesystem. When the file
-/// crosses this ceiling the boot is aborted (qemu killed) and reported as flooded —
-/// generous enough that a normal boot's few KiB of printk never trips it.
+/// Disk ceiling on the COMBINED on-disk capture — `console.log` (ttyS0 via
+/// `-serial file:`) plus `diag.log` (qemu's own stdout/stderr). The in-memory
+/// capture is trimmed to CAP, but both files keep appending on disk, so a guest that
+/// floods ttyS0 OR a qemu that floods stderr could fill the scratch filesystem. When
+/// their sum crosses this ceiling the boot is aborted (qemu killed) and reported as
+/// flooded — generous enough that a normal boot's few KiB of printk never trips it.
 const MAX_CONSOLE_BYTES: u64 = 64 * 1024 * 1024;
 
 /// How the boot loop terminated. Success is decided SOLELY by whether the marker
@@ -226,11 +227,15 @@ fn boot(
     // console=ttyS0: kernel printk + the /init echo land on the 8250 UART.
     // panic=-1: on a kernel panic, reboot immediately (=> qemu exits) rather than
     //   wedge, so a failed boot reds promptly instead of riding out the ceiling.
-    // qemu splits -serial file:PATH on commas (they separate sub-options), so any
-    // literal comma in the path must be doubled to be taken literally. The scratch
-    // path is ours (no commas today), but escape defensively so a future base dir
-    // with a comma can't silently corrupt the console route.
-    let serial = format!("file:{}", console_path.to_string_lossy().replace(',', ",,"));
+    // The path is passed VERBATIM. Comma-doubling is WRONG here: `-serial file:PATH`
+    // is qemu's legacy compat form (qemu_chr_parse_compat), which takes everything
+    // after `file:` as the path directly (`qemu_opt_set(opts, "path", p)`) with NO
+    // comma processing — commas are literal. Comma-splitting applies only to the
+    // QemuOpts/`-chardev file,path=…` form. So doubling a comma would make qemu open
+    // a different (doubled-comma) path than drain_console watches; verbatim opens the
+    // exact path, correct even if the base dir contains a comma. (Do not "escape"
+    // this.)
+    let serial = format!("file:{}", console_path.display());
     let append = "console=ttyS0 panic=-1 rdinit=/init";
     let mut child = Command::new(qemu)
         .args(["-M", "pc", "-accel", "tcg", "-m", "256", "-no-reboot"])
@@ -327,8 +332,8 @@ fn boot(
             format!("no marker within the {secs}s ceiling; qemu was killed")
         }
         EndReason::Flooded(bytes) => format!(
-            "ttyS0 flooded past the {MAX_CONSOLE_BYTES}-byte console ceiling ({bytes} bytes) \
-             without reaching the marker; qemu was killed"
+            "console+diagnostic output flooded past the {MAX_CONSOLE_BYTES}-byte on-disk ceiling \
+             ({bytes} bytes across console.log + diag.log) without reaching the marker; qemu was killed"
         ),
     };
     Ok(BootResult {
