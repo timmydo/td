@@ -5548,6 +5548,42 @@ struct RecipeOutputOptions {
     store: Option<String>,
 }
 
+/// Select the physical byte stores and their canonical prefix for a
+/// `build-recipe` invocation. Recipe-output DBs remain the authority that
+/// admits prior outputs; the recipe-output store is also a candidate byte
+/// directory so closure staging can materialize those authenticated rows.
+fn build_recipe_store_layout<'a>(
+    seed_store: Option<&'a str>,
+    seed_db: Option<&str>,
+    recipe_output_store: Option<&'a str>,
+    legacy_store: &'a str,
+) -> Result<(Vec<String>, String, Option<&'a Path>), String> {
+    match (seed_store, seed_db) {
+        (Some(seed), Some(_)) => Ok((
+            vec![seed.to_string()],
+            store::STORE_DIR.to_string(),
+            recipe_output_store
+                .map(Path::new)
+                .or_else(|| Some(Path::new(seed))),
+        )),
+        (None, None) => match recipe_output_store {
+            Some(recipe_store) => Ok((
+                vec![recipe_store.to_string()],
+                store::store_dir(),
+                Some(Path::new(recipe_store)),
+            )),
+            // Legacy callers without the explicit option still use STORE-DIR
+            // as both physical and canonical input space.
+            None => Ok((
+                vec![legacy_store.to_string()],
+                legacy_store.to_string(),
+                None,
+            )),
+        },
+        _ => Err("TD_SEED_STORE/TD_SEED_DB must be set together".into()),
+    }
+}
+
 /// Peel build-recipe's typed recipe-output options from the argv tail. They
 /// may be interleaved, DBs are repeatable in caller order, and the physical
 /// store may be supplied once.
@@ -8173,24 +8209,12 @@ fn main() -> ExitCode {
                 // (#292 — gate 377's collapse); td-built copies inside it are restored to
                 // their /td/store canonicals from the roots + the typed recipe-output dbs.
                 // Without a seed, the scanned dir IS the live store, canonical where it sits.
-                let (seed_store_dirs, seed_prefix, td_store):
-                    (Vec<String>, String, Option<&Path>) = match (&seed_store, &seed_db) {
-                    (Some(s), Some(_d)) => (
-                        vec![s.clone()],
-                        store::STORE_DIR.to_string(),
-                        recipe_output_store
-                            .as_deref()
-                            .map(Path::new)
-                            .or_else(|| Some(Path::new(s))),
-                    ),
-                    (None, None) => match recipe_output_store.as_deref() {
-                        Some(s) => (Vec::new(), store::store_dir(), Some(Path::new(s))),
-                        // Legacy callers without the explicit option still use
-                        // STORE-DIR as both physical and canonical input space.
-                        None => (vec![store_dir.clone()], store_dir.clone(), None),
-                    },
-                    _ => return Err("TD_SEED_STORE/TD_SEED_DB must be set together".into()),
-                };
+                let (seed_store_dirs, seed_prefix, td_store) = build_recipe_store_layout(
+                    seed_store.as_deref(),
+                    seed_db.as_deref(),
+                    recipe_output_store.as_deref(),
+                    store_dir,
+                )?;
                 // The typed db set: the argv `--recipe-output-db` entries (prior td
                 // recipe outputs whose bytes live OUTSIDE the seed dir — their refs
                 // come from the db they wrote; the FILES stage from td_store/<base>),
@@ -9005,6 +9029,16 @@ glibc-x86-64 /td/store/gl-glibc td-recipe-output
         .map(|arg| (*arg).to_string())
         .collect();
         assert!(parse_recipe_output_options(&args).is_err());
+    }
+
+    #[test]
+    fn recipe_output_only_store_is_a_closure_staging_candidate() {
+        let physical = "/tmp/td-recipe-output-store";
+        let (dirs, prefix, td_store) =
+            build_recipe_store_layout(None, None, Some(physical), "/legacy/store").unwrap();
+        assert_eq!(dirs, [physical]);
+        assert_eq!(prefix, store::store_dir());
+        assert_eq!(td_store, Some(Path::new(physical)));
     }
 
     #[test]
