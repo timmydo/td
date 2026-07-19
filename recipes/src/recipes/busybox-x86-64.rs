@@ -170,13 +170,19 @@ pub fn recipe() -> Recipe {
         .env("C_INCLUDE_PATH", &cip)
         .env("LIBRARY_PATH", &lib),
     );
+    // Pin the config symbols we depend on: delete any defconfig line for each, then
+    // append the value we want (belt-and-suspenders against a defconfig drift across
+    // busybox sub-versions). CONFIG_STATIC + no-PIE + -static make the binary a
+    // self-contained static ELF; CONFIG_SWITCH_ROOT=y keeps the `switch_root` applet
+    // the two-stage boot's stage-1 init execs to pivot into the read-only erofs root
+    // (re #550) — defconfig already enables it, so this is a guard, not a change.
     steps.push(
         Step::run(
             "{src}",
             &[
                 SH,
                 "-c",
-                "{in:sed-mesboot0}/bin/sed -i -r '/^#? *CONFIG_STATIC[ =]/d; /^#? *CONFIG_PIE[ =]/d; /^#? *CONFIG_EXTRA_LDFLAGS[ =]/d; /^#? *CONFIG_FEATURE_COMPRESS_BBCONFIG[ =]/d; /^#? *CONFIG_FEATURE_SH_EMBEDDED_SCRIPTS[ =]/d; /^#? *CONFIG_FEATURE_COMPRESS_USAGE[ =]/d' .config && printf '%s\\n' 'CONFIG_STATIC=y' '# CONFIG_PIE is not set' 'CONFIG_EXTRA_LDFLAGS=\"-static\"' '# CONFIG_FEATURE_COMPRESS_BBCONFIG is not set' '# CONFIG_FEATURE_SH_EMBEDDED_SCRIPTS is not set' '# CONFIG_FEATURE_COMPRESS_USAGE is not set' >> .config",
+                "{in:sed-mesboot0}/bin/sed -i -r '/^#? *CONFIG_STATIC[ =]/d; /^#? *CONFIG_PIE[ =]/d; /^#? *CONFIG_EXTRA_LDFLAGS[ =]/d; /^#? *CONFIG_FEATURE_COMPRESS_BBCONFIG[ =]/d; /^#? *CONFIG_FEATURE_SH_EMBEDDED_SCRIPTS[ =]/d; /^#? *CONFIG_FEATURE_COMPRESS_USAGE[ =]/d; /^#? *CONFIG_SWITCH_ROOT[ =]/d' .config && printf '%s\\n' 'CONFIG_STATIC=y' '# CONFIG_PIE is not set' 'CONFIG_EXTRA_LDFLAGS=\"-static\"' '# CONFIG_FEATURE_COMPRESS_BBCONFIG is not set' '# CONFIG_FEATURE_SH_EMBEDDED_SCRIPTS is not set' '# CONFIG_FEATURE_COMPRESS_USAGE is not set' 'CONFIG_SWITCH_ROOT=y' >> .config",
             ],
         )
         .env("PATH", &mesboot0_path()),
