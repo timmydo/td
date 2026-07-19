@@ -244,11 +244,14 @@ pub(crate) fn run_erofs(runner: &RecipeCheckRunner) -> Result<(), String> {
 /// asserts, in order: the greeter was reached, `/` is a read-only erofs mount, the
 /// writable dirs are tmpfs-backed, and the VM powered off cleanly on `exit`.
 pub(crate) fn run_system(runner: &RecipeCheckRunner) -> Result<(), String> {
-    // qemu first (fail fast if absent), then the kernel, then the system image, then the
+    // qemu first (fail fast if absent), then a SINGLE build of the system image, then the
     // erofs root packed from its staged tree.
     let qemu = find_qemu()?;
-    let (bzimage, _initramfs) = build_kernel(runner)?;
-    let (init_cpio, root_tree) = build_system(runner)?;
+    // One build plan for the whole system closure yields BOTH the bzImage (the
+    // `linux-x86-64` rung, in system's closure) and the stage-1 init.cpio + real-root
+    // tree (the `system-x86-64` rung) — building the kernel once, not twice (mirrors the
+    // interactive `run`). build_system checks all three artifacts are present.
+    let (bzimage, init_cpio, root_tree) = build_system(runner)?;
     let disk = build_system_erofs(runner, &root_tree)?;
 
     println!(
@@ -335,18 +338,27 @@ fn build_kernel(runner: &RecipeCheckRunner) -> Result<(PathBuf, PathBuf), String
     Ok((bzimage, initramfs))
 }
 
-/// Build the `system-x86-64` producer and return its `(init.cpio, root-tree)` — the
-/// stage-1 init-initramfs and the staged real-root TREE the oracle packs into the erofs
-/// root. Both are producer-rung artifacts under the recipe's `{out}` (`init.cpio` is a
-/// file, `root/` is a directory), guarded by the recipe's own shape check at build time;
-/// this re-checks their presence so a missing artifact reds here with a clear message
-/// rather than deep inside qemu.
-fn build_system(runner: &RecipeCheckRunner) -> Result<(PathBuf, PathBuf), String> {
+/// Build the `system-x86-64` producer in a SINGLE build plan and return
+/// `(bzImage, init.cpio, root-tree)`. The system closure includes the `linux-x86-64`
+/// kernel, so one plan produces every artifact the two-stage boot needs: the bzImage from
+/// the `linux-x86-64` rung, and the stage-1 init.cpio + staged real-root TREE from the
+/// `system-x86-64` rung (`init.cpio` is a file, `root/` a directory). The recipe's own
+/// shape check guards them at build time; this re-checks their presence so a missing
+/// artifact reds here with a clear message rather than deep inside qemu.
+fn build_system(runner: &RecipeCheckRunner) -> Result<(PathBuf, PathBuf, PathBuf), String> {
     runner.prepare_recipe_target("system-x86-64")?;
     let build_out = runner.build_plan("system-x86-64")?;
-    let tree = runner.ladder_out_from(&build_out, "system-x86-64")?;
-    let init_cpio = tree.join("init.cpio");
-    let root_tree = tree.join("root");
+    let kernel_tree = runner.ladder_out_from(&build_out, "linux-x86-64")?;
+    let system_tree = runner.ladder_out_from(&build_out, "system-x86-64")?;
+    let bzimage = kernel_tree.join("bzImage");
+    let init_cpio = system_tree.join("init.cpio");
+    let root_tree = system_tree.join("root");
+    if !bzimage.is_file() {
+        return Err(format!(
+            "system-x86-64 build is missing the kernel bzImage ({}) — the two-stage boot needs it",
+            bzimage.display()
+        ));
+    }
     if !init_cpio.is_file() {
         return Err(format!(
             "system-x86-64 output is missing init.cpio ({}) — the two-stage boot needs the stage-1 initramfs",
@@ -359,7 +371,7 @@ fn build_system(runner: &RecipeCheckRunner) -> Result<(PathBuf, PathBuf), String
             root_tree.display()
         ));
     }
-    Ok((init_cpio, root_tree))
+    Ok((bzimage, init_cpio, root_tree))
 }
 
 /// Build a tiny probe erofs image with the control-plane `td-builder mkfs-erofs`
