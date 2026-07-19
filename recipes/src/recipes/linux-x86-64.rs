@@ -106,11 +106,38 @@ pub fn recipe() -> Recipe {
         "/td/store/glibc-2.41-x86_64",
     ));
 
-    // bc (busybox applet) for timeconst.h, linked into the {tools} farm that
-    // mesboot0_path() lays on PATH, so Kbuild's parse-time `bc -q timeconst.bc`
-    // resolves it (the top-level Kbuild in 7.x). BusyBox dispatches on argv[0].
+    // BusyBox applets the kernel's host build execs that neither mesboot0 nor the
+    // native toolchain provides, linked by name into the {tools} farm that
+    // mesboot0_path() lays on PATH (BusyBox dispatches on argv[0]). {tools} precedes
+    // coreutils-mesboot0 on PATH, so ONLY names ABSENT from coreutils-mesboot0 are
+    // farmed here — none of these shadow a mesboot0 tool:
+    //   - bc:     timeconst.h parse-time `bc -q timeconst.bc` (as in the 4.14 rung).
+    //   - xargs:  cmd_ar_builtin (scripts/Makefile.build) builds EVERY built-in.a via
+    //             `printf … | xargs $(AR) …`, and cmd_ld_multi links objtool — the
+    //             core of `make vmlinux`; xargs is findutils, absent from mesboot0.
+    //   - uname:  `uname -m` in scripts/subarch.include (every make) + objtool's
+    //             tools/scripts/Makefile.arch; coreutils-mesboot0 omits uname.
+    //   - mktemp: usr/gen_initramfs.sh runs `mktemp` under `set -e` for the default
+    //             (`-d`, empty INITRAMFS_SOURCE) embedded-initramfs list — a hard fail
+    //             without it; coreutils-mesboot0 omits mktemp.
+    //   - dd:     arch/x86/boot/Makefile's cmd_image pads setup.bin with `dd` when
+    //             assembling bzImage; coreutils-mesboot0 omits dd.
+    //   - find:   usr/gen_initramfs.sh print_mtime. Non-fatal for our empty source (it
+    //             sits in a `| sort | head` pipeline → blank mtime), and BusyBox find
+    //             lacks -printf, but farm it so the probe execs rather than erroring;
+    //             the -printf dir_filelist path is only reached by a DIRECTORY
+    //             INITRAMFS_SOURCE, which this rung does not use.
+    // Only `bc` is feature-probed below (a POSIX-only bc silently mis-builds
+    // timeconst.h); the rest fail loudly as "command not found" if the applet is gone.
     steps.push(Step::ToolFarm {
-        links: vec![("bc".into(), bb.into())],
+        links: vec![
+            ("bc".into(), bb.into()),
+            ("xargs".into(), bb.into()),
+            ("uname".into(), bb.into()),
+            ("mktemp".into(), bb.into()),
+            ("dd".into(), bb.into()),
+            ("find".into(), bb.into()),
+        ],
     });
     // Fail FAST if that bc cannot do what timeconst.h needs (read()/arithmetic/
     // print/halt); a missing/POSIX-only bc yields an EMPTY timeconst.h and a
