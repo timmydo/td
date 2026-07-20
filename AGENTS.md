@@ -248,6 +248,18 @@ branch diff the subagent does. Subagents MUST post their review
 findings to the PR as a comment (unfiltered by the main agent
 requesting it).
 
+The comments you author are terse and carry no issue/PR numbers or
+SHAs. A GitHub comment is throwaway context for a live human; the
+durable record of what changed and why is the commit message
+(`git log`/`git blame`). Reconcile review findings in your COMMITS —
+name each fix in the commit that makes it — not in a sectioned PR
+comment. If you comment at all, one or two lines ("addressed the
+overlay-xattr and fail-safe findings"); never restate issue numbers,
+PR numbers, commit SHAs, or a per-finding changelog — that lives in
+git history, and repeating it is noise. The raw cross-model reviewer
+output is the one exception: post it unfiltered per above, without
+wrapping it in framing of your own.
+
 Claude runs Codex (gpt-5.6-sol, xhigh):
 
 ```
