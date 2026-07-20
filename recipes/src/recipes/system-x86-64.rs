@@ -216,14 +216,24 @@ fn build_stage1_init() -> String {
     // and /home become overlays (lower = the read-only erofs dir, upper = tmpfs) so the
     // packed base content (passwd, inittab, the user home) stays visible AND writable.
     // erofs is inherently read-only; `-o ro` is belt-and-suspenders. The /dev/vda probe
-    // loop tolerates an async virtio-blk attach. Any mount failure is left on the console
-    // (no 2>/dev/null) so a broken boot is diagnosable from the captured serial log.
+    // loop tolerates an async virtio-blk attach.
+    //
+    // `set -e` makes the FIRST failing setup command abort the script — its error already
+    // on the console (no 2>/dev/null) — rather than press on into a doomed or PARTIAL
+    // `switch_root`: a failed erofs/overlay mount then panics loudly (init exits) instead
+    // of booting a half-read-only system where some dirs silently aren't writable (re #550,
+    // Codex review). The `while` probe condition is exempt from `set -e`, so a missing
+    // /dev/vda still falls through to the erofs mount, which fails and aborts cleanly.
+    //
+    // /run is mounted 0755 (not tmpfs's default 1777) — it holds the overlay backing and
+    // matches a standard /run; /tmp keeps the default sticky 1777.
     "#!/bin/sh\n\
+     set -e\n\
      /bin/busybox mount -t devtmpfs dev /dev\n\
      n=0\n\
      while /bin/busybox test \"$n\" -lt 5 && ! /bin/busybox test -b /dev/vda; do /bin/busybox sleep 1; n=$((n+1)); done\n\
      /bin/busybox mount -t erofs -o ro /dev/vda /sysroot\n\
-     /bin/busybox mount -t tmpfs tmpfs /sysroot/run\n\
+     /bin/busybox mount -t tmpfs -o mode=0755 tmpfs /sysroot/run\n\
      /bin/busybox mount -t tmpfs tmpfs /sysroot/tmp\n\
      for d in etc var home; do \
      /bin/busybox mkdir -p /sysroot/run/.rw/$d /sysroot/run/.work/$d; \
@@ -324,8 +334,10 @@ fn build_profile(sys: &SystemDef) -> String {
     // cmdline, the greeter exits immediately so `tty-session`'s `reboot -f` powers the VM
     // off — proving "exit powers off" from a clean qemu exit 0 with no terminal to type
     // into. Interactively (no token), the greeter is a normal shell.
+    // `-F`: the token is a FIXED string (`td.autotest=1`), so match it literally — the `.`
+    // must not act as a regex wildcard (re #550, Agy review).
     s.push_str(&format!(
-        "if /bin/busybox grep -q '{AUTOTEST_CMDLINE_TOKEN}' /proc/cmdline 2>/dev/null; then exit; fi\n"
+        "if /bin/busybox grep -q -F '{AUTOTEST_CMDLINE_TOKEN}' /proc/cmdline 2>/dev/null; then exit; fi\n"
     ));
     s
 }
@@ -472,7 +484,7 @@ fn shape_check() -> String {
      [ -f \"$root/init\" ] || [ -L \"$root/init\" ] || { echo 'root tree: /init missing' >&2; exit 1; }; \
      case $(readlink \"$root/init\") in /td/store/*) : ;; *) echo 'root tree: /init is not a symlink into /td/store' >&2; exit 1;; esac; \
      case $(readlink \"$root/bin/sh\") in /td/store/*) : ;; *) echo 'root tree: /bin/sh is not a symlink into /td/store - the store-native /bin farm regressed' >&2; exit 1;; esac; \
-     for f in passwd group shadow inittab profile autologin tty-session rootcheck; do \
+     for f in passwd group shadow hostname os-release inittab profile autologin tty-session rootcheck; do \
          [ -f \"$root/etc/$f\" ] || { echo \"root tree: /etc/$f missing\" >&2; exit 1; }; \
      done; \
      ls \"$root\"/td/store/*/bin/busybox >/dev/null 2>&1 || { echo 'root tree: the busybox binary is not packed under /td/store/<hash>/bin - the store-native /bin symlinks would all dangle' >&2; exit 1; }; \
@@ -640,12 +652,20 @@ mod tests {
     #[test]
     fn stage1_init_mounts_ro_and_pivots() {
         let init = build_stage1_init();
+        // Fail-safe: `set -e` aborts on the first mount failure rather than pressing on
+        // into a partial switch_root (re #550, Codex review).
+        assert!(
+            init.contains("\nset -e\n") || init.contains("#!/bin/sh\nset -e"),
+            "stage-1 init must `set -e` so a failed mount aborts loudly, not into a partial pivot"
+        );
         assert!(
             init.contains("mount -t erofs -o ro /dev/vda /sysroot"),
             "stage-1 init must mount /dev/vda as read-only erofs at /sysroot"
         );
+        // The /sysroot/run tmpfs backs the overlays; it carries `-o mode=0755` now, so match
+        // on the source+mountpoint (`tmpfs /sysroot/run`) not the exact flag string.
         assert!(
-            init.contains("-t overlay overlay") && init.contains("-t tmpfs tmpfs /sysroot/run"),
+            init.contains("-t overlay overlay") && init.contains("tmpfs /sysroot/run"),
             "stage-1 init must set up the tmpfs-backed writable overlays"
         );
         assert!(
