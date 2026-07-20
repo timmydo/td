@@ -1,12 +1,13 @@
 //! `td-builder daily` — the DAILY BACKSTOP runner (was ci/daily-full-suite.sh,
 //! deleted in the same change; rust-migration, human 2026-07-06).
 //!
-//! Main does not block PRs on the full `td-builder check`: engine/heavy PRs land
-//! on the bounded per-PR tiers + review, and the full heavy+daily+system suite
-//! runs ONCE DAILY on fresh main here, driven by a scheduled agent that heals any
-//! regression by opening a FIX-OR-REVERT PR (no auto-merge — a human merges). This
-//! subcommand is the mechanical half: run the whole suite on fresh main and write a
-//! machine-readable verdict; the agent reads the verdict and does the triage + PR.
+//! Main does not block landings on the full `td-builder check`: engine/heavy
+//! changes land on the bounded per-change tiers + review, and the full
+//! heavy+daily+system suite runs ONCE DAILY on fresh main here, driven by a
+//! scheduled agent that heals any regression by forming a fix-or-revert the
+//! integrator lands (no auto-land — a human integrates). This subcommand is the
+//! mechanical half: run the whole suite on fresh main and write a machine-readable
+//! verdict; the agent reads the verdict and does the triage + fix-or-revert.
 //!
 //! Usage:  td-builder daily [--no-system] [--verdict FILE]
 //!
@@ -340,8 +341,9 @@ fn run(args: &[String]) -> i32 {
     } else {
         println!(
             ">> daily backstop: RED (heavy_rc={} system_rc={} harness_rc={}) — agent: triage \
-             `git log <last-green>..{main}`, reproduce the failing gate, open a FIX-OR-REVERT PR \
-             (no auto-merge). Suspect-revert helper: ci/revert-suspect.sh --ref <sha> --open-pr",
+             `git log <last-green>..{main}`, reproduce the failing gate, form a fix-or-revert \
+             and record it in issues/open/daily-red.md (the integrator lands it). Suspect-revert \
+             helper: ci/revert-suspect.sh --ref <sha>",
             heavy.rc, system.rc, harness.rc
         );
     }

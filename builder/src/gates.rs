@@ -1885,9 +1885,8 @@ mod tests {
     #[test]
     fn every_tier_keyword_selects_a_nonempty_set_against_the_real_registry() {
         // A tier keyword that expands to {} makes `run_selected` error with
-        // "nothing selected" and exit non-zero. For check-fast that is fatal —
-        // it is the REQUIRED CI status check (.github/setup-branch-protection.sh),
-        // so an empty expansion reds it on every PR and blocks all merges. The
+        // "nothing selected" and exit non-zero — a silently vacuous gate is a
+        // real hazard when a whole pool retires (as the Cheap pool did). The
         // earlier expand_goals tests use synthetic pools (synth(...)); this one
         // runs the REAL load() registry so emptying a pool (as retiring the whole
         // Cheap pool did) cannot slip through. Guards the check-fast → Engine fold.

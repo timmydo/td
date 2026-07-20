@@ -4,8 +4,9 @@
 # DURABLE assertion (no Guix oracle): the heal actually does its job — the revert
 # reverses the suspect's change — and it self-guards against revert storms
 # (refuses to revert a revert). git-driven, and the loop sandbox has no git
-# (like no diffutils/awk), so this runs in CI's `lint` job (hosted, has git) —
-# wired in .github/workflows/ci.yml — not as a ./check.sh loop gate.
+# (like no diffutils/awk), so this runs as the `heal-revert` preflight in
+# `td-builder affected-checks` (the dev host has git) — not as a ./check.sh loop
+# gate.
 set -euo pipefail
 
 script=$(cd "$(dirname "$0")/.." && pwd)/ci/revert-suspect.sh

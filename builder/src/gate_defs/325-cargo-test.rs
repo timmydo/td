@@ -46,9 +46,9 @@
 //! lint it, and run its unit tests, ~2-4 min, no from-source builds. Anything that
 //! builds a package (bootstrap-build/build-plan/td-check/corpus/…) is NOT smoke; it
 //! stays in the full `check` / daily backstop.
-//! This gate IS the hosted per-PR engine check: the `cargo-test` GitHub job
-//! (.github/workflows/ci.yml) runs `cargo test --frozen` on the runner's own
-//! rust — no store image, and it is a required check (github issue #415). The
+//! This gate IS the per-PR engine check: the `cargo-test` preflight of
+//! `td-builder affected-checks` runs `cargo test --frozen` on the dev host's own
+//! rust — no store image, no hosted CI (GitHub is a backup remote only). The
 //! deep from-source gates stay on the dev-machine full `td-builder check` (the
 //! §7.2 step-2 landing gate) + the nightly daily suite.
 

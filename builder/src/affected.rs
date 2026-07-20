@@ -638,20 +638,10 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
     }
 
     if p == "tests/heal-revert.sh" {
-        // CI-lint-only test of the heal primitive — git is absent from the loop
-        // sandbox, so it is not a ./check.sh gate; shell-syntax suffices locally.
+        // The heal primitive's behavioral test — git is absent from the loop
+        // sandbox, so it is not a ./check.sh gate; the dev host runs it directly.
         sel.add_preflight("shell-syntax");
-        return;
-    }
-
-    if pattern_matches(".github/setup-branch-protection.sh|.github/workflows/*", p) {
-        // CI/runner-gating files: the local loop never exercises hosted CI, so
-        // the honest local check is the syntax preflight — the workflow run after
-        // push is the real test.
-        sel.add_preflight("shell-syntax");
-        sel.add_note(&format!(
-            "{p} affects CI or branch protection; inspect the workflow result after push."
-        ));
+        sel.add_preflight("heal-revert");
         return;
     }
 
@@ -666,16 +656,14 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
         sel.add_preflight("cargo-test");
         return;
     }
-    if pattern_matches("ci/*.sh|tools/*.sh", p) {
+    if p == "ci/revert-suspect.sh" {
+        // Editing the heal primitive runs its behavioral test (the dev host has git).
         sel.add_preflight("shell-syntax");
+        sel.add_preflight("heal-revert");
         return;
     }
-
-    if pattern_matches("ci/*|.github/workflows/*|.github/*", p) {
+    if pattern_matches("ci/*.sh|tools/*.sh", p) {
         sel.add_preflight("shell-syntax");
-        sel.add_note(&format!(
-            "{p} affects CI or branch protection; inspect the workflow result after push."
-        ));
         return;
     }
 
@@ -699,9 +687,8 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
 
 fn preflight_cmd(name: &str) -> Option<&'static str> {
     match name {
-        "shell-syntax" => Some(
-            "  bash -n tests/*.sh ci/*.sh tools/*.sh .github/setup-branch-protection.sh",
-        ),
+        "shell-syntax" => Some("  bash -n tests/*.sh ci/*.sh tools/*.sh"),
+        "heal-revert" => Some("  bash tests/heal-revert.sh"),
         "cargo-test" => Some("  cargo test + clippy --manifest-path {builder,recipes}/Cargo.toml"),
         "affected-self-test" => Some("  td-builder affected-checks --self-test"),
         _ => None,
@@ -1149,6 +1136,12 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
     assert_runs!("recipes/src/source_pins.rs", "recipe-rs");
     assert_runs!("recipes/src/catalog.rs", "recipe-rs");
 
+    // The heal primitive's behavioral test moved from CI into the `heal-revert`
+    // preflight (GitHub is a backup remote only): editing the primitive or its
+    // test selects it (the dev host has git; the loop sandbox does not).
+    assert_contains!("ci/revert-suspect.sh", "bash tests/heal-revert.sh");
+    assert_contains!("tests/heal-revert.sh", "bash tests/heal-revert.sh");
+
     failures
 }
 
@@ -1237,10 +1230,8 @@ fn run_shell(root: &Path, script: &str) -> i32 {
 
 fn run_preflight(root: &Path, name: &str) -> i32 {
     match name {
-        "shell-syntax" => run_shell(
-            root,
-            "bash -n tests/*.sh ci/*.sh tools/*.sh .github/setup-branch-protection.sh",
-        ),
+        "shell-syntax" => run_shell(root, "bash -n tests/*.sh ci/*.sh tools/*.sh"),
+        "heal-revert" => run_shell(root, "bash tests/heal-revert.sh"),
         // BOTH engine crates, tests AND clippy: the AGENTS.md deny-lints only
         // fire under the clippy driver, and the in-loop cargo-test gate (325)
         // is unreachable while the loop is UNPROVISIONED (re #469) — this
@@ -1552,7 +1543,7 @@ mod tests {
                 "  check.sh",
                 "",
                 "Selected checks:",
-                "  bash -n tests/*.sh ci/*.sh tools/*.sh .github/setup-branch-protection.sh",
+                "  bash -n tests/*.sh ci/*.sh tools/*.sh",
                 "  cargo test + clippy --manifest-path {builder,recipes}/Cargo.toml",
                 "  td-builder check check-pr",
                 "",

@@ -150,20 +150,23 @@ be Rust built with the source-built stage2 `/td/store` toolchain.
    fixed-output fetches. Do not make a build pass by reaching outside
    the container or adding an undeclared dependency
    
-2. Issues track the work. PRs claim the issues and save the
-   state. Open a draft PR when you start working, commit often (we
-   squash merge PRs) so that other agents can pick up the work in the
-   case of an unexpected interruption (e.g. reboot).
+2. Issues track the work — plain markdown files in `issues/`, not
+   GitHub Issues (GitHub is a backup remote only). Claim an item by
+   pushing an `issue-NNNN-*` branch, commit often, and push (the branch
+   is squashed into main at landing) so another agent can pick up the
+   work after an unexpected interruption (e.g. reboot). See "Parallel
+   work" and `issues/README.md`.
 
 3. Avoid external dependencies. Request explicit sign off before
-   adding and make it clear in the PR if this adds a new dependency.
+   adding and make it clear in the landing commit message if this adds
+   a new dependency.
 
 4. Avoid writing shell. Prefer rust code with zero dependencies.
 
-5. Treat PR migrations as a complete, atomic increment — migrations
-   cut over in one PR. Delete the old mechanism in the same PR. We use
-   git. You don't need to put dates in annotations--git blame is for
-   that.
+5. Treat migrations as a complete, atomic increment — a migration cuts
+   over in one landing. Delete the old mechanism in the same landing.
+   We use git. You don't need to put dates in annotations--git blame is
+   for that.
    
 # Tests
 
@@ -175,9 +178,9 @@ cargo run --release --manifest-path builder/Cargo.toml -- check
 
 Recipes should have tests that test the output.
 
-We have different CI tiers (daily, PR, etc.). It'd take too long to
-rebuild the world from scratch for every PR so we only run the minimal
-during PRs.
+We have different check tiers (daily, per-change, etc.). It'd take too
+long to rebuild the world from scratch for every change so we only run
+the minimal per change; the daily backstop covers the deep tiers.
 
 Build td builder with: `cargo build --release --manifest-path builder/Cargo.toml`.
 
@@ -200,40 +203,59 @@ td-builder affected-checks --committed-only --run
 
 It prints `Waiver: the full check waived by affected-checks for
 this diff` — the local waiver for the full loop; record the
-selected checks and waiver line in the PR body (include the
-"Deferred to the daily backstop" line when one prints — that is the
-record of what the daily covers for this diff). Nothing escalates to
-the full loop; every diff waives to the bounded per-PR tiers + the
-daily backstop.
+selected checks and waiver line in the landing commit message
+(include the "Deferred to the daily backstop" line when one prints —
+that is the record of what the daily covers for this diff). Nothing
+escalates to the full loop; every diff waives to the bounded per-change
+tiers + the daily backstop.
 
-# Parallel work (worktrees, merge on green)
+# Parallel work (worktrees, land on green)
 
 Multiple agents work this repo concurrently so use work trees. Take
-new work from the issue backlog. `gh issue list` is the menu.  Draft
-means "not yet reviewable" — nothing else. A draft PR is a CLAIM; the
-moment its validation + review protocol is complete, the SAME agent
-marks it ready — never ask the human to look at a PR still labeled
-draft, and never leave a finished PR in draft (the human reads draft
-as "don't review yet").  If the human asks about a draft PR, treat it
-as the signal your readiness state drifted: reconcile immediately
-(mark ready or say what's missing).  Marking ready REQUIRES all three
-code reviews (the subagent review AND both cross-model CLI reviews) to
-already be POSTED on the PR with their findings addressed
+new work from the backlog: `ls issues/open/` is the menu (see
+`issues/README.md`). GitHub (and the sr.ht mirror) is a git backup
+remote only — no GitHub Issues, PRs, Actions, or branch protection.
 
-Work in your own git worktree/branch.
+Work in your own git worktree/branch named `issue-NNNN-slug`.
+
+**Claim.** Pushing that branch to `origin` is the claim (this replaces
+the old draft PR). The claim board is `git ls-remote --heads origin
+'issue-*'`; before starting, confirm your item's territory is disjoint
+from every active `issue-*` branch (each issue's "Collisions" section).
+A claimed branch with no new commits for a few days is reclaimable.
+
+**Ready.** A branch is ready to land when its bounded checks are green
+(`td-builder affected-checks --committed-only --run`) AND all three
+code reviews have run, their findings acted on, and the acting agent's
+summary of those findings and follow-ups is in the commit message.
+There is no draft/ready flag to flip and nothing on a
+webpage to ask the human to look at — readiness lives entirely in the
+branch. The SAME agent that finishes the work carries it to ready;
+don't hand a half-reviewed branch to the integrator.
+
+**Land.** A single integrator (the test user) lands ready branches into
+main: `git fetch`, `git squash-in <branch>` (squashes the branch,
+prefilling the message from its commits), review `git diff --cached`,
+`git commit`, `git mv issues/open/NNNN-*.md issues/closed/` for any
+item it closes, `git push origin main`, then delete the branch
+(`git push origin :issue-NNNN-slug`). Squash — one commit per landing —
+keeps each landing atomic and the suspect unambiguous for the heal
+primitive (`ci/revert-suspect.sh`).
 
 Never `git stash` in this repo. The stash stack (`refs/stash`) is
   repo-*global*.
 
-Every PR gets THREE independent code reviews — a subagent review AND
-two cross-model reviews, each by a different model's CLI — waivable
-only for documentation changes, and only if you say so in the PR:
-spawn an independent code-review subagent over the full branch diff
+## Code review — three independent reviews, recorded in the commit
+
+Every landing gets THREE independent code reviews — a subagent review
+AND two cross-model reviews, each by a different model's CLI — waivable
+only for documentation changes, and only if the commit message says so.
+Spawn an independent code-review subagent over the full branch diff
 (`/code-review`), AND run two further reviews with *different* models
 driven from their CLIs so two distinct models each audit the same diff
 (catches blind spots one model shares with its own subagent). Which
 three reviewer identities apply depends on which model is the acting
-agent for the PR:
+agent:
 
 - **Acting agent is Claude:** subagent review at Opus 4.8, plus a
   Codex CLI review and an Agy (Antigravity) CLI review.
@@ -243,35 +265,39 @@ agent for the PR:
 Run every cross-model reviewer at a strong model + high reasoning
 effort, and feed it the branch diff on stdin — a bare `git diff` is
 empty once the branch is committed, so pipe `git diff
-origin/main...HEAD` so each cross-model reviewer audits the same full
-branch diff the subagent does. Subagents MUST post their review
-findings to the PR as a comment (unfiltered by the main agent
-requesting it).
+origin/main...HEAD` so each reviewer audits the same full branch diff
+the subagent does. The reviewers do NOT write the record: the acting
+agent reads all three, acts on the findings — fixing each real one or
+dismissing it with a stated reason — then writes ITS OWN summary of the
+findings and how each was followed up into the commit message. Send raw
+reviewer output to a scratch file you do NOT commit; account for every
+finding (don't silently drop one), but the commit carries your summary,
+not the verbatim dumps. That summary is the durable record the
+integrator reads before `squash-in`.
 
 Claude runs Codex (gpt-5.6-sol, xhigh):
 
 ```
-git diff origin/main...HEAD | codex exec --model gpt-5.6-sol -c model_reasoning_effort="xhigh" -s read-only --ephemeral "Do a code review of the git diff on stdin. Do not edit files. Return prioritized findings with file/line references where possible. Post the review as comment on PR #<insert number>"
+git diff origin/main...HEAD | codex exec --model gpt-5.6-sol -c model_reasoning_effort="xhigh" -s read-only --ephemeral "Do a code review of the git diff on stdin. Do not edit files. Return prioritized findings with file/line references where possible." | tee /tmp/codex-review.md
 ```
 
 Codex runs Claude (Opus 4.8, xhigh):
 ```
-git diff origin/main...HEAD | claude -p --model opus --effort xhigh "Do a code review of the git diff on stdin. Do not edit files. Return prioritized findings with file/line references where possible. Post the review as comment on PR #<insert number>"
+git diff origin/main...HEAD | claude -p --model opus --effort xhigh "Do a code review of the git diff on stdin. Do not edit files. Return prioritized findings with file/line references where possible." | tee /tmp/claude-review.md
 ``` 
 
 Either acting agent also runs Antigravity (Gemini 3.1 Pro High) as the
-third, shared cross-model reviewer. `agy --print` reads stdin but does
-not post to GitHub itself in plan mode, so post its raw output
-unchanged:
+third, shared cross-model reviewer:
 
 ```
 git diff origin/main...HEAD | agy --model "Gemini 3.1 Pro (High)" --mode plan --print-timeout 10m --print "Do a code review of the git diff on stdin. Do not edit files. Return prioritized findings with file/line references where possible." | tee /tmp/agy-review.md
-gh pr comment <insert number> --body-file /tmp/agy-review.md
 ```
 
-Use (`--model`/`--effort` for `claude` — effort levels `xhigh`;
-`--model` + `-c model_reasoning_effort=…` for `codex`, and
-`--model`/`--mode plan` for `agy`.
+Use `--model`/`--effort` for `claude` (effort level `xhigh`); `--model`
++ `-c model_reasoning_effort=…` for `codex`; and `--model`/`--mode
+plan` for `agy`. Summarize the three reviews' findings and your
+follow-ups into the landing commit message — your summary, not the raw
+reviewer output.
 
 
 # Rust code
@@ -302,23 +328,23 @@ td's Rust is defensive and minimal-surface.
   *why* in a line or two — not by narrating the change, restating the code, or citing
   issue/PR numbers, review history, or design rationale. That context belongs in the
   commit message (`git blame` walks any line back to it); the review reconciliation
-  belongs in the PR comment. Match the surrounding comment density; when in doubt, cut.
+  belongs there too. Match the surrounding comment density; when in doubt, cut.
 
 
 **Commits**
   
-- **Commit messages ARE the durable record.** main takes only squash merges (merge and
-  rebase merges are disabled), and the repo composes the squash commit's body from your
-  branch's commit messages, not the PR description (`squash_merge_commit_message =
-  COMMIT_MESSAGES`). So put the rationale, the design decisions, and the verified-red
-  evidence in your commit messages — that is what lands in `git log` on main. The PR
-  body is review context for the human and does NOT persist into git; don't rely on it
-  to record anything you want to keep.
+- **Commit messages ARE the durable record.** main is built from squash landings
+  (`git squash-in` composes the squashed commit's body from your branch's commit
+  messages). So put the rationale, the design decisions, the review findings +
+  resolutions, and the verified-red evidence in your commit messages — that is what
+  lands in `git log` on main and what the integrator reads before landing. Nothing
+  else persists (there is no PR description, no webpage); if you want to keep it, it
+  goes in a commit message.
 
-- **Closing keywords in commit messages fire on main.** Because the squash body is
-  composed from branch commit messages, a `fixes #N` / `closes #N` / `resolves #N`
-  ANYWHERE in any branch commit auto-closes that issue the moment the squash lands —
-  GitHub offers no setting to disable this, and it has mis-closed a live issue before
-  (#292, closed by the unrelated #291 squash whose body said "for whoever fixes #292").
-  Write `re #N` / `see #N` / `until #N is fixed` when referring to an issue you are NOT
-  resolving; reserve the closing keywords for the issue your PR actually closes.
+- **Closing an item is a `git mv`, not a keyword.** An item closes when the integrator
+  moves its file from `issues/open/` to `issues/closed/` in the landing commit — there
+  is no GitHub keyword magic firing off commit text anymore. `closes #N` / `fixes #N`
+  in a message is just a human-readable pointer now; when you refer to an item you are
+  NOT closing, write `re #N` / `see #N` / `until #N is fixed` to keep it unambiguous.
+  (The old hazard — a stray `fixes #N` auto-closing a live issue, as #291's squash
+  mis-closed #292 — is gone with GitHub Issues.)
