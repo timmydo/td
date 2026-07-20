@@ -301,6 +301,21 @@ pub(crate) fn run_system(runner: &RecipeCheckRunner) -> Result<(), String> {
             tail(&result.console, 80)
         ));
     }
+    // A kernel panic under `panic=-1` reboots and, with `-no-reboot`, exits qemu 0 — the
+    // SAME exit code as a clean guest power-off. So `exited_clean` alone cannot tell a
+    // genuine "exit powers off" from a panic AFTER the markers were printed (the root
+    // checks run at sysinit, before the greeter); scan the console for a panic explicitly
+    // so such a boot reds instead of false-passing as a clean shutdown (re #550, subagent
+    // review). "Kernel panic" is the leading fragment of the kernel's "Kernel panic - not
+    // syncing:" banner.
+    if result.console.contains("Kernel panic") {
+        return Err(format!(
+            "the markers were printed but the kernel PANICKED rather than powering off cleanly — \
+             under `panic=-1` a panic also exits qemu 0, so this would otherwise masquerade as a \
+             clean \"exit powers off\". Last serial output:\n{}",
+            tail(&result.console, 80)
+        ));
+    }
     if !result.exited_clean {
         return Err(format!(
             "the greeter was reached and both root checks passed, but the VM did not power off cleanly \
@@ -498,11 +513,6 @@ fn parse_timeout(raw: Option<String>) -> Duration {
     Duration::from_secs(secs)
 }
 
-/// Boot bzImage + initramfs under qemu, capturing ttyS0 to a FILE (never a pipe:
-/// a pipe would deadlock if the kernel log outran the buffer while we poll). The
-/// console is read INCREMENTALLY into a bounded rolling buffer — decoded lossily
-/// so a non-UTF-8 serial byte can't empty the capture, and trimmed to the last
-/// CAP bytes so a flooding boot can't balloon memory or make the poll quadratic.
 /// The per-mode boot parameters — everything that differs between the diskless kernel
 /// boot, the erofs-probe boot, and the two-stage system boot. Grouped into one struct so
 /// `boot` keeps a small, self-documenting signature: named fields at the call site
@@ -525,7 +535,11 @@ struct BootPlan<'a> {
     extra_append: &'a str,
 }
 
-/// Boot `bzImage` + `initramfs` under qemu per `plan` (see `BootPlan`), capturing ttyS0.
+/// Boot `bzImage` + `initramfs` under qemu per `plan` (see `BootPlan`), capturing ttyS0 to
+/// a FILE (never a pipe: a pipe would deadlock if the kernel log outran the buffer while we
+/// poll). The console is read INCREMENTALLY into a bounded rolling buffer — decoded lossily
+/// so a non-UTF-8 serial byte can't empty the capture, and trimmed to the last CAP bytes so
+/// a flooding boot can't balloon memory or make the poll quadratic.
 fn boot(
     qemu: &str,
     bzimage: &Path,
