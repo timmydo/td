@@ -116,6 +116,37 @@ pub const EROFS_PROBE_SENTINEL: &str = "td-erofs-probe.ok";
 /// token (no spaces/quotes/newline) so the `[ "$x" = "..." ]` compare stays trivial.
 pub const EROFS_PROBE_CONTENT: &str = "td-erofs-ro-readback-ok";
 
+// ── system-x86-64 two-stage boot markers (re #550) ──────────────────────────────
+// The distro's two-stage boot — a minimal init-initramfs mounts the read-only erofs
+// `/td/store` root over virtio-blk, overlays tmpfs for the writable dirs, and
+// `switch_root`s into it — proves itself on ttyS0 with three lines the headless
+// `qemu-boot-system` oracle asserts on. All three are SINGLE SOURCE OF TRUTH shared
+// by the recipe (`/etc/rootcheck`, `/etc/profile`) and the oracle so they never desync.
+
+/// Printed by `/etc/rootcheck` on the REAL root (post-`switch_root`) once it confirms
+/// via `/proc/mounts` that `/` is an `erofs` mount carrying the read-only (`ro`) option
+/// — i.e. the store root really is the immutable erofs image, not the initramfs.
+pub const SYSTEM_ROOT_RO_MARKER: &str = "TD-ROOT-EROFS-RO-OK";
+
+/// Printed by `/etc/rootcheck` once it confirms the writable dirs are tmpfs-backed
+/// (`/run` is a `tmpfs` mount) AND actually accept a write (a probe file is created and
+/// removed under each overlaid dir) — proving the read-only root is usable via the
+/// tmpfs overlays, not silently read-only everywhere.
+pub const SYSTEM_WRITABLE_MARKER: &str = "TD-WRITABLE-OK";
+
+/// Printed by `/etc/profile` when the auto-login greeter shell is reached — the login
+/// chain (getty → login → ash) ran on the real root. The primary "booted to the
+/// greeter" success line.
+pub const GREETER_MARKER: &str = "TD-GREETER-OK";
+
+/// Kernel-cmdline token the headless `qemu-boot-system` oracle appends so the greeter
+/// SELF-TESTS: `/etc/profile`, on seeing it in `/proc/cmdline`, prints `GREETER_MARKER`
+/// then `exit`s the login shell, which (via `tty-session`'s `reboot -f`) powers the VM
+/// off — so the oracle proves "exit powers off" from a clean qemu exit 0 without a
+/// terminal to type into. Absent it (interactive `td-recipe-eval run`), the greeter is
+/// a normal interactive shell.
+pub const AUTOTEST_CMDLINE_TOKEN: &str = "td.autotest=1";
+
 /// Shell (for `sh -c`) asserting that `initramfs` is a COMPLETE, well-formed newc cpio
 /// carrying the bootable busybox userland. Shared by the `linux-x86-64` producer rung
 /// and the `linux-x86-64-test` rung so the two checks cannot drift.
