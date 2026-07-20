@@ -68,6 +68,14 @@ pub fn recipe() -> Recipe {
         .env("SHELL", SH)
         .env("C_INCLUDE_PATH", &cip),
     );
+    // `make install` must carry the SAME C_INCLUDE_PATH as the build step: the
+    // engine runs every Step with `env -i` (no inherited env), and binutils'
+    // `install-ld` target recompiles the GENERATED ldemul.c when its timestamp
+    // beats ldemul.o (nondeterministic under -j). Our wb/cc wrapper only injects
+    // -B{glibc}/lib, not the header path, so an install-time recompile without
+    // C_INCLUDE_PATH fails with `stdio.h: No such file or directory` and reds the
+    // gcc-x86-64-self-test gate. (The native binutils-x86-64 wrapper bakes
+    // -idirafter {glibc}/include in, so it never hit this.) re #469.
     steps.push(
         Step::run(
             "{src}",
@@ -81,7 +89,8 @@ pub fn recipe() -> Recipe {
         )
         .env("PATH", &path)
         .env("CONFIG_SHELL", SH)
-        .env("SHELL", SH),
+        .env("SHELL", SH)
+        .env("C_INCLUDE_PATH", &cip),
     );
     steps.push(Step::Require {
         paths: vec![
@@ -102,4 +111,47 @@ pub fn recipe() -> Recipe {
         ])
         .inputs_owned(mesboot0_inputs(&["linux-headers-x86-64"]))
         .steps(steps)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::recipe;
+    use crate::types::Step;
+
+    // The install step recompiles the generated ldemul.c when its timestamp beats
+    // ldemul.o (nondeterministic under -j). Because the engine runs every Step with
+    // `env -i` and the wb/cc wrapper doesn't inject the header path, `make install`
+    // MUST carry C_INCLUDE_PATH exactly as the build step does — otherwise the
+    // recompile fails `stdio.h: No such file or directory` and flaky-reds the
+    // gcc-x86-64-self-test gate.
+    #[test]
+    fn make_install_carries_the_build_c_include_path() {
+        let steps = recipe().steps.expect("binutils-x86-64-self steps");
+        let make_steps: Vec<&Vec<(String, String)>> = steps
+            .iter()
+            .filter_map(|step| match step {
+                Step::Run { argv, env, .. }
+                    if argv.first().map(String::as_str)
+                        == Some("{in:make-mesboot}/bin/make") =>
+                {
+                    Some(env)
+                }
+                _ => None,
+            })
+            .collect();
+        // The build `make` and the `make install`.
+        assert_eq!(make_steps.len(), 2, "expected a build and an install make step");
+        for env in make_steps {
+            let cinc = env
+                .iter()
+                .find(|(k, _)| k == "C_INCLUDE_PATH")
+                .map(|(_, v)| v.as_str());
+            assert_eq!(
+                cinc,
+                Some("{in:glibc-x86-64}/stage/td/store/glibc-2.41-x86_64/include:{root}/kh"),
+                "every make step must see the glibc + kernel headers so an \
+                 install-time ldemul.c recompile can find stdio.h"
+            );
+        }
+    }
 }
