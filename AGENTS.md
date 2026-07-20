@@ -298,6 +298,11 @@ td's Rust is defensive and minimal-surface.
 - **Prefer allocating off the hot path** — set buffers/collections up once rather
   than per-iteration in a build's inner loop. This is a code-review guideline, not
   a lint (there is no clippy check for it); don't contort code to satisfy it.
+- **Code comments are terse.** A comment earns its place by explaining a non-obvious
+  *why* in a line or two — not by narrating the change, restating the code, or citing
+  issue/PR numbers, review history, or design rationale. That context belongs in the
+  commit message (`git blame` walks any line back to it); the review reconciliation
+  belongs in the PR comment. Match the surrounding comment density; when in doubt, cut.
 
 
 **Commits**
