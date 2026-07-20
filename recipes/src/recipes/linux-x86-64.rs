@@ -331,6 +331,13 @@ pub fn recipe() -> Recipe {
     //    (gates EROFS_FS). Do not drop them as "redundant" — the grep-verify guard on
     //    the leaves (step 4) reds the whole producer build if a parent goes missing.
     //    (OVERLAY_FS / PCI / BLOCK are directly selectable, no menuconfig parent.)
+    //
+    //    TMPFS_XATTR (re #550): the two-stage boot overlays the writable dirs
+    //    (/etc,/var,/home) with an OverlayFS whose UPPER layer is a tmpfs, and a
+    //    writable OverlayFS upper MUST support trusted.* extended attributes. tmpfs
+    //    only offers xattrs when CONFIG_TMPFS_XATTR=y — a PROMPTED leaf that defaults
+    //    OFF, so (like the menuconfig parents) it is set explicitly and grep-verified,
+    //    else the overlays fall back to a degraded no-xattr mode or fail outright.
     steps.push(
         Step::run(
             "{src}",
@@ -365,6 +372,7 @@ pub fn recipe() -> Recipe {
                   /^#? *CONFIG_SYSFS[ =]/d; \
                   /^#? *CONFIG_DEVTMPFS[ =]/d; \
                   /^#? *CONFIG_TMPFS[ =]/d; \
+                  /^#? *CONFIG_TMPFS_XATTR[ =]/d; \
                   /^#? *CONFIG_BLOCK[ =]/d; \
                   /^#? *CONFIG_BLK_DEV[ =]/d; \
                   /^#? *CONFIG_PCI[ =]/d; \
@@ -397,6 +405,7 @@ pub fn recipe() -> Recipe {
                    'CONFIG_SYSFS=y' \
                    'CONFIG_DEVTMPFS=y' \
                    'CONFIG_TMPFS=y' \
+                   'CONFIG_TMPFS_XATTR=y' \
                    'CONFIG_BLOCK=y' \
                    'CONFIG_BLK_DEV=y' \
                    'CONFIG_PCI=y' \
@@ -435,6 +444,7 @@ pub fn recipe() -> Recipe {
                  grep -q '^CONFIG_PROC_FS=y' .config || { echo 'PROC_FS off - a usable userland (ps/mount/init) needs /proc' >&2; exit 1; }; \
                  grep -q '^CONFIG_SYSFS=y' .config || { echo 'SYSFS off - a usable userland needs /sys' >&2; exit 1; }; \
                  grep -q '^CONFIG_TMPFS=y' .config || { echo 'TMPFS off - a usable userland needs a writable /tmp,/run' >&2; exit 1; }; \
+                 grep -q '^CONFIG_TMPFS_XATTR=y' .config || { echo 'TMPFS_XATTR off - OverlayFS needs xattr support on the tmpfs upperdir, else the writable /etc,/var,/home overlays over the read-only erofs root fail (re #550)' >&2; exit 1; }; \
                  grep -q '^CONFIG_BLOCK=y' .config || { echo 'BLOCK off - no block layer for the virtio-blk erofs disk' >&2; exit 1; }; \
                  grep -q '^CONFIG_PCI=y' .config || { echo 'PCI off - virtio-blk-pci (the -M pc transport) needs the PCI bus' >&2; exit 1; }; \
                  grep -q '^CONFIG_VIRTIO_PCI=y' .config || { echo 'VIRTIO_PCI off - no virtio transport on the -M pc PCI bus' >&2; exit 1; }; \
