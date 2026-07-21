@@ -1292,13 +1292,18 @@ fn host_cargo_bin(root: &Path, dir: &str, bin: &str, deadline: Option<Instant>) 
 /// version, sha256)`. The checksummed entries are the vendored crates-io deps;
 /// the root (path) crate has no checksum and is excluded, exactly the
 /// reduction the retired shell awk did.
-fn parse_lock_checksums(lock: &str) -> Vec<(String, String, String)> {
+pub(crate) fn parse_lock_checksums(lock: &str) -> Vec<(String, String, String)> {
+    // Tolerate non-canonical whitespace around `=` and leading indentation so a
+    // hand-edited lock cannot slip a field past the trust-boundary scanners; a
+    // cargo-written lock (column-0 fields, single space) parses identically.
     fn field<'a>(line: &'a str, key: &str) -> Option<&'a str> {
-        line.strip_prefix(key)?
-            .strip_prefix(" = \"")?
-            .split('"')
-            .next()
-            .filter(|v| !v.is_empty())
+        let (k, v) = line.trim().split_once('=')?;
+        if k.trim() != key {
+            return None;
+        }
+        let inner = v.trim().strip_prefix('"')?;
+        let end = inner.find('"')?;
+        inner.get(..end).filter(|s| !s.is_empty())
     }
     let mut out = Vec::new();
     let (mut name, mut ver): (Option<&str>, Option<&str>) = (None, None);

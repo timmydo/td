@@ -26,7 +26,9 @@ pub fn recipe() -> Recipe {
     let xglibc = "{in:glibc-x86-64}/stage/td/store/glibc-2.41-x86_64";
     let py = "{in:python-mesboot}/bin/python3";
     let path = format!("{{tools}}:{nbin}");
-    let mut steps = unpack_into("rust-source", "{src}");
+    // The rung's own source lands in TD_INPUT_MAP under the LOCAL `{name}-source`,
+    // not its sourceInput pin key (see linux-x86-64.rs) — reference the local name.
+    let mut steps = unpack_into("rust-toolchain-source", "{src}");
 
     steps.extend(unpack_keep_top("linux-headers-x86-64", "{root}/kh"));
     for dir in [

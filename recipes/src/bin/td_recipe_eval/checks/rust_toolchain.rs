@@ -7,6 +7,10 @@ use std::process::Command;
 use crate::check_runner::{is_executable, RecipeCheckRunner, TD_STORE_DIR};
 use crate::sha256::Sha256;
 
+// The nested `stage/td/store/<pkg>` prefix each `-self`/glibc recipe output carries.
+// `td-builder`'s NATIVE_GCC_STAGE/NATIVE_GLIBC_STAGE embed the same pinned versions for
+// the build-plan `--auto` link env; the two must move together on a compiler/libc bump
+// (re #547).
 const GCC_STAGE: &str = "stage/td/store/gcc-14.3.0-x86_64-self";
 const GLIBC_STAGE: &str = "stage/td/store/glibc-2.41-x86_64";
 

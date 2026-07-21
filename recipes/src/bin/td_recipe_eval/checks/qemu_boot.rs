@@ -72,6 +72,11 @@ const EROFS_PROBE_CONTENT: &str = td_recipe::ladder::EROFS_PROBE_CONTENT;
 /// line and the oracle key can never desync.
 const GREETER_MARKER: &str = td_recipe::ladder::GREETER_MARKER;
 
+/// Printed by the headless greeter only after a uutils applet, run by absolute `/bin` path,
+/// exits 0 — the RUNTIME proof (vs `shape_check`'s static scan) that the dynamically-linked
+/// coreutils multicall's closure resolves on the erofs root. Shared via `td_recipe::ladder`.
+const UUTILS_RUNTIME_MARKER: &str = td_recipe::ladder::UUTILS_RUNTIME_MARKER;
+
 /// The line `/etc/rootcheck` prints once it has confirmed `/` is a READ-ONLY erofs
 /// mount (re #550). `qemu-boot-system` asserts it to prove the switched-into root is
 /// the immutable erofs image, not a writable copy.
@@ -301,6 +306,17 @@ pub(crate) fn run_system(runner: &RecipeCheckRunner) -> Result<(), String> {
             tail(&result.console, 80)
         ));
     }
+    if !result.console.contains(UUTILS_RUNTIME_MARKER) {
+        return Err(format!(
+            "the greeter was reached and root checks passed, but the uutils runtime marker \
+             ({UUTILS_RUNTIME_MARKER:?}) was absent — running a uutils applet (`/bin/cat`) by \
+             absolute path did not exit 0, so the dynamically-linked coreutils multicall's \
+             runtime closure (ELF interp, glibc, libgcc_s) does not resolve on the erofs root \
+             even though the static shape scan passed. This is the DT_NEEDED-soname residual the \
+             build-time scan cannot see. Last serial output:\n{}",
+            tail(&result.console, 80)
+        ));
+    }
     // A kernel panic under `panic=-1` reboots and, with `-no-reboot`, exits qemu 0 — the
     // SAME exit code as a clean guest power-off. So `exited_clean` alone cannot tell a
     // genuine "exit powers off" from a panic AFTER the markers were printed (the root
@@ -329,7 +345,8 @@ pub(crate) fn run_system(runner: &RecipeCheckRunner) -> Result<(), String> {
         "PASS: system-x86-64 boots TWO-STAGE under qemu (TCG) — stage-1 mounts the td-written erofs root \
          read-only over virtio-blk, switch_root enters it, and the real-root init reaches the greeter \
          ({GREETER_MARKER}); `/` is a read-only erofs mount ({SYSTEM_ROOT_RO_MARKER}), the writable dirs \
-         are tmpfs-backed ({SYSTEM_WRITABLE_MARKER}), and `exit` powers the VM off cleanly"
+         are tmpfs-backed ({SYSTEM_WRITABLE_MARKER}), a uutils applet runs from the erofs closure \
+         ({UUTILS_RUNTIME_MARKER}), and `exit` powers the VM off cleanly"
     );
     Ok(())
 }

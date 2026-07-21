@@ -724,6 +724,12 @@ pub struct Recipe {
     /// consume these; the build JSON deliberately omits them because `sourceInput`
     /// is the staged input key the builder already understands.
     pub source_pins: Option<Vec<SourcePin>>,
+    /// Repo-relative path to the committed Cargo.lock that pins this rust recipe's
+    /// crate closure. Under `build-plan --auto` the builder verifies every vendored
+    /// `.crate` against this lock's checksums before admitting the closure — the
+    /// committed-checksum ingress that lets a rust node build in the graph without
+    /// reopening the #469 crate-provenance gate.
+    pub cargo_lock: Option<String>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -789,6 +795,7 @@ impl Recipe {
             features: None,
             checks: None,
             source_pins: None,
+            cargo_lock: None,
         }
     }
     pub fn gnu(name: &str, version: &str) -> Recipe {
@@ -890,6 +897,12 @@ impl Recipe {
         self.push_source_pin(pin);
         self
     }
+    /// Name the committed Cargo.lock (repo-relative) that pins this rust recipe's
+    /// crate closure for the `--auto` committed-checksum vendor gate.
+    pub fn cargo_lock(mut self, path: &str) -> Recipe {
+        self.cargo_lock = Some(path.into());
+        self
+    }
     pub fn source_pins(mut self, pins: Vec<SourcePin>) -> Recipe {
         for pin in pins {
             self.push_source_pin(pin);
@@ -978,6 +991,9 @@ impl Recipe {
         }
         if let Some(x) = &self.features {
             o.push(("features".into(), arr(x)));
+        }
+        if let Some(l) = &self.cargo_lock {
+            o.push(("cargoLock".into(), Json::Str(l.clone())));
         }
         Json::Obj(o)
     }

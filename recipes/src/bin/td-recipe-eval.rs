@@ -438,8 +438,9 @@ mod tests {
         // gcc-mesboot 4.9.4 and GCC 14.3.0) + the linux-x86-64 kernel source +
         // flex-2.6.4 + elfutils-0.192 (the modern-kernel host tools flex +
         // libelf, re #529) + CMake 3.31.12 + Rust 1.96.0 source and its exact
-        // three-component Rust 1.95.0 stage0 snapshot.
-        assert_eq!(pins.len(), 51);
+        // three-component Rust 1.95.0 stage0 snapshot + coreutils-0.9.0 (the
+        // uutils userland `.crate`, re #547).
+        assert_eq!(pins.len(), 52);
         assert!(pins.iter().any(|pin| pin.key == "stage0-source"));
         assert!(pins.iter().any(|pin| pin.key == "cmake-x86-64-source"));
         assert!(pins.iter().any(|pin| pin.key == "rust-source"));
@@ -448,6 +449,7 @@ mod tests {
         assert!(pins.iter().any(|pin| pin.key == "rust-stage0-cargo-source"));
         assert!(pins.iter().any(|pin| pin.key == "oyacc-source"));
         assert!(pins.iter().any(|pin| pin.key == "bash-mesboot-source"));
+        assert!(pins.iter().any(|pin| pin.key == "uutils-source"));
     }
 
     #[test]
@@ -473,16 +475,30 @@ mod tests {
         let uutils = catalog::lookup("uutils").unwrap();
         assert_eq!(uutils.no_default_features, Some(true));
         let features = uutils.features.as_deref().unwrap();
-        for expected in [
+        // Applets are selected individually, never via an aggregate: the aggregates
+        // (`unix`/`feat_Tier1`/the `feat_require_unix_*` groups) pull the checksum,
+        // factor, pager, and stdbuf crate subtrees we never ship. (The exact
+        // feature<->/bin farm equality is asserted in system-x86-64.rs.)
+        for expected in ["ls", "cat", "cp", "chmod", "id", "date", "mknod"] {
+            assert!(
+                features.iter().any(|feature| feature == expected),
+                "missing shipped applet feature '{expected}'"
+            );
+        }
+        for banned in [
+            "unix",
+            "stdbuf",
             "feat_Tier1",
+            "feat_common_core",
             "feat_require_unix_core",
             "feat_require_unix_hostid",
             "feat_require_unix_utmpx",
         ] {
-            assert!(features.iter().any(|feature| feature == expected));
+            assert!(
+                !features.iter().any(|feature| feature == banned),
+                "aggregate/unshipped feature '{banned}' must not be selected"
+            );
         }
-        assert!(!features.iter().any(|feature| feature == "unix"));
-        assert!(!features.iter().any(|feature| feature == "stdbuf"));
         let pins = uutils.source_pins.unwrap();
         assert_eq!(pins.len(), 1);
         let pin = pins.first().unwrap();

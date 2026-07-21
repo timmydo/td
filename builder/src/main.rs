@@ -3883,6 +3883,54 @@ fn substitute_gcc_toolchain(inputs: &mut [String], tc: &str) -> bool {
     swapped
 }
 
+// The nested `stage/td/store/<pkg>` prefix each `-self`/glibc recipe output carries.
+// These embed the same pinned versions the rust-toolchain check's GCC_STAGE/GLIBC_STAGE
+// consts do; the two must move together on a compiler/libc bump (re #547).
+const NATIVE_GCC_STAGE: &str = "stage/td/store/gcc-14.3.0-x86_64-self";
+const NATIVE_GLIBC_STAGE: &str = "stage/td/store/glibc-2.41-x86_64";
+
+/// The six native `/td/store` link strings a `rust` recipe bakes into its drv env
+/// (TD_RUST_STORE_*), derived from the declared native inputs.
+struct NativeRustLinkEnv {
+    interp: String,
+    rpath: String,
+    bdir: String,
+    cc: String,
+    cxx: String,
+    include: String,
+}
+
+/// Derive the native link env from a rust recipe's declared toolchain inputs, the
+/// build-plan `--auto` counterpart to the `td shell` path where the rust-toolchain
+/// check pre-sets TD_RUST_STORE_* in the environment. The three inputs' resolved
+/// store paths are the same `{TD_STORE_DIR}/{base}` values that check bakes into
+/// TD_SHELL_NATIVE_*, so the formulas here mirror `checks/rust_toolchain.rs` exactly
+/// — a `td shell` and an `--auto` build of the same recipe get identical link env.
+/// `None` when any of the three inputs is absent (a rust recipe that declares no
+/// native toolchain — not linkable this way).
+fn derive_native_rust_link_env(entries: &[lock::Entry]) -> Option<NativeRustLinkEnv> {
+    let find = |n: &str| {
+        entries
+            .iter()
+            .find(|e| e.name == n)
+            .map(|e| e.path.as_str())
+    };
+    let gcc_root = find("gcc-x86-64-self")?;
+    let binutils_root = find("binutils-x86-64-self")?;
+    let glibc_root = find("glibc-x86-64")?;
+    let gcc_path = format!("{gcc_root}/{NATIVE_GCC_STAGE}");
+    let binutils_path = format!("{binutils_root}/bin");
+    let glibc_path = format!("{glibc_root}/{NATIVE_GLIBC_STAGE}");
+    Some(NativeRustLinkEnv {
+        interp: format!("{glibc_path}/lib/ld-linux-x86-64.so.2"),
+        rpath: format!("{glibc_path}/lib"),
+        bdir: format!("{binutils_path}:{glibc_path}/lib"),
+        cc: format!("{gcc_path}/bin/gcc"),
+        cxx: format!("{gcc_path}/bin/g++"),
+        include: format!("{glibc_path}/include"),
+    })
+}
+
 /// Shared by `build-recipe` (which then realizes it daemon-free) and `assemble-recipe`
 /// (assemble-only, so a SEPARATE process — the build daemon — realizes the td-assembled
 /// drv). Splitting assembly from realization is what lets td's own daemon, not a `guix
@@ -4129,22 +4177,29 @@ fn assemble_recipe_drv(
                 spec.push_str(&format!("env TD_VENDOR_DIR={vd}\n"));
             }
             // Native /td/store toolchain link mode (#258): the sandbox clears the env, so run_rust
-            // only sees the drv's `env` lines — forward the caller's TD_RUST_STORE_* into the drv
-            // (mirroring the TD_GCC_TOOLCHAIN input override above). When TD_RUST_STORE_INTERP is set
-            // the ripgrep cutover is linking against the native /td/store gcc (a PLAIN gcc, no
-            // ld-wrapper): run_rust bakes the interp/RUNPATH/-B explicitly so the built `rg` resolves
-            // its libc/libgcc_s from /td/store at run time. The values are the /td/store glibc paths,
-            // fixed for the run, so the drv (and its double-build `check`) stay deterministic. Unset
-            // ⇒ no env lines emitted ⇒ the guix ld-wrapper path, unchanged.
-            for k in [
-                "TD_RUST_STORE_INTERP",
-                "TD_RUST_STORE_RPATH",
-                "TD_RUST_STORE_BDIR",
-                "TD_RUST_STORE_CC",
-                "TD_RUST_STORE_CXX",
-                "TD_RUST_STORE_INCLUDE",
+            // only sees the drv's `env` lines — bake the six TD_RUST_STORE_* into the drv (mirroring
+            // the TD_GCC_TOOLCHAIN input override above). When they are set the build links against the
+            // native /td/store gcc (a PLAIN gcc, no ld-wrapper): run_rust bakes the interp/RUNPATH/-B
+            // explicitly so the built binary resolves its libc/libgcc_s from /td/store at run time. The
+            // values are fixed /td/store paths, so the drv (and its double-build `check`) stay
+            // deterministic. Two sources, env-first: `td shell` pre-sets them in the environment
+            // (provision_rust_inputs); `build-plan --auto` clears the env, so DERIVE the identical
+            // values from the recipe's declared native inputs (re #547). Neither ⇒ no env lines ⇒ the
+            // legacy ld-wrapper path, unchanged.
+            let derived = derive_native_rust_link_env(&entries);
+            for (k, d) in [
+                ("TD_RUST_STORE_INTERP", derived.as_ref().map(|d| &d.interp)),
+                ("TD_RUST_STORE_RPATH", derived.as_ref().map(|d| &d.rpath)),
+                ("TD_RUST_STORE_BDIR", derived.as_ref().map(|d| &d.bdir)),
+                ("TD_RUST_STORE_CC", derived.as_ref().map(|d| &d.cc)),
+                ("TD_RUST_STORE_CXX", derived.as_ref().map(|d| &d.cxx)),
+                ("TD_RUST_STORE_INCLUDE", derived.as_ref().map(|d| &d.include)),
             ] {
-                if let Ok(v) = std::env::var(k) {
+                let v = match std::env::var(k) {
+                    Ok(v) if !v.is_empty() => Some(v),
+                    _ => d.cloned(),
+                };
+                if let Some(v) = v {
                     if !v.is_empty() {
                         spec.push_str(&format!("env {k}={v}\n"));
                     }
@@ -4210,6 +4265,286 @@ fn persist_store_env() -> Result<Option<(String, String)>, String> {
         (None, None) => Ok(None),
         _ => Err("TD_PERSIST_STORE/TD_PERSIST_DB must be set together".into()),
     }
+}
+
+/// A recipe's committed `cargoLock` path must be repo-relative — no absolute prefix,
+/// no `..` component, and (once joined and canonicalized) landing INSIDE the repo root
+/// so an in-repo symlink cannot redirect it either. The path names a reviewed in-repo
+/// lock; confine it so a recipe cannot aim the gate at an arbitrary host file
+/// (re #469/#547).
+fn confine_repo_relative(root: &Path, rel: &str) -> Result<PathBuf, String> {
+    let relp = Path::new(rel);
+    if relp.is_absolute() {
+        return Err(format!("cargoLock `{rel}' must be repo-relative, not absolute"));
+    }
+    if relp
+        .components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return Err(format!("cargoLock `{rel}' must not escape the repo with `..'"));
+    }
+    let joined = root.join(relp);
+    let canon_root = root
+        .canonicalize()
+        .map_err(|e| format!("canonicalize repo root {}: {e}", root.display()))?;
+    let canon = joined
+        .canonicalize()
+        .map_err(|e| format!("canonicalize cargoLock {}: {e}", joined.display()))?;
+    if !canon.starts_with(&canon_root) {
+        return Err(format!(
+            "cargoLock `{rel}' resolves to {} outside the repo root {}",
+            canon.display(),
+            canon_root.display()
+        ));
+    }
+    // Return the symlink-resolved path so the caller reads the validated node — not the
+    // pre-canonicalize `joined`, which a swapped symlink could redirect after the check.
+    Ok(canon)
+}
+
+/// `remove_dir_all` that tolerates an absent dir but propagates every other error: a
+/// tree that MUST start empty for a security guarantee (the interned vendor staging)
+/// cannot silently inherit leftovers from a clean that quietly failed.
+fn clear_dir(dir: &Path) -> Result<(), String> {
+    match std::fs::remove_dir_all(dir) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(format!("clear {}: {e}", dir.display())),
+    }
+}
+
+/// Stage the crates a recipe's COMMITTED Cargo.lock pins into a FRESH private tree,
+/// verifying as we go: every lock entry must be present in `vendor_dir` as
+/// `<name>-<version>.crate` with a matching sha256, the dir must carry NO extra
+/// `.crate` beyond that pinned set, and only the verified bytes are copied into
+/// `staged_dir`. Interning `staged_dir` (never the shared cache dir) means a stale or
+/// tampered `.td-build-cache` can neither drop, swap, smuggle, NOR win a
+/// verify-to-intern race for a crate the gate did not vouch for (re #469/#547).
+/// Returns the verified crate count.
+fn stage_verified_vendor(
+    vendor_dir: &Path,
+    lock_text: &str,
+    staged_dir: &Path,
+) -> Result<usize, String> {
+    let want = check_loop::parse_lock_checksums(lock_text);
+    if want.is_empty() {
+        return Err("committed Cargo.lock pins no checksummed crates".to_string());
+    }
+    if !vendor_dir.is_dir() {
+        return Err(format!(
+            "vendored crate dir {} absent — `td-builder check' warms the crate closure before the graph build",
+            vendor_dir.display()
+        ));
+    }
+    let mut expected: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for (crate_name, ver, _sum) in &want {
+        let fname = format!("{crate_name}-{ver}.crate");
+        // The name/version come from the lock text; a `..`/separator in either would let
+        // `<dir>.join(fname)` below escape the vendor/staged trees. Admit only a plain
+        // filename (its own `file_name`), never a path with directory components.
+        if Path::new(&fname).file_name() != Some(std::ffi::OsStr::new(fname.as_str())) {
+            return Err(format!(
+                "committed-lock crate `{crate_name}-{ver}' is not a plain filename — refusing a path-bearing crate identity"
+            ));
+        }
+        expected.insert(fname);
+    }
+    // Reject extras up front: a `.crate` the committed lock never pinned is a stale or
+    // tampered cache and must fail loudly rather than be silently left behind.
+    for entry in std::fs::read_dir(vendor_dir)
+        .map_err(|e| format!("read vendor dir {}: {e}", vendor_dir.display()))?
+    {
+        let entry = entry.map_err(|e| format!("read vendor dir {}: {e}", vendor_dir.display()))?;
+        let file_name = entry.file_name();
+        let fname = file_name.to_string_lossy();
+        if fname.ends_with(".crate") && !expected.contains(fname.as_ref()) {
+            return Err(format!(
+                "vendored crate `{fname}' is not pinned by the committed Cargo.lock — the vendor dir carries a crate the gate did not verify"
+            ));
+        }
+    }
+    // Fail-closed clean: the staged tree is interned wholesale, so it must start empty —
+    // a silently-ignored clean failure could leave an unverified leftover to be interned.
+    clear_dir(staged_dir)?;
+    std::fs::create_dir_all(staged_dir)
+        .map_err(|e| format!("create staged vendor dir {}: {e}", staged_dir.display()))?;
+    for (crate_name, ver, sum) in &want {
+        let fname = format!("{crate_name}-{ver}.crate");
+        let src = vendor_dir.join(&fname);
+        let dest = staged_dir.join(&fname);
+        // Copy first, then hash the STAGED copy — the exact bytes that get interned — so
+        // a concurrent rewrite of the cache file between hash and copy cannot slip
+        // unverified bytes past the gate (verify what you use, not what you read).
+        std::fs::copy(&src, &dest)
+            .map_err(|e| format!("stage vendored crate {}: {e}", src.display()))?;
+        let got = crate::sha256::sha256_file(&dest)
+            .map_err(|e| format!("read staged crate {}: {e}", dest.display()))?;
+        if &got != sum {
+            return Err(format!(
+                "vendored crate {crate_name}-{ver} sha256 {got} != committed-lock {sum}"
+            ));
+        }
+    }
+    Ok(want.len())
+}
+
+/// A committed `Cargo.lock` must be fully checksum-pinned before it is trusted as the
+/// closure record: reject any package with a `git+` source (git deps are unsupported)
+/// or a registry source lacking a valid sha256 checksum. Workspace/path members (no
+/// `source`) legitimately carry no checksum. stage_verified_vendor gates only the
+/// CHECKSUMMED set, so without this a git or unchecksummed dependency would be silently
+/// omitted while the gate reported success (re #547).
+fn reject_unpinned_dependencies(lock_text: &str) -> Result<(), String> {
+    let (mut name, mut source, mut checksum) = (String::new(), None, None);
+    let mut in_pkg = false;
+    for line in lock_text.lines() {
+        let t = line.trim();
+        if t == "[[package]]" {
+            if in_pkg {
+                check_pkg_pinned(&name, &source, &checksum)?;
+            }
+            in_pkg = true;
+            name.clear();
+            source = None;
+            checksum = None;
+        } else if t.starts_with('[') {
+            // any other table (e.g. a trailing [metadata]) ends the package section
+            if in_pkg {
+                check_pkg_pinned(&name, &source, &checksum)?;
+                in_pkg = false;
+            }
+        } else if in_pkg {
+            // Split on the first `=` and trim both sides so non-canonical spacing
+            // (e.g. `source="git+…"`) cannot hide a field from the pin check.
+            if let Some((k, v)) = t.split_once('=') {
+                let val = v.trim().trim_matches('"').to_string();
+                match k.trim() {
+                    "name" => name = val,
+                    "source" => source = Some(val),
+                    "checksum" => checksum = Some(val),
+                    _ => {}
+                }
+            }
+        }
+    }
+    if in_pkg {
+        check_pkg_pinned(&name, &source, &checksum)?;
+    }
+    Ok(())
+}
+
+fn is_sha256_hex(s: &str) -> bool {
+    s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+fn check_pkg_pinned(
+    name: &str,
+    source: &Option<String>,
+    checksum: &Option<String>,
+) -> Result<(), String> {
+    let Some(src) = source else {
+        return Ok(()); // no source ⇒ workspace/path member ⇒ no checksum expected
+    };
+    if src.starts_with("git+") {
+        return Err(format!(
+            "committed lock package `{name}' is a git dependency (`{src}') — git deps are unsupported"
+        ));
+    }
+    match checksum {
+        Some(c) if is_sha256_hex(c) => Ok(()),
+        _ => Err(format!(
+            "committed lock package `{name}' has registry source `{src}' but no valid sha256 checksum"
+        )),
+    }
+}
+
+/// build-plan `--auto` crate vendoring: a `rust` recipe's dependency closure rides the
+/// same typed content-addressed vendor channel `td shell` uses (interned tree ->
+/// TD_VENDOR_DIR), NOT a lock-line ingress — so the #469 crate-class reject in
+/// `build_plan` stays intact. The crates are the ones `td-feed warm crate` fetched into
+/// `.td-build-cache/crate-vendor/<name>/vendor`; they are staged into a private tree and
+/// verified against the recipe's committed, fully-checksum-pinned `Cargo.lock` here
+/// (set-equality: every pinned crate present with a matching sha256 and no extra), then
+/// that tree is interned. The build itself is anchored to the AUTHENTICATED source: cargo
+/// `--frozen` unpacks the content-addressed sourceInput and enforces its embedded
+/// Cargo.lock against each vendored crate's checksum. The warm vendor set is fetched by
+/// the committed lock's checksums, and cargo `--frozen` then enforces equality with the
+/// source's embedded lock — so the closure is authenticated downstream, without trusting
+/// the mutable warm cache. (Byte-anchoring the committed lock to
+/// the in-sandbox unpacked source lock — staged into the derivation and compared in
+/// run_rust before cargo — is the stronger follow-up form; reading the mutable
+/// `.td-build-cache` src lock here would only give false assurance.) Returns the
+/// `(canonical, store_dir, db)` triple `build_recipe` wants, or `None` for a non-rust
+/// recipe or a rust recipe with no `cargoLock`. A declared `cargoLock` makes the
+/// `TD_AUTO_REPO_ROOT` anchor MANDATORY: a plan that cannot resolve and gate the
+/// committed closure fails closed rather than building the node ungated.
+fn provision_auto_vendor(
+    alist: &json::Json,
+    name: &str,
+    step_scratch: &Path,
+) -> Result<Option<(String, String, String)>, String> {
+    if alist.get("buildSystem").and_then(json::Json::as_str) != Some("rust") {
+        return Ok(None);
+    }
+    let Some(lock_rel) = alist.get("cargoLock").and_then(json::Json::as_str) else {
+        return Ok(None);
+    };
+    // The recipe name is interpolated into the cache path and the store-add label below;
+    // admit only a plain single component so it cannot traverse out of the cache tree.
+    if Path::new(name).file_name() != Some(std::ffi::OsStr::new(name)) {
+        return Err(format!(
+            "--auto rust `{name}': recipe name is not a plain path component"
+        ));
+    }
+    let repo_root = match std::env::var("TD_AUTO_REPO_ROOT") {
+        Ok(v) if !v.is_empty() => v,
+        _ => {
+            return Err(format!(
+                "--auto rust `{name}': declares cargoLock `{lock_rel}' but TD_AUTO_REPO_ROOT is unset — cannot resolve or gate the committed crate closure"
+            ))
+        }
+    };
+    let root = Path::new(&repo_root);
+    let committed =
+        confine_repo_relative(root, lock_rel).map_err(|e| format!("--auto rust `{name}': {e}"))?;
+    let lock_text = std::fs::read_to_string(&committed).map_err(|e| {
+        format!("--auto rust `{name}': read committed lock {}: {e}", committed.display())
+    })?;
+    // Trust the committed lock as the closure record only if it is fully checksum-pinned —
+    // no git/unchecksummed deps that the set-equality gate below would silently skip.
+    reject_unpinned_dependencies(&lock_text).map_err(|e| format!("--auto rust `{name}': {e}"))?;
+    let vendor_dir = root.join(format!(".td-build-cache/crate-vendor/{name}/vendor"));
+    let staged = step_scratch.join("vendor-verified");
+    let n = stage_verified_vendor(&vendor_dir, &lock_text, &staged)
+        .map_err(|e| format!("--auto rust `{name}': {e}"))?;
+    let self_exe = std::env::current_exe()
+        .map_err(|e| format!("--auto rust `{name}': locate td-builder: {e}"))?
+        .to_string_lossy()
+        .into_owned();
+    let vendor_store = step_scratch.join("vendorstore");
+    let vendor_db = step_scratch.join("vendor.db");
+    clear_dir(&vendor_store)?;
+    match std::fs::remove_file(&vendor_db) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(format!("clear {}: {e}", vendor_db.display())),
+    }
+    let vendor_canonical = run_store_add(
+        &self_exe,
+        &format!("{name}-vendor"),
+        &staged,
+        &vendor_store,
+        &vendor_db,
+    )?;
+    eprintln!(
+        "td-builder: build-plan step `{name}': interned {n} committed-lock-verified crate(s) from {} -> {vendor_canonical}",
+        vendor_dir.display()
+    );
+    Ok(Some((
+        vendor_canonical,
+        vendor_store.to_string_lossy().into_owned(),
+        vendor_db.to_string_lossy().into_owned(),
+    )))
 }
 
 /// build-plan: realize a TOPO-ordered chain of recipes where a downstream step
@@ -4353,6 +4688,15 @@ fn build_plan(
             eprintln!("td-builder: build-plan step `{name}': substituted td outputs -> {}", substituted.join(" "));
         }
 
+        // A `rust` step's crate closure is interned from its committed-lock-verified warm
+        // vendor tree and handed to build_recipe as the typed vendor tree (TD_VENDOR_DIR) —
+        // NOT a lock line, so the crate-class reject above stays intact (re #469/#547).
+        // None for every other step ⇒ the vendor channel is unchanged for the gnu corpus.
+        let vendor_owned = provision_auto_vendor(&alist, name, &step_scratch)?;
+        let vendor_arg = vendor_owned
+            .as_ref()
+            .map(|(c, s, d)| (c.as_str(), s.as_str(), d.as_str()));
+
         // Closure content-scans guix's seed store (seeds) + reads every prior step's td.db
         // (td deps, whose bytes live in the shared td-store, outside the seed dir).
         let seed_dirs = [guix_store.to_string()];
@@ -4364,7 +4708,7 @@ fn build_plan(
             store::STORE_DIR, // the guix seed store's canonical home
             &td_dbs,
             None,            // src_store: build-plan locks carry resolved paths
-            None,            // vendor_store: build-plan deps are not vendored-crate trees
+            vendor_arg,      // vendor_store: a rust step's committed-lock-verified crate tree, else None
             builder_store,   // builder_store: the td-placed stage0 (TD_BUILDER_*), or None → self
             Some(&tdstore),  // td_store: stage td-built deps from the shared td-store
             persist,         // persist: reuse-or-commit each rung across runs (re #469), or None → clean-room in-run store
@@ -12110,6 +12454,135 @@ daemon build START (2/2 active)
         assert!(env_of(&drv0, "TD_RUST_STORE_CXX").is_none(), "no cxx by default");
         assert!(env_of(&drv0, "TD_RUST_STORE_INCLUDE").is_none(), "no include by default");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // build-plan --auto derives TD_RUST_STORE_* from the declared native inputs (the env
+    // is cleared in the graph build). The derived strings must equal the rust-toolchain
+    // check's TD_SHELL_NATIVE_* formulas so a `td shell` and an `--auto` build of the same
+    // recipe link identically (re #547).
+    #[test]
+    fn derive_native_rust_link_env_mirrors_the_check_formulas() {
+        let mk = |name: &str, path: &str| lock::Entry {
+            name: name.to_string(),
+            path: path.to_string(),
+            class: lock::Class::Seed,
+        };
+        let gcc = "/td/store/gggggggggggggggggggggggggggggggg-gcc-x86-64-self";
+        let binutils = "/td/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-binutils-x86-64-self";
+        let glibc = "/td/store/llllllllllllllllllllllllllllllll-glibc-x86-64";
+        let entries = vec![
+            mk("uutils-source", "/td/store/ssssssssssssssssssssssssssssssss-uutils-source"),
+            mk("rust-toolchain", "/td/store/rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr-rust-toolchain"),
+            mk("gcc-x86-64-self", gcc),
+            mk("binutils-x86-64-self", binutils),
+            mk("glibc-x86-64", glibc),
+            mk("busybox-x86-64", "/td/store/xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx-busybox-x86-64"),
+        ];
+        let d = derive_native_rust_link_env(&entries).expect("all three inputs present");
+        let gp = format!("{glibc}/{NATIVE_GLIBC_STAGE}");
+        let gccp = format!("{gcc}/{NATIVE_GCC_STAGE}");
+        assert_eq!(d.interp, format!("{gp}/lib/ld-linux-x86-64.so.2"));
+        assert_eq!(d.rpath, format!("{gp}/lib"));
+        assert_eq!(d.bdir, format!("{binutils}/bin:{gp}/lib"));
+        assert_eq!(d.cc, format!("{gccp}/bin/gcc"));
+        assert_eq!(d.cxx, format!("{gccp}/bin/g++"));
+        assert_eq!(d.include, format!("{gp}/include"));
+
+        // A rust recipe that names no native toolchain is not linkable this way.
+        assert!(derive_native_rust_link_env(&[mk("uutils-source", "/x")]).is_none());
+        // Missing any ONE of the three ⇒ None (binutils absent here).
+        assert!(derive_native_rust_link_env(&[
+            mk("gcc-x86-64-self", gcc),
+            mk("glibc-x86-64", glibc),
+        ])
+        .is_none());
+    }
+
+    // The --auto crate gate: every checksummed committed-lock entry must be present in the
+    // warm vendor dir as `<name>-<ver>.crate` with a matching sha256; the root (no checksum)
+    // is ignored, a tampered/missing crate fails closed (re #547).
+    #[test]
+    fn stage_verified_vendor_gates_on_the_committed_checksums() {
+        let dir = std::env::temp_dir().join(format!("td-vendorverify-{}", std::process::id()));
+        let staged =
+            std::env::temp_dir().join(format!("td-vendorstaged-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let write_crate = |nv: &str, bytes: &[u8]| {
+            let p = dir.join(format!("{nv}.crate"));
+            std::fs::write(&p, bytes).unwrap();
+            crate::sha256::sha256_file(&p).unwrap()
+        };
+        let foo = write_crate("foo-1.2.3", b"foo crate bytes");
+        let bar = write_crate("bar-0.1.0", b"bar crate bytes");
+        let lock = format!(
+            "version = 4\n\n\
+             [[package]]\nname = \"theroot\"\nversion = \"0.9.0\"\n\n\
+             [[package]]\nname = \"foo\"\nversion = \"1.2.3\"\nchecksum = \"{foo}\"\n\n\
+             [[package]]\nname = \"bar\"\nversion = \"0.1.0\"\nchecksum = \"{bar}\"\n"
+        );
+        // All present + matching (root without a checksum is excluded ⇒ 2 verified), and
+        // exactly the verified crates land in the fresh private staged tree.
+        assert_eq!(stage_verified_vendor(&dir, &lock, &staged).unwrap(), 2);
+        assert!(staged.join("foo-1.2.3.crate").is_file());
+        assert!(staged.join("bar-0.1.0.crate").is_file());
+        // A committed crate absent from the vendor dir fails closed.
+        let missing = format!("{lock}\n[[package]]\nname = \"baz\"\nversion = \"2.0.0\"\nchecksum = \"{foo}\"\n");
+        assert!(stage_verified_vendor(&dir, &missing, &staged).is_err());
+        // A checksum mismatch on a PINNED crate (bar re-pinned to foo's sha) fails closed
+        // at the per-crate hash. Pin the full dir set (foo+bar) so set-equality passes and
+        // this isolates the checksum-mismatch branch rather than the reject-extras scan.
+        let tampered = format!(
+            "version = 4\n\n\
+             [[package]]\nname = \"foo\"\nversion = \"1.2.3\"\nchecksum = \"{foo}\"\n\n\
+             [[package]]\nname = \"bar\"\nversion = \"0.1.0\"\nchecksum = \"{foo}\"\n"
+        );
+        assert!(stage_verified_vendor(&dir, &tampered, &staged).is_err());
+        // A lock pinning no checksummed crates is rejected (nothing to gate).
+        assert!(stage_verified_vendor(&dir, "version = 4\n", &staged).is_err());
+        // A smuggled `.crate` the lock does NOT pin fails closed (set equality, not subset).
+        write_crate("evil-9.9.9", b"smuggled newer version");
+        assert!(stage_verified_vendor(&dir, &lock, &staged).is_err());
+        // A committed lock whose crate name carries a path component is rejected before
+        // any filesystem join (no `<dir>.join(fname)` escape from the staged/vendor trees).
+        let traversal = format!(
+            "version = 4\n\n[[package]]\nname = \"../../../../tmp/pwn\"\nversion = \"1.0.0\"\nchecksum = \"{foo}\"\n"
+        );
+        assert!(stage_verified_vendor(&dir, &traversal, &staged).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&staged);
+    }
+
+    #[test]
+    fn reject_unpinned_dependencies_rejects_git_and_unchecksummed() {
+        let hex = "a".repeat(64);
+        // A workspace root (no source) plus a checksummed registry dep: accepted.
+        let clean = format!(
+            "version = 4\n\n\
+             [[package]]\nname = \"theroot\"\nversion = \"0.9.0\"\n\n\
+             [[package]]\nname = \"foo\"\nversion = \"1.0.0\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"{hex}\"\n"
+        );
+        assert!(reject_unpinned_dependencies(&clean).is_ok());
+        // A git dependency is rejected (git deps are unsupported).
+        let git = "version = 4\n\n[[package]]\nname = \"bar\"\nversion = \"0.1.0\"\nsource = \"git+https://example.com/bar#deadbeef\"\n";
+        assert!(reject_unpinned_dependencies(git).is_err());
+        // A registry dependency with no checksum is rejected.
+        let no_sum = "version = 4\n\n[[package]]\nname = \"baz\"\nversion = \"2.0.0\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\n";
+        assert!(reject_unpinned_dependencies(no_sum).is_err());
+        // A registry dependency whose checksum is not 64 hex chars is rejected.
+        let bad_sum = "version = 4\n\n[[package]]\nname = \"qux\"\nversion = \"3.0.0\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"nothex\"\n";
+        assert!(reject_unpinned_dependencies(bad_sum).is_err());
+        // Non-canonical spacing around `=` must not hide a git source from the check.
+        let tight_git = "version = 4\n\n[[package]]\nname=\"bar\"\nversion=\"0.1.0\"\nsource=\"git+https://example.com/bar#deadbeef\"\n";
+        assert!(reject_unpinned_dependencies(tight_git).is_err());
+        // The actual committed uutils lock (verbatim upstream) must pass the gate.
+        let real = concat!(env!("CARGO_MANIFEST_DIR"), "/../recipes/locks/uutils/Cargo.lock");
+        if let Ok(text) = std::fs::read_to_string(real) {
+            assert!(
+                reject_unpinned_dependencies(&text).is_ok(),
+                "the committed uutils Cargo.lock must be fully checksum-pinned"
+            );
+        }
     }
 
     // #429 code-review fix: a mesboot recipe with NO declared `sourceInput` (make-test —

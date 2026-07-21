@@ -458,6 +458,16 @@ const PINS: &[PinDef] = &[
         file: "tcc-0.9.27.tar.bz2",
     },
     PinDef {
+        key: "uutils-source",
+        aliases: &[],
+        // uutils coreutils 0.9.0 — the read-only-root Rust core userland (#547).
+        // The `--auto` source_input pin; the dependency closure is pinned
+        // separately by the committed recipes/locks/uutils/Cargo.lock.
+        url: "https://static.crates.io/crates/coreutils/coreutils-0.9.0.crate",
+        sha256: "b92df9b821533650f3797aadae46e547f72db281c1f8a27f381f36d54284d34b",
+        file: "coreutils-0.9.0.crate",
+    },
+    PinDef {
         key: "zlib-x86-64-source",
         aliases: &[],
         url: "https://github.com/madler/zlib/releases/download/v1.3.1/zlib-1.3.1.tar.gz",
@@ -501,8 +511,9 @@ mod tests {
         // the linux-x86-64 kernel source (separate from the 4.14 UAPI-header
         // pin, re #529) + flex-2.6.4 and elfutils-0.192 (the modern-kernel host
         // tools flex + libelf, re #529) + CMake 3.31.12 + Rust 1.96.0 source and
-        // its exact three-component Rust 1.95.0 bootstrap snapshot.
-        assert_eq!(all().len(), 51);
+        // its exact three-component Rust 1.95.0 bootstrap snapshot +
+        // coreutils-0.9.0 (the uutils userland `.crate`, re #547).
+        assert_eq!(all().len(), 52);
     }
 
     #[test]

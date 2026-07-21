@@ -991,6 +991,7 @@ impl RecipeCheckRunner {
         let recipes = path_str(&self.recipes)?;
         let auto_map_s = path_str(&auto_map)?;
         let scratch = path_str(&self.scratch)?;
+        let root_s = path_str(&self.root)?;
         let mut cmd = Command::new(&self.tb);
         cmd.current_dir(&self.root)
             .env_clear()
@@ -999,7 +1000,11 @@ impl RecipeCheckRunner {
             .env("TD_STORE_DIR", TD_STORE_DIR)
             .env("TD_BUILDER_PATH", &self.builder_path)
             .env("TD_BUILDER_STORE", builder_store)
-            .env("TD_BUILDER_DB", builder_db);
+            .env("TD_BUILDER_DB", builder_db)
+            // Repo anchor for `--auto` rust-step crate vendoring: build_plan resolves a
+            // rust recipe's committed Cargo.lock and its warm `.td-build-cache/crate-vendor`
+            // tree under this root (re #547). Absent ⇒ no committed-lock vendoring.
+            .env("TD_AUTO_REPO_ROOT", root_s);
         // The derived blessed-seed-db lookup keys on the REAL daemon dir; the
         // ladder HOME override above would otherwise re-point it at a dir
         // where nothing was blessed (re #469 round-8).

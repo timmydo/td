@@ -139,6 +139,15 @@ pub const SYSTEM_WRITABLE_MARKER: &str = "TD-WRITABLE-OK";
 /// greeter" success line.
 pub const GREETER_MARKER: &str = "TD-GREETER-OK";
 
+/// Printed by `/etc/profile` on the headless self-test path ONLY after a uutils applet,
+/// invoked by ABSOLUTE `/bin` path, exits 0 — i.e. the dynamically-linked coreutils
+/// multicall's runtime closure (ELF interp, glibc, libgcc_s) actually resolves on the
+/// erofs root. `shape_check` proves that closure STATICALLY; this proves it RAN. A missing
+/// loader or DT_NEEDED soname the static scan cannot see makes the applet fail, so the
+/// marker is absent and the `qemu-boot-system` oracle reds instead of false-passing on the
+/// greeter line (which the shell builtin `echo` prints regardless of uutils health, #547).
+pub const UUTILS_RUNTIME_MARKER: &str = "TD-UUTILS-RUN-OK";
+
 /// Kernel-cmdline token the headless `qemu-boot-system` oracle appends so the greeter
 /// SELF-TESTS: `/etc/profile`, on seeing it in `/proc/cmdline`, prints `GREETER_MARKER`
 /// then `exit`s the login shell, which (via `tty-session`'s `reboot -f`) powers the VM

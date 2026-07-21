@@ -1,6 +1,6 @@
 use crate::ladder::{
     mesboot0_inputs, mesboot0_path, AUTOTEST_CMDLINE_TOKEN, GREETER_MARKER, SH,
-    SYSTEM_ROOT_RO_MARKER, SYSTEM_WRITABLE_MARKER,
+    SYSTEM_ROOT_RO_MARKER, SYSTEM_WRITABLE_MARKER, UUTILS_RUNTIME_MARKER,
 };
 use crate::types::{Recipe, Step};
 
@@ -118,9 +118,17 @@ const SYSTEM: SystemDef = SystemDef {
 };
 // ────────────────────────────────────────────────────────────────────────────────
 
-/// Busybox applets symlinked into `/bin` (busybox dispatches on argv[0]). This is a
-/// curated, tailorable subset — busybox `defconfig` ships far more, each reachable
-/// as `busybox <applet>`; add a name here to give it a bare command in `PATH`.
+/// The real-root `/bin` is a symlink farm split across TWO multicall binaries, each
+/// dispatching on argv[0]'s basename: the static **busybox** (the shell, boot/login/init
+/// glue, and the non-coreutils tools) and the dynamically-linked Rust **uutils**
+/// `coreutils` (the core file/text userland — #547's cutover). A name goes in exactly one
+/// list; `shape_check` asserts the owning binary actually provides it.
+///
+/// BUSYBOX keeps everything the boot path needs and everything uutils does not provide.
+/// The sysinit/greeter/login scripts invoke their applets as `/bin/busybox <applet>` (or
+/// the busybox-served `/bin/mount`, `/bin/hostname -F`, `/bin/reboot`, `/bin/getty`,
+/// `/bin/login`, `/bin/sh`), so the cutover never touches the boot-critical path — it only
+/// changes what an interactive user's `PATH=/bin` resolves to.
 ///
 /// `switch_root` is the stage-1 pivot applet: the init-initramfs execs
 /// `/bin/busybox switch_root` to enter the erofs root. Listing it here both packs a
@@ -128,17 +136,30 @@ const SYSTEM: SystemDef = SystemDef {
 /// busybox actually implements it (a `CONFIG_SWITCH_ROOT` drift would red the build
 /// rather than strand the two-stage boot).
 ///
-/// `find`/`xargs` are intentionally NOT bare symlinks: the ladder's findutils
-/// dead-axis lock (`no_bootstrap_step_invokes_host_find_or_xargs`) forbids those
-/// tokens in any step text, and it can't tell a cpio member NAME from a host
-/// invocation. They stay reachable as `busybox find` / `busybox xargs`.
-const APPLETS: &[&str] = &[
+/// `hostname` stays busybox: the inittab runs `/bin/hostname -F /etc/hostname` and uutils'
+/// hostname has no `-F`. `find`/`xargs` are intentionally NOT bare symlinks either: the
+/// ladder's findutils dead-axis lock (`no_bootstrap_step_invokes_host_find_or_xargs`)
+/// forbids those tokens in any step text and can't tell a cpio member NAME from a host
+/// invocation; they stay reachable as `busybox find` / `busybox xargs`.
+const BUSYBOX_APPLETS: &[&str] = &[
     "sh", "ash", "getty", "login", "init", "mount", "umount", "switch_root", "reboot",
-    "poweroff", "halt", "hostname", "uname", "ls", "cat", "echo", "printf", "pwd", "cp",
-    "mv", "rm", "mkdir", "rmdir", "ln", "ps", "id", "env", "clear", "dmesg", "free", "df",
-    "du", "chmod", "chown", "sleep", "sync", "kill", "vi", "less", "more", "grep",
-    "sed", "awk", "wc", "head", "tail", "sort", "date", "whoami", "tty",
-    "dd", "mktemp", "seq", "touch", "mknod", "cttyhack", "su", "which",
+    "poweroff", "halt", "hostname", "ps", "clear", "dmesg", "free", "kill", "vi",
+    "less", "more", "grep", "sed", "awk", "cttyhack", "su", "which",
+];
+
+/// The core file/text userland, served by the uutils `coreutils` multicall (#547). Every
+/// name must be a coreutils utility the built binary implements. The recipe sandbox cannot
+/// exec the dynamically-linked binary to run `coreutils --list` at build time (its interp
+/// resolves an absolute `/td/store` path that only exists on the assembled root, not in the
+/// build tree), so `shape_check` instead statically proves the multicall AND its full
+/// runtime closure are staged on the root: a missing applet surfaces on the boot oracle, a
+/// missing library reds the build. uutils is dynamically linked, so — unlike static
+/// busybox — it drags a runtime closure (glibc, libgcc_s) that `real_root_steps` packs onto
+/// the erofs root.
+const UUTILS_APPLETS: &[&str] = &[
+    "uname", "ls", "cat", "echo", "printf", "pwd", "cp", "mv", "rm", "mkdir", "rmdir",
+    "ln", "id", "env", "df", "du", "chmod", "chown", "sleep", "sync", "wc", "head",
+    "tail", "sort", "date", "whoami", "tty", "dd", "mktemp", "seq", "touch", "mknod",
 ];
 
 fn build_passwd(sys: &SystemDef) -> String {
@@ -331,13 +352,20 @@ fn build_profile(sys: &SystemDef) -> String {
     // line the qemu-boot-system oracle keys on.
     s.push_str(&format!("echo {GREETER_MARKER}\n"));
     // Headless self-test: when the oracle appends the autotest token to the kernel
-    // cmdline, the greeter exits immediately so `tty-session`'s `reboot -f` powers the VM
+    // cmdline, the greeter (a) RUNS a uutils applet by absolute `/bin` path and, only if it
+    // exits 0, prints UUTILS_RUNTIME_MARKER — a live proof that the dynamically-linked
+    // coreutils multicall's runtime closure resolves on the erofs root (the greeter line
+    // above is a shell builtin `echo`, so it says nothing about uutils health; the MOTD
+    // `cat` ignores failure). Then (b) `exit`s so `tty-session`'s `reboot -f` powers the VM
     // off — proving "exit powers off" from a clean qemu exit 0 with no terminal to type
-    // into. Interactively (no token), the greeter is a normal shell.
+    // into. `/bin/cat` (a uutils applet) on `/etc/os-release` (guaranteed staged) exercises
+    // exec → loader → glibc; a broken closure fails the `&&`, drops the marker, and reds the
+    // oracle. Interactively (no token) none of this runs — the greeter is a normal shell.
     // `-F`: the token is a FIXED string (`td.autotest=1`), so match it literally — the `.`
     // must not act as a regex wildcard (re #550, Agy review).
     s.push_str(&format!(
-        "if /bin/busybox grep -q -F '{AUTOTEST_CMDLINE_TOKEN}' /proc/cmdline 2>/dev/null; then exit; fi\n"
+        "if /bin/busybox grep -q -F '{AUTOTEST_CMDLINE_TOKEN}' /proc/cmdline 2>/dev/null; then \
+         /bin/cat /etc/os-release >/dev/null 2>&1 && echo {UUTILS_RUNTIME_MARKER}; exit; fi\n"
     ));
     s
 }
@@ -432,15 +460,44 @@ fn real_root_steps(sys: &SystemDef) -> Vec<Step> {
         from: "{in:busybox-x86-64}".into(),
         dest: "{out}/root{in:busybox-x86-64}".into(),
     });
+    // uutils' `coreutils` multicall copied to its content-addressed /td/store path (a
+    // direct, hash-prefixed store dir like busybox), so the /bin coreutils symlinks resolve
+    // on the mounted erofs (#547).
+    steps.push(Step::CopyTree {
+        from: "{in:uutils}".into(),
+        dest: "{out}/root{in:uutils}".into(),
+    });
+    // uutils is dynamically linked, so its runtime closure must ALSO live on the read-only
+    // root at the absolute /td/store path its interpreter + RUNPATH resolve. Both build paths
+    // (`td shell` via TD_SHELL_NATIVE_INTERP and `build-plan --auto` via the builder's derived
+    // TD_RUST_STORE_INTERP) bake the HASH-PREFIXED, nested path
+    // /td/store/<hash>-glibc-x86-64/stage/td/store/glibc-2.41-x86_64/lib/ld-linux-x86-64.so.2 —
+    // NOT a fixed /td/store/glibc-2.41-x86_64 — so stage glibc's runtime subtree UNDER its own
+    // content-addressed output dir (like busybox/uutils), matching the exact path the ELF names.
+    // `shape_check` fails closed if uutils references any /td/store package this does not stage
+    // (e.g. a separate libgcc_s dir), naming the exact miss.
+    steps.push(Step::CopyTree {
+        from: "{in:glibc-x86-64}/stage/td/store/glibc-2.41-x86_64".into(),
+        dest: "{out}/root{in:glibc-x86-64}/stage/td/store/glibc-2.41-x86_64".into(),
+    });
     // /bin symlink farm: /bin/busybox, every applet, and /init resolve DIRECTLY into the
     // store busybox (busybox dispatches on argv[0]'s basename).
     steps.push(Step::Symlink {
         target: "{in:busybox-x86-64}/bin/busybox".into(),
         link: "{out}/root/bin/busybox".into(),
     });
-    for app in APPLETS {
+    for app in BUSYBOX_APPLETS {
         steps.push(Step::Symlink {
             target: "{in:busybox-x86-64}/bin/busybox".into(),
+            link: format!("{{out}}/root/bin/{app}"),
+        });
+    }
+    // The core file/text userland resolves into the uutils `coreutils` multicall instead of
+    // busybox (#547). uutils dispatches on argv[0]'s basename exactly like busybox, so a
+    // /bin/<applet> -> coreutils symlink runs that applet.
+    for app in UUTILS_APPLETS {
+        steps.push(Step::Symlink {
+            target: "{in:uutils}/bin/coreutils".into(),
             link: format!("{{out}}/root/bin/{app}"),
         });
     }
@@ -464,12 +521,14 @@ fn real_root_steps(sys: &SystemDef) -> Vec<Step> {
 /// `busybox cpio -t` parse, the members that make it bootable (incl. the /init pivot
 /// script), and the busybox binary under /td/store. For the root tree: /init and /bin/sh
 /// are symlinks into /td/store, the key /etc files exist, and the busybox binary is
-/// packed under /td/store. AND that busybox actually implements EVERY packed APPLETS
+/// packed under /td/store. AND that busybox actually implements EVERY BUSYBOX_APPLETS
 /// entry (incl. `switch_root`) — a config drift or tailoring typo that dropped/misnamed
-/// an applet would leave a dead /bin symlink the member checks alone can't catch. All
-/// strings are ASCII (td-builder's config reader is Latin-1). This is a build sanity
-/// assert, not a behavioural test — the boot is exercised by `td-recipe-eval run` and the
-/// headless `qemu-boot-system` oracle.
+/// an applet would leave a dead /bin symlink the member checks alone can't catch. For the
+/// uutils farm: the `coreutils` multicall is staged, every UUTILS_APPLETS /bin symlink
+/// exists, and — since uutils is dynamically linked — its whole /td/store closure resolves
+/// on the root (fail-closed). All strings are ASCII (td-builder's config reader is
+/// Latin-1). This is a build sanity assert, not a behavioural test — the boot is exercised
+/// by `td-recipe-eval run` and the headless `qemu-boot-system` oracle.
 fn shape_check() -> String {
     "init='{out}/init.cpio'; root='{out}/root'; bb='{in:busybox-x86-64}/bin/busybox'; \
      sz=$(wc -c < \"$init\"); \
@@ -489,13 +548,60 @@ fn shape_check() -> String {
      done; \
      ls \"$root\"/td/store/*/bin/busybox >/dev/null 2>&1 || { echo 'root tree: the busybox binary is not packed under /td/store/<hash>/bin - the store-native /bin symlinks would all dangle' >&2; exit 1; }; \
      applets=$(\"$bb\" --list 2>/dev/null) || { echo 'busybox --list failed - cannot verify applet coverage' >&2; exit 1; }; \
-     for a in @APPLETS@; do \
+     for a in @BUSYBOX_APPLETS@; do \
          printf '%s\\n' \"$applets\" | grep -q -x -F \"$a\" || { echo \"busybox does not implement applet '$a' (config drift) - its packed /bin/$a symlink would be a dead link\" >&2; exit 1; }; \
-     done"
+     done; \
+     uu=\"{out}/root{in:uutils}/bin/coreutils\"; uutgt=\"{in:uutils}/bin/coreutils\"; \
+     { [ -f \"$uu\" ] && [ -x \"$uu\" ]; } || { echo 'root tree: the uutils coreutils multicall is not packed at root{in:uutils}/bin/coreutils - the /bin coreutils symlinks would all dangle (#547)' >&2; exit 1; }; \
+     for a in @UUTILS_APPLETS@; do \
+         [ \"$(readlink \"$root/bin/$a\" 2>/dev/null)\" = \"$uutgt\" ] || { echo \"root tree: /bin/$a is not a symlink to the staged uutils multicall ($uutgt) - the uutils /bin farm regressed (#547)\" >&2; exit 1; }; \
+     done; \
+     pkgs=$(tr -c 'A-Za-z0-9._+/-' '\\n' < \"$uu\" | sed -n 's#^[^/]*/td/store/\\([A-Za-z0-9._+-][A-Za-z0-9._+-]*\\).*#/td/store/\\1#p' | sort -u); \
+     [ -n \"$pkgs\" ] || { echo 'root tree: extracted NO /td/store path from the uutils binary - the static closure scan (tr | sed) is broken or the binary is not dynamically linked; refusing to pass vacuously (#547)' >&2; exit 1; }; \
+     miss=0; \
+     for p in $pkgs; do \
+         [ -d \"$root$p\" ] || { echo \"root tree: uutils references store package '$p' (its interp/RUNPATH) which is NOT staged on the erofs root - the dynamic closure is incomplete (#547); add the package that provides it to native_inputs and CopyTree its store subtree onto the root\" >&2; miss=1; }; \
+     done; \
+     [ \"$miss\" = 0 ] || exit 1"
         // Validate EVERY packed applet, not just the greeter-critical few (re #541, Codex
         // review). Names are all shell-safe identifiers, so a space-joined `for` list is
-        // safe unquoted.
-        .replace("@APPLETS@", &APPLETS.join(" "))
+        // safe unquoted. uutils is dynamically linked and CANNOT be exec'd in the build
+        // sandbox (its interp is an absolute /td/store path present only on the assembled
+        // root, not in the build tree), so verify its closure STATICALLY: the multicall is
+        // staged+executable, every uutils /bin link's TEXT points at that multicall (compare
+        // link text, never resolve — the target is an absolute /td/store path that dangles
+        // on the build host), and every TOP-LEVEL /td/store package dir the binary references
+        // (interp + RUNPATH) is a staged directory. We extract the FIRST `/td/store/<pkg>` per
+        // reference string, not every occurrence, and NOT via `grep -o`, for two reasons:
+        //   (1) this step runs on the mesboot0 PATH, whose grep is GNU grep 2.4 — it predates
+        //       `-o` (--only-matching), which would exit 2 and (via the emptiness guard above)
+        //       leave the recipe permanently unbuildable; and
+        //   (2) `grep -o`'s all-occurrences semantics is WRONG here. glibc is staged under its
+        //       own content-addressed output, so uutils' interp/RUNPATH nest /td/store TWICE:
+        //       `/td/store/<hash>-glibc-x86-64/stage/td/store/glibc-2.41-x86_64/lib/ld-…`. The
+        //       TOP-LEVEL package is the OUTER `<hash>-glibc-x86-64` (a real root dir); the
+        //       inner `glibc-2.41-x86_64` is a SUBPATH inside it (comes along via CopyTree),
+        //       never a top-level dir — extracting it would fail `-d "$root$p"` on every
+        //       correctly-linked image. So `tr -c` bursts the binary into tokens on any byte
+        //       outside the store-path charset (NUL, the `:` in a RUNPATH, …), and one `sed`
+        //       takes the FIRST `/td/store/<pkg>` per token: `^[^/]*` skips a non-slash prefix
+        //       (an interp abutting prior bytes) to reach the first `/td/store/`, the class
+        //       excludes `/` so it stops at the package root, and any later `/td/store/` in the
+        //       same token is that package's own subpath and is ignored. `[class]` requires >=1
+        //       char so a bare `/td/store/` cannot match vacuously; an empty scan is itself a
+        //       failure (a dynamic binary must name its interp). Assumes each store path
+        //       appears as its own absolute string (the toolchain never embeds one behind a
+        //       slash-bearing prefix) — verified against real ELFs.
+        // LIMIT: this catches PATH-referenced closure (interp + RUNPATH dirs), not a
+        // soname-only DT_NEEDED with no RUNPATH entry (e.g. libgcc_s.so.1 if the linker baked
+        // no rpath for it). That residual is caught by the qemu-boot-system oracle, which now
+        // EXECS a uutils applet by absolute path and asserts UUTILS_RUNTIME_MARKER — a broken
+        // runtime closure reds it (a static-only claim would not). That oracle is operator-run
+        // (`td-recipe-eval qemu-boot-system` needs host qemu, absent in the gated/daily
+        // sandbox), so it is a pre-landing backstop, not a per-change gate; this static scan is
+        // the per-change guard and fails closed naming any unstaged package (#547).
+        .replace("@BUSYBOX_APPLETS@", &BUSYBOX_APPLETS.join(" "))
+        .replace("@UUTILS_APPLETS@", &UUTILS_APPLETS.join(" "))
 }
 
 pub fn recipe() -> Recipe {
@@ -551,13 +657,16 @@ pub fn recipe() -> Recipe {
     steps.push(Step::run("{out}", &[SH, "-c", &shape_check()]).env("PATH", &mesboot0_path()));
 
     Recipe::mesboot("system-x86-64", "0.1")
-        // busybox: the packed userland + the `cpio -t`/applet shape check (static binary).
+        // busybox: the static boot/greeter userland + the `cpio -t`/applet shape check.
         // linux-x86-64: the EXPORTED gen_init_cpio packer (verified STATICALLY linked).
-        // glibc-x86-64: no step in THIS (busybox) image links against the native glibc,
-        //   but it is already in the closure (busybox links libc.a from it) and is the
-        //   runtime closure the uutils follow-up (#547) will pack onto the erofs root, so
-        //   it is retained here ahead of that migration rather than dropped and re-added.
-        .native_inputs(&["busybox-x86-64", "linux-x86-64", "glibc-x86-64"])
+        // uutils: the dynamically-linked `coreutils` multicall packed as the /bin file/text
+        //   userland (#547).
+        // glibc-x86-64: uutils' runtime closure (ld-linux + libc.so.6). Staged NESTED under
+        //   its own content-addressed output — /td/store/<hash>-glibc-x86-64/stage/td/store/
+        //   glibc-2.41-x86_64/… — which is the exact absolute interp/RUNPATH uutils bakes, so
+        //   it resolves on the erofs root. shape_check verifies the OUTER <hash>-glibc-x86-64
+        //   dir is staged; the inner glibc-2.41-x86_64 is a subpath inside it (via CopyTree).
+        .native_inputs(&["busybox-x86-64", "linux-x86-64", "uutils", "glibc-x86-64"])
         .inputs_owned(mesboot0_inputs(&[]))
         .steps(steps)
 }
@@ -580,12 +689,13 @@ mod tests {
         for u in SYSTEM.users {
             // busybox `login` execs the shell by ABSOLUTE path (execv, no PATH search),
             // and we only pack applets under /bin, so the shell MUST be "/bin/<applet>"
-            // with <applet> in APPLETS. A bare "sh" would pass a naive basename check yet
+            // packed by either farm. A bare "sh" would pass a naive basename check yet
             // fail at runtime (execv("sh") -> ENOENT -> login respawn-loops); reject it.
             let packed_applet = u.shell.strip_prefix("/bin/");
             assert!(
-                packed_applet.is_some_and(|a| APPLETS.contains(&a)),
-                "user '{}' login shell '{}' must be \"/bin/<applet>\" with <applet> in APPLETS \
+                packed_applet
+                    .is_some_and(|a| BUSYBOX_APPLETS.contains(&a) || UUTILS_APPLETS.contains(&a)),
+                "user '{}' login shell '{}' must be \"/bin/<applet>\" packed by a /bin farm \
                  (busybox login execs it by absolute path)",
                 u.name,
                 u.shell
@@ -608,14 +718,80 @@ mod tests {
     /// getty auto-logs-in via `-l /etc/autologin`, and login needs both applets; the
     /// respawn line is inert without them. `reboot` is what `tty-session` execs when the
     /// greeter session ends (the in-guest power-off path). `switch_root` is the stage-1
-    /// pivot applet — without it the two-stage boot cannot enter the erofs root. Belt-
-    /// and-braces against an APPLETS edit that drops one (the shape check catches it at
-    /// build time, this catches it at `cargo test` time).
+    /// pivot applet — without it the two-stage boot cannot enter the erofs root. These are
+    /// all boot-critical and MUST stay busybox (static, no runtime closure): belt-and-
+    /// braces against a farm edit that drops one or reroutes it to dynamically-linked
+    /// uutils (the shape check catches it at build time, this catches it at test time).
     #[test]
     fn greeter_and_pivot_applets_are_present() {
         for a in ["sh", "getty", "login", "init", "mount", "umount", "reboot", "switch_root"] {
-            assert!(APPLETS.contains(&a), "required applet '{a}' missing from APPLETS");
+            assert!(
+                BUSYBOX_APPLETS.contains(&a),
+                "boot-critical applet '{a}' missing from BUSYBOX_APPLETS"
+            );
         }
+    }
+
+    /// The two /bin farms must be DISJOINT — a name in both would pack two conflicting
+    /// symlinks for one applet (last-writer-wins, non-deterministic) and blur the
+    /// static-vs-dynamic boot-safety boundary. Also pin the boot-critical names that MUST
+    /// stay busybox: `hostname` (inittab runs `hostname -F`, a flag uutils lacks) and
+    /// `mount`/`umount` (the stage-1 pivot runs before uutils' glibc closure is reachable).
+    #[test]
+    fn applet_farms_are_disjoint_and_boot_names_stay_busybox() {
+        for a in UUTILS_APPLETS {
+            assert!(
+                !BUSYBOX_APPLETS.contains(a),
+                "applet '{a}' is in BOTH farms - a name belongs to exactly one /bin farm"
+            );
+        }
+        for a in ["hostname", "mount", "umount", "sh", "init"] {
+            assert!(
+                BUSYBOX_APPLETS.contains(&a),
+                "boot-critical applet '{a}' must stay busybox, not route to uutils"
+            );
+            assert!(
+                !UUTILS_APPLETS.contains(&a),
+                "boot-critical applet '{a}' must NOT be served by dynamically-linked uutils"
+            );
+        }
+    }
+
+    /// The uutils recipe must build exactly the applets we symlink into /bin.
+    /// coreutils 0.9.0 names each applet's cargo feature after the applet, so an
+    /// applet in UUTILS_APPLETS with no matching feature would dispatch to nothing
+    /// (a dead /bin symlink), and a feature we don't symlink is dead weight in the
+    /// COMPILED graph. Selecting only these applets (vs the `feat_Tier1`/`unix`
+    /// aggregate) trims what cargo COMPILES and links — NOT the derivation's INPUT
+    /// closure: the committed Cargo.lock still pins the full resolved set (507 crates)
+    /// and stage_verified_vendor interns every pinned `.crate` — build-time-unused cc /
+    /// bindgen / clang-sys sources included — as authenticated input. So only the
+    /// compiled/linked graph is the smaller, cc-free one; shrinking the interned input
+    /// set too would need a committed selected-closure sub-lock. Guard the
+    /// feature↔applet coupling here.
+    #[test]
+    fn uutils_recipe_builds_exactly_the_shipped_farm() {
+        let uutils = crate::catalog::lookup("uutils")
+            .expect("uutils recipe must be registered in the catalog");
+        let feats: std::collections::BTreeSet<&str> = uutils
+            .features
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .map(String::as_str)
+            .collect();
+        let applets: std::collections::BTreeSet<&str> = UUTILS_APPLETS.iter().copied().collect();
+        assert_eq!(
+            feats, applets,
+            "uutils recipe features must equal UUTILS_APPLETS; drift means a dead \
+             /bin symlink or a wasted crate subtree"
+        );
+        assert_eq!(
+            uutils.no_default_features,
+            Some(true),
+            "uutils must set no_default_features so only the shipped applets build \
+             (the default `feat_common_core` pulls ~76 utilities)"
+        );
     }
 
     /// The inittab must respawn `tty-session` (not a bare getty), run `rootcheck` at
@@ -697,6 +873,17 @@ mod tests {
         assert!(
             profile.contains(AUTOTEST_CMDLINE_TOKEN) && profile.contains("exit"),
             "profile must exit on the autotest cmdline token so the headless boot powers off"
+        );
+        // The headless self-test must PROVE uutils runs: a uutils applet invoked by absolute
+        // /bin path, gated with `&&` on the marker echo, so a broken runtime closure drops the
+        // marker and reds the oracle (#547, review finding #2).
+        assert!(
+            profile.contains(UUTILS_RUNTIME_MARKER),
+            "profile must emit the uutils runtime marker"
+        );
+        assert!(
+            profile.contains("/bin/cat /etc/os-release") && profile.contains(&format!("&& echo {UUTILS_RUNTIME_MARKER}")),
+            "the uutils runtime marker must be gated on a successful absolute-path uutils invocation"
         );
     }
 }

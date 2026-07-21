@@ -708,6 +708,32 @@ fn copy_crates(from: &Path, to: &Path) -> usize {
     n
 }
 
+/// A vendor set is COMPLETE only when this marker sits beside its `.crate` files. It is
+/// written LAST — after every crate is copied — so a warm killed mid-publish leaves no marker
+/// and the next warm redoes it. Without it a partial cache (`count_crates >= 1`) reads as done
+/// yet fails the build-time set-equality gate and never self-heals. The marker is not a
+/// `.crate`, so the build's `stage_verified_vendor` scan ignores it; a re-warm's vendor wipe
+/// clears any stale marker, so it is present only after a fully published set.
+///
+/// Write it ATOMICALLY (temp + rename): a bare `fs::write` truncates the target to 0 bytes
+/// first, so a failed write (ENOSPC — likely the same reason the copy above failed) would
+/// leave a 0-byte `.warm-complete` that `is_warm_complete`'s `is_file()` reads as done,
+/// re-introducing the fail-open the marker exists to close. rename is atomic on the vendor
+/// dir's filesystem, so the marker either does not exist or is a complete record.
+fn mark_warm_complete(vendor: &Path, n: usize) {
+    let tmp = vendor.join(".warm-complete.tmp");
+    if std::fs::write(&tmp, format!("{n}\n")).is_ok()
+        && std::fs::rename(&tmp, vendor.join(".warm-complete")).is_ok()
+    {
+        return;
+    }
+    let _ = std::fs::remove_file(&tmp);
+}
+
+fn is_warm_complete(vendor: &Path) -> bool {
+    vendor.join(".warm-complete").is_file()
+}
+
 /// Run `cmd` with stdio discarded; true on a zero exit (best-effort, never panics).
 fn run_quiet(cmd: &mut Command) -> bool {
     cmd.stdout(Stdio::null())
@@ -780,10 +806,7 @@ fn warm_crate(root: &Path, krate: &str, ver: &str, dest: &str) {
     let work = cv.join("work");
     let srccrate = work.join(format!("{krate}-{ver}.crate"));
 
-    if srcdir.join("Cargo.toml").is_file()
-        && srccrate.is_file()
-        && count_crates(&vendor) >= 1
-    {
+    if srcdir.join("Cargo.toml").is_file() && srccrate.is_file() && is_warm_complete(&vendor) {
         eprintln!(
             "td-feed warm crate: {krate}-{ver} already warm ({} crates) in {}",
             count_crates(&vendor),
@@ -873,12 +896,23 @@ fn warm_crate(root: &Path, krate: &str, ver: &str, dest: &str) {
         eprintln!("td-feed warm crate: could not create vendor dir for {krate}-{ver}");
         return;
     }
-    let n = copy_crates(&proxy_store.join("crates"), &vendor);
+    let crates_src = proxy_store.join("crates");
+    let want = count_crates(&crates_src);
+    let n = copy_crates(&crates_src, &vendor);
     let _ = std::fs::remove_dir_all(srcdir.join("target"));
     if n < 1 {
         eprintln!("td-feed warm crate: no crates vendored for {krate}-{ver}");
         return;
     }
+    // Mark complete ONLY if EVERY fetched crate copied. copy_crates silently drops per-file
+    // errors, so a partial copy (n>=1 but < the fetched set) would otherwise be sealed by the
+    // sentinel and skipped forever while the build-time set-equality gate rejects it (Codex
+    // review). A short copy leaves no marker, so the next warm re-does it.
+    if n != want {
+        eprintln!("td-feed warm crate: copied only {n}/{want} crates for {krate}-{ver} - a copy failed; NOT marking complete so the next warm re-does it");
+        return;
+    }
+    mark_warm_complete(&vendor, n);
     eprintln!(
         "td-feed warm crate: {krate}-{ver} — source + {n} crates provisioned guix-free \
          (cargo-proxy, Cargo.lock-pinned, sha==index cksum) in {}",
@@ -898,7 +932,7 @@ fn warm_crate_local(root: &Path, srcrel: &str, dest: &str) {
         }
     };
     let vendor = root.join(".td-build-cache/crate-vendor").join(dest);
-    if count_crates(&vendor) >= 1 {
+    if is_warm_complete(&vendor) {
         eprintln!(
             "td-feed warm crate-local: {dest} already warm ({} crates) in {}",
             count_crates(&vendor),
@@ -936,12 +970,21 @@ fn warm_crate_local(root: &Path, srcrel: &str, dest: &str) {
         eprintln!("td-feed warm crate-local: could not create vendor dir for {dest}");
         return;
     }
-    let n = copy_crates(&proxy_store.join("crates"), &vendor);
+    let crates_src = proxy_store.join("crates");
+    let want = count_crates(&crates_src);
+    let n = copy_crates(&crates_src, &vendor);
     let _ = std::fs::remove_dir_all(&work);
     if n < 1 {
         eprintln!("td-feed warm crate-local: no crates vendored for {dest}");
         return;
     }
+    // Complete only if EVERY fetched crate copied (see warm_crate) — a short copy leaves no
+    // marker so the next warm re-does it, instead of sealing a partial set forever.
+    if n != want {
+        eprintln!("td-feed warm crate-local: copied only {n}/{want} crates for {dest} - a copy failed; NOT marking complete so the next warm re-does it");
+        return;
+    }
+    mark_warm_complete(&vendor, n);
     eprintln!(
         "td-feed warm crate-local: {dest} — {n} crates provisioned guix-free \
          (cargo-proxy, {}/Cargo.lock-pinned, sha==index cksum) in {}",
