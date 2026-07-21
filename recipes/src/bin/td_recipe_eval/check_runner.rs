@@ -416,8 +416,10 @@ fn reapable_dead_pid(name: &str) -> Option<u32> {
 /// Deliberately DISTINCT from the seed store/db (`<lw>/store`, `<lw>/db`): those hold
 /// interned seed inputs and #468 authenticates the seed db as a seed-only authority, so a
 /// recipe OUTPUT committed there would be rejected as an unpinned seed. The cache lives in
-/// its own subtree so reuse never pollutes the seed authority. Cold-wiped with the seed
-/// store on a pin change (setup's cold path removes the whole `build-cache/`).
+/// its own subtree so reuse never pollutes the seed authority. Shared across worktrees and
+/// content-addressed, so it is never wiped on a pin/patch change; the only reclaim is a
+/// rare high-watermark eviction of the whole `build-cache/` (store + db + `db.receipts`
+/// sidecars — the coherent unit the builder writes) in setup's coarse GC.
 fn build_cache_paths(lw: &Path) -> (PathBuf, PathBuf) {
     let base = lw.join("build-cache");
     (base.join("store"), base.join("db"))
@@ -550,14 +552,18 @@ impl RecipeCheckRunner {
                 if chain_cache.is_empty() {
                     root.join(".td-build-cache/ladder-cold")
                 } else {
-                    home.map(|h| h.join(".td/build-daemon/ladder"))
+                    // Fixed trust/layout epoch, a sibling of the old `ladder` a pre-fix
+                    // worktree still wipes. Bump only on a trust/layout change, not a pin.
+                    home.map(|h| h.join(".td/build-daemon/ladder-shared-v1"))
                         .unwrap_or_else(|| root.join(".td-build-cache/ladder-cold"))
                 }
             });
         let store = lw.join("store");
         let db = lw.join("db");
-        let recipes = lw.join("recipes");
         let scratch = lw.join("scratch").join(scratch_name);
+        // Emitted recipe JSON is current-graph-only, so it lives under the
+        // per-invocation scratch, not a shared/persistent dir.
+        let recipes = scratch.join("recipes");
         Ok(Self {
             root,
             tb,
@@ -599,73 +605,127 @@ impl RecipeCheckRunner {
         build_cache_paths(&self.lw)
     }
 
+    /// The stable per-cache commit lock, shared with the builder's commit transaction
+    /// (builder `lock_store_commit`, which derives the same `<build-cache>.commit.lock`). Sited
+    /// BESIDE `build-cache/`, never inside it, so eviction — which renames `build-cache/` aside
+    /// — cannot split the lock across an evict/recreate. Eviction and the builder take this same
+    /// lock, so GC never renames the cache out from under an uncovered committer.
+    fn cache_commit_lock_path(&self) -> PathBuf {
+        self.lw.join("build-cache.commit.lock")
+    }
+
     pub(crate) fn setup(&self) -> Result<(), String> {
+        self.setup_with_cache_cap(ladder_cache_cap_bytes())
+    }
+
+    /// setup() with the eviction cap injected — the env-reading `setup()` is the
+    /// production entrypoint; tests pass an explicit cap so they stay hermetic against
+    /// the ambient `TD_CHECK_LADDER_CACHE_CAP_BYTES` force-eviction knob.
+    fn setup_with_cache_cap(&self, cache_cap: u64) -> Result<(), String> {
         if self.force_cold {
             remove_path_if_exists(&self.lw)?;
         }
+        // Only the content-addressed build-cache is shared across worktrees; the seeds
+        // (store + db, and the map in prepare_recipe_target) are reset and re-derived per
+        // run. The seed db MUST reset (authenticate_seed_db reds a db holding rows the
+        // current compiled table cannot vouch for); the seed store MUST reset (a shared
+        // store never auto-heals a torn content-addressed item). Under the ladder lock.
+        remove_path_if_exists(&self.store)?;
+        remove_path_if_exists(&self.db)?;
         fs::create_dir_all(&self.store)
             .map_err(|e| format!("mkdir {}: {e}", self.store.display()))?;
-        fs::create_dir_all(&self.recipes)
-            .map_err(|e| format!("mkdir {}: {e}", self.recipes.display()))?;
         remove_path_if_exists(&self.scratch)?;
         fs::create_dir_all(&self.scratch)
             .map_err(|e| format!("mkdir {}: {e}", self.scratch.display()))?;
-        // Reclaim disk from ABANDONED predecessors: only THIS pid's scratch was ever
-        // removed, so dead runs' trees accumulated (95 GB observed). We hold the ladder
-        // lock here, so this is race-free (re #469 build speed).
+        // Reclaim disk from abandoned predecessors' scratch trees; under the ladder lock,
+        // so reaping a dead pid's tree never races a live build.
         self.reap_dead_scratch();
-        let manifest = self.setup_manifest()?;
-        let setup_ok = self.lw.join("setup-ok");
-        // Cold-wipe only when a pin/patch this ladder ALREADY recorded changed
-        // or was removed — never for a pure ADDITION (a new leaf recipe's new
-        // source pin, which is in no already-built rung's closure and cannot
-        // invalidate any content-addressed seed or output). `setup_needs_wipe`
-        // is the decision; see it and `setup_manifest` for the reasoning and
-        // the honest-bump auto-recovery this preserves (re #543).
-        let stored = fs::read_to_string(&setup_ok).ok();
-        let warm = stored
-            .as_deref()
-            .map(|s| !setup_needs_wipe(s, &manifest))
-            .unwrap_or(false)
-            && self.lw.join("srcs.map").is_file();
+        self.evict_build_cache_if_over_watermark(cache_cap)
+    }
 
-        if !warm {
-            remove_path_if_exists(&self.store)?;
-            remove_path_if_exists(&self.db)?;
-            // Cold-wipe the dedicated build-output cache with the seeds: a
-            // recorded pin's change invalidates prior outputs, so stale reuse
-            // never survives a pin bump.
-            remove_path_if_exists(&self.lw.join("build-cache"))?;
-            remove_path_if_exists(&self.lw.join("srcs.map"))?;
-            // tools.map: nothing writes it anymore (the host-tool resolution it
-            // carried is deleted, re #469) — scrub the stale pre-v8 artifact.
-            remove_path_if_exists(&self.lw.join("tools.map"))?;
-            fs::create_dir_all(&self.store)
-                .map_err(|e| format!("mkdir {}: {e}", self.store.display()))?;
-            File::create(self.lw.join("srcs.map"))
-                .map_err(|e| format!("create srcs.map: {e}"))?;
-        }
-        // Record the current manifest on BOTH paths. Rewriting it on the warm
-        // path folds any newly ADDED pins/patches into the recorded baseline,
-        // so a later REMOVAL of one is still detected as a change and wipes —
-        // closing the remove-then-re-add-with-new-content hole. Under the
-        // ladder lock, so no concurrent writer.
-        //
-        // Atomic + symlink-safe: write a temp file, drop whatever is at
-        // setup-ok (a stray symlink or dir, or the old marker —
-        // remove_path_if_exists never follows a symlink), then rename into
-        // place. A crash can then leave only the OLD complete manifest or none
-        // (a safe wipe next run) — never a truncated PREFIX that setup_needs_wipe
-        // would misread as a subset — and the rewrite never writes THROUGH a
-        // symlink to another target (re #543 review).
-        let tmp = self.lw.join(format!("setup-ok.tmp.{}", process::id()));
-        fs::write(&tmp, &manifest).map_err(|e| format!("write {}: {e}", tmp.display()))?;
-        remove_path_if_exists(&setup_ok)?;
-        if let Err(e) = fs::rename(&tmp, &setup_ok) {
-            let _ = remove_path_if_exists(&tmp);
-            return Err(format!("place {}: {e}", setup_ok.display()));
+    /// Coarse disk reclaim for the SHARED build-output cache: over the high-watermark cap,
+    /// evict the whole `build-cache/` subtree atomically — rename to a tombstone, then reap
+    /// it — so a crash mid-reclaim leaves only a stale tombstone (reaped next setup), never a
+    /// torn store/db/receipts triple. Content-addressing makes eviction safe: an evicted rung
+    /// cold-climbs on next need, never mis-reuses. All-or-nothing, so a steady-state union
+    /// over the cap re-evicts every setup; a low-watermark retention GC is the follow-up.
+    fn evict_build_cache_if_over_watermark(&self, cap: u64) -> Result<(), String> {
+        // Take the SAME stable commit lock the builder holds during a commit, held across reap +
+        // size + rename + reap, so eviction never renames the cache out from under an uncovered
+        // committer (an orphaned builder child, or a direct store-commit) the outer ladder lock
+        // does not cover. Lock ordering is always ladder -> commit, so no inversion / deadlock.
+        let _cache_lock = lock_file(&self.cache_commit_lock_path())?;
+        self.reap_cache_tombstones()?;
+        let build_cache = self.lw.join("build-cache");
+        let size = dir_size_capped(&build_cache, cap);
+        if size > cap {
+            eprintln!(
+                "ladder: shared build-cache is {size} bytes (> cap {cap}); evicting {} — \
+                 the next build re-derives seeds and cold-climbs the affected closure",
+                build_cache.display()
+            );
+            let tomb = self
+                .lw
+                .join(format!("build-cache.evicting.{}", process::id()));
+            remove_path_if_exists(&tomb)?;
+            // Atomic swap-aside then reap. Only a NotFound rename is benign (build_cache
+            // vanished under us — nothing to evict); a real error (EBUSY/EACCES/EIO) must
+            // surface, not be mistaken for "already gone" and silently skip the reclaim.
+            match fs::rename(&build_cache, &tomb) {
+                Ok(()) => remove_path_if_exists(&tomb).map_err(|e| {
+                    format!(
+                        "ladder: evicted the over-cap build-cache to {} but could not reclaim \
+                         it: {e} — the cache name is free but the disk is NOT; refusing to \
+                         proceed (a fresh cache would grow atop unreclaimed bytes). Remove {} \
+                         to recover.",
+                        tomb.display(),
+                        tomb.display()
+                    )
+                })?,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    return Err(format!(
+                        "ladder: evict rename {} -> {}: {e}",
+                        build_cache.display(),
+                        tomb.display()
+                    ))
+                }
+            }
         }
         Ok(())
+    }
+
+    /// Reap `build-cache.evicting.*` tombstones an interrupted eviction left behind. A
+    /// tombstone holds unreclaimed disk the cap does not count, so a reap failure is NOT
+    /// best-effort: it fails setup rather than let a fresh cache grow atop it. Runs under
+    /// the ladder lock.
+    fn reap_cache_tombstones(&self) -> Result<(), String> {
+        let entries = match fs::read_dir(&self.lw) {
+            Ok(e) => e,
+            Err(_) => return Ok(()),
+        };
+        let mut first_err: Option<String> = None;
+        for entry in entries.flatten() {
+            let is_tomb = entry
+                .file_name()
+                .to_str()
+                .is_some_and(|n| n.starts_with("build-cache.evicting."));
+            if is_tomb {
+                if let Err(e) = remove_path_if_exists(&entry.path()) {
+                    first_err.get_or_insert_with(|| {
+                        format!(
+                            "ladder: could not reap stale build-cache tombstone {}: {e} — it \
+                             holds unreclaimed disk the cap does not count; remove it to recover",
+                            entry.path().display()
+                        )
+                    });
+                }
+            }
+        }
+        match first_err {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
     }
 
     /// Best-effort removal of ABANDONED per-pid scratch trees under `scratch/`. Each
@@ -696,71 +756,6 @@ impl RecipeCheckRunner {
                 _ => {}
             }
         }
-    }
-
-    /// The ladder's seed identity, as an order-independent PER-ENTRY manifest:
-    /// one sorted line per pinned source (`pin\t<key>\t<url>\t<sha256>\t<file>`)
-    /// and one per in-repo seed patch (`patch\t<name>\t<sha256-of-bytes>`). It
-    /// keys only what the chain may consume — the pinned sources and the
-    /// seed patches; a host-tool ladder input has been an inadmissible class
-    /// since v8 (re #469).
-    ///
-    /// Unlike the old single sha over ALL pins, this is compared entry-by-entry
-    /// (`setup_needs_wipe`): the ladder cold-wipes only when an entry it already
-    /// recorded CHANGED or was REMOVED — an honest pin bump, which the wipe
-    /// exists to auto-recover before the loud `reconcile_seed_map_entry` guard
-    /// fires. Pure ADDITIONS (a new leaf recipe's new source pin, in no
-    /// already-built rung's closure) leave the warmed ladder untouched, so a
-    /// leaf source addition no longer rebuilds the whole bootstrap from stage0
-    /// (re #543). Sorting makes the decision independent of PINS array order.
-    ///
-    /// The `ladder-setup-v9` header is the format epoch: bump it to force a
-    /// one-time wipe when the ladder's build semantics change in a way no pin
-    /// edit captures. A pre-v9 `setup-ok` (the v8 single sha) has no matching
-    /// header, so `setup_needs_wipe` treats it as a mismatch and wipes once.
-    fn setup_manifest(&self) -> Result<String, String> {
-        let mut lines: Vec<String> = Vec::new();
-        for pin in source_pins::all() {
-            // Tab and newline are the manifest's field and line separators; a
-            // field carrying one could let two entries collapse into a single
-            // line and mask a needed wipe. Reject it loudly — the pins are
-            // reviewed compile-time constants, so a separator here is a catalog
-            // bug, not reachable input (re #543 review).
-            manifest_field_ok("pin key", &pin.key)?;
-            manifest_field_ok("pin url", &pin.url)?;
-            manifest_field_ok("pin sha256", &pin.sha256)?;
-            manifest_field_ok("pin file", &pin.file)?;
-            lines.push(format!(
-                "pin\t{}\t{}\t{}\t{}",
-                pin.key, pin.url, pin.sha256, pin.file
-            ));
-        }
-        // One reused buffer across patches (off the hot path, AGENTS.md).
-        let mut bytes = Vec::new();
-        for file in files_with_suffix(&self.root.join("seed/patches"), ".patch")? {
-            let name = file
-                .file_name()
-                .and_then(|n| n.to_str())
-                .ok_or_else(|| format!("seed patch has no UTF-8 name: {}", file.display()))?;
-            manifest_field_ok("patch name", name)?;
-            bytes.clear();
-            append_file_bytes(&file, &mut bytes)?;
-            lines.push(format!("patch\t{}\t{}", name, sha256sum(&bytes)));
-        }
-        lines.sort();
-        let mut out = String::from("ladder-setup-v9\n");
-        for line in &lines {
-            out.push_str(line);
-            out.push('\n');
-        }
-        // Completeness footer: the entry count. A torn write (crash, kill,
-        // disk-full) loses or mismatches it, so `setup_needs_wipe` can reject an
-        // incomplete baseline (a safe wipe) instead of reading a truncated
-        // PREFIX as a valid "older subset" and skipping a required wipe
-        // (re #543 review). Kept out of the subset comparison — it legitimately
-        // differs whenever additions change the count.
-        out.push_str(&format!("entries\t{}\n", lines.len()));
-        Ok(out)
     }
 
     fn intern_source(&self, intern_name: &str, pin: &SourcePin) -> Result<String, String> {
@@ -863,49 +858,21 @@ impl RecipeCheckRunner {
             .ok_or_else(|| format!("store-add-recursive {name} produced no path"))
     }
 
-    fn append_src_map(&self, name: &str, path: &str) -> Result<(), String> {
-        let map = self.lw.join("srcs.map");
-        let mut file = OpenOptions::new()
-            .append(true)
-            .create(true)
-            .open(&map)
-            .map_err(|e| format!("open {}: {e}", map.display()))?;
-        writeln!(file, "{name} {path}").map_err(|e| format!("write {}: {e}", map.display()))
+    /// This TARGET's `--auto` seed map, written fresh each run under the PRIVATE scratch
+    /// dir — never a shared or persistent file. One `NAME PATH` line per seed the target's
+    /// graph declares, each a pin-verified content-addressed store path: the exact format
+    /// `build-plan --auto` parses. Scoped by target so a `prepare_recipe_target(A)` +
+    /// `build_plan(B)` mismatch reds on the missing map rather than silently planning B
+    /// against A's seeds (build_plan's `is_file` guard).
+    fn auto_map_path(&self, target: &str) -> PathBuf {
+        self.scratch
+            .join(format!("auto-map-{}", sanitize_target_for_filename(target)))
     }
 
-    fn map_value_opt(&self, name: &str) -> Result<Option<String>, String> {
-        let map = self.lw.join("srcs.map");
-        if !map.is_file() {
-            return Ok(None);
-        }
-        let contents =
-            fs::read_to_string(&map).map_err(|e| format!("read {}: {e}", map.display()))?;
-        for line in contents.lines() {
-            let mut cols = line.splitn(2, ' ');
-            let key = match cols.next() {
-                Some(k) => k,
-                None => continue,
-            };
-            if key == name {
-                return Ok(cols.next().map(str::trim).map(str::to_string));
-            }
-        }
-        Ok(None)
-    }
-
-    fn stage_tdstore(&self) -> Result<(), String> {
-        fs::create_dir_all(self.scratch.join("tdstore"))
-            .map_err(|e| format!("mkdir tdstore: {e}"))?;
-        let contents = fs::read_to_string(self.lw.join("srcs.map"))
-            .map_err(|e| format!("read srcs.map: {e}"))?;
-        for line in contents.lines() {
-            let mut cols = line.splitn(2, ' ');
-            let _name = cols.next();
-            if let Some(path) = cols.next() {
-                self.stage_store_path(path.trim())?;
-            }
-        }
-        Ok(())
+    fn write_auto_map(&self, target: &str, entries: &[(String, String)]) -> Result<(), String> {
+        let path = self.auto_map_path(target);
+        fs::write(&path, serialize_auto_map(entries))
+            .map_err(|e| format!("write {}: {e}", path.display()))
     }
 
     fn stage_store_path(&self, store_path: &str) -> Result<(), String> {
@@ -940,39 +907,43 @@ impl RecipeCheckRunner {
 
     pub(crate) fn prepare_recipe_target(&self, target: &str) -> Result<(), String> {
         let graph = recipe_closure(&[target])?;
-        self.ensure_graph_inputs(&graph)?;
-        self.emit_recipe_graph(&graph)?;
-        self.stage_tdstore()
+        // ensure_graph_inputs re-derives, pin-verifies, interns, and STAGES every
+        // seed in the current graph, and writes the fresh per-run auto-map from
+        // exactly those verified paths — no persistent map is read or trusted.
+        self.ensure_graph_inputs(target, &graph)?;
+        self.emit_recipe_graph(&graph)
     }
 
     /// Classify then realize every input in the graph: `classify_graph_inputs`
-    /// (the pure planning pass — see its doc for the #469 trust boundary),
-    /// then intern each admitted seed into the ladder store.
-    fn ensure_graph_inputs(&self, nodes: &[RecipeNode]) -> Result<(), String> {
+    /// (the pure planning pass — see its doc for the #469 trust boundary), then
+    /// intern and stage each admitted seed. The `--auto` seed map is written
+    /// FRESH here from this run's re-derived, pin-verified paths — the map is
+    /// per-invocation derived state, never a persisted authority.
+    fn ensure_graph_inputs(&self, target: &str, nodes: &[RecipeNode]) -> Result<(), String> {
+        let tdstore = self.scratch.join("tdstore");
+        fs::create_dir_all(&tdstore)
+            .map_err(|e| format!("mkdir {}: {e}", tdstore.display()))?;
+        let mut entries: Vec<(String, String)> = Vec::new();
         for input in classify_graph_inputs(nodes)? {
-            self.ensure_seed_input(&input)?;
+            let derived = self.ensure_seed_input(&input)?;
+            entries.push((input.key().to_string(), derived));
         }
-        Ok(())
+        self.write_auto_map(target, &entries)
     }
 
-    /// Realize one classified seed input by RE-DERIVING it from the compiled
-    /// pin EVERY run — never by trusting a prior map entry. srcs.map is a
-    /// mutable file, so it is a CACHE of derived paths, not an authority: the
-    /// warm path used to stage whatever the map named without re-verifying
-    /// the declared pin, which let a matching mutable store+db pair vouch for
-    /// self-registered host bytes (re #469, PR review). Each intern_* verifies
-    /// the pinned artifact and re-interns it (`store-add-recursive` is
-    /// idempotent: it NAR-verifies an existing content-addressed item instead
-    /// of copying over it), so the derived path is bound to the compiled pin
-    /// on every run; a pre-existing map entry must AGREE with the derivation
-    /// or planning reds. Cost, stated honestly: per run, each seed's bytes
-    /// are read several times (the pin sha256, the NAR hash at synthesis,
-    /// and store-add-recursive's NAR verify of the existing item) and stage0
-    /// is re-extracted — on the order of the full seed set re-hashed every
-    /// warm run, minutes not seconds on a cold cache. Deliberate: the same
-    /// recorded re-hash-every-step decision as the StageManifest, trading
-    /// warm-run time for a boundary with no trusted mutable state.
-    fn ensure_seed_input(&self, input: &SeedInput) -> Result<(), String> {
+    /// Realize one classified seed input by RE-DERIVING it from the compiled pin
+    /// EVERY run — never by trusting a prior map entry. Each intern_* verifies the
+    /// pinned artifact and re-interns it into the per-run seed store (`store-add-
+    /// recursive` is idempotent: a re-intern of an item already present this run
+    /// NAR-verifies it rather than copying over it), so the returned path is bound to
+    /// the compiled pin on every run. The caller folds the result into the fresh
+    /// per-run auto-map; nothing prior is read, so there is no mutable mapping state to
+    /// reconcile or self-heal — the stronger form of the #469 boundary. Cost, stated
+    /// honestly: per run each seed's bytes are read several times (the pin sha256, the
+    /// NAR hash at synthesis, and store-add-recursive's copy into the reset seed store)
+    /// and stage0 is re-extracted — the same recorded re-hash-every-step decision as the
+    /// StageManifest, trading warm-run time for a boundary with no trusted mutable state.
+    fn ensure_seed_input(&self, input: &SeedInput) -> Result<String, String> {
         let derived = self.derive_seed_input(input)?;
         // The COMPILED table must vouch for the derivation (re #469): pin
         // verification proves the fetched artifact, but a GENERATED seed (the
@@ -981,14 +952,8 @@ impl RecipeCheckRunner {
         // being compiled in is what lets td-builder reject a forged map even
         // when invoked directly.
         crate::seed_digests::require(input.key(), path_basename_str(&derived)?)?;
-        if reconcile_seed_map_entry(
-            input.key(),
-            self.map_value_opt(input.key())?.as_deref(),
-            &derived,
-        )? {
-            self.append_src_map(input.key(), &derived)?;
-        }
-        self.stage_store_path(&derived)
+        self.stage_store_path(&derived)?;
+        Ok(derived)
     }
 
     /// Derive ONE classified seed from its compiled pin — verify, intern, and
@@ -1006,16 +971,18 @@ impl RecipeCheckRunner {
     }
 
     pub(crate) fn build_plan(&self, target: &str) -> Result<PathBuf, String> {
-        // The auto map is srcs.map verbatim: every non-owned input is an
-        // interned seed source. There is no tools map — a host executable is
-        // not an admissible input, so build-plan's content-scan candidate dir
-        // is the ladder's OWN store of interned seeds, never a host store.
-        let srcs = fs::read(self.lw.join("srcs.map")).map_err(|e| format!("read srcs.map: {e}"))?;
-        let auto_map = self.scratch.join("auto-map");
-        let mut map =
-            File::create(&auto_map).map_err(|e| format!("create {}: {e}", auto_map.display()))?;
-        map.write_all(&srcs)
-            .map_err(|e| format!("write {}: {e}", auto_map.display()))?;
+        // The auto map is the FRESH per-run map prepare_recipe_target wrote from this
+        // graph's re-derived, pin-verified seeds (every non-owned input is an interned
+        // seed source). There is no tools map — a host executable is not an admissible
+        // input, so build-plan's content-scan candidate dir is the ladder's OWN store of
+        // interned seeds, never a host store.
+        let auto_map = self.auto_map_path(target);
+        if !auto_map.is_file() {
+            return Err(format!(
+                "ladder: {} missing — prepare_recipe_target({target}) must run before build_plan({target})",
+                auto_map.display()
+            ));
+        }
 
         let home = path_str(&self.lw)?;
         let tmp = path_str(&self.lw)?;
@@ -1056,9 +1023,16 @@ impl RecipeCheckRunner {
         // bit-identical to a fresh build) instead of rebuilt, and a freshly-built rung
         // commits its output back. A CHANGED rung has a different drv ⇒ different output
         // path ⇒ a miss ⇒ still rebuilds, so the rung under development always rebuilds.
-        // The cache rides the same setup warmth as the seeds: a pin change cold-wipes it.
+        // The cache is SHARED across worktrees and content-addressed, so a pin change is
+        // just a different-drv miss (rebuild), never a wipe — divergent branches reuse
+        // each other's unchanged rungs instead of clobbering them. Coarse disk reclaim is
+        // a rare high-watermark eviction in setup(), not a per-change wipe.
         // Safe under the global ladder lock (build-runs are serialized — no concurrent
-        // writer to the cache).
+        // writer to the cache). Caveat (builder follow-up): the builder commits a rung
+        // into the cache in place (copy, not temp+rename), so an OOM/kill mid-commit can
+        // leave a torn item that later fails commit_tree_checked; recovery today is the
+        // watermark eviction (or TD_CHECK_LADDER_CACHE_CAP_BYTES=1 to force one), pending
+        // crash-atomic store commits.
         //
         // The cache MUST NOT be self.store/self.db: those are the SEED store/db (interned
         // seed inputs), and #468 authenticates self.db as a seed-only authority — a recipe
@@ -1425,102 +1399,85 @@ fn verify_source_pin(path: &Path, pin: &SourcePin) -> Result<(), String> {
     Ok(())
 }
 
-/// Reconcile a freshly PIN-DERIVED seed path against the srcs.map cache entry
-/// (None = key not yet mapped). Returns Ok(true) when the caller should append
-/// the new entry, Ok(false) when the cache already agrees, and REDS when the
-/// map names a different path: the map is mutable state, so an entry the
-/// compiled pin cannot re-derive is exactly the self-registered-host-bytes
-/// ingress #469 forbids — never silently prefer either side (re #469).
-///
-/// Deliberately NO self-heal: rewriting the mismatched entry to the derived
-/// value would be safe for the honest causes (a pin bump against a stale
-/// work dir; a torn append from an interrupted run) but would also silently
-/// absorb tampering, and the map feeds build-plan --auto's lock synthesis
-/// downstream. Tampering must be LOUD; the honest causes cost one
-/// work-dir delete (the dir is disposable derived state, and the error says
-/// exactly that).
-fn reconcile_seed_map_entry(
-    key: &str,
-    prior: Option<&str>,
-    derived: &str,
-) -> Result<bool, String> {
-    match prior {
-        None => Ok(true),
-        Some(p) if p == derived => Ok(false),
-        Some(p) => Err(format!(
-            "provenance rejected: srcs.map maps `{key}' to {p}, but the compiled pin derives \
-             {derived} — a map entry the pinned seed cannot reproduce is not admissible \
-             (self-registered or stale bytes; delete the ladder work dir to re-derive, re #469)"
-        )),
+/// Serialize the `--auto` seed map: one `NAME PATH` line per entry, in the order
+/// the graph classified them. The keys are compiled seed constants and the paths
+/// are content-addressed store paths, so neither carries the space separator that
+/// `build-plan --auto` splits each line on.
+fn serialize_auto_map(entries: &[(String, String)]) -> String {
+    let mut out = String::new();
+    for (key, store_path) in entries {
+        out.push_str(key);
+        out.push(' ');
+        out.push_str(store_path);
+        out.push('\n');
     }
+    out
 }
 
-/// Decide whether the ladder must cold-wipe given the PRIOR recorded setup
-/// manifest (`stored`) and the CURRENT one (`current`, from `setup_manifest`).
-///
-/// Wipe iff any ENTRY (`pin`/`patch` line) `stored` recorded is no longer
-/// present VERBATIM in `current`: a changed pin (same key, new url/sha/file) or
-/// a removed pin/patch is a stored entry absent from `current` and wipes; a
-/// pure ADDITION is a `current` entry with no counterpart in `stored` and is
-/// ignored, so a new leaf recipe's new source pin keeps the warmed ladder
-/// (re #543).
-///
-/// Two guards protect the asymmetric (subset) comparison from a corrupt
-/// baseline:
-///  - the epoch header (`current`'s first line) must match `stored`'s first
-///    line; a missing, empty, or pre-v9 (bare-sha, no header) record fails this
-///    and wipes once on cutover; and
-///  - `stored` must be COMPLETE (`manifest_is_complete`) — its `entries <N>`
-///    footer must match the entries present. Without this, a torn write that
-///    left a header-matching PREFIX (a strict subset of `current`) would be
-///    read as "only additions since then" and skip a required wipe. An
-///    incomplete record wipes (`setup_manifest`'s write is atomic, so our own
-///    writer never leaves one; this defends against a crash or a foreign
-///    writer). This also covers the vacuous empty `stored`.
-fn setup_needs_wipe(stored: &str, current: &str) -> bool {
-    if stored.lines().next() != current.lines().next() {
-        return true;
-    }
-    if !manifest_is_complete(stored) {
-        return true;
-    }
-    let current_lines: HashSet<&str> = current.lines().collect();
-    stored
-        .lines()
-        .filter(|l| is_manifest_entry(l))
-        .any(|line| !current_lines.contains(line))
+/// A filesystem-safe rendering of a recipe target for the per-invocation auto-map
+/// filename. Recipe stems are already simple (`[a-z0-9-]`), but map any other byte to `_`
+/// so the target can never traverse out of the scratch dir or inject a path separator.
+fn sanitize_target_for_filename(target: &str) -> String {
+    target
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '-' | '.' | '_') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
 }
 
-/// A pin/patch entry line — not the epoch header or the `entries` footer.
-fn is_manifest_entry(line: &str) -> bool {
-    line.starts_with("pin\t") || line.starts_with("patch\t")
-}
-
-/// A setup manifest is complete iff its trailing `entries <N>` footer equals
-/// the number of entry lines actually present. This is what lets
-/// `setup_needs_wipe` treat a torn/truncated baseline as a cache miss (a safe
-/// wipe) rather than a valid older subset (re #543 review).
-fn manifest_is_complete(manifest: &str) -> bool {
-    let present = manifest.lines().filter(|l| is_manifest_entry(l)).count();
-    manifest
-        .lines()
-        .find_map(|l| l.strip_prefix("entries\t"))
-        .and_then(|n| n.parse::<usize>().ok())
-        .map(|declared| declared == present)
-        .unwrap_or(false)
-}
-
-/// Reject a manifest field that carries the format's separators (tab or
-/// newline), which would make an entry line ambiguous (re #543 review).
-fn manifest_field_ok(what: &str, value: &str) -> Result<(), String> {
-    if value.contains('\t') || value.contains('\n') {
-        return Err(format!(
-            "ladder setup manifest: {what} {value:?} contains a tab or newline (the manifest's \
-             field/line separators) — refusing an ambiguous cache key (re #543)"
-        ));
+/// Recursive byte size of `path`, short-circuiting as soon as it exceeds `cap`
+/// (so the common under-cap walk is the only full traversal, and an over-cap tree
+/// stops early). Uses `symlink_metadata`, so a symlink counts as its own small
+/// entry rather than being followed — bounded and cycle-free. Unreadable entries
+/// are skipped (best-effort disk accounting, never an error).
+fn dir_size_capped(path: &Path, cap: u64) -> u64 {
+    let mut total: u64 = 0;
+    let mut stack = vec![path.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let entries = match fs::read_dir(&dir) {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        for entry in entries.flatten() {
+            let meta = match entry.path().symlink_metadata() {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+            if meta.is_dir() {
+                stack.push(entry.path());
+            } else {
+                total = total.saturating_add(meta.len());
+                if total > cap {
+                    return total;
+                }
+            }
+        }
     }
-    Ok(())
+    total
 }
+
+/// High-watermark byte cap for the shared build-output cache: `TD_CHECK_LADDER_CACHE_CAP_BYTES`
+/// when set to a positive integer, else a generous default. The `TD_CHECK_` prefix is
+/// load-bearing — the `td-builder check` sandbox forwards only `TD_CHECK_*` / `TD_SUBST_*` /
+/// `TD_DAEMON_*`, so a bare `TD_LADDER_…` name would be stripped before it reached the
+/// in-sandbox runner. A deliberately blunt knob for the coarse eviction; a smarter retention
+/// policy is a follow-up.
+fn ladder_cache_cap_bytes() -> u64 {
+    parse_cache_cap(env::var("TD_CHECK_LADDER_CACHE_CAP_BYTES").ok().as_deref())
+}
+
+fn parse_cache_cap(raw: Option<&str>) -> u64 {
+    raw.and_then(|s| s.trim().parse::<u64>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(DEFAULT_LADDER_CACHE_CAP_BYTES)
+}
+
+const DEFAULT_LADDER_CACHE_CAP_BYTES: u64 = 64 * 1024 * 1024 * 1024;
 
 fn find_td_builder_self(root: &Path) -> Result<PathBuf, String> {
     if let Some(path) = env::var_os("TD_BUILDER_SELF").map(PathBuf::from) {
@@ -1622,18 +1579,6 @@ fn append_file_bytes(path: &Path, out: &mut Vec<u8>) -> Result<(), String> {
     file.read_to_end(out)
         .map_err(|e| format!("read {}: {e}", path.display()))?;
     Ok(())
-}
-
-fn files_with_suffix(dir: &Path, suffix: &str) -> Result<Vec<PathBuf>, String> {
-    let mut files = read_dir_sorted(dir)?;
-    files.retain(|p| {
-        p.file_name()
-            .and_then(|n| n.to_str())
-            .map(|n| n.ends_with(suffix))
-            .unwrap_or(false)
-            && p.is_file()
-    });
-    Ok(files)
 }
 
 fn read_dir_sorted(dir: &Path) -> Result<Vec<PathBuf>, String> {
@@ -1835,36 +1780,38 @@ mod tests {
         );
     }
 
-    // The srcs.map is a cache, never an authority (re #469): a fresh
-    // pin-derivation must agree with a prior entry or planning reds — the
-    // mismatch arm is exactly a self-registered/stale item the compiled pin
-    // cannot reproduce. Scope, precisely: this exercises the pure helper
-    // only. It is the SOLE decision point — ensure_seed_input calls it
-    // unconditionally after every intern (the pre-fix warm short-circuit
-    // that staged the mapped path without deriving anything is DELETED, not
-    // gated), so there is no warm path left to integration-test; the
-    // structural guarantee is the absence of any other map read before
-    // staging (grep `map_value_opt`).
+    // The seed map is fresh per-run derived state, never a persisted authority
+    // (re #469): every run re-derives, pin-verifies, and stages each seed, then
+    // writes the `--auto` map from exactly those verified paths. `serialize_auto_map`
+    // is the pure format helper; there is no prior map read anywhere (the persistent
+    // srcs.map, its reconcile guard, and the warm short-circuit are all DELETED).
     #[test]
-    fn seed_map_entries_must_agree_with_the_pin_derivation() {
-        // Unmapped key: derive and append.
-        assert!(reconcile_seed_map_entry("mes-source", None, "/td/store/aaa-mes").unwrap());
-        // Cache agrees: no append, no error.
-        assert!(!reconcile_seed_map_entry(
-            "mes-source",
-            Some("/td/store/aaa-mes"),
-            "/td/store/aaa-mes"
-        )
-        .unwrap());
-        // Cache names bytes the pin cannot re-derive: provenance rejected.
-        let err = reconcile_seed_map_entry(
-            "mes-source",
-            Some("/td/store/zzz-host-bash"),
-            "/td/store/aaa-mes",
-        )
-        .unwrap_err();
-        assert!(err.contains("provenance rejected"), "{err}");
-        assert!(err.contains("zzz-host-bash"), "{err}");
+    fn auto_map_serializes_the_current_graph_seeds_as_name_space_path_lines() {
+        let entries = vec![
+            ("mes-source".to_string(), "/td/store/aaa-mes".to_string()),
+            (
+                "stage0-source".to_string(),
+                "/td/store/bbb-stage0".to_string(),
+            ),
+        ];
+        assert_eq!(
+            serialize_auto_map(&entries),
+            "mes-source /td/store/aaa-mes\nstage0-source /td/store/bbb-stage0\n"
+        );
+        // No entries ⇒ an empty map (not a stray newline).
+        assert_eq!(serialize_auto_map(&[]), "");
+    }
+
+    #[test]
+    fn sanitize_target_keeps_recipe_stems_and_neutralizes_path_bytes() {
+        // A normal recipe stem passes through unchanged (dots kept for versions).
+        assert_eq!(sanitize_target_for_filename("system-x86-64"), "system-x86-64");
+        assert_eq!(sanitize_target_for_filename("gcc.14_2"), "gcc.14_2");
+        // Every separator becomes `_`, so no `/` survives to form a traversal — the result
+        // is always a single flat filename component (kept dots can't traverse alone).
+        assert_eq!(sanitize_target_for_filename("../../etc/x"), ".._.._etc_x");
+        assert_eq!(sanitize_target_for_filename("a/b"), "a_b");
+        assert!(!sanitize_target_for_filename("../../etc/x").contains('/'));
     }
 
     #[test]
@@ -1930,91 +1877,212 @@ mod tests {
         );
     }
 
-    // The ladder cold-wipe (setup) must fire on a CHANGE or REMOVAL of an
-    // already-recorded pin/patch — the honest-bump auto-recovery the wipe
-    // exists for — but NEVER on a pure ADDITION, so a new leaf recipe's new
-    // source pin keeps the warmed ladder instead of rebuilding from stage0
-    // (re #543). `setup_needs_wipe` is that decision, tested directly.
-    // A COMPLETE manifest the way `setup_manifest` writes it: epoch header,
-    // sorted entries, and the `entries <N>` completeness footer.
-    fn test_manifest(entries: &[&str]) -> String {
-        let mut s = String::from("ladder-setup-v9\n");
-        for e in entries {
-            s.push_str(e);
-            s.push('\n');
+    /// A minimal runner pointed at a throwaway ladder tree, for the fs-level
+    /// setup() tests. Only the path fields matter; the rest are inert.
+    fn shared_test_runner(lw: &Path) -> RecipeCheckRunner {
+        let scratch = lw.join("scratch").join("test");
+        RecipeCheckRunner {
+            root: PathBuf::new(),
+            tb: PathBuf::new(),
+            builder_path: String::new(),
+            builder_store: PathBuf::new(),
+            builder_db: PathBuf::new(),
+            lw: lw.to_path_buf(),
+            store: lw.join("store"),
+            db: lw.join("db"),
+            recipes: scratch.join("recipes"),
+            scratch,
+            force_cold: false,
+            daemon_dir: None,
         }
-        s.push_str(&format!("entries\t{}\n", entries.len()));
-        s
     }
 
+    // The heart of the fix: in the SHARED (daemon) mode, setup() must NEVER wipe the
+    // build-cache on a normal under-cap run — that whole-store wipe on a pin/patch
+    // divergence is exactly what let divergent worktrees clobber each other's warm
+    // toolchain cache. Content-addressing makes a changed rung a fresh-path miss, not a
+    // stale reuse, so the shared build-cache never needs wiping. The seeds (store + db)
+    // are the deliberate exception: they ARE reset each run — the db because
+    // authenticate_seed_db authenticates the whole db against the current compiled table
+    // (an accumulated cross-branch db would red wholesale), and the store because a shared
+    // store never auto-heals a torn item (which would wedge every worktree).
     #[test]
-    fn setup_needs_wipe_ignores_additions_but_catches_changes_and_removals() {
-        let busybox = "pin\tbusybox-source\thttps://b/x.tar\tsha-b\tx.tar";
-        let make = "pin\tmake-source\thttps://m/m.tar\tsha-m\tm.tar";
-        let patch = "patch\tfix.patch\tsha-p";
-        let base = test_manifest(&[busybox, make, patch]);
+    fn setup_shares_only_the_build_cache_and_resets_the_seeds() {
+        let lw = env::temp_dir().join(format!("td-ladder-shared-{}", process::id()));
+        let _ = fs::remove_dir_all(&lw);
+        // A neighbor's warm build-cache (the shared layer), plus stale seed store/db and
+        // pre-fix leftovers a divergent or old client might have left behind.
+        fs::create_dir_all(lw.join("build-cache").join("store")).unwrap();
+        fs::write(
+            lw.join("build-cache").join("store").join("rung-sentinel"),
+            b"toolchain",
+        )
+        .unwrap();
+        fs::create_dir_all(lw.join("store")).unwrap();
+        fs::write(lw.join("store").join("stale-seed"), b"partial-or-foreign").unwrap();
+        fs::write(lw.join("db"), b"another branch's accumulated seed rows").unwrap();
+        fs::write(lw.join("srcs.map"), b"stale legacy map\n").unwrap();
+        fs::write(lw.join("setup-ok"), b"ladder-setup-v9\npin\told\n").unwrap();
 
-        // Identical: warm.
-        assert!(!setup_needs_wipe(&base, &base));
+        let runner = shared_test_runner(&lw);
+        // Inject the cap (don't read it from env) so this stays hermetic against the
+        // ambient TD_CHECK_LADDER_CACHE_CAP_BYTES=1 force-eviction knob, which would
+        // otherwise evict the tiny sentinel cache and defeat the survival assertion.
+        runner
+            .setup_with_cache_cap(DEFAULT_LADDER_CACHE_CAP_BYTES)
+            .unwrap();
 
-        // Pure ADDITION of an unrelated pin (a new leaf recipe's source): warm.
-        let uutils = "pin\tuutils-source\thttps://u/u.tar\tsha-u\tu.tar";
-        let added = test_manifest(&[busybox, make, patch, uutils]);
-        assert!(!setup_needs_wipe(&base, &added));
-        // And the reverse (a rebuild that had the extra pin, now removed via a
-        // revert) is a REMOVAL of a recorded entry ⇒ wipe.
-        assert!(setup_needs_wipe(&added, &base));
-
-        // A recorded pin whose sha256 CHANGED (an honest bump): wipe.
-        let make2 = "pin\tmake-source\thttps://m/m.tar\tsha-m2\tm.tar";
-        let bumped = test_manifest(&[busybox, make2, patch]);
-        assert!(setup_needs_wipe(&base, &bumped));
-
-        // A recorded pin REMOVED: wipe.
-        let removed = test_manifest(&[busybox, patch]);
-        assert!(setup_needs_wipe(&base, &removed));
-
-        // A recorded seed patch whose CONTENT changed: wipe; a NEW patch: warm.
-        let patch2 = "patch\tfix.patch\tsha-p2";
-        let patch_bumped = test_manifest(&[busybox, make, patch2]);
-        assert!(setup_needs_wipe(&base, &patch_bumped));
-        let new_patch = "patch\tnew.patch\tsha-n";
-        let patch_added = test_manifest(&[busybox, make, patch, new_patch]);
-        assert!(!setup_needs_wipe(&base, &patch_added));
+        // The under-cap build-cache SURVIVES — no divergence wipe. This is the anti-thrash
+        // property, asserted directly.
+        assert!(lw
+            .join("build-cache")
+            .join("store")
+            .join("rung-sentinel")
+            .is_file());
+        // ...but the seed store and db are reset (this run re-interns + re-registers its
+        // own pin-verified seeds), so a divergent sibling's rows / a torn seed item / stale
+        // pre-fix files never carry over.
+        assert!(!lw.join("store").join("stale-seed").exists());
+        assert!(lw.join("store").is_dir()); // recreated empty, ready for this run's seeds
+        assert!(!lw.join("db").exists());
+        // The per-invocation scratch is freshly created.
+        assert!(runner.scratch.is_dir());
+        let _ = fs::remove_dir_all(&lw);
     }
 
+    // The coarse GC evicts the whole build-cache when it exceeds the cap, and does so
+    // atomically (rename to a `build-cache.evicting.*` tombstone, then reap) so a crash
+    // can never leave a torn store/db/receipts triple — and a stale tombstone from a
+    // previous interrupted eviction is reaped too. Cap is injected (not read from env) so
+    // this stays deterministic under the parallel test runner. The under-cap survival case
+    // is covered by setup_shares_only_the_build_cache_*; the env knob by cache_cap_prefers_*.
     #[test]
-    fn setup_needs_wipe_forces_a_wipe_on_a_missing_incomplete_or_pre_v9_record() {
-        let current = test_manifest(&["pin\ta\tu\ts\tf"]);
-        // No prior record (empty/truncated file): wipe.
-        assert!(setup_needs_wipe("", &current));
-        // A pre-v9 `setup-ok` was a bare hex sha with no header line: wipe once.
-        assert!(setup_needs_wipe("3b1f...deadbeef", &current));
-        // A corrupt record whose header does not match the epoch: wipe.
-        assert!(setup_needs_wipe(
-            "ladder-setup-v8\npin\ta\tu\ts\tf\nentries\t1\n",
-            &current
-        ));
-        // A TORN write: the header matches and the surviving entry is a subset
-        // of current, but the completeness footer is missing (a header-only or
-        // truncated PREFIX) ⇒ wipe, never mistaken for a valid older subset.
-        assert!(setup_needs_wipe("ladder-setup-v9\n", &current));
-        assert!(setup_needs_wipe("ladder-setup-v9\npin\ta\tu\ts\tf\n", &current));
-        // A footer whose count disagrees with the entries present ⇒ incomplete
-        // ⇒ wipe.
-        assert!(setup_needs_wipe(
-            "ladder-setup-v9\npin\ta\tu\ts\tf\nentries\t2\n",
-            &current
-        ));
-        // ...and the complete single-entry baseline is warm against itself.
-        assert!(!setup_needs_wipe(&current, &current));
+    fn evict_over_cap_removes_the_build_cache_and_reaps_tombstones() {
+        let lw = env::temp_dir().join(format!("td-ladder-evict-{}", process::id()));
+        let _ = fs::remove_dir_all(&lw);
+        fs::create_dir_all(lw.join("build-cache").join("store")).unwrap();
+        fs::write(
+            lw.join("build-cache").join("store").join("big-rung"),
+            vec![0u8; 4096],
+        )
+        .unwrap();
+        // A tombstone a prior interrupted eviction abandoned — reaped regardless of cap.
+        fs::create_dir_all(lw.join("build-cache.evicting.999999")).unwrap();
+
+        let runner = shared_test_runner(&lw);
+        runner.evict_build_cache_if_over_watermark(512).unwrap();
+
+        assert!(!lw.join("build-cache").exists());
+        assert!(!lw.join("build-cache.evicting.999999").exists());
+
+        // Under-cap: the reap still runs, but the build-cache is left intact.
+        fs::create_dir_all(lw.join("build-cache").join("store")).unwrap();
+        fs::create_dir_all(lw.join("build-cache.evicting.111111")).unwrap();
+        runner
+            .evict_build_cache_if_over_watermark(64 * 1024 * 1024)
+            .unwrap();
+        assert!(lw.join("build-cache").join("store").is_dir());
+        assert!(!lw.join("build-cache.evicting.111111").exists());
+        let _ = fs::remove_dir_all(&lw);
     }
 
+    // The commit lock is sited BESIDE build-cache/, so eviction (which renames build-cache/
+    // aside and recreates it) leaves the lock file — and its inode — untouched. The builder's
+    // commit transaction and GC therefore always contend on ONE stable inode; that stable
+    // exclusion is what lets GC block an uncovered committer (and vice versa). Without the
+    // sibling placement, an evict/recreate would mint a new lock inode and split the lock.
     #[test]
-    fn manifest_field_ok_rejects_the_format_separators() {
-        assert!(manifest_field_ok("pin url", "https://ok/x.tar").is_ok());
-        assert!(manifest_field_ok("pin key", "a\tb").is_err());
-        assert!(manifest_field_ok("patch name", "a\nb.patch").is_err());
+    fn commit_lock_survives_eviction_and_stays_beside_the_cache() {
+        use std::os::unix::fs::MetadataExt;
+        let lw = env::temp_dir().join(format!("td-ladder-locklife-{}", process::id()));
+        let _ = fs::remove_dir_all(&lw);
+        fs::create_dir_all(lw.join("build-cache").join("store")).unwrap();
+        fs::write(
+            lw.join("build-cache").join("store").join("big-rung"),
+            vec![0u8; 4096],
+        )
+        .unwrap();
+
+        let runner = shared_test_runner(&lw);
+        let lock_path = runner.cache_commit_lock_path();
+        // Sibling of build-cache/, not inside it.
+        assert_eq!(lock_path.parent(), Some(lw.as_path()));
+        assert!(!lock_path.starts_with(lw.join("build-cache")));
+
+        // Materialize the lock file as the builder's first commit would (acquire + release),
+        // then record its identity. Not held across evict — evict takes the SAME lock, and one
+        // process holding it via two descriptions would self-deadlock.
+        drop(lock_file(&lock_path).unwrap());
+        let ino_before = fs::metadata(&lock_path).unwrap().ino();
+
+        runner.evict_build_cache_if_over_watermark(512).unwrap();
+        assert!(!lw.join("build-cache").exists(), "over-cap cache evicted");
+        assert!(lock_path.exists(), "the commit lock survives eviction");
+        assert_eq!(
+            fs::metadata(&lock_path).unwrap().ino(),
+            ino_before,
+            "same lock inode across eviction — the lock is not split"
+        );
+
+        // The stable path mutually excludes — the exclusion both the builder and GC rely on.
+        let held = lock_file(&lock_path).unwrap();
+        let contender = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .unwrap();
+        assert!(contender.try_lock().is_err(), "commit lock is exclusive while held");
+        drop(held);
+        assert!(contender.try_lock().is_ok(), "released once the holder drops");
+        let _ = fs::remove_dir_all(&lw);
+    }
+
+    // The force-cold (per-worktree, no shared cache) mode is unchanged: setup() wipes
+    // the whole ladder tree each run for the clean-room proof.
+    #[test]
+    fn setup_force_cold_wipes_the_worktree_ladder() {
+        let lw = env::temp_dir().join(format!("td-ladder-cold-{}", process::id()));
+        let _ = fs::remove_dir_all(&lw);
+        fs::create_dir_all(lw.join("store")).unwrap();
+        fs::write(lw.join("store").join("stale"), b"x").unwrap();
+
+        let mut runner = shared_test_runner(&lw);
+        runner.force_cold = true;
+        runner.setup().unwrap();
+
+        assert!(!lw.join("store").join("stale").exists());
+        assert!(lw.join("store").is_dir());
+        assert!(runner.scratch.is_dir());
+        let _ = fs::remove_dir_all(&lw);
+    }
+
+    // The coarse GC's size probe: an exact recursive sum under a generous cap, an
+    // early-exit over a tiny cap (so eviction trips), and 0 for a missing tree.
+    #[test]
+    fn dir_size_capped_sums_files_and_short_circuits_over_cap() {
+        let tmp = env::temp_dir().join(format!("td-dirsize-{}", process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(tmp.join("a").join("b")).unwrap();
+        fs::write(tmp.join("a").join("f1"), vec![0u8; 100]).unwrap();
+        fs::write(tmp.join("a").join("b").join("f2"), vec![0u8; 200]).unwrap();
+        assert_eq!(dir_size_capped(&tmp, 10_000), 300);
+        assert!(dir_size_capped(&tmp, 50) > 50);
+        assert_eq!(dir_size_capped(&tmp.join("nope"), 10_000), 0);
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    // The cap knob: a positive override wins; zero, garbage, and absent all fall back
+    // to the compiled default.
+    #[test]
+    fn cache_cap_prefers_a_positive_override_else_the_default() {
+        assert_eq!(parse_cache_cap(Some("4096")), 4096);
+        assert_eq!(parse_cache_cap(Some("  4096  ")), 4096);
+        assert_eq!(parse_cache_cap(Some("0")), DEFAULT_LADDER_CACHE_CAP_BYTES);
+        assert_eq!(
+            parse_cache_cap(Some("not-a-number")),
+            DEFAULT_LADDER_CACHE_CAP_BYTES
+        );
+        assert_eq!(parse_cache_cap(None), DEFAULT_LADDER_CACHE_CAP_BYTES);
     }
 
     #[test]

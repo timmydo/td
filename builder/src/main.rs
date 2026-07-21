@@ -801,6 +801,178 @@ fn copy_canonical(src: &Path, dst: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// Remove PATH (file, dir, or symlink) if present; a missing path is not an error. Never
+/// follows a symlink — removes the link itself.
+fn remove_store_path(path: &Path) -> Result<(), String> {
+    match std::fs::symlink_metadata(path) {
+        Ok(md) if md.is_dir() => {
+            std::fs::remove_dir_all(path).map_err(|e| format!("{}: {e}", path.display()))
+        }
+        Ok(_) => std::fs::remove_file(path).map_err(|e| format!("{}: {e}", path.display())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(format!("{}: {e}", path.display())),
+    }
+}
+
+/// Acquire the exclusive per-store commit lock (`<db>.commit.lock`), so the sweep, the
+/// registered-path snapshot, the tree commits, the db merge, and the receipt write form one
+/// critical section per store/db. The client-side ladder lock serializes recipe-check builds
+/// but does NOT cover a committer that reaches the same cache another way — a parent-death-
+/// orphaned builder child, or a direct `store-commit`/`build-recipe` with TD_PERSIST_* at the
+/// cache; since recovery DELETES a torn orphan, an unlocked second writer racing the snapshot
+/// could clobber a just-registered path. Different stores use different lock files, so
+/// unrelated builds never contend. Blocks until free; the guard releases on drop / process exit.
+fn lock_store_commit(db: &Path) -> Result<std::fs::File, String> {
+    // Site the lock as a SIBLING of the store directory (db's parent), never inside it: the
+    // shared build-cache's whole dir is renamed aside and recreated by over-cap eviction, so a
+    // lock kept inside would get a fresh inode across an evict/recreate and stop excluding a
+    // committer holding the old one. A sibling keeps one stable lock inode.
+    let anchor = db
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(db);
+    let mut os = anchor.as_os_str().to_owned();
+    os.push(".commit.lock");
+    let lock_path = std::path::PathBuf::from(os);
+    if let Some(parent) = lock_path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        std::fs::create_dir_all(parent).map_err(|e| format!("mkdir {}: {e}", parent.display()))?;
+    }
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&lock_path)
+        .map_err(|e| format!("open commit lock {}: {e}", lock_path.display()))?;
+    file.lock()
+        .map_err(|e| format!("lock {}: {e}", lock_path.display()))?;
+    Ok(file)
+}
+
+/// Sibling staging path for an atomic commit of DEST: same parent dir (hence the same
+/// filesystem, so `rename` into place is atomic), a `.commit-tmp.` prefix a sweep can find
+/// (pid FIRST so the sweep can parse it), and a `.staging` suffix so a staged receipt temp
+/// never ends in `.receipt` and gets mistaken for a real sidecar by the `*.receipt` intake.
+fn commit_temp_path(dest: &Path) -> Result<std::path::PathBuf, String> {
+    let parent = dest
+        .parent()
+        .ok_or_else(|| format!("{} has no parent dir", dest.display()))?;
+    let base = dest
+        .file_name()
+        .and_then(|s| s.to_str())
+        .ok_or_else(|| format!("{} has no basename", dest.display()))?;
+    Ok(parent.join(format!(".commit-tmp.{}.{base}.staging", std::process::id())))
+}
+
+/// Whether PID is a live process (a `/proc/<pid>` entry exists) — so a sweep reaps only
+/// crash-orphaned staging temps, never a concurrent committer's live one. Only a NotFound
+/// `/proc/<pid>` is treated as dead; an ambiguous error is treated as ALIVE, so uncertainty
+/// never reaps a temp we cannot prove is an orphan (a leak is safe; a wrong reap is not).
+fn pid_is_alive(pid: u32) -> bool {
+    match std::fs::symlink_metadata(format!("/proc/{pid}")) {
+        Ok(_) => true,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+        Err(_) => true,
+    }
+}
+
+/// Sweep crash-orphaned commit temporaries (`.commit-tmp.<pid>.<base>`) under DIR whose
+/// owning pid is dead — a hard kill between the canonical copy and the atomic rename leaves
+/// one behind. A live pid's staging tree is left untouched. Best-effort: an error defers the
+/// reclaim to a later pass.
+fn sweep_commit_temps(dir: &Path) {
+    let rd = match std::fs::read_dir(dir) {
+        Ok(r) => r,
+        Err(_) => return,
+    };
+    for entry in rd.flatten() {
+        let name = entry.file_name();
+        let name = match name.to_str() {
+            Some(s) => s,
+            None => continue,
+        };
+        let pid = name
+            .strip_prefix(".commit-tmp.")
+            .and_then(|rest| rest.split('.').next())
+            .and_then(|p| p.parse::<u32>().ok());
+        if let Some(pid) = pid {
+            if !pid_is_alive(pid) {
+                let _ = remove_store_path(&entry.path());
+            }
+        }
+    }
+}
+
+/// Copy SRC canonically to DEST atomically: stage into a sibling temp, then rename into
+/// place. A kill before the rename leaves only the (swept) temp — DEST is never a
+/// partially-copied tree. DEST must be absent; the caller handles an existing DEST.
+fn commit_canonical_atomic(src: &Path, dest: &Path) -> Result<(), String> {
+    let tmp = commit_temp_path(dest)?;
+    remove_store_path(&tmp)?; // clear this pid's own stale temp from an earlier crash
+    if let Err(e) = copy_canonical(src, &tmp) {
+        let _ = remove_store_path(&tmp);
+        return Err(e);
+    }
+    std::fs::rename(&tmp, dest).map_err(|e| {
+        let _ = remove_store_path(&tmp);
+        format!("commit rename {} -> {}: {e}", tmp.display(), dest.display())
+    })
+}
+
+/// Write BYTES to PATH atomically: to a sibling temp, then rename over PATH. A kill
+/// mid-write leaves only the (swept) temp; PATH is never a truncated file — the torn-db /
+/// torn-receipt failure mode.
+fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    let tmp = commit_temp_path(path)?;
+    std::fs::write(&tmp, bytes).map_err(|e| format!("write {}: {e}", tmp.display()))?;
+    std::fs::rename(&tmp, path).map_err(|e| {
+        let _ = remove_store_path(&tmp);
+        format!("commit rename {} -> {}: {e}", tmp.display(), path.display())
+    })
+}
+
+/// The store paths already committed (registered with a hash) in the persistent cache DB —
+/// used to tell a torn orphan (unregistered) from a real ABI-drift conflict (registered). A
+/// missing DB is the first commit (empty set); an unreadable DB is a torn write from an
+/// interrupted commit, surfaced with a recovery hint rather than read as empty (which would
+/// misjudge every registered path a torn orphan and clobber the whole cache).
+fn read_registered_paths(db: &Path) -> Result<std::collections::HashSet<String>, String> {
+    match std::fs::read(db) {
+        Ok(bytes) => {
+            let hashes = store_db_read::Db::open(bytes)
+                .and_then(|d| d.hashes_by_path())
+                .map_err(|e| {
+                    format!(
+                        "read cache db {}: {e} — the persistent build-cache db is unreadable \
+                         (a torn write from an interrupted commit); remove {} to rebuild it",
+                        db.display(),
+                        db.display()
+                    )
+                })?;
+            Ok(hashes.into_keys().collect())
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            // `read` follows symlinks, so NotFound means the db is genuinely absent (an empty
+            // first-commit set) ONLY if nothing is at the path at all. A dangling/unreadable db
+            // symlink also reads NotFound; treat that as a torn db and fail closed rather than
+            // misjudge every registered path a torn orphan.
+            match std::fs::symlink_metadata(db) {
+                Err(m) if m.kind() == std::io::ErrorKind::NotFound => {
+                    Ok(std::collections::HashSet::new())
+                }
+                Ok(_) => Err(format!(
+                    "read cache db {}: the path exists but its contents are unreadable \
+                     (a dangling or torn db from an interrupted commit); remove {} to rebuild it",
+                    db.display(),
+                    db.display()
+                )),
+                Err(m) => Err(format!("stat cache db {}: {m}", db.display())),
+            }
+        }
+        Err(e) => Err(format!("read cache db {}: {e}", db.display())),
+    }
+}
+
 /// Commit a freshly-built output tree to a store DESTINATION that may already exist, safely
 /// under ABI-token addressing. Pre-ABI an already-present store path was guaranteed to hold
 /// the same bytes (the path WAS the content hash), so a commit was a pure idempotent skip.
@@ -811,24 +983,47 @@ fn copy_canonical(src: &Path, dst: &Path) -> Result<(), String> {
 /// the copy and let the caller's `merge_output_db`/receipt-write describe bytes that are not
 /// there (a stale tree with a fresh DB record). `expected` is the NAR hash the current build
 /// recorded for this output (`sha256:<hex>`). Absent dest → a plain copy; matching dest → an
-/// idempotent skip; mismatching dest → the ABI-bump demand.
-fn commit_tree_checked(src: &Path, dest: &Path, expected: &str) -> Result<(), String> {
-    if !dest.exists() {
-        return copy_canonical(src, dest);
+/// idempotent skip; mismatching dest → recovered if a torn orphan, else the ABI-bump demand.
+///
+/// The commit is ATOMIC (stage into a sibling temp, rename into place), so a kill can never
+/// leave a partial tree at DEST. An already-present DEST that hashes `expected` is the
+/// idempotent skip. A mismatching DEST is disambiguated by `registered` — whether the
+/// persistent DB already vouches this path: a REGISTERED mismatch is real ABI-drift (two
+/// builds produced different bytes for one ABI-keyed path) and fails closed; an
+/// UNREGISTERED mismatch is a torn tree an interrupted commit left behind (its DB
+/// registration never ran) and is recovered — removed and re-committed — rather than
+/// wedging the shared cache forever.
+fn commit_tree_checked(
+    src: &Path,
+    dest: &Path,
+    expected: &str,
+    registered: bool,
+) -> Result<(), String> {
+    // Only a NotFound dest is genuinely absent; any other metadata error must surface, never be
+    // read as "absent" — that would rename over a registered path we simply could not stat.
+    match dest.symlink_metadata() {
+        Ok(_) => match nar_hash_path(dest) {
+            Ok(have) if have == expected => return Ok(()),
+            outcome if registered => {
+                let detail = match outcome {
+                    Ok(have) => format!("holds a tree hashing {have}"),
+                    Err(e) => format!("is unreadable ({e})"),
+                };
+                return Err(format!(
+                    "store commit: {} {detail}, but this build produced {expected} — an output \
+                     path is keyed on the ABI token, so identical paths MUST be identical bytes. \
+                     A registered output changed without a BUILDER_ABI bump: bump store::BUILDER_ABI \
+                     (or set TD_BUILDER_ABI) so the changed output takes a fresh path. Refusing to \
+                     overwrite the store record over stale bytes.",
+                    dest.display()
+                ));
+            }
+            _ => remove_store_path(dest)?,
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(format!("stat {}: {e}", dest.display())),
     }
-    let have = nar_hash_path(dest)
-        .map_err(|e| format!("re-hash existing store dest {}: {e}", dest.display()))?;
-    if have != expected {
-        return Err(format!(
-            "store commit: {} already holds a tree hashing {have}, but this build produced \
-             {expected} — an output path is keyed on the ABI token, so identical paths MUST be \
-             identical bytes. An output changed without a BUILDER_ABI bump: bump store::BUILDER_ABI \
-             (or set TD_BUILDER_ABI) so the changed output takes a fresh path. Refusing to overwrite \
-             the store record over stale bytes.",
-            dest.display()
-        ));
-    }
-    Ok(())
+    commit_canonical_atomic(src, dest)
 }
 
 /// One built output's post-build registration facts — the daemon's per-path
@@ -1084,7 +1279,7 @@ fn merge_output_db(dest_db: &Path, new_regs: &[OutputReg]) -> Result<(), String>
         Err(e) => return Err(format!("read {}: {e}", dest_db.display())),
     };
     let bytes = merge_regs(existing.as_deref(), new_regs)?;
-    std::fs::write(dest_db, bytes).map_err(|e| format!("write {}: {e}", dest_db.display()))
+    write_atomic(dest_db, &bytes)
 }
 
 /// The `store-add-recursive` body, factored so the merge semantics unit-test:
@@ -1257,7 +1452,24 @@ fn commit_scratch_to_store(scratch: &Path, store_dir: &str, db: &Path) -> Result
     if regs.is_empty() {
         return Err("no outputs in the registration to commit".to_string());
     }
+    // Hold the per-store commit lock across create-dir -> sweep -> snapshot -> tree commits ->
+    // db merge -> receipt, so no second writer — nor GC renaming the whole cache aside — can
+    // race a path this transaction is publishing or recovering. Taken BEFORE the cache dir is
+    // (re)created so it serializes with eviction, which takes the same stable lock.
+    let _commit_lock = lock_store_commit(db)?;
     std::fs::create_dir_all(store_dir).map_err(|e| e.to_string())?;
+    // Recover from any interrupted commit before writing: sweep crash-orphaned staging
+    // temps from the store, the db dir, and the receipts dir.
+    sweep_commit_temps(Path::new(store_dir));
+    if let Some(dbdir) = db.parent() {
+        sweep_commit_temps(dbdir);
+    }
+    let mut receipts_dir = db.as_os_str().to_owned();
+    receipts_dir.push(".receipts");
+    sweep_commit_temps(Path::new(&receipts_dir));
+    // Which paths the persistent db already vouches — tells a torn orphan (unregistered)
+    // from a real ABI-drift conflict (registered) in commit_tree_checked.
+    let registered = read_registered_paths(db)?;
     let newstore = scratch.join("newstore");
     let mut committed = Vec::with_capacity(regs.len());
     for r in &regs {
@@ -1272,10 +1484,9 @@ fn commit_scratch_to_store(scratch: &Path, store_dir: &str, db: &Path) -> Result
             return Err(format!("output tree missing under {}", src.display()));
         }
         let dest = Path::new(store_dir).join(base);
-        // Under ABI-token addressing an already-present path is NOT guaranteed to hold the
-        // same bytes, so re-hash it and fail closed on a mismatch rather than skip the copy
-        // and let merge_output_db/the receipt below describe a stale tree (re #469 ABI merge).
-        commit_tree_checked(&src, &dest, &r.nar_hash)?;
+        // Commit atomically and fail closed only on a REGISTERED mismatch (a torn orphan is
+        // recovered) — see commit_tree_checked.
+        commit_tree_checked(&src, &dest, &r.nar_hash, registered.contains(&r.store_path))?;
         committed.push(r.store_path.clone());
     }
     merge_output_db(db, &regs)?;
@@ -1293,7 +1504,7 @@ fn commit_scratch_to_store(scratch: &Path, store_dir: &str, db: &Path) -> Result
             if let Some(dir) = rp.parent() {
                 std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
             }
-            std::fs::write(&rp, receipt).map_err(|e| format!("write {}: {e}", rp.display()))?;
+            write_atomic(&rp, receipt.as_bytes())?;
         }
     }
     Ok(committed)
@@ -4167,13 +4378,13 @@ fn build_plan(
             .rsplit('/')
             .next()
             .ok_or_else(|| format!("step `{name}': output is not a store path"))?;
-        // Copy the step's output into the shared td-store so a downstream step can
-        // stage it (a real dir — sandbox::build bind-mounts it, so no symlink). An
-        // already-present dest is re-hashed (ABI-token paths are not content addresses,
-        // so same path ≠ same bytes without an ABI bump) and fails closed on a mismatch.
+        // Atomically stage the step's output into the per-invocation td-store so a
+        // downstream step can bind-mount it (a real dir, no symlink). This store has no
+        // persistent db, so any already-present mismatch is a real in-invocation conflict:
+        // fail closed (registered = true), never a torn-orphan recovery.
         let physical = step_scratch.join("newstore").join(base);
         let dest = tdstore.join(base);
-        commit_tree_checked(&physical, &dest, &out.nar_hash)?;
+        commit_tree_checked(&physical, &dest, &out.nar_hash, true)?;
         built.insert(name.to_string(), out.store_path.clone());
         td_dbs.push((
             step_scratch.join("td.db").to_string_lossy().into_owned(),
@@ -4267,8 +4478,8 @@ fn auto_topo(
 }
 
 /// Parse a --auto MAP file: `NAME PATH` per line (blank/`#`-comment lines skipped) —
-/// the pinned-source resolution `ladder_setup` interns (its `srcs.map`; the
-/// host-tool `tools.map` half is deleted, re #469). The FIRST occurrence of a
+/// the pinned-source resolution `ladder_setup` interns (the fresh per-run auto-map;
+/// the host-tool `tools.map` half is deleted, re #469). The FIRST occurrence of a
 /// name wins, so a duplicated name keeps its earliest entry.
 fn auto_parse_map(text: &str) -> std::collections::BTreeMap<String, String> {
     let mut m = std::collections::BTreeMap::new();
@@ -8302,7 +8513,7 @@ fn main() -> ExitCode {
         // `inputs`/`nativeInputs`/`sourceInput` (owned deps `td-recipe-output`,
         // everything else resolved through MAP-FILE), and run it. An input is owned iff
         // RECIPE-DIR/<name>.json exists. MAP-FILE is `NAME PATH` per line — the pinned
-        // seed/source paths `ladder_setup` interned (srcs.map; host tools are not
+        // seed/source paths `ladder_setup` interned (the fresh per-run auto-map; host tools are not
         // admissible inputs, and each PATH must be a canonical store item interned in
         // SEED-STORE or synthesis reds with `provenance rejected`, re #469). SEED-DB is
         // the td-owned db those interns registered into — under strict provenance every
@@ -11136,9 +11347,9 @@ daemon build START (2/2 active)
     }
 
     // commit_tree_checked guards the ABI-token invariant: output paths are keyed on the ABI
-    // token, not content, so an already-present dest is re-hashed and a MISMATCH (an output
-    // changed without a BUILDER_ABI bump) fails closed with an ABI-bump demand instead of
-    // silently keeping stale bytes under a fresh store record.
+    // token, not content, so an already-present REGISTERED dest is re-hashed and a MISMATCH
+    // (an output changed without a BUILDER_ABI bump) fails closed with an ABI-bump demand
+    // instead of silently keeping stale bytes under a fresh store record.
     #[test]
     fn commit_tree_checked_rejects_mismatched_existing_dest() {
         let base = std::env::temp_dir().join(format!("td-ctc-{}", std::process::id()));
@@ -11149,24 +11360,176 @@ daemon build START (2/2 active)
         std::fs::write(src.join("out"), b"built-bytes").unwrap();
         let want = nar_hash_path(&src).unwrap();
 
-        // Absent dest -> a plain copy, NAR-identical to the source.
-        commit_tree_checked(&src, &dst, &want).unwrap();
+        // Absent dest -> a plain (atomic) copy, NAR-identical to the source, no staging temp.
+        commit_tree_checked(&src, &dst, &want, false).unwrap();
         assert_eq!(nar_hash_path(&dst).unwrap(), want, "absent dest copied");
+        assert!(!has_commit_temp(&base), "no staging temp left after a clean commit");
 
         // Present dest with the SAME bytes -> idempotent skip, no error, no change.
-        commit_tree_checked(&src, &dst, &want).unwrap();
+        commit_tree_checked(&src, &dst, &want, false).unwrap();
         assert_eq!(nar_hash_path(&dst).unwrap(), want, "matching dest unchanged");
 
-        // Present dest with DIFFERENT bytes at the SAME (ABI-token) path -> fail closed with
-        // an ABI-bump demand, and the stale tree is left intact (never silently replaced).
+        // Present REGISTERED dest with DIFFERENT bytes at the SAME (ABI-token) path -> fail
+        // closed with an ABI-bump demand, and the stale tree is left intact.
         let stale = base.join("stale");
         std::fs::create_dir_all(&stale).unwrap();
         std::fs::write(stale.join("out"), b"stale-different-bytes").unwrap();
-        let err = commit_tree_checked(&src, &stale, &want).unwrap_err();
+        let err = commit_tree_checked(&src, &stale, &want, true).unwrap_err();
         assert!(err.contains("BUILDER_ABI"), "mismatch must demand an ABI bump: {err}");
         assert_ne!(nar_hash_path(&stale).unwrap(), want, "stale dest left intact");
 
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Any `.commit-tmp.*` staging entry left under DIR (a leaked/uncleaned commit temp).
+    fn has_commit_temp(dir: &Path) -> bool {
+        std::fs::read_dir(dir).map(|rd| {
+            rd.flatten().any(|e| {
+                e.file_name()
+                    .to_str()
+                    .is_some_and(|n| n.starts_with(".commit-tmp."))
+            })
+        }).unwrap_or(false)
+    }
+
+    // The poisoning fix: a torn tree an interrupted commit left at the final path is
+    // UNREGISTERED (its db merge never ran), so commit_tree_checked recovers it — removes
+    // the orphan and re-commits — instead of failing closed on it forever and wedging the
+    // shared cache. Contrast the registered case above, which MUST fail closed.
+    #[test]
+    fn commit_tree_checked_recovers_a_torn_unregistered_orphan() {
+        let base = std::env::temp_dir().join(format!("td-ctc-recover-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let src = base.join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("out"), b"the-real-bytes").unwrap();
+        let want = nar_hash_path(&src).unwrap();
+
+        // A torn/partial tree sitting at the final path, NOT registered in any db.
+        let dest = base.join("dest");
+        std::fs::create_dir_all(&dest).unwrap();
+        std::fs::write(dest.join("out"), b"partial-torn").unwrap();
+        assert_ne!(nar_hash_path(&dest).unwrap(), want, "precondition: dest is torn");
+
+        // Unregistered mismatch -> recovered: the orphan is replaced with the real tree.
+        commit_tree_checked(&src, &dest, &want, false).unwrap();
+        assert_eq!(nar_hash_path(&dest).unwrap(), want, "torn orphan recovered to the real tree");
+        assert!(!has_commit_temp(&base), "recovery leaves no staging temp");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    // sweep_commit_temps reaps ONLY crash-orphaned temps whose owning pid is dead; a live
+    // pid's staging tree (a concurrent committer, or our own in-flight one) is never removed.
+    #[test]
+    fn sweep_commit_temps_reaps_dead_pid_temps_only() {
+        let dir = std::env::temp_dir().join(format!("td-sweep-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // A dead pid (u32::MAX is never a live process) and this live test process.
+        let dead = dir.join(format!(".commit-tmp.{}.out-1.0", u32::MAX));
+        let live = dir.join(format!(".commit-tmp.{}.out-1.0", std::process::id()));
+        let keep = dir.join("real-store-item"); // not a temp — never touched
+        std::fs::create_dir_all(&dead).unwrap();
+        std::fs::create_dir_all(&live).unwrap();
+        std::fs::create_dir_all(&keep).unwrap();
+
+        sweep_commit_temps(&dir);
+        assert!(!dead.exists(), "a dead pid's orphan temp is reaped");
+        assert!(live.exists(), "a live pid's staging temp is left alone");
+        assert!(keep.exists(), "a real store item is never mistaken for a temp");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // write_atomic replaces PATH via a sibling temp + rename, so a reader sees the old or the
+    // new bytes but never a truncated file — the torn-db/torn-receipt failure mode.
+    #[test]
+    fn write_atomic_replaces_without_leaving_a_temp() {
+        let dir = std::env::temp_dir().join(format!("td-watomic-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("db");
+        write_atomic(&f, b"first").unwrap();
+        assert_eq!(std::fs::read(&f).unwrap(), b"first");
+        write_atomic(&f, b"second-longer-and-different").unwrap();
+        assert_eq!(std::fs::read(&f).unwrap(), b"second-longer-and-different");
+        assert!(!has_commit_temp(&dir), "no staging temp left after atomic writes");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // read_registered_paths: a missing db is the first commit (empty set); a written db yields
+    // its registered paths; a torn/corrupt db is surfaced with a recovery hint, never read as
+    // empty (which would misjudge every registered path a torn orphan and clobber the cache).
+    #[test]
+    fn read_registered_paths_distinguishes_missing_from_torn() {
+        let dir = std::env::temp_dir().join(format!("td-regpaths-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("db");
+        assert!(read_registered_paths(&db).unwrap().is_empty(), "missing db -> first commit");
+
+        let out_path = format!("/td/store/{}-out-1.0", "a".repeat(32));
+        write_output_db(
+            std::slice::from_ref(&OutputReg {
+                store_path: out_path.clone(),
+                nar_hash: "sha256:deadbeef".to_string(),
+                nar_size: 7,
+                refs: vec![],
+                deriver: String::new(),
+            }),
+            &db,
+        )
+        .unwrap();
+        let reg = read_registered_paths(&db).unwrap();
+        assert!(reg.contains(&out_path), "a written db vouches its path: {reg:?}");
+
+        std::fs::write(&db, b"not-a-valid-store-db").unwrap();
+        let err = read_registered_paths(&db).unwrap_err();
+        assert!(err.contains("unreadable"), "a torn db is surfaced, not read as empty: {err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // A dangling db symlink reads NotFound (fs::read follows it), but the path is NOT genuinely
+    // absent — reading it as an empty first-commit set would misjudge every registered path a
+    // torn orphan and clobber the cache. It must fail closed.
+    #[test]
+    fn read_registered_paths_fails_closed_on_a_dangling_db_symlink() {
+        let dir = std::env::temp_dir().join(format!("td-regpaths-dangle-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("db");
+        std::os::unix::fs::symlink(dir.join("no-such-target"), &db).unwrap();
+        let err = read_registered_paths(&db).unwrap_err();
+        assert!(err.contains("unreadable"), "a dangling db symlink fails closed: {err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // The per-store commit lock is exclusive: while one committer holds it, a second acquirer on
+    // the SAME store's lock file cannot take it (flock contends across independent open
+    // descriptions even within one process), and it becomes acquirable again once released. This
+    // is the single-writer guarantee that keeps the delete-capable recovery safe against a
+    // committer the client-side ladder lock does not cover.
+    #[test]
+    fn lock_store_commit_is_exclusive_per_store() {
+        let dir = std::env::temp_dir().join(format!("td-commitlock-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = dir.join("build-cache");
+        std::fs::create_dir_all(&store).unwrap();
+        let db = store.join("db");
+        let held = lock_store_commit(&db).unwrap();
+        // The lock is a SIBLING of the store dir, not inside it — so eviction (which renames the
+        // store dir aside) never changes the lock inode.
+        let lock_path = dir.join("build-cache.commit.lock");
+        assert!(lock_path.exists(), "lock sits beside the store dir, not inside it");
+        assert!(!store.join("db.commit.lock").exists(), "lock is not inside the evictable store dir");
+        let contender = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .unwrap();
+        assert!(contender.try_lock().is_err(), "commit lock held exclusively while in use");
+        drop(held);
+        assert!(contender.try_lock().is_ok(), "commit lock acquirable again once released");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
