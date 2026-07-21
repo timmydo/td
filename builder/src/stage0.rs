@@ -844,10 +844,32 @@ mod tests {
         d
     }
 
-    fn exec_file(p: &Path) {
+    /// A shebang line naming a POSIX shell that EXISTS here: a dev host's
+    /// `/bin/sh`, else `sh` resolved from PATH — the loop host-sandbox is
+    /// pivot_root'd with no `/bin/sh`, but its busybox userland puts `sh` on PATH.
+    /// The fixture cc/gcc stubs `provision_glibc_static` execs need a real
+    /// interpreter in both, so they run for real in the sandbox rather than
+    /// exec-failing.
+    fn sh_shebang() -> String {
+        if Path::new("/bin/sh").exists() {
+            return "#!/bin/sh\n".to_string();
+        }
+        let sh = find_in_path(&std::env::var("PATH").unwrap_or_default(), "sh")
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "/bin/sh".to_string());
+        format!("#!{sh}\n")
+    }
+
+    /// Write an executable shell fixture (a fake `cc`/`gcc`) with a shebang that
+    /// resolves in this environment (see `sh_shebang`).
+    fn write_exec(p: &Path, body: &str) {
         std::fs::create_dir_all(p.parent().unwrap()).unwrap();
-        std::fs::write(p, "#!/bin/sh\n").unwrap();
+        std::fs::write(p, format!("{}{body}", sh_shebang())).unwrap();
         std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    fn exec_file(p: &Path) {
+        write_exec(p, "");
     }
 
     /// A hermetic resolver env: no homes, an absent lock, an EMPTY search
@@ -1062,13 +1084,7 @@ mod tests {
         ar(&cc_libdir.join("libc.a"));
         // A fake cc that answers -print-file-name=libc.a with that absolute path.
         let ccbin = d.join("cc/bin/cc");
-        std::fs::create_dir_all(ccbin.parent().unwrap()).unwrap();
-        std::fs::write(
-            &ccbin,
-            format!("#!/bin/sh\necho {}\n", cc_libdir.join("libc.a").display()),
-        )
-        .unwrap();
-        std::fs::set_permissions(&ccbin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        write_exec(&ccbin, &format!("echo {}\n", cc_libdir.join("libc.a").display()));
         // A lock ALSO offering a glibc-static pin — the cc leg must beat it.
         let pin = d.join("store/zzz-glibc-2.41-static");
         ar(&pin.join("lib/libc.a"));
@@ -1086,8 +1102,7 @@ mod tests {
         // paired with the lock's guix glibc:static — its crt objects are a
         // DIFFERENT glibc, so a static link SIGSEGVs at startup (Codex P1). It
         // fails closed rather than silently mismatching.
-        std::fs::write(&ccbin, "#!/bin/sh\necho libc.a\n").unwrap();
-        std::fs::set_permissions(&ccbin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        write_exec(&ccbin, "echo libc.a\n");
         assert!(provision_glibc_static(&env)
             .unwrap_err()
             .contains("no static glibc"));
@@ -1097,9 +1112,7 @@ mod tests {
         // together — so THAT does fall through to the pin.
         let gcc = d.join("store/ggg-gcc-toolchain-15.2.0");
         let gccbin = gcc.join("bin/gcc");
-        std::fs::create_dir_all(gccbin.parent().unwrap()).unwrap();
-        std::fs::write(&gccbin, "#!/bin/sh\necho libc.a\n").unwrap();
-        std::fs::set_permissions(&gccbin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        write_exec(&gccbin, "echo libc.a\n");
         let lock_gcc = d.join("lock-gcc");
         std::fs::write(
             &lock_gcc,
@@ -1134,16 +1147,10 @@ mod tests {
         std::fs::create_dir_all(&bin).unwrap();
         // bin/cc: a wrapper that forwards to `gcc` found on PATH (its own sibling).
         let ccbin = bin.join("cc");
-        std::fs::write(&ccbin, "#!/bin/sh\nexec gcc \"$@\"\n").unwrap();
-        std::fs::set_permissions(&ccbin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        write_exec(&ccbin, "exec gcc \"$@\"\n");
         // bin/gcc: the sibling that answers with the ABSOLUTE libc.a path.
         let gccbin = bin.join("gcc");
-        std::fs::write(
-            &gccbin,
-            format!("#!/bin/sh\necho {}\n", cc_libdir.join("libc.a").display()),
-        )
-        .unwrap();
-        std::fs::set_permissions(&gccbin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        write_exec(&gccbin, &format!("echo {}\n", cc_libdir.join("libc.a").display()));
 
         let mut env = base_env(&d.join("absent-lock"));
         env.cc_home = Some(d.join("cc").to_string_lossy().into_owned());

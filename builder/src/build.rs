@@ -2471,7 +2471,10 @@ mod tests {
         fs::remove_dir_all(&d).unwrap();
     }
 
-    /// The test-process bash + a PATH env for the child (scripts use sleep etc.).
+    /// A real bash + a PATH env for the child (scripts use `printf`/`sleep`/`head`).
+    /// On a dev host that is the system bash; in the loop host-sandbox it is the
+    /// seed bash the `cargo-test` gate puts on PATH (gate_defs/325-cargo-test.rs),
+    /// so these tests RUN there rather than being skipped.
     fn bash_and_env() -> (String, Vec<(String, String)>) {
         let path = env::var("PATH").unwrap();
         let bash = find_in_path(&path, "bash").expect("bash on PATH");
@@ -2712,8 +2715,13 @@ mod tests {
         // Verified red: dropping the `now - run_start >= repeat_ms` gate (trip on
         // volume alone) reds this while the spin test above still passes.
         let (bash, envs) = bash_and_env();
-        let tar_like =
-            "yes 'tar: Ignoring unknown extended header keyword' | head -n 50000; echo done-ok";
+        // `yes` is absent from the loop's busybox userland; a single bash
+        // `printf` emits the burst instead — `%.0s` consumes each brace-expanded
+        // arg and prints nothing, so `{1..50000}` yields exactly 50000 identical
+        // lines and then EXITS, completing before the window (as the old
+        // `yes … | head -n 50000` did).
+        let tar_like = "printf 'tar: Ignoring unknown extended header keyword\\n%.0s' \
+            {1..50000}; echo done-ok";
         let t0 = Instant::now();
         run_cmd(&bash, &["-c", tar_like], ".", &envs, &w(0, 0, 5000))
             .expect("a healthy high-volume identical burst that COMPLETES must stay green");
@@ -2816,11 +2824,12 @@ mod tests {
         // on a noisy-but-terminating tool. And a changing stderr stream resets
         // the counter, so far more total lines than the limit stay green.
         let (bash, envs) = bash_and_env();
-        let noisy = "for i in $(seq 24); do echo 'same warning' >&2; done; echo done-ok";
+        // bash C-loops (no `seq`, absent from the loop's busybox userland).
+        let noisy = "for ((i=0;i<24;i++)); do echo 'same warning' >&2; done; echo done-ok";
         run_cmd(&bash, &["-c", noisy], ".", &envs, &w(600, 25, 0))
             .expect("sub-limit repeats must stay green");
         let alternating =
-            "for i in $(seq 40); do echo \"warn $((i % 2))\" >&2; done; echo done-ok";
+            "for ((i=0;i<40;i++)); do echo \"warn $((i % 2))\" >&2; done; echo done-ok";
         run_cmd(&bash, &["-c", alternating], ".", &envs, &w(600, 25, 0))
             .expect("alternating stderr lines must reset the repeat counter");
     }

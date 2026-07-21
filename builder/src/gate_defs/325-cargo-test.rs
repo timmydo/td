@@ -52,7 +52,7 @@
 //! deep from-source gates stay on the dev-machine full `td-builder check` (the
 //! §7.2 step-2 landing gate) + the nightly daily suite.
 
-use crate::gates::{GateDef, Pool, StoreMode};
+use crate::gates::{ArtifactInput, GateDef, InputKind, Pool, StoreMode};
 
 pub fn gate() -> GateDef {
     GateDef {
@@ -61,7 +61,19 @@ pub fn gate() -> GateDef {
         needs: &[],
         build_gate: false,
         specs: &[],
-        inputs: &[],
+        // A real bash for the engine's process-supervision unit tests
+        // (build::tests::watchdog_*): the loop host-sandbox's busybox userland
+        // has only `sh` (ash), and those tests exercise bash. This seed bash is
+        // a control-plane lock root already bound read-only in the sandbox (same
+        // lock provision-{rust,cc} resolve the toolchain from); the body appends
+        // its bin to PATH (after busybox, so it can't shadow the gate's own `sh`,
+        // and after a dev host's system bash so that one still wins). Scoped to
+        // THIS gate — NOT the global loop userland — so recipe rungs still see no
+        // ambient shell (check_loop.rs).
+        inputs: &[ArtifactInput {
+            name: "bash",
+            kind: InputKind::LockEntry { lock: "tests/td-builder-rust.lock", stem: "bash" },
+        }],
         store: StoreMode::Shared,
         non_blocking: false,
         script: r##"
@@ -74,10 +86,11 @@ pub fn gate() -> GateDef {
 	done; \
 rustpath=`"$td" provision-rust`; \
 ccpath=`"$td" provision-cc`; \
+bashbin="${TD_GATE_INPUT_BASH:?gate-run exports TD_GATE_INPUT_BASH}/bin"; \
 scratch="$PWD/.cargo-test-scratch"; \
 rm -rf "$scratch"; mkdir -p "$scratch/home" "$scratch/target"; \
 log="$scratch/out.log"; \
-PATH="$rustpath:$ccpath:$PATH" \
+PATH="$rustpath:$ccpath:$PATH:$bashbin" \
 CARGO_HOME="$scratch/home" CARGO_TARGET_DIR="$scratch/target" \
 	  sh -c 'set -e; \
 	    cargo clippy --frozen --manifest-path builder/Cargo.toml; \
