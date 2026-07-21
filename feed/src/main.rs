@@ -1075,26 +1075,55 @@ fn strip_scheme(url: &str) -> String {
         .to_string()
 }
 
-/// The shared feed `(addr, store)` if TD_FEED_BASE is set (the loop prelude runs
-/// `td-feed ensure-serve` for the daemon lifecycle and exports it). Else None (direct).
+/// The shared feed directory: $TD_FEED_DIR (non-empty), else $HOME/.td/feed.
+fn feed_dir() -> PathBuf {
+    resolve_feed_dir(
+        std::env::var("TD_FEED_DIR").ok().as_deref(),
+        std::env::var("HOME").ok().as_deref(),
+    )
+}
+
+/// Pure resolution of `feed_dir()` (env passed in so it is unit-testable): a
+/// non-empty TD_FEED_DIR wins; else `<HOME>/.td/feed` (HOME unset -> relative).
+fn resolve_feed_dir(td_feed_dir: Option<&str>, home: Option<&str>) -> PathBuf {
+    match td_feed_dir {
+        Some(v) if !v.trim().is_empty() => PathBuf::from(v.trim()),
+        _ => PathBuf::from(home.unwrap_or(".")).join(".td/feed"),
+    }
+}
+
+/// The shared feed `(addr, store)` — the ONE cross-worktree single-egress path.
+/// This does NOT depend on the caller's env: if TD_FEED_BASE is exported (the loop
+/// prelude runs `td-feed ensure-serve` and exports it) use it directly; otherwise
+/// ensure/discover the shared daemon ourselves on the default store, so an ad-hoc
+/// or background `td-feed warm sources` still egresses each pin ONCE for the whole
+/// host instead of dropping to a per-worktree direct GET. None only if we could
+/// neither reach an exported feed nor bring the shared daemon up.
 fn shared_feed() -> Option<(String, PathBuf)> {
-    let base = std::env::var("TD_FEED_BASE")
-        .ok()
-        .filter(|s| !s.is_empty())?;
-    let addr = strip_scheme(&base);
-    let feed_dir = std::env::var("TD_FEED_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| {
-            let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-            PathBuf::from(home).join(".td/feed")
-        });
-    Some((addr, feed_dir.join("store")))
+    let dir = feed_dir();
+    let store = dir.join("store");
+    if let Some(base) = std::env::var("TD_FEED_BASE").ok().filter(|s| !s.is_empty()) {
+        return Some((strip_scheme(&base), store));
+    }
+    match ensure_serve_daemon(&dir) {
+        Ok(addr) => Some((addr, store)),
+        Err(e) => {
+            eprintln!(
+                ">> td-feed warm sources: could not ensure the shared feed ({e}) — \
+                 falling back to a direct fetch"
+            );
+            None
+        }
+    }
 }
 
 /// warm sources — fetch the recipe-owned pinned source-bootstrap tarballs into
-/// .td-build-cache/sources/ for the offline heavy `bootstrap-*` gates, then produce the i386
-/// + x86_64 Linux UAPI headers. Prefers the shared feed (TD_FEED_BASE), else a direct GET.
-/// td OWNS the fetch (no guix-as-fetcher); each tarball is verified against its recipe sha256.
+/// .td-build-cache/sources/ for the offline heavy `bootstrap-*` gates, then produce the
+/// i386 and x86_64 Linux UAPI headers. Routes through the SHARED feed for cross-worktree
+/// single egress: it uses an exported TD_FEED_BASE, else brings the shared daemon up itself
+/// (`shared_feed`), so egress does not depend on the caller's env; a direct GET is only the
+/// last-resort fallback. td OWNS the fetch (no guix-as-fetcher); each tarball is verified
+/// against its recipe sha256.
 fn warm_sources(root: &Path) -> Result<(), String> {
     let pins = recipe_source_pins_result(root)?;
     let dest = root.join(".td-build-cache/sources");
@@ -1577,6 +1606,24 @@ fn pid_alive(pid: u32) -> bool {
     Path::new(&format!("/proc/{pid}")).exists()
 }
 
+/// Is something actually listening at `addr` (host:port)? A recorded feed.addr is
+/// only reusable if its daemon is reachable — `pid_alive` alone would trust a
+/// recycled pid whose recorded port is now dead, silently dropping single-egress
+/// back to a per-worktree direct fetch. A dead loopback port returns ECONNREFUSED
+/// at once regardless of the bound, so the generous 1s timeout never slows the
+/// spawn-a-fresh-daemon path; it only guards the live-but-slow case: on a
+/// scheduler-starved host a too-short bound would false-negative a healthy daemon
+/// and orphan it behind a second one. 1s is far above any real loopback handshake.
+fn feed_addr_reachable(addr: &str) -> bool {
+    use std::net::ToSocketAddrs;
+    let Ok(mut socks) = addr.to_socket_addrs() else {
+        return false;
+    };
+    socks.any(|sa| {
+        TcpStream::connect_timeout(&sa, std::time::Duration::from_secs(1)).is_ok()
+    })
+}
+
 /// `td-feed ensure-serve` — ensure ONE shared, persistent td-feed `serve` daemon
 /// is running for this host, and print its loopback address (HOST:PORT) on
 /// stdout (native since #318 axis 2 — was tools/feed-ensure.sh). Idempotent +
@@ -1592,42 +1639,50 @@ fn pid_alive(pid: u32) -> bool {
 ///
 /// The daemon binary is TD_FEED_BIN if set, else THIS executable (the natural
 /// port: ensure-serve IS a td-feed subcommand, so it launches its own `serve`).
+///
+/// The daemon lifecycle is factored into `ensure_serve_daemon`, which returns the
+/// address instead of exiting so `warm sources` can bring the shared feed up itself
+/// when TD_FEED_BASE is not exported — keeping single-egress self-sufficient.
 fn ensure_serve() -> ! {
-    let feed_dir = match std::env::var("TD_FEED_DIR") {
-        Ok(v) if !v.trim().is_empty() => PathBuf::from(v),
-        _ => {
-            let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-            PathBuf::from(home).join(".td/feed")
+    match ensure_serve_daemon(&feed_dir()) {
+        Ok(addr) => {
+            println!("{addr}");
+            std::process::exit(0);
         }
-    };
+        Err(e) => die(format!("ensure-serve: {e}")),
+    }
+}
+
+/// Ensure ONE shared, persistent `serve` daemon is running for `feed_dir`, returning
+/// its loopback address (HOST:PORT). Idempotent + concurrency-safe (an exclusive lock
+/// on feed.lock): the FIRST caller starts the daemon; every later caller (any worktree,
+/// any agent, `ensure-serve` OR `warm sources`) reuses it. The reuse path touches no
+/// daemon binary — only a fresh start resolves TD_FEED_BIN/current_exe — so a live
+/// daemon is shared without re-resolving the launcher.
+fn ensure_serve_daemon(feed_dir: &Path) -> Result<String, String> {
     let store = feed_dir.join("store");
     let addr_f = feed_dir.join("feed.addr");
     let pid_f = feed_dir.join("feed.pid");
     let log_f = feed_dir.join("feed.log");
     let lock_f = feed_dir.join("feed.lock");
-    if let Err(e) = std::fs::create_dir_all(&store) {
-        die(format!("ensure-serve: mkdir {}: {e}", store.display()));
-    }
-    let bin = match std::env::var("TD_FEED_BIN") {
-        Ok(v) if !v.trim().is_empty() && Path::new(&v).is_file() => PathBuf::from(v),
-        _ => std::env::current_exe()
-            .unwrap_or_else(|e| die(format!("ensure-serve: cannot resolve current_exe: {e}"))),
-    };
+    std::fs::create_dir_all(&store).map_err(|e| format!("mkdir {}: {e}", store.display()))?;
 
     // Serialize concurrent ensures so two agents never both start a daemon. The
     // lock file is O_CLOEXEC (std default), so the detached daemon does not
-    // inherit-and-hold it; it releases when this process exits.
+    // inherit-and-hold it; it releases when this handle drops.
     let lock = std::fs::OpenOptions::new()
         .create(true)
         .write(true)
         .truncate(false) // a lock handle only; its content is never written
         .open(&lock_f)
-        .unwrap_or_else(|e| die(format!("ensure-serve: open {}: {e}", lock_f.display())));
-    if let Err(e) = lock.lock() {
-        die(format!("ensure-serve: lock {}: {e}", lock_f.display()));
-    }
+        .map_err(|e| format!("open {}: {e}", lock_f.display()))?;
+    lock.lock()
+        .map_err(|e| format!("lock {}: {e}", lock_f.display()))?;
 
-    // Reuse a live daemon.
+    // Reuse a live daemon (started by any worktree/agent) — the cross-worktree
+    // share. Require BOTH a live pid AND a reachable recorded addr, so a stale
+    // feed.pid/feed.addr (crashed daemon, recycled pid) is not trusted; an
+    // unreachable record falls through to start a fresh daemon that overwrites it.
     let live_pid = std::fs::read_to_string(&pid_f)
         .ok()
         .and_then(|t| t.trim().parse::<u32>().ok())
@@ -1635,9 +1690,8 @@ fn ensure_serve() -> ! {
     if live_pid.is_some() {
         if let Ok(addr) = std::fs::read_to_string(&addr_f) {
             let addr = addr.trim();
-            if !addr.is_empty() {
-                println!("{addr}");
-                std::process::exit(0);
+            if !addr.is_empty() && feed_addr_reachable(addr) {
+                return Ok(addr.to_string());
             }
         }
     }
@@ -1646,11 +1700,15 @@ fn ensure_serve() -> ! {
     // process group so it outlives this launcher and survives ^C/hangup (the
     // shell's `nohup` role). stdout+stderr → the log; we scrape the bound
     // address from serve's announcement line.
+    let bin = match std::env::var("TD_FEED_BIN") {
+        Ok(v) if !v.trim().is_empty() && Path::new(&v).is_file() => PathBuf::from(v),
+        _ => std::env::current_exe().map_err(|e| format!("cannot resolve current_exe: {e}"))?,
+    };
     let log = std::fs::File::create(&log_f)
-        .unwrap_or_else(|e| die(format!("ensure-serve: create {}: {e}", log_f.display())));
+        .map_err(|e| format!("create {}: {e}", log_f.display()))?;
     let log2 = log
         .try_clone()
-        .unwrap_or_else(|e| die(format!("ensure-serve: clone log fd: {e}")));
+        .map_err(|e| format!("clone log fd: {e}"))?;
     let mut cmd = Command::new(&bin);
     cmd.arg("serve")
         .arg(&store)
@@ -1664,7 +1722,7 @@ fn ensure_serve() -> ! {
     }
     let mut child = cmd
         .spawn()
-        .unwrap_or_else(|e| die(format!("ensure-serve: spawn {} serve: {e}", bin.display())));
+        .map_err(|e| format!("spawn {} serve: {e}", bin.display()))?;
     let pid = child.id();
     let _ = std::fs::write(&pid_f, format!("{pid}\n"));
 
@@ -1673,22 +1731,17 @@ fn ensure_serve() -> ! {
         if let Ok(logtext) = std::fs::read_to_string(&log_f) {
             if let Some(addr) = logtext.lines().find_map(parse_serve_addr) {
                 let _ = std::fs::write(&addr_f, format!("{addr}\n"));
-                println!("{addr}");
-                std::process::exit(0);
+                return Ok(addr);
             }
         }
         if child.try_wait().ok().flatten().is_some() {
             let tail = std::fs::read_to_string(&log_f).unwrap_or_default();
-            die(format!(
-                "ensure-serve: daemon exited before binding:\n{tail}"
-            ));
+            return Err(format!("daemon exited before binding:\n{tail}"));
         }
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
     let tail = std::fs::read_to_string(&log_f).unwrap_or_default();
-    die(format!(
-        "ensure-serve: daemon did not report an address:\n{tail}"
-    ));
+    Err(format!("daemon did not report an address:\n{tail}"))
 }
 
 fn main() {
@@ -1782,7 +1835,8 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_serve_addr;
+    use super::{ensure_serve_daemon, parse_serve_addr, resolve_feed_dir};
+    use std::path::PathBuf;
 
     /// A per-invocation-unique temp dir under $TMPDIR. `cargo test` runs tests
     /// concurrently in ONE process, so `std::process::id()` alone is shared across
@@ -1956,5 +2010,82 @@ mod tests {
         assert_eq!(parse_serve_addr("on http://127.0.0.1/"), None); // no port
         assert_eq!(parse_serve_addr("on http://:8080/"), None); // no host
         assert_eq!(parse_serve_addr("on http://host:port/"), None); // non-numeric port
+    }
+
+    #[test]
+    fn feed_dir_resolution_prefers_non_empty_td_feed_dir() {
+        // A non-empty TD_FEED_DIR wins verbatim; empty/whitespace falls to
+        // <HOME>/.td/feed; a missing HOME degrades to a relative ./.td/feed. This
+        // is the store both `ensure-serve` and the self-ensuring `warm sources`
+        // share, so the two MUST resolve identically.
+        assert_eq!(
+            resolve_feed_dir(Some("/x/feed"), Some("/home/u")),
+            PathBuf::from("/x/feed")
+        );
+        assert_eq!(
+            resolve_feed_dir(Some("  /x/feed  "), Some("/home/u")),
+            PathBuf::from("/x/feed"),
+            "a padded value is trimmed, not turned into a spaced dir name"
+        );
+        assert_eq!(
+            resolve_feed_dir(Some("   "), Some("/home/u")),
+            PathBuf::from("/home/u/.td/feed")
+        );
+        assert_eq!(
+            resolve_feed_dir(None, Some("/home/u")),
+            PathBuf::from("/home/u/.td/feed")
+        );
+        assert_eq!(resolve_feed_dir(None, None), PathBuf::from("./.td/feed"));
+    }
+
+    #[test]
+    fn ensure_serve_daemon_reuses_a_live_reachable_daemon_without_spawning() {
+        use std::fs;
+        use std::net::TcpListener;
+        // The cross-worktree share: a later caller (any worktree, `ensure-serve`
+        // OR the self-ensuring `warm sources`) reuses the daemon a prior caller
+        // recorded, rather than egressing/serving on its own — but ONLY when that
+        // daemon is still reachable (a live pid AND a listener at the recorded
+        // addr), so a recycled pid pointing at a dead port is not trusted. Bind a
+        // REAL loopback listener, record OUR pid (guaranteed alive) + its addr,
+        // then assert ensure_serve_daemon returns that addr WITHOUT spawning. (No
+        // env mutation and no subprocess, so it stays hermetic under the
+        // concurrent single-process test runner.)
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let dir = unique_tmp_dir("ensure-reuse");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("store")).unwrap();
+        fs::write(dir.join("feed.pid"), format!("{}\n", std::process::id())).unwrap();
+        fs::write(dir.join("feed.addr"), format!("{addr}\n")).unwrap();
+
+        let got = ensure_serve_daemon(&dir);
+
+        // Read the result, clean up, THEN assert (no temp-tree leak on failure).
+        let _ = fs::remove_dir_all(&dir);
+        assert_eq!(got, Ok(addr));
+    }
+
+    #[test]
+    fn feed_addr_reachability_probe_distinguishes_listening_from_dead() {
+        use std::net::TcpListener;
+        // The reuse guard: a bound listener is reachable; a port with nothing
+        // listening and an unparseable address are not. `127.0.0.1:0` never
+        // accepts a connection, so it is a stable "dead" endpoint (no drop-then-
+        // probe race on a freed ephemeral port).
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        assert!(
+            super::feed_addr_reachable(&addr),
+            "a bound loopback listener must be reachable"
+        );
+        assert!(
+            !super::feed_addr_reachable("127.0.0.1:0"),
+            "port 0 never accepts a connection"
+        );
+        assert!(
+            !super::feed_addr_reachable("not-an-address"),
+            "an unparseable addr is unreachable, not a panic"
+        );
     }
 }
