@@ -18,7 +18,7 @@
 //! runtime closure (`.drv`-free); the destructive SWEEP is store-gc-sweep, not here. Needs
 //! td-builder + the corpus build, so it slots in the heavy pool and the build-recipes prelude.
 
-use crate::gates::{GateDef, Pool, StoreMode};
+use crate::gates::{GateDef, Pool};
 
 // Native (typed-Rust) gate body (#318 axis 3): the bash was ported verbatim into
 // `gate_bodies::store_gc`; `script: ""` marks it native, so the runner execs
@@ -31,8 +31,7 @@ pub fn gate() -> GateDef {
         build_gate: true,
         specs: &[],
         inputs: &[],
-        store: StoreMode::Private, // cold by design (#317 audit): GC semantics assert exact contents of a fresh fixture store
-        non_blocking: true,
+        non_blocking: false,
         script: "",
     }
 }

@@ -52,7 +52,7 @@
 //! deep from-source gates stay on the dev-machine full `td-builder check` (the
 //! §7.2 step-2 landing gate) + the nightly daily suite.
 
-use crate::gates::{ArtifactInput, GateDef, InputKind, Pool, StoreMode};
+use crate::gates::{ArtifactInput, GateDef, InputKind, Pool};
 
 pub fn gate() -> GateDef {
     GateDef {
@@ -74,7 +74,6 @@ pub fn gate() -> GateDef {
             name: "bash",
             kind: InputKind::LockEntry { lock: "tests/td-builder-rust.lock", stem: "bash" },
         }],
-        store: StoreMode::Shared,
         non_blocking: false,
         script: r##"
 	echo ">> cargo-test: engine crates lint clean (cargo clippy: no panic surface, .get over indexing, unsafe confined) + td-builder unit tests (cargo test) — offline, guix-free toolchain (td-builder provision-{rust,cc})"

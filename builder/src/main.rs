@@ -9180,7 +9180,7 @@ fn main() -> ExitCode {
                     // when present; a cold machine without a running daemon simply lacks it.
                     let bdd = format!("{home}/.td/build-daemon");
                     if Path::new(&bdd).is_dir() {
-                        binds.push(sandbox::Bind { src: bdd.clone(), dest: None, readonly: false, ro_optional: false });
+                        binds.push(sandbox::Bind { src: bdd, dest: None, readonly: false, ro_optional: false });
                     }
                     // The shared warmed-source cache (~/.td/sources, populated HOST-SIDE by
                     // `td-feed warm sources` before this sandbox starts) — READ-ONLY: the
@@ -9193,24 +9193,6 @@ fn main() -> ExitCode {
                     if Path::new(&sources).is_dir() {
                         binds.push(sandbox::Bind { src: sources, dest: None, readonly: true, ro_optional: false });
                     }
-                    // The #317 warm chain-brick cache: when the operator points
-                    // TD_CHECK_CHAIN_CACHE at a CUSTOM host path (the default lives
-                    // under ~/.td/build-daemon, bound above), bind it RW so warm
-                    // bricks actually persist — unbound, the override would silently
-                    // write to the sandbox's ephemeral root and vanish on teardown.
-                    if let Ok(cc) = std::env::var("TD_CHECK_CHAIN_CACHE") {
-                        if !cc.is_empty() && !Path::new(&cc).starts_with(&bdd) {
-                            let _ = std::fs::create_dir_all(&cc);
-                            if Path::new(&cc).is_dir() {
-                                binds.push(sandbox::Bind {
-                                    src: cc,
-                                    dest: None,
-                                    readonly: false,
-                                    ro_optional: false,
-                                });
-                            }
-                        }
-                    }
                     path_env = std::env::var("PATH").unwrap_or_default();
                     workdir = cwd;
                     for (k, v) in std::env::vars() {
@@ -9218,9 +9200,8 @@ fn main() -> ExitCode {
                         // substitute resolver knobs (TD_SUBST_BIN/STORE/PUBKEY) the toolchain gates
                         // read to FETCH the lock-keyed closure instead of building from seed;
                         // TD_DAEMON_* = the shared build daemon's socket (TD_DAEMON_SOCKET) the
-                        // corpus build submits to. (TD_CHECK_CHAIN_CACHE — the #317 warm
-                        // chain-brick knob, including its set-and-empty force-cold form —
-                        // rides the TD_CHECK_ prefix.)
+                        // corpus build submits to. TD_CHECK_* = the runner's own knobs
+                        // (slots/jobs/disable).
                         if k.starts_with("TD_CHECK_")
                             || k.starts_with("TD_SUBST_")
                             || k.starts_with("TD_DAEMON_")

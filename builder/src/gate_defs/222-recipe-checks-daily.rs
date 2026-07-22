@@ -4,7 +4,7 @@
 //! only to preserve the PR/daily partition in the gate runner and affected-checks.
 //! The loop body is native Rust in `builder/src/gate_bodies.rs`.
 
-use crate::gates::{ArtifactInput, GateDef, InputKind, Pool, StoreMode};
+use crate::gates::{ArtifactInput, GateDef, InputKind, Pool};
 
 pub fn gate() -> GateDef {
     GateDef {
@@ -21,7 +21,6 @@ pub fn gate() -> GateDef {
                 member_stem: "bash-static",
             },
         }],
-        store: StoreMode::Shared,
         non_blocking: true,
         script: "",
     }

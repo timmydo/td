@@ -89,23 +89,6 @@ pub(crate) fn pool_in_full_check(p: Pool) -> bool {
     matches!(p, Pool::Cheap | Pool::Heavy | Pool::Daily)
 }
 
-/// The gate-state default, FLIPPED per the human direction of 2026-07-03 (#317):
-/// gates share warm, machine-wide builder state by default; a gate declares a
-/// private (cold) store only when clean-slate behavior IS the feature under test.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum StoreMode {
-    /// The default: the gate may read/populate the machine-wide content-keyed
-    /// caches (the shared daemon store, the chain-brick cache). The runner
-    /// exports TD_CHECK_CHAIN_CACHE (default `~/.td/build-daemon/chain`, a path
-    /// host-sandbox binds into every check sandbox) unless the caller already
-    /// set it — an explicitly EMPTY ambient TD_CHECK_CHAIN_CACHE forces a cold run.
-    Shared,
-    /// The explicit opt-out for gates whose assertions require a cold store
-    /// (hermeticity/offline/sandbox probes, GC semantics, seed-alone standup):
-    /// the runner force-clears TD_CHECK_CHAIN_CACHE so no warm state can leak in.
-    Private,
-}
-
 /// A TYPED artifact input (#353): a store-path artifact the gate's body
 /// consumes, declared on the GateDef instead of derived by shell inside it.
 /// The runner resolves each declaration (gate_inputs.rs) BEFORE the script
@@ -158,15 +141,12 @@ pub struct GateDef {
     /// Typed artifact inputs (#353): resolved by the runner before the body
     /// runs, exported as `TD_GATE_INPUT_<NAME>` — see ArtifactInput.
     pub inputs: &'static [ArtifactInput],
-    /// Shared (warm, the default) vs Private (cold) builder state — see StoreMode.
-    pub store: StoreMode,
     /// Non-blocking (allow-failure) tag: when a tagged gate FAILS the runner
     /// TOLERATES it — no fail-fast, and the run is not reded by it (it is reported
     /// as a non-blocking failure). A tagged gate that PASSES is unaffected (still
-    /// full coverage). Used for the deferred corpus/seed gates that depend on
-    /// host guix realizing their guix-built seed (`guix build`): a host that
-    /// cannot satisfy that is not blocked by them, while a host that can still
-    /// runs and covers them normally.
+    /// full coverage). Reserved for gates whose realization depends on a host
+    /// capability not every runner can satisfy, so a host that cannot is not
+    /// blocked by them while a host that can still covers them normally.
     pub non_blocking: bool,
     /// The gate body: plain POSIX shell, run as one `sh -c` from the repo root.
     pub script: &'static str,
@@ -192,8 +172,6 @@ struct Gate {
     specs: Vec<String>,
     /// Typed artifact inputs (#353), resolved per run — see ArtifactInput.
     inputs: Vec<ArtifactInput>,
-    /// Shared/Private builder state (the #317 flip) — wired into the body's env.
-    store: StoreMode,
     /// Allow-failure tag (see GateDef::non_blocking): a failure is tolerated
     /// (no fail-fast, does not red the run).
     non_blocking: bool,
@@ -325,7 +303,6 @@ fn load() -> Result<GateSet, String> {
             extra_env: Vec::new(),
             specs: def.specs.iter().map(|s| s.to_string()).collect(),
             inputs: def.inputs.to_vec(),
-            store: def.store,
             non_blocking: def.non_blocking,
         });
     }
@@ -372,9 +349,8 @@ fn derive_graph(set: &mut GateSet, build_gates: &[String]) -> Result<(), String>
         extra_env: vec![("TD_BUILD_SPECS".to_string(), set.build_specs.join(" "))],
         specs: Vec::new(),
         inputs: Vec::new(),
-        store: StoreMode::Shared,
-        // build-recipes builds the corpus via the guix-seeded daemon — it fails
-        // on a host that cannot realize the guix-built seed, so it is non-blocking
+        // build-recipes builds the corpus via the shared daemon — it fails
+        // on a host that cannot realize the seed, so it is non-blocking
         // too (its SoftFailed still satisfies its BUILD_GATE dependents'
         // readiness).
         non_blocking: true,
@@ -962,7 +938,6 @@ fn run_gate(
     log_path: &Path,
     timing: Option<&Path>,
     goal_words: &str,
-    chain_cache: Option<&str>,
     mem_mib: u64,
     tree_mem_mib: u64,
     cgroup_dir: Option<&Path>,
@@ -1054,22 +1029,6 @@ fn run_gate(
             .env("TD_BUILDER_SELF", &self_exe)
             .stdout(std::process::Stdio::from(out))
             .stderr(std::process::Stdio::from(err));
-        // The #317 gate-state wiring: Shared (the default) gets the machine-wide
-        // chain-brick cache exported; Private gets TD_CHECK_CHAIN_CACHE FORCE-CLEARED —
-        // set-and-empty, NOT unset: the consuming libs default an UNSET var to the
-        // warm home, so only an explicit "" keeps warm state out of a gate whose
-        // feature is clean-slate behavior. (This one env var IS the whole per-gate
-        // store-mode contract — deliberately no second signal to keep in sync.)
-        match g.store {
-            StoreMode::Shared => {
-                if let Some(cc) = chain_cache {
-                    cmd.env("TD_CHECK_CHAIN_CACHE", cc);
-                }
-            }
-            StoreMode::Private => {
-                cmd.env("TD_CHECK_CHAIN_CACHE", "");
-            }
-        }
         if let Some(cg) = &gate_cg {
             cmd.env("TD_GATE_CG", cg.join("cgroup.procs"));
         }
@@ -1262,11 +1221,6 @@ struct RunCfg {
     /// instead of triggering the box OOM-killer. Per-process, so a make -jN
     /// tree of modest compilers passes.
     gate_mem_mib: u64,
-    /// The warm chain-brick cache exported to Shared gates (#317): the ambient
-    /// TD_CHECK_CHAIN_CACHE if the caller set one (empty = the operator's force-cold
-    /// switch), else `~/.td/build-daemon/chain`. None (no HOME) leaves the gate
-    /// env untouched. Private gates ALWAYS get TD_CHECK_CHAIN_CACHE force-cleared.
-    chain_cache: Option<String>,
     /// Original requested goal words, exported to gate bodies that need to
     /// distinguish a tier run from a direct gate run.
     goal_words: String,
@@ -1438,7 +1392,6 @@ fn run_selected(set: &GateSet, selected: &HashSet<usize>, cfg: &RunCfg) -> Resul
                     &log_path,
                     cfg.timing_log.as_deref(),
                     &cfg.goal_words,
-                    cfg.chain_cache.as_deref(),
                     cfg.gate_mem_mib,
                     cfg.gate_tree_mem_mib,
                     cfg.cgroup_dir.as_deref(),
@@ -1740,13 +1693,6 @@ pub fn cli(args: &[String]) -> ExitCode {
         .ok()
         .and_then(|v| v.trim().parse().ok())
         .unwrap_or(16384);
-    // The warm-cache home for Shared gates (#317): ambient TD_CHECK_CHAIN_CACHE wins
-    // (set-but-empty = the operator's force-cold switch), else the machine-wide
-    // default under ~/.td/build-daemon (bound into every check sandbox).
-    let chain_cache = match std::env::var("TD_CHECK_CHAIN_CACHE") {
-        Ok(v) => Some(v),
-        Err(_) => std::env::var("HOME").ok().map(|h| format!("{h}/.td/build-daemon/chain")),
-    };
     let cfg = RunCfg {
         root: root.clone(),
         jobs,
@@ -1757,7 +1703,6 @@ pub fn cli(args: &[String]) -> ExitCode {
         resume,
         gate_mem_mib,
         gate_tree_mem_mib,
-        chain_cache,
         goal_words: goals.join(" "),
         explicit_goals: explicit_goal_indices(&set, &goals),
         cgroup_dir: std::env::var("TD_CHECK_CGROUP")
@@ -1943,7 +1888,6 @@ mod tests {
                 extra_env: Vec::new(),
                 specs: Vec::new(),
                 inputs: Vec::new(),
-                store: StoreMode::Shared,
                 non_blocking: false,
             });
         }
@@ -1965,7 +1909,6 @@ mod tests {
             resume: false,
             gate_mem_mib: 0,
             gate_tree_mem_mib: 0,
-            chain_cache: None,
             goal_words: String::new(),
             explicit_goals: HashSet::new(),
             cgroup_dir: None,
@@ -2399,7 +2342,6 @@ mod tests {
             extra_env: Vec::new(),
             specs: Vec::new(),
             inputs: Vec::new(),
-            store: StoreMode::Shared,
             non_blocking: false,
         });
         set.index.insert(BUILD_RECIPES.to_string(), idx);
@@ -2452,77 +2394,4 @@ mod tests {
         assert!(expand_goals(&set, &["not-a-gate".to_string()]).is_err());
     }
 
-    #[test]
-    fn store_modes_are_audited() {
-        let set = load().unwrap();
-        let mut private: Vec<&str> = set
-            .gates
-            .iter()
-            .filter(|g| g.store == StoreMode::Private)
-            .map(|g| g.name.as_str())
-            .collect();
-        private.sort_unstable();
-        // The DELIBERATE cold-store audit (#317): exactly the gates whose feature is
-        // clean-slate behavior. Tagging a new gate Private means extending this list in
-        // the same PR — a conscious, reviewed act (directive 3).
-        assert_eq!(
-            private,
-            vec![
-                "bootstrap-seed",
-                "sandbox-hardening",
-                "store-gc",
-                "store-gc-sweep",
-            ]
-        );
-        // The default is Shared — the #317 flip: warm machine-wide state unless a gate
-        // declares that cold IS its feature.
-        for g in ["store-verify"] {
-            let gate = set.gates.iter().find(|x| x.name == g).unwrap();
-            assert_eq!(gate.store, StoreMode::Shared, "{g} must default Shared");
-        }
-    }
-
-    /// Through the REAL scheduler + bash execution — the #317 poison differential:
-    /// with a warm cache configured and a poison marker seeded in it, the Shared gate
-    /// sees exactly that cache (and can read the marker), while the Private gate gets
-    /// TD_CHECK_CHAIN_CACHE force-cleared to SET-AND-EMPTY (not unset — the consuming libs
-    /// default an unset var to the warm home, so only an explicit "" is cold).
-    #[test]
-    fn store_mode_wires_the_chain_cache_env() {
-        let d = tmpdir("storemode");
-        let cache = d.join("cache");
-        std::fs::create_dir_all(&cache).unwrap();
-        std::fs::write(cache.join("poison"), b"poisoned artifact").unwrap();
-        let mut set = synth(
-            &d,
-            &[
-                (
-                    "wshared",
-                    Pool::Heavy,
-                    r#"test "${TD_CHECK_CHAIN_CACHE:-}" = "{D}/cache" && test -f "$TD_CHECK_CHAIN_CACHE/poison" && touch {D}/shared.ok"#,
-                    &[],
-                ),
-                (
-                    "wprivate",
-                    Pool::Heavy,
-                    r#"test "${TD_CHECK_CHAIN_CACHE+set}" = set && test -z "$TD_CHECK_CHAIN_CACHE" && touch {D}/private.ok"#,
-                    &[],
-                ),
-            ],
-        );
-        if let Some(i) = set.index.get("wprivate").copied() {
-            if let Some(g) = set.gates.get_mut(i) {
-                g.store = StoreMode::Private;
-            }
-        }
-        let sel = expand_goals(&set, &["check".to_string()]).unwrap();
-        let mut c = cfg(&d, 2, None);
-        c.chain_cache = Some(cache.display().to_string());
-        assert!(run_selected(&set, &sel, &c).unwrap());
-        assert!(d.join("shared.ok").exists(), "shared gate did not see the configured warm cache");
-        assert!(
-            d.join("private.ok").exists(),
-            "private gate's TD_CHECK_CHAIN_CACHE was not force-cleared to set-and-empty"
-        );
-    }
 }

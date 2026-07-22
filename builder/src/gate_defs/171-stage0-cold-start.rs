@@ -33,7 +33,7 @@
 //! this gate pins its cold-start contract inside the loop,
 //! where a guix host can still A/B the warm baseline.
 
-use crate::gates::{GateDef, Pool, StoreMode};
+use crate::gates::{GateDef, Pool};
 
 pub fn gate() -> GateDef {
     GateDef {
@@ -43,7 +43,6 @@ pub fn gate() -> GateDef {
         build_gate: false,
         specs: &[],
         inputs: &[],
-        store: StoreMode::Shared,
         non_blocking: true,
         script: r##"
 echo ">> stage0-cold-start: a COLD stage0 placement works with guix state HIDDEN — same path, same closure as the warm guix-host placement; an absent seed dir places with no refs, a broken seed dir errors loudly (#313)"

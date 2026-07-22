@@ -9,7 +9,7 @@
 //! /td/store in Phase 2 (static sidesteps relocation here). td-builder is the guix-free stage0.
 //! Heavy (stage0 + a nested userns) → HEAVY_GATES.
 
-use crate::gates::{GateDef, Pool, StoreMode};
+use crate::gates::{GateDef, Pool};
 
 // Native (typed-Rust) gate body (#318 axis 3): the bash was ported verbatim into
 // `gate_bodies::store_ns`; `script: ""` marks it native, so the runner execs
@@ -22,7 +22,6 @@ pub fn gate() -> GateDef {
         build_gate: false,
         specs: &[],
         inputs: &[],
-        store: StoreMode::Shared,
         non_blocking: false,
         script: "",
     }

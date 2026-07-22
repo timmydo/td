@@ -4,8 +4,8 @@
 //! A gate whose `GateDef.script` is EMPTY is "native": the gate runner
 //! (`gates.rs::run_gate`) execs `<current_exe> gate-body <name>` in the exact
 //! same memory-limited wrapper (the pre_exec setrlimit(RLIMIT_DATA), the
-//! per-gate cgroup, its own process group, TD_CHECK_CHAIN_CACHE /
-//! TD_GATE_SPECS env) it uses for shell gates. `current_exe` is the stage0 td-builder in the loop (the
+//! per-gate cgroup, its own process group, TD_GATE_SPECS env) it uses for
+//! shell gates. `current_exe` is the stage0 td-builder in the loop (the
 //! prelude execs `<stage0> … gate-run`), so a native body gets `tb` = its own
 //! binary for free — no `load_stage0` shell dance for the td-builder under test.
 //!

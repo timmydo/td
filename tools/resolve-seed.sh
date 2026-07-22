@@ -22,10 +22,9 @@
 # FAIL-CLOSED: if a seed path is missing and the substitute store cannot supply it (no
 # store, no entry, bad signature, wrong StorePath, restore failure), exit non-zero with
 # a clear message. There is NO guix fallback — warm the host store out-of-band or
-# publish the seed substitutes (the daily does). Deliberately NOT gated on
-# TD_SUBST_FORCE_BUILD (the daily's "always build from seed" knob): the guix-built seed
-# has no from-source alternative for the daily to protect, so fetching it never
-# undermines the daily's from-seed authority over the toolchain.
+# publish the seed substitutes (the daily does). Seed resolution is UNCONDITIONAL: the
+# guix-built seed has no from-source alternative to protect, so fetching it never
+# undermines any from-seed authority over the toolchain.
 #
 # Usage: resolve-seed.sh LOCK
 #   LOCK lines: `NAME /gnu/store/<base>` (the pinned seed roots; other lines ignored)

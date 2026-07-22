@@ -21,7 +21,7 @@
 //! Standalone + tiny (two ~hundred-byte assemblers, sub-second after the stage0 td-builder build)
 //! — NOT a BUILD_GATE. Later bricks drive kaem-0 over the rest of the chain (mes→tinycc→gcc→glibc).
 
-use crate::gates::{GateDef, Pool, StoreMode};
+use crate::gates::{GateDef, Pool};
 
 pub fn gate() -> GateDef {
     GateDef {
@@ -31,8 +31,7 @@ pub fn gate() -> GateDef {
         build_gate: false,
         specs: &[],
         inputs: &[],
-        store: StoreMode::Private, // cold by design (#317 audit): brick 0 builds from the 229-byte seed alone
-        non_blocking: true,
+        non_blocking: false,
         script: r##"
 echo ">> bootstrap-seed: the structured Rust seed recipe builds the first stage0 artifacts with guix off env — self-reproducing, working, reproducible (source-bootstrap brick 0)"
 set -euo pipefail; \

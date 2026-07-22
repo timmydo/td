@@ -1021,12 +1021,7 @@ fn tree_key(root: &Path) -> Option<String> {
 /// This NEVER fetches or builds td-subst — the DAILY is the sole producer; a
 /// COLD machine (no prior daily) exposes nothing and the gate builds from
 /// seed (the substitute is an optimization, never a correctness dependency).
-/// TD_SUBST_FORCE_BUILD=1 (the daily's authoritative run) suppresses the
-/// exposure so the daily always builds from seed.
 fn subst_env(root: &Path) -> Vec<(String, String)> {
-    if std::env::var("TD_SUBST_FORCE_BUILD").ok().as_deref() == Some("1") {
-        return Vec::new();
-    }
     let store = match std::env::var("TD_SUBST_STORE") {
         Ok(v) if !v.trim().is_empty() => PathBuf::from(v),
         _ => match std::env::var("HOME") {
@@ -2002,21 +1997,15 @@ fn run(args: &[String]) -> Result<i32, CheckError> {
     // The runner's knobs must cross the sandbox boundary (host-sandbox
     // preserves the TD_CHECK_ prefix): without this, TD_CHECK_SLOTS=… ./check.sh
     // would be silently dead and gate-run would always default to nproc.
-    // TD_CHECK_CHAIN_CACHE rides along for the same reason: `TD_CHECK_CHAIN_CACHE= ./check.sh`
-    // (set-and-empty) selects the per-worktree cold ladder (`.td-build-cache/ladder-cold`)
-    // over the shared daemon ladder. It no longer wipes anything — `check-run` setup() never
-    // clears persisted state (#558) — so an authoritative from-stage0 backstop must invoke
-    // `td-recipe-eval clear-store` on that ladder itself before the build; it is no longer a
-    // per-run side effect.
     // TD_CHECK_DISABLE forwards the gate-disable list (gate names / `pool:<name>`
     // tokens) so `TD_CHECK_DISABLE=… td-builder check` reaches the in-sandbox runner.
-    // Cross-run build-cache reuse is unconditional now (re #469) — no env toggle to
-    // forward; `td-recipe-eval clear-store` is the only way to force a cold climb.
+    // Every build uses the one shared warm ladder (re #469) — there is no
+    // cold-cache toggle to forward; `td-recipe-eval clear-store` is the only way
+    // to force a cold climb.
     for k in [
         "TD_CHECK_SLOTS",
         "TD_CHECK_SLOTS_DIR",
         "TD_CHECK_JOBS",
-        "TD_CHECK_CHAIN_CACHE",
         "TD_CHECK_DISABLE",
     ] {
         if let Ok(v) = std::env::var(k) {
@@ -2085,12 +2074,11 @@ fn run(args: &[String]) -> Result<i32, CheckError> {
 
     // The machine-wide slot dir must exist HOST-SIDE so host-sandbox binds
     // ~/.td/build-daemon (same absolute path inside) — that bind is what makes
-    // the gate runner's slot pool machine-wide. The chain-brick cache (#317's
-    // flipped shared-state default) lives under the same bind for the same
-    // reason: every check sandbox sees it at the same absolute path, RW.
+    // the gate runner's slot pool machine-wide. The shared ladder lives under the
+    // same bind (created lazily by the first build), so it too is reachable at the
+    // same absolute path, RW, from every check sandbox.
     if let Ok(home) = std::env::var("HOME") {
         let _ = std::fs::create_dir_all(Path::new(&home).join(".td/build-daemon/slots"));
-        let _ = std::fs::create_dir_all(Path::new(&home).join(".td/build-daemon/chain"));
     }
 
     let jobs = jobs_flag.unwrap_or_else(|| {

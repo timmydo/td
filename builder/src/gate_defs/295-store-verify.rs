@@ -17,7 +17,7 @@
 //! Boundary: td READS + writes only its OWN scratch store/DB/probe — host infra stays
 //! immutable. Needs td-builder + the corpus build → heavy pool + the build-recipes prelude.
 
-use crate::gates::{GateDef, Pool, StoreMode};
+use crate::gates::{GateDef, Pool};
 
 // Native (typed-Rust) gate body (#318 axis 3): the bash was ported verbatim into
 // `gate_bodies::store_verify`; `script: ""` marks it native, so the runner execs
@@ -30,8 +30,7 @@ pub fn gate() -> GateDef {
         build_gate: true,
         specs: &[],
         inputs: &[],
-        store: StoreMode::Shared,
-        non_blocking: true,
+        non_blocking: false,
         script: "",
     }
 }

@@ -13,7 +13,7 @@
 //! Native (#318 axis 3): the gate body is typed Rust in `gate_bodies::sandbox_hardening`;
 //! `script: ""` marks it native, so the runner execs `td-builder gate-body sandbox-hardening`.
 
-use crate::gates::{GateDef, Pool, StoreMode};
+use crate::gates::{GateDef, Pool};
 
 pub fn gate() -> GateDef {
     GateDef {
@@ -23,7 +23,6 @@ pub fn gate() -> GateDef {
         build_gate: false,
         specs: &[],
         inputs: &[],
-        store: StoreMode::Private, // cold by design (#317 audit): the sandbox isolation probe must not see warm state
         non_blocking: true,
         script: "",
     }

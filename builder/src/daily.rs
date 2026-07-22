@@ -236,25 +236,19 @@ fn run(args: &[String]) -> i32 {
 
     println!(">> daily backstop: full td-builder check on origin/main ({main})");
 
-    // Heavy: an empty chain cache (#317) selects the cold per-worktree ladder over the
-    // shared daemon, and TD_SUBST_FORCE_BUILD forces the from-seed toolchain build +
-    // republish so the daily does not fetch its own prior publish and self-starve.
-    // Cross-run build-cache reuse is unconditional now, so consecutive dailies reuse this
-    // ladder's warm cache; the daily does NOT clear it. A from-stage0 clean-room proof is
-    // an explicit `td-recipe-eval clear-store` on this ladder (chain cache empty) before the
-    // run — a deliberate operator step, no longer an automatic nightly guarantee. The
-    // pin-verified seed store is retained rather than wiped, so a seed-pin change reds
-    // `authenticate_seed_db` here until that same `clear-store` (fail-closed, hinted).
+    // Heavy: the full check on origin/main, built into the one shared warm ladder
+    // like every other run. Cross-run build-cache reuse is unconditional, so
+    // consecutive dailies reuse the ladder's warm cache; the daily does NOT clear
+    // it. A from-stage0 clean-room proof is an explicit `td-recipe-eval clear-store`
+    // before the run — a deliberate operator step, not an automatic nightly guarantee.
+    // The pin-verified seed store is retained rather than wiped, so a seed-pin change
+    // reds `authenticate_seed_db` here until that same `clear-store` (fail-closed, hinted).
     let hlog = leg_log("heavy");
     let heavy_code = run_leg(
         &root,
         &tdb,
         &["check"],
-        &[
-            ("TD_CHECK_CHAIN_CACHE", ""),
-            ("TD_SUBST_FORCE_BUILD", "1"),
-            ("TD_BUILD_JOBS", &jobs()),
-        ],
+        &[("TD_BUILD_JOBS", &jobs())],
         &hlog,
     );
     let heavy = LegRc::from_code(heavy_code);

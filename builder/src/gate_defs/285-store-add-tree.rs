@@ -31,7 +31,7 @@
 //! one tree, never showed the address changes when the tree does). Called out in the PR
 //! per directive 3.
 
-use crate::gates::{GateDef, Pool, StoreMode};
+use crate::gates::{GateDef, Pool};
 
 // Native (typed-Rust) gate body (#318 axis 3): the bash was ported verbatim into
 // `gate_bodies::store_add_tree`; `script: ""` marks it native, so the runner execs
@@ -44,8 +44,7 @@ pub fn gate() -> GateDef {
         build_gate: false,
         specs: &[],
         inputs: &[],
-        store: StoreMode::Shared,
-        non_blocking: true,
+        non_blocking: false,
         script: "",
     }
 }

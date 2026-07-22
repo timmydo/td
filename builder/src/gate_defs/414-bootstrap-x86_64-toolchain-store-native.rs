@@ -15,7 +15,7 @@
 //! The package behavior assertion is owned by the `gcc-x86-64-stage2-test` recipe check; this gate is
 //! only the daily scheduling boundary for that check. NOT a BUILD_GATE.
 
-use crate::gates::{ArtifactInput, GateDef, InputKind, Pool, StoreMode};
+use crate::gates::{ArtifactInput, GateDef, InputKind, Pool};
 
 pub fn gate() -> GateDef {
     GateDef {
@@ -32,7 +32,6 @@ pub fn gate() -> GateDef {
                 member_stem: "bash-static",
             },
         }],
-        store: StoreMode::Shared,
         non_blocking: true,
         script: r##"
 echo ">> recipe-check gcc-x86-64-stage2-test: build the x86_64 cross toolchain recipe graph and assert its output"

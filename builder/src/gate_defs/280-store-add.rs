@@ -11,7 +11,7 @@
 //! + the read/write perm bits, so store identity is metadata-independent. Needs
 //! td-builder built, so it slots in the heavy pool.
 
-use crate::gates::{GateDef, Pool, StoreMode};
+use crate::gates::{GateDef, Pool};
 
 // Native (typed-Rust) gate body (#318 axis 3): the bash was ported verbatim into
 // `gate_bodies::store_add`; `script: ""` marks it native, so the runner execs
@@ -24,8 +24,7 @@ pub fn gate() -> GateDef {
         build_gate: false,
         specs: &[],
         inputs: &[],
-        store: StoreMode::Shared,
-        non_blocking: true,
+        non_blocking: false,
         script: "",
     }
 }

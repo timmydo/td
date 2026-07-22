@@ -24,7 +24,7 @@
 //! and falsely red the peak==budget assertion. The gate tests the BUDGET cap; pinning the
 //! reserve off keeps the ceiling deterministic, per the gate's own charter above.
 
-use crate::gates::{GateDef, Pool, StoreMode};
+use crate::gates::{GateDef, Pool};
 
 pub fn gate() -> GateDef {
     GateDef {
@@ -34,8 +34,7 @@ pub fn gate() -> GateDef {
         build_gate: false,
         specs: &[],
         inputs: &[],
-        store: StoreMode::Shared,
-        non_blocking: true,
+        non_blocking: false,
         script: r##"
 echo ">> daemon-budget: the shared build daemon caps concurrent builds at its global budget across independent submitters (the machine-wide limiter)"
 set -euo pipefail; \

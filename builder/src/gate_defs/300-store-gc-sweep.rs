@@ -17,7 +17,7 @@
 //! host /gnu/store is NEVER touched. Needs td-builder + the corpus build → heavy pool + the
 //! build-recipes prelude.
 
-use crate::gates::{GateDef, Pool, StoreMode};
+use crate::gates::{GateDef, Pool};
 
 // Native (typed-Rust) gate body (#318 axis 3): the bash was ported verbatim into
 // `gate_bodies::store_gc_sweep`; `script: ""` marks it native, so the runner execs
@@ -30,8 +30,7 @@ pub fn gate() -> GateDef {
         build_gate: true,
         specs: &[],
         inputs: &[],
-        store: StoreMode::Private, // cold by design (#317 audit): GC-sweep semantics assert exact contents of a fresh fixture store
-        non_blocking: true,
+        non_blocking: false,
         script: "",
     }
 }

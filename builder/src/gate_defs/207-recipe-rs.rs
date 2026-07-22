@@ -22,7 +22,7 @@
 //! just drives cargo + a thin CLI smoke of the release binary. `script: ""` marks this
 //! gate native, so the runner execs `td-builder gate-body recipe-rs`.
 
-use crate::gates::{GateDef, Pool, StoreMode};
+use crate::gates::{GateDef, Pool};
 
 pub fn gate() -> GateDef {
     GateDef {
@@ -32,7 +32,6 @@ pub fn gate() -> GateDef {
         build_gate: false,
         specs: &[],
         inputs: &[],
-        store: StoreMode::Shared,
         non_blocking: false,
         script: "",
     }
