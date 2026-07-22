@@ -156,6 +156,10 @@ pub fn recipe() -> Recipe {
                 "MAKEINFO=true",
                 "LDFLAGS=-static",
                 "LDFLAGS_FOR_TARGET=-static",
+                // rustc links this gcc's static libstdc++.a/libgcc.a into its SHARED
+                // librustc_driver.so, so target libs (C and C++) must be built PIC.
+                "CFLAGS_FOR_TARGET=-g -O2 -fPIC",
+                "CXXFLAGS_FOR_TARGET=-g -O2 -fPIC",
             ],
         )
         .env("PATH", &path)

@@ -46,6 +46,11 @@ pub fn recipe() -> Recipe {
                 content: cxx_codegen_source().into(),
                 exec: false,
             },
+            Step::WriteFile {
+                path: "{root}/test/shared-eh.cc".into(),
+                content: shared_eh_source().into(),
+                exec: false,
+            },
             compile_step(SGCC, SBIN, "{root}/test/assert.c", "{root}/test/assert-tool", false),
             compile_step(SGCC, SBIN, "{root}/test/probe.c", "{root}/test/probe-c", false),
             compile_step(SGPP, SBIN, "{root}/test/probe.cc", "{root}/test/probe-cxx", true),
@@ -55,6 +60,15 @@ pub fn recipe() -> Recipe {
             asm_step(SGPP, SBIN, "{root}/test/codegen.cc", "{root}/test/self-cxx.s"),
             Step::run("{root}/test", &["{root}/test/probe-c"]),
             Step::run("{root}/test", &["{root}/test/probe-cxx"]),
+            // Regression guard for the PIC target libs: link a -static-libstdc++
+            // C++ EH + demangler unit into a SHARED object (rustc's driver shape).
+            // Fails with R_X86_64_32 if libstdc++.a/libgcc.a are not built PIC.
+            pic_compile_step(SGPP, SBIN, "{root}/test/shared-eh.cc", "{root}/test/shared-eh.o"),
+            shared_link_step(SGPP, SBIN, "{root}/test/shared-eh.o", "{root}/test/libshared-eh.so"),
+            Step::run(
+                "{root}/test",
+                &["{root}/test/assert-tool", "elf64-x86_64", "{root}/test/libshared-eh.so"],
+            ),
             Step::run(
                 "{root}/test",
                 &["{root}/test/assert-tool", "elf64-x86_64", SGCC],
@@ -240,6 +254,71 @@ fn asm_step(compiler: &str, binutils: &str, source: &str, output: &str) -> Step 
         env: vec![("PATH".into(), binutils.into())],
         dir: "{root}/test".into(),
     }
+}
+
+// Compile PIC (as rustc compiles its own objects) so only archive members can
+// carry the non-PIC relocations this test is meant to catch. No headers needed.
+fn pic_compile_step(compiler: &str, binutils: &str, source: &str, output: &str) -> Step {
+    Step::Run {
+        argv: vec![
+            compiler.into(),
+            "-nostdinc".into(),
+            "-fPIC".into(),
+            "-O2".into(),
+            "-B".into(),
+            format!("{binutils}/"),
+            "-c".into(),
+            source.into(),
+            "-o".into(),
+            output.into(),
+        ],
+        env: vec![("PATH".into(), binutils.into())],
+        dir: "{root}/test".into(),
+    }
+}
+
+fn shared_link_step(compiler: &str, binutils: &str, object: &str, output: &str) -> Step {
+    Step::Run {
+        argv: vec![
+            compiler.into(),
+            "-shared".into(),
+            "-B".into(),
+            format!("{binutils}/"),
+            "-B".into(),
+            format!("{XGLIBC}/lib"),
+            "-L".into(),
+            format!("{XGLIBC}/lib"),
+            "-static-libgcc".into(),
+            "-static-libstdc++".into(),
+            "-Wl,-rpath".into(),
+            format!("-Wl,{XGLIBC}/lib"),
+            "-o".into(),
+            output.into(),
+            object.into(),
+        ],
+        env: vec![("PATH".into(), binutils.into())],
+        dir: "{root}/test".into(),
+    }
+}
+
+fn shared_eh_source() -> &'static str {
+    // Forces two archive members into the link: cp-demangle.o (C, via
+    // __cxa_demangle) and the C++ EH unwinder (via try/throw/catch).
+    r#"extern "C" char *__cxa_demangle(const char *, char *, unsigned long *, int *);
+
+extern "C" const char *td_shared_eh_probe(const char *mangled) {
+    int status = 0;
+    char *demangled = __cxa_demangle(mangled, 0, 0, &status);
+    try {
+        if (demangled == 0) {
+            throw 1;
+        }
+        return demangled;
+    } catch (int) {
+        return "err";
+    }
+}
+"#
 }
 
 fn c_probe_source() -> &'static str {

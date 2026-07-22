@@ -283,21 +283,16 @@ jemalloc = false
         exec: false,
     });
 
+    // Tee bootstrap's progress to a log kept outside {out} so the post-build check
+    // can assert on it. A status file carries x.py's real exit code across the pipe
+    // (this bash has neither `pipefail` nor `PIPESTATUS`).
+    let xpy = format!(
+        "( {py} x.py build --stage 2 library/std compiler/rustc src/tools/rustdoc \
+         src/tools/cargo; echo $? > '{{root}}/x-py-status' ) 2>&1 | tee '{{root}}/x-py-build.log'; \
+         exit \"$(cat '{{root}}/x-py-status')\""
+    );
     steps.push(
-        Step::run(
-            "{src}",
-            &[
-                py,
-                "x.py",
-                "build",
-                "--stage",
-                "2",
-                "library/std",
-                "compiler/rustc",
-                "src/tools/rustdoc",
-                "src/tools/cargo",
-            ],
-        )
+        Step::run("{src}", &[SH, "-c", xpy.as_str()])
         .env("PATH", &path)
         .env("CONFIG_SHELL", SH)
         .env("SHELL", SH)
@@ -320,11 +315,15 @@ jemalloc = false
         .env("MAKELEVEL", ""),
     );
 
-    // Both stages and the final std must exist before anything is installed.
-    // `full-bootstrap = true` above makes these real builds rather than uplifted
-    // copies. The equality checks below reject an uplifted compiler or std, while
-    // the daily bridge check independently rejects stage0 references and exact
-    // stage0 artifact copies in the installed tree.
+    // Both stages and the final std must exist before anything is installed, and
+    // bootstrap must have genuinely built — not uplifted — stage2 rustc and std.
+    // A reproducible full-bootstrap makes stage1 and stage2 std legitimately
+    // byte-identical, so the correct uplift discriminator is provenance (the
+    // `(stageN -> stageM)` build-graph lines in bootstrap's own log), not a byte
+    // compare: an uplift skips the stage2 build and never emits those lines. These
+    // log strings track the pinned Rust bootstrap's output — re-verify them on a
+    // Rust pin bump. The daily bridge check independently rejects stage0 references
+    // and exact stage0 artifact copies in the installed tree.
     steps.push(
         Step::run(
             "{root}",
@@ -336,12 +335,8 @@ jemalloc = false
                  ls '{root}'/rust-build/x86_64-unknown-linux-gnu/stage1/lib/rustlib/x86_64-unknown-linux-gnu/lib/libstd-*.rlib >/dev/null && \
                  ls '{root}'/rust-build/x86_64-unknown-linux-gnu/stage2/lib/rustlib/x86_64-unknown-linux-gnu/lib/libstd-*.rlib >/dev/null && \
                  test -x '{root}/rust-build/x86_64-unknown-linux-gnu/stage2-tools-bin/cargo' || { echo 'full-bootstrap did not produce all stage1/stage2 rustc, std, and Cargo outputs' >&2; exit 1; }; \
-                 ! cmp -s '{root}/rust-build/x86_64-unknown-linux-gnu/stage1/bin/rustc' '{root}/rust-build/x86_64-unknown-linux-gnu/stage2/bin/rustc' || { echo 'full-bootstrap uplifted stage1 rustc as stage2' >&2; exit 1; }; \
-                 for s1 in '{root}'/rust-build/x86_64-unknown-linux-gnu/stage1/lib/rustlib/x86_64-unknown-linux-gnu/lib/libstd-*.rlib; do \
-                   for s2 in '{root}'/rust-build/x86_64-unknown-linux-gnu/stage2/lib/rustlib/x86_64-unknown-linux-gnu/lib/libstd-*.rlib; do \
-                     cmp -s \"$s1\" \"$s2\" && { echo 'full-bootstrap uplifted a stage1 libstd into stage2' >&2; exit 1; } || :; \
-                   done; \
-                 done",
+                 grep -q 'Building stage2 compiler artifacts.*(stage1 -> stage2' '{root}/x-py-build.log' || { echo 'full-bootstrap did not build stage2 rustc (stage1 -> stage2); it may have uplifted stage1 rustc' >&2; exit 1; }; \
+                 grep -q 'Building stage2 library artifacts.*(stage2 -> stage2' '{root}/x-py-build.log' || { echo 'full-bootstrap did not rebuild stage2 std (stage2 -> stage2); it may have uplifted stage1 std' >&2; exit 1; }",
             ],
         )
         .env("PATH", &path),
@@ -354,6 +349,20 @@ jemalloc = false
         files: vec!["{root}/rust-build/x86_64-unknown-linux-gnu/stage2-tools-bin/cargo".into()],
         dest: "{out}/bin".into(),
     });
+    // bootstrap leaves rust-src/rustc-src as build-tree symlinks into the ephemeral
+    // source dir; they dangle in the store, aren't a shipped component, and following
+    // them (grep -R below) reaches the build config that names the stage0 path.
+    steps.push(
+        Step::run(
+            "{root}",
+            &[
+                SH,
+                "-c",
+                "rm -rf '{out}/lib/rustlib/src' '{out}/lib/rustlib/rustc-src'",
+            ],
+        )
+        .env("PATH", &path),
+    );
     steps.push(Step::Require {
         paths: vec![
             "{out}/bin/rustc".into(),
