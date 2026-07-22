@@ -155,7 +155,12 @@ be Rust built with the source-built stage2 `/td/store` toolchain.
    pushing an `issue-NNNN-*` branch, commit often, and push (the branch
    is squashed into main at landing) so another agent can pick up the
    work after an unexpected interruption (e.g. reboot). See "Parallel
-   work" and `issues/README.md`.
+   work" and `issues/README.md`. No issue file is needed for
+   self-contained work a single landing both opens and closes — don't
+   create one in `issues/open/` just to `git mv` it to `issues/closed/`
+   in the same PR. Open an issue when the work spans landings, needs
+   claiming to avoid collisions, or belongs in the backlog for another
+   agent to pick up.
 
 3. Avoid external dependencies. Request explicit sign off before
    adding and make it clear in the landing commit message if this adds
