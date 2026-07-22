@@ -132,14 +132,15 @@ pub(crate) fn run(runner: &RecipeCheckRunner, lock: File) -> Result<(), String> 
 
     // Build the distro image; its closure includes the kernel, so a single build
     // plan yields the bzImage, the stage-1 init.cpio, and the real-root tree.
-    // Announce the build up front — a cold climb is a long, otherwise-silent wait —
-    // and the runner streams the builder's per-rung stderr live from here on (each
-    // `td-builder: build-plan step ...` line is one rung landing).
+    // Announce the build up front — an otherwise-silent wait — and the runner streams
+    // the builder's per-rung stderr live from here on (each `td-builder: build-plan
+    // step ...` line is one rung landing).
     println!(
         "   [run] building the td distro ({SYSTEM}); its closure pulls in the {KERNEL} kernel.\n         \
-         A cold build climbs the whole bootstrap ladder from stage0 and can take many minutes;\n         \
-         per-rung progress streams below. (Set TD_CHECK_BUILD_REUSE=1 to reuse unchanged rungs\n         \
-         across runs and skip the cold climb.)\n"
+         Unchanged rungs are reused from the shared build cache; only changed rungs rebuild,\n         \
+         so a warm tree finishes in minutes. The first build (or the first after a\n         \
+         `td-recipe-eval clear-store`) cold-climbs the whole ladder from stage0 and can take\n         \
+         many minutes. Per-rung progress streams below.\n"
     );
     runner.prepare_recipe_target(SYSTEM)?;
     let build_out = runner.build_plan(SYSTEM)?;

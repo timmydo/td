@@ -237,15 +237,14 @@ fn run(args: &[String]) -> i32 {
     println!(">> daily backstop: full td-builder check on origin/main ({main})");
 
     // Heavy: an empty chain cache (#317) selects the cold per-worktree ladder over the
-    // shared daemon, TD_SUBST_FORCE_BUILD forces the from-seed toolchain build + republish so
-    // the daily does not fetch its own prior publish and self-starve, and an explicitly empty
-    // TD_CHECK_BUILD_REUSE keeps the chain building from stage0 into its own in-run store —
-    // the clean-room proof. That last pin replaces what the removed per-run wipe (#558) used to
-    // guarantee implicitly: setup() no longer clears the ladder, so without this an ambient
-    // TD_CHECK_BUILD_REUSE=1 could warm-reuse the shared build-cache and defeat the from-stage0
-    // build. The pin-verified seed store is now retained rather than wiped, so a seed-pin change
-    // reds `authenticate_seed_db` here until an explicit `td-recipe-eval clear-store` (fail-
-    // closed, hinted) — the toolchain proof itself is unaffected.
+    // shared daemon, and TD_SUBST_FORCE_BUILD forces the from-seed toolchain build +
+    // republish so the daily does not fetch its own prior publish and self-starve.
+    // Cross-run build-cache reuse is unconditional now, so consecutive dailies reuse this
+    // ladder's warm cache; the daily does NOT clear it. A from-stage0 clean-room proof is
+    // an explicit `td-recipe-eval clear-store` on this ladder (chain cache empty) before the
+    // run — a deliberate operator step, no longer an automatic nightly guarantee. The
+    // pin-verified seed store is retained rather than wiped, so a seed-pin change reds
+    // `authenticate_seed_db` here until that same `clear-store` (fail-closed, hinted).
     let hlog = leg_log("heavy");
     let heavy_code = run_leg(
         &root,
@@ -253,7 +252,6 @@ fn run(args: &[String]) -> i32 {
         &["check"],
         &[
             ("TD_CHECK_CHAIN_CACHE", ""),
-            ("TD_CHECK_BUILD_REUSE", ""),
             ("TD_SUBST_FORCE_BUILD", "1"),
             ("TD_BUILD_JOBS", &jobs()),
         ],

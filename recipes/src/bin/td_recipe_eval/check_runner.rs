@@ -1168,41 +1168,33 @@ impl RecipeCheckRunner {
             .arg(path_str(&self.store)?)
             .arg(path_str(&self.db)?)
             .arg(scratch);
-        // Opt-in cross-run reuse (re #469 build speed). Default (TD_CHECK_BUILD_REUSE
-        // unset): build-plan owns its own in-run td-store and rebuilds the whole chain
-        // from stage0 every run — the clean-room proof. When set, point the chain at a
-        // DEDICATED build-output cache (build_cache_paths, under the ladder work dir),
-        // kept SEPARATE from the seed store/db (self.store/self.db): each UNCHANGED rung
-        // is reused from a prior run (a NAR-verified persistent_realization hit,
-        // bit-identical to a fresh build) instead of rebuilt, and a freshly-built rung
-        // commits its output back. A CHANGED rung has a different drv ⇒ different output
-        // path ⇒ a miss ⇒ still rebuilds, so the rung under development always rebuilds.
-        // The cache is SHARED across worktrees and content-addressed, so a pin change is
-        // just a different-drv miss (rebuild), never a wipe — divergent branches reuse
-        // each other's unchanged rungs instead of clobbering them. Coarse disk reclaim is
-        // a rare high-watermark eviction in setup(), not a per-change wipe.
+        // Cross-run reuse is ALWAYS on (re #469 build speed): point the chain at the
+        // DEDICATED build-output cache (build_cache_paths, under the ladder work dir), kept
+        // SEPARATE from the seed store/db (self.store/self.db). Each UNCHANGED rung is reused
+        // from a prior run (a NAR-verified persistent_realization hit, bit-identical to a
+        // fresh build) instead of rebuilt, and a freshly-built rung commits its output back.
+        // A CHANGED rung has a different drv ⇒ different output path ⇒ a miss ⇒ still
+        // rebuilds, so the rung under development always rebuilds. The cache is SHARED across
+        // worktrees and content-addressed, so a pin change is just a different-drv miss
+        // (rebuild), never a wipe — divergent branches reuse each other's unchanged rungs.
+        // The ONLY way to force a from-stage0 cold climb is the explicit `clear-store`, which
+        // resets the whole ladder; nothing reclaims the cache implicitly except an opt-in
+        // TD_CHECK_LADDER_CACHE_CAP_BYTES high-watermark eviction in setup().
         // Safe under the global ladder lock (build-runs are serialized — no concurrent
         // writer to the cache). Caveat (builder follow-up): the builder commits a rung
         // into the cache in place (copy, not temp+rename), so an OOM/kill mid-commit can
         // leave a torn item that later fails commit_tree_checked; recovery today is the
-        // watermark eviction (or TD_CHECK_LADDER_CACHE_CAP_BYTES=1 to force one), pending
-        // crash-atomic store commits.
+        // watermark eviction (or TD_CHECK_LADDER_CACHE_CAP_BYTES=1 to force one), or a
+        // `clear-store`, pending crash-atomic store commits.
         //
         // The cache MUST NOT be self.store/self.db: those are the SEED store/db (interned
         // seed inputs), and #468 authenticates self.db as a seed-only authority — a recipe
         // OUTPUT committed there would be rejected as an unpinned seed. Keeping the cache a
         // distinct store/db pair keeps the seed authority clean and makes reuse compatible
         // with #468 (which then reuses through the same persistent_realization).
-        //
-        // The toggle is TD_CHECK_BUILD_REUSE (not TD_BUILD_REUSE) so it rides the existing
-        // TD_CHECK_ contract: the `td-builder check` sandbox forwards TD_CHECK_* by prefix
-        // and check_loop's child allowlist carries it, so the opt-in survives to a gate's
-        // in-sandbox `td-recipe-eval check-run` instead of being stripped at the boundary.
-        if env::var_os("TD_CHECK_BUILD_REUSE").is_some_and(|v| !v.is_empty()) {
-            let (cache_store, cache_db) = self.build_cache_paths();
-            cmd.env("TD_PERSIST_STORE", path_str(&cache_store)?)
-                .env("TD_PERSIST_DB", path_str(&cache_db)?);
-        }
+        let (cache_store, cache_db) = self.build_cache_paths();
+        cmd.env("TD_PERSIST_STORE", path_str(&cache_store)?)
+            .env("TD_PERSIST_DB", path_str(&cache_db)?);
         // Host-side human commands stream the builder's per-rung stderr live so a cold
         // ladder climb is not a silent multi-minute wait; gate `check-run` keeps the
         // buffering `.output()` path so its captured log is byte-identical. Both return
@@ -1760,10 +1752,21 @@ fn spawn_capture_tee_stderr(
         .stdout
         .take()
         .ok_or_else(|| "stdout pipe unavailable".to_string())?;
-    let stdout_thread = std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        stdout_pipe.read_to_end(&mut buf).map(|_| buf)
-    });
+    // `Builder::spawn` (fallible) not `thread::spawn` (panics if the OS cannot create the
+    // thread): a panic here would both violate the crate's no-panic rule and unwind past the
+    // already-spawned child, which `Drop` neither kills nor waits — orphaning a builder that
+    // keeps mutating the cache after the caller releases the ladder lock. Reap it instead.
+    let stdout_thread = std::thread::Builder::new()
+        .name("build-plan-stdout".to_string())
+        .spawn(move || {
+            let mut buf = Vec::new();
+            stdout_pipe.read_to_end(&mut buf).map(|_| buf)
+        })
+        .map_err(|e| {
+            let _ = child.kill();
+            let _ = child.wait();
+            format!("spawn build-plan stdout reader: {e}")
+        })?;
     let mut stderr_pipe = child
         .stderr
         .take()
