@@ -1,7 +1,7 @@
 //! bootstrap-mes — source-bootstrap BRICK 2 (north star: no guix BYTES). From the 229-byte stage0
 //! seed, td builds M2-Planet + mescc-tools (brick 1) and drives them over the GNU Mes RELEASE
 //! SOURCE — the pinned mes-0.27.1.tar.gz (recipe-owned source pin), td-fetched (not vendored, not
-//! guix-fetched) in check.sh's prelude into .td-build-cache/sources/ — to compile + link a working
+//! guix-fetched) in check.sh's prelude into ~/.td/sources/ — to compile + link a working
 //! GNU Mes Scheme interpreter, mes-m2 — guix-free.
 //! 
 //! The driver is a STRUCTURED Rust recipe — `td-builder bootstrap-recipe mes`

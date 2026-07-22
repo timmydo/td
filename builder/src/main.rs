@@ -3496,8 +3496,15 @@ fn realize_drv(
             builder_override,
             td_store,
         )?;
+    // A readable label for this recipe's progress lines (e.g. `mes-0.27.1`), taken from
+    // its first output's store path; falls back to a generic name for an output-less drv.
+    let disp = parsed
+        .outputs
+        .first()
+        .and_then(|o| store::name_from_store_path(&o.path))
+        .unwrap_or_else(|| "recipe".to_string());
     eprintln!(
-        "td-builder: realize computed the input closure ITSELF — {} paths by CONTENT-SCANNING {} seed store dir(s) (+ {} td-owned db(s)); no /var/guix/db, no guix gc, no daemon",
+        "td-builder: {disp}: resolved {} input path(s) from {} seed dir(s) + {} store db(s)",
         closure.len(),
         seed_store_dirs.len(),
         extra_dbs.len()
@@ -3565,6 +3572,9 @@ fn realize_drv(
         lines.push_str(&format!("{p} {} {}\n", si.nar_hash, si.origin.as_str()));
     }
     std::fs::write(scratch.join("provenance.manifest"), lines).map_err(|e| e.to_string())?;
+    // The actual compile. This is the slow step, so announce it up front — otherwise the
+    // log falls silent between resolving inputs and the output registering below.
+    eprintln!("td-builder: {disp}: building (running the sandboxed build)...");
     let regs = build_and_register(drv_path, &closure, scratch, &staging_manifest)?;
     // The builder identity path is a VIRTUAL mount alias: the real builder bytes are
     // registered under the builder's OWN content-addressed path, never under this token
@@ -3601,7 +3611,7 @@ fn realize_drv(
     std::fs::write(scratch.join("receipt"), receipt_text(&expect, &regs))
         .map_err(|e| e.to_string())?;
     eprintln!(
-        "td-builder: realize registered {} output(s) into td's store-db {}",
+        "td-builder: {disp}: built {} output(s), registered in {}",
         regs.len(),
         scratch.join("td.db").display()
     );
@@ -3821,7 +3831,7 @@ fn build_recipe(
                 .to_string(),
         );
     }
-    eprintln!("td-builder: build-recipe assembled {drv_path} (no guix (derivation), no Guile)");
+    eprintln!("td-builder: build-recipe: assembled {drv_path}");
     // td realizes it (no guix-daemon). With a td-owned source store, the source is
     // staged from td's own store + closure read from the td DB (no daemon interning);
     // with a td-owned builder, the drv's builder is staged from td's store + its
@@ -3843,7 +3853,7 @@ fn build_recipe(
     if let Some((ps, pd)) = persist {
         commit_scratch_to_store(scratch, ps, Path::new(pd))?;
         eprintln!(
-            "td-builder: build-recipe committed {} output(s) into the persistent store {ps}",
+            "td-builder: build-recipe: committed {} output(s) into the persistent store {ps}",
             regs.len()
         );
     }
@@ -7426,7 +7436,7 @@ fn main() -> ExitCode {
             };
             match run() {
                 Ok(n) => {
-                    eprintln!("td-builder: seed-unpack restored + registered {n} seed paths (NAR-verified, no daemon)");
+                    eprintln!("td-builder: seed-unpack restored + registered {n} seed paths (NAR-verified)");
                     println!("{n}");
                     ExitCode::SUCCESS
                 }
@@ -8683,7 +8693,7 @@ fn main() -> ExitCode {
                 let (drv_path, drv_file, parsed, _source) =
                     assemble_recipe_drv(&recipe_json, lock, Path::new(scratch), None)?;
                 eprintln!(
-                    "td-builder: assemble-recipe assembled {drv_path} (no guix (derivation), no Guile, no realize)"
+                    "td-builder: assemble-recipe: assembled {drv_path} (assemble-only, not realized)"
                 );
                 println!("DRV={}", drv_file.display());
                 for o in &parsed.outputs {

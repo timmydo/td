@@ -1137,7 +1137,6 @@ fn crc64_table() -> [u64; 256] {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::Path;
 
     // Vectors produced once with XZ Utils 5.4.5 (see each test for the
     // exact invocation) and embedded so the tests run offline.
@@ -1485,10 +1484,7 @@ mod tests {
     #[test]
     fn decodes_real_release_tarballs() {
         for name in ["binutils-2.44.tar.xz", "linux-4.14.67.tar.xz"] {
-            let path = Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("..")
-                .join(".td-build-cache/sources")
-                .join(name);
+            let path = crate::bootstrap::shared_sources_dir().join(name);
             if !path.exists() {
                 println!("skipping {name}: {} not present", path.display());
                 continue;

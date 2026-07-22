@@ -1135,6 +1135,20 @@ fn resolve_feed_dir(td_feed_dir: Option<&str>, home: Option<&str>) -> PathBuf {
     }
 }
 
+/// The single shared sources cache: `$HOME/.td/sources` (HOME unset/empty -> relative). The
+/// flat, pin-filename-keyed dir the recipe ladder reads its warmed tarballs and generated
+/// kernel-headers from. Shared across ALL worktrees with NO env override, so one
+/// `td-feed warm sources` warms every tree. Deliberately NOT under `~/.td/build-daemon`
+/// (which is bound read-write into every build sandbox); a pinned tarball is re-verified
+/// against its sha256 on every read regardless. Keep identical to the builder/recipes copies
+/// (`var_os`, so a non-UTF-8 HOME resolves the same in all three).
+fn sources_dir() -> PathBuf {
+    match std::env::var_os("HOME") {
+        Some(h) if !h.is_empty() => PathBuf::from(h).join(".td/sources"),
+        _ => PathBuf::from(".td/sources"),
+    }
+}
+
 /// The shared feed `(addr, store)` — the ONE cross-worktree single-egress path.
 /// This does NOT depend on the caller's env: if TD_FEED_BASE is exported (the loop
 /// prelude runs `td-feed ensure-serve` and exports it) use it directly; otherwise
@@ -1160,16 +1174,17 @@ fn shared_feed() -> Option<(String, PathBuf)> {
     }
 }
 
-/// warm sources — fetch the recipe-owned pinned source-bootstrap tarballs into
-/// .td-build-cache/sources/ for the offline heavy `bootstrap-*` gates, then produce the
-/// i386 and x86_64 Linux UAPI headers. Routes through the SHARED feed for cross-worktree
+/// warm sources — fetch the recipe-owned pinned source-bootstrap tarballs into the shared
+/// sources cache (`sources_dir()`, `$HOME/.td/sources`) for the offline heavy `bootstrap-*`
+/// gates, then produce the i386 and x86_64 Linux UAPI headers. Routes through the SHARED feed
+/// for cross-worktree
 /// single egress: it uses an exported TD_FEED_BASE, else brings the shared daemon up itself
 /// (`shared_feed`), so egress does not depend on the caller's env; a direct GET is only the
 /// last-resort fallback. td OWNS the fetch (no guix-as-fetcher); each tarball is verified
 /// against its recipe sha256.
 fn warm_sources(root: &Path) -> Result<(), String> {
     let pins = recipe_source_pins_result(root)?;
-    let dest = root.join(".td-build-cache/sources");
+    let dest = sources_dir();
     if pins.is_empty() {
         return Err("td-recipe-eval source-pins returned no pins".into());
     }
@@ -1229,8 +1244,8 @@ fn warm_sources(root: &Path) -> Result<(), String> {
 
     // Derived inputs: the sanitized Linux UAPI headers for the glibc rungs, produced FROM the
     // pinned linux source (the sandbox can't run the kernel build). Both lanes, best-effort.
-    warm_kernel_headers_from_pins(root, "i386", &pins);
-    warm_kernel_headers_from_pins(root, "x86_64", &pins);
+    warm_kernel_headers_from_pins("i386", &pins);
+    warm_kernel_headers_from_pins("x86_64", &pins);
     Ok(())
 }
 
@@ -1389,19 +1404,19 @@ fn kernel_headers_pack_command(out: &Path, include_dir: &Path) -> Command {
 }
 
 /// warm kernel-headers ARCH — produce the sanitized Linux UAPI headers for `ARCH` (i386 /
-/// x86_64) FROM the pinned linux source via `make headers_install`, into
-/// .td-build-cache/sources/linux-headers-<ver>-<ARCH>.tar (+ a hand-written version.h).
-/// guix ships a prebuilt header BLOB; td produces the same headers FROM canonical source.
+/// x86_64) FROM the pinned linux source via `make headers_install`, into the shared sources
+/// cache as `linux-headers-<ver>-<ARCH>.tar` (+ a hand-written version.h). guix ships a
+/// prebuilt header BLOB; td produces the same headers FROM canonical source.
 fn warm_kernel_headers(root: &Path, arch: &str) {
     match recipe_source_pins_result(root) {
-        Ok(pins) => warm_kernel_headers_from_pins(root, arch, &pins),
+        Ok(pins) => warm_kernel_headers_from_pins(arch, &pins),
         Err(e) => eprintln!(
             ">> td-feed warm kernel-headers ({arch}): cannot read recipe source pins: {e}"
         ),
     }
 }
 
-fn warm_kernel_headers_from_pins(root: &Path, arch: &str, pins: &[SourcePin]) {
+fn warm_kernel_headers_from_pins(arch: &str, pins: &[SourcePin]) {
     let Some(pin) = pins.iter().find(|pin| pin.key == "linux-source") else {
         return;
     };
@@ -1412,7 +1427,7 @@ fn warm_kernel_headers_from_pins(root: &Path, arch: &str, pins: &[SourcePin]) {
         );
         return;
     };
-    let cache = root.join(".td-build-cache/sources");
+    let cache = sources_dir();
     let src = cache.join(file);
     let out = cache.join(format!("linux-headers-{ver}-{arch}.tar"));
     if out.exists() {
@@ -1475,7 +1490,12 @@ fn warm_kernel_headers_from_pins(root: &Path, arch: &str, pins: &[SourcePin]) {
         cleanup();
         return;
     }
-    let tmp = cache.join(format!("linux-headers-{ver}-{arch}.tar.tmp"));
+    // PID-unique temp: the shared cache may be warmed by concurrent worktrees, and a fixed
+    // `.tmp` would let two of them write the same inode before the atomic rename below.
+    let tmp = cache.join(format!(
+        "linux-headers-{ver}-{arch}.tar.{}.tmp",
+        std::process::id()
+    ));
     // NORMALIZED, UNCOMPRESSED packing (KERNEL_HEADERS_TAR_FLAGS): sorted names,
     // zeroed mtimes, no ownership, GNU format — plus the fixed 0755/0644 modes forced
     // above (tar records mode bits but these flags do not normalize them). Together the

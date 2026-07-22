@@ -765,17 +765,13 @@ mod tests {
     }
 
     fn sources_path(name: &str) -> Option<PathBuf> {
-        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("..")
-            .join(".td-build-cache")
-            .join("sources")
-            .join(name);
+        let path = crate::bootstrap::shared_sources_dir().join(name);
         path.exists().then_some(path)
     }
 
     fn decompress_tarball(name: &str, min_len: usize) -> Option<usize> {
         let Some(path) = sources_path(name) else {
-            eprintln!("skipping: {name} not present in .td-build-cache/sources");
+            eprintln!("skipping: {name} not present in the shared sources cache");
             return None;
         };
         let data = std::fs::read(&path).unwrap();

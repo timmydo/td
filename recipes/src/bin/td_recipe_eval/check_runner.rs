@@ -547,6 +547,16 @@ fn ladder_work_dir(root: &Path, home: Option<&Path>) -> PathBuf {
         .unwrap_or_else(|| root.join(".td-build-cache/ladder-cold"))
 }
 
+/// The single shared sources cache: `$HOME/.td/sources` (HOME unset/empty -> relative), the
+/// flat pin-filename-keyed dir the ladder reads its warmed tarballs and generated
+/// kernel-headers from. Shared across ALL worktrees with NO env override; keep identical to
+/// the feed/builder copies (`home` comes from `var_os`, so a non-UTF-8 HOME resolves the
+/// same in all three). Deliberately NOT under `~/.td/build-daemon` (bound RW into sandboxes).
+fn shared_sources_dir(home: Option<&Path>) -> PathBuf {
+    home.map(|h| h.join(".td/sources"))
+        .unwrap_or_else(|| PathBuf::from(".td/sources"))
+}
+
 /// The ladder's sibling lock, `<lw>.lock`. APPENDS `.lock` to the whole path rather than
 /// `with_extension` (which would REPLACE a dotted final component, e.g. a `TD_RECIPE_CHECK_WORK`
 /// ending in `.v2`, and collide two distinct ladders on one lock). Shared by the build runner
@@ -621,6 +631,9 @@ pub(crate) struct RecipeCheckRunner {
     builder_store: PathBuf,
     builder_db: PathBuf,
     lw: PathBuf,
+    /// The single shared sources cache (`$HOME/.td/sources`) holding the warmed pinned
+    /// tarballs + generated kernel-headers, shared across worktrees (see `shared_sources_dir`).
+    sources_dir: PathBuf,
     store: PathBuf,
     db: PathBuf,
     recipes: PathBuf,
@@ -691,6 +704,7 @@ impl RecipeCheckRunner {
                 .map(|h| h.join(".td/build-daemon").display().to_string()),
         };
         let lw = ladder_work_dir(&root, home.as_deref());
+        let sources_dir = shared_sources_dir(home.as_deref());
         let store = lw.join("store");
         let db = lw.join("db");
         let scratch = lw.join("scratch").join(scratch_name);
@@ -704,6 +718,7 @@ impl RecipeCheckRunner {
             builder_store: stage0_base.join("store"),
             builder_db: stage0_base.join("builder.db"),
             lw,
+            sources_dir,
             store,
             db,
             recipes,
@@ -713,10 +728,11 @@ impl RecipeCheckRunner {
         })
     }
 
-    /// Opt into live per-rung build progress: `build_plan` tees the builder's stderr
-    /// to this process's stderr as the ladder climbs, rather than buffering it until
-    /// the build finishes. Set by the host-side, human-invoked commands (`run`,
+    /// Opt into live per-rung build progress: `build_plan` tees the build's stdout and
+    /// stderr to this process's stdout/stderr as the ladder climbs, rather than buffering
+    /// until the build finishes. Set by the host-side, human-invoked commands (`run`,
     /// `build-run`, `qemu-boot*`) so a cold multi-minute climb is not a silent wait.
+    /// `TD_RECIPE_QUIET=1` overrides this back to the buffered path (see `quiet_requested`).
     pub(crate) fn with_streamed_progress(mut self) -> Self {
         self.stream_progress = true;
         self
@@ -907,7 +923,7 @@ impl RecipeCheckRunner {
 
     fn intern_source(&self, intern_name: &str, pin: &SourcePin) -> Result<String, String> {
         validate_source_file_basename(pin)?;
-        let file = self.root.join(".td-build-cache/sources").join(&pin.file);
+        let file = self.sources_dir.join(&pin.file);
         if !file.is_file() {
             return Err(format!(
                 "ladder: pinned tarball not warm ({}) - run 'td-feed warm sources'",
@@ -923,8 +939,7 @@ impl RecipeCheckRunner {
         validate_source_file_basename(&pin)?;
         let version = linux_version_from_file(&pin.file)?;
         let file = self
-            .root
-            .join(".td-build-cache/sources")
+            .sources_dir
             .join(format!("linux-headers-{version}-{arch}.tar"));
         if !file.is_file() {
             return Err(format!(
@@ -975,7 +990,7 @@ impl RecipeCheckRunner {
     fn stage0_source_tarball(&self) -> Result<PathBuf, String> {
         let pin = source_pin_for_key("stage0-source")?;
         validate_source_file_basename(&pin)?;
-        let tarball = self.root.join(".td-build-cache/sources").join(&pin.file);
+        let tarball = self.sources_dir.join(&pin.file);
         if !tarball.is_file() {
             return Err(format!(
                 "ladder: pinned stage0 source not warm ({}) - run 'td-feed warm sources'",
@@ -1195,12 +1210,14 @@ impl RecipeCheckRunner {
         let (cache_store, cache_db) = self.build_cache_paths();
         cmd.env("TD_PERSIST_STORE", path_str(&cache_store)?)
             .env("TD_PERSIST_DB", path_str(&cache_db)?);
-        // Host-side human commands stream the builder's per-rung stderr live so a cold
-        // ladder climb is not a silent multi-minute wait; gate `check-run` keeps the
-        // buffering `.output()` path so its captured log is byte-identical. Both return
-        // the same (status, stdout, stderr) triple, so the file/tail/scan below is shared.
-        let (status, stdout_bytes, stderr_bytes) = if self.stream_progress {
-            spawn_capture_tee_stderr(&mut cmd)
+        // Host-side human commands stream the build's stdout AND stderr live so a cold
+        // ladder climb is not a silent multi-minute wait; `TD_RECIPE_QUIET` reverts to the
+        // buffered path (output captured and shown on completion, not tee'd live), and gate
+        // `check-run` never streams so its captured log stays byte-identical. All paths
+        // return the same (status, stdout, stderr) triple, so the file/tail/scan below is shared.
+        let stream = self.stream_progress && !quiet_requested();
+        let (status, stdout_bytes, stderr_bytes) = if stream {
+            spawn_capture_tee(&mut cmd)
                 .map_err(|e| format!("build-plan --auto {target}: {e}"))?
         } else {
             let out = cmd
@@ -1228,9 +1245,12 @@ impl RecipeCheckRunner {
                 base
             });
         }
-        io::stdout()
-            .write_all(&stdout_bytes)
-            .map_err(|e| format!("write build-plan stdout: {e}"))?;
+        // The streaming path already tee'd stdout live; only the buffered path flushes it here.
+        if !stream {
+            io::stdout()
+                .write_all(&stdout_bytes)
+                .map_err(|e| format!("write build-plan stdout: {e}"))?;
+        }
         Ok(out_file)
     }
 
@@ -1727,16 +1747,26 @@ fn with_seed_reset_hint(err: String, lw: &Path) -> String {
     }
 }
 
-/// Run `cmd` capturing its stdout, while TEEING its stderr to this process's stderr
-/// in real time AND accumulating the full stderr bytes. Returns the same
-/// `(status, stdout, stderr)` triple `Command::output` would — so a caller can still
-/// write the err-file, take an error tail, and scan for stale-seed markers — but the
-/// operator sees the child's progress as it happens instead of only at the end.
+/// Whether the human-facing live progress stream is suppressed. `TD_RECIPE_QUIET=1`
+/// reverts `run`/`build-run`/`qemu-boot*` to the buffered path: stdout is captured and
+/// flushed on completion, stderr is captured to the err-file and surfaced on failure (the
+/// error tail) — neither is tee'd live as the ladder climbs.
+fn quiet_requested() -> bool {
+    env::var_os("TD_RECIPE_QUIET").is_some_and(|v| !v.is_empty())
+}
+
+/// Run `cmd`, teeing its stdout AND stderr live to this process's stdout/stderr while
+/// accumulating both, and return the same `(status, stdout, stderr)` triple
+/// `Command::output` would — so a caller can still write the out/err files, take an error
+/// tail, and scan for stale-seed markers — but the operator sees the build's own output as
+/// it happens. The sandboxed build inherits the builder's fds, so its make/configure
+/// chatter (stdout) and compiler diagnostics (stderr) both surface live.
 ///
-/// stdout is drained CONCURRENTLY on a thread: build-plan interleaves per-rung `STEP`
-/// lines on stdout with progress on stderr, and reading stderr to EOF before touching
-/// stdout could deadlock once a long build fills the stdout pipe buffer.
-fn spawn_capture_tee_stderr(
+/// Each stream is drained CONCURRENTLY (stdout on a thread, stderr on the main loop):
+/// build-plan interleaves per-rung `STEP` lines on stdout with progress on stderr, and
+/// draining one to EOF before touching the other could deadlock once a long build fills
+/// the unread pipe's buffer.
+fn spawn_capture_tee(
     cmd: &mut Command,
 ) -> Result<(process::ExitStatus, Vec<u8>, Vec<u8>), String> {
     let mut child = cmd
@@ -1756,11 +1786,32 @@ fn spawn_capture_tee_stderr(
     // thread): a panic here would both violate the crate's no-panic rule and unwind past the
     // already-spawned child, which `Drop` neither kills nor waits — orphaning a builder that
     // keeps mutating the cache after the caller releases the ladder lock. Reap it instead.
+    // The reader tees stdout live (chunked, not read_to_end) so it surfaces as it is produced.
     let stdout_thread = std::thread::Builder::new()
         .name("build-plan-stdout".to_string())
         .spawn(move || {
             let mut buf = Vec::new();
-            stdout_pipe.read_to_end(&mut buf).map(|_| buf)
+            let mut chunk = [0u8; 8192];
+            let stdout = io::stdout();
+            loop {
+                match stdout_pipe.read(&mut chunk) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        let slice = chunk.get(..n).unwrap_or(&[]);
+                        // Tee live; a broken/closed terminal must not abort a valid build, so a
+                        // failed write is ignored — the bytes are still captured for the out-file.
+                        {
+                            let mut handle = stdout.lock();
+                            let _ = handle.write_all(slice);
+                            let _ = handle.flush();
+                        }
+                        buf.extend_from_slice(slice);
+                    }
+                    Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                    Err(e) => return Err(e),
+                }
+            }
+            Ok(buf)
         })
         .map_err(|e| {
             let _ = child.kill();
@@ -2181,6 +2232,7 @@ mod tests {
             builder_store: PathBuf::new(),
             builder_db: PathBuf::new(),
             lw: lw.to_path_buf(),
+            sources_dir: lw.join("sources"),
             store: lw.join("store"),
             db: lw.join("db"),
             recipes: scratch.join("recipes"),
@@ -2636,6 +2688,7 @@ mod tests {
             builder_store: PathBuf::new(),
             builder_db: PathBuf::new(),
             lw: tmp.clone(),
+            sources_dir: PathBuf::new(),
             store: PathBuf::new(),
             db: PathBuf::new(),
             recipes: PathBuf::new(),

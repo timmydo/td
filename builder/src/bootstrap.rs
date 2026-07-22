@@ -47,26 +47,35 @@ const KAEM_PIN: &str = "153b8915b73bd07132b59538d10fe53d26578eb160a67db72af07aaa
 const STAGE0_SOURCE_KEY: &str = "stage0-source";
 const MES_SOURCE_KEY: &str = "mes-source";
 
-/// Where a recipe finds its warmed-source cache (`.td-build-cache/sources/`,
-/// populated by
-/// `td-feed warm sources` in check.sh's HOST prelude — the offline loop
-/// never egresses).
+/// The single shared sources cache: `$HOME/.td/sources` (HOME unset/empty -> relative), the
+/// flat pin-filename-keyed dir the recipe ladder reads its warmed tarballs and generated
+/// kernel-headers from. Shared across ALL worktrees with NO env override; keep identical to
+/// the feed/recipes copies (`var_os`, so a non-UTF-8 HOME resolves the same in all three).
+/// Deliberately NOT under `~/.td/build-daemon` (bound read-write into build sandboxes) — a
+/// pinned tarball is re-verified by sha256 on every read anyway.
+pub(crate) fn shared_sources_dir() -> PathBuf {
+    match std::env::var_os("HOME") {
+        Some(h) if !h.is_empty() => PathBuf::from(h).join(".td/sources"),
+        _ => PathBuf::from(".td/sources"),
+    }
+}
+
+/// Where a recipe finds its warmed-source cache (`$HOME/.td/sources/`, populated by
+/// `td-feed warm sources` in check.sh's HOST prelude — the offline loop never egresses).
 pub struct Ctx {
     pub sources_dir: PathBuf,
     source_pins: Vec<SourcePin>,
 }
 
 impl Ctx {
-    /// Default context: repo root = CWD (the gate runs from there), sources =
-    /// `<root>/.td-build-cache/sources` unless `TD_SOURCES_DIR` overrides it.
+    /// Default context: repo root = CWD (the gate runs from there); the sources cache is the
+    /// shared `$HOME/.td/sources` (see `shared_sources_dir`), independent of the repo root.
     pub fn discover() -> Result<Ctx, String> {
         let repo_root = std::env::current_dir().map_err(|e| format!("current dir: {e}"))?;
         Ctx::rooted(repo_root)
     }
     pub fn rooted(repo_root: PathBuf) -> Result<Ctx, String> {
-        let sources_dir = std::env::var_os("TD_SOURCES_DIR")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| repo_root.join(".td-build-cache/sources"));
+        let sources_dir = shared_sources_dir();
         let source_pins = load_recipe_source_pins(&repo_root)?;
         Ok(Ctx {
             sources_dir,
@@ -184,7 +193,7 @@ pub enum Pin {
     /// files inside matching their per-file pins.
     Stage0Source { key: &'static str },
     /// A td-fetched tarball keyed by a recipe-owned fixed-output source pin:
-    /// the warmed `.td-build-cache/sources/<file>` must match the pin sha256.
+    /// the warmed `$HOME/.td/sources/<file>` must match the pin sha256.
     Source { key: &'static str },
 }
 
@@ -997,7 +1006,7 @@ mod tests {
 
     fn synth_ctx() -> Ctx {
         Ctx {
-            sources_dir: repo_root().join(".td-build-cache/sources"),
+            sources_dir: shared_sources_dir(),
             source_pins: Vec::new(),
         }
     }

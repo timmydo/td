@@ -1444,7 +1444,7 @@ fn warm_td_crate_closure(root: &Path) {
 }
 
 /// Generate the host-produced Linux UAPI header seeds
-/// (`.td-build-cache/sources/linux-headers-<ver>-{i386,x86_64}.tar`) the toolchain
+/// (`$HOME/.td/sources/linux-headers-<ver>-{i386,x86_64}.tar`) the toolchain
 /// rungs intern, before the `build-run` that interns them (heavy_warms runs later).
 ///
 /// `newstore_bin` picks a td-built `td-feed` by store hash, so a pre-#536 binary
@@ -1529,18 +1529,19 @@ fn warm_kh_arches(root: &Path, tdfeed: &Path, arches: &[&str]) -> Vec<String> {
                  for {arch}"
             );
         }
-        if !kh_seed_present(root, arch) {
+        if !kh_seed_present(&crate::bootstrap::shared_sources_dir(), arch) {
             missing.push((*arch).to_string());
         }
     }
     missing
 }
 
-/// True when the uncompressed `.tar` seed for `arch` is present (matched by name,
-/// version-independent; a `.tar.gz` is NOT a match — the intern needs the `.tar`).
-fn kh_seed_present(root: &Path, arch: &str) -> bool {
+/// True when the uncompressed `.tar` seed for `arch` is present in the shared sources cache
+/// (matched by name, version-independent; a `.tar.gz` is NOT a match — the intern needs the
+/// `.tar`).
+fn kh_seed_present(sources: &Path, arch: &str) -> bool {
     let suffix = format!("-{arch}.tar");
-    std::fs::read_dir(root.join(".td-build-cache").join("sources"))
+    std::fs::read_dir(sources)
         .into_iter()
         .flatten()
         .flatten()
@@ -2600,37 +2601,37 @@ checksum = \"b74fc6b57825be3373f7054754755f03ac3a8f5d70015f0ffa7ebd06bfeeeb67\"\
         // A pre-#536 `.tar.gz` must not count; the match is version-independent
         // and arch tokens must not cross-match (#546).
         let d = scratch("kh-seed");
-        let src = d.join(".td-build-cache").join("sources");
+        let src = d.join("sources");
         std::fs::create_dir_all(&src).unwrap();
 
         // Only the stale gzip present -> not satisfied for either arch.
         std::fs::write(src.join("linux-headers-4.14.67-i386.tar.gz"), b"gz").unwrap();
         std::fs::write(src.join("linux-headers-4.14.67-x86_64.tar.gz"), b"gz").unwrap();
-        assert!(!kh_seed_present(&d, "i386"));
-        assert!(!kh_seed_present(&d, "x86_64"));
+        assert!(!kh_seed_present(&src, "i386"));
+        assert!(!kh_seed_present(&src, "x86_64"));
 
         // The uncompressed seed for i386 lands -> only i386 satisfied.
         std::fs::write(src.join("linux-headers-4.14.67-i386.tar"), b"tar").unwrap();
-        assert!(kh_seed_present(&d, "i386"));
-        assert!(!kh_seed_present(&d, "x86_64"));
+        assert!(kh_seed_present(&src, "i386"));
+        assert!(!kh_seed_present(&src, "x86_64"));
 
         // A different pinned version still matches (keyed on name, not version).
         std::fs::write(src.join("linux-headers-9.9.9-x86_64.tar"), b"tar").unwrap();
-        assert!(kh_seed_present(&d, "x86_64"));
+        assert!(kh_seed_present(&src, "x86_64"));
 
         // An x86_64-only cache is absent for i386.
         let e = scratch("kh-seed-arch");
-        let esrc = e.join(".td-build-cache").join("sources");
+        let esrc = e.join("sources");
         std::fs::create_dir_all(&esrc).unwrap();
         std::fs::write(esrc.join("linux-headers-4.14.67-x86_64.tar"), b"tar").unwrap();
-        assert!(!kh_seed_present(&e, "i386"));
-        assert!(kh_seed_present(&e, "x86_64"));
+        assert!(!kh_seed_present(&esrc, "i386"));
+        assert!(kh_seed_present(&esrc, "x86_64"));
     }
 
     #[test]
     fn kh_seed_present_false_when_sources_dir_absent() {
-        // No sources cache at all -> not present, no panic.
+        // A sources dir that does not exist -> not present, no panic.
         let d = scratch("kh-seed-nodir");
-        assert!(!kh_seed_present(&d, "i386"));
+        assert!(!kh_seed_present(&d.join("sources"), "i386"));
     }
 }
