@@ -2002,13 +2002,16 @@ fn run(args: &[String]) -> Result<i32, CheckError> {
     // preserves the TD_CHECK_ prefix): without this, TD_CHECK_SLOTS=… ./check.sh
     // would be silently dead and gate-run would always default to nproc.
     // TD_CHECK_CHAIN_CACHE rides along for the same reason: `TD_CHECK_CHAIN_CACHE= ./check.sh`
-    // (set-and-empty) is the operator's force-cold switch for the #317 warm
-    // chain-brick default — the daily backstop uses it to stay authoritative.
+    // (set-and-empty) selects the per-worktree cold ladder (`.td-build-cache/ladder-cold`)
+    // over the shared daemon ladder. It no longer wipes anything — `check-run` setup() never
+    // clears persisted state (#558) — so an authoritative from-stage0 backstop must invoke
+    // `td-recipe-eval clear-store` on that ladder itself before the build; it is no longer a
+    // per-run side effect.
     // TD_CHECK_DISABLE forwards the gate-disable list (gate names / `pool:<name>`
     // tokens) so `TD_CHECK_DISABLE=… td-builder check` reaches the in-sandbox runner.
     // TD_CHECK_BUILD_REUSE is the opt-in cross-run build cache (re #469): forwarded so
     // `TD_CHECK_BUILD_REUSE=1 td-builder check` reaches a gate's in-sandbox
-    // `td-recipe-eval check-run` (default unset ⇒ the clean-room full rebuild).
+    // `td-recipe-eval check-run`.
     for k in [
         "TD_CHECK_SLOTS",
         "TD_CHECK_SLOTS_DIR",

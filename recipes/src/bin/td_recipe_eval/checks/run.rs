@@ -62,7 +62,7 @@ impl TempImages {
     fn new(ladder_work_dir: &Path) -> Result<Self, String> {
         let base = std::env::temp_dir();
         // Fail closed if the system temp dir is INSIDE the ladder work tree. The whole
-        // point of staging the boot images here is to survive a concurrent force-cold
+        // point of staging the boot images here is to survive a concurrent `clear-store`
         // ladder wipe after the lock is released (see `run()`); if `TMPDIR` points into
         // the ladder, these "private" copies would be wiped WITH it and qemu could read
         // them out from under itself — the very race the copy-out closes. Refuse rather
@@ -155,8 +155,8 @@ pub(crate) fn run(runner: &RecipeCheckRunner, lock: File) -> Result<(), String> 
     }
 
     // Stage the boot images OUT of the ladder scratch to a private host temp dir BEFORE we
-    // release the lock. Once the lock is free, a concurrent force-cold runner can acquire
-    // it and wipe the entire ladder work dir (check_runner::setup -> remove_path_if_exists),
+    // release the lock. Once the lock is free, a concurrent `td-recipe-eval clear-store` can
+    // acquire it and wipe the entire ladder work dir (check_runner::clear_ladder),
     // which would delete these images out from under a boot that has not yet loaded
     // -kernel/-initrd/-drive into guest memory. Booting from private copies closes that
     // race entirely (re #541, Codex/subagent review). The kernel and init.cpio are copied;

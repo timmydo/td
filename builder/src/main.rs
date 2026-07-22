@@ -5016,8 +5016,14 @@ fn authenticate_seed_db(dbp: &str, items_dir: &Path) -> Result<(), String> {
         }
     }
     let data = std::fs::read(dbp).map_err(|e| format!("read plan seed db {dbp}: {e}"))?;
-    let db = store_db_read::Db::open(data)?;
-    for (path, _hash) in db.hashes_by_path()? {
+    // Prefix a torn/truncated-db parse red with `plan seed db {dbp}` too: a crash-torn seed db
+    // fails here, not at the basename check below, and the runner keys its clear-store recovery
+    // hint on the `plan seed db` marker — without the prefix a torn seed db would red unhinted.
+    let db = store_db_read::Db::open(data).map_err(|e| format!("plan seed db {dbp}: {e}"))?;
+    for (path, _hash) in db
+        .hashes_by_path()
+        .map_err(|e| format!("plan seed db {dbp}: {e}"))?
+    {
         let base = path.rsplit('/').next().unwrap_or(path.as_str());
         if !pinned.contains(base) {
             return Err(format!(

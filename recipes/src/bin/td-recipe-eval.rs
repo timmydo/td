@@ -17,6 +17,9 @@
 //!   build-run TARGET [OUTPUT_STEM ...]
 //!                         build a catalog target through the same Rust recipe
 //!                         runner and print machine-readable local output paths
+//!   clear-store           reset the ladder work dir (seed store/db + shared
+//!                         build-cache); the next build re-derives seeds and
+//!                         cold-climbs. The only path that clears persisted state
 //!   source-pins           print recipe-owned fixed-output source pins as:
 //!                         <key>\t<url>\t<sha256>\t<file>
 //!   source-pin STEM       print the fixed-output source pin(s) owned by STEM
@@ -215,6 +218,12 @@ fn main() {
                 die_runner(&e);
             }
         }
+        Some("clear-store") => {
+            let rest = args.get(2..).unwrap_or(&[]);
+            if let Err(e) = check_runner::clear_store_cli(rest) {
+                die_runner(&e);
+            }
+        }
         Some("qemu-boot") => {
             let rest = args.get(2..).unwrap_or(&[]);
             if let Err(e) = check_runner::qemu_boot_cli(rest) {
@@ -260,7 +269,7 @@ fn main() {
                 die_runner(&e);
             }
         }
-        _ => die("usage: td-recipe-eval list|emit|check-list|check-count|check-script|check-run|build-run|qemu-boot|qemu-boot-erofs|qemu-boot-system|run|source-pins|source-pin|seed-digests ..."),
+        _ => die("usage: td-recipe-eval list|emit|check-list|check-count|check-script|check-run|build-run|clear-store|qemu-boot|qemu-boot-erofs|qemu-boot-system|run|source-pins|source-pin|seed-digests ..."),
     }
 }
 

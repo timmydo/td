@@ -55,6 +55,116 @@ pub fn cli(args: &[String]) -> Result<(), String> {
     crate::checks::run(check_runner, &runner, stem)
 }
 
+/// `td-recipe-eval clear-store` — the EXPLICIT ladder reset, and the ONLY path that destroys
+/// persisted ladder state now that `setup()` never wipes. Removes the entire ladder work dir
+/// (seed store/db, the shared build-cache, and every per-invocation scratch); the next build
+/// re-derives seeds from the compiled pins and cold-climbs the affected closure. Held under
+/// the ladder lock so it can never race a live build or boot. Resolves the SAME tree `new()`
+/// builds into, so `TD_RECIPE_CHECK_WORK` / `TD_CHECK_CHAIN_CACHE` / `HOME` steer it identically.
+pub fn clear_store_cli(args: &[String]) -> Result<(), String> {
+    if !args.is_empty() {
+        return Err("usage: clear-store".to_string());
+    }
+    let root = env::current_dir().map_err(|e| format!("current dir: {e}"))?;
+    let home = env::var_os("HOME").map(PathBuf::from);
+    clear_ladder(&ladder_work_dir(&root, home.as_deref()))
+}
+
+/// Reset one ladder work dir under its lock. Factored from `clear_store_cli` so the fs-level
+/// test drives it against a throwaway tree without mutating process-global env.
+fn clear_ladder(lw: &Path) -> Result<(), String> {
+    // Refuse an obviously-unsafe target: `remove_dir_all` is recursive, and `TD_RECIPE_CHECK_WORK`
+    // is an unvalidated override — a stray `.`, `/`, `$HOME`, or a too-shallow path would delete
+    // far more than a ladder.
+    reject_unsafe_clear_target(lw)?;
+    // The ladder lock lives BESIDE lw (`<lw>.lock`), so removing lw leaves it — and its inode —
+    // intact; hold it across the whole reset so no concurrent build/boot runs inside meanwhile.
+    let lock_path = ladder_lock_path(lw);
+    if let Some(parent) = lock_path.parent() {
+        fs::create_dir_all(parent).map_err(|e| format!("mkdir {}: {e}", parent.display()))?;
+    }
+    let _lock = lock_file(&lock_path)?;
+    // A prior clear that crashed between the swap-aside and the reap would leave this sibling
+    // tombstone; remove it first (idempotent) so it cannot accrete. Race-free under the ladder
+    // lock, which serializes clears, so a fixed name needs no pid tag.
+    let tomb = clearing_tombstone_path(lw);
+    remove_path_if_exists(&tomb)?;
+    if lw.exists() {
+        // Swap lw aside atomically, THEN delete — never `remove_dir_all` the directory that holds
+        // our own open commit-lock fd. That is the invariant eviction keeps by siting its lock
+        // BESIDE the deleted subtree: an open-fd unlink NFS-silly-renames (rmdir then fails
+        // ENOTEMPTY), and unlinking a still-live lock pathname lets a fresh committer recreate +
+        // lock a NEW inode at the same path while a waiter holds the old one. The commit lock is
+        // held only across the instant rename, excluding an orphaned builder child mid-commit
+        // (the ladder lock does not cover a direct store-commit); once lw is renamed its pathname
+        // is gone, and no committer can recreate `<lw>/build-cache.commit.lock` until a fresh
+        // build — which must first take the ladder lock we still hold — recreates lw.
+        {
+            let _commit_lock = lock_file(&lw.join(CACHE_COMMIT_LOCK_BASENAME))?;
+            fs::rename(lw, &tomb)
+                .map_err(|e| format!("clear-store: swap {} aside: {e}", lw.display()))?;
+        }
+        remove_path_if_exists(&tomb)?;
+        println!("clear-store: reset ladder work dir {}", lw.display());
+    } else {
+        println!("clear-store: ladder work dir {} was already absent", lw.display());
+    }
+    Ok(())
+}
+
+/// The sibling tombstone `<lw>.clearing` that `clear_ladder` swaps lw onto before deleting it,
+/// so the recursive remove never runs against the tree holding its own open lock fd.
+fn clearing_tombstone_path(lw: &Path) -> PathBuf {
+    let mut s = lw.as_os_str().to_os_string();
+    s.push(".clearing");
+    PathBuf::from(s)
+}
+
+/// The commit-lock basename inside a ladder work dir, shared with the builder's commit
+/// transaction (`lock_store_commit`). ONE const so `clear_ladder` (free fn), the runner's
+/// `cache_commit_lock_path`, and eviction can never take DIFFERENT locks — a divergence would
+/// break the "clear/evict never races a direct committer" invariant with no compile error.
+const CACHE_COMMIT_LOCK_BASENAME: &str = "build-cache.commit.lock";
+
+/// Fail closed on a `clear-store` target that would recursively delete more than a ladder.
+/// A ladder work dir is always an absolute path at least THREE plain segments deep
+/// (`<root>/.td-build-cache/ladder-cold`, `<home>/.td/build-daemon/ladder-shared-v1`); `/`, `/x`,
+/// and a bare `$HOME` like `/home/user` (depth two) are rejected, as is any `.`/`..` component
+/// that could normalize the delete up out of the ladder.
+fn reject_unsafe_clear_target(lw: &Path) -> Result<(), String> {
+    if !lw.is_absolute() {
+        return Err(format!(
+            "clear-store: refusing to clear a non-absolute path {} (set TD_RECIPE_CHECK_WORK to \
+             an absolute ladder dir)",
+            lw.display()
+        ));
+    }
+    // Every segment after the root must be a plain name — a `.`/`..` component could traverse the
+    // recursive delete out of the ladder (e.g. `/a/b/../../..`).
+    let mut depth = 0usize;
+    for comp in lw.components() {
+        match comp {
+            std::path::Component::RootDir => {}
+            std::path::Component::Normal(_) => depth += 1,
+            _ => {
+                return Err(format!(
+                    "clear-store: refusing to clear {} — it has a `.` or `..` component; pass a \
+                     plain absolute ladder path",
+                    lw.display()
+                ));
+            }
+        }
+    }
+    if depth < 3 {
+        return Err(format!(
+            "clear-store: refusing to clear the too-shallow path {} — a ladder work dir is at \
+             least three components deep (a bare $HOME or repo root is not a ladder)",
+            lw.display()
+        ));
+    }
+    Ok(())
+}
+
 /// Host-side qemu boot validation (re #529). This is deliberately NOT a gated
 /// recipe check: booting the kernel requires HOST qemu, and the daily gate wraps
 /// every recipe check in a host-free `pivot_root` sandbox that exposes only
@@ -412,14 +522,50 @@ fn reapable_dead_pid(name: &str) -> Option<u32> {
     trailing_pid(name)
 }
 
+/// The ladder work dir this environment resolves to — the tree `check-run`/`build-run` build
+/// into and the explicit `clear-store` nukes. `TD_RECIPE_CHECK_WORK` overrides outright;
+/// otherwise a set, non-empty `TD_CHECK_CHAIN_CACHE` (or the default HOME-derived chain dir)
+/// selects the shared daemon ladder, and an empty chain cache selects the per-worktree cold
+/// ladder under the repo cache. Shared by `new()` (which builds here) and `clear_store_cli`
+/// (which resets it), so both name the identical tree.
+fn ladder_work_dir(root: &Path, home: Option<&Path>) -> PathBuf {
+    if let Some(explicit) = env::var_os("TD_RECIPE_CHECK_WORK") {
+        return PathBuf::from(explicit);
+    }
+    let chain_cache = match env::var("TD_CHECK_CHAIN_CACHE") {
+        Ok(v) => v,
+        Err(_) => home
+            .map(|h| h.join(".td/build-daemon/chain").display().to_string())
+            .unwrap_or_default(),
+    };
+    if chain_cache.is_empty() {
+        return root.join(".td-build-cache/ladder-cold");
+    }
+    // Fixed trust/layout epoch, a sibling of the old `ladder` a pre-fix worktree still wipes.
+    // Bump only on a trust/layout change, not a pin.
+    home.map(|h| h.join(".td/build-daemon/ladder-shared-v1"))
+        .unwrap_or_else(|| root.join(".td-build-cache/ladder-cold"))
+}
+
+/// The ladder's sibling lock, `<lw>.lock`. APPENDS `.lock` to the whole path rather than
+/// `with_extension` (which would REPLACE a dotted final component, e.g. a `TD_RECIPE_CHECK_WORK`
+/// ending in `.v2`, and collide two distinct ladders on one lock). Shared by the build runner
+/// (`lock_path`) and `clear_ladder` so a wipe can never race a live build via a split lock.
+fn ladder_lock_path(lw: &Path) -> PathBuf {
+    let mut s = lw.as_os_str().to_os_string();
+    s.push(".lock");
+    PathBuf::from(s)
+}
+
 /// The DEDICATED persistent build-output cache (store, db) under the ladder work dir.
 /// Deliberately DISTINCT from the seed store/db (`<lw>/store`, `<lw>/db`): those hold
 /// interned seed inputs and #468 authenticates the seed db as a seed-only authority, so a
 /// recipe OUTPUT committed there would be rejected as an unpinned seed. The cache lives in
 /// its own subtree so reuse never pollutes the seed authority. Shared across worktrees and
-/// content-addressed, so it is never wiped on a pin/patch change; the only reclaim is a
-/// rare high-watermark eviction of the whole `build-cache/` (store + db + `db.receipts`
-/// sidecars — the coherent unit the builder writes) in setup's coarse GC.
+/// content-addressed, so it is never wiped on a pin/patch change. Nothing reclaims it
+/// implicitly; the explicit `clear-store` resets the whole ladder, and an opt-in
+/// `TD_CHECK_LADDER_CACHE_CAP_BYTES` enables a coarse high-watermark eviction of the whole
+/// `build-cache/` (store + db + `db.receipts` sidecars — the coherent unit the builder writes).
 fn build_cache_paths(lw: &Path) -> (PathBuf, PathBuf) {
     let base = lw.join("build-cache");
     (base.join("store"), base.join("db"))
@@ -479,7 +625,6 @@ pub(crate) struct RecipeCheckRunner {
     db: PathBuf,
     recipes: PathBuf,
     scratch: PathBuf,
-    force_cold: bool,
     /// The REAL daemon runtime dir (`TD_DAEMON_DIR` or the OUTER
     /// `$HOME/.td/build-daemon`), forwarded to spawned td-builders whose HOME
     /// is re-pointed at the ladder work dir — the derived blessed-seed-db
@@ -539,25 +684,7 @@ impl RecipeCheckRunner {
                 .as_ref()
                 .map(|h| h.join(".td/build-daemon").display().to_string()),
         };
-        let chain_cache = match env::var("TD_CHECK_CHAIN_CACHE") {
-            Ok(v) => v,
-            Err(_) => home
-                .as_ref()
-                .map(|h| h.join(".td/build-daemon/chain").display().to_string())
-                .unwrap_or_default(),
-        };
-        let lw = env::var_os("TD_RECIPE_CHECK_WORK")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| {
-                if chain_cache.is_empty() {
-                    root.join(".td-build-cache/ladder-cold")
-                } else {
-                    // Fixed trust/layout epoch, a sibling of the old `ladder` a pre-fix
-                    // worktree still wipes. Bump only on a trust/layout change, not a pin.
-                    home.map(|h| h.join(".td/build-daemon/ladder-shared-v1"))
-                        .unwrap_or_else(|| root.join(".td-build-cache/ladder-cold"))
-                }
-            });
+        let lw = ladder_work_dir(&root, home.as_deref());
         let store = lw.join("store");
         let db = lw.join("db");
         let scratch = lw.join("scratch").join(scratch_name);
@@ -575,14 +702,12 @@ impl RecipeCheckRunner {
             db,
             recipes,
             scratch,
-            force_cold: chain_cache.is_empty()
-                && env::var_os("TD_RECIPE_CHECK_PRESERVE_WORK").is_none(),
             daemon_dir,
         })
     }
 
     pub(crate) fn lock_path(&self) -> PathBuf {
-        self.lw.with_extension("lock")
+        ladder_lock_path(&self.lw)
     }
 
     /// This runner's private per-invocation scratch directory, freshly created by
@@ -593,9 +718,10 @@ impl RecipeCheckRunner {
         &self.scratch
     }
 
-    /// The ladder work dir — the tree a concurrent force-cold `setup()` wipes. The
-    /// interactive runner uses this to refuse staging boot images anywhere inside it
-    /// (a `TMPDIR` pointed into the ladder), which a wipe could delete mid-boot.
+    /// The ladder work dir — the tree an explicit `clear-store` nukes. The interactive
+    /// runner uses this to refuse staging boot images anywhere inside it (a `TMPDIR`
+    /// pointed into the ladder), which a concurrent post-lock `clear-store` could delete
+    /// mid-boot.
     pub(crate) fn ladder_work_dir(&self) -> &Path {
         &self.lw
     }
@@ -611,36 +737,41 @@ impl RecipeCheckRunner {
     /// — cannot split the lock across an evict/recreate. Eviction and the builder take this same
     /// lock, so GC never renames the cache out from under an uncovered committer.
     fn cache_commit_lock_path(&self) -> PathBuf {
-        self.lw.join("build-cache.commit.lock")
+        self.lw.join(CACHE_COMMIT_LOCK_BASENAME)
     }
 
+    /// Prepare this invocation's private workspace WITHOUT destroying any persisted ladder
+    /// state. setup() ensures the seed-store dir exists, creates a fresh per-invocation
+    /// scratch, and reaps dead runs' abandoned scratch trees — it NEVER wipes the seed
+    /// store/db or the shared build-cache. Resetting the ladder is the explicit `clear-store`
+    /// command's sole job; a stale or torn seed now reds (with a clear-store hint) instead of
+    /// being silently re-derived. The seeds re-intern idempotently every run regardless
+    /// (`ensure_seed_input`), so a retained, intact seed store is reused, not clobbered.
     pub(crate) fn setup(&self) -> Result<(), String> {
-        self.setup_with_cache_cap(ladder_cache_cap_bytes())
+        self.setup_with_cache_cap(explicit_ladder_cache_cap())
     }
 
-    /// setup() with the eviction cap injected — the env-reading `setup()` is the
-    /// production entrypoint; tests pass an explicit cap so they stay hermetic against
-    /// the ambient `TD_CHECK_LADDER_CACHE_CAP_BYTES` force-eviction knob.
-    fn setup_with_cache_cap(&self, cache_cap: u64) -> Result<(), String> {
-        if self.force_cold {
-            remove_path_if_exists(&self.lw)?;
-        }
-        // Only the content-addressed build-cache is shared across worktrees; the seeds
-        // (store + db, and the map in prepare_recipe_target) are reset and re-derived per
-        // run. The seed db MUST reset (authenticate_seed_db reds a db holding rows the
-        // current compiled table cannot vouch for); the seed store MUST reset (a shared
-        // store never auto-heals a torn content-addressed item). Under the ladder lock.
-        remove_path_if_exists(&self.store)?;
-        remove_path_if_exists(&self.db)?;
+    /// setup() with the eviction cap injected — the env-reading `setup()` is the production
+    /// entrypoint; tests pass an explicit cap so they stay hermetic against the ambient
+    /// `TD_CHECK_LADDER_CACHE_CAP_BYTES` knob. `None` ⇒ no eviction at all (the default): an
+    /// implicit default-cap eviction would itself be a surprise cold-climb, exactly what
+    /// dropping the auto-wipe avoids, so build-cache reclaim is opt-in via that env or the
+    /// explicit `clear-store`.
+    fn setup_with_cache_cap(&self, cache_cap: Option<u64>) -> Result<(), String> {
         fs::create_dir_all(&self.store)
             .map_err(|e| format!("mkdir {}: {e}", self.store.display()))?;
+        // Only THIS invocation's private, pid-tagged scratch is (re)created fresh — a stale
+        // same-pid tree is a dead predecessor's leftover, never persisted store state.
         remove_path_if_exists(&self.scratch)?;
         fs::create_dir_all(&self.scratch)
             .map_err(|e| format!("mkdir {}: {e}", self.scratch.display()))?;
         // Reclaim disk from abandoned predecessors' scratch trees; under the ladder lock,
         // so reaping a dead pid's tree never races a live build.
         self.reap_dead_scratch();
-        self.evict_build_cache_if_over_watermark(cache_cap)
+        match cache_cap {
+            Some(cap) => self.evict_build_cache_if_over_watermark(cap),
+            None => Ok(()),
+        }
     }
 
     /// Coarse disk reclaim for the SHARED build-output cache: over the high-watermark cap,
@@ -849,7 +980,8 @@ impl RecipeCheckRunner {
             .arg(src_s)
             .arg(store_s)
             .arg(db_s);
-        let out = command_output(&mut cmd, &format!("store-add-recursive {name}"))?;
+        let out = command_output(&mut cmd, &format!("store-add-recursive {name}"))
+            .map_err(|e| with_seed_reset_hint(e, &self.lw))?;
         out.lines()
             .rev()
             .map(str::trim)
@@ -933,14 +1065,15 @@ impl RecipeCheckRunner {
 
     /// Realize one classified seed input by RE-DERIVING it from the compiled pin
     /// EVERY run — never by trusting a prior map entry. Each intern_* verifies the
-    /// pinned artifact and re-interns it into the per-run seed store (`store-add-
-    /// recursive` is idempotent: a re-intern of an item already present this run
-    /// NAR-verifies it rather than copying over it), so the returned path is bound to
-    /// the compiled pin on every run. The caller folds the result into the fresh
-    /// per-run auto-map; nothing prior is read, so there is no mutable mapping state to
+    /// pinned artifact and re-interns it into the retained seed store (`store-add-
+    /// recursive` is idempotent: a re-intern of an item already present — this run or a
+    /// retained prior run — NAR-verifies it rather than copying over it), so the returned
+    /// path is bound to the compiled pin on every run. The caller folds the result into the
+    /// fresh per-run auto-map; nothing prior is read, so there is no mutable mapping state to
     /// reconcile or self-heal — the stronger form of the #469 boundary. Cost, stated
     /// honestly: per run each seed's bytes are read several times (the pin sha256, the
-    /// NAR hash at synthesis, and store-add-recursive's copy into the reset seed store)
+    /// NAR hash at synthesis, and store-add-recursive's copy of a not-yet-interned item into
+    /// the seed store — a retained item is NAR-verified, not recopied)
     /// and stage0 is re-extracted — the same recorded re-hash-every-step decision as the
     /// StageManifest, trading warm-run time for a boundary with no trusted mutable state.
     fn ensure_seed_input(&self, input: &SeedInput) -> Result<String, String> {
@@ -1064,10 +1197,18 @@ impl RecipeCheckRunner {
         fs::write(&err_file, &out.stderr)
             .map_err(|e| format!("write {}: {e}", err_file.display()))?;
         if !out.status.success() {
-            return Err(format!(
+            let base = format!(
                 "{}\nladder: build-plan --auto {target} failed",
                 tail_bytes(&out.stderr, 40)
-            ));
+            );
+            // Scan the FULL stderr bytes, not just the 40-line tail, for the retained-seed
+            // markers — a long build log could scroll the auth red out of the tail. Byte-level
+            // so a huge or non-UTF-8 log costs no lossy full-buffer allocation on the error path.
+            return Err(if stale_seed_in(&out.stderr) {
+                format!("{base}\n{}", seed_reset_hint(&self.lw))
+            } else {
+                base
+            });
         }
         io::stdout()
             .write_all(&out.stdout)
@@ -1466,23 +1607,21 @@ fn dir_size_capped(path: &Path, cap: u64) -> u64 {
     total
 }
 
-/// High-watermark byte cap for the shared build-output cache: `TD_CHECK_LADDER_CACHE_CAP_BYTES`
-/// when set to a positive integer, else a generous default. The `TD_CHECK_` prefix is
-/// load-bearing — the `td-builder check` sandbox forwards only `TD_CHECK_*` / `TD_SUBST_*` /
-/// `TD_DAEMON_*`, so a bare `TD_LADDER_…` name would be stripped before it reached the
-/// in-sandbox runner. A deliberately blunt knob for the coarse eviction; a smarter retention
-/// policy is a follow-up.
-fn ladder_cache_cap_bytes() -> u64 {
+/// High-watermark byte cap for the shared build-output cache, ONLY when the operator sets a
+/// positive `TD_CHECK_LADDER_CACHE_CAP_BYTES`. Unset/zero/garbage ⇒ `None` ⇒ setup() reclaims
+/// nothing: the ladder is reset only by the explicit `clear-store`, and a rare over-cap
+/// eviction is opt-in for operators who want bounded auto-reclaim (an implicit default-cap
+/// eviction would itself be a surprise cold-climb). The `TD_CHECK_` prefix is load-bearing —
+/// the `td-builder check` sandbox forwards only `TD_CHECK_*` / `TD_SUBST_*` / `TD_DAEMON_*`,
+/// so a bare `TD_LADDER_…` name would be stripped before it reached the in-sandbox runner.
+fn explicit_ladder_cache_cap() -> Option<u64> {
     parse_cache_cap(env::var("TD_CHECK_LADDER_CACHE_CAP_BYTES").ok().as_deref())
 }
 
-fn parse_cache_cap(raw: Option<&str>) -> u64 {
+fn parse_cache_cap(raw: Option<&str>) -> Option<u64> {
     raw.and_then(|s| s.trim().parse::<u64>().ok())
         .filter(|&n| n > 0)
-        .unwrap_or(DEFAULT_LADDER_CACHE_CAP_BYTES)
 }
-
-const DEFAULT_LADDER_CACHE_CAP_BYTES: u64 = 64 * 1024 * 1024 * 1024;
 
 fn find_td_builder_self(root: &Path) -> Result<PathBuf, String> {
     if let Some(path) = env::var_os("TD_BUILDER_SELF").map(PathBuf::from) {
@@ -1521,6 +1660,53 @@ fn place_stage0_builder(
         .find(|line| !line.is_empty())
         .map(str::to_string)
         .ok_or_else(|| "stage0-builder produced no output".to_string())
+}
+
+/// The explicit-reset recovery line, appended when a failure looks like a stale/torn retained
+/// seed. setup() no longer wipes the seed store/db, so these red here instead of self-healing.
+/// Names the AFFECTED ladder via `TD_RECIPE_CHECK_WORK` so the operator clears that exact tree:
+/// a bare `clear-store` from a different `TD_CHECK_CHAIN_CACHE` environment would resolve a
+/// DIFFERENT ladder (cold vs shared) and clear the wrong one.
+fn seed_reset_hint(lw: &Path) -> String {
+    format!(
+        "hint: the ladder's retained seed store/db is stale or torn (a pinned-seed change or an \
+         interrupted intern). Run `TD_RECIPE_CHECK_WORK='{}' td-recipe-eval clear-store` to reset \
+         that exact ladder and re-derive seeds from the compiled pins.",
+        lw.display()
+    )
+}
+
+/// A retained-seed failure marker — a plan-seed-db authentication red
+/// (`authenticate_seed_db`/`authenticate_ca_db`: a pinned-seed change, or rows an accumulated
+/// cross-branch db can no longer vouch for), a corrupt content-addressed seed item
+/// (`store-add-recursive`'s idempotent re-intern rejecting a torn tree), or an `--auto`
+/// provenance red (`auto_seed_provenance`: a retained seed gone missing or content-address
+/// mismatched). All three clear with the same `clear-store` re-derive-from-pins reset.
+fn looks_like_stale_seed(text: &str) -> bool {
+    stale_seed_in(text.as_bytes())
+}
+
+/// Byte-level marker scan — used directly on a (possibly large, possibly non-UTF-8) build-plan
+/// stderr so the error path never allocates a lossy copy of the whole log.
+fn stale_seed_in(bytes: &[u8]) -> bool {
+    contains_subslice(bytes, b"plan seed db")
+        || contains_subslice(bytes, b"corrupt content-addressed item")
+        || contains_subslice(bytes, b"is not interned in the seed store")
+        || contains_subslice(bytes, b"tampered post-intern")
+}
+
+fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {
+    !needle.is_empty()
+        && needle.len() <= haystack.len()
+        && haystack.windows(needle.len()).any(|w| w == needle)
+}
+
+fn with_seed_reset_hint(err: String, lw: &Path) -> String {
+    if looks_like_stale_seed(&err) {
+        format!("{err}\n{}", seed_reset_hint(lw))
+    } else {
+        err
+    }
 }
 
 fn command_output(cmd: &mut Command, label: &str) -> Result<String, String> {
@@ -1897,26 +2083,22 @@ mod tests {
             db: lw.join("db"),
             recipes: scratch.join("recipes"),
             scratch,
-            force_cold: false,
             daemon_dir: None,
         }
     }
 
-    // The heart of the fix: in the SHARED (daemon) mode, setup() must NEVER wipe the
-    // build-cache on a normal under-cap run — that whole-store wipe on a pin/patch
-    // divergence is exactly what let divergent worktrees clobber each other's warm
-    // toolchain cache. Content-addressing makes a changed rung a fresh-path miss, not a
-    // stale reuse, so the shared build-cache never needs wiping. The seeds (store + db)
-    // are the deliberate exception: they ARE reset each run — the db because
-    // authenticate_seed_db authenticates the whole db against the current compiled table
-    // (an accumulated cross-branch db would red wholesale), and the store because a shared
-    // store never auto-heals a torn item (which would wedge every worktree).
+    // The heart of the change: setup() NEVER destroys persisted ladder state. The shared
+    // build-cache AND the seed store/db all survive a normal run — clearing is the explicit
+    // `clear-store`'s job. (The seeds are re-interned idempotently each run by
+    // `ensure_seed_input`; a retained, intact seed store is verified-and-reused, and a torn
+    // one reds with the clear-store hint instead of being silently papered over.) Only THIS
+    // invocation's private, pid-tagged scratch is (re)created fresh.
     #[test]
-    fn setup_shares_only_the_build_cache_and_resets_the_seeds() {
+    fn setup_preserves_all_persisted_ladder_state() {
         let lw = env::temp_dir().join(format!("td-ladder-shared-{}", process::id()));
         let _ = fs::remove_dir_all(&lw);
-        // A neighbor's warm build-cache (the shared layer), plus stale seed store/db and
-        // pre-fix leftovers a divergent or old client might have left behind.
+        // A neighbor's warm build-cache (the shared layer) and this ladder's retained seed
+        // store/db — none of it may be touched by setup().
         fs::create_dir_all(lw.join("build-cache").join("store")).unwrap();
         fs::write(
             lw.join("build-cache").join("store").join("rung-sentinel"),
@@ -1924,35 +2106,66 @@ mod tests {
         )
         .unwrap();
         fs::create_dir_all(lw.join("store")).unwrap();
-        fs::write(lw.join("store").join("stale-seed"), b"partial-or-foreign").unwrap();
-        fs::write(lw.join("db"), b"another branch's accumulated seed rows").unwrap();
-        fs::write(lw.join("srcs.map"), b"stale legacy map\n").unwrap();
-        fs::write(lw.join("setup-ok"), b"ladder-setup-v9\npin\told\n").unwrap();
+        fs::write(lw.join("store").join("seed-item"), b"interned-seed").unwrap();
+        fs::write(lw.join("db"), b"this ladder's registered seed rows").unwrap();
 
         let runner = shared_test_runner(&lw);
-        // Inject the cap (don't read it from env) so this stays hermetic against the
-        // ambient TD_CHECK_LADDER_CACHE_CAP_BYTES=1 force-eviction knob, which would
-        // otherwise evict the tiny sentinel cache and defeat the survival assertion.
-        runner
-            .setup_with_cache_cap(DEFAULT_LADDER_CACHE_CAP_BYTES)
-            .unwrap();
+        // No cap ⇒ no eviction, so even the tiny sentinel build-cache survives; this stays
+        // hermetic against the ambient TD_CHECK_LADDER_CACHE_CAP_BYTES knob.
+        runner.setup_with_cache_cap(None).unwrap();
 
-        // The under-cap build-cache SURVIVES — no divergence wipe. This is the anti-thrash
-        // property, asserted directly.
+        // Nothing persisted is wiped: the build-cache, the seed store, and the seed db all
+        // survive intact.
         assert!(lw
             .join("build-cache")
             .join("store")
             .join("rung-sentinel")
             .is_file());
-        // ...but the seed store and db are reset (this run re-interns + re-registers its
-        // own pin-verified seeds), so a divergent sibling's rows / a torn seed item / stale
-        // pre-fix files never carry over.
-        assert!(!lw.join("store").join("stale-seed").exists());
-        assert!(lw.join("store").is_dir()); // recreated empty, ready for this run's seeds
-        assert!(!lw.join("db").exists());
+        assert!(lw.join("store").join("seed-item").is_file());
+        assert!(lw.join("db").is_file());
         // The per-invocation scratch is freshly created.
         assert!(runner.scratch.is_dir());
         let _ = fs::remove_dir_all(&lw);
+    }
+
+    // `clear-store` is the ONLY path that resets persisted ladder state: it removes the whole
+    // ladder work dir (seed store/db AND the shared build-cache), leaving the sibling lock
+    // untouched. Driven through `clear_ladder` (the env-free core of `clear_store_cli`) so the
+    // test stays hermetic against process-global env.
+    #[test]
+    fn clear_store_nukes_the_whole_ladder_and_keeps_the_lock() {
+        // A deep-enough dir so reject_unsafe_clear_target admits it (a real ladder is >=3 deep).
+        let lw = env::temp_dir()
+            .join(format!("td-clear-{}", process::id()))
+            .join("build-daemon")
+            .join("ladder-shared-v1");
+        let lock = ladder_lock_path(&lw);
+        let tomb = clearing_tombstone_path(&lw);
+        let _ = fs::remove_dir_all(&lw);
+        let _ = fs::remove_file(&lock);
+        let _ = fs::remove_dir_all(&tomb);
+        fs::create_dir_all(lw.join("build-cache").join("store")).unwrap();
+        fs::write(lw.join("build-cache").join("store").join("rung"), b"x").unwrap();
+        fs::create_dir_all(lw.join("store")).unwrap();
+        fs::write(lw.join("store").join("seed-item"), b"y").unwrap();
+        fs::write(lw.join("db"), b"rows").unwrap();
+        // Materialize the sibling lock as a build would, so we can assert it survives.
+        drop(lock_file(&lock).unwrap());
+
+        clear_ladder(&lw).unwrap();
+
+        // The whole ladder tree is gone, the swap-aside tombstone did not leak, and the sibling
+        // lock (BESIDE lw) is not touched.
+        assert!(!lw.exists());
+        assert!(!tomb.exists());
+        assert!(lock.is_file());
+        // Idempotent: clearing an already-absent ladder is a no-op Ok (creates only the lock).
+        clear_ladder(&lw).unwrap();
+        assert!(!lw.exists());
+        // A stray argument is a usage error (checked before any fs work).
+        let err = clear_store_cli(&["extra".to_string()]).unwrap_err();
+        assert!(err.contains("usage: clear-store"));
+        let _ = fs::remove_dir_all(env::temp_dir().join(format!("td-clear-{}", process::id())));
     }
 
     // The coarse GC evicts the whole build-cache when it exceeds the cap, and does so
@@ -2042,21 +2255,21 @@ mod tests {
         let _ = fs::remove_dir_all(&lw);
     }
 
-    // The force-cold (per-worktree, no shared cache) mode is unchanged: setup() wipes
-    // the whole ladder tree each run for the clean-room proof.
+    // There is no force-cold auto-wipe any more: setup() retains the seed store/db even in
+    // the per-worktree cold ladder. A from-stage0 clean-room run is now an explicit
+    // `clear-store` first, never a side effect of setup().
     #[test]
-    fn setup_force_cold_wipes_the_worktree_ladder() {
+    fn setup_retains_the_seed_store_with_no_force_cold_wipe() {
         let lw = env::temp_dir().join(format!("td-ladder-cold-{}", process::id()));
         let _ = fs::remove_dir_all(&lw);
         fs::create_dir_all(lw.join("store")).unwrap();
-        fs::write(lw.join("store").join("stale"), b"x").unwrap();
+        fs::write(lw.join("store").join("prior-seed"), b"x").unwrap();
 
-        let mut runner = shared_test_runner(&lw);
-        runner.force_cold = true;
+        let runner = shared_test_runner(&lw);
         runner.setup().unwrap();
 
-        assert!(!lw.join("store").join("stale").exists());
-        assert!(lw.join("store").is_dir());
+        // The prior run's seed survives — setup() no longer wipes it.
+        assert!(lw.join("store").join("prior-seed").is_file());
         assert!(runner.scratch.is_dir());
         let _ = fs::remove_dir_all(&lw);
     }
@@ -2076,18 +2289,95 @@ mod tests {
         let _ = fs::remove_dir_all(&tmp);
     }
 
-    // The cap knob: a positive override wins; zero, garbage, and absent all fall back
-    // to the compiled default.
+    // The eviction cap is now opt-in: a positive value enables eviction at that cap; zero,
+    // garbage, and absent all yield None ⇒ setup() reclaims nothing (no implicit eviction).
     #[test]
-    fn cache_cap_prefers_a_positive_override_else_the_default() {
-        assert_eq!(parse_cache_cap(Some("4096")), 4096);
-        assert_eq!(parse_cache_cap(Some("  4096  ")), 4096);
-        assert_eq!(parse_cache_cap(Some("0")), DEFAULT_LADDER_CACHE_CAP_BYTES);
+    fn cache_cap_is_opt_in_on_a_positive_value_else_none() {
+        assert_eq!(parse_cache_cap(Some("4096")), Some(4096));
+        assert_eq!(parse_cache_cap(Some("  4096  ")), Some(4096));
+        assert_eq!(parse_cache_cap(Some("0")), None);
+        assert_eq!(parse_cache_cap(Some("not-a-number")), None);
+        assert_eq!(parse_cache_cap(None), None);
+    }
+
+    // The retained-seed failure markers get the clear-store recovery line appended, and it
+    // names the AFFECTED ladder via TD_RECIPE_CHECK_WORK so a bare command can't clear the
+    // wrong tree; an unrelated error passes through untouched (no spurious hint). Byte-level
+    // scan matches raw stderr; the subslice search handles empty/oversized needles.
+    #[test]
+    fn seed_reset_hint_fires_only_on_retained_seed_failures() {
+        let lw = Path::new("/home/u/.td/build-daemon/ladder-shared-v1");
+        let db_red = "plan seed db /x/db: provenance rejected: `/td/store/foo' is not a basename \
+                      the compiled seed-digest table pins";
+        let torn = "store-add-recursive foo failed\nstderr:\nstore item /x exists but hashes \
+                    sha256:aa, expected sha256:bb — corrupt content-addressed item; refusing to \
+                    re-register it (re #469)";
+        // `auto_seed_provenance` reds surface only in build-plan stderr; both wordings clear
+        // with the same reset, so the byte scan matches them too.
+        let auto_missing = "--auto: provenance rejected: recipe `foo' input `bar' resolves to \
+                            `/td/store/x' but `x' is not interned in the seed store /x/store (re #469)";
+        let auto_tampered = "--auto: provenance rejected: the interned bytes content-address to \
+                             `/td/store/y' — renamed, self-registered under the wrong address, or \
+                             tampered post-intern; origin authority is the calling runner's pins";
+        assert!(looks_like_stale_seed(db_red));
+        assert!(stale_seed_in(torn.as_bytes()));
+        assert!(stale_seed_in(auto_missing.as_bytes()));
+        assert!(stale_seed_in(auto_tampered.as_bytes()));
+        for hinted in [
+            with_seed_reset_hint(db_red.to_string(), lw),
+            with_seed_reset_hint(torn.to_string(), lw),
+            with_seed_reset_hint(auto_missing.to_string(), lw),
+            with_seed_reset_hint(auto_tampered.to_string(), lw),
+        ] {
+            assert!(hinted.contains("clear-store"));
+            // The ladder path is single-quoted so a path with spaces/metacharacters stays a
+            // safe copy-paste.
+            assert!(hinted.contains("TD_RECIPE_CHECK_WORK='/home/u/.td/build-daemon/ladder-shared-v1'"));
+        }
+
+        let unrelated = "ladder: pinned tarball not warm (/x/foo.tar) - run 'td-feed warm sources'";
+        assert!(!looks_like_stale_seed(unrelated));
+        assert_eq!(with_seed_reset_hint(unrelated.to_string(), lw), unrelated);
+
+        // Subslice search edges: present, absent, empty needle, needle longer than haystack.
+        assert!(contains_subslice(b"abcXYZdef", b"XYZ"));
+        assert!(!contains_subslice(b"abcdef", b"XYZ"));
+        assert!(!contains_subslice(b"abc", b""));
+        assert!(!contains_subslice(b"ab", b"abc"));
+    }
+
+    // clear-store fails closed on a too-shallow, relative, or `..`-bearing target so a stray
+    // TD_RECIPE_CHECK_WORK can't recursively delete `.`, `/`, `$HOME`, or traverse out of the
+    // ladder. A real ladder is >=3 plain segments deep.
+    #[test]
+    fn clear_store_rejects_unsafe_targets() {
+        // Real ladders (>=3 deep) pass.
+        assert!(reject_unsafe_clear_target(Path::new("/home/u/.td/build-daemon/ladder-shared-v1")).is_ok());
+        assert!(reject_unsafe_clear_target(Path::new("/a/b/c")).is_ok());
+        // Too shallow: root, a system dir, and a bare $HOME (`/home/user`, depth two) are refused.
+        assert!(reject_unsafe_clear_target(Path::new("/")).is_err());
+        assert!(reject_unsafe_clear_target(Path::new("/home")).is_err());
+        assert!(reject_unsafe_clear_target(Path::new("/home/user")).is_err());
+        assert!(reject_unsafe_clear_target(Path::new("/tmp/ladder")).is_err());
+        // Relative and `.`/`..`-bearing targets are refused (traversal can escape the ladder).
+        assert!(reject_unsafe_clear_target(Path::new(".")).is_err());
+        assert!(reject_unsafe_clear_target(Path::new("relative/path/here")).is_err());
+        assert!(reject_unsafe_clear_target(Path::new("/home/user/../../etc")).is_err());
+        assert!(reject_unsafe_clear_target(Path::new("/a/b/c/..")).is_err());
+    }
+
+    // The sibling lock path APPENDS `.lock` (never `with_extension`, which would truncate a
+    // dotted final component and collide two ladders on one lock).
+    #[test]
+    fn ladder_lock_path_appends_and_never_truncates() {
         assert_eq!(
-            parse_cache_cap(Some("not-a-number")),
-            DEFAULT_LADDER_CACHE_CAP_BYTES
+            ladder_lock_path(Path::new("/x/ladder-cold")),
+            Path::new("/x/ladder-cold.lock")
         );
-        assert_eq!(parse_cache_cap(None), DEFAULT_LADDER_CACHE_CAP_BYTES);
+        assert_eq!(
+            ladder_lock_path(Path::new("/x/ladder.v2")),
+            Path::new("/x/ladder.v2.lock")
+        );
     }
 
     #[test]
@@ -2247,7 +2537,6 @@ mod tests {
             db: PathBuf::new(),
             recipes: PathBuf::new(),
             scratch: tmp.join("scratch"),
-            force_cold: false,
             daemon_dir: None,
         };
 
