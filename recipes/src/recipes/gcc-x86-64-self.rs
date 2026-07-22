@@ -181,12 +181,38 @@ pub fn recipe() -> Recipe {
         .env("CPLUS_INCLUDE_PATH", cip)
         .env("LIBRARY_PATH", lp),
     );
+    // rustc forces `-Wl,-Bdynamic -lgcc_s` on every x86_64-unknown-linux-gnu link even
+    // under `-nodefaultlibs`, but this `--disable-shared` gcc ships no `libgcc_s.so`.
+    // Drop a GNU ld linker-script shim into gcc's own libgcc dir so the forced `-lgcc_s`
+    // resolves to the STATIC unwinder with no shared-GCC edge. GROUP names archives via
+    // `-l` (relocatable, no store path); `libgcc_eh.a` is added only when it exists.
+    steps.push(
+        Step::run(
+            "{root}",
+            &[
+                SH,
+                "-c",
+                "g=$('{out}/stage/td/store/gcc-14.3.0-x86_64-self/bin/gcc' -print-libgcc-file-name) || exit 1; \
+                 d=${g%/*}; libs=-lgcc; [ -f \"$d/libgcc_eh.a\" ] && libs=\"$libs -lgcc_eh\"; \
+                 printf 'GROUP ( %s )\\n' \"$libs\" > \"$d/libgcc_s.so\"",
+            ],
+        )
+        .env("PATH", &path),
+    );
     steps.push(Step::Require {
         paths: vec![
             "{out}/stage/td/store/gcc-14.3.0-x86_64-self/bin/gcc".into(),
             "{out}/stage/td/store/gcc-14.3.0-x86_64-self/bin/g++".into(),
         ],
         exec: true,
+    });
+    // Assert the shim reached the dir consumers search (fail-fast on tuple/version
+    // drift from the step's dynamic target); not exec — it is a linker script.
+    steps.push(Step::Require {
+        paths: vec![
+            "{out}/stage/td/store/gcc-14.3.0-x86_64-self/lib/gcc/x86_64-pc-linux-gnu/14.3.0/libgcc_s.so".into(),
+        ],
+        exec: false,
     });
 
     Recipe::mesboot("gcc-x86-64-self", "14.3.0")
