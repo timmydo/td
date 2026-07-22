@@ -191,7 +191,7 @@ pub fn qemu_boot_cli(args: &[String]) -> Result<(), String> {
 
     let root = env::current_dir().map_err(|e| format!("current dir: {e}"))?;
     let scratch_name = scratch_name("qemu-boot", &[stem]);
-    let runner = RecipeCheckRunner::new(root, &scratch_name)?;
+    let runner = RecipeCheckRunner::new(root, &scratch_name)?.with_streamed_progress();
     let _lock = lock_file(&runner.lock_path())?;
     runner.setup()?;
     crate::checks::qemu_boot::run(&runner)
@@ -222,7 +222,7 @@ pub fn qemu_boot_erofs_cli(args: &[String]) -> Result<(), String> {
     // Reuse the `qemu-boot-` scratch prefix so the stale-scratch reaper still cleans
     // a killed erofs boot's per-boot directories.
     let scratch_name = scratch_name("qemu-boot", &[stem]);
-    let runner = RecipeCheckRunner::new(root, &scratch_name)?;
+    let runner = RecipeCheckRunner::new(root, &scratch_name)?.with_streamed_progress();
     let _lock = lock_file(&runner.lock_path())?;
     runner.setup()?;
     crate::checks::qemu_boot::run_erofs(&runner)
@@ -257,7 +257,7 @@ pub fn qemu_boot_system_cli(args: &[String]) -> Result<(), String> {
     // Reuse the `qemu-boot-` scratch prefix so the stale-scratch reaper still cleans
     // a killed system boot's per-boot directories (it can hold a multi-GiB kernel build).
     let scratch_name = scratch_name("qemu-boot", &[stem]);
-    let runner = RecipeCheckRunner::new(root, &scratch_name)?;
+    let runner = RecipeCheckRunner::new(root, &scratch_name)?.with_streamed_progress();
     let _lock = lock_file(&runner.lock_path())?;
     runner.setup()?;
     crate::checks::qemu_boot::run_system(&runner)
@@ -300,7 +300,7 @@ pub fn run_cli(args: &[String]) -> Result<(), String> {
 
     let root = env::current_dir().map_err(|e| format!("current dir: {e}"))?;
     let scratch_name = scratch_name("run", &[stem]);
-    let runner = RecipeCheckRunner::new(root, &scratch_name)?;
+    let runner = RecipeCheckRunner::new(root, &scratch_name)?.with_streamed_progress();
     let lock = lock_file(&runner.lock_path())?;
     runner.setup()?;
     // The interactive boot runs unbounded (until the operator quits qemu), so hand the
@@ -348,7 +348,7 @@ pub fn build_cli(args: &[String]) -> Result<(), String> {
 
     let root = env::current_dir().map_err(|e| format!("current dir: {e}"))?;
     let scratch_name = scratch_name("build", &[target]);
-    let runner = RecipeCheckRunner::new(root, &scratch_name)?;
+    let runner = RecipeCheckRunner::new(root, &scratch_name)?.with_streamed_progress();
     let _lock = lock_file(&runner.lock_path())?;
     runner.setup()?;
     runner.build_recipe_target(target, &outputs)
@@ -631,6 +631,12 @@ pub(crate) struct RecipeCheckRunner {
     /// lookup (re #469 round-8) keys on this dir, and without the forward it
     /// would resolve under the ladder HOME where nothing was ever blessed.
     daemon_dir: Option<String>,
+    /// When set, `build_plan` TEES the builder's per-rung stderr to this process's
+    /// stderr live instead of swallowing it until the build ends — so an operator
+    /// watching a cold multi-minute ladder climb (host-side `run`/`build-run`/
+    /// `qemu-boot`) sees each rung land. Off for gate `check-run`, whose output the
+    /// gate captures wholesale.
+    stream_progress: bool,
 }
 
 struct RecipeNode {
@@ -703,7 +709,17 @@ impl RecipeCheckRunner {
             recipes,
             scratch,
             daemon_dir,
+            stream_progress: false,
         })
+    }
+
+    /// Opt into live per-rung build progress: `build_plan` tees the builder's stderr
+    /// to this process's stderr as the ladder climbs, rather than buffering it until
+    /// the build finishes. Set by the host-side, human-invoked commands (`run`,
+    /// `build-run`, `qemu-boot*`) so a cold multi-minute climb is not a silent wait.
+    pub(crate) fn with_streamed_progress(mut self) -> Self {
+        self.stream_progress = true;
+        self
     }
 
     pub(crate) fn lock_path(&self) -> PathBuf {
@@ -1187,31 +1203,41 @@ impl RecipeCheckRunner {
             cmd.env("TD_PERSIST_STORE", path_str(&cache_store)?)
                 .env("TD_PERSIST_DB", path_str(&cache_db)?);
         }
-        let out = cmd
-            .output()
-            .map_err(|e| format!("spawn build-plan --auto {target}: {e}"))?;
+        // Host-side human commands stream the builder's per-rung stderr live so a cold
+        // ladder climb is not a silent multi-minute wait; gate `check-run` keeps the
+        // buffering `.output()` path so its captured log is byte-identical. Both return
+        // the same (status, stdout, stderr) triple, so the file/tail/scan below is shared.
+        let (status, stdout_bytes, stderr_bytes) = if self.stream_progress {
+            spawn_capture_tee_stderr(&mut cmd)
+                .map_err(|e| format!("build-plan --auto {target}: {e}"))?
+        } else {
+            let out = cmd
+                .output()
+                .map_err(|e| format!("spawn build-plan --auto {target}: {e}"))?;
+            (out.status, out.stdout, out.stderr)
+        };
         let out_file = self.scratch.join(format!("build-{target}.out"));
         let err_file = self.scratch.join(format!("build-{target}.err"));
-        fs::write(&out_file, &out.stdout)
+        fs::write(&out_file, &stdout_bytes)
             .map_err(|e| format!("write {}: {e}", out_file.display()))?;
-        fs::write(&err_file, &out.stderr)
+        fs::write(&err_file, &stderr_bytes)
             .map_err(|e| format!("write {}: {e}", err_file.display()))?;
-        if !out.status.success() {
+        if !status.success() {
             let base = format!(
                 "{}\nladder: build-plan --auto {target} failed",
-                tail_bytes(&out.stderr, 40)
+                tail_bytes(&stderr_bytes, 40)
             );
             // Scan the FULL stderr bytes, not just the 40-line tail, for the retained-seed
             // markers — a long build log could scroll the auth red out of the tail. Byte-level
             // so a huge or non-UTF-8 log costs no lossy full-buffer allocation on the error path.
-            return Err(if stale_seed_in(&out.stderr) {
+            return Err(if stale_seed_in(&stderr_bytes) {
                 format!("{base}\n{}", seed_reset_hint(&self.lw))
             } else {
                 base
             });
         }
         io::stdout()
-            .write_all(&out.stdout)
+            .write_all(&stdout_bytes)
             .map_err(|e| format!("write build-plan stdout: {e}"))?;
         Ok(out_file)
     }
@@ -1709,6 +1735,79 @@ fn with_seed_reset_hint(err: String, lw: &Path) -> String {
     }
 }
 
+/// Run `cmd` capturing its stdout, while TEEING its stderr to this process's stderr
+/// in real time AND accumulating the full stderr bytes. Returns the same
+/// `(status, stdout, stderr)` triple `Command::output` would — so a caller can still
+/// write the err-file, take an error tail, and scan for stale-seed markers — but the
+/// operator sees the child's progress as it happens instead of only at the end.
+///
+/// stdout is drained CONCURRENTLY on a thread: build-plan interleaves per-rung `STEP`
+/// lines on stdout with progress on stderr, and reading stderr to EOF before touching
+/// stdout could deadlock once a long build fills the stdout pipe buffer.
+fn spawn_capture_tee_stderr(
+    cmd: &mut Command,
+) -> Result<(process::ExitStatus, Vec<u8>, Vec<u8>), String> {
+    let mut child = cmd
+        // Null stdin, matching `Command::output`: the build-plan child is non-interactive,
+        // and inheriting the parent's stdin (a terminal on the interactive `run` path) would
+        // both risk a hang and hand the sandboxed build an undeclared host input.
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("spawn: {e}"))?;
+    let mut stdout_pipe = child
+        .stdout
+        .take()
+        .ok_or_else(|| "stdout pipe unavailable".to_string())?;
+    let stdout_thread = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        stdout_pipe.read_to_end(&mut buf).map(|_| buf)
+    });
+    let mut stderr_pipe = child
+        .stderr
+        .take()
+        .ok_or_else(|| "stderr pipe unavailable".to_string())?;
+    let mut stderr_buf = Vec::new();
+    let mut chunk = [0u8; 8192];
+    let stderr = io::stderr();
+    loop {
+        match stderr_pipe.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => {
+                let slice = chunk.get(..n).unwrap_or(&[]);
+                // Tee live. A broken/closed terminal must not abort a valid build, so a
+                // failed terminal write is ignored — the bytes are still captured below
+                // for the err-file, error tail, and stale-seed scan.
+                {
+                    let mut handle = stderr.lock();
+                    let _ = handle.write_all(slice);
+                    let _ = handle.flush();
+                }
+                stderr_buf.extend_from_slice(slice);
+            }
+            Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => {
+                // Hard stderr read error: reap the child before surfacing it. `Child::drop`
+                // neither kills nor waits, so a bare return would orphan a builder that keeps
+                // mutating scratch/cache after the caller releases the ladder lock. Killing
+                // closes the child's stdout too, so the stdout reader unblocks and joins.
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = stdout_thread.join();
+                return Err(format!("read stderr: {e}"));
+            }
+        }
+    }
+    let status = child.wait().map_err(|e| format!("wait: {e}"))?;
+    let stdout_buf = match stdout_thread.join() {
+        Ok(Ok(buf)) => buf,
+        Ok(Err(e)) => return Err(format!("read stdout: {e}")),
+        Err(_) => return Err("stdout reader thread panicked".to_string()),
+    };
+    Ok((status, stdout_buf, stderr_buf))
+}
+
 fn command_output(cmd: &mut Command, label: &str) -> Result<String, String> {
     let out = cmd.output().map_err(|e| format!("spawn {label}: {e}"))?;
     if !out.status.success() {
@@ -2084,6 +2183,7 @@ mod tests {
             recipes: scratch.join("recipes"),
             scratch,
             daemon_dir: None,
+            stream_progress: false,
         }
     }
 
@@ -2538,6 +2638,7 @@ mod tests {
             recipes: PathBuf::new(),
             scratch: tmp.join("scratch"),
             daemon_dir: None,
+            stream_progress: false,
         };
 
         let got = runner.ladder_out_from(&current, "rust-toolchain").unwrap();
