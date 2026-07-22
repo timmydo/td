@@ -27,10 +27,6 @@ host-built control-plane binaries do not enter the final image.
 
 ## Target artifact graph
 
-This section is the normative target architecture. Transitional
-mechanisms still present in the tree are migration state, not
-architectural direction; issues and PRs record their current status.
-
 The target distribution begins with the tiny, auditable stage0-posix
 seed. Recipes build the artifact graph directly into `/td/store`:
 
@@ -150,25 +146,13 @@ be Rust built with the source-built stage2 `/td/store` toolchain.
    fixed-output fetches. Do not make a build pass by reaching outside
    the container or adding an undeclared dependency
    
-2. Issues track the work — plain markdown files in `issues/`, not
-   GitHub Issues (GitHub is a backup remote only). Claim an item by
-   pushing an `issue-NNNN-*` branch, commit often, and push (the branch
-   is squashed into main at landing) so another agent can pick up the
-   work after an unexpected interruption (e.g. reboot). See "Parallel
-   work" and `issues/README.md`. No issue file is needed for
-   self-contained work a single landing both opens and closes — don't
-   create one in `issues/open/` just to `git mv` it to `issues/closed/`
-   in the same PR. Open an issue when the work spans landings, needs
-   claiming to avoid collisions, or belongs in the backlog for another
-   agent to pick up.
-
-3. Avoid external dependencies. Request explicit sign off before
+2. Avoid external dependencies. Request explicit sign off before
    adding and make it clear in the landing commit message if this adds
    a new dependency.
 
-4. Avoid writing shell. Prefer rust code with zero dependencies.
+3. Avoid writing shell. Prefer rust code with zero dependencies.
 
-5. Treat migrations as a complete, atomic increment — a migration cuts
+4. Treat migrations as a complete, atomic increment — a migration cuts
    over in one landing. Delete the old mechanism in the same landing.
    We use git. You don't need to put dates in annotations--git blame is
    for that.
@@ -216,36 +200,25 @@ tiers + the daily backstop.
 
 # Parallel work (worktrees, land on green)
 
-Multiple agents work this repo concurrently so use work trees. Take
-new work from the backlog: `ls issues/open/` is the menu (see
-`issues/README.md`). GitHub (and the sr.ht mirror) is a git backup
-remote only — no GitHub Issues, PRs, Actions, or branch protection.
+Multiple agents work this repo concurrently so use work trees. GitHub
+(and the sr.ht mirror) is a git backup remote only — no GitHub Issues,
+PRs, Actions, or branch protection.
 
-Work in your own git worktree/branch named `issue-NNNN-slug`.
-
-**Claim.** Pushing that branch to `origin` is the claim (this replaces
-the old draft PR). The claim board is `git ls-remote --heads origin
-'issue-*'`; before starting, confirm your item's territory is disjoint
-from every active `issue-*` branch (each issue's "Collisions" section).
-A claimed branch with no new commits for a few days is reclaimable.
+Work in your own git worktree/branch named `work-NNNN-slug`.
 
 **Ready.** A branch is ready to land when its bounded checks are green
 (`td-builder affected-checks --committed-only --run`) AND all three
 code reviews have run, their findings acted on, and the acting agent's
 summary of those findings and follow-ups is in the commit message.
-There is no draft/ready flag to flip and nothing on a
-webpage to ask the human to look at — readiness lives entirely in the
-branch. The SAME agent that finishes the work carries it to ready;
-don't hand a half-reviewed branch to the integrator.
+There is no draft/ready flag to flip and nothing on a webpage to ask
+the human to look at — readiness lives entirely in the branch. The
+SAME agent that finishes the work carries it to ready; don't hand a
+half-reviewed branch to the integrator.
 
 **Land.** A single integrator (the test user) lands ready branches into
 main: `git fetch`, `git squash-in <branch>` (squashes the branch,
 prefilling the message from its commits), review `git diff --cached`,
-`git commit`, `git mv issues/open/NNNN-*.md issues/closed/` for any
-item it closes, `git push origin main`, then delete the branch
-(`git push origin :issue-NNNN-slug`). Squash — one commit per landing —
-keeps each landing atomic and the suspect unambiguous for the heal
-primitive (`ci/revert-suspect.sh`).
+`git commit`, `git push origin main`. 
 
 Never `git stash` in this repo. The stash stack (`refs/stash`) is
   repo-*global*.
@@ -329,11 +302,12 @@ td's Rust is defensive and minimal-surface.
 - **Prefer allocating off the hot path** — set buffers/collections up once rather
   than per-iteration in a build's inner loop. This is a code-review guideline, not
   a lint (there is no clippy check for it); don't contort code to satisfy it.
-- **Code comments are terse.** A comment earns its place by explaining a non-obvious
-  *why* in a line or two — not by narrating the change, restating the code, or citing
-  issue/PR numbers, review history, or design rationale. That context belongs in the
-  commit message (`git blame` walks any line back to it); the review reconciliation
-  belongs there too. Match the surrounding comment density; when in doubt, cut.
+- **Code comments are terse.** A comment earns its place by explaining
+  a non-obvious *why* in a line or two — not by narrating the change,
+  restating the code, review history, or design rationale. That
+  context belongs in the commit message (`git blame` walks any line
+  back to it); the review reconciliation belongs there too. Match the
+  surrounding comment density; when in doubt, cut.
 
 
 **Commits**
@@ -346,10 +320,3 @@ td's Rust is defensive and minimal-surface.
   else persists (there is no PR description, no webpage); if you want to keep it, it
   goes in a commit message.
 
-- **Closing an item is a `git mv`, not a keyword.** An item closes when the integrator
-  moves its file from `issues/open/` to `issues/closed/` in the landing commit — there
-  is no GitHub keyword magic firing off commit text anymore. `closes #N` / `fixes #N`
-  in a message is just a human-readable pointer now; when you refer to an item you are
-  NOT closing, write `re #N` / `see #N` / `until #N is fixed` to keep it unambiguous.
-  (The old hazard — a stray `fixes #N` auto-closing a live issue, as #291's squash
-  mis-closed #292 — is gone with GitHub Issues.)
