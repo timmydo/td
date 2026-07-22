@@ -9182,6 +9182,17 @@ fn main() -> ExitCode {
                     if Path::new(&bdd).is_dir() {
                         binds.push(sandbox::Bind { src: bdd.clone(), dest: None, readonly: false, ro_optional: false });
                     }
+                    // The shared warmed-source cache (~/.td/sources, populated HOST-SIDE by
+                    // `td-feed warm sources` before this sandbox starts) — READ-ONLY: the
+                    // from-source bootstrap gates STAGE the pinned tarballs + generated
+                    // kernel-headers from it (verified against their sha256) and never write
+                    // it from inside. Same absolute path inside so the resolver finds it.
+                    // Deliberately RO, unlike ~/.td/build-daemon above: recipe build steps must
+                    // not be able to mutate the shared source cache. Bound only when present.
+                    let sources = format!("{home}/.td/sources");
+                    if Path::new(&sources).is_dir() {
+                        binds.push(sandbox::Bind { src: sources, dest: None, readonly: true, ro_optional: false });
+                    }
                     // The #317 warm chain-brick cache: when the operator points
                     // TD_CHECK_CHAIN_CACHE at a CUSTOM host path (the default lives
                     // under ~/.td/build-daemon, bound above), bind it RW so warm
