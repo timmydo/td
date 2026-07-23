@@ -167,10 +167,6 @@ cargo run --release --manifest-path builder/Cargo.toml -- check
 
 Recipes should have tests that test the output.
 
-We have different check tiers (daily, per-change, etc.). It'd take too
-long to rebuild the world from scratch for every change so we only run
-the minimal per change; the daily backstop covers the deep tiers.
-
 Build td builder with: `cargo build --release --manifest-path builder/Cargo.toml`.
 
 ```
@@ -189,14 +185,6 @@ After rebasing for PR readiness, run:
 ```
 td-builder affected-checks --committed-only --run
 ```
-
-It prints `Waiver: the full check waived by affected-checks for
-this diff` — the local waiver for the full loop; record the
-selected checks and waiver line in the landing commit message
-(include the "Deferred to the daily backstop" line when one prints —
-that is the record of what the daily covers for this diff). Nothing
-escalates to the full loop; every diff waives to the bounded per-change
-tiers + the daily backstop.
 
 # Parallel work (worktrees, land on green)
 
