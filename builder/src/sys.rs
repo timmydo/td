@@ -68,6 +68,12 @@ const SIOCGIFFLAGS: usize = 0x8913;
 const SIOCSIFFLAGS: usize = 0x8914;
 const IFF_UP: u16 = 0x1;
 
+/// FICLONE = _IOW(0x94, 9, int): clone a whole file's data (reflink/CoW). This is the
+/// asm-generic encoding (x86-64/aarch64/riscv — td's targets); MIPS/PowerPC/SPARC encode
+/// `_IOW` differently, where this constant is simply the wrong ioctl and returns an error —
+/// `try_reflink` then falls back to a byte copy, so a wrong value degrades, never corrupts.
+const FICLONE: usize = 0x4004_9409;
+
 pub const CLONE_NEWNS: usize = 0x0002_0000;
 pub const CLONE_NEWUTS: usize = 0x0400_0000;
 pub const CLONE_NEWIPC: usize = 0x0800_0000;
@@ -205,6 +211,16 @@ pub fn bring_loopback_up() -> io::Result<()> {
     let s = unsafe { syscall5(SYS_IOCTL, fd, SIOCSIFFLAGS, ifr.as_mut_ptr() as usize, 0, 0) };
     close_fd();
     check(s)
+}
+
+/// Reflink (copy-on-write clone) the whole of `src_fd` into `dst_fd` via
+/// ioctl(FICLONE). `dst_fd` must be a freshly-created, empty, writable regular
+/// file on the SAME filesystem as `src_fd`. On success the two files share data
+/// extents copy-on-write: an independent inode whose later writes copy rather
+/// than propagate. Errors (EXDEV cross-device, EOPNOTSUPP/ENOTTY on a fs without
+/// reflink) are returned so the caller can fall back to a byte copy.
+pub fn reflink(dst_fd: i32, src_fd: i32) -> io::Result<()> {
+    check(unsafe { syscall5(SYS_IOCTL, dst_fd as usize, FICLONE, src_fd as usize, 0, 0) })
 }
 
 /// Write a diagnostic line to fd 2 (stderr) via the raw write(2) syscall —

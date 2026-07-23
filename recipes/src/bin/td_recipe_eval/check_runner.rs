@@ -13,6 +13,32 @@ use td_recipe::{
 
 pub(crate) const TD_STORE_DIR: &str = "/td/store";
 
+/// Opt-in warm-run profiling (TD_TIMING=1): time a harness phase and print
+/// `[timing] <label> <ms>ms` on drop. Diagnostic only; the timer is a no-op
+/// unless TD_TIMING is set to a non-empty, non-"0" value.
+fn timing_on() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| matches!(env::var("TD_TIMING"), Ok(v) if v != "0" && !v.is_empty()))
+}
+
+struct HarnessTimer {
+    label: &'static str,
+    start: std::time::Instant,
+}
+
+impl Drop for HarnessTimer {
+    fn drop(&mut self) {
+        if timing_on() {
+            eprintln!("[timing] {} {}ms", self.label, self.start.elapsed().as_millis());
+        }
+    }
+}
+
+fn timed_phase(label: &'static str) -> HarnessTimer {
+    HarnessTimer { label, start: std::time::Instant::now() }
+}
+
 /// The stable in-crate marker for a planning-time provenance rejection.
 /// `main` maps an error carrying it to exit 69 (EX_UNAVAILABLE — the same
 /// "nothing can run here" signal td-builder's loop uses for
@@ -382,10 +408,13 @@ pub fn build_cli(args: &[String]) -> Result<(), String> {
     // build-run plans ONE graph (`build-plan --auto TARGET`) and reads each
     // output's STEP line from that single build log, so a stem outside the
     // closure could only red AFTER the whole build ran. Refuse it up front.
-    let members: HashSet<String> = recipe_closure(&[target])?
-        .into_iter()
-        .map(|n| n.stem)
-        .collect();
+    let members: HashSet<String> = {
+        let _t = timed_phase("harness recipe_closure");
+        recipe_closure(&[target])?
+            .into_iter()
+            .map(|n| n.stem)
+            .collect()
+    };
     for output in &outputs {
         if catalog::lookup(output).is_none() {
             return Err(format!(
@@ -402,13 +431,22 @@ pub fn build_cli(args: &[String]) -> Result<(), String> {
 
     // Provenance planning FIRST — before the runner exists, so a rejected
     // graph spawns no subprocess at all (re #469).
-    ensure_targets_provenance(&[target])?;
+    {
+        let _t = timed_phase("harness provenance");
+        ensure_targets_provenance(&[target])?;
+    }
 
     let root = env::current_dir().map_err(|e| format!("current dir: {e}"))?;
     let scratch_name = scratch_name("build", &[target]);
-    let runner = RecipeCheckRunner::new(root, &scratch_name)?.with_streamed_progress();
+    let runner = {
+        let _t = timed_phase("harness new/stage0-place");
+        RecipeCheckRunner::new(root, &scratch_name)?.with_streamed_progress()
+    };
     let _lock = lock_file(&runner.lock_path())?;
-    runner.setup()?;
+    {
+        let _t = timed_phase("harness setup");
+        runner.setup()?;
+    }
     runner.build_recipe_target(target, &outputs)
 }
 
@@ -808,31 +846,51 @@ impl RecipeCheckRunner {
         build_cache_paths(&self.lw)
     }
 
-    /// Re-verify every registered path in this ladder's persistent build cache against its
-    /// recorded NAR hash (the builder's `store-verify` fsck) — the on-disk integrity check the
-    /// warm build/run REUSE path deliberately skips for speed (it trusts the receipt + db row).
-    /// Explicit and opt-in: run it when you want to detect store rot/corruption. Streams the
-    /// builder's own output; errs if the cache is absent or any path fails to verify.
+    /// Re-verify every registered path against its recorded NAR hash (the builder's
+    /// `store-verify` fsck) for BOTH on-disk stores the warm hot path leans on: the persistent
+    /// build-OUTPUT cache (the reuse path trusts the receipt + db row and skips a re-hash) AND the
+    /// retained SEED store (`ensure_seed_input`/`auto_seed_provenance` trust an already-interned
+    /// seed at its pinned basename per rung). This is an explicit, out-of-band integrity pass a
+    /// build/run never pays for — run it to detect store rot/corruption. (The seed store is also
+    /// CA-authenticated once per `build-plan` inline; this is the additional operator-driven
+    /// fsck.) Verifies whichever of the two stores EXIST, independently — the seed store and the
+    /// cache are populated on different schedules (a fresh checkout, or a post-`clear-store` cache
+    /// drop, can leave one present and the other absent) — and errs only if NEITHER exists.
     pub(crate) fn verify_store(&self) -> Result<(), String> {
-        let (store, db) = self.build_cache_paths();
-        if !db.exists() {
+        let (cache_store, cache_db) = self.build_cache_paths();
+        let mut checked = 0u32;
+        if self.db.exists() {
+            self.store_verify_pair(&self.db, &self.store)?;
+            checked += 1;
+        }
+        if cache_db.exists() {
+            self.store_verify_pair(&cache_db, &cache_store)?;
+            checked += 1;
+        }
+        if checked == 0 {
             return Err(format!(
-                "no persistent build cache to verify at {} — build the ladder first \
-                 (e.g. `td-recipe-eval run system-x86-64`)",
-                db.display()
+                "nothing to verify: neither the seed store db {} nor the build cache db {} \
+                 exists — build the ladder first (e.g. `td-recipe-eval run system-x86-64`)",
+                self.db.display(),
+                cache_db.display()
             ));
         }
+        Ok(())
+    }
+
+    /// One `td-builder store-verify DB STORE` fsck: re-hash every registered path against its
+    /// recorded hash. The builder arm holds the store commit lock; the caller holds the ladder
+    /// lock (see `verify_store_cli`) so a concurrent build/clear can't race the scan.
+    fn store_verify_pair(&self, db: &Path, store: &Path) -> Result<(), String> {
         let mut cmd = self.builder_command();
-        cmd.arg("store-verify")
-            .arg(path_str(&db)?)
-            .arg(path_str(&store)?);
+        cmd.arg("store-verify").arg(path_str(db)?).arg(path_str(store)?);
         let status = cmd
             .status()
             .map_err(|e| format!("spawn td-builder store-verify: {e}"))?;
         if status.success() {
             Ok(())
         } else {
-            Err(format!("td-builder store-verify failed ({status})"))
+            Err(format!("td-builder store-verify {} failed ({status})", db.display()))
         }
     }
 
@@ -1167,20 +1225,36 @@ impl RecipeCheckRunner {
         self.write_auto_map(target, &entries)
     }
 
-    /// Realize one classified seed input by RE-DERIVING it from the compiled pin
-    /// EVERY run — never by trusting a prior map entry. Each intern_* verifies the
-    /// pinned artifact and re-interns it into the retained seed store (`store-add-
-    /// recursive` is idempotent: a re-intern of an item already present — this run or a
-    /// retained prior run — NAR-verifies it rather than copying over it), so the returned
-    /// path is bound to the compiled pin on every run. The caller folds the result into the
-    /// fresh per-run auto-map; nothing prior is read, so there is no mutable mapping state to
-    /// reconcile or self-heal — the stronger form of the #469 boundary. Cost, stated
-    /// honestly: per run each seed's bytes are read several times (the pin sha256, the
-    /// NAR hash at synthesis, and store-add-recursive's copy of a not-yet-interned item into
-    /// the seed store — a retained item is NAR-verified, not recopied)
-    /// and stage0 is re-extracted — the same recorded re-hash-every-step decision as the
-    /// StageManifest, trading warm-run time for a boundary with no trusted mutable state.
+    /// Realize one classified seed input to its content-addressed store path.
+    ///
+    /// WARM path: if the COMPILED seed-digest table pins this key to a basename ALREADY interned
+    /// in the retained seed store, return it and skip the cold re-derive (re-fetch/re-extract/
+    /// re-intern). The compiled table binds key->basename (a forged/renamed map is still rejected
+    /// with no byte I/O), the intern committed ATOMICALLY (a present basename is a whole tree,
+    /// never a half-written one — see store_add_recursive), and the builder CA-authenticates every
+    /// interned seed once per `build-plan` (authenticate_seed_db) — so skipping the recipe-side
+    /// re-derive costs no inline integrity. `verify-store` fscks the seed store as an additional
+    /// out-of-band pass.
+    ///
+    /// KNOWN LIMITATION (#469 "the compiled table is the authority"): the warm short-circuit keys
+    /// on the table's CURRENT basename, so bumping a seed's pin WITHOUT regenerating
+    /// seed-digests.txt, on a store where the OLD basename is still interned, silently reuses the
+    /// old bytes. The intended workflow bumps the pin AND regenerates the table in one commit —
+    /// then the new basename is not yet interned and this falls through to the cold path (which
+    /// re-derives from the pin and gates the fresh basename via `require`); `clear-store` also
+    /// forces cold.
+    ///
+    /// COLD path (basename not yet interned): RE-DERIVE from the compiled pin — each
+    /// intern_* verifies the pinned artifact and interns it into the seed store — then gate
+    /// the derived basename against the compiled table before use.
     fn ensure_seed_input(&self, input: &SeedInput) -> Result<String, String> {
+        if let Some(base) = crate::seed_digests::expected(input.key())? {
+            if self.store.join(base).exists() {
+                let derived = format!("{TD_STORE_DIR}/{base}");
+                self.stage_store_path(&derived)?;
+                return Ok(derived);
+            }
+        }
         let derived = self.derive_seed_input(input)?;
         // The COMPILED table must vouch for the derivation (re #469): pin
         // verification proves the fetched artifact, but a GENERATED seed (the
@@ -1247,6 +1321,11 @@ impl RecipeCheckRunner {
         // where nothing was blessed (re #469 round-8).
         if let Some(d) = &self.daemon_dir {
             cmd.env("TD_DAEMON_DIR", d);
+        }
+        // Pass TD_TIMING through the env_clear() barrier so a warm-run climb emits its
+        // per-rung phase timings from the build-plan subprocess (diagnostic, opt-in).
+        if let Ok(v) = std::env::var("TD_TIMING") {
+            cmd.env("TD_TIMING", v);
         }
         cmd.arg("build-plan")
             .arg("--auto")
@@ -1394,7 +1473,10 @@ impl RecipeCheckRunner {
     }
 
     fn build_recipe_target(&self, target: &str, outputs: &[&str]) -> Result<(), String> {
-        self.prepare_recipe_target(target)?;
+        {
+            let _t = timed_phase("harness prepare/seed-inputs");
+            self.prepare_recipe_target(target)?;
+        }
         let build_out = self.build_plan(target)?;
         println!("TD_RECIPE_RUN_WORK {}", self.lw.display());
         println!(
