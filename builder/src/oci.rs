@@ -208,7 +208,7 @@ pub fn build_layer_tar(root: &Path) -> io::Result<Vec<u8>> {
 }
 
 /// A layer tar laying each closure MEMBER — a `(canonical, on_disk)` pair — at its
-/// CANONICAL location under STORE_DIR (so `/gnu/store/<base>` -> tar `gnu/store/<base>/…`)
+/// CANONICAL location under the store dir (so `/gnu/store/<base>` -> tar `gnu/store/<base>/…`)
 /// while reading its BYTES from `on_disk`, preceded by the parent dir entries (`gnu/`,
 /// `gnu/store/`). The split lets td pack a td-BUILT tree whose bytes live in a td-owned
 /// store (the shared daemon cache) at its canonical /gnu/store name next to the guix-seed
@@ -255,7 +255,7 @@ pub fn build_layer_tar_from_closure(
     Ok(out)
 }
 
-/// A layer tar laying each store PATH's tree at its location under STORE_DIR — the
+/// A layer tar laying each store PATH's tree at its location under the store dir — the
 /// bytes are read from the path itself (canonical == on-disk; a live store).
 pub fn build_layer_tar_from_store_paths(
     store_dir: &Path,
@@ -362,7 +362,7 @@ pub fn write_docker_archive(
 }
 
 /// Write a docker-archive whose single layer is the store CLOSURE PATHS laid out under
-/// STORE_DIR (`build_layer_tar_from_store_paths`). This is the td-native replacement for
+/// the store dir (`build_layer_tar_from_store_paths`). This is the td-native replacement for
 /// `guix system image -t docker`: the caller computes the closure (e.g. `Db::closure`,
 /// no guix process) and td packs it. Deterministic; no guix/Guile.
 pub fn write_docker_archive_from_store_paths(
@@ -375,7 +375,7 @@ pub fn write_docker_archive_from_store_paths(
 }
 
 /// Write a docker-archive whose single layer is the closure MEMBERS — `(canonical,
-/// on_disk)` pairs — each laid at its CANONICAL location under STORE_DIR with bytes read
+/// on_disk)` pairs — each laid at its CANONICAL location under the store dir with bytes read
 /// from `on_disk` (`build_layer_tar_from_closure`). This packs a td-BUILT tree living in
 /// a td-owned store (the shared daemon cache) at its canonical /gnu/store name alongside
 /// the guix-seed deps physically there. Deterministic; no guix/Guile.

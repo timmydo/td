@@ -772,7 +772,7 @@ pub(crate) fn stage0_place(root: &Path, base: &Path) -> Result<String, String> {
         .arg(&s0_dir)
         .arg(&store)
         .arg(&db)
-        .arg("/gnu/store")
+        .arg(crate::store::GUIX_SEED_STORE_DIR) // SEED-scan dir: the guix seed store (absent on a guix-less host)
         .current_dir(root)
         .stdin(Stdio::null())
         .output()
@@ -782,8 +782,15 @@ pub(crate) fn stage0_place(root: &Path, base: &Path) -> Result<String, String> {
         return Err("stage0 store-add-builder failed (see stderr)".to_string());
     }
     let cb = String::from_utf8_lossy(&place.stdout).trim().to_string();
-    if !(cb.starts_with("/gnu/store/") && cb.ends_with("-td-builder-0.1.0")) {
-        return Err(format!("store-add-builder gave a malformed path `{cb}'"));
+    // The canonical name tracks the ACTIVE store prefix — store-add-builder derives
+    // it from store::store_dir() (the SEED-scan dir above is unrelated), so validate
+    // against that, not a hardcoded /gnu/store now the default is `/td/store`. The
+    // subprocess inherited this process's env, so store_dir() here matches its.
+    let store_prefix = format!("{}/", crate::store::store_dir());
+    if !(cb.starts_with(&store_prefix) && cb.ends_with("-td-builder-0.1.0")) {
+        return Err(format!(
+            "store-add-builder gave a malformed path `{cb}' (expected prefix {store_prefix})"
+        ));
     }
     let cur = Path::new(&cb)
         .file_name()

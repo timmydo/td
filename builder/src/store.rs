@@ -16,19 +16,29 @@
 
 use crate::sha256::{self, Sha256};
 
-/// The DEFAULT store directory — guix's (the daemon's `storeDir`). td's own store
-/// prefix is `/td/store` when `TD_STORE_DIR` is set (user-pm Phase 1, the break from
-/// guix): the prefix is part of every content hash, so `/td/store` paths are a
-/// distinct store from guix's `/gnu/store`.
-pub const STORE_DIR: &str = "/gnu/store";
+/// The guix SEED store's canonical home (guix's `storeDir`). This is NOT td's
+/// default store — it is referenced only by the guix-seed import paths (the
+/// `build_recipe` seed-dir canonical prefix). td's native store is `/td/store`
+/// (see [`store_dir`] / [`DEFAULT_STORE_DIR`]); a bare, `TD_STORE_DIR`-unset
+/// invocation defaults THERE, not here. The guix `/gnu/store` prefix is no longer
+/// any code path's silent default — the clean-bootstrap-from-seed0 trust root
+/// lives off `/gnu/store` (the [no-guix] provenance seal enforces it).
+pub const GUIX_SEED_STORE_DIR: &str = "/gnu/store";
 
-/// The active store prefix: `$TD_STORE_DIR` (e.g. `/td/store`) or the default
-/// `/gnu/store`. Read where a store path is computed or recognized so a single env
-/// var re-prefixes the whole store (like nix's `NIX_STORE_DIR`).
+/// td's native default store prefix, used when `TD_STORE_DIR` is unset. The prefix
+/// is part of every content hash, so this is a distinct store from guix's
+/// `/gnu/store`; a `TD_STORE_DIR=/td/store` build is the native build (AGENTS.md),
+/// and it is now also the default when the var is absent.
+pub const DEFAULT_STORE_DIR: &str = "/td/store";
+
+/// The active store prefix: `$TD_STORE_DIR` (e.g. `/td/store`) or, when unset, the
+/// native default [`DEFAULT_STORE_DIR`] (`/td/store`). Read where a store path is
+/// computed or recognized so a single env var re-prefixes the whole store (like
+/// nix's `NIX_STORE_DIR`).
 pub fn store_dir() -> String {
     match std::env::var("TD_STORE_DIR") {
         Ok(d) if !d.is_empty() => d,
-        _ => STORE_DIR.to_string(),
+        _ => DEFAULT_STORE_DIR.to_string(),
     }
 }
 
@@ -585,7 +595,7 @@ mod tests {
             td.rsplit('/').next().unwrap(),
             "re-prefixing must re-hash — /td/store is a distinct store, not a rename"
         );
-        // `make_store_path` follows TD_STORE_DIR (default /gnu/store when unset).
+        // `make_store_path` follows TD_STORE_DIR (default /td/store when unset).
         assert!(make_store_path(ty, h, name).starts_with(&format!("{}/", store_dir())));
     }
 

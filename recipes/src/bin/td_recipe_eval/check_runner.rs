@@ -347,6 +347,38 @@ pub fn qemu_boot_system_cli(args: &[String]) -> Result<(), String> {
     crate::checks::qemu_boot::run_system(&runner)
 }
 
+/// `td-recipe-eval qemu-boot-kexec [kexec-spike-x86-64]` — the Phase-0 kexec spike proof.
+/// Builds the `kexec-spike-x86-64` two-kernel artifact (a bootable bzImage + an outer
+/// initramfs embedding static busybox, td-kexec, a second-boot bzImage, and a nested inner
+/// initramfs) and boots it under host qemu (TCG): the outer /init prints STAGE1 then execs
+/// td-kexec to kexec_file_load(2)+reboot(KEXEC) the inner kernel, whose /init prints STAGE2.
+/// It asserts STAGE2 reached (the kexec worked). Host-side (never a gated check) for the
+/// same reason `qemu-boot` is: the daily sandbox has no host qemu. See checks/qemu_boot.rs.
+pub fn qemu_boot_kexec_cli(args: &[String]) -> Result<(), String> {
+    const STEM: &str = "kexec-spike-x86-64";
+    let stem = args.first().map(String::as_str).unwrap_or(STEM);
+    if stem != STEM {
+        return Err(format!(
+            "qemu-boot-kexec only supports {STEM} (got '{stem}'); usage: qemu-boot-kexec [{STEM}]"
+        ));
+    }
+    if args.get(1).is_some() {
+        return Err(format!("usage: qemu-boot-kexec [{STEM}]"));
+    }
+    // Provenance planning FIRST — before the runner exists (re #469), matching
+    // `qemu_boot_cli`: a rejected graph spawns no subprocess.
+    ensure_targets_provenance(&[stem])?;
+
+    let root = env::current_dir().map_err(|e| format!("current dir: {e}"))?;
+    // Reuse the `qemu-boot-` scratch prefix so the stale-scratch reaper still cleans a
+    // killed kexec boot's per-boot directories (it can hold a multi-GiB kernel build).
+    let scratch_name = scratch_name("qemu-boot", &[stem]);
+    let runner = RecipeCheckRunner::new(root, &scratch_name)?.with_streamed_progress();
+    let _lock = lock_file(&runner.lock_path())?;
+    runner.setup()?;
+    crate::checks::qemu_boot::run_kexec(&runner)
+}
+
 /// `td-recipe-eval run [system-x86-64]` — the interactive distro runner (re #541).
 /// Builds the `system-x86-64` initramfs (its closure pulls in the `linux-x86-64`
 /// bzImage) and boots it under host qemu with an interactive serial console. Like

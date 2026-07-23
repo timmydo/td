@@ -275,10 +275,16 @@ td's Rust is defensive and minimal-surface.
   propagate with `?`. (Inline `#[cfg(test)]` code may `unwrap` — clippy does not
   lint it.)
 - **`.get(i)` over `xs[i]`.** No indexing/slicing that can panic (`clippy::indexing_slicing`).
-- **`unsafe` is confined.** The only `unsafe` is the raw-syscall layer
-  (`builder/src/sys.rs` and its callers `nar.rs`/`sandbox.rs`), which carry
-  `#![allow(unsafe_code)]` so `builder` can be `libc`-free. Every other crate
-  `forbid`s `unsafe_code`. Do not add `unsafe` anywhere else.
+- **`unsafe` is confined.** In the control-plane engine the only `unsafe` is the
+  raw-syscall layer (`builder/src/sys.rs` and its callers `nar.rs`/`sandbox.rs`),
+  which carry `#![allow(unsafe_code)]` so `builder` can be `libc`-free. Every other
+  engine crate (`recipes`/`fetch`/`feed`/`subst`) `forbid`s `unsafe_code`. The one
+  target-side exception is the `td-kexec` guest helper — a standalone crate OUTSIDE
+  the `builder`/`recipes` workspace whose only `unsafe` is that same
+  `syscall`-instruction layer, confined to exactly two syscalls
+  (`kexec_file_load(2)` + `reboot(2)` with `LINUX_REBOOT_CMD_KEXEC`) copied from
+  `sys.rs`. Do not add `unsafe` anywhere else; a new `unsafe` surface is a reviewed
+  amendment recorded here.
 - **The engine is dependency-free.** `builder` and `recipes` carry **zero crates**
   (pure `std`) and must stay that way — the gate fails if either `Cargo.lock` grows
   past its one self-entry. The network tools (`fetch`/`feed`/`subst`) are the *only*

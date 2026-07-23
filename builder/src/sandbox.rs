@@ -42,8 +42,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use crate::drv::Derivation;
 use crate::sys;
 
-/// The store prefix WITH a trailing slash (e.g. `/gnu/store/`, or `/td/store/` when
-/// `TD_STORE_DIR` selects td's own store). Every store-path operation strips/joins this
+/// The store prefix WITH a trailing slash (`/td/store/` by default, or a
+/// `TD_STORE_DIR`-selected prefix). Every store-path operation strips/joins this
 /// so a build targeting `/td/store` stages its inputs and writes its outputs there
 /// NATIVELY — no post-hoc `/gnu/store -> /td/store` byte rewrite. The prefix is part of
 /// the content hash (`store::make_store_path_in`), so a `/td/store` build is a distinct,
@@ -474,7 +474,7 @@ pub fn build(
         )));
     }
 
-    // The active store dir (default /gnu/store; /td/store under TD_STORE_DIR). Every
+    // The active store dir (default /td/store; overridden by TD_STORE_DIR). Every
     // closure path the build SEES is under this prefix, the new root mounts its store
     // here, and NIX_STORE points at it — so a /td/store build is native, not rewritten.
     let store_dir_str = crate::store::store_dir();
@@ -1438,16 +1438,19 @@ mod tests {
 
     #[test]
     fn store_path_name_strips_hash() {
+        // Feeds the ACTIVE store prefix (now the native `/td/store` default); the
+        // sibling `store_path_name_honors_the_active_prefix` covers the explicit-prefix
+        // core and proves a `/gnu/store` path is rejected under a `/td/store` active dir.
         assert_eq!(
-            store_path_name("/gnu/store/xiwgysq1h8dd2k5mkb94ky8vrgcp10dz-td-builder-0.1.0.drv")
+            store_path_name("/td/store/xiwgysq1h8dd2k5mkb94ky8vrgcp10dz-td-builder-0.1.0.drv")
                 .unwrap(),
             "td-builder-0.1.0.drv"
         );
         assert!(store_path_name("/tmp/x").is_err());
-        assert!(store_path_name("/gnu/store/tooshort-x").is_err());
+        assert!(store_path_name("/td/store/tooshort-x").is_err());
         // A slash after the hash means a path INSIDE an item, not an item.
         assert!(store_path_name(
-            "/gnu/store/xiwgysq1h8dd2k5mkb94ky8vrgcp10dz-td-builder-0.1.0/bin/td-builder"
+            "/td/store/xiwgysq1h8dd2k5mkb94ky8vrgcp10dz-td-builder-0.1.0/bin/td-builder"
         )
         .is_err());
     }

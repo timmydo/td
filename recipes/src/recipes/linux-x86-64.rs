@@ -338,6 +338,38 @@ pub fn recipe() -> Recipe {
     //    only offers xattrs when CONFIG_TMPFS_XATTR=y — a PROMPTED leaf that defaults
     //    OFF, so (like the menuconfig parents) it is set explicitly and grep-verified,
     //    else the overlays fall back to a degraded no-xattr mode or fail outright.
+    //
+    //    KEXEC (image-based self-boot): the target boots via a two-hop kexec chain —
+    //    a tiny immutable shim kernel+initramfs (loaded by qemu -kernel) mounts the
+    //    persistent volume and kexec_file_load(2)s the selected deployment's
+    //    bzImage+initramfs. Only CONFIG_KEXEC_FILE (the file-based syscall) + the
+    //    KEXEC_CORE it selects are used; CONFIG_KEXEC — the legacy segment-based
+    //    kexec_load(2) — is pinned OFF and guarded, since nothing here uses it and it
+    //    would only widen the syscall surface (in 7.1.4 KEXEC and KEXEC_FILE are
+    //    independent siblings — KEXEC_FILE does NOT depend on KEXEC — so dropping
+    //    KEXEC leaves KEXEC_FILE intact, and reboot(LINUX_REBOOT_CMD_KEXEC) runs off
+    //    KEXEC_CORE). In 7.1.4 KEXEC_FILE `select`s CRYPTO_LIB_SHA256 + KEXEC_CORE on
+    //    its own (verified against kernel/Kconfig.kexec), so NO CRYPTO menuconfig is
+    //    pulled in — do not add CONFIG_CRYPTO/CRYPTO_SHA256. CONFIG_RELOCATABLE=y is REQUIRED: the x86
+    //    kexec-bzimage64 loader rejects a non-relocatable image, so a kernel that
+    //    boots fine via `-kernel` still fails via kexec — the classic
+    //    works-direct/fails-kexec divergence. allnoconfig drops RELOCATABLE despite
+    //    its `default y`, so it is set explicitly; enabling it makes RANDOMIZE_BASE
+    //    (KASLR, default y) visible, pinned OFF here for a deterministic boot.
+    //    KEXEC_SIG/_FORCE are pinned OFF, consistent with the disabled trusted-keyring
+    //    policy above (no signature/keyring machinery ships).
+    //
+    //    BTRFS + LOOP (persistent volume): the single persistent /dev/vda is one
+    //    btrfs filesystem holding @var plus the immutable root images — each a
+    //    reproducible EROFS blob loop-mounted read-only — so BLK_DEV_LOOP is needed to
+    //    mount an EROFS file out of the btrfs. CONFIG_BTRFS_FS=y self-selects its whole
+    //    dependency set (CRC32, CRYPTO_LIB_SHA256/BLAKE2B, ZLIB/LZO/ZSTD, RAID6_PQ,
+    //    XOR_BLOCKS, XXHASH, FS_IOMAP — verified against fs/btrfs/Kconfig), so do NOT
+    //    pin those individually; note CONFIG_LIBCRC32C does NOT exist in 7.1.4 (btrfs
+    //    uses the CRC32 lib, not CRYPTO_CRC32C) — a guard on it would red the build
+    //    permanently. BTRFS_FS sits under `if BLOCK` (BLOCK already =y) and
+    //    BLK_DEV_LOOP under `menuconfig BLK_DEV` (already =y), so no new menuconfig
+    //    parent is required.
     steps.push(
         Step::run(
             "{src}",
@@ -382,7 +414,15 @@ pub fn recipe() -> Recipe {
                   /^#? *CONFIG_VIRTIO_BLK[ =]/d; \
                   /^#? *CONFIG_MISC_FILESYSTEMS[ =]/d; \
                   /^#? *CONFIG_EROFS_FS[ =]/d; \
-                  /^#? *CONFIG_OVERLAY_FS[ =]/d' .config && \
+                  /^#? *CONFIG_OVERLAY_FS[ =]/d; \
+                  /^#? *CONFIG_KEXEC[ =]/d; \
+                  /^#? *CONFIG_KEXEC_FILE[ =]/d; \
+                  /^#? *CONFIG_KEXEC_SIG[ =]/d; \
+                  /^#? *CONFIG_KEXEC_SIG_FORCE[ =]/d; \
+                  /^#? *CONFIG_RELOCATABLE[ =]/d; \
+                  /^#? *CONFIG_RANDOMIZE_BASE[ =]/d; \
+                  /^#? *CONFIG_BLK_DEV_LOOP[ =]/d; \
+                  /^#? *CONFIG_BTRFS_FS[ =]/d' .config && \
                  printf '%s\\n' \
                    'CONFIG_UNWINDER_FRAME_POINTER=y' \
                    '# CONFIG_UNWINDER_ORC is not set' \
@@ -415,7 +455,15 @@ pub fn recipe() -> Recipe {
                    'CONFIG_VIRTIO_BLK=y' \
                    'CONFIG_MISC_FILESYSTEMS=y' \
                    'CONFIG_EROFS_FS=y' \
-                   'CONFIG_OVERLAY_FS=y' >> .config",
+                   'CONFIG_OVERLAY_FS=y' \
+                   '# CONFIG_KEXEC is not set' \
+                   'CONFIG_KEXEC_FILE=y' \
+                   '# CONFIG_KEXEC_SIG is not set' \
+                   '# CONFIG_KEXEC_SIG_FORCE is not set' \
+                   'CONFIG_RELOCATABLE=y' \
+                   '# CONFIG_RANDOMIZE_BASE is not set' \
+                   'CONFIG_BLK_DEV_LOOP=y' \
+                   'CONFIG_BTRFS_FS=y' >> .config",
             ],
         )
         .env("PATH", &mesboot0_path()),
@@ -453,6 +501,13 @@ pub fn recipe() -> Recipe {
                  grep -q '^CONFIG_OVERLAY_FS=y' .config || { echo 'OVERLAY_FS off - no tmpfs overlay for writable paths over the read-only root' >&2; exit 1; }; \
                  grep -q '^CONFIG_PRINTK=y' .config || { echo 'PRINTK off — no kernel console output' >&2; exit 1; }; \
                  grep -q '^CONFIG_TTY=y' .config || { echo 'TTY off — the serial console needs the tty layer' >&2; exit 1; }; \
+                 grep -q '^CONFIG_KEXEC_FILE=y' .config || { echo 'KEXEC_FILE off — the shim boots the selected deployment via kexec_file_load(2)' >&2; exit 1; }; \
+                 grep -q '^CONFIG_RELOCATABLE=y' .config || { echo 'RELOCATABLE off — a non-relocatable bzImage is rejected by the x86 kexec_file_load loader (boots via -kernel, fails via kexec)' >&2; exit 1; }; \
+                 grep -q '^CONFIG_BTRFS_FS=y' .config || { echo 'BTRFS_FS off — the persistent volume is one btrfs filesystem (@var plus the loop-mounted EROFS root blobs)' >&2; exit 1; }; \
+                 grep -q '^CONFIG_BLK_DEV_LOOP=y' .config || { echo 'BLK_DEV_LOOP off — the immutable EROFS root is a file inside btrfs, loop-mounted read-only' >&2; exit 1; }; \
+                 if grep -q '^CONFIG_KEXEC=y' .config; then echo 'KEXEC (legacy segment-based kexec_load) on — only KEXEC_FILE is used; the legacy syscall is kept off to not widen the surface' >&2; exit 1; fi; \
+                 if grep -q '^CONFIG_KEXEC_SIG=y' .config; then echo 'KEXEC_SIG on — would demand a trusted-keyring signature policy td does not ship' >&2; exit 1; fi; \
+                 if grep -q '^CONFIG_RANDOMIZE_BASE=y' .config; then echo 'RANDOMIZE_BASE (KASLR) on — pinned off for a deterministic kexec boot' >&2; exit 1; fi; \
                  if grep -q '^CONFIG_MODULES=y' .config; then echo 'MODULES on (would need module tooling)' >&2; exit 1; fi; \
                  if grep -q '^CONFIG_DEBUG_INFO_BTF=y' .config; then echo 'BTF on (would need pahole)' >&2; exit 1; fi",
             ],

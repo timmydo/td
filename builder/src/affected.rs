@@ -671,6 +671,24 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
         return; // docs — no checks
     }
 
+    // td-kexec: the target-built guest kexec helper, a standalone crate OUTSIDE the
+    // builder/recipes engine. Unlike fetch/feed/subst it is dependency-free pure std
+    // and compiles offline, so route it to the cargo-test preflight (host-native
+    // clippy/test of the same source). No per-PR gate builds it from source (that is
+    // daily/operator), so the bounded target is check-pr. But src/main.rs is
+    // `include_str!`'d verbatim into the td-kexec RECIPE — a helper-source edit changes
+    // the TARGET artifact, and a target-static-link regression (e.g. the libgcc_eh
+    // gap) is invisible to host cargo. So also route to recipe-checks-daily (daily
+    // tier -> recorded as deferred to the daily backstop, which statically links it via
+    // td-kexec-test). Its RECIPE files under recipes/src/recipes/ are routed by the
+    // recipes arm above, not here.
+    if pattern_matches("td-kexec/*|td-kexec/src/*|td-kexec/Cargo.toml|td-kexec/Cargo.lock", p) {
+        sel.add_preflight("cargo-test");
+        sel.add_target("check-pr");
+        sel.add_target("recipe-checks-daily");
+        return;
+    }
+
     // Catch-all: an unmapped path used to require the FULL loop; it now runs
     // the bounded check-pr tier (the ~10-min per-PR budget) and leans on the
     // daily backstop for the daily-tier gates.
@@ -689,7 +707,9 @@ fn preflight_cmd(name: &str) -> Option<&'static str> {
     match name {
         "shell-syntax" => Some("  bash -n tests/*.sh ci/*.sh tools/*.sh"),
         "heal-revert" => Some("  bash tests/heal-revert.sh"),
-        "cargo-test" => Some("  cargo test + clippy --manifest-path {builder,recipes}/Cargo.toml"),
+        "cargo-test" => {
+            Some("  cargo test + clippy --manifest-path {builder,recipes,td-kexec}/Cargo.toml")
+        }
         "affected-self-test" => Some("  td-builder affected-checks --self-test"),
         _ => None,
     }
@@ -1045,6 +1065,11 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
     assert_target!("fetch/Cargo.lock", "check-pr");
     // A feed/src change smokes the warm-sources consumer — the i686 chain's proof target set.
     assert_target!("feed/src/main.rs", "recipe-checks-daily");
+    // td-kexec/src is include_str!'d into the target artifact, so a helper-source edit
+    // rides the host cargo preflight (check-pr) AND is recorded as deferred to the daily
+    // backstop (recipe-checks-daily statically links it via td-kexec-test).
+    assert_target!("td-kexec/src/main.rs", "check-pr");
+    assert_target!("td-kexec/src/main.rs", "recipe-checks-daily");
     assert_target!("tests/td-toolchain.lock", "toolchain-input-addressed");
     assert_target!(
         "tests/td-toolchain.lock",
@@ -1110,7 +1135,7 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
     // both ways: the preflight COMMAND string is rendered, and stage0-cold-start is selected.
     assert_contains!(
         "seed/control-plane-seed-pins.txt",
-        "cargo test + clippy --manifest-path {builder,recipes}/Cargo.toml"
+        "cargo test + clippy --manifest-path {builder,recipes,td-kexec}/Cargo.toml"
     );
     assert_target!("seed/control-plane-seed-pins.txt", "stage0-cold-start");
     assert_target!("builder/src/bootstrap.rs", "check-engine");
@@ -1238,11 +1263,18 @@ fn run_preflight(root: &Path, name: &str) -> i32 {
         // host preflight is the per-PR enforcement in the meantime (review
         // finding: recipes tests + clippy ran in NO automated per-PR tier).
         "cargo-test" => {
+            // td-kexec (the target-built guest kexec helper) rides the SAME preflight:
+            // it is dependency-free pure std, so unlike fetch/feed/subst it compiles
+            // offline, and its own `[lints]` deny-set (no unwrap/panic/indexing) must be
+            // enforced per-PR too. The static TARGET link is daily/operator (td-kexec-test);
+            // this leg is the host-native clippy/test of the same source.
             for cmd in [
                 "cargo test --frozen --manifest-path builder/Cargo.toml",
                 "cargo test --frozen --manifest-path recipes/Cargo.toml",
+                "cargo test --frozen --manifest-path td-kexec/Cargo.toml",
                 "cargo clippy --frozen --manifest-path builder/Cargo.toml",
                 "cargo clippy --frozen --manifest-path recipes/Cargo.toml",
+                "cargo clippy --frozen --manifest-path td-kexec/Cargo.toml",
             ] {
                 let code = run_shell(root, cmd);
                 if code != 0 {
@@ -1519,7 +1551,7 @@ mod tests {
                 "  builder/src/main.rs",
                 "",
                 "Selected checks:",
-                "  cargo test + clippy --manifest-path {builder,recipes}/Cargo.toml",
+                "  cargo test + clippy --manifest-path {builder,recipes,td-kexec}/Cargo.toml",
                 "  td-builder check check-engine",
                 "",
                 "Waiver: inspection only (--path does not prove the branch diff)",
@@ -1544,7 +1576,7 @@ mod tests {
                 "",
                 "Selected checks:",
                 "  bash -n tests/*.sh ci/*.sh tools/*.sh",
-                "  cargo test + clippy --manifest-path {builder,recipes}/Cargo.toml",
+                "  cargo test + clippy --manifest-path {builder,recipes,td-kexec}/Cargo.toml",
                 "  td-builder check check-pr",
                 "",
                 "Waiver: inspection only (--path does not prove the branch diff)",

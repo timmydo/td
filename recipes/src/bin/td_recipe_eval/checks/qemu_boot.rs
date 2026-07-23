@@ -92,6 +92,16 @@ const SYSTEM_WRITABLE_MARKER: &str = td_recipe::ladder::SYSTEM_WRITABLE_MARKER;
 /// into. Shared with the recipe's `/etc/profile` autotest gate via `td_recipe::ladder`.
 const AUTOTEST_CMDLINE_TOKEN: &str = td_recipe::ladder::AUTOTEST_CMDLINE_TOKEN;
 
+/// The OUTER /init prints this on ttyS0 before it execs td-kexec — stage-1 reached
+/// userspace. `qemu-boot-kexec` asserts it as a diagnostic that the second boot came
+/// from our helper. Shared with the kexec-spike-x86-64 recipe via `td_recipe::ladder`.
+const KEXEC_STAGE1_MARKER: &str = td_recipe::ladder::KEXEC_STAGE1_MARKER;
+
+/// The kexec'd INNER /init prints this on ttyS0 once the SECOND kernel reaches
+/// userspace — the `qemu-boot-kexec` success criterion, unreachable without a working
+/// kexec_file_load(2) + reboot(LINUX_REBOOT_CMD_KEXEC). Shared via `td_recipe::ladder`.
+const KEXEC_STAGE2_MARKER: &str = td_recipe::ladder::KEXEC_STAGE2_MARKER;
+
 /// Default wall-clock ceiling. A tiny allnoconfig kernel boots to userspace under
 /// TCG in a few seconds, but TCG on a loaded builder can be slow; 180s is
 /// generous. The poll loop kills qemu the instant the marker appears, so a healthy
@@ -168,6 +178,7 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
         &initramfs,
         BootPlan {
             disk: None,
+            mem: "256",
             target_marker: MARKER,
             kill_on_marker: true,
             extra_append: "",
@@ -216,6 +227,7 @@ pub(crate) fn run_erofs(runner: &RecipeCheckRunner) -> Result<(), String> {
         &initramfs,
         BootPlan {
             disk: Some(&disk),
+            mem: "256",
             target_marker: EROFS_MARKER,
             kill_on_marker: true,
             extra_append: "",
@@ -275,6 +287,7 @@ pub(crate) fn run_system(runner: &RecipeCheckRunner) -> Result<(), String> {
         &init_cpio,
         BootPlan {
             disk: Some(&disk),
+            mem: "256",
             target_marker: GREETER_MARKER,
             kill_on_marker: false,
             extra_append: AUTOTEST_CMDLINE_TOKEN,
@@ -351,6 +364,78 @@ pub(crate) fn run_system(runner: &RecipeCheckRunner) -> Result<(), String> {
     Ok(())
 }
 
+/// `qemu-boot-kexec` (Phase-0 kexec spike): the operator proof that the source-built
+/// kernel can kexec_file_load(2) a SECOND kernel start under qemu TCG — the mechanism
+/// the image-based boot uses to self-boot a refreshed image. It boots the
+/// `kexec-spike-x86-64` outer bzImage + outer initramfs; the outer /init prints STAGE1
+/// then execs td-kexec to load and reboot(KEXEC) into the inner kernel + inner
+/// initramfs, whose /init prints STAGE2. STAGE2 is the sole success criterion — it is
+/// unreachable without a working kexec; STAGE1 only refines the FAILURE diagnostic
+/// (and may legitimately have scrolled out of the bounded console buffer once STAGE2
+/// is in). Host-side (never a gated check) for the same reason `qemu-boot` is — the
+/// daily sandbox has no host qemu.
+pub(crate) fn run_kexec(runner: &RecipeCheckRunner) -> Result<(), String> {
+    // qemu first (fail fast if absent), then the spike artifact.
+    let qemu = find_qemu()?;
+    let (bzimage, initramfs) = build_spike(runner)?;
+
+    println!(
+        "   [qemu-boot-kexec] {qemu} boots the td-source-built bzImage under TCG, then the outer /init td-kexecs a SECOND kernel start\n              kernel:    {}\n              initramfs: {}",
+        bzimage.display(),
+        initramfs.display()
+    );
+
+    // Key on STAGE2 and kill on it. 512 MiB so the outer kernel + outer initramfs AND
+    // the kexec-loaded inner kernel + inner initramfs all fit at the instant the jump
+    // happens (a tiny allnoconfig kernel would fit in less, but headroom is free under
+    // TCG and an OOM at the kexec would be a confusing failure).
+    let result = boot(
+        &qemu,
+        &bzimage,
+        &initramfs,
+        BootPlan {
+            disk: None,
+            mem: "512",
+            target_marker: KEXEC_STAGE2_MARKER,
+            kill_on_marker: true,
+            extra_append: "",
+        },
+        runner.scratch_dir(),
+    )?;
+    if !result.marker {
+        // STAGE2 absent — use STAGE1's presence to point at which half regressed.
+        // STAGE1 present isolates the kexec itself; STAGE1 absent USUALLY means the
+        // outer kernel/init never ran, but STAGE1 can also have scrolled out of the
+        // bounded tail ahead of the failure, so that branch is hedged, not asserted.
+        let detail = if result.console.contains(KEXEC_STAGE1_MARKER) {
+            "stage-1 ran (STAGE1 seen) but td-kexec's kexec_file_load(2)/reboot(KEXEC) did \
+             not reach stage-2 — the kexec itself failed, or the inner kernel/initramfs did not boot"
+        } else {
+            "STAGE1 is absent from the retained console tail — most likely the outer kernel did \
+             not boot the outer initramfs or its /init did not run, though STAGE1 may instead have \
+             scrolled out of the bounded tail ahead of the failure"
+        };
+        return Err(format!(
+            "the kexec spike did not reach stage-2 {KEXEC_STAGE2_MARKER:?} on ttyS0 — {} — {detail}. \
+             Last serial output:\n{}",
+            result.reason,
+            tail(&result.console, 80)
+        ));
+    }
+    // STAGE2 present ⇒ the kexec worked; STAGE1 necessarily preceded it (its absence from
+    // the bounded buffer is not a failure). Note whether it was still visible, for context.
+    let stage1 = if result.console.contains(KEXEC_STAGE1_MARKER) {
+        KEXEC_STAGE1_MARKER
+    } else {
+        "STAGE1 (scrolled out of the console tail)"
+    };
+    println!(
+        "PASS: kexec-spike-x86-64 kexecs under qemu (TCG) — the td-source-built kernel boots, td-kexec \
+         kexec_file_load(2)+reboot(KEXEC)s a SECOND kernel start ({stage1} -> {KEXEC_STAGE2_MARKER} on ttyS0)"
+    );
+    Ok(())
+}
+
 /// Build the `linux-x86-64` producer and return its `(bzImage, initramfs.cpio)` —
 /// shared by both boot modes so they build the kernel identically.
 fn build_kernel(runner: &RecipeCheckRunner) -> Result<(PathBuf, PathBuf), String> {
@@ -363,6 +448,25 @@ fn build_kernel(runner: &RecipeCheckRunner) -> Result<(PathBuf, PathBuf), String
         if !path.is_file() {
             return Err(format!(
                 "linux-x86-64 output is missing {label} ({}) — the boot check needs both the kernel and its userland",
+                path.display()
+            ));
+        }
+    }
+    Ok((bzimage, initramfs))
+}
+
+/// Build the `kexec-spike-x86-64` producer and return its
+/// `(bzImage, outer-initramfs.cpio)` — the two-kernel boot artifact `run_kexec` boots.
+fn build_spike(runner: &RecipeCheckRunner) -> Result<(PathBuf, PathBuf), String> {
+    runner.prepare_recipe_target("kexec-spike-x86-64")?;
+    let build_out = runner.build_plan("kexec-spike-x86-64")?;
+    let tree = runner.ladder_out_from(&build_out, "kexec-spike-x86-64")?;
+    let bzimage = tree.join("bzImage");
+    let initramfs = tree.join("outer-initramfs.cpio");
+    for (label, path) in [("bzImage", &bzimage), ("outer-initramfs.cpio", &initramfs)] {
+        if !path.is_file() {
+            return Err(format!(
+                "kexec-spike-x86-64 output is missing {label} ({}) — the kexec boot needs both the kernel and the two-kernel initramfs",
                 path.display()
             ));
         }
@@ -538,6 +642,10 @@ struct BootPlan<'a> {
     /// A read-only erofs image to attach over virtio-blk (/dev/vda in the guest), or
     /// `None` for a diskless boot.
     disk: Option<&'a Path>,
+    /// Guest RAM in MiB (qemu `-m`). The single-kernel boots use "256"; the kexec spike
+    /// needs more so the outer kernel + outer initramfs AND the kexec-loaded inner
+    /// kernel + inner initramfs all fit at the instant reboot(KEXEC) jumps.
+    mem: &'a str,
     /// The ttyS0 line whose appearance means the boot reached its target state; lets the
     /// boot modes key on different lines (userland vs. read-only-erofs vs. greeter).
     target_marker: &'a str,
@@ -613,7 +721,7 @@ fn boot(
         format!("{base_append} {}", plan.extra_append)
     };
     let mut cmd = Command::new(qemu);
-    cmd.args(["-M", "pc", "-accel", "tcg", "-m", "256", "-no-reboot"])
+    cmd.args(["-M", "pc", "-accel", "tcg", "-m", plan.mem, "-no-reboot"])
         .args(["-display", "none", "-monitor", "none"])
         .args(["-nic", "none", "-no-user-config"])
         .args(["-serial", &serial])

@@ -1,0 +1,42 @@
+[package]
+name = "td-kexec"
+version = "0.1.0"
+edition = "2021"
+description = "td's guest-side kexec helper: kexec_file_load(2) + reboot(KEXEC), a confined two-syscall surface"
+license = "GPL-3.0-or-later"
+
+[[bin]]
+name = "td-kexec"
+path = "src/main.rs"
+
+# td-kexec is a TARGET-built guest program, NOT part of the control-plane engine.
+# It is a standalone crate OUTSIDE the builder/recipes engine workspace, so the
+# one-self-entry Cargo.lock gate on those crates (which loops only over
+# `builder recipes`) never inspects it. Zero external dependencies (pure std).
+# The recipe compiles src/main.rs directly with rustc; this manifest exists so
+# the same source is an independently `cargo clippy`/`cargo test`-able crate.
+
+# unsafe is confined in SOURCE, not here: src/main.rs `#![deny(unsafe_code)]`s the
+# whole crate and scopes a `#[allow]` to `syscall5` — the ONLY unsafe in td outside
+# builder/src/sys.rs (a recorded AGENTS.md amendment). Compiler-enforced, so an
+# `unsafe` added anywhere else reds the build; no crate-wide allow to override it.
+
+[lints.clippy]
+unwrap_used = "deny"       # no panicking .unwrap(); return Result/Option, use ?
+expect_used = "deny"       # no panicking .expect()
+panic = "deny"             # no panic! on the happy/error path
+unreachable = "deny"
+todo = "deny"
+unimplemented = "deny"
+indexing_slicing = "deny"  # use .get(i) over xs[i] / &xs[a..b]
+
+# The SHIPPED td-kexec is built by recipes/src/recipes/td-kexec.rs invoking rustc
+# DIRECTLY (never `cargo build`), and that recipe mirrors opt-level=s / panic=abort
+# / strip explicitly. This profile therefore governs only local `cargo build
+# --release`; lto is intentionally dropped because a single-crate direct rustc
+# build cannot mirror it (it is a cargo-only, cross-crate step), so declaring it
+# here would be a contract the shipped artifact silently ignores.
+[profile.release]
+opt-level = "s"
+panic = "abort"
+strip = true

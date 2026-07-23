@@ -4,18 +4,22 @@
 //! logic down into fast unit tests" first step, now also the enforcement point for
 //! the AGENTS.md Rust coding rules.
 //! 
-//! clippy leg (AGENTS.md → "Rust code"): builder + recipes must lint clean under the
-//! `[lints]` table each Cargo.toml declares at `deny` — NO panicking surface
-//! (unwrap/expect/panic!/unreachable!/todo!/unimplemented!), `.get(i)` over
-//! panicking `xs[i]`, and `unsafe` confined to the raw-syscall layer. Existing code
+//! clippy leg (AGENTS.md → "Rust code"): builder, recipes, and td-kexec must lint
+//! clean under the `[lints]` table each Cargo.toml declares at `deny` — NO panicking
+//! surface (unwrap/expect/panic!/unreachable!/todo!/unimplemented!), `.get(i)` over
+//! panicking `xs[i]`, and `unsafe` confined to the raw-syscall layer (builder's is
+//! sys.rs; td-kexec's is its own kexec_file_load/reboot syscall wrapper — it alone
+//! sets `unsafe_code = "allow"`, the recorded AGENTS.md amendment). Existing code
 //! is grandfathered (per-file `#![allow]` in modules; per-item `#[allow]` on the
 //! crate root's own fns/impls — a crate-root inner `#![allow]` is crate-GLOBAL and
 //! would silently exempt everything), so a denied lint reds ONLY on NEW code. Also
-//! the one-way "no crates" guard for the engine: builder + recipes stay
-//! dependency-free (Cargo.lock = 1 package each). The network tools
-//! (fetch/feed/subst) carry the vendored FSDG crates and can't compile offline, so
-//! they are NOT linted here; their Cargo.toml still declares the same `[lints]` table
-//! so a local `cargo clippy` enforces it.
+//! the one-way "no crates" guard: builder, recipes, and td-kexec stay
+//! dependency-free (Cargo.lock = 1 package each). td-kexec is a TARGET guest program,
+//! not engine code, but it is pure std and compiles offline, so it lints/tests here
+//! with the engine crates. The network tools (fetch/feed/subst) carry the vendored
+//! FSDG crates and can't compile offline, so they are NOT linted here; their
+//! Cargo.toml still declares the same `[lints]` table so a local `cargo clippy`
+//! enforces it.
 //! 
 //! test leg: the `#[test]`s in builder/src/*.rs (NAR framing, SHA-256 vectors, drv
 //! parse/emit, the store-db SQLite encode/decode + reader, scan, sandbox) otherwise
@@ -79,7 +83,7 @@ pub fn gate() -> GateDef {
 	echo ">> cargo-test: engine crates lint clean (cargo clippy: no panic surface, .get over indexing, unsafe confined) + td-builder unit tests (cargo test) — offline, guix-free toolchain (td-builder provision-{rust,cc})"
 	set -euo pipefail; \
 	td="${TD_BUILDER_SELF:?gate-run exports TD_BUILDER_SELF}"; \
-	for crate in builder recipes; do \
+	for crate in builder recipes td-kexec; do \
 	  n=`"$td" text count-line-exact '[[package]]' "$crate/Cargo.lock"`; \
 	  test "$n" -eq 1 || { echo "ERROR: $crate is no longer dependency-free (Cargo.lock lists $n packages; the engine must carry ZERO crates — AGENTS.md 'Rust code')" >&2; exit 1; }; \
 	done; \
@@ -94,12 +98,14 @@ CARGO_HOME="$scratch/home" CARGO_TARGET_DIR="$scratch/target" \
 	  sh -c 'set -e; \
 	    cargo clippy --frozen --manifest-path builder/Cargo.toml; \
 	    cargo clippy --frozen --manifest-path recipes/Cargo.toml; \
+	    cargo clippy --frozen --manifest-path td-kexec/Cargo.toml; \
 	    cargo test  --frozen --manifest-path builder/Cargo.toml; \
-	    cargo test  --frozen --manifest-path recipes/Cargo.toml' 2>&1 | tee "$log"; \
+	    cargo test  --frozen --manifest-path recipes/Cargo.toml; \
+	    cargo test  --frozen --manifest-path td-kexec/Cargo.toml' 2>&1 | tee "$log"; \
 	"$td" text cargo-test-ok "$log" || \
 	  { echo "ERROR: cargo test reported no passing tests (vacuous run?)" >&2; exit 1; }; \
 rm -rf "$scratch"; \
-echo "PASS: cargo-test — builder + recipes are dependency-free and lint clean; builder + recipes unit tests pass (guix-free toolchain)."
+echo "PASS: cargo-test — builder + recipes + td-kexec are dependency-free and lint clean; their unit tests pass (guix-free toolchain)."
 "##,
     }
 }

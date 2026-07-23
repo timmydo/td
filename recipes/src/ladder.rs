@@ -156,6 +156,26 @@ pub const UUTILS_RUNTIME_MARKER: &str = "TD-UUTILS-RUN-OK";
 /// a normal interactive shell.
 pub const AUTOTEST_CMDLINE_TOKEN: &str = "td.autotest=1";
 
+// ── kexec-spike-x86-64 two-kernel boot markers (Phase-0 kexec spike) ─────────────
+// The spike proves the source-built kernel can kexec_file_load(2) + reboot(KEXEC) a
+// SECOND kernel start under qemu TCG. ONE qemu run boots the outer kernel + outer
+// initramfs; the outer /init runs td-kexec to jump into an inner kernel + inner
+// initramfs (a kexec is NOT a machine reset, so `-no-reboot` does not fire on it),
+// and the inner /init prints STAGE2 before a real `reboot -f` exits qemu. Both markers
+// are SINGLE SOURCE OF TRUTH shared by the spike recipe's two /init scripts and the
+// host-side `qemu-boot-kexec` oracle so they can never silently desync.
+
+/// Printed by the OUTER /init on ttyS0 once the first kernel reaches userspace, just
+/// before it execs td-kexec. Proves stage-1 ran; the oracle asserts it as a diagnostic
+/// that the second boot was initiated by our helper, not a stray direct boot.
+pub const KEXEC_STAGE1_MARKER: &str = "TD-KEXEC-BOOT1";
+
+/// Printed by the INNER /init on ttyS0 once the kexec'd SECOND kernel reaches userspace.
+/// The spike's success criterion: it cannot appear unless kexec_file_load(2) +
+/// reboot(LINUX_REBOOT_CMD_KEXEC) actually loaded and jumped into the second kernel.
+/// The `qemu-boot-kexec` oracle keys on it (and additionally asserts STAGE1).
+pub const KEXEC_STAGE2_MARKER: &str = "TD-KEXEC-BOOT2";
+
 /// Shell (for `sh -c`) asserting that `initramfs` is a COMPLETE, well-formed newc cpio
 /// carrying the bootable busybox userland. Shared by the `linux-x86-64` producer rung
 /// and the `linux-x86-64-test` rung so the two checks cannot drift.

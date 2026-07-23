@@ -1,0 +1,6 @@
+# Cargo build output — never committed. td-kexec's source is the committed tree
+# only (Cargo.toml, Cargo.lock, src/). The recipe compiles src/main.rs with rustc
+# directly; a local `cargo build` here is only for lint/test and must not be
+# packed into any derivation.
+/target
+/.cargo
