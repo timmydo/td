@@ -137,15 +137,22 @@ pub(crate) fn run(runner: &RecipeCheckRunner, lock: File) -> Result<(), String> 
     // step ...` line is one rung landing).
     println!(
         "   [run] building the td distro ({SYSTEM}); its closure pulls in the {KERNEL} kernel.\n         \
-         Unchanged rungs are reused from the shared build cache; only changed rungs rebuild,\n         \
-         so a warm tree finishes in minutes. The first build (or the first after a\n         \
-         `td-recipe-eval clear-store`) cold-climbs the whole ladder from stage0 and can take\n         \
-         many minutes. Per-rung progress streams below.\n"
+         An unchanged tree is reused whole (a `[reuse]` line below) and returns at once; otherwise\n         \
+         only changed rungs rebuild, so a warm tree finishes in minutes. The first build (or the\n         \
+         first after a `td-recipe-eval clear-store`) cold-climbs the whole ladder from stage0 and\n         \
+         can take many minutes. Per-rung progress streams below.\n"
     );
-    runner.prepare_recipe_target(SYSTEM)?;
-    let build_out = runner.build_plan(SYSTEM)?;
-    let system_tree = runner.ladder_out_from(&build_out, SYSTEM)?;
-    let kernel_tree = runner.ladder_out_from(&build_out, KERNEL)?;
+    // Build (or reuse whole) the distro AND its in-closure kernel in one plan,
+    // staging both outputs into tdstore; a warm memo hit skips the climb entirely.
+    let trees = runner.build_and_stage(SYSTEM, &[SYSTEM, KERNEL])?;
+    let system_tree = trees
+        .first()
+        .cloned()
+        .ok_or_else(|| format!("distro build did not stage the {SYSTEM} output"))?;
+    let kernel_tree = trees
+        .get(1)
+        .cloned()
+        .ok_or_else(|| format!("distro build did not stage the {KERNEL} output"))?;
     let bzimage = kernel_tree.join("bzImage");
     let init_cpio = system_tree.join("init.cpio");
     let root_tree = system_tree.join("root");

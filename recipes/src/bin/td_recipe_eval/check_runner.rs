@@ -664,6 +664,152 @@ fn build_cache_paths(lw: &Path) -> (PathBuf, PathBuf) {
     (base.join("store"), base.join("db"))
 }
 
+/// sha256 over the evaluator binary, the builder binary, every
+/// `seed/patches/*.patch`, and every committed `cargo_locks` file, in a fixed
+/// order — the pure-plan fingerprint that keys the build-run reuse memo. Recipes
+/// and seed pins are compiled INTO the binaries (a change rebuilds them and
+/// re-keys); a patch change alters a hashed file; and a rust rung's committed
+/// `Cargo.lock` is the one build input read from the repo at build time rather
+/// than compiled in, so a lock bump (which changes that rung's output) must
+/// re-key here too. Every field is length-delimited so no boundary is ambiguous
+/// (concatenation cannot collide). `cargo_locks` must be sorted and deduped by
+/// the caller; a declared lock that cannot be read fails closed.
+fn plan_fingerprint(
+    eval: &Path,
+    builder: &Path,
+    patches_dir: &Path,
+    repo_root: &Path,
+    cargo_locks: &[String],
+) -> Result<String, String> {
+    let mut h = crate::sha256::Sha256::new();
+    for bin in [eval, builder] {
+        let bytes = fs::read(bin).map_err(|e| format!("read {}: {e}", bin.display()))?;
+        h.update(&(bytes.len() as u64).to_le_bytes());
+        h.update(&bytes);
+    }
+    // Only a MISSING patch dir hashes as zero patches (a tree that GAINS the dir
+    // re-keys by growing the hashed list). Any other read error — and any entry
+    // error — fails closed: silently dropping a patch from the key would let a
+    // stale memo survive a real patch change and serve wrong bytes.
+    let mut names: Vec<String> = match fs::read_dir(patches_dir) {
+        Ok(rd) => {
+            let mut v = Vec::new();
+            for entry in rd {
+                let entry = entry
+                    .map_err(|e| format!("read_dir entry {}: {e}", patches_dir.display()))?;
+                // Skip a directory that happens to be named `*.patch`: `fs::read`
+                // on it below would fail the whole fingerprint (and thus the
+                // build). A file_type() error still fails closed.
+                let ft = entry
+                    .file_type()
+                    .map_err(|e| format!("file_type {}: {e}", entry.path().display()))?;
+                if ft.is_dir() {
+                    continue;
+                }
+                if let Some(name) = entry.file_name().to_str() {
+                    if name.ends_with(".patch") {
+                        v.push(name.to_string());
+                    }
+                }
+            }
+            v
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Vec::new(),
+        Err(e) => return Err(format!("read_dir {}: {e}", patches_dir.display())),
+    };
+    names.sort();
+    for name in &names {
+        let p = patches_dir.join(name);
+        let bytes = fs::read(&p).map_err(|e| format!("read {}: {e}", p.display()))?;
+        h.update(&(name.len() as u64).to_le_bytes());
+        h.update(name.as_bytes());
+        h.update(&(bytes.len() as u64).to_le_bytes());
+        h.update(&bytes);
+    }
+    for rel in cargo_locks {
+        let p = repo_root.join(rel);
+        let bytes = fs::read(&p)
+            .map_err(|e| format!("read committed cargoLock {}: {e}", p.display()))?;
+        h.update(&(rel.len() as u64).to_le_bytes());
+        h.update(rel.as_bytes());
+        h.update(&(bytes.len() as u64).to_le_bytes());
+        h.update(&bytes);
+    }
+    Ok(crate::sha256::to_base16(&h.finalize()))
+}
+
+/// Parse a build-run reuse memo, returning stem -> output basename ONLY when its
+/// header fingerprint matches `expected_fp` (a stale-plan file is ignored, though
+/// the fingerprint is also in the filename). Every basename is validated so a
+/// corrupted row can never escape the cache/tdstore dirs it is joined onto.
+fn parse_build_run_memo(text: &str, expected_fp: &str) -> Option<BTreeMap<String, String>> {
+    let mut lines = text.lines();
+    let fp = lines.next()?.strip_prefix("fingerprint ")?.trim();
+    if fp != expected_fp {
+        return None;
+    }
+    let mut map = BTreeMap::new();
+    for line in lines {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let mut it = line.splitn(2, ' ');
+        let (stem, base) = (it.next()?, it.next()?.trim());
+        if !is_plain_basename(base) {
+            return None;
+        }
+        map.insert(stem.to_string(), base.to_string());
+    }
+    Some(map)
+}
+
+fn serialize_build_run_memo(fingerprint: &str, steps: &BTreeMap<String, String>) -> String {
+    let mut s = format!("fingerprint {fingerprint}\n");
+    for (stem, base) in steps {
+        s.push_str(stem);
+        s.push(' ');
+        s.push_str(base);
+        s.push('\n');
+    }
+    s
+}
+
+/// The stem -> output-basename map from a `build-plan --auto` log's STEP lines,
+/// LAST line winning (matching `ladder_out_from`). Only a completely realized
+/// rung emits a STEP line, so every recorded base is a fully-committed output.
+fn parse_step_map(text: &str) -> BTreeMap<String, String> {
+    let mut map = BTreeMap::new();
+    for line in text.lines() {
+        if let Some(rest) = line.strip_prefix("STEP ") {
+            let mut it = rest.splitn(2, ' ');
+            if let (Some(stem), Some(path)) = (it.next(), it.next()) {
+                let base = path.trim().rsplit('/').next().unwrap_or("");
+                if is_plain_basename(base) {
+                    map.insert(stem.to_string(), base.to_string());
+                }
+            }
+        }
+    }
+    map
+}
+
+/// A bare store basename — no path separator (`/` or `\`), no whitespace, and not
+/// a `.`/`..` traversal — safe to `join` onto the cache store and tdstore. An
+/// fsck-grade guard: the memo lives under our own ladder dir, but a corrupted row
+/// must never escape it. `\` is not a separator on the Linux hosts td targets, but
+/// rejecting it keeps the guard sound if this parser is ever reused elsewhere.
+/// Rejecting whitespace also fails a memo closed if a space ever leaks into a step
+/// stem (the `splitn(2, ' ')` would fold the stem tail into the base).
+fn is_plain_basename(b: &str) -> bool {
+    !b.is_empty()
+        && !b.contains('/')
+        && !b.contains('\\')
+        && !b.contains(|c: char| c.is_whitespace())
+        && b != "."
+        && b != ".."
+}
+
 fn selected_check_runner(stem: &str, scope: &str, index: usize) -> Result<CheckRunner, String> {
     let tier = parse_tier(scope)?;
     let recipe = catalog::lookup(stem)
@@ -1348,11 +1494,12 @@ impl RecipeCheckRunner {
         // resets the whole ladder; nothing reclaims the cache implicitly except an opt-in
         // TD_CHECK_LADDER_CACHE_CAP_BYTES high-watermark eviction in setup().
         // Safe under the global ladder lock (build-runs are serialized — no concurrent
-        // writer to the cache). Caveat (builder follow-up): the builder commits a rung
-        // into the cache in place (copy, not temp+rename), so an OOM/kill mid-commit can
-        // leave a torn item that later fails commit_tree_checked; recovery today is the
-        // watermark eviction (or TD_CHECK_LADDER_CACHE_CAP_BYTES=1 to force one), or a
-        // `clear-store`, pending crash-atomic store commits.
+        // writer to the cache). The builder commits each rung ATOMICALLY (stage into a
+        // sibling temp, then rename — commit_canonical_atomic / commit_tree_checked), so a
+        // kill mid-commit leaves only a swept temp, never a torn tree at the destination;
+        // an unregistered mismatching orphan is removed and re-committed, never served. The
+        // build-run reuse memo relies on this: a committed base (one that emitted a STEP
+        // line) is complete and immutable, so its later presence is a sound reuse gate.
         //
         // The cache MUST NOT be self.store/self.db: those are the SEED store/db (interned
         // seed inputs), and #468 authenticates self.db as a seed-only authority — a recipe
@@ -1473,21 +1620,264 @@ impl RecipeCheckRunner {
     }
 
     fn build_recipe_target(&self, target: &str, outputs: &[&str]) -> Result<(), String> {
-        {
-            let _t = timed_phase("harness prepare/seed-inputs");
-            self.prepare_recipe_target(target)?;
-        }
-        let build_out = self.build_plan(target)?;
+        let staged = self.build_and_stage(target, outputs)?;
         println!("TD_RECIPE_RUN_WORK {}", self.lw.display());
         println!(
             "TD_RECIPE_RUN_TDSTORE {}",
             self.scratch.join("tdstore").display()
         );
-        for output in outputs {
-            let path = self.ladder_out_from(&build_out, output)?;
+        for (output, path) in outputs.iter().zip(staged.iter()) {
             println!("TD_RECIPE_RUN_OUT {output} {}", path.display());
         }
         Ok(())
+    }
+
+    /// Build TARGET's graph and stage the requested output rungs into this run's
+    /// tdstore, returning each output's staged path in `outputs` order. Shared by
+    /// `build-run` and the interactive `run`.
+    ///
+    /// CONTRACT: exactly the REQUESTED `outputs` are staged into tdstore — not the
+    /// whole closure. A cold climb incidentally leaves every rung's output in
+    /// tdstore as a byproduct of building; a warm hit stages only the requested
+    /// roots. Every consumer depends only on the requested roots: `run` reads the
+    /// self-contained `<system>/root` + `<system>/init.cpio` + `<kernel>/bzImage`
+    /// (exactly what it read before this change), loop-userland reads the static
+    /// busybox/make trees, and the CLI prints the paths. Recipe binaries reference
+    /// absolute `/td/store`, never the per-invocation scratch tdstore, so the
+    /// incidental cold closure is not a consumer contract; a caller that needs
+    /// more outputs staged names them explicitly (`build-run TARGET A B ...`).
+    ///
+    /// TOP-LEVEL REUSE: the whole ladder is a pure function of the compiled
+    /// evaluator + builder + seed patches + the closure's committed cargoLocks
+    /// (`evaluator_fingerprint`), so a memo keyed on that fingerprint records each
+    /// rung's content-addressed output basename. When the fingerprint is unchanged AND every requested output's
+    /// durable build-cache tree is still present, this SKIPS seed-inputs,
+    /// planning, and the whole climb — it only copies the recorded outputs into
+    /// tdstore. Any recipe/pin/patch change rebuilds the evaluator or builder,
+    /// re-keys the fingerprint, and misses (full rebuild); an evicted or
+    /// `clear-store`d output also misses. Trust-store presence is the reuse gate
+    /// (the same boundary the persistent-realization warm hit uses):
+    /// `verify-store` fscks the bytes out of band, never inline on this hot path.
+    pub(crate) fn build_and_stage(
+        &self,
+        target: &str,
+        outputs: &[&str],
+    ) -> Result<Vec<PathBuf>, String> {
+        let fingerprint = self.evaluator_fingerprint(target)?;
+        if let Some(staged) = self.reuse_build_run(target, &fingerprint, outputs)? {
+            return Ok(staged);
+        }
+        {
+            let _t = timed_phase("harness prepare/seed-inputs");
+            self.prepare_recipe_target(target)?;
+        }
+        let build_out = self.build_plan(target)?;
+        let steps = parse_step_map(
+            &fs::read_to_string(&build_out)
+                .map_err(|e| format!("read {}: {e}", build_out.display()))?,
+        );
+        // Record only AFTER a successful climb: every recorded base has a STEP
+        // line, i.e. a completely committed output, so a later reuse can trust its
+        // presence. RE-FINGERPRINT first and publish only if it is byte-identical
+        // to the pre-build fingerprint: the plan inputs (evaluator/builder binaries,
+        // patches, closure locks) are hashed before a minutes-long climb but read
+        // DURING it, and the ladder lock does not serialize working-tree edits or a
+        // concurrent `cargo build` replacing the binary. If an input changed under
+        // us the output no longer matches `fingerprint`, so skip the memo rather
+        // than map a fingerprint to bytes built from different inputs; a later run
+        // recomputes and rebuilds. (A single edit-then-revert WITHIN one build is
+        // out of scope — the base build's own output would be equally mixed.)
+        // All of this is best-effort — nothing here fails the completed build.
+        match self.evaluator_fingerprint(target) {
+            Ok(after) if after == fingerprint => {
+                if let Err(e) = self.write_build_run_memo(target, &fingerprint, &steps) {
+                    eprintln!("ladder: build-run reuse memo not recorded (non-fatal): {e}");
+                }
+            }
+            Ok(_) => eprintln!(
+                "ladder: plan inputs changed during the build; reuse memo not recorded for {target}"
+            ),
+            Err(e) => {
+                eprintln!("ladder: reuse memo not recorded (re-fingerprint failed, non-fatal): {e}")
+            }
+        }
+        outputs
+            .iter()
+            .map(|o| self.ladder_out_from(&build_out, o))
+            .collect()
+    }
+
+    /// The compiled-plan fingerprint for TARGET: sha256 over the running evaluator
+    /// binary, the staged builder binary, every `seed/patches/*.patch`, and every
+    /// committed `Cargo.lock` a rung in TARGET's closure vendors from. Mirrors the
+    /// loop-userland fingerprint (check_loop.rs), extended with the builder binary
+    /// (it equally determines the output bytes a reuse skips) and the closure's
+    /// cargoLocks (the one build input read from the repo, not compiled in — a lock
+    /// bump changes a rust rung's output but no binary, so it MUST re-key here).
+    /// Closure-scoped so an unrelated recipe's lock never invalidates this target.
+    fn evaluator_fingerprint(&self, target: &str) -> Result<String, String> {
+        let eval = env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
+        let mut locks: Vec<String> = recipe_closure(&[target])?
+            .iter()
+            .filter_map(|n| n.recipe.cargo_lock.clone())
+            .collect();
+        locks.sort();
+        locks.dedup();
+        plan_fingerprint(
+            &eval,
+            &self.tb,
+            &self.root.join("seed/patches"),
+            &self.root,
+            &locks,
+        )
+    }
+
+    /// A memo HIT: the recorded plan for `fingerprint` is present and every
+    /// requested output's durable build-cache tree still exists. COPY each into
+    /// this run's tdstore (an INDEPENDENT inode — the operator-exposed tdstore
+    /// output must never alias the durable cache, so a modified output cannot
+    /// poison it) and return the staged paths. Any miss (no memo, an output not
+    /// in it, or an evicted tree) returns None so the caller does a full build.
+    ///
+    /// Only the REQUESTED roots are staged, not the whole planned closure the
+    /// full-build path stages — sound because the callers read only those roots
+    /// (`build-run` prints their paths; `run` packs the erofs from
+    /// `<system>/root` and reads `<kernel>/bzImage`), and each root output is a
+    /// self-contained tree. Two passes: validate ALL outputs first (so a partial
+    /// eviction is a clean miss with no half-staged tdstore and no wasted copy),
+    /// then stage.
+    ///
+    /// The stage is `copy_tree` (`fs::copy` per file), reflink-cheap on a CoW
+    /// filesystem (btrfs/xfs) but a full byte copy on ext4 — the builder's
+    /// FICLONE fast path lives behind its `unsafe` syscall layer, unreachable from
+    /// this `unsafe`-forbidden crate — so a warm hit still skips the entire ladder
+    /// climb, but the final copy of the requested roots is image-sized off CoW.
+    fn reuse_build_run(
+        &self,
+        target: &str,
+        fingerprint: &str,
+        outputs: &[&str],
+    ) -> Result<Option<Vec<PathBuf>>, String> {
+        let map = match self.read_build_run_memo(target, fingerprint) {
+            Some(m) => m,
+            None => return Ok(None),
+        };
+        let (cache_store, _cache_db) = self.build_cache_paths();
+        // Pass 1: resolve every requested output to a present durable cache tree.
+        // Any gap (not memoized, or its tree evicted) is a MISS decided with NO
+        // staging side effect.
+        let mut sources: Vec<(String, PathBuf)> = Vec::with_capacity(outputs.len());
+        for output in outputs {
+            let base = match map.get(*output) {
+                Some(b) => b,
+                None => return Ok(None),
+            };
+            let src = cache_store.join(base);
+            // Presence of a REAL DIRECTORY is a sound "complete tree" proxy because
+            // the builder prints a rung's `STEP` line only AFTER its durable
+            // persist-cache commit finishes, and a committed base is
+            // content-addressed and hence immutable — so a memoized base was fully
+            // committed and its bytes can only be removed wholesale (eviction /
+            // clear-store under the ladder lock), never torn in place. Use
+            // `symlink_metadata` (lstat, does NOT follow) not `Path::is_dir` (which
+            // follows): a symlink squatting the basename must be REJECTED, not
+            // followed — else `copy_tree` would recreate the link and stage an
+            // alias to an out-of-cache tree, breaking confinement and copy-not-
+            // alias. A stray file is rejected too. `verify-store` fscks the bytes
+            // out of band, so this hot path never re-hashes.
+            let is_real_dir = fs::symlink_metadata(&src)
+                .map(|m| m.file_type().is_dir())
+                .unwrap_or(false);
+            if !is_real_dir {
+                return Ok(None);
+            }
+            sources.push((base.clone(), src));
+        }
+        // Pass 2: stage each as an INDEPENDENT copy (never a hardlink/symlink).
+        // Copy into a temp then rename, so a kill mid-copy never leaves a torn tree
+        // a later read would trust as complete. The temp name is static (not
+        // pid-tagged): staging serializes under the ladder lock, so there is no
+        // concurrent writer, and a static name lets `remove_path_if_exists` reap a
+        // crashed run's orphan on the next run instead of leaking one per dead pid.
+        let tdstore = self.scratch.join("tdstore");
+        fs::create_dir_all(&tdstore).map_err(|e| format!("mkdir {}: {e}", tdstore.display()))?;
+        let mut staged = Vec::with_capacity(sources.len());
+        for (base, src) in &sources {
+            let dst = tdstore.join(base);
+            if !dst.exists() {
+                let tmp = tdstore.join(format!(".{base}.tmp"));
+                remove_path_if_exists(&tmp)?;
+                copy_tree(src, &tmp).map_err(|e| {
+                    format!(
+                        "ladder: reuse-stage {} ({} -> {}): {e}",
+                        base,
+                        src.display(),
+                        tmp.display()
+                    )
+                })?;
+                fs::rename(&tmp, &dst).map_err(|e| {
+                    format!(
+                        "ladder: reuse-stage rename {} -> {}: {e}",
+                        tmp.display(),
+                        dst.display()
+                    )
+                })?;
+            }
+            staged.push(dst);
+        }
+        eprintln!(
+            "   [reuse] {target} unchanged (plan {}): skipped seed-inputs, planning, and the ladder climb",
+            fingerprint.get(..12).unwrap_or(fingerprint)
+        );
+        Ok(Some(staged))
+    }
+
+    fn build_run_memo_path(&self, target: &str, fingerprint: &str) -> PathBuf {
+        self.lw.join("build-run-memo").join(format!(
+            "{}.{fingerprint}.map",
+            sanitize_target_for_filename(target)
+        ))
+    }
+
+    fn read_build_run_memo(
+        &self,
+        target: &str,
+        fingerprint: &str,
+    ) -> Option<BTreeMap<String, String>> {
+        let text = fs::read_to_string(self.build_run_memo_path(target, fingerprint)).ok()?;
+        parse_build_run_memo(&text, fingerprint)
+    }
+
+    fn write_build_run_memo(
+        &self,
+        target: &str,
+        fingerprint: &str,
+        steps: &BTreeMap<String, String>,
+    ) -> Result<(), String> {
+        let dir = self.lw.join("build-run-memo");
+        fs::create_dir_all(&dir).map_err(|e| format!("mkdir {}: {e}", dir.display()))?;
+        let path = self.build_run_memo_path(target, fingerprint);
+        // Atomic publish: temp then rename, so a kill mid-write never leaves a torn
+        // memo a later run would half-read. Build-runs serialize under the ladder
+        // lock, so there is no concurrent writer to race; the temp name is static
+        // per target (not pid-tagged) so a crashed run's orphan is reaped here on
+        // the next write of this target rather than leaking one per dead pid. `lw`
+        // is shared across runs (unlike the per-run scratch tdstore), so this
+        // matters more here than for the staging temp.
+        //
+        // The published `.map` is per fingerprint and is NOT reaped: `lw` (hence
+        // this dir) is shared across all worktrees, whose distinct evaluator
+        // binaries fingerprint differently, so deleting other-fingerprint maps
+        // would clobber a concurrent worktree's live memo. Per-fingerprint maps sit
+        // side by side (mirroring the loop-userland map, check_loop.rs); a stale one
+        // is inert (its fingerprint never matches, so it is never read) and is
+        // cleaned only wholesale by `clear-store`.
+        let tmp = dir.join(format!(".{}.tmp", sanitize_target_for_filename(target)));
+        remove_path_if_exists(&tmp)?;
+        fs::write(&tmp, serialize_build_run_memo(fingerprint, steps))
+            .map_err(|e| format!("write {}: {e}", tmp.display()))?;
+        fs::rename(&tmp, &path)
+            .map_err(|e| format!("rename {} -> {}: {e}", tmp.display(), path.display()))
     }
 
     pub(crate) fn store_ns_output(
@@ -2884,5 +3274,227 @@ mod tests {
 
         assert_eq!(got, tmp.join("scratch/tdstore/current-rust"));
         let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn is_plain_basename_rejects_traversal_and_separators() {
+        assert!(is_plain_basename("aaa-name"));
+        assert!(!is_plain_basename(""));
+        assert!(!is_plain_basename("."));
+        assert!(!is_plain_basename(".."));
+        assert!(!is_plain_basename("a/b"));
+        assert!(!is_plain_basename("../etc"));
+        assert!(!is_plain_basename("a b"));
+        assert!(!is_plain_basename("a\tb"));
+        assert!(!is_plain_basename("a\\b"));
+        assert!(!is_plain_basename("..\\etc"));
+    }
+
+    // The reuse memo round-trips, and a stale-plan file (header fingerprint != the
+    // caller's) is ignored even if it somehow shares the filename — the header is a
+    // second, in-band check on top of the fingerprint-in-filename.
+    #[test]
+    fn build_run_memo_round_trips_and_rejects_a_wrong_fingerprint() {
+        let mut steps = BTreeMap::new();
+        steps.insert("system-x86-64".to_string(), "aaa-system".to_string());
+        steps.insert("linux-x86-64".to_string(), "bbb-linux".to_string());
+        let text = serialize_build_run_memo("deadbeef", &steps);
+        assert_eq!(parse_build_run_memo(&text, "deadbeef"), Some(steps));
+        assert_eq!(parse_build_run_memo(&text, "cafef00d"), None);
+        // No header line at all is a miss, never a panic.
+        assert_eq!(parse_build_run_memo("", "deadbeef"), None);
+    }
+
+    // A corrupted memo row whose basename would traverse out of the cache/tdstore
+    // dirs is rejected wholesale (fsck-grade): the whole file is treated as a miss.
+    #[test]
+    fn parse_build_run_memo_rejects_a_traversal_basename() {
+        let evil = "fingerprint deadbeef\nsystem-x86-64 ../../etc/passwd\n";
+        assert_eq!(parse_build_run_memo(evil, "deadbeef"), None);
+    }
+
+    // The STEP map takes the LAST line for a stem (matching ladder_out_from) and
+    // keeps only the basename; a malformed/traversal STEP path is dropped.
+    #[test]
+    fn parse_step_map_takes_the_last_step_and_the_basename() {
+        let log = "STEP gcc /td/store/stale-gcc\n\
+                   STEP gcc /td/store/final-gcc\n\
+                   STEP glibc /td/store/xyz-glibc\n\
+                   STEP trailing /td/store/\n\
+                   noise line\n";
+        let map = parse_step_map(log);
+        assert_eq!(map.get("gcc").map(String::as_str), Some("final-gcc"));
+        assert_eq!(map.get("glibc").map(String::as_str), Some("xyz-glibc"));
+        // A path whose last component is empty yields no plain basename, so the row
+        // is dropped rather than recorded.
+        assert_eq!(map.get("trailing"), None);
+    }
+
+    // The fingerprint changes if ANY of the evaluator bytes, the builder bytes, or a
+    // patch changes; it is stable when nothing changes; a missing patch dir is fine;
+    // and the length-delimiting defeats a concatenation collision.
+    #[test]
+    fn plan_fingerprint_changes_with_any_input_and_tolerates_no_patch_dir() {
+        let tmp = env::temp_dir().join(format!("td-fp-test-{}", process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        let patches = tmp.join("seed/patches");
+        fs::create_dir_all(&patches).unwrap();
+        let eval = tmp.join("td-recipe-eval");
+        let builder = tmp.join("td-builder");
+        fs::write(&eval, b"EVAL-v1").unwrap();
+        fs::write(&builder, b"BUILDER-v1").unwrap();
+        fs::write(patches.join("a.patch"), b"patch-a").unwrap();
+        // A committed cargoLock read relative to the repo root (here `tmp`).
+        fs::create_dir_all(tmp.join("recipes/locks/x")).unwrap();
+        fs::write(tmp.join("recipes/locks/x/Cargo.lock"), b"lock-v1").unwrap();
+        let locks = vec!["recipes/locks/x/Cargo.lock".to_string()];
+        let fp = |locks: &[String]| plan_fingerprint(&eval, &builder, &patches, &tmp, locks).unwrap();
+
+        let base = fp(&locks);
+        // Deterministic: same inputs, same fingerprint.
+        assert_eq!(base, fp(&locks));
+        // Evaluator change re-keys.
+        fs::write(&eval, b"EVAL-v2").unwrap();
+        let after_eval = fp(&locks);
+        assert_ne!(base, after_eval);
+        // Builder change re-keys.
+        fs::write(&builder, b"BUILDER-v2").unwrap();
+        let after_builder = fp(&locks);
+        assert_ne!(after_eval, after_builder);
+        // Patch change re-keys.
+        fs::write(patches.join("a.patch"), b"patch-a2").unwrap();
+        let after_patch = fp(&locks);
+        assert_ne!(after_builder, after_patch);
+        // A committed cargoLock bump re-keys (the repo-read build input).
+        fs::write(tmp.join("recipes/locks/x/Cargo.lock"), b"lock-v2").unwrap();
+        let after_lock = fp(&locks);
+        assert_ne!(after_patch, after_lock);
+        // Dropping the lock from the closure (no rust rung) re-keys and is stable.
+        let nolock = fp(&[]);
+        assert_ne!(after_lock, nolock);
+        assert_eq!(nolock, fp(&[]));
+
+        // A missing patch dir is fine (hashes as zero patches) and stable.
+        let nopatch = tmp.join("gone");
+        let f1 = plan_fingerprint(&eval, &builder, &nopatch, &tmp, &[]).unwrap();
+        assert_eq!(f1, plan_fingerprint(&eval, &builder, &nopatch, &tmp, &[]).unwrap());
+
+        // Length-delimiting: splitting a byte across the eval/builder boundary must
+        // NOT collide (naive concatenation would).
+        fs::write(&eval, b"ab").unwrap();
+        fs::write(&builder, b"c").unwrap();
+        let split_a = plan_fingerprint(&eval, &builder, &nopatch, &tmp, &[]).unwrap();
+        fs::write(&eval, b"a").unwrap();
+        fs::write(&builder, b"bc").unwrap();
+        let split_b = plan_fingerprint(&eval, &builder, &nopatch, &tmp, &[]).unwrap();
+        assert_ne!(split_a, split_b);
+
+        // A declared-but-missing lock fails closed (never silently ignored).
+        assert!(plan_fingerprint(&eval, &builder, &nopatch, &tmp, &["recipes/locks/gone/Cargo.lock".to_string()]).is_err());
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    // End-to-end reuse: with a recorded memo AND the durable cache trees present,
+    // reuse_build_run COPIES each requested output into tdstore (an independent
+    // inode) and returns its staged path. It misses (None → full build) when the
+    // fingerprint differs, when a requested output is not in the memo, or when its
+    // durable cache tree is absent (evicted / clear-store'd).
+    #[test]
+    fn build_run_reuse_stages_present_outputs_and_misses_on_absent_or_stale() {
+        let lw = env::temp_dir().join(format!("td-reuse-test-{}", process::id()));
+        let _ = fs::remove_dir_all(&lw);
+        let runner = shared_test_runner(&lw);
+        let (cache_store, _db) = runner.build_cache_paths();
+        // Two committed outputs live in the durable build cache.
+        for (base, body) in [("aaa-system", b"SYS" as &[u8]), ("bbb-linux", b"KRN")] {
+            fs::create_dir_all(cache_store.join(base)).unwrap();
+            fs::write(cache_store.join(base).join("file"), body).unwrap();
+        }
+        let mut steps = BTreeMap::new();
+        steps.insert("system-x86-64".to_string(), "aaa-system".to_string());
+        steps.insert("linux-x86-64".to_string(), "bbb-linux".to_string());
+        runner
+            .write_build_run_memo("system-x86-64", "fp1", &steps)
+            .unwrap();
+
+        // HIT: both outputs staged into tdstore, as independent copies (mutating the
+        // staged copy does NOT touch the durable cache tree).
+        let staged = runner
+            .reuse_build_run("system-x86-64", "fp1", &["system-x86-64", "linux-x86-64"])
+            .unwrap()
+            .expect("memo hit");
+        let tdstore = runner.scratch.join("tdstore");
+        assert_eq!(
+            staged,
+            vec![tdstore.join("aaa-system"), tdstore.join("bbb-linux")]
+        );
+        assert_eq!(fs::read(tdstore.join("aaa-system").join("file")).unwrap(), b"SYS");
+        fs::write(tdstore.join("aaa-system").join("file"), b"TAMPERED").unwrap();
+        assert_eq!(
+            fs::read(cache_store.join("aaa-system").join("file")).unwrap(),
+            b"SYS",
+            "the durable cache tree must not share an inode with the staged copy"
+        );
+
+        // MISS: a different fingerprint has no memo file.
+        assert!(runner
+            .reuse_build_run("system-x86-64", "fp2", &["system-x86-64"])
+            .unwrap()
+            .is_none());
+        // MISS: a requested output not recorded in the memo.
+        assert!(runner
+            .reuse_build_run("system-x86-64", "fp1", &["busybox-x86-64"])
+            .unwrap()
+            .is_none());
+        // MISS: the durable cache tree was evicted since it was recorded.
+        fs::remove_dir_all(cache_store.join("bbb-linux")).unwrap();
+        assert!(runner
+            .reuse_build_run("system-x86-64", "fp1", &["linux-x86-64"])
+            .unwrap()
+            .is_none());
+        // MISS: a non-directory squats the recorded basename (corruption) — a bare
+        // `exists()` would accept it; the real-dir gate rejects it and rebuilds.
+        fs::write(cache_store.join("bbb-linux"), b"not-a-dir").unwrap();
+        assert!(runner
+            .reuse_build_run("system-x86-64", "fp1", &["linux-x86-64"])
+            .unwrap()
+            .is_none());
+        // MISS: a SYMLINK-to-directory squats the basename. `Path::is_dir` follows
+        // and would accept it (then copy_tree would recreate the link and stage an
+        // alias); the `symlink_metadata` gate rejects it and rebuilds.
+        fs::remove_file(cache_store.join("bbb-linux")).unwrap();
+        let external = lw.join("external-dir");
+        fs::create_dir_all(external.join("payload")).unwrap();
+        std::os::unix::fs::symlink(&external, cache_store.join("bbb-linux")).unwrap();
+        assert!(runner
+            .reuse_build_run("system-x86-64", "fp1", &["linux-x86-64"])
+            .unwrap()
+            .is_none());
+        let _ = fs::remove_dir_all(&lw);
+    }
+
+    // Per-fingerprint memo maps coexist and are NOT reaped: `lw` is shared across
+    // worktrees whose distinct binaries fingerprint differently, so a write for one
+    // fingerprint must never delete another's live map (a concurrent worktree's).
+    #[test]
+    fn write_build_run_memo_keeps_other_fingerprint_maps() {
+        let lw = env::temp_dir().join(format!("td-keepmap-test-{}", process::id()));
+        let _ = fs::remove_dir_all(&lw);
+        let runner = shared_test_runner(&lw);
+        let dir = lw.join("build-run-memo");
+        let mut steps = BTreeMap::new();
+        steps.insert("system-x86-64".to_string(), "aaa-system".to_string());
+
+        runner.write_build_run_memo("system-x86-64", "aaa", &steps).unwrap();
+        runner.write_build_run_memo("system-x86-64", "bbb", &steps).unwrap();
+        runner.write_build_run_memo("busybox-x86-64", "ccc", &steps).unwrap();
+
+        assert!(
+            dir.join("system-x86-64.aaa.map").exists(),
+            "a prior-fingerprint map for the same target must survive (could be a live worktree's)"
+        );
+        assert!(dir.join("system-x86-64.bbb.map").exists());
+        assert!(dir.join("busybox-x86-64.ccc.map").exists());
+        let _ = fs::remove_dir_all(&lw);
     }
 }
