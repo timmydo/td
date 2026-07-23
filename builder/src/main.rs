@@ -801,6 +801,61 @@ fn copy_canonical(src: &Path, dst: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// Stage SRC to DST like `copy_canonical`, but HARDLINK a regular file (sharing its inode)
+/// instead of copying its bytes WHEN — and only when — the source is already a canonical,
+/// immutable store file (perms exactly `0444` or `0555`, the only forms `copy_canonical`
+/// produces and the only perms NAR distinguishes). A non-canonical source (e.g. a raw sandbox
+/// build output at `0644`/`0755`) is COPIED via `copy_canonical` instead, so DST always ends up
+/// canonical and never shares an inode with a still-writable tree — a shared inode is safe only
+/// because a `0444`/`0555` file is never mutated in place. Dirs are recreated (left writable, as
+/// copy_canonical leaves them, so the scratch can still be cleaned up — unlinking a hardlink
+/// needs no file-write bit) and symlinks recreated. A hardlink that can't be made here (another
+/// device, the link-count cap, `fs.protected_hardlinks`, a filesystem without hardlinks) falls
+/// back to a copy; copy_canonical surfaces its own error if it also fails.
+fn link_canonical(src: &Path, dst: &Path) -> Result<(), String> {
+    use std::os::unix::fs::{symlink, PermissionsExt};
+    let md = std::fs::symlink_metadata(src).map_err(|e| format!("{}: {e}", src.display()))?;
+    let ft = md.file_type();
+    if ft.is_symlink() {
+        let target = std::fs::read_link(src).map_err(|e| format!("{}: {e}", src.display()))?;
+        symlink(&target, dst).map_err(|e| format!("{}: {e}", dst.display()))?;
+    } else if ft.is_dir() {
+        std::fs::create_dir(dst).map_err(|e| format!("{}: {e}", dst.display()))?;
+        for entry in std::fs::read_dir(src).map_err(|e| format!("{}: {e}", src.display()))? {
+            let entry = entry.map_err(|e| e.to_string())?;
+            link_canonical(&entry.path(), &dst.join(entry.file_name()))?;
+        }
+    } else {
+        let perm = md.permissions().mode() & 0o7777;
+        // Share the inode only for a canonical, immutable file; else copy so DST is
+        // canonicalized and owns independent bytes. A hardlink refused by the environment
+        // (EXDEV/EMLINK/EPERM/EOPNOTSUPP/…) falls back to the same copy.
+        if (perm == 0o444 || perm == 0o555) && std::fs::hard_link(src, dst).is_ok() {
+            return Ok(());
+        }
+        copy_canonical(src, dst)?;
+    }
+    Ok(())
+}
+
+/// Atomic hardlink staging — `commit_canonical_atomic` with `link_canonical` in place of the
+/// byte copy: stage into a sibling temp, then rename into place, so a kill before the rename
+/// never leaves a partial tree at DEST. `link_canonical` self-selects hardlink vs copy per file
+/// (canonical sources share the inode, others are copied), so DST is always canonical. DEST
+/// must be absent (the caller handles an existing DEST).
+fn commit_link_atomic(src: &Path, dest: &Path) -> Result<(), String> {
+    let tmp = commit_temp_path(dest)?;
+    remove_store_path(&tmp)?; // clear this pid's own stale temp from an earlier crash
+    if let Err(e) = link_canonical(src, &tmp) {
+        let _ = remove_store_path(&tmp);
+        return Err(e);
+    }
+    std::fs::rename(&tmp, dest).map_err(|e| {
+        let _ = remove_store_path(&tmp);
+        format!("commit rename {} -> {}: {e}", tmp.display(), dest.display())
+    })
+}
+
 /// Remove PATH (file, dir, or symlink) if present; a missing path is not an error. Never
 /// follows a symlink — removes the link itself.
 fn remove_store_path(path: &Path) -> Result<(), String> {
@@ -993,11 +1048,18 @@ fn read_registered_paths(db: &Path) -> Result<std::collections::HashSet<String>,
 /// UNREGISTERED mismatch is a torn tree an interrupted commit left behind (its DB
 /// registration never ran) and is recovered — removed and re-committed — rather than
 /// wedging the shared cache forever.
+///
+/// When `link` is set the staging HARDLINKS SRC's files (`commit_link_atomic`) instead of
+/// copying their bytes — for staging an immutable store tree onto the same filesystem (the
+/// per-invocation td-store); the existing-DEST re-hash / torn-orphan recovery above is
+/// identical either way. `link=false` byte-copies (the durable persistent-store commit,
+/// whose scratch source is discarded).
 fn commit_tree_checked(
     src: &Path,
     dest: &Path,
     expected: &str,
     registered: bool,
+    link: bool,
 ) -> Result<(), String> {
     // Only a NotFound dest is genuinely absent; any other metadata error must surface, never be
     // read as "absent" — that would rename over a registered path we simply could not stat.
@@ -1023,7 +1085,11 @@ fn commit_tree_checked(
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => return Err(format!("stat {}: {e}", dest.display())),
     }
-    commit_canonical_atomic(src, dest)
+    if link {
+        commit_link_atomic(src, dest)
+    } else {
+        commit_canonical_atomic(src, dest)
+    }
 }
 
 /// One built output's post-build registration facts — the daemon's per-path
@@ -1485,8 +1551,9 @@ fn commit_scratch_to_store(scratch: &Path, store_dir: &str, db: &Path) -> Result
         }
         let dest = Path::new(store_dir).join(base);
         // Commit atomically and fail closed only on a REGISTERED mismatch (a torn orphan is
-        // recovered) — see commit_tree_checked.
-        commit_tree_checked(&src, &dest, &r.nar_hash, registered.contains(&r.store_path))?;
+        // recovered) — see commit_tree_checked. Byte-COPY (link=false): this is the durable
+        // store, and its scratch source is discarded, so it must own independent bytes.
+        commit_tree_checked(&src, &dest, &r.nar_hash, registered.contains(&r.store_path), false)?;
         committed.push(r.store_path.clone());
     }
     merge_output_db(db, &regs)?;
@@ -1510,6 +1577,57 @@ fn commit_scratch_to_store(scratch: &Path, store_dir: &str, db: &Path) -> Result
     Ok(committed)
 }
 
+/// VERIFY a store's on-disk integrity: re-NAR-hash every registered path (a `ValidPaths` row
+/// carrying a recorded hash) at STORE_ROOT/<basename> and report any whose content no longer
+/// matches — the daemon's `guix gc --verify --check-contents`, in pure Rust. This is the
+/// out-of-band integrity check the warm reuse path deliberately SKIPS for speed; run it when
+/// you want to detect store rot/corruption. `Ok` lists a one-line summary; `Err` lists the
+/// mismatches (or reports an empty/hashless store). Backs the `store-verify` CLI verb.
+fn store_verify_paths(db_path: &str, store_root: &str) -> Result<Vec<String>, String> {
+    use store_db_read::{Db, Value};
+    let bytes = std::fs::read(db_path).map_err(|e| e.to_string())?;
+    let db = Db::open(bytes)?;
+    let mut mismatches = Vec::new();
+    let mut checked = 0u64;
+    for (_rowid, cols) in db.table("ValidPaths")? {
+        // Only paths with a recorded hash (skip scaffolding rows).
+        let (path, recorded) = match (cols.get(1), cols.get(2)) {
+            (Some(Value::Text(p)), Some(Value::Text(h))) => (p, h),
+            _ => continue,
+        };
+        checked += 1;
+        // Only a store-shaped basename (`<32-digest>-<name>`) may be joined to STORE-ROOT: a row
+        // whose path is empty / `.` / `..` / non-store-shaped must NEVER resolve to the store
+        // root or its parent (which `rsplit('/')` alone would hash) — record it and keep going.
+        let base = match store::name_from_store_path(path).and(path.rsplit('/').next()) {
+            Some(b) => b,
+            None => {
+                mismatches.push(format!("{path}: not a store-shaped path"));
+                continue;
+            }
+        };
+        let location = Path::new(store_root).join(base);
+        // A missing/unreadable path IS store rot — record it and keep verifying the rest,
+        // rather than aborting the whole fsck on the first bad path.
+        match nar_hash_path(&location) {
+            Ok(got) if &got == recorded => {}
+            Ok(got) => mismatches.push(format!("{path}: recorded {recorded} got {got}")),
+            Err(e) => mismatches.push(format!("{path}: cannot hash {}: {e}", location.display())),
+        }
+    }
+    if checked == 0 {
+        Err("no registered paths with a recorded hash to verify".to_string())
+    } else if mismatches.is_empty() {
+        Ok(vec![format!("verified {checked} paths")])
+    } else {
+        Err(format!(
+            "{} of {checked} paths FAILED verification:\n{}",
+            mismatches.len(),
+            mismatches.join("\n")
+        ))
+    }
+}
+
 /// The receipt SIDECAR of a persistent store db: `<db>.receipts/<drv-basename>.receipt`,
 /// written by `commit_scratch_to_store` from the receipt the engine issued at build
 /// time, keyed by the producing drv's store basename (content-addressed, so one
@@ -1527,18 +1645,103 @@ fn persist_receipt_path(persist_db: &Path, deriver: &str) -> Option<std::path::P
     Some(Path::new(&dir).join(format!("{base}.receipt")))
 }
 
+/// The parsed, PATH-INDEXED view of a persistent store db a warm hit needs: fully-registered
+/// paths → (nar-hash, nar-size, deriver), plus the reference edges. Reading + parsing the whole
+/// db and rebuilding these maps ONCE PER RUNG is the dominant per-rung cost of a warm
+/// `build-plan` climb (the db grows with the store), so `persist_index` memoizes the last db it
+/// parsed and reuses it while the db is byte-for-byte unchanged.
+struct PersistIndex {
+    /// store path -> (nar-hash, nar-size, deriver), for rows carrying a recorded hash.
+    full: std::collections::HashMap<String, (String, u64, String)>,
+    /// store path -> its reference edges.
+    refs: std::collections::HashMap<String, Vec<String>>,
+}
+
+/// Cache key: a db is unchanged iff its (path, dev, inode, len, mtime) are. Every commit rewrites
+/// the db via `write_atomic` (temp + RENAME), so dev+inode changes on any rewrite even when len or
+/// a coarse mtime don't; len+mtime just corroborate. A stale key only ever causes a safe spurious
+/// MISS — reuse identity is re-gated against the freshly-read receipt, never the cache.
+type PersistKey = (std::path::PathBuf, u64, u64, u64, Option<std::time::SystemTime>);
+
+/// The `persist_index` single-slot cache: the last-parsed db's key + its shared index.
+type PersistCacheSlot = std::sync::Mutex<Option<(PersistKey, std::sync::Arc<PersistIndex>)>>;
+
+/// Parse + index PERSIST_DB, reusing the last parse while the db's (dev, inode, len, mtime) are
+/// unchanged (single-slot cache — a `build-plan` uses ONE persist db for the whole climb, so
+/// after the first rung every warm hit is an in-memory lookup). A missing db is `Ok(None)` (a
+/// cold cache / first build). A poisoned lock is recovered (the cached Option is always a
+/// consistent value), so a panic elsewhere never permanently disables the cache; the parse
+/// itself runs OUTSIDE the lock, never holding it across I/O.
+fn persist_index(persist_db: &Path) -> Result<Option<std::sync::Arc<PersistIndex>>, String> {
+    use std::os::unix::fs::MetadataExt;
+    use store_db_read::{Db, Value as RV};
+    let meta = match std::fs::metadata(persist_db) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(format!("stat {}: {e}", persist_db.display())),
+    };
+    let key: PersistKey = (
+        persist_db.to_path_buf(),
+        meta.dev(),
+        meta.ino(),
+        meta.len(),
+        meta.modified().ok(),
+    );
+    static CACHE: std::sync::OnceLock<PersistCacheSlot> = std::sync::OnceLock::new();
+    let cell = CACHE.get_or_init(|| std::sync::Mutex::new(None));
+    {
+        let guard = cell.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((k, idx)) = guard.as_ref() {
+            if *k == key {
+                return Ok(Some(std::sync::Arc::clone(idx)));
+            }
+        }
+    }
+    let bytes =
+        std::fs::read(persist_db).map_err(|e| format!("read {}: {e}", persist_db.display()))?;
+    let db = Db::open(bytes)?;
+    let mut full = std::collections::HashMap::new();
+    for (_rid, cols) in db.table("ValidPaths")? {
+        if let (Some(RV::Text(p)), Some(RV::Text(h))) = (cols.get(1), cols.get(2)) {
+            if h.is_empty() {
+                continue;
+            }
+            let size = match cols.get(5) {
+                Some(RV::Int(s)) => u64::try_from(*s).unwrap_or(0),
+                _ => 0,
+            };
+            let deriver = match cols.get(4) {
+                Some(RV::Text(d)) => d.clone(),
+                _ => String::new(),
+            };
+            full.insert(p.clone(), (h.clone(), size, deriver));
+        }
+    }
+    let refs = db.refs_by_path()?;
+    let idx = std::sync::Arc::new(PersistIndex { full, refs });
+    {
+        let mut guard = cell.lock().unwrap_or_else(|e| e.into_inner());
+        *guard = Some((key, std::sync::Arc::clone(&idx)));
+    }
+    Ok(Some(idx))
+}
+
 /// Persistent-store build cache — like `cached_realization`, but keyed on a PERSISTENT
 /// store (dir + accumulating DB) that survives ACROSS invocations (the incremental
 /// /td/store), and RECEIPT-GATED the same way (re #469 round-7): the reuse requires
 /// the engine-issued receipt sidecar for THIS derivation to match the CURRENT plan's
 /// identity (`ReceiptExpect`), every ValidPaths row to record THIS drv as its deriver
 /// (EXPECTED_DERIVER — a row minted for some other derivation, or with no deriver,
-/// vouches nothing here), the row hash to equal the receipt's, and the tree under
-/// PERSIST_STORE to re-serialize to it. Then each output tree is staged into
-/// SCRATCH/newstore and the read-back regs returned (the caller writes
-/// SCRATCH/registration + td.db from them) — so the build is SKIPPED. Any
-/// missing/mismatched leg ⇒ None (rebuild), and any tree staged so far is unwound.
-/// The daemon's valid-path skip, sourced across process boundaries from an on-disk store.
+/// vouches nothing here), and the row hash to equal the receipt's. The reuse then TRUSTS
+/// the store: it does NOT re-serialize the tree to re-verify its bytes — that on-disk
+/// integrity check is the explicit `store-verify` fsck (`td-recipe-eval verify-store`),
+/// run out of band, never inline on the build/run hot path. So a warm hit skips the re-hash:
+/// each output tree is COPIED into SCRATCH/newstore (the durable cache must never share an
+/// inode with a scratch tree — build_plan hardlinks scratch into the operator-exposed tdstore)
+/// and the read-back regs returned (the caller writes SCRATCH/registration +
+/// td.db from them), so the build is SKIPPED. Any missing/identity-mismatched leg ⇒ None
+/// (rebuild), and any tree staged so far is unwound. The daemon's valid-path skip, sourced
+/// across process boundaries from an on-disk store.
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
 fn persistent_realization(
     parsed: &drv::Derivation,
@@ -1548,12 +1751,6 @@ fn persistent_realization(
     expect: &ReceiptExpect,
     expected_deriver: &str,
 ) -> Result<Option<Vec<OutputReg>>, String> {
-    use store_db_read::{Db, Value as RV};
-    let bytes = match std::fs::read(persist_db) {
-        Ok(b) => b,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(format!("read {}: {e}", persist_db.display())),
-    };
     // The receipt gate: the sidecar for THIS derivation must exist and match the
     // CURRENT plan's identity, or the persistent entry is a miss (rebuild).
     let receipt_hashes = match persist_receipt_path(persist_db, expected_deriver)
@@ -1565,27 +1762,13 @@ fn persistent_realization(
         },
         None => return Ok(None),
     };
-    let db = Db::open(bytes)?;
-    // Fully-registered paths (hash present) → (hash, narSize, deriver).
-    let mut full: std::collections::HashMap<String, (String, u64, String)> =
-        std::collections::HashMap::new();
-    for (_rid, cols) in db.table("ValidPaths")? {
-        if let (Some(RV::Text(p)), Some(RV::Text(h))) = (cols.get(1), cols.get(2)) {
-            if h.is_empty() {
-                continue;
-            }
-            let size = match cols.get(5) {
-                Some(RV::Int(s)) => *s as u64,
-                _ => 0,
-            };
-            let deriver = match cols.get(4) {
-                Some(RV::Text(d)) => d.clone(),
-                _ => String::new(),
-            };
-            full.insert(p.clone(), (h.clone(), size, deriver));
-        }
-    }
-    let refs_map = db.refs_by_path()?;
+    // The db's path-indexed view (memoized across rungs — see persist_index). `full` maps a
+    // fully-registered path → (hash, narSize, deriver); `refs` its edges. A missing db is a
+    // cold cache: miss.
+    let idx = match persist_index(persist_db)? {
+        Some(i) => i,
+        None => return Ok(None),
+    };
     let newstore = scratch.join("newstore");
     std::fs::create_dir_all(&newstore).map_err(|e| e.to_string())?;
     let mut out: Vec<OutputReg> = Vec::with_capacity(parsed.outputs.len());
@@ -1598,7 +1781,7 @@ fn persistent_realization(
         }
     }
     for o in &parsed.outputs {
-        let (hash, size, deriver) = match full.get(&o.path) {
+        let (hash, size, deriver) = match idx.full.get(&o.path) {
             Some(x) => x.clone(),
             None => {
                 unwind(&staged);
@@ -1625,21 +1808,25 @@ fn persistent_realization(
             unwind(&staged);
             return Ok(None);
         }
-        let refs: Vec<String> = refs_map.get(&o.path).cloned().unwrap_or_default();
-        // Integrity: the persistent tree must re-serialize to the recorded hash — a
-        // corrupt/partial persistent entry is a MISS (rebuild), never trusted.
-        let mut scanner = scan::Scanner::new(&refs).map_err(|e| e.to_string())?;
-        nar::write_nar(&mut scanner, &src).map_err(|e| e.to_string())?;
-        let (got, _, _) = scanner.finish();
-        if got != hash {
-            unwind(&staged);
-            return Ok(None);
-        }
+        let refs: Vec<String> = idx.refs.get(&o.path).cloned().unwrap_or_default();
+        // Reuse TRUSTS the store — the receipt + ValidPaths row + deriver already gate this
+        // tree to THIS drv, so a warm hit skips the NAR re-serialization. On-disk rot of an
+        // already-committed tree is caught out of band by the explicit `store-verify` fsck
+        // (`td-recipe-eval verify-store`), never inline on this hot path.
         let dest = newstore.join(base);
         if dest.exists() {
             let _ = std::fs::remove_dir_all(&dest);
         }
-        copy_canonical(&src, &dest)?;
+        // COPY (not hardlink) the durable cache tree into scratch: the durable persist store
+        // must never share an inode with a scratch tree, because build_plan hardlinks scratch
+        // into the OPERATOR-EXPOSED tdstore output. An inode shared cache->scratch->tdstore
+        // would let a modified exposed output poison the durable cache — which reuse now TRUSTS.
+        // The cheap hardlink stays on the ephemeral newstore->tdstore leg only (build_plan).
+        if let Err(e) = copy_canonical(&src, &dest) {
+            let _ = std::fs::remove_dir_all(&dest);
+            unwind(&staged);
+            return Err(e);
+        }
         staged.push(dest);
         out.push(OutputReg {
             store_path: o.path.clone(),
@@ -3793,8 +3980,9 @@ fn build_recipe(
     // store that survives ACROSS invocations (the /td/store the loop builds into). If
     // this exact (deterministic) drv's output is already a valid path there — a PRIOR
     // invocation built it, its receipt sidecar matches the identity above, its rows
-    // name THIS drv as deriver — and its tree re-verifies, read it back instead of
-    // rebuilding. The daemon's valid-path skip, backed by an on-disk store across
+    // name THIS drv as deriver — read it back instead of rebuilding, TRUSTING the store
+    // (the on-disk tree is not re-serialized here; that integrity check is the out-of-band
+    // `store-verify` fsck). The daemon's valid-path skip, backed by an on-disk store across
     // process boundaries.
     if let Some((ps, pd)) = persist {
         if let Some(regs) =
@@ -4735,10 +4923,12 @@ fn build_plan(
         // Atomically stage the step's output into the per-invocation td-store so a
         // downstream step can bind-mount it (a real dir, no symlink). This store has no
         // persistent db, so any already-present mismatch is a real in-invocation conflict:
-        // fail closed (registered = true), never a torn-orphan recovery.
+        // fail closed (registered = true), never a torn-orphan recovery. HARDLINK
+        // (link=true): both trees are on the same filesystem and immutable, so sharing the
+        // inode is safe and avoids a second full byte-copy of the (possibly huge) output.
         let physical = step_scratch.join("newstore").join(base);
         let dest = tdstore.join(base);
-        commit_tree_checked(&physical, &dest, &out.nar_hash, true)?;
+        commit_tree_checked(&physical, &dest, &out.nar_hash, true, true)?;
         built.insert(name.to_string(), out.store_path.clone());
         td_dbs.push((
             step_scratch.join("td.db").to_string_lossy().into_owned(),
@@ -8145,43 +8335,14 @@ fn main() -> ExitCode {
         // Exit 0 if every registered path verifies; exit 1 (listing the mismatches) if
         // any content differs from its recorded hash.
         Some("store-verify") if args.len() == 4 => {
-            let (db_path, store_root) = (&args[2], &args[3]);
-            let run = || -> Result<Vec<String>, String> {
-                use store_db_read::{Db, Value};
-                let bytes = std::fs::read(db_path).map_err(|e| e.to_string())?;
-                let db = Db::open(bytes)?;
-                let mut mismatches = Vec::new();
-                let mut checked = 0u64;
-                for (_rowid, cols) in db.table("ValidPaths")? {
-                    // Only paths with a recorded hash (skip scaffolding rows).
-                    let (path, recorded) = match (cols.get(1), cols.get(2)) {
-                        (Some(Value::Text(p)), Some(Value::Text(h))) => (p, h),
-                        _ => continue,
-                    };
-                    let base = path
-                        .rsplit('/')
-                        .next()
-                        .ok_or_else(|| format!("malformed path {path}"))?;
-                    let location = Path::new(store_root).join(base);
-                    let got = nar_hash_path(&location).map_err(|e| format!("{}: {e}", location.display()))?;
-                    checked += 1;
-                    if &got != recorded {
-                        mismatches.push(format!("{path}: recorded {recorded} got {got}"));
-                    }
-                }
-                if checked == 0 {
-                    Err("no registered paths with a recorded hash to verify".to_string())
-                } else if mismatches.is_empty() {
-                    Ok(vec![format!("verified {checked} paths")])
-                } else {
-                    Err(format!(
-                        "{} of {checked} paths FAILED verification:\n{}",
-                        mismatches.len(),
-                        mismatches.join("\n")
-                    ))
-                }
+            let verify = || -> Result<Vec<String>, String> {
+                // Hold the store commit lock so a concurrent committer can't rewrite the db/store
+                // mid-scan and yield a spurious mismatch. Self-protecting at the primitive,
+                // independent of the recipe-layer ladder lock the operator wrapper also holds.
+                let _commit_lock = lock_store_commit(Path::new(&args[2]))?;
+                store_verify_paths(&args[2], &args[3])
             };
-            match run() {
+            match verify() {
                 Ok(lines) => {
                     for l in lines {
                         println!("{l}");
@@ -9847,14 +10008,14 @@ daemon build START (2/2 active)
     }
 
     #[test]
-    fn persistent_realization_hits_stages_and_rejects_miss_or_corrupt() {
+    fn persistent_realization_hits_stages_and_rejects_identity_misses() {
         // The cross-invocation SKIP is RECEIPT-GATED (re #469 round-7): reuse needs
         // (a) the engine receipt sidecar for THIS drv matching the CURRENT plan
-        // identity, (b) rows whose deriver IS this drv, and (c) a tree that
-        // re-verifies. A valid row+tree without a receipt, a receipt for a
-        // different plan identity, rows minted for another deriver, an unknown
-        // output, or a tampered tree is a MISS (rebuild) — and a corrupt miss
-        // stages nothing.
+        // identity and (b) rows whose deriver IS this drv. A valid row+tree without a
+        // receipt, a receipt for a different plan identity, rows minted for another
+        // deriver, or an unknown output is a MISS (rebuild). Reuse TRUSTS the store's
+        // bytes — a tampered-but-registered tree still HITS (on-disk integrity is the
+        // separate `store-verify` fsck's job, not this hot path).
         let tmp = std::env::temp_dir().join(format!("td-persist-real-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
         let store = tmp.join("store");
@@ -9943,16 +10104,105 @@ daemon build START (2/2 active)
         .unwrap();
         assert!(miss.is_none(), "an unregistered output must be a MISS");
 
-        // CORRUPT: the tree no longer matches the registered hash → MISS, nothing staged.
+        // TAMPERED but still registered → HIT: reuse trusts the store (identity is gated by
+        // the receipt + row + deriver, NOT by re-hashing bytes). The reuse stages the tree as
+        // it finds it and returns the RECORDED regs; catching the tamper is `store-verify`'s
+        // job, exercised by `store_verify_catches_a_tampered_tree` below.
         std::fs::write(tree.join("bin/run"), b"tampered\n").unwrap();
-        let s3 = tmp.join("s-corrupt");
+        let s3 = tmp.join("s-tampered");
         std::fs::create_dir_all(&s3).unwrap();
-        let corrupt =
-            persistent_realization(&one_output_drv(&path), sd, &db, &s3, &expect, &deriver)
-                .unwrap();
-        assert!(corrupt.is_none(), "a tree that no longer matches its hash must be a MISS");
-        assert!(!s3.join("newstore").join(base).exists(), "a corrupt miss must not leave a staged tree");
+        let tampered = persistent_realization(&one_output_drv(&path), sd, &db, &s3, &expect, &deriver)
+            .unwrap()
+            .expect("reuse trusts the store: a tampered-but-registered tree still HITS");
+        assert_eq!(tampered[0].store_path, path);
+        assert_eq!(tampered[0].nar_hash, reg.nar_hash, "the HIT returns the RECORDED hash, not the tree's");
+        assert!(
+            s3.join("newstore").join(base).join("bin/run").exists(),
+            "the trusted tree is staged even though its bytes changed"
+        );
 
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn store_verify_catches_a_tampered_tree() {
+        // The integrity check the warm reuse path drops: a registered tree that is later
+        // tampered on disk verifies clean BEFORE the tamper and FAILS after.
+        let tmp = std::env::temp_dir().join(format!("td-store-verify-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let store = tmp.join("store");
+        let base = "00000000000000000000000000000abc-verify-demo-1";
+        let path = format!("/td/store/{base}");
+        let tree = store.join(base);
+        std::fs::create_dir_all(tree.join("bin")).unwrap();
+        std::fs::write(tree.join("bin/run"), b"#!/bin/sh\necho hi\n").unwrap();
+        let mut sc = scan::Scanner::new(&[]).unwrap();
+        nar::write_nar(&mut sc, &tree).unwrap();
+        let (hash, size, _) = sc.finish();
+        let reg = OutputReg {
+            store_path: path.clone(),
+            nar_hash: hash,
+            nar_size: size,
+            refs: vec![],
+            deriver: format!("{path}.drv"),
+        };
+        let db = tmp.join("db");
+        std::fs::write(&db, merge_regs(None, std::slice::from_ref(&reg)).unwrap()).unwrap();
+        let (dbs, roots) = (db.to_str().unwrap(), store.to_str().unwrap());
+
+        // Intact store verifies clean.
+        assert!(store_verify_paths(dbs, roots).is_ok(), "an intact store must verify");
+
+        // Tamper the tree; the fsck now FAILS (the reuse path would have trusted it).
+        std::fs::write(tree.join("bin/run"), b"tampered\n").unwrap();
+        let err = store_verify_paths(dbs, roots).expect_err("a tampered tree must fail verification");
+        assert!(err.contains("FAILED verification"), "unexpected error: {err}");
+        assert!(err.contains(&path), "the failure must name the tampered path");
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn link_canonical_hardlinks_canonical_copies_noncanonical() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let tmp = std::env::temp_dir().join(format!("td-linkcanon-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let src = tmp.join("src");
+        std::fs::create_dir_all(src.join("bin")).unwrap();
+        // A CANONICAL (0444) file — hardlinked (shared inode); a NON-canonical (0644) file —
+        // copied (canonicalized, independent inode), so DST never shares a writable inode.
+        std::fs::write(src.join("bin/run"), b"hi\n").unwrap();
+        std::fs::set_permissions(src.join("bin/run"), std::fs::Permissions::from_mode(0o444)).unwrap();
+        std::fs::write(src.join("bin/raw"), b"raw\n").unwrap();
+        std::fs::set_permissions(src.join("bin/raw"), std::fs::Permissions::from_mode(0o644)).unwrap();
+        std::os::unix::fs::symlink("bin/run", src.join("link")).unwrap();
+        let dst = tmp.join("dst");
+        link_canonical(&src, &dst).unwrap();
+        // Canonical file: hardlinked (shared inode), same bytes.
+        assert_eq!(
+            std::fs::metadata(src.join("bin/run")).unwrap().ino(),
+            std::fs::metadata(dst.join("bin/run")).unwrap().ino(),
+            "a canonical 0444 file must be hardlinked (shared inode)"
+        );
+        assert_eq!(std::fs::read(dst.join("bin/run")).unwrap(), b"hi\n");
+        // Non-canonical file: COPIED (distinct inode) and canonicalized to 0444.
+        assert_ne!(
+            std::fs::metadata(src.join("bin/raw")).unwrap().ino(),
+            std::fs::metadata(dst.join("bin/raw")).unwrap().ino(),
+            "a non-canonical 0644 file must be copied, not hardlinked"
+        );
+        assert_eq!(
+            std::fs::metadata(dst.join("bin/raw")).unwrap().permissions().mode() & 0o7777,
+            0o444,
+            "the copied file is canonicalized to 0444"
+        );
+        // Symlink recreated verbatim (not followed).
+        let lm = std::fs::symlink_metadata(dst.join("link")).unwrap();
+        assert!(lm.file_type().is_symlink(), "the symlink must be recreated as a symlink");
+        assert_eq!(
+            std::fs::read_link(dst.join("link")).unwrap(),
+            std::path::Path::new("bin/run")
+        );
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
@@ -11713,12 +11963,12 @@ daemon build START (2/2 active)
         let want = nar_hash_path(&src).unwrap();
 
         // Absent dest -> a plain (atomic) copy, NAR-identical to the source, no staging temp.
-        commit_tree_checked(&src, &dst, &want, false).unwrap();
+        commit_tree_checked(&src, &dst, &want, false, false).unwrap();
         assert_eq!(nar_hash_path(&dst).unwrap(), want, "absent dest copied");
         assert!(!has_commit_temp(&base), "no staging temp left after a clean commit");
 
         // Present dest with the SAME bytes -> idempotent skip, no error, no change.
-        commit_tree_checked(&src, &dst, &want, false).unwrap();
+        commit_tree_checked(&src, &dst, &want, false, false).unwrap();
         assert_eq!(nar_hash_path(&dst).unwrap(), want, "matching dest unchanged");
 
         // Present REGISTERED dest with DIFFERENT bytes at the SAME (ABI-token) path -> fail
@@ -11726,10 +11976,35 @@ daemon build START (2/2 active)
         let stale = base.join("stale");
         std::fs::create_dir_all(&stale).unwrap();
         std::fs::write(stale.join("out"), b"stale-different-bytes").unwrap();
-        let err = commit_tree_checked(&src, &stale, &want, true).unwrap_err();
+        let err = commit_tree_checked(&src, &stale, &want, true, false).unwrap_err();
         assert!(err.contains("BUILDER_ABI"), "mismatch must demand an ABI bump: {err}");
         assert_ne!(nar_hash_path(&stale).unwrap(), want, "stale dest left intact");
 
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    // link=true stages a CANONICAL immutable tree by HARDLINK (the per-invocation td-store
+    // path): the committed file is NAR-identical AND shares the source's inode, with no leaked
+    // temp.
+    #[test]
+    fn commit_tree_checked_link_hardlinks_into_fresh_dest() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let base = std::env::temp_dir().join(format!("td-ctc-link-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let src = base.join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("out"), b"linked-bytes").unwrap();
+        std::fs::set_permissions(src.join("out"), std::fs::Permissions::from_mode(0o444)).unwrap();
+        let want = nar_hash_path(&src).unwrap();
+        let dst = base.join("dst");
+        commit_tree_checked(&src, &dst, &want, false, true).unwrap();
+        assert_eq!(nar_hash_path(&dst).unwrap(), want, "linked dest is NAR-identical");
+        assert_eq!(
+            std::fs::metadata(src.join("out")).unwrap().ino(),
+            std::fs::metadata(dst.join("out")).unwrap().ino(),
+            "link=true shares a canonical file's inode (hardlink)"
+        );
+        assert!(!has_commit_temp(&base), "no staging temp left after a clean linked commit");
         let _ = std::fs::remove_dir_all(&base);
     }
 
@@ -11764,7 +12039,7 @@ daemon build START (2/2 active)
         assert_ne!(nar_hash_path(&dest).unwrap(), want, "precondition: dest is torn");
 
         // Unregistered mismatch -> recovered: the orphan is replaced with the real tree.
-        commit_tree_checked(&src, &dest, &want, false).unwrap();
+        commit_tree_checked(&src, &dest, &want, false, false).unwrap();
         assert_eq!(nar_hash_path(&dest).unwrap(), want, "torn orphan recovered to the real tree");
         assert!(!has_commit_temp(&base), "recovery leaves no staging temp");
         let _ = std::fs::remove_dir_all(&base);

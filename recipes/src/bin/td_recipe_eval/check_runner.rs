@@ -66,6 +66,22 @@ pub fn cli(args: &[String]) -> Result<(), String> {
 ///     machine simply has none). Resolved the same way the loop exposes it.
 /// Resolves the SAME ladder tree `new()` builds into: the one shared ladder under
 /// `~/.td/build-daemon` (HOME-derived).
+/// `verify-store`: run the persistent build cache's integrity fsck (`td-builder store-verify`)
+/// against THIS ladder's build cache — the on-disk check the warm reuse path skips. Opt-in and
+/// separate from `run`, so a build/boot never pays for it; run it explicitly to detect rot.
+pub fn verify_store_cli(args: &[String]) -> Result<(), String> {
+    if !args.is_empty() {
+        return Err("usage: verify-store".to_string());
+    }
+    let root = env::current_dir().map_err(|e| format!("current dir: {e}"))?;
+    let runner = RecipeCheckRunner::new(root, &scratch_name("verify-store", &[]))?;
+    // Hold the ladder lock across the fsck so it sees a stable cache: a concurrent build
+    // commit or a `clear-store` would otherwise race the re-hash (spurious "corruption") or
+    // swap the whole cache out from under it. Same lock `run`/`clear-store` take.
+    let _lock = lock_file(&runner.lock_path())?;
+    runner.verify_store()
+}
+
 pub fn clear_store_cli(args: &[String]) -> Result<(), String> {
     if !args.is_empty() {
         return Err("usage: clear-store".to_string());
@@ -790,6 +806,34 @@ impl RecipeCheckRunner {
     /// This ladder's dedicated build-output cache (store, db) — see `build_cache_paths`.
     fn build_cache_paths(&self) -> (PathBuf, PathBuf) {
         build_cache_paths(&self.lw)
+    }
+
+    /// Re-verify every registered path in this ladder's persistent build cache against its
+    /// recorded NAR hash (the builder's `store-verify` fsck) — the on-disk integrity check the
+    /// warm build/run REUSE path deliberately skips for speed (it trusts the receipt + db row).
+    /// Explicit and opt-in: run it when you want to detect store rot/corruption. Streams the
+    /// builder's own output; errs if the cache is absent or any path fails to verify.
+    pub(crate) fn verify_store(&self) -> Result<(), String> {
+        let (store, db) = self.build_cache_paths();
+        if !db.exists() {
+            return Err(format!(
+                "no persistent build cache to verify at {} — build the ladder first \
+                 (e.g. `td-recipe-eval run system-x86-64`)",
+                db.display()
+            ));
+        }
+        let mut cmd = self.builder_command();
+        cmd.arg("store-verify")
+            .arg(path_str(&db)?)
+            .arg(path_str(&store)?);
+        let status = cmd
+            .status()
+            .map_err(|e| format!("spawn td-builder store-verify: {e}"))?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err(format!("td-builder store-verify failed ({status})"))
+        }
     }
 
     /// The stable per-cache commit lock, shared with the builder's commit transaction
