@@ -283,11 +283,15 @@ jemalloc = false
         exec: false,
     });
 
+    // Build the `library` alias, not `library/std`: only a path ending in `library`
+    // expands to the full sysroot (std + proc_macro + test); `library/std` narrows to
+    // `-p std` and ships a sysroot with no libproc_macro/libtest.
+    //
     // Tee bootstrap's progress to a log kept outside {out} so the post-build check
     // can assert on it. A status file carries x.py's real exit code across the pipe
     // (this bash has neither `pipefail` nor `PIPESTATUS`).
     let xpy = format!(
-        "( {py} x.py build --stage 2 library/std compiler/rustc src/tools/rustdoc \
+        "( {py} x.py build --stage 2 library compiler/rustc src/tools/rustdoc \
          src/tools/cargo; echo $? > '{{root}}/x-py-status' ) 2>&1 | tee '{{root}}/x-py-build.log'; \
          exit \"$(cat '{{root}}/x-py-status')\""
     );
@@ -381,7 +385,9 @@ jemalloc = false
             &[
                 SH,
                 "-c",
-                "readelf -l '{out}/bin/rustc' | grep -F '{in:glibc-x86-64}' >/dev/null || { echo 'stage2 rustc does not use td glibc' >&2; exit 1; }; \
+                "ls '{out}'/lib/rustlib/x86_64-unknown-linux-gnu/lib/libproc_macro-*.rlib >/dev/null 2>&1 || { echo 'shipped sysroot is missing libproc_macro: x.py must build the `library` alias, not `library/std`' >&2; exit 1; }; \
+                 ls '{out}'/lib/rustlib/x86_64-unknown-linux-gnu/lib/libtest-*.rlib >/dev/null 2>&1 || { echo 'shipped sysroot is missing libtest: x.py must build the `library` alias, not `library/std`' >&2; exit 1; }; \
+                 readelf -l '{out}/bin/rustc' | grep -F '{in:glibc-x86-64}' >/dev/null || { echo 'stage2 rustc does not use td glibc' >&2; exit 1; }; \
                  readelf -d '{out}/bin/cargo' | grep -E 'libssl|libcrypto|libssh2' && { echo 'source Cargo retained a forbidden TLS/SSH native dependency' >&2; exit 1; } || :; \
                  for llvm in '{out}'/lib/libLLVM*.so*; do test ! -e \"$llvm\" || { echo 'stage2 copied a prebuilt/shared LLVM' >&2; exit 1; }; done; \
                  grep -R -a -F -l '{in:rust-stage0}' '{out}' >'{root}/stage0-refs' && { echo 'stage2 output references rust-stage0' >&2; exit 1; } || :",
@@ -458,5 +464,27 @@ mod tests {
                             && to == "{src}/vendor"
                 )
         ));
+    }
+
+    #[test]
+    fn stage2_builds_the_library_sysroot_alias_not_library_std() {
+        // The shipped sysroot must carry proc_macro + test, which x.py builds only when the
+        // stage-2 target path ends in the `library` alias; `library/std` narrows to `-p std`.
+        let steps = recipe().steps.expect("rust recipe steps");
+        let xpy = steps
+            .iter()
+            .find_map(|step| match step {
+                Step::Run { argv, .. } => argv.iter().find(|a| a.contains("x.py build --stage 2")),
+                _ => None,
+            })
+            .expect("stage-2 x.py build step");
+        assert!(
+            xpy.contains("--stage 2 library "),
+            "stage-2 x.py must build the `library` sysroot alias (got: {xpy})"
+        );
+        assert!(
+            !xpy.contains("library/std"),
+            "stage-2 x.py must NOT narrow to `library/std` (ships no proc_macro/test)"
+        );
     }
 }

@@ -546,7 +546,7 @@ fn shape_check() -> String {
      for f in passwd group shadow hostname os-release inittab profile autologin tty-session rootcheck; do \
          [ -f \"$root/etc/$f\" ] || { echo \"root tree: /etc/$f missing\" >&2; exit 1; }; \
      done; \
-     ls \"$root\"/td/store/*/bin/busybox >/dev/null 2>&1 || { echo 'root tree: the busybox binary is not packed under /td/store/<hash>/bin - the store-native /bin symlinks would all dangle' >&2; exit 1; }; \
+     rbb=\"{out}/root{in:busybox-x86-64}/bin/busybox\"; { [ -f \"$rbb\" ] && [ -x \"$rbb\" ]; } || { echo 'root tree: the busybox binary is not packed/executable at root{in:busybox-x86-64}/bin/busybox - the store-native /bin symlinks would all dangle' >&2; exit 1; }; \
      applets=$(\"$bb\" --list 2>/dev/null) || { echo 'busybox --list failed - cannot verify applet coverage' >&2; exit 1; }; \
      for a in @BUSYBOX_APPLETS@; do \
          printf '%s\\n' \"$applets\" | grep -q -x -F \"$a\" || { echo \"busybox does not implement applet '$a' (config drift) - its packed /bin/$a symlink would be a dead link\" >&2; exit 1; }; \
@@ -563,6 +563,10 @@ fn shape_check() -> String {
          [ -d \"$root$p\" ] || { echo \"root tree: uutils references store package '$p' (its interp/RUNPATH) which is NOT staged on the erofs root - the dynamic closure is incomplete (#547); add the package that provides it to native_inputs and CopyTree its store subtree onto the root\" >&2; miss=1; }; \
      done; \
      [ \"$miss\" = 0 ] || exit 1"
+        // The busybox check names the concrete `{in:busybox-x86-64}` path, not a
+        // `td/store/*/bin/busybox` glob: bash-mesboot 2.05b (this step's shell) can't expand
+        // a wildcard in a non-terminal path component.
+        //
         // Validate EVERY packed applet, not just the greeter-critical few (re #541, Codex
         // review). Names are all shell-safe identifiers, so a space-joined `for` list is
         // safe unquoted. uutils is dynamically linked and CANNOT be exec'd in the build
