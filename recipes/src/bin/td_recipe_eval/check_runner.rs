@@ -317,10 +317,11 @@ pub fn qemu_boot_erofs_cli(args: &[String]) -> Result<(), String> {
 /// boots its bzImage, initramfs.cpio, and root.erofs under host qemu with the
 /// autotest token on the kernel cmdline: stage-1 mounts the erofs root read-only over virtio-blk and
 /// `switch_root`s into it, the real-root init reaches the greeter, and the greeter self-
-/// exits so the VM powers off. It asserts the greeter, a read-only erofs `/`, tmpfs-backed
-/// writable dirs, and a clean power-off. UNLIKE `run`, this is a PASS/FAIL smoke test with
-/// no interactive terminal — host-side (never a gated check) for the same reason `qemu-boot`
-/// is: the daily sandbox has no host qemu. See checks/qemu_boot.rs.
+/// exits so the VM powers off. It asserts the greeter, immutable EROFS `/` and `/etc`,
+/// writable `/var`-backed state, and a clean power-off. UNLIKE `run`, this is a
+/// PASS/FAIL smoke test with no interactive terminal — host-side (never a gated check)
+/// for the same reason `qemu-boot` is: the daily sandbox has no host qemu. See
+/// checks/qemu_boot.rs.
 pub fn qemu_boot_system_cli(args: &[String]) -> Result<(), String> {
     const STEM: &str = "system-x86-64";
     let stem = args.first().map(String::as_str).unwrap_or(STEM);

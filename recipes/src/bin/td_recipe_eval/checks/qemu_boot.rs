@@ -82,10 +82,13 @@ const UUTILS_RUNTIME_MARKER: &str = td_recipe::ladder::UUTILS_RUNTIME_MARKER;
 /// the immutable erofs image, not a writable copy.
 const SYSTEM_ROOT_RO_MARKER: &str = td_recipe::ladder::SYSTEM_ROOT_RO_MARKER;
 
-/// The line `/etc/rootcheck` prints once it has confirmed the writable dirs
-/// (`/etc /var /run /tmp /home`) are tmpfs-backed and actually accept writes (re #550).
-/// Asserted by `qemu-boot-system` so a green result proves the overlays are live.
-const SYSTEM_WRITABLE_MARKER: &str = td_recipe::ladder::SYSTEM_WRITABLE_MARKER;
+/// Printed after root fails to create a probe below deployment-owned `/etc`.
+const SYSTEM_ETC_RO_MARKER: &str = td_recipe::ladder::SYSTEM_ETC_RO_MARKER;
+
+/// Printed after `/var`, `/run`, and `/tmp` are proven writable tmpfs mounts and
+/// the immutable `/home` and `/root` links resolve into writable `/var` state.
+const SYSTEM_STATE_WRITABLE_MARKER: &str =
+    td_recipe::ladder::SYSTEM_STATE_WRITABLE_MARKER;
 
 /// The kernel-cmdline token `qemu-boot-system` appends so the greeter self-exits and
 /// the VM powers off — a headless "exit powers off" proof with no terminal to type
@@ -254,11 +257,11 @@ pub(crate) fn run_erofs(runner: &RecipeCheckRunner) -> Result<(), String> {
 /// The kernel, stage-1 initramfs, and read-only EROFS root come from
 /// `system-x86-64`'s verified deployment bundle. The oracle attaches root.erofs
 /// as `/dev/vda` and boots stage-1 with the autotest token on the kernel
-/// cmdline. Stage-1 mounts the erofs root read-only, overlays tmpfs for the
-/// writable dirs, and `switch_root`s into it; the real-root init reaches the auto-login
+/// cmdline. Stage-1 mounts the erofs root read-only, mounts writable tmpfs state,
+/// and `switch_root`s into it; the real-root init reaches the auto-login
 /// greeter, which (seeing the autotest token) exits so the VM powers off. A green result
-/// asserts, in order: the greeter was reached, `/` is a read-only erofs mount, the
-/// writable dirs are tmpfs-backed, and the VM powered off cleanly on `exit`.
+/// asserts, in order: the greeter was reached, `/` and `/etc` are immutable, the
+/// `/var`-backed state paths are writable, and the VM powered off cleanly on `exit`.
 pub(crate) fn run_system(runner: &RecipeCheckRunner) -> Result<(), String> {
     // qemu first (fail fast if absent), then a single build of the complete
     // deployment artifact.
@@ -305,11 +308,20 @@ pub(crate) fn run_system(runner: &RecipeCheckRunner) -> Result<(), String> {
             tail(&result.console, 80)
         ));
     }
-    if !result.console.contains(SYSTEM_WRITABLE_MARKER) {
+    if !result.console.contains(SYSTEM_ETC_RO_MARKER) {
         return Err(format!(
-            "the greeter was reached but /etc/rootcheck did not confirm tmpfs-backed WRITABLE dirs \
-             ({SYSTEM_WRITABLE_MARKER:?} absent) — the /etc /var /run /tmp /home overlays are not \
-             tmpfs-backed or did not accept a write probe. Last serial output:\n{}",
+            "the greeter was reached but /etc/rootcheck did not confirm immutable deployment config \
+             ({SYSTEM_ETC_RO_MARKER:?} absent) — root could write below /etc or the check did not run. \
+             Last serial output:\n{}",
+            tail(&result.console, 80)
+        ));
+    }
+    if !result.console.contains(SYSTEM_STATE_WRITABLE_MARKER) {
+        return Err(format!(
+            "the greeter was reached but /etc/rootcheck did not confirm writable state \
+             ({SYSTEM_STATE_WRITABLE_MARKER:?} absent) — /var, /run, or /tmp is not a tmpfs mount, \
+             a state path rejected its write probe, or /home and /root do not point into /var. \
+             A configured home ownership change may also have failed. Last serial output:\n{}",
             tail(&result.console, 80)
         ));
     }
@@ -341,7 +353,7 @@ pub(crate) fn run_system(runner: &RecipeCheckRunner) -> Result<(), String> {
     }
     if !result.exited_clean {
         return Err(format!(
-            "the greeter was reached and both root checks passed, but the VM did not power off cleanly \
+            "the greeter was reached and the root checks passed, but the VM did not power off cleanly \
              on the autotest `exit` — {} (the `exit`-powers-off path regressed: getty/login did not \
              return 0, or `reboot -f` did not fire). Last serial output:\n{}",
             result.reason,
@@ -351,8 +363,9 @@ pub(crate) fn run_system(runner: &RecipeCheckRunner) -> Result<(), String> {
     println!(
         "PASS: system-x86-64 boots TWO-STAGE under qemu (TCG) — stage-1 mounts the td-written erofs root \
          read-only over virtio-blk, switch_root enters it, and the real-root init reaches the greeter \
-         ({GREETER_MARKER}); `/` is a read-only erofs mount ({SYSTEM_ROOT_RO_MARKER}), the writable dirs \
-         are tmpfs-backed ({SYSTEM_WRITABLE_MARKER}), a uutils applet runs from the erofs closure \
+         ({GREETER_MARKER}); `/` is a read-only erofs mount ({SYSTEM_ROOT_RO_MARKER}), `/etc` remains \
+         immutable ({SYSTEM_ETC_RO_MARKER}), `/var`-backed state is writable \
+         ({SYSTEM_STATE_WRITABLE_MARKER}), a uutils applet runs from the erofs closure \
          ({UUTILS_RUNTIME_MARKER}), and `exit` powers the VM off cleanly"
     );
     Ok(())
@@ -1106,6 +1119,18 @@ mod tests {
             EROFS_MARKER.as_bytes()
         ));
         assert!(!contains(b"only TD-USERLAND-OK here", EROFS_MARKER.as_bytes()));
+    }
+
+    #[test]
+    fn system_boot_markers_are_distinct() {
+        let markers = std::collections::BTreeSet::from([
+            GREETER_MARKER,
+            SYSTEM_ROOT_RO_MARKER,
+            SYSTEM_ETC_RO_MARKER,
+            SYSTEM_STATE_WRITABLE_MARKER,
+            UUTILS_RUNTIME_MARKER,
+        ]);
+        assert_eq!(markers.len(), 5, "each system assertion needs its own marker");
     }
 
     #[test]

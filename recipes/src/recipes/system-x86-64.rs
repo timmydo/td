@@ -1,6 +1,7 @@
 use crate::ladder::{
     mesboot0_inputs, mesboot0_path, AUTOTEST_CMDLINE_TOKEN, GREETER_MARKER, SH,
-    SYSTEM_ROOT_RO_MARKER, SYSTEM_WRITABLE_MARKER, UUTILS_RUNTIME_MARKER,
+    SYSTEM_ETC_RO_MARKER, SYSTEM_ROOT_RO_MARKER, SYSTEM_STATE_WRITABLE_MARKER,
+    UUTILS_RUNTIME_MARKER,
 };
 use crate::types::{Recipe, Step};
 
@@ -14,8 +15,9 @@ use crate::types::{Recipe, Step};
 //   deployment/{bzImage,initramfs.cpio,root.erofs,manifest}
 //
 // Stage 1 is a tiny initramfs: static busybox plus a `/init` script that mounts
-// root.erofs read-only from virtio-blk, overlays tmpfs for `/etc /var /home`,
-// mounts fresh tmpfs at `/run /tmp`, then switch_roots into stage 2. Stage 2 is
+// root.erofs read-only from virtio-blk, mounts writable tmpfs at `/var /run /tmp`,
+// then switch_roots into stage 2. `/etc` stays deployment-owned and immutable;
+// `/home` and `/root` are root-image symlinks into `/var`. Stage 2 is
 // the store-native real root (busybox and uutils at their /td/store paths, a
 // /bin symlink farm, and generated /etc). The typed PackErofs step invokes the
 // dependency-free control-plane image writer directly; no recipe process can
@@ -37,9 +39,8 @@ use crate::types::{Recipe, Step};
 // Layout: the image is STORE-NATIVE. The busybox binary is packed at its
 // content-addressed /td/store/<hash>-busybox-x86-64/bin path, and /bin is a PURE symlink
 // farm whose every entry (and /init) points straight into that store path. There is no
-// /usr and no /sbin. The only non-store files are generated system config under /etc
-// (passwd/group/shadow/inittab/os-release/profile, plus the login-glue scripts autologin,
-// tty-session, and the boot self-check rootcheck), referenced by absolute path.
+// /usr and no /sbin. Generated system config lives under immutable /etc; the other
+// non-store root entries are mountpoints plus /home and /root links into /var.
 
 /// One account materialised into `/etc/passwd`, `/etc/group`, `/etc/shadow`, and a
 /// home directory. `passwordless` writes an EMPTY shadow password — convenient for
@@ -72,6 +73,22 @@ struct SystemDef {
     /// The user busybox getty auto-logs-in on ttyS0 (no password prompt).
     autologin: &'static str,
     users: &'static [User],
+}
+
+#[cfg(test)]
+fn valid_home(uid: u32, home: &str) -> bool {
+    // Home strings are embedded unquoted in generated PID-1 shell.
+    if uid == 0 {
+        return home == "/root";
+    }
+    home.strip_prefix("/home/").is_some_and(|name| {
+        name != "."
+            && name != ".."
+            && !name.is_empty()
+            && name.bytes().all(|byte| {
+                byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-')
+            })
+    })
 }
 
 // ── EDIT THIS to tailor the distro ─────────────────────────────────────────────
@@ -140,7 +157,7 @@ const SYSTEM: SystemDef = SystemDef {
 const BUSYBOX_APPLETS: &[&str] = &[
     "sh", "ash", "getty", "login", "init", "mount", "umount", "switch_root", "reboot",
     "poweroff", "halt", "hostname", "ps", "clear", "dmesg", "free", "kill", "vi",
-    "less", "more", "grep", "sed", "awk", "cttyhack", "su", "which",
+    "less", "more", "grep", "sed", "awk", "cttyhack", "su", "which", "readlink",
 ];
 
 /// The core file/text userland, served by the uutils `coreutils` multicall (#547). Every
@@ -205,9 +222,9 @@ fn build_inittab() -> String {
     // stage-1 `switch_root`ed into it: init re-mounts the pseudo-filesystems (devtmpfs,
     // proc, sysfs) on the erofs root's empty mountpoint dirs — mounting over a read-only
     // dir is a VFS overlay, no write to the erofs — then runs the boot self-check and
-    // the auto-login getty. It does NOT mount /tmp or /run: stage-1 already mounted those
-    // as tmpfs (they survived switch_root's mount-move), which is also what backs the
-    // writable overlays. /proc must precede /etc/rootcheck (which reads /proc/mounts).
+    // the auto-login getty. It does NOT mount /var, /tmp, or /run: stage-1 already
+    // mounted those as tmpfs, and switch_root preserves the mounts. /proc must precede
+    // /etc/rootcheck (which reads /proc/mounts).
     "::sysinit:/bin/mount -t devtmpfs devtmpfs /dev\n\
      ::sysinit:/bin/mount -t proc proc /proc\n\
      ::sysinit:/bin/mount -t sysfs sysfs /sys\n\
@@ -221,42 +238,43 @@ fn build_inittab() -> String {
 
 /// The stage-1 init-initramfs `/init` (re #550): the FIRST userspace, run by the kernel
 /// as PID 1 from the `init.cpio` initramfs. It mounts the read-only erofs store root over
-/// virtio-blk, sets up the writable tmpfs overlays, then `switch_root`s into the real
+/// virtio-blk, mounts the writable tmpfs filesystems, then `switch_root`s into the real
 /// root. Static busybox with NO /bin PATH yet, so every applet is reached explicitly as
 /// `/bin/busybox <applet>` (only `/bin/sh` and `/bin/busybox` are symlinked in the cpio);
 /// `echo`-free by design. The final line MUST be `exec` so switch_root inherits PID 1.
-fn build_stage1_init() -> String {
-    // Overlay backing lives on a tmpfs mounted at /sysroot/run — INSIDE the future root —
-    // so switch_root's mount-move carries the upper/work dirs cleanly (no orphaned mount
-    // dangling off the discarded initramfs). /run and /tmp become fresh tmpfs; /etc, /var
-    // and /home become overlays (lower = the read-only erofs dir, upper = tmpfs) so the
-    // packed base content (passwd, inittab, the user home) stays visible AND writable.
-    // erofs is inherently read-only; `-o ro` is belt-and-suspenders. The /dev/vda probe
-    // loop tolerates an async virtio-blk attach.
+fn build_stage1_init(sys: &SystemDef) -> String {
+    // /var is the one state mount. /home and /root are immutable symlinks into it, so
+    // replacing this tmpfs with a Btrfs @var mount does not change the real-root layout.
+    // /run and /tmp remain separate volatile tmpfs mounts. EROFS is inherently read-only;
+    // `-o ro` is belt-and-suspenders. The /dev/vda probe tolerates async virtio-blk attach.
     //
     // `set -e` makes the FIRST failing setup command abort the script — its error already
     // on the console (no 2>/dev/null) — rather than press on into a doomed or PARTIAL
-    // `switch_root`: a failed erofs/overlay mount then panics loudly (init exits) instead
+    // `switch_root`: a failed mount then panics loudly (init exits) instead
     // of booting a half-read-only system where some dirs silently aren't writable (re #550,
     // Codex review). The `while` probe condition is exempt from `set -e`, so a missing
     // /dev/vda still falls through to the erofs mount, which fails and aborts cleanly.
-    //
-    // /run is mounted 0755 (not tmpfs's default 1777) — it holds the overlay backing and
-    // matches a standard /run; /tmp keeps the default sticky 1777.
-    "#!/bin/sh\n\
+    let mut init = "#!/bin/sh\n\
      set -e\n\
      /bin/busybox mount -t devtmpfs dev /dev\n\
      n=0\n\
      while /bin/busybox test \"$n\" -lt 5 && ! /bin/busybox test -b /dev/vda; do /bin/busybox sleep 1; n=$((n+1)); done\n\
      /bin/busybox mount -t erofs -o ro /dev/vda /sysroot\n\
+     /bin/busybox mount -t tmpfs -o mode=0755 tmpfs /sysroot/var\n\
      /bin/busybox mount -t tmpfs -o mode=0755 tmpfs /sysroot/run\n\
-     /bin/busybox mount -t tmpfs tmpfs /sysroot/tmp\n\
-     for d in etc var home; do \
-     /bin/busybox mkdir -p /sysroot/run/.rw/$d /sysroot/run/.work/$d; \
-     /bin/busybox mount -t overlay overlay -o lowerdir=/sysroot/$d,upperdir=/sysroot/run/.rw/$d,workdir=/sysroot/run/.work/$d /sysroot/$d; \
-     done\n\
-     exec /bin/busybox switch_root /sysroot /init\n"
-        .into()
+     /bin/busybox mount -t tmpfs -o mode=1777 tmpfs /sysroot/tmp\n\
+     /bin/busybox mkdir -p /sysroot/var/log /sysroot/var/run /sysroot/var/home"
+        .to_string();
+    for user in sys.users {
+        if user.home != "/root" {
+            init.push_str(&format!(" /sysroot/var{}", user.home));
+        }
+    }
+    init.push_str(
+        "\n/bin/busybox sh -c 'umask 077; /bin/busybox mkdir -p /sysroot/var/root'\n\
+         exec /bin/busybox switch_root /sysroot /init\n",
+    );
+    init
 }
 
 /// The ttyS0 session wrapper, run by init AS ROOT (inittab `respawn`). It runs the
@@ -288,42 +306,58 @@ fn build_autologin(sys: &SystemDef) -> String {
 }
 
 /// The boot self-check run once at sysinit AS ROOT on the REAL (post-switch_root) root
-/// (re #550). It (1) gives each non-root user an owned, writable home on the /home
-/// overlay — the erofs base is root-owned (the writer stamps uid/gid 0), so a `chown`
-/// copies the home up in the overlay so the auto-login user can write to `~` — and
-/// (2) prints the two diagnostic markers the headless `qemu-boot-system` oracle asserts
-/// on: the root really is a read-only erofs mount, and the writable dirs are tmpfs-backed
-/// and actually accept writes. All applets are called as `/bin/busybox <applet>` (init
-/// runs sysinit with no PATH); the write probes use a plain `> file` redirection so a
-/// read-only target fails the `if` without needing an external tool.
+/// (re #550). It gives each non-root user ownership of its `/var`-backed home and
+/// prints the diagnostic markers the headless oracle asserts: `/` and `/etc` remain
+/// immutable, while the direct state and volatile mounts accept writes.
 fn build_rootcheck(sys: &SystemDef) -> String {
     let mut s = String::new();
-    s.push_str("#!/bin/sh\n");
-    // (1) Home ownership on the writable /home overlay (skip root, which owns /).
+    s.push_str("#!/bin/sh\nok=1\n");
+    // Home ownership below the writable /var mount (skip root, which already owns it).
     for u in sys.users {
         if u.uid != 0 {
             s.push_str(&format!(
-                "/bin/busybox chown {}:{} {} 2>/dev/null\n",
+                "/bin/busybox chown {}:{} {} 2>/dev/null || ok=0\n",
                 u.uid, u.gid, u.home
             ));
         }
     }
-    // (2) `/` is a read-only erofs mount (fields: <src> <mnt> <fstype> <opts> …; erofs is
+    // `/` is a read-only erofs mount (fields: <src> <mnt> <fstype> <opts> …; erofs is
     //     always mounted `ro`, so the options field begins `ro`).
     s.push_str(&format!(
         "if /bin/busybox grep -Eq '^[^ ]+ / erofs ro[, ]' /proc/mounts; then echo {SYSTEM_ROOT_RO_MARKER}; fi\n"
     ));
-    // (3) The writable dirs are tmpfs-backed AND accept a write. /run must be a tmpfs
-    //     mount, and each overlaid/tmpfs dir must take a probe file (created, then removed).
-    s.push_str("ok=1\n");
-    s.push_str("/bin/busybox grep -Eq '^[^ ]+ /run tmpfs ' /proc/mounts || ok=0\n");
+    // Root runs this check, so a failed /etc write proves the filesystem rejects writes,
+    // not merely that file modes deny an unprivileged process. Run the redirection in a
+    // child shell: ash exits a non-interactive shell when a special builtin redirection
+    // fails, instead of returning control to the parent `if`.
+    s.push_str(&format!(
+        "if /bin/busybox sh -c ': > /etc/.tdwr' 2>/dev/null; then /bin/busybox rm -f /etc/.tdwr; else echo {SYSTEM_ETC_RO_MARKER}; fi\n"
+    ));
+    // State and volatile paths must be direct tmpfs mounts. Homes remain stable paths
+    // through immutable symlinks, ready for /var to become the persistent @var mount.
     s.push_str(
-        "for d in /etc /var /run /tmp /home; do \
-         if : 2>/dev/null > \"$d/.tdwr\"; then /bin/busybox rm -f \"$d/.tdwr\"; else ok=0; fi; \
+        "for d in /var /run /tmp; do \
+         /bin/busybox grep -Eq \"^[^ ]+ $d tmpfs \" /proc/mounts || ok=0; \
          done\n",
     );
+    s.push_str(
+        "[ \"$(/bin/busybox readlink /home)\" = var/home ] || ok=0\n\
+         [ \"$(/bin/busybox readlink /root)\" = var/root ] || ok=0\n",
+    );
+    let mut probe_paths = "/var /run /tmp /home /root".to_string();
+    for user in sys.users {
+        if user.home != "/root" {
+            probe_paths.push(' ');
+            probe_paths.push_str(user.home);
+        }
+    }
     s.push_str(&format!(
-        "[ \"$ok\" = 1 ] && echo {SYSTEM_WRITABLE_MARKER}\n"
+        "for d in {probe_paths}; do \
+         if /bin/busybox sh -c ': > \"$1/.tdwr\"' td-probe \"$d\" 2>/dev/null; then /bin/busybox rm -f \"$d/.tdwr\"; else ok=0; fi; \
+         done\n"
+    ));
+    s.push_str(&format!(
+        "[ \"$ok\" = 1 ] && echo {SYSTEM_STATE_WRITABLE_MARKER}\n"
     ));
     s
 }
@@ -423,30 +457,25 @@ fn build_stage1_spec() -> String {
 /// PackErofs step later packs it into the deployment output. Uses typed steps (no shell): the busybox
 /// package is copied to its /td/store path, /bin is a symlink farm into it, /init is a
 /// symlink to busybox, /etc holds the generated config, and the pseudo-fs + writable
-/// mountpoint dirs are created empty (stage-1/init mount over them). The erofs writer
-/// stamps uid/gid 0, so the whole tree is root-owned; per-user home ownership is fixed at
-/// boot by /etc/rootcheck on the writable /home overlay.
+/// mountpoint dirs are created empty (stage-1/init mount over them). `/home` and `/root`
+/// are immutable symlinks into the writable `/var` mount; per-user ownership is fixed at
+/// boot by `/etc/rootcheck`.
 fn real_root_steps(sys: &SystemDef) -> Vec<Step> {
     let mut steps = Vec::new();
-    // Empty dirs: the pseudo-fs mountpoints (/dev /proc /sys), the writable-overlay bases
-    // (/etc /var /home + per-user homes) and fresh-tmpfs mountpoints (/tmp /run), plus
-    // /root, /bin, /mnt and the /td/store spine. /var/{log,run} exist so login's
-    // utmp/wtmp writes land on the overlay rather than ENOENT.
-    let mut dirs: Vec<String> = [
-        "/dev", "/proc", "/sys", "/tmp", "/run", "/root", "/home", "/etc", "/bin", "/mnt",
-        "/var", "/var/log", "/var/run", "/td", "/td/store",
-    ]
-    .iter()
-    .map(|d| (*d).to_string())
-    .collect();
-    for u in sys.users {
-        if u.home != "/root" {
-            dirs.push(u.home.to_string());
-        }
-    }
-    for d in &dirs {
+    // Empty mountpoints and the immutable root-image skeleton. State directories are
+    // created after /var is mounted, rather than hidden content packed into EROFS.
+    for d in [
+        "/dev", "/proc", "/sys", "/tmp", "/run", "/etc", "/bin", "/mnt", "/var", "/td",
+        "/td/store",
+    ] {
         steps.push(Step::MkDir {
             path: format!("{{root}}/real-root{d}"),
+        });
+    }
+    for (link, target) in [("/home", "var/home"), ("/root", "var/root")] {
+        steps.push(Step::Symlink {
+            target: target.into(),
+            link: format!("{{root}}/real-root{link}"),
         });
     }
     // Static busybox has no runtime store closure; copy its package directly. Scanning the
@@ -529,6 +558,8 @@ fn shape_check() -> String {
      for f in passwd group shadow hostname os-release inittab profile autologin tty-session rootcheck; do \
          [ -f \"$root/etc/$f\" ] || { echo \"root tree: /etc/$f missing\" >&2; exit 1; }; \
      done; \
+     [ \"$(readlink \"$root/home\")\" = var/home ] || { echo 'root tree: /home must point to var/home' >&2; exit 1; }; \
+     [ \"$(readlink \"$root/root\")\" = var/root ] || { echo 'root tree: /root must point to var/root' >&2; exit 1; }; \
      rbb=\"{root}/real-root{in:busybox-x86-64}/bin/busybox\"; { [ -f \"$rbb\" ] && [ -x \"$rbb\" ]; } || { echo 'root tree: the busybox binary is not packed/executable at real-root{in:busybox-x86-64}/bin/busybox - the store-native /bin symlinks would all dangle' >&2; exit 1; }; \
      applets=$(\"$bb\" --list 2>/dev/null) || { echo 'busybox --list failed - cannot verify applet coverage' >&2; exit 1; }; \
      for a in @BUSYBOX_APPLETS@; do \
@@ -585,7 +616,7 @@ pub fn recipe() -> Recipe {
     //    reproducible mtime.
     steps.push(Step::WriteFile {
         path: "{root}/stage1-init".into(),
-        content: build_stage1_init(),
+        content: build_stage1_init(&SYSTEM),
         exec: true,
     });
     steps.push(Step::WriteFile {
@@ -735,6 +766,13 @@ mod tests {
             SYSTEM.autologin
         );
         for u in SYSTEM.users {
+            assert!(
+                valid_home(u.uid, u.home),
+                "user '{}' home '{}' must be /root for uid 0 or one shell-safe direct \
+                 child of /home for an unprivileged uid",
+                u.name,
+                u.home
+            );
             // busybox `login` execs the shell by ABSOLUTE path (execv, no PATH search),
             // and we only pack applets under /bin, so the shell MUST be "/bin/<applet>"
             // packed by either farm. A bare "sh" would pass a naive basename check yet
@@ -870,12 +908,11 @@ mod tests {
         );
     }
 
-    /// The stage-1 init is the load-bearing new piece: it must mount the erofs root
-    /// read-only, set up the tmpfs-backed writable overlays, and `exec switch_root` (so
-    /// the pivot inherits PID 1). Guard those against a careless edit.
+    /// Stage 1 must mount the EROFS root read-only, mount writable state directly,
+    /// leave `/etc` untouched, and `exec switch_root` so the pivot inherits PID 1.
     #[test]
     fn stage1_init_mounts_ro_and_pivots() {
-        let init = build_stage1_init();
+        let init = build_stage1_init(&SYSTEM);
         // Fail-safe: `set -e` aborts on the first mount failure rather than pressing on
         // into a partial switch_root (re #550, Codex review).
         assert!(
@@ -886,16 +923,77 @@ mod tests {
             init.contains("mount -t erofs -o ro /dev/vda /sysroot"),
             "stage-1 init must mount /dev/vda as read-only erofs at /sysroot"
         );
-        // The /sysroot/run tmpfs backs the overlays; it carries `-o mode=0755` now, so match
-        // on the source+mountpoint (`tmpfs /sysroot/run`) not the exact flag string.
         assert!(
-            init.contains("-t overlay overlay") && init.contains("tmpfs /sysroot/run"),
-            "stage-1 init must set up the tmpfs-backed writable overlays"
+            init.contains("tmpfs /sysroot/var")
+                && init.contains("tmpfs /sysroot/run")
+                && init.contains("tmpfs /sysroot/tmp"),
+            "stage-1 init must mount the writable state and volatile directories directly"
+        );
+        assert!(
+            !init.contains("-t overlay") && !init.contains(" /sysroot/etc"),
+            "stage-1 init must leave deployment-owned /etc on the immutable erofs root"
+        );
+        assert!(
+            init.contains("/sysroot/var/home"),
+            "stage-1 init must create the shared home-state directory"
+        );
+        for user in SYSTEM.users {
+            let path = format!("/sysroot/var{}", user.home);
+            assert!(
+                init.contains(&path),
+                "stage-1 init must create state directory {path} before switch_root"
+            );
+        }
+        assert!(
+            init.contains("umask 077") && init.contains("mkdir -p /sysroot/var/root"),
+            "stage-1 init must create the root home with mode 0700"
         );
         assert!(
             init.trim_end().ends_with("exec /bin/busybox switch_root /sysroot /init"),
             "stage-1 init must END by exec-ing switch_root so the pivot inherits PID 1"
         );
+    }
+
+    #[test]
+    fn homes_are_immutable_links_into_var() {
+        let steps = real_root_steps(&SYSTEM);
+        for (link, target) in [("/home", "var/home"), ("/root", "var/root")] {
+            let path = format!("{{root}}/real-root{link}");
+            assert!(
+                steps.iter().any(|step| matches!(
+                    step,
+                    Step::Symlink {
+                        target: actual_target,
+                        link: actual_link,
+                    } if actual_target == target && actual_link == &path
+                )),
+                "{link} must be an immutable root-image symlink to {target}"
+            );
+            assert!(
+                steps.iter().all(|step| !matches!(
+                    step,
+                    Step::MkDir { path: actual } if actual == &path
+                )),
+                "{link} must not also be materialized as a root-image directory"
+            );
+        }
+    }
+
+    #[test]
+    fn home_validation_rejects_shell_and_path_syntax() {
+        for home in [
+            "/home/..",
+            "/home/.",
+            "/home/a b",
+            "/home/a;b",
+            "/home/a/b",
+            "/srv/user",
+            "/root",
+        ] {
+            assert!(!valid_home(1000, home), "unsafe user home passed: {home}");
+        }
+        assert!(valid_home(0, "/root"));
+        assert!(valid_home(1000, "/home/test-user_1.0"));
     }
 
     /// The read-only-root self-check must emit both diagnostic markers the headless
@@ -905,13 +1003,17 @@ mod tests {
     fn boot_markers_are_wired() {
         let rootcheck = build_rootcheck(&SYSTEM);
         assert!(rootcheck.contains(SYSTEM_ROOT_RO_MARKER), "rootcheck must emit the ro-root marker");
-        assert!(rootcheck.contains(SYSTEM_WRITABLE_MARKER), "rootcheck must emit the writable marker");
-        // Home ownership is fixed for every non-root user on the /home overlay.
+        assert!(rootcheck.contains(SYSTEM_ETC_RO_MARKER), "rootcheck must emit the immutable-/etc marker");
+        assert!(
+            rootcheck.contains(SYSTEM_STATE_WRITABLE_MARKER),
+            "rootcheck must emit the writable-state marker"
+        );
+        // Home ownership is fixed for every non-root user below /var.
         for u in SYSTEM.users {
             if u.uid != 0 {
                 assert!(
                     rootcheck.contains(&format!("chown {}:{} {}", u.uid, u.gid, u.home)),
-                    "rootcheck must chown {}'s home on the overlay",
+                    "rootcheck must chown {}'s /var-backed home",
                     u.name
                 );
             }

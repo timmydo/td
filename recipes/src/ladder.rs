@@ -118,9 +118,9 @@ pub const EROFS_PROBE_CONTENT: &str = "td-erofs-ro-readback-ok";
 
 // ── system-x86-64 two-stage boot markers (re #550) ──────────────────────────────
 // The distro's two-stage boot — a minimal init-initramfs mounts the read-only erofs
-// `/td/store` root over virtio-blk, overlays tmpfs for the writable dirs, and
-// `switch_root`s into it — proves itself on ttyS0 with three lines the headless
-// `qemu-boot-system` oracle asserts on. All three are SINGLE SOURCE OF TRUTH shared
+// `/td/store` root over virtio-blk, mounts writable state below `/var`, and
+// `switch_root`s into it — proves itself on ttyS0 with lines the headless
+// `qemu-boot-system` oracle asserts on. They are SINGLE SOURCE OF TRUTH shared
 // by the recipe (`/etc/rootcheck`, `/etc/profile`) and the oracle so they never desync.
 
 /// Printed by `/etc/rootcheck` on the REAL root (post-`switch_root`) once it confirms
@@ -128,11 +128,13 @@ pub const EROFS_PROBE_CONTENT: &str = "td-erofs-ro-readback-ok";
 /// — i.e. the store root really is the immutable erofs image, not the initramfs.
 pub const SYSTEM_ROOT_RO_MARKER: &str = "TD-ROOT-EROFS-RO-OK";
 
-/// Printed by `/etc/rootcheck` once it confirms the writable dirs are tmpfs-backed
-/// (`/run` is a `tmpfs` mount) AND actually accept a write (a probe file is created and
-/// removed under each overlaid dir) — proving the read-only root is usable via the
-/// tmpfs overlays, not silently read-only everywhere.
-pub const SYSTEM_WRITABLE_MARKER: &str = "TD-WRITABLE-OK";
+/// Printed by `/etc/rootcheck` once a root write probe confirms deployment-owned
+/// `/etc` remains on the immutable EROFS root.
+pub const SYSTEM_ETC_RO_MARKER: &str = "TD-ETC-EROFS-RO-OK";
+
+/// Printed by `/etc/rootcheck` once `/var`, `/run`, and `/tmp` are tmpfs mounts,
+/// `/home` and `/root` point into `/var`, and every state path accepts a write probe.
+pub const SYSTEM_STATE_WRITABLE_MARKER: &str = "TD-STATE-WRITABLE-OK";
 
 /// Printed by `/etc/profile` when the auto-login greeter shell is reached — the login
 /// chain (getty → login → ash) ran on the real root. The primary "booted to the

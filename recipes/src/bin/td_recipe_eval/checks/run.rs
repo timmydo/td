@@ -7,7 +7,7 @@
 //!
 //! Two-stage boot (#550): the guest boots the stage-1 initramfs (`initramfs.cpio`),
 //! which mounts the read-only erofs `/td/store` root over virtio-blk (`/dev/vda`),
-//! overlays tmpfs for the writable dirs, and `switch_root`s into the real root. The
+//! mounts tmpfs for `/var`, `/run`, and `/tmp`, and `switch_root`s into the real root. The
 //! recipe emits `{bzImage,initramfs.cpio,root.erofs,manifest}` and this consumer
 //! verifies the manifest before copying the three payloads out for boot.
 //!

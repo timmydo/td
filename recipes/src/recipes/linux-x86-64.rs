@@ -29,7 +29,7 @@ use crate::types::{Recipe, Step};
 // USABLE (re #541): the config also turns on the pseudo-filesystems a real
 // userland needs — PROC_FS (/proc), SYSFS (/sys), DEVTMPFS (the /dev filesystem
 // that init mounts to populate /dev with ttyS0/console/null/…), and TMPFS
-// (/tmp,/run). CONFIG_DEVTMPFS_MOUNT is deliberately NOT managed here: it does not
+// (/var,/tmp,/run). CONFIG_DEVTMPFS_MOUNT is deliberately NOT managed here: it does not
 // auto-mount /dev on an initramfs boot (only when the kernel mounts a real root),
 // so the `system-x86-64` init mounts devtmpfs itself; a hand-packed /dev/console
 // node still covers init's own stdio before that first sysinit line runs. The
@@ -43,11 +43,11 @@ use crate::types::{Recipe, Step};
 // transport the `-M pc` qemu machine exposes (PCI, VIRTIO, VIRTIO_PCI), the
 // virtio block device the erofs image rides (VIRTIO_BLK → /dev/vda), the erofs
 // filesystem itself (EROFS_FS, uncompressed — matching the `td-builder
-// mkfs-erofs` writer, #548), and OVERLAY_FS for the tmpfs overlays the read-only
-// root needs over its writable paths. BLK_DEV_INITRD stays on: the kernel still
-// boots via a minimal initramfs that then mounts and switch_roots into the erofs
-// disk (the switch_root itself is #550). The behavioural proof that
-// this source-built kernel boots to a real userland is the HOST-SIDE tool
+// mkfs-erofs` writer, #548). Writable state is a direct `/var` mount; `/etc`
+// remains on EROFS, so OverlayFS is deliberately absent. BLK_DEV_INITRD stays
+// on: the kernel still boots via a minimal initramfs that then mounts and
+// switch_roots into the erofs disk (the switch_root itself is #550). The
+// behavioural proof that this source-built kernel boots to a real userland is the HOST-SIDE tool
 // `td-recipe-eval qemu-boot linux-x86-64` (checks/qemu_boot.rs): it boots the
 // bzImage + initramfs under host qemu (TCG) and asserts the userland marker
 // reaches the console. It is host-side (not a daily gate check) because a qemu
@@ -330,14 +330,7 @@ pub fn recipe() -> Recipe {
     //    VIRTIO_PCI), CONFIG_BLK_DEV (gates VIRTIO_BLK), CONFIG_MISC_FILESYSTEMS
     //    (gates EROFS_FS). Do not drop them as "redundant" — the grep-verify guard on
     //    the leaves (step 4) reds the whole producer build if a parent goes missing.
-    //    (OVERLAY_FS / PCI / BLOCK are directly selectable, no menuconfig parent.)
-    //
-    //    TMPFS_XATTR (re #550): the two-stage boot overlays the writable dirs
-    //    (/etc,/var,/home) with an OverlayFS whose UPPER layer is a tmpfs, and a
-    //    writable OverlayFS upper MUST support trusted.* extended attributes. tmpfs
-    //    only offers xattrs when CONFIG_TMPFS_XATTR=y — a PROMPTED leaf that defaults
-    //    OFF, so (like the menuconfig parents) it is set explicitly and grep-verified,
-    //    else the overlays fall back to a degraded no-xattr mode or fail outright.
+    //    (PCI / BLOCK are directly selectable, with no menuconfig parent.)
     //
     //    KEXEC (image-based self-boot): the target boots via a two-hop kexec chain —
     //    a tiny immutable shim kernel+initramfs (loaded by qemu -kernel) mounts the
@@ -404,7 +397,6 @@ pub fn recipe() -> Recipe {
                   /^#? *CONFIG_SYSFS[ =]/d; \
                   /^#? *CONFIG_DEVTMPFS[ =]/d; \
                   /^#? *CONFIG_TMPFS[ =]/d; \
-                  /^#? *CONFIG_TMPFS_XATTR[ =]/d; \
                   /^#? *CONFIG_BLOCK[ =]/d; \
                   /^#? *CONFIG_BLK_DEV[ =]/d; \
                   /^#? *CONFIG_PCI[ =]/d; \
@@ -414,7 +406,6 @@ pub fn recipe() -> Recipe {
                   /^#? *CONFIG_VIRTIO_BLK[ =]/d; \
                   /^#? *CONFIG_MISC_FILESYSTEMS[ =]/d; \
                   /^#? *CONFIG_EROFS_FS[ =]/d; \
-                  /^#? *CONFIG_OVERLAY_FS[ =]/d; \
                   /^#? *CONFIG_KEXEC[ =]/d; \
                   /^#? *CONFIG_KEXEC_FILE[ =]/d; \
                   /^#? *CONFIG_KEXEC_SIG[ =]/d; \
@@ -445,7 +436,6 @@ pub fn recipe() -> Recipe {
                    'CONFIG_SYSFS=y' \
                    'CONFIG_DEVTMPFS=y' \
                    'CONFIG_TMPFS=y' \
-                   'CONFIG_TMPFS_XATTR=y' \
                    'CONFIG_BLOCK=y' \
                    'CONFIG_BLK_DEV=y' \
                    'CONFIG_PCI=y' \
@@ -455,7 +445,6 @@ pub fn recipe() -> Recipe {
                    'CONFIG_VIRTIO_BLK=y' \
                    'CONFIG_MISC_FILESYSTEMS=y' \
                    'CONFIG_EROFS_FS=y' \
-                   'CONFIG_OVERLAY_FS=y' \
                    '# CONFIG_KEXEC is not set' \
                    'CONFIG_KEXEC_FILE=y' \
                    '# CONFIG_KEXEC_SIG is not set' \
@@ -491,14 +480,13 @@ pub fn recipe() -> Recipe {
                  grep -q '^CONFIG_DEVTMPFS=y' .config || { echo 'DEVTMPFS off - init cannot mount /dev, so the userland has no ttyS0/console devices' >&2; exit 1; }; \
                  grep -q '^CONFIG_PROC_FS=y' .config || { echo 'PROC_FS off - a usable userland (ps/mount/init) needs /proc' >&2; exit 1; }; \
                  grep -q '^CONFIG_SYSFS=y' .config || { echo 'SYSFS off - a usable userland needs /sys' >&2; exit 1; }; \
-                 grep -q '^CONFIG_TMPFS=y' .config || { echo 'TMPFS off - a usable userland needs a writable /tmp,/run' >&2; exit 1; }; \
-                 grep -q '^CONFIG_TMPFS_XATTR=y' .config || { echo 'TMPFS_XATTR off - OverlayFS needs xattr support on the tmpfs upperdir, else the writable /etc,/var,/home overlays over the read-only erofs root fail (re #550)' >&2; exit 1; }; \
+                 grep -q '^CONFIG_TMPFS=y' .config || { echo 'TMPFS off - a usable userland needs writable /var,/tmp,/run mounts' >&2; exit 1; }; \
                  grep -q '^CONFIG_BLOCK=y' .config || { echo 'BLOCK off - no block layer for the virtio-blk erofs disk' >&2; exit 1; }; \
                  grep -q '^CONFIG_PCI=y' .config || { echo 'PCI off - virtio-blk-pci (the -M pc transport) needs the PCI bus' >&2; exit 1; }; \
                  grep -q '^CONFIG_VIRTIO_PCI=y' .config || { echo 'VIRTIO_PCI off - no virtio transport on the -M pc PCI bus' >&2; exit 1; }; \
                  grep -q '^CONFIG_VIRTIO_BLK=y' .config || { echo 'VIRTIO_BLK off - the erofs disk (/dev/vda) would not appear' >&2; exit 1; }; \
                  grep -q '^CONFIG_EROFS_FS=y' .config || { echo 'EROFS_FS off - the read-only erofs root could not be mounted' >&2; exit 1; }; \
-                 grep -q '^CONFIG_OVERLAY_FS=y' .config || { echo 'OVERLAY_FS off - no tmpfs overlay for writable paths over the read-only root' >&2; exit 1; }; \
+                 if grep -q '^CONFIG_OVERLAY_FS=y' .config; then echo 'OVERLAY_FS on - /etc is immutable and writable state uses direct mounts; no overlay user remains' >&2; exit 1; fi; \
                  grep -q '^CONFIG_PRINTK=y' .config || { echo 'PRINTK off — no kernel console output' >&2; exit 1; }; \
                  grep -q '^CONFIG_TTY=y' .config || { echo 'TTY off — the serial console needs the tty layer' >&2; exit 1; }; \
                  grep -q '^CONFIG_KEXEC_FILE=y' .config || { echo 'KEXEC_FILE off — the shim boots the selected deployment via kexec_file_load(2)' >&2; exit 1; }; \
