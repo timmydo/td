@@ -53,6 +53,15 @@ const PINS: &[PinDef] = &[
         file: "bison-3.8.2.tar.xz",
     },
     PinDef {
+        key: "btrfs-progs-x86-64-source",
+        aliases: &[],
+        // btrfs-progs 7.0 provides the offline --rootdir/--subvol image builder
+        // used to initialize persistent system volumes without host mounts.
+        url: "https://www.kernel.org/pub/linux/kernel/people/kdave/btrfs-progs/btrfs-progs-v7.0.tar.xz",
+        sha256: "c286d6876cbcd72327a0b417e4cfd280353ec23e37b549fdbcd7800a832d9a99",
+        file: "btrfs-progs-v7.0.tar.xz",
+    },
+    PinDef {
         key: "busybox-x86-64-source",
         aliases: &[],
         url: "https://busybox.net/downloads/busybox-1.37.0.tar.bz2",
@@ -458,6 +467,15 @@ const PINS: &[PinDef] = &[
         file: "tcc-0.9.27.tar.bz2",
     },
     PinDef {
+        key: "util-linux-libs-x86-64-source",
+        aliases: &[],
+        // btrfs-progs requires libuuid and libblkid. The recipe builds only
+        // those two static libraries; no util-linux programs are shipped.
+        url: "https://www.kernel.org/pub/linux/utils/util-linux/v2.42/util-linux-2.42.2.tar.xz",
+        sha256: "03a05d3adf9602ef128f2da05b84b3205ce60c351e5737c0370f74000679ce8a",
+        file: "util-linux-2.42.2.tar.xz",
+    },
+    PinDef {
         key: "uutils-source",
         aliases: &[],
         // uutils coreutils 0.9.0 — the read-only-root Rust core userland (#547).
@@ -512,8 +530,10 @@ mod tests {
         // pin, re #529) + flex-2.6.4 and elfutils-0.192 (the modern-kernel host
         // tools flex + libelf, re #529) + CMake 3.31.12 + Rust 1.96.0 source and
         // its exact three-component Rust 1.95.0 bootstrap snapshot +
-        // coreutils-0.9.0 (the uutils userland `.crate`, re #547).
-        assert_eq!(all().len(), 52);
+        // coreutils-0.9.0 (the uutils userland `.crate`, re #547) +
+        // btrfs-progs 7.0 and util-linux 2.42.2 (the persistent-volume writer
+        // and its minimal libuuid/libblkid build closure).
+        assert_eq!(all().len(), 54);
     }
 
     #[test]
