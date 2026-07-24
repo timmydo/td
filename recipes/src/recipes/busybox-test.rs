@@ -76,7 +76,7 @@ pub fn recipe() -> Recipe {
         .checks(vec![RecipeCheck::daily(
             r#"
 echo ">> recipe-check busybox-test: build-plan --auto builds+validates busybox-test: BusyBox 1.37.0, built by make-x86-64 on the native /td/store toolchain, RUNS installed applet links"
-: "${TD_RECIPE_EVAL:=$PWD/recipes/target/release/td-recipe-eval}"
+: "${TD_RECIPE_EVAL:=$PWD/target/release/td-recipe-eval}"
 exec "$TD_RECIPE_EVAL" check-run busybox-test daily 1
 "#,
         )

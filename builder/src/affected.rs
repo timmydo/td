@@ -290,8 +290,9 @@ fn add_chain_targets(sel: &mut Selection) {
 // ---------------------------------------------------------------------------
 
 fn map_path(root: &Path, p: &str, sel: &mut Selection) {
-    // Ignored local metadata.
-    if pattern_matches(".claude/*|.td-build-cache/*|builder/target/*", p) {
+    // Ignored local metadata. `target/*` is the shared workspace build dir
+    // (builder/recipes/engine); `*` crosses `/`, so this covers target/release/…
+    if pattern_matches(".claude/*|.td-build-cache/*|target/*", p) {
         return;
     }
 
@@ -391,7 +392,7 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
         return;
     }
 
-    if pattern_matches("builder/Cargo.toml|builder/Cargo.lock|builder/src/*", p) {
+    if pattern_matches("builder/Cargo.toml|builder/src/*", p) {
         // The td-builder build engine validates on the ~2-min check-engine SMOKE tier
         // (DESIGN §7.2): cargo-test (compile + unit tests), NOT the from-source corpus
         // (that is the DAILY backstop). cargo-test also runs as a host preflight.
@@ -399,6 +400,29 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
         sel.add_target("check-engine");
         sel.add_note(&format!(
             "{p} is the td-builder build engine: validated by the ~2-min check-engine smoke (compile + unit tests); the from-source build coverage is the DAILY backstop (DESIGN §7.2), not a per-PR gate."
+        ));
+        return;
+    }
+
+    // The shared std-only engine lib (JSON + SHA-256) AND the workspace-root
+    // manifest/lock. The engine compiles INTO both td-builder (build engine ->
+    // check-engine) and td-recipe-eval (recipe surface -> recipe-rs + the package
+    // build gates), and the root Cargo.toml/Cargo.lock govern how both bins build
+    // (release profile, member set, dependency graph). So route the UNION of the
+    // builder and recipes rules — a conservative superset. builder/Cargo.lock and
+    // recipes/Cargo.lock are TOMBSTONES: the per-crate locks folded into the one
+    // workspace-root Cargo.lock, so a diff deleting them routes to the same check.
+    if pattern_matches(
+        "engine/Cargo.toml|engine/src/*|Cargo.toml|Cargo.lock|builder/Cargo.lock|recipes/Cargo.lock",
+        p,
+    ) {
+        sel.add_preflight("shell-syntax");
+        sel.add_preflight("cargo-test");
+        sel.add_target("check-engine");
+        sel.add_target("recipe-rs");
+        add_build_gate_targets(root, sel);
+        sel.add_note(&format!(
+            "{p} is shared engine/workspace code compiled into BOTH td-builder and td-recipe-eval: validated by check-engine (compile + unit tests) and the recipe/package build gates."
         ));
         return;
     }
@@ -449,7 +473,7 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
     }
 
     if pattern_matches(
-        "recipes/*|recipes/src/*|recipes/Cargo.toml|recipes/Cargo.lock|tests/recipe-eval-tool.sh",
+        "recipes/*|recipes/src/*|recipes/Cargo.toml|tests/recipe-eval-tool.sh",
         p,
     ) {
         // The td-recipe crate IS the package + system-spec surface (boa/TS retired).
@@ -691,7 +715,7 @@ fn preflight_cmd(name: &str) -> Option<&'static str> {
         "shell-syntax" => Some("  bash -n tests/*.sh ci/*.sh tools/*.sh"),
         "heal-revert" => Some("  bash tests/heal-revert.sh"),
         "cargo-test" => {
-            Some("  cargo test + clippy --manifest-path {builder,recipes,td-kexec}/Cargo.toml")
+            Some("  cargo test + clippy --frozen --workspace (builder/recipes/engine) + --manifest-path td-kexec/Cargo.toml")
         }
         "affected-self-test" => Some("  td-builder affected-checks --self-test"),
         _ => None,
@@ -1043,6 +1067,26 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
     assert_target!("recipes/build.rs", "recipe-rs");
     assert_target!("recipes/Cargo.toml", "recipe-rs");
     assert_target!("builder/src/gate_defs/207-recipe-rs.rs", "recipe-rs");
+    // The td-builder build engine (its own src) rides the check-engine smoke.
+    assert_target!("builder/src/main.rs", "check-engine");
+    // The shared td-engine lib compiles INTO both bins, so an engine-source or
+    // workspace-root manifest/lock change routes the UNION: check-engine (builder
+    // side) AND recipe-rs + the package build gates (recipe side).
+    assert_target!("engine/src/json.rs", "check-engine");
+    assert_target!("engine/src/json.rs", "recipe-rs");
+    assert_target!("engine/src/sha256.rs", "check-engine");
+    assert_target!("engine/Cargo.toml", "check-engine");
+    assert_target!("engine/Cargo.toml", "recipe-rs");
+    assert_target!("Cargo.toml", "check-engine");
+    assert_target!("Cargo.toml", "recipe-rs");
+    assert_target!("Cargo.lock", "check-engine");
+    assert_target!("Cargo.lock", "recipe-rs");
+    // Tombstones: the per-crate locks folded into the root Cargo.lock; a diff
+    // deleting them routes to the same workspace check (not the No-mapping fallback).
+    assert_target!("builder/Cargo.lock", "check-engine");
+    assert_target!("builder/Cargo.lock", "recipe-rs");
+    assert_target!("recipes/Cargo.lock", "check-engine");
+    assert_target!("recipes/Cargo.lock", "recipe-rs");
     // The merged td-net gets the union of the former fetch/feed rules: the chain targets
     // (no gate builds it from source; its main.rs holds the warm-sources consumer smoked by
     // the i686 chain's proof set) AND the bounded check-pr tier (former fetch coverage) so a
@@ -1244,12 +1288,13 @@ fn run_preflight(root: &Path, name: &str) -> i32 {
             // offline, and its own `[lints]` deny-set (no unwrap/panic/indexing) must be
             // enforced per-PR too. The static TARGET link is daily/operator (td-kexec-test);
             // this leg is the host-native clippy/test of the same source.
+            // builder + recipes + the shared engine lib are one cargo workspace,
+            // so --workspace lints/tests all three in one invocation; td-kexec is
+            // its own standalone crate and rides the same preflight explicitly.
             for cmd in [
-                "cargo test --frozen --manifest-path builder/Cargo.toml",
-                "cargo test --frozen --manifest-path recipes/Cargo.toml",
+                "cargo test --frozen --workspace",
                 "cargo test --frozen --manifest-path td-kexec/Cargo.toml",
-                "cargo clippy --frozen --manifest-path builder/Cargo.toml",
-                "cargo clippy --frozen --manifest-path recipes/Cargo.toml",
+                "cargo clippy --frozen --workspace",
                 "cargo clippy --frozen --manifest-path td-kexec/Cargo.toml",
             ] {
                 let code = run_shell(root, cmd);
@@ -1527,7 +1572,7 @@ mod tests {
                 "  builder/src/main.rs",
                 "",
                 "Selected checks:",
-                "  cargo test + clippy --manifest-path {builder,recipes,td-kexec}/Cargo.toml",
+                "  cargo test + clippy --frozen --workspace (builder/recipes/engine) + --manifest-path td-kexec/Cargo.toml",
                 "  td-builder check check-engine",
                 "",
                 "Waiver: inspection only (--path does not prove the branch diff)",
@@ -1552,7 +1597,7 @@ mod tests {
                 "",
                 "Selected checks:",
                 "  bash -n tests/*.sh ci/*.sh tools/*.sh",
-                "  cargo test + clippy --manifest-path {builder,recipes,td-kexec}/Cargo.toml",
+                "  cargo test + clippy --frozen --workspace (builder/recipes/engine) + --manifest-path td-kexec/Cargo.toml",
                 "  td-builder check check-pr",
                 "",
                 "Waiver: inspection only (--path does not prove the branch diff)",

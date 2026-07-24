@@ -414,7 +414,7 @@ jemalloc = false
         .checks(vec![RecipeCheck::daily(
             r#"
 echo ">> recipe-check rust-toolchain: full-bootstraps and validates the source-built /td/store Rust 1.96.0 stage2 toolchain"
-: "${TD_RECIPE_EVAL:=$PWD/recipes/target/release/td-recipe-eval}"
+: "${TD_RECIPE_EVAL:=$PWD/target/release/td-recipe-eval}"
 exec "$TD_RECIPE_EVAL" check-run rust-toolchain daily 1
 "#,
         )

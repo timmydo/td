@@ -35,14 +35,12 @@ mod gate_inputs;
 mod gate_timing;
 mod gates;
 mod gzip;
-mod json;
 mod lock;
 mod mes_boot;
 mod nar;
 mod oci;
 mod sandbox;
 mod scan;
-mod sha256;
 mod stage0;
 mod store;
 mod store_db;
@@ -51,6 +49,12 @@ mod sys;
 mod tar;
 mod toolchain_x86_64;
 mod xz;
+
+// The JSON value/parser/canonical writer and SHA-256 live in the shared,
+// std-only td-engine (one copy for td-builder + td-recipe-eval). Re-exported at
+// crate root so existing `crate::json::` / `json::` (and `sha256::`) paths are
+// unchanged.
+pub use td_engine::{json, sha256};
 
 use std::ffi::CString;
 use std::os::fd::AsRawFd;
@@ -4152,6 +4156,23 @@ fn derive_native_rust_link_env(entries: &[lock::Entry]) -> Option<NativeRustLink
     })
 }
 
+/// The TD_INPUT_MAP object (input NAME -> store PATH) from resolved lock entries.
+/// Input `{in:NAME}` resolution is BY NAME and the map round-trips through the JSON
+/// parser in the builder subprocess, so a duplicate name is ambiguous (and would emit
+/// duplicate JSON keys the parser rejects) — reject it here with a clear message rather
+/// than let it fail cryptically downstream. `lock::parse` does not enforce uniqueness.
+fn input_map_json(entries: &[lock::Entry]) -> Result<json::Json, String> {
+    let mut seen = std::collections::BTreeSet::new();
+    let mut kvs = Vec::with_capacity(entries.len());
+    for e in entries {
+        if !seen.insert(e.name.as_str()) {
+            return Err(format!("duplicate input name `{}' in lock", e.name));
+        }
+        kvs.push((e.name.clone(), json::Json::Str(e.path.clone())));
+    }
+    Ok(json::Json::Obj(kvs))
+}
+
 /// Shared by `build-recipe` (which then realizes it daemon-free) and `assemble-recipe`
 /// (assemble-only, so a SEPARATE process — the build daemon — realizes the td-assembled
 /// drv). Splitting assembly from realization is what lets td's own daemon, not a `guix
@@ -4343,12 +4364,7 @@ fn assemble_recipe_drv(
                 );
             }
             spec.push_str(&format!("env TD_STEPS={}\n", steps.to_json_string()));
-            let map = json::Json::Obj(
-                entries
-                    .iter()
-                    .map(|e| (e.name.clone(), json::Json::Str(e.path.clone())))
-                    .collect(),
-            );
+            let map = input_map_json(&entries)?;
             spec.push_str(&format!("env TD_INPUT_MAP={}\n", map.to_json_string()));
         }
         // rust-stage0: the exact upstream bootstrap-component ELF-retarget transform.
@@ -4369,12 +4385,7 @@ fn assemble_recipe_drv(
                     "recipe: buildSystem \"rust-stage0\" takes no vendored crates — the transform extracts prebuilt bootstrap components, it does not compile".into(),
                 );
             }
-            let map = json::Json::Obj(
-                entries
-                    .iter()
-                    .map(|e| (e.name.clone(), json::Json::Str(e.path.clone())))
-                    .collect(),
-            );
+            let map = input_map_json(&entries)?;
             spec.push_str(&format!("env TD_INPUT_MAP={}\n", map.to_json_string()));
         }
         // rust: the cargo phase runner installs the named binaries (TD_RUST_BINS) and,
@@ -12287,6 +12298,19 @@ daemon build START (2/2 active)
             mk("glibc-x86-64", glibc),
         ])
         .is_none());
+    }
+
+    #[test]
+    fn input_map_json_rejects_duplicate_names() {
+        // Unique names build the NAME->PATH object (whose canonical emit sorts keys).
+        let ok = lock::parse("a /td/store/pa\nb /td/store/pb\n", "").unwrap();
+        let map = input_map_json(&ok).expect("unique names build a map");
+        assert_eq!(map.to_json_string(), r#"{"a":"/td/store/pa","b":"/td/store/pb"}"#);
+        // A duplicate input name is ambiguous for {in:NAME} resolution and would emit
+        // duplicate JSON keys the parser rejects — caught here with a clear message.
+        let dup = lock::parse("a /td/store/pa\na /td/store/pb\n", "").unwrap();
+        let err = input_map_json(&dup).expect_err("duplicate name must be rejected");
+        assert!(err.contains("duplicate input name"), "got: {err}");
     }
 
     // The --auto crate gate: every checksummed committed-lock entry must be present in the

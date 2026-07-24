@@ -98,7 +98,7 @@ pub fn recipe() -> Recipe {
         .checks(vec![RecipeCheck::daily(
             r#"
 echo ">> recipe-check kexec-spike-x86-64-test: build-plan --auto builds kexec-spike-x86-64 (the two-kernel kexec spike artifact: a bootable bzImage + an outer initramfs embedding static busybox, td-kexec, a second-boot bzImage, and a nested inner initramfs) and asserts a complete newc archive carrying every spike member and both /init markers"
-: "${TD_RECIPE_EVAL:=$PWD/recipes/target/release/td-recipe-eval}"
+: "${TD_RECIPE_EVAL:=$PWD/target/release/td-recipe-eval}"
 exec "$TD_RECIPE_EVAL" check-run kexec-spike-x86-64-test daily 1
 "#,
         )

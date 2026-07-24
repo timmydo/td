@@ -279,19 +279,25 @@ td's Rust is defensive and minimal-surface.
 - **`unsafe` is confined.** In the control-plane engine the only `unsafe` is the
   raw-syscall layer (`builder/src/sys.rs` and its callers `nar.rs`/`sandbox.rs`),
   which carry `#![allow(unsafe_code)]` so `builder` can be `libc`-free. Every other
-  engine crate (`recipes`/`fetch`/`feed`/`subst`) `forbid`s `unsafe_code`. The one
+  engine crate (the shared `engine` lib and `recipes`/`fetch`/`feed`/`subst`)
+  `forbid`s `unsafe_code`. The one
   target-side exception is the `td-kexec` guest helper — a standalone crate OUTSIDE
-  the `builder`/`recipes` workspace whose only `unsafe` is that same
+  the `builder`/`recipes`/`engine` workspace whose only `unsafe` is that same
   `syscall`-instruction layer, confined to exactly two syscalls
   (`kexec_file_load(2)` + `reboot(2)` with `LINUX_REBOOT_CMD_KEXEC`) copied from
   `sys.rs`. Do not add `unsafe` anywhere else; a new `unsafe` surface is a reviewed
   amendment recorded here.
-- **The engine is dependency-free.** `builder` and `recipes` carry **zero crates**
-  (pure `std`) and must stay that way — the gate fails if either `Cargo.lock` grows
-  past its one self-entry. The network tools (`fetch`/`feed`/`subst`) are the *only*
-  crates allowed dependencies, and only the vendored-through-the-cargo-proxy FSDG
-  set they already have (`ureq`/`rustls`/`sha2`/`ring`); a *new* dependency anywhere
-  is a reviewed decision (directive 6 territory), never casual.
+- **The engine is dependency-free.** `builder`, `recipes`, and the shared std-only
+  `engine` lib (the one copy of the hand-rolled JSON + SHA-256 both bins use) form one
+  cargo workspace and carry **zero external crates** (pure `std`) — they must stay that
+  way. The gate enforces it on the ONE workspace-root `Cargo.lock`: exactly 3
+  `[[package]]` entries (the known path members) AND no external `source = ` line
+  (path members carry none), so a new registry/git dep OR a new path member both red it.
+  `td-kexec` (a target guest helper outside the workspace) keeps its own 1-package lock.
+  The network tools (`fetch`/`feed`/`subst`) are the *only* crates allowed dependencies,
+  and only the vendored-through-the-cargo-proxy FSDG set they already have
+  (`ureq`/`rustls`/`sha2`/`ring`); a *new* dependency anywhere is a reviewed decision
+  (directive 6 territory), never casual.
 - **`std`, not `no_std`.** These are OS-driving userspace programs
   (`std::fs`/`std::process`/namespace syscalls); `no_std` is out of scope.
 - **Prefer allocating off the hot path** — set buffers/collections up once rather

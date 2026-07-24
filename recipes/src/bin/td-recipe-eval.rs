@@ -39,8 +39,10 @@ mod check_runner;
 mod checks;
 #[path = "td_recipe_eval/seed_digests.rs"]
 mod seed_digests;
-#[path = "td_recipe_eval/sha256.rs"]
-mod sha256;
+// SHA-256 lives in the shared, std-only td-engine (one copy for td-recipe-eval +
+// td-builder). Re-exported at crate root so existing `crate::sha256::` paths are
+// unchanged.
+use td_engine::sha256;
 
 #[allow(
     clippy::unwrap_used,

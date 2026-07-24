@@ -1,0 +1,22 @@
+# Control-plane engine workspace: the two host-built td programs (td-builder,
+# td-recipe-eval) and the std-only library they share (td-engine). One virtual
+# root so the shared JSON + SHA-256 code lives in exactly one place and the two
+# bins pull it as a path dependency — no third diverged copy.
+#
+# The other crates in this repo stay OUT of the workspace and build standalone:
+#   net/            — the network tools (td-net); the ONLY crates allowed
+#                     external deps (ureq/rustls/sha2/ring), so their vendored
+#                     closure must not mix into the engine's dependency-free lock.
+#   td-kexec/       — a target-side guest helper, deliberately outside the
+#                     builder/recipes trust boundary (its own confined unsafe).
+#   tests/*-demo/   — throwaway fixtures for vendoring/ssh tests.
+[workspace]
+resolver = "2"
+members = ["builder", "recipes", "engine"]
+exclude = ["net", "td-kexec", "tests/russh-demo", "tests/vendor-demo"]
+
+[profile.release]
+# Keep the release profile explicit and minimal so the reproducibility oracle
+# has a stable target as the binaries grow. Profiles are only honoured at the
+# workspace root (member [profile.*] sections are ignored), so this is the one
+# place it can live for td-builder and td-recipe-eval.

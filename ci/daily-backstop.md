@@ -39,7 +39,7 @@ it rather than creating a second.
 ```
 You are the td daily full-suite backstop. The repo is at <REPO>. Steps:
 1. cd <REPO>; build the engine: cargo build --release --manifest-path builder/Cargo.toml
-2. Run: builder/target/release/td-builder daily --verdict .td-daily-verdict
+2. Run: target/release/td-builder daily --verdict .td-daily-verdict
 3. Read .td-daily-verdict.
    - Exit 10: no current leg ran — a HOST setup gap, not a code regression.
      Report it and stop; no backlog file.

@@ -8,7 +8,10 @@
 //! change is needed (the consumer cutover is a follow-up).
 
 pub mod catalog;
-pub mod json;
+// JSON value/parser/canonical writer lives in the shared, std-only td-engine
+// (one copy for td-recipe-eval + td-builder). Re-exported so `crate::json::` /
+// `td_recipe::json::` paths are unchanged.
+pub use td_engine::json;
 pub mod ladder;
 pub mod source_pins;
 pub mod types;

@@ -87,7 +87,7 @@ pub fn recipe() -> Recipe {
         .checks(vec![RecipeCheck::daily(
             r#"
 echo "[td] running gcc-x86-64-stage2-test recipe check"
-: "${TD_RECIPE_EVAL:=$PWD/recipes/target/release/td-recipe-eval}"
+: "${TD_RECIPE_EVAL:=$PWD/target/release/td-recipe-eval}"
 exec "$TD_RECIPE_EVAL" check-run gcc-x86-64-stage2-test daily 1
 "#,
         )

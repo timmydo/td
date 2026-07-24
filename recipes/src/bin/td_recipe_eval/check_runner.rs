@@ -2248,7 +2248,8 @@ fn find_td_builder_self(root: &Path) -> Result<PathBuf, String> {
             path.display()
         ));
     }
-    let release = root.join("builder/target/release/td-builder");
+    // Workspace member: the build output lands in the workspace-root target dir.
+    let release = root.join("target/release/td-builder");
     if is_executable(&release) {
         return Ok(release);
     }

@@ -940,9 +940,7 @@ fn apply_phases(srcdir: &str, search_path: &str, envs: &[(String, String)]) -> R
                 let fa = sub.get("file").ok_or("substitution: missing file")?;
                 let from = sub.get("from").cloned().ok_or("substitution: missing from")?;
                 let to = sub.get("to").cloned().ok_or("substitution: missing to")?;
-                let mut clause = std::collections::BTreeMap::new();
-                clause.insert("from".to_string(), from);
-                clause.insert("to".to_string(), to);
+                let clause = vec![("from".to_string(), from), ("to".to_string(), to)];
                 apply_substitute(fa, &[Json::Obj(clause)], srcdir, &sed, &bindings, search_path, envs)?;
             }
         } else {

@@ -148,7 +148,7 @@ pub fn recipe() -> Recipe {
         .checks(vec![RecipeCheck::daily(
             r#"
 echo ">> recipe-check cmake-x86-64: build source CMake with td's POSIX native GCC and validate its static executable"
-: "${TD_RECIPE_EVAL:=$PWD/recipes/target/release/td-recipe-eval}"
+: "${TD_RECIPE_EVAL:=$PWD/target/release/td-recipe-eval}"
 exec "$TD_RECIPE_EVAL" check-run cmake-x86-64 daily 1
 "#,
         )

@@ -15,9 +15,12 @@ path = "src/bin/td-recipe-eval.rs"
 
 # DEPENDENCY-FREE on purpose (the builder/ discipline): the crate compiles OFFLINE
 # in the check.sh sandbox with nothing fetched. The JSON value/parser/canonical
-# writer is hand-rolled (src/json.rs) rather than pulling serde, so no vendored
-# crate closure is needed — this is the whole point of moving the recipe surface
+# writer and SHA-256 are hand-rolled — now in the in-repo, std-only td-engine
+# (path member of this workspace, itself zero-dependency), shared with td-builder
+# rather than pulling serde. This is the whole point of moving the recipe surface
 # off boa (a JS engine + its crate tree leaves the loop).
+[dependencies]
+td-engine = { path = "../engine" }
 
 # Rust coding rules (AGENTS.md → "Rust code"): deny the panic/indexing/unsafe
 # surface for NEW code. Existing files carry a per-file `#![allow(...)]`
@@ -37,5 +40,6 @@ todo = "deny"
 unimplemented = "deny"
 indexing_slicing = "deny"  # use .get(i) over xs[i] / &xs[a..b]
 
-[profile.release]
-# Explicit + minimal so a future reproducibility oracle has a stable target.
+# NOTE: no [profile.release] here — release profile settings are only honoured
+# at the workspace root (../Cargo.toml) for a member crate; a member's own
+# [profile.*] section is ignored by cargo.

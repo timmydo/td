@@ -113,7 +113,7 @@ pub fn recipe() -> Recipe {
         .checks(vec![RecipeCheck::daily(
             r#"
 echo ">> recipe-check elfutils-x86-64-test: build-plan --auto builds elfutils-x86-64 (static libelf.a + libeu.a + libz.a, source-built by the native /td/store x86_64 toolchain) and links+runs a libelf program against it"
-: "${TD_RECIPE_EVAL:=$PWD/recipes/target/release/td-recipe-eval}"
+: "${TD_RECIPE_EVAL:=$PWD/target/release/td-recipe-eval}"
 exec "$TD_RECIPE_EVAL" check-run elfutils-x86-64-test daily 1
 "#,
         )

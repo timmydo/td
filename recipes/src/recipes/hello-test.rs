@@ -59,7 +59,7 @@ pub fn recipe() -> Recipe {
             RecipeCheck::daily(
                 r#"
 echo ">> recipe-check hello-test: build GNU Hello 2.10 with the native /td/store GCC/glibc/Make/BusyBox graph and run it with /gnu/store absent"
-: "${TD_RECIPE_EVAL:=$PWD/recipes/target/release/td-recipe-eval}"
+: "${TD_RECIPE_EVAL:=$PWD/target/release/td-recipe-eval}"
 exec "$TD_RECIPE_EVAL" check-run hello-test daily 1
 "#,
             )

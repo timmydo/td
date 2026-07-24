@@ -635,12 +635,20 @@ pub(crate) fn stage0_place(root: &Path, base: &Path) -> Result<String, String> {
     // SEED_DIGESTS), so it is a genuine compile input to the placed binary and
     // MUST be fingerprinted too — otherwise adding a source pin (a new
     // seed-digests row) leaves the prior placement's compiled table in force
-    // and the new pin reads as an unpinned seed (re #469).
+    // and the new pin reads as an unpinned seed (re #469). The builder now
+    // compiles the shared `td-engine` lib (JSON + SHA-256) as a path dependency,
+    // resolved through the workspace-root Cargo.toml/Cargo.lock (which also carry
+    // the release profile + member set), so engine/src, engine/Cargo.toml, and
+    // both workspace-root files are compile inputs and join the fingerprint too —
+    // else an engine edit leaves a stale placement in force.
     let fp_roots: Vec<String> = [
         "builder/src",
         "builder/build.rs",
         "builder/Cargo.toml",
-        "builder/Cargo.lock",
+        "engine/src",
+        "engine/Cargo.toml",
+        "Cargo.toml",
+        "Cargo.lock",
         "seed/seed-digests.txt",
     ]
     .iter()

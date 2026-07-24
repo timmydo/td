@@ -85,9 +85,11 @@ const SYSTEM: SystemDef = SystemDef {
     hostname: "td",
     os_name: "td",
     os_version: "0.1",
-    // NOTE: keep motd (and every emitted /etc string) ASCII — td-builder's config
-    // reader is Latin-1 (builder/src/json.rs), so a multi-byte UTF-8 char here (e.g.
-    // an em-dash) is silently corrupted in the written file. Use '-', not the glyph.
+    // NOTE: td-builder's config reader now decodes JSON as UTF-8 (the shared
+    // engine/src/json.rs, same codec td-recipe-eval emits with), so a multi-byte
+    // char here round-trips intact. Keeping /etc strings ASCII is still the safe
+    // default for the minimal boot console — use '-' rather than an em-dash unless
+    // you've confirmed the console renders the glyph.
     motd: "\n  Welcome to td - a source-built, Rust-first Linux.\n  \
            Minimal busybox userland, booted two-stage onto a read-only erofs root.\n  \
            Edit recipes/src/recipes/system-x86-64.rs (the SYSTEM const) to tailor it.\n  \

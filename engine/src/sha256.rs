@@ -1,14 +1,17 @@
-//! SHA-256 (FIPS 180-4) for the recipe evaluator, pure `std`.
+//! SHA-256 (FIPS 180-4), pure `std` — the one copy shared by td-builder and
+//! td-recipe-eval (each formerly carried its own diverged hand-roll).
 //!
-//! The runner's cache keys hash small inputs (setup-manifest seed-patch
-//! digests, recipe bodies); it previously piped them through an ambient host
-//! `sha256sum`,
-//! which was the last host-binary lookup on the check path (re #469 —
-//! executable provenance). Hashing in-process deletes that lookup.
+//! Kept dependency-free on purpose: the engine crates compile OFFLINE with
+//! nothing fetched, and correctness is pinned two ways — the FIPS/CAVP test
+//! vectors below, and (on the builder side) the S2 rung differential against the
+//! daemon's recorded NAR hashes. The builder hashes multi-MB bootstrap artifacts
+//! and warmed crates through `sha256_file` (streamed, no whole-file buffer); the
+//! recipe runner hashes small setup-manifest/recipe inputs through `hex_digest`,
+//! deleting its last ambient `sha256sum` lookup (re #469 — executable provenance).
 //!
-//! This is a sibling of `builder/src/sha256.rs`, rewritten to the recipes
-//! crate's lint bar (no indexing/slicing, no panics): the compression loops
-//! run on iterators and `split_at_mut` views instead of `w[i]`.
+//! This is the recipes crate's lint-clean implementation (no indexing/slicing,
+//! no panics: the compression loops run on iterators and `split_at_mut` views)
+//! plus the builder's streaming `sha256_file` helper.
 
 /// SHA-256 round constants (fractional parts of cube roots of primes 2..311).
 const K: [u32; 64] = [
@@ -35,6 +38,12 @@ pub struct Sha256 {
     block: [u8; 64],
     block_len: usize,
     total_len: u64,
+}
+
+impl Default for Sha256 {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Sha256 {
@@ -170,6 +179,24 @@ pub fn hex_digest(bytes: &[u8]) -> String {
     to_base16(&hasher.finalize())
 }
 
+/// sha256 (lowercase hex) of a file's bytes, streamed in 64 KiB chunks —
+/// bootstrap artifacts and warmed crates run multi-MB, so no whole-file
+/// buffer. The one shared file-hash helper (bootstrap.rs + check_loop.rs).
+pub fn sha256_file(p: &std::path::Path) -> std::io::Result<String> {
+    use std::io::Read as _;
+    let mut f = std::fs::File::open(p)?;
+    let mut h = Sha256::new();
+    let mut buf = [0u8; 65536];
+    loop {
+        let n = f.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        h.update(buf.get(..n).unwrap_or(&[]));
+    }
+    Ok(to_base16(&h.finalize()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -223,5 +250,32 @@ mod tests {
             hasher.update(b);
             assert_eq!(to_base16(&hasher.finalize()), one_shot, "split at {split}");
         }
+    }
+
+    #[test]
+    fn byte_at_a_time_matches_one_shot() {
+        // Block-boundary handling: feeding byte-by-byte must equal one shot.
+        let data: Vec<u8> = (0u16..=255).map(|b| b as u8).cycle().take(1000).collect();
+        let mut h = Sha256::new();
+        for b in &data {
+            h.update(std::slice::from_ref(b));
+        }
+        assert_eq!(to_base16(&h.finalize()), hex_digest(&data));
+    }
+
+    #[test]
+    fn sha256_file_matches_hex_digest() {
+        // sha256_file streams a file; its result must equal the in-memory digest.
+        // Written without unwrap/expect so the module stays panic-surface clean
+        // even when clippy lints the tests (--all-targets).
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("td-engine-sha256-{}.bin", std::process::id()));
+        let bytes: Vec<u8> = (0u32..200_000).map(|i| (i % 253) as u8).collect();
+        let Ok(()) = std::fs::write(&path, &bytes) else {
+            return;
+        };
+        let streamed = sha256_file(&path);
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(streamed.ok(), Some(hex_digest(&bytes)));
     }
 }

@@ -519,7 +519,9 @@ fn resolve_recipe_eval_bin(root: &Path) -> Result<String, CheckError> {
                  failed) — a code regression, not a provisioning gap",
             )));
         }
-        let p = root.join("recipes/target/release/td-recipe-eval");
+        // recipes is a workspace member now, so `cargo build` from recipes/ lands
+        // the binary in the workspace-root target dir, not recipes/target/.
+        let p = root.join("target/release/td-recipe-eval");
         if p.is_file() {
             return Ok(p.display().to_string());
         }

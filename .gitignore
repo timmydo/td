@@ -13,7 +13,9 @@
 .cargo-test-scratch/
 # recipe-rs: scratch CARGO_HOME + CARGO_TARGET_DIR + a local `cargo build` target.
 .recipe-rs-scratch/
-recipes/target/
+# Engine workspace `cargo build` output — builder/recipes/engine now share ONE
+# target dir at the workspace root (was recipes/target/ + builder/target/).
+/target/
 
 # check-memo verdicts (constraint 2): host-local state,
 # NEVER committed — a verdict greens only the environment that recorded it.

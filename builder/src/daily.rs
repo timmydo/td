@@ -438,7 +438,9 @@ fn locate_tdb(root: &Path) -> Option<PathBuf> {
             .map(|s| s.success())
             .unwrap_or(false);
         if built {
-            let p = root.join("builder/target/release/td-builder");
+            // Workspace member: `cargo build` output lands in the workspace-root
+            // target dir, not builder/target/.
+            let p = root.join("target/release/td-builder");
             if is_exec(&p) {
                 return Some(p);
             }

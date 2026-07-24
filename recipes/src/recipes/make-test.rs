@@ -88,7 +88,7 @@ pub fn recipe() -> Recipe {
         .checks(vec![RecipeCheck::daily(
             r#"
 echo ">> recipe-check make-test: build-plan --auto builds+validates make-test — GNU make 4.4.1, built on the native /td/store toolchain (make-x86-64), RUNS a real build; a broken make reds make-test's build"
-: "${TD_RECIPE_EVAL:=$PWD/recipes/target/release/td-recipe-eval}"
+: "${TD_RECIPE_EVAL:=$PWD/target/release/td-recipe-eval}"
 exec "$TD_RECIPE_EVAL" check-run make-test daily 1
 "#,
         )

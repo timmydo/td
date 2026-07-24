@@ -1,0 +1,29 @@
+[package]
+name = "td-engine"
+version = "0.1.0"
+edition = "2021"
+description = "Shared std-only engine library for td-builder and td-recipe-eval — the hand-rolled JSON value/parser/canonical writer and SHA-256 both bins depend on (zero external crates)"
+license = "GPL-3.0-or-later"
+
+[lib]
+name = "td_engine"
+path = "src/lib.rs"
+
+# DEPENDENCY-FREE (the builder/recipes engine discipline): compiles OFFLINE with
+# nothing fetched. This is the single source for the JSON + SHA-256 code the two
+# engine bins previously each carried a diverged copy of. No [profile.release]
+# here — profiles live at the workspace root (member profiles are ignored).
+
+[lints.rust]
+# No unsafe in the shared lib (pure computation) — forbid (cannot be re-enabled
+# by an inner #![allow]).
+unsafe_code = "forbid"
+
+[lints.clippy]
+unwrap_used = "deny"       # no panicking .unwrap(); return Result/Option, use ?
+expect_used = "deny"       # no panicking .expect()
+panic = "deny"             # no panic! on the happy/error path
+unreachable = "deny"
+todo = "deny"
+unimplemented = "deny"
+indexing_slicing = "deny"  # use .get(i) over xs[i] / &xs[a..b]

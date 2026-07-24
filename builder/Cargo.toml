@@ -10,8 +10,12 @@ name = "td-builder"
 path = "src/main.rs"
 
 # S1 is the toolchain probe: no dependencies, so the crate compiles OFFLINE in
-# the check.sh sandbox with nothing fetched. Dependencies arrive later (S2+) and
-# must be free crates vendored through the pinned channel (FSDG).
+# the check.sh sandbox with nothing fetched. The one dependency is the in-repo,
+# std-only td-engine (path member of this workspace; carries no external crates
+# of its own). Any real dependency still arrives later (S2+) and must be a free
+# crate vendored through the pinned channel (FSDG).
+[dependencies]
+td-engine = { path = "../engine" }
 
 # Rust coding rules (AGENTS.md → "Rust code"): deny the panic/indexing/unsafe
 # surface for NEW code. Existing files carry a per-file `#![allow(...)]`
@@ -32,6 +36,6 @@ todo = "deny"
 unimplemented = "deny"
 indexing_slicing = "deny"  # use .get(i) over xs[i] / &xs[a..b]
 
-[profile.release]
-# Keep the release profile explicit and minimal so the reproducibility oracle
-# (`guix build --check`) has a stable target as the binary grows.
+# NOTE: no [profile.release] here — release profile settings are only honoured
+# at the workspace root (../Cargo.toml) for a member crate; a member's own
+# [profile.*] section is ignored by cargo.
