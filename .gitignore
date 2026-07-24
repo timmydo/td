@@ -28,6 +28,10 @@
 
 .store-backend-scratch/
 
+# Store-gate commit-lock files (store-backend/store-verify): sibling `.commit.lock`
+# files to the scratch dirs above, written during a gate run. Host-local, never versioned.
+.store-*-scratch.commit.lock
+
 # Persistent content-addressed build-recipe cache (skip-if-already-realized).
 .td-build-cache
 
