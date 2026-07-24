@@ -2929,10 +2929,11 @@ fn closure_ref_memo() -> &'static std::sync::Mutex<std::collections::HashMap<([u
 
 /// The transitive closure of the control-plane builder's runtime libraries by DYNAMIC
 /// LINKAGE — the store paths the loader consults to run the builder — computed from the
-/// loader's OWN search structure (`PT_INTERP` + `DT_RUNPATH`/`DT_RPATH`), NOT a content
-/// scan. ROOTS are the builder's DIRECT runtime refs (the vouched builder-placement db's
-/// closure minus the builder tree — glibc/gcc-lib). For each store path reached, EVERY ELF
-/// object in it contributes its interp + run-path store dirs; the walk recurses to fixpoint.
+/// loader's OWN search structure (`PT_INTERP`, `DT_RUNPATH`/`DT_RPATH`, and absolute
+/// `DT_NEEDED` pathnames), NOT a content scan. ROOTS are the builder's DIRECT runtime refs
+/// (the vouched builder-placement db's closure minus the builder tree — glibc/gcc-lib).
+/// For each store path reached, EVERY ELF object contributes those loader-visible edges;
+/// the walk recurses to fixpoint.
 ///
 /// This is narrower than `scan_closure_hybrid` (`guix gc -R`) on purpose: glibc's
 /// `libc.so.6` bakes the absolute bash-static path into its `_PATH_BSHELL` STRING CONSTANT,
@@ -3006,7 +3007,7 @@ fn resolve_link_closure(
                 if !ft.is_file() {
                     continue;
                 }
-                let (interp, rpaths) = elf::runtime_link_search(&entry.path())?;
+                let (interp, rpaths, needed) = elf::runtime_link_search(&entry.path())?;
                 if let Some(i) = interp {
                     if let Some(sp) = store_path_of(&i) {
                         refs.insert(sp);
@@ -3014,6 +3015,11 @@ fn resolve_link_closure(
                 }
                 for rp in rpaths {
                     if let Some(sp) = store_path_of(&rp) {
+                        refs.insert(sp);
+                    }
+                }
+                for name in needed {
+                    if let Some(sp) = store_path_of(&name) {
                         refs.insert(sp);
                     }
                 }

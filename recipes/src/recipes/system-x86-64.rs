@@ -147,11 +147,10 @@ const BUSYBOX_APPLETS: &[&str] = &[
 /// name must be a coreutils utility the built binary implements. The recipe sandbox cannot
 /// exec the dynamically-linked binary to run `coreutils --list` at build time (its interp
 /// resolves an absolute `/td/store` path that only exists on the assembled root, not in the
-/// build tree), so `shape_check` instead statically proves the multicall AND its full
-/// runtime closure are staged on the root: a missing applet surfaces on the boot oracle, a
-/// missing library reds the build. uutils is dynamically linked, so — unlike static
-/// busybox — it drags a runtime closure (glibc, libgcc_s) that `real_root_steps` packs onto
-/// the erofs root.
+/// build tree). A missing applet surfaces on the boot oracle; the engine-native runtime
+/// closure step proves every referenced store item is declared and stages it at its
+/// canonical path. uutils is dynamically linked, so — unlike static busybox — it pulls its
+/// reachable runtime store closure onto the erofs root.
 const UUTILS_APPLETS: &[&str] = &[
     "uname", "ls", "cat", "echo", "printf", "pwd", "cp", "mv", "rm", "mkdir", "rmdir",
     "ln", "id", "env", "df", "du", "chmod", "chown", "sleep", "sync", "wc", "head",
@@ -450,31 +449,19 @@ fn real_root_steps(sys: &SystemDef) -> Vec<Step> {
             path: format!("{{root}}/real-root{d}"),
         });
     }
-    // The busybox store package copied to its content-addressed /td/store path inside the
-    // root, so /bin's symlinks (and /init) resolve on the mounted erofs.
+    // Static busybox has no runtime store closure; copy its package directly. Scanning the
+    // whole output as a runtime root would mistake build-provenance strings for runtime
+    // edges and pull its compiler into the image.
     steps.push(Step::CopyTree {
         from: "{in:busybox-x86-64}".into(),
         dest: "{root}/real-root{in:busybox-x86-64}".into(),
     });
-    // uutils' `coreutils` multicall copied to its content-addressed /td/store path (a
-    // direct, hash-prefixed store dir like busybox), so the /bin coreutils symlinks resolve
-    // on the mounted erofs (#547).
-    steps.push(Step::CopyTree {
-        from: "{in:uutils}".into(),
-        dest: "{root}/real-root{in:uutils}".into(),
-    });
-    // uutils is dynamically linked, so its runtime closure must ALSO live on the read-only
-    // root at the absolute /td/store path its interpreter + RUNPATH resolve. Both build paths
-    // (`td shell` via TD_SHELL_NATIVE_INTERP and `build-plan --auto` via the builder's derived
-    // TD_RUST_STORE_INTERP) bake the HASH-PREFIXED, nested path
-    // /td/store/<hash>-glibc-x86-64/stage/td/store/glibc-2.41-x86_64/lib/ld-linux-x86-64.so.2 —
-    // NOT a fixed /td/store/glibc-2.41-x86_64 — so stage glibc's runtime subtree UNDER its own
-    // content-addressed output dir (like busybox/uutils), matching the exact path the ELF names.
-    // `shape_check` fails closed if uutils references any /td/store package this does not stage
-    // (e.g. a separate libgcc_s dir), naming the exact miss.
-    steps.push(Step::CopyTree {
-        from: "{in:glibc-x86-64}/stage/td/store/glibc-2.41-x86_64".into(),
-        dest: "{root}/real-root{in:glibc-x86-64}/stage/td/store/glibc-2.41-x86_64".into(),
+    // Stage uutils plus every transitively referenced store item at its canonical absolute
+    // path. The engine admits only direct recipe inputs, so a new runtime dependency fails
+    // closed until it is reviewed and declared here.
+    steps.push(Step::StageRuntimeClosure {
+        roots: vec!["{in:uutils}".into()],
+        dest: "{root}/real-root".into(),
     });
     // /bin symlink farm: /bin/busybox, every applet, and /init resolve DIRECTLY into the
     // store busybox (busybox dispatches on argv[0]'s basename).
@@ -520,11 +507,11 @@ fn real_root_steps(sys: &SystemDef) -> Vec<Step> {
 /// packed under /td/store. AND that busybox actually implements EVERY BUSYBOX_APPLETS
 /// entry (incl. `switch_root`) — a config drift or tailoring typo that dropped/misnamed
 /// an applet would leave a dead /bin symlink the member checks alone can't catch. For the
-/// uutils farm: the `coreutils` multicall is staged, every UUTILS_APPLETS /bin symlink
-/// exists, and — since uutils is dynamically linked — its whole /td/store closure resolves
-/// on the root (fail-closed). All strings are ASCII (td-builder's config reader is
-/// Latin-1). This is a build sanity assert, not a behavioural test — the boot is exercised
-/// by `td-recipe-eval run` and the headless `qemu-boot-system` oracle.
+/// uutils farm: the `coreutils` multicall is staged and every UUTILS_APPLETS /bin symlink
+/// exists. Its transitive store closure is enforced and staged by `StageRuntimeClosure`.
+/// All strings are ASCII (td-builder's config reader is Latin-1). This is a build sanity
+/// assert, not a behavioural test — the boot is exercised by `td-recipe-eval run` and the
+/// headless `qemu-boot-system` oracle.
 fn shape_check() -> String {
     "init='{out}/deployment/initramfs.cpio'; root='{root}/real-root'; disk='{out}/deployment/root.erofs'; manifest='{out}/deployment/manifest'; bb='{in:busybox-x86-64}/bin/busybox'; \
      sz=$(wc -c < \"$init\"); \
@@ -552,13 +539,6 @@ fn shape_check() -> String {
      for a in @UUTILS_APPLETS@; do \
          [ \"$(readlink \"$root/bin/$a\" 2>/dev/null)\" = \"$uutgt\" ] || { echo \"root tree: /bin/$a is not a symlink to the staged uutils multicall ($uutgt) - the uutils /bin farm regressed (#547)\" >&2; exit 1; }; \
      done; \
-     pkgs=$(tr -c 'A-Za-z0-9._+/-' '\\n' < \"$uu\" | sed -n 's#^[^/]*/td/store/\\([A-Za-z0-9._+-][A-Za-z0-9._+-]*\\).*#/td/store/\\1#p' | sort -u); \
-     [ -n \"$pkgs\" ] || { echo 'root tree: extracted NO /td/store path from the uutils binary - the static closure scan (tr | sed) is broken or the binary is not dynamically linked; refusing to pass vacuously (#547)' >&2; exit 1; }; \
-     miss=0; \
-     for p in $pkgs; do \
-         [ -d \"$root$p\" ] || { echo \"root tree: uutils references store package '$p' (its interp/RUNPATH) which is NOT staged on the erofs root - the dynamic closure is incomplete (#547); add the package that provides it to native_inputs and CopyTree its store subtree onto the root\" >&2; miss=1; }; \
-     done; \
-     [ \"$miss\" = 0 ] || exit 1; \
      dsz=$(wc -c < \"$disk\"); \
      [ \"$dsz\" -ge 4096 ] || { echo \"root.erofs: implausibly small ($dsz bytes)\" >&2; exit 1; }; \
      set -- $(od -An -tx1 -j 1024 -N 4 \"$disk\"); \
@@ -572,43 +552,11 @@ fn shape_check() -> String {
         // `td/store/*/bin/busybox` glob: bash-mesboot 2.05b (this step's shell) can't expand
         // a wildcard in a non-terminal path component.
         //
-        // Validate EVERY packed applet, not just the greeter-critical few (re #541, Codex
-        // review). Names are all shell-safe identifiers, so a space-joined `for` list is
-        // safe unquoted. uutils is dynamically linked and CANNOT be exec'd in the build
-        // sandbox (its interp is an absolute /td/store path present only on the assembled
-        // root, not in the build tree), so verify its closure STATICALLY: the multicall is
-        // staged+executable, every uutils /bin link's TEXT points at that multicall (compare
-        // link text, never resolve — the target is an absolute /td/store path that dangles
-        // on the build host), and every TOP-LEVEL /td/store package dir the binary references
-        // (interp + RUNPATH) is a staged directory. We extract the FIRST `/td/store/<pkg>` per
-        // reference string, not every occurrence, and NOT via `grep -o`, for two reasons:
-        //   (1) this step runs on the mesboot0 PATH, whose grep is GNU grep 2.4 — it predates
-        //       `-o` (--only-matching), which would exit 2 and (via the emptiness guard above)
-        //       leave the recipe permanently unbuildable; and
-        //   (2) `grep -o`'s all-occurrences semantics is WRONG here. glibc is staged under its
-        //       own content-addressed output, so uutils' interp/RUNPATH nest /td/store TWICE:
-        //       `/td/store/<hash>-glibc-x86-64/stage/td/store/glibc-2.41-x86_64/lib/ld-…`. The
-        //       TOP-LEVEL package is the OUTER `<hash>-glibc-x86-64` (a real root dir); the
-        //       inner `glibc-2.41-x86_64` is a SUBPATH inside it (comes along via CopyTree),
-        //       never a top-level dir — extracting it would fail `-d "$root$p"` on every
-        //       correctly-linked image. So `tr -c` bursts the binary into tokens on any byte
-        //       outside the store-path charset (NUL, the `:` in a RUNPATH, …), and one `sed`
-        //       takes the FIRST `/td/store/<pkg>` per token: `^[^/]*` skips a non-slash prefix
-        //       (an interp abutting prior bytes) to reach the first `/td/store/`, the class
-        //       excludes `/` so it stops at the package root, and any later `/td/store/` in the
-        //       same token is that package's own subpath and is ignored. `[class]` requires >=1
-        //       char so a bare `/td/store/` cannot match vacuously; an empty scan is itself a
-        //       failure (a dynamic binary must name its interp). Assumes each store path
-        //       appears as its own absolute string (the toolchain never embeds one behind a
-        //       slash-bearing prefix) — verified against real ELFs.
-        // LIMIT: this catches PATH-referenced closure (interp + RUNPATH dirs), not a
-        // soname-only DT_NEEDED with no RUNPATH entry (e.g. libgcc_s.so.1 if the linker baked
-        // no rpath for it). That residual is caught by the qemu-boot-system oracle, which now
-        // EXECS a uutils applet by absolute path and asserts UUTILS_RUNTIME_MARKER — a broken
-        // runtime closure reds it (a static-only claim would not). That oracle is operator-run
-        // (`td-recipe-eval qemu-boot-system` needs host qemu, absent in the gated/daily
-        // sandbox), so it is a pre-landing backstop, not a per-change gate; this static scan is
-        // the per-change guard and fails closed naming any unstaged package (#547).
+        // Validate EVERY packed applet, not just the greeter-critical few. Names are all
+        // shell-safe identifiers, so a space-joined `for` list is safe unquoted. uutils
+        // cannot execute in the build sandbox because its absolute interpreter exists only
+        // inside the assembled root; compare symlink text without resolving it. The headless
+        // boot oracle executes uutils after pivoting and remains the behavioral runtime check.
         .replace("@BUSYBOX_APPLETS@", &BUSYBOX_APPLETS.join(" "))
         .replace("@UUTILS_APPLETS@", &UUTILS_APPLETS.join(" "))
 }
@@ -705,11 +653,8 @@ pub fn recipe() -> Recipe {
         // linux-x86-64: the EXPORTED gen_init_cpio packer (verified STATICALLY linked).
         // uutils: the dynamically-linked `coreutils` multicall packed as the /bin file/text
         //   userland (#547).
-        // glibc-x86-64: uutils' runtime closure (ld-linux + libc.so.6). Staged NESTED under
-        //   its own content-addressed output — /td/store/<hash>-glibc-x86-64/stage/td/store/
-        //   glibc-2.41-x86_64/… — which is the exact absolute interp/RUNPATH uutils bakes, so
-        //   it resolves on the erofs root. shape_check verifies the OUTER <hash>-glibc-x86-64
-        //   dir is staged; the inner glibc-2.41-x86_64 is a subpath inside it (via CopyTree).
+        // glibc-x86-64: uutils' declared runtime input. StageRuntimeClosure reaches it from
+        //   uutils's embedded store reference and copies the whole content-addressed item.
         .native_inputs(&["busybox-x86-64", "linux-x86-64", "uutils", "glibc-x86-64"])
         .inputs_owned(mesboot0_inputs(&[]))
         .steps(steps)
@@ -722,6 +667,31 @@ mod tests {
     #[test]
     fn deployment_contract_is_recipe_owned() {
         let steps = recipe().steps.expect("system recipe steps");
+        let closures: Vec<(&Vec<String>, &String)> = steps
+            .iter()
+            .filter_map(|step| match step {
+                Step::StageRuntimeClosure { roots, dest } => Some((roots, dest)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(closures.len(), 1, "the image needs one runtime-closure step");
+        let (roots, dest) = closures.first().expect("one runtime closure");
+        assert_eq!(
+            roots.as_slice(),
+            ["{in:uutils}"],
+            "dynamically linked uutils is the explicit runtime root"
+        );
+        assert_eq!(dest.as_str(), "{root}/real-root");
+        assert!(
+            steps.iter().all(|step| !matches!(
+                step,
+                Step::CopyTree { from, .. }
+                    if from.contains("uutils")
+                        || from.contains("glibc-x86-64")
+            )),
+            "runtime store items must not bypass StageRuntimeClosure"
+        );
+
         let pack = steps.iter().filter_map(|step| match step {
             Step::PackErofs { root, output } => Some((root.as_str(), output.as_str())),
             _ => None,

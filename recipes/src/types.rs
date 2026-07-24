@@ -121,6 +121,14 @@ pub enum Step {
         from: String,
         dest: String,
     },
+    /// Stage the transitive ELF-loader and symlink store closure of explicit
+    /// roots under `dest`. Script interpreters and data-only `dlopen` paths are
+    /// outside this step's graph. Every reachable store item must be a declared
+    /// recipe input; the engine rejects ambient or merely transitive paths.
+    StageRuntimeClosure {
+        roots: Vec<String>,
+        dest: String,
+    },
     /// Pack `root` as a deterministic EROFS image at `output` using the
     /// control-plane engine's dependency-free image writer.
     PackErofs {
@@ -303,6 +311,13 @@ impl Step {
                 "copyTree".into(),
                 Json::Obj(vec![
                     ("from".into(), Json::Str(from.clone())),
+                    ("dest".into(), Json::Str(dest.clone())),
+                ]),
+            )]),
+            Step::StageRuntimeClosure { roots, dest } => Json::Obj(vec![(
+                "stageRuntimeClosure".into(),
+                Json::Obj(vec![
+                    ("roots".into(), arr(roots)),
                     ("dest".into(), Json::Str(dest.clone())),
                 ]),
             )]),
@@ -1087,6 +1102,15 @@ mod tests {
 
     #[test]
     fn deployment_steps_emit_the_engine_dispatch_shape() {
+        let closure = Step::StageRuntimeClosure {
+            roots: vec!["{in:uutils}".into()],
+            dest: "{root}/real-root".into(),
+        };
+        assert_eq!(
+            closure.to_json().to_canonical(),
+            r#"{"stageRuntimeClosure":{"dest":"{root}/real-root","roots":["{in:uutils}"]}}"#
+        );
+
         let pack = Step::PackErofs {
             root: "{root}/real-root".into(),
             output: "{out}/deployment/root.erofs".into(),

@@ -710,7 +710,7 @@ fn run_cmd(
 // byte-identical edit. `let`-`which` bindings + `with-fluids` wrappers are
 // descended; their `{var}` references resolve to the bound program path.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// Escape a LITERAL string for the replacement side of `sed s|…|…|`: `\` and `&`
 /// are special there, and a newline would terminate the `s` command (so it
@@ -2027,6 +2027,331 @@ fn copy_file_writable(from: &Path, dest_dir: &Path) -> Result<(), String> {
         .map_err(|e| format!("chmod {}: {e}", to.display()))
 }
 
+fn runtime_candidate_index(
+    inputs: &[(String, String)],
+    target_store: &str,
+) -> Result<BTreeMap<String, PathBuf>, String> {
+    let mut store_dirs = BTreeSet::new();
+    store_dirs.insert(PathBuf::from(target_store));
+    for (_, path) in inputs {
+        if crate::store::hash_from_store_path(path).is_none() {
+            continue;
+        }
+        if let Some(parent) = Path::new(path).parent() {
+            store_dirs.insert(parent.to_path_buf());
+        }
+    }
+    let mut by_hash: BTreeMap<String, (String, String)> = BTreeMap::new();
+    for dir in store_dirs {
+        let entries = fs::read_dir(&dir).map_err(|e| {
+            format!(
+                "stageRuntimeClosure: read store {}: {e}",
+                dir.display()
+            )
+        })?;
+        for entry in entries {
+            let entry = entry.map_err(|e| {
+                format!(
+                    "stageRuntimeClosure: read store entry {}: {e}",
+                    dir.display()
+                )
+            })?;
+            let path = entry.path();
+            let path_str = path.to_str().ok_or_else(|| {
+                format!(
+                    "stageRuntimeClosure: non-UTF-8 store path under {}",
+                    dir.display()
+                )
+            })?;
+            let Some(hash) = crate::store::hash_from_store_path(path_str) else {
+                continue;
+            };
+            let name = entry.file_name().into_string().map_err(|_| {
+                format!(
+                    "stageRuntimeClosure: non-UTF-8 store entry under {}",
+                    dir.display()
+                )
+            })?;
+            // The canonical entry is shorter than its `.check`/`.chroot` siblings.
+            match by_hash.get(hash) {
+                Some((current_name, _)) if current_name.len() < name.len() => {}
+                Some((current_name, current_path)) if current_name.len() == name.len() => {
+                    if current_path != path_str {
+                        return Err(format!(
+                            "stageRuntimeClosure: store hash {hash} names both \
+                             {current_path} and {path_str}"
+                        ));
+                    }
+                }
+                _ => {
+                    by_hash.insert(hash.to_string(), (name, path_str.to_string()));
+                }
+            }
+        }
+    }
+
+    let mut candidates = BTreeMap::new();
+    for (_, (_, path)) in by_hash {
+        candidates.insert(path.clone(), PathBuf::from(path));
+    }
+    Ok(candidates)
+}
+
+/// Walk the loader-visible graph only. `runtime_link_search` projects each
+/// ELF's PT_INTERP, RUNPATH/RPATH, and DT_NEEDED plus symlink targets into the
+/// daemon-compatible hash scanner, excluding unrelated build-provenance strings.
+fn runtime_store_closure(
+    candidates: &BTreeMap<String, PathBuf>,
+    declared: &BTreeSet<String>,
+    roots: &[String],
+    target_store: &str,
+) -> Result<BTreeSet<String>, String> {
+    if roots.is_empty() {
+        return Err("stageRuntimeClosure: roots is empty".into());
+    }
+    let target_store = Path::new(target_store);
+    for root in roots {
+        if !declared.contains(root) {
+            return Err(format!(
+                "stageRuntimeClosure: root {root} is not a declared recipe input"
+            ));
+        }
+        if Path::new(root).parent() != Some(target_store)
+            || crate::store::hash_from_store_path(root).is_none()
+        {
+            return Err(format!(
+                "stageRuntimeClosure: root {root} is not a top-level item in {}",
+                target_store.display()
+            ));
+        }
+        if !candidates.contains_key(root) {
+            return Err(format!(
+                "stageRuntimeClosure: declared root {root} is absent from the staged store"
+            ));
+        }
+    }
+
+    let candidate_paths: Vec<String> = candidates.keys().cloned().collect();
+    let mut scanner = crate::scan::Scanner::new(&candidate_paths)
+        .map_err(|e| format!("stageRuntimeClosure: build reference index: {e}"))?;
+    let mut closure = BTreeSet::new();
+    let mut pending: std::collections::VecDeque<String> = roots.iter().cloned().collect();
+    while let Some(path) = pending.pop_front() {
+        if !closure.insert(path.clone()) {
+            continue;
+        }
+        let physical = candidates.get(&path).ok_or_else(|| {
+            format!("stageRuntimeClosure: reachable store item {path} is not staged")
+        })?;
+        scanner.reset();
+        let absolute_refs = scan_runtime_store_refs(&mut scanner, physical, target_store)?;
+        let mut references: BTreeSet<String> = scanner.refs().into_iter().collect();
+        references.extend(absolute_refs);
+        for reference in references {
+            if !declared.contains(&reference) {
+                return Err(format!(
+                    "stageRuntimeClosure: {path} references undeclared recipe input {reference}"
+                ));
+            }
+            if Path::new(&reference).parent() != Some(target_store) {
+                return Err(format!(
+                    "stageRuntimeClosure: {path} references {reference} outside active store {}",
+                    target_store.display()
+                ));
+            }
+            if !closure.contains(&reference) {
+                pending.push_back(reference);
+            }
+        }
+    }
+    Ok(closure)
+}
+
+fn scan_runtime_store_refs(
+    scanner: &mut crate::scan::Scanner,
+    root: &Path,
+    target_store: &Path,
+) -> Result<BTreeSet<String>, String> {
+    let mut absolute_refs = BTreeSet::new();
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(path) = pending.pop() {
+        let metadata = fs::symlink_metadata(&path)
+            .map_err(|e| format!("stageRuntimeClosure: stat {}: {e}", path.display()))?;
+        if metadata.file_type().is_dir() {
+            let entries = fs::read_dir(&path)
+                .map_err(|e| format!("stageRuntimeClosure: read dir {}: {e}", path.display()))?;
+            for entry in entries {
+                let entry = entry.map_err(|e| {
+                    format!("stageRuntimeClosure: read dir {}: {e}", path.display())
+                })?;
+                pending.push(entry.path());
+            }
+            continue;
+        }
+        if metadata.file_type().is_symlink() {
+            let target = fs::read_link(&path)
+                .map_err(|e| format!("stageRuntimeClosure: readlink {}: {e}", path.display()))?;
+            scan_runtime_fragment(
+                scanner,
+                target.as_os_str().as_encoded_bytes(),
+                &path,
+                "symlink",
+                target_store,
+                &mut absolute_refs,
+            )?;
+            continue;
+        }
+        if !metadata.file_type().is_file() {
+            continue;
+        }
+        let (interp, run_paths, needed) = crate::elf::runtime_link_search(&path)
+            .map_err(|e| format!("stageRuntimeClosure: inspect {}: {e}", path.display()))?;
+        if let Some(interp) = interp {
+            scan_runtime_fragment(
+                scanner,
+                interp.as_bytes(),
+                &path,
+                "interpreter",
+                target_store,
+                &mut absolute_refs,
+            )?;
+        }
+        for run_path in run_paths {
+            scan_runtime_fragment(
+                scanner,
+                run_path.as_bytes(),
+                &path,
+                "run-path",
+                target_store,
+                &mut absolute_refs,
+            )?;
+        }
+        for needed in needed {
+            scan_runtime_fragment(
+                scanner,
+                needed.as_bytes(),
+                &path,
+                "needed entry",
+                target_store,
+                &mut absolute_refs,
+            )?;
+        }
+    }
+    Ok(absolute_refs)
+}
+
+fn scan_runtime_fragment(
+    scanner: &mut crate::scan::Scanner,
+    fragment: &[u8],
+    path: &Path,
+    kind: &str,
+    target_store: &Path,
+    absolute_refs: &mut BTreeSet<String>,
+) -> Result<(), String> {
+    for store_dir in [target_store, Path::new("/gnu/store")] {
+        if let Some(reference) = absolute_store_reference(fragment, store_dir) {
+            absolute_refs.insert(reference);
+        }
+    }
+    std::io::Write::write_all(scanner, fragment)
+        .and_then(|()| std::io::Write::write_all(scanner, b"\0"))
+        .map_err(|e| {
+            format!(
+                "stageRuntimeClosure: scan {kind} {}: {e}",
+                path.display()
+            )
+        })
+}
+
+fn absolute_store_reference(fragment: &[u8], store_dir: &Path) -> Option<String> {
+    let prefix = store_dir.as_os_str().as_encoded_bytes();
+    let rest = fragment.strip_prefix(prefix)?.strip_prefix(b"/")?;
+    let component_len = rest
+        .iter()
+        .take_while(|byte| {
+            byte.is_ascii_alphanumeric()
+                || matches!(byte, b'+' | b'-' | b'.' | b'_' | b'?' | b'=')
+        })
+        .count();
+    let component = std::str::from_utf8(rest.get(..component_len)?).ok()?;
+    let reference = format!("{}/{}", store_dir.display(), component);
+    crate::store::name_from_store_path(&reference)?;
+    Some(reference)
+}
+
+fn copy_store_item_writable(from: &Path, to: &Path) -> Result<(), String> {
+    match fs::symlink_metadata(to) {
+        Ok(_) => {
+            return Err(format!(
+                "stageRuntimeClosure: destination already exists: {}",
+                to.display()
+            ));
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            return Err(format!(
+                "stageRuntimeClosure: stat {}: {e}",
+                to.display()
+            ));
+        }
+    }
+    let metadata = fs::symlink_metadata(from)
+        .map_err(|e| format!("stageRuntimeClosure: stat {}: {e}", from.display()))?;
+    if metadata.file_type().is_dir() {
+        return copy_tree_writable(from, to);
+    }
+    let parent = to.parent().ok_or_else(|| {
+        format!(
+            "stageRuntimeClosure: destination {} has no parent",
+            to.display()
+        )
+    })?;
+    fs::create_dir_all(parent)
+        .map_err(|e| format!("stageRuntimeClosure: mkdir {}: {e}", parent.display()))?;
+    if metadata.file_type().is_symlink() {
+        let target = fs::read_link(from)
+            .map_err(|e| format!("stageRuntimeClosure: readlink {}: {e}", from.display()))?;
+        return std::os::unix::fs::symlink(target, to)
+            .map_err(|e| format!("stageRuntimeClosure: symlink {}: {e}", to.display()));
+    }
+    fs::copy(from, to)
+        .map_err(|e| format!("stageRuntimeClosure: copy {} -> {}: {e}", from.display(), to.display()))?;
+    let mode = metadata.permissions().mode();
+    fs::set_permissions(to, fs::Permissions::from_mode((mode & 0o777) | 0o200))
+        .map_err(|e| format!("stageRuntimeClosure: chmod {}: {e}", to.display()))
+}
+
+fn stage_runtime_closure(
+    inputs: &[(String, String)],
+    roots: &[String],
+    dest: &Path,
+) -> Result<BTreeSet<String>, String> {
+    let target_store = crate::store::store_dir();
+    let candidates = runtime_candidate_index(inputs, &target_store)?;
+    let declared: BTreeSet<String> = inputs.iter().map(|(_, path)| path.clone()).collect();
+    stage_runtime_closure_from_index(&candidates, &declared, roots, &target_store, dest)
+}
+
+fn stage_runtime_closure_from_index(
+    candidates: &BTreeMap<String, PathBuf>,
+    declared: &BTreeSet<String>,
+    roots: &[String],
+    target_store: &str,
+    dest: &Path,
+) -> Result<BTreeSet<String>, String> {
+    let closure = runtime_store_closure(candidates, declared, roots, target_store)?;
+    for path in &closure {
+        let relative = Path::new(path)
+            .strip_prefix("/")
+            .map_err(|_| format!("stageRuntimeClosure: store path is not absolute: {path}"))?;
+        let physical = candidates.get(path).ok_or_else(|| {
+            format!("stageRuntimeClosure: reachable store item {path} is not staged")
+        })?;
+        copy_store_item_writable(physical, &dest.join(relative))?;
+    }
+    Ok(closure)
+}
+
 fn bytes_contains(hay: &[u8], needle: &[u8]) -> bool {
     !needle.is_empty() && hay.windows(needle.len()).any(|w| w == needle)
 }
@@ -2292,6 +2617,10 @@ pub fn run_mesboot() -> Result<(), String> {
             let from = ctx.expand(&field(o, "from")?).map_err(err)?;
             let dest = ctx.expand(&field(o, "dest")?).map_err(err)?;
             copy_tree_writable(Path::new(&from), Path::new(&dest)).map_err(err)?;
+        } else if let Some(o) = step.get("stageRuntimeClosure") {
+            let roots = ctx.expand_all(&strs(o, "roots")?).map_err(err)?;
+            let dest = ctx.expand(&field(o, "dest")?).map_err(err)?;
+            stage_runtime_closure(&ctx.inputs, &roots, Path::new(&dest)).map_err(err)?;
         } else if let Some(o) = step.get("packErofs") {
             let root = ctx.expand(&field(o, "root")?).map_err(err)?;
             let output = ctx.expand(&field(o, "output")?).map_err(err)?;
@@ -2753,6 +3082,186 @@ mod tests {
         assert_eq!(data & 0o111, 0, "plain file stays non-exec: {data:o}");
         assert_eq!(data & 0o200, 0o200, "owner write added: {data:o}");
         fs::remove_dir_all(&d).unwrap();
+    }
+
+    fn runtime_test_item(
+        dir: &Path,
+        hash: &str,
+        name: &str,
+        runtime_ref: Option<&str>,
+    ) -> (String, PathBuf) {
+        let canonical = format!("/td/store/{hash}-{name}");
+        let physical = dir.join(format!("{hash}-{name}"));
+        fs::create_dir_all(&physical).unwrap();
+        fs::write(physical.join("payload"), b"runtime payload").unwrap();
+        if let Some(reference) = runtime_ref {
+            std::os::unix::fs::symlink(reference, physical.join("runtime-ref")).unwrap();
+        }
+        (canonical, physical)
+    }
+
+    fn runtime_needed_elf(needed: &str) -> Vec<u8> {
+        const EHDR: usize = 64;
+        const PHENT: usize = 56;
+        const DYNENT: usize = 16;
+        let dyn_off = EHDR + 2 * PHENT;
+        let dyn_size = 3 * DYNENT;
+        let strtab_off = dyn_off + dyn_size;
+        let total = strtab_off + 1 + needed.len() + 1;
+        let mut bytes = vec![0u8; total];
+        bytes.get_mut(0..4).unwrap().copy_from_slice(b"\x7fELF");
+        bytes[4] = 2;
+        bytes[5] = 1;
+        let put_u64 = |bytes: &mut [u8], offset: usize, value: u64| {
+            bytes
+                .get_mut(offset..offset + 8)
+                .unwrap()
+                .copy_from_slice(&value.to_le_bytes());
+        };
+        put_u64(&mut bytes, 0x20, EHDR as u64);
+        bytes
+            .get_mut(0x36..0x38)
+            .unwrap()
+            .copy_from_slice(&(PHENT as u16).to_le_bytes());
+        bytes
+            .get_mut(0x38..0x3a)
+            .unwrap()
+            .copy_from_slice(&2u16.to_le_bytes());
+
+        bytes
+            .get_mut(EHDR..EHDR + 4)
+            .unwrap()
+            .copy_from_slice(&1u32.to_le_bytes());
+        put_u64(&mut bytes, EHDR + 0x20, total as u64);
+        let dynamic = EHDR + PHENT;
+        bytes
+            .get_mut(dynamic..dynamic + 4)
+            .unwrap()
+            .copy_from_slice(&2u32.to_le_bytes());
+        put_u64(&mut bytes, dynamic + 0x08, dyn_off as u64);
+        put_u64(&mut bytes, dynamic + 0x10, dyn_off as u64);
+        put_u64(&mut bytes, dynamic + 0x20, dyn_size as u64);
+
+        put_u64(&mut bytes, dyn_off, 5);
+        put_u64(&mut bytes, dyn_off + 8, strtab_off as u64);
+        put_u64(&mut bytes, dyn_off + DYNENT, 1);
+        put_u64(&mut bytes, dyn_off + DYNENT + 8, 1);
+        bytes
+            .get_mut(strtab_off + 1..strtab_off + 1 + needed.len())
+            .unwrap()
+            .copy_from_slice(needed.as_bytes());
+        bytes
+    }
+
+    #[test]
+    fn runtime_closure_stages_transitive_declared_refs_once() {
+        let d = test_dir("runtime-closure");
+        let _ = fs::remove_dir_all(&d);
+        fs::create_dir_all(&d).unwrap();
+        let hash_a = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let hash_b = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let hash_c = "cccccccccccccccccccccccccccccccc";
+        let path_a = format!("/td/store/{hash_a}-app");
+        let path_b = format!("/td/store/{hash_b}-lib");
+        let path_c = format!("/td/store/{hash_c}-loader");
+        let (a, a_disk) = runtime_test_item(&d, hash_a, "app", None);
+        let (b, b_disk) = runtime_test_item(&d, hash_b, "lib", Some(&path_c));
+        let (c, c_disk) = runtime_test_item(&d, hash_c, "loader", Some(&path_a));
+        fs::write(a_disk.join("app"), runtime_needed_elf(&path_b)).unwrap();
+        let candidates = BTreeMap::from([
+            (a.clone(), a_disk),
+            (b.clone(), b_disk),
+            (c.clone(), c_disk),
+        ]);
+        let declared = BTreeSet::from([a.clone(), b.clone(), c.clone()]);
+        let dest = d.join("root");
+
+        let closure = stage_runtime_closure_from_index(
+            &candidates,
+            &declared,
+            &[a.clone(), c],
+            "/td/store",
+            &dest,
+        )
+        .unwrap();
+
+        assert_eq!(closure, BTreeSet::from([a, path_b, path_c]));
+        for path in &closure {
+            let relative = Path::new(path).strip_prefix("/").unwrap();
+            assert!(
+                dest.join(relative).join("payload").is_file(),
+                "closure member was not staged at its canonical path: {path}"
+            );
+        }
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn runtime_closure_rejects_undeclared_and_foreign_refs() {
+        let d = test_dir("runtime-closure-reject");
+        let _ = fs::remove_dir_all(&d);
+        fs::create_dir_all(&d).unwrap();
+        let hash_a = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let hash_b = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let undeclared = format!("/td/store/{hash_b}-ambient");
+        let (app_path, app_disk) = runtime_test_item(&d, hash_a, "app", None);
+        let candidates = BTreeMap::from([(app_path.clone(), app_disk.clone())]);
+        let declared = BTreeSet::from([app_path.clone()]);
+
+        fs::write(app_disk.join("payload"), &undeclared).unwrap();
+        assert_eq!(
+            runtime_store_closure(
+                &candidates,
+                &declared,
+                &[app_path.clone()],
+                "/td/store",
+            )
+            .unwrap(),
+            BTreeSet::from([app_path.clone()]),
+            "a provenance string outside loader metadata is not a runtime edge"
+        );
+        std::os::unix::fs::symlink(&undeclared, app_disk.join("runtime-ref")).unwrap();
+        let error = runtime_store_closure(
+            &candidates,
+            &declared,
+            &[app_path.clone()],
+            "/td/store",
+        )
+        .unwrap_err();
+        assert!(
+            error.contains("references undeclared recipe input") && error.contains(&undeclared),
+            "{error}"
+        );
+
+        let foreign = format!("/gnu/store/{hash_b}-foreign");
+        let (_foreign_path, foreign_disk) = runtime_test_item(&d, hash_b, "foreign", None);
+        fs::remove_file(app_disk.join("runtime-ref")).unwrap();
+        std::os::unix::fs::symlink(&foreign, app_disk.join("runtime-ref")).unwrap();
+        let candidates = BTreeMap::from([
+            (app_path.clone(), app_disk),
+            (foreign.clone(), foreign_disk),
+        ]);
+        let declared = BTreeSet::from([app_path.clone(), foreign.clone()]);
+        let error =
+            runtime_store_closure(&candidates, &declared, &[app_path], "/td/store").unwrap_err();
+        assert!(
+            error.contains("outside active store") && error.contains(&foreign),
+            "{error}"
+        );
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn runtime_closure_rejects_a_root_not_declared_directly() {
+        let path = "/td/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-app".to_string();
+        let error = runtime_store_closure(
+            &BTreeMap::new(),
+            &BTreeSet::new(),
+            &[path],
+            "/td/store",
+        )
+        .unwrap_err();
+        assert!(error.contains("root") && error.contains("not a declared recipe input"), "{error}");
     }
 
     #[test]

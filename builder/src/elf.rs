@@ -168,7 +168,7 @@ impl<'a> Elf<'a> {
         let phoff = self.word(off)? as usize;
         let phentsize = u16le(self.b, ents)? as usize;
         let phnum = u16le(self.b, num)? as usize;
-        if phentsize < min_ents {
+        if phnum != 0 && phentsize < min_ents {
             return Err(format!("implausible e_phentsize {phentsize}"));
         }
         Ok((phoff, phentsize, phnum))
@@ -506,11 +506,12 @@ pub fn set_rpath(path: &Path, new_rpath: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// The dynamic-linkage SEARCH references of a file: its program interpreter (`PT_INTERP`)
-/// and every colon-separated entry of its `DT_RUNPATH`/`DT_RPATH` run-path — i.e. the paths
-/// the loader consults to find the interpreter and the DT_NEEDED libraries. A NON-ELF file
-/// (a shell script, a header, a static archive) yields `(None, [])`; a static ELF yields its
-/// interp (`None`) and empty run-path. Reads the file at most once.
+/// The dynamic-linkage SEARCH references of a file: its program interpreter (`PT_INTERP`),
+/// every colon-separated entry of its `DT_RUNPATH`/`DT_RPATH` run-path, and its
+/// `DT_NEEDED` entries. A needed entry containing `/` is itself a loader pathname, while a
+/// soname is resolved through the run-path. A NON-ELF file (a shell script, a header, a
+/// static archive) yields three empty values; a static ELF does likewise. Reads the file at
+/// most once.
 ///
 /// This is the loader's OWN view, and it is deliberately NARROWER than a content scan
 /// (`guix gc -R` / `scan::Scanner`): a store item can NAME another store path in a string
@@ -522,11 +523,23 @@ pub fn set_rpath(path: &Path, new_rpath: &str) -> Result<(), String> {
 /// host shell absent (re #469). The run-path entries are returned verbatim (absolute store
 /// dirs for a Guix binary, possibly with unnormalized `..` tails or `$ORIGIN`); the caller
 /// extracts the store PATH, for which the `..` tail is irrelevant.
-pub fn runtime_link_search(path: &Path) -> Result<(Option<String>, Vec<String>), String> {
-    let b = std::fs::read(path).map_err(|e| format!("read {}: {e}", path.display()))?;
-    if b.len() < 4 || &b[0..4] != EI_MAG {
-        return Ok((None, Vec::new())); // not an ELF — no dynamic-linkage search set
+pub fn runtime_link_search(
+    path: &Path,
+) -> Result<(Option<String>, Vec<String>, Vec<String>), String> {
+    let mut file =
+        std::fs::File::open(path).map_err(|e| format!("read {}: {e}", path.display()))?;
+    let mut magic = [0u8; 4];
+    match std::io::Read::read_exact(&mut file, &mut magic) {
+        Ok(()) if magic == EI_MAG => {}
+        Ok(()) => return Ok((None, Vec::new(), Vec::new())),
+        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+            return Ok((None, Vec::new(), Vec::new()));
+        }
+        Err(e) => return Err(format!("read {}: {e}", path.display())),
     }
+    let mut b = magic.to_vec();
+    std::io::Read::read_to_end(&mut file, &mut b)
+        .map_err(|e| format!("read {}: {e}", path.display()))?;
     let interp = match interp_slot(&b)? {
         None => None,
         Some((off, sz)) => {
@@ -552,7 +565,27 @@ pub fn runtime_link_search(path: &Path) -> Result<(Option<String>, Vec<String>),
             }
         }
     }
-    Ok((interp, dirs))
+    Ok((interp, dirs, needed_names(&b)?))
+}
+
+fn needed_names(b: &[u8]) -> Result<Vec<String>, String> {
+    let slots = match needed_slots(b)? {
+        None => return Ok(Vec::new()),
+        Some(slots) => slots,
+    };
+    let mut names = Vec::with_capacity(slots.offsets.len());
+    for offset in slots.offsets {
+        let offset = usize::try_from(offset)
+            .map_err(|_| "DT_NEEDED string offset does not fit this architecture")?;
+        let off = slots
+            .strtab_off
+            .checked_add(offset)
+            .ok_or("DT_NEEDED string offset overflow")?;
+        let raw = b.get(off..).ok_or("DT_NEEDED string offset past end of file")?;
+        let end = raw.iter().position(|&c| c == 0).unwrap_or(raw.len());
+        names.push(String::from_utf8_lossy(&raw[..end]).into_owned());
+    }
+    Ok(names)
 }
 
 /// Read the DT_NEEDED shared-object names of a dynamic ELF — the libraries the loader would
@@ -562,18 +595,7 @@ pub fn runtime_link_search(path: &Path) -> Result<(Option<String>, Vec<String>),
 /// host `readelf` (which would itself be host-executable ingress, re #469).
 pub fn read_needed(path: &Path) -> Result<Vec<String>, String> {
     let b = std::fs::read(path).map_err(|e| format!("read {}: {e}", path.display()))?;
-    let slots = match needed_slots(&b)? {
-        None => return Ok(Vec::new()),
-        Some(s) => s,
-    };
-    let mut names = Vec::with_capacity(slots.offsets.len());
-    for o in slots.offsets {
-        let off = slots.strtab_off + o as usize;
-        let raw = b.get(off..).ok_or("DT_NEEDED string offset past end of file")?;
-        let end = raw.iter().position(|&c| c == 0).unwrap_or(raw.len());
-        names.push(String::from_utf8_lossy(&raw[..end]).into_owned());
-    }
-    Ok(names)
+    needed_names(&b)
 }
 
 /// Assert an ELF is FULLY STATIC — no program interpreter (`PT_INTERP`), no `DT_NEEDED`
@@ -971,21 +993,42 @@ mod tests {
         let f = dir.join("a");
         // A run-path-only dynamic ELF (no interp): the colon-separated entries split out.
         std::fs::write(&f, synth_dyn_elf("/gnu/store/aaa/lib:/gnu/store/bbb/lib", true, true)).unwrap();
-        let (interp, dirs) = runtime_link_search(&f).unwrap();
+        let (interp, dirs, needed) = runtime_link_search(&f).unwrap();
         assert_eq!(interp, None);
         assert_eq!(dirs, vec!["/gnu/store/aaa/lib".to_string(), "/gnu/store/bbb/lib".to_string()]);
+        assert!(needed.is_empty());
         // An interp-only ELF (no PT_DYNAMIC): interp out, no run-path.
         std::fs::write(&f, synth_elf("/gnu/store/ccc/lib/ld-linux-x86-64.so.2")).unwrap();
-        let (interp, dirs) = runtime_link_search(&f).unwrap();
+        let (interp, dirs, needed) = runtime_link_search(&f).unwrap();
         assert_eq!(interp.as_deref(), Some("/gnu/store/ccc/lib/ld-linux-x86-64.so.2"));
         assert!(dirs.is_empty());
+        assert!(needed.is_empty());
+        // A DT_NEEDED name containing a slash is opened as a pathname, without a run-path.
+        let absolute_needed = "/td/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-lib/lib/libfoo.so";
+        std::fs::write(&f, synth_needed_elf(&[absolute_needed], true)).unwrap();
+        let (interp, dirs, needed) = runtime_link_search(&f).unwrap();
+        assert_eq!(interp, None);
+        assert!(dirs.is_empty());
+        assert_eq!(needed, [absolute_needed]);
         // A NON-ELF file (a script, a header) has NO dynamic-linkage search set — this is
         // exactly why a store path named only in such a file (bash-static in glibc's
         // bin/ldd or include/paths.h) never enters the builder's runtime closure (re #469).
         std::fs::write(&f, b"#!/gnu/store/ddd-bash/bin/sh\necho hi\n").unwrap();
-        let (interp, dirs) = runtime_link_search(&f).unwrap();
+        let (interp, dirs, needed) = runtime_link_search(&f).unwrap();
         assert_eq!(interp, None);
         assert!(dirs.is_empty());
+        assert!(needed.is_empty());
+        // A relocatable ELF object legitimately has no program headers. It is not a
+        // loader input by itself and contributes no interpreter or run-path.
+        let mut reloc = vec![0u8; 64];
+        reloc[0..4].copy_from_slice(EI_MAG);
+        reloc[EI_CLASS] = 2;
+        reloc[EI_DATA] = 1;
+        std::fs::write(&f, reloc).unwrap();
+        let (interp, dirs, needed) = runtime_link_search(&f).unwrap();
+        assert_eq!(interp, None);
+        assert!(dirs.is_empty());
+        assert!(needed.is_empty());
         std::fs::remove_dir_all(&dir).ok();
     }
 
