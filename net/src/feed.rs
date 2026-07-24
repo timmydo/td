@@ -1,13 +1,3 @@
-#![allow(
-    clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::panic,
-    clippy::unreachable,
-    clippy::todo,
-    clippy::unimplemented,
-    clippy::indexing_slicing
-)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md). This single-file network tool is not linted in the loop (the cargo-test gate's clippy leg covers only the dependency-free engine crates); the [lints] table still guards new unsafe (forbid) and enforces under a local `cargo clippy`.
-
 // td-feed — td's OWN local HTTP mirror of the artifacts this repo downloads over the
 // network. A sibling of fetch/ (td-fetch) reusing the same pure-Rust HTTP(S)+sha256 stack
 // (ureq + rustls/ring + sha2); the mirror server uses only std::net (no extra crate).
@@ -1767,12 +1757,22 @@ fn ensure_serve_daemon(feed_dir: &Path) -> Result<String, String> {
         Ok(v) if !v.trim().is_empty() && Path::new(&v).is_file() => PathBuf::from(v),
         _ => std::env::current_exe().map_err(|e| format!("cannot resolve current_exe: {e}"))?,
     };
+    // Route the daemon self-spawn through the umbrella `feed` selector ONLY when the resolved
+    // binary IS the td-net multicall: current_exe() resolves /proc/self/exe to the real file
+    // (basename `td-net`), NOT the td-feed applet link, so the umbrella needs the selector. A
+    // `td-feed`-named link already dispatches by basename; and any OTHER name — an explicit
+    // TD_FEED_BIN the operator aimed at a standalone (non-multicall) feed executable — must be
+    // invoked verbatim (`<bin> serve …`), never handed a spurious `feed` arg it can't parse.
+    let is_umbrella = Path::new(&bin).file_name().and_then(|s| s.to_str()) == Some("td-net");
     let log = std::fs::File::create(&log_f)
         .map_err(|e| format!("create {}: {e}", log_f.display()))?;
     let log2 = log
         .try_clone()
         .map_err(|e| format!("clone log fd: {e}"))?;
     let mut cmd = Command::new(&bin);
+    if is_umbrella {
+        cmd.arg("feed");
+    }
     cmd.arg("serve")
         .arg(&store)
         .arg("127.0.0.1:0")
@@ -1807,8 +1807,7 @@ fn ensure_serve_daemon(feed_dir: &Path) -> Result<String, String> {
     Err(format!("daemon did not report an address:\n{tail}"))
 }
 
-fn main() {
-    let a: Vec<String> = std::env::args().collect();
+pub fn run(a: &[String]) {
     match a.get(1).map(String::as_str) {
         // warm <action> — the structured host-PREP orchestration (consolidated warm-*.sh).
         // The low-level `warm INDEX STORE` primitive (feed-shared gate, feed-ensure serve)

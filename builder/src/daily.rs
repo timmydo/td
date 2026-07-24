@@ -675,9 +675,23 @@ fn publish_export(
     }
     if stash_td_subst {
         // Stash the consumer's td-subst into the store so the host prelude exposes it.
-        let _ = Command::new("cp")
-            .args(["-a", sb, &format!("{store}/td-subst")])
-            .status();
+        // -aL dereferences: td-subst is now typically a symlink to the td-net multicall, so
+        // follow it and stash a real binary named td-subst (basename dispatch → subst applet)
+        // rather than a dangling link that subst_env_at would reject. Remove the destination
+        // FIRST: GNU cp follows a dangling destination symlink instead of replacing it (a
+        // prior `cp -a` of the symlink could have left `$store/td-subst -> td-net` dangling),
+        // so onto a fresh path -aL always lands a real file. A failed stash is only a warning
+        // — the substitute is an optimization, never a correctness dependency.
+        let dst = format!("{store}/td-subst");
+        let _ = std::fs::remove_file(&dst);
+        let stashed = Command::new("cp")
+            .args(["-aL", sb, &dst])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !stashed {
+            println!(">> {label}: WARN — stash of td-subst into {store} failed; loop prelude will lack it");
+        }
     }
     println!(">> {label}: signed + published {what} to {store} (the loop resolver fetches it; trust = tests/td-subst.pub)");
 }

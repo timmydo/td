@@ -1,22 +1,29 @@
 [package]
-name = "td-feed"
+name = "td-net"
 version = "0.1.0"
 edition = "2021"
 
+# One multicall (busybox-style) binary for td's OWN network tools: the former
+# fetch/ (td-fetch), feed/ (td-feed), and subst/ (td-subst) crates. argv[0]'s
+# basename selects the applet, so the td-fetch/td-feed/td-subst links dispatch
+# with the caller's argv unchanged (src/main.rs).
 [[bin]]
-name = "td-feed"
+name = "td-net"
 path = "src/main.rs"
 
 [dependencies]
+# Union of the three former crates' deps. ureq + sha2 are shared by all three;
+# ring (ed25519) is td-subst's only.
 ureq = { version = "2", default-features = false, features = ["tls"] }
 sha2 = "0.10"
+ring = "0.17"
 
 # Rust coding rules (AGENTS.md → "Rust code"). This is a NETWORK tool — the only
 # tier allowed dependencies (the vendored-through-the-cargo-proxy FSDG set above);
 # adding a NEW dep is a reviewed decision. The panic/indexing rules still apply;
-# existing files carry a per-file `#![allow(...)]` grandfather header. (The
-# cargo-test gate's clippy leg lints only the dependency-free engine crates offline;
-# these fire under a local `cargo clippy`.)
+# the merged applets carry a crate-level `#![allow(...)]` grandfather header in
+# src/main.rs. (The cargo-test gate's clippy leg lints only the dependency-free
+# engine crates offline; these fire under a local `cargo clippy`.)
 [lints.rust]
 unsafe_code = "forbid"     # no unsafe in the network tools
 

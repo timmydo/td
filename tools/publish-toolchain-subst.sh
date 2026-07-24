@@ -20,7 +20,8 @@
 #   OUT_STORE  the persistent substitute store dir to write <hash>.narinfo + nar/ into
 # Env:
 #   TD_BUILDER        td-builder (toolchain-path/subst-export) (REQUIRED)
-#   TD_SUBST_BIN      td-subst (sign) (REQUIRED)
+#   TD_SUBST_BIN      td-subst, sign (REQUIRED). A `td-subst`-named link to the td-net
+#                     multicall (basename dispatch); a bare `td-net` will not route.
 #   TD_SUBST_PRIVKEY  the daily-runner's ed25519 private key, pkcs8 (REQUIRED, host secret)
 #   TD_STORE_DIR      logical store prefix (default: /td/store)
 set -eu

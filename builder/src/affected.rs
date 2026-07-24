@@ -474,16 +474,15 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
         return;
     }
 
-    if pattern_matches("fetch/*|fetch/src/*|fetch/Cargo.toml|fetch/Cargo.lock", p) {
-        // No gate builds the fetch crate from source (the td-fetch corpus recipe is
-        // retired), so a change to it validates on the bounded check-pr tier.
+    if pattern_matches("net/*|net/src/*|net/Cargo.toml|net/Cargo.lock", p) {
+        // The merged td-net (fetch/feed/subst). It holds the host-PREP warm that feeds the
+        // recipe-graph consumers (`warm sources` + `warm kernel-headers`) → the chain targets
+        // (former feed coverage); AND, since the old fetch/* mapped to the bounded check-pr
+        // tier, a net-only change must keep that per-PR validation — the chain targets are
+        // daily-DEFERRED, so without check-pr a net-only diff would run nothing while waiving
+        // the full check. The union of BOTH former rules. No gate builds td-net from source;
+        // the warm compiles it.
         sel.add_target("check-pr");
-        return;
-    }
-
-    if pattern_matches("feed/*|feed/src/*|feed/Cargo.toml|feed/Cargo.lock", p) {
-        // main.rs holds the host-PREP warm that feeds the recipe graph consumers
-        // (`warm sources` + `warm kernel-headers`).
         add_chain_targets(sel);
         return;
     }
@@ -1044,11 +1043,14 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
     assert_target!("recipes/build.rs", "recipe-rs");
     assert_target!("recipes/Cargo.toml", "recipe-rs");
     assert_target!("builder/src/gate_defs/207-recipe-rs.rs", "recipe-rs");
-    // No gate builds the fetch crate from source (the td-fetch corpus recipe is
-    // retired), so a change to it validates on the bounded check-pr tier.
-    assert_target!("fetch/Cargo.lock", "check-pr");
-    // A feed/src change smokes the warm-sources consumer — the i686 chain's proof target set.
-    assert_target!("feed/src/main.rs", "recipe-checks-daily");
+    // The merged td-net gets the union of the former fetch/feed rules: the chain targets
+    // (no gate builds it from source; its main.rs holds the warm-sources consumer smoked by
+    // the i686 chain's proof set) AND the bounded check-pr tier (former fetch coverage) so a
+    // net-ONLY diff still runs a per-PR gate rather than only daily-deferred chain targets.
+    assert_target!("net/Cargo.lock", "recipe-checks-daily");
+    assert_target!("net/src/main.rs", "recipe-checks-daily");
+    assert_target!("net/src/fetch.rs", "check-pr");
+    assert_target!("net/Cargo.toml", "check-pr");
     // td-kexec/src is include_str!'d into the target artifact, so a helper-source edit
     // rides the host cargo preflight (check-pr) AND is recorded as deferred to the daily
     // backstop (recipe-checks-daily statically links it via td-kexec-test).

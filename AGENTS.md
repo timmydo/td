@@ -11,9 +11,10 @@ with the target distribution artifact graph.
 ## Control plane
 
 The host builder supplies a pinned Rust toolchain used to compile td's
-control-plane programs (`td-builder`, `td-recipe-eval`, `td-fetch`,
-and related tools). These programs may evaluate recipes, fetch
-declared fixed-output sources, construct sandboxes, and place outputs.
+control-plane programs (`td-builder`, `td-recipe-eval`, and the `td-net`
+network multicall — fetch/feed/subst — and related tools). These programs
+may evaluate recipes, fetch declared fixed-output sources, construct
+sandboxes, and place outputs.
 The `td-builder` executable that implements a derivation is staged and
 executed with explicit `ControlPlaneBuilder` provenance solely to run
 that build. This typed exception does not make it a recipe tool, target

@@ -24,7 +24,10 @@
 # Env:
 #   TD_SUBST_STORE   persistent signed substitute store dir (REQUIRED; MISS if unset/absent)
 #   TD_SUBST_PUBKEY  pinned ed25519 public key, hex (default: tests/td-subst.pub)
-#   TD_SUBST_BIN     the td-subst binary (serve/fetch) (REQUIRED)
+#   TD_SUBST_BIN     the td-subst binary, serve/fetch (REQUIRED). This runs as a single
+#                    executable path (`"$TD_SUBST_BIN" serve …`), so it must be a
+#                    `td-subst`-named link to the td-net multicall (basename dispatch); a
+#                    bare `td-net` (or a `td-net subst` two-token string) will not route.
 #   TD_BUILDER       the td-builder binary (toolchain-path/nar-restore) (REQUIRED)
 #   TD_STORE_DIR     logical store prefix (default: /td/store)
 # stdout (HIT only): the restored toolchain path (DEST/<basename>)

@@ -975,8 +975,9 @@ fn find_in_frags(frags: &str, bin: &str) -> Option<PathBuf> {
     })
 }
 
-/// Build a td network tool (`dir` = feed/fetch — the only tools this is called
-/// for) with the HOST cargo, STATICALLY linked (crt-static against a matched
+/// Build a td network tool (`dir` = `net`, the merged td-net multicall — the only
+/// crate this is called for, via [`host_net_applet`]) with the HOST cargo, STATICALLY
+/// linked (crt-static against a matched
 /// glibc), and return the binary. Best-effort: any missing piece (no toolchain,
 /// no static glibc, a non-static result) logs and returns `None` so the warm
 /// degrades to the td-built binary or is skipped — it never returns a
@@ -987,10 +988,11 @@ fn find_in_frags(frags: &str, bin: &str) -> Option<PathBuf> {
 /// is present, so the static glibc's runtime `dlopen` of NSS modules during DNS
 /// resolves normally. `assert_static` proves an empty STARTUP closure (no
 /// PT_INTERP/DT_NEEDED/run-path — the flake fix), NOT that DNS needs zero runtime
-/// DSOs. td-subst is deliberately NOT built here: it is sourced ambiently
-/// (`TD_SUBST_BIN`/PATH, `daily::publish_substitutes`) and runs inside the
-/// NEWNET-isolated loop sandbox, so its name-resolution/NSS posture is a separate
-/// question (PR #534 discussion) — statically linking it is out of scope.
+/// DSOs. td-subst's code compiles into td-net, but the td-subst APPLET is deliberately
+/// NOT resolved here (host_net_applet is called only for the fetch/feed applets): it is
+/// sourced ambiently (`TD_SUBST_BIN`/PATH, `daily::publish_substitutes`) and runs inside
+/// the NEWNET-isolated loop sandbox, so its name-resolution/NSS posture is a separate
+/// question (PR #534 discussion) — statically linking that path is out of scope.
 ///
 /// Unlike the pure-std tools, the network crates (ureq/rustls/ring) pull in
 /// PROC-MACROS that must compile for the host compiler, so `+crt-static` cannot
@@ -1134,6 +1136,51 @@ fn host_cargo_bin(root: &Path, dir: &str, bin: &str, deadline: Option<Instant>) 
     Some(p)
 }
 
+/// Build the merged `net` control-plane crate (td-net) with the host cargo, statically,
+/// then return an APPLET-named link to it (td-fetch/td-feed/td-subst) beside the binary —
+/// so argv[0] basename multicall dispatch selects the applet with the caller's argv
+/// UNCHANGED. One td-net build is shared across the applets. None on any build/link
+/// failure (best-effort warm; the gates enforce presence).
+fn host_net_applet(root: &Path, applet: &str, deadline: Option<Instant>) -> Option<PathBuf> {
+    let td_net = host_cargo_bin(root, "net", "td-net", deadline)?;
+    let link = td_net.with_file_name(applet);
+    if link == td_net {
+        return Some(link);
+    }
+    // Point the applet link at the freshly built td-net. A RELATIVE target keeps
+    // /proc/self/exe resolving to td-net — feed's daemon self-spawn relies on that
+    // (net/src/feed.rs). Do it race-free: concurrent preludes warm the same target dir, so a
+    // naive remove-then-symlink lets one caller observe the other's half-done state and
+    // spuriously skip. Fast-path an already-correct link; else create at a per-process temp
+    // name and rename() over the destination (atomic replace of any stale/dangling link); on a
+    // lost race, accept the peer's correct link.
+    let want = Path::new("td-net");
+    if std::fs::read_link(&link).ok().as_deref() == Some(want) {
+        return Some(link);
+    }
+    let tmp = link.with_file_name(format!(".{applet}.tmp.{}", std::process::id()));
+    let _ = std::fs::remove_file(&tmp);
+    if let Err(e) = std::os::unix::fs::symlink(want, &tmp) {
+        eprintln!(
+            "td-builder check: net applet link {}: {e} — skipping host build",
+            link.display()
+        );
+        return None;
+    }
+    if let Err(e) = std::fs::rename(&tmp, &link) {
+        let _ = std::fs::remove_file(&tmp);
+        if std::fs::read_link(&link).ok().as_deref() == Some(want) {
+            return Some(link);
+        }
+        eprintln!(
+            "td-builder check: net applet link {}: {e} — skipping host build",
+            link.display()
+        );
+        return None;
+    }
+    Some(link)
+}
+
 /// One `[[package]]` entry of a Cargo.lock that carries a checksum — `(name,
 /// version, sha256)`. The checksummed entries are the vendored crates-io deps;
 /// the root (path) crate has no checksum and is excluded, exactly the
@@ -1213,7 +1260,7 @@ fn warm_crate_closure(root: &Path, lock_rel: &str, name: &str) {
         ".td-build-cache/td-fetch-recipe-check/sd/newstore",
         "td-fetch",
     )
-    .or_else(|| host_cargo_bin(root, "fetch", "td-fetch", deadline)) else {
+    .or_else(|| host_net_applet(root, "td-fetch", deadline)) else {
         eprintln!(
             "td-builder check: warm {name} crates: no td-fetch binary — skipping (PREP best-effort)"
         );
@@ -1285,8 +1332,9 @@ fn warm_crate_closure(root: &Path, lock_rel: &str, name: &str) {
 /// so a warm placed after it never runs. Best-effort (a missing fetcher / no
 /// network warns; the recipe checks enforce presence).
 fn warm_td_crate_closure(root: &Path) {
-    // td-fetch's own crate closure (its own warm — not the cargo-proxy).
-    warm_crate_closure(root, "fetch/Cargo.lock", "td-fetch");
+    // td-net's own crate closure (the merged fetch/feed/subst deps — its own warm, not
+    // the cargo-proxy). The fetcher used to warm it is the td-fetch applet of td-net.
+    warm_crate_closure(root, "net/Cargo.lock", "td-net");
 }
 
 /// Generate the host-produced Linux UAPI header seeds
@@ -1307,7 +1355,7 @@ fn warm_kernel_headers_seed(root: &Path) {
     let newstore = newstore_bin(root, ".td-build-cache/td-feed/sd/newstore", "td-feed");
     let primary = match newstore.clone() {
         Some(p) => p,
-        None => match host_cargo_bin(root, "feed", "td-feed", deadline) {
+        None => match host_net_applet(root, "td-feed", deadline) {
             Some(p) => p,
             None => {
                 eprintln!(
@@ -1333,7 +1381,7 @@ fn warm_kernel_headers_seed(root: &Path) {
         );
         return;
     }
-    let Some(fresh) = host_cargo_bin(root, "feed", "td-feed", deadline) else {
+    let Some(fresh) = host_net_applet(root, "td-feed", deadline) else {
         eprintln!(
             "td-builder check: kernel-headers seed still absent for {} and no source-built \
              td-feed to retry — the loop intern will report it",
@@ -1402,7 +1450,7 @@ fn heavy_warms(root: &Path) {
     // Resolve ONE host td-feed binary: the gate's td-built one, else a host
     // cargo build of feed/.
     let Some(tdfeed) = newstore_bin(root, ".td-build-cache/td-feed/sd/newstore", "td-feed")
-        .or_else(|| host_cargo_bin(root, "feed", "td-feed", None))
+        .or_else(|| host_net_applet(root, "td-feed", None))
     else {
         eprintln!(
             "td-builder check: no td-feed binary for the heavy warm (build feed/ with cargo) — \
@@ -2015,13 +2063,12 @@ checksum = \"b74fc6b57825be3373f7054754755f03ac3a8f5d70015f0ffa7ebd06bfeeeb67\"\
     }
 
     #[test]
-    fn parse_lock_checksums_covers_the_real_td_fetch_lock() {
-        // The td-fetch recipe check asserts ≥70 vendored crates in the warmed dir;
-        // the parser must see at least that many in the real fetch/Cargo.lock
-        // (drift guard: a lockfile-format change that blinds the parser reds
-        // here, not as a silently-cold warm).
+    fn parse_lock_checksums_covers_the_real_td_net_lock() {
+        // The td-net crate-closure warm vendors ≥70 crates; the parser must see at least
+        // that many in the real net/Cargo.lock (drift guard: a lockfile-format change that
+        // blinds the parser reds here, not as a silently-cold warm).
         let lock =
-            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../fetch/Cargo.lock"))
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../net/Cargo.lock"))
                 .unwrap();
         let got = parse_lock_checksums(&lock);
         assert!(
