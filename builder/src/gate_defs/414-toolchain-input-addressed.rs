@@ -15,7 +15,7 @@
 //! Native (#318 axis 3): the gate body is typed Rust in `gate_bodies::toolchain_input_addressed`;
 //! `script: ""` marks it native, so the runner execs `td-builder gate-body toolchain-input-addressed`.
 
-use crate::gates::{ArtifactInput, GateDef, InputKind, Pool};
+use crate::gates::{GateDef, Pool};
 
 pub fn gate() -> GateDef {
     GateDef {
@@ -24,16 +24,9 @@ pub fn gate() -> GateDef {
         needs: &[],
         build_gate: false,
         specs: &[],
-        // Typed artifact input (#353): the runnable static-bash fixture resolved
-        // by the runner, no lock-grepping or store-closure-scan in the body.
-        inputs: &[ArtifactInput {
-            name: "bash-static",
-            kind: InputKind::ClosureMember {
-                lock: "tests/td-subst.lock",
-                root_stem: "bash",
-                member_stem: "bash-static",
-            },
-        }],
+        // The runnable static fixture is the loop's td-built busybox, resolved
+        // from PATH in the body (gate_bodies::busybox_pkg_dir) — no declared
+        // guix-lock input.
         non_blocking: false,
         script: "",
     }

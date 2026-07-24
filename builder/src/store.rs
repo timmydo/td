@@ -16,15 +16,6 @@
 
 use crate::sha256::{self, Sha256};
 
-/// The guix SEED store's canonical home (guix's `storeDir`). This is NOT td's
-/// default store — it is referenced only by the guix-seed import paths (the
-/// `build_recipe` seed-dir canonical prefix). td's native store is `/td/store`
-/// (see [`store_dir`] / [`DEFAULT_STORE_DIR`]); a bare, `TD_STORE_DIR`-unset
-/// invocation defaults THERE, not here. The guix `/gnu/store` prefix is no longer
-/// any code path's silent default — the clean-bootstrap-from-seed0 trust root
-/// lives off `/gnu/store` (the [no-guix] provenance seal enforces it).
-pub const GUIX_SEED_STORE_DIR: &str = "/gnu/store";
-
 /// td's native default store prefix, used when `TD_STORE_DIR` is unset. The prefix
 /// is part of every content hash, so this is a distinct store from guix's
 /// `/gnu/store`; a `TD_STORE_DIR=/td/store` build is the native build (AGENTS.md),

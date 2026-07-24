@@ -2471,14 +2471,16 @@ mod tests {
         fs::remove_dir_all(&d).unwrap();
     }
 
-    /// A real bash + a PATH env for the child (scripts use `printf`/`sleep`/`head`).
-    /// On a dev host that is the system bash; in the loop host-sandbox it is the
-    /// seed bash the `cargo-test` gate puts on PATH (gate_defs/325-cargo-test.rs),
-    /// so these tests RUN there rather than being skipped.
-    fn bash_and_env() -> (String, Vec<(String, String)>) {
+    /// A POSIX `sh` + a PATH env for the child. The watchdog scripts use only
+    /// shell builtins plus `kill` and INTEGER `sleep` (busybox `sleep` has no
+    /// float applet in defconfig), so they run under any POSIX shell. On a dev
+    /// host that is the system `/bin/sh`; in the loop host-sandbox it is busybox
+    /// `sh` (ash), already on PATH — no seed bash, so these tests RUN there
+    /// without a guix lock.
+    fn sh_and_env() -> (String, Vec<(String, String)>) {
         let path = env::var("PATH").unwrap();
-        let bash = find_in_path(&path, "bash").expect("bash on PATH");
-        (bash, vec![("PATH".to_string(), path)])
+        let sh = find_in_path(&path, "sh").expect("sh on PATH");
+        (sh, vec![("PATH".to_string(), path)])
     }
 
     /// A test-sized Watch. `silence`/`limit`/`repeat_ms` 0 = off; drain grace 1s.
@@ -2624,11 +2626,11 @@ mod tests {
         // returns (verified-red: with the trip neutered, this test hangs past
         // any bound); with it, the phase reds in seconds and the diagnostic
         // quotes the failing tool's stderr line.
-        let (bash, envs) = bash_and_env();
+        let (sh, envs) = sh_and_env();
         let loop_forever = "while :; do echo 'expr: error while loading shared libraries: \
                             libgmp.so.10: cannot open shared object file' >&2; done";
         let t0 = Instant::now();
-        let err = run_cmd(&bash, &["-c", loop_forever], ".", &envs, &w(0, 25, 0))
+        let err = run_cmd(&sh, &["-c", loop_forever], ".", &envs, &w(0, 25, 0))
             .expect_err("a persistently-failing tool loop must red");
         assert!(t0.elapsed() < Duration::from_secs(30), "must red promptly, not spin: {err}");
         assert!(err.contains("td-build watchdog KILLED"), "names the watchdog: {err}");
@@ -2644,10 +2646,10 @@ mod tests {
         // A retry spin that prints to STDOUT would reset the silence clock on
         // every line and escape a stderr-only repeat bound — under a repeat
         // bound both streams are line-watched, so it reds all the same.
-        let (bash, envs) = bash_and_env();
+        let (sh, envs) = sh_and_env();
         let t0 = Instant::now();
         let err = run_cmd(
-            &bash,
+            &sh,
             &["-c", "while :; do echo 'configure: retrying tool probe'; done"],
             ".",
             &envs,
@@ -2664,9 +2666,9 @@ mod tests {
         // /dev/null or config.log, so the spin produces NO output. The silence
         // bound is the backstop; the whole process group dies (the exec'd
         // sleep included), so the test returns instead of waiting 300s.
-        let (bash, envs) = bash_and_env();
+        let (sh, envs) = sh_and_env();
         let t0 = Instant::now();
-        let err = run_cmd(&bash, &["-c", "exec sleep 300"], ".", &envs, &w(1, 0, 0))
+        let err = run_cmd(&sh, &["-c", "exec sleep 300"], ".", &envs, &w(1, 0, 0))
             .expect_err("a silent wedged phase must red");
         assert!(t0.elapsed() < Duration::from_secs(30), "must red at the bound: {err}");
         assert!(err.contains("no output for 1s"), "names the silence bound: {err}");
@@ -2686,11 +2688,11 @@ mod tests {
         // prove stdout is line-watched under the phase's duration bound. Verified
         // red: with the duration bound neutered this run_cmd never returns
         // (silence + count both off), the test hangs past any bound.
-        let (bash, envs) = bash_and_env();
+        let (sh, envs) = sh_and_env();
         let make_nested_spin = "echo 'make: Entering directory subdir'; \
             while :; do echo 'configure: error: cannot run C compiled programs'; done";
         let t0 = Instant::now();
-        let err = run_cmd(&bash, &["-c", make_nested_spin], ".", &envs, &w(0, 0, 500))
+        let err = run_cmd(&sh, &["-c", make_nested_spin], ".", &envs, &w(0, 0, 500))
             .expect_err("a chatty make-nested spin must red on the duration bound");
         assert!(t0.elapsed() < Duration::from_secs(30), "must red at the window, not spin: {err}");
         assert!(err.contains("td-build watchdog KILLED"), "names the watchdog: {err}");
@@ -2714,16 +2716,16 @@ mod tests {
         // because it is the DURATION (not the count) the phase bound keys on.
         // Verified red: dropping the `now - run_start >= repeat_ms` gate (trip on
         // volume alone) reds this while the spin test above still passes.
-        let (bash, envs) = bash_and_env();
-        // `yes` is absent from the loop's busybox userland; a single bash
-        // `printf` emits the burst instead — `%.0s` consumes each brace-expanded
-        // arg and prints nothing, so `{1..50000}` yields exactly 50000 identical
-        // lines and then EXITS, completing before the window (as the old
-        // `yes … | head -n 50000` did).
-        let tar_like = "printf 'tar: Ignoring unknown extended header keyword\\n%.0s' \
-            {1..50000}; echo done-ok";
+        let (sh, envs) = sh_and_env();
+        // A POSIX `while` counter emits the burst and then EXITS, completing
+        // before the window — no bash `{1..N}` brace expansion (busybox ash lacks
+        // it) and no `yes`/`seq` (absent from the loop's busybox userland). 50000
+        // builtin-`echo` iterations finish in well under the 5s window, so it is
+        // the DURATION, not the count, that a phase bound could key on.
+        let tar_like = "i=0; while [ \"$i\" -lt 50000 ]; do \
+            echo 'tar: Ignoring unknown extended header keyword'; i=$((i+1)); done; echo done-ok";
         let t0 = Instant::now();
-        run_cmd(&bash, &["-c", tar_like], ".", &envs, &w(0, 0, 5000))
+        run_cmd(&sh, &["-c", tar_like], ".", &envs, &w(0, 0, 5000))
             .expect("a healthy high-volume identical burst that COMPLETES must stay green");
         assert!(
             t0.elapsed() < Duration::from_secs(30),
@@ -2780,14 +2782,15 @@ mod tests {
         // longer reachable: `killed` stays false, the recorded reason is dropped,
         // and the exit status (0) decides. The drain grace kills the straggler
         // group so run_cmd still returns promptly.
-        let (bash, envs) = bash_and_env();
+        let (sh, envs) = sh_and_env();
         let t0 = Instant::now();
         run_cmd(
-            &bash,
+            &sh,
             &[
                 "-c",
-                "parent=$$; (while kill -0 \"$parent\" 2>/dev/null; do sleep 0.01; done; \
-                 for ((i = 0; i < 30; i++)); do echo 'expr: died again' >&2; done; sleep 30) & exit 0",
+                "parent=$$; (while kill -0 \"$parent\" 2>/dev/null; do :; done; \
+                 i=0; while [ \"$i\" -lt 30 ]; do echo 'expr: died again' >&2; i=$((i+1)); done; \
+                 sleep 30) & exit 0",
             ],
             ".",
             &envs,
@@ -2807,9 +2810,9 @@ mod tests {
         // returned at exit; the readers must not wait 30s for the sleep) and
         // must NOT red: the drain grace kills the straggler group, and the
         // command's own exit status decides.
-        let (bash, envs) = bash_and_env();
+        let (sh, envs) = sh_and_env();
         let t0 = Instant::now();
-        run_cmd(&bash, &["-c", "sleep 30 & exit 0"], ".", &envs, &w(600, 0, 0))
+        run_cmd(&sh, &["-c", "sleep 30 & exit 0"], ".", &envs, &w(600, 0, 0))
             .expect("a green exit with a straggler must stay green");
         assert!(
             t0.elapsed() < Duration::from_secs(10),
@@ -2823,14 +2826,15 @@ mod tests {
         // limit 25) exit green — the guard trips on the pathological loop, not
         // on a noisy-but-terminating tool. And a changing stderr stream resets
         // the counter, so far more total lines than the limit stay green.
-        let (bash, envs) = bash_and_env();
-        // bash C-loops (no `seq`, absent from the loop's busybox userland).
-        let noisy = "for ((i=0;i<24;i++)); do echo 'same warning' >&2; done; echo done-ok";
-        run_cmd(&bash, &["-c", noisy], ".", &envs, &w(600, 25, 0))
+        let (sh, envs) = sh_and_env();
+        // POSIX `while` counters (no `seq`/`yes`, absent from the busybox
+        // userland; no bash C-style `for (( ))`, which busybox ash lacks).
+        let noisy = "i=0; while [ \"$i\" -lt 24 ]; do echo 'same warning' >&2; i=$((i+1)); done; echo done-ok";
+        run_cmd(&sh, &["-c", noisy], ".", &envs, &w(600, 25, 0))
             .expect("sub-limit repeats must stay green");
         let alternating =
-            "for ((i=0;i<40;i++)); do echo \"warn $((i % 2))\" >&2; done; echo done-ok";
-        run_cmd(&bash, &["-c", alternating], ".", &envs, &w(600, 25, 0))
+            "i=0; while [ \"$i\" -lt 40 ]; do echo \"warn $((i % 2))\" >&2; i=$((i+1)); done; echo done-ok";
+        run_cmd(&sh, &["-c", alternating], ".", &envs, &w(600, 25, 0))
             .expect("alternating stderr lines must reset the repeat counter");
     }
 
@@ -2839,11 +2843,11 @@ mod tests {
         // A normal non-zero exit still reds with the pre-#308 message shape —
         // the supervisor changes HOW output is carried, not the pass/fail
         // contract.
-        let (bash, envs) = bash_and_env();
-        let err = run_cmd(&bash, &["-c", "echo out; echo err >&2; exit 3"], ".", &envs, &WATCH_PHASE)
+        let (sh, envs) = sh_and_env();
+        let err = run_cmd(&sh, &["-c", "echo out; echo err >&2; exit 3"], ".", &envs, &WATCH_PHASE)
             .expect_err("exit 3 must red");
         assert!(err.contains("failed"), "plain failure message kept: {err}");
-        run_cmd(&bash, &["-c", "true"], ".", &envs, &WATCH_PHASE).expect("true is green");
+        run_cmd(&sh, &["-c", "true"], ".", &envs, &WATCH_PHASE).expect("true is green");
     }
 
     #[test]

@@ -3,15 +3,11 @@
 # VERBATIM from the Makefile's `build-recipes` recipe when the gate runner
 # (`td-builder gate-run`, builder/src/gates.rs) replaced make as the loop scheduler.
 #
-# Separates "build everything" from "the checks": td-ASSEMBLE + SUBMIT every package
-# recipe (TD_BUILD_SPECS — the corpus, toolchain leaves and library deps, accumulated
-# from the mk/gates/*.mk fragments' `BUILD_SPECS +=` lines) up front to the ONE shared
-# build daemon, which realizes + reproducibility-checks them into the shared
-# content-addressed store; the package build gates then cache-HIT + memo-skip the
-# double-build and only assert behavior + migration-oracle. The daemon
-# (started by the `td-builder check` host prelude) is the SINGLE machine-wide
-# build limiter (TD_BUILD_JOBS). The xargs -P below is only SUBMIT
-# parallelism — submits block on the daemon's budget.
+# Separates "build everything" from "the checks". The guix-seeded corpus has
+# retired, so this is now a corpus-free PRELUDE: it places the stage0 td-builder
+# and builds td-recipe-eval (which the build_gate store primitives reuse),
+# asserts TD_BUILD_SPECS is empty, and does no per-spec pre-build. Package build
+# gates build their subjects in-gate on td's mes-rooted /td/store toolchain.
 #
 # Called by the runner with cwd = repo root and:
 #   TD_BUILD_SPECS  the specs to pre-build. The runner SCOPES this to the selected
@@ -27,7 +23,6 @@ set -euo pipefail
 nspecs=$(set -- $TD_BUILD_SPECS; echo $#)
 
 echo ">> build-recipes: the build_gate PRELUDE — stage0 td-builder (env rust) + td-recipe-eval, GUIX-FREE"
-: "${TD_DAEMON_SOCKET:?the shared build daemon is not running — the \`td-builder check\` host prelude starts it (ensure_build_daemon)}"
 # The guix-seeded corpus retired — every package now builds on td's mes-rooted
 # /td/store toolchain via the store-native gates, not guix's gcc-toolchain.
 # So build-recipes is a corpus-free prelude: it places the stage0
@@ -37,8 +32,10 @@ echo ">> build-recipes: the build_gate PRELUDE — stage0 td-builder (env rust) 
 export CACHE="$PWD/.td-build-cache/pkg" TD_STAGE0_BASE="$PWD/.td-build-cache/stage0"; mkdir -p "$CACHE"
 . tests/cache-lib.sh; load_stage0
 echo ">> builds run on the td-bootstrapped stage0 td-builder ($TD_BUILDER_PATH) — compiled from source with the environment's rust, no guix-built td-builder"
+# Preserve recipe-eval-tool's exit code: 69 (no toolchain in the jail) degrades
+# this prelude to Unprovisioned/tolerated in gate-run rather than RED (#469).
 sh tests/recipe-eval-tool.sh "$PWD/.td-build-cache/recipe-eval" >/dev/null \
-  || { echo "ERROR: could not build td's Rust recipe evaluator (recipes/ crate)" >&2; exit 1; }
+  || { rc=$?; echo "ERROR: could not build td's Rust recipe evaluator (recipes/ crate)" >&2; exit $rc; }
 load_recipe_eval
 echo ">> recipes EVALUATE with td's OWN Rust td-recipe-eval ($TD_RECIPE_EVAL)"
 test "$nspecs" -eq 0 || { echo "ERROR: build-recipes got specs ($TD_BUILD_SPECS) but the guix-seeded corpus retired — no spec-carrying gate should remain" >&2; exit 1; }

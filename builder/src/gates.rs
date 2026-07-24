@@ -89,40 +89,6 @@ pub(crate) fn pool_in_full_check(p: Pool) -> bool {
     matches!(p, Pool::Cheap | Pool::Heavy | Pool::Daily)
 }
 
-/// A TYPED artifact input (#353): a store-path artifact the gate's body
-/// consumes, declared on the GateDef instead of derived by shell inside it.
-/// The runner resolves each declaration (gate_inputs.rs) BEFORE the script
-/// body runs and exports the path as `TD_GATE_INPUT_<NAME>` (upper-cased,
-/// `-`→`_`); an unresolvable input (missing lock, no match, ambiguous match)
-/// REDS the gate without running its body. This replaces the per-gate
-/// `grep -- '-<stem>-' LOCK | head -1` / `store-closure-scan | grep | head -1`
-/// wiring and makes the gate's artifact dependencies inspectable
-/// (`gate-run list-gates` prints them).
-#[derive(Clone, Copy, Debug)]
-pub struct ArtifactInput {
-    /// The env handle: the body reads `TD_GATE_INPUT_<name upper-snake>`.
-    pub name: &'static str,
-    pub kind: InputKind,
-}
-
-/// How an ArtifactInput is resolved (gate_inputs::resolve).
-#[derive(Clone, Copy, Debug)]
-pub enum InputKind {
-    /// The UNIQUE entry of a td lock whose PATH names package `stem` —
-    /// exact-package matching on the basename after the 32-char hash
-    /// (`bash` matches `…-bash-5.2.37`, never `…-bash-static-5.2.37`), and
-    /// two matches are an error, never a silent first-wins.
-    LockEntry { lock: &'static str, stem: &'static str },
-    /// The UNIQUE member naming `member_stem` in the CONTENT-SCANNED runtime
-    /// closure of the lock entry naming `root_stem` (the daemon's
-    /// scanForReferences walk, scanned in the root's own store dir).
-    ClosureMember {
-        lock: &'static str,
-        root_stem: &'static str,
-        member_stem: &'static str,
-    },
-}
-
 /// One gate, declared as compiled Rust data in `src/gate_defs/<NNN>-<name>.rs`.
 /// The registry (`build.rs`) collects every file's `gate()` into `all()`.
 pub struct GateDef {
@@ -138,9 +104,6 @@ pub struct GateDef {
     /// Package recipes this gate asserts on — contributed to the build phase
     /// (the former BUILD_SPECS pool).
     pub specs: &'static [&'static str],
-    /// Typed artifact inputs (#353): resolved by the runner before the body
-    /// runs, exported as `TD_GATE_INPUT_<NAME>` — see ArtifactInput.
-    pub inputs: &'static [ArtifactInput],
     /// Non-blocking (allow-failure) tag: when a tagged gate FAILS the runner
     /// TOLERATES it — no fail-fast, and the run is not reded by it (it is reported
     /// as a non-blocking failure). A tagged gate that PASSES is unaffected (still
@@ -170,8 +133,6 @@ struct Gate {
     /// The def's own spec list, exported to the body as TD_GATE_SPECS — the
     /// single source both the build phase and the gate's assertion loop read.
     specs: Vec<String>,
-    /// Typed artifact inputs (#353), resolved per run — see ArtifactInput.
-    inputs: Vec<ArtifactInput>,
     /// Allow-failure tag (see GateDef::non_blocking): a failure is tolerated
     /// (no fail-fast, does not red the run).
     non_blocking: bool,
@@ -199,29 +160,6 @@ impl GateSet {
             .filter_map(|i| self.gates.get(*i).map(|g| g.name.clone()))
             .collect()
     }
-}
-
-/// Input declarations: each name must be a valid env handle, and no two may
-/// collide on the MAPPED env var — env_var folds case and maps `-`/`.`/`+`
-/// all to `_`, so comparing raw names would let `bash-static` and
-/// `bash.static` both export TD_GATE_INPUT_BASH_STATIC, silently shadowing
-/// each other (exactly what this check exists to prevent).
-fn validate_input_decls(gate: &str, inputs: &[ArtifactInput]) -> Result<(), String> {
-    for (i, inp) in inputs.iter().enumerate() {
-        if !valid_word(inp.name) {
-            return Err(format!("gate-run: gate `{gate}`: invalid input name `{}`", inp.name));
-        }
-        let var = crate::gate_inputs::env_var(inp.name);
-        if let Some(o) =
-            inputs.iter().take(i).find(|o| crate::gate_inputs::env_var(o.name) == var)
-        {
-            return Err(format!(
-                "gate-run: gate `{gate}`: inputs `{}` and `{}` collide on the same {var} env var",
-                o.name, inp.name
-            ));
-        }
-    }
-    Ok(())
 }
 
 /// A word that may name a gate or build spec.
@@ -286,7 +224,6 @@ fn load() -> Result<GateSet, String> {
                 return Err(format!("gate-run: gate `{}`: invalid word `{w}`", def.name));
             }
         }
-        validate_input_decls(def.name, def.inputs)?;
         if index.contains_key(def.name) {
             return Err(format!("gate-run: duplicate gate `{}`", def.name));
         }
@@ -302,7 +239,6 @@ fn load() -> Result<GateSet, String> {
             deps: def.needs.iter().map(|d| d.to_string()).collect(),
             extra_env: Vec::new(),
             specs: def.specs.iter().map(|s| s.to_string()).collect(),
-            inputs: def.inputs.to_vec(),
             non_blocking: def.non_blocking,
         });
     }
@@ -348,7 +284,6 @@ fn derive_graph(set: &mut GateSet, build_gates: &[String]) -> Result<(), String>
         deps: last_cheap.iter().cloned().collect(),
         extra_env: vec![("TD_BUILD_SPECS".to_string(), set.build_specs.join(" "))],
         specs: Vec::new(),
-        inputs: Vec::new(),
         // build-recipes builds the corpus via the shared daemon — it fails
         // on a host that cannot realize the seed, so it is non-blocking
         // too (its SoftFailed still satisfies its BUILD_GATE dependents'
@@ -932,6 +867,30 @@ fn cgroup_oom_kills(cg: &Path) -> u64 {
         .unwrap_or(0)
 }
 
+/// How one gate ended. `Unprovisioned` (the body exited EXIT_UNPROVISIONED, 69)
+/// is a runner-setup gap — no toolchain reachable in this jail — tolerated like a
+/// non-blocking failure but reported as a skip, NOT a red. Any other nonzero exit
+/// is `Failed` (a real regression). (re #469.)
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Outcome {
+    Passed,
+    Unprovisioned,
+    Failed,
+}
+
+/// True iff the finished gate's captured log carries the unprovisioned sentinel
+/// every td-builder `EXIT_UNPROVISIONED` exit prints. Read AFTER `wait()` — the
+/// child is dead and its writes to the log are flushed — so a token its
+/// provisioning path emitted is present. Bytes, not String: a build log routinely
+/// carries non-UTF-8, and a lossy decode must not drop the token.
+fn log_has_unprovisioned_sentinel(log_path: &Path) -> bool {
+    let needle = crate::check_loop::UNPROVISIONED_SENTINEL.as_bytes();
+    match std::fs::read(log_path) {
+        Ok(bytes) => bytes.windows(needle.len()).any(|w| w == needle),
+        Err(_) => false,
+    }
+}
+
 fn run_gate(
     g: &Gate,
     root: &Path,
@@ -941,36 +900,15 @@ fn run_gate(
     mem_mib: u64,
     tree_mem_mib: u64,
     cgroup_dir: Option<&Path>,
-) -> bool {
+) -> Outcome {
     let mut logf = match std::fs::File::create(log_path) {
         Ok(f) => f,
         Err(e) => {
             eprintln!("gate-run: cannot open log for gate {}: {e}", g.name);
-            return false;
+            return Outcome::Failed;
         }
     };
     timing_event(timing, &g.name, "START");
-    // Typed artifact inputs (#353): resolve every declaration BEFORE the body
-    // runs. A failure reds the gate with the reason in its log — the body
-    // never starts on a missing/misdeclared input.
-    let mut input_env: Vec<(String, String)> = Vec::new();
-    for inp in &g.inputs {
-        match crate::gate_inputs::resolve(root, inp) {
-            Ok(p) => {
-                let _ = writeln!(logf, "[gate-run] {}: input {} = {p}", g.name, inp.name);
-                input_env.push((crate::gate_inputs::env_var(inp.name), p));
-            }
-            Err(e) => {
-                let _ = writeln!(
-                    logf,
-                    "gate-run: FAIL: gate {}: cannot resolve declared input `{}`: {e}",
-                    g.name, inp.name
-                );
-                timing_event(timing, &g.name, "END");
-                return false;
-            }
-        }
-    }
     // Cgroup mode (primary when delegated): the BODY self-moves into the gate's
     // cgroup before anything else runs — written by the child itself, so there
     // is no parent-side move race with early forks.
@@ -999,13 +937,13 @@ fn run_gate(
         Err(e) => {
             let _ = writeln!(logf, "gate-run: FAIL: gate {}: cannot resolve current_exe: {e}", g.name);
             timing_event(timing, &g.name, "END");
-            return false;
+            return Outcome::Failed;
         }
     };
-    let ok = (|| {
+    let outcome = (|| {
         let (out, err) = match (logf.try_clone(), logf.try_clone()) {
             (Ok(o), Ok(e)) => (o, e),
-            _ => return false,
+            _ => return Outcome::Failed,
         };
         // The inner program is `sh -c <body>` (shell gate) or `<self> gate-body
         // <name>` (native gate). When mem_mib > 0, a pre_exec
@@ -1035,9 +973,6 @@ fn run_gate(
         if !g.specs.is_empty() {
             cmd.env("TD_GATE_SPECS", g.specs.join(" "));
         }
-        for (k, v) in &input_env {
-            cmd.env(k, v);
-        }
         for (k, v) in &g.extra_env {
             cmd.env(k, v);
         }
@@ -1052,7 +987,7 @@ fn run_gate(
             Err(e) => {
                 let _ = writeln!(logf, "gate-run: FAIL: gate {}: cannot spawn bash: {e}", g.name);
                 timing_event(timing, &g.name, "END");
-                return false;
+                return Outcome::Failed;
             }
         };
         let pgid = child.id();
@@ -1104,9 +1039,32 @@ fn run_gate(
             );
         }
         match status {
-            Ok(st) if st.success() && !breached.load(std::sync::atomic::Ordering::Relaxed) => true,
+            Ok(st) if st.success() && !breached.load(std::sync::atomic::Ordering::Relaxed) => {
+                Outcome::Passed
+            }
             Ok(st) => {
-                if !breached.load(std::sync::atomic::Ordering::Relaxed) {
+                let breached = breached.load(std::sync::atomic::Ordering::Relaxed);
+                // Exit 69 (EX_UNAVAILABLE), NOT an OOM/RSS kill, AND the gate log
+                // carries the sentinel td's own provisioning path prints: the body
+                // could not provision a toolchain in this jail (re #469). Tolerated
+                // as Unprovisioned, not a red — the host preflight is the
+                // enforcement. Requiring the sentinel keeps the 69 TIGHT: a bare
+                // `exit 69` (a stray EX_UNAVAILABLE from an unrelated tool, or an
+                // accidental exit) has no token and stays a real failure, so a
+                // genuine regression can never masquerade as a skip (Codex review).
+                if !breached
+                    && st.code() == Some(crate::check_loop::EXIT_UNPROVISIONED)
+                    && log_has_unprovisioned_sentinel(log_path)
+                {
+                    let _ = writeln!(
+                        logf,
+                        "gate-run: gate {} — SKIPPED (unprovisioned): body exited {} (no toolchain reachable in the loop sandbox)",
+                        g.name,
+                        crate::check_loop::EXIT_UNPROVISIONED
+                    );
+                    return Outcome::Unprovisioned;
+                }
+                if !breached {
                     let _ = writeln!(
                         logf,
                         "gate-run: FAIL: gate {} — body exited {}",
@@ -1114,33 +1072,34 @@ fn run_gate(
                         st.code().unwrap_or(-1)
                     );
                 }
-                false
+                Outcome::Failed
             }
             Err(e) => {
                 let _ = writeln!(logf, "gate-run: FAIL: gate {}: wait failed: {e}", g.name);
-                false
+                Outcome::Failed
             }
         }
     })();
     timing_event(timing, &g.name, "END");
-    ok
+    outcome
 }
 
 /// Dump one finished gate's buffered output atomically (--output-sync=target
 /// parity), with a one-line PASS/FAIL trailer. Raw bytes, not String: build
 /// logs routinely carry non-UTF-8 (compiler/tar output), and read_to_string
 /// would silently drop the WHOLE log — the one thing a red gate must not lose.
-fn print_gate_output(name: &str, log_path: &Path, ok: bool, non_blocking: bool, secs: f64) {
+fn print_gate_output(name: &str, log_path: &Path, outcome: Outcome, non_blocking: bool, secs: f64) {
     let body = std::fs::read(log_path).unwrap_or_default();
     let stdout = std::io::stdout();
     let mut lock = stdout.lock();
     let _ = lock.write_all(&body);
-    let verdict = if ok {
-        "PASS"
-    } else if non_blocking {
-        "FAIL (non-blocking — tolerated)"
-    } else {
-        "FAIL"
+    let verdict = match outcome {
+        Outcome::Passed => "PASS",
+        Outcome::Unprovisioned => {
+            "SKIPPED (unprovisioned — no toolchain in the jail; host cargo-test preflight enforces this)"
+        }
+        Outcome::Failed if non_blocking => "FAIL (non-blocking — tolerated)",
+        Outcome::Failed => "FAIL",
     };
     let _ = writeln!(lock, "[gate-run] {name}: {verdict} ({secs:.1}s)");
     let _ = lock.flush();
@@ -1177,6 +1136,13 @@ enum St {
     /// A non-blocking gate that FAILED: tolerated — it satisfies dependents (like
     /// Done for readiness) and does not red the run, but is reported distinctly.
     SoftFailed,
+    /// A gate whose body could not provision a toolchain in the jail (exit 69,
+    /// re #469): tolerated like SoftFailed (satisfies dependents, does not red),
+    /// but reported as a skip — it did NOT run, so unlike a SoftFailed it stays
+    /// tolerated even when named as the explicit goal (an honest "cannot run
+    /// here", not a silenced failure). Never journaled green (a provisioned host
+    /// must re-run it).
+    Unprovisioned,
 }
 
 struct Sched {
@@ -1314,11 +1280,16 @@ fn run_selected(set: &GateSet, selected: &HashSet<usize>, cfg: &RunCfg) -> Resul
                 continue;
             }
             let deps = dep_idx.get(i).map(Vec::as_slice).unwrap_or(&[]);
-            // A dep is satisfied when it is Done OR SoftFailed (a tolerated
-            // non-blocking failure must not wedge its dependents as Pending).
+            // A dep is satisfied when it is Done, SoftFailed, or Unprovisioned (a
+            // tolerated failure/skip must not wedge its dependents as Pending —
+            // e.g. build-recipes skipped for no toolchain must not strand the
+            // store gates, which drive the host-mounted binaries, not a recompile).
             let ready = deps.iter().all(|d| {
                 !s.st.contains_key(d)
-                    || matches!(s.st.get(d), Some(St::Done) | Some(St::SoftFailed))
+                    || matches!(
+                        s.st.get(d),
+                        Some(St::Done) | Some(St::SoftFailed) | Some(St::Unprovisioned)
+                    )
             });
             if !ready {
                 continue;
@@ -1386,7 +1357,7 @@ fn run_selected(set: &GateSet, selected: &HashSet<usize>, cfg: &RunCfg) -> Resul
                 }
                 let log_path = cfg.log_dir.join(format!("{}.log", g.name));
                 let started = std::time::Instant::now();
-                let ok = run_gate(
+                let outcome = run_gate(
                     g,
                     &cfg.root,
                     &log_path,
@@ -1399,25 +1370,27 @@ fn run_selected(set: &GateSet, selected: &HashSet<usize>, cfg: &RunCfg) -> Resul
                 print_gate_output(
                     &g.name,
                     &log_path,
-                    ok,
+                    outcome,
                     g.non_blocking,
                     started.elapsed().as_secs_f64(),
                 );
-                if ok {
+                // Only a real PASS is journaled: an Unprovisioned skip must re-run
+                // on a provisioned host, so it is never recorded green for --resume.
+                if outcome == Outcome::Passed {
                     if let Some(key) = &cfg.tree_key {
                         journal_pass(&cfg.root, key, &g.name);
                     }
                 }
                 let mut s = lock_sched(&sched);
-                // A non-blocking gate that fails SoftFails: it satisfies dependents
-                // and does not red the run, and — crucially — does not set `fail`,
-                // so it never triggers the fail-fast that would stop other gates.
-                let new_st = if ok {
-                    St::Done
-                } else if g.non_blocking {
-                    St::SoftFailed
-                } else {
-                    St::Failed
+                // Passed → Done. Unprovisioned (exit 69) → tolerated skip. A failing
+                // non-blocking gate SoftFails. All three satisfy dependents and do
+                // NOT set `fail`, so none triggers the fail-fast that stops others;
+                // only a hard Failed reds the run.
+                let new_st = match outcome {
+                    Outcome::Passed => St::Done,
+                    Outcome::Unprovisioned => St::Unprovisioned,
+                    Outcome::Failed if g.non_blocking => St::SoftFailed,
+                    Outcome::Failed => St::Failed,
                 };
                 s.st.insert(gi, new_st);
                 s.running -= 1;
@@ -1461,12 +1434,26 @@ fn run_selected(set: &GateSet, selected: &HashSet<usize>, cfg: &RunCfg) -> Resul
             soft.join(" ")
         );
     }
-    // Green iff every gate ended Done, or SoftFailed AND not the explicit goal
-    // (issue #377 — a SoftFailed gate that IS the goal must red the run; one
-    // that's merely along for the ride stays tolerated) — no hard Failed,
-    // none left Pending/Running by fail-fast.
+    let unprov = names(St::Unprovisioned);
+    if !unprov.is_empty() {
+        // The leading token is the stable whole-suite signal daily greps: a leg
+        // that exits green yet printed this SKIPPED ≥1 gate, so it is not a
+        // full-suite proof (daily withholds .td-last-green + publish, re #469).
+        eprintln!(
+            "gate-run: {} {} gate(s) SKIPPED — no toolchain reachable in the jail (re #469); \
+             tolerated, the host cargo-test preflight enforces these: {}",
+            crate::check_loop::GATES_SKIPPED_SENTINEL,
+            unprov.len(),
+            unprov.join(" ")
+        );
+    }
+    // Green iff every gate ended Done, Unprovisioned (a tolerated skip — it did
+    // not run, so it stays tolerated even as the explicit goal), or SoftFailed
+    // AND not the explicit goal (issue #377 — a SoftFailed gate that IS the goal
+    // must red the run; one merely along for the ride stays tolerated) — no hard
+    // Failed, none left Pending/Running by fail-fast.
     let green = s.st.iter().all(|(i, st)| match st {
-        St::Done => true,
+        St::Done | St::Unprovisioned => true,
         St::SoftFailed => !cfg.explicit_goals.contains(i),
         St::Failed | St::Pending | St::Running => false,
     });
@@ -1509,27 +1496,6 @@ fn print_pools(set: &GateSet) {
     line("system", Pool::System);
     line("engine", Pool::Engine);
     line("parked", Pool::Parked);
-    // Declared artifact inputs (#353): the inspectable per-gate dependency
-    // graph the shell wiring used to bury (one line per gate that declares any).
-    for g in &set.gates {
-        if g.inputs.is_empty() {
-            continue;
-        }
-        let decls: Vec<String> = g
-            .inputs
-            .iter()
-            .map(|i| {
-                let d = match &i.kind {
-                    InputKind::LockEntry { lock, stem } => format!("lock-entry({lock}#{stem})"),
-                    InputKind::ClosureMember { lock, root_stem, member_stem } => {
-                        format!("closure-member({lock}#{root_stem} -> {member_stem})")
-                    }
-                };
-                format!("{}={d}", crate::gate_inputs::env_var(i.name))
-            })
-            .collect();
-        println!("inputs {}: {}", g.name, decls.join(" "));
-    }
 }
 
 /// Re-print the newest run's per-gate table (the former Makefile
@@ -1787,10 +1753,6 @@ mod tests {
         // legitimately expands to {}. The build_specs corpus is empty since the
         // guix-seeded recipe-checks retired — build-recipes is now a corpus-free stage0 +
         // recipe-eval prelude only.)
-        // Typed artifact inputs (#353): a KEEP store-native gate declares its lock inputs
-        // instead of grepping locks in shell.
-        let snp = set.gates.iter().find(|g| g.name == "store-native-profile").unwrap();
-        assert!(snp.inputs.iter().any(|i| i.name == "bash-static"), "store-native-profile lost its declared inputs");
         // The derived graph holds: the synthetic build-recipes prelude node is present.
         let br = set.gates.iter().find(|g| g.name == BUILD_RECIPES).unwrap();
         assert!(br.extra_env.iter().any(|(k, _)| k == "TD_BUILD_SPECS"));
@@ -1887,7 +1849,6 @@ mod tests {
                 deps: deps.iter().map(|d| d.to_string()).collect(),
                 extra_env: Vec::new(),
                 specs: Vec::new(),
-                inputs: Vec::new(),
                 non_blocking: false,
             });
         }
@@ -2032,68 +1993,99 @@ mod tests {
     }
 
     #[test]
-    fn input_names_colliding_on_the_mapped_env_var_are_rejected() {
-        // env_var folds case and maps -/./+ to _, so the dedup must compare the
-        // MAPPED names — raw-name comparison would let these shadow each other.
-        const K: InputKind = InputKind::LockEntry { lock: "x.lock", stem: "bash" };
-        let a = ArtifactInput { name: "bash-static", kind: K };
-        let b = ArtifactInput { name: "bash.static", kind: K };
-        let err = validate_input_decls("g", &[a, b]).unwrap_err();
-        assert!(err.contains("collide on the same TD_GATE_INPUT_BASH_STATIC"), "got: {err}");
-        // distinct mapped names pass; an invalid name is rejected.
-        let c = ArtifactInput { name: "coreutils", kind: K };
-        assert!(validate_input_decls("g", &[a, c]).is_ok());
-        let bad = ArtifactInput { name: "no/slash", kind: K };
-        assert!(validate_input_decls("g", &[bad]).is_err());
-    }
-
-    #[test]
-    fn a_declared_input_is_resolved_and_exported_to_the_body() {
-        // Drive the REAL runner path: the gate's body sees the resolved path in
-        // TD_GATE_INPUT_<NAME> and asserts it equals the lock's entry.
-        let d = tmpdir("inputs-env");
-        const H: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-        std::fs::write(d.join("t.lock"), format!("{H}-make-4.4.1 /td/store/{H}-make-4.4.1\n"))
-            .unwrap();
-        let mut set = synth(
+    fn unprovisioned_gate_exit_69_is_tolerated_and_does_not_fail_fast() {
+        // Shape A (re #469): a gate that exits EXIT_UNPROVISIONED (69) — its body
+        // could not provision a toolchain in the jail — is tolerated like a
+        // non-blocking failure WITHOUT the gate being tagged non_blocking, so a
+        // genuine compile regression (any other nonzero) still reds. This is what
+        // lets the in-loop compile gates (cargo-test/recipe-rs/build-recipes)
+        // degrade to a skip post-guix while the host preflight enforces them.
+        //
+        // The 69 is tolerated ONLY when the body ALSO emits the sentinel td's own
+        // provisioning path prints (proof the 69 is a real toolchain gap, not a
+        // stray EX_UNAVAILABLE) — a bare `exit 69` reds, asserted below.
+        let unprov = format!("echo '{}' >&2; exit 69", crate::check_loop::UNPROVISIONED_SENTINEL);
+        let d = tmpdir("unprov");
+        let set = synth(
             &d,
-            &[(
-                "uses-input",
-                Pool::Cheap,
-                "test \"$TD_GATE_INPUT_MAKE\" = \"/td/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-make-4.4.1\" && touch {D}/env.ok",
-                &[],
-            )],
+            &[
+                // NOT tagged non_blocking — the 69 + sentinel earns tolerance.
+                ("compile", Pool::Cheap, unprov.as_str(), &[]),
+                ("after", Pool::Cheap, "touch {D}/after.ran", &["compile"]),
+                ("indep", Pool::Cheap, "touch {D}/indep.ran", &[]),
+            ],
         );
-        let gi = *set.index.get("uses-input").unwrap();
-        set.gates.get_mut(gi).unwrap().inputs = vec![ArtifactInput {
-            name: "make",
-            kind: InputKind::LockEntry { lock: "t.lock", stem: "make" },
-        }];
         let sel = expand_goals(&set, &["check-fast".to_string()]).unwrap();
-        assert!(run_selected(&set, &sel, &cfg(&d, 2, None)).unwrap());
-        assert!(d.join("env.ok").exists(), "the body did not see the resolved input");
+        assert!(
+            run_selected(&set, &sel, &cfg(&d, 4, None)).unwrap(),
+            "an exit-69 (unprovisioned) gate must not red the run"
+        );
+        assert!(
+            d.join("after.ran").exists(),
+            "a dependent of an unprovisioned (skipped) gate must still run"
+        );
+        assert!(d.join("indep.ran").exists(), "an independent gate must still run");
+
+        // Contrast: any OTHER nonzero from an untagged gate is a real regression —
+        // it reds and fail-fasts, exactly as before this fix.
+        let d2 = tmpdir("unprov-red");
+        let set2 = synth(
+            &d2,
+            &[
+                ("compile", Pool::Cheap, "exit 1", &[]),
+                ("after", Pool::Heavy, "touch {D}/after.ran", &["compile"]),
+            ],
+        );
+        let sel2 = expand_goals(&set2, &["check".to_string()]).unwrap();
+        assert!(
+            !run_selected(&set2, &sel2, &cfg(&d2, 4, None)).unwrap(),
+            "a non-69 failure from an untagged gate must still red the run"
+        );
+        assert!(
+            !d2.join("after.ran").exists(),
+            "a real (non-69) failure must fail-fast the dependent"
+        );
+
+        // Contrast: exit 69 WITHOUT the sentinel is NOT tolerated — a stray
+        // EX_UNAVAILABLE (or accidental `exit 69`) from code that is not td's
+        // provisioning path reds and fail-fasts, so the 69 tolerance can never be
+        // spoofed by an unrelated failure that merely shares the code (Codex).
+        let d3 = tmpdir("unprov-bare69");
+        let set3 = synth(
+            &d3,
+            &[
+                ("compile", Pool::Cheap, "exit 69", &[]),
+                ("after", Pool::Heavy, "touch {D}/after.ran", &["compile"]),
+            ],
+        );
+        let sel3 = expand_goals(&set3, &["check".to_string()]).unwrap();
+        assert!(
+            !run_selected(&set3, &sel3, &cfg(&d3, 4, None)).unwrap(),
+            "a bare exit-69 with no sentinel must red the run, not be tolerated"
+        );
+        assert!(
+            !d3.join("after.ran").exists(),
+            "a bare (sentinel-less) 69 must fail-fast the dependent"
+        );
     }
 
     #[test]
-    fn an_unresolvable_input_reds_the_gate_without_running_its_body() {
-        // The verified-red half of #353: a misdeclared input (a stem the lock
-        // does not carry) fails the gate BEFORE the body starts.
-        let d = tmpdir("inputs-red");
-        const H: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-        std::fs::write(d.join("t.lock"), format!("{H}-make-4.4.1 /td/store/{H}-make-4.4.1\n"))
-            .unwrap();
-        let mut set = synth(&d, &[("bad-input", Pool::Cheap, "touch {D}/ran", &[])]);
-        let gi = *set.index.get("bad-input").unwrap();
-        set.gates.get_mut(gi).unwrap().inputs = vec![ArtifactInput {
-            name: "gawk",
-            kind: InputKind::LockEntry { lock: "t.lock", stem: "gawk" },
-        }];
-        let sel = expand_goals(&set, &["check-fast".to_string()]).unwrap();
-        assert!(!run_selected(&set, &sel, &cfg(&d, 2, None)).unwrap());
-        assert!(!d.join("ran").exists(), "the body must not run on an unresolvable input");
-        // The reason lands in the gate's log, not just a generic exit.
-        let log = std::fs::read_to_string(d.join("logs/bad-input.log")).unwrap();
-        assert!(log.contains("cannot resolve declared input `gawk`"), "log: {log}");
+    fn unprovisioned_gate_named_as_the_explicit_goal_stays_tolerated() {
+        // Unlike a SoftFailed gate (issue #377), an Unprovisioned gate did NOT run
+        // — it could not be provisioned here — so naming it directly
+        // (`td-builder check cargo-test` on a toolchain-less host) reports an honest
+        // skip, not a red. Asking "is this gate green here?" when it cannot run at
+        // all is answered "skipped", never a fabricated failure.
+        let unprov = format!("echo '{}' >&2; exit 69", crate::check_loop::UNPROVISIONED_SENTINEL);
+        let d = tmpdir("unprov-explicit");
+        let set = synth(&d, &[("compile", Pool::Cheap, unprov.as_str(), &[])]);
+        let sel = expand_goals(&set, &["compile".to_string()]).unwrap();
+        let mut c = cfg(&d, 4, None);
+        c.explicit_goals = explicit_goal_indices(&set, &["compile".to_string()]);
+        assert!(
+            run_selected(&set, &sel, &c).unwrap(),
+            "an unprovisioned gate named directly as the goal stays a tolerated skip"
+        );
     }
 
     #[test]
@@ -2341,7 +2333,6 @@ mod tests {
             deps: Vec::new(),
             extra_env: Vec::new(),
             specs: Vec::new(),
-            inputs: Vec::new(),
             non_blocking: false,
         });
         set.index.insert(BUILD_RECIPES.to_string(), idx);

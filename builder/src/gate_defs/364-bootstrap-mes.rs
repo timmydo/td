@@ -27,7 +27,6 @@ pub fn gate() -> GateDef {
         needs: &[],
         build_gate: false,
         specs: &[],
-        inputs: &[],
         non_blocking: false,
         script: r##"
 echo ">> bootstrap-mes: the structured Rust mes recipe builds GNU Mes (mes-m2) and proves it evaluates Scheme, guix-free + reproducible (source-bootstrap brick 2)"

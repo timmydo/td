@@ -52,6 +52,8 @@ const NATIVE: &[&str] = &[
     "toolchain-x86_64-input-addressed",
 ];
 
+use crate::check_loop::UNPROVISIONED_TAG;
+
 /// `td-builder gate-body <name>` — run one native gate body. Self-moves into
 /// the per-gate cgroup first (the bash bodies' `echo $$ > $TD_GATE_CG` line),
 /// then dispatches. Prints the gate's PASS/FAIL narration itself.
@@ -89,9 +91,16 @@ pub fn cli(name: &str) -> ExitCode {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             // Match the bash convention: the FAIL line goes to stderr; the
-            // runner captures both streams into the gate log.
-            eprintln!("{e}");
-            ExitCode::FAILURE
+            // runner captures both streams into the gate log. An UNPROVISIONED_TAG
+            // error is a toolchain gap, not a regression → exit 69 so gate-run
+            // classifies it Unprovisioned (tolerated), never RED.
+            if let Some(rest) = e.strip_prefix(UNPROVISIONED_TAG) {
+                eprintln!("gate-body {name}: unprovisioned — {rest}");
+                crate::check_loop::unprovisioned_exit()
+            } else {
+                eprintln!("{e}");
+                ExitCode::FAILURE
+            }
         }
     }
 }
@@ -1582,54 +1591,28 @@ fn store_ns(root: &Path) -> Result<(), String> {
     );
     let work = fresh_scratch(root, ".store-ns-scratch")?;
 
-    // A static binary to run from /td/store: bash-static, from the committed
-    // substitute fixture lock (td's own content scan — no store DB, no guix process).
-    let lock_rel = "tests/td-subst.lock";
-    let lock_text = std::fs::read_to_string(root.join(lock_rel))
-        .map_err(|e| format!("FAIL: read {lock_rel}: {e}"))?;
-    let bash = lock_text
-        .lines()
-        .find(|l| l.contains("-bash-") && !l.contains("static"))
-        .and_then(|l| l.split_once(' ').map(|(_, p)| p.trim().to_string()))
-        .ok_or_else(|| String::from("FAIL: no bash in td-subst.lock"))?;
-    // The candidate dir for the closure scan is the lock entry's OWN store
-    // (its parent dir) — derived, never a hardcoded prefix.
-    let seed_scan = Path::new(&bash)
-        .parent()
-        .and_then(Path::to_str)
-        .map(str::to_string)
-        .ok_or_else(|| format!("FAIL: no store dir above {bash}"))?;
-    let scan = tb_out(
-        &tb,
-        &["store-closure-scan", &seed_scan, &bash],
-        "store-closure-scan",
-    )?;
-    let bs = scan
-        .lines()
-        .find(|l| l.contains("-bash-static-"))
-        .map(str::to_string)
-        .ok_or_else(|| format!("FAIL: no static bash in the closure of {bash}"))?;
-    if !Path::new(&bs).join("bin/bash").is_file() {
-        return Err(format!("FAIL: no static bash in the closure of {bash}"));
-    }
+    // A static package to run from /td/store: the loop's td-built busybox.
+    let bs = busybox_pkg_dir()?;
+    let bs_s = path_str(&bs)?;
 
     // The user's /td/store: place the static package at <store>/<base>.
     let store = work.join("td-store");
     std::fs::create_dir_all(&store).map_err(|e| format!("FAIL: mkdir {}: {e}", store.display()))?;
-    let base = base_of(&bs);
-    cp_a(Path::new(&bs), &store.join(&base))?;
+    let base = base_of(&bs_s);
+    cp_a(&bs, &store.join(&base))?;
     chmod_r_uw(&store)?;
     println!(
         "   placed {base} into the td-owned store {}",
         store.display()
     );
 
-    // Run inside the own-root store-ns (rootless): /td/store = store, /gnu/store absent.
+    // Run inside the own-root store-ns (rootless): /td/store = store, /gnu/store
+    // absent. `$(( ))` proves a LIVE interpreter ran, not a stub echoing bytes.
     let inner = format!(
         "[ -d /td/store ] && echo TDSTORE-OK\n\
          [ -d /td/store/{base}/bin ] && echo PKG-AT-TDSTORE\n\
          [ -e /gnu/store ] && echo GNU-PRESENT || echo GNU-ABSENT\n\
-         echo \"RAN:$BASH_VERSION\"\n"
+         echo \"RAN:$(( 40 + 2 ))\"\n"
     );
     let store_s = path_str(&store)?;
     let out = tb_out(
@@ -1638,7 +1621,7 @@ fn store_ns(root: &Path) -> Result<(), String> {
             "store-ns",
             &store_s,
             "--",
-            &format!("/td/store/{base}/bin/bash"),
+            &format!("/td/store/{base}/bin/sh"),
             "-c",
             &inner,
         ],
@@ -1649,7 +1632,7 @@ fn store_ns(root: &Path) -> Result<(), String> {
     }
 
     // Leg A: DURABLE behavioral — the binary ran from /td/store.
-    if !out.lines().any(|l| l.starts_with("RAN:5")) {
+    if !out.lines().any(|l| l == "RAN:42") {
         return Err("FAIL: the static binary did not run from /td/store".into());
     }
     if !out.lines().any(|l| l == "PKG-AT-TDSTORE") {
@@ -1841,17 +1824,21 @@ fn recipe_rs(root: &Path) -> Result<(), String> {
     );
 
     let penv = crate::stage0::ProvisionEnv::from_env(root);
-    let rustpath = crate::stage0::provision_rust(&penv)
-        .map_err(|e| format!("FAIL: provision-rust: {e}"))?;
-    let ccpath =
-        crate::stage0::provision_cc(&penv).map_err(|e| format!("FAIL: provision-cc: {e}"))?;
+    // An ABSENT toolchain is a PROVISIONING gap, not a recipes-crate regression:
+    // `ProvisionErr::tagged` carries the UNPROVISIONED_TAG so `cli` exits 69
+    // (Unprovisioned/tolerated). In the host-tool-free loop sandbox no toolchain
+    // is reachable, so this leg degrades to a skip and the host `cargo-test`
+    // preflight carries the recipes crate's tests + clippy. A RESOLVED-but-broken
+    // toolchain stays untagged → FAILURE → RED (not silenced as a skip).
+    let rustpath = crate::stage0::provision_rust(&penv).map_err(|e| e.tagged())?;
+    let ccpath = crate::stage0::provision_cc(&penv).map_err(|e| e.tagged())?;
     let cargo_bin = find_in_path_frags(&rustpath, "cargo")
         .ok_or_else(|| format!("FAIL: no cargo in provision-rust output ({rustpath})"))?;
-    // Pin the compiler and linker to the provisioned toolchain (Codex P2): the
-    // rustc the build actually uses, and the gcc that owns the matched static
-    // glibc, so no inherited RUSTC / CARGO_TARGET_<triple>_LINKER substitutes a
-    // different one and pairs the static glibc's crt objects with a mismatched
-    // driver (which links clean yet SIGSEGVs at startup).
+    // Pin the compiler and the HOST build-script linker to the provisioned
+    // toolchain (Codex P2): the rustc the build actually uses, and the gcc that
+    // links the host build script (`cc` may be absent by that name under a guix
+    // profile), so no inherited RUSTC / CARGO_TARGET_<host>_LINKER substitutes a
+    // different one.
     let rustc_bin = find_in_path_frags(&rustpath, "rustc")
         .ok_or_else(|| format!("FAIL: no rustc in provision-rust output ({rustpath})"))?;
     let cc_bin = find_in_path_frags(&ccpath, "cc")
@@ -1859,6 +1846,11 @@ fn recipe_rs(root: &Path) -> Result<(), String> {
         .ok_or_else(|| format!("FAIL: no cc/gcc in provision-cc output ({ccpath})"))?;
     let rustc_s = path_str(&rustc_bin)?;
     let cc_s = path_str(&cc_bin)?;
+    // The host build scripts / proc-macros link with the provisioned cc; the
+    // MUSL_TARGET binary links itself static via rust-lld (below).
+    let host_triple = crate::stage0::rustc_host_triple(&rustc_bin)
+        .map_err(|e| format!("FAIL: {e}"))?;
+    let host_linker_var = crate::stage0::target_linker_var(&host_triple);
 
     let scratch = fresh_scratch(root, ".recipe-rs-scratch")?;
     let cargo_home = scratch.join("home");
@@ -1873,33 +1865,32 @@ fn recipe_rs(root: &Path) -> Result<(), String> {
 
     let old_path = std::env::var("PATH").unwrap_or_default();
     let new_path = format!("{rustpath}:{ccpath}:{old_path}");
-    // STATICALLY link the evaluator (and its cargo build-script/test binaries)
-    // against a MATCHED static glibc. A static binary has an EMPTY runtime closure
-    // — no DT_NEEDED, no DT_RUNPATH — so it can never load libgcc_s.so.1/libc.so.6
-    // from the MUTABLE ~/.guix-home/profile/lib that guix's gcc ld-wrapper would
-    // otherwise bake in as a runpath and that vanishes while guix-home reconfigures
-    // or GCs ("error while loading shared libraries: libgcc_s.so.1", exit 127),
-    // flaking this control-plane tool and reddening the daily backstop. Fixing it
-    // at the SOURCE (crt-static) supersedes pinning a runpath (re #469). The recipes
-    // crate is dependency-free (pure std, no proc-macros) so the flags apply
-    // cleanly to the whole build; see stage0::static_rustflags.
+    // STATICALLY link the evaluator (and its cargo test binaries) for
+    // MUSL_TARGET: `+crt-static` pulls in musl's self-contained libc.a and the
+    // bundled `rust-lld` links it with NO external cc/glibc. A static binary has
+    // an EMPTY runtime closure — no DT_NEEDED, no DT_RUNPATH — so it can never
+    // load libgcc_s.so.1/libc.so.6 from the MUTABLE ~/.guix-home/profile/lib that
+    // a glibc gcc ld-wrapper would otherwise bake in as a runpath and that
+    // vanishes while guix-home reconfigures or GCs ("error while loading shared
+    // libraries: libgcc_s.so.1", exit 127), flaking this control-plane tool and
+    // reddening the daily backstop. Fixing it at the SOURCE (crt-static musl)
+    // supersedes pinning a runpath (re #469). The recipes crate is
+    // dependency-free (pure std, no proc-macros).
     //
     // Pass the flags via CARGO_ENCODED_RUSTFLAGS, not RUSTFLAGS: run_out_env
     // OVERLAYS onto this gate's inherited environment, and cargo reads exactly
     // ONE rustflags source (first-set wins, no merge). An ambient RUSTFLAGS or
     // CARGO_ENCODED_RUSTFLAGS on the build host would otherwise outrank a
-    // tier-2 RUSTFLAGS we set here and drop the static flags — assert_static
-    // would then fail the gate (fail-closed, but a spurious env-dependent red,
-    // the very failure mode this PR removes). CARGO_ENCODED_RUSTFLAGS is cargo's
-    // highest-precedence source, so setting it here wins unconditionally, and it
-    // carries the linker pin (`-C linker=<cc>`); see stage0::static_encoded_rustflags.
-    // RUSTC pins the compiler; RUSTC_WRAPPER/RUSTC_WORKSPACE_WRAPPER are neutralized
-    // (empty = "no wrapper" to cargo) so no inherited rustc or sccache-style wrapper
-    // interposes on this control-plane build.
-    let glibc_static = crate::stage0::provision_glibc_static(&penv)
-        .map_err(|e| format!("FAIL: provision static glibc for a crt-static evaluator: {e}"))?;
-    let encoded_rustflags = crate::stage0::static_encoded_rustflags(&glibc_static, Some(&cc_s));
-    let envs: [(&str, &str); 7] = [
+    // tier-2 RUSTFLAGS and drop the static flags — assert_static would then fail
+    // the gate (fail-closed, but a spurious env-dependent red). With `--target
+    // MUSL_TARGET` set, this global CARGO_ENCODED_RUSTFLAGS applies to the
+    // MUSL_TARGET binary ONLY, leaving the host build script to link via
+    // CARGO_TARGET_<host>_LINKER = the provisioned cc. RUSTC pins the compiler;
+    // RUSTC_WRAPPER/RUSTC_WORKSPACE_WRAPPER are neutralized (empty = "no wrapper"
+    // to cargo) so no inherited rustc or sccache-style wrapper interposes.
+    let encoded_rustflags = crate::stage0::musl_static_encoded_rustflags();
+    let target = crate::stage0::MUSL_TARGET;
+    let envs: [(&str, &str); 8] = [
         ("PATH", &new_path),
         ("CARGO_ENCODED_RUSTFLAGS", &encoded_rustflags),
         ("CARGO_HOME", &cargo_home_s),
@@ -1907,6 +1898,7 @@ fn recipe_rs(root: &Path) -> Result<(), String> {
         ("RUSTC", &rustc_s),
         ("RUSTC_WRAPPER", ""),
         ("RUSTC_WORKSPACE_WRAPPER", ""),
+        (&host_linker_var, &cc_s),
     ];
 
     println!(
@@ -1919,7 +1911,14 @@ fn recipe_rs(root: &Path) -> Result<(), String> {
     // crate's own data. `cargo test` here is what actually runs them.
     run_out_env(
         &cargo_bin_s,
-        &["test", "--frozen", "--manifest-path", "recipes/Cargo.toml"],
+        &[
+            "test",
+            "--frozen",
+            "--target",
+            target,
+            "--manifest-path",
+            "recipes/Cargo.toml",
+        ],
         &envs,
         "cargo test recipes",
     )?;
@@ -1929,6 +1928,8 @@ fn recipe_rs(root: &Path) -> Result<(), String> {
             "build",
             "--release",
             "--frozen",
+            "--target",
+            target,
             "--manifest-path",
             "recipes/Cargo.toml",
         ],
@@ -1936,7 +1937,9 @@ fn recipe_rs(root: &Path) -> Result<(), String> {
         "cargo build recipes",
     )?;
 
-    let eval = cargo_target.join("release/td-recipe-eval");
+    let eval = cargo_target
+        .join(target)
+        .join("release/td-recipe-eval");
     if !eval.is_file() {
         return Err(format!(
             "FAIL: td-recipe-eval was not built at {}",
@@ -2010,16 +2013,6 @@ fn writef(p: &Path, data: &str) -> Result<(), String> {
     std::fs::write(p, data).map_err(|e| format!("FAIL: write {}: {e}", p.display()))
 }
 
-/// A declared artifact input's resolved path — the runner exported it as
-/// `TD_GATE_INPUT_<NAME>` before the body ran (#353). The env-var name is
-/// computed by the SAME function the runner uses, so the two can't drift.
-fn gate_input(name: &str) -> Result<String, String> {
-    let var = crate::gate_inputs::env_var(name);
-    std::env::var(&var).map_err(|_| {
-        format!("FAIL: {var} unset — run via td-builder gate-run, which resolves the gate's declared inputs")
-    })
-}
-
 /// `readlink -f $(command -v BIN)` — the first executable `bin` on PATH,
 /// canonicalized. Resolves the absolute binary ourselves (Command's PATH search
 /// uses the CURRENT process env, not a child override).
@@ -2054,6 +2047,28 @@ fn store_root_for(p: &str) -> Result<String, String> {
         return Err(format!("FAIL: {p} is not under a store root"));
     }
     Ok(root)
+}
+
+/// The loop's td-built busybox package dir — the guix-free static shell already
+/// on the gate's PATH (the same one `sandbox_hardening` resolves), the store-ns
+/// gates' runnable static fixture now that the guix bash-static lock is retired.
+/// `which_path` keeps the bound /td/store path (an applet symlink dispatches on
+/// argv[0], so we must NOT canonicalize it to `busybox`); its parent's parent is
+/// the package dir. `store_root_for` rejects a host `/bin/sh` — loud, not silent.
+fn busybox_pkg_dir() -> Result<PathBuf, String> {
+    let sh_bound = which_path("sh")
+        .ok_or_else(|| String::from("FAIL: no busybox `sh` on PATH (loop userland)"))?;
+    let sh_bound_s = path_str(&sh_bound)?;
+    let bs = sh_bound
+        .parent()
+        .and_then(Path::parent)
+        .ok_or_else(|| format!("FAIL: no package dir above {sh_bound_s}"))?
+        .to_path_buf();
+    store_root_for(&path_str(&bs)?)?;
+    if !is_executable_file(&bs.join("bin/sh")) {
+        return Err(format!("FAIL: no static busybox `sh` at {}", bs.display()));
+    }
+    Ok(bs)
 }
 
 /// Count the processes whose `/proc/<pid>/cmdline` carries `marker` (NULs read as
@@ -2351,10 +2366,10 @@ fn check_pinned_sync(
 }
 
 /// The [behavioral]+[structural] leg shared by both input-addressed gates: place
-/// the static-bash fixture at the arch-keyed input-addressed /td/store path and
-/// run it in the store-ns own-root with /gnu/store ABSENT. `name_stem` is the
-/// input-addressed name (`bash-static` / `bash-static-x86_64`).
-fn run_input_addressed_bash(
+/// the busybox fixture at the arch-keyed input-addressed /td/store path and run
+/// it in the store-ns own-root with /gnu/store ABSENT. `name_stem` is the
+/// input-addressed name (`busybox-static` / `busybox-static-x86_64`).
+fn run_input_addressed_shell(
     tb: &Path,
     work: &Path,
     bs: &str,
@@ -2377,10 +2392,10 @@ fn run_input_addressed_bash(
             "FAIL: {name_stem} not input-addressed at /td/store: {runp}"
         ));
     }
-    if !is_executable_file(&store.join(base_of(&runp)).join("bin/bash")) {
+    if !is_executable_file(&store.join(base_of(&runp)).join("bin/sh")) {
         return Err(format!("FAIL: interned {name_stem} missing physically"));
     }
-    let run_bin = format!("{runp}/bin/bash");
+    let run_bin = format!("{runp}/bin/sh");
     let out = tb_out(
         tb,
         &[
@@ -2389,14 +2404,14 @@ fn run_input_addressed_bash(
             "--",
             &run_bin,
             "-c",
-            "[ -e /gnu/store ] && echo GNU-PRESENT || echo GNU-ABSENT; echo \"RAN:$BASH_VERSION\"",
+            "[ -e /gnu/store ] && echo GNU-PRESENT || echo GNU-ABSENT; echo \"RAN:$(( 40 + 2 ))\"",
         ],
         "store-ns run from the input-addressed path",
     )?;
     for l in out.lines() {
         println!("     {l}");
     }
-    if !out.lines().any(|l| l.starts_with("RAN:5")) {
+    if !out.lines().any(|l| l == "RAN:42") {
         return Err(
             "FAIL: [behavioral] the binary did not run from its input-addressed /td/store path"
                 .into(),
@@ -2426,11 +2441,9 @@ fn store_native_profile(root: &Path) -> Result<(), String> {
     println!(">> td-builder (stage0, guix-free): {}", tb.display());
     let work = fresh_scratch(root, ".store-native-profile-scratch")?;
 
-    // The declared bash-static fixture (#353): a real multi-entry static package.
-    let bs = gate_input("bash-static")?;
-    if !is_executable_file(&Path::new(&bs).join("bin/bash")) {
-        return Err(format!("FAIL: no static bash fixture at {bs}"));
-    }
+    // A real multi-entry static package: the loop's td-built busybox.
+    let bs = busybox_pkg_dir()?;
+    let bs_s = path_str(&bs)?;
 
     // Intern it at the LOGICAL /td/store; bytes land physically under `store`.
     let store = work.join("td-store");
@@ -2439,20 +2452,20 @@ fn store_native_profile(root: &Path) -> Result<(), String> {
     let db_s = path_str(&work.join("db.sqlite"))?;
     let pkg = tb_out_env(
         &tb,
-        &["store-add-recursive", "bash-static", &bs, &store_s, &db_s],
+        &["store-add-recursive", "busybox-x86-64", &bs_s, &store_s, &db_s],
         &[("TD_STORE_DIR", "/td/store")],
-        "store-add-recursive bash-static",
+        "store-add-recursive busybox-x86-64",
     )?;
-    if !(pkg.starts_with("/td/store/") && pkg.ends_with("-bash-static")) {
+    if !(pkg.starts_with("/td/store/") && pkg.ends_with("-busybox-x86-64")) {
         return Err(format!(
-            "FAIL: bash-static not content-addressed at /td/store: {pkg}"
+            "FAIL: busybox not content-addressed at /td/store: {pkg}"
         ));
     }
     let physpkg = store.join(base_of(&pkg));
     let physpkg_s = path_str(&physpkg)?;
-    if !is_executable_file(&physpkg.join("bin/bash")) {
+    if !is_executable_file(&physpkg.join("bin/busybox")) {
         return Err(format!(
-            "FAIL: interned bash-static missing physically at {}",
+            "FAIL: interned busybox missing physically at {}",
             physpkg.display()
         ));
     }
@@ -2467,32 +2480,34 @@ fn store_native_profile(root: &Path) -> Result<(), String> {
         "profile --store-native",
     )?;
 
-    // [structural] the profile entries are LOGICAL /td/store symlinks.
-    for t in ["bash", "sh"] {
+    // [structural] the profile entries are LOGICAL /td/store symlinks. busybox
+    // provides `sh` (an applet symlink) alongside the `busybox` multiplexer;
+    // check both retarget logically.
+    for t in ["sh", "busybox"] {
         let link = prof.join("bin").join(t);
         let tgt = std::fs::read_link(&link)
             .map_err(|_| format!("FAIL: no profile entry for {t}"))?;
         let tgt_s = tgt.to_string_lossy();
-        let want = format!("-bash-static/bin/{t}");
+        let want = format!("-busybox-x86-64/bin/{t}");
         if !(tgt_s.starts_with("/td/store/") && tgt_s.ends_with(&want)) {
             return Err(format!(
                 "FAIL: profile/bin/{t} is not a logical /td/store link (got: {tgt_s})"
             ));
         }
     }
-    println!("   [structural] profile entries (bash, sh) are logical /td/store symlinks");
+    println!("   [structural] profile entries (sh, busybox) are logical /td/store symlinks");
 
     // Run the profiled tools in the own-root via a probe FILE bound in the store
     // (no nested quoting between the outer capture and the inner script).
+    // `$(( ))` proves a LIVE interpreter ran, not a stub echoing bytes.
     let probe = store.join("probe.sh");
     writef(
         &probe,
         "export PATH=/td/store/profile/bin\n\
          [ -e /gnu/store ] && echo GNU-PRESENT || echo GNU-ABSENT\n\
-         case \"$(command -v bash)\" in /td/store/profile/bin/bash) echo BASH-VIA-PROFILE ;; esac\n\
          case \"$(command -v sh)\" in /td/store/profile/bin/sh) echo SH-VIA-PROFILE ;; esac\n\
-         bash -c 'echo \"BASH-RAN:$BASH_VERSION\"'\n\
-         sh -c 'echo SH-RAN-OK'\n",
+         case \"$(command -v busybox)\" in /td/store/profile/bin/busybox) echo BUSYBOX-VIA-PROFILE ;; esac\n\
+         sh -c 'echo \"SH-RAN:$(( 40 + 2 ))\"'\n",
     )?;
     let out = tb_out(
         &tb,
@@ -2500,7 +2515,7 @@ fn store_native_profile(root: &Path) -> Result<(), String> {
             "store-ns",
             &store_s,
             "--",
-            "/td/store/profile/bin/bash",
+            "/td/store/profile/bin/sh",
             "/td/store/probe.sh",
         ],
         "store-ns profile run",
@@ -2510,16 +2525,13 @@ fn store_native_profile(root: &Path) -> Result<(), String> {
     }
 
     let has = |s: &str| out.lines().any(|l| l == s);
-    if !has("BASH-VIA-PROFILE") {
-        return Err("FAIL: bash did not resolve via /td/store/profile/bin".into());
-    }
     if !has("SH-VIA-PROFILE") {
         return Err("FAIL: sh did not resolve via /td/store/profile/bin".into());
     }
-    if !out.lines().any(|l| l.starts_with("BASH-RAN:5")) {
-        return Err("FAIL: the profiled bash did not run from /td/store".into());
+    if !has("BUSYBOX-VIA-PROFILE") {
+        return Err("FAIL: busybox did not resolve via /td/store/profile/bin".into());
     }
-    if !has("SH-RAN-OK") {
+    if !has("SH-RAN:42") {
         return Err("FAIL: the profiled sh did not run from /td/store".into());
     }
     println!(
@@ -2559,7 +2571,7 @@ fn store_native_profile(root: &Path) -> Result<(), String> {
 /// itself is exec'd, so argv[0] keeps the program name and any layout
 /// dispatches correctly. The nested td-builder's processes are visible in this
 /// PID namespace, so a /proc cmdline scan confirms they are gone after the kill.
-fn sandbox_hardening(root: &Path) -> Result<(), String> {
+fn sandbox_hardening(_root: &Path) -> Result<(), String> {
     println!(
         ">> sandbox-hardening: td's loop sandbox has a minimal /dev (no host device leak), \
          reaps its inner tree when killed, and exposes the store input-only"
@@ -2662,85 +2674,6 @@ exit 0
     println!(
         "   {sroot} exposes {entries} bound items; the sh package rejects writes"
     );
-    // The declared SEED store (whatever dir the seed locks name — derived,
-    // never hardcoded, exactly like the prelude derives it): also a bounded
-    // per-item closure, also read-only. The only remaining seed locks are the
-    // pinned RUST toolchain's (td-subst.lock / td-builder-rust.lock — the
-    // AGENTS.md control plane); the recipe rungs' seed-tools lock is DELETED
-    // (host executables are not admissible bootstrap inputs, re #469).
-    let lock_text =
-        std::fs::read_to_string(root.join("tests/td-subst.lock")).unwrap_or_default();
-    let seed_item = lock_text
-        .lines()
-        .map(str::trim)
-        .filter(|l| !l.is_empty() && !l.starts_with('#'))
-        .filter_map(|l| l.split_whitespace().nth(1))
-        .filter(|p| p.starts_with('/'))
-        .find(|p| Path::new(p).is_dir());
-    match seed_item {
-        Some(item) => {
-            let seed_dir = Path::new(item)
-                .parent()
-                .ok_or_else(|| format!("FAIL: no parent dir above the seed item {item}"))?;
-            let seed_entries = std::fs::read_dir(seed_dir)
-                .map_err(|e| format!("FAIL: cannot read {}: {e}", seed_dir.display()))?
-                .count();
-            if seed_entries == 0 || seed_entries > 4096 {
-                return Err(format!(
-                    "FAIL: {} exposes {seed_entries} entries — expected the loop's bounded \
-                     seed-lock closure, not a whole-store bind",
-                    seed_dir.display()
-                ));
-            }
-            // The bound item's CONTENT must be visible, not just its mountpoint:
-            // ro_dirs locks the parent via a recursive self-bind + ro remount,
-            // and a non-recursive self-bind there would clone only the top
-            // mount, shadowing every item bind with its empty mountpoint dir
-            // (review finding — the loop would see empty store items).
-            let item_entries = std::fs::read_dir(item)
-                .map_err(|e| format!("FAIL: cannot read the bound seed item {item}: {e}"))?
-                .count();
-            if item_entries == 0 {
-                return Err(format!(
-                    "FAIL: {item} is EMPTY inside the sandbox — the item bind is shadowed \
-                     by the parent dir's read-only lock (host_shell ro_dirs must self-bind \
-                     recursively so child mounts stay visible)"
-                ));
-            }
-            let probe = Path::new(item).join(".td-ro-probe");
-            if std::fs::File::create(&probe).is_ok() {
-                let _ = std::fs::remove_file(&probe);
-                return Err(format!(
-                    "FAIL: created {} — a bound seed item is WRITABLE inside the sandbox",
-                    probe.display()
-                ));
-            }
-            // The seed dir ITSELF must reject entry creation (host_shell
-            // ro_dirs): the items being ro is not enough — a writable parent
-            // would let a gate plant a fake sibling "store item" next to the
-            // declared inputs. (/td/store is the documented exception: it is
-            // the loop's WORKING store prefix and stays writable.)
-            let sibling = seed_dir.join(".td-sibling-probe");
-            if std::fs::File::create(&sibling).is_ok() {
-                let _ = std::fs::remove_file(&sibling);
-                return Err(format!(
-                    "FAIL: created {} — the seed store dir accepts NEW entries inside the \
-                     sandbox (a fake sibling store item is plantable)",
-                    sibling.display()
-                ));
-            }
-            println!(
-                "   {} exposes {seed_entries} bound items (not the host store); {item} shows \
-                 {item_entries} entries and rejects writes; the dir rejects new entries",
-                seed_dir.display()
-            );
-        }
-        None => println!(
-            "   (no seed-lock item present in the sandbox — seed-store leg skipped, matching \
-             a seed-less prelude)"
-        ),
-    }
-
     // (B) orphan reaping: killing td-builder reaps the whole inner sandbox tree.
     println!(">> (B) orphan reaping: killing td-builder reaps the whole inner sandbox tree");
     // A distinctive token carried in every inner cmdline. It doubles as the sleep
@@ -2969,11 +2902,9 @@ fn toolchain_input_addressed(root: &Path) -> Result<(), String> {
     );
 
     // [behavioral]+[structural] a real binary at an input-addressed path RUNS.
-    let bs = gate_input("bash-static")?;
-    if !is_executable_file(&Path::new(&bs).join("bin/bash")) {
-        return Err(format!("FAIL: no static bash fixture at {bs}"));
-    }
-    run_input_addressed_bash(&tb, &work, &bs, &k1, "bash-static")?;
+    let bs = busybox_pkg_dir()?;
+    let bs_s = path_str(&bs)?;
+    run_input_addressed_shell(&tb, &work, &bs_s, &k1, "busybox-static")?;
 
     let _ = chmod_r_uw(&work);
     let _ = std::fs::remove_dir_all(&work);
@@ -3136,11 +3067,9 @@ fn toolchain_x86_64_input_addressed(root: &Path) -> Result<(), String> {
     );
 
     // [behavioral]+[structural] a real binary at the x86_64-keyed path RUNS.
-    let bs = gate_input("bash-static")?;
-    if !is_executable_file(&Path::new(&bs).join("bin/bash")) {
-        return Err(format!("FAIL: no static bash fixture at {bs}"));
-    }
-    run_input_addressed_bash(&tb, &work, &bs, &kx, "bash-static-x86_64")?;
+    let bs = busybox_pkg_dir()?;
+    let bs_s = path_str(&bs)?;
+    run_input_addressed_shell(&tb, &work, &bs_s, &kx, "busybox-static-x86_64")?;
 
     let _ = chmod_r_uw(&work);
     let _ = std::fs::remove_dir_all(&work);

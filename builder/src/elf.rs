@@ -33,10 +33,6 @@ const EI_MAG: &[u8] = b"\x7fELF";
 const EI_CLASS: usize = 4; // 1 = ELFCLASS32, 2 = ELFCLASS64
 const EI_DATA: usize = 5; // 1 = ELFDATA2LSB
 
-// e_type values (Elf*_Half at file offset 0x10 in both classes).
-const ET_EXEC: u16 = 2; // a position-dependent executable
-const ET_DYN: u16 = 3; // a shared object OR a PIE executable
-
 // Program-header types and dynamic-section tags (class-independent values).
 const PT_LOAD: u32 = 1;
 const PT_DYNAMIC: u32 = 2;
@@ -52,8 +48,6 @@ const DT_NEEDED: u64 = 1; // .dynstr offset of a required shared-object name
 const DT_STRTAB: u64 = 5; // vaddr of the .dynstr string table
 const DT_RPATH: u64 = 15; // legacy run-path (string offset into .dynstr)
 const DT_RUNPATH: u64 = 29; // run-path, takes precedence over DT_RPATH at load time
-const DT_FLAGS_1: u64 = 0x6fff_fffb; // DT_FLAGS_1: state flags (holds the DF_1_* bit set)
-const DF_1_PIE: u64 = 0x0800_0000; // DF_1_PIE: this ET_DYN is a position-independent EXECUTABLE
 
 fn u16le(b: &[u8], off: usize) -> Result<u16, String> {
     b.get(off..off + 2)
@@ -349,61 +343,6 @@ pub fn read_interp(path: &Path) -> Result<Option<String>, String> {
     }
 }
 
-/// True iff the ELF is flagged a position-independent EXECUTABLE by `DT_FLAGS_1 & DF_1_PIE`.
-/// A STATIC PIE (e.g. guix's `ldconfig`) is `ET_DYN` with a PT_DYNAMIC but NO `PT_INTERP`,
-/// so PT_INTERP alone cannot separate it from a shared library — the linker sets this flag to
-/// say "this DYN is really an executable". `false` for a plain shared object, the dynamic
-/// loader itself, and any ELF with no dynamic section (a truly static non-PIE).
-fn is_pie_by_flags(elf: &Elf<'_>) -> Result<bool, String> {
-    let (doff, dsize) = match elf.segment_slot(PT_DYNAMIC, "PT_DYNAMIC")? {
-        None => return Ok(false), // no dynamic section — not a PIE
-        Some(x) => x,
-    };
-    // Elf64_Dyn is 16 bytes (d_tag u64 @0, d_un u64 @8); Elf32_Dyn is 8 (u32 @0, u32 @4).
-    let (entsize, d_un) = if elf.is64 { (16, 8) } else { (8, 4) };
-    for i in 0..(dsize / entsize) {
-        let e = doff + i * entsize;
-        match elf.word(e)? {
-            DT_NULL => break,
-            DT_FLAGS_1 => return Ok(elf.word(e + d_un)? & DF_1_PIE != 0),
-            _ => {}
-        }
-    }
-    Ok(false)
-}
-
-/// True iff `path` is a runnable **program** — a file the sandbox could execute, directly
-/// or through the staged dynamic loader, to run code. Three shapes qualify: an ELF
-/// executable (`ET_EXEC`); an ELF PIE executable (`ET_DYN` that is either wired to the loader
-/// via `PT_INTERP`, or — as a STATIC PIE — carries no `PT_INTERP` but is stamped `DF_1_PIE` in
-/// `DT_FLAGS_1`); and a non-ELF file bearing an execute bit (a `#!`-script or similar).
-///
-/// A shared library and the dynamic loader itself (`ET_DYN`, no `PT_INTERP`, not `DF_1_PIE`),
-/// and relocatable objects / archive members (`ET_REL`), are NOT programs. `executable` is
-/// the file's execute-bit test; it is consulted ONLY for the non-ELF case — an ELF executable
-/// is a program even without `+x`, because the staged loader can map and run it regardless.
-///
-/// The WHOLE file is read: a static PIE's `DT_FLAGS_1` lives in its dynamic section, which a
-/// linker can place well past any fixed header prefix, so a bounded prefix read would
-/// misclassify exactly the static-PIE case this guard exists to catch. Used to bound the
-/// builder-runtime staging surface to libraries, never a program (re #469).
-pub fn is_runnable_program(path: &Path, executable: bool) -> Result<bool, String> {
-    let b = std::fs::read(path).map_err(|e| format!("read {}: {e}", path.display()))?;
-    let elf = match Elf::parse(&b) {
-        Ok(e) => e,
-        Err(_) => return Ok(executable), // non-ELF: a program iff it carries an execute bit
-    };
-    match u16le(&b, 0x10)? {
-        ET_EXEC => Ok(true),
-        // ET_DYN is a shared object OR a PIE executable. A dynamically-linked PIE carries
-        // PT_INTERP (the loader runs it); a STATIC PIE has none but sets DF_1_PIE in
-        // DT_FLAGS_1 (guix's ldconfig has exactly this shape). Either marker ⇒ a program; a
-        // plain shared object / the loader itself has neither.
-        ET_DYN => Ok(elf.segment_slot(PT_INTERP, "PT_INTERP")?.is_some() || is_pie_by_flags(&elf)?),
-        _ => Ok(false), // ET_REL (.o/.a), ET_CORE, … — not a runnable program
-    }
-}
-
 /// Rewrite the program interpreter (`PT_INTERP`) string. A path that fits the existing slot
 /// (plus its NUL) is written IN PLACE (remaining bytes NUL-padded). A LONGER path is handled
 /// by GROWING: the new path (NUL-terminated) is appended to the end of the file, the
@@ -674,79 +613,6 @@ pub fn assert_static(path: &Path) -> Result<(), String> {
 mod tests {
     use super::*;
 
-    // Patch e_type (Elf*_Half @ 0x10) in a synth buffer so one synth helper can stand in for
-    // an executable / shared object / relocatable object.
-    fn with_etype(mut b: Vec<u8>, et: u16) -> Vec<u8> {
-        b[16..18].copy_from_slice(&et.to_le_bytes());
-        b
-    }
-
-    #[test]
-    fn is_runnable_program_separates_programs_from_libraries() {
-        let dir = std::env::temp_dir().join(format!("td-runnable-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-
-        // A shared object (ET_DYN, no PT_INTERP) is NOT a program — even with +x, which
-        // real `.so`/loader files carry.
-        let lib = dir.join("libfoo.so");
-        std::fs::write(&lib, with_etype(synth_dyn_elf("/x/lib", true, true), ET_DYN)).unwrap();
-        assert!(!is_runnable_program(&lib, true).unwrap());
-
-        // A PIE executable (ET_DYN WITH PT_INTERP) IS a program — even without +x, because
-        // the staged loader can run it.
-        let pie = dir.join("pie");
-        std::fs::write(&pie, with_etype(synth_interp_elf("/lib/ld.so", true), ET_DYN)).unwrap();
-        assert!(is_runnable_program(&pie, false).unwrap());
-
-        // A classic executable (ET_EXEC) IS a program.
-        let exe = dir.join("prog");
-        std::fs::write(&exe, with_etype(synth_interp_elf("/lib/ld.so", true), ET_EXEC)).unwrap();
-        assert!(is_runnable_program(&exe, false).unwrap());
-
-        // A relocatable object (ET_REL — a `.o`/`.a` member) is NOT a program.
-        let obj = dir.join("crt1.o");
-        std::fs::write(&obj, with_etype(synth_dyn_elf("/x/lib", true, true), 1 /* ET_REL */)).unwrap();
-        assert!(!is_runnable_program(&obj, true).unwrap());
-
-        // A non-ELF file is a program iff it carries an execute bit (a `#!`-script).
-        let script = dir.join("run.sh");
-        std::fs::write(&script, b"#!/bin/sh\necho hi\n").unwrap();
-        assert!(is_runnable_program(&script, true).unwrap());
-        assert!(!is_runnable_program(&script, false).unwrap());
-
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    // Regression (re #469, PR review): a STATIC PIE — guix's `ldconfig` has this exact shape —
-    // is ET_DYN with a PT_DYNAMIC but NO PT_INTERP, so the PT_INTERP-only test misclassified it
-    // as a library. DF_1_PIE in DT_FLAGS_1 is the marker that it is really an executable. The
-    // same shape WITHOUT that flag is a genuine shared object and must stay a library.
-    #[test]
-    fn is_runnable_program_flags_static_pie_via_df_1_pie() {
-        let dir = std::env::temp_dir().join(format!("td-staticpie-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-
-        for is64 in [true, false] {
-            // Static PIE: DF_1_PIE set, no PT_INTERP → a program, even without +x.
-            let spie = dir.join(format!("ldconfig-{is64}"));
-            std::fs::write(&spie, with_etype(synth_flags1_elf(DF_1_PIE, is64), ET_DYN)).unwrap();
-            assert!(
-                is_runnable_program(&spie, false).unwrap(),
-                "static PIE (DF_1_PIE, no PT_INTERP, is64={is64}) must be a program"
-            );
-
-            // Same shape, DT_FLAGS_1 present but DF_1_PIE clear → a real shared object.
-            let lib = dir.join(format!("libshared-{is64}.so"));
-            std::fs::write(&lib, with_etype(synth_flags1_elf(0, is64), ET_DYN)).unwrap();
-            assert!(
-                !is_runnable_program(&lib, true).unwrap(),
-                "a plain shared object (no DF_1_PIE, no PT_INTERP, is64={is64}) must be a library"
-            );
-        }
-
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
     // A minimal little-endian ELF buffer with exactly one PT_INTERP program header whose
     // string slot holds `interp` (NUL-terminated). `is64` selects ELFCLASS64 (x86-64) or
     // ELFCLASS32 (i686 — the class the bootstrap toolchain cc1/as/ld actually is). Enough
@@ -845,47 +711,6 @@ mod tests {
 
         b[strtab_off + rpath_str_off..strtab_off + rpath_str_off + rpath.len()]
             .copy_from_slice(rpath.as_bytes());
-        b
-    }
-
-    // A minimal ET_DYN-shaped buffer (caller stamps e_type via `with_etype`) with a PT_LOAD +
-    // a PT_DYNAMIC holding a single DT_FLAGS_1 = `flags1` entry then DT_NULL, and NO PT_INTERP
-    // — the shape of a STATIC PIE (DF_1_PIE) or, with flags1 == 0, a plain shared object.
-    fn synth_flags1_elf(flags1: u64, is64: bool) -> Vec<u8> {
-        let (ehdr, phentsize, dyn_entsize, d_un) =
-            if is64 { (64usize, 56usize, 16usize, 8usize) } else { (52usize, 32usize, 8usize, 4usize) };
-        let phnum = 2usize;
-        let dyn_off = ehdr + phnum * phentsize;
-        let dyn_size = 2 * dyn_entsize; // DT_FLAGS_1, DT_NULL
-        let total = dyn_off + dyn_size;
-
-        let mut b = vec![0u8; total];
-        b[0..4].copy_from_slice(EI_MAG);
-        b[EI_CLASS] = if is64 { 2 } else { 1 };
-        b[EI_DATA] = 1;
-        put_phdr_header(&mut b, ehdr, phentsize, phnum, is64);
-        let (p_off, p_vaddr, p_filesz) = ph_field_offsets(is64);
-
-        // PHDR 0: PT_LOAD covering the whole file, identity-mapped.
-        let p0 = ehdr;
-        b[p0..p0 + 4].copy_from_slice(&PT_LOAD.to_le_bytes());
-        put_word(&mut b, p0 + p_off, 0, is64);
-        put_word(&mut b, p0 + p_vaddr, 0, is64);
-        put_word(&mut b, p0 + p_filesz, total as u64, is64);
-        // PHDR 1: PT_DYNAMIC pointing at the dynamic array.
-        let p1 = ehdr + phentsize;
-        b[p1..p1 + 4].copy_from_slice(&PT_DYNAMIC.to_le_bytes());
-        put_word(&mut b, p1 + p_off, dyn_off as u64, is64);
-        put_word(&mut b, p1 + p_vaddr, dyn_off as u64, is64);
-        put_word(&mut b, p1 + p_filesz, dyn_size as u64, is64);
-
-        let put_dyn = |b: &mut [u8], idx: usize, tag: u64, val: u64| {
-            let e = dyn_off + idx * dyn_entsize;
-            put_word(b, e, tag, is64);
-            put_word(b, e + d_un, val, is64);
-        };
-        put_dyn(&mut b, 0, DT_FLAGS_1, flags1);
-        put_dyn(&mut b, 1, DT_NULL, 0);
         b
     }
 

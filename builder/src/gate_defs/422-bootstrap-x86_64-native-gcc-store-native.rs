@@ -17,7 +17,7 @@
 //! (recipes/src/recipes/, driven by td-recipe-eval check-run) — the retirement of the
 //! former `td-builder toolchain-recipe x86_64-native` imperative Rust path.
 
-use crate::gates::{ArtifactInput, GateDef, InputKind, Pool};
+use crate::gates::{GateDef, Pool};
 
 pub fn gate() -> GateDef {
     GateDef {
@@ -26,14 +26,6 @@ pub fn gate() -> GateDef {
         needs: &[],
         build_gate: false,
         specs: &[],
-        inputs: &[ArtifactInput {
-            name: "bash-static",
-            kind: InputKind::ClosureMember {
-                lock: "tests/td-subst.lock",
-                root_stem: "bash",
-                member_stem: "bash-static",
-            },
-        }],
         non_blocking: false,
         script: r##"
 echo ">> recipe-check gcc-x86-64-native-test: build the native x86_64 gcc recipe graph and assert its output"

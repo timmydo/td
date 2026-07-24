@@ -26,7 +26,7 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-use crate::check_loop::{find_in_path, EXIT_UNPROVISIONED};
+use crate::check_loop::{find_in_path, EXIT_UNPROVISIONED, GATES_SKIPPED_SENTINEL};
 
 const HELP: &str = "\
 td-builder daily [--no-system] [--verdict FILE]
@@ -45,12 +45,18 @@ pub fn cli(args: &[String]) -> std::process::ExitCode {
 }
 
 /// The per-leg outcome the pure verdict function reasons over: each leg's exit
-/// code plus whether that code was `EXIT_UNPROVISIONED`. Kept free of IO so the
-/// scenario matrix can drive `compute_verdict` directly (the unit test below).
+/// code, whether that code was `EXIT_UNPROVISIONED`, and whether the leg exited
+/// GREEN but SKIPPED ≥1 gate as Unprovisioned (the `GATES_SKIPPED_SENTINEL` in
+/// its log). Kept free of IO so the scenario matrix can drive `compute_verdict`
+/// directly (the unit test below); `run` sets `skipped` from the leg log.
 #[derive(Clone, Copy)]
 struct LegRc {
     rc: i32,
     unprovisioned: bool,
+    /// The leg exited (green) but did not run every gate — some skipped as
+    /// Unprovisioned. Not a full-suite proof: PARTIAL, `.td-last-green`/publish
+    /// withheld. Only meaningful when `rc == 0` (a red leg is red regardless).
+    skipped: bool,
 }
 
 impl LegRc {
@@ -58,13 +64,32 @@ impl LegRc {
         LegRc {
             rc: code,
             unprovisioned: code == EXIT_UNPROVISIONED,
+            skipped: false,
         }
     }
     fn green() -> Self {
         LegRc {
             rc: 0,
             unprovisioned: false,
+            skipped: false,
         }
+    }
+}
+
+/// A leg's `td-builder check` exited green but its log carries the whole-suite
+/// [`GATES_SKIPPED_SENTINEL`] — ≥1 gate skipped as Unprovisioned, so this is not
+/// a full-suite proof (re #469). Scans raw BYTES (a build/console log routinely
+/// carries non-UTF-8 — a lossy decode would drop the token; mirrors the per-gate
+/// `log_has_unprovisioned_sentinel`), and FAILS CLOSED: if the completed leg log
+/// cannot be read, treat the run as not-a-full-proof (withhold `.td-last-green` +
+/// publish) rather than certify a green we could not verify.
+fn log_has_skips(log: &Path) -> bool {
+    match std::fs::read(log) {
+        Ok(bytes) => {
+            let tok = GATES_SKIPPED_SENTINEL.as_bytes();
+            bytes.windows(tok.len()).any(|w| w == tok)
+        }
+        Err(_) => true,
     }
 }
 
@@ -107,11 +132,20 @@ fn compute_verdict(inp: &VerdictInput) -> Verdict {
     // unprovisioned (exit 69), treat it symmetrically — no red bit, PARTIAL.
     let system_unprov = inp.run_system && !env_error && inp.system.unprovisioned;
     let harness_env_error = inp.harness.unprovisioned;
+    // A leg that exited GREEN but SKIPPED ≥1 in-jail gate (Unprovisioned) did not
+    // run the full suite: PARTIAL, exactly like an unprovisioned tier — no red
+    // bit, but `.td-last-green`/publish withheld (re #469). Only when the leg is
+    // otherwise green (rc == 0, not itself unprovisioned).
+    let heavy_skipped = !env_error && inp.heavy.rc == 0 && inp.heavy.skipped;
+    let system_skipped =
+        inp.run_system && !env_error && !system_unprov && inp.system.rc == 0 && inp.system.skipped;
 
     let heavy_state = if env_error {
         "unprovisioned"
     } else if inp.heavy.rc != 0 {
         "red"
+    } else if heavy_skipped {
+        "partial"
     } else {
         "green"
     };
@@ -119,10 +153,12 @@ fn compute_verdict(inp: &VerdictInput) -> Verdict {
         "skipped"
     } else if env_error || system_unprov {
         "unprovisioned"
-    } else if inp.system.rc == 0 {
-        "green"
-    } else {
+    } else if inp.system.rc != 0 {
         "red"
+    } else if system_skipped {
+        "partial"
+    } else {
+        "green"
     };
     let harness_state = if harness_env_error {
         "unprovisioned"
@@ -158,12 +194,14 @@ fn compute_verdict(inp: &VerdictInput) -> Verdict {
         rc += 2;
     }
 
-    // Any current leg unprovisioned (heavy/system) means this is not a full-suite
-    // proof: PARTIAL, and `.td-last-green` / publish are withheld. all_green requires
-    // every attempted leg to have actually run green.
+    // Any current leg unprovisioned OR green-but-skipping gates (heavy/system)
+    // means this is not a full-suite proof: PARTIAL, and `.td-last-green` /
+    // publish are withheld. all_green requires every attempted leg to have run
+    // green AND run every gate.
     let any_unprovisioned = env_error || system_unprov;
-    let partial = rc == 0 && any_unprovisioned;
-    let all_green = rc == 0 && !any_unprovisioned;
+    let any_skipped = heavy_skipped || system_skipped;
+    let partial = rc == 0 && (any_unprovisioned || any_skipped);
+    let all_green = rc == 0 && !any_unprovisioned && !any_skipped;
 
     Verdict {
         heavy_state,
@@ -251,7 +289,9 @@ fn run(args: &[String]) -> i32 {
         &[("TD_BUILD_JOBS", &jobs())],
         &hlog,
     );
-    let heavy = LegRc::from_code(heavy_code);
+    let mut heavy = LegRc::from_code(heavy_code);
+    // A green heavy leg that skipped in-jail gates is PARTIAL, not full-green.
+    heavy.skipped = log_has_skips(&hlog);
     let heavy_fail = if heavy.unprovisioned {
         ENV_ERROR_MSG.to_string()
     } else {
@@ -276,6 +316,7 @@ fn run(args: &[String]) -> i32 {
             &slog,
         );
         system = LegRc::from_code(code);
+        system.skipped = log_has_skips(&slog);
         system_fail = grep_fails(&slog);
         let _ = std::fs::remove_file(&slog);
     }
@@ -329,15 +370,16 @@ fn run(args: &[String]) -> i32 {
 
     if v.partial {
         println!(
-            ">> daily backstop: PARTIAL at {main} — a tier was unprovisioned this run \
-             (heavy={} system={} harness={}); nothing that ran is red, but this is not a \
-             full-suite proof — .td-last-green NOT recorded",
+            ">> daily backstop: PARTIAL at {main} — a tier was unprovisioned or skipped \
+             in-jail gates this run (heavy={} system={} harness={}); nothing that ran is \
+             red, but this is not a full-suite proof — .td-last-green NOT recorded, \
+             substitutes NOT published",
             v.heavy_state, v.system_state, v.harness_state
         );
     } else if v.all_green {
         let _ = std::fs::write(root.join(".td-last-green"), format!("{main}\n"));
         println!(">> daily backstop: ALL GREEN at {main} (recorded .td-last-green)");
-        publish_substitutes(&root, &tdb);
+        publish_substitutes(&root);
     } else {
         println!(
             ">> daily backstop: RED (heavy_rc={} system_rc={} harness_rc={}) — agent: triage \
@@ -541,9 +583,8 @@ fn is_exec(p: &Path) -> bool {
 /// On all-green: sign + publish the from-seed exports this run produced so the
 /// per-PR loop FETCHES prebuilt closures instead of rebuilding. Guarded — each
 /// block is a clear no-op unless the daily runner supplies TD_SUBST_PRIVKEY + a
-/// td-subst binary. (The seed publisher still shells out to its existing helper;
-/// porting it is a separate rust-migration slice.)
-fn publish_substitutes(root: &Path, tdb: &Path) {
+/// td-subst binary.
+fn publish_substitutes(root: &Path) {
     let store = std::env::var("TD_SUBST_STORE").unwrap_or_else(|_| {
         std::env::var("HOME")
             .map(|h| format!("{h}/.td/subst"))
@@ -585,28 +626,6 @@ fn publish_substitutes(root: &Path, tdb: &Path) {
         "the native x86_64 toolchain closure",
         false,
     );
-
-    // seed: still shell out to its existing publisher.
-    if privkey.is_empty() || sb.is_empty() {
-        println!(">> publish-seed-subst: SKIP — TD_SUBST_PRIVKEY / td-subst binary not set");
-        return;
-    }
-    let seed_ok = Command::new("sh")
-        .args([
-            "tools/publish-seed-subst.sh",
-            "tests/td-builder-rust.lock",
-            &store,
-        ])
-        .current_dir(root)
-        .env("TD_BUILDER", tdb)
-        .env("TD_SUBST_BIN", &sb)
-        .env("TD_SUBST_PRIVKEY", &privkey)
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
-    if !seed_ok {
-        println!(">> publish-seed-subst: WARN — seed publish failed; not published");
-    }
 }
 
 /// One inline sign+copy publish block (gate export dir → signed substitute store).
@@ -685,6 +704,12 @@ mod tests {
     }
     fn red(code: i32) -> LegRc {
         LegRc::from_code(code)
+    }
+    /// A leg that exited 0 (green) but skipped ≥1 in-jail gate as Unprovisioned.
+    fn green_skipped() -> LegRc {
+        let mut l = LegRc::green();
+        l.skipped = true;
+        l
     }
 
     // The scenario matrix ci/daily-full-suite.sh could only verify by stubbing
@@ -819,6 +844,47 @@ mod tests {
         assert_eq!(v.exit_code, 0, "no red bit for an unprovisioned system leg");
         assert_eq!(v.system_state, "unprovisioned");
         assert!(v.partial);
+        assert!(!v.all_green);
+    }
+
+    // Cross-model review (codex P1b, re #469): a heavy leg that exits GREEN (0) but
+    // SKIPPED in-jail gates as Unprovisioned (warm userland map + no host rust —
+    // provision_userland is bypassed, gate-run greens with skips, check exits 0)
+    // must NOT be certified full-green: it is PARTIAL, so .td-last-green is withheld
+    // and substitutes are NOT published on a run where the compile/build ladder
+    // never ran.
+    #[test]
+    fn heavy_green_but_skipped_gates_is_partial_not_full_green() {
+        let v = compute_verdict(&VerdictInput {
+            run_system: true,
+            heavy: green_skipped(),
+            system: LegRc::green(),
+            harness: LegRc::green(),
+        });
+        assert_eq!(v.exit_code, 0, "skips are not a red regression");
+        assert_eq!(v.heavy_state, "partial");
+        assert!(v.partial, "green-with-skips must be PARTIAL");
+        assert!(
+            !v.all_green,
+            "must NOT record .td-last-green / publish on a skipped run"
+        );
+        assert!(!v.abort_all_unprovisioned);
+    }
+
+    // A real red still wins over a skip: rc != 0 → red, never demoted to partial.
+    #[test]
+    fn heavy_red_with_skips_is_red_not_partial() {
+        let mut heavy = red(1);
+        heavy.skipped = true;
+        let v = compute_verdict(&VerdictInput {
+            run_system: true,
+            heavy,
+            system: LegRc::green(),
+            harness: LegRc::green(),
+        });
+        assert_eq!(v.exit_code, 1);
+        assert_eq!(v.heavy_state, "red");
+        assert!(!v.partial);
         assert!(!v.all_green);
     }
 }

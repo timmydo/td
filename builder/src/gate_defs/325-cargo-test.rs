@@ -32,16 +32,17 @@
 //! GUIX-FREE toolchain (R1 of the guix-retirement ladder, github issue #274): the Rust +
 //! C toolchain is resolved by `td-builder provision-{rust,cc}` (builder/src/stage0.rs) —
 //! the SAME guix-free resolvers the stage0 td-builder SEED build uses (a PROVIDED
-//! TD_RUST_HOME/TD_CC_HOME, or rustup/system cc on a guix-less host, else the pinned lock
-//! seed retired LAST §5) — NOT a `guix shell` process. No guix is invoked here anymore
-//! (this used to be tracked by the guix-surface census, retired with the guix-oracle gates).
+//! TD_RUST_HOME/TD_CC_HOME, or rustup/system cc on a guix-less host) — NOT a `guix shell`
+//! process. No guix is invoked here anymore. The seed-lock toolchain fallback is retired,
+//! so a runner with no host cc/rustup and nothing mounted (the loop sandbox) can't
+//! provision one — provision-{rust,cc} then exit EXIT_UNPROVISIONED (69) and this gate
+//! degrades to a tolerated Unprovisioned/SKIP (below), while a real failure still REDs.
 //! 
 //! Offline by construction: the provisioned rust bin dir carries rustc + cargo-clippy +
 //! clippy-driver, the cargo bin dir carries cargo, and the cc bin dir (gcc-toolchain, rust's
-//! default linker driver) is prepended to PATH; all three are already WARM in the store — the
-//! check.sh prelude's UNCONDITIONAL `guix build td-builder` realizes rust/cargo/gcc-toolchain
-//! (td-builder's build closure), so NO `guix build` realize is needed in this recipe. `cargo
-//! clippy/test --frozen` (= --locked --offline) on DEPENDENCY-FREE crates touches no network.
+//! default linker driver) is prepended to PATH — all resolved guix-free by `provision-{rust,cc}`
+//! (a PROVIDED TD_RUST_HOME/TD_CC_HOME, or rustup/system cc). `cargo clippy/test --frozen`
+//! (= --locked --offline) on DEPENDENCY-FREE crates touches no network.
 //! Scratch CARGO_HOME/CARGO_TARGET_DIR live in .cargo-test-scratch/ at the repo ROOT — OUTSIDE
 //! the crate dirs, so they cannot perturb the td-builder/td-recipe package source hashes.
 //! `set -e` inside the shell + pipefail keep a FAILED clippy or test from being greened by the
@@ -56,7 +57,7 @@
 //! deep from-source gates stay on the dev-machine full `td-builder check` (the
 //! §7.2 step-2 landing gate) + the nightly daily suite.
 
-use crate::gates::{ArtifactInput, GateDef, InputKind, Pool};
+use crate::gates::{GateDef, Pool};
 
 pub fn gate() -> GateDef {
     GateDef {
@@ -65,19 +66,18 @@ pub fn gate() -> GateDef {
         needs: &[],
         build_gate: false,
         specs: &[],
-        // A real bash for the engine's process-supervision unit tests
-        // (build::tests::watchdog_*): the loop host-sandbox's busybox userland
-        // has only `sh` (ash), and those tests exercise bash. This seed bash is
-        // a control-plane lock root already bound read-only in the sandbox (same
-        // lock provision-{rust,cc} resolve the toolchain from); the body appends
-        // its bin to PATH (after busybox, so it can't shadow the gate's own `sh`,
-        // and after a dev host's system bash so that one still wins). Scoped to
-        // THIS gate — NOT the global loop userland — so recipe rungs still see no
-        // ambient shell (check_loop.rs).
-        inputs: &[ArtifactInput {
-            name: "bash",
-            kind: InputKind::LockEntry { lock: "tests/td-builder-rust.lock", stem: "bash" },
-        }],
+        // The engine's process-supervision unit tests (build::tests::watchdog_*)
+        // now spawn a POSIX `sh` resolved from PATH — busybox `sh` (ash) in the
+        // loop host-sandbox, the system `/bin/sh` on a dev host — and their
+        // scripts use only shell builtins plus `kill`/integer `sleep`, so no seed
+        // bash (and no guix lock) is bound here anymore.
+        //
+        // In the guix-free loop sandbox no toolchain is reachable, so
+        // provision-{rust,cc} exit EXIT_UNPROVISIONED (69) (propagated by the
+        // `|| exit $?` below) and the gate degrades to a tolerated Unprovisioned
+        // SKIP — even as an explicit goal. A real clippy/test failure exits
+        // non-69 and still REDs; the blocking host-side cargo-test preflight
+        // (affected-checks --run) is the authoritative from-source enforcement.
         non_blocking: false,
         script: r##"
 	echo ">> cargo-test: engine crates lint clean (cargo clippy: no panic surface, .get over indexing, unsafe confined) + td-builder unit tests (cargo test) — offline, guix-free toolchain (td-builder provision-{rust,cc})"
@@ -87,13 +87,12 @@ pub fn gate() -> GateDef {
 	  n=`"$td" text count-line-exact '[[package]]' "$crate/Cargo.lock"`; \
 	  test "$n" -eq 1 || { echo "ERROR: $crate is no longer dependency-free (Cargo.lock lists $n packages; the engine must carry ZERO crates — AGENTS.md 'Rust code')" >&2; exit 1; }; \
 	done; \
-rustpath=`"$td" provision-rust`; \
-ccpath=`"$td" provision-cc`; \
-bashbin="${TD_GATE_INPUT_BASH:?gate-run exports TD_GATE_INPUT_BASH}/bin"; \
+rustpath=`"$td" provision-rust` || exit $?; \
+ccpath=`"$td" provision-cc` || exit $?; \
 scratch="$PWD/.cargo-test-scratch"; \
 rm -rf "$scratch"; mkdir -p "$scratch/home" "$scratch/target"; \
 log="$scratch/out.log"; \
-PATH="$rustpath:$ccpath:$PATH:$bashbin" \
+PATH="$rustpath:$ccpath:$PATH" \
 CARGO_HOME="$scratch/home" CARGO_TARGET_DIR="$scratch/target" \
 	  sh -c 'set -e; \
 	    cargo clippy --frozen --manifest-path builder/Cargo.toml; \

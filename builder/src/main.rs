@@ -616,9 +616,9 @@ fn daemon_budget_check(log_file: &str, budget: &str) -> Result<(u64, u64), Strin
 
 // --- substitute server: export half (store-coupled, dependency-free) ---
 // Write a serve-able directory for a store closure: a td-native `<basename>.narinfo` per
-// member + `nar/<narhash-hex>.nar`. This is the dual of `seed-manifest`/`seed-unpack` —
-// the seed pair captures a closure into ONE tarball + manifest; the substitute export
-// serves each path on its OWN, addressable by basename, so a consumer can fetch just the
+// member + `nar/<narhash-hex>.nar`. Like `seed-manifest` it walks a store closure with
+// td's own reader + NAR serializer, but serves each path on its OWN, addressable by
+// basename, so a consumer can fetch just the
 // paths it lacks. The networked `subst/` binary signs + serves this dir and the consumer
 // verifies + restores it (with `nar-restore`); this half stays in the dependency-free
 // engine because it needs the store DB + NAR serializer, not crypto/HTTP. Same reader +
@@ -2018,7 +2018,7 @@ fn drv_declared_inputs(parsed: &drv::Derivation) -> Result<Vec<String>, String> 
 /// cache that used to bust on every recompile. SCOPE NOTE: the in-process / SELF_TREE case (a
 /// daemon started with no `TD_BUILDER_*` serving a bare drv, or a manual `build-recipe`) is NOT
 /// stabilized by this — there the builder is `self_store_path()`, content-scanned and vouched as
-/// `BlessedSeedClosure`/`AuditedSeed`, NOT `ControlPlaneBuilder`, so the origin gate does not
+/// `AuditedSeed`, NOT `ControlPlaneBuilder`, so the origin gate does not
 /// exclude it and an in-process recompile still moves the key, exactly as before this change.
 /// The check-ladder never takes that path; stabilizing self-driven builds is a separate
 /// follow-up. A change to — or removal of — any OTHER real input still moves the key; the
@@ -2602,50 +2602,11 @@ fn output_trees_present(dir: &Path, canons: &[String]) -> bool {
 
 /// Realize ONE drv into a content-addressed keyed scratch under `scratch_base`, with
 /// guix-daemon-parity cache reuse (a valid prior output is not rebuilt). Returns
-/// DERIVE the blessed seed-closure db for this process's repo root (cwd) and
-/// SEED-DIR — the round-8 replacement for the deleted `[BLESS-DB]` argv: the
-/// db's location is a pure function of the repo's checked-in seed-lock
-/// declarations, so a public caller cannot point the `BlessedSeedClosure`
-/// origin at a db of their choosing. A derived path with no db on disk means
-/// "nothing blessed": the build proceeds without that authority and strict
-/// staging fails closed on unvouched closure items.
-fn derived_bless_db(seed_dir: &str) -> Result<Option<String>, String> {
-    let cwd = std::env::current_dir().map_err(|e| format!("getcwd: {e}"))?;
-    match check_loop::blessed_seed_db_path(&cwd, seed_dir)? {
-        Some(db) if db.is_file() => Ok(Some(db.display().to_string())),
-        Some(db) => {
-            eprintln!(
-                "td-builder: no blessed seed-closure db at the derived {} — staging has no \
-                 BlessedSeedClosure authority (run `td-builder check` to bless; re #469)",
-                db.display()
-            );
-            Ok(None)
-        }
-        None => Ok(None),
-    }
-}
-
-/// `derived_bless_db` with the SEED-DIR derived too (`daemon_seed_dir`: the
-/// operator env override or the declared seed-lock parent) — the ladder
-/// entrances (`build-plan`, `build-recipe`) take no seed-dir argv, and must
-/// not grow one for this: the whole point of the derived channel is that no
-/// caller input selects the db. The authority it adds is what vouches the
-/// control-plane builder's host-seed runtime closure (glibc/gcc-lib) in
-/// strict staging manifests.
-fn derived_bless_db_auto() -> Result<Option<String>, String> {
-    let cwd = std::env::current_dir().map_err(|e| format!("getcwd: {e}"))?;
-    match check_loop::daemon_seed_dir(&cwd) {
-        Some(seed_dir) => derived_bless_db(&seed_dir),
-        None => Ok(None),
-    }
-}
-
 /// (canonical store path, host output path). Run in a child process by `daemon-build`.
 fn daemon_realize_one(
     drv: &str,
     seed_dir: &str,
     scratch_base: &Path,
-    bless_db: Option<&str>,
 ) -> Result<(String, String, bool), String> {
     let ov = builder_override_from_env()?;
     let content = std::fs::read(drv).map_err(|e| format!("read {drv}: {e}"))?;
@@ -2661,15 +2622,11 @@ fn daemon_realize_one(
         Ok((canon, host))
     };
     // The daemon scans the live store dir: entries are canonical where they sit.
-    // Strict manifests are unconditional (re #469): the vouching db is the blessed
-    // seed-closure db at its DERIVED location (`derived_bless_db` in the arm) —
-    // ensure_build_daemon blesses the REPO-DECLARED seed-lock closure once, and
-    // the child re-derives where that record must live, so every staged item must
-    // match the hash recorded at bless time and neither env nor argv can add
-    // manifest authority (re #469 round-8 origin authentication).
-    let extra_dbs: Vec<(String, sandbox::InputOrigin)> = bless_db
-        .map(|d| vec![(d.to_string(), sandbox::InputOrigin::BlessedSeedClosure)])
-        .unwrap_or_default();
+    // Strict manifests are unconditional (re #469): every staged item must be
+    // vouched by a typed td-owned db (a prior step's td.db, a source/builder
+    // placement db) — no seed-store bytes carry manifest authority now that the
+    // guix seed and its bless db are retired.
+    let extra_dbs: Vec<(String, sandbox::InputOrigin)> = Vec::new();
     // The reuse identity comes BEFORE the cache read (re #469 round-7): the typed
     // manifest is assembled first and the prior realization must carry a receipt
     // matching it — the daemon's pre-manifest cache hit is gone. The reuse-key digest
@@ -2726,7 +2683,6 @@ fn daemon_check_one(
     drv: &str,
     seed_dir: &str,
     scratch_base: &Path,
-    bless_db: Option<&str>,
 ) -> Result<(String, String), String> {
     let ov = builder_override_from_env()?;
     let seed_dirs = [seed_dir.to_string()];
@@ -2734,10 +2690,8 @@ fn daemon_check_one(
     let scr = scratch_base.join(format!("{key}-chk"));
     let _ = std::fs::remove_dir_all(&scr); // the rebuild here must be fresh, never a cache reuse
     let r1 = scr.join("r1");
-    // Same derived-location channel as daemon_realize_one (re #469 round-8).
-    let extra_dbs: Vec<(String, sandbox::InputOrigin)> = bless_db
-        .map(|d| vec![(d.to_string(), sandbox::InputOrigin::BlessedSeedClosure)])
-        .unwrap_or_default();
+    // No seed-store bytes carry manifest authority (the guix bless db is retired).
+    let extra_dbs: Vec<(String, sandbox::InputOrigin)> = Vec::new();
     let regs1 = realize_drv(drv, &seed_dirs, &store::store_dir(), &extra_dbs, &r1, &[], ov.as_ref(), None)?;
     // Baseline for the comparison: the build verb's already-realized output at
     // scratch_base/<key> when every output tree is present there (the loop's normal path,
@@ -2891,7 +2845,7 @@ fn scan_closure_hybrid(
     // fingerprint is a SHA-256 over the sorted candidate hashes — cryptographic, so two DISTINCT
     // sets cannot collide onto one match-set (a 64-bit hash could, and a false hit under-stages).
     // A warm `build-plan` climb scans one fixed seed store (build_plan's `seed_dirs =
-    // [guix_store]`), so the fingerprint is constant across rungs and every shared closure member
+    // [seed_store]`), so the fingerprint is constant across rungs and every shared closure member
     // is scanned once.
     cand_hashes.sort_unstable();
     let cand_fp: [u8; 32] = {
@@ -3265,83 +3219,23 @@ fn assemble_input_manifest(
     Ok(manifest)
 }
 
-/// BLESS the declared seed closure (re #469): compute the transitive closure
-/// of ROOTS by content-scanning SEED-DIR, NAR-hash every member, and write a
-/// td-owned store db recording (path, hash, size, refs). This is the explicit
-/// trust moment for a host-provisioned seed — the pinned toolchain the daemon
-/// flow builds with (§5, retired last): strict staging manifests verify every
-/// later build's staged bytes against THIS record, so a seed-store item that
-/// changes after the bless, or was never reachable from the declared roots,
-/// refuses to stage. The canonical prefix is the ACTIVE store dir, mirroring
-/// the daemon children's realize exactly. Bless ONCE per declared root set and
-/// keep the db (the caller keys it by the roots): re-blessing would re-trust
-/// whatever bytes are currently on disk, which is exactly the
-/// existence-as-authority hole the manifest closes. The PUBLIC verb derives
-/// ROOTS itself from the repo's checked-in seed-lock declarations
-/// (`seed_lock_roots`) so a caller cannot mint authority for arbitrary paths;
-/// this function takes them as a parameter for the engine and its tests.
-fn bless_seed_closure(seed_dir: &str, roots: &[String], out_db: &Path) -> Result<usize, String> {
-    if roots.is_empty() {
-        return Err("seed-bless: no roots to bless".to_string());
-    }
-    let dirs = [seed_dir.to_string()];
-    let (candidates, on_disk) = scan_candidate_index(&dirs, &store::store_dir())?;
-    let mut scanner = scan::Scanner::new(&candidates).map_err(|e| e.to_string())?;
-    let closure = scan_closure_hybrid(
-        &mut scanner,
-        &on_disk,
-        &std::collections::HashMap::new(),
-        roots,
-    )?;
-    let closure: Vec<String> = closure.into_iter().collect();
-    let mut regs: Vec<OutputReg> = Vec::with_capacity(closure.len());
-    for canon in &closure {
-        let od = on_disk.get(canon).ok_or_else(|| {
-            format!("seed-bless: closure item {canon} is not in the seed dir {seed_dir}")
-        })?;
-        // Fresh scanner per item (store-register's shape): finish() yields the
-        // (hash, size, refs) triple a full registration records.
-        let mut s = scan::Scanner::new(&closure).map_err(|e| e.to_string())?;
-        nar::write_nar(&mut s, Path::new(od))
-            .map_err(|e| format!("seed-bless: nar {canon} (at {od}): {e}"))?;
-        let (hash, size, refs) = s.finish();
-        regs.push(OutputReg {
-            store_path: canon.clone(),
-            nar_hash: hash,
-            nar_size: size,
-            refs,
-            deriver: String::new(), // a blessed seed item has no td deriver
-        });
-    }
-    write_output_db(&regs, out_db)?;
-    Ok(regs.len())
-}
-
 /// The staging-boundary input policy (re #469 round-10 — the host-tool
 /// mandate): the builder accepts NO host tools. Enforced HERE at the one
 /// choke point every realize path goes through (build-plan, build-recipe, the
 /// daemon children) — not in any planner, because the daemon realizes drvs a
-/// planner never saw (the round-10 P0 #1: a crafted drv could select host
-/// bash/coreutils/tar/gzip from the blessed seed closure, or name host bash
-/// as its builder outright).
+/// planner never saw (a crafted drv could name host bash as its builder).
 ///
-/// Three rules over the typed manifest:
-///   1. every closure item is vouched by a typed td-owned db (unchanged);
+/// Two rules over the typed manifest:
+///   1. every closure item is vouched by a typed td-owned db;
 ///   2. the drv's BUILDER must itself be admissible executable provenance —
 ///      the lineage-verified stage0 placement (`ControlPlaneBuilder`), a td
 ///      recipe output (`RecipeOutput` — a td-built tool may drive
 ///      builds), or this very engine binary (SELF_TREE, the engine
-///      realizing with itself). A seed-store path — blessed or merely
-///      scannable — is never a builder;
-///   3. `BlessedSeedClosure` rows vouch ONLY the builder's own runtime
-///      closure (BUILDER_REACH — the glibc/gcc-lib the control-plane builder
-///      links until it self-hosts), never a drv input: host tools stopped
-///      being reachable as inputs when their only authority was the bless db.
+///      realizing with itself). A seed-store path is never a builder.
 fn enforce_realize_input_policy(
     drv_builder: &str,
     roots: &[String],
     closure: &[String],
-    builder_reach: &std::collections::BTreeSet<String>,
     manifest: &sandbox::StageManifest,
     self_tree: Option<&str>,
 ) -> Result<(), String> {
@@ -3379,18 +3273,7 @@ fn enforce_realize_input_policy(
         match manifest.get(canonical) {
             None => {
                 return Err(format!(
-                    "provenance rejected: closure item {canonical} has no td-owned store-db record (re #469) — every staged input must be vouched for by the plan's seed db, a prior step's td.db, a source/builder placement db, or the blessed seed-closure db"
-                ));
-            }
-            Some(si)
-                if matches!(si.origin, sandbox::InputOrigin::BlessedSeedClosure)
-                    && !builder_reach.contains(canonical) =>
-            {
-                return Err(format!(
-                    "provenance rejected: closure item {canonical} is blessed-seed bytes outside \
-                     the builder's own runtime closure (re #469) — host tools are not admissible \
-                     build inputs: a build may stage only td recipe outputs, pinned sources, and \
-                     the control-plane builder's runtime libs"
+                    "provenance rejected: closure item {canonical} has no td-owned store-db record (re #469) — every staged input must be vouched for by the plan's seed db, a prior step's td.db, or a source/builder placement db"
                 ));
             }
             Some(_) => {}
@@ -3467,9 +3350,6 @@ struct InputClosure {
     /// `canonical\ton-disk`. The exact set realize stages, enforces over, and the
     /// reuse key scopes to.
     closure: Vec<String>,
-    /// The closure slice reachable from the builder — the only slice a
-    /// `BlessedSeedClosure` row may vouch (`enforce_realize_input_policy`).
-    builder_reach: std::collections::BTreeSet<String>,
 }
 
 /// Compute a drv's staged input closure with NO guix store DB: resolve the real
@@ -3606,20 +3486,6 @@ fn stage_input_closure(
         })
         .collect::<Result<_, _>>()?;
     let mut closure: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-    // The closure slice reachable FROM THE DRV'S BUILDER (the builder tree plus
-    // its refs' transitive closures) — the ONLY slice `BlessedSeedClosure` rows
-    // may vouch (`enforce_realize_input_policy`, re #469 round-10): the blessed
-    // db exists to vouch the control-plane builder's own host-seed runtime
-    // closure (glibc/gcc-lib), never a host tool a drv selects as an input.
-    let mut builder_reach: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-    // Same prefix-safe + non-empty ownership test as enforce_realize_input_policy's
-    // `owns`: only a root that is (or contains) the drv's builder tree tracks into
-    // builder_reach, so the bless db vouches exactly the builder's runtime closure.
-    let builder_owns = |r: &str| {
-        !r.is_empty()
-            && (builder_exec == r
-                || builder_exec.strip_prefix(r).is_some_and(|t| t.starts_with('/')))
-    };
     for r in &roots {
         // A td-interned tree (the recipe source OR the vendored-crate tree): no-ref
         // closure from its OWN db, the entry bound FROM on_disk (canonical\ton-disk).
@@ -3650,7 +3516,6 @@ fn stage_input_closure(
             // (bin/ldd) or HEADER (paths.h) merely names.
             Some(ov) if r == &ov.canonical => {
                 // Bind the builder tree itself from on_disk.
-                builder_reach.insert(ov.canonical.clone());
                 closure.insert(format!("{}\t{}", ov.canonical, ov.on_disk));
                 // Stage its runtime deps by LINKAGE from the builder binary ITSELF, not
                 // from the builder db's content-scanned DIRECT refs. A STATIC stage0
@@ -3677,22 +3542,16 @@ fn stage_input_closure(
                 // is already bound (canonical\ton-disk) above, so drop the bare entry.
                 linkage.remove(&ov.canonical);
                 for canon in linkage {
-                    builder_reach.insert(canon.clone());
                     closure.insert(canon);
                 }
             }
             _ => {
-                let track = builder_owns(r);
                 for q in scan_closure_hybrid(
                     &mut scanner,
                     &on_disk,
                     &extra_refs,
                     std::slice::from_ref(r),
                 )? {
-                    if track {
-                        let (canon, _) = sandbox::split_closure_entry(&q);
-                        builder_reach.insert(canon.to_string());
-                    }
                     closure.insert(q);
                 }
             }
@@ -3727,7 +3586,7 @@ fn stage_input_closure(
             e
         })
         .collect();
-    Ok(InputClosure { real_builder_cb, builder_exec, roots, closure, builder_reach })
+    Ok(InputClosure { real_builder_cb, builder_exec, roots, closure })
 }
 
 /// Realize DRV with NO guix-daemon and NO guix store DB: compute the input closure ITSELF by
@@ -3753,9 +3612,9 @@ fn stage_input_closure(
 /// own store dir holding td-BUILT deps: a closure path whose tree lives under TD_STORE/<base>
 /// is emitted `canonical\ton-disk` so the sandbox binds it FROM THERE (the build-plan chaining
 /// edge) — the same on-disk encoding SRC_OVERRIDE uses. SEED_CANONICAL_PREFIX is the canonical
-/// home of the seed dirs' entries — `/gnu/store` for a guix-captured seed/warm-seed staging
-/// dir, the live `store::store_dir()` when scanning the active store itself; per-entry truth
-/// (a td-built copy inside a guix seed dir, or vice versa) is restored from the drv roots +
+/// home of the seed dirs' entries — a foreign prefix for a captured-seed staging dir, the
+/// live `store::store_dir()` when scanning the active store itself; per-entry truth
+/// (a td-built copy inside a foreign-prefix seed dir, or vice versa) is restored from the drv roots +
 /// td-owned DBs by `recanonicalize_candidates` (#292).
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
 fn realize_drv(
@@ -3776,7 +3635,7 @@ fn realize_drv(
     // very cache miss the scoping removes. Destructured into the same locals the enforce /
     // stage / builder-re-key logic below has always used.
     let stable_builder_id = store::builder_identity_path();
-    let InputClosure { real_builder_cb, builder_exec, roots, closure, builder_reach } =
+    let InputClosure { real_builder_cb, builder_exec, roots, closure } =
         stage_input_closure(
             &parsed,
             seed_store_dirs,
@@ -3820,7 +3679,6 @@ fn realize_drv(
         &builder_exec,
         &roots,
         &closure,
-        &builder_reach,
         &manifest,
         self_store_path().ok().as_deref(),
     )?;
@@ -4930,7 +4788,7 @@ fn provision_auto_vendor(
 /// store path recorded for downstream steps.
 fn build_plan(
     plan_file: &str,
-    guix_store: &str,
+    seed_store: &str,
     seed_db: &str,
     scratch: &Path,
     builder_store: Option<(&str, &str, &str)>,
@@ -4960,18 +4818,10 @@ fn build_plan(
     // content-address to itself AND land on a basename the compiled seed-digest
     // table pins — a store-register'd row over foreign bytes, or a CA-valid
     // item the pins never derived, cannot be typed `AuditedSeed`.
-    authenticate_seed_db(seed_db, Path::new(guix_store))?;
+    authenticate_seed_db(seed_db, Path::new(seed_store))?;
     let mut built: BTreeMap<String, String> = BTreeMap::new();
     let mut td_dbs: Vec<(String, sandbox::InputOrigin)> =
         vec![(seed_db.to_string(), sandbox::InputOrigin::AuditedSeed)];
-    // The DERIVED blessed seed-closure db (re #469 round-8): vouches the
-    // control-plane builder's host-seed runtime closure (glibc/gcc-lib — the
-    // §5 toolchain td-builder itself links against until it self-hosts).
-    // Derived, never an argument; absent means that authority is simply not
-    // there and staging reds on any closure item that needed it.
-    if let Some(bless) = derived_bless_db_auto()? {
-        td_dbs.push((bless, sandbox::InputOrigin::BlessedSeedClosure));
-    }
     let store_prefix = store::store_dir();
 
     for raw in plan.lines() {
@@ -5027,7 +4877,7 @@ fn build_plan(
                     let gate_key = seed_gate_key(&e.name, &src_key, &alist);
                     auto_seed_provenance(
                         &store_prefix,
-                        Path::new(guix_store),
+                        Path::new(seed_store),
                         name,
                         gate_key,
                         &e.path,
@@ -5063,15 +4913,16 @@ fn build_plan(
             .as_ref()
             .map(|(c, s, d)| (c.as_str(), s.as_str(), d.as_str()));
 
-        // Closure content-scans guix's seed store (seeds) + reads every prior step's td.db
-        // (td deps, whose bytes live in the shared td-store, outside the seed dir).
-        let seed_dirs = [guix_store.to_string()];
+        // Closure content-scans the ladder's interned-seed store (seeds) + reads every prior
+        // step's td.db (td deps, whose bytes live in the shared td-store, outside the seed dir).
+        let seed_dirs = [seed_store.to_string()];
+        let seed_canonical = store::store_dir();
         let regs = build_recipe(
             &recipe_text,
             &resolved_lock.to_string_lossy(),
             &step_scratch,
             &seed_dirs,
-            store::GUIX_SEED_STORE_DIR, // the guix seed store's canonical home
+            &seed_canonical, // interned seeds are canonically /td/store (store-add-recursive)
             &td_dbs,
             None,            // src_store: build-plan locks carry resolved paths
             vendor_arg,      // vendor_store: a rust step's committed-lock-verified crate tree, else None
@@ -5274,85 +5125,6 @@ fn seed_digests_expected(key: &str) -> Result<Option<&'static str>, String> {
     Ok(None)
 }
 
-/// The COMPILED control-plane seed-capture pins (re #469 round-8):
-/// `seed/control-plane-seed-pins.txt`, sha256 of each ADMISSIBLE frozen seed
-/// tarball (the `seed-manifest`/`seed-unpack` capture of the pinned §5
-/// toolchain). Compiled in so the authority travels with td-builder itself;
-/// pinning a new capture is a reviewed commit, never a runtime side effect.
-const CONTROL_PLANE_SEED_PINS: &str = include_str!("../../seed/control-plane-seed-pins.txt");
-
-/// AUTHENTICATE a `TD_SEED_DB` seed-capture db (re #469 round-8): the env var
-/// is public, so the db is not trusted by presence — `seed-unpack` binds the
-/// db to the tarball it restored from via the `<db>.seed-tarball` sidecar
-/// (sha256 of the tarball bytes), and that sha256 must be one the COMPILED
-/// pins file admits. The unforgeable core is the compiled pin: it names ONE
-/// exact audited capture. (The sidecar itself is same-user-writable — the
-/// standing trust-domain limit recorded on the receipt layer; the daemon-owned
-/// provenance db is the follow-on, re #472.) A db with no sidecar (any db not
-/// written by the current `seed-unpack`) or an unpinned capture refuses intake.
-fn authenticate_seed_capture_db(dbp: &str) -> Result<(), String> {
-    authenticate_seed_capture_db_with(dbp, CONTROL_PLANE_SEED_PINS)
-}
-
-/// The pins-parameterized core of `authenticate_seed_capture_db` — production
-/// always passes the COMPILED pins; tests pass synthetic pins to drive the
-/// green path without a repo-pinned capture existing yet.
-fn authenticate_seed_capture_db_with(dbp: &str, pins: &str) -> Result<(), String> {
-    let sidecar = format!("{dbp}.seed-tarball");
-    let text = std::fs::read_to_string(&sidecar).map_err(|e| {
-        format!(
-            "seed db {dbp}: provenance rejected: no seed-tarball binding at {sidecar} ({e}) — \
-             re-run `td-builder seed-unpack` (it records the capture the db restores) and pin \
-             the capture in seed/control-plane-seed-pins.txt (re #469 round-8)"
-        )
-    })?;
-    let sha = text
-        .lines()
-        .find_map(|l| l.strip_prefix("sha256 "))
-        .map(|rest| rest.split_whitespace().next().unwrap_or(""))
-        .filter(|s| s.len() == 64)
-        .ok_or_else(|| format!("seed db {dbp}: malformed sidecar {sidecar}"))?;
-    // The sidecar also fixes the db BYTES seed-unpack wrote: a row added or
-    // edited after the restore breaks this leg even with a pinned capture —
-    // the pin vouches for what the tarball restored, not for later edits.
-    let want_db_sha = text
-        .lines()
-        .find_map(|l| l.strip_prefix("db-sha256 "))
-        .map(str::trim)
-        .filter(|s| s.len() == 64)
-        .ok_or_else(|| format!("seed db {dbp}: sidecar {sidecar} has no db-sha256 binding"))?;
-    let got_db_sha = sha256::sha256_file(Path::new(dbp))
-        .map_err(|e| format!("sha256 {dbp}: {e}"))?;
-    if got_db_sha != want_db_sha {
-        return Err(format!(
-            "seed db {dbp}: provenance rejected: the db was modified after seed-unpack wrote \
-             it (sidecar db-sha256 {want_db_sha}, current {got_db_sha}) — re-run seed-unpack \
-             (re #469 round-8)"
-        ));
-    }
-    for (n, line) in pins.lines().enumerate() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        let pin = line.split_whitespace().next().unwrap_or("");
-        if pin.len() != 64 || !pin.chars().all(|c| c.is_ascii_hexdigit()) {
-            return Err(format!(
-                "seed/control-plane-seed-pins.txt line {}: malformed pin `{line}'",
-                n + 1
-            ));
-        }
-        if pin == sha {
-            return Ok(());
-        }
-    }
-    Err(format!(
-        "seed db {dbp}: provenance rejected: its capture sha256 {sha} is not pinned in \
-         seed/control-plane-seed-pins.txt — an unaudited seed capture cannot be typed \
-         AuditedSeed; pin the capture via a reviewed commit (re #469 round-8)"
-    ))
-}
-
 /// AUTHENTICATE a plan's seed db (re #469 round-8): the db path is
 /// caller-supplied (and reused warm across `--auto` runs), so its rows are not
 /// trusted by presence — every row must (a) content-address to its own on-disk
@@ -5542,7 +5314,7 @@ fn build_plan_auto(
     target: &str,
     recipe_dir: &str,
     map_file: &str,
-    guix_store: &str,
+    seed_store: &str,
     seed_db: &str,
     scratch: &Path,
     builder_store: Option<(&str, &str, &str)>,
@@ -5569,7 +5341,7 @@ fn build_plan_auto(
     let t_synth = std::time::Instant::now();
     for name in &order {
         let synthesized =
-            auto_synthesize_lock(recipe_dir, &map, name, &store_prefix, Path::new(guix_store))?;
+            auto_synthesize_lock(recipe_dir, &map, name, &store_prefix, Path::new(seed_store))?;
         let lock_path = scratch.join(format!("{name}-auto.lock"));
         std::fs::write(&lock_path, &synthesized).map_err(|e| e.to_string())?;
         plan.push_str(&format!(
@@ -5586,7 +5358,7 @@ fn build_plan_auto(
     }
     let plan_path = scratch.join("auto.plan");
     std::fs::write(&plan_path, &plan).map_err(|e| e.to_string())?;
-    build_plan(&plan_path.to_string_lossy(), guix_store, seed_db, scratch, builder_store, persist)
+    build_plan(&plan_path.to_string_lossy(), seed_store, seed_db, scratch, builder_store, persist)
 }
 
 /// Emit PKG's recipe JSON from td's Rust catalog via `td-recipe-eval emit` — the
@@ -6268,12 +6040,10 @@ struct HostSandboxArgs {
     /// `/td/store` harness) instead of the host `/gnu/store`.
     store_from: Option<String>,
     /// `--store-at DEST`: the in-sandbox mount point for `--store-from`. Defaults to
-    /// the guix seed store's home (`store::GUIX_SEED_STORE_DIR` = `/gnu/store`) — a
-    /// guix-captured seed's binaries hardcode that interpreter path — NOT `store_dir()`
-    /// (whose default is now `/td/store`); pass `/td/store` for td's own store-native
-    /// harness (interp relinked to `/td/store/ld`). Only meaningful with `--store-from`;
-    /// when DEST != `/gnu/store` the host `/gnu/store` is NOT bound at all — the
-    /// guix-byte-free VM substrate.
+    /// `store_dir()` (the td store, `/td/store` by default), where a td-native
+    /// unpacked store's items are canonical. Pass an explicit DEST (e.g. `/gnu/store`)
+    /// to bind an unpacked store whose binaries hardcode a different interpreter
+    /// prefix. Only meaningful with `--store-from`.
     store_at: Option<String>,
     /// `--store-item PATH` (repeatable): bind ONE store item (dir or file)
     /// read-only at its own path, and `--store-item-at SRC DEST` (repeatable):
@@ -6378,11 +6148,12 @@ fn host_sandbox_base_binds(store_from: Option<&str>, store_at: Option<&str>) -> 
     match store_from {
         Some(dir) => vec![sandbox::Bind {
             src: dir.to_string(),
-            // --store-at omitted → mount at the guix SEED store's home (/gnu/store):
-            // --store-from is an unpacked guix seed whose binaries carry /gnu/store
-            // interpreters, so it must land there, NOT at store_dir() (whose default
-            // is now /td/store). Pass `--store-at /td/store` for a relinked native seed.
-            dest: Some(store_at.map_or_else(|| store::GUIX_SEED_STORE_DIR.to_string(), str::to_string)),
+            // --store-at omitted → mount at store_dir() (the td store, /td/store by
+            // default), where a td-native unpacked store's items are canonical. An
+            // unpacked store whose binaries carry a different interpreter prefix
+            // (e.g. a guix capture at /gnu/store) is bound by passing `--store-at`
+            // explicitly.
+            dest: Some(store_at.map_or_else(store::store_dir, str::to_string)),
             readonly: true,
             ro_optional: false,
         }],
@@ -6490,34 +6261,22 @@ struct RecipeOutputOptions {
 /// admits prior outputs; the recipe-output store is also a candidate byte
 /// directory so closure staging can materialize those authenticated rows.
 fn build_recipe_store_layout<'a>(
-    seed_store: Option<&'a str>,
-    seed_db: Option<&str>,
     recipe_output_store: Option<&'a str>,
     legacy_store: &'a str,
 ) -> Result<(Vec<String>, String, Option<&'a Path>), String> {
-    match (seed_store, seed_db) {
-        (Some(seed), Some(_)) => Ok((
-            vec![seed.to_string()],
-            store::GUIX_SEED_STORE_DIR.to_string(),
-            recipe_output_store
-                .map(Path::new)
-                .or_else(|| Some(Path::new(seed))),
+    match recipe_output_store {
+        Some(recipe_store) => Ok((
+            vec![recipe_store.to_string()],
+            store::store_dir(),
+            Some(Path::new(recipe_store)),
         )),
-        (None, None) => match recipe_output_store {
-            Some(recipe_store) => Ok((
-                vec![recipe_store.to_string()],
-                store::store_dir(),
-                Some(Path::new(recipe_store)),
-            )),
-            // Legacy callers without the explicit option still use STORE-DIR
-            // as both physical and canonical input space.
-            None => Ok((
-                vec![legacy_store.to_string()],
-                legacy_store.to_string(),
-                None,
-            )),
-        },
-        _ => Err("TD_SEED_STORE/TD_SEED_DB must be set together".into()),
+        // Legacy callers without the explicit option still use STORE-DIR
+        // as both physical and canonical input space.
+        None => Ok((
+            vec![legacy_store.to_string()],
+            legacy_store.to_string(),
+            None,
+        )),
     }
 }
 
@@ -7590,11 +7349,10 @@ fn main() -> ExitCode {
                 }
             }
         }
-        // seed-manifest: emit the MANIFEST for a seed closure — the capture half of the
-        // frozen seed tarball (North-Star step 2). For the GC closure of ROOT…, print one
-        // line per member: `<path> <nar-hash> <nar-size> <ref,ref,…>` (direct refs sorted;
-        // `-` if none), all from td's OWN reader + NAR serializer (no daemon). The capture
-        // tool tars the same closure; `seed-unpack` restores + registers from this manifest.
+        // seed-manifest: emit the MANIFEST for a store closure — for the GC closure of
+        // ROOT…, print one line per member: `<path> <nar-hash> <nar-size> <ref,ref,…>`
+        // (direct refs sorted; `-` if none), all from td's OWN reader + NAR serializer (no
+        // daemon). The store-add-referenced content-scan gate uses this as its closure oracle.
         //
         // SOURCE (arg 1) is EITHER a store DB FILE — closure + direct refs read from its Refs
         // graph (td's `store_db_read`) — OR a store DIRECTORY, in which case the closure and
@@ -7674,139 +7432,6 @@ fn main() -> ExitCode {
                 }
                 Err(e) => {
                     eprintln!("td-builder: seed-manifest: {e}");
-                    ExitCode::FAILURE
-                }
-            }
-        }
-        // seed-unpack: RESTORE a frozen seed tarball into a td-owned store + register it
-        // from the manifest — North-Star step 2, so the loop has the toolchain seed with NO
-        // guix install. Extracts TARBALL into DEST-STORE (the canonical `/gnu/store/<base>`
-        // trees land at `DEST-STORE/gnu/store/<base>`), VERIFIES each restored tree's NAR
-        // hash equals the manifest (the seed survived the tarball, byte-for-byte), and writes
-        // DEST-DB (ValidPaths + Refs) FROM the manifest — no re-scan (the live /gnu/store is
-        // read-only in the loop), no daemon. Usage:
-        //   seed-unpack TARBALL MANIFEST DEST-STORE DEST-DB
-        Some("seed-unpack") if args.len() == 6 => {
-            let (tarball, manifest, dest_store, dest_db) =
-                (&args[2], &args[3], &args[4], &args[5]);
-            let run = || -> Result<usize, String> {
-                use store_db::{Table, Value};
-                // Parse the manifest: `<path> <nar-hash> <nar-size> <ref,ref,…>`.
-                let text = std::fs::read_to_string(manifest)
-                    .map_err(|e| format!("read manifest {manifest}: {e}"))?;
-                struct Entry {
-                    path: String,
-                    hash: String,
-                    size: u64,
-                    refs: Vec<String>,
-                }
-                let mut entries: Vec<Entry> = Vec::new();
-                for (i, line) in text.lines().enumerate() {
-                    let line = line.trim();
-                    if line.is_empty() {
-                        continue;
-                    }
-                    let f: Vec<&str> = line.split(' ').collect();
-                    if f.len() != 4 {
-                        return Err(format!("manifest:{}: want `PATH HASH SIZE REFS', got `{line}'", i + 1));
-                    }
-                    let refs = if f[3] == "-" {
-                        Vec::new()
-                    } else {
-                        f[3].split(',').map(str::to_string).collect()
-                    };
-                    entries.push(Entry {
-                        path: f[0].to_string(),
-                        hash: f[1].to_string(),
-                        size: f[2].parse().map_err(|_| format!("manifest:{}: bad size", i + 1))?,
-                        refs,
-                    });
-                }
-                if entries.is_empty() {
-                    return Err("manifest is empty".into());
-                }
-                // Extract the tar into DEST-STORE (its members are `gnu/store/<base>`).
-                std::fs::create_dir_all(dest_store).map_err(|e| e.to_string())?;
-                tar::extract_tar(Path::new(tarball), Path::new(dest_store))?;
-                // Verify every restored tree is NAR-identical to the manifest.
-                for e in &entries {
-                    let on_disk = format!("{dest_store}{}", e.path); // DEST-STORE + /gnu/store/<base>
-                    let got = nar_hash_path(Path::new(&on_disk))
-                        .map_err(|err| format!("nar-hash {on_disk}: {err}"))?;
-                    if got != e.hash {
-                        return Err(format!(
-                            "NAR mismatch after restore for {} (restored={got} manifest={})",
-                            e.path, e.hash
-                        ));
-                    }
-                }
-                // Register DEST-DB from the manifest: rowids in manifest order, Refs by id.
-                let id_of: std::collections::HashMap<&str, i64> = entries
-                    .iter()
-                    .enumerate()
-                    .map(|(i, e)| (e.path.as_str(), i as i64 + 1))
-                    .collect();
-                let mut valid: Vec<(i64, Vec<Value>)> = Vec::with_capacity(entries.len());
-                let mut ref_rows: Vec<(i64, Vec<Value>)> = Vec::new();
-                let mut ref_rowid = 1i64;
-                for e in &entries {
-                    let id = id_of[e.path.as_str()];
-                    valid.push((
-                        id,
-                        vec![
-                            Value::Null,
-                            Value::Text(e.path.clone()),
-                            Value::Text(e.hash.clone()),
-                            Value::Int(1), // registrationTime sentinel
-                            Value::Null,   // deriver: a seed has none
-                            Value::Int(e.size as i64),
-                        ],
-                    ));
-                    for r in &e.refs {
-                        let rid = *id_of.get(r.as_str()).ok_or_else(|| {
-                            format!("reference `{r}' of {} is not in the manifest", e.path)
-                        })?;
-                        ref_rows.push((ref_rowid, vec![Value::Int(id), Value::Int(rid)]));
-                        ref_rowid += 1;
-                    }
-                }
-                let tables = [
-                    Table {
-                        name: "ValidPaths",
-                        sql: "CREATE TABLE ValidPaths (id integer primary key, path text, hash text, registrationTime integer, deriver text, narSize integer)",
-                        rows: valid,
-                    },
-                    Table {
-                        name: "Refs",
-                        sql: "CREATE TABLE Refs (referrer integer, reference integer)",
-                        rows: ref_rows,
-                    },
-                ];
-                std::fs::write(dest_db, store_db::write_db(&tables)).map_err(|e| e.to_string())?;
-                // BIND the db to the capture it restores (re #469 round-8): the
-                // `<db>.seed-tarball` sidecar records the tarball's sha256, and
-                // `authenticate_seed_capture_db` admits the db as AuditedSeed only
-                // if that sha256 is pinned in seed/control-plane-seed-pins.txt.
-                let tb_sha = sha256::sha256_file(Path::new(tarball))
-                    .map_err(|e| format!("sha256 {tarball}: {e}"))?;
-                let db_sha = sha256::sha256_file(Path::new(dest_db))
-                    .map_err(|e| format!("sha256 {dest_db}: {e}"))?;
-                let tb_base = tarball.rsplit('/').next().unwrap_or(tarball);
-                std::fs::write(
-                    format!("{dest_db}.seed-tarball"),
-                    format!("sha256 {tb_sha} {tb_base}\ndb-sha256 {db_sha}\n"),
-                )
-                .map_err(|e| format!("write {dest_db}.seed-tarball: {e}"))?;
-                Ok(entries.len())
-            };
-            match run() {
-                Ok(n) => {
-                    eprintln!("td-builder: seed-unpack restored + registered {n} seed paths (NAR-verified)");
-                    println!("{n}");
-                    ExitCode::SUCCESS
-                }
-                Err(e) => {
-                    eprintln!("td-builder: seed-unpack: {e}");
                     ExitCode::FAILURE
                 }
             }
@@ -8659,8 +8284,9 @@ fn main() -> ExitCode {
         // the reviewer's finding named — and no gate, test, or tool invoked either.
         // Every production realize path is a TYPED planner site now: `build-plan
         // --auto` (compiled-digest-gated seed db + step td.dbs), `build-recipe`
-        // (seed db + `--recipe-output-db` argv), and the daemon children (the
-        // blessed seed-closure db at its derived location).
+        // (seed db + `--recipe-output-db` argv), and the daemon children (no
+        // seed-store manifest authority — every closure item vouched by a typed
+        // td-owned db, the guix seed bless db retired).
         // td-builder daemon — td's OWN persistent build daemon: a long-running
         // process that realizes derivations served over a Unix socket, instead of
         // guix-daemon (own-builder-daemon track). Each request realizes via the
@@ -8686,9 +8312,10 @@ fn main() -> ExitCode {
         // (enforce_realize_input_policy) — an arbitrary drv over the socket can no
         // longer select blessed host tools as inputs or name one as its builder.
         // Usage:  daemon SOCKET STORE-DIR SCRATCH-BASE
-        // The blessed seed-closure db is never an argument: build children
-        // derive its location from the repo's seed-lock declarations
-        // (re #469 round-8 origin authentication).
+        // No seed db is an argument: build children realize with NO seed-store
+        // manifest authority (daemon_realize_one's extra_dbs is empty) — every
+        // input-closure item is vouched by a typed td-owned db instead, the guix
+        // seed bless db retired (re #469 origin authentication).
         // td-builder stage0-place — compile + place the guix-free stage0 td-builder
         // under BASEDIR and print its canonical store path (the one entry point every
         // stage0 consumer goes through; the Rust port of tests/stage0-builder.sh —
@@ -8706,18 +8333,30 @@ fn main() -> ExitCode {
                     ExitCode::SUCCESS
                 }
                 Err(e) => {
-                    eprintln!("td-builder: stage0-place: {e}");
-                    ExitCode::FAILURE
+                    // A tagged provisioning gap (no toolchain in this jail) exits
+                    // 69 so a caller — stage0-cold-start's cold leg — degrades to
+                    // Unprovisioned/tolerated instead of RED (re #469).
+                    if let Some(rest) = e.strip_prefix(crate::check_loop::UNPROVISIONED_TAG) {
+                        eprintln!("td-builder: stage0-place: unprovisioned — {rest}");
+                        crate::check_loop::unprovisioned_exit()
+                    } else {
+                        eprintln!("td-builder: stage0-place: {e}");
+                        ExitCode::FAILURE
+                    }
                 }
             }
         }
         // td-builder provision-rust / provision-cc — resolve the SEED build's
         // guix-free toolchain and print a PATH fragment (the Rust port of
-        // tools/provision-{rust,cc}.sh; resolution order in stage0.rs). Exit 3 when
-        // nothing resolves — operator guidance, distinct from a hard failure.
+        // tools/provision-{rust,cc}.sh; resolution order in stage0.rs). An ABSENT
+        // toolchain (ProvisionErr::Unavailable) exits EXIT_UNPROVISIONED (69) so a
+        // no-toolchain gate degrades to Unprovisioned/tolerated (re #469); a
+        // RESOLVED-but-broken toolchain (::Broken) — or a getcwd failure — is a
+        // hard FAILURE, never a silent skip.
         Some("provision-rust") if args.len() == 2 => {
-            let run = || -> Result<String, String> {
-                let root = std::env::current_dir().map_err(|e| format!("getcwd: {e}"))?;
+            let run = || -> Result<String, stage0::ProvisionErr> {
+                let root = std::env::current_dir()
+                    .map_err(|e| stage0::ProvisionErr::Broken(format!("getcwd: {e}")))?;
                 stage0::provision_rust(&stage0::ProvisionEnv::from_env(&root))
             };
             match run() {
@@ -8725,15 +8364,20 @@ fn main() -> ExitCode {
                     println!("{frag}");
                     ExitCode::SUCCESS
                 }
-                Err(e) => {
-                    eprintln!("td-builder: provision-rust: {e}");
-                    ExitCode::from(3)
+                Err(stage0::ProvisionErr::Unavailable(m)) => {
+                    eprintln!("td-builder: provision-rust: unprovisioned — {m}");
+                    crate::check_loop::unprovisioned_exit()
+                }
+                Err(stage0::ProvisionErr::Broken(m)) => {
+                    eprintln!("td-builder: provision-rust: {m}");
+                    ExitCode::FAILURE
                 }
             }
         }
         Some("provision-cc") if args.len() == 2 => {
-            let run = || -> Result<String, String> {
-                let root = std::env::current_dir().map_err(|e| format!("getcwd: {e}"))?;
+            let run = || -> Result<String, stage0::ProvisionErr> {
+                let root = std::env::current_dir()
+                    .map_err(|e| stage0::ProvisionErr::Broken(format!("getcwd: {e}")))?;
                 stage0::provision_cc(&stage0::ProvisionEnv::from_env(&root))
             };
             match run() {
@@ -8741,31 +8385,13 @@ fn main() -> ExitCode {
                     println!("{frag}");
                     ExitCode::SUCCESS
                 }
-                Err(e) => {
-                    eprintln!("td-builder: provision-cc: {e}");
-                    ExitCode::from(3)
+                Err(stage0::ProvisionErr::Unavailable(m)) => {
+                    eprintln!("td-builder: provision-cc: unprovisioned — {m}");
+                    crate::check_loop::unprovisioned_exit()
                 }
-            }
-        }
-        // td-builder provision-glibc-static — resolve the MATCHED static glibc's
-        // `lib/` dir (holding `libc.a`) for a crt-static control-plane build. The
-        // shell recipe-eval-tool.sh consumes it as the RUSTFLAGS `-L` so the
-        // evaluator links statically (no host/guix-home runpath). Same
-        // operator-guidance contract as provision-{rust,cc}: exit 3 when nothing
-        // resolves (set TD_GLIBC_STATIC_HOME, a build-essential cc, or a lock pin).
-        Some("provision-glibc-static") if args.len() == 2 => {
-            let run = || -> Result<String, String> {
-                let root = std::env::current_dir().map_err(|e| format!("getcwd: {e}"))?;
-                stage0::provision_glibc_static(&stage0::ProvisionEnv::from_env(&root))
-            };
-            match run() {
-                Ok(frag) => {
-                    println!("{frag}");
-                    ExitCode::SUCCESS
-                }
-                Err(e) => {
-                    eprintln!("td-builder: provision-glibc-static: {e}");
-                    ExitCode::from(3)
+                Err(stage0::ProvisionErr::Broken(m)) => {
+                    eprintln!("td-builder: provision-cc: {m}");
+                    ExitCode::FAILURE
                 }
             }
         }
@@ -8786,45 +8412,8 @@ fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         },
-        // td-builder seed-bless — record the DECLARED seed closure's hashes into a
-        // td-owned store db (re #469): derive the roots ITSELF from the repo's
-        // checked-in seed-lock declarations (`seed_lock_roots` over the cwd — the
-        // caller cannot select them), content-scan SEED-DIR for their transitive
-        // closure, and fully register every member (path/hash/size/refs). The db is
-        // the strict staging manifest's authority for the daemon flow
-        // (`ensure_build_daemon` blesses once per root set into the DERIVED
-        // `blessed_seed_db_path` location the build children re-derive). Bless
-        // ONCE per root set — see
-        // `bless_seed_closure` on why re-blessing would defeat the gate. A verb that
-        // blessed arbitrary caller-supplied roots would mint manifest authority for
-        // whatever bytes occupy those paths, exactly the self-issued-provenance hole
-        // typed origins close.
-        // Usage: seed-bless SEED-DIR OUT-DB   (cwd must be the repo root)
-        Some("seed-bless") if args.len() == 4 => {
-            let (seed_dir, out_db) = (&args[2], &args[3]);
-            let run = || -> Result<usize, String> {
-                let root = std::env::current_dir().map_err(|e| format!("getcwd: {e}"))?;
-                let roots = check_loop::seed_lock_roots(&root);
-                bless_seed_closure(seed_dir, &roots, Path::new(out_db))
-            };
-            match run() {
-                Ok(n) => {
-                    println!("blessed {n} paths");
-                    ExitCode::SUCCESS
-                }
-                Err(e) => {
-                    eprintln!("td-builder: seed-bless: {e}");
-                    ExitCode::FAILURE
-                }
-            }
-        }
         Some("daemon") if args.len() == 5 => {
             let (socket, seed_dir, scratch) = (args[2].clone(), args[3].clone(), args[4].clone());
-            // The blessed seed-closure db is NOT an argument (re #469 round-8):
-            // each build child RE-DERIVES its location from the repo's own
-            // seed-lock declarations (`check_loop::blessed_seed_db_path` over
-            // the child's cwd + its request's seed dir), so no caller-selected
-            // path can be typed `BlessedSeedClosure`.
             // Fail fast on a half-set builder override (the children re-read the same env).
             if let Err(e) = builder_override_from_env() {
                 eprintln!("td-builder: daemon: {e}");
@@ -8936,25 +8525,11 @@ fn main() -> ExitCode {
         // one drv into a content-addressed keyed scratch (guix-daemon-parity cache reuse) and
         // prints `OK <canonical> <host>`; daemon-check reproducibility-double-builds it and
         // prints `OK repro <canonical> <host>`. Both read the td-owned builder from
-        // TD_BUILDER_* (inherited from the daemon). The blessed seed-closure db is
-        // NOT an argument: the child DERIVES its location from the repo's own
-        // seed-lock declarations (cwd + the request's seed dir) — a caller-selected
-        // db path can no longer be typed `BlessedSeedClosure` (re #469 round-8).
+        // TD_BUILDER_* (inherited from the daemon). No seed-store bytes carry manifest
+        // authority — staging is vouched only by typed td-owned dbs.
         // Usage: daemon-build|daemon-check DRV SEED-DIR SCRATCH-BASE
         Some("daemon-build") if args.len() == 5 => {
-            let bless = match derived_bless_db(&args[3]) {
-                Ok(b) => b,
-                Err(e) => {
-                    eprintln!("td-builder: daemon-build {}: {e}", args[2]);
-                    return ExitCode::FAILURE;
-                }
-            };
-            match daemon_realize_one(
-                &args[2],
-                &args[3],
-                Path::new(&args[4]),
-                bless.as_deref(),
-            ) {
+            match daemon_realize_one(&args[2], &args[3], Path::new(&args[4])) {
                 Ok((canon, host, hit)) => {
                     println!("OK {canon} {host} {}", if hit { "hit" } else { "built" });
                     ExitCode::SUCCESS
@@ -8966,19 +8541,7 @@ fn main() -> ExitCode {
             }
         }
         Some("daemon-check") if args.len() == 5 => {
-            let bless = match derived_bless_db(&args[3]) {
-                Ok(b) => b,
-                Err(e) => {
-                    eprintln!("td-builder: daemon-check {}: {e}", args[2]);
-                    return ExitCode::FAILURE;
-                }
-            };
-            match daemon_check_one(
-                &args[2],
-                &args[3],
-                Path::new(&args[4]),
-                bless.as_deref(),
-            ) {
+            match daemon_check_one(&args[2], &args[3], Path::new(&args[4])) {
                 Ok((canon, host)) => {
                     println!("OK repro {canon} {host}");
                     ExitCode::SUCCESS
@@ -9106,16 +8669,6 @@ fn main() -> ExitCode {
             let bp = std::env::var("TD_BUILDER_PATH").ok();
             let bs = std::env::var("TD_BUILDER_STORE").ok();
             let bd = std::env::var("TD_BUILDER_DB").ok();
-            // North-Star step 2: build from the UNPACKED SEED, not a host guix. With
-            // TD_SEED_STORE + TD_SEED_DB set (a `td-builder seed-unpack` output), the input
-            // closure is CONTENT-SCANNED from the unpacked seed store and every seed input
-            // binds from it (TD_SEED_STORE/<base>) — so STORE-DIR and the live /gnu/store are
-            // out of the build path. Set together; the build is otherwise identical (same drv,
-            // same output). TD_SEED_DB is the seed's VOUCHING db: the content-scan of
-            // TD_SEED_STORE supplies the closure's edges, and the db's registrations are what
-            // admit its items into the strict staging manifest (re #469).
-            let seed_store = std::env::var("TD_SEED_STORE").ok();
-            let seed_db = std::env::var("TD_SEED_DB").ok();
             // Optional PERSISTENT store (the incremental /td/store the loop builds into):
             // set TD_PERSIST_STORE + TD_PERSIST_DB together and the build reads an
             // already-built output back from there (skip) or, on a miss, commits its fresh
@@ -9136,42 +8689,23 @@ fn main() -> ExitCode {
                         )
                     }
                 };
-                // The seed staging dir's entries are guix-captured bytes whose canonical
-                // home is /gnu/store even when the BUILD targets TD_STORE_DIR=/td/store
-                // (#292 — gate 377's collapse); td-built copies inside it are restored to
-                // their /td/store canonicals from the roots + the typed recipe-output dbs.
-                // Without a seed, the scanned dir IS the live store, canonical where it sits.
+                // The scanned dir IS the live store, canonical where it sits (or the
+                // `--recipe-output-store` when one is given); td-built copies are
+                // restored to their /td/store canonicals from the roots + the typed
+                // recipe-output dbs.
                 let (seed_store_dirs, seed_prefix, td_store) = build_recipe_store_layout(
-                    seed_store.as_deref(),
-                    seed_db.as_deref(),
                     recipe_output_store.as_deref(),
                     store_dir,
                 )?;
                 // The typed db set: the argv `--recipe-output-db` entries (prior td
-                // recipe outputs whose bytes live OUTSIDE the seed dir — their refs
-                // come from the db they wrote; the FILES stage from td_store/<base>),
-                // plus the seed's own vouching db — under unconditional strict staging
-                // (re #469) the unpacked seed's items are admitted by ITS
-                // registrations, typed `AuditedSeed`, not by being on disk.
-                // Both channels are AUTHENTICATED at intake (round-8): recipe-output
-                // rows must be engine-receipt-backed, and the seed db must bind to a
-                // COMPILED-pinned seed capture — a raw path/env value cannot mint a
-                // typed origin.
+                // recipe outputs whose bytes live OUTSIDE the scanned dir — their refs
+                // come from the db they wrote; the FILES stage from td_store/<base>).
+                // AUTHENTICATED at intake (round-8): recipe-output rows must be
+                // engine-receipt-backed — a raw path/env value cannot mint a typed origin.
                 for (dbp, _) in &recipe_output_dbs {
                     authenticate_recipe_output_db(dbp)?;
                 }
-                let mut extra_dbs: Vec<(String, sandbox::InputOrigin)> = recipe_output_dbs.clone();
-                if let Some(d) = &seed_db {
-                    authenticate_seed_capture_db(d)?;
-                    extra_dbs.push((d.clone(), sandbox::InputOrigin::AuditedSeed));
-                }
-                // The DERIVED blessed seed-closure db (re #469 round-8): the
-                // control-plane builder's own runtime closure (host glibc/
-                // gcc-lib until td-builder self-hosts) needs vouching in the
-                // strict manifest, and its authority is derived — never argv.
-                if let Some(bless) = derived_bless_db_auto()? {
-                    extra_dbs.push((bless, sandbox::InputOrigin::BlessedSeedClosure));
-                }
+                let extra_dbs: Vec<(String, sandbox::InputOrigin)> = recipe_output_dbs.clone();
                 let recipe_json =
                     std::fs::read_to_string(recipe_file).map_err(|e| e.to_string())?;
                 build_recipe(
@@ -9217,7 +8751,7 @@ fn main() -> ExitCode {
         // NAR-hash-match at the sandbox staging boundary.
         // Usage: build-plan --auto TARGET RECIPE-DIR MAP-FILE SEED-STORE SEED-DB SCRATCH
         Some("build-plan") if args.len() == 9 && args[2] == "--auto" => {
-            let (target, recipe_dir, map_file, guix_store, seed_db, scratch) =
+            let (target, recipe_dir, map_file, seed_store, seed_db, scratch) =
                 (&args[3], &args[4], &args[5], &args[6], &args[7], &args[8]);
             let bov = match builder_store_env() {
                 Ok(b) => b,
@@ -9235,7 +8769,7 @@ fn main() -> ExitCode {
                 }
             };
             let persist = pov.as_ref().map(|(s, d)| (s.as_str(), d.as_str()));
-            match build_plan_auto(target, recipe_dir, map_file, guix_store, seed_db, Path::new(scratch), builder_store, persist) {
+            match build_plan_auto(target, recipe_dir, map_file, seed_store, seed_db, Path::new(scratch), builder_store, persist) {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(e) => {
                     eprintln!("td-builder: build-plan --auto {target}: {e}");
@@ -9372,13 +8906,12 @@ fn main() -> ExitCode {
         //   --no-daemon      : accepted for compatibility. /var/guix is never
         //                      bound; the build path uses td-builder's own build
         //                      jail and shared build daemon.
-        //   --store-at DEST  : where --store-from is mounted INSIDE (default: the guix
-        //                      seed store /gnu/store, GUIX_SEED_STORE_DIR — a seed's
-        //                      binaries hardcode it). Pass /td/store
-        //                      for td's own store-native harness (busybox/make/
-        //                      td-builder relinked to /td/store/ld); then the host
-        //                      /gnu/store is NOT bound at all — the guix-byte-free
-        //                      loop substrate.
+        //   --store-at DEST  : where --store-from is mounted INSIDE (default:
+        //                      store_dir(), the td store /td/store — where a
+        //                      td-native unpacked store's items are canonical).
+        //                      Pass an explicit DEST to bind an unpacked store
+        //                      whose binaries hardcode a different interpreter
+        //                      prefix.
         //   --store-item PATH: bind ONE store item read-only at its own path
         //                      (repeatable). The loop's input-only exposure:
         //                      `td-builder check` passes its declared input set
@@ -9414,11 +8947,10 @@ fn main() -> ExitCode {
                 // containers see a private /proc.
                 //
                 // The store bind is explicit: with --store-from DIR, bind the
-                // UNPACKED store DIR, mounted at DEST
-                // (--store-at, default: the guix seed store /gnu/store) so its binaries'
-                // hardcoded interpreters resolve. With --store-at /td/store (td's own
-                // store-native harness) the host /gnu/store is then absent — the
-                // guix-byte-free loop substrate. /var/guix is never bound.
+                // UNPACKED store DIR, mounted at DEST (--store-at, default:
+                // store_dir(), the td store /td/store). Pass an explicit --store-at
+                // to bind a store whose binaries' hardcoded interpreters resolve at
+                // a different prefix. /var/guix is never bound.
                 let mut binds = host_sandbox_base_binds(store_from.as_deref(), store_at.as_deref());
                 // Per-item store inputs (--store-item / --store-item-at): each
                 // declared input bound READ-ONLY at its own path (or the given
@@ -9762,13 +9294,11 @@ fn main() -> ExitCode {
             eprintln!("       td-builder store-verify DB STORE-ROOT");
             eprintln!("       td-builder store-gc-sweep STORE-DIR DB ROOT");
             eprintln!("       td-builder resolve LOCKFILE NAME...");
-            eprintln!("       td-builder seed-bless SEED-DIR OUT-DB");
             eprintln!("       td-builder build-recipe RECIPE-JSON LOCK SCRATCH-DIR STORE-DIR [SRC-STORE-DIR SRC-DB] [--recipe-output-store STORE] [--recipe-output-db DB]...");
             eprintln!("       td-builder build-plan --auto TARGET RECIPE-DIR MAP-FILE SEED-STORE SEED-DB SCRATCH");
             eprintln!("       td-builder stage0-place BASEDIR        # compile+place the guix-free stage0 (memoized)");
             eprintln!("       td-builder provision-rust              # print the guix-free rust toolchain PATH fragment");
             eprintln!("       td-builder provision-cc                # print the guix-free C toolchain PATH fragment");
-            eprintln!("       td-builder provision-glibc-static      # print the matched static glibc lib dir (crt-static -L)");
             eprintln!("       td-builder assert-static PATH          # fail unless PATH is a fully static binary");
             eprintln!("       td-builder autotools-build   # as a derivation builder");
             eprintln!("       td-builder rust-build        # as a derivation builder (cargo)");
@@ -9967,7 +9497,7 @@ glibc-x86-64 /td/store/gl-glibc td-recipe-output
     fn recipe_output_only_store_is_a_closure_staging_candidate() {
         let physical = "/tmp/td-recipe-output-store";
         let (dirs, prefix, td_store) =
-            build_recipe_store_layout(None, None, Some(physical), "/legacy/store").unwrap();
+            build_recipe_store_layout(Some(physical), "/legacy/store").unwrap();
         assert_eq!(dirs, [physical]);
         assert_eq!(prefix, store::store_dir());
         assert_eq!(td_store, Some(Path::new(physical)));
@@ -10438,10 +9968,10 @@ daemon build START (2/2 active)
 
     #[test]
     fn host_sandbox_back_compat_no_store_at() {
-        // inc2a back-compat: --store-from alone still means "mount the guix seed at
-        // /gnu/store" (store_at None — the handler defaults the dest via
-        // store::GUIX_SEED_STORE_DIR), and the daemon/cwd flags parse as before.
-        // Asserting store_at==None keeps the default wired here.
+        // inc2a back-compat: --store-from alone parses with store_at None — the
+        // handler then defaults the dest to store_dir() (the td store). The
+        // daemon/cwd flags parse as before. Asserting store_at==None keeps the
+        // default wired here.
         let p = hs(&["--expose-cwd", "--store-from", "/seed", "--", "make", "check"])
             .expect("valid");
         assert_eq!(p.store_from.as_deref(), Some("/seed"));
@@ -10472,12 +10002,13 @@ daemon build START (2/2 active)
         assert_eq!(harness[0].dest.as_deref(), Some("/td/store"));
         assert!(harness.iter().all(|b| b.src != "/var/guix"));
 
-        // --store-from alone (no --store-at) mounts the guix SEED at /gnu/store — its
-        // binaries carry /gnu/store interpreters — INDEPENDENT of store_dir()'s default
-        // (now /td/store). A relinked native seed uses the explicit --store-at above.
+        // --store-from alone (no --store-at) defaults the dest to store_dir() (the
+        // td store, /td/store by default), where a td-native unpacked store's items
+        // are canonical. An unpacked store with a different interpreter prefix uses
+        // the explicit --store-at above.
         let seed = host_sandbox_base_binds(Some("/seed"), None);
         assert_eq!(seed.len(), 1);
-        assert_eq!(seed[0].dest.as_deref(), Some("/gnu/store"));
+        assert_eq!(seed[0].dest.as_deref(), Some(store::store_dir().as_str()));
     }
 
     #[test]
@@ -10643,74 +10174,6 @@ daemon build START (2/2 active)
         path
     }
 
-    // seed-bless (re #469): blessing a declared root set content-scans its
-    // closure, records every member's NAR hash into a td-owned db, and the
-    // strict staging manifest built from that db (a) vouches exactly the
-    // closure, (b) verifies untouched bytes, and (c) reds bytes tampered
-    // AFTER the bless — the existence-as-authority hole, closed. Also red:
-    // a root that is not in the seed dir cannot be blessed at all.
-    #[test]
-    fn seed_bless_vouches_the_closure_and_tampering_after_the_bless_reds() {
-        let d = std::env::temp_dir().join(format!("td-seed-bless-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&d);
-        std::fs::create_dir_all(&d).unwrap();
-        // Two "store items": tool references lib by embedding its store path.
-        let lib_base = format!("{}-lib", "b".repeat(32));
-        let tool_base = format!("{}-tool", "a".repeat(32));
-        let lib_canon = format!("{}/{lib_base}", store::store_dir());
-        let tool_canon = format!("{}/{tool_base}", store::store_dir());
-        std::fs::write(d.join(&lib_base), b"lib bytes").unwrap();
-        std::fs::write(d.join(&tool_base), format!("exec {lib_canon}").as_bytes()).unwrap();
-        let db = d.join("bless.db");
-        let n = bless_seed_closure(
-            &d.to_string_lossy(),
-            std::slice::from_ref(&tool_canon),
-            &db,
-        )
-        .unwrap();
-        assert_eq!(n, 2, "the scan must pull lib into the blessed closure via tool's bytes");
-        let manifest = manifest_from_typed_dbs(&[(
-            db.to_string_lossy().into_owned(),
-            sandbox::InputOrigin::BlessedSeedClosure,
-        )])
-        .unwrap();
-        for (canon, base) in [(&tool_canon, &tool_base), (&lib_canon, &lib_base)] {
-            assert!(manifest.contains_key(canon.as_str()), "{canon} not vouched");
-            assert_eq!(
-                manifest.get(canon.as_str()).map(|si| si.origin),
-                Some(sandbox::InputOrigin::BlessedSeedClosure),
-                "{canon} must carry the intake site's declared origin class"
-            );
-            sandbox::verify_staged_item(&manifest, canon, &d.join(base).to_string_lossy())
-                .unwrap();
-        }
-        // Tamper AFTER the bless: same path, different bytes — refuses to stage.
-        std::fs::write(d.join(&lib_base), b"tampered lib bytes").unwrap();
-        let err = sandbox::verify_staged_item(
-            &manifest,
-            &lib_canon,
-            &d.join(&lib_base).to_string_lossy(),
-        )
-        .unwrap_err();
-        assert!(err.to_string().contains("refusing to stage tampered bytes"), "{err}");
-        // An item the bless never recorded is not vouched at all.
-        let err = sandbox::verify_staged_item(
-            &manifest,
-            &format!("{}/{}-ghost", store::store_dir(), "c".repeat(32)),
-            &d.join(&lib_base).to_string_lossy(),
-        )
-        .unwrap_err();
-        assert!(err.to_string().contains("no td-owned store-db record"), "{err}");
-        // A root that does not live in the seed dir cannot be blessed.
-        let err = bless_seed_closure(
-            &d.to_string_lossy(),
-            &[format!("{}/{}-absent", store::store_dir(), "d".repeat(32))],
-            &d.join("bless2.db"),
-        )
-        .unwrap_err();
-        assert!(err.contains("is not in the seed dir"), "{err}");
-        std::fs::remove_dir_all(&d).ok();
-    }
 
     // authenticate_ca_db (re #469 round-8): a placement db carries authority
     // only for rows whose on-disk bytes reproduce BOTH the recorded NAR hash
@@ -11143,54 +10606,20 @@ daemon build START (2/2 active)
         std::fs::remove_dir_all(&d).ok();
     }
 
-    // re #469 round-10 P0 #1: the staging-boundary host-tool policy. The daemon
-    // realizes drvs no planner saw, so a crafted drv could (a) SELECT blessed
-    // host tools (bash/coreutils/tar/gzip live in the blessed seed closure) as
-    // inputs, or (b) name one as its BUILDER. Both must red at the bind
-    // boundary; the builder's own runtime closure (glibc/gcc-lib) must stay
-    // green — that is the only slice the bless db exists to vouch.
-    #[test]
-    fn blessed_seed_items_vouch_only_the_builder_runtime_closure() {
-        let builder_tree = format!("/gnu/store/{}-td-builder-0.1.0", "a".repeat(32));
-        let builder = format!("{builder_tree}/bin/td-builder");
-        let glibc = format!("/gnu/store/{}-glibc-2.41", "b".repeat(32));
-        let bash = format!("/gnu/store/{}-bash-5.2.37", "c".repeat(32));
-        let si = |origin| sandbox::StagedInput { nar_hash: "sha256:00".to_string(), origin };
-        let mut manifest = sandbox::StageManifest::new();
-        manifest.insert(builder_tree.clone(), si(sandbox::InputOrigin::ControlPlaneBuilder));
-        manifest.insert(glibc.clone(), si(sandbox::InputOrigin::BlessedSeedClosure));
-        manifest.insert(bash.clone(), si(sandbox::InputOrigin::BlessedSeedClosure));
-        let roots = vec![builder_tree.clone(), bash.clone()];
-        let reach: std::collections::BTreeSet<String> =
-            [builder_tree.clone(), glibc.clone()].into_iter().collect();
-        // Green: the builder plus its glibc runtime — the legitimate bless slice.
-        let ok_closure = vec![builder_tree.clone(), glibc.clone()];
-        enforce_realize_input_policy(&builder, &roots, &ok_closure, &reach, &manifest, None)
-            .unwrap();
-        // Red: the drv additionally selected blessed host bash as an INPUT.
-        let bad_closure = vec![builder_tree, glibc, bash];
-        let err =
-            enforce_realize_input_policy(&builder, &roots, &bad_closure, &reach, &manifest, None)
-                .unwrap_err();
-        assert!(err.contains("host tools are not admissible"), "{err}");
-    }
-
-    // re #469 round-10: builder-identity leg of the policy. A blessed host tool
-    // named as the drv's BUILDER reds even though its bytes are vouched and
-    // reachable; a RecipeOutput-typed executable (a td-built tool) and the
-    // engine's own tree stay admissible.
+    // re #469 round-10: builder-identity leg of the policy. A host tool named as
+    // the drv's BUILDER reds even though its bytes are vouched (AuditedSeed); a
+    // RecipeOutput-typed executable (a td-built tool) and the engine's own tree
+    // stay admissible.
     #[test]
     fn a_host_tool_is_never_a_drv_builder() {
         let bash_tree = format!("/gnu/store/{}-bash-5.2.37", "c".repeat(32));
         let builder = format!("{bash_tree}/bin/bash");
         let si = |origin| sandbox::StagedInput { nar_hash: "sha256:00".to_string(), origin };
         let mut manifest = sandbox::StageManifest::new();
-        manifest.insert(bash_tree.clone(), si(sandbox::InputOrigin::BlessedSeedClosure));
+        manifest.insert(bash_tree.clone(), si(sandbox::InputOrigin::AuditedSeed));
         let roots = vec![bash_tree.clone()];
-        let reach: std::collections::BTreeSet<String> =
-            [bash_tree.clone()].into_iter().collect();
         let closure = vec![bash_tree.clone()];
-        let err = enforce_realize_input_policy(&builder, &roots, &closure, &reach, &manifest, None)
+        let err = enforce_realize_input_policy(&builder, &roots, &closure, &manifest, None)
             .unwrap_err();
         assert!(err.contains("not admissible executable provenance"), "{err}");
         // A td recipe output IS an admissible builder.
@@ -11202,7 +10631,6 @@ daemon build START (2/2 active)
             &tool,
             std::slice::from_ref(&tool_tree),
             std::slice::from_ref(&tool_tree),
-            &std::collections::BTreeSet::new(),
             &m2,
             None,
         )
@@ -11214,11 +10642,33 @@ daemon build START (2/2 active)
             &self_builder,
             &[],
             &[],
-            &std::collections::BTreeSet::new(),
             &sandbox::StageManifest::new(),
             Some(&self_tree),
         )
         .unwrap();
+    }
+
+    // re #469: the closure-vouching leg. Every staged input must carry a typed
+    // td-owned record; an item the manifest does not vouch for reds at the choke
+    // point (the daemon realizes drvs a planner never saw, so a crafted drv could
+    // name an unvouched store path as an input).
+    #[test]
+    fn an_unvouched_closure_item_is_rejected() {
+        let tree = format!("/gnu/store/{}-td-tool-1.0", "a".repeat(32));
+        let builder = format!("{tree}/bin/td-tool");
+        let si = |origin| sandbox::StagedInput { nar_hash: "sha256:00".to_string(), origin };
+        let mut manifest = sandbox::StageManifest::new();
+        manifest.insert(tree.clone(), si(sandbox::InputOrigin::RecipeOutput));
+        let roots = vec![tree.clone()];
+        // The builder itself is admissible, but the closure names an item with no record.
+        let stray = format!("/gnu/store/{}-stray-1.0", "b".repeat(32));
+        let closure = vec![tree.clone(), stray.clone()];
+        let err = enforce_realize_input_policy(&builder, &roots, &closure, &manifest, None)
+            .unwrap_err();
+        assert!(err.contains(&stray) && err.contains("no td-owned store-db record"), "{err}");
+        // Vouch it and the same closure passes.
+        manifest.insert(stray, si(sandbox::InputOrigin::RecipeOutput));
+        enforce_realize_input_policy(&builder, &roots, &closure, &manifest, None).unwrap();
     }
 
     // re #469 round-10 P0 #2: a self-content-addressed tree with NO stage0
@@ -11287,48 +10737,6 @@ daemon build START (2/2 active)
         assert!(err.contains("not a basename the compiled seed-digest table pins"), "{err}");
         // Absent db: authenticates vacuously — no rows means no authority.
         authenticate_seed_db(&d.join("absent.db").to_string_lossy(), &items).unwrap();
-        std::fs::remove_dir_all(&d).ok();
-    }
-
-    // authenticate_seed_capture_db (re #469 round-8): TD_SEED_DB types
-    // AuditedSeed only through the seed-unpack sidecar binding the db to a
-    // capture tarball whose sha256 the COMPILED pins file admits, with the db
-    // bytes themselves fixed by the sidecar. Red: no sidecar; a post-write db
-    // edit; an unpinned capture (including against the SHIPPED pins file,
-    // which pins nothing yet — the fail-closed default). Green: pinned
-    // capture + untouched db, via the pins-parameterized core.
-    #[test]
-    fn authenticate_seed_capture_db_binds_capture_and_db_bytes() {
-        let d = std::env::temp_dir().join(format!("td-auth-cap-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&d);
-        std::fs::create_dir_all(&d).unwrap();
-        let db = d.join("cap.db");
-        std::fs::write(&db, b"db bytes").unwrap();
-        let dbp = db.to_string_lossy().into_owned();
-        // Red: a db with no sidecar (any db seed-unpack did not write).
-        let err = authenticate_seed_capture_db(&dbp).unwrap_err();
-        assert!(err.contains("no seed-tarball binding"), "{err}");
-        let tb_sha = sha256_hex(b"tarball bytes");
-        let db_sha = sha256_hex(b"db bytes");
-        std::fs::write(
-            d.join("cap.db.seed-tarball"),
-            format!("sha256 {tb_sha} seed.tar\ndb-sha256 {db_sha}\n"),
-        )
-        .unwrap();
-        // Red: the SHIPPED pins file admits nothing yet — fail closed.
-        let err = authenticate_seed_capture_db(&dbp).unwrap_err();
-        assert!(err.contains("is not pinned"), "{err}");
-        // Green: a pins file that admits this capture.
-        let pins = format!("# audited\n{tb_sha} frozen seed capture\n");
-        authenticate_seed_capture_db_with(&dbp, &pins).unwrap();
-        // Red: db bytes changed after seed-unpack wrote the sidecar.
-        std::fs::write(&db, b"db bytes edited").unwrap();
-        let err = authenticate_seed_capture_db_with(&dbp, &pins).unwrap_err();
-        assert!(err.contains("modified after seed-unpack"), "{err}");
-        std::fs::write(&db, b"db bytes").unwrap();
-        // Red: a malformed pin line is a hard error, not a skip.
-        let err = authenticate_seed_capture_db_with(&dbp, "not-a-sha admit-all\n").unwrap_err();
-        assert!(err.contains("malformed pin"), "{err}");
         std::fs::remove_dir_all(&d).ok();
     }
 
@@ -12640,121 +12048,6 @@ daemon build START (2/2 active)
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    // Integration boundary (re #469 round-10 P0 #1): FREEZE the host-shell provenance boundary
-    // by driving the REAL staging-decision pipeline against an on-disk synthetic seed — the
-    // builder arm's DYNAMIC-LINKAGE closure computation (`resolve_link_closure`, mirrored from
-    // realize_drv line-for-line) feeding both `enforce_realize_input_policy` (the choke point
-    // every realize path goes through) and the sandbox's `verify_staged_item` bind check.
-    // `resolve_link_closure_excludes_a_string_only_host_shell` and
-    // `blessed_seed_items_vouch_only_the_builder_runtime_closure` each prove ONE half with
-    // hand-authored inputs; this proves their COMPOSITION — the tightened `builder_reach` the
-    // linkage pass actually PRODUCES is exactly the slice the gate vouches — so no seam hides a
-    // divergence between what resolution computes and what enforcement checks. A host shell a
-    // drv could name by absolute `Step::Run` is thereby BOTH absent from the staged closure AND
-    // rejected before any bind if a future content edge re-injects it: the reviewer's "absent or
-    // rejected" criterion, held by the code paths a real build runs.
-    #[test]
-    fn host_shell_is_absent_from_and_rejected_by_the_realize_staging_boundary() {
-        // A realistic synthetic seed: glibc NAMES bash (its `_PATH_BSHELL` constant + a bin/ldd
-        // shebang) but the loader never LINKS it; the builder links only glibc + gcc-lib.
-        let dir = std::env::temp_dir().join(format!("hsb-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        let seed = dir.join("seed");
-        let cp = "/gnu/store";
-        let glibc = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-glibc-2.41";
-        let bash = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-bash-static-5.2.37";
-        let gcclib = "cccccccccccccccccccccccccccccccc-gcc-14.3.0-lib";
-        let bld = "dddddddddddddddddddddddddddddddd-td-builder-0.1.0";
-        std::fs::create_dir_all(seed.join(glibc).join("lib")).unwrap();
-        std::fs::create_dir_all(seed.join(glibc).join("bin")).unwrap();
-        std::fs::create_dir_all(seed.join(bash).join("bin")).unwrap();
-        std::fs::create_dir_all(seed.join(gcclib).join("lib")).unwrap();
-        std::fs::create_dir_all(seed.join(bld).join("bin")).unwrap();
-        let ld = format!("/gnu/store/{glibc}/lib/ld-linux-x86-64.so.2");
-        let bash_bin = format!("/gnu/store/{bash}/bin/bash");
-        // libc.so.6: interp -> ld, EMBEDS the bash path (the leak the content scan followed).
-        std::fs::write(seed.join(glibc).join("lib/libc.so.6"), synth_link_elf(Some(&ld), None, &[&bash_bin])).unwrap();
-        std::fs::write(seed.join(glibc).join("lib/ld-linux-x86-64.so.2"), synth_link_elf(None, None, &[])).unwrap();
-        // glibc bin/ldd: a helper SCRIPT shebanging bash (a content ref, not a link edge).
-        std::fs::write(seed.join(glibc).join("bin/ldd"), format!("#!{bash_bin}\nexec ...\n").into_bytes()).unwrap();
-        // libgcc_s.so.1: run-path -> glibc/lib (the real cross-package link edge).
-        std::fs::write(seed.join(gcclib).join("lib/libgcc_s.so.1"), synth_link_elf(None, Some(&format!("/gnu/store/{glibc}/lib")), &[])).unwrap();
-        // bash-static: the runnable host shell — the regression target.
-        std::fs::write(seed.join(bash).join("bin/bash"), b"a runnable host shell").unwrap();
-        // The builder ELF links its real direct runtime refs (glibc + gcc-lib) and nothing else.
-        std::fs::write(seed.join(bld).join("bin/td-builder"), synth_link_elf(Some(&ld), Some(&format!("/gnu/store/{glibc}/lib:/gnu/store/{gcclib}/lib")), &[])).unwrap();
-
-        let seed_dir = seed.to_string_lossy().into_owned();
-        let od = |p: &str| seed.join(p).to_string_lossy().into_owned();
-        let sp = |p: &str| format!("/gnu/store/{p}");
-        let mut on_disk = std::collections::HashMap::new();
-        for p in [glibc, bash, gcclib, bld] {
-            on_disk.insert(sp(p), od(p));
-        }
-
-        // Compute the builder closure EXACTLY as realize_drv's builder arm does: the builder
-        // tree binds `canonical\ton-disk` and tracks into builder_reach; its runtime deps are
-        // resolved by DYNAMIC LINKAGE from the BUILDER TREE ITSELF (the arm's root), then the
-        // bare self-entry is dropped (the tree is bound tabbed). glibc + gcc-lib flow into BOTH
-        // the staged closure and builder_reach; bash (glibc merely names it) does not.
-        let mut closure: Vec<String> = vec![format!("{}\t{}", sp(bld), od(bld))];
-        let mut builder_reach: std::collections::BTreeSet<String> = std::iter::once(sp(bld)).collect();
-        let mut linkage =
-            resolve_link_closure(std::slice::from_ref(&sp(bld)), std::slice::from_ref(&seed_dir), cp, &on_disk)
-                .unwrap();
-        linkage.remove(&sp(bld));
-        for canon in linkage {
-            builder_reach.insert(canon.clone());
-            closure.push(canon);
-        }
-
-        // (1) ABSENT: the host shell is neither staged nor vouchable; the real runtime libs are.
-        assert!(builder_reach.contains(&sp(glibc)) && builder_reach.contains(&sp(gcclib)), "runtime libs reachable: {builder_reach:?}");
-        assert!(!builder_reach.contains(&sp(bash)), "host shell absent from builder_reach: {builder_reach:?}");
-        assert!(!closure.iter().any(|e| e.contains(bash)), "host shell absent from the staged closure: {closure:?}");
-
-        // The manifest the seed's dbs issue: builder ControlPlaneBuilder, runtime libs
-        // BlessedSeedClosure. (The content scan the fix removed WOULD also have blessed bash.)
-        let si = |o| sandbox::StagedInput { nar_hash: "sha256:00".to_string(), origin: o };
-        let mut manifest = sandbox::StageManifest::new();
-        manifest.insert(sp(bld), si(sandbox::InputOrigin::ControlPlaneBuilder));
-        manifest.insert(sp(glibc), si(sandbox::InputOrigin::BlessedSeedClosure));
-        manifest.insert(sp(gcclib), si(sandbox::InputOrigin::BlessedSeedClosure));
-        let builder_exec = format!("{}/bin/td-builder", sp(bld));
-        let roots = vec![sp(bld)];
-
-        // (2) POSITIVE CONTROL: the honest linkage closure — builder + its runtime libs — passes.
-        enforce_realize_input_policy(&builder_exec, &roots, &closure, &builder_reach, &manifest, None)
-            .expect("builder + its dynamic-linkage runtime closure is admissible");
-
-        // (3) REJECTED: a future content edge / crafted drv re-drags bash into the closure as a
-        // blessed-seed row. Against the TIGHTENED builder_reach it is no longer vouched, so rule
-        // 3 reds BEFORE any bind.
-        let mut leaked = closure.clone();
-        leaked.push(sp(bash));
-        let mut m2 = manifest.clone();
-        m2.insert(sp(bash), si(sandbox::InputOrigin::BlessedSeedClosure));
-        let err = enforce_realize_input_policy(&builder_exec, &roots, &leaked, &builder_reach, &m2, None)
-            .expect_err("a blessed host shell outside the builder's runtime closure must be rejected");
-        assert!(err.contains(bash) && err.contains("host tools are not admissible"), "rejection names the host-tool rule: {err}");
-
-        // (4) LOAD-BEARING: the tightening is WHAT rejects it. Had builder_reach still vouched
-        // bash (the pre-fix content-scan leak), the SAME gate would ACCEPT the SAME closure — so
-        // removing bash from builder_reach is exactly the fix, not incidental.
-        let mut pre_fix_reach = builder_reach.clone();
-        pre_fix_reach.insert(sp(bash));
-        enforce_realize_input_policy(&builder_exec, &roots, &leaked, &pre_fix_reach, &m2, None)
-            .expect("counterfactual: a builder_reach still vouching bash ACCEPTS it — the pre-fix leak");
-
-        // (5) BIND-BOUNDARY BELT: even past the gate, the sandbox re-hashes every item against
-        // the manifest; a host shell with no honest record can never bind (verify_staged_item).
-        let err = sandbox::verify_staged_item(&manifest, &sp(bash), &od(bash))
-            .expect_err("the sandbox refuses to stage an item no td-owned db vouches for");
-        assert!(err.to_string().contains("no td-owned store-db record"), "bind-boundary rejection: {err}");
-
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
     // A STATICALLY-linked stage0 builder (builder/src/stage0.rs) stages NOTHING host — even
     // though it INLINES glibc's `.rodata` and so its own bytes name glibc's store path AND
     // glibc's `_PATH_BSHELL` bash-static path (re #469). The realize builder arm roots its
@@ -12871,7 +12164,7 @@ daemon build START (2/2 active)
             glibc.clone(),
             sandbox::StagedInput {
                 nar_hash: "sha256:bb".into(),
-                origin: sandbox::InputOrigin::BlessedSeedClosure,
+                origin: sandbox::InputOrigin::AuditedSeed,
             },
         );
 
@@ -13370,7 +12663,7 @@ daemon build START (2/2 active)
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let wr = |name: &str, bytes: String| std::fs::write(dir.join(name), bytes).unwrap();
-        // The warm-seed staging dir mixes guix-captured entries and copied-in td-built ones.
+        // A captured-seed staging dir mixes foreign-prefix entries and copied-in td-built ones.
         wr(&format!("{cu_h}-coreutils-9.1"), format!("expr RPATHs /gnu/store/{gmp_h}-gmp-6.3.0/lib\n"));
         wr(&format!("{gmp_h}-gmp-6.3.0"), "a guix-built leaf\n".to_string());
         wr(&format!("{tc_h}-gcc-toolchain-tdstore"), format!("wrapper: -Wl,--dynamic-linker /td/store/{gl_h}-glibc-2.41/lib/ld-linux.so.2\n"));

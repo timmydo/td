@@ -1,19 +1,12 @@
-# tests/cache-lib.sh — the shared content-addressed build-recipe cache wrapper used
-# by the package-manager build gates (recipe-checks, rust-build).
-# `td-builder build-recipe` assembles a
-# DETERMINISTIC .drv, so a PERSISTENT cache (.td-build-cache/<gate>/, gitignored)
-# lets td reuse a prior NAR-verified output for an UNCHANGED recipe (build-recipe
-# prints CACHE=hit) and skip the build; on a verified hit the reproducibility
-# double-build is skipped too (verdict memoized, like check-memo). Only a CHANGED
-# recipe (⇒ different drv ⇒ miss) rebuilds. Reproducibility/behavior unweakened: the
-# first build still double-builds, every run re-NAR-verifies the cached output, and
-# the gate's own behavioral test (run/--version/link) re-runs each time.
+# tests/cache-lib.sh — shared helpers for the build_gate prelude: place the
+# td-bootstrapped stage0 td-builder and load td's Rust recipe evaluator. Sourced
+# by tests/build-recipes.sh (and the package build gates) so every build uses the
+# stage0 td-builder compiled from builder/ source — never a guix-built td-builder.
 #
 # Caller presets: CU (coreutils dir for the scrubbed PATH), CACHE (the gate's
 # persistent cache root). `load_stage0` provides TB + the TD_BUILDER_* override
 # (move-off-Guile §5 brick 3): cache-lib BUILDS with the td-bootstrapped stage0, NOT
-# the guix-built td-builder. cached_build/cached_check set/use the shell vars: sd (this
-# spec's cache dir), out (store path), ns (newstore output dir), hit (non-empty on a hit).
+# the guix-built td-builder.
 
 # load_stage0 — ensure a td-bootstrapped stage0 td-builder is placed (`td-builder
 # stage0-place`, builder/src/stage0.rs: cargo-compiled guix-free, stage0 places ITSELF via
@@ -22,13 +15,13 @@
 # TD_BUILDER_PATH/STORE/DB (the in-store builder-of-record the assembled drv names). So
 # the package gates build with stage0, never `guix build -e '(@ (system td-builder)
 # td-builder)'`. The placement is shared under .td-build-cache/stage0 (build-recipes
-# populates it once before its fan-out; the gates reuse it). The toolchain SEED stays the
-# guix-built pin (§5, retired last) — realized by the caller, read by stage0-place as
-# strings.
+# populates it once before its fan-out; the gates reuse it). The rust+cc toolchain is
+# resolved guix-free by `provision-{rust,cc}` (TD_RUST_HOME, or rustc/cargo + system cc
+# on PATH, or rustup) — no lock, no guix pin.
 load_stage0() {
   _s0base="${TD_STAGE0_BASE:-$(pwd)/.td-build-cache/stage0}"
   _tb_self="${TD_BUILDER_SELF:?load_stage0 requires TD_BUILDER_SELF (gate-run exports it)}"
-  _cb=`"$_tb_self" stage0-place "$_s0base"` || { echo "FAIL: td-builder stage0-place could not place a stage0 td-builder" >&2; return 1; }
+  _cb=`"$_tb_self" stage0-place "$_s0base"` || { rc=$?; echo "FAIL: td-builder stage0-place could not place a stage0 td-builder" >&2; return $rc; }  # preserve 69 (no toolchain in the jail) so callers degrade to Unprovisioned, not RED (#469)
   TB="$_s0base/store/`basename "$_cb"`/bin/td-builder"
   TD_BUILDER_PATH="$_cb"
   TD_BUILDER_STORE="$_s0base/store"
@@ -41,9 +34,10 @@ load_stage0() {
 # check + check-rung; workstream E #294). The stage0 td-builder compiles from
 # builder/ source with the ENVIRONMENT's rust + cc (`td-builder provision-{rust,cc}`,
 # builder/src/stage0.rs), so there is no guix-built toolchain seed to realize/fetch
-# here — it is just load_stage0. On a guix host with the pinned lock paths present,
-# provision-rust/cc use them (a guix-free PROCESS); on a guix-less host they use
-# rustup / system cc.
+# here — it is just load_stage0. provision-{rust,cc} resolve the toolchain from
+# TD_RUST_HOME, rustc/cargo + system cc on PATH, or rustup — never a lock or a guix
+# profile. Inside the host-tool-free loop sandbox none of those are reachable, so
+# stage0-place exits 69 and the gate degrades to Unprovisioned/tolerated (#469).
 provision_stage0() {
   load_stage0
 }
@@ -61,77 +55,6 @@ load_recipe_eval() {
   TD_RECIPE_EVAL=`cat "$_re"`
   export TD_RECIPE_EVAL
   test -x "$TD_RECIPE_EVAL" || { echo "FAIL: td-recipe-eval not executable at $TD_RECIPE_EVAL" >&2; return 1; }
-}
-
-# cached_build SPEC LOCK  — emit the recipe, td-ASSEMBLE its .drv, and SUBMIT it to the ONE
-# shared build daemon (the machine-wide budget limiter, started by the `td-builder check`
-# prelude; the daemon caps concurrent builds across ALL agents, so N checks never
-# oversubscribe/OOM).
-# Sets sd, out, ns, hit. Returns non-zero (with a FAIL message) on a real failure.
-cached_build() {
-  _spec="$1"; _lock="$2"
-  sd="$CACHE/$_spec"; mkdir -p "$sd/b" "$sd/tmp"
-  : "${TD_RECIPE_EVAL:?load_recipe_eval must run before cached_build (TD_RECIPE_EVAL unset)}"
-  : "${TD_DAEMON_SOCKET:?the shared build daemon must be running (TD_DAEMON_SOCKET unset) — the \`td-builder check\` host prelude starts it}"
-  "$TD_RECIPE_EVAL" emit "$_spec" > "$sd/recipe.json" \
-    || { echo "FAIL: td-recipe-eval emit $_spec" >&2; return 1; }
-  test -s "$sd/recipe.json" || { echo "ERROR: td-recipe-eval produced no JSON for $_spec" >&2; return 1; }
-  rm -f "$sd/b/"*.drv                       # drop any stale drv; assemble-recipe rewrites the current one
-  : "${TB:?load_stage0 must run before cached_build (TB unset)}"
-  # (1) td ASSEMBLES the .drv itself (no guix (derivation …), no Guile) with the STAGE0
-  # builder override (brick 3): TD_BUILDER_* ride through `env -i` so the drv's builder is
-  # the td-bootstrapped stage0, not the guix-built td-builder (asserted below). No realize
-  # here — the daemon does that. The canonical /gnu/store .drv path lands on stderr ($sd/err),
-  # which the corpus gate's self-discrimination leg greps.
-  if env -i HOME="$sd" TMPDIR="$sd/tmp" PATH="$CU/bin" \
-       TD_BUILDER_PATH="$TD_BUILDER_PATH" TD_BUILDER_STORE="$TD_BUILDER_STORE" TD_BUILDER_DB="$TD_BUILDER_DB" \
-       "$TB" assemble-recipe \
-       "$sd/recipe.json" "$_lock" "$sd/b" > "$sd/bout" 2>"$sd/err"; then :; \
-  else echo "FAIL: assemble-recipe $_spec (guix/Guile off PATH):" >&2; tail -20 "$sd/err" >&2; return 1; fi
-  _drvf=`"$TB" text extract-prefix 'DRV=' "$sd/bout"`
-  test -n "$_drvf" && [ -f "$_drvf" ] || { echo "FAIL: assemble-recipe produced no .drv for $_spec" >&2; cat "$sd/bout" "$sd/err" >&2; return 1; }
-  # [DURABLE structural, brick 3] the assembled drv's builder is the td-bootstrapped stage0,
-  # NOT the guix-built td-builder. Non-vacuous: TD_BUILDER_PATH must be the stage0 placement.
-  test -n "$TD_BUILDER_PATH" || { echo "FAIL: TD_BUILDER_PATH unset — load_stage0 did not place a stage0 builder" >&2; return 1; }
-  "$TB" text contains "$TD_BUILDER_PATH/bin/td-builder" "$_drvf" \
-    || { echo "FAIL: $_spec .drv builder is not the stage0 $TD_BUILDER_PATH — built by the wrong td-builder?" >&2; return 1; }
-  # (2) SUBMIT to the shared daemon, carrying the SEED STORE DIR (content-scanned for the
-  # input closure — #267 retired the /var/guix/db read) + the per-request builder override
-  # (BP BS BD) so the daemon stages THIS worktree's inputs + stage0 builder. Reply:
-  # OK <canon> <host> <hit|built>.
-  _resp=`"$TB" daemon-request "$TD_DAEMON_SOCKET" "$_drvf /gnu/store $TD_BUILDER_PATH $TD_BUILDER_STORE $TD_BUILDER_DB"` \
-    || { echo "FAIL: $_spec daemon build failed ($_resp) — see the daemon log" >&2; return 1; }
-  case "$_resp" in "OK "*) : ;; *) echo "FAIL: $_spec daemon build not OK: $_resp" >&2; return 1 ;; esac
-  # shellcheck disable=SC2086 -- split the OK <canon> <host> <hit|built> reply into fields
-  set -- $_resp
-  out="$2"; ns="$3"
-  test -n "$out" && [ -n "$ns" ] || { echo "FAIL: $_spec daemon reply malformed: $_resp" >&2; return 1; }
-  if [ "${4:-}" = hit ]; then hit=1; else hit=; fi
-}
-
-# cached_check SPEC — prove reproducibility, memoized: skip the daemon repro rebuild only when
-# a prior check verified THIS EXACT output (the sentinel records the verified output path, so
-# a cross-worktree daemon-store HIT for a different drv cannot reuse a stale verdict — the
-# shared store made a bare present/absent sentinel unsafe). Otherwise submit a CHECK to the
-# SAME shared daemon (so the repro rebuild ALSO counts against the machine-wide budget instead
-# of re-oversubscribing) and record the verified output. The CHECK verb reuses the build the
-# daemon already realized as the first of the two independent builds and rebuilds only once
-# more, so a check costs ONE build, not two. `out` is set by the preceding cached_build in the
-# same shell.
-cached_check() {
-  _spec="$1"
-  : "${TD_DAEMON_SOCKET:?the shared build daemon must be running (TD_DAEMON_SOCKET unset)}"
-  if [ -n "$hit" ] && [ -n "${out:-}" ] && [ "`cat "$sd/b/verified-reproducible" 2>/dev/null`" = "$out" ]; then
-    echo "  [DURABLE repro] CACHED: $_spec output $out previously verified reproducible — daemon repro rebuild skipped (verdict memoized)"
-    return 0
-  fi
-  _drvf=`ls "$sd/b/"*.drv 2>/dev/null | head -1`
-  test -n "$_drvf" || { echo "FAIL: no assembled .drv for $_spec" >&2; return 1; }
-  _resp=`"$TB" daemon-request "$TD_DAEMON_SOCKET" "CHECK $_drvf /gnu/store $TD_BUILDER_PATH $TD_BUILDER_STORE $TD_BUILDER_DB"` \
-    || { echo "FAIL: $_spec NOT reproducible (daemon CHECK: $_resp) — see the daemon log" >&2; return 1; }
-  case "$_resp" in "OK "*) : ;; *) echo "FAIL: $_spec NOT reproducible: $_resp" >&2; return 1 ;; esac
-  printf '%s\n' "${out:-verified}" > "$sd/b/verified-reproducible"
-  echo "  [DURABLE repro] the td build daemon agrees $_spec is reproducible (a fresh rebuild is NAR-equal to the build it already realized)"
 }
 
 # cached_clean — drop this spec's transient files, KEEP $sd/b (the cache).

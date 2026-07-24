@@ -30,7 +30,6 @@ pub fn gate() -> GateDef {
         needs: &[],
         build_gate: false,
         specs: &[],
-        inputs: &[],
         non_blocking: false,
         script: r##"
 echo ">> bootstrap-seed: the structured Rust seed recipe builds the first stage0 artifacts with guix off env — self-reproducing, working, reproducible (source-bootstrap brick 0)"

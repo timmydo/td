@@ -43,7 +43,6 @@ pub fn gate() -> GateDef {
         needs: &[],
         build_gate: false,
         specs: &[],
-        inputs: &[],
         non_blocking: false,
         script: "",
     }

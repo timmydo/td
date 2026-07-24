@@ -17,7 +17,7 @@
 //! a MISS adds the ~45-min native build, from-seed adds the ~98-min cross build). NOT a BUILD_GATE.
 //! The self-hosting assertion is owned by the `gcc-x86-64-self-test` recipe.
 
-use crate::gates::{ArtifactInput, GateDef, InputKind, Pool};
+use crate::gates::{GateDef, Pool};
 
 pub fn gate() -> GateDef {
     GateDef {
@@ -26,14 +26,6 @@ pub fn gate() -> GateDef {
         needs: &[],
         build_gate: false,
         specs: &[],
-        inputs: &[ArtifactInput {
-            name: "bash-static",
-            kind: InputKind::ClosureMember {
-                lock: "tests/td-subst.lock",
-                root_stem: "bash",
-                member_stem: "bash-static",
-            },
-        }],
         non_blocking: false,
         script: r##"
 echo ">> recipe-check gcc-x86-64-self-test: rebuild gcc with the native recipe output and assert self-hosting"

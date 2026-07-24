@@ -12,14 +12,12 @@
 //!      (`provision_userland`) — host tools are forbidden, and the loop fails
 //!      CLOSED (exit `EXIT_UNPROVISIONED`) while the bootstrap graph still
 //!      declares scaffolding the chain has not built (re #469),
-//!   4. the warm prelude (subst store, source/crate warms, build daemon),
+//!   4. the warm prelude (subst store, source/crate warms),
 //!   5. the machine-wide slot dir, and
 //!   6. the sandboxed gate run: TB host-sandbox --expose-cwd --no-daemon
-//!      --store-item ITEM… --store-item-at SRC DEST… -- TB gate-run. The
-//!      sandbox mounts NO store directory: only the loop's declared inputs —
-//!      the seed-lock closure (`loop_store_items`) at its own paths and the
-//!      td-built userland at /td/store — each bound read-only, the drv build
-//!      jail's input-only model.
+//!      --store-item-at SRC DEST… -- TB gate-run. The sandbox mounts NO store
+//!      directory: only the loop's declared inputs — the td-built userland at
+//!      /td/store — each bound read-only, the drv build jail's input-only model.
 //!
 //! (The host-guix == pinned-channel integrity guard that used to run `guix
 //! describe` was removed in #406 — it only warned on drift, so dropping it is
@@ -45,6 +43,42 @@ fn fatal(msg: &str) -> String {
 /// (the coupling that broke twice — #268, then #315). EX_UNAVAILABLE from
 /// sysexits(3): "service unavailable", i.e. this host cannot run the loop.
 pub const EXIT_UNPROVISIONED: i32 = 69;
+
+/// The error-string half of the same signal: a control-plane routine (a gate
+/// body, a `provision-*`/`stage0-place` verb) prefixes its `Err` with this when
+/// the failure is a toolchain PROVISIONING gap — no rust/cc reachable in this
+/// jail — rather than a code regression. The verb / gate-body CLI maps a
+/// so-tagged error to `EXIT_UNPROVISIONED` so gate-run tolerates it
+/// (Unprovisioned, not RED); the host `cargo-test` preflight is the real per-PR
+/// enforcement (re #469).
+pub(crate) const UNPROVISIONED_TAG: &str = "UNPROVISIONED: ";
+
+/// The stderr LOG token every `EXIT_UNPROVISIONED` exit prints (see
+/// [`unprovisioned_exit`]). gate-run reads a finished gate's captured log and
+/// tolerates a 69 as Unprovisioned ONLY when this exact token is present — proof
+/// the 69 came from td's own provisioning path, not a coincidental
+/// EX_UNAVAILABLE from an unrelated tool or an accidental `exit 69`. Distinctive
+/// on purpose so it never collides with build-log noise (Codex review, re #469).
+pub(crate) const UNPROVISIONED_SENTINEL: &str = "[td-unprovisioned-69:re#469]";
+
+/// The stable stdout/stderr token the gate runner prints when a run finishes
+/// GREEN but with ≥1 gate SKIPPED as Unprovisioned. `td-builder daily` greps its
+/// heavy/system leg log for this: a leg that exited 0 yet carries this token did
+/// NOT run every gate, so it is not a full-suite proof — daily records it PARTIAL
+/// and WITHHOLDS `.td-last-green` + substitute publication (re #469). A distinct,
+/// whole-suite token (not the per-gate [`UNPROVISIONED_SENTINEL`], and a STABLE
+/// machine signal rather than FATAL prose — the daily coupling that broke twice,
+/// #268 then #315, is exactly what a stable token avoids).
+pub(crate) const GATES_SKIPPED_SENTINEL: &str = "[td-gates-skipped:re#469]";
+
+/// Print [`UNPROVISIONED_SENTINEL`] to stderr, then return the process exit code
+/// for a toolchain-provisioning gap. EVERY `EXIT_UNPROVISIONED` exit funnels
+/// through here so the log token gate-run keys on and the exit code can never
+/// drift apart.
+pub(crate) fn unprovisioned_exit() -> ExitCode {
+    eprintln!("{UNPROVISIONED_SENTINEL}");
+    ExitCode::from(EXIT_UNPROVISIONED as u8)
+}
 
 /// The two ways a check can end unhappily. `Unprovisioned` is a RUNNER-setup gap
 /// (nothing ran — not a code regression); `Fatal` is every other hard error.
@@ -139,9 +173,7 @@ fn provision_stage0(root: &Path) -> Result<String, String> {
 /// must appear inside the sandbox (the recipe graph builds everything with
 /// `TD_STORE_DIR=/td/store`). The loop never mounts a store DIRECTORY and
 /// never resolves a tool from the host: its userland is td-BUILT
-/// (`LOOP_USERLAND_STEMS`), and the only other store bytes it exposes are the
-/// DECLARED seed-lock closures (`seed_lock_roots`) — each bound read-only,
-/// item by item, at its own path.
+/// (`LOOP_USERLAND_STEMS`), each item bound read-only at its own /td/store path.
 const TD_STORE_DIR: &str = "/td/store";
 
 /// The td-built loop userland: the recipe stems whose outputs provide every
@@ -535,169 +567,6 @@ fn copy_tree_preserving(src: &Path, dst: &Path) -> Result<(), String> {
     }
     std::fs::copy(src, dst).map_err(|e| format!("copy {}: {e}", src.display()))?;
     Ok(())
-}
-
-/// The store paths of the SEED locks that gate bodies resolve INSIDE the
-/// sandbox (format `NAME <store-path>`): tests/td-builder-rust.lock
-/// (tools/provision-{rust,cc}.sh branch 2 execs its rust/cc paths directly)
-/// and tests/td-subst.lock (td-subst's pinned build closure) — both serve the
-/// pinned RUST toolchain seed (AGENTS.md's allowed control plane), never a
-/// bootstrap build: recipe rungs admit NO host executable at all (planning
-/// rejects the provenance, re #469). Every lock path present on the host is a
-/// DECLARED loop input and joins the closure roots. An absent path is skipped
-/// — the consumers fall through / fail loudly the same way they do today on a
-/// host without it.
-pub(crate) fn seed_lock_roots(root: &Path) -> Vec<String> {
-    let mut roots: Vec<String> = Vec::new();
-    for lock in ["tests/td-builder-rust.lock", "tests/td-subst.lock"] {
-        let Ok(content) = std::fs::read_to_string(root.join(lock)) else {
-            continue;
-        };
-        for p in parse_seed_lock(&content) {
-            if Path::new(&p).exists() && !roots.contains(&p) {
-                roots.push(p);
-            }
-        }
-    }
-    roots
-}
-
-/// Parse the seed lock's `NAME <store-path>` lines (comments/blank skipped)
-/// into the deduped path list. Only absolute paths qualify — the lock is the
-/// DECLARED seed, whatever store its paths live in; there is no hardcoded
-/// prefix to check against.
-fn parse_seed_lock(content: &str) -> Vec<String> {
-    let mut paths: Vec<String> = Vec::new();
-    for line in content.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        let Some(path) = line.split_whitespace().nth(1) else {
-            continue;
-        };
-        if path.starts_with('/') && !paths.iter().any(|p| p == path) {
-            paths.push(path.to_string());
-        }
-    }
-    paths
-}
-
-/// The seed store DIRECTORY, DERIVED from the declared lock paths (the unique
-/// parent of the lock items) — never a hardcoded prefix. This is the candidate
-/// dir the closure scan indexes and the build daemon's default seed dir; on a
-/// guix host the locks point under /gnu/store so that is what derives, and a
-/// re-captured lock on another host derives that host's store with no code
-/// change. Locks spanning several parents keep the FIRST (warned) — the seed
-/// is one store by construction.
-fn seed_store_dir(roots: &[String]) -> Option<String> {
-    let mut dirs: Vec<String> = Vec::new();
-    for r in roots {
-        if let Some(parent) = Path::new(r).parent() {
-            let d = parent.display().to_string();
-            if !d.is_empty() && d != "/" && !dirs.contains(&d) {
-                dirs.push(d);
-            }
-        }
-    }
-    if dirs.len() > 1 {
-        eprintln!(
-            "td-builder check: WARNING: seed locks span {} store dirs ({}); scanning only \
-             the first",
-            dirs.len(),
-            dirs.join(" ")
-        );
-    }
-    dirs.into_iter().next()
-}
-
-/// Everything the loop sandbox mounts from the SEED store — the full declared
-/// input set, computed so the sandbox never mounts a store DIRECTORY, only
-/// declared items (the td-built userland is separate — `provision_userland`):
-///
-///   1. the runtime CLOSURE of `roots` (the seed locks' declared paths —
-///      see `seed_lock_roots`), and
-///   2. the closure of each `scan_files` binary: host-built ELF executables
-///      that RUN INSIDE the sandbox (the stage0 td-builder, the daily's stashed
-///      td-subst), whose libc/gcc-lib references are found by content-scanning
-///      the binary itself — declared, not assumed to coincide with (1).
-///
-/// The candidate store dir is DERIVED from the lock paths (`seed_store_dir`),
-/// never hardcoded. The closure walk is the same no-DB content scan
-/// realize_drv uses (`scan_candidate_index` + `scan_closure_hybrid`; never
-/// /var/guix), and it is RECOMPUTED FROM THE SCAN ON EVERY RUN: the
-/// loop-closure CACHE is deleted (re #469, round-7 review). Its hit path
-/// accepted any superset of items whose extras merely looked like top-level
-/// seed-store children — path-shape validation, not proof of membership in
-/// the actual reference closure — so stale or edited host state could add
-/// undeclared executable store items to the next loop sandbox. This list
-/// names the exact `--store-item` binds of the run: nothing but the live
-/// scan may produce it. Until an audited seed carries an explicit closure
-/// manifest, the recompute — O(seed-store bytes), once per `check`
-/// invocation, small next to the gate ladder it admits — is the price of
-/// that authority. Returns the sorted item paths (roots included).
-fn loop_store_items(
-    root: &Path,
-    roots: &[String],
-    scan_files: &[String],
-) -> Result<Vec<String>, String> {
-    let Some(store_dir) = seed_store_dir(roots) else {
-        // No declared seed at all: nothing to scan, nothing to bind. The
-        // sandbox still gets the td-built userland; anything that needed the
-        // seed (a dynamically linked stage0) fails loudly inside.
-        eprintln!(
-            "td-builder check: WARNING: no seed-lock paths exist on this host — binding \
-             no seed store items (tests/td-*.lock)"
-        );
-        return Ok(Vec::new());
-    };
-    let store_dir = store_dir.as_str();
-    // Sweep the RETIRED cache locations unconditionally, so a poisoned or stale
-    // leftover can never be re-read by an older binary: the pre-round-5 in-tree
-    // file (inside the tree every gate sandbox mounts read-write) and the
-    // round-6 per-worktree file under the loop-userland dir.
-    let _ = std::fs::remove_file(root.join(".td-build-cache/loop-closure.list"));
-    if let Ok(dir) = loop_userland_dir() {
-        let mut h = crate::sha256::Sha256::new();
-        h.update(root.display().to_string().as_bytes());
-        let key = crate::sha256::to_base16(&h.finalize());
-        let key = key.get(..16).unwrap_or(&key);
-        let _ = std::fs::remove_file(dir.join(format!("loop-closure.{key}.list")));
-    }
-    let (candidates, on_disk) =
-        crate::scan_candidate_index(&[store_dir.to_string()], store_dir)?;
-    let mut scanner = crate::scan::Scanner::new(&candidates).map_err(|e| e.to_string())?;
-    let mut all_roots: std::collections::BTreeSet<String> = roots.iter().cloned().collect();
-    for f in scan_files {
-        scanner.reset();
-        crate::nar::write_nar(&mut scanner, Path::new(f))
-            .map_err(|e| format!("content-scan {f}: {e}"))?;
-        all_roots.extend(scanner.refs());
-    }
-    eprintln!(
-        "td-builder check: content-scanning the loop's seed-lock closure ({} roots; \
-         recomputed every run — no closure cache, re #469)",
-        all_roots.len()
-    );
-    let empty = std::collections::HashMap::new();
-    let root_list: Vec<String> = all_roots.iter().cloned().collect();
-    let seen = crate::scan_closure_hybrid(&mut scanner, &on_disk, &empty, &root_list)?;
-    Ok(seen.into_iter().collect())
-}
-
-/// The host-built binaries that RUN INSIDE the loop sandbox and whose store
-/// references must therefore be closure roots: the stage0 td-builder (gate-run
-/// itself) and, when the substitute store is usable, its stashed td-subst (the
-/// toolchain gates exec it). `check` and `check-rung` share this so the
-/// closure cache stays stable across both.
-fn loop_scan_files(root: &Path, tb: &str) -> Vec<String> {
-    let mut files = vec![tb.to_string()];
-    for (k, v) in subst_env(root) {
-        if k == "TD_SUBST_BIN" {
-            files.push(v);
-        }
-    }
-    files
 }
 
 fn native_applet_path(root: &Path, provider: &str) -> Result<String, String> {
@@ -1127,20 +996,25 @@ fn find_in_frags(frags: &str, bin: &str) -> Option<PathBuf> {
 /// PROC-MACROS that must compile for the host compiler, so `+crt-static` cannot
 /// go in a global RUSTFLAGS (it would try to statically link the proc-macro
 /// dylibs — "does not support these crate types"). Instead pass `--target
-/// <host-triple>` and set the PER-TARGET rustflags env: cargo then applies the
-/// static flags to the final binary + its normal deps only, leaving host-kind
-/// build scripts / proc-macros dynamic. Ambient RUSTFLAGS/CARGO_ENCODED_RUSTFLAGS
-/// are removed so they cannot win over the per-target var (cargo's flag-source
-/// precedence) and silently defeat the static flags. The compiler is pinned too:
-/// RUSTC to the provisioned rustc (the one the triple was read from) and
+/// x86_64-unknown-linux-musl` and set the static flags via CARGO_ENCODED_RUSTFLAGS
+/// ([`musl_static_encoded_rustflags`]): with `--target` set they apply to the
+/// MUSL_TARGET binary + its normal deps ONLY, leaving host-kind build scripts /
+/// proc-macros dynamic. The MUSL_TARGET link uses rustc's bundled `rust-lld` and
+/// musl's self-contained `libc.a` (no external glibc, no linker-glibc matching), so
+/// the result is fully static with an EMPTY runtime closure. CARGO_ENCODED_RUSTFLAGS
+/// is cargo's HIGHEST-precedence flag source — the one form a guix cargo wrapper
+/// (which re-injects `RUSTFLAGS="… -C linker=<gcc> -rpath …"` at runtime) cannot
+/// outrank; a per-target CARGO_TARGET_<musl>_RUSTFLAGS would lose to that global
+/// RUSTFLAGS, dropping `rust-lld` and baking a mutable guix-home DT_RUNPATH that
+/// fails assert_static. The compiler is pinned too: RUSTC to the provisioned rustc and
 /// RUSTC_WRAPPER/RUSTC_WORKSPACE_WRAPPER removed, so no ambient rustc or wrapper
-/// interposes on the control-plane build. ring's `cc-rs` build script needs a `cc`
-/// (CC/HOST_CC/TARGET_CC and the per-target CC_<triple> forms → the gcc-toolchain's
-/// `gcc`, AR alongside — every form cc-rs consults is pinned so an ambient one
-/// cannot outrank them), and the rustc LINKER is pinned to that SAME gcc so the
-/// link uses the compiler matched with the static glibc — else a mismatched-glibc
-/// binary links + passes assert_static yet SIGSEGVs at startup (this path has no
-/// smoke-run to catch it).
+/// interposes on the control-plane build. ring's `cc-rs` build script compiles
+/// ring's C/asm FOR the musl target, so its CC/AR env forms (CC/HOST_CC/TARGET_CC
+/// and the per-target CC_<musl> spellings → the toolchain's `gcc`, AR alongside —
+/// every form cc-rs consults is pinned so an ambient one cannot outrank them). The
+/// HOST build scripts / proc-macros still link with the provisioned cc via
+/// CARGO_TARGET_<host-triple>_LINKER; `cc` may be absent by that name (a guix
+/// profile exposes only `gcc`), so it is pinned explicitly.
 fn host_cargo_bin(root: &Path, dir: &str, bin: &str, deadline: Option<Instant>) -> Option<PathBuf> {
     let penv = crate::stage0::ProvisionEnv::from_env(root);
     let rustpath = match crate::stage0::provision_rust(&penv) {
@@ -1154,15 +1028,6 @@ fn host_cargo_bin(root: &Path, dir: &str, bin: &str, deadline: Option<Instant>) 
         Ok(p) => p,
         Err(e) => {
             eprintln!("td-builder check: static {bin}: no C toolchain ({e}) — skipping host build");
-            return None;
-        }
-    };
-    let glibc_static = match crate::stage0::provision_glibc_static(&penv) {
-        Ok(g) => g,
-        Err(e) => {
-            eprintln!(
-                "td-builder check: static {bin}: no matched static glibc ({e}) — skipping host build"
-            );
             return None;
         }
     };
@@ -1183,49 +1048,37 @@ fn host_cargo_bin(root: &Path, dir: &str, bin: &str, deadline: Option<Instant>) 
         return None;
     };
 
-    // Host target triple from `rustc -vV`'s `host:` line, and the matching
-    // per-target env-var suffix (`<TRIPLE>` uppercased with '-' → '_').
-    let vv = match Command::new(&rustc).arg("-vV").stdin(Stdio::null()).output() {
-        Ok(o) => o,
+    // Host triple (`rustc -vV`'s `host:` line): the triple cargo compiles the host
+    // build scripts / proc-macros for — those link with the provisioned cc.
+    let host_triple = match crate::stage0::rustc_host_triple(&rustc) {
+        Ok(t) => t,
         Err(e) => {
-            eprintln!("td-builder check: static {bin}: `rustc -vV` failed ({e}) — skipping host build");
+            eprintln!("td-builder check: static {bin}: {e} — skipping host build");
             return None;
         }
     };
-    let vv_text = String::from_utf8_lossy(&vv.stdout);
-    let Some(triple) = vv_text
-        .lines()
-        .find_map(|l| l.strip_prefix("host: "))
-        .map(str::trim)
-    else {
-        eprintln!("td-builder check: static {bin}: no `host:` line in `rustc -vV` — skipping host build");
-        return None;
-    };
-    let triple = triple.to_string();
-    // cargo normalizes BOTH `-` and `.` to `_` in the CARGO_TARGET_<triple>_* env
-    // var name (host triples are dot-free today, but match cargo's rule exactly).
-    let tvar = triple.to_uppercase().replace(['-', '.'], "_");
-    let target_flags_var = format!("CARGO_TARGET_{tvar}_RUSTFLAGS");
-    let target_linker_var = format!("CARGO_TARGET_{tvar}_LINKER");
-    // The rustc linker is pinned via target_linker_var below (not `-C linker` in
-    // the rustflags), so pass None here.
-    let rustflags = crate::stage0::static_rustflags(&glibc_static, None);
+    let musl = crate::stage0::MUSL_TARGET;
+    // The MUSL_TARGET binary gets the static flags (via CARGO_ENCODED_RUSTFLAGS —
+    // see the doc comment); the host build-script link gets the provisioned cc as
+    // its per-target linker.
+    let host_linker_var = crate::stage0::target_linker_var(&host_triple);
+    let encoded_rustflags = crate::stage0::musl_static_encoded_rustflags();
     // cc-rs (ring's C build) resolves the compiler/archiver from the FIRST of
     // several env forms, and the per-target-suffixed forms outrank the plain
-    // CC/HOST_CC/AR we set. Pin every form cc-rs consults to the matched
-    // toolchain so an ambient CC_<triple>/AR_<triple>/HOST_AR cannot slip a
-    // different compiler into a control-plane binary (review PR #534, Codex P2).
-    // cc-rs reads both the dash and underscore triple spellings.
-    let triple_us = triple.replace('-', "_");
-    let cc_target = format!("CC_{triple}");
-    let cc_target_us = format!("CC_{triple_us}");
-    let ar_target = format!("AR_{triple}");
-    let ar_target_us = format!("AR_{triple_us}");
+    // CC/HOST_CC/AR we set. ring's C compiles FOR the musl target, so pin every
+    // form cc-rs consults for that triple (both dash and underscore spellings) to
+    // the matched toolchain so an ambient CC_<triple>/AR_<triple>/HOST_AR cannot
+    // slip a different compiler into a control-plane binary (review PR #534).
+    let musl_us = musl.replace('-', "_");
+    let cc_target = format!("CC_{musl}");
+    let cc_target_us = format!("CC_{musl_us}");
+    let ar_target = format!("AR_{musl}");
+    let ar_target_us = format!("AR_{musl_us}");
     let ambient_path = std::env::var("PATH").unwrap_or_default();
     let new_path = format!("{rustpath}:{ccpath}:{ambient_path}");
 
     let child = Command::new(&cargo)
-        .args(["build", "--release", "--quiet", "--target", &triple])
+        .args(["build", "--release", "--quiet", "--target", musl])
         .current_dir(root.join(dir))
         .env("PATH", &new_path)
         // Pin the compiler itself: an inherited RUSTC would build with a
@@ -1247,10 +1100,8 @@ fn host_cargo_bin(root: &Path, dir: &str, bin: &str, deadline: Option<Instant>) 
         .env("TARGET_AR", &ar)
         .env(&ar_target, &ar)
         .env(&ar_target_us, &ar)
-        .env(&target_linker_var, &cc)
-        .env(&target_flags_var, &rustflags)
-        .env_remove("RUSTFLAGS")
-        .env_remove("CARGO_ENCODED_RUSTFLAGS")
+        .env(&host_linker_var, &cc)
+        .env("CARGO_ENCODED_RUSTFLAGS", &encoded_rustflags)
         .stdin(Stdio::null())
         .spawn();
     let mut child = match child {
@@ -1266,7 +1117,7 @@ fn host_cargo_bin(root: &Path, dir: &str, bin: &str, deadline: Option<Instant>) 
     let p = root
         .join(dir)
         .join("target")
-        .join(&triple)
+        .join(musl)
         .join("release")
         .join(bin);
     if !p.is_file() {
@@ -1622,36 +1473,10 @@ fn heavy_warms(root: &Path) {
     drain(&mut running);
 }
 
-/// Ensure ONE shared, persistent td build daemon is running for this host and
-/// return its Unix-socket PATH (native since #318 axis 2 — was
-/// tools/build-daemon-ensure.sh). Idempotent + concurrency-safe (an exclusive
-/// file lock serializes ensures): the FIRST caller starts the daemon; every
-/// later caller (any worktree, any agent) reuses it. This is how N agents on N
-/// worktrees SHARE one builder with ONE global budget — the machine-wide build
-/// limiter. The daemon realizes drvs submitted over the socket (`td-builder
-/// daemon`), bounded to TD_BUILD_JOBS concurrent builds; the per-drv builder
-/// override travels with each request, so one shared daemon serves every
-/// worktree.
-///
-/// The daemon BINARY is the provisioned stage0 `tb` (TD_DAEMON_BUILDER
-/// overrides) — the same deterministic current-tree build the loop's client
-/// (cache-lib) resolves, so the client and the serving daemon always speak the
-/// same request grammar. The socket/pid/log are keyed by the binary's CONTENT
-/// hash: a daemon started by a different (e.g. older-grammar) td-builder lives
-/// on a different socket, so an ensure never reuses a stale-grammar daemon;
-/// old-binary daemons idle out on their own sockets.
-///
-/// Env: TD_DAEMON_DIR (shared dir, default ~/.td/build-daemon),
-/// TD_DAEMON_BUILDER (daemon binary override), TD_DAEMON_SEED_DIR (the
-/// start-time seed store DIR, default: derived from the declared seed-lock
-/// paths (`seed_store_dir`) — content-scanned host-side for the
-/// input closure, #267; only bare-drv requests use it), TD_BUILD_JOBS (the
-/// global budget — inherited by the spawned daemon), TD_NICE (nice level for
-/// the daemon + its build children, default 10).
-/// The daemon's runtime dir (sockets, pid files, the blessed seed-closure db):
-/// `TD_DAEMON_DIR` or `$HOME/.td/build-daemon`. Shared by `ensure_build_daemon`
-/// (which creates state here) and the daemon/child verbs (which RE-DERIVE the
-/// same paths rather than trusting an argv, re #469 round-8).
+/// The daemon's runtime dir (sockets, pid files, lineage records):
+/// `TD_DAEMON_DIR` or `$HOME/.td/build-daemon`. The daemon/child verbs and the
+/// stage0 lineage record RE-DERIVE their paths here rather than trusting an
+/// argv (re #469 round-8).
 pub(crate) fn daemon_runtime_dir() -> Result<PathBuf, String> {
     match std::env::var("TD_DAEMON_DIR") {
         Ok(v) if !v.trim().is_empty() => Ok(PathBuf::from(v)),
@@ -1662,254 +1487,12 @@ pub(crate) fn daemon_runtime_dir() -> Result<PathBuf, String> {
     }
 }
 
-/// The DERIVED path of the blessed seed-closure db for (repo ROOT, SEED-DIR):
-/// keyed by the repo's own checked-in seed-lock declarations, never by a
-/// caller-supplied path. This is the round-8 origin-authentication fix for the
-/// `BlessedSeedClosure` intake: the daemon and its `daemon-build`/`daemon-check`
-/// children re-derive the db location from the same repo-declared inputs
-/// `ensure_build_daemon` blessed under, so NO public interface accepts a
-/// caller-selected db path as manifest authority — a raw path can no longer
-/// become a typed origin. (A same-user writer can still forge the file at the
-/// derived location; that trust-domain limit is the same one recorded on the
-/// receipt layer, and a daemon-owned provenance db remains the follow-on,
-/// re #472.) `None` when the repo declares no seed-lock roots — there is
-/// nothing to bless, and strict staging fails closed on unvouched items.
-pub(crate) fn blessed_seed_db_path(
-    root: &Path,
-    seed_dir: &str,
-) -> Result<Option<PathBuf>, String> {
-    let roots = seed_lock_roots(root);
-    if roots.is_empty() {
-        return Ok(None);
-    }
-    let mut h = crate::sha256::Sha256::new();
-    h.update(seed_dir.as_bytes());
-    for r in &roots {
-        h.update(b"\n");
-        h.update(r.as_bytes());
-    }
-    let bfull = crate::sha256::to_base16(&h.finalize());
-    let bkey: String = bfull.chars().take(16).collect();
-    Ok(Some(
-        daemon_runtime_dir()?.join(format!("seed-bless.{bkey}.db")),
-    ))
-}
-
-/// The host seed-store DIRECTORY every derived-bless consumer keys on:
-/// `TD_DAEMON_SEED_DIR` (operator override) or the unique parent of the
-/// repo's declared seed-lock paths. ONE derivation shared by the blesser
-/// (`ensure_seed_bless`), the daemon (`ensure_build_daemon`), and the ladder
-/// entrances' derived-db lookup (`derived_bless_db_auto` in main) — the
-/// bless-db key includes this string, so every consumer must derive it the
-/// same way or fail closed on a db that is not there.
-pub(crate) fn daemon_seed_dir(root: &Path) -> Option<String> {
-    match std::env::var("TD_DAEMON_SEED_DIR") {
-        Ok(v) if !v.trim().is_empty() => Some(v),
-        _ => seed_store_dir(&seed_lock_roots(root)),
-    }
-}
-
-/// BLESS the declared seed closure once per root set (re #469): strict
-/// staging manifests are unconditional, so every build that stages the
-/// host-provisioned toolchain — the daemon's children AND the ladder's
-/// `build-plan`/`build-recipe`, whose control-plane builder carries the §5
-/// seed's glibc/gcc-lib in its runtime closure — needs a td-owned db
-/// vouching that closure. The `seed-bless` verb derives the roots ITSELF
-/// from the repo's checked-in seed-lock declarations (cwd = root below) —
-/// no caller-supplied roots file exists to tamper with. The db lives at the
-/// DERIVED `blessed_seed_db_path` location, keyed by those declared roots
-/// (store paths embed content hashes, so a pin bump derives a new key and
-/// re-blesses); an existing db is REUSED, never rewritten — re-blessing
-/// would re-trust whatever is currently on disk, the existence-as-authority
-/// hole the manifest closes. Never handed around: every consumer RE-DERIVES
-/// the path from the same repo-declared inputs (re #469 round-8 — a
-/// caller-selected db path is no longer an intake). Runs in the check
-/// prelude BEFORE userland provisioning (whose recipe builds already need
-/// the authority), and again from `ensure_build_daemon` (idempotent).
-pub(crate) fn ensure_seed_bless(root: &Path, tb: &str) -> Result<(), String> {
-    let Some(seed_dir) = daemon_seed_dir(root) else {
-        eprintln!(
-            "td-builder check: WARNING: no seed store dir (no declared seed-lock roots and \
-             TD_DAEMON_SEED_DIR unset) — nothing to bless (re #469)"
-        );
-        return Ok(());
-    };
-    match blessed_seed_db_path(root, &seed_dir)? {
-        None => {
-            eprintln!(
-                "td-builder check: WARNING: no declared seed-lock roots to bless — strict \
-                 builds will red on unvouched closure items (re #469)"
-            );
-        }
-        Some(db) => {
-            if !db.exists() {
-                eprintln!(
-                    "td-builder check: blessing the declared seed closure into {} — \
-                     a one-time hash of the pinned toolchain (re #469)",
-                    db.display()
-                );
-                if let Some(parent) = db.parent() {
-                    std::fs::create_dir_all(parent)
-                        .map_err(|e| format!("mkdir {}: {e}", parent.display()))?;
-                }
-                // Pid-unique tmp + atomic rename: concurrent blessers (two
-                // agents' preludes) each write their own tmp of the SAME
-                // deterministic closure; whichever renames last wins with
-                // identical content, and no reader ever sees a partial db.
-                let tmp = db.with_extension(format!("db.tmp.{}", std::process::id()));
-                let out = Command::new(tb)
-                    .args(["seed-bless", &seed_dir])
-                    .arg(&tmp)
-                    .current_dir(root)
-                    .output()
-                    .map_err(|e| format!("spawn seed-bless: {e}"))?;
-                if !out.status.success() {
-                    let _ = std::fs::remove_file(&tmp);
-                    return Err(format!(
-                        "seed-bless failed: {}",
-                        String::from_utf8_lossy(&out.stderr)
-                    ));
-                }
-                std::fs::rename(&tmp, &db)
-                    .map_err(|e| format!("rename {} -> {}: {e}", tmp.display(), db.display()))?;
-            }
-        }
-    }
-    Ok(())
-}
-
-fn ensure_build_daemon(root: &Path, tb: &str) -> Result<String, String> {
-    let daemon_dir = daemon_runtime_dir()?;
-    let store = daemon_dir.join("store");
-    std::fs::create_dir_all(&store).map_err(|e| format!("mkdir {}: {e}", store.display()))?;
-    // Default seed store = DERIVED from the declared seed-lock paths, read
-    // HOST-SIDE by the daemon (never a hardcoded prefix; the loop SANDBOX
-    // never mounts it). A lock-less host must say where its seed lives.
-    let seed_dir = daemon_seed_dir(root).ok_or_else(|| {
-        s("no seed store dir: the seed locks name no existing paths and \
-           TD_DAEMON_SEED_DIR is unset")
-    })?;
-    let daemon_tb = match std::env::var("TD_DAEMON_BUILDER") {
-        Ok(v) if !v.trim().is_empty() && Path::new(&v).is_file() => v,
-        _ => tb.to_string(),
-    };
-
-    // Key the socket/pid/log by the daemon binary's CONTENT hash (grammar skew
-    // guard — see the doc comment).
-    let bytes = std::fs::read(&daemon_tb).map_err(|e| format!("read {daemon_tb}: {e}"))?;
-    let mut h = crate::sha256::Sha256::new();
-    h.update(&bytes);
-    let full = crate::sha256::to_base16(&h.finalize());
-    let key: String = full.chars().take(16).collect();
-    let sock = daemon_dir.join(format!("socket.{key}"));
-    let pid_f = daemon_dir.join(format!("daemon.{key}.pid"));
-    let log_f = daemon_dir.join(format!("daemon.{key}.log"));
-
-    // Serialize concurrent ensures so two agents never both start a daemon.
-    // The lock file is O_CLOEXEC (std default), so the spawned daemon does not
-    // inherit-and-hold it; it releases when this fn returns.
-    let lock = std::fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(false) // a lock handle only; its content is never written
-        .open(daemon_dir.join("daemon.lock"))
-        .map_err(|e| format!("open daemon.lock: {e}"))?;
-    lock.lock().map_err(|e| format!("lock daemon.lock: {e}"))?;
-
-    // Reuse a live daemon.
-    let pid_alive = |pf: &Path| -> bool {
-        std::fs::read_to_string(pf)
-            .ok()
-            .and_then(|t| t.trim().parse::<u32>().ok())
-            .is_some_and(|pid| Path::new(&format!("/proc/{pid}")).exists())
-    };
-    let is_socket = |p: &Path| -> bool {
-        use std::os::unix::fs::FileTypeExt as _;
-        std::fs::symlink_metadata(p)
-            .map(|m| m.file_type().is_socket())
-            .unwrap_or(false)
-    };
-    if pid_alive(&pid_f) && is_socket(&sock) {
-        return Ok(sock.display().to_string());
-    }
-
-    // The blessed seed closure must exist before this daemon's children build
-    // (idempotent — `ensure_seed_bless` reuses an existing db; the prelude
-    // normally blessed already, but the daemon path stays self-sufficient).
-    ensure_seed_bless(root, &daemon_tb)?;
-
-    // Start a fresh daemon, detached in its OWN process group so it outlives
-    // this check AND survives the terminal's ^C/hangup signals (the machine-
-    // wide limiter must persist across checks — the shell's `nohup` role).
-    // nice/ionice it so its build children (the corpus builds — the real
-    // CPU/IO) yield to interactive work; the global budget bounds how MANY run
-    // at once. TD_BUILD_JOBS reaches the daemon by plain env inheritance.
-    let log =
-        std::fs::File::create(&log_f).map_err(|e| format!("create {}: {e}", log_f.display()))?;
-    let log2 = log.try_clone().map_err(|e| format!("clone log fd: {e}"))?;
-    let _ = std::fs::remove_file(&sock);
-    let tdnice = std::env::var("TD_NICE").unwrap_or_else(|_| s("10"));
-    let mut argv: Vec<String> = Vec::new();
-    if let Some(nice) = find_in_path("nice") {
-        argv.extend([nice.display().to_string(), s("-n"), tdnice]);
-        if let Some(ionice) = find_in_path("ionice") {
-            argv.extend([ionice.display().to_string(), s("-c2"), s("-n7")]);
-        }
-    }
-    argv.extend([
-        daemon_tb,
-        s("daemon"),
-        sock.display().to_string(),
-        seed_dir,
-        store.display().to_string(),
-    ]);
-    // The blessed seed-closure db is NOT an argument: the daemon's build
-    // children re-derive its location from the repo's own seed-lock
-    // declarations (`blessed_seed_db_path` over their cwd = root, spawned
-    // below with `current_dir(root)`), so no argv or env channel can add
-    // manifest authority (re #469 round-8 origin authentication).
-    let (head, rest) = argv
-        .split_first()
-        .ok_or_else(|| s("internal: empty daemon argv"))?;
-    let mut cmd = Command::new(head);
-    cmd.args(rest)
-        .current_dir(root)
-        .stdin(Stdio::null())
-        .stdout(Stdio::from(log))
-        .stderr(Stdio::from(log2));
-    {
-        use std::os::unix::process::CommandExt as _;
-        cmd.process_group(0);
-    }
-    let mut child = cmd
-        .spawn()
-        .map_err(|e| format!("spawn the build daemon: {e}"))?;
-    let _ = std::fs::write(&pid_f, format!("{}\n", child.id()));
-
-    // Wait for it to bind the socket.
-    for _ in 0..100 {
-        if is_socket(&sock) {
-            return Ok(sock.display().to_string());
-        }
-        if child.try_wait().ok().flatten().is_some() {
-            let tail = std::fs::read_to_string(&log_f).unwrap_or_default();
-            return Err(format!("the daemon exited before binding:\n{tail}"));
-        }
-        std::thread::sleep(std::time::Duration::from_millis(100));
-    }
-    let tail = std::fs::read_to_string(&log_f).unwrap_or_default();
-    Err(format!(
-        "the daemon did not bind {}:\n{tail}",
-        sock.display()
-    ))
-}
-
 pub fn cli(args: &[String]) -> ExitCode {
     match run(args) {
         Ok(code) => ExitCode::from(code.clamp(0, 255) as u8),
         Err(e @ CheckError::Unprovisioned(_)) => {
             eprintln!("{e}");
-            ExitCode::from(EXIT_UNPROVISIONED as u8)
+            unprovisioned_exit()
         }
         Err(e) => {
             eprintln!("{e}");
@@ -1980,12 +1563,6 @@ fn run(args: &[String]) -> Result<i32, CheckError> {
     });
 
     let tb = provision_stage0(&root)?;
-    // Bless the declared seed closure BEFORE any recipe build: userland
-    // provisioning realizes the chain through build-plan, whose staging
-    // manifest needs the blessed db to vouch the control-plane builder's
-    // host-seed runtime closure (glibc/gcc-lib) — blessing only at daemon
-    // ensure time (after userland) deadlocked a cold host (re #469 round-8).
-    ensure_seed_bless(&root, &tb)?;
     let ul = provision_userland(&root)?;
     let toolchain = loop_path_with_native_applets(&root, &tb, &ul.path).map_err(|e| {
         CheckError::Fatal(fatal(&format!(
@@ -2034,25 +1611,12 @@ fn run(args: &[String]) -> Result<i32, CheckError> {
 
     if heavy_warm {
         heavy_warms(&root);
-        // The shared build daemon: the loop's single machine-wide BUILD limiter
-        // (host-side; it must outlive this check). Only the heavy tier needs it.
-        match ensure_build_daemon(&root, &tb) {
-            Ok(sock) => child_envs.push((s("TD_DAEMON_SOCKET"), sock)),
-            Err(e) => eprintln!(
-                "td-builder check: WARNING: could not start the shared build daemon \
-                 ({e}); corpus gates will fail loudly"
-            ),
-        }
     }
 
     // Per-gate cgroup memory limits (issue #328): when the host delegates a
     // writable cgroup-v2 subtree, gate-run gives every gate a child cgroup
     // with memory.max/high — the escape-proof successor to the RSS watchdog
-    // (which stays the fallback everywhere else). Deliberately AFTER the
-    // daemon warm: the self-move happens here, so the detached persistent
-    // build daemon (started above, outliving this check) is NOT captured in
-    // this run's host leaf (review finding — it would pin the run dir forever
-    // and a recycled pid would then silently lose cgroup mode on EEXIST).
+    // (which stays the fallback everywhere else).
     let cgroup_run = cgroup_delegated_root().and_then(|r| cgroup_run_dir(&r));
     match &cgroup_run {
         Some(dir) => {
@@ -2101,25 +1665,13 @@ fn run(args: &[String]) -> Result<i32, CheckError> {
     }
     // The sandbox mounts NO store directory and NO host tool — only the loop's
     // declared input ITEMS, each bound read-only (the drv build jail's
-    // input-only model): the td-BUILT userland at its /td/store paths, the
-    // seed locks' declared closures, and the closures of the host-built
-    // binaries that run inside (the stage0 td-builder; the stashed td-subst
-    // when exposed).
-    let roots = seed_lock_roots(&root);
-    let items = loop_store_items(&root, &roots, &loop_scan_files(&root, &tb)).map_err(|e| {
-        fatal(&format!(
-            "could not compute the loop sandbox's store-item inputs ({e})"
-        ))
-    })?;
+    // input-only model): the td-BUILT userland at its /td/store paths.
     argv.extend([
         tb.clone(),
         s("host-sandbox"),
         s("--expose-cwd"),
         s("--no-daemon"),
     ]);
-    for it in &items {
-        argv.extend([s("--store-item"), it.clone()]);
-    }
     for (src, dest) in &ul.items {
         argv.extend([s("--store-item-at"), src.clone(), dest.clone()]);
     }
@@ -2208,10 +1760,7 @@ fn check_rung(args: &[String]) -> Result<i32, String> {
     let toolchain = loop_path_with_native_applets(&root, &tb, &ul.path)
         .map_err(|e| format!("check-rung: FATAL: could not provision loop native applets ({e})"))?;
     // The same input-only store exposure as the loop (per-item binds, no store
-    // directory mounted; same scan-file set, recomputed from the live scan).
-    let roots = seed_lock_roots(&root);
-    let items = loop_store_items(&root, &roots, &loop_scan_files(&root, &tb))
-        .map_err(|e| format!("check-rung: FATAL: {e}"))?;
+    // directory mounted): only the td-built userland at its /td/store paths.
     eprintln!(
         ">> check-rung: {harness} inside td-builder host-sandbox (cached chain reused; \
          sandbox env matches the gate)"
@@ -2219,9 +1768,6 @@ fn check_rung(args: &[String]) -> Result<i32, String> {
     let mut cmd = Command::new(&tb);
     let mut sandbox_args: Vec<String> =
         vec![s("host-sandbox"), s("--expose-cwd"), s("--no-daemon")];
-    for it in &items {
-        sandbox_args.extend([s("--store-item"), it.clone()]);
-    }
     for (src, dest) in &ul.items {
         sandbox_args.extend([s("--store-item-at"), src.clone(), dest.clone()]);
     }
@@ -2278,58 +1824,6 @@ mod tests {
             .any(|(k, v)| k == "TD_SUBST_BIN" && v.ends_with("/td-subst")));
     }
 
-    // The blessed-seed db location is a PURE FUNCTION of the repo's seed-lock
-    // declarations + the seed dir (re #469 round-8): the daemon and its
-    // children DERIVE it — there is no argv/env channel that can point the
-    // BlessedSeedClosure origin at a caller-selected db. Same declarations →
-    // same basename; different seed dir or root set → different basename; no
-    // declarations → no bless db at all.
-    #[test]
-    fn blessed_seed_db_path_derives_from_declarations_only() {
-        let d = scratch("bless-derive");
-        // Two fake declared seed roots that exist on disk (seed_lock_roots
-        // keeps only existing absolute paths).
-        let (r1, r2) = (d.join("store").join("aaa-tool"), d.join("store").join("bbb-lib"));
-        std::fs::create_dir_all(d.join("store")).unwrap();
-        std::fs::write(&r1, b"t").unwrap();
-        std::fs::write(&r2, b"l").unwrap();
-        let repo = d.join("repo");
-        std::fs::create_dir_all(repo.join("tests")).unwrap();
-        std::fs::write(
-            repo.join("tests/td-builder-rust.lock"),
-            format!("tool {}\nlib {}\n", r1.display(), r2.display()),
-        )
-        .unwrap();
-        let name_at = |root: &Path, seed_dir: &str| {
-            blessed_seed_db_path(root, seed_dir)
-                .unwrap()
-                .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
-        };
-        let a = name_at(&repo, "/seed/dir").unwrap();
-        assert_eq!(a, name_at(&repo, "/seed/dir").unwrap(), "must be deterministic");
-        assert!(
-            a.starts_with("seed-bless.") && a.ends_with(".db"),
-            "derived name shape: {a}"
-        );
-        assert_ne!(
-            a,
-            name_at(&repo, "/other/dir").unwrap(),
-            "a different seed dir must derive a different bless db"
-        );
-        // Dropping a declared root changes the derivation too.
-        std::fs::write(
-            repo.join("tests/td-builder-rust.lock"),
-            format!("tool {}\n", r1.display()),
-        )
-        .unwrap();
-        assert_ne!(a, name_at(&repo, "/seed/dir").unwrap());
-        // No declarations → None: nothing to bless, nothing to derive.
-        let bare = d.join("bare-repo");
-        std::fs::create_dir_all(&bare).unwrap();
-        assert_eq!(blessed_seed_db_path(&bare, "/seed/dir").unwrap(), None);
-        std::fs::remove_dir_all(&d).ok();
-    }
-
     #[test]
     fn subst_env_is_empty_when_any_piece_is_missing() {
         // Each missing piece independently means "expose nothing" — the gate
@@ -2357,48 +1851,6 @@ mod tests {
                 "missing {missing} must expose nothing"
             );
         }
-    }
-
-    #[test]
-    fn parse_seed_lock_keeps_absolute_paths_deduped() {
-        // The lock is the DECLARED seed, whatever store its paths live in —
-        // any absolute path qualifies; only relative/malformed lines drop.
-        let lock = "\
-# comment line
-aaa-rust-1.93.0 /td/store/aaa-rust-1.93.0
-bbb-cargo /td/store/bbb-rust-1.93.0-cargo extra-field
-bbb-again /td/store/bbb-rust-1.93.0-cargo
-
-malformed-line-without-path
-ccc-relative not/absolute
-";
-        assert_eq!(
-            parse_seed_lock(lock),
-            vec![
-                "/td/store/aaa-rust-1.93.0".to_string(),
-                "/td/store/bbb-rust-1.93.0-cargo".to_string(),
-            ]
-        );
-    }
-
-    #[test]
-    fn seed_store_dir_derives_the_unique_parent() {
-        // The candidate store dir comes from the declared lock paths, never a
-        // hardcoded prefix.
-        let roots = vec![
-            "/td/store/aaa-bash-5.2.37".to_string(),
-            "/td/store/bbb-make-4.4.1".to_string(),
-        ];
-        assert_eq!(seed_store_dir(&roots), Some("/td/store".to_string()));
-        // Several parents: the FIRST wins (warned) — the seed is one store.
-        let mixed = vec![
-            "/td/store/aaa-bash-5.2.37".to_string(),
-            "/other/store/ccc-sed-4.9".to_string(),
-        ];
-        assert_eq!(seed_store_dir(&mixed), Some("/td/store".to_string()));
-        // No roots, or roots with no usable parent: no store dir.
-        assert_eq!(seed_store_dir(&[]), None);
-        assert_eq!(seed_store_dir(&["/toplevel".to_string()]), None);
     }
 
     #[test]

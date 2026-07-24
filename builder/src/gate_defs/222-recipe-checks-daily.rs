@@ -4,7 +4,7 @@
 //! only to preserve the PR/daily partition in the gate runner and affected-checks.
 //! The loop body is native Rust in `builder/src/gate_bodies.rs`.
 
-use crate::gates::{ArtifactInput, GateDef, InputKind, Pool};
+use crate::gates::{GateDef, Pool};
 
 pub fn gate() -> GateDef {
     GateDef {
@@ -13,14 +13,6 @@ pub fn gate() -> GateDef {
         needs: &[],
         build_gate: true,
         specs: &[],
-        inputs: &[ArtifactInput {
-            name: "bash-static",
-            kind: InputKind::ClosureMember {
-                lock: "tests/td-subst.lock",
-                root_stem: "bash",
-                member_stem: "bash-static",
-            },
-        }],
         non_blocking: true,
         script: "",
     }

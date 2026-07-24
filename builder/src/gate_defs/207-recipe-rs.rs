@@ -31,7 +31,11 @@ pub fn gate() -> GateDef {
         needs: &[],
         build_gate: false,
         specs: &[],
-        inputs: &[],
+        // In the host-tool-free loop sandbox no toolchain is reachable, so
+        // provision-{rust,cc} exit EXIT_UNPROVISIONED (69) and the gate degrades to
+        // a tolerated Unprovisioned/SKIP — even as an explicit goal (it did not
+        // run). A real compile/lint failure exits non-69 and still REDs; the
+        // host-side cargo-test preflight is the blocking from-source enforcement.
         non_blocking: false,
         script: "",
     }
