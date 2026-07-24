@@ -17,9 +17,9 @@
 //! the one-way "no crates" guard: builder/recipes/engine share ONE workspace-root
 //! Cargo.lock and stay dependency-free — asserted two ways so BOTH a registry/git
 //! dep AND a new path member are caught: exactly 3 `[[package]]` entries (the known
-//! members) AND no external `source = ` line (path members carry none). td-kexec keeps
-//! its own 1-package lock. td-kexec is a TARGET guest program,
-//! not engine code, but it is pure std and compiles offline, so it lints/tests here
+//! members) AND no external `source = ` line (path members carry none). td-kexec and
+//! td-netd each keep their own 1-package lock. They are TARGET guest programs,
+//! not engine code, but both are pure std and compile offline, so they lint/test here
 //! with the engine crates. The network tools (fetch/feed/subst) carry the vendored
 //! FSDG crates and can't compile offline, so they are NOT linted here; their
 //! Cargo.toml still declares the same `[lints]` table so a local `cargo clippy`
@@ -92,6 +92,8 @@ pub fn gate() -> GateDef {
 	"$td" text not-contains 'source = "' Cargo.lock || { echo "ERROR: the engine workspace is no longer dependency-free (root Cargo.lock carries an external 'source = ' — builder/recipes/engine must carry ZERO external crates; AGENTS.md 'Rust code')" >&2; exit 1; }; \
 	n=`"$td" text count-line-exact '[[package]]' td-kexec/Cargo.lock`; \
 	test "$n" -eq 1 || { echo "ERROR: td-kexec is no longer dependency-free (Cargo.lock lists $n packages; it must carry ZERO crates — AGENTS.md 'Rust code')" >&2; exit 1; }; \
+	nn=`"$td" text count-line-exact '[[package]]' td-netd/Cargo.lock`; \
+	test "$nn" -eq 1 || { echo "ERROR: td-netd is no longer dependency-free (Cargo.lock lists $nn packages; it must carry ZERO crates — AGENTS.md 'Rust code')" >&2; exit 1; }; \
 rustpath=`"$td" provision-rust` || exit $?; \
 ccpath=`"$td" provision-cc` || exit $?; \
 scratch="$PWD/.cargo-test-scratch"; \
@@ -102,12 +104,14 @@ CARGO_HOME="$scratch/home" CARGO_TARGET_DIR="$scratch/target" \
 	  sh -c 'set -e; \
 	    cargo clippy --frozen --workspace; \
 	    cargo clippy --frozen --manifest-path td-kexec/Cargo.toml; \
+	    cargo clippy --frozen --manifest-path td-netd/Cargo.toml; \
 	    cargo test  --frozen --workspace; \
-	    cargo test  --frozen --manifest-path td-kexec/Cargo.toml' 2>&1 | tee "$log"; \
+	    cargo test  --frozen --manifest-path td-kexec/Cargo.toml; \
+	    cargo test  --frozen --manifest-path td-netd/Cargo.toml' 2>&1 | tee "$log"; \
 	"$td" text cargo-test-ok "$log" || \
 	  { echo "ERROR: cargo test reported no passing tests (vacuous run?)" >&2; exit 1; }; \
 rm -rf "$scratch"; \
-echo "PASS: cargo-test — the engine workspace (builder + recipes + engine) and td-kexec are dependency-free and lint clean; their unit tests pass (guix-free toolchain)."
+echo "PASS: cargo-test — the engine workspace (builder + recipes + engine), td-kexec, and td-netd are dependency-free and lint clean; their unit tests pass (guix-free toolchain)."
 "##,
     }
 }

@@ -95,6 +95,19 @@ const SYSTEM_STATE_WRITABLE_MARKER: &str =
 /// into. Shared with the recipe's `/etc/profile` autotest gate via `td_recipe::ladder`.
 const AUTOTEST_CMDLINE_TOKEN: &str = td_recipe::ladder::AUTOTEST_CMDLINE_TOKEN;
 
+/// The three networking markers `/etc/netup` prints under the nettest token: the link
+/// came up + DHCP applied, td-netd's own DNS client resolved the test host, and a TCP
+/// connection reached it. `qemu-boot-net` asserts all three. Shared with the recipe
+/// (system-x86-64.rs `build_netup`) via `td_recipe::ladder` so they can never desync.
+const SYSTEM_NET_UP_MARKER: &str = td_recipe::ladder::SYSTEM_NET_UP_MARKER;
+const SYSTEM_NET_RESOLVE_MARKER: &str = td_recipe::ladder::SYSTEM_NET_RESOLVE_MARKER;
+const SYSTEM_NET_REACH_MARKER: &str = td_recipe::ladder::SYSTEM_NET_REACH_MARKER;
+
+/// The kernel-cmdline token `qemu-boot-net` appends so `/etc/netup` runs the
+/// resolve+reach self-test (and prints the three markers above). Shared via
+/// `td_recipe::ladder` with the recipe's netup gate.
+const NETTEST_CMDLINE_TOKEN: &str = td_recipe::ladder::NETTEST_CMDLINE_TOKEN;
+
 /// The OUTER /init prints this on ttyS0 before it execs td-kexec — stage-1 reached
 /// userspace. `qemu-boot-kexec` asserts it as a diagnostic that the second boot came
 /// from our helper. Shared with the kexec-spike-x86-64 recipe via `td_recipe::ladder`.
@@ -185,6 +198,7 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
             target_marker: MARKER,
             kill_on_marker: true,
             extra_append: "",
+            user_net: false,
         },
         runner.scratch_dir(),
     )?;
@@ -234,6 +248,7 @@ pub(crate) fn run_erofs(runner: &RecipeCheckRunner) -> Result<(), String> {
             target_marker: EROFS_MARKER,
             kill_on_marker: true,
             extra_append: "",
+            user_net: false,
         },
         runner.scratch_dir(),
     )?;
@@ -288,6 +303,7 @@ pub(crate) fn run_system(runner: &RecipeCheckRunner) -> Result<(), String> {
             target_marker: GREETER_MARKER,
             kill_on_marker: false,
             extra_append: AUTOTEST_CMDLINE_TOKEN,
+            user_net: false,
         },
         runner.scratch_dir(),
     )?;
@@ -371,6 +387,113 @@ pub(crate) fn run_system(runner: &RecipeCheckRunner) -> Result<(), String> {
     Ok(())
 }
 
+/// `qemu-boot-net`: the operator proof that the source-built kernel + the static
+/// td-netd bring the network up under QEMU user-net and can resolve + reach a host.
+/// It boots the SAME `system-x86-64` deployment as `qemu-boot-system`, but with a
+/// user-mode NIC on virtio-net-pci and BOTH the nettest and autotest tokens on the
+/// cmdline: at sysinit `/etc/netup` DHCP-configures the link (SLIRP hands out
+/// 10.0.2.15), then td-netd's own DNS client resolves the test host via the DHCP
+/// nameserver (10.0.2.3) and TCP-connects it — printing the three net markers — before
+/// the greeter self-exits (autotest) and the VM powers off. Host-side (never a gated
+/// check) like the other qemu oracles: it needs host qemu AND outbound DNS/TCP from
+/// the operator host (SLIRP forwards the guest's DNS and NATs its TCP), which the
+/// daily host-free sandbox has neither of.
+pub(crate) fn run_net(runner: &RecipeCheckRunner) -> Result<(), String> {
+    let qemu = find_qemu()?;
+    let (bzimage, init_cpio, disk) = build_system(runner)?;
+
+    println!(
+        "   [qemu-boot-net] {qemu} boots the recipe-built deployment under TCG with a user-mode NIC; /etc/netup DHCP-configures the link, then td-netd resolves + reaches {}:{}\n              kernel:     {}\n              initramfs:  {}\n              erofs root: {}",
+        td_recipe::ladder::NETTEST_DEFAULT_HOST,
+        td_recipe::ladder::NETTEST_DEFAULT_PORT,
+        bzimage.display(),
+        init_cpio.display(),
+        disk.display()
+    );
+
+    // Both tokens: nettest drives netup's resolve+reach self-test (the three net
+    // markers), autotest makes the greeter self-exit so the VM powers off cleanly —
+    // the same clean-exit assertion qemu-boot-system uses. Key on the greeter (reached
+    // AFTER netup) with kill_on_marker=false so the net markers, which print earlier at
+    // sysinit, are all captured before the guest powers off.
+    let tokens = format!("{AUTOTEST_CMDLINE_TOKEN} {NETTEST_CMDLINE_TOKEN}");
+    let result = boot(
+        &qemu,
+        &bzimage,
+        &init_cpio,
+        BootPlan {
+            disk: Some(&disk),
+            mem: "256",
+            target_marker: GREETER_MARKER,
+            kill_on_marker: false,
+            extra_append: &tokens,
+            user_net: true,
+        },
+        runner.scratch_dir(),
+    )?;
+
+    if !result.marker {
+        return Err(format!(
+            "the two-stage boot did not reach the greeter {GREETER_MARKER:?} on ttyS0 — {} \
+             (the network self-test runs at sysinit BEFORE the greeter, so a boot that never \
+             reached the greeter likely failed earlier — unrelated to networking). Last serial \
+             output:\n{}",
+            result.reason,
+            tail(&result.console, 80)
+        ));
+    }
+    if !result.console.contains(SYSTEM_NET_UP_MARKER) {
+        return Err(format!(
+            "the boot reached the greeter but td-netd did not bring the link up \
+             ({SYSTEM_NET_UP_MARKER:?} absent) — the VIRTIO_NET NIC did not appear, autodetect \
+             found no interface, or the DHCP handshake (SLIRP's server at 10.0.2.2) did not \
+             complete. Last serial output:\n{}",
+            tail(&result.console, 80)
+        ));
+    }
+    if !result.console.contains(SYSTEM_NET_RESOLVE_MARKER) {
+        return Err(format!(
+            "the link came up but td-netd could not RESOLVE the test host \
+             ({SYSTEM_NET_RESOLVE_MARKER:?} absent) — its DNS client got no A record from the \
+             DHCP-provided nameserver (SLIRP's 10.0.2.3). This can also mean the OPERATOR HOST \
+             has no outbound DNS for SLIRP to forward. Last serial output:\n{}",
+            tail(&result.console, 80)
+        ));
+    }
+    if !result.console.contains(SYSTEM_NET_REACH_MARKER) {
+        return Err(format!(
+            "resolve succeeded but td-netd could not REACH the host \
+             ({SYSTEM_NET_REACH_MARKER:?} absent) — the TCP connect to the resolved address \
+             failed or timed out. This can also mean the OPERATOR HOST has no outbound TCP for \
+             SLIRP to NAT. Last serial output:\n{}",
+            tail(&result.console, 80)
+        ));
+    }
+    if result.console.contains("Kernel panic") {
+        return Err(format!(
+            "the net markers were printed but the kernel PANICKED rather than powering off cleanly — \
+             under `panic=-1` a panic also exits qemu 0, so this would otherwise masquerade as a \
+             clean shutdown. Last serial output:\n{}",
+            tail(&result.console, 80)
+        ));
+    }
+    if !result.exited_clean {
+        return Err(format!(
+            "the net self-test passed but the VM did not power off cleanly on the autotest `exit` — \
+             {}. Last serial output:\n{}",
+            result.reason,
+            tail(&result.console, 80)
+        ));
+    }
+    println!(
+        "PASS: system-x86-64 brings the network up under qemu user-net — td-netd DHCP-configures the \
+         virtio-net link ({SYSTEM_NET_UP_MARKER}), resolves the test host with its own DNS client \
+         ({SYSTEM_NET_RESOLVE_MARKER}), TCP-reaches it ({SYSTEM_NET_REACH_MARKER}), and the VM powers \
+         off cleanly"
+    );
+    Ok(())
+}
+
 /// `qemu-boot-kexec` (Phase-0 kexec spike): the operator proof that the source-built
 /// kernel can kexec_file_load(2) a SECOND kernel start under qemu TCG — the mechanism
 /// the image-based boot uses to self-boot a refreshed image. It boots the
@@ -406,6 +529,7 @@ pub(crate) fn run_kexec(runner: &RecipeCheckRunner) -> Result<(), String> {
             target_marker: KEXEC_STAGE2_MARKER,
             kill_on_marker: true,
             extra_append: "",
+            user_net: false,
         },
         runner.scratch_dir(),
     )?;
@@ -692,6 +816,10 @@ struct BootPlan<'a> {
     /// Extra kernel cmdline appended after the base (empty for none) — `qemu-boot-system`
     /// passes the autotest token so the greeter self-exits headlessly.
     extra_append: &'a str,
+    /// `true`: attach a qemu user-mode (SLIRP) NIC on virtio-net-pci instead of `-nic
+    /// none`, so the guest's td-netd can DHCP, resolve, and reach a host — the
+    /// `qemu-boot-net` mode. `false` (every other mode): no network, hermetic and offline.
+    user_net: bool,
 }
 
 /// Boot `bzImage` + `initramfs` under qemu per `plan` (see `BootPlan`), capturing ttyS0 to
@@ -727,8 +855,9 @@ fn boot(
     // -serial file:<console>: route ttyS0 straight to a file — deterministic, no
     //   tty/stdio games (unlike -nographic, which wants a terminal on stdin).
     // -display none / -monitor none: fully headless.
-    // -nic none: the guest needs no network; qemu's default is a user-mode NIC, so
-    //   disable it to keep the boot offline and free of inherited host net state.
+    // Networking is attached conditionally below (a user-mode NIC for qemu-boot-net,
+    // else `-nic none`) — qemu's default is an implicit user-mode NIC, so every mode
+    // sets one explicitly.
     // -no-user-config: ignore the host's qemu config files for a hermetic run.
     // -no-reboot: the busybox /init issues `reboot -f`; qemu exits on the guest
     //   reset instead of looping, so a healthy boot terminates on its own.
@@ -757,13 +886,25 @@ fn boot(
     let mut cmd = Command::new(qemu);
     cmd.args(["-M", "pc", "-accel", "tcg", "-m", plan.mem, "-no-reboot"])
         .args(["-display", "none", "-monitor", "none"])
-        .args(["-nic", "none", "-no-user-config"])
+        .args(["-no-user-config"])
         .args(["-serial", &serial])
         .arg("-kernel")
         .arg(bzimage)
         .arg("-initrd")
         .arg(initramfs)
         .args(["-append", &append]);
+    // Networking: either a user-mode NIC (qemu-boot-net) or none (every other mode).
+    // SLIRP's user net provides DHCP (10.0.2.15/24, gw 10.0.2.2) and a DNS forwarder
+    // (10.0.2.3), so the guest's td-netd can DHCP-configure, resolve, and reach a host
+    // with no host network config. virtio-net-pci is the NIC the guest's VIRTIO_NET
+    // driver binds; the guest autodetects it (eth0) and brings it up.
+    if plan.user_net {
+        cmd.args(["-netdev", "user,id=net0"]);
+        cmd.args(["-device", "virtio-net-pci,netdev=net0"]);
+    } else {
+        // -nic none: hermetic, offline; qemu's default is a user-mode NIC, so disable it.
+        cmd.args(["-nic", "none"]);
+    }
     // Optional read-only erofs disk (re #549): if=none defines the backing store and
     // a separate virtio-blk-pci -device attaches it as /dev/vda in the guest.
     // readonly=on matches the immutable erofs root and lets qemu refuse any write.
@@ -1129,8 +1270,11 @@ mod tests {
             SYSTEM_ETC_RO_MARKER,
             SYSTEM_STATE_WRITABLE_MARKER,
             UUTILS_RUNTIME_MARKER,
+            SYSTEM_NET_UP_MARKER,
+            SYSTEM_NET_RESOLVE_MARKER,
+            SYSTEM_NET_REACH_MARKER,
         ]);
-        assert_eq!(markers.len(), 5, "each system assertion needs its own marker");
+        assert_eq!(markers.len(), 8, "each system/net assertion needs its own marker");
     }
 
     #[test]

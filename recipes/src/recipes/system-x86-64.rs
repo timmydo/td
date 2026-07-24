@@ -1,7 +1,8 @@
 use crate::ladder::{
-    mesboot0_inputs, mesboot0_path, AUTOTEST_CMDLINE_TOKEN, GREETER_MARKER, SH,
-    SYSTEM_ETC_RO_MARKER, SYSTEM_ROOT_RO_MARKER, SYSTEM_STATE_WRITABLE_MARKER,
-    UUTILS_RUNTIME_MARKER,
+    mesboot0_inputs, mesboot0_path, AUTOTEST_CMDLINE_TOKEN, GREETER_MARKER, NETTEST_CMDLINE_TOKEN,
+    NETTEST_DEFAULT_HOST, NETTEST_DEFAULT_PORT, SH, SYSTEM_ETC_RO_MARKER, SYSTEM_NET_REACH_MARKER,
+    SYSTEM_NET_RESOLVE_MARKER, SYSTEM_NET_UP_MARKER, SYSTEM_ROOT_RO_MARKER,
+    SYSTEM_STATE_WRITABLE_MARKER, UUTILS_RUNTIME_MARKER,
 };
 use crate::types::{Recipe, Step};
 
@@ -225,11 +226,16 @@ fn build_inittab() -> String {
     // the auto-login getty. It does NOT mount /var, /tmp, or /run: stage-1 already
     // mounted those as tmpfs, and switch_root preserves the mounts. /proc must precede
     // /etc/rootcheck (which reads /proc/mounts).
+    // /etc/netup runs AFTER rootcheck (networking after the read-only-root self-check)
+    // and AFTER /run is a tmpfs (mounted by stage-1, preserved through switch_root): it
+    // brings the link up every boot and — under the nettest token — self-tests resolve
+    // + reach. td-netd writes resolv.conf/hosts through /etc symlinks into that /run.
     "::sysinit:/bin/mount -t devtmpfs devtmpfs /dev\n\
      ::sysinit:/bin/mount -t proc proc /proc\n\
      ::sysinit:/bin/mount -t sysfs sysfs /sys\n\
      ::sysinit:/bin/hostname -F /etc/hostname\n\
      ::sysinit:/etc/rootcheck\n\
+     ::sysinit:/etc/netup\n\
      ttyS0::respawn:/etc/tty-session\n\
      ::ctrlaltdel:/bin/reboot\n\
      ::shutdown:/bin/umount -a -r\n"
@@ -399,6 +405,30 @@ fn build_profile(sys: &SystemDef) -> String {
     s
 }
 
+/// The sysinit network bring-up glue, run AS ROOT once at boot. `td-netd up`
+/// autodetects the link, DHCP-configures it, and writes resolv.conf + hosts (a
+/// NIC-less boot is a clean no-op). Under the `NETTEST_CMDLINE_TOKEN` the headless
+/// `qemu-boot-net` oracle appends, it additionally self-tests the stack — resolve
+/// the default host via the DHCP-provided nameserver, then TCP-reach it — printing
+/// the three net markers on ttyS0. Off the token (normal boot, or the `-nic none`
+/// `qemu-boot-system` oracle) the link still comes up but no marker is printed.
+///
+/// One `td-netd up`: `$up` records whether it configured the link so NET_UP is
+/// asserted only on real success (a DHCP timeout drops the marker and reds the
+/// oracle rather than false-passing). `-F`: the token is a fixed string, matched
+/// literally (the `.` must not act as a regex wildcard), mirroring build_profile.
+fn build_netup() -> String {
+    format!(
+        "#!/bin/sh\n\
+         if /bin/td-netd up; then up=1; else up=0; fi\n\
+         if /bin/busybox grep -q -F '{NETTEST_CMDLINE_TOKEN}' /proc/cmdline 2>/dev/null; then \
+         [ \"$up\" = 1 ] && echo {SYSTEM_NET_UP_MARKER}; \
+         /bin/td-netd resolve {NETTEST_DEFAULT_HOST} && echo {SYSTEM_NET_RESOLVE_MARKER}; \
+         /bin/td-netd reach {NETTEST_DEFAULT_HOST} {NETTEST_DEFAULT_PORT} && echo {SYSTEM_NET_REACH_MARKER}; \
+         fi\n"
+    )
+}
+
 fn build_os_release(sys: &SystemDef) -> String {
     format!(
         "NAME=\"{name}\"\nID={id}\nVERSION=\"{ver}\"\nVERSION_ID={ver}\n\
@@ -427,6 +457,7 @@ fn etc_files(sys: &SystemDef) -> Vec<(&'static str, String, bool)> {
         ("autologin", build_autologin(sys), true),
         ("tty-session", build_tty_session(), true),
         ("rootcheck", build_rootcheck(sys), true),
+        ("netup", build_netup(), true),
     ]
 }
 
@@ -485,6 +516,13 @@ fn real_root_steps(sys: &SystemDef) -> Vec<Step> {
         from: "{in:busybox-x86-64}".into(),
         dest: "{root}/real-root{in:busybox-x86-64}".into(),
     });
+    // td-netd is STATIC (empty runtime closure, like busybox), so copy its package
+    // directly rather than through StageRuntimeClosure — scanning it as a runtime
+    // root would mistake build-provenance strings for edges and pull its toolchain in.
+    steps.push(Step::CopyTree {
+        from: "{in:td-netd}".into(),
+        dest: "{root}/real-root{in:td-netd}".into(),
+    });
     // Stage uutils plus every transitively referenced store item at its canonical absolute
     // path. The engine admits only direct recipe inputs, so a new runtime dependency fails
     // closed until it is reviewed and declared here.
@@ -517,6 +555,21 @@ fn real_root_steps(sys: &SystemDef) -> Vec<Step> {
         target: "{in:busybox-x86-64}/bin/busybox".into(),
         link: "{root}/real-root/init".into(),
     });
+    // /bin/td-netd resolves into the store td-netd package (a single static binary,
+    // NOT a multicall — it is its own /bin entry, unlike the busybox/uutils farms).
+    steps.push(Step::Symlink {
+        target: "{in:td-netd}/bin/td-netd".into(),
+        link: "{root}/real-root/bin/td-netd".into(),
+    });
+    // resolv.conf and hosts live at /etc but are SYMLINKS into the writable /run
+    // tmpfs, so td-netd can (re)write them under the read-only erofs /etc. They are
+    // deliberately dangling at build time; td-netd creates the /run targets at boot.
+    for name in ["resolv.conf", "hosts"] {
+        steps.push(Step::Symlink {
+            target: format!("/run/{name}"),
+            link: format!("{{root}}/real-root/etc/{name}"),
+        });
+    }
     // Generated /etc.
     for (name, content, exec) in etc_files(sys) {
         steps.push(Step::WriteFile {
@@ -555,9 +608,14 @@ fn shape_check() -> String {
      [ -f \"$root/init\" ] || [ -L \"$root/init\" ] || { echo 'root tree: /init missing' >&2; exit 1; }; \
      case $(readlink \"$root/init\") in /td/store/*) : ;; *) echo 'root tree: /init is not a symlink into /td/store' >&2; exit 1;; esac; \
      case $(readlink \"$root/bin/sh\") in /td/store/*) : ;; *) echo 'root tree: /bin/sh is not a symlink into /td/store - the store-native /bin farm regressed' >&2; exit 1;; esac; \
-     for f in passwd group shadow hostname os-release inittab profile autologin tty-session rootcheck; do \
+     for f in passwd group shadow hostname os-release inittab profile autologin tty-session rootcheck netup; do \
          [ -f \"$root/etc/$f\" ] || { echo \"root tree: /etc/$f missing\" >&2; exit 1; }; \
      done; \
+     for l in resolv.conf hosts; do \
+         [ \"$(readlink \"$root/etc/$l\")\" = \"/run/$l\" ] || { echo \"root tree: /etc/$l must be a symlink into writable /run (td-netd writes it under the read-only erofs /etc)\" >&2; exit 1; }; \
+     done; \
+     case $(readlink \"$root/bin/td-netd\") in /td/store/*/bin/td-netd) : ;; *) echo 'root tree: /bin/td-netd is not a symlink into /td/store - the network daemon /bin entry regressed' >&2; exit 1;; esac; \
+     tnd=\"{root}/real-root{in:td-netd}/bin/td-netd\"; { [ -f \"$tnd\" ] && [ -x \"$tnd\" ]; } || { echo 'root tree: the td-netd binary is not packed/executable at real-root{in:td-netd}/bin/td-netd - the /bin/td-netd symlink would dangle' >&2; exit 1; }; \
      [ \"$(readlink \"$root/home\")\" = var/home ] || { echo 'root tree: /home must point to var/home' >&2; exit 1; }; \
      [ \"$(readlink \"$root/root\")\" = var/root ] || { echo 'root tree: /root must point to var/root' >&2; exit 1; }; \
      rbb=\"{root}/real-root{in:busybox-x86-64}/bin/busybox\"; { [ -f \"$rbb\" ] && [ -x \"$rbb\" ]; } || { echo 'root tree: the busybox binary is not packed/executable at real-root{in:busybox-x86-64}/bin/busybox - the store-native /bin symlinks would all dangle' >&2; exit 1; }; \
@@ -686,7 +744,8 @@ pub fn recipe() -> Recipe {
         //   userland (#547).
         // glibc-x86-64: uutils' declared runtime input. StageRuntimeClosure reaches it from
         //   uutils's embedded store reference and copies the whole content-addressed item.
-        .native_inputs(&["busybox-x86-64", "linux-x86-64", "uutils", "glibc-x86-64"])
+        // td-netd: the static network bring-up daemon (empty runtime closure, CopyTree'd).
+        .native_inputs(&["busybox-x86-64", "linux-x86-64", "uutils", "glibc-x86-64", "td-netd"])
         .inputs_owned(mesboot0_inputs(&[]))
         .steps(steps)
 }
@@ -896,6 +955,10 @@ mod tests {
             inittab.contains("::sysinit:/etc/rootcheck"),
             "inittab must run /etc/rootcheck at sysinit (the read-only-root self-check)"
         );
+        assert!(
+            inittab.contains("::sysinit:/etc/netup"),
+            "inittab must run /etc/netup at sysinit (network bring-up + resolve/reach self-test)"
+        );
         let session = build_tty_session();
         // getty must gate the reboot (`&&`), so a FAILED session respawns rather than
         // firing reboot -f and masking a broken greeter as a clean exit-0 shutdown.
@@ -1035,5 +1098,80 @@ mod tests {
             profile.contains("/bin/cat /etc/os-release") && profile.contains(&format!("&& echo {UUTILS_RUNTIME_MARKER}")),
             "the uutils runtime marker must be gated on a successful absolute-path uutils invocation"
         );
+
+        // Networking: netup brings the link up unconditionally, and under the nettest
+        // token self-tests resolve + reach, printing the three net markers. Each marker
+        // must be `&&`-gated on its td-netd subcommand so a failure drops the marker and
+        // reds the qemu-boot-net oracle rather than false-passing.
+        let netup = build_netup();
+        assert!(
+            netup.contains("/bin/td-netd up"),
+            "netup must bring the link up via td-netd on every boot"
+        );
+        assert!(
+            netup.contains(NETTEST_CMDLINE_TOKEN),
+            "netup must gate its self-test on the nettest cmdline token"
+        );
+        assert!(
+            netup.contains(SYSTEM_NET_UP_MARKER),
+            "netup must emit the link-up marker"
+        );
+        assert!(
+            netup.contains(&format!(
+                "/bin/td-netd resolve {NETTEST_DEFAULT_HOST} && echo {SYSTEM_NET_RESOLVE_MARKER}"
+            )),
+            "the resolve marker must be gated on a successful td-netd resolve"
+        );
+        assert!(
+            netup.contains(&format!(
+                "/bin/td-netd reach {NETTEST_DEFAULT_HOST} {NETTEST_DEFAULT_PORT} && echo {SYSTEM_NET_REACH_MARKER}"
+            )),
+            "the reach marker must be gated on a successful td-netd reach"
+        );
+    }
+
+    /// td-netd must be packed and symlinked into /bin, and resolv.conf/hosts must be
+    /// /etc symlinks into writable /run so the daemon can (re)write them under the
+    /// read-only erofs root. A refactor that drops the CopyTree, the /bin symlink, or
+    /// reverts the /etc files to plain writes would silently break network bring-up.
+    #[test]
+    fn td_netd_is_packed_and_etc_is_run_backed() {
+        let steps = real_root_steps(&SYSTEM);
+        assert!(
+            steps.iter().any(|s| matches!(
+                s,
+                Step::CopyTree { from, dest }
+                    if from == "{in:td-netd}" && dest == "{root}/real-root{in:td-netd}"
+            )),
+            "td-netd package must be CopyTree'd into the real root (static, empty closure)"
+        );
+        assert!(
+            steps.iter().any(|s| matches!(
+                s,
+                Step::Symlink { target, link }
+                    if target == "{in:td-netd}/bin/td-netd"
+                        && link == "{root}/real-root/bin/td-netd"
+            )),
+            "/bin/td-netd must symlink into the store td-netd package"
+        );
+        for name in ["resolv.conf", "hosts"] {
+            let link = format!("{{root}}/real-root/etc/{name}");
+            let target = format!("/run/{name}");
+            assert!(
+                steps.iter().any(|s| matches!(
+                    s,
+                    Step::Symlink { target: t, link: l } if *t == target && *l == link
+                )),
+                "/etc/{name} must be a symlink into /run (writable under the read-only /etc)"
+            );
+            // And NOT also written as a plain file (a WriteFile would shadow the symlink).
+            assert!(
+                steps.iter().all(|s| !matches!(
+                    s,
+                    Step::WriteFile { path, .. } if *path == link
+                )),
+                "/etc/{name} must be a /run symlink only, never a plain WriteFile"
+            );
+        }
     }
 }

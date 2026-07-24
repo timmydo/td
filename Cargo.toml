@@ -9,11 +9,13 @@
 #                     closure must not mix into the engine's dependency-free lock.
 #   td-kexec/       — a target-side guest helper, deliberately outside the
 #                     builder/recipes trust boundary (its own confined unsafe).
+#   td-netd/        — a target-side network bring-up daemon, likewise outside the
+#                     engine trust boundary (its own confined single-ioctl unsafe).
 #   tests/*-demo/   — throwaway fixtures for vendoring/ssh tests.
 [workspace]
 resolver = "2"
 members = ["builder", "recipes", "engine"]
-exclude = ["net", "td-kexec", "tests/russh-demo", "tests/vendor-demo"]
+exclude = ["net", "td-kexec", "td-netd", "tests/russh-demo", "tests/vendor-demo"]
 
 [profile.release]
 # Keep the release profile explicit and minimal so the reproducibility oracle

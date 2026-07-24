@@ -55,6 +55,23 @@ use crate::types::{Recipe, Step};
 // at the Recipe builder below. In-sandbox CI coverage is the artifact shape
 // checks (this recipe's producer rung + linux-x86-64-test).
 //
+// NETWORKING (link-up + DHCP, re the td-netd bring-up daemon): the config turns
+// on the networking stack the static `td-netd` needs — NET (the whole stack),
+// INET (IPv4/TCP/UDP, for DHCP over UDP and `reach`/`resolve` over TCP/UDP), UNIX
+// (AF_UNIX, the baseline local-socket family), and PACKET (AF_PACKET; td-netd
+// itself does NOT use a raw socket — it broadcasts DHCP over a normal UDP socket
+// plus an explicit limited-broadcast route — but PACKET is the conventional
+// raw-socket family general net tooling expects, so it is enabled once here). The
+// NIC drivers ride the SAME menuconfig-parent trap the erofs leaves hit (#549):
+// VIRTIO_NET (the qemu user-net `-device virtio-net-pci` NIC) sits under the
+// prompted `menuconfig NETDEVICES`, and E1000 (a real Intel NIC, and qemu's
+// `-device e1000`) sits under `menuconfig ETHERNET` → `config NET_VENDOR_INTEL`.
+// All three parents (NETDEVICES, ETHERNET, NET_VENDOR_INTEL) are forced off by
+// allnoconfig and would drop their leaves under olddefconfig, so they are pinned
+// =y EXPLICITLY alongside the drivers, and the grep-verify guard re-checks the
+// leaves. The behavioural proof is the host-side `qemu-boot-net` oracle (QEMU
+// user-net; td-netd brings the link up, then resolve + reach a host).
+//
 // A modern (>= 4.18) kernel needs host tools the 4.14 rung dodged; each is now a
 // td recipe (AGENTS.md directive 3, pre-authorized as part of this migration):
 //   - flex (flex-x86-64) + bison (bison-mesboot): scripts/kconfig's lexer/parser
@@ -413,7 +430,16 @@ pub fn recipe() -> Recipe {
                   /^#? *CONFIG_RELOCATABLE[ =]/d; \
                   /^#? *CONFIG_RANDOMIZE_BASE[ =]/d; \
                   /^#? *CONFIG_BLK_DEV_LOOP[ =]/d; \
-                  /^#? *CONFIG_BTRFS_FS[ =]/d' .config && \
+                  /^#? *CONFIG_BTRFS_FS[ =]/d; \
+                  /^#? *CONFIG_NET[ =]/d; \
+                  /^#? *CONFIG_PACKET[ =]/d; \
+                  /^#? *CONFIG_UNIX[ =]/d; \
+                  /^#? *CONFIG_INET[ =]/d; \
+                  /^#? *CONFIG_NETDEVICES[ =]/d; \
+                  /^#? *CONFIG_VIRTIO_NET[ =]/d; \
+                  /^#? *CONFIG_ETHERNET[ =]/d; \
+                  /^#? *CONFIG_NET_VENDOR_INTEL[ =]/d; \
+                  /^#? *CONFIG_E1000[ =]/d' .config && \
                  printf '%s\\n' \
                    'CONFIG_UNWINDER_FRAME_POINTER=y' \
                    '# CONFIG_UNWINDER_ORC is not set' \
@@ -452,7 +478,16 @@ pub fn recipe() -> Recipe {
                    'CONFIG_RELOCATABLE=y' \
                    '# CONFIG_RANDOMIZE_BASE is not set' \
                    'CONFIG_BLK_DEV_LOOP=y' \
-                   'CONFIG_BTRFS_FS=y' >> .config",
+                   'CONFIG_BTRFS_FS=y' \
+                   'CONFIG_NET=y' \
+                   'CONFIG_PACKET=y' \
+                   'CONFIG_UNIX=y' \
+                   'CONFIG_INET=y' \
+                   'CONFIG_NETDEVICES=y' \
+                   'CONFIG_VIRTIO_NET=y' \
+                   'CONFIG_ETHERNET=y' \
+                   'CONFIG_NET_VENDOR_INTEL=y' \
+                   'CONFIG_E1000=y' >> .config",
             ],
         )
         .env("PATH", &mesboot0_path()),
@@ -493,6 +528,13 @@ pub fn recipe() -> Recipe {
                  grep -q '^CONFIG_RELOCATABLE=y' .config || { echo 'RELOCATABLE off — a non-relocatable bzImage is rejected by the x86 kexec_file_load loader (boots via -kernel, fails via kexec)' >&2; exit 1; }; \
                  grep -q '^CONFIG_BTRFS_FS=y' .config || { echo 'BTRFS_FS off — the persistent volume is one btrfs filesystem (@var plus the loop-mounted EROFS root blobs)' >&2; exit 1; }; \
                  grep -q '^CONFIG_BLK_DEV_LOOP=y' .config || { echo 'BLK_DEV_LOOP off — the immutable EROFS root is a file inside btrfs, loop-mounted read-only' >&2; exit 1; }; \
+                 grep -q '^CONFIG_NET=y' .config || { echo 'NET off — no networking stack for td-netd link-up/DHCP' >&2; exit 1; }; \
+                 grep -q '^CONFIG_INET=y' .config || { echo 'INET off — no IPv4/TCP/UDP for DHCP or resolve/reach' >&2; exit 1; }; \
+                 grep -q '^CONFIG_PACKET=y' .config || { echo 'PACKET off — AF_PACKET raw-socket family unavailable' >&2; exit 1; }; \
+                 grep -q '^CONFIG_UNIX=y' .config || { echo 'UNIX off — AF_UNIX local-socket family unavailable' >&2; exit 1; }; \
+                 grep -q '^CONFIG_NETDEVICES=y' .config || { echo 'NETDEVICES off (menuconfig parent dropped) — no NIC drivers are visible' >&2; exit 1; }; \
+                 grep -q '^CONFIG_VIRTIO_NET=y' .config || { echo 'VIRTIO_NET off — the qemu user-net virtio NIC would not appear' >&2; exit 1; }; \
+                 grep -q '^CONFIG_E1000=y' .config || { echo 'E1000 off (ETHERNET/NET_VENDOR_INTEL menuconfig parents likely dropped) — no real Intel NIC driver' >&2; exit 1; }; \
                  if grep -q '^CONFIG_KEXEC=y' .config; then echo 'KEXEC (legacy segment-based kexec_load) on — only KEXEC_FILE is used; the legacy syscall is kept off to not widen the surface' >&2; exit 1; fi; \
                  if grep -q '^CONFIG_KEXEC_SIG=y' .config; then echo 'KEXEC_SIG on — would demand a trusted-keyring signature policy td does not ship' >&2; exit 1; fi; \
                  if grep -q '^CONFIG_RANDOMIZE_BASE=y' .config; then echo 'RANDOMIZE_BASE (KASLR) on — pinned off for a deterministic kexec boot' >&2; exit 1; fi; \

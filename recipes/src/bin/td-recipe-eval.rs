@@ -244,6 +244,12 @@ fn main() {
                 die_runner(&e);
             }
         }
+        Some("qemu-boot-net") => {
+            let rest = args.get(2..).unwrap_or(&[]);
+            if let Err(e) = check_runner::qemu_boot_net_cli(rest) {
+                die_runner(&e);
+            }
+        }
         Some("qemu-boot-kexec") => {
             let rest = args.get(2..).unwrap_or(&[]);
             if let Err(e) = check_runner::qemu_boot_kexec_cli(rest) {
@@ -283,7 +289,7 @@ fn main() {
                 die_runner(&e);
             }
         }
-        _ => die("usage: td-recipe-eval list|emit|check-list|check-count|check-script|check-run|build-run|clear-store|qemu-boot|qemu-boot-erofs|qemu-boot-system|qemu-boot-kexec|run|verify-store|source-pins|source-pin|seed-digests ..."),
+        _ => die("usage: td-recipe-eval list|emit|check-list|check-count|check-script|check-run|build-run|clear-store|qemu-boot|qemu-boot-erofs|qemu-boot-system|qemu-boot-net|qemu-boot-kexec|run|verify-store|source-pins|source-pin|seed-digests ..."),
     }
 }
 

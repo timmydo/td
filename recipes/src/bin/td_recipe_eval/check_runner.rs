@@ -347,6 +347,39 @@ pub fn qemu_boot_system_cli(args: &[String]) -> Result<(), String> {
     crate::checks::qemu_boot::run_system(&runner)
 }
 
+/// `td-recipe-eval qemu-boot-net [system-x86-64]` — the headless networking proof. Builds
+/// and verifies the SAME `system-x86-64` deployment as `qemu-boot-system`, then boots it
+/// under host qemu with a user-mode NIC and both the nettest + autotest tokens: at sysinit
+/// `/etc/netup` brings the link up over DHCP and td-netd resolves + reaches the test host,
+/// then the greeter self-exits so the VM powers off. It asserts the three net markers and a
+/// clean power-off. Host-side (never a gated check) like the other qemu oracles — the daily
+/// sandbox has no host qemu, and this additionally needs the operator host's outbound
+/// DNS/TCP (SLIRP forwards/NATs them). See checks/qemu_boot.rs.
+pub fn qemu_boot_net_cli(args: &[String]) -> Result<(), String> {
+    const STEM: &str = "system-x86-64";
+    let stem = args.first().map(String::as_str).unwrap_or(STEM);
+    if stem != STEM {
+        return Err(format!(
+            "qemu-boot-net only supports {STEM} (got '{stem}'); usage: qemu-boot-net [{STEM}]"
+        ));
+    }
+    if args.get(1).is_some() {
+        return Err(format!("usage: qemu-boot-net [{STEM}]"));
+    }
+    // Provenance planning FIRST — before the runner exists (re #469), matching
+    // `qemu_boot_cli`: a rejected graph spawns no subprocess.
+    ensure_targets_provenance(&[stem])?;
+
+    let root = env::current_dir().map_err(|e| format!("current dir: {e}"))?;
+    // Reuse the `qemu-boot-` scratch prefix so the stale-scratch reaper still cleans
+    // a killed net boot's per-boot directories (it can hold a multi-GiB kernel build).
+    let scratch_name = scratch_name("qemu-boot", &[stem]);
+    let runner = RecipeCheckRunner::new(root, &scratch_name)?.with_streamed_progress();
+    let _lock = lock_file(&runner.lock_path())?;
+    runner.setup()?;
+    crate::checks::qemu_boot::run_net(&runner)
+}
+
 /// `td-recipe-eval qemu-boot-kexec [kexec-spike-x86-64]` — the Phase-0 kexec spike proof.
 /// Builds the `kexec-spike-x86-64` two-kernel artifact (a bootable bzImage + an outer
 /// initramfs embedding static busybox, td-kexec, a second-boot bzImage, and a nested inner

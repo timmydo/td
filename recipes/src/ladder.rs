@@ -158,6 +158,42 @@ pub const UUTILS_RUNTIME_MARKER: &str = "TD-UUTILS-RUN-OK";
 /// a normal interactive shell.
 pub const AUTOTEST_CMDLINE_TOKEN: &str = "td.autotest=1";
 
+// ── system-x86-64 networking markers (link-up + DHCP, re td-netd) ─────────────────
+// The static td-netd daemon brings the link up and DHCP-configures it at sysinit on
+// every boot (a NIC-less boot is a clean no-op). Under the `td.nettest=1` token the
+// headless `qemu-boot-net` oracle appends, `/etc/netup` additionally SELF-TESTS the
+// stack — resolve a name via the DHCP-provided nameserver, then TCP-reach it — and
+// prints these markers on ttyS0. SINGLE SOURCE OF TRUTH shared by `/etc/netup` (baked
+// by the recipe) and the oracle so they never desync.
+
+/// Printed by `/etc/netup` once `td-netd up` has brought the link up and applied a
+/// DHCP lease (address + netmask + default route, resolv.conf written). Emitted only
+/// under `NETTEST_CMDLINE_TOKEN` so a normal or NIC-less boot never false-asserts it.
+pub const SYSTEM_NET_UP_MARKER: &str = "TD-NET-UP-OK";
+
+/// Printed by `/etc/netup` once `td-netd resolve` returns an address for the test
+/// host via the DHCP-provided nameserver — proves td-netd's own (NSS-free) DNS client
+/// works end to end against qemu user-net's resolver.
+pub const SYSTEM_NET_RESOLVE_MARKER: &str = "TD-NET-RESOLVE-OK";
+
+/// Printed by `/etc/netup` once `td-netd reach` opens a TCP connection to the test
+/// host — the "reach a host" half of the QEMU user-net test.
+pub const SYSTEM_NET_REACH_MARKER: &str = "TD-NET-REACH-OK";
+
+/// Kernel-cmdline token the headless `qemu-boot-net` oracle appends so `/etc/netup`
+/// runs the resolve+reach self-test (and prints the three markers above). Absent it
+/// (normal boot, or the `-nic none` `qemu-boot-system` oracle), td-netd still brings
+/// the link up but the self-test and its markers are skipped.
+pub const NETTEST_CMDLINE_TOKEN: &str = "td.nettest=1";
+
+/// Fixed resolve/reach target for the self-test. qemu user-net forwards DNS (via
+/// 10.0.2.3) and NATs outbound TCP, so a stable public anycast host answers both a
+/// DNS A-query and a TCP connect; `NETTEST_DEFAULT_PORT` is DNS-over-TCP (53), which
+/// that host serves reliably. `/etc/netup` compiles these in — there is no runtime
+/// cmdline override (that would need argument parsing in the boot shell).
+pub const NETTEST_DEFAULT_HOST: &str = "one.one.one.one";
+pub const NETTEST_DEFAULT_PORT: &str = "53";
+
 // ── kexec-spike-x86-64 two-kernel boot markers (Phase-0 kexec spike) ─────────────
 // The spike proves the source-built kernel can kexec_file_load(2) + reboot(KEXEC) a
 // SECOND kernel start under qemu TCG. ONE qemu run boots the outer kernel + outer
