@@ -313,10 +313,9 @@ pub fn qemu_boot_erofs_cli(args: &[String]) -> Result<(), String> {
 }
 
 /// `td-recipe-eval qemu-boot-system [system-x86-64]` — the headless two-stage boot proof
-/// (re #550). Builds the `linux-x86-64` bzImage and the `system-x86-64` stage-1 init.cpio
-/// and real-root tree, packs the tree into a read-only erofs image with the control-plane
-/// `mkfs-erofs` writer (#548), and boots the two stages under host qemu with the autotest
-/// token on the kernel cmdline: stage-1 mounts the erofs root read-only over virtio-blk and
+/// (re #550). Builds and verifies the `system-x86-64` deployment bundle, then
+/// boots its bzImage, initramfs.cpio, and root.erofs under host qemu with the
+/// autotest token on the kernel cmdline: stage-1 mounts the erofs root read-only over virtio-blk and
 /// `switch_root`s into it, the real-root init reaches the greeter, and the greeter self-
 /// exits so the VM powers off. It asserts the greeter, a read-only erofs `/`, tmpfs-backed
 /// writable dirs, and a clean power-off. UNLIKE `run`, this is a PASS/FAIL smoke test with
@@ -380,10 +379,10 @@ pub fn qemu_boot_kexec_cli(args: &[String]) -> Result<(), String> {
 }
 
 /// `td-recipe-eval run [system-x86-64]` — the interactive distro runner (re #541).
-/// Builds the `system-x86-64` initramfs (its closure pulls in the `linux-x86-64`
-/// bzImage) and boots it under host qemu with an interactive serial console. Like
-/// `qemu-boot`, this is a host-side command run OUTSIDE the daily sandbox (which
-/// has no host qemu and no terminal), never a gated check. See checks/run.rs.
+/// Builds and verifies the complete `system-x86-64` deployment bundle, then
+/// boots it under host qemu with an interactive serial console. Like `qemu-boot`,
+/// this is a host-side command run OUTSIDE the daily sandbox (which has no host
+/// qemu and no terminal), never a gated check. See checks/run.rs.
 pub fn run_cli(args: &[String]) -> Result<(), String> {
     const STEM: &str = "system-x86-64";
     let stem = args.first().map(String::as_str).unwrap_or(STEM);
@@ -1672,8 +1671,7 @@ impl RecipeCheckRunner {
     /// whole closure. A cold climb incidentally leaves every rung's output in
     /// tdstore as a byproduct of building; a warm hit stages only the requested
     /// roots. Every consumer depends only on the requested roots: `run` reads the
-    /// self-contained `<system>/root` + `<system>/init.cpio` + `<kernel>/bzImage`
-    /// (exactly what it read before this change), loop-userland reads the static
+    /// self-contained `<system>/deployment` bundle, loop-userland reads the static
     /// busybox/make trees, and the CLI prints the paths. Recipe binaries reference
     /// absolute `/td/store`, never the per-invocation scratch tdstore, so the
     /// incidental cold closure is not a consumer contract; a caller that needs
@@ -1773,11 +1771,10 @@ impl RecipeCheckRunner {
     ///
     /// Only the REQUESTED roots are staged, not the whole planned closure the
     /// full-build path stages — sound because the callers read only those roots
-    /// (`build-run` prints their paths; `run` packs the erofs from
-    /// `<system>/root` and reads `<kernel>/bzImage`), and each root output is a
-    /// self-contained tree. Two passes: validate ALL outputs first (so a partial
-    /// eviction is a clean miss with no half-staged tdstore and no wasted copy),
-    /// then stage.
+    /// (`build-run` prints their paths; `run` verifies and consumes the
+    /// `<system>/deployment` bundle), and each root output is a self-contained
+    /// tree. Two passes: validate ALL outputs first (so a partial eviction is a
+    /// clean miss with no half-staged tdstore and no wasted copy), then stage.
     ///
     /// The stage is `copy_tree` (`fs::copy` per file), reflink-cheap on a CoW
     /// filesystem (btrfs/xfs) but a full byte copy on ext4 — the builder's

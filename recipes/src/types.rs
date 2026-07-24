@@ -121,6 +121,18 @@ pub enum Step {
         from: String,
         dest: String,
     },
+    /// Pack `root` as a deterministic EROFS image at `output` using the
+    /// control-plane engine's dependency-free image writer.
+    PackErofs {
+        root: String,
+        output: String,
+    },
+    /// Write a deterministic manifest of `(name, file)` SHA-256 entries.
+    /// Names are artifact labels, while file paths are template-expanded.
+    Sha256Manifest {
+        output: String,
+        entries: Vec<(String, String)>,
+    },
     Symlink {
         target: String,
         link: String,
@@ -292,6 +304,20 @@ impl Step {
                 Json::Obj(vec![
                     ("from".into(), Json::Str(from.clone())),
                     ("dest".into(), Json::Str(dest.clone())),
+                ]),
+            )]),
+            Step::PackErofs { root, output } => Json::Obj(vec![(
+                "packErofs".into(),
+                Json::Obj(vec![
+                    ("root".into(), Json::Str(root.clone())),
+                    ("output".into(), Json::Str(output.clone())),
+                ]),
+            )]),
+            Step::Sha256Manifest { output, entries } => Json::Obj(vec![(
+                "sha256Manifest".into(),
+                Json::Obj(vec![
+                    ("output".into(), Json::Str(output.clone())),
+                    ("entries".into(), pair_arr(entries)),
                 ]),
             )]),
             Step::Symlink { target, link } => Json::Obj(vec![(
@@ -1056,6 +1082,33 @@ mod tests {
         assert_eq!(
             s.to_json().to_canonical(),
             r#"{"mesBoot":{"nyacc":"{in:nyacc}","source":"{in:mes-source}","stage0":"{in:stage0}"}}"#
+        );
+    }
+
+    #[test]
+    fn deployment_steps_emit_the_engine_dispatch_shape() {
+        let pack = Step::PackErofs {
+            root: "{root}/real-root".into(),
+            output: "{out}/deployment/root.erofs".into(),
+        };
+        assert_eq!(
+            pack.to_json().to_canonical(),
+            r#"{"packErofs":{"output":"{out}/deployment/root.erofs","root":"{root}/real-root"}}"#
+        );
+
+        let manifest = Step::Sha256Manifest {
+            output: "{out}/deployment/manifest".into(),
+            entries: vec![
+                ("bzImage".into(), "{out}/deployment/bzImage".into()),
+                (
+                    "initramfs.cpio".into(),
+                    "{out}/deployment/initramfs.cpio".into(),
+                ),
+            ],
+        };
+        assert_eq!(
+            manifest.to_json().to_canonical(),
+            r#"{"sha256Manifest":{"entries":[["bzImage","{out}/deployment/bzImage"],["initramfs.cpio","{out}/deployment/initramfs.cpio"]],"output":"{out}/deployment/manifest"}}"#
         );
     }
 }

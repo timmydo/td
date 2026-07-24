@@ -2089,6 +2089,59 @@ fn relocate_ld_scripts(dir: &Path, prefix: &str) -> Result<(), String> {
     Ok(())
 }
 
+fn pack_erofs(root: &Path, output: &Path) -> Result<(), String> {
+    let image = crate::erofs::build_image(root)
+        .map_err(|e| format!("pack erofs {}: {e}", root.display()))?;
+    if let Some(parent) = output.parent().filter(|p| !p.as_os_str().is_empty()) {
+        fs::create_dir_all(parent)
+            .map_err(|e| format!("pack erofs: mkdir {}: {e}", parent.display()))?;
+    }
+    fs::write(output, image)
+        .map_err(|e| format!("pack erofs: write {}: {e}", output.display()))
+}
+
+fn valid_artifact_label(label: &str) -> bool {
+    !label.is_empty()
+        && label != "."
+        && label != ".."
+        && label
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+}
+
+fn write_sha256_manifest(
+    output: &Path,
+    mut entries: Vec<(String, String)>,
+) -> Result<(), String> {
+    if entries.is_empty() {
+        return Err("sha256 manifest: no artifacts".into());
+    }
+    entries.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut manifest = String::from("td-deployment-v1\n");
+    let mut previous: Option<&str> = None;
+    for (label, path) in &entries {
+        if !valid_artifact_label(label) {
+            return Err(format!("sha256 manifest: invalid artifact label `{label}'"));
+        }
+        if previous == Some(label.as_str()) {
+            return Err(format!("sha256 manifest: duplicate artifact label `{label}'"));
+        }
+        let digest = crate::sha256::sha256_file(Path::new(path))
+            .map_err(|e| format!("sha256 manifest: hash {path}: {e}"))?;
+        manifest.push_str(&digest);
+        manifest.push_str("  ");
+        manifest.push_str(label);
+        manifest.push('\n');
+        previous = Some(label);
+    }
+    if let Some(parent) = output.parent().filter(|p| !p.as_os_str().is_empty()) {
+        fs::create_dir_all(parent)
+            .map_err(|e| format!("sha256 manifest: mkdir {}: {e}", parent.display()))?;
+    }
+    fs::write(output, manifest)
+        .map_err(|e| format!("sha256 manifest: write {}: {e}", output.display()))
+}
+
 /// mesboot-build — td's bootstrap-RUNG build "system" (#378 slices 2+3; sibling
 /// of `run`/`run_rust`/`run_cmake`/`run_stage0`). Executes the recipe's typed
 /// steps (TD_STEPS, data — see recipes/src/types.rs `Step`) over the staged
@@ -2239,6 +2292,17 @@ pub fn run_mesboot() -> Result<(), String> {
             let from = ctx.expand(&field(o, "from")?).map_err(err)?;
             let dest = ctx.expand(&field(o, "dest")?).map_err(err)?;
             copy_tree_writable(Path::new(&from), Path::new(&dest)).map_err(err)?;
+        } else if let Some(o) = step.get("packErofs") {
+            let root = ctx.expand(&field(o, "root")?).map_err(err)?;
+            let output = ctx.expand(&field(o, "output")?).map_err(err)?;
+            pack_erofs(Path::new(&root), Path::new(&output)).map_err(err)?;
+        } else if let Some(o) = step.get("sha256Manifest") {
+            let output = ctx.expand(&field(o, "output")?).map_err(err)?;
+            let mut entries = Vec::new();
+            for (label, path) in pairs(o, "entries")? {
+                entries.push((label, ctx.expand(&path).map_err(err)?));
+            }
+            write_sha256_manifest(Path::new(&output), entries).map_err(err)?;
         } else if let Some(o) = step.get("symlink") {
             let target = ctx.expand(&field(o, "target")?).map_err(err)?;
             let link = ctx.expand(&field(o, "link")?).map_err(err)?;
@@ -2307,6 +2371,10 @@ pub fn run_mesboot() -> Result<(), String> {
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    fn test_dir(tag: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("td-build-{tag}-{}", std::process::id()))
+    }
 
     fn edit(from: &str, to: &str, expect: usize) -> (String, String, usize) {
         (from.to_string(), to.to_string(), expect)
@@ -2389,6 +2457,78 @@ mod tests {
         let e_from = apply_text_edits("f", "x".to_string(), &[edit("café", "cafe", 1)])
             .unwrap_err();
         assert!(e_from.contains("must be ASCII"), "{e_from}");
+    }
+
+    #[test]
+    fn deployment_image_and_manifest_are_engine_native_and_deterministic() {
+        let d = test_dir("deployment");
+        let _ = fs::remove_dir_all(&d);
+        let root = d.join("root");
+        fs::create_dir_all(root.join("etc")).unwrap();
+        fs::write(root.join("etc/issue"), b"td\n").unwrap();
+        let deployment = d.join("deployment");
+        let image = deployment.join("root.erofs");
+        pack_erofs(&root, &image).unwrap();
+        let bytes = fs::read(&image).unwrap();
+        assert_eq!(
+            bytes.get(1024..1028),
+            Some([0xe2, 0xe1, 0xf5, 0xe0].as_slice()),
+            "EROFS superblock magic"
+        );
+
+        let kernel = deployment.join("bzImage");
+        fs::write(&kernel, b"kernel").unwrap();
+        let manifest = deployment.join("manifest");
+        write_sha256_manifest(
+            &manifest,
+            vec![
+                ("root.erofs".into(), image.to_string_lossy().into_owned()),
+                ("bzImage".into(), kernel.to_string_lossy().into_owned()),
+            ],
+        )
+        .unwrap();
+        let first = fs::read_to_string(&manifest).unwrap();
+        write_sha256_manifest(
+            &manifest,
+            vec![
+                ("bzImage".into(), kernel.to_string_lossy().into_owned()),
+                ("root.erofs".into(), image.to_string_lossy().into_owned()),
+            ],
+        )
+        .unwrap();
+        assert_eq!(fs::read_to_string(&manifest).unwrap(), first);
+        assert!(first.starts_with("td-deployment-v1\n"));
+        assert!(
+            first.find("  bzImage\n").unwrap() < first.find("  root.erofs\n").unwrap(),
+            "entries are sorted by artifact label: {first}"
+        );
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn deployment_manifest_rejects_ambiguous_labels() {
+        let d = test_dir("manifest-labels");
+        let _ = fs::remove_dir_all(&d);
+        fs::create_dir_all(&d).unwrap();
+        let artifact = d.join("artifact");
+        fs::write(&artifact, b"x").unwrap();
+        let path = artifact.to_string_lossy().into_owned();
+
+        for label in ["../escape", ".", ".."] {
+            let bad = write_sha256_manifest(
+                &d.join("bad"),
+                vec![(label.into(), path.clone())],
+            )
+            .unwrap_err();
+            assert!(bad.contains("invalid artifact label"), "{bad}");
+        }
+        let duplicate = write_sha256_manifest(
+            &d.join("duplicate"),
+            vec![("same".into(), path.clone()), ("same".into(), path)],
+        )
+        .unwrap_err();
+        assert!(duplicate.contains("duplicate artifact label"), "{duplicate}");
+        fs::remove_dir_all(&d).unwrap();
     }
 
     #[test]

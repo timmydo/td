@@ -1,17 +1,15 @@
 //! Host-side interactive distro runner (re #541, #550): build the td-source-built
-//! distro — the `system-x86-64` two-stage boot images plus the `linux-x86-64` bzImage
-//! — and boot it under HOST qemu with an INTERACTIVE serial console, so an operator can
+//! `system-x86-64` deployment bundle and boot it under HOST qemu with an
+//! INTERACTIVE serial console, so an operator can
 //! watch it boot, mount the read-only erofs root, `switch_root` into it, auto-log-in as
 //! the test user, and use the shell. Reached only through the `td-recipe-eval run`
 //! subcommand (check_runner::run_cli).
 //!
-//! Two-stage boot (#550): the guest boots the stage-1 init-initramfs (`init.cpio`),
+//! Two-stage boot (#550): the guest boots the stage-1 initramfs (`initramfs.cpio`),
 //! which mounts the read-only erofs `/td/store` root over virtio-blk (`/dev/vda`),
 //! overlays tmpfs for the writable dirs, and `switch_root`s into the real root. The
-//! erofs image is packed HERE from the recipe's staged `{out}/root` tree by the
-//! control-plane `td-builder mkfs-erofs` writer (#548) — recipes cannot invoke the
-//! writer, so the recipe stages the tree and this host-side tool builds the image, the
-//! same split checks/qemu_boot.rs uses.
+//! recipe emits `{bzImage,initramfs.cpio,root.erofs,manifest}` and this consumer
+//! verifies the manifest before copying the three payloads out for boot.
 //!
 //! Sibling of checks/qemu_boot.rs. Same host-free build (`build_plan` builds the kernel
 //! and system images inside their own nested build jail) and the same trust model (host
@@ -31,7 +29,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use crate::check_runner::RecipeCheckRunner;
-use crate::checks::qemu_boot::{drive_arg, find_qemu};
+use crate::checks::qemu_boot::{drive_arg, find_qemu, verify_deployment};
 
 /// The distro image recipe this runner boots; its recipe closure pulls in the
 /// `linux-x86-64` kernel that supplies the bzImage.
@@ -100,12 +98,6 @@ impl TempImages {
             .to_string())
     }
 
-    /// The private dir's path, so `run()` can target the control-plane erofs writer at it
-    /// (the erofs root is BUILT here, not copied — see `run()`).
-    fn dir(&self) -> &Path {
-        &self.dir
-    }
-
     /// Copy `src` to `<dir>/<name>`, returning the destination path.
     fn stage(&self, src: &Path, name: &str) -> Result<PathBuf, String> {
         let dst = self.dir.join(name);
@@ -131,7 +123,7 @@ pub(crate) fn run(runner: &RecipeCheckRunner, lock: File) -> Result<(), String> 
     let qemu = find_qemu()?;
 
     // Build the distro image; its closure includes the kernel, so a single build
-    // plan yields the bzImage, the stage-1 init.cpio, and the real-root tree.
+    // plan yields the complete deployment bundle.
     // Announce the build up front — an otherwise-silent wait — and the runner streams
     // the builder's per-rung stderr live from here on (each `td-builder: build-plan
     // step ...` line is one rung landing).
@@ -142,73 +134,29 @@ pub(crate) fn run(runner: &RecipeCheckRunner, lock: File) -> Result<(), String> 
          first after a `td-recipe-eval clear-store`) cold-climbs the whole ladder from stage0 and\n         \
          can take many minutes. Per-rung progress streams below.\n"
     );
-    // Build (or reuse whole) the distro AND its in-closure kernel in one plan,
-    // staging both outputs into tdstore; a warm memo hit skips the climb entirely.
-    let trees = runner.build_and_stage(SYSTEM, &[SYSTEM, KERNEL])?;
+    // Build (or reuse whole) the distro and stage its single deployment output
+    // into tdstore; a warm memo hit skips the climb entirely.
+    let trees = runner.build_and_stage(SYSTEM, &[SYSTEM])?;
     let system_tree = trees
         .first()
         .cloned()
         .ok_or_else(|| format!("distro build did not stage the {SYSTEM} output"))?;
-    let kernel_tree = trees
-        .get(1)
-        .cloned()
-        .ok_or_else(|| format!("distro build did not stage the {KERNEL} output"))?;
-    let bzimage = kernel_tree.join("bzImage");
-    let init_cpio = system_tree.join("init.cpio");
-    let root_tree = system_tree.join("root");
-    for (label, path) in [("bzImage", &bzimage), ("init.cpio", &init_cpio)] {
-        if !path.is_file() {
-            return Err(format!(
-                "distro build is missing {label} ({}) - the runner needs the kernel and the stage-1 initramfs",
-                path.display()
-            ));
-        }
-    }
-    if !root_tree.is_dir() {
-        return Err(format!(
-            "distro build is missing the real-root tree ({}) - the runner needs it to build the erofs root",
-            root_tree.display()
-        ));
-    }
+    let (bzimage, initramfs, root_erofs) =
+        verify_deployment(&system_tree.join("deployment"))?;
 
     // Stage the boot images OUT of the ladder scratch to a private host temp dir BEFORE we
     // release the lock. Once the lock is free, a concurrent `td-recipe-eval clear-store` can
     // acquire it and wipe the entire ladder work dir (check_runner::clear_ladder),
     // which would delete these images out from under a boot that has not yet loaded
     // -kernel/-initrd/-drive into guest memory. Booting from private copies closes that
-    // race entirely (re #541, Codex/subagent review). The kernel and init.cpio are copied;
-    // the erofs root is BUILT directly into the private dir from the ladder tree (below).
-    // Everything under `images` is removed when it drops — on every return path.
+    // race entirely (re #541, Codex/subagent review). Everything under `images`
+    // is removed when it drops — on every return path.
     let images = TempImages::new(runner.ladder_work_dir())?;
     let boot_bzimage = images.stage(&bzimage, "bzImage")?;
-    let boot_init = images.stage(&init_cpio, "init.cpio")?;
+    let boot_init = images.stage(&initramfs, "initramfs.cpio")?;
+    let boot_disk = images.stage(&root_erofs, "root.erofs")?;
 
-    // Pack the real-root TREE into a read-only erofs image with the control-plane
-    // `td-builder mkfs-erofs` writer (#548), writing it straight into the private dir so
-    // it survives a post-lock ladder wipe. Done while the lock is STILL HELD — it reads
-    // `root_tree` from the ladder scratch, which a concurrent wipe could otherwise remove.
-    let boot_disk = images.dir().join("system-root.img");
-    let status = runner
-        .builder_command()
-        .arg("mkfs-erofs")
-        .arg(&root_tree)
-        .arg(&boot_disk)
-        .status()
-        .map_err(|e| format!("spawn td-builder mkfs-erofs: {e}"))?;
-    if !status.success() {
-        return Err(format!(
-            "td-builder mkfs-erofs failed ({status}) building the erofs root from {}",
-            root_tree.display()
-        ));
-    }
-    if !boot_disk.is_file() {
-        return Err(format!(
-            "td-builder mkfs-erofs reported success but did not produce the erofs root image {}",
-            boot_disk.display()
-        ));
-    }
-
-    // The build (which mutates the ladder) is done and every image is staged/built out.
+    // The build is done and every verified payload is staged out.
     // Release the ladder lock now, BEFORE the unbounded interactive boot: this process
     // stays alive so the reaper never touches our scratch, and the boot reads only the
     // private copies. Holding the lock across an unbounded interactive session would
@@ -217,7 +165,7 @@ pub(crate) fn run(runner: &RecipeCheckRunner, lock: File) -> Result<(), String> 
 
     println!(
         "   [run] booting the td distro TWO-STAGE under {qemu} (TCG) - interactive serial console\n         \
-         kernel:     {}\n         init.cpio:  {}\n         erofs root: {}\n         \
+         kernel:     {}\n         initramfs:  {}\n         erofs root: {}\n         \
          Stage-1 mounts the read-only erofs root over virtio-blk and switch_roots into it;\n         \
          auto-login as the test user is enabled.\n         \
          To power off: type `exit` (or Ctrl-D) at the shell - the session wrapper reboots\n         \
@@ -232,7 +180,7 @@ pub(crate) fn run(runner: &RecipeCheckRunner, lock: File) -> Result<(), String> 
 
 /// Boot the two-stage image under qemu with the guest's ttyS0 wired to THIS process's
 /// stdio (`-nographic`), inherited so the operator drives the console directly. The
-/// stage-1 `init.cpio` is the initramfs and the erofs root is attached as a READ-ONLY
+/// stage-1 `initramfs.cpio` is the initramfs and root.erofs is attached as a READ-ONLY
 /// virtio-blk disk (`/dev/vda`) the stage-1 init mounts and `switch_root`s into. No
 /// marker scan, no timeout, no kill — the guest owns the terminal until the operator
 /// types `exit`/Ctrl-D at the greeter (the `tty-session` wrapper then `reboot -f`s as

@@ -4,41 +4,35 @@ use crate::ladder::{
 };
 use crate::types::{Recipe, Step};
 
-// system-x86-64 (re #541, #550): a MINIMAL, TAILORABLE Rust-first Linux distro image,
-// booted TWO-STAGE onto a disk-backed READ-ONLY erofs `/td/store` root.
+// system-x86-64 (re #541, #550): a MINIMAL, TAILORABLE Rust-first Linux
+// deployment, booted TWO-STAGE onto a disk-backed READ-ONLY erofs root.
 //
 // This is the "system definition" recipe. It composes artifacts that already exist in
 // the ladder — the source-built `linux-x86-64` kernel and the td-built STATIC busybox —
-// into a two-stage boot:
+// into a first-class deployment bundle:
 //
-//   Stage 1 — a tiny init-initramfs (`{out}/init.cpio`): static busybox + a `/init`
-//   SCRIPT that mounts the erofs root read-only over virtio-blk at `/sysroot`, overlays
-//   tmpfs for the writable dirs (`/etc /var /home`) plus fresh tmpfs `/run` `/tmp`, then
-//   `switch_root`s into the real root and execs its init.
+//   deployment/{bzImage,initramfs.cpio,root.erofs,manifest}
 //
-//   Stage 2 — the REAL ROOT TREE (`{out}/root/`): the store-native rootfs (busybox at
-//   its /td/store path, a /bin symlink farm, generated /etc) staged as a real directory.
-//   The control-plane erofs WRITER (`td-builder mkfs-erofs`, #548) packs THIS tree into
-//   the read-only erofs image the boot tools attach as `/dev/vda`. Recipes cannot invoke
-//   the control-plane writer (it never sits on a recipe PATH/argv), so the recipe stages
-//   the TREE and the host-side boot tools (`checks/run.rs`, `checks/qemu_boot.rs`) build
-//   the image from it — the same split the #549 `qemu-boot-erofs` probe already uses.
+// Stage 1 is a tiny initramfs: static busybox plus a `/init` script that mounts
+// root.erofs read-only from virtio-blk, overlays tmpfs for `/etc /var /home`,
+// mounts fresh tmpfs at `/run /tmp`, then switch_roots into stage 2. Stage 2 is
+// the store-native real root (busybox and uutils at their /td/store paths, a
+// /bin symlink farm, and generated /etc). The typed PackErofs step invokes the
+// dependency-free control-plane image writer directly; no recipe process can
+// execute td-builder through PATH or argv. The versioned manifest hashes the
+// three boot payloads.
 //
 // The busybox init auto-logs-in a test user to a shell with a welcome banner. EDIT the
 // `SYSTEM` const below to tailor the distro (hostname, users, the auto-login user, the
-// login shell, the applet set). A producer-rung shape check on both the packed init.cpio
-// and the staged root tree is the automated build guard; the interactive
+// login shell, the applet set). A producer-rung shape check on the deployment
+// bundle and its scratch root tree is the automated build guard; the interactive
 // `td-recipe-eval run` boots the two-stage image under host qemu so you can use it, and
 // the headless `td-recipe-eval qemu-boot-system` asserts it boots to the greeter on a
 // read-only erofs root and powers off cleanly on `exit`.
 //
-// Userland strategy (v0): busybox provides init/getty/login/ash/coreutils/switch_root —
-// all present in its `defconfig`, all STATIC, so both the initramfs AND the erofs root
-// are self-contained (no glibc closure, no host bytes). This is an explicitly
-// TRANSITIONAL start on the AGENTS.md Rust-first path: swapping busybox coreutils for the
-// (dynamically-linked, Rust) uutils is its own atomic migration PR (#547) — it needs the
-// full Rust bootstrap plus a packed glibc runtime closure on the erofs root, so it lands
-// separately, not inline here.
+// Userland strategy (v0): static busybox provides the boot/login/shell path;
+// source-built Rust uutils provides the interactive core file/text userland
+// with its declared glibc runtime closure.
 //
 // Layout: the image is STORE-NATIVE. The busybox binary is packed at its
 // content-addressed /td/store/<hash>-busybox-x86-64/bin path, and /bin is a PURE symlink
@@ -384,7 +378,7 @@ fn build_os_release(sys: &SystemDef) -> String {
 
 /// The generated /etc files (config + the login-glue and boot-check scripts). `exec`
 /// marks the ones getty/init reference as executables. Shared by the real-root staging
-/// (written under `{out}/root/etc`) and the shape check (which asserts they landed).
+/// (written under `{root}/real-root/etc`) and the shape check (which asserts they landed).
 fn etc_files(sys: &SystemDef) -> Vec<(&'static str, String, bool)> {
     vec![
         ("passwd", build_passwd(sys), false),
@@ -426,8 +420,8 @@ fn build_stage1_spec() -> String {
     s
 }
 
-/// Stage the REAL ROOT tree under `{out}/root` (packed to a read-only erofs by the
-/// control-plane writer in the boot tools). Uses typed steps (no shell): the busybox
+/// Stage the REAL ROOT tree under `{root}/real-root` build scratch. The typed
+/// PackErofs step later packs it into the deployment output. Uses typed steps (no shell): the busybox
 /// package is copied to its /td/store path, /bin is a symlink farm into it, /init is a
 /// symlink to busybox, /etc holds the generated config, and the pseudo-fs + writable
 /// mountpoint dirs are created empty (stage-1/init mount over them). The erofs writer
@@ -453,21 +447,21 @@ fn real_root_steps(sys: &SystemDef) -> Vec<Step> {
     }
     for d in &dirs {
         steps.push(Step::MkDir {
-            path: format!("{{out}}/root{d}"),
+            path: format!("{{root}}/real-root{d}"),
         });
     }
     // The busybox store package copied to its content-addressed /td/store path inside the
     // root, so /bin's symlinks (and /init) resolve on the mounted erofs.
     steps.push(Step::CopyTree {
         from: "{in:busybox-x86-64}".into(),
-        dest: "{out}/root{in:busybox-x86-64}".into(),
+        dest: "{root}/real-root{in:busybox-x86-64}".into(),
     });
     // uutils' `coreutils` multicall copied to its content-addressed /td/store path (a
     // direct, hash-prefixed store dir like busybox), so the /bin coreutils symlinks resolve
     // on the mounted erofs (#547).
     steps.push(Step::CopyTree {
         from: "{in:uutils}".into(),
-        dest: "{out}/root{in:uutils}".into(),
+        dest: "{root}/real-root{in:uutils}".into(),
     });
     // uutils is dynamically linked, so its runtime closure must ALSO live on the read-only
     // root at the absolute /td/store path its interpreter + RUNPATH resolve. Both build paths
@@ -480,18 +474,18 @@ fn real_root_steps(sys: &SystemDef) -> Vec<Step> {
     // (e.g. a separate libgcc_s dir), naming the exact miss.
     steps.push(Step::CopyTree {
         from: "{in:glibc-x86-64}/stage/td/store/glibc-2.41-x86_64".into(),
-        dest: "{out}/root{in:glibc-x86-64}/stage/td/store/glibc-2.41-x86_64".into(),
+        dest: "{root}/real-root{in:glibc-x86-64}/stage/td/store/glibc-2.41-x86_64".into(),
     });
     // /bin symlink farm: /bin/busybox, every applet, and /init resolve DIRECTLY into the
     // store busybox (busybox dispatches on argv[0]'s basename).
     steps.push(Step::Symlink {
         target: "{in:busybox-x86-64}/bin/busybox".into(),
-        link: "{out}/root/bin/busybox".into(),
+        link: "{root}/real-root/bin/busybox".into(),
     });
     for app in BUSYBOX_APPLETS {
         steps.push(Step::Symlink {
             target: "{in:busybox-x86-64}/bin/busybox".into(),
-            link: format!("{{out}}/root/bin/{app}"),
+            link: format!("{{root}}/real-root/bin/{app}"),
         });
     }
     // The core file/text userland resolves into the uutils `coreutils` multicall instead of
@@ -500,17 +494,17 @@ fn real_root_steps(sys: &SystemDef) -> Vec<Step> {
     for app in UUTILS_APPLETS {
         steps.push(Step::Symlink {
             target: "{in:uutils}/bin/coreutils".into(),
-            link: format!("{{out}}/root/bin/{app}"),
+            link: format!("{{root}}/real-root/bin/{app}"),
         });
     }
     steps.push(Step::Symlink {
         target: "{in:busybox-x86-64}/bin/busybox".into(),
-        link: "{out}/root/init".into(),
+        link: "{root}/real-root/init".into(),
     });
     // Generated /etc.
     for (name, content, exec) in etc_files(sys) {
         steps.push(Step::WriteFile {
-            path: format!("{{out}}/root/etc/{name}"),
+            path: format!("{{root}}/real-root/etc/{name}"),
             content,
             exec,
         });
@@ -518,8 +512,8 @@ fn real_root_steps(sys: &SystemDef) -> Vec<Step> {
     steps
 }
 
-/// A producer-rung shape check on BOTH the stage-1 `init.cpio` and the staged real-root
-/// tree. For the cpio: real newc magic, a size floor (static busybox alone is ~1 MiB), a
+/// A producer-rung shape check on the deployment bundle and staged real-root
+/// scratch tree. For the cpio: real newc magic, a size floor (static busybox alone is ~1 MiB), a
 /// `busybox cpio -t` parse, the members that make it bootable (incl. the /init pivot
 /// script), and the busybox binary under /td/store. For the root tree: /init and /bin/sh
 /// are symlinks into /td/store, the key /etc files exist, and the busybox binary is
@@ -532,7 +526,7 @@ fn real_root_steps(sys: &SystemDef) -> Vec<Step> {
 /// Latin-1). This is a build sanity assert, not a behavioural test — the boot is exercised
 /// by `td-recipe-eval run` and the headless `qemu-boot-system` oracle.
 fn shape_check() -> String {
-    "init='{out}/init.cpio'; root='{out}/root'; bb='{in:busybox-x86-64}/bin/busybox'; \
+    "init='{out}/deployment/initramfs.cpio'; root='{root}/real-root'; disk='{out}/deployment/root.erofs'; manifest='{out}/deployment/manifest'; bb='{in:busybox-x86-64}/bin/busybox'; \
      sz=$(wc -c < \"$init\"); \
      [ \"$sz\" -ge 65536 ] || { echo \"init.cpio: implausibly small ($sz bytes) - the static busybox alone is ~1 MiB\" >&2; exit 1; }; \
      set -- $(od -An -tx1 -N 6 \"$init\"); \
@@ -548,13 +542,13 @@ fn shape_check() -> String {
      for f in passwd group shadow hostname os-release inittab profile autologin tty-session rootcheck; do \
          [ -f \"$root/etc/$f\" ] || { echo \"root tree: /etc/$f missing\" >&2; exit 1; }; \
      done; \
-     rbb=\"{out}/root{in:busybox-x86-64}/bin/busybox\"; { [ -f \"$rbb\" ] && [ -x \"$rbb\" ]; } || { echo 'root tree: the busybox binary is not packed/executable at root{in:busybox-x86-64}/bin/busybox - the store-native /bin symlinks would all dangle' >&2; exit 1; }; \
+     rbb=\"{root}/real-root{in:busybox-x86-64}/bin/busybox\"; { [ -f \"$rbb\" ] && [ -x \"$rbb\" ]; } || { echo 'root tree: the busybox binary is not packed/executable at real-root{in:busybox-x86-64}/bin/busybox - the store-native /bin symlinks would all dangle' >&2; exit 1; }; \
      applets=$(\"$bb\" --list 2>/dev/null) || { echo 'busybox --list failed - cannot verify applet coverage' >&2; exit 1; }; \
      for a in @BUSYBOX_APPLETS@; do \
          printf '%s\\n' \"$applets\" | grep -q -x -F \"$a\" || { echo \"busybox does not implement applet '$a' (config drift) - its packed /bin/$a symlink would be a dead link\" >&2; exit 1; }; \
      done; \
-     uu=\"{out}/root{in:uutils}/bin/coreutils\"; uutgt=\"{in:uutils}/bin/coreutils\"; \
-     { [ -f \"$uu\" ] && [ -x \"$uu\" ]; } || { echo 'root tree: the uutils coreutils multicall is not packed at root{in:uutils}/bin/coreutils - the /bin coreutils symlinks would all dangle (#547)' >&2; exit 1; }; \
+     uu=\"{root}/real-root{in:uutils}/bin/coreutils\"; uutgt=\"{in:uutils}/bin/coreutils\"; \
+     { [ -f \"$uu\" ] && [ -x \"$uu\" ]; } || { echo 'root tree: the uutils coreutils multicall is not packed at real-root{in:uutils}/bin/coreutils - the /bin coreutils symlinks would all dangle (#547)' >&2; exit 1; }; \
      for a in @UUTILS_APPLETS@; do \
          [ \"$(readlink \"$root/bin/$a\" 2>/dev/null)\" = \"$uutgt\" ] || { echo \"root tree: /bin/$a is not a symlink to the staged uutils multicall ($uutgt) - the uutils /bin farm regressed (#547)\" >&2; exit 1; }; \
      done; \
@@ -564,7 +558,16 @@ fn shape_check() -> String {
      for p in $pkgs; do \
          [ -d \"$root$p\" ] || { echo \"root tree: uutils references store package '$p' (its interp/RUNPATH) which is NOT staged on the erofs root - the dynamic closure is incomplete (#547); add the package that provides it to native_inputs and CopyTree its store subtree onto the root\" >&2; miss=1; }; \
      done; \
-     [ \"$miss\" = 0 ] || exit 1"
+     [ \"$miss\" = 0 ] || exit 1; \
+     dsz=$(wc -c < \"$disk\"); \
+     [ \"$dsz\" -ge 4096 ] || { echo \"root.erofs: implausibly small ($dsz bytes)\" >&2; exit 1; }; \
+     set -- $(od -An -tx1 -j 1024 -N 4 \"$disk\"); \
+     [ \"$1$2$3$4\" = e2e1f5e0 ] || { echo 'root.erofs: missing EROFS superblock magic at byte 1024' >&2; exit 1; }; \
+     [ \"$(wc -l < \"$manifest\")\" -eq 4 ] || { echo 'manifest: expected header plus exactly three payload entries' >&2; exit 1; }; \
+     [ \"$(head -n 1 \"$manifest\")\" = td-deployment-v1 ] || { echo 'manifest: unsupported or missing td-deployment-v1 header' >&2; exit 1; }; \
+     for a in bzImage initramfs.cpio root.erofs; do \
+         grep -q -E \"^[0-9a-f]{64}  $a$\" \"$manifest\" || { echo \"manifest: missing strict SHA-256 entry for $a\" >&2; exit 1; }; \
+     done"
         // The busybox check names the concrete `{in:busybox-x86-64}` path, not a
         // `td/store/*/bin/busybox` glob: bash-mesboot 2.05b (this step's shell) can't expand
         // a wildcard in a non-terminal path component.
@@ -616,15 +619,14 @@ pub fn recipe() -> Recipe {
         path: "{out}".into(),
     });
 
-    // 1) Stage the real-root TREE at {out}/root (packed to a read-only erofs by the boot
-    //    tools' control-plane writer). shadow gets a follow-up chmod 0600 (WriteFile can
+    // 1) Stage the real-root tree in build scratch. shadow gets a follow-up chmod 0600 (WriteFile can
     //    only set 0644/0755, and a world-readable shadow — even with empty/locked
     //    passwords — should not regress from the old gen_init_cpio 0600).
     steps.extend(real_root_steps(&SYSTEM));
     steps.push(
         Step::run(
             "{out}",
-            &[SH, "-c", "chmod 0600 '{out}/root/etc/shadow'"],
+            &[SH, "-c", "chmod 0600 '{root}/real-root/etc/shadow'"],
         )
         .env("PATH", &mesboot0_path()),
     );
@@ -649,15 +651,51 @@ pub fn recipe() -> Recipe {
             &[
                 SH,
                 "-c",
-                "'{in:linux-x86-64}/gen_init_cpio' -t 1 '{root}/init.spec' > '{out}/init.cpio'",
+                "'{in:linux-x86-64}/gen_init_cpio' -t 1 '{root}/init.spec' > '{root}/initramfs.cpio'",
             ],
         )
         .env("PATH", &mesboot0_path()),
     );
 
-    // 3) Require the artifacts and shape-check them.
+    // 3) Materialise the first-class deployment bundle. PackErofs is executed
+    //    by the derivation engine itself, never exposed to recipe argv/PATH.
+    steps.push(Step::MkDir {
+        path: "{out}/deployment".into(),
+    });
+    steps.push(Step::CopyFiles {
+        files: vec![
+            "{in:linux-x86-64}/bzImage".into(),
+            "{root}/initramfs.cpio".into(),
+        ],
+        dest: "{out}/deployment".into(),
+    });
+    steps.push(Step::PackErofs {
+        root: "{root}/real-root".into(),
+        output: "{out}/deployment/root.erofs".into(),
+    });
+    steps.push(Step::Sha256Manifest {
+        output: "{out}/deployment/manifest".into(),
+        entries: vec![
+            ("bzImage".into(), "{out}/deployment/bzImage".into()),
+            (
+                "initramfs.cpio".into(),
+                "{out}/deployment/initramfs.cpio".into(),
+            ),
+            (
+                "root.erofs".into(),
+                "{out}/deployment/root.erofs".into(),
+            ),
+        ],
+    });
+
+    // 4) Require the complete contract and shape-check every payload.
     steps.push(Step::Require {
-        paths: vec!["{out}/init.cpio".into(), "{out}/root/init".into()],
+        paths: vec![
+            "{out}/deployment/bzImage".into(),
+            "{out}/deployment/initramfs.cpio".into(),
+            "{out}/deployment/root.erofs".into(),
+            "{out}/deployment/manifest".into(),
+        ],
         exec: false,
     });
     steps.push(Step::run("{out}", &[SH, "-c", &shape_check()]).env("PATH", &mesboot0_path()));
@@ -680,6 +718,40 @@ pub fn recipe() -> Recipe {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn deployment_contract_is_recipe_owned() {
+        let steps = recipe().steps.expect("system recipe steps");
+        let pack = steps.iter().filter_map(|step| match step {
+            Step::PackErofs { root, output } => Some((root.as_str(), output.as_str())),
+            _ => None,
+        });
+        assert_eq!(
+            pack.collect::<Vec<_>>(),
+            vec![("{root}/real-root", "{out}/deployment/root.erofs")],
+            "the recipe must pack its scratch root into the deployment output exactly once"
+        );
+
+        let manifests: Vec<&Vec<(String, String)>> = steps
+            .iter()
+            .filter_map(|step| match step {
+                Step::Sha256Manifest { output, entries }
+                    if output == "{out}/deployment/manifest" =>
+                {
+                    Some(entries)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(manifests.len(), 1, "the deployment needs one manifest");
+        let labels: Vec<&str> = manifests
+            .first()
+            .expect("one deployment manifest")
+            .iter()
+            .map(|(label, _)| label.as_str())
+            .collect();
+        assert_eq!(labels, ["bzImage", "initramfs.cpio", "root.erofs"]);
+    }
 
     /// The tailorable `SYSTEM` const is hand-edited to shape the distro; guard the
     /// invariants a bad edit would otherwise surface only as a silent boot failure —

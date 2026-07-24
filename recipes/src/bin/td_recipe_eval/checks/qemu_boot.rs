@@ -251,28 +251,22 @@ pub(crate) fn run_erofs(runner: &RecipeCheckRunner) -> Result<(), String> {
 }
 
 /// `qemu-boot-system` (re #550): the headless end-to-end proof of the TWO-STAGE boot.
-/// The kernel (bzImage) comes from `linux-x86-64`; the stage-1 init-initramfs
-/// (`init.cpio`) and the real-root TREE come from `system-x86-64`. The oracle packs the
-/// tree into a read-only erofs image with the control-plane `td-builder mkfs-erofs`
-/// writer (#548), attaches it as `/dev/vda`, and boots stage-1 with the autotest token on
-/// the kernel cmdline. Stage-1 mounts the erofs root read-only, overlays tmpfs for the
+/// The kernel, stage-1 initramfs, and read-only EROFS root come from
+/// `system-x86-64`'s verified deployment bundle. The oracle attaches root.erofs
+/// as `/dev/vda` and boots stage-1 with the autotest token on the kernel
+/// cmdline. Stage-1 mounts the erofs root read-only, overlays tmpfs for the
 /// writable dirs, and `switch_root`s into it; the real-root init reaches the auto-login
 /// greeter, which (seeing the autotest token) exits so the VM powers off. A green result
 /// asserts, in order: the greeter was reached, `/` is a read-only erofs mount, the
 /// writable dirs are tmpfs-backed, and the VM powered off cleanly on `exit`.
 pub(crate) fn run_system(runner: &RecipeCheckRunner) -> Result<(), String> {
-    // qemu first (fail fast if absent), then a SINGLE build of the system image, then the
-    // erofs root packed from its staged tree.
+    // qemu first (fail fast if absent), then a single build of the complete
+    // deployment artifact.
     let qemu = find_qemu()?;
-    // One build plan for the whole system closure yields BOTH the bzImage (the
-    // `linux-x86-64` rung, in system's closure) and the stage-1 init.cpio + real-root
-    // tree (the `system-x86-64` rung) — building the kernel once, not twice (mirrors the
-    // interactive `run`). build_system checks all three artifacts are present.
-    let (bzimage, init_cpio, root_tree) = build_system(runner)?;
-    let disk = build_system_erofs(runner, &root_tree)?;
+    let (bzimage, init_cpio, disk) = build_system(runner)?;
 
     println!(
-        "   [qemu-boot-system] {qemu} boots the two-stage system image under TCG: init.cpio -> read-only erofs root over virtio-blk -> switch_root -> greeter\n              kernel:     {}\n              init.cpio:  {}\n              erofs root: {}",
+        "   [qemu-boot-system] {qemu} boots the recipe-built deployment under TCG: initramfs.cpio -> read-only root.erofs over virtio-blk -> switch_root -> greeter\n              kernel:     {}\n              initramfs:  {}\n              erofs root: {}",
         bzimage.display(),
         init_cpio.display(),
         disk.display()
@@ -474,40 +468,101 @@ fn build_spike(runner: &RecipeCheckRunner) -> Result<(PathBuf, PathBuf), String>
     Ok((bzimage, initramfs))
 }
 
-/// Build the `system-x86-64` producer in a SINGLE build plan and return
-/// `(bzImage, init.cpio, root-tree)`. The system closure includes the `linux-x86-64`
-/// kernel, so one plan produces every artifact the two-stage boot needs: the bzImage from
-/// the `linux-x86-64` rung, and the stage-1 init.cpio + staged real-root TREE from the
-/// `system-x86-64` rung (`init.cpio` is a file, `root/` a directory). The recipe's own
-/// shape check guards them at build time; this re-checks their presence so a missing
-/// artifact reds here with a clear message rather than deep inside qemu.
+/// Validate a deployment manifest and return its three payload paths. The
+/// parser is deliberately strict: one version header, the canonical payload
+/// order, lowercase SHA-256, exactly two separating spaces, and no extra lines.
+/// Hashing again at consumption catches stale, truncated, or tampered staging
+/// before qemu sees any artifact.
+pub(crate) fn verify_deployment(
+    deployment: &Path,
+) -> Result<(PathBuf, PathBuf, PathBuf), String> {
+    // This byte-sorted order is part of the v1 wire format: the producer sorts
+    // labels before writing, and the strict consumer rejects non-canonical order.
+    const CANONICAL_NAMES: [&str; 3] = ["bzImage", "initramfs.cpio", "root.erofs"];
+    let manifest_path = deployment.join("manifest");
+    let manifest = fs::read_to_string(&manifest_path)
+        .map_err(|e| format!("read deployment manifest {}: {e}", manifest_path.display()))?;
+    if !manifest.ends_with('\n') {
+        return Err(format!(
+            "deployment manifest {} has no final newline",
+            manifest_path.display()
+        ));
+    }
+    let mut lines = manifest.lines();
+    if lines.next() != Some("td-deployment-v1") {
+        return Err(format!(
+            "deployment manifest {} has an unsupported or missing version header",
+            manifest_path.display()
+        ));
+    }
+
+    let mut paths = Vec::with_capacity(CANONICAL_NAMES.len());
+    for name in CANONICAL_NAMES {
+        let line = lines.next().ok_or_else(|| {
+            format!(
+                "deployment manifest {} is missing the {name} entry",
+                manifest_path.display()
+            )
+        })?;
+        let (digest, label) = line.split_once("  ").ok_or_else(|| {
+            format!(
+                "deployment manifest {} has a malformed {name} entry",
+                manifest_path.display()
+            )
+        })?;
+        if label != name
+            || digest.len() != 64
+            || !digest
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        {
+            return Err(format!(
+                "deployment manifest {} has a non-canonical {name} entry",
+                manifest_path.display()
+            ));
+        }
+        let path = deployment.join(name);
+        if !path.is_file() {
+            return Err(format!(
+                "system-x86-64 deployment is missing {name} ({})",
+                path.display()
+            ));
+        }
+        let actual = crate::sha256::sha256_file(&path)
+            .map_err(|e| format!("hash deployment payload {}: {e}", path.display()))?;
+        if actual != digest {
+            return Err(format!(
+                "system-x86-64 deployment hash mismatch for {name}: manifest has {digest}, payload has {actual}"
+            ));
+        }
+        paths.push(path);
+    }
+    if lines.next().is_some() {
+        return Err(format!(
+            "deployment manifest {} has unexpected extra entries",
+            manifest_path.display()
+        ));
+    }
+    let mut paths = paths.into_iter();
+    let bzimage = paths
+        .next()
+        .ok_or_else(|| "internal: verified deployment lost bzImage".to_string())?;
+    let initramfs = paths
+        .next()
+        .ok_or_else(|| "internal: verified deployment lost initramfs.cpio".to_string())?;
+    let root = paths
+        .next()
+        .ok_or_else(|| "internal: verified deployment lost root.erofs".to_string())?;
+    Ok((bzimage, initramfs, root))
+}
+
+/// Build `system-x86-64` in one plan and return its verified deployment
+/// `(bzImage, initramfs.cpio, root.erofs)`.
 fn build_system(runner: &RecipeCheckRunner) -> Result<(PathBuf, PathBuf, PathBuf), String> {
     runner.prepare_recipe_target("system-x86-64")?;
     let build_out = runner.build_plan("system-x86-64")?;
-    let kernel_tree = runner.ladder_out_from(&build_out, "linux-x86-64")?;
     let system_tree = runner.ladder_out_from(&build_out, "system-x86-64")?;
-    let bzimage = kernel_tree.join("bzImage");
-    let init_cpio = system_tree.join("init.cpio");
-    let root_tree = system_tree.join("root");
-    if !bzimage.is_file() {
-        return Err(format!(
-            "system-x86-64 build is missing the kernel bzImage ({}) — the two-stage boot needs it",
-            bzimage.display()
-        ));
-    }
-    if !init_cpio.is_file() {
-        return Err(format!(
-            "system-x86-64 output is missing init.cpio ({}) — the two-stage boot needs the stage-1 initramfs",
-            init_cpio.display()
-        ));
-    }
-    if !root_tree.is_dir() {
-        return Err(format!(
-            "system-x86-64 output is missing the real-root tree ({}) — the two-stage boot needs it to build the erofs root",
-            root_tree.display()
-        ));
-    }
-    Ok((bzimage, init_cpio, root_tree))
+    verify_deployment(&system_tree.join("deployment"))
 }
 
 /// Build a tiny probe erofs image with the control-plane `td-builder mkfs-erofs`
@@ -548,40 +603,6 @@ fn build_probe_image(runner: &RecipeCheckRunner) -> Result<PathBuf, String> {
     if !img.is_file() {
         return Err(format!(
             "td-builder mkfs-erofs reported success but did not produce {}",
-            img.display()
-        ));
-    }
-    Ok(img)
-}
-
-/// Pack the staged real-root TREE (`{out}/root` from the `system-x86-64` build) into a
-/// read-only erofs image with the control-plane `td-builder mkfs-erofs` writer (#548) —
-/// the `/dev/vda` root the two-stage boot switch_root's into. The recipe stages the tree
-/// (recipes cannot invoke the control-plane writer, which never sits on a recipe
-/// PATH/argv); the oracle packs it, exactly as the #549 probe path does. The image lands
-/// in the runner's per-invocation scratch, rebuilt fresh (any stale copy removed first) so
-/// a prior run's bytes can never be reused. The writer stamps uid/gid 0, so the whole root
-/// is root-owned — per-user home ownership is fixed at boot by `/etc/rootcheck`.
-fn build_system_erofs(runner: &RecipeCheckRunner, root_tree: &Path) -> Result<PathBuf, String> {
-    let scratch = runner.scratch_dir();
-    let img = scratch.join("system-root.img");
-    let _ = fs::remove_file(&img);
-    let status = runner
-        .builder_command()
-        .arg("mkfs-erofs")
-        .arg(root_tree)
-        .arg(&img)
-        .status()
-        .map_err(|e| format!("spawn td-builder mkfs-erofs: {e}"))?;
-    if !status.success() {
-        return Err(format!(
-            "td-builder mkfs-erofs failed ({status}) building the erofs root from {}",
-            root_tree.display()
-        ));
-    }
-    if !img.is_file() {
-        return Err(format!(
-            "td-builder mkfs-erofs reported success but did not produce the erofs root image {}",
             img.display()
         ));
     }
@@ -1039,6 +1060,35 @@ mod tests {
             "if=none,format=raw,readonly=on,id=erofs0,file=/sc,,ratch/erofs,,probe.img",
             "path commas not doubled (or prefix separators mangled): {s}"
         );
+    }
+
+    #[test]
+    fn deployment_manifest_verifies_payloads_and_rejects_tampering() {
+        let seq = AtomicU64::new(2000);
+        let dir = create_scratch_dir(&env::temp_dir(), &seq).unwrap();
+        let _guard = Scratch { dir: dir.clone() };
+        for (name, bytes) in [
+            ("bzImage", b"kernel".as_slice()),
+            ("initramfs.cpio", b"initramfs".as_slice()),
+            ("root.erofs", b"root".as_slice()),
+        ] {
+            fs::write(dir.join(name), bytes).unwrap();
+        }
+        let mut manifest = String::from("td-deployment-v1\n");
+        for name in ["bzImage", "initramfs.cpio", "root.erofs"] {
+            let digest = crate::sha256::sha256_file(&dir.join(name)).unwrap();
+            manifest.push_str(&format!("{digest}  {name}\n"));
+        }
+        fs::write(dir.join("manifest"), manifest).unwrap();
+
+        let (kernel, initramfs, root) = verify_deployment(&dir).unwrap();
+        assert_eq!(kernel, dir.join("bzImage"));
+        assert_eq!(initramfs, dir.join("initramfs.cpio"));
+        assert_eq!(root, dir.join("root.erofs"));
+
+        fs::write(dir.join("root.erofs"), b"tampered").unwrap();
+        let error = verify_deployment(&dir).unwrap_err();
+        assert!(error.contains("hash mismatch for root.erofs"), "{error}");
     }
 
     #[test]
