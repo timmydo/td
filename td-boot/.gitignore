@@ -1,0 +1,4 @@
+# Cargo build output — never committed. The recipe compiles the committed
+# source directly with rustc; local Cargo state is only for lint/test.
+/target
+/.cargo

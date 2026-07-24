@@ -4,7 +4,7 @@
 //!   * `kexec_file_load(2)` (#320) — stage the selected kernel + initramfs
 //!   * `reboot(2)` (#169) with `LINUX_REBOOT_CMD_KEXEC` — jump into it
 //!
-//! Payload-hash verification is the shim's job (busybox `sha256sum`), NOT this
+//! Payload-hash verification is td-boot's job, NOT this
 //! program's, so this stays a two-syscall surface. This is the ONLY `unsafe` in
 //! td outside `builder/src/sys.rs` — a recorded amendment to the confinement
 //! rule (AGENTS.md). Unlike builder's crate-level `#![allow(unsafe_code)]`, the
@@ -12,6 +12,7 @@
 //! only `syscall5` carries a scoped `#[allow]`, so any other `unsafe` reds.
 //!
 //! Usage: `td-kexec <kernel> <initramfs|-> <cmdline>`
+//!        `td-kexec --fds <cmdline>` (kernel on fd 0, initramfs on fd 1)
 //!   `<initramfs>` == "-" boots with no initramfs (`KEXEC_FILE_NO_INITRAMFS`).
 #![deny(unsafe_code)]
 
@@ -76,40 +77,33 @@ fn check(ret: isize) -> std::io::Result<isize> {
 fn usage_err() -> std::io::Error {
     std::io::Error::new(
         std::io::ErrorKind::InvalidInput,
-        "usage: td-kexec <kernel> <initramfs|-> <cmdline>",
+        "usage: td-kexec <kernel> <initramfs|-> <cmdline>\n       td-kexec --fds <cmdline>",
     )
 }
 
-fn parse_args<I: Iterator<Item = OsString>>(
-    mut args: I,
-) -> std::io::Result<(OsString, OsString, OsString)> {
-    let kernel = args.next().ok_or_else(usage_err)?;
+enum Inputs {
+    Paths(OsString, OsString, OsString),
+    Fds(OsString),
+}
+
+fn parse_args<I: Iterator<Item = OsString>>(mut args: I) -> std::io::Result<Inputs> {
+    let first = args.next().ok_or_else(usage_err)?;
+    if first == OsStr::new("--fds") {
+        let cmdline = args.next().ok_or_else(usage_err)?;
+        if args.next().is_some() {
+            return Err(usage_err());
+        }
+        return Ok(Inputs::Fds(cmdline));
+    }
     let initramfs = args.next().ok_or_else(usage_err)?;
     let cmdline = args.next().ok_or_else(usage_err)?;
     if args.next().is_some() {
         return Err(usage_err());
     }
-    Ok((kernel, initramfs, cmdline))
+    Ok(Inputs::Paths(first, initramfs, cmdline))
 }
 
-fn run() -> std::io::Result<()> {
-    // args_os()/OsString, not args()/String: kernel and initramfs are OS byte
-    // paths, and the String iterator PANICS on a non-UTF-8 argument — a valid
-    // path is not a reason to panic.
-    let (kernel, initramfs, cmdline) = parse_args(std::env::args_os().skip(1))?;
-
-    let kernel_file = File::open(&kernel)?;
-
-    // The initramfs File must outlive the syscall so its fd stays valid; bind it
-    // in an outer scope. "-" means boot with no initramfs.
-    let initrd_file;
-    let (initrd_fd, flags): (i32, usize) = if initramfs.as_os_str() == OsStr::new("-") {
-        (-1, KEXEC_FILE_NO_INITRAMFS)
-    } else {
-        initrd_file = File::open(&initramfs)?;
-        (initrd_file.as_raw_fd(), 0)
-    };
-
+fn load(kernel_fd: i32, initrd_fd: i32, flags: usize, cmdline: &OsStr) -> std::io::Result<()> {
     // The kernel copies `cmdline_len` bytes and requires the last be NUL, so pass
     // the length WITH the terminator.
     let cmdline_c = CString::new(cmdline.as_bytes()).map_err(|_| {
@@ -123,7 +117,7 @@ fn run() -> std::io::Result<()> {
     // kexec_file_load(kernel_fd, initrd_fd, cmdline_len, cmdline_ptr, flags)
     check(syscall5(
         SYS_KEXEC_FILE_LOAD,
-        kernel_file.as_raw_fd() as usize,
+        kernel_fd as usize,
         initrd_fd as usize,
         cmdline_bytes.len(),
         cmdline_bytes.as_ptr() as usize,
@@ -144,6 +138,35 @@ fn run() -> std::io::Result<()> {
     Err(std::io::Error::other(
         "reboot(LINUX_REBOOT_CMD_KEXEC) returned without booting the staged image",
     ))
+}
+
+fn run_paths(kernel: OsString, initramfs: OsString, cmdline: OsString) -> std::io::Result<()> {
+    let kernel_file = File::open(&kernel)?;
+    let initrd_file;
+    let (initrd_fd, flags): (i32, usize) = if initramfs.as_os_str() == OsStr::new("-") {
+        (-1, KEXEC_FILE_NO_INITRAMFS)
+    } else {
+        initrd_file = File::open(&initramfs)?;
+        (initrd_file.as_raw_fd(), 0)
+    };
+    load(
+        kernel_file.as_raw_fd(),
+        initrd_fd,
+        flags,
+        cmdline.as_os_str(),
+    )
+}
+
+fn run() -> std::io::Result<()> {
+    // args_os()/OsString, not args()/String: paths are arbitrary OS bytes and
+    // the String iterator panics on non-UTF-8 input.
+    match parse_args(std::env::args_os().skip(1))? {
+        Inputs::Paths(kernel, initramfs, cmdline) => run_paths(kernel, initramfs, cmdline),
+        // td-boot maps its already-open, verified files onto these descriptors
+        // across exec. Stdout is reserved for the read-only initramfs; stderr
+        // remains the diagnostic channel.
+        Inputs::Fds(cmdline) => load(0, 1, 0, cmdline.as_os_str()),
+    }
 }
 
 fn main() -> ExitCode {
@@ -180,10 +203,26 @@ mod tests {
 
     #[test]
     fn parse_preserves_the_three_values() {
-        let (k, i, c) = parse_args(args(&["/boot/bzImage", "-", "console=ttyS0"])).unwrap();
-        assert_eq!(k, OsString::from("/boot/bzImage"));
-        assert_eq!(i, OsString::from("-"));
-        assert_eq!(c, OsString::from("console=ttyS0"));
+        let parsed = parse_args(args(&["/boot/bzImage", "-", "console=ttyS0"])).unwrap();
+        match parsed {
+            Inputs::Paths(k, i, c) => {
+                assert_eq!(k, OsString::from("/boot/bzImage"));
+                assert_eq!(i, OsString::from("-"));
+                assert_eq!(c, OsString::from("console=ttyS0"));
+            }
+            Inputs::Fds(_) => panic!("expected path mode"),
+        }
+    }
+
+    #[test]
+    fn parse_accepts_verified_file_descriptor_mode() {
+        let parsed = parse_args(args(&["--fds", "console=ttyS0"])).unwrap();
+        match parsed {
+            Inputs::Fds(cmdline) => assert_eq!(cmdline, OsString::from("console=ttyS0")),
+            Inputs::Paths(_, _, _) => panic!("expected fd mode"),
+        }
+        assert!(parse_args(args(&["--fds"])).is_err());
+        assert!(parse_args(args(&["--fds", "cmdline", "extra"])).is_err());
     }
 
     #[test]

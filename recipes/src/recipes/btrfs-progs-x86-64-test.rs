@@ -6,9 +6,10 @@ use crate::types::{CheckRunner, Recipe, RecipeCheck, Step};
 pub fn recipe() -> Recipe {
     let mkfs = "{in:btrfs-progs-x86-64}/bin/mkfs.btrfs";
     let btrfs = "{in:btrfs-progs-x86-64}/bin/btrfs";
+    // Deployment directory names are the SHA-256 of their manifest bytes.
     let mut steps = vec![
         Step::MkDir {
-            path: "{root}/seed/td/deployments/test-id".into(),
+            path: "{root}/seed/td/deployments/9b749e4f4dd9ef26ce57d6c2e5e7120ea3a5e64de4394c80e56369c35791ea9d".into(),
         },
         Step::MkDir {
             path: "{root}/seed/td/boot".into(),
@@ -20,7 +21,7 @@ pub fn recipe() -> Recipe {
             path: "{root}/seed/@var/root".into(),
         },
         Step::WriteFile {
-            path: "{root}/seed/td/deployments/test-id/manifest".into(),
+            path: "{root}/seed/td/deployments/9b749e4f4dd9ef26ce57d6c2e5e7120ea3a5e64de4394c80e56369c35791ea9d/manifest".into(),
             content: "td-deployment-v1\ntest-payload\n".into(),
             exec: false,
         },
@@ -30,7 +31,7 @@ pub fn recipe() -> Recipe {
             exec: false,
         },
         Step::Symlink {
-            target: "../deployments/test-id".into(),
+            target: "../deployments/9b749e4f4dd9ef26ce57d6c2e5e7120ea3a5e64de4394c80e56369c35791ea9d".into(),
             link: "{root}/seed/td/boot/current".into(),
         },
         Step::WriteFile {
@@ -91,9 +92,9 @@ pub fn recipe() -> Recipe {
                    END { if (!found) exit 1 } \
                  ' '{root}/root-tree' || { echo '@var root item is missing or read-only' >&2; exit 1; }; \
                  '{in:btrfs-progs-x86-64}/bin/btrfs' restore -s -S '{root}/volume.btrfs' '{root}/restored'; \
-                 cmp '{root}/seed/td/deployments/test-id/manifest' '{root}/restored/td/deployments/test-id/manifest' || { echo 'deployment manifest did not round-trip' >&2; exit 1; }; \
+                 cmp '{root}/seed/td/deployments/9b749e4f4dd9ef26ce57d6c2e5e7120ea3a5e64de4394c80e56369c35791ea9d/manifest' '{root}/restored/td/deployments/9b749e4f4dd9ef26ce57d6c2e5e7120ea3a5e64de4394c80e56369c35791ea9d/manifest' || { echo 'deployment manifest did not round-trip' >&2; exit 1; }; \
                  cmp '{root}/seed/@var/home/persisted' '{root}/restored/@var/home/persisted' || { echo 'persistent-state payload did not round-trip through the @var subvolume' >&2; exit 1; }; \
-                 [ \"$(readlink '{root}/restored/td/boot/current')\" = ../deployments/test-id ] || { echo 'boot selector symlink did not round-trip' >&2; exit 1; }",
+                 [ \"$(readlink '{root}/restored/td/boot/current')\" = ../deployments/9b749e4f4dd9ef26ce57d6c2e5e7120ea3a5e64de4394c80e56369c35791ea9d ] || { echo 'boot selector symlink did not round-trip' >&2; exit 1; }",
             ],
         )
         .env("PATH", &mesboot0_path()),

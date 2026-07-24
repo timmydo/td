@@ -2806,12 +2806,18 @@ mod tests {
         );
 
         let kernel = deployment.join("bzImage");
+        let initramfs = deployment.join("initramfs.cpio");
         fs::write(&kernel, b"kernel").unwrap();
+        fs::write(&initramfs, b"initramfs").unwrap();
         let manifest = deployment.join("manifest");
         write_sha256_manifest(
             &manifest,
             vec![
                 ("root.erofs".into(), image.to_string_lossy().into_owned()),
+                (
+                    "initramfs.cpio".into(),
+                    initramfs.to_string_lossy().into_owned(),
+                ),
                 ("bzImage".into(), kernel.to_string_lossy().into_owned()),
             ],
         )
@@ -2822,14 +2828,23 @@ mod tests {
             vec![
                 ("bzImage".into(), kernel.to_string_lossy().into_owned()),
                 ("root.erofs".into(), image.to_string_lossy().into_owned()),
+                (
+                    "initramfs.cpio".into(),
+                    initramfs.to_string_lossy().into_owned(),
+                ),
             ],
         )
         .unwrap();
         assert_eq!(fs::read_to_string(&manifest).unwrap(), first);
-        assert!(first.starts_with("td-deployment-v1\n"));
-        assert!(
-            first.find("  bzImage\n").unwrap() < first.find("  root.erofs\n").unwrap(),
-            "entries are sorted by artifact label: {first}"
+        assert_eq!(
+            first,
+            format!(
+                "td-deployment-v1\n{}  bzImage\n{}  initramfs.cpio\n{}  root.erofs\n",
+                crate::sha256::hex_digest(b"kernel"),
+                crate::sha256::hex_digest(b"initramfs"),
+                crate::sha256::hex_digest(&bytes),
+            ),
+            "the engine producer matches the target boot contract"
         );
         fs::remove_dir_all(&d).unwrap();
     }

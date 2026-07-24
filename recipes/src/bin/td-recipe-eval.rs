@@ -409,6 +409,17 @@ mod tests {
         );
         assert_eq!(recipe_checks(&btrfs, None).len(), 1);
 
+        let boot = catalog::lookup("td-boot-test").unwrap();
+        assert_eq!(
+            recipe_checks(&boot, Some(td_recipe::types::CheckTier::Pr)).len(),
+            0
+        );
+        assert_eq!(
+            recipe_checks(&boot, Some(td_recipe::types::CheckTier::Daily)).len(),
+            1
+        );
+        assert_eq!(recipe_checks(&boot, None).len(), 1);
+
         let hello = catalog::lookup("hello-test").unwrap();
         assert_eq!(
             recipe_checks(&hello, Some(td_recipe::types::CheckTier::Pr)).len(),
@@ -445,6 +456,7 @@ mod tests {
             ("flex-x86-64-test", 1),
             ("elfutils-x86-64-test", 1),
             ("btrfs-progs-x86-64-test", 1),
+            ("td-boot-test", 1),
             ("hello-test", 1),
         ] {
             let recipe = catalog::lookup(stem).unwrap();

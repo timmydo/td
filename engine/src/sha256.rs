@@ -1,5 +1,5 @@
-//! SHA-256 (FIPS 180-4), pure `std` — the one copy shared by td-builder and
-//! td-recipe-eval (each formerly carried its own diverged hand-roll).
+//! SHA-256 (FIPS 180-4), pure `std` — the one copy shared by td-builder,
+//! td-recipe-eval, and the target-built td-boot verifier.
 //!
 //! Kept dependency-free on purpose: the engine crates compile OFFLINE with
 //! nothing fetched, and correctness is pinned two ways — the FIPS/CAVP test
@@ -74,13 +74,10 @@ impl Sha256 {
                 self.block_len = 0;
             }
         }
-        let mut chunks = rest.chunks_exact(64);
-        for chunk in &mut chunks {
-            let mut block = [0u8; 64];
-            block.copy_from_slice(chunk);
-            self.compress(&block);
+        let (chunks, rem) = rest.as_chunks::<64>();
+        for block in chunks {
+            self.compress(block);
         }
-        let rem = chunks.remainder();
         if !rem.is_empty() {
             if let Some(dst) = self.block.get_mut(..rem.len()) {
                 dst.copy_from_slice(rem);
@@ -103,18 +100,18 @@ impl Sha256 {
         let block = self.block;
         self.compress(&block);
         let mut out = [0u8; 32];
-        for (dst, word) in out.chunks_exact_mut(4).zip(self.h.iter()) {
-            dst.copy_from_slice(&word.to_be_bytes());
+        let (words, _) = out.as_chunks_mut::<4>();
+        for (dst, word) in words.iter_mut().zip(self.h.iter()) {
+            *dst = word.to_be_bytes();
         }
         out
     }
 
     fn compress(&mut self, block: &[u8; 64]) {
         let mut w = [0u32; 64];
-        for (slot, chunk) in w.iter_mut().zip(block.chunks_exact(4)) {
-            let mut word = [0u8; 4];
-            word.copy_from_slice(chunk);
-            *slot = u32::from_be_bytes(word);
+        let (words, _) = block.as_chunks::<4>();
+        for (slot, word) in w.iter_mut().zip(words.iter()) {
+            *slot = u32::from_be_bytes(*word);
         }
         // Message schedule: w[i] from taps at i-2, i-7, i-15, i-16. The
         // split keeps this free of panicking index expressions; the taps are
@@ -179,22 +176,24 @@ pub fn hex_digest(bytes: &[u8]) -> String {
     to_base16(&hasher.finalize())
 }
 
-/// sha256 (lowercase hex) of a file's bytes, streamed in 64 KiB chunks —
-/// bootstrap artifacts and warmed crates run multi-MB, so no whole-file
-/// buffer. The one shared file-hash helper (bootstrap.rs + check_loop.rs).
-pub fn sha256_file(p: &std::path::Path) -> std::io::Result<String> {
-    use std::io::Read as _;
-    let mut f = std::fs::File::open(p)?;
+/// SHA-256 (lowercase hex) of a reader's bytes, streamed in 64 KiB chunks.
+pub fn sha256_reader(mut reader: impl std::io::Read) -> std::io::Result<String> {
     let mut h = Sha256::new();
     let mut buf = [0u8; 65536];
     loop {
-        let n = f.read(&mut buf)?;
+        let n = reader.read(&mut buf)?;
         if n == 0 {
             break;
         }
         h.update(buf.get(..n).unwrap_or(&[]));
     }
     Ok(to_base16(&h.finalize()))
+}
+
+/// sha256 of a file's bytes. Bootstrap artifacts and warmed crates run
+/// multi-MB, so this delegates to the streaming reader helper.
+pub fn sha256_file(p: &std::path::Path) -> std::io::Result<String> {
+    sha256_reader(std::fs::File::open(p)?)
 }
 
 #[cfg(test)]

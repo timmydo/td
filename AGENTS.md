@@ -296,8 +296,8 @@ td's Rust is defensive and minimal-surface.
   way. The gate enforces it on the ONE workspace-root `Cargo.lock`: exactly 3
   `[[package]]` entries (the known path members) AND no external `source = ` line
   (path members carry none), so a new registry/git dep OR a new path member both red it.
-  `td-kexec` and `td-netd` (target guest programs outside the workspace) each keep their
-  own 1-package lock.
+  The target-side `td-kexec`, `td-netd`, and `td-boot` crates outside the workspace
+  each keep their own 1-package lock; `td-boot` contains no `unsafe`.
   The network tools (`fetch`/`feed`/`subst`) are the *only* crates allowed dependencies,
   and only the vendored-through-the-cargo-proxy FSDG set they already have
   (`ureq`/`rustls`/`sha2`/`ring`); a *new* dependency anywhere is a reviewed decision
@@ -324,4 +324,3 @@ td's Rust is defensive and minimal-surface.
   lands in `git log` on main and what the integrator reads before landing. Nothing
   else persists (there is no PR description, no webpage); if you want to keep it, it
   goes in a commit message.
-

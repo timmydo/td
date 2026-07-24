@@ -1,0 +1,31 @@
+[package]
+name = "td-boot"
+version = "0.1.0"
+edition = "2021"
+description = "td's verified deployment selector and kexec boot shim"
+license = "GPL-3.0-or-later"
+
+[[bin]]
+name = "td-boot"
+path = "src/main.rs"
+
+# td-boot is a TARGET-built guest program outside the control-plane workspace.
+# It has zero external dependencies. The target recipe compiles this source and
+# the shared engine SHA-256 implementation directly with rustc.
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+unreachable = "deny"
+todo = "deny"
+unimplemented = "deny"
+indexing_slicing = "deny"
+
+[profile.release]
+opt-level = 2
+panic = "abort"
+strip = true
