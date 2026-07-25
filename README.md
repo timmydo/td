@@ -22,7 +22,10 @@ nothing in the root is mutable.
 - **Rust-first userland** — the core file and text tools are Rust uutils;
   the boot/login/shell path is a static busybox.
 - **Content-addressed** — store paths, offline builds, and fixed-output
-  sources verified by SHA-256.
+  sources verified by SHA-256. Deployment updates are verified into a hidden
+  directory, flushed, atomically published by manifest hash, and activated
+  with a retained verified previous deployment for rollback. Install and
+  rollback transactions are serialized per block device through unmount.
 
 ## Requirements
 
@@ -48,7 +51,9 @@ Btrfs volume, kexecs that deployment, loop-mounts its read-only EROFS root, and
 auto-logs you in as `tester` on the serial console. Type `exit` (or Ctrl-D) to
 power off; Ctrl-A X force-quits QEMU. The private test volume lasts for this
 interactive session and is discarded when QEMU exits; the headless
-`qemu-boot-system` check proves persistence by booting its volume twice.
+`qemu-boot-system` check installs and boots a new deployment, rolls back and
+boots the retained prior deployment, preserves `/var` across those boots, and
+proves a corrupted current payload falls back to verified previous.
 
 ## Filesystem layout
 

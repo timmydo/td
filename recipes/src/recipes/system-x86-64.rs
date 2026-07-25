@@ -1,10 +1,12 @@
 use crate::ladder::{
-    mesboot0_inputs, mesboot0_path, AUTOTEST_CMDLINE_TOKEN, GREETER_MARKER, NETTEST_CMDLINE_TOKEN,
-    NETTEST_DEFAULT_HOST, NETTEST_DEFAULT_PORT, PERSIST_READ_CMDLINE_TOKEN,
-    PERSIST_WRITE_CMDLINE_TOKEN, SH, SSHD_MARKER, SYSTEM_ETC_RO_MARKER, SYSTEM_NET_REACH_MARKER,
-    SYSTEM_NET_RESOLVE_MARKER, SYSTEM_NET_UP_MARKER, SYSTEM_PERSIST_READ_MARKER,
-    SYSTEM_PERSIST_WRITE_MARKER, SYSTEM_ROOT_RO_MARKER, SYSTEM_SHUTDOWN_MARKER,
-    SYSTEM_STATE_OWNER_MARKER, SYSTEM_STATE_WRITABLE_MARKER, UUTILS_RUNTIME_MARKER,
+    mesboot0_inputs, mesboot0_path, AUTOTEST_CMDLINE_TOKEN, DEPLOY_INSTALL_CMDLINE_TOKEN,
+    DEPLOY_ROLLBACK_CMDLINE_TOKEN, GREETER_MARKER, NETTEST_CMDLINE_TOKEN, NETTEST_DEFAULT_HOST,
+    NETTEST_DEFAULT_PORT, PERSIST_READ_CMDLINE_TOKEN, PERSIST_WRITE_CMDLINE_TOKEN, SH, SSHD_MARKER,
+    SYSTEM_DEPLOY_INSTALL_MARKER, SYSTEM_DEPLOY_ROLLBACK_MARKER, SYSTEM_ETC_RO_MARKER,
+    SYSTEM_NET_REACH_MARKER, SYSTEM_NET_RESOLVE_MARKER, SYSTEM_NET_UP_MARKER,
+    SYSTEM_PERSIST_READ_MARKER, SYSTEM_PERSIST_WRITE_MARKER, SYSTEM_ROOT_RO_MARKER,
+    SYSTEM_SHUTDOWN_MARKER, SYSTEM_STATE_OWNER_MARKER, SYSTEM_STATE_WRITABLE_MARKER,
+    UUTILS_RUNTIME_MARKER,
 };
 use crate::types::{Recipe, Step};
 
@@ -504,6 +506,19 @@ fn build_rootcheck(sys: &SystemDef) -> String {
          echo {SYSTEM_PERSIST_READ_MARKER}; \
          fi\n"
     ));
+    s.push_str(&format!(
+        "if /bin/busybox grep -q -F '{DEPLOY_INSTALL_CMDLINE_TOKEN}' /proc/cmdline; then \
+         if /bin/busybox mkdir -m 700 /run/td-update \
+         && /bin/busybox mount -t btrfs -o rw,nodev,nosuid,noexec /dev/vda /run/td-update \
+         && /bin/td-boot install /dev/vda /run/td-update \
+         /run/td-volume/td/incoming/candidate >/run/td-installed-id; then \
+         echo {SYSTEM_DEPLOY_INSTALL_MARKER}; fi; \
+         fi\n\
+         if /bin/busybox grep -q -F '{DEPLOY_ROLLBACK_CMDLINE_TOKEN}' /proc/cmdline; then \
+         if /bin/td-boot rollback /dev/vda /run/td-update >/run/td-rollback-id; then \
+         echo {SYSTEM_DEPLOY_ROLLBACK_MARKER}; fi; \
+         fi\n"
+    ));
     s
 }
 
@@ -691,6 +706,12 @@ fn real_root_steps(sys: &SystemDef) -> Vec<Step> {
         from: "{in:td-netd}".into(),
         dest: "{root}/real-root{in:td-netd}".into(),
     });
+    // td-boot is static and serves both initramfs selection and root-side
+    // deployment transactions.
+    steps.push(Step::CopyTree {
+        from: "{in:td-boot}".into(),
+        dest: "{root}/real-root{in:td-boot}".into(),
+    });
     // Stage uutils and sshd plus every transitively referenced store item at its canonical
     // absolute path. Both are dynamically linked, so each pulls its reachable runtime store
     // closure (glibc, libgcc_s, and for sshd the aws-lc crypto C lib) onto the erofs root.
@@ -730,6 +751,10 @@ fn real_root_steps(sys: &SystemDef) -> Vec<Step> {
     steps.push(Step::Symlink {
         target: "{in:td-netd}/bin/td-netd".into(),
         link: "{root}/real-root/bin/td-netd".into(),
+    });
+    steps.push(Step::Symlink {
+        target: "{in:td-boot}/bin/td-boot".into(),
+        link: "{root}/real-root/bin/td-boot".into(),
     });
     // resolv.conf and hosts live at /etc but are SYMLINKS into the writable /run
     // tmpfs, so td-netd can (re)write them under the read-only erofs /etc. They are
@@ -821,6 +846,8 @@ fn shape_check() -> String {
      done; \
      case $(readlink \"$root/bin/td-netd\") in /td/store/*/bin/td-netd) : ;; *) echo 'root tree: /bin/td-netd is not a symlink into /td/store - the network daemon /bin entry regressed' >&2; exit 1;; esac; \
      tnd=\"{root}/real-root{in:td-netd}/bin/td-netd\"; { [ -f \"$tnd\" ] && [ -x \"$tnd\" ]; } || { echo 'root tree: the td-netd binary is not packed/executable at real-root{in:td-netd}/bin/td-netd - the /bin/td-netd symlink would dangle' >&2; exit 1; }; \
+     [ \"$(readlink \"$root/bin/td-boot\" 2>/dev/null)\" = \"{in:td-boot}/bin/td-boot\" ] || { echo 'root tree: /bin/td-boot is not a symlink to the staged deployment helper' >&2; exit 1; }; \
+     tdb=\"{root}/real-root{in:td-boot}/bin/td-boot\"; { [ -f \"$tdb\" ] && [ -x \"$tdb\" ]; } || { echo 'root tree: td-boot is not packed/executable for root-side deployment transactions' >&2; exit 1; }; \
      [ \"$(readlink \"$root/home\")\" = var/home ] || { echo 'root tree: /home must point to var/home' >&2; exit 1; }; \
      [ \"$(readlink \"$root/root\")\" = var/root ] || { echo 'root tree: /root must point to var/root' >&2; exit 1; }; \
      rbb=\"{root}/real-root{in:busybox-x86-64}/bin/busybox\"; { [ -f \"$rbb\" ] && [ -x \"$rbb\" ]; } || { echo 'root tree: the busybox binary is not packed/executable at real-root{in:busybox-x86-64}/bin/busybox - the store-native /bin symlinks would all dangle' >&2; exit 1; }; \
@@ -982,7 +1009,8 @@ pub fn recipe() -> Recipe {
         // glibc-x86-64: uutils' and sshd's declared runtime input. StageRuntimeClosure reaches
         //   it from their embedded store references and copies the whole content-addressed item.
         // td-netd: the static network bring-up daemon (empty runtime closure, CopyTree'd).
-        // td-boot/td-kexec: static initramfs selector and confined kexec helper.
+        // td-boot: static initramfs selector and root-side deployment helper (CopyTree'd).
+        // td-kexec: confined selector-only kexec helper.
         .native_inputs(&[
             "busybox-x86-64",
             "linux-x86-64",
@@ -1395,6 +1423,7 @@ mod tests {
     #[test]
     fn boot_markers_are_wired() {
         let rootcheck = build_rootcheck(&SYSTEM);
+        let steps = real_root_steps(&SYSTEM);
         assert!(
             rootcheck.contains(SYSTEM_ROOT_RO_MARKER),
             "rootcheck must emit the ro-root marker"
@@ -1428,6 +1457,31 @@ mod tests {
             rootcheck.contains("test ! -e /var/lib/td/boot-marker")
                 && rootcheck.contains("&& /bin/busybox sync"),
             "the write marker must require a fresh path and a successful sync"
+        );
+        assert!(
+            rootcheck.contains(DEPLOY_INSTALL_CMDLINE_TOKEN)
+                && rootcheck.contains(
+                    "mount -t btrfs -o rw,nodev,nosuid,noexec /dev/vda /run/td-update"
+                )
+                && rootcheck.contains("td-boot install /dev/vda /run/td-update")
+                && rootcheck.contains(SYSTEM_DEPLOY_INSTALL_MARKER)
+                && rootcheck.contains(DEPLOY_ROLLBACK_CMDLINE_TOKEN)
+                && rootcheck.contains("td-boot rollback /dev/vda /run/td-update")
+                && rootcheck.contains(SYSTEM_DEPLOY_ROLLBACK_MARKER),
+            "rootcheck must wire transactional install and explicit rollback through td-boot"
+        );
+        assert!(
+            steps.iter().any(|step| matches!(
+                step,
+                Step::CopyTree { from, dest }
+                    if from == "{in:td-boot}" && dest == "{root}/real-root{in:td-boot}"
+            )) && steps.iter().any(|step| matches!(
+                step,
+                Step::Symlink { target, link }
+                    if target == "{in:td-boot}/bin/td-boot"
+                        && link == "{root}/real-root/bin/td-boot"
+            )),
+            "the immutable root must pack td-boot and expose /bin/td-boot for transactions"
         );
         // Home ownership is fixed for every non-root user below /var.
         for u in SYSTEM.users {

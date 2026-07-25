@@ -148,6 +148,14 @@ pub const SYSTEM_PERSIST_WRITE_MARKER: &str = "TD-PERSIST-WRITE-OK";
 /// first boot survives with its exact content.
 pub const SYSTEM_PERSIST_READ_MARKER: &str = "TD-PERSIST-READ-OK";
 
+/// Printed after the running system installs and activates a verified candidate
+/// deployment through td-boot's fsync + atomic-rename transaction.
+pub const SYSTEM_DEPLOY_INSTALL_MARKER: &str = "TD-DEPLOY-INSTALL-OK";
+
+/// Printed after td-boot durably replaces current with verified previous.
+/// The displaced deployment data remains retained but is no longer selected.
+pub const SYSTEM_DEPLOY_ROLLBACK_MARKER: &str = "TD-DEPLOY-ROLLBACK-OK";
+
 /// Printed by BusyBox init's shutdown action after syncing and unmounting @var.
 pub const SYSTEM_SHUTDOWN_MARKER: &str = "TD-SHUTDOWN-OK";
 
@@ -190,6 +198,14 @@ pub const PERSIST_WRITE_CMDLINE_TOKEN: &str = "td.persist=write";
 /// Kernel-cmdline token for boot two of the persistence oracle. `/etc/rootcheck`
 /// emits `SYSTEM_PERSIST_READ_MARKER` only after reading boot one's exact bytes.
 pub const PERSIST_READ_CMDLINE_TOKEN: &str = "td.persist=read";
+
+/// Kernel-cmdline token for the transactional-update oracle. `/etc/rootcheck`
+/// installs the fixture candidate from the read-only top-volume view.
+pub const DEPLOY_INSTALL_CMDLINE_TOKEN: &str = "td.deploy=install";
+
+/// Kernel-cmdline token for the explicit rollback oracle. `/etc/rootcheck`
+/// asks td-boot to replace current with verified previous idempotently.
+pub const DEPLOY_ROLLBACK_CMDLINE_TOKEN: &str = "td.deploy=rollback";
 
 // ── system-x86-64 networking markers (link-up + DHCP, re td-netd) ─────────────────
 // The static td-netd daemon brings the link up and DHCP-configures it at sysinit on

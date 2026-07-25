@@ -30,8 +30,8 @@
 //! always means a real boot happened.
 use std::env;
 use std::ffi::OsString;
-use std::fs::{self, File};
-use std::io::{Read, Seek, SeekFrom};
+use std::fs::{self, File, OpenOptions};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::{symlink, DirBuilderExt};
 use std::path::{Path, PathBuf};
@@ -102,6 +102,8 @@ const SYSTEM_STATE_WRITABLE_MARKER: &str = td_recipe::ladder::SYSTEM_STATE_WRITA
 const SYSTEM_STATE_OWNER_MARKER: &str = td_recipe::ladder::SYSTEM_STATE_OWNER_MARKER;
 const SYSTEM_PERSIST_WRITE_MARKER: &str = td_recipe::ladder::SYSTEM_PERSIST_WRITE_MARKER;
 const SYSTEM_PERSIST_READ_MARKER: &str = td_recipe::ladder::SYSTEM_PERSIST_READ_MARKER;
+const SYSTEM_DEPLOY_INSTALL_MARKER: &str = td_recipe::ladder::SYSTEM_DEPLOY_INSTALL_MARKER;
+const SYSTEM_DEPLOY_ROLLBACK_MARKER: &str = td_recipe::ladder::SYSTEM_DEPLOY_ROLLBACK_MARKER;
 const SYSTEM_SHUTDOWN_MARKER: &str = td_recipe::ladder::SYSTEM_SHUTDOWN_MARKER;
 
 /// The kernel-cmdline token `qemu-boot-system` appends so the greeter self-exits and
@@ -110,6 +112,8 @@ const SYSTEM_SHUTDOWN_MARKER: &str = td_recipe::ladder::SYSTEM_SHUTDOWN_MARKER;
 const AUTOTEST_CMDLINE_TOKEN: &str = td_recipe::ladder::AUTOTEST_CMDLINE_TOKEN;
 const PERSIST_WRITE_CMDLINE_TOKEN: &str = td_recipe::ladder::PERSIST_WRITE_CMDLINE_TOKEN;
 const PERSIST_READ_CMDLINE_TOKEN: &str = td_recipe::ladder::PERSIST_READ_CMDLINE_TOKEN;
+const DEPLOY_INSTALL_CMDLINE_TOKEN: &str = td_recipe::ladder::DEPLOY_INSTALL_CMDLINE_TOKEN;
+const DEPLOY_ROLLBACK_CMDLINE_TOKEN: &str = td_recipe::ladder::DEPLOY_ROLLBACK_CMDLINE_TOKEN;
 
 /// The three networking markers `/etc/netup` prints under the nettest token: the link
 /// came up + DHCP applied, td-netd's own DNS client resolved the test host, and a TCP
@@ -179,6 +183,10 @@ enum EndReason {
 struct ConsoleEvidence {
     target: bool,
     current_rejected: bool,
+    selected_current: bool,
+    selected_previous: bool,
+    selected_current_id: Option<String>,
+    selected_previous_id: Option<String>,
     root_read_only: bool,
     etc_read_only: bool,
     state_writable: bool,
@@ -187,6 +195,8 @@ struct ConsoleEvidence {
     sshd: bool,
     persist_write: bool,
     persist_read: bool,
+    deploy_install: bool,
+    deploy_rollback: bool,
     shutdown: bool,
     net_up: bool,
     net_resolve: bool,
@@ -314,23 +324,40 @@ pub(crate) fn run_erofs(runner: &RecipeCheckRunner) -> Result<(), String> {
 }
 
 /// `qemu-boot-system`: the headless end-to-end proof of persistent deployment boot.
-/// It builds a Btrfs volume containing the verified deployment and @var, then boots
-/// that SAME writable volume twice. Each direct boot enters the initramfs selector,
-/// kexecs the verified deployment, loop-mounts root.erofs, and mounts @var. Boot one
-/// writes + syncs a marker; boot two must read its exact bytes back. Both boots also
-/// assert the immutable root, writable state, uutils runtime, and clean self-exit.
+/// It builds a Btrfs volume containing a verified deployment, an incoming candidate,
+/// and @var. Three boots of that same volume install+activate the candidate, boot it
+/// and request rollback, then boot the restored deployment while retaining persistent
+/// state. A fourth boot recreates the fixture with a corrupted current deployment and
+/// proves the selector enters verified previous. Every boot also asserts the immutable
+/// root, writable state, uutils runtime, and clean self-exit.
 pub(crate) fn run_system(runner: &RecipeCheckRunner) -> Result<(), String> {
     let qemu = find_qemu()?;
-    let (bzimage, init_cpio, volume, btrfs) = build_persistent_system(runner)?;
+    let (bzimage, init_cpio, deployment) = build_system(runner)?;
+    let (mkfs, btrfs) = build_btrfs_tools(runner)?;
+    let volume = runner.scratch_dir().join("system-volume.btrfs");
+    let fixture = create_persistent_volume_layout(
+        &deployment,
+        &mkfs,
+        &btrfs,
+        &volume,
+        VolumeLayout::Transactional,
+    )?;
+    if fixture.initial_id == fixture.alternate_id {
+        return Err("transaction fixture candidate did not change the deployment id".to_string());
+    }
 
     println!(
-        "   [qemu-boot-system] {qemu} boots one recipe-built Btrfs volume twice under TCG: selector -> verified kexec -> loop-mounted root.erofs + persistent @var -> greeter\n              shim kernel:    {}\n              initramfs:      {}\n              Btrfs volume:   {}",
+        "   [qemu-boot-system] {qemu} exercises transactional install, rollback, and corrupt-current fallback under TCG: selector -> verified kexec -> loop-mounted root.erofs + persistent @var -> greeter\n              shim kernel:    {}\n              initramfs:      {}\n              Btrfs volume:   {}\n              initial:        {}\n              candidate:      {}",
         bzimage.display(),
         init_cpio.display(),
-        volume.display()
+        volume.display(),
+        fixture.initial_id,
+        fixture.alternate_id
     );
 
-    let first_tokens = format!("{AUTOTEST_CMDLINE_TOKEN} {PERSIST_WRITE_CMDLINE_TOKEN}");
+    let first_tokens = format!(
+        "{AUTOTEST_CMDLINE_TOKEN} {PERSIST_WRITE_CMDLINE_TOKEN} {DEPLOY_INSTALL_CMDLINE_TOKEN}"
+    );
     let first = boot(
         &qemu,
         &bzimage,
@@ -352,10 +379,29 @@ pub(crate) fn run_system(runner: &RecipeCheckRunner) -> Result<(), String> {
         "   [qemu-boot-system] boot one elapsed: {:.2}s",
         first.elapsed.as_secs_f64()
     );
-    validate_system_boot(&first, PersistencePhase::Write, "first")?;
+    validate_system_boot(
+        &first,
+        PersistencePhase::Write,
+        "install",
+        SelectionExpectation::Current,
+    )?;
+    require_selected_deployment(
+        &first,
+        td_boot_protocol::SELECTED_CURRENT_MARKER,
+        &fixture.initial_id,
+        "install boot",
+    )?;
+    require_action_marker(
+        &first,
+        first.evidence.deploy_install,
+        SYSTEM_DEPLOY_INSTALL_MARKER,
+        "install",
+    )?;
     check_persistent_volume(&btrfs, &volume)?;
 
-    let second_tokens = format!("{AUTOTEST_CMDLINE_TOKEN} {PERSIST_READ_CMDLINE_TOKEN}");
+    let second_tokens = format!(
+        "{AUTOTEST_CMDLINE_TOKEN} {PERSIST_READ_CMDLINE_TOKEN} {DEPLOY_ROLLBACK_CMDLINE_TOKEN}"
+    );
     let second = boot(
         &qemu,
         &bzimage,
@@ -377,30 +423,158 @@ pub(crate) fn run_system(runner: &RecipeCheckRunner) -> Result<(), String> {
         "   [qemu-boot-system] boot two elapsed: {:.2}s",
         second.elapsed.as_secs_f64()
     );
-    validate_system_boot(&second, PersistencePhase::Read, "second")?;
+    validate_system_boot(
+        &second,
+        PersistencePhase::Read,
+        "candidate",
+        SelectionExpectation::Current,
+    )?;
+    require_selected_deployment(
+        &second,
+        td_boot_protocol::SELECTED_CURRENT_MARKER,
+        &fixture.alternate_id,
+        "candidate boot",
+    )?;
+    require_action_marker(
+        &second,
+        second.evidence.deploy_rollback,
+        SYSTEM_DEPLOY_ROLLBACK_MARKER,
+        "rollback",
+    )?;
+    check_persistent_volume(&btrfs, &volume)?;
+
+    let third_tokens = format!("{AUTOTEST_CMDLINE_TOKEN} {PERSIST_READ_CMDLINE_TOKEN}");
+    let third = boot(
+        &qemu,
+        &bzimage,
+        &init_cpio,
+        BootPlan {
+            disk: Some(BootDisk {
+                path: &volume,
+                read_only: false,
+            }),
+            mem: "512",
+            target_marker: GREETER_MARKER,
+            kill_on_marker: false,
+            extra_append: &third_tokens,
+            user_net: false,
+        },
+        runner.scratch_dir(),
+    )?;
+    println!(
+        "   [qemu-boot-system] boot three elapsed: {:.2}s",
+        third.elapsed.as_secs_f64()
+    );
+    validate_system_boot(
+        &third,
+        PersistencePhase::Read,
+        "restored",
+        SelectionExpectation::Current,
+    )?;
+    require_selected_deployment(
+        &third,
+        td_boot_protocol::SELECTED_CURRENT_MARKER,
+        &fixture.initial_id,
+        "restored boot",
+    )?;
+    check_persistent_volume(&btrfs, &volume)?;
+
+    let fallback_fixture = create_persistent_volume_layout(
+        &deployment,
+        &mkfs,
+        &btrfs,
+        &volume,
+        VolumeLayout::CorruptCurrent,
+    )?;
+    if fallback_fixture.initial_id != fixture.initial_id
+        || fallback_fixture.alternate_id == fallback_fixture.initial_id
+    {
+        return Err("corrupt-current fixture ids do not identify current and previous".to_string());
+    }
+    let fallback = boot(
+        &qemu,
+        &bzimage,
+        &init_cpio,
+        BootPlan {
+            disk: Some(BootDisk {
+                path: &volume,
+                read_only: false,
+            }),
+            mem: "512",
+            target_marker: GREETER_MARKER,
+            kill_on_marker: false,
+            extra_append: AUTOTEST_CMDLINE_TOKEN,
+            user_net: false,
+        },
+        runner.scratch_dir(),
+    )?;
+    println!(
+        "   [qemu-boot-system] fallback boot elapsed: {:.2}s",
+        fallback.elapsed.as_secs_f64()
+    );
+    validate_system_boot(
+        &fallback,
+        PersistencePhase::None,
+        "corrupt-current fallback",
+        SelectionExpectation::PreviousFallback,
+    )?;
+    require_selected_deployment(
+        &fallback,
+        td_boot_protocol::SELECTED_PREVIOUS_MARKER,
+        &fallback_fixture.initial_id,
+        "corrupt-current fallback boot",
+    )?;
     check_persistent_volume(&btrfs, &volume)?;
 
     println!(
-        "PASS: system-x86-64 boots the SAME Btrfs volume twice under qemu (TCG) — each direct \
-         boot selects and kexecs the verified deployment, loop-mounts its EROFS root read-only \
-         ({SYSTEM_ROOT_RO_MARKER}), keeps /etc immutable ({SYSTEM_ETC_RO_MARKER}), mounts writable \
-         @var with target ownership ({SYSTEM_STATE_WRITABLE_MARKER}, {SYSTEM_STATE_OWNER_MARKER}), \
-         runs uutils ({UUTILS_RUNTIME_MARKER}), and unmounts state before exit \
-         ({SYSTEM_SHUTDOWN_MARKER}); boot two read the exact marker boot one synced below /var \
-         ({SYSTEM_PERSIST_WRITE_MARKER} -> {SYSTEM_PERSIST_READ_MARKER})"
+        "PASS: system-x86-64 transactionally installed and booted a new content-addressed \
+         deployment ({SYSTEM_DEPLOY_INSTALL_MARKER}), rolled back and booted the retained prior \
+         deployment ({SYSTEM_DEPLOY_ROLLBACK_MARKER}), preserved exact /var state across all three \
+         boots ({SYSTEM_PERSIST_WRITE_MARKER} -> {SYSTEM_PERSIST_READ_MARKER}), and rejected a \
+         corrupted current payload in favor of verified previous \
+         ({} -> {}). Every boot kept root and /etc immutable \
+         ({SYSTEM_ROOT_RO_MARKER}, {SYSTEM_ETC_RO_MARKER}), mounted target-owned writable @var \
+         ({SYSTEM_STATE_WRITABLE_MARKER}, {SYSTEM_STATE_OWNER_MARKER}), ran uutils \
+         ({UUTILS_RUNTIME_MARKER}), and unmounted state before exit ({SYSTEM_SHUTDOWN_MARKER})",
+        td_boot_protocol::CURRENT_REJECTED_MARKER,
+        td_boot_protocol::SELECTED_PREVIOUS_MARKER
     );
     Ok(())
 }
 
+fn require_action_marker(
+    result: &BootResult,
+    seen: bool,
+    marker: &str,
+    action: &str,
+) -> Result<(), String> {
+    if seen {
+        Ok(())
+    } else {
+        Err(format!(
+            "the {action} boot reached userspace but did not emit {marker:?}; the verified \
+             deployment transaction did not complete. Last serial output:\n{}",
+            tail(&result.console, 80)
+        ))
+    }
+}
+
 enum PersistencePhase {
+    None,
     Write,
     Read,
+}
+
+enum SelectionExpectation {
+    Current,
+    PreviousFallback,
 }
 
 fn validate_system_boot(
     result: &BootResult,
     persistence: PersistencePhase,
     ordinal: &str,
+    selection: SelectionExpectation,
 ) -> Result<(), String> {
     if !result.evidence.target {
         return Err(format!(
@@ -411,7 +585,14 @@ fn validate_system_boot(
             tail(&result.console, 80)
         ));
     }
-    validate_primary_selection(result, &format!("{ordinal} persistent boot"))?;
+    match selection {
+        SelectionExpectation::Current => {
+            validate_primary_selection(result, &format!("{ordinal} persistent boot"))?
+        }
+        SelectionExpectation::PreviousFallback => {
+            validate_fallback_selection(result, &format!("{ordinal} persistent boot"))?
+        }
+    }
     if !result.evidence.root_read_only {
         return Err(format!(
             "the greeter was reached but /etc/rootcheck did not confirm a READ-ONLY erofs root \
@@ -468,17 +649,21 @@ fn validate_system_boot(
             tail(&result.console, 80)
         ));
     }
-    let (persistence_marker, persistence_seen) = match persistence {
-        PersistencePhase::Write => (SYSTEM_PERSIST_WRITE_MARKER, result.evidence.persist_write),
-        PersistencePhase::Read => (SYSTEM_PERSIST_READ_MARKER, result.evidence.persist_read),
-    };
-    if !persistence_seen {
-        return Err(format!(
-            "the {ordinal} boot reached the greeter but did not emit the persistence marker \
-             {persistence_marker:?}; boot one must write+sync it and boot two must read the same \
-             bytes from the reused @var subvolume. Last serial output:\n{}",
-            tail(&result.console, 80)
-        ));
+    if let Some((persistence_marker, persistence_seen)) = match persistence {
+        PersistencePhase::None => None,
+        PersistencePhase::Write => {
+            Some((SYSTEM_PERSIST_WRITE_MARKER, result.evidence.persist_write))
+        }
+        PersistencePhase::Read => Some((SYSTEM_PERSIST_READ_MARKER, result.evidence.persist_read)),
+    } {
+        if !persistence_seen {
+            return Err(format!(
+                "the {ordinal} boot reached the greeter but did not emit the persistence marker \
+                 {persistence_marker:?}; boot one must write+sync it and later boots must read the \
+                 same bytes from the reused @var subvolume. Last serial output:\n{}",
+                tail(&result.console, 80)
+            ));
+        }
     }
     validate_persistent_shutdown(result, &format!("{ordinal} persistent boot"))?;
     // A kernel panic under `panic=-1` reboots and, with `-no-reboot`, exits qemu 0 — the
@@ -517,7 +702,58 @@ fn validate_primary_selection(result: &BootResult, context: &str) -> Result<(), 
             tail(&result.console, 80)
         ));
     }
+    if !result.evidence.selected_current || result.evidence.selected_previous {
+        return Err(format!(
+            "the {context} did not report an unambiguous current selection \
+             ({:?} absent or {:?} unexpectedly present). Last serial output:\n{}",
+            td_boot_protocol::SELECTED_CURRENT_MARKER,
+            td_boot_protocol::SELECTED_PREVIOUS_MARKER,
+            tail(&result.console, 80)
+        ));
+    }
     Ok(())
+}
+
+fn validate_fallback_selection(result: &BootResult, context: &str) -> Result<(), String> {
+    if !result.evidence.current_rejected
+        || !result.evidence.selected_previous
+        || result.evidence.selected_current
+    {
+        return Err(format!(
+            "the {context} did not prove corrupt-current fallback: {:?} and {:?} must be \
+             present while {:?} remains absent. Last serial output:\n{}",
+            td_boot_protocol::CURRENT_REJECTED_MARKER,
+            td_boot_protocol::SELECTED_PREVIOUS_MARKER,
+            td_boot_protocol::SELECTED_CURRENT_MARKER,
+            tail(&result.console, 80)
+        ));
+    }
+    Ok(())
+}
+
+fn require_selected_deployment(
+    result: &BootResult,
+    marker: &str,
+    deployment_id: &str,
+    context: &str,
+) -> Result<(), String> {
+    let selected = if marker == td_boot_protocol::SELECTED_CURRENT_MARKER {
+        result.evidence.selected_current_id.as_deref()
+    } else if marker == td_boot_protocol::SELECTED_PREVIOUS_MARKER {
+        result.evidence.selected_previous_id.as_deref()
+    } else {
+        return Err(format!(
+            "internal: unknown deployment selection marker {marker:?}"
+        ));
+    };
+    if selected == Some(deployment_id) {
+        return Ok(());
+    }
+    Err(format!(
+        "the {context} did not latch the expected deployment {deployment_id} with \
+         {marker:?} (latched {selected:?}). Last serial output:\n{}",
+        tail(&result.console, 80)
+    ))
 }
 
 fn validate_persistent_shutdown(result: &BootResult, context: &str) -> Result<(), String> {
@@ -937,6 +1173,28 @@ pub(crate) fn create_persistent_volume(
     btrfs: &Path,
     output: &Path,
 ) -> Result<(), String> {
+    create_persistent_volume_layout(deployment, mkfs, btrfs, output, VolumeLayout::Basic)
+        .map(|_| ())
+}
+
+enum VolumeLayout {
+    Basic,
+    Transactional,
+    CorruptCurrent,
+}
+
+struct VolumeFixture {
+    initial_id: String,
+    alternate_id: String,
+}
+
+fn create_persistent_volume_layout(
+    deployment: &Path,
+    mkfs: &Path,
+    btrfs: &Path,
+    output: &Path,
+    layout: VolumeLayout,
+) -> Result<VolumeFixture, String> {
     let manifest = deployment.join("manifest");
     let deployment_id = crate::sha256::sha256_file(&manifest)
         .map_err(|e| format!("hash deployment manifest {}: {e}", manifest.display()))?;
@@ -950,10 +1208,18 @@ pub(crate) fn create_persistent_volume(
             .checked_add(bytes)
             .ok_or_else(|| "persistent fixture payload size overflow".to_string())?;
     }
+    let copies = match layout {
+        VolumeLayout::Basic => 1,
+        VolumeLayout::Transactional => 3,
+        VolumeLayout::CorruptCurrent => 2,
+    };
+    let fixture_payload_bytes = payload_bytes
+        .checked_mul(copies)
+        .ok_or_else(|| "persistent fixture payload size overflow".to_string())?;
     let payload_limit = PERSISTENT_VOLUME_BYTES.saturating_sub(PERSISTENT_VOLUME_HEADROOM);
-    if payload_bytes > payload_limit {
+    if fixture_payload_bytes > payload_limit {
         return Err(format!(
-            "persistent fixture deployment is {payload_bytes} bytes, exceeding the \
+            "persistent fixture deployments are {fixture_payload_bytes} bytes, exceeding the \
              {payload_limit}-byte payload limit for the {PERSISTENT_VOLUME_BYTES}-byte volume"
         ));
     }
@@ -977,6 +1243,34 @@ pub(crate) fn create_persistent_volume(
     let _seed_cleanup = Scratch { dir: seed.clone() };
 
     populate_persistent_seed(deployment, &seed, &deployment_id)?;
+    let alternate_id = match layout {
+        VolumeLayout::Basic => deployment_id.clone(),
+        VolumeLayout::Transactional => {
+            let candidate = seed.join("td/incoming/candidate");
+            create_bootable_candidate(deployment, &candidate)?
+        }
+        VolumeLayout::CorruptCurrent => {
+            let candidate = seed.join("td/incoming/corrupt-candidate");
+            let id = create_bootable_candidate(deployment, &candidate)?;
+            let installed = seed.join(td_boot_protocol::DEPLOYMENTS_DIR).join(&id);
+            fs::rename(&candidate, &installed).map_err(|e| {
+                format!(
+                    "stage corrupt-current deployment {} -> {}: {e}",
+                    candidate.display(),
+                    installed.display()
+                )
+            })?;
+            let root = installed.join("root.erofs");
+            let mut file = OpenOptions::new()
+                .append(true)
+                .open(&root)
+                .map_err(|e| format!("open corrupt-current payload {}: {e}", root.display()))?;
+            file.write_all(b"td-corrupt-current")
+                .map_err(|e| format!("corrupt current payload {}: {e}", root.display()))?;
+            replace_seed_selector(&seed, "current", &id)?;
+            id
+        }
+    };
 
     // mkfs.btrfs grows this regular-file target to --byte-count; creating it
     // first keeps path and permission failures in this control plane.
@@ -1004,7 +1298,83 @@ pub(crate) fn create_persistent_volume(
     }
     fs::remove_dir_all(&seed)
         .map_err(|e| format!("remove populated seed {}: {e}", seed.display()))?;
-    check_persistent_volume(btrfs, output)
+    check_persistent_volume(btrfs, output)?;
+    Ok(VolumeFixture {
+        initial_id: deployment_id,
+        alternate_id,
+    })
+}
+
+fn copy_candidate_payload(source: &Path, destination: &Path) -> Result<(), String> {
+    let mut input = File::open(source)
+        .map_err(|e| format!("open candidate source {}: {e}", source.display()))?;
+    let mut output = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(destination)
+        .map_err(|e| {
+            format!(
+                "create candidate payload {} from {}: {e}",
+                destination.display(),
+                source.display()
+            )
+        })?;
+    std::io::copy(&mut input, &mut output).map_err(|e| {
+        format!(
+            "copy candidate payload {} -> {}: {e}",
+            source.display(),
+            destination.display()
+        )
+    })?;
+    Ok(())
+}
+
+fn create_bootable_candidate(deployment: &Path, destination: &Path) -> Result<String, String> {
+    fs::create_dir_all(destination)
+        .map_err(|e| format!("create candidate directory {}: {e}", destination.display()))?;
+    for name in ["bzImage", "initramfs.cpio", "root.erofs"] {
+        copy_candidate_payload(&deployment.join(name), &destination.join(name))?;
+    }
+    let initramfs = destination.join("initramfs.cpio");
+    let mut padding = OpenOptions::new()
+        .append(true)
+        .open(&initramfs)
+        .map_err(|e| format!("open candidate initramfs {}: {e}", initramfs.display()))?;
+    padding
+        .write_all(&[0u8; 4])
+        .map_err(|e| format!("pad candidate initramfs {}: {e}", initramfs.display()))?;
+
+    let kernel_digest = crate::sha256::sha256_file(&destination.join("bzImage"))
+        .map_err(|e| format!("hash candidate bzImage: {e}"))?;
+    let initramfs_digest = crate::sha256::sha256_file(&initramfs)
+        .map_err(|e| format!("hash candidate initramfs: {e}"))?;
+    let root_digest = crate::sha256::sha256_file(&destination.join("root.erofs"))
+        .map_err(|e| format!("hash candidate root.erofs: {e}"))?;
+    let manifest = format!(
+        "td-deployment-v1\n{kernel_digest}  bzImage\n{initramfs_digest}  initramfs.cpio\n\
+         {root_digest}  root.erofs\n"
+    );
+    fs::write(destination.join("manifest"), manifest)
+        .map_err(|e| format!("write candidate manifest {}: {e}", destination.display()))?;
+    verify_deployment(destination)?;
+    crate::sha256::sha256_file(&destination.join("manifest"))
+        .map_err(|e| format!("hash candidate manifest {}: {e}", destination.display()))
+}
+
+fn replace_seed_selector(seed: &Path, slot: &str, deployment_id: &str) -> Result<(), String> {
+    let selector = seed.join(td_boot_protocol::BOOT_DIR).join(slot);
+    fs::remove_file(&selector)
+        .map_err(|e| format!("remove fixture {slot} selector {}: {e}", selector.display()))?;
+    symlink(
+        format!("{}{deployment_id}", td_boot_protocol::SELECTOR_PREFIX),
+        &selector,
+    )
+    .map_err(|e| {
+        format!(
+            "replace fixture {slot} selector {}: {e}",
+            selector.display()
+        )
+    })
 }
 
 fn populate_persistent_seed(
@@ -1546,6 +1916,8 @@ fn evidence_marker_max_len(target: &[u8]) -> usize {
     [
         target.len(),
         td_boot_protocol::CURRENT_REJECTED_MARKER.len(),
+        td_boot_protocol::SELECTED_CURRENT_MARKER.len() + 1 + 64,
+        td_boot_protocol::SELECTED_PREVIOUS_MARKER.len() + 1 + 64,
         SYSTEM_ROOT_RO_MARKER.len(),
         SYSTEM_ETC_RO_MARKER.len(),
         SYSTEM_STATE_WRITABLE_MARKER.len(),
@@ -1554,6 +1926,8 @@ fn evidence_marker_max_len(target: &[u8]) -> usize {
         SSHD_MARKER.len(),
         SYSTEM_PERSIST_WRITE_MARKER.len(),
         SYSTEM_PERSIST_READ_MARKER.len(),
+        SYSTEM_DEPLOY_INSTALL_MARKER.len(),
+        SYSTEM_DEPLOY_ROLLBACK_MARKER.len(),
         SYSTEM_SHUTDOWN_MARKER.len(),
         SYSTEM_NET_UP_MARKER.len(),
         SYSTEM_NET_RESOLVE_MARKER.len(),
@@ -1571,6 +1945,26 @@ fn latch_console_evidence(evidence: &mut ConsoleEvidence, buf: &[u8], target: &[
         &mut evidence.current_rejected,
         buf,
         td_boot_protocol::CURRENT_REJECTED_MARKER.as_bytes(),
+    );
+    latch_marker(
+        &mut evidence.selected_current,
+        buf,
+        td_boot_protocol::SELECTED_CURRENT_MARKER.as_bytes(),
+    );
+    latch_marker(
+        &mut evidence.selected_previous,
+        buf,
+        td_boot_protocol::SELECTED_PREVIOUS_MARKER.as_bytes(),
+    );
+    latch_selection_id(
+        &mut evidence.selected_current_id,
+        buf,
+        td_boot_protocol::SELECTED_CURRENT_MARKER.as_bytes(),
+    );
+    latch_selection_id(
+        &mut evidence.selected_previous_id,
+        buf,
+        td_boot_protocol::SELECTED_PREVIOUS_MARKER.as_bytes(),
     );
     latch_marker(
         &mut evidence.root_read_only,
@@ -1609,6 +2003,16 @@ fn latch_console_evidence(evidence: &mut ConsoleEvidence, buf: &[u8], target: &[
         SYSTEM_PERSIST_READ_MARKER.as_bytes(),
     );
     latch_marker(
+        &mut evidence.deploy_install,
+        buf,
+        SYSTEM_DEPLOY_INSTALL_MARKER.as_bytes(),
+    );
+    latch_marker(
+        &mut evidence.deploy_rollback,
+        buf,
+        SYSTEM_DEPLOY_ROLLBACK_MARKER.as_bytes(),
+    );
+    latch_marker(
         &mut evidence.shutdown,
         buf,
         SYSTEM_SHUTDOWN_MARKER.as_bytes(),
@@ -1635,6 +2039,42 @@ fn latch_console_evidence(evidence: &mut ConsoleEvidence, buf: &[u8], target: &[
 fn latch_marker(found: &mut bool, haystack: &[u8], marker: &[u8]) {
     if !*found {
         *found = contains(haystack, marker);
+    }
+}
+
+fn latch_selection_id(found: &mut Option<String>, haystack: &[u8], marker: &[u8]) {
+    if found.is_some() {
+        return;
+    }
+    for start in 0..haystack.len() {
+        let Some(after_marker) = start.checked_add(marker.len()) else {
+            return;
+        };
+        if haystack.get(start..after_marker) != Some(marker) {
+            continue;
+        }
+        let Some(id_start) = after_marker.checked_add(1) else {
+            return;
+        };
+        if haystack.get(after_marker) != Some(&b' ') {
+            continue;
+        }
+        let Some(id_end) = id_start.checked_add(64) else {
+            return;
+        };
+        let Some(id) = haystack.get(id_start..id_end) else {
+            continue;
+        };
+        if !id
+            .iter()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+        {
+            continue;
+        }
+        if let Ok(text) = std::str::from_utf8(id) {
+            *found = Some(text.to_string());
+            return;
+        }
     }
 }
 
@@ -1837,6 +2277,41 @@ mod tests {
     }
 
     #[test]
+    fn candidate_changes_identity_and_remains_manifest_valid() {
+        let seq = AtomicU64::new(2050);
+        let dir = create_scratch_dir(&env::temp_dir(), &seq).unwrap();
+        let _guard = Scratch { dir: dir.clone() };
+        let deployment = dir.join("deployment");
+        fs::create_dir(&deployment).unwrap();
+        for (name, bytes) in [
+            ("bzImage", b"kernel".as_slice()),
+            ("initramfs.cpio", b"070701initramfs".as_slice()),
+            ("root.erofs", b"root".as_slice()),
+        ] {
+            fs::write(deployment.join(name), bytes).unwrap();
+        }
+        let mut manifest = String::from("td-deployment-v1\n");
+        for name in ["bzImage", "initramfs.cpio", "root.erofs"] {
+            let digest = crate::sha256::sha256_file(&deployment.join(name)).unwrap();
+            manifest.push_str(&format!("{digest}  {name}\n"));
+        }
+        fs::write(deployment.join("manifest"), &manifest).unwrap();
+        let initial_id = crate::sha256::sha256_file(&deployment.join("manifest")).unwrap();
+
+        let candidate = dir.join("incoming/candidate");
+        let candidate_id = create_bootable_candidate(&deployment, &candidate).unwrap();
+        assert_ne!(candidate_id, initial_id);
+        assert_eq!(
+            crate::sha256::sha256_file(&candidate.join("manifest")).unwrap(),
+            candidate_id
+        );
+        verify_deployment(&candidate).unwrap();
+        assert!(fs::read(candidate.join("initramfs.cpio"))
+            .unwrap()
+            .ends_with(&[0u8; 4]));
+    }
+
+    #[test]
     fn selector_manifest_verifies_payload_and_rejects_tampering() {
         let seq = AtomicU64::new(2100);
         let dir = create_scratch_dir(&env::temp_dir(), &seq).unwrap();
@@ -1907,6 +2382,8 @@ mod tests {
             MARKER,
             EROFS_MARKER,
             td_boot_protocol::CURRENT_REJECTED_MARKER,
+            td_boot_protocol::SELECTED_CURRENT_MARKER,
+            td_boot_protocol::SELECTED_PREVIOUS_MARKER,
             KEXEC_STAGE1_MARKER,
             KEXEC_STAGE2_MARKER,
             "Kernel panic",
@@ -1917,6 +2394,8 @@ mod tests {
             SYSTEM_STATE_OWNER_MARKER,
             SYSTEM_PERSIST_WRITE_MARKER,
             SYSTEM_PERSIST_READ_MARKER,
+            SYSTEM_DEPLOY_INSTALL_MARKER,
+            SYSTEM_DEPLOY_ROLLBACK_MARKER,
             SYSTEM_SHUTDOWN_MARKER,
             UUTILS_RUNTIME_MARKER,
             SYSTEM_NET_UP_MARKER,
@@ -1978,8 +2457,14 @@ mod tests {
         let dir = create_scratch_dir(&env::temp_dir(), &seq).unwrap();
         let _g = Scratch { dir: dir.clone() };
         let path = dir.join("console.log");
+        let selected_id = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let selected_previous = format!(
+            "{} {selected_id}",
+            td_boot_protocol::SELECTED_PREVIOUS_MARKER
+        );
         let mut bytes = [
             td_boot_protocol::CURRENT_REJECTED_MARKER,
+            selected_previous.as_str(),
             SYSTEM_ROOT_RO_MARKER,
             SYSTEM_ETC_RO_MARKER,
             SYSTEM_STATE_WRITABLE_MARKER,
@@ -1988,6 +2473,8 @@ mod tests {
             SSHD_MARKER,
             SYSTEM_PERSIST_WRITE_MARKER,
             SYSTEM_PERSIST_READ_MARKER,
+            SYSTEM_DEPLOY_INSTALL_MARKER,
+            SYSTEM_DEPLOY_ROLLBACK_MARKER,
             SYSTEM_SHUTDOWN_MARKER,
             SYSTEM_NET_UP_MARKER,
             SYSTEM_NET_RESOLVE_MARKER,
@@ -2014,6 +2501,10 @@ mod tests {
         .unwrap();
         assert!(!evidence.target);
         assert!(evidence.current_rejected);
+        assert!(evidence.selected_previous);
+        assert!(!evidence.selected_current);
+        assert_eq!(evidence.selected_previous_id.as_deref(), Some(selected_id));
+        assert_eq!(evidence.selected_current_id, None);
         assert!(evidence.root_read_only);
         assert!(evidence.etc_read_only);
         assert!(evidence.state_writable);
@@ -2022,6 +2513,8 @@ mod tests {
         assert!(evidence.sshd);
         assert!(evidence.persist_write);
         assert!(evidence.persist_read);
+        assert!(evidence.deploy_install);
+        assert!(evidence.deploy_rollback);
         assert!(evidence.shutdown);
         assert!(evidence.net_up);
         assert!(evidence.net_resolve);
@@ -2051,6 +2544,56 @@ mod tests {
         let mut evidence = ConsoleEvidence::default();
         drain_console(&path, &mut file, &mut buffer, target, true, &mut evidence).unwrap();
         assert!(evidence.target);
+    }
+
+    #[test]
+    fn drain_console_latches_a_selection_id_split_across_read_chunks() {
+        let seq = AtomicU64::new(0);
+        let dir = create_scratch_dir(&env::temp_dir(), &seq).unwrap();
+        let _g = Scratch { dir: dir.clone() };
+        let path = dir.join("console.log");
+        let selected_id = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
+        let mut bytes = vec![b'x'; 8192 - 5];
+        bytes.extend_from_slice(td_boot_protocol::SELECTED_CURRENT_MARKER.as_bytes());
+        bytes.push(b' ');
+        bytes.extend_from_slice(selected_id.as_bytes());
+        bytes.push(b'\n');
+        fs::write(&path, bytes).unwrap();
+
+        let mut file = None;
+        let mut buffer = Vec::new();
+        let mut evidence = ConsoleEvidence::default();
+        drain_console(
+            &path,
+            &mut file,
+            &mut buffer,
+            b"target-never-appears",
+            false,
+            &mut evidence,
+        )
+        .unwrap();
+
+        assert_eq!(evidence.selected_current_id.as_deref(), Some(selected_id));
+        assert_eq!(evidence.selected_previous_id, None);
+    }
+
+    #[test]
+    fn selection_id_latch_rejects_truncated_and_non_hex_ids() {
+        let marker = td_boot_protocol::SELECTED_CURRENT_MARKER;
+        let mut evidence = ConsoleEvidence::default();
+
+        latch_console_evidence(
+            &mut evidence,
+            format!("{marker} {}", "a".repeat(63)).as_bytes(),
+            b"target",
+        );
+        assert_eq!(evidence.selected_current_id, None);
+        latch_console_evidence(
+            &mut evidence,
+            format!("{marker} {}", "g".repeat(64)).as_bytes(),
+            b"target",
+        );
+        assert_eq!(evidence.selected_current_id, None);
     }
 
     #[test]

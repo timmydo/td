@@ -1,4 +1,6 @@
 pub const CURRENT_REJECTED_MARKER: &str = "TD-BOOT-CURRENT-REJECTED";
+pub const SELECTED_CURRENT_MARKER: &str = "TD-BOOT-SELECTED-CURRENT";
+pub const SELECTED_PREVIOUS_MARKER: &str = "TD-BOOT-SELECTED-PREVIOUS";
 pub const BOOT_DIR: &str = "td/boot";
 pub const DEPLOYMENTS_DIR: &str = "td/deployments";
 pub const SELECTOR_PREFIX: &str = "../deployments/";
