@@ -771,6 +771,14 @@ pub struct Recipe {
     /// committed-checksum ingress that lets a rust node build in the graph without
     /// reopening the #469 crate-provenance gate.
     pub cargo_lock: Option<String>,
+    /// Repo-relative path to an IN-TREE source directory this recipe builds from
+    /// (#469 local-source provenance). Set via `local_source`, which also points
+    /// `source_input` at this recipe's own `<name>-source` key. The runner
+    /// (`td-recipe-eval`) copies the committed tree into the store and interns it
+    /// under that key, pinned by the compiled seed-digest table. Like `cargo_lock`
+    /// and `source_pins` it is a runner-side concern and is deliberately omitted
+    /// from the build JSON — the builder only needs `sourceInput`.
+    pub local_source: Option<String>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -837,6 +845,7 @@ impl Recipe {
             checks: None,
             source_pins: None,
             cargo_lock: None,
+            local_source: None,
         }
     }
     pub fn gnu(name: &str, version: &str) -> Recipe {
@@ -942,6 +951,17 @@ impl Recipe {
     /// crate closure for the `--auto` committed-checksum vendor gate.
     pub fn cargo_lock(mut self, path: &str) -> Recipe {
         self.cargo_lock = Some(path.into());
+        self
+    }
+    /// Build this recipe from an IN-TREE source directory (repo-relative `path`),
+    /// interned as its own `<name>-source` seed input by the runner (#469
+    /// local-source provenance). Unlike `source`/`source_input` this declares NO
+    /// fixed-output fetch: the bytes are the committed tree, pinned by the compiled
+    /// seed-digest table. Sets `source_input` directly (no fetch pin) so the build
+    /// plan aliases in the interned tree under `<name>-source`.
+    pub fn local_source(mut self, path: &str) -> Recipe {
+        self.source_input = Some(format!("{}-source", self.name));
+        self.local_source = Some(path.into());
         self
     }
     pub fn source_pins(mut self, pins: Vec<SourcePin>) -> Recipe {

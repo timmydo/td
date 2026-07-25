@@ -77,6 +77,12 @@ const GREETER_MARKER: &str = td_recipe::ladder::GREETER_MARKER;
 /// coreutils multicall's closure resolves on the erofs root. Shared via `td_recipe::ladder`.
 const UUTILS_RUNTIME_MARKER: &str = td_recipe::ladder::UUTILS_RUNTIME_MARKER;
 
+/// Printed by the headless greeter only after `/bin/sshd selftest` exits 0 — a full
+/// loopback SSH round-trip against an in-process russh server. Proves the kernel's
+/// TCP/IP loopback (CONFIG_NET+INET), the russh stack, and sshd's dynamic closure all
+/// work on the erofs root. Shared via `td_recipe::ladder`.
+const SSHD_MARKER: &str = td_recipe::ladder::SSHD_MARKER;
+
 /// The line `/etc/rootcheck` prints once it has confirmed `/` is a READ-ONLY erofs
 /// mount (re #550). `qemu-boot-system` asserts it to prove the switched-into root is
 /// the immutable erofs image, not a writable copy.
@@ -352,6 +358,16 @@ pub(crate) fn run_system(runner: &RecipeCheckRunner) -> Result<(), String> {
             tail(&result.console, 80)
         ));
     }
+    if !result.console.contains(SSHD_MARKER) {
+        return Err(format!(
+            "the greeter was reached and root/uutils checks passed, but the sshd runtime marker \
+             ({SSHD_MARKER:?}) was absent — `/bin/sshd selftest` did not complete a loopback SSH \
+             round-trip and exit 0. Either the kernel lacks working TCP/IP loopback (CONFIG_NET/INET \
+             or the `lo` bring-up regressed), or sshd's dynamic runtime closure (loader, glibc, \
+             libgcc_s, aws-lc crypto) does not resolve on the erofs root. Last serial output:\n{}",
+            tail(&result.console, 80)
+        ));
+    }
     // A kernel panic under `panic=-1` reboots and, with `-no-reboot`, exits qemu 0 — the
     // SAME exit code as a clean guest power-off. So `exited_clean` alone cannot tell a
     // genuine "exit powers off" from a panic AFTER the markers were printed (the root
@@ -382,7 +398,8 @@ pub(crate) fn run_system(runner: &RecipeCheckRunner) -> Result<(), String> {
          ({GREETER_MARKER}); `/` is a read-only erofs mount ({SYSTEM_ROOT_RO_MARKER}), `/etc` remains \
          immutable ({SYSTEM_ETC_RO_MARKER}), `/var`-backed state is writable \
          ({SYSTEM_STATE_WRITABLE_MARKER}), a uutils applet runs from the erofs closure \
-         ({UUTILS_RUNTIME_MARKER}), and `exit` powers the VM off cleanly"
+         ({UUTILS_RUNTIME_MARKER}), the source-built sshd completes a loopback SSH round-trip \
+         ({SSHD_MARKER}), and `exit` powers the VM off cleanly"
     );
     Ok(())
 }
@@ -1273,8 +1290,9 @@ mod tests {
             SYSTEM_NET_UP_MARKER,
             SYSTEM_NET_RESOLVE_MARKER,
             SYSTEM_NET_REACH_MARKER,
+            SSHD_MARKER,
         ]);
-        assert_eq!(markers.len(), 8, "each system/net assertion needs its own marker");
+        assert_eq!(markers.len(), 9, "each system/net/sshd assertion needs its own marker");
     }
 
     #[test]

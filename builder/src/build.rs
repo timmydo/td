@@ -1330,6 +1330,32 @@ pub fn run_rust() -> Result<(), String> {
             }
         }
     }
+    // A crate's C build script drives the `cc` crate, whose compile+link reads LIBRARY_PATH
+    // for BOTH -l libraries and the crt startfiles (crt1.o/crti.o/crtn.o) — but only the
+    // rustc link gets TD_RUST_STORE_BDIR's glibc dir via -B above, and the native glibc's
+    // lib lives at a nested stage/td/store/<pkg>/lib path that is NOT any input's {p}/lib.
+    // Fold those same bdir dirs into LIBRARY_PATH so a C crypto crate (aws-lc-sys/ring) links
+    // instead of redding with "cannot find crt1.o". Unset ⇒ empty ⇒ no-op (the pure-Rust and
+    // self-host paths are unchanged); binutils' bin dir carries no libs so adding it is inert.
+    for b in env::var("TD_RUST_STORE_BDIR").unwrap_or_default().split(':').filter(|s| !s.is_empty()) {
+        lib.push(b.to_string());
+    }
+    // A C build script may compile *and run* a probe executable (aws-lc-sys's memcmp_check
+    // links a binary and asserts it exits 0). The native gcc bakes no interp/RUNPATH, so
+    // that probe cannot exec in the hermetic sandbox and the crate misreports it as a
+    // "compiler bug". Such probes honor LDFLAGS on their link, so mirror the same /td/store
+    // dynamic-linker + RUNPATH the rustc link gets above. The `cc` crate never reads LDFLAGS
+    // for its object compiles, so this only reaches build scripts that link a runnable exe.
+    // Unset TD_RUST_STORE_INTERP ⇒ LDFLAGS stays unset (guix + self-host paths unchanged).
+    let mut ldflags = String::new();
+    if let Ok(interp) = env::var("TD_RUST_STORE_INTERP") {
+        if !interp.is_empty() {
+            ldflags.push_str(&format!("-Wl,--dynamic-linker,{interp}"));
+            for rp in env::var("TD_RUST_STORE_RPATH").unwrap_or_default().split(':').filter(|s| !s.is_empty()) {
+                ldflags.push_str(&format!(" -Wl,-rpath,{rp}"));
+            }
+        }
+    }
     let mut envs: Vec<(String, String)> = vec![
         ("out".into(), out.clone()),
         ("PATH".into(), path.clone()),
@@ -1344,6 +1370,9 @@ pub fn run_rust() -> Result<(), String> {
     ];
     if let Some(gpp) = gpp {
         envs.push(("CXX".into(), gpp));
+    }
+    if !ldflags.is_empty() {
+        envs.push(("LDFLAGS".into(), ldflags));
     }
 
     // vendored deps: if TD_VENDOR_CRATES is set, assemble a cargo `vendored-sources`

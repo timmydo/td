@@ -150,6 +150,16 @@ pub const GREETER_MARKER: &str = "TD-GREETER-OK";
 /// greeter line (which the shell builtin `echo` prints regardless of uutils health, #547).
 pub const UUTILS_RUNTIME_MARKER: &str = "TD-UUTILS-RUN-OK";
 
+/// Printed by `/etc/profile` on the headless self-test path ONLY after `/bin/sshd selftest`
+/// exits 0 — the source-built russh daemon stood up an in-process server on an ephemeral
+/// loopback port and completed a full SSH handshake+auth+channel+exec round-trip against it.
+/// This proves THREE things the static scan can't: the kernel's TCP/IP loopback works
+/// (CONFIG_NET+INET), the russh crypto/protocol stack runs, and sshd's dynamic runtime
+/// closure (ELF interp, glibc, libgcc_s, the aws-lc crypto C lib) resolves on the erofs root.
+/// The marker string is DUPLICATED as `OK_MARKER` in tests/sshd/src/main.rs (a separate
+/// crate the recipe builds); the two must stay identical.
+pub const SSHD_MARKER: &str = "TD-SSHD-OK";
+
 /// Kernel-cmdline token the headless `qemu-boot-system` oracle appends so the greeter
 /// SELF-TESTS: `/etc/profile`, on seeing it in `/proc/cmdline`, prints `GREETER_MARKER`
 /// then `exit`s the login shell, which (via `tty-session`'s `reboot -f`) powers the VM

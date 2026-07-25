@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::env;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, IsTerminal, Read, Write};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{symlink, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{self, Command, Stdio};
@@ -736,15 +737,21 @@ fn build_cache_paths(lw: &Path) -> (PathBuf, PathBuf) {
 /// re-keys); a patch change alters a hashed file; and a rust rung's committed
 /// `Cargo.lock` is the one build input read from the repo at build time rather
 /// than compiled in, so a lock bump (which changes that rung's output) must
-/// re-key here too. Every field is length-delimited so no boundary is ambiguous
-/// (concatenation cannot collide). `cargo_locks` must be sorted and deduped by
-/// the caller; a declared lock that cannot be read fails closed.
+/// re-key here too. A `local_source` recipe (#469) is the same shape as a lock:
+/// its bytes are an editable in-tree DIR read at build time, not a hash compiled
+/// into the binary, so an edit MUST re-key here or a memo hit would serve stale
+/// bytes. Its tree is hashed the same way the interner walks it (`hash_source_tree`),
+/// so this fingerprint co-varies with the interned content address. Every field is
+/// length-delimited so no boundary is ambiguous (concatenation cannot collide).
+/// `cargo_locks` and `local_sources` must each be sorted and deduped by the caller;
+/// a declared lock or source dir that cannot be read fails closed.
 fn plan_fingerprint(
     eval: &Path,
     builder: &Path,
     patches_dir: &Path,
     repo_root: &Path,
     cargo_locks: &[String],
+    local_sources: &[String],
 ) -> Result<String, String> {
     let mut h = crate::sha256::Sha256::new();
     for bin in [eval, builder] {
@@ -800,7 +807,68 @@ fn plan_fingerprint(
         h.update(&(bytes.len() as u64).to_le_bytes());
         h.update(&bytes);
     }
+    for rel in local_sources {
+        let p = repo_root.join(rel);
+        h.update(&(rel.len() as u64).to_le_bytes());
+        h.update(rel.as_bytes());
+        // hash_source_tree emits its own self-delimiting type/length framing, and
+        // this section follows cargo_locks in a fixed order, so no cross-section
+        // ambiguity. A missing/unreadable declared source dir fails closed.
+        hash_source_tree(&p, &mut h)?;
+    }
     Ok(crate::sha256::to_base16(&h.finalize()))
+}
+
+/// Hash a local-source tree into `h` exactly the way `copy_source_tree` interns it
+/// — skip `target`/`.git`, sorted entries, symlink targets verbatim, file contents
+/// plus the executable bit (`mode & 0o100`, the only mode bit the NAR records) — so
+/// the build-run memo fingerprint co-varies with the store content address without
+/// recomputing the NAR. Fails closed on any I/O error or an unrepresentable node.
+fn hash_source_tree(dir: &Path, h: &mut crate::sha256::Sha256) -> Result<(), String> {
+    let meta = fs::symlink_metadata(dir).map_err(|e| format!("stat {}: {e}", dir.display()))?;
+    let ftype = meta.file_type();
+    if ftype.is_symlink() {
+        let target = fs::read_link(dir).map_err(|e| format!("readlink {}: {e}", dir.display()))?;
+        let tb = target.as_os_str().as_bytes();
+        h.update(b"L");
+        h.update(&(tb.len() as u64).to_le_bytes());
+        h.update(tb);
+        return Ok(());
+    }
+    if ftype.is_dir() {
+        h.update(b"D");
+        let mut children = Vec::new();
+        for entry in fs::read_dir(dir).map_err(|e| format!("read_dir {}: {e}", dir.display()))? {
+            let entry = entry.map_err(|e| format!("read_dir entry {}: {e}", dir.display()))?;
+            children.push(entry.path());
+        }
+        children.sort();
+        for child in children {
+            let Some(name) = child.file_name().map(|n| n.to_owned()) else {
+                continue;
+            };
+            if matches!(name.to_str(), Some("target") | Some(".git")) {
+                continue;
+            }
+            let nb = name.as_bytes();
+            h.update(&(nb.len() as u64).to_le_bytes());
+            h.update(nb);
+            hash_source_tree(&child, h)?;
+        }
+        return Ok(());
+    }
+    if ftype.is_file() {
+        let bytes = fs::read(dir).map_err(|e| format!("read {}: {e}", dir.display()))?;
+        h.update(if meta.permissions().mode() & 0o100 != 0 {
+            b"X"
+        } else {
+            b"F"
+        });
+        h.update(&(bytes.len() as u64).to_le_bytes());
+        h.update(&bytes);
+        return Ok(());
+    }
+    Err(format!("unsupported file type at {}", dir.display()))
 }
 
 /// Parse a build-run reuse memo, returning stem -> output basename ONLY when its
@@ -957,6 +1025,11 @@ enum SeedInput {
     Source { key: String, pin: SourcePin },
     LinuxHeaders { key: String, arch: &'static str },
     Patch { key: String, patch: String },
+    /// An IN-TREE source directory (#469 local-source provenance): `path` is the
+    /// repo-relative dir the recipe's `local_source` names. Interned by copying
+    /// the committed tree (minus build/VCS artifacts) into the seed store, then
+    /// gated against the compiled table like every other seed.
+    LocalSource { key: String, path: String },
 }
 
 impl SeedInput {
@@ -965,7 +1038,8 @@ impl SeedInput {
             SeedInput::Stage0 { key }
             | SeedInput::Source { key, .. }
             | SeedInput::LinuxHeaders { key, .. }
-            | SeedInput::Patch { key, .. } => key,
+            | SeedInput::Patch { key, .. }
+            | SeedInput::LocalSource { key, .. } => key,
         }
     }
 }
@@ -1329,6 +1403,73 @@ impl RecipeCheckRunner {
         self.store_add_recursive(intern_name, &stage0)
     }
 
+    /// Intern an IN-TREE source directory (#469 local-source provenance): resolve
+    /// the repo-relative path, copy the committed source (minus `target`/`.git`)
+    /// into scratch, and content-address it into the seed store under
+    /// `intern_name`. No fetch/verify: the bytes ARE the committed tree, and the
+    /// compiled seed-digest table is what pins them (`ensure_seed_input`).
+    fn intern_local_source(&self, intern_name: &str, rel: &str) -> Result<String, String> {
+        let dir = self.resolve_local_source_dir(rel)?;
+        let scratch = self.scratch.join(format!("local-source-{intern_name}"));
+        remove_path_if_exists(&scratch)?;
+        copy_source_tree(&dir, &scratch)
+            .map_err(|e| format!("copy local source {}: {e}", dir.display()))?;
+        self.store_add_recursive(intern_name, &scratch)
+    }
+
+    /// Resolve and validate a `local_source` path: it must be a plain
+    /// repo-relative path (no `..`/`.`/absolute component) that, once symlinks are
+    /// resolved, stays under the repo root, naming a directory that is a Cargo
+    /// crate (Cargo.toml + committed Cargo.lock). Returns the CANONICAL path so the
+    /// interner copies the validated bytes.
+    fn resolve_local_source_dir(&self, rel: &str) -> Result<PathBuf, String> {
+        if rel.is_empty() {
+            return Err("local source path is empty".into());
+        }
+        let relp = Path::new(rel);
+        for comp in relp.components() {
+            if !matches!(comp, std::path::Component::Normal(_)) {
+                return Err(format!(
+                    "local source `{rel}' must be a plain repo-relative path \
+                     (no `..', `.', or absolute root)"
+                ));
+            }
+        }
+        let dir = self.root.join(relp);
+        if !dir.is_dir() {
+            return Err(format!(
+                "local source `{rel}' is not a directory ({})",
+                dir.display()
+            ));
+        }
+        // Defense beyond the lexical `..` check: a symlinked path COMPONENT could
+        // still resolve outside the checkout and smuggle ambient (non-committed)
+        // bytes into the interned seed, breaking the in-tree provenance boundary.
+        // Canonicalize both and require the source stays under the repo root; the
+        // interner then copies this resolved path.
+        let canon_root = self
+            .root
+            .canonicalize()
+            .map_err(|e| format!("canonicalize repo root {}: {e}", self.root.display()))?;
+        let canon_dir = dir
+            .canonicalize()
+            .map_err(|e| format!("canonicalize local source {}: {e}", dir.display()))?;
+        if !canon_dir.starts_with(&canon_root) {
+            return Err(format!(
+                "local source `{rel}' resolves outside the checkout ({}) — a symlinked \
+                 component must not escape the repo (#469 in-tree provenance)",
+                canon_dir.display()
+            ));
+        }
+        if !canon_dir.join("Cargo.toml").is_file() {
+            return Err(format!("local source `{rel}' has no Cargo.toml"));
+        }
+        if !canon_dir.join("Cargo.lock").is_file() {
+            return Err(format!("local source `{rel}' has no committed Cargo.lock"));
+        }
+        Ok(canon_dir)
+    }
+
     fn stage0_source_tarball(&self) -> Result<PathBuf, String> {
         let pin = source_pin_for_key("stage0-source")?;
         validate_source_file_basename(&pin)?;
@@ -1489,6 +1630,7 @@ impl RecipeCheckRunner {
             SeedInput::Source { key, pin } => self.intern_source(key, pin),
             SeedInput::LinuxHeaders { key, arch } => self.intern_linux_headers(key, arch),
             SeedInput::Patch { key, patch } => self.intern_patch(key, patch),
+            SeedInput::LocalSource { key, path } => self.intern_local_source(key, path),
         }
     }
 
@@ -1777,22 +1919,33 @@ impl RecipeCheckRunner {
     /// loop-userland fingerprint (check_loop.rs), extended with the builder binary
     /// (it equally determines the output bytes a reuse skips) and the closure's
     /// cargoLocks (the one build input read from the repo, not compiled in — a lock
-    /// bump changes a rust rung's output but no binary, so it MUST re-key here).
-    /// Closure-scoped so an unrelated recipe's lock never invalidates this target.
+    /// bump changes a rust rung's output but no binary, so it MUST re-key here), and
+    /// every `local_source` dir a rung in the closure interns (#469: an editable
+    /// in-tree source, likewise repo-read and not compiled in, so an edit MUST
+    /// re-key). Closure-scoped so an unrelated recipe's lock or source never
+    /// invalidates this target.
     fn evaluator_fingerprint(&self, target: &str) -> Result<String, String> {
         let eval = env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
-        let mut locks: Vec<String> = recipe_closure(&[target])?
+        let closure = recipe_closure(&[target])?;
+        let mut locks: Vec<String> = closure
             .iter()
             .filter_map(|n| n.recipe.cargo_lock.clone())
             .collect();
         locks.sort();
         locks.dedup();
+        let mut local_sources: Vec<String> = closure
+            .iter()
+            .filter_map(|n| n.recipe.local_source.clone())
+            .collect();
+        local_sources.sort();
+        local_sources.dedup();
         plan_fingerprint(
             &eval,
             &self.tb,
             &self.root.join("seed/patches"),
             &self.root,
             &locks,
+            &local_sources,
         )
     }
 
@@ -2087,6 +2240,15 @@ fn classify_graph_inputs(nodes: &[RecipeNode]) -> Result<Vec<SeedInput>, String>
 }
 
 fn seed_input_for_recipe_source(key: &str, recipe: &Recipe) -> Result<SeedInput, String> {
+    // A local-source recipe supplies its OWN bytes (an in-tree dir), so it is
+    // classified from `recipe.local_source` — never a fetch pin or a special
+    // seed. This must win first: its `<name>-source` key has no pin to resolve.
+    if let Some(path) = &recipe.local_source {
+        return Ok(SeedInput::LocalSource {
+            key: key.to_string(),
+            path: path.clone(),
+        });
+    }
     match special_seed_input(key)? {
         Some(input) => Ok(input),
         None => {
@@ -2670,6 +2832,58 @@ fn copy_tree(src: &Path, dst: &Path) -> io::Result<()> {
             if let Some(name) = child.file_name() {
                 copy_tree(&child, &dst.join(name))?;
             }
+        }
+        fs::set_permissions(dst, meta.permissions())?;
+        return Ok(());
+    }
+    if ftype.is_file() {
+        if let Some(parent) = dst.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::copy(src, dst)?;
+        fs::set_permissions(dst, meta.permissions())?;
+    }
+    Ok(())
+}
+
+/// Copy a source tree, skipping build/VCS artifacts (`target`, `.git`) at every
+/// level so the interned bytes are the committed source only — a content address
+/// that does not depend on a prior host `cargo build` or the local git dir.
+// Recursively copy a source tree (skipping `target`/`.git`), preserving symlinks,
+// executable bits, and a deterministic (sorted) directory order for a stable
+// content address. This interns the WORKING tree, not a git snapshot: any other
+// untracked or locally-modified file under the dir folds into the address and, if
+// it does not match the compiled seed-digest pin, reds the gate. That is
+// fail-closed (a dirty checkout can never silently swap the interned source), so
+// the pin builds from a clean tree; git-tracked filtering would need a git
+// subprocess, which the zero-shell recipe runner deliberately avoids.
+fn copy_source_tree(src: &Path, dst: &Path) -> io::Result<()> {
+    let meta = fs::symlink_metadata(src)?;
+    let ftype = meta.file_type();
+    if ftype.is_symlink() {
+        if let Some(parent) = dst.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let target = fs::read_link(src)?;
+        let _ = fs::remove_file(dst);
+        symlink(target, dst)?;
+        return Ok(());
+    }
+    if ftype.is_dir() {
+        fs::create_dir_all(dst)?;
+        let mut children = Vec::new();
+        for entry in fs::read_dir(src)? {
+            children.push(entry?.path());
+        }
+        children.sort();
+        for child in children {
+            let Some(name) = child.file_name() else {
+                continue;
+            };
+            if matches!(name.to_str(), Some("target") | Some(".git")) {
+                continue;
+            }
+            copy_source_tree(&child, &dst.join(name))?;
         }
         fs::set_permissions(dst, meta.permissions())?;
         return Ok(());
@@ -3412,49 +3626,91 @@ mod tests {
         fs::create_dir_all(tmp.join("recipes/locks/x")).unwrap();
         fs::write(tmp.join("recipes/locks/x/Cargo.lock"), b"lock-v1").unwrap();
         let locks = vec!["recipes/locks/x/Cargo.lock".to_string()];
-        let fp = |locks: &[String]| plan_fingerprint(&eval, &builder, &patches, &tmp, locks).unwrap();
+        let fp = |locks: &[String], srcs: &[String]| {
+            plan_fingerprint(&eval, &builder, &patches, &tmp, locks, srcs).unwrap()
+        };
 
-        let base = fp(&locks);
+        let base = fp(&locks, &[]);
         // Deterministic: same inputs, same fingerprint.
-        assert_eq!(base, fp(&locks));
+        assert_eq!(base, fp(&locks, &[]));
         // Evaluator change re-keys.
         fs::write(&eval, b"EVAL-v2").unwrap();
-        let after_eval = fp(&locks);
+        let after_eval = fp(&locks, &[]);
         assert_ne!(base, after_eval);
         // Builder change re-keys.
         fs::write(&builder, b"BUILDER-v2").unwrap();
-        let after_builder = fp(&locks);
+        let after_builder = fp(&locks, &[]);
         assert_ne!(after_eval, after_builder);
         // Patch change re-keys.
         fs::write(patches.join("a.patch"), b"patch-a2").unwrap();
-        let after_patch = fp(&locks);
+        let after_patch = fp(&locks, &[]);
         assert_ne!(after_builder, after_patch);
         // A committed cargoLock bump re-keys (the repo-read build input).
         fs::write(tmp.join("recipes/locks/x/Cargo.lock"), b"lock-v2").unwrap();
-        let after_lock = fp(&locks);
+        let after_lock = fp(&locks, &[]);
         assert_ne!(after_patch, after_lock);
         // Dropping the lock from the closure (no rust rung) re-keys and is stable.
-        let nolock = fp(&[]);
+        let nolock = fp(&[], &[]);
         assert_ne!(after_lock, nolock);
-        assert_eq!(nolock, fp(&[]));
+        assert_eq!(nolock, fp(&[], &[]));
+
+        // A local_source dir (#469): its in-tree content is read at build time, so
+        // editing it MUST re-key. Declaring one re-keys; a byte edit under it
+        // re-keys; and it is deterministic when unchanged.
+        let srcdir = tmp.join("tests/demo-src");
+        fs::create_dir_all(&srcdir).unwrap();
+        fs::write(srcdir.join("main.rs"), b"fn main() {}").unwrap();
+        let srcs = vec!["tests/demo-src".to_string()];
+        let with_src = fp(&[], &srcs);
+        assert_ne!(nolock, with_src);
+        assert_eq!(with_src, fp(&[], &srcs));
+        fs::write(srcdir.join("main.rs"), b"fn main() { /* v2 */ }").unwrap();
+        let after_src_edit = fp(&[], &srcs);
+        assert_ne!(with_src, after_src_edit);
+        // The skipped `target`/`.git` dirs do NOT perturb the fingerprint (they are
+        // excluded from the interned content address too).
+        fs::create_dir_all(srcdir.join("target")).unwrap();
+        fs::write(srcdir.join("target/junk"), b"artifact").unwrap();
+        assert_eq!(after_src_edit, fp(&[], &srcs));
 
         // A missing patch dir is fine (hashes as zero patches) and stable.
         let nopatch = tmp.join("gone");
-        let f1 = plan_fingerprint(&eval, &builder, &nopatch, &tmp, &[]).unwrap();
-        assert_eq!(f1, plan_fingerprint(&eval, &builder, &nopatch, &tmp, &[]).unwrap());
+        let f1 = plan_fingerprint(&eval, &builder, &nopatch, &tmp, &[], &[]).unwrap();
+        assert_eq!(
+            f1,
+            plan_fingerprint(&eval, &builder, &nopatch, &tmp, &[], &[]).unwrap()
+        );
 
         // Length-delimiting: splitting a byte across the eval/builder boundary must
         // NOT collide (naive concatenation would).
         fs::write(&eval, b"ab").unwrap();
         fs::write(&builder, b"c").unwrap();
-        let split_a = plan_fingerprint(&eval, &builder, &nopatch, &tmp, &[]).unwrap();
+        let split_a = plan_fingerprint(&eval, &builder, &nopatch, &tmp, &[], &[]).unwrap();
         fs::write(&eval, b"a").unwrap();
         fs::write(&builder, b"bc").unwrap();
-        let split_b = plan_fingerprint(&eval, &builder, &nopatch, &tmp, &[]).unwrap();
+        let split_b = plan_fingerprint(&eval, &builder, &nopatch, &tmp, &[], &[]).unwrap();
         assert_ne!(split_a, split_b);
 
         // A declared-but-missing lock fails closed (never silently ignored).
-        assert!(plan_fingerprint(&eval, &builder, &nopatch, &tmp, &["recipes/locks/gone/Cargo.lock".to_string()]).is_err());
+        assert!(plan_fingerprint(
+            &eval,
+            &builder,
+            &nopatch,
+            &tmp,
+            &["recipes/locks/gone/Cargo.lock".to_string()],
+            &[]
+        )
+        .is_err());
+        // A declared-but-missing local_source dir also fails closed.
+        assert!(plan_fingerprint(
+            &eval,
+            &builder,
+            &nopatch,
+            &tmp,
+            &[],
+            &["tests/gone-src".to_string()]
+        )
+        .is_err());
         let _ = fs::remove_dir_all(&tmp);
     }
 

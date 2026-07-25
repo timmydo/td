@@ -1,0 +1,25 @@
+# Own workspace root: this source is built standalone (as the `sshd`
+# local-source recipe, or here on the host), never as a member of the engine
+# workspace. The empty table stops cargo from walking up into an enclosing
+# checkout's workspace.
+[workspace]
+
+[package]
+name = "td-sshd"
+version = "0.1.0"
+edition = "2021"
+
+# Dependency set held IDENTICAL to the retired tests/russh-demo spike so the
+# already-committed, feed-indexed, checksum-pinned russh closure pinned by the
+# sibling tests/sshd/Cargo.lock (what sshd.rs `.cargo_lock(...)` hashes into the
+# seed-digest gate and builds `--frozen` against) is reused unchanged — no new
+# crate enters the graph. Do not widen this without a dependency review (AGENTS.md
+# directive 2) AND refreshing tests/sshd/Cargo.lock + tests/td-feed.index together.
+[dependencies]
+russh = "0.61"
+tokio = { version = "1", features = ["full"] }
+anyhow = "1"
+
+[[bin]]
+name = "sshd"
+path = "src/main.rs"

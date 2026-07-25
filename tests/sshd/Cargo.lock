@@ -1649,7 +1649,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "td-russh-demo"
+name = "td-sshd"
 version = "0.1.0"
 dependencies = [
  "anyhow",

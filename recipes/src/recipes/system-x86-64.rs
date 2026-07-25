@@ -1,7 +1,7 @@
 use crate::ladder::{
     mesboot0_inputs, mesboot0_path, AUTOTEST_CMDLINE_TOKEN, GREETER_MARKER, NETTEST_CMDLINE_TOKEN,
-    NETTEST_DEFAULT_HOST, NETTEST_DEFAULT_PORT, SH, SYSTEM_ETC_RO_MARKER, SYSTEM_NET_REACH_MARKER,
-    SYSTEM_NET_RESOLVE_MARKER, SYSTEM_NET_UP_MARKER, SYSTEM_ROOT_RO_MARKER,
+    NETTEST_DEFAULT_HOST, NETTEST_DEFAULT_PORT, SH, SSHD_MARKER, SYSTEM_ETC_RO_MARKER,
+    SYSTEM_NET_REACH_MARKER, SYSTEM_NET_RESOLVE_MARKER, SYSTEM_NET_UP_MARKER, SYSTEM_ROOT_RO_MARKER,
     SYSTEM_STATE_WRITABLE_MARKER, UUTILS_RUNTIME_MARKER,
 };
 use crate::types::{Recipe, Step};
@@ -222,20 +222,29 @@ fn build_inittab() -> String {
     // process; empty id => the system console. This inittab runs on the REAL root AFTER
     // stage-1 `switch_root`ed into it: init re-mounts the pseudo-filesystems (devtmpfs,
     // proc, sysfs) on the erofs root's empty mountpoint dirs — mounting over a read-only
-    // dir is a VFS overlay, no write to the erofs — then runs the boot self-check and
-    // the auto-login getty. It does NOT mount /var, /tmp, or /run: stage-1 already
-    // mounted those as tmpfs, and switch_root preserves the mounts. /proc must precede
-    // /etc/rootcheck (which reads /proc/mounts).
+    // dir is a VFS overlay, no write to the erofs — then runs the boot self-check, brings
+    // the network up, starts the sshd service, and the auto-login getty. It does NOT mount
+    // /var, /tmp, or /run: stage-1 already mounted those as tmpfs, and switch_root preserves
+    // the mounts. /proc must precede /etc/rootcheck (which reads /proc/mounts).
     // /etc/netup runs AFTER rootcheck (networking after the read-only-root self-check)
     // and AFTER /run is a tmpfs (mounted by stage-1, preserved through switch_root): it
-    // brings the link up every boot and — under the nettest token — self-tests resolve
-    // + reach. td-netd writes resolv.conf/hosts through /etc symlinks into that /run.
+    // brings the link up every boot — loopback with 127.0.0.1/8 (so sshd's own loopback
+    // bind/connect and the boot self-test route) plus any NIC — and, under the nettest
+    // token, self-tests resolve + reach. td-netd writes resolv.conf/hosts through /etc
+    // symlinks into that /run.
+    //
+    // sshd runs as an init-managed `respawn` service AFTER netup (so loopback and any
+    // external link are already up): it binds all interfaces on port 22 (privileged, so it
+    // runs as root) and authorizes only /etc/ssh/authorized_keys (shipped empty => deny-all
+    // until keys are provisioned). A correctly-binding daemon never exits, so respawn does
+    // not loop; if it ever did, init restarts it rather than leaving the box without sshd.
     "::sysinit:/bin/mount -t devtmpfs devtmpfs /dev\n\
      ::sysinit:/bin/mount -t proc proc /proc\n\
      ::sysinit:/bin/mount -t sysfs sysfs /sys\n\
      ::sysinit:/bin/hostname -F /etc/hostname\n\
      ::sysinit:/etc/rootcheck\n\
      ::sysinit:/etc/netup\n\
+     ::respawn:/bin/sshd serve --listen 0.0.0.0:22 --authorized-keys /etc/ssh/authorized_keys\n\
      ttyS0::respawn:/etc/tty-session\n\
      ::ctrlaltdel:/bin/reboot\n\
      ::shutdown:/bin/umount -a -r\n"
@@ -398,9 +407,21 @@ fn build_profile(sys: &SystemDef) -> String {
     // oracle. Interactively (no token) none of this runs — the greeter is a normal shell.
     // `-F`: the token is a FIXED string (`td.autotest=1`), so match it literally — the `.`
     // must not act as a regex wildcard (re #550, Agy review).
+    // Then (c) `/bin/sshd selftest`, only if it exits 0, prints SSHD_MARKER — the loopback
+    // boot proof. selftest stands up an in-process russh server on an ephemeral 127.0.0.1
+    // port and drives a full SSH handshake+auth+channel+exec round-trip against it,
+    // exercising the kernel's TCP/IP stack (CONFIG_NET+INET), the russh protocol stack, and
+    // sshd's dynamic runtime closure (loader, glibc, libgcc_s, the aws-lc crypto C lib) on
+    // the erofs root. It runs as the UNPRIVILEGED greeter user on an ephemeral port — no
+    // root, no shipped credential — needing only the loopback `lo` that sysinit brought up.
+    // A broken net stack or closure fails the `&&`, drops the marker, and reds the oracle;
+    // selftest's own stdout/stderr are suppressed so the marker string appears exactly once.
+    // Runs before `exit` so `tty-session`'s `reboot -f` still powers the VM off.
     s.push_str(&format!(
         "if /bin/busybox grep -q -F '{AUTOTEST_CMDLINE_TOKEN}' /proc/cmdline 2>/dev/null; then \
-         /bin/cat /etc/os-release >/dev/null 2>&1 && echo {UUTILS_RUNTIME_MARKER}; exit; fi\n"
+         /bin/cat /etc/os-release >/dev/null 2>&1 && echo {UUTILS_RUNTIME_MARKER}; \
+         /bin/sshd selftest >/dev/null 2>&1 && echo {SSHD_MARKER}; \
+         exit; fi\n"
     ));
     s
 }
@@ -523,11 +544,13 @@ fn real_root_steps(sys: &SystemDef) -> Vec<Step> {
         from: "{in:td-netd}".into(),
         dest: "{root}/real-root{in:td-netd}".into(),
     });
-    // Stage uutils plus every transitively referenced store item at its canonical absolute
-    // path. The engine admits only direct recipe inputs, so a new runtime dependency fails
-    // closed until it is reviewed and declared here.
+    // Stage uutils and sshd plus every transitively referenced store item at its canonical
+    // absolute path. Both are dynamically linked, so each pulls its reachable runtime store
+    // closure (glibc, libgcc_s, and for sshd the aws-lc crypto C lib) onto the erofs root.
+    // The engine admits only direct recipe inputs, so a new runtime dependency fails closed
+    // until it is reviewed and declared here.
     steps.push(Step::StageRuntimeClosure {
-        roots: vec!["{in:uutils}".into()],
+        roots: vec!["{in:uutils}".into(), "{in:sshd}".into()],
         dest: "{root}/real-root".into(),
     });
     // /bin symlink farm: /bin/busybox, every applet, and /init resolve DIRECTLY into the
@@ -570,6 +593,13 @@ fn real_root_steps(sys: &SystemDef) -> Vec<Step> {
             link: format!("{{root}}/real-root/etc/{name}"),
         });
     }
+    // The sshd daemon: a single (non-multicall) dynamically-linked binary. /bin/sshd
+    // resolves into its staged store path; its runtime closure is staged by
+    // StageRuntimeClosure above.
+    steps.push(Step::Symlink {
+        target: "{in:sshd}/bin/sshd".into(),
+        link: "{root}/real-root/bin/sshd".into(),
+    });
     // Generated /etc.
     for (name, content, exec) in etc_files(sys) {
         steps.push(Step::WriteFile {
@@ -578,6 +608,19 @@ fn real_root_steps(sys: &SystemDef) -> Vec<Step> {
             exec,
         });
     }
+    // /etc/ssh/authorized_keys — the daemon's ONLY authorization source. Shipped EMPTY
+    // (comment only) so a fresh image denies every login until an operator provisions keys
+    // into this immutable-/etc file; the daemon fails closed on a missing/empty file.
+    steps.push(Step::MkDir {
+        path: "{root}/real-root/etc/ssh".into(),
+    });
+    steps.push(Step::WriteFile {
+        path: "{root}/real-root/etc/ssh/authorized_keys".into(),
+        content: "# td-sshd authorized_keys — one OpenSSH public key per line.\n\
+                  # Empty => deny all. /etc is immutable; rebuild the image to change this.\n"
+            .into(),
+        exec: false,
+    });
     steps
 }
 
@@ -628,6 +671,10 @@ fn shape_check() -> String {
      for a in @UUTILS_APPLETS@; do \
          [ \"$(readlink \"$root/bin/$a\" 2>/dev/null)\" = \"$uutgt\" ] || { echo \"root tree: /bin/$a is not a symlink to the staged uutils multicall ($uutgt) - the uutils /bin farm regressed (#547)\" >&2; exit 1; }; \
      done; \
+     sshd=\"{root}/real-root{in:sshd}/bin/sshd\"; sshdtgt=\"{in:sshd}/bin/sshd\"; \
+     { [ -f \"$sshd\" ] && [ -x \"$sshd\" ]; } || { echo 'root tree: the sshd daemon is not packed/executable at real-root{in:sshd}/bin/sshd - /bin/sshd would dangle and StageRuntimeClosure did not stage it' >&2; exit 1; }; \
+     [ \"$(readlink \"$root/bin/sshd\" 2>/dev/null)\" = \"$sshdtgt\" ] || { echo 'root tree: /bin/sshd is not a symlink to the staged sshd daemon' >&2; exit 1; }; \
+     [ -f \"$root/etc/ssh/authorized_keys\" ] || { echo 'root tree: /etc/ssh/authorized_keys missing - the sshd daemon has no authorization source' >&2; exit 1; }; \
      dsz=$(wc -c < \"$disk\"); \
      [ \"$dsz\" -ge 4096 ] || { echo \"root.erofs: implausibly small ($dsz bytes)\" >&2; exit 1; }; \
      set -- $(od -An -tx1 -j 1024 -N 4 \"$disk\"); \
@@ -742,10 +789,12 @@ pub fn recipe() -> Recipe {
         // linux-x86-64: the EXPORTED gen_init_cpio packer (verified STATICALLY linked).
         // uutils: the dynamically-linked `coreutils` multicall packed as the /bin file/text
         //   userland (#547).
-        // glibc-x86-64: uutils' declared runtime input. StageRuntimeClosure reaches it from
-        //   uutils's embedded store reference and copies the whole content-addressed item.
+        // sshd: the source-built russh SSH daemon, packed at /bin/sshd; its runtime closure
+        //   (glibc, libgcc_s, aws-lc crypto C lib) is reached by StageRuntimeClosure.
+        // glibc-x86-64: uutils' and sshd's declared runtime input. StageRuntimeClosure reaches
+        //   it from their embedded store references and copies the whole content-addressed item.
         // td-netd: the static network bring-up daemon (empty runtime closure, CopyTree'd).
-        .native_inputs(&["busybox-x86-64", "linux-x86-64", "uutils", "glibc-x86-64", "td-netd"])
+        .native_inputs(&["busybox-x86-64", "linux-x86-64", "uutils", "glibc-x86-64", "sshd", "td-netd"])
         .inputs_owned(mesboot0_inputs(&[]))
         .steps(steps)
 }
@@ -768,8 +817,8 @@ mod tests {
         let (roots, dest) = closures.first().expect("one runtime closure");
         assert_eq!(
             roots.as_slice(),
-            ["{in:uutils}"],
-            "dynamically linked uutils is the explicit runtime root"
+            ["{in:uutils}", "{in:sshd}"],
+            "the dynamically linked uutils multicall and sshd daemon are the explicit runtime roots"
         );
         assert_eq!(dest.as_str(), "{root}/real-root");
         assert!(

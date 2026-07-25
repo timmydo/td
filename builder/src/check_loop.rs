@@ -1488,8 +1488,10 @@ fn heavy_warms(root: &Path) {
         &["warm", "crate", "coreutils", "0.9.0", "uutils"],
         &["warm", "crate", "youki", "0.6.0"],
         &["warm", "crate", "uu_cat", "0.9.0", "cat"],
-        // Local-source variant: russh's 188-crate DEP closure only.
-        &["warm", "crate-local", "tests/russh-demo", "russh"],
+        // Local-source variant: the sshd recipe's russh DEP closure only (the
+        // in-tree source is interned by the gate). DEST = the recipe name so the
+        // closure lands where provision_auto_vendor reads it.
+        &["warm", "crate-local", "tests/sshd", "sshd"],
     ];
     let envs = vec![(s("TD_ROOT"), root.display().to_string())];
     let mut running: Vec<(std::process::Child, Vec<String>)> = Vec::new();

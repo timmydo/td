@@ -5,6 +5,16 @@ edition = "2021"
 description = "td's verified deployment selector and kexec boot shim"
 license = "GPL-3.0-or-later"
 
+# Own workspace root. The engine root manifest lists this crate in `exclude` (so
+# its lock never mixes into the dependency-free engine lock), but that exclude only
+# stops cargo at that manifest — from a nested checkout (e.g. .claude/worktrees/*,
+# which lives physically under the main checkout) cargo would keep walking up and
+# be captured by the outer manifest, which lists neither member nor exclude for the
+# nested path. An explicit empty `[workspace]` pins THIS as the root and stops the
+# walk, so `cargo clippy/test` works identically from the main checkout or a
+# worktree — the standalone-build invariant the recipe's direct-rustc build assumes.
+[workspace]
+
 [[bin]]
 name = "td-boot"
 path = "src/main.rs"

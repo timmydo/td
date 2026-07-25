@@ -17,6 +17,10 @@
 # target dir at the workspace root (was recipes/target/ + builder/target/).
 /target/
 
+# Standalone test-fixture crates (tests/sshd, tests/vendor-demo, …) each build
+# to their own target dir when compiled directly on the host for validation.
+tests/*/target/
+
 # check-memo verdicts (constraint 2): host-local state,
 # NEVER committed — a verdict greens only the environment that recorded it.
 .check-verdicts/

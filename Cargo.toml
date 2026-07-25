@@ -17,11 +17,13 @@
 #                     engine trust boundary (its own confined single-ioctl unsafe).
 #   td-boot/        — the target-side verified deployment selector and boot
 #                     shim; pure std and sharing the engine SHA-256 source.
-#   tests/*-demo/   — throwaway fixtures for vendoring/ssh tests.
+#   tests/sshd/     — td-owned SSH daemon source, built offline as the `sshd`
+#                     local-source recipe and shipped in system-x86-64.
+#   tests/vendor-demo/ — throwaway fixture for the vendoring test.
 [workspace]
 resolver = "2"
 members = ["builder", "recipes", "engine"]
-exclude = ["net", "td-kexec", "td-sh", "td-netd", "td-boot", "tests/russh-demo", "tests/vendor-demo"]
+exclude = ["net", "td-kexec", "td-sh", "td-netd", "td-boot", "tests/sshd", "tests/vendor-demo"]
 
 [profile.release]
 # Keep the release profile explicit and minimal so the reproducibility oracle

@@ -912,7 +912,9 @@ fn warm_crate(root: &Path, krate: &str, ver: &str, dest: &str) {
 
 /// warm crate-local SRCDIR DEST — provision a LOCAL (in-tree) crate's dep closure THROUGH
 /// the in-process cargo-proxy. No source crate to fetch (the source IS the in-tree dir, which
-/// the gate interns itself); only the locked dep closure -> .td-build-cache/crate-vendor/<dest>/*.crate.
+/// the gate interns itself); only the locked dep closure ->
+/// .td-build-cache/crate-vendor/<dest>/vendor/*.crate — the SAME layout `warm crate` writes and
+/// `provision_auto_vendor` reads (crate-vendor/<recipe-name>/vendor), so DEST is the recipe name.
 fn warm_crate_local(root: &Path, srcrel: &str, dest: &str) {
     let srcdir = match std::fs::canonicalize(root.join(srcrel)) {
         Ok(p) if p.join("Cargo.lock").is_file() => p,
@@ -921,7 +923,10 @@ fn warm_crate_local(root: &Path, srcrel: &str, dest: &str) {
             return;
         }
     };
-    let vendor = root.join(".td-build-cache/crate-vendor").join(dest);
+    let vendor = root
+        .join(".td-build-cache/crate-vendor")
+        .join(dest)
+        .join("vendor");
     if is_warm_complete(&vendor) {
         eprintln!(
             "td-feed warm crate-local: {dest} already warm ({} crates) in {}",
