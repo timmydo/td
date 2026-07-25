@@ -15,6 +15,9 @@
 //!   ## <key>: <value>           a single-line assertion/metadata on the case
 //!   ## STDOUT:  ...  ## END      a multiline expected-stdout block (verbatim)
 //!   ## STDERR:  ...  ## END      a multiline expected-stderr block (verbatim)
+//!                                 (END is optional/lenient, per Oils: the block
+//!                                 also ends at the next `##`/`####` or EOF, and
+//!                                 `## END:` with trailing text still terminates)
 //!   ## <QUAL> <shells> <k>: v    a per-shell override (QUAL ∈ OK|OK-N|BUG|BUG-N|N-I)
 //!   ## <QUAL> <shells> STDOUT:   a per-shell multiline override; shells `/`-separated
 //!   #  (single hash) / blank      an ignored comment (also a no-op shell comment)
@@ -33,8 +36,18 @@
 //! why the shells legitimately differ, so resolution keys on the shell list.
 #![deny(unsafe_code)]
 
+use std::collections::BTreeSet;
+use std::io::Read;
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
+use std::time::{Duration, Instant};
+
+/// Per-case wall-clock cap. A bulk corpus contains cases that block forever
+/// under a POSIX shell (`read` with no input, an unbounded loop); without this
+/// one hung case would wedge the shared land-on-green gate. A timed-out case is
+/// reported as a failure (its known-hang entry belongs on the `skip` list so it
+/// is not re-run every gate).
+const CASE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// The default identity chain for td-sh: prefer busybox `ash`'s expected output
 /// (what we replace), then `dash` (the same NetBSD-ash POSIX lineage), then the
@@ -105,6 +118,7 @@ pub struct CaseOutcome {
     pub name: String,
     pub passed: bool,
     pub detail: Option<String>, // human-readable mismatch when failed
+    pub timed_out: bool,        // hit CASE_TIMEOUT (a typed signal, not parsed from `detail`)
 }
 
 // ---- parsing -------------------------------------------------------------
@@ -166,20 +180,41 @@ fn is_block_opener(head: &Head) -> bool {
     head.has_colon && head.value.is_empty() && (head.key == "STDOUT" || head.key == "STDERR")
 }
 
-/// Collect a `## STDOUT:` block body verbatim (each line plus a trailing '\n')
-/// until a `## END` line. Returns the body and the index just past `## END`.
-fn read_block(lines: &[&str], start: usize) -> Result<(String, usize), SpecError> {
+/// A block terminator, matching Oils' `END_MULTILINE_RE` (`re.match(r'##\s+END')`):
+/// two hashes, at least one space, then `END`; any trailing text (a stray `:`,
+/// a comment) is ignored, as in the real corpus (`## END:`).
+fn is_end_marker(line: &str) -> bool {
+    match line.strip_prefix("##") {
+        Some(rest) => {
+            let trimmed = rest.trim_start();
+            rest.len() != trimmed.len() && trimmed.starts_with("END")
+        }
+        None => false,
+    }
+}
+
+/// Collect a `## STDOUT:`/`## STDERR:` block body verbatim (each line plus a
+/// trailing '\n'). The body runs to an explicit `## END` (consumed), OR — since
+/// Oils makes the END token optional — to the next `##` annotation / `####` case
+/// (NOT consumed, so the caller re-reads it) / EOF. Returns the body and the
+/// index at which the caller should resume.
+fn read_block(lines: &[&str], start: usize) -> (String, usize) {
     let mut body = String::new();
     let mut j = start;
     while let Some(l) = lines.get(j) {
-        if l.trim() == "## END" {
-            return Ok((body, j + 1));
+        if is_end_marker(l) {
+            return (body, j + 1);
+        }
+        // Optional-END: a new token (annotation or case header) ends the block
+        // without being consumed. A single-`#` line is shell-comment/plain body.
+        if l.starts_with("##") || l.starts_with("####") {
+            return (body, j);
         }
         body.push_str(l);
         body.push('\n');
         j += 1;
     }
-    Err(SpecError::new(start, "unterminated `## STDOUT:`/`## STDERR:` block (missing `## END`)"))
+    (body, j)
 }
 
 /// Flush a completed case, trimming trailing blank lines from its code (they sit
@@ -198,6 +233,7 @@ pub fn parse_spec(input: &str) -> Result<Vec<SpecCase>, SpecError> {
     let lines: Vec<&str> = input.lines().collect();
     let mut cases: Vec<SpecCase> = Vec::new();
     let mut cur: Option<SpecCase> = None;
+    let mut code_inline = false; // this case's code came from `## code:` (Oils: exclusive with body code)
     let mut i = 0;
 
     while let Some(line) = lines.get(i) {
@@ -206,6 +242,7 @@ pub fn parse_spec(input: &str) -> Result<Vec<SpecCase>, SpecError> {
             push_case(&mut cases, cur.take());
             let name = line.trim_start_matches('#').trim().to_string();
             cur = Some(SpecCase { name, code: String::new(), line: i + 1, annotations: Vec::new() });
+            code_inline = false;
             i += 1;
             continue;
         }
@@ -214,7 +251,7 @@ pub fn parse_spec(input: &str) -> Result<Vec<SpecCase>, SpecError> {
             let content = line.get(2..).unwrap_or("").trim_start();
             let head = parse_ann_head(content);
             if is_block_opener(&head) {
-                let (body, next) = read_block(&lines, i + 1)?;
+                let (body, next) = read_block(&lines, i + 1);
                 if let Some(c) = cur.as_mut() {
                     c.annotations.push(Annotation {
                         qualifier: head.qualifier,
@@ -227,9 +264,29 @@ pub fn parse_spec(input: &str) -> Result<Vec<SpecCase>, SpecError> {
                 i = next;
                 continue;
             }
-            // A single-line annotation with a colon carries an assertion; a bare
-            // token (e.g. a stray `## END`) is ignored. File-header annotations
-            // (cur is None) are ignored too.
+            // Inline-code form: `## code: <code>` (Oils) supplies the case's shell
+            // code in an annotation instead of as body lines. Record it as the
+            // code, not an assertion, so the case runs and `code` never looks like
+            // a typo'd assertion key.
+            if head.has_colon
+                && head.key == "code"
+                && head.qualifier == Qualifier::Default
+                && head.shells.is_empty()
+            {
+                if let Some(c) = cur.as_mut() {
+                    // Oils treats `## code:` as mutually exclusive with body code:
+                    // fail closed on the mixed shape rather than silently discard
+                    // body code already collected.
+                    if !c.code.is_empty() {
+                        return Err(SpecError::new(i + 1, "case mixes body code with `## code:`"));
+                    }
+                    c.code = head.value;
+                    code_inline = true;
+                }
+                i += 1;
+                continue;
+            }
+            // A single-line annotation with a colon carries an assertion.
             if head.has_colon {
                 if let Some(c) = cur.as_mut() {
                     c.annotations.push(Annotation {
@@ -240,6 +297,16 @@ pub fn parse_spec(input: &str) -> Result<Vec<SpecCase>, SpecError> {
                         value: head.value,
                     });
                 }
+                i += 1;
+                continue;
+            }
+            // A `##` line inside a case that is neither a block opener, `## code:`,
+            // an assertion, nor a consumed `## END` is malformed — Oils raises on
+            // it (`Invalid ## line`). Fail closed so a typo (`##END`, `## STODUT`)
+            // can't silently truncate a golden. Before the first `####` (cur None)
+            // a bare `##` line is file-level prose/metadata — ignore it.
+            if cur.is_some() {
+                return Err(SpecError::new(i + 1, format!("invalid `##` line: {line:?}")));
             }
             i += 1;
             continue;
@@ -253,10 +320,19 @@ pub fn parse_spec(input: &str) -> Result<Vec<SpecCase>, SpecError> {
         // annotations (blank separators before the next `####`) are not code.
         if let Some(c) = cur.as_mut() {
             if c.annotations.is_empty() {
-                if !c.code.is_empty() {
-                    c.code.push('\n');
+                if code_inline {
+                    // `## code:` already supplied the code; only trailing blanks
+                    // may follow. Real body code after it is the mixed shape Oils
+                    // rejects — fail closed (mirror of the check above).
+                    if !line.trim().is_empty() {
+                        return Err(SpecError::new(i + 1, "case mixes `## code:` with body code"));
+                    }
+                } else {
+                    if !c.code.is_empty() {
+                        c.code.push('\n');
+                    }
+                    c.code.push_str(line);
                 }
-                c.code.push_str(line);
             }
         }
         i += 1;
@@ -480,29 +556,149 @@ fn evaluate(name: &str, expected: &Expected, status: i32, stdout: &[u8], stderr:
         name: name.to_string(),
         passed,
         detail: if passed { None } else { Some(fails.join("; ")) },
+        timed_out: false,
     }
 }
 
-/// Run one case: feed its code to `shell` via `-c`, in a cleared environment, and
-/// diff stdout/stderr/status against the resolved expectation.
+/// Grace to collect a drained stream AFTER the child has exited or been killed.
+/// Normally a reader hits EOF the instant the child's last pipe writer closes, so
+/// this is not consumed; it only bounds the pathological case where a backgrounded
+/// descendant inherited the pipe and outlives the child. We abandon that reader
+/// (leaking one thread blocked on `read`) rather than hang the shared gate — such
+/// a case yields truncated output and belongs on the `skip` list. Generous so a
+/// loaded host's post-exit EOF is never mistaken for a stuck reader.
+const DRAIN_GRACE: Duration = Duration::from_secs(2);
+
+/// Read `stream` to EOF on its own thread, delivering the bytes once on a channel.
+/// A read error or a pipe that never reaches EOF yields no value (the caller treats
+/// a missing value as empty), so the caller never blocks on the read itself.
+fn drain_pipe<R: Read + Send + 'static>(stream: Option<R>) -> std::sync::mpsc::Receiver<Vec<u8>> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    match stream {
+        Some(mut s) => {
+            std::thread::spawn(move || {
+                let mut buf = Vec::new();
+                let _ = s.read_to_end(&mut buf); // bytes read before an error are retained
+                let _ = tx.send(buf);
+            });
+        }
+        None => {
+            let _ = tx.send(Vec::new());
+        }
+    }
+    rx
+}
+
+/// Wait for `child` up to `timeout` while draining its pipes, returning
+/// `(status_code_or_-1, timed_out, stdout, stderr)`. A killed child reports code
+/// `-1` (no exit code), which matches no expected status, so the case fails.
+///
+/// Both pipes are drained on reader threads started BEFORE the wait, so a case
+/// whose output exceeds the pipe buffer (~64 KiB) keeps running instead of
+/// deadlocking on write. On expiry the child is SIGKILLed and reaped. The final
+/// collect is itself bounded by `DRAIN_GRACE`: a descendant that inherited the
+/// pipe and outlives the child cannot make this block forever — we abandon the
+/// reader and return what was captured. So this always returns in bounded time.
+fn wait_and_capture(mut child: Child, timeout: Duration) -> std::io::Result<(i32, bool, Vec<u8>, Vec<u8>)> {
+    let out_rx = drain_pipe(child.stdout.take());
+    let err_rx = drain_pipe(child.stderr.take());
+    let deadline = Instant::now() + timeout;
+    let mut timed_out = false;
+    let status = loop {
+        if let Some(st) = child.try_wait()? {
+            break st;
+        }
+        if Instant::now() >= deadline {
+            child.kill()?;
+            timed_out = true;
+            break child.wait()?;
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    };
+    let out = out_rx.recv_timeout(DRAIN_GRACE).unwrap_or_default();
+    let err = err_rx.recv_timeout(DRAIN_GRACE).unwrap_or_default();
+    Ok((status.code().unwrap_or(-1), timed_out, out, err))
+}
+
+/// A throwaway working directory for one case: a case that redirects to a file
+/// (`echo x > f`) would otherwise litter — or clobber — the gate's working tree.
+/// Each case runs in its own temp dir, removed on drop (best-effort). Named by
+/// pid + a per-process counter so parallel gate processes and successive cases
+/// never collide.
+struct CaseWorkdir(std::path::PathBuf);
+
+impl CaseWorkdir {
+    fn new() -> std::io::Result<Self> {
+        use std::os::unix::fs::DirBuilderExt;
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let base = std::env::temp_dir();
+        let pid = std::process::id();
+        // Exclusive create (not `create_dir_all`): the name is predictable, so a
+        // symlink planted at it, or a dir leaked by a crashed run whose pid the OS
+        // reused, must red the create rather than be silently adopted (stale files,
+        // an escaped cwd). `create` fails on any existing leaf; a fresh `seq`
+        // retries past a genuine collision. 0700 keeps the throwaway dir owner-only.
+        loop {
+            let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let dir = base.join(format!("td-sh-case-{pid}-{seq}"));
+            match std::fs::DirBuilder::new().mode(0o700).create(&dir) {
+                Ok(()) => return Ok(Self(dir)),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(e) => return Err(e),
+            }
+        }
+    }
+}
+
+impl Drop for CaseWorkdir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0); // best-effort; a case may have left files
+    }
+}
+
+/// Run one case: feed its code to `shell` via `-c`, in a cleared environment and
+/// an isolated working directory, and diff stdout/stderr/status against the
+/// resolved expectation. Bounded by `CASE_TIMEOUT`; a timed-out case fails with a
+/// `timed out` detail.
 pub fn run_case(
     shell: &Path,
     case: &SpecCase,
     chain: &[&str],
 ) -> Result<CaseOutcome, Box<dyn std::error::Error>> {
     let expected = resolve(case, chain)?;
-    // env_clear for determinism; the seed corpus uses only shell builtins, so no
-    // PATH is needed. A future real td-sh that execs externals will take a
-    // configurable environment here.
-    let output = Command::new(shell)
+    // env_clear for determinism; a case that execs an external will fail closed
+    // (no PATH) rather than leak the host environment into the result. `$SH` is
+    // the one variable Oils sets — the path to the shell under test, used by
+    // cases that re-invoke it (`$SH -c ...`); point it at this same binary. The
+    // workdir is a throwaway temp dir (dropped after the run) so a case that
+    // writes a file cannot touch the gate's tree.
+    //
+    // Absolutize the shell first: `current_dir` moves the child's cwd, so a
+    // relative `shell` (and the `$SH` we export) would otherwise resolve against
+    // the temp dir and not be found.
+    let shell = std::fs::canonicalize(shell)?;
+    let workdir = CaseWorkdir::new()?;
+    let child = Command::new(&shell)
         .arg("-c")
         .arg(&case.code)
         .env_clear()
+        .env("SH", &shell)
+        .current_dir(&workdir.0)
         .stdin(Stdio::null())
-        .output()?;
-    // status.code() is None when killed by a signal; -1 can match no expectation.
-    let status = output.status.code().unwrap_or(-1);
-    Ok(evaluate(&case.name, &expected, status, &output.stdout, &output.stderr))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let (status, timed_out, stdout, stderr) = wait_and_capture(child, CASE_TIMEOUT)?;
+    let mut outcome = evaluate(&case.name, &expected, status, &stdout, &stderr);
+    if timed_out {
+        outcome.passed = false;
+        outcome.timed_out = true;
+        outcome.detail = Some(match outcome.detail {
+            Some(d) => format!("timed out after {}s; {d}", CASE_TIMEOUT.as_secs()),
+            None => format!("timed out after {}s", CASE_TIMEOUT.as_secs()),
+        });
+    }
+    Ok(outcome)
 }
 
 /// Parse and run every case in a spec file.
@@ -520,12 +716,12 @@ pub fn run_file(
     Ok(outcomes)
 }
 
-/// Run every `*.test.sh` file in `dir` (non-recursive, sorted by name).
-pub fn run_dir(
-    shell: &Path,
-    dir: &Path,
-    chain: &[&str],
-) -> Result<Vec<CaseOutcome>, Box<dyn std::error::Error>> {
+/// Every `*.test.sh` file in `dir` (non-recursive, sorted by name). The `.txt`
+/// expectations overlay and any other non-corpus file are excluded, so vendored
+/// spec files and td-sh's known-gap manifest can share the directory. Public so the
+/// overlay generator (examples/gen_expectations.rs) enumerates the exact same set the
+/// gate does — one source of truth, so no file can be in one but not the other.
+pub fn spec_paths(dir: &Path) -> std::io::Result<Vec<std::path::PathBuf>> {
     let mut paths: Vec<std::path::PathBuf> = Vec::new();
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
@@ -537,8 +733,17 @@ pub fn run_dir(
         }
     }
     paths.sort();
+    Ok(paths)
+}
+
+/// Run every `*.test.sh` file in `dir` (non-recursive, sorted by name).
+pub fn run_dir(
+    shell: &Path,
+    dir: &Path,
+    chain: &[&str],
+) -> Result<Vec<CaseOutcome>, Box<dyn std::error::Error>> {
     let mut outcomes = Vec::new();
-    for path in &paths {
+    for path in &spec_paths(dir)? {
         outcomes.extend(run_file(shell, path, chain)?);
     }
     Ok(outcomes)
@@ -548,6 +753,220 @@ pub fn run_dir(
 pub fn tally(outcomes: &[CaseOutcome]) -> (usize, usize) {
     let passed = outcomes.iter().filter(|o| o.passed).count();
     (passed, outcomes.len())
+}
+
+// ---- expectations overlay ------------------------------------------------
+
+/// How a case's observed result relates to td-sh's declared expectation for it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Disposition {
+    /// Ran, matched, and was not listed — real green coverage.
+    Pass,
+    /// Ran, mismatched, and is listed `xfail` — a known gap, tolerated.
+    XFail,
+    /// Ran and matched, but is listed `xfail` — the gap closed; the stale entry
+    /// must be removed. Reds the gate so progress is always recorded.
+    XPass,
+    /// Ran, mismatched, and was not listed — a regression. Reds the gate.
+    Fail,
+    /// Listed `skip`; not run at all (a known hang or a case that needs a
+    /// facility the `-c` harness does not provide).
+    Skip,
+}
+
+/// td-sh's known-gap manifest: cases it cannot yet pass (`xfail`) or must not run
+/// (`skip`). Kept OUTSIDE the spec files so the vendored Oils corpus stays
+/// byte-for-byte pristine — the overlay is td-sh's view, not an edit to upstream.
+#[derive(Clone, Debug, Default)]
+pub struct Expectations {
+    xfail: BTreeSet<String>,
+    skip: BTreeSet<String>,
+}
+
+/// The manifest key for a case: `<spec-file-basename>::<case description>`.
+pub fn case_key(file: &str, case_name: &str) -> String {
+    format!("{file}::{case_name}")
+}
+
+/// Overlay keys for a whole file's cases, in file order. A description that
+/// appears more than once in the file cannot be told apart by `case_key` alone,
+/// so the 2nd and later occurrences get an ` ##N` occurrence suffix (the first
+/// keeps the bare key). This makes every case individually addressable, so a
+/// duplicate description can be xfail'd/tracked per-occurrence instead of collapsing
+/// two cases onto one entry. Both the gate (`run_dir_classified`) and the overlay
+/// generator derive keys through here, so the occurrence numbering matches.
+pub fn case_keys(file: &str, cases: &[SpecCase]) -> Vec<String> {
+    // Single O(n) pass: a running per-description count assigns the suffix. The 1st
+    // occurrence keeps the bare key; the Nth (N>=2) gets ` ##N`. (No `total` check is
+    // needed — reaching count>0 already means the description repeats.)
+    let mut seen: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    let mut keys = Vec::with_capacity(cases.len());
+    for case in cases {
+        let count = seen.entry(case.name.as_str()).or_insert(0);
+        if *count == 0 {
+            keys.push(case_key(file, &case.name));
+        } else {
+            keys.push(format!("{file}::{} ##{}", case.name, *count + 1));
+        }
+        *count += 1;
+    }
+    keys
+}
+
+impl Expectations {
+    /// Parse the overlay. Each non-blank, non-`#` line is
+    /// `<xfail|skip> <file>::<case description>`; the key runs to end-of-line so a
+    /// description may contain spaces. Duplicate or contradictory entries, an
+    /// unknown disposition, or a key without `::` are hard errors — a sloppy
+    /// manifest must not silently mis-tolerate a case.
+    pub fn parse(text: &str) -> Result<Self, SpecError> {
+        let mut xfail = BTreeSet::new();
+        let mut skip = BTreeSet::new();
+        for (idx, raw) in text.lines().enumerate() {
+            let line = raw.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let ln = idx + 1;
+            let (disp, key) = line
+                .split_once(char::is_whitespace)
+                .ok_or_else(|| SpecError::new(ln, "expectation needs `<xfail|skip> <file>::<case>`"))?;
+            let key = key.trim();
+            if !key.contains("::") {
+                return Err(SpecError::new(ln, "expectation key must be `<file>::<case>`"));
+            }
+            let inserted = match disp {
+                "xfail" => xfail.insert(key.to_string()),
+                "skip" => skip.insert(key.to_string()),
+                other => {
+                    return Err(SpecError::new(ln, format!("unknown disposition {other:?} (want xfail|skip)")));
+                }
+            };
+            if !inserted {
+                return Err(SpecError::new(ln, format!("duplicate expectation {key:?}")));
+            }
+        }
+        if let Some(k) = xfail.intersection(&skip).next() {
+            return Err(SpecError::new(0, format!("{k:?} listed as both xfail and skip")));
+        }
+        Ok(Self { xfail, skip })
+    }
+
+    fn is_xfail(&self, key: &str) -> bool {
+        self.xfail.contains(key)
+    }
+
+    fn is_skip(&self, key: &str) -> bool {
+        self.skip.contains(key)
+    }
+
+    /// All listed keys (xfail then skip), for stale-entry detection.
+    fn keys(&self) -> impl Iterator<Item = &String> {
+        self.xfail.iter().chain(self.skip.iter())
+    }
+}
+
+/// One case run, classified against the overlay.
+#[derive(Clone, Debug)]
+pub struct ClassifiedOutcome {
+    pub key: String,
+    pub disposition: Disposition,
+    pub detail: Option<String>, // mismatch text for Fail/XFail
+}
+
+/// Counts by disposition over a classified run.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Summary {
+    pub pass: usize,
+    pub xfail: usize,
+    pub xpass: usize,
+    pub fail: usize,
+    pub skip: usize,
+}
+
+impl Summary {
+    /// Green iff there is no regression and no stale-tolerated pass. Stale
+    /// manifest keys are surfaced separately (see `run_dir_classified`) and must
+    /// also be empty for a clean gate.
+    pub fn is_green(&self) -> bool {
+        self.fail == 0 && self.xpass == 0
+    }
+}
+
+/// Tally a classified run by disposition.
+pub fn summarize(outcomes: &[ClassifiedOutcome]) -> Summary {
+    let mut s = Summary::default();
+    for o in outcomes {
+        match o.disposition {
+            Disposition::Pass => s.pass += 1,
+            Disposition::XFail => s.xfail += 1,
+            Disposition::XPass => s.xpass += 1,
+            Disposition::Fail => s.fail += 1,
+            Disposition::Skip => s.skip += 1,
+        }
+    }
+    s
+}
+
+/// Classify one already-run outcome against the overlay for a given key.
+fn classify(key: String, outcome: &CaseOutcome, exp: &Expectations) -> ClassifiedOutcome {
+    let disposition = match (outcome.passed, exp.is_xfail(&key)) {
+        (true, false) => Disposition::Pass,
+        (false, true) => Disposition::XFail,
+        (true, true) => Disposition::XPass,
+        (false, false) => Disposition::Fail,
+    };
+    ClassifiedOutcome { key, disposition, detail: outcome.detail.clone() }
+}
+
+/// Backstop against a genuine overlay-key collision. `case_keys` occurrence-qualifies
+/// duplicate descriptions, so within one corpus every case yields a distinct key and
+/// `is_new` (from the `seen` set) is always true. A `false` therefore means two cases
+/// mapped to the SAME key — a real bug, or an upstream description literally colliding
+/// with an ` ##N` suffix — which would let one overlay entry (or one run result)
+/// stand in for two cases. Red the gate unconditionally so the collision cannot hide,
+/// whether or not the key is listed.
+fn duplicate_conflicts(is_new: bool) -> bool {
+    !is_new
+}
+
+/// Run every case under `dir`, classifying each against `exp`. `skip` cases are
+/// not executed. Returns the classified outcomes and the list of overlay keys
+/// that matched no case (stale entries — a typo, or a renamed/removed upstream
+/// case); a caller enforcing land-on-green must red the gate when it is non-empty.
+pub fn run_dir_classified(
+    shell: &Path,
+    dir: &Path,
+    chain: &[&str],
+    exp: &Expectations,
+) -> Result<(Vec<ClassifiedOutcome>, Vec<String>), Box<dyn std::error::Error>> {
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+    let mut out: Vec<ClassifiedOutcome> = Vec::new();
+    for path in &spec_paths(dir)? {
+        let file = path.file_name().and_then(|n| n.to_str()).unwrap_or_default().to_string();
+        let text = std::fs::read_to_string(path)?;
+        let cases = parse_spec(&text)?;
+        let keys = case_keys(&file, &cases);
+        for (case, key) in cases.iter().zip(keys) {
+            let is_new = seen.insert(key.clone());
+            if duplicate_conflicts(is_new) {
+                out.push(ClassifiedOutcome {
+                    key,
+                    disposition: Disposition::Fail,
+                    detail: Some("two cases map to the same overlay key (collision) — cannot disambiguate".into()),
+                });
+                continue;
+            }
+            if exp.is_skip(&key) {
+                out.push(ClassifiedOutcome { key, disposition: Disposition::Skip, detail: None });
+                continue;
+            }
+            let outcome = run_case(shell, case, chain)?;
+            out.push(classify(key, &outcome, exp));
+        }
+    }
+    let stale: Vec<String> = exp.keys().filter(|k| !seen.contains(*k)).cloned().collect();
+    Ok((out, stale))
 }
 
 #[cfg(test)]
@@ -607,6 +1026,44 @@ echo real-line
         let cases = parse_spec(spec)?;
         let c = cases.first().ok_or_else(|| SpecError::new(0, "missing case"))?;
         assert_eq!(c.code, "cat <<'EOF2'\n#!/bin/sh\necho real-line\nEOF2");
+        Ok(())
+    }
+
+    #[test]
+    fn inline_code_annotation_supplies_the_case_code() -> Result<(), SpecError> {
+        // Oils' `## code:` form: the shell code is in the annotation, not body
+        // lines. It must become the case code and NOT be flagged as an unknown key.
+        let spec = "\
+#### Unterminated single quote
+## code: ls foo bar '
+## status: 2
+";
+        let cases = parse_spec(spec)?;
+        let c = cases.first().ok_or_else(|| SpecError::new(0, "missing case"))?;
+        assert_eq!(c.code, "ls foo bar '");
+        assert!(c.unrecognized_keys().is_empty());
+        assert_eq!(resolve(c, ASH_DASH_CHAIN)?.status, 2);
+        Ok(())
+    }
+
+    #[test]
+    fn block_end_is_lenient_and_optional() -> Result<(), SpecError> {
+        // `## END:` (trailing colon) still terminates, per Oils' `re.match`.
+        let colon = parse_spec("#### x\necho hi\n## STDOUT:\nhi\n## END:\n")?;
+        let c = colon.first().ok_or_else(|| SpecError::new(0, "missing case"))?;
+        assert_eq!(resolve(c, ASH_DASH_CHAIN)?.stdout.as_deref(), Some("hi\n"));
+
+        // END is optional: a following `##` annotation ends the block, and an
+        // empty per-shell block (the real `## N-I dash STDOUT:` / `## END:` shape)
+        // resolves to empty output for that shell.
+        let optional = parse_spec(
+            "#### y\necho hi\n## STDOUT:\nideal\n## N-I dash STDOUT:\n## END:\n",
+        )?;
+        let c = optional.first().ok_or_else(|| SpecError::new(0, "missing case"))?;
+        // Chain [ash, dash]: the dash block (empty) wins over the default.
+        assert_eq!(resolve(c, ASH_DASH_CHAIN)?.stdout.as_deref(), Some(""));
+        // A chain without dash falls back to the default block.
+        assert_eq!(resolve(c, &["mksh"])?.stdout.as_deref(), Some("ideal\n"));
         Ok(())
     }
 
@@ -703,5 +1160,136 @@ false
         let out = evaluate("x", &expected, 0, b"hi\n", b"");
         assert!(out.passed);
         assert_eq!(out.detail, None);
+    }
+
+    fn outcome(passed: bool) -> CaseOutcome {
+        CaseOutcome {
+            name: "c".into(),
+            passed,
+            detail: if passed { None } else { Some("mismatch".into()) },
+            timed_out: false,
+        }
+    }
+
+    #[test]
+    fn expectations_parse_reads_xfail_and_skip_with_spaces() -> Result<(), SpecError> {
+        let exp = Expectations::parse(
+            "# comment\n\
+             xfail arith.test.sh::Add one to var\n\
+             skip loop.test.sh::reads from stdin forever\n",
+        )?;
+        assert!(exp.is_xfail("arith.test.sh::Add one to var"));
+        assert!(exp.is_skip("loop.test.sh::reads from stdin forever"));
+        assert!(!exp.is_xfail("loop.test.sh::reads from stdin forever"));
+        Ok(())
+    }
+
+    #[test]
+    fn expectations_parse_rejects_malformed_lines() {
+        assert!(Expectations::parse("wat arith.test.sh::x").is_err()); // unknown disposition
+        assert!(Expectations::parse("xfail no-double-colon").is_err()); // missing `::`
+        assert!(Expectations::parse("lonelytoken").is_err()); // no whitespace split
+        assert!(Expectations::parse("xfail f::c\nxfail f::c").is_err()); // duplicate
+        assert!(Expectations::parse("xfail f::c\nskip f::c").is_err()); // both xfail and skip
+    }
+
+    #[test]
+    fn classify_maps_every_quadrant() {
+        let exp = Expectations::parse("xfail f::gap").unwrap_or_default();
+        // pass + unlisted => Pass; fail + unlisted => Fail (regression).
+        assert_eq!(classify("f::ok".into(), &outcome(true), &exp).disposition, Disposition::Pass);
+        assert_eq!(classify("f::reg".into(), &outcome(false), &exp).disposition, Disposition::Fail);
+        // fail + listed => XFail (tolerated); pass + listed => XPass (promote).
+        assert_eq!(classify("f::gap".into(), &outcome(false), &exp).disposition, Disposition::XFail);
+        assert_eq!(classify("f::gap".into(), &outcome(true), &exp).disposition, Disposition::XPass);
+    }
+
+    #[test]
+    fn summary_greens_only_without_fail_or_xpass() {
+        let clean = [
+            ClassifiedOutcome { key: "a".into(), disposition: Disposition::Pass, detail: None },
+            ClassifiedOutcome { key: "b".into(), disposition: Disposition::XFail, detail: None },
+            ClassifiedOutcome { key: "c".into(), disposition: Disposition::Skip, detail: None },
+        ];
+        let s = summarize(&clean);
+        assert_eq!((s.pass, s.xfail, s.skip), (1, 1, 1));
+        assert!(s.is_green());
+
+        let regressed =
+            [ClassifiedOutcome { key: "d".into(), disposition: Disposition::Fail, detail: None }];
+        assert!(!summarize(&regressed).is_green());
+        let stale_pass =
+            [ClassifiedOutcome { key: "e".into(), disposition: Disposition::XPass, detail: None }];
+        assert!(!summarize(&stale_pass).is_green());
+    }
+
+    #[test]
+    fn duplicate_conflicts_backstops_key_collision() -> Result<(), SpecError> {
+        // `case_keys` occurrence-qualifies duplicates, so `is_new` is true for every
+        // case in a well-formed corpus. A `false` means a genuine key collision, which
+        // reds the gate unconditionally — listed or not — so one entry/run can never
+        // stand in for two cases.
+        assert!(!duplicate_conflicts(true)); // first sight of a key never conflicts
+        assert!(duplicate_conflicts(false)); // a repeat key is a collision -> red
+        Ok(())
+    }
+
+    #[test]
+    fn case_keys_reds_gate_on_adversarial_suffix_collision() -> Result<(), SpecError> {
+        // Adversarial: a doubled "dup" makes `f::dup ##2`, which an upstream case
+        // literally named "dup ##2" also produces. case_keys cannot tell them apart,
+        // so the gate must red via the collision backstop, not silently mask one.
+        let text = "#### dup\ntrue\n#### dup\ntrue\n#### dup ##2\ntrue\n";
+        let cases = parse_spec(text)?;
+        let keys = case_keys("f.test.sh", &cases);
+        // 2nd "dup" and literal "dup ##2" collide on the same key.
+        assert_eq!(keys.get(1), keys.get(2));
+        let mut seen = BTreeSet::new();
+        let collided = keys.iter().any(|k| !seen.insert(k.clone()));
+        assert!(collided, "expected a key collision the gate would red on");
+        Ok(())
+    }
+
+    #[test]
+    fn case_keys_qualifies_repeated_descriptions() -> Result<(), SpecError> {
+        // Two cases share "dup"; "solo" appears once. The first "dup" keeps the bare
+        // key, later occurrences get an ` ##N` suffix, so every case is addressable.
+        let text = "#### dup\ntrue\n#### solo\ntrue\n#### dup\ntrue\n#### dup\ntrue\n";
+        let cases = parse_spec(text)?;
+        let keys = case_keys("f.test.sh", &cases);
+        assert_eq!(
+            keys,
+            vec![
+                "f.test.sh::dup".to_string(),
+                "f.test.sh::solo".to_string(),
+                "f.test.sh::dup ##2".to_string(),
+                "f.test.sh::dup ##3".to_string(),
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn parse_rejects_invalid_hash_line_inside_a_case() {
+        // A `##` line inside a case that is neither assertion, block, nor `## END`
+        // is malformed (Oils raises) — it must not silently truncate a golden.
+        assert!(parse_spec("#### x\necho hi\n##BADLINE\n").is_err()); // no space
+        assert!(parse_spec("#### x\necho hi\n## STODUT\n").is_err()); // typo, no colon
+        // File-level `##` prose before the first case stays ignorable metadata.
+        assert!(parse_spec("## just prose here\n#### x\necho hi\n## status: 0\n").is_ok());
+    }
+
+    #[test]
+    fn parse_rejects_code_mixed_with_body_lines() -> Result<(), SpecError> {
+        // `## code:` alone is the real corpus shape.
+        let ok = parse_spec("#### x\n## code: echo hi\n## status: 0\n")?;
+        assert_eq!(ok.first().map(|c| c.code.as_str()), Some("echo hi"));
+        // Body code after `## code:` is the mixed shape Oils rejects.
+        assert!(parse_spec("#### x\n## code: echo hi\necho again\n").is_err());
+        // Body code before `## code:` too.
+        assert!(parse_spec("#### x\necho first\n## code: echo hi\n").is_err());
+        // A trailing blank line after `## code:` is tolerated, not treated as code.
+        assert!(parse_spec("#### x\n## code: echo hi\n\n## status: 0\n").is_ok());
+        Ok(())
     }
 }

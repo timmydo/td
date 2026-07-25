@@ -1,0 +1,49 @@
+td-sh conformance spec corpus
+=============================
+
+This directory holds the Oils-format spec-test cases the `td-sh` conformance
+gate runs (see ../tests/conformance.rs). Two provenances live here:
+
+Vendored from Oils (oils-for-unix/oils), UNMODIFIED
+---------------------------------------------------
+  Upstream:  https://github.com/oils-for-unix/oils
+  Commit:    15de8fd779569e6e3a9f5fcbfc00e7df0ebe0380
+  Path:      spec/<file>  (copied byte-for-byte)
+  License:   Apache-2.0 (Oils). Copyright the Oils contributors.
+
+  Selection rule (reproducible from the pin): every `spec/*.test.sh` at that
+  commit EXCEPT
+    - the YSH/Oil *language* files (`ysh-*`, `oil-*`, `hay*`, `func-parsing`,
+      `proc-*`) — they test a different language, not a POSIX /bin/sh, so their
+      cases can never go green here; and
+    - Oils `smoke.test.sh`, whose name collides with td-sh's own seed below.
+  That is the POSIX/bash-family shell-conformance set: 137 files.
+
+  These files are pristine — the upstream bytes, verified byte-identical to that
+  pinned commit (each file's git blob SHA matches the pin). td-sh's own view of
+  which cases it cannot yet pass lives in `expectations.txt`, NOT as edits to
+  these files, so a pin bump is a clean re-copy. `td_sh::parse_spec` reads the
+  native Oils format directly (no conversion step). Bumping the pin, or changing
+  the selection, is a reviewed change: re-copy, re-verify the blob SHAs, and
+  regenerate `expectations.txt`.
+
+td-sh-authored seed cases
+-------------------------
+  smoke.test.sh
+  expansion.test.sh
+
+  Hand-written in the same Oils format; the original RED-baseline seed corpus.
+  Retained as additional, always-green coverage.
+
+Overlay
+-------
+  expectations.txt   td-sh's known-gap manifest (xfail / skip). Not a spec file.
+                     GENERATED, not hand-edited: examples/gen_expectations.rs runs
+                     each case through the built td-sh and buckets it. See its
+                     header for the xfail/skip semantics. Regenerate on a pin bump
+                     or when passes change (do not hand-edit):
+
+                       cargo build --release --manifest-path td-sh/Cargo.toml
+                       cargo run --release --manifest-path td-sh/Cargo.toml \
+                         --example gen_expectations -- \
+                         target/release/td-sh td-sh/spec > td-sh/spec/expectations.txt
