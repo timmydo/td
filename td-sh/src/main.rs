@@ -143,7 +143,7 @@ fn repl(sh: &mut Shell) -> i32 {
         let mut buffer = String::new();
         let ended = matches!(read_complete(&stdin, sh, &mut buffer), ReadResult::Eof);
         if !buffer.trim().is_empty() {
-            match parser::parse(&buffer) {
+            match parser::parse_aliased(&buffer, &sh.aliases) {
                 Ok(list) => match exec::run_list(sh, &list) {
                     Ok(()) => {}
                     Err(exec::Sig::Exit(code)) => return code,
@@ -177,7 +177,7 @@ fn read_complete(stdin: &std::io::Stdin, sh: &Shell, buffer: &mut String) -> Rea
             Ok(_) => buffer.push_str(&line),
             Err(_) => return ReadResult::Eof,
         }
-        match parser::parse(buffer) {
+        match parser::parse_aliased(buffer, &sh.aliases) {
             Ok(_) => return ReadResult::Ready,
             Err(e) if e.starts_with(ast::INCOMPLETE) => {
                 let ps2 = sh.get_var("PS2").unwrap_or_else(|| "> ".to_string());

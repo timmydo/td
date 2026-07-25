@@ -11,10 +11,11 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use crate::ast::{AndOr, Cmd, Conn, List, Pipeline, Redir, Sep, Word};
+use crate::ast::{AndOr, Cmd, Conn, List, Pipeline, Redir, Sep, Word, INCOMPLETE};
 use crate::builtin;
 use crate::expand;
-use crate::parser::parse;
+use crate::lexer::Aliases;
+use crate::parser::parse_aliased;
 use crate::pattern;
 use crate::process::{self, Fds};
 
@@ -98,6 +99,9 @@ pub struct Shell {
     /// it -- while the OPTIND *variable* is global and only written by `getopts`.
     pub getopts_optind: i64,
     pub getopts_off: i64,
+    /// Aliases in force. They are consumed at PARSE time, so only the unit loop
+    /// and the other parse entry points read this.
+    pub aliases: Aliases,
 }
 
 /// Bound on nested command execution — enforced once, at the `run_command` choke
@@ -140,6 +144,7 @@ impl Shell {
             interactive: false,
             getopts_optind: 1,
             getopts_off: -1,
+            aliases: Aliases::new(),
         };
         // POSIX seeds these when absent; scripts assume they exist.
         if sh.get_var("IFS").is_none() {
@@ -174,6 +179,7 @@ impl Shell {
             interactive: false,
             getopts_optind: 1,
             getopts_off: -1,
+            aliases: Aliases::new(),
         };
         let _ = sh.set_var("IFS", " \t\n");
         let _ = sh.set_var("OPTIND", "1");
@@ -292,14 +298,7 @@ impl Default for Shell {
 /// Parse and run a whole program, returning the final `$?`. A parse error prints
 /// to stderr and yields 2 (the POSIX syntax-error status).
 pub fn run_program(sh: &mut Shell, src: &str) -> i32 {
-    let list = match parse(src) {
-        Ok(l) => l,
-        Err(e) => {
-            let _ = write_stderr(sh, &format!("td-sh: {e}"));
-            return 2;
-        }
-    };
-    match run_list(sh, &list) {
+    match run_source(sh, src, "") {
         Ok(()) => sh.status,
         Err(Sig::Exit(code)) => code,
         // A stray break/continue/return at the top level is not an error worth
@@ -307,6 +306,58 @@ pub fn run_program(sh: &mut Shell, src: &str) -> i32 {
         Err(_) => sh.status,
     }
 }
+
+/// Run `src` one top-level unit at a time, as dash reads a script: a command is
+/// parsed only once everything before it has run. That is what makes an `alias`
+/// visible to the next line but not to the rest of its own line. A syntax error
+/// stops the run with status 2, reported as `td-sh: {what}{error}`.
+pub fn run_source(sh: &mut Shell, src: &str, what: &str) -> R<()> {
+    let mut off = 0usize;
+    loop {
+        let Some(rest) = src.get(off..) else {
+            return Ok(());
+        };
+        match next_unit(rest, &sh.aliases) {
+            None => return Ok(()),
+            Some(Err(e)) => {
+                let _ = write_stderr(sh, &format!("td-sh: {what}{e}"));
+                sh.set_status(2);
+                return Ok(());
+            }
+            Some(Ok((list, used))) => {
+                off += used;
+                run_list(sh, &list)?;
+            }
+        }
+    }
+}
+
+/// The next parse unit: the shortest run of whole lines that parses. `None` once
+/// only blanks remain; the `usize` is how many bytes of `src` it consumed.
+fn next_unit(src: &str, aliases: &Aliases) -> Option<Result<(List, usize), String>> {
+    if src.trim().is_empty() {
+        return None;
+    }
+    let mut end = 0usize;
+    loop {
+        end = match src
+            .as_bytes()
+            .get(end..)
+            .and_then(|tail| tail.iter().position(|&b| b == b'\n'))
+        {
+            Some(off) => end + off + 1,
+            None => src.len(),
+        };
+        let more = end < src.len();
+        let head = src.get(..end).unwrap_or(src);
+        match parse_aliased(head, aliases) {
+            Ok(list) => return Some(Ok((list, end))),
+            Err(e) if more && e.starts_with(INCOMPLETE) => continue,
+            Err(e) => return Some(Err(e)),
+        }
+    }
+}
+
 
 pub fn run_list(sh: &mut Shell, list: &List) -> R<()> {
     for (and_or, sep) in &list.items {

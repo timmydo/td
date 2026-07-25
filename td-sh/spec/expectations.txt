@@ -49,48 +49,16 @@
 # (see duplicate_conflicts).
 
 # ---- xfail: td-sh runs, wrong answer (known gaps) ----
-xfail alias.test.sh::Alias can be defined and used on a single line
-xfail alias.test.sh::Alias is respected inside eval
-xfail alias.test.sh::Alias must be an unquoted word, no expansions allowed
-xfail alias.test.sh::Alias name with punctuation
 xfail alias.test.sh::Alias that is && || ;
 xfail alias.test.sh::Alias that is pipeline
-xfail alias.test.sh::Alias trailing newline
-xfail alias.test.sh::Alias with a quote in the middle is a syntax error
-xfail alias.test.sh::Alias with internal newlines
-xfail alias.test.sh::Basic alias
-xfail alias.test.sh::Dynamic alias definition
-xfail alias.test.sh::Expansion of alias with variable
-xfail alias.test.sh::List aliases by providing names
-xfail alias.test.sh::Loop split across alias and arg works
-xfail alias.test.sh::Loop split across alias in another way
-xfail alias.test.sh::Loop split across both iterative and recursive aliases
-xfail alias.test.sh::Recursive alias expansion of SECOND word
-xfail alias.test.sh::Recursive alias expansion of first word
-xfail alias.test.sh::Syntax error after expansion
 xfail alias.test.sh::Two aliases in pipeline
-xfail alias.test.sh::Usage of builtins
-xfail alias.test.sh::alias can override builtin
-xfail alias.test.sh::alias for left brace
-xfail alias.test.sh::alias for left paren
-xfail alias.test.sh::alias not defined
 xfail alias.test.sh::alias used in here doc
-xfail alias.test.sh::alias used in subshell and command sub
 xfail alias.test.sh::alias with environment bindings works
-xfail alias.test.sh::alias with keywords
-xfail alias.test.sh::alias with line continuation in the middle
 xfail alias.test.sh::alias with redirects works
-xfail alias.test.sh::alias with trailing space causes alias expansion on second word
 xfail alias.test.sh::alias with word of multiple lines
 xfail alias.test.sh::alias without args lists all aliases
-xfail alias.test.sh::define and use alias on a single line
-xfail alias.test.sh::defining multiple aliases, then unalias
-xfail alias.test.sh::first and second word are the same alias, but no trailing space
-xfail alias.test.sh::first and second word are the same alias, with trailing space
 xfail alias.test.sh::here doc inside alias
 xfail alias.test.sh::unalias -a
-xfail alias.test.sh::unalias not defined
-xfail alias.test.sh::unalias without args is a usage error
 xfail append.test.sh::Append string to string
 xfail append.test.sh::Append string to undefined variable
 xfail append.test.sh::Strings have value semantics, not reference semantics
@@ -435,16 +403,8 @@ xfail bugs.test.sh::unset readonly -- multiple lines
 xfail bugs.test.sh::unset readonly -- one line
 xfail builtin-bash.test.sh::bad help topic
 xfail builtin-bash.test.sh::help
-xfail builtin-bash.test.sh::mapfile
-xfail builtin-bash.test.sh::mapfile (array name): arr
-xfail builtin-bash.test.sh::mapfile (delimiter): -d '' (null-separated)
-xfail builtin-bash.test.sh::mapfile (delimiter): -d delim
-xfail builtin-bash.test.sh::mapfile (input range): -s start -n count
-xfail builtin-bash.test.sh::mapfile (store position): -O start
-xfail builtin-bash.test.sh::mapfile (truncate delim): -t
 xfail builtin-bash.test.sh::mapfile -t bugs (ble.sh)
 xfail builtin-bash.test.sh::mapfile / readarray stdin  TODO: Fix me.
-xfail builtin-bash.test.sh::readarray (synonym for mapfile)
 xfail builtin-bind.test.sh::bind -X
 xfail builtin-bind.test.sh::bind -l should report readline functions
 xfail builtin-bind.test.sh::bind -m with bind -x/-X
@@ -844,9 +804,7 @@ xfail builtin-vars.test.sh::Exporting a parent func variable (dynamic scope)
 xfail builtin-vars.test.sh::Make an existing local variable readonly
 xfail builtin-vars.test.sh::Unset a function without -f
 xfail builtin-vars.test.sh::Unset and scope (bug #653)
-xfail builtin-vars.test.sh::Unset errors
 xfail builtin-vars.test.sh::Unset exported variable, then define it again.  It's NOT still exported.
-xfail builtin-vars.test.sh::Unset invalid variable name
 xfail builtin-vars.test.sh::Unset readonly variable
 xfail builtin-vars.test.sh::Use local twice
 xfail builtin-vars.test.sh::assign to readonly variable
@@ -1571,7 +1529,6 @@ xfail vars-special.test.sh::$HOSTNAME
 xfail vars-special.test.sh::$LINENO for assignment
 xfail vars-special.test.sh::$LINENO in "bare" redirect arg (bug regression)
 xfail vars-special.test.sh::$LINENO in case
-xfail vars-special.test.sh::$LINENO in for (( loop
 xfail vars-special.test.sh::$LINENO in for loop
 xfail vars-special.test.sh::$LINENO in other for loops
 xfail vars-special.test.sh::$LINENO in redirect arg (bug regression)
@@ -1635,7 +1592,6 @@ skip append.test.sh::myarray[-1]+=s - Append to last element
 skip append.test.sh::myarray[1]+=s - Append to element
 skip append.test.sh::typeset s+=(my array)
 skip array-assign.test.sh::Indexed LHS with spaces
-skip array-assign.test.sh::Indexed LHS without spaces, and +=
 skip array-assign.test.sh::Multiple LHS array words
 skip array-assign.test.sh::Nested a[i[0]]=0
 skip array-assign.test.sh::argv.py a[1 + 2]=
@@ -1744,7 +1700,6 @@ skip ble-features.test.sh::[compat_array] scalar write to associative arrays
 skip ble-idioms.test.sh::Issue #1069 [59] N-I: arr=s should set RHS to arr[0]
 skip brace-expansion.test.sh::Empty alternative
 skip brace-expansion.test.sh::Empty alternative with empty string suffix
-skip builtin-bash.test.sh::mapfile -t doesn't remove \r
 skip builtin-bracket.test.sh::test -b -c -S (block, character, socket)
 skip builtin-bracket.test.sh::test -p named pipe
 skip builtin-completion.test.sh::-o plusdirs and -o dirnames with compgen

@@ -11,10 +11,20 @@ use crate::ast::{
     is_name, AndOr, Assign, CaseItem, Cmd, Conn, IfArm, List, Pipeline, Redir, RedirKind, Seg, Sep,
     Syn, Word, INCOMPLETE,
 };
-use crate::lexer::{tokenize, Op, Tok};
+use crate::lexer::{expand_aliases, tokenize, Aliases, Op, Tok};
 
-pub fn parse(src: &str) -> Syn<List> {
-    let lexed = tokenize(src)?;
+/// Parse with no aliases in force. Every runtime path carries a table, so this
+/// is the grammar tests' entry point.
+#[cfg(test)]
+fn parse(src: &str) -> Syn<List> {
+    parse_aliased(src, &Aliases::new())
+}
+
+/// Parse with an alias table in force. Substitution happens between lexing and
+/// parsing, so a replacement can supply grammar (`alias L='{'`) and is itself
+/// rescanned for further aliases.
+pub fn parse_aliased(src: &str, aliases: &Aliases) -> Syn<List> {
+    let lexed = expand_aliases(tokenize(src)?, aliases)?;
     let mut p = Parser {
         toks: lexed.toks,
         heredocs: lexed.heredocs,
@@ -433,7 +443,13 @@ impl Parser {
             }
         }
         if assigns.is_empty() && words.is_empty() && redirs.is_empty() {
-            return Err(format!("syntax error near {}", self.describe()));
+            // Running out of input where a command was due is incomplete, not
+            // wrong: `f ()` on its own line still has its body coming.
+            return Err(if self.at_eof() {
+                format!("{INCOMPLETE}: expected a command")
+            } else {
+                format!("syntax error near {}", self.describe())
+            });
         }
         Ok(Cmd::Simple {
             assigns,

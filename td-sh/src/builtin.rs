@@ -7,7 +7,6 @@
 //! the redirections in force.
 
 use crate::exec::{Shell, Sig, R};
-use crate::parser::parse;
 use crate::process::{read_byte, write_fd};
 use crate::{ast, exec};
 
@@ -36,6 +35,8 @@ pub enum Builtin {
     Dot,
     Command,
     Wait,
+    Alias,
+    Unalias,
 }
 
 pub fn lookup(name: &str) -> Option<Builtin> {
@@ -63,6 +64,8 @@ pub fn lookup(name: &str) -> Option<Builtin> {
         "." => Builtin::Dot,
         "command" => Builtin::Command,
         "wait" => Builtin::Wait,
+        "alias" => Builtin::Alias,
+        "unalias" => Builtin::Unalias,
         _ => return None,
     })
 }
@@ -112,6 +115,8 @@ pub fn run(sh: &mut Shell, bi: Builtin, argv: &[String]) -> R<()> {
         Builtin::Dot => dot(sh, argv),
         Builtin::Command => command(sh, argv),
         Builtin::Wait => ok(sh),
+        Builtin::Alias => alias(sh, argv),
+        Builtin::Unalias => unalias(sh, argv),
     }
 }
 
@@ -1285,31 +1290,40 @@ fn apply_named_option(sh: &mut Shell, name: &str, on: bool) {
 
 fn unset(sh: &mut Shell, argv: &[String]) -> R<()> {
     let mut i = 1usize;
-    // `-v` (variable) / `-f` (function); default is variable-then-function.
-    let mut funcs_only = false;
-    let mut vars_only = false;
+    // `-v` (variable) / `-f` (function); default is variable-then-function. dash's
+    // option loop keeps the LAST one given, so `-f -v` means `-v`.
+    let mut mode = None;
     while let Some(arg) = argv.get(i) {
         match arg.as_str() {
-            "-f" => funcs_only = true,
-            "-v" => vars_only = true,
+            "-f" => mode = Some('f'),
+            "-v" => mode = Some('v'),
             _ => break,
         }
         i += 1;
     }
     let mut status_code = 0;
-    while let Some(name) = argv.get(i) {
-        if funcs_only {
-            sh.funcs.remove(name);
-        } else {
-            if !vars_only && !sh.vars.contains_key(name) {
-                sh.funcs.remove(name);
-            }
-            if !sh.unset_var(name) {
-                err_line(sh, &format!("unset: {name}: cannot unset"));
-                status_code = 1;
-            }
-        }
+    while let Some(arg) = argv.get(i) {
         i += 1;
+        if mode == Some('f') {
+            sh.funcs.remove(arg);
+            continue;
+        }
+        // dash unsets through setvar, which takes the name up to an `=` and
+        // rejects only what it cannot parse as one -- so `unset b=c` unsets `b`,
+        // but `unset 'a[1]'` is an error. `unset` is a special builtin, so that
+        // error is fatal to a non-interactive shell rather than a status.
+        let end = arg.bytes().position(|b| b == b'=').unwrap_or(arg.len());
+        let name = arg.get(..end).unwrap_or("");
+        if !ast::is_name(name) {
+            return Err(sh.fatal(&format!("unset: {arg}: bad variable name"), 2));
+        }
+        if mode.is_none() && !sh.vars.contains_key(name) {
+            sh.funcs.remove(name);
+        }
+        if !sh.unset_var(name) {
+            err_line(sh, &format!("unset: {name}: cannot unset"));
+            status_code = 1;
+        }
     }
     status(sh, status_code)
 }
@@ -1685,6 +1699,112 @@ fn split_read(line: &str, ifs: &str, n: usize) -> Vec<String> {
     fields
 }
 
+/// dash's `single_quote`: runs of ordinary text go in `'…'`, runs of quotes in
+/// `"…"`, so `it's` prints as `'it'"'"'s'`.
+fn single_quote(s: &str) -> String {
+    let mut out = String::new();
+    let mut rest = s;
+    loop {
+        let plain = rest.bytes().position(|b| b == b'\'').unwrap_or(rest.len());
+        out.push('\'');
+        out.push_str(rest.get(..plain).unwrap_or(""));
+        out.push('\'');
+        rest = rest.get(plain..).unwrap_or("");
+        let quotes = rest.bytes().take_while(|&b| b == b'\'').count();
+        if quotes == 0 {
+            break;
+        }
+        out.push('"');
+        out.push_str(rest.get(..quotes).unwrap_or(""));
+        out.push('"');
+        rest = rest.get(quotes..).unwrap_or("");
+        if rest.is_empty() {
+            break;
+        }
+    }
+    out
+}
+
+/// `alias [name[=value] …]`: define, or print in a form that can be re-read.
+/// dash looks for the `=` from the SECOND byte, so `-x` and `=y` are name
+/// lookups rather than definitions.
+fn alias(sh: &mut Shell, argv: &[String]) -> R<()> {
+    let mut ret = 0;
+    if argv.len() == 1 {
+        let listing: Vec<String> = sh
+            .aliases
+            .iter()
+            .map(|(name, value)| format!("{name}={}\n", single_quote(value)))
+            .collect();
+        for line in listing {
+            // A failed write is reported, as it is for every other builtin that
+            // prints (see `out`), rather than silently succeeding.
+            if write_fd(sh, 1, line.as_bytes()).is_err() {
+                ret = 1;
+            }
+        }
+        return status(sh, ret);
+    }
+    for arg in argv.iter().skip(1) {
+        // Bytes, not chars: the `=` is looked for from the second BYTE, and a
+        // name may start with a multi-byte character (`alias é=echo`).
+        let eq = arg
+            .as_bytes()
+            .get(1..)
+            .and_then(|tail| tail.iter().position(|&b| b == b'=').map(|at| at + 1));
+        match eq {
+            Some(at) => {
+                let name = arg.get(..at).unwrap_or("").to_string();
+                let value = arg.get(at + 1..).unwrap_or("").to_string();
+                sh.aliases.insert(name, value);
+            }
+            None => match sh.aliases.get(arg) {
+                Some(value) => {
+                    let line = format!("{arg}={}\n", single_quote(value));
+                    if write_fd(sh, 1, line.as_bytes()).is_err() {
+                        ret = 1;
+                    }
+                }
+                None => {
+                    err_line(sh, &format!("alias: {arg} not found"));
+                    ret = 1;
+                }
+            },
+        }
+    }
+    status(sh, ret)
+}
+
+/// `unalias [-a] [name …]`. dash's option loop takes only `-a` and stops at
+/// `--`; with no names left it reports success, so bare `unalias` is not an
+/// error there.
+fn unalias(sh: &mut Shell, argv: &[String]) -> R<()> {
+    let mut i = 1usize;
+    match argv.get(i).and_then(|arg| arg.strip_prefix('-')) {
+        // A bare `-`, or no leading `-` at all, is already an operand.
+        None | Some("") => {}
+        Some("-") => i += 1,
+        Some(flags) => {
+            for bad in flags.chars() {
+                if bad != 'a' {
+                    err_line(sh, &format!("unalias: Illegal option -{bad}"));
+                    return status(sh, 2);
+                }
+            }
+            sh.aliases.clear();
+            return status(sh, 0);
+        }
+    }
+    let mut ret = 0;
+    for name in argv.iter().skip(i) {
+        if sh.aliases.remove(name).is_none() {
+            err_line(sh, &format!("unalias: {name} not found"));
+            ret = 1;
+        }
+    }
+    status(sh, ret)
+}
+
 fn eval(sh: &mut Shell, argv: &[String]) -> R<()> {
     let joined = argv
         .iter()
@@ -1695,14 +1815,9 @@ fn eval(sh: &mut Shell, argv: &[String]) -> R<()> {
     if joined.trim().is_empty() {
         return ok(sh);
     }
-    let list = match parse(&joined) {
-        Ok(l) => l,
-        Err(e) => {
-            err_line(sh, &format!("td-sh: eval: {e}"));
-            return status(sh, 2);
-        }
-    };
-    exec::run_list(sh, &list)
+    // Unit at a time, so `eval "alias x=…\nx"` sees its own alias (dash's
+    // evalstring parses and runs one command at a time too).
+    exec::run_source(sh, &joined, "eval: ")
 }
 
 fn cd(sh: &mut Shell, argv: &[String]) -> R<()> {
@@ -1761,15 +1876,9 @@ fn dot(sh: &mut Shell, argv: &[String]) -> R<()> {
             return status(sh, 1);
         }
     };
-    let list = match parse(&text) {
-        Ok(l) => l,
-        Err(e) => {
-            err_line(sh, &format!("td-sh: {name}: {e}"));
-            return status(sh, 2);
-        }
-    };
+    let what = format!("{name}: ");
     // A `return` in a sourced file returns from the `.`, not the process.
-    match exec::run_list(sh, &list) {
+    match exec::run_source(sh, &text, &what) {
         Err(Sig::Return(code)) => status(sh, code),
         other => other,
     }
@@ -2551,5 +2660,221 @@ mod tests {
             run_capturing("command -v no_such_cmd_xyz; echo $?").1,
             "1\n"
         );
+    }
+
+    #[test]
+    fn alias_defines_lists_and_removes() {
+        // dash prints `name='value'` with no `alias ` prefix, quoting the value
+        // so the listing can be re-read.
+        assert_eq!(
+            run_capturing("alias e=echo ll='ls -l'\nalias e ll").1,
+            "e='echo'\nll='ls -l'\n"
+        );
+        assert_eq!(run_capturing("alias q=\"it's\"\nalias q").1, "q='it'\"'\"'s'\n");
+        // A name with no `=` is a lookup, and a miss is status 1.
+        assert_eq!(
+            run_capturing("alias e=echo nonexistentZ; echo status=$?").1,
+            "status=1\n"
+        );
+        assert_eq!(
+            run_capturing("alias e=echo\nunalias e nonexistentZ; echo status=$?").1,
+            "status=1\n"
+        );
+        // The `=` is looked for from the SECOND byte, so `--` is a lookup.
+        assert_eq!(run_capturing("alias -- foo=echo; echo status=$?").1, "status=1\n");
+        assert_eq!(run_capturing("alias -- foo=echo\nfoo x").1, "x\n");
+    }
+
+    #[test]
+    fn unalias_takes_only_dashs_option_surface() {
+        // dash's option loop leaves no names to remove, and reports success.
+        assert_eq!(run_capturing("unalias; echo status=$?").1, "status=0\n");
+        assert_eq!(
+            run_capturing("alias a=echo b=echo\nunalias -a\nalias; echo status=$?").1,
+            "status=0\n"
+        );
+        // `--` ends the options, so the name after it is removed, not treated as one.
+        assert_eq!(
+            run_capturing("alias foo=echo\nunalias -- foo\nfoo x 2>/dev/null; echo $?").1,
+            "127\n"
+        );
+        let (status, _, err) = run_capturing("unalias -z");
+        assert_eq!(status, 2);
+        assert!(err.contains("Illegal option -z"), "err: {err:?}");
+    }
+
+    #[test]
+    fn alias_is_substituted_only_from_the_next_parse_unit() {
+        // A whole line is parsed before any of it runs, so the alias defined on
+        // it is not yet in force for the rest of that line.
+        assert_eq!(
+            run_capturing("alias e=echo; e one 2>/dev/null\ne two; e three").1,
+            "two\nthree\n"
+        );
+        // ... but `eval` and `.`-style unit loops do see their own definitions.
+        assert_eq!(
+            run_capturing("eval \"alias hi='echo hello'\nhi inside\"\nhi outside").1,
+            "hello inside\nhello outside\n"
+        );
+        // A subshell inherits aliases but cannot publish one back.
+        assert_eq!(
+            run_capturing("alias e_='echo ['\n( e_ subshell )\necho $(e_ cmdsub)").1,
+            "[ subshell\n[ cmdsub\n"
+        );
+        assert_eq!(
+            run_capturing("echo $(alias hi='echo hello')\nhi 2>/dev/null; echo $?").1,
+            "\n127\n"
+        );
+    }
+
+    #[test]
+    fn alias_substitution_follows_dashs_scan_rules() {
+        // Only an unquoted literal in command position is a candidate, and an
+        // alias is not re-entered while its own replacement is being scanned.
+        assert_eq!(run_capturing("alias echo='echo foo'\necho bar").1, "foo bar\n");
+        assert_eq!(
+            run_capturing("alias hi='echo hello world'\nhi\necho hi\n'hi' || echo failed").1,
+            "hello world\nhi\nfailed\n"
+        );
+        assert_eq!(
+            run_capturing("alias e=echo\ncmd=e\n$cmd X 2>/dev/null; echo $?").1,
+            "127\n"
+        );
+        // A replacement ending in a blank makes the NEXT word a candidate too.
+        assert_eq!(
+            run_capturing("alias hi='echo hello '\nalias punct='!!!'\nhi punct").1,
+            "hello !!!\n"
+        );
+        assert_eq!(
+            run_capturing("alias hi='echo hello'\nalias punct='!!!'\nhi punct").1,
+            "hello punct\n"
+        );
+        // The replacement is rescanned, so its own first word expands as well.
+        assert_eq!(
+            run_capturing("alias hi='e_ hello world'\nalias e_='echo __'\nhi").1,
+            "__ hello world\n"
+        );
+        // The value is text, expanded when the command runs, not when defined.
+        assert_eq!(
+            run_capturing("x=x\nalias echo-x='echo $x'\nx=y\necho-x hi").1,
+            "y hi\n"
+        );
+    }
+
+    #[test]
+    fn alias_replacement_can_supply_grammar() {
+        // A replacement is re-lexed into the surrounding parse, so it can carry
+        // reserved words, operators and newlines.
+        assert_eq!(
+            run_capturing("alias e_='for i in 1 2 3; do echo $i;'\ne_ done").1,
+            "1\n2\n3\n"
+        );
+        assert_eq!(run_capturing("alias L='{'\nL echo one; echo two; }").1, "one\ntwo\n");
+        assert_eq!(run_capturing("alias L='('\nL echo one; echo two )").1, "one\ntwo\n");
+        assert_eq!(
+            run_capturing("alias e_='echo 1\necho 2\necho 3'\nvar='echo foo'\ne_ ${var}").1,
+            "1\n2\n3 echo foo\n"
+        );
+        // A reserved word wins over an alias of the same name (dash checks
+        // keywords first), and a redirection target is never a candidate.
+        assert_eq!(run_capturing("alias done=echo\nfor i in 1; do echo $i; done").1, "1\n");
+    }
+
+    #[test]
+    fn alias_is_not_substituted_in_a_case_pattern() {
+        // A pattern is not a command word -- and the newline between patterns
+        // does not make one, which is what distinguishes this from every other
+        // newline in the scan.
+        assert_eq!(
+            run_capturing("alias p=z\ncase z in\np) echo WRONG;;\n*) echo right;;\nesac").1,
+            "right\n"
+        );
+        // The arm's body IS a command position, in both pattern forms.
+        assert_eq!(run_capturing("alias e=echo\ncase z in\nz) e ARM;;\nesac").1, "ARM\n");
+        assert_eq!(run_capturing("alias e=echo\ncase z in\n(z) e ARM;;\nesac").1, "ARM\n");
+        // A nested case restores the outer state on `esac`.
+        assert_eq!(
+            run_capturing("alias e=echo\ncase a in\na) case b in\nb) e IN;;\nesac\ne OUT;;\nesac").1,
+            "IN\nOUT\n"
+        );
+        // Closing a SUBSHELL leaves no command position, so dash reports the
+        // stray word rather than expanding it.
+        let (status, _, _) = run_capturing("alias foo='; echo X'\n(echo a) foo");
+        assert_eq!(status, 2);
+        // A pattern list opens after `(` and continues after `|`, so neither
+        // makes a command position while patterns are being read.
+        assert_eq!(
+            run_capturing("alias hi='echo HI'\ncase hi in (hi) echo pat;; *) echo no;; esac").1,
+            "pat\n"
+        );
+        assert_eq!(
+            run_capturing("alias hi='echo HI'\ncase hi in a|hi) echo pat;; *) echo no;; esac").1,
+            "pat\n"
+        );
+    }
+
+    #[test]
+    fn alias_scan_spans_the_replacement_boundary() {
+        // The redirection target can sit past the end of the replacement, so the
+        // command word after it still expands.
+        assert_eq!(
+            run_capturing("alias r='>'\nalias e=echo\nr /dev/null e hi; echo rc=$?").1,
+            "rc=0\n"
+        );
+        // A `\` inside a comment is not a line continuation, so the next line is
+        // its own parse unit and sees the alias.
+        assert_eq!(run_capturing("alias e=echo # \\\ne ok").1, "ok\n");
+        // A real continuation still holds the unit open.
+        assert_eq!(
+            run_capturing("alias e_='echo '\nalias one='ONE '\ne_ one \\\n  one").1,
+            "ONE ONE\n"
+        );
+        // A replacement that trails off in a comment comments out the rest of the
+        // line it was written on, which is text the replacement does not contain.
+        assert_eq!(run_capturing("alias a='#'\na echo SURVIVES\necho after").1, "after\n");
+        assert_eq!(
+            run_capturing("alias a='echo hi #'\na SURVIVES\necho after").1,
+            "hi\nafter\n"
+        );
+        // ... but a comment CLOSED inside the replacement does not leak out.
+        assert_eq!(
+            run_capturing("alias a='echo one # c\necho two'\na THREE").1,
+            "one\ntwo THREE\n"
+        );
+        // dash spends the trailing-blank check on the next token READ, so a
+        // redirection in between consumes it and the filename's successor is a
+        // plain word again.
+        assert_eq!(
+            run_capturing("alias e='echo hi '\nalias t=WORLD\ne >/dev/null t; echo rc=$?").1,
+            "rc=0\n"
+        );
+        // A replacement that cannot be lexed at all is a hard error: no further
+        // input can complete it, so the unit loop must not keep reading lines.
+        let (status, out, _) = run_capturing("alias e='cat <<EOF'\ne\necho after");
+        assert_eq!((status, out.as_str()), (2, ""));
+    }
+
+    #[test]
+    fn unset_takes_a_name_up_to_an_equals() {
+        // dash's setvar takes the name up to `=`, so this unsets `b` rather than
+        // failing -- but a name it cannot parse at all is still fatal.
+        assert_eq!(
+            run_capturing("a=1 b=2\nunset a b=c; echo after rc=$?").1,
+            "after rc=0\n"
+        );
+        assert_eq!(run_capturing("unset %; echo NOTREACHED").0, 2);
+        assert_eq!(run_capturing("unset 'a[1]'; echo NOTREACHED").0, 2);
+        // The last of `-f`/`-v` wins, as in dash's option loop.
+        assert_eq!(
+            run_capturing("x=var\nx() { echo func; }\nunset -f -v x\necho [$x]").1,
+            "[]\n"
+        );
+    }
+
+    #[test]
+    fn alias_name_may_start_with_a_multibyte_character() {
+        // dash looks for the `=` from the second BYTE; slicing there by char
+        // boundary would make this a lookup instead of a definition.
+        assert_eq!(run_capturing("alias é=echo\né works").1, "works\n");
     }
 }

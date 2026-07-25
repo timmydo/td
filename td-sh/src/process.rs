@@ -409,13 +409,15 @@ pub fn fork_shell(sh: &Shell) -> Shell {
         interactive: false,
         getopts_optind: sh.getopts_optind,
         getopts_off: sh.getopts_off,
+        // A subshell inherits the aliases but cannot publish one back (POSIX).
+        aliases: sh.aliases.clone(),
     }
 }
 
 /// `$(code)`: run `code` in a subshell with stdout captured to a buffer, and
 /// return the captured bytes as text.
 pub fn capture_stdout(sh: &mut Shell, code: &str) -> R<String> {
-    let list = match crate::parser::parse(code) {
+    let list = match crate::parser::parse_aliased(code, &sh.aliases) {
         Ok(l) => l,
         Err(e) => return Err(sh.fatal(&e, 2)),
     };
