@@ -183,9 +183,14 @@ specific file.
 
 # Parallel work (worktrees, land on green)
 
-Multiple agents work this repo concurrently so use work trees. GitHub
-(and the sr.ht mirror) is a git backup remote only — no GitHub Issues,
-PRs, Actions, or branch protection.
+Multiple agents work this repo concurrently so use work trees. There is
+no GitHub PR/Issues/Actions UI and no branch protection; GitHub and the
+sr.ht mirror are backup remotes. But the shared `origin` is NOT merely a
+backup: the integrator reviews and lands from a SEPARATE clone, so you
+push your ready `work-NNNN-slug` branch to `origin` for them to fetch.
+That pushed, ready branch IS the "PR" — the standing ask for the
+integrator to squash it into main. There is no other handoff and nothing
+else to notify.
 
 Work in your own git worktree/branch named `work-NNNN-slug`.
 
@@ -196,12 +201,18 @@ summary of those findings and follow-ups is in the commit message.
 There is no draft/ready flag to flip and nothing on a webpage to ask
 the human to look at — readiness lives entirely in the branch. The
 SAME agent that finishes the work carries it to ready; don't hand a
-half-reviewed branch to the integrator.
+half-reviewed branch to the integrator. When it is ready, push it to
+`origin` (`git push -u origin work-NNNN-slug`): that push is what submits
+it for landing — the integrator fetches it into their review clone.
 
 **Land.** A single integrator (the test user) lands ready branches into
-main: `git fetch`, `git squash-in <branch>` (squashes the branch,
-prefilling the message from its commits), review `git diff --cached`,
-`git commit`, `git push origin main`. 
+main from their own clone: `git fetch origin` (retrieves the pushed
+`work-NNNN-slug` branch), `git squash-in <branch>` on the fetched branch
+(squashes it, prefilling the message from its commits), review `git diff
+--cached`, `git commit`, `git push origin main`. The squash lands a fresh
+commit rather than replaying yours, so your branch and its individual
+commits never appear on main; after landing, the `work-NNNN-slug` branch
+is removed from `origin` — its disappearance is the signal it landed.
 
 Never `git stash` in this repo. The stash stack (`refs/stash`) is
   repo-*global*.
