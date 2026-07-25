@@ -5,7 +5,8 @@
 //! the AGENTS.md Rust coding rules.
 //! 
 //! clippy leg (AGENTS.md → "Rust code"): the engine workspace (builder, recipes,
-//! and the shared std-only engine lib), td-kexec, td-netd, and td-boot must lint
+//! and the shared std-only engine lib), td-kexec, td-sh, td-netd, td-boot, and
+//! td-util must lint
 //! clean under the `[lints]` table each Cargo.toml declares at `deny` — NO panicking
 //! surface (unwrap/expect/panic!/unreachable!/todo!/unimplemented!), `.get(i)` over
 //! panicking `xs[i]`, and `unsafe` confined to the raw-syscall layer (builder's is
@@ -17,9 +18,10 @@
 //! Cargo.lock and stay dependency-free — asserted two ways so BOTH a registry/git
 //! dep AND a new path member are caught: exactly 3 `[[package]]` entries (the known
 //! members) AND no external `source = ` line (path members carry none). td-kexec,
-//! td-sh, td-netd, and td-boot each keep a 1-package lock. They are TARGET-built
-//! programs (the guest kexec helper, the /bin/sh replacement, the network daemon,
-//! and the boot shim), not engine code, but are pure std and compile offline, so
+//! td-sh, td-netd, td-boot, and td-util each keep a 1-package lock. They are
+//! TARGET-built programs (the guest kexec helper, the /bin/sh replacement, the
+//! network daemon, the boot shim, and the diagnostics multicall), not engine
+//! code, but are pure std and compile offline, so
 //! they lint/test here with the engine crates. The network tools
 //! (fetch/feed/subst) carry the vendored
 //! FSDG crates and can't compile offline, so they are NOT linted here; their
@@ -99,6 +101,8 @@ pub fn gate() -> GateDef {
 	test "$nn" -eq 1 || { echo "ERROR: td-netd is no longer dependency-free (Cargo.lock lists $nn packages; it must carry ZERO crates — AGENTS.md 'Rust code')" >&2; exit 1; }; \
 	b=`"$td" text count-line-exact '[[package]]' td-boot/Cargo.lock`; \
 	test "$b" -eq 1 || { echo "ERROR: td-boot is no longer dependency-free (Cargo.lock lists $b packages; it must carry ZERO crates — AGENTS.md 'Rust code')" >&2; exit 1; }; \
+	u=`"$td" text count-line-exact '[[package]]' td-util/Cargo.lock`; \
+	test "$u" -eq 1 || { echo "ERROR: td-util is no longer dependency-free (Cargo.lock lists $u packages; it must carry ZERO crates — AGENTS.md 'Rust code')" >&2; exit 1; }; \
 rustpath=`"$td" provision-rust` || exit $?; \
 ccpath=`"$td" provision-cc` || exit $?; \
 scratch="$PWD/.cargo-test-scratch"; \
@@ -112,15 +116,17 @@ CARGO_HOME="$scratch/home" CARGO_TARGET_DIR="$scratch/target" \
 	    cargo clippy --frozen --manifest-path td-sh/Cargo.toml; \
 	    cargo clippy --frozen --manifest-path td-netd/Cargo.toml; \
 	    cargo clippy --frozen --manifest-path td-boot/Cargo.toml; \
+	    cargo clippy --frozen --manifest-path td-util/Cargo.toml; \
 	    cargo test  --frozen --workspace; \
 	    cargo test  --frozen --manifest-path td-kexec/Cargo.toml; \
 	    cargo test  --frozen --manifest-path td-sh/Cargo.toml; \
 	    cargo test  --frozen --manifest-path td-netd/Cargo.toml; \
-	    cargo test  --frozen --manifest-path td-boot/Cargo.toml' 2>&1 | tee "$log"; \
+	    cargo test  --frozen --manifest-path td-boot/Cargo.toml; \
+	    cargo test  --frozen --manifest-path td-util/Cargo.toml' 2>&1 | tee "$log"; \
 	"$td" text cargo-test-ok "$log" || \
 	  { echo "ERROR: cargo test reported no passing tests (vacuous run?)" >&2; exit 1; }; \
 rm -rf "$scratch"; \
-echo "PASS: cargo-test — the engine workspace (builder + recipes + engine), td-kexec, td-sh, td-netd, and td-boot are dependency-free and lint clean; their unit tests pass (guix-free toolchain)."
+echo "PASS: cargo-test — the engine workspace (builder + recipes + engine), td-kexec, td-sh, td-netd, td-boot, and td-util are dependency-free and lint clean; their unit tests pass (guix-free toolchain)."
 "##,
     }
 }

@@ -1,0 +1,5 @@
+# Cargo build output — never committed. td-util's source is the committed tree
+# only (Cargo.toml, Cargo.lock, src/). The root .gitignore's /target is
+# root-anchored, so it does not cover this directory.
+/target
+/.cargo
