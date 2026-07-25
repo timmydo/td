@@ -1,0 +1,6 @@
+# Cargo build output — never committed. td-init's source is the committed tree
+# only (Cargo.toml, Cargo.lock, src/). The recipe compiles src/main.rs with rustc
+# directly; a local `cargo build` here is only for lint/test. The root
+# .gitignore's /target is root-anchored, so it does not cover this directory.
+/target
+/.cargo

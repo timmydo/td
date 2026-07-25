@@ -1,0 +1,52 @@
+[package]
+name = "td-init"
+version = "0.1.0"
+edition = "2021"
+description = "Static dependency-free multicall for td's boot glue (init, reboot, poweroff, halt, switch_root, cttyhack, hostname)"
+license = "GPL-3.0-or-later"
+
+[[bin]]
+name = "td-init"
+path = "src/main.rs"
+
+# The engine root `exclude`s td-init, but that only stops cargo at THAT manifest.
+# From a nested checkout (`.claude/worktrees/*` lives physically under the main
+# checkout) cargo walks past the excluding root and is captured by the OUTER
+# manifest. An explicit empty `[workspace]` pins THIS as the root and stops the
+# walk. Same reason td-sh/td-util carry one.
+[workspace]
+
+# td-init is a TARGET-built userland program, NOT part of the control-plane
+# engine: a standalone crate with zero external dependencies (pure std), so the
+# engine's one-workspace-lock gate never inspects it. The recipe compiles
+# src/main.rs directly with rustc; this manifest exists so the same source is an
+# independently `cargo clippy`/`cargo test`-able crate.
+#
+# unsafe is confined in SOURCE, not here: src/main.rs `#![deny(unsafe_code)]`s the
+# whole crate and src/sys.rs scopes a `#[allow]` to `syscall5` — the one raw
+# syscall body, through which the eight amended syscalls go. This is the THIRD
+# target-side unsafe surface after td-kexec and td-netd (a recorded AGENTS.md
+# amendment). The `deny` reds an added `unsafe`, but a module can demote that
+# lint without using `unsafe` at all, so `main.rs`'s confinement tests are the
+# real enforcement: they pin the syscall roster, every call site, the one asm
+# body, and the lint's own level — none of which the compiler checks.
+
+[lints.clippy]
+unwrap_used = "deny"       # no panicking .unwrap(); return Result/Option, use ?
+expect_used = "deny"       # no panicking .expect()
+panic = "deny"             # no panic! on the happy/error path
+unreachable = "deny"
+todo = "deny"
+unimplemented = "deny"
+indexing_slicing = "deny"  # use .get(i) over xs[i] / &xs[a..b]
+
+# The SHIPPED td-init is built by recipes/src/recipes/td-init.rs invoking rustc
+# DIRECTLY (never `cargo build`), and that recipe mirrors opt-level=s /
+# panic=abort / strip explicitly. This profile therefore governs only local
+# `cargo build --release`; lto is intentionally dropped because a single-crate
+# direct rustc build cannot mirror it (a cargo-only, cross-crate step), so
+# declaring it here would be a contract the shipped artifact silently ignores.
+[profile.release]
+opt-level = "s"
+panic = "abort"
+strip = true

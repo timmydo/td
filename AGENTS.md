@@ -274,25 +274,38 @@ td's Rust is defensive and minimal-surface.
   raw-syscall layer (`builder/src/sys.rs` and its callers `nar.rs`/`sandbox.rs`),
   which carry `#![allow(unsafe_code)]` so `builder` can be `libc`-free. Every other
   engine crate (the shared `engine` lib and `recipes`/`fetch`/`feed`/`subst`)
-  `forbid`s `unsafe_code`. There are TWO target-side exceptions, each a standalone
+  `forbid`s `unsafe_code`. There are THREE target-side exceptions, each a standalone
   crate OUTSIDE the `builder`/`recipes`/`engine` workspace whose only `unsafe` is that
   same `syscall`-instruction layer under a scoped `#[allow]` (the crate itself
   `#![deny(unsafe_code)]`s): (1) the `td-kexec` guest helper, confined to exactly two
   syscalls (`kexec_file_load(2)` + `reboot(2)` with `LINUX_REBOOT_CMD_KEXEC`) copied
-  from `sys.rs`; and (2) the `td-netd` network bring-up daemon, confined to a single
+  from `sys.rs`; (2) the `td-netd` network bring-up daemon, confined to a single
   `ioctl(2)` wrapper (`syscall3`) through which its interface-config ioctls
   (SIOCSIFFLAGS/ADDR/NETMASK, SIOCGIFHWADDR, SIOCADDRT) go — all its socket I/O rides
-  `std`, so DHCP needs no AF_PACKET raw socket. Do not add `unsafe` anywhere else; a
-  new `unsafe` surface is a reviewed amendment recorded here.
+  `std`, so DHCP needs no AF_PACKET raw socket; and (3) the `td-init` boot-glue
+  multicall, whose one `syscall5` body in `td-init/src/sys.rs` carries EXACTLY these
+  eight syscalls, one per applet that safe `std` cannot reach: `reboot(2)` + `sync(2)`
+  (reboot/poweroff/halt), `mount(2)` restricted to `MS_MOVE` + `chroot(2)`
+  (switch_root), `setsid(2)` + `ioctl(2)` restricted to `TIOCSCTTY` (cttyhack),
+  `sethostname(2)` (`hostname -F`, the flag uutils lacks), and `wait4(2)` (init, which
+  as PID 1 must reap the orphans a targeted `Child::wait` cannot see). Deliberately
+  NOT in that surface: `pivot_root(2)` (it fails on the initramfs rootfs, so
+  switch_root moves the mount as util-linux and busybox do), `fork`/`execve` (`Command`
+  plus the safe `CommandExt::exec` cover both), `dup2` (`Stdio::from(File)` wires the
+  console), and any signal handler — which is why td's init supports no `ctrlaltdel`,
+  `shutdown` or `restart` inittab action. A ninth syscall, or a second scoped `#[allow]`,
+  is an amendment here; `td-init/src/main.rs`'s confinement test asserts both counts
+  against the crate's own source, since the compiler alone cannot. Do not add `unsafe`
+  anywhere else; a new `unsafe` surface is a reviewed amendment recorded here.
 - **The engine is dependency-free.** `builder`, `recipes`, and the shared std-only
   `engine` lib (the one copy of the hand-rolled JSON + SHA-256 both bins use) form one
   cargo workspace and carry **zero external crates** (pure `std`) — they must stay that
   way. The gate enforces it on the ONE workspace-root `Cargo.lock`: exactly 3
   `[[package]]` entries (the known path members) AND no external `source = ` line
   (path members carry none), so a new registry/git dep OR a new path member both red it.
-  The target-side `td-kexec`, `td-sh`, `td-netd`, `td-boot`, and `td-util` crates
-  outside the workspace each keep their own 1-package lock; `td-sh`, `td-boot`, and
-  `td-util` contain no `unsafe`. `td-review` (the host-side integrator
+  The target-side `td-kexec`, `td-sh`, `td-netd`, `td-boot`, `td-util`, and `td-init`
+  crates outside the workspace each keep their own 1-package lock; `td-sh`, `td-boot`,
+  and `td-util` contain no `unsafe`. `td-review` (the host-side integrator
   branch-review/landing TUI) keeps one too: it is in NEITHER bootstrap graph — no
   recipe builds it and it never enters a closure — but it is pure `std`, `forbid`s
   `unsafe_code`, and rides the same cargo-test gate, so the coding rules are

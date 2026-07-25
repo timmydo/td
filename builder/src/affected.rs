@@ -766,6 +766,26 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
         return;
     }
 
+    // td-init: the target-built static boot-glue multicall (init/reboot/poweroff/
+    // halt/switch_root/cttyhack/hostname), a standalone std-only crate OUTSIDE the
+    // engine workspace — same routing as td-util, which it complements. Its unit
+    // tests AND its unsafe-confinement test (the scoped-allow count and the syscall
+    // roster, which the compiler cannot check) run on the host cargo-test preflight
+    // (check-pr); src/main.rs and its modules are `include_str!`'d into the td-init
+    // RECIPE, so a source edit changes the TARGET artifact and a static-link
+    // regression is invisible to host cargo — so also route to recipe-checks-daily
+    // (the daily backstop statically links + exercises it via td-init-test). Its
+    // RECIPE files under recipes/src/recipes/ are routed by the recipes arm above.
+    if pattern_matches(
+        "td-init/*|td-init/src/*|td-init/Cargo.toml|td-init/Cargo.lock",
+        p,
+    ) {
+        sel.add_preflight("cargo-test");
+        sel.add_target("check-pr");
+        sel.add_target("recipe-checks-daily");
+        return;
+    }
+
     // Catch-all: an unmapped path used to require the FULL loop; it now runs
     // the bounded check-pr tier (the ~10-min per-PR budget) and leans on the
     // daily backstop for the daily-tier gates.
@@ -785,7 +805,7 @@ fn preflight_cmd(name: &str) -> Option<&'static str> {
         "shell-syntax" => Some("  bash -n tests/*.sh ci/*.sh tools/*.sh"),
         "heal-revert" => Some("  bash tests/heal-revert.sh"),
         "cargo-test" => {
-            Some("  cargo test + clippy --frozen --workspace (builder/recipes/engine) + --manifest-path td-kexec/Cargo.toml + --manifest-path td-sh/Cargo.toml + --manifest-path td-netd/Cargo.toml + --manifest-path td-boot/Cargo.toml + --manifest-path td-util/Cargo.toml + --manifest-path td-review/Cargo.toml -- --include-ignored")
+            Some("  cargo test + clippy --frozen --workspace (builder/recipes/engine) + --manifest-path td-kexec/Cargo.toml + --manifest-path td-sh/Cargo.toml + --manifest-path td-netd/Cargo.toml + --manifest-path td-boot/Cargo.toml + --manifest-path td-util/Cargo.toml + --manifest-path td-init/Cargo.toml + --manifest-path td-review/Cargo.toml -- --include-ignored")
         }
         "affected-self-test" => Some("  td-builder affected-checks --self-test"),
         _ => None,
@@ -1207,6 +1227,15 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
     assert_target!("td-util/src/ps.rs", "recipe-checks-daily");
     assert_target!("td-util/Cargo.lock", "check-pr");
     assert_target!("td-util/Cargo.lock", "recipe-checks-daily");
+    // td-init mirrors td-util, including its confined syscall module: every source
+    // is include_str!'d into the td-init recipe, so host cargo preflight (check-pr)
+    // + daily static-link backstop.
+    assert_target!("td-init/src/main.rs", "check-pr");
+    assert_target!("td-init/src/main.rs", "recipe-checks-daily");
+    assert_target!("td-init/src/sys.rs", "check-pr");
+    assert_target!("td-init/src/sys.rs", "recipe-checks-daily");
+    assert_target!("td-init/Cargo.lock", "check-pr");
+    assert_target!("td-init/Cargo.lock", "recipe-checks-daily");
     // td-netd/src is include_str!'d into the target artifact (its recipe AND packed
     // into system-x86-64), so a helper-source edit rides the host cargo preflight
     // (check-pr) AND is recorded as deferred to the daily backstop (recipe-checks-daily
@@ -1415,9 +1444,9 @@ fn run_preflight(root: &Path, name: &str) -> i32 {
             // dependency-free pure std, while their static TARGET links are daily.
             // builder + recipes + the shared engine lib are one cargo workspace,
             // so --workspace lints/tests all three in one invocation; the target
-            // programs (td-kexec, td-sh, td-netd, td-boot) are standalone crates and
-            // ride the preflight explicitly, as does the host-side td-review
-            // integrator tool. td-sh's conformance corpus run is
+            // programs (td-kexec, td-sh, td-netd, td-boot, td-util, td-init) are
+            // standalone crates and ride the preflight explicitly, as does the
+            // host-side td-review integrator tool. td-sh's conformance corpus run is
             // `#[ignore]`d, so this plain `cargo test` runs only its (green)
             // parser/harness unit tests. td-review goes the other way: its
             // App-level tests drive a real git repo, are `#[ignore]`d so the
@@ -1430,6 +1459,7 @@ fn run_preflight(root: &Path, name: &str) -> i32 {
                 "cargo test --frozen --manifest-path td-netd/Cargo.toml",
                 "cargo test --frozen --manifest-path td-boot/Cargo.toml",
                 "cargo test --frozen --manifest-path td-util/Cargo.toml",
+                "cargo test --frozen --manifest-path td-init/Cargo.toml",
                 "cargo test --frozen --manifest-path td-review/Cargo.toml -- --include-ignored",
                 "cargo clippy --frozen --workspace",
                 "cargo clippy --frozen --manifest-path td-kexec/Cargo.toml",
@@ -1437,6 +1467,7 @@ fn run_preflight(root: &Path, name: &str) -> i32 {
                 "cargo clippy --frozen --manifest-path td-netd/Cargo.toml",
                 "cargo clippy --frozen --manifest-path td-boot/Cargo.toml",
                 "cargo clippy --frozen --manifest-path td-util/Cargo.toml",
+                "cargo clippy --frozen --manifest-path td-init/Cargo.toml",
                 "cargo clippy --frozen --manifest-path td-review/Cargo.toml --all-targets",
             ] {
                 let code = run_shell(root, cmd);
@@ -1714,7 +1745,7 @@ mod tests {
                 "  builder/src/main.rs",
                 "",
                 "Selected checks:",
-                "  cargo test + clippy --frozen --workspace (builder/recipes/engine) + --manifest-path td-kexec/Cargo.toml + --manifest-path td-sh/Cargo.toml + --manifest-path td-netd/Cargo.toml + --manifest-path td-boot/Cargo.toml + --manifest-path td-util/Cargo.toml + --manifest-path td-review/Cargo.toml -- --include-ignored",
+                "  cargo test + clippy --frozen --workspace (builder/recipes/engine) + --manifest-path td-kexec/Cargo.toml + --manifest-path td-sh/Cargo.toml + --manifest-path td-netd/Cargo.toml + --manifest-path td-boot/Cargo.toml + --manifest-path td-util/Cargo.toml + --manifest-path td-init/Cargo.toml + --manifest-path td-review/Cargo.toml -- --include-ignored",
                 "  td-builder check check-engine",
                 "",
                 "Waiver: inspection only (--path does not prove the branch diff)",
@@ -1739,7 +1770,7 @@ mod tests {
                 "",
                 "Selected checks:",
                 "  bash -n tests/*.sh ci/*.sh tools/*.sh",
-                "  cargo test + clippy --frozen --workspace (builder/recipes/engine) + --manifest-path td-kexec/Cargo.toml + --manifest-path td-sh/Cargo.toml + --manifest-path td-netd/Cargo.toml + --manifest-path td-boot/Cargo.toml + --manifest-path td-util/Cargo.toml + --manifest-path td-review/Cargo.toml -- --include-ignored",
+                "  cargo test + clippy --frozen --workspace (builder/recipes/engine) + --manifest-path td-kexec/Cargo.toml + --manifest-path td-sh/Cargo.toml + --manifest-path td-netd/Cargo.toml + --manifest-path td-boot/Cargo.toml + --manifest-path td-util/Cargo.toml + --manifest-path td-init/Cargo.toml + --manifest-path td-review/Cargo.toml -- --include-ignored",
                 "  td-builder check check-pr",
                 "",
                 "Waiver: inspection only (--path does not prove the branch diff)",
