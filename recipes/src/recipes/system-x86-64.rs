@@ -6,7 +6,7 @@ use crate::ladder::{
     SYSTEM_NET_REACH_MARKER, SYSTEM_NET_RESOLVE_MARKER, SYSTEM_NET_UP_MARKER,
     SYSTEM_PERSIST_READ_MARKER, SYSTEM_PERSIST_WRITE_MARKER, SYSTEM_ROOT_RO_MARKER,
     SYSTEM_SHUTDOWN_MARKER, SYSTEM_STATE_OWNER_MARKER, SYSTEM_STATE_WRITABLE_MARKER,
-    UUTILS_RUNTIME_MARKER,
+    TD_UTIL_RUNTIME_MARKER, UUTILS_RUNTIME_MARKER,
 };
 use crate::types::{Recipe, Step};
 
@@ -184,10 +184,6 @@ const BUSYBOX_APPLETS: &[&str] = &[
     "poweroff",
     "halt",
     "hostname",
-    "ps",
-    "clear",
-    "dmesg",
-    "free",
     "vi",
     "less",
     "more",
@@ -196,7 +192,6 @@ const BUSYBOX_APPLETS: &[&str] = &[
     "awk",
     "cttyhack",
     "su",
-    "which",
 ];
 
 /// Applets reached through the packed BusyBox multicall as `/bin/busybox <applet>`, whether
@@ -226,6 +221,16 @@ const INITRAMFS_APPLETS: &[&str] = &[
     "test",
     "umount",
 ];
+
+/// The diagnostics userland, served by the static td-util multicall — the busybox names
+/// uutils does not provide. Like busybox and uutils it dispatches on argv[0]'s basename, so
+/// a `/bin/<applet>` -> td-util symlink runs that applet. Unlike uutils it is an ET_EXEC
+/// with an EMPTY runtime closure, so these entries keep working when no dynamic loader
+/// would: a diagnostics tool that dies with the closure is useless exactly when it is
+/// needed. `shape_check` probes each name against the packed binary's own `--list`, so an
+/// entry td-util does not serve reds the build rather than shipping a `/bin` name that
+/// dispatches to nothing.
+const TD_UTIL_APPLETS: &[&str] = &["clear", "which", "free", "ps", "dmesg"];
 
 /// The core file/text userland, served by the uutils `coreutils` multicall (#547). Every
 /// name must be a coreutils utility the built binary implements. The recipe sandbox cannot
@@ -569,12 +574,34 @@ fn build_profile(sys: &SystemDef) -> String {
     // A broken net stack or closure fails the `&&`, drops the marker, and reds the oracle;
     // selftest's own stdout/stderr are suppressed so the marker string appears exactly once.
     // Runs before `exit` so `tty-session` can ask init to power the VM off.
+    // Then (d) TD_UTIL_RUNTIME_MARKER, only if EVERY /bin name the td-util farm serves runs.
+    // By absolute /bin path, so the shipped symlink and argv[0] dispatch are what run — and
+    // on a booted kernel, the only place free/ps see /proc and dmesg sees /dev/kmsg.
+    // One literal `/bin/<applet>` per name, not a shell loop: a computed `/bin/$a` fails
+    // direct_bin_calls_resolve_to_a_packed_name closed, so spelling them out is what lets
+    // that guard confirm each probed name is packed. `which` needs a resolvable argument.
+    let mut probes = String::new();
+    for a in TD_UTIL_APPLETS {
+        let args = if *a == "which" { " sh" } else { "" };
+        probes.push_str(&format!(
+            "/bin/{a}{args} >/dev/null 2>&1 || {{ echo 'td-util: /bin/{a} failed'; u=0; }}; "
+        ));
+    }
     s.push_str(&format!(
         "if /bin/busybox grep -q -F '{AUTOTEST_CMDLINE_TOKEN}' /proc/cmdline 2>/dev/null; then \
          /bin/cat /etc/os-release >/dev/null 2>&1 && echo {UUTILS_RUNTIME_MARKER}; \
          /bin/sshd selftest >/dev/null 2>&1 && echo {SSHD_MARKER}; \
-         exit; fi\n"
+         u=1; \
+         /bin/td-util --list >/dev/null 2>&1 || {{ echo 'td-util: --list failed'; u=0; }}; \
+         {probes}\
+         [ \"$u\" = 1 ] && echo {TD_UTIL_RUNTIME_MARKER}; \
+         exit 0; fi\n"
     ));
+    // `exit 0`, not a bare `exit`: bare takes the last command's status, so a withheld
+    // marker would exit 1, tty-session's `getty … && exec /bin/reboot` would not reboot,
+    // and init would respawn until the oracle's 300s timeout — burying a named applet
+    // failure under a timeout. Marker ABSENCE is the red signal; the exit path stays clean
+    // so "exit powers off" still proves itself.
     s
 }
 
@@ -719,6 +746,12 @@ fn real_root_steps(sys: &SystemDef) -> Vec<Step> {
         from: "{in:td-boot}".into(),
         dest: "{root}/real-root{in:td-boot}".into(),
     });
+    // td-util is static too (ET_EXEC, empty closure — assert_static fail-closes on it),
+    // so it copies directly rather than through StageRuntimeClosure.
+    steps.push(Step::CopyTree {
+        from: "{in:td-util}".into(),
+        dest: "{root}/real-root{in:td-util}".into(),
+    });
     // Stage uutils and sshd plus every transitively referenced store item at its canonical
     // absolute path. Both are dynamically linked, so each pulls its reachable runtime store
     // closure (glibc, libgcc_s, and for sshd the aws-lc crypto C lib) onto the erofs root.
@@ -763,6 +796,18 @@ fn real_root_steps(sys: &SystemDef) -> Vec<Step> {
         target: "{in:td-boot}/bin/td-boot".into(),
         link: "{root}/real-root/bin/td-boot".into(),
     });
+    // /bin/td-util is the multicall's own entry (`td-util <applet>`, and `--list`); the loop
+    // below is the argv[0] farm the diagnostics names resolve through.
+    steps.push(Step::Symlink {
+        target: "{in:td-util}/bin/td-util".into(),
+        link: "{root}/real-root/bin/td-util".into(),
+    });
+    for app in TD_UTIL_APPLETS {
+        steps.push(Step::Symlink {
+            target: "{in:td-util}/bin/td-util".into(),
+            link: format!("{{root}}/real-root/bin/{app}"),
+        });
+    }
     // resolv.conf and hosts live at /etc but are SYMLINKS into the writable /run
     // tmpfs, so td-netd can (re)write them under the read-only erofs /etc. They are
     // deliberately dangling at build time; td-netd creates the /run targets at boot.
@@ -855,6 +900,13 @@ fn shape_check() -> String {
      tnd=\"{root}/real-root{in:td-netd}/bin/td-netd\"; { [ -f \"$tnd\" ] && [ -x \"$tnd\" ]; } || { echo 'root tree: the td-netd binary is not packed/executable at real-root{in:td-netd}/bin/td-netd - the /bin/td-netd symlink would dangle' >&2; exit 1; }; \
      [ \"$(readlink \"$root/bin/td-boot\" 2>/dev/null)\" = \"{in:td-boot}/bin/td-boot\" ] || { echo 'root tree: /bin/td-boot is not a symlink to the staged deployment helper' >&2; exit 1; }; \
      tdb=\"{root}/real-root{in:td-boot}/bin/td-boot\"; { [ -f \"$tdb\" ] && [ -x \"$tdb\" ]; } || { echo 'root tree: td-boot is not packed/executable for root-side deployment transactions' >&2; exit 1; }; \
+     [ \"$(readlink \"$root/bin/td-util\" 2>/dev/null)\" = \"{in:td-util}/bin/td-util\" ] || { echo 'root tree: /bin/td-util is not a symlink to the staged diagnostics multicall' >&2; exit 1; }; \
+     tdu=\"{root}/real-root{in:td-util}/bin/td-util\"; tdutgt=\"{in:td-util}/bin/td-util\"; { [ -f \"$tdu\" ] && [ -x \"$tdu\" ]; } || { echo 'root tree: the td-util binary is not packed/executable at real-root{in:td-util}/bin/td-util - the /bin/td-util symlink would dangle' >&2; exit 1; }; \
+     tdulist=$(\"$tdu\" --list 2>/dev/null) || { echo 'td-util --list failed - cannot verify the diagnostics farm' >&2; exit 1; }; \
+     for a in @TD_UTIL_APPLETS@; do \
+         [ \"$(readlink \"$root/bin/$a\" 2>/dev/null)\" = \"$tdutgt\" ] || { echo \"root tree: /bin/$a is not a symlink to the staged td-util multicall ($tdutgt) - the diagnostics /bin farm regressed\" >&2; exit 1; }; \
+         printf '%s\\n' \"$tdulist\" | grep -q -x -F \"$a\" || { echo \"td-util does not serve applet '$a' - its packed /bin/$a symlink would dispatch to nothing (usage, exit 2)\" >&2; exit 1; }; \
+     done; \
      [ \"$(readlink \"$root/home\")\" = var/home ] || { echo 'root tree: /home must point to var/home' >&2; exit 1; }; \
      [ \"$(readlink \"$root/root\")\" = var/root ] || { echo 'root tree: /root must point to var/root' >&2; exit 1; }; \
      rbb=\"{root}/real-root{in:busybox-x86-64}/bin/busybox\"; { [ -f \"$rbb\" ] && [ -x \"$rbb\" ]; } || { echo 'root tree: the busybox binary is not packed/executable at real-root{in:busybox-x86-64}/bin/busybox - the store-native /bin symlinks would all dangle' >&2; exit 1; }; \
@@ -895,6 +947,7 @@ fn shape_check() -> String {
         .replace("@BUSYBOX_APPLETS@", &BUSYBOX_APPLETS.join(" "))
         .replace("@INITRAMFS_APPLETS@", &INITRAMFS_APPLETS.join(" "))
         .replace("@UUTILS_APPLETS@", &UUTILS_APPLETS.join(" "))
+        .replace("@TD_UTIL_APPLETS@", &TD_UTIL_APPLETS.join(" "))
 }
 
 pub fn recipe() -> Recipe {
@@ -1018,6 +1071,8 @@ pub fn recipe() -> Recipe {
         // td-netd: the static network bring-up daemon (empty runtime closure, CopyTree'd).
         // td-boot: static initramfs selector and root-side deployment helper (CopyTree'd).
         // td-kexec: confined selector-only kexec helper.
+        // td-util: the static diagnostics multicall (empty runtime closure, CopyTree'd),
+        //   serving the /bin farm those five names resolve through.
         .native_inputs(&[
             "busybox-x86-64",
             "linux-x86-64",
@@ -1027,6 +1082,7 @@ pub fn recipe() -> Recipe {
             "td-netd",
             "td-boot",
             "td-kexec",
+            "td-util",
         ])
         .inputs_owned(mesboot0_inputs(&[]))
         .steps(steps)
@@ -1205,16 +1261,28 @@ mod tests {
     /// `mount`/`umount` (the stage-1 pivot runs before uutils' glibc closure is reachable).
     #[test]
     fn applet_farms_are_disjoint_and_boot_names_stay_busybox() {
-        for a in UUTILS_APPLETS {
-            assert!(
-                !BUSYBOX_APPLETS.contains(a),
-                "applet '{a}' is in BOTH farms - a name belongs to exactly one /bin farm"
-            );
+        // Three farms now, so check every pair: a name served twice emits two Symlink steps
+        // for one link and the LAST one silently wins.
+        const FARMS: [(&str, &[&str]); 3] = [
+            ("busybox", BUSYBOX_APPLETS),
+            ("uutils", UUTILS_APPLETS),
+            ("td-util", TD_UTIL_APPLETS),
+        ];
+        for (i, (a_name, a_set)) in FARMS.iter().enumerate() {
+            for (b_name, b_set) in FARMS.iter().skip(i + 1) {
+                for a in a_set.iter() {
+                    assert!(
+                        !b_set.contains(a),
+                        "applet '{a}' is in BOTH the {a_name} and {b_name} farms - a name \
+                         belongs to exactly one /bin farm"
+                    );
+                }
+            }
         }
         for a in ["hostname", "mount", "umount", "sh", "init"] {
             assert!(
                 BUSYBOX_APPLETS.contains(&a),
-                "boot-critical applet '{a}' must stay busybox, not route to uutils"
+                "boot-critical applet '{a}' must stay busybox, not route to another farm"
             );
             assert!(
                 !UUTILS_APPLETS.contains(&a),
@@ -1386,7 +1454,12 @@ mod tests {
         let packed = packed_bin_names();
         // Guard the derivation: if it stops seeing real_root_steps' symlinks it would
         // accept nothing (and red on everything) or, worse, be edited into accepting all.
-        for a in BUSYBOX_APPLETS.iter().chain(UUTILS_APPLETS).chain(&["busybox"]) {
+        for a in BUSYBOX_APPLETS
+            .iter()
+            .chain(UUTILS_APPLETS)
+            .chain(TD_UTIL_APPLETS)
+            .chain(&["busybox", "td-util"])
+        {
             assert!(
                 packed.iter().any(|p| p == a),
                 "'{a}' is a /bin name this file packs, but packed_bin_names() did not derive \
@@ -1805,6 +1878,99 @@ mod tests {
                 "td-boot invokes uncovered busybox applet {applet}"
             );
         }
+    }
+
+    /// td-util is packed, serves its whole /bin farm, and every one of those names is
+    /// exercised by the greeter on the image. All three must hold together: a farm whose
+    /// binary is not packed dangles, and a farm no probe runs is a cutover asserted only by
+    /// symlink text — `shape_check` compares link targets and cannot execute an applet.
+    #[test]
+    fn td_util_serves_its_farm_and_every_name_is_probed() {
+        let steps = real_root_steps(&SYSTEM);
+        assert!(
+            steps.iter().any(|s| matches!(
+                s,
+                Step::CopyTree { from, dest }
+                    if from == "{in:td-util}" && dest == "{root}/real-root{in:td-util}"
+            )),
+            "td-util must be CopyTree'd into the real root (static, empty closure)"
+        );
+        assert!(
+            steps.iter().any(|s| matches!(
+                s,
+                Step::Symlink { target, link }
+                    if target == "{in:td-util}/bin/td-util"
+                        && link == "{root}/real-root/bin/td-util"
+            )),
+            "/bin/td-util must symlink into the store td-util package"
+        );
+        // Collect every step claiming each link, not the first: Step::Symlink is
+        // last-writer-wins (build.rs unlinks before creating), so a name left in two farms
+        // would ship whichever loop ran last while a first-match probe still found the
+        // other and passed. Requiring exactly one claimant closes that and the general
+        // duplicate-name hole; applet_farms_are_disjoint_... checks the same thing from the
+        // list side.
+        for applet in TD_UTIL_APPLETS {
+            let link = format!("{{root}}/real-root/bin/{applet}");
+            let targets: Vec<&str> = steps
+                .iter()
+                .filter_map(|s| match s {
+                    Step::Symlink { target, link: l } if *l == link => Some(target.as_str()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                targets.len(),
+                1,
+                "exactly one Symlink step may claim /bin/{applet}, found {}: a later step \
+                 silently overwrites an earlier one, so a second claimant re-points the name \
+                 with nothing else noticing",
+                targets.len()
+            );
+            assert_eq!(
+                targets.first().copied(),
+                Some("{in:td-util}/bin/td-util"),
+                "/bin/{applet} must resolve to the staged td-util multicall"
+            );
+        }
+        let profile = build_profile(&SYSTEM);
+        // Every farm name must be probed BY ITS /bin PATH: that is what exercises the
+        // shipped symlink and argv[0] dispatch. A probe over a subset would green-light
+        // names it never ran.
+        assert!(
+            !TD_UTIL_APPLETS.is_empty(),
+            "an empty farm would make every per-applet assertion below, and shape_check's \
+             own farm loop, silently vacuous"
+        );
+        for applet in TD_UTIL_APPLETS {
+            // Match the WHOLE generated segment, failure branch included. Matching the name
+            // alone is satisfied by the diagnostic `echo`, which also contains it — the
+            // command could be deleted and this would pass. And matching everything except
+            // `u=0` leaves the gate defeatable: drop that one assignment and the marker
+            // prints unconditionally, so the oracle greens with a broken applet.
+            let args = if *applet == "which" { " sh" } else { "" };
+            assert!(
+                profile.contains(&format!(
+                    "/bin/{applet}{args} >/dev/null 2>&1 || {{ echo 'td-util: /bin/{applet} \
+                     failed'; u=0; }}"
+                )),
+                "the greeter must RUN /bin/{applet} by its literal /bin path AND clear the \
+                 marker gate on failure - without the u=0 the marker is unconditional and \
+                 the oracle passes a broken applet"
+            );
+        }
+        // `exit 0`, not a bare `exit`. Bare takes the last command's status, so a withheld
+        // marker exits 1, tty-session's `getty … && exec /bin/reboot` never reboots, and the
+        // VM respawns to the oracle's timeout — turning a named applet failure into a
+        // timeout with no cause attached.
+        assert!(
+            profile.contains(&format!(
+                "[ \"$u\" = 1 ] && echo {TD_UTIL_RUNTIME_MARKER}; exit 0; fi"
+            )),
+            "the greeter must emit the td-util marker GATED on every probed applet exiting 0 \
+             (an ungated echo would prove the binary runs when it never ran), and must then \
+             `exit 0` so a withheld marker still powers the VM off instead of respawning"
+        );
     }
 
     /// td-netd must be packed and symlinked into /bin, and resolv.conf/hosts must be

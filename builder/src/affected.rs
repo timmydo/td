@@ -741,8 +741,9 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
     // src/main.rs and its modules are `include_str!`'d into the td-util RECIPE, so a
     // source edit changes the TARGET artifact and a static-link regression is
     // invisible to host cargo — so also route to recipe-checks-daily (the daily
-    // backstop statically links + exercises it via td-util-test). Its RECIPE files
-    // under recipes/src/recipes/ are routed by the recipes arm above, not here.
+    // backstop statically links + exercises it via td-util-test) AND it is packed into
+    // system-x86-64, serving the /bin diagnostics farm. Its RECIPE files under
+    // recipes/src/recipes/ are routed by the recipes arm above, not here.
     if pattern_matches(
         "td-util/*|td-util/src/*|td-util/Cargo.toml|td-util/Cargo.lock",
         p,

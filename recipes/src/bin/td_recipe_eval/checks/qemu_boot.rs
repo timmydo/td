@@ -87,6 +87,12 @@ const UUTILS_RUNTIME_MARKER: &str = td_recipe::ladder::UUTILS_RUNTIME_MARKER;
 /// work on the erofs root. Shared via `td_recipe::ladder`.
 const SSHD_MARKER: &str = td_recipe::ladder::SSHD_MARKER;
 
+/// Printed by the headless greeter only after every `/bin` name the static diagnostics
+/// multicall serves exits 0, invoked by its absolute `/bin` path — the runtime proof for the
+/// td-util farm, covering the /proc and /dev/kmsg applets the build sandbox cannot run.
+/// Shared via `td_recipe::ladder`.
+const TD_UTIL_RUNTIME_MARKER: &str = td_recipe::ladder::TD_UTIL_RUNTIME_MARKER;
+
 /// The line `/etc/rootcheck` prints once it has confirmed `/` is a READ-ONLY erofs
 /// mount (re #550). `qemu-boot-system` asserts it to prove the switched-into root is
 /// the immutable erofs image, not a writable copy.
@@ -193,6 +199,7 @@ struct ConsoleEvidence {
     state_owner: bool,
     uutils_runtime: bool,
     sshd: bool,
+    td_util_runtime: bool,
     persist_write: bool,
     persist_read: bool,
     deploy_install: bool,
@@ -535,7 +542,8 @@ pub(crate) fn run_system(runner: &RecipeCheckRunner) -> Result<(), String> {
          ({} -> {}). Every boot kept root and /etc immutable \
          ({SYSTEM_ROOT_RO_MARKER}, {SYSTEM_ETC_RO_MARKER}), mounted target-owned writable @var \
          ({SYSTEM_STATE_WRITABLE_MARKER}, {SYSTEM_STATE_OWNER_MARKER}), ran uutils \
-         ({UUTILS_RUNTIME_MARKER}), and unmounted state before exit ({SYSTEM_SHUTDOWN_MARKER})",
+         ({UUTILS_RUNTIME_MARKER}) and td-util ({TD_UTIL_RUNTIME_MARKER}), and unmounted state \
+         before exit ({SYSTEM_SHUTDOWN_MARKER})",
         td_boot_protocol::CURRENT_REJECTED_MARKER,
         td_boot_protocol::SELECTED_PREVIOUS_MARKER
     );
@@ -646,6 +654,19 @@ fn validate_system_boot(
              round-trip and exit 0. Either the kernel lacks working TCP/IP loopback (CONFIG_NET/INET \
              or the `lo` bring-up regressed), or sshd's dynamic runtime closure (loader, glibc, \
              libgcc_s, aws-lc crypto) does not resolve on the erofs root. Last serial output:\n{}",
+            tail(&result.console, 80)
+        ));
+    }
+    if !result.evidence.td_util_runtime {
+        return Err(format!(
+            "the greeter was reached and root/uutils/sshd checks passed, but the td-util runtime \
+             marker ({TD_UTIL_RUNTIME_MARKER:?}) was absent — at least one /bin name the td-util \
+             farm serves did not exit 0, so a shipped diagnostics command is broken on the image. \
+             The console names the applet (`td-util: /bin/<name> failed`). Either the static \
+             multicall does not run on the erofs root, its argv[0] dispatch regressed, or the \
+             /proc or /dev/kmsg the applet reads is unavailable there. td-util-test covers ELF \
+             shape and dispatch in the build sandbox but skips those legs when it has no /proc. \
+             Last serial output:\n{}",
             tail(&result.console, 80)
         ));
     }
@@ -1924,6 +1945,7 @@ fn evidence_marker_max_len(target: &[u8]) -> usize {
         SYSTEM_STATE_OWNER_MARKER.len(),
         UUTILS_RUNTIME_MARKER.len(),
         SSHD_MARKER.len(),
+        TD_UTIL_RUNTIME_MARKER.len(),
         SYSTEM_PERSIST_WRITE_MARKER.len(),
         SYSTEM_PERSIST_READ_MARKER.len(),
         SYSTEM_DEPLOY_INSTALL_MARKER.len(),
@@ -1992,6 +2014,11 @@ fn latch_console_evidence(evidence: &mut ConsoleEvidence, buf: &[u8], target: &[
         UUTILS_RUNTIME_MARKER.as_bytes(),
     );
     latch_marker(&mut evidence.sshd, buf, SSHD_MARKER.as_bytes());
+    latch_marker(
+        &mut evidence.td_util_runtime,
+        buf,
+        TD_UTIL_RUNTIME_MARKER.as_bytes(),
+    );
     latch_marker(
         &mut evidence.persist_write,
         buf,
@@ -2376,9 +2403,13 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn system_boot_markers_are_distinct() {
-        let markers = [
+    /// Every marker the console scanner latches, enumerated once so a new one is added in a
+    /// single place. `evidence_marker_max_len` deliberately does NOT check itself against
+    /// this: its result is dominated by the id-bearing markers (marker + space + 64-char
+    /// hex), so a "no marker exceeds the max" assertion cannot fail and would only look like
+    /// a guard. The rescan window is covered behaviourally instead, by the split tests below.
+    fn all_console_markers() -> [&'static str; 24] {
+        [
             MARKER,
             EROFS_MARKER,
             td_boot_protocol::CURRENT_REJECTED_MARKER,
@@ -2402,7 +2433,13 @@ mod tests {
             SYSTEM_NET_RESOLVE_MARKER,
             SYSTEM_NET_REACH_MARKER,
             SSHD_MARKER,
-        ];
+            TD_UTIL_RUNTIME_MARKER,
+        ]
+    }
+
+    #[test]
+    fn system_boot_markers_are_distinct() {
+        let markers = all_console_markers();
         let unique = std::collections::BTreeSet::from(markers);
         assert_eq!(
             unique.len(),
@@ -2419,6 +2456,43 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// `drain_console` reads in fixed-size chunks and rescans the last
+    /// `evidence_marker_max_len() - 1` bytes, so a marker straddling a read boundary is
+    /// still latched. Drop the overlap and a marker that lands across the seam is lost —
+    /// silently, and only on consoles long enough to need a second read, which is every
+    /// real boot. Split the td-util marker across the seam and require it anyway.
+    #[test]
+    fn drain_console_latches_a_marker_split_across_a_read_boundary() {
+        const CHUNK: usize = 8192;
+        let seq = AtomicU64::new(0);
+        let dir = create_scratch_dir(&env::temp_dir(), &seq).unwrap();
+        let _g = Scratch { dir: dir.clone() };
+        let path = dir.join("console.log");
+        // Straddle the seam: all but the last byte of the marker lands in read 1.
+        let head = CHUNK - (TD_UTIL_RUNTIME_MARKER.len() - 1);
+        let mut bytes = vec![b'x'; head];
+        bytes.extend_from_slice(TD_UTIL_RUNTIME_MARKER.as_bytes());
+        bytes.extend_from_slice(&[b'y'; 128]);
+        fs::write(&path, &bytes).unwrap();
+
+        let mut file = None;
+        let mut buffer = Vec::new();
+        let mut evidence = ConsoleEvidence::default();
+        drain_console_to_eof(
+            &path,
+            &mut file,
+            &mut buffer,
+            b"target-never-appears",
+            &mut evidence,
+        )
+        .unwrap();
+        assert!(
+            evidence.td_util_runtime,
+            "a marker split across a read boundary must still latch - the rescan overlap \
+             regressed"
+        );
     }
 
     #[test]
@@ -2471,6 +2545,7 @@ mod tests {
             SYSTEM_STATE_OWNER_MARKER,
             UUTILS_RUNTIME_MARKER,
             SSHD_MARKER,
+            TD_UTIL_RUNTIME_MARKER,
             SYSTEM_PERSIST_WRITE_MARKER,
             SYSTEM_PERSIST_READ_MARKER,
             SYSTEM_DEPLOY_INSTALL_MARKER,
@@ -2511,6 +2586,7 @@ mod tests {
         assert!(evidence.state_owner);
         assert!(evidence.uutils_runtime);
         assert!(evidence.sshd);
+        assert!(evidence.td_util_runtime);
         assert!(evidence.persist_write);
         assert!(evidence.persist_read);
         assert!(evidence.deploy_install);

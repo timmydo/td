@@ -183,6 +183,13 @@ pub const UUTILS_RUNTIME_MARKER: &str = "TD-UUTILS-RUN-OK";
 /// crate the recipe builds); the two must stay identical.
 pub const SSHD_MARKER: &str = "TD-SSHD-OK";
 
+/// Printed by `/etc/profile` on the headless self-test path ONLY after EVERY `/bin` name the
+/// static td-util multicall serves exits 0, each invoked by its absolute `/bin` path — so it
+/// covers the shipped symlink and argv[0] dispatch, plus the `/proc` and `/dev/kmsg` reads
+/// `td-util-test` skips when the build sandbox has no `/proc`. td-util is an ET_EXEC with an
+/// EMPTY runtime closure, so unlike `UUTILS_RUNTIME_MARKER` this says nothing about a loader.
+pub const TD_UTIL_RUNTIME_MARKER: &str = "TD-UTIL-RUN-OK";
+
 /// Kernel-cmdline token the headless `qemu-boot-system` oracle appends so the greeter
 /// SELF-TESTS: `/etc/profile`, on seeing it in `/proc/cmdline`, prints `GREETER_MARKER`
 /// then `exit`s the login shell, which (via `tty-session`'s init-mediated reboot) powers the VM

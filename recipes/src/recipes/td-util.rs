@@ -16,10 +16,13 @@ use crate::types::{Recipe, Step};
 // switch_root, cttyhack, init) are deliberately out of scope: each needs a raw
 // syscall, which is a reviewed unsafe-surface amendment, not a drive-by.
 //
-// td-util is NOT yet referenced by system-x86-64: the shipped /bin entries stay
-// busybox until the daily tier has built this and the headless boot oracle has
-// exercised the binary on the image. Only then is the farm flipped. Same staging
-// td-sh follows.
+// system-x86-64 packs td-util and routes /bin/{clear,which,free,ps,dmesg} here, off
+// busybox. The greeter runs each by its /bin path and emits TD_UTIL_RUNTIME_MARKER
+// only if all five exit 0, so `td-recipe-eval qemu-boot-system` re-proves the whole
+// farm on every boot — including the /proc and /dev/kmsg applets whose legs below
+// are skipped when the build sandbox lacks /proc. That oracle is operator-run (qemu
+// is absent from the host-free gate sandbox), so it is a release gate, not a
+// per-change one. Same staging td-sh follows.
 //
 // Why mesboot-style (rustc invoked directly) rather than `Recipe::rust`, and why
 // static: identical to td-sh/td-kexec. A diagnostics tool that cannot run when
