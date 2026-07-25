@@ -4696,7 +4696,13 @@ fn stage_verified_vendor(
     }
     if !vendor_dir.is_dir() {
         return Err(format!(
-            "vendored crate dir {} absent — `td-builder check' warms the crate closure before the graph build",
+            "vendored crate dir {} absent — `td-builder check` normally warms it before \
+             the graph build; from a source checkout run:\n  \
+             cargo run --release --manifest-path builder/Cargo.toml -- check\n\
+             then retry the build. The warm requires `cc`/`gcc` on PATH or \
+             TD_CC_HOME=<toolchain-root>. If this error came from that check, inspect its \
+             earlier cargo-proxy warm error, correct the reported network/tool problem, and \
+             rerun it",
             vendor_dir.display()
         ));
     }
@@ -12416,6 +12422,23 @@ daemon build START (2/2 active)
              [[package]]\nname = \"foo\"\nversion = \"1.2.3\"\nchecksum = \"{foo}\"\n\n\
              [[package]]\nname = \"bar\"\nversion = \"0.1.0\"\nchecksum = \"{bar}\"\n"
         );
+        let absent = dir.with_extension("absent");
+        let _ = std::fs::remove_dir_all(&absent);
+        let error = stage_verified_vendor(&absent, &lock, &staged).unwrap_err();
+        assert!(
+            error.contains(
+                "\n  cargo run --release --manifest-path builder/Cargo.toml -- check\n"
+            ),
+            "a source checkout must receive a directly runnable provisioning command: {error}"
+        );
+        assert!(
+            error.contains("If this error came from that check"),
+            "a failed check warm must not receive circular recovery guidance: {error}"
+        );
+        assert!(
+            error.contains("TD_CC_HOME=<toolchain-root>"),
+            "the command must disclose its host C-toolchain prerequisite: {error}"
+        );
         // All present + matching (root without a checksum is excluded ⇒ 2 verified), and
         // exactly the verified crates land in the fresh private staged tree.
         assert_eq!(stage_verified_vendor(&dir, &lock, &staged).unwrap(), 2);
@@ -12445,6 +12468,7 @@ daemon build START (2/2 active)
         );
         assert!(stage_verified_vendor(&dir, &traversal, &staged).is_err());
         let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&absent);
         let _ = std::fs::remove_dir_all(&staged);
     }
 
