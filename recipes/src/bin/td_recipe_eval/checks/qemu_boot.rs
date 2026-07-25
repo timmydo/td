@@ -33,7 +33,7 @@ use std::ffi::OsString;
 use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
-use std::os::unix::fs::DirBuilderExt;
+use std::os::unix::fs::{symlink, DirBuilderExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -41,6 +41,10 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::check_runner::{is_executable, RecipeCheckRunner};
+
+#[path = "../../../../../td-boot/src/protocol.rs"]
+#[allow(dead_code)]
+mod td_boot_protocol;
 
 /// The busybox /init prints this exact line on ttyS0 once the kernel has reached
 /// userspace and executed the static busybox userland. Sourced from the SHARED
@@ -91,15 +95,21 @@ const SYSTEM_ROOT_RO_MARKER: &str = td_recipe::ladder::SYSTEM_ROOT_RO_MARKER;
 /// Printed after root fails to create a probe below deployment-owned `/etc`.
 const SYSTEM_ETC_RO_MARKER: &str = td_recipe::ladder::SYSTEM_ETC_RO_MARKER;
 
-/// Printed after `/var`, `/run`, and `/tmp` are proven writable tmpfs mounts and
-/// the immutable `/home` and `/root` links resolve into writable `/var` state.
-const SYSTEM_STATE_WRITABLE_MARKER: &str =
-    td_recipe::ladder::SYSTEM_STATE_WRITABLE_MARKER;
+/// Printed after `/var` is proven to be writable Btrfs, `/run` and `/tmp` are
+/// writable tmpfs mounts, and the immutable `/home` and `/root` links resolve
+/// into writable `/var` state.
+const SYSTEM_STATE_WRITABLE_MARKER: &str = td_recipe::ladder::SYSTEM_STATE_WRITABLE_MARKER;
+const SYSTEM_STATE_OWNER_MARKER: &str = td_recipe::ladder::SYSTEM_STATE_OWNER_MARKER;
+const SYSTEM_PERSIST_WRITE_MARKER: &str = td_recipe::ladder::SYSTEM_PERSIST_WRITE_MARKER;
+const SYSTEM_PERSIST_READ_MARKER: &str = td_recipe::ladder::SYSTEM_PERSIST_READ_MARKER;
+const SYSTEM_SHUTDOWN_MARKER: &str = td_recipe::ladder::SYSTEM_SHUTDOWN_MARKER;
 
 /// The kernel-cmdline token `qemu-boot-system` appends so the greeter self-exits and
 /// the VM powers off — a headless "exit powers off" proof with no terminal to type
 /// into. Shared with the recipe's `/etc/profile` autotest gate via `td_recipe::ladder`.
 const AUTOTEST_CMDLINE_TOKEN: &str = td_recipe::ladder::AUTOTEST_CMDLINE_TOKEN;
+const PERSIST_WRITE_CMDLINE_TOKEN: &str = td_recipe::ladder::PERSIST_WRITE_CMDLINE_TOKEN;
+const PERSIST_READ_CMDLINE_TOKEN: &str = td_recipe::ladder::PERSIST_READ_CMDLINE_TOKEN;
 
 /// The three networking markers `/etc/netup` prints under the nettest token: the link
 /// came up + DHCP applied, td-netd's own DNS client resolved the test host, and a TCP
@@ -125,13 +135,11 @@ const KEXEC_STAGE1_MARKER: &str = td_recipe::ladder::KEXEC_STAGE1_MARKER;
 const KEXEC_STAGE2_MARKER: &str = td_recipe::ladder::KEXEC_STAGE2_MARKER;
 
 /// Default wall-clock ceiling. A tiny allnoconfig kernel boots to userspace under
-/// TCG in a few seconds, but TCG on a loaded builder can be slow; 180s is
-/// generous. The poll loop kills qemu the instant the marker appears, so a healthy
-/// boot returns in seconds — the ceiling only bounds a FAILED boot (panic without
-/// reboot, a wedged userland) so the check reds instead of hanging forever. The
-/// `TD_QEMU_BOOT_TIMEOUT_SECS` env var overrides it (for a slower CI host or a
-/// faster local smoke test).
-const DEFAULT_BOOT_TIMEOUT_SECS: u64 = 180;
+/// TCG in a few seconds, but the persistent system modes hash their deployment,
+/// kexec, and boot a second kernel. The poll loop returns as soon as the selected
+/// mode finishes, so this ceiling only bounds a failed or unusually slow boot.
+/// `TD_QEMU_BOOT_TIMEOUT_SECS` overrides it.
+const DEFAULT_BOOT_TIMEOUT_SECS: u64 = 300;
 const POLL: Duration = Duration::from_millis(200);
 
 /// Cap on retained console/diagnostic bytes. The console is scanned incrementally
@@ -151,9 +159,14 @@ const DRAIN_BUDGET: usize = 4 * 1024 * 1024;
 /// their sum crosses this ceiling the boot is aborted (qemu killed) and reported as
 /// flooded — generous enough that a normal boot's few KiB of printk never trips it.
 const MAX_CONSOLE_BYTES: u64 = 64 * 1024 * 1024;
+const PERSISTENT_VOLUME_BYTES: u64 = 1024 * 1024 * 1024;
+// Reserve fixture space for Btrfs metadata and the writable @var subvolume.
+const PERSISTENT_VOLUME_HEADROOM: u64 = 256 * 1024 * 1024;
+// A 64 MiB console needs 17 passes including EOF; allow seven EINTR retries.
+const FINAL_DRAIN_PASSES: usize = 24;
 
-/// How the boot loop terminated. Success is decided SOLELY by whether the marker
-/// reached the console; this only labels a FAILED boot's diagnostics.
+/// How the boot loop terminated. Callers combine this with latched protocol
+/// evidence; floods are rejected directly before a result is returned.
 enum EndReason {
     MarkerSeen,
     QemuExited(ExitStatus),
@@ -162,9 +175,30 @@ enum EndReason {
 }
 
 /// Outcome of a boot attempt.
+#[derive(Default)]
+struct ConsoleEvidence {
+    target: bool,
+    current_rejected: bool,
+    root_read_only: bool,
+    etc_read_only: bool,
+    state_writable: bool,
+    state_owner: bool,
+    uutils_runtime: bool,
+    sshd: bool,
+    persist_write: bool,
+    persist_read: bool,
+    shutdown: bool,
+    net_up: bool,
+    net_resolve: bool,
+    net_reach: bool,
+    kexec_stage1: bool,
+    kernel_panic: bool,
+}
+
 struct BootResult {
-    /// The userland marker reached ttyS0 — the sole success criterion.
-    marker: bool,
+    /// Protocol evidence latched while reading ttyS0, before the diagnostic tail
+    /// is trimmed. This keeps early boot markers authoritative under noisy printk.
+    evidence: ConsoleEvidence,
     /// qemu terminated on its OWN with a success status: a clean guest-initiated
     /// power-off under `-no-reboot`. Only meaningful when the boot was allowed to run
     /// to the guest's own shutdown (`kill_on_marker = false`); the marker-killed modes
@@ -176,6 +210,8 @@ struct BootResult {
     /// Bounded, lossily-decoded tail of ttyS0 (or qemu's own diagnostics if ttyS0
     /// was empty), for error context.
     console: String,
+    /// Wall-clock time from qemu spawn through the bounded final console drain.
+    elapsed: Duration,
 }
 
 pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
@@ -208,7 +244,7 @@ pub(crate) fn run(runner: &RecipeCheckRunner) -> Result<(), String> {
         },
         runner.scratch_dir(),
     )?;
-    if !result.marker {
+    if !result.evidence.target {
         return Err(format!(
             "kernel did not reach the userland marker {MARKER:?} on ttyS0 — {} \
              (no console output, a kernel panic before userspace, or the busybox /init did not run). \
@@ -249,7 +285,10 @@ pub(crate) fn run_erofs(runner: &RecipeCheckRunner) -> Result<(), String> {
         &bzimage,
         &initramfs,
         BootPlan {
-            disk: Some(&disk),
+            disk: Some(BootDisk {
+                path: &disk,
+                read_only: true,
+            }),
             mem: "256",
             target_marker: EROFS_MARKER,
             kill_on_marker: true,
@@ -258,7 +297,7 @@ pub(crate) fn run_erofs(runner: &RecipeCheckRunner) -> Result<(), String> {
         },
         runner.scratch_dir(),
     )?;
-    if !result.marker {
+    if !result.evidence.target {
         return Err(format!(
             "kernel did not reach the read-only-erofs marker {EROFS_MARKER:?} on ttyS0 — {} \
              (the initramfs could not mount /dev/vda as read-only erofs, the virtio-blk node did not \
@@ -274,55 +313,106 @@ pub(crate) fn run_erofs(runner: &RecipeCheckRunner) -> Result<(), String> {
     Ok(())
 }
 
-/// `qemu-boot-system` (re #550): the headless end-to-end proof of the TWO-STAGE boot.
-/// The kernel, stage-1 initramfs, and read-only EROFS root come from
-/// `system-x86-64`'s verified deployment bundle. The oracle attaches root.erofs
-/// as `/dev/vda` and boots stage-1 with the autotest token on the kernel
-/// cmdline. Stage-1 mounts the erofs root read-only, mounts writable tmpfs state,
-/// and `switch_root`s into it; the real-root init reaches the auto-login
-/// greeter, which (seeing the autotest token) exits so the VM powers off. A green result
-/// asserts, in order: the greeter was reached, `/` and `/etc` are immutable, the
-/// `/var`-backed state paths are writable, and the VM powered off cleanly on `exit`.
+/// `qemu-boot-system`: the headless end-to-end proof of persistent deployment boot.
+/// It builds a Btrfs volume containing the verified deployment and @var, then boots
+/// that SAME writable volume twice. Each direct boot enters the initramfs selector,
+/// kexecs the verified deployment, loop-mounts root.erofs, and mounts @var. Boot one
+/// writes + syncs a marker; boot two must read its exact bytes back. Both boots also
+/// assert the immutable root, writable state, uutils runtime, and clean self-exit.
 pub(crate) fn run_system(runner: &RecipeCheckRunner) -> Result<(), String> {
-    // qemu first (fail fast if absent), then a single build of the complete
-    // deployment artifact.
     let qemu = find_qemu()?;
-    let (bzimage, init_cpio, disk) = build_system(runner)?;
+    let (bzimage, init_cpio, volume, btrfs) = build_persistent_system(runner)?;
 
     println!(
-        "   [qemu-boot-system] {qemu} boots the recipe-built deployment under TCG: initramfs.cpio -> read-only root.erofs over virtio-blk -> switch_root -> greeter\n              kernel:     {}\n              initramfs:  {}\n              erofs root: {}",
+        "   [qemu-boot-system] {qemu} boots one recipe-built Btrfs volume twice under TCG: selector -> verified kexec -> loop-mounted root.erofs + persistent @var -> greeter\n              shim kernel:    {}\n              initramfs:      {}\n              Btrfs volume:   {}",
         bzimage.display(),
         init_cpio.display(),
-        disk.display()
+        volume.display()
     );
 
-    // kill_on_marker = false: the greeter marker is NOT the end — the guest prints it and
-    // then powers itself off, and we assert on that clean self-exit. AUTOTEST_CMDLINE_TOKEN
-    // drives the greeter's headless self-exit.
-    let result = boot(
+    let first_tokens = format!("{AUTOTEST_CMDLINE_TOKEN} {PERSIST_WRITE_CMDLINE_TOKEN}");
+    let first = boot(
         &qemu,
         &bzimage,
         &init_cpio,
         BootPlan {
-            disk: Some(&disk),
-            mem: "256",
+            disk: Some(BootDisk {
+                path: &volume,
+                read_only: false,
+            }),
+            mem: "512",
             target_marker: GREETER_MARKER,
             kill_on_marker: false,
-            extra_append: AUTOTEST_CMDLINE_TOKEN,
+            extra_append: &first_tokens,
             user_net: false,
         },
         runner.scratch_dir(),
     )?;
-    if !result.marker {
+    println!(
+        "   [qemu-boot-system] boot one elapsed: {:.2}s",
+        first.elapsed.as_secs_f64()
+    );
+    validate_system_boot(&first, PersistencePhase::Write, "first")?;
+    check_persistent_volume(&btrfs, &volume)?;
+
+    let second_tokens = format!("{AUTOTEST_CMDLINE_TOKEN} {PERSIST_READ_CMDLINE_TOKEN}");
+    let second = boot(
+        &qemu,
+        &bzimage,
+        &init_cpio,
+        BootPlan {
+            disk: Some(BootDisk {
+                path: &volume,
+                read_only: false,
+            }),
+            mem: "512",
+            target_marker: GREETER_MARKER,
+            kill_on_marker: false,
+            extra_append: &second_tokens,
+            user_net: false,
+        },
+        runner.scratch_dir(),
+    )?;
+    println!(
+        "   [qemu-boot-system] boot two elapsed: {:.2}s",
+        second.elapsed.as_secs_f64()
+    );
+    validate_system_boot(&second, PersistencePhase::Read, "second")?;
+    check_persistent_volume(&btrfs, &volume)?;
+
+    println!(
+        "PASS: system-x86-64 boots the SAME Btrfs volume twice under qemu (TCG) — each direct \
+         boot selects and kexecs the verified deployment, loop-mounts its EROFS root read-only \
+         ({SYSTEM_ROOT_RO_MARKER}), keeps /etc immutable ({SYSTEM_ETC_RO_MARKER}), mounts writable \
+         @var with target ownership ({SYSTEM_STATE_WRITABLE_MARKER}, {SYSTEM_STATE_OWNER_MARKER}), \
+         runs uutils ({UUTILS_RUNTIME_MARKER}), and unmounts state before exit \
+         ({SYSTEM_SHUTDOWN_MARKER}); boot two read the exact marker boot one synced below /var \
+         ({SYSTEM_PERSIST_WRITE_MARKER} -> {SYSTEM_PERSIST_READ_MARKER})"
+    );
+    Ok(())
+}
+
+enum PersistencePhase {
+    Write,
+    Read,
+}
+
+fn validate_system_boot(
+    result: &BootResult,
+    persistence: PersistencePhase,
+    ordinal: &str,
+) -> Result<(), String> {
+    if !result.evidence.target {
         return Err(format!(
-            "the two-stage boot did not reach the greeter {GREETER_MARKER:?} on ttyS0 — {} \
-             (stage-1 could not mount the erofs root over virtio-blk, switch_root failed, or the \
-             real-root init never reached an auto-login shell). Last serial output:\n{}",
+            "the {ordinal} persistent boot did not reach the greeter {GREETER_MARKER:?} on ttyS0 — {} \
+             (selection, kexec, Btrfs, loop setup, EROFS, switch_root, or login failed). \
+             Last serial output:\n{}",
             result.reason,
             tail(&result.console, 80)
         ));
     }
-    if !result.console.contains(SYSTEM_ROOT_RO_MARKER) {
+    validate_primary_selection(result, &format!("{ordinal} persistent boot"))?;
+    if !result.evidence.root_read_only {
         return Err(format!(
             "the greeter was reached but /etc/rootcheck did not confirm a READ-ONLY erofs root \
              ({SYSTEM_ROOT_RO_MARKER:?} absent from /proc/mounts) — `/` is not a read-only erofs mount \
@@ -330,7 +420,7 @@ pub(crate) fn run_system(runner: &RecipeCheckRunner) -> Result<(), String> {
             tail(&result.console, 80)
         ));
     }
-    if !result.console.contains(SYSTEM_ETC_RO_MARKER) {
+    if !result.evidence.etc_read_only {
         return Err(format!(
             "the greeter was reached but /etc/rootcheck did not confirm immutable deployment config \
              ({SYSTEM_ETC_RO_MARKER:?} absent) — root could write below /etc or the check did not run. \
@@ -338,16 +428,26 @@ pub(crate) fn run_system(runner: &RecipeCheckRunner) -> Result<(), String> {
             tail(&result.console, 80)
         ));
     }
-    if !result.console.contains(SYSTEM_STATE_WRITABLE_MARKER) {
+    if !result.evidence.state_writable {
         return Err(format!(
             "the greeter was reached but /etc/rootcheck did not confirm writable state \
-             ({SYSTEM_STATE_WRITABLE_MARKER:?} absent) — /var, /run, or /tmp is not a tmpfs mount, \
+             ({SYSTEM_STATE_WRITABLE_MARKER:?} absent) — /var is not Btrfs, /run or /tmp is not tmpfs, \
              a state path rejected its write probe, or /home and /root do not point into /var. \
              A configured home ownership change may also have failed. Last serial output:\n{}",
             tail(&result.console, 80)
         ));
     }
-    if !result.console.contains(UUTILS_RUNTIME_MARKER) {
+    // The shipped system deliberately autologins an unprivileged user; keep that
+    // target-ownership guarantee part of the distribution oracle.
+    if !result.evidence.state_owner {
+        return Err(format!(
+            "the greeter was reached but the unprivileged ownership check failed \
+             ({SYSTEM_STATE_OWNER_MARKER:?} absent) — the login user could write /var or \
+             /var/root, or could not write its own home. Last serial output:\n{}",
+            tail(&result.console, 80)
+        ));
+    }
+    if !result.evidence.uutils_runtime {
         return Err(format!(
             "the greeter was reached and root checks passed, but the uutils runtime marker \
              ({UUTILS_RUNTIME_MARKER:?}) was absent — running a uutils applet (`/bin/cat`) by \
@@ -358,7 +458,7 @@ pub(crate) fn run_system(runner: &RecipeCheckRunner) -> Result<(), String> {
             tail(&result.console, 80)
         ));
     }
-    if !result.console.contains(SSHD_MARKER) {
+    if !result.evidence.sshd {
         return Err(format!(
             "the greeter was reached and root/uutils checks passed, but the sshd runtime marker \
              ({SSHD_MARKER:?}) was absent — `/bin/sshd selftest` did not complete a loopback SSH \
@@ -368,6 +468,19 @@ pub(crate) fn run_system(runner: &RecipeCheckRunner) -> Result<(), String> {
             tail(&result.console, 80)
         ));
     }
+    let (persistence_marker, persistence_seen) = match persistence {
+        PersistencePhase::Write => (SYSTEM_PERSIST_WRITE_MARKER, result.evidence.persist_write),
+        PersistencePhase::Read => (SYSTEM_PERSIST_READ_MARKER, result.evidence.persist_read),
+    };
+    if !persistence_seen {
+        return Err(format!(
+            "the {ordinal} boot reached the greeter but did not emit the persistence marker \
+             {persistence_marker:?}; boot one must write+sync it and boot two must read the same \
+             bytes from the reused @var subvolume. Last serial output:\n{}",
+            tail(&result.console, 80)
+        ));
+    }
+    validate_persistent_shutdown(result, &format!("{ordinal} persistent boot"))?;
     // A kernel panic under `panic=-1` reboots and, with `-no-reboot`, exits qemu 0 — the
     // SAME exit code as a clean guest power-off. So `exited_clean` alone cannot tell a
     // genuine "exit powers off" from a panic AFTER the markers were printed (the root
@@ -375,7 +488,7 @@ pub(crate) fn run_system(runner: &RecipeCheckRunner) -> Result<(), String> {
     // so such a boot reds instead of false-passing as a clean shutdown (re #550, subagent
     // review). "Kernel panic" is the leading fragment of the kernel's "Kernel panic - not
     // syncing:" banner.
-    if result.console.contains("Kernel panic") {
+    if result.evidence.kernel_panic {
         return Err(format!(
             "the markers were printed but the kernel PANICKED rather than powering off cleanly — \
              under `panic=-1` a panic also exits qemu 0, so this would otherwise masquerade as a \
@@ -387,20 +500,35 @@ pub(crate) fn run_system(runner: &RecipeCheckRunner) -> Result<(), String> {
         return Err(format!(
             "the greeter was reached and the root checks passed, but the VM did not power off cleanly \
              on the autotest `exit` — {} (the `exit`-powers-off path regressed: getty/login did not \
-             return 0, or `reboot -f` did not fire). Last serial output:\n{}",
+             return 0, or init-mediated reboot did not fire). Last serial output:\n{}",
             result.reason,
             tail(&result.console, 80)
         ));
     }
-    println!(
-        "PASS: system-x86-64 boots TWO-STAGE under qemu (TCG) — stage-1 mounts the td-written erofs root \
-         read-only over virtio-blk, switch_root enters it, and the real-root init reaches the greeter \
-         ({GREETER_MARKER}); `/` is a read-only erofs mount ({SYSTEM_ROOT_RO_MARKER}), `/etc` remains \
-         immutable ({SYSTEM_ETC_RO_MARKER}), `/var`-backed state is writable \
-         ({SYSTEM_STATE_WRITABLE_MARKER}), a uutils applet runs from the erofs closure \
-         ({UUTILS_RUNTIME_MARKER}), the source-built sshd completes a loopback SSH round-trip \
-         ({SSHD_MARKER}), and `exit` powers the VM off cleanly"
-    );
+    Ok(())
+}
+
+fn validate_primary_selection(result: &BootResult, context: &str) -> Result<(), String> {
+    if result.evidence.current_rejected {
+        return Err(format!(
+            "the {context} reached userspace only after td-boot rejected the current \
+             deployment and fell back to previous — the primary selector path is broken. \
+             Last serial output:\n{}",
+            tail(&result.console, 80)
+        ));
+    }
+    Ok(())
+}
+
+fn validate_persistent_shutdown(result: &BootResult, context: &str) -> Result<(), String> {
+    if !result.evidence.shutdown {
+        return Err(format!(
+            "the {context} reached its userspace markers but BusyBox init did not complete \
+             the persistent shutdown action ({SYSTEM_SHUTDOWN_MARKER:?} absent) — @var was \
+             not synced and unmounted before reboot. Last serial output:\n{}",
+            tail(&result.console, 80)
+        ));
+    }
     Ok(())
 }
 
@@ -417,10 +545,10 @@ pub(crate) fn run_system(runner: &RecipeCheckRunner) -> Result<(), String> {
 /// daily host-free sandbox has neither of.
 pub(crate) fn run_net(runner: &RecipeCheckRunner) -> Result<(), String> {
     let qemu = find_qemu()?;
-    let (bzimage, init_cpio, disk) = build_system(runner)?;
+    let (bzimage, init_cpio, disk, btrfs) = build_persistent_system(runner)?;
 
     println!(
-        "   [qemu-boot-net] {qemu} boots the recipe-built deployment under TCG with a user-mode NIC; /etc/netup DHCP-configures the link, then td-netd resolves + reaches {}:{}\n              kernel:     {}\n              initramfs:  {}\n              erofs root: {}",
+        "   [qemu-boot-net] {qemu} boots the recipe-built deployment under TCG with a user-mode NIC; /etc/netup DHCP-configures the link, then td-netd resolves + reaches {}:{}\n              kernel:        {}\n              initramfs:     {}\n              Btrfs volume:  {}",
         td_recipe::ladder::NETTEST_DEFAULT_HOST,
         td_recipe::ladder::NETTEST_DEFAULT_PORT,
         bzimage.display(),
@@ -439,8 +567,11 @@ pub(crate) fn run_net(runner: &RecipeCheckRunner) -> Result<(), String> {
         &bzimage,
         &init_cpio,
         BootPlan {
-            disk: Some(&disk),
-            mem: "256",
+            disk: Some(BootDisk {
+                path: &disk,
+                read_only: false,
+            }),
+            mem: "512",
             target_marker: GREETER_MARKER,
             kill_on_marker: false,
             extra_append: &tokens,
@@ -448,10 +579,14 @@ pub(crate) fn run_net(runner: &RecipeCheckRunner) -> Result<(), String> {
         },
         runner.scratch_dir(),
     )?;
+    println!(
+        "   [qemu-boot-net] elapsed: {:.2}s",
+        result.elapsed.as_secs_f64()
+    );
 
-    if !result.marker {
+    if !result.evidence.target {
         return Err(format!(
-            "the two-stage boot did not reach the greeter {GREETER_MARKER:?} on ttyS0 — {} \
+            "the selector/kexec boot did not reach the greeter {GREETER_MARKER:?} on ttyS0 — {} \
              (the network self-test runs at sysinit BEFORE the greeter, so a boot that never \
              reached the greeter likely failed earlier — unrelated to networking). Last serial \
              output:\n{}",
@@ -459,7 +594,8 @@ pub(crate) fn run_net(runner: &RecipeCheckRunner) -> Result<(), String> {
             tail(&result.console, 80)
         ));
     }
-    if !result.console.contains(SYSTEM_NET_UP_MARKER) {
+    validate_primary_selection(&result, "network boot")?;
+    if !result.evidence.net_up {
         return Err(format!(
             "the boot reached the greeter but td-netd did not bring the link up \
              ({SYSTEM_NET_UP_MARKER:?} absent) — the VIRTIO_NET NIC did not appear, autodetect \
@@ -468,7 +604,7 @@ pub(crate) fn run_net(runner: &RecipeCheckRunner) -> Result<(), String> {
             tail(&result.console, 80)
         ));
     }
-    if !result.console.contains(SYSTEM_NET_RESOLVE_MARKER) {
+    if !result.evidence.net_resolve {
         return Err(format!(
             "the link came up but td-netd could not RESOLVE the test host \
              ({SYSTEM_NET_RESOLVE_MARKER:?} absent) — its DNS client got no A record from the \
@@ -477,7 +613,7 @@ pub(crate) fn run_net(runner: &RecipeCheckRunner) -> Result<(), String> {
             tail(&result.console, 80)
         ));
     }
-    if !result.console.contains(SYSTEM_NET_REACH_MARKER) {
+    if !result.evidence.net_reach {
         return Err(format!(
             "resolve succeeded but td-netd could not REACH the host \
              ({SYSTEM_NET_REACH_MARKER:?} absent) — the TCP connect to the resolved address \
@@ -486,7 +622,7 @@ pub(crate) fn run_net(runner: &RecipeCheckRunner) -> Result<(), String> {
             tail(&result.console, 80)
         ));
     }
-    if result.console.contains("Kernel panic") {
+    if result.evidence.kernel_panic {
         return Err(format!(
             "the net markers were printed but the kernel PANICKED rather than powering off cleanly — \
              under `panic=-1` a panic also exits qemu 0, so this would otherwise masquerade as a \
@@ -502,6 +638,8 @@ pub(crate) fn run_net(runner: &RecipeCheckRunner) -> Result<(), String> {
             tail(&result.console, 80)
         ));
     }
+    validate_persistent_shutdown(&result, "network boot")?;
+    check_persistent_volume(&btrfs, &disk)?;
     println!(
         "PASS: system-x86-64 brings the network up under qemu user-net — td-netd DHCP-configures the \
          virtio-net link ({SYSTEM_NET_UP_MARKER}), resolves the test host with its own DNS client \
@@ -550,12 +688,12 @@ pub(crate) fn run_kexec(runner: &RecipeCheckRunner) -> Result<(), String> {
         },
         runner.scratch_dir(),
     )?;
-    if !result.marker {
+    if !result.evidence.target {
         // STAGE2 absent — use STAGE1's presence to point at which half regressed.
         // STAGE1 present isolates the kexec itself; STAGE1 absent USUALLY means the
         // outer kernel/init never ran, but STAGE1 can also have scrolled out of the
         // bounded tail ahead of the failure, so that branch is hedged, not asserted.
-        let detail = if result.console.contains(KEXEC_STAGE1_MARKER) {
+        let detail = if result.evidence.kexec_stage1 {
             "stage-1 ran (STAGE1 seen) but td-kexec's kexec_file_load(2)/reboot(KEXEC) did \
              not reach stage-2 — the kexec itself failed, or the inner kernel/initramfs did not boot"
         } else {
@@ -572,7 +710,7 @@ pub(crate) fn run_kexec(runner: &RecipeCheckRunner) -> Result<(), String> {
     }
     // STAGE2 present ⇒ the kexec worked; STAGE1 necessarily preceded it (its absence from
     // the bounded buffer is not a failure). Note whether it was still visible, for context.
-    let stage1 = if result.console.contains(KEXEC_STAGE1_MARKER) {
+    let stage1 = if result.evidence.kexec_stage1 {
         KEXEC_STAGE1_MARKER
     } else {
         "STAGE1 (scrolled out of the console tail)"
@@ -622,59 +760,79 @@ fn build_spike(runner: &RecipeCheckRunner) -> Result<(PathBuf, PathBuf), String>
     Ok((bzimage, initramfs))
 }
 
-/// Validate a deployment manifest and return its three payload paths. The
-/// parser is deliberately strict: one version header, the canonical payload
-/// order, lowercase SHA-256, exactly two separating spaces, and no extra lines.
-/// Hashing again at consumption catches stale, truncated, or tampered staging
-/// before qemu sees any artifact.
-pub(crate) fn verify_deployment(
-    deployment: &Path,
-) -> Result<(PathBuf, PathBuf, PathBuf), String> {
-    // This byte-sorted order is part of the v1 wire format: the producer sorts
-    // labels before writing, and the strict consumer rejects non-canonical order.
-    const CANONICAL_NAMES: [&str; 3] = ["bzImage", "initramfs.cpio", "root.erofs"];
-    let manifest_path = deployment.join("manifest");
-    let manifest = fs::read_to_string(&manifest_path)
-        .map_err(|e| format!("read deployment manifest {}: {e}", manifest_path.display()))?;
+fn parse_host_manifest(
+    manifest_path: &Path,
+    kind: &str,
+    canonical_names: &[&str],
+) -> Result<Vec<String>, String> {
+    let manifest = fs::read_to_string(manifest_path)
+        .map_err(|e| format!("read {kind} manifest {}: {e}", manifest_path.display()))?;
     if !manifest.ends_with('\n') {
         return Err(format!(
-            "deployment manifest {} has no final newline",
+            "{kind} manifest {} has no final newline",
             manifest_path.display()
         ));
     }
     let mut lines = manifest.lines();
     if lines.next() != Some("td-deployment-v1") {
         return Err(format!(
-            "deployment manifest {} has an unsupported or missing version header",
+            "{kind} manifest {} has an unsupported or missing version header",
             manifest_path.display()
         ));
     }
 
-    let mut paths = Vec::with_capacity(CANONICAL_NAMES.len());
-    for name in CANONICAL_NAMES {
+    let mut digests = Vec::with_capacity(canonical_names.len());
+    for name in canonical_names {
         let line = lines.next().ok_or_else(|| {
             format!(
-                "deployment manifest {} is missing the {name} entry",
+                "{kind} manifest {} is missing the {name} entry",
                 manifest_path.display()
             )
         })?;
         let (digest, label) = line.split_once("  ").ok_or_else(|| {
             format!(
-                "deployment manifest {} has a malformed {name} entry",
+                "{kind} manifest {} has a malformed {name} entry",
                 manifest_path.display()
             )
         })?;
-        if label != name
-            || digest.len() != 64
-            || !digest
-                .bytes()
-                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-        {
+        if label != *name || !valid_manifest_digest(digest) {
             return Err(format!(
-                "deployment manifest {} has a non-canonical {name} entry",
+                "{kind} manifest {} has a non-canonical {name} entry",
                 manifest_path.display()
             ));
         }
+        digests.push(digest.to_string());
+    }
+    if lines.next().is_some() {
+        return Err(format!(
+            "{kind} manifest {} has unexpected extra entries",
+            manifest_path.display()
+        ));
+    }
+    Ok(digests)
+}
+
+fn valid_manifest_digest(digest: &str) -> bool {
+    digest.len() == 64
+        && digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+/// Validate a deployment manifest and return its three payload paths. The
+/// parser is deliberately strict: one version header, the canonical payload
+/// order, lowercase SHA-256, exactly two separating spaces, and no extra lines.
+/// Hashing again at consumption catches stale, truncated, or tampered staging
+/// before qemu sees any artifact.
+pub(crate) fn verify_deployment(deployment: &Path) -> Result<(PathBuf, PathBuf, PathBuf), String> {
+    // This byte-sorted order is part of the v1 wire format: the producer sorts
+    // labels before writing, and the strict consumer rejects non-canonical order.
+    const CANONICAL_NAMES: [&str; 3] = ["bzImage", "initramfs.cpio", "root.erofs"];
+    let manifest_path = deployment.join("manifest");
+    let digests = parse_host_manifest(&manifest_path, "deployment", &CANONICAL_NAMES)?;
+
+    let mut paths = Vec::with_capacity(CANONICAL_NAMES.len());
+    for (name, digest) in CANONICAL_NAMES.into_iter().zip(digests) {
         let path = deployment.join(name);
         if !path.is_file() {
             return Err(format!(
@@ -691,12 +849,6 @@ pub(crate) fn verify_deployment(
         }
         paths.push(path);
     }
-    if lines.next().is_some() {
-        return Err(format!(
-            "deployment manifest {} has unexpected extra entries",
-            manifest_path.display()
-        ));
-    }
     let mut paths = paths.into_iter();
     let bzimage = paths
         .next()
@@ -710,13 +862,208 @@ pub(crate) fn verify_deployment(
     Ok((bzimage, initramfs, root))
 }
 
-/// Build `system-x86-64` in one plan and return its verified deployment
-/// `(bzImage, initramfs.cpio, root.erofs)`.
+/// Verify the direct-boot selector before handing its privileged td-boot/td-kexec
+/// contents to qemu.
+pub(crate) fn verify_selector(boot: &Path) -> Result<PathBuf, String> {
+    const NAME: &str = "selector-initramfs.cpio";
+    let manifest_path = boot.join("manifest");
+    let digest = parse_host_manifest(&manifest_path, "selector", &[NAME])?
+        .into_iter()
+        .next()
+        .ok_or_else(|| "internal: verified selector manifest lost its digest".to_string())?;
+    let selector = boot.join(NAME);
+    if !selector.is_file() {
+        return Err(format!(
+            "system-x86-64 selector is missing {NAME} ({})",
+            selector.display()
+        ));
+    }
+    let actual = crate::sha256::sha256_file(&selector)
+        .map_err(|e| format!("hash selector payload {}: {e}", selector.display()))?;
+    if actual != digest {
+        return Err(format!(
+            "system-x86-64 selector hash mismatch: manifest has {digest}, payload has {actual}"
+        ));
+    }
+    Ok(selector)
+}
+
+/// Build `system-x86-64` and return the direct-boot kernel, selector initramfs,
+/// and verified deployment directory.
 fn build_system(runner: &RecipeCheckRunner) -> Result<(PathBuf, PathBuf, PathBuf), String> {
     runner.prepare_recipe_target("system-x86-64")?;
     let build_out = runner.build_plan("system-x86-64")?;
     let system_tree = runner.ladder_out_from(&build_out, "system-x86-64")?;
-    verify_deployment(&system_tree.join("deployment"))
+    let deployment = system_tree.join("deployment");
+    let (bzimage, _, _) = verify_deployment(&deployment)?;
+    let selector = verify_selector(&system_tree.join("boot"))?;
+    Ok((bzimage, selector, deployment))
+}
+
+fn build_persistent_system(
+    runner: &RecipeCheckRunner,
+) -> Result<(PathBuf, PathBuf, PathBuf, PathBuf), String> {
+    let (bzimage, initramfs, deployment) = build_system(runner)?;
+    let (mkfs, btrfs) = build_btrfs_tools(runner)?;
+    let volume = runner.scratch_dir().join("system-volume.btrfs");
+    create_persistent_volume(&deployment, &mkfs, &btrfs, &volume)?;
+    Ok((bzimage, initramfs, volume, btrfs))
+}
+
+pub(crate) fn build_btrfs_tools(runner: &RecipeCheckRunner) -> Result<(PathBuf, PathBuf), String> {
+    runner.prepare_recipe_target("btrfs-progs-x86-64")?;
+    let build_out = runner.build_plan("btrfs-progs-x86-64")?;
+    let tree = runner.ladder_out_from(&build_out, "btrfs-progs-x86-64")?;
+    let mkfs = tree.join("bin/mkfs.btrfs");
+    let btrfs = tree.join("bin/btrfs");
+    for (label, path) in [("mkfs.btrfs", &mkfs), ("btrfs", &btrfs)] {
+        if !is_executable(path) {
+            return Err(format!(
+                "btrfs-progs-x86-64 output is missing executable {label} ({})",
+                path.display()
+            ));
+        }
+    }
+    Ok((mkfs, btrfs))
+}
+
+/// Build one writable Btrfs image containing a content-addressed deployment and
+/// an empty @var subvolume. This is a disposable host-side test fixture; PID 1
+/// normalizes @var ownership and modes before exposing it to userspace. The
+/// deployment tree's host ownership is inert on its read-only guest mount.
+pub(crate) fn create_persistent_volume(
+    deployment: &Path,
+    mkfs: &Path,
+    btrfs: &Path,
+    output: &Path,
+) -> Result<(), String> {
+    let manifest = deployment.join("manifest");
+    let deployment_id = crate::sha256::sha256_file(&manifest)
+        .map_err(|e| format!("hash deployment manifest {}: {e}", manifest.display()))?;
+    let mut payload_bytes = 0u64;
+    for name in ["manifest", "bzImage", "initramfs.cpio", "root.erofs"] {
+        let path = deployment.join(name);
+        let bytes = fs::metadata(&path)
+            .map_err(|e| format!("stat persistent fixture payload {}: {e}", path.display()))?
+            .len();
+        payload_bytes = payload_bytes
+            .checked_add(bytes)
+            .ok_or_else(|| "persistent fixture payload size overflow".to_string())?;
+    }
+    let payload_limit = PERSISTENT_VOLUME_BYTES.saturating_sub(PERSISTENT_VOLUME_HEADROOM);
+    if payload_bytes > payload_limit {
+        return Err(format!(
+            "persistent fixture deployment is {payload_bytes} bytes, exceeding the \
+             {payload_limit}-byte payload limit for the {PERSISTENT_VOLUME_BYTES}-byte volume"
+        ));
+    }
+    let parent = output.parent().ok_or_else(|| {
+        format!(
+            "persistent volume output has no parent: {}",
+            output.display()
+        )
+    })?;
+    let seed = parent.join("persistent-volume-seed");
+    match fs::remove_dir_all(&seed) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(format!("remove stale seed {}: {error}", seed.display())),
+    }
+    match fs::remove_file(output) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(format!("remove stale volume {}: {error}", output.display())),
+    }
+    let _seed_cleanup = Scratch { dir: seed.clone() };
+
+    populate_persistent_seed(deployment, &seed, &deployment_id)?;
+
+    // mkfs.btrfs grows this regular-file target to --byte-count; creating it
+    // first keeps path and permission failures in this control plane.
+    File::create(output)
+        .map_err(|e| format!("create persistent volume {}: {e}", output.display()))?;
+    static UUID_SEQ: AtomicU64 = AtomicU64::new(0);
+    let sequence = UUID_SEQ.fetch_add(1, Ordering::Relaxed) & 0xffff;
+    let fixture_id = (u64::from(std::process::id()) << 16) | sequence;
+    let fixture_uuid = format!("12345678-1234-4234-8234-{fixture_id:012x}");
+    let status = Command::new(mkfs)
+        .args(["--rootdir"])
+        .arg(&seed)
+        .args(["--subvol", "rw:@var", "--byte-count"])
+        .arg(PERSISTENT_VOLUME_BYTES.to_string())
+        .args(["--uuid", &fixture_uuid, "--label", "td-system"])
+        .arg(output)
+        .status()
+        .map_err(|e| format!("spawn {}: {e}", mkfs.display()))?;
+    if !status.success() {
+        return Err(format!(
+            "{} failed ({status}) creating {}",
+            mkfs.display(),
+            output.display()
+        ));
+    }
+    fs::remove_dir_all(&seed)
+        .map_err(|e| format!("remove populated seed {}: {e}", seed.display()))?;
+    check_persistent_volume(btrfs, output)
+}
+
+fn populate_persistent_seed(
+    deployment: &Path,
+    seed: &Path,
+    deployment_id: &str,
+) -> Result<(), String> {
+    let installed = seed
+        .join(td_boot_protocol::DEPLOYMENTS_DIR)
+        .join(deployment_id);
+    fs::create_dir_all(&installed)
+        .map_err(|e| format!("create deployment dir {}: {e}", installed.display()))?;
+    fs::create_dir_all(seed.join(td_boot_protocol::BOOT_DIR))
+        .map_err(|e| format!("create boot selector dir: {e}"))?;
+    fs::create_dir_all(seed.join("@var")).map_err(|e| format!("create @var seed dir: {e}"))?;
+    for name in ["bzImage", "initramfs.cpio", "root.erofs", "manifest"] {
+        let source = deployment.join(name);
+        let target = installed.join(name);
+        link_or_copy(&source, &target)?;
+    }
+    for slot in ["current", "previous"] {
+        let link = seed.join(td_boot_protocol::BOOT_DIR).join(slot);
+        symlink(
+            format!("{}{deployment_id}", td_boot_protocol::SELECTOR_PREFIX),
+            &link,
+        )
+        .map_err(|e| format!("create {} selector {}: {e}", slot, link.display()))?;
+    }
+    Ok(())
+}
+
+fn link_or_copy(source: &Path, target: &Path) -> Result<(), String> {
+    if fs::hard_link(source, target).is_ok() {
+        return Ok(());
+    }
+    fs::copy(source, target).map_err(|e| {
+        format!(
+            "stage deployment payload {} -> {}: {e}",
+            source.display(),
+            target.display()
+        )
+    })?;
+    Ok(())
+}
+
+pub(crate) fn check_persistent_volume(btrfs: &Path, output: &Path) -> Result<(), String> {
+    let status = Command::new(btrfs)
+        .args(["check", "--readonly", "--check-data-csum"])
+        .arg(output)
+        .status()
+        .map_err(|e| format!("spawn {} check: {e}", btrfs.display()))?;
+    if !status.success() {
+        return Err(format!(
+            "{} check failed ({status}) for {}",
+            btrfs.display(),
+            output.display()
+        ));
+    }
+    Ok(())
 }
 
 /// Build a tiny probe erofs image with the control-plane `td-builder mkfs-erofs`
@@ -813,13 +1160,17 @@ fn parse_timeout(raw: Option<String>) -> Duration {
 /// boot, the erofs-probe boot, and the two-stage system boot. Grouped into one struct so
 /// `boot` keeps a small, self-documenting signature: named fields at the call site
 /// (`kill_on_marker: false`) beat positional bools/strings.
+struct BootDisk<'a> {
+    path: &'a Path,
+    read_only: bool,
+}
+
 struct BootPlan<'a> {
-    /// A read-only erofs image to attach over virtio-blk (/dev/vda in the guest), or
-    /// `None` for a diskless boot.
-    disk: Option<&'a Path>,
-    /// Guest RAM in MiB (qemu `-m`). The single-kernel boots use "256"; the kexec spike
-    /// needs more so the outer kernel + outer initramfs AND the kexec-loaded inner
-    /// kernel + inner initramfs all fit at the instant reboot(KEXEC) jumps.
+    /// A raw image to attach over virtio-blk (/dev/vda), or none for diskless.
+    /// Probe EROFS images are read-only; system volumes allow @var writes.
+    disk: Option<BootDisk<'a>>,
+    /// Guest RAM in MiB (qemu `-m`). Diskless/probe boots use "256"; selector and
+    /// kexec boots use "512" so both kernels and initramfses fit at the handoff.
     mem: &'a str,
     /// The ttyS0 line whose appearance means the boot reached its target state; lets the
     /// boot modes key on different lines (userland vs. read-only-erofs vs. greeter).
@@ -864,8 +1215,11 @@ fn boot(
     let _scratch = Scratch { dir: dir.clone() };
     let console_path = dir.join("console.log");
     let diag_path = dir.join("diag.log");
-    let diag = File::create(&diag_path).map_err(|e| format!("create {}: {e}", diag_path.display()))?;
-    let diag_err = diag.try_clone().map_err(|e| format!("clone diag fd: {e}"))?;
+    let diag =
+        File::create(&diag_path).map_err(|e| format!("create {}: {e}", diag_path.display()))?;
+    let diag_err = diag
+        .try_clone()
+        .map_err(|e| format!("clone diag fd: {e}"))?;
 
     // -M pc + TCG: no KVM needed (the sandbox denies /dev/kvm and the host may not
     //   expose it either; TCG always works and a tiny kernel boots fast).
@@ -876,7 +1230,7 @@ fn boot(
     // else `-nic none`) — qemu's default is an implicit user-mode NIC, so every mode
     // sets one explicitly.
     // -no-user-config: ignore the host's qemu config files for a hermetic run.
-    // -no-reboot: the busybox /init issues `reboot -f`; qemu exits on the guest
+    // -no-reboot: BusyBox init ultimately issues reboot(2); qemu exits on the guest
     //   reset instead of looping, so a healthy boot terminates on its own.
     // console=ttyS0: kernel printk + the /init echo land on the 8250 UART.
     // panic=-1: on a kernel panic, reboot immediately (=> qemu exits) rather than
@@ -922,14 +1276,13 @@ fn boot(
         // -nic none: hermetic, offline; qemu's default is a user-mode NIC, so disable it.
         cmd.args(["-nic", "none"]);
     }
-    // Optional read-only erofs disk (re #549): if=none defines the backing store and
-    // a separate virtio-blk-pci -device attaches it as /dev/vda in the guest.
-    // readonly=on matches the immutable erofs root and lets qemu refuse any write.
+    // Optional raw disk: if=none defines the backing store and a separate
+    // virtio-blk-pci device attaches it as /dev/vda.
     // drive_arg comma-doubles the image path so a scratch dir with a literal comma in
     // its path can't be misparsed as an extra -drive key=value pair.
     if let Some(disk) = plan.disk {
-        cmd.arg("-drive").arg(drive_arg(disk));
-        cmd.args(["-device", "virtio-blk-pci,drive=erofs0"]);
+        cmd.arg("-drive").arg(drive_arg(disk.path, disk.read_only));
+        cmd.args(["-device", "virtio-blk-pci,drive=disk0"]);
     }
     let mut child = cmd
         .stdin(Stdio::null())
@@ -943,11 +1296,26 @@ fn boot(
     let marker_bytes = plan.target_marker.as_bytes();
     let mut console_file: Option<File> = None;
     let mut buf: Vec<u8> = Vec::new();
-    let mut marker = false;
+    let mut evidence = ConsoleEvidence::default();
     let mut end;
     loop {
-        marker |= drain_console(&console_path, &mut console_file, &mut buf, marker_bytes);
-        if marker && plan.kill_on_marker {
+        if let Err(error) = drain_console(
+            &console_path,
+            &mut console_file,
+            &mut buf,
+            marker_bytes,
+            plan.kill_on_marker,
+            &mut evidence,
+        ) {
+            let _ = child.kill();
+            let _ = child.wait();
+            let console = String::from_utf8_lossy(&buf);
+            return Err(format!(
+                "{error}. Last serial output:\n{}",
+                tail(&console, 80)
+            ));
+        }
+        if evidence.target && plan.kill_on_marker {
             let _ = child.kill();
             let _ = child.wait();
             end = EndReason::MarkerSeen;
@@ -989,24 +1357,39 @@ fn boot(
         thread::sleep(POLL);
     }
 
-    // Whether qemu terminated on its OWN with a success status. Captured from the loop's
-    // terminating reason BEFORE the marker realignment below (which may relabel `end` to
-    // MarkerSeen for the reason string) so a clean self-exit is never erased: the
-    // qemu-boot-system guest prints its marker and THEN powers off, and that clean
-    // shutdown is the "exit powers off" proof. `matches!` on `&end` leaves `end` intact
-    // for the reason match below; the marker-killed modes never reach QemuExited, so this
-    // stays false for them.
-    let exited_clean = matches!(&end, EndReason::QemuExited(status) if status.success());
+    // Drain all final bytes qemu flushed before it was reaped. A marker-killed
+    // mode succeeds if its target appears here; persistent modes retain the exit,
+    // timeout, or flood reason because reaching the greeter is not their finish.
+    let target_before_final_drain = evidence.target;
+    let final_on_disk = fs::metadata(&console_path).map(|m| m.len()).unwrap_or(0)
+        + fs::metadata(&diag_path).map(|m| m.len()).unwrap_or(0);
+    let final_flooded = final_on_disk > MAX_CONSOLE_BYTES;
+    let final_drain_error = if final_flooded {
+        end = EndReason::Flooded(final_on_disk);
+        None
+    } else {
+        drain_console_to_eof(
+            &console_path,
+            &mut console_file,
+            &mut buf,
+            marker_bytes,
+            &mut evidence,
+        )
+        .err()
+    };
 
-    // Drain any final bytes qemu flushed before it was reaped (e.g. the marker
-    // line printed just before `reboot -f` made qemu exit). If the marker only
-    // shows up in this final flush, realign `end` so it agrees with `marker`.
-    if drain_console(&console_path, &mut console_file, &mut buf, marker_bytes) {
-        marker = true;
+    // Capture a clean self-exit after the final flood check but before a
+    // marker-only mode realigns its diagnostic end reason.
+    let exited_clean = matches!(&end, EndReason::QemuExited(status) if status.success());
+    if plan.kill_on_marker && !target_before_final_drain && evidence.target {
         end = EndReason::MarkerSeen;
     }
 
-    let mut console = String::from_utf8_lossy(&buf).into_owned();
+    let mut console = if final_flooded {
+        read_tail(&console_path, CAP).unwrap_or_else(|_| String::from_utf8_lossy(&buf).into_owned())
+    } else {
+        String::from_utf8_lossy(&buf).into_owned()
+    };
     if console.trim().is_empty() {
         // ttyS0 produced nothing — qemu likely failed before the guest ran; surface
         // its own diagnostics (bad args, missing accelerator, unreadable image),
@@ -1018,65 +1401,241 @@ fn boot(
         }
     }
 
-    let reason = match end {
+    let reason = format_end_reason(end, evidence.target);
+    if final_flooded {
+        return Err(format!(
+            "{reason}. Last serial output:\n{}",
+            tail(&console, 80)
+        ));
+    }
+    if let Some(error) = final_drain_error {
+        return Err(format!(
+            "{error}. Last serial output:\n{}",
+            tail(&console, 80)
+        ));
+    }
+    Ok(BootResult {
+        evidence,
+        exited_clean,
+        reason,
+        console,
+        elapsed: start.elapsed(),
+    })
+}
+
+fn format_end_reason(end: EndReason, target_seen: bool) -> String {
+    match end {
         EndReason::MarkerSeen => "the marker was seen".to_string(),
+        EndReason::QemuExited(status) if target_seen => {
+            format!("qemu exited on its own after the marker ({status})")
+        }
         EndReason::QemuExited(status) => {
             format!("qemu exited on its own before the marker ({status})")
+        }
+        EndReason::TimedOut(secs) if target_seen => {
+            format!("qemu did not finish within the {secs}s ceiling after the marker; it was killed")
         }
         EndReason::TimedOut(secs) => {
             format!("no marker within the {secs}s ceiling; qemu was killed")
         }
+        EndReason::Flooded(bytes) if target_seen => format!(
+            "console+diagnostic output flooded past the {MAX_CONSOLE_BYTES}-byte on-disk ceiling \
+             after the marker ({bytes} bytes across console.log + diag.log); qemu was killed"
+        ),
         EndReason::Flooded(bytes) => format!(
             "console+diagnostic output flooded past the {MAX_CONSOLE_BYTES}-byte on-disk ceiling \
-             ({bytes} bytes across console.log + diag.log) without reaching the marker; qemu was killed"
+             without reaching the marker ({bytes} bytes across console.log + diag.log); qemu was killed"
         ),
-    };
-    Ok(BootResult {
-        marker,
-        exited_clean,
-        reason,
-        console,
-    })
+    }
 }
 
 /// Read whatever new bytes are available on the console file into `buf`, opening
 /// it lazily (qemu creates it after spawn). Keeps only the last CAP bytes and
-/// returns whether the marker is now present. Bounded by DRAIN_BUDGET per call so
-/// a flooding guest can't starve the outer deadline check.
-fn drain_console(path: &Path, file: &mut Option<File>, buf: &mut Vec<u8>, marker: &[u8]) -> bool {
+/// latches protocol evidence before trimming so early boot markers remain
+/// authoritative. Bounded by DRAIN_BUDGET per call so a flooding guest can't
+/// starve the outer deadline check. Marker-killed modes may return on a newly
+/// seen target; persistent and final drains consume the whole available budget.
+enum DrainProgress {
+    Complete,
+    More,
+}
+
+fn drain_console(
+    path: &Path,
+    file: &mut Option<File>,
+    buf: &mut Vec<u8>,
+    marker: &[u8],
+    stop_on_new_target: bool,
+    evidence: &mut ConsoleEvidence,
+) -> Result<DrainProgress, String> {
     if file.is_none() {
-        *file = File::open(path).ok();
-    }
-    let mut found = false;
-    if let Some(f) = file.as_mut() {
-        let mut chunk = [0u8; 8192];
-        let mut drained = 0usize;
-        while drained < DRAIN_BUDGET {
-            match f.read(&mut chunk) {
-                Ok(0) => break,
-                Ok(n) => {
-                    if let Some(slice) = chunk.get(..n) {
-                        buf.extend_from_slice(slice);
-                        drained += n;
-                        if buf.len() > CAP {
-                            let drop = buf.len() - CAP;
-                            buf.drain(..drop);
-                        }
-                        if contains(buf, marker) {
-                            // Latch and stop: the caller kills qemu the moment this
-                            // returns true, so draining further bytes only wastes work
-                            // (and on a flooding-then-marker boot, could spin to
-                            // DRAIN_BUDGET before the outer loop reacts).
-                            found = true;
-                            break;
-                        }
-                    }
-                }
-                Err(_) => break,
+        match File::open(path) {
+            Ok(opened) => *file = Some(opened),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(DrainProgress::Complete);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {
+                return Ok(DrainProgress::More);
+            }
+            Err(error) => {
+                return Err(format!("open qemu console {}: {error}", path.display()));
             }
         }
     }
-    found
+    let target_was_seen = evidence.target;
+    let overlap = evidence_marker_max_len(marker).saturating_sub(1);
+    let Some(f) = file.as_mut() else {
+        return Ok(DrainProgress::Complete);
+    };
+    let mut chunk = [0u8; 8192];
+    let mut drained = 0usize;
+    while drained < DRAIN_BUDGET {
+        match f.read(&mut chunk) {
+            Ok(0) => return Ok(DrainProgress::Complete),
+            Ok(n) => {
+                if let Some(slice) = chunk.get(..n) {
+                    let prior_len = buf.len();
+                    buf.extend_from_slice(slice);
+                    drained += n;
+                    let scan_from = prior_len.saturating_sub(overlap);
+                    let scan = buf.get(scan_from..).unwrap_or(buf.as_slice());
+                    latch_console_evidence(evidence, scan, marker);
+                    if buf.len() > CAP {
+                        let drop = buf.len() - CAP;
+                        buf.drain(..drop);
+                    }
+                    if stop_on_new_target && !target_was_seen && evidence.target {
+                        // Return once when the target first appears so marker-killed
+                        // modes react immediately. Persistent modes resume draining
+                        // normally on the next poll.
+                        return Ok(DrainProgress::More);
+                    }
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {
+                return Ok(DrainProgress::More);
+            }
+            Err(error) => {
+                return Err(format!("read qemu console {}: {error}", path.display()));
+            }
+        }
+    }
+    Ok(DrainProgress::More)
+}
+
+fn drain_console_to_eof(
+    path: &Path,
+    file: &mut Option<File>,
+    buf: &mut Vec<u8>,
+    marker: &[u8],
+    evidence: &mut ConsoleEvidence,
+) -> Result<(), String> {
+    for _ in 0..FINAL_DRAIN_PASSES {
+        match drain_console(path, file, buf, marker, false, evidence)? {
+            DrainProgress::Complete => return Ok(()),
+            DrainProgress::More => {}
+        }
+    }
+    Err(format!(
+        "qemu console {} did not reach EOF within {FINAL_DRAIN_PASSES} bounded final-drain passes",
+        path.display()
+    ))
+}
+
+fn evidence_marker_max_len(target: &[u8]) -> usize {
+    [
+        target.len(),
+        td_boot_protocol::CURRENT_REJECTED_MARKER.len(),
+        SYSTEM_ROOT_RO_MARKER.len(),
+        SYSTEM_ETC_RO_MARKER.len(),
+        SYSTEM_STATE_WRITABLE_MARKER.len(),
+        SYSTEM_STATE_OWNER_MARKER.len(),
+        UUTILS_RUNTIME_MARKER.len(),
+        SSHD_MARKER.len(),
+        SYSTEM_PERSIST_WRITE_MARKER.len(),
+        SYSTEM_PERSIST_READ_MARKER.len(),
+        SYSTEM_SHUTDOWN_MARKER.len(),
+        SYSTEM_NET_UP_MARKER.len(),
+        SYSTEM_NET_RESOLVE_MARKER.len(),
+        SYSTEM_NET_REACH_MARKER.len(),
+        KEXEC_STAGE1_MARKER.len(),
+        "Kernel panic".len(),
+    ]
+    .into_iter()
+    .fold(0, usize::max)
+}
+
+fn latch_console_evidence(evidence: &mut ConsoleEvidence, buf: &[u8], target: &[u8]) {
+    latch_marker(&mut evidence.target, buf, target);
+    latch_marker(
+        &mut evidence.current_rejected,
+        buf,
+        td_boot_protocol::CURRENT_REJECTED_MARKER.as_bytes(),
+    );
+    latch_marker(
+        &mut evidence.root_read_only,
+        buf,
+        SYSTEM_ROOT_RO_MARKER.as_bytes(),
+    );
+    latch_marker(
+        &mut evidence.etc_read_only,
+        buf,
+        SYSTEM_ETC_RO_MARKER.as_bytes(),
+    );
+    latch_marker(
+        &mut evidence.state_writable,
+        buf,
+        SYSTEM_STATE_WRITABLE_MARKER.as_bytes(),
+    );
+    latch_marker(
+        &mut evidence.state_owner,
+        buf,
+        SYSTEM_STATE_OWNER_MARKER.as_bytes(),
+    );
+    latch_marker(
+        &mut evidence.uutils_runtime,
+        buf,
+        UUTILS_RUNTIME_MARKER.as_bytes(),
+    );
+    latch_marker(&mut evidence.sshd, buf, SSHD_MARKER.as_bytes());
+    latch_marker(
+        &mut evidence.persist_write,
+        buf,
+        SYSTEM_PERSIST_WRITE_MARKER.as_bytes(),
+    );
+    latch_marker(
+        &mut evidence.persist_read,
+        buf,
+        SYSTEM_PERSIST_READ_MARKER.as_bytes(),
+    );
+    latch_marker(
+        &mut evidence.shutdown,
+        buf,
+        SYSTEM_SHUTDOWN_MARKER.as_bytes(),
+    );
+    latch_marker(&mut evidence.net_up, buf, SYSTEM_NET_UP_MARKER.as_bytes());
+    latch_marker(
+        &mut evidence.net_resolve,
+        buf,
+        SYSTEM_NET_RESOLVE_MARKER.as_bytes(),
+    );
+    latch_marker(
+        &mut evidence.net_reach,
+        buf,
+        SYSTEM_NET_REACH_MARKER.as_bytes(),
+    );
+    latch_marker(
+        &mut evidence.kexec_stage1,
+        buf,
+        KEXEC_STAGE1_MARKER.as_bytes(),
+    );
+    latch_marker(&mut evidence.kernel_panic, buf, b"Kernel panic");
+}
+
+fn latch_marker(found: &mut bool, haystack: &[u8], marker: &[u8]) {
+    if !*found {
+        *found = contains(haystack, marker);
+    }
 }
 
 /// Byte-substring search — marker detection without a UTF-8 decode, so a non-UTF-8
@@ -1087,9 +1646,8 @@ fn contains(haystack: &[u8], needle: &[u8]) -> bool {
         && haystack.windows(needle.len()).any(|w| w == needle)
 }
 
-/// The `-drive` value attaching `disk` as a read-only raw backing store with the
-/// `erofs0` id the `virtio-blk-pci` -device references. `readonly=on` matches the
-/// immutable erofs root (qemu refuses guest writes); `if=none` keeps qemu from
+/// The `-drive` value attaching `disk` as a raw backing store with the `disk0`
+/// id the `virtio-blk-pci` device references. `if=none` keeps qemu from
 /// auto-attaching it to an implicit controller so only the explicit -device wires it.
 ///
 /// qemu splits `-drive`'s key=value pairs on commas, so a literal comma in the image
@@ -1098,9 +1656,13 @@ fn contains(haystack: &[u8], needle: &[u8]) -> bool {
 /// are doubled — the option-separator commas in the fixed prefix stay single. Built
 /// byte-wise off the raw path bytes and returned as an `OsString` so a non-UTF-8 path
 /// survives without a lossy round-trip. Shared with the interactive `run` tool
-/// (checks/run.rs), which attaches the same read-only erofs root over virtio-blk.
-pub(crate) fn drive_arg(disk: &Path) -> OsString {
-    let mut out = OsString::from("if=none,format=raw,readonly=on,id=erofs0,file=");
+/// (checks/run.rs), which attaches the same persistent volume over virtio-blk.
+pub(crate) fn drive_arg(disk: &Path, read_only: bool) -> OsString {
+    let mut out = OsString::from("if=none,format=raw,id=disk0");
+    if read_only {
+        out.push(",readonly=on");
+    }
+    out.push(",file=");
     let path_bytes = disk.as_os_str().as_bytes();
     let mut escaped: Vec<u8> = Vec::with_capacity(path_bytes.len());
     for &b in path_bytes {
@@ -1185,7 +1747,10 @@ mod tests {
 
     #[test]
     fn contains_matches_substrings_and_boundaries() {
-        assert!(contains(b"boot log: TD-USERLAND-OK done", MARKER.as_bytes()));
+        assert!(contains(
+            b"boot log: TD-USERLAND-OK done",
+            MARKER.as_bytes()
+        ));
         assert!(contains(b"abc", b"a")); // at the very start
         assert!(contains(b"abc", b"c")); // at the very end
         assert!(contains(b"abc", b"abc")); // full length
@@ -1207,16 +1772,18 @@ mod tests {
 
     #[test]
     fn drive_arg_is_readonly_raw_with_the_device_id() {
-        let arg = drive_arg(Path::new("/scratch/erofs-probe.img"));
+        let arg = drive_arg(Path::new("/scratch/erofs-probe.img"), true);
         let s = arg.to_string_lossy();
-        // The virtio-blk-pci -device references drive=erofs0, so the drive's id must match.
-        assert!(s.contains("id=erofs0"), "missing id: {s}");
+        assert!(s.contains("id=disk0"), "missing id: {s}");
         // Read-only + raw + the exact backing file, and if=none (no implicit controller).
         assert!(s.contains("readonly=on"), "not read-only: {s}");
         assert!(s.contains("format=raw"), "not raw: {s}");
         assert!(s.contains("if=none"), "not if=none: {s}");
         // A comma-free path is passed through verbatim after file=.
-        assert!(s.ends_with("file=/scratch/erofs-probe.img"), "wrong file: {s}");
+        assert!(
+            s.ends_with("file=/scratch/erofs-probe.img"),
+            "wrong file: {s}"
+        );
     }
 
     #[test]
@@ -1224,13 +1791,20 @@ mod tests {
         // A repo/scratch path containing a literal comma must not break -drive's
         // key=value parse: qemu wants such commas doubled. Only the PATH's commas are
         // doubled; the fixed option-separator commas in the prefix stay single.
-        let arg = drive_arg(Path::new("/sc,ratch/erofs,probe.img"));
+        let arg = drive_arg(Path::new("/sc,ratch/erofs,probe.img"), true);
         let s = arg.to_string_lossy();
         assert_eq!(
-            s,
-            "if=none,format=raw,readonly=on,id=erofs0,file=/sc,,ratch/erofs,,probe.img",
+            s, "if=none,format=raw,id=disk0,readonly=on,file=/sc,,ratch/erofs,,probe.img",
             "path commas not doubled (or prefix separators mangled): {s}"
         );
+    }
+
+    #[test]
+    fn persistent_drive_arg_allows_guest_writes() {
+        let arg = drive_arg(Path::new("/scratch/system.btrfs"), false);
+        let s = arg.to_string_lossy();
+        assert_eq!(s, "if=none,format=raw,id=disk0,file=/scratch/system.btrfs");
+        assert!(!s.contains("readonly"));
     }
 
     #[test]
@@ -1263,6 +1837,51 @@ mod tests {
     }
 
     #[test]
+    fn selector_manifest_verifies_payload_and_rejects_tampering() {
+        let seq = AtomicU64::new(2100);
+        let dir = create_scratch_dir(&env::temp_dir(), &seq).unwrap();
+        let _guard = Scratch { dir: dir.clone() };
+        let name = "selector-initramfs.cpio";
+        fs::write(dir.join(name), b"selector").unwrap();
+        let digest = crate::sha256::sha256_file(&dir.join(name)).unwrap();
+        fs::write(
+            dir.join("manifest"),
+            format!("td-deployment-v1\n{digest}  {name}\n"),
+        )
+        .unwrap();
+        assert_eq!(verify_selector(&dir).unwrap(), dir.join(name));
+
+        fs::write(dir.join(name), b"tampered").unwrap();
+        let error = verify_selector(&dir).unwrap_err();
+        assert!(error.contains("selector hash mismatch"), "{error}");
+    }
+
+    #[test]
+    fn persistent_seed_uses_the_td_boot_layout_contract() {
+        let seq = AtomicU64::new(2200);
+        let dir = create_scratch_dir(&env::temp_dir(), &seq).unwrap();
+        let _guard = Scratch { dir: dir.clone() };
+        let deployment = dir.join("deployment");
+        fs::create_dir(&deployment).unwrap();
+        for name in ["bzImage", "initramfs.cpio", "root.erofs", "manifest"] {
+            fs::write(deployment.join(name), name.as_bytes()).unwrap();
+        }
+        let id = "a".repeat(64);
+        let seed = dir.join("seed");
+        populate_persistent_seed(&deployment, &seed, &id).unwrap();
+
+        let installed = seed.join(td_boot_protocol::DEPLOYMENTS_DIR).join(&id);
+        assert_eq!(fs::read(installed.join("manifest")).unwrap(), b"manifest");
+        for slot in ["current", "previous"] {
+            assert_eq!(
+                fs::read_link(seed.join(td_boot_protocol::BOOT_DIR).join(slot)).unwrap(),
+                PathBuf::from(format!("{}{id}", td_boot_protocol::SELECTOR_PREFIX))
+            );
+        }
+        assert!(seed.join("@var").is_dir());
+    }
+
+    #[test]
     fn erofs_marker_is_distinct_from_the_userland_marker() {
         // Both boot modes must key on different lines: the plain check kills qemu on
         // MARKER (printed first), the erofs check waits for EROFS_MARKER (printed only
@@ -1276,23 +1895,51 @@ mod tests {
             b"...booted... TD-EROFS-RO-OK ...done",
             EROFS_MARKER.as_bytes()
         ));
-        assert!(!contains(b"only TD-USERLAND-OK here", EROFS_MARKER.as_bytes()));
+        assert!(!contains(
+            b"only TD-USERLAND-OK here",
+            EROFS_MARKER.as_bytes()
+        ));
     }
 
     #[test]
     fn system_boot_markers_are_distinct() {
-        let markers = std::collections::BTreeSet::from([
+        let markers = [
+            MARKER,
+            EROFS_MARKER,
+            td_boot_protocol::CURRENT_REJECTED_MARKER,
+            KEXEC_STAGE1_MARKER,
+            KEXEC_STAGE2_MARKER,
+            "Kernel panic",
             GREETER_MARKER,
             SYSTEM_ROOT_RO_MARKER,
             SYSTEM_ETC_RO_MARKER,
             SYSTEM_STATE_WRITABLE_MARKER,
+            SYSTEM_STATE_OWNER_MARKER,
+            SYSTEM_PERSIST_WRITE_MARKER,
+            SYSTEM_PERSIST_READ_MARKER,
+            SYSTEM_SHUTDOWN_MARKER,
             UUTILS_RUNTIME_MARKER,
             SYSTEM_NET_UP_MARKER,
             SYSTEM_NET_RESOLVE_MARKER,
             SYSTEM_NET_REACH_MARKER,
             SSHD_MARKER,
-        ]);
-        assert_eq!(markers.len(), 9, "each system/net/sshd assertion needs its own marker");
+        ];
+        let unique = std::collections::BTreeSet::from(markers);
+        assert_eq!(
+            unique.len(),
+            markers.len(),
+            "each boot assertion needs its own marker"
+        );
+        for (index, marker) in markers.iter().enumerate() {
+            for (other_index, other) in markers.iter().enumerate() {
+                if index != other_index {
+                    assert!(
+                        !marker.contains(other),
+                        "marker {marker:?} must not contain {other:?}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
@@ -1323,6 +1970,120 @@ mod tests {
         fs::write(&path, b"0123456789").unwrap();
         assert_eq!(read_tail(&path, 4).unwrap(), "6789"); // only the last cap bytes
         assert_eq!(read_tail(&path, 100).unwrap(), "0123456789"); // cap >= len → whole file
+    }
+
+    #[test]
+    fn drain_console_latches_protocol_evidence_before_tail_trim() {
+        let seq = AtomicU64::new(0);
+        let dir = create_scratch_dir(&env::temp_dir(), &seq).unwrap();
+        let _g = Scratch { dir: dir.clone() };
+        let path = dir.join("console.log");
+        let mut bytes = [
+            td_boot_protocol::CURRENT_REJECTED_MARKER,
+            SYSTEM_ROOT_RO_MARKER,
+            SYSTEM_ETC_RO_MARKER,
+            SYSTEM_STATE_WRITABLE_MARKER,
+            SYSTEM_STATE_OWNER_MARKER,
+            UUTILS_RUNTIME_MARKER,
+            SSHD_MARKER,
+            SYSTEM_PERSIST_WRITE_MARKER,
+            SYSTEM_PERSIST_READ_MARKER,
+            SYSTEM_SHUTDOWN_MARKER,
+            SYSTEM_NET_UP_MARKER,
+            SYSTEM_NET_RESOLVE_MARKER,
+            SYSTEM_NET_REACH_MARKER,
+            KEXEC_STAGE1_MARKER,
+            "Kernel panic",
+        ]
+        .join("\n")
+        .into_bytes();
+        bytes.resize(CAP + 8192, b'x');
+        fs::write(&path, bytes).unwrap();
+
+        let mut file = None;
+        let mut buffer = Vec::new();
+        let mut evidence = ConsoleEvidence::default();
+        drain_console(
+            &path,
+            &mut file,
+            &mut buffer,
+            b"target-never-appears",
+            false,
+            &mut evidence,
+        )
+        .unwrap();
+        assert!(!evidence.target);
+        assert!(evidence.current_rejected);
+        assert!(evidence.root_read_only);
+        assert!(evidence.etc_read_only);
+        assert!(evidence.state_writable);
+        assert!(evidence.state_owner);
+        assert!(evidence.uutils_runtime);
+        assert!(evidence.sshd);
+        assert!(evidence.persist_write);
+        assert!(evidence.persist_read);
+        assert!(evidence.shutdown);
+        assert!(evidence.net_up);
+        assert!(evidence.net_resolve);
+        assert!(evidence.net_reach);
+        assert!(evidence.kexec_stage1);
+        assert!(evidence.kernel_panic);
+        assert!(!contains(
+            &buffer,
+            td_boot_protocol::CURRENT_REJECTED_MARKER.as_bytes()
+        ));
+        assert!(!contains(&buffer, SSHD_MARKER.as_bytes()));
+    }
+
+    #[test]
+    fn drain_console_latches_a_target_split_across_read_chunks() {
+        let seq = AtomicU64::new(0);
+        let dir = create_scratch_dir(&env::temp_dir(), &seq).unwrap();
+        let _g = Scratch { dir: dir.clone() };
+        let path = dir.join("console.log");
+        let target = b"target-split-across-chunks";
+        let mut bytes = vec![b'x'; 8192 - 5];
+        bytes.extend_from_slice(target);
+        fs::write(&path, bytes).unwrap();
+
+        let mut file = None;
+        let mut buffer = Vec::new();
+        let mut evidence = ConsoleEvidence::default();
+        drain_console(&path, &mut file, &mut buffer, target, true, &mut evidence).unwrap();
+        assert!(evidence.target);
+    }
+
+    #[test]
+    fn full_drain_keeps_reading_protocol_evidence_after_the_target() {
+        let seq = AtomicU64::new(0);
+        let dir = create_scratch_dir(&env::temp_dir(), &seq).unwrap();
+        let _g = Scratch { dir: dir.clone() };
+        let path = dir.join("console.log");
+        let target = b"early-target";
+        let mut bytes = target.to_vec();
+        bytes.resize(DRAIN_BUDGET + 100, b'x');
+        bytes.extend_from_slice(b"Kernel panic");
+        fs::write(&path, bytes).unwrap();
+
+        let mut file = None;
+        let mut buffer = Vec::new();
+        let mut evidence = ConsoleEvidence::default();
+        drain_console_to_eof(&path, &mut file, &mut buffer, target, &mut evidence).unwrap();
+        assert!(evidence.target);
+        assert!(evidence.kernel_panic);
+    }
+
+    #[test]
+    fn end_reasons_distinguish_before_and_after_target() {
+        let before = format_end_reason(EndReason::TimedOut(17), false);
+        let after = format_end_reason(EndReason::TimedOut(17), true);
+        assert!(before.contains("no marker"));
+        assert!(after.contains("after the marker"));
+
+        let before = format_end_reason(EndReason::Flooded(42), false);
+        let after = format_end_reason(EndReason::Flooded(42), true);
+        assert!(before.contains("without reaching the marker"));
+        assert!(after.contains("after the marker"));
     }
 
     #[test]

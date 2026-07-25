@@ -117,9 +117,9 @@ pub const EROFS_PROBE_SENTINEL: &str = "td-erofs-probe.ok";
 pub const EROFS_PROBE_CONTENT: &str = "td-erofs-ro-readback-ok";
 
 // ── system-x86-64 two-stage boot markers (re #550) ──────────────────────────────
-// The distro's two-stage boot — a minimal init-initramfs mounts the read-only erofs
-// `/td/store` root over virtio-blk, mounts writable state below `/var`, and
-// `switch_root`s into it — proves itself on ttyS0 with lines the headless
+// The distro's persistent boot — the initramfs selects a deployment from Btrfs,
+// kexecs it, loop-mounts its read-only EROFS root, mounts persistent state below
+// `/var`, and `switch_root`s into it — proves itself on ttyS0 with lines the headless
 // `qemu-boot-system` oracle asserts on. They are SINGLE SOURCE OF TRUTH shared
 // by the recipe (`/etc/rootcheck`, `/etc/profile`) and the oracle so they never desync.
 
@@ -132,9 +132,24 @@ pub const SYSTEM_ROOT_RO_MARKER: &str = "TD-ROOT-EROFS-RO-OK";
 /// `/etc` remains on the immutable EROFS root.
 pub const SYSTEM_ETC_RO_MARKER: &str = "TD-ETC-EROFS-RO-OK";
 
-/// Printed by `/etc/rootcheck` once `/var`, `/run`, and `/tmp` are tmpfs mounts,
+/// Printed by `/etc/rootcheck` once `/var` is Btrfs, `/run` and `/tmp` are tmpfs,
 /// `/home` and `/root` point into `/var`, and every state path accepts a write probe.
 pub const SYSTEM_STATE_WRITABLE_MARKER: &str = "TD-STATE-WRITABLE-OK";
+
+/// Printed only after the unprivileged login user can write its own home but
+/// cannot write the persistent state root or root's home.
+pub const SYSTEM_STATE_OWNER_MARKER: &str = "TD-STATE-OWNER-OK";
+
+/// Printed after the first persistence-oracle boot writes and syncs its marker below
+/// `/var`. The second boot uses the same Btrfs volume and must read the exact bytes back.
+pub const SYSTEM_PERSIST_WRITE_MARKER: &str = "TD-PERSIST-WRITE-OK";
+
+/// Printed on the second persistence-oracle boot only when the marker written by the
+/// first boot survives with its exact content.
+pub const SYSTEM_PERSIST_READ_MARKER: &str = "TD-PERSIST-READ-OK";
+
+/// Printed by BusyBox init's shutdown action after syncing and unmounting @var.
+pub const SYSTEM_SHUTDOWN_MARKER: &str = "TD-SHUTDOWN-OK";
 
 /// Printed by `/etc/profile` when the auto-login greeter shell is reached — the login
 /// chain (getty → login → ash) ran on the real root. The primary "booted to the
@@ -162,11 +177,19 @@ pub const SSHD_MARKER: &str = "TD-SSHD-OK";
 
 /// Kernel-cmdline token the headless `qemu-boot-system` oracle appends so the greeter
 /// SELF-TESTS: `/etc/profile`, on seeing it in `/proc/cmdline`, prints `GREETER_MARKER`
-/// then `exit`s the login shell, which (via `tty-session`'s `reboot -f`) powers the VM
+/// then `exit`s the login shell, which (via `tty-session`'s init-mediated reboot) powers the VM
 /// off — so the oracle proves "exit powers off" from a clean qemu exit 0 without a
 /// terminal to type into. Absent it (interactive `td-recipe-eval run`), the greeter is
 /// a normal interactive shell.
 pub const AUTOTEST_CMDLINE_TOKEN: &str = "td.autotest=1";
+
+/// Kernel-cmdline token for boot one of the persistence oracle. `/etc/rootcheck`
+/// writes and syncs the fixed marker below `/var` before the greeter self-exits.
+pub const PERSIST_WRITE_CMDLINE_TOKEN: &str = "td.persist=write";
+
+/// Kernel-cmdline token for boot two of the persistence oracle. `/etc/rootcheck`
+/// emits `SYSTEM_PERSIST_READ_MARKER` only after reading boot one's exact bytes.
+pub const PERSIST_READ_CMDLINE_TOKEN: &str = "td.persist=read";
 
 // ── system-x86-64 networking markers (link-up + DHCP, re td-netd) ─────────────────
 // The static td-netd daemon brings the link up and DHCP-configures it at sysinit on

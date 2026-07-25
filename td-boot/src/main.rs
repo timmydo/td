@@ -3,6 +3,7 @@
 //! helper. Hashes detect corruption; they do not authenticate a deployment.
 #![forbid(unsafe_code)]
 
+mod protocol;
 #[path = "../../engine/src/sha256.rs"]
 #[allow(dead_code)]
 mod sha256;
@@ -17,6 +18,8 @@ use std::process::{Command, ExitCode, Stdio};
 
 const BUSYBOX: &str = "/bin/busybox";
 const TD_KEXEC: &str = "/bin/td-kexec";
+// root-loop requires procfs so losetup reopens the verified inode, not its path.
+const STDIN_PATH: &str = "/proc/self/fd/0";
 const MANIFEST_HEADER: &[u8] = b"td-deployment-v1";
 const MANIFEST_NAME: &str = "manifest";
 const MAX_MANIFEST_BYTES: u64 = 4096;
@@ -25,6 +28,11 @@ const MAX_CMDLINE_BYTES: usize = 2048;
 enum Mode {
     Verify {
         root: PathBuf,
+    },
+    RootLoop {
+        root: PathBuf,
+        deployment_id: String,
+        loop_device: PathBuf,
     },
     Boot {
         device: PathBuf,
@@ -58,8 +66,19 @@ fn invalid(message: impl Into<String>) -> io::Error {
 fn usage_error() -> io::Error {
     io::Error::new(
         io::ErrorKind::InvalidInput,
-        "usage: td-boot verify <volume-root>\n       td-boot boot <device> <mountpoint> <cmdline>",
+        "usage: td-boot verify <volume-root>\n       td-boot root-loop <volume-root> <deployment-id> <loop-device>\n       td-boot boot <device> <mountpoint> <cmdline>",
     )
+}
+
+fn parse_deployment_id(value: OsString) -> io::Result<String> {
+    if !valid_digest(value.as_bytes()) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "deployment id must be exactly 64 lowercase hexadecimal characters",
+        ));
+    }
+    String::from_utf8(value.into_vec())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "deployment id is not ASCII"))
 }
 
 fn parse_args<I: Iterator<Item = OsString>>(mut args: I) -> io::Result<Mode> {
@@ -71,6 +90,19 @@ fn parse_args<I: Iterator<Item = OsString>>(mut args: I) -> io::Result<Mode> {
             }
             Ok(Mode::Verify {
                 root: PathBuf::from(root),
+            })
+        }
+        Some(mode) if mode == OsStr::new("root-loop") => {
+            let root = args.next().ok_or_else(usage_error)?;
+            let deployment_id = parse_deployment_id(args.next().ok_or_else(usage_error)?)?;
+            let loop_device = args.next().ok_or_else(usage_error)?;
+            if args.next().is_some() {
+                return Err(usage_error());
+            }
+            Ok(Mode::RootLoop {
+                root: PathBuf::from(root),
+                deployment_id,
+                loop_device: PathBuf::from(loop_device),
             })
         }
         Some(mode) if mode == OsStr::new("boot") => {
@@ -216,7 +248,7 @@ fn parse_manifest(bytes: &[u8]) -> io::Result<Manifest> {
 }
 
 fn read_selector(root: &Path, slot: &str) -> io::Result<String> {
-    let selector = root.join("td").join("boot").join(slot);
+    let selector = root.join(protocol::BOOT_DIR).join(slot);
     let metadata = fs::symlink_metadata(&selector).map_err(|error| {
         io::Error::new(
             error.kind(),
@@ -231,7 +263,7 @@ fn read_selector(root: &Path, slot: &str) -> io::Result<String> {
     }
     let target = fs::read_link(&selector)?;
     let bytes = target.as_os_str().as_bytes();
-    let prefix = b"../deployments/";
+    let prefix = protocol::SELECTOR_PREFIX.as_bytes();
     let id = bytes
         .strip_prefix(prefix)
         .ok_or_else(|| invalid(format!("{slot} selector has an invalid target")))?;
@@ -257,23 +289,42 @@ fn verify_payload(directory: &Path, name: &str, expected: &str) -> io::Result<Fi
     }
 }
 
-fn verify_slot(root: &Path, slot: &str) -> io::Result<Deployment> {
-    let id = read_selector(root, slot)?;
-    let directory = root.join("td").join("deployments").join(&id);
-    require_real_directory(&directory, "deployment")?;
+fn verified_manifest(root: &Path, id: &str) -> io::Result<(PathBuf, Manifest)> {
+    require_absolute(root, "volume root")?;
+    require_real_directory(root, "volume root")?;
+    require_real_directory(&root.join("td"), "td directory")?;
+    require_real_directory(
+        &root.join(protocol::DEPLOYMENTS_DIR),
+        "deployments directory",
+    )?;
+    if !valid_digest(id.as_bytes()) {
+        return Err(invalid(
+            "deployment id must be exactly 64 lowercase hexadecimal characters",
+        ));
+    }
 
+    let directory = root.join(protocol::DEPLOYMENTS_DIR).join(id);
+    require_real_directory(&directory, "deployment")?;
     let manifest_path = directory.join(MANIFEST_NAME);
     let manifest_bytes =
         read_bounded_real_file(&manifest_path, "deployment manifest", MAX_MANIFEST_BYTES)?;
     let manifest_id = sha256::hex_digest(&manifest_bytes);
-    if manifest_id != id {
+    if manifest_id.as_str() != id {
         return Err(invalid(format!(
             "deployment id {id} does not match manifest hash {manifest_id}"
         )));
     }
     let manifest = parse_manifest(&manifest_bytes)?;
+    Ok((directory, manifest))
+}
+
+fn verify_slot(root: &Path, slot: &str) -> io::Result<Deployment> {
+    let id = read_selector(root, slot)?;
+    let (directory, manifest) = verified_manifest(root, &id)?;
     let kernel = verify_payload(&directory, "bzImage", &manifest.kernel)?;
     let initramfs = verify_payload(&directory, "initramfs.cpio", &manifest.initramfs)?;
+    // Verify root here so corruption selects previous; root-loop repeats the hash
+    // after kexec to bind the verified inode at the actual mount boundary.
     verify_payload(&directory, "root.erofs", &manifest.root)?;
 
     Ok(Deployment {
@@ -283,13 +334,18 @@ fn verify_slot(root: &Path, slot: &str) -> io::Result<Deployment> {
     })
 }
 
+fn verify_root_payload(root: &Path, deployment_id: &str) -> io::Result<File> {
+    let (directory, manifest) = verified_manifest(root, deployment_id)?;
+    verify_payload(&directory, "root.erofs", &manifest.root)
+}
+
 fn select_deployment(root: &Path) -> io::Result<Selection> {
     require_absolute(root, "volume root")?;
     require_real_directory(root, "volume root")?;
     require_real_directory(&root.join("td"), "td directory")?;
-    require_real_directory(&root.join("td").join("boot"), "boot selector directory")?;
+    require_real_directory(&root.join(protocol::BOOT_DIR), "boot selector directory")?;
     require_real_directory(
-        &root.join("td").join("deployments"),
+        &root.join(protocol::DEPLOYMENTS_DIR),
         "deployments directory",
     )?;
 
@@ -367,7 +423,7 @@ fn run_command(command: &mut Command, label: &str) -> io::Result<()> {
 fn mount_command(device: &Path, mountpoint: &Path) -> Command {
     let mut command = Command::new(BUSYBOX);
     command.args([
-        OsStr::new("mount"),
+        OsStr::new(protocol::MOUNT_APPLET),
         OsStr::new("-t"),
         OsStr::new("btrfs"),
         OsStr::new("-o"),
@@ -388,19 +444,36 @@ fn kexec_command(kernel: File, initramfs: File, cmdline: &OsStr) -> Command {
     command
 }
 
-fn report_fallback(selection: &Selection) {
+fn loop_command(root: File, loop_device: &Path) -> Command {
+    let mut command = Command::new(BUSYBOX);
+    command
+        .args([
+            OsStr::new(protocol::LOSETUP_APPLET),
+            OsStr::new("-r"),
+            loop_device.as_os_str(),
+            OsStr::new(STDIN_PATH),
+        ])
+        .stdin(Stdio::from(root));
+    command
+}
+
+fn report_fallback(selection: &Selection) -> io::Result<()> {
     if let Some(error) = &selection.current_error {
-        let _ = writeln!(
+        // Rejection is boot protocol, not best-effort diagnostics: an unobservable
+        // fallback must not masquerade as a healthy primary selection.
+        writeln!(
             io::stderr(),
-            "td-boot: current rejected ({error}); using previous {}",
+            "{}: current rejected ({error}); using previous {}",
+            protocol::CURRENT_REJECTED_MARKER,
             selection.deployment.id
-        );
+        )?;
     }
+    Ok(())
 }
 
 fn run_verify(root: &Path) -> io::Result<()> {
     let selection = select_deployment(root)?;
-    report_fallback(&selection);
+    report_fallback(&selection)?;
     writeln!(
         io::stdout(),
         "{} {}",
@@ -409,8 +482,20 @@ fn run_verify(root: &Path) -> io::Result<()> {
     )
 }
 
+fn run_root_loop(root: &Path, deployment_id: &str, loop_device: &Path) -> io::Result<()> {
+    require_absolute(loop_device, "loop device")?;
+    let root_file = verify_root_payload(root, deployment_id)?;
+    run_command(
+        &mut loop_command(root_file, loop_device),
+        "read-only root loop setup",
+    )
+}
+
 fn best_effort_unmount(mountpoint: &Path) {
-    let _ = Command::new(BUSYBOX).arg("umount").arg(mountpoint).status();
+    let _ = Command::new(BUSYBOX)
+        .arg(protocol::UMOUNT_APPLET)
+        .arg(mountpoint)
+        .status();
 }
 
 fn run_boot(device: &Path, mountpoint: &Path, base_cmdline: &OsStr) -> io::Result<()> {
@@ -426,12 +511,10 @@ fn run_boot(device: &Path, mountpoint: &Path, base_cmdline: &OsStr) -> io::Resul
 
     let result = (|| {
         let selection = select_deployment(mountpoint)?;
-        report_fallback(&selection);
+        report_fallback(&selection)?;
         let cmdline = kernel_cmdline(base_cmdline, &selection.deployment.id)?;
         let Deployment {
-            kernel,
-            initramfs,
-            ..
+            kernel, initramfs, ..
         } = selection.deployment;
         run_command(
             &mut kexec_command(kernel, initramfs, cmdline.as_os_str()),
@@ -448,6 +531,11 @@ fn run_boot(device: &Path, mountpoint: &Path, base_cmdline: &OsStr) -> io::Resul
 fn run() -> io::Result<()> {
     match parse_args(std::env::args_os().skip(1))? {
         Mode::Verify { root } => run_verify(&root),
+        Mode::RootLoop {
+            root,
+            deployment_id,
+            loop_device,
+        } => run_root_loop(&root, &deployment_id, &loop_device),
         Mode::Boot {
             device,
             mountpoint,
@@ -541,7 +629,23 @@ mod tests {
             parse_args(args(&["boot", "/dev/vda", "/volume", "quiet"])),
             Ok(Mode::Boot { .. })
         ));
+        assert!(matches!(
+            parse_args(args(&[
+                "root-loop",
+                "/volume",
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "/dev/loop0",
+            ])),
+            Ok(Mode::RootLoop { .. })
+        ));
         assert!(parse_args(args(&["verify"])).is_err());
+        assert!(parse_args(args(&[
+            "root-loop",
+            "/volume",
+            "not-a-digest",
+            "/dev/loop0"
+        ]))
+        .is_err());
         assert!(parse_args(args(&["boot", "/dev/vda", "/volume"])).is_err());
         assert!(parse_args(args(&["unknown", "/volume"])).is_err());
     }
@@ -597,6 +701,30 @@ mod tests {
         )
         .unwrap();
         let error = select_deployment(&fixture.root).err().unwrap();
+        assert!(error.to_string().contains("root.erofs hash mismatch"));
+    }
+
+    #[test]
+    fn exact_root_verification_is_bound_to_the_manifest_id() {
+        let fixture = Fixture::new();
+        let id = fixture.valid_deployment();
+        let root = verify_root_payload(&fixture.root, &id).unwrap();
+        assert_eq!(
+            root.metadata().unwrap().len(),
+            b"root-payload\n".len() as u64
+        );
+        assert!(verify_root_payload(&fixture.root, &"0".repeat(64)).is_err());
+
+        fs::write(
+            fixture
+                .root
+                .join("td/deployments")
+                .join(&id)
+                .join("root.erofs"),
+            b"tampered\n",
+        )
+        .unwrap();
+        let error = verify_root_payload(&fixture.root, &id).err().unwrap();
         assert!(error.to_string().contains("root.erofs hash mismatch"));
     }
 
@@ -673,15 +801,26 @@ mod tests {
         fixture.selector("current", &id);
         let deployment = select_deployment(&fixture.root).unwrap().deployment;
         let Deployment {
-            kernel,
-            initramfs,
-            ..
+            kernel, initramfs, ..
         } = deployment;
         let command = kexec_command(kernel, initramfs, OsStr::new("quiet td.deployment=test"));
         assert_eq!(command.get_program(), OsStr::new(TD_KEXEC));
         assert_eq!(
             command.get_args().collect::<Vec<_>>(),
             vec![OsStr::new("--fds"), OsStr::new("quiet td.deployment=test")]
+        );
+
+        let root = verify_root_payload(&fixture.root, &id).unwrap();
+        let command = loop_command(root, Path::new("/dev/loop0"));
+        assert_eq!(command.get_program(), OsStr::new(BUSYBOX));
+        assert_eq!(
+            command.get_args().collect::<Vec<_>>(),
+            vec![
+                OsStr::new("losetup"),
+                OsStr::new("-r"),
+                OsStr::new("/dev/loop0"),
+                OsStr::new(STDIN_PATH),
+            ]
         );
     }
 }

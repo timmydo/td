@@ -5,11 +5,12 @@
 //! the test user, and use the shell. Reached only through the `td-recipe-eval run`
 //! subcommand (check_runner::run_cli).
 //!
-//! Two-stage boot (#550): the guest boots the stage-1 initramfs (`initramfs.cpio`),
-//! which mounts the read-only erofs `/td/store` root over virtio-blk (`/dev/vda`),
-//! mounts tmpfs for `/var`, `/run`, and `/tmp`, and `switch_root`s into the real root. The
-//! recipe emits `{bzImage,initramfs.cpio,root.erofs,manifest}` and this consumer
-//! verifies the manifest before copying the three payloads out for boot.
+//! Persistent deployment boot: the guest boots the verified selector initramfs,
+//! selects and kexecs `current` from the Btrfs volume, then
+//! loop-mounts the selected EROFS root read-only, mounts persistent `@var` plus
+//! volatile `/run` and `/tmp`, and `switch_root`s into the real root. The recipe
+//! emits hashed deployment and selector artifacts; this consumer verifies both
+//! manifests before building the boot volume.
 //!
 //! Sibling of checks/qemu_boot.rs. Same host-free build (`build_plan` builds the kernel
 //! and system images inside their own nested build jail) and the same trust model (host
@@ -19,7 +20,7 @@
 //! real terminal (`-nographic` wires ttyS0 <-> the operator's stdio) and does NOT scan,
 //! time out, or kill. The operator exits the guest by typing `exit` / Ctrl-D at the
 //! greeter shell: the ttyS0 session is wrapped by `/etc/tty-session`, which runs the
-//! login flow AS ROOT (init's child) and then `reboot -f`s when the session ends, so
+//! login flow AS ROOT (init's child) and asks init to reboot when the session ends, so
 //! under `-no-reboot` qemu exits 0. (qemu's own Ctrl-A X still force-quits at any time.)
 //! Because it is interactive it is a host-side command, never a gated check (a gate has
 //! no terminal, and the daily sandbox has no host qemu).
@@ -29,7 +30,10 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use crate::check_runner::RecipeCheckRunner;
-use crate::checks::qemu_boot::{drive_arg, find_qemu, verify_deployment};
+use crate::checks::qemu_boot::{
+    build_btrfs_tools, create_persistent_volume, drive_arg, find_qemu, verify_deployment,
+    verify_selector,
+};
 
 /// The distro image recipe this runner boots; its recipe closure pulls in the
 /// `linux-x86-64` kernel that supplies the bzImage.
@@ -88,14 +92,14 @@ impl TempImages {
             match std::fs::DirBuilder::new().mode(0o700).create(&dir) {
                 Ok(()) => return Ok(Self { dir }),
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
-                Err(e) => {
-                    return Err(format!("create boot-image temp dir {}: {e}", dir.display()))
-                }
+                Err(e) => return Err(format!("create boot-image temp dir {}: {e}", dir.display())),
             }
         }
-        Err("could not create a private boot-image temp dir under the system temp \
+        Err(
+            "could not create a private boot-image temp dir under the system temp \
              directory after 1024 attempts"
-            .to_string())
+                .to_string(),
+        )
     }
 
     /// Copy `src` to `<dir>/<name>`, returning the destination path.
@@ -141,8 +145,11 @@ pub(crate) fn run(runner: &RecipeCheckRunner, lock: File) -> Result<(), String> 
         .first()
         .cloned()
         .ok_or_else(|| format!("distro build did not stage the {SYSTEM} output"))?;
-    let (bzimage, initramfs, root_erofs) =
-        verify_deployment(&system_tree.join("deployment"))?;
+    let deployment = system_tree.join("deployment");
+    // Verify every selected payload before copying the direct-boot artifacts.
+    let (bzimage, _, _) = verify_deployment(&deployment)?;
+    let selector = verify_selector(&system_tree.join("boot"))?;
+    let (mkfs, btrfs) = build_btrfs_tools(runner)?;
 
     // Stage the boot images OUT of the ladder scratch to a private host temp dir BEFORE we
     // release the lock. Once the lock is free, a concurrent `td-recipe-eval clear-store` can
@@ -153,8 +160,9 @@ pub(crate) fn run(runner: &RecipeCheckRunner, lock: File) -> Result<(), String> 
     // is removed when it drops — on every return path.
     let images = TempImages::new(runner.ladder_work_dir())?;
     let boot_bzimage = images.stage(&bzimage, "bzImage")?;
-    let boot_init = images.stage(&initramfs, "initramfs.cpio")?;
-    let boot_disk = images.stage(&root_erofs, "root.erofs")?;
+    let boot_init = images.stage(&selector, "selector-initramfs.cpio")?;
+    let boot_disk = images.dir.join("system.btrfs");
+    create_persistent_volume(&deployment, &mkfs, &btrfs, &boot_disk)?;
 
     // The build is done and every verified payload is staged out.
     // Release the ladder lock now, BEFORE the unbounded interactive boot: this process
@@ -164,9 +172,11 @@ pub(crate) fn run(runner: &RecipeCheckRunner, lock: File) -> Result<(), String> 
     drop(lock);
 
     println!(
-        "   [run] booting the td distro TWO-STAGE under {qemu} (TCG) - interactive serial console\n         \
-         kernel:     {}\n         initramfs:  {}\n         erofs root: {}\n         \
-         Stage-1 mounts the read-only erofs root over virtio-blk and switch_roots into it;\n         \
+        "   [run] booting the td distro through its persistent selector under {qemu} (TCG) - interactive serial console\n         \
+         shim kernel:   {}\n         initramfs:     {}\n         Btrfs volume:  {}\n         \
+         The initramfs verifies + kexecs current, loop-mounts its EROFS root, mounts @var,\n         \
+         and switch_roots into the deployment. This private test volume lasts for the\n         \
+         interactive session and is discarded when qemu exits;\n         \
          auto-login as the test user is enabled.\n         \
          To power off: type `exit` (or Ctrl-D) at the shell - the session wrapper reboots\n         \
          as root and qemu (-no-reboot) exits. To force-quit qemu at any time: Ctrl-A then X.\n",
@@ -178,15 +188,20 @@ pub(crate) fn run(runner: &RecipeCheckRunner, lock: File) -> Result<(), String> 
     boot_interactive(&qemu, &boot_bzimage, &boot_init, &boot_disk)
 }
 
-/// Boot the two-stage image under qemu with the guest's ttyS0 wired to THIS process's
+/// Boot the selector plus deployment under qemu with the guest's ttyS0 wired to THIS process's
 /// stdio (`-nographic`), inherited so the operator drives the console directly. The
-/// stage-1 `initramfs.cpio` is the initramfs and root.erofs is attached as a READ-ONLY
-/// virtio-blk disk (`/dev/vda`) the stage-1 init mounts and `switch_root`s into. No
+/// selector initramfs boots with a writable Btrfs volume attached as `/dev/vda`.
+/// It selects and kexecs current; the deployment initramfs mounts root.erofs and @var. No
 /// marker scan, no timeout, no kill — the guest owns the terminal until the operator
-/// types `exit`/Ctrl-D at the greeter (the `tty-session` wrapper then `reboot -f`s as
+/// types `exit`/Ctrl-D at the greeter (the `tty-session` wrapper then asks init to reboot as
 /// root) or force-quits with Ctrl-A X. `-nic none` + `-no-user-config` keep the run
 /// offline and hermetic; `-no-reboot` makes the guest reset exit qemu.
-fn boot_interactive(qemu: &str, bzimage: &Path, init_cpio: &Path, disk: &Path) -> Result<(), String> {
+fn boot_interactive(
+    qemu: &str,
+    bzimage: &Path,
+    init_cpio: &Path,
+    disk: &Path,
+) -> Result<(), String> {
     // No `panic=-1` here (unlike the headless qemu_boot oracle, which uses it to
     // auto-exit on panic): an interactive operator wants a kernel panic left ON SCREEN
     // to read, then quits with Ctrl-A X — an auto-reboot would scroll it away. No autotest
@@ -194,19 +209,17 @@ fn boot_interactive(qemu: &str, bzimage: &Path, init_cpio: &Path, disk: &Path) -
     // not immediately).
     let append = "console=ttyS0 rdinit=/init";
     let status = Command::new(qemu)
-        .args(["-M", "pc", "-accel", "tcg", "-m", "256", "-no-reboot"])
+        .args(["-M", "pc", "-accel", "tcg", "-m", "512", "-no-reboot"])
         .args(["-no-user-config", "-nic", "none", "-nographic"])
         .arg("-kernel")
         .arg(bzimage)
         .arg("-initrd")
         .arg(init_cpio)
         .args(["-append", append])
-        // The read-only erofs root over virtio-blk (/dev/vda in the guest): if=none defines
-        // the backing store and the virtio-blk-pci -device attaches it; drive_arg (shared
-        // with qemu_boot.rs) comma-doubles the image path and sets readonly=on.
+        // The writable persistent Btrfs volume over virtio-blk (/dev/vda).
         .arg("-drive")
-        .arg(drive_arg(disk))
-        .args(["-device", "virtio-blk-pci,drive=erofs0"])
+        .arg(drive_arg(disk, false))
+        .args(["-device", "virtio-blk-pci,drive=disk0"])
         .status()
         .map_err(|e| format!("spawn {qemu}: {e}"))?;
     // The legitimate interactive exits all return 0: a guest `poweroff`/`reboot` under

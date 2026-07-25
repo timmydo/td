@@ -3,6 +3,7 @@ use crate::types::{Recipe, Step};
 // Target-built static deployment verifier and kexec boot shim. The shipped
 // source reuses the engine's dependency-free SHA-256 implementation.
 const MAIN_RS: &str = include_str!("../../../td-boot/src/main.rs");
+const PROTOCOL_RS: &str = include_str!("../../../td-boot/src/protocol.rs");
 const SHA256_RS: &str = include_str!("../../../engine/src/sha256.rs");
 
 pub fn recipe() -> Recipe {
@@ -33,6 +34,11 @@ pub fn recipe() -> Recipe {
         Step::WriteFile {
             path: "{src}/td-boot/src/main.rs".into(),
             content: MAIN_RS.into(),
+            exec: false,
+        },
+        Step::WriteFile {
+            path: "{src}/td-boot/src/protocol.rs".into(),
+            content: PROTOCOL_RS.into(),
             exec: false,
         },
         Step::WriteFile {

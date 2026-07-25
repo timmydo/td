@@ -13,7 +13,7 @@ nothing in the root is mutable.
 
 - **Immutable** — the root filesystem is a read-only erofs image. `/bin`
   is a pure symlink farm into `/td/store`; there is no `/usr` or `/sbin`.
-  Only `/var`, `/run`, and `/tmp` hold mutable state (tmpfs).
+  `/var` is persistent Btrfs state; `/run` and `/tmp` are volatile tmpfs.
 - **Built from source** — bootstrapped from the tiny `stage0-posix` seed
   through an iterative GCC/glibc ladder and a source-built Rust toolchain.
   Host `/bin`, `/usr`, and ambient `PATH` never enter a build. (The one
@@ -43,9 +43,12 @@ Build the system and boot it under QEMU:
 td-recipe-eval run system-x86-64
 ```
 
-It boots the two-stage image, mounts the read-only erofs root, and
-auto-logs you in as `tester` on the serial console. Type `exit` (or Ctrl-D)
-to power off; Ctrl-A X force-quits QEMU.
+It boots a selector initramfs, verifies the current deployment on a persistent
+Btrfs volume, kexecs that deployment, loop-mounts its read-only EROFS root, and
+auto-logs you in as `tester` on the serial console. Type `exit` (or Ctrl-D) to
+power off; Ctrl-A X force-quits QEMU. The private test volume lasts for this
+interactive session and is discarded when QEMU exits; the headless
+`qemu-boot-system` check proves persistence by booting its volume twice.
 
 ## Filesystem layout
 
@@ -53,17 +56,18 @@ to power off; Ctrl-A X force-quits QEMU.
 /td/store/<hash>-<name>/   every package, content-addressed and read-only
 /bin                       symlink farm → /td/store (busybox + uutils applets)
 /etc                       generated, deployment-owned, immutable
-/var /run /tmp             writable tmpfs — the only mutable state
+/var                       persistent writable Btrfs @var subvolume
+/run /tmp                  volatile writable tmpfs
 /home /root                symlinks into /var
 ```
 
 ## Defining the system
 
 A whole distribution is one Rust recipe. `recipes/src/recipes/system-x86-64.rs`
-composes the kernel, busybox, and uutils into a bootable
-`{bzImage, initramfs.cpio, root.erofs, manifest}` bundle. Edit its `SYSTEM`
-constant to tailor the hostname, users, auto-login, login shell, and applet
-set, then `td-recipe-eval run` again.
+composes the kernel, busybox, and uutils into a boot selector plus a deployment
+bundle containing `{bzImage, initramfs.cpio, root.erofs, manifest}`. Edit its
+`SYSTEM` constant to tailor the hostname, users, auto-login, login shell, and
+applet set, then `td-recipe-eval run` again.
 
 Individual packages are recipes too — declarative Rust, no shell:
 

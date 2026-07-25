@@ -313,16 +313,12 @@ pub fn qemu_boot_erofs_cli(args: &[String]) -> Result<(), String> {
     crate::checks::qemu_boot::run_erofs(&runner)
 }
 
-/// `td-recipe-eval qemu-boot-system [system-x86-64]` — the headless two-stage boot proof
-/// (re #550). Builds and verifies the `system-x86-64` deployment bundle, then
-/// boots its bzImage, initramfs.cpio, and root.erofs under host qemu with the
-/// autotest token on the kernel cmdline: stage-1 mounts the erofs root read-only over virtio-blk and
-/// `switch_root`s into it, the real-root init reaches the greeter, and the greeter self-
-/// exits so the VM powers off. It asserts the greeter, immutable EROFS `/` and `/etc`,
-/// writable `/var`-backed state, and a clean power-off. UNLIKE `run`, this is a
-/// PASS/FAIL smoke test with no interactive terminal — host-side (never a gated check)
-/// for the same reason `qemu-boot` is: the daily sandbox has no host qemu. See
-/// checks/qemu_boot.rs.
+/// `td-recipe-eval qemu-boot-system [system-x86-64]` — the persistent deployment
+/// boot proof. It builds the system and target Btrfs tools, creates one volume,
+/// and boots it twice through selector, verified kexec, loop-mounted EROFS, and
+/// persistent @var. Boot two must read boot one's synced marker; both prove the
+/// immutable root, target-owned state, clean shutdown, and offline Btrfs checks.
+/// This is host-side because the daily sandbox has no host qemu.
 pub fn qemu_boot_system_cli(args: &[String]) -> Result<(), String> {
     const STEM: &str = "system-x86-64";
     let stem = args.first().map(String::as_str).unwrap_or(STEM);
@@ -336,7 +332,7 @@ pub fn qemu_boot_system_cli(args: &[String]) -> Result<(), String> {
     }
     // Provenance planning FIRST — before the runner exists (re #469), matching
     // `qemu_boot_cli`: a rejected graph spawns no subprocess.
-    ensure_targets_provenance(&[stem])?;
+    ensure_targets_provenance(&[stem, "btrfs-progs-x86-64"])?;
 
     let root = env::current_dir().map_err(|e| format!("current dir: {e}"))?;
     // Reuse the `qemu-boot-` scratch prefix so the stale-scratch reaper still cleans
@@ -348,14 +344,11 @@ pub fn qemu_boot_system_cli(args: &[String]) -> Result<(), String> {
     crate::checks::qemu_boot::run_system(&runner)
 }
 
-/// `td-recipe-eval qemu-boot-net [system-x86-64]` — the headless networking proof. Builds
-/// and verifies the SAME `system-x86-64` deployment as `qemu-boot-system`, then boots it
-/// under host qemu with a user-mode NIC and both the nettest + autotest tokens: at sysinit
-/// `/etc/netup` brings the link up over DHCP and td-netd resolves + reaches the test host,
-/// then the greeter self-exits so the VM powers off. It asserts the three net markers and a
-/// clean power-off. Host-side (never a gated check) like the other qemu oracles — the daily
-/// sandbox has no host qemu, and this additionally needs the operator host's outbound
-/// DNS/TCP (SLIRP forwards/NATs them). See checks/qemu_boot.rs.
+/// `td-recipe-eval qemu-boot-net [system-x86-64]` — the networking proof. It
+/// creates the same persistent volume and selector/kexec boot as the system
+/// oracle, adds a user-mode NIC, and asserts td-netd's DHCP, DNS, and TCP markers,
+/// clean shutdown, and an offline Btrfs check. This additionally needs the
+/// operator host's outbound DNS/TCP for SLIRP.
 pub fn qemu_boot_net_cli(args: &[String]) -> Result<(), String> {
     const STEM: &str = "system-x86-64";
     let stem = args.first().map(String::as_str).unwrap_or(STEM);
@@ -369,7 +362,7 @@ pub fn qemu_boot_net_cli(args: &[String]) -> Result<(), String> {
     }
     // Provenance planning FIRST — before the runner exists (re #469), matching
     // `qemu_boot_cli`: a rejected graph spawns no subprocess.
-    ensure_targets_provenance(&[stem])?;
+    ensure_targets_provenance(&[stem, "btrfs-progs-x86-64"])?;
 
     let root = env::current_dir().map_err(|e| format!("current dir: {e}"))?;
     // Reuse the `qemu-boot-` scratch prefix so the stale-scratch reaper still cleans
@@ -446,7 +439,7 @@ pub fn run_cli(args: &[String]) -> Result<(), String> {
     }
     // Provenance planning FIRST — before the runner exists, so a rejected graph
     // spawns no subprocess at all (re #469), matching `cli`/`build_cli`/`qemu_boot`.
-    ensure_targets_provenance(&[stem])?;
+    ensure_targets_provenance(&[stem, "btrfs-progs-x86-64"])?;
 
     let root = env::current_dir().map_err(|e| format!("current dir: {e}"))?;
     let scratch_name = scratch_name("run", &[stem]);

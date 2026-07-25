@@ -1,37 +1,49 @@
 use crate::ladder::{
     mesboot0_inputs, mesboot0_path, AUTOTEST_CMDLINE_TOKEN, GREETER_MARKER, NETTEST_CMDLINE_TOKEN,
-    NETTEST_DEFAULT_HOST, NETTEST_DEFAULT_PORT, SH, SSHD_MARKER, SYSTEM_ETC_RO_MARKER,
-    SYSTEM_NET_REACH_MARKER, SYSTEM_NET_RESOLVE_MARKER, SYSTEM_NET_UP_MARKER, SYSTEM_ROOT_RO_MARKER,
-    SYSTEM_STATE_WRITABLE_MARKER, UUTILS_RUNTIME_MARKER,
+    NETTEST_DEFAULT_HOST, NETTEST_DEFAULT_PORT, PERSIST_READ_CMDLINE_TOKEN,
+    PERSIST_WRITE_CMDLINE_TOKEN, SH, SSHD_MARKER, SYSTEM_ETC_RO_MARKER, SYSTEM_NET_REACH_MARKER,
+    SYSTEM_NET_RESOLVE_MARKER, SYSTEM_NET_UP_MARKER, SYSTEM_PERSIST_READ_MARKER,
+    SYSTEM_PERSIST_WRITE_MARKER, SYSTEM_ROOT_RO_MARKER, SYSTEM_SHUTDOWN_MARKER,
+    SYSTEM_STATE_OWNER_MARKER, SYSTEM_STATE_WRITABLE_MARKER, UUTILS_RUNTIME_MARKER,
 };
 use crate::types::{Recipe, Step};
 
+#[cfg(test)]
+#[path = "../../../td-boot/src/protocol.rs"]
+#[allow(dead_code)]
+mod td_boot_protocol;
+
 // system-x86-64 (re #541, #550): a MINIMAL, TAILORABLE Rust-first Linux
-// deployment, booted TWO-STAGE onto a disk-backed READ-ONLY erofs root.
+// deployment, selected from persistent Btrfs and entered through kexec onto a
+// disk-backed READ-ONLY EROFS root.
 //
 // This is the "system definition" recipe. It composes artifacts that already exist in
 // the ladder — the source-built `linux-x86-64` kernel and the td-built STATIC busybox —
 // into a first-class deployment bundle:
 //
+//   boot/{selector-initramfs.cpio,manifest}
 //   deployment/{bzImage,initramfs.cpio,root.erofs,manifest}
 //
-// Stage 1 is a tiny initramfs: static busybox plus a `/init` script that mounts
-// root.erofs read-only from virtio-blk, mounts writable tmpfs at `/var /run /tmp`,
-// then switch_roots into stage 2. `/etc` stays deployment-owned and immutable;
-// `/home` and `/root` are root-image symlinks into `/var`. Stage 2 is
+// The direct-boot selector initramfs carries static busybox, td-boot, and
+// td-kexec; it has no branch that can enter a deployment directly. It verifies
+// current/previous from the Btrfs volume and kexecs the selected deployment.
+// That deployment's distinct initramfs requires the td.deployment handoff,
+// re-verifies root.erofs, binds it to a read-only loop device, mounts @var from
+// Btrfs, and switch_roots. `/etc` stays deployment-owned and immutable; `/home`
+// and `/root` are root-image symlinks into `/var`. The real root is
 // the store-native real root (busybox and uutils at their /td/store paths, a
 // /bin symlink farm, and generated /etc). The typed PackErofs step invokes the
 // dependency-free control-plane image writer directly; no recipe process can
-// execute td-builder through PATH or argv. The versioned manifest hashes the
-// three boot payloads.
+// execute td-builder through PATH or argv. Strict manifests separately hash the
+// selector and the three deployment payloads.
 //
 // The busybox init auto-logs-in a test user to a shell with a welcome banner. EDIT the
 // `SYSTEM` const below to tailor the distro (hostname, users, the auto-login user, the
 // login shell, the applet set). A producer-rung shape check on the deployment
 // bundle and its scratch root tree is the automated build guard; the interactive
-// `td-recipe-eval run` boots the two-stage image under host qemu so you can use it, and
-// the headless `td-recipe-eval qemu-boot-system` asserts it boots to the greeter on a
-// read-only erofs root and powers off cleanly on `exit`.
+// `td-recipe-eval run` boots the selector, kexecs the verified deployment under
+// host qemu, and gives you a shell. The headless `td-recipe-eval
+// qemu-boot-system` asserts two clean boots from the same persistent volume.
 //
 // Userland strategy (v0): static busybox provides the boot/login/shell path;
 // source-built Rust uutils provides the interactive core file/text userland
@@ -86,9 +98,9 @@ fn valid_home(uid: u32, home: &str) -> bool {
         name != "."
             && name != ".."
             && !name.is_empty()
-            && name.bytes().all(|byte| {
-                byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-')
-            })
+            && name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
     })
 }
 
@@ -103,7 +115,7 @@ const SYSTEM: SystemDef = SystemDef {
     // default for the minimal boot console — use '-' rather than an em-dash unless
     // you've confirmed the console renders the glyph.
     motd: "\n  Welcome to td - a source-built, Rust-first Linux.\n  \
-           Minimal busybox userland, booted two-stage onto a read-only erofs root.\n  \
+           Selected from persistent Btrfs onto a read-only erofs root.\n  \
            Edit recipes/src/recipes/system-x86-64.rs (the SYSTEM const) to tailor it.\n  \
            Type 'exit' (or Ctrl-D) to power off the VM; Ctrl-A X quits qemu.\n\n",
     autologin: "tester",
@@ -156,9 +168,54 @@ const SYSTEM: SystemDef = SystemDef {
 /// forbids those tokens in any step text and can't tell a cpio member NAME from a host
 /// invocation; they stay reachable as `busybox find` / `busybox xargs`.
 const BUSYBOX_APPLETS: &[&str] = &[
-    "sh", "ash", "getty", "login", "init", "mount", "umount", "switch_root", "reboot",
-    "poweroff", "halt", "hostname", "ps", "clear", "dmesg", "free", "kill", "vi",
-    "less", "more", "grep", "sed", "awk", "cttyhack", "su", "which", "readlink",
+    "sh",
+    "ash",
+    "getty",
+    "login",
+    "init",
+    "mount",
+    "umount",
+    "switch_root",
+    "reboot",
+    "poweroff",
+    "halt",
+    "hostname",
+    "ps",
+    "clear",
+    "dmesg",
+    "free",
+    "kill",
+    "vi",
+    "less",
+    "more",
+    "grep",
+    "sed",
+    "awk",
+    "cttyhack",
+    "su",
+    "which",
+    "readlink",
+];
+
+/// Boot-support applets invoked through the packed BusyBox multicall. Most run
+/// before the real root; the remainder support its boot and shutdown checks.
+const INITRAMFS_APPLETS: &[&str] = &[
+    "cat",
+    "chmod",
+    "chown",
+    "ln",
+    "losetup",
+    "mkdir",
+    "mknod",
+    "mount",
+    "printf",
+    "rm",
+    "sh",
+    "sleep",
+    "switch_root",
+    "sync",
+    "test",
+    "umount",
 ];
 
 /// The core file/text userland, served by the uutils `coreutils` multicall (#547). Every
@@ -170,9 +227,9 @@ const BUSYBOX_APPLETS: &[&str] = &[
 /// canonical path. uutils is dynamically linked, so — unlike static busybox — it pulls its
 /// reachable runtime store closure onto the erofs root.
 const UUTILS_APPLETS: &[&str] = &[
-    "uname", "ls", "cat", "echo", "printf", "pwd", "cp", "mv", "rm", "mkdir", "rmdir",
-    "ln", "id", "env", "df", "du", "chmod", "chown", "sleep", "sync", "wc", "head",
-    "tail", "sort", "date", "whoami", "tty", "dd", "mktemp", "seq", "touch", "mknod",
+    "uname", "ls", "cat", "echo", "printf", "pwd", "cp", "mv", "rm", "mkdir", "rmdir", "ln", "id",
+    "env", "df", "du", "chmod", "chown", "sleep", "sync", "wc", "head", "tail", "sort", "date",
+    "whoami", "tty", "dd", "mktemp", "seq", "touch", "mknod",
 ];
 
 fn build_passwd(sys: &SystemDef) -> String {
@@ -224,8 +281,9 @@ fn build_inittab() -> String {
     // proc, sysfs) on the erofs root's empty mountpoint dirs — mounting over a read-only
     // dir is a VFS overlay, no write to the erofs — then runs the boot self-check, brings
     // the network up, starts the sshd service, and the auto-login getty. It does NOT mount
-    // /var, /tmp, or /run: stage-1 already mounted those as tmpfs, and switch_root preserves
-    // the mounts. /proc must precede /etc/rootcheck (which reads /proc/mounts).
+    // /var, /tmp, or /run: stage-1 already mounted persistent @var and the volatile
+    // tmpfs filesystems, and switch_root preserves the mounts. /proc must precede
+    // /etc/rootcheck (which reads /proc/mounts).
     // /etc/netup runs AFTER rootcheck (networking after the read-only-root self-check)
     // and AFTER /run is a tmpfs (mounted by stage-1, preserved through switch_root): it
     // brings the link up every boot — loopback with 127.0.0.1/8 (so sshd's own loopback
@@ -247,38 +305,62 @@ fn build_inittab() -> String {
      ::respawn:/bin/sshd serve --listen 0.0.0.0:22 --authorized-keys /etc/ssh/authorized_keys\n\
      ttyS0::respawn:/etc/tty-session\n\
      ::ctrlaltdel:/bin/reboot\n\
-     ::shutdown:/bin/umount -a -r\n"
+     ::shutdown:/etc/shutdown\n"
         .into()
 }
 
-/// The stage-1 init-initramfs `/init` (re #550): the FIRST userspace, run by the kernel
-/// as PID 1 from the `init.cpio` initramfs. It mounts the read-only erofs store root over
-/// virtio-blk, mounts the writable tmpfs filesystems, then `switch_root`s into the real
-/// root. Static busybox with NO /bin PATH yet, so every applet is reached explicitly as
-/// `/bin/busybox <applet>` (only `/bin/sh` and `/bin/busybox` are symlinked in the cpio);
-/// `echo`-free by design. The final line MUST be `exec` so switch_root inherits PID 1.
-fn build_stage1_init(sys: &SystemDef) -> String {
-    // /var is the one state mount. /home and /root are immutable symlinks into it, so
-    // replacing this tmpfs with a Btrfs @var mount does not change the real-root layout.
-    // /run and /tmp remain separate volatile tmpfs mounts. EROFS is inherently read-only;
-    // `-o ro` is belt-and-suspenders. The /dev/vda probe tolerates async virtio-blk attach.
-    //
-    // `set -e` makes the FIRST failing setup command abort the script — its error already
-    // on the console (no 2>/dev/null) — rather than press on into a doomed or PARTIAL
-    // `switch_root`: a failed mount then panics loudly (init exits) instead
-    // of booting a half-read-only system where some dirs silently aren't writable (re #550,
-    // Codex review). The `while` probe condition is exempt from `set -e`, so a missing
-    // /dev/vda still falls through to the erofs mount, which fails and aborts cleanly.
-    let mut init = "#!/bin/sh\n\
+/// The firmware/direct-boot initramfs always selects through td-boot and kexecs
+/// the verified deployment. It has no selected-deployment branch, so an external
+/// kernel command line cannot bypass current/previous selection.
+fn build_selector_init() -> String {
+    "#!/bin/sh\n\
      set -e\n\
+     set -f\n\
      /bin/busybox mount -t devtmpfs dev /dev\n\
+     /bin/busybox mount -t proc proc /proc\n\
      n=0\n\
      while /bin/busybox test \"$n\" -lt 5 && ! /bin/busybox test -b /dev/vda; do /bin/busybox sleep 1; n=$((n+1)); done\n\
-     /bin/busybox mount -t erofs -o ro /dev/vda /sysroot\n\
-     /bin/busybox mount -t tmpfs -o mode=0755 tmpfs /sysroot/var\n\
+     exec /bin/td-boot boot /dev/vda /volume \"$(/bin/busybox cat /proc/cmdline)\"\n"
+        .into()
+}
+
+/// The selected deployment initramfs requires exactly one td.deployment handoff,
+/// validates that manifest and root payload, and enters the immutable root.
+fn build_deployment_init(sys: &SystemDef) -> String {
+    // /dev/vda is one Btrfs filesystem. The top-level vfsmount stays read-only,
+    // while the shared Btrfs superblock becomes writable for the @var mount. The
+    // mount flag prevents accidental writes, not a privileged remount by root.
+    // The verified loop keeps root.erofs open, so the top-level mount cannot be
+    // unmounted; move it below the new root's volatile /run instead.
+    let mut init = "#!/bin/sh\n\
+     set -e\n\
+     set -f\n\
+     /bin/busybox mount -t devtmpfs dev /dev\n\
+     /bin/busybox mount -t proc proc /proc\n\
+     n=0\n\
+     while /bin/busybox test \"$n\" -lt 5 && ! /bin/busybox test -b /dev/vda; do /bin/busybox sleep 1; n=$((n+1)); done\n\
+     deployment=\n\
+     deployment_seen=\n\
+     for word in $(/bin/busybox cat /proc/cmdline); do\n\
+       case \"$word\" in\n\
+         td.deployment=*) \
+           /bin/busybox test -z \"$deployment_seen\" || { echo 'td-init: duplicate td.deployment handoff' >&2; exit 1; }; \
+           deployment_seen=1; deployment=${word#td.deployment=} ;;\n\
+       esac\n\
+     done\n\
+     /bin/busybox test -n \"$deployment\" || { echo 'td-init: missing td.deployment handoff' >&2; exit 1; }\n\
+     /bin/busybox mount -t btrfs -o ro,nodev,nosuid,noexec /dev/vda /volume\n\
+     if ! /bin/busybox test -b /dev/loop0; then /bin/busybox mknod /dev/loop0 b 7 0; fi\n\
+     /bin/td-boot root-loop /volume \"$deployment\" /dev/loop0\n\
+     /bin/busybox mount -t erofs -o ro /dev/loop0 /sysroot\n\
+     /bin/busybox mount -t btrfs -o rw,nodev,nosuid,subvol=@var /dev/vda /sysroot/var\n\
+     /bin/busybox umount /proc\n\
+     /bin/busybox umount /dev\n\
      /bin/busybox mount -t tmpfs -o mode=0755 tmpfs /sysroot/run\n\
+     /bin/busybox mkdir -p /sysroot/run/td-volume\n\
+     /bin/busybox mount -o move /volume /sysroot/run/td-volume\n\
      /bin/busybox mount -t tmpfs -o mode=1777 tmpfs /sysroot/tmp\n\
-     /bin/busybox mkdir -p /sysroot/var/log /sysroot/var/run /sysroot/var/home"
+     /bin/busybox mkdir -p /sysroot/var/log /sysroot/var/home"
         .to_string();
     for user in sys.users {
         if user.home != "/root" {
@@ -287,6 +369,11 @@ fn build_stage1_init(sys: &SystemDef) -> String {
     }
     init.push_str(
         "\n/bin/busybox sh -c 'umask 077; /bin/busybox mkdir -p /sysroot/var/root'\n\
+         /bin/busybox rm -rf /sysroot/var/run\n\
+         /bin/busybox ln -s /run /sysroot/var/run\n\
+         /bin/busybox chown 0:0 /sysroot/var /sysroot/var/log /sysroot/var/home /sysroot/var/root\n\
+         /bin/busybox chmod 0755 /sysroot/var /sysroot/var/log /sysroot/var/home\n\
+         /bin/busybox chmod 0700 /sysroot/var/root\n\
          exec /bin/busybox switch_root /sysroot /init\n",
     );
     init
@@ -297,21 +384,34 @@ fn build_stage1_init(sys: &SystemDef) -> String {
 /// ENDS — the greeter user types `exit` / Ctrl-D — resets the machine so the VM
 /// stops. The auto-login user is UNPRIVILEGED and cannot shut the system down
 /// itself; this wrapper runs as root (init's child), so it does it on the user's
-/// behalf, making `exit` a clean way out of the VM. `reboot -f` calls `reboot(2)`
-/// directly and, under qemu's `-no-reboot`, makes qemu exit 0 — the exact proven
-/// exit path the kernel-boot test uses (`linux-x86-64-test`).
+/// behalf, making `exit` a clean way out of the VM. Plain `reboot` asks PID 1
+/// to run its shutdown action before the reboot syscall; under qemu's
+/// `-no-reboot`, the resulting reset makes qemu exit 0.
 ///
 /// The reboot is gated on `getty` SUCCEEDING (`&&`): getty sets up the tty and execs
 /// the login chain, returning the user shell's exit status, so a normal `exit`/Ctrl-D
 /// returns 0 -> power off. But if getty/login FAILS to start a session at all (e.g. it
 /// cannot open ttyS0), getty returns non-zero, the `&&` short-circuits, and the wrapper
 /// exits non-zero so init RESPAWNS it — a visible retry loop — rather than firing
-/// `reboot -f` and letting `-no-reboot` mask a broken greeter as a clean exit-0 shutdown
+/// `reboot` and letting `-no-reboot` mask a broken greeter as a clean exit-0 shutdown
 /// (re #541, Codex review).
 fn build_tty_session() -> String {
     "#!/bin/sh\n\
-     /bin/getty -L -n -l /etc/autologin 115200 ttyS0 vt100 && exec /bin/reboot -f\n"
+     /bin/getty -L -n -l /etc/autologin 115200 ttyS0 vt100 && exec /bin/reboot\n"
         .into()
+}
+
+fn build_shutdown() -> String {
+    // BusyBox init runs shutdown actions before killing other processes. Keep
+    // this a strict tripwire, but attempt every safety step after any failure.
+    format!(
+        "#!/bin/sh\n\
+         ok=1\n\
+         /bin/busybox sync || {{ echo 'td-shutdown: sync failed' >&2; ok=0; }}\n\
+         /bin/busybox umount /var || {{ echo 'td-shutdown: umount /var failed' >&2; ok=0; }}\n\
+         /bin/busybox umount -a -r || {{ echo 'td-shutdown: final unmount failed' >&2; ok=0; }}\n\
+         /bin/busybox test \"$ok\" = 1 && echo {SYSTEM_SHUTDOWN_MARKER}\n"
+    )
 }
 
 fn build_autologin(sys: &SystemDef) -> String {
@@ -336,6 +436,19 @@ fn build_rootcheck(sys: &SystemDef) -> String {
             ));
         }
     }
+    if let Some(user) = sys.users.iter().find(|user| user.name == sys.autologin) {
+        if user.uid != 0 {
+            s.push_str(&format!(
+                "if /bin/busybox su -s /bin/sh {} -c \
+                 '/bin/busybox test -d /var/root \
+                 && /bin/busybox test ! -w /var \
+                 && /bin/busybox test ! -w /var/root \
+                 && /bin/busybox test -w {}'; then \
+                 echo {SYSTEM_STATE_OWNER_MARKER}; fi\n",
+                user.name, user.home
+            ));
+        }
+    }
     // `/` is a read-only erofs mount (fields: <src> <mnt> <fstype> <opts> …; erofs is
     //     always mounted `ro`, so the options field begins `ro`).
     s.push_str(&format!(
@@ -348,16 +461,20 @@ fn build_rootcheck(sys: &SystemDef) -> String {
     s.push_str(&format!(
         "if /bin/busybox sh -c ': > /etc/.tdwr' 2>/dev/null; then /bin/busybox rm -f /etc/.tdwr; else echo {SYSTEM_ETC_RO_MARKER}; fi\n"
     ));
-    // State and volatile paths must be direct tmpfs mounts. Homes remain stable paths
-    // through immutable symlinks, ready for /var to become the persistent @var mount.
+    // State is the persistent Btrfs @var subvolume; only run/tmp are volatile.
+    // Homes remain stable paths through immutable symlinks into /var.
     s.push_str(
-        "for d in /var /run /tmp; do \
+        "/bin/busybox grep -Eq '^[^ ]+ /var btrfs ' /proc/mounts || ok=0\n\
+         /bin/busybox awk '$2 == \"/run/td-volume\" && $3 == \"btrfs\" && \
+         $4 ~ /(^|,)ro(,|$)/ { found=1 } END { exit !found }' /proc/mounts || ok=0\n\
+         for d in /run /tmp; do \
          /bin/busybox grep -Eq \"^[^ ]+ $d tmpfs \" /proc/mounts || ok=0; \
          done\n",
     );
     s.push_str(
         "[ \"$(/bin/busybox readlink /home)\" = var/home ] || ok=0\n\
-         [ \"$(/bin/busybox readlink /root)\" = var/root ] || ok=0\n",
+         [ \"$(/bin/busybox readlink /root)\" = var/root ] || ok=0\n\
+         [ \"$(/bin/busybox readlink /var/run)\" = /run ] || ok=0\n",
     );
     let mut probe_paths = "/var /run /tmp /home /root".to_string();
     for user in sys.users {
@@ -373,6 +490,19 @@ fn build_rootcheck(sys: &SystemDef) -> String {
     ));
     s.push_str(&format!(
         "[ \"$ok\" = 1 ] && echo {SYSTEM_STATE_WRITABLE_MARKER}\n"
+    ));
+    s.push_str(&format!(
+        "if /bin/busybox grep -q -F '{PERSIST_WRITE_CMDLINE_TOKEN}' /proc/cmdline; then \
+         if /bin/busybox test ! -e /var/lib/td/boot-marker \
+         && /bin/busybox mkdir -p /var/lib/td \
+         && /bin/busybox printf '%s\\n' td-persistent-v1 > /var/lib/td/boot-marker \
+         && /bin/busybox sync; then \
+         echo {SYSTEM_PERSIST_WRITE_MARKER}; fi; \
+         fi\n\
+         if /bin/busybox grep -q -F '{PERSIST_READ_CMDLINE_TOKEN}' /proc/cmdline \
+         && /bin/busybox test \"$(/bin/busybox cat /var/lib/td/boot-marker 2>/dev/null)\" = td-persistent-v1; then \
+         echo {SYSTEM_PERSIST_READ_MARKER}; \
+         fi\n"
     ));
     s
 }
@@ -400,7 +530,7 @@ fn build_profile(sys: &SystemDef) -> String {
     // exits 0, prints UUTILS_RUNTIME_MARKER — a live proof that the dynamically-linked
     // coreutils multicall's runtime closure resolves on the erofs root (the greeter line
     // above is a shell builtin `echo`, so it says nothing about uutils health; the MOTD
-    // `cat` ignores failure). Then (b) `exit`s so `tty-session`'s `reboot -f` powers the VM
+    // `cat` ignores failure). Then (b) `exit`s so `tty-session` asks init to power the VM
     // off — proving "exit powers off" from a clean qemu exit 0 with no terminal to type
     // into. `/bin/cat` (a uutils applet) on `/etc/os-release` (guaranteed staged) exercises
     // exec → loader → glibc; a broken closure fails the `&&`, drops the marker, and reds the
@@ -416,7 +546,7 @@ fn build_profile(sys: &SystemDef) -> String {
     // root, no shipped credential — needing only the loopback `lo` that sysinit brought up.
     // A broken net stack or closure fails the `&&`, drops the marker, and reds the oracle;
     // selftest's own stdout/stderr are suppressed so the marker string appears exactly once.
-    // Runs before `exit` so `tty-session`'s `reboot -f` still powers the VM off.
+    // Runs before `exit` so `tty-session` can ask init to power the VM off.
     s.push_str(&format!(
         "if /bin/busybox grep -q -F '{AUTOTEST_CMDLINE_TOKEN}' /proc/cmdline 2>/dev/null; then \
          /bin/cat /etc/os-release >/dev/null 2>&1 && echo {UUTILS_RUNTIME_MARKER}; \
@@ -477,19 +607,17 @@ fn etc_files(sys: &SystemDef) -> Vec<(&'static str, String, bool)> {
         // store-symlink farm.
         ("autologin", build_autologin(sys), true),
         ("tty-session", build_tty_session(), true),
+        ("shutdown", build_shutdown(), true),
         ("rootcheck", build_rootcheck(sys), true),
         ("netup", build_netup(), true),
     ]
 }
 
-/// The gen_init_cpio spec for the STAGE-1 init-initramfs (`init.cpio`): a self-contained
-/// static busybox plus the `/init` pivot script. `{in:...}`/`{root}` tokens are expanded
-/// by the engine when it writes this file, so gen_init_cpio reads real paths. Every entry
-/// is uid/gid 0. The packed `/dev/console` node carries PID-1 stdio in the window before
-/// stage-1 mounts devtmpfs; /sysroot is the erofs mountpoint.
-fn build_stage1_spec() -> String {
+/// A gen_init_cpio spec for one of the two structurally distinct boot phases.
+/// The selector carries td-kexec; the selected deployment phase does not.
+fn build_initramfs_spec(init: &str, include_kexec: bool) -> String {
     let mut s = String::new();
-    for d in ["/dev", "/sysroot", "/td", "/td/store"] {
+    for d in ["/dev", "/proc", "/volume", "/sysroot", "/td", "/td/store"] {
         s.push_str(&format!("dir {d} 0755 0 0\n"));
     }
     // The static busybox at its content-addressed /td/store path; the cpio's /bin/busybox
@@ -500,8 +628,18 @@ fn build_stage1_spec() -> String {
     s.push_str("dir /bin 0755 0 0\n");
     s.push_str("slink /bin/busybox {in:busybox-x86-64}/bin/busybox 0777 0 0\n");
     s.push_str("slink /bin/sh {in:busybox-x86-64}/bin/busybox 0777 0 0\n");
+    s.push_str("dir {in:td-boot} 0755 0 0\n");
+    s.push_str("dir {in:td-boot}/bin 0755 0 0\n");
+    s.push_str("file {in:td-boot}/bin/td-boot {in:td-boot}/bin/td-boot 0755 0 0\n");
+    s.push_str("slink /bin/td-boot {in:td-boot}/bin/td-boot 0777 0 0\n");
+    if include_kexec {
+        s.push_str("dir {in:td-kexec} 0755 0 0\n");
+        s.push_str("dir {in:td-kexec}/bin 0755 0 0\n");
+        s.push_str("file {in:td-kexec}/bin/td-kexec {in:td-kexec}/bin/td-kexec 0755 0 0\n");
+        s.push_str("slink /bin/td-kexec {in:td-kexec}/bin/td-kexec 0777 0 0\n");
+    }
     s.push_str("nod /dev/console 0600 0 0 c 5 1\n");
-    s.push_str("file /init {root}/stage1-init 0755 0 0\n");
+    s.push_str(&format!("file /init {{root}}/{init} 0755 0 0\n"));
     s
 }
 
@@ -517,7 +655,16 @@ fn real_root_steps(sys: &SystemDef) -> Vec<Step> {
     // Empty mountpoints and the immutable root-image skeleton. State directories are
     // created after /var is mounted, rather than hidden content packed into EROFS.
     for d in [
-        "/dev", "/proc", "/sys", "/tmp", "/run", "/etc", "/bin", "/mnt", "/var", "/td",
+        "/dev",
+        "/proc",
+        "/sys",
+        "/tmp",
+        "/run",
+        "/etc",
+        "/bin",
+        "/mnt",
+        "/var",
+        "/td",
         "/td/store",
     ] {
         steps.push(Step::MkDir {
@@ -638,20 +785,35 @@ fn real_root_steps(sys: &SystemDef) -> Vec<Step> {
 /// assert, not a behavioural test — the boot is exercised by `td-recipe-eval run` and the
 /// headless `qemu-boot-system` oracle.
 fn shape_check() -> String {
-    "init='{out}/deployment/initramfs.cpio'; root='{root}/real-root'; disk='{out}/deployment/root.erofs'; manifest='{out}/deployment/manifest'; bb='{in:busybox-x86-64}/bin/busybox'; \
-     sz=$(wc -c < \"$init\"); \
-     [ \"$sz\" -ge 65536 ] || { echo \"init.cpio: implausibly small ($sz bytes) - the static busybox alone is ~1 MiB\" >&2; exit 1; }; \
-     set -- $(od -An -tx1 -N 6 \"$init\"); \
-     [ \"$1$2$3$4$5$6\" = 303730373031 ] || { echo 'init.cpio: missing the newc cpio magic 070701' >&2; exit 1; }; \
-     list=$(\"$bb\" cpio -t < \"$init\" 2>/dev/null) || { echo 'init.cpio: busybox cpio -t could not parse the archive (truncated/corrupt newc stream)' >&2; exit 1; }; \
-     for m in init bin/busybox bin/sh dev/console; do \
-         printf '%s\\n' \"$list\" | grep -q -x -F \"$m\" || { echo \"init.cpio: cpio member '$m' missing - the stage-1 initramfs is incomplete\" >&2; exit 1; }; \
+    "selector='{out}/boot/selector-initramfs.cpio'; selector_manifest='{out}/boot/manifest'; init='{out}/deployment/initramfs.cpio'; root='{root}/real-root'; disk='{out}/deployment/root.erofs'; manifest='{out}/deployment/manifest'; bb='{in:busybox-x86-64}/bin/busybox'; \
+     for archive in \"$selector\" \"$init\"; do \
+         sz=$(wc -c < \"$archive\"); \
+         [ \"$sz\" -ge 65536 ] || { echo \"initramfs $archive: implausibly small ($sz bytes) - the static busybox alone is ~1 MiB\" >&2; exit 1; }; \
+         set -- $(od -An -tx1 -N 6 \"$archive\"); \
+         [ \"$1$2$3$4$5$6\" = 303730373031 ] || { echo \"initramfs $archive: missing the newc cpio magic 070701\" >&2; exit 1; }; \
+         \"$bb\" cpio -t < \"$archive\" >/dev/null 2>&1 || { echo \"initramfs $archive: busybox cpio -t could not parse the archive\" >&2; exit 1; }; \
      done; \
-     printf '%s\\n' \"$list\" | grep -qE '^td/store/[^/]+/bin/busybox$' || { echo 'init.cpio: the busybox binary is not packed under td/store/<hash>/bin' >&2; exit 1; }; \
+     selector_list=$(\"$bb\" cpio -t < \"$selector\" 2>/dev/null); \
+     init_list=$(\"$bb\" cpio -t < \"$init\" 2>/dev/null); \
+     for m in init bin/busybox bin/sh bin/td-boot dev/console proc volume sysroot; do \
+         printf '%s\\n' \"$selector_list\" | grep -q -x -F \"$m\" || { echo \"selector initramfs: cpio member '$m' missing\" >&2; exit 1; }; \
+         printf '%s\\n' \"$init_list\" | grep -q -x -F \"$m\" || { echo \"deployment initramfs: cpio member '$m' missing\" >&2; exit 1; }; \
+     done; \
+     printf '%s\\n' \"$selector_list\" | grep -q -x -F bin/td-kexec || { echo 'selector initramfs: td-kexec missing' >&2; exit 1; }; \
+     if printf '%s\\n' \"$init_list\" | grep -q -x -F bin/td-kexec; then echo 'deployment initramfs: td-kexec must be selector-only' >&2; exit 1; fi; \
+     printf '%s\\n' \"$selector_list\" | grep -qE '^td/store/[^/]+/bin/td-boot$' || { echo 'selector initramfs: td-boot store member missing' >&2; exit 1; }; \
+     printf '%s\\n' \"$init_list\" | grep -qE '^td/store/[^/]+/bin/td-boot$' || { echo 'deployment initramfs: td-boot store member missing' >&2; exit 1; }; \
+     printf '%s\\n' \"$selector_list\" | grep -qE '^td/store/[^/]+/bin/td-kexec$' || { echo 'selector initramfs: td-kexec store member missing' >&2; exit 1; }; \
+     if printf '%s\\n' \"$init_list\" | grep -qE '^td/store/[^/]+/bin/td-kexec$'; then echo 'deployment initramfs: td-kexec store member must be selector-only' >&2; exit 1; fi; \
+     [ \"$(wc -l < \"$selector_manifest\")\" -eq 2 ] || { echo 'selector manifest: expected header plus one payload entry' >&2; exit 1; }; \
+     [ \"$(head -n 1 \"$selector_manifest\")\" = td-deployment-v1 ] || { echo 'selector manifest: unsupported header' >&2; exit 1; }; \
+     grep -q -E '^[0-9a-f]{64}  selector-initramfs\\.cpio$' \"$selector_manifest\" || { echo 'selector manifest: missing strict SHA-256 entry' >&2; exit 1; }; \
+     printf '%s\\n' \"$selector_list\" | grep -qE '^td/store/[^/]+/bin/busybox$' || { echo 'selector initramfs: busybox store member missing' >&2; exit 1; }; \
+     printf '%s\\n' \"$init_list\" | grep -qE '^td/store/[^/]+/bin/busybox$' || { echo 'deployment initramfs: busybox store member missing' >&2; exit 1; }; \
      [ -f \"$root/init\" ] || [ -L \"$root/init\" ] || { echo 'root tree: /init missing' >&2; exit 1; }; \
      case $(readlink \"$root/init\") in /td/store/*) : ;; *) echo 'root tree: /init is not a symlink into /td/store' >&2; exit 1;; esac; \
      case $(readlink \"$root/bin/sh\") in /td/store/*) : ;; *) echo 'root tree: /bin/sh is not a symlink into /td/store - the store-native /bin farm regressed' >&2; exit 1;; esac; \
-     for f in passwd group shadow hostname os-release inittab profile autologin tty-session rootcheck netup; do \
+     for f in passwd group shadow hostname os-release inittab profile autologin tty-session shutdown rootcheck netup; do \
          [ -f \"$root/etc/$f\" ] || { echo \"root tree: /etc/$f missing\" >&2; exit 1; }; \
      done; \
      for l in resolv.conf hosts; do \
@@ -665,6 +827,9 @@ fn shape_check() -> String {
      applets=$(\"$bb\" --list 2>/dev/null) || { echo 'busybox --list failed - cannot verify applet coverage' >&2; exit 1; }; \
      for a in @BUSYBOX_APPLETS@; do \
          printf '%s\\n' \"$applets\" | grep -q -x -F \"$a\" || { echo \"busybox does not implement applet '$a' (config drift) - its packed /bin/$a symlink would be a dead link\" >&2; exit 1; }; \
+     done; \
+     for a in @INITRAMFS_APPLETS@; do \
+         printf '%s\\n' \"$applets\" | grep -q -x -F \"$a\" || { echo \"busybox does not implement initramfs applet '$a' (config drift)\" >&2; exit 1; }; \
      done; \
      uu=\"{root}/real-root{in:uutils}/bin/coreutils\"; uutgt=\"{in:uutils}/bin/coreutils\"; \
      { [ -f \"$uu\" ] && [ -x \"$uu\" ]; } || { echo 'root tree: the uutils coreutils multicall is not packed at real-root{in:uutils}/bin/coreutils - the /bin coreutils symlinks would all dangle (#547)' >&2; exit 1; }; \
@@ -694,6 +859,7 @@ fn shape_check() -> String {
         // inside the assembled root; compare symlink text without resolving it. The headless
         // boot oracle executes uutils after pivoting and remains the behavioral runtime check.
         .replace("@BUSYBOX_APPLETS@", &BUSYBOX_APPLETS.join(" "))
+        .replace("@INITRAMFS_APPLETS@", &INITRAMFS_APPLETS.join(" "))
         .replace("@UUTILS_APPLETS@", &UUTILS_APPLETS.join(" "))
 }
 
@@ -715,18 +881,26 @@ pub fn recipe() -> Recipe {
         .env("PATH", &mesboot0_path()),
     );
 
-    // 2) Stage the STAGE-1 init-initramfs: write the pivot /init script and the
-    //    gen_init_cpio spec, then pack init.cpio with the exported (td-built)
-    //    gen_init_cpio — root-owned entries, the /dev/console fallback node, `-t 1` for a
-    //    reproducible mtime.
+    // 2) Pack distinct direct-boot selector and selected-deployment initramfs
+    //    artifacts. Only the selector contains td-kexec.
     steps.push(Step::WriteFile {
-        path: "{root}/stage1-init".into(),
-        content: build_stage1_init(&SYSTEM),
+        path: "{root}/selector-init".into(),
+        content: build_selector_init(),
         exec: true,
     });
     steps.push(Step::WriteFile {
-        path: "{root}/init.spec".into(),
-        content: build_stage1_spec(),
+        path: "{root}/selector.spec".into(),
+        content: build_initramfs_spec("selector-init", true),
+        exec: false,
+    });
+    steps.push(Step::WriteFile {
+        path: "{root}/deployment-init".into(),
+        content: build_deployment_init(&SYSTEM),
+        exec: true,
+    });
+    steps.push(Step::WriteFile {
+        path: "{root}/deployment.spec".into(),
+        content: build_initramfs_spec("deployment-init", false),
         exec: false,
     });
     steps.push(
@@ -735,7 +909,8 @@ pub fn recipe() -> Recipe {
             &[
                 SH,
                 "-c",
-                "'{in:linux-x86-64}/gen_init_cpio' -t 1 '{root}/init.spec' > '{root}/initramfs.cpio'",
+                "'{in:linux-x86-64}/gen_init_cpio' -t 1 '{root}/selector.spec' > '{root}/selector-initramfs.cpio'; \
+                 '{in:linux-x86-64}/gen_init_cpio' -t 1 '{root}/deployment.spec' > '{root}/initramfs.cpio'",
             ],
         )
         .env("PATH", &mesboot0_path()),
@@ -746,12 +921,26 @@ pub fn recipe() -> Recipe {
     steps.push(Step::MkDir {
         path: "{out}/deployment".into(),
     });
+    steps.push(Step::MkDir {
+        path: "{out}/boot".into(),
+    });
     steps.push(Step::CopyFiles {
         files: vec![
             "{in:linux-x86-64}/bzImage".into(),
             "{root}/initramfs.cpio".into(),
         ],
         dest: "{out}/deployment".into(),
+    });
+    steps.push(Step::CopyFiles {
+        files: vec!["{root}/selector-initramfs.cpio".into()],
+        dest: "{out}/boot".into(),
+    });
+    steps.push(Step::Sha256Manifest {
+        output: "{out}/boot/manifest".into(),
+        entries: vec![(
+            "selector-initramfs.cpio".into(),
+            "{out}/boot/selector-initramfs.cpio".into(),
+        )],
     });
     steps.push(Step::PackErofs {
         root: "{root}/real-root".into(),
@@ -765,10 +954,7 @@ pub fn recipe() -> Recipe {
                 "initramfs.cpio".into(),
                 "{out}/deployment/initramfs.cpio".into(),
             ),
-            (
-                "root.erofs".into(),
-                "{out}/deployment/root.erofs".into(),
-            ),
+            ("root.erofs".into(), "{out}/deployment/root.erofs".into()),
         ],
     });
 
@@ -779,12 +965,14 @@ pub fn recipe() -> Recipe {
             "{out}/deployment/initramfs.cpio".into(),
             "{out}/deployment/root.erofs".into(),
             "{out}/deployment/manifest".into(),
+            "{out}/boot/selector-initramfs.cpio".into(),
+            "{out}/boot/manifest".into(),
         ],
         exec: false,
     });
     steps.push(Step::run("{out}", &[SH, "-c", &shape_check()]).env("PATH", &mesboot0_path()));
 
-    Recipe::mesboot("system-x86-64", "0.1")
+    Recipe::mesboot("system-x86-64", "0.2")
         // busybox: the static boot/greeter userland + the `cpio -t`/applet shape check.
         // linux-x86-64: the EXPORTED gen_init_cpio packer (verified STATICALLY linked).
         // uutils: the dynamically-linked `coreutils` multicall packed as the /bin file/text
@@ -794,7 +982,17 @@ pub fn recipe() -> Recipe {
         // glibc-x86-64: uutils' and sshd's declared runtime input. StageRuntimeClosure reaches
         //   it from their embedded store references and copies the whole content-addressed item.
         // td-netd: the static network bring-up daemon (empty runtime closure, CopyTree'd).
-        .native_inputs(&["busybox-x86-64", "linux-x86-64", "uutils", "glibc-x86-64", "sshd", "td-netd"])
+        // td-boot/td-kexec: static initramfs selector and confined kexec helper.
+        .native_inputs(&[
+            "busybox-x86-64",
+            "linux-x86-64",
+            "uutils",
+            "glibc-x86-64",
+            "sshd",
+            "td-netd",
+            "td-boot",
+            "td-kexec",
+        ])
         .inputs_owned(mesboot0_inputs(&[]))
         .steps(steps)
 }
@@ -813,7 +1011,11 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(closures.len(), 1, "the image needs one runtime-closure step");
+        assert_eq!(
+            closures.len(),
+            1,
+            "the image needs one runtime-closure step"
+        );
         let (roots, dest) = closures.first().expect("one runtime closure");
         assert_eq!(
             roots.as_slice(),
@@ -860,6 +1062,16 @@ mod tests {
             .map(|(label, _)| label.as_str())
             .collect();
         assert_eq!(labels, ["bzImage", "initramfs.cpio", "root.erofs"]);
+        assert!(steps.iter().any(|step| matches!(
+            step,
+            Step::Sha256Manifest { output, entries }
+                if output == "{out}/boot/manifest"
+                    && entries.as_slice()
+                        == [(
+                            "selector-initramfs.cpio".into(),
+                            "{out}/boot/selector-initramfs.cpio".into(),
+                        )]
+        )));
     }
 
     /// The tailorable `SYSTEM` const is hand-edited to shape the distro; guard the
@@ -868,9 +1080,25 @@ mod tests {
     /// never packed into /bin.
     #[test]
     fn system_def_is_self_consistent() {
+        for user in SYSTEM.users {
+            assert_eq!(
+                SYSTEM
+                    .users
+                    .iter()
+                    .filter(|candidate| candidate.name == user.name)
+                    .count(),
+                1,
+                "user name '{}' must be unique",
+                user.name
+            );
+        }
         assert!(
-            SYSTEM.users.iter().any(|u| u.name == SYSTEM.autologin),
-            "autologin user '{}' is not defined in SYSTEM.users",
+            SYSTEM
+                .users
+                .iter()
+                .find(|user| user.name == SYSTEM.autologin)
+                .is_some_and(|user| user.uid != 0),
+            "autologin user '{}' must resolve uniquely to an unprivileged user",
             SYSTEM.autologin
         );
         for u in SYSTEM.users {
@@ -918,7 +1146,16 @@ mod tests {
     /// uutils (the shape check catches it at build time, this catches it at test time).
     #[test]
     fn greeter_and_pivot_applets_are_present() {
-        for a in ["sh", "getty", "login", "init", "mount", "umount", "reboot", "switch_root"] {
+        for a in [
+            "sh",
+            "getty",
+            "login",
+            "init",
+            "mount",
+            "umount",
+            "reboot",
+            "switch_root",
+        ] {
             assert!(
                 BUSYBOX_APPLETS.contains(&a),
                 "boot-critical applet '{a}' missing from BUSYBOX_APPLETS"
@@ -989,7 +1226,7 @@ mod tests {
     }
 
     /// The inittab must respawn `tty-session` (not a bare getty), run `rootcheck` at
-    /// sysinit (the read-only-root self-check), and `tty-session` must exec `reboot -f`
+    /// sysinit (the read-only-root self-check), and `tty-session` must ask init to reboot
     /// after the login flow — the "exit / Ctrl-D powers off the VM" path. A refactor that
     /// reverts the inittab to a bare getty, drops rootcheck, or drops the reboot would
     /// silently strip a guarantee; red it here.
@@ -1010,40 +1247,77 @@ mod tests {
         );
         let session = build_tty_session();
         // getty must gate the reboot (`&&`), so a FAILED session respawns rather than
-        // firing reboot -f and masking a broken greeter as a clean exit-0 shutdown.
+        // firing reboot and masking a broken greeter as a clean exit-0 shutdown.
         assert!(
             session.contains("/bin/getty ")
                 && session.contains("-l /etc/autologin ")
-                && session.contains("&& exec /bin/reboot -f"),
+                && session.contains("&& exec /bin/reboot")
+                && !session.contains("reboot -f"),
             "tty-session must run getty (autologin at /etc/autologin) then, only on success, \
-             `reboot -f` so the greeter's exit stops the VM but a failure retries"
+             ask init to reboot so shutdown actions run, while a failed login retries"
+        );
+        let shutdown = build_shutdown();
+        assert!(
+            shutdown.contains("/bin/busybox sync || {")
+                && shutdown.contains("/bin/busybox umount /var || {")
+                && shutdown.contains("/bin/busybox umount -a -r || {")
+                && shutdown.contains("/bin/busybox test \"$ok\" = 1")
+                && shutdown.contains(SYSTEM_SHUTDOWN_MARKER),
+            "the init shutdown action must attempt every safety step and emit its marker only when all pass"
         );
     }
 
-    /// Stage 1 must mount the EROFS root read-only, mount writable state directly,
-    /// leave `/etc` untouched, and `exec switch_root` so the pivot inherits PID 1.
+    /// The first pass must select through td-boot. The selected pass must bind
+    /// root.erofs through td-boot, mount persistent @var, leave `/etc`
+    /// untouched, and `exec switch_root` so the pivot inherits PID 1.
     #[test]
-    fn stage1_init_mounts_ro_and_pivots() {
-        let init = build_stage1_init(&SYSTEM);
-        // Fail-safe: `set -e` aborts on the first mount failure rather than pressing on
-        // into a partial switch_root (re #550, Codex review).
+    fn distinct_initramfses_select_then_mount_persistent_state() {
+        let selector = build_selector_init();
+        let init = build_deployment_init(&SYSTEM);
         assert!(
-            init.contains("\nset -e\n") || init.contains("#!/bin/sh\nset -e"),
-            "stage-1 init must `set -e` so a failed mount aborts loudly, not into a partial pivot"
+            selector.contains("exec /bin/td-boot boot /dev/vda /volume")
+                && !selector.contains("root-loop")
+                && init.contains("root-loop")
+                && !init.contains("td-boot boot"),
+            "the direct-boot selector and selected-deployment initramfs must be structurally distinct"
+        );
+        // Fail-safe: abort on the first mount failure instead of switch_rooting
+        // into a partial system.
+        assert!(
+            selector.contains("\nset -e\n") && init.contains("\nset -e\n"),
+            "both initramfs phases must fail closed"
         );
         assert!(
-            init.contains("mount -t erofs -o ro /dev/vda /sysroot"),
-            "stage-1 init must mount /dev/vda as read-only erofs at /sysroot"
+            selector.contains("\nset -f\n")
+                && init.contains("\nset -f\n")
+                && init.contains("duplicate td.deployment handoff")
+                && init.contains("missing td.deployment handoff"),
+            "both initramfses must disable globbing and the selected phase must require one handoff"
         );
         assert!(
-            init.contains("tmpfs /sysroot/var")
+            init.contains("/bin/td-boot root-loop /volume")
+                && init.contains("mount -t erofs -o ro /dev/loop0 /sysroot"),
+            "the selected pass must bind the reverified root to a read-only loop device"
+        );
+        assert!(
+            init.contains("subvol=@var /dev/vda /sysroot/var")
                 && init.contains("tmpfs /sysroot/run")
-                && init.contains("tmpfs /sysroot/tmp"),
-            "stage-1 init must mount the writable state and volatile directories directly"
+                && init.contains("tmpfs /sysroot/tmp")
+                && init.contains("rm -rf /sysroot/var/run")
+                && init.contains("ln -s /run /sysroot/var/run"),
+            "stage-1 init must mount persistent @var, keep runtime state volatile, and link /var/run into /run"
         );
         assert!(
-            !init.contains("-t overlay") && !init.contains(" /sysroot/etc"),
-            "stage-1 init must leave deployment-owned /etc on the immutable erofs root"
+            !init.contains("tmpfs /sysroot/var")
+                && !init.contains("-t overlay")
+                && !init.contains(" /sysroot/etc"),
+            "stage-1 init must not restore tmpfs state or an overlay over immutable /etc"
+        );
+        assert!(
+            init.contains("mount -o move /volume /sysroot/run/td-volume")
+                && init.contains("/bin/busybox umount /proc")
+                && init.contains("/bin/busybox umount /dev"),
+            "the verified backing volume must move below the new root while old pseudo-filesystems are released"
         );
         assert!(
             init.contains("/sysroot/var/home"),
@@ -1061,7 +1335,14 @@ mod tests {
             "stage-1 init must create the root home with mode 0700"
         );
         assert!(
-            init.trim_end().ends_with("exec /bin/busybox switch_root /sysroot /init"),
+            init.contains("chown 0:0 /sysroot/var")
+                && init.contains("chmod 0755 /sysroot/var")
+                && init.contains("chmod 0700 /sysroot/var/root"),
+            "selected init must normalize persistent state ownership and modes"
+        );
+        assert!(
+            init.trim_end()
+                .ends_with("exec /bin/busybox switch_root /sysroot /init"),
             "stage-1 init must END by exec-ing switch_root so the pivot inherits PID 1"
         );
     }
@@ -1114,11 +1395,39 @@ mod tests {
     #[test]
     fn boot_markers_are_wired() {
         let rootcheck = build_rootcheck(&SYSTEM);
-        assert!(rootcheck.contains(SYSTEM_ROOT_RO_MARKER), "rootcheck must emit the ro-root marker");
-        assert!(rootcheck.contains(SYSTEM_ETC_RO_MARKER), "rootcheck must emit the immutable-/etc marker");
+        assert!(
+            rootcheck.contains(SYSTEM_ROOT_RO_MARKER),
+            "rootcheck must emit the ro-root marker"
+        );
+        assert!(
+            rootcheck.contains(SYSTEM_ETC_RO_MARKER),
+            "rootcheck must emit the immutable-/etc marker"
+        );
         assert!(
             rootcheck.contains(SYSTEM_STATE_WRITABLE_MARKER),
             "rootcheck must emit the writable-state marker"
+        );
+        assert!(
+            rootcheck.contains("readlink /var/run)\" = /run"),
+            "rootcheck must prove /var/run resolves into volatile /run"
+        );
+        assert!(
+            rootcheck.contains(SYSTEM_STATE_OWNER_MARKER)
+                && rootcheck.contains("test ! -w /var")
+                && rootcheck.contains("test ! -w /var/root"),
+            "rootcheck must prove the login user cannot own system state"
+        );
+        assert!(
+            rootcheck.contains(PERSIST_WRITE_CMDLINE_TOKEN)
+                && rootcheck.contains(SYSTEM_PERSIST_WRITE_MARKER)
+                && rootcheck.contains(PERSIST_READ_CMDLINE_TOKEN)
+                && rootcheck.contains(SYSTEM_PERSIST_READ_MARKER),
+            "rootcheck must wire both halves of the two-boot persistence oracle"
+        );
+        assert!(
+            rootcheck.contains("test ! -e /var/lib/td/boot-marker")
+                && rootcheck.contains("&& /bin/busybox sync"),
+            "the write marker must require a fresh path and a successful sync"
         );
         // Home ownership is fixed for every non-root user below /var.
         for u in SYSTEM.users {
@@ -1131,7 +1440,10 @@ mod tests {
             }
         }
         let profile = build_profile(&SYSTEM);
-        assert!(profile.contains(GREETER_MARKER), "profile must emit the greeter marker");
+        assert!(
+            profile.contains(GREETER_MARKER),
+            "profile must emit the greeter marker"
+        );
         assert!(
             profile.contains(AUTOTEST_CMDLINE_TOKEN) && profile.contains("exit"),
             "profile must exit on the autotest cmdline token so the headless boot powers off"
@@ -1177,6 +1489,54 @@ mod tests {
             )),
             "the reach marker must be gated on a successful td-netd reach"
         );
+    }
+
+    #[test]
+    fn initramfs_packs_the_verified_boot_chain() {
+        let selector = build_initramfs_spec("selector-init", true);
+        let deployment = build_initramfs_spec("deployment-init", false);
+        for entry in [
+            "file {in:td-boot}/bin/td-boot {in:td-boot}/bin/td-boot 0755 0 0",
+            "slink /bin/td-boot {in:td-boot}/bin/td-boot 0777 0 0",
+            "dir /volume 0755 0 0",
+            "dir /proc 0755 0 0",
+        ] {
+            assert!(
+                selector.contains(entry) && deployment.contains(entry),
+                "both initramfs specs need boot-chain entry {entry}"
+            );
+        }
+        assert!(
+            selector
+                .contains("file {in:td-kexec}/bin/td-kexec {in:td-kexec}/bin/td-kexec 0755 0 0")
+                && selector.contains("slink /bin/td-kexec {in:td-kexec}/bin/td-kexec 0777 0 0")
+                && !deployment.contains("{in:td-kexec}"),
+            "only the selector initramfs may carry td-kexec"
+        );
+        for applet in td_boot_protocol::REQUIRED_BUSYBOX_APPLETS {
+            assert!(
+                INITRAMFS_APPLETS.contains(applet),
+                "td-boot invokes uncovered busybox applet {applet}"
+            );
+        }
+        for script in [
+            build_selector_init(),
+            build_deployment_init(&SYSTEM),
+            build_rootcheck(&SYSTEM),
+            build_shutdown(),
+        ] {
+            for invocation in script.split("/bin/busybox ").skip(1) {
+                if let Some(raw) = invocation.split_whitespace().next() {
+                    let applet = raw.trim_end_matches(|character: char| {
+                        !character.is_ascii_alphanumeric() && character != '-' && character != '_'
+                    });
+                    assert!(
+                        INITRAMFS_APPLETS.contains(&applet) || BUSYBOX_APPLETS.contains(&applet),
+                        "boot script invokes uncovered busybox applet {applet}"
+                    );
+                }
+            }
+        }
     }
 
     /// td-netd must be packed and symlinked into /bin, and resolv.conf/hosts must be
