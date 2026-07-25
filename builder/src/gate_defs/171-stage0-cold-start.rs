@@ -83,6 +83,11 @@ pa=`"$tbw" store-add-builder probe-0.1.0 "$scratch/probe" "$scratch/pstore-a" "$
 	pan=`"$tbw" store-closure "$scratch/pa.db" "$pa" | "$tbw" text count-nonempty -`; \
 test "$pan" = 1 || { echo "FAIL: absent-seed-dir placement recorded $pan closure paths, expected 1 (self only)" >&2; exit 1; }; \
 echo "  [DURABLE guix-less arm] absent seed dir: placement succeeds, closure is self-only"; \
+echo ">> idempotent re-placement: whenever stage0_place misses its .stage0-meta memo but the placement still stands (a torn place that never wrote the memo, a deleted builder.db, or a fingerprint-only source change that compiles byte-identically), it re-places into a store that ALREADY holds that content-addressed path — which must succeed at the same path, not EEXIST"; \
+pa2=`"$tbw" store-add-builder probe-0.1.0 "$scratch/probe" "$scratch/pstore-a" "$scratch/pa2.db" "$scratch/ABSENT"` \
+  || { echo "FAIL: re-placing an already-present content-addressed builder failed — store-add-builder is not idempotent, so a warm re-run cannot place the stage0" >&2; exit 1; }; \
+	test "$pa2" = "$pa" || { echo "FAIL: re-placement returned $pa2, expected the same content-addressed path $pa" >&2; exit 1; }; \
+echo "  [DURABLE idempotent re-intern] re-placing the same tree into the same store succeeds at the same path"; \
 echo ">> fail-loud arm: a PRESENT-but-unreadable seed dir (a regular file, not a directory) must ERROR — a broken seed must not silently place a refless builder (#313 fail-open guard)"; \
 printf 'not a store directory\n' > "$scratch/notadir"; \
 if "$tbw" store-add-builder probe-0.1.0 "$scratch/probe" "$scratch/pstore-f" "$scratch/pf.db" "$scratch/notadir" 2>"$scratch/pf.err"; then \
@@ -103,7 +108,7 @@ pb=`"$tbw" store-add-builder probe2-0.1.0 "$scratch/probe2" "$scratch/pstore-b" 
 	  || { echo "FAIL: the embedded ref $g was NOT found by the controlled seed-dir readdir scan — the candidate source is broken" >&2; exit 1; }; \
 echo "  [DURABLE self-discrimination] same probe bytes: absent dir → self-only; controlled seed dir → the embedded synthetic ref recorded"; \
 rm -rf "$scratch"; \
-echo "PASS: the stage0 placement no longer needs ANY guix state: with /var/guix bind-mounted empty, a cold td-builder stage0-place run placed a stage0 that runs, at the SAME canonical path with the SAME SELF-ONLY builder.db closure as the warm guix-host placement — the musl-static builder embeds no external store ref, so an empty seed scan is exactly right and no host runtime lib dir leaks into the sandbox (re #469). The reference-scan mechanism stays load-bearing (a probe with a synthetic store path records the ref ONLY when a controlled seed dir holding the matching entry is passed); an absent seed dir (a truly guix-less host) still places with a self-only closure; and a non-directory seed dir errors loudly (no silent refless placement). The guix-less cold start (#313) is unblocked."
+echo "PASS: the stage0 placement no longer needs ANY guix state: with /var/guix bind-mounted empty, a cold td-builder stage0-place run placed a stage0 that runs, at the SAME canonical path with the SAME SELF-ONLY builder.db closure as the warm guix-host placement — the musl-static builder embeds no external store ref, so an empty seed scan is exactly right and no host runtime lib dir leaks into the sandbox (re #469). The reference-scan mechanism stays load-bearing (a probe with a synthetic store path records the ref ONLY when a controlled seed dir holding the matching entry is passed); an absent seed dir (a truly guix-less host) still places with a self-only closure; re-placing an already-present tree is idempotent (same path, no EEXIST) so a warm re-run can place the stage0; and a non-directory seed dir errors loudly (no silent refless placement). The guix-less cold start (#313) is unblocked."
 "##,
     }
 }

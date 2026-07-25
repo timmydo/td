@@ -1416,7 +1416,7 @@ fn store_add_recursive(
         let got = nar_hash_path(&disk).map_err(|e| e.to_string())?;
         if got != nar {
             return Err(format!(
-                "store item {} exists but hashes {got}, expected {nar} — corrupt content-addressed item; refusing to re-register it (re #469)",
+                "store item {} exists but hashes {got}, expected {nar} — corrupt content-addressed item; refusing to re-register it; remove it to re-intern (re #469)",
                 disk.display()
             ));
         }
@@ -1442,6 +1442,132 @@ fn store_add_recursive(
         deriver: String::new(), // a source add has none
     };
     merge_output_db(Path::new(out_db), std::slice::from_ref(&reg))?;
+    Ok(path)
+}
+
+/// The `store-add-builder` body, factored so the re-intern semantics unit-test
+/// (mirroring `store_add_recursive`): restore TREE as a content-addressed
+/// `source` item under STORE-DIR, scan its references against SEED-STORE-DIR's
+/// entries, and write OUT-DB. Prints nothing; returns the computed store path.
+fn store_add_builder(
+    name: &str,
+    tree: &str,
+    store_dir: &str,
+    out_db: &str,
+    seed_store: &str,
+) -> Result<String, String> {
+    use store_db::{Table, Value};
+    // Content-addressed path from the tree's recursive NAR sha256 (same as
+    // store-add-recursive — a `source`-type path).
+    let nar = nar_hash(tree).map_err(|e| e.to_string())?;
+    let hex = nar
+        .strip_prefix("sha256:")
+        .ok_or_else(|| format!("nar-hash returned `{nar}', expected sha256:<hex>"))?;
+    let path = store::make_store_path("source", hex, name);
+    let base = path
+        .rsplit('/')
+        .next()
+        .filter(|_| store::name_from_store_path(&path).is_some())
+        .ok_or_else(|| format!("computed path {path} is malformed"))?
+        .to_string();
+    // Canonically restore the tree into the td-owned store. The path is
+    // content-addressed, so an EXISTING tree there must already BE this content:
+    // verify it instead of copying over it, which is what makes the loop's warm
+    // re-placement idempotent. A hash mismatch is a corrupt store item, never
+    // reuse. Mirrors store_add_recursive, including its atomic first intern.
+    std::fs::create_dir_all(store_dir).map_err(|e| e.to_string())?;
+    let disk = Path::new(store_dir).join(&base);
+    if disk.symlink_metadata().is_ok() {
+        let got = nar_hash_path(&disk).map_err(|e| e.to_string())?;
+        if got != nar {
+            return Err(format!(
+                "store item {} exists but hashes {got}, expected {nar} — corrupt content-addressed item; refusing to re-register it; remove it to re-intern (re #469)",
+                disk.display()
+            ));
+        }
+    } else {
+        commit_canonical_atomic(Path::new(tree), &disk)?;
+    }
+    // Scan the restored tree for references AGAINST the seed store DIRECTORY's
+    // entries (the pinned toolchain store) — the builder's actual store deps,
+    // with NO read of guix's private db (#313: a guix-less host cold-starts).
+    // An ABSENT seed dir is legitimate (a guix-less host has no /gnu/store, so
+    // the stage0 embeds no store refs and the placement records an empty ref
+    // set). But a PRESENT-but-unreadable seed dir (a typo'd path, a regular
+    // file, an EACCES mount) must FAIL LOUDLY, not be silently treated as
+    // empty — a refless placement would poison the builder's closure and
+    // surface only as an opaque exec/link failure at build time. So
+    // distinguish NotFound (benign, no candidates) from any other read_dir
+    // error here, restoring the loud failure the old sqlite seed read gave;
+    // scan_candidate_index itself swallows both as "contributes nothing".
+    match std::fs::read_dir(seed_store) {
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(format!("seed store {seed_store}: {e}")),
+    }
+    // The path itself is a candidate so a self-reference is detected. Extra
+    // never-matching candidates cannot add references (scan.rs candidate note).
+    let seed_dirs = [seed_store.to_string()];
+    let (mut candidates, _on_disk) = scan_candidate_index(&seed_dirs, seed_store)?;
+    candidates.push(path.clone());
+    let mut s = scan::Scanner::new(&candidates).map_err(|e| e.to_string())?;
+    nar::write_nar(&mut s, &disk).map_err(|e| e.to_string())?;
+    let (hash, size, mut refs) = s.finish();
+    refs.sort();
+    refs.dedup();
+    // Register: id 1 = the builder (full record), each external reference a
+    // scaffolding ValidPaths row (path only) so the Refs ids resolve. So
+    // OUT-DB.closure(path) returns the builder + its DIRECT refs; realize then
+    // spans those refs' transitive closures from the seed content-scan.
+    let mut valid: Vec<(i64, Vec<Value>)> = vec![(
+        1,
+        vec![
+            Value::Null,
+            Value::Text(path.clone()),
+            Value::Text(hash),
+            Value::Int(1),
+            Value::Null,
+            Value::Int(size as i64),
+        ],
+    )];
+    let mut ref_rows: Vec<(i64, Vec<Value>)> = Vec::new();
+    let mut edge = 1i64;
+    let mut next_id = 2i64;
+    for r in &refs {
+        let target = if r == &path {
+            1 // a self-reference resolves to id 1
+        } else {
+            valid.push((
+                next_id,
+                vec![
+                    Value::Null,
+                    Value::Text(r.clone()),
+                    Value::Null,
+                    Value::Null,
+                    Value::Null,
+                    Value::Null,
+                ],
+            ));
+            let id = next_id;
+            next_id += 1;
+            id
+        };
+        ref_rows.push((edge, vec![Value::Int(1), Value::Int(target)]));
+        edge += 1;
+    }
+    let tables = [
+        Table {
+            name: "ValidPaths",
+            sql: "CREATE TABLE ValidPaths (id integer primary key, path text, hash text, registrationTime integer, deriver text, narSize integer)",
+            rows: valid,
+        },
+        Table {
+            name: "Refs",
+            sql: "CREATE TABLE Refs (referrer integer, reference integer)",
+            rows: ref_rows,
+        },
+    ];
+    std::fs::write(out_db, store_db::write_db(&tables)).map_err(|e| e.to_string())?;
     Ok(path)
 }
 
@@ -7719,108 +7845,7 @@ fn main() -> ExitCode {
         Some("store-add-builder") if args.len() == 7 => {
             let (name, tree, store_dir, out_db, seed_store) =
                 (&args[2], &args[3], &args[4], &args[5], &args[6]);
-            let run = || -> Result<String, String> {
-                use store_db::{Table, Value};
-                // Content-addressed path from the tree's recursive NAR sha256 (same as
-                // store-add-recursive — a `source`-type path).
-                let nar = nar_hash(tree).map_err(|e| e.to_string())?;
-                let hex = nar
-                    .strip_prefix("sha256:")
-                    .ok_or_else(|| format!("nar-hash returned `{nar}', expected sha256:<hex>"))?;
-                let path = store::make_store_path("source", hex, name);
-                let base = path
-                    .rsplit('/')
-                    .next()
-                    .filter(|_| store::name_from_store_path(&path).is_some())
-                    .ok_or_else(|| format!("computed path {path} is malformed"))?
-                    .to_string();
-                // Canonically restore the tree into the td-owned store.
-                std::fs::create_dir_all(store_dir).map_err(|e| e.to_string())?;
-                let disk = Path::new(store_dir).join(&base);
-                copy_canonical(Path::new(tree), &disk)?;
-                // Scan the restored tree for references AGAINST the seed store DIRECTORY's
-                // entries (the pinned toolchain store) — the builder's actual store deps,
-                // with NO read of guix's private db (#313: a guix-less host cold-starts).
-                // An ABSENT seed dir is legitimate (a guix-less host has no /gnu/store, so
-                // the stage0 embeds no store refs and the placement records an empty ref
-                // set). But a PRESENT-but-unreadable seed dir (a typo'd path, a regular
-                // file, an EACCES mount) must FAIL LOUDLY, not be silently treated as
-                // empty — a refless placement would poison the builder's closure and
-                // surface only as an opaque exec/link failure at build time. So
-                // distinguish NotFound (benign, no candidates) from any other read_dir
-                // error here, restoring the loud failure the old sqlite seed read gave;
-                // scan_candidate_index itself swallows both as "contributes nothing".
-                match std::fs::read_dir(seed_store) {
-                    Ok(_) => {}
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(e) => return Err(format!("seed store {seed_store}: {e}")),
-                }
-                // The path itself is a candidate so a self-reference is detected. Extra
-                // never-matching candidates cannot add references (scan.rs candidate note).
-                let (mut candidates, _on_disk) =
-                    scan_candidate_index(std::slice::from_ref(seed_store), seed_store)?;
-                candidates.push(path.clone());
-                let mut s = scan::Scanner::new(&candidates).map_err(|e| e.to_string())?;
-                nar::write_nar(&mut s, &disk).map_err(|e| e.to_string())?;
-                let (hash, size, mut refs) = s.finish();
-                refs.sort();
-                refs.dedup();
-                // Register: id 1 = the builder (full record), each external reference a
-                // scaffolding ValidPaths row (path only) so the Refs ids resolve. So
-                // OUT-DB.closure(path) returns the builder + its DIRECT refs; realize then
-                // spans those refs' transitive closures from the seed content-scan.
-                let mut valid: Vec<(i64, Vec<Value>)> = vec![(
-                    1,
-                    vec![
-                        Value::Null,
-                        Value::Text(path.clone()),
-                        Value::Text(hash),
-                        Value::Int(1),
-                        Value::Null,
-                        Value::Int(size as i64),
-                    ],
-                )];
-                let mut ref_rows: Vec<(i64, Vec<Value>)> = Vec::new();
-                let mut edge = 1i64;
-                let mut next_id = 2i64;
-                for r in &refs {
-                    let target = if r == &path {
-                        1 // a self-reference resolves to id 1
-                    } else {
-                        valid.push((
-                            next_id,
-                            vec![
-                                Value::Null,
-                                Value::Text(r.clone()),
-                                Value::Null,
-                                Value::Null,
-                                Value::Null,
-                                Value::Null,
-                            ],
-                        ));
-                        let id = next_id;
-                        next_id += 1;
-                        id
-                    };
-                    ref_rows.push((edge, vec![Value::Int(1), Value::Int(target)]));
-                    edge += 1;
-                }
-                let tables = [
-                    Table {
-                        name: "ValidPaths",
-                        sql: "CREATE TABLE ValidPaths (id integer primary key, path text, hash text, registrationTime integer, deriver text, narSize integer)",
-                        rows: valid,
-                    },
-                    Table {
-                        name: "Refs",
-                        sql: "CREATE TABLE Refs (referrer integer, reference integer)",
-                        rows: ref_rows,
-                    },
-                ];
-                std::fs::write(out_db, store_db::write_db(&tables)).map_err(|e| e.to_string())?;
-                Ok(path)
-            };
-            match run() {
+            match store_add_builder(name, tree, store_dir, out_db, seed_store) {
                 Ok(path) => {
                     println!("{path}");
                     ExitCode::SUCCESS
@@ -11049,6 +11074,55 @@ daemon build START (2/2 active)
                 "{p} missing from the merged seed db: {hashes:?}"
             );
         }
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    // store-add-builder must be idempotent for the same reason store-add-recursive
+    // is: the check loop re-places the stage0 builder on every warm run, so a plain
+    // create into an already-warm .td-build-cache/stage0 made the SECOND
+    // `affected-checks --run` in one worktree die on EEXIST. The path is
+    // content-addressed, so a present item already IS this content — verify it
+    // rather than copy over it. An item that no longer hashes to its own name is
+    // corruption and must still fail loudly, never be silently reused.
+    #[test]
+    fn store_add_builder_re_places_idempotently_and_rejects_a_corrupt_item() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = std::env::temp_dir().join(format!("td-sab-idem-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        let tree = d.join("tree");
+        std::fs::create_dir_all(tree.join("bin")).unwrap();
+        std::fs::write(tree.join("bin").join("tool"), "no store refs in this tree\n").unwrap();
+        let tree_s = tree.to_string_lossy().to_string();
+        let store = d.join("store");
+        let store_s = store.to_string_lossy().to_string();
+        let absent_s = d.join("ABSENT").to_string_lossy().to_string();
+        let db1 = d.join("a.db").to_string_lossy().to_string();
+        let db2 = d.join("b.db").to_string_lossy().to_string();
+
+        let p1 = store_add_builder("probe-0.1.0", &tree_s, &store_s, &db1, &absent_s).unwrap();
+        let p2 = store_add_builder("probe-0.1.0", &tree_s, &store_s, &db2, &absent_s)
+            .expect("re-placing an already-present builder must succeed, not EEXIST");
+        assert_eq!(p1, p2, "the content-addressed path must not move on re-intern");
+        // The re-intern still registers: a warm run's OUT-DB is as usable as a cold one's.
+        let hashes = store_db_read::Db::open(std::fs::read(&db2).unwrap())
+            .unwrap()
+            .hashes_by_path()
+            .unwrap();
+        let expected = nar_hash(&tree_s).unwrap();
+        assert_eq!(
+            hashes.get(p2.as_str()).map(String::as_str),
+            Some(expected.as_str()),
+            "the re-interned builder must be vouched with the tree's real NAR hash: {hashes:?}"
+        );
+
+        // Now make the placed item disagree with its own content-addressed name.
+        let base = p1.rsplit('/').next().unwrap().to_string();
+        let victim = store.join(&base).join("bin").join("tool");
+        std::fs::set_permissions(&victim, std::fs::Permissions::from_mode(0o644)).unwrap();
+        std::fs::write(&victim, "corrupted\n").unwrap();
+        let err = store_add_builder("probe-0.1.0", &tree_s, &store_s, &db2, &absent_s)
+            .expect_err("a store item that no longer hashes to its name must not be reused");
+        assert!(err.contains("corrupt content-addressed item"), "unexpected error: {err}");
         std::fs::remove_dir_all(&d).ok();
     }
 
