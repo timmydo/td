@@ -166,103 +166,576 @@ fn echo(sh: &mut Shell, argv: &[String]) -> R<()> {
     out(sh, line.as_bytes())
 }
 
-/// A deliberately small `printf`: `%s`, `%d`, `%%`, `\n`, `\t`, `\\` in the
-/// format, cycling the format over the remaining arguments (POSIX behaviour).
+/// POSIX `printf`: format directives with flags/width/precision (including `*`
+/// width/precision from arguments), the integer conversions `d i o u x X` (C
+/// base-0 parsing, the `'c` char-code form, ash's i64/u64 range rules), plus
+/// `c`, `s`, `b` (its own escape set with `\c` early stop), `f`, and
+/// format-string backslash escapes. The format cycles over the remaining
+/// arguments (POSIX). Matched to the dash/ash goldens (spec/builtin-printf),
+/// not bash: no `-v`, and `%q`/`%e`/`%g`/`%(..)T` are rejected like dash/ash.
 fn printf(sh: &mut Shell, argv: &[String]) -> R<()> {
-    let Some(format) = argv.get(1) else {
+    let mut idx = 1usize;
+    // dash/ash accept a single leading `--` as end-of-options (bash's `-v` is not
+    // supported: a `-v` there is just a format string, matching ash).
+    if argv.get(idx).map(String::as_str) == Some("--") {
+        idx += 1;
+    }
+    let Some(format) = argv.get(idx) else {
         err_line(sh, "printf: usage: printf format [arguments]");
         return status(sh, 2);
     };
-    let args: Vec<&String> = argv.iter().skip(2).collect();
-    let mut output = String::new();
-    let mut errors: Vec<String> = Vec::new();
-    let mut ai = 0usize;
+    let args: Vec<&str> = argv.iter().skip(idx + 1).map(String::as_str).collect();
+    let mut out_buf: Vec<u8> = Vec::new();
+    let mut st = Pf { ai: 0, error: false, stop: false, errors: Vec::new() };
     loop {
-        let consumed_before = ai;
-        format_once(format, &args, &mut ai, &mut output, &mut errors);
-        // Re-run the format while it still consumes arguments (POSIX cycling).
-        if ai >= args.len() || ai == consumed_before {
+        let before = st.ai;
+        format_once(format, &args, &mut out_buf, &mut st);
+        if st.stop || st.ai >= args.len() || st.ai == before {
             break;
         }
     }
-    for bad in &errors {
-        err_line(sh, &format!("printf: {bad}: expected a numeric value"));
+    for e in &st.errors {
+        err_line(sh, e);
     }
-    match write_fd(sh, 1, output.as_bytes()) {
-        Ok(()) => sh.set_status(if errors.is_empty() { 0 } else { 1 }),
+    match write_fd(sh, 1, &out_buf) {
+        Ok(()) => sh.set_status(if st.error { 1 } else { 0 }),
         Err(_) => sh.set_status(1),
     }
     Ok(())
 }
 
-fn format_once(
-    format: &str,
-    args: &[&String],
-    ai: &mut usize,
-    output: &mut String,
-    errors: &mut Vec<String>,
-) {
+// printf run state threaded through the format walk.
+struct Pf {
+    ai: usize,           // next argument index
+    error: bool,         // a conversion/parse error occurred => exit status 1
+    stop: bool,          // %b `\c`: stop ALL further output (and format cycling)
+    errors: Vec<String>, // stderr lines, emitted once after the walk
+}
+
+#[derive(Default, Clone, Copy)]
+struct Flags {
+    minus: bool,
+    plus: bool,
+    space: bool,
+    hash: bool,
+    zero: bool,
+}
+
+// Parsed field spec of one directive; `left` folds in a negative `*` width.
+struct Spec {
+    flags: Flags,
+    width: usize,
+    left: bool,
+    prec: Option<i64>,
+}
+
+fn format_once(format: &str, args: &[&str], out: &mut Vec<u8>, st: &mut Pf) {
     let chars: Vec<char> = format.chars().collect();
     let mut i = 0usize;
     while let Some(&c) = chars.get(i) {
         match c {
-            '\\' => {
-                i += 1;
-                match chars.get(i) {
-                    Some('n') => output.push('\n'),
-                    Some('t') => output.push('\t'),
-                    Some('r') => output.push('\r'),
-                    Some('\\') => output.push('\\'),
-                    Some(&other) => {
-                        output.push('\\');
-                        output.push(other);
-                    }
-                    None => output.push('\\'),
-                }
-                i += 1;
-            }
+            '\\' => i = format_escape(&chars, i, out),
             '%' => {
-                i += 1;
-                match chars.get(i) {
-                    Some('%') => output.push('%'),
-                    Some('s') => output.push_str(next_arg(args, ai)),
-                    Some('d') | Some('i') => {
-                        let raw = next_arg(args, ai);
-                        let t = raw.trim();
-                        // An absent/empty argument is 0 with no error (POSIX); a
-                        // present-but-non-numeric one prints 0 and fails.
-                        if t.is_empty() {
-                            output.push('0');
-                        } else {
-                            match t.parse::<i64>() {
-                                Ok(n) => output.push_str(&n.to_string()),
-                                Err(_) => {
-                                    output.push('0');
-                                    errors.push(raw.to_string());
-                                }
-                            }
-                        }
-                    }
-                    Some(&other) => {
-                        output.push('%');
-                        output.push(other);
-                    }
-                    None => output.push('%'),
+                i = conversion(&chars, i + 1, args, out, st);
+                if st.stop {
+                    return;
                 }
-                i += 1;
             }
             other => {
-                output.push(other);
+                push_char(out, other);
                 i += 1;
             }
         }
     }
 }
 
-fn next_arg<'a>(args: &'a [&'a String], ai: &mut usize) -> &'a str {
-    let s = args.get(*ai).map(|s| s.as_str()).unwrap_or("");
-    *ai += 1;
-    s
+// Parse and emit one `%` directive; `start` points just past the `%`. Returns
+// the index following the directive.
+// Width/precision are clamped to this bound before use. Defensive, not cosmetic:
+// Rust's float formatter panics at precision >= 65536, and an unbounded width or
+// integer precision would drive a multi-gigabyte allocation that aborts under
+// panic=abort. No real format approaches this (the corpus max is ~10).
+const MAX_FIELD: usize = 65535;
+
+fn conversion(chars: &[char], start: usize, args: &[&str], out: &mut Vec<u8>, st: &mut Pf) -> usize {
+    let mut i = start;
+    if chars.get(i) == Some(&'%') {
+        out.push(b'%');
+        return i + 1;
+    }
+    let mut flags = Flags::default();
+    loop {
+        match chars.get(i) {
+            Some('-') => flags.minus = true,
+            Some('+') => flags.plus = true,
+            Some(' ') => flags.space = true,
+            Some('#') => flags.hash = true,
+            Some('0') => flags.zero = true,
+            _ => break,
+        }
+        i += 1;
+    }
+    let mut left = flags.minus;
+    // Width: a decimal literal, or `*` taken from an argument (a negative `*`
+    // width means left-justify with its magnitude).
+    let width: usize;
+    if chars.get(i) == Some(&'*') {
+        let w = take_int(args, st);
+        if w < 0 {
+            left = true;
+            width = w.unsigned_abs() as usize;
+        } else {
+            width = w as usize;
+        }
+        i += 1;
+    } else {
+        let (w, ni) = read_dec(chars, i);
+        width = w as usize;
+        i = ni;
+    }
+    // Precision: `.` then a decimal (bare `.` is 0) or `*` (a negative `.*` is
+    // taken as omitted).
+    let mut prec: Option<i64> = None;
+    if chars.get(i) == Some(&'.') {
+        i += 1;
+        if chars.get(i) == Some(&'*') {
+            let p = take_int(args, st);
+            prec = if p < 0 { None } else { Some(p) };
+            i += 1;
+        } else {
+            let (p, ni) = read_dec(chars, i);
+            prec = Some(p);
+            i = ni;
+        }
+    }
+    let conv = match chars.get(i) {
+        Some(&c) => c,
+        None => {
+            // Format ended mid-directive: emit the literal `%` and the modifiers
+            // already consumed rather than swallowing them.
+            out.push(b'%');
+            for &c in chars.get(start..i).unwrap_or(&[]) {
+                push_char(out, c);
+            }
+            return i;
+        }
+    };
+    i += 1;
+    let width = width.min(MAX_FIELD);
+    let prec = prec.map(|p| if p < 0 { p } else { p.min(MAX_FIELD as i64) });
+    let spec = Spec { flags, width, left, prec };
+    match conv {
+        's' => emit_str(out, args, st, &spec),
+        'c' => emit_char(out, args, st, &spec),
+        'b' => emit_b(out, args, st, &spec),
+        'd' | 'i' | 'o' | 'u' | 'x' | 'X' => emit_int(out, args, st, conv, &spec),
+        'f' | 'F' => emit_float(out, args, st, &spec),
+        _ => {
+            // Unsupported directive. %q is a bash extension dash/ash reject; %e/%E,
+            // %g/%G and %(..)T are simply not implemented yet (they need C-exact
+            // float / strftime formatting — a follow-up). All are handled the ash
+            // way: keep the prefix already emitted, stop, exit status 1.
+            st.errors.push(format!("printf: %{conv}: invalid directive"));
+            st.error = true;
+            st.stop = true;
+        }
+    }
+    i
+}
+
+fn emit_str(out: &mut Vec<u8>, args: &[&str], st: &mut Pf, spec: &Spec) {
+    let raw = take_arg(args, &mut st.ai).unwrap_or("");
+    let bytes = raw.as_bytes();
+    let body: &[u8] = match spec.prec {
+        Some(p) if p >= 0 => bytes.get(0..p as usize).unwrap_or(bytes),
+        _ => bytes,
+    };
+    pad_bytes(out, &[], &[], body, spec.width, spec.left, false);
+}
+
+fn emit_char(out: &mut Vec<u8>, args: &[&str], st: &mut Pf, spec: &Spec) {
+    let raw = take_arg(args, &mut st.ai).unwrap_or("");
+    // ash's %c takes the first BYTE, not the first code point; an empty argument
+    // yields a NUL byte.
+    let body: &[u8] = raw.as_bytes().get(0..1).unwrap_or(b"\0");
+    pad_bytes(out, &[], &[], body, spec.width, spec.left, false);
+}
+
+fn emit_b(out: &mut Vec<u8>, args: &[&str], st: &mut Pf, spec: &Spec) {
+    let raw = take_arg(args, &mut st.ai).unwrap_or("");
+    let mut body: Vec<u8> = Vec::new();
+    let hit_c = process_b_escapes(raw, &mut body);
+    let shown: &[u8] = match spec.prec {
+        Some(p) if p >= 0 => body.get(0..p as usize).unwrap_or(&body),
+        _ => &body,
+    };
+    pad_bytes(out, &[], &[], shown, spec.width, spec.left, false);
+    if hit_c {
+        st.stop = true;
+    }
+}
+
+fn emit_int(out: &mut Vec<u8>, args: &[&str], st: &mut Pf, conv: char, spec: &Spec) {
+    let value: i128 = match take_arg(args, &mut st.ai) {
+        None => 0, // an absent argument is a silent zero (POSIX)
+        Some(raw) => match parse_int_arg(raw) {
+            Some(v) if range_ok(v, conv) => v,
+            _ => {
+                st.errors.push(format!("printf: {raw}: expected a numeric value"));
+                st.error = true;
+                0
+            }
+        },
+    };
+    let flags = spec.flags;
+    let mut sign: Vec<u8> = Vec::new();
+    let mut mag: String = match conv {
+        'd' | 'i' => {
+            if value < 0 {
+                sign.push(b'-');
+            } else if flags.plus {
+                sign.push(b'+');
+            } else if flags.space {
+                sign.push(b' ');
+            }
+            value.unsigned_abs().to_string()
+        }
+        'u' => as_u64(value).to_string(),
+        'o' => format!("{:o}", as_u64(value)),
+        'x' => format!("{:x}", as_u64(value)),
+        'X' => format!("{:X}", as_u64(value)),
+        _ => String::new(),
+    };
+    // Precision sets a minimum digit count; `.0` applied to 0 yields no digits.
+    if let Some(p) = spec.prec {
+        let p = if p < 0 { 0 } else { p as usize };
+        if p == 0 && value == 0 {
+            mag.clear();
+        } else if mag.len() < p {
+            let mut z = "0".repeat(p - mag.len());
+            z.push_str(&mag);
+            mag = z;
+        }
+    }
+    // `#`: octal gains a leading 0, a non-zero hex gains a 0x/0X prefix.
+    let mut prefix: Vec<u8> = Vec::new();
+    if flags.hash {
+        match conv {
+            'o' if !mag.starts_with('0') => {
+                let mut m = String::from("0");
+                m.push_str(&mag);
+                mag = m;
+            }
+            'x' if value != 0 => prefix.extend_from_slice(b"0x"),
+            'X' if value != 0 => prefix.extend_from_slice(b"0X"),
+            _ => {}
+        }
+    }
+    // The 0 flag is ignored when a precision is given, or when left-justifying.
+    let zero = flags.zero && !spec.left && spec.prec.is_none();
+    pad_bytes(out, &sign, &prefix, mag.as_bytes(), spec.width, spec.left, zero);
+}
+
+fn emit_float(out: &mut Vec<u8>, args: &[&str], st: &mut Pf, spec: &Spec) {
+    let raw = take_arg(args, &mut st.ai).unwrap_or("");
+    // No `'c` char-code form here: dash's getdouble and busybox-ash's my_xstrtod
+    // are plain strtod, so `printf '%f' "'A"` is a numeric error in both (only the
+    // integer path takes the quote form). Matching bash here would deviate.
+    let value: f64 = if raw.is_empty() {
+        0.0
+    } else {
+        match raw.trim().parse::<f64>() {
+            Ok(v) => v,
+            Err(_) => {
+                st.errors.push(format!("printf: {raw}: expected a numeric value"));
+                st.error = true;
+                0.0
+            }
+        }
+    };
+    let p = match spec.prec {
+        Some(p) if p >= 0 => p as usize,
+        _ => 6,
+    };
+    let flags = spec.flags;
+    let mut sign: Vec<u8> = Vec::new();
+    if value.is_sign_negative() && !value.is_nan() {
+        sign.push(b'-');
+    } else if flags.plus {
+        sign.push(b'+');
+    } else if flags.space {
+        sign.push(b' ');
+    }
+    // Rust prints NaN as "NaN"; C/ash print "nan".
+    let mut digits = if value.is_nan() {
+        String::from("nan")
+    } else {
+        format!("{:.*}", p, value.abs())
+    };
+    if flags.hash && p == 0 && !digits.contains('.') {
+        digits.push('.');
+    }
+    // Unlike integers, a precision does NOT disable the 0 flag for floats.
+    let zero = flags.zero && !spec.left;
+    pad_bytes(out, &sign, &[], digits.as_bytes(), spec.width, spec.left, zero);
+}
+
+fn push_char(out: &mut Vec<u8>, c: char) {
+    let mut buf = [0u8; 4];
+    out.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
+}
+
+fn take_arg<'a>(args: &[&'a str], ai: &mut usize) -> Option<&'a str> {
+    let a = args.get(*ai).copied();
+    if a.is_some() {
+        *ai += 1;
+    }
+    a
+}
+
+fn take_int(args: &[&str], st: &mut Pf) -> i64 {
+    match take_arg(args, &mut st.ai) {
+        None => 0,
+        Some(raw) => match parse_int_arg(raw) {
+            Some(v) if v >= i64::MIN as i128 && v <= i64::MAX as i128 => v as i64,
+            _ => {
+                st.errors.push(format!("printf: {raw}: expected a numeric value"));
+                st.error = true;
+                0
+            }
+        },
+    }
+}
+
+fn read_dec(chars: &[char], start: usize) -> (i64, usize) {
+    let mut v: i64 = 0;
+    let mut j = start;
+    while let Some(&c) = chars.get(j) {
+        if c.is_ascii_digit() {
+            v = v.saturating_mul(10).saturating_add((c as i64) - ('0' as i64));
+            j += 1;
+        } else {
+            break;
+        }
+    }
+    (v, j)
+}
+
+fn read_octal(chars: &[char], start: usize, max: usize) -> (u8, usize) {
+    let mut val: u32 = 0;
+    let mut j = start;
+    let mut n = 0usize;
+    while n < max {
+        match chars.get(j) {
+            Some(&c) if ('0'..='7').contains(&c) => {
+                val = val * 8 + (c as u32 - '0' as u32);
+                j += 1;
+                n += 1;
+            }
+            _ => break,
+        }
+    }
+    ((val & 0xff) as u8, j)
+}
+
+// Format-string backslash escapes (dash/ash): the C control escapes, `\\`, and
+// `\ooo` octal (1-3 digits). `\x`, `\u`, `\U` and any other escape are left
+// literal (backslash kept), matching dash.
+fn format_escape(chars: &[char], at: usize, out: &mut Vec<u8>) -> usize {
+    let j = at + 1;
+    match chars.get(j) {
+        Some('a') => out.push(0x07),
+        Some('b') => out.push(0x08),
+        Some('f') => out.push(0x0c),
+        Some('n') => out.push(b'\n'),
+        Some('r') => out.push(b'\r'),
+        Some('t') => out.push(b'\t'),
+        Some('v') => out.push(0x0b),
+        Some('\\') => out.push(b'\\'),
+        Some(&c) if ('0'..='7').contains(&c) => {
+            let (byte, nj) = read_octal(chars, j, 3);
+            out.push(byte);
+            return nj;
+        }
+        Some(&other) => {
+            out.push(b'\\');
+            push_char(out, other);
+        }
+        None => {
+            out.push(b'\\');
+            return j;
+        }
+    }
+    j + 1
+}
+
+// %b escapes (dash/ash): the C control escapes, `\\`, `\0ooo`/`\ooo` octal, and
+// `\c` which stops ALL output. `\x`/`\u` are left literal (matching dash/ash).
+// Returns true if `\c` was seen.
+fn process_b_escapes(raw: &str, out: &mut Vec<u8>) -> bool {
+    let chars: Vec<char> = raw.chars().collect();
+    let mut i = 0usize;
+    while let Some(&c) = chars.get(i) {
+        if c != '\\' {
+            push_char(out, c);
+            i += 1;
+            continue;
+        }
+        i += 1;
+        match chars.get(i) {
+            Some('a') => out.push(0x07),
+            Some('b') => out.push(0x08),
+            Some('c') => return true,
+            Some('f') => out.push(0x0c),
+            Some('n') => out.push(b'\n'),
+            Some('r') => out.push(b'\r'),
+            Some('t') => out.push(b'\t'),
+            Some('v') => out.push(0x0b),
+            Some('\\') => out.push(b'\\'),
+            Some('0') => {
+                // `\0ooo`: a leading-0 marker, then up to 3 octal digits.
+                let (byte, ni) = read_octal(&chars, i + 1, 3);
+                out.push(byte);
+                i = ni;
+                continue;
+            }
+            Some(&d) if ('1'..='7').contains(&d) => {
+                let (byte, ni) = read_octal(&chars, i, 3);
+                out.push(byte);
+                i = ni;
+                continue;
+            }
+            Some(&other) => {
+                out.push(b'\\');
+                push_char(out, other);
+            }
+            None => {
+                out.push(b'\\');
+                return false;
+            }
+        }
+        i += 1;
+    }
+    false
+}
+
+// The `'c`/`"c` printf char-code form: a leading `'` or `"` makes the value the
+// first BYTE after the quote (0 if nothing follows). Shared by the integer and
+// float directives.
+fn quote_char_code(s: &str) -> Option<i128> {
+    let bytes = s.as_bytes();
+    match bytes.first() {
+        Some(&f) if f == b'\'' || f == b'"' => Some(bytes.get(1).map(|&b| b as i128).unwrap_or(0)),
+        _ => None,
+    }
+}
+
+// Parse a printf integer argument the way ash does: the `'c`/`"c` char-code
+// form (first BYTE after the quote); otherwise leading whitespace is skipped,
+// a C base-0 integer is read (0x hex, 0 octal, else decimal), and ANY trailing
+// character (a stray digit-looking char OR trailing space) makes it invalid.
+// `None` signals an error (the caller uses 0 and sets exit status 1).
+fn parse_int_arg(s: &str) -> Option<i128> {
+    if let Some(cc) = quote_char_code(s) {
+        return Some(cc);
+    }
+    let trimmed = s.trim_start_matches([' ', '\t']);
+    let tb: Vec<char> = trimmed.chars().collect();
+    let mut idx = 0usize;
+    let mut neg = false;
+    match tb.get(idx) {
+        Some('+') => idx += 1,
+        Some('-') => {
+            neg = true;
+            idx += 1;
+        }
+        _ => {}
+    }
+    let (base, start) = detect_base(&tb, idx);
+    let mut val: i128 = 0;
+    let mut any = false;
+    let mut j = start;
+    while let Some(&c) = tb.get(j) {
+        match digit_val(c) {
+            Some(d) if (d as u32) < base => {
+                val = val.checked_mul(base as i128)?.checked_add(d as i128)?;
+                any = true;
+                j += 1;
+            }
+            _ => break,
+        }
+    }
+    if !any || j != tb.len() {
+        return None;
+    }
+    Some(if neg { -val } else { val })
+}
+
+fn detect_base(tb: &[char], idx: usize) -> (u32, usize) {
+    if tb.get(idx) == Some(&'0') {
+        match tb.get(idx + 1) {
+            Some('x') | Some('X') => (16, idx + 2),
+            _ => (8, idx), // the leading 0 is itself an octal digit ("0" == 0)
+        }
+    } else {
+        (10, idx)
+    }
+}
+
+fn digit_val(c: char) -> Option<u8> {
+    match c {
+        '0'..='9' => Some(c as u8 - b'0'),
+        'a'..='f' => Some(c as u8 - b'a' + 10),
+        'A'..='F' => Some(c as u8 - b'A' + 10),
+        _ => None,
+    }
+}
+
+// Reinterpret a value known to be in [i64::MIN, u64::MAX] as u64: negatives wrap
+// via two's complement (ash prints `%u` of -42 as 18446744073709551574).
+fn as_u64(v: i128) -> u64 {
+    if v < 0 {
+        (v as i64) as u64
+    } else {
+        v as u64
+    }
+}
+
+fn range_ok(v: i128, conv: char) -> bool {
+    match conv {
+        'd' | 'i' => v >= i64::MIN as i128 && v <= i64::MAX as i128,
+        _ => v >= i64::MIN as i128 && v <= u64::MAX as i128,
+    }
+}
+
+// Apply a field width to `sign + prefix + body`: space- or zero-pad on the left,
+// or space-pad on the right when left-justifying. Zero padding lands between the
+// sign/prefix and the body.
+fn pad_bytes(out: &mut Vec<u8>, sign: &[u8], prefix: &[u8], body: &[u8], width: usize, left: bool, zero: bool) {
+    let len = sign.len() + prefix.len() + body.len();
+    let pad = width.saturating_sub(len);
+    if left {
+        out.extend_from_slice(sign);
+        out.extend_from_slice(prefix);
+        out.extend_from_slice(body);
+        for _ in 0..pad {
+            out.push(b' ');
+        }
+    } else if zero {
+        out.extend_from_slice(sign);
+        out.extend_from_slice(prefix);
+        for _ in 0..pad {
+            out.push(b'0');
+        }
+        out.extend_from_slice(body);
+    } else {
+        for _ in 0..pad {
+            out.push(b' ');
+        }
+        out.extend_from_slice(sign);
+        out.extend_from_slice(prefix);
+        out.extend_from_slice(body);
+    }
 }
 
 fn exit(sh: &mut Shell, argv: &[String]) -> R<()> {
@@ -1068,6 +1541,91 @@ mod tests {
         let (status, out, _) = run_capturing("printf '%d\\n'");
         assert_eq!(out, "0\n");
         assert_eq!(status, 0);
+    }
+
+    #[test]
+    fn printf_width_precision_and_flags() {
+        // Strings: width, left-justify, precision (truncation).
+        assert_eq!(
+            run_capturing("printf '[%5s][%-5s][%.2s]' abc abc abcdef").1,
+            "[  abc][abc  ][ab]"
+        );
+        // Integers: zero-pad, sign flags, precision padding ahead of a sign.
+        assert_eq!(
+            run_capturing("printf '[%05d][%+d][% d][%6.4d]' 42 42 42 -42").1,
+            "[00042][+42][ 42][ -0042]"
+        );
+        // Dynamic width/precision consumed from `*` arguments, in order.
+        assert_eq!(run_capturing("printf '[%*.*f]' 8 2 3.14159").1, "[    3.14]");
+    }
+
+    #[test]
+    fn printf_integer_bases_and_charcode() {
+        // Hex/octal, the `#` alternate-form prefixes, unsigned two's-complement.
+        assert_eq!(
+            run_capturing("printf '[%x][%#x][%o][%#o][%X]' 255 255 8 8 255").1,
+            "[ff][0xff][10][010][FF]"
+        );
+        assert_eq!(run_capturing("printf '[%u]' -1").1, "[18446744073709551615]");
+        // Base-0 parsing: 0x hex and leading-0 octal in the argument.
+        assert_eq!(run_capturing("printf '%d %d' 0x55 055").1, "85 45");
+        // `'c` uses the first byte's code.
+        assert_eq!(run_capturing("printf '%d %d' \"'A\" \"'z\"").1, "65 122");
+    }
+
+    #[test]
+    fn printf_char_b_and_float() {
+        // %c takes the first byte only.
+        assert_eq!(run_capturing("printf '[%c][%cZ]' abc abc").1, "[a][aZ]");
+        // %b evaluates its own escapes (\t, \0ooo octal) — unlike %s.
+        assert_eq!(run_capturing("printf '[%b]' 'a\\tb\\0101'").1, "[a\tbA]");
+        // %b \c stops all further output.
+        assert_eq!(run_capturing("printf 'x%by' 'a\\cb'").1, "xa");
+        // %f defaults to 6 digits of precision; honour width and the 0 flag.
+        assert_eq!(run_capturing("printf '[%.2f][%08.3f]' 3.14159 3.14").1, "[3.14][0003.140]");
+    }
+
+    #[test]
+    fn printf_format_escapes_dashdash_and_bad_directive() {
+        // Format-string octal escape (\ooo => a byte).
+        assert_eq!(run_capturing("printf '[\\101]'").1, "[A]");
+        // A leading `--` ends options (dash/ash have no bash -v); format cycles.
+        assert_eq!(run_capturing("printf -- '%s.' a b c").1, "a.b.c.");
+        // An unsupported directive (bash's %q) is rejected like ash: keep the
+        // already-emitted prefix, stop, exit status 1.
+        let (status, out, err) = run_capturing("printf 'a%qb' x");
+        assert_eq!(out, "a");
+        assert_eq!(status, 1);
+        assert!(err.contains("invalid directive"), "err: {err:?}");
+    }
+
+    #[test]
+    fn printf_pathological_fields_are_bounded() {
+        // A width or precision far past any real use must neither panic nor drive
+        // an unbounded allocation: MAX_FIELD (65535) caps them. Rust's float
+        // formatter itself panics at precision >= 65536, so an unclamped `%f`
+        // precision would abort under panic=abort.
+        let (status, out, _) = run_capturing("printf '%.9999999999f' 1");
+        assert_eq!(status, 0);
+        assert_eq!(out.len(), 65535 + 2); // "1." + 65535 fraction digits
+        let (status, out, _) = run_capturing("printf '%9999999999s' x");
+        assert_eq!(status, 0);
+        assert_eq!(out.len(), 65535);
+        // Dynamic `*` width/precision are clamped the same way.
+        let (status, out, _) = run_capturing("printf '%.*d' 9999999999 5");
+        assert_eq!(status, 0);
+        assert_eq!(out.len(), 65535);
+    }
+
+    #[test]
+    fn printf_nan_empty_char_and_incomplete_directive() {
+        // NaN prints the C spelling, not Rust's "NaN".
+        assert_eq!(run_capturing("printf '%f' nan").1, "nan");
+        // %c of an empty argument is a NUL byte (matches dash/busybox-ash).
+        assert_eq!(run_capturing("printf '%c' ''").1, "\0");
+        // A format ending mid-directive keeps the literal `%` and the modifiers
+        // already consumed rather than swallowing them.
+        assert_eq!(run_capturing("printf 'x%5'").1, "x%5");
     }
 
     #[test]

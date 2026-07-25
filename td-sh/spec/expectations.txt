@@ -432,7 +432,6 @@ xfail bugs.test.sh::assign readonly -- one line
 xfail bugs.test.sh::for loop (issue #1446)
 xfail bugs.test.sh::for loop 2 (issue #1446)
 xfail bugs.test.sh::other builtins fail on writing to full disk
-xfail bugs.test.sh::printf integer size bug
 xfail bugs.test.sh::subshell while running a script (regression)
 xfail bugs.test.sh::unset readonly -- multiple lines
 xfail bugs.test.sh::unset readonly -- one line
@@ -684,51 +683,15 @@ xfail builtin-misc.test.sh::Print shell strings with normal chars: set and print
 xfail builtin-misc.test.sh::Print shell strings with weird chars: set and printf %q and ${x@Q}
 xfail builtin-misc.test.sh::Shifting too far
 xfail builtin-misc.test.sh::time pipeline
-xfail builtin-printf.test.sh::%(strftime format)T
-xfail builtin-printf.test.sh::%06d zero padding vs. %6.6d
-xfail builtin-printf.test.sh::%06s is no-op
-xfail builtin-printf.test.sh::%06x %06X %06o
-xfail builtin-printf.test.sh::%10.5(strftime format)T
 xfail builtin-printf.test.sh::Invalid UTF-8
-xfail builtin-printf.test.sh::No char after ' => zero code point
 xfail builtin-printf.test.sh::Too large
-xfail builtin-printf.test.sh::Unicode char with '
 xfail builtin-printf.test.sh::bash truncates long strftime string at 128
-xfail builtin-printf.test.sh::empty string (osh is more strict)
-xfail builtin-printf.test.sh::leading spaces are accepted in value given to %d %X, but not trailing spaces
-xfail builtin-printf.test.sh::negative numbers with unsigned / octal / hex
 xfail builtin-printf.test.sh::printf # flag
-xfail builtin-printf.test.sh::printf %*.*s (width/precision from args)
-xfail builtin-printf.test.sh::printf %6.0s and %0.0s
-xfail builtin-printf.test.sh::printf %6.4d -- "precision" does padding for integers
-xfail builtin-printf.test.sh::printf %6.4s does both truncation and padding
-xfail builtin-printf.test.sh::printf %6.4x X o
-xfail builtin-printf.test.sh::printf %6.s and %0.s
-xfail builtin-printf.test.sh::printf %6q (width)
-xfail builtin-printf.test.sh::printf %b does backslash escaping
-xfail builtin-printf.test.sh::printf %b respects \c early return
-xfail builtin-printf.test.sh::printf %b supports octal escapes, both \141 and \0141
-xfail builtin-printf.test.sh::printf %b unicode escapes
 xfail builtin-printf.test.sh::printf %b with truncated octal escapes
-xfail builtin-printf.test.sh::printf %c ASCII
 xfail builtin-printf.test.sh::printf %c unicode - prints the first BYTE of a string - it does not respect UTF-8
-xfail builtin-printf.test.sh::printf %d %X support hex 0x5 and octal 055
-xfail builtin-printf.test.sh::printf %d with + prefix (positive sign)
-xfail builtin-printf.test.sh::printf %q
-xfail builtin-printf.test.sh::printf + and space flags
 xfail builtin-printf.test.sh::printf -v dynamic scope
 xfail builtin-printf.test.sh::printf eE fF gG
-xfail builtin-printf.test.sh::printf floating point (not required, but they all implement it)
-xfail builtin-printf.test.sh::printf floating point with - and 0
-xfail builtin-printf.test.sh::printf integer
 xfail builtin-printf.test.sh::printf invalid format
-xfail builtin-printf.test.sh::printf negative integer overflow
-xfail builtin-printf.test.sh::printf negative numbers
-xfail builtin-printf.test.sh::printf positive integer overflow
-xfail builtin-printf.test.sh::printf width strings
-xfail builtin-printf.test.sh::printf with too few arguments
-xfail builtin-printf.test.sh::printf with too many arguments
-xfail builtin-printf.test.sh::unsigned / octal / hex
 xfail builtin-printf.test.sh::unsigned / octal / hex big
 xfail builtin-process.test.sh::Changing resource limit is denied
 xfail builtin-process.test.sh::YSH readability: ulimit --all the same as ulimit -a
