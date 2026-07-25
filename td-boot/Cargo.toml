@@ -23,12 +23,6 @@ path = "src/main.rs"
 # It has zero external dependencies. The target recipe compiles this source and
 # the shared engine SHA-256 implementation directly with rustc.
 
-# Pin THIS as the workspace root so `cargo` stops here instead of walking up into
-# the outer engine manifest from a nested `.claude/worktrees/*` checkout (mirrors
-# td-kexec/td-netd/td-sh; without it `cargo test --manifest-path td-boot/Cargo.toml`
-# fails from a worktree).
-[workspace]
-
 [lints.rust]
 unsafe_code = "forbid"
 
