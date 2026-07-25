@@ -78,6 +78,24 @@ pub enum MergeResult {
     Unavailable(String),
 }
 
+/// What the endpoints of a remote claim about one branch's `HEAD`.
+#[derive(Debug, PartialEq, Eq)]
+pub enum HeadClaim {
+    /// Some endpoint's `HEAD` is a symref to it: its default branch.
+    Default,
+    /// Every endpoint answered, and each named a `HEAD` that is not this branch
+    /// — or advertised none at all. A live `HEAD` withheld by
+    /// `uploadpack.hideRefs` cannot be told on the wire from one that dangles or
+    /// is unborn, so this permits the delete and leans on the server's own
+    /// refusal to delete its checked-out branch.
+    NotDefault,
+    /// An endpoint resolved `HEAD` without naming a branch and the oids do not
+    /// rule this one out: a server too old for the `symref` capability, or one
+    /// hiding refs from the advertisement. Nothing on the wire tells that apart
+    /// from `HEAD` being the branch, so it counts against the delete.
+    Unnamed,
+}
+
 /// One remote-tracking branch as shown in the list.
 pub struct Branch {
     pub refname: String,
@@ -446,36 +464,30 @@ impl Git {
         Ok(urls)
     }
 
-    /// The default branch of every endpoint a delete would reach, asked live.
-    /// The local `refs/remotes/<remote>/HEAD` symref is not consulted: it is
-    /// whatever the last `set-head` recorded and the delete goes to the PUSH
-    /// URLs, which need not be the repository that symref describes. `Err`
-    /// means it could not be established — a delete must refuse rather than
-    /// assume, since "unknown" is exactly the state in which the branch could
-    /// be the one that must not go.
-    pub fn default_branches(&self, remote: &str) -> io::Result<Vec<String>> {
-        let mut heads = Vec::new();
+    /// Whether `short` is the default branch of any endpoint a delete would
+    /// reach, asked live. The local `refs/remotes/<remote>/HEAD` symref is not
+    /// consulted: it is whatever the last `set-head` recorded and the delete
+    /// goes to the PUSH URLs, which need not be the repository that symref
+    /// describes. `Err` means an endpoint could not be asked at all — a delete
+    /// must refuse rather than assume, since "unknown" is exactly the state in
+    /// which the branch could be the one that must not go.
+    pub fn head_claim(&self, remote: &str, short: &str) -> io::Result<HeadClaim> {
+        let refname = format!("refs/heads/{short}");
+        let mut unnamed = false;
         for url in self.push_urls(remote)? {
-            let run = self.run(&["ls-remote", "--symref", "--end-of-options", &url, "HEAD"])?;
+            let run =
+                self.run(&["ls-remote", "--symref", "--end-of-options", &url, "HEAD", &refname])?;
             if !run.ok {
                 return Err(io::Error::other(run.failure()));
             }
-            // `ref: refs/heads/<name>\tHEAD` on the first line.
-            let head = run
-                .stdout
-                .lines()
-                .filter_map(|l| l.strip_prefix("ref: "))
-                .filter_map(|l| l.split_whitespace().next())
-                .filter_map(|r| r.strip_prefix("refs/heads/"))
-                .next();
-            match head {
-                Some(name) => heads.push(name.to_string()),
-                None => {
-                    return Err(io::Error::other(format!("{url} did not report a default branch")))
-                }
+            match parse_head_claim(&run.stdout, &refname) {
+                // Decisive: one endpoint protecting the branch is enough.
+                HeadClaim::Default => return Ok(HeadClaim::Default),
+                HeadClaim::Unnamed => unnamed = true,
+                HeadClaim::NotDefault => {}
             }
         }
-        Ok(heads)
+        Ok(if unnamed { HeadClaim::Unnamed } else { HeadClaim::NotDefault })
     }
 
     /// Configured remote names, in `git remote` order.
@@ -544,6 +556,43 @@ pub fn parse_branches(out: &str, base: &str, remotes: &[String]) -> Vec<Branch> 
         branches.push(Branch { refname, commit, committed_unix, author, subject, counts });
     }
     branches
+}
+
+/// Classify one `ls-remote --symref <url> HEAD refs/heads/<short>` answer. A
+/// `HEAD` that does not resolve — dangling at a deleted branch, or an empty
+/// repository — produces NO line for it at all, so its absence is not evidence
+/// that the branch is the default; a symref line or an oid is.
+///
+/// Ref names are compared whole. ls-remote matches its patterns by tail, so the
+/// exact compare is what keeps `refs/heads/refs/heads/<short>` from answering
+/// for `<short>` — not any assumption about what a caller passed in.
+fn parse_head_claim(out: &str, refname: &str) -> HeadClaim {
+    let mut head_oid = None;
+    let mut branch_oid = None;
+    for line in out.lines() {
+        let (value, name) = match line.split_once('\t') {
+            Some((v, n)) => (v.trim(), n.trim()),
+            None => continue,
+        };
+        match (value.strip_prefix("ref: "), name) {
+            // A symref for HEAD settles it either way, including one aimed
+            // outside refs/heads: whatever it is, it is not this branch.
+            (Some(target), "HEAD") => {
+                return if target == refname { HeadClaim::Default } else { HeadClaim::NotDefault }
+            }
+            (Some(_), _) => {}
+            (None, "HEAD") => head_oid = Some(value),
+            (None, n) if n == refname => branch_oid = Some(value),
+            (None, _) => {}
+        }
+    }
+    match (head_oid, branch_oid) {
+        (None, _) => HeadClaim::NotDefault,
+        (Some(head), Some(branch)) if head != branch => HeadClaim::NotDefault,
+        // HEAD resolved but named nothing, and the oids leave it open: it sits
+        // at this branch's tip, or the branch was not advertised to compare.
+        _ => HeadClaim::Unnamed,
+    }
 }
 
 /// `%(ahead-behind:...)` renders as "<ahead> <behind>"; empty when the field
@@ -654,6 +703,54 @@ mod tests {
             branches.first().map(|b| (b.refname.as_str(), b.subject.as_str())),
             Some(("origin/feat/x", "a: b/c d"))
         );
+    }
+
+    fn claim(out: &str) -> HeadClaim {
+        parse_head_claim(out, "refs/heads/work-1")
+    }
+
+    #[test]
+    fn a_symref_naming_the_branch_is_the_default_branch() {
+        let out = "ref: refs/heads/work-1\tHEAD\naaa\tHEAD\naaa\trefs/heads/work-1\n";
+        assert_eq!(claim(out), HeadClaim::Default);
+    }
+
+    #[test]
+    fn a_symref_naming_anything_else_clears_the_branch() {
+        // Same oid throughout, so only the symref distinguishes these.
+        let out = "ref: refs/heads/main\tHEAD\naaa\tHEAD\naaa\trefs/heads/work-1\n";
+        assert_eq!(claim(out), HeadClaim::NotDefault);
+        // Aimed outside refs/heads, so the oids must not be consulted at all:
+        // whatever HEAD is, it is not this branch.
+        let tag = "ref: refs/tags/v1\tHEAD\naaa\tHEAD\naaa\trefs/heads/work-1\n";
+        assert_eq!(claim(tag), HeadClaim::NotDefault);
+    }
+
+    /// ls-remote matches patterns by tail, so a branch whose name ends in the
+    /// one being deleted is advertised too. Only the whole name may answer.
+    #[test]
+    fn a_tail_matching_branch_does_not_answer_for_the_branch() {
+        let out = "aaa\tHEAD\naaa\trefs/heads/refs/heads/work-1\n";
+        assert_eq!(claim(out), HeadClaim::Unnamed);
+    }
+
+    /// A HEAD dangling at a branch that no longer exists reports NOTHING — not
+    /// an error, not an oid. Reading that as "unknown" refused every delete on
+    /// a remote whose HEAD had gone stale.
+    #[test]
+    fn a_head_that_resolves_to_nothing_protects_nothing() {
+        assert_eq!(claim(""), HeadClaim::NotDefault);
+        assert_eq!(claim("aaa\trefs/heads/work-1\n"), HeadClaim::NotDefault);
+    }
+
+    /// No symref capability: the oid is the only evidence either way.
+    #[test]
+    fn an_unnamed_head_counts_only_where_the_oids_do_not_clear_it() {
+        assert_eq!(claim("aaa\tHEAD\naaa\trefs/heads/work-1\n"), HeadClaim::Unnamed);
+        assert_eq!(claim("bbb\tHEAD\naaa\trefs/heads/work-1\n"), HeadClaim::NotDefault);
+        // HEAD resolved but the branch was not advertised, so there is no oid to
+        // clear it with. A hidden ref must not read as an absent one.
+        assert_eq!(claim("aaa\tHEAD\n"), HeadClaim::Unnamed);
     }
 
     #[test]

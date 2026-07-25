@@ -1088,6 +1088,155 @@ fn a_stale_head_symref_does_not_authorise_deleting_the_real_default() -> Res<()>
     Ok(())
 }
 
+/// A `HEAD` symref pointing at a branch that does not exist — what a bare repo
+/// initialised as `master` and only ever pushed `main` to is left with. It
+/// resolves to nothing, so `ls-remote --symref` prints NO line for it, and
+/// reading that silence as "unanswerable" refused every delete on that remote.
+#[test]
+fn a_remote_whose_head_dangles_does_not_block_a_delete() -> Res<()> {
+    let s = scenario("delete-dangling-head")?;
+    publish_branch_everywhere(&s)?;
+    for bare in [&s.origin, &s.backup] {
+        git(bare, &["symbolic-ref", "HEAD", "refs/heads/master"])?;
+        assert!(
+            git(bare, &["ls-remote", "--symref", ".", "HEAD"])?.trim().is_empty(),
+            "the fixture must leave HEAD unresolvable for this test to mean anything"
+        );
+    }
+
+    let (ok, output) = review(&s.work, &["--delete", "work-0001-feature", "--yes"])?;
+    assert!(ok, "a HEAD that resolves to nothing protects nothing:\n{output}");
+    assert!(!remote_has_branch(&s.origin)?, "origin still carries the branch:\n{output}");
+    assert!(!remote_has_branch(&s.backup)?, "backup still carries the branch:\n{output}");
+    Ok(())
+}
+
+/// No symref line at all — a detached `HEAD`, or a server too old for the
+/// symref capability — leaves the oid as the only evidence. At the branch's own
+/// tip that is indistinguishable from `HEAD` being the branch, so it refuses.
+#[test]
+fn an_unnamed_head_at_the_branch_tip_still_refuses() -> Res<()> {
+    let s = scenario("delete-unnamed-head")?;
+    publish_branch_everywhere(&s)?;
+    let tip =
+        git(&s.work, &["rev-parse", "refs/remotes/origin/work-0001-feature"])?.trim().to_string();
+    // `--no-deref`, or this writes through HEAD to the branch it names.
+    git(&s.backup, &["update-ref", "--no-deref", "HEAD", &tip])?;
+
+    let (ok, output) = review(&s.work, &["--delete", "backup/work-0001-feature", "--yes"])?;
+    assert!(!ok, "an unnamed HEAD at the tip must refuse:\n{output}");
+    assert!(output.contains("without naming a branch"), "wrong reason:\n{output}");
+    assert!(!output.contains("==> backup"), "the remote must not be pushed to:\n{output}");
+    assert!(remote_has_branch(&s.backup)?, "backup lost the branch:\n{output}");
+    Ok(())
+}
+
+/// A `HEAD` symrefed outside `refs/heads` is not a branch, so it settles the
+/// question by itself — even parked on this branch's own commit, where an oid
+/// comparison alone would read it as the default branch and refuse.
+#[test]
+fn a_head_symrefed_to_a_tag_does_not_block_a_delete() -> Res<()> {
+    let s = scenario("delete-head-tag")?;
+    publish_branch_everywhere(&s)?;
+    let tip =
+        git(&s.work, &["rev-parse", "refs/remotes/origin/work-0001-feature"])?.trim().to_string();
+    git(&s.backup, &["update-ref", "refs/tags/v1", &tip])?;
+    git(&s.backup, &["symbolic-ref", "HEAD", "refs/tags/v1"])?;
+
+    let (ok, output) = review(&s.work, &["--delete", "backup/work-0001-feature", "--yes"])?;
+    assert!(ok, "a HEAD that is not a branch protects no branch:\n{output}");
+    assert!(!remote_has_branch(&s.backup)?, "backup still carries the branch:\n{output}");
+    Ok(())
+}
+
+/// The trade this guard makes: a live `HEAD` withheld by `uploadpack.hideRefs`
+/// looks exactly like one that dangles, so the delete is attempted. The server's
+/// own refusal to delete its checked-out branch is what keeps the branch — and
+/// that failure must be reported as a failure, not as a delete.
+#[test]
+fn a_hidden_live_head_is_caught_by_the_server_and_reported() -> Res<()> {
+    let s = scenario("delete-hidden-head")?;
+    publish_branch_everywhere(&s)?;
+    git(&s.backup, &["symbolic-ref", "HEAD", "refs/heads/work-0001-feature"])?;
+    git(&s.backup, &["config", "uploadpack.hideRefs", "HEAD"])?;
+
+    let (ok, output) = review(&s.work, &["--delete", "backup/work-0001-feature", "--yes"])?;
+    assert!(!ok, "a rejected delete must not report success:\n{output}");
+    assert!(output.contains("delete on backup failed"), "the rejection must be shown:\n{output}");
+    assert!(remote_has_branch(&s.backup)?, "the server's refusal must keep the branch:\n{output}");
+    Ok(())
+}
+
+/// A ref the server does not advertise is not a ref the server does not have.
+/// With no symref line and the branch hidden there is no oid to clear `HEAD`
+/// with, and an unadvertised ref must not read as an absent one.
+#[test]
+fn a_hidden_branch_ref_is_not_evidence_the_delete_is_safe() -> Res<()> {
+    let s = scenario("delete-hidden-ref")?;
+    publish_branch_everywhere(&s)?;
+    let base = git(&s.work, &["rev-parse", "refs/heads/main"])?.trim().to_string();
+    // Detached, so no symref line is sent; and the branch is withheld, so its
+    // oid cannot rule HEAD out. `uploadpack.hideRefs` is fetch-side only.
+    git(&s.backup, &["update-ref", "--no-deref", "HEAD", &base])?;
+    git(&s.backup, &["config", "uploadpack.hideRefs", "refs/heads/work-0001-feature"])?;
+
+    let (ok, output) = review(&s.work, &["--delete", "backup/work-0001-feature", "--yes"])?;
+    assert!(!ok, "an unanswerable endpoint must refuse:\n{output}");
+    assert!(output.contains("without naming a branch"), "wrong reason:\n{output}");
+    assert!(remote_has_branch(&s.backup)?, "backup lost the branch:\n{output}");
+    Ok(())
+}
+
+/// `git push` writes to EVERY pushurl, so every one must be asked: a second
+/// endpoint whose HEAD IS the branch has to refuse the whole delete, even
+/// though the first endpoint cleared it.
+#[test]
+fn every_pushurl_is_asked_before_a_delete() -> Res<()> {
+    let s = scenario("delete-two-pushurls")?;
+    publish_branch_everywhere(&s)?;
+    let root = match s.origin.parent() {
+        Some(root) => root.to_path_buf(),
+        None => return Err("the scenario has no root".into()),
+    };
+    let mirror = root.join("mirror.git");
+    git(&root, &["init", "--bare", "-b", "main", &mirror.to_string_lossy()])?;
+    git(
+        &s.work,
+        &[
+            "push",
+            &mirror.to_string_lossy(),
+            "origin/work-0001-feature:refs/heads/work-0001-feature",
+        ],
+    )?;
+    git(&mirror, &["symbolic-ref", "HEAD", "refs/heads/work-0001-feature"])?;
+    // backup's own url stays FIRST, and clears the branch; the added one must
+    // still be consulted.
+    git(&s.work, &["remote", "set-url", "--push", "backup", &s.backup.to_string_lossy()])?;
+    git(&s.work, &["remote", "set-url", "--add", "--push", "backup", &mirror.to_string_lossy()])?;
+
+    let (ok, output) = review(&s.work, &["--delete", "backup/work-0001-feature", "--yes"])?;
+    assert!(!ok, "the second endpoint's default branch must refuse:\n{output}");
+    assert!(output.contains("backup's default branch"), "wrong reason:\n{output}");
+    assert!(!output.contains("==> backup"), "the remote must not be pushed to:\n{output}");
+    assert!(remote_has_branch(&s.backup)?, "backup lost the branch:\n{output}");
+    Ok(())
+}
+
+/// The same detached `HEAD`, parked anywhere else: nothing about the branch
+/// being deleted, so it must not refuse.
+#[test]
+fn an_unnamed_head_elsewhere_does_not_block_a_delete() -> Res<()> {
+    let s = scenario("delete-unnamed-head-elsewhere")?;
+    publish_branch_everywhere(&s)?;
+    let base = git(&s.work, &["rev-parse", "refs/heads/main"])?.trim().to_string();
+    git(&s.backup, &["update-ref", "--no-deref", "HEAD", &base])?;
+
+    let (ok, output) = review(&s.work, &["--delete", "backup/work-0001-feature", "--yes"])?;
+    assert!(ok, "a HEAD at some other commit protects nothing:\n{output}");
+    assert!(!remote_has_branch(&s.backup)?, "backup still carries the branch:\n{output}");
+    Ok(())
+}
+
 #[test]
 fn delete_requires_an_explicit_yes() -> Res<()> {
     let s = scenario("delete-noyes")?;

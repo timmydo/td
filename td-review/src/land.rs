@@ -4,7 +4,7 @@
 use std::fs;
 use std::io;
 
-use crate::git::{Git, MergeResult, NO_PUSH};
+use crate::git::{Git, HeadClaim, MergeResult, NO_PUSH};
 use crate::term::{Line, Style, CYAN, GRAY, GREEN, RED, YELLOW};
 
 /// What the landing did. Anything other than `Committed` left HEAD unmoved.
@@ -544,11 +544,14 @@ pub fn delete_branch(
         // receive.denyDeleteCurrent is a server-side default we do not control.
         // An unanswerable remote refuses: "unknown" is the state in which the
         // branch could be exactly the one that must not go.
-        targets.iter().find_map(|t| match git.default_branches(&t.remote) {
-            Ok(heads) if heads.iter().any(|h| h == short) => {
-                Some(format!("it is {}'s default branch", t.remote))
-            }
-            Ok(_) => None,
+        targets.iter().find_map(|t| match git.head_claim(&t.remote, short) {
+            Ok(HeadClaim::Default) => Some(format!("it is {}'s default branch", t.remote)),
+            // Never the URL: a push URL routinely carries a credential.
+            Ok(HeadClaim::Unnamed) => Some(format!(
+                "{} reported HEAD without naming a branch, and it could be this one",
+                t.remote
+            )),
+            Ok(HeadClaim::NotDefault) => None,
             Err(e) => Some(format!("{}'s default branch could not be established ({e})", t.remote)),
         })
     };
