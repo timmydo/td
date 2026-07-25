@@ -686,11 +686,9 @@ xfail builtin-misc.test.sh::time pipeline
 xfail builtin-printf.test.sh::Invalid UTF-8
 xfail builtin-printf.test.sh::Too large
 xfail builtin-printf.test.sh::bash truncates long strftime string at 128
-xfail builtin-printf.test.sh::printf # flag
 xfail builtin-printf.test.sh::printf %b with truncated octal escapes
 xfail builtin-printf.test.sh::printf %c unicode - prints the first BYTE of a string - it does not respect UTF-8
 xfail builtin-printf.test.sh::printf -v dynamic scope
-xfail builtin-printf.test.sh::printf eE fF gG
 xfail builtin-printf.test.sh::printf invalid format
 xfail builtin-printf.test.sh::unsigned / octal / hex big
 xfail builtin-process.test.sh::Changing resource limit is denied

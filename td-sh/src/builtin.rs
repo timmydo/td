@@ -168,11 +168,12 @@ fn echo(sh: &mut Shell, argv: &[String]) -> R<()> {
 
 /// POSIX `printf`: format directives with flags/width/precision (including `*`
 /// width/precision from arguments), the integer conversions `d i o u x X` (C
-/// base-0 parsing, the `'c` char-code form, ash's i64/u64 range rules), plus
-/// `c`, `s`, `b` (its own escape set with `\c` early stop), `f`, and
-/// format-string backslash escapes. The format cycles over the remaining
-/// arguments (POSIX). Matched to the dash/ash goldens (spec/builtin-printf),
-/// not bash: no `-v`, and `%q`/`%e`/`%g`/`%(..)T` are rejected like dash/ash.
+/// base-0 parsing, the `'c` char-code form, ash's i64/u64 range rules), the
+/// float conversions `f F e E g G` (C `strtod` operands, C-exact output), plus
+/// `c`, `s`, `b` (its own escape set with `\c` early stop), and format-string
+/// backslash escapes. The format cycles over the remaining arguments (POSIX).
+/// Matched to the dash/ash goldens (spec/builtin-printf), not bash: no `-v`, and
+/// `%q`/`%(..)T` are rejected like dash/ash.
 fn printf(sh: &mut Shell, argv: &[String]) -> R<()> {
     let mut idx = 1usize;
     // dash/ash accept a single leading `--` as end-of-options (bash's `-v` is not
@@ -329,12 +330,12 @@ fn conversion(chars: &[char], start: usize, args: &[&str], out: &mut Vec<u8>, st
         'c' => emit_char(out, args, st, &spec),
         'b' => emit_b(out, args, st, &spec),
         'd' | 'i' | 'o' | 'u' | 'x' | 'X' => emit_int(out, args, st, conv, &spec),
-        'f' | 'F' => emit_float(out, args, st, &spec),
+        'f' | 'F' | 'e' | 'E' | 'g' | 'G' => emit_float(out, args, st, conv, &spec),
         _ => {
-            // Unsupported directive. %q is a bash extension dash/ash reject; %e/%E,
-            // %g/%G and %(..)T are simply not implemented yet (they need C-exact
-            // float / strftime formatting — a follow-up). All are handled the ash
-            // way: keep the prefix already emitted, stop, exit status 1.
+            // Unsupported directive. %q is a bash extension dash/ash reject;
+            // %(..)T is not implemented yet (it needs strftime — a follow-up).
+            // Both are handled the ash way: keep the prefix already emitted,
+            // stop, exit status 1.
             st.errors.push(format!("printf: %{conv}: invalid directive"));
             st.error = true;
             st.stop = true;
@@ -436,48 +437,452 @@ fn emit_int(out: &mut Vec<u8>, args: &[&str], st: &mut Pf, conv: char, spec: &Sp
     pad_bytes(out, &sign, &prefix, mag.as_bytes(), spec.width, spec.left, zero);
 }
 
-fn emit_float(out: &mut Vec<u8>, args: &[&str], st: &mut Pf, spec: &Spec) {
+fn emit_float(out: &mut Vec<u8>, args: &[&str], st: &mut Pf, conv: char, spec: &Spec) {
     let raw = take_arg(args, &mut st.ai).unwrap_or("");
-    // No `'c` char-code form here: dash's getdouble and busybox-ash's my_xstrtod
-    // are plain strtod, so `printf '%f' "'A"` is a numeric error in both (only the
-    // integer path takes the quote form). Matching bash here would deviate.
-    let value: f64 = if raw.is_empty() {
-        0.0
-    } else {
-        match raw.trim().parse::<f64>() {
-            Ok(v) => v,
-            Err(_) => {
-                st.errors.push(format!("printf: {raw}: expected a numeric value"));
-                st.error = true;
-                0.0
-            }
-        }
-    };
-    let p = match spec.prec {
+    // The float path takes no `'c` char-code form, unlike the integer one: a
+    // leading quote is just an unconvertible operand. No corpus golden pins this,
+    // and the FreeBSD printf lineage dash descends from does apply the quote form
+    // to floats too, so it is worth re-checking against dash/busybox source.
+    let num = strtod(raw);
+    // dash's check_conversion: an unconverted tail, or an out-of-range value, is
+    // an error — but the (partially converted) value is still printed. An operand
+    // absent altogether, or empty, converts to 0 with no complaint.
+    if num.consumed < raw.len() {
+        let why = if num.consumed == 0 { "expected a numeric value" } else { "not completely converted" };
+        st.errors.push(format!("printf: {raw}: {why}"));
+        st.error = true;
+    } else if num.erange {
+        st.errors.push(format!("printf: {raw}: Numerical result out of range"));
+        st.error = true;
+    }
+    let value = num.value;
+    let prec = match spec.prec {
         Some(p) if p >= 0 => p as usize,
         _ => 6,
     };
     let flags = spec.flags;
+    let upper = matches!(conv, 'F' | 'E' | 'G');
     let mut sign: Vec<u8> = Vec::new();
-    if value.is_sign_negative() && !value.is_nan() {
+    if value.is_sign_negative() {
         sign.push(b'-');
     } else if flags.plus {
         sign.push(b'+');
     } else if flags.space {
         sign.push(b' ');
     }
-    // Rust prints NaN as "NaN"; C/ash print "nan".
-    let mut digits = if value.is_nan() {
-        String::from("nan")
+    let mag = value.abs();
+    // C spells these "inf"/"nan" (uppercased by an uppercase conversion) and
+    // ignores both the precision and the 0 flag for them.
+    let (body, numeric) = if mag.is_nan() {
+        (String::from(if upper { "NAN" } else { "nan" }), false)
+    } else if mag.is_infinite() {
+        (String::from(if upper { "INF" } else { "inf" }), false)
     } else {
-        format!("{:.*}", p, value.abs())
+        let s = match conv {
+            'e' | 'E' => fmt_e(mag, prec, upper, flags.hash),
+            'g' | 'G' => fmt_g(mag, prec, upper, flags.hash),
+            _ => fmt_f(mag, prec, flags.hash),
+        };
+        (s, true)
     };
-    if flags.hash && p == 0 && !digits.contains('.') {
-        digits.push('.');
-    }
     // Unlike integers, a precision does NOT disable the 0 flag for floats.
-    let zero = flags.zero && !spec.left;
-    pad_bytes(out, &sign, &[], digits.as_bytes(), spec.width, spec.left, zero);
+    let zero = flags.zero && !spec.left && numeric;
+    pad_bytes(out, &sign, &[], body.as_bytes(), spec.width, spec.left, zero);
+}
+
+// C `%f`: `prec` fraction digits, and `#` keeps the point that `.0` would drop.
+// Rust's fixed formatting is correctly rounded (ties to even) like glibc's.
+fn fmt_f(mag: f64, prec: usize, hash: bool) -> String {
+    let mut s = format!("{:.*}", prec, mag);
+    if hash && prec == 0 {
+        s.push('.');
+    }
+    s
+}
+
+// C `%e`: one digit, `prec` fraction digits, then `e±dd` (at least two exponent
+// digits). Rust rounds the same way but spells the exponent as "3.14e0".
+fn fmt_e(mag: f64, prec: usize, upper: bool, hash: bool) -> String {
+    let (digits, exp) = exp_digits(mag, prec);
+    let mut s = String::new();
+    s.push_str(digits.get(0..1).unwrap_or("0"));
+    let frac = digits.get(1..).unwrap_or("");
+    if !frac.is_empty() || hash {
+        s.push('.');
+    }
+    s.push_str(frac);
+    push_exp(&mut s, exp, upper);
+    s
+}
+
+// C `%g`: `prec` significant digits (0 means 1); style `e` when the exponent is
+// below -4 or at least the precision, else style `f`; without `#`, trailing
+// fraction zeros (and a bare point) are dropped. Both styles are built from the
+// ONE rounded digit string so they cannot round differently.
+fn fmt_g(mag: f64, prec: usize, upper: bool, hash: bool) -> String {
+    let p = prec.max(1);
+    let (digits, exp) = exp_digits(mag, p - 1);
+    if exp < -4 || exp >= p as i32 {
+        let mut s = String::new();
+        s.push_str(digits.get(0..1).unwrap_or("0"));
+        let frac = digits.get(1..).unwrap_or("");
+        let frac = if hash {
+            // glibc quirk, reproduced because dash/ash print THROUGH glibc: when
+            // rounding carries the exponent out of style f's range, glibc keeps
+            // style f's fraction count (always 0 there) instead of style e's, so
+            // `%#.6g` of 999999.5 is `1.e+06`, not C's `1.00000e+06`. Only a value
+            // style f would have taken UNROUNDED carries like that; one already in
+            // style e (exponent below -4) is formatted normally.
+            if (-4..p as i32).contains(&decimal_exponent(mag)) { "" } else { frac }
+        } else {
+            frac.trim_end_matches('0')
+        };
+        if !frac.is_empty() || hash {
+            s.push('.');
+        }
+        s.push_str(frac);
+        push_exp(&mut s, exp, upper);
+        s
+    } else {
+        let mut s = fixed_from_digits(&digits, exp);
+        if hash {
+            if !s.contains('.') {
+                s.push('.');
+            }
+        } else if s.contains('.') {
+            s = s.trim_end_matches('0').trim_end_matches('.').to_string();
+        }
+        s
+    }
+}
+
+// The `prec + 1` correctly rounded significant digits of `mag` and its decimal
+// exponent, read back out of Rust's exponential form ("d.ddde<exp>"). `mag` is
+// finite and non-negative, so the shape is fixed; the fallbacks only keep a
+// malformed read from panicking.
+// `prec` MUST stay <= MAX_FIELD: Rust's formatter panics at 65536, so the clamp
+// in `conversion()` is what keeps this call safe, with nothing to spare.
+fn exp_digits(mag: f64, prec: usize) -> (String, i32) {
+    let s = format!("{:.*e}", prec, mag);
+    let (mant, e) = match s.split_once('e') {
+        Some(parts) => parts,
+        None => (s.as_str(), "0"),
+    };
+    let digits: String = mant.chars().filter(|c| *c != '.').collect();
+    (digits, e.parse::<i32>().unwrap_or(0))
+}
+
+// The decimal exponent `mag` has BEFORE any rounding to a precision. Rust's
+// shortest round-trip form carries the true one (it cannot round up into the
+// next decade, since that would need the value to be that decade already).
+fn decimal_exponent(mag: f64) -> i32 {
+    let s = format!("{mag:e}");
+    match s.split_once('e') {
+        Some((_, e)) => e.parse::<i32>().unwrap_or(0),
+        None => 0,
+    }
+}
+
+// C's exponent suffix: sign always, at least two digits.
+fn push_exp(s: &mut String, exp: i32, upper: bool) {
+    s.push(if upper { 'E' } else { 'e' });
+    s.push(if exp < 0 { '-' } else { '+' });
+    let a = exp.unsigned_abs();
+    if a < 10 {
+        s.push('0');
+    }
+    s.push_str(&a.to_string());
+}
+
+// Lay significant `digits` out as plain fixed-point with the decimal exponent
+// `exp` (the value is `0.digits * 10^(exp+1)`). Callers guarantee `exp` is small
+// enough that the string stays bounded by the field clamp.
+fn fixed_from_digits(digits: &str, exp: i32) -> String {
+    let mut s = String::new();
+    if exp < 0 {
+        s.push_str("0.");
+        for _ in 0..(-exp - 1) {
+            s.push('0');
+        }
+        s.push_str(digits);
+        return s;
+    }
+    let split = (exp as usize).saturating_add(1).min(digits.len());
+    s.push_str(digits.get(0..split).unwrap_or(""));
+    let frac = digits.get(split..).unwrap_or("");
+    if !frac.is_empty() {
+        s.push('.');
+        s.push_str(frac);
+    }
+    s
+}
+
+// The result of C's `strtod` — the conversion dash's `getdouble` and busybox-ash's
+// float path both delegate to: the value, how many bytes it consumed (0 == no
+// conversion at all), and whether it over/underflowed (C's ERANGE).
+struct Num {
+    value: f64,
+    consumed: usize,
+    erange: bool,
+}
+
+// C `strtod`: optional whitespace and sign, then an `inf`/`nan` spelling, a C99
+// hex float, or a decimal float. Stops at the first byte that cannot extend the
+// number, so `"1 "` converts 1.0 AND reports a tail (dash's status 1).
+fn strtod(s: &str) -> Num {
+    let none = Num { value: 0.0, consumed: 0, erange: false };
+    let b = s.as_bytes();
+    let mut i = 0usize;
+    while matches!(b.get(i), Some(&c) if c == b' ' || (0x09..=0x0d).contains(&c)) {
+        i += 1;
+    }
+    let neg = match b.get(i) {
+        Some(&b'-') => {
+            i += 1;
+            true
+        }
+        Some(&b'+') => {
+            i += 1;
+            false
+        }
+        _ => false,
+    };
+    let Some((mag, end, erange)) =
+        parse_inf_nan(b, i).or_else(|| parse_hex_float(b, i)).or_else(|| parse_dec_float(b, i))
+    else {
+        return none;
+    };
+    Num { value: if neg { -mag } else { mag }, consumed: end, erange }
+}
+
+// `inf`/`infinity`/`nan`/`nan(chars)`, case-insensitive. A longer word that only
+// starts with one of them keeps just the prefix ("infinit" converts "inf").
+fn parse_inf_nan(b: &[u8], i: usize) -> Option<(f64, usize, bool)> {
+    if word_at(b, i, b"infinity") {
+        return Some((f64::INFINITY, i + 8, false));
+    }
+    if word_at(b, i, b"inf") {
+        return Some((f64::INFINITY, i + 3, false));
+    }
+    if !word_at(b, i, b"nan") {
+        return None;
+    }
+    let mut j = i + 3;
+    if b.get(j) == Some(&b'(') {
+        let mut k = j + 1;
+        while matches!(b.get(k), Some(&c) if c.is_ascii_alphanumeric() || c == b'_') {
+            k += 1;
+        }
+        if b.get(k) == Some(&b')') {
+            j = k + 1;
+        }
+    }
+    Some((f64::NAN, j, false))
+}
+
+fn word_at(b: &[u8], i: usize, word: &[u8]) -> bool {
+    word.iter().enumerate().all(|(k, w)| b.get(i + k).is_some_and(|c| c.eq_ignore_ascii_case(w)))
+}
+
+// C99 hex float `0x<hex digits>[.<hex digits>][p[±]<decimal digits>]`. Without a
+// hex digit the `0x` is not a prefix at all, so `"0x"` falls through to the
+// decimal parse and converts just the `0` (as glibc does).
+fn parse_hex_float(b: &[u8], i: usize) -> Option<(f64, usize, bool)> {
+    if b.get(i) != Some(&b'0') || !matches!(b.get(i + 1), Some(&c) if c == b'x' || c == b'X') {
+        return None;
+    }
+    let mut j = i + 2;
+    let mut mant: u128 = 0;
+    let mut dropped: i64 = 0; // significand digits past what `mant` can hold
+    let mut nfrac: i64 = 0;
+    let mut sticky = false;
+    let mut any = false;
+    let mut after_point = false;
+    while let Some(&c) = b.get(j) {
+        let d = match c {
+            b'.' if !after_point => {
+                after_point = true;
+                j += 1;
+                continue;
+            }
+            _ => match digit_val(c as char) {
+                Some(d) if d < 16 => d,
+                _ => break,
+            },
+        };
+        any = true;
+        if after_point {
+            nfrac += 1;
+        }
+        // Absorb while there is room; beyond it only the fact that a dropped
+        // digit was non-zero matters (the sticky bit for rounding).
+        if mant < (1u128 << 124) {
+            mant = (mant << 4) | d as u128;
+        } else {
+            if d != 0 {
+                sticky = true;
+            }
+            dropped += 1;
+        }
+        j += 1;
+    }
+    if !any {
+        return None;
+    }
+    let mut pexp: i64 = 0;
+    if matches!(b.get(j), Some(&c) if c == b'p' || c == b'P') {
+        let mut k = j + 1;
+        let eneg = match b.get(k) {
+            Some(&b'-') => {
+                k += 1;
+                true
+            }
+            Some(&b'+') => {
+                k += 1;
+                false
+            }
+            _ => false,
+        };
+        let mut digits = 0usize;
+        let mut v: i64 = 0;
+        while let Some(&c) = b.get(k) {
+            if !c.is_ascii_digit() {
+                break;
+            }
+            v = v.saturating_mul(10).saturating_add((c - b'0') as i64);
+            digits += 1;
+            k += 1;
+        }
+        // A `p` with no digits is not part of the number (glibc leaves it).
+        if digits > 0 {
+            pexp = if eneg { -v } else { v };
+            j = k;
+        }
+    }
+    let e = dropped.saturating_sub(nfrac).saturating_mul(4).saturating_add(pexp);
+    let (mag, erange) = scale_pow2(mant, e, sticky);
+    Some((mag, j, erange))
+}
+
+// Round `mant * 2^e` (with `sticky` recording significand bits already dropped)
+// to the nearest f64, ties to even, and report C's ERANGE.
+fn scale_pow2(mant: u128, e: i64, sticky: bool) -> (f64, bool) {
+    if mant == 0 {
+        return (0.0, false);
+    }
+    let mut m = mant;
+    let mut lost = sticky;
+    // Beyond this the result can only overflow or underflow, and the clamp keeps
+    // every shift below in range.
+    let mut exp = e.clamp(-(1 << 20), 1 << 20);
+    let mut bits = 128 - i64::from(m.leading_zeros());
+    // Reduce to 64 significant bits first so the rounding shift stays small.
+    if bits > 64 {
+        let sh = bits - 64;
+        if m & ((1u128 << sh) - 1) != 0 {
+            lost = true;
+        }
+        m >>= sh;
+        exp += sh;
+        bits = 64;
+    }
+    // Underflow is judged on the value rounded to a 53-bit significand with an
+    // UNBOUNDED exponent, not on the exact value: IEEE leaves the choice open and
+    // glibc detects tininess after rounding. So `0x0.fffffffffffffcp-1022` is in
+    // range (it rounds up to 2^-1022) while `0x1.fffffffffffffp-1023` is not,
+    // even though both land on the smallest normal.
+    let (tm, texp, _) = round_shift(m, exp, lost, bits - 53);
+    let tiny = texp + (128 - i64::from(tm.leading_zeros())) - 1 < -1022;
+    // Discard down to a 53-bit significand, or further once the subnormal floor
+    // (a quantum of 2^-1074) is the binding constraint.
+    let drop = (bits - 53).max(-1074 - exp);
+    let (m, exp, lost) = round_shift(m, exp, lost, drop);
+    if m == 0 {
+        return (0.0, true); // rounded away below the quantum
+    }
+    let bits = 128 - i64::from(m.leading_zeros());
+    let msb = exp + bits - 1; // value == 1.f * 2^msb
+    if msb > 1023 {
+        return (f64::INFINITY, true);
+    }
+    let raw = if msb < -1022 {
+        // Subnormal: `drop` left the quantum at 2^-1074, so rescaling `m` to it
+        // gives the IEEE encoding directly (`msb < -1022` keeps it under 2^52).
+        ((m << (exp + 1074).clamp(0, 52)) & ((1u128 << 52) - 1)) as u64
+    } else {
+        let shift = 53 - bits;
+        let m53 = if shift >= 0 { m << shift } else { m >> shift.unsigned_abs() };
+        (((msb + 1023) as u64) << 52) | ((m53 as u64) & ((1u64 << 52) - 1))
+    };
+    (f64::from_bits(raw), tiny && lost)
+}
+
+// Shift `m` right by `d` bits, rounding to nearest with ties to even. `lost`
+// carries the sticky bit of everything already dropped in, and back out.
+fn round_shift(m: u128, exp: i64, lost: bool, d: i64) -> (u128, i64, bool) {
+    if d <= 0 {
+        return (m, exp, lost);
+    }
+    if d >= 128 {
+        // Even the rounding bit sits below the target quantum.
+        return (0, exp + d, true);
+    }
+    let rem = m & ((1u128 << d) - 1);
+    let half = 1u128 << (d - 1);
+    let mut q = m >> d;
+    if rem > half || (rem == half && (lost || q & 1 == 1)) {
+        q += 1;
+    }
+    (q, exp + d, lost || rem != 0)
+}
+
+// A decimal float: digits with an optional point and an optional `e` exponent.
+// The scanned prefix is handed to Rust's parser, which is correctly rounded and
+// accepts exactly these forms.
+fn parse_dec_float(b: &[u8], i: usize) -> Option<(f64, usize, bool)> {
+    let mut j = i;
+    let mut digits = 0usize;
+    let mut nonzero = false;
+    let mut after_point = false;
+    while let Some(&c) = b.get(j) {
+        if c == b'.' && !after_point {
+            after_point = true;
+        } else if c.is_ascii_digit() {
+            digits += 1;
+            nonzero |= c != b'0';
+        } else {
+            break;
+        }
+        j += 1;
+    }
+    if digits == 0 {
+        return None;
+    }
+    if matches!(b.get(j), Some(&c) if c == b'e' || c == b'E') {
+        let mut k = j + 1;
+        if matches!(b.get(k), Some(&c) if c == b'-' || c == b'+') {
+            k += 1;
+        }
+        let mut n = 0usize;
+        while matches!(b.get(k), Some(&c) if c.is_ascii_digit()) {
+            k += 1;
+            n += 1;
+        }
+        // An `e` with no digits is not part of the number.
+        if n > 0 {
+            j = k;
+        }
+    }
+    let text = std::str::from_utf8(b.get(i..j)?).ok()?;
+    let mag = text.parse::<f64>().ok()?;
+    // C's ERANGE. Rust's parser reports neither inexactness nor tininess, so a
+    // subnormal result stands in for both. That differs from glibc only for
+    // operands no one can write by hand: an EXACT subnormal (needs >=751
+    // significant digits, e.g. 5^1074 e-1074, which glibc leaves in range), and
+    // the one-2^-1075-wide window below 2^-1022 that rounds up to it (glibc
+    // reports those out of range). The hex path decides both exactly.
+    let erange = mag.is_infinite() || (nonzero && (mag == 0.0 || mag < f64::MIN_POSITIVE));
+    Some((mag, j, erange))
 }
 
 fn push_char(out: &mut Vec<u8>, c: char) {
@@ -1626,6 +2031,102 @@ mod tests {
         // A format ending mid-directive keeps the literal `%` and the modifiers
         // already consumed rather than swallowing them.
         assert_eq!(run_capturing("printf 'x%5'").1, "x%5");
+    }
+
+    #[test]
+    fn printf_exponent_and_general_float_forms() {
+        // %e/%E: one digit, six by default, a signed two-digit-minimum exponent.
+        assert_eq!(
+            run_capturing("printf '[%e][%E][%.0e][%#.0e][%.3e]' 3.14 3.14 3.14 3.14 -3.14").1,
+            "[3.140000e+00][3.140000E+00][3e+00][3.e+00][-3.140e+00]"
+        );
+        // A three-digit exponent keeps all three digits.
+        assert_eq!(run_capturing("printf '[%e][%e]' 1e300 1e-300").1, "[1.000000e+300][1.000000e-300]");
+        // %g picks style f or e by exponent and drops trailing zeros; `#` keeps
+        // them (and the point), and precision 0 means 1 significant digit.
+        assert_eq!(
+            run_capturing("printf '[%g][%#g][%g][%g][%g]' 3 3 100000 1000000 0.00001").1,
+            "[3][3.00000][100000][1e+06][1e-05]"
+        );
+        assert_eq!(
+            run_capturing("printf '[%.3g][%G][%#.0g][%g]' 1234.5 0.0001 3 0.000123456789").1,
+            "[1.23e+03][0.0001][3.][0.000123457]"
+        );
+        // Rounding that carries into the next decade must re-pick the style.
+        assert_eq!(run_capturing("printf '[%g][%g]' 9.9999995 999999.5").1, "[10][1e+06]");
+        // With `#`, that carry keeps style f's (zero) fraction count -- glibc's
+        // spelling, which dash/ash inherit. A carry that stays inside style e
+        // (9995 at .3g), and a value style f never applied to (exponent below
+        // -4), both keep the full fraction.
+        assert_eq!(
+            run_capturing("printf '[%#.6g][%#.3g][%#.3g][%#.6g][%#.6g]' 999999.5 999.5 9995 1000000 0.00001").1,
+            "[1.e+06][1.e+03][1.00e+04][1.00000e+06][1.00000e-05]"
+        );
+        // Width/justification/zero-fill apply to the whole converted field.
+        assert_eq!(
+            run_capturing("printf '[%12.3e][%-12.3e][%012.3e][%015.4g]' -3.14 -3.14 -3.14 1234567").1,
+            "[  -3.140e+00][-3.140e+00  ][-003.140e+00][0000001.235e+06]"
+        );
+    }
+
+    #[test]
+    fn printf_float_infinity_and_nan_spellings() {
+        // C spells these inf/nan, uppercased by an uppercase conversion, and
+        // ignores the 0 flag for them (glibc pads with spaces).
+        assert_eq!(
+            run_capturing("printf '[%f][%F][%e][%E][%g][%G]' inf inf inf -inf nan nan").1,
+            "[inf][INF][inf][-INF][nan][NAN]"
+        );
+        assert_eq!(run_capturing("printf '[%08f][%-8f][%+f]' inf inf inf").1, "[     inf][inf     ][+inf]");
+        // The sign bit survives, including on NaN and negative zero.
+        assert_eq!(run_capturing("printf '[%f][%g][%e]' -nan -0.0 -0").1, "[-nan][-0][-0.000000e+00]");
+        // INFINITY/NAN spellings are case-insensitive; a longer word keeps only
+        // the prefix that converted, which is then an unconverted tail.
+        assert_eq!(run_capturing("printf '[%f][%f]' INFINITY Inf").1, "[inf][inf]");
+        let (status, out, _) = run_capturing("printf '[%f]' infinit");
+        assert_eq!(out, "[inf]");
+        assert_eq!(status, 1);
+    }
+
+    #[test]
+    fn printf_float_operands_follow_strtod() {
+        // C99 hex floats convert like strtod, including a bare `0x` (which is not
+        // a prefix at all, so only the `0` converts and `x` is a tail).
+        assert_eq!(run_capturing("printf '[%g][%g][%g][%g]' 0x1p2 0x1.8p1 0X1P-1 0x10").1, "[4][3][0.5][16]");
+        // Exactly representable subnormals are in range; inexact ones are not.
+        assert_eq!(run_capturing("printf '[%.0e]' 0x1p-1074").1, "[5e-324]");
+        assert_eq!(run_capturing("printf '[%.0e]' 0x1p-1074").0, 0);
+        assert_eq!(run_capturing("printf '[%.0e]' 0x1.8p-1074").0, 1);
+        // Tininess is judged after rounding to 53 bits, so two operands that both
+        // land on the smallest normal split: `0x1.fffffffffffffp-1023` is tiny
+        // first and rounds up (out of range), `0x0.fffffffffffffcp-1022` rounds up
+        // to 2^-1022 before the test and is in range.
+        let (status, out, _) = run_capturing("printf '[%.17g]' 0x1.fffffffffffffp-1023");
+        assert_eq!(out, "[2.2250738585072014e-308]");
+        assert_eq!(status, 1);
+        let (status, out, _) = run_capturing("printf '[%.17g]' 0x0.fffffffffffffcp-1022");
+        assert_eq!(out, "[2.2250738585072014e-308]");
+        assert_eq!(status, 0);
+        // A tail leaves the partial conversion in place but fails (dash's
+        // check_conversion), and so does an out-of-range magnitude.
+        let (status, out, err) = run_capturing("printf '[%f]' '1 '");
+        assert_eq!(out, "[1.000000]");
+        assert_eq!(status, 1);
+        assert!(err.contains("not completely converted"), "err: {err:?}");
+        let (status, out, err) = run_capturing("printf '[%f]' 1e400");
+        assert_eq!(out, "[inf]");
+        assert_eq!(status, 1);
+        assert!(err.contains("out of range"), "err: {err:?}");
+        assert_eq!(run_capturing("printf '[%f]' 1e-400"), (1, "[0.000000]".into(), "printf: 1e-400: Numerical result out of range\n".into()));
+        // Leading whitespace is skipped; a wholly unconvertible operand is 0.
+        assert_eq!(run_capturing("printf '[%g]' '  42'").1, "[42]");
+        let (status, out, err) = run_capturing("printf '[%f]' abc");
+        assert_eq!(out, "[0.000000]");
+        assert_eq!(status, 1);
+        assert!(err.contains("expected a numeric value"), "err: {err:?}");
+        // An operand that is absent, or present but empty, is a silent zero.
+        assert_eq!(run_capturing("printf '[%f]'"), (0, "[0.000000]".into(), String::new()));
+        assert_eq!(run_capturing("printf '[%f]' ''"), (0, "[0.000000]".into(), String::new()));
     }
 
     #[test]
