@@ -102,6 +102,10 @@ pub struct Shell {
     /// Aliases in force. They are consumed at PARSE time, so only the unit loop
     /// and the other parse entry points read this.
     pub aliases: Aliases,
+    /// This `Shell` is an in-process CLONE (subshell, async list, command
+    /// substitution), not a forked process. `exec` must not replace the real
+    /// process from one, or the rest of the script would be lost with it.
+    pub cloned: bool,
 }
 
 /// Bound on nested command execution — enforced once, at the `run_command` choke
@@ -145,6 +149,7 @@ impl Shell {
             getopts_optind: 1,
             getopts_off: -1,
             aliases: Aliases::new(),
+            cloned: false,
         };
         // POSIX seeds these when absent; scripts assume they exist.
         if sh.get_var("IFS").is_none() {
@@ -180,6 +185,7 @@ impl Shell {
             getopts_optind: 1,
             getopts_off: -1,
             aliases: Aliases::new(),
+            cloned: false,
         };
         let _ = sh.set_var("IFS", " \t\n");
         let _ = sh.set_var("OPTIND", "1");
@@ -700,9 +706,21 @@ fn run_builtin(
             for a in assigns {
                 let value = expand::expand_assign(sh, &a.value)?;
                 sh.set_var(&a.name, &value)?;
+                // `exec`'s prefix bindings go to the replacement process, so they
+                // are exported as well as set (dash's listsetvar VEXPORT).
+                if matches!(bi, builtin::Builtin::Exec) {
+                    sh.export(&a.name);
+                }
             }
             builtin::run(sh, bi, argv)
         })();
+        // Bare `exec` is the one builtin whose redirections are the POINT: they
+        // stay in force for the rest of the shell instead of being unwound here.
+        // With a command word they belong to the replacement process, so a FAILED
+        // `exec` (which only returns in an interactive shell) must still unwind.
+        if matches!(bi, builtin::Builtin::Exec) && argv.len() == 1 {
+            return result;
+        }
         process::restore_redirs(sh, saved);
         return result;
     }

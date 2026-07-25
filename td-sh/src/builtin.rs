@@ -7,7 +7,7 @@
 //! the redirections in force.
 
 use crate::exec::{Shell, Sig, R};
-use crate::process::{read_byte, write_fd};
+use crate::process::{self, read_byte, write_fd};
 use crate::{ast, exec};
 
 #[derive(Clone, Copy, Debug)]
@@ -37,6 +37,7 @@ pub enum Builtin {
     Wait,
     Alias,
     Unalias,
+    Exec,
 }
 
 pub fn lookup(name: &str) -> Option<Builtin> {
@@ -66,6 +67,7 @@ pub fn lookup(name: &str) -> Option<Builtin> {
         "wait" => Builtin::Wait,
         "alias" => Builtin::Alias,
         "unalias" => Builtin::Unalias,
+        "exec" => Builtin::Exec,
         _ => return None,
     })
 }
@@ -79,6 +81,7 @@ pub fn is_special(bi: Builtin) -> bool {
         Builtin::Colon
             | Builtin::Dot
             | Builtin::Break
+            | Builtin::Exec
             | Builtin::Continue
             | Builtin::Eval
             | Builtin::Exit
@@ -117,6 +120,7 @@ pub fn run(sh: &mut Shell, bi: Builtin, argv: &[String]) -> R<()> {
         Builtin::Wait => ok(sh),
         Builtin::Alias => alias(sh, argv),
         Builtin::Unalias => unalias(sh, argv),
+        Builtin::Exec => exec_cmd(sh, argv),
     }
 }
 
@@ -1605,7 +1609,9 @@ fn read(sh: &mut Shell, argv: &[String]) -> R<()> {
 /// Read one input line, honouring backslash-newline continuation unless `-r`.
 /// Returns `None` only at end-of-input with nothing read (so a blank line reads as
 /// an empty, successful line). The bool is whether a newline terminated the line: a
-/// partial line at EOF returns `false`, which makes `read` report failure.
+/// partial line at EOF returns `false`, which makes `read` report failure. `None`
+/// is end of input with nothing read -- or a reported I/O error, which dash also
+/// leaves the destinations empty for.
 fn read_logical_line(sh: &mut Shell, raw: bool) -> R<Option<(String, bool)>> {
     let mut bytes: Vec<u8> = Vec::new();
     let mut read_anything = false;
@@ -1625,8 +1631,13 @@ fn read_logical_line(sh: &mut Shell, raw: bool) -> R<Option<(String, bool)>> {
                 }
                 Ok(None) => break,
                 Err(e) => {
+                    // A read error fails the BUILTIN; it does not kill the shell
+                    // (`read x < some-directory` is EISDIR). dash breaks out of
+                    // its read loop and falls into the ordinary assignment path,
+                    // so the destinations end up empty -- which is what returning
+                    // end-of-input here does.
                     err_line(sh, &format!("read: {e}"));
-                    return Err(Sig::Exit(2));
+                    return Ok(None);
                 }
             }
         }
@@ -1803,6 +1814,16 @@ fn unalias(sh: &mut Shell, argv: &[String]) -> R<()> {
         }
     }
     status(sh, ret)
+}
+
+/// `exec [command [arg …]]`. With no command this is only a carrier for its
+/// redirections, which the caller leaves in force instead of restoring; with one
+/// it REPLACES this shell, so it returns only when the command cannot be run.
+fn exec_cmd(sh: &mut Shell, argv: &[String]) -> R<()> {
+    match argv.get(1..) {
+        None | Some([]) => ok(sh),
+        Some(words) => process::exec_replace(sh, words),
+    }
 }
 
 fn eval(sh: &mut Shell, argv: &[String]) -> R<()> {
@@ -2852,6 +2873,48 @@ mod tests {
         // input can complete it, so the unit loop must not keep reading lines.
         let (status, out, _) = run_capturing("alias e='cat <<EOF'\ne\necho after");
         assert_eq!((status, out.as_str()), (2, ""));
+    }
+
+    #[test]
+    fn exec_without_a_command_keeps_its_redirections() {
+        // The whole point of `exec` with no command word: the redirections are
+        // NOT unwound when it returns.
+        assert_eq!(run_capturing("exec 3>&1\necho hi 1>&3").1, "hi\n");
+        assert_eq!(
+            run_capturing("exec 3>&1\nexec 4>&1\necho three 1>&3\necho four 1>&4").1,
+            "three\nfour\n"
+        );
+        // Bare `exec` is a no-op that succeeds.
+        assert_eq!(run_capturing("exec; echo status=$?").1, "status=0\n");
+    }
+
+    #[test]
+    fn exec_of_an_unknown_command_ends_the_shell() {
+        // POSIX: a failed `exec` is fatal to a non-interactive shell.
+        let (status, out, err) = run_capturing("exec no_such_cmd_xyz\necho NOTREACHED");
+        assert_eq!((status, out.as_str()), (127, ""));
+        assert!(err.contains("not found"), "err: {err:?}");
+    }
+
+    #[test]
+    fn read_reports_an_io_error_without_killing_the_shell() {
+        // Reading a directory is EISDIR: the builtin fails, the shell carries on.
+        // dash falls into its ordinary assignment path afterwards, so the
+        // destination ends up empty rather than keeping its old value.
+        let (status, out, _) = run_capturing("x=old; read x < .; echo \"[$x] $?\"; echo alive");
+        assert_eq!((status, out.as_str()), (0, "[] 1\nalive\n"));
+    }
+
+    #[test]
+    fn exec_failure_is_confined_to_a_subshell() {
+        // `exec` must never take the rest of the script with it from an
+        // in-process clone: the subshell ends, the parent carries on.
+        let (status, out, _) =
+            run_capturing("( exec no_such_cmd_xyz ) 2>/dev/null; echo after=$?");
+        assert_eq!((status, out.as_str()), (0, "after=127\n"));
+        let (_, out, _) =
+            run_capturing("for i in 1 2; do ( exec no_such_cmd_xyz ) 2>/dev/null; done; echo done");
+        assert_eq!(out, "done\n");
     }
 
     #[test]

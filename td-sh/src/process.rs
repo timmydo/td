@@ -9,6 +9,12 @@
 //! stage with the previous stage's output buffered as the next stage's input —
 //! correct for every finite producer, which is the whole seed corpus and the
 //! overwhelming majority of scripts. True concurrent pipes are a later refinement.
+//!
+//! The virtual table is why `exec cmd` hands the child only descriptors 0/1/2:
+//! passing a higher one across an `execve` needs a `pre_exec` `dup2` (unsafe) or a
+//! real `fork`, so `exec 3>f; cmd >&3` works (3 is remapped onto a standard
+//! descriptor for the child) while `exec 3>f; cmd` cannot let `cmd` see fd 3.
+//! A `Fd::Closed` likewise reaches the child as `/dev/null` rather than closed.
 
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
@@ -411,6 +417,7 @@ pub fn fork_shell(sh: &Shell) -> Shell {
         getopts_off: sh.getopts_off,
         // A subshell inherits the aliases but cannot publish one back (POSIX).
         aliases: sh.aliases.clone(),
+        cloned: true,
     }
 }
 
@@ -437,6 +444,61 @@ pub fn capture_stdout(sh: &mut Shell, code: &str) -> R<String> {
         .map(|v| v.clone())
         .map_err(|_| sh.fatal("command substitution: poisoned capture buffer", 1))?;
     Ok(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+/// `exec command …`: replace this shell process with `command`.
+///
+/// Returns only if the command cannot be run at all — a real `execve` never comes
+/// back. Falls back to run-then-exit when a descriptor is one of the shell's
+/// in-process buffers (a pipeline stage or command substitution): those bytes have
+/// no kernel descriptor to hand over, so the command is run normally and the shell
+/// exits with its status, which is what the caller would have observed anyway.
+pub fn exec_replace(sh: &mut Shell, argv: &[String]) -> R<()> {
+    use std::os::unix::process::CommandExt;
+
+    let Some(program) = argv.first() else {
+        return Ok(());
+    };
+    let Some(resolved) = resolve_program(sh, program) else {
+        let _ = exec::write_stderr(sh, &format!("td-sh: exec: {program}: not found"));
+        return failed_exec(sh, 127);
+    };
+    // Replacing the process is only safe from the real shell with real stdio. An
+    // in-process clone (subshell, `&`, command substitution) would take the whole
+    // script with it, and an in-process buffer has no kernel fd to hand over; both
+    // run the command and exit instead, which is what the caller would have seen.
+    let buffered = (0..=2).any(|fd| {
+        matches!(sh.fds.get(fd), Some(Fd::ReadBuf(_)) | Some(Fd::WriteBuf(_)))
+    });
+    if sh.cloned || buffered {
+        exec_external(sh, argv, &[])?;
+        return Err(Sig::Exit(sh.status));
+    }
+
+    let mut cmd = Command::new(&resolved);
+    cmd.args(argv.iter().skip(1));
+    cmd.env_clear();
+    for (k, v) in sh.exported_env() {
+        cmd.env(k, v);
+    }
+    cmd.current_dir(&sh.cwd);
+    cmd.stdin(stdio_for(sh, 0)?);
+    cmd.stdout(stdio_for(sh, 1)?);
+    cmd.stderr(stdio_for(sh, 2)?);
+
+    // Safe: `CommandExt::exec` returns the error rather than trapping it.
+    let e = cmd.exec();
+    let _ = exec::write_stderr(sh, &format!("td-sh: exec: {program}: {e}"));
+    failed_exec(sh, 126)
+}
+
+/// A failed `exec` ends the shell, interactive or not: dash and busybox-ash both
+/// clear `iflag` before handing over, and by the time `CommandExt::exec` reports
+/// failure it has already applied the redirections to the REAL descriptors, so
+/// carrying on would leave the shell rewired.
+fn failed_exec(sh: &mut Shell, code: i32) -> R<()> {
+    sh.set_status(code);
+    Err(Sig::Exit(code))
 }
 
 /// Spawn an external program, wiring its stdio to the current descriptor table.
@@ -592,7 +654,12 @@ pub fn exec_external(
 /// (inherit) for any fd the bridge does not special-case.
 fn stdio_for(sh: &Shell, fd: u32) -> R<Stdio> {
     match sh.fds.get(fd) {
-        Some(Fd::Inherit(_)) | None => Ok(Stdio::inherit()),
+        // Map to the REAL stream the entry names, not to this position: after
+        // `1>&2` fd 1 holds `Inherit(2)`, so the child's stdout must go to the
+        // shell's stderr. `try_clone_to_owned` is the safe dup; if it fails the
+        // positional inherit is the harmless fallback.
+        Some(Fd::Inherit(n)) => Ok(inherit_stream(*n)),
+        None => Ok(Stdio::inherit()),
         Some(Fd::Null) => Ok(Stdio::null()),
         Some(Fd::File(f)) => match f.lock() {
             Ok(file) => match file.try_clone() {
@@ -603,6 +670,20 @@ fn stdio_for(sh: &Shell, fd: u32) -> R<Stdio> {
         },
         Some(Fd::Closed) => Ok(Stdio::null()),
         Some(Fd::ReadBuf(_)) | Some(Fd::WriteBuf(_)) => Ok(Stdio::inherit()),
+    }
+}
+
+/// A `Stdio` for the process's own stream `n` (0/1/2).
+fn inherit_stream(n: u8) -> Stdio {
+    use std::os::fd::AsFd;
+    let cloned = match n {
+        0 => std::io::stdin().as_fd().try_clone_to_owned(),
+        1 => std::io::stdout().as_fd().try_clone_to_owned(),
+        _ => std::io::stderr().as_fd().try_clone_to_owned(),
+    };
+    match cloned {
+        Ok(owned) => Stdio::from(owned),
+        Err(_) => Stdio::inherit(),
     }
 }
 

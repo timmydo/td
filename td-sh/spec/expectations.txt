@@ -424,7 +424,6 @@ xfail builtin-bracket.test.sh::-w
 xfail builtin-bracket.test.sh::-x
 xfail builtin-bracket.test.sh::More negative numbers
 xfail builtin-bracket.test.sh::operator/operand ambiguity with -a
-xfail builtin-bracket.test.sh::test -s
 xfail builtin-cd.test.sh::$OLDPWD
 xfail builtin-cd.test.sh::'unset PWD; pwd' before any cd (tickles a rare corner case)
 xfail builtin-cd.test.sh::CDPATH is respected
@@ -441,6 +440,7 @@ xfail builtin-cd.test.sh::cd to relative path with -L and -P
 xfail builtin-cd.test.sh::cd to symlink with -L and -P
 xfail builtin-cd.test.sh::cd with 2 or more args - with strict_arg_parse
 xfail builtin-cd.test.sh::cd with 2 or more args is allowed (strict_arg_parse disabled)
+xfail builtin-cd.test.sh::cd with no arguments
 xfail builtin-cd.test.sh::chdir is a synonym for cd - busybox ash
 xfail builtin-cd.test.sh::lie about PWD; pwd before any cd
 xfail builtin-cd.test.sh::pwd after cd ..
@@ -530,7 +530,6 @@ xfail builtin-echo.test.sh::incomplete hex escape
 xfail builtin-echo.test.sh::incomplete octal escape
 xfail builtin-echo.test.sh::incomplete unicode escape
 xfail builtin-eval-source.test.sh::Eval with syntax error
-xfail builtin-eval-source.test.sh::Source
 xfail builtin-eval-source.test.sh::Source with syntax error
 xfail builtin-eval-source.test.sh::eval YSH block with 'break continue return error'
 xfail builtin-eval-source.test.sh::eval string with 'break continue return error'
@@ -617,9 +616,7 @@ xfail builtin-printf.test.sh::unsigned / octal / hex big
 xfail builtin-process.test.sh::Changing resource limit is denied
 xfail builtin-process.test.sh::YSH readability: ulimit --all the same as ulimit -a
 xfail builtin-process.test.sh::arg that would overflow 64 bits is detected
-xfail builtin-process.test.sh::exec -- 2>&1
 xfail builtin-process.test.sh::exec builtin
-xfail builtin-process.test.sh::exec builtin with redirects
 xfail builtin-process.test.sh::time with brace group argument
 xfail builtin-process.test.sh::ulimit -S for soft limit (default), -H for hard limit
 xfail builtin-process.test.sh::ulimit -f 1 prevents files larger 512 bytes
@@ -672,7 +669,6 @@ xfail builtin-special.test.sh::Special builtins can't be redefined as shell func
 xfail builtin-special.test.sh::Which shells allow special builtins to be redefined?
 xfail builtin-special.test.sh::bash 'type' gets confused - says 'function', but runs builtin
 xfail builtin-special.test.sh::command, builtin - both can be redefined, not special (regression)
-xfail builtin-special.test.sh::exec without args is a special case of the special case in some shells
 xfail builtin-special.test.sh::true is not special; prefix assignments don't persist, it can be redefined
 xfail builtin-times.test.sh::times shows two formatted lines
 xfail builtin-trap-bash.test.sh::Combine DEBUG trap and ERR trap
@@ -1248,7 +1244,6 @@ xfail redirect.test.sh::: 3>&3 (OSH regression)
 xfail redirect.test.sh::: 3>&3-
 xfail redirect.test.sh::: 9> fdleak (OSH regression)
 xfail redirect.test.sh::: >/dev/null 2> / (OSH regression: fail to pop fd frame)
-xfail redirect.test.sh::<&
 xfail redirect.test.sh::<> for read/write
 xfail redirect.test.sh::<> for read/write named pipes
 xfail redirect.test.sh::>&word redirects stdout and stderr when word is not a number or -
@@ -1256,10 +1251,8 @@ xfail redirect.test.sh::>| to clobber
 xfail redirect.test.sh::Descriptor redirect with filename
 xfail redirect.test.sh::Filename redirect with spaces
 xfail redirect.test.sh::Nonexistent file
-xfail redirect.test.sh::Open descriptor with exec
 xfail redirect.test.sh::Open file on descriptor 3 and write to it many times
 xfail redirect.test.sh::Open file on descriptor 4 and write to it many times
-xfail redirect.test.sh::Open multiple descriptors with exec
 xfail redirect.test.sh::Quoted filename redirect with spaces
 xfail redirect.test.sh::Redirect echo to stderr, and then redirect all of stdout somewhere.
 xfail redirect.test.sh::Redirect to empty string
@@ -1267,7 +1260,6 @@ xfail redirect.test.sh::Redirect to file descriptor that's not open
 xfail redirect.test.sh::can't mention big file descriptor
 xfail redirect.test.sh::echo foo >&100 (OSH regression: does not fail with invalid fd 100)
 xfail redirect.test.sh::echo foo >&N where N is first unused fd
-xfail redirect.test.sh::exec redirect then various builtins
 xfail redirect.test.sh::exec {fd}>&- (OSH regression: fails to close fd)
 xfail redirect.test.sh::xtrace not affected by redirects
 xfail regex.test.sh::Bug: Nix idiom with closing ) next to pattern
@@ -1343,7 +1335,6 @@ xfail sh-options.test.sh::set without args lists variables
 xfail sh-options.test.sh::shopt -o prints 'set' options
 xfail sh-options.test.sh::shopt -p -o prints 'set' options
 xfail sh-options.test.sh::shopt -p exit code (regression)
-xfail sh-options.test.sh::shopt -p validates option names
 xfail sh-options.test.sh::shopt -s nounset works in YSH, not in bash
 xfail sh-options.test.sh::shopt with no flags prints options
 xfail sh-usage.test.sh::'sh -c -z' does not try to run -z

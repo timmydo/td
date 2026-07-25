@@ -678,12 +678,22 @@ pub fn run_case(
     // the temp dir and not be found.
     let shell = std::fs::canonicalize(shell)?;
     let workdir = CaseWorkdir::new()?;
+    // `$TMP` is what Oils' own runner exports; without it every `$TMP/f` in the
+    // corpus becomes `/f`, which fails on permissions or reads whatever the build
+    // host happens to have there. It is a SIBLING of the cwd, as it is under Oils:
+    // inside it, a case that writes `$TMP/f` and then globs `.` would see the two
+    // merged (which is what globignore's `*` cases assert on).
+    let cwd = workdir.0.join("cwd");
+    let tmpdir = workdir.0.join("tmp");
+    std::fs::create_dir(&cwd)?;
+    std::fs::create_dir(&tmpdir)?;
     let child = Command::new(&shell)
         .arg("-c")
         .arg(&case.code)
         .env_clear()
         .env("SH", &shell)
-        .current_dir(&workdir.0)
+        .env("TMP", &tmpdir)
+        .current_dir(&cwd)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
