@@ -181,12 +181,6 @@ includes dirty, staged, and untracked files by default. Use
 branch diff only, or `--path FILE` to inspect the mapping for a
 specific file.
 
-After rebasing for PR readiness, run:
-
-```
-td-builder affected-checks --committed-only --run
-```
-
 # Parallel work (worktrees, land on green)
 
 Multiple agents work this repo concurrently so use work trees. GitHub
