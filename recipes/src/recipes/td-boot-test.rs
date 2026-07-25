@@ -64,7 +64,7 @@ pub fn recipe() -> Recipe {
                 "-c",
                 &format!(
                     "'{bin}' verify '{{root}}/volume' > '{{root}}/selected' 2> '{{root}}/warning' || exit 1; \
-                     grep -qx 'previous {GOOD_ID}' '{{root}}/selected' || {{ echo 'td-boot did not select the verified previous deployment' >&2; exit 1; }}; \
+                     grep -qx 'previous {GOOD_ID} successful' '{{root}}/selected' || {{ echo 'td-boot did not report the verified previous deployment successful' >&2; exit 1; }}; \
                      grep -q 'current rejected' '{{root}}/warning' || {{ echo 'td-boot did not report current fallback' >&2; exit 1; }}"
                 ),
             ],
@@ -116,7 +116,7 @@ pub fn recipe() -> Recipe {
         },
         Step::WriteFile {
             path: "{out}/result".into(),
-            content: "PASS: target-built static td-boot rejects corrupt current, verifies and selects previous, then rejects payload tampering\n".into(),
+            content: "PASS: target-built static td-boot rejects corrupt current, reports the successful previous deployment, then rejects payload tampering\n".into(),
             exec: false,
         },
         Step::Require {

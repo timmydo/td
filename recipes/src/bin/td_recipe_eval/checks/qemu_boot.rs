@@ -76,21 +76,13 @@ const EROFS_PROBE_CONTENT: &str = td_recipe::ladder::EROFS_PROBE_CONTENT;
 /// line and the oracle key can never desync.
 const GREETER_MARKER: &str = td_recipe::ladder::GREETER_MARKER;
 
-/// Printed by the headless greeter only after a uutils applet, run by absolute `/bin` path,
-/// exits 0 — the RUNTIME proof (vs `shape_check`'s static scan) that the dynamically-linked
-/// coreutils multicall's closure resolves on the erofs root. Shared via `td_recipe::ladder`.
+/// Printed by the root-owned health target after an unprivileged uutils invocation.
 const UUTILS_RUNTIME_MARKER: &str = td_recipe::ladder::UUTILS_RUNTIME_MARKER;
 
-/// Printed by the headless greeter only after `/bin/sshd selftest` exits 0 — a full
-/// loopback SSH round-trip against an in-process russh server. Proves the kernel's
-/// TCP/IP loopback (CONFIG_NET+INET), the russh stack, and sshd's dynamic closure all
-/// work on the erofs root. Shared via `td_recipe::ladder`.
+/// Printed by the root-owned health target after an unprivileged SSH loopback self-test.
 const SSHD_MARKER: &str = td_recipe::ladder::SSHD_MARKER;
 
-/// Printed by the headless greeter only after every `/bin` name the static diagnostics
-/// multicall serves exits 0, invoked by its absolute `/bin` path — the runtime proof for the
-/// td-util farm, covering the /proc and /dev/kmsg applets the build sandbox cannot run.
-/// Shared via `td_recipe::ladder`.
+/// Printed by the root-owned health target after every td-util farm name runs unprivileged.
 const TD_UTIL_RUNTIME_MARKER: &str = td_recipe::ladder::TD_UTIL_RUNTIME_MARKER;
 
 /// The line `/etc/rootcheck` prints once it has confirmed `/` is a READ-ONLY erofs
@@ -108,9 +100,10 @@ const SYSTEM_STATE_WRITABLE_MARKER: &str = td_recipe::ladder::SYSTEM_STATE_WRITA
 const SYSTEM_STATE_OWNER_MARKER: &str = td_recipe::ladder::SYSTEM_STATE_OWNER_MARKER;
 const SYSTEM_PERSIST_WRITE_MARKER: &str = td_recipe::ladder::SYSTEM_PERSIST_WRITE_MARKER;
 const SYSTEM_PERSIST_READ_MARKER: &str = td_recipe::ladder::SYSTEM_PERSIST_READ_MARKER;
+const SYSTEM_BOOT_SUCCESS_MARKER: &str = td_recipe::ladder::SYSTEM_BOOT_SUCCESS_MARKER;
 const SYSTEM_DEPLOY_INSTALL_MARKER: &str = td_recipe::ladder::SYSTEM_DEPLOY_INSTALL_MARKER;
-const SYSTEM_DEPLOY_ROLLBACK_MARKER: &str = td_recipe::ladder::SYSTEM_DEPLOY_ROLLBACK_MARKER;
 const SYSTEM_SHUTDOWN_MARKER: &str = td_recipe::ladder::SYSTEM_SHUTDOWN_MARKER;
+const BOOKKEEPING_UNAVAILABLE_MARKER: &str = td_boot_protocol::BOOKKEEPING_UNAVAILABLE_MARKER;
 
 /// The kernel-cmdline token `qemu-boot-system` appends so the greeter self-exits and
 /// the VM powers off — a headless "exit powers off" proof with no terminal to type
@@ -119,7 +112,7 @@ const AUTOTEST_CMDLINE_TOKEN: &str = td_recipe::ladder::AUTOTEST_CMDLINE_TOKEN;
 const PERSIST_WRITE_CMDLINE_TOKEN: &str = td_recipe::ladder::PERSIST_WRITE_CMDLINE_TOKEN;
 const PERSIST_READ_CMDLINE_TOKEN: &str = td_recipe::ladder::PERSIST_READ_CMDLINE_TOKEN;
 const DEPLOY_INSTALL_CMDLINE_TOKEN: &str = td_recipe::ladder::DEPLOY_INSTALL_CMDLINE_TOKEN;
-const DEPLOY_ROLLBACK_CMDLINE_TOKEN: &str = td_recipe::ladder::DEPLOY_ROLLBACK_CMDLINE_TOKEN;
+const BOOT_FAIL_TARGET_CMDLINE_TOKEN: &str = td_recipe::ladder::BOOT_FAIL_TARGET_CMDLINE_TOKEN;
 
 /// The three networking markers `/etc/netup` prints under the nettest token: the link
 /// came up + DHCP applied, td-netd's own DNS client resolved the test host, and a TCP
@@ -150,6 +143,7 @@ const KEXEC_STAGE2_MARKER: &str = td_recipe::ladder::KEXEC_STAGE2_MARKER;
 /// mode finishes, so this ceiling only bounds a failed or unusually slow boot.
 /// `TD_QEMU_BOOT_TIMEOUT_SECS` overrides it.
 const DEFAULT_BOOT_TIMEOUT_SECS: u64 = 300;
+const GUEST_WAIT_MARGIN_SECS: u64 = 30;
 const POLL: Duration = Duration::from_millis(200);
 
 /// Cap on retained console/diagnostic bytes. The console is scanned incrementally
@@ -188,11 +182,15 @@ enum EndReason {
 #[derive(Default)]
 struct ConsoleEvidence {
     target: bool,
+    greeter: bool,
     current_rejected: bool,
     selected_current: bool,
     selected_previous: bool,
     selected_current_id: Option<String>,
     selected_previous_id: Option<String>,
+    attempt_consumed: bool,
+    attempts_exhausted: bool,
+    bookkeeping_unavailable: bool,
     root_read_only: bool,
     etc_read_only: bool,
     state_writable: bool,
@@ -202,8 +200,8 @@ struct ConsoleEvidence {
     td_util_runtime: bool,
     persist_write: bool,
     persist_read: bool,
+    boot_success: bool,
     deploy_install: bool,
-    deploy_rollback: bool,
     shutdown: bool,
     net_up: bool,
     net_resolve: bool,
@@ -332,11 +330,12 @@ pub(crate) fn run_erofs(runner: &RecipeCheckRunner) -> Result<(), String> {
 
 /// `qemu-boot-system`: the headless end-to-end proof of persistent deployment boot.
 /// It builds a Btrfs volume containing a verified deployment, an incoming candidate,
-/// and @var. Three boots of that same volume install+activate the candidate, boot it
-/// and request rollback, then boot the restored deployment while retaining persistent
-/// state. A fourth boot recreates the fixture with a corrupted current deployment and
-/// proves the selector enters verified previous. Every boot also asserts the immutable
-/// root, writable state, uutils runtime, and clean self-exit.
+/// and @var. One fixture proves a pending candidate is acknowledged and stays free of
+/// attempt state; a selector-only fixture covers read-only bookkeeping recovery. A fresh
+/// fixture then fails every configured candidate attempt before the health target and
+/// must automatically restore verified previous. A final fixture proves corrupt-current
+/// fallback independently. Every full boot also asserts the immutable root, writable
+/// state, and clean self-exit; healthy boots assert the runtime target.
 pub(crate) fn run_system(runner: &RecipeCheckRunner) -> Result<(), String> {
     let qemu = find_qemu()?;
     let (bzimage, init_cpio, deployment) = build_system(runner)?;
@@ -354,7 +353,7 @@ pub(crate) fn run_system(runner: &RecipeCheckRunner) -> Result<(), String> {
     }
 
     println!(
-        "   [qemu-boot-system] {qemu} exercises transactional install, rollback, and corrupt-current fallback under TCG: selector -> verified kexec -> loop-mounted root.erofs + persistent @var -> greeter\n              shim kernel:    {}\n              initramfs:      {}\n              Btrfs volume:   {}\n              initial:        {}\n              candidate:      {}",
+        "   [qemu-boot-system] {qemu} exercises transactional install, boot-attempt rollback, and corrupt-current fallback under TCG: selector -> verified kexec -> loop-mounted root.erofs + persistent @var -> greeter\n              shim kernel:    {}\n              initramfs:      {}\n              Btrfs volume:   {}\n              initial:        {}\n              candidate:      {}",
         bzimage.display(),
         init_cpio.display(),
         volume.display(),
@@ -362,30 +361,20 @@ pub(crate) fn run_system(runner: &RecipeCheckRunner) -> Result<(), String> {
         fixture.alternate_id
     );
 
+    let wait_token = autotest_wait_token(boot_timeout());
     let first_tokens = format!(
-        "{AUTOTEST_CMDLINE_TOKEN} {PERSIST_WRITE_CMDLINE_TOKEN} {DEPLOY_INSTALL_CMDLINE_TOKEN}"
+        "{AUTOTEST_CMDLINE_TOKEN} {wait_token} {PERSIST_WRITE_CMDLINE_TOKEN} \
+         {DEPLOY_INSTALL_CMDLINE_TOKEN}"
     );
-    let first = boot(
+    let first = boot_system_once(
         &qemu,
         &bzimage,
         &init_cpio,
-        BootPlan {
-            disk: Some(BootDisk {
-                path: &volume,
-                read_only: false,
-            }),
-            mem: "512",
-            target_marker: GREETER_MARKER,
-            kill_on_marker: false,
-            extra_append: &first_tokens,
-            user_net: false,
-        },
+        &volume,
+        &first_tokens,
+        "install",
         runner.scratch_dir(),
     )?;
-    println!(
-        "   [qemu-boot-system] boot one elapsed: {:.2}s",
-        first.elapsed.as_secs_f64()
-    );
     validate_system_boot(
         &first,
         PersistencePhase::Write,
@@ -404,86 +393,273 @@ pub(crate) fn run_system(runner: &RecipeCheckRunner) -> Result<(), String> {
         SYSTEM_DEPLOY_INSTALL_MARKER,
         "install",
     )?;
+    if first.evidence.attempt_consumed || first.evidence.attempts_exhausted {
+        return Err(format!(
+            "the install boot unexpectedly consumed or exhausted a boot-attempt budget. \
+             Last serial output:\n{}",
+            tail(&first.console, 80)
+        ));
+    }
     check_persistent_volume(&btrfs, &volume)?;
 
-    let second_tokens = format!(
-        "{AUTOTEST_CMDLINE_TOKEN} {PERSIST_READ_CMDLINE_TOKEN} {DEPLOY_ROLLBACK_CMDLINE_TOKEN}"
-    );
-    let second = boot(
+    let read_only_recovery = boot(
         &qemu,
         &bzimage,
         &init_cpio,
         BootPlan {
             disk: Some(BootDisk {
                 path: &volume,
-                read_only: false,
+                read_only: true,
             }),
             mem: "512",
-            target_marker: GREETER_MARKER,
-            kill_on_marker: false,
-            extra_append: &second_tokens,
+            target_marker: td_boot_protocol::SELECTED_PREVIOUS_MARKER,
+            kill_on_marker: true,
+            extra_append: "",
             user_net: false,
         },
         runner.scratch_dir(),
     )?;
     println!(
-        "   [qemu-boot-system] boot two elapsed: {:.2}s",
-        second.elapsed.as_secs_f64()
+        "   [qemu-boot-system] read-only bookkeeping recovery elapsed: {:.2}s",
+        read_only_recovery.elapsed.as_secs_f64()
     );
+    if !read_only_recovery.evidence.target
+        || !read_only_recovery.evidence.bookkeeping_unavailable
+        || !read_only_recovery.evidence.selected_previous
+        || read_only_recovery.evidence.selected_current
+        || read_only_recovery.evidence.current_rejected
+        || read_only_recovery.evidence.attempt_consumed
+        || read_only_recovery.evidence.attempts_exhausted
+        || read_only_recovery.evidence.kernel_panic
+    {
+        return Err(format!(
+            "the read-only bookkeeping fixture did not recover the verified previous deployment \
+             without mutating attempt state. Last serial output:\n{}",
+            tail(&read_only_recovery.console, 80)
+        ));
+    }
+    require_selected_deployment(
+        &read_only_recovery,
+        td_boot_protocol::SELECTED_PREVIOUS_MARKER,
+        &fixture.initial_id,
+        "read-only bookkeeping recovery boot",
+    )?;
+    check_persistent_volume(&btrfs, &volume)?;
+
+    let healthy_tokens =
+        format!("{AUTOTEST_CMDLINE_TOKEN} {wait_token} {PERSIST_READ_CMDLINE_TOKEN}");
+    let healthy_candidate = boot_system_once(
+        &qemu,
+        &bzimage,
+        &init_cpio,
+        &volume,
+        &healthy_tokens,
+        "healthy pending candidate",
+        runner.scratch_dir(),
+    )?;
     validate_system_boot(
-        &second,
+        &healthy_candidate,
         PersistencePhase::Read,
-        "candidate",
+        "healthy pending candidate",
         SelectionExpectation::Current,
     )?;
     require_selected_deployment(
-        &second,
+        &healthy_candidate,
         td_boot_protocol::SELECTED_CURRENT_MARKER,
         &fixture.alternate_id,
-        "candidate boot",
+        "healthy pending candidate boot",
     )?;
     require_action_marker(
-        &second,
-        second.evidence.deploy_rollback,
-        SYSTEM_DEPLOY_ROLLBACK_MARKER,
-        "rollback",
+        &healthy_candidate,
+        healthy_candidate.evidence.attempt_consumed,
+        td_boot_protocol::ATTEMPT_CONSUMED_MARKER,
+        "healthy pending candidate",
     )?;
+    if healthy_candidate.evidence.attempts_exhausted {
+        return Err(format!(
+            "the healthy pending candidate unexpectedly exhausted its boot budget. \
+             Last serial output:\n{}",
+            tail(&healthy_candidate.console, 80)
+        ));
+    }
     check_persistent_volume(&btrfs, &volume)?;
 
-    let third_tokens = format!("{AUTOTEST_CMDLINE_TOKEN} {PERSIST_READ_CMDLINE_TOKEN}");
-    let third = boot(
+    let stable_candidate = boot_system_once(
         &qemu,
         &bzimage,
         &init_cpio,
-        BootPlan {
-            disk: Some(BootDisk {
-                path: &volume,
-                read_only: false,
-            }),
-            mem: "512",
-            target_marker: GREETER_MARKER,
-            kill_on_marker: false,
-            extra_append: &third_tokens,
-            user_net: false,
-        },
+        &volume,
+        &healthy_tokens,
+        "acknowledged candidate",
         runner.scratch_dir(),
     )?;
-    println!(
-        "   [qemu-boot-system] boot three elapsed: {:.2}s",
-        third.elapsed.as_secs_f64()
-    );
     validate_system_boot(
-        &third,
+        &stable_candidate,
         PersistencePhase::Read,
-        "restored",
+        "acknowledged candidate",
         SelectionExpectation::Current,
     )?;
     require_selected_deployment(
-        &third,
+        &stable_candidate,
         td_boot_protocol::SELECTED_CURRENT_MARKER,
-        &fixture.initial_id,
-        "restored boot",
+        &fixture.alternate_id,
+        "acknowledged candidate boot",
     )?;
+    if stable_candidate.evidence.attempt_consumed || stable_candidate.evidence.attempts_exhausted {
+        return Err(format!(
+            "the acknowledged candidate retained boot-attempt state after success. \
+             Last serial output:\n{}",
+            tail(&stable_candidate.console, 80)
+        ));
+    }
+    check_persistent_volume(&btrfs, &volume)?;
+
+    let failure_fixture = create_persistent_volume_layout(
+        &deployment,
+        &mkfs,
+        &btrfs,
+        &volume,
+        VolumeLayout::Transactional,
+    )?;
+    if failure_fixture.initial_id != fixture.initial_id
+        || failure_fixture.alternate_id != fixture.alternate_id
+    {
+        return Err("recreated transaction fixture changed deployment ids".to_string());
+    }
+    let failure_install = boot_system_once(
+        &qemu,
+        &bzimage,
+        &init_cpio,
+        &volume,
+        &first_tokens,
+        "failure-sequence install",
+        runner.scratch_dir(),
+    )?;
+    validate_system_boot(
+        &failure_install,
+        PersistencePhase::Write,
+        "failure-sequence install",
+        SelectionExpectation::Current,
+    )?;
+    require_selected_deployment(
+        &failure_install,
+        td_boot_protocol::SELECTED_CURRENT_MARKER,
+        &failure_fixture.initial_id,
+        "failure-sequence install boot",
+    )?;
+    require_action_marker(
+        &failure_install,
+        failure_install.evidence.deploy_install,
+        SYSTEM_DEPLOY_INSTALL_MARKER,
+        "failure-sequence install",
+    )?;
+    if failure_install.evidence.attempt_consumed || failure_install.evidence.attempts_exhausted {
+        return Err(format!(
+            "the failure-sequence install unexpectedly consumed or exhausted a boot-attempt budget. \
+             Last serial output:\n{}",
+            tail(&failure_install.console, 80)
+        ));
+    }
+    check_persistent_volume(&btrfs, &volume)?;
+
+    let candidate_tokens =
+        format!("{wait_token} {PERSIST_READ_CMDLINE_TOKEN} {BOOT_FAIL_TARGET_CMDLINE_TOKEN}");
+    for attempt in 1..=td_boot_protocol::DEFAULT_BOOT_ATTEMPTS {
+        let ordinal = format!("candidate attempt {attempt}");
+        let candidate = boot_failed_target_once(
+            &qemu,
+            &bzimage,
+            &init_cpio,
+            &volume,
+            &candidate_tokens,
+            &ordinal,
+            runner.scratch_dir(),
+        )?;
+        validate_failed_target_boot(&candidate, &ordinal)?;
+        require_selected_deployment(
+            &candidate,
+            td_boot_protocol::SELECTED_CURRENT_MARKER,
+            &failure_fixture.alternate_id,
+            &ordinal,
+        )?;
+        require_action_marker(
+            &candidate,
+            candidate.evidence.attempt_consumed,
+            td_boot_protocol::ATTEMPT_CONSUMED_MARKER,
+            &ordinal,
+        )?;
+        if candidate.evidence.attempts_exhausted {
+            return Err(format!(
+                "the {ordinal} exhausted the candidate before all configured attempts ran. \
+                 Last serial output:\n{}",
+                tail(&candidate.console, 80)
+            ));
+        }
+        check_persistent_volume(&btrfs, &volume)?;
+    }
+
+    let rollback_tokens =
+        format!("{AUTOTEST_CMDLINE_TOKEN} {wait_token} {PERSIST_READ_CMDLINE_TOKEN}");
+    let automatic_rollback = boot_system_once(
+        &qemu,
+        &bzimage,
+        &init_cpio,
+        &volume,
+        &rollback_tokens,
+        "automatic rollback",
+        runner.scratch_dir(),
+    )?;
+    validate_system_boot(
+        &automatic_rollback,
+        PersistencePhase::Read,
+        "automatic rollback",
+        SelectionExpectation::AttemptsExhausted,
+    )?;
+    require_selected_deployment(
+        &automatic_rollback,
+        td_boot_protocol::SELECTED_PREVIOUS_MARKER,
+        &failure_fixture.initial_id,
+        "automatic rollback boot",
+    )?;
+    require_action_marker(
+        &automatic_rollback,
+        automatic_rollback.evidence.attempts_exhausted,
+        td_boot_protocol::ATTEMPTS_EXHAUSTED_MARKER,
+        "automatic rollback",
+    )?;
+    check_persistent_volume(&btrfs, &volume)?;
+
+    let stable_rollback = boot_system_once(
+        &qemu,
+        &bzimage,
+        &init_cpio,
+        &volume,
+        &rollback_tokens,
+        "persisted automatic rollback",
+        runner.scratch_dir(),
+    )?;
+    validate_system_boot(
+        &stable_rollback,
+        PersistencePhase::Read,
+        "persisted automatic rollback",
+        SelectionExpectation::Current,
+    )?;
+    require_selected_deployment(
+        &stable_rollback,
+        td_boot_protocol::SELECTED_CURRENT_MARKER,
+        &failure_fixture.initial_id,
+        "persisted automatic rollback boot",
+    )?;
+    if stable_rollback.evidence.attempt_consumed
+        || stable_rollback.evidence.attempts_exhausted
+        || stable_rollback.evidence.bookkeeping_unavailable
+    {
+        return Err(format!(
+            "the automatic rollback selector rewrite did not persist as attempt-free current. \
+             Last serial output:\n{}",
+            tail(&stable_rollback.console, 80)
+        ));
+    }
     check_persistent_volume(&btrfs, &volume)?;
 
     let fallback_fixture = create_persistent_volume_layout(
@@ -493,32 +669,21 @@ pub(crate) fn run_system(runner: &RecipeCheckRunner) -> Result<(), String> {
         &volume,
         VolumeLayout::CorruptCurrent,
     )?;
-    if fallback_fixture.initial_id != fixture.initial_id
+    if fallback_fixture.initial_id != failure_fixture.initial_id
         || fallback_fixture.alternate_id == fallback_fixture.initial_id
     {
         return Err("corrupt-current fixture ids do not identify current and previous".to_string());
     }
-    let fallback = boot(
+    let fallback_tokens = format!("{AUTOTEST_CMDLINE_TOKEN} {wait_token}");
+    let fallback = boot_system_once(
         &qemu,
         &bzimage,
         &init_cpio,
-        BootPlan {
-            disk: Some(BootDisk {
-                path: &volume,
-                read_only: false,
-            }),
-            mem: "512",
-            target_marker: GREETER_MARKER,
-            kill_on_marker: false,
-            extra_append: AUTOTEST_CMDLINE_TOKEN,
-            user_net: false,
-        },
+        &volume,
+        &fallback_tokens,
+        "corrupt-current fallback",
         runner.scratch_dir(),
     )?;
-    println!(
-        "   [qemu-boot-system] fallback boot elapsed: {:.2}s",
-        fallback.elapsed.as_secs_f64()
-    );
     validate_system_boot(
         &fallback,
         PersistencePhase::None,
@@ -535,18 +700,129 @@ pub(crate) fn run_system(runner: &RecipeCheckRunner) -> Result<(), String> {
 
     println!(
         "PASS: system-x86-64 transactionally installed and booted a new content-addressed \
-         deployment ({SYSTEM_DEPLOY_INSTALL_MARKER}), rolled back and booted the retained prior \
-         deployment ({SYSTEM_DEPLOY_ROLLBACK_MARKER}), preserved exact /var state across all three \
-         boots ({SYSTEM_PERSIST_WRITE_MARKER} -> {SYSTEM_PERSIST_READ_MARKER}), and rejected a \
-         corrupted current payload in favor of verified previous \
-         ({} -> {}). Every boot kept root and /etc immutable \
+         deployment ({SYSTEM_DEPLOY_INSTALL_MARKER}), recovered verified previous when boot \
+         bookkeeping was read-only ({BOOKKEEPING_UNAVAILABLE_MARKER}), acknowledged a healthy \
+         pending candidate and proved its durable attempt state stayed cleared, consumed {} unacknowledged boot \
+         attempts in a fresh fixture ({}) and automatically restored the retained successful \
+         deployment ({}), \
+         preserved exact /var state across the reused-volume boots \
+         ({SYSTEM_PERSIST_WRITE_MARKER} -> {SYSTEM_PERSIST_READ_MARKER}), marked healthy boots \
+         successful ({SYSTEM_BOOT_SUCCESS_MARKER}), and rejected a corrupted current payload \
+         in favor of verified previous \
+         ({} -> {}). Every full boot kept root and /etc immutable \
          ({SYSTEM_ROOT_RO_MARKER}, {SYSTEM_ETC_RO_MARKER}), mounted target-owned writable @var \
          ({SYSTEM_STATE_WRITABLE_MARKER}, {SYSTEM_STATE_OWNER_MARKER}), ran uutils \
          ({UUTILS_RUNTIME_MARKER}) and td-util ({TD_UTIL_RUNTIME_MARKER}), and unmounted state \
          before exit ({SYSTEM_SHUTDOWN_MARKER})",
+        td_boot_protocol::DEFAULT_BOOT_ATTEMPTS,
+        td_boot_protocol::ATTEMPT_CONSUMED_MARKER,
+        td_boot_protocol::ATTEMPTS_EXHAUSTED_MARKER,
         td_boot_protocol::CURRENT_REJECTED_MARKER,
         td_boot_protocol::SELECTED_PREVIOUS_MARKER
     );
+    Ok(())
+}
+
+fn boot_system_once(
+    qemu: &str,
+    bzimage: &Path,
+    init_cpio: &Path,
+    volume: &Path,
+    tokens: &str,
+    label: &str,
+    scratch: &Path,
+) -> Result<BootResult, String> {
+    let result = boot(
+        qemu,
+        bzimage,
+        init_cpio,
+        BootPlan {
+            disk: Some(BootDisk {
+                path: volume,
+                read_only: false,
+            }),
+            mem: "512",
+            target_marker: GREETER_MARKER,
+            kill_on_marker: false,
+            extra_append: tokens,
+            user_net: false,
+        },
+        scratch,
+    )?;
+    println!(
+        "   [qemu-boot-system] {label} elapsed: {:.2}s",
+        result.elapsed.as_secs_f64()
+    );
+    Ok(result)
+}
+
+fn boot_failed_target_once(
+    qemu: &str,
+    bzimage: &Path,
+    init_cpio: &Path,
+    volume: &Path,
+    tokens: &str,
+    label: &str,
+    scratch: &Path,
+) -> Result<BootResult, String> {
+    let result = boot(
+        qemu,
+        bzimage,
+        init_cpio,
+        BootPlan {
+            disk: Some(BootDisk {
+                path: volume,
+                read_only: false,
+            }),
+            mem: "512",
+            target_marker: SYSTEM_SHUTDOWN_MARKER,
+            kill_on_marker: false,
+            extra_append: tokens,
+            user_net: false,
+        },
+        scratch,
+    )?;
+    println!(
+        "   [qemu-boot-system] {label} failed-target reboot elapsed: {:.2}s",
+        result.elapsed.as_secs_f64()
+    );
+    Ok(result)
+}
+
+fn validate_failed_target_boot(result: &BootResult, ordinal: &str) -> Result<(), String> {
+    if !result.evidence.shutdown
+        || result.evidence.greeter
+        || result.evidence.uutils_runtime
+        || result.evidence.sshd
+        || result.evidence.boot_success
+    {
+        return Err(format!(
+            "the {ordinal} did not prove a pre-target failure: shutdown must complete while \
+             greeter, runtime-health, and success markers remain absent. Last serial output:\n{}",
+            tail(&result.console, 80)
+        ));
+    }
+    validate_primary_selection(result, ordinal)?;
+    if !result.evidence.root_read_only
+        || !result.evidence.etc_read_only
+        || !result.evidence.state_writable
+        || !result.evidence.state_owner
+        || !result.evidence.persist_read
+    {
+        return Err(format!(
+            "the {ordinal} failed before the greeter but did not preserve the root, state, and \
+             persistence preconditions. Last serial output:\n{}",
+            tail(&result.console, 80)
+        ));
+    }
+    if result.evidence.kernel_panic || !result.exited_clean {
+        return Err(format!(
+            "the {ordinal} did not reboot cleanly after the injected pre-target failure — {}. \
+             Last serial output:\n{}",
+            result.reason,
+            tail(&result.console, 80)
+        ));
+    }
     Ok(())
 }
 
@@ -576,6 +852,7 @@ enum PersistencePhase {
 enum SelectionExpectation {
     Current,
     PreviousFallback,
+    AttemptsExhausted,
 }
 
 fn validate_system_boot(
@@ -600,6 +877,9 @@ fn validate_system_boot(
         SelectionExpectation::PreviousFallback => {
             validate_fallback_selection(result, &format!("{ordinal} persistent boot"))?
         }
+        SelectionExpectation::AttemptsExhausted => {
+            validate_exhausted_selection(result, &format!("{ordinal} persistent boot"))?
+        }
     }
     if !result.evidence.root_read_only {
         return Err(format!(
@@ -617,15 +897,6 @@ fn validate_system_boot(
             tail(&result.console, 80)
         ));
     }
-    if !result.evidence.state_writable {
-        return Err(format!(
-            "the greeter was reached but /etc/rootcheck did not confirm writable state \
-             ({SYSTEM_STATE_WRITABLE_MARKER:?} absent) — /var is not Btrfs, /run or /tmp is not tmpfs, \
-             a state path rejected its write probe, or /home and /root do not point into /var. \
-             A configured home ownership change may also have failed. Last serial output:\n{}",
-            tail(&result.console, 80)
-        ));
-    }
     // The shipped system deliberately autologins an unprivileged user; keep that
     // target-ownership guarantee part of the distribution oracle.
     if !result.evidence.state_owner {
@@ -633,6 +904,17 @@ fn validate_system_boot(
             "the greeter was reached but the unprivileged ownership check failed \
              ({SYSTEM_STATE_OWNER_MARKER:?} absent) — the login user could write /var or \
              /var/root, or could not write its own home. Last serial output:\n{}",
+            tail(&result.console, 80)
+        ));
+    }
+    if !result.evidence.state_writable {
+        return Err(format!(
+            "the greeter was reached but /etc/rootcheck did not confirm writable state \
+             ({SYSTEM_STATE_WRITABLE_MARKER:?} absent) — /var is not Btrfs, /run or /tmp is not tmpfs, \
+             /run/td-volume is not read-only Btrfs, a state path rejected its write probe, \
+             /home, /root, or /var/run has the wrong target, home ownership setup failed, or \
+             failed-target parking could not be prepared. \
+             Last serial output:\n{}",
             tail(&result.console, 80)
         ));
     }
@@ -667,6 +949,13 @@ fn validate_system_boot(
              /proc or /dev/kmsg the applet reads is unavailable there. td-util-test covers ELF \
              shape and dispatch in the build sandbox but skips those legs when it has no /proc. \
              Last serial output:\n{}",
+            tail(&result.console, 80)
+        ));
+    }
+    if !result.evidence.boot_success {
+        return Err(format!(
+            "the {ordinal} boot did not emit the deployment-success marker \
+             {SYSTEM_BOOT_SUCCESS_MARKER:?}. Last serial output:\n{}",
             tail(&result.console, 80)
         ));
     }
@@ -739,12 +1028,34 @@ fn validate_fallback_selection(result: &BootResult, context: &str) -> Result<(),
     if !result.evidence.current_rejected
         || !result.evidence.selected_previous
         || result.evidence.selected_current
+        || result.evidence.attempts_exhausted
+        || result.evidence.bookkeeping_unavailable
     {
         return Err(format!(
             "the {context} did not prove corrupt-current fallback: {:?} and {:?} must be \
-             present while {:?} remains absent. Last serial output:\n{}",
+             present while {:?}, {:?}, and attempt exhaustion remain absent. Last serial output:\n{}",
             td_boot_protocol::CURRENT_REJECTED_MARKER,
             td_boot_protocol::SELECTED_PREVIOUS_MARKER,
+            td_boot_protocol::SELECTED_CURRENT_MARKER,
+            BOOKKEEPING_UNAVAILABLE_MARKER,
+            tail(&result.console, 80)
+        ));
+    }
+    Ok(())
+}
+
+fn validate_exhausted_selection(result: &BootResult, context: &str) -> Result<(), String> {
+    if result.evidence.current_rejected
+        || !result.evidence.attempts_exhausted
+        || !result.evidence.selected_previous
+        || result.evidence.selected_current
+    {
+        return Err(format!(
+            "the {context} did not prove automatic rollback after exhausted attempts: {:?} and \
+             {:?} must be present while {:?} and {:?} remain absent. Last serial output:\n{}",
+            td_boot_protocol::ATTEMPTS_EXHAUSTED_MARKER,
+            td_boot_protocol::SELECTED_PREVIOUS_MARKER,
+            td_boot_protocol::CURRENT_REJECTED_MARKER,
             td_boot_protocol::SELECTED_CURRENT_MARKER,
             tail(&result.console, 80)
         ));
@@ -813,12 +1124,13 @@ pub(crate) fn run_net(runner: &RecipeCheckRunner) -> Result<(), String> {
         disk.display()
     );
 
-    // Both tokens: nettest drives netup's resolve+reach self-test (the three net
-    // markers), autotest makes the greeter self-exit so the VM powers off cleanly —
-    // the same clean-exit assertion qemu-boot-system uses. Key on the greeter (reached
-    // AFTER netup) with kill_on_marker=false so the net markers, which print earlier at
-    // sysinit, are all captured before the guest powers off.
-    let tokens = format!("{AUTOTEST_CMDLINE_TOKEN} {NETTEST_CMDLINE_TOKEN}");
+    // Nettest drives netup's resolve+reach self-test (the three net markers); autotest
+    // and its host-derived wait bound make the greeter self-exit after health completion
+    // so the VM powers off cleanly. Key on the greeter (reached AFTER netup) with
+    // kill_on_marker=false so the net markers, which print earlier at sysinit, are all
+    // captured before the guest powers off.
+    let wait_token = autotest_wait_token(boot_timeout());
+    let tokens = format!("{AUTOTEST_CMDLINE_TOKEN} {wait_token} {NETTEST_CMDLINE_TOKEN}");
     let result = boot(
         &qemu,
         &bzimage,
@@ -1537,6 +1849,21 @@ fn boot_timeout() -> Duration {
     parse_timeout(env::var("TD_QEMU_BOOT_TIMEOUT_SECS").ok())
 }
 
+fn guest_success_wait_secs(timeout: Duration) -> u64 {
+    timeout
+        .as_secs()
+        .saturating_sub(GUEST_WAIT_MARGIN_SECS)
+        .max(1)
+}
+
+fn autotest_wait_token(timeout: Duration) -> String {
+    format!(
+        "{}{}",
+        td_recipe::ladder::BOOT_SUCCESS_WAIT_CMDLINE_PREFIX,
+        guest_success_wait_secs(timeout)
+    )
+}
+
 /// Pure parser behind `boot_timeout` (unit-tested without mutating process env):
 /// a positive integer wins; anything unparsable, zero, or absent → the default.
 fn parse_timeout(raw: Option<String>) -> Duration {
@@ -1936,7 +2263,11 @@ fn drain_console_to_eof(
 fn evidence_marker_max_len(target: &[u8]) -> usize {
     [
         target.len(),
+        GREETER_MARKER.len(),
         td_boot_protocol::CURRENT_REJECTED_MARKER.len(),
+        td_boot_protocol::ATTEMPT_CONSUMED_MARKER.len(),
+        td_boot_protocol::ATTEMPTS_EXHAUSTED_MARKER.len(),
+        BOOKKEEPING_UNAVAILABLE_MARKER.len(),
         td_boot_protocol::SELECTED_CURRENT_MARKER.len() + 1 + 64,
         td_boot_protocol::SELECTED_PREVIOUS_MARKER.len() + 1 + 64,
         SYSTEM_ROOT_RO_MARKER.len(),
@@ -1948,8 +2279,8 @@ fn evidence_marker_max_len(target: &[u8]) -> usize {
         TD_UTIL_RUNTIME_MARKER.len(),
         SYSTEM_PERSIST_WRITE_MARKER.len(),
         SYSTEM_PERSIST_READ_MARKER.len(),
+        SYSTEM_BOOT_SUCCESS_MARKER.len(),
         SYSTEM_DEPLOY_INSTALL_MARKER.len(),
-        SYSTEM_DEPLOY_ROLLBACK_MARKER.len(),
         SYSTEM_SHUTDOWN_MARKER.len(),
         SYSTEM_NET_UP_MARKER.len(),
         SYSTEM_NET_RESOLVE_MARKER.len(),
@@ -1963,10 +2294,26 @@ fn evidence_marker_max_len(target: &[u8]) -> usize {
 
 fn latch_console_evidence(evidence: &mut ConsoleEvidence, buf: &[u8], target: &[u8]) {
     latch_marker(&mut evidence.target, buf, target);
+    latch_marker(&mut evidence.greeter, buf, GREETER_MARKER.as_bytes());
     latch_marker(
         &mut evidence.current_rejected,
         buf,
         td_boot_protocol::CURRENT_REJECTED_MARKER.as_bytes(),
+    );
+    latch_marker(
+        &mut evidence.attempt_consumed,
+        buf,
+        td_boot_protocol::ATTEMPT_CONSUMED_MARKER.as_bytes(),
+    );
+    latch_marker(
+        &mut evidence.attempts_exhausted,
+        buf,
+        td_boot_protocol::ATTEMPTS_EXHAUSTED_MARKER.as_bytes(),
+    );
+    latch_marker(
+        &mut evidence.bookkeeping_unavailable,
+        buf,
+        BOOKKEEPING_UNAVAILABLE_MARKER.as_bytes(),
     );
     latch_marker(
         &mut evidence.selected_current,
@@ -2030,14 +2377,14 @@ fn latch_console_evidence(evidence: &mut ConsoleEvidence, buf: &[u8], target: &[
         SYSTEM_PERSIST_READ_MARKER.as_bytes(),
     );
     latch_marker(
+        &mut evidence.boot_success,
+        buf,
+        SYSTEM_BOOT_SUCCESS_MARKER.as_bytes(),
+    );
+    latch_marker(
         &mut evidence.deploy_install,
         buf,
         SYSTEM_DEPLOY_INSTALL_MARKER.as_bytes(),
-    );
-    latch_marker(
-        &mut evidence.deploy_rollback,
-        buf,
-        SYSTEM_DEPLOY_ROLLBACK_MARKER.as_bytes(),
     );
     latch_marker(
         &mut evidence.shutdown,
@@ -2408,11 +2755,14 @@ mod tests {
     /// this: its result is dominated by the id-bearing markers (marker + space + 64-char
     /// hex), so a "no marker exceeds the max" assertion cannot fail and would only look like
     /// a guard. The rescan window is covered behaviourally instead, by the split tests below.
-    fn all_console_markers() -> [&'static str; 24] {
+    fn all_console_markers() -> [&'static str; 27] {
         [
             MARKER,
             EROFS_MARKER,
             td_boot_protocol::CURRENT_REJECTED_MARKER,
+            td_boot_protocol::ATTEMPT_CONSUMED_MARKER,
+            td_boot_protocol::ATTEMPTS_EXHAUSTED_MARKER,
+            BOOKKEEPING_UNAVAILABLE_MARKER,
             td_boot_protocol::SELECTED_CURRENT_MARKER,
             td_boot_protocol::SELECTED_PREVIOUS_MARKER,
             KEXEC_STAGE1_MARKER,
@@ -2425,8 +2775,8 @@ mod tests {
             SYSTEM_STATE_OWNER_MARKER,
             SYSTEM_PERSIST_WRITE_MARKER,
             SYSTEM_PERSIST_READ_MARKER,
+            SYSTEM_BOOT_SUCCESS_MARKER,
             SYSTEM_DEPLOY_INSTALL_MARKER,
-            SYSTEM_DEPLOY_ROLLBACK_MARKER,
             SYSTEM_SHUTDOWN_MARKER,
             UUTILS_RUNTIME_MARKER,
             SYSTEM_NET_UP_MARKER,
@@ -2514,6 +2864,17 @@ mod tests {
     }
 
     #[test]
+    fn guest_success_wait_stays_below_the_host_timeout() {
+        assert_eq!(guest_success_wait_secs(Duration::from_secs(300)), 270);
+        assert_eq!(guest_success_wait_secs(Duration::from_secs(1800)), 1770);
+        assert_eq!(guest_success_wait_secs(Duration::from_secs(1)), 1);
+        assert_eq!(
+            autotest_wait_token(Duration::from_secs(300)),
+            format!("{}270", td_recipe::ladder::BOOT_SUCCESS_WAIT_CMDLINE_PREFIX)
+        );
+    }
+
+    #[test]
     fn read_tail_bounds_to_last_cap_bytes() {
         // Isolate the test file in its own exclusively-created scratch dir.
         let seq = AtomicU64::new(0);
@@ -2538,7 +2899,11 @@ mod tests {
         );
         let mut bytes = [
             td_boot_protocol::CURRENT_REJECTED_MARKER,
+            td_boot_protocol::ATTEMPT_CONSUMED_MARKER,
+            td_boot_protocol::ATTEMPTS_EXHAUSTED_MARKER,
+            BOOKKEEPING_UNAVAILABLE_MARKER,
             selected_previous.as_str(),
+            GREETER_MARKER,
             SYSTEM_ROOT_RO_MARKER,
             SYSTEM_ETC_RO_MARKER,
             SYSTEM_STATE_WRITABLE_MARKER,
@@ -2548,8 +2913,8 @@ mod tests {
             TD_UTIL_RUNTIME_MARKER,
             SYSTEM_PERSIST_WRITE_MARKER,
             SYSTEM_PERSIST_READ_MARKER,
+            SYSTEM_BOOT_SUCCESS_MARKER,
             SYSTEM_DEPLOY_INSTALL_MARKER,
-            SYSTEM_DEPLOY_ROLLBACK_MARKER,
             SYSTEM_SHUTDOWN_MARKER,
             SYSTEM_NET_UP_MARKER,
             SYSTEM_NET_RESOLVE_MARKER,
@@ -2575,7 +2940,11 @@ mod tests {
         )
         .unwrap();
         assert!(!evidence.target);
+        assert!(evidence.greeter);
         assert!(evidence.current_rejected);
+        assert!(evidence.attempt_consumed);
+        assert!(evidence.attempts_exhausted);
+        assert!(evidence.bookkeeping_unavailable);
         assert!(evidence.selected_previous);
         assert!(!evidence.selected_current);
         assert_eq!(evidence.selected_previous_id.as_deref(), Some(selected_id));
@@ -2589,8 +2958,8 @@ mod tests {
         assert!(evidence.td_util_runtime);
         assert!(evidence.persist_write);
         assert!(evidence.persist_read);
+        assert!(evidence.boot_success);
         assert!(evidence.deploy_install);
-        assert!(evidence.deploy_rollback);
         assert!(evidence.shutdown);
         assert!(evidence.net_up);
         assert!(evidence.net_resolve);

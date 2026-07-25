@@ -132,8 +132,8 @@ pub const SYSTEM_ROOT_RO_MARKER: &str = "TD-ROOT-EROFS-RO-OK";
 /// `/etc` remains on the immutable EROFS root.
 pub const SYSTEM_ETC_RO_MARKER: &str = "TD-ETC-EROFS-RO-OK";
 
-/// Printed by `/etc/rootcheck` once `/var` is Btrfs, `/run` and `/tmp` are tmpfs,
-/// `/home` and `/root` point into `/var`, and every state path accepts a write probe.
+/// Printed by `/etc/rootcheck` once all immutable-root, ownership, mount, link, and
+/// state write checks pass.
 pub const SYSTEM_STATE_WRITABLE_MARKER: &str = "TD-STATE-WRITABLE-OK";
 
 /// Printed only after the unprivileged login user can write its own home but
@@ -152,9 +152,9 @@ pub const SYSTEM_PERSIST_READ_MARKER: &str = "TD-PERSIST-READ-OK";
 /// deployment through td-boot's fsync + atomic-rename transaction.
 pub const SYSTEM_DEPLOY_INSTALL_MARKER: &str = "TD-DEPLOY-INSTALL-OK";
 
-/// Printed after td-boot durably replaces current with verified previous.
-/// The displaced deployment data remains retained but is no longer selected.
-pub const SYSTEM_DEPLOY_ROLLBACK_MARKER: &str = "TD-DEPLOY-ROLLBACK-OK";
+/// Printed after the root-owned target passes immutable-state checks plus unprivileged
+/// uutils and SSH runtime probes, then td-boot records or confirms the deployment successful.
+pub const SYSTEM_BOOT_SUCCESS_MARKER: &str = "TD-BOOT-SUCCESS-OK";
 
 /// Printed by BusyBox init's shutdown action after syncing and unmounting @var.
 pub const SYSTEM_SHUTDOWN_MARKER: &str = "TD-SHUTDOWN-OK";
@@ -164,8 +164,8 @@ pub const SYSTEM_SHUTDOWN_MARKER: &str = "TD-SHUTDOWN-OK";
 /// greeter" success line.
 pub const GREETER_MARKER: &str = "TD-GREETER-OK";
 
-/// Printed by `/etc/profile` on the headless self-test path ONLY after a uutils applet,
-/// invoked by ABSOLUTE `/bin` path, exits 0 — i.e. the dynamically-linked coreutils
+/// Printed by the root-owned health target only after a uutils applet, invoked as the
+/// unprivileged login user by ABSOLUTE `/bin` path, exits 0 — i.e. the dynamically-linked coreutils
 /// multicall's runtime closure (ELF interp, glibc, libgcc_s) actually resolves on the
 /// erofs root. `shape_check` proves that closure STATICALLY; this proves it RAN. A missing
 /// loader or DT_NEEDED soname the static scan cannot see makes the applet fail, so the
@@ -173,7 +173,7 @@ pub const GREETER_MARKER: &str = "TD-GREETER-OK";
 /// greeter line (which the shell builtin `echo` prints regardless of uutils health, #547).
 pub const UUTILS_RUNTIME_MARKER: &str = "TD-UUTILS-RUN-OK";
 
-/// Printed by `/etc/profile` on the headless self-test path ONLY after `/bin/sshd selftest`
+/// Printed by the root-owned health target only after unprivileged `/bin/sshd selftest`
 /// exits 0 — the source-built russh daemon stood up an in-process server on an ephemeral
 /// loopback port and completed a full SSH handshake+auth+channel+exec round-trip against it.
 /// This proves THREE things the static scan can't: the kernel's TCP/IP loopback works
@@ -183,20 +183,18 @@ pub const UUTILS_RUNTIME_MARKER: &str = "TD-UUTILS-RUN-OK";
 /// crate the recipe builds); the two must stay identical.
 pub const SSHD_MARKER: &str = "TD-SSHD-OK";
 
-/// Printed by `/etc/profile` on the headless self-test path ONLY after EVERY `/bin` name the
-/// static td-util multicall serves exits 0, each invoked by its absolute `/bin` path — so it
-/// covers the shipped symlink and argv[0] dispatch, plus the `/proc` and `/dev/kmsg` reads
-/// `td-util-test` skips when the build sandbox has no `/proc`. td-util is an ET_EXEC with an
-/// EMPTY runtime closure, so unlike `UUTILS_RUNTIME_MARKER` this says nothing about a loader.
+/// Printed by the root-owned health target only after EVERY `/bin` name the static td-util
+/// multicall serves exits 0 as the unprivileged login user. Absolute paths cover the shipped
+/// symlinks and argv[0] dispatch plus `/proc` and `/dev/kmsg` reads skipped in the sandbox.
 pub const TD_UTIL_RUNTIME_MARKER: &str = "TD-UTIL-RUN-OK";
 
 /// Kernel-cmdline token the headless `qemu-boot-system` oracle appends so the greeter
-/// SELF-TESTS: `/etc/profile`, on seeing it in `/proc/cmdline`, prints `GREETER_MARKER`
-/// then `exit`s the login shell, which (via `tty-session`'s init-mediated reboot) powers the VM
-/// off — so the oracle proves "exit powers off" from a clean qemu exit 0 without a
-/// terminal to type into. Absent it (interactive `td-recipe-eval run`), the greeter is
-/// a normal interactive shell.
+/// waits for the root-owned health/update transaction and then exits. `tty-session`
+/// turns that exit into a clean VM poweroff. Without it, the greeter is interactive.
 pub const AUTOTEST_CMDLINE_TOKEN: &str = "td.autotest=1";
+/// Caps greeter completion and failed-boot parking below the host QEMU timeout.
+/// Boot time consumes the same host budget, whose deadline remains the final backstop.
+pub const BOOT_SUCCESS_WAIT_CMDLINE_PREFIX: &str = "td.boot-success-wait=";
 
 /// Kernel-cmdline token for boot one of the persistence oracle. `/etc/rootcheck`
 /// writes and syncs the fixed marker below `/var` before the greeter self-exits.
@@ -206,13 +204,13 @@ pub const PERSIST_WRITE_CMDLINE_TOKEN: &str = "td.persist=write";
 /// emits `SYSTEM_PERSIST_READ_MARKER` only after reading boot one's exact bytes.
 pub const PERSIST_READ_CMDLINE_TOKEN: &str = "td.persist=read";
 
-/// Kernel-cmdline token for the transactional-update oracle. `/etc/rootcheck`
-/// installs the fixture candidate from the read-only top-volume view.
+/// Kernel-cmdline token for the transactional-update oracle. The root-owned health
+/// target installs the fixture candidate from the read-only top-volume view.
 pub const DEPLOY_INSTALL_CMDLINE_TOKEN: &str = "td.deploy=install";
 
-/// Kernel-cmdline token for the explicit rollback oracle. `/etc/rootcheck`
-/// asks td-boot to replace current with verified previous idempotently.
-pub const DEPLOY_ROLLBACK_CMDLINE_TOKEN: &str = "td.deploy=rollback";
+/// Kernel-cmdline token used only by the boot-attempt oracle. The login profile blocks
+/// before its greeter milestone and an isolated root-owned watchdog reboots the target.
+pub const BOOT_FAIL_TARGET_CMDLINE_TOKEN: &str = "td.boot-fail-target=1";
 
 // ── system-x86-64 networking markers (link-up + DHCP, re td-netd) ─────────────────
 // The static td-netd daemon brings the link up and DHCP-configures it at sysinit on

@@ -1,8 +1,9 @@
 use crate::ladder::{
-    mesboot0_inputs, mesboot0_path, AUTOTEST_CMDLINE_TOKEN, DEPLOY_INSTALL_CMDLINE_TOKEN,
-    DEPLOY_ROLLBACK_CMDLINE_TOKEN, GREETER_MARKER, NETTEST_CMDLINE_TOKEN, NETTEST_DEFAULT_HOST,
-    NETTEST_DEFAULT_PORT, PERSIST_READ_CMDLINE_TOKEN, PERSIST_WRITE_CMDLINE_TOKEN, SH, SSHD_MARKER,
-    SYSTEM_DEPLOY_INSTALL_MARKER, SYSTEM_DEPLOY_ROLLBACK_MARKER, SYSTEM_ETC_RO_MARKER,
+    mesboot0_inputs, mesboot0_path, AUTOTEST_CMDLINE_TOKEN, BOOT_FAIL_TARGET_CMDLINE_TOKEN,
+    BOOT_SUCCESS_WAIT_CMDLINE_PREFIX, DEPLOY_INSTALL_CMDLINE_TOKEN, GREETER_MARKER,
+    NETTEST_CMDLINE_TOKEN, NETTEST_DEFAULT_HOST, NETTEST_DEFAULT_PORT,
+    PERSIST_READ_CMDLINE_TOKEN, PERSIST_WRITE_CMDLINE_TOKEN, SH, SSHD_MARKER,
+    SYSTEM_BOOT_SUCCESS_MARKER, SYSTEM_DEPLOY_INSTALL_MARKER, SYSTEM_ETC_RO_MARKER,
     SYSTEM_NET_REACH_MARKER, SYSTEM_NET_RESOLVE_MARKER, SYSTEM_NET_UP_MARKER,
     SYSTEM_PERSIST_READ_MARKER, SYSTEM_PERSIST_WRITE_MARKER, SYSTEM_ROOT_RO_MARKER,
     SYSTEM_SHUTDOWN_MARKER, SYSTEM_STATE_OWNER_MARKER, SYSTEM_STATE_WRITABLE_MARKER,
@@ -14,6 +15,11 @@ use crate::types::{Recipe, Step};
 #[path = "../../../td-boot/src/protocol.rs"]
 #[allow(dead_code)]
 mod td_boot_protocol;
+
+const BOOT_SUCCESS_RETRY_SECS: u8 = 3;
+const BOOT_SUCCESS_RETRY_MAX_SECS: u8 = 10;
+const BOOT_FAIL_PARK_WAIT_SECS: u8 = 30;
+const BOOT_FAIL_PARKED: &str = "td-boot-parked-v1";
 
 // system-x86-64 (re #541, #550): a MINIMAL, TAILORABLE Rust-first Linux
 // deployment, selected from persistent Btrfs and entered through kexec onto a
@@ -45,7 +51,7 @@ mod td_boot_protocol;
 // bundle and its scratch root tree is the automated build guard; the interactive
 // `td-recipe-eval run` boots the selector, kexecs the verified deployment under
 // host qemu, and gives you a shell. The headless `td-recipe-eval
-// qemu-boot-system` asserts two clean boots from the same persistent volume.
+// qemu-boot-system` asserts the deployment state machine across repeated boots.
 //
 // Userland strategy (v0): static busybox provides the boot/login/shell path;
 // source-built Rust uutils provides the interactive core file/text userland
@@ -316,6 +322,8 @@ fn build_inittab() -> String {
      ::sysinit:/bin/hostname -F /etc/hostname\n\
      ::sysinit:/etc/rootcheck\n\
      ::sysinit:/etc/netup\n\
+     ::once:/etc/bootsuccess\n\
+     ::once:/etc/bootfail\n\
      ::respawn:/bin/sshd serve --listen 0.0.0.0:22 --authorized-keys /etc/ssh/authorized_keys\n\
      ttyS0::respawn:/etc/tty-session\n\
      ::ctrlaltdel:/bin/reboot\n\
@@ -371,6 +379,8 @@ fn build_deployment_init(sys: &SystemDef) -> String {
      /bin/busybox umount /proc\n\
      /bin/busybox umount /dev\n\
      /bin/busybox mount -t tmpfs -o mode=0755 tmpfs /sysroot/run\n\
+     /bin/busybox printf '%s\\n' \"$deployment\" > /sysroot/run/td-deployment\n\
+     /bin/busybox chmod 0600 /sysroot/run/td-deployment\n\
      /bin/busybox mkdir -p /sysroot/run/td-volume\n\
      /bin/busybox mount -o move /volume /sysroot/run/td-volume\n\
      /bin/busybox mount -t tmpfs -o mode=1777 tmpfs /sysroot/tmp\n\
@@ -458,7 +468,7 @@ fn build_rootcheck(sys: &SystemDef) -> String {
                  && /bin/busybox test ! -w /var \
                  && /bin/busybox test ! -w /var/root \
                  && /bin/busybox test -w {}'; then \
-                 echo {SYSTEM_STATE_OWNER_MARKER}; fi\n",
+                 echo {SYSTEM_STATE_OWNER_MARKER}; else ok=0; fi\n",
                 user.name, user.home
             ));
         }
@@ -466,14 +476,14 @@ fn build_rootcheck(sys: &SystemDef) -> String {
     // `/` is a read-only erofs mount (fields: <src> <mnt> <fstype> <opts> …; erofs is
     //     always mounted `ro`, so the options field begins `ro`).
     s.push_str(&format!(
-        "if /bin/busybox grep -Eq '^[^ ]+ / erofs ro[, ]' /proc/mounts; then echo {SYSTEM_ROOT_RO_MARKER}; fi\n"
+        "if /bin/busybox grep -Eq '^[^ ]+ / erofs ro[, ]' /proc/mounts; then echo {SYSTEM_ROOT_RO_MARKER}; else ok=0; fi\n"
     ));
     // Root runs this check, so a failed /etc write proves the filesystem rejects writes,
     // not merely that file modes deny an unprivileged process. Run the redirection in a
     // child shell: ash exits a non-interactive shell when a special builtin redirection
     // fails, instead of returning control to the parent `if`.
     s.push_str(&format!(
-        "if /bin/busybox sh -c ': > /etc/.tdwr' 2>/dev/null; then /bin/busybox rm -f /etc/.tdwr; else echo {SYSTEM_ETC_RO_MARKER}; fi\n"
+        "if /bin/busybox sh -c ': > /etc/.tdwr' 2>/dev/null; then /bin/busybox rm -f /etc/.tdwr; ok=0; else echo {SYSTEM_ETC_RO_MARKER}; fi\n"
     ));
     // State is the persistent Btrfs @var subvolume; only run/tmp are volatile.
     // Homes remain stable paths through immutable symlinks into /var.
@@ -502,8 +512,22 @@ fn build_rootcheck(sys: &SystemDef) -> String {
          if /bin/busybox sh -c ': > \"$1/.tdwr\"' td-probe \"$d\" 2>/dev/null; then /bin/busybox rm -f \"$d/.tdwr\"; else ok=0; fi; \
          done\n"
     ));
+    if let Some(user) = sys.users.iter().find(|user| user.name == sys.autologin) {
+        s.push_str(&format!(
+            "if /bin/busybox grep -q -F '{BOOT_FAIL_TARGET_CMDLINE_TOKEN}' /proc/cmdline; then \
+             /bin/busybox printf '%s\\n' waiting > /run/td-boot-parked \
+             && /bin/busybox chown {}:{} /run/td-boot-parked \
+             && /bin/busybox chmod 0600 /run/td-boot-parked || ok=0; \
+             fi\n",
+            user.uid, user.gid
+        ));
+    }
     s.push_str(&format!(
-        "[ \"$ok\" = 1 ] && echo {SYSTEM_STATE_WRITABLE_MARKER}\n"
+        "if [ \"$ok\" = 1 ]; then \
+         echo {SYSTEM_STATE_WRITABLE_MARKER}; \
+         /bin/busybox printf '%s\\n' td-rootcheck-v1 > /run/td-rootcheck-ok \
+         && /bin/busybox chmod 0600 /run/td-rootcheck-ok; \
+         fi\n"
     ));
     s.push_str(&format!(
         "if /bin/busybox grep -q -F '{PERSIST_WRITE_CMDLINE_TOKEN}' /proc/cmdline; then \
@@ -518,20 +542,87 @@ fn build_rootcheck(sys: &SystemDef) -> String {
          echo {SYSTEM_PERSIST_READ_MARKER}; \
          fi\n"
     ));
-    s.push_str(&format!(
-        "if /bin/busybox grep -q -F '{DEPLOY_INSTALL_CMDLINE_TOKEN}' /proc/cmdline; then \
-         if /bin/busybox mkdir -m 700 /run/td-update \
-         && /bin/busybox mount -t btrfs -o rw,nodev,nosuid,noexec /dev/vda /run/td-update \
-         && /bin/td-boot install /dev/vda /run/td-update \
-         /run/td-volume/td/incoming/candidate >/run/td-installed-id; then \
-         echo {SYSTEM_DEPLOY_INSTALL_MARKER}; fi; \
-         fi\n\
-         if /bin/busybox grep -q -F '{DEPLOY_ROLLBACK_CMDLINE_TOKEN}' /proc/cmdline; then \
-         if /bin/td-boot rollback /dev/vda /run/td-update >/run/td-rollback-id; then \
-         echo {SYSTEM_DEPLOY_ROLLBACK_MARKER}; fi; \
-         fi\n"
-    ));
     s
+}
+
+fn build_bootsuccess(sys: &SystemDef) -> String {
+    let mut td_util_probes = String::new();
+    for applet in TD_UTIL_APPLETS {
+        let args = if *applet == "which" { " sh" } else { "" };
+        td_util_probes.push_str(&format!(
+            "/bin/{applet}{args} >/dev/null 2>&1 || \
+             {{ echo \"td-util: /bin/{applet} failed\"; u=0; }}; "
+        ));
+    }
+    format!(
+        "#!/bin/sh\n\
+         set -f\n\
+         finish() {{ /bin/busybox printf '%s\\n' \"$1\" > /run/td-boot-success-ok; \
+         /bin/busybox chmod 0644 /run/td-boot-success-ok; }}\n\
+         fail() {{ finish td-boot-failure-v1; exit 1; }}\n\
+         /bin/busybox grep -q -F '{BOOT_FAIL_TARGET_CMDLINE_TOKEN}' /proc/cmdline && exit 0\n\
+         /bin/busybox test \"$(/bin/busybox cat /run/td-rootcheck-ok 2>/dev/null)\" = td-rootcheck-v1 || fail\n\
+         deployment=$(/bin/busybox cat /run/td-deployment 2>/dev/null)\n\
+         /bin/busybox test -n \"$deployment\" || fail\n\
+         wait={BOOT_SUCCESS_RETRY_SECS}\n\
+         for token in $(/bin/busybox cat /proc/cmdline); do \
+         case \"$token\" in {BOOT_SUCCESS_WAIT_CMDLINE_PREFIX}*) \
+         wait=${{token#{BOOT_SUCCESS_WAIT_CMDLINE_PREFIX}}};; esac; done\n\
+         case \"$wait\" in ''|*[!0-9]*|0) wait={BOOT_SUCCESS_RETRY_SECS};; esac\n\
+         [ \"$wait\" -gt {BOOT_SUCCESS_RETRY_MAX_SECS} ] && wait={BOOT_SUCCESS_RETRY_MAX_SECS}\n\
+         n=0\n\
+         while [ \"$n\" -lt \"$wait\" ]; do \
+         healthy=1; \
+         if /bin/busybox su -s /bin/sh {} -c \
+         '/bin/cat /etc/os-release >/dev/null 2>&1'; then \
+         :; else healthy=0; fi; \
+         if /bin/busybox su -s /bin/sh {} -c \
+         '/bin/sshd selftest >/dev/null 2>&1'; then \
+         :; else healthy=0; fi; \
+         if /bin/busybox su -s /bin/sh {} -c \
+         'u=1; /bin/td-util --list >/dev/null 2>&1 || \
+         {{ echo \"td-util: --list failed\"; u=0; }}; \
+         {td_util_probes}[ \"$u\" = 1 ]'; then \
+         :; else healthy=0; fi; \
+         if [ \"$healthy\" = 1 ] \
+         && /bin/td-boot success /dev/vda /run/td-update \"$deployment\" >/run/td-success-id; then \
+         if /bin/busybox grep -q -F '{DEPLOY_INSTALL_CMDLINE_TOKEN}' /proc/cmdline; then \
+         if /bin/td-boot install /dev/vda /run/td-update \
+         /run/td-volume/td/incoming/candidate >/run/td-installed-id; then \
+         echo {SYSTEM_DEPLOY_INSTALL_MARKER}; else healthy=0; fi; \
+         fi; \
+         if [ \"$healthy\" = 1 ]; then \
+         echo {UUTILS_RUNTIME_MARKER}; echo {SSHD_MARKER}; \
+         echo {TD_UTIL_RUNTIME_MARKER}; echo {SYSTEM_BOOT_SUCCESS_MARKER}; \
+         finish td-boot-success-v1; exit 0; fi; \
+         fi; \
+         n=$((n+1)); /bin/busybox sleep 1; \
+         done\n\
+         fail\n",
+        sys.autologin, sys.autologin, sys.autologin
+    )
+}
+
+fn build_bootfail() -> String {
+    format!(
+        "#!/bin/sh\n\
+         set -f\n\
+         /bin/busybox grep -q -F '{BOOT_FAIL_TARGET_CMDLINE_TOKEN}' /proc/cmdline || exit 0\n\
+         /bin/busybox test \"$(/bin/busybox cat /run/td-rootcheck-ok 2>/dev/null)\" = td-rootcheck-v1 || exit 1\n\
+         wait={BOOT_FAIL_PARK_WAIT_SECS}\n\
+         for token in $(/bin/busybox cat /proc/cmdline); do \
+         case \"$token\" in {BOOT_SUCCESS_WAIT_CMDLINE_PREFIX}*) \
+         wait=${{token#{BOOT_SUCCESS_WAIT_CMDLINE_PREFIX}}};; esac; done\n\
+         case \"$wait\" in ''|*[!0-9]*|0) wait={BOOT_FAIL_PARK_WAIT_SECS};; esac\n\
+         [ \"$wait\" -gt {BOOT_FAIL_PARK_WAIT_SECS} ] && wait={BOOT_FAIL_PARK_WAIT_SECS}\n\
+         n=0\n\
+         while [ \"$n\" -lt \"$wait\" ]; do \
+         /bin/busybox grep -q -x '{BOOT_FAIL_PARKED}' /run/td-boot-parked 2>/dev/null && exec /bin/reboot; \
+         n=$((n+1)); /bin/busybox sleep 1; \
+         done\n\
+         echo 'td-boot: greeter park handshake timed out' >&2\n\
+         exit 1\n"
+    )
 }
 
 fn build_profile(sys: &SystemDef) -> String {
@@ -543,6 +634,14 @@ fn build_profile(sys: &SystemDef) -> String {
     // (every /bin entry resolves into /td/store), so keep PATH honest and minimal.
     s.push_str("export PATH=/bin\n");
     s.push_str("export PS1='\\u@\\h:\\w\\$ '\n");
+    s.push_str(&format!(
+        "if /bin/busybox grep -q -F '{BOOT_FAIL_TARGET_CMDLINE_TOKEN}' /proc/cmdline; then \
+         exec /bin/busybox sh -c 'cd / \
+         || exit 1; \
+         if ! /bin/busybox printf \"%s\\n\" {BOOT_FAIL_PARKED} > /run/td-boot-parked; then \
+         echo \"td-boot: could not park greeter\" >&2; fi; \
+         while :; do /bin/busybox sleep 300; done'; fi\n"
+    ));
     s.push_str("cat <<'__TD_MOTD__'\n");
     s.push_str(sys.motd);
     if !sys.motd.ends_with('\n') {
@@ -552,56 +651,20 @@ fn build_profile(sys: &SystemDef) -> String {
     // The greeter has been reached (login chain ran, shell live) — the primary success
     // line the qemu-boot-system oracle keys on.
     s.push_str(&format!("echo {GREETER_MARKER}\n"));
-    // Headless self-test: when the oracle appends the autotest token to the kernel
-    // cmdline, the greeter (a) RUNS a uutils applet by absolute `/bin` path and, only if it
-    // exits 0, prints UUTILS_RUNTIME_MARKER — a live proof that the dynamically-linked
-    // coreutils multicall's runtime closure resolves on the erofs root (the greeter line
-    // above is a shell builtin `echo`, so it says nothing about uutils health; the MOTD
-    // `cat` ignores failure). Then (b) `exit`s so `tty-session` asks init to power the VM
-    // off — proving "exit powers off" from a clean qemu exit 0 with no terminal to type
-    // into. `/bin/cat` (a uutils applet) on `/etc/os-release` (guaranteed staged) exercises
-    // exec → loader → glibc; a broken closure fails the `&&`, drops the marker, and reds the
-    // oracle. Interactively (no token) none of this runs — the greeter is a normal shell.
-    // `-F`: the token is a FIXED string (`td.autotest=1`), so match it literally — the `.`
-    // must not act as a regex wildcard (re #550, Agy review).
-    // Then (c) `/bin/sshd selftest`, only if it exits 0, prints SSHD_MARKER — the loopback
-    // boot proof. selftest stands up an in-process russh server on an ephemeral 127.0.0.1
-    // port and drives a full SSH handshake+auth+channel+exec round-trip against it,
-    // exercising the kernel's TCP/IP stack (CONFIG_NET+INET), the russh protocol stack, and
-    // sshd's dynamic runtime closure (loader, glibc, libgcc_s, the aws-lc crypto C lib) on
-    // the erofs root. It runs as the UNPRIVILEGED greeter user on an ephemeral port — no
-    // root, no shipped credential — needing only the loopback `lo` that sysinit brought up.
-    // A broken net stack or closure fails the `&&`, drops the marker, and reds the oracle;
-    // selftest's own stdout/stderr are suppressed so the marker string appears exactly once.
-    // Runs before `exit` so `tty-session` can ask init to power the VM off.
-    // Then (d) TD_UTIL_RUNTIME_MARKER, only if EVERY /bin name the td-util farm serves runs.
-    // By absolute /bin path, so the shipped symlink and argv[0] dispatch are what run — and
-    // on a booted kernel, the only place free/ps see /proc and dmesg sees /dev/kmsg.
-    // One literal `/bin/<applet>` per name, not a shell loop: a computed `/bin/$a` fails
-    // direct_bin_calls_resolve_to_a_packed_name closed, so spelling them out is what lets
-    // that guard confirm each probed name is packed. `which` needs a resolvable argument.
-    let mut probes = String::new();
-    for a in TD_UTIL_APPLETS {
-        let args = if *a == "which" { " sh" } else { "" };
-        probes.push_str(&format!(
-            "/bin/{a}{args} >/dev/null 2>&1 || {{ echo 'td-util: /bin/{a} failed'; u=0; }}; "
-        ));
-    }
+    // Autotest waits for the independent root-owned health transaction.
     s.push_str(&format!(
         "if /bin/busybox grep -q -F '{AUTOTEST_CMDLINE_TOKEN}' /proc/cmdline 2>/dev/null; then \
-         /bin/cat /etc/os-release >/dev/null 2>&1 && echo {UUTILS_RUNTIME_MARKER}; \
-         /bin/sshd selftest >/dev/null 2>&1 && echo {SSHD_MARKER}; \
-         u=1; \
-         /bin/td-util --list >/dev/null 2>&1 || {{ echo 'td-util: --list failed'; u=0; }}; \
-         {probes}\
-         [ \"$u\" = 1 ] && echo {TD_UTIL_RUNTIME_MARKER}; \
+         set -f; wait=0; for token in $(/bin/busybox cat /proc/cmdline); do \
+         case \"$token\" in {BOOT_SUCCESS_WAIT_CMDLINE_PREFIX}*) \
+         wait=${{token#{BOOT_SUCCESS_WAIT_CMDLINE_PREFIX}}};; esac; done; \
+         case \"$wait\" in ''|*[!0-9]*|0) wait=1;; esac; \
+         n=0; while [ \"$n\" -lt \"$wait\" ]; do \
+         status=$(/bin/busybox cat /run/td-boot-success-ok 2>/dev/null); \
+         [ \"$status\" = td-boot-success-v1 ] && break; \
+         [ \"$status\" = td-boot-failure-v1 ] && break; \
+         n=$((n+1)); /bin/busybox sleep 1; done; \
          exit 0; fi\n"
     ));
-    // `exit 0`, not a bare `exit`: bare takes the last command's status, so a withheld
-    // marker would exit 1, tty-session's `getty … && exec /bin/reboot` would not reboot,
-    // and init would respawn until the oracle's 300s timeout — burying a named applet
-    // failure under a timeout. Marker ABSENCE is the red signal; the exit path stays clean
-    // so "exit powers off" still proves itself.
     s
 }
 
@@ -659,6 +722,8 @@ fn etc_files(sys: &SystemDef) -> Vec<(&'static str, String, bool)> {
         ("shutdown", build_shutdown(), true),
         ("rootcheck", build_rootcheck(sys), true),
         ("netup", build_netup(), true),
+        ("bootsuccess", build_bootsuccess(sys), true),
+        ("bootfail", build_bootfail(), true),
     ]
 }
 
@@ -666,9 +731,10 @@ fn etc_files(sys: &SystemDef) -> Vec<(&'static str, String, bool)> {
 /// The selector carries td-kexec; the selected deployment phase does not.
 fn build_initramfs_spec(init: &str, include_kexec: bool) -> String {
     let mut s = String::new();
-    for d in ["/dev", "/proc", "/volume", "/sysroot", "/td", "/td/store"] {
+    for d in ["/dev", "/proc", "/run", "/sysroot", "/td", "/td/store"] {
         s.push_str(&format!("dir {d} 0755 0 0\n"));
     }
+    s.push_str("dir /volume 0700 0 0\n");
     // The static busybox at its content-addressed /td/store path; the cpio's /bin/busybox
     // and /bin/sh symlinks (all the stage-1 script needs) point straight at it.
     s.push_str("dir {in:busybox-x86-64} 0755 0 0\n");
@@ -872,7 +938,7 @@ fn shape_check() -> String {
      done; \
      selector_list=$(\"$bb\" cpio -t < \"$selector\" 2>/dev/null); \
      init_list=$(\"$bb\" cpio -t < \"$init\" 2>/dev/null); \
-     for m in init bin/busybox bin/sh bin/td-boot dev/console proc volume sysroot; do \
+     for m in init bin/busybox bin/sh bin/td-boot dev/console proc run volume sysroot; do \
          printf '%s\\n' \"$selector_list\" | grep -q -x -F \"$m\" || { echo \"selector initramfs: cpio member '$m' missing\" >&2; exit 1; }; \
          printf '%s\\n' \"$init_list\" | grep -q -x -F \"$m\" || { echo \"deployment initramfs: cpio member '$m' missing\" >&2; exit 1; }; \
      done; \
@@ -890,7 +956,7 @@ fn shape_check() -> String {
      [ -f \"$root/init\" ] || [ -L \"$root/init\" ] || { echo 'root tree: /init missing' >&2; exit 1; }; \
      case $(readlink \"$root/init\") in /td/store/*) : ;; *) echo 'root tree: /init is not a symlink into /td/store' >&2; exit 1;; esac; \
      case $(readlink \"$root/bin/sh\") in /td/store/*) : ;; *) echo 'root tree: /bin/sh is not a symlink into /td/store - the store-native /bin farm regressed' >&2; exit 1;; esac; \
-     for f in passwd group shadow hostname os-release inittab profile autologin tty-session shutdown rootcheck netup; do \
+     for f in passwd group shadow hostname os-release inittab profile autologin tty-session shutdown rootcheck netup bootsuccess bootfail; do \
          [ -f \"$root/etc/$f\" ] || { echo \"root tree: /etc/$f missing\" >&2; exit 1; }; \
      done; \
      for l in resolv.conf hosts; do \
@@ -1578,6 +1644,14 @@ mod tests {
             inittab.contains("::sysinit:/etc/netup"),
             "inittab must run /etc/netup at sysinit (network bring-up + resolve/reach self-test)"
         );
+        assert!(
+            inittab.contains("::once:/etc/bootsuccess"),
+            "inittab must start the root-owned health target"
+        );
+        assert!(
+            inittab.contains("::once:/etc/bootfail"),
+            "inittab must start the isolated failed-target watchdog"
+        );
         let session = build_tty_session();
         // getty must gate the reboot (`&&`), so a FAILED session respawns rather than
         // firing reboot and masking a broken greeter as a clean exit-0 shutdown.
@@ -1648,9 +1722,11 @@ mod tests {
         );
         assert!(
             init.contains("mount -o move /volume /sysroot/run/td-volume")
+                && init.contains("printf '%s\\n' \"$deployment\" > /sysroot/run/td-deployment")
+                && init.contains("chmod 0600 /sysroot/run/td-deployment")
                 && init.contains("/bin/busybox umount /proc")
                 && init.contains("/bin/busybox umount /dev"),
-            "the verified backing volume must move below the new root while old pseudo-filesystems are released"
+            "the selected id must be handed to the real root before the verified backing volume moves below it"
         );
         assert!(
             init.contains("/sysroot/var/home"),
@@ -1763,17 +1839,75 @@ mod tests {
                 && rootcheck.contains("&& /bin/busybox sync"),
             "the write marker must require a fresh path and a successful sync"
         );
+        let bootsuccess = build_bootsuccess(&SYSTEM);
+        let bootfail = build_bootfail();
+        let profile = build_profile(&SYSTEM);
         assert!(
-            rootcheck.contains(DEPLOY_INSTALL_CMDLINE_TOKEN)
-                && rootcheck.contains(
-                    "mount -t btrfs -o rw,nodev,nosuid,noexec /dev/vda /run/td-update"
-                )
-                && rootcheck.contains("td-boot install /dev/vda /run/td-update")
-                && rootcheck.contains(SYSTEM_DEPLOY_INSTALL_MARKER)
-                && rootcheck.contains(DEPLOY_ROLLBACK_CMDLINE_TOKEN)
-                && rootcheck.contains("td-boot rollback /dev/vda /run/td-update")
-                && rootcheck.contains(SYSTEM_DEPLOY_ROLLBACK_MARKER),
-            "rootcheck must wire transactional install and explicit rollback through td-boot"
+            rootcheck.contains("td-rootcheck-v1 > /run/td-rootcheck-ok")
+                && bootsuccess.contains("set -f")
+                && bootsuccess.contains("su -s /bin/sh tester -c")
+                && bootsuccess.contains("/bin/cat /etc/os-release")
+                && bootsuccess.contains("/bin/sshd selftest")
+                && bootsuccess.contains("/bin/td-util --list")
+                && bootsuccess.contains(TD_UTIL_RUNTIME_MARKER)
+                && bootsuccess
+                    .contains("td-boot success /dev/vda /run/td-update \"$deployment\"")
+                && bootsuccess.contains(SYSTEM_BOOT_SUCCESS_MARKER)
+                && bootsuccess.contains("test -n \"$deployment\" || fail")
+                && bootsuccess.contains(&format!("wait={BOOT_SUCCESS_RETRY_SECS}"))
+                && bootsuccess.contains(BOOT_SUCCESS_WAIT_CMDLINE_PREFIX)
+                && bootsuccess.contains(&format!(
+                    "case \"$wait\" in ''|*[!0-9]*|0) wait={BOOT_SUCCESS_RETRY_SECS}"
+                ))
+                && bootsuccess.contains(&format!(
+                    "[ \"$wait\" -gt {BOOT_SUCCESS_RETRY_MAX_SECS} ] \
+                     && wait={BOOT_SUCCESS_RETRY_MAX_SECS}"
+                ))
+                && bootsuccess.contains("while [ \"$n\" -lt \"$wait\" ]")
+                && profile.contains("/run/td-boot-success-ok"),
+            "the root-owned target must probe unprivileged runtime health, retry, and acknowledge the exact deployment"
+        );
+        assert!(
+            bootsuccess.find("/bin/cat /etc/os-release").unwrap()
+                < bootsuccess
+                    .find("&& /bin/td-boot success /dev/vda")
+                    .unwrap()
+                && bootsuccess.find("/bin/sshd selftest").unwrap()
+                    < bootsuccess
+                        .find("&& /bin/td-boot success /dev/vda")
+                        .unwrap()
+                && bootsuccess.find("/bin/td-util --list").unwrap()
+                    < bootsuccess
+                        .find("if [ \"$healthy\" = 1 ]")
+                        .unwrap(),
+            "deployment success must follow every unprivileged runtime probe"
+        );
+        assert!(
+            bootsuccess.contains(DEPLOY_INSTALL_CMDLINE_TOKEN)
+                && bootsuccess.contains("td-boot install /dev/vda /run/td-update")
+                && bootsuccess.contains(SYSTEM_DEPLOY_INSTALL_MARKER),
+            "the root-owned health target must wire transactional install through td-boot"
+        );
+        assert!(
+            bootfail.contains(BOOT_FAIL_TARGET_CMDLINE_TOKEN)
+                && bootfail.contains("set -f")
+                && bootfail.contains("exec /bin/reboot")
+                && bootfail.contains(BOOT_FAIL_PARKED)
+                && bootfail.contains("greeter park handshake timed out")
+                && bootfail.contains(&format!("wait={BOOT_FAIL_PARK_WAIT_SECS}"))
+                && bootfail.contains(BOOT_SUCCESS_WAIT_CMDLINE_PREFIX)
+                && bootfail.contains(&format!(
+                    "case \"$wait\" in ''|*[!0-9]*|0) wait={BOOT_FAIL_PARK_WAIT_SECS}"
+                ))
+                && bootfail.contains(&format!(
+                    "[ \"$wait\" -gt {BOOT_FAIL_PARK_WAIT_SECS} ] \
+                     && wait={BOOT_FAIL_PARK_WAIT_SECS}"
+                ))
+                && bootfail.contains("while [ \"$n\" -lt \"$wait\" ]")
+                && profile.contains("cd /")
+                && profile.contains("> /run/td-boot-parked")
+                && profile.contains("while :; do /bin/busybox sleep 300; done"),
+            "the failed-target injection must park outside /var before its watchdog reboots"
         );
         assert!(
             steps.iter().any(|step| matches!(
@@ -1804,19 +1938,31 @@ mod tests {
             "profile must emit the greeter marker"
         );
         assert!(
-            profile.contains(AUTOTEST_CMDLINE_TOKEN) && profile.contains("exit"),
+            profile.contains(AUTOTEST_CMDLINE_TOKEN)
+                && profile.contains("set -f; wait=0")
+                && profile.contains("exit"),
             "profile must exit on the autotest cmdline token so the headless boot powers off"
         );
-        // The headless self-test must PROVE uutils runs: a uutils applet invoked by absolute
-        // /bin path, gated with `&&` on the marker echo, so a broken runtime closure drops the
-        // marker and reds the oracle (#547, review finding #2).
+        // The root-owned target must prove uutils runs as the unprivileged user before
+        // it emits the marker, so a broken runtime closure reds the oracle.
         assert!(
-            profile.contains(UUTILS_RUNTIME_MARKER),
-            "profile must emit the uutils runtime marker"
+            bootsuccess.contains(UUTILS_RUNTIME_MARKER),
+            "the root-owned target must emit the uutils runtime marker"
         );
         assert!(
-            profile.contains("/bin/cat /etc/os-release") && profile.contains(&format!("&& echo {UUTILS_RUNTIME_MARKER}")),
-            "the uutils runtime marker must be gated on a successful absolute-path uutils invocation"
+            bootsuccess.contains("/bin/cat /etc/os-release")
+                && bootsuccess.find("/bin/cat /etc/os-release").unwrap()
+                    < bootsuccess.find(&format!("echo {UUTILS_RUNTIME_MARKER}")).unwrap(),
+            "the uutils marker must follow a successful unprivileged absolute-path invocation"
+        );
+        assert!(
+            bootsuccess.contains("finish td-boot-failure-v1")
+                && bootsuccess.contains("chmod 0644 /run/td-boot-success-ok")
+                && profile.contains("td-boot-failure-v1")
+                && profile.contains("cat /run/td-boot-success-ok")
+                && profile.contains(BOOT_SUCCESS_WAIT_CMDLINE_PREFIX)
+                && profile.contains("while [ \"$n\" -lt \"$wait\" ]"),
+            "the root-owned completion status must be readable by the headless greeter"
         );
 
         // Networking: netup brings the link up unconditionally, and under the nettest
@@ -1857,8 +2003,9 @@ mod tests {
         for entry in [
             "file {in:td-boot}/bin/td-boot {in:td-boot}/bin/td-boot 0755 0 0",
             "slink /bin/td-boot {in:td-boot}/bin/td-boot 0777 0 0",
-            "dir /volume 0755 0 0",
+            "dir /volume 0700 0 0",
             "dir /proc 0755 0 0",
+            "dir /run 0755 0 0",
         ] {
             assert!(
                 selector.contains(entry) && deployment.contains(entry),
@@ -1933,7 +2080,7 @@ mod tests {
                 "/bin/{applet} must resolve to the staged td-util multicall"
             );
         }
-        let profile = build_profile(&SYSTEM);
+        let bootsuccess = build_bootsuccess(&SYSTEM);
         // Every farm name must be probed BY ITS /bin PATH: that is what exercises the
         // shipped symlink and argv[0] dispatch. A probe over a subset would green-light
         // names it never ran.
@@ -1950,26 +2097,21 @@ mod tests {
             // prints unconditionally, so the oracle greens with a broken applet.
             let args = if *applet == "which" { " sh" } else { "" };
             assert!(
-                profile.contains(&format!(
-                    "/bin/{applet}{args} >/dev/null 2>&1 || {{ echo 'td-util: /bin/{applet} \
-                     failed'; u=0; }}"
+                bootsuccess.contains(&format!(
+                    "/bin/{applet}{args} >/dev/null 2>&1 || {{ echo \"td-util: /bin/{applet} \
+                     failed\"; u=0; }}"
                 )),
-                "the greeter must RUN /bin/{applet} by its literal /bin path AND clear the \
+                "the health target must RUN /bin/{applet} by its literal /bin path AND clear the \
                  marker gate on failure - without the u=0 the marker is unconditional and \
                  the oracle passes a broken applet"
             );
         }
-        // `exit 0`, not a bare `exit`. Bare takes the last command's status, so a withheld
-        // marker exits 1, tty-session's `getty … && exec /bin/reboot` never reboots, and the
-        // VM respawns to the oracle's timeout — turning a named applet failure into a
-        // timeout with no cause attached.
         assert!(
-            profile.contains(&format!(
-                "[ \"$u\" = 1 ] && echo {TD_UTIL_RUNTIME_MARKER}; exit 0; fi"
-            )),
-            "the greeter must emit the td-util marker GATED on every probed applet exiting 0 \
-             (an ungated echo would prove the binary runs when it never ran), and must then \
-             `exit 0` so a withheld marker still powers the VM off instead of respawning"
+            bootsuccess.contains(&format!(
+                "[ \"$u\" = 1 ]'; then :; else healthy=0"
+            )) && bootsuccess.find("[ \"$u\" = 1 ]'").unwrap()
+                < bootsuccess.find(&format!("echo {TD_UTIL_RUNTIME_MARKER}")).unwrap(),
+            "the health target must gate td-util health on every probed applet exiting 0"
         );
     }
 

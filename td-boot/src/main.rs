@@ -24,7 +24,9 @@ const TD_KEXEC: &str = "/bin/td-kexec";
 const STDIN_PATH: &str = "/proc/self/fd/0";
 const MANIFEST_HEADER: &[u8] = b"td-deployment-v1";
 const MANIFEST_NAME: &str = "manifest";
+const ATTEMPT_HEADER: &[u8] = b"td-boot-attempt-v1";
 const MAX_MANIFEST_BYTES: u64 = 4096;
+const MAX_ATTEMPT_BYTES: u64 = 64;
 const MAX_CMDLINE_BYTES: usize = 2048;
 const MAX_MOUNTINFO_BYTES: u64 = 1024 * 1024;
 const UPDATE_LOCK_DIR: &str = "/run/td-boot-locks";
@@ -52,6 +54,11 @@ enum Mode {
         device: PathBuf,
         mountpoint: PathBuf,
     },
+    Success {
+        device: PathBuf,
+        mountpoint: PathBuf,
+        deployment_id: String,
+    },
 }
 
 struct Manifest {
@@ -70,6 +77,16 @@ struct Selection {
     slot: &'static str,
     deployment: Deployment,
     current_error: Option<String>,
+}
+
+struct BootDecision {
+    slot: &'static str,
+    deployment_id: String,
+    current_error: Option<String>,
+    exhausted_deployment: Option<String>,
+    fallback_error: Option<String>,
+    bookkeeping_error: Option<String>,
+    remaining_attempts: Option<u8>,
 }
 
 struct VerifiedBundle {
@@ -111,7 +128,7 @@ fn invalid(message: impl Into<String>) -> io::Error {
 fn usage_error() -> io::Error {
     io::Error::new(
         io::ErrorKind::InvalidInput,
-        "usage: td-boot verify <volume-root>\n       td-boot root-loop <volume-root> <deployment-id> <loop-device>\n       td-boot boot <device> <mountpoint> <cmdline>\n       td-boot install <device> <mountpoint> <deployment-directory>\n       td-boot rollback <device> <mountpoint>",
+        "usage: td-boot verify <volume-root>\n       td-boot root-loop <volume-root> <deployment-id> <loop-device>\n       td-boot boot <device> <mountpoint> <cmdline>\n       td-boot install <device> <mountpoint> <deployment-directory>\n       td-boot rollback <device> <mountpoint>\n       td-boot success <device> <mountpoint> <deployment-id>",
     )
 }
 
@@ -185,6 +202,19 @@ fn parse_args<I: Iterator<Item = OsString>>(mut args: I) -> io::Result<Mode> {
             Ok(Mode::Rollback {
                 device: PathBuf::from(device),
                 mountpoint: PathBuf::from(mountpoint),
+            })
+        }
+        Some(mode) if mode == OsStr::new("success") => {
+            let device = args.next().ok_or_else(usage_error)?;
+            let mountpoint = args.next().ok_or_else(usage_error)?;
+            let deployment_id = parse_deployment_id(args.next().ok_or_else(usage_error)?)?;
+            if args.next().is_some() {
+                return Err(usage_error());
+            }
+            Ok(Mode::Success {
+                device: PathBuf::from(device),
+                mountpoint: PathBuf::from(mountpoint),
+                deployment_id,
             })
         }
         _ => Err(usage_error()),
@@ -382,6 +412,128 @@ fn sync_directory(path: &Path) -> io::Result<()> {
     File::open(path)?.sync_all()
 }
 
+fn uid_is_root(uid: u32) -> bool {
+    uid == 0
+}
+
+fn state_owner_allowed(file_uid: u32, fixture_uid: Option<u32>) -> bool {
+    uid_is_root(file_uid) || fixture_uid == Some(file_uid)
+}
+
+#[cfg(test)]
+fn fixture_uid() -> Option<u32> {
+    fs::metadata("/proc/self").ok().map(|process| process.uid())
+}
+
+#[cfg(not(test))]
+fn fixture_uid() -> Option<u32> {
+    None
+}
+
+fn root_owned(metadata: &Metadata) -> bool {
+    state_owner_allowed(metadata.uid(), fixture_uid())
+}
+
+fn validate_attempts_directory(path: &Path) -> io::Result<()> {
+    let metadata = fs::symlink_metadata(path)?;
+    if !metadata.file_type().is_dir()
+        || !root_owned(&metadata)
+        || metadata.permissions().mode() & 0o777 != 0o700
+    {
+        return Err(invalid(format!(
+            "boot attempts directory must be a root-owned real directory with mode 0700: {}",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+fn attempts_directory(root: &Path, create: bool) -> io::Result<Option<PathBuf>> {
+    let path = root.join(protocol::ATTEMPTS_DIR);
+    match fs::symlink_metadata(&path) {
+        Ok(_) => {
+            validate_attempts_directory(&path)?;
+            Ok(Some(path))
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound && !create => Ok(None),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            let mut builder = fs::DirBuilder::new();
+            builder.mode(0o700);
+            builder.create(&path)?;
+            validate_attempts_directory(&path)?;
+            sync_directory(&root.join(protocol::BOOT_DIR))?;
+            Ok(Some(path))
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn parse_attempt_state(bytes: &[u8]) -> io::Result<u8> {
+    let mut lines = bytes.split(|byte| *byte == b'\n');
+    let header = lines
+        .next()
+        .ok_or_else(|| invalid("boot attempt state is empty"))?;
+    let remaining = lines
+        .next()
+        .ok_or_else(|| invalid("boot attempt state has no remaining count"))?;
+    let terminator = lines
+        .next()
+        .ok_or_else(|| invalid("boot attempt state lacks a trailing newline"))?;
+    if header != ATTEMPT_HEADER || !terminator.is_empty() || lines.next().is_some() {
+        return Err(invalid(
+            "boot attempt state must have the exact td-boot-attempt-v1 two-line form",
+        ));
+    }
+    let value = remaining
+        .strip_prefix(b"remaining ")
+        .ok_or_else(|| invalid("boot attempt state has a malformed remaining count"))?;
+    if value.is_empty()
+        || !value.iter().all(u8::is_ascii_digit)
+        || (value.len() > 1 && value.first() == Some(&b'0'))
+    {
+        return Err(invalid(
+            "boot attempt remaining count must be canonical decimal",
+        ));
+    }
+    let remaining = std::str::from_utf8(value)
+        .ok()
+        .and_then(|text| text.parse::<u8>().ok())
+        .ok_or_else(|| invalid("boot attempt remaining count is out of range"))?;
+    if remaining > protocol::ATTEMPT_V1_MAX_REMAINING {
+        return Err(invalid(format!(
+            "boot attempt remaining count exceeds {}",
+            protocol::ATTEMPT_V1_MAX_REMAINING
+        )));
+    }
+    Ok(remaining)
+}
+
+fn read_attempt_state(root: &Path, id: &str) -> io::Result<Option<u8>> {
+    if !valid_digest(id.as_bytes()) {
+        return Err(invalid("invalid boot attempt deployment id"));
+    }
+    let Some(directory) = attempts_directory(root, false)? else {
+        return Ok(None);
+    };
+    let path = directory.join(id);
+    let metadata = match fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    if !metadata.file_type().is_file()
+        || !root_owned(&metadata)
+        || metadata.permissions().mode() & 0o777 != 0o600
+    {
+        return Err(invalid(format!(
+            "boot attempt state must be a root-owned real file with mode 0600: {}",
+            path.display()
+        )));
+    }
+    let bytes = read_bounded_real_file(&path, "boot attempt state", MAX_ATTEMPT_BYTES)?;
+    parse_attempt_state(&bytes).map(Some)
+}
+
 fn parse_decimal_u32(bytes: &[u8]) -> Option<u32> {
     if bytes.is_empty() || !bytes.iter().all(u8::is_ascii_digit) {
         return None;
@@ -454,6 +606,109 @@ fn reap_selector_temporaries(boot: &Path) -> io::Result<()> {
         sync_directory(boot)?;
     }
     Ok(())
+}
+
+fn reap_attempt_temporaries(attempts: &Path) -> io::Result<()> {
+    let mut changed = false;
+    for entry in fs::read_dir(attempts)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        if temporary_owner_pid(name.as_bytes(), b".attempt-", true).is_none() {
+            continue;
+        }
+        let path = entry.path();
+        let metadata = fs::symlink_metadata(&path)?;
+        if metadata.file_type().is_dir() {
+            fs::remove_dir_all(&path)?;
+        } else {
+            fs::remove_file(&path)?;
+        }
+        changed = true;
+    }
+    if changed {
+        sync_directory(attempts)?;
+    }
+    Ok(())
+}
+
+fn create_attempt_file(directory: &Path, id: &str) -> io::Result<(PathBuf, File)> {
+    for attempt in 0..1024u32 {
+        let path = directory.join(format!(".attempt-{id}-{}-{attempt}", std::process::id()));
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)
+        {
+            Ok(file) => return Ok((path, file)),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        format!(
+            "could not create a unique boot attempt file below {}",
+            directory.display()
+        ),
+    ))
+}
+
+fn write_attempt_state(root: &Path, id: &str, remaining: u8) -> io::Result<()> {
+    if !valid_digest(id.as_bytes()) || remaining > protocol::ATTEMPT_V1_MAX_REMAINING {
+        return Err(invalid("invalid boot attempt state"));
+    }
+    let directory = attempts_directory(root, true)?
+        .ok_or_else(|| invalid("boot attempts directory was not created"))?;
+    reap_attempt_temporaries(&directory)?;
+    let (temporary, mut file) = create_attempt_file(&directory, id)?;
+    let mut cleanup = RemoveFile {
+        path: Some(temporary.clone()),
+    };
+    let metadata = file.metadata()?;
+    if !metadata.file_type().is_file()
+        || !root_owned(&metadata)
+        || metadata.permissions().mode() & 0o777 != 0o600
+    {
+        return Err(invalid(format!(
+            "new boot attempt state must be a root-owned real file with mode 0600: {}",
+            temporary.display()
+        )));
+    }
+    file.write_all(ATTEMPT_HEADER)?;
+    writeln!(file, "\nremaining {remaining}")?;
+    file.sync_all()?;
+    fs::rename(&temporary, directory.join(id))?;
+    cleanup.path = None;
+    sync_directory(&directory)
+}
+
+fn mark_attempt_successful(root: &Path, id: &str) -> io::Result<()> {
+    if read_attempt_state(root, id)?.is_none() {
+        return Ok(());
+    }
+    let directory = attempts_directory(root, false)?
+        .ok_or_else(|| invalid("boot attempts directory disappeared"))?;
+    fs::remove_file(directory.join(id))?;
+    sync_directory(&directory)
+}
+
+enum AttemptDecision {
+    Successful,
+    Consumed(u8),
+    Exhausted,
+}
+
+fn consume_boot_attempt(root: &Path, id: &str) -> io::Result<AttemptDecision> {
+    match read_attempt_state(root, id)? {
+        None => Ok(AttemptDecision::Successful),
+        Some(0) => Ok(AttemptDecision::Exhausted),
+        Some(remaining) => {
+            let next = remaining.saturating_sub(1);
+            write_attempt_state(root, id, next)?;
+            Ok(AttemptDecision::Consumed(next))
+        }
+    }
 }
 
 fn create_install_directory(parent: &Path, id: &str) -> io::Result<PathBuf> {
@@ -644,6 +899,9 @@ fn selectors_are_absent(root: &Path) -> io::Result<bool> {
 fn activate_install(root: &Path, previous: &str, current: &str) -> io::Result<()> {
     // Preserve a verified fallback across every crash prefix.
     replace_selector(root, "previous", previous)?;
+    if current != previous {
+        write_attempt_state(root, current, protocol::DEFAULT_BOOT_ATTEMPTS)?;
+    }
     replace_selector(root, "current", current)
 }
 
@@ -671,20 +929,49 @@ fn install_deployment(root: &Path, source: &Path) -> io::Result<String> {
             )));
         }
     };
-    let known_good = match &selection {
-        Some(selected) => selected.deployment.id.clone(),
-        None => candidate.clone(),
-    };
     let installed = publish_bundle(root, bundle)?;
     if selection
         .as_ref()
         .is_some_and(|selected| selected.slot == "current" && selected.deployment.id == installed)
     {
-        if verify_slot(root, "previous").is_err() {
-            replace_selector(root, "previous", &installed)?;
+        match verify_slot(root, "previous") {
+            Ok(previous) if read_attempt_state(root, &previous.id)?.is_none() => {}
+            Ok(previous) => {
+                return Err(invalid(format!(
+                    "refusing to retain pending deployment {} as the fallback",
+                    previous.id
+                )));
+            }
+            Err(_) => {
+                if read_attempt_state(root, &installed)?.is_some() {
+                    return Err(invalid(
+                        "refusing to replace an invalid fallback with a pending deployment",
+                    ));
+                }
+                replace_selector(root, "previous", &installed)?;
+            }
         }
         return Ok(installed);
     }
+    let known_good = match &selection {
+        Some(selected) if read_attempt_state(root, &selected.deployment.id)?.is_some() => {
+            let previous = verify_slot(root, "previous").map_err(|error| {
+                invalid(format!(
+                    "refusing activation while current deployment {} is pending: \
+                     no verified fallback ({error})",
+                    selected.deployment.id
+                ))
+            })?;
+            if read_attempt_state(root, &previous.id)?.is_some() {
+                return Err(invalid(
+                    "refusing activation without a successful fallback deployment",
+                ));
+            }
+            previous.id
+        }
+        Some(selected) => selected.deployment.id.clone(),
+        None => candidate.clone(),
+    };
     activate_install(root, &known_good, &installed)?;
     Ok(installed)
 }
@@ -696,8 +983,36 @@ fn rollback_deployment(root: &Path) -> io::Result<String> {
     reap_selector_temporaries(&root.join(protocol::BOOT_DIR))?;
     let previous = verify_slot(root, "previous")?;
     let previous_id = previous.id;
+    if read_attempt_state(root, &previous_id)?.is_some() {
+        return Err(invalid(format!(
+            "previous deployment {previous_id} is not marked successful"
+        )));
+    }
     replace_selector(root, "current", &previous_id)?;
     Ok(previous_id)
+}
+
+fn current_attempt_state(root: &Path, deployment_id: &str) -> io::Result<Option<u8>> {
+    require_absolute(root, "volume root")?;
+    require_real_directory(root, "volume root")?;
+    require_real_directory(&root.join(protocol::BOOT_DIR), "boot selector directory")?;
+    let current_id = read_selector(root, "current")?;
+    if current_id != deployment_id {
+        return Err(invalid(format!(
+            "running deployment {deployment_id} is not current {}",
+            current_id
+        )));
+    }
+    read_attempt_state(root, deployment_id)
+}
+
+fn mark_deployment_successful(root: &Path, deployment_id: &str) -> io::Result<String> {
+    if current_attempt_state(root, deployment_id)?.is_none() {
+        return Ok(deployment_id.to_string());
+    }
+    verify_deployment(root, deployment_id)?;
+    mark_attempt_successful(root, deployment_id)?;
+    Ok(deployment_id.to_string())
 }
 
 fn verified_manifest(root: &Path, id: &str) -> io::Result<(PathBuf, Manifest)> {
@@ -731,7 +1046,11 @@ fn verified_manifest(root: &Path, id: &str) -> io::Result<(PathBuf, Manifest)> {
 
 fn verify_slot(root: &Path, slot: &str) -> io::Result<Deployment> {
     let id = read_selector(root, slot)?;
-    let (directory, manifest) = verified_manifest(root, &id)?;
+    verify_deployment(root, &id)
+}
+
+fn verify_deployment(root: &Path, id: &str) -> io::Result<Deployment> {
+    let (directory, manifest) = verified_manifest(root, id)?;
     let kernel = verify_payload(&directory, "bzImage", &manifest.kernel)?;
     let initramfs = verify_payload(&directory, "initramfs.cpio", &manifest.initramfs)?;
     // Verify root here so corruption selects previous; root-loop repeats the hash
@@ -739,7 +1058,7 @@ fn verify_slot(root: &Path, slot: &str) -> io::Result<Deployment> {
     verify_payload(&directory, "root.erofs", &manifest.root)?;
 
     Ok(Deployment {
-        id,
+        id: id.to_string(),
         kernel,
         initramfs,
     })
@@ -779,7 +1098,154 @@ fn select_deployment(root: &Path) -> io::Result<Selection> {
     }
 }
 
-fn kernel_cmdline(base: &OsStr, deployment_id: &str) -> io::Result<OsString> {
+fn verified_previous_decision(
+    root: &Path,
+    current_error: Option<String>,
+    exhausted_deployment: Option<String>,
+) -> io::Result<BootDecision> {
+    let previous = verify_slot(root, "previous")?;
+    if read_attempt_state(root, &previous.id)?.is_some() {
+        return Err(invalid(format!(
+            "previous deployment {} is not marked successful",
+            previous.id
+        )));
+    }
+    Ok(BootDecision {
+        slot: "previous",
+        deployment_id: previous.id,
+        current_error,
+        exhausted_deployment,
+        fallback_error: None,
+        bookkeeping_error: None,
+        remaining_attempts: None,
+    })
+}
+
+fn select_boot_deployment(root: &Path) -> io::Result<BootDecision> {
+    require_absolute(root, "volume root")?;
+    require_real_directory(root, "volume root")?;
+    require_real_directory(&root.join("td"), "td directory")?;
+    require_real_directory(&root.join(protocol::BOOT_DIR), "boot selector directory")?;
+    require_real_directory(
+        &root.join(protocol::DEPLOYMENTS_DIR),
+        "deployments directory",
+    )?;
+    // Invalid attempt metadata cannot authorize a write, but must not prevent
+    // conservative verified-previous recovery.
+    let attempts = attempts_directory(root, false).map_err(|error| {
+        io::Error::other(format!("boot attempt bookkeeping rejected: {error}"))
+    })?;
+    if let Some(attempts) = attempts {
+        reap_attempt_temporaries(&attempts)?;
+    }
+
+    let current = match verify_slot(root, "current") {
+        Ok(current) => current,
+        Err(error) => {
+            let decision = verified_previous_decision(root, Some(error.to_string()), None)
+                .map_err(|previous| {
+                    invalid(format!(
+                        "no verified deployment: current rejected ({error}); \
+                         previous rejected ({previous})"
+                    ))
+                })?;
+            replace_selector(root, "current", &decision.deployment_id)?;
+            return Ok(decision);
+        }
+    };
+    match consume_boot_attempt(root, &current.id) {
+        Ok(AttemptDecision::Successful) => Ok(BootDecision {
+            slot: "current",
+            deployment_id: current.id,
+            current_error: None,
+            exhausted_deployment: None,
+            fallback_error: None,
+            bookkeeping_error: None,
+            remaining_attempts: None,
+        }),
+        Ok(AttemptDecision::Consumed(remaining)) => Ok(BootDecision {
+            slot: "current",
+            deployment_id: current.id,
+            current_error: None,
+            exhausted_deployment: None,
+            fallback_error: None,
+            bookkeeping_error: None,
+            remaining_attempts: Some(remaining),
+        }),
+        Ok(AttemptDecision::Exhausted) => {
+            let exhausted = current.id;
+            match verified_previous_decision(root, None, Some(exhausted.clone())) {
+                Ok(decision) => {
+                    replace_selector(root, "current", &decision.deployment_id)?;
+                    Ok(decision)
+                }
+                Err(error) => Ok(BootDecision {
+                    slot: "current",
+                    deployment_id: exhausted.clone(),
+                    current_error: None,
+                    exhausted_deployment: Some(exhausted),
+                    fallback_error: Some(error.to_string()),
+                    bookkeeping_error: None,
+                    remaining_attempts: None,
+                }),
+            }
+        }
+        Err(error) => {
+            match verified_previous_decision(root, Some(error.to_string()), None) {
+                Ok(decision) => {
+                    replace_selector(root, "current", &decision.deployment_id)?;
+                    Ok(decision)
+                }
+                Err(previous) => Ok(BootDecision {
+                    slot: "current",
+                    deployment_id: current.id,
+                    current_error: None,
+                    exhausted_deployment: None,
+                    fallback_error: None,
+                    bookkeeping_error: Some(format!(
+                        "current attempt state rejected ({error}); \
+                         previous unavailable ({previous})"
+                    )),
+                    remaining_attempts: None,
+                }),
+            }
+        }
+    }
+}
+
+fn cmdline_has_token(cmdline: &[u8], token: &[u8]) -> bool {
+    cmdline
+        .split(|byte| byte.is_ascii_whitespace())
+        .any(|field| field == token)
+}
+
+#[derive(Debug, Eq, PartialEq)]
+enum SuccessDisposition {
+    Record,
+    ConfirmRecovery,
+    RejectRecovery,
+}
+
+fn success_disposition(cmdline: &[u8], deployment_id: &str) -> SuccessDisposition {
+    if !cmdline_has_token(
+        cmdline,
+        protocol::BOOKKEEPING_UNAVAILABLE_CMDLINE_TOKEN.as_bytes(),
+    ) {
+        return SuccessDisposition::Record;
+    }
+    let deployment = format!("td.deployment={deployment_id}");
+    if cmdline_has_token(cmdline, deployment.as_bytes()) {
+        SuccessDisposition::ConfirmRecovery
+    } else {
+        SuccessDisposition::RejectRecovery
+    }
+}
+
+fn kernel_cmdline(
+    base: &OsStr,
+    deployment_id: &str,
+    bookkeeping_unavailable: bool,
+) -> io::Result<OsString> {
     let bytes = base.as_bytes();
     if !bytes
         .iter()
@@ -791,17 +1257,29 @@ fn kernel_cmdline(base: &OsStr, deployment_id: &str) -> io::Result<OsString> {
         ));
     }
     const SELECTOR: &[u8] = b"td.deployment=";
-    if bytes
-        .windows(SELECTOR.len())
-        .any(|window| window == SELECTOR)
-    {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "kernel cmdline already contains td.deployment=",
-        ));
+    for reserved in [
+        SELECTOR,
+        protocol::BOOKKEEPING_UNAVAILABLE_CMDLINE_TOKEN.as_bytes(),
+    ] {
+        if bytes
+            .windows(reserved.len())
+            .any(|window| window == reserved)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "kernel cmdline already contains reserved token {}",
+                    String::from_utf8_lossy(reserved)
+                ),
+            ));
+        }
     }
 
-    let token = format!("td.deployment={deployment_id}");
+    let mut token = format!("td.deployment={deployment_id}");
+    if bookkeeping_unavailable {
+        token.push(' ');
+        token.push_str(protocol::BOOKKEEPING_UNAVAILABLE_CMDLINE_TOKEN);
+    }
     let separator = usize::from(!bytes.is_empty());
     if bytes.len() + separator + token.len() + 1 > MAX_CMDLINE_BYTES {
         return Err(io::Error::new(
@@ -898,28 +1376,89 @@ fn report_fallback(selection: &Selection) -> io::Result<()> {
     Ok(())
 }
 
-fn report_boot_selection(selection: &Selection) -> io::Result<()> {
-    let marker = match selection.slot {
+fn report_boot_decision(decision: &BootDecision) -> io::Result<()> {
+    if let Some(error) = &decision.bookkeeping_error {
+        writeln!(
+            io::stderr(),
+            "{}: {error}",
+            protocol::BOOKKEEPING_UNAVAILABLE_MARKER
+        )?;
+    }
+    if let Some(error) = &decision.current_error {
+        writeln!(
+            io::stderr(),
+            "{}: current rejected ({error}); using previous {}",
+            protocol::CURRENT_REJECTED_MARKER,
+            decision.deployment_id
+        )?;
+    }
+    if let Some(exhausted) = &decision.exhausted_deployment {
+        if let Some(error) = &decision.fallback_error {
+            writeln!(
+                io::stderr(),
+                "{} {exhausted}: previous unavailable ({error}); retrying {}",
+                protocol::ATTEMPTS_EXHAUSTED_MARKER,
+                decision.deployment_id
+            )?;
+        } else {
+            writeln!(
+                io::stderr(),
+                "{} {exhausted} -> {}",
+                protocol::ATTEMPTS_EXHAUSTED_MARKER,
+                decision.deployment_id
+            )?;
+        }
+    }
+    if let Some(remaining) = decision.remaining_attempts {
+        writeln!(
+            io::stderr(),
+            "{} {} remaining={remaining}",
+            protocol::ATTEMPT_CONSUMED_MARKER,
+            decision.deployment_id
+        )?;
+    }
+    let marker = match decision.slot {
         "current" => protocol::SELECTED_CURRENT_MARKER,
         "previous" => protocol::SELECTED_PREVIOUS_MARKER,
         _ => {
             return Err(invalid(format!(
-                "internal: unknown deployment slot {}",
-                selection.slot
+                "internal: unknown boot decision slot {}",
+                decision.slot
             )));
         }
     };
-    writeln!(io::stderr(), "{marker} {}", selection.deployment.id)
+    writeln!(io::stderr(), "{marker} {}", decision.deployment_id)
+}
+
+fn attempt_status(state: Option<u8>) -> String {
+    match state {
+        None => "successful".to_string(),
+        Some(0) => "exhausted".to_string(),
+        Some(remaining) => format!("pending remaining={remaining}"),
+    }
 }
 
 fn run_verify(root: &Path) -> io::Result<()> {
     let selection = select_deployment(root)?;
     report_fallback(&selection)?;
+    let state = read_attempt_state(root, &selection.deployment.id)?;
+    if selection.slot == "current" && state == Some(0) {
+        if let Ok(previous) =
+            verified_previous_decision(root, None, Some(selection.deployment.id.clone()))
+        {
+            return writeln!(
+                io::stdout(),
+                "previous {} successful current-exhausted={}",
+                previous.deployment_id,
+                selection.deployment.id
+            );
+        }
+    }
+    let status = attempt_status(state);
     writeln!(
         io::stdout(),
-        "{} {}",
-        selection.slot,
-        selection.deployment.id
+        "{} {} {status}",
+        selection.slot, selection.deployment.id
     )
 }
 
@@ -1171,6 +1710,66 @@ fn prepare_update_mountpoint(mountpoint: &Path, device_id: u64) -> io::Result<()
     Ok(())
 }
 
+enum WritableVolumeFailure<T> {
+    Transaction(io::Error),
+    Committed { value: T, unmount_error: io::Error },
+    Mounted(io::Error),
+}
+
+impl<T> WritableVolumeFailure<T> {
+    fn into_io(self) -> io::Error {
+        match self {
+            WritableVolumeFailure::Transaction(error) => error,
+            WritableVolumeFailure::Committed {
+                value: _,
+                unmount_error,
+            } => io::Error::new(
+                unmount_error.kind(),
+                format!("deployment transaction committed, but {unmount_error}"),
+            ),
+            WritableVolumeFailure::Mounted(error) => error,
+        }
+    }
+}
+
+fn finish_writable_operation<T>(
+    result: io::Result<T>,
+    unmounted: io::Result<()>,
+) -> Result<T, WritableVolumeFailure<T>> {
+    match (result, unmounted) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Err(error), Ok(())) => Err(WritableVolumeFailure::Transaction(error)),
+        (Ok(value), Err(unmount_error)) => Err(WritableVolumeFailure::Committed {
+            value,
+            unmount_error,
+        }),
+        (Err(operation_error), Err(unmount_error)) => {
+            Err(WritableVolumeFailure::Mounted(io::Error::new(
+                operation_error.kind(),
+                format!("{operation_error}; additionally {unmount_error}"),
+            )))
+        }
+    }
+}
+
+fn run_on_prelocked_writable_volume<T>(
+    device: &Path,
+    mountpoint: &Path,
+    device_id: u64,
+    operation: impl FnOnce(&Path) -> io::Result<T>,
+) -> Result<T, WritableVolumeFailure<T>> {
+    prepare_update_mountpoint(mountpoint, device_id).map_err(WritableVolumeFailure::Transaction)?;
+    run_command(
+        &mut writable_mount_command(device, mountpoint),
+        "read-write Btrfs mount",
+    )
+    .map_err(WritableVolumeFailure::Transaction)?;
+
+    let result = operation(mountpoint);
+    let unmounted = run_command(&mut unmount_command(mountpoint), "Btrfs unmount");
+    finish_writable_operation(result, unmounted)
+}
+
 fn run_on_writable_volume<T>(
     device: &Path,
     mountpoint: &Path,
@@ -1179,54 +1778,191 @@ fn run_on_writable_volume<T>(
     require_absolute(device, "volume device")?;
     require_absolute(mountpoint, "mountpoint")?;
     let (_transaction_lock, _device_lock, device_id) = acquire_update_locks(device)?;
-    prepare_update_mountpoint(mountpoint, device_id)?;
-    run_command(
-        &mut writable_mount_command(device, mountpoint),
-        "read-write Btrfs mount",
-    )?;
+    run_on_prelocked_writable_volume(device, mountpoint, device_id, operation)
+        .map_err(WritableVolumeFailure::into_io)
+}
 
-    let result = operation(mountpoint);
-    let unmounted = run_command(&mut unmount_command(mountpoint), "Btrfs unmount");
-    match (result, unmounted) {
-        (Ok(value), Ok(())) => Ok(value),
-        (Err(error), Ok(())) => Err(error),
-        (Ok(_), Err(error)) => Err(io::Error::new(
-            error.kind(),
-            format!("deployment transaction committed, but {error}"),
-        )),
-        (Err(operation_error), Err(unmount_error)) => Err(io::Error::new(
-            operation_error.kind(),
-            format!("{operation_error}; additionally {unmount_error}"),
-        )),
+fn read_only_current(root: &Path) -> Option<(BootDecision, Deployment)> {
+    let id = read_selector(root, "current").ok()?;
+    if read_attempt_state(root, &id).ok()?.is_some() {
+        return None;
     }
+    let deployment = verify_deployment(root, &id).ok()?;
+    Some((
+        BootDecision {
+            slot: "current",
+            deployment_id: id,
+            current_error: None,
+            exhausted_deployment: None,
+            fallback_error: None,
+            bookkeeping_error: None,
+            remaining_attempts: None,
+        },
+        deployment,
+    ))
+}
+
+fn read_only_recovery(
+    root: &Path,
+    transaction_error: &io::Error,
+) -> io::Result<(BootDecision, Deployment)> {
+    let bookkeeping_error = Some(transaction_error.to_string());
+    let current = verify_slot(root, "current");
+    let previous = verify_slot(root, "previous");
+    // The writable transaction owns attempt-state authority; recovery can only trust
+    // verified payloads and the invariant that activation retains previous as fallback.
+    match (current, previous) {
+        (Ok(current), Ok(previous)) if previous.id != current.id => Ok((
+            BootDecision {
+                slot: "previous",
+                deployment_id: previous.id.clone(),
+                current_error: None,
+                exhausted_deployment: None,
+                fallback_error: None,
+                bookkeeping_error,
+                remaining_attempts: None,
+            },
+            previous,
+        )),
+        (Ok(current), _) => Ok((
+            BootDecision {
+                slot: "current",
+                deployment_id: current.id.clone(),
+                current_error: None,
+                exhausted_deployment: None,
+                fallback_error: None,
+                bookkeeping_error,
+                remaining_attempts: None,
+            },
+            current,
+        )),
+        (Err(current_error), Ok(previous)) => Ok((
+            BootDecision {
+                slot: "previous",
+                deployment_id: previous.id.clone(),
+                current_error: Some(current_error.to_string()),
+                exhausted_deployment: None,
+                fallback_error: None,
+                bookkeeping_error,
+                remaining_attempts: None,
+            },
+            previous,
+        )),
+        (Err(current_error), Err(previous_error)) => Err(invalid(format!(
+            "boot state transaction failed ({transaction_error}); no read-only recovery: \
+             current rejected ({current_error}); previous rejected ({previous_error})"
+        ))),
+    }
+}
+
+fn kexec_boot_decision(
+    deployment: Deployment,
+    decision: &BootDecision,
+    base_cmdline: &OsStr,
+) -> io::Result<()> {
+    report_boot_decision(decision)?;
+    let cmdline = kernel_cmdline(
+        base_cmdline,
+        &decision.deployment_id,
+        decision.bookkeeping_error.is_some(),
+    )?;
+    let Deployment {
+        kernel, initramfs, ..
+    } = deployment;
+    run_command(
+        &mut kexec_command(kernel, initramfs, cmdline.as_os_str()),
+        "td-kexec",
+    )?;
+    Err(io::Error::other(
+        "td-kexec returned without booting the verified deployment",
+    ))
 }
 
 fn run_boot(device: &Path, mountpoint: &Path, base_cmdline: &OsStr) -> io::Result<()> {
     require_absolute(device, "volume device")?;
     require_absolute(mountpoint, "mountpoint")?;
-    fs::create_dir_all(mountpoint)?;
-    require_real_directory(mountpoint, "mountpoint")?;
+    let (_transaction_lock, _device_lock, device_id) = acquire_update_locks(device)?;
+    prepare_update_mountpoint(mountpoint, device_id)?;
+    run_command(
+        &mut mount_command(device, mountpoint),
+        "read-only Btrfs mount",
+    )?;
+    if let Some((decision, deployment)) = read_only_current(mountpoint) {
+        let result = kexec_boot_decision(deployment, &decision, base_cmdline);
+        best_effort_unmount(mountpoint);
+        return result;
+    }
+    if let Err(transaction_error) =
+        run_command(&mut unmount_command(mountpoint), "read-only Btrfs unmount")
+    {
+        let result = (|| {
+            let (decision, deployment) = read_only_recovery(mountpoint, &transaction_error)?;
+            kexec_boot_decision(deployment, &decision, base_cmdline)
+        })();
+        best_effort_unmount(mountpoint);
+        return result;
+    }
 
+    let decision =
+        match run_on_prelocked_writable_volume(device, mountpoint, device_id, |root| {
+            select_boot_deployment(root)
+        }) {
+            Ok(decision) => decision,
+            Err(WritableVolumeFailure::Committed {
+                value: decision,
+                unmount_error,
+            }) => {
+                let result = (|| {
+                    writeln!(
+                        io::stderr(),
+                        "td-boot: selection committed but Btrfs unmount failed \
+                         ({unmount_error}); booting the committed deployment"
+                    )?;
+                    let deployment = verify_deployment(mountpoint, &decision.deployment_id)?;
+                    kexec_boot_decision(deployment, &decision, base_cmdline)
+                })();
+                best_effort_unmount(mountpoint);
+                return result;
+            }
+            Err(WritableVolumeFailure::Mounted(transaction_error)) => {
+                let result = (|| {
+                    let (decision, deployment) =
+                        read_only_recovery(mountpoint, &transaction_error)?;
+                    kexec_boot_decision(deployment, &decision, base_cmdline)
+                })();
+                best_effort_unmount(mountpoint);
+                return result;
+            }
+            Err(WritableVolumeFailure::Transaction(transaction_error)) => {
+                // Update APIs fail closed on semantic errors; PID 1 still tries the
+                // verified payload-only recovery path before giving up.
+                best_effort_unmount(mountpoint);
+                prepare_update_mountpoint(mountpoint, device_id)?;
+                run_command(
+                    &mut mount_command(device, mountpoint),
+                    "read-only Btrfs recovery mount",
+                )?;
+                let result = (|| {
+                    let (decision, deployment) =
+                        read_only_recovery(mountpoint, &transaction_error)?;
+                    kexec_boot_decision(deployment, &decision, base_cmdline)
+                })();
+                best_effort_unmount(mountpoint);
+                return result;
+            }
+        };
+
+    prepare_update_mountpoint(mountpoint, device_id)?;
     run_command(
         &mut mount_command(device, mountpoint),
         "read-only Btrfs mount",
     )?;
 
     let result = (|| {
-        let selection = select_deployment(mountpoint)?;
-        report_fallback(&selection)?;
-        report_boot_selection(&selection)?;
-        let cmdline = kernel_cmdline(base_cmdline, &selection.deployment.id)?;
-        let Deployment {
-            kernel, initramfs, ..
-        } = selection.deployment;
-        run_command(
-            &mut kexec_command(kernel, initramfs, cmdline.as_os_str()),
-            "td-kexec",
-        )?;
-        Err(io::Error::other(
-            "td-kexec returned without booting the verified deployment",
-        ))
+        // The writable transaction closed its payload handles before unmounting.
+        // Reverify under the mount whose handles are passed to kexec.
+        let deployment = verify_deployment(mountpoint, &decision.deployment_id)?;
+        kexec_boot_decision(deployment, &decision, base_cmdline)
     })();
     best_effort_unmount(mountpoint);
     result
@@ -1240,6 +1976,55 @@ fn run_install(device: &Path, mountpoint: &Path, source: &Path) -> io::Result<()
 
 fn run_rollback(device: &Path, mountpoint: &Path) -> io::Result<()> {
     let id = run_on_writable_volume(device, mountpoint, rollback_deployment)?;
+    writeln!(io::stdout(), "{id}")
+}
+
+fn run_success(device: &Path, mountpoint: &Path, deployment_id: &str) -> io::Result<()> {
+    let cmdline = read_bounded_real_file(
+        Path::new("/proc/cmdline"),
+        "kernel command line",
+        MAX_CMDLINE_BYTES as u64,
+    )?;
+    match success_disposition(&cmdline, deployment_id) {
+        SuccessDisposition::ConfirmRecovery => {
+            writeln!(io::stdout(), "{deployment_id}")?;
+            return Ok(());
+        }
+        SuccessDisposition::RejectRecovery => {
+            return Err(invalid(format!(
+                "recovery command line does not select deployment {deployment_id}"
+            )));
+        }
+        SuccessDisposition::Record => {}
+    }
+    require_absolute(device, "volume device")?;
+    require_absolute(mountpoint, "mountpoint")?;
+    let (_transaction_lock, _device_lock, device_id) = acquire_update_locks(device)?;
+    prepare_update_mountpoint(mountpoint, device_id)?;
+    run_command(
+        &mut mount_command(device, mountpoint),
+        "read-only Btrfs mount",
+    )?;
+    let state = current_attempt_state(mountpoint, deployment_id);
+    let unmounted = run_command(&mut unmount_command(mountpoint), "read-only Btrfs unmount");
+    let state = match (state, unmounted) {
+        (Ok(state), Ok(())) => state,
+        (Err(error), Ok(())) | (Ok(_), Err(error)) => return Err(error),
+        (Err(state_error), Err(unmount_error)) => {
+            return Err(io::Error::new(
+                state_error.kind(),
+                format!("{state_error}; additionally {unmount_error}"),
+            ));
+        }
+    };
+    if state.is_none() {
+        writeln!(io::stdout(), "{deployment_id}")?;
+        return Ok(());
+    }
+    let id = run_on_prelocked_writable_volume(device, mountpoint, device_id, |root| {
+        mark_deployment_successful(root, deployment_id)
+    })
+    .map_err(WritableVolumeFailure::into_io)?;
     writeln!(io::stdout(), "{id}")
 }
 
@@ -1262,6 +2047,11 @@ fn run() -> io::Result<()> {
             source,
         } => run_install(&device, &mountpoint, &source),
         Mode::Rollback { device, mountpoint } => run_rollback(&device, &mountpoint),
+        Mode::Success {
+            device,
+            mountpoint,
+            deployment_id,
+        } => run_success(&device, &mountpoint, &deployment_id),
     }
 }
 
@@ -1394,6 +2184,15 @@ mod tests {
             parse_args(args(&["rollback", "/dev/vda", "/run/td-update"])),
             Ok(Mode::Rollback { .. })
         ));
+        assert!(matches!(
+            parse_args(args(&[
+                "success",
+                "/dev/vda",
+                "/run/td-update",
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            ])),
+            Ok(Mode::Success { .. })
+        ));
         assert!(parse_args(args(&["verify"])).is_err());
         assert!(parse_args(args(&[
             "root-loop",
@@ -1406,6 +2205,7 @@ mod tests {
         assert!(parse_args(args(&["install", "/dev/vda", "/volume"])).is_err());
         assert!(parse_args(args(&["rollback", "/volume"])).is_err());
         assert!(parse_args(args(&["rollback", "/dev/vda", "/volume", "extra"])).is_err());
+        assert!(parse_args(args(&["success", "/dev/vda", "/volume", "not-a-digest"])).is_err());
         assert!(parse_args(args(&["unknown", "/volume"])).is_err());
     }
 
@@ -1448,6 +2248,10 @@ mod tests {
         assert_eq!(read_selector(&fixture.root, "previous").unwrap(), initial);
         assert_eq!(read_selector(&fixture.root, "current").unwrap(), candidate);
         assert_eq!(verify_slot(&fixture.root, "current").unwrap().id, candidate);
+        assert_eq!(
+            read_attempt_state(&fixture.root, &candidate).unwrap(),
+            Some(protocol::DEFAULT_BOOT_ATTEMPTS)
+        );
         let entries = fs::read_dir(fixture.root.join("td/deployments"))
             .unwrap()
             .map(|entry| entry.unwrap().file_name())
@@ -1458,7 +2262,25 @@ mod tests {
     }
 
     #[test]
-    fn repeated_install_preserves_the_rollback_target() {
+    fn failed_pending_mark_keeps_the_verified_current_as_previous() {
+        let fixture = Fixture::new();
+        let current = fixture.valid_deployment();
+        fixture.selector("current", &current);
+        fixture.selector("previous", &current);
+        let (source, previous) = fixture.source_bundle("previous", "previous");
+        let bundle = open_bundle(&source).unwrap();
+        publish_bundle(&fixture.root, bundle).unwrap();
+        replace_selector(&fixture.root, "previous", &previous).unwrap();
+        let attempts = attempts_directory(&fixture.root, true).unwrap().unwrap();
+        fs::create_dir(attempts.join(&previous)).unwrap();
+
+        assert!(install_deployment(&fixture.root, &source).is_err());
+        assert_eq!(read_selector(&fixture.root, "current").unwrap(), current);
+        assert_eq!(read_selector(&fixture.root, "previous").unwrap(), current);
+    }
+
+    #[test]
+    fn repeated_pending_install_preserves_budget_and_rollback_target() {
         let fixture = Fixture::new();
         let initial = fixture.valid_deployment();
         fixture.selector("current", &initial);
@@ -1466,14 +2288,24 @@ mod tests {
         let (source, candidate) = fixture.source_bundle("candidate", "next");
 
         install_deployment(&fixture.root, &source).unwrap();
+        let first = select_boot_deployment(&fixture.root).unwrap();
+        assert_eq!(
+            first.remaining_attempts,
+            Some(protocol::DEFAULT_BOOT_ATTEMPTS - 1)
+        );
         install_deployment(&fixture.root, &source).unwrap();
 
         assert_eq!(read_selector(&fixture.root, "current").unwrap(), candidate);
         assert_eq!(read_selector(&fixture.root, "previous").unwrap(), initial);
+        // Reinstall is idempotent, not an escape from automatic rollback.
+        assert_eq!(
+            read_attempt_state(&fixture.root, &candidate).unwrap(),
+            Some(protocol::DEFAULT_BOOT_ATTEMPTS - 1)
+        );
     }
 
     #[test]
-    fn repeated_install_repairs_a_broken_previous_selector() {
+    fn repeated_pending_install_rejects_a_broken_previous_selector() {
         let fixture = Fixture::new();
         let initial = fixture.valid_deployment();
         fixture.selector("current", &initial);
@@ -1482,13 +2314,32 @@ mod tests {
 
         install_deployment(&fixture.root, &source).unwrap();
         fs::remove_dir_all(fixture.root.join("td/deployments").join(initial)).unwrap();
-        install_deployment(&fixture.root, &source).unwrap();
+        let error = install_deployment(&fixture.root, &source).unwrap_err();
 
+        assert!(error
+            .to_string()
+            .contains("invalid fallback with a pending deployment"));
         assert_eq!(read_selector(&fixture.root, "current").unwrap(), candidate);
-        assert_eq!(
-            read_selector(&fixture.root, "previous").unwrap(),
-            candidate
-        );
+        assert!(verify_slot(&fixture.root, "previous").is_err());
+    }
+
+    #[test]
+    fn repeated_install_rejects_a_pending_previous_deployment() {
+        let fixture = Fixture::new();
+        let initial = fixture.valid_deployment();
+        fixture.selector("current", &initial);
+        fixture.selector("previous", &initial);
+        let (source, candidate) = fixture.source_bundle("candidate", "next");
+
+        install_deployment(&fixture.root, &source).unwrap();
+        write_attempt_state(&fixture.root, &initial, 1).unwrap();
+        let error = install_deployment(&fixture.root, &source).unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("refusing to retain pending deployment"));
+        assert_eq!(read_selector(&fixture.root, "current").unwrap(), candidate);
+        assert_eq!(read_selector(&fixture.root, "previous").unwrap(), initial);
     }
 
     #[test]
@@ -1673,6 +2524,24 @@ mod tests {
     }
 
     #[test]
+    fn rollback_rejects_a_pending_previous_without_moving_current() {
+        let fixture = Fixture::new();
+        let initial = fixture.valid_deployment();
+        fixture.selector("current", &initial);
+        fixture.selector("previous", &initial);
+        let (source, candidate) = fixture.source_bundle("candidate", "next");
+        install_deployment(&fixture.root, &source).unwrap();
+        fs::remove_file(fixture.root.join("td/boot/previous")).unwrap();
+        fixture.selector("previous", &candidate);
+
+        let error = rollback_deployment(&fixture.root).unwrap_err();
+
+        assert!(error.to_string().contains("is not marked successful"));
+        assert_eq!(read_selector(&fixture.root, "current").unwrap(), candidate);
+        assert_eq!(read_selector(&fixture.root, "previous").unwrap(), candidate);
+    }
+
+    #[test]
     fn first_install_bootstraps_both_selectors() {
         let fixture = Fixture::new();
         let (source, candidate) = fixture.source_bundle("candidate", "first");
@@ -1683,6 +2552,204 @@ mod tests {
         );
         assert_eq!(read_selector(&fixture.root, "current").unwrap(), candidate);
         assert_eq!(read_selector(&fixture.root, "previous").unwrap(), candidate);
+        assert_eq!(read_attempt_state(&fixture.root, &candidate).unwrap(), None);
+    }
+
+    #[test]
+    fn attempt_state_parser_is_strict() {
+        assert_eq!(
+            parse_attempt_state(b"td-boot-attempt-v1\nremaining 3\n").unwrap(),
+            3
+        );
+        for malformed in [
+            b"".as_slice(),
+            b"td-boot-attempt-v1\nremaining 3".as_slice(),
+            b"td-boot-attempt-v1\nremaining 4\n".as_slice(),
+            b"td-boot-attempt-v1\nremaining 03\n".as_slice(),
+            b"td-boot-attempt-v1\nremaining 3\nextra\n".as_slice(),
+            b"td-boot-attempt-v2\nremaining 3\n".as_slice(),
+        ] {
+            assert!(parse_attempt_state(malformed).is_err());
+        }
+        assert_eq!(attempt_status(None), "successful");
+        assert_eq!(attempt_status(Some(0)), "exhausted");
+        assert_eq!(attempt_status(Some(2)), "pending remaining=2");
+        let fixture = Fixture::new();
+        assert!(read_attempt_state(&fixture.root, "../current").is_err());
+    }
+
+    #[test]
+    fn invalid_attempts_directory_recovers_previous_without_moving_current() {
+        let fixture = Fixture::new();
+        let initial = fixture.valid_deployment();
+        fixture.selector("current", &initial);
+        fixture.selector("previous", &initial);
+        let (source, candidate) = fixture.source_bundle("candidate", "next");
+        install_deployment(&fixture.root, &source).unwrap();
+        let attempts = fixture.root.join(protocol::ATTEMPTS_DIR);
+        fs::set_permissions(&attempts, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let error = select_boot_deployment(&fixture.root).err().unwrap();
+        let (decision, _) = read_only_recovery(&fixture.root, &error).unwrap();
+
+        assert!(error.to_string().contains("mode 0700"));
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+        assert_eq!(decision.slot, "previous");
+        assert_eq!(decision.deployment_id, initial);
+        assert_eq!(read_selector(&fixture.root, "current").unwrap(), candidate);
+    }
+
+    #[test]
+    fn state_owner_policy_separates_production_from_fixtures() {
+        assert!(state_owner_allowed(0, None));
+        assert!(!state_owner_allowed(1, None));
+        assert!(!state_owner_allowed(u32::MAX, None));
+        assert!(state_owner_allowed(1000, Some(1000)));
+        assert!(!state_owner_allowed(1001, Some(1000)));
+    }
+
+    #[test]
+    fn pending_boots_consume_budget_then_promote_previous() {
+        let fixture = Fixture::new();
+        let initial = fixture.valid_deployment();
+        fixture.selector("current", &initial);
+        fixture.selector("previous", &initial);
+        let (source, candidate) = fixture.source_bundle("candidate", "next");
+        install_deployment(&fixture.root, &source).unwrap();
+
+        for remaining in [2, 1, 0] {
+            let decision = select_boot_deployment(&fixture.root).unwrap();
+            assert_eq!(decision.slot, "current");
+            assert_eq!(decision.deployment_id, candidate);
+            assert_eq!(decision.remaining_attempts, Some(remaining));
+            assert!(decision.exhausted_deployment.is_none());
+        }
+
+        let decision = select_boot_deployment(&fixture.root).unwrap();
+        assert_eq!(decision.slot, "previous");
+        assert_eq!(decision.deployment_id, initial);
+        assert_eq!(decision.exhausted_deployment, Some(candidate.clone()));
+        assert_eq!(read_selector(&fixture.root, "current").unwrap(), initial);
+        assert_eq!(
+            read_attempt_state(&fixture.root, &candidate).unwrap(),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn exhausted_current_still_boots_when_previous_is_unusable() {
+        let fixture = Fixture::new();
+        let initial = fixture.valid_deployment();
+        fixture.selector("current", &initial);
+        fixture.selector("previous", &initial);
+        let (source, candidate) = fixture.source_bundle("candidate", "next");
+        install_deployment(&fixture.root, &source).unwrap();
+        fs::remove_dir_all(fixture.root.join("td/deployments").join(initial)).unwrap();
+        for _ in 0..protocol::DEFAULT_BOOT_ATTEMPTS {
+            select_boot_deployment(&fixture.root).unwrap();
+        }
+
+        let decision = select_boot_deployment(&fixture.root).unwrap();
+
+        assert_eq!(decision.slot, "current");
+        assert_eq!(decision.deployment_id, candidate);
+        assert_eq!(
+            decision.exhausted_deployment,
+            Some(decision.deployment_id.clone())
+        );
+        assert!(decision.fallback_error.is_some());
+        assert_eq!(read_selector(&fixture.root, "current").unwrap(), candidate);
+    }
+
+    #[test]
+    fn successful_boot_clears_attempt_budget() {
+        let fixture = Fixture::new();
+        let initial = fixture.valid_deployment();
+        fixture.selector("current", &initial);
+        fixture.selector("previous", &initial);
+        let (source, candidate) = fixture.source_bundle("candidate", "next");
+        install_deployment(&fixture.root, &source).unwrap();
+        select_boot_deployment(&fixture.root).unwrap();
+        assert_eq!(
+            current_attempt_state(&fixture.root, &candidate).unwrap(),
+            Some(protocol::DEFAULT_BOOT_ATTEMPTS - 1)
+        );
+
+        assert_eq!(
+            mark_deployment_successful(&fixture.root, &candidate).unwrap(),
+            candidate
+        );
+        assert_eq!(read_attempt_state(&fixture.root, &candidate).unwrap(), None);
+        assert_eq!(
+            current_attempt_state(&fixture.root, &candidate).unwrap(),
+            None
+        );
+        let decision = select_boot_deployment(&fixture.root).unwrap();
+        assert_eq!(decision.deployment_id, candidate);
+        assert_eq!(decision.remaining_attempts, None);
+    }
+
+    #[test]
+    fn success_rejects_a_non_current_deployment() {
+        let fixture = Fixture::new();
+        let initial = fixture.valid_deployment();
+        fixture.selector("current", &initial);
+        fixture.selector("previous", &initial);
+        let (source, candidate) = fixture.source_bundle("candidate", "next");
+        install_deployment(&fixture.root, &source).unwrap();
+
+        let error = mark_deployment_successful(&fixture.root, &initial).unwrap_err();
+
+        assert!(error.to_string().contains("is not current"));
+        assert_eq!(
+            read_attempt_state(&fixture.root, &candidate).unwrap(),
+            Some(protocol::DEFAULT_BOOT_ATTEMPTS)
+        );
+    }
+
+    #[test]
+    fn malformed_attempt_state_promotes_verified_previous() {
+        let fixture = Fixture::new();
+        let initial = fixture.valid_deployment();
+        fixture.selector("current", &initial);
+        fixture.selector("previous", &initial);
+        let (source, candidate) = fixture.source_bundle("candidate", "next");
+        install_deployment(&fixture.root, &source).unwrap();
+        fs::write(
+            fixture.root.join(protocol::ATTEMPTS_DIR).join(&candidate),
+            b"malformed\n",
+        )
+        .unwrap();
+
+        let decision = select_boot_deployment(&fixture.root).unwrap();
+
+        assert_eq!(decision.slot, "previous");
+        assert_eq!(decision.deployment_id, initial);
+        assert!(decision.current_error.is_some());
+        assert_eq!(read_selector(&fixture.root, "current").unwrap(), initial);
+    }
+
+    #[test]
+    fn malformed_attempt_state_keeps_verified_current_when_previous_is_unusable() {
+        let fixture = Fixture::new();
+        let initial = fixture.valid_deployment();
+        fixture.selector("current", &initial);
+        fixture.selector("previous", &initial);
+        let (source, candidate) = fixture.source_bundle("candidate", "next");
+        install_deployment(&fixture.root, &source).unwrap();
+        fs::remove_dir_all(fixture.root.join("td/deployments").join(initial)).unwrap();
+        fs::write(
+            fixture.root.join(protocol::ATTEMPTS_DIR).join(&candidate),
+            b"malformed\n",
+        )
+        .unwrap();
+
+        let decision = select_boot_deployment(&fixture.root).unwrap();
+
+        assert_eq!(decision.slot, "current");
+        assert_eq!(decision.deployment_id, candidate);
+        assert!(decision.bookkeeping_error.is_some());
+        assert_eq!(read_selector(&fixture.root, "current").unwrap(), candidate);
     }
 
     #[test]
@@ -1694,6 +2761,52 @@ mod tests {
         assert_eq!(selected.slot, "current");
         assert_eq!(selected.deployment.id, id);
         assert!(selected.current_error.is_none());
+    }
+
+    #[test]
+    fn read_only_fast_path_accepts_only_successful_current() {
+        let fixture = Fixture::new();
+        let initial = fixture.valid_deployment();
+        fixture.selector("current", &initial);
+        fixture.selector("previous", &initial);
+        assert_eq!(
+            read_only_current(&fixture.root).map(|(decision, _)| decision.deployment_id),
+            Some(initial.clone())
+        );
+
+        let (source, candidate) = fixture.source_bundle("candidate", "next");
+        install_deployment(&fixture.root, &source).unwrap();
+
+        assert!(read_only_current(&fixture.root).is_none());
+        assert_eq!(read_selector(&fixture.root, "current").unwrap(), candidate);
+    }
+
+    #[test]
+    fn read_only_recovery_prefers_previous_but_keeps_a_verified_current_available() {
+        let fixture = Fixture::new();
+        let initial = fixture.valid_deployment();
+        fixture.selector("current", &initial);
+        fixture.selector("previous", &initial);
+        let (source, candidate) = fixture.source_bundle("candidate", "next");
+        install_deployment(&fixture.root, &source).unwrap();
+        let transaction_error = io::Error::other("read-write mount rejected");
+
+        let (decision, _) = read_only_recovery(&fixture.root, &transaction_error).unwrap();
+
+        assert_eq!(decision.slot, "previous");
+        assert_eq!(decision.deployment_id, initial);
+        assert!(decision.bookkeeping_error.is_some());
+
+        fs::remove_dir_all(
+            fixture
+                .root
+                .join("td/deployments")
+                .join(&decision.deployment_id),
+        )
+        .unwrap();
+        let (decision, _) = read_only_recovery(&fixture.root, &transaction_error).unwrap();
+        assert_eq!(decision.slot, "current");
+        assert_eq!(decision.deployment_id, candidate);
     }
 
     #[test]
@@ -1718,6 +2831,35 @@ mod tests {
         assert_eq!(selected.slot, "previous");
         assert_eq!(selected.deployment.id, previous);
         assert!(selected.current_error.is_some());
+    }
+
+    #[test]
+    fn boot_selection_promotes_a_verified_previous_after_current_corruption() {
+        let fixture = Fixture::new();
+        let initial = fixture.valid_deployment();
+        fixture.selector("current", &initial);
+        fixture.selector("previous", &initial);
+        let (source, candidate) = fixture.source_bundle("candidate", "next");
+        install_deployment(&fixture.root, &source).unwrap();
+        fs::write(
+            fixture
+                .root
+                .join("td/deployments")
+                .join(candidate)
+                .join("root.erofs"),
+            b"tampered\n",
+        )
+        .unwrap();
+
+        let selected = select_boot_deployment(&fixture.root).unwrap();
+
+        assert_eq!(selected.slot, "previous");
+        assert_eq!(selected.deployment_id, initial);
+        assert!(selected.current_error.is_some());
+        assert_eq!(
+            read_selector(&fixture.root, "current").unwrap(),
+            selected.deployment_id
+        );
     }
 
     #[test]
@@ -1792,14 +2934,61 @@ mod tests {
     fn cmdline_appends_one_selector_and_rejects_ambiguity() {
         let id = "b".repeat(64);
         assert_eq!(
-            kernel_cmdline(OsStr::new("console=ttyS0 quiet"), &id).unwrap(),
+            kernel_cmdline(OsStr::new("console=ttyS0 quiet"), &id, false).unwrap(),
             OsString::from(format!("console=ttyS0 quiet td.deployment={id}"))
         );
-        assert!(kernel_cmdline(OsStr::new("td.deployment=old"), &id).is_err());
-        assert!(kernel_cmdline(OsStr::new("\"td.deployment=old\""), &id).is_err());
-        assert!(kernel_cmdline(OsStr::new("foo=\"unterminated"), &id).is_err());
-        assert!(kernel_cmdline(OsStr::new("foo\\ bar"), &id).is_err());
-        assert!(kernel_cmdline(OsStr::from_bytes(b"quiet\nbad"), &id).is_err());
+        assert_eq!(
+            kernel_cmdline(OsStr::new("console=ttyS0"), &id, true).unwrap(),
+            OsString::from(format!(
+                "console=ttyS0 td.deployment={id} {}",
+                protocol::BOOKKEEPING_UNAVAILABLE_CMDLINE_TOKEN
+            ))
+        );
+        assert!(kernel_cmdline(OsStr::new("td.deployment=old"), &id, false).is_err());
+        assert!(kernel_cmdline(
+            OsStr::new(protocol::BOOKKEEPING_UNAVAILABLE_CMDLINE_TOKEN),
+            &id,
+            false
+        )
+        .is_err());
+        assert!(kernel_cmdline(OsStr::new("\"td.deployment=old\""), &id, false).is_err());
+        assert!(kernel_cmdline(OsStr::new("foo=\"unterminated"), &id, false).is_err());
+        assert!(kernel_cmdline(OsStr::new("foo\\ bar"), &id, false).is_err());
+        assert!(kernel_cmdline(OsStr::from_bytes(b"quiet\nbad"), &id, false).is_err());
+    }
+
+    #[test]
+    fn cmdline_token_matching_is_field_exact() {
+        let token = protocol::BOOKKEEPING_UNAVAILABLE_CMDLINE_TOKEN.as_bytes();
+        assert!(cmdline_has_token(
+            b"quiet td.boot-bookkeeping-unavailable=1 console=ttyS0\n",
+            token
+        ));
+        assert!(!cmdline_has_token(
+            b"quiet x=td.boot-bookkeeping-unavailable=1",
+            token
+        ));
+        assert!(!cmdline_has_token(
+            b"td.boot-bookkeeping-unavailable=10",
+            token
+        ));
+        let id = "a".repeat(64);
+        let matching = format!(
+            "td.deployment={id} {}",
+            protocol::BOOKKEEPING_UNAVAILABLE_CMDLINE_TOKEN
+        );
+        assert_eq!(
+            success_disposition(b"quiet console=ttyS0", &id),
+            SuccessDisposition::Record
+        );
+        assert_eq!(
+            success_disposition(matching.as_bytes(), &id),
+            SuccessDisposition::ConfirmRecovery
+        );
+        assert_eq!(
+            success_disposition(matching.as_bytes(), &"b".repeat(64)),
+            SuccessDisposition::RejectRecovery
+        );
     }
 
     #[test]
@@ -1807,11 +2996,11 @@ mod tests {
         let id = "c".repeat(64);
         let token_len = format!("td.deployment={id}").len();
         let accepted = "x".repeat(MAX_CMDLINE_BYTES - token_len - 2);
-        let output = kernel_cmdline(OsStr::new(&accepted), &id).unwrap();
+        let output = kernel_cmdline(OsStr::new(&accepted), &id, false).unwrap();
         assert_eq!(output.as_bytes().len() + 1, MAX_CMDLINE_BYTES);
 
         let rejected = "x".repeat(accepted.len() + 1);
-        assert!(kernel_cmdline(OsStr::new(&rejected), &id).is_err());
+        assert!(kernel_cmdline(OsStr::new(&rejected), &id, false).is_err());
     }
 
     #[test]
@@ -1836,6 +3025,49 @@ mod tests {
 37 25 0:36 / /run/td\\040update rw,nodev,nosuid,noexec - btrfs /dev/vda rw\n";
         assert!(mounted_btrfs_source(stacked, mountpoint).is_err());
         assert!(decode_mountinfo_field(b"/run/bad\\09x").is_err());
+    }
+
+    #[test]
+    fn writable_failures_preserve_transaction_outcomes() {
+        let operation = finish_writable_operation::<()>(
+            Err(invalid("invalid attempt state")),
+            Ok(()),
+        );
+        assert!(matches!(
+            operation,
+            Err(WritableVolumeFailure::Transaction(_))
+        ));
+
+        let storage_full = finish_writable_operation::<()>(
+            Err(io::Error::from(io::ErrorKind::StorageFull)),
+            Ok(()),
+        );
+        assert!(matches!(
+            storage_full,
+            Err(WritableVolumeFailure::Transaction(_))
+        ));
+
+        let io_failure =
+            finish_writable_operation::<()>(Err(io::Error::other("I/O error")), Ok(()));
+        assert!(matches!(
+            io_failure,
+            Err(WritableVolumeFailure::Transaction(_))
+        ));
+
+        let committed = finish_writable_operation(Ok(()), Err(io::Error::other("busy")));
+        assert!(matches!(
+            committed,
+            Err(WritableVolumeFailure::Committed { .. })
+        ));
+
+        let failed_and_busy = finish_writable_operation::<()>(
+            Err(invalid("invalid attempt state")),
+            Err(io::Error::other("busy")),
+        );
+        assert!(matches!(
+            failed_and_busy,
+            Err(WritableVolumeFailure::Mounted(_))
+        ));
     }
 
     #[test]

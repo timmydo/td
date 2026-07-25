@@ -24,8 +24,19 @@ nothing in the root is mutable.
 - **Content-addressed** — store paths, offline builds, and fixed-output
   sources verified by SHA-256. Deployment updates are verified into a hidden
   directory, flushed, atomically published by manifest hash, and activated
-  with a retained verified previous deployment for rollback. Install and
-  rollback transactions are serialized per block device through unmount.
+  with a retained verified previous deployment. Once a fallback exists, new
+  deployments receive three durable boot attempts; the first deployment is
+  trusted because it has nowhere to roll back. A healthy target acknowledges
+  its exact deployment, while an exhausted candidate automatically rolls back.
+  A corrupt current selector is durably repaired to its verified previous
+  deployment, and an explicit `td-boot rollback` remains available. Update
+  transactions and boot selection are serialized per block device through
+  unmount; verified read-only recovery remains available when a writable
+  bookkeeping transaction is unavailable and confirms health without attempting
+  to mutate that state.
+  Invalid bookkeeping ownership or modes are not repaired automatically:
+  verified recovery remains bootable, but a root operator must inspect and
+  repair the state before normal update acknowledgement resumes.
 
 ## Requirements
 
@@ -51,9 +62,12 @@ Btrfs volume, kexecs that deployment, loop-mounts its read-only EROFS root, and
 auto-logs you in as `tester` on the serial console. Type `exit` (or Ctrl-D) to
 power off; Ctrl-A X force-quits QEMU. The private test volume lasts for this
 interactive session and is discarded when QEMU exits; the headless
-`qemu-boot-system` check installs and boots a new deployment, rolls back and
-boots the retained prior deployment, preserves `/var` across those boots, and
-proves a corrupted current payload falls back to verified previous.
+`qemu-boot-system` check first proves a pending deployment can acknowledge and
+remain attempt-free, then recreates the volume, fails a candidate before the
+health target for three boots, preserves `/var` through that reused-volume
+sequence, and proves automatic rollback on the next boot. An explicitly
+read-only disk pass exercises selector-side bookkeeping recovery; a separate
+fixture proves corrupted-current fallback.
 
 ## Filesystem layout
 
