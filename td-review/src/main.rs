@@ -40,7 +40,8 @@ options:
   -h, --help          this text
 
 keys (TUI):
-  j/k move   enter review   f fetch   r reload   / filter   D delete   ? help   q quit
+  j/k move   enter review   f fetch base's remote   F fetch all   r reload
+  / filter   D delete   ? help   q quit
   in review: j/k or space/b scroll, p pager, a approve + land
 ";
 

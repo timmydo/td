@@ -2,7 +2,7 @@
 
 use std::io;
 
-use crate::git::{self, now_unix, Branch, Git};
+use crate::git::{self, now_unix, Branch, DefaultRemote, Git};
 use crate::land::{self, Outcome, Preview};
 use crate::term::{
     self, Frame, Key, Line, Style, Ui, CYAN, GRAY, GREEN, MAGENTA, RED, YELLOW,
@@ -312,7 +312,7 @@ impl App {
         }
         self.footer(
             f,
-            " enter review · f fetch · r reload · / filter · D delete · ? help · q quit",
+            " enter review · f/F fetch · r reload · / filter · D delete · ? help · q quit",
         );
     }
 
@@ -443,17 +443,8 @@ impl App {
                 self.reload()?;
                 self.note("reloaded", Style::fg(GREEN));
             }
-            Key::Char('f') => {
-                self.note("fetching all remotes…", Style::fg(YELLOW));
-                self.redraw(term)?;
-                let fetch = self.git.run(&["fetch", "--all", "--prune"])?;
-                if fetch.ok {
-                    self.reload()?;
-                    self.note("fetched", Style::fg(GREEN));
-                } else {
-                    self.note(format!("fetch failed: {}", fetch.failure()), Style::fg(RED));
-                }
-            }
+            Key::Char('f') => self.fetch(false, term)?,
+            Key::Char('F') => self.fetch(true, term)?,
             Key::Char('D') => {
                 if let Some(refname) =
                     self.view.get(self.sel).and_then(|&i| self.branches.get(i)).map(|b| b.refname.clone())
@@ -467,6 +458,45 @@ impl App {
         }
         self.top = scroll_top(self.sel, self.top, height);
         Ok(Flow::Continue)
+    }
+
+    /// `f` fetches only the base's remote; `F` sweeps every remote. A mirror
+    /// that is unreachable would otherwise fail the ordinary refresh.
+    fn fetch(&mut self, all: bool, term: &mut dyn Ui) -> io::Result<()> {
+        let mut remote = None;
+        if !all {
+            match self.git.default_remote(&self.base) {
+                Ok(DefaultRemote::Remote(name)) => remote = Some(name),
+                Ok(DefaultRemote::NoRemotes) => {
+                    self.note("no remotes configured", Style::fg(YELLOW));
+                    return Ok(());
+                }
+                Ok(DefaultRemote::Ambiguous) => {
+                    self.note("no default remote — F fetches all of them", Style::fg(YELLOW));
+                    return Ok(());
+                }
+                // Which remote to fetch is a query, not the fetch: report it
+                // like a failed fetch rather than ending the session.
+                Err(e) => {
+                    self.note(format!("fetch failed: {e}"), Style::fg(RED));
+                    return Ok(());
+                }
+            }
+        }
+        let (args, what): (Vec<&str>, &str) = match &remote {
+            Some(name) => (vec!["fetch", "--prune", "--end-of-options", name], name),
+            None => (vec!["fetch", "--all", "--prune"], "all remotes"),
+        };
+        self.note(format!("fetching {what}…"), Style::fg(YELLOW));
+        self.redraw(term)?;
+        let fetch = self.git.run(&args)?;
+        if fetch.ok {
+            self.reload()?;
+            self.note(format!("fetched {what}"), Style::fg(GREEN));
+        } else {
+            self.note(format!("fetch failed: {}", fetch.failure()), Style::fg(RED));
+        }
+        Ok(())
     }
 
     fn handle_review(&mut self, key: Key, term: &mut dyn Ui) -> io::Result<Flow> {
@@ -832,7 +862,8 @@ fn help_lines() -> Vec<Line> {
             ("space / b", "page down / up"),
             ("g / G", "first / last"),
             ("enter", "review the selected branch against the base"),
-            ("f", "git fetch --all --prune"),
+            ("f", "fetch + prune the base's remote (else origin)"),
+            ("F", "fetch + prune every remote, mirrors included"),
             ("r", "re-read branches"),
             ("/", "filter by branch name (esc clears)"),
             ("D", "delete the selected branch from every pushable remote"),
@@ -1248,6 +1279,114 @@ mod tests {
         assert!(app.prompt.is_some(), "the prompt was consumed by its own batch");
         let refs = git_in(&work, &["ls-remote", "--heads", "origin"]);
         assert!(refs.contains("work-0001-feature"), "the branch was deleted: {refs}");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// The refresh an integrator reaches for constantly must not depend on every
+    /// mirror being reachable: `f` goes to the base's remote alone, and only `F`
+    /// reaches the one that is down.
+    #[test]
+    #[ignore = "drives a real git repo; the sandbox gate has no git, the host preflight does"]
+    fn f_fetches_only_the_base_remote_and_capital_f_sweeps_them_all() {
+        let (root, work) = repo("fetch-default");
+        // A branch only a fetch of origin can discover, plus a mirror that is
+        // not there — pointed at a path that was never initialised.
+        git_in(&root.join("origin.git"), &["branch", "work-0002-later", "main"]);
+        git_in(&work, &["remote", "add", "backup", &root.join("gone.git").to_string_lossy()]);
+        let mut app = app_on(&work);
+        let mut ui = FakeUi::new();
+
+        app.handle(Key::Char('f'), &mut ui).unwrap();
+
+        assert_eq!(app.status, "fetched origin", "f must not have swept every remote");
+        assert!(
+            app.branches.iter().any(|b| b.refname == "origin/work-0002-later"),
+            "f did not actually fetch origin"
+        );
+
+        app.handle(Key::Char('F'), &mut ui).unwrap();
+
+        assert!(
+            app.status.starts_with("fetch failed"),
+            "F must reach the broken mirror: {}",
+            app.status
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Which remote `f` means. Guessing wrong would refresh a mirror while the
+    /// list keeps showing a stale copy of the remote that is landed to.
+    #[test]
+    #[ignore = "drives a real git repo; the sandbox gate has no git, the host preflight does"]
+    fn the_default_remote_is_the_one_the_base_tracks() {
+        let (root, work) = repo("default-remote");
+        let git = Git::discover(&work).unwrap();
+        let remote = |name: &str| DefaultRemote::Remote(name.to_string());
+        assert_eq!(git.default_remote("main").unwrap(), remote("origin"));
+
+        let mirror = root.join("mirror.git");
+        git_in(&root, &["init", "--bare", "-b", "main", &mirror.to_string_lossy()]);
+        git_in(&work, &["remote", "add", "mirror", &mirror.to_string_lossy()]);
+        git_in(&work, &["config", "branch.main.remote", "mirror"]);
+        assert_eq!(git.default_remote("main").unwrap(), remote("mirror"));
+
+        // `.` means the base tracks a LOCAL branch: not a remote, so origin.
+        git_in(&work, &["config", "branch.main.remote", "."]);
+        assert_eq!(git.default_remote("main").unwrap(), remote("origin"));
+
+        // A left-behind name (the remote was renamed or removed) is not a
+        // remote either — and a URL, which bare `git fetch` would take, has no
+        // tracking refs to prune.
+        git_in(&work, &["config", "branch.main.remote", "gone"]);
+        assert_eq!(git.default_remote("main").unwrap(), remote("origin"));
+        git_in(&work, &["config", "branch.main.remote", &mirror.to_string_lossy()]);
+        assert_eq!(git.default_remote("main").unwrap(), remote("origin"));
+
+        // Several remotes, none of them origin and none tracked: nothing is
+        // distinguished, so `f` says so rather than picking one.
+        git_in(&work, &["config", "--unset", "branch.main.remote"]);
+        git_in(&work, &["remote", "rename", "origin", "upstream"]);
+        assert_eq!(git.default_remote("main").unwrap(), DefaultRemote::Ambiguous);
+
+        git_in(&work, &["remote", "remove", "mirror"]);
+        assert_eq!(git.default_remote("main").unwrap(), remote("upstream"));
+
+        git_in(&work, &["remote", "remove", "upstream"]);
+        assert_eq!(git.default_remote("main").unwrap(), DefaultRemote::NoRemotes);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// With no remote to single out, `f` must say so and run no fetch at all:
+    /// falling through to every remote is exactly what `F` is for, and in a
+    /// repo with no remotes `git fetch --all` succeeds having done nothing,
+    /// which would paint a green "fetched" over a no-op.
+    #[test]
+    #[ignore = "drives a real git repo; the sandbox gate has no git, the host preflight does"]
+    fn f_without_a_default_remote_fetches_nothing_and_says_which_case_it_is() {
+        let (root, work) = repo("no-default");
+        // A branch that only a fetch would bring in — none must arrive below.
+        git_in(&root.join("origin.git"), &["branch", "work-0002-later", "main"]);
+        let mirror = root.join("mirror.git");
+        git_in(&root, &["init", "--bare", "-b", "main", &mirror.to_string_lossy()]);
+        git_in(&work, &["remote", "add", "mirror", &mirror.to_string_lossy()]);
+        git_in(&work, &["remote", "rename", "origin", "upstream"]);
+        let mut app = app_on(&work);
+        let mut ui = FakeUi::new();
+
+        app.handle(Key::Char('f'), &mut ui).unwrap();
+
+        assert_eq!(app.status, "no default remote — F fetches all of them");
+        assert!(
+            !app.branches.iter().any(|b| b.refname.ends_with("work-0002-later")),
+            "f fetched despite having no default remote"
+        );
+
+        for name in ["mirror", "upstream"] {
+            git_in(&work, &["remote", "remove", name]);
+        }
+        app.handle(Key::Char('f'), &mut ui).unwrap();
+
+        assert_eq!(app.status, "no remotes configured", "a no-op must not read as a refresh");
         let _ = std::fs::remove_dir_all(root);
     }
 

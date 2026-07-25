@@ -96,6 +96,18 @@ pub enum HeadClaim {
     Unnamed,
 }
 
+/// Which remote a plain refresh resolves to. The two "not one remote" answers
+/// are distinct because only one of them makes fetching every remote a useful
+/// thing to suggest.
+#[derive(Debug, PartialEq, Eq)]
+pub enum DefaultRemote {
+    Remote(String),
+    NoRemotes,
+    /// Several remotes and none distinguished: picking one would silently
+    /// refresh the wrong mirror.
+    Ambiguous,
+}
+
 /// One remote-tracking branch as shown in the list.
 pub struct Branch {
     pub refname: String,
@@ -488,6 +500,29 @@ impl Git {
             }
         }
         Ok(if unnamed { HeadClaim::Unnamed } else { HeadClaim::NotDefault })
+    }
+
+    /// The one remote a plain refresh means: whichever `branch.<base>.remote`
+    /// names, else `origin`, else the sole remote. A `branch.<base>.remote`
+    /// holding a URL rather than a remote name falls through — bare `git fetch`
+    /// would take it, but a URL has no tracking refs to prune.
+    pub fn default_remote(&self, base: &str) -> io::Result<DefaultRemote> {
+        let remotes = self.remote_names()?;
+        if remotes.is_empty() {
+            return Ok(DefaultRemote::NoRemotes);
+        }
+        // `.` (a local-branch upstream) is not a remote, so it fails this test.
+        let configured = self.run(&["config", "--get", &format!("branch.{base}.remote")])?;
+        if configured.ok && remotes.iter().any(|r| r == configured.line()) {
+            return Ok(DefaultRemote::Remote(configured.line().to_string()));
+        }
+        if remotes.iter().any(|r| r == "origin") {
+            return Ok(DefaultRemote::Remote("origin".to_string()));
+        }
+        Ok(match remotes.as_slice() {
+            [only] => DefaultRemote::Remote(only.clone()),
+            _ => DefaultRemote::Ambiguous,
+        })
     }
 
     /// Configured remote names, in `git remote` order.
