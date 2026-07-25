@@ -372,12 +372,10 @@ xfail blog1.test.sh::${##}
 xfail blog1.test.sh::${#1#'###'}
 xfail blog1.test.sh::Julia example from spec/oil-user-feedback
 xfail blog2.test.sh::-a -a
-xfail blog2.test.sh::-a -a -a
 xfail blog2.test.sh::-a -a -a -a
 xfail blog2.test.sh::-a -a -a -a -a -a
 xfail blog2.test.sh::-a -a -a -a -a -a -a -a
 xfail bool-parse.test.sh::test builtin - Unexpected trailing word '--' (#2409)
-xfail bool-parse.test.sh::test builtin: ( == ) is confusing: equality test or non-empty string test
 xfail brace-expansion.test.sh::Adjacent comma and range works
 xfail brace-expansion.test.sh::Ascending number range expansion with negative step is invalid
 xfail brace-expansion.test.sh::Char range expansion
@@ -459,21 +457,14 @@ xfail builtin-bind.test.sh::bind -v -V accepted
 xfail builtin-bracket.test.sh::-G and -O for effective user ID and group ID
 xfail builtin-bracket.test.sh::-ef
 xfail builtin-bracket.test.sh::-h and -L test for symlink
-xfail builtin-bracket.test.sh::-k for sticky bit
 xfail builtin-bracket.test.sh::-ot and -nt
 xfail builtin-bracket.test.sh::-r
 xfail builtin-bracket.test.sh::-u for setuid, -g too
 xfail builtin-bracket.test.sh::-w
 xfail builtin-bracket.test.sh::-x
-xfail builtin-bracket.test.sh::== and = does not do glob
-xfail builtin-bracket.test.sh::== is alias for =
 xfail builtin-bracket.test.sh::More negative numbers
-xfail builtin-bracket.test.sh::[ -t invalid ]
 xfail builtin-bracket.test.sh::operator/operand ambiguity with -a
-xfail builtin-bracket.test.sh::test -S
-xfail builtin-bracket.test.sh::test -c
 xfail builtin-bracket.test.sh::test -s
-xfail builtin-bracket.test.sh::three args
 xfail builtin-cd.test.sh::$OLDPWD
 xfail builtin-cd.test.sh::'unset PWD; pwd' before any cd (tickles a rare corner case)
 xfail builtin-cd.test.sh::CDPATH is respected
@@ -600,34 +591,6 @@ xfail builtin-fc.test.sh::fc -ln lists history commands without numbers
 xfail builtin-fc.test.sh::fc -lnr lists history commands without numbers in reverse order
 xfail builtin-fc.test.sh::fc -lr [first] [last] where first and last are reversed indexes does not undo reverse
 xfail builtin-fc.test.sh::fc -lr lists history commands in reverse order
-xfail builtin-getopts.test.sh::Basic getopts invocation
-xfail builtin-getopts.test.sh::Getopts parses the function's arguments
-xfail builtin-getopts.test.sh::Local OPTIND
-xfail builtin-getopts.test.sh::More Smooshing 1
-xfail builtin-getopts.test.sh::More Smooshing 2
-xfail builtin-getopts.test.sh::OPTARG is empty (not unset) after parsing a flag doesn't take an arg
-xfail builtin-getopts.test.sh::OPTIND
-xfail builtin-getopts.test.sh::OPTIND after multiple getopts with different spec
-xfail builtin-getopts.test.sh::OPTIND after multiple getopts with same spec
-xfail builtin-getopts.test.sh::OPTIND narrowed down
-xfail builtin-getopts.test.sh::OPTIND should be >= 1 (regression)
-xfail builtin-getopts.test.sh::flag and arg: -c10
-xfail builtin-getopts.test.sh::getopts doesn't look for flags after args
-xfail builtin-getopts.test.sh::getopts empty
-xfail builtin-getopts.test.sh::getopts handles '--' #2579
-xfail builtin-getopts.test.sh::getopts leaves all args after '--' as operands #2579
-xfail builtin-getopts.test.sh::getopts missing required argument
-xfail builtin-getopts.test.sh::getopts normal mode - invalid option (compare with silent)
-xfail builtin-getopts.test.sh::getopts normal mode - missing required argument (compare with silent)
-xfail builtin-getopts.test.sh::getopts resets OPTARG
-xfail builtin-getopts.test.sh::getopts sees unknown arg
-xfail builtin-getopts.test.sh::getopts silent error reporting - invalid option
-xfail builtin-getopts.test.sh::getopts silent error reporting - missing required argument
-xfail builtin-getopts.test.sh::getopts three invocations
-xfail builtin-getopts.test.sh::getopts with explicit args
-xfail builtin-getopts.test.sh::getopts with invalid flag
-xfail builtin-getopts.test.sh::getopts with invalid variable name
-xfail builtin-getopts.test.sh::two flags: -ab
 xfail builtin-history.test.sh::HISTFILE is defined initially
 xfail builtin-history.test.sh::HISTFILE set to array
 xfail builtin-history.test.sh::HISTFILE unset
@@ -712,33 +675,23 @@ xfail builtin-process.test.sh::write big file with ulimit
 xfail builtin-read.test.sh::mapfile from directory (bash doesn't handle errors)
 xfail builtin-read.test.sh::read -N doesn't respect delimiter, while read -n does
 xfail builtin-read.test.sh::read -N ignores delimiters
-xfail builtin-read.test.sh::read -d '' (null-separated records)
 xfail builtin-read.test.sh::read -d -n - respects delimiter and splits
-xfail builtin-read.test.sh::read -d : (colon-separated records)
-xfail builtin-read.test.sh::read -d when there's no delimiter
 xfail builtin-read.test.sh::read -n doesn't strip whitespace (bug fix)
 xfail builtin-read.test.sh::read -n from directory
 xfail builtin-read.test.sh::read -n from pipe
 xfail builtin-read.test.sh::read -n vs. -N
-xfail builtin-read.test.sh::read -n with invalid arg
 xfail builtin-read.test.sh::read -p (not fully tested)
 xfail builtin-read.test.sh::read -r -d '' for NUL strings, e.g. find -print0
 xfail builtin-read.test.sh::read -s from pipe, not a terminal
-xfail builtin-read.test.sh::read -t -0.5 is invalid
 xfail builtin-read.test.sh::read -t 0 tests if input is available
 xfail builtin-read.test.sh::read -t 0.5
 xfail builtin-read.test.sh::read -u
 xfail builtin-read.test.sh::read -u -s
 xfail builtin-read.test.sh::read -u 3 -d 5
 xfail builtin-read.test.sh::read -u 3 -d b -N 6
-xfail builtin-read.test.sh::read -u syntax error
-xfail builtin-read.test.sh::read /dev/null
 xfail builtin-read.test.sh::read does not respect C backslash escapes
 xfail builtin-read.test.sh::read multiple lines with IFS=:
-xfail builtin-read.test.sh::read usage
 xfail builtin-read.test.sh::read will unset extranous vars
-xfail builtin-read.test.sh::read with smooshed args
-xfail builtin-read.test.sh::read with zero args
 xfail builtin-read.test.sh::read without args uses $REPLY, no splitting occurs (without -n)
 xfail builtin-set.test.sh::'set' and 'eval' round trip
 xfail builtin-set.test.sh::can continue after unknown option

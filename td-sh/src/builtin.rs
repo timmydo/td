@@ -28,6 +28,7 @@ pub enum Builtin {
     Export,
     Readonly,
     Read,
+    Getopts,
     Test,
     Eval,
     Cd,
@@ -54,6 +55,7 @@ pub fn lookup(name: &str) -> Option<Builtin> {
         "export" => Builtin::Export,
         "readonly" => Builtin::Readonly,
         "read" => Builtin::Read,
+        "getopts" => Builtin::Getopts,
         "test" | "[" => Builtin::Test,
         "eval" => Builtin::Eval,
         "cd" => Builtin::Cd,
@@ -102,6 +104,7 @@ pub fn run(sh: &mut Shell, bi: Builtin, argv: &[String]) -> R<()> {
         Builtin::Export => export(sh, argv, false),
         Builtin::Readonly => export(sh, argv, true),
         Builtin::Read => read(sh, argv),
+        Builtin::Getopts => getopts(sh, argv),
         Builtin::Test => test(sh, argv),
         Builtin::Eval => eval(sh, argv),
         Builtin::Cd => cd(sh, argv),
@@ -1208,6 +1211,9 @@ fn shift(sh: &mut Shell, argv: &[String]) -> R<()> {
         return status(sh, 1);
     }
     sh.params.drain(0..n);
+    // Shifting renumbers the arguments the cursor indexes, so dash restarts it.
+    sh.getopts_optind = 1;
+    sh.getopts_off = -1;
     ok(sh)
 }
 
@@ -1243,6 +1249,12 @@ fn set(sh: &mut Shell, argv: &[String]) -> R<()> {
     // `--` replace them, while a pure option change leaves them untouched.
     if saw_ddash || argv.get(i).is_some() {
         sh.params = argv.iter().skip(i).cloned().collect();
+        // New positional parameters restart the `getopts` scan, as in dash --
+        // otherwise a second option loop would resume at the old cursor. Only the
+        // hidden cursor moves: dash leaves the OPTIND *variable* untouched until
+        // the next `getopts` writes it (and touching it would break `readonly`).
+        sh.getopts_optind = 1;
+        sh.getopts_off = -1;
     }
     ok(sh)
 }
@@ -1339,23 +1351,215 @@ fn export(sh: &mut Shell, argv: &[String], readonly: bool) -> R<()> {
     ok(sh)
 }
 
+/// POSIX `getopts optstring name [arg...]`, matched to dash. Two details drive
+/// the shape: `OPTIND` is the 1-based index of the next WORD, so it advances when
+/// a clustered word is ENTERED rather than once per letter (`-ab` reports
+/// `OPTIND=2` for both `a` and `b`); and the offset inside that word is shell
+/// state, not a variable. A leading `:` in `optstring` selects silent mode, which
+/// reports a bad option or a missing argument through `OPTARG` instead of stderr.
+fn getopts(sh: &mut Shell, argv: &[String]) -> R<()> {
+    let (Some(optstring), Some(name)) = (argv.get(1), argv.get(2)) else {
+        err_line(sh, "getopts: usage: getopts optstring var [arg...]");
+        return status(sh, 2);
+    };
+    let args: Vec<String> = if argv.len() > 3 {
+        argv.iter().skip(3).cloned().collect()
+    } else {
+        sh.params.clone()
+    };
+    // dash treats an OPTIND that is not a positive integer as fatal (the shell
+    // exits 2), rather than quietly restarting the scan.
+    let mut optind = sh.getopts_optind;
+    if optind < 1 {
+        let shown = sh.get_var("OPTIND").unwrap_or_default();
+        err_line(sh, &format!("getopts: Illegal number: {shown}"));
+        return Err(Sig::Exit(2));
+    }
+    let mut off = sh.getopts_off;
+    // A scan left past the end of a now-shorter argument list starts over.
+    if optind > args.len() as i64 + 1 {
+        optind = 1;
+        off = -1;
+    }
+
+    // Continue inside the word already being consumed, else enter the next one.
+    let inword = if off >= 1 && optind >= 2 {
+        args.get((optind - 2) as usize).filter(|w| (w.len() as i64) > off).cloned()
+    } else {
+        None
+    };
+    let (word, at) = match inword {
+        Some(w) => (w, off as usize),
+        None => match args.get((optind - 1) as usize) {
+            // `-` alone and a non-option word both end the scan without being
+            // consumed; `--` ends it and IS consumed.
+            Some(w) if w.starts_with('-') && w.len() > 1 => {
+                optind += 1;
+                if w == "--" {
+                    return getopts_done(sh, name, optind);
+                }
+                (w.clone(), 1usize)
+            }
+            _ => return getopts_done(sh, name, optind),
+        },
+    };
+
+    let silent = optstring.starts_with(':');
+    let c = match word.as_bytes().get(at) {
+        Some(&b) => b as char,
+        None => return getopts_done(sh, name, optind),
+    };
+    let at = at + 1;
+    let takes_arg = getopts_lookup(optstring, c);
+    let mut letter = c;
+    match takes_arg {
+        None => {
+            if silent {
+                sh.set_var("OPTARG", &c.to_string())?;
+            } else {
+                err_line(sh, &format!("getopts: Illegal option -{c}"));
+                sh.unset_var("OPTARG");
+            }
+            letter = '?';
+            off = if at >= word.len() { -1 } else { at as i64 };
+        }
+        Some(false) => {
+            sh.set_var("OPTARG", "")?;
+            off = if at >= word.len() { -1 } else { at as i64 };
+        }
+        Some(true) => {
+            off = -1;
+            if at < word.len() {
+                let tail = String::from_utf8_lossy(word.as_bytes().get(at..).unwrap_or(&[])).into_owned();
+                sh.set_var("OPTARG", &tail)?;
+            } else if let Some(a) = args.get((optind - 1) as usize).cloned() {
+                sh.set_var("OPTARG", &a)?;
+                optind += 1;
+            } else if silent {
+                sh.set_var("OPTARG", &c.to_string())?;
+                letter = ':';
+            } else {
+                err_line(sh, &format!("getopts: No arg for -{c} option"));
+                sh.unset_var("OPTARG");
+                letter = '?';
+            }
+        }
+    }
+    // After `getopts_store`, whose OPTIND write resets the cursor via the hook.
+    getopts_store(sh, name, optind, &letter.to_string())?;
+    sh.getopts_optind = optind;
+    sh.getopts_off = off;
+    // An unusable variable name still leaves OPTIND/OPTARG updated (dash does the
+    // parse first, then fails on the assignment).
+    if !ast::is_name(name) {
+        err_line(sh, &format!("getopts: {name}: not a valid identifier"));
+        return status(sh, 2);
+    }
+    ok(sh)
+}
+
+// End of options: report `?` through `name` and stop, leaving OPTARG alone.
+fn getopts_done(sh: &mut Shell, name: &str, optind: i64) -> R<()> {
+    getopts_store(sh, name, optind, "?")?;
+    sh.getopts_optind = optind;
+    sh.getopts_off = -1;
+    status(sh, 1)
+}
+
+// Publish OPTIND and the option letter, skipping a name that is not an identifier.
+fn getopts_store(sh: &mut Shell, name: &str, optind: i64, letter: &str) -> R<()> {
+    sh.set_var("OPTIND", &optind.to_string())?;
+    if ast::is_name(name) {
+        sh.set_var(name, letter)?;
+    }
+    Ok(())
+}
+
+// Whether `c` is in `optstring`, and if so whether it takes an argument. The
+// leading silent-mode `:` is NOT skipped, so like dash it can itself be matched.
+fn getopts_lookup(optstring: &str, c: char) -> Option<bool> {
+    let b = optstring.as_bytes();
+    let mut k = 0usize;
+    while let Some(&s) = b.get(k) {
+        let takes = b.get(k + 1) == Some(&b':');
+        if s as char == c {
+            return Some(takes);
+        }
+        k += if takes { 2 } else { 1 };
+    }
+    None
+}
+
+/// POSIX `read`, with dash's option surface: `-r` and `-p prompt`, clustered
+/// (`-rp x`) or smooshed (`-pfoo`), `--` ending them. Every other letter is a
+/// usage error (status 2, which does NOT end the shell -- `read` is not a
+/// special builtin). That includes dash's own `-t`: rejecting a timeout td-sh
+/// cannot implement is a deliberate DEVIATION from dash, not its surface.
 fn read(sh: &mut Shell, argv: &[String]) -> R<()> {
     let mut i = 1usize;
     let mut raw = false;
+    let mut prompt: Option<String> = None;
     while let Some(arg) = argv.get(i) {
-        if arg == "-r" {
-            raw = true;
-            i += 1;
-        } else if arg == "--" {
+        let bytes = arg.as_bytes();
+        if bytes.first() != Some(&b'-') || bytes.len() < 2 {
+            break;
+        }
+        if arg == "--" {
             i += 1;
             break;
-        } else if arg.starts_with('-') && arg.len() > 1 {
-            i += 1; // ignore unsupported flags rather than mis-treating them as names
-        } else {
-            break;
+        }
+        i += 1;
+        let mut k = 1usize;
+        while let Some(&c) = bytes.get(k) {
+            k += 1;
+            match c {
+                b'r' => raw = true,
+                b'p' => {
+                    // The rest of the word is the prompt, else the next word is.
+                    let rest = arg.get(k..).unwrap_or("");
+                    if rest.is_empty() {
+                        match argv.get(i) {
+                            Some(next) => {
+                                prompt = Some(next.clone());
+                                i += 1;
+                            }
+                            None => {
+                                err_line(sh, "read: No arg for -p option");
+                                return status(sh, 2);
+                            }
+                        }
+                    } else {
+                        prompt = Some(rest.to_string());
+                    }
+                    k = bytes.len();
+                }
+                _ => {
+                    err_line(sh, &format!("read: Illegal option -{}", c as char));
+                    return status(sh, 2);
+                }
+            }
+        }
+    }
+    // dash prompts before validating the operands, only when it is actually
+    // reading from a terminal, and writes the prompt bare (no newline).
+    if let Some(p) = &prompt {
+        if sh.fds.is_terminal(0) {
+            let _ = write_fd(sh, 2, p.as_bytes());
         }
     }
     let names: Vec<String> = argv.iter().skip(i).cloned().collect();
+    if names.is_empty() {
+        // dash requires at least one variable name; there is no bare-`read`
+        // fallback to $REPLY (that is a bash/ksh extension).
+        err_line(sh, "read: arg count");
+        return status(sh, 2);
+    }
+    for bad in &names {
+        if !ast::is_name(bad) {
+            err_line(sh, &format!("read: {bad}: bad variable name"));
+            return status(sh, 2);
+        }
+    }
 
     let (line, terminated) = match read_logical_line(sh, raw)? {
         Some(l) => l,
@@ -1368,10 +1572,7 @@ fn read(sh: &mut Shell, argv: &[String]) -> R<()> {
         }
     };
 
-    if names.is_empty() {
-        // `read` with no variable stores the line in REPLY.
-        sh.set_var("REPLY", &line)?;
-    } else {
+    {
         let ifs = sh.get_var("IFS").unwrap_or_else(|| " \t\n".to_string());
         let fields = split_read(&line, &ifs, names.len());
         for (idx, name) in names.iter().enumerate() {
@@ -1645,7 +1846,12 @@ fn eval_test(sh: &Shell, args: &[String]) -> Result<bool, String> {
         1 => Ok(!s(args, 0).is_empty()),
         2 => two_arg(sh, args),
         3 => three_arg(sh, args),
-        4 if s(args, 0) == "!" => Ok(!three_arg(sh, args.get(1..).unwrap_or(&[]))?),
+        // `!` negates the 3-argument test -- except over `-a`/`-o`, which it binds
+        // TIGHTER than, so `[ ! x -a "" ]` is `(!x) && ""`. The general parser
+        // below has that precedence already.
+        4 if s(args, 0) == "!" && !matches!(s(args, 2), "-a" | "-o") => {
+            Ok(!three_arg(sh, args.get(1..).unwrap_or(&[]))?)
+        }
         _ => {
             let mut p = TestParser { args, pos: 0, depth: 0, sh };
             let v = p.or_expr()?;
@@ -1673,7 +1879,7 @@ fn two_arg(sh: &Shell, args: &[String]) -> Result<bool, String> {
 fn three_arg(sh: &Shell, args: &[String]) -> Result<bool, String> {
     let op = s(args, 1);
     if is_binary(op) {
-        return binary_op(s(args, 0), op, s(args, 2));
+        return binary_op(sh, s(args, 0), op, s(args, 2));
     }
     if s(args, 0) == "!" {
         return Ok(!two_arg(sh, args.get(1..).unwrap_or(&[]))?);
@@ -1681,7 +1887,20 @@ fn three_arg(sh: &Shell, args: &[String]) -> Result<bool, String> {
     if s(args, 0) == "(" && s(args, 2) == ")" {
         return Ok(!s(args, 1).is_empty());
     }
+    // POSIX leaves `A -a B` / `A -o B` unspecified; combine them as non-empty
+    // string tests. This binds LAST: `!` and `( )` above claim their operands
+    // first, and a leading unary operator claims the next word (dash-style), so
+    // `[ ! -a B ]` and `[ -z -a ] ]` stay the syntax errors dash reports.
+    if (op == "-a" || op == "-o") && !is_unary(s(args, 0)) {
+        let (l, r) = (!s(args, 0).is_empty(), !s(args, 2).is_empty());
+        return Ok(if op == "-a" { l && r } else { l || r });
+    }
     Err(format!("binary operator expected: `{op}`"))
+}
+
+// The `-X` spellings `unary_op` understands.
+fn is_unary(w: &str) -> bool {
+    matches!(w.strip_prefix('-'), Some(u) if u.len() == 1 && "znefdrwxshLtbcpSugk".contains(u))
 }
 
 /// Fetch an argument, defaulting to the empty string past the end.
@@ -1689,19 +1908,22 @@ fn s(args: &[String], i: usize) -> &str {
     args.get(i).map(String::as_str).unwrap_or("")
 }
 
+// `==` is deliberately absent: it is a bash/ksh spelling that dash rejects as a
+// missing binary operator (status 2), which is what the corpus goldens expect.
 fn is_binary(op: &str) -> bool {
     matches!(
         op,
-        "=" | "==" | "!=" | "-eq" | "-ne" | "-lt" | "-le" | "-gt" | "-ge" | "<" | ">"
+        "=" | "!=" | "-eq" | "-ne" | "-lt" | "-le" | "-gt" | "-ge" | "<" | ">" | "-nt" | "-ot" | "-ef"
     )
 }
 
-fn binary_op(a: &str, op: &str, b: &str) -> Result<bool, String> {
+fn binary_op(sh: &Shell, a: &str, op: &str, b: &str) -> Result<bool, String> {
     match op {
-        "=" | "==" => Ok(a == b),
+        "=" => Ok(a == b),
         "!=" => Ok(a != b),
         "<" => Ok(a < b),
         ">" => Ok(a > b),
+        "-nt" | "-ot" | "-ef" => Ok(file_cmp(sh, a, op, b)),
         _ => {
             let x = int_arg(a)?;
             let y = int_arg(b)?;
@@ -1725,6 +1947,7 @@ fn int_arg(s: &str) -> Result<i64, String> {
 }
 
 fn unary_op(sh: &Shell, op: &str, arg: &str) -> Result<bool, String> {
+    use std::os::unix::fs::FileTypeExt;
     let path = || sh.resolve(arg);
     Ok(match op {
         "z" => arg.is_empty(),
@@ -1740,9 +1963,42 @@ fn unary_op(sh: &Shell, op: &str, arg: &str) -> Result<bool, String> {
             .symlink_metadata()
             .map(|m| m.file_type().is_symlink())
             .unwrap_or(false),
-        "t" => false, // no controlling terminal in the harness
+        "b" => path().metadata().is_ok_and(|m| m.file_type().is_block_device()),
+        "c" => path().metadata().is_ok_and(|m| m.file_type().is_char_device()),
+        "p" => path().metadata().is_ok_and(|m| m.file_type().is_fifo()),
+        "S" => path().metadata().is_ok_and(|m| m.file_type().is_socket()),
+        "u" => mode_bit(&path(), 0o4000),
+        "g" => mode_bit(&path(), 0o2000),
+        "k" => mode_bit(&path(), 0o1000),
+        // `-t FD`: a non-numeric operand is an error, not false. Only the three
+        // standard descriptors can be probed without a raw isatty(3).
+        "t" => match arg.trim().parse::<i64>() {
+            Ok(n) => u32::try_from(n).is_ok_and(|fd| sh.fds.is_terminal(fd)),
+            Err(_) => return Err(format!("integer expression expected: `{arg}`")),
+        },
         _ => return Err(format!("unknown unary operator `-{op}`")),
     })
+}
+
+fn mode_bit(p: &std::path::Path, bit: u32) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    p.metadata().is_ok_and(|m| m.mode() & bit != 0)
+}
+
+// `-nt`/`-ot` compare modification times; `-ef` is identity (same device and
+// inode). An operand that cannot be stat'd makes the test false, as in dash.
+fn file_cmp(sh: &Shell, a: &str, op: &str, b: &str) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let (Ok(x), Ok(y)) = (sh.resolve(a).metadata(), sh.resolve(b).metadata()) else {
+        return false;
+    };
+    // Whole seconds, as dash's newerf/olderf compare st_mtime.
+    let (xt, yt) = (x.mtime(), y.mtime());
+    match op {
+        "-nt" => xt > yt,
+        "-ot" => xt < yt,
+        _ => x.dev() == y.dev() && x.ino() == y.ino(),
+    }
 }
 
 fn read_only(p: &std::path::Path) -> bool {
@@ -1831,7 +2087,7 @@ impl TestParser<'_> {
         let a = self.peek().unwrap_or("").to_string();
         // Unary op: `-z STR`, `-f FILE`, …
         if let Some(u) = a.strip_prefix('-') {
-            if u.len() == 1 && "znefdrwxshLt".contains(u) {
+            if is_unary(&a) {
                 let arg = self.args.get(self.pos + 1).map(String::as_str).unwrap_or("");
                 self.pos += 2;
                 return unary_op(self.sh, u, arg);
@@ -1841,7 +2097,7 @@ impl TestParser<'_> {
         if let Some(op) = self.args.get(self.pos + 1).map(String::as_str) {
             if is_binary(op) {
                 let b = self.args.get(self.pos + 2).map(String::as_str).unwrap_or("");
-                let v = binary_op(&a, op, b)?;
+                let v = binary_op(self.sh, &a, op, b)?;
                 self.pos += 3;
                 return Ok(v);
             }
@@ -2127,6 +2383,143 @@ mod tests {
         // An operand that is absent, or present but empty, is a silent zero.
         assert_eq!(run_capturing("printf '[%f]'"), (0, "[0.000000]".into(), String::new()));
         assert_eq!(run_capturing("printf '[%f]' ''"), (0, "[0.000000]".into(), String::new()));
+    }
+
+    #[test]
+    fn getopts_scans_options_clusters_and_arguments() {
+        // OPTIND names the next WORD, so it is already 2 for both letters of a
+        // cluster; OPTARG is set empty for a flag that takes no argument.
+        assert_eq!(
+            run_capturing("set -- -ab; getopts ab o; echo \"$OPTIND $o [$OPTARG]\"; getopts ab o; echo \"$OPTIND $o [$OPTARG]\"").1,
+            "2 a []\n2 b []\n"
+        );
+        // An option argument may be smooshed or the following word.
+        assert_eq!(run_capturing("set -- -c10; getopts 'c:' o; echo \"$OPTIND $o $OPTARG\"").1, "2 c 10\n");
+        assert_eq!(run_capturing("set -- -c 10; getopts 'c:' o; echo \"$OPTIND $o $OPTARG\"").1, "3 c 10\n");
+        // End of options: status 1 and `?`, both for exhaustion and for `--`.
+        assert_eq!(run_capturing("set -- ; getopts 'a' o; echo \"$? $o\"").1, "1 ?\n");
+        assert_eq!(run_capturing("set -- -- -a; getopts 'a' o; echo \"$? $o $OPTIND\"").1, "1 ? 2\n");
+        // A non-option word stops the scan without being consumed.
+        assert_eq!(run_capturing("set -- x -a; getopts 'a' o; echo \"$? $OPTIND\"").1, "1 1\n");
+    }
+
+    #[test]
+    fn getopts_reports_errors_and_restarts() {
+        // Normal mode: unknown option and missing argument both report `?` with a
+        // message, and still return 0 so the caller's loop sees them.
+        let (_, out, err) = run_capturing("set -- -Z; getopts 'a:' o; echo \"$? $o\"");
+        assert_eq!(out, "0 ?\n");
+        assert!(err.contains("Illegal option -Z"), "err: {err:?}");
+        let (_, out, err) = run_capturing("set -- -a; getopts 'a:' o; echo \"$? $o\"");
+        assert_eq!(out, "0 ?\n");
+        assert!(err.contains("No arg for -a"), "err: {err:?}");
+        // A leading `:` selects silent mode: the letter comes back in OPTARG, and a
+        // missing argument reports `:` instead of `?`.
+        assert_eq!(run_capturing("set -- -Z; getopts ':a:' o; echo \"$o $OPTARG\"").1, "? Z\n");
+        assert_eq!(run_capturing("set -- -a; getopts ':a:' o; echo \"$o $OPTARG\"").1, ": a\n");
+        // New positional parameters restart the scan (dash), so a second loop over
+        // a fresh argument list does not resume at the old OPTIND.
+        assert_eq!(
+            run_capturing("set -- -a; getopts 'a' o; set -- -b; getopts 'b' o; echo \"$o $OPTIND\"").1,
+            "b 2\n"
+        );
+        // Assigning OPTIND restarts at a word boundary even when the value does
+        // not change, so a half-consumed cluster is abandoned (dash's hook).
+        assert_eq!(
+            run_capturing("set -- -ab; getopts ab o; OPTIND=2; getopts ab o; echo \"$o $?\"").1,
+            "? 1\n"
+        );
+        // OPTIND is 1 before any getopts, and a non-positive one is fatal.
+        assert_eq!(run_capturing("echo $OPTIND").1, "1\n");
+        // The cursor is per argument frame: a function scans its OWN arguments
+        // from the start, the caller resumes where it left off, and `shift` (which
+        // renumbers them) restarts it.
+        assert_eq!(
+            run_capturing("set -- -a; getopts a o; f() { getopts b i; echo \"$? $i $OPTIND\"; }; f -b").1,
+            "0 b 2\n"
+        );
+        assert_eq!(run_capturing("set -- -a -b; getopts a o; shift; getopts b o; echo $o").1, "b\n");
+        // `set` moves only the hidden cursor: $OPTIND keeps the value the last
+        // getopts published, so a readonly OPTIND is not disturbed either.
+        assert_eq!(run_capturing("set -- -a; getopts a o; set -- x; echo $OPTIND").1, "2\n");
+        assert_eq!(run_capturing("readonly OPTIND; set -- x; echo ok=$?").1, "ok=0\n");
+        // dash's number(): an all-digit OPTIND is taken (0 coerced up to 1), and
+        // anything else -- negative, signed, padded, non-numeric -- is fatal.
+        assert_eq!(run_capturing("set -- -a; OPTIND=0; getopts a o; echo \"$o $?\"").1, "a 0\n");
+        for bad in ["-1", "abc", "' 2'", "+1"] {
+            let (status, out, _) = run_capturing(&format!("OPTIND={bad}; getopts a: x; echo unreached"));
+            assert_eq!((status, out.as_str()), (2, ""), "OPTIND={bad} should be fatal");
+        }
+    }
+
+    #[test]
+    fn read_rejects_a_bad_variable_name() {
+        // dash validates the operands; `getopts` in this file does too.
+        let (status, _, err) = run_capturing("echo hi | read 1bad");
+        assert_eq!(status, 2);
+        assert!(err.contains("bad variable name"), "err: {err:?}");
+    }
+
+    #[test]
+    fn read_takes_only_dashs_option_surface() {
+        // `-r` still works, clustered or not, and `--` ends the options.
+        assert_eq!(run_capturing("printf 'a\\\\b\\n' | { read -r v; echo \"[$v]\"; }").1, "[a\\b]\n");
+        // bash-only flags (and dash's own -t, which needs a timeout td-sh cannot
+        // implement) are usage errors, not silently ignored.
+        for bad in ["-n 1", "-N 1", "-d :", "-u 3", "-t 1", "-s", "-rn1"] {
+            let (status, _, err) = run_capturing(&format!("echo hi | {{ read {bad} v; }}"));
+            assert_eq!(status, 2, "read {bad} should be a usage error");
+            assert!(err.contains("Illegal option"), "read {bad} err: {err:?}");
+        }
+        // dash requires a variable name; there is no bare-`read` $REPLY fallback.
+        let (status, _, err) = run_capturing("echo hi | read");
+        assert_eq!(status, 2);
+        assert!(err.contains("arg count"), "err: {err:?}");
+        // `-p` is accepted with its argument attached or separate (the prompt only
+        // prints on a terminal, which the test harness is not).
+        assert_eq!(run_capturing("echo hi | { read -p 'x? ' v; echo $v; }"), (0, "hi\n".into(), String::new()));
+        assert_eq!(run_capturing("echo hi | { read -pfoo v; echo $v; }").1, "hi\n");
+    }
+
+    #[test]
+    fn test_file_type_and_mode_operators() {
+        // Character device vs socket, on a node every Linux system has.
+        assert_eq!(run_capturing("test -c /dev/zero; echo $?").1, "0\n");
+        assert_eq!(run_capturing("test -S /dev/zero; echo $?").1, "1\n");
+        assert_eq!(run_capturing("test -b /dev/zero; echo $?").1, "1\n");
+        // /tmp carries the sticky bit but not setuid/setgid.
+        assert_eq!(run_capturing("test -k /tmp; echo $?").1, "0\n");
+        assert_eq!(run_capturing("test -u /tmp; echo $?").1, "1\n");
+        // `-ef` is identity, so a path is always the same file as itself.
+        assert_eq!(run_capturing("test /dev/zero -ef /dev/zero; echo $?").1, "0\n");
+        assert_eq!(run_capturing("test /dev/zero -ef /dev/null; echo $?").1, "1\n");
+        // `-nt`/`-ot` are false when either operand cannot be stat'd.
+        assert_eq!(run_capturing("test /nonexistent -nt /dev/zero; echo $?").1, "1\n");
+        // `-t` takes a descriptor number: any integer is answerable, a word is not.
+        assert_eq!(run_capturing("test -t 12345678910; echo $?").1, "1\n");
+        assert_eq!(run_capturing("test -t invalid; echo $?").1, "2\n");
+    }
+
+    #[test]
+    fn test_rejects_double_equals_and_takes_three_arg_and_or() {
+        // dash has no `==`; it is a missing-binary-operator error (status 2).
+        assert_eq!(run_capturing("[ a = a ]; echo $?").1, "0\n");
+        assert_eq!(run_capturing("[ a == a ] 2>/dev/null; echo $?").1, "2\n");
+        // The 3-argument `-a`/`-o` forms combine non-empty string tests.
+        assert_eq!(run_capturing("[ foo -a '' ]; echo $?").1, "1\n");
+        assert_eq!(run_capturing("[ foo -o '' ]; echo $?").1, "0\n");
+        assert_eq!(run_capturing("[ foo -a bar ]; echo $?").1, "0\n");
+        // But not when the first word is itself a unary operator, nor when `!` or
+        // `( )` claim the operands first: dash reports those as syntax errors.
+        assert_eq!(run_capturing("[ -z -a ] ] 2>/dev/null; echo $?").1, "2\n");
+        assert_eq!(run_capturing("[ ! -a B ] 2>/dev/null; echo $?").1, "2\n");
+        assert_eq!(run_capturing("[ ! -z '' ]; echo $?").1, "1\n");
+        // `!` binds tighter than `-a`/`-o`, so the 4-argument form is
+        // `(! A) && B`, not `!(A && B)`.
+        assert_eq!(run_capturing("[ ! x -a '' ]; echo $?").1, "1\n");
+        assert_eq!(run_capturing("[ ! '' -o x ]; echo $?").1, "0\n");
+        // `-t` answers for the SHELL's descriptor, so a redirection is not a tty.
+        assert_eq!(run_capturing("[ -t 0 ] < /dev/null; echo $?").1, "1\n");
     }
 
     #[test]

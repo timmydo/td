@@ -52,6 +52,20 @@ impl Fds {
         self.map.get(&fd)
     }
 
+    /// Whether descriptor `fd` is a terminal. Only an INHERITED descriptor can
+    /// be: the shell's own table means a redirection to a file or to an internal
+    /// pipeline buffer must answer no, which `IsTerminal` on the process's real
+    /// stream would get wrong.
+    pub fn is_terminal(&self, fd: u32) -> bool {
+        use std::io::IsTerminal;
+        match self.get(fd) {
+            Some(Fd::Inherit(0)) => std::io::stdin().is_terminal(),
+            Some(Fd::Inherit(1)) => std::io::stdout().is_terminal(),
+            Some(Fd::Inherit(2)) => std::io::stderr().is_terminal(),
+            _ => false,
+        }
+    }
+
     fn set(&mut self, fd: u32, target: Fd) {
         self.map.insert(fd, target);
     }
@@ -393,6 +407,8 @@ pub fn fork_shell(sh: &Shell) -> Shell {
         cmdsubst_count: sh.cmdsubst_count,
         errexit_suppressed: sh.errexit_suppressed,
         interactive: false,
+        getopts_optind: sh.getopts_optind,
+        getopts_off: sh.getopts_off,
     }
 }
 

@@ -91,6 +91,13 @@ pub struct Shell {
     /// it propagates into compounds nested inside the condition.
     pub errexit_suppressed: u32,
     pub interactive: bool,
+    /// `getopts` scan cursor, hidden like dash's: the 1-based index of the next
+    /// WORD and the byte offset inside the word being consumed (-1 == start a
+    /// fresh one). Hidden rather than read back out of $OPTIND because dash keeps
+    /// it per argument frame -- a function gets its own, and `set`/`shift` reset
+    /// it -- while the OPTIND *variable* is global and only written by `getopts`.
+    pub getopts_optind: i64,
+    pub getopts_off: i64,
 }
 
 /// Bound on nested command execution — enforced once, at the `run_command` choke
@@ -131,11 +138,15 @@ impl Shell {
             cmdsubst_count: 0,
             errexit_suppressed: 0,
             interactive: false,
+            getopts_optind: 1,
+            getopts_off: -1,
         };
         // POSIX seeds these when absent; scripts assume they exist.
         if sh.get_var("IFS").is_none() {
             let _ = sh.set_var("IFS", " \t\n");
         }
+        // POSIX: OPTIND is 1 at shell start, overriding any imported value.
+        let _ = sh.set_var("OPTIND", "1");
         if sh.get_var("PPID").is_none() {
             // Best-effort; std has no getppid, so leave it to the environment.
         }
@@ -161,8 +172,11 @@ impl Shell {
             cmdsubst_count: 0,
             errexit_suppressed: 0,
             interactive: false,
+            getopts_optind: 1,
+            getopts_off: -1,
         };
         let _ = sh.set_var("IFS", " \t\n");
+        let _ = sh.set_var("OPTIND", "1");
         sh
     }
 
@@ -173,6 +187,19 @@ impl Shell {
     /// Assign a shell variable, honouring the readonly attribute. Errors are
     /// returned as `Sig::Exit(1)` after a message, so `?` reports them.
     pub fn set_var(&mut self, name: &str, value: &str) -> R<()> {
+        // Assigning OPTIND at all -- even the value it already holds -- restarts
+        // `getopts` at a word boundary, as dash's OPTIND hook does. `getopts`
+        // itself re-establishes the offset after publishing OPTIND.
+        if name == "OPTIND" {
+            // dash's OPTIND hook: any assignment moves the cursor and abandons a
+            // half-consumed word. dash's number() takes an all-digit string only
+            // (so " 2", "+1" and "-1" are all rejected) and coerces 0 up to 1; a
+            // rejected value parks -1, which `getopts` reports when it next runs.
+            let digits = !value.is_empty() && value.bytes().all(|b| b.is_ascii_digit());
+            self.getopts_optind =
+                if digits { value.parse::<i64>().unwrap_or(i64::MAX).max(1) } else { -1 };
+            self.getopts_off = -1;
+        }
         match self.vars.get_mut(name) {
             Some(v) if v.readonly => {
                 return Err(self.fatal(&format!("{name}: is read only"), 1));
@@ -693,6 +720,12 @@ fn call_function(
     }
     let new_params = argv.get(1..).unwrap_or(&[]).to_vec();
     let saved_params = std::mem::replace(&mut sh.params, new_params);
+    // The cursor belongs to the argument frame, so the function scans its own
+    // arguments from the start and the caller resumes where it left off. The
+    // OPTIND variable is global and deliberately NOT restored.
+    let saved_getopts = (sh.getopts_optind, sh.getopts_off);
+    sh.getopts_optind = 1;
+    sh.getopts_off = -1;
     let was_in_function = sh.in_function;
     let saved_loop_depth = sh.loop_depth;
     sh.in_function = true;
@@ -707,6 +740,7 @@ fn call_function(
         process::RedirOutcome::Failed => Ok(()),
     };
     sh.params = saved_params;
+    (sh.getopts_optind, sh.getopts_off) = saved_getopts;
     sh.in_function = was_in_function;
     sh.loop_depth = saved_loop_depth;
     match result {
