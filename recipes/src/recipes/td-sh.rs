@@ -1,19 +1,21 @@
 use crate::types::{Recipe, Step};
 
-// td-sh — target-built static POSIX /bin/sh (busybox-`sh` replacement), stub tier.
+// td-sh — target-built static POSIX /bin/sh (busybox-`sh` replacement).
 //
-// This recipe compiles the td-sh CRATE's `src/main.rs` (a standalone crate,
-// linted and unit-tested there) into a statically-linked target ELF. The crate
-// source is embedded via `include_str!` so the lintable/testable crate and the
-// shipped binary are ONE source of truth and cannot drift; the path escapes the
+// This recipe compiles the td-sh CRATE's binary source (`src/main.rs` plus its
+// sibling modules) into a statically-linked target ELF. The sources are embedded
+// via `include_str!` so the lintable/testable crate and the shipped binary are
+// ONE source of truth and cannot drift; the path escapes the
 // `recipes/src/recipes/*.rs` catalog glob, so it is not itself a recipe module.
 //
-// STATUS: the crate's `main.rs` is an exit-0 STUB (parses/executes nothing). This
-// recipe exists now so the build wiring, the static-ELF shape, and the daily
-// parity assertion (td-sh-test) land ahead of the interpreter. td-sh is NOT yet
-// referenced by system-x86-64: the shipped `/bin/sh` stays busybox until td-sh
-// passes conformance (the Oils spec corpus, resolved to the dash/ash goldens) and
-// the busybox `ash_test` parity gate. Only then is the image symlink flipped.
+// STATUS: the interpreter passes the seed Oils conformance corpus (resolved to
+// the dash/ash goldens; see td-sh/tests/conformance.rs) — a lexer/parser, word
+// expansion (parameter/command/arithmetic substitution, field splitting,
+// pathname expansion), control flow, functions and the core builtins, all pure
+// safe `std` (`#![deny(unsafe_code)]`). td-sh is NOT yet referenced by
+// system-x86-64: the shipped `/bin/sh` stays busybox until td-sh also clears the
+// busybox `ash_test` parity gate and the bulk Oils import. Only then is the image
+// symlink flipped.
 //
 // Why mesboot-style (rustc invoked directly) rather than `Recipe::rust`, and why
 // static: identical to td-kexec. The busybox `sh` it replaces is boot-critical and
@@ -27,7 +29,31 @@ use crate::types::{Recipe, Step};
 // The actual static link needs the full target toolchain, so it is DAILY/
 // operator tier (no target rustc in the per-change sandbox); the sibling
 // td-sh-test carries that daily build+assert check.
+//
+// The crate root (`main.rs`) declares each sibling module with `mod NAME;`, so a
+// single `rustc src/main.rs` pulls them all in — but only if every module file is
+// present next to it in {src}. Keep MODULES in sync with `main.rs`'s `mod` lines.
+//
+// Every source below is written out with a WriteFile, which the ladder
+// `no_bootstrap_step_invokes_host_find_or_xargs` guard scans as a command surface.
+// So the embedded `.rs` must not contain the literal tokens `find`/`xargs` (use a
+// plain loop / `bytes().position` over `Iterator::find`/`str::find`) — they would
+// trip the host-tool-tier guard even though rustc never interprets the file as a
+// shell script. Same constraint td-kexec/td-netd document.
 const MAIN_RS: &str = include_str!("../../../td-sh/src/main.rs");
+
+// (module basename, source text). rustc resolves `mod NAME;` to `{src}/NAME.rs`.
+const MODULES: &[(&str, &str)] = &[
+    ("arith", include_str!("../../../td-sh/src/arith.rs")),
+    ("ast", include_str!("../../../td-sh/src/ast.rs")),
+    ("builtin", include_str!("../../../td-sh/src/builtin.rs")),
+    ("exec", include_str!("../../../td-sh/src/exec.rs")),
+    ("expand", include_str!("../../../td-sh/src/expand.rs")),
+    ("lexer", include_str!("../../../td-sh/src/lexer.rs")),
+    ("parser", include_str!("../../../td-sh/src/parser.rs")),
+    ("pattern", include_str!("../../../td-sh/src/pattern.rs")),
+    ("process", include_str!("../../../td-sh/src/process.rs")),
+];
 
 pub fn recipe() -> Recipe {
     // The self-hosted toolchains install under a nested stage/td/store/<pkg>
@@ -63,6 +89,15 @@ pub fn recipe() -> Recipe {
         content: MAIN_RS.into(),
         exec: false,
     });
+    // Every module `main.rs` declares must sit beside it so `rustc src/main.rs`
+    // can resolve `mod NAME;` from the filesystem.
+    for (name, source) in MODULES {
+        steps.push(Step::WriteFile {
+            path: format!("{{src}}/{name}.rs"),
+            content: (*source).into(),
+            exec: false,
+        });
+    }
     // Synthesize {root}/eh/libgcc_eh.a = libgcc.a (objcopy preserves the members;
     // ranlib writes the archive index ld needs) so `-lgcc_eh` resolves.
     steps.push(Step::MkDir {

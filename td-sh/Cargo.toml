@@ -2,7 +2,7 @@
 name = "td-sh"
 version = "0.1.0"
 edition = "2021"
-description = "td's target-built POSIX /bin/sh (busybox-sh replacement): exit-0 stub + Oils-spec conformance harness"
+description = "td's target-built POSIX /bin/sh (busybox-sh replacement): interpreter + Oils-spec conformance harness"
 license = "GPL-3.0-or-later"
 
 # The SHIPPED shell is the `td-sh` bin (src/main.rs), compiled directly by rustc
@@ -24,6 +24,15 @@ path = "src/lib.rs"
 # the engine's 3-package lock gate never inspects it. Zero external dependencies
 # (pure std) — a POSIX sh is a thin layer over exactly the OS services std wraps,
 # and std is the pinned toolchain, not a cargo dep (AGENTS.md "std, not no_std").
+#
+# The engine root `exclude`s td-sh, but that only stops cargo at THAT manifest.
+# From a nested checkout (.claude/worktrees/* lives physically under the main
+# checkout) cargo walks past the excluding root and is captured by the OUTER
+# manifest, which lists the nested path as neither member nor exclude. An explicit
+# empty `[workspace]` pins THIS as the root and stops the walk, so `cargo
+# clippy/test` behave identically from the main checkout or a worktree (mirrors
+# td-kexec/td-netd).
+[workspace]
 
 [lints.clippy]
 unwrap_used = "deny"       # no panicking .unwrap(); return Result/Option, use ?

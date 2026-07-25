@@ -688,9 +688,9 @@ false
     }
 
     #[test]
-    fn evaluate_reds_the_exit0_stub_baseline() {
-        // The exact RED baseline this PR establishes: a stub that exits 0 and
-        // prints nothing fails a case that expects real output.
+    fn evaluate_reds_a_stdout_mismatch() {
+        // A run that exits 0 but prints nothing must fail a case expecting output —
+        // the harness's own red-detection, independent of any real shell.
         let expected = Expected { status: 0, stdout: Some("hello world\n".into()), stderr: None };
         let out = evaluate("echo two words", &expected, 0, b"", b"");
         assert!(!out.passed);

@@ -1,34 +1,32 @@
 //! td-sh conformance: run the seed Oils-format spec corpus through the built
 //! `td-sh` binary and require every case to pass.
 //!
-//! This is the RED TDD baseline this PR establishes: the exit-0 stub fails every
-//! case. It is `#[ignore]`d ON PURPOSE so it does NOT run in the plain `cargo
-//! test` that the shared `cargo-test` gate — and every agent's `affected-checks`
-//! cargo-test preflight — executes. A perpetually-red shared gate would break
-//! land-on-green for the whole repo; the red baseline must stay opt-in until the
-//! interpreter can pass it. The harness's own red-detection logic is proven
-//! GREEN by the unit tests in `lib.rs` (`evaluate_reds_the_exit0_stub_baseline`).
+//! This WAS the RED TDD baseline (the exit-0 stub failed every case); the
+//! interpreter now passes the whole seed corpus, so the behavioral test runs in
+//! the plain `cargo test` that the shared `cargo-test` gate — and every agent's
+//! `affected-checks` cargo-test preflight — executes. It builds the debug
+//! `td-sh` and runs each case against it (no target toolchain needed), so it
+//! stays a green, blocking gate that locks conformance in: a regression that
+//! breaks any case reds the gate.
 //!
-//! The STRUCTURE of the corpus is still validated in-loop, though: the GREEN
-//! `seed_corpus_is_well_formed` test below parses and resolves every `spec/*.test.sh`
-//! on each gate run — it never runs the shell, so it stays green while catching a
-//! malformed corpus file (bad annotation, unterminated block) that the ignored
-//! behavioral test would otherwise never surface.
+//! The corpus STRUCTURE is validated separately by `seed_corpus_is_well_formed`,
+//! which parses and resolves every `spec/*.test.sh` without running the shell —
+//! so a malformed corpus file is caught even if the behavioral run is skipped.
 //!
-//! Watch progress explicitly:
-//!   cargo test --manifest-path td-sh/Cargo.toml -- --ignored --nocapture
+//! Watch case-by-case detail explicitly:
+//!   cargo test --manifest-path td-sh/Cargo.toml -- --nocapture
 //!
-//! Future PRs grow the interpreter until this is green, then drop `#[ignore]`;
-//! only once this AND the busybox `ash_test` parity gate pass is td-sh wired into
-//! the image as `/bin/sh` (system-x86-64).
+//! Conformance green is one of two gates before td-sh becomes the image
+//! `/bin/sh`; the busybox `ash_test` parity gate and the bulk Oils import are
+//! the remaining ones (system-x86-64), handled in later PRs.
 
 use std::path::{Path, PathBuf};
 
 use td_sh::{parse_spec, resolve, run_dir, tally, ASH_DASH_CHAIN};
 
-/// GREEN, non-ignored: parse and resolve every seed spec file on each gate run so
-/// a malformed corpus file reds in-loop (the behavioral RUN stays `#[ignore]`d
-/// below, off the shared gate). Runs no shell, so it cannot go red on the stub.
+/// Parse and resolve every seed spec file on each gate run so a malformed corpus
+/// file reds in-loop. Runs no shell, so it catches a structural corpus defect
+/// (bad annotation, unterminated block) independently of the behavioral run below.
 #[test]
 fn seed_corpus_is_well_formed() -> Result<(), Box<dyn std::error::Error>> {
     let spec_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("spec");
@@ -69,8 +67,9 @@ fn seed_corpus_is_well_formed() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// Build `td-sh` and run every seed spec case against it, requiring all to pass.
+/// Green and blocking: a regression that breaks any case reds the shared gate.
 #[test]
-#[ignore = "RED TDD baseline: the exit-0 stub fails every conformance case; run with --ignored"]
 fn seed_corpus_conformance() -> Result<(), Box<dyn std::error::Error>> {
     let shell = PathBuf::from(env!("CARGO_BIN_EXE_td-sh"));
     let spec_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("spec");
@@ -91,7 +90,7 @@ fn seed_corpus_conformance() -> Result<(), Box<dyn std::error::Error>> {
     assert!(total > 0, "no spec cases found under {}", spec_dir.display());
     assert_eq!(
         passed, total,
-        "{} of {} conformance cases failing (expected while td-sh is a stub)",
+        "{} of {} conformance cases failing — see FAIL lines above",
         total - passed,
         total
     );

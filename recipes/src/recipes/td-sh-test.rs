@@ -20,10 +20,10 @@ use crate::types::{CheckRunner, Recipe, RecipeCheck, Step};
 //
 // This is a BUILD-shape + smoke-exec check, not a conformance one. td-sh's actual
 // POSIX behavior is driven by the host-side conformance harness in the td-sh crate
-// (tests/conformance.rs over the Oils spec corpus): while `main.rs` is an exit-0
-// stub that harness is a RED baseline, and it is deliberately kept off the
-// shared per-change gate (it is `#[ignore]`d) so it cannot break land-on-green.
-// The shape build + smoke-exec here is green as soon as the toolchain links the stub.
+// (tests/conformance.rs over the Oils spec corpus), which runs green in the shared
+// per-change cargo-test gate. The shape build + smoke-exec here proves the SEPARATE
+// property that harness cannot: that the target toolchain links td-sh into the
+// self-contained static ELF the boot-critical `/bin/sh` slot requires.
 pub fn recipe() -> Recipe {
     let bin = "{in:td-sh}/bin/td-sh";
     let readelf = "{in:binutils-x86-64-native}/bin/readelf";
@@ -75,9 +75,8 @@ pub fn recipe() -> Recipe {
     );
     // Beyond the shape: actually RUN the static binary so a mis-built ELF with
     // correct headers but a broken entry point / bad static link fails here (the
-    // shape checks alone would pass it). The exit-0 stub returns 0 for any argv;
-    // when the interpreter lands, `-c 'exit 0'` is a real no-op program that still
-    // exits 0, so this smoke check stays valid across the stub→interpreter cutover.
+    // shape checks alone would pass it). `-c 'exit 0'` parses and runs a real (if
+    // trivial) program through the interpreter and must exit 0.
     steps.push(Step::run("{root}", &[bin, "-c", "exit 0"]));
 
     steps.push(Step::MkDir {
