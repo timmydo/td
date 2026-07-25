@@ -22,7 +22,11 @@
 //! TARGET-built programs (the guest kexec helper, the /bin/sh replacement, the
 //! network daemon, the boot shim, and the diagnostics multicall), not engine
 //! code, but are pure std and compile offline, so
-//! they lint/test here with the engine crates. The network tools
+//! they lint/test here with the engine crates. td-review is the one HOST-side
+//! crate here (in neither bootstrap graph, but pure std and offline), and only
+//! its `--bins` tests run: its integration tests need a `git`, which the sandbox
+//! toolchain has none of, so they run in the host `cargo-test` preflight.
+//! The network tools
 //! (fetch/feed/subst) carry the vendored
 //! FSDG crates and can't compile offline, so they are NOT linted here; their
 //! Cargo.toml still declares the same `[lints]` table so a local `cargo clippy`
@@ -103,6 +107,8 @@ pub fn gate() -> GateDef {
 	test "$b" -eq 1 || { echo "ERROR: td-boot is no longer dependency-free (Cargo.lock lists $b packages; it must carry ZERO crates — AGENTS.md 'Rust code')" >&2; exit 1; }; \
 	u=`"$td" text count-line-exact '[[package]]' td-util/Cargo.lock`; \
 	test "$u" -eq 1 || { echo "ERROR: td-util is no longer dependency-free (Cargo.lock lists $u packages; it must carry ZERO crates — AGENTS.md 'Rust code')" >&2; exit 1; }; \
+	rv=`"$td" text count-line-exact '[[package]]' td-review/Cargo.lock`; \
+	test "$rv" -eq 1 || { echo "ERROR: td-review is no longer dependency-free (Cargo.lock lists $rv packages; it must carry ZERO crates — AGENTS.md 'Rust code')" >&2; exit 1; }; \
 rustpath=`"$td" provision-rust` || exit $?; \
 ccpath=`"$td" provision-cc` || exit $?; \
 scratch="$PWD/.cargo-test-scratch"; \
@@ -117,16 +123,18 @@ CARGO_HOME="$scratch/home" CARGO_TARGET_DIR="$scratch/target" \
 	    cargo clippy --frozen --manifest-path td-netd/Cargo.toml; \
 	    cargo clippy --frozen --manifest-path td-boot/Cargo.toml; \
 	    cargo clippy --frozen --manifest-path td-util/Cargo.toml; \
+	    cargo clippy --frozen --manifest-path td-review/Cargo.toml --all-targets; \
 	    cargo test  --frozen --workspace; \
 	    cargo test  --frozen --manifest-path td-kexec/Cargo.toml; \
 	    cargo test  --frozen --manifest-path td-sh/Cargo.toml; \
 	    cargo test  --frozen --manifest-path td-netd/Cargo.toml; \
 	    cargo test  --frozen --manifest-path td-boot/Cargo.toml; \
-	    cargo test  --frozen --manifest-path td-util/Cargo.toml' 2>&1 | tee "$log"; \
+	    cargo test  --frozen --manifest-path td-util/Cargo.toml; \
+	    cargo test  --frozen --manifest-path td-review/Cargo.toml --bins' 2>&1 | tee "$log"; \
 	"$td" text cargo-test-ok "$log" || \
 	  { echo "ERROR: cargo test reported no passing tests (vacuous run?)" >&2; exit 1; }; \
 rm -rf "$scratch"; \
-echo "PASS: cargo-test — the engine workspace (builder + recipes + engine), td-kexec, td-sh, td-netd, td-boot, and td-util are dependency-free and lint clean; their unit tests pass (guix-free toolchain)."
+echo "PASS: cargo-test — the engine workspace (builder + recipes + engine), td-kexec, td-sh, td-netd, td-boot, td-util, and td-review are dependency-free and lint clean; their unit tests pass (guix-free toolchain)."
 "##,
     }
 }

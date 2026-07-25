@@ -1,0 +1,668 @@
+//! Capturing wrapper around the `git` CLI plus the few queries the review TUI
+//! needs. Everything runs with the pager and colour disabled so parsed output
+//! is plain text, and with `GIT_TERMINAL_PROMPT=0` so a credential prompt fails
+//! loudly instead of deadlocking behind the alternate screen.
+
+use std::io;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+/// Field separator for `for-each-ref` formats. Records are newline-separated and
+/// the free-text fields (author, subject) come last, so commit text cannot forge
+/// a row or shift a structural field.
+const FS: char = '\x1f';
+
+/// A remote's push URL set to this literal means "never push here" — the
+/// convention `git pushall` already honours.
+pub const NO_PUSH: &str = "no_push";
+
+pub struct Git {
+    repo: PathBuf,
+}
+
+/// One captured `git` invocation with stdout/stderr left as bytes.
+pub struct RawRun {
+    pub ok: bool,
+    pub code: Option<i32>,
+    pub stdout: Vec<u8>,
+    pub stderr: Vec<u8>,
+}
+
+/// Result of one captured `git` invocation.
+pub struct Run {
+    pub ok: bool,
+    pub code: Option<i32>,
+    pub stdout: String,
+    pub stderr: String,
+}
+
+impl Run {
+    /// Trimmed stdout — the common shape for single-value plumbing queries.
+    pub fn line(&self) -> &str {
+        self.stdout.trim()
+    }
+
+    /// One-line failure summary. Callers log git's full output separately, so
+    /// this must stay a single row: a multi-line blob would be collapsed into
+    /// one clipped smear by the frame renderer.
+    pub fn failure(&self) -> String {
+        let text = if self.stderr.trim().is_empty() { &self.stdout } else { &self.stderr };
+        // Prefer git's own diagnostic: it routinely prints warnings ahead of the
+        // fatal line, and the first line alone would report the wrong cause.
+        // `!` first, because on a rejected push the useful line is
+        // `! [remote rejected] … (deletion of the current branch prohibited)`
+        // while the `error:` line is only "failed to push some refs".
+        let mut lines = text.lines().map(str::trim).filter(|l| !l.is_empty());
+        let first = lines
+            .clone()
+            .find(|l| l.starts_with('!'))
+            .or_else(|| lines.clone().find(|l| l.starts_with("fatal:") || l.starts_with("error:")));
+        match first.or_else(|| lines.next()) {
+            Some(line) => line.to_string(),
+            None => match self.code {
+                Some(c) => format!("git exited with status {c}"),
+                None => "git terminated by signal".to_string(),
+            },
+        }
+    }
+}
+
+/// Outcome of a trial squash-merge.
+pub enum MergeResult {
+    /// Tree oid the landing would stage.
+    Clean(String),
+    Conflicted,
+    /// git could not compute it (too old for `merge-tree --write-tree`, a bad
+    /// ref, …) — carries git's own message.
+    Unavailable(String),
+}
+
+/// One remote-tracking branch as shown in the list.
+pub struct Branch {
+    pub refname: String,
+    pub commit: String,
+    pub committed_unix: i64,
+    pub author: String,
+    pub subject: String,
+    /// Commits ahead of / behind the base. `None` when git could not report
+    /// them (pre-2.41, no `%(ahead-behind:)`).
+    pub counts: Option<(u32, u32)>,
+}
+
+impl Branch {
+    /// Compact age ("26m", "4h", "3d") relative to `now`.
+    pub fn age(&self, now: i64) -> String {
+        age_label(now.saturating_sub(self.committed_unix))
+    }
+
+    pub fn counts_label(&self) -> String {
+        match self.counts {
+            Some((a, b)) => format!("{a}/{b}"),
+            None => "?/?".to_string(),
+        }
+    }
+
+    /// Known to contribute nothing — dimmed in the list. Unknown counts are
+    /// not treated as empty.
+    pub fn nothing_ahead(&self) -> bool {
+        matches!(self.counts, Some((0, _)))
+    }
+}
+
+/// Split a remote-tracking ref into (remote, branch name) — the branch name is
+/// what a delete refspec names. Splits ONLY on a leading component that is a
+/// configured remote, so `origin/feature/x` -> `("origin", "feature/x")` while a
+/// local `feature/x` is left whole.
+pub fn split_remote<'a>(refname: &'a str, remotes: &[String]) -> (Option<&'a str>, &'a str) {
+    // `git remote add foo/bar` is accepted, so the remote is not necessarily the
+    // first path component: take the LONGEST configured remote that prefixes the
+    // ref. Splitting on the first `/` would hand a delete the wrong branch name.
+    let mut best = 0usize;
+    for r in remotes {
+        if r.len() > best
+            && refname.starts_with(r.as_str())
+            && refname.get(r.len()..r.len().saturating_add(1)) == Some("/")
+        {
+            best = r.len();
+        }
+    }
+    match (refname.get(..best), refname.get(best.saturating_add(1)..)) {
+        (Some(name), Some(rest)) if best > 0 => (Some(name), rest),
+        _ => (None, refname),
+    }
+}
+
+/// Render a duration in seconds as a fixed-width-ish compact label.
+pub fn age_label(secs: i64) -> String {
+    if secs < 0 {
+        return "future".to_string();
+    }
+    const MINUTE: i64 = 60;
+    const HOUR: i64 = 60 * MINUTE;
+    const DAY: i64 = 24 * HOUR;
+    const WEEK: i64 = 7 * DAY;
+    const YEAR: i64 = 365 * DAY;
+    if secs < MINUTE {
+        format!("{secs}s")
+    } else if secs < HOUR {
+        format!("{}m", secs / MINUTE)
+    } else if secs < DAY {
+        format!("{}h", secs / HOUR)
+    } else if secs < WEEK {
+        format!("{}d", secs / DAY)
+    } else if secs < YEAR {
+        format!("{}w", secs / WEEK)
+    } else {
+        format!("{}y", secs / YEAR)
+    }
+}
+
+pub fn now_unix() -> i64 {
+    match SystemTime::now().duration_since(UNIX_EPOCH) {
+        Ok(d) => d.as_secs() as i64,
+        Err(_) => 0,
+    }
+}
+
+impl Git {
+    pub fn new(repo: PathBuf) -> Git {
+        Git { repo }
+    }
+
+    /// Locate the work tree root containing `start`.
+    pub fn discover(start: &Path) -> io::Result<Git> {
+        let out = Command::new("git")
+            .current_dir(start)
+            .args(["rev-parse", "--show-toplevel"])
+            .stdin(Stdio::null())
+            .output()
+            .map_err(|e| io::Error::new(e.kind(), format!("running git: {e}")))?;
+        let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if !out.status.success() || stdout.is_empty() {
+            let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("{} is not inside a git work tree: {err}", start.display()),
+            ));
+        }
+        Ok(Git::new(PathBuf::from(stdout)))
+    }
+
+    pub fn repo(&self) -> &Path {
+        &self.repo
+    }
+
+    /// Run git with output captured. Never fails on a non-zero exit status —
+    /// inspect [`Run::ok`].
+    pub fn run(&self, args: &[&str]) -> io::Result<Run> {
+        let out = self.run_raw(args)?;
+        Ok(Run {
+            ok: out.ok,
+            code: out.code,
+            stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+        })
+    }
+
+    /// One git invocation with stdout left undecoded. A commit message is copied
+    /// through verbatim, and `from_utf8_lossy` would rewrite the bytes of a
+    /// message that is not valid UTF-8 into U+FFFD.
+    pub fn run_raw(&self, args: &[&str]) -> io::Result<RawRun> {
+        let out = Command::new("git")
+            .current_dir(&self.repo)
+            .arg("--no-pager")
+            // color.ui=false alone is overridden by a per-command
+            // `color.diff=always`, which would bleed escapes into the panes.
+            .args(["-c", "color.ui=false", "-c", "color.diff=never"])
+            .args(args)
+            .stdin(Stdio::null())
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .env("GIT_PAGER", "cat")
+            .output()
+            .map_err(|e| io::Error::new(e.kind(), format!("running git: {e}")))?;
+        Ok(RawRun {
+            ok: out.status.success(),
+            code: out.status.code(),
+            stdout: out.stdout,
+            stderr: out.stderr,
+        })
+    }
+
+    /// The squash message exactly as git stored it. Returned as bytes: it is
+    /// written to SQUASH_MSG and committed verbatim, so it must not be decoded.
+    pub fn message_bytes(&self, range: &str) -> io::Result<Vec<u8>> {
+        // Pin the output encoding: git re-encodes a message that declares a
+        // legacy `encoding` header into `i18n.logOutputEncoding`, and the
+        // committed result must be the UTF-8 `git commit` will record, not
+        // whatever the ambient config asks for.
+        let run = self.run_raw(&[
+            "-c",
+            "i18n.logOutputEncoding=UTF-8",
+            "log",
+            "--reverse",
+            "--format=%B",
+            range,
+            "--",
+        ])?;
+        if run.ok {
+            return Ok(run.stdout);
+        }
+        Err(io::Error::other(String::from_utf8_lossy(&run.stderr).trim().to_string()))
+    }
+
+    /// Run git, turning a non-zero exit into an `Err` carrying git's own message.
+    pub fn run_ok(&self, args: &[&str]) -> io::Result<String> {
+        let run = self.run(args)?;
+        if run.ok {
+            Ok(run.stdout)
+        } else {
+            Err(io::Error::other(format!(
+                "git {}: {}",
+                args.join(" "),
+                run.failure()
+            )))
+        }
+    }
+
+    /// Run git with the terminal handed over (pager, colour, prompts) for the
+    /// "open this diff in my own pager" escape hatch. Stdio is bound to
+    /// `/dev/tty` rather than inherited, so the pager still works when
+    /// td-review's own stdin or stdout is redirected.
+    pub fn run_interactive(&self, args: &[&str]) -> io::Result<()> {
+        let open = |write: bool| -> io::Result<std::fs::File> {
+            std::fs::OpenOptions::new().read(!write).write(write).open("/dev/tty")
+        };
+        let status = Command::new("git")
+            .current_dir(&self.repo)
+            .args(args)
+            .stdin(Stdio::from(open(false)?))
+            .stdout(Stdio::from(open(true)?))
+            .stderr(Stdio::from(open(true)?))
+            .status()
+            .map_err(|e| io::Error::new(e.kind(), format!("running git: {e}")))?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err(io::Error::other(match status.code() {
+                Some(c) => format!("git {} exited with status {c}", args.join(" ")),
+                None => format!("git {} terminated by signal", args.join(" ")),
+            }))
+        }
+    }
+
+    /// Uncommitted changes, including untracked files — the same porcelain
+    /// check `git squash-in` refuses on.
+    pub fn dirty_entries(&self) -> io::Result<Vec<String>> {
+        let out = self.run_ok(&["status", "--porcelain"])?;
+        Ok(out.lines().map(str::to_string).collect())
+    }
+
+    /// Currently checked-out branch, or `None` when HEAD is detached.
+    pub fn head_branch(&self) -> io::Result<Option<String>> {
+        let run = self.run(&["symbolic-ref", "--quiet", "--short", "HEAD"])?;
+        if run.ok {
+            Ok(Some(run.line().to_string()))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub fn git_dir(&self) -> io::Result<PathBuf> {
+        Ok(PathBuf::from(
+            self.run_ok(&["rev-parse", "--absolute-git-dir"])?.trim(),
+        ))
+    }
+
+    /// `--verify`: resolve exactly one object, and never read `rev` as a flag.
+    pub fn rev_parse(&self, rev: &str) -> io::Result<String> {
+        Ok(self.run_ok(&["rev-parse", "--verify", "--end-of-options", rev])?.trim().to_string())
+    }
+
+    /// Resolve a branch argument the way the list means it. `rev-parse` DWIM
+    /// searches `refs/tags/<name>` before `refs/remotes/<name>`, so a tag named
+    /// `origin/work-1` would outrank the remote-tracking ref and the pane, the
+    /// pin and the merge could then name different commits.
+    pub fn branch_oid(&self, name: &str) -> io::Result<String> {
+        for qualified in [format!("refs/remotes/{name}"), format!("refs/heads/{name}")] {
+            let run =
+                self.run(&["rev-parse", "--verify", "--quiet", "--end-of-options", &qualified])?;
+            if run.ok {
+                return Ok(run.line().to_string());
+            }
+        }
+        self.rev_parse(name)
+    }
+
+    pub fn merge_base(&self, a: &str, b: &str) -> io::Result<String> {
+        let run = self.run(&["merge-base", a, b])?;
+        if !run.ok {
+            return Err(io::Error::other(format!("no merge base between {a} and {b}")));
+        }
+        Ok(run.line().to_string())
+    }
+
+    /// Remote-tracking branches, newest commit first, excluding the `*/HEAD`
+    /// symrefs and every remote's copy of the base branch.
+    ///
+    /// `%(ahead-behind:)` needs git >= 2.41; on an older git the whole query
+    /// fails, so retry without it and leave the counts unknown rather than
+    /// refusing to start.
+    pub fn branches(&self, base: &str) -> io::Result<Vec<Branch>> {
+        let fmt = |counts: &str| {
+            format!(
+                // Full refname, not %(refname:short): git's shortening drops a
+                // trailing /HEAD, which would smuggle the symref in as a branch.
+                "--format=%(refname){FS}%(objectname){FS}%(committerdate:unix){FS}\
+                 {counts}{FS}%(authorname){FS}%(contents:subject)"
+            )
+        };
+        let with_counts = fmt(&format!("%(ahead-behind:refs/heads/{base})"));
+        let run = self.run(&["for-each-ref", "--sort=-committerdate", &with_counts, "refs/remotes"])?;
+        let remotes = self.remote_names()?;
+        if run.ok {
+            return Ok(parse_branches(&run.stdout, base, &remotes));
+        }
+        // Leave the counts field empty so the record shape is unchanged.
+        let out = self.run_ok(&["for-each-ref", "--sort=-committerdate", &fmt(""), "refs/remotes"])?;
+        Ok(parse_branches(&out, base, &remotes))
+    }
+
+    /// How far the local base has fallen behind its upstream, if it has one.
+    /// Landing onto a stale base produces a commit every remote then rejects.
+    pub fn base_behind_upstream(&self, base: &str) -> io::Result<Option<(String, u32)>> {
+        let upstream = self.run(&["rev-parse", "--abbrev-ref", &format!("{base}@{{upstream}}")])?;
+        if !upstream.ok {
+            return Ok(None);
+        }
+        let name = upstream.line().to_string();
+        let counts = self.run(&["rev-list", "--count", &format!("{base}..{name}")])?;
+        if !counts.ok {
+            return Ok(None);
+        }
+        match counts.line().parse::<u32>() {
+            Ok(0) | Err(_) => Ok(None),
+            Ok(n) => Ok(Some((name, n))),
+        }
+    }
+
+    /// Commits on `base` that its upstream does not have, oldest first. A push
+    /// publishes all of them, not just the one that was reviewed.
+    pub fn unpushed(&self, base: &str) -> io::Result<Vec<String>> {
+        let upstream = self.run(&["rev-parse", "--abbrev-ref", &format!("{base}@{{upstream}}")])?;
+        if !upstream.ok {
+            return Ok(Vec::new());
+        }
+        let name = upstream.line().to_string();
+        let run = self.run(&[
+            "log",
+            "--reverse",
+            "--oneline",
+            "--no-decorate",
+            &format!("{name}..{base}"),
+            "--",
+        ])?;
+        if !run.ok {
+            return Ok(Vec::new());
+        }
+        Ok(run.stdout.lines().map(str::to_string).collect())
+    }
+
+    /// The oid of `refs/remotes/<remote>/<short>`, or None when it does not exist.
+    pub fn remote_branch_oid(&self, remote: &str, short: &str) -> io::Result<Option<String>> {
+        let refname = format!("refs/remotes/{remote}/{short}");
+        let run = self.run(&["rev-parse", "--verify", "--quiet", &refname])?;
+        Ok(if run.ok { Some(run.line().to_string()) } else { None })
+    }
+
+    /// The tree `git merge --squash <branch>` would stage onto `base`, computed
+    /// without touching the index or work tree. `Conflicted` and `Unavailable`
+    /// both mean "no tree to diff" — the caller says which, because they read
+    /// very differently to someone about to approve a landing.
+    pub fn merge_tree(&self, base: &str, branch: &str) -> io::Result<MergeResult> {
+        let run = self.run(&["merge-tree", "--write-tree", base, branch])?;
+        let tree = run.stdout.lines().next().unwrap_or_default().trim();
+        let is_oid = tree.len() >= 40 && tree.chars().all(|c| c.is_ascii_hexdigit());
+        Ok(match (run.ok, run.code) {
+            (true, _) if is_oid => MergeResult::Clean(tree.to_string()),
+            // 1 is "merged with conflicts"; anything else is git declining.
+            (false, Some(1)) => MergeResult::Conflicted,
+            _ => MergeResult::Unavailable(run.failure()),
+        })
+    }
+
+    /// Every URL `git push <remote>` writes to, in that order. `--all`, because
+    /// a push reaches all of them and only the first is reported without it.
+    pub fn push_urls(&self, remote: &str) -> io::Result<Vec<String>> {
+        let run = self.run(&["remote", "get-url", "--push", "--all", remote])?;
+        if !run.ok {
+            return Err(io::Error::other(run.failure()));
+        }
+        let urls: Vec<String> =
+            run.stdout.lines().map(str::trim).filter(|l| !l.is_empty()).map(str::to_string).collect();
+        if urls.is_empty() {
+            return Err(io::Error::other(format!("{remote} has no push URL")));
+        }
+        Ok(urls)
+    }
+
+    /// The default branch of every endpoint a delete would reach, asked live.
+    /// The local `refs/remotes/<remote>/HEAD` symref is not consulted: it is
+    /// whatever the last `set-head` recorded and the delete goes to the PUSH
+    /// URLs, which need not be the repository that symref describes. `Err`
+    /// means it could not be established — a delete must refuse rather than
+    /// assume, since "unknown" is exactly the state in which the branch could
+    /// be the one that must not go.
+    pub fn default_branches(&self, remote: &str) -> io::Result<Vec<String>> {
+        let mut heads = Vec::new();
+        for url in self.push_urls(remote)? {
+            let run = self.run(&["ls-remote", "--symref", "--end-of-options", &url, "HEAD"])?;
+            if !run.ok {
+                return Err(io::Error::other(run.failure()));
+            }
+            // `ref: refs/heads/<name>\tHEAD` on the first line.
+            let head = run
+                .stdout
+                .lines()
+                .filter_map(|l| l.strip_prefix("ref: "))
+                .filter_map(|l| l.split_whitespace().next())
+                .filter_map(|r| r.strip_prefix("refs/heads/"))
+                .next();
+            match head {
+                Some(name) => heads.push(name.to_string()),
+                None => {
+                    return Err(io::Error::other(format!("{url} did not report a default branch")))
+                }
+            }
+        }
+        Ok(heads)
+    }
+
+    /// Configured remote names, in `git remote` order.
+    pub fn remote_names(&self) -> io::Result<Vec<String>> {
+        Ok(self
+            .run_ok(&["remote"])?
+            .lines()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect())
+    }
+
+    /// Every configured remote paired with its push URL.
+    pub fn remotes(&self) -> io::Result<Vec<(String, String)>> {
+        let names = self.run_ok(&["remote"])?;
+        let mut out = Vec::new();
+        for name in names.lines().map(str::trim).filter(|s| !s.is_empty()) {
+            let run = self.run(&["remote", "get-url", "--push", "--all", name])?;
+            // `git push` uses EVERY configured pushurl, so `--all`: without it
+            // only the first is seen and a later sentinel would be missed.
+            // If any of them is the sentinel the remote is not pushable.
+            let url = if run.ok && run.stdout.lines().any(|l| l.trim() == NO_PUSH) {
+                NO_PUSH.to_string()
+            } else if run.ok {
+                run.line().to_string()
+            } else {
+                String::new()
+            };
+            out.push((name.to_string(), url));
+        }
+        Ok(out)
+    }
+}
+
+/// Split `for-each-ref` output into records. Kept free of `Git` so it is
+/// directly testable.
+const REMOTES: &str = "refs/remotes/";
+
+pub fn parse_branches(out: &str, base: &str, remotes: &[String]) -> Vec<Branch> {
+    let mut branches = Vec::new();
+    for record in out.lines() {
+        if record.trim().is_empty() {
+            continue;
+        }
+        // Exactly 6 fields; the last absorbs any FS the subject carries.
+        let mut fields = record.splitn(6, FS);
+        let refname = match fields.next().map(|r| r.strip_prefix(REMOTES).unwrap_or(r)) {
+            Some(r) if !r.is_empty() => r.to_string(),
+            _ => continue,
+        };
+        let commit = fields.next().unwrap_or_default().to_string();
+        let committed_unix =
+            fields.next().unwrap_or_default().trim().parse::<i64>().unwrap_or(0);
+        let counts = parse_ahead_behind(fields.next().unwrap_or_default());
+        let author = fields.next().unwrap_or_default().to_string();
+        let subject = fields.next().unwrap_or_default().to_string();
+
+        // `*/HEAD` is a symref alias, and every remote's copy of the base
+        // branch is the landing target rather than a candidate. Split the way a
+        // delete does, or a remote whose name contains `/` slips both through.
+        let short = split_remote(&refname, remotes).1;
+        if short == "HEAD" || short == base {
+            continue;
+        }
+        branches.push(Branch { refname, commit, committed_unix, author, subject, counts });
+    }
+    branches
+}
+
+/// `%(ahead-behind:...)` renders as "<ahead> <behind>"; empty when the field
+/// was not requested or the base ref is missing.
+fn parse_ahead_behind(field: &str) -> Option<(u32, u32)> {
+    let mut parts = field.split_whitespace();
+    let ahead = parts.next()?.parse().ok()?;
+    let behind = parts.next()?.parse().ok()?;
+    Some((ahead, behind))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn names(branches: &[Branch]) -> Vec<&str> {
+        branches.iter().map(|b| b.refname.as_str()).collect()
+    }
+
+    /// `git remote add foo/bar` is accepted, and a delete that guessed the
+    /// remote from the first path component would name the wrong branch.
+    #[test]
+    fn a_ref_is_split_on_the_longest_remote_that_prefixes_it() {
+        let remotes = ["origin".to_string(), "origin/mirror".to_string()];
+        assert_eq!(split_remote("origin/work-1", &remotes), (Some("origin"), "work-1"));
+        assert_eq!(
+            split_remote("origin/mirror/work-1", &remotes),
+            (Some("origin/mirror"), "work-1")
+        );
+        // A slashed BRANCH name on a plain remote still keeps its slashes.
+        assert_eq!(split_remote("origin/feature/x", &remotes), (Some("origin"), "feature/x"));
+        // Nothing matches: the whole thing is the branch name.
+        assert_eq!(split_remote("work-1", &remotes), (None, "work-1"));
+        assert_eq!(split_remote("upstream/work-1", &remotes), (None, "upstream/work-1"));
+        // A remote name alone is not a branch on that remote.
+        assert_eq!(split_remote("origin", &remotes), (None, "origin"));
+    }
+
+    /// The list must hide the same rows a delete would refuse: a remote whose
+    /// name contains `/` otherwise leaks its HEAD symref and its copy of the
+    /// base branch into the candidates.
+    #[test]
+    fn a_slashed_remote_still_hides_its_head_and_the_base() {
+        let remotes = ["origin".to_string(), "foo/bar".to_string()];
+        let out = [
+            record("foo/bar/HEAD", "0 0", "a", "s"),
+            record("foo/bar/main", "0 0", "a", "s"),
+            record("foo/bar/work-1", "1 0", "a", "s"),
+        ]
+        .join("\n");
+        assert_eq!(names(&parse_branches(&out, "main", &remotes)), vec!["foo/bar/work-1"]);
+    }
+
+    /// One `for-each-ref` record in the shipped field order.
+    fn record(refname: &str, counts: &str, author: &str, subject: &str) -> String {
+        format!("refs/remotes/{refname}{FS}abc123{FS}1700000000{FS}{counts}{FS}{author}{FS}{subject}\n")
+    }
+
+    #[test]
+    fn parses_records_and_skips_head_and_base() {
+        let out = format!(
+            "{}{}{}{}",
+            record("origin/work-1", "3 4", "Ada", "subject one"),
+            // git shortens refs/remotes/origin/HEAD to plain "origin"; parsing
+            // the full refname is what keeps it out of the list.
+            record("origin/HEAD", "0 0", "Ada", "sym"),
+            record("origin/main", "0 0", "Ada", "base"),
+            record("other/work-2", "1 0", "Bob", "subject two"),
+        );
+        let branches = parse_branches(&out, "main", &["origin".to_string()]);
+        assert_eq!(names(&branches), vec!["origin/work-1", "other/work-2"]);
+        assert_eq!(
+            branches.first().map(|b| (b.subject.as_str(), b.counts)),
+            Some(("subject one", Some((3, 4))))
+        );
+    }
+
+    #[test]
+    fn missing_ahead_behind_is_unknown_not_zero() {
+        // The pre-2.41 fallback leaves the field empty; "0 ahead" must not be
+        // implied, or an unlandable branch would look dimmed and landable.
+        let out = record("origin/w", "", "Ada", "s");
+        let branches = parse_branches(&out, "main", &["origin".to_string()]);
+        let b = branches.first();
+        assert_eq!(b.and_then(|b| b.counts), None);
+        assert_eq!(b.map(Branch::counts_label), Some("?/?".to_string()));
+        assert_eq!(b.map(Branch::nothing_ahead), Some(false));
+    }
+
+    #[test]
+    fn a_subject_cannot_forge_a_row_or_shift_a_structural_field() {
+        // A subject stuffed with field separators and a whole fake record.
+        let hostile = format!("evil{FS}deadbeef{FS}1{FS}9 9{FS}Mallory{FS}spoofed");
+        let out = record("origin/w", "2 0", "Ada", &hostile);
+        let branches = parse_branches(&out, "main", &["origin".to_string()]);
+        assert_eq!(names(&branches), vec!["origin/w"]);
+        // The structural fields all precede the free text, so they survive.
+        assert_eq!(branches.first().and_then(|b| b.counts), Some((2, 0)));
+        assert_eq!(branches.first().map(|b| b.author.as_str()), Some("Ada"));
+        assert_eq!(branches.first().map(|b| b.subject.as_str()), Some(hostile.as_str()));
+    }
+
+    #[test]
+    fn subject_may_contain_slashes_and_spaces() {
+        let out = record("origin/feat/x", "2 0", "A B", "a: b/c d");
+        let branches = parse_branches(&out, "main", &["origin".to_string()]);
+        assert_eq!(
+            branches.first().map(|b| (b.refname.as_str(), b.subject.as_str())),
+            Some(("origin/feat/x", "a: b/c d"))
+        );
+    }
+
+    #[test]
+    fn age_labels_scale() {
+        assert_eq!(age_label(30), "30s");
+        assert_eq!(age_label(90), "1m");
+        assert_eq!(age_label(3 * 3600 + 5), "3h");
+        assert_eq!(age_label(50 * 3600), "2d");
+        assert_eq!(age_label(20 * 86400), "2w");
+        assert_eq!(age_label(800 * 86400), "2y");
+    }
+}

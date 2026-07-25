@@ -50,3 +50,6 @@ tests/*/target/
 
 # Claude Code session runtime state — session-specific, never versioned.
 .claude/scheduled_tasks.lock
+
+# td-review: the host-side integrator TUI is built locally, not by a recipe.
+td-review/target/

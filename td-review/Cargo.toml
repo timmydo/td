@@ -1,0 +1,30 @@
+[package]
+name = "td-review"
+version = "0.1.0"
+edition = "2021"
+description = "Host-side integrator TUI: review branches against main, squash-land them, push to every remote"
+license = "GPL-3.0-or-later"
+
+# Own workspace root, so cargo behaves the same from the main checkout as from a
+# worktree nested under it.
+[workspace]
+
+[[bin]]
+name = "td-review"
+path = "src/main.rs"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+unreachable = "deny"
+todo = "deny"
+unimplemented = "deny"
+indexing_slicing = "deny"
+
+[profile.release]
+opt-level = 2
+strip = true

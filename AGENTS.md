@@ -292,7 +292,13 @@ td's Rust is defensive and minimal-surface.
   (path members carry none), so a new registry/git dep OR a new path member both red it.
   The target-side `td-kexec`, `td-sh`, `td-netd`, `td-boot`, and `td-util` crates
   outside the workspace each keep their own 1-package lock; `td-sh`, `td-boot`, and
-  `td-util` contain no `unsafe`.
+  `td-util` contain no `unsafe`. `td-review` (the host-side integrator
+  branch-review/landing TUI) keeps one too: it is in NEITHER bootstrap graph — no
+  recipe builds it and it never enters a closure — but it is pure `std`, `forbid`s
+  `unsafe_code`, and rides the same cargo-test gate, so the coding rules are
+  enforced on it like any other td crate. A new standalone crate must be added to
+  that gate and to `builder/src/affected.rs` in its landing, or its lints and tests
+  never run.
   The network tools (`fetch`/`feed`/`subst`) are the *only* crates allowed dependencies,
   and only the vendored-through-the-cargo-proxy FSDG set they already have
   (`ureq`/`rustls`/`sha2`/`ring`); a *new* dependency anywhere is a reviewed decision
