@@ -1,0 +1,6 @@
+# Cargo build output — never committed. td-sh's source is the committed tree
+# only (Cargo.toml, Cargo.lock, src/, tests/, spec/). The recipe compiles
+# src/main.rs with rustc directly; a local `cargo build`/`cargo test` here is
+# only for lint/test and must not be packed into any derivation.
+/target
+/.cargo

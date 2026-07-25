@@ -716,6 +716,25 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
         return;
     }
 
+    // td-sh: the target-built POSIX /bin/sh (busybox-`sh` replacement), a standalone
+    // std-only crate OUTSIDE the engine workspace, exactly like td-kexec — same
+    // routing. Its lib.rs conformance harness + unit tests lint/test on the host
+    // cargo-test preflight (check-pr). src/main.rs is `include_str!`'d into the td-sh
+    // RECIPE, so a stub-source edit changes the TARGET artifact and a static-link
+    // regression is invisible to host cargo — so also route to recipe-checks-daily
+    // (daily backstop statically links it via td-sh-test). Its RECIPE files under
+    // recipes/src/recipes/ are routed by the recipes arm above, not here. The
+    // spec/ corpus and tests/ carry no standalone shell scripts, so no shell-syntax.
+    if pattern_matches(
+        "td-sh/*|td-sh/src/*|td-sh/tests/*|td-sh/spec/*|td-sh/Cargo.toml|td-sh/Cargo.lock",
+        p,
+    ) {
+        sel.add_preflight("cargo-test");
+        sel.add_target("check-pr");
+        sel.add_target("recipe-checks-daily");
+        return;
+    }
+
     // Catch-all: an unmapped path used to require the FULL loop; it now runs
     // the bounded check-pr tier (the ~10-min per-PR budget) and leans on the
     // daily backstop for the daily-tier gates.
@@ -735,7 +754,7 @@ fn preflight_cmd(name: &str) -> Option<&'static str> {
         "shell-syntax" => Some("  bash -n tests/*.sh ci/*.sh tools/*.sh"),
         "heal-revert" => Some("  bash tests/heal-revert.sh"),
         "cargo-test" => {
-            Some("  cargo test + clippy --frozen --workspace (builder/recipes/engine) + --manifest-path td-kexec/Cargo.toml + --manifest-path td-netd/Cargo.toml + --manifest-path td-boot/Cargo.toml")
+            Some("  cargo test + clippy --frozen --workspace (builder/recipes/engine) + --manifest-path td-kexec/Cargo.toml + --manifest-path td-sh/Cargo.toml + --manifest-path td-netd/Cargo.toml + --manifest-path td-boot/Cargo.toml")
         }
         "affected-self-test" => Some("  td-builder affected-checks --self-test"),
         _ => None,
@@ -1121,6 +1140,14 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
     // backstop (recipe-checks-daily statically links it via td-kexec-test).
     assert_target!("td-kexec/src/main.rs", "check-pr");
     assert_target!("td-kexec/src/main.rs", "recipe-checks-daily");
+    // td-sh mirrors td-kexec: standalone std-only crate, main.rs include_str!'d into
+    // its recipe, so host cargo preflight (check-pr) + daily static-link backstop.
+    assert_target!("td-sh/src/main.rs", "check-pr");
+    assert_target!("td-sh/src/main.rs", "recipe-checks-daily");
+    assert_target!("td-sh/src/lib.rs", "check-pr");
+    assert_target!("td-sh/src/lib.rs", "recipe-checks-daily");
+    assert_target!("td-sh/spec/smoke.test.sh", "check-pr");
+    assert_target!("td-sh/spec/smoke.test.sh", "recipe-checks-daily");
     // td-netd/src is include_str!'d into the target artifact (its recipe AND packed
     // into system-x86-64), so a helper-source edit rides the host cargo preflight
     // (check-pr) AND is recorded as deferred to the daily backstop (recipe-checks-daily
@@ -1320,14 +1347,19 @@ fn run_preflight(root: &Path, name: &str) -> i32 {
             // dependency-free pure std, while their static TARGET links are daily.
             // builder + recipes + the shared engine lib are one cargo workspace,
             // so --workspace lints/tests all three in one invocation; the target
-            // programs are standalone crates and ride the preflight explicitly.
+            // programs (td-kexec, td-sh, td-netd, td-boot) are standalone crates and
+            // ride the preflight explicitly. td-sh's conformance corpus run is
+            // `#[ignore]`d, so this plain `cargo test` runs only its (green)
+            // parser/harness unit tests.
             for cmd in [
                 "cargo test --frozen --workspace",
                 "cargo test --frozen --manifest-path td-kexec/Cargo.toml",
+                "cargo test --frozen --manifest-path td-sh/Cargo.toml",
                 "cargo test --frozen --manifest-path td-netd/Cargo.toml",
                 "cargo test --frozen --manifest-path td-boot/Cargo.toml",
                 "cargo clippy --frozen --workspace",
                 "cargo clippy --frozen --manifest-path td-kexec/Cargo.toml",
+                "cargo clippy --frozen --manifest-path td-sh/Cargo.toml",
                 "cargo clippy --frozen --manifest-path td-netd/Cargo.toml",
                 "cargo clippy --frozen --manifest-path td-boot/Cargo.toml",
             ] {
@@ -1606,7 +1638,7 @@ mod tests {
                 "  builder/src/main.rs",
                 "",
                 "Selected checks:",
-                "  cargo test + clippy --frozen --workspace (builder/recipes/engine) + --manifest-path td-kexec/Cargo.toml + --manifest-path td-netd/Cargo.toml + --manifest-path td-boot/Cargo.toml",
+                "  cargo test + clippy --frozen --workspace (builder/recipes/engine) + --manifest-path td-kexec/Cargo.toml + --manifest-path td-sh/Cargo.toml + --manifest-path td-netd/Cargo.toml + --manifest-path td-boot/Cargo.toml",
                 "  td-builder check check-engine",
                 "",
                 "Waiver: inspection only (--path does not prove the branch diff)",
@@ -1631,7 +1663,7 @@ mod tests {
                 "",
                 "Selected checks:",
                 "  bash -n tests/*.sh ci/*.sh tools/*.sh",
-                "  cargo test + clippy --frozen --workspace (builder/recipes/engine) + --manifest-path td-kexec/Cargo.toml + --manifest-path td-netd/Cargo.toml + --manifest-path td-boot/Cargo.toml",
+                "  cargo test + clippy --frozen --workspace (builder/recipes/engine) + --manifest-path td-kexec/Cargo.toml + --manifest-path td-sh/Cargo.toml + --manifest-path td-netd/Cargo.toml + --manifest-path td-boot/Cargo.toml",
                 "  td-builder check check-pr",
                 "",
                 "Waiver: inspection only (--path does not prove the branch diff)",
