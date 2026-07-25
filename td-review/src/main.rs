@@ -1,7 +1,7 @@
 //! td-review — the integrator's branch review and landing TUI. It is
-//! `git squash-in` then `git commit` then `git pushall`, driven with plumbing
-//! so each step's outcome is visible and testable. The non-interactive modes
-//! exist for scripting and for the integration test.
+//! `git squash-in` then `git commit`, then a separate `p`/`P` push, driven with
+//! plumbing so each step's outcome is visible and testable. The non-interactive
+//! modes exist for scripting and for the integration test.
 #![forbid(unsafe_code)]
 
 mod app;
@@ -30,7 +30,8 @@ options:
       --list          print the branch table and exit (no TUI)
       --preview <br>  print what landing <br> would stage, and exit
       --land <branch> land <branch> non-interactively; needs --yes
-      --push          with --land, also push the base to every remote
+      --push          with --land, also push the base to every remote (`P`;
+                      the TUI's `p` pushes to the base's remote alone)
       --expect <oid>  with --land, require the branch to still be at <oid>
       --expect-base <oid>
                       with --land, require the base to still be at <oid>
@@ -40,9 +41,11 @@ options:
   -h, --help          this text
 
 keys (TUI):
-  j/k move   enter review   f fetch base's remote   F fetch all   r reload
-  / filter   D delete   ? help   q quit
+  j/k move   enter review   r reload   / filter   D delete   ? help   q quit
+  f fetch the base's remote   F fetch every remote
+  p push the base to its remote   P push the base to every remote
   in review: j/k or space/b scroll, p pager, a approve + land
+  landing commits only; p publishes it afterwards
 ";
 
 struct Args {
@@ -246,11 +249,12 @@ fn delete_headless(
     }
     let remotes = git.remote_names()?;
     let (named, short) = git::split_remote(branch, &remotes);
-    // Post-land cleanup sweeps every remote holding the commit we just took (the
-    // oid filter is what makes that safe); an ad-hoc `--delete origin/x` touches
-    // only the remote it names.
-    let only = if landed_oid.is_some() { None } else { named };
-    let (targets, diverged) = land::delete_plan(git, short, only, landed_oid)?;
+    // Post-land cleanup sweeps every remote holding the commit we just took —
+    // `--delete-landed` only runs after `--push` reached them all, and the oid
+    // filter is what makes it safe; an ad-hoc `--delete origin/x` touches only
+    // the remote it names.
+    let only = if landed_oid.is_some() { None } else { named.map(|n| vec![n.to_string()]) };
+    let (targets, diverged) = land::delete_plan(git, short, only.as_deref(), landed_oid)?;
     for d in &diverged {
         println!("{}/{} is not the landed commit — left alone", scrub(&d.remote), scrub(short));
     }
@@ -261,7 +265,7 @@ fn delete_headless(
     if !deleted.all_ok {
         return Ok(ExitCode::FAILURE);
     }
-    if deleted.count == 0 {
+    if deleted.count() == 0 {
         // After a landing, nothing to delete means the oid filter did its job.
         // Only a hand-typed --delete that matched nothing is a failure.
         if landed_oid.is_none() {
@@ -325,7 +329,7 @@ fn land_headless(git: &Git, base: &str, branch: &str, args: &Args) -> io::Result
         if !pushed.all_ok {
             return Ok(ExitCode::FAILURE);
         }
-        if pushed.count == 0 {
+        if pushed.count() == 0 {
             eprintln!("td-review: no remote was eligible — the commit was not published");
             return Ok(ExitCode::FAILURE);
         }

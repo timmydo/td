@@ -438,6 +438,32 @@ impl Git {
         Ok(run.stdout.lines().map(str::to_string).collect())
     }
 
+    /// Whether `tip` carries `commit` — `merge-base --is-ancestor` answers with
+    /// its exit status. Anything git could not answer (an unknown oid, say)
+    /// reads as "no": the callers use this to gate an irreversible delete.
+    pub fn contains(&self, tip: &str, commit: &str) -> io::Result<bool> {
+        Ok(self.run(&["merge-base", "--is-ancestor", commit, tip])?.ok)
+    }
+
+    /// Commits on `base` that `remote`'s copy of it lacks, oldest first, as of
+    /// the last fetch. `None` when there is no `refs/remotes/<remote>/<base>`:
+    /// nothing local then says what that remote holds, and "no commits" would
+    /// read as "nothing to publish" when the whole branch may be new to it.
+    pub fn unpushed_to(&self, remote: &str, base: &str) -> io::Result<Option<Vec<String>>> {
+        if self.remote_branch_oid(remote, base)?.is_none() {
+            return Ok(None);
+        }
+        let range = format!("refs/remotes/{remote}/{base}..refs/heads/{base}");
+        let run = self.run(&["log", "--reverse", "--oneline", "--no-decorate", &range, "--"])?;
+        if !run.ok {
+            // The tracking ref is there, so this is git declining to walk the
+            // range — not the same state as "no copy here", and it must not be
+            // reported as one.
+            return Err(io::Error::other(run.failure()));
+        }
+        Ok(Some(run.stdout.lines().map(str::to_string).collect()))
+    }
+
     /// The oid of `refs/remotes/<remote>/<short>`, or None when it does not exist.
     pub fn remote_branch_oid(&self, remote: &str, short: &str) -> io::Result<Option<String>> {
         let refname = format!("refs/remotes/{remote}/{short}");

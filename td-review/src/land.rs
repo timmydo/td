@@ -463,9 +463,16 @@ pub fn discard(git: &Git) -> io::Result<Vec<Line>> {
 pub struct Pushed {
     pub log: Vec<Line>,
     pub all_ok: bool,
-    /// Remotes actually pushed to. Zero means nothing was published, however
-    /// green the individual steps looked.
-    pub count: usize,
+    /// Remotes the operation actually reached. Empty means nothing was
+    /// published or deleted, however green the individual steps looked — and
+    /// on a partial push it names exactly the remotes that do have the work.
+    pub reached: Vec<String>,
+}
+
+impl Pushed {
+    pub fn count(&self) -> usize {
+        self.reached.len()
+    }
 }
 
 /// Never deleted whatever `--base` says: an integration branch is one typo away
@@ -489,12 +496,12 @@ fn partition_landed(
 }
 
 /// What a delete of `short` would touch: (deletable, diverged). `only` limits the
-/// search to one remote; `landed_oid` filters out remotes whose tip the landing
-/// never took. The single place both the TUI and the CLI decide this.
+/// search to the remotes it names; `landed_oid` filters out remotes whose tip the
+/// landing never took. The single place both the TUI and the CLI decide this.
 pub fn delete_plan(
     git: &Git,
     short: &str,
-    only: Option<&str>,
+    only: Option<&[String]>,
     landed_oid: Option<&str>,
 ) -> io::Result<(Vec<DeleteTarget>, Vec<DeleteTarget>)> {
     let targets = remotes_carrying(git, short, only)?;
@@ -506,10 +513,14 @@ pub fn delete_plan(
 
 /// Pushable remotes that currently carry `short`, each with the tip our
 /// remote-tracking ref records. That oid becomes the delete's lease.
-fn remotes_carrying(git: &Git, short: &str, only: Option<&str>) -> io::Result<Vec<DeleteTarget>> {
+fn remotes_carrying(
+    git: &Git,
+    short: &str,
+    only: Option<&[String]>,
+) -> io::Result<Vec<DeleteTarget>> {
     let mut out = Vec::new();
     for (name, url) in git.remotes()? {
-        if url == NO_PUSH || only.is_some_and(|r| r != name) {
+        if url == NO_PUSH || only.is_some_and(|rs| !rs.contains(&name)) {
             continue;
         }
         if let Some(oid) = git.remote_branch_oid(&name, short)? {
@@ -557,18 +568,18 @@ pub fn delete_branch(
     };
     if let Some(reason) = reason {
         log.push(err_line(format!("refusing to delete '{short}': {reason}")));
-        return Ok(Pushed { log, all_ok: false, count: 0 });
+        return Ok(Pushed { log, all_ok: false, reached: Vec::new() });
     }
     if targets.is_empty() {
         log.push(Line::new(format!("no pushable remote carries {short}"), Style::fg(YELLOW)));
-        return Ok(Pushed { log, all_ok: true, count: 0 });
+        return Ok(Pushed { log, all_ok: true, reached: Vec::new() });
     }
     // Fully qualified: an unqualified name is ambiguous when the remote also
     // carries a tag of the same name.
     let refname = format!("refs/heads/{short}");
     let delete = format!(":{refname}");
     let mut all_ok = true;
-    let mut count = 0usize;
+    let mut reached = Vec::new();
     for t in targets {
         // The lease is the whole safety story: if anyone pushed to the branch
         // since our last fetch, the remote tip no longer matches and git
@@ -579,14 +590,14 @@ pub fn delete_branch(
         let del = git.run(&["push", &lease, name, &delete])?;
         log_output(&mut log, &del);
         if del.ok {
-            count += 1;
+            reached.push(name.clone());
             log.push(ok_line(format!("  deleted {short} from {name}")));
         } else {
             all_ok = false;
             log.push(err_line(format!("  delete on {name} failed: {}", del.failure())));
         }
     }
-    Ok(Pushed { log, all_ok, count })
+    Ok(Pushed { log, all_ok, reached })
 }
 
 /// Push the just-committed `sha` to every remote, skipping the `no_push` ones
@@ -609,16 +620,16 @@ pub fn push_all(
             short(&current),
             short(sha)
         )));
-        return Ok(Pushed { log, all_ok: false, count: 0 });
+        return Ok(Pushed { log, all_ok: false, reached: Vec::new() });
     }
 
     if remotes.is_empty() {
         log.push(Line::new("no remotes configured — nothing to publish", Style::fg(YELLOW)));
-        return Ok(Pushed { log, all_ok: true, count: 0 });
+        return Ok(Pushed { log, all_ok: true, reached: Vec::new() });
     }
     let refspec = format!("{sha}:refs/heads/{base}");
     let mut all_ok = true;
-    let mut count = 0usize;
+    let mut reached = Vec::new();
     for (name, url) in remotes {
         if url.as_str() == NO_PUSH {
             log.push(note_line(format!("==> {name} (skipped: {NO_PUSH})")));
@@ -628,20 +639,20 @@ pub fn push_all(
         let push = git.run(&["push", name, &refspec])?;
         log_output(&mut log, &push);
         if push.ok {
-            count += 1;
+            reached.push(name.clone());
             log.push(ok_line(format!("  pushed to {name}")));
         } else {
             all_ok = false;
             log.push(err_line(format!("  push to {name} failed: {}", push.failure())));
         }
     }
-    if count == 0 && all_ok {
+    if reached.is_empty() && all_ok {
         log.push(Line::new(
             "every remote is marked no_push — the commit is local only",
             Style::fg(YELLOW),
         ));
     }
-    Ok(Pushed { log, all_ok, count })
+    Ok(Pushed { log, all_ok, reached })
 }
 
 #[cfg(test)]
