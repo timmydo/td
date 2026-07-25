@@ -165,7 +165,9 @@ const SYSTEM: SystemDef = SystemDef {
 /// rather than strand the two-stage boot).
 ///
 /// `hostname` stays busybox: the inittab runs `/bin/hostname -F /etc/hostname` and uutils'
-/// hostname has no `-F`. `find`/`xargs` are intentionally NOT bare symlinks either: the
+/// hostname has no `-F`. `more` stays too — its uutils feature compiles a crossterm pager
+/// stack into the shipped multicall, which is a dependency call, not a farm move.
+/// `find`/`xargs` are intentionally NOT bare symlinks either: the
 /// ladder's findutils dead-axis lock (`no_bootstrap_step_invokes_host_find_or_xargs`)
 /// forbids those tokens in any step text and can't tell a cpio member NAME from a host
 /// invocation; they stay reachable as `busybox find` / `busybox xargs`.
@@ -186,7 +188,6 @@ const BUSYBOX_APPLETS: &[&str] = &[
     "clear",
     "dmesg",
     "free",
-    "kill",
     "vi",
     "less",
     "more",
@@ -196,11 +197,16 @@ const BUSYBOX_APPLETS: &[&str] = &[
     "cttyhack",
     "su",
     "which",
-    "readlink",
 ];
 
-/// Boot-support applets invoked through the packed BusyBox multicall. Most run
-/// before the real root; the remainder support its boot and shutdown checks.
+/// Applets reached through the packed BusyBox multicall as `/bin/busybox <applet>`, whether
+/// or not they also get a `/bin` symlink — `rootcheck` reaches `chown`, `mkdir`, `readlink`,
+/// `rm` and `test` this way, all names uutils serves in `/bin`. They must still EXIST in
+/// busybox, so `shape_check` probes them against `busybox --list` like the farm names;
+/// otherwise a config drift breaks sysinit with no build-time signal. Unlike the two farms
+/// this is deliberately NOT disjoint from BUSYBOX_APPLETS. `script_applets_are_covered`
+/// derives it from the script text both ways, so neither an uncovered call nor a stale
+/// entry survives; td-boot's own invocations are justified by its protocol constant.
 const INITRAMFS_APPLETS: &[&str] = &[
     "cat",
     "chmod",
@@ -211,6 +217,7 @@ const INITRAMFS_APPLETS: &[&str] = &[
     "mknod",
     "mount",
     "printf",
+    "readlink",
     "rm",
     "sh",
     "sleep",
@@ -231,7 +238,7 @@ const INITRAMFS_APPLETS: &[&str] = &[
 const UUTILS_APPLETS: &[&str] = &[
     "uname", "ls", "cat", "echo", "printf", "pwd", "cp", "mv", "rm", "mkdir", "rmdir", "ln", "id",
     "env", "df", "du", "chmod", "chown", "sleep", "sync", "wc", "head", "tail", "sort", "date",
-    "whoami", "tty", "dd", "mktemp", "seq", "touch", "mknod",
+    "whoami", "tty", "dd", "mktemp", "seq", "touch", "mknod", "kill", "readlink",
 ];
 
 fn build_passwd(sys: &SystemDef) -> String {
@@ -856,7 +863,7 @@ fn shape_check() -> String {
          printf '%s\\n' \"$applets\" | grep -q -x -F \"$a\" || { echo \"busybox does not implement applet '$a' (config drift) - its packed /bin/$a symlink would be a dead link\" >&2; exit 1; }; \
      done; \
      for a in @INITRAMFS_APPLETS@; do \
-         printf '%s\\n' \"$applets\" | grep -q -x -F \"$a\" || { echo \"busybox does not implement initramfs applet '$a' (config drift)\" >&2; exit 1; }; \
+         printf '%s\\n' \"$applets\" | grep -q -x -F \"$a\" || { echo \"busybox does not implement multiplexed applet '$a' (config drift) - a generated script or td-boot invokes it as 'busybox $a'\" >&2; exit 1; }; \
      done; \
      uu=\"{root}/real-root{in:uutils}/bin/coreutils\"; uutgt=\"{in:uutils}/bin/coreutils\"; \
      { [ -f \"$uu\" ] && [ -x \"$uu\" ]; } || { echo 'root tree: the uutils coreutils multicall is not packed at real-root{in:uutils}/bin/coreutils - the /bin coreutils symlinks would all dangle (#547)' >&2; exit 1; }; \
@@ -1216,6 +1223,231 @@ mod tests {
         }
     }
 
+    /// The `/bin` names one initramfs actually carries, DERIVED from its gen_init_cpio spec.
+    /// The two cpios differ (only the selector carries td-kexec), so each `/init` is checked
+    /// against its own `/bin`, not a shared guess. Both `slink` and `file` count: everything
+    /// is a symlink to the multicall today, but a directly packed binary is still a name the
+    /// script may call.
+    fn initramfs_bin_names(include_kexec: bool) -> Vec<String> {
+        const BIN: &str = "/bin/";
+        let spec = build_initramfs_spec("unused-init", include_kexec);
+        let mut names = Vec::new();
+        for line in spec.lines() {
+            let mut fields = line.split_whitespace();
+            let (Some(kind), Some(path)) = (fields.next(), fields.next()) else {
+                continue;
+            };
+            if matches!(kind, "slink" | "file") {
+                if let Some(name) = path.strip_prefix(BIN) {
+                    names.push(name.to_string());
+                }
+            }
+        }
+        names
+    }
+
+    /// Every generated script TEXT, paired with the name each carries in the image (so a
+    /// failure names the file to edit) and the `/bin` universe it resolves against: the two
+    /// `/init` scripts run before the pivot, off a cpio whose `/bin` is far smaller than the
+    /// real root's, so `None` means "the real root's packed farm".
+    fn script_sources() -> Vec<(String, String, Option<Vec<String>>)> {
+        let mut sources = vec![
+            (
+                "/init (selector)".to_string(),
+                build_selector_init(),
+                Some(initramfs_bin_names(true)),
+            ),
+            (
+                "/init (deployment)".to_string(),
+                build_deployment_init(&SYSTEM),
+                Some(initramfs_bin_names(false)),
+            ),
+        ];
+        for (name, content, _) in etc_files(&SYSTEM) {
+            sources.push((format!("/etc/{name}"), content, None));
+        }
+        sources
+    }
+
+    /// Every `busybox <applet>` the generated scripts invoke through the multiplexer must be
+    /// one `shape_check` verifies against `busybox --list` — a packed farm name or an
+    /// INITRAMFS_APPLETS entry. Derived from the script TEXT, so adding a `busybox
+    /// <applet>` call without covering it reds here rather than at sysinit. This is what
+    /// keeps applets like `chown`/`readlink` (served in /bin by uutils, but still invoked as
+    /// `busybox chown` by rootcheck) from losing their busybox-side guarantee.
+    ///
+    /// Only the absolute `/bin/busybox <applet>` spelling is scannable, so the bare token is
+    /// rejected outright rather than parsed for command position: deciding that from
+    /// surrounding shell text needs a shell grammar, and every approximation of one leaves a
+    /// form (`if`, a `case` arm, an assignment prefix) that reads as prose and escapes.
+    #[test]
+    fn script_applets_are_covered() {
+        const TOKEN: &str = "busybox";
+        let mut seen: Vec<String> = Vec::new();
+        let mut sources_with_calls = 0usize;
+        for (name, text, _) in script_sources() {
+            let before_count = seen.len();
+            for (idx, _) in text.match_indices(TOKEN) {
+                let before = text.get(..idx).unwrap_or("");
+                assert!(
+                    before.ends_with("/bin/"),
+                    "{name} spells the busybox multiplexer as a bare `{TOKEN}` token rather \
+                     than `/bin/{TOKEN} <applet>`. In command position that runs it through \
+                     $PATH, invisibly to this scan, so its applet would never be verified \
+                     against `busybox --list`; write the absolute form (even in prose)"
+                );
+                let Some(rest) = text.get(idx + TOKEN.len()..) else {
+                    continue;
+                };
+                // The charset spans every name busybox can expose: truncating `mkfs.ext2` to
+                // `mkfs` would red naming an applet that does not exist.
+                let rest = rest.trim_start();
+                let applet: String = rest
+                    .chars()
+                    .take_while(|c| {
+                        c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | '[')
+                    })
+                    .collect();
+                // Fail CLOSED on a form this cannot resolve (`/bin/busybox "$cmd"`): skipping
+                // it would let the one invocation that most needs review escape the check.
+                assert!(
+                    !applet.is_empty(),
+                    "{name} invokes the busybox multiplexer with a form this scan cannot \
+                     resolve statically ({:?}) - it would silently escape the coverage check; \
+                     invoke the applet under a literal name",
+                    rest.chars().take(24).collect::<String>()
+                );
+                assert!(
+                    BUSYBOX_APPLETS.contains(&applet.as_str())
+                        || INITRAMFS_APPLETS.contains(&applet.as_str()),
+                    "{name} invokes `busybox {applet}`, but neither the /bin farm nor \
+                     INITRAMFS_APPLETS covers it - shape_check would never verify \
+                     busybox implements it"
+                );
+                seen.push(applet);
+            }
+            if seen.len() > before_count {
+                sources_with_calls += 1;
+            }
+        }
+        // Guard the guard. A bare total would not bind: one `/init` alone contributes more
+        // than any plausible floor, so dropping the whole `/etc` half of the scan would keep
+        // a count green. Requiring several sources to contribute is what pins the inputs.
+        assert!(
+            sources_with_calls >= 3,
+            "only {sources_with_calls} generated script(s) matched a `/bin/busybox <applet>` \
+             call - the scan has gone stale or stopped being fed its sources, and this test \
+             is now vacuous"
+        );
+        // ...and no dead entries: a multiplexed applet nothing invokes is a stale shape-check
+        // probe that outlived the call it was protecting, and would red the build for a
+        // legitimate busybox config trim. Script text is not the only source of the
+        // requirement — td-boot invokes its own set from Rust, where this scan cannot see it,
+        // so those are justified by the protocol constant instead.
+        for a in INITRAMFS_APPLETS {
+            assert!(
+                seen.iter().any(|s| s == a)
+                    || td_boot_protocol::REQUIRED_BUSYBOX_APPLETS.contains(a),
+                "INITRAMFS_APPLETS lists '{a}', but no generated script invokes `busybox {a}` \
+                 and td-boot does not require it - drop it, or move it to the /bin farm if it \
+                 needs a symlink"
+            );
+        }
+    }
+
+    /// Every name `real_root_steps` actually links into the real root's /bin, DERIVED from
+    /// the steps rather than restated: both farms plus each binary packed by hand. A list
+    /// spelled out here would silently rot behind a newly packed daemon.
+    fn packed_bin_names() -> Vec<String> {
+        const LINK_PREFIX: &str = "{root}/real-root/bin/";
+        let mut names = Vec::new();
+        for step in real_root_steps(&SYSTEM) {
+            if let Step::Symlink { link, .. } = step {
+                if let Some(name) = link.strip_prefix(LINK_PREFIX) {
+                    names.push(name.to_string());
+                }
+            }
+        }
+        names
+    }
+
+    /// The mirror of `script_applets_are_covered`, for the form this commit actually
+    /// re-points: a direct `/bin/<name>`. Every one must be a name its own image actually
+    /// packs, or the script calls a dangling symlink — and `shape_check` only validates
+    /// farm → symlink, never script → farm, so nothing else would catch it.
+    ///
+    /// The two `/init` scripts are stricter: each runs from its cpio, whose `/bin` holds
+    /// only the handful of `slink`s `build_initramfs_spec` emits, and runs BEFORE the pivot
+    /// that makes uutils' glibc closure reachable. A `/bin/<anything-else>` there is an
+    /// unbootable image, even for a name the real root packs.
+    #[test]
+    fn direct_bin_calls_resolve_to_a_packed_name() {
+        const PREFIX: &str = "/bin/";
+        let packed = packed_bin_names();
+        // Guard the derivation: if it stops seeing real_root_steps' symlinks it would
+        // accept nothing (and red on everything) or, worse, be edited into accepting all.
+        for a in BUSYBOX_APPLETS.iter().chain(UUTILS_APPLETS).chain(&["busybox"]) {
+            assert!(
+                packed.iter().any(|p| p == a),
+                "'{a}' is a /bin name this file packs, but packed_bin_names() did not derive \
+                 it from real_root_steps - the derivation has gone stale"
+            );
+        }
+        // The pre-pivot half is the strict one, and it lives entirely in the sources that
+        // carry a cpio /bin. Pin their count here: a script_sources() that stopped returning
+        // the two inits would make that half vacuous with every remaining assertion green.
+        let cpio_backed = script_sources().iter().filter(|(_, _, c)| c.is_some()).count();
+        assert_eq!(
+            cpio_backed, 2,
+            "expected the selector and deployment inits to be checked against their own cpio \
+             /bin, found {cpio_backed} such sources - the pre-pivot half has gone vacuous"
+        );
+        for (name, text, cpio_bin) in script_sources() {
+            // Same guard for the initramfs side: an empty derived /bin would accept nothing.
+            if let Some(names) = &cpio_bin {
+                assert!(
+                    names.iter().any(|n| n == "busybox"),
+                    "{name} runs from a cpio whose derived /bin does not contain busybox - \
+                     initramfs_bin_names() has gone stale"
+                );
+            }
+            let available = cpio_bin.as_ref().unwrap_or(&packed);
+            for (idx, _) in text.match_indices(PREFIX) {
+                let before = text.get(..idx).unwrap_or("");
+                // Only the ROOT /bin. `/td/store/<hash>/bin/coreutils` is an absolute store
+                // path, not a call into the farm this checks, and would resolve against the
+                // wrong universe.
+                if before.ends_with(|c: char| c.is_ascii_alphanumeric() || c == '.') {
+                    continue;
+                }
+                let Some(rest) = text.get(idx + PREFIX.len()..) else {
+                    continue;
+                };
+                let called: String = rest
+                    .chars()
+                    .take_while(|c| {
+                        c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | '[')
+                    })
+                    .collect();
+                // Fail CLOSED, as the multiplexer scan does: `/bin/"$cmd"` and `/bin//ls`
+                // both leave this empty, and skipping them would let the calls that most
+                // need review escape unchecked.
+                assert!(
+                    !called.is_empty(),
+                    "{name} calls /bin/ with a form this scan cannot resolve statically \
+                     ({:?}) - it would silently escape the check; call it under a literal name",
+                    rest.chars().take(24).collect::<String>()
+                );
+                assert!(
+                    available.iter().any(|p| *p == called),
+                    "{name} calls /bin/{called}, which its image does not pack - it would be \
+                     a dangling symlink at boot; add it to a farm or call it through the \
+                     busybox multiplexer"
+                );
+            }
+        }
+    }
+
     /// The uutils recipe must build exactly the applets we symlink into /bin.
     /// coreutils 0.9.0 names each applet's cargo feature after the applet, so an
     /// applet in UUTILS_APPLETS with no matching feature would dispatch to nothing
@@ -1572,24 +1804,6 @@ mod tests {
                 INITRAMFS_APPLETS.contains(applet),
                 "td-boot invokes uncovered busybox applet {applet}"
             );
-        }
-        for script in [
-            build_selector_init(),
-            build_deployment_init(&SYSTEM),
-            build_rootcheck(&SYSTEM),
-            build_shutdown(),
-        ] {
-            for invocation in script.split("/bin/busybox ").skip(1) {
-                if let Some(raw) = invocation.split_whitespace().next() {
-                    let applet = raw.trim_end_matches(|character: char| {
-                        !character.is_ascii_alphanumeric() && character != '-' && character != '_'
-                    });
-                    assert!(
-                        INITRAMFS_APPLETS.contains(&applet) || BUSYBOX_APPLETS.contains(&applet),
-                        "boot script invokes uncovered busybox applet {applet}"
-                    );
-                }
-            }
         }
     }
 
