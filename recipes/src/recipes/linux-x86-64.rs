@@ -380,6 +380,14 @@ pub fn recipe() -> Recipe {
     //    permanently. BTRFS_FS sits under `if BLOCK` (BLOCK already =y) and
     //    BLK_DEV_LOOP under `menuconfig BLK_DEV` (already =y), so no new menuconfig
     //    parent is required.
+    //
+    //    SECURITY_DMESG_RESTRICT (pinned OFF): with it on, an unprivileged
+    //    /dev/kmsg open is EPERM, so the /bin/dmesg system-x86-64 ships from
+    //    TD_UTIL_APPLETS breaks for ordinary users. Its `menu "Security options"`
+    //    parent has no config symbol, so unlike the erofs-root leaves above no
+    //    parent pin is needed. A `default` flip is absorbed by the pin; only a
+    //    `select` that defeats it reaches the guard, which names the symbol here
+    //    rather than letting it surface as a broken applet in the boot oracle.
     steps.push(
         Step::run(
             "{src}",
@@ -439,7 +447,8 @@ pub fn recipe() -> Recipe {
                   /^#? *CONFIG_VIRTIO_NET[ =]/d; \
                   /^#? *CONFIG_ETHERNET[ =]/d; \
                   /^#? *CONFIG_NET_VENDOR_INTEL[ =]/d; \
-                  /^#? *CONFIG_E1000[ =]/d' .config && \
+                  /^#? *CONFIG_E1000[ =]/d; \
+                  /^#? *CONFIG_SECURITY_DMESG_RESTRICT[ =]/d' .config && \
                  printf '%s\\n' \
                    'CONFIG_UNWINDER_FRAME_POINTER=y' \
                    '# CONFIG_UNWINDER_ORC is not set' \
@@ -487,7 +496,8 @@ pub fn recipe() -> Recipe {
                    'CONFIG_VIRTIO_NET=y' \
                    'CONFIG_ETHERNET=y' \
                    'CONFIG_NET_VENDOR_INTEL=y' \
-                   'CONFIG_E1000=y' >> .config",
+                   'CONFIG_E1000=y' \
+                   '# CONFIG_SECURITY_DMESG_RESTRICT is not set' >> .config",
             ],
         )
         .env("PATH", &mesboot0_path()),
@@ -539,7 +549,8 @@ pub fn recipe() -> Recipe {
                  if grep -q '^CONFIG_KEXEC_SIG=y' .config; then echo 'KEXEC_SIG on — would demand a trusted-keyring signature policy td does not ship' >&2; exit 1; fi; \
                  if grep -q '^CONFIG_RANDOMIZE_BASE=y' .config; then echo 'RANDOMIZE_BASE (KASLR) on — pinned off for a deterministic kexec boot' >&2; exit 1; fi; \
                  if grep -q '^CONFIG_MODULES=y' .config; then echo 'MODULES on (would need module tooling)' >&2; exit 1; fi; \
-                 if grep -q '^CONFIG_DEBUG_INFO_BTF=y' .config; then echo 'BTF on (would need pahole)' >&2; exit 1; fi",
+                 if grep -q '^CONFIG_DEBUG_INFO_BTF=y' .config; then echo 'BTF on (would need pahole)' >&2; exit 1; fi; \
+                 if grep -q '^CONFIG_SECURITY_DMESG_RESTRICT=y' .config; then echo 'SECURITY_DMESG_RESTRICT on — unprivileged /dev/kmsg reads become EPERM, so the shipped /bin/dmesg breaks for ordinary users' >&2; exit 1; fi",
             ],
         )
         .env("PATH", &mesboot0_path()),

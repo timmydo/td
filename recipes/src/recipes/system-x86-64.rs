@@ -546,6 +546,9 @@ fn build_rootcheck(sys: &SystemDef) -> String {
 }
 
 fn build_bootsuccess(sys: &SystemDef) -> String {
+    // These run under `su` as the unprivileged user, so the dmesg leg needs an unprivileged
+    // /dev/kmsg read — which linux-x86-64 guarantees by pinning CONFIG_SECURITY_DMESG_RESTRICT
+    // off. Drop dmesg from the farm and that pin is orphaned.
     let mut td_util_probes = String::new();
     for applet in TD_UTIL_APPLETS {
         let args = if *applet == "which" { " sh" } else { "" };
