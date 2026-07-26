@@ -1,13 +1,11 @@
 //! Arithmetic expansion: `$(( ... ))`.
 //!
 //! The full POSIX operator set over `i64`, including assignment and the ternary.
-//! Names are looked up in the shell and their values are themselves evaluated as
-//! expressions (`a=b; b=5; echo $((a))` is 5), bounded by a recursion limit so a
-//! self-referential variable errors instead of overflowing the stack.
+//! A name's value must itself be a number: dash resolves it with `strtoimax` and
+//! errors on anything else, so `e=1+2; echo $((e+3))` is a fatal error rather
+//! than bash's 6 — the value is data, never a nested expression to evaluate.
 
 use crate::exec::{Shell, R};
-
-const MAX_NAME_DEPTH: u32 = 32;
 
 pub fn eval(sh: &mut Shell, text: &str) -> R<i64> {
     let mut p = Arith {
@@ -16,7 +14,6 @@ pub fn eval(sh: &mut Shell, text: &str) -> R<i64> {
             Err(e) => return Err(sh.fatal(&format!("arithmetic: {e}"), 2)),
         },
         pos: 0,
-        depth: 0,
         pdepth: 0,
         live: true,
     };
@@ -114,7 +111,12 @@ fn op_at(chars: &[char], i: usize, op: &str) -> bool {
 fn lex_number(chars: &[char], start: usize) -> Result<(i64, usize), String> {
     let mut i = start;
     let (radix, skip) = match (chars.get(i), chars.get(i + 1)) {
-        (Some('0'), Some('x')) | (Some('0'), Some('X')) => (16, 2),
+        // `0x` with no hex digit after it is not a hex constant: it falls through
+        // to the decimal run, which then fails to parse — so both of this file's
+        // number parsers reject it, as dash does by lexing `0` and a name `x`.
+        (Some('0'), Some('x' | 'X')) if chars.get(i + 2).is_some_and(char::is_ascii_hexdigit) => {
+            (16, 2)
+        }
         (Some('0'), Some(d)) if d.is_ascii_digit() => (8, 1),
         _ => (10, 0),
     };
@@ -129,8 +131,7 @@ fn lex_number(chars: &[char], start: usize) -> Result<(i64, usize), String> {
         }
     }
     if digits.is_empty() {
-        // A bare `0`; the radix prefix consumed the only digit.
-        return Ok((0, i));
+        return Err("expected a digit".into());
     }
     i64::from_str_radix(&digits, radix)
         .map(|v| (v, i))
@@ -140,7 +141,6 @@ fn lex_number(chars: &[char], start: usize) -> Result<(i64, usize), String> {
 struct Arith {
     toks: Vec<Tk>,
     pos: usize,
-    depth: u32,
     /// Parenthesis-nesting depth, bounded so `((((…))))` errors instead of
     /// overflowing the recursive-descent stack.
     pdepth: u32,
@@ -466,40 +466,77 @@ impl Arith {
         }
     }
 
-    /// A variable's value, itself evaluated as an expression. An unset or empty
-    /// variable is 0 (POSIX).
+    /// A variable's value as a number. An unset or empty variable is 0; anything
+    /// else must BE a number, not an expression that evaluates to one.
     fn name_value(&mut self, sh: &mut Shell, name: &str) -> A<i64> {
         let Some(text) = sh.get_var(name) else {
             return Ok(0);
         };
-        if text.trim().is_empty() {
-            return Ok(0);
-        }
-        if let Ok(n) = text.trim().parse::<i64>() {
+        if let Some(n) = strtoimax(&text) {
             return Ok(n);
         }
-        // A non-numeric value is itself an expression, but the dead side of a
-        // short circuit (`0 && x`, `1 || x`, the untaken `?:` branch) must not be
-        // evaluated — nor allowed to error or recurse. It contributes 0.
+        // The dead side of a short circuit (`0 && x`, `1 || x`, the untaken `?:`
+        // branch) is never evaluated, so a junk value there cannot error.
         if !self.live {
             return Ok(0);
         }
-        if self.depth >= MAX_NAME_DEPTH {
-            return Err(format!("{name}: expression recursion limit exceeded"));
-        }
-        let mut inner = Arith {
-            toks: lex(&text)?,
-            pos: 0,
-            depth: self.depth + 1,
-            pdepth: 0,
-            live: self.live,
-        };
-        let v = inner.expr_comma(sh)?;
-        if inner.peek().is_some() {
-            return Err(format!("{name}: invalid expression {text:?}"));
-        }
-        Ok(v)
+        Err(format!("{name}: bad number"))
     }
+}
+
+/// C `strtoimax(value, &end, 0)` with dash's "the whole value or nothing" check:
+/// the base comes from the C prefix and any leftover input rejects the value.
+/// Blanks around the number are skipped and a value that is empty or all blanks
+/// is 0 — `a=' '; echo $((a))` prints 0 in dash, so the check cannot be
+/// strtoimax's literal `*end == '\0'`, which would convert nothing there.
+fn strtoimax(text: &str) -> Option<i64> {
+    // Bytes, not chars: every character this accepts is ASCII, so a non-ASCII
+    // byte can only end the digit run — and a name is read once per arithmetic
+    // operand, which `while [ $i -lt N ]; i=$((i+1))` makes an inner loop.
+    // C `isspace`, not `char::is_whitespace`: a value carries arbitrary UTF-8 and
+    // strtoimax converts nothing from a NBSP-prefixed one.
+    let text = text.trim_matches(|c: char| matches!(c, ' ' | '\t' | '\n' | '\u{b}' | '\u{c}' | '\r'));
+    let bytes = text.as_bytes();
+    if bytes.is_empty() {
+        return Some(0);
+    }
+    let mut i = 0usize;
+    let negative = match bytes.get(i) {
+        Some(b'-') => {
+            i += 1;
+            true
+        }
+        Some(b'+') => {
+            i += 1;
+            false
+        }
+        _ => false,
+    };
+    let radix = match (bytes.get(i), bytes.get(i + 1)) {
+        (Some(b'0'), Some(b'x' | b'X')) if bytes.get(i + 2).is_some_and(u8::is_ascii_hexdigit) => {
+            i += 2;
+            16
+        }
+        (Some(b'0'), _) => 8, // a lone `0` is octal zero, which parses the same
+        _ => 10,
+    };
+    let start = i;
+    while bytes.get(i).is_some_and(|b| char::from(*b).is_digit(radix)) {
+        i += 1;
+    }
+    if i == start || i != bytes.len() {
+        return None;
+    }
+    // Magnitude first, then apply the sign: i64::MIN has no positive counterpart,
+    // so `-9223372036854775808` has to be recognised as the whole value it is.
+    let magnitude = u64::from_str_radix(text.get(start..i)?, radix).ok()?;
+    if !negative {
+        return i64::try_from(magnitude).ok();
+    }
+    if magnitude == i64::MIN.unsigned_abs() {
+        return Some(i64::MIN);
+    }
+    i64::try_from(magnitude).ok()?.checked_neg()
 }
 
 /// Apply a checked binary operator, folding to 0 on the unevaluated side of a
@@ -602,16 +639,35 @@ mod tests {
     }
 
     #[test]
-    fn variable_values_are_themselves_expressions() -> Result<(), String> {
+    fn a_variables_value_must_be_a_number_not_an_expression() -> Result<(), String> {
         let mut sh = Shell::new_for_test();
-        sh.set_var("b", "5").map_err(|_| "set failed".to_string())?;
-        sh.set_var("a", "b").map_err(|_| "set failed".to_string())?;
-        assert_eq!(eval(&mut sh, "a").map_err(|_| "eval")?, 5);
-        // A self-reference must terminate rather than recurse forever.
-        sh.set_var("loop", "loop")
-            .map_err(|_| "set failed".to_string())?;
-        assert!(eval(&mut sh, "loop").is_err());
+        for (name, value) in [("b", "5"), ("a", "b"), ("e", "1+2"), ("blank", " ")] {
+            sh.set_var(name, value)
+                .map_err(|_| "set failed".to_string())?;
+        }
+        // `a` holds a name and `e` an expression; neither is evaluated further.
+        assert!(eval(&mut sh, "a").is_err());
+        assert!(eval(&mut sh, "e + 3").is_err());
+        assert_eq!(eval(&mut sh, "blank").map_err(|_| "eval")?, 0);
+        assert_eq!(eval(&mut sh, "b + 1").map_err(|_| "eval")?, 6);
         Ok(())
+    }
+
+    #[test]
+    fn a_names_value_parses_with_the_c_prefix_rules() {
+        assert_eq!(strtoimax(""), Some(0));
+        assert_eq!(strtoimax("  "), Some(0));
+        assert_eq!(strtoimax("0"), Some(0));
+        assert_eq!(strtoimax(" \t 42 "), Some(42)); // blanks around it are skipped
+        assert_eq!(strtoimax("4 2"), None); // blanks inside it are not
+        assert_eq!(strtoimax("0x1f"), Some(31));
+        assert_eq!(strtoimax("-0x1f"), Some(-31));
+        assert_eq!(strtoimax("010"), Some(8));
+        assert_eq!(strtoimax("08"), None); // 8 is not an octal digit
+        assert_eq!(strtoimax("0x"), None); // the prefix alone converts nothing
+        assert_eq!(strtoimax("-9223372036854775808"), Some(i64::MIN));
+        assert_eq!(strtoimax("9223372036854775808"), None);
+        assert_eq!(strtoimax("1+2"), None);
     }
 
     #[test]
@@ -640,7 +696,7 @@ mod tests {
     #[test]
     fn dead_short_circuit_branch_does_not_evaluate_variables() -> Result<(), String> {
         let mut sh = Shell::new_for_test();
-        // A self-referential name would recurse/err if evaluated; the dead side of
+        // A name whose value is not a number errors if evaluated; the dead side of
         // `||`/`&&`/`?:` must skip it and contribute 0.
         sh.set_var("x", "x").map_err(|_| "set failed".to_string())?;
         assert_eq!(eval(&mut sh, "1 || x").map_err(|_| "eval")?, 1);

@@ -85,18 +85,9 @@ xfail arith-context.test.sh::Slicing of string with constants
 xfail arith-context.test.sh::Slicing of string with expressions
 xfail arith-context.test.sh::Slicing of string with variables
 xfail arith-context.test.sh::Triple parens should be disambiguated
-xfail arith-dynamic.test.sh::Double quotes
-xfail arith-dynamic.test.sh::Single quotes
-xfail arith-dynamic.test.sh::Substitutions
-xfail arith-dynamic.test.sh::Variable references
 xfail arith.test.sh::Comma operator (borrowed from C)
-xfail arith.test.sh::Constant with quotes like '1'
-xfail arith.test.sh::Dynamic parsing of arithmetic
-xfail arith.test.sh::Invalid string to int
-xfail arith.test.sh::Invalid string to int with strict_arith
 xfail arith.test.sh::More 64-bit ops
 xfail arith.test.sh::Negative numbers with bit shift
-xfail arith.test.sh::Recursive name evaluation is a result of runtime parse/eval
 xfail arith.test.sh::s[0] with string 42
 xfail arith.test.sh::s[0] with string abc
 xfail arith.test.sh::undef[0]
@@ -315,11 +306,9 @@ xfail ble-idioms.test.sh::dynamic arith varname: assign
 xfail ble-idioms.test.sh::dynamic arith varname: copy/add
 xfail ble-idioms.test.sh::dynamic arith varname: read
 xfail ble-idioms.test.sh::is-array with ${var@a}
-xfail ble-idioms.test.sh::recursive arith: one level
 xfail ble-idioms.test.sh::recursive arith: short circuit &&, ||
 xfail ble-idioms.test.sh::recursive arith: short circuit ?:
 xfail ble-idioms.test.sh::recursive arith: side effects
-xfail ble-idioms.test.sh::recursive arith: two levels
 xfail ble-idioms.test.sh::shopt -u expand_aliases and eval
 xfail ble-unset.test.sh::[bash_unset] dynamic-unset for nested localvars
 xfail ble-unset.test.sh::[bash_unset] dynamic-unset for nested tempenvs

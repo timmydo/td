@@ -204,8 +204,9 @@ impl WordBuf {
 }
 
 /// Cap on nested expansion re-lexing (`${a:-${b:-${c:-…}}}`, `$(( ${x} ))`), which
-/// re-enters `word_from_str_at` per level. Bounds the recursion so a pathological
-/// input errors instead of overflowing the stack. Well above any real script's nesting.
+/// re-enters `word_from_str_at`/`arith_from_str_at` per level. Bounds the recursion so
+/// a pathological input errors instead of overflowing the stack. Well above any real
+/// script's nesting.
 const MAX_EXPANSION_DEPTH: u32 = 100;
 
 /// Lex all of `src`, failing on the first error. For text that must be whole to
@@ -236,16 +237,27 @@ pub fn tokenize_prefix(src: &str) -> Lexed {
 }
 
 /// Scan `text` as a single word: blanks and operator characters are ordinary
-/// literal characters. Used for the operand of `${x:-...}` and for the body of
-/// `$((...))`, both of which are delimited by their braces, not by blanks. Nested
-/// `${…}`/`$((…))` operands re-enter here one level deeper; the depth cap is checked
-/// before any scanning so the mutual recursion
+/// literal characters. Used for the operand of `${x:-...}`, which is delimited by
+/// its brace, not by blanks. A nested `${…}` operand re-enters here one level
+/// deeper; the depth cap is checked before any scanning so the mutual recursion
 /// `scan_dollar -> parse_param -> word_from_str_at` is bounded.
 fn word_from_str_at(text: &str, depth: u32) -> Syn<Word> {
+    lexer_over(text, depth)?.scan_word(false)
+}
+
+/// Scan the body of `$((...))`. POSIX expands it as if it were double-quoted,
+/// "except that a double-quote inside the expression is not treated specially",
+/// so NEITHER quote character quotes here: both reach the arithmetic lexer, which
+/// rejects them. That is why `$(( '1' + 2 ))` is an error and not 3.
+fn arith_from_str_at(text: &str, depth: u32) -> Syn<Word> {
+    lexer_over(text, depth)?.scan_arith_body()
+}
+
+fn lexer_over(text: &str, depth: u32) -> Syn<Lexer> {
     if depth > MAX_EXPANSION_DEPTH {
         return Err("expansion nested too deeply".into());
     }
-    let mut lx = Lexer {
+    Ok(Lexer {
         sc: Scanner {
             src: text.chars().collect(),
             pos: 0,
@@ -256,8 +268,7 @@ fn word_from_str_at(text: &str, depth: u32) -> Syn<Word> {
         pending: Vec::new(),
         awaiting: None,
         depth,
-    };
-    lx.scan_word(false)
+    })
 }
 
 struct Lexer {
@@ -544,6 +555,40 @@ impl Lexer {
         Ok(buf.finish())
     }
 
+    /// Body of `$((...))`: double-quote rules for `$`, backtick and backslash,
+    /// but no quoting — every other character, quote marks included, is literal.
+    fn scan_arith_body(&mut self) -> Syn<Word> {
+        let mut buf = WordBuf::default();
+        while let Some(c) = self.sc.peek() {
+            match c {
+                '\\' => {
+                    self.sc.bump();
+                    match self.sc.peek() {
+                        Some(esc @ ('$' | '`' | '"' | '\\')) => {
+                            self.sc.bump();
+                            buf.push_quoted(esc);
+                        }
+                        Some('\n') => {
+                            self.sc.bump();
+                        }
+                        _ => buf.push_quoted('\\'),
+                    }
+                }
+                '`' => {
+                    self.sc.bump();
+                    let code = self.scan_backtick()?;
+                    buf.push_seg(Seg::Cmd { code, quoted: true });
+                }
+                '$' => self.scan_dollar(&mut buf, true)?,
+                other => {
+                    self.sc.bump();
+                    buf.push_quoted(other);
+                }
+            }
+        }
+        Ok(buf.finish())
+    }
+
     /// Body of a `"..."`; the opening quote is already consumed.
     fn scan_double(&mut self, buf: &mut WordBuf) -> Syn<()> {
         loop {
@@ -611,7 +656,7 @@ impl Lexer {
                     self.sc.bump();
                     let text = self.scan_arith()?;
                     buf.push_seg(Seg::Arith {
-                        expr: word_from_str_at(&text, self.depth + 1)?,
+                        expr: arith_from_str_at(&text, self.depth + 1)?,
                         quoted: in_dq,
                     });
                 } else {
@@ -1085,6 +1130,41 @@ mod tests {
             s.push('}');
         }
         assert!(word_from_str_at(&s, 0).is_err());
+        // The arith body shares the cap through the same constructor.
+        let mut a = String::new();
+        for _ in 0..500 {
+            a.push_str("$((");
+        }
+        a.push('1');
+        for _ in 0..500 {
+            a.push_str("))");
+        }
+        assert!(arith_from_str_at(&a, 0).is_err());
+    }
+
+    #[test]
+    fn an_arith_body_quotes_nothing() -> Syn<()> {
+        // No corpus case covers this, so pin it here: inside `$(( … ))` neither
+        // quote character quotes, and a backslash keeps its double-quote meaning
+        // (literal before anything but `$`, backtick, `"`, `\`). Every one of these
+        // reaches the arithmetic lexer, which rejects them — as dash does.
+        for src in ["'1' + 2", "\"1\" + 2", "1 \\+ 2", "\\1"] {
+            let w = arith_from_str_at(src, 0)?;
+            let text: String = w
+                .0
+                .iter()
+                .map(|s| match s {
+                    Seg::Lit(t) | Seg::Quoted(t) => t.as_str(),
+                    _ => "",
+                })
+                .collect();
+            assert_eq!(text, src);
+        }
+        // The expansions a double-quoted body still performs are unaffected.
+        let w = arith_from_str_at("$x + `echo 1`", 0)?;
+        assert!(w.0.iter().any(|s| matches!(s, Seg::Param(_))));
+        assert!(w.0.iter().any(|s| matches!(s, Seg::Cmd { .. })));
+        Ok(())
     }
 
     #[test]
