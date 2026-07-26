@@ -11,11 +11,10 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use crate::ast::{AndOr, Cmd, Conn, List, Pipeline, Redir, Sep, Word, INCOMPLETE};
+use crate::ast::{AndOr, Cmd, Conn, List, Pipeline, Redir, Sep, Word};
 use crate::builtin;
 use crate::expand;
-use crate::lexer::Aliases;
-use crate::parser::parse_aliased;
+use crate::parser::{self, Aliases};
 use crate::pattern;
 use crate::process::{self, Fds};
 
@@ -318,48 +317,16 @@ pub fn run_program(sh: &mut Shell, src: &str) -> i32 {
 /// visible to the next line but not to the rest of its own line. A syntax error
 /// stops the run with status 2, reported as `td-sh: {what}{error}`.
 pub fn run_source(sh: &mut Shell, src: &str, what: &str) -> R<()> {
-    let mut off = 0usize;
+    let mut units = parser::Units::new(src);
     loop {
-        let Some(rest) = src.get(off..) else {
-            return Ok(());
-        };
-        match next_unit(rest, &sh.aliases) {
+        match units.next_unit(&sh.aliases) {
             None => return Ok(()),
             Some(Err(e)) => {
                 let _ = write_stderr(sh, &format!("td-sh: {what}{e}"));
                 sh.set_status(2);
                 return Ok(());
             }
-            Some(Ok((list, used))) => {
-                off += used;
-                run_list(sh, &list)?;
-            }
-        }
-    }
-}
-
-/// The next parse unit: the shortest run of whole lines that parses. `None` once
-/// only blanks remain; the `usize` is how many bytes of `src` it consumed.
-fn next_unit(src: &str, aliases: &Aliases) -> Option<Result<(List, usize), String>> {
-    if src.trim().is_empty() {
-        return None;
-    }
-    let mut end = 0usize;
-    loop {
-        end = match src
-            .as_bytes()
-            .get(end..)
-            .and_then(|tail| tail.iter().position(|&b| b == b'\n'))
-        {
-            Some(off) => end + off + 1,
-            None => src.len(),
-        };
-        let more = end < src.len();
-        let head = src.get(..end).unwrap_or(src);
-        match parse_aliased(head, aliases) {
-            Ok(list) => return Some(Ok((list, end))),
-            Err(e) if more && e.starts_with(INCOMPLETE) => continue,
-            Err(e) => return Some(Err(e)),
+            Some(Ok(list)) => run_list(sh, &list)?,
         }
     }
 }

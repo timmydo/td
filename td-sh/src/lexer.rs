@@ -85,6 +85,10 @@ pub struct Lexed {
     /// replacement that trails off in a comment must swallow the rest of the
     /// line it was written on, which is text the replacement does not contain.
     pub ended_in_comment: bool,
+    /// What stopped the scan, if anything. `toks` is then the valid prefix before
+    /// it, which the parser runs before reporting: a shell lexes as it parses, so
+    /// the commands ahead of a bad quote have already run when it is diagnosed.
+    pub error: Option<String>,
 }
 
 /// A here-document whose operator has been seen but whose body has not been
@@ -204,7 +208,18 @@ impl WordBuf {
 /// input errors instead of overflowing the stack. Well above any real script's nesting.
 const MAX_EXPANSION_DEPTH: u32 = 100;
 
+/// Lex all of `src`, failing on the first error. For text that must be whole to
+/// mean anything at all -- an alias replacement, an expansion operand.
 pub fn tokenize(src: &str) -> Syn<Lexed> {
+    let lexed = tokenize_prefix(src);
+    match lexed.error {
+        Some(e) => Err(e),
+        None => Ok(lexed),
+    }
+}
+
+/// Lex as much of `src` as scans, reporting what stopped it in `Lexed::error`.
+pub fn tokenize_prefix(src: &str) -> Lexed {
     let mut lx = Lexer {
         sc: Scanner {
             src: src.chars().collect(),
@@ -257,8 +272,34 @@ struct Lexer {
 }
 
 impl Lexer {
-    fn run(&mut self) -> Syn<Lexed> {
+    fn run(&mut self) -> Lexed {
         let mut toks = Vec::new();
+        let mut error = None;
+        loop {
+            match self.next_tok() {
+                Ok(tok) => {
+                    let last = matches!(tok, Tok::Eof);
+                    toks.push(tok);
+                    if last {
+                        break;
+                    }
+                }
+                Err(e) => {
+                    error = Some(e);
+                    break;
+                }
+            }
+        }
+        Lexed {
+            toks,
+            heredocs: std::mem::take(&mut self.heredocs),
+            ended_in_comment: self.ended_in_comment,
+            error,
+        }
+    }
+
+    /// The next token, or `Tok::Eof` once the input is spent.
+    fn next_tok(&mut self) -> Syn<Tok> {
         loop {
             self.skip_blanks();
             let Some(c) = self.sc.peek() else {
@@ -266,14 +307,12 @@ impl Lexer {
                     return Err(format!("{INCOMPLETE}: line continuation"));
                 }
                 self.finish_heredocs()?;
-                toks.push(Tok::Eof);
-                break;
+                return Ok(Tok::Eof);
             };
             if c == '\n' {
                 self.sc.bump();
                 self.read_heredoc_bodies()?;
-                toks.push(Tok::Newline);
-                continue;
+                return Ok(Tok::Newline);
             }
             if c == '#' {
                 while let Some(c) = self.sc.peek() {
@@ -286,9 +325,7 @@ impl Lexer {
                 continue;
             }
             if matches!(c, '|' | '&' | ';' | '<' | '>' | '(' | ')') {
-                let op = self.scan_op()?;
-                toks.push(Tok::Op(op));
-                continue;
+                return Ok(Tok::Op(self.scan_op()?));
             }
             let word = self.scan_word(true)?;
             if let Some((id, strip_tabs)) = self.awaiting.take() {
@@ -301,8 +338,7 @@ impl Lexer {
                     quoted,
                     strip_tabs,
                 });
-                toks.push(Tok::Word(word));
-                continue;
+                return Ok(Tok::Word(word));
             }
             // `2>file`: digits glued to a redirection operator name the fd.
             if let Some(text) = word.plain() {
@@ -311,18 +347,12 @@ impl Lexer {
                     && matches!(self.sc.peek(), Some('<') | Some('>'))
                 {
                     if let Ok(n) = text.parse::<u32>() {
-                        toks.push(Tok::IoNumber(n));
-                        continue;
+                        return Ok(Tok::IoNumber(n));
                     }
                 }
             }
-            toks.push(Tok::Word(word));
+            return Ok(Tok::Word(word));
         }
-        Ok(Lexed {
-            toks,
-            heredocs: std::mem::take(&mut self.heredocs),
-            ended_in_comment: self.ended_in_comment,
-        })
     }
 
     fn skip_blanks(&mut self) {
@@ -923,287 +953,6 @@ fn parse_param(inner: &str, quoted: bool, depth: u32) -> Syn<Param> {
 
 fn is_special_param_name(s: &str) -> bool {
     s.chars().next().is_some_and(is_special_param) || s.chars().all(|c| c.is_ascii_digit())
-}
-
-/// Alias name -> replacement text. Ordered so `alias` lists deterministically.
-pub type Aliases = std::collections::BTreeMap<String, String>;
-
-/// Bound on substitutions per parse unit. The in-use guard already stops an
-/// alias re-entering itself, but a chain of aliases that each name several
-/// others still expands exponentially; this fires far past any real script.
-const MAX_ALIAS_EXPANSIONS: u32 = 4096;
-
-/// Reserved words. dash resolves these BEFORE aliases, so `alias if=…` never
-/// fires in command position, and each one also says whether another command
-/// word can start right after it.
-fn reserved(w: &str) -> bool {
-    matches!(
-        w,
-        "if" | "then"
-            | "else"
-            | "elif"
-            | "fi"
-            | "do"
-            | "done"
-            | "case"
-            | "esac"
-            | "while"
-            | "until"
-            | "for"
-            | "in"
-            | "{"
-            | "}"
-            | "!"
-    )
-}
-
-/// Whether a command word can start immediately after this operator. `)` is not
-/// here: closing a subshell leaves no command position (only a case-arm `)`
-/// does, which `Scan` handles from its case state).
-fn opens_command(op: Op) -> bool {
-    matches!(
-        op,
-        Op::Semi | Op::DSemi | Op::Amp | Op::AndIf | Op::OrIf | Op::Pipe | Op::LParen
-    )
-}
-
-/// `NAME=…`: an assignment prefix, which keeps the following word in command
-/// position (`FOO=1 alias_name args`).
-fn is_assignment(w: &Word) -> bool {
-    let Some(Seg::Lit(s)) = w.0.first() else {
-        return false;
-    };
-    match s.bytes().position(|b| b == b'=') {
-        Some(eq) => eq > 0 && is_name(s.get(..eq).unwrap_or("")),
-        None => false,
-    }
-}
-
-/// Command position survives an assignment prefix and the reserved words that
-/// introduce a command; anything else ends it.
-fn keeps_command_pos(w: &Word) -> bool {
-    match w.plain() {
-        Some("if" | "then" | "else" | "elif" | "do" | "while" | "until" | "!" | "{") => true,
-        _ => is_assignment(w),
-    }
-}
-
-/// How far into a `case` the scan is. Patterns are not command position -- and
-/// unlike everywhere else, a NEWLINE between them does not make one -- so the
-/// state has to be tracked to keep `case z in\np) …` from expanding `p`.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum CaseState {
-    AwaitIn,
-    Pattern,
-    Body,
-}
-
-/// Where the next word sits: whether a command can start there, whether the
-/// preceding replacement ended in a blank (which makes the next word a
-/// candidate wherever it sits), whether a redirection target is due, and the
-/// stack of `case`s being scanned (one entry per open `case`, so a nested one
-/// restores the outer state).
-struct Scan {
-    cmd_pos: bool,
-    force: bool,
-    redir_target: bool,
-    drop_line: bool,
-    cases: Vec<CaseState>,
-}
-
-impl Scan {
-    fn case(&self) -> Option<CaseState> {
-        self.cases.last().copied()
-    }
-
-    fn set_case(&mut self, state: CaseState) {
-        if let Some(top) = self.cases.last_mut() {
-            *top = state;
-        }
-    }
-}
-
-/// Track `case … in … esac` across the words that delimit it.
-fn step_case(w: &Word, st: &mut Scan) {
-    match w.plain() {
-        Some("case") if st.cmd_pos => st.cases.push(CaseState::AwaitIn),
-        Some("in") if st.case() == Some(CaseState::AwaitIn) => {
-            st.set_case(CaseState::Pattern);
-        }
-        // `esac` closes the case from a pattern (`case x in esac`) as well as
-        // from a command position, but is an ordinary argument elsewhere.
-        Some("esac") if st.case() == Some(CaseState::Pattern) || st.cmd_pos => {
-            st.cases.pop();
-        }
-        _ => {}
-    }
-}
-
-
-struct Expander<'a> {
-    table: &'a Aliases,
-    out: Vec<Tok>,
-    heredocs: Vec<Word>,
-    /// Aliases whose replacement is currently being scanned; dash's ALIASINUSE.
-    in_use: Vec<String>,
-    budget: u32,
-}
-
-/// Substitute aliases into a lexed unit the way dash does: only a command-position
-/// word is a candidate, the replacement is re-lexed and rescanned in place, an
-/// alias is not re-entered while its own replacement is being scanned, and a
-/// replacement ending in a blank makes the FOLLOWING word a candidate too.
-pub fn expand_aliases(lexed: Lexed, table: &Aliases) -> Syn<Lexed> {
-    if table.is_empty() {
-        return Ok(lexed);
-    }
-    let mut ex = Expander {
-        table,
-        out: Vec::new(),
-        heredocs: lexed.heredocs,
-        in_use: Vec::new(),
-        budget: MAX_ALIAS_EXPANSIONS,
-    };
-    let mut st = Scan {
-        cmd_pos: true,
-        force: false,
-        redir_target: false,
-        drop_line: false,
-        cases: Vec::new(),
-    };
-    ex.scan(&lexed.toks, &mut st)?;
-    Ok(Lexed {
-        toks: ex.out,
-        heredocs: ex.heredocs,
-        ended_in_comment: lexed.ended_in_comment,
-    })
-}
-
-impl Expander<'_> {
-    /// Lex a replacement and renumber its here-doc ids onto the end of the unit's
-    /// table, so a here-doc written inside an alias still resolves.
-    fn relex(&mut self, value: &str) -> Syn<(Vec<Tok>, bool)> {
-        let sub = tokenize(value)?;
-        let base = self.heredocs.len();
-        self.heredocs.extend(sub.heredocs);
-        let toks = sub
-            .toks
-            .into_iter()
-            .filter(|t| !matches!(t, Tok::Eof))
-            .map(|t| match t {
-                Tok::Op(Op::DLess(id)) => Tok::Op(Op::DLess(id + base)),
-                other => other,
-            })
-            .collect();
-        Ok((toks, sub.ended_in_comment))
-    }
-
-    fn scan(&mut self, toks: &[Tok], st: &mut Scan) -> Syn<()> {
-        for tok in toks {
-            // dash clears its alias check on the next token READ, whatever kind it
-            // is, so a redirection between the blank-terminated replacement and
-            // the next word spends it (`alias e='echo hi '` then `e >f t`).
-            let forced = std::mem::take(&mut st.force);
-            // A replacement left a `#` comment open, which runs to the next
-            // newline of the INPUT -- i.e. over the rest of the invoking line.
-            if st.drop_line {
-                if !matches!(tok, Tok::Newline | Tok::Eof) {
-                    continue;
-                }
-                st.drop_line = false;
-            }
-            // A redirection's target is never a command word. The flag rather than
-            // a lookahead because the target can sit past the end of a replacement
-            // (`alias r='>'` then `r /dev/null cmd`).
-            if std::mem::take(&mut st.redir_target) {
-                self.out.push(tok.clone());
-                continue;
-            }
-            match tok {
-                // A redirection before the command leaves it in command position
-                // (`>f alias_name`), so cmd_pos is untouched here.
-                Tok::Op(op) if op.is_redirect() => {
-                    st.redir_target = true;
-                    self.out.push(tok.clone());
-                }
-                Tok::Op(Op::RParen) => {
-                    // Ends a case pattern -- the arm's body follows -- unless it is
-                    // closing a subshell, after which no command word can start.
-                    st.cmd_pos = st.case() == Some(CaseState::Pattern);
-                    if st.cmd_pos {
-                        st.set_case(CaseState::Body);
-                    }
-                    self.out.push(tok.clone());
-                }
-                Tok::Op(Op::DSemi) => {
-                    st.set_case(CaseState::Pattern);
-                    st.cmd_pos = false;
-                    self.out.push(tok.clone());
-                }
-                Tok::Op(op) => {
-                    // A pattern list starts after `(` and continues after `|`, so
-                    // in pattern position those open no command either.
-                    st.cmd_pos =
-                        opens_command(*op) && st.case() != Some(CaseState::Pattern);
-                    self.out.push(tok.clone());
-                }
-                // A newline opens a command everywhere EXCEPT between case
-                // patterns, where the next word is still a pattern.
-                Tok::Newline => {
-                    st.cmd_pos = st.case() != Some(CaseState::Pattern);
-                    self.out.push(tok.clone());
-                }
-                Tok::IoNumber(_) | Tok::Eof => self.out.push(tok.clone()),
-                Tok::Word(w) => {
-                    if (st.cmd_pos || forced) && self.substitute(w, st.cmd_pos, st)? {
-                        continue;
-                    }
-                    step_case(w, st);
-                    st.cmd_pos = st.cmd_pos && keeps_command_pos(w);
-                    self.out.push(tok.clone());
-                }
-            }
-        }
-        Ok(())
-    }
-
-    /// Expand `w` if it names an eligible alias, reporting whether it did.
-    fn substitute(&mut self, w: &Word, cmd_pos: bool, st: &mut Scan) -> Syn<bool> {
-        // Only an unquoted literal word is a candidate: `'hi'` and `$cmd` are not.
-        let Some(name) = w.plain() else {
-            return Ok(false);
-        };
-        if (cmd_pos && reserved(name)) || self.in_use.iter().any(|u| u == name) {
-            return Ok(false);
-        }
-        let Some(value) = self.table.get(name) else {
-            return Ok(false);
-        };
-        self.budget = self
-            .budget
-            .checked_sub(1)
-            .ok_or_else(|| "alias expansion too deep".to_string())?;
-        // Not an incomplete-input error however it failed: no amount of further
-        // input can complete a replacement, so the unit loop must stop here.
-        let (sub, in_comment) = self
-            .relex(value)
-            .map_err(|e| format!("alias `{name}': {e}"))?;
-        let ends_blank = value.ends_with([' ', '\t']);
-        self.in_use.push(name.to_string());
-        st.cmd_pos = true;
-        let scanned = self.scan(&sub, st);
-        self.in_use.pop();
-        scanned?;
-        // dash sets the check on popping a blank-terminated replacement and never
-        // clears it, so an inner one that ended in a blank still counts.
-        st.force = st.force || ends_blank;
-        // A replacement that trails off inside a comment comments out the rest of
-        // the line it was written on: dash reads the replacement from the same
-        // input stream, so the comment runs to the NEXT newline, not to the end
-        // of the replacement.
-        st.drop_line = st.drop_line || in_comment;
-        Ok(true)
-    }
 }
 
 #[cfg(test)]

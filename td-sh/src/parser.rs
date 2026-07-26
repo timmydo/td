@@ -3,15 +3,21 @@
 //!
 //! Reserved words are resolved here rather than in the lexer because they are
 //! positional: `done` ends a loop only where a command could start, and is an
-//! ordinary argument in `echo done`.
+//! ordinary argument in `echo done`. Alias substitution is here for the same
+//! reason -- only the grammar knows which positions can start a command word --
+//! and happens at the token fetch, as dash's does.
 
+use std::cell::Cell;
 use std::sync::Arc;
 
 use crate::ast::{
     is_name, AndOr, Assign, CaseItem, Cmd, Conn, IfArm, List, Pipeline, Redir, RedirKind, Seg, Sep,
     Syn, Word, INCOMPLETE,
 };
-use crate::lexer::{expand_aliases, tokenize, Aliases, Op, Tok};
+use crate::lexer::{tokenize, tokenize_prefix, Op, Tok};
+
+/// Alias name -> replacement text. Ordered so `alias` lists deterministically.
+pub type Aliases = std::collections::BTreeMap<String, String>;
 
 /// Parse with no aliases in force. Every runtime path carries a table, so this
 /// is the grammar tests' entry point.
@@ -20,22 +26,15 @@ fn parse(src: &str) -> Syn<List> {
     parse_aliased(src, &Aliases::new())
 }
 
-/// Parse with an alias table in force. Substitution happens between lexing and
-/// parsing, so a replacement can supply grammar (`alias L='{'`) and is itself
-/// rescanned for further aliases.
+/// Parse all of `src` under one alias table, for the callers that run nothing
+/// while parsing: the interactive line and command substitution.
 pub fn parse_aliased(src: &str, aliases: &Aliases) -> Syn<List> {
-    let lexed = expand_aliases(tokenize(src)?, aliases)?;
-    let mut p = Parser {
-        toks: lexed.toks,
-        heredocs: lexed.heredocs,
-        pos: 0,
-        depth: 0,
-    };
-    let list = p.parse_list(&[])?;
-    if !p.at_eof() {
-        return Err(format!("syntax error near {}", p.describe()));
+    let mut units = Units::new(src);
+    let mut items = Vec::new();
+    while let Some(unit) = units.next_unit(aliases) {
+        items.extend(unit?.items);
     }
-    Ok(list)
+    Ok(List { items })
 }
 
 /// Bound on command-nesting depth. Every nested compound (`( … )`, `{ … }`, `if`,
@@ -45,22 +44,287 @@ pub fn parse_aliased(src: &str, aliases: &Aliases) -> Syn<List> {
 /// scripts nest a handful deep; this only fires far past any legitimate program.
 const MAX_PARSE_DEPTH: u32 = 256;
 
-struct Parser {
-    toks: Vec<Tok>,
-    heredocs: Vec<Word>,
-    pos: usize,
-    depth: u32,
+/// Bound on substitutions per parse unit -- a unit being a whole compound command,
+/// however long. The in-use guard already stops an alias re-entering itself, but a
+/// chain of aliases that each name several others still expands exponentially.
+const MAX_ALIAS_EXPANSIONS: u32 = 4096;
+
+/// Reserved words. dash resolves these BEFORE aliases, so `alias if=…` never fires
+/// where a keyword is recognized.
+fn is_reserved(w: &str) -> bool {
+    matches!(
+        w,
+        "if" | "then"
+            | "else"
+            | "elif"
+            | "fi"
+            | "do"
+            | "done"
+            | "case"
+            | "esac"
+            | "while"
+            | "until"
+            | "for"
+            | "in"
+            | "{"
+            | "}"
+            | "!"
+    )
 }
 
-impl Parser {
+/// What the grammar says about the next token, in dash's terms: whether an alias
+/// is looked up there at all (CHKALIAS), and whether a reserved word wins (CHKKWD).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Chk {
+    /// A command word may start here.
+    Command,
+    /// The assignment prefix of a simple command, where an alias still expands but
+    /// a reserved word is an ordinary word.
+    Word,
+    /// Nowhere a command starts. Only a blank-terminated replacement reaches here.
+    None,
+}
+
+/// A replacement spliced into the token stream, live until the parse passes its
+/// end: dash's ALIASINUSE, plus the trailing blank it checks when popping one.
+struct Region {
+    name: String,
+    end: usize,
+    blank: bool,
+}
+
+/// One source's tokens, handed out a parse unit at a time -- dash's `list(1)`:
+/// and-or lists up to the first newline the grammar does not consume. Running each
+/// unit before the next is parsed is what makes an `alias` visible to the next line
+/// but not to the rest of its own, and it costs one lexing pass, not one per line.
+pub struct Units {
+    toks: Vec<Tok>,
+    heredocs: Vec<Word>,
+    /// What stopped the lexer, raised only once a parse needs the text there.
+    pending: Option<String>,
+    /// Set when a fetch ran off the end of the tokens, which is how `pending`
+    /// becomes this unit's error rather than a bare "unexpected end of input".
+    hit_end: Cell<bool>,
+    pos: usize,
+    depth: u32,
+    budget: u32,
+    /// The table this unit is parsed under, copied because the caller runs each
+    /// unit -- with `&mut Shell` -- before asking for the next.
+    aliases: Aliases,
+    active: Vec<Region>,
+    /// Index of the token a blank-terminated replacement made a candidate.
+    force_at: Option<usize>,
+}
+
+impl Units {
+    pub fn new(src: &str) -> Units {
+        let lexed = tokenize_prefix(src);
+        Units {
+            toks: lexed.toks,
+            heredocs: lexed.heredocs,
+            pending: lexed.error,
+            hit_end: Cell::new(false),
+            pos: 0,
+            depth: 0,
+            budget: 0,
+            aliases: Aliases::new(),
+            active: Vec::new(),
+            force_at: None,
+        }
+    }
+
+    /// The next unit, or `None` at the end of the source.
+    pub fn next_unit(&mut self, aliases: &Aliases) -> Option<Syn<List>> {
+        self.aliases.clone_from(aliases);
+        // `active`/`force_at` deliberately survive: a replacement containing a
+        // newline spans the boundary, and dash keeps ALIASINUSE across its units.
+        self.depth = 0;
+        self.budget = MAX_ALIAS_EXPANSIONS;
+        let parsed = self.parse_unit();
+        if self.hit_end.get() {
+            // The parse reached where lexing stopped, so what stopped it is the
+            // real error -- and everything before here has already run.
+            if let Some(e) = self.pending.take() {
+                return Some(Err(e));
+            }
+        }
+        match parsed {
+            Ok(list) if list.items.is_empty() => None,
+            other => Some(other),
+        }
+    }
+
+    fn parse_unit(&mut self) -> Syn<List> {
+        let mut items = Vec::new();
+        loop {
+            self.open_command()?;
+            if self.at_eof() {
+                return Ok(List { items });
+            }
+            let and_or = self.parse_and_or()?;
+            let (sep, explicit) = match self.peek_op() {
+                Some(Op::Semi) => {
+                    self.bump();
+                    (Sep::Seq, true)
+                }
+                Some(Op::Amp) => {
+                    self.bump();
+                    (Sep::Bg, true)
+                }
+                _ => (Sep::Seq, false),
+            };
+            items.push((and_or, sep));
+            if matches!(self.peek(), Some(Tok::Newline)) {
+                self.bump();
+                return Ok(List { items });
+            }
+            if !explicit {
+                break;
+            }
+        }
+        if self.at_eof() {
+            return Ok(List { items });
+        }
+        Err(format!("syntax error near {}", self.describe()))
+    }
+
+    /// A CHKNL|CHKKWD|CHKALIAS point: a newline is not a token where a command may
+    /// start, and a replacement can leave more of them behind -- one ending in a
+    /// comment eats the rest of its line -- so the two go round together.
+    fn open_command(&mut self) -> Syn<()> {
+        loop {
+            self.skip_newlines();
+            if !self.check_alias(Chk::Command)? {
+                return Ok(());
+            }
+        }
+    }
+
+    /// dash's CHKALIAS point: substitute the alias named by the token at `pos`,
+    /// rescanning the replacement in place so it can name further aliases. Reports
+    /// whether anything was substituted.
+    fn check_alias(&mut self, chk: Chk) -> Syn<bool> {
+        let mut any = false;
+        loop {
+            self.settle();
+            let Some((name, value)) = self.alias_here(chk) else {
+                return Ok(any);
+            };
+            self.expand(&name, &value)?;
+            any = true;
+        }
+    }
+
+    /// The alias the token at `pos` names, if this position may take one: where the
+    /// grammar allows one, or on the token after a blank-terminated replacement --
+    /// dash sets its check when popping one, wherever that lands.
+    fn alias_here(&self, chk: Chk) -> Option<(String, String)> {
+        if chk == Chk::None && self.force_at != Some(self.pos) {
+            return None;
+        }
+        // Only an unquoted literal word is a candidate: `'hi'` and `$cmd` are not.
+        let Some(Tok::Word(w)) = self.toks.get(self.pos) else {
+            return None;
+        };
+        let name = w.plain()?;
+        if (chk == Chk::Command && is_reserved(name)) || self.active.iter().any(|r| r.name == name) {
+            return None;
+        }
+        let value = self.aliases.get(name)?.clone();
+        Some((name.to_string(), value))
+    }
+
+    /// Splice a replacement in place of the alias word, so the grammar sees it: an
+    /// alias may supply syntax (`alias L='{'`), which is why substitution has to
+    /// happen before the parser reads the token rather than after.
+    fn expand(&mut self, name: &str, value: &str) -> Syn<()> {
+        self.budget = self
+            .budget
+            .checked_sub(1)
+            .ok_or_else(|| "alias expansion too deep".to_string())?;
+        // Not incomplete input however it failed: no amount of further input can
+        // complete a replacement, so the unit loop must stop rather than read on.
+        let lexed = tokenize(value).map_err(|e| format!("alias `{name}': {e}"))?;
+        let base = self.heredocs.len();
+        self.heredocs.extend(lexed.heredocs);
+        let sub: Vec<Tok> = lexed
+            .toks
+            .into_iter()
+            .filter(|t| !matches!(t, Tok::Eof))
+            // Renumber onto the end of this source's table so a here-document
+            // written inside an alias still resolves.
+            .map(|t| match t {
+                Tok::Op(Op::DLess(id)) => Tok::Op(Op::DLess(id + base)),
+                other => other,
+            })
+            .collect();
+        let end = self.pos + sub.len();
+        // A replacement that trails off inside a comment comments out the rest of
+        // the line it was written on: dash reads the replacement from the same
+        // input stream, so the comment runs to the next newline of the INPUT.
+        let over = if lexed.ended_in_comment {
+            self.line_end(self.pos + 1)
+        } else {
+            self.pos + 1
+        };
+        self.splice(self.pos, over, sub);
+        self.active.push(Region {
+            name: name.to_string(),
+            end,
+            blank: value.ends_with([' ', '\t']),
+        });
+        Ok(())
+    }
+
+    /// Replace `toks[at..over]` with `sub`, carrying the recorded replacement ends
+    /// across the shift.
+    fn splice(&mut self, at: usize, over: usize, sub: Vec<Tok>) {
+        let at = at.min(self.toks.len());
+        let over = over.max(at).min(self.toks.len());
+        let added = sub.len();
+        self.toks.splice(at..over, sub);
+        for r in &mut self.active {
+            r.end = reindex(r.end, at, over, added);
+        }
+    }
+
+    /// The newline ending the line token `from` sits on, or the end of the stream.
+    fn line_end(&self, from: usize) -> usize {
+        let mut i = from;
+        while !matches!(self.toks.get(i), None | Some(Tok::Newline) | Some(Tok::Eof)) {
+            i += 1;
+        }
+        i
+    }
+
+    /// dash's popstring: drop the replacements the parse has passed the end of.
+    /// Their names become expandable again, and one that ended in a blank makes the
+    /// token landed on a candidate wherever it sits.
+    fn settle(&mut self) {
+        while self.active.last().is_some_and(|r| r.end <= self.pos) {
+            if self.active.pop().is_some_and(|r| r.blank) {
+                self.force_at = Some(self.pos);
+            }
+        }
+    }
+
+    fn tok_at(&self, i: usize) -> Option<&Tok> {
+        let tok = self.toks.get(i);
+        if tok.is_none() {
+            self.hit_end.set(true);
+        }
+        tok
+    }
+
     fn peek(&self) -> Option<&Tok> {
-        self.toks.get(self.pos)
+        self.tok_at(self.pos)
     }
 
     fn bump(&mut self) {
         if self.pos < self.toks.len() {
             self.pos += 1;
         }
+        self.settle();
     }
 
     fn at_eof(&self) -> bool {
@@ -132,6 +396,9 @@ impl Parser {
     }
 
     fn take_word(&mut self) -> Syn<Word> {
+        // No command starts here (a redirection target, a `case` pattern, a `for`
+        // list word), but a blank-terminated replacement still reaches this far.
+        self.check_alias(Chk::None)?;
         match self.peek() {
             Some(Tok::Word(w)) => {
                 let w = w.clone();
@@ -157,7 +424,9 @@ impl Parser {
     fn parse_list(&mut self, terms: &[&str]) -> Syn<List> {
         let mut items = Vec::new();
         loop {
-            self.skip_newlines();
+            // Before the terminator test, not after: `alias t=then` has to become
+            // `then` for `if …; t …; fi` to see the arm end.
+            self.open_command()?;
             if self.at_list_end(terms) {
                 break;
             }
@@ -191,7 +460,7 @@ impl Parser {
                 _ => break,
             };
             self.bump();
-            self.skip_newlines();
+            self.open_command()?;
             rest.push((conn, self.parse_pipeline()?));
         }
         Ok(AndOr { first, rest })
@@ -199,14 +468,20 @@ impl Parser {
 
     fn parse_pipeline(&mut self) -> Syn<Pipeline> {
         let mut bang = false;
-        while self.peek_reserved() == Some("!") {
+        // Every command in the grammar is reached through here, so this is the one
+        // place a command word's alias check has to be made.
+        loop {
+            self.check_alias(Chk::Command)?;
+            if self.peek_reserved() != Some("!") {
+                break;
+            }
             self.bump();
             bang = !bang;
         }
         let mut cmds = vec![self.parse_command()?];
         while self.peek_op() == Some(Op::Pipe) {
             self.bump();
-            self.skip_newlines();
+            self.open_command()?;
             cmds.push(self.parse_command()?);
         }
         Ok(Pipeline { bang, cmds })
@@ -217,6 +492,7 @@ impl Parser {
     fn parse_command(&mut self) -> Syn<Cmd> {
         self.depth += 1;
         if self.depth > MAX_PARSE_DEPTH {
+            self.depth -= 1;
             return Err("syntax error: command nesting too deep".to_string());
         }
         let result = self.parse_command_inner();
@@ -260,7 +536,7 @@ impl Parser {
         if !w.plain().is_some_and(is_name) {
             return false;
         }
-        matches!(self.toks.get(self.pos + 1), Some(Tok::Op(Op::LParen)))
+        matches!(self.tok_at(self.pos + 1), Some(Tok::Op(Op::LParen)))
     }
 
     fn parse_func_def(&mut self) -> Syn<Cmd> {
@@ -271,7 +547,9 @@ impl Parser {
         self.bump();
         self.expect_op(Op::LParen)?;
         self.expect_op(Op::RParen)?;
-        self.skip_newlines();
+        // The body is a command position like any other, so an alias may supply it:
+        // `alias B='{ echo yes; }'` then `f()` / `B`.
+        self.open_command()?;
         let body = self.parse_command()?;
         if matches!(body, Cmd::Simple { .. }) {
             return Err(format!(
@@ -335,6 +613,10 @@ impl Parser {
 
     fn parse_for(&mut self) -> Syn<Cmd> {
         self.expect_reserved("for")?;
+        // dash reads the loop variable with its keyword and alias checks off, but a
+        // blank-terminated replacement still reaches it: `alias F='for '` then
+        // `F eye ...` expands `eye`.
+        self.check_alias(Chk::None)?;
         let var = match self.peek() {
             Some(Tok::Word(w)) => match w.plain() {
                 Some(n) if is_name(n) => n.to_string(),
@@ -343,11 +625,17 @@ impl Parser {
             _ => return Err("syntax error: `for` requires a variable name".into()),
         };
         self.bump();
-        self.skip_newlines();
+        self.open_command()?;
         let words = if self.peek_reserved() == Some("in") {
             self.bump();
             let mut ws = Vec::new();
-            while matches!(self.peek(), Some(Tok::Word(_))) {
+            loop {
+                // Before the test, not inside `take_word`: a replacement can be the
+                // operator that ENDS the list (`alias S=';'`).
+                self.check_alias(Chk::None)?;
+                if !matches!(self.peek(), Some(Tok::Word(_))) {
+                    break;
+                }
                 ws.push(self.take_word()?);
             }
             Some(ws)
@@ -357,7 +645,7 @@ impl Parser {
         if self.peek_op() == Some(Op::Semi) {
             self.bump();
         }
-        self.skip_newlines();
+        self.open_command()?;
         self.expect_reserved("do")?;
         let body = self.parse_list(&["done"])?;
         self.expect_reserved("done")?;
@@ -373,11 +661,12 @@ impl Parser {
     fn parse_case(&mut self) -> Syn<Cmd> {
         self.expect_reserved("case")?;
         let word = self.take_word()?;
-        self.skip_newlines();
+        self.open_command()?;
         self.expect_reserved("in")?;
         let mut items = Vec::new();
         loop {
             self.skip_newlines();
+            self.check_alias(Chk::None)?;
             if self.peek_reserved() == Some("esac") {
                 break;
             }
@@ -416,6 +705,18 @@ impl Parser {
         let mut words: Vec<Word> = Vec::new();
         let mut redirs: Vec<Redir> = Vec::new();
         loop {
+            // dash holds the alias check open across the whole assignment prefix
+            // and its redirections, so `FOO=1 al` and `>f al` expand -- but with
+            // keywords off past the first word, so `FOO=1 if` is a command named
+            // `if`. Past the command word only a blank-terminated replacement
+            // still reaches an argument.
+            self.check_alias(if !words.is_empty() {
+                Chk::None
+            } else if assigns.is_empty() && redirs.is_empty() {
+                Chk::Command
+            } else {
+                Chk::Word
+            })?;
             match self.peek() {
                 Some(Tok::IoNumber(n)) => {
                     let n = *n;
@@ -460,6 +761,10 @@ impl Parser {
 
     fn parse_redirs(&mut self) -> Syn<Vec<Redir>> {
         let mut redirs = Vec::new();
+        // Only the FIRST token after a compound command is checked, which is what
+        // dash's one `checkkwd` before its redirection loop amounts to: an alias
+        // may carry the redirection itself (`alias R='>/dev/null'`).
+        self.check_alias(Chk::Command)?;
         loop {
             match self.peek() {
                 Some(Tok::IoNumber(n)) => {
@@ -503,6 +808,19 @@ impl Parser {
         };
         let word = self.take_word()?;
         Ok(Redir { fd, kind, word })
+    }
+}
+
+/// Where an index recorded in the old token stream lands once `toks[a..b]` has
+/// become `added` tokens.
+fn reindex(e: usize, a: usize, b: usize, added: usize) -> usize {
+    if e <= a {
+        e
+    } else if e >= b {
+        (e + added).saturating_sub(b - a)
+    } else {
+        // Inside the replaced span: what it pointed past is gone.
+        a + added
     }
 }
 

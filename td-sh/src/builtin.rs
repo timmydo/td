@@ -2746,6 +2746,24 @@ mod tests {
             run_capturing("echo $(alias hi='echo hello')\nhi 2>/dev/null; echo $?").1,
             "\n127\n"
         );
+        // A `;` does not end the unit, so the alias is still not in force; the
+        // newline after it does.
+        assert_eq!(
+            run_capturing("alias e=echo; e one 2>/dev/null; echo two\ne three").1,
+            "two\nthree\n"
+        );
+    }
+
+    #[test]
+    fn a_lexical_error_is_reported_where_the_parse_reaches_it() {
+        // The source is lexed in one pass, but what stopped the lexer surfaces only
+        // when a unit needs that text: the commands before it have already run.
+        let (status, out, err) = run_capturing("echo hi\necho 'unterminated");
+        assert_eq!((status, out.as_str()), (2, "hi\n"));
+        assert!(err.contains("unmatched"), "err: {err:?}");
+        // ... and the command the bad text belongs to does NOT run.
+        let (status, out, _) = run_capturing("echo before\necho VISIBLE <<EOF\nbody\n");
+        assert_eq!((status, out.as_str()), (2, "before\n"));
     }
 
     #[test]
@@ -2818,10 +2836,6 @@ mod tests {
             run_capturing("alias e=echo\ncase a in\na) case b in\nb) e IN;;\nesac\ne OUT;;\nesac").1,
             "IN\nOUT\n"
         );
-        // Closing a SUBSHELL leaves no command position, so dash reports the
-        // stray word rather than expanding it.
-        let (status, _, _) = run_capturing("alias foo='; echo X'\n(echo a) foo");
-        assert_eq!(status, 2);
         // A pattern list opens after `(` and continues after `|`, so neither
         // makes a command position while patterns are being read.
         assert_eq!(
@@ -2873,6 +2887,45 @@ mod tests {
         // input can complete it, so the unit loop must not keep reading lines.
         let (status, out, _) = run_capturing("alias e='cat <<EOF'\ne\necho after");
         assert_eq!((status, out.as_str()), (2, ""));
+        // The check reaches even the positions the grammar reads by name: the
+        // loop variable of a `for` and the `in` of a `case`.
+        assert_eq!(
+            run_capturing("alias F='for '\nalias eye='i '\nF eye in 1 2; do echo $i; done").1,
+            "1\n2\n"
+        );
+        assert_eq!(
+            run_capturing("alias c='case x '\nalias IN='in '\nc IN x) echo hit;; esac").1,
+            "hit\n"
+        );
+        // A redirection FILENAME is one too, since dash spends the check on the
+        // next token read whatever the grammar wanted there.
+        assert_eq!(
+            run_capturing("alias e=': < '\nalias f=/dev/null\ne f; echo rc=$?").1,
+            "rc=0\n"
+        );
+        // A replacement may also be the operator that ENDS a `for` word list, so
+        // the check has to precede the is-it-a-word test.
+        assert_eq!(
+            run_capturing("alias F='for i in x '\nalias S=';'\nF S do echo $i; done").1,
+            "x\n"
+        );
+    }
+
+    #[test]
+    fn alias_reaches_the_positions_the_grammar_reads_by_name() {
+        // A function body is a command position of its own (dash sets its checks
+        // before parsing one), so an alias may supply the whole compound.
+        assert_eq!(run_capturing("alias B='{ echo yes; }'\nf()\nB\nf").1, "yes\n");
+        // `case … in` takes the check the same way `for … in` does.
+        assert_eq!(run_capturing("alias I=in\ncase x I x) echo hit;; esac").1, "hit\n");
+        // The token after a COMPOUND command is where dash looks for the
+        // redirections that may follow it, and it looks with keywords and aliases
+        // both on -- so an alias may supply that redirection, or a separator.
+        assert_eq!(
+            run_capturing("alias R='>/dev/null'\n{ echo hidden; } R\necho after").1,
+            "after\n"
+        );
+        assert_eq!(run_capturing("alias foo='; echo X'\n(echo a) foo").1, "a\nX\n");
     }
 
     #[test]
