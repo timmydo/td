@@ -95,7 +95,14 @@ pub struct Shell {
     pub status: i32,         // $?
     pub last_bg: u32,        // $!
     pub opts: Opts,
+    /// The PHYSICAL working directory: what a child process is started in and
+    /// what a relative path resolves against, so it is kept canonical.
     pub cwd: PathBuf,
+    /// dash's `curdir`: the LOGICAL path, the one the shell was walked to by
+    /// name. It is what `$PWD` and `pwd` report, and what `..` is applied to,
+    /// so a directory reached through a symlink keeps the name it was reached
+    /// by. Only `cd` moves it.
+    pub logical_cwd: PathBuf,
     pub fds: Fds,
     pub in_function: bool,
     /// Bindings this function invocation's `local`s displaced, in declaration
@@ -146,6 +153,17 @@ pub struct Shell {
 /// would SIGABRT — there is no unsafe/stack-probe escape hatch here).
 const MAX_RUN_DEPTH: u32 = 256;
 
+/// Whether two paths name the same directory, by device and inode as dash's
+/// startup check does -- a string compare would accept a stale inherited `PWD`
+/// that merely looks plausible.
+fn same_dir(a: &Path, b: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    match (std::fs::metadata(a), std::fs::metadata(b)) {
+        (Ok(x), Ok(y)) => x.dev() == y.dev() && x.ino() == y.ino(),
+        _ => false,
+    }
+}
+
 impl Shell {
     pub fn new() -> Self {
         let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
@@ -168,6 +186,7 @@ impl Shell {
             status: 0,
             last_bg: 0,
             opts: Opts::default(),
+            logical_cwd: cwd.clone(),
             cwd,
             fds: Fds::new(),
             in_function: false,
@@ -188,6 +207,19 @@ impl Shell {
         if sh.get_var("IFS").is_none() {
             let _ = sh.set_var("IFS", " \t\n");
         }
+        // dash's setpwd at startup: an inherited PWD is kept only if it is
+        // absolute AND names this very directory (same dev/ino, so a stale or
+        // lying value from the parent cannot survive); otherwise the physical
+        // path replaces it. Either way PWD ends up set and EXPORTED.
+        let logical = match sh.get_var("PWD") {
+            Some(p) if p.starts_with('/') && same_dir(Path::new(&p), &sh.cwd) => {
+                PathBuf::from(p)
+            }
+            _ => sh.cwd.clone(),
+        };
+        let _ = sh.set_var("PWD", &logical.to_string_lossy());
+        sh.logical_cwd = logical;
+        sh.export_var("PWD");
         // POSIX: OPTIND is 1 at shell start, overriding any imported value.
         let _ = sh.set_var("OPTIND", "1");
         if sh.get_var("PPID").is_none() {
@@ -207,6 +239,8 @@ impl Shell {
             status: 0,
             last_bg: 0,
             opts: Opts::default(),
+            logical_cwd: std::env::current_dir()
+                .unwrap_or_else(|_| PathBuf::from("/")),
             cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/")),
             fds: Fds::new(),
             in_function: false,
@@ -302,6 +336,15 @@ impl Shell {
                     readonly: true,
                 },
             );
+        }
+    }
+
+    /// Mark an existing name for export. dash's setvar takes a flags word, so
+    /// `PWD` and `OLDPWD` are written and exported in one step; this is that
+    /// second half for the callers that need it.
+    pub fn export_var(&mut self, name: &str) {
+        if let Some(v) = self.vars.get_mut(name) {
+            v.exported = true;
         }
     }
 

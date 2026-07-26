@@ -120,7 +120,7 @@ pub fn run(sh: &mut Shell, bi: Builtin, argv: &[String]) -> R<()> {
         Builtin::Test => test(sh, argv),
         Builtin::Eval => eval(sh, argv),
         Builtin::Cd => cd(sh, argv),
-        Builtin::Pwd => pwd(sh),
+        Builtin::Pwd => pwd(sh, argv),
         Builtin::Dot => dot(sh, argv),
         Builtin::Command => command(sh, argv),
         Builtin::Wait => ok(sh),
@@ -2117,47 +2117,175 @@ fn eval(sh: &mut Shell, argv: &[String]) -> R<()> {
     exec::run_source(sh, &joined, "eval: ")
 }
 
-fn cd(sh: &mut Shell, argv: &[String]) -> R<()> {
-    let target = match argv.get(1) {
-        Some(s) if s == "-" => match sh.get_var("OLDPWD") {
-            Some(p) => p,
-            None => {
-                err_line(sh, "cd: OLDPWD not set");
-                return status(sh, 1);
-            }
-        },
-        Some(s) => s.clone(),
-        None => match sh.get_var("HOME") {
-            Some(h) => h,
-            None => {
-                err_line(sh, "cd: HOME not set");
-                return status(sh, 1);
-            }
-        },
+/// dash's `updatepwd`: build the LOGICAL path `dir` names from `curdir`, purely
+/// lexically. `..` pops the previous component off the string without looking at
+/// the filesystem -- which is why `cd nonexistent/..` succeeds, and why a path
+/// through a symlink keeps the name it was reached by rather than its target.
+fn update_pwd(curdir: &std::path::Path, dir: &str) -> std::path::PathBuf {
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
+    // Bytes, not chars: a path is bytes on Unix, and the only characters this
+    // inspects (`/` and `.`) are ASCII, so a directory whose name is not valid
+    // UTF-8 passes through untouched rather than becoming U+FFFD.
+    let curdir = curdir.as_os_str().as_bytes();
+    let dir = dir.as_bytes();
+    // `floor` is dash's `lim`: `..` may walk up to the root and no further -- NOT
+    // merely back to where this started, so `cd ../..` from /tmp reaches /. Two
+    // leading slashes are implementation-defined, and dash keeps them as the
+    // floor instead. The two branches test that differently, and deliberately:
+    // an ABSOLUTE operand must have exactly two (`dir[1] == '/' && dir[2] != '/'`,
+    // so `///` collapses to one), while for a relative one dash looks only at
+    // `curdir[1]`, so a curdir of `///x` still floors at two.
+    let (mut out, floor): (Vec<u8>, usize) = if dir.starts_with(b"/") {
+        if dir.starts_with(b"//") && !dir.starts_with(b"///") {
+            (b"//".to_vec(), 2)
+        } else {
+            (b"/".to_vec(), 1)
+        }
+    } else {
+        let mut s = curdir.to_vec();
+        if !s.ends_with(b"/") {
+            s.push(b'/');
+        }
+        let floor = if s.get(1) == Some(&b'/') { 2 } else { 1 };
+        (s, floor)
     };
-    let new = sh.resolve(&target);
-    let canonical = match new.canonicalize() {
-        Ok(p) => p,
-        Err(e) => {
-            err_line(sh, &format!("cd: {target}: {e}"));
-            return status(sh, 1);
+    for part in dir.split(|b| *b == b'/') {
+        match part {
+            b"" | b"." => {}
+            b".." => {
+                // Drop bytes until the one now at the end is the `/` that ended
+                // the previous component.
+                while out.len() > floor {
+                    out.pop();
+                    if out.ends_with(b"/") && out.len() > floor {
+                        break;
+                    }
+                }
+            }
+            _ => {
+                if !out.ends_with(b"/") {
+                    out.push(b'/');
+                }
+                out.extend_from_slice(part);
+            }
+        }
+    }
+    if out.len() > floor && out.ends_with(b"/") {
+        out.pop();
+    }
+    std::path::PathBuf::from(std::ffi::OsString::from_vec(out))
+}
+
+/// `-L`/`-P` for `cd` and `pwd`. dash's `cdopt` XORs the physical bit whenever
+/// the letter CHANGES, starting from `L`, which comes to the same thing as the
+/// LAST of the two winning. Err carries the offending letter.
+fn cd_opts(argv: &[String]) -> Result<(bool, usize), char> {
+    let mut physical = false;
+    let mut i = 1usize;
+    while let Some(arg) = argv.get(i) {
+        if arg == "--" {
+            i += 1;
+            break;
+        }
+        let Some(letters) = arg.strip_prefix('-') else {
+            break;
+        };
+        // A lone `-` is the operand meaning $OLDPWD, not an option.
+        if letters.is_empty() {
+            break;
+        }
+        for c in letters.chars() {
+            if c != 'L' && c != 'P' {
+                return Err(c);
+            }
+            physical = c == 'P';
+        }
+        i += 1;
+    }
+    Ok((physical, i))
+}
+
+fn cd(sh: &mut Shell, argv: &[String]) -> R<()> {
+    let (physical, i) = match cd_opts(argv) {
+        Ok(v) => v,
+        Err(c) => {
+            err_line(sh, &format!("cd: Illegal option -{c}"));
+            return status(sh, 2);
         }
     };
-    if !canonical.is_dir() {
-        err_line(sh, &format!("cd: {target}: not a directory"));
-        return status(sh, 1);
+    // `cd -` reports where it landed, as does a CDPATH hit (which td-sh does not
+    // implement yet).
+    let mut print = false;
+    let dest = match argv.get(i) {
+        Some(s) if s == "-" => {
+            print = true;
+            sh.get_var("OLDPWD").unwrap_or_default()
+        }
+        Some(s) => s.clone(),
+        None => sh.get_var("HOME").unwrap_or_default(),
+    };
+    // dash never errors on an empty destination: an unset HOME or OLDPWD leaves
+    // the empty string, which it then treats as `.`, so `cd -` without OLDPWD is
+    // a successful no-move.
+    let dest = if dest.is_empty() { "." } else { dest.as_str() };
+    // dash's docd runs updatepwd ONLY in logical mode; `-P` hands the operand
+    // straight to chdir, so `link/..` follows the link first instead of having
+    // both components cancel lexically.
+    let target = if physical {
+        sh.resolve(dest)
+    } else {
+        update_pwd(&sh.logical_cwd, dest)
+    };
+    // The physical directory is what a child is started in and what a relative
+    // path resolves against, so it is always the canonical one. `cd` is a REGULAR
+    // builtin, so dash's sh_error here is caught and becomes a status rather than
+    // ending the script -- but the status is 2, not 1.
+    let Ok(phys) = target.canonicalize() else {
+        err_line(sh, &format!("cd: can't cd to {dest}"));
+        return status(sh, 2);
+    };
+    if !phys.is_dir() {
+        err_line(sh, &format!("cd: can't cd to {dest}"));
+        return status(sh, 2);
     }
-    let old = sh.cwd.to_string_lossy().into_owned();
-    sh.cwd = canonical.clone();
-    sh.set_var("OLDPWD", &old)?;
-    sh.set_var("PWD", &canonical.to_string_lossy())?;
+    // With `-P` dash passes no logical path to setpwd, which then takes the
+    // physical one; otherwise the name walked to is kept.
+    let new = if physical { phys.clone() } else { target };
+    let old = std::mem::replace(&mut sh.logical_cwd, new.clone());
+    sh.cwd = phys;
+    // Both are exported, as dash's setpwd writes them. The variables are the one
+    // place the path has to become a String, so a name that is not UTF-8 is lossy
+    // THERE while the shell's own directory keeps its bytes.
+    sh.set_var("OLDPWD", &old.to_string_lossy())?;
+    sh.export_var("OLDPWD");
+    sh.set_var("PWD", &new.to_string_lossy())?;
+    sh.export_var("PWD");
+    if print {
+        use std::os::unix::ffi::OsStrExt;
+        let mut line = new.as_os_str().as_bytes().to_vec();
+        line.push(b'\n');
+        return out(sh, &line);
+    }
     ok(sh)
 }
 
-fn pwd(sh: &mut Shell) -> R<()> {
-    let line = format!("{}\n", sh.cwd.to_string_lossy());
+fn pwd(sh: &mut Shell, argv: &[String]) -> R<()> {
+    let physical = match cd_opts(argv) {
+        Ok((p, _)) => p,
+        Err(c) => {
+            err_line(sh, &format!("pwd: Illegal option -{c}"));
+            return status(sh, 2);
+        }
+    };
+    // The LOGICAL cwd, which is what `cd` recorded -- not $PWD, which a script is
+    // free to overwrite, and not a fresh lookup. `-P` reports the physical one,
+    // which the shell already holds canonicalized.
+    use std::os::unix::ffi::OsStrExt;
+    let dir = if physical { &sh.cwd } else { &sh.logical_cwd };
+    let mut line = dir.as_os_str().as_bytes().to_vec();
+    line.push(b'\n');
     // `out` sets `$?` (0, or 1 on write error); do not overwrite it.
-    out(sh, line.as_bytes())
+    out(sh, &line)
 }
 
 /// Where `.` looks: a name containing a slash is used as given -- unexamined, so
@@ -2762,6 +2890,123 @@ mod tests {
         // Two of them consume two names, leaving nothing behind as a parameter.
         let (status, out, _) = run_capturing("set -oo errexit noglob\necho $-[$1]");
         assert_eq!((status, out.as_str()), (0, "ef[]\n"));
+    }
+
+    #[test]
+    fn update_pwd_builds_the_logical_path_lexically() {
+        let cases = [
+            // (curdir, dir, want)
+            ("/tmp", "x", "/tmp/x"),
+            ("/tmp", "/etc", "/etc"),
+            ("/tmp", ".", "/tmp"),
+            ("/tmp", "./x/./y", "/tmp/x/y"),
+            // The whole point: `..` is a string operation, so an intermediate
+            // component that does not exist is still cancelled by it.
+            ("/tmp", "nonexistent/..", "/tmp"),
+            ("/tmp", "..", "/"),
+            // `..` walks past where it started, up to the root and no further.
+            ("/tmp", "../..", "/"),
+            ("/", "..", "/"),
+            ("/a/b/c", "../../..", "/"),
+            ("/a/b", "../x", "/a/x"),
+            // Empty components collapse, and a trailing slash is dropped.
+            ("/tmp", "a//b/", "/tmp/a/b"),
+            ("/", "tmp", "/tmp"),
+            // Exactly two leading slashes are preserved and act as the floor.
+            ("/tmp", "//", "//"),
+            ("/tmp", "///", "/"),
+            ("//", "..", "//"),
+            ("//a", "..", "//"),
+            // A relative move floors at `//` whenever curdir's SECOND byte is a
+            // slash -- dash tests only that byte, so `///x` floors there too.
+            ("///x", "..", "//"),
+            ("///", "..", "//"),
+        ];
+        for (curdir, dir, want) in cases {
+            // Compare the BYTES: `Path`'s PartialEq goes through components, so
+            // it calls `/`, `//` and `///` equal and would not see a slash bug.
+            let got = super::update_pwd(std::path::Path::new(curdir), dir);
+            assert_eq!(got.as_os_str(), want, "{curdir} + {dir}");
+        }
+    }
+
+    #[test]
+    fn cd_reports_two_and_keeps_going() {
+        // `cd` is a REGULAR builtin, so dash's sh_error is caught: the status is
+        // 2 (not 1) and the script continues. builtin-cd pins it for dash AND ash.
+        let (_, out, _) = run_capturing("cd /nonexistent/dir; echo status=$?");
+        assert_eq!(out, "status=2\n");
+        // A `..` that cancels a nonexistent component never touches the disk.
+        let (_, out, _) = run_capturing("cd /; cd nonexistent_ZZ/..; echo status=$? $PWD");
+        assert_eq!(out, "status=0 /\n");
+    }
+
+    #[test]
+    fn cd_dash_prints_where_it_landed() {
+        // dash sets CD_PRINT for `cd -`, and an unset OLDPWD leaves the empty
+        // destination it treats as `.` -- a successful no-move, not an error.
+        let (_, out, _) = run_capturing("cd /; cd /tmp; cd -");
+        assert_eq!(out, "/\n");
+        let (_, out, _) = run_capturing("cd - >/dev/null; echo status=$?");
+        assert_eq!(out, "status=0\n");
+    }
+
+    #[test]
+    fn cd_takes_l_and_p_and_a_double_dash() {
+        let (_, out, _) = run_capturing("cd -- /; echo $PWD");
+        assert_eq!(out, "/\n");
+        let (_, out, _) = run_capturing("cd -L /; pwd");
+        assert_eq!(out, "/\n");
+        // dash's cdopt XORs on each CHANGE of letter, so this is back to logical.
+        let (_, out, _) = run_capturing("cd -P -L /; pwd");
+        assert_eq!(out, "/\n");
+        let (status, _, err) = run_capturing("cd -q /");
+        assert_eq!(status, 2);
+        assert!(err.contains("Illegal option"), "{err:?}");
+    }
+
+    #[test]
+    fn cd_keeps_the_name_it_walked_but_children_get_the_real_path() {
+        // The distinction only shows through a symlink: -L (the default) keeps
+        // the name, so `..` undoes the link; -P resolves it first, so `..` is the
+        // parent of the TARGET. builtin-cd pins this but cannot run -- it needs
+        // `ln -s` -- so build the tree here instead.
+        let base = std::env::temp_dir().join(format!("td-sh-cd-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("real/sub")).unwrap();
+        std::os::unix::fs::symlink(base.join("real/sub"), base.join("deep")).unwrap();
+        // canonicalize: on some hosts the temp dir is itself a symlink, and the
+        // physical answers below are canonical by construction.
+        let b = base.canonicalize().unwrap();
+        let b = b.display();
+        let (_, out, _) = run_capturing(&format!("cd {b}/deep; echo $PWD; pwd -P"));
+        assert_eq!(out, format!("{b}/deep\n{b}/real/sub\n"));
+        let (_, out, _) = run_capturing(&format!("cd {b}/deep; cd ..; pwd"));
+        assert_eq!(out, format!("{b}\n"));
+        let (_, out, _) = run_capturing(&format!("cd {b}; cd -P deep/..; pwd"));
+        assert_eq!(out, format!("{b}/real\n"));
+        let (_, out, _) = run_capturing(&format!("cd -P {b}/deep; echo $PWD"));
+        assert_eq!(out, format!("{b}/real/sub\n"));
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn pwd_and_oldpwd_are_exported_and_logical() {
+        // dash's setpwd writes both with VEXPORT.
+        let mut sh = crate::exec::Shell::new_for_test();
+        assert!(sh.get_var("PWD").is_none());
+        let _ = super::cd(&mut sh, &["cd".into(), "/tmp".into()]);
+        let _ = super::cd(&mut sh, &["cd".into(), "/".into()]);
+        let exported: Vec<String> =
+            sh.exported_env().into_iter().map(|(k, _)| k).collect();
+        for want in ["PWD", "OLDPWD"] {
+            assert!(exported.contains(&want.to_string()), "{want} not exported");
+        }
+        assert_eq!(sh.get_var("PWD").as_deref(), Some("/"));
+        assert_eq!(sh.get_var("OLDPWD").as_deref(), Some("/tmp"));
+        // `pwd` reports the logical cwd, not whatever $PWD was overwritten with.
+        let (_, out, _) = run_capturing("cd /tmp; PWD=lying; pwd; echo $PWD");
+        assert_eq!(out, "/tmp\nlying\n");
     }
 
     #[test]

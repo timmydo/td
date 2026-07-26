@@ -406,11 +406,7 @@ xfail builtin-cd.test.sh::Change directory in non-shell parent process (make or 
 xfail builtin-cd.test.sh::Survey of getcwd() syscall
 xfail builtin-cd.test.sh::Test the current directory after 'cd ..' involving symlinks
 xfail builtin-cd.test.sh::What happens when inherited $PWD and current dir disagree?
-xfail builtin-cd.test.sh::cd - without OLDPWD
-xfail builtin-cd.test.sh::cd BAD/..
 xfail builtin-cd.test.sh::cd away from dir that was deleted
-xfail builtin-cd.test.sh::cd permits double bare dash
-xfail builtin-cd.test.sh::cd to nonexistent dir
 xfail builtin-cd.test.sh::cd to relative path with -L and -P
 xfail builtin-cd.test.sh::cd to symlink with -L and -P
 xfail builtin-cd.test.sh::cd with 2 or more args - with strict_arg_parse

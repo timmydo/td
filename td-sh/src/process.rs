@@ -408,6 +408,7 @@ pub fn fork_shell(sh: &Shell) -> Shell {
         last_bg: sh.last_bg,
         opts: sh.opts,
         cwd: sh.cwd.clone(),
+        logical_cwd: sh.logical_cwd.clone(),
         fds: sh.fds.clone(),
         in_function: sh.in_function,
         // A clone unwinds only what it declares itself; the caller's frame belongs
