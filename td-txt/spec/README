@@ -97,6 +97,16 @@ td-txt-authored case files
   the generated scripts (`recipes`' `script_applets_are_covered` derives applet
   usage from the same text) and the recipe step strings.
 
+  grep-cli.test.txt ends with one further block, the `rootcheck td-volume` cases.
+  Those score a shape that is not merely USED by the image but was MOVED to it:
+  /etc/rootcheck decided whether the persistent volume was mounted read-only with
+  a busybox `awk` field test, and that predicate is now an ERE. `ro` has to match
+  as a whole comma-delimited option, so the block is mostly negatives —
+  `errors=remount-ro`, `rootcontext=`, `rofoo` and a `subvol=/@ro` value all carry
+  the letters without being the option. `recipes` pins the same pattern text in
+  `rootcheck_pins_the_td_volume_ere`, which is the other half of the binding: that
+  end proves the script still spells what this end scores.
+
   Format: see the module header of ../src/lib.rs. `#### desc` opens a case,
   `## argv:` gives the command (argv[0] is the applet), `## stdin:`…`## END`
   and friends carry verbatim blocks, and `-json` spellings carry exact bytes
@@ -136,3 +146,9 @@ Overlay
                      operand, `-i` following symlinks and sharing hard links,
                      `--version`/`--help`, and Rust's `(os error N)` suffix on
                      every io diagnostic.
+
+                     The `rootcheck td-volume` block found NONE: td-txt already
+                     answered all 17 exactly as GNU grep 3.11 did. Those cases
+                     earn their place as the score for a predicate that MOVED
+                     onto this binary, not as a bug report — an ERE standing in
+                     for an awk field test is worth pinning either way.

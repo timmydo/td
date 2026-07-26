@@ -2001,3 +2001,216 @@ beta
 ## stderr-json: ""
 ## status: 2
 
+
+# rootcheck's /run/td-volume predicate. This ERE replaced an `awk` field test, so
+# these cases are what score the replacement: `ro` must match as a whole
+# comma-delimited option, never as a substring of `errors=remount-ro`,
+# `rootcontext=` or `rofoo`. `recipes` pins the same spelling in
+# `rootcheck_pins_the_td_volume_ere`.
+
+#### rootcheck td-volume: selects the read-only volume among the other mounts
+## argv: grep -E '^[^ ]+ /run/td-volume btrfs ([^ ]*,)?ro(,[^ ]*)?( |$)' mounts
+## file mounts:
+none /proc proc rw,relatime 0 0
+/dev/vda1 / erofs ro,relatime 0 0
+/dev/vda2 /var btrfs rw,relatime,subvol=/@var 0 0
+/dev/vda2 /run/td-volume btrfs ro,relatime 0 0
+## END
+## stdout:
+/dev/vda2 /run/td-volume btrfs ro,relatime 0 0
+## END
+## stderr-json: ""
+## status: 0
+
+#### rootcheck td-volume: -q on the same shape is the exit status rootcheck reads
+## argv: grep -Eq '^[^ ]+ /run/td-volume btrfs ([^ ]*,)?ro(,[^ ]*)?( |$)' mounts
+## file mounts:
+none /proc proc rw,relatime 0 0
+/dev/vda1 / erofs ro,relatime 0 0
+/dev/vda2 /var btrfs rw,relatime,subvol=/@var 0 0
+/dev/vda2 /run/td-volume btrfs ro,relatime 0 0
+## END
+## stdout-json: ""
+## stderr-json: ""
+## status: 0
+
+#### rootcheck td-volume: a rw volume is refused
+## argv: grep -Eq '^[^ ]+ /run/td-volume btrfs ([^ ]*,)?ro(,[^ ]*)?( |$)' mounts
+## file mounts:
+none /proc proc rw,relatime 0 0
+/dev/vda1 / erofs ro,relatime 0 0
+/dev/vda2 /var btrfs rw,relatime,subvol=/@var 0 0
+/dev/vda2 /run/td-volume btrfs rw,relatime 0 0
+## END
+## stdout-json: ""
+## stderr-json: ""
+## status: 1
+
+#### rootcheck td-volume: errors=remount-ro is not a ro option
+## argv: grep -Eq '^[^ ]+ /run/td-volume btrfs ([^ ]*,)?ro(,[^ ]*)?( |$)' mounts
+## file mounts:
+none /proc proc rw,relatime 0 0
+/dev/vda1 / erofs ro,relatime 0 0
+/dev/vda2 /var btrfs rw,relatime,subvol=/@var 0 0
+/dev/vda2 /run/td-volume btrfs rw,relatime,errors=remount-ro 0 0
+## END
+## stdout-json: ""
+## stderr-json: ""
+## status: 1
+
+#### rootcheck td-volume: rootcontext= starts with ro but is not it
+## argv: grep -Eq '^[^ ]+ /run/td-volume btrfs ([^ ]*,)?ro(,[^ ]*)?( |$)' mounts
+## file mounts:
+none /proc proc rw,relatime 0 0
+/dev/vda1 / erofs ro,relatime 0 0
+/dev/vda2 /var btrfs rw,relatime,subvol=/@var 0 0
+/dev/vda2 /run/td-volume btrfs rw,rootcontext=system_u 0 0
+## END
+## stdout-json: ""
+## stderr-json: ""
+## status: 1
+
+#### rootcheck td-volume: ro as the last option
+## argv: grep -Eq '^[^ ]+ /run/td-volume btrfs ([^ ]*,)?ro(,[^ ]*)?( |$)' mounts
+## file mounts:
+none /proc proc rw,relatime 0 0
+/dev/vda1 / erofs ro,relatime 0 0
+/dev/vda2 /var btrfs rw,relatime,subvol=/@var 0 0
+/dev/vda2 /run/td-volume btrfs relatime,ro 0 0
+## END
+## stdout-json: ""
+## stderr-json: ""
+## status: 0
+
+#### rootcheck td-volume: ro as the only option
+## argv: grep -Eq '^[^ ]+ /run/td-volume btrfs ([^ ]*,)?ro(,[^ ]*)?( |$)' mounts
+## file mounts:
+none /proc proc rw,relatime 0 0
+/dev/vda1 / erofs ro,relatime 0 0
+/dev/vda2 /var btrfs rw,relatime,subvol=/@var 0 0
+/dev/vda2 /run/td-volume btrfs ro 0 0
+## END
+## stdout-json: ""
+## stderr-json: ""
+## status: 0
+
+#### rootcheck td-volume: ro between two other options
+## argv: grep -Eq '^[^ ]+ /run/td-volume btrfs ([^ ]*,)?ro(,[^ ]*)?( |$)' mounts
+## file mounts:
+none /proc proc rw,relatime 0 0
+/dev/vda1 / erofs ro,relatime 0 0
+/dev/vda2 /var btrfs rw,relatime,subvol=/@var 0 0
+/dev/vda2 /run/td-volume btrfs rw,ro,relatime 0 0
+## END
+## stdout-json: ""
+## stderr-json: ""
+## status: 0
+
+#### rootcheck td-volume: ro inside a subvol value does not count, the real ro does
+## argv: grep -E '^[^ ]+ /run/td-volume btrfs ([^ ]*,)?ro(,[^ ]*)?( |$)' mounts
+## file mounts:
+none /proc proc rw,relatime 0 0
+/dev/vda1 / erofs ro,relatime 0 0
+/dev/vda2 /var btrfs rw,relatime,subvol=/@var 0 0
+/dev/vda2 /run/td-volume btrfs subvol=/@ro,ro 0 0
+## END
+## stdout:
+/dev/vda2 /run/td-volume btrfs subvol=/@ro,ro 0 0
+## END
+## stderr-json: ""
+## status: 0
+
+#### rootcheck td-volume: a subvol named /@ro without a real ro is refused
+## argv: grep -Eq '^[^ ]+ /run/td-volume btrfs ([^ ]*,)?ro(,[^ ]*)?( |$)' mounts
+## file mounts:
+none /proc proc rw,relatime 0 0
+/dev/vda1 / erofs ro,relatime 0 0
+/dev/vda2 /var btrfs rw,relatime,subvol=/@var 0 0
+/dev/vda2 /run/td-volume btrfs rw,subvol=/@ro 0 0
+## END
+## stdout-json: ""
+## stderr-json: ""
+## status: 1
+
+#### rootcheck td-volume: rofoo is not ro
+## argv: grep -Eq '^[^ ]+ /run/td-volume btrfs ([^ ]*,)?ro(,[^ ]*)?( |$)' mounts
+## file mounts:
+none /proc proc rw,relatime 0 0
+/dev/vda1 / erofs ro,relatime 0 0
+/dev/vda2 /var btrfs rw,relatime,subvol=/@var 0 0
+/dev/vda2 /run/td-volume btrfs rofoo,relatime 0 0
+## END
+## stdout-json: ""
+## stderr-json: ""
+## status: 1
+
+#### rootcheck td-volume: a different mount point is refused
+## argv: grep -Eq '^[^ ]+ /run/td-volume btrfs ([^ ]*,)?ro(,[^ ]*)?( |$)' mounts
+## file mounts:
+none /proc proc rw,relatime 0 0
+/dev/vda1 / erofs ro,relatime 0 0
+/dev/vda2 /var btrfs rw,relatime,subvol=/@var 0 0
+/dev/vda2 /run/td-volume2 btrfs ro,relatime 0 0
+## END
+## stdout-json: ""
+## stderr-json: ""
+## status: 1
+
+#### rootcheck td-volume: a different fstype is refused
+## argv: grep -Eq '^[^ ]+ /run/td-volume btrfs ([^ ]*,)?ro(,[^ ]*)?( |$)' mounts
+## file mounts:
+none /proc proc rw,relatime 0 0
+/dev/vda1 / erofs ro,relatime 0 0
+/dev/vda2 /var btrfs rw,relatime,subvol=/@var 0 0
+/dev/vda2 /run/td-volume ext4 ro,relatime 0 0
+## END
+## stdout-json: ""
+## stderr-json: ""
+## status: 1
+
+#### rootcheck td-volume: btrfs2 does not satisfy the btrfs field
+## argv: grep -Eq '^[^ ]+ /run/td-volume btrfs ([^ ]*,)?ro(,[^ ]*)?( |$)' mounts
+## file mounts:
+none /proc proc rw,relatime 0 0
+/dev/vda1 / erofs ro,relatime 0 0
+/dev/vda2 /var btrfs rw,relatime,subvol=/@var 0 0
+/dev/vda2 /run/td-volume btrfs2 ro,relatime 0 0
+## END
+## stdout-json: ""
+## stderr-json: ""
+## status: 1
+
+#### rootcheck td-volume: the path as a SOURCE rather than a mount point is refused
+## argv: grep -Eq '^[^ ]+ /run/td-volume btrfs ([^ ]*,)?ro(,[^ ]*)?( |$)' mounts
+## file mounts:
+none /proc proc rw,relatime 0 0
+/dev/vda1 / erofs ro,relatime 0 0
+/dev/vda2 /var btrfs rw,relatime,subvol=/@var 0 0
+/run/td-volume /mnt btrfs ro,relatime 0 0
+## END
+## stdout-json: ""
+## stderr-json: ""
+## status: 1
+
+#### rootcheck td-volume: a line with no options field is refused
+## argv: grep -Eq '^[^ ]+ /run/td-volume btrfs ([^ ]*,)?ro(,[^ ]*)?( |$)' mounts
+## file mounts:
+none /proc proc rw,relatime 0 0
+/dev/vda1 / erofs ro,relatime 0 0
+/dev/vda2 /var btrfs rw,relatime,subvol=/@var 0 0
+/dev/vda2 /run/td-volume btrfs
+## END
+## stdout-json: ""
+## stderr-json: ""
+## status: 1
+
+#### rootcheck td-volume: absent entirely is refused
+## argv: grep -Eq '^[^ ]+ /run/td-volume btrfs ([^ ]*,)?ro(,[^ ]*)?( |$)' mounts
+## file mounts:
+none /proc proc rw,relatime 0 0
+/dev/vda1 / erofs ro,relatime 0 0
+/dev/vda2 /var btrfs rw,relatime,subvol=/@var 0 0
+## END
+## stdout-json: ""
+## stderr-json: ""
+## status: 1

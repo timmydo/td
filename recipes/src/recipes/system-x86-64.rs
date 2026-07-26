@@ -201,8 +201,17 @@ const SYSTEM: SystemDef = SystemDef {
 /// `grep`/`sed` LEFT this list for td-txt (see `TD_TXT_APPLETS`) once the conformance corpus
 /// covered the shapes the image's own scripts use — which is also why those scripts stopped
 /// spelling them `/bin/busybox grep` and now call `/bin/grep`: with the name off this list,
-/// the multiplexer spelling would name an applet `shape_check` no longer verifies. `awk` is
-/// what keeps busybox's text half alive; td-txt serves no awk.
+/// the multiplexer spelling would name an applet `shape_check` no longer verifies.
+///
+/// `awk` stays only as a utility a user may reach for: NO generated script invokes it now
+/// that `rootcheck`'s one field test is an ERE, and `no_generated_script_invokes_awk` keeps
+/// it that way by banning the name outright — being in this list is what makes `/bin/awk`
+/// a real symlink, so a caller would have several spellings and only a shell grammar could
+/// tell which are command position. Dropping it is a one-line change nothing on the image
+/// blocks. It is not the only caller-less entry (`ash` and `more` have no call site either;
+/// only `sh` and `getty` do), but it is the only one whose absence is ASSERTED, because it
+/// is the only one whose return would put a boot-path text decision back on a farm no
+/// conformance corpus scores.
 ///
 /// `find`/`xargs` are intentionally NOT bare symlinks either: the ladder's findutils
 /// dead-axis lock (`no_bootstrap_step_invokes_host_find_or_xargs`) forbids those tokens in
@@ -220,12 +229,16 @@ const BUSYBOX_APPLETS: &[&str] = &["sh", "ash", "getty", "more", "awk"];
 /// and td-init (and unlike uutils) it is an ET_EXEC with an EMPTY runtime closure.
 ///
 /// These names are LOAD-BEARING, which is what separates this farm from td-util's: the real
-/// root's `/etc/rootcheck` decides whether the boot is healthy with four `grep -Eq` runs over
+/// root's `/etc/rootcheck` decides whether the boot is healthy with five `grep -Eq` runs over
 /// `/proc/mounts` and `/etc/machine-id`, and `/etc/profile`, `/etc/netup`, `/etc/bootsuccess`
 /// and `/etc/bootfail` each read `/proc/cmdline` with one. So every boot runs this binary
 /// before it can report success, and a grep that answered wrongly would not fail loudly — it
 /// would quietly mark a broken root healthy. That is why the corpus (td-txt/spec) had to
 /// cover those exact invocation shapes before this list existed.
+///
+/// The fifth was busybox's last text call on the image — an `awk` field test over
+/// `/proc/mounts`. It decided boot health from a farm the conformance corpus does not
+/// cover, so moving it here put every text predicate in that decision under the corpus.
 ///
 /// `/proc` files stat as zero-length, so the applets must read them as streams rather than
 /// sizing a buffer from `st_size`; td-txt reads whole inputs by `read_to_end`, and the
@@ -799,10 +812,17 @@ fn build_rootcheck(sys: &SystemDef) -> String {
     ));
     // State is the persistent Btrfs @var subvolume; only run/tmp are volatile.
     // Homes remain stable paths through immutable symlinks into /var.
+    // The td-volume line needs `ro` as a whole comma-delimited option, not a substring:
+    // `errors=remount-ro` and `rootcontext=…` both carry the letters. An awk field test
+    // used to spell that; an ERE anchored on the space-delimited fields is equivalent
+    // over procfs, which emits exactly six single-space-separated fields per line and
+    // escapes any literal blank as `\040` (see `rootcheck_pins_the_td_volume_ere`).
+    // ANY matching line satisfies it, exactly as the awk's `found=1` did — so a volume
+    // mounted ro and later over-mounted rw still reads healthy here.
     s.push_str(
         "/bin/grep -Eq '^[^ ]+ /var btrfs ' /proc/mounts || ok=0\n\
-         /bin/busybox awk '$2 == \"/run/td-volume\" && $3 == \"btrfs\" && \
-         $4 ~ /(^|,)ro(,|$)/ { found=1 } END { exit !found }' /proc/mounts || ok=0\n\
+         /bin/grep -Eq '^[^ ]+ /run/td-volume btrfs ([^ ]*,)?ro(,[^ ]*)?( |$)' \
+         /proc/mounts || ok=0\n\
          for d in /run /tmp; do \
          /bin/grep -Eq \"^[^ ]+ $d tmpfs \" /proc/mounts || ok=0; \
          done\n",
@@ -2673,6 +2693,78 @@ mod tests {
                 "INITRAMFS_APPLETS lists '{a}', but no generated script invokes `busybox {a}` \
                  and td-boot does not require it - drop it, or move it to the /bin farm if it \
                  needs a symlink"
+            );
+        }
+    }
+
+    /// `awk` is in the farm for a user, not for a caller: no generated script invokes it,
+    /// and re-introducing a call would put a boot-path text decision back on a farm the
+    /// td-txt corpus does not cover — so the absence is asserted rather than left to review.
+    ///
+    /// The assertion is the whole SUBSTRING, not a scan of call spellings, because
+    /// deciding "is this `awk` in command position" needs a shell grammar and every
+    /// approximation of one leaves a spelling that escapes: `/bin/awk` (being in the farm
+    /// is what makes that symlink real, and `/bin/<applet>` is the spelling d95578ce
+    /// endorsed for grep/sed), `/bin/busybox  awk` on the whitespace, and a bare `awk`
+    /// found through the PATH td-init exports. No generated script contains the three
+    /// letters at all, so banning them outright costs nothing and cannot be evaded. A
+    /// script that some day needs them for an unrelated word reds here and gets a
+    /// deliberate decision instead of silently reopening the hole.
+    #[test]
+    fn no_generated_script_invokes_awk() {
+        for (name, text, _) in script_sources() {
+            assert!(
+                !text.contains("awk"),
+                "{name} contains `awk`. The image's text predicates run on td-txt, whose \
+                 conformance corpus is what makes a wrong answer a red build; awk has no \
+                 such corpus. Express it with grep/sed, or land an awk corpus first"
+            );
+        }
+    }
+
+    /// The ERE that replaced rootcheck's awk field test, pinned because its correctness is
+    /// not local: `ro` must match as a whole comma-delimited option, so `errors=remount-ro`
+    /// and `rootcontext=…` must NOT satisfy it. The truth table lives where it can actually
+    /// be EXECUTED — the td-txt corpus runs this pattern against the real binary — so this
+    /// asserts BOTH ends carry it. One end alone is not a pin: the script and the corpus
+    /// could drift apart with each suite still green, leaving the corpus scoring a pattern
+    /// the image no longer runs.
+    #[test]
+    fn rootcheck_pins_the_td_volume_ere() {
+        // The quoted pattern is the substring the two ends SHARE: rootcheck spells it
+        // `/bin/grep -Eq <PATTERN> /proc/mounts`, a corpus case `grep -Eq <PATTERN> mounts`.
+        const PATTERN: &str = "'^[^ ]+ /run/td-volume btrfs ([^ ]*,)?ro(,[^ ]*)?( |$)'";
+        const CORPUS: &str = include_str!("../../../td-txt/spec/grep-cli.test.txt");
+        const OVERLAY: &str = include_str!("../../../td-txt/spec/expectations.txt");
+        const SCORED: usize = 17;
+        let text = build_rootcheck(&SYSTEM);
+        assert!(
+            text.contains(&format!("/bin/grep -Eq {PATTERN} /proc/mounts")),
+            "rootcheck no longer runs the td-volume ERE the td-txt corpus scores.\n\
+             want: /bin/grep -Eq {PATTERN} /proc/mounts\ngot:\n{text}"
+        );
+        // `## argv:` lines, not raw occurrences: only an argv line is a case the harness
+        // runs, so counting text would keep this green with the whole block commented out.
+        let scored = CORPUS
+            .lines()
+            .filter(|l| l.starts_with("## argv:") && l.contains(PATTERN))
+            .count();
+        assert!(
+            scored >= SCORED,
+            "td-txt/spec/grep-cli.test.txt runs the td-volume ERE in {scored} case(s), want \
+             at least the {SCORED} `rootcheck td-volume` ones. The image decides boot health \
+             with this pattern and the corpus is the only thing that executes it"
+        );
+        // ...and each must still be RUN and ASSERTED. The overlay tolerates a case by name,
+        // so an `xfail`/`skip` entry would retire the boot-critical predicate from scoring
+        // with the count above, both suites, and the whole gate still green.
+        for line in OVERLAY.lines() {
+            let entry = line.trim();
+            assert!(
+                entry.starts_with('#') || !entry.contains("rootcheck td-volume"),
+                "td-txt/spec/expectations.txt tolerates a `rootcheck td-volume` case \
+                 ({entry:?}) - the predicate the image decides boot health with would stop \
+                 being scored while everything stayed green"
             );
         }
     }

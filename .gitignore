@@ -62,3 +62,8 @@ td-firstboot/target/
 # recipe) during development; the shared gate redirects CARGO_TARGET_DIR to a
 # scratch dir instead.
 td-txt/target/
+
+# td-login: same — the credential multicall is shipped by its recipe as a direct
+# rustc build, but compiled here by the cargo-test gate and by hand when
+# validating the login chain.
+td-login/target/
