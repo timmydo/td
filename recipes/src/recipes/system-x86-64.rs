@@ -162,16 +162,21 @@ const SYSTEM: SystemDef = SystemDef {
 /// BUSYBOX now keeps only what no Rust multicall serves: the shell (`sh`/`ash`), the login
 /// chain (`getty`/`login`/`su`), the mount pair the pre-pivot initramfs needs before any
 /// dynamic closure is reachable, the text tools uutils does not provide (`grep`/`sed`/`awk`),
-/// and the pagers/editor. `more` stays because its uutils feature compiles a crossterm pager
-/// stack into the shipped multicall, which is a dependency call, not a farm move.
+/// and `more`, whose uutils feature would compile a crossterm pager stack into the shipped
+/// multicall — a dependency call, not a farm move.
 /// `find`/`xargs` are intentionally NOT bare symlinks either: the ladder's findutils
 /// dead-axis lock (`no_bootstrap_step_invokes_host_find_or_xargs`) forbids those tokens in
 /// any step text and can't tell a cpio member NAME from a host invocation; they stay
 /// reachable as `busybox find` / `busybox xargs`.
 const BUSYBOX_APPLETS: &[&str] = &[
-    "sh", "ash", "getty", "login", "mount", "umount", "vi", "less", "more", "grep", "sed", "awk",
-    "su",
+    "sh", "ash", "getty", "login", "mount", "umount", "more", "grep", "sed", "awk", "su",
 ];
+
+/// Names the busybox retirement DROPS rather than reimplementing as a td app: nothing on the
+/// image calls either, and `more` remains the pager. Listed rather than merely absent so the
+/// drop is checkable — `shape_check` asserts the staged root packs no such `/bin` entry, and
+/// `dropped_applets_stay_dropped` makes putting one back a deliberate deletion here.
+const DROPPED_APPLETS: &[&str] = &["vi", "less"];
 
 /// The boot glue, served by the static td-init multicall — the busybox applets that need a
 /// RAW SYSCALL, which is why they are a separate binary from td-util's
@@ -1205,6 +1210,11 @@ fn shape_check() -> String {
      for a in @INITRAMFS_APPLETS@; do \
          printf '%s\\n' \"$applets\" | grep -q -x -F \"$a\" || { echo \"busybox does not implement multiplexed applet '$a' (config drift) - a generated script or td-boot invokes it as 'busybox $a'\" >&2; exit 1; }; \
      done; \
+     for a in @DROPPED_APPLETS@; do \
+         if [ -e \"$root/bin/$a\" ] || [ -L \"$root/bin/$a\" ]; then echo \"root tree: /bin/$a is packed, but '$a' is in DROPPED_APPLETS - the busybox retirement dropped this name rather than reimplementing it\" >&2; exit 1; fi; \
+         if printf '%s\\n' \"$selector_list\" | grep -q -x -F \"bin/$a\"; then echo \"selector initramfs: bin/$a is packed, but '$a' is in DROPPED_APPLETS\" >&2; exit 1; fi; \
+         if printf '%s\\n' \"$init_list\" | grep -q -x -F \"bin/$a\"; then echo \"deployment initramfs: bin/$a is packed, but '$a' is in DROPPED_APPLETS\" >&2; exit 1; fi; \
+     done; \
      uu=\"{root}/real-root{in:uutils}/bin/coreutils\"; uutgt=\"{in:uutils}/bin/coreutils\"; \
      { [ -f \"$uu\" ] && [ -x \"$uu\" ]; } || { echo 'root tree: the uutils coreutils multicall is not packed at real-root{in:uutils}/bin/coreutils - the /bin coreutils symlinks would all dangle (#547)' >&2; exit 1; }; \
      for a in @UUTILS_APPLETS@; do \
@@ -1240,6 +1250,9 @@ fn shape_check() -> String {
         // boot oracle executes uutils after pivoting and remains the behavioral runtime check.
         .replace("@BUSYBOX_APPLETS@", &BUSYBOX_APPLETS.join(" "))
         .replace("@INITRAMFS_APPLETS@", &INITRAMFS_APPLETS.join(" "))
+        // The dropped-name sweep tests -e AND -L because a repacked /bin entry pointing at a
+        // target the build tree does not hold is DANGLING, which -e alone reads as absent.
+        .replace("@DROPPED_APPLETS@", &DROPPED_APPLETS.join(" "))
         .replace("@UUTILS_APPLETS@", &UUTILS_APPLETS.join(" "))
         .replace("@TD_UTIL_APPLETS@", &TD_UTIL_APPLETS.join(" "))
         .replace("@TD_INIT_APPLETS@", &td_init_applets().join(" "))
@@ -1597,17 +1610,23 @@ mod tests {
     /// one of them runs somewhere no dynamic loader is reachable (the pre-pivot initramfs)
     /// or where a failure has nowhere to be reported (PID 1's own sysinit), so what matters
     /// is not which static binary serves them but that uutils never does.
-    #[test]
-    fn applet_farms_are_disjoint_and_boot_names_stay_static() {
-        // Four farms now, so check every pair: a name served twice emits two Symlink steps
-        // for one link and the LAST one silently wins.
-        let td_init = td_init_applets();
-        let farms: [(&str, &[&str]); 4] = [
+    /// Every /bin farm, name-tagged. ONE table: two tests consume it, and a fifth farm added
+    /// to only one of them would leave the other silently narrower.
+    fn bin_farms<'a>(td_init: &'a [&'static str]) -> [(&'static str, &'a [&'static str]); 4] {
+        [
             ("busybox", BUSYBOX_APPLETS),
             ("uutils", UUTILS_APPLETS),
             ("td-util", TD_UTIL_APPLETS),
-            ("td-init", &td_init),
-        ];
+            ("td-init", td_init),
+        ]
+    }
+
+    #[test]
+    fn applet_farms_are_disjoint_and_boot_names_stay_static() {
+        // Check every pair: a name served twice emits two Symlink steps for one link and the
+        // LAST one silently wins.
+        let td_init = td_init_applets();
+        let farms = bin_farms(&td_init);
         for (i, (a_name, a_set)) in farms.iter().enumerate() {
             for (b_name, b_set) in farms.iter().skip(i + 1) {
                 for a in a_set.iter() {
@@ -1628,6 +1647,82 @@ mod tests {
             assert!(
                 !UUTILS_APPLETS.contains(&a),
                 "boot-critical applet '{a}' must NOT be served by dynamically-linked uutils"
+            );
+        }
+    }
+
+    /// A dropped name is invisible to every other check here: absent from all four farms it
+    /// looks exactly like a name nobody ever considered, so nothing would notice `vi` coming
+    /// back as a busybox symlink or as a td-util applet. This is the assertion that makes the
+    /// drop a decision rather than an omission — including through the multiplexer, since a
+    /// dropped name in INITRAMFS_APPLETS would put it back as `busybox vi` with a shape-check
+    /// probe behind it. The last leg pins shape_check's own scan of the STAGED tree, which is
+    /// what catches a `/bin/vi` packed by some route these lists never model.
+    #[test]
+    fn dropped_applets_stay_dropped() {
+        // An emptied list would make every loop below vacuous, which is the one way this
+        // guard can be disabled without deleting it.
+        assert!(
+            !DROPPED_APPLETS.is_empty(),
+            "DROPPED_APPLETS is empty - either every dropped name was reinstated (say so \
+             here) or the guard was hollowed out"
+        );
+        let td_init = td_init_applets();
+        let farms = bin_farms(&td_init);
+        let packed = packed_bin_names();
+        for a in DROPPED_APPLETS {
+            for (farm, set) in &farms {
+                assert!(
+                    !set.contains(a),
+                    "'{a}' is in DROPPED_APPLETS but the {farm} farm serves it - the busybox \
+                     retirement dropped this name instead of reimplementing it; remove it from \
+                     DROPPED_APPLETS in the landing that brings it back"
+                );
+            }
+            assert!(
+                !INITRAMFS_APPLETS.contains(a),
+                "'{a}' is in DROPPED_APPLETS but INITRAMFS_APPLETS declares it as \
+                 `busybox {a}` - a dropped name gets no /bin entry and no declared \
+                 multiplexed use"
+            );
+            assert!(
+                !packed.iter().any(|p| p == a),
+                "'{a}' is in DROPPED_APPLETS but real_root_steps packs /bin/{a} - the drop \
+                 did not reach the symlink steps"
+            );
+            // Both cpios too: shape_check's sweep sees only the real root, and an initramfs
+            // /bin is a second, independent farm.
+            for phase in [Phase::Selector, Phase::Deployment] {
+                assert!(
+                    !initramfs_bin_names(phase).iter().any(|p| p == a),
+                    "'{a}' is in DROPPED_APPLETS but a boot cpio packs /bin/{a} - the drop \
+                     did not reach build_initramfs_spec"
+                );
+            }
+        }
+        // The build-time half, asserted the way the td-init legs above it are. Match each
+        // leg's whole condition, not just the loop header: the header survives every
+        // weakening the legs can suffer, `-L` included.
+        let shape = shape_check();
+        assert!(
+            shape.contains(&format!(
+                "for a in {}; do if [ -e \"$root/bin/$a\" ] || [ -L \"$root/bin/$a\" ]; then",
+                DROPPED_APPLETS.join(" ")
+            )),
+            "shape_check no longer sweeps DROPPED_APPLETS over the staged /bin with both \
+             tests - only the lists in this file would still be checked, and a /bin/vi \
+             packed by any other route would ship"
+        );
+        // The cpio legs check the SHIPPED archive listing; the initramfs_bin_names loop
+        // above checks the spec that generated it. Losing these leaves only the model.
+        for (list, cpio) in [("selector_list", "selector"), ("init_list", "deployment")] {
+            assert!(
+                shape.contains(&format!(
+                    "printf '%s\\n' \"${list}\" | grep -q -x -F \"bin/$a\""
+                )),
+                "shape_check no longer sweeps DROPPED_APPLETS over the {cpio} initramfs \
+                 listing - a dropped name repacked into that cpio would only be caught by \
+                 this file's model of the spec"
             );
         }
     }
