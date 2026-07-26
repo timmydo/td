@@ -7,7 +7,7 @@ use crate::ladder::{
     SYSTEM_NET_REACH_MARKER, SYSTEM_NET_RESOLVE_MARKER, SYSTEM_NET_UP_MARKER,
     SYSTEM_PERSIST_READ_MARKER, SYSTEM_PERSIST_WRITE_MARKER, SYSTEM_ROOT_RO_MARKER,
     SYSTEM_SHUTDOWN_MARKER, SYSTEM_STATE_OWNER_MARKER, SYSTEM_STATE_WRITABLE_MARKER,
-    TD_UTIL_RUNTIME_MARKER, UUTILS_RUNTIME_MARKER,
+    TD_INIT_RUNTIME_MARKER, TD_UTIL_RUNTIME_MARKER, UUTILS_RUNTIME_MARKER,
 };
 use crate::types::{Recipe, Step};
 
@@ -152,59 +152,139 @@ const SYSTEM: SystemDef = SystemDef {
 };
 // ────────────────────────────────────────────────────────────────────────────────
 
-/// The real-root `/bin` is a symlink farm split across TWO multicall binaries, each
-/// dispatching on argv[0]'s basename: the static **busybox** (the shell, boot/login/init
-/// glue, and the non-coreutils tools) and the dynamically-linked Rust **uutils**
-/// `coreutils` (the core file/text userland — #547's cutover). A name goes in exactly one
-/// list; `shape_check` asserts the owning binary actually provides it.
+/// The real-root `/bin` is a symlink farm split across FOUR multicall binaries, each
+/// dispatching on argv[0]'s basename: the static **busybox** (the shell and the login/tty
+/// glue), the static Rust **td-init** (the boot glue — see `TD_INIT_FARM`), the static
+/// Rust **td-util** (diagnostics), and the dynamically-linked Rust **uutils** `coreutils`
+/// (the core file/text userland — #547's cutover). A name goes in exactly one list;
+/// `shape_check` asserts the owning binary actually provides it.
 ///
-/// BUSYBOX keeps everything the boot path needs and everything uutils does not provide.
-/// The sysinit/greeter/login scripts invoke their applets as `/bin/busybox <applet>` (or
-/// the busybox-served `/bin/mount`, `/bin/hostname -F`, `/bin/reboot`, `/bin/getty`,
-/// `/bin/login`, `/bin/sh`), so the cutover never touches the boot-critical path — it only
-/// changes what an interactive user's `PATH=/bin` resolves to.
-///
-/// `switch_root` is the stage-1 pivot applet: the init-initramfs execs
-/// `/bin/busybox switch_root` to enter the erofs root. Listing it here both packs a
-/// `/bin/switch_root` on the real root and — via `shape_check` — asserts the static
-/// busybox actually implements it (a `CONFIG_SWITCH_ROOT` drift would red the build
-/// rather than strand the two-stage boot).
-///
-/// `hostname` stays busybox: the inittab runs `/bin/hostname -F /etc/hostname` and uutils'
-/// hostname has no `-F`. `more` stays too — its uutils feature compiles a crossterm pager
+/// BUSYBOX now keeps only what no Rust multicall serves: the shell (`sh`/`ash`), the login
+/// chain (`getty`/`login`/`su`), the mount pair the pre-pivot initramfs needs before any
+/// dynamic closure is reachable, the text tools uutils does not provide (`grep`/`sed`/`awk`),
+/// and the pagers/editor. `more` stays because its uutils feature compiles a crossterm pager
 /// stack into the shipped multicall, which is a dependency call, not a farm move.
-/// `find`/`xargs` are intentionally NOT bare symlinks either: the
-/// ladder's findutils dead-axis lock (`no_bootstrap_step_invokes_host_find_or_xargs`)
-/// forbids those tokens in any step text and can't tell a cpio member NAME from a host
-/// invocation; they stay reachable as `busybox find` / `busybox xargs`.
+/// `find`/`xargs` are intentionally NOT bare symlinks either: the ladder's findutils
+/// dead-axis lock (`no_bootstrap_step_invokes_host_find_or_xargs`) forbids those tokens in
+/// any step text and can't tell a cpio member NAME from a host invocation; they stay
+/// reachable as `busybox find` / `busybox xargs`.
 const BUSYBOX_APPLETS: &[&str] = &[
-    "sh",
-    "ash",
-    "getty",
-    "login",
-    "init",
-    "mount",
-    "umount",
-    "switch_root",
-    "reboot",
-    "poweroff",
-    "halt",
-    "hostname",
-    "vi",
-    "less",
-    "more",
-    "grep",
-    "sed",
-    "awk",
-    "cttyhack",
+    "sh", "ash", "getty", "login", "mount", "umount", "vi", "less", "more", "grep", "sed", "awk",
     "su",
 ];
+
+/// The boot glue, served by the static td-init multicall — the busybox applets that need a
+/// RAW SYSCALL, which is why they are a separate binary from td-util's
+/// `#![forbid(unsafe_code)]` farm. Unlike every other farm here these names are LOAD-BEARING:
+/// `/init` is PID 1, `switch_root` is the stage-1 pivot, `hostname -F` runs at sysinit (the
+/// `-F` flag is the gap uutils has — it ships no `hostname` at all), and `reboot` is how a
+/// boot ends. So this farm is not merely symlinked and probed; the image's actual boot path
+/// runs it, and `shape_check` additionally dry-runs the shipped `/etc/inittab` through the
+/// packed binary so a table PID 1 would reject reds the BUILD rather than the boot.
+///
+/// td-init is an ET_EXEC with an EMPTY runtime closure, which is what lets the same binary
+/// serve the pre-pivot initramfs (where no loader exists) and the real root's `/bin`.
+///
+/// ONE table, name paired with the way the greeter proves that name on the booted image, so
+/// a farm entry cannot exist without a probe or a probe without a farm entry — the shape the
+/// td-util cutover had to add a separate test to get.
+const TD_INIT_FARM: &[(&str, Probe)] = &[
+    // Probed by REFUSAL even though it is reversible, because the success path is not free:
+    // cttyhack's whole job is `setsid(2)` + `TIOCSCTTY`, and the health target inherits
+    // init's /dev/console on stdin, so a run-it probe claims the LIVE console once per boot.
+    // That normally EPERMs (getty holds ttyS0 by then), but `::once:` jobs start before the
+    // respawned tty session, so there is a window where the claim succeeds and the probe —
+    // exiting immediately as a session leader — vhangups it. No script on this image uses
+    // cttyhack, so a probe that mutates global terminal state to prove an exec nothing
+    // performs is pure cost. The usage refusal still pins the packed name and its dispatch.
+    ("cttyhack", Probe::Refuses("", "usage: cttyhack")),
+    ("halt", Probe::Refuses("--not-an-option", "unrecognised argument")),
+    ("hostname", Probe::ReadsBackHostname),
+    // The shipped table, parsed by the binary that will be PID 1 next boot.
+    ("init", Probe::Runs("--dry-run -f /etc/inittab")),
+    (
+        "poweroff",
+        Probe::Refuses("--not-an-option", "unrecognised argument"),
+    ),
+    (
+        "reboot",
+        Probe::Refuses("--not-an-option", "unrecognised argument"),
+    ),
+    // /etc holds no init, so this is refused by the INIT-RESOLUTION check — the first of
+    // the two fail-early guards, and the only one a read-only root can drive without
+    // building a candidate NEWROOT. The mount-point guard behind it is exercised at build
+    // time, where shape_check can construct a directory holding a real init. Nothing is
+    // moved either way, and the greeter is unprivileged, so mount(2)/chroot(2) would EPERM
+    // even if both regressed — which is why this matches the DIAGNOSTIC, not a bare
+    // non-zero exit that an EPERM would also produce.
+    (
+        "switch_root",
+        Probe::Refuses("/etc /init", "refusing to switch"),
+    ),
+];
+
+/// How the greeter proves one td-init farm name on the booted image. Three of these applets
+/// are IRREVERSIBLE — running them successfully ENDS the boot — so they are proven by their
+/// REFUSAL instead. That is not a weaker proof of the shipped symlink and argv[0] dispatch
+/// (the binary still had to run in order to refuse), and it is a sharper proof of the
+/// contract that matters most for a name a typo can fire: options are parsed before anything
+/// irreversible happens. Their SUCCESS path is proven by the boot itself — `reboot` is how
+/// the oracle's VM powers off.
+enum Probe {
+    /// Must exit 0 with these arguments.
+    Runs(&'static str),
+    /// Must exit NON-ZERO with these arguments AND say so with this diagnostic. The
+    /// diagnostic is half the assertion: an unprivileged EPERM from the syscall would also
+    /// exit non-zero, and that would prove the applet TRIED — the opposite of the contract.
+    Refuses(&'static str, &'static str),
+    /// Must print the hostname `sysinit` set from /etc/hostname — the only way to see that
+    /// `hostname -F` actually took, since it runs long before the greeter exists.
+    ReadsBackHostname,
+}
+
+fn td_init_applets() -> Vec<&'static str> {
+    TD_INIT_FARM.iter().map(|(name, _)| *name).collect()
+}
+
+/// The greeter's proof for one farm name, generated from the table so the probe and the
+/// shipped symlink can never cover different sets. Each segment clears the marker gate
+/// (`i=0`) on failure and names the applet, so the oracle's console tail says WHICH one
+/// broke instead of only that the marker was absent.
+/// Double quotes only, never single: these segments are pasted inside the health target's
+/// single-quoted `su -c '…'` argument, where one `'` would end it and hand the rest to the
+/// wrong shell.
+fn td_init_probe(applet: &str, probe: &Probe, sys: &SystemDef) -> String {
+    match probe {
+        // Captured, not discarded: the one Runs probe is `init --dry-run` over the shipped
+        // table, and its per-line parse diagnostics ARE the answer to why it refused.
+        // shape_check prints them at build time; a boot-time rejection deserves the same.
+        Probe::Runs(args) => format!(
+            "if e=$(/bin/{applet} {args} 2>&1); then :; \
+             else echo \"td-init: /bin/{applet} failed: $e\"; i=0; fi; "
+        ),
+        // if/else, not `&&` then an unconditional `case`: the two failures are mutually
+        // exclusive, and running both would report an applet that RAN a bogus argument as
+        // also having refused it wrongly. The wrong-diagnostic arm echoes what it actually
+        // got, since that arm fires precisely when the expected text is not what to look for.
+        Probe::Refuses(args, says) => format!(
+            "if e=$(/bin/{applet} {args} 2>&1); then \
+             echo \"td-init: /bin/{applet} ran a bogus argument instead of refusing it\"; i=0; \
+             else case \"$e\" in *\"{says}\"*) ;; \
+             *) echo \"td-init: /bin/{applet} refused without saying {says}: $e\"; i=0 ;; esac; fi; "
+        ),
+        Probe::ReadsBackHostname => format!(
+            "[ \"$(/bin/{applet})\" = \"{}\" ] || \
+             {{ echo \"td-init: /bin/{applet} did not read back the configured name\"; i=0; }}; ",
+            sys.hostname
+        ),
+    }
+}
 
 /// Applets reached through the packed BusyBox multicall as `/bin/busybox <applet>`, whether
 /// or not they also get a `/bin` symlink — `rootcheck` reaches `chown`, `mkdir`, `readlink`,
 /// `rm` and `test` this way, all names uutils serves in `/bin`. They must still EXIST in
 /// busybox, so `shape_check` probes them against `busybox --list` like the farm names;
-/// otherwise a config drift breaks sysinit with no build-time signal. Unlike the two farms
+/// otherwise a config drift breaks sysinit with no build-time signal. Unlike the three /bin farms
 /// this is deliberately NOT disjoint from BUSYBOX_APPLETS. `script_applets_are_covered`
 /// derives it from the script text both ways, so neither an uncovered call nor a stale
 /// entry survives; td-boot's own invocations are justified by its protocol constant.
@@ -222,7 +302,6 @@ const INITRAMFS_APPLETS: &[&str] = &[
     "rm",
     "sh",
     "sleep",
-    "switch_root",
     "sync",
     "test",
     "umount",
@@ -295,7 +374,7 @@ fn build_shadow(sys: &SystemDef) -> String {
 }
 
 fn build_inittab() -> String {
-    // busybox init: `<id>::<action>:<process>`. `id` names the tty init opens for the
+    // td-init: `<id>::<action>:<process>`. `id` names the tty init opens for the
     // process; empty id => the system console. This inittab runs on the REAL root AFTER
     // stage-1 `switch_root`ed into it: init re-mounts the pseudo-filesystems (devtmpfs,
     // proc, sysfs) on the erofs root's empty mountpoint dirs — mounting over a read-only
@@ -316,6 +395,11 @@ fn build_inittab() -> String {
     // runs as root) and authorizes only /etc/ssh/authorized_keys (shipped empty => deny-all
     // until keys are provisioned). A correctly-binding daemon never exits, so respawn does
     // not loop; if it ever did, init restarts it rather than leaving the box without sshd.
+    //
+    // There is no `ctrlaltdel` or `shutdown` line: td-init supervises with NO signals (a
+    // blocking wait4 IS its event loop), so both actions are signal contracts it cannot
+    // honour and would only be rejected at boot as unsupported. The teardown they used to
+    // reach lives in /etc/tty-session instead — see build_tty_session.
     "::sysinit:/bin/mount -t devtmpfs devtmpfs /dev\n\
      ::sysinit:/bin/mount -t proc proc /proc\n\
      ::sysinit:/bin/mount -t sysfs sysfs /sys\n\
@@ -325,9 +409,7 @@ fn build_inittab() -> String {
      ::once:/etc/bootsuccess\n\
      ::once:/etc/bootfail\n\
      ::respawn:/bin/sshd serve --listen 0.0.0.0:22 --authorized-keys /etc/ssh/authorized_keys\n\
-     ttyS0::respawn:/etc/tty-session\n\
-     ::ctrlaltdel:/bin/reboot\n\
-     ::shutdown:/etc/shutdown\n"
+     ttyS0::respawn:/etc/tty-session\n"
         .into()
 }
 
@@ -398,36 +480,53 @@ fn build_deployment_init(sys: &SystemDef) -> String {
          /bin/busybox chown 0:0 /sysroot/var /sysroot/var/log /sysroot/var/home /sysroot/var/root\n\
          /bin/busybox chmod 0755 /sysroot/var /sysroot/var/log /sysroot/var/home\n\
          /bin/busybox chmod 0700 /sysroot/var/root\n\
-         exec /bin/busybox switch_root /sysroot /init\n",
+         exec /bin/switch_root /sysroot /init\n",
     );
     init
 }
 
 /// The ttyS0 session wrapper, run by init AS ROOT (inittab `respawn`). It runs the
 /// normal getty -> autologin -> `login -f <user>` flow, then, when that session
-/// ENDS — the greeter user types `exit` / Ctrl-D — resets the machine so the VM
-/// stops. The auto-login user is UNPRIVILEGED and cannot shut the system down
-/// itself; this wrapper runs as root (init's child), so it does it on the user's
-/// behalf, making `exit` a clean way out of the VM. Plain `reboot` asks PID 1
-/// to run its shutdown action before the reboot syscall; under qemu's
+/// ENDS — the greeter user types `exit` / Ctrl-D — tears the system down and resets
+/// the machine so the VM stops. The auto-login user is UNPRIVILEGED and cannot shut
+/// the system down itself; this wrapper runs as root (init's child), so it does it on
+/// the user's behalf, making `exit` a clean way out of the VM. Under qemu's
 /// `-no-reboot`, the resulting reset makes qemu exit 0.
 ///
-/// The reboot is gated on `getty` SUCCEEDING (`&&`): getty sets up the tty and execs
-/// the login chain, returning the user shell's exit status, so a normal `exit`/Ctrl-D
-/// returns 0 -> power off. But if getty/login FAILS to start a session at all (e.g. it
-/// cannot open ttyS0), getty returns non-zero, the `&&` short-circuits, and the wrapper
-/// exits non-zero so init RESPAWNS it — a visible retry loop — rather than firing
+/// It runs `/etc/shutdown` ITSELF rather than leaving it to PID 1. td-init supervises
+/// with no signals, so it has no shutdown sequence to hook: on td the orderly teardown
+/// belongs to whoever DECIDES to shut down, and this wrapper is that decision point.
+/// The teardown's own failure never blocks the reset (`;`, not `&&`) — a machine that
+/// refuses to reboot because it could not unmount is worse than one that reboots after
+/// a sync — but /etc/shutdown withholds its marker, so the oracle reds rather than
+/// passing a boot whose state was never released.
+///
+/// The teardown writes to `/dev/console`, NOT to the tty it inherited. By the time it
+/// runs, the greeter shell — the SESSION LEADER of the ttyS0 session getty created —
+/// has exited, so the kernel has vhangup'd that terminal and every write through the
+/// inherited descriptor returns EIO. The teardown would run correctly and silently: the
+/// machine reboots, and the marker proving state was released is lost, which reads
+/// exactly like a teardown that never ran. This is only a hazard because the teardown
+/// moved OFF PID 1 (whose stdio is /dev/console and is never part of a login session);
+/// under busybox init the same script needed no redirect. Verified by observing exactly
+/// that failure — reboot with no output at all — before adding it.
+///
+/// The teardown and reboot are both gated on `getty` SUCCEEDING (`&&`): getty sets up the
+/// tty and execs the login chain, returning the user shell's exit status, so a normal
+/// `exit`/Ctrl-D returns 0 -> power off. But if getty/login FAILS to start a session at all
+/// (e.g. it cannot open ttyS0), getty returns non-zero, the `&&` short-circuits, and the
+/// wrapper exits non-zero so init RESPAWNS it — a visible retry loop — rather than firing
 /// `reboot` and letting `-no-reboot` mask a broken greeter as a clean exit-0 shutdown
 /// (re #541, Codex review).
 fn build_tty_session() -> String {
     "#!/bin/sh\n\
-     /bin/getty -L -n -l /etc/autologin 115200 ttyS0 vt100 && exec /bin/reboot\n"
+     /bin/getty -L -n -l /etc/autologin 115200 ttyS0 vt100 && { /etc/shutdown; exec /bin/reboot; } >/dev/console 2>&1\n"
         .into()
 }
 
 fn build_shutdown() -> String {
-    // BusyBox init runs shutdown actions before killing other processes. Keep
-    // this a strict tripwire, but attempt every safety step after any failure.
+    // Run by /etc/tty-session before it reboots, with the greeter session already gone.
+    // Keep this a strict tripwire, but attempt every safety step after any failure.
     format!(
         "#!/bin/sh\n\
          ok=1\n\
@@ -545,6 +644,12 @@ fn build_rootcheck(sys: &SystemDef) -> String {
     s
 }
 
+/// Each component marker is emitted by its OWN leg, not from one block gated on every leg
+/// passing. Emitting them together meant any single failure withheld all four, so the oracle
+/// reported whichever it checked first — uutils — and the diagnostics the other farms went to
+/// trouble to produce named a component nobody would look at. The `m*` flags keep a retry from
+/// reprinting a marker it already earned. `SYSTEM_BOOT_SUCCESS_MARKER` stays gated on the whole
+/// transaction, which is what it means.
 fn build_bootsuccess(sys: &SystemDef) -> String {
     // These run under `su` as the unprivileged user, so the dmesg leg needs an unprivileged
     // /dev/kmsg read — which linux-x86-64 guarantees by pinning CONFIG_SECURITY_DMESG_RESTRICT
@@ -556,6 +661,15 @@ fn build_bootsuccess(sys: &SystemDef) -> String {
             "/bin/{applet}{args} >/dev/null 2>&1 || \
              {{ echo \"td-util: /bin/{applet} failed\"; u=0; }}; "
         ));
+    }
+    // The boot-glue farm. Unlike td-util's, this one cannot be plain invocations: running
+    // `reboot` for real ends the boot, and `init`'s and `switch_root`'s success paths already
+    // RAN — as PID 1 and as the pivot — before this script existed. So the reversible names
+    // are invoked and the irreversible ones are driven into their refusal, which is the only
+    // probe that can precede the marker it gates. See `Probe`.
+    let mut td_init_probes = String::new();
+    for (applet, probe) in TD_INIT_FARM {
+        td_init_probes.push_str(&td_init_probe(applet, probe, sys));
     }
     format!(
         "#!/bin/sh\n\
@@ -574,19 +688,25 @@ fn build_bootsuccess(sys: &SystemDef) -> String {
          case \"$wait\" in ''|*[!0-9]*|0) wait={BOOT_SUCCESS_RETRY_SECS};; esac\n\
          [ \"$wait\" -gt {BOOT_SUCCESS_RETRY_MAX_SECS} ] && wait={BOOT_SUCCESS_RETRY_MAX_SECS}\n\
          n=0\n\
+         mu=0; ms=0; mtu=0; mti=0\n\
          while [ \"$n\" -lt \"$wait\" ]; do \
          healthy=1; \
          if /bin/busybox su -s /bin/sh {} -c \
          '/bin/cat /etc/os-release >/dev/null 2>&1'; then \
-         :; else healthy=0; fi; \
+         [ \"$mu\" = 1 ] || {{ echo {UUTILS_RUNTIME_MARKER}; mu=1; }}; else healthy=0; fi; \
          if /bin/busybox su -s /bin/sh {} -c \
          '/bin/sshd selftest >/dev/null 2>&1'; then \
-         :; else healthy=0; fi; \
+         [ \"$ms\" = 1 ] || {{ echo {SSHD_MARKER}; ms=1; }}; else healthy=0; fi; \
          if /bin/busybox su -s /bin/sh {} -c \
          'u=1; /bin/td-util --list >/dev/null 2>&1 || \
          {{ echo \"td-util: --list failed\"; u=0; }}; \
          {td_util_probes}[ \"$u\" = 1 ]'; then \
-         :; else healthy=0; fi; \
+         [ \"$mtu\" = 1 ] || {{ echo {TD_UTIL_RUNTIME_MARKER}; mtu=1; }}; else healthy=0; fi; \
+         if /bin/busybox su -s /bin/sh {} -c \
+         'i=1; /bin/td-init --list >/dev/null 2>&1 || \
+         {{ echo \"td-init: --list failed\"; i=0; }}; \
+         {td_init_probes}[ \"$i\" = 1 ]'; then \
+         [ \"$mti\" = 1 ] || {{ echo {TD_INIT_RUNTIME_MARKER}; mti=1; }}; else healthy=0; fi; \
          if [ \"$healthy\" = 1 ] \
          && /bin/td-boot success /dev/vda /run/td-update \"$deployment\" >/run/td-success-id; then \
          if /bin/busybox grep -q -F '{DEPLOY_INSTALL_CMDLINE_TOKEN}' /proc/cmdline; then \
@@ -595,17 +715,20 @@ fn build_bootsuccess(sys: &SystemDef) -> String {
          echo {SYSTEM_DEPLOY_INSTALL_MARKER}; else healthy=0; fi; \
          fi; \
          if [ \"$healthy\" = 1 ]; then \
-         echo {UUTILS_RUNTIME_MARKER}; echo {SSHD_MARKER}; \
-         echo {TD_UTIL_RUNTIME_MARKER}; echo {SYSTEM_BOOT_SUCCESS_MARKER}; \
+         echo {SYSTEM_BOOT_SUCCESS_MARKER}; \
          finish td-boot-success-v1; exit 0; fi; \
          fi; \
          n=$((n+1)); /bin/busybox sleep 1; \
          done\n\
          fail\n",
-        sys.autologin, sys.autologin, sys.autologin
+        sys.autologin, sys.autologin, sys.autologin, sys.autologin
     )
 }
 
+/// The failed-candidate watchdog, and the SECOND thing on this image that decides to reboot.
+/// Since td-init supervises with no signals there is no `::shutdown:` action for `/bin/reboot`
+/// to trigger, so every initiator runs `/etc/shutdown` itself; `reboots_run_the_teardown_first`
+/// holds that invariant over all generated scripts.
 fn build_bootfail() -> String {
     format!(
         "#!/bin/sh\n\
@@ -620,7 +743,8 @@ fn build_bootfail() -> String {
          [ \"$wait\" -gt {BOOT_FAIL_PARK_WAIT_SECS} ] && wait={BOOT_FAIL_PARK_WAIT_SECS}\n\
          n=0\n\
          while [ \"$n\" -lt \"$wait\" ]; do \
-         /bin/busybox grep -q -x '{BOOT_FAIL_PARKED}' /run/td-boot-parked 2>/dev/null && exec /bin/reboot; \
+         /bin/busybox grep -q -x '{BOOT_FAIL_PARKED}' /run/td-boot-parked 2>/dev/null && \
+         {{ /etc/shutdown; exec /bin/reboot; }} >/dev/console 2>&1; \
          n=$((n+1)); /bin/busybox sleep 1; \
          done\n\
          echo 'td-boot: greeter park handshake timed out' >&2\n\
@@ -730,9 +854,19 @@ fn etc_files(sys: &SystemDef) -> Vec<(&'static str, String, bool)> {
     ]
 }
 
+/// Which of the two structurally distinct boot phases a cpio is packed for. They carry
+/// DISJOINT helpers, and each helper's absence from the other phase is asserted: the
+/// selector kexecs (td-kexec) and never pivots, the deployment phase pivots (td-init's
+/// `switch_root`) and never kexecs. A phase that carried both would let an initramfs do
+/// something its /init has no branch for.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Phase {
+    Selector,
+    Deployment,
+}
+
 /// A gen_init_cpio spec for one of the two structurally distinct boot phases.
-/// The selector carries td-kexec; the selected deployment phase does not.
-fn build_initramfs_spec(init: &str, include_kexec: bool) -> String {
+fn build_initramfs_spec(init: &str, phase: Phase) -> String {
     let mut s = String::new();
     for d in ["/dev", "/proc", "/run", "/sysroot", "/td", "/td/store"] {
         s.push_str(&format!("dir {d} 0755 0 0\n"));
@@ -750,11 +884,23 @@ fn build_initramfs_spec(init: &str, include_kexec: bool) -> String {
     s.push_str("dir {in:td-boot}/bin 0755 0 0\n");
     s.push_str("file {in:td-boot}/bin/td-boot {in:td-boot}/bin/td-boot 0755 0 0\n");
     s.push_str("slink /bin/td-boot {in:td-boot}/bin/td-boot 0777 0 0\n");
-    if include_kexec {
-        s.push_str("dir {in:td-kexec} 0755 0 0\n");
-        s.push_str("dir {in:td-kexec}/bin 0755 0 0\n");
-        s.push_str("file {in:td-kexec}/bin/td-kexec {in:td-kexec}/bin/td-kexec 0755 0 0\n");
-        s.push_str("slink /bin/td-kexec {in:td-kexec}/bin/td-kexec 0777 0 0\n");
+    match phase {
+        Phase::Selector => {
+            s.push_str("dir {in:td-kexec} 0755 0 0\n");
+            s.push_str("dir {in:td-kexec}/bin 0755 0 0\n");
+            s.push_str("file {in:td-kexec}/bin/td-kexec {in:td-kexec}/bin/td-kexec 0755 0 0\n");
+            s.push_str("slink /bin/td-kexec {in:td-kexec}/bin/td-kexec 0777 0 0\n");
+        }
+        // The pivot applet, and ONLY it: /init execs `/bin/switch_root`, so that is the one
+        // name this phase needs. td-init is a static ET_EXEC with an empty runtime closure,
+        // which is what lets it run here at all — nothing has mounted the real root yet, so
+        // a dynamically-linked pivot would be a kernel panic rather than a degraded boot.
+        Phase::Deployment => {
+            s.push_str("dir {in:td-init} 0755 0 0\n");
+            s.push_str("dir {in:td-init}/bin 0755 0 0\n");
+            s.push_str("file {in:td-init}/bin/td-init {in:td-init}/bin/td-init 0755 0 0\n");
+            s.push_str("slink /bin/switch_root {in:td-init}/bin/td-init 0777 0 0\n");
+        }
     }
     s.push_str("nod /dev/console 0600 0 0 c 5 1\n");
     s.push_str(&format!("file /init {{root}}/{init} 0755 0 0\n"));
@@ -821,6 +967,13 @@ fn real_root_steps(sys: &SystemDef) -> Vec<Step> {
         from: "{in:td-util}".into(),
         dest: "{root}/real-root{in:td-util}".into(),
     });
+    // td-init likewise — and here the empty closure is load-bearing rather than merely
+    // convenient: this same binary is /init (PID 1) and the initramfs pivot, both of which
+    // run where no dynamic loader is reachable.
+    steps.push(Step::CopyTree {
+        from: "{in:td-init}".into(),
+        dest: "{root}/real-root{in:td-init}".into(),
+    });
     // Stage uutils and sshd plus every transitively referenced store item at its canonical
     // absolute path. Both are dynamically linked, so each pulls its reachable runtime store
     // closure (glibc, libgcc_s, and for sshd the aws-lc crypto C lib) onto the erofs root.
@@ -851,8 +1004,12 @@ fn real_root_steps(sys: &SystemDef) -> Vec<Step> {
             link: format!("{{root}}/real-root/bin/{app}"),
         });
     }
+    // /init is PID 1 on the real root, and it is td-init. switch_root execs it under the
+    // OPERAND's name (`/init`), so argv[0]'s basename is `init` and the multicall dispatches
+    // to the init applet exactly as a /bin/<applet> symlink would — the symlink's TARGET
+    // name never enters that decision.
     steps.push(Step::Symlink {
-        target: "{in:busybox-x86-64}/bin/busybox".into(),
+        target: "{in:td-init}/bin/td-init".into(),
         link: "{root}/real-root/init".into(),
     });
     // /bin/td-netd resolves into the store td-netd package (a single static binary,
@@ -874,6 +1031,18 @@ fn real_root_steps(sys: &SystemDef) -> Vec<Step> {
     for app in TD_UTIL_APPLETS {
         steps.push(Step::Symlink {
             target: "{in:td-util}/bin/td-util".into(),
+            link: format!("{{root}}/real-root/bin/{app}"),
+        });
+    }
+    // /bin/td-init is the multicall's own entry (`td-init <applet>`, and `--list`); the loop
+    // below is the argv[0] farm the boot-glue names resolve through.
+    steps.push(Step::Symlink {
+        target: "{in:td-init}/bin/td-init".into(),
+        link: "{root}/real-root/bin/td-init".into(),
+    });
+    for app in td_init_applets() {
+        steps.push(Step::Symlink {
+            target: "{in:td-init}/bin/td-init".into(),
             link: format!("{{root}}/real-root/bin/{app}"),
         });
     }
@@ -927,9 +1096,18 @@ fn real_root_steps(sys: &SystemDef) -> Vec<Step> {
 /// an applet would leave a dead /bin symlink the member checks alone can't catch. For the
 /// uutils farm: the `coreutils` multicall is staged and every UUTILS_APPLETS /bin symlink
 /// exists. Its transitive store closure is enforced and staged by `StageRuntimeClosure`.
-/// All strings are ASCII (td-builder's config reader is Latin-1). This is a build sanity
-/// assert, not a behavioural test — the boot is exercised by `td-recipe-eval run` and the
-/// headless `qemu-boot-system` oracle.
+/// All strings are ASCII (td-builder's config reader is Latin-1).
+///
+/// The td-init legs are the exception to "shape assert, not behavioural test", and
+/// deliberately so. Every other farm here fails visibly at runtime — a dead /bin name
+/// prints an error to somebody's terminal — but td-init's names ARE the boot: a table PID 1
+/// rejects, or a pivot that refuses, is an image that does not come up, which the oracle can
+/// only report as a timeout. So this step EXECUTES the packed static binary (it can: ET_EXEC,
+/// empty closure) and drives the two failures that would otherwise be silent — the shipped
+/// `/etc/inittab` through `init --dry-run`, and `switch_root`'s fail-early refusal — turning
+/// each into a named build error on a per-change check instead of an unbootable artifact on
+/// a nightly one. The boot ITSELF is still exercised by `td-recipe-eval run` and the headless
+/// `qemu-boot-system` oracle; this only moves the cheaply-decidable half earlier.
 fn shape_check() -> String {
     "selector='{out}/boot/selector-initramfs.cpio'; selector_manifest='{out}/boot/manifest'; init='{out}/deployment/initramfs.cpio'; root='{root}/real-root'; disk='{out}/deployment/root.erofs'; manifest='{out}/deployment/manifest'; bb='{in:busybox-x86-64}/bin/busybox'; \
      for archive in \"$selector\" \"$init\"; do \
@@ -951,6 +1129,9 @@ fn shape_check() -> String {
      printf '%s\\n' \"$init_list\" | grep -qE '^td/store/[^/]+/bin/td-boot$' || { echo 'deployment initramfs: td-boot store member missing' >&2; exit 1; }; \
      printf '%s\\n' \"$selector_list\" | grep -qE '^td/store/[^/]+/bin/td-kexec$' || { echo 'selector initramfs: td-kexec store member missing' >&2; exit 1; }; \
      if printf '%s\\n' \"$init_list\" | grep -qE '^td/store/[^/]+/bin/td-kexec$'; then echo 'deployment initramfs: td-kexec store member must be selector-only' >&2; exit 1; fi; \
+     printf '%s\\n' \"$init_list\" | grep -q -x -F bin/switch_root || { echo 'deployment initramfs: bin/switch_root missing - its /init would exec nothing and the boot would end in a 300s timeout with no cause' >&2; exit 1; }; \
+     printf '%s\\n' \"$init_list\" | grep -qE '^td/store/[^/]+/bin/td-init$' || { echo 'deployment initramfs: td-init store member missing - the switch_root symlink would dangle' >&2; exit 1; }; \
+     if printf '%s\\n' \"$selector_list\" | grep -q -x -F bin/switch_root; then echo 'selector initramfs: switch_root must be deployment-only - the selector kexecs, it never pivots' >&2; exit 1; fi; \
      [ \"$(wc -l < \"$selector_manifest\")\" -eq 2 ] || { echo 'selector manifest: expected header plus one payload entry' >&2; exit 1; }; \
      [ \"$(head -n 1 \"$selector_manifest\")\" = td-deployment-v1 ] || { echo 'selector manifest: unsupported header' >&2; exit 1; }; \
      grep -q -E '^[0-9a-f]{64}  selector-initramfs\\.cpio$' \"$selector_manifest\" || { echo 'selector manifest: missing strict SHA-256 entry' >&2; exit 1; }; \
@@ -976,6 +1157,18 @@ fn shape_check() -> String {
          [ \"$(readlink \"$root/bin/$a\" 2>/dev/null)\" = \"$tdutgt\" ] || { echo \"root tree: /bin/$a is not a symlink to the staged td-util multicall ($tdutgt) - the diagnostics /bin farm regressed\" >&2; exit 1; }; \
          printf '%s\\n' \"$tdulist\" | grep -q -x -F \"$a\" || { echo \"td-util does not serve applet '$a' - its packed /bin/$a symlink would dispatch to nothing (usage, exit 2)\" >&2; exit 1; }; \
      done; \
+     [ \"$(readlink \"$root/bin/td-init\" 2>/dev/null)\" = \"{in:td-init}/bin/td-init\" ] || { echo 'root tree: /bin/td-init is not a symlink to the staged boot-glue multicall' >&2; exit 1; }; \
+     tdi=\"{root}/real-root{in:td-init}/bin/td-init\"; tditgt=\"{in:td-init}/bin/td-init\"; { [ -f \"$tdi\" ] && [ -x \"$tdi\" ]; } || { echo 'root tree: the td-init binary is not packed/executable at real-root{in:td-init}/bin/td-init - /init would not exec and the machine would not boot' >&2; exit 1; }; \
+     [ \"$(readlink \"$root/init\")\" = \"$tditgt\" ] || { echo 'root tree: /init must be a symlink to the staged td-init multicall - it is PID 1' >&2; exit 1; }; \
+     tdilist=$(\"$tdi\" --list 2>/dev/null) || { echo 'td-init --list failed - cannot verify the boot-glue farm' >&2; exit 1; }; \
+     for a in @TD_INIT_APPLETS@; do \
+         [ \"$(readlink \"$root/bin/$a\" 2>/dev/null)\" = \"$tditgt\" ] || { echo \"root tree: /bin/$a is not a symlink to the staged td-init multicall ($tditgt) - the boot-glue /bin farm regressed\" >&2; exit 1; }; \
+         printf '%s\\n' \"$tdilist\" | grep -q -x -F \"$a\" || { echo \"td-init does not serve applet '$a' - its packed /bin/$a symlink would dispatch to nothing (usage, exit 2)\" >&2; exit 1; }; \
+     done; \
+     tditab=$(\"$tdi\" init --dry-run -f \"$root/etc/inittab\" 2>&1) || { echo 'td-init init --dry-run REJECTED the inittab this image ships - PID 1 would come up having understood only part of its table. Its per-line diagnostics:' >&2; printf '%s\\n' \"$tditab\" >&2; exit 1; }; \
+     mkdir -p '{root}/pivot-probe' && cp \"$tdi\" '{root}/pivot-probe/init' || { echo 'root tree: could not build the switch_root probe NEWROOT' >&2; exit 1; }; \
+     tdipiv=$(\"$tdi\" switch_root '{root}/pivot-probe' /init 2>&1) && { echo 'td-init switch_root ACCEPTED a NEWROOT that is not a mount point - the last refusal standing between a bad pivot and a panicked kernel is gone' >&2; exit 1; }; \
+     case \"$tdipiv\" in *'not a mount point'*) : ;; *) echo \"td-init switch_root refused a non-mount NEWROOT for the WRONG reason, so the mount-point guard is untested: $tdipiv\" >&2; exit 1;; esac; \
      [ \"$(readlink \"$root/home\")\" = var/home ] || { echo 'root tree: /home must point to var/home' >&2; exit 1; }; \
      [ \"$(readlink \"$root/root\")\" = var/root ] || { echo 'root tree: /root must point to var/root' >&2; exit 1; }; \
      rbb=\"{root}/real-root{in:busybox-x86-64}/bin/busybox\"; { [ -f \"$rbb\" ] && [ -x \"$rbb\" ]; } || { echo 'root tree: the busybox binary is not packed/executable at real-root{in:busybox-x86-64}/bin/busybox - the store-native /bin symlinks would all dangle' >&2; exit 1; }; \
@@ -1017,6 +1210,7 @@ fn shape_check() -> String {
         .replace("@INITRAMFS_APPLETS@", &INITRAMFS_APPLETS.join(" "))
         .replace("@UUTILS_APPLETS@", &UUTILS_APPLETS.join(" "))
         .replace("@TD_UTIL_APPLETS@", &TD_UTIL_APPLETS.join(" "))
+        .replace("@TD_INIT_APPLETS@", &td_init_applets().join(" "))
 }
 
 pub fn recipe() -> Recipe {
@@ -1046,7 +1240,7 @@ pub fn recipe() -> Recipe {
     });
     steps.push(Step::WriteFile {
         path: "{root}/selector.spec".into(),
-        content: build_initramfs_spec("selector-init", true),
+        content: build_initramfs_spec("selector-init", Phase::Selector),
         exec: false,
     });
     steps.push(Step::WriteFile {
@@ -1056,7 +1250,7 @@ pub fn recipe() -> Recipe {
     });
     steps.push(Step::WriteFile {
         path: "{root}/deployment.spec".into(),
-        content: build_initramfs_spec("deployment-init", false),
+        content: build_initramfs_spec("deployment-init", Phase::Deployment),
         exec: false,
     });
     steps.push(
@@ -1142,6 +1336,9 @@ pub fn recipe() -> Recipe {
         // td-kexec: confined selector-only kexec helper.
         // td-util: the static diagnostics multicall (empty runtime closure, CopyTree'd),
         //   serving the /bin farm those five names resolve through.
+        // td-init: the static boot-glue multicall (empty runtime closure, CopyTree'd). Not a
+        //   farm like the others: it is /init (PID 1), the deployment initramfs' pivot, and
+        //   the sysinit `hostname -F`, so the image's boot path runs it on every boot.
         .native_inputs(&[
             "busybox-x86-64",
             "linux-x86-64",
@@ -1152,6 +1349,7 @@ pub fn recipe() -> Recipe {
             "td-boot",
             "td-kexec",
             "td-util",
+            "td-init",
         ])
         .inputs_owned(mesboot0_inputs(&[]))
         .steps(steps)
@@ -1301,44 +1499,48 @@ mod tests {
     /// respawn line is inert without them. `reboot` is what `tty-session` execs when the
     /// greeter session ends (the in-guest power-off path). `switch_root` is the stage-1
     /// pivot applet — without it the two-stage boot cannot enter the erofs root. These are
-    /// all boot-critical and MUST stay busybox (static, no runtime closure): belt-and-
+    /// all boot-critical and must stay on a STATIC multicall (no runtime closure) — busybox
+    /// for the login pair, td-init for `reboot`/`switch_root` since the cutover: belt-and-
     /// braces against a farm edit that drops one or reroutes it to dynamically-linked
     /// uutils (the shape check catches it at build time, this catches it at test time).
     #[test]
     fn greeter_and_pivot_applets_are_present() {
-        for a in [
-            "sh",
-            "getty",
-            "login",
-            "init",
-            "mount",
-            "umount",
-            "reboot",
-            "switch_root",
-        ] {
+        // Split across two static multicalls now, so each name is pinned to the ONE that
+        // serves it. Asserting only "some farm has it" would let a boot name drift between
+        // binaries unnoticed — and for these names that drift IS the boot.
+        for a in ["sh", "getty", "login", "mount", "umount"] {
             assert!(
                 BUSYBOX_APPLETS.contains(&a),
                 "boot-critical applet '{a}' missing from BUSYBOX_APPLETS"
             );
         }
+        for a in ["init", "reboot", "switch_root", "hostname"] {
+            assert!(
+                td_init_applets().contains(&a),
+                "boot-glue applet '{a}' missing from the td-init farm"
+            );
+        }
     }
 
-    /// The two /bin farms must be DISJOINT — a name in both would pack two conflicting
-    /// symlinks for one applet (last-writer-wins, non-deterministic) and blur the
-    /// static-vs-dynamic boot-safety boundary. Also pin the boot-critical names that MUST
-    /// stay busybox: `hostname` (inittab runs `hostname -F`, a flag uutils lacks) and
-    /// `mount`/`umount` (the stage-1 pivot runs before uutils' glibc closure is reachable).
+    /// The /bin farms must be DISJOINT — a name in both would pack two conflicting symlinks
+    /// for one applet (last-writer-wins, non-deterministic) and blur the static-vs-dynamic
+    /// boot-safety boundary. Also pin the boot-critical names to a STATIC multicall: every
+    /// one of them runs somewhere no dynamic loader is reachable (the pre-pivot initramfs)
+    /// or where a failure has nowhere to be reported (PID 1's own sysinit), so what matters
+    /// is not which static binary serves them but that uutils never does.
     #[test]
-    fn applet_farms_are_disjoint_and_boot_names_stay_busybox() {
-        // Three farms now, so check every pair: a name served twice emits two Symlink steps
+    fn applet_farms_are_disjoint_and_boot_names_stay_static() {
+        // Four farms now, so check every pair: a name served twice emits two Symlink steps
         // for one link and the LAST one silently wins.
-        const FARMS: [(&str, &[&str]); 3] = [
+        let td_init = td_init_applets();
+        let farms: [(&str, &[&str]); 4] = [
             ("busybox", BUSYBOX_APPLETS),
             ("uutils", UUTILS_APPLETS),
             ("td-util", TD_UTIL_APPLETS),
+            ("td-init", &td_init),
         ];
-        for (i, (a_name, a_set)) in FARMS.iter().enumerate() {
-            for (b_name, b_set) in FARMS.iter().skip(i + 1) {
+        for (i, (a_name, a_set)) in farms.iter().enumerate() {
+            for (b_name, b_set) in farms.iter().skip(i + 1) {
                 for a in a_set.iter() {
                     assert!(
                         !b_set.contains(a),
@@ -1348,10 +1550,11 @@ mod tests {
                 }
             }
         }
-        for a in ["hostname", "mount", "umount", "sh", "init"] {
+        for a in ["hostname", "mount", "umount", "sh", "init", "switch_root"] {
             assert!(
-                BUSYBOX_APPLETS.contains(&a),
-                "boot-critical applet '{a}' must stay busybox, not route to another farm"
+                BUSYBOX_APPLETS.contains(&a) || td_init.contains(&a),
+                "boot-critical applet '{a}' must be served by a STATIC multicall (busybox or \
+                 td-init) - it runs where no dynamic loader is reachable"
             );
             assert!(
                 !UUTILS_APPLETS.contains(&a),
@@ -1365,9 +1568,9 @@ mod tests {
     /// against its own `/bin`, not a shared guess. Both `slink` and `file` count: everything
     /// is a symlink to the multicall today, but a directly packed binary is still a name the
     /// script may call.
-    fn initramfs_bin_names(include_kexec: bool) -> Vec<String> {
+    fn initramfs_bin_names(phase: Phase) -> Vec<String> {
         const BIN: &str = "/bin/";
-        let spec = build_initramfs_spec("unused-init", include_kexec);
+        let spec = build_initramfs_spec("unused-init", phase);
         let mut names = Vec::new();
         for line in spec.lines() {
             let mut fields = line.split_whitespace();
@@ -1392,12 +1595,12 @@ mod tests {
             (
                 "/init (selector)".to_string(),
                 build_selector_init(),
-                Some(initramfs_bin_names(true)),
+                Some(initramfs_bin_names(Phase::Selector)),
             ),
             (
                 "/init (deployment)".to_string(),
                 build_deployment_init(&SYSTEM),
-                Some(initramfs_bin_names(false)),
+                Some(initramfs_bin_names(Phase::Deployment)),
             ),
         ];
         for (name, content, _) in etc_files(&SYSTEM) {
@@ -1523,11 +1726,13 @@ mod tests {
         let packed = packed_bin_names();
         // Guard the derivation: if it stops seeing real_root_steps' symlinks it would
         // accept nothing (and red on everything) or, worse, be edited into accepting all.
+        let td_init = td_init_applets();
         for a in BUSYBOX_APPLETS
             .iter()
             .chain(UUTILS_APPLETS)
             .chain(TD_UTIL_APPLETS)
-            .chain(&["busybox", "td-util"])
+            .chain(&td_init)
+            .chain(&["busybox", "td-util", "td-init"])
         {
             assert!(
                 packed.iter().any(|p| p == a),
@@ -1655,16 +1860,56 @@ mod tests {
             inittab.contains("::once:/etc/bootfail"),
             "inittab must start the isolated failed-target watchdog"
         );
+        // td-init supervises with no signals, so an inittab action it does not implement is
+        // not "inert" — it is a line PID 1 reports as unsupported on every boot, and (for
+        // `shutdown`) a teardown silently never run. shape_check dry-runs this table through
+        // the real parser; this catches the same thing without a target build.
+        const SUPPORTED_ACTIONS: [&str; 4] = ["sysinit", "wait", "once", "respawn"];
+        for line in inittab
+            .lines()
+            .filter(|l| !l.trim().is_empty() && !l.trim_start().starts_with('#'))
+        {
+            let mut fields = line.splitn(4, ':');
+            let action = fields.nth(2).unwrap_or("");
+            assert!(
+                SUPPORTED_ACTIONS.contains(&action),
+                "inittab line {line:?} uses action '{action}', which td-init does not \
+                 implement - it supervises with NO signals, so `ctrlaltdel`/`shutdown`/\
+                 `restart` have nothing to trigger them. Teardown belongs in /etc/tty-session"
+            );
+        }
         let session = build_tty_session();
-        // getty must gate the reboot (`&&`), so a FAILED session respawns rather than
-        // firing reboot and masking a broken greeter as a clean exit-0 shutdown.
+        // getty must gate BOTH the teardown and the reboot (`&&`), so a FAILED session
+        // respawns rather than tearing a live system down and masking a broken greeter as a
+        // clean exit-0 shutdown.
         assert!(
             session.contains("/bin/getty ")
                 && session.contains("-l /etc/autologin ")
-                && session.contains("&& exec /bin/reboot")
+                && session.contains("&& { /etc/shutdown; exec /bin/reboot; }")
                 && !session.contains("reboot -f"),
             "tty-session must run getty (autologin at /etc/autologin) then, only on success, \
-             ask init to reboot so shutdown actions run, while a failed login retries"
+             run the teardown and reboot, while a failed login retries"
+        );
+        // The teardown runs AFTER the greeter shell — the ttyS0 session leader — exited, so
+        // the kernel has already vhangup'd that terminal and writes through the inherited
+        // descriptor return EIO. Without this the machine still reboots and the marker is
+        // simply lost, which is indistinguishable from a teardown that never ran. Observed,
+        // not theorised.
+        assert!(
+            session.contains("{ /etc/shutdown; exec /bin/reboot; } >/dev/console 2>&1"),
+            "the teardown must write to /dev/console, not the hung-up tty it inherits from \
+             the ended login session - otherwise TD-SHUTDOWN-OK is written to a descriptor \
+             returning EIO and the oracle reds on a teardown that actually worked"
+        );
+        // `;` between them, not `&&`: a machine that refuses to reboot because it could not
+        // unmount is worse than one that reboots after a sync. The marker, not the exit
+        // status, is what carries the failure to the oracle.
+        // Assert the separator POSITIVELY: forbidding `&&` alone still admits `|| exit 1`
+        // and every other operator that makes the reset conditional on the teardown.
+        assert!(
+            session.contains("/etc/shutdown; exec /bin/reboot"),
+            "a failed teardown must not block the reset - `;` between them, so the reboot is \
+             unconditional and a failure is carried by the withheld marker, not the exit status"
         );
         let shutdown = build_shutdown();
         assert!(
@@ -1673,7 +1918,7 @@ mod tests {
                 && shutdown.contains("/bin/busybox umount -a -r || {")
                 && shutdown.contains("/bin/busybox test \"$ok\" = 1")
                 && shutdown.contains(SYSTEM_SHUTDOWN_MARKER),
-            "the init shutdown action must attempt every safety step and emit its marker only when all pass"
+            "the teardown must attempt every safety step and emit its marker only when all pass"
         );
     }
 
@@ -1753,8 +1998,7 @@ mod tests {
             "selected init must normalize persistent state ownership and modes"
         );
         assert!(
-            init.trim_end()
-                .ends_with("exec /bin/busybox switch_root /sysroot /init"),
+            init.trim_end().ends_with("exec /bin/switch_root /sysroot /init"),
             "stage-1 init must END by exec-ing switch_root so the pivot inherits PID 1"
         );
     }
@@ -2001,8 +2245,8 @@ mod tests {
 
     #[test]
     fn initramfs_packs_the_verified_boot_chain() {
-        let selector = build_initramfs_spec("selector-init", true);
-        let deployment = build_initramfs_spec("deployment-init", false);
+        let selector = build_initramfs_spec("selector-init", Phase::Selector);
+        let deployment = build_initramfs_spec("deployment-init", Phase::Deployment);
         for entry in [
             "file {in:td-boot}/bin/td-boot {in:td-boot}/bin/td-boot 0755 0 0",
             "slink /bin/td-boot {in:td-boot}/bin/td-boot 0777 0 0",
@@ -2021,6 +2265,17 @@ mod tests {
                 && selector.contains("slink /bin/td-kexec {in:td-kexec}/bin/td-kexec 0777 0 0")
                 && !deployment.contains("{in:td-kexec}"),
             "only the selector initramfs may carry td-kexec"
+        );
+        // The mirror image: the pivot applet belongs to the phase that pivots. The selector
+        // kexecs and has no branch that enters a root, so a td-init there would be a
+        // capability its /init cannot reach — and one more payload in the cpio the firmware
+        // path loads.
+        assert!(
+            deployment.contains("file {in:td-init}/bin/td-init {in:td-init}/bin/td-init 0755 0 0")
+                && deployment.contains("slink /bin/switch_root {in:td-init}/bin/td-init 0777 0 0")
+                && !selector.contains("{in:td-init}"),
+            "only the deployment initramfs may carry td-init, and it must expose the pivot as \
+             /bin/switch_root"
         );
         for applet in td_boot_protocol::REQUIRED_BUSYBOX_APPLETS {
             assert!(
@@ -2109,12 +2364,271 @@ mod tests {
                  the oracle passes a broken applet"
             );
         }
+        // The marker is emitted by THIS leg, so match the whole gate: the `else healthy=0`
+        // keeps a failure out of the deployment transaction, and the marker echo sits inside
+        // the success branch, which is what makes an absent TD-UTIL-RUN-OK mean td-util
+        // rather than "some component upstream of it failed".
         assert!(
             bootsuccess.contains(&format!(
-                "[ \"$u\" = 1 ]'; then :; else healthy=0"
-            )) && bootsuccess.find("[ \"$u\" = 1 ]'").unwrap()
-                < bootsuccess.find(&format!("echo {TD_UTIL_RUNTIME_MARKER}")).unwrap(),
-            "the health target must gate td-util health on every probed applet exiting 0"
+                "[ \"$u\" = 1 ]'; then [ \"$mtu\" = 1 ] || {{ echo {TD_UTIL_RUNTIME_MARKER}; \
+                 mtu=1; }}; else healthy=0; fi"
+            )),
+            "the health target must gate td-util health on every probed applet exiting 0, and \
+             emit the td-util marker from that leg alone"
+        );
+    }
+
+    /// td-init is packed, is /init and the pivot, serves its whole /bin farm, and every one
+    /// of those names is exercised by the health target on the image.
+    ///
+    /// This farm differs from td-util's in what a mistake COSTS. A dead diagnostics symlink
+    /// prints an error to somebody's terminal; a dead `/init` or `switch_root` is an image
+    /// that does not boot, which the oracle reports as a 300s timeout with no cause attached.
+    /// So the assertions here are about keeping every failure NAMED: one Symlink claimant per
+    /// link, a probe per farm name, and — in shape_check — the shipped inittab driven through
+    /// the real parser at build time.
+    #[test]
+    fn td_init_serves_its_farm_and_every_name_is_probed() {
+        let steps = real_root_steps(&SYSTEM);
+        assert!(
+            steps.iter().any(|s| matches!(
+                s,
+                Step::CopyTree { from, dest }
+                    if from == "{in:td-init}" && dest == "{root}/real-root{in:td-init}"
+            )),
+            "td-init must be CopyTree'd into the real root (static, empty closure)"
+        );
+        // /init is the one that cannot merely dangle: the kernel's exec of it IS the boot.
+        assert!(
+            steps.iter().any(|s| matches!(
+                s,
+                Step::Symlink { target, link }
+                    if target == "{in:td-init}/bin/td-init"
+                        && link == "{root}/real-root/init"
+            )),
+            "/init must symlink into the store td-init package - it is PID 1"
+        );
+        assert!(
+            steps.iter().any(|s| matches!(
+                s,
+                Step::Symlink { target, link }
+                    if target == "{in:td-init}/bin/td-init"
+                        && link == "{root}/real-root/bin/td-init"
+            )),
+            "/bin/td-init must symlink into the store td-init package"
+        );
+        // Collect every step claiming each link, not the first: Step::Symlink is
+        // last-writer-wins, so a name left in two farms would ship whichever loop ran last
+        // while a first-match probe still found the other and passed.
+        for applet in td_init_applets() {
+            let link = format!("{{root}}/real-root/bin/{applet}");
+            let targets: Vec<&str> = steps
+                .iter()
+                .filter_map(|s| match s {
+                    Step::Symlink { target, link: l } if *l == link => Some(target.as_str()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                targets.len(),
+                1,
+                "exactly one Symlink step may claim /bin/{applet}, found {}: a later step \
+                 silently overwrites an earlier one, so a second claimant re-points the name \
+                 with nothing else noticing",
+                targets.len()
+            );
+            assert_eq!(
+                targets.first().copied(),
+                Some("{in:td-init}/bin/td-init"),
+                "/bin/{applet} must resolve to the staged td-init multicall"
+            );
+        }
+        let bootsuccess = build_bootsuccess(&SYSTEM);
+        assert!(
+            !TD_INIT_FARM.is_empty(),
+            "an empty farm would make every per-applet assertion below, and shape_check's \
+             own farm loop, silently vacuous"
+        );
+        // The segments are pasted inside the health target's single-quoted `su -c '…'`
+        // argument, so ONE `'` anywhere in them ends it and hands the rest to the wrong
+        // shell. The rule is stated at `td_init_probe`; this is what holds it — including
+        // for `sys.hostname`, the one caller-supplied value that reaches generated shell here.
+        assert!(
+            !SYSTEM.hostname.is_empty()
+                && SYSTEM
+                    .hostname
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '.'),
+            "hostname {:?} is interpolated into generated shell; keep it to characters that \
+             need no quoting",
+            SYSTEM.hostname
+        );
+        for (applet, probe) in TD_INIT_FARM {
+            let segment = td_init_probe(applet, probe, &SYSTEM);
+            assert!(
+                !segment.contains('\''),
+                "the probe segment for /bin/{applet} contains a single quote, which would \
+                 terminate the health target's `su -c '...'` argument: {segment}"
+            );
+        }
+        // Match the WHOLE generated segment, failure branch included: matching the applet
+        // name alone is satisfied by the diagnostic `echo`, which also contains it, so the
+        // invocation itself could be deleted and this would still pass. And matching
+        // everything except the `i=0` leaves the gate defeatable — drop that one assignment
+        // and the marker prints unconditionally.
+        for (applet, probe) in TD_INIT_FARM {
+            let segment = td_init_probe(applet, probe, &SYSTEM);
+            assert!(
+                bootsuccess.contains(&segment),
+                "the health target must probe /bin/{applet} by its literal /bin path AND clear the \
+                 marker gate on failure; expected segment:\n{segment}"
+            );
+            assert!(
+                segment.contains("i=0"),
+                "the probe for /bin/{applet} does not clear the marker gate, so the marker \
+                 would print even when the applet misbehaved"
+            );
+        }
+        // The irreversible three are probed by REFUSAL, never by invocation: a probe that
+        // simply ran `/bin/reboot` would end the boot before the marker it gates.
+        for applet in ["reboot", "poweroff", "halt"] {
+            let probe = TD_INIT_FARM
+                .iter()
+                .find(|(name, _)| *name == applet)
+                .map(|(_, probe)| probe);
+            assert!(
+                matches!(probe, Some(Probe::Refuses(_, _))),
+                "/bin/{applet} must be probed through its REFUSAL - running it successfully \
+                 ends the boot, so an invocation probe could never reach the marker it gates"
+            );
+        }
+        // Same shape as td-util's: the marker belongs to THIS leg, so an absent
+        // TD-INIT-RUN-OK localizes to the boot glue instead of being one of four markers
+        // withheld together by whichever component happened to fail.
+        assert!(
+            bootsuccess.contains(&format!(
+                "[ \"$i\" = 1 ]'; then [ \"$mti\" = 1 ] || {{ echo {TD_INIT_RUNTIME_MARKER}; \
+                 mti=1; }}; else healthy=0; fi"
+            )),
+            "the health target must gate td-init health on every probe passing AND emit the \
+             td-init marker from that leg alone, so an absent marker names the boot glue"
+        );
+        // The build-time half. These two legs are the only thing that turns "PID 1 rejects a
+        // line of the shipped inittab" and "the pivot's fail-early refusal is gone" into a
+        // named per-change failure instead of an image that does not come up; they run in the
+        // daily tier, so nothing else here would notice their deletion.
+        let shape = shape_check();
+        assert!(
+            shape.contains("init --dry-run -f \"$root/etc/inittab\""),
+            "shape_check must dry-run the image's OWN /etc/inittab through the packed td-init \
+             - without it an inittab line PID 1 rejects ships as an unbootable image whose \
+             only symptom is the boot oracle timing out"
+        );
+        // Assert the two DISCRIMINATING pieces, not the phrase "not a mount point": that
+        // phrase also occurs in the leg's own failure `echo`, so an assertion on it survives
+        // deleting either the NEWROOT construction or the diagnostic test — the exact trap
+        // this test warns about for the probe segments above.
+        assert!(
+            shape.contains("cp \"$tdi\" '{root}/pivot-probe/init'"),
+            "shape_check must build a NEWROOT that HOLDS an init, so switch_root's earlier \
+             init-resolution check cannot be what refuses - without it the mount-point guard \
+             is never reached and could be deleted with this check still green"
+        );
+        assert!(
+            shape.contains("case \"$tdipiv\" in *'not a mount point'*"),
+            "shape_check must assert switch_root refused for the MOUNT-POINT reason, not merely \
+             that it exited non-zero - that guard is what stands between a bad pivot and a \
+             panicked kernel, and every other failure also exits non-zero"
+        );
+        // …and the farm loop is fed the whole farm, expanded — a placeholder left unreplaced
+        // would iterate over the literal token and verify nothing.
+        assert!(
+            shape.contains(&format!("for a in {}; do", td_init_applets().join(" "))),
+            "shape_check must loop over the EXPANDED td-init farm, verifying each /bin symlink \
+             against the packed binary's own --list"
+        );
+    }
+
+    /// Every diagnostic a refusal probe waits for must exist in the applet that emits it.
+    ///
+    /// `Probe::Refuses` asserts on td-init's own words — "unrecognised argument", "refusing to
+    /// switch", "usage: cttyhack" — copied by hand across a crate boundary. Americanise one
+    /// spelling or reword one refusal and the probe stops matching: the marker is withheld on
+    /// a HEALTHY image, and the only thing that would have caught it is a manual
+    /// qemu-boot-system run, which is not in check-pr or the daily tier. The recipe already
+    /// embeds every applet source via `include_str!`, so the link costs nothing.
+    #[test]
+    fn every_expected_refusal_is_a_string_the_applet_actually_emits() {
+        // applet -> the module that implements it (reboot/poweroff/halt are one module).
+        fn module(applet: &str) -> &str {
+            match applet {
+                "reboot" | "poweroff" | "halt" => "halt",
+                "switch_root" => "switchroot",
+                other => other,
+            }
+        }
+        let mut checked = 0;
+        for (applet, probe) in TD_INIT_FARM {
+            let Probe::Refuses(_, says) = probe else {
+                continue;
+            };
+            let name = module(applet);
+            let source = super::super::td_init::module_source(name)
+                .unwrap_or_else(|| panic!("td-init embeds no module `{name}` for /bin/{applet}"));
+            assert!(
+                source.contains(says),
+                "the probe for /bin/{applet} waits for {says:?}, which does not appear in \
+                 td-init/src/{name}.rs - the applet was reworded and the probe now withholds \
+                 TD-INIT-RUN-OK on a healthy image"
+            );
+            checked += 1;
+        }
+        assert!(
+            checked >= 5,
+            "expected every refusal probe to be pinned, checked only {checked}"
+        );
+    }
+
+    /// Every script that decides to reboot must run the teardown itself.
+    ///
+    /// Under busybox `/bin/reboot` signalled PID 1 into `::shutdown:/etc/shutdown`. td-init
+    /// supervises with NO signals, so that action does not exist and nothing catches a bare
+    /// `exec /bin/reboot`: /var stays mounted (unclean Btrfs) and the shutdown marker never
+    /// prints. This scans EVERY generated /etc file rather than the one initiator that
+    /// existed when the rule was written — `/etc/bootfail` became a second one while this
+    /// branch was in review, and a per-file assertion would not have noticed.
+    #[test]
+    fn reboots_run_the_teardown_first() {
+        // Match `/bin/reboot`, not `exec /bin/reboot`: a caller that drops the `exec` still
+        // reboots, and still skips the teardown, so keying on the `exec` would let exactly
+        // that edit through (Agy review). The refusal PROBES also name /bin/reboot — on
+        // purpose, with a bogus argument they must refuse — so strip the generated probe
+        // segments first; they are the one invocation that does not reboot.
+        // All three power applets, not just reboot: poweroff and halt end a boot identically,
+        // so a script switched to either would escape a reboot-only scan while the count below
+        // still held.
+        let mut initiators = 0;
+        for (name, body, _) in etc_files(&SYSTEM) {
+            let mut body = body;
+            for (applet, probe) in TD_INIT_FARM {
+                body = body.replace(&td_init_probe(applet, probe, &SYSTEM), "");
+            }
+            for applet in ["reboot", "poweroff", "halt"] {
+                for (at, _) in body.match_indices(&format!("/bin/{applet}")) {
+                    initiators += 1;
+                    assert!(
+                        body.get(..at).unwrap_or_default().contains("/etc/shutdown"),
+                        "/etc/{name} runs /bin/{applet} without running /etc/shutdown first - \
+                         with no ::shutdown: action to catch it, /var is left mounted and the \
+                         shutdown marker is never printed"
+                    );
+                }
+            }
+        }
+        assert_eq!(
+            initiators, 2,
+            "expected exactly the two known reboot initiators (tty-session, bootfail); a new \
+             one must run the teardown too, and a vanished one means this stopped covering it"
         );
     }
 

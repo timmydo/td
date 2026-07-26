@@ -18,10 +18,15 @@ use crate::types::{Recipe, Step};
 // THIRD target-side unsafe exception recorded in AGENTS.md, after td-kexec and
 // td-netd.
 //
-// td-init is NOT yet referenced by system-x86-64: the shipped /sbin/init and the
-// /bin entries stay busybox until the daily tier has built this and the headless
-// boot oracle has exercised the binary on the image. Only then is the farm
-// flipped. Same staging td-sh and td-util follow.
+// system-x86-64 SHIPS this: /init (PID 1), the deployment initramfs' switch_root
+// pivot, and a /bin farm of all seven names. Unlike the td-util cutover, most of
+// these applets cannot be probed from the greeter — running `reboot` successfully
+// ends the boot, and `init`/`switch_root` have already done their work by the time
+// a greeter exists — so the evidence is layered instead: system-x86-64's shape
+// check EXECUTES this binary at BUILD time to dry-run the image's own inittab and
+// drive switch_root's fail-early refusal, the greeter probes the rest (the
+// irreversible ones through their refusal paths), and the boot oracle exercises the
+// success paths by booting three times.
 //
 // Why mesboot-style (rustc invoked directly) rather than `Recipe::rust`, and why
 // static: identical to td-sh/td-util/td-kexec. Every applet here runs where the
@@ -58,6 +63,14 @@ const MODULES: &[(&str, &str)] = &[
     ("switchroot", include_str!("../../../td-init/src/switchroot.rs")),
     ("sys", include_str!("../../../td-init/src/sys.rs")),
 ];
+
+/// The embedded source of one applet module. Lets a consumer that hard-codes a diagnostic
+/// td-init emits — system-x86-64's refusal probes — pin that string to the source it came
+/// from, instead of the two drifting apart until a boot oracle nobody ran notices.
+#[cfg(test)]
+pub(crate) fn module_source(name: &str) -> Option<&'static str> {
+    MODULES.iter().find(|(n, _)| *n == name).map(|(_, s)| *s)
+}
 
 pub fn recipe() -> Recipe {
     // The self-hosted toolchains install under a nested stage/td/store/<pkg>

@@ -188,6 +188,18 @@ pub const SSHD_MARKER: &str = "TD-SSHD-OK";
 /// symlinks and argv[0] dispatch plus `/proc` and `/dev/kmsg` reads skipped in the sandbox.
 pub const TD_UTIL_RUNTIME_MARKER: &str = "TD-UTIL-RUN-OK";
 
+/// Printed by `/etc/bootsuccess` ONLY after every `/bin` name the static td-init multicall
+/// serves has been exercised by its absolute `/bin` path. Unlike the td-util farm, three of
+/// those names are IRREVERSIBLE — `reboot`/`poweroff`/`halt` end the boot — so they are probed
+/// through their REFUSAL: a bad option must exit non-zero without reaching `reboot(2)`, which
+/// is exactly the parse-before-act contract that keeps a typo from powering the machine off.
+/// `switch_root` is probed the same way (its fail-early refusal), `hostname` by reading back
+/// what sysinit set, and `init` by `--dry-run` over the shipped table. The applets whose
+/// SUCCESS path no probe can reach — `init` as PID 1, `switch_root` as the pivot, `reboot` as
+/// the exit — are proven instead by the boot getting far enough to print this at all: nothing
+/// reaches the health target unless td-init ran the inittab and pivoted the root.
+pub const TD_INIT_RUNTIME_MARKER: &str = "TD-INIT-RUN-OK";
+
 /// Kernel-cmdline token the headless `qemu-boot-system` oracle appends so the greeter
 /// waits for the root-owned health/update transaction and then exits. `tty-session`
 /// turns that exit into a clean VM poweroff. Without it, the greeter is interactive.

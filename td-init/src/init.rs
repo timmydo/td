@@ -755,6 +755,14 @@ pub fn run(args: &[String]) -> Result<u8, String> {
     if opts.dry {
         return dry_run(&entries, &problems);
     }
+    // Supervising from anywhere but PID 1 is never what the caller meant, and it is
+    // actively destructive: sysinit would re-run (remounting filesystems), every
+    // respawn job would gain a duplicate, and the loop never returns. busybox and
+    // sysvinit both refuse for the same reason, and this applet now has a /bin entry
+    // any root shell can reach — `--dry-run` above is the way to inspect a table.
+    if !pid1 {
+        return Err("must be run as PID 1 (use --dry-run to check a table)".to_string());
+    }
     for problem in &problems {
         log(problem);
     }
@@ -929,6 +937,22 @@ mod tests {
         // fail on it too, or `-f /dev/null` reads as a clean bill of health.
         let (fell_back, why) = load("/nonexistent/inittab");
         assert_eq!(dry_run(&fell_back, &why), Ok(1));
+    }
+
+    /// Supervising from a process that is not PID 1 re-runs sysinit and duplicates
+    /// every respawn job, so `run` refuses — but `--dry-run` still has to work there,
+    /// since a test process, a shell and the image's own greeter probe are all not
+    /// PID 1. The test process is not PID 1, so this exercises the real refusal.
+    #[test]
+    fn supervising_is_refused_anywhere_but_pid_1_while_dry_run_still_works() {
+        assert_ne!(std::process::id(), 1, "this test relies on not being PID 1");
+        let err = run(&[]).unwrap_err();
+        assert!(
+            err.contains("must be run as PID 1"),
+            "expected a PID-1 refusal, got {err:?}"
+        );
+        // …and the validation path is unaffected by that refusal.
+        assert_eq!(run(&["--dry-run".into(), "-f".into(), "/nonexistent".into()]), Ok(1));
     }
 
     /// The jobs printed may not be the operator's at all: `load` substitutes the

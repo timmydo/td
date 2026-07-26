@@ -20,8 +20,9 @@
 //! real terminal (`-nographic` wires ttyS0 <-> the operator's stdio) and does NOT scan,
 //! time out, or kill. The operator exits the guest by typing `exit` / Ctrl-D at the
 //! greeter shell: the ttyS0 session is wrapped by `/etc/tty-session`, which runs the
-//! login flow AS ROOT (init's child) and asks init to reboot when the session ends, so
-//! under `-no-reboot` qemu exits 0. (qemu's own Ctrl-A X still force-quits at any time.)
+//! login flow AS ROOT (init's child) and, when the session ends, runs `/etc/shutdown`
+//! and reboots — td's init has no signal surface to ask — so under `-no-reboot` qemu
+//! exits 0. (qemu's own Ctrl-A X still force-quits at any time.)
 //! Because it is interactive it is a host-side command, never a gated check (a gate has
 //! no terminal, and the daily sandbox has no host qemu).
 use std::fs::File;
@@ -178,8 +179,8 @@ pub(crate) fn run(runner: &RecipeCheckRunner, lock: File) -> Result<(), String> 
          and switch_roots into the deployment. This private test volume lasts for the\n         \
          interactive session and is discarded when qemu exits;\n         \
          auto-login as the test user is enabled.\n         \
-         To power off: type `exit` (or Ctrl-D) at the shell - the session wrapper reboots\n         \
-         as root and qemu (-no-reboot) exits. To force-quit qemu at any time: Ctrl-A then X.\n",
+         To power off: type `exit` (or Ctrl-D) at the shell - the session wrapper tears\n         \
+         state down and reboots as root, and qemu (-no-reboot) exits. To force-quit qemu at any time: Ctrl-A then X.\n",
         boot_bzimage.display(),
         boot_init.display(),
         boot_disk.display()
@@ -193,8 +194,8 @@ pub(crate) fn run(runner: &RecipeCheckRunner, lock: File) -> Result<(), String> 
 /// selector initramfs boots with a writable Btrfs volume attached as `/dev/vda`.
 /// It selects and kexecs current; the deployment initramfs mounts root.erofs and @var. No
 /// marker scan, no timeout, no kill — the guest owns the terminal until the operator
-/// types `exit`/Ctrl-D at the greeter (the `tty-session` wrapper then asks init to reboot as
-/// root) or force-quits with Ctrl-A X. `-nic none` + `-no-user-config` keep the run
+/// types `exit`/Ctrl-D at the greeter (the `tty-session` wrapper then tears state down and
+/// reboots as root) or force-quits with Ctrl-A X. `-nic none` + `-no-user-config` keep the run
 /// offline and hermetic; `-no-reboot` makes the guest reset exit qemu.
 fn boot_interactive(
     qemu: &str,

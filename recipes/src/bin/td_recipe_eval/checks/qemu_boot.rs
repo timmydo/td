@@ -84,6 +84,10 @@ const SSHD_MARKER: &str = td_recipe::ladder::SSHD_MARKER;
 
 /// Printed by the root-owned health target after every td-util farm name runs unprivileged.
 const TD_UTIL_RUNTIME_MARKER: &str = td_recipe::ladder::TD_UTIL_RUNTIME_MARKER;
+/// Printed by the greeter once every `/bin` name the static td-init boot-glue multicall
+/// serves has been exercised — the reversible ones by running, the irreversible ones
+/// (`reboot`/`poweroff`/`halt`/`switch_root`) by refusing a bad argument with a diagnostic.
+const TD_INIT_RUNTIME_MARKER: &str = td_recipe::ladder::TD_INIT_RUNTIME_MARKER;
 
 /// The line `/etc/rootcheck` prints once it has confirmed `/` is a READ-ONLY erofs
 /// mount (re #550). `qemu-boot-system` asserts it to prove the switched-into root is
@@ -198,6 +202,7 @@ struct ConsoleEvidence {
     uutils_runtime: bool,
     sshd: bool,
     td_util_runtime: bool,
+    td_init_runtime: bool,
     persist_write: bool,
     persist_read: bool,
     boot_success: bool,
@@ -712,7 +717,8 @@ pub(crate) fn run_system(runner: &RecipeCheckRunner) -> Result<(), String> {
          ({} -> {}). Every full boot kept root and /etc immutable \
          ({SYSTEM_ROOT_RO_MARKER}, {SYSTEM_ETC_RO_MARKER}), mounted target-owned writable @var \
          ({SYSTEM_STATE_WRITABLE_MARKER}, {SYSTEM_STATE_OWNER_MARKER}), ran uutils \
-         ({UUTILS_RUNTIME_MARKER}) and td-util ({TD_UTIL_RUNTIME_MARKER}), and unmounted state \
+         ({UUTILS_RUNTIME_MARKER}), td-util ({TD_UTIL_RUNTIME_MARKER}) and the td-init boot \
+         glue ({TD_INIT_RUNTIME_MARKER}), and unmounted state \
          before exit ({SYSTEM_SHUTDOWN_MARKER})",
         td_boot_protocol::DEFAULT_BOOT_ATTEMPTS,
         td_boot_protocol::ATTEMPT_CONSUMED_MARKER,
@@ -925,7 +931,14 @@ fn validate_system_boot(
              absolute path did not exit 0, so the dynamically-linked coreutils multicall's \
              runtime closure (ELF interp, glibc, libgcc_s) does not resolve on the erofs root \
              even though the static shape scan passed. This is the DT_NEEDED-soname residual the \
-             build-time scan cannot see. Last serial output:\n{}",
+             build-time scan cannot see. \
+             READ THE CONSOLE BEFORE BLAMING uutils: /etc/bootsuccess emits the uutils, sshd, \
+             td-util and td-init markers TOGETHER, only once every component passed, so ANY of \
+             the four failing withholds all four and this — the first one checked — is what \
+             gets reported. The failing component names itself on the console \
+             (`td-util: /bin/<name> failed`, `td-init: /bin/<name> ...`); if such a line is \
+             present, that is the real failure and uutils is fine. \
+             Last serial output:\n{}",
             tail(&result.console, 80)
         ));
     }
@@ -948,6 +961,26 @@ fn validate_system_boot(
              multicall does not run on the erofs root, its argv[0] dispatch regressed, or the \
              /proc or /dev/kmsg the applet reads is unavailable there. td-util-test covers ELF \
              shape and dispatch in the build sandbox but skips those legs when it has no /proc. \
+             Last serial output:\n{}",
+            tail(&result.console, 80)
+        ));
+    }
+    // Reached only when the console output is TORN — the four markers are separate `echo`s in
+    // one block, so a boot that dies between them can latch the earlier ones and not this. A
+    // genuine td-init probe failure withholds all four and is reported by the uutils leg above,
+    // which says so and points at the console line naming the applet.
+    if !result.evidence.td_init_runtime {
+        return Err(format!(
+            "the root/uutils/sshd/td-util health checks passed, but the td-init runtime marker \
+             ({TD_INIT_RUNTIME_MARKER:?}) was absent — at least one /bin name the boot-glue farm \
+             serves did not behave. The console names it (`td-init: /bin/<name> ...`). Note what \
+             reaching the health target ALREADY proved: td-init ran the inittab as PID 1 and \
+             pivoted the root as `switch_root`, since nothing else does either on this image. \
+             So this marker is about the REST of the farm — `hostname` reading back what \
+             sysinit set, `cttyhack` exec'ing, `init --dry-run` accepting the shipped table, and \
+             `reboot`/`poweroff`/`halt`/`switch_root` REFUSING a bogus argument with a diagnostic \
+             rather than acting on it. That last class is the one to read carefully: a refusal \
+             probe that fails means an irreversible applet ran something it should have rejected. \
              Last serial output:\n{}",
             tail(&result.console, 80)
         ));
@@ -2277,6 +2310,7 @@ fn evidence_marker_max_len(target: &[u8]) -> usize {
         UUTILS_RUNTIME_MARKER.len(),
         SSHD_MARKER.len(),
         TD_UTIL_RUNTIME_MARKER.len(),
+        TD_INIT_RUNTIME_MARKER.len(),
         SYSTEM_PERSIST_WRITE_MARKER.len(),
         SYSTEM_PERSIST_READ_MARKER.len(),
         SYSTEM_BOOT_SUCCESS_MARKER.len(),
@@ -2365,6 +2399,11 @@ fn latch_console_evidence(evidence: &mut ConsoleEvidence, buf: &[u8], target: &[
         &mut evidence.td_util_runtime,
         buf,
         TD_UTIL_RUNTIME_MARKER.as_bytes(),
+    );
+    latch_marker(
+        &mut evidence.td_init_runtime,
+        buf,
+        TD_INIT_RUNTIME_MARKER.as_bytes(),
     );
     latch_marker(
         &mut evidence.persist_write,
@@ -2755,7 +2794,7 @@ mod tests {
     /// this: its result is dominated by the id-bearing markers (marker + space + 64-char
     /// hex), so a "no marker exceeds the max" assertion cannot fail and would only look like
     /// a guard. The rescan window is covered behaviourally instead, by the split tests below.
-    fn all_console_markers() -> [&'static str; 27] {
+    fn all_console_markers() -> [&'static str; 28] {
         [
             MARKER,
             EROFS_MARKER,
@@ -2784,6 +2823,7 @@ mod tests {
             SYSTEM_NET_REACH_MARKER,
             SSHD_MARKER,
             TD_UTIL_RUNTIME_MARKER,
+            TD_INIT_RUNTIME_MARKER,
         ]
     }
 

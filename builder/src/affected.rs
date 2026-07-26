@@ -775,8 +775,10 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
     // (check-pr); src/main.rs and its modules are `include_str!`'d into the td-init
     // RECIPE, so a source edit changes the TARGET artifact and a static-link
     // regression is invisible to host cargo — so also route to recipe-checks-daily
-    // (the daily backstop statically links + exercises it via td-init-test). Its
-    // RECIPE files under recipes/src/recipes/ are routed by the recipes arm above.
+    // (the daily backstop statically links + exercises it via td-init-test) AND it is
+    // packed into system-x86-64 as /init, the initramfs pivot, and the /bin boot-glue
+    // farm, so a source edit here changes what PID 1 IS. Its RECIPE files under
+    // recipes/src/recipes/ are routed by the recipes arm above.
     if pattern_matches(
         "td-init/*|td-init/src/*|td-init/Cargo.toml|td-init/Cargo.lock",
         p,
