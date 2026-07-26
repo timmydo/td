@@ -349,3 +349,19 @@ td's Rust is defensive and minimal-surface.
   lands in `git log` on main and what the integrator reads before landing. Nothing
   else persists (there is no PR description, no webpage); if you want to keep it, it
   goes in a commit message.
+
+- **Put the headline commit FIRST on the branch.** `squash-in` concatenates your
+  commit messages in order, and the FIRST commit's subject becomes the subject
+  of the squashed commit that lands; every later commit's subject is demoted to
+  a line in the body. So a branch that leads with a small preparatory fix lands
+  under that fix's name, and `git log` on main describes the change by its least
+  interesting part — the body is complete, but nobody scanning subjects can
+  tell. Order the branch so the commit naming the whole change comes first, or
+  squash it yourself before pushing so there is only one subject to pick.
+
+- **Hard-wrap message bodies at 72 columns.** They are read through `git log`,
+  which indents them four spaces and does not reflow, so an unwrapped paragraph
+  becomes one line running off the screen. 72 is already this history's median
+  body line, so wrapping keeps a landing consistent with what surrounds it. Let
+  genuinely unbreakable content — a command to copy, a store path, a quoted
+  diagnostic — run long rather than mangling it mid-token.
