@@ -263,7 +263,6 @@ xfail assign.test.sh::Test above without 'local' (which is not POSIX)
 xfail assign.test.sh::declare -A dict does not remove existing arrays (OSH regression)
 xfail assign.test.sh::declare -a arr does not remove existing arrays (OSH regression)
 xfail assign.test.sh::export a=1 no_value c=2
-xfail assign.test.sh::readonly $x where x='b c'
 xfail assign.test.sh::redirect after assignment builtin (eval redirects after evaluating arguments)
 xfail assign.test.sh::redirect after command sub (like case above but without assignment builtin)
 xfail assign.test.sh::redirect after declare -p
@@ -373,15 +372,10 @@ xfail brace-expansion.test.sh::} in expansion
 xfail bugs.test.sh::#2640 Hanging when reading from character devices
 xfail bugs.test.sh::(( status bug
 xfail bugs.test.sh::OSH can use ARGV name
-xfail bugs.test.sh::assign readonly -- multiple lines
-xfail bugs.test.sh::assign readonly -- multiple lines -- set -o posix
-xfail bugs.test.sh::assign readonly -- one line
 xfail bugs.test.sh::for loop (issue #1446)
 xfail bugs.test.sh::for loop 2 (issue #1446)
 xfail bugs.test.sh::other builtins fail on writing to full disk
 xfail bugs.test.sh::subshell while running a script (regression)
-xfail bugs.test.sh::unset readonly -- multiple lines
-xfail bugs.test.sh::unset readonly -- one line
 xfail builtin-bash.test.sh::bad help topic
 xfail builtin-bash.test.sh::help
 xfail builtin-bash.test.sh::mapfile -t bugs (ble.sh)
@@ -755,16 +749,9 @@ xfail builtin-vars.test.sh::Export existing local variable
 xfail builtin-vars.test.sh::Export sets a global variable
 xfail builtin-vars.test.sh::Export sets a global variable that persists after export -n
 xfail builtin-vars.test.sh::Exporting a parent func variable (dynamic scope)
-xfail builtin-vars.test.sh::Make an existing local variable readonly
 xfail builtin-vars.test.sh::Unset a function without -f
 xfail builtin-vars.test.sh::Unset exported variable, then define it again.  It's NOT still exported.
-xfail builtin-vars.test.sh::Unset readonly variable
-xfail builtin-vars.test.sh::assign to readonly variable
-xfail builtin-vars.test.sh::assign to readonly variable - errexit
 xfail builtin-vars.test.sh::can't export associative array (strict_array)
-xfail builtin-vars.test.sh::export -n foo=bar not allowed
-xfail builtin-vars.test.sh::export -n undefined is ignored
-xfail builtin-vars.test.sh::local after readonly
 xfail builtin-vars.test.sh::unset -v assoc (related to issue #661)
 xfail builtin-vars.test.sh::unset a[-1] (bf.bash regression)
 xfail builtin-vars.test.sh::unset a[-1] in sparse array (bf.bash regression)
@@ -886,7 +873,6 @@ xfail exit-status.test.sh::Truncating 'exit' status
 xfail exit-status.test.sh::Truncating 'return' status
 xfail exit-status.test.sh::func subshell OverflowError https://github.com/oilshell/oil/issues/996
 xfail exit-status.test.sh::subshell OverflowError https://github.com/oilshell/oil/issues/996
-xfail explore-parsing.test.sh::readonly +
 xfail extglob-files.test.sh::!(*.h|*.cc) to match everything except C++
 xfail extglob-files.test.sh::*() matches 0 or more
 xfail extglob-files.test.sh::+() matches 1 or more
@@ -1079,7 +1065,6 @@ xfail paren-ambiguity.test.sh::(((grep example - 4+ instances in regtest/aports 
 xfail parse-errors.test.sh::Bad var sub caught at parse time
 xfail parse-errors.test.sh::Long Token - 65535 bytes
 xfail parse-errors.test.sh::Token that's too long for Oils - 65536 bytes
-xfail parse-errors.test.sh::bad var name in export
 xfail parse-errors.test.sh::do unexpected
 xfail parse-errors.test.sh::{ is its own word, needs a space
 xfail parse-errors.test.sh::} is a parse error
@@ -1316,8 +1301,6 @@ xfail toysh-posix.test.sh::IFS 4
 xfail toysh-posix.test.sh::Pipeline - http://landley.net/notes-2019.html#16-12-2019
 xfail toysh-posix.test.sh::dynamic glob - http://landley.net/notes.html#08-05-2020
 xfail toysh-posix.test.sh::no shebang
-xfail toysh-posix.test.sh::readonly with temp binding
-xfail toysh-posix.test.sh::setting readonly var (bash is only one where it's non-fatal)
 xfail toysh-posix.test.sh::shift is fatal at top level?
 xfail toysh.test.sh::@Q
 xfail toysh.test.sh::Brace Expansion

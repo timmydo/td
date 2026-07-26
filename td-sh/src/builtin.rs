@@ -1302,6 +1302,19 @@ fn apply_named_option(sh: &mut Shell, name: &str, on: bool) {
     }
 }
 
+/// A usage error in a SPECIAL builtin, and the ONE route for them: POSIX 2.8.1
+/// ends a non-interactive shell on one, while dash's sh_error returns an
+/// interactive one to its prompt. Reaching for `Shell::fatal` here instead would
+/// silently drop that second half.
+fn special_usage_error(sh: &mut Shell, msg: &str) -> R<()> {
+    err_line(sh, msg);
+    sh.set_status(2);
+    if sh.interactive {
+        return Ok(());
+    }
+    Err(Sig::Exit(2))
+}
+
 fn unset(sh: &mut Shell, argv: &[String]) -> R<()> {
     let mut i = 1usize;
     // `-v` (variable) / `-f` (function); default is variable-then-function. dash's
@@ -1315,7 +1328,6 @@ fn unset(sh: &mut Shell, argv: &[String]) -> R<()> {
         }
         i += 1;
     }
-    let mut status_code = 0;
     while let Some(arg) = argv.get(i) {
         i += 1;
         if mode == Some('f') {
@@ -1329,31 +1341,54 @@ fn unset(sh: &mut Shell, argv: &[String]) -> R<()> {
         let end = arg.bytes().position(|b| b == b'=').unwrap_or(arg.len());
         let name = arg.get(..end).unwrap_or("");
         if !ast::is_name(name) {
-            return Err(sh.fatal(&format!("unset: {arg}: bad variable name"), 2));
+            return special_usage_error(sh, &format!("unset: {arg}: bad variable name"));
         }
         if mode.is_none() && !sh.vars.contains_key(name) {
             sh.funcs.remove(name);
         }
         if !sh.unset_var(name) {
-            err_line(sh, &format!("unset: {name}: cannot unset"));
-            status_code = 1;
+            // dash unsets through setvar too, so a readonly name aborts the shell
+            // rather than reporting a status.
+            return special_usage_error(sh, &format!("unset: {name}: is read only"));
         }
     }
-    status(sh, status_code)
+    ok(sh)
 }
 
 fn export(sh: &mut Shell, argv: &[String], readonly: bool) -> R<()> {
+    let cmd = if readonly { "readonly" } else { "export" };
     let mut any = false;
+    let mut options = true;
     for arg in argv.iter().skip(1) {
-        if arg == "-p" {
+        if options && arg == "--" {
+            options = false;
             continue;
         }
+        // dash's nextopt knows only `-p` here, and reads a cluster letter by
+        // letter, so `-px` reports the `x`. An unknown one is fatal: that is what
+        // makes bash's `export -n` end a dash script rather than warn.
+        if options && arg.len() > 1 && arg.starts_with('-') {
+            // A plain loop, not a search combinator: this source is embedded
+            // verbatim in the td-sh recipe, whose ladder guard rejects that tool's
+            // bare name as a token (see the note in arith.rs).
+            let mut bad = None;
+            for c in arg.chars().skip(1) {
+                if c != 'p' {
+                    bad = Some(c);
+                    break;
+                }
+            }
+            if let Some(c) = bad {
+                return special_usage_error(sh, &format!("td-sh: {cmd}: Illegal option -{c}"));
+            }
+            continue;
+        }
+        options = false;
         any = true;
         match arg.split_once('=') {
             Some((name, value)) => {
                 if !ast::is_name(name) {
-                    err_line(sh, &format!("export: {name}: not a valid identifier"));
-                    return status(sh, 1);
+                    return special_usage_error(sh, &format!("{cmd}: {name}: bad variable name"));
                 }
                 sh.set_var(name, value)?;
                 if readonly {
@@ -1364,8 +1399,7 @@ fn export(sh: &mut Shell, argv: &[String], readonly: bool) -> R<()> {
             }
             None => {
                 if !ast::is_name(arg) {
-                    err_line(sh, &format!("export: {arg}: not a valid identifier"));
-                    return status(sh, 1);
+                    return special_usage_error(sh, &format!("{cmd}: {arg}: bad variable name"));
                 }
                 if readonly {
                     sh.set_readonly(arg);
@@ -1391,7 +1425,7 @@ fn export(sh: &mut Shell, argv: &[String], readonly: bool) -> R<()> {
 /// revealing the global, because the outer binding only comes back on unwind.
 fn local(sh: &mut Shell, argv: &[String]) -> R<()> {
     if !sh.in_function {
-        return Err(sh.fatal("local: not in a function", 2));
+        return special_usage_error(sh, "local: not in a function");
     }
     // Only the FIRST save of a name matters -- the frame unwinds newest-first, so
     // a later one is overwritten by it. Re-saving would let `while …; do local
@@ -1412,7 +1446,7 @@ fn local(sh: &mut Shell, argv: &[String]) -> R<()> {
             // setvar, which aborts the shell. (dash only validates the valueless
             // form -- `local 1bad=x` slips past setvareq into a name no expansion
             // can name again. td-sh rejects both rather than store that.)
-            return Err(sh.fatal(&format!("local: {name}: bad variable name"), 2));
+            return special_usage_error(sh, &format!("local: {name}: bad variable name"));
         }
         let existed = sh.vars.contains_key(name);
         if !sh
@@ -1870,12 +1904,7 @@ fn trap(sh: &mut Shell, argv: &[String]) -> R<()> {
             ops = ops.get(1..).unwrap_or_default();
         } else if !rest.is_empty() {
             let c = rest.chars().next().unwrap_or('-');
-            err_line(sh, &format!("td-sh: trap: Illegal option -{c}"));
-            sh.set_status(2);
-            if sh.interactive {
-                return Ok(());
-            }
-            return Err(Sig::Exit(2));
+            return special_usage_error(sh, &format!("td-sh: trap: Illegal option -{c}"));
         }
     }
     let Some(first) = ops.first() else {
@@ -2585,6 +2614,35 @@ mod tests {
         let (_, out, _) =
             run_capturing("f() { local -; set -f; echo in=$-; }; f; case $- in *f*) echo still;; *) echo restored;; esac");
         assert!(out.contains("restored"), "got {out:?}");
+    }
+
+    #[test]
+    fn a_readonly_variable_is_fatal_to_write_or_unset() {
+        // dash reports both through sh_error, which ends the script with 2 rather
+        // than a status the next command could test.
+        for src in [
+            "readonly foo=bar; foo=eggs; echo reached",
+            "readonly R=foo; unset R; echo reached",
+            "readonly x=1; f() { x=2; }; f; echo reached",
+        ] {
+            let (status, out, err) = run_capturing(src);
+            assert_eq!((status, out.as_str()), (2, ""), "{src}");
+            assert!(err.contains("is read only"), "{src}: {err:?}");
+        }
+    }
+
+    #[test]
+    fn an_unknown_option_to_export_or_readonly_is_fatal() {
+        // bash's `export -n` is not dash's, and on a special builtin an unknown
+        // option ends the script.
+        for src in ["export -n undef; echo reached", "readonly -q x; echo reached"] {
+            let (status, out, err) = run_capturing(src);
+            assert_eq!((status, out.as_str()), (2, ""), "{src}");
+            assert!(err.contains("Illegal option"), "{src}: {err:?}");
+        }
+        // `-p` and `--` stay options, and everything after `--` is a name.
+        let (status, out, _) = run_capturing("export -p; readonly -- a=1; echo \"[$a]\"");
+        assert_eq!((status, out.as_str()), (0, "[1]\n"));
     }
 
     #[test]

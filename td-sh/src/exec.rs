@@ -222,8 +222,9 @@ impl Shell {
         self.vars.get(name).map(|v| v.value.clone())
     }
 
-    /// Assign a shell variable, honouring the readonly attribute. Errors are
-    /// returned as `Sig::Exit(1)` after a message, so `?` reports them.
+    /// Assign a shell variable, honouring the readonly attribute. A write to a
+    /// readonly name is dash's sh_error: reported, then `Sig::Exit(2)` so `?`
+    /// carries it out and the script stops rather than testing a status.
     pub fn set_var(&mut self, name: &str, value: &str) -> R<()> {
         // Assigning OPTIND at all -- even the value it already holds -- restarts
         // `getopts` at a word boundary, as dash's OPTIND hook does. `getopts`
@@ -239,8 +240,10 @@ impl Shell {
             self.getopts_off = -1;
         }
         match self.vars.get_mut(name) {
+            // dash reports this through sh_error, which ends a non-interactive
+            // shell with status 2 -- not a status a script can test.
             Some(v) if v.readonly => {
-                return Err(self.fatal(&format!("{name}: is read only"), 1));
+                return Err(self.fatal(&format!("{name}: is read only"), 2));
             }
             Some(v) => v.value = value.to_string(),
             None => {
