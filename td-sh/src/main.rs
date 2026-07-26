@@ -122,7 +122,8 @@ fn run(args: &[String]) -> Result<i32, String> {
     sh.params = args.iter().skip(i).cloned().collect();
     if !read_stdin && std::io::stdin().is_terminal() {
         sh.interactive = true;
-        return Ok(repl(&mut sh));
+        let code = repl(&mut sh);
+        return Ok(exec::run_exit_trap(&mut sh, code));
     }
     let mut src = String::new();
     std::io::stdin()

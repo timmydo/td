@@ -679,7 +679,6 @@ xfail builtin-trap-bash.test.sh::One 'echo' in first pipeline part - why does ba
 xfail builtin-trap-bash.test.sh::but trap DEBUG respects errexit
 xfail builtin-trap-bash.test.sh::trap -l
 xfail builtin-trap-bash.test.sh::trap -p
-xfail builtin-trap-bash.test.sh::trap -p in child is BUGGY in bash
 xfail builtin-trap-bash.test.sh::trap DEBUG and command sub / subshell
 xfail builtin-trap-bash.test.sh::trap DEBUG and control flow
 xfail builtin-trap-bash.test.sh::trap DEBUG and pipeline (lastpipe difference)
@@ -711,31 +710,10 @@ xfail builtin-trap-err.test.sh::trap ERR with YSH proc
 xfail builtin-trap-err.test.sh::trap ERR with for,  case, { }
 xfail builtin-trap-err.test.sh::trap ERR with redirect
 xfail builtin-trap-err.test.sh::trap can use original $LINENO
-xfail builtin-trap.test.sh::Register the same handler for multiple signals
-xfail builtin-trap.test.sh::Remove trap with an unsigned integer
-xfail builtin-trap.test.sh::SIGINT and INT are aliases
-xfail builtin-trap.test.sh::eval in the exit trap (regression for issue #293)
 xfail builtin-trap.test.sh::exit 1 when trap code string is invalid
 xfail builtin-trap.test.sh::exit codes for traps are isolated
-xfail builtin-trap.test.sh::print trap handler with multiple lines
-xfail builtin-trap.test.sh::trap '' EXIT - printing state
-xfail builtin-trap.test.sh::trap '' sets handler to empty string (SIG_IGN)
-xfail builtin-trap.test.sh::trap '' with multiple signals
-xfail builtin-trap.test.sh::trap 'echo hi' KILL (regression test, caught by smoosh suite)
-xfail builtin-trap.test.sh::trap -p is like trap: it prints the handlers and full signal names
-xfail builtin-trap.test.sh::trap 0 2 resets EXIT AND SIGINT
-xfail builtin-trap.test.sh::trap 0 is equivalent to trap EXIT
-xfail builtin-trap.test.sh::trap 1 is equivalent to SIGHUP; HUP is equivalent to SIGHUP
-xfail builtin-trap.test.sh::trap EXIT calling exit
-xfail builtin-trap.test.sh::trap EXIT clears the EXIT trap
-xfail builtin-trap.test.sh::trap EXIT return status ignored
-xfail builtin-trap.test.sh::trap EXIT with PARSE error
-xfail builtin-trap.test.sh::trap EXIT with PARSE error and explicit exit
 xfail builtin-trap.test.sh::trap EXIT with command sub / subshell / pipeline
-xfail builtin-trap.test.sh::trap EXIT with explicit exit
-xfail builtin-trap.test.sh::trap accepts/ignores --
 xfail builtin-trap.test.sh::trap with command.NoOp - check internal invariant
-xfail builtin-trap.test.sh::trap without args prints traps
 xfail builtin-trap.test.sh::traps are cleared in subshell (started with &)
 xfail builtin-trap.test.sh::traps are not active inside subshells $() ()  trap | cat
 xfail builtin-type-bash.test.sh::type -P builtin -> not a file

@@ -356,6 +356,7 @@ pub fn run_pipeline(sh: &mut Shell, cmds: &[Cmd]) -> R<()> {
             Err(Sig::Exit(code)) => code,
             Err(_) => stage.status,
         };
+        last_status = exec::run_exit_trap(&mut stage, last_status);
 
         input = capture.and_then(|buf| buf.lock().ok().map(|v| v.clone()));
     }
@@ -385,6 +386,7 @@ pub fn run_subshell(sh: &mut Shell, body: &List, redirs: &[Redir]) -> R<()> {
         Err(Sig::Exit(code)) => code,
         Err(_) => child.status,
     };
+    let status = exec::run_exit_trap(&mut child, status);
     sh.set_status(status);
     Ok(())
 }
@@ -418,6 +420,16 @@ pub fn fork_shell(sh: &Shell) -> Shell {
         // A subshell inherits the aliases but cannot publish one back (POSIX).
         aliases: sh.aliases.clone(),
         cloned: true,
+        trap_status: None,
+        // POSIX 2.12: a subshell resets the traps it inherited to their defaults,
+        // so only one it sets ITSELF runs when its environment ends -- but one set
+        // to IGNORE (dash's empty action) stays ignored, and keeps being reported.
+        traps: sh
+            .traps
+            .iter()
+            .filter(|(_, action)| action.is_empty())
+            .map(|(signo, action)| (*signo, action.clone()))
+            .collect(),
     }
 }
 
@@ -437,6 +449,7 @@ pub fn capture_stdout(sh: &mut Shell, code: &str) -> R<String> {
         Err(Sig::Exit(code)) => code,
         Err(_) => child.status,
     };
+    let status = exec::run_exit_trap(&mut child, status);
     // Command substitution updates $? of the enclosing shell.
     sh.set_status(status);
     let bytes = buf
@@ -471,6 +484,10 @@ pub fn exec_replace(sh: &mut Shell, argv: &[String]) -> R<()> {
         matches!(sh.fds.get(fd), Some(Fd::ReadBuf(_)) | Some(Fd::WriteBuf(_)))
     });
     if sh.cloned || buffered {
+        // A real `execve` replaces the image, taking the trap table with it, so the
+        // emulation has to drop it too -- otherwise this shell runs an EXIT trap
+        // the exec'd program could never have run.
+        sh.traps.clear();
         exec_external(sh, argv, &[])?;
         return Err(Sig::Exit(sh.status));
     }

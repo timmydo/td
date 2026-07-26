@@ -7,7 +7,7 @@
 //! the ordinary `?` operator carries it out to the right handler. A normal
 //! command just leaves its status in `Shell::status`.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -105,6 +105,14 @@ pub struct Shell {
     /// substitution), not a forked process. `exec` must not replace the real
     /// process from one, or the rest of the script would be lost with it.
     pub cloned: bool,
+    /// Set while a trap action runs, to the status the shell was exiting with.
+    /// POSIX makes that the value a bare `exit` in the action reports.
+    pub trap_status: Option<i32>,
+    /// `trap` actions by signal number, 0 being EXIT. An empty action is POSIX's
+    /// "ignore". Only EXIT is ever RUN: delivering a real signal needs a handler
+    /// this shell cannot install (see the crate-root note), so the rest are kept
+    /// so that `trap` reports them faithfully.
+    pub traps: BTreeMap<u8, String>,
 }
 
 /// Bound on nested command execution — enforced once, at the `run_command` choke
@@ -149,6 +157,8 @@ impl Shell {
             getopts_off: -1,
             aliases: Aliases::new(),
             cloned: false,
+            traps: BTreeMap::new(),
+            trap_status: None,
         };
         // POSIX seeds these when absent; scripts assume they exist.
         if sh.get_var("IFS").is_none() {
@@ -185,6 +195,8 @@ impl Shell {
             getopts_off: -1,
             aliases: Aliases::new(),
             cloned: false,
+            traps: BTreeMap::new(),
+            trap_status: None,
         };
         let _ = sh.set_var("IFS", " \t\n");
         let _ = sh.set_var("OPTIND", "1");
@@ -303,13 +315,33 @@ impl Default for Shell {
 /// Parse and run a whole program, returning the final `$?`. A parse error prints
 /// to stderr and yields 2 (the POSIX syntax-error status).
 pub fn run_program(sh: &mut Shell, src: &str) -> i32 {
-    match run_source(sh, src, "") {
+    let status = match run_source(sh, src, "") {
         Ok(()) => sh.status,
         Err(Sig::Exit(code)) => code,
         // A stray break/continue/return at the top level is not an error worth
         // aborting the process over; POSIX leaves it unspecified.
         Err(_) => sh.status,
-    }
+    };
+    run_exit_trap(sh, status)
+}
+
+/// Run the EXIT trap on the way out of a shell environment. POSIX: the action sees
+/// the exiting status in `$?`, its own status is discarded, and only an `exit` WITH
+/// an operand replaces the status (`trap_status` is what makes a bare one report the
+/// status being exited with). Taken out of the table first, so it cannot re-enter.
+pub fn run_exit_trap(sh: &mut Shell, status: i32) -> i32 {
+    let Some(action) = sh.traps.remove(&0) else {
+        return status;
+    };
+    sh.set_status(status);
+    let saved = sh.trap_status.replace(status);
+    let code = match run_source(sh, &action, "") {
+        Ok(()) => status,
+        Err(Sig::Exit(code)) => code,
+        Err(_) => status,
+    };
+    sh.trap_status = saved;
+    code
 }
 
 /// Run `src` one top-level unit at a time, as dash reads a script: a command is
@@ -340,7 +372,12 @@ pub fn run_list(sh: &mut Shell, list: &List) -> R<()> {
             // with $?=0. True background execution, a real $! and a functional
             // `wait` are deferred (see the crate-root note); $! is a placeholder.
             let mut child = process::fork_shell(sh);
-            let _ = run_and_or(&mut child, and_or);
+            let status = match run_and_or(&mut child, and_or) {
+                Ok(()) => child.status,
+                Err(Sig::Exit(code)) => code,
+                Err(_) => child.status,
+            };
+            let _ = run_exit_trap(&mut child, status);
             sh.last_bg = std::process::id();
             sh.set_status(0);
         } else {
@@ -766,14 +803,18 @@ fn call_function(
     let saved_loop_depth = sh.loop_depth;
     sh.in_function = true;
     sh.loop_depth = 0;
-    let result = match process::apply_redirs(sh, redirs)? {
-        process::RedirOutcome::Applied(saved) => {
+    // Not `?`: a fatal error in a redirection WORD (`f 2>${u:?}`) must still unwind
+    // the argument frame below, or the caller -- or an EXIT trap -- sees the
+    // function's `$1`/`$#`.
+    let result = match process::apply_redirs(sh, redirs) {
+        Ok(process::RedirOutcome::Applied(saved)) => {
             let r = run_command(sh, body);
             process::restore_redirs(sh, saved);
             r
         }
         // A failed redirection skips the function body; `$?` is already 1.
-        process::RedirOutcome::Failed => Ok(()),
+        Ok(process::RedirOutcome::Failed) => Ok(()),
+        Err(sig) => Err(sig),
     };
     sh.params = saved_params;
     (sh.getopts_optind, sh.getopts_off) = saved_getopts;

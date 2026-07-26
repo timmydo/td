@@ -38,6 +38,7 @@ pub enum Builtin {
     Alias,
     Unalias,
     Exec,
+    Trap,
 }
 
 pub fn lookup(name: &str) -> Option<Builtin> {
@@ -68,6 +69,7 @@ pub fn lookup(name: &str) -> Option<Builtin> {
         "alias" => Builtin::Alias,
         "unalias" => Builtin::Unalias,
         "exec" => Builtin::Exec,
+        "trap" => Builtin::Trap,
         _ => return None,
     })
 }
@@ -90,6 +92,7 @@ pub fn is_special(bi: Builtin) -> bool {
             | Builtin::Return
             | Builtin::Set
             | Builtin::Shift
+            | Builtin::Trap
             | Builtin::Unset
     )
 }
@@ -121,6 +124,7 @@ pub fn run(sh: &mut Shell, bi: Builtin, argv: &[String]) -> R<()> {
         Builtin::Alias => alias(sh, argv),
         Builtin::Unalias => unalias(sh, argv),
         Builtin::Exec => exec_cmd(sh, argv),
+        Builtin::Trap => trap(sh, argv),
     }
 }
 
@@ -1158,7 +1162,10 @@ fn pad_bytes(out: &mut Vec<u8>, sign: &[u8], prefix: &[u8], body: &[u8], width: 
 fn exit(sh: &mut Shell, argv: &[String]) -> R<()> {
     let code = match argv.get(1) {
         Some(s) => parse_status(sh, s)?,
-        None => sh.status,
+        // POSIX: inside a trap action, "the last command" is the one that ran
+        // before the trap, so a bare `exit` there reports the status the shell was
+        // already exiting with -- not whatever the action's own last command left.
+        None => sh.trap_status.unwrap_or(sh.status),
     };
     Err(Sig::Exit(code & 0xff))
 }
@@ -1708,6 +1715,139 @@ fn split_read(line: &str, ifs: &str, n: usize) -> Vec<String> {
         }
     }
     fields
+}
+
+/// Signal numbers and the names `trap` accepts and prints, Linux/x86-64 order.
+/// 0 is EXIT, POSIX's "condition" that is not a signal at all. dash matches the
+/// name WITHOUT a `SIG` prefix, so `trap - SIGINT` is a bad trap while `INT` is not.
+const SIGNALS: &[(u8, &str)] = &[
+    (0, "EXIT"),
+    (1, "HUP"),
+    (2, "INT"),
+    (3, "QUIT"),
+    (4, "ILL"),
+    (5, "TRAP"),
+    (6, "ABRT"),
+    (7, "BUS"),
+    (8, "FPE"),
+    (9, "KILL"),
+    (10, "USR1"),
+    (11, "SEGV"),
+    (12, "USR2"),
+    (13, "PIPE"),
+    (14, "ALRM"),
+    (15, "TERM"),
+    (16, "STKFLT"),
+    (17, "CHLD"),
+    (18, "CONT"),
+    (19, "STOP"),
+    (20, "TSTP"),
+    (21, "TTIN"),
+    (22, "TTOU"),
+    (23, "URG"),
+    (24, "XCPU"),
+    (25, "XFSZ"),
+    (26, "VTALRM"),
+    (27, "PROF"),
+    (28, "WINCH"),
+    (29, "IO"),
+    (30, "PWR"),
+    (31, "SYS"),
+];
+
+/// The highest number `trap` accepts as a condition. Linux has 64 signals; the
+/// real-time ones above SYS have no name here, so they print as their number.
+const MAX_SIGNAL: u8 = 64;
+
+/// An operand that is an unsigned decimal integer -- POSIX's test for "this is a
+/// condition, not an action", which is what makes `trap 0 EXIT` reset two traps
+/// rather than set EXIT to the command `0`. Digits ONLY, as dash's `is_number` has
+/// it: `trap ' 0 ' EXIT` sets an action. The range check belongs to decoding, not
+/// here, so `trap 256 EXIT` is a bad CONDITION and not an action named `256`.
+fn unsigned_int(s: &str) -> Option<u64> {
+    if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    s.parse::<u64>().ok()
+}
+
+fn decode_signal(s: &str) -> Option<u8> {
+    if let Some(n) = unsigned_int(s) {
+        return u8::try_from(n).ok().filter(|n| *n <= MAX_SIGNAL);
+    }
+    // dash compares names case-insensitively, so `trap - int 0 3` clears INT.
+    for (n, name) in SIGNALS {
+        if name.eq_ignore_ascii_case(s) {
+            return Some(*n);
+        }
+    }
+    None
+}
+
+fn signal_name(n: u8) -> String {
+    for (num, name) in SIGNALS {
+        if *num == n {
+            return (*name).to_string();
+        }
+    }
+    n.to_string()
+}
+
+/// `trap [action] condition...`. Only EXIT ever fires: installing a real signal
+/// handler needs syscalls this shell cannot make, so the other conditions are
+/// recorded and reported but never delivered.
+fn trap(sh: &mut Shell, argv: &[String]) -> R<()> {
+    let mut ops = argv.get(1..).unwrap_or_default();
+    // dash's `nextopt(nullstr)`: `--` ends an empty option set, a bare `-` is the
+    // reset ACTION, and any other `-x` is a usage error -- fatal, `trap` being a
+    // special builtin, which is how `trap -p` ends a script with status 2.
+    if let Some(rest) = ops.first().and_then(|a| a.strip_prefix('-')) {
+        if rest == "-" {
+            ops = ops.get(1..).unwrap_or_default();
+        } else if !rest.is_empty() {
+            let c = rest.chars().next().unwrap_or('-');
+            err_line(sh, &format!("td-sh: trap: Illegal option -{c}"));
+            sh.set_status(2);
+            if sh.interactive {
+                return Ok(());
+            }
+            return Err(Sig::Exit(2));
+        }
+    }
+    let Some(first) = ops.first() else {
+        let mut text = String::new();
+        for (signo, action) in &sh.traps {
+            text.push_str("trap -- ");
+            text.push_str(&single_quote(action));
+            text.push(' ');
+            text.push_str(&signal_name(*signo));
+            text.push('\n');
+        }
+        return out(sh, text.as_bytes());
+    };
+    // With one operand there is no action: `trap EXIT` and `trap 2` RESET.
+    let (action, conditions) = if ops.len() > 1 && unsigned_int(first).is_none() {
+        (Some(first.as_str()), ops.get(1..).unwrap_or_default())
+    } else {
+        (None, ops)
+    };
+    let mut code = 0;
+    for name in conditions {
+        let Some(signo) = decode_signal(name) else {
+            err_line(sh, &format!("td-sh: trap: {name}: invalid signal specification"));
+            code = 1;
+            continue;
+        };
+        match action {
+            None | Some("-") => {
+                sh.traps.remove(&signo);
+            }
+            Some(a) => {
+                sh.traps.insert(signo, a.to_string());
+            }
+        }
+    }
+    status(sh, code)
 }
 
 /// dash's `single_quote`: runs of ordinary text go in `'…'`, runs of quotes in
@@ -2909,6 +3049,112 @@ mod tests {
             run_capturing("alias F='for i in x '\nalias S=';'\nF S do echo $i; done").1,
             "x\n"
         );
+    }
+
+    #[test]
+    fn exit_trap_runs_once_on_the_way_out() {
+        // POSIX: the action runs with the exiting status in `$?`, and its own
+        // status is discarded -- only an `exit` inside it changes the result.
+        let (status, out, _) = run_capturing("trap 'echo bye' EXIT\necho hi");
+        assert_eq!((status, out.as_str()), (0, "hi\nbye\n"));
+        let (status, out, _) = run_capturing("f() { echo cleanup; exit 42; }\ntrap f EXIT");
+        assert_eq!((status, out.as_str()), (42, "cleanup\n"));
+        let (status, _, _) = run_capturing("f() { return 42; }\ntrap f EXIT");
+        assert_eq!(status, 0);
+        assert_eq!(run_capturing("trap 'echo $?' EXIT\n(exit 7)").1, "7\n");
+        // A syntax error still leaves the shell exiting through its trap.
+        let (status, out, _) = run_capturing("trap 'echo FAILED' EXIT\nfor");
+        assert_eq!((status, out.as_str()), (2, "FAILED\n"));
+        // The action is taken out of the table before it runs, so an `exit` inside
+        // it cannot send the shell round again.
+        assert_eq!(run_capturing("trap 'echo once; exit' EXIT\n:").1, "once\n");
+        // POSIX: in a trap action "the last command" is the one BEFORE the trap, so
+        // a bare `exit` there reports the status the shell was already exiting with
+        // -- a cleanup action must not rewrite it. (busybox ash reports the action's
+        // own status here; nothing in the corpus pins either, so this follows POSIX
+        // and dash.) An explicit operand still wins.
+        assert_eq!(run_capturing("trap 'false; exit' EXIT\nexit 3").0, 3);
+        assert_eq!(run_capturing("trap 'exit 42' EXIT\nexit 3").0, 42);
+        // ... and outside a trap a bare `exit` still reports the last command.
+        assert_eq!(run_capturing("false\nexit").0, 1);
+    }
+
+    #[test]
+    fn trap_prints_what_is_in_force() {
+        // dash's format, in signal-number order, with the action single-quoted.
+        assert_eq!(
+            run_capturing("trap 'echo test' TERM 2 EXIT\ntrap").1,
+            "trap -- 'echo test' EXIT\ntrap -- 'echo test' INT\ntrap -- 'echo test' TERM\ntest\n"
+        );
+        // An empty action is POSIX's "ignore" and prints as such; a multi-line one
+        // keeps its newlines inside the quotes.
+        assert_eq!(run_capturing("trap '' USR1\ntrap").1, "trap -- '' USR1\n");
+        assert_eq!(
+            run_capturing("trap 'echo 1\necho 2' INT\ntrap").1,
+            "trap -- 'echo 1\necho 2' INT\n"
+        );
+        assert_eq!(run_capturing("trap").1, "");
+    }
+
+    #[test]
+    fn trap_conditions_follow_dashs_decoding() {
+        // A `SIG` prefix is not accepted, the bare name is, and the comparison is
+        // case-insensitive -- so `trap - int` clears INT.
+        let (_, out, _) = run_capturing("trap - SIGINT\necho $?\ntrap - INT\necho $?");
+        assert_eq!(out, "1\n0\n");
+        assert_eq!(run_capturing("trap 'echo x' INT\ntrap - int\ntrap").1, "");
+        // Numbers name signals, and 0 is EXIT.
+        assert_eq!(run_capturing("trap 'echo x' 1\ntrap").1, "trap -- 'echo x' HUP\n");
+        assert_eq!(run_capturing("trap 'echo x' 0\ntrap").1, "trap -- 'echo x' EXIT\nx\n");
+        // Untrappable signals are still accepted, as dash accepts them.
+        assert_eq!(run_capturing("trap 'echo hi' KILL STOP\necho $?").1, "0\n");
+        // POSIX: an unsigned first operand means every operand is a CONDITION, so
+        // this resets rather than setting the action to `0`.
+        assert_eq!(run_capturing("trap 'echo noprint' EXIT\ntrap 0 EXIT\necho ok").1, "ok\n");
+        // Out of range is a bad CONDITION, not an action that happens to be digits.
+        let (_, out, _) = run_capturing("trap 'echo noprint' EXIT\ntrap 256 EXIT\necho $?");
+        assert_eq!(out, "1\n");
+        // Digits ONLY, as dash's `is_number` has it: with a blank in it this is an
+        // action again, so it REPLACES the EXIT trap rather than resetting it.
+        assert_eq!(run_capturing("trap 'echo noprint' EXIT\ntrap ' echo spaced ' EXIT").1, "spaced\n");
+        // A single operand is a condition too: `trap EXIT` clears it.
+        assert_eq!(run_capturing("trap 'echo noprint' EXIT\ntrap EXIT\necho ok").1, "ok\n");
+    }
+
+    #[test]
+    fn trap_usage_errors_are_fatal_but_still_run_the_exit_trap() {
+        // `trap` is a special builtin, so a bad option ends the script -- with the
+        // EXIT trap that was already in force still firing.
+        let (status, out, _) = run_capturing("trap 'echo trap-exit' EXIT\ntrap -1 EXIT\necho bad");
+        assert_eq!((status, out.as_str()), (2, "trap-exit\n"));
+        // A bad CONDITION is not fatal: it reports and carries on with status 1.
+        let (status, out, _) = run_capturing("trap 'echo x' NOSUCH\necho status=$?");
+        assert_eq!((status, out.as_str()), (0, "status=1\n"));
+    }
+
+    #[test]
+    fn a_subshell_starts_with_no_inherited_traps() {
+        // POSIX 2.12: the parent's EXIT trap must not fire when a subshell, command
+        // substitution or pipeline stage ends -- only once, for the shell itself.
+        assert_eq!(
+            run_capturing("trap 'echo EXIT TRAP' EXIT\necho $(echo sub)\n( echo shell )").1,
+            "sub\nshell\nEXIT TRAP\n"
+        );
+        // ... but a trap the subshell sets ITSELF runs when it ends.
+        assert_eq!(run_capturing("( trap 'echo inner' EXIT; echo body )\necho after").1,
+            "body\ninner\nafter\n");
+        // And it does not leak back out.
+        assert_eq!(run_capturing("( trap 'echo inner' EXIT )\ntrap").1, "inner\n");
+        // A trap set to IGNORE is the exception: POSIX keeps it ignored in the
+        // subshell, so it is still reported there.
+        assert_eq!(run_capturing("trap '' INT\n( trap )").1, "trap -- '' INT\n");
+        assert_eq!(run_capturing("trap 'echo x' INT\n( trap )\necho end").1, "end\n");
+        // A FAILED `exec` never replaced anything, so the trap still runs. (The
+        // succeeding case -- where the emulated `exec` must drop the trap the way a
+        // real `execve` drops the image -- needs an external, which this harness's
+        // cleared environment has none of.)
+        let (status, out, _) = run_capturing("( trap 'echo T' EXIT; exec no_such_cmd_xyz )");
+        assert_eq!((status, out.as_str()), (127, "T\n"));
     }
 
     #[test]
