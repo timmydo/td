@@ -245,12 +245,25 @@ fn word_from_str_at(text: &str, depth: u32) -> Syn<Word> {
     lexer_over(text, depth)?.scan_word(false)
 }
 
+/// Scan a whole runtime string as if it were the body of a `"..."` -- dash's
+/// `expandstr`, which parses `$PS4` with DQSYNTAX and expands it EXP_QUOTED.
+/// There is no enclosing quote to close, so a `'` or `"` in the value is an
+/// ordinary character rather than the start of a quote that never ends.
+///
+/// Not QUITE a double-quoted body, though: dash scans it against a fake end
+/// marker, and its backslash guard (parser.c:951) spares `\"` when one is set,
+/// so `a\"b` traces with the backslash still on. `\$`, `` \` `` and `\\` lose
+/// theirs as they would inside real quotes.
+pub fn word_from_str(text: &str) -> Syn<Word> {
+    lexer_over(text, 0)?.scan_dq_run(false)
+}
+
 /// Scan the body of `$((...))`. POSIX expands it as if it were double-quoted,
 /// "except that a double-quote inside the expression is not treated specially",
 /// so NEITHER quote character quotes here: both reach the arithmetic lexer, which
 /// rejects them. That is why `$(( '1' + 2 ))` is an error and not 3.
 fn arith_from_str_at(text: &str, depth: u32) -> Syn<Word> {
-    lexer_over(text, depth)?.scan_arith_body()
+    lexer_over(text, depth)?.scan_dq_run(true)
 }
 
 fn lexer_over(text: &str, depth: u32) -> Syn<Lexer> {
@@ -555,18 +568,27 @@ impl Lexer {
         Ok(buf.finish())
     }
 
-    /// Body of `$((...))`: double-quote rules for `$`, backtick and backslash,
-    /// but no quoting — every other character, quote marks included, is literal.
-    fn scan_arith_body(&mut self) -> Syn<Word> {
+    /// A run of text under double-quote rules with no closing quote to look for:
+    /// `$`, backtick and backslash keep their meaning, every other character --
+    /// quote marks included -- is literal, and the whole run stays quoted, so it
+    /// is neither field-split nor globbed. Serves both `$((...))` bodies and the
+    /// runtime strings expanded as if double-quoted (`$PS4`).
+    ///
+    /// `escapes_dquote` is the one place the two part company; see `word_from_str`.
+    fn scan_dq_run(&mut self, escapes_dquote: bool) -> Syn<Word> {
         let mut buf = WordBuf::default();
         while let Some(c) = self.sc.peek() {
             match c {
                 '\\' => {
                     self.sc.bump();
                     match self.sc.peek() {
-                        Some(esc @ ('$' | '`' | '"' | '\\')) => {
+                        Some(esc @ ('$' | '`' | '\\')) => {
                             self.sc.bump();
                             buf.push_quoted(esc);
+                        }
+                        Some('"') if escapes_dquote => {
+                            self.sc.bump();
+                            buf.push_quoted('"');
                         }
                         Some('\n') => {
                             self.sc.bump();

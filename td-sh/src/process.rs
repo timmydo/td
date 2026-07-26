@@ -94,7 +94,13 @@ impl Clone for Fds {
 /// Write bytes to a shell descriptor. An unwritable or closed descriptor is an
 /// error, surfaced to the caller as an `io::Error` (EBADF-like).
 pub fn write_fd(sh: &Shell, fd: u32, bytes: &[u8]) -> std::io::Result<()> {
-    match sh.fds.get(fd) {
+    write_target(sh.fds.get(fd), bytes)
+}
+
+/// Write to a descriptor's target directly, for a caller holding one that is no
+/// longer in the table -- dash's `preverrout`.
+pub fn write_target(target: Option<&Fd>, bytes: &[u8]) -> std::io::Result<()> {
+    match target {
         Some(Fd::Inherit(0)) | Some(Fd::Closed) | None => Err(std::io::Error::other("bad file descriptor")),
         Some(Fd::Inherit(1)) => {
             let stdout = std::io::stdout();
@@ -166,6 +172,27 @@ pub fn read_byte(sh: &Shell, fd: u32) -> std::io::Result<Option<u8>> {
 /// A descriptor saved by `apply_redirs` so `restore_redirs` can put it back.
 pub struct Saved {
     entries: Vec<(u32, Option<Fd>)>,
+}
+
+impl Saved {
+    /// The fd 2 that was in effect BEFORE this command's redirections, if they
+    /// touched it. dash saves it as `preverrout` (REDIR_SAVEFD2) so `set -x`
+    /// still reports a command that sends its own stderr elsewhere.
+    ///
+    /// The outer `Option` says whether fd 2 was redirected at all; the inner one
+    /// distinguishes "had no entry before" from "had this target", so a caller
+    /// cannot mistake an absent prior stderr for an untouched one and write the
+    /// trace into the very file the command redirected to.
+    pub fn prev_stderr(&self) -> Option<Option<&Fd>> {
+        // The FIRST entry for fd 2 is the pre-command one; a later `2>` in the
+        // same command saved only the value an earlier one had just installed.
+        for (fd, prev) in &self.entries {
+            if *fd == 2 {
+                return Some(prev.as_ref());
+            }
+        }
+        None
+    }
 }
 
 /// The result of applying one command's redirections.
@@ -419,6 +446,9 @@ pub fn fork_shell(sh: &Shell) -> Shell {
         cmdsubst_count: sh.cmdsubst_count,
         errexit_suppressed: sh.errexit_suppressed,
         interactive: false,
+        // Inherited: a `$(...)` inside $PS4 runs in one of these, and it must
+        // still know it is inside PS4 or the guard buys nothing.
+        in_ps4: sh.in_ps4,
         getopts_optind: sh.getopts_optind,
         getopts_off: sh.getopts_off,
         // A subshell inherits the aliases but cannot publish one back (POSIX).

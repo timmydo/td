@@ -121,6 +121,9 @@ pub struct Shell {
     /// it propagates into compounds nested inside the condition.
     pub errexit_suppressed: u32,
     pub interactive: bool,
+    /// dash's `inps4`: set while $PS4 is being expanded, so a command
+    /// substitution inside it cannot trace itself into infinite regress.
+    pub in_ps4: bool,
     /// `getopts` scan cursor, hidden like dash's: the 1-based index of the next
     /// WORD and the byte offset inside the word being consumed (-1 == start a
     /// fresh one). Hidden rather than read back out of $OPTIND because dash keeps
@@ -196,6 +199,7 @@ impl Shell {
             cmdsubst_count: 0,
             errexit_suppressed: 0,
             interactive: false,
+            in_ps4: false,
             getopts_optind: 1,
             getopts_off: -1,
             aliases: Aliases::new(),
@@ -203,6 +207,11 @@ impl Shell {
             traps: BTreeMap::new(),
             trap_status: None,
         };
+        // dash's varinit carries `PS4=+ `, so it is a real variable a script can
+        // read, not just a default the tracer falls back to.
+        if sh.get_var("PS4").is_none() {
+            let _ = sh.set_var("PS4", "+ ");
+        }
         // POSIX seeds these when absent; scripts assume they exist.
         if sh.get_var("IFS").is_none() {
             let _ = sh.set_var("IFS", " \t\n");
@@ -250,6 +259,7 @@ impl Shell {
             cmdsubst_count: 0,
             errexit_suppressed: 0,
             interactive: false,
+            in_ps4: false,
             getopts_optind: 1,
             getopts_off: -1,
             aliases: Aliases::new(),
@@ -259,6 +269,7 @@ impl Shell {
         };
         let _ = sh.set_var("IFS", " \t\n");
         let _ = sh.set_var("OPTIND", "1");
+        let _ = sh.set_var("PS4", "+ ");
         sh
     }
 
@@ -711,6 +722,49 @@ fn run_case(sh: &mut Shell, word: &Word, items: &[crate::ast::CaseItem]) -> R<()
     Ok(())
 }
 
+/// `set -x`: report the command on stderr, prefixed by the EXPANDED `$PS4`.
+/// `errout` overrides the destination with what fd 2 held before this command's
+/// redirections ran -- `Some(None)` for "it held nothing", which fails the write
+/// rather than falling back to the redirected fd. `None` writes to fd 2 as it stands.
+fn trace(sh: &mut Shell, parts: &[String], errout: Option<Option<&process::Fd>>) {
+    // dash's `inps4` guard: a `$(...)` inside PS4 must not trace its own
+    // commands, which would re-enter here forever.
+    if !sh.opts.xtrace || sh.in_ps4 {
+        return;
+    }
+    // An UNSET PS4 prefixes nothing. Both references reach the value as
+    // `vps4.text + 4` -- past the "PS4=" of a variable they never let go of --
+    // so unsetting it leaves an empty string rather than restoring `+ `.
+    let ps4 = sh.get_var("PS4").unwrap_or_default();
+    // Tracing only observes. A `$(...)` in $PS4 runs a real command, but it must not
+    // become the traced command's own `$?`, nor be counted among ITS substitutions --
+    // that count is what decides an assignment-only command's status, so leaking one
+    // makes `PS4='$(false) '; x=1` report 1 where POSIX says 0.
+    let saved_status = sh.status;
+    let saved_cmdsubst = sh.cmdsubst_count;
+    sh.in_ps4 = true;
+    let expanded = (|| {
+        // `fatal` here is only a way to get the diagnostic onto stderr: the `Sig` it
+        // builds is dropped with the rest of the error below, so the status is inert.
+        let word = crate::lexer::word_from_str(&ps4).map_err(|e| sh.fatal(&e, 2))?;
+        expand::expand_single(sh, &word)
+    })();
+    sh.in_ps4 = false;
+    sh.status = saved_status;
+    sh.cmdsubst_count = saved_cmdsubst;
+    // A PS4 that will not expand -- an unterminated `${`, `$(( 1 / 0 ))` -- does
+    // NOT stop the shell. Both references set a handler around this one
+    // expansion and fall back to the unexpanded string ("readtoken1() might die
+    // horribly", as busybox puts it), so the diagnostic is already on stderr and
+    // the trace goes out with the raw value.
+    let prefix = expanded.unwrap_or(ps4);
+    let line = format!("{prefix}{}\n", parts.join(" "));
+    let _ = match errout {
+        Some(target) => process::write_target(target, line.as_bytes()),
+        None => process::write_fd(sh, 2, line.as_bytes()),
+    };
+}
+
 fn run_simple(
     sh: &mut Shell,
     assigns: &[crate::ast::Assign],
@@ -732,10 +786,17 @@ fn run_simple(
             process::RedirOutcome::Failed => return Ok(()),
         };
         let result = (|| {
+            // dash traces the assignments as its `varlist`, with the values
+            // already expanded, and does it AFTER applying them.
+            let mut traced = Vec::with_capacity(assigns.len());
             for a in assigns {
                 let value = expand::expand_assign(sh, &a.value)?;
                 sh.set_var(&a.name, &value)?;
+                traced.push(format!("{}={}", a.name, value));
             }
+            // Through the stderr this command redirected AWAY from: `x=1 2>/dev/null`
+            // still traces, because dash traces to `preverrout` and not to fd 2.
+            trace(sh, &traced, saved.prev_stderr());
             if sh.cmdsubst_count == cmdsubst_before {
                 sh.set_status(0);
             }
@@ -745,9 +806,7 @@ fn run_simple(
         return result;
     }
 
-    if sh.opts.xtrace {
-        let _ = write_stderr(sh, &format!("+ {}", argv.join(" ")));
-    }
+    trace(sh, &argv, None);
 
     // A function call runs in the current shell with the assignments applied for
     // its duration and the words as its positional parameters.
@@ -1029,6 +1088,72 @@ mod tests {
             sh.exported_env().into_iter().map(|(k, _)| k).collect();
         env.sort();
         assert_eq!(env, ["before", "during"]);
+    }
+
+    #[test]
+    fn xtrace_uses_ps4_and_traces_assignments() {
+        // The prefix is the EXPANDED $PS4, re-expanded per command, so it can
+        // report state that changes as the script runs.
+        let (_, _, err) = run("PS4='[last=$?] '; set -x; false; echo ok");
+        assert_eq!(err, "[last=0] false\n[last=1] echo ok\n");
+        // An assignment-only command is traced too, with its values expanded and
+        // AFTER they are applied -- dash prints its varlist here.
+        let (_, out, err) = run("set -x; x=1 x=2; echo $x");
+        assert_eq!((out.as_str(), err.as_str()), ("2\n", "+ x=1 x=2\n+ echo 2\n"));
+        // dash seeds PS4 as a real variable; unsetting it leaves an EMPTY prefix
+        // rather than restoring the default, and the command is still traced.
+        let (_, out, _) = run("echo [$PS4]");
+        assert_eq!(out, "[+ ]\n");
+        let (_, _, err) = run("unset PS4; set -x; echo hi");
+        assert_eq!(err, "echo hi\n");
+        // $PS4 is read under double-quote rules and expanded quoted, so a quote
+        // character in it is literal rather than an unterminated quote, and
+        // neither tilde expansion nor globbing applies.
+        let (_, _, err) = run("PS4=\"it's ~/ * \"; set -x; echo hi");
+        assert_eq!(err, "it's ~/ * echo hi\n");
+        // A backslash escapes what it would inside `"..."`, with the one exception
+        // dash gets from scanning against a fake end marker: `\"` keeps its
+        // backslash where `\$` loses one.
+        let (_, _, err) = run(r#"PS4='\q \" \$ '; set -x; echo hi"#);
+        assert_eq!(err, "\\q \\\" $ echo hi\n");
+        // Traced to the stderr in force BEFORE this command's redirections --
+        // dash's `preverrout` -- so a command that redirects its own stderr away
+        // is still reported.
+        let (_, out, err) = run("set -x; x=1 2>/dev/null; echo $x");
+        assert_eq!((out.as_str(), err.as_str()), ("1\n", "+ x=1\n+ echo 1\n"));
+    }
+
+    #[test]
+    fn expanding_ps4_does_not_disturb_the_traced_command() {
+        // A `$(...)` in $PS4 runs a real command, but tracing only observes: it is
+        // not the traced command's own substitution, so it neither supplies its `$?`
+        // nor counts toward the rule that gives an assignment-only command the last
+        // substitution's status.
+        let (_, out, _) = run("set -x; PS4='$(false) '; x=1; echo $?");
+        assert_eq!(out, "0\n");
+        let (_, out, _) = run("PS4='$(true) '; set -x; false; echo status=$?");
+        assert_eq!(out, "status=1\n");
+        // A substitution in the assignment ITSELF still sets the status, as dash does.
+        let (_, out, _) = run("x=$(false); echo $?");
+        assert_eq!(out, "1\n");
+    }
+
+    #[test]
+    fn a_ps4_that_cannot_expand_does_not_stop_the_shell() {
+        // Both references wrap this one expansion in a handler and fall back to
+        // the raw string, so the script runs on. Verified against a dash 0.5.12
+        // built from source: it prints its diagnostic and still reports 0.
+        for ps4 in ["+${x", "+$(x", "+oops $(( 1 / 0 )) \\$"] {
+            let (status, out, _) =
+                run(&format!("PS4='{ps4}'; set -x; echo one; echo status=$?"));
+            assert_eq!((status, out.as_str()), (0, "one\nstatus=0\n"), "{ps4}");
+        }
+        // A LIVE command substitution in PS4 -- single-quoted, so it runs at
+        // trace time -- must expand once and not trace its own commands. The
+        // subshell it runs in inherits the guard, or this recurses until the
+        // depth cap.
+        let (status, out, err) = run("PS4='$(echo X)'; set -x; echo hi");
+        assert_eq!((status, out.as_str(), err.as_str()), (0, "hi\n", "Xecho hi\n"));
     }
 
     #[test]

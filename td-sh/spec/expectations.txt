@@ -1456,12 +1456,10 @@ xfail word-split.test.sh::4 x 3 table - with for loop
 xfail word-split.test.sh::IFS='' with $@ and $* and printf (bug #627)
 xfail word-split.test.sh::Regression: "${!v*}"x should not be split
 xfail word-split.test.sh::Unicode in IFS
-xfail xtrace.test.sh::Assignments and assign builtins
 xfail xtrace.test.sh::PS4 is scoped
 xfail xtrace.test.sh::PS4 with runtime error
 xfail xtrace.test.sh::PS4 with unterminated $(
 xfail xtrace.test.sh::PS4 with unterminated ${
-xfail xtrace.test.sh::Reading $? in PS4
 xfail xtrace.test.sh::Regression: xtrace for "a+=(v)"
 xfail xtrace.test.sh::Regression: xtrace for "declare -a a+=(v)"
 xfail xtrace.test.sh::[[ ]]
