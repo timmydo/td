@@ -1,0 +1,26 @@
+# td-txt conformance expectations overlay
+#
+# td-txt's known-gap manifest for the corpus in this directory (see spec/README).
+# Kept out of the case files so the vendored GNU suites stay byte-for-byte
+# pristine.
+#
+# GENERATED, not hand-curated, by examples/gen_expectations.rs: every case is run
+# once through the built td-txt in the isolated harness and bucketed. A passing
+# case is unlisted; every non-passing case is listed here so the gate stays green
+# while td-txt grows. As td-txt improves, a listed case that starts passing reds
+# the gate as an XPASS so it is promoted (removed here). Regenerate (do not
+# hand-edit) on a pin bump or when passes change:
+#   cargo build --release --manifest-path td-txt/Cargo.toml
+#   cargo run --release --manifest-path td-txt/Cargo.toml --example gen_expectations \
+#     -- td-txt/target/release/td-txt td-txt/spec > td-txt/spec/expectations.txt
+#
+# Format, one per line:   <xfail|skip> <corpus-file>::<case name>
+#   xfail = td-txt runs it and gets the wrong answer today. It still RUNS every
+#           gate; the failure is tolerated, a regression (an unlisted case that
+#           fails) reds the gate, and an unexpected PASS (XPASS) reds it so the
+#           entry is promoted.
+#   skip  = not run at all, because the case TIMED OUT: it would cost the shared
+#           gate the full per-case timeout for an answer already known to be
+#           wrong.
+#
+# EMPTY: td-txt passes every case in the corpus today.

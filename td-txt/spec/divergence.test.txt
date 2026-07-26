@@ -1,0 +1,68 @@
+# Where td-txt deliberately does NOT do what GNU does.
+#
+# Every other case file in this corpus takes its goldens from GNU grep 3.11 /
+# GNU sed 4.9 (see spec/README). These do not: each one pins a behavior td-txt
+# chooses differently ON PURPOSE, so the choice is a test rather than a comment
+# somebody can quietly delete. A case here that starts failing means td-txt
+# drifted from a decision, not from upstream.
+#
+# All of them fail CLOSED — a diagnosed error and a non-zero status, never a
+# silent no-op — so a script written for GNU cannot mistake a refusal for
+# success.
+
+#### sed refuses the e command, which would need a shell
+# GNU sed's `e` runs its argument through /bin/sh. td-txt is a static binary
+# with an empty runtime closure; a sed that spawns a shell puts the dependency
+# td is removing right back, and on the image would reach for the /bin/sh
+# td-sh is still replacing.
+## argv: sed '1e echo hi'
+## stdin:
+a
+## END
+## stdout-json: ""
+## status: 1
+## stderr-contains: the `e' command is not supported
+
+#### sed refuses the s///e flag for the same reason
+## argv: sed s/a/b/e
+## stdin:
+a
+## END
+## stdout-json: ""
+## status: 1
+## stderr-contains: the `e' flag is not supported
+
+#### grep refuses -P rather than pretending to have PCRE
+# GNU grep's -P switches to a whole second regex engine (PCRE). td-txt carries
+# one POSIX engine; accepting -P and quietly running POSIX semantics would
+# silently change what a script matches.
+## argv: grep -P a
+## stdin:
+a
+## END
+## stdout-json: ""
+## status: 2
+## stderr-contains: invalid option -- 'P'
+
+#### sed refuses --debug rather than accepting it as a no-op
+# GNU's --debug prints an annotated dump of the program and each cycle's state.
+# td-txt does not implement it. Accepting it silently would fail OPEN: a script
+# run for its debug output would produce none and still exit 0.
+## argv: sed --debug p
+## stdin:
+a
+## END
+## stdout-json: ""
+## status: 1
+## stderr-contains: unsupported option -- 'debug'
+
+#### sed refuses --follow-symlinks rather than accepting it as a no-op
+# It changes which file -i rewrites: GNU replaces the symlink's TARGET, td-txt
+# would replace the symlink. Silently ignoring it would edit the wrong file.
+## argv: sed --follow-symlinks -i s/a/b/ f
+## file f:
+a
+## END
+## stdout-json: ""
+## status: 1
+## stderr-contains: unsupported option -- 'follow-symlinks'

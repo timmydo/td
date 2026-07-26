@@ -1,0 +1,2158 @@
+# sed — the command language, addressing, options and diagnostics.
+#
+# td-txt-authored (see spec/README): the vendored GNU sed testsuite drives whole
+# SCRIPTS through `sed -f`, so it says little about sed as a PROGRAM — options,
+# per-command edge cases, exit statuses, in-place rewriting, what it refuses.
+# That is what lives here. Goldens were produced by running each case against
+# GNU sed 4.9 under LC_ALL=C.
+
+#### s replaces the first occurrence
+## argv: sed s/a/X/
+## stdin:
+aaa
+## END
+## stdout:
+Xaa
+## END
+## status: 0
+
+#### s///g replaces every occurrence
+## argv: sed s/a/X/g
+## stdin:
+aaa
+## END
+## stdout:
+XXX
+## END
+## status: 0
+
+#### s///N replaces only the Nth
+## argv: sed s/a/X/2
+## stdin:
+aaa
+## END
+## stdout:
+aXa
+## END
+## status: 0
+
+#### s///Ng replaces from the Nth on
+## argv: sed s/a/X/2g
+## stdin:
+aaaa
+## END
+## stdout:
+aXXX
+## END
+## status: 0
+
+#### s///p prints the changed line again
+## argv: sed -n s/a/X/p
+## stdin:
+aaa
+bbb
+## END
+## stdout:
+Xaa
+## END
+## status: 0
+
+#### s///I folds case
+## argv: sed s/A/x/I
+## stdin:
+aAa
+## END
+## stdout:
+xAa
+## END
+## status: 0
+
+#### & in the replacement is the whole match
+## argv: sed 's/b*/[&]/'
+## stdin:
+bbc
+## END
+## stdout:
+[bb]c
+## END
+## status: 0
+
+#### a group reference copies a capture
+## argv: sed "s/\\(a\\)\\(b\\)/\\2\\1/"
+## stdin:
+ab
+## END
+## stdout:
+ba
+## END
+## status: 0
+
+#### case conversion escapes apply to the rest
+## argv: sed "s/.*/\\U&/"
+## stdin:
+ab cd
+## END
+## stdout:
+AB CD
+## END
+## status: 0
+
+#### a single-character case escape applies once
+## argv: sed "s/.*/\\u&/"
+## stdin:
+ab cd
+## END
+## stdout:
+Ab cd
+## END
+## status: 0
+
+#### case conversion ends at backslash-E
+## argv: sed "s/\\(a*\\)\\(b*\\)/\\U\\1\\E\\2/"
+## stdin:
+aabb
+## END
+## stdout:
+AAbb
+## END
+## status: 0
+
+#### a hex escape in the replacement is a byte
+## argv: sed "s/x/\\x41/"
+## stdin:
+x
+## END
+## stdout:
+A
+## END
+## status: 0
+
+#### a newline escape in the replacement splits the line
+## argv: sed "s/ /\\n/"
+## stdin:
+a b
+## END
+## stdout:
+a
+b
+## END
+## status: 0
+
+#### an ampersand can be escaped to a literal
+## argv: sed "s/x/\\&/"
+## stdin:
+x
+## END
+## stdout:
+&
+## END
+## status: 0
+
+#### an alternate delimiter avoids escaping slashes
+## argv: sed 's,/usr,/opt,'
+## stdin:
+/usr/bin
+## END
+## stdout:
+/opt/bin
+## END
+## status: 0
+
+#### an escaped delimiter is literal in the regex
+## argv: sed "s/a\\/b/X/"
+## stdin:
+a/b
+## END
+## stdout:
+X
+## END
+## status: 0
+
+#### an empty regex reuses the last one
+## argv: sed 's/ab/X/;s//Y/'
+## stdin:
+abab
+## END
+## stdout:
+XY
+## END
+## status: 0
+
+#### an empty match advances by one byte
+## argv: sed 's/x*/-/g'
+## stdin:
+abc
+## END
+## stdout:
+-a-b-c-
+## END
+## status: 0
+
+#### -E takes extended syntax
+## argv: sed -E 's/(a|b)+/X/'
+## stdin:
+abab c
+## END
+## stdout:
+X c
+## END
+## status: 0
+
+#### -r is the same as -E
+## argv: sed -r 's/a{2}/X/'
+## stdin:
+aa
+## END
+## stdout:
+X
+## END
+## status: 0
+
+#### s///w writes matching lines to a file
+## argv: sed 's/a/X/w out'
+## file-json out: ""
+## stdin:
+a
+b
+## END
+## stdout:
+X
+b
+## END
+## status: 0
+## file-after out:
+X
+## END
+
+#### a line number selects one line
+## argv: sed 2d
+## stdin:
+a
+b
+c
+## END
+## stdout:
+a
+c
+## END
+## status: 0
+
+#### $ selects the last line
+## argv: sed '$d'
+## stdin:
+a
+b
+c
+## END
+## stdout:
+a
+b
+## END
+## status: 0
+
+#### a regex address selects matching lines
+## argv: sed /b/d
+## stdin:
+a
+b
+c
+## END
+## stdout:
+a
+c
+## END
+## status: 0
+
+#### a regex address takes an I flag
+## argv: sed /B/Id
+## stdin:
+a
+b
+c
+## END
+## stdout:
+a
+c
+## END
+## status: 0
+
+#### an alternate address delimiter is spelled backslash-c
+## argv: sed "\\%b%d"
+## stdin:
+a
+b
+c
+## END
+## stdout:
+a
+c
+## END
+## status: 0
+
+#### a two-address range is inclusive
+## argv: sed '2,3d'
+## stdin:
+one
+two
+three
+four
+five
+## END
+## stdout:
+one
+four
+five
+## END
+## status: 0
+
+#### a range ending in a regex closes at the match
+## argv: sed '/two/,/four/d'
+## stdin:
+one
+two
+three
+four
+five
+## END
+## stdout:
+one
+five
+## END
+## status: 0
+
+#### a range whose end is behind the start runs one line
+## argv: sed '3,1d'
+## stdin:
+one
+two
+three
+four
+five
+## END
+## stdout:
+one
+two
+four
+five
+## END
+## status: 0
+
+#### 0,/re/ can close on the first line
+## argv: sed '0,/one/d'
+## stdin:
+one
+two
+three
+four
+five
+## END
+## stdout:
+two
+three
+four
+five
+## END
+## status: 0
+
+#### 1,/re/ cannot close on the first line
+## argv: sed '1,/one/d'
+## stdin:
+one
+two
+three
+four
+five
+## END
+## stdout-json: ""
+## status: 0
+
+#### first~step selects an arithmetic sequence
+## argv: sed '1~2d'
+## stdin:
+one
+two
+three
+four
+five
+## END
+## stdout:
+two
+four
+## END
+## status: 0
+
+#### addr,+N selects N more lines
+## argv: sed '2,+2d'
+## stdin:
+one
+two
+three
+four
+five
+## END
+## stdout:
+one
+five
+## END
+## status: 0
+
+#### addr,~N runs to the next multiple
+## argv: sed '2,~4d'
+## stdin:
+one
+two
+three
+four
+five
+## END
+## stdout:
+one
+five
+## END
+## status: 0
+
+#### ! negates an address
+## argv: sed '2!d'
+## stdin:
+a
+b
+c
+## END
+## stdout:
+b
+## END
+## status: 0
+
+#### a bare $ address with no command is an error
+## argv: sed '$'
+## stdin:
+a
+b
+c
+## END
+## stdout-json: ""
+## status: 1
+## stderr-contains: sed:
+
+#### p prints the pattern space
+## argv: sed -n p
+## stdin:
+a
+b
+c
+## END
+## stdout:
+a
+b
+c
+## END
+## status: 0
+
+#### P prints up to the first newline
+## argv: sed -n 'N;P'
+## stdin:
+a
+b
+c
+## END
+## stdout:
+a
+## END
+## status: 0
+
+#### d deletes and starts the next cycle
+# The trailing `s` must NOT run on the deleted line — that is what distinguishes
+# `d` from a bare address, and asserting only the deletion would not show it.
+## argv: sed '/b/d;s/^/>/'
+## stdin:
+a
+b
+c
+## END
+## stdout:
+>a
+>c
+## END
+## status: 0
+
+#### D restarts the cycle on the remainder
+## argv: sed -n '$!N;P;D'
+## stdin:
+a
+b
+c
+## END
+## stdout:
+a
+b
+c
+## END
+## status: 0
+
+#### n prints and reads the next line
+## argv: sed 'n;d'
+## stdin:
+a
+b
+c
+d
+## END
+## stdout:
+a
+c
+## END
+## status: 0
+
+#### N appends the next line
+## argv: sed "N;s/\\n/-/"
+## stdin:
+a
+b
+## END
+## stdout:
+a-b
+## END
+## status: 0
+
+#### N at the last line prints and exits
+## argv: sed "$!N;s/\\n/-/"
+## stdin:
+a
+b
+c
+## END
+## stdout:
+a-b
+c
+## END
+## status: 0
+
+#### h and g move the pattern space through the hold space
+## argv: sed '1h;2g'
+## stdin:
+a
+b
+c
+## END
+## stdout:
+a
+a
+c
+## END
+## status: 0
+
+#### H and G append instead of replacing
+## argv: sed '1h;2G'
+## stdin:
+a
+b
+c
+## END
+## stdout:
+a
+b
+a
+c
+## END
+## status: 0
+
+#### x exchanges the two spaces
+## argv: sed '1{x;d};2x'
+## stdin:
+a
+b
+c
+## END
+## stdout:
+a
+c
+## END
+## status: 0
+
+#### y transliterates bytes
+## argv: sed y/abc/xyz/
+## stdin:
+cab
+## END
+## stdout:
+zxy
+## END
+## status: 0
+
+#### y takes escapes
+## argv: sed "y/a\\n/x\\t/"
+## stdin:
+a
+## END
+## stdout:
+x
+## END
+## status: 0
+
+#### = prints the line number
+## argv: sed -n =
+## stdin:
+a
+b
+c
+## END
+## stdout:
+1
+2
+3
+## END
+## status: 0
+
+#### l escapes non-printing bytes
+## argv: sed -n l
+## stdin:
+a	b\c
+## END
+## stdout:
+a\tb\\c$
+## END
+## status: 0
+
+#### l takes a wrap width
+## argv: sed -n 'l 5'
+## stdin:
+abcdefghij
+## END
+## stdout:
+abcd\
+efgh\
+ij$
+## END
+## status: 0
+
+#### a queues text after the line
+## argv: sed '1a hello'
+## stdin:
+a
+b
+c
+## END
+## stdout:
+a
+hello
+b
+c
+## END
+## status: 0
+
+#### i writes text before the line
+## argv: sed '2i hello'
+## stdin:
+a
+b
+c
+## END
+## stdout:
+a
+hello
+b
+c
+## END
+## status: 0
+
+#### c replaces the line
+## argv: sed '2c hello'
+## stdin:
+a
+b
+c
+## END
+## stdout:
+a
+hello
+c
+## END
+## status: 0
+
+#### c over a range prints once at the end
+## argv: sed '1,2c hello'
+## stdin:
+a
+b
+c
+## END
+## stdout:
+hello
+c
+## END
+## status: 0
+
+#### the classic a-backslash form takes the next line
+## argv: sed "1a\\\nhello"
+## stdin:
+a
+b
+c
+## END
+## stdout:
+a
+hello
+b
+c
+## END
+## status: 0
+
+#### q stops after the current line
+## argv: sed 2q
+## stdin:
+a
+b
+c
+## END
+## stdout:
+a
+b
+## END
+## status: 0
+
+#### q takes an exit status
+## argv: sed 2q5
+## stdin:
+a
+b
+c
+## END
+## stdout:
+a
+b
+## END
+## status: 5
+
+#### Q stops without printing
+## argv: sed 2Q
+## stdin:
+a
+b
+c
+## END
+## stdout:
+a
+## END
+## status: 0
+
+#### z empties the pattern space
+## argv: sed 2z
+## stdin:
+a
+b
+c
+## END
+## stdout:
+a
+
+c
+## END
+## status: 0
+
+#### r queues a whole file
+## argv: sed '1r extra'
+## file extra:
+X
+Y
+## END
+## stdin:
+a
+b
+c
+## END
+## stdout:
+a
+X
+Y
+b
+c
+## END
+## status: 0
+
+#### R queues one line of a file per use
+## argv: sed 'R extra'
+## file extra:
+X
+Y
+## END
+## stdin:
+a
+b
+c
+## END
+## stdout:
+a
+X
+b
+Y
+c
+## END
+## status: 0
+
+#### w writes the pattern space to a file
+## argv: sed -n 'w out'
+## file-json out: ""
+## stdin:
+a
+b
+c
+## END
+## stdout-json: ""
+## status: 0
+## file-after out:
+a
+b
+c
+## END
+
+#### w /dev/stdout writes to standard output
+## argv: sed -n 'w /dev/stdout'
+## stdin:
+a
+b
+c
+## END
+## stdout:
+a
+b
+c
+## END
+## status: 0
+
+#### a block groups commands under one address
+## argv: sed '2{s/b/X/;p}'
+## stdin:
+a
+b
+c
+## END
+## stdout:
+a
+X
+X
+c
+## END
+## status: 0
+
+#### a label and branch make a loop
+## argv: sed ':a;s/aa/a/;ta'
+## stdin:
+aaaa
+## END
+## stdout:
+a
+## END
+## status: 0
+
+#### t branches only after a substitution
+## argv: sed 's/x/y/;t;s/a/b/'
+## stdin:
+a
+## END
+## stdout:
+b
+## END
+## status: 0
+
+#### T branches when none happened
+## argv: sed 's/x/y/;T;s/a/b/'
+## stdin:
+a
+## END
+## stdout:
+a
+## END
+## status: 0
+
+#### b with no label ends the cycle
+## argv: sed '/b/b;s/./X/'
+## stdin:
+a
+b
+c
+## END
+## stdout:
+X
+b
+X
+## END
+## status: 0
+
+#### a comment runs to the end of the line
+## argv: sed "# nothing\np"
+## stdin:
+a
+## END
+## stdout:
+a
+a
+## END
+## status: 0
+
+#### #n on the first line suppresses auto-print
+## argv: sed "#n\np"
+## stdin:
+a
+## END
+## stdout:
+a
+## END
+## status: 0
+
+#### -n suppresses the automatic print
+## argv: sed -n 2p
+## stdin:
+a
+b
+c
+## END
+## stdout:
+b
+## END
+## status: 0
+
+#### -e concatenates script fragments
+## argv: sed -e 1d -e '$d'
+## stdin:
+a
+b
+c
+## END
+## stdout:
+b
+## END
+## status: 0
+
+#### -f reads the script from a file
+## argv: sed -f prog.sed
+## file prog.sed:
+2d
+## END
+## stdin:
+a
+b
+c
+## END
+## stdout:
+a
+c
+## END
+## status: 0
+
+#### two files are one stream by default
+## argv: sed -n '$=' f1 f2
+## file f1:
+a
+b
+## END
+## file f2:
+c
+## END
+## stdout:
+3
+## END
+## status: 0
+
+#### -s treats each file separately
+## argv: sed -n -s '$=' f1 f2
+## file f1:
+a
+b
+## END
+## file f2:
+c
+## END
+## stdout:
+2
+1
+## END
+## status: 0
+
+#### -i rewrites the file in place
+## argv: sed -i s/a/X/ f1
+## file f1:
+a
+b
+## END
+## stdout-json: ""
+## status: 0
+## file-after f1:
+X
+b
+## END
+
+#### -i with a suffix keeps a backup
+## argv: sed -i.bak s/a/X/ f1
+## file f1:
+a
+b
+## END
+## stdout-json: ""
+## status: 0
+## file-after f1:
+X
+b
+## END
+
+#### a missing final newline is preserved
+## argv: sed s/a/X/
+## stdin-json: "a"
+## stdout-json: "X"
+## status: 0
+
+#### a missing file is a diagnosed error
+## argv: sed p nosuch
+## stdout-json: ""
+## status: 2
+## stderr-contains: nosuch
+
+#### an unknown command is refused
+## argv: sed k
+## stdin:
+a
+b
+c
+## END
+## stdout-json: ""
+## status: 1
+## stderr-contains: sed:
+
+#### an unterminated s command is refused
+## argv: sed s/a/b
+## stdin:
+a
+b
+c
+## END
+## stdout-json: ""
+## status: 1
+## stderr-contains: sed:
+
+#### an unmatched block is refused
+## argv: sed '{p'
+## stdin:
+a
+b
+c
+## END
+## stdout-json: ""
+## status: 1
+## stderr-contains: sed:
+
+#### a branch to a missing label is refused
+## argv: sed 'b nowhere'
+## stdin:
+a
+b
+c
+## END
+## stdout-json: ""
+## status: 4
+## stderr-contains: sed:
+
+#### no script at all is a usage error
+## argv: sed
+## stdout-json: ""
+## status: 1
+
+#### nested blocks nest their addresses
+## argv: sed '2{/b/{s/b/X/}}'
+## stdin:
+a
+b
+c
+## END
+## stdout:
+a
+X
+c
+## END
+## status: 0
+
+#### a block can hold several commands
+## argv: sed '/two/{s/t/T/;s/o/O/;}'
+## stdin:
+one
+two
+three
+four
+five
+## END
+## stdout:
+one
+TwO
+three
+four
+five
+## END
+## status: 0
+
+#### a semicolon inside a text argument is literal
+## argv: sed '1a x;y'
+## stdin:
+a
+b
+c
+## END
+## stdout:
+a
+x;y
+b
+c
+## END
+## status: 0
+
+#### a and i accept a leading backslash form with continuation
+## argv: sed "1a\\\nfirst\\\nsecond"
+## stdin:
+a
+b
+c
+## END
+## stdout:
+a
+first
+second
+b
+c
+## END
+## status: 0
+
+#### -z separates records by NUL
+## argv: sed -z s/a/X/
+## stdin-json: "a\x00b\x00"
+## stdout-json: "X\x00b\x00"
+## status: 0
+
+#### --posix drops the GNU N-at-EOF behavior
+## argv: sed --posix '$!d;N'
+## stdin:
+a
+b
+c
+## END
+## stdout-json: ""
+## status: 0
+
+#### N at EOF prints the pattern space by default
+## argv: sed N
+## stdin:
+a
+b
+c
+## END
+## stdout:
+a
+b
+c
+## END
+## status: 0
+
+#### 0~3 selects every third line
+## argv: sed -n '0~3p'
+## stdin:
+1
+2
+3
+4
+5
+6
+## END
+## stdout:
+3
+6
+## END
+## status: 0
+
+#### the M flag anchors at embedded newlines
+## argv: sed -n 'N;/^b$/Mp'
+## stdin:
+a
+b
+c
+## END
+## stdout:
+a
+b
+## END
+## status: 0
+
+#### the m flag is the same as M
+## argv: sed 'N;s/^b$/X/M'
+## stdin:
+a
+b
+c
+## END
+## stdout:
+a
+X
+c
+## END
+## status: 0
+
+#### backtick and quote anchor the buffer, not the line
+## argv: sed "N;s/\\`a/X/"
+## stdin:
+a
+b
+c
+## END
+## stdout:
+X
+b
+c
+## END
+## status: 0
+
+#### l wraps at the default width
+## argv: sed -n l
+## stdin:
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+## END
+## stdout:
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx$
+## END
+## status: 0
+
+#### l 0 disables wrapping
+## argv: sed -n 'l 0'
+## stdin:
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+## END
+## stdout:
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx$
+## END
+## status: 0
+
+#### --expression is the long form of -e
+## argv: sed --expression=2d
+## stdin:
+a
+b
+c
+## END
+## stdout:
+a
+c
+## END
+## status: 0
+
+#### --file is the long form of -f
+## argv: sed --file=prog.sed
+## file prog.sed:
+2d
+## END
+## stdin:
+a
+b
+c
+## END
+## stdout:
+a
+c
+## END
+## status: 0
+
+#### --quiet is the long form of -n
+## argv: sed --quiet 2p
+## stdin:
+a
+b
+c
+## END
+## stdout:
+b
+## END
+## status: 0
+
+#### clustered -ne applies both
+## argv: sed -ne 2p
+## stdin:
+a
+b
+c
+## END
+## stdout:
+b
+## END
+## status: 0
+
+#### a script fragment can end mid-block and continue in the next -e
+## argv: sed -e '2{' -e s/b/X/ -e '}'
+## stdin:
+a
+b
+c
+## END
+## stdout:
+a
+X
+c
+## END
+## status: 0
+
+#### w /dev/stderr writes to standard error
+## argv: sed -n 'w /dev/stderr'
+## stdin:
+a
+## END
+## stdout-json: ""
+## status: 0
+## stderr-contains: a
+
+#### W writes only the first line of the pattern space
+## argv: sed -n 'N;W out'
+## file-json out: ""
+## stdin:
+a
+b
+c
+## END
+## stdout-json: ""
+## status: 0
+## file-after out:
+a
+## END
+
+#### a w file is truncated once, not per line
+## argv: sed -n 'w out'
+## file out:
+stale
+## END
+## stdin:
+a
+b
+c
+## END
+## stdout-json: ""
+## status: 0
+## file-after out:
+a
+b
+c
+## END
+
+#### -i on several files rewrites each
+## argv: sed -i 's/^/X/' f1 f2
+## file f1:
+a
+## END
+## file f2:
+b
+## END
+## stdout-json: ""
+## status: 0
+## file-after f1:
+Xa
+## END
+## file-after f2:
+Xb
+## END
+
+#### -i keeps line numbers per file
+## argv: sed -i -n '$=' f1 f2
+## file f1:
+a
+b
+## END
+## file f2:
+c
+## END
+## stdout-json: ""
+## status: 0
+## file-after f1:
+2
+## END
+## file-after f2:
+1
+## END
+
+#### q inside -i stops that file
+## argv: sed -i 1q f1
+## file f1:
+a
+b
+## END
+## stdout-json: ""
+## status: 0
+## file-after f1:
+a
+## END
+
+#### a regex address may span the pattern space after N
+## argv: sed -n "N;/a\\nb/p"
+## stdin:
+a
+b
+c
+## END
+## stdout:
+a
+b
+## END
+## status: 0
+
+#### an address regex sets the last regex for s//
+## argv: sed /b/s//X/
+## stdin:
+a
+b
+c
+## END
+## stdout:
+a
+X
+c
+## END
+## status: 0
+
+#### s with no previous regex is refused
+## argv: sed s//X/
+## stdin:
+a
+b
+c
+## END
+## stdout-json: ""
+## status: 1
+## stderr-contains: sed:
+
+#### an invalid option is refused
+## argv: sed -k p
+## stdin:
+a
+b
+c
+## END
+## stdout-json: ""
+## status: 1
+## stderr-contains: sed:
+
+#### y with unequal strings is refused
+## argv: sed y/ab/x/
+## stdin:
+a
+b
+c
+## END
+## stdout-json: ""
+## status: 1
+## stderr-contains: sed:
+
+#### s with a zero occurrence is refused
+## argv: sed s/a/X/0
+## stdin:
+a
+b
+c
+## END
+## stdout-json: ""
+## status: 1
+## stderr-contains: sed:
+
+#### an unknown s flag is refused
+## argv: sed s/a/X/Z
+## stdin:
+a
+b
+c
+## END
+## stdout-json: ""
+## status: 1
+## stderr-contains: sed:
+
+#### a stray closing brace is refused
+## argv: sed 'p}'
+## stdin:
+a
+b
+c
+## END
+## stdout-json: ""
+## status: 1
+## stderr-contains: sed:
+
+#### an unterminated last line stays unterminated on output
+## argv: sed -n p
+## stdin-json: "a"
+## stdout-json: "a"
+## status: 0
+## stderr-json: ""
+
+#### the missing final newline is owed, not dropped, when more output follows
+## argv: sed p
+## stdin-json: "a\nb"
+## stdout-json: "a\na\nb\nb"
+## status: 0
+## stderr-json: ""
+
+#### P and p both lag the separator on an unterminated line
+## argv: sed -n 'P;p'
+## stdin-json: "a\nb"
+## stdout-json: "a\na\nb\nb"
+## status: 0
+## stderr-json: ""
+
+#### P prints through an embedded newline even when the pattern space is unterminated
+## argv: sed -n 'N;P'
+## stdin-json: "a\nb"
+## stdout:
+a
+## END
+## status: 0
+## stderr-json: ""
+
+#### a substitution with p keeps the unterminated tail unterminated
+## argv: sed -n s/a/X/p
+## stdin-json: "a"
+## stdout-json: "X"
+## status: 0
+## stderr-json: ""
+
+#### w copies the input line's terminator, not an unconditional one
+## argv: sed -n 'w out'
+## stdin-json: "a"
+## stdout-json: ""
+## file-after-json out: "a"
+## status: 0
+## stderr-json: ""
+
+#### addr,~N runs to the NEXT multiple even when the start line is one
+## argv: sed -n '4,~2p'
+## stdin:
+1
+2
+3
+4
+5
+6
+7
+## END
+## stdout:
+4
+5
+6
+## END
+## status: 0
+## stderr-json: ""
+
+#### addr,~N from a non-multiple stops at the first multiple
+## argv: sed -n '3,~4p'
+## stdin:
+1
+2
+3
+4
+5
+6
+7
+8
+9
+## END
+## stdout:
+3
+4
+## END
+## status: 0
+## stderr-json: ""
+
+#### a backreference the pattern cannot supply is a script error
+## argv: sed 's/a/\1/'
+## stdin:
+a
+## END
+## stdout-json: ""
+## status: 1
+## stderr-contains: invalid reference
+
+#### a backreference within range is expanded
+## argv: sed 's/\(a\)/[\1]/'
+## stdin:
+a
+## END
+## stdout:
+[a]
+## END
+## status: 0
+## stderr-json: ""
+
+#### --sandbox refuses the w command
+## argv: sed --sandbox 'w out'
+## stdin:
+a
+## END
+## stdout-json: ""
+## status: 1
+## stderr-contains: sandbox
+
+#### --sandbox refuses the w flag of s
+## argv: sed --sandbox 's/a/b/w out'
+## stdin:
+a
+## END
+## stdout-json: ""
+## status: 1
+## stderr-contains: sandbox
+
+#### --sandbox refuses the r command
+## argv: sed --sandbox 'r out'
+## stdin:
+a
+## END
+## stdout-json: ""
+## status: 1
+## stderr-contains: sandbox
+
+#### --sandbox allows a script that only edits the stream
+## argv: sed --sandbox s/a/b/
+## stdin:
+a
+## END
+## stdout:
+b
+## END
+## status: 0
+## stderr-json: ""
+
+#### F names the file each line came from across concatenated operands
+## argv: sed -n F f1 f2
+## file f1:
+1
+2
+## END
+## file f2:
+3
+## END
+## stdout:
+f1
+f1
+f2
+## END
+## status: 0
+## stderr-json: ""
+
+#### F names stdin as -
+## argv: sed -n F
+## stdin:
+1
+## END
+## stdout:
+-
+## END
+## status: 0
+## stderr-json: ""
+
+#### R interleaves one line of its file per cycle
+## argv: sed 'R f1'
+## file f1:
+1
+2
+3
+## END
+## stdin:
+a
+b
+## END
+## stdout:
+a
+1
+b
+2
+## END
+## status: 0
+## stderr-json: ""
+
+#### R stops silently when its file runs out
+## argv: sed 'R f1'
+## file f1:
+1
+## END
+## stdin:
+a
+b
+c
+## END
+## stdout:
+a
+1
+b
+c
+## END
+## status: 0
+## stderr-json: ""
+
+#### R of a missing file appends nothing
+## argv: sed 'R nope'
+## stdin:
+a
+## END
+## stdout:
+a
+## END
+## status: 0
+## stderr-json: ""
+
+#### a line-number range start is absolute, so N cannot skip past it
+## argv: sed -n 'N;1,2p'
+## stdin:
+1
+2
+3
+4
+5
+6
+7
+8
+## END
+## stdout:
+1
+2
+## END
+## status: 0
+## stderr-json: ""
+
+#### n likewise cannot skip a line-number range start
+## argv: sed -n 'n;1,2p'
+## stdin:
+1
+2
+3
+4
+5
+6
+7
+8
+## END
+## stdout:
+2
+## END
+## status: 0
+## stderr-json: ""
+
+#### a line-number range overshot past its end selects nothing
+## argv: sed -n 'N;N;1,2p'
+## stdin:
+1
+2
+3
+4
+5
+6
+7
+8
+## END
+## stdout-json: ""
+## status: 0
+## stderr-json: ""
+
+#### a line-number range overshot but still within its end selects
+## argv: sed -n 'N;N;1,5p'
+## stdin:
+1
+2
+3
+4
+5
+6
+7
+8
+## END
+## stdout:
+1
+2
+3
+## END
+## status: 0
+## stderr-json: ""
+
+#### a line-number range still ends on its own start line
+## argv: sed -n 3,1p
+## stdin:
+1
+2
+3
+4
+5
+6
+7
+8
+## END
+## stdout:
+3
+## END
+## status: 0
+## stderr-json: ""
+
+#### a closed line-number range never re-arms
+## argv: sed -n 2,3p
+## stdin:
+1
+2
+3
+4
+5
+6
+7
+8
+## END
+## stdout:
+2
+3
+## END
+## status: 0
+## stderr-json: ""
+
+#### a regex-started range always selects at least its first line
+## argv: sed -n /4/,2p
+## stdin:
+1
+2
+3
+4
+5
+6
+7
+8
+## END
+## stdout:
+4
+## END
+## status: 0
+## stderr-json: ""
+
+#### a regex end always includes at least two lines
+## argv: sed -n 'N;N;1,/zzz/p'
+## stdin:
+1
+2
+3
+4
+5
+6
+7
+8
+## END
+## stdout:
+1
+2
+3
+4
+5
+6
+## END
+## status: 0
+## stderr-json: ""
+
+#### addr,+N measures from the line the range started on
+## argv: sed -n 'N;N;1,+1p'
+## stdin:
+1
+2
+3
+4
+5
+6
+7
+8
+## END
+## stdout:
+1
+2
+3
+4
+5
+6
+## END
+## status: 0
+## stderr-json: ""
+
+#### -z joins the pattern space with NUL, not newline
+## argv: sed -z 'N;s/\x00/-/'
+## stdin-json: "a\u0000b\u0000"
+## stdout-json: "a-b\u0000"
+## status: 0
+## stderr-json: ""
+
+#### -z splits P on NUL
+## argv: sed -z -n 'N;P'
+## stdin-json: "a\u0000b\u0000"
+## stdout-json: "a\u0000"
+## status: 0
+## stderr-json: ""
+
+#### -z splits D on NUL
+## argv: sed -z 'N;D'
+## stdin-json: "a\u0000b\u0000"
+## stdout-json: "b\u0000"
+## status: 0
+## stderr-json: ""
+
+#### -z joins the hold space with NUL
+## argv: sed -z -n '1h;2{H;x;s/\x00/-/g;p}'
+## stdin-json: "a\u0000b\u0000"
+## stdout-json: "a-b\u0000"
+## status: 0
+## stderr-json: ""
+
+#### -z terminates = with NUL
+## argv: sed -z -n =
+## stdin-json: "a\u0000b\u0000"
+## stdout-json: "1\u00002\u0000"
+## status: 0
+## stderr-json: ""
+
+#### -z terminates F with NUL
+## argv: sed -z -n F
+## stdin-json: "a\u0000b\u0000"
+## stdout-json: "-\u0000-\u0000"
+## status: 0
+## stderr-json: ""
+
+#### -z terminates l with NUL
+## argv: sed -z -n l
+## stdin-json: "a\u0000b\u0000"
+## stdout-json: "a$\u0000b$\u0000"
+## status: 0
+## stderr-json: ""
+
+#### r with no filename is a script error
+## argv: sed r
+## stdin:
+a
+## END
+## stdout-json: ""
+## status: 1
+## stderr-contains: missing filename
+
+#### w with no filename is a script error
+## argv: sed w
+## stdin:
+a
+## END
+## stdout-json: ""
+## status: 1
+## stderr-contains: missing filename
+
+#### the s///w flag with no filename is a script error
+## argv: sed s/a/b/w
+## stdin:
+a
+## END
+## stdout-json: ""
+## status: 1
+## stderr-contains: missing filename
+
+#### q masks an exit status wider than a byte
+## argv: sed 2q300
+## stdin:
+1
+2
+3
+4
+5
+6
+7
+8
+## END
+## stdout:
+1
+2
+## END
+## status: 44
+## stderr-json: ""
+
+#### an unreadable script file is a runtime failure, not a bad script
+## argv: sed -f nosuch
+## stdin:
+a
+## END
+## stdout-json: ""
+## status: 4
+
+#### an unambiguous long-option prefix is accepted
+## argv: sed --quie -e 2p
+## stdin:
+a
+b
+## END
+## stdout:
+b
+## END
+## status: 0
+## stderr-json: ""
+
+#### an ambiguous long-option prefix is refused
+## argv: sed --s 2p
+## stdin:
+a
+b
+## END
+## stdout-json: ""
+## status: 1
+## stderr-contains: ambiguous
+
+#### 0,/re/ is open before line 1, so n cannot skip past its start
+## argv: sed -n 'n;0,/2/p'
+## stdin:
+1
+2
+3
+## END
+## stdout:
+2
+## END
+## status: 0
+## stderr-json: ""
+
+#### 0,/re/ can end on line 1
+## argv: sed -n 0,/1/p
+## stdin:
+1
+2
+3
+## END
+## stdout:
+1
+## END
+## status: 0
+## stderr-json: ""
+
+#### 0,/re/ that never matches runs to the end
+## argv: sed -n 0,/zzz/p
+## stdin:
+1
+2
+3
+## END
+## stdout:
+1
+2
+3
+## END
+## status: 0
+## stderr-json: ""
+
+#### -z terminates i text with NUL
+## argv: sed -z 'i\X'
+## stdin-json: "a\u0000b\u0000"
+## stdout-json: "X\u0000a\u0000X\u0000b\u0000"
+## status: 0
+## stderr-json: ""
+
+#### -z terminates c text with NUL
+## argv: sed -z 'c\X'
+## stdin-json: "a\u0000b\u0000"
+## stdout-json: "X\u0000X\u0000"
+## status: 0
+## stderr-json: ""
+
+#### -z still terminates appended a text with a newline, as GNU does
+## argv: sed -z 'a\X'
+## stdin-json: "a\u0000b\u0000"
+## stdout-json: "a\u0000X\nb\u0000X\n"
+## status: 0
+## stderr-json: ""
+
+#### appended text is terminated even after an unterminated last line
+## argv: sed '$a\X'
+## stdin-json: "a\nb"
+## stdout:
+a
+b
+X
+## END
+## status: 0
+## stderr-json: ""
+
+#### W writes the first record's own terminator
+## argv: sed -n 'N;W out'
+## stdin-json: "a\nb"
+## stdout-json: ""
+## file-after out:
+a
+## END
+## status: 0
+## stderr-json: ""
+
+#### c over a range ending at $ prints its text on a one-line file
+## argv: sed '1,$c\TEXT'
+## stdin:
+a
+## END
+## stdout:
+TEXT
+## END
+## status: 0
+## stderr-json: ""
+
+#### c over a range ending at $ prints once at the end
+## argv: sed '2,$c\TEXT'
+## stdin:
+a
+b
+c
+## END
+## stdout:
+a
+TEXT
+## END
+## status: 0
+## stderr-json: ""
+
+#### G takes the hold space's terminator, not the input line's
+## argv: sed G
+## stdin-json: "a\nb"
+## stdout:
+a
+
+b
+
+## END
+## status: 0
+## stderr-json: ""
+
+#### x swaps the terminator along with the buffers
+## argv: sed x
+## stdin-json: "a\nb"
+## stdout:
+
+a
+## END
+## status: 0
+## stderr-json: ""
+
+#### H then x carries the pattern space's terminator into the hold space
+## argv: sed -n 'H;${x;p}'
+## stdin-json: "a\nb"
+## stdout-json: "\na\nb"
+## status: 0
+## stderr-json: ""
+
+#### q refuses a two-address range
+## argv: sed 1,2q
+## stdin:
+a
+## END
+## stdout-json: ""
+## status: 1
+## stderr-contains: command only uses one address
+
+#### Q refuses a two-address range
+## argv: sed 1,2Q
+## stdin:
+a
+## END
+## stdout-json: ""
+## status: 1
+## stderr-contains: command only uses one address
+
+#### a label refuses an address
+## argv: sed 1:foo
+## stdin:
+a
+## END
+## stdout-json: ""
+## status: 1
+## stderr-contains: doesn't want any addresses

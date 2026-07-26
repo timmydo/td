@@ -1,0 +1,56 @@
+[package]
+name = "td-txt"
+version = "0.1.0"
+edition = "2021"
+description = "td's target-built text userland (busybox grep/sed replacement): multicall + conformance harness"
+license = "GPL-3.0-or-later"
+
+# The SHIPPED multicall is the `td-txt` bin (src/main.rs), compiled directly by
+# rustc from recipes/src/recipes/td-txt.rs (never `cargo build`) into a static
+# ET_EXEC. It dispatches on argv[0]'s basename like busybox, so /bin/grep and
+# /bin/sed are symlinks to it.
+[[bin]]
+name = "td-txt"
+path = "src/main.rs"
+
+# The `td_txt` lib is host-side CONFORMANCE TOOLING only: zero-dependency readers
+# for the vendored GNU grep/sed corpora and td-txt's own case format, plus a
+# runner and the xfail/skip overlay. It is NOT compiled into the shipped binary
+# (the recipe builds src/main.rs and its sibling modules alone).
+# tests/conformance.rs drives the corpus through the built `td-txt` bin.
+[lib]
+name = "td_txt"
+path = "src/lib.rs"
+
+# td-txt is a TARGET-built program, NOT part of the control-plane engine
+# workspace. It is standalone (workspace `exclude`) with its own one-self-entry
+# Cargo.lock, so the engine's 3-package lock gate never inspects it. Zero
+# external dependencies (pure std) — a grep/sed is a regex engine plus line I/O,
+# both of which std covers.
+#
+# The engine root `exclude`s td-txt, but that only stops cargo at THAT manifest.
+# From a nested checkout (.claude/worktrees/* lives physically under the main
+# checkout) cargo walks past the excluding root and is captured by the OUTER
+# manifest, which lists the nested path as neither member nor exclude. An
+# explicit empty `[workspace]` pins THIS as the root and stops the walk (mirrors
+# td-sh/td-kexec/td-netd).
+[workspace]
+
+[lints.clippy]
+unwrap_used = "deny"       # no panicking .unwrap(); return Result/Option, use ?
+expect_used = "deny"       # no panicking .expect()
+panic = "deny"             # no panic! on the happy/error path
+unreachable = "deny"
+todo = "deny"
+unimplemented = "deny"
+indexing_slicing = "deny"  # use .get(i) over xs[i] / &xs[a..b]
+
+# The shipped td-txt is built by recipes/src/recipes/td-txt.rs invoking rustc
+# DIRECTLY with +crt-static (mirroring td-sh); that recipe restates opt-level=s /
+# panic=abort / strip. This profile governs only local `cargo build --release`.
+# lto is dropped: a single-crate direct rustc build cannot mirror it, so
+# declaring it here would be a contract the artifact ignores.
+[profile.release]
+opt-level = "s"
+panic = "abort"
+strip = true

@@ -1,0 +1,124 @@
+td-txt conformance corpus
+=========================
+
+The cases the td-txt conformance gate runs (see ../tests/conformance.rs). Three
+provenances live here, and the harness (../src/lib.rs) reads all three into one
+case type — argv, input files, stdin, expected stdout/stderr/status.
+
+Why not one upstream corpus, the way td-sh vendors Oils' spec files: grep and
+sed have no single self-contained suite with recorded goldens. What they have is
+better in one way and worse in another — their upstream tests are DATA files
+whose expected result is already written down (so no oracle binary is needed in
+an offline sandbox), but that data covers the REGEX ENGINE and whole SCRIPTS,
+not the programs' option surface. Hence the split below.
+
+
+Vendored from GNU grep, UNMODIFIED
+----------------------------------
+  gnu-grep/bre.tests
+  gnu-grep/ere.tests
+  gnu-grep/spencer1.tests
+  gnu-grep/khadafy.regexp
+  gnu-grep/khadafy.lines
+
+  Upstream:  https://ftp.gnu.org/gnu/grep/grep-3.11.tar.xz
+  SHA-256:   1db2aedde89d0dea42b16d9528f894c8d15dae4e190b59aecc78f5a951276eab
+  Path:      tests/<file>  (copied byte-for-byte)
+  License:   GPL-3.0-or-later (GNU grep). Copyright the Free Software Foundation.
+
+  Selection rule (reproducible from the pin): the DATA files of grep's own
+  regression suite — the three Spencer-format `.tests` files plus the Khadafy
+  pair. Everything else under tests/ is a shell script driven by gnulib's
+  init.sh, which needs a shell, a built grep tree and `$srcdir`; those are the
+  scripts this corpus deliberately does not import.
+
+  Row grammar (`<status>@<pattern>@<input>`) and the invocation come from
+  upstream's own awk drivers at that pin. bre.awk emits
+
+      status=$(echo '<input>' | { grep -e '<pattern>' >/dev/null 2>&1; echo $?; })
+
+  and ere.awk/spencer1.awk the same with `-E`. So this corpus runs
+  `grep [-E] -e <pattern>` with `<input>` (plus a newline, as `echo` writes it)
+  on stdin and asserts ONLY the exit status — upstream discards the output. A
+  row with a FOURTH field is upstream's own "expected non-conformance" marker
+  (`TO CORRECT`, `NO ALTERNATION`): its awk driver does not assert those rows,
+  and neither does the reader here.
+
+  The Khadafy case is upstream's `khadafy` test: one ERE read with `-f` over 32
+  spellings, all of which must come back unchanged.
+
+
+Vendored from GNU sed, UNMODIFIED
+---------------------------------
+  gnu-sed/<name>.sed  +  <name>.inp  +  <name>.good   (35 triples)
+
+  Upstream:  https://ftp.gnu.org/gnu/sed/sed-4.2.2.tar.gz
+  SHA-256:   fea0a94d4b605894f3e2d5572e3f96e4413bcad3a085aae7367c2cf07908b2ff
+  Path:      testsuite/<file>  (copied byte-for-byte)
+  License:   GPL-3.0-or-later (GNU sed). Copyright the Free Software Foundation.
+
+  Selection rule (reproducible from the pin): exactly the test names listed in
+  the FIRST, uniform recipe of upstream's testsuite/Makefile.tests —
+
+      enable sep inclib 8bit 8to7 newjis xabcx dollar noeol bkslashes numsub
+      head madding mac-mf empty xbxcx xbxcx3 recall recall2 xemacs appquit
+      fasts uniq manis linecnt khadafy allsub flipcase space modulo y-bracket
+      y-newline insert brackets amp-escape
+
+  — the ones upstream runs as plain
+
+      LC_ALL=C sed -f <name>.sed < <name>.inp   |cmp -   <name>.good
+
+  with no other flag or environment. That is why this pin is 4.2.2 rather than
+  the current 4.9: 4.9 converted most of these into shell scripts, and the
+  triples are the part that needs no shell. Names upstream runs differently
+  (`0range` needs `-s`, `badenc`/`utf8-*` need a UTF-8 locale, `stdin` pipes two
+  seds) are deliberately NOT here: importing them would mean encoding an
+  invocation this corpus cannot read off the data.
+
+  Why 4.2.2's goldens are still the right target: these cases exercise POSIX sed
+  behavior that did not change between 4.2.2 and 4.9. Where td-txt is scored
+  against NEWER sed behavior, that lives in sed-cli.test.txt below, whose
+  goldens come from 4.9.
+
+
+td-txt-authored case files
+--------------------------
+  grep-cli.test.txt   the grep option surface, prefixes, exit statuses, refusals
+  sed-cli.test.txt    the sed command language, options, in-place editing, refusals
+  divergence.test.txt where td-txt deliberately differs from GNU
+
+  Format: see the module header of ../src/lib.rs. `#### desc` opens a case,
+  `## argv:` gives the command (argv[0] is the applet), `## stdin:`…`## END`
+  and friends carry verbatim blocks, and `-json` spellings carry exact bytes
+  where a block cannot (no trailing newline, a NUL).
+
+  Provenance of the goldens: every case in grep-cli.test.txt and
+  sed-cli.test.txt was RUN against the GNU program under LC_ALL=C, and its real
+  stdout/status recorded here — GNU grep 3.11 and GNU sed 4.9, both from the
+  authoring host's store. So these are upstream goldens too, just captured by
+  running rather than copied from a file. To re-derive one by hand:
+
+      printf '<the stdin block>' | grep <the argv, minus argv[0]>; echo $?
+
+  divergence.test.txt is the exception, and says so in its own header: those
+  goldens are td-txt's, pinning behavior it chooses differently on purpose (no
+  shell-executing `sed e`, no PCRE `grep -P`, no `sed --debug`). Its cases are
+  the record of those decisions.
+
+
+Overlay
+-------
+  expectations.txt   td-txt's known-gap manifest (xfail / skip). Not a case file.
+                     GENERATED, not hand-edited, by ../examples/gen_expectations.rs.
+                     See its header for the xfail/skip semantics. Regenerate on a
+                     pin bump or when passes change:
+
+                       cargo build --release --manifest-path td-txt/Cargo.toml
+                       cargo run --release --manifest-path td-txt/Cargo.toml \
+                         --example gen_expectations -- \
+                         td-txt/target/release/td-txt td-txt/spec > td-txt/spec/expectations.txt
+
+                     It is EMPTY today: td-txt passes every case in this corpus.
+                     That is a statement about the corpus as much as about
+                     td-txt — growing the corpus is how the next gap gets found.

@@ -1,0 +1,1580 @@
+# grep — the option surface, exit statuses and diagnostics.
+#
+# td-txt-authored (see spec/README): the vendored GNU suites cover the REGEX
+# engine and assert only an exit status, so everything about grep as a PROGRAM —
+# which lines it prints, how it prefixes them, what it exits with, what it
+# refuses — lives here. Goldens were produced by running each case against GNU
+# grep 3.11 under LC_ALL=C.
+
+#### a matching pattern selects the line and exits 0
+## argv: grep apple
+## stdin:
+apple
+banana
+cherry
+apple pie
+## END
+## stdout:
+apple
+apple pie
+## END
+## status: 0
+
+#### no match exits 1 with no output
+## argv: grep kiwi
+## stdin:
+apple
+banana
+cherry
+apple pie
+## END
+## stdout-json: ""
+## status: 1
+
+#### an empty pattern selects every line
+## argv: grep ''
+## stdin:
+apple
+banana
+cherry
+apple pie
+## END
+## stdout:
+apple
+banana
+cherry
+apple pie
+## END
+## status: 0
+
+#### -v inverts the selection
+## argv: grep -v apple
+## stdin:
+apple
+banana
+cherry
+apple pie
+## END
+## stdout:
+banana
+cherry
+## END
+## status: 0
+
+#### -i folds case
+## argv: grep -i APPLE
+## stdin:
+apple
+banana
+cherry
+apple pie
+## END
+## stdout:
+apple
+apple pie
+## END
+## status: 0
+
+#### -w requires word boundaries
+## argv: grep -w apple
+## stdin:
+apple
+banana
+cherry
+apple pie
+## END
+## stdout:
+apple
+apple pie
+## END
+## status: 0
+
+#### -x requires the whole line
+## argv: grep -x apple
+## stdin:
+apple
+banana
+cherry
+apple pie
+## END
+## stdout:
+apple
+## END
+## status: 0
+
+#### -c counts selected lines
+## argv: grep -c apple
+## stdin:
+apple
+banana
+cherry
+apple pie
+## END
+## stdout:
+2
+## END
+## status: 0
+
+#### -c with -v counts the rest
+## argv: grep -cv apple
+## stdin:
+apple
+banana
+cherry
+apple pie
+## END
+## stdout:
+2
+## END
+## status: 0
+
+#### -n prefixes the line number
+## argv: grep -n apple
+## stdin:
+apple
+banana
+cherry
+apple pie
+## END
+## stdout:
+1:apple
+4:apple pie
+## END
+## status: 0
+
+#### -o prints each match on its own line
+## argv: grep -o a.p
+## stdin:
+apple
+banana
+cherry
+apple pie
+## END
+## stdout:
+app
+app
+## END
+## status: 0
+
+#### -o with -n prefixes every match
+## argv: grep -on an
+## stdin:
+apple
+banana
+cherry
+apple pie
+## END
+## stdout:
+2:an
+2:an
+## END
+## status: 0
+
+#### -q prints nothing and exits 0 on a match
+## argv: grep -q apple
+## stdin:
+apple
+banana
+cherry
+apple pie
+## END
+## stdout-json: ""
+## status: 0
+
+#### -q exits 1 when nothing matches
+## argv: grep -q kiwi
+## stdin:
+apple
+banana
+cherry
+apple pie
+## END
+## stdout-json: ""
+## status: 1
+
+#### -m stops after the given number of matches
+## argv: grep -m 1 apple
+## stdin:
+apple
+banana
+cherry
+apple pie
+## END
+## stdout:
+apple
+## END
+## status: 0
+
+#### a line without a trailing newline still prints
+## argv: grep b
+## stdin-json: "ab"
+## stdout:
+ab
+## END
+## status: 0
+
+#### -e takes the pattern
+## argv: grep -e apple
+## stdin:
+apple
+banana
+cherry
+apple pie
+## END
+## stdout:
+apple
+apple pie
+## END
+## status: 0
+
+#### repeated -e matches any of them
+## argv: grep -e apple -e cherry
+## stdin:
+apple
+banana
+cherry
+apple pie
+## END
+## stdout:
+apple
+cherry
+apple pie
+## END
+## status: 0
+
+#### a pattern argument holds one pattern per line
+## argv: grep "apple\ncherry"
+## stdin:
+apple
+banana
+cherry
+apple pie
+## END
+## stdout:
+apple
+cherry
+apple pie
+## END
+## status: 0
+
+#### -f reads patterns from a file
+## argv: grep -f pats
+## file pats:
+apple
+cherry
+## END
+## stdin:
+apple
+banana
+cherry
+apple pie
+## END
+## stdout:
+apple
+cherry
+apple pie
+## END
+## status: 0
+
+#### -f - reads patterns from stdin
+## argv: grep -f - f1
+## file f1:
+apple
+banana
+cherry
+apple pie
+## END
+## stdin:
+apple
+cherry
+## END
+## stdout:
+apple
+cherry
+apple pie
+## END
+## status: 0
+
+#### -E enables extended syntax
+## argv: grep -E 'app(le|les)'
+## stdin:
+apple
+banana
+cherry
+apple pie
+## END
+## stdout:
+apple
+apple pie
+## END
+## status: 0
+
+#### -F takes the pattern literally
+## argv: grep -F a.p
+## stdin:
+a.p
+abp
+## END
+## stdout:
+a.p
+## END
+## status: 0
+
+#### -F with -x matches a whole line only
+## argv: grep -Fx apple
+## stdin:
+apple
+banana
+cherry
+apple pie
+## END
+## stdout:
+apple
+## END
+## status: 0
+
+#### -G is the default basic syntax
+## argv: grep -G "a\\(pp\\)le"
+## stdin:
+apple
+banana
+cherry
+apple pie
+## END
+## stdout:
+apple
+apple pie
+## END
+## status: 0
+
+#### -- ends the options
+## argv: grep -- -v
+## stdin:
+-v
+x
+## END
+## stdout:
+-v
+## END
+## status: 0
+
+#### a pattern that looks like an option needs -e
+## argv: grep -e -v
+## stdin:
+-v
+x
+## END
+## stdout:
+-v
+## END
+## status: 0
+
+#### one file argument prints no name prefix
+## argv: grep apple f1
+## file f1:
+apple
+banana
+cherry
+apple pie
+## END
+## stdout:
+apple
+apple pie
+## END
+## status: 0
+
+#### two file arguments prefix each line
+## argv: grep apple f1 f2
+## file f1:
+apple
+banana
+cherry
+apple pie
+## END
+## file f2:
+apple cart
+## END
+## stdout:
+f1:apple
+f1:apple pie
+f2:apple cart
+## END
+## status: 0
+
+#### -h suppresses the name prefix
+## argv: grep -h apple f1 f2
+## file f1:
+apple
+banana
+cherry
+apple pie
+## END
+## file f2:
+apple cart
+## END
+## stdout:
+apple
+apple pie
+apple cart
+## END
+## status: 0
+
+#### -H adds the name prefix for one file
+## argv: grep -H apple f1
+## file f1:
+apple
+banana
+cherry
+apple pie
+## END
+## stdout:
+f1:apple
+f1:apple pie
+## END
+## status: 0
+
+#### -l lists the files that matched
+## argv: grep -l apple f1 f2
+## file f1:
+apple
+banana
+cherry
+apple pie
+## END
+## file f2:
+kiwi
+## END
+## stdout:
+f1
+## END
+## status: 0
+
+#### -L lists the files that did not
+## argv: grep -L apple f1 f2
+## file f1:
+apple
+banana
+cherry
+apple pie
+## END
+## file f2:
+kiwi
+## END
+## stdout:
+f2
+## END
+## status: 0
+
+#### -c per file carries the name prefix
+## argv: grep -c apple f1 f2
+## file f1:
+apple
+banana
+cherry
+apple pie
+## END
+## file f2:
+apple cart
+apple
+## END
+## stdout:
+f1:2
+f2:2
+## END
+## status: 0
+
+#### stdin is named (standard input) when a name is shown
+## argv: grep -H apple
+## stdin:
+apple
+banana
+cherry
+apple pie
+## END
+## stdout:
+(standard input):apple
+(standard input):apple pie
+## END
+## status: 0
+
+#### - reads standard input alongside a file
+## argv: grep apple f1 -
+## file f1:
+apple
+banana
+cherry
+apple pie
+## END
+## stdin:
+apple juice
+## END
+## stdout:
+f1:apple
+f1:apple pie
+(standard input):apple juice
+## END
+## status: 0
+
+#### -r walks a directory
+## argv: grep -r apple d
+## file d/a.txt:
+apple
+banana
+cherry
+apple pie
+## END
+## file d/b.txt:
+kiwi
+## END
+## stdout:
+d/a.txt:apple
+d/a.txt:apple pie
+## END
+## status: 0
+
+#### -n with a file prefix orders name then number
+## argv: grep -n apple f1 f2
+## file f1:
+apple
+banana
+cherry
+apple pie
+## END
+## file f2:
+apple cart
+## END
+## stdout:
+f1:1:apple
+f1:4:apple pie
+f2:1:apple cart
+## END
+## status: 0
+
+#### -A prints trailing context
+## argv: grep -A 1 banana
+## stdin:
+apple
+banana
+cherry
+apple pie
+## END
+## stdout:
+banana
+cherry
+## END
+## status: 0
+
+#### -B prints leading context
+## argv: grep -B 1 banana
+## stdin:
+apple
+banana
+cherry
+apple pie
+## END
+## stdout:
+apple
+banana
+## END
+## status: 0
+
+#### -C prints both sides
+## argv: grep -C 1 banana
+## stdin:
+apple
+banana
+cherry
+apple pie
+## END
+## stdout:
+apple
+banana
+cherry
+## END
+## status: 0
+
+#### context groups are separated by --
+## argv: grep -A 1 -e apple
+## stdin:
+apple
+banana
+cherry
+apple pie
+## END
+## stdout:
+apple
+banana
+--
+apple pie
+## END
+## status: 0
+
+#### a missing file is an error but other files are still searched
+## argv: grep apple nosuch f1
+## file f1:
+apple
+banana
+cherry
+apple pie
+## END
+## stdout:
+f1:apple
+f1:apple pie
+## END
+## status: 2
+## stderr-contains: nosuch
+
+#### -s suppresses the missing-file message
+## argv: grep -s apple nosuch f1
+## file f1:
+apple
+banana
+cherry
+apple pie
+## END
+## stdout:
+f1:apple
+f1:apple pie
+## END
+## status: 2
+# The POINT of -s: without asserting stderr is EMPTY this case is byte-identical
+# to the one above it, and a grep that ignored -s entirely would pass.
+## stderr-json: ""
+
+#### an unterminated group is a syntax error
+## argv: grep "a\\("
+## stdin:
+apple
+banana
+cherry
+apple pie
+## END
+## stdout-json: ""
+## status: 2
+## stderr-contains: grep:
+
+#### an invalid option is refused
+## argv: grep -k apple
+## stdin:
+apple
+banana
+cherry
+apple pie
+## END
+## stdout-json: ""
+## status: 2
+## stderr-contains: grep:
+
+#### no arguments at all is a usage error
+## argv: grep
+## stdout-json: ""
+## status: 2
+
+#### -z separates records by NUL
+## argv: grep -z apple
+## stdin-json: "apple\x00kiwi\x00apple pie\x00"
+## stdout-json: "apple\x00apple pie\x00"
+## status: 0
+
+#### -A after the last line stops cleanly
+## argv: grep -A 3 cherry
+## stdin:
+apple
+banana
+cherry
+apple pie
+## END
+## stdout:
+cherry
+apple pie
+## END
+## status: 0
+
+#### overlapping context groups are not repeated
+## argv: grep -C 1 -e banana -e cherry
+## stdin:
+apple
+banana
+cherry
+apple pie
+## END
+## stdout:
+apple
+banana
+cherry
+apple pie
+## END
+## status: 0
+
+#### -c with -m counts only up to the limit
+## argv: grep -c -m 1 apple
+## stdin:
+apple
+banana
+cherry
+apple pie
+## END
+## stdout:
+1
+## END
+## status: 0
+
+#### -o with -i keeps the input casing
+## argv: grep -oi APPLE
+## stdin:
+apple
+banana
+cherry
+apple pie
+## END
+## stdout:
+apple
+apple
+## END
+## status: 0
+
+#### a backreference matches the repeated text
+## argv: grep "\\(an\\)\\1"
+## stdin:
+apple
+banana
+cherry
+apple pie
+## END
+## stdout:
+banana
+## END
+## status: 0
+
+#### a bracket class selects a character set
+## argv: grep '^[abc]'
+## stdin:
+apple
+banana
+cherry
+apple pie
+## END
+## stdout:
+apple
+banana
+cherry
+apple pie
+## END
+## status: 0
+
+#### a word-start anchor binds to the left edge
+## argv: grep "\\<pie"
+## stdin:
+apple
+banana
+cherry
+apple pie
+## END
+## stdout:
+apple pie
+## END
+## status: 0
+
+#### -x with -v keeps the lines that differ
+## argv: grep -xv apple
+## stdin:
+apple
+banana
+cherry
+apple pie
+## END
+## stdout:
+banana
+cherry
+apple pie
+## END
+## status: 0
+
+#### an empty pattern file matches nothing
+## argv: grep -f pats
+## file-json pats: ""
+## stdin:
+apple
+banana
+cherry
+apple pie
+## END
+## stdout-json: ""
+## status: 1
+
+#### a pattern file with a blank line matches everything
+## argv: grep -f pats
+## file pats:
+kiwi
+
+## END
+## stdin:
+apple
+banana
+cherry
+apple pie
+## END
+## stdout:
+apple
+banana
+cherry
+apple pie
+## END
+## status: 0
+
+#### --ignore-case is the long form of -i
+## argv: grep --ignore-case APPLE
+## stdin:
+apple
+banana
+cherry
+apple pie
+## END
+## stdout:
+apple
+apple pie
+## END
+## status: 0
+
+#### --regexp= takes the pattern
+## argv: grep --regexp=apple
+## stdin:
+apple
+banana
+cherry
+apple pie
+## END
+## stdout:
+apple
+apple pie
+## END
+## status: 0
+
+#### --count is the long form of -c
+## argv: grep --count apple
+## stdin:
+apple
+banana
+cherry
+apple pie
+## END
+## stdout:
+2
+## END
+## status: 0
+
+#### --line-number is the long form of -n
+## argv: grep --line-number apple
+## stdin:
+apple
+banana
+cherry
+apple pie
+## END
+## stdout:
+1:apple
+4:apple pie
+## END
+## status: 0
+
+#### --max-count= bounds the matches
+## argv: grep --max-count=1 apple
+## stdin:
+apple
+banana
+cherry
+apple pie
+## END
+## stdout:
+apple
+## END
+## status: 0
+
+#### a clustered short option group applies each letter
+## argv: grep -vin APPLE
+## stdin:
+apple
+banana
+cherry
+apple pie
+## END
+## stdout:
+2:banana
+3:cherry
+## END
+## status: 0
+
+#### -e can be attached to its argument
+## argv: grep -eapple
+## stdin:
+apple
+banana
+cherry
+apple pie
+## END
+## stdout:
+apple
+apple pie
+## END
+## status: 0
+
+#### -r on a directory prefixes every path
+## argv: grep -r apple d f1
+## file d/a.txt:
+apple
+banana
+cherry
+apple pie
+## END
+## file f1:
+apple cart
+## END
+## stdout:
+d/a.txt:apple
+d/a.txt:apple pie
+f1:apple cart
+## END
+## status: 0
+
+#### -l stops at the first match in each file
+## argv: grep -l apple f1 f2
+## file f1:
+apple
+banana
+cherry
+apple pie
+## END
+## file f2:
+apple
+banana
+cherry
+apple pie
+## END
+## stdout:
+f1
+f2
+## END
+## status: 0
+
+#### -i and -w together still need word edges
+## argv: grep -iw APPLE
+## stdin:
+apple
+banana
+cherry
+apple pie
+## END
+## stdout:
+apple
+apple pie
+## END
+## status: 0
+
+#### a NUL byte makes a file binary
+## argv: grep -H foo b1
+## file-json b1: "foo\x00bar\nbaz\n"
+## stdout-json: ""
+## status: 0
+
+#### -a treats a binary file as text
+## argv: grep -a foo b1
+## file-json b1: "foo\x00bar\nbaz\n"
+## stdout-json: "foo\x00bar\n"
+## status: 0
+
+#### -x with an empty pattern selects only the empty line
+## argv: grep -x ''
+## stdin:
+alpha
+
+beta
+## END
+## stdout:
+
+## END
+## status: 0
+## stderr-json: ""
+
+#### -w with an empty pattern selects only the empty line
+## argv: grep -w ''
+## stdin:
+alpha
+
+beta
+## END
+## stdout:
+
+## END
+## status: 0
+## stderr-json: ""
+
+#### an empty pattern without -x or -w selects every line
+## argv: grep ''
+## stdin:
+alpha
+
+beta
+## END
+## stdout:
+alpha
+
+beta
+## END
+## status: 0
+## stderr-json: ""
+
+#### -m0 selects nothing
+## argv: grep -m 0 a
+## stdin:
+alpha
+
+beta
+## END
+## stdout-json: ""
+## status: 1
+## stderr-json: ""
+
+#### -c with -m0 counts zero
+## argv: grep -c -m 0 a
+## stdin:
+alpha
+
+beta
+## END
+## stdout-json: ""
+## status: 1
+## stderr-json: ""
+
+#### -m still prints the trailing after-context of its last match
+## argv: grep -m 1 -A 1 a
+## stdin:
+a
+b
+c
+d
+## END
+## stdout:
+a
+b
+## END
+## status: 0
+## stderr-json: ""
+
+#### -m counts only selected lines and stops there
+## argv: grep -m 2 a
+## stdin:
+a
+b
+a
+a
+## END
+## stdout:
+a
+a
+## END
+## status: 0
+## stderr-json: ""
+
+#### -i does not let a negated class match the folded case
+## argv: grep -i '[^a]'
+## stdin:
+a
+A
+b
+## END
+## stdout:
+b
+## END
+## status: 0
+## stderr-json: ""
+
+#### -i folds an ordinary class
+## argv: grep -i '[a]'
+## stdin:
+a
+A
+b
+## END
+## stdout:
+a
+A
+## END
+## status: 0
+## stderr-json: ""
+
+#### an empty -f file supplies no patterns and selects nothing
+## argv: grep -f pats
+## file-json pats: ""
+## stdin:
+alpha
+
+beta
+## END
+## stdout-json: ""
+## status: 1
+## stderr-json: ""
+
+#### a -f file's trailing newline does not add an empty pattern
+## argv: grep -f pats
+## file pats:
+alpha
+## END
+## stdin:
+alpha
+
+beta
+## END
+## stdout:
+alpha
+## END
+## status: 0
+## stderr-json: ""
+
+#### an -f file with a blank line does supply the empty pattern
+## argv: grep -f pats
+## file pats:
+alpha
+
+## END
+## stdin:
+alpha
+
+beta
+## END
+## stdout:
+alpha
+
+beta
+## END
+## status: 0
+## stderr-json: ""
+
+#### -e with an empty argument is one empty pattern
+## argv: grep -e ''
+## stdin:
+alpha
+
+beta
+## END
+## stdout:
+alpha
+
+beta
+## END
+## status: 0
+## stderr-json: ""
+
+#### a repetition with an empty body still requires its minimum
+## argv: grep -c '^\(a*\)\{2\}'
+## stdin:
+
+aa
+## END
+## stdout:
+2
+## END
+## status: 0
+## stderr-json: ""
+
+#### -L names a file that -m0 keeps unmatched
+## argv: grep -L -m 0 a in
+## file in:
+alpha
+
+beta
+## END
+## stdout:
+in
+## END
+## status: 1
+## stderr-json: ""
+
+#### context groups from different files are separated by --
+## argv: grep -A1 a f1 f2
+## file f1:
+a
+b
+## END
+## file f2:
+a
+c
+## END
+## stdout:
+f1:a
+f1-b
+--
+f2:a
+f2-c
+## END
+## status: 0
+## stderr-json: ""
+
+#### no -- separator without context
+## argv: grep a f1 f2
+## file f1:
+a
+b
+## END
+## file f2:
+a
+c
+## END
+## stdout:
+f1:a
+f2:a
+## END
+## status: 0
+## stderr-json: ""
+
+#### -c counts a binary file instead of reporting one
+## argv: grep -c foo b1
+## file-json b1: "foo\u0000bar\n"
+## stdout:
+1
+## END
+## status: 0
+## stderr-json: ""
+
+#### -l names a binary file instead of reporting one
+## argv: grep -l foo b1
+## file-json b1: "foo\u0000bar\n"
+## stdout:
+b1
+## END
+## status: 0
+## stderr-json: ""
+
+#### -o does not spill binary content onto stdout
+## argv: grep -o foo b1
+## file-json b1: "foo\u0000bar\n"
+## stdout-json: ""
+## status: 0
+## stderr-contains: binary file matches
+
+#### an unambiguous long-option prefix is accepted
+## argv: grep --ignore-c A f1
+## file f1:
+a
+b
+## END
+## file f2:
+a
+c
+## END
+## stdout:
+a
+## END
+## status: 0
+## stderr-json: ""
+
+#### an ambiguous long-option prefix is refused
+## argv: grep --f a f1
+## file f1:
+a
+b
+## END
+## file f2:
+a
+c
+## END
+## stdout-json: ""
+## status: 2
+## stderr-contains: ambiguous
+
+#### --max-c=N takes an inline argument
+## argv: grep --max-c=1 a f1
+## file f1:
+a
+b
+## END
+## file f2:
+a
+c
+## END
+## stdout:
+a
+## END
+## status: 0
+## stderr-json: ""
+
+#### -lZ terminates each file name with NUL for xargs -0
+## argv: grep -lZ a f1 f2
+## file f1:
+a
+b
+## END
+## file f2:
+a
+c
+## END
+## stdout-json: "f1\u0000f2\u0000"
+## status: 0
+## stderr-json: ""
+
+#### -Z replaces only the byte after the file name
+## argv: grep -Zn a f1 f2
+## file f1:
+a
+b
+## END
+## file f2:
+a
+c
+## END
+## stdout-json: "f1\u00001:a\nf2\u00001:a\n"
+## status: 0
+## stderr-json: ""
+
+#### -Z leaves a count line ordinarily terminated
+## argv: grep -Zc a f1 f2
+## file f1:
+a
+b
+## END
+## file f2:
+a
+c
+## END
+## stdout-json: "f1\u00001\nf2\u00001\n"
+## status: 0
+## stderr-json: ""
+
+#### --null is the long form of -Z
+## argv: grep --null -L zzz f1 f2
+## file f1:
+a
+b
+## END
+## file f2:
+a
+c
+## END
+## stdout-json: "f1\u0000f2\u0000"
+## status: 1
+## stderr-json: ""
+
+#### a long option takes its value as the next argument
+## argv: grep --max-count 1 a f1
+## file f1:
+a
+b
+## END
+## stdout:
+a
+## END
+## status: 0
+## stderr-json: ""
+
+#### an abbreviated long option takes its value too
+## argv: grep --reg a f1
+## file f1:
+a
+b
+## END
+## stdout:
+a
+## END
+## status: 0
+## stderr-json: ""
+
+#### a flag refuses an inline value
+## argv: grep --count=1 a f1
+## file f1:
+a
+b
+## END
+## stdout-json: ""
+## status: 2
+## stderr-contains: doesn't allow an argument
+
+#### a value-taking long option with no value is an error
+## argv: grep --max-count
+## file f1:
+a
+b
+## END
+## stdout-json: ""
+## status: 2
+## stderr-contains: requires an argument
+
+#### -m rejects a non-number with its own wording
+## argv: grep -m a f1
+## file f1:
+a
+b
+## END
+## stdout-json: ""
+## status: 2
+## stderr-contains: invalid max count
+
+#### -A rejects a non-number with the context wording
+## argv: grep -A a f1
+## file f1:
+a
+b
+## END
+## stdout-json: ""
+## status: 2
+## stderr-contains: invalid context length argument
+
+#### an empty pattern list matches nothing and never opens its operands
+## argv: grep -f pats nosuch f1
+## file f1:
+a
+b
+## END
+## file-json pats: ""
+## stdout-json: ""
+## status: 1
+## stderr-json: ""
+
+#### an empty pattern list under -v selects every line
+## argv: grep -v -f pats f1
+## file f1:
+a
+b
+## END
+## file-json pats: ""
+## stdout:
+a
+b
+## END
+## status: 0
+## stderr-json: ""
+
+#### an empty pattern list under -L still names the file
+## argv: grep -L -f pats f1
+## file f1:
+a
+b
+## END
+## file-json pats: ""
+## stdout:
+f1
+## END
+## status: 1
+## stderr-json: ""
+
+#### an empty pattern list under -c prints no count
+## argv: grep -c -f pats f1
+## file f1:
+a
+b
+## END
+## file-json pats: ""
+## stdout-json: ""
+## status: 1
+## stderr-json: ""
+
+#### a BRE repetition operator after a leading anchor is a literal
+## argv: grep -c '^*'
+## stdin:
+*
+a
+*x
+## END
+## stdout:
+2
+## END
+## status: 0
+## stderr-json: ""
+
+#### a BRE \+ after a leading anchor is a literal too
+## argv: grep -c '^\+'
+## stdin:
++
+a
+^+
+## END
+## stdout:
+1
+## END
+## status: 0
+
+#### a leading BRE * is a literal
+## argv: grep -c '*'
+## stdin:
+*
+a
+## END
+## stdout:
+1
+## END
+## status: 0
+## stderr-json: ""
+
+#### an ERE leading * still repeats the anchor
+## argv: grep -Ec '^*'
+## stdin:
+*
+a
+## END
+## stdout:
+2
+## END
+## status: 0
+
+#### -q suppresses the count -c would print
+## argv: grep -qc a f1
+## file f1:
+a
+b
+## END
+## stdout-json: ""
+## status: 0
+## stderr-json: ""
+
+#### -q suppresses the name -l would print
+## argv: grep -ql a f1
+## file f1:
+a
+b
+## END
+## stdout-json: ""
+## status: 0
+## stderr-json: ""
+
+#### -q suppresses the name -L would print
+## argv: grep -qL zzz f1
+## file f1:
+a
+b
+## END
+## stdout-json: ""
+## status: 1
+## stderr-json: ""
+
+#### -m with a negative count means no limit
+## argv: grep -m -1 a f1
+## file f1:
+a
+b
+## END
+## stdout:
+a
+## END
+## status: 0
+## stderr-json: ""
+
+#### -v over an every-line pattern selects nothing and prints no count
+## argv: grep -cv '' f1
+## file f1:
+a
+b
+## END
+## stdout-json: ""
+## status: 1
+## stderr-json: ""
+
+#### -x keeps an empty pattern from selecting every line under -v
+## argv: grep -xv '' f1
+## file f1:
+a
+b
+## END
+## stdout:
+a
+b
+## END
+## status: 0
+## stderr-json: ""

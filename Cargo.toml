@@ -17,6 +17,10 @@
 #                     engine trust boundary (its own confined single-ioctl unsafe).
 #   td-boot/        — the target-side verified deployment selector and boot
 #                     shim; pure std and sharing the engine SHA-256 source.
+#   td-txt/         — the target-built static TEXT multicall (grep, sed): the
+#                     two applets uutils does not provide and busybox still
+#                     owns on the image, plus the host-side conformance harness
+#                     that scores them against the vendored GNU corpora.
 #   td-util/        — the target-built static diagnostics multicall (clear,
 #                     which, free, ps, dmesg): the busybox applets uutils does
 #                     not provide, in pure safe std with no syscall surface.
@@ -38,7 +42,7 @@
 [workspace]
 resolver = "2"
 members = ["builder", "recipes", "engine"]
-exclude = ["net", "td-kexec", "td-sh", "td-netd", "td-boot", "td-util", "td-init", "td-firstboot", "td-review", "tests/sshd"]
+exclude = ["net", "td-kexec", "td-sh", "td-txt", "td-netd", "td-boot", "td-util", "td-init", "td-firstboot", "td-review", "tests/sshd"]
 
 [profile.release]
 # Keep the release profile explicit and minimal so the reproducibility oracle

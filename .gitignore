@@ -57,3 +57,8 @@ td-review/target/
 # td-firstboot: shipped by its recipe as a direct rustc build, but compiled here
 # too by the cargo-test gate and by hand when validating provisioning.
 td-firstboot/target/
+
+# td-txt: the grep/sed multicall is built directly (cargo, or by rustc in its
+# recipe) during development; the shared gate redirects CARGO_TARGET_DIR to a
+# scratch dir instead.
+td-txt/target/

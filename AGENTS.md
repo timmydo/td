@@ -326,10 +326,10 @@ td's Rust is defensive and minimal-surface.
   way. The gate enforces it on the ONE workspace-root `Cargo.lock`: exactly 3
   `[[package]]` entries (the known path members) AND no external `source = ` line
   (path members carry none), so a new registry/git dep OR a new path member both red it.
-  The target-side `td-kexec`, `td-sh`, `td-netd`, `td-boot`, `td-util`, `td-init`, and
-  `td-firstboot`
-  crates outside the workspace each keep their own 1-package lock; `td-sh`, `td-boot`,
-  `td-util`, and `td-firstboot` contain no `unsafe`. `td-review` (the host-side integrator
+  The target-side `td-kexec`, `td-sh`, `td-txt`, `td-netd`, `td-boot`, `td-util`,
+  `td-init`, and `td-firstboot` crates outside the workspace each keep their own
+  1-package lock; `td-sh`, `td-txt`, `td-boot`, `td-util`, and `td-firstboot`
+  contain no `unsafe`. `td-review` (the host-side integrator
   branch-review/landing TUI) keeps one too: it is in NEITHER bootstrap graph — no
   recipe builds it and it never enters a closure — but it is pure `std`, `forbid`s
   `unsafe_code`, and rides the same cargo-test gate, so the coding rules are
