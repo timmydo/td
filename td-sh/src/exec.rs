@@ -55,19 +55,29 @@ pub struct Opts {
     pub noglob: bool,    // -f
     pub verbose: bool,   // -v
     pub noclobber: bool, // -C
+    pub noexec: bool,    // -n
+    pub allexport: bool, // -a
+    /// `-s`: read the program from stdin. Only the invocation acts on it, as in
+    /// dash, but it is an optlist entry there so it shows up in `$-`.
+    pub stdin: bool,
 }
 
 impl Opts {
-    /// The `$-` letters, in a fixed order.
-    pub fn letters(&self) -> String {
+    /// The `$-` letters. The order is dash's `optlist`, which is the order it
+    /// prints them in -- not alphabetical and not the order they were set.
+    pub fn letters(&self, interactive: bool) -> String {
         let mut s = String::new();
         for (on, c) in [
             (self.errexit, 'e'),
-            (self.nounset, 'u'),
-            (self.xtrace, 'x'),
             (self.noglob, 'f'),
+            (interactive, 'i'),
+            (self.noexec, 'n'),
+            (self.stdin, 's'),
+            (self.xtrace, 'x'),
             (self.verbose, 'v'),
             (self.noclobber, 'C'),
+            (self.allexport, 'a'),
+            (self.nounset, 'u'),
         ] {
             if on {
                 s.push(c);
@@ -245,13 +255,18 @@ impl Shell {
             Some(v) if v.readonly => {
                 return Err(self.fatal(&format!("{name}: is read only"), 2));
             }
-            Some(v) => v.value = value.to_string(),
+            Some(v) => {
+                v.value = value.to_string();
+                v.exported |= self.opts.allexport;
+            }
             None => {
                 self.vars.insert(
                     name.to_string(),
                     Var {
                         value: value.to_string(),
-                        exported: false,
+                        // `set -a` is exactly this: every name an assignment
+                        // touches is marked for export as it is written.
+                        exported: self.opts.allexport,
                         readonly: false,
                     },
                 );
@@ -376,6 +391,8 @@ pub fn run_source(sh: &mut Shell, src: &str, what: &str) -> R<()> {
                 sh.set_status(2);
                 return Ok(());
             }
+            // Still PARSED under `-n`, which is the point of the mode: the syntax
+            // errors are reported. `run_command` is what declines to run it.
             Some(Ok(list)) => run_list(sh, &list)?,
         }
     }
@@ -480,6 +497,15 @@ fn run_pipeline(sh: &mut Shell, pipe: &Pipeline) -> R<()> {
 /// call, `eval`/`.`, and command-substitution body re-enters here, so one guard
 /// covers them all (and their compositions) against a native stack overflow.
 pub fn run_command(sh: &mut Shell, cmd: &Cmd) -> R<()> {
+    // dash's and busybox ash's `nflag`, which both test at the top of evaltree --
+    // this walker's counterpart -- so `-n` stops at the next COMMAND, not merely
+    // at the next parsed unit. That is why `set +n` can never turn it back off,
+    // and why `eval` and a trap action are suppressed too: they reach evaltree
+    // the same way. Neither shell exempts an interactive shell (POSIX 2.5.1 does),
+    // so neither does td-sh. `$?` is left alone, as at evaltree's `out:`.
+    if sh.opts.noexec {
+        return Ok(());
+    }
     if sh.run_depth >= MAX_RUN_DEPTH {
         return Err(sh.fatal("maximum recursion depth exceeded", 2));
     }
@@ -940,6 +966,26 @@ mod tests {
         assert_eq!(out, "hello world\n");
         let (status, _, _) = run("exit 7");
         assert_eq!(status, 7);
+    }
+
+    #[test]
+    fn allexport_marks_every_assignment_for_export() {
+        // dash's setvareq ORs in VEXPORT under aflag, so `set -a` covers every
+        // writer, not just a plain assignment. Asserted on the variable table
+        // because td-sh has no `export -p` listing to read it back with.
+        let mut sh = super::Shell::new_for_test();
+        sh.set_var("before", "0").unwrap();
+        sh.opts.allexport = true;
+        sh.set_var("during", "1").unwrap();
+        // An assignment to an EXISTING name exports it too -- the flag is applied
+        // on write, not only on creation.
+        sh.set_var("before", "2").unwrap();
+        sh.opts.allexport = false;
+        sh.set_var("after", "3").unwrap();
+        let mut env: Vec<String> =
+            sh.exported_env().into_iter().map(|(k, _)| k).collect();
+        env.sort();
+        assert_eq!(env, ["before", "during"]);
     }
 
     #[test]

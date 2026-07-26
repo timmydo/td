@@ -317,7 +317,7 @@ pub fn lookup(sh: &Shell, name: &str) -> Option<String> {
         "#" => Some(sh.params.len().to_string()),
         "$" => Some(std::process::id().to_string()),
         "!" => Some(sh.last_bg.to_string()),
-        "-" => Some(sh.opts.letters()),
+        "-" => Some(sh.opts.letters(sh.interactive)),
         "0" => Some(sh.arg0.clone()),
         "*" => {
             let sep = sh

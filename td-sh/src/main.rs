@@ -51,63 +51,80 @@ fn main() -> ExitCode {
 fn run(args: &[String]) -> Result<i32, String> {
     let mut sh = Shell::new();
     let mut i = 1usize;
-    let mut command: Option<String> = None;
-    let mut read_stdin = false;
+    let mut minus_c = false;
 
-    // Leading options: `-c`, `-s`, and the `set`-style single-letter flags.
+    // Leading options, parsed as dash's `options(cmdline=1)` does.
     while let Some(arg) = args.get(i) {
-        if arg == "--" {
+        // On the COMMAND LINE both of these only end option processing; the other
+        // meanings dash gives them (`-` clearing -x/-v, `--` resetting the
+        // parameters) belong to the `set` builtin, so `sh -x - foo.sh` runs the
+        // script rather than reading stdin.
+        if arg == "-" || arg == "--" {
             i += 1;
             break;
         }
-        let Some(flags) = arg.strip_prefix('-') else {
-            break;
+        // dash parses `+x` here exactly as `set` does, so both signs are options
+        // and neither is an operand.
+        let (on, flags) = match arg.strip_prefix('-') {
+            Some(f) => (true, f),
+            None => match arg.strip_prefix('+') {
+                Some(f) => (false, f),
+                None => break,
+            },
         };
-        if flags.is_empty() {
-            // A bare `-` means read from stdin.
-            read_stdin = true;
-            i += 1;
-            break;
-        }
-        let mut consumed_value = false;
+        let sign = if on { '-' } else { '+' };
+        // Extra argv entries this cluster took: EACH `o` in it consumes one name.
+        let mut consumed = 0usize;
         for c in flags.chars() {
             match c {
-                'c' => {
-                    let cmd = args
-                        .get(i + 1)
-                        .ok_or_else(|| "-c requires an argument".to_string())?;
-                    command = Some(cmd.clone());
-                    consumed_value = true;
+                // dash records that it saw `-c` and takes the command only once
+                // the whole option list is done, which is why `sh -c -x 'echo hi'`
+                // traces rather than running `-x`.
+                'c' => minus_c = true,
+                'o' => {
+                    // `-o` without a name lists the settings in dash; td-sh has no
+                    // listing yet, so it is the same no-op `set -o` is.
+                    if let Some(name) = args.get(i + 1 + consumed) {
+                        // dash keeps iflag in the same optlist as the rest, so
+                        // `-o interactive` does what `-i` does; `-o stdin` needs
+                        // no special case, the shared table carries it.
+                        if name == "interactive" {
+                            sh.interactive = on;
+                        } else if !builtin::apply_named_option(&mut sh, name, on) {
+                            return Err(format!("Illegal option {sign}o {name}"));
+                        }
+                        consumed += 1;
+                    }
                 }
-                's' => read_stdin = true,
-                'e' => sh.opts.errexit = true,
-                'u' => sh.opts.nounset = true,
-                'x' => sh.opts.xtrace = true,
-                'f' => sh.opts.noglob = true,
-                'v' => sh.opts.verbose = true,
-                'C' => sh.opts.noclobber = true,
-                'i' => sh.interactive = true,
-                other => return Err(format!("unknown option -{other}")),
+                'i' => sh.interactive = on,
+                // Every other letter comes from the one table `set` reads, so the
+                // command line cannot drift from it.
+                other => {
+                    if !builtin::apply_option_letter(&mut sh, other, on) {
+                        return Err(format!("Illegal option {sign}{other}"));
+                    }
+                }
             }
         }
-        i += 1;
-        if consumed_value {
-            i += 1;
-            break;
-        }
+        i += 1 + consumed;
     }
 
-    // `-c COMMAND [name [arg...]]`: the word after COMMAND is $0.
-    if let Some(cmd) = command {
-        if let Some(name) = args.get(i) {
+    // `-c COMMAND [name [arg...]]`: the command is the first operand, taken after
+    // the whole option list, and the word after it is $0.
+    if minus_c {
+        let cmd = args
+            .get(i)
+            .ok_or_else(|| "-c requires an argument".to_string())?
+            .clone();
+        if let Some(name) = args.get(i + 1) {
             sh.arg0 = name.clone();
-            sh.params = args.iter().skip(i + 1).cloned().collect();
+            sh.params = args.iter().skip(i + 2).cloned().collect();
         }
         return Ok(run_program(&mut sh, &cmd));
     }
 
     // A script-file operand: `td-sh script [arg...]`.
-    if !read_stdin {
+    if !sh.opts.stdin {
         if let Some(path) = args.get(i) {
             sh.arg0 = path.clone();
             sh.params = args.iter().skip(i + 1).cloned().collect();
@@ -120,7 +137,11 @@ fn run(args: &[String]) -> Result<i32, String> {
     // No script and no `-c`: interactive when stdin is a terminal, otherwise read
     // and run the whole of stdin as a script.
     sh.params = args.iter().skip(i).cloned().collect();
-    if !read_stdin && std::io::stdin().is_terminal() {
+    // dash sets sflag when no operand is left as well, which is what puts `s` in
+    // `$-`; an EXPLICIT `-s` is what suppresses the prompt.
+    let explicit_s = sh.opts.stdin;
+    sh.opts.stdin = true;
+    if !explicit_s && std::io::stdin().is_terminal() {
         sh.interactive = true;
         let code = repl(&mut sh);
         return Ok(exec::run_exit_trap(&mut sh, code));

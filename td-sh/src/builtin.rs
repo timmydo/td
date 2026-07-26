@@ -1245,6 +1245,14 @@ fn set(sh: &mut Shell, argv: &[String]) -> R<()> {
             saw_ddash = true;
             break;
         }
+        // In the BUILTIN (not on the command line) a lone `-` turns -x and -v off
+        // and ends option processing, so `set - -e` leaves `-e` as $1.
+        if arg == "-" {
+            sh.opts.xtrace = false;
+            sh.opts.verbose = false;
+            i += 1;
+            break;
+        }
         let (sign, rest) = match arg.strip_prefix('-') {
             Some(r) => (true, r),
             None => match arg.strip_prefix('+') {
@@ -1252,16 +1260,31 @@ fn set(sh: &mut Shell, argv: &[String]) -> R<()> {
                 None => break,
             },
         };
-        if rest == "o" {
-            let name = argv.get(i + 1).cloned().unwrap_or_default();
-            apply_named_option(sh, &name, sign);
-            i += 2;
-            continue;
-        }
+        let flag = if sign { '-' } else { '+' };
+        // dash reads a cluster letter by letter, and EACH `o` in one consumes the
+        // next argument as its name -- `set -eo nounset` is errexit plus nounset,
+        // and `set -oo a b` applies both.
+        let mut names = 0usize;
         for c in rest.chars() {
-            apply_option_letter(sh, c, sign);
+            if c == 'o' {
+                // Bare `-o`/`+o` print the settings in dash (as a reusable `set`
+                // command for `+o`). td-sh has neither listing, so a missing name
+                // stays the no-op it was rather than becoming an error.
+                if let Some(name) = argv.get(i + 1 + names) {
+                    if !apply_named_option(sh, name, sign) {
+                        err_line(sh, &format!("td-sh: set: Illegal option {flag}o {name}"));
+                        return status(sh, 2);
+                    }
+                    names += 1;
+                }
+                continue;
+            }
+            if !apply_option_letter(sh, c, sign) {
+                err_line(sh, &format!("td-sh: set: Illegal option {flag}{c}"));
+                return status(sh, 2);
+            }
         }
-        i += 1;
+        i += 1 + names;
     }
     // `--` present: the operands after it REPLACE the positional params, and an
     // empty operand list clears them (`set --`). Otherwise operands present without
@@ -1278,7 +1301,10 @@ fn set(sh: &mut Shell, argv: &[String]) -> R<()> {
     ok(sh)
 }
 
-fn apply_option_letter(sh: &mut Shell, c: char, on: bool) {
+/// One option letter. False means neither reference shell has it, so the caller
+/// reports it rather than ignoring it. The command line reads this same table,
+/// as dash's does, so the two cannot drift apart.
+pub fn apply_option_letter(sh: &mut Shell, c: char, on: bool) -> bool {
     match c {
         'e' => sh.opts.errexit = on,
         'u' => sh.opts.nounset = on,
@@ -1286,11 +1312,22 @@ fn apply_option_letter(sh: &mut Shell, c: char, on: bool) {
         'f' => sh.opts.noglob = on,
         'v' => sh.opts.verbose = on,
         'C' => sh.opts.noclobber = on,
-        _ => {}
+        'n' => sh.opts.noexec = on,
+        'a' => sh.opts.allexport = on,
+        's' => sh.opts.stdin = on,
+        // The UNION of the two reference tables, since accepting a mode this
+        // shell lacks never breaks a script while refusing one does: `V` is
+        // dash's alone (ash spells vi with no letter) and `c` is ash's alone.
+        'I' | 'i' | 'm' | 'b' | 'V' | 'E' | 'c' => {}
+        _ => return false,
     }
+    true
 }
 
-fn apply_named_option(sh: &mut Shell, name: &str, on: bool) {
+/// The `-o` names, split the same way as the letters. `pipefail` is the one
+/// refusal worth naming: ash has it under BASH_PIPEFAIL, but accepting it as a
+/// no-op would silently give every guarded pipeline the wrong status.
+pub fn apply_named_option(sh: &mut Shell, name: &str, on: bool) -> bool {
     match name {
         "errexit" => sh.opts.errexit = on,
         "nounset" => sh.opts.nounset = on,
@@ -1298,8 +1335,14 @@ fn apply_named_option(sh: &mut Shell, name: &str, on: bool) {
         "noglob" => sh.opts.noglob = on,
         "verbose" => sh.opts.verbose = on,
         "noclobber" => sh.opts.noclobber = on,
-        _ => {}
+        "noexec" => sh.opts.noexec = on,
+        "allexport" => sh.opts.allexport = on,
+        "stdin" => sh.opts.stdin = on,
+        "ignoreeof" | "interactive" | "monitor" | "vi" | "emacs" | "notify" | "nolog"
+        | "debug" | "errtrace" => {}
+        _ => return false,
     }
+    true
 }
 
 /// A usage error in a SPECIAL builtin, and the ONE route for them: POSIX 2.8.1
@@ -2117,17 +2160,48 @@ fn pwd(sh: &mut Shell) -> R<()> {
     out(sh, line.as_bytes())
 }
 
+/// Where `.` looks: a name containing a slash is used as given -- unexamined, so
+/// `. /dev/null` and a FIFO still work -- and anything else is looked up in PATH,
+/// where only a REGULAR file counts. Unlike a command lookup there is no implicit
+/// fallback to the current directory (dash reaches cwd only through an empty or
+/// `.` PATH element) and executability is not required.
+fn dot_path(sh: &Shell, name: &str) -> Option<std::path::PathBuf> {
+    if name.contains('/') {
+        return Some(sh.resolve(name));
+    }
+    let path = sh.get_var("PATH").unwrap_or_default();
+    for dir in path.split(':') {
+        let dir = if dir.is_empty() { "." } else { dir };
+        let candidate = sh.resolve(dir).join(name);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
 fn dot(sh: &mut Shell, argv: &[String]) -> R<()> {
     let Some(name) = argv.get(1) else {
+        // Not fatal in either shell: busybox ash returns 2 outright ("bash
+        // compat" in its own words) and dash returns 0 without a word. Only a
+        // file it cannot LOCATE raises.
         err_line(sh, ".: filename argument required");
         return status(sh, 2);
     };
-    let path = sh.resolve(name);
-    let text = match std::fs::read_to_string(&path) {
-        Ok(t) => t,
+    let Some(path) = dot_path(sh, name) else {
+        return special_usage_error(sh, &format!(".: {name}: not found"));
+    };
+    // Only a failure to OPEN raises. A read that then fails -- a directory, most
+    // often -- reaches dash's input layer as EOF, so it sources nothing and
+    // reports 0; `. ./dir/` is pinned that way for dash in the corpus.
+    let text = match std::fs::File::open(&path) {
+        Ok(mut f) => {
+            let mut t = String::new();
+            let _ = std::io::Read::read_to_string(&mut f, &mut t);
+            t
+        }
         Err(e) => {
-            err_line(sh, &format!(".: {name}: {e}"));
-            return status(sh, 1);
+            return special_usage_error(sh, &format!(".: {name}: {e}"));
         }
     };
     let what = format!("{name}: ");
@@ -2614,6 +2688,124 @@ mod tests {
         let (_, out, _) =
             run_capturing("f() { local -; set -f; echo in=$-; }; f; case $- in *f*) echo still;; *) echo restored;; esac");
         assert!(out.contains("restored"), "got {out:?}");
+    }
+
+    #[test]
+    fn an_unknown_shell_option_is_refused_not_ignored() {
+        // Silently accepting one is the dangerous answer: a script that asks for
+        // `pipefail` and is told nothing runs WITHOUT it.
+        for src in ["set -q", "set -o pipefail", "set +o pipefail"] {
+            let (_, _, err) = run_capturing(src);
+            assert!(err.contains("Illegal option"), "{src}: {err:?}");
+        }
+        // Options dash HAS are accepted, whether or not td-sh acts on them, and a
+        // bare `-o` is not an option name.
+        for src in ["set -e -u -x", "set -a; set -n; set -m", "set -o noglob", "set -o"] {
+            let (status, _, err) = run_capturing(src);
+            assert_eq!((status, err.as_str()), (0, ""), "{src}");
+        }
+    }
+
+    #[test]
+    fn set_and_shift_errors_do_not_end_the_script() {
+        // Deliberate: busybox ash does NOT apply POSIX 2.8.1 here, and
+        // builtin-special.test.sh pins that for both (`## N-I …ash`). Keep them
+        // non-fatal even though dash aborts.
+        let (_, out, _) = run_capturing("set -q; echo reached");
+        assert_eq!(out, "reached\n");
+        let (_, out, _) = run_capturing("set -- a; shift 3; echo reached");
+        assert_eq!(out, "reached\n");
+    }
+
+    #[test]
+    fn sourcing_a_missing_file_is_fatal() {
+        // Both ash and dash raise for a file they cannot locate, rather than
+        // returning a status ("This aborts if file isn't found, which is POSIXly
+        // correct", as busybox puts it).
+        let (status, out, err) = run_capturing(". /no/such/file/here; echo reached");
+        assert_eq!((status, out.as_str()), (2, ""));
+        assert!(err.contains("/no/such/file/here"), "{err:?}");
+        // A MISSING OPERAND is not that: ash returns 2 and dash 0, and neither
+        // stops the script.
+        let (_, out, _) = run_capturing(".; echo reached");
+        assert_eq!(out, "reached\n");
+    }
+
+    #[test]
+    fn noexec_skips_evaluation_but_not_parsing() {
+        // Both shells test nflag at the top of evaltree, so `-n` stops at the next
+        // COMMAND -- including one later in the same list or inside a compound --
+        // and the `set +n` that would undo it can never run.
+        for src in [
+            "echo a\nset -n\necho no\nset +n\necho no2",
+            "echo a; set -n; echo no",
+            "echo a; if true; then set -n; echo no; fi; echo no2",
+            "echo a; set -n; eval \"echo no\"",
+        ] {
+            let (_, out, _) = run_capturing(src);
+            assert_eq!(out, "a\n", "{src}");
+        }
+        // The point of the mode: the skipped units are still parsed, so their
+        // syntax errors are still reported.
+        let (status, _, err) = run_capturing("set -n\nfor");
+        assert_eq!(status, 2);
+        assert!(err.contains("syntax error"), "{err:?}");
+    }
+
+    #[test]
+    fn an_o_inside_a_cluster_takes_the_next_argument() {
+        // dash reads the cluster letter by letter and each `o` consumes one name,
+        // so this is errexit plus nounset -- not an illegal option.
+        let (status, out, err) = run_capturing("set -eo nounset\necho $-");
+        assert_eq!((status, err.as_str()), (0, ""));
+        assert_eq!(out, "eu\n");
+        // Two of them consume two names, leaving nothing behind as a parameter.
+        let (status, out, _) = run_capturing("set -oo errexit noglob\necho $-[$1]");
+        assert_eq!((status, out.as_str()), (0, "ef[]\n"));
+    }
+
+    #[test]
+    fn dollar_dash_is_in_dash_optlist_order() {
+        // Not alphabetical and not the order they were set: dash prints them in
+        // its optlist order, which puts f before u whichever way round they came.
+        let (_, out, _) = run_capturing("set -uf\necho $-");
+        assert_eq!(out, "fu\n");
+        let (_, out, _) = run_capturing("set -fu\necho $-");
+        assert_eq!(out, "fu\n");
+    }
+
+    #[test]
+    fn set_minus_alone_clears_xtrace_and_ends_the_options() {
+        // A lone `-` is the one dash spelling that turns -x/-v off, and it stops
+        // option processing, so what follows is a positional parameter.
+        let (_, out, _) = run_capturing("set -x -v; set -; echo [$-]");
+        assert_eq!(out, "[]\n");
+        let (_, out, _) = run_capturing("set - -e; echo [$-][$1]");
+        assert_eq!(out, "[][-e]\n");
+    }
+
+    #[test]
+    fn dot_looks_in_path_and_prefers_it_to_the_cwd() {
+        // dash resolves a name with no slash against PATH only; a file of the same
+        // name in the cwd does not win, and is not even reached unless PATH says so.
+        let base = std::env::temp_dir().join(format!("td-sh-dot-{}", std::process::id()));
+        let dir = base.join("dir");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("cmd"), "echo from-path\n").unwrap();
+        std::fs::write(base.join("cmd"), "echo from-cwd\n").unwrap();
+        let base = base.display();
+        let (status, out, _) =
+            run_capturing(&format!("cd {base}; PATH=dir; . cmd; echo status=$?"));
+        assert_eq!((status, out.as_str()), (0, "from-path\nstatus=0\n"));
+        // A slash makes it a path again, so the cwd copy is reachable that way.
+        let (_, out, _) = run_capturing(&format!("cd {base}; PATH=dir; . ./cmd"));
+        assert_eq!(out, "from-cwd\n");
+        // Not in PATH is fatal, and a directory in PATH is skipped, not sourced.
+        let (status, out, err) =
+            run_capturing(&format!("cd {base}; PATH=dir; . nope; echo reached"));
+        assert_eq!((status, out.as_str()), (2, ""));
+        assert!(err.contains("not found"), "{err:?}");
+        std::fs::remove_dir_all(base.to_string()).unwrap();
     }
 
     #[test]

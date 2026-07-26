@@ -627,10 +627,6 @@ xfail builtin-read.test.sh::read without args uses $REPLY, no splitting occurs (
 xfail builtin-set.test.sh::'set' and 'eval' round trip
 xfail builtin-set.test.sh::can continue after unknown option
 xfail builtin-set.test.sh::set +a stops exporting
-xfail builtin-set.test.sh::set - + and + -
-xfail builtin-set.test.sh::set - - and so forth
-xfail builtin-set.test.sh::set - leading single dash is ignored, turns off xtrace verbose (#2364)
-xfail builtin-set.test.sh::set - stops option processing like set --
 xfail builtin-set.test.sh::set -a exports declare variables
 xfail builtin-set.test.sh::set -a exports local variables
 xfail builtin-set.test.sh::set -a exports variables
@@ -1244,10 +1240,8 @@ xfail sh-options-bash.test.sh::SHELLOPTS reflects flags like sh -x
 xfail sh-options-bash.test.sh::export SHELLOPTS does cross-process tracing
 xfail sh-options-bash.test.sh::export SHELLOPTS does cross-process tracing with bash
 xfail sh-options-bash.test.sh::shopt -s progcomp hostcomplete are stubs (bash-completion)
-xfail sh-options.test.sh::$- with -c
 xfail sh-options.test.sh::$- with interactive shell
 xfail sh-options.test.sh::$- with pipefail
-xfail sh-options.test.sh::-n for no execution (useful with --ast-output)
 xfail sh-options.test.sh::Unimplemented options - OSH shopt -s ignore_shopt_not_impl
 xfail sh-options.test.sh::Unimplemented options - print, query, set, unset
 xfail sh-options.test.sh::interactive shell starts with emacs mode on
@@ -1257,7 +1251,6 @@ xfail sh-options.test.sh::noclobber on &> >
 xfail sh-options.test.sh::noclobber on &>> >>
 xfail sh-options.test.sh::noclobber on <>
 xfail sh-options.test.sh::noclobber on >>
-xfail sh-options.test.sh::pass long options like sh -o errexit
 xfail sh-options.test.sh::pipefail
 xfail sh-options.test.sh::set without args and assoc array variables (not in OSH)
 xfail sh-options.test.sh::set without args lists variables
@@ -1266,17 +1259,13 @@ xfail sh-options.test.sh::shopt -p -o prints 'set' options
 xfail sh-options.test.sh::shopt -p exit code (regression)
 xfail sh-options.test.sh::shopt -s nounset works in YSH, not in bash
 xfail sh-options.test.sh::shopt with no flags prints options
-xfail sh-usage.test.sh::'sh -c -z' does not try to run -z
 xfail sh-usage.test.sh::--rcfile in non-interactive shell prints warnings
 xfail sh-usage.test.sh::LC_CTYPE=invalid
 xfail sh-usage.test.sh::Set LC_ALL LC_CTYPE LC_COLLATE LANG - affects glob ?
 xfail sh-usage.test.sh::accepts -l flag
 xfail sh-usage.test.sh::osh --eval
-xfail sh-usage.test.sh::sh +c is accepted
 xfail sh-usage.test.sh::sh - and sh -- stop flag processing
 xfail sh-usage.test.sh::sh -c -- 'echo hi' does not run anything (#2637)
-xfail sh-usage.test.sh::sh -c -x 'echo hi' - order is reversed
-xfail sh-usage.test.sh::weird flag parsing -oo errexit noglob
 xfail shell-bugs.test.sh::./configure idiom
 xfail shell-grammar.test.sh::Case all on one line without trailing ;; or ;
 xfail shell-grammar.test.sh::Invalid token
