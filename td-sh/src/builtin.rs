@@ -6,7 +6,7 @@
 //! table (`process::write_fd`), never straight to `println!`, so a builtin obeys
 //! the redirections in force.
 
-use crate::exec::{Shell, Sig, R};
+use crate::exec::{Local, Shell, Sig, R};
 use crate::process::{self, read_byte, write_fd};
 use crate::{ast, exec};
 
@@ -39,6 +39,7 @@ pub enum Builtin {
     Unalias,
     Exec,
     Trap,
+    Local,
 }
 
 pub fn lookup(name: &str) -> Option<Builtin> {
@@ -70,6 +71,7 @@ pub fn lookup(name: &str) -> Option<Builtin> {
         "unalias" => Builtin::Unalias,
         "exec" => Builtin::Exec,
         "trap" => Builtin::Trap,
+        "local" => Builtin::Local,
         _ => return None,
     })
 }
@@ -112,6 +114,7 @@ pub fn run(sh: &mut Shell, bi: Builtin, argv: &[String]) -> R<()> {
         Builtin::Unset => unset(sh, argv),
         Builtin::Export => export(sh, argv, false),
         Builtin::Readonly => export(sh, argv, true),
+        Builtin::Local => local(sh, argv),
         Builtin::Read => read(sh, argv),
         Builtin::Getopts => getopts(sh, argv),
         Builtin::Test => test(sh, argv),
@@ -1376,6 +1379,67 @@ fn export(sh: &mut Shell, argv: &[String], readonly: bool) -> R<()> {
     ok(sh)
 }
 
+/// `local [name[=value]... | -]`, dash's. Not POSIX, but dash, busybox ash and
+/// bash all have it and scripts are written to it, so a `/bin/sh` without one
+/// cannot run them.
+///
+/// Each name's current binding is saved for the function's return to restore.
+/// Only the `=` form ASSIGNS; a bare `local x` declares and leaves whatever the
+/// name held, so it starts out unset only when there was no prior binding (which
+/// is why `set -u; f() { local x; echo $x; }` is an error, not a blank line).
+/// `unset` on a local then leaves it unset for the rest of the call instead of
+/// revealing the global, because the outer binding only comes back on unwind.
+fn local(sh: &mut Shell, argv: &[String]) -> R<()> {
+    if !sh.in_function {
+        return Err(sh.fatal("local: not in a function", 2));
+    }
+    // Only the FIRST save of a name matters -- the frame unwinds newest-first, so
+    // a later one is overwritten by it. Re-saving would let `while …; do local
+    // x=$i; done` grow the frame without bound for the length of the call.
+    for arg in argv.iter().skip(1) {
+        if arg == "-" {
+            if !sh.locals.iter().any(|l| matches!(l, Local::Opts(_))) {
+                sh.locals.push(Local::Opts(sh.opts));
+            }
+            continue;
+        }
+        let (name, value) = match arg.split_once('=') {
+            Some((n, v)) => (n, Some(v)),
+            None => (arg.as_str(), None),
+        };
+        if !ast::is_name(name) {
+            // Fatal, as every other `local` error is: dash reaches this through
+            // setvar, which aborts the shell. (dash only validates the valueless
+            // form -- `local 1bad=x` slips past setvareq into a name no expansion
+            // can name again. td-sh rejects both rather than store that.)
+            return Err(sh.fatal(&format!("local: {name}: bad variable name"), 2));
+        }
+        let existed = sh.vars.contains_key(name);
+        if !sh
+            .locals
+            .iter()
+            .any(|l| matches!(l, Local::Var(n, _) if n == name))
+        {
+            sh.locals
+                .push(Local::Var(name.to_string(), sh.vars.get(name).cloned()));
+        }
+        match value {
+            // `local x=v` keeps the attributes of the name it shadows, since
+            // set_var writes through the existing entry.
+            Some(v) => sh.set_var(name, v)?,
+            // A valueless `local x` only DECLARES: dash assigns nothing unless the
+            // argument carries `=`, so an existing value survives being localised
+            // (`local x=1; local x` is still 1) and only a name that did not exist
+            // starts out unset.
+            None if !existed => {
+                sh.vars.remove(name);
+            }
+            None => {}
+        }
+    }
+    ok(sh)
+}
+
 /// POSIX `getopts optstring name [arg...]`, matched to dash. Two details drive
 /// the shape: `OPTIND` is the 1-based index of the next WORD, so it advances when
 /// a clustered word is ENTERED rather than once per letter (`-ab` reports
@@ -2080,7 +2144,16 @@ fn command(sh: &mut Shell, argv: &[String]) -> R<()> {
         return status(sh, 1);
     }
     if let Some(bi) = lookup(name) {
-        return run(sh, bi, &rest);
+        // POSIX: `command` strips a builtin's special properties, which in dash
+        // means the builtin runs inside a scratch local frame -- which is why
+        // `command local s=1` leaves `s` as it was while a bare `local s=1` does
+        // not. Wrapping every builtin is a no-op by construction: declaring into a
+        // frame is what `local` is, so nothing else can observe one.
+        let saved = std::mem::take(&mut sh.locals);
+        let result = run(sh, bi, &rest);
+        exec::pop_locals(sh);
+        sh.locals = saved;
+        return result;
     }
     crate::process::exec_external(sh, &rest, &[])
 }
@@ -2435,6 +2508,83 @@ mod tests {
     fn read_splits_into_named_variables() {
         let (_, out, _) = run_capturing("printf 'x y z\\n' | { read a b; echo \"$a|$b\"; }");
         assert_eq!(out, "x|y z\n");
+    }
+
+    #[test]
+    fn local_shadows_and_is_restored_on_return() {
+        let (_, out, _) = run_capturing(
+            "x=g; y=g; f() { local x=l y; y=mut; echo \"in $x $y\"; }; f; echo \"out $x $y\"",
+        );
+        // `local y` declares without assigning, so y keeps `g` until the function
+        // writes to it -- and that write does not escape.
+        assert_eq!(out, "in l mut\nout g g\n");
+        // A name that did not exist before is removed again, not left empty.
+        let (_, out, _) = run_capturing("f() { local n=1; }; f; echo \"[${n-unset}]\"");
+        assert_eq!(out, "[unset]\n");
+    }
+
+    #[test]
+    fn a_bare_local_leaves_the_name_unset() {
+        // Only a name that did not exist starts out unset; `set -u` is then fatal.
+        let (_, out, _) = run_capturing("f() { local x; echo \"[${x-default}]\"; }; f");
+        assert_eq!(out, "[default]\n");
+        let (status, out, _) = run_capturing("set -u; f() { local x; echo $x; }; f");
+        assert_eq!((status, out.as_str()), (2, ""));
+    }
+
+    #[test]
+    fn unsetting_a_local_does_not_reveal_the_global() {
+        // dash restores the outer binding only when the frame unwinds, so within
+        // the call the name stays unset.
+        let (_, out, _) =
+            run_capturing("x=g; f() { local x=l; unset x; echo \"[${x-gone}]\"; }; f; echo $x");
+        assert_eq!(out, "[gone]\ng\n");
+    }
+
+    #[test]
+    fn each_invocation_unwinds_only_its_own_locals() {
+        let (_, out, _) = run_capturing(
+            "x=0; f() { local x=$1; [ $1 -gt 0 ] && f $(($1 - 1)); echo $x; }; f 2; echo end=$x",
+        );
+        assert_eq!(out, "0\n1\n2\nend=0\n");
+    }
+
+    #[test]
+    fn redeclaring_a_local_saves_the_outer_binding_once() {
+        // Re-declaring keeps the FIRST save, so a `local` in a loop cannot grow
+        // the frame — and the outer value still comes back intact.
+        let (_, out, _) = run_capturing(
+            "x=g; f() { i=0; while [ $i -lt 3 ]; do local x=$i; i=$((i+1)); done; echo in=$x; }; f; echo out=$x",
+        );
+        assert_eq!(out, "in=2\nout=g\n");
+        // A second, valueless declaration assigns nothing, so the value survives.
+        let (_, out, _) = run_capturing("f() { local foo=bar; local foo; echo \"[${foo-u}]\"; }; f");
+        assert_eq!(out, "[bar]\n");
+    }
+
+    #[test]
+    fn command_strips_locals_special_properties() {
+        // dash runs a `command`-invoked builtin in a scratch frame, so the local
+        // is gone the moment `command` returns -- while a bare `local` persists.
+        let (_, out, _) = run_capturing("f() { command local s=1; echo \"[${s-gone}]\"; }; f");
+        assert_eq!(out, "[gone]\n");
+        let (_, out, _) = run_capturing("f() { local s=1; echo \"[${s-gone}]\"; }; f");
+        assert_eq!(out, "[1]\n");
+    }
+
+    #[test]
+    fn local_outside_a_function_is_fatal() {
+        let (status, _, err) = run_capturing("local x=1; echo unreached");
+        assert_eq!(status, 2);
+        assert!(err.contains("not in a function"));
+    }
+
+    #[test]
+    fn local_dash_saves_the_option_set() {
+        // `local -` restores the flags on return, so `set -f` inside is undone.
+        let (_, out, _) =
+            run_capturing("f() { local -; set -f; echo in=$-; }; f; case $- in *f*) echo still;; *) echo restored;; esac");
+        assert!(out.contains("restored"), "got {out:?}");
     }
 
     #[test]

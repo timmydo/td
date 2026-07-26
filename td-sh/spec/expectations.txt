@@ -260,11 +260,8 @@ xfail assign.test.sh::Escaped = in command name
 xfail assign.test.sh::Multiple temporary envs on the stack
 xfail assign.test.sh::Reveal existence of "temp frame" (All shells disagree here!!!)
 xfail assign.test.sh::Test above without 'local' (which is not POSIX)
-xfail assign.test.sh::Using ${x-default} after unsetting a temp binding shadowing a global
-xfail assign.test.sh::Using ${x-default} after unsetting local shadowing a global
 xfail assign.test.sh::declare -A dict does not remove existing arrays (OSH regression)
 xfail assign.test.sh::declare -a arr does not remove existing arrays (OSH regression)
-xfail assign.test.sh::dynamic local variables (and splitting)
 xfail assign.test.sh::export a=1 no_value c=2
 xfail assign.test.sh::readonly $x where x='b c'
 xfail assign.test.sh::redirect after assignment builtin (eval redirects after evaluating arguments)
@@ -299,12 +296,7 @@ xfail ble-idioms.test.sh::Issue #1069 [52] BUG: \builtin local v=1 fails
 xfail ble-idioms.test.sh::Issue #1069 [53] - LHS array parsing a[1 + 2]=3 (see spec/array-assign for more)
 xfail ble-idioms.test.sh::Issue #1069 [53] BUG: a[1 + 1]=2, etc. fails
 xfail ble-idioms.test.sh::Issue #1069 [56] BUG: declare -p unset does not print any error message
-xfail ble-idioms.test.sh::Issue #1069 [57] - Variable v should be visible after IFS= eval 'local v=...'
-xfail ble-idioms.test.sh::Issue #1069 [57] BUG: variable v is invisible after IFS= eval 'local v=...'
 xfail ble-idioms.test.sh::Issue #1069 [59] - Assigning Str to BashArray/BashAssoc should not remove BashArray/BashAssoc
-xfail ble-idioms.test.sh::dynamic arith varname: assign
-xfail ble-idioms.test.sh::dynamic arith varname: copy/add
-xfail ble-idioms.test.sh::dynamic arith varname: read
 xfail ble-idioms.test.sh::is-array with ${var@a}
 xfail ble-idioms.test.sh::recursive arith: short circuit &&, ||
 xfail ble-idioms.test.sh::recursive arith: short circuit ?:
@@ -521,7 +513,6 @@ xfail builtin-echo.test.sh::incomplete unicode escape
 xfail builtin-eval-source.test.sh::Eval with syntax error
 xfail builtin-eval-source.test.sh::Source with syntax error
 xfail builtin-eval-source.test.sh::eval YSH block with 'break continue return error'
-xfail builtin-eval-source.test.sh::eval string with 'break continue return error'
 xfail builtin-eval-source.test.sh::source doesn't crash when targeting a directory
 xfail builtin-eval-source.test.sh::source finds files in PATH before current dir
 xfail builtin-eval-source.test.sh::source looks in PATH for files
@@ -766,10 +757,8 @@ xfail builtin-vars.test.sh::Export sets a global variable that persists after ex
 xfail builtin-vars.test.sh::Exporting a parent func variable (dynamic scope)
 xfail builtin-vars.test.sh::Make an existing local variable readonly
 xfail builtin-vars.test.sh::Unset a function without -f
-xfail builtin-vars.test.sh::Unset and scope (bug #653)
 xfail builtin-vars.test.sh::Unset exported variable, then define it again.  It's NOT still exported.
 xfail builtin-vars.test.sh::Unset readonly variable
-xfail builtin-vars.test.sh::Use local twice
 xfail builtin-vars.test.sh::assign to readonly variable
 xfail builtin-vars.test.sh::assign to readonly variable - errexit
 xfail builtin-vars.test.sh::can't export associative array (strict_array)
@@ -780,16 +769,13 @@ xfail builtin-vars.test.sh::unset -v assoc (related to issue #661)
 xfail builtin-vars.test.sh::unset a[-1] (bf.bash regression)
 xfail builtin-vars.test.sh::unset a[-1] in sparse array (bf.bash regression)
 xfail builtin-vars.test.sh::unset assoc errors
-xfail builtin-vars.test.sh::unset of local reveals variable in higher scope
 xfail case_.test.sh::Pattern ? matches 1 code point (many bytes), but not multiple code points
 xfail case_.test.sh::\(\) in pattern (regression)
 xfail case_.test.sh::matching every byte against itself
-xfail command-parsing.test.sh::Prefix env on assignment
 xfail command-sub-ksh.test.sh::${ echo hi }  without semi-colon
 xfail command-sub-ksh.test.sh::${ echo hi;}
 xfail command-sub-ksh.test.sh::${|REPLY=hi}
 xfail command-sub-ksh.test.sh::for loop / case
-xfail command-sub.test.sh::Command Sub in local sets exit code
 xfail command-sub.test.sh::Command sub with here doc
 xfail command-sub.test.sh::Double Quotes in Command Sub in Double Quotes
 xfail command-sub.test.sh::Escaped quote in [[ ]]
@@ -876,15 +862,10 @@ xfail empty-bodies.test.sh::Empty then/fi
 xfail errexit-osh.test.sh::OLD: command sub in conditional, with inherit_errexit
 xfail errexit-osh.test.sh::OLD: command sub in redirect in conditional
 xfail errexit-osh.test.sh::Regression
-xfail errexit-osh.test.sh::What's in strict:all?
 xfail errexit-osh.test.sh::command sub with inherit_errexit and command_sub_errexit
 xfail errexit-osh.test.sh::command sub with inherit_errexit only
-xfail errexit-osh.test.sh::command_sub_errexit causes local d=$(date %x) to fail
 xfail errexit-osh.test.sh::command_sub_errexit stops at first error
 xfail errexit-osh.test.sh::local and inherit_errexit / command_sub_errexit
-xfail errexit-osh.test.sh::local: last command fails and also keeps going
-xfail errexit-osh.test.sh::local: middle command fails and keeps going
-xfail errexit-osh.test.sh::strict_errexit and assignment builtins (local, export, readonly ...)
 xfail errexit-osh.test.sh::strict_errexit and command sub in export / readonly
 xfail errexit-osh.test.sh::strict_errexit and errexit disabled
 xfail errexit-osh.test.sh::strict_errexit disallows pipeline
@@ -1099,7 +1080,6 @@ xfail parse-errors.test.sh::Bad var sub caught at parse time
 xfail parse-errors.test.sh::Long Token - 65535 bytes
 xfail parse-errors.test.sh::Token that's too long for Oils - 65536 bytes
 xfail parse-errors.test.sh::bad var name in export
-xfail parse-errors.test.sh::bad var name in local
 xfail parse-errors.test.sh::do unexpected
 xfail parse-errors.test.sh::{ is its own word, needs a space
 xfail parse-errors.test.sh::} is a parse error
@@ -1270,9 +1250,6 @@ xfail serialize.test.sh::printf %q unicode
 xfail serialize.test.sh::printf %q unprintable
 xfail serialize.test.sh::set
 xfail serialize.test.sh::xtrace
-xfail sh-func.test.sh::Assign a local and global on same line
-xfail sh-func.test.sh::Dynamic Scope
-xfail sh-func.test.sh::Dynamic Scope Mutation (wow this is bad)
 xfail sh-func.test.sh::Subshell function
 xfail sh-options-bash.test.sh::If shopt --set xtrace is allowed, it should update SHELLOPTS, not BASHOPTS
 xfail sh-options-bash.test.sh::OSH calling bash with SHELLOPTS does not change braceexpand
@@ -1329,7 +1306,6 @@ xfail subshell.test.sh::Subshell with redirects
 xfail tilde.test.sh::${undef:-~}
 xfail tilde.test.sh::a[x]=foo:~ has tilde expansion
 xfail tilde.test.sh::temp assignment x=~ env
-xfail tilde.test.sh::tilde expansion an assignment keyword
 xfail tilde.test.sh::tilde expansion of word after redirect
 xfail tilde.test.sh::x=${undef-~:~}
 xfail toysh-posix.test.sh::Can't parse extra }

@@ -410,6 +410,9 @@ pub fn fork_shell(sh: &Shell) -> Shell {
         cwd: sh.cwd.clone(),
         fds: sh.fds.clone(),
         in_function: sh.in_function,
+        // A clone unwinds only what it declares itself; the caller's frame belongs
+        // to the shell that keeps running.
+        locals: Vec::new(),
         loop_depth: 0,
         run_depth: sh.run_depth,
         cmdsubst_count: sh.cmdsubst_count,

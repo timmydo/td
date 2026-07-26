@@ -37,6 +37,15 @@ pub struct Var {
     pub readonly: bool,
 }
 
+/// A binding displaced by `local`, kept so the function's return can put it back.
+/// `None` means the name did not exist, so restoring it is an unset.
+#[derive(Clone, Debug)]
+pub enum Local {
+    Var(String, Option<Var>),
+    /// `local -`, which saves the option set rather than a variable.
+    Opts(Opts),
+}
+
 /// The `set -o` flags the interpreter honours.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Opts {
@@ -79,6 +88,10 @@ pub struct Shell {
     pub cwd: PathBuf,
     pub fds: Fds,
     pub in_function: bool,
+    /// Bindings this function invocation's `local`s displaced, in declaration
+    /// order. `call_function` swaps in a fresh list per call, so each invocation
+    /// unwinds only its own — including a recursive one's.
+    pub locals: Vec<Local>,
     pub loop_depth: u32,
     /// Runtime recursion depth (function calls + command substitution), bounded so
     /// `f() { f; }; f` and `$( $( … ) )` error instead of overflowing the stack.
@@ -148,6 +161,7 @@ impl Shell {
             cwd,
             fds: Fds::new(),
             in_function: false,
+            locals: Vec::new(),
             loop_depth: 0,
             run_depth: 0,
             cmdsubst_count: 0,
@@ -186,6 +200,7 @@ impl Shell {
             cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/")),
             fds: Fds::new(),
             in_function: false,
+            locals: Vec::new(),
             loop_depth: 0,
             run_depth: 0,
             cmdsubst_count: 0,
@@ -734,12 +749,21 @@ fn run_builtin(
     // exported for that run so a builtin that itself execs an external utility
     // (`FOO=bar command extcmd`) passes it through; the saved prior `Var` carries the
     // original export flag, which the restore below puts back.
+    // `local` is the exception: dash groups it with the declaration utilities, whose
+    // prefix assignment persists (`export`/`readonly` are special builtins and took
+    // the branch above). Rolling it back here would also undo what `local` itself
+    // just assigned to the same name, leaving `x=t local x=l` with neither value.
+    let transient = !matches!(bi, builtin::Builtin::Local);
     let mut saved_vars: Vec<(String, Option<Var>)> = Vec::with_capacity(assigns.len());
     for a in assigns {
         let value = expand::expand_assign(sh, &a.value)?;
-        saved_vars.push((a.name.clone(), sh.vars.get(&a.name).cloned()));
+        if transient {
+            saved_vars.push((a.name.clone(), sh.vars.get(&a.name).cloned()));
+        }
         sh.set_var(&a.name, &value)?;
-        sh.export(&a.name);
+        if transient {
+            sh.export(&a.name);
+        }
     }
     let result = match process::apply_redirs(sh, redirs)? {
         process::RedirOutcome::Applied(saved) => {
@@ -776,6 +800,24 @@ fn expand_assignments(
     Ok(out)
 }
 
+/// Put back what a frame's `local`s displaced, newest first -- a function's on
+/// return, or the scratch one `command` runs a builtin in. The writes go straight
+/// to the map: a name made `readonly` inside the frame must not block the restore
+/// of the binding that existed before it.
+pub fn pop_locals(sh: &mut Shell) {
+    while let Some(entry) = sh.locals.pop() {
+        match entry {
+            Local::Var(name, Some(var)) => {
+                sh.vars.insert(name, var);
+            }
+            Local::Var(name, None) => {
+                sh.vars.remove(&name);
+            }
+            Local::Opts(opts) => sh.opts = opts,
+        }
+    }
+}
+
 fn call_function(
     sh: &mut Shell,
     body: &Arc<Cmd>,
@@ -801,6 +843,7 @@ fn call_function(
     sh.getopts_off = -1;
     let was_in_function = sh.in_function;
     let saved_loop_depth = sh.loop_depth;
+    let saved_locals = std::mem::take(&mut sh.locals);
     sh.in_function = true;
     sh.loop_depth = 0;
     // Not `?`: a fatal error in a redirection WORD (`f 2>${u:?}`) must still unwind
@@ -816,6 +859,8 @@ fn call_function(
         Ok(process::RedirOutcome::Failed) => Ok(()),
         Err(sig) => Err(sig),
     };
+    pop_locals(sh);
+    sh.locals = saved_locals;
     sh.params = saved_params;
     (sh.getopts_optind, sh.getopts_off) = saved_getopts;
     sh.in_function = was_in_function;
