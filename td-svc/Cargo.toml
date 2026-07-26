@@ -1,0 +1,51 @@
+[package]
+name = "td-svc"
+version = "0.1.0"
+edition = "2021"
+description = "Static dependency-free service supervisor for td (ordering, backoff, log capture, shutdown)"
+license = "GPL-3.0-or-later"
+
+[[bin]]
+name = "td-svc"
+path = "src/main.rs"
+
+# The engine root `exclude`s td-svc, but that only stops cargo at THAT manifest.
+# From a nested checkout (`.claude/worktrees/*` lives physically under the main
+# checkout) cargo walks past the excluding root and is captured by the OUTER
+# manifest. An explicit empty `[workspace]` pins THIS as the root and stops the
+# walk, and is what actually makes this crate standalone — the exclude entry
+# only keeps the root's inventory honest. Same reason td-sh/td-util/td-init/
+# td-login carry one.
+[workspace]
+
+# td-svc is a TARGET-built userland program, NOT part of the control-plane
+# engine: a standalone crate with zero external dependencies (pure std), so the
+# engine's one-workspace-lock gate never inspects it. The recipe compiles
+# src/main.rs directly with rustc; this manifest exists so the same source is an
+# independently `cargo clippy`/`cargo test`-able crate.
+#
+# Unlike td-init/td-login/td-netd/td-kexec, this crate is NOT an unsafe
+# exception: src/main.rs `#![forbid(unsafe_code)]`s and there is no scoped
+# allow anywhere. DESIGN.md I1 states that as an invariant and I2 states why
+# `pre_exec` is banned even though it needs no `unsafe` of ours — a pre-exec
+# closure runs between fork and exec in a multithreaded process, where an
+# allocation or a lock held elsewhere at fork time deadlocks the child.
+[lints.clippy]
+unwrap_used = "deny"       # no panicking .unwrap(); return Result/Option, use ?
+expect_used = "deny"       # no panicking .expect()
+panic = "deny"             # no panic! on the happy/error path
+unreachable = "deny"
+todo = "deny"
+unimplemented = "deny"
+indexing_slicing = "deny"  # use .get(i) over xs[i] / &xs[a..b]
+
+# The SHIPPED td-svc is built by recipes/src/recipes/td-svc.rs invoking rustc
+# DIRECTLY (never `cargo build`), and that recipe mirrors opt-level=s /
+# panic=abort / strip explicitly. This profile therefore governs only local
+# `cargo build --release`; lto is intentionally dropped because a single-crate
+# direct rustc build cannot mirror it (a cargo-only, cross-crate step), so
+# declaring it here would be a contract the shipped artifact silently ignores.
+[profile.release]
+opt-level = "s"
+panic = "abort"
+strip = true

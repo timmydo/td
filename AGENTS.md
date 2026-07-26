@@ -344,11 +344,18 @@ td's Rust is defensive and minimal-surface.
   `[[package]]` entries (the known path members) AND no external `source = ` line
   (path members carry none), so a new registry/git dep OR a new path member both red it.
   The target-side `td-kexec`, `td-sh`, `td-txt`, `td-netd`, `td-boot`, `td-util`,
-  `td-init`, `td-firstboot`, and `td-login` crates outside the workspace each keep
-  their own 1-package lock; `td-sh`, `td-txt`, `td-boot`, `td-util`, and
-  `td-firstboot` contain no `unsafe`. `td-review` (the host-side integrator
-  branch-review/landing TUI) keeps one too: it is in NEITHER bootstrap graph — no
-  recipe builds it and it never enters a closure — but it is pure `std`, `forbid`s
+  `td-init`, `td-firstboot`, `td-login`, and `td-svc` crates outside the workspace
+  each keep their own 1-package lock; `td-sh`, `td-txt`, `td-boot`, `td-util`,
+  `td-firstboot`, and `td-svc` contain no `unsafe`. `td-svc` (the service
+  supervisor: ordering, restart backoff, log capture, ordered shutdown, and
+  Ctrl-Alt-Del) is deliberately NOT a fifth exception — it `#![forbid(unsafe_code)]`s,
+  and `td-svc/DESIGN.md` is its normative specification, recording both why every
+  capability it needs is reachable through safe `std` and the invariants no compiler
+  checks (no `pre_exec`, liveness read from `/proc` rather than inferred from an exit
+  status, and a console that is neither skippable nor indefinitely delayed).
+  `td-review` (the host-side integrator branch-review/landing TUI) keeps one
+  too: it is in NEITHER bootstrap graph — no recipe builds it and it never
+  enters a closure — but it is pure `std`, `forbid`s
   `unsafe_code`, and rides the same cargo-test gate, so the coding rules are
   enforced on it like any other td crate. A new standalone crate must be added to
   that gate and to `builder/src/affected.rs` in its landing, or its lints and tests

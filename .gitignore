@@ -63,6 +63,10 @@ td-firstboot/target/
 # scratch dir instead.
 td-txt/target/
 
+# td-svc: same — the supervisor is built directly while developing, and by
+# rustc in its recipe; the gate uses a scratch CARGO_TARGET_DIR.
+td-svc/target/
+
 # td-login: same — the credential multicall is shipped by its recipe as a direct
 # rustc build, but compiled here by the cargo-test gate and by hand when
 # validating the login chain.

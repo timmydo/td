@@ -42,7 +42,7 @@
 [workspace]
 resolver = "2"
 members = ["builder", "recipes", "engine"]
-exclude = ["net", "td-kexec", "td-sh", "td-txt", "td-netd", "td-boot", "td-util", "td-init", "td-firstboot", "td-review", "tests/sshd"]
+exclude = ["net", "td-kexec", "td-sh", "td-txt", "td-netd", "td-boot", "td-util", "td-init", "td-firstboot", "td-review", "td-svc", "tests/sshd"]
 
 [profile.release]
 # Keep the release profile explicit and minimal so the reproducibility oracle

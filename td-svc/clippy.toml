@@ -1,0 +1,6 @@
+# td-svc is linted with --all-targets, so its tests are held to the AGENTS.md
+# rules too. AGENTS.md exempts `#[cfg(test)]` from the panic lints.
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+allow-panic-in-tests = true
+allow-indexing-slicing-in-tests = true
