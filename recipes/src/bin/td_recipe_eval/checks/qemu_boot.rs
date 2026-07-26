@@ -91,6 +91,11 @@ const TD_UTIL_RUNTIME_MARKER: &str = td_recipe::ladder::TD_UTIL_RUNTIME_MARKER;
 /// serves has been exercised — the reversible ones by running, the irreversible ones
 /// (`reboot`/`poweroff`/`halt`/`switch_root`) by refusing a bad argument with a diagnostic.
 const TD_INIT_RUNTIME_MARKER: &str = td_recipe::ladder::TD_INIT_RUNTIME_MARKER;
+/// Printed by the root-owned health target after `/bin/su` — td-login — switched to the
+/// unprivileged login user AND the switched process read its own credentials back out of
+/// `/proc/self/status` and they matched exactly. This is the only marker that asserts the
+/// RESULT of a credential change rather than that something ran.
+const TD_LOGIN_RUNTIME_MARKER: &str = td_recipe::ladder::TD_LOGIN_RUNTIME_MARKER;
 
 /// The line `/etc/rootcheck` prints once it has confirmed `/` is a READ-ONLY erofs
 /// mount (re #550). `qemu-boot-system` asserts it to prove the switched-into root is
@@ -219,6 +224,7 @@ struct ConsoleEvidence {
     sshd: bool,
     td_util_runtime: bool,
     td_init_runtime: bool,
+    td_login_runtime: bool,
     persist_write: bool,
     persist_read: bool,
     boot_success: bool,
@@ -769,7 +775,9 @@ pub(crate) fn run_system(runner: &RecipeCheckRunner) -> Result<(), String> {
          target-owned writable @var \
          ({SYSTEM_STATE_WRITABLE_MARKER}, {SYSTEM_STATE_OWNER_MARKER}), ran uutils \
          ({UUTILS_RUNTIME_MARKER}), ripgrep+fd ({RIPGREP_FD_RUNTIME_MARKER}), td-util \
-         ({TD_UTIL_RUNTIME_MARKER}) and the td-init boot glue ({TD_INIT_RUNTIME_MARKER}), \
+         ({TD_UTIL_RUNTIME_MARKER}), the td-init boot glue ({TD_INIT_RUNTIME_MARKER}) and a \
+         td-login credential switch the switched process read back and confirmed \
+         ({TD_LOGIN_RUNTIME_MARKER}), \
          and unmounted state \
          before exit ({SYSTEM_SHUTDOWN_MARKER})",
         td_boot_protocol::DEFAULT_BOOT_ATTEMPTS,
@@ -1110,6 +1118,23 @@ fn validate_system_boot(
              rather than acting on it. That last class is the one to read carefully: a refusal \
              probe that fails means an irreversible applet ran something it should have rejected. \
              Last serial output:\n{}",
+            tail(&result.console, 80)
+        ));
+    }
+    if !result.evidence.td_login_runtime {
+        return Err(format!(
+            "the root/userland/sshd/td-util/td-init health checks passed, but the td-login \
+             runtime marker ({TD_LOGIN_RUNTIME_MARKER:?}) was absent — `/bin/su` reached the \
+             unprivileged login user (every other health leg above runs through it, so it \
+             must have), but the switched process did not read its own credentials back as \
+             the ones the switch asked for. The console names the disagreement \
+             (`real/effective/saved/filesystem uid is …, expected …`, or `supplementary \
+             groups are …`). Read this one carefully: it is the ONLY check on this image \
+             that would notice a credential switch which started a perfectly working \
+             session while leaving a residual credential attached — a `setuid(2)` issued \
+             before `setgroups(2)` drops the uid and silently keeps root's supplementary \
+             groups, and every other marker here still prints. See \
+             td-login/THREAT-MODEL.md. Last serial output:\n{}",
             tail(&result.console, 80)
         ));
     }
@@ -2509,6 +2534,7 @@ fn evidence_marker_max_len(target: &[u8]) -> usize {
         SSHD_MARKER.len(),
         TD_UTIL_RUNTIME_MARKER.len(),
         TD_INIT_RUNTIME_MARKER.len(),
+        TD_LOGIN_RUNTIME_MARKER.len(),
         SYSTEM_PERSIST_WRITE_MARKER.len(),
         SYSTEM_PERSIST_READ_MARKER.len(),
         SYSTEM_BOOT_SUCCESS_MARKER.len(),
@@ -2627,6 +2653,11 @@ fn latch_console_evidence(evidence: &mut ConsoleEvidence, buf: &[u8], target: &[
         &mut evidence.td_init_runtime,
         buf,
         TD_INIT_RUNTIME_MARKER.as_bytes(),
+    );
+    latch_marker(
+        &mut evidence.td_login_runtime,
+        buf,
+        TD_LOGIN_RUNTIME_MARKER.as_bytes(),
     );
     latch_marker(
         &mut evidence.persist_write,
@@ -3067,7 +3098,7 @@ mod tests {
     /// this: its result is dominated by the id-bearing markers (marker + space + 64-char
     /// hex), so a "no marker exceeds the max" assertion cannot fail and would only look like
     /// a guard. The rescan window is covered behaviourally instead, by the split tests below.
-    fn all_console_markers() -> [&'static str; 29] {
+    fn all_console_markers() -> [&'static str; 30] {
         [
             MARKER,
             EROFS_MARKER,
@@ -3098,6 +3129,7 @@ mod tests {
             SSHD_MARKER,
             TD_UTIL_RUNTIME_MARKER,
             TD_INIT_RUNTIME_MARKER,
+            TD_LOGIN_RUNTIME_MARKER,
         ]
     }
 

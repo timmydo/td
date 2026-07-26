@@ -6,13 +6,14 @@
 //! 
 //! clippy leg (AGENTS.md → "Rust code"): the engine workspace (builder, recipes,
 //! and the shared std-only engine lib), td-kexec, td-sh, td-txt, td-netd, td-boot,
-//! td-util, td-init, and td-firstboot must lint
+//! td-util, td-init, td-firstboot, and td-login must lint
 //! clean under the `[lints]` table each Cargo.toml declares at `deny` — NO panicking
 //! surface (unwrap/expect/panic!/unreachable!/todo!/unimplemented!), `.get(i)` over
 //! panicking `xs[i]`, and `unsafe` confined to the raw-syscall layer (builder's is
-//! sys.rs; td-kexec, td-netd and td-init carry the three recorded target-side
-//! exceptions — td-init's own confinement test additionally pins its scoped-allow
-//! count and syscall roster, which the compiler cannot check).
+//! sys.rs; td-kexec, td-netd, td-init and td-login carry the four recorded target-side
+//! exceptions — td-init's and td-login's own confinement tests additionally pin their
+//! scoped-allow counts and syscall rosters, and td-login's the ORDER its three
+//! credential syscalls are issued in, none of which the compiler checks).
 //! Existing code is grandfathered (per-file `#![allow]` in modules; per-item `#[allow]` on the
 //! crate root's own fns/impls — a crate-root inner `#![allow]` is crate-GLOBAL and
 //! would silently exempt everything), so a denied lint reds ONLY on NEW code. Also
@@ -20,11 +21,11 @@
 //! Cargo.lock and stay dependency-free — asserted two ways so BOTH a registry/git
 //! dep AND a new path member are caught: exactly 3 `[[package]]` entries (the known
 //! members) AND no external `source = ` line (path members carry none). td-kexec,
-//! td-sh, td-txt, td-netd, td-boot, td-util, td-init, and td-firstboot each keep a
-//! 1-package lock. They are TARGET-built programs (the guest kexec helper, the
+//! td-sh, td-txt, td-netd, td-boot, td-util, td-init, td-firstboot, and td-login
+//! each keep a 1-package lock. They are TARGET-built programs (the guest kexec helper, the
 //! /bin/sh replacement, the grep/sed text multicall, the network daemon, the boot
-//! shim, the diagnostics and boot-glue multicalls, and the per-machine identity
-//! provisioner),
+//! shim, the diagnostics, boot-glue and credential multicalls, and the per-machine
+//! identity provisioner),
 //! not engine code, but are pure std and compile offline, so
 //! they lint/test here with the engine crates. td-firstboot is linted
 //! `--all-targets` (its clippy.toml carries the AGENTS.md `#[cfg(test)]` panic
@@ -121,6 +122,8 @@ pub fn gate() -> GateDef {
 	test "$i" -eq 1 || { echo "ERROR: td-init is no longer dependency-free (Cargo.lock lists $i packages; it must carry ZERO crates — AGENTS.md 'Rust code')" >&2; exit 1; }; \
 	fb=`"$td" text count-line-exact '[[package]]' td-firstboot/Cargo.lock`; \
 	test "$fb" -eq 1 || { echo "ERROR: td-firstboot is no longer dependency-free (Cargo.lock lists $fb packages; it must carry ZERO crates — AGENTS.md 'Rust code')" >&2; exit 1; }; \
+	lg=`"$td" text count-line-exact '[[package]]' td-login/Cargo.lock`; \
+	test "$lg" -eq 1 || { echo "ERROR: td-login is no longer dependency-free (Cargo.lock lists $lg packages; it must carry ZERO crates — AGENTS.md 'Rust code')" >&2; exit 1; }; \
 rustpath=`"$td" provision-rust` || exit $?; \
 ccpath=`"$td" provision-cc` || exit $?; \
 scratch="$PWD/.cargo-test-scratch"; \
@@ -138,6 +141,7 @@ CARGO_HOME="$scratch/home" CARGO_TARGET_DIR="$scratch/target" \
 	    cargo clippy --frozen --manifest-path td-util/Cargo.toml; \
 	    cargo clippy --frozen --manifest-path td-init/Cargo.toml; \
 	    cargo clippy --frozen --manifest-path td-firstboot/Cargo.toml --all-targets; \
+	    cargo clippy --frozen --manifest-path td-login/Cargo.toml; \
 	    cargo clippy --frozen --manifest-path td-review/Cargo.toml --all-targets; \
 	    cargo test  --frozen --workspace; \
 	    cargo test  --frozen --manifest-path td-kexec/Cargo.toml; \
@@ -148,11 +152,12 @@ CARGO_HOME="$scratch/home" CARGO_TARGET_DIR="$scratch/target" \
 	    cargo test  --frozen --manifest-path td-util/Cargo.toml; \
 	    cargo test  --frozen --manifest-path td-init/Cargo.toml; \
 	    cargo test  --frozen --manifest-path td-firstboot/Cargo.toml; \
+	    cargo test  --frozen --manifest-path td-login/Cargo.toml; \
 	    cargo test  --frozen --manifest-path td-review/Cargo.toml --bins' 2>&1 | tee "$log"; \
 	"$td" text cargo-test-ok "$log" || \
 	  { echo "ERROR: cargo test reported no passing tests (vacuous run?)" >&2; exit 1; }; \
 rm -rf "$scratch"; \
-echo "PASS: cargo-test — the engine workspace (builder + recipes + engine), td-kexec, td-sh, td-txt, td-netd, td-boot, td-util, td-init, td-firstboot, and td-review are dependency-free and lint clean; their unit tests pass (guix-free toolchain)."
+echo "PASS: cargo-test — the engine workspace (builder + recipes + engine), td-kexec, td-sh, td-txt, td-netd, td-boot, td-util, td-init, td-firstboot, td-login, and td-review are dependency-free and lint clean; their unit tests pass (guix-free toolchain)."
 
 "##,
     }

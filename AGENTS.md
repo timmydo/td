@@ -285,7 +285,7 @@ td's Rust is defensive and minimal-surface.
   raw-syscall layer (`builder/src/sys.rs` and its callers `nar.rs`/`sandbox.rs`),
   which carry `#![allow(unsafe_code)]` so `builder` can be `libc`-free. Every other
   engine crate (the shared `engine` lib and `recipes`/`fetch`/`feed`/`subst`)
-  `forbid`s `unsafe_code`. There are THREE target-side exceptions, each a standalone
+  `forbid`s `unsafe_code`. There are FOUR target-side exceptions, each a standalone
   crate OUTSIDE the `builder`/`recipes`/`engine` workspace whose only `unsafe` is that
   same `syscall`-instruction layer under a scoped `#[allow]` (the crate itself
   `#![deny(unsafe_code)]`s): (1) the `td-kexec` guest helper, confined to exactly two
@@ -318,8 +318,25 @@ td's Rust is defensive and minimal-surface.
   init supports no `ctrlaltdel`, `shutdown` or `restart` inittab action. A tenth
   syscall, a new `MS_*` bit, or a second scoped `#[allow]` is an amendment here;
   `td-init/src/main.rs`'s confinement tests assert all three against the crate's own
-  source, since the compiler alone cannot. Do not add `unsafe`
-  anywhere else; a new `unsafe` surface is a reviewed amendment recorded here.
+  source, since the compiler alone cannot. And (4) the
+  `td-login` credential multicall (`login`/`su`), whose one `syscall2` body in
+  `td-login/src/sys.rs` carries EXACTLY three syscalls — `setgroups(2)`, `setgid(2)`,
+  `setuid(2)` — issued once each, in that order, from the single `creds::apply`, which
+  then re-reads `/proc/self/status` and refuses to `exec` unless the kernel agrees with
+  what was asked for. This one is NOT reachable through safe `std`: `CommandExt::groups`
+  is unstable (`feature(setgroups)`), so the only stable behaviour drops every
+  supplementary group, and `std` applies credentials in a forked child where nothing can
+  read back what took — and the readback is the defence, because a `setuid(2)` issued
+  before `setgroups(2)` starts a working session that silently keeps the previous
+  holder's groups. Deliberately NOT in that surface: `getuid`/`getgid`/`getgroups`
+  (`/proc/self/status` answers all three and has to be read anyway),
+  `setresuid`/`setreuid` (a second way to set the same thing is a second way to get it
+  wrong), `execve` (safe `CommandExt::exec`), and `umask`. `td-login/THREAT-MODEL.md` is
+  the normative specification for that crate and its confinement tests assert what it
+  says — including the ORDER of the three calls, which no compiler checks; a fourth
+  syscall, or relaxing the fail-closed authentication policy, is an amendment there AND
+  here. Do not add `unsafe` anywhere else; a new `unsafe` surface is a reviewed
+  amendment recorded here.
 - **The engine is dependency-free.** `builder`, `recipes`, and the shared std-only
   `engine` lib (the one copy of the hand-rolled JSON + SHA-256 both bins use) form one
   cargo workspace and carry **zero external crates** (pure `std`) — they must stay that
@@ -327,9 +344,9 @@ td's Rust is defensive and minimal-surface.
   `[[package]]` entries (the known path members) AND no external `source = ` line
   (path members carry none), so a new registry/git dep OR a new path member both red it.
   The target-side `td-kexec`, `td-sh`, `td-txt`, `td-netd`, `td-boot`, `td-util`,
-  `td-init`, and `td-firstboot` crates outside the workspace each keep their own
-  1-package lock; `td-sh`, `td-txt`, `td-boot`, `td-util`, and `td-firstboot`
-  contain no `unsafe`. `td-review` (the host-side integrator
+  `td-init`, `td-firstboot`, and `td-login` crates outside the workspace each keep
+  their own 1-package lock; `td-sh`, `td-txt`, `td-boot`, `td-util`, and
+  `td-firstboot` contain no `unsafe`. `td-review` (the host-side integrator
   branch-review/landing TUI) keeps one too: it is in NEITHER bootstrap graph — no
   recipe builds it and it never enters a closure — but it is pure `std`, `forbid`s
   `unsafe_code`, and rides the same cargo-test gate, so the coding rules are

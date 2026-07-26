@@ -244,6 +244,22 @@ pub const TD_UTIL_RUNTIME_MARKER: &str = "TD-UTIL-RUN-OK";
 /// reaches the health target unless td-init ran the inittab and pivoted the root.
 pub const TD_INIT_RUNTIME_MARKER: &str = "TD-INIT-RUN-OK";
 
+/// Printed by `/etc/bootsuccess` only after `/bin/su` — td-login — has switched to
+/// the unprivileged login user AND the kernel's own view of the switched process
+/// matched what the switch asked for, read back out of `/proc/self/status` by
+/// `td-login verify-credentials`.
+///
+/// Unlike the td-util and td-init farms, td-login's success path needs no synthetic
+/// probe: `login -f` is how this image reaches its greeter and `su` is how every
+/// other unprivileged health leg runs, so a td-login that fails to start a session
+/// fails the boot outright. What those legs CANNOT see is the failure that matters
+/// most — a switch that started a working session while leaving a residual
+/// credential attached. A `setuid(2)` issued before `setgroups(2)` drops the uid and
+/// silently keeps root's supplementary groups; every marker on this image still
+/// prints. So this one asserts the RESULT: all four uid columns, all four gid
+/// columns, and the supplementary set exactly. See td-login/THREAT-MODEL.md.
+pub const TD_LOGIN_RUNTIME_MARKER: &str = "TD-LOGIN-RUN-OK";
+
 /// Kernel-cmdline token the headless `qemu-boot-system` oracle appends so the greeter
 /// waits for the root-owned health/update transaction and then exits. `tty-session`
 /// turns that exit into a clean VM poweroff. Without it, the greeter is interactive.

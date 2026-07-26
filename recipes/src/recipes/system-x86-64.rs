@@ -8,7 +8,8 @@ use crate::ladder::{
     SYSTEM_NET_REACH_MARKER, SYSTEM_NET_RESOLVE_MARKER, SYSTEM_NET_UP_MARKER,
     SYSTEM_PERSIST_READ_MARKER, SYSTEM_PERSIST_WRITE_MARKER, SYSTEM_ROOT_RO_MARKER,
     SYSTEM_SHUTDOWN_MARKER, SYSTEM_STATE_OWNER_MARKER, SYSTEM_STATE_WRITABLE_MARKER,
-    TD_INIT_RUNTIME_MARKER, TD_UTIL_RUNTIME_MARKER, UUTILS_RUNTIME_MARKER,
+    TD_INIT_RUNTIME_MARKER, TD_LOGIN_RUNTIME_MARKER, TD_UTIL_RUNTIME_MARKER,
+    UUTILS_RUNTIME_MARKER,
 };
 use crate::types::{Recipe, Step};
 
@@ -59,10 +60,12 @@ const BOOT_FAIL_PARKED: &str = "td-boot-parked-v1";
 // qemu-boot-system` asserts the deployment state machine across repeated boots.
 //
 // Userland strategy (v0): the static Rust td-init multicall provides the boot
-// glue — PID 1, the pivot, and every mount/umount on the machine — while static
-// busybox provides the login/shell path and the text tools uutils lacks;
-// source-built Rust uutils provides the interactive core file/text userland
-// with its declared glibc runtime closure.
+// glue — PID 1, the pivot, and every mount/umount on the machine — the static
+// Rust td-login serves the credential switch (/bin/{login,su}) and td-util the
+// diagnostics, while static busybox provides the shell, the tty setup and the
+// text tools uutils lacks; source-built Rust uutils provides the interactive
+// core file/text userland with its declared glibc runtime closure.
+
 //
 // Layout: the image is STORE-NATIVE. The busybox binary is packed at its
 // content-addressed /td/store/<hash>-busybox-x86-64/bin path, and /bin is a PURE symlink
@@ -98,9 +101,31 @@ struct SystemDef {
     os_version: &'static str,
     /// Welcome banner printed by the login shell (via `/etc/profile`).
     motd: &'static str,
-    /// The user busybox getty auto-logs-in on ttyS0 (no password prompt).
+    /// The user getty auto-logs-in on ttyS0, through `/etc/autologin` running
+    /// `login -f`. td-login refuses `-f` for a LOCKED account, so this user must be
+    /// `passwordless` — `system_def_is_self_consistent` holds that.
     autologin: &'static str,
     users: &'static [User],
+}
+
+/// Account names are embedded UNQUOTED in generated root shell — `/bin/su -s /bin/sh
+/// <name> -c …` in rootcheck and every health leg, and `/bin/login -f <name>` in
+/// /etc/autologin — and unquoted in the colon-separated /etc/{passwd,group,shadow}
+/// this recipe writes. A name carrying `$(…)` would run as ROOT at sysinit; one
+/// carrying `:` would silently restructure the account database. This is the same
+/// hazard `valid_home` below already guards, applied to the other string that
+/// reaches those scripts.
+///
+/// The grammar is td-login's own `plausible_name`, so a name this accepts is one the
+/// image's `login` will look up (`the_account_grammar_matches_the_one_td_login_uses`
+/// pins the two together).
+#[cfg(test)]
+fn valid_account_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 32
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
 }
 
 #[cfg(test)]
@@ -159,17 +184,20 @@ const SYSTEM: SystemDef = SystemDef {
 };
 // ────────────────────────────────────────────────────────────────────────────────
 
-/// The real-root `/bin` is a symlink farm split across FOUR multicall binaries, each
-/// dispatching on argv[0]'s basename: the static **busybox** (the shell and the login/tty
-/// glue), the static Rust **td-init** (the boot glue — see `TD_INIT_FARM`), the static
-/// Rust **td-util** (diagnostics), and the dynamically-linked Rust **uutils** `coreutils`
+/// The real-root `/bin` is a symlink farm split across FIVE multicall binaries, each
+/// dispatching on argv[0]'s basename: the static **busybox** (the shell and the tty glue),
+/// the static Rust **td-init** (the boot glue — see `TD_INIT_FARM`), the static Rust
+/// **td-login** (the credential switch — see `TD_LOGIN_APPLETS`), the static Rust
+/// **td-util** (diagnostics), and the dynamically-linked Rust **uutils** `coreutils`
 /// (the core file/text userland — #547's cutover). A name goes in exactly one list;
 /// `shape_check` asserts the owning binary actually provides it.
 ///
-/// BUSYBOX now keeps only what no Rust multicall serves: the shell (`sh`/`ash`), the login
-/// chain (`getty`/`login`/`su`), the text tools uutils does not provide (`grep`/`sed`/`awk`),
-/// and `more`, whose uutils feature would compile a crossterm pager stack into the shipped
-/// multicall — a dependency call, not a farm move.
+/// BUSYBOX now keeps only what no Rust multicall serves: the shell (`sh`/`ash`), `getty`
+/// (the tty setup half of the login chain — `login`/`su` moved to td-login), the text
+/// tools uutils does not provide (`grep`/`sed`/`awk`), and `more`, whose uutils feature
+/// would compile a crossterm pager stack into the shipped multicall — a dependency call,
+/// not a farm move.
+
 /// `find`/`xargs` are intentionally NOT bare symlinks either: the ladder's findutils
 /// dead-axis lock (`no_bootstrap_step_invokes_host_find_or_xargs`) forbids those tokens in
 /// any step text and can't tell a cpio member NAME from a host invocation; they stay
@@ -179,7 +207,7 @@ const SYSTEM: SystemDef = SystemDef {
 /// were the last thing on the boot path only busybox could do, and moving them is what lets
 /// both `/init` scripts stop calling the multiplexer.
 const BUSYBOX_APPLETS: &[&str] = &[
-    "sh", "ash", "getty", "login", "more", "grep", "sed", "awk", "su",
+    "sh", "ash", "getty", "more", "grep", "sed", "awk",
 ];
 
 /// Names the busybox retirement DROPS rather than reimplementing as a td app: nothing on the
@@ -187,6 +215,24 @@ const BUSYBOX_APPLETS: &[&str] = &[
 /// drop is checkable — `shape_check` asserts the staged root packs no such `/bin` entry, and
 /// `dropped_applets_stay_dropped` makes putting one back a deliberate deletion here.
 const DROPPED_APPLETS: &[&str] = &["vi", "less"];
+/// The credential switch, served by the static td-login multicall — the two busybox applets
+/// that change WHO A PROCESS IS. They are their own binary, and their own AGENTS.md unsafe
+/// exception, because a credential-ordering bug in them is privilege escalation rather than
+/// a malfunction: `setuid(2)` before `setgroups(2)` drops the uid and silently keeps the
+/// previous holder's supplementary groups. td-login/THREAT-MODEL.md is the specification.
+///
+/// Both names are LOAD-BEARING on this image, more so than any other farm here. `/bin/login`
+/// is what getty execs through `/etc/autologin`, so it is how the machine reaches its greeter
+/// at all; `/bin/su` is how `/etc/rootcheck` and `/etc/bootsuccess` run every unprivileged
+/// health leg. Neither can regress without the boot failing, which is why — unlike td-util
+/// and td-init — this farm needs no synthetic per-name probe. What the boot cannot see is a
+/// switch that started a working session while leaving a residual credential behind, and
+/// that is what `TD_LOGIN_RUNTIME_MARKER` gates on.
+///
+/// td-login is an ET_EXEC with an EMPTY runtime closure: a `login` that dies with the
+/// dynamic closure locks an operator out of the console exactly when the closure is what
+/// broke.
+const TD_LOGIN_APPLETS: &[&str] = &["login", "su"];
 
 /// The boot glue, served by the static td-init multicall — the busybox applets that need a
 /// RAW SYSCALL, which is why they are a separate binary from td-util's
@@ -608,7 +654,7 @@ fn build_rootcheck(sys: &SystemDef) -> String {
     if let Some(user) = sys.users.iter().find(|user| user.name == sys.autologin) {
         if user.uid != 0 {
             s.push_str(&format!(
-                "if /bin/busybox su -s /bin/sh {} -c \
+                "if /bin/su -s /bin/sh {} -c \
                  '/bin/busybox test -d /var/root \
                  && /bin/busybox test ! -w /var \
                  && /bin/busybox test ! -w /var/root \
@@ -736,7 +782,7 @@ fn build_mutable_etc_check(sys: &SystemDef) -> String {
             // non-zero exit and withholds the marker, while a passing run has proved
             // both halves — the private key is NOT readable and the `.pub` IS.
             s.push_str(&format!(
-                "if /bin/busybox su -s /bin/sh {name} -c \
+                "if /bin/su -s /bin/sh {name} -c \
                  'if /bin/busybox cat {key} >/dev/null 2>&1; then exit 1; fi; \
                  /bin/busybox cat {key}.pub >/dev/null 2>&1'; then :; else me=0; fi\n",
                 name = user.name,
@@ -748,6 +794,69 @@ fn build_mutable_etc_check(sys: &SystemDef) -> String {
         "if [ \"$me\" = 1 ]; then echo {SYSTEM_ETC_MUTABLE_MARKER}; fi\n"
     ));
     s
+}
+
+/// The supplementary gids the SHIPPED `/etc/group` grants `user`, derived by reading the
+/// generated file the way td-login will read it at boot rather than by restating the gids
+/// here. The health probe below compares against this, so a `wheel` that changed gid — or a
+/// membership the generator stopped emitting — moves both sides together instead of turning
+/// the credential assertion into a false failure (or, worse, a vacuous pass).
+///
+/// A user's PRIMARY group is deliberately not in this list: `build_group` writes those lines
+/// with an empty member field, so td-login's `/etc/group` walk does not see them either, and
+/// `Credentials::new` is the one place that folds the primary gid into the set.
+fn supplementary_gids(sys: &SystemDef, user: &str) -> Vec<u32> {
+    let mut gids = Vec::new();
+    for line in build_group(sys).lines() {
+        let fields: Vec<&str> = line.split(':').collect();
+        let (Some(gid), Some(members)) = (fields.get(2), fields.get(3)) else {
+            continue;
+        };
+        let Ok(gid) = gid.parse::<u32>() else {
+            continue;
+        };
+        if members.split(',').any(|m| !m.is_empty() && m == user) {
+            gids.push(gid);
+        }
+    }
+    gids.sort_unstable();
+    gids.dedup();
+    gids
+}
+
+/// The td-login leg of the health target: run THROUGH `/bin/su` (which is td-login) and have
+/// the switched process read its own credentials back out of `/proc/self/status`.
+///
+/// This is the one failure the rest of the image cannot see. Every other unprivileged leg
+/// already goes through `su`, so a td-login that fails to start a session reds them all — but
+/// a `setuid(2)` issued before `setgroups(2)` starts a perfectly working session that has
+/// silently kept root's supplementary groups, and every marker still prints. So this asserts
+/// the RESULT: all four uid columns, all four gid columns, and the exact supplementary set.
+///
+/// Double quotes only, never single: this is pasted inside the health target's single-quoted
+/// `su -c '…'` argument, where one `'` would end it and hand the rest to the wrong shell.
+fn td_login_probe(sys: &SystemDef) -> String {
+    let Some(user) = sys.users.iter().find(|user| user.name == sys.autologin) else {
+        // Fail CLOSED. `system_def_is_self_consistent` makes this unreachable, but an
+        // EMPTY probe body is a `su -c ''` that exits 0, so the marker would print
+        // unconditionally and the oracle would green a switch nothing checked. A
+        // vacuous pass is worse than the build error it replaces.
+        return "echo \"td-login: no autologin user to verify credentials for\"; false".into();
+    };
+    let groups: Vec<String> = supplementary_gids(sys, user.name)
+        .iter()
+        .map(|gid| gid.to_string())
+        .collect();
+    format!(
+        "l=1; /bin/td-login --list >/dev/null 2>&1 || \
+         {{ echo \"td-login: --list failed\"; l=0; }}; \
+         /bin/td-login verify-credentials --uid {uid} --gid {gid} --groups \"{groups}\" || \
+         {{ echo \"td-login: the su credential switch did not produce uid {uid} gid {gid} \
+         groups [{groups}]\"; l=0; }}; [ \"$l\" = 1 ]",
+        uid = user.uid,
+        gid = user.gid,
+        groups = groups.join(",")
+    )
 }
 
 /// Each component marker is emitted by its OWN leg, not from one block gated on every leg
@@ -777,6 +886,7 @@ fn build_bootsuccess(sys: &SystemDef) -> String {
     for (applet, probe) in TD_INIT_FARM {
         td_init_probes.push_str(&td_init_probe(applet, probe, sys));
     }
+    let td_login_probe = td_login_probe(sys);
     format!(
         "#!/bin/sh\n\
          set -f\n\
@@ -794,13 +904,13 @@ fn build_bootsuccess(sys: &SystemDef) -> String {
          case \"$wait\" in ''|*[!0-9]*|0) wait={BOOT_SUCCESS_RETRY_SECS};; esac\n\
          [ \"$wait\" -gt {BOOT_SUCCESS_RETRY_MAX_SECS} ] && wait={BOOT_SUCCESS_RETRY_MAX_SECS}\n\
          n=0\n\
-         mu=0; mrf=0; ms=0; mtu=0; mti=0\n\
+         mu=0; mrf=0; ms=0; mtu=0; mti=0; mtl=0\n\
          while [ \"$n\" -lt \"$wait\" ]; do \
          healthy=1; \
-         if /bin/busybox su -s /bin/sh {} -c \
+         if /bin/su -s /bin/sh {} -c \
          '/bin/cat /etc/os-release >/dev/null 2>&1'; then \
          [ \"$mu\" = 1 ] || {{ echo {UUTILS_RUNTIME_MARKER}; mu=1; }}; else healthy=0; fi; \
-         if /bin/busybox su -s /bin/sh {} -c \
+         if /bin/su -s /bin/sh {} -c \
          'r=$(/bin/rg --color never --no-filename --fixed-strings --line-regexp -- \
          {hostname} /etc/hostname) || \
          {{ echo \"ripgrep: /bin/rg failed\"; exit 1; }}; \
@@ -810,19 +920,22 @@ fn build_bootsuccess(sys: &SystemDef) -> String {
          {{ echo \"fd: /bin/fd failed\"; exit 1; }}; \
          [ \"$f\" = /etc/hostname ] || {{ echo \"fd: unexpected hostname path: $f\"; exit 1; }}'; then \
          [ \"$mrf\" = 1 ] || {{ echo {RIPGREP_FD_RUNTIME_MARKER}; mrf=1; }}; else healthy=0; fi; \
-         if /bin/busybox su -s /bin/sh {} -c \
+         if /bin/su -s /bin/sh {} -c \
          '/bin/sshd selftest >/dev/null 2>&1'; then \
          [ \"$ms\" = 1 ] || {{ echo {SSHD_MARKER}; ms=1; }}; else healthy=0; fi; \
-         if /bin/busybox su -s /bin/sh {} -c \
+         if /bin/su -s /bin/sh {} -c \
          'u=1; /bin/td-util --list >/dev/null 2>&1 || \
          {{ echo \"td-util: --list failed\"; u=0; }}; \
          {td_util_probes}[ \"$u\" = 1 ]'; then \
          [ \"$mtu\" = 1 ] || {{ echo {TD_UTIL_RUNTIME_MARKER}; mtu=1; }}; else healthy=0; fi; \
-         if /bin/busybox su -s /bin/sh {} -c \
+         if /bin/su -s /bin/sh {} -c \
          'i=1; /bin/td-init --list >/dev/null 2>&1 || \
          {{ echo \"td-init: --list failed\"; i=0; }}; \
          {td_init_probes}[ \"$i\" = 1 ]'; then \
          [ \"$mti\" = 1 ] || {{ echo {TD_INIT_RUNTIME_MARKER}; mti=1; }}; else healthy=0; fi; \
+         if /bin/su -s /bin/sh {} -c \
+         '{td_login_probe}'; then \
+         [ \"$mtl\" = 1 ] || {{ echo {TD_LOGIN_RUNTIME_MARKER}; mtl=1; }}; else healthy=0; fi; \
          if [ \"$healthy\" = 1 ] \
          && /bin/td-boot success /dev/vda /run/td-update \"$deployment\" >/run/td-success-id; then \
          if /bin/busybox grep -q -F '{DEPLOY_INSTALL_CMDLINE_TOKEN}' /proc/cmdline; then \
@@ -837,6 +950,7 @@ fn build_bootsuccess(sys: &SystemDef) -> String {
          n=$((n+1)); /bin/busybox sleep 1; \
          done\n\
          fail\n",
+        sys.autologin,
         sys.autologin,
         sys.autologin,
         sys.autologin,
@@ -874,9 +988,10 @@ fn build_bootfail() -> String {
 }
 
 fn build_profile(sys: &SystemDef) -> String {
-    // The login shell (busybox ash, invoked as `-sh`) sources this. We print the banner
-    // HERE via a literal here-doc so it shows exactly once regardless of busybox login's
-    // own motd feature, and set a sane PATH/PS1.
+    // The login shell (busybox ash, invoked as `-sh` by td-login) sources this. We print
+    // the banner HERE via a literal here-doc rather than leaning on a `login` motd feature
+    // — td-login has none, by design: printing files at a console is not the job of the
+    // program that hands out credentials — and set a sane PATH/PS1.
     let mut s = String::new();
     // Just /bin — the store-native symlink farm. There is no /usr or /sbin in this image
     // (every /bin entry resolves into /td/store), so keep PATH honest and minimal.
@@ -890,6 +1005,31 @@ fn build_profile(sys: &SystemDef) -> String {
          echo \"td-boot: could not park greeter\" >&2; fi; \
          while :; do /bin/busybox sleep 300; done'; fi\n"
     ));
+    // The terminal hand-over, checked where it actually happened. `login` chowns the
+    // session's terminal to the user and chmods it 0600, and a FAILED hand-over is
+    // deliberately not fatal (see td-login/THREAT-MODEL.md section 6) — the shell
+    // already holds the descriptor, so the session works and every marker still
+    // prints. That is exactly why it needs saying out loud somewhere.
+    //
+    // It lives HERE, in the login session, rather than in /etc/bootsuccess: the health
+    // target runs as root through `su`, whose terminal is not this one, and making it
+    // wait for a greeter that may not have started yet would couple the deployment
+    // transaction to a session with its own timing. A console diagnostic in the one
+    // process that can see the answer is the honest trade; `greeter_checks_the_login_
+    // terminal_was_handed_over` asserts this is here.
+    //
+    // A subshell, because `set -f` in a sourced profile would persist into the
+    // operator's interactive shell. `ls -ln` fields: mode, links, uid, gid.
+    if let Some(user) = sys.users.iter().find(|user| user.name == sys.autologin) {
+        s.push_str(&format!(
+            "(t=$(/bin/tty 2>/dev/null); [ -n \"$t\" ] || exit 0; set -f; \
+             set -- $(/bin/ls -ln \"$t\" 2>/dev/null); \
+             [ \"$1\" = crw------- ] && [ \"$2\" = 1 ] && [ \"$3\" = {uid} ] && [ \"$4\" = {gid} ] || \
+             echo \"td-login: login terminal $t is not 0600 {uid}:{gid} (got $1 $3:$4)\")\n",
+            uid = user.uid,
+            gid = user.gid
+        ));
+    }
     s.push_str("cat <<'__TD_MOTD__'\n");
     s.push_str(sys.motd);
     if !sys.motd.ends_with('\n') {
@@ -1259,6 +1399,13 @@ fn real_root_steps(sys: &SystemDef) -> Vec<Step> {
         from: "{in:td-firstboot}".into(),
         dest: "{root}/real-root{in:td-firstboot}".into(),
     });
+    // td-login the same way, and for the same reason as td-util plus one of its own: a
+    // `login` that cannot run without the dynamic closure locks an operator out of the
+    // console exactly when the closure is what broke.
+    steps.push(Step::CopyTree {
+        from: "{in:td-login}".into(),
+        dest: "{root}/real-root{in:td-login}".into(),
+    });
     // Stage the dynamically linked userland and every transitively referenced store item
     // at its canonical absolute path. uutils, ripgrep, and fd pull their td glibc closure;
     // sshd additionally pulls the aws-lc crypto C lib. The engine admits only direct recipe
@@ -1345,6 +1492,20 @@ fn real_root_steps(sys: &SystemDef) -> Vec<Step> {
     for app in td_init_applets() {
         steps.push(Step::Symlink {
             target: "{in:td-init}/bin/td-init".into(),
+            link: format!("{{root}}/real-root/bin/{app}"),
+        });
+    }
+    // /bin/td-login is the multicall's own entry (`td-login <applet>`, `--list`, and the
+    // `verify-credentials` readback the health target runs); the loop below is the argv[0]
+    // farm `login` and `su` resolve through. The probe deliberately gets NO symlink — it is
+    // not an applet, and a /bin name no farm list accounts for is a name nothing checks.
+    steps.push(Step::Symlink {
+        target: "{in:td-login}/bin/td-login".into(),
+        link: "{root}/real-root/bin/td-login".into(),
+    });
+    for app in TD_LOGIN_APPLETS {
+        steps.push(Step::Symlink {
+            target: "{in:td-login}/bin/td-login".into(),
             link: format!("{{root}}/real-root/bin/{app}"),
         });
     }
@@ -1483,6 +1644,16 @@ fn shape_check() -> String {
          [ \"$(readlink \"$root/bin/$a\" 2>/dev/null)\" = \"$tditgt\" ] || { echo \"root tree: /bin/$a is not a symlink to the staged td-init multicall ($tditgt) - the boot-glue /bin farm regressed\" >&2; exit 1; }; \
          printf '%s\\n' \"$tdilist\" | grep -q -x -F \"$a\" || { echo \"td-init does not serve applet '$a' - its packed /bin/$a symlink would dispatch to nothing (usage, exit 2)\" >&2; exit 1; }; \
      done; \
+     [ \"$(readlink \"$root/bin/td-login\" 2>/dev/null)\" = \"{in:td-login}/bin/td-login\" ] || { echo 'root tree: /bin/td-login is not a symlink to the staged credential multicall' >&2; exit 1; }; \
+     tdl=\"{root}/real-root{in:td-login}/bin/td-login\"; tdltgt=\"{in:td-login}/bin/td-login\"; { [ -f \"$tdl\" ] && [ -x \"$tdl\" ]; } || { echo 'root tree: the td-login binary is not packed/executable at real-root{in:td-login}/bin/td-login - getty would exec a dangling /bin/login and no session could start' >&2; exit 1; }; \
+     tdllist=$(\"$tdl\" --list 2>/dev/null) || { echo 'td-login --list failed - cannot verify the credential farm' >&2; exit 1; }; \
+     for a in @TD_LOGIN_APPLETS@; do \
+         [ \"$(readlink \"$root/bin/$a\" 2>/dev/null)\" = \"$tdltgt\" ] || { echo \"root tree: /bin/$a is not a symlink to the staged td-login multicall ($tdltgt) - the credential /bin farm regressed\" >&2; exit 1; }; \
+         printf '%s\\n' \"$tdllist\" | grep -q -x -F \"$a\" || { echo \"td-login does not serve applet '$a' - its packed /bin/$a symlink would dispatch to nothing (usage, exit 2)\" >&2; exit 1; }; \
+     done; \
+     [ -e \"$root/bin/verify-credentials\" ] && { echo 'root tree: verify-credentials is a readback PROBE, not an applet; a /bin symlink for it is a name no farm list accounts for' >&2; exit 1; }; \
+     \"$tdl\" verify-credentials --uid 4294967294 --gid 4294967294 >/dev/null 2>&1 && { echo 'td-login verify-credentials ACCEPTED credentials this build process cannot have - the readback the TD-LOGIN-RUN-OK marker gates on proves nothing' >&2; exit 1; }; \
+     set -- $(ls -l \"$tdl\"); case \"$1\" in *[sS]*) echo \"root tree: the packed td-login carries a setuid/setgid bit (mode $1). td-login is NEVER installed setuid-root (td-login/THREAT-MODEL.md section 4): with one, an unprivileged caller starts with euid 0 and 'su root' becomes root without authenticating\" >&2; exit 1;; esac; \
      tditab=$(\"$tdi\" init --dry-run -f \"$root/etc/inittab\" 2>&1) || { echo 'td-init init --dry-run REJECTED the inittab this image ships - PID 1 would come up having understood only part of its table. Its per-line diagnostics:' >&2; printf '%s\\n' \"$tditab\" >&2; exit 1; }; \
      mkdir -p '{root}/pivot-probe' && cp \"$tdi\" '{root}/pivot-probe/init' || { echo 'root tree: could not build the switch_root probe NEWROOT' >&2; exit 1; }; \
      tdipiv=$(\"$tdi\" switch_root '{root}/pivot-probe' /init 2>&1) && { echo 'td-init switch_root ACCEPTED a NEWROOT that is not a mount point - the last refusal standing between a bad pivot and a panicked kernel is gone' >&2; exit 1; }; \
@@ -1547,6 +1718,7 @@ fn shape_check() -> String {
         .replace("@UUTILS_APPLETS@", &UUTILS_APPLETS.join(" "))
         .replace("@TD_UTIL_APPLETS@", &TD_UTIL_APPLETS.join(" "))
         .replace("@TD_INIT_APPLETS@", &td_init_applets().join(" "))
+        .replace("@TD_LOGIN_APPLETS@", &TD_LOGIN_APPLETS.join(" "))
         // `<etc path>=<target>` pairs, and the etc paths alone. Both lists are
         // space-joined and unquoted in the script, which
         // `mutable_etc_paths_are_shell_safe_and_well_formed` keeps safe.
@@ -1717,6 +1889,10 @@ pub fn recipe() -> Recipe {
         // td-firstboot: the static per-machine identity provisioner (empty runtime closure,
         //   CopyTree'd). One /bin entry, run once per boot as a sysinit job; it is what
         //   fills the /var targets the MUTABLE_ETC symlinks point at.
+        // td-login: the static credential multicall (empty runtime closure, CopyTree'd),
+        //   serving the /bin/{login,su} farm. Load-bearing like td-init rather than
+        //   probe-only like td-util: `login -f` is how the greeter is reached and `su` is
+        //   how every unprivileged health leg runs. See td-login/THREAT-MODEL.md.
         .native_inputs(&[
             "busybox-x86-64",
             "linux-x86-64",
@@ -1731,6 +1907,7 @@ pub fn recipe() -> Recipe {
             "td-util",
             "td-init",
             "td-firstboot",
+            "td-login",
         ])
         .inputs_owned(mesboot0_inputs(&[]))
         .steps(steps)
@@ -1865,6 +2042,12 @@ mod tests {
             );
         }
         assert!(
+            valid_account_name(SYSTEM.autologin),
+            "autologin user '{}' must be a plain [A-Za-z0-9._-] name: /etc/autologin execs \
+             `/bin/login -f <name>` unquoted, as root, before any session exists",
+            SYSTEM.autologin
+        );
+        assert!(
             SYSTEM
                 .users
                 .iter()
@@ -1873,7 +2056,30 @@ mod tests {
             "autologin user '{}' must resolve uniquely to an unprivileged user",
             SYSTEM.autologin
         );
+        // td-login refuses `login -f` for a LOCKED account — stricter than busybox, whose
+        // `-f` skips the account database entirely (td-login/THREAT-MODEL.md section 3). So a
+        // `passwordless: false` auto-login user is an image that boots to a getty respawn
+        // loop and never reaches a greeter, with the oracle able to report only a timeout.
+        // `build_shadow` writes `!` for such a user, which is exactly what td-login locks on.
+        assert!(
+            SYSTEM
+                .users
+                .iter()
+                .find(|user| user.name == SYSTEM.autologin)
+                .is_some_and(|user| user.passwordless),
+            "autologin user '{}' must be passwordless: build_shadow writes `!` otherwise, and \
+             td-login denies a locked account even under `login -f`",
+            SYSTEM.autologin
+        );
         for u in SYSTEM.users {
+            assert!(
+                valid_account_name(u.name),
+                "user name '{}' must be a plain [A-Za-z0-9._-] name of at most 32 bytes: it \
+                 is embedded UNQUOTED in generated root shell (`/bin/su … <name> -c …`, \
+                 `/bin/login -f <name>`) and in the colon-separated /etc/{{passwd,group,shadow}} \
+                 this recipe writes",
+                u.name
+            );
             assert!(
                 valid_home(u.uid, u.home),
                 "user '{}' home '{}' must be /root for uid 0 or one shell-safe direct \
@@ -1881,16 +2087,17 @@ mod tests {
                 u.name,
                 u.home
             );
-            // busybox `login` execs the shell by ABSOLUTE path (execv, no PATH search),
-            // and we only pack applets under /bin, so the shell MUST be "/bin/<applet>"
-            // packed by either farm. A bare "sh" would pass a naive basename check yet
-            // fail at runtime (execv("sh") -> ENOENT -> login respawn-loops); reject it.
+            // td-login execs the shell by ABSOLUTE path (`db::account` REFUSES a relative
+            // one, and there is no PATH search), and we only pack applets under /bin, so the
+            // shell MUST be "/bin/<applet>" packed by a farm. A bare "sh" would pass a naive
+            // basename check yet fail at runtime (execv("sh") -> ENOENT -> getty respawn-
+            // loops); reject it.
             let packed_applet = u.shell.strip_prefix("/bin/");
             assert!(
                 packed_applet
                     .is_some_and(|a| BUSYBOX_APPLETS.contains(&a) || UUTILS_APPLETS.contains(&a)),
                 "user '{}' login shell '{}' must be \"/bin/<applet>\" packed by a /bin farm \
-                 (busybox login execs it by absolute path)",
+                 (td-login execs it by absolute path)",
                 u.name,
                 u.shell
             );
@@ -1909,6 +2116,40 @@ mod tests {
         }
     }
 
+    /// The greeter is the only process that can see whether `login` handed it the
+    /// terminal, so the check for that lives in the profile it sources. It is a
+    /// diagnostic, not a gate — see the comment at the site — which is exactly why
+    /// it needs a test: nothing reds if it silently stops being emitted.
+    #[test]
+    fn greeter_checks_the_login_terminal_was_handed_over() {
+        let profile = build_profile(&SYSTEM);
+        let user = SYSTEM
+            .users
+            .iter()
+            .filter(|u| u.name == SYSTEM.autologin)
+            .next()
+            .expect("the autologin account must exist");
+        assert!(
+            profile.contains("/bin/tty"),
+            "the greeter must ask the kernel which terminal it is on"
+        );
+        assert!(
+            profile.contains("crw-------"),
+            "0600 is the whole point of the hand-over; a mode check that accepts \
+             group- or world-access would green a terminal the next session can read"
+        );
+        assert!(
+            profile.contains(&format!("[ \"$3\" = {} ] && [ \"$4\" = {} ]", user.uid, user.gid)),
+            "the terminal must be checked against the autologin account's OWN ids, \
+             not merely against 'not root'"
+        );
+        // A subshell, so `set -f` cannot leak into the operator's interactive shell.
+        assert!(
+            profile.contains("(t=$(/bin/tty") && profile.contains("set -f;"),
+            "the check must run in a subshell: `set -f` in a sourced profile persists"
+        );
+    }
+
     /// getty auto-logs-in via `-l /etc/autologin`, and login needs both applets; the
     /// respawn line is inert without them. `reboot` is what `tty-session` execs when the
     /// greeter session ends (the in-guest power-off path). `switch_root` is the stage-1
@@ -1920,13 +2161,24 @@ mod tests {
     /// check catches it at build time, this catches it at test time).
     #[test]
     fn greeter_and_pivot_applets_are_present() {
-        // Split across two static multicalls now, so each name is pinned to the ONE that
+        // Split across THREE static multicalls now, so each name is pinned to the ONE that
         // serves it. Asserting only "some farm has it" would let a boot name drift between
         // binaries unnoticed — and for these names that drift IS the boot.
-        for a in ["sh", "getty", "login"] {
+        for a in ["sh", "getty"] {
             assert!(
                 BUSYBOX_APPLETS.contains(&a),
                 "boot-critical applet '{a}' missing from BUSYBOX_APPLETS"
+            );
+        }
+        for a in ["login", "su"] {
+            assert!(
+                TD_LOGIN_APPLETS.contains(&a),
+                "credential applet '{a}' missing from the td-login farm"
+            );
+            assert!(
+                !BUSYBOX_APPLETS.contains(&a),
+                "'{a}' is still on busybox; the td-login cutover replaces it, and a name in \
+                 both farms ships whichever Symlink step ran last"
             );
         }
         for a in ["init", "reboot", "switch_root", "hostname", "mount", "umount"] {
@@ -1954,12 +2206,13 @@ mod tests {
     /// is not which static binary serves them but that uutils never does.
     /// Every /bin farm, name-tagged. ONE table: two tests consume it, and a fifth farm added
     /// to only one of them would leave the other silently narrower.
-    fn bin_farms<'a>(td_init: &'a [&'static str]) -> [(&'static str, &'a [&'static str]); 4] {
+    fn bin_farms<'a>(td_init: &'a [&'static str]) -> [(&'static str, &'a [&'static str]); 5] {
         [
             ("busybox", BUSYBOX_APPLETS),
             ("uutils", UUTILS_APPLETS),
             ("td-util", TD_UTIL_APPLETS),
             ("td-init", td_init),
+            ("td-login", TD_LOGIN_APPLETS),
         ]
     }
 
@@ -1980,11 +2233,15 @@ mod tests {
                 }
             }
         }
-        for a in ["hostname", "mount", "umount", "sh", "init", "switch_root"] {
+        for a in [
+            "hostname", "mount", "umount", "sh", "init", "switch_root", "login", "su",
+        ] {
             assert!(
-                BUSYBOX_APPLETS.contains(&a) || td_init.contains(&a),
-                "boot-critical applet '{a}' must be served by a STATIC multicall (busybox or \
-                 td-init) - it runs where no dynamic loader is reachable"
+                BUSYBOX_APPLETS.contains(&a)
+                    || td_init.contains(&a)
+                    || TD_LOGIN_APPLETS.contains(&a),
+                "boot-critical applet '{a}' must be served by a STATIC multicall (busybox, \
+                 td-init or td-login) - it runs where no dynamic loader is reachable"
             );
             assert!(
                 !UUTILS_APPLETS.contains(&a),
@@ -3389,6 +3646,254 @@ mod tests {
             "shape_check must loop over the EXPANDED td-init farm, verifying each /bin symlink \
              against the packed binary's own --list"
         );
+    }
+
+    /// td-login is packed, owns `/bin/{login,su}`, and the credential switch it performs is
+    /// VERIFIED on the image rather than assumed.
+    ///
+    /// This farm differs from td-util's and td-init's in what its failures look like. A dead
+    /// `/bin/login` or `/bin/su` fails the boot outright — nothing reaches a greeter and no
+    /// unprivileged health leg runs — so the SUCCESS path needs no synthetic probe and gets
+    /// none. The failure worth a test is the opposite: a switch that started a perfectly
+    /// working session while leaving a residual credential attached. `setuid(2)` issued
+    /// before `setgroups(2)` drops the uid and keeps root's supplementary groups; every other
+    /// marker on this image still prints. So the assertions here are about the READBACK —
+    /// that the health target actually runs it, through `su`, with the credentials the
+    /// shipped /etc/{passwd,group} imply, and clears the marker gate when it disagrees.
+    #[test]
+    fn td_login_serves_its_farm_and_the_credential_switch_is_verified() {
+        // THREAT-MODEL.md section 4 says td-login is never installed setuid-root, and
+        // creds::apply refuses to switch unless all four uid columns are 0 so that a
+        // setuid exec cannot reach the switch. This is the other half: the shipped
+        // artifact is inspected, because the crate's own tests can only see modes
+        // td-login itself constructs, never the one the packer left on the file.
+        let shape = shape_check();
+        assert!(
+            shape.contains("*[sS]*)") && shape.contains("setuid/setgid bit"),
+            "the shape check must refuse a packed td-login carrying a setuid or \
+             setgid bit"
+        );
+
+        let steps = real_root_steps(&SYSTEM);
+        assert!(
+            steps.iter().any(|s| matches!(
+                s,
+                Step::CopyTree { from, dest }
+                    if from == "{in:td-login}" && dest == "{root}/real-root{in:td-login}"
+            )),
+            "td-login must be CopyTree'd into the real root (static, empty closure)"
+        );
+        assert!(
+            steps.iter().any(|s| matches!(
+                s,
+                Step::Symlink { target, link }
+                    if target == "{in:td-login}/bin/td-login"
+                        && link == "{root}/real-root/bin/td-login"
+            )),
+            "/bin/td-login must symlink into the store td-login package - the health target \
+             runs `td-login verify-credentials` by that path"
+        );
+        // Exactly one Symlink step per farm name: Step::Symlink is last-writer-wins, so a
+        // name left in two farms would ship whichever loop ran last while a first-match probe
+        // still found the other and passed.
+        assert!(!TD_LOGIN_APPLETS.is_empty(), "an empty farm makes this vacuous");
+        for applet in TD_LOGIN_APPLETS {
+            let link = format!("{{root}}/real-root/bin/{applet}");
+            let targets: Vec<&str> = steps
+                .iter()
+                .filter_map(|s| match s {
+                    Step::Symlink { target, link: l } if *l == link => Some(target.as_str()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                targets.len(),
+                1,
+                "exactly one Symlink step may claim /bin/{applet}, found {}",
+                targets.len()
+            );
+            assert_eq!(
+                targets.first().copied(),
+                Some("{in:td-login}/bin/td-login"),
+                "/bin/{applet} must resolve to the staged td-login multicall"
+            );
+        }
+        // The readback PROBE gets no /bin name: it is not an applet, and a farm-less /bin
+        // entry is one no list in this file accounts for and no shape check verifies.
+        assert!(
+            !packed_bin_names().iter().any(|n| n == "verify-credentials"),
+            "verify-credentials is a probe, not an applet; it must not be packed into /bin"
+        );
+
+        // The health target must RUN the readback through /bin/su — the shipped symlink and
+        // the real credential switch — and clear the marker gate when it disagrees.
+        let bootsuccess = build_bootsuccess(&SYSTEM);
+        let user = SYSTEM
+            .users
+            .iter()
+            .find(|user| user.name == SYSTEM.autologin)
+            .expect("the autologin user resolves");
+        let groups: Vec<String> = supplementary_gids(&SYSTEM, user.name)
+            .iter()
+            .map(|gid| gid.to_string())
+            .collect();
+        assert!(
+            bootsuccess.contains(&format!(
+                "/bin/su -s /bin/sh {} -c '{}", SYSTEM.autologin, "l=1;"
+            )),
+            "the td-login leg must run THROUGH /bin/su as the login user: that IS the \
+             credential switch under test, and a leg run as root would verify nothing"
+        );
+        assert!(
+            bootsuccess.contains(&format!(
+                "/bin/td-login verify-credentials --uid {} --gid {} --groups \"{}\"",
+                user.uid,
+                user.gid,
+                groups.join(",")
+            )),
+            "the health target must read the switched process's credentials back with the \
+             uid, gid and supplementary set the shipped /etc/passwd and /etc/group imply, \
+             and must QUOTE the group list: a user with no supplementary groups yields an \
+             empty value that an unquoted --groups drops from the argv entirely, so the \
+             probe errors and the marker is withheld on a healthy image"
+        );
+        // The EMPTY case, which the stock SYSTEM never exercises because tester is in
+        // wheel — and which is the whole reason the value is quoted. An unquoted empty
+        // list vanishes from the argv, `--groups` then has no argument, and the probe
+        // errors on a healthy image.
+        const LONE: &[User] = &[User {
+            name: "solo",
+            uid: 1001,
+            gid: 1001,
+            gecos: "No Groups",
+            home: "/home/solo",
+            shell: "/bin/sh",
+            groups: &[],
+            passwordless: true,
+        }];
+        let lone = SystemDef {
+            autologin: "solo",
+            users: LONE,
+            ..SYSTEM
+        };
+        assert!(supplementary_gids(&lone, "solo").is_empty());
+        assert!(
+            td_login_probe(&lone).contains("--groups \"\" ||"),
+            "a user with no supplementary groups must still produce a well-formed, \
+             QUOTED empty --groups value: {}",
+            td_login_probe(&lone)
+        );
+        // A SystemDef whose autologin user does not resolve must produce a probe that
+        // FAILS, never an empty one: `su -c ''` exits 0 and would print the marker
+        // unconditionally.
+        assert!(
+            td_login_probe(&SystemDef {
+                autologin: "nobody-here",
+                ..SYSTEM
+            })
+            .contains("false"),
+            "an unresolvable autologin user must yield a failing probe, not an empty one"
+        );
+        // The gate, not just the command: without `l=0` on the failure branch the marker is
+        // unconditional and the oracle greens a switch that left a residual group attached.
+        assert!(
+            bootsuccess.contains("l=0; }; [ \"$l\" = 1 ]"),
+            "a failed readback must clear the marker gate"
+        );
+        assert!(
+            bootsuccess.contains(&format!(
+                "[ \"$l\" = 1 ]'; then [ \"$mtl\" = 1 ] || {{ echo {TD_LOGIN_RUNTIME_MARKER}; \
+                 mtl=1; }}; else healthy=0; fi"
+            )),
+            "the health target must emit the td-login marker from that leg alone, so an \
+             absent TD-LOGIN-RUN-OK names the credential switch rather than some component \
+             upstream of it"
+        );
+        // ...and the group set must be DERIVED from the generated /etc/group, not a constant
+        // that quietly stops matching it. wheel is the membership the stock SYSTEM grants.
+        assert_eq!(
+            supplementary_gids(&SYSTEM, "tester"),
+            vec![10],
+            "the shipped /etc/group grants tester wheel(10) and nothing else; if that changed \
+             deliberately, the probe follows it automatically and this line records the new \
+             expectation"
+        );
+        assert!(
+            supplementary_gids(&SYSTEM, "root").is_empty(),
+            "a user's PRIMARY group must not appear in the supplementary set: build_group \
+             writes those lines with an empty member field, and td-login folds the primary \
+             gid in itself"
+        );
+    }
+
+    /// The account-name grammar this recipe enforces is the one td-login enforces.
+    ///
+    /// Two different graders would be worse than one: a name this accepted but
+    /// `login` refused would ship an image whose auto-login user cannot log in, and a
+    /// name td-login accepted but this refused would block a legitimate tailoring.
+    /// The charset is copied across a crate boundary, so it is pinned to the source
+    /// it came from — and the injection cases are asserted here rather than left to
+    /// the reader to believe.
+    #[test]
+    fn the_account_grammar_matches_the_one_td_login_uses() {
+        let source =
+            super::super::td_login::source("login").expect("the recipe embeds src/login.rs");
+        assert!(
+            source.contains("b'.' | b'_' | b'-'"),
+            "td-login's plausible_name no longer uses this charset; re-derive \
+             valid_account_name from it"
+        );
+        for good in ["root", "tester", "td.user", "a_b-c"] {
+            assert!(valid_account_name(good), "{good} should be a legal account name");
+        }
+        // Each of these reaches a ROOT shell unquoted through /etc/rootcheck,
+        // /etc/bootsuccess or /etc/autologin, or restructures /etc/passwd.
+        for bad in [
+            "",
+            "$(id)",
+            "`id`",
+            "a b",
+            "a;id",
+            "a:x:0:0::/root:/bin/sh",
+            "a\nroot",
+            "a$IFS",
+            "*",
+            "verylongnameverylongnameverylongnameverylong",
+        ] {
+            assert!(
+                !valid_account_name(bad),
+                "{bad:?} must be refused: it is embedded unquoted in generated root shell"
+            );
+        }
+        // ...and the shipped definition passes its own guard.
+        for user in SYSTEM.users {
+            assert!(valid_account_name(user.name));
+        }
+    }
+
+    /// The flags the health probe spells out must be flags td-login actually parses.
+    ///
+    /// `verify-credentials --uid/--gid/--groups` is copied by hand across a crate boundary,
+    /// exactly like td-init's refusal diagnostics. Rename one and the probe fails on a
+    /// HEALTHY image: TD-LOGIN-RUN-OK is withheld, and the only thing that would have caught
+    /// it is a manual qemu-boot-system run. The recipe already embeds the source via
+    /// `include_str!`, so the link costs nothing.
+    #[test]
+    fn the_credential_readback_probe_uses_flags_td_login_parses() {
+        let source = super::super::td_login::source("main")
+            .expect("the td-login recipe embeds src/main.rs");
+        for spelling in ["verify-credentials", "--uid", "--gid", "--groups"] {
+            assert!(
+                source.contains(spelling),
+                "the health probe spells {spelling:?}, which does not appear in \
+                 td-login/src/main.rs - the readback would fail on a healthy image and \
+                 withhold TD-LOGIN-RUN-OK"
+            );
+        }
+        // ...and the probe the recipe generates is built from exactly those.
+        let probe = td_login_probe(&SYSTEM);
+        assert!(probe.contains("verify-credentials"), "probe: {probe}");
+        assert!(probe.starts_with("l=1;"), "probe: {probe}");
     }
 
     /// Every diagnostic a refusal probe waits for must exist in the applet that emits it.
