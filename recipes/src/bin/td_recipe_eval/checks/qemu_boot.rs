@@ -79,6 +79,9 @@ const GREETER_MARKER: &str = td_recipe::ladder::GREETER_MARKER;
 /// Printed by the root-owned health target after an unprivileged uutils invocation.
 const UUTILS_RUNTIME_MARKER: &str = td_recipe::ladder::UUTILS_RUNTIME_MARKER;
 
+/// Printed after unprivileged ripgrep and fd searches return exact expected results.
+const RIPGREP_FD_RUNTIME_MARKER: &str = td_recipe::ladder::RIPGREP_FD_RUNTIME_MARKER;
+
 /// Printed by the root-owned health target after an unprivileged SSH loopback self-test.
 const SSHD_MARKER: &str = td_recipe::ladder::SSHD_MARKER;
 
@@ -200,6 +203,7 @@ struct ConsoleEvidence {
     state_writable: bool,
     state_owner: bool,
     uutils_runtime: bool,
+    ripgrep_fd_runtime: bool,
     sshd: bool,
     td_util_runtime: bool,
     td_init_runtime: bool,
@@ -717,8 +721,9 @@ pub(crate) fn run_system(runner: &RecipeCheckRunner) -> Result<(), String> {
          ({} -> {}). Every full boot kept root and /etc immutable \
          ({SYSTEM_ROOT_RO_MARKER}, {SYSTEM_ETC_RO_MARKER}), mounted target-owned writable @var \
          ({SYSTEM_STATE_WRITABLE_MARKER}, {SYSTEM_STATE_OWNER_MARKER}), ran uutils \
-         ({UUTILS_RUNTIME_MARKER}), td-util ({TD_UTIL_RUNTIME_MARKER}) and the td-init boot \
-         glue ({TD_INIT_RUNTIME_MARKER}), and unmounted state \
+         ({UUTILS_RUNTIME_MARKER}), ripgrep+fd ({RIPGREP_FD_RUNTIME_MARKER}), td-util \
+         ({TD_UTIL_RUNTIME_MARKER}) and the td-init boot glue ({TD_INIT_RUNTIME_MARKER}), \
+         and unmounted state \
          before exit ({SYSTEM_SHUTDOWN_MARKER})",
         td_boot_protocol::DEFAULT_BOOT_ATTEMPTS,
         td_boot_protocol::ATTEMPT_CONSUMED_MARKER,
@@ -799,6 +804,7 @@ fn validate_failed_target_boot(result: &BootResult, ordinal: &str) -> Result<(),
     if !result.evidence.shutdown
         || result.evidence.greeter
         || result.evidence.uutils_runtime
+        || result.evidence.ripgrep_fd_runtime
         || result.evidence.sshd
         || result.evidence.boot_success
     {
@@ -931,20 +937,25 @@ fn validate_system_boot(
              absolute path did not exit 0, so the dynamically-linked coreutils multicall's \
              runtime closure (ELF interp, glibc, libgcc_s) does not resolve on the erofs root \
              even though the static shape scan passed. This is the DT_NEEDED-soname residual the \
-             build-time scan cannot see. \
-             READ THE CONSOLE BEFORE BLAMING uutils: /etc/bootsuccess emits the uutils, sshd, \
-             td-util and td-init markers TOGETHER, only once every component passed, so ANY of \
-             the four failing withholds all four and this — the first one checked — is what \
-             gets reported. The failing component names itself on the console \
-             (`td-util: /bin/<name> failed`, `td-init: /bin/<name> ...`); if such a line is \
-             present, that is the real failure and uutils is fine. \
-             Last serial output:\n{}",
+             build-time scan cannot see. Each health leg emits its own marker, so this absence \
+             localizes to uutils. Last serial output:\n{}",
+            tail(&result.console, 80)
+        ));
+    }
+    if !result.evidence.ripgrep_fd_runtime {
+        return Err(format!(
+            "the greeter was reached and uutils ran, but the ripgrep/fd runtime marker \
+             ({RIPGREP_FD_RUNTIME_MARKER:?}) was absent — the unprivileged health leg did not \
+             get the exact configured hostname match from `/bin/rg` and the exact \
+             `/etc/hostname` path from `/bin/fd`. The console names the command and unexpected \
+             result; either its /bin symlink is wrong or its dynamically linked runtime closure \
+             does not resolve on the EROFS root. Last serial output:\n{}",
             tail(&result.console, 80)
         ));
     }
     if !result.evidence.sshd {
         return Err(format!(
-            "the greeter was reached and root/uutils checks passed, but the sshd runtime marker \
+            "the greeter was reached and root/userland checks passed, but the sshd runtime marker \
              ({SSHD_MARKER:?}) was absent — `/bin/sshd selftest` did not complete a loopback SSH \
              round-trip and exit 0. Either the kernel lacks working TCP/IP loopback (CONFIG_NET/INET \
              or the `lo` bring-up regressed), or sshd's dynamic runtime closure (loader, glibc, \
@@ -954,7 +965,7 @@ fn validate_system_boot(
     }
     if !result.evidence.td_util_runtime {
         return Err(format!(
-            "the greeter was reached and root/uutils/sshd checks passed, but the td-util runtime \
+            "the greeter was reached and root/userland/sshd checks passed, but the td-util runtime \
              marker ({TD_UTIL_RUNTIME_MARKER:?}) was absent — at least one /bin name the td-util \
              farm serves did not exit 0, so a shipped diagnostics command is broken on the image. \
              The console names the applet (`td-util: /bin/<name> failed`). Either the static \
@@ -965,13 +976,9 @@ fn validate_system_boot(
             tail(&result.console, 80)
         ));
     }
-    // Reached only when the console output is TORN — the four markers are separate `echo`s in
-    // one block, so a boot that dies between them can latch the earlier ones and not this. A
-    // genuine td-init probe failure withholds all four and is reported by the uutils leg above,
-    // which says so and points at the console line naming the applet.
     if !result.evidence.td_init_runtime {
         return Err(format!(
-            "the root/uutils/sshd/td-util health checks passed, but the td-init runtime marker \
+            "the root/userland/sshd/td-util health checks passed, but the td-init runtime marker \
              ({TD_INIT_RUNTIME_MARKER:?}) was absent — at least one /bin name the boot-glue farm \
              serves did not behave. The console names it (`td-init: /bin/<name> ...`). Note what \
              reaching the health target ALREADY proved: td-init ran the inittab as PID 1 and \
@@ -2308,6 +2315,7 @@ fn evidence_marker_max_len(target: &[u8]) -> usize {
         SYSTEM_STATE_WRITABLE_MARKER.len(),
         SYSTEM_STATE_OWNER_MARKER.len(),
         UUTILS_RUNTIME_MARKER.len(),
+        RIPGREP_FD_RUNTIME_MARKER.len(),
         SSHD_MARKER.len(),
         TD_UTIL_RUNTIME_MARKER.len(),
         TD_INIT_RUNTIME_MARKER.len(),
@@ -2393,6 +2401,11 @@ fn latch_console_evidence(evidence: &mut ConsoleEvidence, buf: &[u8], target: &[
         &mut evidence.uutils_runtime,
         buf,
         UUTILS_RUNTIME_MARKER.as_bytes(),
+    );
+    latch_marker(
+        &mut evidence.ripgrep_fd_runtime,
+        buf,
+        RIPGREP_FD_RUNTIME_MARKER.as_bytes(),
     );
     latch_marker(&mut evidence.sshd, buf, SSHD_MARKER.as_bytes());
     latch_marker(
@@ -2794,7 +2807,7 @@ mod tests {
     /// this: its result is dominated by the id-bearing markers (marker + space + 64-char
     /// hex), so a "no marker exceeds the max" assertion cannot fail and would only look like
     /// a guard. The rescan window is covered behaviourally instead, by the split tests below.
-    fn all_console_markers() -> [&'static str; 28] {
+    fn all_console_markers() -> [&'static str; 29] {
         [
             MARKER,
             EROFS_MARKER,
@@ -2818,6 +2831,7 @@ mod tests {
             SYSTEM_DEPLOY_INSTALL_MARKER,
             SYSTEM_SHUTDOWN_MARKER,
             UUTILS_RUNTIME_MARKER,
+            RIPGREP_FD_RUNTIME_MARKER,
             SYSTEM_NET_UP_MARKER,
             SYSTEM_NET_RESOLVE_MARKER,
             SYSTEM_NET_REACH_MARKER,
@@ -2949,6 +2963,7 @@ mod tests {
             SYSTEM_STATE_WRITABLE_MARKER,
             SYSTEM_STATE_OWNER_MARKER,
             UUTILS_RUNTIME_MARKER,
+            RIPGREP_FD_RUNTIME_MARKER,
             SSHD_MARKER,
             TD_UTIL_RUNTIME_MARKER,
             SYSTEM_PERSIST_WRITE_MARKER,
@@ -2994,6 +3009,7 @@ mod tests {
         assert!(evidence.state_writable);
         assert!(evidence.state_owner);
         assert!(evidence.uutils_runtime);
+        assert!(evidence.ripgrep_fd_runtime);
         assert!(evidence.sshd);
         assert!(evidence.td_util_runtime);
         assert!(evidence.persist_write);

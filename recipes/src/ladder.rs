@@ -173,6 +173,12 @@ pub const GREETER_MARKER: &str = "TD-GREETER-OK";
 /// greeter line (which the shell builtin `echo` prints regardless of uutils health, #547).
 pub const UUTILS_RUNTIME_MARKER: &str = "TD-UUTILS-RUN-OK";
 
+/// Printed by the root-owned health target only after unprivileged `/bin/rg` finds
+/// the exact hostname line and `/bin/fd` finds the exact hostname path on the EROFS
+/// root. One marker covers the pair because both commands must pass before it is
+/// emitted; either failure withholds boot success and names the failing command.
+pub const RIPGREP_FD_RUNTIME_MARKER: &str = "TD-RG-FD-RUN-OK";
+
 /// Printed by the root-owned health target only after unprivileged `/bin/sshd selftest`
 /// exits 0 — the source-built russh daemon stood up an in-process server on an ephemeral
 /// loopback port and completed a full SSH handshake+auth+channel+exec round-trip against it.

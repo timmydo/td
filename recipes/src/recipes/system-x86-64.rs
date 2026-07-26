@@ -1,8 +1,8 @@
 use crate::ladder::{
     mesboot0_inputs, mesboot0_path, AUTOTEST_CMDLINE_TOKEN, BOOT_FAIL_TARGET_CMDLINE_TOKEN,
     BOOT_SUCCESS_WAIT_CMDLINE_PREFIX, DEPLOY_INSTALL_CMDLINE_TOKEN, GREETER_MARKER,
-    NETTEST_CMDLINE_TOKEN, NETTEST_DEFAULT_HOST, NETTEST_DEFAULT_PORT,
-    PERSIST_READ_CMDLINE_TOKEN, PERSIST_WRITE_CMDLINE_TOKEN, SH, SSHD_MARKER,
+    NETTEST_CMDLINE_TOKEN, NETTEST_DEFAULT_HOST, NETTEST_DEFAULT_PORT, PERSIST_READ_CMDLINE_TOKEN,
+    PERSIST_WRITE_CMDLINE_TOKEN, RIPGREP_FD_RUNTIME_MARKER, SH, SSHD_MARKER,
     SYSTEM_BOOT_SUCCESS_MARKER, SYSTEM_DEPLOY_INSTALL_MARKER, SYSTEM_ETC_RO_MARKER,
     SYSTEM_NET_REACH_MARKER, SYSTEM_NET_RESOLVE_MARKER, SYSTEM_NET_UP_MARKER,
     SYSTEM_PERSIST_READ_MARKER, SYSTEM_PERSIST_WRITE_MARKER, SYSTEM_ROOT_RO_MARKER,
@@ -39,9 +39,9 @@ const BOOT_FAIL_PARKED: &str = "td-boot-parked-v1";
 // re-verifies root.erofs, binds it to a read-only loop device, mounts @var from
 // Btrfs, and switch_roots. `/etc` stays deployment-owned and immutable; `/home`
 // and `/root` are root-image symlinks into `/var`. The real root is
-// the store-native real root (busybox and uutils at their /td/store paths, a
-// /bin symlink farm, and generated /etc). The typed PackErofs step invokes the
-// dependency-free control-plane image writer directly; no recipe process can
+// the store-native real root (busybox, uutils, ripgrep, and fd at their /td/store
+// paths, a /bin symlink farm, and generated /etc). The typed PackErofs step invokes
+// the dependency-free control-plane image writer directly; no recipe process can
 // execute td-builder through PATH or argv. Strict manifests separately hash the
 // selector and the three deployment payloads.
 //
@@ -645,7 +645,7 @@ fn build_rootcheck(sys: &SystemDef) -> String {
 }
 
 /// Each component marker is emitted by its OWN leg, not from one block gated on every leg
-/// passing. Emitting them together meant any single failure withheld all four, so the oracle
+/// passing. Emitting them together meant any single failure withheld every marker, so the oracle
 /// reported whichever it checked first — uutils — and the diagnostics the other farms went to
 /// trouble to produce named a component nobody would look at. The `m*` flags keep a retry from
 /// reprinting a marker it already earned. `SYSTEM_BOOT_SUCCESS_MARKER` stays gated on the whole
@@ -688,12 +688,22 @@ fn build_bootsuccess(sys: &SystemDef) -> String {
          case \"$wait\" in ''|*[!0-9]*|0) wait={BOOT_SUCCESS_RETRY_SECS};; esac\n\
          [ \"$wait\" -gt {BOOT_SUCCESS_RETRY_MAX_SECS} ] && wait={BOOT_SUCCESS_RETRY_MAX_SECS}\n\
          n=0\n\
-         mu=0; ms=0; mtu=0; mti=0\n\
+         mu=0; mrf=0; ms=0; mtu=0; mti=0\n\
          while [ \"$n\" -lt \"$wait\" ]; do \
          healthy=1; \
          if /bin/busybox su -s /bin/sh {} -c \
          '/bin/cat /etc/os-release >/dev/null 2>&1'; then \
          [ \"$mu\" = 1 ] || {{ echo {UUTILS_RUNTIME_MARKER}; mu=1; }}; else healthy=0; fi; \
+         if /bin/busybox su -s /bin/sh {} -c \
+         'r=$(/bin/rg --color never --no-filename --fixed-strings --line-regexp -- \
+         {hostname} /etc/hostname) || \
+         {{ echo \"ripgrep: /bin/rg failed\"; exit 1; }}; \
+         [ \"$r\" = {hostname} ] || \
+         {{ echo \"ripgrep: unexpected hostname result: $r\"; exit 1; }}; \
+         f=$(/bin/fd --color never --absolute-path --max-depth 1 ^hostname$ /etc) || \
+         {{ echo \"fd: /bin/fd failed\"; exit 1; }}; \
+         [ \"$f\" = /etc/hostname ] || {{ echo \"fd: unexpected hostname path: $f\"; exit 1; }}'; then \
+         [ \"$mrf\" = 1 ] || {{ echo {RIPGREP_FD_RUNTIME_MARKER}; mrf=1; }}; else healthy=0; fi; \
          if /bin/busybox su -s /bin/sh {} -c \
          '/bin/sshd selftest >/dev/null 2>&1'; then \
          [ \"$ms\" = 1 ] || {{ echo {SSHD_MARKER}; ms=1; }}; else healthy=0; fi; \
@@ -721,7 +731,12 @@ fn build_bootsuccess(sys: &SystemDef) -> String {
          n=$((n+1)); /bin/busybox sleep 1; \
          done\n\
          fail\n",
-        sys.autologin, sys.autologin, sys.autologin, sys.autologin
+        sys.autologin,
+        sys.autologin,
+        sys.autologin,
+        sys.autologin,
+        sys.autologin,
+        hostname = sys.hostname
     )
 }
 
@@ -974,13 +989,18 @@ fn real_root_steps(sys: &SystemDef) -> Vec<Step> {
         from: "{in:td-init}".into(),
         dest: "{root}/real-root{in:td-init}".into(),
     });
-    // Stage uutils and sshd plus every transitively referenced store item at its canonical
-    // absolute path. Both are dynamically linked, so each pulls its reachable runtime store
-    // closure (glibc, libgcc_s, and for sshd the aws-lc crypto C lib) onto the erofs root.
-    // The engine admits only direct recipe inputs, so a new runtime dependency fails closed
-    // until it is reviewed and declared here.
+    // Stage the dynamically linked userland and every transitively referenced store item
+    // at its canonical absolute path. uutils, ripgrep, and fd pull their td glibc closure;
+    // sshd additionally pulls the aws-lc crypto C lib. The engine admits only direct recipe
+    // inputs, so a Rust bootstrap or other build-only reference fails closed rather than
+    // entering the EROFS image.
     steps.push(Step::StageRuntimeClosure {
-        roots: vec!["{in:uutils}".into(), "{in:sshd}".into()],
+        roots: vec![
+            "{in:uutils}".into(),
+            "{in:ripgrep}".into(),
+            "{in:fd}".into(),
+            "{in:sshd}".into(),
+        ],
         dest: "{root}/real-root".into(),
     });
     // /bin symlink farm: /bin/busybox, every applet, and /init resolve DIRECTLY into the
@@ -1002,6 +1022,12 @@ fn real_root_steps(sys: &SystemDef) -> Vec<Step> {
         steps.push(Step::Symlink {
             target: "{in:uutils}/bin/coreutils".into(),
             link: format!("{{root}}/real-root/bin/{app}"),
+        });
+    }
+    for (name, target) in [("rg", "{in:ripgrep}/bin/rg"), ("fd", "{in:fd}/bin/fd")] {
+        steps.push(Step::Symlink {
+            target: target.into(),
+            link: format!("{{root}}/real-root/bin/{name}"),
         });
     }
     // /init is PID 1 on the real root, and it is td-init. switch_root execs it under the
@@ -1184,6 +1210,12 @@ fn shape_check() -> String {
      for a in @UUTILS_APPLETS@; do \
          [ \"$(readlink \"$root/bin/$a\" 2>/dev/null)\" = \"$uutgt\" ] || { echo \"root tree: /bin/$a is not a symlink to the staged uutils multicall ($uutgt) - the uutils /bin farm regressed (#547)\" >&2; exit 1; }; \
      done; \
+     rg=\"{root}/real-root{in:ripgrep}/bin/rg\"; rgtgt=\"{in:ripgrep}/bin/rg\"; \
+     { [ -f \"$rg\" ] && [ -x \"$rg\" ]; } || { echo 'root tree: ripgrep is not packed/executable at real-root{in:ripgrep}/bin/rg - /bin/rg would dangle and StageRuntimeClosure did not stage it' >&2; exit 1; }; \
+     [ \"$(readlink \"$root/bin/rg\" 2>/dev/null)\" = \"$rgtgt\" ] || { echo 'root tree: /bin/rg is not a symlink to staged ripgrep' >&2; exit 1; }; \
+     fd=\"{root}/real-root{in:fd}/bin/fd\"; fdtgt=\"{in:fd}/bin/fd\"; \
+     { [ -f \"$fd\" ] && [ -x \"$fd\" ]; } || { echo 'root tree: fd is not packed/executable at real-root{in:fd}/bin/fd - /bin/fd would dangle and StageRuntimeClosure did not stage it' >&2; exit 1; }; \
+     [ \"$(readlink \"$root/bin/fd\" 2>/dev/null)\" = \"$fdtgt\" ] || { echo 'root tree: /bin/fd is not a symlink to staged fd' >&2; exit 1; }; \
      sshd=\"{root}/real-root{in:sshd}/bin/sshd\"; sshdtgt=\"{in:sshd}/bin/sshd\"; \
      { [ -f \"$sshd\" ] && [ -x \"$sshd\" ]; } || { echo 'root tree: the sshd daemon is not packed/executable at real-root{in:sshd}/bin/sshd - /bin/sshd would dangle and StageRuntimeClosure did not stage it' >&2; exit 1; }; \
      [ \"$(readlink \"$root/bin/sshd\" 2>/dev/null)\" = \"$sshdtgt\" ] || { echo 'root tree: /bin/sshd is not a symlink to the staged sshd daemon' >&2; exit 1; }; \
@@ -1327,10 +1359,12 @@ pub fn recipe() -> Recipe {
         // linux-x86-64: the EXPORTED gen_init_cpio packer (verified STATICALLY linked).
         // uutils: the dynamically-linked `coreutils` multicall packed as the /bin file/text
         //   userland (#547).
+        // ripgrep/fd: dynamically linked Rust search tools exposed as /bin/rg and /bin/fd.
         // sshd: the source-built russh SSH daemon, packed at /bin/sshd; its runtime closure
         //   (glibc, libgcc_s, aws-lc crypto C lib) is reached by StageRuntimeClosure.
-        // glibc-x86-64: uutils' and sshd's declared runtime input. StageRuntimeClosure reaches
-        //   it from their embedded store references and copies the whole content-addressed item.
+        // glibc-x86-64: the dynamic Rust userland's declared runtime input.
+        //   StageRuntimeClosure reaches it from embedded store references and copies the whole
+        //   content-addressed item.
         // td-netd: the static network bring-up daemon (empty runtime closure, CopyTree'd).
         // td-boot: static initramfs selector and root-side deployment helper (CopyTree'd).
         // td-kexec: confined selector-only kexec helper.
@@ -1343,6 +1377,8 @@ pub fn recipe() -> Recipe {
             "busybox-x86-64",
             "linux-x86-64",
             "uutils",
+            "ripgrep",
+            "fd",
             "glibc-x86-64",
             "sshd",
             "td-netd",
@@ -1377,8 +1413,8 @@ mod tests {
         let (roots, dest) = closures.first().expect("one runtime closure");
         assert_eq!(
             roots.as_slice(),
-            ["{in:uutils}", "{in:sshd}"],
-            "the dynamically linked uutils multicall and sshd daemon are the explicit runtime roots"
+            ["{in:uutils}", "{in:ripgrep}", "{in:fd}", "{in:sshd}"],
+            "the dynamically linked shipped programs are the explicit runtime roots"
         );
         assert_eq!(dest.as_str(), "{root}/real-root");
         assert!(
@@ -1386,10 +1422,43 @@ mod tests {
                 step,
                 Step::CopyTree { from, .. }
                     if from.contains("uutils")
+                        || from.contains("ripgrep")
+                        || from.starts_with("{in:fd}")
                         || from.contains("glibc-x86-64")
             )),
             "runtime store items must not bypass StageRuntimeClosure"
         );
+        for (name, target) in [("rg", "{in:ripgrep}/bin/rg"), ("fd", "{in:fd}/bin/fd")] {
+            let link = format!("{{root}}/real-root/bin/{name}");
+            let targets: Vec<&str> = steps
+                .iter()
+                .filter_map(|step| match step {
+                    Step::Symlink {
+                        target,
+                        link: candidate,
+                    } if candidate == &link => Some(target.as_str()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                targets,
+                [target],
+                "/bin/{name} must have one claimant resolving to its staged package"
+            );
+        }
+
+        let native_inputs = recipe().native_inputs.expect("system native inputs");
+        for forbidden in [
+            "rust-stage0",
+            "rust-toolchain",
+            "gcc-x86-64-self",
+            "binutils-x86-64-self",
+        ] {
+            assert!(
+                !native_inputs.iter().any(|input| input == forbidden),
+                "build-only input {forbidden} must not be a direct system input"
+            );
+        }
 
         let pack = steps.iter().filter_map(|step| match step {
             Step::PackErofs { root, output } => Some((root.as_str(), output.as_str())),
@@ -2094,6 +2163,15 @@ mod tests {
                 && bootsuccess.contains("set -f")
                 && bootsuccess.contains("su -s /bin/sh tester -c")
                 && bootsuccess.contains("/bin/cat /etc/os-release")
+                && bootsuccess.contains(&format!(
+                    "/bin/rg --color never --no-filename --fixed-strings --line-regexp -- {} \
+                     /etc/hostname",
+                    SYSTEM.hostname
+                ))
+                && bootsuccess.contains(
+                    "/bin/fd --color never --absolute-path --max-depth 1 ^hostname$ /etc"
+                )
+                && bootsuccess.contains(RIPGREP_FD_RUNTIME_MARKER)
                 && bootsuccess.contains("/bin/sshd selftest")
                 && bootsuccess.contains("/bin/td-util --list")
                 && bootsuccess.contains(TD_UTIL_RUNTIME_MARKER)
@@ -2119,6 +2197,14 @@ mod tests {
                 < bootsuccess
                     .find("&& /bin/td-boot success /dev/vda")
                     .unwrap()
+                && bootsuccess.find("/bin/rg --color never").unwrap()
+                    < bootsuccess
+                        .find("&& /bin/td-boot success /dev/vda")
+                        .unwrap()
+                && bootsuccess.find("/bin/fd --color never").unwrap()
+                    < bootsuccess
+                        .find("&& /bin/td-boot success /dev/vda")
+                        .unwrap()
                 && bootsuccess.find("/bin/sshd selftest").unwrap()
                     < bootsuccess
                         .find("&& /bin/td-boot success /dev/vda")
@@ -2128,6 +2214,37 @@ mod tests {
                         .find("if [ \"$healthy\" = 1 ]")
                         .unwrap(),
             "deployment success must follow every unprivileged runtime probe"
+        );
+        assert!(
+            bootsuccess.contains(
+                &format!(
+                    "r=$(/bin/rg --color never --no-filename --fixed-strings --line-regexp -- {} \
+                     /etc/hostname) || {{ echo \"ripgrep: /bin/rg failed\"; exit 1; }}",
+                    SYSTEM.hostname
+                )
+            ) && bootsuccess.contains(
+                "f=$(/bin/fd --color never --absolute-path --max-depth 1 ^hostname$ /etc) || \
+                 { echo \"fd: /bin/fd failed\"; exit 1; }"
+            ) && bootsuccess.contains(&format!(
+                "[ \"$f\" = /etc/hostname ] || \
+                 {{ echo \"fd: unexpected hostname path: $f\"; exit 1; }}'; then \
+                 [ \"$mrf\" = 1 ] || {{ echo {RIPGREP_FD_RUNTIME_MARKER}; mrf=1; }}; \
+                 else healthy=0; fi"
+            )),
+            "ripgrep and fd must both return exact results before their shared marker is emitted"
+        );
+        let configured = SystemDef {
+            hostname: "configured.host",
+            ..SYSTEM
+        };
+        let configured_bootsuccess = build_bootsuccess(&configured);
+        assert!(
+            configured_bootsuccess.contains(
+                "r=$(/bin/rg --color never --no-filename --fixed-strings --line-regexp -- \
+                 configured.host /etc/hostname)"
+            ) && configured_bootsuccess.contains("[ \"$r\" = configured.host ]"),
+            "the ripgrep health probe must follow the configured hostname without treating \
+             hostname punctuation as a regular expression"
         );
         assert!(
             bootsuccess.contains(DEPLOY_INSTALL_CMDLINE_TOKEN)
@@ -2503,7 +2620,7 @@ mod tests {
             );
         }
         // Same shape as td-util's: the marker belongs to THIS leg, so an absent
-        // TD-INIT-RUN-OK localizes to the boot glue instead of being one of four markers
+        // TD-INIT-RUN-OK localizes to the boot glue instead of being one of several markers
         // withheld together by whichever component happened to fail.
         assert!(
             bootsuccess.contains(&format!(
