@@ -88,6 +88,15 @@ td-txt-authored case files
   sed-cli.test.txt    the sed command language, options, in-place editing, refusals
   divergence.test.txt where td-txt deliberately differs from GNU
 
+  grep-cli.test.txt and sed-cli.test.txt each end with a block derived from td's
+  OWN usage: every grep/sed invocation shape the image's generated /etc scripts
+  and the recipes' build steps actually make, one case per shape, each paired
+  with the negative that shows the shape DISCRIMINATES. That block is what makes
+  the corpus a statement about the image rather than about the option list: the
+  /bin/grep those scripts call is this binary. Re-derive the shapes by scanning
+  the generated scripts (`recipes`' `script_applets_are_covered` derives applet
+  usage from the same text) and the recipe step strings.
+
   Format: see the module header of ../src/lib.rs. `#### desc` opens a case,
   `## argv:` gives the command (argv[0] is the applet), `## stdin:`…`## END`
   and friends carry verbatim blocks, and `-json` spellings carry exact bytes
@@ -122,3 +131,8 @@ Overlay
                      It is EMPTY today: td-txt passes every case in this corpus.
                      That is a statement about the corpus as much as about
                      td-txt — growing the corpus is how the next gap gets found.
+                     The usage-derived block above is one such growth, and it
+                     found four (see the landing commit): `sed -i` with no file
+                     operand, `-i` following symlinks and sharing hard links,
+                     `--version`/`--help`, and Rust's `(os error N)` suffix on
+                     every io diagnostic.

@@ -742,7 +742,10 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
     // (check-pr). src/main.rs and its modules are `include_str!`'d into the td-txt
     // RECIPE, so a source edit changes the TARGET artifact and a static-link
     // regression is invisible to host cargo — so also route to recipe-checks-daily
-    // (the daily backstop statically links + smoke-runs it via td-txt-test). Its
+    // (the daily backstop statically links + smoke-runs it via td-txt-test) AND it is
+    // packed into system-x86-64, serving /bin/grep and /bin/sed. That farm is on the
+    // BOOT PATH — /etc/rootcheck greps /proc/mounts with it — so recipe-checks-daily
+    // is also what runs the qemu boot oracle that waits for TD_TXT_RUNTIME_MARKER. Its
     // RECIPE files under recipes/src/recipes/ are routed by the recipes arm above,
     // not here. spec/ holds corpus DATA (no standalone shell scripts), so no
     // shell-syntax preflight.

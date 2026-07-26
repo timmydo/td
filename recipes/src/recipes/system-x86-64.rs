@@ -8,8 +8,8 @@ use crate::ladder::{
     SYSTEM_NET_REACH_MARKER, SYSTEM_NET_RESOLVE_MARKER, SYSTEM_NET_UP_MARKER,
     SYSTEM_PERSIST_READ_MARKER, SYSTEM_PERSIST_WRITE_MARKER, SYSTEM_ROOT_RO_MARKER,
     SYSTEM_SHUTDOWN_MARKER, SYSTEM_STATE_OWNER_MARKER, SYSTEM_STATE_WRITABLE_MARKER,
-    TD_INIT_RUNTIME_MARKER, TD_LOGIN_RUNTIME_MARKER, TD_UTIL_RUNTIME_MARKER,
-    UUTILS_RUNTIME_MARKER,
+    TD_INIT_RUNTIME_MARKER, TD_LOGIN_RUNTIME_MARKER, TD_TXT_RUNTIME_MARKER,
+    TD_UTIL_RUNTIME_MARKER, UUTILS_RUNTIME_MARKER,
 };
 use crate::types::{Recipe, Step};
 
@@ -184,20 +184,26 @@ const SYSTEM: SystemDef = SystemDef {
 };
 // ────────────────────────────────────────────────────────────────────────────────
 
-/// The real-root `/bin` is a symlink farm split across FIVE multicall binaries, each
+/// The real-root `/bin` is a symlink farm split across SIX multicall binaries, each
 /// dispatching on argv[0]'s basename: the static **busybox** (the shell and the tty glue),
 /// the static Rust **td-init** (the boot glue — see `TD_INIT_FARM`), the static Rust
 /// **td-login** (the credential switch — see `TD_LOGIN_APPLETS`), the static Rust
-/// **td-util** (diagnostics), and the dynamically-linked Rust **uutils** `coreutils`
+/// **td-txt** (grep/sed — see `TD_TXT_APPLETS`), the static Rust **td-util**
+/// (diagnostics), and the dynamically-linked Rust **uutils** `coreutils`
 /// (the core file/text userland — #547's cutover). A name goes in exactly one list;
 /// `shape_check` asserts the owning binary actually provides it.
 ///
 /// BUSYBOX now keeps only what no Rust multicall serves: the shell (`sh`/`ash`), `getty`
-/// (the tty setup half of the login chain — `login`/`su` moved to td-login), the text
-/// tools uutils does not provide (`grep`/`sed`/`awk`), and `more`, whose uutils feature
-/// would compile a crossterm pager stack into the shipped multicall — a dependency call,
-/// not a farm move.
-
+/// (the tty setup half of the login chain — `login`/`su` moved to td-login), `awk`, and
+/// `more`, whose uutils feature would compile a crossterm pager stack into the shipped
+/// multicall — a dependency call, not a farm move.
+///
+/// `grep`/`sed` LEFT this list for td-txt (see `TD_TXT_APPLETS`) once the conformance corpus
+/// covered the shapes the image's own scripts use — which is also why those scripts stopped
+/// spelling them `/bin/busybox grep` and now call `/bin/grep`: with the name off this list,
+/// the multiplexer spelling would name an applet `shape_check` no longer verifies. `awk` is
+/// what keeps busybox's text half alive; td-txt serves no awk.
+///
 /// `find`/`xargs` are intentionally NOT bare symlinks either: the ladder's findutils
 /// dead-axis lock (`no_bootstrap_step_invokes_host_find_or_xargs`) forbids those tokens in
 /// any step text and can't tell a cpio member NAME from a host invocation; they stay
@@ -206,9 +212,25 @@ const SYSTEM: SystemDef = SystemDef {
 /// `mount`/`umount` LEFT this list with td-init's `mount(2)`/`umount2(2)` amendment. They
 /// were the last thing on the boot path only busybox could do, and moving them is what lets
 /// both `/init` scripts stop calling the multiplexer.
-const BUSYBOX_APPLETS: &[&str] = &[
-    "sh", "ash", "getty", "more", "grep", "sed", "awk",
-];
+const BUSYBOX_APPLETS: &[&str] = &["sh", "ash", "getty", "more", "awk"];
+
+/// The text userland, served by the static td-txt multicall — the `grep` and `sed` busybox
+/// used to own, because uutils ships neither. Like every other farm here it dispatches on
+/// argv[0]'s basename, so a `/bin/<applet>` -> td-txt symlink runs that applet; like td-util
+/// and td-init (and unlike uutils) it is an ET_EXEC with an EMPTY runtime closure.
+///
+/// These names are LOAD-BEARING, which is what separates this farm from td-util's: the real
+/// root's `/etc/rootcheck` decides whether the boot is healthy with four `grep -Eq` runs over
+/// `/proc/mounts` and `/etc/machine-id`, and `/etc/profile`, `/etc/netup`, `/etc/bootsuccess`
+/// and `/etc/bootfail` each read `/proc/cmdline` with one. So every boot runs this binary
+/// before it can report success, and a grep that answered wrongly would not fail loudly — it
+/// would quietly mark a broken root healthy. That is why the corpus (td-txt/spec) had to
+/// cover those exact invocation shapes before this list existed.
+///
+/// `/proc` files stat as zero-length, so the applets must read them as streams rather than
+/// sizing a buffer from `st_size`; td-txt reads whole inputs by `read_to_end`, and the
+/// greeter probe below re-proves it on the booted image against the real `/proc/mounts`.
+const TD_TXT_APPLETS: &[&str] = &["grep", "sed"];
 
 /// Names the busybox retirement DROPS rather than reimplementing as a td app: nothing on the
 /// image calls either, and `more` remains the pager. Listed rather than merely absent so the
@@ -766,7 +788,7 @@ fn build_rootcheck(sys: &SystemDef) -> String {
     // `/` is a read-only erofs mount (fields: <src> <mnt> <fstype> <opts> …; erofs is
     //     always mounted `ro`, so the options field begins `ro`).
     s.push_str(&format!(
-        "if /bin/busybox grep -Eq '^[^ ]+ / erofs ro[, ]' /proc/mounts; then echo {SYSTEM_ROOT_RO_MARKER}; else ok=0; fi\n"
+        "if /bin/grep -Eq '^[^ ]+ / erofs ro[, ]' /proc/mounts; then echo {SYSTEM_ROOT_RO_MARKER}; else ok=0; fi\n"
     ));
     // Root runs this check, so a failed /etc write proves the filesystem rejects writes,
     // not merely that file modes deny an unprivileged process. Run the redirection in a
@@ -778,11 +800,11 @@ fn build_rootcheck(sys: &SystemDef) -> String {
     // State is the persistent Btrfs @var subvolume; only run/tmp are volatile.
     // Homes remain stable paths through immutable symlinks into /var.
     s.push_str(
-        "/bin/busybox grep -Eq '^[^ ]+ /var btrfs ' /proc/mounts || ok=0\n\
+        "/bin/grep -Eq '^[^ ]+ /var btrfs ' /proc/mounts || ok=0\n\
          /bin/busybox awk '$2 == \"/run/td-volume\" && $3 == \"btrfs\" && \
          $4 ~ /(^|,)ro(,|$)/ { found=1 } END { exit !found }' /proc/mounts || ok=0\n\
          for d in /run /tmp; do \
-         /bin/busybox grep -Eq \"^[^ ]+ $d tmpfs \" /proc/mounts || ok=0; \
+         /bin/grep -Eq \"^[^ ]+ $d tmpfs \" /proc/mounts || ok=0; \
          done\n",
     );
     s.push_str(
@@ -805,7 +827,7 @@ fn build_rootcheck(sys: &SystemDef) -> String {
     ));
     if let Some(user) = sys.users.iter().find(|user| user.name == sys.autologin) {
         s.push_str(&format!(
-            "if /bin/busybox grep -q -F '{BOOT_FAIL_TARGET_CMDLINE_TOKEN}' /proc/cmdline; then \
+            "if /bin/grep -q -F '{BOOT_FAIL_TARGET_CMDLINE_TOKEN}' /proc/cmdline; then \
              /bin/busybox printf '%s\\n' waiting > /run/td-boot-parked \
              && /bin/busybox chown {}:{} /run/td-boot-parked \
              && /bin/busybox chmod 0600 /run/td-boot-parked || ok=0; \
@@ -821,14 +843,14 @@ fn build_rootcheck(sys: &SystemDef) -> String {
          fi\n"
     ));
     s.push_str(&format!(
-        "if /bin/busybox grep -q -F '{PERSIST_WRITE_CMDLINE_TOKEN}' /proc/cmdline; then \
+        "if /bin/grep -q -F '{PERSIST_WRITE_CMDLINE_TOKEN}' /proc/cmdline; then \
          if /bin/busybox test ! -e /var/lib/td/boot-marker \
          && /bin/busybox mkdir -p /var/lib/td \
          && /bin/busybox printf '%s\\n' td-persistent-v1 > /var/lib/td/boot-marker \
          && /bin/busybox sync; then \
          echo {SYSTEM_PERSIST_WRITE_MARKER}; fi; \
          fi\n\
-         if /bin/busybox grep -q -F '{PERSIST_READ_CMDLINE_TOKEN}' /proc/cmdline \
+         if /bin/grep -q -F '{PERSIST_READ_CMDLINE_TOKEN}' /proc/cmdline \
          && /bin/busybox test \"$(/bin/busybox cat /var/lib/td/boot-marker 2>/dev/null)\" = td-persistent-v1; then \
          echo {SYSTEM_PERSIST_READ_MARKER}; \
          fi\n"
@@ -870,7 +892,7 @@ fn build_mutable_etc_check(sys: &SystemDef) -> String {
     }
     // The id must be the shape every reader expects, read back THROUGH /etc.
     s.push_str(
-        "/bin/busybox grep -Eq '^[0-9a-f]{32}$' /etc/machine-id || me=0\n",
+        "/bin/grep -Eq '^[0-9a-f]{32}$' /etc/machine-id || me=0\n",
     );
     if let Some(user) = sys.users.iter().find(|user| user.name == sys.autologin) {
         if user.uid != 0 {
@@ -964,6 +986,50 @@ fn td_login_probe(sys: &SystemDef) -> String {
 /// trouble to produce named a component nobody would look at. The `m*` flags keep a retry from
 /// reprinting a marker it already earned. `SYSTEM_BOOT_SUCCESS_MARKER` stays gated on the whole
 /// transaction, which is what it means.
+/// The td-txt farm's greeter probes. Unlike td-util's `/bin/<applet> >/dev/null` loop these
+/// assert an ANSWER, not an exit status, because the failure that matters for a text tool is
+/// a wrong answer rather than a crash — a `grep -Eq` that selected the wrong line would let
+/// `/etc/rootcheck` call a writable root read-only, in silence.
+///
+/// - `grep` runs rootcheck's own `-Eq` over the LIVE `/proc/mounts`, both ways: it must select
+///   the read-only erofs root and must NOT select the `rw` spelling of the same line. Two
+///   runs, so a grep that matched everything (or nothing) fails one of them. Reading
+///   `/proc/mounts` at all is the other half — procfs files stat as zero-length, so a reader
+///   that trusted `st_size` would see an empty file and quietly agree with whichever test
+///   asked for "no match".
+/// - `sed` has no boot-path duty, so it is exercised on its own, over `/etc/os-release`:
+///   an `s///p` that must print `td`, and a `2p` that must print `ID=td`. Both compare
+///   against a known value rather than just checking the exit status, for the same reason.
+///
+/// Every probe is unprivileged and read-only — no state to restore, unlike td-init's farm
+/// where the reversible/irreversible split forced probing by refusal.
+fn build_td_txt_probes() -> String {
+    // NO SINGLE QUOTE may appear below: this whole string is interpolated INSIDE the
+    // greeter's `su -s /bin/sh USER -c '…'` argument, so one would close that argument
+    // and scatter the rest of the probe into the outer shell as stray words — which
+    // still PARSES, so `sh -n` would not catch it. Double quotes are literal there, and
+    // none of these patterns contains `$`, a backtick or a backslash.
+    // `td_txt_probes_survive_the_greeters_quoting` asserts the rule.
+    let mut p = String::from("t=1; ");
+    p.push_str(
+        "/bin/grep -Eq \"^[^ ]+ / erofs ro[, ]\" /proc/mounts || \
+         { echo \"td-txt: /bin/grep did not select the read-only root in /proc/mounts\"; \
+         t=0; }; \
+         if /bin/grep -Eq \"^[^ ]+ / erofs rw[, ]\" /proc/mounts; then \
+         echo \"td-txt: /bin/grep selected a rw root line that is not there\"; t=0; fi; ",
+    );
+    p.push_str(
+        "s=$(/bin/sed -n \"s/^ID=//p\" /etc/os-release) || \
+         { echo \"td-txt: /bin/sed substitution failed\"; t=0; }; \
+         [ \"$s\" = td ] || { echo \"td-txt: /bin/sed printed $s, want td\"; t=0; }; \
+         n=$(/bin/sed -n \"2p\" /etc/os-release) || \
+         { echo \"td-txt: /bin/sed line select failed\"; t=0; }; \
+         [ \"$n\" = \"ID=td\" ] || \
+         { echo \"td-txt: /bin/sed printed $n for line 2, want ID=td\"; t=0; }; ",
+    );
+    p
+}
+
 fn build_bootsuccess(sys: &SystemDef) -> String {
     let mut uutils_behavior_probes = String::new();
     for probe in UUTILS_BEHAVIOR_PROBES {
@@ -990,13 +1056,14 @@ fn build_bootsuccess(sys: &SystemDef) -> String {
         td_init_probes.push_str(&td_init_probe(applet, probe, sys));
     }
     let td_login_probe = td_login_probe(sys);
+    let td_txt_probes = build_td_txt_probes();
     format!(
         "#!/bin/sh\n\
          set -f\n\
          finish() {{ /bin/busybox printf '%s\\n' \"$1\" > /run/td-boot-success-ok; \
          /bin/busybox chmod 0644 /run/td-boot-success-ok; }}\n\
          fail() {{ finish td-boot-failure-v1; exit 1; }}\n\
-         /bin/busybox grep -q -F '{BOOT_FAIL_TARGET_CMDLINE_TOKEN}' /proc/cmdline && exit 0\n\
+         /bin/grep -q -F '{BOOT_FAIL_TARGET_CMDLINE_TOKEN}' /proc/cmdline && exit 0\n\
          /bin/busybox test \"$(/bin/busybox cat /run/td-rootcheck-ok 2>/dev/null)\" = td-rootcheck-v1 || fail\n\
          deployment=$(/bin/busybox cat /run/td-deployment 2>/dev/null)\n\
          /bin/busybox test -n \"$deployment\" || fail\n\
@@ -1007,7 +1074,7 @@ fn build_bootsuccess(sys: &SystemDef) -> String {
          case \"$wait\" in ''|*[!0-9]*|0) wait={BOOT_SUCCESS_RETRY_SECS};; esac\n\
          [ \"$wait\" -gt {BOOT_SUCCESS_RETRY_MAX_SECS} ] && wait={BOOT_SUCCESS_RETRY_MAX_SECS}\n\
          n=0\n\
-         mu=0; mrf=0; ms=0; mtu=0; mti=0; mtl=0\n\
+         mu=0; mrf=0; ms=0; mtu=0; mti=0; mtl=0; mtt=0\n\
          while [ \"$n\" -lt \"$wait\" ]; do \
          healthy=1; \
          if /bin/su -s /bin/sh {} -c \
@@ -1046,9 +1113,12 @@ fn build_bootsuccess(sys: &SystemDef) -> String {
          if /bin/su -s /bin/sh {} -c \
          '{td_login_probe}'; then \
          [ \"$mtl\" = 1 ] || {{ echo {TD_LOGIN_RUNTIME_MARKER}; mtl=1; }}; else healthy=0; fi; \
+         if /bin/su -s /bin/sh {} -c \
+         '{td_txt_probes}[ \"$t\" = 1 ]'; then \
+         [ \"$mtt\" = 1 ] || {{ echo {TD_TXT_RUNTIME_MARKER}; mtt=1; }}; else healthy=0; fi; \
          if [ \"$healthy\" = 1 ] \
          && /bin/td-boot success /dev/vda /run/td-update \"$deployment\" >/run/td-success-id; then \
-         if /bin/busybox grep -q -F '{DEPLOY_INSTALL_CMDLINE_TOKEN}' /proc/cmdline; then \
+         if /bin/grep -q -F '{DEPLOY_INSTALL_CMDLINE_TOKEN}' /proc/cmdline; then \
          if /bin/td-boot install /dev/vda /run/td-update \
          /run/td-volume/td/incoming/candidate >/run/td-installed-id; then \
          echo {SYSTEM_DEPLOY_INSTALL_MARKER}; else healthy=0; fi; \
@@ -1060,6 +1130,7 @@ fn build_bootsuccess(sys: &SystemDef) -> String {
          n=$((n+1)); /bin/busybox sleep 1; \
          done\n\
          fail\n",
+        sys.autologin,
         sys.autologin,
         sys.autologin,
         sys.autologin,
@@ -1078,7 +1149,7 @@ fn build_bootfail() -> String {
     format!(
         "#!/bin/sh\n\
          set -f\n\
-         /bin/busybox grep -q -F '{BOOT_FAIL_TARGET_CMDLINE_TOKEN}' /proc/cmdline || exit 0\n\
+         /bin/grep -q -F '{BOOT_FAIL_TARGET_CMDLINE_TOKEN}' /proc/cmdline || exit 0\n\
          /bin/busybox test \"$(/bin/busybox cat /run/td-rootcheck-ok 2>/dev/null)\" = td-rootcheck-v1 || exit 1\n\
          wait={BOOT_FAIL_PARK_WAIT_SECS}\n\
          for token in $(/bin/busybox cat /proc/cmdline); do \
@@ -1088,7 +1159,7 @@ fn build_bootfail() -> String {
          [ \"$wait\" -gt {BOOT_FAIL_PARK_WAIT_SECS} ] && wait={BOOT_FAIL_PARK_WAIT_SECS}\n\
          n=0\n\
          while [ \"$n\" -lt \"$wait\" ]; do \
-         /bin/busybox grep -q -x '{BOOT_FAIL_PARKED}' /run/td-boot-parked 2>/dev/null && \
+         /bin/grep -q -x '{BOOT_FAIL_PARKED}' /run/td-boot-parked 2>/dev/null && \
          {{ /etc/shutdown; exec /bin/reboot; }} >/dev/console 2>&1; \
          n=$((n+1)); /bin/busybox sleep 1; \
          done\n\
@@ -1108,7 +1179,7 @@ fn build_profile(sys: &SystemDef) -> String {
     s.push_str("export PATH=/bin\n");
     s.push_str("export PS1='\\u@\\h:\\w\\$ '\n");
     s.push_str(&format!(
-        "if /bin/busybox grep -q -F '{BOOT_FAIL_TARGET_CMDLINE_TOKEN}' /proc/cmdline; then \
+        "if /bin/grep -q -F '{BOOT_FAIL_TARGET_CMDLINE_TOKEN}' /proc/cmdline; then \
          exec /bin/busybox sh -c 'cd / \
          || exit 1; \
          if ! /bin/busybox printf \"%s\\n\" {BOOT_FAIL_PARKED} > /run/td-boot-parked; then \
@@ -1151,7 +1222,7 @@ fn build_profile(sys: &SystemDef) -> String {
     s.push_str(&format!("echo {GREETER_MARKER}\n"));
     // Autotest waits for the independent root-owned health transaction.
     s.push_str(&format!(
-        "if /bin/busybox grep -q -F '{AUTOTEST_CMDLINE_TOKEN}' /proc/cmdline 2>/dev/null; then \
+        "if /bin/grep -q -F '{AUTOTEST_CMDLINE_TOKEN}' /proc/cmdline 2>/dev/null; then \
          set -f; wait=0; for token in $(/bin/busybox cat /proc/cmdline); do \
          case \"$token\" in {BOOT_SUCCESS_WAIT_CMDLINE_PREFIX}*) \
          wait=${{token#{BOOT_SUCCESS_WAIT_CMDLINE_PREFIX}}};; esac; done; \
@@ -1182,7 +1253,7 @@ fn build_netup() -> String {
     format!(
         "#!/bin/sh\n\
          if /bin/td-netd up; then up=1; else up=0; fi\n\
-         if /bin/busybox grep -q -F '{NETTEST_CMDLINE_TOKEN}' /proc/cmdline 2>/dev/null; then \
+         if /bin/grep -q -F '{NETTEST_CMDLINE_TOKEN}' /proc/cmdline 2>/dev/null; then \
          [ \"$up\" = 1 ] && echo {SYSTEM_NET_UP_MARKER}; \
          /bin/td-netd resolve {NETTEST_DEFAULT_HOST} && echo {SYSTEM_NET_RESOLVE_MARKER}; \
          /bin/td-netd reach {NETTEST_DEFAULT_HOST} {NETTEST_DEFAULT_PORT} && echo {SYSTEM_NET_REACH_MARKER}; \
@@ -1494,6 +1565,14 @@ fn real_root_steps(sys: &SystemDef) -> Vec<Step> {
         from: "{in:td-util}".into(),
         dest: "{root}/real-root{in:td-util}".into(),
     });
+    // td-txt is static too, and its empty closure matters for the same reason td-util's
+    // does: /etc/rootcheck greps /proc/mounts to decide whether the root came up correctly,
+    // so a text tool that needs a working runtime closure would be unusable exactly when the
+    // machine is being asked to prove it has one.
+    steps.push(Step::CopyTree {
+        from: "{in:td-txt}".into(),
+        dest: "{root}/real-root{in:td-txt}".into(),
+    });
     // td-init likewise — and here the empty closure is load-bearing rather than merely
     // convenient: this same binary is /init (PID 1) and the initramfs pivot, both of which
     // run where no dynamic loader is reachable.
@@ -1590,6 +1669,19 @@ fn real_root_steps(sys: &SystemDef) -> Vec<Step> {
     for app in TD_UTIL_APPLETS {
         steps.push(Step::Symlink {
             target: "{in:td-util}/bin/td-util".into(),
+            link: format!("{{root}}/real-root/bin/{app}"),
+        });
+    }
+    // /bin/td-txt is the multicall's own entry (`td-txt <applet>`, and `--list`); the loop
+    // below is the argv[0] farm `grep` and `sed` resolve through — the two names that left
+    // busybox once the conformance corpus covered the image's own invocation shapes.
+    steps.push(Step::Symlink {
+        target: "{in:td-txt}/bin/td-txt".into(),
+        link: "{root}/real-root/bin/td-txt".into(),
+    });
+    for app in TD_TXT_APPLETS {
+        steps.push(Step::Symlink {
+            target: "{in:td-txt}/bin/td-txt".into(),
             link: format!("{{root}}/real-root/bin/{app}"),
         });
     }
@@ -1746,6 +1838,17 @@ fn shape_check() -> String {
          [ \"$(readlink \"$root/bin/$a\" 2>/dev/null)\" = \"$tdutgt\" ] || { echo \"root tree: /bin/$a is not a symlink to the staged td-util multicall ($tdutgt) - the diagnostics /bin farm regressed\" >&2; exit 1; }; \
          printf '%s\\n' \"$tdulist\" | grep -q -x -F \"$a\" || { echo \"td-util does not serve applet '$a' - its packed /bin/$a symlink would dispatch to nothing (usage, exit 2)\" >&2; exit 1; }; \
      done; \
+     [ \"$(readlink \"$root/bin/td-txt\" 2>/dev/null)\" = \"{in:td-txt}/bin/td-txt\" ] || { echo 'root tree: /bin/td-txt is not a symlink to the staged text multicall' >&2; exit 1; }; \
+     tdt=\"{root}/real-root{in:td-txt}/bin/td-txt\"; tdttgt=\"{in:td-txt}/bin/td-txt\"; { [ -f \"$tdt\" ] && [ -x \"$tdt\" ]; } || { echo 'root tree: the td-txt binary is not packed/executable at real-root{in:td-txt}/bin/td-txt - the /bin/grep symlink would dangle and /etc/rootcheck would fail every boot' >&2; exit 1; }; \
+     tdtlist=$(\"$tdt\" --list 2>/dev/null) || { echo 'td-txt --list failed - cannot verify the text farm' >&2; exit 1; }; \
+     for a in @TD_TXT_APPLETS@; do \
+         [ \"$(readlink \"$root/bin/$a\" 2>/dev/null)\" = \"$tdttgt\" ] || { echo \"root tree: /bin/$a is not a symlink to the staged td-txt multicall ($tdttgt) - the text /bin farm regressed\" >&2; exit 1; }; \
+         printf '%s\\n' \"$tdtlist\" | grep -q -x -F \"$a\" || { echo \"td-txt does not serve applet '$a' - its packed /bin/$a symlink would dispatch to nothing (usage, exit 2)\" >&2; exit 1; }; \
+     done; \
+     tdtro=$(printf '/dev/root / erofs ro,relatime 0 0\\n/dev/vda2 /var btrfs rw 0 0\\n' | \"$tdt\" grep -E '^[^ ]+ / erofs ro[, ]') || { echo 'td-txt: the packed grep did not select the read-only root line /etc/rootcheck depends on' >&2; exit 1; }; \
+     case \"$tdtro\" in '/dev/root / erofs ro,relatime 0 0') : ;; *) echo \"td-txt: the packed grep selected the wrong /proc/mounts line: $tdtro\" >&2; exit 1;; esac; \
+     printf '/dev/root / erofs rw,relatime 0 0\\n' | \"$tdt\" grep -qE '^[^ ]+ / erofs ro[, ]' && { echo 'td-txt: the packed grep selected a rw root as read-only - /etc/rootcheck would call a writable root healthy' >&2; exit 1; }; \
+     [ \"$(printf 'a\\nb\\n' | \"$tdt\" sed -n '$=')\" = 2 ] || { echo 'td-txt: the packed sed miscounted a two-line stream' >&2; exit 1; }; \
      [ \"$(readlink \"$root/bin/td-init\" 2>/dev/null)\" = \"{in:td-init}/bin/td-init\" ] || { echo 'root tree: /bin/td-init is not a symlink to the staged boot-glue multicall' >&2; exit 1; }; \
      tdi=\"{root}/real-root{in:td-init}/bin/td-init\"; tditgt=\"{in:td-init}/bin/td-init\"; { [ -f \"$tdi\" ] && [ -x \"$tdi\" ]; } || { echo 'root tree: the td-init binary is not packed/executable at real-root{in:td-init}/bin/td-init - /init would not exec and the machine would not boot' >&2; exit 1; }; \
      [ \"$(readlink \"$root/init\")\" = \"$tditgt\" ] || { echo 'root tree: /init must be a symlink to the staged td-init multicall - it is PID 1' >&2; exit 1; }; \
@@ -1827,6 +1930,7 @@ fn shape_check() -> String {
         .replace("@DROPPED_APPLETS@", &DROPPED_APPLETS.join(" "))
         .replace("@UUTILS_APPLETS@", &UUTILS_APPLETS.join(" "))
         .replace("@TD_UTIL_APPLETS@", &TD_UTIL_APPLETS.join(" "))
+        .replace("@TD_TXT_APPLETS@", &TD_TXT_APPLETS.join(" "))
         .replace("@TD_INIT_APPLETS@", &td_init_applets().join(" "))
         .replace("@TD_LOGIN_APPLETS@", &TD_LOGIN_APPLETS.join(" "))
         // `<etc path>=<target>` pairs, and the etc paths alone. Both lists are
@@ -1993,6 +2097,9 @@ pub fn recipe() -> Recipe {
         // td-kexec: confined selector-only kexec helper.
         // td-util: the static diagnostics multicall (empty runtime closure, CopyTree'd),
         //   serving the /bin farm those five names resolve through.
+        // td-txt: the static text multicall (empty runtime closure, CopyTree'd), serving
+        //   /bin/grep and /bin/sed. Unlike td-util's farm these are on the boot path —
+        //   /etc/rootcheck and four other generated scripts grep /proc with them.
         // td-init: the static boot-glue multicall (empty runtime closure, CopyTree'd). Not a
         //   farm like the others: it is /init (PID 1), the deployment initramfs' pivot, and
         //   the sysinit `hostname -F`, so the image's boot path runs it on every boot.
@@ -2015,6 +2122,7 @@ pub fn recipe() -> Recipe {
             "td-boot",
             "td-kexec",
             "td-util",
+            "td-txt",
             "td-init",
             "td-firstboot",
             "td-login",
@@ -2314,13 +2422,14 @@ mod tests {
     /// one of them runs somewhere no dynamic loader is reachable (the pre-pivot initramfs)
     /// or where a failure has nowhere to be reported (PID 1's own sysinit), so what matters
     /// is not which static binary serves them but that uutils never does.
-    /// Every /bin farm, name-tagged. ONE table: two tests consume it, and a fifth farm added
-    /// to only one of them would leave the other silently narrower.
-    fn bin_farms<'a>(td_init: &'a [&'static str]) -> [(&'static str, &'a [&'static str]); 5] {
+    /// Every /bin farm, name-tagged. ONE table: two tests consume it, and a seventh farm
+    /// added to only one of them would leave the other silently narrower.
+    fn bin_farms<'a>(td_init: &'a [&'static str]) -> [(&'static str, &'a [&'static str]); 6] {
         [
             ("busybox", BUSYBOX_APPLETS),
             ("uutils", UUTILS_APPLETS),
             ("td-util", TD_UTIL_APPLETS),
+            ("td-txt", TD_TXT_APPLETS),
             ("td-init", td_init),
             ("td-login", TD_LOGIN_APPLETS),
         ]
@@ -3616,6 +3725,120 @@ mod tests {
         }
     }
 
+    /// td-txt is packed, serves both /bin names, and each is exercised by the greeter — the
+    /// same three-part contract td-util's test below states, with one addition that is the
+    /// point of this farm: the grep probe must be DISCRIMINATING. `/etc/rootcheck` decides
+    /// the boot is healthy with `/bin/grep -Eq`, so a grep that selected every line would
+    /// pass a "did it exit 0" probe while calling a writable root read-only. The probe
+    /// therefore asserts a match AND a non-match, and this test pins both halves.
+    #[test]
+    fn td_txt_serves_its_farm_and_the_grep_probe_discriminates() {
+        let steps = real_root_steps(&SYSTEM);
+        assert!(
+            steps.iter().any(|s| matches!(
+                s,
+                Step::CopyTree { from, dest }
+                    if from == "{in:td-txt}" && dest == "{root}/real-root{in:td-txt}"
+            )),
+            "td-txt must be CopyTree'd into the real root (static, empty closure)"
+        );
+        assert!(
+            steps.iter().any(|s| matches!(
+                s,
+                Step::Symlink { target, link }
+                    if target == "{in:td-txt}/bin/td-txt"
+                        && link == "{root}/real-root/bin/td-txt"
+            )),
+            "/bin/td-txt must symlink into the store td-txt package"
+        );
+        assert!(
+            !TD_TXT_APPLETS.is_empty(),
+            "an empty farm would make every assertion below, and shape_check's own farm \
+             loop, silently vacuous"
+        );
+        // Exactly one claimant per link, for the reason spelled out in the td-util test.
+        for applet in TD_TXT_APPLETS {
+            let link = format!("{{root}}/real-root/bin/{applet}");
+            let targets: Vec<&str> = steps
+                .iter()
+                .filter_map(|s| match s {
+                    Step::Symlink { target, link: l } if *l == link => Some(target.as_str()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                targets.as_slice(),
+                ["{in:td-txt}/bin/td-txt"],
+                "/bin/{applet} must resolve to the staged td-txt multicall, and to nothing else"
+            );
+        }
+        // Match the WHOLE generated invocation, not just the name: every diagnostic
+        // below also says `/bin/grep`, so a name-only assertion is satisfied by the
+        // `echo` alone — delete the command, keep the message, and the test still
+        // passes. The td-init test documents the same trap.
+        let probes = build_td_txt_probes();
+        for invocation in [
+            r#"/bin/grep -Eq "^[^ ]+ / erofs ro[, ]" /proc/mounts ||"#,
+            r#"s=$(/bin/sed -n "s/^ID=//p" /etc/os-release) ||"#,
+            r#"n=$(/bin/sed -n "2p" /etc/os-release) ||"#,
+        ] {
+            assert!(
+                probes.contains(invocation),
+                "the greeter never runs `{invocation}`, so that applet's symlink and \
+                 argv[0] dispatch would ship unexercised"
+            );
+        }
+        for applet in TD_TXT_APPLETS {
+            assert!(
+                probes.contains(&format!("/bin/{applet} ")),
+                "no probe names /bin/{applet} at all"
+            );
+        }
+        // The negative leg. Without it the probe is satisfied by a grep that matches
+        // everything — precisely the failure that would let rootcheck pass a rw root.
+        assert!(
+            probes.contains(r#"if /bin/grep -Eq "^[^ ]+ / erofs rw[, ]" /proc/mounts; then"#),
+            "the grep probe must also assert a NON-match; a match-only probe cannot tell a \
+             working grep from one that selects every line"
+        );
+        // Both legs must be able to fail the marker, or the probe is decoration.
+        assert_eq!(
+            probes.matches("t=0").count(),
+            6,
+            "each probe leg needs its own `t=0': a leg that cannot clear the flag reports \
+             success no matter what the applet did"
+        );
+        let bootsuccess = build_bootsuccess(&SYSTEM);
+        assert!(
+            bootsuccess.contains(&format!("echo {TD_TXT_RUNTIME_MARKER}")),
+            "the greeter must print the td-txt marker the boot oracle waits for"
+        );
+    }
+
+    /// The greeter wraps the probes in `su -s /bin/sh USER -c '\u{2026}'`, so a single quote
+    /// anywhere in them closes that argument and scatters the rest into the OUTER shell
+    /// as stray words: `grep -Eq "^[^ ]+ / erofs ro[, ]"` becomes `grep -Eq ^[^` plus
+    /// five loose arguments, `$t` is set in the wrong shell, and the marker can never be
+    /// earned. The result still PARSES, so `sh -n` greens it and only the qemu boot
+    /// oracle — a daily-tier check — would ever notice. Hence a unit test.
+    ///
+    /// Two halves, and both are needed: the probes carry no single quote, and they sit
+    /// immediately after the opening quote of the `su -c` argument. The second is what
+    /// makes the first a proof rather than a convention about a wrapper nothing pins.
+    #[test]
+    fn td_txt_probes_survive_the_greeters_quoting() {
+        let probes = build_td_txt_probes();
+        assert!(
+            !probes.contains('\''),
+            "a single quote in the td-txt probes would close the greeter's `su -c` \
+             argument: {probes}"
+        );
+        assert!(
+            build_bootsuccess(&SYSTEM).contains(&format!("-c '{probes}")),
+            "the greeter must run the td-txt probes verbatim inside its `su -c` argument"
+        );
+    }
+
     /// td-util is packed, serves its whole /bin farm, and every one of those names is
     /// exercised by the greeter on the image. All three must hold together: a farm whose
     /// binary is not packed dangles, and a farm no probe runs is a cutover asserted only by
@@ -4258,3 +4481,4 @@ mod tests {
         }
     }
 }
+

@@ -57,8 +57,12 @@ a
 ## stderr-contains: unsupported option -- 'debug'
 
 #### sed refuses --follow-symlinks rather than accepting it as a no-op
-# It changes which file -i rewrites: GNU replaces the symlink's TARGET, td-txt
-# would replace the symlink. Silently ignoring it would edit the wrong file.
+# It changes which file -i rewrites. WITHOUT it — td-txt's only behavior, and
+# GNU's default — a symlink operand is REPLACED by a regular file and its target
+# is untouched; WITH it GNU resolves the link and rewrites the target instead.
+# Accepting it as a no-op would silently edit the wrong file, so it is refused.
+# `sed_in_place_replaces_a_symlink_rather_than_following_it` pins the default a
+# case file cannot express (the harness materializes no symlinks).
 ## argv: sed --follow-symlinks -i s/a/b/ f
 ## file f:
 a
@@ -66,3 +70,110 @@ a
 ## stdout-json: ""
 ## status: 1
 ## stderr-contains: unsupported option -- 'follow-symlinks'
+
+#### grep --version reports td-txt, not a GNU banner
+# GNU prints `grep (GNU grep) 3.11' and a copyright block. td-txt is not GNU
+# grep, and a script that reads the banner to decide what its grep can do must
+# not be told otherwise. Answering (exit 0) rather than refusing is the point:
+# `grep --version' is how a build script asks "is there a grep here", and td's
+# own recipes ask it. What it answers WITH is the divergence.
+## argv: grep --version
+## stdout:
+grep (td-txt) 0.1.0
+## END
+## stderr-json: ""
+## status: 0
+
+#### sed --version reports td-txt, not a GNU banner
+## argv: sed --version
+## stdout:
+sed (td-txt) 0.1.0
+## END
+## stderr-json: ""
+## status: 0
+
+#### --help prints td-txt's usage, not GNU's option manual
+# Same bargain as --version: exit 0 with a real answer, but the answer names the
+# options td-txt HAS. Reprinting GNU's help would advertise --color, -P and the
+# include/exclude globs this applet refuses two cases below.
+## argv: grep --help
+## stdout:
+usage: grep [-EFGHhicLlnoqsvwxrzZ] [-m NUM] [-A NUM] [-B NUM] [-C NUM] [-e PATTERN] [-f FILE] [PATTERN] [FILE]...
+## END
+## stderr-json: ""
+## status: 0
+
+#### grep refuses -b rather than reporting a byte offset it does not track
+# GNU's -b prefixes each output line with its byte offset. Nothing on the image
+# or in td's recipes uses it — glibc's build wants `grep -ob U', and the ladder
+# SUBSTITUTES an awk program for that line rather than requiring it — so it is
+# refused instead of guessed at.
+## argv: grep -b a
+## stdin:
+a
+## END
+## stdout-json: ""
+## status: 2
+## stderr-contains: invalid option -- 'b'
+
+#### sed refuses -l N rather than silently ignoring the l wrap width
+# The `l' command itself is implemented and wraps at GNU's default 70. `-l N'
+# changes that width; accepting it as a no-op would fail OPEN, printing 70-column
+# output to a caller that asked for something else.
+## argv: sed -l 5 l
+## stdin:
+a
+## END
+## stdout-json: ""
+## status: 1
+## stderr-contains: invalid option -- 'l'
+
+#### grep refuses --color rather than emitting or dropping escapes
+## argv: grep --color=auto a
+## stdin:
+a
+## END
+## stdout-json: ""
+## status: 2
+## stderr-contains: unrecognized option '--color=auto'
+
+#### grep refuses --include rather than searching everything
+# A glob filter that is silently ignored SEARCHES MORE than the caller asked, so
+# a refusal is the only safe reading.
+## argv: grep -r --include=*.c a .
+## file x.txt:
+a
+## END
+## stdout-json: ""
+## status: 2
+## stderr-contains: unrecognized option '--include=*.c'
+
+#### --version=x is GNU's arity error, but the usage that follows is td-txt's
+# The ERROR matches GNU exactly (`option '--version' doesn't allow an argument`,
+# exit 1) — this case is here only because the usage block printed after it names
+# td-txt's options rather than reprinting GNU's manual. Same for --help=x.
+## argv: sed --version=x
+## stdin:
+a
+## END
+## stdout-json: ""
+## status: 1
+## stderr-contains: option '--version' doesn't allow an argument
+
+#### --help=x likewise
+## argv: sed --help=x
+## stdin:
+a
+## END
+## stdout-json: ""
+## status: 1
+## stderr-contains: option '--help' doesn't allow an argument
+
+#### grep --version=x refuses the argument the same way
+## argv: grep --version=x
+## stdin:
+a
+## END
+## stdout-json: ""
+## status: 2
+## stderr-contains: option '--version' doesn't allow an argument

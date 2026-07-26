@@ -41,7 +41,7 @@ fn bin() -> PathBuf {
 /// missing vendored `.inp`/`.good`, or a typo'd annotation reds in-loop — without
 /// depending on the behavioral run below.
 /// Raise this with the corpus; it exists to catch a corpus that SHRANK.
-const CORPUS_FLOOR: usize = 660;
+const CORPUS_FLOOR: usize = 740;
 
 #[test]
 fn corpus_is_well_formed() -> Result<(), Box<dyn std::error::Error>> {
@@ -314,5 +314,144 @@ fn a_file_writing_case_does_not_pollute_the_working_tree() -> Result<(), Box<dyn
         !Path::new(&marker).exists(),
         "case leaked {marker} into the working tree — isolation is broken"
     );
+    Ok(())
+}
+
+/// A throwaway directory for the filesystem-level `sed -i` tests below, removed
+/// on drop so a failing assertion cannot leave a tree behind.
+struct TempDir(PathBuf);
+
+impl TempDir {
+    fn new(tag: &str) -> std::io::Result<Self> {
+        let dir = std::env::temp_dir().join(format!("td-txt-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir)?;
+        Ok(Self(dir))
+    }
+
+    fn join(&self, name: &str) -> PathBuf {
+        self.0.join(name)
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+fn sed_in(dir: &TempDir, args: &[&str]) -> std::io::Result<std::process::Output> {
+    std::process::Command::new(bin())
+        .arg("sed")
+        .args(args)
+        .current_dir(&dir.0)
+        .output()
+}
+
+/// `sed -i` writes a NEW file and renames it over the name, which is what makes a
+/// symlink operand get REPLACED instead of resolved. Writing through the name —
+/// the obvious implementation, and the one this replaced — silently gives every
+/// `-i` run the `--follow-symlinks` behavior the applet refuses to be asked for.
+/// The case files cannot express this: the harness materializes regular files
+/// only, so it lives here.
+#[test]
+fn sed_in_place_replaces_a_symlink_rather_than_following_it(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let dir = TempDir::new("symlink")?;
+    std::fs::write(dir.join("real"), b"a\n")?;
+    std::os::unix::fs::symlink("real", dir.join("link"))?;
+
+    let out = sed_in(&dir, &["-i", "s/a/b/", "link"])?;
+    assert!(out.status.success(), "sed -i on a symlink: {out:?}");
+    assert!(
+        !std::fs::symlink_metadata(dir.join("link"))?.file_type().is_symlink(),
+        "-i left `link' a symlink, so it followed it and edited the target"
+    );
+    assert_eq!(std::fs::read(dir.join("link"))?, b"b\n");
+    assert_eq!(
+        std::fs::read(dir.join("real"))?,
+        b"a\n",
+        "-i rewrote the symlink's TARGET; GNU leaves it untouched"
+    );
+    Ok(())
+}
+
+/// The same rename is what breaks a hard link: the other name keeps the old
+/// content and the old inode. Writing through the name would have changed both.
+#[test]
+fn sed_in_place_breaks_a_hard_link() -> Result<(), Box<dyn std::error::Error>> {
+    let dir = TempDir::new("hardlink")?;
+    std::fs::write(dir.join("one"), b"a\n")?;
+    std::fs::hard_link(dir.join("one"), dir.join("two"))?;
+
+    let out = sed_in(&dir, &["-i", "s/a/b/", "one"])?;
+    assert!(out.status.success(), "sed -i on a hard link: {out:?}");
+    assert_eq!(std::fs::read(dir.join("one"))?, b"b\n");
+    assert_eq!(
+        std::fs::read(dir.join("two"))?,
+        b"a\n",
+        "-i edited the shared inode, so every other name for it changed too"
+    );
+    Ok(())
+}
+
+/// Two more consequences of the rename, both of which a caller relies on: the new
+/// file carries the original's mode (a create default would silently relax or
+/// tighten it), and a read-only file can be rewritten at all — writing through the
+/// name cannot open it.
+#[test]
+fn sed_in_place_keeps_the_mode_and_rewrites_a_read_only_file(
+) -> Result<(), Box<dyn std::error::Error>> {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = TempDir::new("mode")?;
+    for (name, mode) in [("exec", 0o754u32), ("readonly", 0o444)] {
+        std::fs::write(dir.join(name), b"a\n")?;
+        std::fs::set_permissions(dir.join(name), std::fs::Permissions::from_mode(mode))?;
+    }
+
+    let out = sed_in(&dir, &["-i", "s/a/b/", "exec", "readonly"])?;
+    assert!(out.status.success(), "sed -i mode case: {out:?}");
+    for (name, mode) in [("exec", 0o754u32), ("readonly", 0o444)] {
+        assert_eq!(std::fs::read(dir.join(name))?, b"b\n", "{name} was not rewritten");
+        assert_eq!(
+            std::fs::metadata(dir.join(name))?.permissions().mode() & 0o777,
+            mode,
+            "{name} lost its mode across the rename"
+        );
+    }
+    // The scratch file is renamed, never left behind.
+    let mut names: Vec<String> = std::fs::read_dir(&dir.0)?
+        .filter_map(|e| e.ok().map(|e| e.file_name().to_string_lossy().into_owned()))
+        .collect();
+    names.sort();
+    assert_eq!(names, vec!["exec".to_string(), "readonly".to_string()]);
+    Ok(())
+}
+
+/// A failed backup rename must not leave the scratch file behind either, and it
+/// is a RUNTIME failure (exit 4) — the script compiled fine, the filesystem
+/// refused — so it carries no `-e expression #N' prefix blaming the script.
+#[test]
+fn a_failed_in_place_backup_is_exit_4_and_leaves_no_scratch_file(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let dir = TempDir::new("backup")?;
+    std::fs::write(dir.join("f"), b"a\n")?;
+
+    // `*` expands to the operand as written, so this names a directory that does
+    // not exist and the rename fails.
+    // The suffix is ATTACHED to -i, never a separate argument.
+    let out = sed_in(&dir, &["-inodir/*", "s/a/b/", "f"])?;
+    assert_eq!(out.status.code(), Some(4), "want exit 4, got {out:?}");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.starts_with("sed: cannot rename f:"), "unexpected diagnostic: {err:?}");
+    assert!(
+        !err.contains("expression"),
+        "a filesystem failure blamed the script: {err:?}"
+    );
+    let names: Vec<String> = std::fs::read_dir(&dir.0)?
+        .filter_map(|e| e.ok().map(|e| e.file_name().to_string_lossy().into_owned()))
+        .collect();
+    assert_eq!(names, vec!["f".to_string()], "a scratch file was left behind");
+    assert_eq!(std::fs::read(dir.join("f"))?, b"a\n", "the original was modified anyway");
     Ok(())
 }

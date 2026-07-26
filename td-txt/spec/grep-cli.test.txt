@@ -1578,3 +1578,426 @@ b
 ## END
 ## status: 0
 ## stderr-json: ""
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# Cases derived from td's OWN grep usage.
+#
+# Every invocation shape the image's /etc scripts and the recipes' build steps
+# actually make, one case per shape, plus the negative that shows the shape is
+# DISCRIMINATING (an anchor that rejects a commented-out config line, an -x that
+# rejects a superstring). An empty xfail overlay measures how far the corpus
+# reaches, not conformance, so the reach is what grows here: these are the
+# invocations /bin/grep has to answer for once it stops being busybox.
+# Goldens captured from GNU grep 3.11 under LC_ALL=C, as above.
+
+#### rootcheck: -Eq selects the read-only erofs root line of /proc/mounts
+## argv: grep -Eq '^[^ ]+ / erofs ro[, ]' mounts
+## file mounts:
+/dev/root / erofs ro,relatime 0 0
+/dev/vda2 /var btrfs rw,relatime,subvol=/@var 0 0
+tmpfs /run tmpfs rw,nosuid,nodev 0 0
+tmpfs /tmp tmpfs rw,nosuid,nodev 0 0
+devtmpfs /dev devtmpfs rw 0 0
+## END
+## stdout-json: ""
+## stderr-json: ""
+## status: 0
+
+#### rootcheck: the same -Eq rejects a WRITABLE root, which is the whole check
+## argv: grep -Eq '^[^ ]+ / erofs ro[, ]' mounts
+## file mounts:
+/dev/root / erofs rw,relatime 0 0
+/dev/vda2 /var btrfs rw,relatime,subvol=/@var 0 0
+## END
+## stdout-json: ""
+## stderr-json: ""
+## status: 1
+
+#### rootcheck: `ro[, ]' does not accept `rootflags' as a mount option
+## argv: grep -Eq '^[^ ]+ / erofs ro[, ]' mounts
+## file mounts:
+/dev/root / erofs rootflags=x 0 0
+## END
+## stdout-json: ""
+## stderr-json: ""
+## status: 1
+
+#### rootcheck: -Eq finds the persistent /var btrfs
+## argv: grep -Eq '^[^ ]+ /var btrfs ' mounts
+## file mounts:
+/dev/root / erofs ro,relatime 0 0
+/dev/vda2 /var btrfs rw,relatime,subvol=/@var 0 0
+## END
+## stdout-json: ""
+## stderr-json: ""
+## status: 0
+
+#### rootcheck: -Eq finds a tmpfs at an interpolated mount point
+## argv: grep -Eq '^[^ ]+ /run tmpfs ' mounts
+## file mounts:
+/dev/root / erofs ro,relatime 0 0
+tmpfs /run tmpfs rw,nosuid,nodev 0 0
+tmpfs /tmp tmpfs rw,nosuid,nodev 0 0
+## END
+## stdout-json: ""
+## stderr-json: ""
+## status: 0
+
+#### rootcheck: the trailing space in `/run tmpfs ' rejects a /run-prefixed point
+## argv: grep -Eq '^[^ ]+ /run tmpfs ' mounts
+## file mounts:
+tmpfs /runtime tmpfs rw 0 0
+## END
+## stdout-json: ""
+## stderr-json: ""
+## status: 1
+
+#### rootcheck: -Eq accepts a 32-hex machine-id
+## argv: grep -Eq '^[0-9a-f]{32}$' machine-id
+## file machine-id:
+0123456789abcdef0123456789abcdef
+## END
+## stdout-json: ""
+## stderr-json: ""
+## status: 0
+
+#### rootcheck: the {32} interval rejects a 31-hex machine-id
+## argv: grep -Eq '^[0-9a-f]{32}$' machine-id
+## file machine-id:
+0123456789abcdef0123456789abcde
+## END
+## stdout-json: ""
+## stderr-json: ""
+## status: 1
+
+#### rootcheck: the anchors reject a 32-hex id with trailing text
+## argv: grep -Eq '^[0-9a-f]{32}$' machine-id
+## file machine-id:
+0123456789abcdef0123456789abcdefX
+## END
+## stdout-json: ""
+## stderr-json: ""
+## status: 1
+
+#### profile: -q -F finds a cmdline token
+## argv: grep -q -F td.autotest=1 cmdline
+## file cmdline:
+console=ttyS0 td.autotest=1 root=/dev/vda1
+## END
+## stdout-json: ""
+## stderr-json: ""
+## status: 0
+
+#### profile: -q -F exits 1 on an absent cmdline token
+## argv: grep -q -F td.deploy=install cmdline
+## file cmdline:
+console=ttyS0 td.autotest=1 root=/dev/vda1
+## END
+## stdout-json: ""
+## stderr-json: ""
+## status: 1
+
+#### profile: -F makes the dots in a cmdline token literal
+## argv: grep -q -F td.persist=write cmdline
+## file cmdline:
+console=ttyS0 tdxpersist=write root=/dev/vda1
+## END
+## stdout-json: ""
+## stderr-json: ""
+## status: 1
+
+#### bootfail: -q -x matches the park marker as a whole line
+## argv: grep -q -x td-boot-parked-v1 parked
+## file parked:
+td-boot-parked-v1
+## END
+## stdout-json: ""
+## stderr-json: ""
+## status: 0
+
+#### bootfail: -x rejects a park marker with a suffix
+## argv: grep -q -x td-boot-parked-v1 parked
+## file parked:
+td-boot-parked-v1-draining
+## END
+## stdout-json: ""
+## stderr-json: ""
+## status: 1
+
+#### -q -a finds a marker in a file holding NUL bytes
+## argv: grep -q -a TRAILER cpio
+## file-json cpio: "\x00bin/busybox\x00TRAILER!!!\x00"
+## stdout-json: ""
+## stderr-json: ""
+## status: 0
+
+#### -Fq -a finds a host store path baked into a binary
+## argv: grep -Fq -a /gnu/store binary
+## file-json binary: "ELF\x00/gnu/store/abc-glibc/lib\x00"
+## stdout-json: ""
+## stderr-json: ""
+## status: 0
+
+#### without -a a matching binary file gets the notice, not the line
+## argv: grep -F /gnu/store binary
+## file-json binary: "ELF\x00/gnu/store/abc-glibc/lib\x00"
+## stdout-json: ""
+## stderr:
+grep: binary: binary file matches
+## END
+## status: 0
+
+#### -qi matches the ELF class case-insensitively
+## argv: grep -qi ELF64 header
+## file header:
+ELF Header:
+  Class:                             ELF64
+  Machine:                           Advanced Micro Devices X86-64
+## END
+## stdout-json: ""
+## stderr-json: ""
+## status: 0
+
+#### -i prints the readelf line whose label differs in case
+## argv: grep -i class: header
+## file header:
+ELF Header:
+  Class:                             ELF64
+  Machine:                           Advanced Micro Devices X86-64
+## END
+## stdout:
+  Class:                             ELF64
+## END
+## stderr-json: ""
+## status: 0
+
+#### -q with a ^-anchored pattern accepts an enabled kernel config
+## argv: grep -q '^CONFIG_KERNEL_GZIP=y' config
+## file config:
+CONFIG_STATIC=y
+CONFIG_KERNEL_GZIP=y
+# CONFIG_MODULES is not set
+## END
+## stdout-json: ""
+## stderr-json: ""
+## status: 0
+
+#### the ^ anchor is what makes a commented-out kernel config read as absent
+## argv: grep -q '^CONFIG_MODULES=y' config
+## file config:
+CONFIG_STATIC=y
+CONFIG_KERNEL_GZIP=y
+# CONFIG_MODULES is not set
+## END
+## stdout-json: ""
+## stderr-json: ""
+## status: 1
+
+#### a bracketed dot matches a version literally
+## argv: grep -q 'btrfs-progs v7[.]0' version
+## file version:
+btrfs-progs v7.0
+## END
+## stdout-json: ""
+## stderr-json: ""
+## status: 0
+
+#### a bracketed dot does not match an arbitrary byte
+## argv: grep -q 'btrfs-progs v7[.]0' version
+## file version:
+btrfs-progs v7X0
+## END
+## stdout-json: ""
+## stderr-json: ""
+## status: 1
+
+#### -F -x selects an exact name from a tool list
+## argv: grep -F -x stdbuf list
+## file list:
+stdbuf
+stdbuf-wrapper
+env
+## END
+## stdout:
+stdbuf
+## END
+## stderr-json: ""
+## status: 0
+
+#### -q -x -F selects an exact applet name from a multicall listing
+## argv: grep -q -x -F sed applets
+## file applets:
+sh
+sed
+sedfoo
+## END
+## stdout-json: ""
+## stderr-json: ""
+## status: 0
+
+#### -q -x -F rejects an applet name that is only a substring
+## argv: grep -q -x -F se applets
+## file applets:
+sh
+sed
+sedfoo
+## END
+## stdout-json: ""
+## stderr-json: ""
+## status: 1
+
+#### -R -a -F -l names each file under a tree that references a store path
+## argv: grep -R -a -F -l /td/store .
+## file d/x.txt:
+/td/store/abc-thing
+## END
+## file y.txt:
+nothing here
+## END
+## stdout:
+./d/x.txt
+## END
+## stderr-json: ""
+## status: 0
+
+#### -R -a -F -l exits 1 and names nothing when the tree has no reference
+## argv: grep -R -a -F -l /td/store .
+## file d/x.txt:
+nothing here
+## END
+## stdout-json: ""
+## stderr-json: ""
+## status: 1
+
+#### -cE counts the mount lines td-init's `mount' with no argument prints
+## argv: grep -cE '^[^ ]+ on [^ ]+ type [^ ]+ [(]' mounts
+## file mounts:
+/dev/root on / type erofs (ro,relatime)
+proc on /proc type proc (rw)
+not a mount line
+sysfs on /sys type sysfs (rw)
+## END
+## stdout:
+3
+## END
+## stderr-json: ""
+## status: 0
+
+#### -v inverts a BRE selection over a fruit list
+## argv: grep -v ap fruit
+## file fruit:
+apple
+banana
+cherry
+apricot
+a.*b
+## END
+## stdout:
+banana
+cherry
+a.*b
+## END
+## stderr-json: ""
+## status: 0
+
+#### -E turns an alternation group into an ERE
+## argv: grep -E 'a(pp|pr)' fruit
+## file fruit:
+apple
+banana
+cherry
+apricot
+a.*b
+## END
+## stdout:
+apple
+apricot
+## END
+## stderr-json: ""
+## status: 0
+
+#### -F selects the line holding regex metacharacters literally
+## argv: grep -F '.*' fruit
+## file fruit:
+apple
+banana
+cherry
+apricot
+a.*b
+## END
+## stdout:
+a.*b
+## END
+## stderr-json: ""
+## status: 0
+
+#### -F -v inverts that literal selection
+## argv: grep -F -v '.*' fruit
+## file fruit:
+apple
+banana
+cherry
+apricot
+a.*b
+## END
+## stdout:
+apple
+banana
+cherry
+apricot
+## END
+## stderr-json: ""
+## status: 0
+
+#### -q reports the match it found even though another operand was missing
+## argv: grep -q alpha nosuch present
+## file present:
+alpha
+## END
+## stdout-json: ""
+## stderr:
+grep: nosuch: No such file or directory
+## END
+## status: 0
+
+#### -s silences the missing-file diagnostic
+## argv: grep -s -q alpha nosuch present
+## file present:
+alpha
+## END
+## stdout-json: ""
+## stderr-json: ""
+## status: 0
+
+#### a directory operand without -r is diagnosed, not descended
+## argv: grep alpha d
+## file d/x.txt:
+alpha
+## END
+## stdout-json: ""
+## stderr:
+grep: d: Is a directory
+## END
+## status: 2
+
+#### a missing operand file with nothing matched anywhere is exit 2
+## argv: grep alpha nosuch present
+## file present:
+beta
+## END
+## stdout-json: ""
+## stderr:
+grep: nosuch: No such file or directory
+## END
+## status: 2
+
+#### -s leaves that exit 2 alone: it silences the message, not the failure
+## argv: grep -s alpha nosuch present
+## file present:
+beta
+## END
+## stdout-json: ""
+## stderr-json: ""
+## status: 2
+

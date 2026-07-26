@@ -227,6 +227,18 @@ pub const SSHD_MARKER: &str = "TD-SSHD-OK";
 /// symlinks and argv[0] dispatch plus `/proc` and `/dev/kmsg` reads skipped in the sandbox.
 pub const TD_UTIL_RUNTIME_MARKER: &str = "TD-UTIL-RUN-OK";
 
+/// Printed by the root-owned health target only after both `/bin` names the static td-txt
+/// multicall serves — `grep` and `sed` — answer correctly as the unprivileged login user.
+///
+/// This one is deliberately NOT a bare "did it exit 0" probe like td-util's. `/bin/grep` is
+/// on the boot path (`/etc/rootcheck` decides the root is healthy with it), so the interesting
+/// failure is not a grep that dies, it is a grep that ANSWERS WRONGLY — which would mark a
+/// broken root healthy in silence. So the probe greps the live `/proc/mounts` for the root
+/// line and requires the DISCRIMINATING answer, which also re-proves on the real image that a
+/// zero-`st_size` procfs file is read as a stream. `/bin/sed` has no boot-path duty at all,
+/// so it is proven here or nowhere.
+pub const TD_TXT_RUNTIME_MARKER: &str = "TD-TXT-RUN-OK";
+
 /// Printed by `/etc/bootsuccess` ONLY after every `/bin` name the static td-init multicall
 /// serves has been exercised by its absolute `/bin` path. Unlike the td-util farm, three of
 /// those names are IRREVERSIBLE — `reboot`/`poweroff`/`halt` end the boot — so they are probed

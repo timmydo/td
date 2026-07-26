@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 //! td-txt — the static, dependency-free multicall behind td's TEXT userland: the
-//! `grep` and `sed` busybox still owns on the image because uutils ships neither.
+//! `grep` and `sed` on the image, which busybox owned until this corpus covered the
+//! shapes the image's own scripts use (uutils ships neither).
 //!
 //! Dispatch is on argv[0]'s basename, the busybox/uutils/td-util convention, so a
 //! `/bin/<applet> -> td-txt` symlink runs that applet. An explicit
@@ -44,7 +45,8 @@ const _: () = assert!(
 
 /// Every applet this multicall serves. ONE table, so a name cannot exist without
 /// an arm or an arm without a name — `--list`, argv[0] dispatch and the shipped
-/// /bin symlink farm all read it.
+/// /bin symlink farm all read it. `system-x86-64`'s `shape_check` compares this
+/// list, through `--list`, against the names it packs.
 const APPLETS: &[(&str, Applet)] = &[("grep", grep::main), ("sed", sed::main)];
 
 /// A plain loop rather than an iterator search: this file is embedded verbatim
@@ -93,14 +95,11 @@ fn main() -> ExitCode {
     // Invoked as td-txt: the applet is argv[1], and it gets argv[1..] — again
     // leaving the applet name at its argv[0].
     match argv.get(1).map(Vec::as_slice) {
-        Some(b"--list") => {
-            println!("{}", names().join("\n"));
-            ExitCode::SUCCESS
-        }
-        Some(b"--help" | b"-h") => {
-            println!("{}", usage());
-            ExitCode::SUCCESS
-        }
+        // Through `print_line` for the reason its doc gives: `td-txt --list | head -1`
+        // must not panic the way `println!` does on a closed reader. A genuine write
+        // failure is exit 2, the multicall's own usage status.
+        Some(b"--list") => tell(&names().join("\n")),
+        Some(b"--help" | b"-h") => tell(&usage()),
         Some(name) => {
             let applet = String::from_utf8_lossy(name).into_owned();
             match lookup(&applet) {
@@ -116,6 +115,18 @@ fn main() -> ExitCode {
         }
         None => {
             eprintln!("{}", usage());
+            ExitCode::from(2)
+        }
+    }
+}
+
+/// One informational line on stdout, exit 0 — or exit 2 if the write genuinely
+/// failed (a closed READER is not a failure; see `util::print_line`).
+fn tell(text: &str) -> ExitCode {
+    match util::print_line(text) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("td-txt: write error: {}", util::errmsg(&e));
             ExitCode::from(2)
         }
     }
@@ -168,8 +179,10 @@ mod tests {
         assert!(lookup("awk").is_none());
     }
 
+    /// The two names `system-x86-64`'s `TD_TXT_APPLETS` packs as `/bin` symlinks.
+    /// `awk` is deliberately absent — it stays busybox's.
     #[test]
-    fn the_applet_table_covers_what_busybox_still_owns_for_text() {
+    fn the_applet_table_is_the_bin_farm_this_multicall_serves() {
         assert_eq!(names(), vec!["grep", "sed"]);
     }
 }

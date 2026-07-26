@@ -5,11 +5,14 @@
 //! inputs are read whole, so a pattern never straddles a read boundary.
 //!
 //! Deliberate omissions: no `-P` (PCRE — a second regex engine), no `--color`,
-//! and no `--include`/`--exclude` globs. Each is a diagnosed `invalid option`,
-//! never a silent no-op.
+//! no `--include`/`--exclude` globs, and no `-b` byte offsets. Each is a diagnosed
+//! `invalid option`, never a silent no-op, and each is pinned in
+//! spec/divergence.test.txt.
 
 use crate::regex::{Options, Regex};
-use crate::util::{number, path_bytes, read_input, records, show, walk, Out};
+use crate::util::{
+    errmsg, number, path_bytes, print_line, read_input, records, show, walk, Out, VERSION,
+};
 
 const USAGE: &str = "usage: grep [-EFGHhicLlnoqsvwxrzZ] [-m NUM] [-A NUM] [-B NUM] [-C NUM] \
                      [-e PATTERN] [-f FILE] [PATTERN] [FILE]...";
@@ -306,6 +309,24 @@ pub fn main(args: &[Vec<u8>]) -> i32 {
                     }
                 },
             };
+            // Both answer on stdout and exit 0 the moment they are seen, before
+            // any later option is applied — but AFTER the arity check above, so
+            // `--version=x` is still the error GNU makes it. The TEXT is td-txt's
+            // own: reporting a GNU banner would be a lie a caller could act on.
+            if name == b"help" || name == b"version" {
+                let line = if name == b"help" {
+                    USAGE.to_string()
+                } else {
+                    format!("grep (td-txt) {VERSION}")
+                };
+                return match print_line(&line) {
+                    Ok(()) => 0,
+                    Err(e) => {
+                        err(&format!("write error: {}", errmsg(&e)));
+                        2
+                    }
+                };
+            }
             match parse_long(&mut conf, name, value.as_deref(), &mut patterns, &mut pattern_seen) {
                 Ok(()) => continue,
                 // `resolve_long` already rejected an unknown name.
@@ -377,7 +398,7 @@ pub fn main(args: &[Vec<u8>]) -> i32 {
                             pattern_seen = true;
                         }
                         Err(e) => {
-                            err(&format!("{}: {e}", show(&v)));
+                            err(&format!("{}: {}", show(&v), errmsg(&e)));
                             return 2;
                         }
                     },
@@ -464,7 +485,7 @@ pub fn main(args: &[Vec<u8>]) -> i32 {
             }));
             for (path, e) in &errs {
                 if !conf.no_messages {
-                    err(&format!("{}: {e}", show(&path_bytes(path))));
+                    err(&format!("{}: {}", show(&path_bytes(path)), errmsg(e)));
                 }
                 status_error = true;
             }
@@ -497,7 +518,7 @@ pub fn main(args: &[Vec<u8>]) -> i32 {
                 Ok(d) => d,
                 Err(e) => {
                     if !grep.conf.no_messages {
-                        err(&format!("{}: {e}", show(path)));
+                        err(&format!("{}: {}", show(path), errmsg(&e)));
                     }
                     status_error = true;
                     continue;
@@ -574,6 +595,7 @@ const LONG_OPTIONS: &[(&[u8], Arg)] = &[
     (b"files-with-matches", Arg::None),
     (b"files-without-match", Arg::None),
     (b"fixed-strings", Arg::None),
+    (b"help", Arg::None),
     (b"ignore-case", Arg::None),
     (b"invert-match", Arg::None),
     (b"line-number", Arg::None),
@@ -589,6 +611,7 @@ const LONG_OPTIONS: &[(&[u8], Arg)] = &[
     (b"regexp", Arg::Required),
     (b"silent", Arg::None),
     (b"text", Arg::None),
+    (b"version", Arg::None),
     (b"with-filename", Arg::None),
     (b"word-regexp", Arg::None),
 ];
@@ -661,7 +684,7 @@ fn parse_long(
         b"file" => {
             let path = need(value)?;
             let bytes = read_input(&path)
-                .map_err(|e| LongErr::Message(format!("{}: {e}", show(&path))))?;
+                .map_err(|e| LongErr::Message(format!("{}: {}", show(&path), errmsg(&e))))?;
             push_file(patterns, &bytes);
             *pattern_seen = true;
         }
@@ -796,7 +819,7 @@ fn search_file(
     let mut pending_after: usize = 0;
     let mut any = false;
 
-    let io = |r: std::io::Result<()>| -> Result<(), String> { r.map_err(|e| format!("write error: {e}")) };
+    let io = |r: std::io::Result<()>| -> Result<(), String> { r.map_err(|e| format!("write error: {}", errmsg(&e))) };
     if grep.settled() {
         if grep.conf.files_without && !grep.conf.quiet {
             io(out.write(display))?;

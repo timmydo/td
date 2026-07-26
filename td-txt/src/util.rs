@@ -25,6 +25,25 @@ pub fn show(bytes: &[u8]) -> String {
     String::from_utf8_lossy(bytes).into_owned()
 }
 
+/// What `--version` reports. A literal rather than `env!("CARGO_PKG_VERSION")`
+/// because the SHIPPED binary is compiled by a direct `rustc src/main.rs` with no
+/// cargo to set that variable; `version_matches_the_manifest` pins the two.
+pub const VERSION: &str = "0.1.0";
+
+/// An errno as GNU spells it. Rust's `io::Error` Display appends ` (os error N)`
+/// to the `strerror` text; these diagnostics are read next to every other tool's,
+/// so the suffix comes back off.
+pub fn errmsg(e: &std::io::Error) -> String {
+    let text = e.to_string();
+    let Some(n) = e.raw_os_error() else {
+        return text;
+    };
+    match text.strip_suffix(&format!(" (os error {n})")) {
+        Some(head) => head.to_string(),
+        None => text,
+    }
+}
+
 /// Read a whole file, or stdin for `-`. Applets read whole inputs: both grep and
 /// sed need arbitrary lookahead within a file, and the largest thing td's image
 /// greps is a source tree.
@@ -35,6 +54,20 @@ pub fn read_input(path: &[u8]) -> std::io::Result<Vec<u8>> {
         return Ok(buf);
     }
     std::fs::read(path_from_bytes(path))
+}
+
+/// Write one line to stdout, treating a CLOSED READER as "done" rather than as a
+/// panic — `println!` aborts the applet thread on EPIPE (`grep --help | head -1`),
+/// which every other write here already avoids by going through `Out`, so the
+/// one-shot informational outputs go through it too. A genuine write failure is
+/// returned rather than turned into a status here: the two applets number their
+/// errors differently (grep 2, sed 4), and picking one for them would be wrong for
+/// the other.
+pub fn print_line(text: &str) -> std::io::Result<()> {
+    let mut out = Out::new();
+    out.write(text.as_bytes())?;
+    out.write(b"\n")?;
+    out.flush()
 }
 
 /// Buffered stdout. `broken` latches once the reader has gone away so a caller
@@ -196,6 +229,21 @@ mod tests {
     #[test]
     fn empty_input_has_no_records() {
         assert!(records(b"", b'\n').is_empty());
+    }
+
+    #[test]
+    fn version_matches_the_manifest() {
+        assert_eq!(VERSION, env!("CARGO_PKG_VERSION"));
+    }
+
+    #[test]
+    fn errmsg_drops_rusts_os_error_suffix() {
+        let e = std::io::Error::from_raw_os_error(2);
+        assert!(e.to_string().contains("(os error 2)"));
+        assert_eq!(errmsg(&e), "No such file or directory");
+        // A non-errno error has no suffix to drop.
+        let other = std::io::Error::other("boom");
+        assert_eq!(errmsg(&other), "boom");
     }
 
     #[test]

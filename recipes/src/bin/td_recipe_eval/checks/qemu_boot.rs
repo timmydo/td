@@ -87,6 +87,9 @@ const SSHD_MARKER: &str = td_recipe::ladder::SSHD_MARKER;
 
 /// Printed by the root-owned health target after every td-util farm name runs unprivileged.
 const TD_UTIL_RUNTIME_MARKER: &str = td_recipe::ladder::TD_UTIL_RUNTIME_MARKER;
+/// Printed by the root-owned health target once `/bin/grep` and `/bin/sed` — td-txt — gave
+/// the RIGHT answers over the live `/proc` and `/etc`, not merely exited 0.
+const TD_TXT_RUNTIME_MARKER: &str = td_recipe::ladder::TD_TXT_RUNTIME_MARKER;
 /// Printed by the greeter once every `/bin` name the static td-init boot-glue multicall
 /// serves has been exercised — the reversible ones by running, the irreversible ones
 /// (`reboot`/`poweroff`/`halt`/`switch_root`) by refusing a bad argument with a diagnostic.
@@ -223,6 +226,7 @@ struct ConsoleEvidence {
     ripgrep_fd_runtime: bool,
     sshd: bool,
     td_util_runtime: bool,
+    td_txt_runtime: bool,
     td_init_runtime: bool,
     td_login_runtime: bool,
     persist_write: bool,
@@ -775,7 +779,8 @@ pub(crate) fn run_system(runner: &RecipeCheckRunner) -> Result<(), String> {
          target-owned writable @var \
          ({SYSTEM_STATE_WRITABLE_MARKER}, {SYSTEM_STATE_OWNER_MARKER}), ran uutils \
          ({UUTILS_RUNTIME_MARKER}), ripgrep+fd ({RIPGREP_FD_RUNTIME_MARKER}), td-util \
-         ({TD_UTIL_RUNTIME_MARKER}), the td-init boot glue ({TD_INIT_RUNTIME_MARKER}) and a \
+         ({TD_UTIL_RUNTIME_MARKER}), td-txt's grep+sed answering correctly over the live \
+         /proc ({TD_TXT_RUNTIME_MARKER}), the td-init boot glue ({TD_INIT_RUNTIME_MARKER}) and a \
          td-login credential switch the switched process read back and confirmed \
          ({TD_LOGIN_RUNTIME_MARKER}), \
          and unmounted state \
@@ -1101,6 +1106,22 @@ fn validate_system_boot(
              multicall does not run on the erofs root, its argv[0] dispatch regressed, or the \
              /proc or /dev/kmsg the applet reads is unavailable there. td-util-test covers ELF \
              shape and dispatch in the build sandbox but skips those legs when it has no /proc. \
+             Last serial output:\n{}",
+            tail(&result.console, 80)
+        ));
+    }
+    if !result.evidence.td_txt_runtime {
+        return Err(format!(
+            "the root/userland/sshd/td-util health checks passed, but the td-txt runtime marker \
+             ({TD_TXT_RUNTIME_MARKER:?}) was absent — `/bin/grep` or `/bin/sed` did not give the \
+             expected ANSWER on this image. The console names which leg (`td-txt: ...`). This is \
+             not merely a broken diagnostics command: /etc/rootcheck decides the root came up \
+             read-only with the same `grep -Eq` over /proc/mounts, so a grep that answers wrongly \
+             would mark a broken root healthy in silence — which is why the probe asserts a \
+             non-match as well as a match. Either the static multicall does not run on the erofs \
+             root, its argv[0] dispatch regressed, or it mis-reads a /proc file (they stat as \
+             zero-length, so a reader that sized a buffer from st_size sees nothing). The \
+             td-txt conformance corpus covers the same invocation shapes host-side. \
              Last serial output:\n{}",
             tail(&result.console, 80)
         ));
@@ -2650,6 +2671,11 @@ fn latch_console_evidence(evidence: &mut ConsoleEvidence, buf: &[u8], target: &[
         TD_UTIL_RUNTIME_MARKER.as_bytes(),
     );
     latch_marker(
+        &mut evidence.td_txt_runtime,
+        buf,
+        TD_TXT_RUNTIME_MARKER.as_bytes(),
+    );
+    latch_marker(
         &mut evidence.td_init_runtime,
         buf,
         TD_INIT_RUNTIME_MARKER.as_bytes(),
@@ -3098,7 +3124,7 @@ mod tests {
     /// this: its result is dominated by the id-bearing markers (marker + space + 64-char
     /// hex), so a "no marker exceeds the max" assertion cannot fail and would only look like
     /// a guard. The rescan window is covered behaviourally instead, by the split tests below.
-    fn all_console_markers() -> [&'static str; 30] {
+    fn all_console_markers() -> [&'static str; 31] {
         [
             MARKER,
             EROFS_MARKER,
@@ -3128,6 +3154,7 @@ mod tests {
             SYSTEM_NET_REACH_MARKER,
             SSHD_MARKER,
             TD_UTIL_RUNTIME_MARKER,
+            TD_TXT_RUNTIME_MARKER,
             TD_INIT_RUNTIME_MARKER,
             TD_LOGIN_RUNTIME_MARKER,
         ]
@@ -3263,6 +3290,7 @@ mod tests {
             RIPGREP_FD_RUNTIME_MARKER,
             SSHD_MARKER,
             TD_UTIL_RUNTIME_MARKER,
+            TD_TXT_RUNTIME_MARKER,
             SYSTEM_PERSIST_WRITE_MARKER,
             SYSTEM_PERSIST_READ_MARKER,
             SYSTEM_BOOT_SUCCESS_MARKER,
@@ -3313,6 +3341,7 @@ mod tests {
         assert!(evidence.ripgrep_fd_runtime);
         assert!(evidence.sshd);
         assert!(evidence.td_util_runtime);
+        assert!(evidence.td_txt_runtime);
         assert!(evidence.persist_write);
         assert!(evidence.persist_read);
         assert!(evidence.boot_success);

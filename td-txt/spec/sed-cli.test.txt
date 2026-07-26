@@ -2156,3 +2156,400 @@ a
 ## stdout-json: ""
 ## status: 1
 ## stderr-contains: doesn't want any addresses
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# Cases derived from td's OWN sed usage.
+#
+# The image's /etc scripts call no sed at all, so every shape here comes from
+# the recipes' build steps: the -i config edits, the readelf s///p pipelines,
+# the mesboot rung smoke tests. Same rule as the grep block above — one case per
+# shape, plus what makes each shape discriminating.
+# Goldens captured from GNU sed 4.9 under LC_ALL=C.
+
+#### -i -r deletes every matching config line and rewrites the file
+## argv: sed -i -r '/^#? *CONFIG_STATIC[ =]/d; /^#? *CONFIG_PIE[ =]/d; /^#? *CONFIG_FEATURE_COMPRESS_USAGE[ =]/d' .config
+## file .config:
+CONFIG_STATIC=y
+# CONFIG_PIE is not set
+CONFIG_EXTRA_LDFLAGS="-static"
+CONFIG_KERNEL_GZIP=y
+# CONFIG_FEATURE_COMPRESS_USAGE is not set
+CONFIG_STATIC_LIBGCC=y
+## END
+## stdout-json: ""
+## stderr-json: ""
+## status: 0
+## file-after .config:
+CONFIG_EXTRA_LDFLAGS="-static"
+CONFIG_KERNEL_GZIP=y
+CONFIG_STATIC_LIBGCC=y
+## END
+
+#### -r is -E: the same script under -E gives the same file
+## argv: sed -i -E '/^#? *CONFIG_STATIC[ =]/d; /^#? *CONFIG_PIE[ =]/d' .config
+## file .config:
+CONFIG_STATIC=y
+# CONFIG_PIE is not set
+CONFIG_KERNEL_GZIP=y
+## END
+## stdout-json: ""
+## stderr-json: ""
+## status: 0
+## file-after .config:
+CONFIG_KERNEL_GZIP=y
+## END
+
+#### -i with a comma-delimited s///g strips a store prefix in place
+## argv: sed -i 's,/td/store/glibc-2.41-x86_64/lib/,,g' ldscript
+## file ldscript:
+GROUP ( /td/store/glibc-2.41-x86_64/lib/libc.so.6 /td/store/glibc-2.41-x86_64/lib/libc_nonshared.a )
+## END
+## stdout-json: ""
+## stderr-json: ""
+## status: 0
+## file-after ldscript:
+GROUP ( libc.so.6 libc_nonshared.a )
+## END
+
+#### -e with an escaped dot rewrites a symbol version
+## argv: sed -e 's/\./_/g'
+## stdin:
+LINUX_2.6
+GLIBC_2.41
+## END
+## stdout:
+LINUX_2_6
+GLIBC_2_41
+## END
+## stderr-json: ""
+## status: 0
+
+#### -n s///p extracts a DT_NEEDED name from readelf output
+## argv: sed -n 's/^.*(NEEDED).*Shared library: \[\([^]]*\)\].*$/\1/p'
+## stdin:
+Dynamic section at offset 0x2dc8 contains 27 entries:
+ 0x0000000000000001 (NEEDED)             Shared library: [libc.so.6]
+ 0x0000000000000001 (NEEDED)             Shared library: [libm.so.6]
+ 0x000000000000001d (RUNPATH)            Library runpath: [/td/store/glibc/lib]
+## END
+## stdout:
+libc.so.6
+libm.so.6
+## END
+## stderr-json: ""
+## status: 0
+
+#### -n s///p extracts a RUNPATH from readelf output
+## argv: sed -n 's/^.*(RUNPATH).*Library runpath: \[\([^]]*\)\].*$/\1/p'
+## stdin:
+ 0x0000000000000001 (NEEDED)             Shared library: [libc.so.6]
+ 0x000000000000001d (RUNPATH)            Library runpath: [/td/store/glibc/lib]
+## END
+## stdout:
+/td/store/glibc/lib
+## END
+## stderr-json: ""
+## status: 0
+
+#### -n s///p prints nothing when the ELF carries no RPATH
+## argv: sed -n 's/^.*(RPATH).*Library rpath: \[\([^]]*\)\].*$/\1/p'
+## stdin:
+ 0x0000000000000001 (NEEDED)             Shared library: [libc.so.6]
+ 0x000000000000001d (RUNPATH)            Library runpath: [/td/store/glibc/lib]
+## END
+## stdout-json: ""
+## stderr-json: ""
+## status: 0
+
+#### N joins line pairs and s/\n/-/ replaces the embedded separator
+## argv: sed 'N;s/\n/-/'
+## stdin:
+a
+b
+c
+d
+## END
+## stdout:
+a-b
+c-d
+## END
+## stderr-json: ""
+## status: 0
+
+#### -n $= counts the lines of a piped stream
+## argv: sed -n '$='
+## stdin:
+a
+b
+c
+d
+## END
+## stdout:
+4
+## END
+## stderr-json: ""
+## status: 0
+
+#### $ is the last line of the JOINED stream, so a `-' operand last wins
+## argv: sed -n '$p' f1.txt -
+## file f1.txt:
+1
+2
+## END
+## stdin:
+x
+## END
+## stdout:
+x
+## END
+## stderr-json: ""
+## status: 0
+
+#### -s makes $ the last line of EACH file
+## argv: sed -s -n '$p' f1.txt f2.txt
+## file f1.txt:
+1
+2
+## END
+## file f2.txt:
+x
+## END
+## stdout:
+2
+x
+## END
+## stderr-json: ""
+## status: 0
+
+#### w to a character device is not an error
+## argv: sed -n 'w /dev/null' in.txt
+## file in.txt:
+alpha
+beta
+## END
+## stdout-json: ""
+## stderr-json: ""
+## status: 0
+
+#### the s///w flag writes the substituted lines to its own file
+## argv: sed -n 's/b.ta/world/w proof' in.txt
+## file in.txt:
+alpha
+beta
+## END
+## stdout-json: ""
+## stderr-json: ""
+## status: 0
+## file-after proof:
+world
+## END
+
+#### a plain s/// over a file operand
+## argv: sed 's/beta/gamma/' in.txt
+## file in.txt:
+alpha
+beta
+gamma
+## END
+## stdout:
+alpha
+gamma
+gamma
+## END
+## stderr-json: ""
+## status: 0
+
+#### an addressed block substitutes and prints only its own line
+## argv: sed -n '2{s/e/E/;p}' in.txt
+## file in.txt:
+alpha
+beta
+gamma
+## END
+## stdout:
+bEta
+## END
+## stderr-json: ""
+## status: 0
+
+#### -i.bak keeps the original beside the rewritten file
+## argv: sed -i.bak 's/beta/BETA/' in.txt
+## file in.txt:
+alpha
+beta
+## END
+## stdout-json: ""
+## stderr-json: ""
+## status: 0
+## file-after in.txt:
+alpha
+BETA
+## END
+## file-after in.txt.bak:
+alpha
+beta
+## END
+
+#### an unreadable input file is exit 2, and the readable ones still run
+## argv: sed 's/a/A/' nosuch in.txt
+## file in.txt:
+alpha
+## END
+## stdout:
+Alpha
+## END
+## stderr:
+sed: can't read nosuch: No such file or directory
+## END
+## status: 2
+
+#### an unreadable -f script file is a RUNTIME failure, exit 4
+## argv: sed -f nosuch.sed in.txt
+## file in.txt:
+alpha
+## END
+## stdout-json: ""
+## stderr:
+sed: couldn't open file nosuch.sed: No such file or directory
+## END
+## status: 4
+
+#### -f reads the script from a file
+## argv: sed -f edit.sed in.txt
+## file edit.sed:
+s/alpha/ALPHA/
+## END
+## file in.txt:
+alpha
+beta
+## END
+## stdout:
+ALPHA
+beta
+## END
+## stderr-json: ""
+## status: 0
+
+#### -i with no file operand refuses rather than editing stdin into stdout
+## argv: sed -i 's/a/b/'
+## stdin:
+alpha
+## END
+## stdout-json: ""
+## stderr:
+sed: no input files
+## END
+## status: 4
+
+#### -i -r with no file operand refuses the same way
+## argv: sed -i -r '/^#/d'
+## stdin:
+# comment
+alpha
+## END
+## stdout-json: ""
+## stderr:
+sed: no input files
+## END
+## status: 4
+
+#### under -i a `-' operand is a FILE NAME, not stdin: there is no editing a pipe
+## argv: sed -i 's/a/b/' -
+## stdin:
+alpha
+## END
+## stdout-json: ""
+## stderr:
+sed: can't read -: No such file or directory
+## END
+## status: 2
+
+#### a bad script beats the missing-operand check: exit 1, not 4
+## argv: sed -i 'Z'
+## stdin:
+alpha
+## END
+## stdout-json: ""
+## stderr-contains: unknown command: `Z'
+## status: 1
+
+#### -i with a `*' suffix names the backup after the operand as written
+## argv: sed -i'bak_*' 's/a/b/' f
+## file f:
+alpha
+## END
+## stdout-json: ""
+## stderr-json: ""
+## status: 0
+## file-after f:
+blpha
+## END
+## file-after bak_f:
+alpha
+## END
+
+#### -i preserves an input that ended without a newline
+# The rewrite goes through a temp file and a rename, so the terminator has to
+# survive the round trip; a sink that "finished the last line" would add one.
+## argv: sed -i 's/a/b/' f
+## file-json f: "alpha\nbeta"
+## stdout-json: ""
+## stderr-json: ""
+## status: 0
+## file-after-json f: "blpha\nbetb"
+
+#### -i on an EMPTY file writes an empty file, not a newline
+## argv: sed -i 's/a/b/' f
+## file-json f: ""
+## stdout-json: ""
+## stderr-json: ""
+## status: 0
+## file-after-json f: ""
+#### an unreadable --file script is the same runtime failure as -f, exit 4
+## argv: sed --file=nosuch.sed in.txt
+## file in.txt:
+alpha
+## END
+## stdout-json: ""
+## stderr:
+sed: couldn't open file nosuch.sed: No such file or directory
+## END
+## status: 4
+
+#### --file and -f agree on a readable script too
+## argv: sed --file=edit.sed in.txt
+## file edit.sed:
+s/alpha/ALPHA/
+## END
+## file in.txt:
+alpha
+## END
+## stdout:
+ALPHA
+## END
+## stderr-json: ""
+## status: 0
+
+#### a w file that will not open is a RUNTIME failure, exit 4, with no expression blamed
+## argv: sed -n "w /nosuchdir/out"
+## stdin:
+alpha
+## END
+## stdout-json: ""
+## stderr:
+sed: couldn't open file /nosuchdir/out: No such file or directory
+## END
+## status: 4
+
+#### the s///w flag reports the same way
+## argv: sed -n "s/a/b/w /nosuchdir/out"
+## stdin:
+alpha
+## END
+## stdout-json: ""
+## stderr:
+sed: couldn't open file /nosuchdir/out: No such file or directory
+## END
+## status: 4
+

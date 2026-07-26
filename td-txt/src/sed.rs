@@ -19,9 +19,11 @@
 //! not a syntactic one.
 
 use std::collections::BTreeMap;
+use std::io::Write;
+use std::path::{Path, PathBuf};
 
 use crate::regex::{Captures, Options, Regex};
-use crate::util::{number, read_input, records, show, Out};
+use crate::util::{errmsg, number, print_line, read_input, records, show, Out, VERSION};
 
 const USAGE: &str = "usage: sed [-nrEsz] [-i[SUFFIX]] [-e SCRIPT] [-f FILE] [SCRIPT] [FILE]...";
 
@@ -870,7 +872,7 @@ impl<'a> Sink<'a> {
 
     fn put(&mut self, bytes: &[u8]) -> Result<(), String> {
         match &mut self.dest {
-            Dest::Stdout(out) => out.write(bytes).map_err(|e| format!("write error: {e}")),
+            Dest::Stdout(out) => out.write(bytes).map_err(|e| format!("write error: {}", errmsg(&e))),
             Dest::Buffer(buf) => {
                 buf.extend_from_slice(bytes);
                 Ok(())
@@ -997,9 +999,9 @@ fn kind_matches(
         AddrKind::Rx(slot) => {
             let idx = match slot {
                 Some(i) => *i,
-                None => last_regex.ok_or_else(|| "no previous regular expression".to_string())?,
+                None => last_regex.ok_or_else(|| NO_PREVIOUS_REGEX.to_string())?,
             };
-            let re = regexes.get(idx).ok_or_else(|| "no previous regular expression".to_string())?;
+            let re = regexes.get(idx).ok_or_else(|| NO_PREVIOUS_REGEX.to_string())?;
             Ok((re.is_match(pattern).map_err(|e| e.msg)?, Some(idx)))
         }
     }
@@ -1242,6 +1244,25 @@ impl From<String> for Fatal {
     }
 }
 
+/// The one error raised WHILE RUNNING that GNU still classifies as a bad SCRIPT:
+/// an empty `s//…/` or `//p` can only be checked once the previous regex is known,
+/// but it is a mistake in the program, not a refusal by the filesystem — exit 1,
+/// with the `-e expression #N' prefix. One constant, named at the sites that raise
+/// it and at the boundary that classifies it, so the two cannot drift apart.
+const NO_PREVIOUS_REGEX: &str = "no previous regular expression";
+
+impl Fatal {
+    /// A failure surfaced while RUNNING the script — a `w` file that will not open,
+    /// a write that fails. Exit 4, and no `-e expression #N' prefix: the script
+    /// compiled, the filesystem refused. `From<String>` stamps 1 for the COMPILE
+    /// errors `parse_script` raises, so every runtime `String` has to come through
+    /// here or it lands in the wrong bucket wearing the wrong prefix.
+    fn runtime(msg: String) -> Self {
+        let status = if msg == NO_PREVIOUS_REGEX { 1 } else { 4 };
+        Self { msg, status }
+    }
+}
+
 struct Conf {
     suppress: bool,
     sandbox: bool,
@@ -1256,7 +1277,16 @@ pub fn main(args: &[Vec<u8>]) -> i32 {
     match run(args) {
         Ok(code) => code,
         Err(f) => {
-            eprintln!("sed: -e expression #1: {}", f.msg);
+            // The `-e expression #N' prefix belongs to a failure to COMPILE the
+            // script (exit 1). A runtime failure — an unopenable `-f' file, an
+            // unresolvable label (exit 4) — is not about an expression, and GNU
+            // reports it bare; naming an expression there points at the wrong
+            // thing.
+            if f.status == 1 {
+                eprintln!("sed: -e expression #1: {}", f.msg);
+            } else {
+                eprintln!("sed: {}", f.msg);
+            }
             f.status
         }
     }
@@ -1300,6 +1330,7 @@ const LONG_OPTIONS: &[&[u8]] = &[
     b"expression",
     b"file",
     b"follow-symlinks",
+    b"help",
     b"in-place",
     b"null-data",
     b"posix",
@@ -1309,6 +1340,7 @@ const LONG_OPTIONS: &[&[u8]] = &[
     b"separate",
     b"silent",
     b"unbuffered",
+    b"version",
     b"zero-terminated",
 ];
 
@@ -1387,6 +1419,32 @@ fn run(args: &[Vec<u8>]) -> Result<i32, Fatal> {
                 }
             };
             match name {
+                // Answered on stdout, exit 0, before any later option applies.
+                // The text is td-txt's own: a GNU banner would be a lie a caller
+                // could act on.
+                // Answered on stdout, exit 0, before any later option applies —
+                // but neither takes a value, so `--version=x` is the error GNU
+                // makes it. The text is td-txt's own: a GNU banner would be a lie
+                // a caller could act on.
+                b"help" | b"version" => {
+                    if inline.is_some() {
+                        eprintln!("sed: option '--{}' doesn't allow an argument", show(name));
+                        eprintln!("{USAGE}");
+                        return Ok(1);
+                    }
+                    let line = if name == b"help" {
+                        USAGE.to_string()
+                    } else {
+                        format!("sed (td-txt) {VERSION}")
+                    };
+                    return Ok(match print_line(&line) {
+                        Ok(()) => 0,
+                        Err(e) => {
+                            eprintln!("sed: write error: {}", errmsg(&e));
+                            4
+                        }
+                    });
+                }
                 b"quiet" | b"silent" => conf.suppress = true,
                 b"regexp-extended" => conf.ere = true,
                 b"separate" => conf.separate = true,
@@ -1418,9 +1476,13 @@ fn run(args: &[Vec<u8>]) -> Result<i32, Fatal> {
                         }
                     };
                     if name == b"file" {
-                        script_parts.push(
-                            read_input(&value).map_err(|e| format!("{}: {e}", show(&value)))?,
-                        );
+                        // Same failure as short `-f`, so the same status and the same
+                        // wording: the script did not fail to COMPILE, the file failed
+                        // to open.
+                        script_parts.push(read_input(&value).map_err(|e| Fatal {
+                            msg: format!("couldn't open file {}: {}", show(&value), errmsg(&e)),
+                            status: 4,
+                        })?);
                     } else {
                         script_parts.push(value);
                     }
@@ -1476,7 +1538,7 @@ fn run(args: &[Vec<u8>]) -> Result<i32, Fatal> {
                     // An unreadable SCRIPT file is exit 4, like any other
                     // runtime failure — not 1, which means a bad script.
                     let text = read_input(&v).map_err(|e| Fatal {
-                        msg: format!("couldn't open file {}: {e}", show(&v)),
+                        msg: format!("couldn't open file {}: {}", show(&v), errmsg(&e)),
                         status: 4,
                     })?;
                     script_parts.push(text);
@@ -1538,16 +1600,32 @@ fn run(args: &[Vec<u8>]) -> Result<i32, Fatal> {
         file_name: b"-".to_vec(),
     };
 
+    // `-i` rewrites its OPERANDS, so with none there is nothing to edit and
+    // falling back to stdin would silently send the edit to stdout — the file the
+    // caller meant to change left untouched, exit 0. GNU refuses; so does this.
+    // Checked after `compile_script` because a bad script still reports itself
+    // first (exit 1), which is the order GNU resolves the two in.
+    if conf.in_place.is_some() && files.is_empty() {
+        eprintln!("sed: no input files");
+        return Ok(4);
+    }
     let inputs: Vec<Vec<u8>> = if files.is_empty() { vec![b"-".to_vec()] } else { files };
     let mut out = Out::new();
     let mut status = 0;
 
     if conf.separate || conf.in_place.is_some() {
         for path in &inputs {
-            let data = match read_input(path) {
+            // Under `-i` an operand names the file to REWRITE, so `-` is an
+            // ordinary name here rather than stdin — there is no rewriting a
+            // pipe. GNU reports it as the missing file it is.
+            let read = match &conf.in_place {
+                Some(_) => std::fs::read(crate::util::path_from_bytes(path)),
+                None => read_input(path),
+            };
+            let data = match read {
                 Ok(d) => d,
                 Err(e) => {
-                    eprintln!("sed: can't read {}: {e}", show(path));
+                    eprintln!("sed: can't read {}: {}", show(path), errmsg(&e));
                     status = 2;
                     continue;
                 }
@@ -1557,19 +1635,19 @@ fn run(args: &[Vec<u8>]) -> Result<i32, Fatal> {
             sed.line_number = 0;
             sed.ranges = seed_ranges(&sed.script.cmds);
             let quit = match &conf.in_place {
-                Some(suffix) if path.as_slice() != b"-" => {
+                Some(suffix) => {
                     let mut sink = Sink::buffer(separator);
-                    let quit = sed.run_stream(&mut stream, &mut sink)?;
+                    let quit = sed.run_stream(&mut stream, &mut sink).map_err(Fatal::runtime)?;
                     write_in_place(path, suffix, &sink.into_buffer())?;
                     quit
                 }
                 _ => {
                     let mut sink = Sink::stdout(&mut out, separator);
-                    sed.run_stream(&mut stream, &mut sink)?
+                    sed.run_stream(&mut stream, &mut sink).map_err(Fatal::runtime)?
                 }
             };
             if let Some(code) = quit {
-                out.flush().map_err(|e| format!("write error: {e}"))?;
+                out.flush().map_err(|e| Fatal::runtime(format!("write error: {}", errmsg(&e))))?;
                 return Ok(code);
             }
         }
@@ -1584,20 +1662,20 @@ fn run(args: &[Vec<u8>]) -> Result<i32, Fatal> {
                     lines.extend(to_lines(&d, separator));
                 }
                 Err(e) => {
-                    eprintln!("sed: can't read {}: {e}", show(path));
+                    eprintln!("sed: can't read {}: {}", show(path), errmsg(&e));
                     status = 2;
                 }
             }
         }
         let mut stream = Stream { names, lines, pos: 0 };
         let mut sink = Sink::stdout(&mut out, separator);
-        let quit = sed.run_stream(&mut stream, &mut sink)?;
+        let quit = sed.run_stream(&mut stream, &mut sink).map_err(Fatal::runtime)?;
         if let Some(code) = quit {
-            out.flush().map_err(|e| format!("write error: {e}"))?;
+            out.flush().map_err(|e| Fatal::runtime(format!("write error: {}", errmsg(&e))))?;
             return Ok(code);
         }
     }
-    out.flush().map_err(|e| format!("write error: {e}"))?;
+    out.flush().map_err(|e| Fatal::runtime(format!("write error: {}", errmsg(&e))))?;
     Ok(status)
 }
 
@@ -1612,30 +1690,127 @@ fn to_stream(path: &[u8], data: &[u8], separator: u8) -> Stream {
     Stream { names: vec![(0, path.to_vec())], lines: to_lines(data, separator), pos: 0 }
 }
 
-fn write_in_place(path: &[u8], suffix: &[u8], data: &[u8]) -> Result<(), String> {
-    let target = crate::util::path_from_bytes(path);
-    if !suffix.is_empty() {
-        // A `*` in the suffix stands for the file name (GNU's backup form).
-        let backup = if suffix.contains(&b'*') {
-            let base = crate::util::path_bytes(&target);
-            let mut name = Vec::new();
-            for b in suffix {
-                if *b == b'*' {
-                    name.extend_from_slice(&base);
-                } else {
-                    name.push(*b);
-                }
-            }
-            crate::util::path_from_bytes(&name)
-        } else {
-            let mut name = crate::util::path_bytes(&target);
-            name.extend_from_slice(suffix);
-            crate::util::path_from_bytes(&name)
-        };
-        std::fs::copy(&target, &backup)
-            .map_err(|e| format!("cannot back up {}: {e}", show(path)))?;
+/// The backup name for `-i SUFFIX`: the suffix appended, or — GNU's other form —
+/// the suffix with `*` standing for the OPERAND AS WRITTEN, path and all. So
+/// `-i'bak_*'` on `sub/f` backs up to `bak_sub/f`, not `sub/bak_f`, and fails if
+/// that directory does not exist.
+fn backup_name(target: &Path, suffix: &[u8]) -> PathBuf {
+    let base = crate::util::path_bytes(target);
+    if !suffix.contains(&b'*') {
+        let mut name = base;
+        name.extend_from_slice(suffix);
+        return crate::util::path_from_bytes(&name);
     }
-    std::fs::write(&target, data).map_err(|e| format!("couldn't write {}: {e}", show(path)))
+    let mut name = Vec::new();
+    for b in suffix {
+        if *b == b'*' {
+            name.extend_from_slice(&base);
+        } else {
+            name.push(*b);
+        }
+    }
+    crate::util::path_from_bytes(&name)
+}
+
+/// Rewrite `path` with `data`, GNU's way: a NEW file beside it, then a rename
+/// over the name.
+///
+/// Writing THROUGH the name instead — which is what this used to do — silently
+/// made `-i` follow symlinks and share hard links: the edit landed on whatever
+/// the name resolved to, and every other name for that inode saw it. That is
+/// exactly the `--follow-symlinks` behavior this applet REFUSES to be asked for,
+/// so it must not be the default. A rename also makes the replacement atomic (no
+/// truncated file if the write dies partway) and lets a read-only file be
+/// rewritten, both of which GNU callers rely on.
+///
+/// NOT copied across the rename: owner and group. GNU `fchown`s the temp file when
+/// it is privileged enough to; td-txt does not, so a root `sed -i` over a file
+/// owned by someone else leaves the rewrite owned by root. Nothing on the image
+/// runs sed at all, let alone as root over another user's file, so this is a
+/// recorded gap rather than a fix.
+fn write_in_place(path: &[u8], suffix: &[u8], data: &[u8]) -> Result<(), Fatal> {
+    // Every failure here is the filesystem refusing, so they all go through
+    // `Fatal::runtime` rather than the `String` conversion, which would blame the
+    // script for a full disk.
+    let target = crate::util::path_from_bytes(path);
+    let dir = match target.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
+        _ => PathBuf::from("."),
+    };
+    // The new file carries the original's mode; a rename would otherwise silently
+    // reset it to the create default.
+    let mode = std::fs::metadata(&target).ok().map(|m| m.permissions());
+
+    let (temp, mut file) = create_temp(&dir, path).map_err(Fatal::runtime)?;
+    let write = file
+        .write_all(data)
+        .and_then(|()| file.flush())
+        .map_err(|e| format!("couldn't write {}: {}", show(path), errmsg(&e)));
+    drop(file);
+    let finish = write.and_then(|()| {
+        if let Some(mode) = mode {
+            std::fs::set_permissions(&temp, mode)
+                .map_err(|e| format!("couldn't write {}: {}", show(path), errmsg(&e)))?;
+        }
+        let mut moved_aside = None;
+        if !suffix.is_empty() {
+            // The ORIGINAL is renamed aside, so the backup keeps its inode and
+            // the new content lands at the original name — GNU's order.
+            let backup = backup_name(&target, suffix);
+            std::fs::rename(&target, &backup)
+                .map_err(|e| format!("cannot rename {}: {}", show(path), errmsg(&e)))?;
+            moved_aside = Some(backup);
+        }
+        std::fs::rename(&temp, &target).map_err(|e| {
+            // The original is already at the backup name; without this the run
+            // would fail with the edited path GONE, which is worse than either
+            // outcome the caller asked for.
+            if let Some(backup) = moved_aside {
+                let _ = std::fs::rename(&backup, &target);
+            }
+            format!("cannot rename {}: {}", show(path), errmsg(&e))
+        })
+    });
+    if finish.is_err() {
+        // Leaving the scratch file behind would litter the directory the caller
+        // asked to edit.
+        let _ = std::fs::remove_file(&temp);
+    }
+    finish.map_err(Fatal::runtime)
+}
+
+/// Create a fresh scratch file beside the target. Exclusive create, so an
+/// existing name (or a planted symlink) is never adopted; the pid plus a counter
+/// keeps concurrent seds apart without a random source.
+///
+/// Created 0600, NOT at the umask default: the caller's content is written before
+/// the original's mode is restored, so a 0600 secret edited in a traversable
+/// directory would otherwise be world-readable for the length of the write under
+/// a predictable name. Widening to the original mode afterwards is safe; starting
+/// wide is not.
+fn create_temp(dir: &Path, path: &[u8]) -> Result<(PathBuf, std::fs::File), String> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let pid = std::process::id();
+    for n in 0..u32::MAX {
+        let candidate = dir.join(format!("sed{pid}{n}.tmp"));
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&candidate)
+        {
+            Ok(f) => return Ok((candidate, f)),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => {
+                return Err(format!(
+                    "couldn't open temporary file {}: {}",
+                    show(&crate::util::path_bytes(&candidate)),
+                    errmsg(&e)
+                ))
+            }
+        }
+    }
+    Err(format!("couldn't open temporary file for {}", show(path)))
 }
 
 impl Sed {
@@ -1738,18 +1913,18 @@ impl Sed {
         use std::io::Write as _;
         if !self.wfiles.contains_key(path) {
             let file = std::fs::File::create(crate::util::path_from_bytes(path))
-                .map_err(|e| format!("couldn't open file {}: {e}", show(path)))?;
+                .map_err(|e| format!("couldn't open file {}: {}", show(path), errmsg(&e)))?;
             self.wfiles.insert(path.to_vec(), file);
         }
         let separator = self.separator;
         let Some(file) = self.wfiles.get_mut(path) else {
             return Err(format!("couldn't open file {}", show(path)));
         };
-        file.write_all(bytes).map_err(|e| format!("write error: {e}"))?;
+        file.write_all(bytes).map_err(|e| format!("write error: {}", errmsg(&e)))?;
         if !terminated {
             return Ok(()); // the input line had none either
         }
-        file.write_all(&[separator]).map_err(|e| format!("write error: {e}"))
+        file.write_all(&[separator]).map_err(|e| format!("write error: {}", errmsg(&e)))
     }
 
     /// One pass over the script for the current pattern space.
@@ -2000,11 +2175,11 @@ impl Sed {
         };
         let re_idx = match own_re.or(self.last_regex) {
             Some(i) => i,
-            None => return Err("no previous regular expression".to_string()),
+            None => return Err(NO_PREVIOUS_REGEX.to_string()),
         };
         self.last_regex = Some(re_idx);
         let Some(re) = self.script.regexes.get(re_idx) else {
-            return Err("no previous regular expression".to_string());
+            return Err(NO_PREVIOUS_REGEX.to_string());
         };
         let Some(Cmd { kind: Kind::Subst(sub), .. }) = self.script.cmds.get(idx) else {
             return Ok((false, false, None));
@@ -2211,6 +2386,40 @@ mod tests {
     #[test]
     fn d_capital_restarts_the_cycle_on_the_remainder() {
         assert_eq!(sed("N;P;D", "a\nb\nc\n", &[]), b"a\nb\nc\n");
+    }
+
+    /// The scratch file `-i` writes through must be created 0600, not at the
+    /// umask default. The content lands in it BEFORE the original's mode is
+    /// restored, so a 0600 secret edited in a traversable directory would be
+    /// world-readable for the length of the write, under a predictable name.
+    /// Asserted on `create_temp` directly: the finished file carries the
+    /// original's mode either way, so no end-to-end test can see this window.
+    #[test]
+    fn the_in_place_scratch_file_is_created_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("td-txt-temp-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (path, file) = create_temp(&dir, b"f").unwrap();
+        let mode = file.metadata().unwrap().permissions().mode() & 0o777;
+        drop(file);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(mode, 0o600, "the scratch file was created world-readable");
+        assert!(
+            path.starts_with(&dir),
+            "the scratch file must sit beside the target so the rename stays within one \
+             filesystem"
+        );
+    }
+
+    /// The runtime/compile split `Fatal::runtime` draws, both ways. A filesystem
+    /// refusal is exit 4 and blames no expression; the one runtime error that IS a
+    /// script mistake keeps GNU's exit 1 and its prefix.
+    #[test]
+    fn a_runtime_failure_is_exit_4_unless_it_is_a_script_mistake() {
+        assert_eq!(Fatal::runtime("couldn't open file x: nope".into()).status, 4);
+        assert_eq!(Fatal::runtime("write error: nope".into()).status, 4);
+        assert_eq!(Fatal::runtime(NO_PREVIOUS_REGEX.into()).status, 1);
     }
 
     #[test]
