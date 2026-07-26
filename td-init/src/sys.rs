@@ -13,8 +13,8 @@
 //! — then compiles. `main.rs`'s confinement tests are what close that, and they
 //! are the durable enforcement here.
 //!
-//! The amended surface is exactly the eight syscalls below, one per boot-glue
-//! applet requirement that safe `std` does not expose. A NINTH is a reviewed
+//! The amended surface is exactly the nine syscalls below, one per boot-glue
+//! applet requirement that safe `std` does not expose. A TENTH is a reviewed
 //! amendment, not an edit; `main.rs`'s confinement test asserts the roster.
 //! Notably absent: `pivot_root(2)` (it fails on the initramfs rootfs, so
 //! switch_root moves the mount instead, as util-linux and busybox do),
@@ -29,13 +29,14 @@ use std::ptr;
 #[cfg(not(all(target_arch = "x86_64", target_os = "linux")))]
 compile_error!("td-init is x86_64-linux only (raw syscall ABI)");
 
-// The amended eight (x86_64 syscall numbers).
+// The amended nine (x86_64 syscall numbers).
 const SYS_IOCTL: usize = 16;
 const SYS_WAIT4: usize = 61;
 const SYS_SETSID: usize = 112;
 const SYS_CHROOT: usize = 161;
 const SYS_SYNC: usize = 162;
 const SYS_MOUNT: usize = 165;
+const SYS_UMOUNT2: usize = 166;
 const SYS_REBOOT: usize = 169;
 const SYS_SETHOSTNAME: usize = 170;
 
@@ -105,24 +106,72 @@ pub fn sync() {
     let _ = syscall5(SYS_SYNC, 0, 0, 0, 0, 0);
 }
 
-// ── switch_root's two syscalls ──────────────────────────────────────────────
+// ── the filesystem pair (mount/umount applets, and switch_root's move) ──────
 
-/// `MS_MOVE` (linux/mount.h) — the ONLY mount flag this crate ever passes.
-const MS_MOVE: usize = 0x2000;
+/// The `mount(2)` flags this crate may set (linux/mount.h). The list IS the
+/// surface, and `mount.rs` is the only module that composes from it — through
+/// its option table, the `-r`/`-w` shorthands for the bit that table already
+/// owns, and `umount -r`'s read-only remount. `switch_root` names `MS_MOVE` and
+/// nothing else. Both halves are asserted in `main.rs`: the roster is exactly
+/// this list, and no other module may name one.
+///
+/// Until the `mount`/`umount` applets landed, `MS_MOVE` was the only one — the
+/// amendment that widened this is the same one that added `umount2(2)`, and it
+/// is what took the last busybox job off td's boot path.
+pub const MS_RDONLY: usize = 0x1;
+pub const MS_NOSUID: usize = 0x2;
+pub const MS_NODEV: usize = 0x4;
+pub const MS_NOEXEC: usize = 0x8;
+pub const MS_SYNCHRONOUS: usize = 0x10;
+pub const MS_REMOUNT: usize = 0x20;
+pub const MS_NOATIME: usize = 0x400;
+pub const MS_NODIRATIME: usize = 0x800;
+pub const MS_BIND: usize = 0x1000;
+pub const MS_MOVE: usize = 0x2000;
+pub const MS_RELATIME: usize = 0x0020_0000;
 
-/// `mount(source, target, NULL, MS_MOVE, NULL)`: relocate an existing mount.
-/// No other mount operation is reachable — the filesystem type and data
-/// arguments are pinned to NULL here, not chosen by a caller.
-pub fn move_mount(source: &CStr, target: &CStr) -> io::Result<()> {
+/// `mount(source, target, fstype, flags, data)`.
+///
+/// `fstype` and `data` are `Option` rather than `&CStr` because NULL is not a
+/// spelling of the empty string here: the kernel reads a non-NULL `data` as an
+/// option string the filesystem must accept, and every flag-only operation
+/// (`MS_MOVE`, `MS_REMOUNT`) passes NULL for both.
+pub fn mount(
+    source: &CStr,
+    target: &CStr,
+    fstype: Option<&CStr>,
+    flags: usize,
+    data: Option<&CStr>,
+) -> io::Result<()> {
     check(syscall5(
         SYS_MOUNT,
         source.as_ptr() as usize,
         target.as_ptr() as usize,
-        0,
-        MS_MOVE,
-        0,
+        nullable(fstype),
+        flags,
+        nullable(data),
     ))
     .map(|_| ())
+}
+
+/// A string argument the kernel accepts NULL for. Kept as a named helper so the
+/// two `Option` arguments above cannot be spelled differently from each other.
+fn nullable(s: Option<&CStr>) -> usize {
+    match s {
+        Some(c) => c.as_ptr() as usize,
+        None => 0,
+    }
+}
+
+/// `umount2(2)`'s flags. `MNT_EXPIRE` and `UMOUNT_NOFOLLOW` are deliberately
+/// absent: neither applet offers them, so neither is reachable.
+pub const MNT_FORCE: usize = 0x1;
+pub const MNT_DETACH: usize = 0x2;
+
+/// `umount2(target, flags)`. `umount(2)` proper takes no flags and is a strict
+/// subset, so this one call serves both — `flags` of 0 IS `umount(2)`.
+pub fn umount(target: &CStr, flags: usize) -> io::Result<()> {
+    check(syscall5(SYS_UMOUNT2, target.as_ptr() as usize, flags, 0, 0, 0)).map(|_| ())
 }
 
 /// `chroot(2)`.

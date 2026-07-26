@@ -4,9 +4,9 @@
 //! raw Linux syscall.
 //!
 //! `reboot`/`poweroff`/`halt` (`reboot(2)`), `switch_root` (`mount(MS_MOVE)` +
-//! `chroot(2)`), `cttyhack` (`setsid(2)` + `TIOCSCTTY`), `init` (`wait4(2)`), and
-//! `hostname` (`sethostname(2)` — the `-F` flag uutils lacks, and the only reason
-//! `hostname` is still busybox on the image).
+//! `chroot(2)`), `mount`/`umount` (`mount(2)` + `umount2(2)`), `cttyhack`
+//! (`setsid(2)` + `TIOCSCTTY`), `init` (`wait4(2)`), and `hostname`
+//! (`sethostname(2)` — the `-F` flag uutils lacks).
 //!
 //! The sibling multicall `td-util` covers the applets that need NO syscall
 //! surface and is `#![forbid(unsafe_code)]` as a result. The split is deliberate:
@@ -14,7 +14,7 @@
 //! to `sys.rs` — one `syscall5` body under a scoped `#[allow]`. That is the THIRD
 //! target-side unsafe exception AGENTS.md records, after td-kexec and td-netd.
 //! The `deny` above is the first line of that, not the last: `mod confinement`
-//! below is what actually holds the surface to eight syscalls and one asm body,
+//! below is what actually holds the surface to nine syscalls and one asm body,
 //! because a lint level can be demoted and the compiler cannot count syscalls.
 //!
 //! Dispatch is on argv[0]'s basename, the busybox/uutils convention, so a
@@ -26,6 +26,7 @@ mod cttyhack;
 mod halt;
 mod hostname;
 mod init;
+mod mount;
 mod switchroot;
 mod sys;
 
@@ -42,9 +43,11 @@ const APPLETS: &[(&str, Applet)] = &[
     ("halt", halt::halt),
     ("hostname", hostname::run),
     ("init", init::run),
+    ("mount", mount::mount),
     ("poweroff", halt::poweroff),
     ("reboot", halt::reboot),
     ("switch_root", switchroot::run),
+    ("umount", mount::umount),
 ];
 
 /// A plain loop rather than an iterator search: this file is embedded verbatim
@@ -367,7 +370,7 @@ mod tests {
     /// The roster is the shipped /bin symlink farm, so a rename is a visible
     /// change to the image, not an internal one.
     #[test]
-    fn the_roster_is_the_amended_seven() {
+    fn the_roster_is_the_amended_nine() {
         assert_eq!(
             names(),
             vec![
@@ -375,9 +378,11 @@ mod tests {
                 "halt",
                 "hostname",
                 "init",
+                "mount",
                 "poweroff",
                 "reboot",
-                "switch_root"
+                "switch_root",
+                "umount"
             ]
         );
     }
@@ -608,6 +613,7 @@ mod confinement {
         ("SYS_SETHOSTNAME", "170"),
         ("SYS_SETSID", "112"),
         ("SYS_SYNC", "162"),
+        ("SYS_UMOUNT2", "166"),
         ("SYS_WAIT4", "61"),
     ];
 
@@ -760,7 +766,7 @@ mod confinement {
                 declared.push(target);
             }
         }
-        assert_eq!(declared.len(), 6, "expected six modules beside the crate root");
+        assert_eq!(declared.len(), 7, "expected seven modules beside the crate root");
         // ...and nothing scanned is orphaned: a file present but declared by no
         // `mod` line is either dead or reached a way this scan does not model,
         // and either way the counts above stop meaning what they say. Matching on
@@ -774,7 +780,7 @@ mod confinement {
         }
     }
 
-    /// `src/` holds these seven files and nothing else.
+    /// `src/` holds these eight files and nothing else.
     ///
     /// The scan above proves every `mod` line has a file and every file has a
     /// `mod` line, which is a closed loop that says nothing about WHICH files:
@@ -787,7 +793,7 @@ mod confinement {
     /// skipping them: `src/sys.inc` is invisible to a `.rs`-only scan and
     /// compiles perfectly well through the constructs refused below.
     #[test]
-    fn src_holds_exactly_the_seven_scanned_modules() {
+    fn src_holds_exactly_the_eight_scanned_modules() {
         let (rs, other) = walk();
         let paths: Vec<&str> = rs.iter().map(|(p, _)| p.as_str()).collect();
         assert_eq!(
@@ -798,6 +804,7 @@ mod confinement {
                 "hostname.rs",
                 "init.rs",
                 "main.rs",
+                "mount.rs",
                 "switchroot.rs",
                 "sys.rs",
             ],
@@ -945,7 +952,7 @@ mod confinement {
     /// and call-site assertion here still green. Squeezed, position on a line
     /// stops existing.
     #[test]
-    fn the_syscall_surface_is_the_amended_eight() {
+    fn the_syscall_surface_is_the_amended_nine() {
         const DECL: &str = concat!("const", "SYS_");
         let sys = squeeze(&source("sys.rs"));
         let mut declared = Vec::new();
@@ -998,16 +1005,16 @@ mod confinement {
         );
     }
 
-    /// All eight calls, pinned WHOLE — every register, not just the selector.
+    /// All nine calls, pinned WHOLE — every register, not just the selector.
     ///
     /// `every_syscall_call_site_uses_a_named_constant` reads argument ONE and
     /// stops. The other five are where the amendment's restrictions actually
-    /// live: `mount` is "restricted to `MS_MOVE`", but that is a claim about
-    /// the flags register, and `MS_MOVE | 0x1000` (MS_BIND) or a non-NULL
-    /// fstype pointer is a different kernel operation with the roster, the
-    /// declaration pins and the selector scan all still green. Same for
-    /// `ioctl`'s "restricted to `TIOCSCTTY`" and `reboot`'s two magics — a
-    /// wrong magic is a reboot that silently does nothing.
+    /// live: `ioctl` is "restricted to `TIOCSCTTY`", but that is a claim about
+    /// the request register, and a different request number is a different
+    /// kernel operation with the roster, the declaration pins and the selector
+    /// scan all still green. Same for `reboot`'s two magics — a wrong magic is
+    /// a reboot that silently does nothing — and for `mount`'s flags and data
+    /// arriving from the option table rather than being composed here.
     ///
     /// Squeezed, so reformatting the multi-line calls does not red this; the
     /// argument lists are literals but `CALL` is assembled, since main.rs may
@@ -1017,7 +1024,8 @@ mod confinement {
         const ARGUMENTS: &[&str] = &[
             "(SYS_REBOOT,LINUX_REBOOT_MAGIC1,LINUX_REBOOT_MAGIC2,cmd,0,0)",
             "(SYS_SYNC,0,0,0,0,0)",
-            "(SYS_MOUNT,source.as_ptr()asusize,target.as_ptr()asusize,0,MS_MOVE,0,)",
+            "(SYS_MOUNT,source.as_ptr()asusize,target.as_ptr()asusize,nullable(fstype),flags,nullable(data),)",
+            "(SYS_UMOUNT2,target.as_ptr()asusize,flags,0,0,0)",
             "(SYS_CHROOT,path.as_ptr()asusize,0,0,0,0)",
             "(SYS_SETHOSTNAME,name.as_ptr()asusize,name.len(),0,0,0,)",
             "(SYS_SETSID,0,0,0,0,0)",
@@ -1035,17 +1043,36 @@ mod confinement {
         }
     }
 
-    /// AGENTS.md confines two of the eight by FLAG, not just by number: `mount`
-    /// "restricted to MS_MOVE" and `ioctl` "restricted to TIOCSCTTY". Both are
-    /// one constant, and editing the constant keeps every name and number in
+    /// AGENTS.md confines `ioctl` by FLAG, not just by number: "restricted to
+    /// TIOCSCTTY" is one constant, and editing it keeps every name and number in
     /// the roster intact — 0x540e to 0x5412 turns the terminal claim into
-    /// TIOCSTI, which injects input into another session's terminal. The
-    /// reboot magics are pinned for the same reason.
+    /// TIOCSTI, which injects input into another session's terminal. The reboot
+    /// magics are pinned for the same reason: a wrong magic is a reboot that
+    /// silently does nothing.
+    ///
+    /// `mount(2)` used to be confined the same way — one pinned `MS_MOVE` — and
+    /// the amendment that added the `mount`/`umount` applets is exactly the one
+    /// that gave it the real flag word. What replaces that pin is this list:
+    /// every bit the crate may set, spelled out with its value, so a mistyped
+    /// `MS_NOSUID` is not a mount that silently permits setuid. Which of them
+    /// any given call composes is held by the option table (see below).
     #[test]
     fn the_flags_the_syscalls_are_restricted_to_are_pinned() {
         let sys = source("sys.rs");
         for decl in [
-            "const MS_MOVE: usize = 0x2000;",
+            "pub const MS_RDONLY: usize = 0x1;",
+            "pub const MS_NOSUID: usize = 0x2;",
+            "pub const MS_NODEV: usize = 0x4;",
+            "pub const MS_NOEXEC: usize = 0x8;",
+            "pub const MS_SYNCHRONOUS: usize = 0x10;",
+            "pub const MS_REMOUNT: usize = 0x20;",
+            "pub const MS_NOATIME: usize = 0x400;",
+            "pub const MS_NODIRATIME: usize = 0x800;",
+            "pub const MS_BIND: usize = 0x1000;",
+            "pub const MS_MOVE: usize = 0x2000;",
+            "pub const MS_RELATIME: usize = 0x0020_0000;",
+            "pub const MNT_FORCE: usize = 0x1;",
+            "pub const MNT_DETACH: usize = 0x2;",
             "const TIOCSCTTY: usize = 0x540e;",
             "const LINUX_REBOOT_MAGIC1: usize = 0xfee1_dead;",
             "const LINUX_REBOOT_MAGIC2: usize = 0x2812_1969;",
@@ -1058,6 +1085,126 @@ mod confinement {
                 1,
                 "`{decl}` is part of the amended surface and must read exactly so"
             );
+        }
+    }
+
+    /// ...and `sys.rs` declares NOTHING ELSE of the kind.
+    ///
+    /// The pins above prove each listed bit reads as its right value. They say
+    /// nothing about a FOURTEENTH constant beside them, and the flag word is a
+    /// runtime parameter now rather than the frozen `MS_MOVE` the old call-site
+    /// pin froze — so `pub const MS_REC: usize = 0x4000;` would satisfy every
+    /// assertion here, become composable by the option table, and reach mount
+    /// propagation, an operation this crate has no business performing, with
+    /// the roster, the call-site pins and the naming confinement all green.
+    ///
+    /// This is the half of the widened confinement that lives in the source;
+    /// `mount.rs` carries the other half, pinning the option table's BITS to
+    /// these same constants so a bare `0x4000` in the table cannot reach the
+    /// kernel either.
+    #[test]
+    fn the_mount_flag_roster_is_exactly_the_amended_set() {
+        const EXPECTED: &[&str] = &[
+            "MNT_DETACH",
+            "MNT_FORCE",
+            "MS_BIND",
+            "MS_MOVE",
+            "MS_NOATIME",
+            "MS_NODEV",
+            "MS_NODIRATIME",
+            "MS_NOEXEC",
+            "MS_NOSUID",
+            "MS_RDONLY",
+            "MS_RELATIME",
+            "MS_REMOUNT",
+            "MS_SYNCHRONOUS",
+        ];
+        // sys.rs alone, because main.rs's own pins above quote these
+        // declarations verbatim and would count themselves.
+        let sys = squeeze(&source("sys.rs"));
+        let mut declared: Vec<String> = Vec::new();
+        for (offset, _) in sys.match_indices("const") {
+            let rest = sys.get(offset + "const".len()..).unwrap_or_default();
+            let name: String = rest
+                .chars()
+                .take_while(|c| c.is_alphanumeric() || *c == '_')
+                .collect();
+            if name.starts_with(concat!("MS", "_")) || name.starts_with(concat!("MNT", "_")) {
+                declared.push(name);
+            }
+        }
+        declared.sort();
+        assert_eq!(declared, EXPECTED, "the mount-flag surface changed");
+    }
+
+    /// The two filesystem wrappers are reachable from `mount.rs` and, for the
+    /// pivot's `MS_MOVE`, `switchroot.rs` — and nowhere else.
+    ///
+    /// `sys::mount` takes `flags: usize`, so any module that can call it can
+    /// pass a numeric literal and reach an operation no option table describes.
+    /// That was structurally impossible while the wrapper had no flags
+    /// parameter; naming is what replaces it.
+    #[test]
+    fn the_filesystem_wrappers_are_called_only_from_the_two_permitted_modules() {
+        for (call, permitted) in [
+            (concat!("sys::", "mount"), &["mount.rs", "switchroot.rs"][..]),
+            (concat!("sys::", "umount"), &["mount.rs"][..]),
+        ] {
+            for (path, text) in sources() {
+                if path == "sys.rs" || path == "main.rs" || permitted.contains(&path.as_str()) {
+                    continue;
+                }
+                assert_eq!(
+                    text.matches(call).count(),
+                    0,
+                    "'{path}' calls {call}; only {permitted:?} may"
+                );
+            }
+        }
+        // A glob import would name neither wrapper and defeat the scan above.
+        assert_eq!(
+            squeezed().matches(concat!("sys::", "*")).count(),
+            0,
+            "a glob import of the syscall module hides which wrappers a caller reaches"
+        );
+    }
+
+    /// Where a mount flag may be NAMED. The pins above say what each bit is
+    /// worth; this says who may compose one, which is the half that decides
+    /// what the kernel is actually asked to do.
+    ///
+    /// `mount.rs` is entitled to all of them: the option table every `-o` word
+    /// routes through, the `-r`/`-w` shorthands for the bit that table already
+    /// owns, and `umount -r`'s read-only remount. `switch_root` is entitled to
+    /// exactly `MS_MOVE`, twice: the API-mount move and the root move. Anywhere
+    /// else, a flag word would be a mount operation no table describes and no
+    /// `-o` spelling can reach.
+    #[test]
+    fn the_mount_flag_names_are_confined_to_the_table_that_composes_them() {
+        const MS: &str = concat!("MS", "_");
+        const MNT: &str = concat!("MNT", "_");
+        for (path, text) in sources() {
+            match path.as_str() {
+                // Declares them; and main.rs pins them, just above.
+                "sys.rs" | "main.rs" | "mount.rs" => {}
+                "switchroot.rs" => {
+                    assert_eq!(
+                        text.matches(MS).count(),
+                        2,
+                        "switch_root moves two mounts and may name no other flag"
+                    );
+                    assert_eq!(
+                        text.matches(MNT).count(),
+                        0,
+                        "switch_root never unmounts — it moves and frees"
+                    );
+                }
+                _ => assert_eq!(
+                    text.matches(MS).count() + text.matches(MNT).count(),
+                    0,
+                    "'{path}' composes a mount flag; only mount.rs's option table may"
+                ),
+            }
         }
     }
 
@@ -1152,15 +1299,15 @@ mod confinement {
             );
             selected.push(selector);
         }
-        // Each of the eight EXACTLY once. Membership alone would let all eight
+        // Each of the nine EXACTLY once. Membership alone would let all nine
         // sites name SYS_REBOOT while a wrapper quietly issued a different call
         // than the one it is named for.
         selected.sort();
         let roster: Vec<String> = AMENDED.iter().map(|(n, _)| (*n).to_string()).collect();
         assert_eq!(selected, roster, "each amended syscall is issued exactly once");
-        // One call per wrapper: reboot, sync, mount, chroot, sethostname,
-        // setsid, ioctl, wait4.
-        assert_eq!(sites, 8, "expected exactly eight call sites");
+        // One call per wrapper: reboot, sync, mount, umount2, chroot,
+        // sethostname, setsid, ioctl, wait4.
+        assert_eq!(sites, 9, "expected exactly nine call sites");
         // ...and the definition, and NOTHING else. The loop skips any mention
         // not followed by `(`, which is the function ITEM: bind it once and
         // every later call goes through a name this scan does not know.

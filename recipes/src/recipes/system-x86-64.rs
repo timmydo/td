@@ -33,8 +33,9 @@ const BOOT_FAIL_PARKED: &str = "td-boot-parked-v1";
 //   boot/{selector-initramfs.cpio,manifest}
 //   deployment/{bzImage,initramfs.cpio,root.erofs,manifest}
 //
-// The direct-boot selector initramfs carries static busybox, td-boot, and
-// td-kexec; it has no branch that can enter a deployment directly. It verifies
+// The direct-boot selector initramfs carries static busybox, td-init (for the
+// mount pair), td-boot, and td-kexec; it has no branch that can enter a
+// deployment directly, because it links no `/bin/switch_root`. It verifies
 // current/previous from the Btrfs volume and kexecs the selected deployment.
 // That deployment's distinct initramfs requires the td.deployment handoff,
 // re-verifies root.erofs, binds it to a read-only loop device, mounts @var from
@@ -57,7 +58,9 @@ const BOOT_FAIL_PARKED: &str = "td-boot-parked-v1";
 // host qemu, and gives you a shell. The headless `td-recipe-eval
 // qemu-boot-system` asserts the deployment state machine across repeated boots.
 //
-// Userland strategy (v0): static busybox provides the boot/login/shell path;
+// Userland strategy (v0): the static Rust td-init multicall provides the boot
+// glue — PID 1, the pivot, and every mount/umount on the machine — while static
+// busybox provides the login/shell path and the text tools uutils lacks;
 // source-built Rust uutils provides the interactive core file/text userland
 // with its declared glibc runtime closure.
 //
@@ -164,16 +167,19 @@ const SYSTEM: SystemDef = SystemDef {
 /// `shape_check` asserts the owning binary actually provides it.
 ///
 /// BUSYBOX now keeps only what no Rust multicall serves: the shell (`sh`/`ash`), the login
-/// chain (`getty`/`login`/`su`), the mount pair the pre-pivot initramfs needs before any
-/// dynamic closure is reachable, the text tools uutils does not provide (`grep`/`sed`/`awk`),
+/// chain (`getty`/`login`/`su`), the text tools uutils does not provide (`grep`/`sed`/`awk`),
 /// and `more`, whose uutils feature would compile a crossterm pager stack into the shipped
 /// multicall — a dependency call, not a farm move.
 /// `find`/`xargs` are intentionally NOT bare symlinks either: the ladder's findutils
 /// dead-axis lock (`no_bootstrap_step_invokes_host_find_or_xargs`) forbids those tokens in
 /// any step text and can't tell a cpio member NAME from a host invocation; they stay
 /// reachable as `busybox find` / `busybox xargs`.
+///
+/// `mount`/`umount` LEFT this list with td-init's `mount(2)`/`umount2(2)` amendment. They
+/// were the last thing on the boot path only busybox could do, and moving them is what lets
+/// both `/init` scripts stop calling the multiplexer.
 const BUSYBOX_APPLETS: &[&str] = &[
-    "sh", "ash", "getty", "login", "mount", "umount", "more", "grep", "sed", "awk", "su",
+    "sh", "ash", "getty", "login", "more", "grep", "sed", "awk", "su",
 ];
 
 /// Names the busybox retirement DROPS rather than reimplementing as a td app: nothing on the
@@ -185,11 +191,13 @@ const DROPPED_APPLETS: &[&str] = &["vi", "less"];
 /// The boot glue, served by the static td-init multicall — the busybox applets that need a
 /// RAW SYSCALL, which is why they are a separate binary from td-util's
 /// `#![forbid(unsafe_code)]` farm. Unlike every other farm here these names are LOAD-BEARING:
-/// `/init` is PID 1, `switch_root` is the stage-1 pivot, `hostname -F` runs at sysinit (the
-/// `-F` flag is the gap uutils has — it ships no `hostname` at all), and `reboot` is how a
-/// boot ends. So this farm is not merely symlinked and probed; the image's actual boot path
-/// runs it, and `shape_check` additionally dry-runs the shipped `/etc/inittab` through the
-/// packed binary so a table PID 1 would reject reds the BUILD rather than the boot.
+/// `/init` is PID 1, `switch_root` is the stage-1 pivot, `mount`/`umount` bring up and
+/// release every filesystem the machine has (both `/init` scripts, sysinit, td-boot and
+/// `/etc/shutdown`), `hostname -F` runs at sysinit (the `-F` flag is the gap uutils has — it
+/// ships no `hostname` at all), and `reboot` is how a boot ends. So this farm is not merely
+/// symlinked and probed; the image's actual boot path runs it, and `shape_check` additionally
+/// dry-runs the shipped `/etc/inittab` through the packed binary so a table PID 1 would
+/// reject reds the BUILD rather than the boot.
 ///
 /// td-init is an ET_EXEC with an EMPTY runtime closure, which is what lets the same binary
 /// serve the pre-pivot initramfs (where no loader exists) and the real root's `/bin`.
@@ -211,6 +219,16 @@ const TD_INIT_FARM: &[(&str, Probe)] = &[
     ("hostname", Probe::ReadsBackHostname),
     // The shipped table, parsed by the binary that will be PID 1 next boot.
     ("init", Probe::Runs("--dry-run -f /etc/inittab")),
+    // Probed by REFUSAL, though for the opposite reason to the three below: mount SUCCEEDS
+    // destructively. A probe that mounted something would change the running system's mount
+    // table to prove a symlink, and the greeter is unprivileged so the interesting paths
+    // would EPERM anyway. The refusal proves the packed name, the argv[0] dispatch, and the
+    // property every fixed mount line on this image rests on — arguments are parsed before
+    // any syscall, so a typo cannot mount over a directory the boot needs.
+    (
+        "mount",
+        Probe::Refuses("--not-an-option", "unrecognised argument"),
+    ),
     (
         "poweroff",
         Probe::Refuses("--not-an-option", "unrecognised argument"),
@@ -229,6 +247,14 @@ const TD_INIT_FARM: &[(&str, Probe)] = &[
     (
         "switch_root",
         Probe::Refuses("/etc /init", "refusing to switch"),
+    ),
+    // The one applet on this image whose SUCCESS path can end the boot as thoroughly as
+    // `reboot`: `umount -a` releases the root. So it is proven by its refusal too — and the
+    // bad option is the sharpest case, since a parser that fell through to `-a` would take
+    // the greeter's own filesystems away.
+    (
+        "umount",
+        Probe::Refuses("--not-an-option", "unrecognised argument"),
     ),
 ];
 
@@ -305,7 +331,6 @@ const INITRAMFS_APPLETS: &[&str] = &[
     "losetup",
     "mkdir",
     "mknod",
-    "mount",
     "printf",
     "readlink",
     "rm",
@@ -313,7 +338,6 @@ const INITRAMFS_APPLETS: &[&str] = &[
     "sleep",
     "sync",
     "test",
-    "umount",
 ];
 
 /// The diagnostics userland, served by the static td-util multicall — the busybox names
@@ -442,8 +466,8 @@ fn build_selector_init() -> String {
     "#!/bin/sh\n\
      set -e\n\
      set -f\n\
-     /bin/busybox mount -t devtmpfs dev /dev\n\
-     /bin/busybox mount -t proc proc /proc\n\
+     /bin/mount -t devtmpfs dev /dev\n\
+     /bin/mount -t proc proc /proc\n\
      n=0\n\
      while /bin/busybox test \"$n\" -lt 5 && ! /bin/busybox test -b /dev/vda; do /bin/busybox sleep 1; n=$((n+1)); done\n\
      exec /bin/td-boot boot /dev/vda /volume \"$(/bin/busybox cat /proc/cmdline)\"\n"
@@ -461,8 +485,8 @@ fn build_deployment_init(sys: &SystemDef) -> String {
     let mut init = "#!/bin/sh\n\
      set -e\n\
      set -f\n\
-     /bin/busybox mount -t devtmpfs dev /dev\n\
-     /bin/busybox mount -t proc proc /proc\n\
+     /bin/mount -t devtmpfs dev /dev\n\
+     /bin/mount -t proc proc /proc\n\
      n=0\n\
      while /bin/busybox test \"$n\" -lt 5 && ! /bin/busybox test -b /dev/vda; do /bin/busybox sleep 1; n=$((n+1)); done\n\
      deployment=\n\
@@ -475,19 +499,19 @@ fn build_deployment_init(sys: &SystemDef) -> String {
        esac\n\
      done\n\
      /bin/busybox test -n \"$deployment\" || { echo 'td-init: missing td.deployment handoff' >&2; exit 1; }\n\
-     /bin/busybox mount -t btrfs -o ro,nodev,nosuid,noexec /dev/vda /volume\n\
+     /bin/mount -t btrfs -o ro,nodev,nosuid,noexec /dev/vda /volume\n\
      if ! /bin/busybox test -b /dev/loop0; then /bin/busybox mknod /dev/loop0 b 7 0; fi\n\
      /bin/td-boot root-loop /volume \"$deployment\" /dev/loop0\n\
-     /bin/busybox mount -t erofs -o ro /dev/loop0 /sysroot\n\
-     /bin/busybox mount -t btrfs -o rw,nodev,nosuid,subvol=@var /dev/vda /sysroot/var\n\
-     /bin/busybox umount /proc\n\
-     /bin/busybox umount /dev\n\
-     /bin/busybox mount -t tmpfs -o mode=0755 tmpfs /sysroot/run\n\
+     /bin/mount -t erofs -o ro /dev/loop0 /sysroot\n\
+     /bin/mount -t btrfs -o rw,nodev,nosuid,subvol=@var /dev/vda /sysroot/var\n\
+     /bin/umount /proc\n\
+     /bin/umount /dev\n\
+     /bin/mount -t tmpfs -o mode=0755 tmpfs /sysroot/run\n\
      /bin/busybox printf '%s\\n' \"$deployment\" > /sysroot/run/td-deployment\n\
      /bin/busybox chmod 0600 /sysroot/run/td-deployment\n\
      /bin/busybox mkdir -p /sysroot/run/td-volume\n\
-     /bin/busybox mount -o move /volume /sysroot/run/td-volume\n\
-     /bin/busybox mount -t tmpfs -o mode=1777 tmpfs /sysroot/tmp\n\
+     /bin/mount -o move /volume /sysroot/run/td-volume\n\
+     /bin/mount -t tmpfs -o mode=1777 tmpfs /sysroot/tmp\n\
      /bin/busybox mkdir -p /sysroot/var/log /sysroot/var/home"
         .to_string();
     for user in sys.users {
@@ -553,8 +577,8 @@ fn build_shutdown() -> String {
         "#!/bin/sh\n\
          ok=1\n\
          /bin/busybox sync || {{ echo 'td-shutdown: sync failed' >&2; ok=0; }}\n\
-         /bin/busybox umount /var || {{ echo 'td-shutdown: umount /var failed' >&2; ok=0; }}\n\
-         /bin/busybox umount -a -r || {{ echo 'td-shutdown: final unmount failed' >&2; ok=0; }}\n\
+         /bin/umount /var || {{ echo 'td-shutdown: umount /var failed' >&2; ok=0; }}\n\
+         /bin/umount -a -r || {{ echo 'td-shutdown: final unmount failed' >&2; ok=0; }}\n\
          /bin/busybox test \"$ok\" = 1 && echo {SYSTEM_SHUTDOWN_MARKER}\n"
     )
 }
@@ -1097,10 +1121,16 @@ fn etc_files(sys: &SystemDef) -> Vec<(&'static str, String, bool)> {
 }
 
 /// Which of the two structurally distinct boot phases a cpio is packed for. They carry
-/// DISJOINT helpers, and each helper's absence from the other phase is asserted: the
-/// selector kexecs (td-kexec) and never pivots, the deployment phase pivots (td-init's
-/// `switch_root`) and never kexecs. A phase that carried both would let an initramfs do
-/// something its /init has no branch for.
+/// DISJOINT capabilities, and each one's absence from the other phase is asserted: the
+/// selector kexecs (`/bin/td-kexec`) and never pivots, the deployment phase pivots
+/// (`/bin/switch_root`) and never kexecs. A phase that carried both would let an initramfs
+/// do something its /init has no branch for.
+///
+/// The line is drawn at the /bin NAME, not at the binary: since the `mount(2)` amendment
+/// BOTH phases pack td-init, because both mount devtmpfs and proc before doing anything
+/// else. Only the deployment phase links `switch_root` to it, which is the capability the
+/// selector must not have — and the same test that pins that pins the selector's
+/// `bin/switch_root` absent.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Phase {
     Selector,
@@ -1126,6 +1156,16 @@ fn build_initramfs_spec(init: &str, phase: Phase) -> String {
     s.push_str("dir {in:td-boot}/bin 0755 0 0\n");
     s.push_str("file {in:td-boot}/bin/td-boot {in:td-boot}/bin/td-boot 0755 0 0\n");
     s.push_str("slink /bin/td-boot {in:td-boot}/bin/td-boot 0777 0 0\n");
+    // td-init, in BOTH phases: each /init mounts devtmpfs and proc as its first act, and
+    // td-boot mounts the Btrfs volume through the same `/bin/mount`. td-init is a static
+    // ET_EXEC with an empty runtime closure, which is what lets it run here at all — nothing
+    // has mounted the real root yet, so a dynamically-linked mount would be a kernel panic
+    // rather than a degraded boot.
+    s.push_str("dir {in:td-init} 0755 0 0\n");
+    s.push_str("dir {in:td-init}/bin 0755 0 0\n");
+    s.push_str("file {in:td-init}/bin/td-init {in:td-init}/bin/td-init 0755 0 0\n");
+    s.push_str("slink /bin/mount {in:td-init}/bin/td-init 0777 0 0\n");
+    s.push_str("slink /bin/umount {in:td-init}/bin/td-init 0777 0 0\n");
     match phase {
         Phase::Selector => {
             s.push_str("dir {in:td-kexec} 0755 0 0\n");
@@ -1133,14 +1173,9 @@ fn build_initramfs_spec(init: &str, phase: Phase) -> String {
             s.push_str("file {in:td-kexec}/bin/td-kexec {in:td-kexec}/bin/td-kexec 0755 0 0\n");
             s.push_str("slink /bin/td-kexec {in:td-kexec}/bin/td-kexec 0777 0 0\n");
         }
-        // The pivot applet, and ONLY it: /init execs `/bin/switch_root`, so that is the one
-        // name this phase needs. td-init is a static ET_EXEC with an empty runtime closure,
-        // which is what lets it run here at all — nothing has mounted the real root yet, so
-        // a dynamically-linked pivot would be a kernel panic rather than a degraded boot.
+        // The pivot applet, and ONLY here: /init execs `/bin/switch_root`, and the selector
+        // has no branch that enters a root, so this is the name that must not exist there.
         Phase::Deployment => {
-            s.push_str("dir {in:td-init} 0755 0 0\n");
-            s.push_str("dir {in:td-init}/bin 0755 0 0\n");
-            s.push_str("file {in:td-init}/bin/td-init {in:td-init}/bin/td-init 0755 0 0\n");
             s.push_str("slink /bin/switch_root {in:td-init}/bin/td-init 0777 0 0\n");
         }
     }
@@ -1381,10 +1416,11 @@ fn shape_check() -> String {
      done; \
      selector_list=$(\"$bb\" cpio -t < \"$selector\" 2>/dev/null); \
      init_list=$(\"$bb\" cpio -t < \"$init\" 2>/dev/null); \
-     for m in init bin/busybox bin/sh bin/td-boot dev/console proc run volume sysroot; do \
+     for m in init bin/busybox bin/sh bin/td-boot bin/mount bin/umount dev/console proc run volume sysroot; do \
          printf '%s\\n' \"$selector_list\" | grep -q -x -F \"$m\" || { echo \"selector initramfs: cpio member '$m' missing\" >&2; exit 1; }; \
          printf '%s\\n' \"$init_list\" | grep -q -x -F \"$m\" || { echo \"deployment initramfs: cpio member '$m' missing\" >&2; exit 1; }; \
      done; \
+     printf '%s\\n' \"$selector_list\" | grep -qE '^td/store/[^/]+/bin/td-init$' || { echo 'selector initramfs: td-init store member missing - its /bin/mount and /bin/umount symlinks would dangle and the boot would stop before its first mount' >&2; exit 1; }; \
      printf '%s\\n' \"$selector_list\" | grep -q -x -F bin/td-kexec || { echo 'selector initramfs: td-kexec missing' >&2; exit 1; }; \
      if printf '%s\\n' \"$init_list\" | grep -q -x -F bin/td-kexec; then echo 'deployment initramfs: td-kexec must be selector-only' >&2; exit 1; fi; \
      printf '%s\\n' \"$selector_list\" | grep -qE '^td/store/[^/]+/bin/td-boot$' || { echo 'selector initramfs: td-boot store member missing' >&2; exit 1; }; \
@@ -1392,7 +1428,7 @@ fn shape_check() -> String {
      printf '%s\\n' \"$selector_list\" | grep -qE '^td/store/[^/]+/bin/td-kexec$' || { echo 'selector initramfs: td-kexec store member missing' >&2; exit 1; }; \
      if printf '%s\\n' \"$init_list\" | grep -qE '^td/store/[^/]+/bin/td-kexec$'; then echo 'deployment initramfs: td-kexec store member must be selector-only' >&2; exit 1; fi; \
      printf '%s\\n' \"$init_list\" | grep -q -x -F bin/switch_root || { echo 'deployment initramfs: bin/switch_root missing - its /init would exec nothing and the boot would end in a 300s timeout with no cause' >&2; exit 1; }; \
-     printf '%s\\n' \"$init_list\" | grep -qE '^td/store/[^/]+/bin/td-init$' || { echo 'deployment initramfs: td-init store member missing - the switch_root symlink would dangle' >&2; exit 1; }; \
+     printf '%s\\n' \"$init_list\" | grep -qE '^td/store/[^/]+/bin/td-init$' || { echo 'deployment initramfs: td-init store member missing - the switch_root and mount/umount symlinks would dangle' >&2; exit 1; }; \
      if printf '%s\\n' \"$selector_list\" | grep -q -x -F bin/switch_root; then echo 'selector initramfs: switch_root must be deployment-only - the selector kexecs, it never pivots' >&2; exit 1; fi; \
      [ \"$(wc -l < \"$selector_manifest\")\" -eq 2 ] || { echo 'selector manifest: expected header plus one payload entry' >&2; exit 1; }; \
      [ \"$(head -n 1 \"$selector_manifest\")\" = td-deployment-v1 ] || { echo 'selector manifest: unsupported header' >&2; exit 1; }; \
@@ -1876,26 +1912,36 @@ mod tests {
     /// getty auto-logs-in via `-l /etc/autologin`, and login needs both applets; the
     /// respawn line is inert without them. `reboot` is what `tty-session` execs when the
     /// greeter session ends (the in-guest power-off path). `switch_root` is the stage-1
-    /// pivot applet — without it the two-stage boot cannot enter the erofs root. These are
+    /// pivot applet — without it the two-stage boot cannot enter the erofs root, and
+    /// `mount`/`umount` are what bring every filesystem up and let it go again. These are
     /// all boot-critical and must stay on a STATIC multicall (no runtime closure) — busybox
-    /// for the login pair, td-init for `reboot`/`switch_root` since the cutover: belt-and-
-    /// braces against a farm edit that drops one or reroutes it to dynamically-linked
-    /// uutils (the shape check catches it at build time, this catches it at test time).
+    /// for the login pair, td-init for the rest since the cutovers: belt-and-braces against
+    /// a farm edit that drops one or reroutes it to dynamically-linked uutils (the shape
+    /// check catches it at build time, this catches it at test time).
     #[test]
     fn greeter_and_pivot_applets_are_present() {
         // Split across two static multicalls now, so each name is pinned to the ONE that
         // serves it. Asserting only "some farm has it" would let a boot name drift between
         // binaries unnoticed — and for these names that drift IS the boot.
-        for a in ["sh", "getty", "login", "mount", "umount"] {
+        for a in ["sh", "getty", "login"] {
             assert!(
                 BUSYBOX_APPLETS.contains(&a),
                 "boot-critical applet '{a}' missing from BUSYBOX_APPLETS"
             );
         }
-        for a in ["init", "reboot", "switch_root", "hostname"] {
+        for a in ["init", "reboot", "switch_root", "hostname", "mount", "umount"] {
             assert!(
                 td_init_applets().contains(&a),
                 "boot-glue applet '{a}' missing from the td-init farm"
+            );
+        }
+        // ...and the pair that MOVED is gone from the one it left, so a stray re-add cannot
+        // pack two symlinks for one name (the disjointness test below would catch that, but
+        // this is the assertion that says which direction the cutover went).
+        for a in ["mount", "umount"] {
+            assert!(
+                !BUSYBOX_APPLETS.contains(&a),
+                "'{a}' is td-init's since the mount(2)/umount2(2) amendment"
             );
         }
     }
@@ -2639,8 +2685,8 @@ mod tests {
         let shutdown = build_shutdown();
         assert!(
             shutdown.contains("/bin/busybox sync || {")
-                && shutdown.contains("/bin/busybox umount /var || {")
-                && shutdown.contains("/bin/busybox umount -a -r || {")
+                && shutdown.contains("/bin/umount /var || {")
+                && shutdown.contains("/bin/umount -a -r || {")
                 && shutdown.contains("/bin/busybox test \"$ok\" = 1")
                 && shutdown.contains(SYSTEM_SHUTDOWN_MARKER),
             "the teardown must attempt every safety step and emit its marker only when all pass"
@@ -2697,8 +2743,8 @@ mod tests {
             init.contains("mount -o move /volume /sysroot/run/td-volume")
                 && init.contains("printf '%s\\n' \"$deployment\" > /sysroot/run/td-deployment")
                 && init.contains("chmod 0600 /sysroot/run/td-deployment")
-                && init.contains("/bin/busybox umount /proc")
-                && init.contains("/bin/busybox umount /dev"),
+                && init.contains("/bin/umount /proc")
+                && init.contains("/bin/umount /dev"),
             "the selected id must be handed to the real root before the verified backing volume moves below it"
         );
         assert!(
@@ -3039,22 +3085,45 @@ mod tests {
                 && !deployment.contains("{in:td-kexec}"),
             "only the selector initramfs may carry td-kexec"
         );
-        // The mirror image: the pivot applet belongs to the phase that pivots. The selector
-        // kexecs and has no branch that enters a root, so a td-init there would be a
-        // capability its /init cannot reach — and one more payload in the cpio the firmware
-        // path loads.
+        // The mirror image is a NAME, not a payload. Both phases pack td-init (both mount
+        // devtmpfs and proc before anything else), so the capability line is drawn at the
+        // `/bin/switch_root` symlink: the selector has no branch that enters a root and must
+        // not carry the applet that would.
+        for (phase, spec) in [("selector", &selector), ("deployment", &deployment)] {
+            assert!(
+                spec.contains(
+                    "file {in:td-init}/bin/td-init {in:td-init}/bin/td-init 0755 0 0"
+                ) && spec.contains("slink /bin/mount {in:td-init}/bin/td-init 0777 0 0")
+                    && spec.contains("slink /bin/umount {in:td-init}/bin/td-init 0777 0 0"),
+                "the {phase} initramfs must pack td-init and expose its mount pair - its \
+                 /init mounts devtmpfs and proc before it does anything else"
+            );
+        }
         assert!(
-            deployment.contains("file {in:td-init}/bin/td-init {in:td-init}/bin/td-init 0755 0 0")
-                && deployment.contains("slink /bin/switch_root {in:td-init}/bin/td-init 0777 0 0")
-                && !selector.contains("{in:td-init}"),
-            "only the deployment initramfs may carry td-init, and it must expose the pivot as \
-             /bin/switch_root"
+            deployment.contains("slink /bin/switch_root {in:td-init}/bin/td-init 0777 0 0")
+                && !selector.contains("switch_root"),
+            "only the deployment initramfs may expose the pivot as /bin/switch_root"
         );
         for applet in td_boot_protocol::REQUIRED_BUSYBOX_APPLETS {
             assert!(
                 INITRAMFS_APPLETS.contains(applet),
                 "td-boot invokes uncovered busybox applet {applet}"
             );
+        }
+        // td-boot calls mount/umount by their /bin names, so each must be a td-init farm
+        // entry AND actually linked into both cpios — td-boot runs in both phases.
+        let td_init = td_init_applets();
+        for applet in td_boot_protocol::REQUIRED_TD_INIT_APPLETS {
+            assert!(
+                td_init.contains(applet),
+                "td-boot invokes /bin/{applet}, which the td-init farm does not serve"
+            );
+            for (phase, spec) in [("selector", &selector), ("deployment", &deployment)] {
+                assert!(
+                    spec.contains(&format!("slink /bin/{applet} ")),
+                    "the {phase} initramfs does not link /bin/{applet}, which td-boot runs there"
+                );
+            }
         }
     }
 
@@ -3332,11 +3401,13 @@ mod tests {
     /// embeds every applet source via `include_str!`, so the link costs nothing.
     #[test]
     fn every_expected_refusal_is_a_string_the_applet_actually_emits() {
-        // applet -> the module that implements it (reboot/poweroff/halt are one module).
+        // applet -> the module that implements it (reboot/poweroff/halt are one module, and
+        // so are mount/umount — they share the mount-table reading).
         fn module(applet: &str) -> &str {
             match applet {
                 "reboot" | "poweroff" | "halt" => "halt",
                 "switch_root" => "switchroot",
+                "umount" => "mount",
                 other => other,
             }
         }

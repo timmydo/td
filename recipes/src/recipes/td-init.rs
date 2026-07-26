@@ -9,24 +9,26 @@ use crate::types::{Recipe, Step};
 // `recipes/src/recipes/*.rs` catalog glob, so it is not itself a recipe module.
 //
 // SCOPE: the busybox applets that need a RAW SYSCALL — `init` (wait4), `reboot`/
-// `poweroff`/`halt` (reboot), `switch_root` (mount MS_MOVE + chroot), `cttyhack`
-// (setsid + TIOCSCTTY), and `hostname` (sethostname, the `-F` flag uutils lacks
-// and the reason `hostname` is still busybox). That is the complement of td-util,
+// `poweroff`/`halt` (reboot), `switch_root` (mount MS_MOVE + chroot), `mount`/
+// `umount` (mount + umount2), `cttyhack` (setsid + TIOCSCTTY), and `hostname`
+// (sethostname, the `-F` flag uutils lacks). That is the complement of td-util,
 // which covers the applets safe `std` already reaches and is
 // `#![forbid(unsafe_code)]` as a result. The crate confines its `unsafe` to one
 // `syscall5` body under a scoped `#[allow]` beneath a crate-level `deny` — the
 // THIRD target-side unsafe exception recorded in AGENTS.md, after td-kexec and
 // td-netd.
 //
-// system-x86-64 SHIPS this: /init (PID 1), the deployment initramfs' switch_root
-// pivot, and a /bin farm of all seven names. Unlike the td-util cutover, most of
-// these applets cannot be probed from the greeter — running `reboot` successfully
-// ends the boot, and `init`/`switch_root` have already done their work by the time
-// a greeter exists — so the evidence is layered instead: system-x86-64's shape
-// check EXECUTES this binary at BUILD time to dry-run the image's own inittab and
-// drive switch_root's fail-early refusal, the greeter probes the rest (the
-// irreversible ones through their refusal paths), and the boot oracle exercises the
-// success paths by booting three times.
+// system-x86-64 SHIPS this: /init (PID 1), both initramfses' mount pair, the
+// deployment initramfs' switch_root pivot, and a /bin farm of all nine names.
+// Unlike the td-util cutover, most of these applets cannot be probed from the
+// greeter — running `reboot` successfully ends the boot, `mount` mutates the
+// running system, and `init`/`switch_root` have already done their work by the
+// time a greeter exists — so the evidence is layered instead: system-x86-64's
+// shape check EXECUTES this binary at BUILD time to dry-run the image's own
+// inittab and drive switch_root's fail-early refusal, the greeter probes the rest
+// (the irreversible ones through their refusal paths), and the boot oracle
+// exercises the success paths by booting three times — every filesystem on the
+// machine is now mounted by this binary.
 //
 // Why mesboot-style (rustc invoked directly) rather than `Recipe::rust`, and why
 // static: identical to td-sh/td-util/td-kexec. Every applet here runs where the
@@ -60,6 +62,7 @@ const MODULES: &[(&str, &str)] = &[
     ("halt", include_str!("../../../td-init/src/halt.rs")),
     ("hostname", include_str!("../../../td-init/src/hostname.rs")),
     ("init", include_str!("../../../td-init/src/init.rs")),
+    ("mount", include_str!("../../../td-init/src/mount.rs")),
     ("switchroot", include_str!("../../../td-init/src/switchroot.rs")),
     ("sys", include_str!("../../../td-init/src/sys.rs")),
 ];

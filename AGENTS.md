@@ -295,18 +295,30 @@ td's Rust is defensive and minimal-surface.
   (SIOCSIFFLAGS/ADDR/NETMASK, SIOCGIFHWADDR, SIOCADDRT) go — all its socket I/O rides
   `std`, so DHCP needs no AF_PACKET raw socket; and (3) the `td-init` boot-glue
   multicall, whose one `syscall5` body in `td-init/src/sys.rs` carries EXACTLY these
-  eight syscalls, one per applet that safe `std` cannot reach: `reboot(2)` + `sync(2)`
-  (reboot/poweroff/halt), `mount(2)` restricted to `MS_MOVE` + `chroot(2)`
-  (switch_root), `setsid(2)` + `ioctl(2)` restricted to `TIOCSCTTY` (cttyhack),
-  `sethostname(2)` (`hostname -F`, the flag uutils lacks), and `wait4(2)` (init, which
-  as PID 1 must reap the orphans a targeted `Child::wait` cannot see). Deliberately
-  NOT in that surface: `pivot_root(2)` (it fails on the initramfs rootfs, so
-  switch_root moves the mount as util-linux and busybox do), `fork`/`execve` (`Command`
-  plus the safe `CommandExt::exec` cover both), `dup2` (`Stdio::from(File)` wires the
-  console), and any signal handler — which is why td's init supports no `ctrlaltdel`,
-  `shutdown` or `restart` inittab action. A ninth syscall, or a second scoped `#[allow]`,
-  is an amendment here; `td-init/src/main.rs`'s confinement test asserts both counts
-  against the crate's own source, since the compiler alone cannot. Do not add `unsafe`
+  nine syscalls, one per applet that safe `std` cannot reach: `reboot(2)` + `sync(2)`
+  (reboot/poweroff/halt), `mount(2)` + `umount2(2)` (mount/umount, and switch_root's
+  `MS_MOVE`), `chroot(2)` (switch_root), `setsid(2)` + `ioctl(2)` restricted to
+  `TIOCSCTTY` (cttyhack), `sethostname(2)` (`hostname -F`, the flag uutils lacks), and
+  `wait4(2)` (init, which as PID 1 must reap the orphans a targeted `Child::wait`
+  cannot see). `mount(2)` was restricted to `MS_MOVE` until the `mount`/`umount`
+  applets landed; they need the real flag word, so the restriction moved from the
+  syscall to `td-init/src/mount.rs`, the only module that composes one. Because the
+  flags are a runtime parameter now rather than a frozen constant, FOUR assertions
+  replace the old call-site pin, and between them they are the confinement: `sys.rs`
+  declares exactly thirteen `MS_*`/`MNT_*` constants and no more; each is
+  value-pinned; the option table's BITS must each be one of them (so a bare
+  `0x4000` cannot reach the kernel); and no module but `mount.rs` — plus
+  `switch_root`'s two `MS_MOVE` moves — may name one or call the two wrappers.
+  That amendment is what lets both initramfses and `/etc/inittab` mount without
+  busybox; `losetup` (ioctl requests not in this surface) is the one boot-path job
+  still left to it. Deliberately NOT in that surface: `pivot_root(2)` (it fails on the
+  initramfs rootfs, so switch_root moves the mount as util-linux and busybox do),
+  `fork`/`execve` (`Command` plus the safe `CommandExt::exec` cover both), `dup2`
+  (`Stdio::from(File)` wires the console), and any signal handler — which is why td's
+  init supports no `ctrlaltdel`, `shutdown` or `restart` inittab action. A tenth
+  syscall, a new `MS_*` bit, or a second scoped `#[allow]` is an amendment here;
+  `td-init/src/main.rs`'s confinement tests assert all three against the crate's own
+  source, since the compiler alone cannot. Do not add `unsafe`
   anywhere else; a new `unsafe` surface is a reviewed amendment recorded here.
 - **The engine is dependency-free.** `builder`, `recipes`, and the shared std-only
   `engine` lib (the one copy of the hand-rolled JSON + SHA-256 both bins use) form one

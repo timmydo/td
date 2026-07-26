@@ -30,6 +30,13 @@ use crate::types::{CheckRunner, Recipe, RecipeCheck, Step};
 //     asserted through its usage path and init through `--dry-run`, the inittab
 //     validator that parses a table and reports rejected lines through its exit
 //     code.
+//   * mount and umount are never asked to CHANGE the mount table: a build
+//     sandbox is a mount namespace whose filesystems the rest of the derivation
+//     is still standing on, and a `umount -a` here would take the store out from
+//     under the check. Their argument parsing is asserted instead — which is the
+//     property that matters, since every mount on this image is a fixed argument
+//     list some script wrote once — plus `mount`'s read-only table listing where
+//     /proc is available.
 //
 // The applets' live behaviour on a booted machine (PID 1 supervision, ctty
 // acquisition, the real switch_root) belongs to the headless boot oracle, which
@@ -95,11 +102,11 @@ pub fn recipe() -> Recipe {
                 "-c",
                 &format!(
                     "l=$('{bin}' --list) || {{ echo 'td-init --list failed' >&2; exit 1; }}; \
-                     for a in cttyhack halt hostname init poweroff reboot switch_root; do \
+                     for a in cttyhack halt hostname init mount poweroff reboot switch_root umount; do \
                          printf '%s\\n' \"$l\" | grep -q -x -F \"$a\" || {{ echo \"td-init does not serve applet '$a'\" >&2; exit 1; }}; \
                      done; \
                      n=$(printf '%s\\n' \"$l\" | wc -l); \
-                     [ \"$n\" -eq 7 ] || {{ echo \"td-init serves $n applets, expected exactly 7 — update this check deliberately when adding one\" >&2; exit 1; }}"
+                     [ \"$n\" -eq 9 ] || {{ echo \"td-init serves $n applets, expected exactly 9 — update this check deliberately when adding one\" >&2; exit 1; }}"
                 ),
             ],
         )
@@ -237,6 +244,55 @@ pub fn recipe() -> Recipe {
         .env("PATH", &mesboot0_path()),
     );
 
+    // mount/umount: the rejection paths, then the read-only table listing where
+    // /proc is available. NOTHING below may reach mount(2) or umount2(2) with a
+    // real target — see the header. Each refusal asserts the DIAGNOSTIC as well
+    // as the exit status: an unprivileged EPERM from the syscall would also exit
+    // non-zero, and that would prove the applet TRIED, which is the opposite of
+    // the contract these fixed argument lists depend on.
+    steps.push(
+        Step::run(
+            "{root}",
+            &[
+                SH,
+                "-c",
+                &format!(
+                    "e=$('{bin}' mount --not-an-option 2>&1); \
+                     [ $? -eq 1 ] || {{ echo 'mount must reject an unknown option with exit 1 — falling through would mount something over a directory the boot needs' >&2; exit 1; }}; \
+                     printf '%s\\n' \"$e\" | grep -q 'unrecognised argument' || {{ echo \"mount rejected the option without saying so: '$e'\" >&2; exit 1; }}; \
+                     e=$('{bin}' mount /mnt 2>&1); \
+                     [ $? -eq 1 ] || {{ echo 'mount accepted a lone operand — td ships no /etc/fstab to resolve one against, so it would have mounted nothing and reported success' >&2; exit 1; }}; \
+                     printf '%s\\n' \"$e\" | grep -q 'fstab' || {{ echo \"mount refused a lone operand for the wrong reason: '$e'\" >&2; exit 1; }}; \
+                     '{bin}' mount -t >/dev/null 2>&1; \
+                     [ $? -eq 1 ] || {{ echo 'mount -t with no TYPE must exit 1, not consume the next operand' >&2; exit 1; }}; \
+                     '{bin}' mount -o ro >/dev/null 2>&1; \
+                     [ $? -eq 1 ] || {{ echo 'mount with options but no operands must exit 1 rather than silently printing the table' >&2; exit 1; }}; \
+                     e=$('{bin}' umount 2>&1); \
+                     [ $? -eq 1 ] || {{ echo 'umount with no TARGET must exit 1' >&2; exit 1; }}; \
+                     printf '%s\\n' \"$e\" | grep -q 'no TARGET' || {{ echo \"umount said '$e' about a missing TARGET\" >&2; exit 1; }}; \
+                     e=$('{bin}' umount --not-an-option 2>&1); \
+                     [ $? -eq 1 ] || {{ echo 'umount must reject an unknown option with exit 1 — falling through to -a would tear down the sandbox' >&2; exit 1; }}; \
+                     printf '%s\\n' \"$e\" | grep -q 'unrecognised argument' || {{ echo \"umount rejected the option without saying so: '$e'\" >&2; exit 1; }}; \
+                     '{bin}' umount -ax >/dev/null 2>&1; \
+                     [ $? -eq 1 ] || {{ echo 'one bad letter must reject the WHOLE clustered word — applying the good ones would unmount everything on a typo' >&2; exit 1; }}; \
+                     '{bin}' umount -a /proc >/dev/null 2>&1; \
+                     [ $? -eq 1 ] || {{ echo 'umount -a with a TARGET is ambiguous and must be refused' >&2; exit 1; }}; \
+                     if [ -r /proc/self/mounts ]; then \
+                         t=$('{bin}' mount) || {{ echo 'td-init mount could not print the table' >&2; exit 1; }}; \
+                         [ -n \"$t\" ] || {{ echo 'mount printed an empty table where /proc is mounted' >&2; exit 1; }}; \
+                         printf '%s\\n' \"$t\" | grep -qE '^[^ ]+ on [^ ]+ type [^ ]+ [(]' || {{ echo \"mount's table is not in the 'SOURCE on TARGET type FSTYPE (OPTS)' spelling: '$t'\" >&2; exit 1; }}; \
+                         n=$(printf '%s\\n' \"$t\" | grep -cE '^[^ ]+ on [^ ]+ type [^ ]+ [(]'); \
+                         m=$(printf '%s\\n' \"$t\" | wc -l); \
+                         [ \"$n\" -eq \"$m\" ] || {{ echo \"mount printed $m lines but only $n are mount entries\" >&2; exit 1; }}; \
+                     else \
+                         echo 'note: /proc not mounted in this sandbox; the mount table listing is asserted by the boot oracle'; \
+                     fi"
+                ),
+            ],
+        )
+        .env("PATH", &mesboot0_path()),
+    );
+
     // hostname: the rejection paths, then printing where /proc is mounted. The
     // SET paths are deliberately never taken — see the header.
     steps.push(
@@ -271,7 +327,7 @@ pub fn recipe() -> Recipe {
     });
     steps.push(Step::WriteFile {
         path: "{out}/result".into(),
-        content: "PASS: td-init is a statically-linked ELF64 x86-64 executable (ET_EXEC) with no PT_INTERP and no dynamic NEEDED entry; it serves exactly the seven applets cttyhack/halt/hostname/init/poweroff/reboot/switch_root, dispatches through both the argv[0] and `td-init <applet>` forms, rejects an unknown reboot option before reaching reboot(2), validates an inittab through `init --dry-run` (exit 1 on a rejected line), refuses a switch_root into a new root with no executable init, and prints the hostname where /proc is mounted\n".into(),
+        content: "PASS: td-init is a statically-linked ELF64 x86-64 executable (ET_EXEC) with no PT_INTERP and no dynamic NEEDED entry; it serves exactly the nine applets cttyhack/halt/hostname/init/mount/poweroff/reboot/switch_root/umount, dispatches through both the argv[0] and `td-init <applet>` forms, rejects an unknown reboot option before reaching reboot(2), validates an inittab through `init --dry-run` (exit 1 on a rejected line), refuses a switch_root into a new root with no executable init, refuses an unknown mount/umount argument before reaching mount(2)/umount2(2) and a lone mount operand td has no fstab to resolve, and prints the mount table and the hostname where /proc is mounted\n".into(),
         exec: false,
     });
     steps.push(Step::Require {
@@ -285,7 +341,7 @@ pub fn recipe() -> Recipe {
         .steps(steps)
         .checks(vec![RecipeCheck::daily(
             r#"
-echo ">> recipe-check td-init-test: build-plan --auto builds td-init (td's static boot-glue multicall: init/reboot/poweroff/halt/switch_root/cttyhack/hostname, statically linked by the /td/store target Rust + native GCC/binutils/glibc toolchain), asserts a self-contained static ELF64 x86-64 executable (ET_EXEC, no PT_INTERP, no dynamic NEEDED), and exercises the applet roster, both dispatch forms, the inittab validator, and the fail-early/reject paths of the irreversible applets"
+echo ">> recipe-check td-init-test: build-plan --auto builds td-init (td's static boot-glue multicall: init/reboot/poweroff/halt/switch_root/mount/umount/cttyhack/hostname, statically linked by the /td/store target Rust + native GCC/binutils/glibc toolchain), asserts a self-contained static ELF64 x86-64 executable (ET_EXEC, no PT_INTERP, no dynamic NEEDED), and exercises the applet roster, both dispatch forms, the inittab validator, the mount-table listing, and the fail-early/reject paths of the irreversible applets"
 : "${TD_RECIPE_EVAL:=$PWD/target/release/td-recipe-eval}"
 exec "$TD_RECIPE_EVAL" check-run td-init-test daily 1
 "#,

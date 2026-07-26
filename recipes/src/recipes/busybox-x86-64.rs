@@ -259,7 +259,11 @@ pub fn recipe() -> Recipe {
                  printf '%s\\n' \"$h\" | grep -i 'class:'   | grep -qi 'ELF64'  || { echo 'busybox is not ELF64' >&2; exit 1; }; \
                  printf '%s\\n' \"$h\" | grep -i 'machine:' | grep -qi 'x86-64' || { echo 'busybox is not x86-64' >&2; exit 1; }; \
                  b=$('{out}/bin/busybox' 2>&1); \
-                 printf '%s\\n' \"$b\" | grep -q '^BusyBox v1[.]37[.]0 (1970-01-01 00:00:01 UTC) multi-call binary[.]$' || { echo 'busybox banner is not reproducible' >&2; exit 1; }",
+                 printf '%s\\n' \"$b\" | grep -q '^BusyBox v1[.]37[.]0 (1970-01-01 00:00:01 UTC) multi-call binary[.]$' || { echo 'busybox banner is not reproducible' >&2; exit 1; }; \
+                 l=$('{out}/bin/busybox' --list) || { echo 'busybox --list failed' >&2; exit 1; }; \
+                 for a in mount umount losetup; do \
+                     printf '%s\\n' \"$l\" | grep -q -x -F \"$a\" || { echo \"busybox does not serve applet '$a' - linux-x86-64's own initramfs /init runs mount, and td-boot runs losetup; a defconfig trim would break the kernel boot test with no other build-time signal\" >&2; exit 1; }; \
+                 done",
             ],
         )
         .env("PATH", &mesboot0_path()),

@@ -422,54 +422,18 @@ fn is_mount_point(path: &Path, mounts: Option<&str>) -> bool {
 ///
 /// The kernel octal-escapes four characters in that field, so the text is
 /// unescaped rather than used raw: the API paths never contain them, but NEWROOT
-/// is an arbitrary path now that it is compared against this list.
+/// is an arbitrary path now that it is compared against this list. That reading
+/// lives in `mount`, which parses the same table for `umount -a`.
+/// Lossy on purpose, and only here: these paths are COMPARED against a
+/// canonicalised NEWROOT, never handed back to the kernel, so a mangled name can
+/// only fail to match its own mount — and a NEWROOT that fails to match is
+/// refused, which is the safe direction. `mount`'s own table reading keeps the
+/// raw bytes, because `umount -a` acts on them.
 fn mount_points(mounts: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    for line in mounts.lines() {
-        let mut fields = line.split_whitespace();
-        let _device = fields.next();
-        if let Some(point) = fields.next() {
-            out.push(unescape_mount(point));
-        }
-    }
-    out
-}
-
-/// Undo the kernel's `\040` (space), `\011` (tab), `\012` (newline) and `\134`
-/// (backslash) escaping of a mount field. Anything else is left alone.
-fn unescape_mount(field: &str) -> String {
-    let bytes = field.as_bytes();
-    // Bytes, not `char`: `char::from(byte)` is a Latin-1 decode, so it would
-    // re-encode each byte of a multi-byte character as its own scalar and turn
-    // `/mnt/réal` into a name that matches no canonicalised path — a refusal to
-    // boot. The four escapes are ASCII and `\` never occurs inside a UTF-8
-    // sequence, so copying the rest verbatim keeps the field valid.
-    let mut out = Vec::with_capacity(field.len());
-    let mut i = 0usize;
-    while let Some(b) = bytes.get(i) {
-        let escape = if *b == b'\\' {
-            match bytes.get(i + 1..i + 4) {
-                Some(b"040") => Some(b' '),
-                Some(b"011") => Some(b'\t'),
-                Some(b"012") => Some(b'\n'),
-                Some(b"134") => Some(b'\\'),
-                _ => None,
-            }
-        } else {
-            None
-        };
-        match escape {
-            Some(c) => {
-                out.push(c);
-                i += 4;
-            }
-            None => {
-                out.push(*b);
-                i += 1;
-            }
-        }
-    }
-    String::from_utf8(out).unwrap_or_else(|_| field.to_string())
+    crate::mount::parse_table(mounts.as_bytes())
+        .into_iter()
+        .map(|e| String::from_utf8_lossy(&e.target).into_owned())
+        .collect()
 }
 
 /// The (source, target) moves to perform: every API mount that is currently
@@ -494,12 +458,9 @@ const DISPOSABLE_ROOT: &[&str] = &["rootfs", "ramfs", "tmpfs"];
 
 /// The filesystem type mounted at `/`, from a `/proc/self/mounts` table.
 fn root_fstype(mounts: &str) -> Option<String> {
-    for line in mounts.lines() {
-        let mut fields = line.split_whitespace();
-        let _device = fields.next();
-        let point = fields.next()?;
-        if unescape_mount(point) == "/" {
-            return fields.next().map(str::to_string);
+    for entry in crate::mount::parse_table(mounts.as_bytes()) {
+        if entry.target == b"/" && !entry.fstype.is_empty() {
+            return Some(String::from_utf8_lossy(&entry.fstype).into_owned());
         }
     }
     None
@@ -638,7 +599,13 @@ pub fn run(args: &[String]) -> Result<u8, String> {
             ));
             continue;
         }
-        if let Err(e) = sys::move_mount(&cpath(source)?, &cpath(target)?) {
+        if let Err(e) = sys::mount(
+            &cpath(source)?,
+            &cpath(target)?,
+            None,
+            sys::MS_MOVE,
+            None,
+        ) {
             crate::emit_err(&format!("switch_root: moving {source} to {target}: {e}\n"));
         }
     }
@@ -650,7 +617,8 @@ pub fn run(args: &[String]) -> Result<u8, String> {
     // "." rather than NEWROOT: the chdir above has already resolved it, so this
     // is correct whether the caller passed an absolute or a relative path.
     let dot = cpath(".")?;
-    sys::move_mount(&dot, &cpath("/")?).map_err(|e| format!("moving {newroot} to /: {e}"))?;
+    sys::mount(&dot, &cpath("/")?, None, sys::MS_MOVE, None)
+        .map_err(|e| format!("moving {newroot} to /: {e}"))?;
     sys::chroot(&dot).map_err(|e| format!("chroot: {e}"))?;
     std::env::set_current_dir("/").map_err(|e| format!("chdir /: {e}"))?;
 

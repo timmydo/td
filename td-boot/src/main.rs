@@ -18,7 +18,13 @@ use std::os::unix::fs::{
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
 
+// The last job td-boot still reaches busybox for: `losetup` needs ioctl(2)
+// requests outside td-init's confined syscall amendment. mount/umount moved to
+// td-init's own applets, which is what lets the deployment initramfs drop the
+// multicall from its `/init`.
 const BUSYBOX: &str = "/bin/busybox";
+const TD_MOUNT: &str = "/bin/mount";
+const TD_UMOUNT: &str = "/bin/umount";
 const TD_KEXEC: &str = "/bin/td-kexec";
 // root-loop requires procfs so losetup reopens the verified inode, not its path.
 const STDIN_PATH: &str = "/proc/self/fd/0";
@@ -1310,9 +1316,8 @@ fn run_command(command: &mut Command, label: &str) -> io::Result<()> {
 }
 
 fn btrfs_mount_command(device: &Path, mountpoint: &Path, options: &str) -> Command {
-    let mut command = Command::new(BUSYBOX);
+    let mut command = Command::new(TD_MOUNT);
     command.args([
-        OsStr::new(protocol::MOUNT_APPLET),
         OsStr::new("-t"),
         OsStr::new("btrfs"),
         OsStr::new("-o"),
@@ -1332,10 +1337,8 @@ fn writable_mount_command(device: &Path, mountpoint: &Path) -> Command {
 }
 
 fn unmount_command(mountpoint: &Path) -> Command {
-    let mut command = Command::new(BUSYBOX);
-    command
-        .arg(protocol::UMOUNT_APPLET)
-        .arg(mountpoint.as_os_str());
+    let mut command = Command::new(TD_UMOUNT);
+    command.arg(mountpoint.as_os_str());
     command
 }
 
@@ -3072,12 +3075,18 @@ mod tests {
 
     #[test]
     fn boot_commands_pin_mount_options_and_fd_handoff() {
+        // mount/umount are td-init applets called by their /bin names — NOT
+        // `busybox <applet>` — since the mount(2)/umount2(2) amendment. The
+        // program IS the applet name here, so pin the two to each other: a path
+        // that stopped matching its protocol name would send td-boot to a
+        // symlink the image does not pack.
+        assert_eq!(TD_MOUNT, format!("/bin/{}", protocol::MOUNT_APPLET));
+        assert_eq!(TD_UMOUNT, format!("/bin/{}", protocol::UMOUNT_APPLET));
         let mount = mount_command(Path::new("/dev/vda"), Path::new("/run/td-volume"));
-        assert_eq!(mount.get_program(), OsStr::new(BUSYBOX));
+        assert_eq!(mount.get_program(), OsStr::new(TD_MOUNT));
         assert_eq!(
             mount.get_args().collect::<Vec<_>>(),
             vec![
-                OsStr::new("mount"),
                 OsStr::new("-t"),
                 OsStr::new("btrfs"),
                 OsStr::new("-o"),
@@ -3090,7 +3099,6 @@ mod tests {
         assert_eq!(
             mount.get_args().collect::<Vec<_>>(),
             vec![
-                OsStr::new("mount"),
                 OsStr::new("-t"),
                 OsStr::new("btrfs"),
                 OsStr::new("-o"),
@@ -3100,9 +3108,10 @@ mod tests {
             ]
         );
         let unmount = unmount_command(Path::new("/run/td-update"));
+        assert_eq!(unmount.get_program(), OsStr::new(TD_UMOUNT));
         assert_eq!(
             unmount.get_args().collect::<Vec<_>>(),
-            vec![OsStr::new("umount"), OsStr::new("/run/td-update")]
+            vec![OsStr::new("/run/td-update")]
         );
 
         let fixture = Fixture::new();
