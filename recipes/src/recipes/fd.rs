@@ -1,16 +1,19 @@
-use crate::types::{Recipe, SourcePin};
+use crate::types::Recipe;
 
-// Keep fd's C-building jemalloc default disabled. The completions feature is
-// pure Rust and preserves the prior shipped package configuration while the
-// build remains wholly inside the declared td toolchain and offline crate set.
+// Keep fd's C-building jemalloc default disabled. The committed lock and
+// declared native inputs let `td shell` and `build-plan --auto` share the same
+// offline crate closure and source-built target toolchain.
 pub fn recipe() -> Recipe {
     Recipe::rust("fd", "10.2.0")
-        .source_pin(SourcePin::new(
-            "fd-source",
-            "https://static.crates.io/crates/fd-find/fd-find-10.2.0.crate",
-            "de08defa195af894cc295a43bfc65ba28903e492fd5f32f7a24bf75eafd9bf34",
-            "fd-find-10.2.0.crate",
-        ))
+        .source_input("fd-source")
+        .native_inputs(&[
+            "rust-toolchain",
+            "gcc-x86-64-self",
+            "binutils-x86-64-self",
+            "glibc-x86-64",
+            "busybox-x86-64",
+        ])
+        .cargo_lock("recipes/locks/fd/Cargo.lock")
         .bins(&["fd"])
         .no_default_features()
         .features(&["completions"])

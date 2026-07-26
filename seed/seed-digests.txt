@@ -16,6 +16,7 @@ cmake-x86-64-source arcs0qgnqjhfljjd69mpgnjnanpcrlid-cmake-x86-64-source
 coreutils-mesboot0-source 7dkw301jma5vnzc6x5i09nmh2dn7ak0q-coreutils-mesboot0-source
 diffutils-mesboot0-source ilin34x3xf4shlhs892wchsc0vjyqwb8-diffutils-mesboot0-source
 elfutils-x86-64-source n4g2hjlg72jm5wn0lx9fxplvh2y82d0b-elfutils-x86-64-source
+fd-source rsp3qagl8x7gh5hqpzy93adwfv5pv2ay-fd-source
 flex-x86-64-source v1hf8a11jna03slg5iqr5zj5kfxshvwz-flex-x86-64-source
 gawk-mesboot-source 128bh62a669ds6v5q6v2sih5a1qk51wj-gawk-mesboot-source
 gawk-mesboot0-source zdx7nfqxa7pddqpip7bpa13d79d5p7q2-gawk-mesboot0-source
@@ -55,6 +56,7 @@ patch-glibc-bootstrap-system-2.16.0 nggbvl93zgr74xf9x50331yfgsw4hh0r-patch-glibc
 patch-glibc-bootstrap-system-2.2.5 wjhcnyy2wspd9bf312ql84gfmvivixs2-patch-glibc-bootstrap-system-2.2.5
 patch-mesboot-source r3w1jmlradg89l3av29y1ifp7y312pk9-patch-mesboot-source
 python-mesboot-source 460ch0an5nlsgs5i9ppdk6b890fnvw1y-python-mesboot-source
+ripgrep-source ma4kmnnyn1hlimj2rw6hq7p07h8g2p3x-ripgrep-source
 rust-source cm16nyx12gdvnbm868xrrfcyaij9xqi1-rust-source
 rust-stage0-cargo-source gsd6q27xf6sv3js5hy0ngi3d5hp0s73l-rust-stage0-cargo-source
 rust-stage0-rustc-source 5jhmhhjm2dc9k0xp2xcyn37f6mm548nb-rust-stage0-rustc-source

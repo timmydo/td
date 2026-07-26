@@ -118,6 +118,13 @@ const PINS: &[PinDef] = &[
         file: "elfutils-0.192.tar.bz2",
     },
     PinDef {
+        key: "fd-source",
+        aliases: &[],
+        url: "https://static.crates.io/crates/fd-find/fd-find-10.2.0.crate",
+        sha256: "de08defa195af894cc295a43bfc65ba28903e492fd5f32f7a24bf75eafd9bf34",
+        file: "fd-find-10.2.0.crate",
+    },
+    PinDef {
         key: "flex-x86-64-source",
         aliases: &[],
         // GNU flex 2.6.4 — the lexical-analyzer generator the modern Linux kernel
@@ -392,6 +399,13 @@ const PINS: &[PinDef] = &[
         file: "Python-3.11.1.tar.xz",
     },
     PinDef {
+        key: "ripgrep-source",
+        aliases: &[],
+        url: "https://static.crates.io/crates/ripgrep/ripgrep-14.1.1.crate",
+        sha256: "f77b8032dc584527975f34aa5a897d0ef5a785573fda778771a614ff9da501d9",
+        file: "ripgrep-14.1.1.crate",
+    },
+    PinDef {
         key: "rust-source",
         aliases: &[],
         // The upstream source release is comprehensive: vendored Cargo sources,
@@ -530,10 +544,11 @@ mod tests {
         // pin, re #529) + flex-2.6.4 and elfutils-0.192 (the modern-kernel host
         // tools flex + libelf, re #529) + CMake 3.31.12 + Rust 1.96.0 source and
         // its exact three-component Rust 1.95.0 bootstrap snapshot +
-        // coreutils-0.9.0 (the uutils userland `.crate`, re #547) +
+        // coreutils-0.9.0, ripgrep 14.1.1, and fd 10.2.0 (the Rust userland
+        // `.crate` sources) +
         // btrfs-progs 7.0 and util-linux 2.42.2 (the persistent-volume writer
         // and its minimal libuuid/libblkid build closure).
-        assert_eq!(all().len(), 54);
+        assert_eq!(all().len(), 56);
     }
 
     #[test]

@@ -430,6 +430,17 @@ mod tests {
             1
         );
         assert_eq!(recipe_checks(&hello, None).len(), 1);
+
+        let rust_userland = catalog::lookup("rust-userland-auto-test").unwrap();
+        assert_eq!(
+            recipe_checks(&rust_userland, Some(td_recipe::types::CheckTier::Pr)).len(),
+            0
+        );
+        assert_eq!(
+            recipe_checks(&rust_userland, Some(td_recipe::types::CheckTier::Daily)).len(),
+            1
+        );
+        assert_eq!(recipe_checks(&rust_userland, None).len(), 1);
     }
 
     #[test]
@@ -458,6 +469,7 @@ mod tests {
             ("btrfs-progs-x86-64-test", 1),
             ("td-boot-test", 1),
             ("hello-test", 1),
+            ("rust-userland-auto-test", 1),
         ] {
             let recipe = catalog::lookup(stem).unwrap();
             let checks = recipe_checks(&recipe, Some(td_recipe::types::CheckTier::Daily));
@@ -492,9 +504,10 @@ mod tests {
         // flex-2.6.4 + elfutils-0.192 (the modern-kernel host tools flex +
         // libelf, re #529) + CMake 3.31.12 + Rust 1.96.0 source and its exact
         // three-component Rust 1.95.0 stage0 snapshot + coreutils-0.9.0 (the
-        // uutils userland `.crate`, re #547) + btrfs-progs 7.0 and util-linux
-        // 2.42.2 (the persistent-volume writer and its minimal libraries).
-        assert_eq!(pins.len(), 54);
+        // uutils, ripgrep, and fd userland `.crate` sources) + btrfs-progs 7.0
+        // and util-linux 2.42.2 (the persistent-volume writer and its minimal
+        // libraries).
+        assert_eq!(pins.len(), 56);
         assert!(pins.iter().any(|pin| pin.key == "stage0-source"));
         assert!(pins.iter().any(|pin| pin.key == "cmake-x86-64-source"));
         assert!(pins.iter().any(|pin| pin.key == "rust-source"));
@@ -514,7 +527,23 @@ mod tests {
 
     #[test]
     fn rust_userland_recipes_own_their_fixed_output_source_pins() {
+        let platform: Vec<String> = [
+            "rust-toolchain",
+            "gcc-x86-64-self",
+            "binutils-x86-64-self",
+            "glibc-x86-64",
+            "busybox-x86-64",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
         let ripgrep = catalog::lookup("ripgrep").unwrap();
+        assert_eq!(ripgrep.source_input.as_deref(), Some("ripgrep-source"));
+        assert_eq!(ripgrep.native_inputs.as_deref(), Some(platform.as_slice()));
+        assert_eq!(
+            ripgrep.cargo_lock.as_deref(),
+            Some("recipes/locks/ripgrep/Cargo.lock")
+        );
         let pins = ripgrep.source_pins.unwrap();
         assert_eq!(pins.len(), 1);
         assert_eq!(pins[0].key, "ripgrep-source");
@@ -524,6 +553,12 @@ mod tests {
         );
 
         let fd = catalog::lookup("fd").unwrap();
+        assert_eq!(fd.source_input.as_deref(), Some("fd-source"));
+        assert_eq!(fd.native_inputs.as_deref(), Some(platform.as_slice()));
+        assert_eq!(
+            fd.cargo_lock.as_deref(),
+            Some("recipes/locks/fd/Cargo.lock")
+        );
         let pins = fd.source_pins.unwrap();
         assert_eq!(pins.len(), 1);
         assert_eq!(pins[0].key, "fd-source");

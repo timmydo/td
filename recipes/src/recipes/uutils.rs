@@ -8,8 +8,8 @@ use crate::types::Recipe;
 // whose crates.io archive lacks src/libstdbuf and embeds an empty preload
 // library. The residual closure is uucore + clap + uucore's baked-in i18n.
 //
-// Unlike ripgrep/fd (built only via `td shell`), uutils builds as a `--auto`
-// graph node so the read-only-root system image can consume it: `source_input`
+// Like ripgrep/fd, uutils builds as a `--auto` graph node; the read-only-root
+// system image also consumes it. `source_input`
 // wires TD_SRC from the pinned .crate; `native_inputs` name the build platform
 // (rust-toolchain for cargo/rustc, gcc/binutils/glibc-`self` for the native link
 // env the builder derives, busybox for cp/chmod/tar); `cargo_lock` is the
