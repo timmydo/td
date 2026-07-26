@@ -4483,8 +4483,10 @@ fn assemble_recipe_drv(
             }
         }
         // mesboot: the bootstrap-rung step executor (#378 slices 2+3). The typed
-        // steps ride as JSON; {in:NAME} templates resolve through TD_INPUT_MAP
-        // (lock entry name -> canonical store path, source entry included).
+        // steps are hashed as drv data; the sandbox materializes them as the
+        // builder's steps file rather than forwarding them through execve.
+        // {in:NAME} templates resolve through TD_INPUT_MAP (lock entry name ->
+        // canonical store path, source entry included).
         // configureFlags/phases have no runner here — hard error, never ignored.
         "mesboot" => {
             let steps = alist
@@ -11968,6 +11970,45 @@ daemon build START (2/2 active)
         let ti0 = td_inputs(&drv0);
         assert!(ti0.contains("gcc-toolchain-15.2.0"), "default keeps the guix gcc-toolchain: {ti0}");
         assert!(!ti0.contains(tc), "default has no /td/store toolchain: {ti0}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn assemble_recipe_drv_keeps_large_steps_as_exact_hashed_data() {
+        let dir = std::env::temp_dir().join(format!("td-large-steps-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let lock = dir.join("fixture.lock");
+        std::fs::write(&lock, "").unwrap();
+        let content = "x".repeat(300 * 1024);
+        let recipe = format!(
+            "{{\"name\":\"fixture\",\"version\":\"1.0\",\"buildSystem\":\"mesboot\",\
+             \"steps\":[{{\"writeFile\":{{\"path\":\"{{out}}/payload\",\
+             \"content\":\"{content}\",\"exec\":false}}}}]}}"
+        );
+        let expected_steps = json::parse(&recipe)
+            .unwrap()
+            .get("steps")
+            .unwrap()
+            .to_json_string();
+        let (_path, _file, drv, _source) =
+            assemble_recipe_drv(&recipe, lock.to_str().unwrap(), &dir, None).unwrap();
+        assert_eq!(
+            drv.builder,
+            format!("{}/bin/td-builder", store::builder_identity_path())
+        );
+        assert_eq!(drv.args, vec!["mesboot-build".to_string()]);
+        let steps = drv
+            .env
+            .iter()
+            .find(|(key, _)| key == "TD_STEPS")
+            .map(|(_, value)| value)
+            .unwrap();
+        assert_eq!(steps, &expected_steps, "the file payload is byte-exact");
+        assert!(
+            steps.len() > 128 * 1024,
+            "the regression payload must exceed Linux MAX_ARG_STRLEN"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

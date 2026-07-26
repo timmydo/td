@@ -21,10 +21,12 @@
 //!     rung's mechanics) and the bound inputs stay protected by their host-root
 //!     ownership;
 //!   - build dir: a fresh tmpfs /tmp with /tmp/guix-build-<drvname>-0 (0700,
-//!     <drvname> keeps the .drv suffix), cwd there;
+//!     <drvname> keeps the .drv suffix), cwd there. Mesboot steps are materialized
+//!     there and consumed before recipe execution;
 //!   - env: cleared, then PATH/HOME/NIX_STORE/NIX_BUILD_CORES, the drv's
-//!     env, then NIX_BUILD_TOP/TMPDIR/TEMPDIR/TMP/TEMP/PWD — build.cc's
-//!     exact set and override order (the TMPDIR group wins over drv env).
+//!     env, then NIX_BUILD_TOP/TMPDIR/TEMPDIR/TMP/TEMP/PWD — build.cc's exact
+//!     set and override order (the TMPDIR group wins over drv env). The trusted
+//!     mesboot runner receives the hashed TD_STEPS data path through TD_STEPS_FILE.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
 #![allow(unsafe_code)] // confined raw-syscall / low-level layer (AGENTS.md)
@@ -55,6 +57,53 @@ const GUEST_GID: u32 = 30000;
 
 fn err(what: String) -> io::Error {
     io::Error::new(io::ErrorKind::Other, what)
+}
+
+/// Replace the trusted mesboot runner's hashed `TD_STEPS` data with the
+/// sandbox-local file path that `run_mesboot` consumes.
+fn configure_builder_env(
+    command: &mut Command,
+    builder: &str,
+    args: &[String],
+    env: &[(String, String)],
+    mesboot_steps_file: &Path,
+) -> io::Result<Option<String>> {
+    let mesboot = args.len() == 1
+        && args.first().is_some_and(|arg| arg == "mesboot-build")
+        && builder.ends_with("/bin/td-builder");
+    if mesboot {
+        let stable_builder =
+            builder == format!("{}/bin/td-builder", crate::store::builder_identity_path());
+        if !stable_builder {
+            return Err(err(format!(
+                "mesboot derivation builder {builder} is not the stable td-builder identity"
+            )));
+        }
+    }
+    let mut steps = None;
+    for (key, value) in env {
+        if mesboot && key == "TD_STEPS" {
+            steps = Some(value.clone());
+        } else {
+            command.env(key, value);
+        }
+    }
+    if mesboot && steps.is_none() {
+        return Err(err(
+            "mesboot derivation is missing its TD_STEPS file payload".to_string(),
+        ));
+    }
+    if mesboot {
+        command.env(crate::build::MESBOOT_STEPS_FILE_ENV, mesboot_steps_file);
+    }
+    Ok(steps)
+}
+
+fn write_mesboot_steps_file(path: &Path, steps: Option<&str>) -> io::Result<()> {
+    if let Some(steps) = steps {
+        fs::write(path, steps)?;
+    }
+    Ok(())
 }
 
 /// Map exactly one uid/gid pair into a user namespace already entered via
@@ -466,14 +515,8 @@ pub fn build(
     );
     let group_body = format!("root:x:0:\nnixbld:x:{GUEST_GID}:\nnogroup:x:65534:\n");
     let build_dir_owned = build_dir.clone();
-
-    // Per-build resource caps (opt-in via TD_BUILD_MEM_MAX; OFF by default).
-    // The cgroup leaf — when an operator delegates one via TD_BUILD_CGROUP — is
-    // a true RSS cap; the setrlimit(RLIMIT_DATA) backstop applied in pre_exec
-    // works everywhere (rootless, CI). Both are inherited onto the PID-1 builder.
-    let mem_cap = parse_mem_max(std::env::var("TD_BUILD_MEM_MAX").ok());
-    let cgroup_leaf = mem_cap.and_then(setup_build_cgroup);
-    let cgroup_procs = cgroup_leaf.as_ref().map(|d| d.join("cgroup.procs"));
+    let mesboot_steps_file =
+        PathBuf::from(&build_dir).join(crate::build::MESBOOT_STEPS_FILE);
 
     let mut cmd = Command::new(&drv.builder);
     cmd.args(&drv.args);
@@ -484,12 +527,24 @@ pub fn build(
     cmd.env("HOME", "/homeless-shelter");
     cmd.env("NIX_STORE", &store_dir_str);
     cmd.env("NIX_BUILD_CORES", "1");
-    for (k, v) in &drv.env {
-        cmd.env(k, v);
-    }
+    let mesboot_steps = configure_builder_env(
+        &mut cmd,
+        &drv.builder,
+        &drv.args,
+        &drv.env,
+        &mesboot_steps_file,
+    )?;
     for k in ["NIX_BUILD_TOP", "TMPDIR", "TEMPDIR", "TMP", "TEMP", "PWD"] {
         cmd.env(k, &build_dir);
     }
+
+    // Per-build resource caps (opt-in via TD_BUILD_MEM_MAX; OFF by default).
+    // The cgroup leaf — when an operator delegates one via TD_BUILD_CGROUP — is
+    // a true RSS cap; the setrlimit(RLIMIT_DATA) backstop applied in pre_exec
+    // works everywhere (rootless, CI). Both are inherited onto the PID-1 builder.
+    let mem_cap = parse_mem_max(std::env::var("TD_BUILD_MEM_MAX").ok());
+    let cgroup_leaf = mem_cap.and_then(setup_build_cgroup);
+    let cgroup_procs = cgroup_leaf.as_ref().map(|d| d.join("cgroup.procs"));
 
     unsafe {
         cmd.pre_exec(move || {
@@ -615,19 +670,19 @@ pub fn build(
             let _ = fs::remove_dir("/oldroot");
             // The build dir lives on the fresh /tmp tmpfs.
             fs::DirBuilder::new().mode(0o700).create(&build_dir_owned)?;
+            write_mesboot_steps_file(&mesboot_steps_file, mesboot_steps.as_deref())?;
             std::env::set_current_dir(&build_dir_owned)?;
             Ok(())
         });
     }
 
-    let status = cmd
-        .status()
-        .map_err(|e| err(format!("spawning builder {}: {e}", drv.builder)))?;
+    let status = cmd.status();
     // The build tree has exited, so the leaf cgroup is empty — tear it down
     // (best-effort) whether the build passed or failed, before any early return.
     if let Some(leaf) = &cgroup_leaf {
         let _ = fs::remove_dir(leaf);
     }
+    let status = status.map_err(|e| err(format!("spawning builder {}: {e}", drv.builder)))?;
     if !status.success() {
         return Err(err(format!(
             "builder for {drv_path} failed: {status}"
@@ -1141,6 +1196,134 @@ mod tests {
         fs::write(&item, b"tampered bytes").unwrap();
         let err = verify_staged_item(&vouched, canonical, on_disk).unwrap_err();
         assert!(err.to_string().contains("refusing to stage tampered bytes"), "{err}");
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn mesboot_steps_are_a_file_payload_not_an_exec_environment_value() {
+        let builder_store = crate::store::builder_identity_path();
+        let builder = format!("{builder_store}/bin/td-builder");
+        let args = vec!["mesboot-build".to_string()];
+        let large = "x".repeat(300 * 1024);
+        let env = vec![
+            ("TD_INPUT_MAP".to_string(), "{}".to_string()),
+            ("TD_STEPS".to_string(), large.clone()),
+        ];
+        let mut command = Command::new(&builder);
+        command.env_clear();
+        let steps_file = Path::new("/tmp/build/.td-steps.json");
+        let steps = configure_builder_env(
+            &mut command,
+            &builder,
+            &args,
+            &env,
+            steps_file,
+        )
+        .unwrap();
+        assert_eq!(steps.as_deref(), Some(large.as_str()));
+        assert!(
+            command
+                .get_envs()
+                .all(|(key, _)| key != std::ffi::OsStr::new("TD_STEPS")),
+            "TD_STEPS must not cross execve in the environment"
+        );
+        assert!(
+            command
+                .get_envs()
+                .any(|(key, value)| key == std::ffi::OsStr::new("TD_INPUT_MAP")
+                    && value == Some(std::ffi::OsStr::new("{}"))),
+            "ordinary derivation environment entries remain environment entries"
+        );
+        assert!(
+            command.get_envs().any(|(key, value)| {
+                key == std::ffi::OsStr::new(crate::build::MESBOOT_STEPS_FILE_ENV)
+                    && value == Some(steps_file.as_os_str())
+            }),
+            "the builder receives the absolute steps-file contract"
+        );
+        let mut missing = Command::new("/td/store/builder/bin/td-builder");
+        missing.env_clear();
+        assert!(
+            configure_builder_env(
+                &mut missing,
+                &builder,
+                &args,
+                &[],
+                steps_file,
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("missing its TD_STEPS file payload")
+        );
+        let mut other_builder = Command::new("/td/store/other/bin/builder");
+        other_builder.env_clear();
+        assert!(
+            configure_builder_env(
+                &mut other_builder,
+                "/td/store/other/bin/builder",
+                &args,
+                &env,
+                steps_file,
+            )
+            .unwrap()
+            .is_none()
+        );
+        assert!(
+            other_builder
+                .get_envs()
+                .any(|(key, value)| key == std::ffi::OsStr::new("TD_STEPS")
+                    && value == Some(std::ffi::OsStr::new(&large))),
+            "another builder's environment ABI must remain unchanged"
+        );
+        let mut untrusted_td_builder = Command::new("/td/store/other/bin/td-builder");
+        untrusted_td_builder.env_clear();
+        assert!(
+            configure_builder_env(
+                &mut untrusted_td_builder,
+                "/td/store/other/bin/td-builder",
+                &args,
+                &env,
+                steps_file,
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("not the stable td-builder identity"),
+            "a td-builder-shaped mesboot invocation must fail before execve"
+        );
+        for other_args in [
+            vec!["autotools-build".to_string()],
+            vec!["mesboot-build".to_string(), "extra".to_string()],
+        ] {
+            let mut other_command = Command::new(&builder);
+            other_command.env_clear();
+            assert!(
+                configure_builder_env(
+                    &mut other_command,
+                    &builder,
+                    &other_args,
+                    &env,
+                    steps_file,
+                )
+                .unwrap()
+                .is_none()
+            );
+            assert!(
+                other_command
+                    .get_envs()
+                    .any(|(key, _)| key == std::ffi::OsStr::new("TD_STEPS")),
+                "only the exact mesboot invocation uses the file handoff"
+            );
+        }
+        let dir =
+            std::env::temp_dir().join(format!("td-mesboot-steps-file-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(crate::build::MESBOOT_STEPS_FILE);
+        write_mesboot_steps_file(&path, steps.as_deref()).unwrap();
+        assert_eq!(
+            crate::build::consume_mesboot_steps_file(&path).unwrap(),
+            large
+        );
+        assert!(!path.exists(), "the composed handoff consumes its input file");
         fs::remove_dir_all(&dir).ok();
     }
 

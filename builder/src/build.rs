@@ -2496,21 +2496,42 @@ fn write_sha256_manifest(
         .map_err(|e| format!("sha256 manifest: write {}: {e}", output.display()))
 }
 
+pub(crate) const MESBOOT_STEPS_FILE: &str = ".td-steps.json";
+pub(crate) const MESBOOT_STEPS_FILE_ENV: &str = "TD_STEPS_FILE";
+
+pub(crate) fn consume_mesboot_steps_file(path: &Path) -> Result<String, String> {
+    let steps = fs::read_to_string(path)
+        .map_err(|e| format!("read mesboot steps input {}: {e}", path.display()))?;
+    fs::remove_file(path)
+        .map_err(|e| format!("remove mesboot steps input {}: {e}", path.display()))?;
+    Ok(steps)
+}
+
 /// mesboot-build — td's bootstrap-RUNG build "system" (#378 slices 2+3; sibling
 /// of `run`/`run_rust`/`run_cmake`/`run_stage0`). Executes the recipe's typed
-/// steps (TD_STEPS, data — see recipes/src/types.rs `Step`) over the staged
-/// inputs (TD_INPUT_MAP: lock name → store path, `{in:NAME}` templates). The
-/// engine interprets NO shell: a `run` step spawns its argv directly with the
-/// EXACT env given (cleared otherwise — the ladder's `env -i` + `MAKEFLAGS=`
-/// scrubbing as engine policy); configure scripts run because their argv names
-/// the declared bash input. `{jobs}` is the available parallelism (execution-
-/// time, not baked into the drv — the double-build repro oracle guards it).
+/// steps (materialized from the drv's `TD_STEPS` data; see recipes/src/types.rs
+/// `Step`) over the staged inputs (TD_INPUT_MAP: lock name → store path,
+/// `{in:NAME}` templates). The engine interprets NO shell: a `run` step spawns
+/// its argv directly with the EXACT env given (cleared otherwise — the ladder's
+/// `env -i` + `MAKEFLAGS=` scrubbing as engine policy); configure scripts run
+/// because their argv names the declared bash input. `{jobs}` is the available
+/// parallelism (execution-time, not baked into the drv — the double-build repro
+/// oracle guards it).
 pub fn run_mesboot() -> Result<(), String> {
     let out = env::var("out").map_err(|_| "out not set".to_string())?;
-    let steps_json = env::var("TD_STEPS").map_err(|_| "TD_STEPS not set".to_string())?;
+    let steps_file = env::var_os(MESBOOT_STEPS_FILE_ENV)
+        .ok_or_else(|| format!("{MESBOOT_STEPS_FILE_ENV} not set"))?;
+    let steps_path = Path::new(&steps_file);
+    let steps_json = consume_mesboot_steps_file(steps_path)?;
     let map_json = env::var("TD_INPUT_MAP").map_err(|_| "TD_INPUT_MAP not set".to_string())?;
-    let steps = crate::json::parse(&steps_json).map_err(|e| format!("TD_STEPS JSON: {e}"))?;
-    let steps = steps.as_arr().ok_or("TD_STEPS is not a JSON array")?;
+    let steps = crate::json::parse(&steps_json).map_err(|e| {
+        format!(
+            "TD_STEPS file {} ({} bytes) JSON: {e}",
+            steps_path.display(),
+            steps_json.len()
+        )
+    })?;
+    let steps = steps.as_arr().ok_or("TD_STEPS file is not a JSON array")?;
     let map = crate::json::parse(&map_json).map_err(|e| format!("TD_INPUT_MAP JSON: {e}"))?;
     let inputs: Vec<(String, String)> = match &map {
         Json::Obj(kvs) => kvs
@@ -2736,6 +2757,21 @@ mod tests {
 
     fn edit(from: &str, to: &str, expect: usize) -> (String, String, usize) {
         (from.to_string(), to.to_string(), expect)
+    }
+
+    #[test]
+    fn mesboot_steps_file_is_consumed_after_read() {
+        let dir = test_dir("steps-file");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(MESBOOT_STEPS_FILE);
+        let steps = format!("[{{\"payload\":\"{}\"}}]", "x".repeat(300 * 1024));
+        fs::write(&path, &steps).unwrap();
+        assert_eq!(consume_mesboot_steps_file(&path).unwrap(), steps);
+        assert!(
+            !path.exists(),
+            "the transport file must not be observable to recipe steps"
+        );
+        fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
