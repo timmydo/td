@@ -407,8 +407,107 @@ const TD_UTIL_APPLETS: &[&str] = &["clear", "which", "free", "ps", "dmesg"];
 const UUTILS_APPLETS: &[&str] = &[
     "uname", "ls", "cat", "echo", "printf", "pwd", "cp", "mv", "rm", "mkdir", "rmdir", "ln", "id",
     "env", "df", "du", "chmod", "chown", "sleep", "sync", "wc", "head", "tail", "sort", "date",
-    "whoami", "tty", "dd", "mktemp", "seq", "touch", "mknod", "kill", "readlink",
+    "whoami", "tty", "dd", "mktemp", "seq", "touch", "mknod", "kill", "readlink", "basename",
+    "dirname", "true", "false", "printenv", "link", "unlink",
 ];
+
+enum UutilsProbe {
+    Output {
+        applet: &'static str,
+        args: &'static str,
+        expected: &'static str,
+    },
+    Succeeds(&'static str),
+    Fails(&'static str),
+    Printenv,
+    Link,
+    Unlink,
+}
+
+const UUTILS_BEHAVIOR_PROBES: &[UutilsProbe] = &[
+    UutilsProbe::Output {
+        applet: "basename",
+        args: "/tmp/td-uutils-probe/source",
+        expected: "source",
+    },
+    UutilsProbe::Output {
+        applet: "dirname",
+        args: "/tmp/td-uutils-probe/source",
+        expected: "/tmp/td-uutils-probe",
+    },
+    UutilsProbe::Succeeds("true"),
+    UutilsProbe::Fails("false"),
+    UutilsProbe::Printenv,
+    UutilsProbe::Link,
+    UutilsProbe::Unlink,
+];
+
+impl UutilsProbe {
+    fn applet(&self) -> &'static str {
+        match self {
+            Self::Output { applet, .. } | Self::Succeeds(applet) | Self::Fails(applet) => applet,
+            Self::Printenv => "printenv",
+            Self::Link => "link",
+            Self::Unlink => "unlink",
+        }
+    }
+}
+
+/// Render one unprivileged `/bin` behavior check. The result is embedded in a
+/// single-quoted `su -c` script, so it must contain no single quotes.
+fn uutils_behavior_probe(probe: &UutilsProbe) -> String {
+    let applet = probe.applet();
+    match probe {
+        UutilsProbe::Output { args, expected, .. } => format!(
+            "if o=$(/bin/{applet} {args} 2>&1); then \
+             [ \"$o\" = \"{expected}\" ] || \
+             {{ echo \"uutils: /bin/{applet} returned unexpected output: $o\"; u=0; }}; \
+             else echo \"uutils: /bin/{applet} failed: $o\"; u=0; fi; "
+        ),
+        UutilsProbe::Succeeds(_) => format!(
+            "/bin/{applet} || \
+             {{ echo \"uutils: /bin/{applet} did not exit zero\"; u=0; }}; "
+        ),
+        UutilsProbe::Fails(_) => format!(
+            "o=$(/bin/{applet} 2>&1); s=$?; \
+             if [ \"$s\" != 1 ] || [ -n \"$o\" ]; then \
+             echo \"uutils: /bin/{applet} exited $s: $o\"; u=0; fi; "
+        ),
+        UutilsProbe::Printenv => format!(
+            "TD_UUTILS_PROBE=td-uutils-v1; export TD_UUTILS_PROBE; \
+             if o=$(/bin/{applet} TD_UUTILS_PROBE 2>&1); then \
+             [ \"$o\" = td-uutils-v1 ] || \
+             {{ echo \"uutils: /bin/{applet} returned unexpected output: $o\"; u=0; }}; \
+             else echo \"uutils: /bin/{applet} failed: $o\"; u=0; fi; "
+        ),
+        UutilsProbe::Link => format!(
+            "if /bin/printf \"%s\\n\" td-uutils-before > /tmp/td-uutils-probe/source; then \
+             if /bin/{applet} /tmp/td-uutils-probe/source /tmp/td-uutils-probe/hard; then \
+             if [ -h /tmp/td-uutils-probe/hard ]; then \
+             echo \"uutils: /bin/{applet} created a symbolic link\"; u=0; \
+             elif /bin/printf \"%s\\n\" td-uutils-after > /tmp/td-uutils-probe/source; then \
+             if o=$(/bin/cat /tmp/td-uutils-probe/hard 2>&1); then \
+             if [ \"$o\" = td-uutils-after ]; then h=1; \
+             else echo \"uutils: /bin/{applet} hard-link contents mismatch: $o\"; u=0; fi; \
+             else echo \"uutils: /bin/cat could not read hard link: $o\"; u=0; fi; \
+             else echo \"uutils: /bin/printf could not rewrite hard-link source\"; u=0; fi; \
+             else echo \"uutils: /bin/{applet} failed\"; u=0; fi; \
+             else echo \"uutils: /bin/printf could not seed hard-link source\"; u=0; fi; "
+        ),
+        UutilsProbe::Unlink => format!(
+            "if [ \"$h\" = 1 ]; then \
+             if /bin/{applet} /tmp/td-uutils-probe/hard; then \
+             if [ -e /tmp/td-uutils-probe/hard ] || \
+             [ -h /tmp/td-uutils-probe/hard ]; then \
+             echo \"uutils: /bin/{applet} left the directory entry present\"; u=0; fi; \
+             if o=$(/bin/cat /tmp/td-uutils-probe/source 2>&1); then \
+             [ \"$o\" = td-uutils-after ] || \
+             {{ echo \"uutils: /bin/{applet} source contents mismatch: $o\"; u=0; }}; \
+             else echo \"uutils: /bin/cat could not read source after unlink: $o\"; u=0; fi; \
+             else echo \"uutils: /bin/{applet} failed\"; u=0; fi; fi; "
+        ),
+    }
+}
 
 fn build_passwd(sys: &SystemDef) -> String {
     let mut s = String::new();
@@ -866,6 +965,10 @@ fn td_login_probe(sys: &SystemDef) -> String {
 /// reprinting a marker it already earned. `SYSTEM_BOOT_SUCCESS_MARKER` stays gated on the whole
 /// transaction, which is what it means.
 fn build_bootsuccess(sys: &SystemDef) -> String {
+    let mut uutils_behavior_probes = String::new();
+    for probe in UUTILS_BEHAVIOR_PROBES {
+        uutils_behavior_probes.push_str(&uutils_behavior_probe(probe));
+    }
     // These run under `su` as the unprivileged user, so the dmesg leg needs an unprivileged
     // /dev/kmsg read — which linux-x86-64 guarantees by pinning CONFIG_SECURITY_DMESG_RESTRICT
     // off. Drop dmesg from the farm and that pin is orphaned.
@@ -908,7 +1011,14 @@ fn build_bootsuccess(sys: &SystemDef) -> String {
          while [ \"$n\" -lt \"$wait\" ]; do \
          healthy=1; \
          if /bin/su -s /bin/sh {} -c \
-         '/bin/cat /etc/os-release >/dev/null 2>&1'; then \
+         'u=1; h=0; /bin/cat /etc/os-release >/dev/null 2>&1 || \
+         {{ echo \"uutils: /bin/cat failed\"; u=0; }}; \
+         /bin/rm -rf /tmp/td-uutils-probe; \
+         /bin/mkdir /tmp/td-uutils-probe || \
+         {{ echo \"uutils: /bin/mkdir could not create probe directory\"; u=0; }}; \
+         {uutils_behavior_probes}/bin/rm -rf /tmp/td-uutils-probe || \
+         {{ echo \"uutils: /bin/rm could not remove probe directory\"; u=0; }}; \
+         [ \"$u\" = 1 ]'; then \
          [ \"$mu\" = 1 ] || {{ echo {UUTILS_RUNTIME_MARKER}; mu=1; }}; else healthy=0; fi; \
          if /bin/su -s /bin/sh {} -c \
          'r=$(/bin/rg --color never --no-filename --fixed-strings --line-regexp -- \
@@ -2857,6 +2967,128 @@ mod tests {
             position("-t proc proc /proc") < firstboot,
             "td-firstboot reads /proc/mounts to refuse provisioning onto volatile storage, so \
              /proc must be mounted first"
+        );
+    }
+
+    #[test]
+    fn uutils_expansion_is_shipped_and_behavior_probed() {
+        let mut probed = std::collections::BTreeSet::new();
+        for probe in UUTILS_BEHAVIOR_PROBES {
+            let applet = probe.applet();
+            assert!(
+                UUTILS_APPLETS.contains(&applet),
+                "probed applet '{applet}' is not shipped in the uutils /bin farm"
+            );
+            assert!(
+                probed.insert(applet),
+                "uutils applet '{applet}' has duplicate behavior probes"
+            );
+        }
+
+        let bootsuccess = build_bootsuccess(&SYSTEM);
+        let mut rendered_probes = String::new();
+        for probe in UUTILS_BEHAVIOR_PROBES {
+            let applet = probe.applet();
+            let segment = uutils_behavior_probe(probe);
+            rendered_probes.push_str(&segment);
+            assert!(
+                !segment.contains('\''),
+                "the /bin/{applet} probe would break the enclosing single-quoted su script"
+            );
+            assert!(
+                bootsuccess.contains(&segment),
+                "the health target does not carry the generated /bin/{applet} probe"
+            );
+            if let UutilsProbe::Output { args, expected, .. } = probe {
+                for (label, value) in [("argument", *args), ("expected output", *expected)] {
+                    assert!(
+                        value.bytes().all(|byte| {
+                            byte.is_ascii_alphanumeric()
+                                || matches!(byte, b'/' | b'-' | b'.' | b'_')
+                        }),
+                        "/bin/{applet} {label} is not a shell-literal-safe token: {value:?}"
+                    );
+                }
+            }
+        }
+        for (contract, expected) in [
+            (
+                "basename exact output",
+                "if o=$(/bin/basename /tmp/td-uutils-probe/source 2>&1); then \
+                 [ \"$o\" = \"source\" ]",
+            ),
+            (
+                "dirname exact output",
+                "if o=$(/bin/dirname /tmp/td-uutils-probe/source 2>&1); then \
+                 [ \"$o\" = \"/tmp/td-uutils-probe\" ]",
+            ),
+            ("true zero status", "/bin/true ||"),
+            ("false captured status", "o=$(/bin/false 2>&1); s=$?;"),
+            (
+                "false exact status and output",
+                "if [ \"$s\" != 1 ] || [ -n \"$o\" ]; then",
+            ),
+            ("printenv exact lookup", "/bin/printenv TD_UUTILS_PROBE"),
+            (
+                "hard-link creation",
+                "/bin/link /tmp/td-uutils-probe/source /tmp/td-uutils-probe/hard",
+            ),
+            (
+                "hard link is not a symlink",
+                "if [ -h /tmp/td-uutils-probe/hard ]; then",
+            ),
+            (
+                "hard-link identity",
+                "if o=$(/bin/cat /tmp/td-uutils-probe/hard 2>&1); then \
+                 if [ \"$o\" = td-uutils-after ]; then h=1",
+            ),
+            (
+                "unlink removal",
+                "/bin/unlink /tmp/td-uutils-probe/hard",
+            ),
+            (
+                "unlink entry absence",
+                "if [ -e /tmp/td-uutils-probe/hard ] || \
+                 [ -h /tmp/td-uutils-probe/hard ]; then",
+            ),
+            (
+                "unlink source preservation",
+                "if o=$(/bin/cat /tmp/td-uutils-probe/source 2>&1); then \
+                 [ \"$o\" = td-uutils-after ]",
+            ),
+        ] {
+            assert!(
+                bootsuccess.contains(expected),
+                "the uutils probe does not enforce {contract}"
+            );
+        }
+        let link = UUTILS_BEHAVIOR_PROBES
+            .iter()
+            .position(|probe| matches!(probe, UutilsProbe::Link));
+        let unlink = UUTILS_BEHAVIOR_PROBES
+            .iter()
+            .position(|probe| matches!(probe, UutilsProbe::Unlink));
+        assert!(
+            matches!((link, unlink), (Some(link), Some(unlink)) if link < unlink),
+            "the link probe must create the hard link before unlink consumes it"
+        );
+        let gated_probes = format!(
+            "if /bin/su -s /bin/sh {user} -c \
+             'u=1; h=0; /bin/cat /etc/os-release >/dev/null 2>&1 || \
+             {{ echo \"uutils: /bin/cat failed\"; u=0; }}; \
+             /bin/rm -rf /tmp/td-uutils-probe; \
+             /bin/mkdir /tmp/td-uutils-probe || \
+             {{ echo \"uutils: /bin/mkdir could not create probe directory\"; u=0; }}; \
+             {rendered_probes}/bin/rm -rf /tmp/td-uutils-probe || \
+             {{ echo \"uutils: /bin/rm could not remove probe directory\"; u=0; }}; \
+             [ \"$u\" = 1 ]'; then \
+             [ \"$mu\" = 1 ] || {{ echo {UUTILS_RUNTIME_MARKER}; mu=1; }}; \
+             else healthy=0; fi;",
+            user = SYSTEM.autologin
+        );
+        assert!(
+            bootsuccess.contains(&gated_probes),
+            "the complete unprivileged behavior probe must gate the uutils marker"
         );
     }
 

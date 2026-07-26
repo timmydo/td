@@ -76,7 +76,7 @@ const EROFS_PROBE_CONTENT: &str = td_recipe::ladder::EROFS_PROBE_CONTENT;
 /// line and the oracle key can never desync.
 const GREETER_MARKER: &str = td_recipe::ladder::GREETER_MARKER;
 
-/// Printed by the root-owned health target after an unprivileged uutils invocation.
+/// Printed after unprivileged uutils behavior probes pass; shape checks cover only static closure.
 const UUTILS_RUNTIME_MARKER: &str = td_recipe::ladder::UUTILS_RUNTIME_MARKER;
 
 /// Printed after unprivileged ripgrep and fd searches return exact expected results.
@@ -1062,12 +1062,12 @@ fn validate_system_boot(
     if !result.evidence.uutils_runtime {
         return Err(format!(
             "the greeter was reached and root checks passed, but the uutils runtime marker \
-             ({UUTILS_RUNTIME_MARKER:?}) was absent — running a uutils applet (`/bin/cat`) by \
-             absolute path did not exit 0, so the dynamically-linked coreutils multicall's \
-             runtime closure (ELF interp, glibc, libgcc_s) does not resolve on the erofs root \
-             even though the static shape scan passed. This is the DT_NEEDED-soname residual the \
-             build-time scan cannot see. Each health leg emits its own marker, so this absence \
-             localizes to uutils. Last serial output:\n{}",
+             ({UUTILS_RUNTIME_MARKER:?}) was absent — a named unprivileged uutils probe failed \
+             its exact output, exit-status, environment, or hard-link mutation contract, or the \
+             dynamically-linked coreutils runtime closure (ELF interp, glibc, libgcc_s) does not \
+             resolve on the erofs root. Static shape checks cannot see that runtime DT_NEEDED \
+             failure. The guest console names the failed applet. Each health leg emits its own \
+             marker, so this absence localizes to uutils. Last serial output:\n{}",
             tail(&result.console, 80)
         ));
     }

@@ -33,5 +33,6 @@ pub fn recipe() -> Recipe {
             "mkdir", "rmdir", "ln", "id", "env", "df", "du", "chmod", "chown",
             "sleep", "sync", "wc", "head", "tail", "sort", "date", "whoami",
             "tty", "dd", "mktemp", "seq", "touch", "mknod", "kill", "readlink",
+            "basename", "dirname", "true", "false", "printenv", "link", "unlink",
         ])
 }
