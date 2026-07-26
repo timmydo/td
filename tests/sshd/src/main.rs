@@ -2,18 +2,24 @@
 // plus a self-contained `selftest` that doubles as the boot oracle.
 //
 //   sshd serve    [--listen ADDR] [--host-key PATH] [--authorized-keys PATH]
+//   sshd keygen   --host-key PATH --public-key PATH
 //   sshd selftest
 //
 // `serve` runs the real daemon: it accepts SSH connections, authorizes ONLY the
 // public keys listed in --authorized-keys (a missing/empty file => deny all),
 // and runs each `exec` request through /bin/sh -c, returning its stdout, stderr,
-// and exit status. `selftest` stands up an in-process server on an ephemeral
+// and exit status. `keygen` provisions the per-machine ed25519 host identity that
+// `serve` then presents — td-firstboot calls it at every sysinit, so it is
+// idempotent. `selftest` stands up an in-process server on an ephemeral
 // 127.0.0.1 port and connects a client to it over real loopback TCP, proving the
 // kernel's TCP/IP stack, the russh handshake+auth+channel+exec path, and the
 // shipped runtime closure all work — it prints the boot marker on success and
 // touches neither /bin/sh nor the shipped authorized-keys file.
 use std::collections::HashSet;
+use std::io::Read;
 use std::net::SocketAddr;
+use std::os::unix::fs::OpenOptionsExt;
+use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
@@ -33,7 +39,9 @@ const OK_MARKER: &str = "TD-SSHD-OK";
 // an access credential: the real daemon authorizes only --authorized-keys, and
 // this key is never written there. Because it is public it must not serve as a
 // host identity a client could trust, so `serve` refuses to fall back to it once
-// authorized keys exist. Per-machine persisted host keys are the follow-up.
+// authorized keys exist. `keygen` below is what mints the real per-machine
+// identity td-firstboot persists into /var, so on a provisioned machine this key
+// is only ever the selftest's.
 const BUILTIN_KEY: &str = "-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAAAAtzc2gtZW\nQyNTUxOQAAACCIPJHhaH8qIsFU2QJi0O7p3lKaZnJq8tbL/8CtmQ0wrwAAAJCaC52Mmgud\njAAAAAtzc2gtZWQyNTUxOQAAACCIPJHhaH8qIsFU2QJi0O7p3lKaZnJq8tbL/8CtmQ0wrw\nAAAEAbUmkQe16m+pWjFZz5pn7XbR4ciX0nger8vt4v9H/LPIg8keFofyoiwVTZAmLQ7une\nUppmcmry1sv/wK2ZDTCvAAAADXRkLXJ1c3NoLXRlc3Q=\n-----END OPENSSH PRIVATE KEY-----\n";
 
 // One connection's server state: the SHA-256 fingerprints of the authorized
@@ -153,6 +161,7 @@ async fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
     match args.get(1).map(String::as_str) {
         Some("serve") | None => serve(args.get(2..).unwrap_or(&[])).await,
+        Some("keygen") => keygen(args.get(2..).unwrap_or(&[])),
         Some("selftest") => selftest().await,
         Some("-h") | Some("--help") | Some("help") => {
             print_usage();
@@ -160,14 +169,15 @@ async fn main() -> Result<()> {
         }
         Some(other) => {
             print_usage();
-            bail!("td-sshd: unknown mode `{other}` (want serve|selftest)");
+            bail!("td-sshd: unknown mode `{other}` (want serve|keygen|selftest)");
         }
     }
 }
 
 fn print_usage() {
     eprintln!(
-        "usage:\n  sshd serve [--listen ADDR] [--host-key PATH] [--authorized-keys PATH]\n  sshd selftest"
+        "usage:\n  sshd serve [--listen ADDR] [--host-key PATH] [--authorized-keys PATH]\n  \
+         sshd keygen --host-key PATH --public-key PATH\n  sshd selftest"
     );
 }
 
@@ -237,6 +247,159 @@ async fn serve(args: &[String]) -> Result<()> {
         use_shell: true,
     };
     srv.run_on_socket(cfg, &listener).await?;
+    Ok(())
+}
+
+// The comment baked into a generated host key. Not a hostname: this file is
+// written before the machine has any identity BUT this key, and a comment that
+// varied with hostname or clock would make the artifact needlessly unstable.
+const HOST_KEY_COMMENT: &str = "td-sshd-host-key";
+
+// Provision the per-machine ed25519 SSH host identity. td-firstboot runs this at
+// EVERY sysinit, so it is idempotent by construction: a host key that silently
+// rotated would be a host key no client could pin, which is the entire reason to
+// persist one.
+//
+// Entropy is 32 bytes read through plain `std::fs`. An ed25519 private key IS its
+// 32-byte seed, so the kernel CSPRNG's bytes are the key material with nothing
+// derived in between — no RNG crate needed, and the daemon's dependency set stays
+// exactly the reviewed russh closure (AGENTS.md directive 2).
+//
+// /dev/random, NOT /dev/urandom: td-firstboot calls this at early sysinit, where
+// urandom would hand out bytes from a CRNG that is not yet seeded and a fleet
+// first-booting one image could mint correlated host keys. Since Linux 5.6
+// /dev/random blocks only until the CRNG is initialized and is otherwise identical.
+//
+// The private key is the single source of truth: the public file is re-derived
+// from it every run, so a first boot interrupted between the two self-heals. A
+// private key that EXISTS but does not parse is a hard error, NEVER a silent
+// regeneration — discarding a machine's identity because one read went wrong is
+// the failure this whole path exists to prevent.
+//
+// Prints `created <fingerprint>` or `existing <fingerprint>` on stdout; that first
+// word is what td-firstboot reports as provisioned-vs-stable, and the fingerprint
+// is what the boot oracle compares across reboots.
+fn keygen(args: &[String]) -> Result<()> {
+    let mut private_path: Option<String> = None;
+    let mut public_path: Option<String> = None;
+    let mut it = args.iter();
+    while let Some(flag) = it.next() {
+        let val = || -> Result<String> {
+            it.clone()
+                .next()
+                .cloned()
+                .with_context(|| format!("flag `{flag}` needs a value"))
+        };
+        match flag.as_str() {
+            "--host-key" => {
+                private_path = Some(val()?);
+                it.next();
+            }
+            "--public-key" => {
+                public_path = Some(val()?);
+                it.next();
+            }
+            other => bail!("td-sshd keygen: unknown flag `{other}`"),
+        }
+    }
+    let private_path = private_path.context("td-sshd keygen: --host-key PATH is required")?;
+    let public_path = public_path.context("td-sshd keygen: --public-key PATH is required")?;
+
+    let existing = match std::fs::read_to_string(&private_path) {
+        Ok(pem) => Some(pem),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(e).with_context(|| format!("read host key {private_path}")),
+    };
+    let (key, state) = match existing {
+        Some(pem) => {
+            let key = PrivateKey::from_openssh(&pem).with_context(|| {
+                format!(
+                    "parse the host key already at {private_path}; refusing to replace it - move \
+                     it aside deliberately if it is unrecoverable"
+                )
+            })?;
+            (key, "existing")
+        }
+        None => {
+            let mut seed = [0u8; 32];
+            std::fs::File::open("/dev/random")
+                .context("open /dev/random")?
+                .read_exact(&mut seed)
+                .context("read 32 seed bytes from /dev/random")?;
+            let key = PrivateKey::new(
+                ssh_key::private::KeypairData::Ed25519(ssh_key::private::Ed25519Keypair::from_seed(
+                    &seed,
+                )),
+                HOST_KEY_COMMENT,
+            )
+            .context("assemble the ed25519 host key")?;
+            let pem = key
+                .to_openssh(ssh_key::LineEnding::LF)
+                .context("encode the host key as OpenSSH PEM")?;
+            write_durably(&private_path, pem.as_bytes(), 0o600)?;
+            (key, "created")
+        }
+    };
+
+    // Re-derive the public file from the private key and rewrite it only when it
+    // does not already say exactly that — so a repaired .pub is possible without
+    // making every boot a write to persistent storage.
+    let want = format!(
+        "{}\n",
+        key.public_key()
+            .to_openssh()
+            .context("encode the host public key")?
+    );
+    if std::fs::read_to_string(&public_path).ok().as_deref() != Some(want.as_str()) {
+        write_durably(&public_path, want.as_bytes(), 0o644)?;
+    }
+    println!("{state} {}", key.fingerprint(HashAlg::Sha256));
+    Ok(())
+}
+
+// Write bytes to `path` through a same-directory temporary, then rename. The
+// rename is atomic, so no reader (and no interrupted boot) can observe a
+// half-written host key — a truncated private key would be unparseable, and
+// `keygen` deliberately refuses to regenerate over one. `mode` is set at CREATE
+// time, not chmod'd afterwards, so a 0600 key is never briefly world-readable.
+// Both the file and its directory are fsync'd: the rename must be on disk before
+// the boot that generated the key continues, or a crash could lose the identity
+// while the rest of the system carried on as if it had one.
+fn write_durably(path: &str, bytes: &[u8], mode: u32) -> Result<()> {
+    use std::io::Write as _;
+
+    let target = Path::new(path);
+    let dir = target
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let mut temp = target.as_os_str().to_owned();
+    temp.push(".new");
+    let temp = std::path::PathBuf::from(temp);
+
+    // Unlink any leftover from an interrupted run and create EXCLUSIVELY: reusing
+    // an existing temp would keep ITS mode (OpenOptions only applies `mode` when it
+    // creates the file), which is how a 0600 private key ends up 0644.
+    match std::fs::remove_file(&temp) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e).with_context(|| format!("clear stale {}", temp.display())),
+    }
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(mode)
+        .open(&temp)
+        .with_context(|| format!("create {}", temp.display()))?;
+    file.write_all(bytes)
+        .and_then(|()| file.sync_all())
+        .with_context(|| format!("write {}", temp.display()))?;
+    drop(file);
+    std::fs::rename(&temp, target)
+        .with_context(|| format!("rename {} into place as {path}", temp.display()))?;
+    std::fs::File::open(dir)
+        .and_then(|d| d.sync_all())
+        .with_context(|| format!("fsync {}", dir.display()))?;
     Ok(())
 }
 

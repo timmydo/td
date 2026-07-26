@@ -3,7 +3,8 @@ use crate::ladder::{
     BOOT_SUCCESS_WAIT_CMDLINE_PREFIX, DEPLOY_INSTALL_CMDLINE_TOKEN, GREETER_MARKER,
     NETTEST_CMDLINE_TOKEN, NETTEST_DEFAULT_HOST, NETTEST_DEFAULT_PORT, PERSIST_READ_CMDLINE_TOKEN,
     PERSIST_WRITE_CMDLINE_TOKEN, RIPGREP_FD_RUNTIME_MARKER, SH, SSHD_MARKER,
-    SYSTEM_BOOT_SUCCESS_MARKER, SYSTEM_DEPLOY_INSTALL_MARKER, SYSTEM_ETC_RO_MARKER,
+    SYSTEM_BOOT_SUCCESS_MARKER, SYSTEM_DEPLOY_INSTALL_MARKER, SYSTEM_ETC_MUTABLE_MARKER,
+    SYSTEM_ETC_RO_MARKER,
     SYSTEM_NET_REACH_MARKER, SYSTEM_NET_RESOLVE_MARKER, SYSTEM_NET_UP_MARKER,
     SYSTEM_PERSIST_READ_MARKER, SYSTEM_PERSIST_WRITE_MARKER, SYSTEM_ROOT_RO_MARKER,
     SYSTEM_SHUTDOWN_MARKER, SYSTEM_STATE_OWNER_MARKER, SYSTEM_STATE_WRITABLE_MARKER,
@@ -37,8 +38,11 @@ const BOOT_FAIL_PARKED: &str = "td-boot-parked-v1";
 // current/previous from the Btrfs volume and kexecs the selected deployment.
 // That deployment's distinct initramfs requires the td.deployment handoff,
 // re-verifies root.erofs, binds it to a read-only loop device, mounts @var from
-// Btrfs, and switch_roots. `/etc` stays deployment-owned and immutable; `/home`
-// and `/root` are root-image symlinks into `/var`. The real root is
+// Btrfs, and switch_roots. `/etc` stays deployment-owned and immutable, with ONE
+// reviewed symlink per mutable file out to writable state (the `MUTABLE_ETC` table
+// below) rather than an overlay — so the read-only-`/etc` assertion survives while
+// per-machine identity still persists; `/home` and `/root` are root-image symlinks
+// into `/var`. The real root is
 // the store-native real root (busybox, uutils, ripgrep, and fd at their /td/store
 // paths, a /bin symlink farm, and generated /etc). The typed PackErofs step invokes
 // the dependency-free control-plane image writer directly; no recipe process can
@@ -395,27 +399,40 @@ fn build_inittab() -> String {
     // token, self-tests resolve + reach. td-netd writes resolv.conf/hosts through /etc
     // symlinks into that /run.
     //
+    // /bin/td-firstboot runs at sysinit BEFORE rootcheck, netup, and sshd, because it
+    // mints the per-machine identity they read or check: td-init runs every sysinit job
+    // to completion before starting a `respawn` line, so that ordering is the only
+    // synchronisation needed. Running before rootcheck is what lets rootcheck assert the
+    // identity is READABLE through the MUTABLE_ETC symlinks on a still-read-only /etc.
+    //
     // sshd runs as an init-managed `respawn` service AFTER netup (so loopback and any
     // external link are already up): it binds all interfaces on port 22 (privileged, so it
-    // runs as root) and authorizes only /etc/ssh/authorized_keys (shipped empty => deny-all
-    // until keys are provisioned). A correctly-binding daemon never exits, so respawn does
-    // not loop; if it ever did, init restarts it rather than leaving the box without sshd.
+    // runs as root), presents the PER-MACHINE host key, and authorizes only per-machine
+    // /etc/ssh/authorized_keys (created empty => deny-all until an operator adds a key). A
+    // correctly-binding daemon never exits, so respawn does not loop.
+    //
+    // Naming --host-key is FAIL-CLOSED on purpose: with no identity sshd refuses to start
+    // rather than fall back to the public committed builtin key, and td-init's respawn
+    // throttle holds the job rather than scrolling the console.
     //
     // There is no `ctrlaltdel` or `shutdown` line: td-init supervises with NO signals (a
     // blocking wait4 IS its event loop), so both actions are signal contracts it cannot
     // honour and would only be rejected at boot as unsupported. The teardown they used to
     // reach lives in /etc/tty-session instead — see build_tty_session.
-    "::sysinit:/bin/mount -t devtmpfs devtmpfs /dev\n\
-     ::sysinit:/bin/mount -t proc proc /proc\n\
-     ::sysinit:/bin/mount -t sysfs sysfs /sys\n\
-     ::sysinit:/bin/hostname -F /etc/hostname\n\
-     ::sysinit:/etc/rootcheck\n\
-     ::sysinit:/etc/netup\n\
-     ::once:/etc/bootsuccess\n\
-     ::once:/etc/bootfail\n\
-     ::respawn:/bin/sshd serve --listen 0.0.0.0:22 --authorized-keys /etc/ssh/authorized_keys\n\
-     ttyS0::respawn:/etc/tty-session\n"
-        .into()
+    format!(
+        "::sysinit:/bin/mount -t devtmpfs devtmpfs /dev\n\
+         ::sysinit:/bin/mount -t proc proc /proc\n\
+         ::sysinit:/bin/mount -t sysfs sysfs /sys\n\
+         ::sysinit:/bin/hostname -F /etc/hostname\n\
+         ::sysinit:/bin/td-firstboot provision\n\
+         ::sysinit:/etc/rootcheck\n\
+         ::sysinit:/etc/netup\n\
+         ::once:/etc/bootsuccess\n\
+         ::once:/etc/bootfail\n\
+         ::respawn:/bin/sshd serve --listen 0.0.0.0:22 --host-key {SSHD_HOST_KEY} \
+         --authorized-keys {SSHD_AUTHORIZED_KEYS}\n\
+         ttyS0::respawn:/etc/tty-session\n"
+    )
 }
 
 /// The firmware/direct-boot initramfs always selects through td-boot and kexecs
@@ -604,6 +621,7 @@ fn build_rootcheck(sys: &SystemDef) -> String {
          [ \"$(/bin/busybox readlink /root)\" = var/root ] || ok=0\n\
          [ \"$(/bin/busybox readlink /var/run)\" = /run ] || ok=0\n",
     );
+    s.push_str(&build_mutable_etc_check(sys));
     let mut probe_paths = "/var /run /tmp /home /root".to_string();
     for user in sys.users {
         if user.home != "/root" {
@@ -645,6 +663,65 @@ fn build_rootcheck(sys: &SystemDef) -> String {
          && /bin/busybox test \"$(/bin/busybox cat /var/lib/td/boot-marker 2>/dev/null)\" = td-persistent-v1; then \
          echo {SYSTEM_PERSIST_READ_MARKER}; \
          fi\n"
+    ));
+    s
+}
+
+/// The mutable-`/etc` contract, checked on the RUNNING system rather than only in the
+/// staged image — the half of this design that a build check cannot reach.
+///
+/// Emitted from `/etc/rootcheck`, which runs at sysinit right AFTER `td-firstboot`, so
+/// the persistent targets exist by now while the volatile ones do not (td-netd writes
+/// those later in the same sequence). Its own flag, not `rootcheck`'s `ok`: folding it
+/// in would make one firstboot failure withhold the unrelated state-writable marker and
+/// send whoever reads the console after the wrong component (the lesson
+/// `build_bootsuccess` records).
+///
+/// The private-key leg is a BEHAVIOURAL mode check rather than a `stat` comparison: the
+/// unprivileged login user must be unable to read the host key and able to read its
+/// `.pub`. That is the property that actually matters, and busybox ships no `stat`.
+fn build_mutable_etc_check(sys: &SystemDef) -> String {
+    let mut s = String::from("me=1\n");
+    for entry in MUTABLE_ETC {
+        // Every entry: the symlink must say exactly what the table records. A
+        // symlink that moved is a file whose writes land somewhere unreviewed.
+        s.push_str(&format!(
+            "[ \"$(/bin/busybox readlink /etc/{})\" = {} ] || me=0\n",
+            entry.etc, entry.target
+        ));
+        // Persistent entries only: td-firstboot has already run, so these must
+        // RESOLVE — which is the proof that a read through the read-only /etc
+        // reaches writable /var.
+        if entry.state == State::Persistent {
+            s.push_str(&format!(
+                "/bin/busybox test -f /etc/{} || me=0\n",
+                entry.etc
+            ));
+        }
+    }
+    // The id must be the shape every reader expects, read back THROUGH /etc.
+    s.push_str(
+        "/bin/busybox grep -Eq '^[0-9a-f]{32}$' /etc/machine-id || me=0\n",
+    );
+    if let Some(user) = sys.users.iter().find(|user| user.name == sys.autologin) {
+        if user.uid != 0 {
+            // ONE su, and the marker requires it to SUCCEED. Splitting this into a
+            // negative probe (`if su …; then me=0; fi`) would fail OPEN: `su` itself
+            // failing for any unrelated reason would look exactly like a private key
+            // that is correctly unreadable, and pass. Here a broken `su` is a
+            // non-zero exit and withholds the marker, while a passing run has proved
+            // both halves — the private key is NOT readable and the `.pub` IS.
+            s.push_str(&format!(
+                "if /bin/busybox su -s /bin/sh {name} -c \
+                 'if /bin/busybox cat {key} >/dev/null 2>&1; then exit 1; fi; \
+                 /bin/busybox cat {key}.pub >/dev/null 2>&1'; then :; else me=0; fi\n",
+                name = user.name,
+                key = SSHD_HOST_KEY,
+            ));
+        }
+    }
+    s.push_str(&format!(
+        "if [ \"$me\" = 1 ]; then echo {SYSTEM_ETC_MUTABLE_MARKER}; fi\n"
     ));
     s
 }
@@ -849,6 +926,150 @@ fn build_os_release(sys: &SystemDef) -> String {
     )
 }
 
+/// Whether a mutable `/etc` file's real bytes have to survive a reboot.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum State {
+    /// Rebuilt from nothing every boot by its owner, so the target lives on the
+    /// `/run` tmpfs and is absent at the start of each boot.
+    Volatile,
+    /// Per-machine identity on the persistent Btrfs `@var` subvolume. Minted once
+    /// by `/bin/td-firstboot` and thereafter never rewritten.
+    Persistent,
+}
+
+/// One reviewed hole in the immutable `/etc`.
+///
+/// `/etc` is deployment-owned content inside the read-only erofs image, and
+/// `SYSTEM_ETC_RO_MARKER` is the boot-time assertion that it rejects writes even
+/// from root. A writable `/etc` overlay would retire that assertion for the WHOLE
+/// directory in exchange for mutability in a handful of files. So each mutable file
+/// is instead one symlink out of `/etc` into writable state, named here with its
+/// owner and the reason it cannot be image content — and this table is the only way
+/// to add another: the staging steps and `shape_check` are both generated from it,
+/// and the shape check additionally proves that no OTHER entry under `/etc` is a
+/// symlink, because the invariant is only as strong as the list of holes in it.
+///
+/// `/home` and `/root` are NOT here: those are whole directories rather than
+/// config, and they are staged separately (see `real_root_steps`).
+struct MutableEtc {
+    /// Path under `/etc` — the stable name every reader uses.
+    etc: &'static str,
+    /// Absolute symlink target: under `/run` for `Volatile`, under `/var/lib/td`
+    /// (td-firstboot's state dir) for `Persistent`.
+    target: &'static str,
+    state: State,
+    /// Who writes the target, and why this cannot be image content. The reason has
+    /// to be that the content differs PER MACHINE or PER BOOT; anything that can be
+    /// identical everywhere belongs in the image, where it is immutable.
+    why: &'static str,
+}
+
+/// td-firstboot's state directory, which every `Persistent` target above is under.
+/// Test-only because the targets are `const` literals (there is no const `format!`)
+/// — its whole job is to be the thing
+/// `firstboot_and_the_mutable_etc_table_agree_on_every_path` checks the table and
+/// that crate's own source against.
+#[cfg(test)]
+const STATE_DIR: &str = "/var/lib/td";
+
+const MUTABLE_ETC: &[MutableEtc] = &[
+    MutableEtc {
+        etc: "resolv.conf",
+        target: "/run/resolv.conf",
+        state: State::Volatile,
+        why: "td-netd writes this boot's DHCP-supplied nameservers",
+    },
+    MutableEtc {
+        etc: "hosts",
+        target: "/run/hosts",
+        state: State::Volatile,
+        why: "td-netd writes this boot's own address mapping",
+    },
+    MutableEtc {
+        etc: "machine-id",
+        target: "/var/lib/td/machine-id",
+        state: State::Persistent,
+        why: "one image boots many machines; a baked id would make them all the same machine",
+    },
+    MutableEtc {
+        etc: "ssh/ssh_host_ed25519_key",
+        target: "/var/lib/td/ssh/ssh_host_ed25519_key",
+        state: State::Persistent,
+        why: "a baked host key is a host identity every holder of the image can impersonate",
+    },
+    MutableEtc {
+        etc: "ssh/ssh_host_ed25519_key.pub",
+        target: "/var/lib/td/ssh/ssh_host_ed25519_key.pub",
+        state: State::Persistent,
+        why: "the fingerprint an operator pins, re-derived from the per-machine private key",
+    },
+    MutableEtc {
+        etc: "ssh/authorized_keys",
+        target: "/var/lib/td/ssh/authorized_keys",
+        state: State::Persistent,
+        why: "granting admin access is a per-machine act; an image-baked file would grant it \
+              on every machine that boots the image, and only a rebuild could revoke it",
+    },
+];
+
+/// The two `/etc` paths the sshd service line names. Both are `MUTABLE_ETC`
+/// entries — `the_sshd_service_reads_only_mutable_etc_paths` proves it — so the
+/// daemon presents a per-machine host identity and authorizes from per-machine
+/// state.
+const SSHD_HOST_KEY: &str = "/etc/ssh/ssh_host_ed25519_key";
+const SSHD_AUTHORIZED_KEYS: &str = "/etc/ssh/authorized_keys";
+
+/// Directories that must exist under `/etc` to hold the table's symlinks, and the
+/// globs `shape_check` sweeps for symlinks that are not in the table. Derived from
+/// the table so a new entry in a new subdirectory extends both.
+fn mutable_etc_dirs() -> Vec<&'static str> {
+    let mut dirs = Vec::new();
+    for entry in MUTABLE_ETC {
+        if let Some((dir, _)) = entry.etc.rsplit_once('/') {
+            if !dirs.contains(&dir) {
+                dirs.push(dir);
+            }
+        }
+    }
+    dirs
+}
+
+/// `/etc/mutable-state` — the reviewed list of every `/etc` path that is NOT
+/// immutable image content, written into the image as an ordinary (immutable) file.
+///
+/// The table above already decides the symlinks, so shipping it as text costs one
+/// small file and answers, ON the machine, the question the design provokes: why is
+/// this one file not immutable like the rest of `/etc`, and where do its writes go?
+/// `shape_check` asserts every table entry appears here, so the answer cannot go
+/// stale.
+fn build_mutable_state() -> String {
+    let mut s = String::from(
+        "# Every /etc path that is NOT immutable image content.\n\
+         #\n\
+         # /etc is a read-only erofs directory (proved on each boot by /etc/rootcheck)\n\
+         # and there is deliberately NO /etc overlay: each line below is one reviewed\n\
+         # symlink out of it, so the set of mutable files is a fixed, auditable list\n\
+         # rather than a whole writable directory.\n\
+         #\n\
+         # volatile  = /run tmpfs, rebuilt every boot by td-netd\n\
+         # persistent = /var Btrfs subvolume, minted once per machine by td-firstboot\n\
+         #\n\
+         # <path>  <state>  <target>\n\
+         #     why it cannot be image content\n",
+    );
+    for entry in MUTABLE_ETC {
+        let state = match entry.state {
+            State::Volatile => "volatile",
+            State::Persistent => "persistent",
+        };
+        s.push_str(&format!(
+            "{}  {state}  {}\n    {}\n",
+            entry.etc, entry.target, entry.why
+        ));
+    }
+    s
+}
+
 /// The generated /etc files (config + the login-glue and boot-check scripts). `exec`
 /// marks the ones getty/init reference as executables. Shared by the real-root staging
 /// (written under `{root}/real-root/etc`) and the shape check (which asserts they landed).
@@ -859,6 +1080,7 @@ fn etc_files(sys: &SystemDef) -> Vec<(&'static str, String, bool)> {
         ("shadow", build_shadow(sys), false),
         ("hostname", format!("{}\n", sys.hostname), false),
         ("os-release", build_os_release(sys), false),
+        ("mutable-state", build_mutable_state(), false),
         ("inittab", build_inittab(), false),
         ("profile", build_profile(sys), false),
         // Executable glue (mode 0755): getty execs autologin; init respawns tty-session
@@ -994,6 +1216,14 @@ fn real_root_steps(sys: &SystemDef) -> Vec<Step> {
         from: "{in:td-init}".into(),
         dest: "{root}/real-root{in:td-init}".into(),
     });
+    // td-firstboot is static too, and here the empty closure matters for the same
+    // reason it does for td-util: this runs at sysinit on a machine with no identity
+    // yet, and a provisioning tool that needs a working closure cannot report why
+    // the machine has none.
+    steps.push(Step::CopyTree {
+        from: "{in:td-firstboot}".into(),
+        dest: "{root}/real-root{in:td-firstboot}".into(),
+    });
     // Stage the dynamically linked userland and every transitively referenced store item
     // at its canonical absolute path. uutils, ripgrep, and fd pull their td glibc closure;
     // sshd additionally pulls the aws-lc crypto C lib. The engine admits only direct recipe
@@ -1053,6 +1283,12 @@ fn real_root_steps(sys: &SystemDef) -> Vec<Step> {
         target: "{in:td-boot}/bin/td-boot".into(),
         link: "{root}/real-root/bin/td-boot".into(),
     });
+    // /bin/td-firstboot — a single static binary, not a multicall, so it is its own
+    // /bin entry. The inittab runs it at sysinit; nothing else invokes it.
+    steps.push(Step::Symlink {
+        target: "{in:td-firstboot}/bin/td-firstboot".into(),
+        link: "{root}/real-root/bin/td-firstboot".into(),
+    });
     // /bin/td-util is the multicall's own entry (`td-util <applet>`, and `--list`); the loop
     // below is the argv[0] farm the diagnostics names resolve through.
     steps.push(Step::Symlink {
@@ -1077,13 +1313,21 @@ fn real_root_steps(sys: &SystemDef) -> Vec<Step> {
             link: format!("{{root}}/real-root/bin/{app}"),
         });
     }
-    // resolv.conf and hosts live at /etc but are SYMLINKS into the writable /run
-    // tmpfs, so td-netd can (re)write them under the read-only erofs /etc. They are
-    // deliberately dangling at build time; td-netd creates the /run targets at boot.
-    for name in ["resolv.conf", "hosts"] {
+    // The mutable /etc: one symlink per reviewed MUTABLE_ETC entry, out of the
+    // read-only erofs /etc into writable state. Every one is deliberately DANGLING
+    // at build time — the volatile targets are written each boot by td-netd, the
+    // persistent ones once per machine by td-firstboot. A dangling symlink is the
+    // correct shipped state: it is what makes "this file is per-machine" a property
+    // of the image rather than a convention.
+    for dir in mutable_etc_dirs() {
+        steps.push(Step::MkDir {
+            path: format!("{{root}}/real-root/etc/{dir}"),
+        });
+    }
+    for entry in MUTABLE_ETC {
         steps.push(Step::Symlink {
-            target: format!("/run/{name}"),
-            link: format!("{{root}}/real-root/etc/{name}"),
+            target: entry.target.into(),
+            link: format!("{{root}}/real-root/etc/{}", entry.etc),
         });
     }
     // The sshd daemon: a single (non-multicall) dynamically-linked binary. /bin/sshd
@@ -1101,19 +1345,6 @@ fn real_root_steps(sys: &SystemDef) -> Vec<Step> {
             exec,
         });
     }
-    // /etc/ssh/authorized_keys — the daemon's ONLY authorization source. Shipped EMPTY
-    // (comment only) so a fresh image denies every login until an operator provisions keys
-    // into this immutable-/etc file; the daemon fails closed on a missing/empty file.
-    steps.push(Step::MkDir {
-        path: "{root}/real-root/etc/ssh".into(),
-    });
-    steps.push(Step::WriteFile {
-        path: "{root}/real-root/etc/ssh/authorized_keys".into(),
-        content: "# td-sshd authorized_keys — one OpenSSH public key per line.\n\
-                  # Empty => deny all. /etc is immutable; rebuild the image to change this.\n"
-            .into(),
-        exec: false,
-    });
     steps
 }
 
@@ -1171,12 +1402,32 @@ fn shape_check() -> String {
      [ -f \"$root/init\" ] || [ -L \"$root/init\" ] || { echo 'root tree: /init missing' >&2; exit 1; }; \
      case $(readlink \"$root/init\") in /td/store/*) : ;; *) echo 'root tree: /init is not a symlink into /td/store' >&2; exit 1;; esac; \
      case $(readlink \"$root/bin/sh\") in /td/store/*) : ;; *) echo 'root tree: /bin/sh is not a symlink into /td/store - the store-native /bin farm regressed' >&2; exit 1;; esac; \
-     for f in passwd group shadow hostname os-release inittab profile autologin tty-session shutdown rootcheck netup bootsuccess bootfail; do \
+     for f in passwd group shadow hostname os-release mutable-state inittab profile autologin tty-session shutdown rootcheck netup bootsuccess bootfail; do \
          [ -f \"$root/etc/$f\" ] || { echo \"root tree: /etc/$f missing\" >&2; exit 1; }; \
+         if [ -L \"$root/etc/$f\" ]; then echo \"root tree: /etc/$f is a symlink - immutable image config must be a regular file in the erofs, not a hole in the read-only /etc\" >&2; exit 1; fi; \
      done; \
-     for l in resolv.conf hosts; do \
-         [ \"$(readlink \"$root/etc/$l\")\" = \"/run/$l\" ] || { echo \"root tree: /etc/$l must be a symlink into writable /run (td-netd writes it under the read-only erofs /etc)\" >&2; exit 1; }; \
+     for pair in @MUTABLE_ETC@; do \
+         l=${pair%%=*}; t=${pair#*=}; \
+         [ \"$(readlink \"$root/etc/$l\")\" = \"$t\" ] || { echo \"root tree: /etc/$l must be a symlink to $t - it is a reviewed MUTABLE_ETC entry, so its writes must land on the state it names and nowhere else\" >&2; exit 1; }; \
+         grep -q -F \"$l  \" \"$root/etc/mutable-state\" || { echo \"root tree: /etc/mutable-state does not document /etc/$l - the shipped list of holes in the read-only /etc must name every one of them\" >&2; exit 1; }; \
      done; \
+     ( cd \"$root/etc\" || exit 1; \
+       for p in * .*; do \
+           { [ -d \"$p\" ] && [ ! -L \"$p\" ]; } || continue; \
+           case $p in .|..) continue;; esac; \
+           seen=0; for d in @MUTABLE_ETC_DIRS@; do if [ \"$d\" = \"$p\" ]; then seen=1; fi; done; \
+           [ \"$seen\" = 1 ] || { echo \"root tree: /etc/$p is a directory no MUTABLE_ETC entry declares, so the symlink sweep below cannot look inside it - add the entry that needs it (or the sweep stops being a proof)\" >&2; exit 1; }; \
+       done; \
+       n=0; \
+       for p in @ETC_GLOBS@; do \
+           [ -L \"$p\" ] || continue; \
+           case $p in .|..) continue;; esac; \
+           n=$((n+1)); \
+           seen=0; for a in @MUTABLE_ETC_NAMES@; do if [ \"$a\" = \"$p\" ]; then seen=1; fi; done; \
+           [ \"$seen\" = 1 ] || { echo \"root tree: /etc/$p is a symlink out of the immutable /etc but is not a reviewed MUTABLE_ETC entry - the read-only-/etc invariant is only as strong as the list of holes in it\" >&2; exit 1; }; \
+       done; \
+       [ \"$n\" = @MUTABLE_ETC_COUNT@ ] || { echo \"root tree: found $n symlinks under /etc but MUTABLE_ETC declares @MUTABLE_ETC_COUNT@ - the counts must agree or a hole is unaccounted for in either direction\" >&2; exit 1; }; \
+     ) || exit 1; \
      case $(readlink \"$root/bin/td-netd\") in /td/store/*/bin/td-netd) : ;; *) echo 'root tree: /bin/td-netd is not a symlink into /td/store - the network daemon /bin entry regressed' >&2; exit 1;; esac; \
      tnd=\"{root}/real-root{in:td-netd}/bin/td-netd\"; { [ -f \"$tnd\" ] && [ -x \"$tnd\" ]; } || { echo 'root tree: the td-netd binary is not packed/executable at real-root{in:td-netd}/bin/td-netd - the /bin/td-netd symlink would dangle' >&2; exit 1; }; \
      [ \"$(readlink \"$root/bin/td-boot\" 2>/dev/null)\" = \"{in:td-boot}/bin/td-boot\" ] || { echo 'root tree: /bin/td-boot is not a symlink to the staged deployment helper' >&2; exit 1; }; \
@@ -1229,7 +1480,11 @@ fn shape_check() -> String {
      sshd=\"{root}/real-root{in:sshd}/bin/sshd\"; sshdtgt=\"{in:sshd}/bin/sshd\"; \
      { [ -f \"$sshd\" ] && [ -x \"$sshd\" ]; } || { echo 'root tree: the sshd daemon is not packed/executable at real-root{in:sshd}/bin/sshd - /bin/sshd would dangle and StageRuntimeClosure did not stage it' >&2; exit 1; }; \
      [ \"$(readlink \"$root/bin/sshd\" 2>/dev/null)\" = \"$sshdtgt\" ] || { echo 'root tree: /bin/sshd is not a symlink to the staged sshd daemon' >&2; exit 1; }; \
-     [ -f \"$root/etc/ssh/authorized_keys\" ] || { echo 'root tree: /etc/ssh/authorized_keys missing - the sshd daemon has no authorization source' >&2; exit 1; }; \
+     tdf=\"{root}/real-root{in:td-firstboot}/bin/td-firstboot\"; tdftgt=\"{in:td-firstboot}/bin/td-firstboot\"; \
+     { [ -f \"$tdf\" ] && [ -x \"$tdf\" ]; } || { echo 'root tree: the td-firstboot binary is not packed/executable at real-root{in:td-firstboot}/bin/td-firstboot - the sysinit job would fail and the machine would have no identity, so sshd (--host-key) would refuse to start' >&2; exit 1; }; \
+     [ \"$(readlink \"$root/bin/td-firstboot\" 2>/dev/null)\" = \"$tdftgt\" ] || { echo 'root tree: /bin/td-firstboot is not a symlink to the staged identity provisioner' >&2; exit 1; }; \
+     \"$tdf\" --help >/dev/null 2>&1 || { echo 'the packed td-firstboot does not run (it is static with an empty closure, so it must)' >&2; exit 1; }; \
+     \"$tdf\" --nonesuch >/dev/null 2>&1; [ $? -eq 2 ] || { echo 'td-firstboot must exit 2 on an unknown argument (usage error) rather than provisioning something unasked' >&2; exit 1; }; \
      dsz=$(wc -c < \"$disk\"); \
      [ \"$dsz\" -ge 4096 ] || { echo \"root.erofs: implausibly small ($dsz bytes)\" >&2; exit 1; }; \
      set -- $(od -An -tx1 -j 1024 -N 4 \"$disk\"); \
@@ -1256,6 +1511,43 @@ fn shape_check() -> String {
         .replace("@UUTILS_APPLETS@", &UUTILS_APPLETS.join(" "))
         .replace("@TD_UTIL_APPLETS@", &TD_UTIL_APPLETS.join(" "))
         .replace("@TD_INIT_APPLETS@", &td_init_applets().join(" "))
+        // `<etc path>=<target>` pairs, and the etc paths alone. Both lists are
+        // space-joined and unquoted in the script, which
+        // `mutable_etc_paths_are_shell_safe_and_well_formed` keeps safe.
+        .replace(
+            "@MUTABLE_ETC@",
+            &MUTABLE_ETC
+                .iter()
+                .map(|entry| format!("{}={}", entry.etc, entry.target))
+                .collect::<Vec<_>>()
+                .join(" "),
+        )
+        .replace("@MUTABLE_ETC_NAMES@", &mutable_etc_names().join(" "))
+        // One glob per directory the table uses, relative to /etc — a sweep for
+        // symlinks the table does not name. Globs rather than a recursive walk
+        // because the ladder guard bans the host directory-walk tools by name, and
+        // because the table is what decides which directories can hold one.
+        .replace("@ETC_GLOBS@", &etc_globs().join(" "))
+        .replace("@MUTABLE_ETC_DIRS@", &mutable_etc_dirs().join(" "))
+        .replace("@MUTABLE_ETC_COUNT@", &MUTABLE_ETC.len().to_string())
+}
+
+/// The `/etc`-relative paths of the table, for the allowlist sweep.
+fn mutable_etc_names() -> Vec<&'static str> {
+    MUTABLE_ETC.iter().map(|entry| entry.etc).collect()
+}
+
+/// `*` plus one `<dir>/*` per subdirectory the table uses.
+/// `*` and `.*` (a dot-name is not matched by `*`), plus the same pair inside every
+/// directory the table declares. The dir-allowlist leg above is what makes that
+/// scope a proof rather than a guess: no OTHER directory may exist under /etc.
+fn etc_globs() -> Vec<String> {
+    let mut globs = vec!["*".to_string(), ".*".to_string()];
+    for dir in mutable_etc_dirs() {
+        globs.push(format!("{dir}/*"));
+        globs.push(format!("{dir}/.*"));
+    }
+    globs
 }
 
 pub fn recipe() -> Recipe {
@@ -1386,6 +1678,9 @@ pub fn recipe() -> Recipe {
         // td-init: the static boot-glue multicall (empty runtime closure, CopyTree'd). Not a
         //   farm like the others: it is /init (PID 1), the deployment initramfs' pivot, and
         //   the sysinit `hostname -F`, so the image's boot path runs it on every boot.
+        // td-firstboot: the static per-machine identity provisioner (empty runtime closure,
+        //   CopyTree'd). One /bin entry, run once per boot as a sysinit job; it is what
+        //   fills the /var targets the MUTABLE_ETC symlinks point at.
         .native_inputs(&[
             "busybox-x86-64",
             "linux-x86-64",
@@ -1399,6 +1694,7 @@ pub fn recipe() -> Recipe {
             "td-kexec",
             "td-util",
             "td-init",
+            "td-firstboot",
         ])
         .inputs_owned(mesboot0_inputs(&[]))
         .steps(steps)
@@ -1993,6 +2289,271 @@ mod tests {
             Some(true),
             "uutils must set no_default_features so only the shipped applets build \
              (the default `feat_common_core` pulls ~76 utilities)"
+        );
+    }
+
+    /// Read a `const NAME: &str = "…";` value out of td-firstboot's own source — the
+    /// text the recipe embeds and rustc compiles, so this is what the shipped binary
+    /// will actually use rather than a second declaration that could drift.
+    fn firstboot_const(name: &str) -> Option<&'static str> {
+        const FIRSTBOOT_MAIN_RS: &str = include_str!("../../../td-firstboot/src/main.rs");
+        let (_, after) = FIRSTBOOT_MAIN_RS.split_once(&format!("const {name}: &str = \""))?;
+        let (value, _) = after.split_once('"')?;
+        Some(value)
+    }
+
+    /// The table and td-firstboot are two crates that must agree on four paths, and
+    /// nothing in the type system makes them: the image points `/etc` symlinks at
+    /// `/var/lib/td/...` while the provisioner independently decides where to write.
+    /// Disagree and the symlinks dangle forever — the machine boots, `/etc` looks
+    /// right, and every identity file is missing.
+    #[test]
+    fn firstboot_and_the_mutable_etc_table_agree_on_every_path() {
+        assert_eq!(
+            firstboot_const("DEFAULT_STATE_DIR"),
+            Some(STATE_DIR),
+            "td-firstboot writes its state somewhere other than where MUTABLE_ETC points"
+        );
+        // Each persistent entry's target must be exactly the state dir joined with the
+        // relative path td-firstboot declares for it.
+        for (name, etc) in [
+            ("MACHINE_ID", "machine-id"),
+            ("HOST_KEY", "ssh/ssh_host_ed25519_key"),
+            ("HOST_KEY_PUB", "ssh/ssh_host_ed25519_key.pub"),
+            ("AUTHORIZED_KEYS", "ssh/authorized_keys"),
+        ] {
+            let relative = firstboot_const(name);
+            assert_eq!(
+                relative,
+                Some(etc),
+                "td-firstboot's `{name}` is not the /etc name MUTABLE_ETC uses"
+            );
+            let entry = MUTABLE_ETC
+                .iter()
+                .find(|entry| entry.etc == etc)
+                .unwrap_or_else(|| unreachable!("MUTABLE_ETC has no entry for {etc}"));
+            assert_eq!(
+                entry.target,
+                format!("{STATE_DIR}/{etc}"),
+                "/etc/{etc} points somewhere other than td-firstboot's state dir"
+            );
+            assert_eq!(
+                entry.state,
+                State::Persistent,
+                "/etc/{etc} is provisioned by td-firstboot into /var, so it cannot be volatile"
+            );
+        }
+        // Every PERSISTENT entry must be one td-firstboot actually creates: a table
+        // entry with no provisioner is a symlink that dangles for the life of the
+        // machine, which is worse than no entry at all.
+        let provisioned = ["MACHINE_ID", "HOST_KEY", "HOST_KEY_PUB", "AUTHORIZED_KEYS"]
+            .iter()
+            .filter_map(|name| firstboot_const(name))
+            .collect::<Vec<_>>();
+        for entry in MUTABLE_ETC.iter().filter(|e| e.state == State::Persistent) {
+            assert!(
+                provisioned.contains(&entry.etc),
+                "/etc/{} is persistent state but nothing in td-firstboot provisions it",
+                entry.etc
+            );
+        }
+    }
+
+    /// The table's invariants, including the ones that keep it safe to interpolate
+    /// unquoted into `shape_check`'s and `rootcheck`'s generated shell.
+    #[test]
+    fn mutable_etc_paths_are_shell_safe_and_well_formed() {
+        assert!(!MUTABLE_ETC.is_empty());
+        for entry in MUTABLE_ETC {
+            let etc = entry.etc;
+            assert!(
+                !etc.is_empty() && !etc.starts_with('/') && !etc.ends_with('/'),
+                "/etc/{etc}: the table stores a path RELATIVE to /etc"
+            );
+            assert!(
+                !etc.contains("..") && !etc.contains("//"),
+                "/etc/{etc}: a traversal or empty component would escape /etc"
+            );
+            assert!(
+                !etc.starts_with('-') && !etc.contains("/-"),
+                "/etc/{etc}: a leading '-' in any component is read as an OPTION by the \
+                 `grep`/`test` the generated shell runs on it"
+            );
+            // At most one directory level: `etc_globs` sweeps exactly the levels the
+            // table declares, and a deeper path would be swept by nothing.
+            assert!(
+                etc.matches('/').count() <= 1,
+                "/etc/{etc} is nested deeper than one directory, so the unreviewed-symlink \
+                 sweep in shape_check would not reach it"
+            );
+            for (label, path) in [("etc", etc), ("target", entry.target)] {
+                assert!(
+                    path.bytes().all(|b| b.is_ascii_alphanumeric()
+                        || matches!(b, b'.' | b'_' | b'-' | b'/')),
+                    "{label} {path:?} has a character that is not safe unquoted in the \
+                     generated shell (or that td-builder's ASCII config reader would mangle)"
+                );
+            }
+            assert!(
+                entry.target.starts_with('/'),
+                "/etc/{etc} must point at an ABSOLUTE path: a relative symlink out of /etc \
+                 would resolve against /etc itself"
+            );
+            let wanted_root = match entry.state {
+                // Volatile state must be on the /run tmpfs, which starts every boot
+                // empty — that is what makes it volatile rather than merely mutable.
+                State::Volatile => "/run/",
+                State::Persistent => "/var/",
+            };
+            assert!(
+                entry.target.starts_with(wanted_root),
+                "/etc/{etc} is {:?} state but points at {} instead of {wanted_root}",
+                match entry.state {
+                    State::Volatile => "volatile",
+                    State::Persistent => "persistent",
+                },
+                entry.target
+            );
+            assert!(
+                entry.why.len() > 20,
+                "/etc/{etc} needs a real reason it cannot be image content - every hole in \
+                 the read-only /etc is an individually reviewed decision"
+            );
+        }
+        // Duplicates would stage two symlinks at one path (last wins) and make the
+        // allowlist sweep pass on a name nobody meant to review twice.
+        let mut names = mutable_etc_names();
+        let count = names.len();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(count, names.len(), "MUTABLE_ETC lists a path twice");
+        let mut targets: Vec<&str> = MUTABLE_ETC.iter().map(|e| e.target).collect();
+        targets.sort_unstable();
+        targets.dedup();
+        assert_eq!(
+            count,
+            targets.len(),
+            "two MUTABLE_ETC entries share a target, so one /etc name silently shadows another"
+        );
+    }
+
+    /// A `MUTABLE_ETC` entry must not collide with generated image config: the same
+    /// name cannot be both a regular file in the erofs and a symlink out of it, and
+    /// whichever step ran last would decide which — silently.
+    #[test]
+    fn no_mutable_etc_entry_shadows_a_generated_etc_file() {
+        for (generated, _, _) in etc_files(&SYSTEM) {
+            assert!(
+                !mutable_etc_names().contains(&generated),
+                "/etc/{generated} is both generated image config and a MUTABLE_ETC entry"
+            );
+        }
+    }
+
+    /// The staged tree must carry one symlink per table entry, with the recorded
+    /// target, and the directory to hold it. Asserted on the STEPS, so a table entry
+    /// that never became a staging step reds here rather than in a daily image build.
+    #[test]
+    fn every_mutable_etc_entry_is_staged_as_a_symlink() {
+        let steps = real_root_steps(&SYSTEM);
+        for entry in MUTABLE_ETC {
+            let link = format!("{{root}}/real-root/etc/{}", entry.etc);
+            assert!(
+                steps.iter().any(|step| matches!(
+                    step,
+                    Step::Symlink { target, link: at } if at == &link && target == entry.target
+                )),
+                "nothing stages /etc/{} as a symlink to {}",
+                entry.etc,
+                entry.target
+            );
+            // …and NOT as a file: a WriteFile at the same path would win or lose
+            // depending on step order.
+            assert!(
+                !steps.iter().any(|step| matches!(
+                    step,
+                    Step::WriteFile { path, .. } if path == &link
+                )),
+                "/etc/{} is written as a regular file as well as symlinked",
+                entry.etc
+            );
+        }
+        for dir in mutable_etc_dirs() {
+            let path = format!("{{root}}/real-root/etc/{dir}");
+            assert!(
+                steps
+                    .iter()
+                    .any(|step| matches!(step, Step::MkDir { path: at } if at == &path)),
+                "/etc/{dir} is never created, so the symlinks it holds cannot be staged"
+            );
+        }
+    }
+
+    /// The sshd service must read its identity and its authorization from per-machine
+    /// state, not from image content. Both paths it names have to be table entries —
+    /// otherwise a rebuild is the only way to rotate a host key or grant access, and
+    /// every machine booting the image shares both.
+    #[test]
+    fn the_sshd_service_reads_only_mutable_etc_paths() {
+        let inittab = build_inittab();
+        for path in [SSHD_HOST_KEY, SSHD_AUTHORIZED_KEYS] {
+            let relative = path
+                .strip_prefix("/etc/")
+                .unwrap_or_else(|| unreachable!("{path} must be under /etc"));
+            assert!(
+                mutable_etc_names().contains(&relative),
+                "the sshd service reads {path}, which is not a reviewed MUTABLE_ETC entry"
+            );
+        }
+        assert!(
+            inittab.contains(&format!("--host-key {SSHD_HOST_KEY} ")),
+            "the sshd service line must present the per-machine host key; without --host-key \
+             it falls back to the PUBLIC committed builtin key whenever no client is authorized"
+        );
+        assert!(
+            inittab.contains(&format!("--authorized-keys {SSHD_AUTHORIZED_KEYS}")),
+            "the sshd service line must authorize from per-machine state"
+        );
+    }
+
+    /// td-firstboot must run at sysinit and BEFORE everything that reads or checks
+    /// what it writes. td-init runs sysinit jobs to completion in table order, so
+    /// this ordering IS the guarantee — there is no other synchronisation.
+    #[test]
+    fn firstboot_provisions_before_anything_reads_the_identity() {
+        let inittab = build_inittab();
+        let position = |needle: &str| {
+            inittab
+                .lines()
+                .position(|line| line.contains(needle))
+                .unwrap_or_else(|| unreachable!("the inittab has no {needle} line"))
+        };
+        let firstboot = position("/bin/td-firstboot");
+        assert!(
+            inittab.contains("::sysinit:/bin/td-firstboot provision"),
+            "td-firstboot must be a sysinit job: `once`/`respawn` run concurrently with the \
+             services that read the identity it mints"
+        );
+        for (label, later) in [
+            // rootcheck asserts the identity is readable THROUGH the /etc symlinks.
+            ("/etc/rootcheck", position("::sysinit:/etc/rootcheck")),
+            // td-netd writes the volatile /run targets; ordering here is only about
+            // keeping the identity ahead of the network coming up.
+            ("/etc/netup", position("::sysinit:/etc/netup")),
+            // sshd reads --host-key and --authorized-keys.
+            ("/bin/sshd", position("::respawn:/bin/sshd")),
+        ] {
+            assert!(
+                firstboot < later,
+                "td-firstboot runs after {label}, which reads or checks the identity it mints"
+            );
+        }
+        // The sysinit jobs before it are the ones IT needs: /proc (it reads
+        // /proc/mounts to refuse a volatile state dir) must already be mounted.
+        assert!(
+            position("-t proc proc /proc") < firstboot,
+            "td-firstboot reads /proc/mounts to refuse provisioning onto volatile storage, so \
+             /proc must be mounted first"
         );
     }
 

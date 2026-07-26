@@ -132,6 +132,18 @@ pub const SYSTEM_ROOT_RO_MARKER: &str = "TD-ROOT-EROFS-RO-OK";
 /// `/etc` remains on the immutable EROFS root.
 pub const SYSTEM_ETC_RO_MARKER: &str = "TD-ETC-EROFS-RO-OK";
 
+/// Printed by `/etc/rootcheck` once every reviewed `MUTABLE_ETC` symlink resolves to
+/// the target the image recorded, the PERSISTENT ones are populated (td-firstboot is
+/// the sysinit job before it), `/etc/machine-id` reads back as 32 hex digits through
+/// its symlink, and the unprivileged login user can read the SSH host key's `.pub`
+/// but NOT the private key.
+///
+/// The companion to `SYSTEM_ETC_RO_MARKER`, and only meaningful beside it: together
+/// they say `/etc` is immutable AND that the handful of per-machine files reach
+/// writable state anyway — which is what td gets by naming each mutable file
+/// individually instead of mounting an `/etc` overlay.
+pub const SYSTEM_ETC_MUTABLE_MARKER: &str = "TD-ETC-MUTABLE-OK";
+
 /// Printed by `/etc/rootcheck` once all immutable-root, ownership, mount, link, and
 /// state write checks pass.
 pub const SYSTEM_STATE_WRITABLE_MARKER: &str = "TD-STATE-WRITABLE-OK";
@@ -139,6 +151,32 @@ pub const SYSTEM_STATE_WRITABLE_MARKER: &str = "TD-STATE-WRITABLE-OK";
 /// Printed only after the unprivileged login user can write its own home but
 /// cannot write the persistent state root or root's home.
 pub const SYSTEM_STATE_OWNER_MARKER: &str = "TD-STATE-OWNER-OK";
+
+/// Printed by `/bin/td-firstboot` at sysinit when it had to MINT part of this
+/// machine's identity — i.e. this is the machine's first boot on this `/var`.
+/// Seeing it on a LATER boot means identity did not persist, which is the failure
+/// the per-file `/etc` → `/var` symlinks exist to prevent.
+///
+/// DUPLICATED as `NEW_MARKER` in td-firstboot/src/main.rs (a separate crate the
+/// recipe builds from its own source); `td-firstboot.rs`'s unit tests read the
+/// literals back out of that source and assert the two agree.
+pub const TD_FIRSTBOOT_NEW_MARKER: &str = "TD-FIRSTBOOT-NEW-OK";
+
+/// Printed by `/bin/td-firstboot` when every identity file was already present and
+/// valid — the steady state of a provisioned machine. Its counterpart above must
+/// NOT appear on the same boot.
+///
+/// DUPLICATED as `STABLE_MARKER` in td-firstboot/src/main.rs.
+pub const TD_FIRSTBOOT_STABLE_MARKER: &str = "TD-FIRSTBOOT-STABLE-OK";
+
+/// Prefix of the line `/bin/td-firstboot` prints this machine's SSH host-key
+/// fingerprint on: `TD-FIRSTBOOT-HOSTKEY SHA256:<base64>`. The oracle compares the
+/// fingerprint across reboots — a marker can only say a key was reused, this proves
+/// it is the SAME key. Only the public fingerprint is printed; nothing derived from
+/// the private key or the machine-id reaches the console.
+///
+/// DUPLICATED as `HOST_KEY_PREFIX` in td-firstboot/src/main.rs.
+pub const TD_FIRSTBOOT_HOST_KEY_PREFIX: &str = "TD-FIRSTBOOT-HOSTKEY ";
 
 /// Printed after the first persistence-oracle boot writes and syncs its marker below
 /// `/var`. The second boot uses the same Btrfs volume and must read the exact bytes back.

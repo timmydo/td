@@ -105,6 +105,10 @@ const SYSTEM_ETC_RO_MARKER: &str = td_recipe::ladder::SYSTEM_ETC_RO_MARKER;
 /// into writable `/var` state.
 const SYSTEM_STATE_WRITABLE_MARKER: &str = td_recipe::ladder::SYSTEM_STATE_WRITABLE_MARKER;
 const SYSTEM_STATE_OWNER_MARKER: &str = td_recipe::ladder::SYSTEM_STATE_OWNER_MARKER;
+const SYSTEM_ETC_MUTABLE_MARKER: &str = td_recipe::ladder::SYSTEM_ETC_MUTABLE_MARKER;
+const TD_FIRSTBOOT_NEW_MARKER: &str = td_recipe::ladder::TD_FIRSTBOOT_NEW_MARKER;
+const TD_FIRSTBOOT_STABLE_MARKER: &str = td_recipe::ladder::TD_FIRSTBOOT_STABLE_MARKER;
+const TD_FIRSTBOOT_HOST_KEY_PREFIX: &str = td_recipe::ladder::TD_FIRSTBOOT_HOST_KEY_PREFIX;
 const SYSTEM_PERSIST_WRITE_MARKER: &str = td_recipe::ladder::SYSTEM_PERSIST_WRITE_MARKER;
 const SYSTEM_PERSIST_READ_MARKER: &str = td_recipe::ladder::SYSTEM_PERSIST_READ_MARKER;
 const SYSTEM_BOOT_SUCCESS_MARKER: &str = td_recipe::ladder::SYSTEM_BOOT_SUCCESS_MARKER;
@@ -200,6 +204,14 @@ struct ConsoleEvidence {
     bookkeeping_unavailable: bool,
     root_read_only: bool,
     etc_read_only: bool,
+    etc_mutable: bool,
+    firstboot_new: bool,
+    firstboot_stable: bool,
+    /// This machine's SSH host-key fingerprint, as td-firstboot printed it. An
+    /// Option rather than a bool because its VALUE is the evidence: comparing it
+    /// across reboots is what proves the identity persisted rather than merely
+    /// that some key existed on each boot.
+    host_key: Option<String>,
     state_writable: bool,
     state_owner: bool,
     uutils_runtime: bool,
@@ -387,6 +399,7 @@ pub(crate) fn run_system(runner: &RecipeCheckRunner) -> Result<(), String> {
     validate_system_boot(
         &first,
         PersistencePhase::Write,
+        IdentityPhase::Fresh,
         "install",
         SelectionExpectation::Current,
     )?;
@@ -469,6 +482,7 @@ pub(crate) fn run_system(runner: &RecipeCheckRunner) -> Result<(), String> {
     validate_system_boot(
         &healthy_candidate,
         PersistencePhase::Read,
+        IdentityPhase::Reused,
         "healthy pending candidate",
         SelectionExpectation::Current,
     )?;
@@ -484,6 +498,10 @@ pub(crate) fn run_system(runner: &RecipeCheckRunner) -> Result<(), String> {
         td_boot_protocol::ATTEMPT_CONSUMED_MARKER,
         "healthy pending candidate",
     )?;
+    // The reboot-crossing proof. The marker only says td-firstboot found an identity
+    // already there; this says it is the SAME one, which is what a client pinning a
+    // host key (or a fleet keyed by machine-id) actually depends on.
+    require_same_identity(&first, &healthy_candidate, "install", "healthy pending candidate")?;
     if healthy_candidate.evidence.attempts_exhausted {
         return Err(format!(
             "the healthy pending candidate unexpectedly exhausted its boot budget. \
@@ -505,6 +523,7 @@ pub(crate) fn run_system(runner: &RecipeCheckRunner) -> Result<(), String> {
     validate_system_boot(
         &stable_candidate,
         PersistencePhase::Read,
+        IdentityPhase::Reused,
         "acknowledged candidate",
         SelectionExpectation::Current,
     )?;
@@ -514,6 +533,7 @@ pub(crate) fn run_system(runner: &RecipeCheckRunner) -> Result<(), String> {
         &fixture.alternate_id,
         "acknowledged candidate boot",
     )?;
+    require_same_identity(&first, &stable_candidate, "install", "acknowledged candidate")?;
     if stable_candidate.evidence.attempt_consumed || stable_candidate.evidence.attempts_exhausted {
         return Err(format!(
             "the acknowledged candidate retained boot-attempt state after success. \
@@ -547,6 +567,7 @@ pub(crate) fn run_system(runner: &RecipeCheckRunner) -> Result<(), String> {
     validate_system_boot(
         &failure_install,
         PersistencePhase::Write,
+        IdentityPhase::Fresh,
         "failure-sequence install",
         SelectionExpectation::Current,
     )?;
@@ -562,6 +583,11 @@ pub(crate) fn run_system(runner: &RecipeCheckRunner) -> Result<(), String> {
         SYSTEM_DEPLOY_INSTALL_MARKER,
         "failure-sequence install",
     )?;
+    // The @var was recreated, so this is a DIFFERENT machine and must have a
+    // different host key. Equality here would mean the key is coming from the image
+    // rather than from this machine's entropy — i.e. every machine that boots the
+    // image shares one host identity, exactly what moving the key to /var prevents.
+    require_distinct_identity(&first, &failure_install, "install", "failure-sequence install")?;
     if failure_install.evidence.attempt_consumed || failure_install.evidence.attempts_exhausted {
         return Err(format!(
             "the failure-sequence install unexpectedly consumed or exhausted a boot-attempt budget. \
@@ -621,8 +647,15 @@ pub(crate) fn run_system(runner: &RecipeCheckRunner) -> Result<(), String> {
     validate_system_boot(
         &automatic_rollback,
         PersistencePhase::Read,
+        IdentityPhase::Reused,
         "automatic rollback",
         SelectionExpectation::AttemptsExhausted,
+    )?;
+    require_same_identity(
+        &failure_install,
+        &automatic_rollback,
+        "failure-sequence install",
+        "automatic rollback",
     )?;
     require_selected_deployment(
         &automatic_rollback,
@@ -650,6 +683,7 @@ pub(crate) fn run_system(runner: &RecipeCheckRunner) -> Result<(), String> {
     validate_system_boot(
         &stable_rollback,
         PersistencePhase::Read,
+        IdentityPhase::Reused,
         "persisted automatic rollback",
         SelectionExpectation::Current,
     )?;
@@ -658,6 +692,12 @@ pub(crate) fn run_system(runner: &RecipeCheckRunner) -> Result<(), String> {
         td_boot_protocol::SELECTED_CURRENT_MARKER,
         &failure_fixture.initial_id,
         "persisted automatic rollback boot",
+    )?;
+    require_same_identity(
+        &failure_install,
+        &stable_rollback,
+        "failure-sequence install",
+        "persisted automatic rollback",
     )?;
     if stable_rollback.evidence.attempt_consumed
         || stable_rollback.evidence.attempts_exhausted
@@ -696,6 +736,7 @@ pub(crate) fn run_system(runner: &RecipeCheckRunner) -> Result<(), String> {
     validate_system_boot(
         &fallback,
         PersistencePhase::None,
+        IdentityPhase::Fresh,
         "corrupt-current fallback",
         SelectionExpectation::PreviousFallback,
     )?;
@@ -718,8 +759,14 @@ pub(crate) fn run_system(runner: &RecipeCheckRunner) -> Result<(), String> {
          ({SYSTEM_PERSIST_WRITE_MARKER} -> {SYSTEM_PERSIST_READ_MARKER}), marked healthy boots \
          successful ({SYSTEM_BOOT_SUCCESS_MARKER}), and rejected a corrupted current payload \
          in favor of verified previous \
-         ({} -> {}). Every full boot kept root and /etc immutable \
-         ({SYSTEM_ROOT_RO_MARKER}, {SYSTEM_ETC_RO_MARKER}), mounted target-owned writable @var \
+         ({} -> {}). Each freshly created @var minted this machine's identity exactly once \
+         ({TD_FIRSTBOOT_NEW_MARKER}) and every reboot of it found that identity intact with the \
+         SAME SSH host-key fingerprint ({TD_FIRSTBOOT_STABLE_MARKER}), while a recreated @var \
+         minted a DIFFERENT one — so the identity is per machine, not per image. Every full boot \
+         kept root and /etc immutable \
+         ({SYSTEM_ROOT_RO_MARKER}, {SYSTEM_ETC_RO_MARKER}) while the reviewed per-file /etc \
+         symlinks still reached that writable state ({SYSTEM_ETC_MUTABLE_MARKER}), mounted \
+         target-owned writable @var \
          ({SYSTEM_STATE_WRITABLE_MARKER}, {SYSTEM_STATE_OWNER_MARKER}), ran uutils \
          ({UUTILS_RUNTIME_MARKER}), ripgrep+fd ({RIPGREP_FD_RUNTIME_MARKER}), td-util \
          ({TD_UTIL_RUNTIME_MARKER}) and the td-init boot glue ({TD_INIT_RUNTIME_MARKER}), \
@@ -867,9 +914,22 @@ enum SelectionExpectation {
     AttemptsExhausted,
 }
 
+/// What this boot's `@var` subvolume already holds, which decides whether
+/// td-firstboot must MINT this machine's identity or must find it already there.
+/// Stated per call site rather than derived from `PersistencePhase`, because that
+/// phase describes which persistence markers the kernel cmdline asked for and says
+/// nothing about whether the volume was just recreated.
+enum IdentityPhase {
+    /// A freshly created `@var`: a new machine, so identity is minted here.
+    Fresh,
+    /// The same `@var` a previous boot in this run already provisioned.
+    Reused,
+}
+
 fn validate_system_boot(
     result: &BootResult,
     persistence: PersistencePhase,
+    identity: IdentityPhase,
     ordinal: &str,
     selection: SelectionExpectation,
 ) -> Result<(), String> {
@@ -906,6 +966,67 @@ fn validate_system_boot(
             "the greeter was reached but /etc/rootcheck did not confirm immutable deployment config \
              ({SYSTEM_ETC_RO_MARKER:?} absent) — root could write below /etc or the check did not run. \
              Last serial output:\n{}",
+            tail(&result.console, 80)
+        ));
+    }
+    // The other half of the /etc contract. `SYSTEM_ETC_RO_MARKER` above says /etc
+    // rejects writes; this says the handful of per-machine files reach writable state
+    // anyway, through the reviewed per-file symlinks. Both, on the same boot, are what
+    // "immutable /etc with per-machine identity" means — and it is checked on a
+    // BOOTED machine because a staged tree cannot show that a read through a dangling
+    // build-time symlink resolves once /var is mounted and provisioned.
+    if !result.evidence.etc_mutable {
+        return Err(format!(
+            "the {ordinal} boot reached the greeter but /etc/rootcheck did not confirm the \
+             mutable-/etc contract ({SYSTEM_ETC_MUTABLE_MARKER:?} absent) — a reviewed \
+             MUTABLE_ETC symlink points somewhere other than the image recorded, a persistent \
+             one did not resolve (so td-firstboot did not provision it), /etc/machine-id is not \
+             32 hex digits through its symlink, or the unprivileged login user could read the \
+             SSH host PRIVATE key (or could not read its .pub). Last serial output:\n{}",
+            tail(&result.console, 80)
+        ));
+    }
+    // td-firstboot's own report. A fresh @var must be provisioned exactly once, and
+    // every later boot must find that identity intact: the marker that appears says
+    // which happened, and the marker that does NOT is the load-bearing half —
+    // `TD_FIRSTBOOT_NEW_MARKER` on a reused volume means the machine silently became
+    // a DIFFERENT machine, which is the failure this whole mechanism exists to
+    // prevent and which nothing else in the boot would notice.
+    let (wanted, unwanted, why) = match identity {
+        IdentityPhase::Fresh => (
+            (TD_FIRSTBOOT_NEW_MARKER, result.evidence.firstboot_new),
+            (TD_FIRSTBOOT_STABLE_MARKER, result.evidence.firstboot_stable),
+            "this @var was just created, so td-firstboot must mint the identity here",
+        ),
+        IdentityPhase::Reused => (
+            (TD_FIRSTBOOT_STABLE_MARKER, result.evidence.firstboot_stable),
+            (TD_FIRSTBOOT_NEW_MARKER, result.evidence.firstboot_new),
+            "this @var was already provisioned by an earlier boot in this run, so the \
+             identity must survive unchanged",
+        ),
+    };
+    if !wanted.1 {
+        return Err(format!(
+            "the {ordinal} boot did not emit {:?} — {why}. Either /bin/td-firstboot did not run \
+             at sysinit, or it refused (the console carries its diagnostic: a volatile or \
+             read-only state filesystem, a malformed machine-id it will not replace, or a \
+             `/bin/sshd keygen` that failed). Last serial output:\n{}",
+            wanted.0,
+            tail(&result.console, 80)
+        ));
+    }
+    if unwanted.1 {
+        return Err(format!(
+            "the {ordinal} boot emitted {:?}, but {why}. Last serial output:\n{}",
+            unwanted.0,
+            tail(&result.console, 80)
+        ));
+    }
+    if result.evidence.host_key.is_none() {
+        return Err(format!(
+            "the {ordinal} boot provisioned an identity but printed no \
+             {TD_FIRSTBOOT_HOST_KEY_PREFIX:?} fingerprint line, so there is nothing to compare \
+             across reboots. Last serial output:\n{}",
             tail(&result.console, 80)
         ));
     }
@@ -1038,6 +1159,71 @@ fn validate_system_boot(
              return 0, or init-mediated reboot did not fire). Last serial output:\n{}",
             result.reason,
             tail(&result.console, 80)
+        ));
+    }
+    Ok(())
+}
+
+/// The SSH host-key fingerprints two boots reported. `validate_system_boot` has
+/// already refused a boot that printed none, so a missing one here is a caller
+/// passing an unvalidated boot rather than a guest failure — say so instead of
+/// silently comparing `None == None` and passing.
+fn identities(
+    earlier: &BootResult,
+    later: &BootResult,
+    earlier_label: &str,
+    later_label: &str,
+) -> Result<(String, String), String> {
+    match (&earlier.evidence.host_key, &later.evidence.host_key) {
+        (Some(a), Some(b)) => Ok((a.clone(), b.clone())),
+        _ => Err(format!(
+            "cannot compare the {earlier_label} and {later_label} host identities: one of them \
+             reported no fingerprint, which validate_system_boot should already have rejected"
+        )),
+    }
+}
+
+/// Two boots of the SAME machine must present the same host key. This is the
+/// assertion a marker cannot make: `TD_FIRSTBOOT_STABLE_MARKER` only says the files
+/// were already there, not that they still hold the identity a client pinned.
+fn require_same_identity(
+    earlier: &BootResult,
+    later: &BootResult,
+    earlier_label: &str,
+    later_label: &str,
+) -> Result<(), String> {
+    let (before, after) = identities(earlier, later, earlier_label, later_label)?;
+    if before != after {
+        return Err(format!(
+            "the machine's SSH host key CHANGED across a reboot of the same @var: the \
+             {earlier_label} boot presented {before} and the {later_label} boot presented \
+             {after}. Every client that pinned the first key now sees a host-key mismatch, \
+             which is indistinguishable from an attack — per-machine identity did not \
+             persist. Last serial output:\n{}",
+            tail(&later.console, 80)
+        ));
+    }
+    Ok(())
+}
+
+/// A freshly created `@var` is a DIFFERENT machine and must get a different host
+/// key. Equality would mean the key came from the image rather than from this
+/// machine's entropy — one identity shared by every machine that boots the image,
+/// which is precisely what keeping it out of the image prevents.
+fn require_distinct_identity(
+    earlier: &BootResult,
+    later: &BootResult,
+    earlier_label: &str,
+    later_label: &str,
+) -> Result<(), String> {
+    let (before, after) = identities(earlier, later, earlier_label, later_label)?;
+    if before == after {
+        return Err(format!(
+            "a freshly created @var produced the SAME SSH host key as the previous machine \
+             ({before}): the {earlier_label} and {later_label} boots are different machines, so \
+             an identical host identity means it is baked into the image (or derived from \
+             something constant) rather than minted per machine. Last serial output:\n{}",
+            tail(&later.console, 80)
         ));
     }
     Ok(())
@@ -2312,6 +2498,10 @@ fn evidence_marker_max_len(target: &[u8]) -> usize {
         td_boot_protocol::SELECTED_PREVIOUS_MARKER.len() + 1 + 64,
         SYSTEM_ROOT_RO_MARKER.len(),
         SYSTEM_ETC_RO_MARKER.len(),
+        SYSTEM_ETC_MUTABLE_MARKER.len(),
+        TD_FIRSTBOOT_NEW_MARKER.len(),
+        TD_FIRSTBOOT_STABLE_MARKER.len(),
+        TD_FIRSTBOOT_HOST_KEY_PREFIX.len() + HOST_KEY_MAX,
         SYSTEM_STATE_WRITABLE_MARKER.len(),
         SYSTEM_STATE_OWNER_MARKER.len(),
         UUTILS_RUNTIME_MARKER.len(),
@@ -2386,6 +2576,26 @@ fn latch_console_evidence(evidence: &mut ConsoleEvidence, buf: &[u8], target: &[
         &mut evidence.etc_read_only,
         buf,
         SYSTEM_ETC_RO_MARKER.as_bytes(),
+    );
+    latch_marker(
+        &mut evidence.etc_mutable,
+        buf,
+        SYSTEM_ETC_MUTABLE_MARKER.as_bytes(),
+    );
+    latch_marker(
+        &mut evidence.firstboot_new,
+        buf,
+        TD_FIRSTBOOT_NEW_MARKER.as_bytes(),
+    );
+    latch_marker(
+        &mut evidence.firstboot_stable,
+        buf,
+        TD_FIRSTBOOT_STABLE_MARKER.as_bytes(),
+    );
+    latch_token(
+        &mut evidence.host_key,
+        buf,
+        TD_FIRSTBOOT_HOST_KEY_PREFIX.as_bytes(),
     );
     latch_marker(
         &mut evidence.state_writable,
@@ -2465,6 +2675,56 @@ fn latch_console_evidence(evidence: &mut ConsoleEvidence, buf: &[u8], target: &[
 fn latch_marker(found: &mut bool, haystack: &[u8], marker: &[u8]) {
     if !*found {
         *found = contains(haystack, marker);
+    }
+}
+
+/// Longest token `latch_token` will accept. An ed25519 SHA-256 fingerprint is
+/// `SHA256:` plus 43 base64 characters; the ceiling is generous enough for another
+/// hash without letting a console line of `x`s become an unbounded String.
+const HOST_KEY_MAX: usize = 64;
+
+/// Latch the graphic-character token that follows `prefix` — used for the SSH
+/// host-key fingerprint, which is variable-length base64 rather than the
+/// fixed-width hex deployment ids `latch_selection_id` reads.
+///
+/// Requires the token to be TERMINATED within the window: the console is drained
+/// incrementally, so a token still being written would otherwise latch truncated
+/// and then compare unequal against the same key on the next boot. The scan window
+/// carries `evidence_marker_max_len` bytes of overlap (which counts this prefix plus
+/// `HOST_KEY_MAX`), so a line skipped for that reason is re-examined intact.
+fn latch_token(found: &mut Option<String>, haystack: &[u8], prefix: &[u8]) {
+    if found.is_some() {
+        return;
+    }
+    for start in 0..haystack.len() {
+        let Some(after_prefix) = start.checked_add(prefix.len()) else {
+            return;
+        };
+        if haystack.get(start..after_prefix) != Some(prefix) {
+            continue;
+        }
+        let mut end = after_prefix;
+        while let Some(byte) = haystack.get(end) {
+            if !byte.is_ascii_graphic() || end.saturating_sub(after_prefix) >= HOST_KEY_MAX {
+                break;
+            }
+            let Some(next) = end.checked_add(1) else {
+                return;
+            };
+            end = next;
+        }
+        // Only a token followed by a real terminator counts. Anything else is
+        // either still being written (its newline has not arrived), or longer than
+        // the ceiling — and latching a PREFIX of a fingerprint would compare
+        // unequal against the same key next boot, reporting a rotation that did
+        // not happen.
+        if end == after_prefix || !matches!(haystack.get(end), Some(b) if !b.is_ascii_graphic()) {
+            continue;
+        }
+        if let Some(Ok(token)) = haystack.get(after_prefix..end).map(std::str::from_utf8) {
+            *found = Some(token.to_string());
+            return;
+        }
     }
 }
 
@@ -2951,6 +3211,7 @@ mod tests {
             "{} {selected_id}",
             td_boot_protocol::SELECTED_PREVIOUS_MARKER
         );
+        let host_key_line = format!("{TD_FIRSTBOOT_HOST_KEY_PREFIX}SHA256:aGVsbG8gd29ybGQ");
         let mut bytes = [
             td_boot_protocol::CURRENT_REJECTED_MARKER,
             td_boot_protocol::ATTEMPT_CONSUMED_MARKER,
@@ -2960,6 +3221,10 @@ mod tests {
             GREETER_MARKER,
             SYSTEM_ROOT_RO_MARKER,
             SYSTEM_ETC_RO_MARKER,
+            SYSTEM_ETC_MUTABLE_MARKER,
+            TD_FIRSTBOOT_NEW_MARKER,
+            TD_FIRSTBOOT_STABLE_MARKER,
+            host_key_line.as_str(),
             SYSTEM_STATE_WRITABLE_MARKER,
             SYSTEM_STATE_OWNER_MARKER,
             UUTILS_RUNTIME_MARKER,
@@ -3006,6 +3271,10 @@ mod tests {
         assert_eq!(evidence.selected_current_id, None);
         assert!(evidence.root_read_only);
         assert!(evidence.etc_read_only);
+        assert!(evidence.etc_mutable);
+        assert!(evidence.firstboot_new);
+        assert!(evidence.firstboot_stable);
+        assert_eq!(evidence.host_key.as_deref(), Some("SHA256:aGVsbG8gd29ybGQ"));
         assert!(evidence.state_writable);
         assert!(evidence.state_owner);
         assert!(evidence.uutils_runtime);
@@ -3076,6 +3345,77 @@ mod tests {
 
         assert_eq!(evidence.selected_current_id.as_deref(), Some(selected_id));
         assert_eq!(evidence.selected_previous_id, None);
+    }
+
+    /// The fingerprint latch is what turns "a key existed" into "the SAME key", so
+    /// a truncated latch would report a host-key rotation that never happened.
+    #[test]
+    fn host_key_latch_takes_whole_terminated_tokens_only() {
+        let prefix = TD_FIRSTBOOT_HOST_KEY_PREFIX;
+        let fingerprint = "SHA256:4lqaECIkRUNj0elPdI5ADeldChXHFOGuogerW1L1iAU";
+
+        let mut evidence = ConsoleEvidence::default();
+        latch_console_evidence(
+            &mut evidence,
+            format!("noise\n{prefix}{fingerprint}\nmore\n").as_bytes(),
+            b"target",
+        );
+        assert_eq!(evidence.host_key.as_deref(), Some(fingerprint));
+
+        // Still being written: no terminator yet, so nothing latches. The scan
+        // window's overlap re-examines the line once the newline arrives.
+        let mut partial = ConsoleEvidence::default();
+        latch_console_evidence(
+            &mut partial,
+            format!("{prefix}{fingerprint}").as_bytes(),
+            b"target",
+        );
+        assert_eq!(partial.host_key, None);
+        latch_console_evidence(
+            &mut partial,
+            format!("{prefix}{fingerprint}\n").as_bytes(),
+            b"target",
+        );
+        assert_eq!(partial.host_key.as_deref(), Some(fingerprint));
+
+        // Longer than the ceiling: refused outright rather than latched truncated.
+        let mut oversized = ConsoleEvidence::default();
+        latch_console_evidence(
+            &mut oversized,
+            format!("{prefix}{}\n", "x".repeat(HOST_KEY_MAX + 1)).as_bytes(),
+            b"target",
+        );
+        assert_eq!(oversized.host_key, None);
+
+        // An empty token is not a fingerprint.
+        let mut empty = ConsoleEvidence::default();
+        latch_console_evidence(&mut empty, format!("{prefix}\n").as_bytes(), b"target");
+        assert_eq!(empty.host_key, None);
+
+        // The FIRST fingerprint wins, so a later boot's line cannot overwrite the
+        // one this boot is being judged on.
+        let mut first = ConsoleEvidence::default();
+        latch_console_evidence(
+            &mut first,
+            format!("{prefix}{fingerprint}\n{prefix}SHA256:different\n").as_bytes(),
+            b"target",
+        );
+        assert_eq!(first.host_key.as_deref(), Some(fingerprint));
+    }
+
+    /// The overlap the incremental drain carries must admit the LONGEST thing
+    /// latched, or a fingerprint line straddling two reads is never seen at all.
+    /// The budget is `evidence_marker_max_len(marker) - 1` (see `drain_console`),
+    /// and `latch_token` needs the prefix, up to HOST_KEY_MAX token bytes, AND the
+    /// terminator inside the window — hence the +2.
+    #[test]
+    fn the_scan_overlap_covers_a_full_fingerprint_line() {
+        let overlap = evidence_marker_max_len(b"t").saturating_sub(1);
+        assert!(
+            overlap >= TD_FIRSTBOOT_HOST_KEY_PREFIX.len() + HOST_KEY_MAX + 1,
+            "the drain overlap ({overlap}) cannot hold a whole host-key line, so one \
+             split across two reads would never latch"
+        );
     }
 
     #[test]

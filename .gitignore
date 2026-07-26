@@ -53,3 +53,7 @@ tests/*/target/
 
 # td-review: the host-side integrator TUI is built locally, not by a recipe.
 td-review/target/
+
+# td-firstboot: shipped by its recipe as a direct rustc build, but compiled here
+# too by the cargo-test gate and by hand when validating provisioning.
+td-firstboot/target/

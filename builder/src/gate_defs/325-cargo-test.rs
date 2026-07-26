@@ -6,7 +6,7 @@
 //! 
 //! clippy leg (AGENTS.md → "Rust code"): the engine workspace (builder, recipes,
 //! and the shared std-only engine lib), td-kexec, td-sh, td-netd, td-boot, td-util,
-//! and td-init must lint
+//! td-init, and td-firstboot must lint
 //! clean under the `[lints]` table each Cargo.toml declares at `deny` — NO panicking
 //! surface (unwrap/expect/panic!/unreachable!/todo!/unimplemented!), `.get(i)` over
 //! panicking `xs[i]`, and `unsafe` confined to the raw-syscall layer (builder's is
@@ -20,14 +20,17 @@
 //! Cargo.lock and stay dependency-free — asserted two ways so BOTH a registry/git
 //! dep AND a new path member are caught: exactly 3 `[[package]]` entries (the known
 //! members) AND no external `source = ` line (path members carry none). td-kexec,
-//! td-sh, td-netd, td-boot, td-util, and td-init each keep a 1-package lock. They
-//! are TARGET-built programs (the guest kexec helper, the /bin/sh replacement, the
-//! network daemon, the boot shim, and the diagnostics and boot-glue multicalls),
+//! td-sh, td-netd, td-boot, td-util, td-init, and td-firstboot each keep a
+//! 1-package lock. They are TARGET-built programs (the guest kexec helper, the
+//! /bin/sh replacement, the network daemon, the boot shim, the diagnostics and
+//! boot-glue multicalls, and the per-machine identity provisioner),
 //! not engine code, but are pure std and compile offline, so
-//! they lint/test here with the engine crates. td-review is the one HOST-side
-//! crate here (in neither bootstrap graph, but pure std and offline), and only
-//! its `--bins` tests run: its integration tests need a `git`, which the sandbox
-//! toolchain has none of, so they run in the host `cargo-test` preflight.
+//! they lint/test here with the engine crates. td-firstboot is linted
+//! `--all-targets` (its clippy.toml carries the AGENTS.md `#[cfg(test)]` panic
+//! exemptions), so its tests are held to the coding rules too. td-review is the one
+//! HOST-side crate here (in neither bootstrap graph, but pure std and offline), and
+//! only its `--bins` tests run: its integration tests need a `git`, which the
+//! sandbox toolchain has none of, so they run in the host `cargo-test` preflight.
 //! The network tools
 //! (fetch/feed/subst) carry the vendored
 //! FSDG crates and can't compile offline, so they are NOT linted here; their
@@ -113,6 +116,8 @@ pub fn gate() -> GateDef {
 	test "$rv" -eq 1 || { echo "ERROR: td-review is no longer dependency-free (Cargo.lock lists $rv packages; it must carry ZERO crates — AGENTS.md 'Rust code')" >&2; exit 1; }; \
 	i=`"$td" text count-line-exact '[[package]]' td-init/Cargo.lock`; \
 	test "$i" -eq 1 || { echo "ERROR: td-init is no longer dependency-free (Cargo.lock lists $i packages; it must carry ZERO crates — AGENTS.md 'Rust code')" >&2; exit 1; }; \
+	fb=`"$td" text count-line-exact '[[package]]' td-firstboot/Cargo.lock`; \
+	test "$fb" -eq 1 || { echo "ERROR: td-firstboot is no longer dependency-free (Cargo.lock lists $fb packages; it must carry ZERO crates — AGENTS.md 'Rust code')" >&2; exit 1; }; \
 rustpath=`"$td" provision-rust` || exit $?; \
 ccpath=`"$td" provision-cc` || exit $?; \
 scratch="$PWD/.cargo-test-scratch"; \
@@ -128,6 +133,7 @@ CARGO_HOME="$scratch/home" CARGO_TARGET_DIR="$scratch/target" \
 	    cargo clippy --frozen --manifest-path td-boot/Cargo.toml; \
 	    cargo clippy --frozen --manifest-path td-util/Cargo.toml; \
 	    cargo clippy --frozen --manifest-path td-init/Cargo.toml; \
+	    cargo clippy --frozen --manifest-path td-firstboot/Cargo.toml --all-targets; \
 	    cargo clippy --frozen --manifest-path td-review/Cargo.toml --all-targets; \
 	    cargo test  --frozen --workspace; \
 	    cargo test  --frozen --manifest-path td-kexec/Cargo.toml; \
@@ -136,11 +142,12 @@ CARGO_HOME="$scratch/home" CARGO_TARGET_DIR="$scratch/target" \
 	    cargo test  --frozen --manifest-path td-boot/Cargo.toml; \
 	    cargo test  --frozen --manifest-path td-util/Cargo.toml; \
 	    cargo test  --frozen --manifest-path td-init/Cargo.toml; \
+	    cargo test  --frozen --manifest-path td-firstboot/Cargo.toml; \
 	    cargo test  --frozen --manifest-path td-review/Cargo.toml --bins' 2>&1 | tee "$log"; \
 	"$td" text cargo-test-ok "$log" || \
 	  { echo "ERROR: cargo test reported no passing tests (vacuous run?)" >&2; exit 1; }; \
 rm -rf "$scratch"; \
-echo "PASS: cargo-test — the engine workspace (builder + recipes + engine), td-kexec, td-sh, td-netd, td-boot, td-util, td-init, and td-review are dependency-free and lint clean; their unit tests pass (guix-free toolchain)."
+echo "PASS: cargo-test — the engine workspace (builder + recipes + engine), td-kexec, td-sh, td-netd, td-boot, td-util, td-init, td-firstboot, and td-review are dependency-free and lint clean; their unit tests pass (guix-free toolchain)."
 "##,
     }
 }

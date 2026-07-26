@@ -24,6 +24,12 @@
 #                     poweroff, halt, switch_root, cttyhack, hostname): td-util's
 #                     complement, the applets that DO need raw syscalls, with its
 #                     own confined eight-syscall unsafe surface.
+#   td-firstboot/   — the target-built static per-machine identity provisioner
+#                     (machine-id, SSH host key, deny-all authorized_keys under
+#                     /var/lib/td, which the image's read-only /etc reaches
+#                     through one reviewed symlink each). Pure safe std: it
+#                     delegates ed25519 generation to `sshd keygen` and reads
+#                     its entropy from /dev/urandom as an ordinary file.
 #   td-review/      — a HOST-side integrator utility (branch review + squash
 #                     landing TUI). In neither bootstrap graph: it is not a
 #                     control-plane build program and never enters a closure.
@@ -32,7 +38,7 @@
 [workspace]
 resolver = "2"
 members = ["builder", "recipes", "engine"]
-exclude = ["net", "td-kexec", "td-sh", "td-netd", "td-boot", "td-util", "td-init", "td-review", "tests/sshd"]
+exclude = ["net", "td-kexec", "td-sh", "td-netd", "td-boot", "td-util", "td-init", "td-firstboot", "td-review", "tests/sshd"]
 
 [profile.release]
 # Keep the release profile explicit and minimal so the reproducibility oracle
