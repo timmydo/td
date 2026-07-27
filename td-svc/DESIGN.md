@@ -71,6 +71,12 @@ refuses to skip one, and a console's wait for its dependencies is bounded
 (`CONSOLE_PATIENCE`) after which it starts with its ordering ignored. The
 first three reason about the GRAPH; only the fourth catches a stall.
 
+I5 has exactly one limit, and it is **I6**: once a shutdown begins, nothing
+starts, a `tty=` unit included. The two invariants want opposite things there
+and I6 wins, because the machine a console exists to rescue is being taken
+apart — its filesystems are going away, and a console handed to someone at
+that moment can only mislead. Everywhere else I5 is absolute.
+
 **I6. Shutdown is a persisted, monotonic transition.** PID 1 respawns
 td-svc unconditionally, so a td-svc that dies mid-teardown must not come
 back and start services while an orphaned `/etc/shutdown` is unmounting
@@ -522,8 +528,8 @@ immediate EOF, exited, and turned a missing device into a restart spin.
 ## 8. Control socket and shutdown
 
 `/run/td-svc/control`, a `UnixListener` inside a `0700` directory created
-*before* bind. Newline-delimited commands: `status`, `start|stop|restart
-NAME` (landed), `reload`, `reboot|poweroff|halt` (with shutdown).
+*before* bind. Newline-delimited commands: `status [NAME]`, `start|stop|restart
+NAME`, `reload`, and `reboot|poweroff|halt`.
 
 The directory carries the protection, not the socket: a path that cannot be
 traversed cannot be connected to whatever the socket's own bits say. It is
@@ -593,33 +599,120 @@ the same argument.
 A `start` cannot rescue a unit the PLAN dropped. `start_eligible` walks the
 resolved order, and a unit in a dependency cycle is not in it, so setting it
 `Down` would reply "starting" and leave it there forever; it answers with
-the reason instead. §3 assigns cycle recovery to this socket, and that
-remains unbuilt — it needs a `reload`, which lands with shutdown.
+the reason instead. §3 assigns cycle recovery to this socket: the route is
+`reload`, which re-reads the table, so a cycle is repaired by fixing the
+file and reloading rather than by a verb that pretends the plan says
+something it does not.
 
 `reload` is transactional: on any diagnostic the last-known-good table is
-kept rather than applying the valid fragments.
+kept rather than applying the valid fragments. A table is a graph, so a
+partial apply is not a partial configuration but a different one — half of
+a renamed dependency edge resolves to an order nobody wrote.
 
 Shutdown writes `/run/td-svc/shutdown` before stopping anything (**I6**). A
 replacement instance that finds it **resumes to the power applet** — parking
 forever is a hung machine. Two constraints make that hold:
 
 - The teardown must not destroy the state it is gated on. `/etc/shutdown`
-  runs `umount -a -r`, which would take `/run` with it; `/run` is tmpfs
-  holding nothing that needs releasing, so it is excluded.
+  runs `umount -a -r --exclude /run`; without the exclusion it would take
+  `/run` with it, and the replacement would see a clean start and bring
+  services up against filesystems already released. The exclusion is EXACT,
+  so the moved btrfs at `/run/td-volume` is still unmounted; `/run` is tmpfs
+  holding nothing that needs releasing.
 - Once the transition begins, `start`/`restart`/`reload` are rejected and a
-  second shutdown request is a no-op.
+  second shutdown request is a no-op. Two presses, or a greeter and a park
+  handshake racing, are the ordinary way it arrives twice — so the second
+  reply reports the transition already under way rather than an error.
+
+The teardown walks BACKWARDS, one unit at a time, through
+the ordinary `stop` path — the same TERM, recorded containment, scheduled
+KILL and I4 sweep an operator's `stop` uses. A second teardown path would be
+a second set of bugs, and this one is already the harder-won code. A unit
+that will not go is waited for `stop-timeout`, doubled and with the sweep
+interval and a little slack added, and then left behind with a log line: a
+machine that refuses to power off because one service will not die is worse
+than one that powers off with it still running.
+
+What it walks is captured once, when the request arrives, and it is NOT simply
+the start order. A unit a `reload` dropped from the table is in no plan and no
+start order — but if it is still on its way down it is still a running
+process, and walking only the order would run `/etc/shutdown` while it held a
+filesystem open. Those go LAST in the captured walk, so the reverse pass
+reaches them FIRST: nothing still declared can depend on a unit that is no
+longer declared. A `reload` cannot change the walk underneath the teardown
+because `reload` is refused once the transition has begun.
+
+Reload's other half of that bookkeeping: a removed unit that is NOT running is
+dropped immediately rather than kept as a corpse. Keeping it would leak a
+`Service` per removal per reload, leave undeclared units in `status` forever,
+and — worse — re-declaring the name later would match the corpse and adopt its
+`Phase::Stopped`, which is a standing operator decision `start_eligible` will
+not override, so the re-added unit would never start.
+
+One word is the verb, the marker's contents and the applet's basename. That
+is deliberate: a resume reads back what the request wrote, and a mapping
+that disagreed anywhere would reboot a machine an operator asked to power
+off — silently, since nothing compares the two. A marker that is torn or
+unrecognised reads as `reboot` rather than as no shutdown at all, because
+the state it was written from is a system already being torn down.
+
+`finish_shutdown` runs `/etc/shutdown` and then `exec`s the applet, so it
+does not return on success. It opens `/dev/console` for the teardown rather
+than passing on whatever td-svc inherited: the teardown's last act is a
+marker the boot oracle latches, and by then the greeter's session leader is
+gone, so writes through any descriptor inherited from that terminal return
+EIO after the kernel's vhangup. The marker would simply vanish, which is
+indistinguishable from a teardown that never ran. If the `exec` fails the
+applet is missing or refused; td-svc says so on a timer and PARKS rather than
+resuming supervision of a system whose filesystems `/etc/shutdown` has just
+released. Exiting would be worse: PID 1 respawns td-svc unconditionally, so a
+fresh instance would read the marker, resume straight back to the same missing
+applet and exit again — a hot respawn loop through PID 1, no likelier to
+succeed on the hundredth try than the first. Parking leaves the machine
+diagnosable and the marker in place, so the handoff still completes if what
+was wrong is repaired.
+
+**Nothing on the image calls a power applet directly.** `/etc/tty-session`
+and `/etc/bootfail` — the two things that decide a boot is over — each
+`exec /bin/td-svc reboot`, and the `reboots_run_the_teardown_first` recipe
+test holds that over every generated `/etc` file: no direct
+`/bin/{reboot,poweroff,halt}`, no inlined `/etc/shutdown`, and exactly two
+initiators. Before td-svc they inlined `{ /etc/shutdown; exec /bin/reboot; }`
+themselves, which was right when nothing was supervised and resets a machine
+with live services now that something is.
 
 ### The greeter's exit status is meaningful
 
-`/etc/tty-session` ends `getty … && <tail>`. That `&&` is a safety property,
-not sequencing: if getty/login fails to start a session *at all*, the
-non-zero exit short-circuits the reboot so the wrapper is respawned visibly,
-rather than firing `reboot` and letting QEMU's `-no-reboot` mask a broken
+`/etc/tty-session` ends `getty … && exec /bin/td-svc reboot`. That `&&` is a
+safety property, not sequencing: if getty/login fails to start a session *at
+all*, the non-zero exit short-circuits the reboot so the wrapper is
+respawned visibly, rather than firing `reboot` and letting QEMU's
+`-no-reboot` mask a broken
 greeter as a clean exit-0 shutdown. **"The greeter never started" and "the
 user logged out" must remain distinguishable** — losing that yields a green
 boot oracle on a machine with no greeter, the worst shape a regression can
 take, since the oracle is what would otherwise catch it. td-svc never reads
 a non-zero greeter exit as a shutdown request; that is a restart.
+
+Delegating the reboot makes the greeter DEPEND on td-svc being reachable,
+which it did not before. If the control socket is gone the client exits
+non-zero, the wrapper exits non-zero, and the greeter is respawned — a retry
+loop at the console with td-svc's own error printed to `/dev/console` beside
+it. That is the right direction to fail: a supervisor that cannot be reached
+is broken, and under QEMU's `-no-reboot` this shows up as a boot that never
+ends rather than as a clean exit 0. A hung test is a worse experience than a
+failing one but a far better signal, and it is the same trade the `&&` above
+already makes. What the cutover must never do is fall back to `/bin/reboot`
+when td-svc cannot be reached: that would reset the machine with services
+running and the marker unwritten, which is exactly the outcome the invariant
+test forbids.
+
+The `exec` matters as much as the `&&`. The greeter is a `restart=always`
+unit, so the process td-svc watches for it BECOMES the client asking to
+reboot — and stopping the greeter is one of the steps that request triggers.
+td-svc must not read that exit as a crash: `stopping` short-circuits the
+restart policy before it is consulted, or a `restart=always` greeter would
+come back mid-teardown, forever, and the walk would never reach the handoff.
 
 ## 9. Ctrl-Alt-Del
 
@@ -696,13 +789,32 @@ Landing 3 added the control socket and the stop path: `/run/td-svc/control`
 with `status`, `start`, `stop` and `restart`; `td-svc <verb> [NAME]` as the
 client so the socket is usable from the image without another tool; and
 `Containment::Console`, which is what finally reaches the greeter's login
-tree (§4). `reload` and the power verbs land with ordered shutdown, since
-they are requests to begin a transition that does not exist yet.
+tree (§4).
 
-Ordered shutdown, Ctrl-Alt-Del arming, and log capture land subsequently,
-in that order. Sections above describe the completed design; anything not
-yet built is specified here so the later landings implement a reviewed
-target rather than an improvised one.
+Landing 4 (this one) added the ordered shutdown, and with it the three
+remaining verbs that were requests to begin a transition that did not exist:
+`reload`, `reboot`, `poweroff` and `halt`. td-svc now owns the end of a boot.
+The teardown reuses landing 3's stop path over the reversed plan,
+`/etc/shutdown` runs once every unit is down, and the applet is `exec`ed
+from there. The
+transition is persisted at `/run/td-svc/shutdown` before anything is stopped,
+so a supervisor that dies mid-teardown and is respawned by PID 1 resumes to
+the handoff instead of starting services (**I6**) — which is also why
+`/etc/shutdown` now unmounts with `--exclude /run`, a `umount` flag this
+landing added to `td-init`.
+
+The two things that decide a boot is over — `/etc/tty-session` when the
+greeter's session ends, and `/etc/bootfail` when a candidate image fails its
+park handshake — were cut over in the same landing, per directive 4: both
+`exec /bin/td-svc reboot`, and neither inlines the teardown any more. The
+invariant test that used to demand each initiator run `/etc/shutdown` itself
+now demands the opposite, because the teardown became a sequence only td-svc
+knows.
+
+Ctrl-Alt-Del arming and log capture land subsequently, in that order.
+Sections above describe the completed design; anything not yet built is
+specified here so the later landings implement a reviewed target rather than
+an improvised one.
 
 ### A table with no units, and the rescue td-init has but td-svc does not
 

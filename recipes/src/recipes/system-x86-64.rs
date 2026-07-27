@@ -879,46 +879,55 @@ fn build_deployment_init(sys: &SystemDef) -> String {
 /// the user's behalf, making `exit` a clean way out of the VM. Under qemu's
 /// `-no-reboot`, the resulting reset makes qemu exit 0.
 ///
-/// It runs `/etc/shutdown` ITSELF rather than leaving it to PID 1. td-init supervises
-/// with no signals, so it has no shutdown sequence to hook: on td the orderly teardown
-/// belongs to whoever DECIDES to shut down, and this wrapper is that decision point.
-/// The teardown's own failure never blocks the reset (`;`, not `&&`) — a machine that
-/// refuses to reboot because it could not unmount is worse than one that reboots after
-/// a sync — but /etc/shutdown withholds its marker, so the oracle reds rather than
-/// passing a boot whose state was never released.
+/// It ASKS td-svc rather than tearing the system down itself. The supervisor owns the
+/// ordered teardown (stop every unit in reverse dependency order, run `/etc/shutdown`,
+/// then exec the power applet); this wrapper is only the decision point, and one word
+/// on td-svc's control socket is the whole of that decision. It used to inline
+/// `{ /etc/shutdown; exec /bin/reboot; }`, which reset the machine with services still
+/// running — fine when nothing was supervised, wrong now that something is.
 ///
-/// The teardown writes to `/dev/console`, NOT to the tty it inherited. By the time it
-/// runs, the greeter shell — the SESSION LEADER of the ttyS0 session getty created —
-/// has exited, so the kernel has vhangup'd that terminal and every write through the
-/// inherited descriptor returns EIO. The teardown would run correctly and silently: the
-/// machine reboots, and the marker proving state was released is lost, which reads
-/// exactly like a teardown that never ran. This is only a hazard because the teardown
-/// moved OFF PID 1 (whose stdio is /dev/console and is never part of a login session);
-/// under busybox init the same script needed no redirect. Verified by observing exactly
-/// that failure — reboot with no output at all — before adding it.
+/// The reboot is gated on `getty` SUCCEEDING (`&&`): getty sets up the tty and execs the
+/// login chain, returning the user shell's exit status, so a normal `exit`/Ctrl-D returns
+/// 0 -> power off. But if getty/login FAILS to start a session at all (e.g. it cannot open
+/// ttyS0), getty returns non-zero, the `&&` short-circuits, and the wrapper exits non-zero
+/// so init RESPAWNS it — a visible retry loop — rather than firing `reboot` and letting
+/// `-no-reboot` mask a broken greeter as a clean exit-0 shutdown (re #541, Codex review).
+/// Keeping the `&&` keeps "the greeter never started" and "the user logged out"
+/// distinguishable, which is the only thing that makes a retry loop possible.
 ///
-/// The teardown and reboot are both gated on `getty` SUCCEEDING (`&&`): getty sets up the
-/// tty and execs the login chain, returning the user shell's exit status, so a normal
-/// `exit`/Ctrl-D returns 0 -> power off. But if getty/login FAILS to start a session at all
-/// (e.g. it cannot open ttyS0), getty returns non-zero, the `&&` short-circuits, and the
-/// wrapper exits non-zero so init RESPAWNS it — a visible retry loop — rather than firing
-/// `reboot` and letting `-no-reboot` mask a broken greeter as a clean exit-0 shutdown
-/// (re #541, Codex review).
+/// `>/dev/console` is for td-svc's OWN diagnostics — a refused or unreachable socket must
+/// be visible. By the time this runs the greeter shell (SESSION LEADER of getty's ttyS0
+/// session) has exited, so the kernel has vhangup'd that terminal and writes through the
+/// inherited descriptor return EIO. Under busybox init the same script needed no redirect;
+/// verified by observing exactly that failure — reboot with no output at all — before
+/// adding it. The teardown's own output no longer rides this descriptor: td-svc opens the
+/// console itself for `/etc/shutdown` (supervise.rs `run_teardown`), so the marker the boot
+/// oracle latches survives even if this client is gone by then.
 fn build_tty_session() -> String {
     "#!/bin/sh\n\
-     /bin/getty -L -n -l /etc/autologin 115200 ttyS0 vt100 && { /etc/shutdown; exec /bin/reboot; } >/dev/console 2>&1\n"
+     /bin/getty -L -n -l /etc/autologin 115200 ttyS0 vt100 && exec /bin/td-svc reboot >/dev/console 2>&1\n"
         .into()
 }
 
 fn build_shutdown() -> String {
-    // Run by /etc/tty-session before it reboots, with the greeter session already gone.
-    // Keep this a strict tripwire, but attempt every safety step after any failure.
+    // Run by td-svc once every service is down, immediately before it hands off to the
+    // power applet. Keep this a strict tripwire, but attempt every safety step after
+    // any failure.
+    //
+    // `--exclude /run` is load-bearing, not tidiness. td-svc records a shutdown in
+    // flight at /run/td-svc/shutdown BEFORE it stops anything (DESIGN.md I6), and PID 1
+    // respawns td-svc unconditionally — so a supervisor that dies while this script is
+    // running has to find that marker and resume to the power applet. `umount -a` would
+    // take the /run tmpfs with it, and the replacement would instead see a clean start
+    // and bring services up against filesystems this script has already released. The
+    // exclusion is EXACT, so the moved btrfs at /run/td-volume is still released; /run
+    // itself is tmpfs holding nothing that needs releasing.
     format!(
         "#!/bin/sh\n\
          ok=1\n\
          /bin/busybox sync || {{ echo 'td-shutdown: sync failed' >&2; ok=0; }}\n\
          /bin/umount /var || {{ echo 'td-shutdown: umount /var failed' >&2; ok=0; }}\n\
-         /bin/umount -a -r || {{ echo 'td-shutdown: final unmount failed' >&2; ok=0; }}\n\
+         /bin/umount -a -r --exclude /run || {{ echo 'td-shutdown: final unmount failed' >&2; ok=0; }}\n\
          /bin/busybox test \"$ok\" = 1 && echo {SYSTEM_SHUTDOWN_MARKER}\n"
     )
 }
@@ -1322,9 +1331,9 @@ fn build_bootsuccess(sys: &SystemDef) -> String {
 }
 
 /// The failed-candidate watchdog, and the SECOND thing on this image that decides to reboot.
-/// Since td-init supervises with no signals there is no `::shutdown:` action for `/bin/reboot`
-/// to trigger, so every initiator runs `/etc/shutdown` itself; `reboots_run_the_teardown_first`
-/// holds that invariant over all generated scripts.
+/// Like the greeter wrapper it asks td-svc rather than resetting the machine itself, so the
+/// ordered teardown happens once, in one place; `reboots_run_the_teardown_first` holds that
+/// invariant over all generated scripts.
 fn build_bootfail() -> String {
     format!(
         "#!/bin/sh\n\
@@ -1340,7 +1349,7 @@ fn build_bootfail() -> String {
          n=0\n\
          while [ \"$n\" -lt \"$wait\" ]; do \
          /bin/grep -q -x '{BOOT_FAIL_PARKED}' /run/td-boot-parked 2>/dev/null && \
-         {{ /etc/shutdown; exec /bin/reboot; }} >/dev/console 2>&1; \
+         exec /bin/td-svc reboot >/dev/console 2>&1; \
          n=$((n+1)); /bin/busybox sleep 1; \
          done\n\
          echo 'td-boot: greeter park handshake timed out' >&2\n\
@@ -3876,43 +3885,41 @@ mod tests {
             );
         }
         let session = build_tty_session();
-        // getty must gate BOTH the teardown and the reboot (`&&`), so a FAILED session
-        // respawns rather than tearing a live system down and masking a broken greeter as a
-        // clean exit-0 shutdown.
+        // getty must gate the reboot (`&&`), so a FAILED session respawns rather than tearing
+        // a live system down and masking a broken greeter as a clean exit-0 shutdown. This is
+        // the only thing keeping "the greeter never started" and "the user logged out"
+        // distinguishable.
         assert!(
             session.contains("/bin/getty ")
                 && session.contains("-l /etc/autologin ")
-                && session.contains("&& { /etc/shutdown; exec /bin/reboot; }")
+                && session.contains("&& exec /bin/td-svc reboot")
                 && !session.contains("reboot -f"),
             "tty-session must run getty (autologin at /etc/autologin) then, only on success, \
-             run the teardown and reboot, while a failed login retries"
+             ask td-svc to reboot, while a failed login retries"
         );
-        // The teardown runs AFTER the greeter shell — the ttyS0 session leader — exited, so
-        // the kernel has already vhangup'd that terminal and writes through the inherited
-        // descriptor return EIO. Without this the machine still reboots and the marker is
-        // simply lost, which is indistinguishable from a teardown that never ran. Observed,
-        // not theorised.
+        // The wrapper must not tear the system down itself: td-svc owns the ordered teardown,
+        // and a second copy of that sequence here would reset the machine with services still
+        // running.
         assert!(
-            session.contains("{ /etc/shutdown; exec /bin/reboot; } >/dev/console 2>&1"),
-            "the teardown must write to /dev/console, not the hung-up tty it inherits from \
-             the ended login session - otherwise TD-SHUTDOWN-OK is written to a descriptor \
-             returning EIO and the oracle reds on a teardown that actually worked"
+            !session.contains("/etc/shutdown"),
+            "the greeter wrapper must delegate the teardown to td-svc, not inline /etc/shutdown"
         );
-        // `;` between them, not `&&`: a machine that refuses to reboot because it could not
-        // unmount is worse than one that reboots after a sync. The marker, not the exit
-        // status, is what carries the failure to the oracle.
-        // Assert the separator POSITIVELY: forbidding `&&` alone still admits `|| exit 1`
-        // and every other operator that makes the reset conditional on the teardown.
+        // td-svc's own diagnostics must reach /dev/console, not the hung-up tty. This runs
+        // AFTER the greeter shell — the ttyS0 session leader — exited, so the kernel has
+        // vhangup'd that terminal and writes through the inherited descriptor return EIO.
+        // Without this a refused or unreachable control socket is silent and the machine just
+        // sits there. Observed as a reboot with no output at all, not theorised.
         assert!(
-            session.contains("/etc/shutdown; exec /bin/reboot"),
-            "a failed teardown must not block the reset - `;` between them, so the reboot is \
-             unconditional and a failure is carried by the withheld marker, not the exit status"
+            session.contains("exec /bin/td-svc reboot >/dev/console 2>&1"),
+            "the reboot client must write to /dev/console, not the hung-up tty it inherits \
+             from the ended login session - otherwise its errors go to a descriptor returning \
+             EIO and a greeter that cannot reach td-svc looks like a hang with no explanation"
         );
         let shutdown = build_shutdown();
         assert!(
             shutdown.contains("/bin/busybox sync || {")
                 && shutdown.contains("/bin/umount /var || {")
-                && shutdown.contains("/bin/umount -a -r || {")
+                && shutdown.contains("/bin/umount -a -r --exclude /run || {")
                 && shutdown.contains("/bin/busybox test \"$ok\" = 1")
                 && shutdown.contains(SYSTEM_SHUTDOWN_MARKER),
             "the teardown must attempt every safety step and emit its marker only when all pass"
@@ -4183,7 +4190,8 @@ mod tests {
         assert!(
             bootfail.contains(BOOT_FAIL_TARGET_CMDLINE_TOKEN)
                 && bootfail.contains("set -f")
-                && bootfail.contains("exec /bin/reboot")
+                && bootfail.contains("exec /bin/td-svc reboot >/dev/console 2>&1")
+                && !bootfail.contains("/etc/shutdown")
                 && bootfail.contains(BOOT_FAIL_PARKED)
                 && bootfail.contains("greeter park handshake timed out")
                 && bootfail.contains(&format!("wait={BOOT_FAIL_PARK_WAIT_SECS}"))
@@ -5021,46 +5029,62 @@ mod tests {
         );
     }
 
-    /// Every script that decides to reboot must run the teardown itself.
+    /// Every script that decides to end the boot must go through td-svc.
     ///
     /// Under busybox `/bin/reboot` signalled PID 1 into `::shutdown:/etc/shutdown`. td-init
     /// supervises with NO signals, so that action does not exist and nothing catches a bare
-    /// `exec /bin/reboot`: /var stays mounted (unclean Btrfs) and the shutdown marker never
-    /// prints. This scans EVERY generated /etc file rather than the one initiator that
-    /// existed when the rule was written — `/etc/bootfail` became a second one while this
-    /// branch was in review, and a per-file assertion would not have noticed.
+    /// `exec /bin/reboot`: services stay running, /var stays mounted (unclean Btrfs) and the
+    /// shutdown marker never prints. The rule used to be "run /etc/shutdown first", which each
+    /// initiator satisfied by inlining the teardown; that stopped being enough once td-svc had
+    /// units to stop, because the teardown is now a SEQUENCE (stop every unit in reverse
+    /// dependency order, then /etc/shutdown, then the power applet) and only td-svc knows it.
+    /// So the invariant tightened: the power applets belong to td-svc alone, and a generated
+    /// script asks for one by NAMING it to td-svc.
+    ///
+    /// Scanning every generated /etc file, not the one initiator that existed when the rule was
+    /// written: `/etc/bootfail` became a second one while an earlier branch was in review, and
+    /// a per-file assertion would not have noticed.
     #[test]
     fn reboots_run_the_teardown_first() {
-        // Match `/bin/reboot`, not `exec /bin/reboot`: a caller that drops the `exec` still
-        // reboots, and still skips the teardown, so keying on the `exec` would let exactly
-        // that edit through (Agy review). The refusal PROBES also name /bin/reboot — on
-        // purpose, with a bogus argument they must refuse — so strip the generated probe
-        // segments first; they are the one invocation that does not reboot.
-        // All three power applets, not just reboot: poweroff and halt end a boot identically,
-        // so a script switched to either would escape a reboot-only scan while the count below
-        // still held.
+        // The refusal PROBES name the applets on purpose — with a bogus argument they must
+        // refuse — so strip the generated probe segments first; they are the one invocation
+        // that does not end a boot.
+        // All three applets, not just reboot: poweroff and halt end a boot identically, so a
+        // script switched to either would escape a reboot-only scan while the count still held.
+        const POWER: [&str; 3] = ["reboot", "poweroff", "halt"];
         let mut initiators = 0;
         for (name, body, _) in etc_files(&SYSTEM) {
             let mut body = body;
             for (applet, probe) in TD_INIT_FARM {
                 body = body.replace(&td_init_probe(applet, probe, &SYSTEM), "");
             }
-            for applet in ["reboot", "poweroff", "halt"] {
-                for (at, _) in body.match_indices(&format!("/bin/{applet}")) {
-                    initiators += 1;
-                    assert!(
-                        body.get(..at).unwrap_or_default().contains("/etc/shutdown"),
-                        "/etc/{name} runs /bin/{applet} without running /etc/shutdown first - \
-                         with no ::shutdown: action to catch it, /var is left mounted and the \
-                         shutdown marker is never printed"
-                    );
-                }
+            for applet in POWER {
+                // Match `/bin/reboot`, not `exec /bin/reboot`: a caller that drops the `exec`
+                // still reboots, and still skips the teardown, so keying on the `exec` would
+                // let exactly that edit through (Agy review).
+                assert!(
+                    !body.contains(&format!("/bin/{applet}")),
+                    "/etc/{name} runs /bin/{applet} directly - the power applets belong to \
+                     td-svc, which stops every unit in reverse dependency order and runs \
+                     /etc/shutdown before exec'ing one; calling it here resets the machine \
+                     with services still running and no marker printed"
+                );
+                initiators += body.matches(&format!("/bin/td-svc {applet}")).count();
             }
+            // The teardown script is td-svc's to run, at the point in the sequence where every
+            // unit is already down. An initiator that also runs it directly runs it twice, the
+            // first time against a live system.
+            assert!(
+                !body.contains("/etc/shutdown"),
+                "/etc/{name} runs /etc/shutdown itself - td-svc runs it, after the units are \
+                 stopped; running it here unmounts /var out from under them"
+            );
         }
         assert_eq!(
             initiators, 2,
-            "expected exactly the two known reboot initiators (tty-session, bootfail); a new \
-             one must run the teardown too, and a vanished one means this stopped covering it"
+            "expected exactly the two known power initiators (tty-session, bootfail), each \
+             asking td-svc; a new one must ask it too, and a vanished one means this stopped \
+             covering it"
         );
     }
 

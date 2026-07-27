@@ -48,14 +48,19 @@ pub(crate) fn emit_err(text: &str) {
 fn usage() -> String {
     format!(
         "usage: td-svc <check|run> [-f FILE]\n       \
-         td-svc <status|start|stop|restart> [NAME]\n  \
-         check    validate FILE and print the start order (exit 1 on any complaint)\n  \
-         run      supervise the services in FILE\n  \
-         status   what the running supervisor is doing (all units, or NAME)\n  \
-         start    start NAME, clearing any restart backoff\n  \
-         stop     stop NAME and keep it stopped\n  \
-         restart  stop NAME, then start it again\n\
-         FILE defaults to {DEFAULT_PATH}; the last four talk to {socket}"
+         td-svc <status|start|stop|restart> [NAME]\n       \
+         td-svc <reload|reboot|poweroff|halt>\n  \
+         check     validate FILE and print the start order (exit 1 on any complaint)\n  \
+         run       supervise the services in FILE\n  \
+         status    what the running supervisor is doing (all units, or NAME)\n  \
+         start     start NAME, clearing any restart backoff\n  \
+         stop      stop NAME and keep it stopped\n  \
+         restart   stop NAME, then start it again\n  \
+         reload    re-read FILE; on any complaint the running table is kept\n  \
+         reboot    stop every service, run /etc/shutdown, then reset\n  \
+         poweroff  the same, then power off\n  \
+         halt      the same, then halt\n\
+         FILE defaults to {DEFAULT_PATH}; everything but check/run talks to {socket}"
     ,
         socket = control::PATH
     )
@@ -76,7 +81,9 @@ enum Route {
 }
 
 /// The verbs that address a running supervisor rather than a file.
-const CTL_VERBS: [&str; 4] = ["status", "start", "stop", "restart"];
+const CTL_VERBS: [&str; 8] = [
+    "status", "start", "stop", "restart", "reload", "reboot", "poweroff", "halt",
+];
 
 fn route(args: &[String]) -> Route {
     let Some(verb) = args.first() else {
@@ -283,6 +290,10 @@ mod tests {
             (vec!["stop", "sshd"], "stop sshd"),
             (vec!["restart", "greeter"], "restart greeter"),
             (vec!["start", "netup"], "start netup"),
+            (vec!["reload"], "reload"),
+            (vec!["reboot"], "reboot"),
+            (vec!["poweroff"], "poweroff"),
+            (vec!["halt"], "halt"),
         ] {
             let args: Vec<String> = argv.iter().map(|a| (*a).to_string()).collect();
             assert_eq!(
@@ -291,6 +302,20 @@ mod tests {
                     request: expect.to_string()
                 },
                 "{argv:?} did not route to the control socket"
+            );
+        }
+        // And EVERY verb, so adding one to CTL_VERBS without routing it — or
+        // dropping one — cannot pass. `/etc/tty-session` ends by exec'ing
+        // `td-svc reboot`; if that stopped reaching the socket the greeter
+        // could no longer end a boot.
+        for verb in CTL_VERBS {
+            let args = vec![verb.to_string()];
+            assert_eq!(
+                route(&args),
+                Route::Ctl {
+                    request: verb.to_string()
+                },
+                "{verb} is a control verb but did not route to the socket"
             );
         }
     }

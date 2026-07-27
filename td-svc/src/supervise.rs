@@ -53,7 +53,30 @@ const SILENT_TABLE_COMPLAINT: Duration = Duration::from_secs(60);
 const STOP_SWEEP_INTERVAL: Duration = Duration::from_secs(1);
 
 /// What the socket answers an unparseable request with.
-const CONTROL_USAGE: &str = "usage: status [NAME] | start NAME | stop NAME | restart NAME\n";
+const CONTROL_USAGE: &str = "usage: status [NAME] | start NAME | stop NAME | restart NAME | \
+                             reload | reboot | poweroff | halt\n";
+
+/// Where a shutdown in flight is recorded, so a REPLACEMENT td-svc finds it.
+///
+/// DESIGN.md I6. PID 1 respawns td-svc unconditionally, so a supervisor that
+/// dies mid-teardown must not come back and start services while an orphaned
+/// `/etc/shutdown` is unmounting filesystems underneath them.
+const SHUTDOWN_MARKER: &str = "/run/td-svc/shutdown";
+
+/// The teardown script, run once every service is down and before the power
+/// applet. It is what actually syncs and unmounts.
+const SHUTDOWN_SCRIPT: &str = "/etc/shutdown";
+
+/// Extra time, beyond the unit's own `stop-timeout`, that a shutdown waits for
+/// one service before moving on.
+///
+/// A stop is TERM, wait `stop-timeout`, KILL — so a unit that ignores both
+/// needs a second `stop-timeout` for the KILL to land and the containment to
+/// drain, plus a sweep interval for the scan that proves it. Past that the
+/// shutdown proceeds anyway and says so: one service that will not die must
+/// not leave the machine up forever, which is the failure this bound exists to
+/// rule out.
+const SHUTDOWN_UNIT_SLACK: Duration = Duration::from_secs(2);
 
 fn unknown(name: &str) -> String {
     format!("error: no such service {name:?}\n")
@@ -121,6 +144,12 @@ pub struct Service {
     pub unit: Unit,
     pub phase: Phase,
     pub pid: Option<i32>,
+    /// Dropped from the table by a `reload`, but still on its way down.
+    ///
+    /// It is no longer declared, so it is in no plan and no start order — but
+    /// it is still RUNNING, and the shutdown has to wait for it like any other
+    /// live process. Cleared if the name is declared again.
+    pub retired: bool,
     /// `/proc` field 22 for `pid`, read at spawn. A pid alone does not identify
     /// a process: the KILL that follows a TERM is `stop-timeout` later, and in
     /// that window the child can die, be reaped, and have its pid recycled onto
@@ -215,6 +244,7 @@ impl Service {
             tty_dev: None,
             killed: false,
             next_sweep: None,
+            retired: false,
         }
     }
 
@@ -295,6 +325,105 @@ fn packed_device(rdev: u64) -> Option<i32> {
     // the two bit-exact over the whole range.
     let packed = u32::try_from(rdev).ok()? as i32;
     (packed != 0).then_some(packed)
+}
+
+/// The next service a teardown should stop, and the cursor to resume from.
+///
+/// REVERSE plan order, which is the only thing that makes the order mean
+/// anything: a dependent must be down before what it depends on, or the
+/// teardown pulls `netup` out from under an `sshd` that is still serving.
+///
+/// Split out from `advance_shutdown` so the direction is testable without
+/// live processes and a working `kill` — with those in the way, a walk that
+/// went forwards and a walk that went backwards leave the same wreckage.
+fn next_to_stop(order: &[usize], cursor: usize, live: &[bool]) -> Option<(usize, usize)> {
+    let mut cursor = cursor;
+    while cursor < order.len() {
+        let index = order.get(order.len() - 1 - cursor).copied();
+        cursor += 1;
+        if let Some(index) = index {
+            if live.get(index).copied().unwrap_or(false) {
+                return Some((index, cursor));
+            }
+        }
+    }
+    None
+}
+
+/// Record a shutdown in flight, durably enough for a REPLACEMENT to see it.
+///
+/// Written to a temporary name and renamed, because a torn marker is worse
+/// than none: `rename(2)` within a directory is atomic, so a resumer sees
+/// either the whole word or no file at all, never half of one. The directory
+/// is `control::DIR`, which `bind` already created at `0700`.
+fn write_marker(path: &str, power: Power) -> io::Result<()> {
+    let staging = format!("{path}.new");
+    if let Some(dir) = std::path::Path::new(path).parent() {
+        // `bind` normally made this, but a td-svc whose socket failed to bind
+        // still has to be able to shut the machine down. An existing DIRECTORY
+        // is already `Ok`; the only thing this can now report is something that
+        // is not one sitting in the way, which is worth saying precisely rather
+        // than rediscovering as a confusing failure of the write below.
+        std::fs::create_dir_all(dir)?;
+    }
+    std::fs::write(&staging, format!("{}\n", power.as_str()))?;
+    std::fs::rename(&staging, path)
+}
+
+/// What a marker left by an earlier instance says, if there is one.
+///
+/// A marker that exists but cannot be read, or carries a word this does not
+/// know, still means a shutdown BEGAN — so it resumes, and resumes to
+/// `Reboot`. The alternative is to park, and a machine that is up with its
+/// filesystems unmounted and no services is the outcome I6 exists to prevent.
+/// Reboot is the recoverable end of that choice.
+fn read_marker(path: &str) -> Option<Power> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return None,
+        Err(e) => {
+            log(&format!("{path}: {e}; resuming the shutdown as a reboot"));
+            return Some(Power::Reboot);
+        }
+    };
+    match Power::parse(text.trim()) {
+        Some(power) => Some(power),
+        None => {
+            log(&format!(
+                "{path}: does not name a power action; resuming as a reboot"
+            ));
+            Some(Power::Reboot)
+        }
+    }
+}
+
+/// Run `/etc/shutdown` and wait for it. Its failures are ITS to report — the
+/// script is a tripwire that prints its own diagnostics — but a script that
+/// cannot be run at all is worth a line, since the unmounts then never happen.
+fn run_teardown(script: &str) {
+    log(&format!("running {script}"));
+    let mut cmd = Command::new(script);
+    cmd.stdin(Stdio::null());
+    // Explicitly the CONSOLE, not whatever td-svc inherited. The teardown's
+    // last act is to print a marker the boot oracle latches, and by the time it
+    // runs the greeter's session leader is gone — so the terminal it was on has
+    // been vhangup'd and writes through any descriptor inherited from it return
+    // EIO. The marker would simply vanish, which is indistinguishable from a
+    // teardown that never ran. Observed on the wire, not theorised.
+    match open_tty(CONSOLE) {
+        Ok(console) => match console.try_clone() {
+            Ok(errors) => {
+                cmd.stdout(Stdio::from(console)).stderr(Stdio::from(errors));
+            }
+            Err(e) => log(&format!("{CONSOLE}: {e}; the teardown keeps our own output")),
+        },
+        Err(e) => log(&format!("{CONSOLE}: {e}; the teardown keeps our own output")),
+    }
+    match cmd.status() {
+        Ok(status) if status.success() => {}
+        Ok(status) => log(&format!("{script}: exited {status}; continuing anyway")),
+        Err(e) => log(&format!("{script}: {e}; filesystems may not be clean")),
+    }
 }
 
 /// What is left of a recorded stop scope once its leader has been reaped.
@@ -679,6 +808,65 @@ fn spawn_thread<F: FnOnce() + Send + 'static>(what: &str, body: F) -> bool {
     }
 }
 
+/// Where a shutdown ends. The three td-init applets that call `reboot(2)`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Power {
+    Reboot,
+    /// `poweroff`.
+    Off,
+    Halt,
+}
+
+impl Power {
+    /// The word the control verb uses, the word the marker carries, and the
+    /// applet's basename — deliberately the same string, so a resume cannot
+    /// disagree with the request that wrote it.
+    fn as_str(self) -> &'static str {
+        match self {
+            Power::Reboot => "reboot",
+            Power::Off => "poweroff",
+            Power::Halt => "halt",
+        }
+    }
+
+    fn parse(word: &str) -> Option<Power> {
+        match word {
+            "reboot" => Some(Power::Reboot),
+            "poweroff" => Some(Power::Off),
+            "halt" => Some(Power::Halt),
+            _ => None,
+        }
+    }
+
+    fn applet(self) -> String {
+        format!("/bin/{}", self.as_str())
+    }
+}
+
+/// A shutdown transition in flight.
+///
+/// Services are stopped ONE AT A TIME in reverse plan order, because that is
+/// the only thing that makes the order mean anything: a dependent must be down
+/// before what it depends on. Each is bounded, so a service that will not die
+/// costs its own timeout rather than the machine.
+struct Shutdown {
+    power: Power,
+    /// What to stop, in START order; the teardown walks it backwards.
+    ///
+    /// Captured once, at `begin_shutdown`, rather than read from `order` each
+    /// pass — and it is NOT just `order`. A unit a `reload` dropped from the
+    /// table is in no plan and no start order, but if it is still on its way
+    /// down it is still a running process, and walking only `order` would run
+    /// `/etc/shutdown` while it held a filesystem open. Those go at the END
+    /// here, so the reverse walk reaches them FIRST: nothing declared depends
+    /// on a unit that is no longer declared.
+    walk: Vec<usize>,
+    /// How far down the reversed walk we have got.
+    cursor: usize,
+    /// The service being stopped now, and when to give up on it.
+    current: Option<(usize, Instant)>,
+}
+
 pub struct Runtime {
     services: Vec<Service>,
     /// Indices into `services`, in start order. Indices rather than names so
@@ -703,6 +891,16 @@ pub struct Runtime {
     /// The table this was loaded from, carried only so the "no units" complaint
     /// can name the file an operator has to go look at.
     table_path: String,
+    /// The shutdown transition, once one has begun. Monotonic (**I6**): it is
+    /// set once and never cleared, so nothing can start a service after the
+    /// teardown has touched one.
+    shutdown: Option<Shutdown>,
+    /// Where the I6 marker lives. A field, not the constant used directly, for
+    /// the same reason `table_path` is one: every interesting property of the
+    /// marker — that it is written BEFORE the first stop, that a resume reads
+    /// it, that a torn one still resumes — is only testable against a path a
+    /// test can write. The shipped binary always passes `SHUTDOWN_MARKER`.
+    marker_path: String,
 }
 
 impl Runtime {
@@ -754,6 +952,8 @@ impl Runtime {
                 self_pid,
                 self_ids: own,
                 table_path: table_path.to_string(),
+                shutdown: None,
+                marker_path: SHUTDOWN_MARKER.to_string(),
             },
             complaints,
         )
@@ -1053,7 +1253,16 @@ impl Runtime {
     fn start_eligible(&mut self) -> Option<Instant> {
         let mut next_wake: Option<Instant> = None;
         let now = Instant::now();
+        // Once the teardown has begun NOTHING starts again — not a restart, not
+        // a pending retry, not a console (I5 yields to I6 here: a console on a
+        // machine whose filesystems are going away is not a rescue). The timer
+        // collection below still runs, because the stops in flight are driven
+        // by exactly those deadlines.
+        let starting = self.shutdown.is_none();
         for position in 0..self.order.len() {
+            if !starting {
+                break;
+            }
             let Some(&index) = self.order.get(position) else {
                 continue;
             };
@@ -1485,6 +1694,333 @@ impl Runtime {
         }
     }
 
+    /// Re-read the table. TRANSACTIONAL: on any diagnostic, nothing changes.
+    ///
+    /// The bar is exactly `td-svc check`'s — parse problems AND plan
+    /// complaints — because applying the valid fragments of a table an
+    /// operator got wrong is how a reload turns one broken unit into a broken
+    /// machine. Keeping the last-known-good table means the worst case of a
+    /// bad reload is that it did nothing, which is a state the operator can
+    /// still fix from the console the old table is still running.
+    ///
+    /// This is what §3 assigns dependency-cycle recovery to: a unit the plan
+    /// dropped cannot be rescued by `start` (nothing walks it), so the only
+    /// route back is a corrected table.
+    ///
+    /// RUNNING processes are not disturbed. A unit whose stanza changed keeps
+    /// its current process — the new definition applies at its next start —
+    /// because restarting on reload would take the console down as a side
+    /// effect of editing an unrelated stanza. A unit that VANISHED from the
+    /// table is no longer declared, so it is stopped; it stays visible in
+    /// `status` until it is down, rather than disappearing while its process
+    /// is still alive.
+    fn control_reload(&mut self) -> String {
+        let path = self.table_path.clone();
+        let text = match std::fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(e) => return format!("error: reload: cannot read {path}: {e}; kept the running table\n"),
+        };
+        let (units, problems) = crate::table::parse(&text);
+        if !problems.is_empty() {
+            return format!(
+                "error: reload: {path} has {} problem(s); kept the running table\n{}",
+                problems.len(),
+                problems
+                    .iter()
+                    .map(|p| format!("  {p}\n"))
+                    .collect::<String>()
+            );
+        }
+        if units.is_empty() {
+            return format!(
+                "error: reload: {path} declares no units; kept the running table\n"
+            );
+        }
+        let plan = order::plan(&units);
+        let complaints = plan.complaints();
+        if !complaints.is_empty() {
+            return format!(
+                "error: reload: {path} does not resolve; kept the running table\n{}",
+                complaints
+                    .iter()
+                    .map(|c| format!("  {c}\n"))
+                    .collect::<String>()
+            );
+        }
+
+        // Committed. First drop any retired unit whose stop has since finished:
+        // `self.order` is rebuilt from scratch below, so this is the one place
+        // a `Service` can be removed without invalidating an index somebody
+        // holds.
+        self.services
+            .retain(|s| !(s.retired && s.pid.is_none() && !s.stopping));
+
+        // Carry each surviving unit's RUNTIME state across, keyed by
+        // name, and swap in its new definition.
+        let mut kept: Vec<Service> = Vec::new();
+        let mut retired: Vec<String> = Vec::new();
+        for unit in units {
+            let existing = self.services.iter().position(|s| s.unit.name == unit.name);
+            let mut service = match existing {
+                Some(at) => {
+                    let mut service = self.services.remove(at);
+                    service.unit = unit;
+                    // Declared again, so no longer retired. If the stop this
+                    // unit's REMOVAL started is still in flight, the table now
+                    // says it should be up: reuse the restart intent so it
+                    // comes back when the stop completes, rather than settling
+                    // into `Stopped` — a phase only an explicit `start` leaves.
+                    if service.retired && service.stopping {
+                        service.start_after_stop = true;
+                    }
+                    service.retired = false;
+                    service
+                }
+                None => Service::new(unit),
+            };
+            let name = &service.unit.name;
+            let skipped = plan.skipped.iter().any(|(n, _)| n == name);
+            let ordered = plan.order.iter().any(|n| n == name);
+            if skipped && !ordered && service.pid.is_none() {
+                service.phase = Phase::Failed;
+            }
+            service.forced = skipped && ordered;
+            kept.push(service);
+        }
+        // Whatever is left in `self.services` is no longer declared. One that
+        // is still UP is kept, so its stop can be driven and `status` can show
+        // it going down; one that is already down is dropped here and now.
+        // Keeping those too would leak a `Service` per removed unit per reload,
+        // and worse: re-declaring that name later would match the corpse, adopt
+        // its `Phase::Stopped` — a standing operator decision `start_eligible`
+        // will not override — and the re-added unit would never start.
+        let leftover: Vec<Service> = std::mem::take(&mut self.services);
+        for mut service in leftover {
+            if service.pid.is_none() && !service.stopping {
+                log(&format!("{}: no longer in the table", service.unit.name));
+                continue;
+            }
+            retired.push(service.unit.name.clone());
+            service.retired = true;
+            kept.push(service);
+        }
+        self.services = kept;
+        self.order = plan
+            .order
+            .iter()
+            .filter_map(|name| self.services.iter().position(|s| &s.unit.name == name))
+            .collect();
+        for name in &retired {
+            // Only stop what is not already stopping. Re-issuing it would reset
+            // `kill_at`, so a script reloading once a second would hold the
+            // escalation off forever for that unit.
+            if self
+                .index_of(name)
+                .and_then(|i| self.services.get(i))
+                .is_some_and(|s| s.stopping)
+            {
+                continue;
+            }
+            let reply = self.control_stop(name, false);
+            if let Some(why) = reply.strip_prefix("error: ") {
+                log(&format!("{name}: no longer declared, and {}", why.trim_end()));
+            } else {
+                log(&format!("{name}: no longer in the table; stopping it"));
+            }
+        }
+        let mut reply = format!("reloaded {path}\n");
+        if !retired.is_empty() {
+            reply.push_str(&format!(
+                "  stopping {} unit(s) no longer declared: {}\n",
+                retired.len(),
+                retired.join(", ")
+            ));
+        }
+        reply
+    }
+
+    /// Begin the transition, or report that one is already under way.
+    ///
+    /// The MARKER goes down before a single service is stopped (**I6**). The
+    /// order is the whole point: a supervisor that dies after stopping sshd but
+    /// before recording why would be respawned by PID 1 and would start sshd
+    /// again, against a `/etc/shutdown` already unmounting underneath it. A
+    /// marker that cannot be written is therefore fatal to the REQUEST, not
+    /// something to proceed past — better a machine that stays up and says so
+    /// than one torn down with no record that it was deliberate.
+    fn begin_shutdown(&mut self, power: Power) -> String {
+        if let Some(existing) = &self.shutdown {
+            // Not an error. Two presses, or a greeter and a park handshake
+            // racing, are the ordinary way this arrives twice.
+            return format!(
+                "shutdown already in progress ({})\n",
+                existing.power.as_str()
+            );
+        }
+        if let Err(e) = write_marker(&self.marker_path, power) {
+            let path = &self.marker_path;
+            return format!(
+                "error: cannot record the shutdown in {path}: {e}; \
+                 nothing has been stopped\n"
+            );
+        }
+        log(&format!("{}: stopping every service", power.as_str()));
+        let mut walk = self.order.clone();
+        for index in 0..self.services.len() {
+            let undeclared = self
+                .services
+                .get(index)
+                .is_some_and(|s| s.retired && (s.pid.is_some() || s.stopping));
+            if undeclared && !walk.contains(&index) {
+                walk.push(index);
+            }
+        }
+        self.shutdown = Some(Shutdown {
+            power,
+            walk,
+            cursor: 0,
+            current: None,
+        });
+        format!("{} requested\n", power.as_str())
+    }
+
+    /// Drive the teardown one step. Called once per loop pass.
+    ///
+    /// Reuses the ordinary stop path rather than opening a second one: each
+    /// service goes through `control_stop`, so the TERM, the recorded
+    /// containment, the scheduled KILL and the I4 sweep are the SAME code an
+    /// operator's `stop` uses. A second teardown would be a second set of bugs.
+    /// Returns the power action once every service is down — the caller runs
+    /// the teardown and hands off. Split that way so this whole state machine
+    /// is testable: the handoff `exec`s, so a version that performed it here
+    /// could only ever be run once, by the real `run` loop.
+    fn advance_shutdown(&mut self) -> Option<Power> {
+        let Some(state) = &self.shutdown else {
+            return None;
+        };
+        let power = state.power;
+        let mut cursor = state.cursor;
+        let walk = state.walk.clone();
+        // Still waiting on the service we asked to stop?
+        if let Some((index, deadline)) = state.current {
+            let done = self
+                .services
+                .get(index)
+                .is_some_and(|s| !s.stopping && s.pid.is_none());
+            if !done {
+                if Instant::now() < deadline {
+                    return None;
+                }
+                if let Some(service) = self.services.get(index) {
+                    log(&format!(
+                        "{}: did not stop in time; going on without it",
+                        service.unit.name
+                    ));
+                }
+            }
+            if let Some(state) = &mut self.shutdown {
+                state.current = None;
+            }
+        }
+        // Reverse plan order: a dependent is stopped before what it depends on.
+        let live: Vec<bool> = self
+            .services
+            .iter()
+            .map(|s| s.pid.is_some() || s.stopping)
+            .collect();
+        while let Some((index, next)) = next_to_stop(&walk, cursor, &live) {
+            cursor = next;
+            let Some(name) = self.services.get(index).map(|s| s.unit.name.clone()) else {
+                continue;
+            };
+            let reply = self.control_stop(&name, false);
+            if let Some(why) = reply.strip_prefix("error: ") {
+                // A stop that could not be sent is not a reason to wait out a
+                // deadline for it.
+                log(&format!("{name}: {}", why.trim_end()));
+                continue;
+            }
+            let bound = self
+                .services
+                .get(index)
+                .map(|s| s.unit.stop_timeout)
+                .unwrap_or(crate::table::DEFAULT_STOP_TIMEOUT);
+            // `saturating_*` throughout: `Duration`'s `+` PANICS on overflow,
+            // and a deadline is not worth a panic in the one code path whose
+            // job is to end a boot cleanly.
+            let wait = bound
+                .saturating_mul(2)
+                .saturating_add(STOP_SWEEP_INTERVAL)
+                .saturating_add(SHUTDOWN_UNIT_SLACK);
+            // A deadline that will not fit means DO NOT WAIT, never wait
+            // forever — and the cursor moves regardless, or the next pass
+            // re-selects this same unit, re-sends TERM and resets the KILL it
+            // just scheduled, so the escalation never fires and the teardown
+            // never advances.
+            let deadline = Instant::now()
+                .checked_add(wait)
+                .unwrap_or_else(Instant::now);
+            if let Some(state) = &mut self.shutdown {
+                state.cursor = cursor;
+                state.current = Some((index, deadline));
+            }
+            return None;
+        }
+        if let Some(state) = &mut self.shutdown {
+            state.cursor = cursor;
+        }
+        Some(power)
+    }
+
+    /// Adopt a shutdown an earlier instance began but did not finish (**I6**).
+    ///
+    /// Split out of `run` so it can be tested: `run` never returns, so the one
+    /// step that decides a respawned supervisor supervises nothing would
+    /// otherwise be reachable only from a booted machine.
+    fn resume_if_marked(&mut self) {
+        let Some(power) = read_marker(&self.marker_path) else {
+            return;
+        };
+        let path = &self.marker_path;
+        log(&format!(
+            "{path} found: an earlier shutdown did not finish; resuming"
+        ));
+        // A fresh process has nothing retired: this table has never been
+        // reloaded, so the start order IS everything there is to stop.
+        self.shutdown = Some(Shutdown {
+            power,
+            walk: self.order.clone(),
+            cursor: 0,
+            current: None,
+        });
+    }
+
+    /// Every service is down: run the teardown, then hand off to the applet.
+    ///
+    /// This does not return on success — `exec` replaces td-svc. If it DOES
+    /// return, the applet is missing or refused, and this PARKS: it says so on
+    /// a timer and stays. Exiting would be worse, not better. PID 1 respawns
+    /// td-svc unconditionally, so a fresh instance would read the marker,
+    /// resume straight back to this same missing applet and exit again — a hot
+    /// respawn loop through PID 1 that is no likelier to succeed on the
+    /// hundredth try than the first. Parking leaves the machine diagnosable
+    /// and the marker in place, so the handoff still completes if whatever was
+    /// wrong is repaired.
+    fn finish_shutdown(&mut self, power: Power) -> ! {
+        run_teardown(SHUTDOWN_SCRIPT);
+        let applet = power.applet();
+        log(&format!("handing off to {applet}"));
+        // `exec` only RETURNS on failure, and what it returns is the error.
+        let error = std::os::unix::process::CommandExt::exec(&mut Command::new(&applet));
+        log(&format!("{applet}: {error}; the machine is still up"));
+        // Nothing here can fix it, and returning would resume supervising a
+        // system whose filesystems `/etc/shutdown` has just unmounted.
+        loop {
+            std::thread::sleep(SILENT_TABLE_COMPLAINT);
+            log(&format!("{applet} failed earlier; the machine is still up"));
+        }
+    }
+
     /// A sender for the event channel, so the control thread can reach the loop.
     pub fn events(&self) -> Sender<Event> {
         self.tx.clone()
@@ -1512,12 +2048,31 @@ impl Runtime {
                 Some(index) => self.status_line(index),
                 None => unknown(name),
             },
-            ("start", Some(name)) => self.control_start(name),
-            ("stop", Some(name)) => self.control_stop(name, false),
-            ("restart", Some(name)) => self.control_stop(name, true),
+            // Refused once a transition is under way. Starting a service
+            // against an `/etc/shutdown` that is unmounting underneath it is
+            // the fail-open I6 exists to forbid, and `reload` is worse still —
+            // it would rewrite the very order the teardown is walking.
+            // Arity first: "reload foo" is malformed whatever the supervisor is
+            // doing, and answering "a shutdown is in progress" would send
+            // whoever typed it looking for a state that is not the problem.
+            ("reload" | "reboot" | "poweroff" | "halt", Some(extra)) => {
+                format!("error: {verb}: takes no argument (got {extra:?})\n")
+            }
             ("start" | "stop" | "restart", None) => {
                 format!("error: {verb}: needs a service name\n")
             }
+            ("start" | "restart" | "reload", _) if self.shutdown.is_some() => {
+                format!("error: {verb}: refused, a shutdown is in progress\n")
+            }
+            ("start", Some(name)) => self.control_start(name),
+            ("stop", Some(name)) => self.control_stop(name, false),
+            ("restart", Some(name)) => self.control_stop(name, true),
+            ("reload", None) => self.control_reload(),
+            ("reboot" | "poweroff" | "halt", None) => match Power::parse(verb) {
+                Some(power) => self.begin_shutdown(power),
+                // Unreachable: the arm's own pattern is the list `parse` takes.
+                None => format!("error: unknown request {verb:?}\n{CONTROL_USAGE}"),
+            },
             _ => format!("error: unknown request {verb:?}\n{CONTROL_USAGE}"),
         }
     }
@@ -1573,6 +2128,18 @@ impl Runtime {
         // dependencies could not be resolved — a cycle, or anything downstream
         // of one. Setting it `Down` would reply "starting" and then nothing
         // would ever pick it up, forever. Answer with the reason instead.
+        // A retired unit is out of the order for a different reason, and saying
+        // "dependency cycle" would send an operator hunting a graph problem
+        // that does not exist.
+        if self
+            .services
+            .get(index)
+            .is_some_and(|s| s.retired)
+        {
+            return format!(
+                "error: {name}: no longer in the table; reload after declaring it again\n"
+            );
+        }
         if !self.order.contains(&index) {
             return format!(
                 "error: {name}: the plan could not order it (a dependency cycle, or a \
@@ -1809,6 +2376,11 @@ impl Runtime {
     /// Run until killed. td-svc is respawned by PID 1, so returning is not a
     /// normal outcome — but unlike PID 1 it is not fatal either.
     pub fn run(&mut self) -> ! {
+        // I6: a marker means an earlier instance began a teardown and did not
+        // finish it. Resume rather than supervise — every service it had
+        // already stopped is down, and `/etc/shutdown` may be part way through
+        // unmounting what the rest are using.
+        self.resume_if_marked();
         let mut complain_at = Some(Instant::now());
         loop {
             // A table that yielded NO units is the one failure this process cannot
@@ -1830,6 +2402,9 @@ impl Runtime {
                 }
             }
             self.enforce_deadlines();
+            if let Some(power) = self.advance_shutdown() {
+                self.finish_shutdown(power);
+            }
             let next_wake = self.start_eligible();
             let timeout = match next_wake {
                 Some(at) => at.saturating_duration_since(Instant::now()).max(TICK),
@@ -3037,6 +3612,474 @@ mod tests {
         assert!(
             service.kill_at.is_some(),
             "a stale exit disarmed the KILL of a newer, live instance"
+        );
+    }
+
+
+    /// A runtime whose table is a real file, so `reload` has one to re-read.
+    fn reloadable(text: &str, tag: &str) -> (Runtime, String) {
+        let dir = format!(
+            "{}/td-svc-reload-{}-{tag}",
+            std::env::temp_dir().display(),
+            std::process::id()
+        );
+        let _ = std::fs::create_dir_all(&dir);
+        let path = format!("{dir}/td-svc.conf");
+        std::fs::write(&path, text).unwrap();
+        let (units, problems) = parse(text);
+        assert!(problems.is_empty(), "{problems:?}");
+        let mut rt = Runtime::new(units, &path).0;
+        rt.table_path = path;
+        (rt, dir)
+    }
+
+    /// `reload` is transactional: any diagnostic keeps the running table.
+    ///
+    /// Applying the valid fragments of a table an operator got wrong is how a
+    /// reload turns one bad stanza into a machine with no console. The bar is
+    /// exactly `td-svc check`'s, because that is the bar the operator was told
+    /// about — parse problems AND a plan that does not resolve.
+    #[test]
+    fn a_reload_that_does_not_check_changes_nothing() {
+        let good = "[a]\ntype=daemon\nexec=/x\nrestart=always\n";
+        let (mut rt, dir) = reloadable(good, "bad");
+        let before: Vec<String> = rt.services.iter().map(|s| s.unit.name.clone()).collect();
+
+        for (why, text) in [
+            ("a malformed line", "[a]\ntype=daemon\nexec=/x\nrequires firewall\n"),
+            ("an unknown key value", "[a]\ntype=nonsense\nexec=/x\n"),
+            (
+                "a dependency cycle",
+                "[a]\ntype=oneshot\nexec=/x\nafter=b\n[b]\ntype=oneshot\nexec=/x\nafter=a\n",
+            ),
+            ("no units at all", "# nothing here\n"),
+        ] {
+            std::fs::write(&rt.table_path, text).unwrap();
+            let reply = rt.control("reload");
+            assert!(
+                reply.starts_with("error:"),
+                "{why} was accepted by reload: {reply}"
+            );
+            assert!(
+                reply.contains("kept the running table"),
+                "{why}: reload did not say what it kept: {reply}"
+            );
+            let after: Vec<String> = rt.services.iter().map(|s| s.unit.name.clone()).collect();
+            assert_eq!(after, before, "{why} changed the running table anyway");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A good reload applies, without disturbing what is running.
+    ///
+    /// A unit whose stanza changed keeps its process — the new definition
+    /// applies at its next start — because restarting on reload would take the
+    /// console down as a side effect of editing an unrelated stanza. A unit
+    /// that VANISHED is no longer declared, so it is stopped rather than left
+    /// running with nothing supervising it.
+    #[test]
+    fn a_good_reload_applies_and_leaves_running_processes_alone() {
+        let (mut rt, dir) = reloadable(
+            "[keep]\ntype=daemon\nexec=/x\nrestart=always\n\
+             [gone]\ntype=daemon\nexec=/x\nrestart=always\n\
+             [gone-live]\ntype=daemon\nexec=/x\nrestart=always\n",
+            "good",
+        );
+        // `keep` is up; the reload must not touch it. `gone-live` is up too and
+        // is about to be dropped from the table — the two removed units differ
+        // only in whether anything is RUNNING, which is the whole distinction
+        // under test.
+        let (Some(live), Some(doomed)) = (live_child(), live_child()) else {
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        };
+        for (name, child) in [("keep", &live), ("gone-live", &doomed)] {
+            let service = rt.lookup_mut(name).unwrap();
+            service.phase = Phase::Ready;
+            service.pid = Some(child.pid);
+            service.starttime = Some(child.starttime);
+        }
+        std::fs::write(
+            &rt.table_path,
+            "[keep]\ntype=daemon\nexec=/x\nrestart=always\nstop-timeout=3\n\
+             [fresh]\ntype=oneshot\nexec=/bin/true\n",
+        )
+        .unwrap();
+        let reply = rt.control("reload");
+        assert!(!reply.starts_with("error:"), "{reply}");
+        assert!(reply.contains("reloaded"), "{reply}");
+
+        // The running process is untouched...
+        let keep = rt.lookup("keep").unwrap();
+        assert_eq!(keep.pid, Some(live.pid), "a reload restarted a live service");
+        assert_eq!(keep.phase, Phase::Ready);
+        // ...and it picked up its NEW definition for next time.
+        assert_eq!(keep.unit.stop_timeout, Duration::from_secs(3));
+        // The new unit is present and startable.
+        assert!(rt.index_of("fresh").is_some(), "a new unit was not added");
+        assert!(
+            rt.index_of("fresh").is_some_and(|i| rt.order.contains(&i)),
+            "a new unit was added but left out of the plan, so nothing starts it"
+        );
+        // A removed unit that was NOT running is gone at once. Keeping it would
+        // leak a `Service` per removal per reload, and re-declaring the name
+        // later would match the corpse and adopt its phase.
+        assert!(
+            rt.index_of("gone").is_none(),
+            "a removed unit with no process was kept anyway"
+        );
+        // A removed unit that IS running stays visible until it is down, and is
+        // marked so the teardown knows to wait for it even though no plan names
+        // it any more.
+        let doomed_index = rt
+            .index_of("gone-live")
+            .expect("a removed unit with a live process must stay visible");
+        assert!(
+            rt.services.get(doomed_index).is_some_and(|s| s.retired),
+            "a removed but still-running unit was not marked retired"
+        );
+        assert!(
+            !rt.order.contains(&doomed_index),
+            "a unit no longer in the table is still in the start plan"
+        );
+        // ...and a shutdown starting now must still tear it down, or
+        // /etc/shutdown unmounts while it is holding a filesystem open.
+        rt.marker_path = format!("{dir}/shutdown");
+        let reply = rt.begin_shutdown(Power::Reboot);
+        assert!(!reply.starts_with("error:"), "{reply}");
+        assert!(
+            rt.shutdown
+                .as_ref()
+                .is_some_and(|s| s.walk.contains(&doomed_index)),
+            "the teardown skipped a removed unit that was still running"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        drop(live);
+        drop(doomed);
+    }
+
+    /// A runtime whose I6 marker is somewhere a test may write.
+    fn shutdown_runtime(text: &str, tag: &str) -> (Runtime, String) {
+        let mut rt = runtime(text);
+        let dir = format!(
+            "{}/td-svc-shutdown-{}-{tag}",
+            std::env::temp_dir().display(),
+            std::process::id()
+        );
+        let _ = std::fs::create_dir_all(&dir);
+        let path = format!("{dir}/shutdown");
+        rt.marker_path = path.clone();
+        (rt, dir)
+    }
+
+    /// The word is the verb, the marker's contents and the applet's basename.
+    ///
+    /// Deliberately ONE string: a resume reads back what the request wrote, so
+    /// a mapping that disagreed anywhere would reboot a machine an operator
+    /// asked to power off — silently, since nothing compares the two.
+    #[test]
+    fn a_power_action_survives_the_round_trip_through_the_marker() {
+        for power in [Power::Reboot, Power::Off, Power::Halt] {
+            assert_eq!(Power::parse(power.as_str()), Some(power));
+            assert_eq!(power.applet(), format!("/bin/{}", power.as_str()));
+        }
+        let dir = format!(
+            "{}/td-svc-marker-{}",
+            std::env::temp_dir().display(),
+            std::process::id()
+        );
+        let _ = std::fs::create_dir_all(&dir);
+        let path = format!("{dir}/shutdown");
+
+        assert_eq!(read_marker(&path), None, "no marker must read as no shutdown");
+        for power in [Power::Reboot, Power::Off, Power::Halt] {
+            write_marker(&path, power).unwrap();
+            assert_eq!(read_marker(&path), Some(power));
+        }
+        // A marker that exists but says something unusable still means a
+        // shutdown BEGAN. Resuming as a reboot is recoverable; parking on a
+        // machine whose filesystems are going away is not.
+        std::fs::write(&path, b"something else entirely\n").unwrap();
+        assert_eq!(
+            read_marker(&path),
+            Some(Power::Reboot),
+            "an unreadable marker must resume, not park"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The marker goes down BEFORE the first service is stopped.
+    ///
+    /// This ordering is the whole of I6. A supervisor that stopped sshd and
+    /// then died before recording why would be respawned by PID 1, see no
+    /// marker, and start sshd again — against an `/etc/shutdown` already
+    /// unmounting underneath it.
+    #[test]
+    fn the_marker_is_written_before_anything_is_stopped() {
+        let (mut rt, dir) = shutdown_runtime(
+            "[a]\ntype=daemon\nexec=/x\nrestart=always\n",
+            "before",
+        );
+        mark_running(&mut rt, "a", Duration::from_secs(5));
+        let reply = rt.control("poweroff");
+        assert!(reply.contains("poweroff requested"), "{reply}");
+        assert_eq!(
+            read_marker(&rt.marker_path),
+            Some(Power::Off),
+            "the transition began without recording it"
+        );
+        // Nothing has been asked to stop yet — that is `advance_shutdown`'s
+        // job, one loop pass later.
+        assert!(!rt.lookup("a").unwrap().stopping);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A second request is a no-op, not a second teardown.
+    ///
+    /// Two presses, or a greeter logout racing the boot-fail park handshake,
+    /// are the ordinary way this arrives twice. Restarting the sequence would
+    /// rewind the cursor and re-stop services already down.
+    #[test]
+    fn a_second_shutdown_request_does_not_restart_the_sequence() {
+        let (mut rt, dir) = shutdown_runtime("[a]\ntype=daemon\nexec=/x\n", "twice");
+        assert!(rt.control("reboot").contains("reboot requested"));
+        let again = rt.control("poweroff");
+        assert!(again.contains("already in progress"), "{again}");
+        assert!(
+            !again.starts_with("error:"),
+            "a second request is ordinary, not an error: {again}"
+        );
+        // And it does NOT change where the shutdown ends.
+        assert_eq!(read_marker(&rt.marker_path), Some(Power::Reboot));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Once the teardown begins, nothing may start a service again.
+    #[test]
+    fn a_shutdown_refuses_start_restart_and_reload() {
+        let (mut rt, dir) = shutdown_runtime(
+            "[a]\ntype=daemon\nexec=/x\nrestart=always\n",
+            "refuse",
+        );
+        assert!(rt.control("reboot").contains("reboot requested"));
+        for verb in ["start a", "restart a", "reload"] {
+            let reply = rt.control(verb);
+            assert!(
+                reply.starts_with("error:") && reply.contains("shutdown is in progress"),
+                "{verb} was not refused during a shutdown: {reply}"
+            );
+        }
+        // `stop` is still allowed — it is what the teardown itself issues.
+        assert!(!rt.control("stop a").starts_with("error: stop: refused"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The restart policy must not fight the teardown.
+    ///
+    /// `start_eligible` walks every unit each pass; a `restart=always` daemon
+    /// the shutdown just stopped is exactly the shape it would bring back, and
+    /// then the teardown would walk past a service that is up again.
+    #[test]
+    fn nothing_starts_once_the_shutdown_has_begun() {
+        // `exec=/x`, and the assertions look at PHASE, not just at `pid`. An
+        // earlier version used `/bin/true` and asserted only `pid.is_none()`,
+        // which passed with the gate DELETED: this host has no `/bin/true`, so
+        // the spawn failed and left `pid` empty either way. A unit that was
+        // never started is `Down` with no retry; one that was started and could
+        // not spawn is `Failed`, and a `restart=always` one has a `retry_at` —
+        // states the failure cannot hide.
+        let (mut rt, dir) = shutdown_runtime(
+            "[a]\ntype=daemon\nexec=/x\nrestart=always\n\
+             [b]\ntype=oneshot\nexec=/x\n",
+            "nostart",
+        );
+        assert!(rt.control("reboot").contains("reboot requested"));
+        rt.start_eligible();
+        for name in ["a", "b"] {
+            let service = rt.lookup(name).unwrap();
+            assert!(
+                service.pid.is_none(),
+                "{name} was started after the shutdown began"
+            );
+            assert_eq!(
+                service.phase,
+                Phase::Down,
+                "{name} was started after the shutdown began (it left Down)"
+            );
+            assert_eq!(
+                service.retry_at, None,
+                "{name} was queued for a start after the shutdown began"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Services are stopped in REVERSE plan order.
+    ///
+    /// That is the only thing that makes the order mean anything: a dependent
+    /// has to be down before the thing it depends on. Stopping in plan order
+    /// would tear out `netup` while `sshd` is still serving on it.
+    ///
+    /// Driven through `next_to_stop` rather than real processes: signalling
+    /// needs `/bin/kill`, and with the signals failing a forwards walk and a
+    /// backwards walk leave exactly the same wreckage, so a state-based test
+    /// would pass either way.
+    #[test]
+    fn the_teardown_walks_the_plan_backwards() {
+        // Plan order is [first, second, third]; service indices need not match.
+        let order = vec![7, 8, 9];
+        let mut live = vec![false; 10];
+        for i in [7, 8, 9] {
+            live[i] = true;
+        }
+        let mut seen = Vec::new();
+        let mut cursor = 0;
+        while let Some((index, next)) = next_to_stop(&order, cursor, &live) {
+            seen.push(index);
+            cursor = next;
+        }
+        assert_eq!(
+            seen,
+            vec![9, 8, 7],
+            "the teardown did not walk the plan backwards"
+        );
+
+        // Units already down are skipped, and the cursor never revisits one.
+        live[8] = false;
+        let mut seen = Vec::new();
+        let mut cursor = 0;
+        while let Some((index, next)) = next_to_stop(&order, cursor, &live) {
+            seen.push(index);
+            cursor = next;
+        }
+        assert_eq!(seen, vec![9, 7], "a unit that was already down was stopped");
+
+        // Nothing live: the teardown is finished, which is what tells the loop
+        // to run /etc/shutdown and hand off.
+        assert_eq!(next_to_stop(&order, 0, &[false; 10]), None);
+        // And an exhausted cursor terminates rather than wrapping.
+        assert_eq!(next_to_stop(&order, order.len(), &live), None);
+    }
+
+    /// The greeter is `restart=always` and its exit IS one of the shutdown's steps.
+    ///
+    /// `/etc/tty-session` ends by exec'ing `td-svc reboot`, so the process the
+    /// supervisor is watching for the greeter becomes the client asking to
+    /// reboot — and stopping the greeter is one of the steps that request
+    /// triggers. Read that exit as a crash and a `restart=always` unit comes
+    /// back mid-teardown, forever: the shutdown would stop it, it would
+    /// respawn, and `advance_shutdown` would never reach the handoff. The
+    /// short-circuit is `stopping`, checked before the restart policy.
+    #[test]
+    fn a_restart_always_unit_stopped_by_the_shutdown_does_not_come_back() {
+        let (mut rt, dir) = shutdown_runtime(
+            "[greeter]\ntype=daemon\nexec=/etc/tty-session\nrestart=always\n",
+            "greeter",
+        );
+        mark_running(&mut rt, "greeter", Duration::from_secs(60));
+        // The state the teardown's `control_stop` leaves behind, set directly so
+        // the claim under test does not rest on a host having `/bin/kill`: the
+        // signal is not what makes the restart wrong, `stopping` is.
+        {
+            let service = rt.lookup_mut("greeter").unwrap();
+            service.pid = Some(i32::MAX);
+            service.stopping = true;
+            service.phase = Phase::Ready;
+        }
+        rt.begin_shutdown(Power::Reboot);
+
+        // The greeter exits, as `exit`/Ctrl-D at the console always makes it.
+        // `restart=always` must not fire.
+        rt.on_exit("greeter", Some(0));
+        let greeter = rt.lookup("greeter").unwrap();
+        assert_eq!(
+            greeter.retry_at, None,
+            "a restart=always greeter was queued for restart by its own shutdown"
+        );
+        assert_eq!(greeter.phase, Phase::Stopped, "the stop did not complete");
+
+        // With nothing left up, the teardown reaches the handoff rather than
+        // stopping a greeter that keeps coming back.
+        assert_eq!(
+            rt.advance_shutdown(),
+            Some(Power::Reboot),
+            "the shutdown never finished"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// I6's other half: a supervisor that comes back to a marker supervises
+    /// NOTHING.
+    ///
+    /// PID 1 respawns td-svc unconditionally, so this is the boot after a crash
+    /// mid-teardown. Starting anything here brings services up against
+    /// filesystems `/etc/shutdown` has already released. `run` never returns,
+    /// so the decision lives in `resume_if_marked` where a test can reach it.
+    #[test]
+    fn a_supervisor_that_resumes_a_shutdown_starts_nothing() {
+        let (mut rt, dir) = shutdown_runtime(
+            "[a]\ntype=daemon\nexec=/x\nrestart=always\n\
+             [b]\ntype=oneshot\nexec=/x\n",
+            "resume",
+        );
+        write_marker(&rt.marker_path, Power::Halt).unwrap();
+
+        rt.resume_if_marked();
+        assert!(
+            rt.shutdown.is_some(),
+            "a marker on disk did not resume the teardown"
+        );
+        // The ACTION survives, or a machine asked to halt comes back rebooting.
+        assert_eq!(
+            rt.shutdown.as_ref().map(|s| s.power),
+            Some(Power::Halt),
+            "the resumed shutdown lost the power action"
+        );
+
+        rt.start_eligible();
+        for name in ["a", "b"] {
+            let service = rt.lookup(name).unwrap();
+            assert_eq!(
+                service.phase,
+                Phase::Down,
+                "{name} was started by a supervisor resuming a shutdown"
+            );
+            assert_eq!(service.retry_at, None, "{name} was queued for a start");
+        }
+
+        // No marker means an ordinary boot, and nothing is resumed.
+        let (mut fresh, dir2) = shutdown_runtime("[a]\ntype=oneshot\nexec=/x\n", "noresume");
+        fresh.resume_if_marked();
+        assert!(
+            fresh.shutdown.is_none(),
+            "a boot with no marker resumed a shutdown that never happened"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir2);
+    }
+
+    /// The plan a real table produces is the one the reverse walk consumes.
+    ///
+    /// `next_to_stop` is pinned on synthetic indices above; this is the other
+    /// half — that `order` really does run dependencies-first, so reversing it
+    /// really does stop dependents first.
+    #[test]
+    fn the_plan_this_walks_backwards_is_dependencies_first() {
+        let rt = runtime(
+            "[netup]\ntype=oneshot\nexec=/bin/true\n\
+             [sshd]\ntype=daemon\nexec=/x\nafter=netup\n",
+        );
+        let names: Vec<&str> = rt
+            .order
+            .iter()
+            .filter_map(|&i| rt.services.get(i))
+            .map(|s| s.unit.name.as_str())
+            .collect();
+        assert_eq!(
+            names,
+            ["netup", "sshd"],
+            "the plan is not dependencies-first, so reversing it is not \
+             dependents-first either"
         );
     }
 

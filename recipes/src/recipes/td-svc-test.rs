@@ -274,7 +274,7 @@ pub fn recipe() -> Recipe {
                 POST_BOOTSTRAP_SH,
                 "-c",
                 &format!(
-                    "if mkdir -p /run/td-svc 2>/dev/null; then \
+                    "if mkdir -p /run/td-svc 2>/dev/null && {{ [ -x /bin/kill ] || {{ mkdir -p /bin 2>/dev/null && ln -sf '{uu}' /bin/kill 2>/dev/null; }}; }}; then \
                          '{bin}' run -f '{{root}}/ctl.conf' >/dev/null 2>&1 & \
                          p=$!; \
                          i=0; \
@@ -328,8 +328,127 @@ pub fn recipe() -> Recipe {
                              *) kill $p 2>/dev/null; echo \"an unknown unit must be named, got: $e\" >&2; exit 1;; \
                          esac; \
                          kill $p 2>/dev/null; \
+                         : 'Reap it before the next leg binds the same socket path:'; \
+                         : 'a supervisor still dying answers clear_stale, so bind gets'; \
+                         : 'AddrInUse and the next one runs with no socket at all.'; \
+                         wait $p 2>/dev/null || :; \
                      else \
-                         echo 'note: /run is not writable in this sandbox; the control socket is re-proved by the boot oracle'; \
+                         echo 'note: this sandbox has no writable /run or /bin; the control socket is re-proved by the boot oracle'; \
+                     fi"
+                ),
+            ],
+        )
+        .env("PATH", &post_bootstrap_path()),
+    );
+
+    // The shutdown path, end to end in the shipped binary. Two legs, because the
+    // interesting halves fail differently: a `reboot` REQUEST must record itself
+    // and tear the services down, and a supervisor that comes back to a recorded
+    // shutdown must NOT start anything (DESIGN.md I6).
+    //
+    // Neither leg can watch the handoff itself: `finish_shutdown` execs
+    // /bin/<applet>, which does not exist in this sandbox, so td-svc logs the
+    // failure and parks rather than exiting. Both legs kill it instead of
+    // waiting on it, and assert through the marker and the filesystem — the
+    // control socket stops being answered the moment the teardown finishes, so
+    // a `status` poll for the final state would race the handoff.
+    steps.push(Step::WriteFile {
+        path: "{root}/down.conf".into(),
+        content: format!(
+            "[held-open]\ntype=daemon\n\
+             exec={POST_BOOTSTRAP_SH} -c 'echo $$ > /run/td-svc/held.pid; while : ; do sleep 1; done'\n\
+             restart=always\n"
+        ),
+        exec: false,
+    });
+    // A oneshot whose only job is to leave a trace if it ever runs.
+    steps.push(Step::WriteFile {
+        path: "{root}/resume.conf".into(),
+        content: format!(
+            "[tracer]\ntype=oneshot\nexec={POST_BOOTSTRAP_SH} -c 'echo ran > /run/td-svc/tracer-ran'\n"
+        ),
+        exec: false,
+    });
+    steps.push(
+        Step::run(
+            "{root}",
+            &[
+                POST_BOOTSTRAP_SH,
+                "-c",
+                &format!(
+                    "if mkdir -p /run/td-svc 2>/dev/null && {{ [ -x /bin/kill ] || {{ mkdir -p /bin 2>/dev/null && ln -sf '{uu}' /bin/kill 2>/dev/null; }}; }}; then \
+                         rm -f /run/td-svc/shutdown /run/td-svc/tracer-ran /run/td-svc/held.pid; \
+                         '{bin}' run -f '{{root}}/down.conf' >/dev/null 2>&1 & \
+                         p=$!; \
+                         i=0; \
+                         while [ $i -lt 30 ]; do \
+                             o=$('{bin}' status 2>/dev/null) && \
+                             case \"$o\" in *'held-open ready'*) break;; esac; \
+                             i=$((i+1)); \
+                             sleep 1; \
+                         done; \
+                         o=$('{bin}' status 2>&1); \
+                         case \"$o\" in \
+                             *'held-open ready'*) : ;; \
+                             *) kill $p 2>/dev/null; echo \"td-svc never brought the daemon up before the shutdown leg, got: $o\" >&2; exit 1;; \
+                         esac; \
+                         r=$('{bin}' reboot 2>&1); \
+                         case \"$r\" in \
+                             *'reboot requested'*) : ;; \
+                             *) kill $p 2>/dev/null; echo \"td-svc reboot was not accepted, got: $r\" >&2; exit 1;; \
+                         esac; \
+                         : 'The marker is written BEFORE anything is stopped, so it is'; \
+                         : 'already on disk by the time the reply comes back.'; \
+                         m=$(cat /run/td-svc/shutdown 2>&1); \
+                         case \"$m\" in \
+                             reboot) : ;; \
+                             *) kill $p 2>/dev/null; echo \"the shutdown marker does not name the power action, got: $m\" >&2; exit 1;; \
+                         esac; \
+                         : 'And the teardown must actually stop the daemon. Watch the'; \
+                         : 'DAEMON, not the socket: once the last unit is down td-svc'; \
+                         : 'execs the applet - absent here - and parks, so it stops'; \
+                         : 'answering status. Polling for the final phase would time'; \
+                         : 'out over and over and then report a failure that did not'; \
+                         : 'happen. The pid the daemon published stays readable after'; \
+                         : 'the process it names is gone, so there is nothing to poll'; \
+                         : 'the supervisor for. (kill -0 is pid-reuse sensitive in'; \
+                         : 'principle; over this 30s window in a fresh pid namespace'; \
+                         : 'with one spawner it is not a real hazard.)'; \
+                         d=$(cat /run/td-svc/held.pid 2>/dev/null); \
+                         case \"$d\" in \
+                             ''|*[!0-9]*) kill $p 2>/dev/null; echo \"the daemon never published its pid, got: '$d'\" >&2; exit 1;; \
+                         esac; \
+                         i=0; \
+                         while [ $i -lt 30 ]; do \
+                             kill -0 \"$d\" 2>/dev/null || break; \
+                             i=$((i+1)); \
+                             sleep 1; \
+                         done; \
+                         kill $p 2>/dev/null; \
+                         wait $p 2>/dev/null || :; \
+                         if kill -0 \"$d\" 2>/dev/null; then \
+                             echo 'the teardown did not stop a restart=always daemon' >&2; \
+                             exit 1; \
+                         fi; \
+                         : 'I6: a supervisor that arrives to a recorded shutdown resumes'; \
+                         : 'the teardown; it must never start a service. PID 1 respawns'; \
+                         : 'td-svc unconditionally, so this is the boot after a crash'; \
+                         : 'mid-teardown, and starting the tracer here would mean bringing'; \
+                         : 'services up against filesystems /etc/shutdown has released.'; \
+                         printf reboot > /run/td-svc/shutdown; \
+                         rm -f /run/td-svc/tracer-ran; \
+                         '{bin}' run -f '{{root}}/resume.conf' >/dev/null 2>&1 & \
+                         q=$!; \
+                         sleep 5; \
+                         kill $q 2>/dev/null; \
+                         wait $q 2>/dev/null || :; \
+                         if [ -e /run/td-svc/tracer-ran ]; then \
+                             echo 'td-svc started a service while a shutdown was recorded (I6) - a crash mid-teardown would bring services back up against released filesystems' >&2; \
+                             exit 1; \
+                         fi; \
+                         rm -f /run/td-svc/shutdown /run/td-svc/tracer-ran /run/td-svc/held.pid; \
+                     else \
+                         echo 'note: this sandbox has no writable /run or /bin; the shutdown path is re-proved by the boot oracle'; \
                      fi"
                 ),
             ],
@@ -389,7 +508,7 @@ pub fn recipe() -> Recipe {
         .steps(steps)
         .checks(vec![RecipeCheck::new(
             r#"
-echo ">> recipe-check td-svc-test: build-plan --auto builds td-svc (td's static service supervisor: dependency ordering, restart backoff, readiness probing, and — in later landings — log capture, ordered shutdown and Ctrl-Alt-Del, statically linked by the /td/store target Rust + native GCC/binutils/glibc toolchain), asserts a self-contained static ELF64 x86-64 executable (ET_EXEC, no PT_INTERP, no dynamic NEEDED), and exercises the table validator: the shipped boot chain's order, the refusal paths for a cycle, an unknown dependency, a skippable console, an unimplemented key, an unparseable stanza line, restart= on a oneshot, and an unreadable table; and `td-svc run` actually supervising two ordered oneshots in the shipped static binary"
+echo ">> recipe-check td-svc-test: build-plan --auto builds td-svc (td's static service supervisor: dependency ordering, restart backoff, readiness probing, ordered shutdown, and — in later landings — log capture and Ctrl-Alt-Del, statically linked by the /td/store target Rust + native GCC/binutils/glibc toolchain), asserts a self-contained static ELF64 x86-64 executable (ET_EXEC, no PT_INTERP, no dynamic NEEDED), and exercises the table validator: the shipped boot chain's order, the refusal paths for a cycle, an unknown dependency, a skippable console, an unimplemented key, an unparseable stanza line, restart= on a oneshot, and an unreadable table; and `td-svc run` actually supervising two ordered oneshots in the shipped static binary; and the shutdown path end to end - a `reboot` request records its marker and tears a restart=always daemon down, and a supervisor that starts with a marker already on disk resumes the teardown instead of starting anything"
 : "${TD_RECIPE_EVAL:=$PWD/target/release/td-recipe-eval}"
 exec "$TD_RECIPE_EVAL" check-run td-svc-test 1
 "#,

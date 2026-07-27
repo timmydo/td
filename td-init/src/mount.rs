@@ -389,7 +389,8 @@ fn umount_usage() -> String {
      -a  every filesystem in the mount table, deepest first\n  \
      -f  MNT_FORCE\n  \
      -l  MNT_DETACH (lazy: detach now, release when nothing holds it)\n  \
-     -r  remount read-only whatever will not unmount"
+     -r  remount read-only whatever will not unmount\n  \
+     --exclude MOUNTPOINT  with -a, leave this one mounted (exact match)"
         .to_string()
 }
 
@@ -399,6 +400,14 @@ struct UmountPlan {
     remount_ro: bool,
     flags: usize,
     targets: Vec<String>,
+    /// Mount points `-a` must leave alone, matched exactly.
+    ///
+    /// Exact, not prefix: `--exclude /run` keeps the tmpfs itself while still
+    /// releasing anything mounted UNDER it. td's teardown needs precisely
+    /// that — `/run/td-volume` is a moved btrfs that must be released, while
+    /// `/run` carries the shutdown marker a replacement supervisor is gated
+    /// on.
+    exclude: Vec<String>,
 }
 
 fn parse_umount(args: &[String]) -> Result<UmountPlan, String> {
@@ -407,10 +416,24 @@ fn parse_umount(args: &[String]) -> Result<UmountPlan, String> {
         remount_ro: false,
         flags: 0,
         targets: Vec::new(),
+        exclude: Vec::new(),
     };
-    for a in args {
+    let mut rest = args.iter();
+    while let Some(a) = rest.next() {
         match a.as_str() {
             "--all" => plan.all = true,
+            // Long form only: the short flags cluster, and a letter that
+            // swallows the next word cannot be clustered without surprising
+            // whoever writes `-arx`.
+            "--exclude" => match rest.next() {
+                Some(path) => plan.exclude.push(path.clone()),
+                None => {
+                    return Err(format!(
+                        "--exclude needs a mount point\n{}",
+                        umount_usage()
+                    ))
+                }
+            },
             "--force" => plan.flags |= sys::MNT_FORCE,
             "--lazy" => plan.flags |= sys::MNT_DETACH,
             "--read-only" => plan.remount_ro = true,
@@ -441,6 +464,12 @@ fn parse_umount(args: &[String]) -> Result<UmountPlan, String> {
             }
             other => plan.targets.push(other.to_string()),
         }
+    }
+    if !plan.all && !plan.exclude.is_empty() {
+        return Err(format!(
+            "--exclude only means anything with -a\n{}",
+            umount_usage()
+        ));
     }
     if plan.all && !plan.targets.is_empty() {
         return Err(format!(
@@ -518,10 +547,21 @@ fn table_flags(table: &[Entry], path: &[u8]) -> Option<usize> {
 /// `umount /proc` must not depend on `/proc` being readable, since taking it
 /// away is exactly what it is for. That read is best-effort for the same
 /// reason: an unreadable table costs the fallback, not the unmount.
+/// Is this mount point one `-a` was told to spare?
+///
+/// EXACT, never a prefix, and split out so that distinction has somewhere to be
+/// tested — a prefix match would keep `/run/td-volume` (a moved btrfs that must
+/// be released) mounted forever, which is the failure `--exclude /run` exists
+/// to avoid, not to cause.
+fn excluded(plan: &UmountPlan, target: &[u8]) -> bool {
+    plan.exclude.iter().any(|x| x.as_bytes() == target)
+}
+
 fn targets_for(plan: &UmountPlan) -> Result<Vec<Target>, String> {
     if plan.all {
         let mut targets: Vec<Target> = read_table()?
             .iter()
+            .filter(|e| !excluded(plan, &e.target))
             .map(|e| Target {
                 path: e.target.clone(),
                 mounted_with: Some(flags_from_options(&e.opts)),
@@ -1112,6 +1152,49 @@ proc /proc proc rw,nosuid,nodev,noexec 0 0
         );
     }
 
+
+    /// `--exclude` is EXACT, not a prefix.
+    ///
+    /// td's teardown depends on the distinction: `/run` carries the shutdown
+    /// marker a replacement supervisor is gated on and must survive, while
+    /// `/run/td-volume` is a moved btrfs that must be released. A prefix match
+    /// would keep the volume mounted and the machine would never come down
+    /// cleanly; no exclusion at all would take the marker with it.
+    #[test]
+    fn umount_all_can_spare_one_mount_point_without_sparing_its_children() {
+        let plan = uplan(&["-a", "--exclude", "/run"]).unwrap();
+        assert!(plan.all);
+        assert_eq!(plan.exclude, vec!["/run".to_string()]);
+
+        // Drive `excluded` ITSELF, not a copy of it: an earlier version of this
+        // test re-implemented the comparison, so changing `==` to `starts_with`
+        // in the real filter left it green while `/run/td-volume` would have
+        // stayed mounted forever.
+        let table = ["/", "/proc", "/run", "/run/td-volume", "/var"];
+        let kept: Vec<&str> = table
+            .iter()
+            .copied()
+            .filter(|t| !excluded(&plan, t.as_bytes()))
+            .collect();
+        assert_eq!(
+            kept,
+            ["/", "/proc", "/run/td-volume", "/var"],
+            "--exclude /run must spare the tmpfs and still release what is under it"
+        );
+        assert!(excluded(&plan, b"/run"), "the named mount point is spared");
+        assert!(
+            !excluded(&plan, b"/run/td-volume"),
+            "--exclude is exact: a child of a spared mount point is still released"
+        );
+
+        // More than one is allowed, and the option needs its operand.
+        let two = uplan(&["-a", "--exclude", "/run", "--exclude", "/proc"]).unwrap();
+        assert_eq!(two.exclude, vec!["/run".to_string(), "/proc".to_string()]);
+        assert!(uplan(&["-a", "--exclude"]).is_err());
+        // It means nothing without -a, and saying so beats silently ignoring it.
+        assert!(uplan(&["/var", "--exclude", "/run"]).is_err());
+    }
+
     #[test]
     fn umount_takes_either_targets_or_dash_a_but_never_both() {
         assert_eq!(
@@ -1121,6 +1204,7 @@ proc /proc proc rw,nosuid,nodev,noexec 0 0
                 remount_ro: false,
                 flags: 0,
                 targets: vec!["/proc".to_string()],
+                exclude: Vec::new(),
             })
         );
         assert_eq!(uplan(&["-a"]).map(|p| p.all), Ok(true));
