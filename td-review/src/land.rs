@@ -5,7 +5,7 @@ use std::fs;
 use std::io;
 
 use crate::git::{Git, HeadClaim, MergeResult, NO_PUSH};
-use crate::term::{Line, Style, CYAN, GRAY, GREEN, RED, YELLOW};
+use crate::term::{Line, Style, CYAN, GREEN, RED, YELLOW};
 
 /// What the landing did. Anything other than `Committed` left HEAD unmoved.
 #[derive(Debug, PartialEq, Eq)]
@@ -63,7 +63,7 @@ fn step_line(text: impl Into<String>) -> Line {
 }
 
 fn note_line(text: impl Into<String>) -> Line {
-    Line::new(text, Style::fg(GRAY))
+    Line::new(text, Style::dim())
 }
 
 /// Log every line of a git invocation's output, one row each.

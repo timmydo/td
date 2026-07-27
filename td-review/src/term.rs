@@ -24,7 +24,10 @@ pub const GREEN: u8 = 32;
 pub const YELLOW: u8 = 33;
 pub const MAGENTA: u8 = 35;
 pub const CYAN: u8 = 36;
-pub const GRAY: u8 = 90;
+// De-emphasis is `Style::dim()`, not a palette slot: SGR 2 is computed from
+// whatever foreground the terminal is already using, so it stays legible on a
+// theme this crate cannot see. Bright black (90) does not — most dark themes
+// draw it close to the background.
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Style {
@@ -576,6 +579,17 @@ fn stty(args: &[&str]) -> io::Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// De-emphasis carries no colour of its own, so the status bar composes it
+    /// with reverse video into a bar the terminal derives from its own theme.
+    #[test]
+    fn emits_the_style_compositions_the_panes_build() {
+        assert_eq!(Style::PLAIN.sgr(), "");
+        assert_eq!(Style::dim().sgr(), "\x1b[2m");
+        assert_eq!(Style::dim().with_invert().sgr(), "\x1b[2;7m");
+        assert_eq!(Style::fg(RED).with_bold().sgr(), "\x1b[1;31m");
+        assert_eq!(Style::bar(CYAN).sgr(), "\x1b[1;7;36m");
+    }
 
     #[test]
     fn decodes_arrows_and_paging() {

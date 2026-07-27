@@ -6,7 +6,7 @@ use std::io;
 use crate::git::{self, now_unix, Branch, DefaultRemote, Git};
 use crate::land::{self, Outcome, Preview};
 use crate::term::{
-    self, Frame, Key, Line, Style, Ui, CYAN, GRAY, GREEN, MAGENTA, RED, YELLOW,
+    self, Frame, Key, Line, Style, Ui, CYAN, GREEN, MAGENTA, RED, YELLOW,
 };
 
 pub enum Flow {
@@ -329,7 +329,7 @@ impl App {
         let top = scroll_top(self.sel, self.top, height);
         if self.view.is_empty() {
             f.push_blank();
-            f.push_text("  no branches match", Style::fg(GRAY));
+            f.push_text("  no branches match", Style::dim());
         }
         for (row, &idx) in self.view.iter().enumerate().skip(top).take(height) {
             let Some(b) = self.branches.get(idx) else { continue };
@@ -627,11 +627,11 @@ impl App {
         }
         // Per target, since they need not be level. What each remote holds is
         // read from its tracking ref, so it is only true as of the last fetch.
-        self.log.push(Line::new("what each target lacks, as of the last fetch:", Style::fg(GRAY)));
+        self.log.push(Line::new("what each target lacks, as of the last fetch:", Style::dim()));
         for name in pushable(&remotes) {
             let lines = match self.git.unpushed_to(name, &self.base) {
                 Ok(Some(commits)) if commits.is_empty() => {
-                    vec![Line::new(format!("  {name} is already at this commit"), Style::fg(GRAY))]
+                    vec![Line::new(format!("  {name} is already at this commit"), Style::dim())]
                 }
                 Ok(Some(commits)) => {
                     let mut lines = vec![Line::new(
@@ -652,7 +652,7 @@ impl App {
                             .map(|c| Line::new(format!("    {c}"), Style::fg(YELLOW))),
                     );
                     if let Some(rest) = commits.len().checked_sub(SHOWN_COMMITS).filter(|n| *n > 0) {
-                        lines.push(Line::new(format!("    …and {rest} more"), Style::fg(GRAY)));
+                        lines.push(Line::new(format!("    …and {rest} more"), Style::dim()));
                     }
                     lines
                 }
@@ -725,7 +725,7 @@ impl App {
                 }
                 _ => {
                     self.prompt = None;
-                    self.note("cancelled", Style::fg(GRAY));
+                    self.note("cancelled", Style::dim());
                 }
             },
             // Scrolling the plan is not answering it: these panes list every
@@ -744,7 +744,7 @@ impl App {
                 _ => {
                     self.prompt = None;
                     self.screen = Screen::List;
-                    self.note("not pushed", Style::fg(GRAY));
+                    self.note("not pushed", Style::dim());
                 }
             },
             Some(Prompt::Delete { .. }) => {
@@ -769,16 +769,16 @@ impl App {
                     // queued — this ends the sweep, not the session's cleanup.
                     Key::Esc if sweeping => {
                         self.pushed = None;
-                        self.log.push(Line::new(format!("kept {short}"), Style::fg(GRAY)));
+                        self.log.push(Line::new(format!("kept {short}"), Style::dim()));
                         self.log_to_end(term);
-                        self.note("sweep ended", Style::fg(GRAY));
+                        self.note("sweep ended", Style::dim());
                     }
                     // The note is hidden by the next prompt in a sweep, so the
                     // pane has to carry the record of what was kept.
                     Key::Char('n') | Key::Char('N') => {
-                        self.log.push(Line::new(format!("kept {short}"), Style::fg(GRAY)));
+                        self.log.push(Line::new(format!("kept {short}"), Style::dim()));
                         self.log_to_end(term);
-                        self.note(format!("kept {short}"), Style::fg(GRAY));
+                        self.note(format!("kept {short}"), Style::dim());
                     }
                     // Anything else is not an answer: keep the branch, and keep
                     // the landing too — a stray key must not be what makes a
@@ -789,9 +789,9 @@ impl App {
                                 self.landed.push_back(entry);
                             }
                         }
-                        self.log.push(Line::new(format!("kept {short}"), Style::fg(GRAY)));
+                        self.log.push(Line::new(format!("kept {short}"), Style::dim()));
                         self.log_to_end(term);
-                        self.note(format!("kept {short}"), Style::fg(GRAY));
+                        self.note(format!("kept {short}"), Style::dim());
                     }
                 }
                 // A push can publish several landings at once; each one's
@@ -1071,7 +1071,7 @@ impl App {
                 Err(e) => return self.note(format!("{e}"), Style::fg(RED)),
             };
         if targets.is_empty() {
-            return self.note(format!("no pushable remote carries {short}"), Style::fg(GRAY));
+            return self.note(format!("no pushable remote carries {short}"), Style::dim());
         }
         // The prompt bar is one clipped row, so the pane must carry the record
         // of what `y` will delete — and be the pane on screen.
@@ -1087,7 +1087,7 @@ impl App {
         for t in &targets {
             self.log.push(Line::new(
                 format!("  {} at {}", t.remote, land::short(&t.oid)),
-                Style::fg(GRAY),
+                Style::dim(),
             ));
         }
         self.log_to_end(term);
@@ -1337,7 +1337,7 @@ fn preview_lines(branch: &Branch, p: &Preview, base: &str, now: i64) -> Vec<Line
     }));
     out.push(Line::new(
         format!("  tip {}  merge-base {}", land::short(&branch.commit), land::short(&p.merge_base)),
-        Style::fg(GRAY),
+        Style::dim(),
     ));
     out.push(Line::blank());
 
@@ -1354,8 +1354,10 @@ fn preview_lines(branch: &Branch, p: &Preview, base: &str, now: i64) -> Vec<Line
     if p.message.trim().is_empty() {
         out.push(Line::new("  (empty)", Style::fg(RED)));
     }
+    // Not de-emphasised: this is the message the landing commits with, the one
+    // thing in the pane that must be read word for word.
     for l in p.message.lines() {
-        out.push(Line::new(format!("  {l}"), Style::fg(GRAY)));
+        out.push(Line::plain(format!("  {l}")));
     }
     out.push(Line::blank());
 
@@ -2306,5 +2308,45 @@ mod tests {
         assert_eq!(diff_style("-removed"), Style::fg(RED));
         assert_eq!(diff_style("@@ -1,2 +1,3 @@"), Style::fg(CYAN));
         assert_eq!(diff_style(" context"), Style::PLAIN);
+    }
+
+    /// No test can assert a colour is legible, but it can assert the pane never
+    /// picks a fixed dark palette slot for text — and that the message the
+    /// landing commits with is not the thing de-emphasised.
+    #[test]
+    fn the_review_pane_de_emphasises_with_dim_not_bright_black() {
+        let branch = Branch {
+            refname: "origin/work-0001-feature".to_string(),
+            commit: "1111111111111111111111111111111111111111".to_string(),
+            committed_unix: 1_700_000_000,
+            author: "a".to_string(),
+            subject: "s".to_string(),
+            counts: Some((2, 0)),
+        };
+        let preview = Preview {
+            branch_oid: branch.commit.clone(),
+            base_oid: "2222222222222222222222222222222222222222".to_string(),
+            merge_base: "3333333333333333333333333333333333333333".to_string(),
+            commits: vec!["c1 first".to_string()],
+            message: "subject\n\nbody line\n".to_string(),
+            stat: " f | 1 +".to_string(),
+            diff: "+added\n-removed\n".to_string(),
+            note: None,
+        };
+        let lines = preview_lines(&branch, &preview, "main", 1_700_000_100);
+
+        // 90 is bright black: most dark themes draw it against the background.
+        assert!(
+            lines.iter().all(|l| l.style.fg != Some(90)),
+            "the pane must not pin text to bright black"
+        );
+
+        let body: Vec<&Line> =
+            lines.iter().filter(|l| l.text.trim_start().starts_with("body line")).collect();
+        assert_eq!(body.len(), 1, "expected the message body in the pane");
+        assert!(
+            body.iter().all(|l| l.style == Style::PLAIN),
+            "the squash message reads at full contrast, not de-emphasised"
+        );
     }
 }
