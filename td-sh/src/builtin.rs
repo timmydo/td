@@ -1169,31 +1169,22 @@ fn pad_bytes(out: &mut Vec<u8>, sign: &[u8], prefix: &[u8], body: &[u8], width: 
 
 fn exit(sh: &mut Shell, argv: &[String]) -> R<()> {
     let code = match argv.get(1) {
-        Some(s) => parse_status(sh, s)?,
+        Some(s) => number(sh, argv, s)?,
         // POSIX: inside a trap action, "the last command" is the one that ran
         // before the trap, so a bare `exit` there reports the status the shell was
         // already exiting with -- not whatever the action's own last command left.
         None => sh.trap_status.unwrap_or(sh.status),
     };
-    Err(Sig::Exit(code & 0xff))
+    // No mask of its own: `set_status` and `main` are where a status narrows.
+    Err(Sig::Exit(code))
 }
 
 fn ret(sh: &mut Shell, argv: &[String]) -> R<()> {
     let code = match argv.get(1) {
-        Some(s) => parse_status(sh, s)?,
+        Some(s) => number(sh, argv, s)?,
         None => sh.status,
     };
-    Err(Sig::Return(code & 0xff))
-}
-
-fn parse_status(sh: &mut Shell, s: &str) -> R<i32> {
-    match s.trim().parse::<i32>() {
-        Ok(n) => Ok(n),
-        Err(_) => {
-            err_line(sh, &format!("td-sh: {s}: numeric argument required"));
-            Err(Sig::Exit(2))
-        }
-    }
+    Err(Sig::Return(code))
 }
 
 /// busybox ash's `is_number`: every character a digit, so a sign or a space
@@ -1203,19 +1194,35 @@ fn is_all_digits(s: &str) -> bool {
     !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit())
 }
 
+/// The operand rule `exit`, `return`, `break` and `shift` share: ash's
+/// `is_number` digit test plus dash's `n > INT_MAX` bound, because ash has no
+/// bound and `atoi`-overflows instead. Separate from the reporting half only
+/// because `shift` wants the same rule with a different fatality.
+fn parse_number(s: &str) -> Option<i32> {
+    s.parse::<i32>().ok().filter(|_| is_all_digits(s))
+}
+
+fn number(sh: &mut Shell, argv: &[String], s: &str) -> R<i32> {
+    parse_number(s).ok_or_else(|| badnum(sh, argv, s))
+}
+
+fn badnum(sh: &mut Shell, argv: &[String], s: &str) -> Sig {
+    let cmd = argv.first().map(String::as_str).unwrap_or_default();
+    err_line(sh, &format!("{cmd}: Illegal number: {s}"));
+    Sig::Exit(2)
+}
+
 fn loop_ctl(sh: &mut Shell, argv: &[String], is_break: bool) -> R<()> {
     let n = match argv.get(1) {
         // Fatal, not reported-and-resumed: the one thing that would end the loop is
         // what just failed, so returning left it spinning. Deliberately not
         // `special_usage_error` -- its interactive branch returns Ok, which resumes
         // that loop, and td-sh has no abort-the-command signal to use instead.
-        Some(s) => match s.parse::<u32>().ok().filter(|n| *n > 0 && is_all_digits(s)) {
+        // `breakcmd` runs the operand through `number` and THEN rejects a
+        // non-positive count, so `break 0` reports the same way `break oops` does.
+        Some(s) => match parse_number(s).filter(|n| *n > 0).and_then(|n| u32::try_from(n).ok()) {
             Some(n) => n,
-            None => {
-                let cmd = argv.first().map(String::as_str).unwrap_or("break");
-                err_line(sh, &format!("{cmd}: {s}: bad loop count"));
-                return Err(Sig::Exit(2));
-            }
+            None => return Err(badnum(sh, argv, s)),
         },
         None => 1,
     };
@@ -1233,13 +1240,12 @@ fn loop_ctl(sh: &mut Shell, argv: &[String], is_break: bool) -> R<()> {
 
 fn shift(sh: &mut Shell, argv: &[String]) -> R<()> {
     let n = match argv.get(1) {
-        // Fatal like `break`'s, but nothing here can loop, so it takes the usual
-        // interactive exemption.
-        Some(s) => match s.parse::<usize>().ok().filter(|_| is_all_digits(s)) {
+        // The same `number()` rejection as `break`'s -- INT_MAX bound included, so
+        // `shift 2147483648` is a bad number and not a huge count -- but nothing
+        // here can loop, so it takes the usual interactive exemption.
+        Some(s) => match parse_number(s).and_then(|n| usize::try_from(n).ok()) {
             Some(n) => n,
-            None => {
-                return special_usage_error(sh, &format!("shift: {s}: numeric argument required"))
-            }
+            None => return special_usage_error(sh, &format!("shift: Illegal number: {s}")),
         },
         None => 1,
     };
@@ -2892,21 +2898,72 @@ mod tests {
         let (status, out, err) =
             run_capturing("for i in 1 2 3; do echo hi; break oops; done; echo AFTER");
         assert_eq!((status, out.as_str()), (2, "hi\n"));
-        assert!(err.contains("break: oops"), "{err:?}");
+        assert!(err.contains("break: Illegal number: oops"), "{err:?}");
         let (status, out, err) =
             run_capturing("for i in 1 2 3; do echo hi; continue oops; done; echo AFTER");
         assert_eq!((status, out.as_str()), (2, "hi\n"));
-        assert!(err.contains("continue: oops"), "{err:?}");
+        assert!(err.contains("continue: Illegal number: oops"), "{err:?}");
         // `is_all_digits` is busybox's rule, so a sign disqualifies either way even
         // though dash's `atomax10` accepts `+1`.
         for bad in ["0", "-1", "+1", "1x", "''", "' 1'"] {
             let (status, _, _) = run_capturing(&format!("for i in 1 2; do break {bad}; done"));
             assert_eq!(status, 2, "break {bad}");
         }
-        // Same rule for `shift`, but via the interactive-preserving route.
-        let (status, out, err) = run_capturing("shift oops; echo AFTER");
-        assert_eq!((status, out.as_str()), (2, ""));
-        assert!(err.contains("shift: oops"), "{err:?}");
+        // Same rule for `shift`, but via the interactive-preserving route. The
+        // INT_MAX bound is part of it: over it is a bad NUMBER, not a huge count,
+        // so it must not reach the non-fatal overrun branch below it.
+        for bad in ["oops", "2147483648"] {
+            let (status, out, err) =
+                run_capturing(&format!("set -- a b; shift {bad}; echo AFTER"));
+            assert_eq!((status, out.as_str()), (2, ""), "shift {bad}");
+            assert!(err.contains(&format!("shift: Illegal number: {bad}")), "{err:?}");
+        }
+    }
+
+    #[test]
+    fn a_wide_status_is_narrowed_to_a_byte_as_ashs_uint8_t_is() {
+        // `number()` accepts these, so what narrows them is the STORE, not the
+        // parse. dash keeps 256/257/300/2147483647; ash is `uint8_t exitstatus`.
+        for (operand, want) in
+            [("255", "255"), ("256", "0"), ("257", "1"), ("300", "44"), ("2147483647", "255")]
+        {
+            let (_, out, _) =
+                run_capturing(&format!("f() {{ return {operand}; }}; f; echo $?"));
+            assert_eq!(out, format!("{want}\n"), "return {operand}");
+        }
+        // Everywhere `$?` can be reached from, not just a function return: a
+        // subshell, a command substitution, a pipeline stage, and an EXIT trap.
+        for src in [
+            "(exit 300)",
+            "x=$(exit 300)",
+            "f() { return 300; }; (f)",
+            "true | { exit 300; }",
+            "echo x | { f() { return 300; }; f; }",
+        ] {
+            let (_, out, _) = run_capturing(&format!("{src}; echo $?"));
+            assert_eq!(out, "44\n", "{src}");
+        }
+        let (_, out, _) = run_capturing("trap 'echo trap=$?' EXIT; exit 300");
+        assert_eq!(out, "trap=44\n");
+        // And the whole program's status, which `main` hands to the process.
+        let (status, _, _) = run_capturing("exit 300");
+        assert_eq!(status, 44);
+    }
+
+    #[test]
+    fn exit_and_return_reject_what_number_rejects() {
+        // Sign, non-digit and empty fail `number()` in both references; the two
+        // over-INT_MAX operands are dash's rule, since ash's `atoi` overflows there.
+        // These are special builtins, so the failure ends the script.
+        for bad in ["-1", "-2", "abc", "1x", "''", "2147483648", "99999999999999999999"] {
+            let (status, out, err) = run_capturing(&format!("exit {bad}; echo AFTER"));
+            assert_eq!((status, out.as_str()), (2, ""), "exit {bad}");
+            assert!(err.contains("exit: Illegal number:"), "exit {bad}: {err:?}");
+            let (status, out, err) =
+                run_capturing(&format!("f() {{ return {bad}; }}; f; echo AFTER"));
+            assert_eq!((status, out.as_str()), (2, ""), "return {bad}");
+            assert!(err.contains("return: Illegal number:"), "return {bad}: {err:?}");
+        }
     }
 
     #[test]

@@ -388,6 +388,9 @@ impl Shell {
         }
     }
 
+    /// busybox ash declares `$?` as `uint8_t exitstatus` (ash.c), so a status wider
+    /// than a byte is narrowed the moment it is stored -- `return 300` leaves 44.
+    /// dash's is an `int` and keeps 300; the chain puts ash first.
     pub fn set_status(&mut self, code: i32) {
         self.status = code & 0xff;
     }
@@ -409,7 +412,9 @@ pub fn run_program(sh: &mut Shell, src: &str) -> i32 {
         // aborting the process over; POSIX leaves it unspecified.
         Err(_) => sh.status,
     };
-    run_exit_trap(sh, status)
+    // Narrowed here so the return really is `$?`: an `exit 300` reaches this arm
+    // whole, and this is where the shell environment ends.
+    run_exit_trap(sh, status) & 0xff
 }
 
 /// Run the EXIT trap on the way out of a shell environment. POSIX: the action sees
