@@ -166,11 +166,11 @@ fn repl(sh: &mut Shell) -> i32 {
         let ended = matches!(read_complete(&stdin, sh, &mut buffer), ReadResult::Eof);
         if !buffer.trim().is_empty() {
             match parser::parse_aliased(&buffer, &sh.aliases) {
-                Ok(list) => match exec::run_list(sh, &list) {
-                    Ok(()) => {}
-                    Err(exec::Sig::Exit(code)) => return code,
-                    Err(_) => {}
-                },
+                Ok(list) => {
+                    if let Some(code) = exec::run_interactive_unit(sh, &list) {
+                        return code;
+                    }
+                }
                 Err(e) => {
                     let _ = writeln!(std::io::stderr(), "td-sh: {e}");
                     sh.set_status(2);

@@ -380,7 +380,7 @@ pub fn run_pipeline(sh: &mut Shell, cmds: &[Cmd]) -> R<()> {
         // stage's subshell; only its exit status survives.
         last_status = match exec::run_command(&mut stage, cmd) {
             Ok(()) => stage.status,
-            Err(Sig::Exit(code)) => code,
+            Err(Sig::Exit(code) | Sig::Abort(code)) => code,
             Err(_) => stage.status,
         };
         last_status = exec::run_exit_trap(&mut stage, last_status);
@@ -402,7 +402,7 @@ pub fn run_subshell(sh: &mut Shell, body: &List, redirs: &[Redir]) -> R<()> {
     let status = match apply_redirs(&mut child, redirs) {
         Ok(RedirOutcome::Applied(_saved)) => match exec::run_list(&mut child, body) {
             Ok(()) => child.status,
-            Err(Sig::Exit(code)) => code,
+            Err(Sig::Exit(code) | Sig::Abort(code)) => code,
             // break/continue/return that escape a subshell are confined to it.
             Err(_) => child.status,
         },
@@ -410,7 +410,7 @@ pub fn run_subshell(sh: &mut Shell, body: &List, redirs: &[Redir]) -> R<()> {
         Ok(RedirOutcome::Failed) => child.status,
         // A fatal expansion error in a target word (`>${x:?}`) exits the SUBSHELL,
         // not the parent — confine it here rather than propagating.
-        Err(Sig::Exit(code)) => code,
+        Err(Sig::Exit(code) | Sig::Abort(code)) => code,
         Err(_) => child.status,
     };
     let status = exec::run_exit_trap(&mut child, status);
@@ -480,7 +480,7 @@ pub fn capture_stdout(sh: &mut Shell, code: &str) -> R<String> {
     let outcome = exec::run_list(&mut child, &list);
     let status = match outcome {
         Ok(()) => child.status,
-        Err(Sig::Exit(code)) => code,
+        Err(Sig::Exit(code) | Sig::Abort(code)) => code,
         Err(_) => child.status,
     };
     let status = exec::run_exit_trap(&mut child, status);
@@ -788,18 +788,32 @@ pub fn run_capturing(src: &str) -> (i32, String, String) {
     (status, out_s, err_s)
 }
 
-/// Like `run_capturing` but marks the shell INTERACTIVE, returning captured stdout.
+/// Drive several units through the INTERACTIVE handler, as the prompt loop does,
+/// returning `$?` plus captured stdout/stderr. Distinct from `run_capturing`:
+/// only this path can show that a shell survives an aborted command.
 #[cfg(test)]
-pub fn run_capturing_interactive(src: &str) -> String {
+pub fn run_capturing_interactive_units(units: &[&str]) -> (i32, String, String) {
     let out = Arc::new(Mutex::new(Vec::new()));
+    let err = Arc::new(Mutex::new(Vec::new()));
     let mut sh = Shell::new_for_test();
     sh.interactive = true;
     sh.fds.set(1, Fd::WriteBuf(out.clone()));
-    sh.fds.set(2, Fd::WriteBuf(Arc::new(Mutex::new(Vec::new()))));
-    let _ = exec::run_program(&mut sh, src);
-    out.lock()
-        .map(|v| String::from_utf8_lossy(&v).into_owned())
-        .unwrap_or_default()
+    sh.fds.set(2, Fd::WriteBuf(err.clone()));
+    for unit in units {
+        match crate::parser::parse_aliased(unit, &sh.aliases) {
+            Ok(list) => {
+                if let Some(code) = exec::run_interactive_unit(&mut sh, &list) {
+                    sh.set_status(code);
+                    break;
+                }
+            }
+            Err(_) => sh.set_status(2),
+        }
+    }
+    let text = |b: &Arc<Mutex<Vec<u8>>>| {
+        b.lock().map(|v| String::from_utf8_lossy(&v).into_owned()).unwrap_or_default()
+    };
+    (sh.status, text(&out), text(&err))
 }
 
 pub fn is_builtin(name: &str) -> bool {

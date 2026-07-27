@@ -556,7 +556,7 @@ impl Shell {
     /// errors POSIX makes fatal in a non-interactive shell (`set -u`, `${x:?}`).
     pub fn fatal(&self, msg: &str, status: i32) -> Sig {
         let _ = exec::write_stderr(self, msg);
-        Sig::Exit(status)
+        Sig::Abort(status)
     }
 }
 

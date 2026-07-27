@@ -18,14 +18,21 @@ use crate::parser::{self, Aliases};
 use crate::pattern;
 use crate::process::{self, Fds};
 
-/// A non-local transfer of control. Only `Sig::Exit` leaves the interpreter; the
-/// loop and function forms are caught by their construct.
+/// A non-local transfer of control. `Sig::Exit` and `Sig::Abort` leave the
+/// interpreter; the loop and function forms are caught by their construct.
 #[derive(Clone, Copy, Debug)]
 pub enum Sig {
     Break(u32),
     Continue(u32),
     Return(i32),
     Exit(i32),
+    /// dash's `sh_error`/`EXERROR`: abandon the command being run. Identical to
+    /// `Exit` everywhere except an interactive top level, which catches it and
+    /// prompts again -- so a typo costs the command, not the session. The two
+    /// wrong answers it replaces were "always exit" (which ends an interactive
+    /// shell) and "return Ok if interactive" (which resumes the very loop the
+    /// failing command was meant to leave, and spins).
+    Abort(i32),
 }
 
 pub type R<T> = Result<T, Sig>;
@@ -278,8 +285,8 @@ impl Shell {
     }
 
     /// Assign a shell variable, honouring the readonly attribute. A write to a
-    /// readonly name is dash's sh_error: reported, then `Sig::Exit(2)` so `?`
-    /// carries it out and the script stops rather than testing a status.
+    /// readonly name is dash's sh_error, so it goes out as `Sig::Abort` and `?`
+    /// carries it to the nearest handler rather than leaving a status to test.
     pub fn set_var(&mut self, name: &str, value: &str) -> R<()> {
         // Assigning OPTIND at all -- even the value it already holds -- restarts
         // `getopts` at a word boundary, as dash's OPTIND hook does. `getopts`
@@ -407,7 +414,7 @@ impl Default for Shell {
 pub fn run_program(sh: &mut Shell, src: &str) -> i32 {
     let status = match run_source(sh, src, "") {
         Ok(()) => sh.status,
-        Err(Sig::Exit(code)) => code,
+        Err(Sig::Exit(code) | Sig::Abort(code)) => code,
         // A stray break/continue/return at the top level is not an error worth
         // aborting the process over; POSIX leaves it unspecified.
         Err(_) => sh.status,
@@ -415,6 +422,22 @@ pub fn run_program(sh: &mut Shell, src: &str) -> i32 {
     // Narrowed here so the return really is `$?`: an `exit 300` reaches this arm
     // whole, and this is where the shell environment ends.
     run_exit_trap(sh, status) & 0xff
+}
+
+/// Run one unit read at an interactive prompt. `Some(code)` means the shell is
+/// over; `None` means prompt again -- which is the whole point of `Sig::Abort`,
+/// and the one place it differs from `Sig::Exit`.
+pub fn run_interactive_unit(sh: &mut Shell, list: &List) -> Option<i32> {
+    match run_list(sh, list) {
+        Ok(()) => None,
+        Err(Sig::Exit(code)) => Some(code),
+        Err(Sig::Abort(code)) => {
+            sh.set_status(code);
+            None
+        }
+        // A stray break/continue/return typed at a prompt is not an error.
+        Err(_) => None,
+    }
 }
 
 /// Run the EXIT trap on the way out of a shell environment. POSIX: the action sees
@@ -429,7 +452,7 @@ pub fn run_exit_trap(sh: &mut Shell, status: i32) -> i32 {
     let saved = sh.trap_status.replace(status);
     let code = match run_source(sh, &action, "") {
         Ok(()) => status,
-        Err(Sig::Exit(code)) => code,
+        Err(Sig::Exit(code) | Sig::Abort(code)) => code,
         Err(_) => status,
     };
     sh.trap_status = saved;
@@ -448,7 +471,9 @@ pub fn run_source(sh: &mut Shell, src: &str, what: &str) -> R<()> {
             Some(Err(e)) => {
                 let _ = write_stderr(sh, &format!("td-sh: {what}{e}"));
                 sh.set_status(2);
-                return Ok(());
+                // Abandons the enclosing list, as `eval 'if'; echo` shows in both
+                // references: reporting and returning Ok ran the rest of it.
+                return Err(Sig::Abort(2));
             }
             // Still PARSED under `-n`, which is the point of the mode: the syntax
             // errors are reported. `run_command` is what declines to run it.
@@ -468,7 +493,7 @@ pub fn run_list(sh: &mut Shell, list: &List) -> R<()> {
             let mut child = process::fork_shell(sh);
             let status = match run_and_or(&mut child, and_or) {
                 Ok(()) => child.status,
-                Err(Sig::Exit(code)) => code,
+                Err(Sig::Exit(code) | Sig::Abort(code)) => code,
                 Err(_) => child.status,
             };
             let _ = run_exit_trap(&mut child, status);
@@ -848,14 +873,9 @@ fn run_builtin(
         // assignments (POSIX 2.9.1 order), so a failed redirection skips both.
         let saved = match process::apply_redirs(sh, redirs)? {
             process::RedirOutcome::Applied(s) => s,
-            // A redirection error on a special builtin aborts a NON-interactive shell
-            // (POSIX); an interactive shell reports it and continues. `$?` is already 1.
-            process::RedirOutcome::Failed => {
-                if sh.interactive {
-                    return Ok(());
-                }
-                return Err(Sig::Exit(sh.status));
-            }
+            // A redirection error on a special builtin is POSIX-fatal, so it takes
+            // the same route every other `sh_error` here does. `$?` is already 1.
+            process::RedirOutcome::Failed => return Err(Sig::Abort(sh.status)),
         };
         let result = (|| {
             for a in assigns {
@@ -891,26 +911,42 @@ fn run_builtin(
     // just assigned to the same name, leaving `x=t local x=l` with neither value.
     let transient = !matches!(bi, builtin::Builtin::Local);
     let mut saved_vars: Vec<(String, Option<Var>)> = Vec::with_capacity(assigns.len());
-    for a in assigns {
-        let value = expand::expand_assign(sh, &a.value)?;
-        if transient {
-            saved_vars.push((a.name.clone(), sh.vars.get(&a.name).cloned()));
+    // Closed over so an unwind mid-way -- a readonly target, `>${x:?}` -- still
+    // reaches the rollback below; a `?` here used to skip it and leak the binding
+    // into the next command, which only became visible once the shell survived.
+    let result = (|| {
+        for a in assigns {
+            let value = expand::expand_assign(sh, &a.value)?;
+            if transient {
+                saved_vars.push((a.name.clone(), sh.vars.get(&a.name).cloned()));
+            }
+            sh.set_var(&a.name, &value)?;
+            if transient {
+                sh.export(&a.name);
+            }
         }
-        sh.set_var(&a.name, &value)?;
-        if transient {
-            sh.export(&a.name);
+        match process::apply_redirs(sh, redirs)? {
+            process::RedirOutcome::Applied(saved) => {
+                let r = builtin::run(sh, bi, argv);
+                process::restore_redirs(sh, saved);
+                // dash re-raises EXERROR from `evalbltin` only for a SPECIAL
+                // builtin, and only for an error raised in the builtin's own BODY
+                // -- an error from the assignments or redirect words above is
+                // `evalcommand`'s and stays fatal. `Exit` propagates regardless,
+                // so `command exit 7` still exits.
+                match r {
+                    Err(Sig::Abort(code)) if swallows_abort(bi) => {
+                        sh.set_status(code);
+                        Ok(())
+                    }
+                    other => other,
+                }
+            }
+            // A failed redirection skips a regular builtin; `$?` is already 1. The
+            // transient prefix assignments are still rolled back below.
+            process::RedirOutcome::Failed => Ok(()),
         }
-    }
-    let result = match process::apply_redirs(sh, redirs)? {
-        process::RedirOutcome::Applied(saved) => {
-            let r = builtin::run(sh, bi, argv);
-            process::restore_redirs(sh, saved);
-            r
-        }
-        // A failed redirection skips a regular builtin; `$?` is already 1. The
-        // transient prefix assignments are still rolled back below.
-        process::RedirOutcome::Failed => Ok(()),
-    };
+    })();
     for (name, prev) in saved_vars.into_iter().rev() {
         match prev {
             Some(v) => {
@@ -922,6 +958,14 @@ fn run_builtin(
         }
     }
     result
+}
+
+/// Whether an `Abort` raised inside this builtin's body stops at the command
+/// boundary. dash keys it on the COMMAND WORD's own flags (`spclbltin` is locked
+/// to the first word), so only `command`, which is not special and which resolves
+/// what follows, hands the error back as a status.
+fn swallows_abort(bi: builtin::Builtin) -> bool {
+    matches!(bi, builtin::Builtin::Command)
 }
 
 fn expand_assignments(
@@ -1332,14 +1376,137 @@ mod tests {
     }
 
     #[test]
-    fn interactive_special_builtin_survives_a_redirection_error() {
-        // POSIX: a redirection error on a special builtin aborts a non-interactive
-        // shell but NOT an interactive one. Redirections also precede the prefix
-        // assignments, so the failed `export`'s FOO must not persist.
-        let s = crate::process::run_capturing_interactive(
-            "export FOO=bar >/nonexistent/dir/x; echo \"[${FOO}]\"",
-        );
-        assert_eq!(s, "[]\n");
+    fn an_interactive_shell_loses_the_command_and_not_the_session() {
+        use crate::process::run_capturing_interactive_units;
+        // Every `sh_error` here: a bad operand on each of the four builtins that
+        // parse one, a redirection error on a special builtin, and the two fatal
+        // expansions. In each the REST OF THE LINE is dropped and the NEXT unit
+        // still runs -- what ash and dash do on a pty.
+        for bad in [
+            "shift oops; echo SAME",
+            "while :; do break oops; done; echo SAME",
+            "exit oops; echo SAME",
+            "f() { return oops; }; f; echo SAME",
+            "export FOO=bar >/nonexistent/dir/x; echo SAME",
+            "echo ${undefined_var:?bad}; echo SAME",
+            "set -u; echo $undefined_var; echo SAME",
+            "readonly RO=1; RO=2; echo SAME",
+            "set -- -a; OPTIND=abc; getopts a o; echo SAME",
+        ] {
+            let (status, out, _) =
+                run_capturing_interactive_units(&[bad, "set +u", "echo NEXT"]);
+            assert_eq!(out, "NEXT\n", "{bad}");
+            assert_eq!(status, 0, "{bad}");
+        }
+        // The redirection case also has to leave the prefix assignment undone,
+        // because redirections are applied before it.
+        let (_, out, _) = run_capturing_interactive_units(&[
+            "export FOO=bar >/nonexistent/dir/x",
+            "echo \"[${FOO}]\"",
+        ]);
+        assert_eq!(out, "[]\n");
+        // `$?` is the aborted command's, not the shell's previous one. `${x:?}` is
+        // the case that tests the HANDLER: `Shell::fatal` is the one raiser that
+        // sets no status itself, so only `run_interactive_unit` can supply it.
+        for src in ["shift oops", "echo ${undefined_var:?bad}"] {
+            let (_, out, _) = run_capturing_interactive_units(&[src, "echo st=$?"]);
+            assert_eq!(out, "st=2\n", "{src}");
+        }
+    }
+
+    #[test]
+    fn an_abort_is_confined_by_every_stand_in_for_a_child_process() {
+        // One case per `Sig::Exit(code) | Sig::Abort(code)` arm. Each value was
+        // read off the td-built busybox ash and dash, which run these in a real
+        // child -- so the status comes back and the enclosing list carries on.
+        // Each raises through `Shell::fatal`, which sets no status of its own, so
+        // the value can ONLY have come back through the arm under test -- with
+        // `shift bad` the arm is unobservable, because `badnum` sets `$?` anyway.
+        for (src, want) in [
+            ("( echo ${x:?bad} ); echo $?", "2\n"),                 // subshell body
+            ("echo a | { echo ${x:?bad}; }; echo $?", "2\n"),       // pipeline stage
+            ("v=$(echo ${x:?bad}); echo $?", "2\n"),                // command sub
+            ("( shift bad ); echo $?", "2\n"),
+            // A background list reports 0 either way, so its own arm is only
+            // visible from inside: the child's EXIT trap sees the aborted status.
+            ("{ trap 'echo $?' EXIT; echo ${x:?bad}; } & wait; echo $?", "2\n0\n"),
+        ] {
+            let (status, out, _) = run(src);
+            assert_eq!(out, want, "{src}");
+            assert_eq!(status, 0, "{src}");
+        }
+        // The EXIT trap is the other arm: its abort becomes the shell's status.
+        let (status, _, _) = run("trap 'shift bad' EXIT; true");
+        assert_eq!(status, 2);
+    }
+
+    #[test]
+    fn an_abort_stops_at_command_but_nowhere_else() {
+        // dash re-raises EXERROR out of `evalbltin` only for a special COMMAND
+        // WORD, so `command` -- which is not special -- turns one back into a
+        // status and the list carries on.
+        for src in [
+            "command exit bad; echo SAME",
+            "command shift bad; echo SAME",
+            "command return bad; echo SAME",
+            "f() { command exit bad; }; f; echo SAME",
+        ] {
+            let (status, out, _) = run(&format!("{src}; echo st=$?"));
+            assert_eq!(out, "SAME\nst=0\n", "{src}");
+            assert_eq!(status, 0, "{src}");
+        }
+        // Only `Abort`, though: a real `exit` through `command` still exits.
+        let (status, out, _) = run("command exit 7; echo SAME");
+        assert_eq!((status, out.as_str()), (7, ""));
+        // And without `command` the same operand is fatal, as before.
+        let (status, out, _) = run("shift bad; echo SAME");
+        assert_eq!((status, out.as_str()), (2, ""));
+    }
+
+    #[test]
+    fn a_syntax_error_abandons_the_list_it_was_parsed_in() {
+        // Reported-and-continue let `eval 'if'; echo BAD` print BAD and exit 0;
+        // both references abandon the list with status 2.
+        for src in ["eval 'if'; echo BAD", ". /dev/null; eval 'for'; echo BAD"] {
+            let (status, out, _) = run(src);
+            assert_eq!((status, out.as_str()), (2, ""), "{src}");
+        }
+    }
+
+    #[test]
+    fn a_prefix_assignment_is_rolled_back_even_when_the_command_aborts() {
+        // The rollback used to sit after a `?`, so an abort mid-assignment left the
+        // transient binding behind -- invisible while the shell then died, and not
+        // once it survives.
+        use crate::process::run_capturing_interactive_units;
+        let (_, out, _) = run_capturing_interactive_units(&[
+            "A=old; readonly R=old",
+            "A=new R=new echo x",
+            "echo A=$A",
+        ]);
+        assert_eq!(out, "A=old\n");
+        let (_, out, _) = run_capturing_interactive_units(&[
+            "A=old",
+            "A=new echo hi >${UNSET_TARGET:?bad}",
+            "echo A=$A",
+        ]);
+        assert_eq!(out, "A=old\n");
+    }
+
+    #[test]
+    fn an_interactive_abort_leaves_the_loop_it_was_raised_in() {
+        // The other half, and the one that used to hang: returning Ok to keep an
+        // interactive shell alive resumed the loop the failing command was meant to
+        // end. Bounded so a regression fails instead of wedging the gate.
+        use crate::process::run_capturing_interactive_units;
+        for spinner in [
+            "for i in 1 2 3; do shift oops; done; echo SAME",
+            "for i in 1 2 3; do echo tick; break oops; done; echo SAME",
+        ] {
+            let (_, out, _) = run_capturing_interactive_units(&[spinner, "echo NEXT"]);
+            assert!(!out.contains("SAME"), "{spinner}: {out:?}");
+            assert!(out.ends_with("NEXT\n"), "{spinner}: {out:?}");
+        }
     }
 
     #[test]

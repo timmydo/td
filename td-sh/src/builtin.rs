@@ -1209,15 +1209,12 @@ fn number(sh: &mut Shell, argv: &[String], s: &str) -> R<i32> {
 fn badnum(sh: &mut Shell, argv: &[String], s: &str) -> Sig {
     let cmd = argv.first().map(String::as_str).unwrap_or_default();
     err_line(sh, &format!("{cmd}: Illegal number: {s}"));
-    Sig::Exit(2)
+    sh.set_status(2);
+    Sig::Abort(2)
 }
 
 fn loop_ctl(sh: &mut Shell, argv: &[String], is_break: bool) -> R<()> {
     let n = match argv.get(1) {
-        // Fatal, not reported-and-resumed: the one thing that would end the loop is
-        // what just failed, so returning left it spinning. Deliberately not
-        // `special_usage_error` -- its interactive branch returns Ok, which resumes
-        // that loop, and td-sh has no abort-the-command signal to use instead.
         // `breakcmd` runs the operand through `number` and THEN rejects a
         // non-positive count, so `break 0` reports the same way `break oops` does.
         Some(s) => match parse_number(s).filter(|n| *n > 0).and_then(|n| u32::try_from(n).ok()) {
@@ -1240,9 +1237,8 @@ fn loop_ctl(sh: &mut Shell, argv: &[String], is_break: bool) -> R<()> {
 
 fn shift(sh: &mut Shell, argv: &[String]) -> R<()> {
     let n = match argv.get(1) {
-        // The same `number()` rejection as `break`'s -- INT_MAX bound included, so
-        // `shift 2147483648` is a bad number and not a huge count -- but nothing
-        // here can loop, so it takes the usual interactive exemption.
+        // The same `number()` rejection as `break`'s, INT_MAX bound included, so
+        // `shift 2147483648` is a bad number and not a huge count.
         Some(s) => match parse_number(s).and_then(|n| usize::try_from(n).ok()) {
             Some(n) => n,
             None => return special_usage_error(sh, &format!("shift: Illegal number: {s}")),
@@ -1379,10 +1375,7 @@ pub fn apply_named_option(sh: &mut Shell, name: &str, on: bool) -> bool {
 fn special_usage_error(sh: &mut Shell, msg: &str) -> R<()> {
     err_line(sh, msg);
     sh.set_status(2);
-    if sh.interactive {
-        return Ok(());
-    }
-    Err(Sig::Exit(2))
+    Err(Sig::Abort(2))
 }
 
 fn unset(sh: &mut Shell, argv: &[String]) -> R<()> {
@@ -1560,13 +1553,15 @@ fn getopts(sh: &mut Shell, argv: &[String]) -> R<()> {
     } else {
         sh.params.clone()
     };
-    // dash treats an OPTIND that is not a positive integer as fatal (the shell
-    // exits 2), rather than quietly restarting the scan.
+    // dash treats an OPTIND that is not a positive integer as fatal, rather than
+    // quietly restarting the scan; ash ignores it (`is_number` guards its
+    // `number()` call), which is a divergence of its own and not this one.
     let mut optind = sh.getopts_optind;
     if optind < 1 {
         let shown = sh.get_var("OPTIND").unwrap_or_default();
         err_line(sh, &format!("getopts: Illegal number: {shown}"));
-        return Err(Sig::Exit(2));
+        sh.set_status(2);
+        return Err(Sig::Abort(2));
     }
     let mut off = sh.getopts_off;
     // A scan left past the end of a now-shorter argument list starts over.
@@ -2909,9 +2904,9 @@ mod tests {
             let (status, _, _) = run_capturing(&format!("for i in 1 2; do break {bad}; done"));
             assert_eq!(status, 2, "break {bad}");
         }
-        // Same rule for `shift`, but via the interactive-preserving route. The
-        // INT_MAX bound is part of it: over it is a bad NUMBER, not a huge count,
-        // so it must not reach the non-fatal overrun branch below it.
+        // Same rule for `shift`. The INT_MAX bound is part of it: over it is a bad
+        // NUMBER, not a huge count, so it must not reach the non-fatal overrun
+        // branch below it.
         for bad in ["oops", "2147483648"] {
             let (status, out, err) =
                 run_capturing(&format!("set -- a b; shift {bad}; echo AFTER"));

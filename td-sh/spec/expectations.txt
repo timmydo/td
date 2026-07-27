@@ -485,8 +485,6 @@ xfail builtin-echo.test.sh::echo to redirected directory is an error
 xfail builtin-echo.test.sh::incomplete hex escape
 xfail builtin-echo.test.sh::incomplete octal escape
 xfail builtin-echo.test.sh::incomplete unicode escape
-xfail builtin-eval-source.test.sh::Eval with syntax error
-xfail builtin-eval-source.test.sh::Source with syntax error
 xfail builtin-eval-source.test.sh::eval YSH block with 'break continue return error'
 xfail builtin-eval-source.test.sh::source doesn't crash when targeting a directory
 xfail builtin-eval-source.test.sh::source finds files in PATH before current dir
@@ -661,7 +659,6 @@ xfail builtin-trap-err.test.sh::trap ERR with YSH proc
 xfail builtin-trap-err.test.sh::trap ERR with for,  case, { }
 xfail builtin-trap-err.test.sh::trap ERR with redirect
 xfail builtin-trap-err.test.sh::trap can use original $LINENO
-xfail builtin-trap.test.sh::exit 1 when trap code string is invalid
 xfail builtin-trap.test.sh::exit codes for traps are isolated
 xfail builtin-trap.test.sh::trap EXIT with command sub / subshell / pipeline
 xfail builtin-trap.test.sh::trap with command.NoOp - check internal invariant
