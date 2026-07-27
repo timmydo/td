@@ -264,7 +264,19 @@ fn main() {
                 die_runner(&e);
             }
         }
-        _ => die("usage: td-recipe-eval list|emit|check-list|check-count|check-script|check-run|build-run|clear-store|qemu-boot|qemu-boot-erofs|qemu-boot-system|qemu-boot-net|qemu-boot-kexec|run|verify-store|source-pins|source-pin|seed-digests ..."),
+        Some("local-source-digests") => {
+            if args.get(2).is_some() {
+                die("usage: local-source-digests");
+            }
+            // `die`, not `die_runner`: this reds on a stale COMMITTED table, which is a
+            // hard failure to fix in the tree. die_runner would map its `provenance
+            // rejected' prose to 69, the code a gate runner reads as UNPROVISIONED and
+            // tolerates as a SKIP — the one outcome that would make this gate vacuous.
+            if let Err(e) = check_runner::local_source_digests_cli() {
+                die(&e);
+            }
+        }
+        _ => die("usage: td-recipe-eval list|emit|check-list|check-count|check-script|check-run|build-run|clear-store|qemu-boot|qemu-boot-erofs|qemu-boot-system|qemu-boot-net|qemu-boot-kexec|run|verify-store|source-pins|source-pin|seed-digests|local-source-digests ..."),
     }
 }
 

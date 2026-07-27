@@ -470,8 +470,11 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
     // digest-coverage unit tests in both crates are the direct check
     // (cargo-test); a row change shifts what the planners ADMIT, so the
     // recipe self-consistency and package build gates run too.
+    // A row edit is checkable directly for the LOCAL sources (their bytes are in the
+    // checkout); the fetched pins' rows still need a warm-cache `seed-digests` run.
     if p == "seed/seed-digests.txt" {
         sel.add_preflight("cargo-test");
+        sel.add_preflight("local-source-digests");
         sel.add_target("recipe-rs");
         add_build_gate_targets(root, sel);
         return;
@@ -490,6 +493,9 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
         // in-loop gates are unprovisionable (re #469).
         sel.add_preflight("shell-syntax");
         sel.add_preflight("cargo-test");
+        // A catalog edit can add, retarget, or drop a `local_source`, any of which
+        // changes which trees the table must pin.
+        sel.add_preflight("local-source-digests");
         sel.add_target("recipe-rs");
         if glob_match("recipes/src/recipes/*.rs", p) {
             sel.add_target("recipe-checks");
@@ -805,10 +811,17 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
     // recipe builds it, and `qemu-boot-system` runs the daemon on the image (the
     // selftest marker, and `keygen` minting this machine's host identity for
     // td-firstboot). The full check still runs for the fast repo-wide guards.
+    //
+    // It DOES ride local-source-digests: these bytes ARE the `sshd-source` seed, so
+    // editing them re-addresses it and seed/seed-digests.txt must be regenerated in
+    // the same landing. Omitting that is not hypothetical — it is how the row went
+    // stale, and nothing here caught it, because the key stayed present and every
+    // warm ladder kept answering from the pre-edit tree.
     if pattern_matches(
         "tests/sshd/*|tests/sshd/src/*|tests/sshd/Cargo.toml|tests/sshd/Cargo.lock",
         p,
     ) {
+        sel.add_preflight("local-source-digests");
         sel.add_target("check");
         sel.add_target("recipe-checks");
         return;
@@ -915,6 +928,7 @@ fn preflight_cmd(name: &str) -> Option<&'static str> {
             Some("  cargo test + clippy --frozen --workspace (builder/recipes/engine) + --manifest-path td-kexec/Cargo.toml + --manifest-path td-sh/Cargo.toml + --manifest-path td-txt/Cargo.toml + --manifest-path td-netd/Cargo.toml + --manifest-path td-boot/Cargo.toml + --manifest-path td-util/Cargo.toml + --manifest-path td-init/Cargo.toml + --manifest-path td-firstboot/Cargo.toml + --manifest-path td-login/Cargo.toml + --manifest-path td-svc/Cargo.toml + --manifest-path td-review/Cargo.toml -- --include-ignored")
         }
         "affected-self-test" => Some("  td-builder affected-checks --self-test"),
+        "local-source-digests" => Some("  td-recipe-eval local-source-digests"),
         _ => None,
     }
 }
@@ -1300,6 +1314,14 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
     assert_target!("tests/sshd/src/main.rs", "check");
     assert_target!("tests/sshd/src/main.rs", "recipe-checks");
     assert_target!("tests/sshd/Cargo.lock", "recipe-checks");
+    // Its bytes ARE the `sshd-source` seed, so any edit re-addresses it and the
+    // seed-digest row must be regenerated in the same landing. The row going stale
+    // unnoticed is what this mapping exists to prevent.
+    assert_preflight!("tests/sshd/src/main.rs", "local-source-digests");
+    assert_preflight!("tests/sshd/Cargo.toml", "local-source-digests");
+    assert_preflight!("tests/sshd/Cargo.lock", "local-source-digests");
+    assert_preflight!("seed/seed-digests.txt", "local-source-digests");
+    assert_preflight!("recipes/src/recipes/sshd.rs", "local-source-digests");
     // td-init mirrors td-util, including its confined syscall module: every source
     // is include_str!'d into the td-init recipe, so host cargo preflight
     // + the recipe-checks static-link proof.
@@ -1537,6 +1559,17 @@ fn run_shell(root: &Path, script: &str) -> i32 {
         .unwrap_or(1)
 }
 
+/// Single-quote a path for the bash `-c` string preflights run through. Refuses a
+/// path holding a single quote rather than guessing at an escape — the caller then
+/// runs without the variable instead of running a mis-quoted command.
+fn shell_quote(p: &Path) -> Option<String> {
+    let s = p.to_str()?;
+    if s.contains('\'') {
+        return None;
+    }
+    Some(format!("'{s}'"))
+}
+
 fn run_preflight(root: &Path, name: &str) -> i32 {
     match name {
         "shell-syntax" => run_shell(root, "bash -n tests/*.sh ci/*.sh tools/*.sh"),
@@ -1606,6 +1639,25 @@ fn run_preflight(root: &Path, name: &str) -> i32 {
             } else {
                 eprintln!("affected-checks self-test: {} failure(s)", failures.len());
                 1
+            }
+        }
+        // Re-hash every `local_source` tree and compare it to the row
+        // seed/seed-digests.txt pins (re #469). Cheap by construction — the bytes are
+        // already in the checkout, so there is no fetch and no ladder — which is why
+        // this can be a preflight while the fetched pins' equivalent (`seed-digests`,
+        // whole universe, warm cache required) cannot. The key-set coverage unit test
+        // does not overlap it: an edited local source keeps its key, so coverage stays
+        // green while the row describes a tree that no longer exists.
+        // td-recipe-eval hashes through td-builder, so hand it THIS binary rather than
+        // rebuilding one: cargo would be replacing the executable it is running from,
+        // and a stale one would not matter anyway — td-builder only NAR-hashes here;
+        // the compiled table being checked is td-recipe-eval's, which cargo rebuilds.
+        "local-source-digests" => {
+            let cmd = "cargo run --release --frozen --quiet --manifest-path recipes/Cargo.toml \
+                       --bin td-recipe-eval -- local-source-digests";
+            match std::env::current_exe().ok().and_then(|p| shell_quote(&p)) {
+                Some(tb) => run_shell(root, &format!("TD_BUILDER_SELF={tb} {cmd}")),
+                None => run_shell(root, cmd),
             }
         }
         _ => 0,

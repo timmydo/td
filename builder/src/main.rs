@@ -1390,10 +1390,7 @@ fn store_add_recursive(
 ) -> Result<String, String> {
     // Content-addressed path from the source tree's recursive NAR sha256.
     let nar = nar_hash(src).map_err(|e| e.to_string())?;
-    let hex = nar
-        .strip_prefix("sha256:")
-        .ok_or_else(|| format!("nar-hash returned `{nar}', expected sha256:<hex>"))?;
-    let path = store::make_store_path("source", hex, name);
+    let path = store_path_recursive_from_nar(name, &nar)?;
     let base = path
         .rsplit('/')
         .next()
@@ -1442,6 +1439,171 @@ fn store_add_recursive(
     };
     merge_output_db(Path::new(out_db), std::slice::from_ref(&reg))?;
     Ok(path)
+}
+
+/// Rewrite a td-owned STORE-DIR/DB down to the registered content paths `keep`
+/// admits, DELETING every dropped item's tree from STORE-DIR and renumbering
+/// what survives (ValidPaths 1..k by path, Refs remapped among survivors).
+/// `keep` is handed each row's full store path and its basename. Returns
+/// (rows dropped, files deleted, rows kept); dropped exceeds deleted when a
+/// dropped row's item was already missing, or when the row was too malformed to
+/// name a delete target (see the escape guard below).
+///
+/// Takes the ALREADY-OPENED db, so a caller that inspects it first — GC's
+/// liveness closure, `seed-prune`'s is-anything-unpinned check — decides and
+/// rewrites from one snapshot rather than re-reading between the two.
+///
+/// The surviving db carries ValidPaths + Refs only: the deriver scaffold and
+/// DerivationOutputs are deliberately not carried over, because a pruned store
+/// is content + references — the build-derivation mapping is rebuilt by
+/// registration, not by pruning. Shared by GC's liveness sweep and
+/// `seed-prune`'s compiled-table prune, which differ only in `keep`.
+fn retain_registered_paths(
+    store_dir: &str,
+    db_path: &str,
+    db: &store_db_read::Db,
+    keep: impl Fn(&str, &str) -> bool,
+) -> Result<(u64, u64, usize), String> {
+    use std::collections::HashMap;
+    use store_db::{Table, Value as WV};
+    use store_db_read::Value as RV;
+    let valid = db.table("ValidPaths")?;
+    let refs = db.table("Refs")?;
+    // old rowid -> path (to remap Refs after renumbering).
+    let mut path_of: HashMap<i64, String> = HashMap::new();
+    for (rid, cols) in &valid {
+        if let Some(RV::Text(p)) = cols.get(1) {
+            path_of.insert(*rid, p.clone());
+        }
+    }
+    // A registered content path = a row WITH a recorded hash (skip the deriver
+    // scaffold). Keep the admitted ones; DELETE the dropped ones' files.
+    let mut survivors: Vec<&Vec<RV>> = Vec::new();
+    let mut condemned: Vec<PathBuf> = Vec::new();
+    let mut dropped = 0u64;
+    for (_rid, cols) in &valid {
+        let path = match (cols.get(1), cols.get(2)) {
+            (Some(RV::Text(p)), Some(RV::Text(_))) => p,
+            _ => continue, // no hash -> scaffolding, not a content path
+        };
+        let base = path.rsplit('/').next().unwrap_or(path.as_str());
+        if keep(path, base) {
+            survivors.push(cols);
+            continue;
+        }
+        dropped += 1;
+        // The db is caller-supplied, so its rows do not get to name a delete target.
+        // `<store>/..` would resolve to the store's PARENT, and this runs unattended
+        // now that the ladder prunes every setup. Only a canonical `<digest>-<name>`
+        // basename may be removed; anything else loses its row — an unregistered item
+        // holds no authority either way — and keeps its bytes.
+        if store::name_from_store_path(path).is_some() && !base.contains('/') {
+            condemned.push(Path::new(store_dir).join(base));
+        } else {
+            eprintln!(
+                "td-builder: dropping db row `{path}' without deleting anything: not a \
+                 canonical store path"
+            );
+        }
+    }
+    // Renumber survivors 1..k by path; remap Refs among them.
+    survivors.sort_by(|a, b| path_at(a).cmp(path_at(b)));
+    let mut newid: HashMap<String, i64> = HashMap::new();
+    let mut vrows: Vec<(i64, Vec<WV>)> = Vec::new();
+    for (i, cols) in survivors.iter().enumerate() {
+        let nid = i as i64 + 1;
+        let path = path_at(cols).to_string();
+        newid.insert(path.clone(), nid);
+        let conv = |v: Option<&RV>| -> WV {
+            match v {
+                Some(RV::Int(n)) => WV::Int(*n),
+                Some(RV::Text(s)) => WV::Text(s.clone()),
+                _ => WV::Null,
+            }
+        };
+        vrows.push((
+            nid,
+            vec![
+                WV::Null,
+                WV::Text(path),
+                conv(cols.get(2)), // hash
+                conv(cols.get(3)), // registrationTime
+                conv(cols.get(4)), // deriver
+                conv(cols.get(5)), // narSize
+            ],
+        ));
+    }
+    let mut rrows: Vec<(i64, Vec<WV>)> = Vec::new();
+    let mut rid = 1i64;
+    for (_r, cols) in &refs {
+        let (a, b) = match (cols.first(), cols.get(1)) {
+            (Some(RV::Int(a)), Some(RV::Int(b))) => (*a, *b),
+            _ => continue,
+        };
+        if let (Some(pa), Some(pb)) = (path_of.get(&a), path_of.get(&b)) {
+            if let (Some(&na), Some(&nb)) = (newid.get(pa), newid.get(pb)) {
+                rrows.push((rid, vec![WV::Int(na), WV::Int(nb)]));
+                rid += 1;
+            }
+        }
+    }
+    let tables = [
+        Table {
+            name: "ValidPaths",
+            sql: "CREATE TABLE ValidPaths (id integer primary key, path text, hash text, registrationTime integer, deriver text, narSize integer)",
+            rows: vrows,
+        },
+        Table {
+            name: "Refs",
+            sql: "CREATE TABLE Refs (referrer integer, reference integer)",
+            rows: rrows,
+        },
+    ];
+    // DB first, bytes second, and atomically. A dropped row's item is unregistered
+    // the moment the db lands, so a leaked tree is inert — the store contributes
+    // bytes, never authority. The other order is not survivable: a delete that lands
+    // before the db leaves a row pointing at a missing item, and `authenticate_ca_db`
+    // cannot hash what is not there, so it rejects the WHOLE seed db — the exact
+    // brick this command exists to clear. A torn write would do the same, hence
+    // `write_atomic` rather than a direct `write`.
+    //
+    // The cost of that order: a crash between the two leaves trees no row names, and
+    // since both callers are db-driven neither will ever revisit them. Trading a
+    // rare unreclaimed tree for never producing a db that reds every plan is the
+    // right way round; reclaiming them wants an orphan pass over the store dir.
+    write_atomic(Path::new(db_path), &store_db::write_db(&tables))?;
+    let mut deleted = 0u64;
+    for entry in &condemned {
+        if !entry.exists() {
+            continue;
+        }
+        if entry.is_dir() {
+            std::fs::remove_dir_all(entry).map_err(|e| format!("{}: {e}", entry.display()))?;
+        } else {
+            std::fs::remove_file(entry).map_err(|e| format!("{}: {e}", entry.display()))?;
+        }
+        deleted += 1;
+    }
+    Ok((dropped, deleted, newid.len()))
+}
+
+/// The content-addressed `source` path a tree WOULD intern at — computed, not
+/// committed. `store_add_recursive` derives its path this way and then writes;
+/// this is the derivation alone, so a caller can gate the address BEFORE any
+/// store or db is touched (a rejected address must leave no trace: an interned
+/// item the compiled seed-digest table does not pin poisons the retained seed
+/// db for EVERY later plan, not just the one that interned it —
+/// `authenticate_seed_db` rejects the db wholesale).
+fn store_path_recursive(name: &str, src: &str) -> Result<String, String> {
+    let nar = nar_hash(src).map_err(|e| e.to_string())?;
+    store_path_recursive_from_nar(name, &nar)
+}
+
+fn store_path_recursive_from_nar(name: &str, nar: &str) -> Result<String, String> {
+    let hex = nar
+        .strip_prefix("sha256:")
+        .ok_or_else(|| format!("nar-hash returned `{nar}', expected sha256:<hex>"))?;
+    Ok(store::make_store_path("source", hex, name))
 }
 
 /// The `store-add-builder` body, factored so the re-intern semantics unit-test
@@ -5275,22 +5437,11 @@ fn seed_digests_expected(key: &str) -> Result<Option<&'static str>, String> {
     Ok(None)
 }
 
-/// AUTHENTICATE a plan's seed db (re #469 round-8): the db path is
-/// caller-supplied (and reused warm across `--auto` runs), so its rows are not
-/// trusted by presence — every row must (a) content-address to its own on-disk
-/// bytes (`authenticate_ca_db`) and (b) land on a basename the COMPILED
-/// seed-digest table pins for some seed key. (a) kills rows registered over
-/// foreign bytes; (b) kills self-consistent CA items the audited pins never
-/// derived — together the db can only vouch for the pinned seed universe.
-/// An ABSENT db authenticates vacuously: authority rides rows, and a missing
-/// file has none to grant — any step that actually needs seed items then reds
-/// at per-entry provenance or manifest assembly, never silently succeeds.
-fn authenticate_seed_db(dbp: &str, items_dir: &Path) -> Result<(), String> {
-    if !Path::new(dbp).is_file() {
-        return Ok(());
-    }
-    authenticate_ca_db(dbp, items_dir, "plan seed")?;
-    let mut pinned: std::collections::HashSet<&'static str> = std::collections::HashSet::new();
+/// Every basename the COMPILED seed-digest table pins, whatever key pins it.
+/// The admissible seed universe by content address: `authenticate_seed_db`
+/// rejects a db row outside it, and `seed-prune` drops one.
+fn compiled_pinned_basenames() -> Result<std::collections::HashSet<&'static str>, String> {
+    let mut pinned = std::collections::HashSet::new();
     for (n, line) in SEED_DIGESTS.lines().enumerate() {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
@@ -5309,6 +5460,25 @@ fn authenticate_seed_db(dbp: &str, items_dir: &Path) -> Result<(), String> {
             }
         }
     }
+    Ok(pinned)
+}
+
+/// AUTHENTICATE a plan's seed db (re #469 round-8): the db path is
+/// caller-supplied (and reused warm across `--auto` runs), so its rows are not
+/// trusted by presence — every row must (a) content-address to its own on-disk
+/// bytes (`authenticate_ca_db`) and (b) land on a basename the COMPILED
+/// seed-digest table pins for some seed key. (a) kills rows registered over
+/// foreign bytes; (b) kills self-consistent CA items the audited pins never
+/// derived — together the db can only vouch for the pinned seed universe.
+/// An ABSENT db authenticates vacuously: authority rides rows, and a missing
+/// file has none to grant — any step that actually needs seed items then reds
+/// at per-entry provenance or manifest assembly, never silently succeeds.
+fn authenticate_seed_db(dbp: &str, items_dir: &Path) -> Result<(), String> {
+    if !Path::new(dbp).is_file() {
+        return Ok(());
+    }
+    authenticate_ca_db(dbp, items_dir, "plan seed")?;
+    let pinned = compiled_pinned_basenames()?;
     let data = std::fs::read(dbp).map_err(|e| format!("read plan seed db {dbp}: {e}"))?;
     // Prefix a torn/truncated-db parse red with `plan seed db {dbp}` too: a crash-torn seed db
     // fails here, not at the basename check below, and the runner keys its clear-store recovery
@@ -7748,6 +7918,24 @@ fn main() -> ExitCode {
                 }
             }
         }
+        // The content-addressed path `store-add-recursive NAME SRC …` would produce,
+        // WITHOUT interning or registering anything: hash the tree, print the path.
+        // Lets a caller gate an address against the compiled seed-digest table before
+        // the store or db is touched, so a rejected tree leaves no trace. Usage:
+        //   store-path-recursive NAME SRC
+        Some("store-path-recursive") if args.len() == 4 => {
+            let (name, src) = (&args[2], &args[3]);
+            match store_path_recursive(name, src) {
+                Ok(path) => {
+                    println!("{path}");
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("td-builder: store-path-recursive {name}: {e}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
         // INPUT-ADDRESSED add: like store-add-recursive, but the store path's digest is
         // KEY (a hash of the artifact's DECLARED INPUTS — `toolchain-key`), NOT the tree's
         // recursive NAR hash. So a NON-byte-reproducible tree (the modern toolchain: cc1
@@ -8212,105 +8400,16 @@ fn main() -> ExitCode {
         Some("store-gc-sweep") if args.len() == 5 => {
             let (store_dir, db_path, root) = (&args[2], &args[3], &args[4]);
             let run = || -> Result<String, String> {
-                use std::collections::{HashMap, HashSet};
-                use store_db::{Table, Value as WV};
-                use store_db_read::Value as RV;
+                use std::collections::HashSet;
                 let bytes = std::fs::read(db_path).map_err(|e| e.to_string())?;
+                // One snapshot serves both the mark and the sweep.
                 let db = store_db_read::Db::open(bytes)?;
                 let live: HashSet<String> = db.closure(root)?.into_iter().collect();
-                let valid = db.table("ValidPaths")?;
-                let refs = db.table("Refs")?;
-                // old rowid -> path (to remap Refs after renumbering).
-                let mut path_of: HashMap<i64, String> = HashMap::new();
-                for (rid, cols) in &valid {
-                    if let Some(RV::Text(p)) = cols.get(1) {
-                        path_of.insert(*rid, p.clone());
-                    }
-                }
-                // A registered content path = a row WITH a recorded hash (skip the
-                // deriver scaffold). Keep the live ones; DELETE the dead ones' files.
-                let mut survivors: Vec<&Vec<RV>> = Vec::new();
-                let mut deleted = 0u64;
-                for (_rid, cols) in &valid {
-                    let path = match (cols.get(1), cols.get(2)) {
-                        (Some(RV::Text(p)), Some(RV::Text(_))) => p,
-                        _ => continue, // no hash -> scaffolding, not a content path
-                    };
-                    if live.contains(path) {
-                        survivors.push(cols);
-                    } else if let Some(base) = path.rsplit('/').next() {
-                        let entry = Path::new(store_dir).join(base);
-                        if entry.exists() {
-                            if entry.is_dir() {
-                                std::fs::remove_dir_all(&entry)
-                                    .map_err(|e| format!("{}: {e}", entry.display()))?;
-                            } else {
-                                std::fs::remove_file(&entry)
-                                    .map_err(|e| format!("{}: {e}", entry.display()))?;
-                            }
-                            deleted += 1;
-                        }
-                    }
-                }
-                // Renumber survivors 1..k by path; remap Refs among them.
-                survivors.sort_by(|a, b| path_at(a).cmp(path_at(b)));
-                let mut newid: HashMap<String, i64> = HashMap::new();
-                let mut vrows: Vec<(i64, Vec<WV>)> = Vec::new();
-                for (i, cols) in survivors.iter().enumerate() {
-                    let nid = i as i64 + 1;
-                    let path = path_at(cols).to_string();
-                    newid.insert(path.clone(), nid);
-                    let conv = |v: Option<&RV>| -> WV {
-                        match v {
-                            Some(RV::Int(n)) => WV::Int(*n),
-                            Some(RV::Text(s)) => WV::Text(s.clone()),
-                            _ => WV::Null,
-                        }
-                    };
-                    vrows.push((
-                        nid,
-                        vec![
-                            WV::Null,
-                            WV::Text(path),
-                            conv(cols.get(2)), // hash
-                            conv(cols.get(3)), // registrationTime
-                            conv(cols.get(4)), // deriver
-                            conv(cols.get(5)), // narSize
-                        ],
-                    ));
-                }
-                let mut rrows: Vec<(i64, Vec<WV>)> = Vec::new();
-                let mut rid = 1i64;
-                for (_r, cols) in &refs {
-                    let (a, b) = match (cols.first(), cols.get(1)) {
-                        (Some(RV::Int(a)), Some(RV::Int(b))) => (*a, *b),
-                        _ => continue,
-                    };
-                    if let (Some(pa), Some(pb)) = (path_of.get(&a), path_of.get(&b)) {
-                        if let (Some(&na), Some(&nb)) = (newid.get(pa), newid.get(pb)) {
-                            rrows.push((rid, vec![WV::Int(na), WV::Int(nb)]));
-                            rid += 1;
-                        }
-                    }
-                }
-                // The swept DB carries the live ValidPaths + Refs only; the deriver
-                // scaffold and DerivationOutputs are intentionally not carried (a swept
-                // store is content + references — the build-derivation mapping is rebuilt
-                // by registration, not GC).
-                let tables = [
-                    Table {
-                        name: "ValidPaths",
-                        sql: "CREATE TABLE ValidPaths (id integer primary key, path text, hash text, registrationTime integer, deriver text, narSize integer)",
-                        rows: vrows,
-                    },
-                    Table {
-                        name: "Refs",
-                        sql: "CREATE TABLE Refs (referrer integer, reference integer)",
-                        rows: rrows,
-                    },
-                ];
-                std::fs::write(db_path, store_db::write_db(&tables)).map_err(|e| e.to_string())?;
-                Ok(format!("swept {deleted} dead paths, {} live remain", newid.len()))
+                let (_dropped, deleted, kept) =
+                    retain_registered_paths(store_dir, db_path, &db, |path, _base| {
+                        live.contains(path)
+                    })?;
+                Ok(format!("swept {deleted} dead paths, {kept} live remain"))
             };
             match run() {
                 Ok(msg) => {
@@ -8319,6 +8418,64 @@ fn main() -> ExitCode {
                 }
                 Err(e) => {
                     eprintln!("td-builder: store-gc-sweep: {e}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        // seed-prune: drop from a RETAINED seed store/db every registered item whose
+        // basename the compiled seed-digest table no longer pins. Without it a table
+        // change (a pin bump, or an edit to a `local_source` tree) bricks every warm
+        // ladder: `authenticate_seed_db` rejects the WHOLE db over one stale row, so
+        // plans for unrelated targets red until the ladder is thrown away and
+        // re-climbed. The table is the authority, so an item it does not pin holds no
+        // authority to lose — dropping it is the cheap, correct healing. Usage:
+        //   seed-prune STORE-DIR DB
+        // Prints how many items were pruned / remain.
+        Some("seed-prune") if args.len() == 4 => {
+            let (store_dir, db_path) = (&args[2], &args[3]);
+            let run = || -> Result<String, String> {
+                if !Path::new(db_path).is_file() {
+                    return Ok("seed-prune: no seed db yet, nothing to prune".to_string());
+                }
+                let _commit_lock = lock_store_commit(Path::new(db_path))?;
+                let pinned = compiled_pinned_basenames()?;
+                // A table that pins nothing would authorize deleting the entire seed
+                // store. It cannot happen (the row set is compiled in and unit-tested
+                // non-empty), which is exactly why an unattended deleter should say so
+                // rather than act on it.
+                if pinned.is_empty() {
+                    return Err("compiled seed-digest table pins nothing — refusing to \
+                                prune every retained seed (re #469)"
+                        .to_string());
+                }
+                // Look before rewriting. The ladder prunes on EVERY setup, and the
+                // overwhelmingly common answer is "nothing to do" — rewriting a healthy
+                // db that often is a torn-write lottery this command exists to avoid
+                // losing, and it would also strip the scaffolding rows for no reason.
+                let bytes = std::fs::read(db_path).map_err(|e| e.to_string())?;
+                let db = store_db_read::Db::open(bytes)?;
+                let unpinned = db.hashes_by_path()?.into_iter().any(|(path, _)| {
+                    !pinned.contains(path.rsplit('/').next().unwrap_or(path.as_str()))
+                });
+                if !unpinned {
+                    return Ok("seed-prune: every retained seed is pinned, nothing to prune"
+                        .to_string());
+                }
+                let (pruned, _deleted, kept) =
+                    retain_registered_paths(store_dir, db_path, &db, |_p, base| {
+                        pinned.contains(base)
+                    })?;
+                Ok(format!(
+                    "seed-prune: pruned {pruned} unpinned items, {kept} pinned remain"
+                ))
+            };
+            match run() {
+                Ok(msg) => {
+                    println!("{msg}");
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("td-builder: seed-prune: {e}");
                     ExitCode::FAILURE
                 }
             }
@@ -9334,10 +9491,12 @@ fn main() -> ExitCode {
             eprintln!("       td-builder store-closure-scan STORE-DIR[,EXTRA-DIR...] ROOT...");
             eprintln!("       td-builder store-add-text NAME CONTENT-FILE STORE-DIR OUT-DB");
             eprintln!("       td-builder store-add-recursive NAME SRC STORE-DIR OUT-DB");
+            eprintln!("       td-builder store-path-recursive NAME SRC   # the address, interning nothing");
             eprintln!("       td-builder store-add-referenced NAME CONTENT-FILE REFS-FILE STORE-DIR OUT-DB");
             eprintln!("       td-builder store-add-output OUTPUT DERIVER CLOSURE-FILE STORE-DIR OUT-DB");
             eprintln!("       td-builder store-verify DB STORE-ROOT");
             eprintln!("       td-builder store-gc-sweep STORE-DIR DB ROOT");
+            eprintln!("       td-builder seed-prune STORE-DIR DB        # drop seeds the compiled table no longer pins");
             eprintln!("       td-builder resolve LOCKFILE NAME...");
             eprintln!("       td-builder build-recipe RECIPE-JSON LOCK SCRATCH-DIR STORE-DIR [SRC-STORE-DIR SRC-DB] [--recipe-output-store STORE] [--recipe-output-db DB]...");
             eprintln!("       td-builder build-plan --auto TARGET RECIPE-DIR MAP-FILE SEED-STORE SEED-DB SCRATCH");
@@ -10819,6 +10978,133 @@ daemon build START (2/2 active)
             verified += 1;
         }
         assert!(verified > 0, "no in-repo patch rows verified — table missing patches?");
+    }
+
+    // store_path_recursive computes the address store_add_recursive would intern at,
+    // and writes NOTHING: same path, but no store dir and no db appear. That is what
+    // lets a caller gate a local source's address and walk away without leaving a row
+    // the retained seed db would then be rejected over.
+    #[test]
+    fn store_path_recursive_agrees_with_the_intern_and_touches_no_store() {
+        let d = std::env::temp_dir().join(format!("td-store-path-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        let src = d.join("tree");
+        std::fs::create_dir_all(src.join("sub")).unwrap();
+        std::fs::write(src.join("sub/file"), b"contents").unwrap();
+        let src_s = src.to_string_lossy().into_owned();
+
+        let computed = store_path_recursive("thing", &src_s).unwrap();
+        let store = d.join("store");
+        let db = d.join("db");
+        assert!(!store.exists() && !db.exists(), "computing an address must write nothing");
+
+        let interned = store_add_recursive(
+            "thing",
+            &src_s,
+            &store.to_string_lossy(),
+            &db.to_string_lossy(),
+        )
+        .unwrap();
+        assert_eq!(computed, interned);
+        // And it stays a pure computation once the store DOES exist.
+        assert_eq!(computed, store_path_recursive("thing", &src_s).unwrap());
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    // seed-prune drops exactly the retained items the compiled table no longer pins,
+    // and keeps the pinned ones. Without it a table change (a pin bump, or an edited
+    // local_source) leaves the old basename registered, and authenticate_seed_db —
+    // which judges the db WHOLESALE — reds every later plan for every target until
+    // the whole ladder is discarded. Asserted as a pair: after pruning, the same db
+    // that authenticate_seed_db rejected authenticates.
+    #[test]
+    fn seed_prune_drops_unpinned_items_and_heals_a_warm_seed_db() {
+        let d = std::env::temp_dir().join(format!("td-seed-prune-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        let items = d.join("items");
+        std::fs::create_dir_all(&items).unwrap();
+        let reg = |p: &str, h: &str| OutputReg {
+            store_path: p.to_string(),
+            nar_hash: h.to_string(),
+            nar_size: 7,
+            refs: vec![],
+            deriver: String::new(),
+        };
+        let hash_of = |path: &str| {
+            let base = path.rsplit('/').next().unwrap_or(path);
+            nar_hash_path(&items.join(base)).unwrap()
+        };
+        // A warm seed store: one item the table pins, one it does not (the shape a
+        // stale local-source row leaves behind).
+        let pinned = intern_real_patch_seed(&items, "patch-glibc-boot-2.16.0");
+        let stale = intern_test_seed(&items, "sshd-source", b"the pre-edit tree");
+        let db = d.join("seed.db");
+        write_output_db(
+            &[reg(&pinned, &hash_of(&pinned)), reg(&stale, &hash_of(&stale))],
+            &db,
+        )
+        .unwrap();
+        let (db_s, items_s) = (db.to_string_lossy().into_owned(), items.to_string_lossy().into_owned());
+
+        // Warm and contaminated: the whole db is rejected over the one unpinned row.
+        let err = authenticate_seed_db(&db_s, &items).unwrap_err();
+        assert!(err.contains("not a basename the compiled seed-digest table pins"), "{err}");
+
+        let pinned_set = compiled_pinned_basenames().unwrap();
+        let opened = store_db_read::Db::open(std::fs::read(&db).unwrap()).unwrap();
+        let (dropped, deleted, kept) =
+            retain_registered_paths(&items_s, &db_s, &opened, |_p, base| pinned_set.contains(base))
+                .unwrap();
+        assert_eq!((dropped, deleted, kept), (1, 1, 1));
+        let stale_base = stale.rsplit('/').next().unwrap();
+        assert!(!items.join(stale_base).exists(), "the unpinned item's bytes go too");
+        let pinned_base = pinned.rsplit('/').next().unwrap();
+        assert!(items.join(pinned_base).exists(), "a pinned item must survive");
+        // Healed: the retained db now vouches for the pinned universe only, so plans
+        // for every OTHER target proceed — no clear-store, no cold climb.
+        authenticate_seed_db(&db_s, &items).unwrap();
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    // A db row does not get to choose what gets deleted. `<store>/..` names the
+    // store's PARENT, and pruning runs unattended on every ladder setup, so a row
+    // whose path is not a canonical store item loses its registration and NOTHING is
+    // removed. Asserted on the parent dir itself, which the naive join would have fed
+    // to remove_dir_all.
+    #[test]
+    fn retain_registered_paths_never_deletes_outside_the_store() {
+        let d = std::env::temp_dir().join(format!("td-retain-esc-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        let items = d.join("items");
+        std::fs::create_dir_all(&items).unwrap();
+        let bystander = d.join("not-the-store");
+        std::fs::create_dir_all(&bystander).unwrap();
+        let reg = |p: &str| OutputReg {
+            store_path: p.to_string(),
+            nar_hash: "sha256:00".to_string(),
+            nar_size: 1,
+            refs: vec![],
+            deriver: String::new(),
+        };
+        let db = d.join("seed.db");
+        write_output_db(
+            &[reg("/td/store/.."), reg("/td/store/."), reg("/td/store/")],
+            &db,
+        )
+        .unwrap();
+        let opened = store_db_read::Db::open(std::fs::read(&db).unwrap()).unwrap();
+        let (dropped, deleted, kept) = retain_registered_paths(
+            &items.to_string_lossy(),
+            &db.to_string_lossy(),
+            &opened,
+            |_p, _base| false,
+        )
+        .unwrap();
+        assert_eq!((dropped, deleted, kept), (3, 0, 0), "rows drop, nothing is deleted");
+        assert!(items.is_dir(), "the store dir survives");
+        assert!(bystander.is_dir(), "so does its sibling");
+        assert!(d.is_dir(), "and above all the store's PARENT");
+        std::fs::remove_dir_all(&d).ok();
     }
 
     // --auto: synthesize a recipe's WHOLE lock straight from its declared graph — no

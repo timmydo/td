@@ -573,6 +573,69 @@ pub fn seed_digests_cli() -> Result<(), String> {
     Ok(())
 }
 
+/// local-source-digests: check every catalog `local_source` tree against the row
+/// the compiled table pins for it.
+///
+/// The cheap half of `seed-digests`. That command re-derives the WHOLE seed
+/// universe and so needs a warm source cache and the ladder; a local source needs
+/// neither — its bytes are already in the checkout, so the check is a tree copy
+/// and a NAR hash. It exists because the key-set coverage test cannot see this
+/// class of staleness at all: editing `tests/sshd` leaves the key present and the
+/// row unchanged, so coverage stays green while the row now describes a tree that
+/// no longer exists. Nothing but a re-hash catches that, and re-hashing a fetched
+/// pin is expensive while re-hashing this is not — which is the whole reason it
+/// can be a per-change gate.
+///
+/// Deliberately NOT a `RecipeCheckRunner`: no ladder lock, no ladder scratch, no
+/// stage0 placement, no store and no db. It is wired to the recipes surface, which
+/// is edited constantly, and it must never be the thing that makes
+/// `affected-checks --run` sit behind another agent's multi-hour climb on the
+/// SHARED ladder — every other preflight is lock-free and this one has no business
+/// being the exception. td-builder is used only to NAR-hash a scratch copy, which
+/// is what `--auto` staging would do to it anyway; nothing here derives a seed.
+pub fn local_source_digests_cli() -> Result<(), String> {
+    let root = env::current_dir().map_err(|e| format!("current dir: {e}"))?;
+    let tb = find_td_builder_self(&root)?;
+    let scratch = env::temp_dir().join(format!("td-local-source-digests-{}", process::id()));
+    remove_path_if_exists(&scratch)?;
+    fs::create_dir_all(&scratch).map_err(|e| format!("mkdir {}: {e}", scratch.display()))?;
+    let mut checked = 0u32;
+    let mut errors: Vec<String> = Vec::new();
+    for input in catalog_seed_universe()? {
+        let SeedInput::LocalSource { key, path } = &input else {
+            continue;
+        };
+        checked += 1;
+        // Every local source is reported, so one that cannot even be hashed does not
+        // hide a stale row behind it — and the cleanup below stays reachable.
+        let hashed = stage_local_source_at(&root, key, path, &scratch.join(key))
+            .and_then(|staged| store_path_recursive_with(&tb, &root, key, &staged))
+            .and_then(|candidate| {
+                gate_local_source_candidate(key, &candidate).map(|()| candidate)
+            });
+        match hashed {
+            Ok(candidate) => {
+                println!("local source `{key}' ({path}) hashes to its pinned {candidate}")
+            }
+            Err(e) => errors.push(e),
+        }
+    }
+    remove_path_if_exists(&scratch)?;
+    if !errors.is_empty() {
+        return Err(errors.join("\n"));
+    }
+    // A gate that passes over an empty class is a gate that stopped working. The
+    // catalog has a local source; if this ever finds none, the classifier changed
+    // under it, not the tree.
+    if checked == 0 {
+        return Err("no local sources found in the catalog — this check verifies nothing; \
+                    the `local_source` classifier or the catalog changed under it"
+            .to_string());
+    }
+    println!("PASS: {checked} local source(s) agree with seed/seed-digests.txt");
+    Ok(())
+}
+
 fn usage() -> String {
     "usage: check-run STEM [INDEX]".to_string()
 }
@@ -995,6 +1058,126 @@ struct RecipeNode {
     recipe: Recipe,
 }
 
+/// Gate one local source's freshly computed content address against the compiled
+/// table. Separate from `seed_digests::require` only for its recovery line: the
+/// generic wording blames "a pin bump without regenerating", which for a local
+/// source is never what happened — nobody bumped anything, the tree was edited.
+/// It also has to say what NOT to do: the failure surfaces near enough to the
+/// stale-seed-store reds that `clear-store` looks like the fix, and it is not one.
+/// A cold ladder derives the same address from the same tree and reds identically,
+/// having thrown away every rung to get there.
+/// Resolve and validate a `local_source` path against a repo root: it must be a
+/// plain repo-relative path (no `..`/`.`/absolute component) that, once symlinks
+/// are resolved, stays under the root, naming a directory that is a Cargo crate
+/// (Cargo.toml + committed Cargo.lock). Returns the CANONICAL path, so whoever
+/// copies it copies the validated bytes.
+fn resolve_local_source_dir_at(root: &Path, rel: &str) -> Result<PathBuf, String> {
+    if rel.is_empty() {
+        return Err("local source path is empty".into());
+    }
+    let relp = Path::new(rel);
+    for comp in relp.components() {
+        if !matches!(comp, std::path::Component::Normal(_)) {
+            return Err(format!(
+                "local source `{rel}' must be a plain repo-relative path \
+                 (no `..', `.', or absolute root)"
+            ));
+        }
+    }
+    let dir = root.join(relp);
+    if !dir.is_dir() {
+        return Err(format!(
+            "local source `{rel}' is not a directory ({})",
+            dir.display()
+        ));
+    }
+    // Defense beyond the lexical `..` check: a symlinked path COMPONENT could
+    // still resolve outside the checkout and smuggle ambient (non-committed)
+    // bytes into the interned seed, breaking the in-tree provenance boundary.
+    // Canonicalize both and require the source stays under the repo root; the
+    // caller then copies this resolved path.
+    let canon_root = root
+        .canonicalize()
+        .map_err(|e| format!("canonicalize repo root {}: {e}", root.display()))?;
+    let canon_dir = dir
+        .canonicalize()
+        .map_err(|e| format!("canonicalize local source {}: {e}", dir.display()))?;
+    if !canon_dir.starts_with(&canon_root) {
+        return Err(format!(
+            "local source `{rel}' resolves outside the checkout ({}) — a symlinked \
+             component must not escape the repo (#469 in-tree provenance)",
+            canon_dir.display()
+        ));
+    }
+    if !canon_dir.join("Cargo.toml").is_file() {
+        return Err(format!("local source `{rel}' has no Cargo.toml"));
+    }
+    if !canon_dir.join("Cargo.lock").is_file() {
+        return Err(format!("local source `{rel}' has no committed Cargo.lock"));
+    }
+    Ok(canon_dir)
+}
+
+/// Copy a validated `local_source` tree (minus `target`/`.git`) to `dest`. The
+/// staged tree is what BOTH the content-address computation and the intern read,
+/// so the address that is gated and the bytes that are interned cannot diverge.
+fn stage_local_source_at(root: &Path, key: &str, rel: &str, dest: &Path) -> Result<PathBuf, String> {
+    let dir = resolve_local_source_dir_at(root, rel)?;
+    remove_path_if_exists(dest)?;
+    copy_source_tree(&dir, dest)
+        .map_err(|e| format!("copy local source {} for `{key}': {e}", dir.display()))?;
+    Ok(dest.to_path_buf())
+}
+
+/// `td-builder store-path-recursive`: the content address `src` WOULD intern at,
+/// computed with no store and no db written.
+fn store_path_recursive_with(
+    tb: &Path,
+    root: &Path,
+    name: &str,
+    src: &Path,
+) -> Result<String, String> {
+    let mut cmd = Command::new(tb);
+    cmd.current_dir(root)
+        .env("TD_STORE_DIR", TD_STORE_DIR)
+        .arg("store-path-recursive")
+        .arg(name)
+        .arg(path_str(src)?);
+    let out = command_output(&mut cmd, &format!("store-path-recursive {name}"))?;
+    out.lines()
+        .rev()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| format!("store-path-recursive {name} produced no path"))
+}
+
+fn gate_local_source_candidate(key: &str, candidate_path: &str) -> Result<(), String> {
+    let candidate = path_basename_str(candidate_path)?;
+    // The DECISION stays `require`'s, so a local source is admitted on exactly the
+    // terms every other seed is; only the explanation below is local.
+    if crate::seed_digests::require(key, candidate).is_ok() {
+        return Ok(());
+    }
+    // PROVENANCE_REJECTED, not the literal: `die_runner` keys the 69/UNPROVISIONED
+    // exit on this prefix, so a drifted copy would silently reclassify the failure.
+    Err(match crate::seed_digests::expected(key)? {
+        Some(exp) => format!(
+            "{PROVENANCE_REJECTED}local source `{key}' hashes to {candidate} but the compiled \
+             table pins {exp} — the in-tree source was edited without regenerating \
+             seed/seed-digests.txt. Fix the TABLE (`td-recipe-eval seed-digests > \
+             seed/seed-digests.txt', or edit this one row to {candidate}) and commit it. \
+             `clear-store' does NOT help: a cold ladder hashes the same tree to the same \
+             {candidate} and reds here again, minus the build cache (re #469)"
+        ),
+        None => format!(
+            "{PROVENANCE_REJECTED}local source `{key}' has no compiled expected digest in \
+             seed/seed-digests.txt — an unpinned seed is not admissible; regenerate the table \
+             with `td-recipe-eval seed-digests' and commit it (re #469)"
+        ),
+    })
+}
+
 #[derive(Debug)]
 enum SeedInput {
     Stage0 { key: String },
@@ -1172,7 +1355,8 @@ impl RecipeCheckRunner {
     /// being silently re-derived. The seeds re-intern idempotently every run regardless
     /// (`ensure_seed_input`), so a retained, intact seed store is reused, not clobbered.
     pub(crate) fn setup(&self) -> Result<(), String> {
-        self.setup_with_cache_cap(explicit_ladder_cache_cap())
+        self.setup_with_cache_cap(explicit_ladder_cache_cap())?;
+        self.prune_unpinned_seeds()
     }
 
     /// setup() with the eviction cap injected — the env-reading `setup()` is the production
@@ -1196,6 +1380,38 @@ impl RecipeCheckRunner {
             Some(cap) => self.evict_build_cache_if_over_watermark(cap),
             None => Ok(()),
         }
+    }
+
+    /// Drop retained seed items the compiled table no longer pins, so a table change
+    /// costs a re-derive of the changed seed rather than the whole ladder.
+    ///
+    /// `build-plan` authenticates the seed db WHOLESALE: ONE row on an unpinned
+    /// basename reds every plan, for every target. That is exactly the state a
+    /// legitimate table change leaves a warm ladder in — the old basename is still
+    /// registered — so without this, bumping a pin or editing a `local_source` means
+    /// a full cold climb, and the recovery hint on the resulting red says
+    /// `clear-store', which throws the cache away to reach the same place. Dropping
+    /// the row concedes nothing: the table is the authority, so an item it does not
+    /// pin could never be typed `AuditedSeed` anyway.
+    fn prune_unpinned_seeds(&self) -> Result<(), String> {
+        if !self.db.is_file() {
+            return Ok(());
+        }
+        let mut cmd = self.builder_command();
+        cmd.arg("seed-prune")
+            .arg(path_str(&self.store)?)
+            .arg(path_str(&self.db)?);
+        // A torn/unreadable seed db reds HERE now rather than at build-plan, so it
+        // needs build-plan's recovery hint or the reset it names goes unsaid.
+        let out = command_output(&mut cmd, "td-builder seed-prune")
+            .map_err(|e| with_seed_reset_hint(e, &self.lw))?;
+        // Erasing an item from the trust store is not a silent event. A seed the
+        // compiled table does not pin is exactly the anomaly `authenticate_seed_db`
+        // exists to red on; it holds no authority, but somebody should see it go.
+        for line in out.lines().filter(|l| l.contains("pruned")) {
+            eprintln!("ladder: {}", line.trim());
+        }
+        Ok(())
     }
 
     /// Coarse disk reclaim for the SHARED build-output cache: over the high-watermark cap,
@@ -1379,71 +1595,51 @@ impl RecipeCheckRunner {
         self.store_add_recursive(intern_name, &stage0)
     }
 
-    /// Intern an IN-TREE source directory (#469 local-source provenance): resolve
-    /// the repo-relative path, copy the committed source (minus `target`/`.git`)
-    /// into scratch, and content-address it into the seed store under
-    /// `intern_name`. No fetch/verify: the bytes ARE the committed tree, and the
-    /// compiled seed-digest table is what pins them (`ensure_seed_input`).
-    fn intern_local_source(&self, intern_name: &str, rel: &str) -> Result<String, String> {
-        let dir = self.resolve_local_source_dir(rel)?;
-        let scratch = self.scratch.join(format!("local-source-{intern_name}"));
-        remove_path_if_exists(&scratch)?;
-        copy_source_tree(&dir, &scratch)
-            .map_err(|e| format!("copy local source {}: {e}", dir.display()))?;
-        self.store_add_recursive(intern_name, &scratch)
+    /// Stage an IN-TREE source directory for hashing (#469 local-source
+    /// provenance): resolve the repo-relative path and copy the committed source
+    /// (minus `target`/`.git`) into scratch. The staged tree is what both the
+    /// content-address computation and the intern read, so the address that is
+    /// gated and the bytes that are interned cannot diverge.
+    fn stage_local_source(&self, intern_name: &str, rel: &str) -> Result<PathBuf, String> {
+        let dest = self.scratch.join(format!("local-source-{intern_name}"));
+        stage_local_source_at(&self.root, intern_name, rel, &dest)
     }
 
-    /// Resolve and validate a `local_source` path: it must be a plain
-    /// repo-relative path (no `..`/`.`/absolute component) that, once symlinks are
-    /// resolved, stays under the repo root, naming a directory that is a Cargo
-    /// crate (Cargo.toml + committed Cargo.lock). Returns the CANONICAL path so the
-    /// interner copies the validated bytes.
-    fn resolve_local_source_dir(&self, rel: &str) -> Result<PathBuf, String> {
-        if rel.is_empty() {
-            return Err("local source path is empty".into());
-        }
-        let relp = Path::new(rel);
-        for comp in relp.components() {
-            if !matches!(comp, std::path::Component::Normal(_)) {
-                return Err(format!(
-                    "local source `{rel}' must be a plain repo-relative path \
-                     (no `..', `.', or absolute root)"
-                ));
-            }
-        }
-        let dir = self.root.join(relp);
-        if !dir.is_dir() {
+    /// Intern an IN-TREE source directory: stage it, then content-address it into
+    /// the seed store under `intern_name`. No fetch/verify: the bytes ARE the
+    /// committed tree, and the compiled seed-digest table is what pins them. This
+    /// is the GENERATOR's path (`seed-digests`, which is producing the table and so
+    /// cannot be gated by it); the enforcing path is `ensure_local_source`.
+    fn intern_local_source(&self, intern_name: &str, rel: &str) -> Result<String, String> {
+        let staged = self.stage_local_source(intern_name, rel)?;
+        self.store_add_recursive(intern_name, &staged)
+    }
+
+    /// Realize a local source under the compiled table's authority, in the ONE order
+    /// that keeps a stale digest recoverable: hash, GATE, only then intern.
+    ///
+    /// Interning first would be self-defeating. The retained seed db is authenticated
+    /// WHOLESALE (`authenticate_seed_db`) — one row on a basename the table does not
+    /// pin makes every later `build-plan` red, for every target, including ones that
+    /// never look at this source. So an intern that happens before the gate converts
+    /// "this tree's digest is stale" into "the ladder is unusable", and the developer
+    /// pays a full cold climb for a one-line table fix.
+    fn ensure_local_source(&self, key: &str, rel: &str) -> Result<String, String> {
+        let staged = self.stage_local_source(key, rel)?;
+        let candidate = self.store_path_recursive(key, &staged)?;
+        gate_local_source_candidate(key, &candidate)?;
+        let derived = self.store_add_recursive(key, &staged)?;
+        // The intern re-hashes the same staged tree, so this cannot disagree with the
+        // gate above — assert it rather than assume it, since everything downstream
+        // trusts that the interned basename is the one the table vouched for.
+        if derived != candidate {
             return Err(format!(
-                "local source `{rel}' is not a directory ({})",
-                dir.display()
+                "local source `{key}': hashed {candidate} before interning but interned \
+                 {derived} — the staged tree changed under the gate"
             ));
         }
-        // Defense beyond the lexical `..` check: a symlinked path COMPONENT could
-        // still resolve outside the checkout and smuggle ambient (non-committed)
-        // bytes into the interned seed, breaking the in-tree provenance boundary.
-        // Canonicalize both and require the source stays under the repo root; the
-        // interner then copies this resolved path.
-        let canon_root = self
-            .root
-            .canonicalize()
-            .map_err(|e| format!("canonicalize repo root {}: {e}", self.root.display()))?;
-        let canon_dir = dir
-            .canonicalize()
-            .map_err(|e| format!("canonicalize local source {}: {e}", dir.display()))?;
-        if !canon_dir.starts_with(&canon_root) {
-            return Err(format!(
-                "local source `{rel}' resolves outside the checkout ({}) — a symlinked \
-                 component must not escape the repo (#469 in-tree provenance)",
-                canon_dir.display()
-            ));
-        }
-        if !canon_dir.join("Cargo.toml").is_file() {
-            return Err(format!("local source `{rel}' has no Cargo.toml"));
-        }
-        if !canon_dir.join("Cargo.lock").is_file() {
-            return Err(format!("local source `{rel}' has no committed Cargo.lock"));
-        }
-        Ok(canon_dir)
+        self.stage_store_path(&derived)?;
+        Ok(derived)
     }
 
     fn stage0_source_tarball(&self) -> Result<PathBuf, String> {
@@ -1458,6 +1654,13 @@ impl RecipeCheckRunner {
         }
         verify_source_pin(&tarball, &pin)?;
         Ok(tarball)
+    }
+
+    /// The content-addressed store path `src` WOULD intern at — computed, nothing
+    /// written. The seed store and db are untouched, so a caller may compare the
+    /// address against the compiled table and walk away.
+    fn store_path_recursive(&self, name: &str, src: &Path) -> Result<String, String> {
+        store_path_recursive_with(&self.tb, &self.root, name, src)
     }
 
     fn store_add_recursive(&self, name: &str, src: &Path) -> Result<String, String> {
@@ -1572,10 +1775,22 @@ impl RecipeCheckRunner {
     /// re-derives from the pin and gates the fresh basename via `require`); `clear-store` also
     /// forces cold.
     ///
+    /// A LOCAL source is exempt from the warm path entirely (the early return at the top of
+    /// this function, before the table is consulted at all), because
+    /// for it that limitation is not a mis-workflow but the ORDINARY case: its bytes are the
+    /// working tree, so any edit — no pin to bump, no table row to notice — leaves the store
+    /// holding a tree the table's basename no longer describes, and the warm hit would then
+    /// build the old bytes on every warm machine while a cold one reds. Re-deriving is a tree
+    /// copy plus a NAR hash of a small in-tree crate: no fetch, no extract, cheap enough to pay
+    /// every run so the table is checked against what the checkout says NOW.
+    ///
     /// COLD path (basename not yet interned): RE-DERIVE from the compiled pin — each
     /// intern_* verifies the pinned artifact and interns it into the seed store — then gate
     /// the derived basename against the compiled table before use.
     fn ensure_seed_input(&self, input: &SeedInput) -> Result<String, String> {
+        if let SeedInput::LocalSource { key, path } = input {
+            return self.ensure_local_source(key, path);
+        }
         if let Some(base) = crate::seed_digests::expected(input.key())? {
             if self.store.join(base).exists() {
                 let derived = format!("{TD_STORE_DIR}/{base}");
@@ -1600,6 +1815,11 @@ impl RecipeCheckRunner {
     /// path (`ensure_seed_input`) and the table generator (`seed-digests`),
     /// so the printed table is produced by the exact derivation the runner
     /// later enforces.
+    ///
+    /// GENERATOR-ONLY for a local source: this arm interns UNGATED, which is
+    /// correct for the command that is producing the table and wrong for anything
+    /// else. `ensure_seed_input` therefore never reaches it — it dispatches local
+    /// sources to `ensure_local_source` before this is called.
     fn derive_seed_input(&self, input: &SeedInput) -> Result<String, String> {
         match input {
             SeedInput::Stage0 { key } => self.intern_stage0_source(key),
@@ -1722,7 +1942,11 @@ impl RecipeCheckRunner {
             // markers — a long build log could scroll the auth red out of the tail. Byte-level
             // so a huge or non-UTF-8 log costs no lossy full-buffer allocation on the error path.
             return Err(if stale_seed_in(&stderr_bytes) {
-                format!("{base}\n{}", seed_reset_hint(&self.lw))
+                // Which hint is chosen reads the FULL stderr too: the unpinned-basename
+                // marker is what distinguishes a prune from a ladder-destroying reset, and
+                // it can sit well above the tail.
+                let hint = seed_reset_hint(&self.lw, &String::from_utf8_lossy(&stderr_bytes));
+                format!("{base}\n{hint}")
             } else {
                 base
             });
@@ -2447,17 +2671,42 @@ fn place_stage0_builder(
         .ok_or_else(|| "stage0-builder produced no output".to_string())
 }
 
-/// The explicit-reset recovery line, appended when a failure looks like a stale/torn retained
-/// seed. setup() no longer wipes the seed store/db, so these red here instead of self-healing.
-/// There is one shared ladder, so a bare `clear-store` always targets it; the path is shown
-/// for the operator's confirmation.
-fn seed_reset_hint(lw: &Path) -> String {
+/// The recovery line for a stale/torn retained seed. setup() no longer wipes the seed
+/// store/db, so these red here instead of self-healing. There is one shared ladder, so a
+/// bare `clear-store` always targets it; the path is shown for the operator's confirmation.
+///
+/// Two very different failures used to share one line, and the shared line said
+/// `clear-store'. For a TORN seed that is right — the bytes are unusable and must be
+/// re-derived. For an UNPINNED one it is actively destructive: the store merely holds an
+/// item the compiled table does not pin (another branch's table, or a pin this branch
+/// changed), `seed-prune` drops it in milliseconds, and `clear-store' instead discards the
+/// whole shared ladder — build cache included, which is hours of other people's rungs —
+/// and lands on the identical red, because throwing bytes away cannot correct a table.
+fn seed_reset_hint(lw: &Path, err: &str) -> String {
+    if unpinned_seed_in(err.as_bytes()) {
+        return format!(
+            "hint: the ladder's retained seed store holds an item the compiled seed-digest \
+             table does not pin — a pin or `local_source' changed here, or another branch \
+             sharing the ladder ({}) interned its own. `td-builder seed-prune STORE DB' drops \
+             it, and the ladder does that at every setup, so re-running usually suffices. Do \
+             NOT `clear-store': it discards the whole shared build cache and cannot correct a \
+             stale table — if the table is what is wrong, regenerate it \
+             (`td-recipe-eval seed-digests', or `local-source-digests' for an in-tree source).",
+            lw.display()
+        );
+    }
     format!(
-        "hint: the ladder's retained seed store/db is stale or torn (a pinned-seed change or an \
-         interrupted intern). Run `td-recipe-eval clear-store` to reset the ladder ({}) and \
-         re-derive seeds from the compiled pins.",
+        "hint: the ladder's retained seed store/db is torn or corrupt (an interrupted intern, \
+         or bytes changed under a registration). Run `td-recipe-eval clear-store` to reset the \
+         ladder ({}) and re-derive seeds from the compiled pins.",
         lw.display()
     )
+}
+
+/// The one stale-seed marker that `seed-prune` fixes and `clear-store` does not: a retained
+/// item on a basename the compiled table has no row for.
+fn unpinned_seed_in(bytes: &[u8]) -> bool {
+    contains_subslice(bytes, b"is not a basename the compiled seed-digest table pins")
 }
 
 /// A retained-seed failure marker — a plan-seed-db authentication red
@@ -2487,7 +2736,8 @@ fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {
 
 fn with_seed_reset_hint(err: String, lw: &Path) -> String {
     if looks_like_stale_seed(&err) {
-        format!("{err}\n{}", seed_reset_hint(lw))
+        let hint = seed_reset_hint(lw, &err);
+        format!("{err}\n{hint}")
     } else {
         err
     }
@@ -2922,6 +3172,154 @@ mod tests {
         );
     }
 
+    // The stale basename this repo actually shipped: `tests/sshd` was edited in the
+    // /etc-symlinks landing while its table row kept the digest of the tree before
+    // that edit. Every warm machine kept building the old bytes; a cold one red.
+    const STALE_SSHD_BASENAME: &str = "gyw2rg42bcbx74znn7kr0hlcdhds13r2-sshd-source";
+
+    fn pinned_basename(key: &str) -> &'static str {
+        crate::seed_digests::expected(key).unwrap().unwrap()
+    }
+
+    // The gate an edited local source hits, in both directions. An address that is
+    // NOT the pinned one is rejected however warm the ladder is (the store still
+    // holding the old basename is not consulted — this is a pure comparison against
+    // the compiled table), and the matching address is accepted.
+    #[test]
+    fn a_local_source_is_gated_on_its_current_hash_not_on_what_the_store_holds() {
+        let key = "sshd-source";
+        let err = gate_local_source_candidate(key, &format!("{TD_STORE_DIR}/{STALE_SSHD_BASENAME}"))
+            .expect_err("the pre-edit basename must no longer be admissible");
+        assert!(err.contains("provenance rejected"), "got: {err}");
+        assert!(err.contains(pinned_basename(key)), "got: {err}");
+        // The recovery line must send the developer to the TABLE. `clear-store` is the
+        // reflex the neighbouring stale-seed reds teach, and it is wrong here: it costs
+        // the whole ladder and lands on the identical red.
+        assert!(err.contains("seed/seed-digests.txt"), "got: {err}");
+        assert!(
+            err.contains("`clear-store' does NOT help"),
+            "the error must say clear-store is not the fix: {err}"
+        );
+
+        gate_local_source_candidate(key, &format!("{TD_STORE_DIR}/{}", pinned_basename(key)))
+            .expect("the tree's current hash is exactly what the committed table pins");
+    }
+
+    // A warm seed store answers for a PINNED seed and NEVER for a local source. A pin
+    // names bytes no checkout edit can change, so a present basename IS those bytes; a
+    // local source's bytes are the working tree, so the same presence proves nothing.
+    // Driven through `ensure_seed_input` with BOTH basenames interned: the pinned seed
+    // short-circuits (this runner's `tb` is empty, so it cannot have derived anything),
+    // and the local source declines to, reaching the staging step — which reds here
+    // because the test root holds no such directory.
+    #[test]
+    fn warm_seed_store_answers_for_a_pin_but_never_for_a_local_source() {
+        let lw = env::temp_dir().join(format!("td-warm-seed-{}", process::id()));
+        let _ = fs::remove_dir_all(&lw);
+        let mut runner = shared_test_runner(&lw);
+        runner.root = lw.join("root");
+        fs::create_dir_all(&runner.root).unwrap();
+        fs::create_dir_all(&runner.store).unwrap();
+        fs::create_dir_all(&runner.scratch).unwrap();
+        for key in ["stage0-source", "sshd-source"] {
+            fs::create_dir_all(runner.store.join(pinned_basename(key))).unwrap();
+        }
+
+        let warm = runner
+            .ensure_seed_input(&SeedInput::Stage0 {
+                key: "stage0-source".into(),
+            })
+            .expect("a pinned seed interned at its table basename is a warm hit");
+        assert_eq!(
+            warm,
+            format!("{TD_STORE_DIR}/{}", pinned_basename("stage0-source"))
+        );
+
+        let err = runner
+            .ensure_seed_input(&SeedInput::LocalSource {
+                key: "sshd-source".into(),
+                path: "tests/sshd".into(),
+            })
+            .expect_err("a local source must re-hash even with its basename interned");
+        assert!(err.contains("local source"), "got: {err}");
+        let _ = fs::remove_dir_all(&lw);
+    }
+
+    // A local source that does not make it through the check leaves the retained seed
+    // store and db byte-identical. The tree here is a real, resolvable crate, so the
+    // run gets as far as hashing it (which fails: this runner has no builder) — far
+    // enough to prove nothing along the way writes to the ladder.
+    //
+    // What this does NOT prove is the ORDER, since it never reaches the gate; a
+    // rejection that had already interned would need a working hasher to observe.
+    // `ensure_local_source_gates_before_it_interns` is the guard for that.
+    #[test]
+    fn a_failed_local_source_check_leaves_the_retained_store_and_db_untouched() {
+        let lw = env::temp_dir().join(format!("td-local-src-notouch-{}", process::id()));
+        let _ = fs::remove_dir_all(&lw);
+        let mut runner = shared_test_runner(&lw);
+        runner.root = lw.join("root");
+        let src = runner.root.join("tests/demo-src");
+        fs::create_dir_all(&src).unwrap();
+        fs::write(src.join("Cargo.toml"), b"[package]\nname = \"demo\"\n").unwrap();
+        fs::write(src.join("Cargo.lock"), b"version = 4\n").unwrap();
+        fs::create_dir_all(&runner.store).unwrap();
+        fs::create_dir_all(&runner.scratch).unwrap();
+        // A retained ladder: one interned seed plus its db.
+        fs::create_dir_all(runner.store.join(pinned_basename("stage0-source"))).unwrap();
+        fs::write(&runner.db, b"the retained seed registrations").unwrap();
+        let store_before = dir_listing(&runner.store);
+        let db_before = fs::read(&runner.db).unwrap();
+
+        let err = runner
+            .ensure_seed_input(&SeedInput::LocalSource {
+                key: "sshd-source".into(),
+                path: "tests/demo-src".into(),
+            })
+            .expect_err("this runner has no td-builder to hash with");
+        assert!(err.contains("store-path-recursive"), "got: {err}");
+
+        assert_eq!(store_before, dir_listing(&runner.store));
+        assert_eq!(db_before, fs::read(&runner.db).unwrap());
+        let _ = fs::remove_dir_all(&lw);
+    }
+
+    // The ORDER inside `ensure_local_source` — hash, gate, only then intern — is the
+    // whole defence, and no type or test above can observe it without a real builder
+    // to hash with. Assert it against the source, as td-init does for its syscall
+    // confinement: the gate call must PRECEDE the interning call.
+    #[test]
+    fn ensure_local_source_gates_before_it_interns() {
+        let src = include_str!("check_runner.rs");
+        let body = src
+            .split_once("fn ensure_local_source(")
+            .and_then(|(_, rest)| rest.split_once("\n    }\n"))
+            .map(|(body, _)| body)
+            .expect("ensure_local_source must be findable in this file");
+        let gate = body
+            .find("gate_local_source_candidate(")
+            .expect("ensure_local_source must gate the candidate address");
+        let intern = body
+            .find("store_add_recursive(")
+            .expect("ensure_local_source must intern the staged tree");
+        assert!(
+            gate < intern,
+            "ensure_local_source must gate the address BEFORE interning it — interning \
+             first poisons the retained seed db for every later plan"
+        );
+    }
+
+    fn dir_listing(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = fs::read_dir(dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
     // The seed map is fresh per-run derived state, never a persisted authority
     // (re #469): every run re-derives, pin-verifies, and stages each seed, then
     // writes the `--auto` map from exactly those verified paths. `serialize_auto_map`
@@ -3311,11 +3709,26 @@ mod tests {
             with_seed_reset_hint(auto_missing.to_string(), lw),
             with_seed_reset_hint(auto_tampered.to_string(), lw),
         ] {
-            assert!(hinted.contains("clear-store"));
             // The ladder path is shown for the operator's confirmation; no env-var override.
             assert!(hinted.contains("/home/u/.td/build-daemon/ladder-shared-v1"));
             assert!(!hinted.contains("TD_RECIPE_CHECK_WORK"));
         }
+        // A TORN seed must be re-derived, so it still says clear-store.
+        for torn_case in [torn, auto_missing, auto_tampered] {
+            assert!(with_seed_reset_hint(torn_case.to_string(), lw).contains("clear-store"));
+        }
+        // An UNPINNED one must NOT. `seed-prune` drops the row in milliseconds; clear-store
+        // throws away the shared ladder — every other branch's cached rungs with it — and
+        // lands on the same red, because discarding bytes cannot correct a table. This is
+        // the advice that turns one stale row into hours of everybody's rebuilt rungs.
+        let unpinned = with_seed_reset_hint(db_red.to_string(), lw);
+        assert!(
+            !unpinned.contains("Run `td-recipe-eval clear-store`"),
+            "an unpinned seed must not be sent to clear-store: {unpinned}"
+        );
+        assert!(unpinned.contains("Do NOT `clear-store'"), "{unpinned}");
+        assert!(unpinned.contains("seed-prune"), "{unpinned}");
+        assert!(unpinned.contains("seed-digests"), "{unpinned}");
 
         let unrelated = "ladder: pinned tarball not warm (/x/foo.tar) - run 'td-feed warm sources'";
         assert!(!looks_like_stale_seed(unrelated));
