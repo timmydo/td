@@ -9,7 +9,7 @@
 //! `invalid option`, never a silent no-op, and each is pinned in
 //! spec/divergence.test.txt.
 
-use crate::regex::{Options, Regex};
+use crate::regex::{Filter, OnBudget, Options, Regex};
 use crate::util::{
     errmsg, number, path_bytes, print_line, read_input, records, show, walk, Out, VERSION,
 };
@@ -115,12 +115,26 @@ impl Patterns {
 struct Grep {
     conf: Conf,
     pats: Patterns,
-    /// An empty pattern selects every line, so it short-circuits the matcher.
+    /// Some pattern is empty, so every line matches unless `-w`/`-x` narrows it.
+    /// Only `settled` reads this; matching compiles an empty pattern like any other.
     match_all: bool,
 }
 
 fn is_word(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_'
+}
+
+/// The `-w` test splits in two, and this half depends only on the START. That is what
+/// lets the scan rule out a start position without matching there (see `regex::Filter`),
+/// so both callers must agree on it — hence one function rather than two copies.
+fn word_start_ok(line: &[u8], s: usize) -> bool {
+    s.checked_sub(1).is_none_or(|i| line.get(i).is_none_or(|b| !is_word(*b)))
+}
+
+/// The other half: the byte AFTER the span must not be a word byte either. Past the
+/// end of the line counts as a boundary.
+fn word_end_ok(line: &[u8], e: usize) -> bool {
+    line.get(e).is_none_or(|b| !is_word(*b))
 }
 
 fn eq_fold(a: u8, b: u8, icase: bool) -> bool {
@@ -157,23 +171,35 @@ fn locate(hay: &[u8], needle: &[u8], from: usize, icase: bool) -> Option<(usize,
 }
 
 impl Grep {
-    /// The leftmost match in `line` at or after `from`, honoring `-w`/`-x`.
-    /// `-w` retries at the next start when a match is not word-bounded, which is
-    /// what GNU does.
-    fn match_at(&self, line: &[u8], from: usize) -> Result<Option<(usize, usize)>, String> {
-        if self.match_all {
-            // An empty pattern still has to clear -x/-w: `grep -x ''` selects
-            // only EMPTY lines, not every line.
-            let at = from.min(line.len());
-            if self.acceptable(line, at, at) {
-                return Ok(Some((at, at)));
-            }
-            return Ok(None);
-        }
+    /// The leftmost-then-longest match in `line` at or after `from`, honoring `-w`/`-x`
+    /// — EXCEPT under `OnBudget::Existence`, where the span is only valid as a boolean:
+    /// that mode stops at the first acceptable end, so `x\|xy` on `xy` reports `(0,1)`.
+    /// Callers that print or edit the span pass `OnBudget::Fail`.
+    ///
+    /// `-w` cannot be a filter over `search`'s answer: GNU retries SHORTER matches at
+    /// the same start before advancing, so a pattern whose greedy span is not
+    /// word-bounded can still select the line on a shorter span. `grep -w '\.*'`
+    /// selects `..a` (on `.`) and `.a` (on the empty span); testing only the greedy
+    /// `..`/`.` would report no match. `search_filtered` carries the test.
+    fn match_at(
+        &self,
+        line: &[u8],
+        from: usize,
+        on_budget: OnBudget,
+    ) -> Result<Option<(usize, usize)>, String> {
+        // An empty pattern takes no short cut here. It is compiled like any other, and
+        // it still has to clear -x/-w: `grep -x ''` selects only EMPTY lines, and
+        // `grep -w ''` only a word-bounded gap, which may lie well along the line
+        // (`a.` matches on the span after the dot). Short-circuiting on "some pattern
+        // is empty" also DISCARDED the other patterns, so `grep -w -e '' -e ab` missed
+        // the `ab` GNU selects.
         let mut best: Option<(usize, usize)> = None;
         match &self.pats {
             Patterns::Fixed(lits) => {
                 for lit in lits {
+                    if settles(on_budget, best) {
+                        return Ok(best);
+                    }
                     let mut at = from;
                     while let Some((s, e)) = locate(line, lit, at, self.conf.icase) {
                         if self.acceptable(line, s, e) {
@@ -188,24 +214,65 @@ impl Grep {
                 }
             }
             Patterns::Regex(res) => {
+                // A pattern the budget could not settle does not decide the LIST: the
+                // list is an OR, so a later pattern may still match, and only if none
+                // does is the refusal the answer. Held aside rather than propagated.
+                let mut refused: Option<String> = None;
                 for re in res {
-                    if self.conf.whole_line {
-                        if from == 0 && re.matches_whole(line).map_err(|e| e.msg)? {
-                            best = Some(better(best, (0, line.len())));
-                        }
-                        continue;
+                    // A match already settles an existence question, and running a
+                    // later pathological pattern could only turn that settled YES
+                    // into `too complex`.
+                    if settles(on_budget, best) {
+                        return Ok(best);
                     }
-                    let mut at = from;
-                    while let Some(caps) = re.search(line, at).map_err(|e| e.msg)? {
-                        let (s, e) = (caps.start(), caps.end());
-                        if self.acceptable(line, s, e) {
-                            best = Some(better(best, (s, e)));
-                            break;
+                    let found = if self.conf.whole_line {
+                        match from == 0 {
+                            // `-x` consumes the span implicitly (it compares the end to
+                            // the line length), so it never takes the relaxed budget.
+                            true => re.matches_whole(line).map(|hit| match hit {
+                                true => Some((0, line.len())),
+                                false => None,
+                            }),
+                            false => Ok(None),
                         }
-                        at = s + 1;
-                        if at > line.len() {
-                            break;
+                    } else if self.conf.word {
+                        // The word test belongs INSIDE the scan: GNU retries a shorter
+                        // match at the same start before advancing, and the acceptable
+                        // span can be shorter than the greedy one (or empty).
+                        let span = |s: usize, e: usize| self.acceptable(line, s, e);
+                        // Whether a start can bear a word-bounded span depends only on
+                        // the byte BEFORE it, so the scan can rule one out without
+                        // matching — see `Filter`.
+                        let start = |s: usize| word_start_ok(line, s);
+                        let filter = Filter { span: &span, start: &start };
+                        // Searching every end costs more than testing one, so a
+                        // pathological `-w` pattern can exhaust the budget where the
+                        // one-span-per-start algorithm this replaced would have
+                        // answered. That refusal is deliberate: the cheap answer is
+                        // reachable, but it is the WRONG one — testing only the greedy
+                        // span is the bug at the top of this file, and its "no match"
+                        // is a false negative, which is worse than a diagnosed refusal.
+                        re.search_filtered(line, from, &filter, on_budget)
+                            .map(|c| c.map(|c| (c.start(), c.end())))
+                    } else {
+                        match on_budget {
+                            OnBudget::Fail => re.search(line, from),
+                            OnBudget::Existence => re.search_existence(line, from),
                         }
+                        .map(|c| c.map(|c| (c.start(), c.end())))
+                    };
+                    match found {
+                        Ok(Some(span)) => best = Some(better(best, span)),
+                        Ok(None) => {}
+                        // Spans are compared ACROSS patterns, so a caller that consumes
+                        // one cannot proceed without every pattern's answer.
+                        Err(e) if on_budget == OnBudget::Fail => return Err(e.msg),
+                        Err(e) => refused = refused.or(Some(e.msg)),
+                    }
+                }
+                if best.is_none() {
+                    if let Some(msg) = refused {
+                        return Err(msg);
                     }
                 }
             }
@@ -218,20 +285,24 @@ impl Grep {
         if self.conf.whole_line && (s != 0 || e != line.len()) {
             return false;
         }
-        if self.conf.word {
-            let before_ok = s == 0 || line.get(s.wrapping_sub(1)).is_none_or(|b| !is_word(*b));
-            let after_ok = line.get(e).is_none_or(|b| !is_word(*b));
-            if !before_ok || !after_ok {
-                return false;
-            }
+        if self.conf.word && !(word_start_ok(line, s) && word_end_ok(line, e)) {
+            return false;
         }
         true
     }
 
     fn selects(&self, line: &[u8]) -> Result<bool, String> {
-        let hit = self.match_at(line, 0)?.is_some();
+        // Selection asks only WHETHER the line matches, so a budget exhausted with
+        // a match in hand still answers it. `-o` below consumes the span and cannot.
+        let hit = self.match_at(line, 0, OnBudget::Existence)?.is_some();
         Ok(hit != self.conf.invert)
     }
+}
+
+/// Whether a match in hand ends the search over the pattern LIST. Only when the
+/// caller asked existence: `-o` and sed compare spans ACROSS patterns and need them all.
+fn settles(on_budget: OnBudget, best: Option<(usize, usize)>) -> bool {
+    on_budget == OnBudget::Existence && best.is_some()
 }
 
 /// Prefer the leftmost span, then the longest — the order `grep -o` prints in.
@@ -872,7 +943,7 @@ fn search_file(
                 }
                 if grep.conf.only {
                     let mut at = 0usize;
-                    while let Some((s, e)) = grep.match_at(line, at)? {
+                    while let Some((s, e)) = grep.match_at(line, at, OnBudget::Fail)? {
                         if e == s {
                             at = s + 1;
                             if at > line.len() {
@@ -961,6 +1032,81 @@ mod tests {
         assert!(g.selects(b"concatenate cat").unwrap());
     }
 
+    /// The empty span is word-bounded only between non-word characters, which need not
+    /// be the line start — so `-w ''` has to scan. An earlier short-circuit tested only
+    /// the first position and called `a.` no match.
+    #[test]
+    fn word_option_scans_for_a_word_bounded_gap_under_an_empty_pattern() {
+        let g = grep_with(Conf { word: true, ..conf() }, &[""]);
+        // The only word-bounded gap in `a.` is the one after the dot.
+        assert_eq!(g.match_at(b"a.", 0, OnBudget::Fail).unwrap(), Some((2, 2)));
+        assert!(g.selects(b"a.").unwrap());
+        assert!(g.selects(b"a ").unwrap());
+        // Every gap in `ab`/`a.b` touches a word character.
+        assert!(!g.selects(b"ab").unwrap());
+        assert!(!g.selects(b"a.b").unwrap());
+        // `-x` is unaffected: an empty pattern still selects only the empty line.
+        let x = grep_with(Conf { whole_line: true, ..conf() }, &[""]);
+        assert!(x.selects(b"").unwrap());
+        assert!(!x.selects(b"a").unwrap());
+    }
+
+    /// Retrying at a later start is not the whole rule: GNU also retries a SHORTER
+    /// span at the SAME start, so the span `-w` accepts can be shorter than the
+    /// greedy one — or empty. Testing only the greedy span reported no match here.
+    #[test]
+    fn word_option_retries_a_shorter_span_at_the_same_start() {
+        let g = grep_with(Conf { word: true, ..conf() }, &[r"\.*"]);
+        // Greedy at 0 is `..`, not word-bounded (`a` follows); `.` is.
+        assert_eq!(g.match_at(b"..a", 0, OnBudget::Fail).unwrap(), Some((0, 1)));
+        // Greedy at 0 is `.`, not word-bounded; only the EMPTY span is.
+        assert_eq!(g.match_at(b".a", 0, OnBudget::Fail).unwrap(), Some((0, 0)));
+        assert!(g.selects(b"..a").unwrap());
+        assert!(g.selects(b".a").unwrap());
+        // A word character on either side blocks the empty span too.
+        let g2 = grep_with(Conf { word: true, ..conf() }, &["a*"]);
+        assert!(!g2.selects(b"ab").unwrap());
+    }
+
+    /// `-w` searching every end is only affordable because a start whose left
+    /// neighbour is a word byte is skipped without matching at all — on a line of
+    /// words that is most of them. The observable claim is the span: the match must
+    /// begin at a word edge, never inside one.
+    #[test]
+    fn word_option_starts_only_at_a_word_edge() {
+        let g = grep_with(Conf { word: true, ..conf() }, &["at"]);
+        assert_eq!(g.match_at(b"cat at", 0, OnBudget::Fail).unwrap(), Some((4, 6)));
+        assert!(!g.selects(b"cat cat").unwrap());
+    }
+
+    /// A pattern list is an OR, so one pattern the budget cannot settle must not
+    /// decide it. Either order answers: a match already found ends the loop before the
+    /// costly pattern runs, and a costly pattern that runs FIRST has its refusal held
+    /// aside while the rest of the list is tried. Only a list where nothing matches
+    /// refuses — see the case above.
+    #[test]
+    fn a_costly_pattern_does_not_veto_a_match_from_another() {
+        let line = "key=val ".repeat(80);
+        let costly = r"[^:]*.*a\(ab\)*a*";
+        for pats in [vec!["key", costly], vec![costly, "key"]] {
+            let g = grep_with(Conf { word: true, ..conf() }, &pats);
+            assert!(g.selects(line.as_bytes()).unwrap(), "order {pats:?}");
+        }
+    }
+
+    /// A `-w` pattern too costly to search exhaustively REFUSES rather than answering
+    /// from the cheap one-span-per-start algorithm. That algorithm is the bug this
+    /// file's `-w` fix removed, and its answer here would be a false negative — GNU
+    /// selects nothing on this line, but only an exhaustive search establishes that,
+    /// and this one does not finish.
+    #[test]
+    fn word_option_refuses_rather_than_guessing_when_out_of_budget() {
+        let g = grep_with(Conf { word: true, ..conf() }, &[r"[^:]*.*a\(ab\)*a*"]);
+        let line = "key=val ".repeat(80);
+        let err = g.selects(line.as_bytes()).unwrap_err();
+        assert!(err.contains("too complex"), "{err}");
+    }
+
     #[test]
     fn line_option_requires_the_whole_line() {
         let g = grep_with(Conf { whole_line: true, ..conf() }, &["a*"]);
@@ -993,8 +1139,8 @@ mod tests {
     #[test]
     fn only_matching_reports_leftmost_longest_spans() {
         let g = grep_with(conf(), &["ab*"]);
-        assert_eq!(g.match_at(b"xabb yab", 0).unwrap(), Some((1, 4)));
-        assert_eq!(g.match_at(b"xabb yab", 4).unwrap(), Some((6, 8)));
+        assert_eq!(g.match_at(b"xabb yab", 0, OnBudget::Fail).unwrap(), Some((1, 4)));
+        assert_eq!(g.match_at(b"xabb yab", 4, OnBudget::Fail).unwrap(), Some((6, 8)));
     }
 
     #[test]

@@ -22,5 +22,7 @@
 #   skip  = not run at all, because the case TIMED OUT: it would cost the shared
 #           gate the full per-case timeout for an answer already known to be
 #           wrong.
-#
-# EMPTY: td-txt passes every case in the corpus today.
+xfail grep-cli.test.txt::-w over sliding greedy repeats on a long line
+xfail grep-cli.test.txt::-o -w prints a shrunk span only at the first search position
+xfail grep-cli.test.txt::-o -w skips two shrinkable spans in the middle of the line
+xfail grep-cli.test.txt::-o -w after a shrunk span at the line start

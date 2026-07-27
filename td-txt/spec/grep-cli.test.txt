@@ -2214,3 +2214,636 @@ none /proc proc rw,relatime 0 0
 ## stdout-json: ""
 ## stderr-json: ""
 ## status: 1
+
+# `grep -w` over a pattern that can match a SHORTER span at the same start.
+# GNU retries shorter (down to empty) before advancing the start, so the span it
+# selects on need not be the greedy one; td-txt tested only the greedy span and
+# reported a false NO-MATCH. Found by differential fuzzing against grep 3.11.
+
+#### -w takes a SHORTER match at the same start when the greedy one is not word-bounded
+## argv: grep -w -e '\.*'
+## stdin-json: "..a"
+## stdout:
+..a
+## END
+## stderr-json: ""
+## status: 0
+
+#### -w on that shape reports the shorter span, not the greedy one
+## argv: grep -w -o -e '\.*'
+## stdin-json: "..a"
+## stdout:
+.
+## END
+## stderr-json: ""
+## status: 0
+
+#### -w accepts the EMPTY span when both neighbours are non-word
+## argv: grep -w -e '\.*'
+## stdin-json: ".a"
+## stdout:
+.a
+## END
+## stderr-json: ""
+## status: 0
+
+#### -w selects on an empty span but -o prints nothing for it
+## argv: grep -w -o -e '\.*'
+## stdin-json: ".a"
+## stdout-json: ""
+## stderr-json: ""
+## status: 0
+
+#### -w with the greedy span already word-bounded is unchanged
+## argv: grep -w -o -e '\.*'
+## stdin-json: "..."
+## stdout:
+...
+## END
+## stderr-json: ""
+## status: 0
+
+#### -w: a word neighbour blocks the empty span too, so no match
+## argv: grep -w -e 'a*'
+## stdin-json: "ab"
+## stdout-json: ""
+## stderr-json: ""
+## status: 1
+
+#### -w: same for a trailing word character
+## argv: grep -w -e 'c*'
+## stdin-json: "ca"
+## stdout-json: ""
+## stderr-json: ""
+## status: 1
+
+#### -w over a bracket class that can match empty
+## argv: grep -w -e '[.]*'
+## stdin-json: ".c"
+## stdout:
+.c
+## END
+## stderr-json: ""
+## status: 0
+
+#### -w when the pattern cannot match empty but can match shorter
+## argv: grep -w -o -e '\.\.*'
+## stdin-json: "..a"
+## stdout:
+.
+## END
+## stderr-json: ""
+## status: 0
+
+#### -w counts the line once however short the accepted span is
+## argv: grep -w -c -e '\.*'
+## stdin-json: ".a\n..a\nab\n"
+## stdout:
+2
+## END
+## stderr-json: ""
+## status: 0
+
+#### -w -v inverts on the shorter-span decision
+## argv: grep -w -v -e '\.*'
+## stdin-json: ".a\nab\n"
+## stdout:
+ab
+## END
+## stderr-json: ""
+## status: 0
+
+#### -w -n numbers the lines the shorter span selected
+## argv: grep -w -n -e '\.*'
+## stdin-json: "ab\n.a\n"
+## stdout:
+2:.a
+## END
+## stderr-json: ""
+## status: 0
+
+#### -w -i does not change which span is word-bounded
+## argv: grep -w -i -e '[^abc]\?'
+## stdin-json: "[A]c"
+## stdout:
+[A]c
+## END
+## stderr-json: ""
+## status: 0
+
+#### -w -x together still require the whole line
+## argv: grep -w -x -e '\.*'
+## stdin-json: "..a"
+## stdout-json: ""
+## stderr-json: ""
+## status: 1
+
+#### -wF with an empty fixed string is the degenerate shape
+## argv: grep -w -F -e ''
+## stdin-json: ".a"
+## stdout:
+.a
+## END
+## stderr-json: ""
+## status: 0
+
+# BRE anchor-vs-literal: `^` is the anchor only at the start of a branch. A
+# SECOND `^` is a literal caret, so `^^` selects lines beginning with `^` rather
+# than every line. td-txt kept one flag for both "nothing precedes this atom"
+# (which makes a leading `*` literal, and survives the anchor) and "a `^` here
+# still anchors" (which does not), so `^^` matched everything. Found by
+# differential fuzzing against grep 3.11.
+
+#### BRE: a second ^ is a LITERAL, so ^^ selects only lines starting with ^
+## argv: grep -e '^^'
+## stdin-json: "x\n^x\n"
+## stdout:
+^x
+## END
+## stderr-json: ""
+## status: 0
+
+#### BRE: ^^ does not select a line with no leading ^
+## argv: grep -e '^^'
+## stdin-json: "x\nab\n"
+## stdout-json: ""
+## stderr-json: ""
+## status: 1
+
+#### BRE: ^^ with -o reports the literal caret it matched
+## argv: grep -o -e '^^'
+## stdin-json: "^x\n"
+## stdout:
+^
+## END
+## stderr-json: ""
+## status: 0
+
+#### BRE: the anchor is consumed but a following * still has nothing to repeat
+## argv: grep -e '^*'
+## stdin-json: "*x\nx\n"
+## stdout:
+*x
+## END
+## stderr-json: ""
+## status: 0
+
+#### BRE: ^^* is the anchor, then zero or more literal carets
+## argv: grep -e '^^*'
+## stdin-json: "^^x\nx\nab\n"
+## stdout:
+^^x
+x
+ab
+## END
+## stderr-json: ""
+## status: 0
+
+#### BRE: ^^^ is the anchor then two literal carets
+## argv: grep -e '^^^'
+## stdin-json: "^^x\n^x\n"
+## stdout:
+^^x
+## END
+## stderr-json: ""
+## status: 0
+
+#### BRE: ^ after \| opens a new branch, so it anchors there
+## argv: grep -e '^^\|a'
+## stdin-json: "x\na\n^x\n"
+## stdout:
+a
+^x
+## END
+## stderr-json: ""
+## status: 0
+
+#### BRE: ^ after \( opens a new branch too
+## argv: grep -e '\(^^\)b'
+## stdin-json: "^b\nxb\n"
+## stdout:
+^b
+## END
+## stderr-json: ""
+## status: 0
+
+#### BRE: a ^ mid-branch was already literal and stays so
+## argv: grep -e '^a^b'
+## stdin-json: "a^b\nab\n"
+## stdout:
+a^b
+## END
+## stderr-json: ""
+## status: 0
+
+#### ERE: ^ anchors ANYWHERE, so ^^ still selects every line
+## argv: grep -E -e '^^'
+## stdin-json: "x\nab\n"
+## stdout:
+x
+ab
+## END
+## stderr-json: ""
+## status: 0
+
+#### ERE: that is the divergence from BRE, on the same pattern and input
+## argv: grep -E -e '^^'
+## stdin-json: "x\n"
+## stdout:
+x
+## END
+## stderr-json: ""
+## status: 0
+
+# POSIX leftmost-LONGEST across a bounded repeat. The matcher explored every end
+# only for patterns containing an alternation; a bounded repeat can also need an
+# EARLIER greedy repeat to give ground to reach its higher count, so these came
+# back short. Found by differential fuzzing against grep 3.11.
+
+#### leftmost-longest: a bounded repeat reaches its higher count when an earlier greedy one gives ground
+## argv: grep -o -e '.A*\(\^\?.\W\)\{1,3\}'
+## stdin-json: "AA[  \n"
+## stdout:
+AA[  
+## END
+## stderr-json: ""
+## status: 0
+
+#### leftmost-longest: same shape, the greedy-first answer would be one byte shorter
+## argv: grep -o -e '.A*\(.\W\)\{1,3\}'
+## stdin-json: "AA[  \n"
+## stdout:
+AA[  
+## END
+## stderr-json: ""
+## status: 0
+
+#### leftmost-longest with no alternation anywhere in the pattern
+## argv: grep -o -e 'a*\(ab\)\{1,2\}'
+## stdin-json: "aabab\n"
+## stdout:
+aabab
+## END
+## stderr-json: ""
+## status: 0
+
+#### leftmost-longest is unchanged when the greedy path is already longest
+## argv: grep -o -e 'a*b'
+## stdin-json: "aaab\n"
+## stdout:
+aaab
+## END
+## stderr-json: ""
+## status: 0
+
+# `-w` over an EMPTY pattern. That pattern short-circuits the regex engine
+# entirely (`match_all`), and the short circuit tested the empty span at ONE
+# position instead of scanning: `grep -w ''` selects `a.` on the span AFTER the
+# dot, and testing only the line start called it no match. Found by a reviewer,
+# not by the fuzzer above -- which never generated an empty pattern.
+
+#### -w over an EMPTY pattern scans for a word-bounded position, it is not just the line start
+## argv: grep -w -F -e ''
+## stdin-json: "a.\n"
+## stdout:
+a.
+## END
+## stderr-json: ""
+## status: 0
+
+#### -w over an empty pattern: the same for a trailing blank
+## argv: grep -w -F -e ''
+## stdin-json: "a \n"
+## stdout:
+a 
+## END
+## stderr-json: ""
+## status: 0
+
+#### -w over an empty pattern refuses a line whose every gap touches a word character
+## argv: grep -w -F -e ''
+## stdin-json: "a\nab\na.b\n"
+## stdout-json: ""
+## stderr-json: ""
+## status: 1
+
+#### -w over an empty pattern accepts at the line start when the first byte is non-word
+## argv: grep -w -F -e ''
+## stdin-json: ".a\n"
+## stdout:
+.a
+## END
+## stderr-json: ""
+## status: 0
+
+#### -w over an empty REGEX pattern behaves the same as the -F spelling
+## argv: grep -w -e ''
+## stdin-json: "a.\nab\n"
+## stdout:
+a.
+## END
+## stderr-json: ""
+## status: 0
+
+#### -w -o over an empty pattern prints nothing but still selects
+## argv: grep -w -o -F -e ''
+## stdin-json: "a.\n"
+## stdout-json: ""
+## stderr-json: ""
+## status: 0
+
+#### -w -c over an empty pattern counts the lines it selected
+## argv: grep -w -c -F -e ''
+## stdin-json: "a.\nab\n.a\n"
+## stdout:
+2
+## END
+## stderr-json: ""
+## status: 0
+
+#### -x over an empty pattern still selects only the empty line
+## argv: grep -x -F -e ''
+## stdin-json: "\na\n.\n"
+## stdout:
+
+## END
+## stderr-json: ""
+## status: 0
+
+#### -x and -w together over an empty pattern
+## argv: grep -x -w -F -e ''
+## stdin-json: "\na\n"
+## stdout:
+
+## END
+## stderr-json: ""
+## status: 0
+
+#### an empty pattern with neither -w nor -x selects every line
+## argv: grep -F -e ''
+## stdin-json: "a\n.\n"
+## stdout:
+a
+.
+## END
+## stderr-json: ""
+## status: 0
+
+
+# Leftmost-longest costs a backtracker every end at every start, and the first
+# cut of that explored unconditionally: these ordinary patterns on a 641-byte line
+# exhausted the step budget and reported `too complex` -- an exit 2 where GNU and
+# td-txt's own previous release both answer. The engine now stops at an end that
+# reaches the last byte (none can beat it) and, out of budget with a match already
+# in hand, returns that match rather than failing. The corpus had no long-line case
+# at all, which is why 798 green cases missed it. Found by all three reviews.
+
+#### a trailing greedy repeat on a long line stays linear (-c)
+## argv: grep -c -e '^.*key.*=.*val.*$'
+## stdin-json: "key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val \n"
+## stdout:
+1
+## END
+## stderr-json: ""
+## status: 0
+
+#### two sliding greedy repeats on a long line
+## argv: grep -c -e '.*=.*=.*'
+## stdin-json: "key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val \n"
+## stdout:
+1
+## END
+## stderr-json: ""
+## status: 0
+
+#### three adjacent greedy repeats on a long line
+## argv: grep -c -e '.*.*.*'
+## stdin-json: "key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val \n"
+## stdout:
+1
+## END
+## stderr-json: ""
+## status: 0
+
+#### a greedy repeat whose longest match stops short of the line end
+## argv: grep -c -e '.*:.*:.*E'
+## stdin-json: "x:x:x:x:x:x:x:x:x:x:x:x:x:x:x:x:x:x:x:x:x:x:x:x:x:x:x:x:x:x:x:x:x:x:x:x:x:x:x:x:Eyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy\n"
+## stdout:
+1
+## END
+## stderr-json: ""
+## status: 0
+
+# A KNOWN GAP, listed xfail: `-w` cannot take the end-of-line shortcut when the
+# line does not match at all, so a pathological pattern runs the budget out and
+# grep REFUSES with `too complex` where GNU answers 0. The cheap answer is
+# reachable -- test one span per start, as this program did before `-w` searched
+# for shorter spans -- and it was written that way first, then removed: that
+# algorithm is the bug at the top of this file, and here its answer would be a
+# false negative. A diagnosed refusal beats silently missing a match. Proving
+# ABSENCE is what costs; a `-w` pattern that MATCHES stops at the match.
+
+#### -w over sliding greedy repeats on a long line
+## argv: grep -c -w -e '[^:]*.*a\(ab\)*a*'
+## stdin-json: "key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val \n"
+## stdout:
+0
+## END
+## stderr-json: ""
+## status: 1
+
+# Leftmost-longest is not recoverable by widening the old fast path to "has an
+# alternation or a bounded repeat", as a review suggested: an UNBOUNDED repeat
+# giving ground needs the same exploration. GNU takes `aab` here where the greedy
+# path alone yields `aa`.
+
+#### leftmost-longest needs an unbounded repeat to give ground too
+## argv: grep -o -e 'a*\(ab\)*'
+## stdin-json: "aab\n"
+## stdout:
+aab
+## END
+## stderr-json: ""
+## status: 0
+
+#### an unbounded repeat giving ground, longer subject
+## argv: grep -o -e 'a*\(ab\)*'
+## stdin-json: "aaab\n"
+## stdout:
+aaab
+## END
+## stderr-json: ""
+## status: 0
+
+# An empty pattern used to short-circuit matching for the whole pattern LIST, so
+# the other patterns were never tried: `grep -w -e '' -e ab` missed the `ab` GNU
+# selects. Pre-existing, found by review while reading the rewritten block.
+
+#### -w does not discard the other patterns of an empty pattern list
+## argv: grep -w -e '' -e ab
+## stdin-json: "ab\n"
+## stdout:
+ab
+## END
+## stderr-json: ""
+## status: 0
+
+#### -x does not discard the other patterns of an empty pattern list
+## argv: grep -x -e '' -e ab
+## stdin-json: "ab\n"
+## stdout:
+ab
+## END
+## stderr-json: ""
+## status: 0
+
+#### an empty pattern beside a non-matching one still selects the gap
+## argv: grep -w -o -e '' -e zz
+## stdin-json: "a.\n"
+## stdout-json: ""
+## stderr-json: ""
+## status: 0
+
+
+# A KNOWN GAP, listed xfail in expectations.txt rather than fixed: `-o` with `-w`.
+# GNU shrinks a non-word-bounded greedy span only at the line's FIRST search
+# position; at a later start it advances past the span instead, so `-o -w '..\?'`
+# on `a b c` prints `a` and `c` and never `b` -- though every one of the three IS
+# a word-bounded match, and `-w` alone selects the line in both programs. td-txt
+# prints all three. The fourth case is the contrast: when no span needs shrinking
+# the two agree, which is what localizes the rule. Found by a `-w` fuzz run AFTER
+# the fixes above, so it is a gap this landing narrowed rather than opened -- the
+# previous release printed only `c`, missing the word-bounded `a` outright. The
+# blast radius is `-o` output alone: selection, `-c`, `-n` and `-v` all agree.
+
+#### -o -w prints a shrunk span only at the first search position
+## argv: grep -o -w -e '..\?'
+## stdin-json: "a b c\n"
+## stdout:
+a
+c
+## END
+## stderr-json: ""
+## status: 0
+
+#### -o -w skips two shrinkable spans in the middle of the line
+## argv: grep -o -w -e '..\?'
+## stdin-json: "a b c d\n"
+## stdout:
+a
+d
+## END
+## stderr-json: ""
+## status: 0
+
+#### -o -w after a shrunk span at the line start
+## argv: grep -o -w -e '..\?'
+## stdin-json: "b c d\n"
+## stdout:
+b
+d
+## END
+## stderr-json: ""
+## status: 0
+
+#### -o -w emits every span when none needs shrinking
+## argv: grep -o -w -e '..\?'
+## stdin-json: "a bb c\n"
+## stdout:
+a
+bb
+c
+## END
+## stderr-json: ""
+## status: 0
+
+
+# A pattern LIST is an OR, so a pattern the step budget cannot settle must not
+# decide it. Both orders answer: a match already found ends the loop before the
+# costly pattern runs, and a costly pattern that runs FIRST has its refusal held
+# aside while the rest of the list is tried. Found by review of the fix above --
+# `OnBudget::Existence` stopped the exploration WITHIN one pattern and nothing
+# stopped the loop ACROSS them, so a settled match still became exit 2.
+
+#### a costly pattern does not veto a match from an earlier one
+## argv: grep -c -w -e key -e '[^:]*.*a\(ab\)*a*'
+## stdin-json: "key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val \n"
+## stdout:
+1
+## END
+## stderr-json: ""
+## status: 0
+
+#### a costly pattern first does not veto a later one that matches
+## argv: grep -c -w -e '[^:]*.*a\(ab\)*a*' -e key
+## stdin-json: "key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val key=val \n"
+## stdout:
+1
+## END
+## stderr-json: ""
+## status: 0
+
+
+# Long-line cases for the SPAN-consuming callers. Searching every end for POSIX
+# leftmost-longest can exhaust the step budget on a line of a thousand-odd bytes
+# with three or more sliding repeats, and `sed`/`grep -o` cannot answer from a
+# match that is merely SOME match. Refusing them would regress an ordinary idiom
+# both GNU and the previous release handle, so the previous release's first-end
+# algorithm is the floor beneath the search -- see `Regex::scan`. Every other
+# long-line case in the corpus has a match reaching END OF LINE, where the search
+# stops anyway, and so could not have caught this; these two stop short.
+
+#### -o over three sliding repeats whose match stops short of the line end
+## argv: grep -o -e '.*].*].*TAIL'
+## stdin-json: "a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c TAILzzzzzzzzzzzz\n"
+## stdout:
+a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c a]b]c TAIL
+## END
+## stderr-json: ""
+## status: 0
+
+
+# `-x` over a REGEX must not accept a partial span. td-txt does not implement `-x`
+# by wrapping the pattern in `^\(...\)$` -- that would renumber the backreferences --
+# so the whole-line test is a separate arm of the matcher, and a reviewer reading the
+# arm BELOW it read the span check as missing. It is not, but nothing in the corpus
+# said so: these fail the moment the whole-line arm stops running first.
+
+#### -x over a regex rejects a span shorter than the line
+## argv: grep -x -e b
+## stdin-json: "abc\n"
+## stdout-json: ""
+## stderr-json: ""
+## status: 1
+
+#### -x over a regex rejects a prefix span
+## argv: grep -x -e ab
+## stdin-json: "abc\n"
+## stdout-json: ""
+## stderr-json: ""
+## status: 1
+
+#### -x over a regex accepts only the whole line
+## argv: grep -x -e a.c
+## stdin-json: "abc\n"
+## stdout:
+abc
+## END
+## stderr-json: ""
+## status: 0
+
+#### -x over a repeat that could match a prefix
+## argv: grep -x -e 'a*'
+## stdin-json: "abc\n"
+## stdout-json: ""
+## stderr-json: ""
+## status: 1
+
+#### -x over an alternation whose short branch is a prefix
+## argv: grep -x -e 'a\|abc'
+## stdin-json: "abc\n"
+## stdout:
+abc
+## END
+## stderr-json: ""
+## status: 0

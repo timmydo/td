@@ -6,9 +6,12 @@
 # somebody can quietly delete. A case here that starts failing means td-txt
 # drifted from a decision, not from upstream.
 #
-# All of them fail CLOSED — a diagnosed error and a non-zero status, never a
-# silent no-op — so a script written for GNU cannot mistake a refusal for
-# success.
+# The refusals here all fail CLOSED — a diagnosed error and a non-zero status,
+# never a silent no-op — so a script written for GNU cannot mistake a refusal for
+# success. One case is not a refusal but a different ANSWER (the anchor inside a
+# repeated group, last); it is here because the reason is the same — a decision,
+# not a gap — and a differing answer needs pinning more than a refusal does, since
+# nothing about it is self-announcing.
 
 #### sed refuses the e command, which would need a shell
 # GNU sed's `e` runs its argument through /bin/sh. td-txt is a static binary
@@ -177,3 +180,17 @@ a
 ## stdout-json: ""
 ## status: 2
 ## stderr-contains: option '--version' doesn't allow an argument
+
+#### an anchor inside a repeated group keeps leftmost-longest, where GNU reports empty
+# `^` inside a subexpression is a GNU extension; POSIX does not define an anchor
+# there at all, and GNU's own answer here is an artifact of how it compiles one
+# inside a `\+`. On `a]` GNU selects the EMPTY span at the start; td-txt selects
+# the longer `a`, which is what leftmost-longest says. Pinned rather than chased:
+# matching GNU would mean special-casing an undefined construct.
+## argv: grep -o -e '\(^[a-c]\{0,2\}\)\+'
+## stdin-json: "a]\n"
+## stdout:
+a
+## END
+## stderr-json: ""
+## status: 0

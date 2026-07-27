@@ -107,6 +107,52 @@ td-txt-authored case files
   `rootcheck_pins_the_td_volume_ere`, which is the other half of the binding: that
   end proves the script still spells what this end scores.
 
+  Three further blocks come from DIFFERENTIAL FUZZING against grep 3.11 rather than
+  from reading the option list — `grep -w` over a pattern that can match a shorter
+  span, BRE anchor-vs-literal (`^^`), and POSIX leftmost-longest across a bounded
+  repeat. All three were wrong ANSWERS, not refusals, and none of the shapes is
+  exotic (`-w` with a `*`/`?` pattern; a doubled `^`; a `\{n,m\}` after a `*`). The
+  hand-picked cases had missed all three — which is the point. How to run another
+  campaign:
+
+    - generate random patterns from a BRE/ERE grammar and random short inputs,
+      run `grep [-E] <flags> -e PAT file` under both binaries with LC_ALL=C, and
+      compare status + stdout + stderr;
+    - BUCKET the divergences before reading them. Raw counts are dominated by
+      noise: a deliberate refusal (`-b`), GNU's own `warning:` notices, and the
+      corner where a quantifier is applied to a zero-width assertion (`\<*`,
+      `\b?`) which POSIX leaves undefined and GNU itself warns about. Excluding
+      that corner is what took a run from ~450 divergences to 3, all real;
+    - the bucket that matters is "both accepted the pattern and the ANSWERS
+      differ". Everything else is a refusal-text question.
+
+  The fuzzer is deliberately NOT committed: it needs a GNU oracle binary, which
+  is not a declared input of any recipe, so it could not run in the offline gate.
+  Its findings are committed instead — as cases with goldens captured from the
+  oracle, which is what the gate can actually check.
+
+  What the fuzzer did NOT reach is worth knowing too. Its grammar never emits an
+  EMPTY pattern, and an empty pattern short-circuited the regex engine entirely,
+  so the whole `match_all` path was outside the search space — and that path had
+  the same `-w` bug in its own form. A reviewer found it by reading. A generator
+  only covers the shapes its grammar can produce, so the block below it
+  (`-w` over an empty pattern) exists because someone looked at the code instead.
+
+  Its inputs were also all SHORT, which hid a whole class: what a change costs on
+  a long line. Making the matcher explore every end for leftmost-longest turned
+  `grep '.*=.*=.*'` on a 641-byte line into `too complex` (exit 2), and 798 green
+  cases said nothing, because not one of them had a line that long. Fuzz LENGTH,
+  not just shape, and diff against the PREVIOUS td-txt as well as against GNU: the
+  question "did something that used to answer stop answering" is invisible when
+  the oracle is the only comparison. The long-line block below is that regression
+  test.
+
+  Goldens are C-locale. Under LC_ALL=C — the only locale td's image sets, and what
+  every case here was captured under — GNU `grep -w '\.*'` selects `.a`; under a
+  UTF-8 locale the same GNU binary selects nothing. Re-derive a `-w` golden without
+  LC_ALL=C and it will look as though the corpus pins non-GNU behavior. It does
+  not; it pins GNU in the locale td runs.
+
   Format: see the module header of ../src/lib.rs. `#### desc` opens a case,
   `## argv:` gives the command (argv[0] is the applet), `## stdin:`…`## END`
   and friends carry verbatim blocks, and `-json` spellings carry exact bytes
@@ -152,3 +198,36 @@ Overlay
                      earn their place as the score for a predicate that MOVED
                      onto this binary, not as a bug report — an ERE standing in
                      for an awk field test is worth pinning either way.
+
+                     The fuzz-derived blocks found THREE, all wrong answers
+                     rather than refusals, all now fixed: `-w` tested only the
+                     greedy span at each start; BRE `^^` treated the second `^`
+                     as a second anchor; and the matcher explored every end only
+                     for patterns containing an alternation, so a bounded repeat
+                     that needed an earlier greedy one to give ground came back
+                     short. Hand-written cases had not reached any of the three
+                     in 783 tries; a random search reached all three in a few
+                     thousand. That is the argument for repeating the campaign
+                     rather than only adding cases by reading the option list.
+
+                     A FOURTH came from review rather than from either: `-w`
+                     over an empty pattern, on the `match_all` path the fuzzer's
+                     grammar could not reach. Same rule, second implementation
+                     of it — which is the more useful lesson than the bug.
+
+                     A FIFTH and SIXTH came from reviewing the FIX for the third,
+                     which is the more instructive pair. Exploring every end made
+                     ordinary long-line patterns report `too complex`; and the
+                     empty-pattern short circuit, while being rewritten, was seen
+                     to discard the rest of the pattern list, so `grep -w -e ''
+                     -e ab` missed what GNU selects. The long-line block and the
+                     mixed-pattern block are their scores. Both were invisible to
+                     a corpus of short lines and single patterns, and the first
+                     was a REGRESSION the oracle alone could not name — GNU and
+                     the previous td-txt agreed, and only the new one differed.
+
+                     A fourth divergence was pinned instead of fixed, in
+                     divergence.test.txt: an anchor inside a `\+`-repeated group,
+                     where GNU reports the empty span and td-txt the longer one.
+                     POSIX does not define an anchor there, so matching GNU would
+                     mean special-casing its artifact.

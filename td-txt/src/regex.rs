@@ -9,10 +9,12 @@
 //! Both dialects compile to one AST. Backreferences (`\1`) are part of POSIX BRE
 //! and GNU ERE, which rules out a Thompson/Pike VM, so matching is backtracking
 //! with a step budget: a pathological pattern reports `too complex` instead of
-//! wedging the caller. Repetition is greedy (POSIX has no lazy quantifier), and
-//! for a pattern containing alternation the matcher explores the whole space and
-//! keeps the LONGEST match at the leftmost start — POSIX leftmost-longest, which
-//! is where a Perl-style first-match engine would differ (`x\|xy` on `xy`).
+//! wedging the caller. Repetition is greedy (POSIX has no lazy quantifier), and the
+//! matcher explores the whole space at each start and keeps the LONGEST match —
+//! POSIX leftmost-longest, which is where a Perl-style first-match engine would
+//! differ (`x\|xy` on `xy`). Exploring was once limited to patterns containing an
+//! alternation; a bounded repeat can also need an earlier greedy one to give ground,
+//! so that shortcut returned a short match (see `match_from`).
 
 /// A compile error. The message follows GNU's wording where the corpus asserts a
 /// diagnostic; callers prefix it with the program name.
@@ -133,12 +135,42 @@ pub struct Regex {
     ngroups: usize,
     icase: bool,
     multiline: bool,
-    /// Explore the whole match space and keep the longest (POSIX) instead of
-    /// returning the first match. Only alternation can make the two differ.
-    longest: bool,
     /// Bytes that can begin a match, when that is knowable — a cheap skip for the
     /// scan loop. `None` means "anything".
     first: Option<ByteSet>,
+    /// Whether the pattern contains an alternation. Not a matching rule — it once
+    /// wrongly decided whether to search for the longest match — but the condition
+    /// under which the FIRST end found can be catastrophically shorter than the
+    /// longest, which is what makes it unsafe as a budget fallback. See `scan`.
+    has_alt: bool,
+}
+
+/// What an exhausted step budget means for the caller.
+///
+/// Exploring every end is what leftmost-longest costs, and on a pathological pattern
+/// the budget can run out with a match found but not yet proven longest. Whether that
+/// match may be reported depends entirely on what the caller does with it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum OnBudget {
+    /// Fail closed. The caller consumes the SPAN — sed's substitution, `grep -o`,
+    /// `grep -x` — where a span that is merely SOME match is wrong output: for
+    /// `x\|x\(a\|aa\)*b` the first branch matches one byte and the second the whole
+    /// line, so answering with the short one silently rewrites the wrong text. A
+    /// diagnosed refusal is the honest answer.
+    Fail,
+    /// Answer with the match already found. The caller only asks WHETHER the line
+    /// matches — `grep` selection, `-c`, `-v`, `-q` — and any match settles that, so
+    /// refusing a line the previous release answered would be the worse trade.
+    Existence,
+}
+
+/// Which spans `search_filtered` may return. `span` tests a candidate `(start, end)`
+/// as the matcher reports it; `start` answers the cheaper question "could ANY end at
+/// this start pass?", which lets the scan skip a start without exploring it. `start`
+/// must not reject a start that `span` would accept some end at, or a match is lost.
+pub struct Filter<'a> {
+    pub span: &'a dyn Fn(usize, usize) -> bool,
+    pub start: &'a dyn Fn(usize) -> bool,
 }
 
 /// Byte spans of a match and its groups; `None` where a group did not
@@ -252,6 +284,11 @@ impl<'a> Parser<'a> {
         // branch, so it is a LITERAL there — and a leading `^` anchor does not
         // give it one: `^*` matches a line starting with `*`, not every line.
         let mut first = true;
+        // Whether a `^` HERE is still the anchor. Separate from `first`, which outlives
+        // it: after a leading `^` a repetition operator is still literal, but a SECOND
+        // `^` is not a second anchor — BRE `^^` selects lines starting with `^`, and
+        // conflating the two made it match every line.
+        let mut bol_ok = true;
         loop {
             if self.peek().is_none() || self.at_op(b'|') || (depth > 0 && self.at_op(b')')) {
                 break;
@@ -261,10 +298,11 @@ impl<'a> Parser<'a> {
             if items.len() >= MAX_CONCAT {
                 return Err(Error::new("regular expression is too complex"));
             }
-            let atom = self.parse_atom(depth, first)?;
+            let atom = self.parse_atom(depth, first, bol_ok)?;
             let anchor = !self.opts.ere && first && matches!(atom, Node::Bol);
             let atom = if anchor { atom } else { self.parse_repeats(atom)? };
             first = anchor;
+            bol_ok = false;
             items.push(atom);
         }
         match items.len() {
@@ -387,15 +425,17 @@ impl<'a> Parser<'a> {
         Some(n)
     }
 
-    /// One atom. `first` says the atom is at the start of a branch, which is what
-    /// makes `^` an anchor rather than a literal in BRE.
-    fn parse_atom(&mut self, depth: usize, first: bool) -> Result<Node, Error> {
+    /// One atom. `first` says nothing precedes the atom in its branch, which is what
+    /// makes a leading `*` a literal; `bol_ok` says a `^` here is still that branch's
+    /// leading anchor. They differ after a `^`: it consumes the anchor but still leaves
+    /// a following repetition operator nothing to repeat.
+    fn parse_atom(&mut self, depth: usize, first: bool, bol_ok: bool) -> Result<Node, Error> {
         let b = self.bump().ok_or_else(|| Error::new("unexpected end of pattern"))?;
         match b {
             b'.' => Ok(Node::Any),
             b'[' => self.parse_bracket(),
             b'^' => {
-                if self.opts.ere || first {
+                if self.opts.ere || bol_ok {
                     Ok(Node::Bol)
                 } else {
                     Ok(self.literal(b'^'))
@@ -683,26 +723,110 @@ impl Regex {
             // Only an unbalanced `)` can stop the top-level parse early.
             return Err(Error::new("Unmatched ) or \\)"));
         }
-        let longest = has_alt(&root);
         let first = first_bytes(&root);
-        Ok(Self { root, ngroups: p.ngroups, icase: opts.icase, multiline: opts.multiline, longest, first })
+        let has_alt = has_alt(&root);
+        Ok(Self {
+            root,
+            ngroups: p.ngroups,
+            icase: opts.icase,
+            multiline: opts.multiline,
+            first,
+            has_alt,
+        })
     }
 
     /// Leftmost match at or after `from`, or `None`. `Err` means the step budget
     /// was exhausted.
     pub fn search(&self, hay: &[u8], from: usize) -> Result<Option<Captures>, Error> {
+        self.scan(hay, from, None, OnBudget::Fail)
+    }
+
+    /// As `search`, but a budget exhausted with a match in hand answers with that
+    /// match instead of failing. Only for callers that ask WHETHER `hay` matches —
+    /// the span may not be the longest. See `OnBudget`.
+    pub fn search_existence(&self, hay: &[u8], from: usize) -> Result<Option<Captures>, Error> {
+        self.scan(hay, from, None, OnBudget::Existence)
+    }
+
+    /// Leftmost-then-longest match at or after `from` whose span satisfies `filter`.
+    ///
+    /// `grep -w` needs the test INSIDE the scan. GNU retries a SHORTER match at the
+    /// SAME start before advancing, so filtering `search`'s result cannot express it:
+    /// for `\.*` the greedy span at the start of `..a` is `..`, which is not
+    /// word-bounded, and the span GNU selects is the shorter `.`. On `.a` it is the
+    /// EMPTY span. `match_from` explores every end anyway, so `filter.span` only has
+    /// to narrow which of them may win.
+    pub fn search_filtered(
+        &self,
+        hay: &[u8],
+        from: usize,
+        filter: &Filter<'_>,
+        on_budget: OnBudget,
+    ) -> Result<Option<Captures>, Error> {
+        self.scan(hay, from, Some(filter), on_budget)
+    }
+
+    /// `scan_once`, with the PREVIOUS release's algorithm as a floor beneath it.
+    ///
+    /// Searching every end is what leftmost-longest costs, and on a long line with
+    /// three or more sliding repeats it can exhaust the budget where stopping at the
+    /// first end would have answered — `sed 's/\(.*\)=\(.*\);.*END/[\2]/'` over a
+    /// 1200-byte line did. Refusing that is a REGRESSION, so a `Fail` caller retries
+    /// with first-end semantics rather than failing.
+    ///
+    /// Except when the pattern has an alternation, where the first end can be
+    /// arbitrarily shorter than the longest — `x\|x\(a\|aa\)*b` matches one byte on
+    /// its first branch and the whole line on its second, so first-end would hand sed
+    /// a one-byte span to rewrite. That is exactly the case the previous release also
+    /// refused, because its own shortcut was conditional on this same flag. So the
+    /// floor is "whatever the previous release answered", never a new wrong span.
+    fn scan(
+        &self,
+        hay: &[u8],
+        from: usize,
+        filter: Option<&Filter<'_>>,
+        on_budget: OnBudget,
+    ) -> Result<Option<Captures>, Error> {
+        match self.scan_once(hay, from, filter, on_budget) {
+            Err(e) => match on_budget == OnBudget::Fail && !self.has_alt {
+                // One retry, so the worst case stays a bounded multiple of the budget.
+                true => self.scan_once(hay, from, filter, OnBudget::Existence),
+                false => Err(e),
+            },
+            found => found,
+        }
+    }
+
+    /// Advance the start position until `match_from` reports a match. One step
+    /// budget spans the whole scan, so a long line cannot multiply the worst case
+    /// by its length.
+    fn scan_once(
+        &self,
+        hay: &[u8],
+        from: usize,
+        filter: Option<&Filter<'_>>,
+        on_budget: OnBudget,
+    ) -> Result<Option<Captures>, Error> {
         let mut steps = 0u64;
         let mut at = from;
         loop {
             if at > hay.len() {
                 return Ok(None);
             }
-            let skippable = self
+            // The first-byte skip is sound even under a filter: `first_bytes` yields
+            // None whenever the pattern can match empty, so a start whose empty span
+            // might be acceptable is never skipped.
+            let mut skippable = self
                 .first
                 .as_ref()
                 .is_some_and(|set| hay.get(at).is_some_and(|b| !set.contains(*b)));
+            // A start no end can satisfy is skipped WITHOUT matching. This is what
+            // keeps `-w` affordable now that it explores every end: on a line of
+            // words, most starts sit inside one, and exploring them can only ever
+            // rediscover spans the word test then throws away.
+            skippable = skippable || filter.is_some_and(|f| !(f.start)(at));
             if !skippable {
-                if let Some(caps) = self.match_from(hay, at, self.longest, &mut steps)? {
+                if let Some(caps) = self.match_from(hay, at, &mut steps, filter, on_budget)? {
                     return Ok(Some(caps));
                 }
             }
@@ -717,7 +841,7 @@ impl Regex {
     }
 
     pub fn is_match(&self, hay: &[u8]) -> Result<bool, Error> {
-        Ok(self.search(hay, 0)?.is_some())
+        Ok(self.search_existence(hay, 0)?.is_some())
     }
 
     /// Does some match cover `hay` exactly? Used by `grep -x`, which cannot be
@@ -726,21 +850,36 @@ impl Regex {
     /// seen even when a greedier one does not.
     pub fn matches_whole(&self, hay: &[u8]) -> Result<bool, Error> {
         let mut steps = 0u64;
-        match self.match_from(hay, 0, true, &mut steps)? {
+        match self.match_from(hay, 0, &mut steps, None, OnBudget::Fail)? {
             Some(caps) => Ok(caps.end() == hay.len()),
             None => Ok(false),
         }
     }
 
-    /// Match anchored at exactly `at`, longest-first when the pattern alternates.
+    /// The LONGEST match anchored at exactly `at`. Every end is explored, because
+    /// POSIX is leftmost-longest and the greedy path is not always the longest one:
+    /// a bounded repeat reaches its higher count only if an EARLIER greedy repeat
+    /// gives ground, so `.A*\(\^\?.\W\)\{1,3\}` covers two more bytes of `AA[  `
+    /// when `A*` takes none. This was once conditional on the pattern containing an
+    /// alternation, which is why that case came back short.
+    ///
+    /// Exploring every end is what a backtracker pays for leftmost-longest, so three
+    /// things bound it: `k` stops at an end reaching the last byte, `OnBudget::
+    /// Existence` stops at the FIRST acceptable end because its caller needs a boolean
+    /// and not a span, and an exhausted budget yields the best end so far to that same
+    /// caller rather than an error. Running out with nothing found is always fatal.
+    ///
     /// `steps` is the caller's running budget, so a whole scan is bounded rather
     /// than each start position separately.
+    /// `filter`, when given, narrows candidate ends as they are reported — see
+    /// `search_filtered` for why the span test cannot be applied afterwards.
     fn match_from(
         &self,
         hay: &[u8],
         at: usize,
-        longest: bool,
         steps: &mut u64,
+        filter: Option<&Filter<'_>>,
+        on_budget: OnBudget,
     ) -> Result<Option<Captures>, Error> {
         let mut st = State {
             hay,
@@ -749,11 +888,11 @@ impl Regex {
             caps: vec![None; self.ngroups + 1],
             best: None,
             steps: *steps,
-            longest,
         };
         let root = &self.root;
         let matched = m(&mut st, root, at, &mut |st, end| {
-            let better = st.best.as_ref().is_none_or(|(_, e)| end > *e);
+            let allowed = filter.is_none_or(|f| (f.span)(at, end));
+            let better = allowed && st.best.as_ref().is_none_or(|(_, e)| end > *e);
             if better {
                 let mut spans = st.caps.clone();
                 if let Some(slot) = spans.first_mut() {
@@ -761,11 +900,21 @@ impl Regex {
                 }
                 st.best = Some((spans, end));
             }
-            // In longest mode keep exploring by reporting "not done".
-            !st.longest
+            // POSIX wants the LONGEST end, so keep exploring — with two exceptions.
+            // An end at the last byte cannot be beaten, which is what keeps a trailing
+            // greedy repeat linear: `.*=.*=.*` on a 4000-byte line reaches the end on
+            // its first success, and without the stop it re-partitions the line and
+            // exhausts the budget. And a caller asking only WHETHER `hay` matches has
+            // its answer from any end at all, so it pays for no exploration — the
+            // filtered scan still reaches a SHORTER acceptable end first, because
+            // `allowed` is tested as each end is reported, not afterwards.
+            allowed && (on_budget == OnBudget::Existence || end == st.hay.len())
         });
         *steps = st.steps;
-        if st.steps >= STEP_BUDGET {
+        if st.steps >= STEP_BUDGET && (st.best.is_none() || on_budget == OnBudget::Fail) {
+            // Out of budget with nothing found: "no match" cannot be claimed without
+            // having looked, so fail closed. With a match in hand it depends on what
+            // the caller does with the span — see `OnBudget`.
             return Err(Error::new("regular expression is too complex"));
         }
         if !matched && st.best.is_none() {
@@ -775,6 +924,7 @@ impl Regex {
     }
 }
 
+/// Does the pattern contain an alternation anywhere?
 fn has_alt(node: &Node) -> bool {
     match node {
         Node::Alt(_) => true,
@@ -823,10 +973,9 @@ struct State<'a> {
     icase: bool,
     multiline: bool,
     caps: Spans,
-    /// The longest match seen so far and where it ended (longest mode only).
+    /// The longest match seen so far and where it ended.
     best: Option<(Spans, usize)>,
     steps: u64,
-    longest: bool,
 }
 
 impl State<'_> {
@@ -858,9 +1007,10 @@ impl State<'_> {
     }
 }
 
-/// Continuation-passing backtracker. `k` reports a candidate end position and
-/// returns `true` to stop the search (first-match mode) or `false` to keep
-/// exploring (longest mode). The return value propagates that "stop" signal.
+/// Continuation-passing backtracker. `k` reports a candidate end position and returns
+/// `true` to stop the search or `false` to keep exploring; the return value propagates
+/// that "stop" signal. `match_from`'s `k` keeps exploring until an end reaches the last
+/// byte, which no later end can beat.
 fn m(st: &mut State, node: &Node, pos: usize, k: &mut dyn FnMut(&mut State, usize) -> bool) -> bool {
     st.steps += 1;
     if st.steps >= STEP_BUDGET {
@@ -1162,6 +1312,88 @@ mod tests {
         assert!(!matched(&bre("^ab$"), "xab"));
         // A `$` in the middle of a BRE is a literal.
         assert!(matched(&bre("a$b"), "a$b"));
+    }
+
+    /// Only the FIRST `^` of a BRE branch anchors; a second one is a literal caret.
+    /// The leading-`*`-is-literal rule outlives the anchor, so `^*` still matches a
+    /// star — one flag cannot carry both, and sharing one made `^^` match every line.
+    /// POSIX is leftmost-LONGEST, and the greedy path is not always the longest: the
+    /// group below reaches its SECOND iteration only if `A*` takes nothing, and the
+    /// traversal reports the greedy 4-byte end first. Exploring every end was once
+    /// conditional on the pattern alternating, so this came back as (0, 4).
+    #[test]
+    fn a_bounded_repeat_can_beat_an_earlier_greedy_one() {
+        let re = bre(r".A*\(.\W\)\{1,3\}");
+        let caps = re.search(b"AA[  ", 0).unwrap().unwrap();
+        assert_eq!((caps.start(), caps.end()), (0, 5));
+        // Still longest when the greedy path already was.
+        let re2 = bre("a*b");
+        let c2 = re2.search(b"aaab", 0).unwrap().unwrap();
+        assert_eq!((c2.start(), c2.end()), (0, 4));
+        // An UNBOUNDED repeat needs the same exploration, which is why the old fast
+        // path cannot be recovered by asking whether a repeat is counted: greedy `a*`
+        // takes both a's and leaves `\(ab\)*` nothing, so the longest match needs it
+        // to give one back.
+        let re3 = bre(r"a*\(ab\)*");
+        let c3 = re3.search(b"aab", 0).unwrap().unwrap();
+        assert_eq!((c3.start(), c3.end()), (0, 3));
+    }
+
+    /// Exploring every end is bounded two ways. An end at the last byte cannot be
+    /// beaten, so the scan stops there rather than re-partitioning the line — without
+    /// which these blew the step budget and reported `too complex`.
+    #[test]
+    fn a_match_reaching_the_last_byte_stops_the_search() {
+        let hay = "key=val ".repeat(80);
+        for pat in [r"^.*key.*=.*val.*$", r".*=.*=.*", r".*.*.*"] {
+            let re = bre(pat);
+            let caps = re
+                .search(hay.as_bytes(), 0)
+                .unwrap_or_else(|e| panic!("{pat}: {}", e.msg))
+                .unwrap_or_else(|| panic!("{pat}: no match"));
+            assert_eq!(caps.end(), hay.len(), "{pat} should reach the line end");
+        }
+    }
+
+    /// The other bound, and it depends on the CALLER. No end reaches the last byte
+    /// here, so the search explores until the budget runs out.
+    #[test]
+    fn an_exhausted_budget_falls_back_rather_than_refusing() {
+        let hay = "x:".repeat(2000) + "E" + &"y".repeat(2000);
+        let re = bre(r".*:.*:.*E");
+        // Asked whether the line matches, that is settled by any end at all.
+        let seen = re.search_existence(hay.as_bytes(), 0).unwrap().unwrap();
+        assert_eq!(seen.start(), 0);
+        // Asked for the SPAN, the longest is unaffordable — but refusing would regress
+        // a line the previous release answered, so first-end semantics answer instead.
+        // No alternation, so that end cannot be arbitrarily short.
+        let span = re.search(hay.as_bytes(), 0).unwrap().unwrap();
+        assert_eq!(span.start(), 0);
+        assert!(span.end() <= hay.len());
+        // A pattern the budget DOES cover answers both ways, identically.
+        let easy = bre(r"x:*");
+        assert_eq!(
+            easy.search(hay.as_bytes(), 0).unwrap().unwrap().end(),
+            easy.search_existence(hay.as_bytes(), 0).unwrap().unwrap().end(),
+        );
+    }
+
+    #[test]
+    fn only_the_first_caret_of_a_bre_branch_anchors() {
+        assert!(matched(&bre("^^"), "^x"));
+        assert!(!matched(&bre("^^"), "x"));
+        // …while the repeat rule still sees a branch start.
+        assert!(matched(&bre("^*"), "*x"));
+        assert!(!matched(&bre("^*"), "x"));
+        // `^` then zero-or-more literal carets.
+        assert!(matched(&bre("^^*"), "^^x"));
+        assert!(matched(&bre("^^*"), "x"));
+        // A new branch restores the anchor.
+        assert!(matched(&bre(r"\(^^\)b"), "^b"));
+        assert!(!matched(&bre(r"\(^^\)b"), "xb"));
+        // ERE anchors anywhere, so there the same pattern matches everything.
+        let ere = Regex::compile(b"^^", Options { ere: true, ..Options::default() }).unwrap();
+        assert!(matched(&ere, "x"));
     }
 
     #[test]

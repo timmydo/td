@@ -2553,3 +2553,22 @@ sed: couldn't open file /nosuchdir/out: No such file or directory
 ## END
 ## status: 4
 
+
+
+# Long-line cases for the SPAN-consuming callers. Searching every end for POSIX
+# leftmost-longest can exhaust the step budget on a line of a thousand-odd bytes
+# with three or more sliding repeats, and `sed`/`grep -o` cannot answer from a
+# match that is merely SOME match. Refusing them would regress an ordinary idiom
+# both GNU and the previous release handle, so the previous release's first-end
+# algorithm is the floor beneath the search -- see `Regex::scan`. Every other
+# long-line case in the corpus has a match reaching END OF LINE, where the search
+# stops anyway, and so could not have caught this; these two stop short.
+
+#### a substitution over three sliding repeats on a 1224-byte line
+## argv: sed -e 's/\(.*\)=\(.*\);.*END/[\2]/'
+## stdin-json: "k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;k=v;ENDxxxxxxxxxx\n"
+## stdout:
+[v]xxxxxxxxxx
+## END
+## stderr-json: ""
+## status: 0
