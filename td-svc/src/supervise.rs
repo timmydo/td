@@ -38,6 +38,10 @@ const PROBE_ATTEMPT: Duration = Duration::from_secs(5);
 /// engages when a dependency simply never settles. A console that is waiting
 /// indefinitely is a console that is not there, which is the same outcome by a
 /// slower route, so its wait is bounded and its ordering is a preference.
+/// How often a supervisor with NO units repeats that fact. Slow, because it is a
+/// standing condition rather than news, but never silent — see `run`.
+const SILENT_TABLE_COMPLAINT: Duration = Duration::from_secs(60);
+
 const CONSOLE_PATIENCE: Duration = Duration::from_secs(30);
 
 /// `O_NOCTTY` — opening a terminal must never make it td-svc's own by side
@@ -243,7 +247,14 @@ fn log(msg: &str) {
 ///
 /// No `pre_exec` (DESIGN.md I2): td-svc is multithreaded, and a closure running
 /// between fork and exec may touch nothing that allocates or locks.
-fn build(unit: &Unit) -> Result<Command, String> {
+///
+/// `report` gates the terminal diagnostics. They are per-SPAWN, so a unit that
+/// crash-loops would repeat them at the restart rate forever — the console
+/// scrolling DESIGN.md §6 says the backoff gate exists to prevent. The restart
+/// message is gated and these were not, which is worse than it sounds: the
+/// ungated one is the message that explains WHY.
+fn build(unit: &Unit, report: bool) -> Result<(Command, Vec<String>), String> {
+    let mut said: Vec<String> = Vec::new();
     let prog = unit.argv.first().ok_or_else(|| "empty exec".to_string())?;
     let mut cmd = Command::new(prog);
     cmd.args(unit.argv.get(1..).unwrap_or(&[]));
@@ -269,7 +280,11 @@ fn build(unit: &Unit) -> Result<Command, String> {
                 Ok(console) => {
                     cmd.stderr(Stdio::from(console));
                 }
-                Err(e) => log(&format!("{}: {CONSOLE}: {e}", unit.name)),
+                Err(e) => {
+                    if report {
+                        said.push(format!("{}: {CONSOLE}: {e}", unit.name));
+                    }
+                }
             }
         }
         None => {
@@ -277,7 +292,7 @@ fn build(unit: &Unit) -> Result<Command, String> {
             cmd.process_group(0);
         }
     }
-    Ok(cmd)
+    Ok((cmd, said))
 }
 
 /// Where a `tty=` value points. Bare names are under `/dev`, matching the
@@ -312,25 +327,59 @@ fn open_tty(path: &str) -> io::Result<std::fs::File> {
 /// earlier draft logged "inheriting stdio" and left it null, so a greeter whose
 /// terminal was missing got a shell reading immediate EOF: it exited at once,
 /// every time, and the restart loop turned a missing device into a spin.
-fn attach_tty(cmd: &mut Command, unit: &Unit) {
-    let Some(tty) = &unit.tty else { return };
+/// Wire a `tty=` unit's stdin/stdout to its terminal, RETURNING the diagnostics
+/// it would emit rather than logging them.
+///
+/// Returning them is what makes the gate testable: `report` decides whether a
+/// message is built at all, so a test can assert the result is empty at
+/// `report=false` and non-empty at `report=true` without a log sink. Asserting
+/// on `backoff::should_report` alone tests `backoff`, not this.
+fn attach_tty(cmd: &mut Command, unit: &Unit, report: bool) -> Vec<String> {
+    let mut said = Vec::new();
+    let Some(tty) = &unit.tty else {
+        return said;
+    };
     let path = tty_path(tty);
+    // Gated for the same reason as `build`'s: a greeter whose terminal is
+    // missing restarts forever, and an ungated line here scrolls the console at
+    // the restart rate with the one message that would have explained it. The
+    // check wraps each `format!` rather than the push so a silent restart does
+    // not build the string either.
     let opened = match open_tty(&path) {
         Ok(file) => Some(file),
         Err(e) => {
-            log(&format!("{}: {path}: {e}; falling back to {CONSOLE}", unit.name));
-            open_tty(CONSOLE)
-                .map_err(|e| log(&format!("{}: {CONSOLE}: {e}; it will have no terminal", unit.name)))
-                .ok()
+            if report {
+                said.push(format!(
+                    "{}: {path}: {e}; falling back to {CONSOLE}",
+                    unit.name
+                ));
+            }
+            match open_tty(CONSOLE) {
+                Ok(file) => Some(file),
+                Err(e) => {
+                    if report {
+                        said.push(format!(
+                            "{}: {CONSOLE}: {e}; it will have no terminal",
+                            unit.name
+                        ));
+                    }
+                    None
+                }
+            }
         }
     };
-    let Some(file) = opened else { return };
+    let Some(file) = opened else { return said };
     match file.try_clone() {
         Ok(out) => {
             cmd.stdin(Stdio::from(file)).stdout(Stdio::from(out));
         }
-        Err(e) => log(&format!("{}: {path}: {e}", unit.name)),
+        Err(e) => {
+            if report {
+                said.push(format!("{}: {path}: {e}", unit.name));
+            }
+        }
     }
+    said
 }
 
 /// The uutils multicall's `kill`. td-svc takes no `kill(2)` surface at all
@@ -409,10 +458,13 @@ pub struct Runtime {
     /// something else, so every comparison passed and the guard was off exactly
     /// when `/proc` was least trustworthy.)
     self_ids: Option<(i32, i32)>,
+    /// The table this was loaded from, carried only so the "no units" complaint
+    /// can name the file an operator has to go look at.
+    table_path: String,
 }
 
 impl Runtime {
-    pub fn new(units: Vec<Unit>) -> (Runtime, Vec<String>) {
+    pub fn new(units: Vec<Unit>, table_path: &str) -> (Runtime, Vec<String>) {
         let plan = order::plan(&units);
         let complaints = plan.complaints();
         // A unit is pre-failed only if it is skipped AND absent from the order.
@@ -459,6 +511,7 @@ impl Runtime {
                 rx,
                 self_pid,
                 self_ids: own.map(|s| (s.pgrp, s.session)),
+                table_path: table_path.to_string(),
             },
             complaints,
         )
@@ -554,15 +607,32 @@ impl Runtime {
         };
         let unit = service.unit.clone();
         let generation = service.generation.wrapping_add(1);
+        // Same gate the restart message uses: loud on the first attempt and on
+        // the escalation into the hold, silent in between.
+        //
+        // The `+ 1` is NOT a variant of the spelling at the other two call
+        // sites; all three ask "is the failure this attempt would become a loud
+        // one?", and only the state differs — `on_exit` and
+        // `record_start_failure` have already incremented `fast_failures`, this
+        // runs BEFORE the attempt that might. Unifying the spellings would move
+        // the loud spawn off the escalation attempt, and no test would notice.
+        let report = backoff::should_report(service.fast_failures.saturating_add(1));
 
-        let mut cmd = match build(&unit) {
-            Ok(cmd) => cmd,
+        let mut cmd = match build(&unit, report) {
+            Ok((cmd, said)) => {
+                for line in said {
+                    log(&line);
+                }
+                cmd
+            }
             Err(e) => {
                 self.record_start_failure(index, &format!("{}: {e}", unit.name));
                 return;
             }
         };
-        attach_tty(&mut cmd, &unit);
+        for said in attach_tty(&mut cmd, &unit, report) {
+            log(&said);
+        }
 
         match cmd.spawn() {
             Ok(child) => {
@@ -1013,7 +1083,26 @@ impl Runtime {
     /// Run until killed. td-svc is respawned by PID 1, so returning is not a
     /// normal outcome — but unlike PID 1 it is not fatal either.
     pub fn run(&mut self) -> ! {
+        let mut complain_at = Some(Instant::now());
         loop {
+            // A table that yielded NO units is the one failure this process cannot
+            // recover from and cannot be told about: td-init falls back to a shell on
+            // an unreadable /etc/inittab, but after the cutover the console is a unit,
+            // so an unreadable table means no console to read the complaint on. Worse,
+            // `run` never exits, so PID 1 never respawns us into a retry. One line at
+            // startup then silence looked identical to a healthy boot on the serial
+            // console; repeating it on a slow throttle at least keeps saying so.
+            if self.services.is_empty() {
+                if let Some(at) = complain_at {
+                    if Instant::now() >= at {
+                        log(&format!(
+                            "no units to supervise; nothing will start. Check {}",
+                            self.table_path
+                        ));
+                        complain_at = Instant::now().checked_add(SILENT_TABLE_COMPLAINT);
+                    }
+                }
+            }
             self.enforce_deadlines();
             let next_wake = self.start_eligible();
             let timeout = match next_wake {
@@ -1151,7 +1240,7 @@ mod tests {
     fn runtime(text: &str) -> Runtime {
         let (units, problems) = parse(text);
         assert!(problems.is_empty(), "{problems:?}");
-        Runtime::new(units).0
+        Runtime::new(units, "<test>").0
     }
 
     /// Simulate a spawn so exit handling can be tested without a real process.
@@ -1293,7 +1382,7 @@ mod tests {
              [b]\ntype=oneshot\nexec=/x\nafter=a\n\
              [c]\ntype=oneshot\nexec=/x\n",
         );
-        let (rt, complaints) = Runtime::new(units);
+        let (rt, complaints) = Runtime::new(units, "<test>");
         assert_eq!(rt.lookup("a").unwrap().phase, Phase::Failed);
         assert_eq!(rt.lookup("b").unwrap().phase, Phase::Failed);
         assert_eq!(rt.lookup("c").unwrap().phase, Phase::Down);
@@ -1308,7 +1397,7 @@ mod tests {
             "[netup]\ntype=oneshot\nexec=/x\nafter=ghost\n\
              [greeter]\ntype=daemon\nexec=/x\ntty=ttyS0\nafter=netup\n",
         );
-        let (rt, _) = Runtime::new(units);
+        let (rt, _) = Runtime::new(units, "<test>");
         assert_eq!(rt.lookup("greeter").unwrap().phase, Phase::Down);
         assert_eq!(rt.lookup("netup").unwrap().phase, Phase::Failed);
     }
@@ -1411,7 +1500,7 @@ mod tests {
             "[c1]\ntype=daemon\nexec=/x\ntty=ttyS0\nafter=c2\n\
              [c2]\ntype=daemon\nexec=/y\ntty=ttyS1\nafter=c1\n",
         );
-        let (rt, complaints) = Runtime::new(units);
+        let (rt, complaints) = Runtime::new(units, "<test>");
         assert_eq!(complaints.len(), 2);
         for name in ["c1", "c2"] {
             let at = rt.services.iter().position(|s| s.unit.name == name).unwrap();
@@ -1421,6 +1510,58 @@ mod tests {
                 "{name} was promised its ordering would be ignored"
             );
         }
+    }
+
+    /// A spawn's terminal diagnostics are gated by the SAME rule as the restart
+    /// message, so a crash-looping unit cannot scroll the console with them.
+    ///
+    /// Found by running the shipped boot table through the real supervisor with a
+    /// `/dev/console` it could not open: the restart message was correctly quiet
+    /// after the first, while `greeter: /dev/console: Permission denied` repeated
+    /// on every single restart — the console filling with the one line that had
+    /// already said everything it was going to.
+    #[test]
+    fn a_crash_looping_units_spawn_diagnostics_are_not_repeated_every_restart() {
+        // Drive the real spawn path, not `backoff` (which backoff.rs already pins):
+        // a tty= unit whose terminal cannot exist, so both diagnostics are reachable.
+        let unit = Unit {
+            tty: Some("td-svc-no-such-tty".into()),
+            ..runtime("[greeter]\ntype=daemon\nexec=/bin/true\ntty=ttyS0\n")
+                .lookup("greeter")
+                .unwrap()
+                .unit
+                .clone()
+        };
+
+        let (mut loud_cmd, loud_build) = build(&unit, true).unwrap();
+        let loud_tty = attach_tty(&mut loud_cmd, &unit, true);
+        assert!(
+            !loud_build.is_empty() || !loud_tty.is_empty(),
+            "a REPORTED spawn must say why the terminal could not be opened; with this \
+             gate stuck closed a greeter that can never start explains itself nowhere"
+        );
+
+        let (mut quiet_cmd, quiet_build) = build(&unit, false).unwrap();
+        let quiet_tty = attach_tty(&mut quiet_cmd, &unit, false);
+        assert!(
+            quiet_build.is_empty() && quiet_tty.is_empty(),
+            "a GATED spawn built {:?}/{:?}; these run once per restart, so an ungated \
+             line scrolls the console at the restart rate — which is the bug this gate \
+             exists to stop, and it was real: the greeter printed its /dev/console \
+             failure on every attempt while the restart message was correctly quiet",
+            quiet_build,
+            quiet_tty
+        );
+
+        // ...and the gate opens on exactly the attempts DESIGN.md §6 names.
+        let loud = (0..500u32)
+            .filter(|failures| backoff::should_report(failures.saturating_add(1)))
+            .count();
+        assert!(
+            loud <= 2,
+            "{loud} of 500 restarts would print their terminal diagnostics; the gate \
+             allows the first attempt and the escalation into the hold, and no more"
+        );
     }
 
     /// A oneshot that outruns `timeout=` must settle. It used to sit at

@@ -161,7 +161,7 @@ fn main() -> ExitCode {
             for problem in &problems {
                 emit_err(&format!("td-svc: {problem}\n"));
             }
-            let (mut runtime, complaints) = supervise::Runtime::new(units);
+            let (mut runtime, complaints) = supervise::Runtime::new(units, &path);
             for complaint in &complaints {
                 emit_err(&format!("td-svc: {complaint}\n"));
             }

@@ -589,53 +589,214 @@ fn build_shadow(sys: &SystemDef) -> String {
 fn build_inittab() -> String {
     // td-init: `<id>::<action>:<process>`. `id` names the tty init opens for the
     // process; empty id => the system console. This inittab runs on the REAL root AFTER
-    // stage-1 `switch_root`ed into it: init re-mounts the pseudo-filesystems (devtmpfs,
-    // proc, sysfs) on the erofs root's empty mountpoint dirs — mounting over a read-only
-    // dir is a VFS overlay, no write to the erofs — then runs the boot self-check, brings
-    // the network up, starts the sshd service, and the auto-login getty. It does NOT mount
-    // /var, /tmp, or /run: stage-1 already mounted persistent @var and the volatile
-    // tmpfs filesystems, and switch_root preserves the mounts. /proc must precede
-    // /etc/rootcheck (which reads /proc/mounts).
-    // /etc/netup runs AFTER rootcheck (networking after the read-only-root self-check)
-    // and AFTER /run is a tmpfs (mounted by stage-1, preserved through switch_root): it
-    // brings the link up every boot — loopback with 127.0.0.1/8 (so sshd's own loopback
-    // bind/connect and the boot self-test route) plus any NIC — and, under the nettest
-    // token, self-tests resolve + reach. td-netd writes resolv.conf/hosts through /etc
-    // symlinks into that /run.
+    // stage-1 `switch_root`ed into it.
     //
-    // /bin/td-firstboot runs at sysinit BEFORE rootcheck, netup, and sshd, because it
-    // mints the per-machine identity they read or check: td-init runs every sysinit job
-    // to completion before starting a `respawn` line, so that ordering is the only
-    // synchronisation needed. Running before rootcheck is what lets rootcheck assert the
-    // identity is READABLE through the MUTABLE_ETC symlinks on a still-read-only /etc.
+    // PID 1 now keeps only what it must OWN: the pseudo-filesystem mounts, then
+    // respawning td-svc. Every service, its ordering, and its restart policy moved to
+    // /etc/td-svc.conf — see build_td_svc_conf for why, and td-svc/DESIGN.md §1 for the
+    // three things a signal-free PID 1 cannot express.
     //
-    // sshd runs as an init-managed `respawn` service AFTER netup (so loopback and any
-    // external link are already up): it binds all interfaces on port 22 (privileged, so it
-    // runs as root), presents the PER-MACHINE host key, and authorizes only per-machine
-    // /etc/ssh/authorized_keys (created empty => deny-all until an operator adds a key). A
-    // correctly-binding daemon never exits, so respawn does not loop.
+    // The mounts stay HERE, not in the table, because td-svc reads /proc: its own
+    // process group and session come from /proc/self/stat, and every containment query
+    // and liveness check is a /proc read. A td-svc started before /proc exists comes up
+    // degraded and cannot signal a group at all (it fails closed). sysinit jobs run to
+    // completion before any respawn line starts, so this ordering IS that guarantee.
+    // Mounting over a read-only dir is a VFS overlay, no write to the erofs. It does NOT
+    // mount /var, /tmp, or /run: stage-1 already mounted persistent @var and the
+    // volatile tmpfs filesystems, and switch_root preserves the mounts.
     //
-    // Naming --host-key is FAIL-CLOSED on purpose: with no identity sshd refuses to start
-    // rather than fall back to the public committed builtin key, and td-init's respawn
-    // throttle holds the job rather than scrolling the console.
+    // td-svc is a `respawn` job: if the supervisor dies, PID 1 brings it back. That is
+    // the whole reason PID 1 keeps reaping — td-svc's children reparent onto PID 1 when
+    // it dies, and only wait4(-1) can collect them.
     //
-    // There is no `ctrlaltdel` or `shutdown` line: td-init supervises with NO signals (a
-    // blocking wait4 IS its event loop), so both actions are signal contracts it cannot
-    // honour and would only be rejected at boot as unsupported. The teardown they used to
-    // reach lives in /etc/tty-session instead — see build_tty_session.
+    // There is still no `ctrlaltdel` or `shutdown` line: td-init supervises with NO
+    // signals (a blocking wait4 IS its event loop), so both actions are signal contracts
+    // it cannot honour. Ctrl-Alt-Del is td-svc's to own precisely because PID 1 cannot.
     format!(
         "::sysinit:/bin/mount -t devtmpfs devtmpfs /dev\n\
          ::sysinit:/bin/mount -t proc proc /proc\n\
          ::sysinit:/bin/mount -t sysfs sysfs /sys\n\
-         ::sysinit:/bin/hostname -F /etc/hostname\n\
-         ::sysinit:/bin/td-firstboot provision\n\
-         ::sysinit:/etc/rootcheck\n\
-         ::sysinit:/etc/netup\n\
-         ::once:/etc/bootsuccess\n\
-         ::once:/etc/bootfail\n\
-         ::respawn:/bin/sshd serve --listen 0.0.0.0:22 --host-key {SSHD_HOST_KEY} \
-         --authorized-keys {SSHD_AUTHORIZED_KEYS}\n\
-         ttyS0::respawn:/etc/tty-session\n"
+         ::respawn:/bin/td-svc run -f {TD_SVC_CONF}\n"
+    )
+}
+
+/// Where the unit table lives. ONE const, and every consumer derives from it: the
+/// inittab's `-f`, the `etc_files` entry that generates it, and the shape check that
+/// runs `td-svc check` against it. They cannot disagree, which matters because a
+/// disagreement is silent and boot-fatal — td-svc given a path that does not exist
+/// prints one line and then idles forever with zero units (it has no exit path, so PID
+/// 1 never respawns it either), which is a machine with no console, no sshd and no
+/// network. The recipe would still generate a perfectly good table at the old path and
+/// the shape check would still validate it, both exiting 0.
+const TD_SVC_CONF: &str = "/etc/td-svc.conf";
+
+/// `TD_SVC_CONF` as `etc_files` names it: relative to /etc, since that is the directory
+/// it writes into. Derived rather than repeated — see TD_SVC_CONF for what a divergence
+/// costs. `the_unit_table_path_has_exactly_one_source_of_truth` pins the relationship.
+fn td_svc_conf_etc_name() -> &'static str {
+    match TD_SVC_CONF.strip_prefix("/etc/") {
+        Some(name) => name,
+        // Unreachable while TD_SVC_CONF is under /etc; the test above reds if it moves,
+        // rather than this silently generating a file the inittab does not name.
+        None => TD_SVC_CONF,
+    }
+}
+
+/// Every unit `/etc/td-svc.conf` must resolve into a start order.
+///
+/// The shape check greps `td-svc check`'s printed plan for each. `check` already reds
+/// on a table it cannot parse, but a unit SILENTLY dropped from the plan — skipped for
+/// an unsatisfiable dependency — is a clean exit with a shorter list, and that is the
+/// regression this catches: the boot comes up missing a service and says nothing.
+const TD_SVC_UNITS: [&str; 8] = [
+    "hostname",
+    "td-firstboot",
+    "rootcheck",
+    "netup",
+    "bootsuccess",
+    "bootfail",
+    "sshd",
+    "greeter",
+];
+
+/// Each generated oneshot's `timeout=`.
+///
+/// td-svc defaults one when a table omits it — a oneshot that hangs never settles, and
+/// everything ordered after it waits forever — but that default is sized for a small
+/// job and these are not. So each is explicit, and each is a BACKSTOP against a hang,
+/// not a service-level objective: the values sit far above what the job can actually
+/// take. Under the old inittab these jobs had no bound at all, and one that hung
+/// wedged the boot with no console and no sshd, so a finite bound is strictly better —
+/// a oneshot that times out is marked failed, and since `after=` is ordering, every
+/// dependent still runs.
+mod svc_timeouts {
+    /// `sethostname(2)` plus one file read.
+    pub const HOSTNAME: u32 = 30;
+    /// Mints the per-machine identity: ed25519 keygen, writes to /var, then sync.
+    pub const FIRSTBOOT: u32 = 300;
+    /// Dozens of greps over /proc/mounts, several `su` runs, and write probes.
+    pub const ROOTCHECK: u32 = 120;
+    /// `td-netd up` is DHCP with bounded retries (2s reads); under the nettest token it
+    /// also resolves (3s x 3) and reaches (5s connect) a real host.
+    pub const NETUP: u32 = 300;
+    /// The script's own retry loop is clamped to BOOT_SUCCESS_RETRY_MAX_SECS iterations,
+    /// but each runs a large probe farm (seven `su` blocks) and can run a transactional
+    /// `td-boot install`, so an iteration is worth seconds on a slow disk, not one.
+    pub const BOOTSUCCESS: u32 = 600;
+    /// The park handshake: a grep and a 1s sleep, clamped to BOOT_FAIL_PARK_WAIT_SECS.
+    pub const BOOTFAIL: u32 = 300;
+}
+
+/// `/etc/td-svc.conf` — the boot's ordering contract, as a graph rather than as line
+/// order in the inittab.
+///
+/// This is the cutover's substance. The same jobs run in the same order for the same
+/// reasons; what changes is that the reasons are now DECLARED and machine-checkable.
+/// `td-svc check` runs over this table at image-build time (see shape_check), so an
+/// ordering regression reds the build instead of the boot — which the inittab could
+/// never do, because "sysinit runs in table order" makes every line's position
+/// load-bearing and nothing can tell a deliberate order from an accidental one.
+///
+/// Ordering, and why each edge exists:
+///   hostname precedes td-firstboot only to keep the sysinit chain SERIAL. init ran
+///     sysinit lines one at a time; td-svc starts every unit whose edges are settled in
+///     the same pass, so an absent edge here is not "no constraint", it is CONCURRENCY
+///     the inittab never had. Nothing actually reads across the two.
+///   td-firstboot mints the per-machine identity, so it precedes everything that reads
+///     or checks it — rootcheck (asserts it is READABLE through the MUTABLE_ETC
+///     symlinks on a still-read-only /etc), sshd (--host-key, --authorized-keys).
+///   rootcheck precedes netup: the read-only-root self-check before networking.
+///   netup brings the link up — loopback 127.0.0.1/8, so sshd's own loopback bind and
+///     the boot self-test route work, plus any NIC.
+///
+/// Everything that was `::once:` or `::respawn:` names the WHOLE sysinit set, because
+/// that is exactly what init gave it: those jobs started only once every sysinit job
+/// had run to completion. Naming the set rather than just its last member keeps that
+/// true if the chain is ever reordered.
+///
+/// `after=` throughout, never `requires=`: these are the ORDERING edges the inittab
+/// already had. A failed job did not stop the ones behind it under init, and it must
+/// not here — td-svc/DESIGN.md records why strictness would never engage where it
+/// would help on these particular scripts, and would strip the console where it hurts.
+fn build_td_svc_conf() -> String {
+    // The sysinit set, in one place: every post-sysinit unit names all of it.
+    let sysinit = "hostname,td-firstboot,rootcheck,netup";
+    format!(
+        "# Generated by the system-x86-64 recipe. Edit build_td_svc_conf, not this file.\n\
+         #\n\
+         # PID 1 (/etc/inittab) mounts /dev, /proc and /sys, then respawns td-svc with\n\
+         # this table. Ordering lives here as a graph; `td-svc check` validates it at\n\
+         # image-build time.\n\
+         \n\
+         [hostname]\n\
+         type=oneshot\n\
+         exec=/bin/hostname -F /etc/hostname\n\
+         timeout={hostname}\n\
+         \n\
+         # Mints the per-machine identity everything below reads or checks.\n\
+         # after=hostname only to keep sysinit SERIAL, as init ran it: nothing here\n\
+         # reads the hostname (this writes /var/lib/td alone), but a cutover that\n\
+         # silently made two jobs concurrent would be a behaviour change wearing a\n\
+         # migration's clothes. Relaxing this edge is a separate, argued landing.\n\
+         [td-firstboot]\n\
+         type=oneshot\n\
+         exec=/bin/td-firstboot provision\n\
+         after=hostname\n\
+         timeout={firstboot}\n\
+         \n\
+         # Asserts the identity is readable through the MUTABLE_ETC symlinks.\n\
+         [rootcheck]\n\
+         type=oneshot\n\
+         exec=/etc/rootcheck\n\
+         after=td-firstboot\n\
+         timeout={rootcheck}\n\
+         \n\
+         # Networking after the read-only-root self-check.\n\
+         [netup]\n\
+         type=oneshot\n\
+         exec=/etc/netup\n\
+         after=rootcheck\n\
+         timeout={netup}\n\
+         \n\
+         [bootsuccess]\n\
+         type=oneshot\n\
+         exec=/etc/bootsuccess\n\
+         after={sysinit}\n\
+         timeout={bootsuccess}\n\
+         \n\
+         [bootfail]\n\
+         type=oneshot\n\
+         exec=/etc/bootfail\n\
+         after={sysinit}\n\
+         timeout={bootfail}\n\
+         \n\
+         # Binds all interfaces on port 22 (privileged, so root). Naming --host-key is\n\
+         # FAIL-CLOSED: with no identity sshd refuses to start rather than fall back to\n\
+         # the public committed builtin key, and td-svc's backoff holds the job rather\n\
+         # than scrolling the console.\n\
+         [sshd]\n\
+         type=daemon\n\
+         exec=/bin/sshd serve --listen 0.0.0.0:22 --host-key {host_key} --authorized-keys {authorized_keys}\n\
+         after={sysinit}\n\
+         restart=always\n\
+         \n\
+         # The auto-login greeter. tty= hands it /dev/ttyS0 and, per td-svc/DESIGN.md,\n\
+         # exempts it from process_group(0) so getty's setsid() succeeds — grouping it\n\
+         # would yield a console with no controlling terminal on every boot.\n\
+         [greeter]\n\
+         type=daemon\n\
+         exec=/etc/tty-session\n\
+         after={sysinit}\n\
+         tty=ttyS0\n\
+         restart=always\n",
+        hostname = svc_timeouts::HOSTNAME,
+        firstboot = svc_timeouts::FIRSTBOOT,
+        rootcheck = svc_timeouts::ROOTCHECK,
+        netup = svc_timeouts::NETUP,
+        bootsuccess = svc_timeouts::BOOTSUCCESS,
+        bootfail = svc_timeouts::BOOTFAIL,
+        host_key = SSHD_HOST_KEY,
+        authorized_keys = SSHD_AUTHORIZED_KEYS,
     )
 }
 
@@ -1447,6 +1608,7 @@ fn etc_files(sys: &SystemDef) -> Vec<(&'static str, String, bool)> {
         ("os-release", build_os_release(sys), false),
         ("mutable-state", build_mutable_state(), false),
         ("inittab", build_inittab(), false),
+        (td_svc_conf_etc_name(), build_td_svc_conf(), false),
         ("profile", build_profile(sys), false),
         // Executable glue (mode 0755): getty execs autologin; init respawns tty-session
         // and runs rootcheck at sysinit. They live in /etc so /bin stays a pure
@@ -1615,6 +1777,13 @@ fn real_root_steps(sys: &SystemDef) -> Vec<Step> {
         from: "{in:td-login}".into(),
         dest: "{root}/real-root{in:td-login}".into(),
     });
+    // td-svc the same way. Its empty closure is load-bearing like td-init's: PID 1 execs
+    // this before anything has established that the dynamic loader works, and it is the
+    // process that would otherwise be reporting that it does not.
+    steps.push(Step::CopyTree {
+        from: "{in:td-svc}".into(),
+        dest: "{root}/real-root{in:td-svc}".into(),
+    });
     // Stage the dynamically linked userland and every transitively referenced store item
     // at its canonical absolute path. uutils, ripgrep, and fd pull their td glibc closure;
     // sshd additionally pulls the aws-lc crypto C lib. The engine admits only direct recipe
@@ -1679,6 +1848,14 @@ fn real_root_steps(sys: &SystemDef) -> Vec<Step> {
     steps.push(Step::Symlink {
         target: "{in:td-firstboot}/bin/td-firstboot".into(),
         link: "{root}/real-root/bin/td-firstboot".into(),
+    });
+    // /bin/td-svc — the service supervisor, a single static binary. PID 1's ONLY
+    // respawn line, so its absence is not a degraded boot but no userland at all: no
+    // identity, no network, no sshd, no console. Static with an empty runtime closure
+    // for exactly that reason.
+    steps.push(Step::Symlink {
+        target: "{in:td-svc}/bin/td-svc".into(),
+        link: "{root}/real-root/bin/td-svc".into(),
     });
     // /bin/td-util is the multicall's own entry (`td-util <applet>`, and `--list`); the loop
     // below is the argv[0] farm the diagnostics names resolve through.
@@ -1821,7 +1998,7 @@ fn shape_check() -> String {
      [ -f \"$root/init\" ] || [ -L \"$root/init\" ] || { echo 'root tree: /init missing' >&2; exit 1; }; \
      case $(readlink \"$root/init\") in /td/store/*) : ;; *) echo 'root tree: /init is not a symlink into /td/store' >&2; exit 1;; esac; \
      case $(readlink \"$root/bin/sh\") in /td/store/*) : ;; *) echo 'root tree: /bin/sh is not a symlink into /td/store - the store-native /bin farm regressed' >&2; exit 1;; esac; \
-     for f in passwd group shadow hostname os-release mutable-state inittab profile autologin tty-session shutdown rootcheck netup bootsuccess bootfail; do \
+     for f in passwd group shadow hostname os-release mutable-state inittab @TD_SVC_CONF_NAME@ profile autologin tty-session shutdown rootcheck netup bootsuccess bootfail; do \
          [ -f \"$root/etc/$f\" ] || { echo \"root tree: /etc/$f missing\" >&2; exit 1; }; \
          if [ -L \"$root/etc/$f\" ]; then echo \"root tree: /etc/$f is a symlink - immutable image config must be a regular file in the erofs, not a hole in the read-only /etc\" >&2; exit 1; fi; \
      done; \
@@ -1888,6 +2065,24 @@ fn shape_check() -> String {
      \"$tdl\" verify-credentials --uid 4294967294 --gid 4294967294 >/dev/null 2>&1 && { echo 'td-login verify-credentials ACCEPTED credentials this build process cannot have - the readback the TD-LOGIN-RUN-OK marker gates on proves nothing' >&2; exit 1; }; \
      set -- $(ls -l \"$tdl\"); case \"$1\" in *[sS]*) echo \"root tree: the packed td-login carries a setuid/setgid bit (mode $1). td-login is NEVER installed setuid-root (td-login/THREAT-MODEL.md section 4): with one, an unprivileged caller starts with euid 0 and 'su root' becomes root without authenticating\" >&2; exit 1;; esac; \
      tditab=$(\"$tdi\" init --dry-run -f \"$root/etc/inittab\" 2>&1) || { echo 'td-init init --dry-run REJECTED the inittab this image ships - PID 1 would come up having understood only part of its table. Its per-line diagnostics:' >&2; printf '%s\\n' \"$tditab\" >&2; exit 1; }; \
+     [ \"$(readlink \"$root/bin/td-svc\" 2>/dev/null)\" = \"{in:td-svc}/bin/td-svc\" ] || { echo 'root tree: /bin/td-svc is not a symlink to the staged service supervisor - PID 1s only respawn line would exec nothing and the machine would have no userland at all' >&2; exit 1; }; \
+     tds=\"{root}/real-root{in:td-svc}/bin/td-svc\"; { [ -f \"$tds\" ] && [ -x \"$tds\" ]; } || { echo 'root tree: the td-svc binary is not packed/executable at real-root{in:td-svc}/bin/td-svc - no identity, no network, no sshd and no console' >&2; exit 1; }; \
+     tdsplan=$(\"$tds\" check -f \"$root@TD_SVC_CONF@\" 2>&1) || { echo 'td-svc check REJECTED the unit table this image ships - the boot would run a table the supervisor only partly understood. Its diagnostics:' >&2; printf '%s\\n' \"$tdsplan\" >&2; exit 1; }; \
+     for u in @TD_SVC_UNITS@; do \
+         printf '%s\\n' \"$tdsplan\" | grep -q -E \"^[0-9]+\\. $u\\$\" || { echo \"td-svc check resolved a start order without '$u' - a unit the inittab used to run is missing from the plan\" >&2; exit 1; }; \
+     done; \
+     : 'Order as the SHIPPED binary resolves the SHIPPED table. This cannot see a'; \
+     : 'DELETED after= edge - ties break in declaration order, so dropping one leaves'; \
+     : 'the plan identical. the_declared_edges_are_exactly_these pins the edge set on'; \
+     : 'the host; this pins that td-svc itself still resolves them this way.'; \
+     svcpos() { printf '%s\\n' \"$tdsplan\" | grep -n -E \"^[0-9]+\\. $1\\$\" | cut -d: -f1; }; \
+     hn=$(svcpos hostname); fb=$(svcpos td-firstboot); rc=$(svcpos rootcheck); nu=$(svcpos netup); sd=$(svcpos sshd); gr=$(svcpos greeter); \
+     [ \"$hn\" -lt \"$fb\" ] || { echo 'td-svc would not serialize hostname before td-firstboot - init ran every sysinit line to completion before the next, and td-svc starts settled units in the same pass' >&2; exit 1; }; \
+     [ \"$fb\" -lt \"$rc\" ] || { echo 'td-svc would start rootcheck before td-firstboot - rootcheck asserts the identity td-firstboot mints is readable' >&2; exit 1; }; \
+     [ \"$rc\" -lt \"$nu\" ] || { echo 'td-svc would start netup before rootcheck - networking must follow the read-only-root self-check' >&2; exit 1; }; \
+     [ \"$nu\" -lt \"$sd\" ] || { echo 'td-svc would start sshd before netup - sshd binds loopback, which netup brings up' >&2; exit 1; }; \
+     [ \"$fb\" -lt \"$sd\" ] || { echo 'td-svc would start sshd before td-firstboot - sshd is fail-closed on the host key td-firstboot mints, so it would refuse to start on every boot' >&2; exit 1; }; \
+     [ \"$nu\" -lt \"$gr\" ] || { echo 'td-svc would start the greeter before netup' >&2; exit 1; }; \
      mkdir -p '{root}/pivot-probe' && cp \"$tdi\" '{root}/pivot-probe/init' || { echo 'root tree: could not build the switch_root probe NEWROOT' >&2; exit 1; }; \
      tdipiv=$(\"$tdi\" switch_root '{root}/pivot-probe' /init 2>&1) && { echo 'td-init switch_root ACCEPTED a NEWROOT that is not a mount point - the last refusal standing between a bad pivot and a panicked kernel is gone' >&2; exit 1; }; \
      case \"$tdipiv\" in *'not a mount point'*) : ;; *) echo \"td-init switch_root refused a non-mount NEWROOT for the WRONG reason, so the mount-point guard is untested: $tdipiv\" >&2; exit 1;; esac; \
@@ -1953,6 +2148,10 @@ fn shape_check() -> String {
         .replace("@TD_TXT_APPLETS@", &TD_TXT_APPLETS.join(" "))
         .replace("@TD_INIT_APPLETS@", &td_init_applets().join(" "))
         .replace("@TD_LOGIN_APPLETS@", &TD_LOGIN_APPLETS.join(" "))
+        .replace("@TD_SVC_UNITS@", &TD_SVC_UNITS.join(" "))
+        .replace("@TD_SVC_CONF@", TD_SVC_CONF)
+        .replace("@TD_SVC_CONF_NAME@", td_svc_conf_etc_name())
+
         // `<etc path>=<target>` pairs, and the etc paths alone. Both lists are
         // space-joined and unquoted in the script, which
         // `mutable_etc_paths_are_shell_safe_and_well_formed` keeps safe.
@@ -2146,6 +2345,7 @@ pub fn recipe() -> Recipe {
             "td-init",
             "td-firstboot",
             "td-login",
+            "td-svc",
         ])
         .inputs_owned(mesboot0_inputs(&[]))
         .steps(steps)
@@ -2154,6 +2354,347 @@ pub fn recipe() -> Recipe {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+
+    /// Parse the generated unit table into `(name, [(key, value)])`.
+    ///
+    /// The tests below assert on DECLARED EDGES, not on line positions. Under the
+    /// inittab, order WAS position — `::sysinit:` lines ran top to bottom — so a test
+    /// could only compare line numbers. Under td-svc the order is a graph, and a test
+    /// still reading positions would pass for the wrong reason: it would keep passing
+    /// after someone deleted an `after=` and left the stanzas in a lucky order.
+    fn parse_td_svc_conf() -> Vec<(String, Vec<(String, String)>)> {
+        let table = build_td_svc_conf();
+        let mut units: Vec<(String, Vec<(String, String)>)> = Vec::new();
+        for raw in table.lines() {
+            let line = raw.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            if let Some(name) = line.strip_prefix('[').and_then(|r| r.strip_suffix(']')) {
+                units.push((name.to_string(), Vec::new()));
+                continue;
+            }
+            let (key, value) = line
+                .split_once('=')
+                .unwrap_or_else(|| unreachable!("table line {line:?} is not key=value"));
+            match units.last_mut() {
+                Some((_, keys)) => keys.push((key.to_string(), value.to_string())),
+                None => unreachable!("table line {line:?} precedes any [unit]"),
+            }
+        }
+        units
+    }
+
+    /// One unit's value for a key, or None.
+    fn unit_key(name: &str, key: &str) -> Option<String> {
+        parse_td_svc_conf()
+            .into_iter()
+            .find(|(unit, _)| unit == name)
+            .and_then(|(_, keys)| {
+                keys.into_iter()
+                    .find(|(k, _)| k == key)
+                    .map(|(_, value)| value)
+            })
+    }
+
+    /// Everything a unit declares it starts after.
+    fn unit_after(name: &str) -> Vec<String> {
+        unit_key(name, "after")
+            .map(|v| v.split(',').map(|d| d.trim().to_string()).collect())
+            .unwrap_or_default()
+    }
+
+    /// Is `earlier` an ancestor of `later` through `after=` edges? The transitive
+    /// question is the one that matters — `sshd after netup after rootcheck after
+    /// td-firstboot` orders sshd behind the identity just as surely as naming it.
+    fn ordered_before(earlier: &str, later: &str) -> bool {
+        let mut frontier = unit_after(later);
+        let mut seen: Vec<String> = Vec::new();
+        while let Some(name) = frontier.pop() {
+            if name == earlier {
+                return true;
+            }
+            if seen.contains(&name) {
+                continue;
+            }
+            frontier.extend(unit_after(&name));
+            seen.push(name);
+        }
+        false
+    }
+
+    /// PID 1 keeps ONLY what it must own. Everything else is a unit.
+    ///
+    /// The mounts stay because td-svc reads /proc — its own group and session, every
+    /// containment query, every liveness check. A td-svc started before /proc exists
+    /// comes up unable to signal a process group at all. sysinit runs to completion
+    /// before any respawn line, so the position of these three lines IS that guarantee,
+    /// and it is the one place in this file where line order still carries meaning.
+    #[test]
+    fn the_inittab_keeps_only_what_pid_one_must_own() {
+        let inittab = build_inittab();
+        let lines: Vec<&str> = inittab
+            .lines()
+            .filter(|l| !l.trim().is_empty() && !l.trim_start().starts_with('#'))
+            .collect();
+        assert_eq!(
+            lines,
+            vec![
+                "::sysinit:/bin/mount -t devtmpfs devtmpfs /dev",
+                "::sysinit:/bin/mount -t proc proc /proc",
+                "::sysinit:/bin/mount -t sysfs sysfs /sys",
+                &format!("::respawn:/bin/td-svc run -f {TD_SVC_CONF}"),
+            ],
+            "PID 1's table is the pseudo-filesystem mounts plus td-svc, and nothing else \
+             — a service that reappears here is one td-svc cannot order, restart, or stop"
+        );
+        let proc = lines
+            .iter()
+            .position(|l| l.contains("proc /proc"))
+            .unwrap_or_else(|| unreachable!("no /proc mount"));
+        let svc = lines
+            .iter()
+            .position(|l| l.contains("/bin/td-svc"))
+            .unwrap_or_else(|| unreachable!("no td-svc line"));
+        assert!(
+            proc < svc,
+            "/proc must be mounted before td-svc starts: it reads /proc/self/stat for its \
+             own group and session, and fails closed without them"
+        );
+    }
+
+    /// Nothing may be lost in the cutover. Every command the inittab used to run is
+    /// either still PID 1's or is now a unit — a job that quietly vanished is a boot
+    /// that comes up missing a service with no diagnostic anywhere.
+    #[test]
+    fn every_job_the_inittab_used_to_run_still_runs() {
+        let table = build_td_svc_conf();
+        let inittab = build_inittab();
+        for command in [
+            "/bin/hostname -F /etc/hostname",
+            "/bin/td-firstboot provision",
+            "/etc/rootcheck",
+            "/etc/netup",
+            "/etc/bootsuccess",
+            "/etc/bootfail",
+            "/bin/sshd serve",
+            "/etc/tty-session",
+        ] {
+            assert!(
+                table.contains(command) || inittab.contains(command),
+                "{command} ran under the old inittab and is now in neither PID 1's table \
+                 nor td-svc's"
+            );
+        }
+        // ...and the roster the shape check greps for must match the table itself, or
+        // the build-time check silently stops covering a unit.
+        let declared: Vec<String> = parse_td_svc_conf().into_iter().map(|(n, _)| n).collect();
+        assert_eq!(
+            declared,
+            TD_SVC_UNITS.iter().map(|u| u.to_string()).collect::<Vec<_>>(),
+            "TD_SVC_UNITS is what shape_check greps `td-svc check`'s plan for; a unit \
+             missing from it is a unit whose absence from the plan nothing would catch"
+        );
+    }
+
+    /// Every oneshot carries an explicit `timeout=`.
+    ///
+    /// td-svc defaults one, but its default is sized for a small job and these are not
+    /// — netup runs DHCP with retries, bootsuccess has a cmdline-configurable wait. A
+    /// oneshot killed early is a service that silently did not happen, so the values are
+    /// backstops against a hang, well above what the job can take. Daemons get none:
+    /// td-svc rejects `timeout=` on a daemon, which uses `ready-timeout=` instead.
+    #[test]
+    fn every_oneshot_bounds_itself_and_no_daemon_does() {
+        for (name, keys) in parse_td_svc_conf() {
+            let kind = keys
+                .iter()
+                .find(|(k, _)| k == "type")
+                .map(|(_, v)| v.clone())
+                .unwrap_or_else(|| unreachable!("unit {name} declares no type="));
+            let timeout = keys.iter().find(|(k, _)| k == "timeout").map(|(_, v)| v);
+            match kind.as_str() {
+                "oneshot" => {
+                    let secs: u32 = timeout
+                        .unwrap_or_else(|| unreachable!("oneshot {name} has no timeout="))
+                        .parse()
+                        .unwrap_or_else(|_| unreachable!("{name}: timeout= is not a number"));
+                    assert!(
+                        secs >= svc_timeouts::HOSTNAME,
+                        "{name}: a {secs}s bound is below even the trivial jobs' — a \
+                         timeout that fires early makes a service silently not happen"
+                    );
+                }
+                "daemon" => assert!(
+                    timeout.is_none(),
+                    "{name}: td-svc REJECTS timeout= on a daemon, so this table would \
+                     fail `td-svc check` and the image build with it"
+                ),
+                other => unreachable!("unit {name} has unknown type '{other}'"),
+            }
+        }
+    }
+
+    /// The timeout VALUES, pinned against the worst case each one covers.
+    ///
+    /// `every_oneshot_bounds_itself_and_no_daemon_does` asserts only that a bound exists
+    /// and clears a 30s floor, so `NETUP` could go from 300 to 31 with every host test
+    /// green — and 31 is below what the job takes: td-netd is 3 tries x 2s DISCOVER plus
+    /// the same REQUEST (12s), then under the nettest token a 3s-timeout resolve and a 5s
+    /// connect. A oneshot that outruns its bound is TERMed and marked failed, so netup
+    /// would silently not configure the link and sshd would start against a half-open
+    /// network — visible only to the daily oracle. Under the inittab these jobs had NO
+    /// bound, so a too-tight value is a failure mode this landing introduces, and the
+    /// values are therefore reviewed constants rather than free parameters.
+    #[test]
+    fn each_timeout_stays_above_the_worst_case_its_comment_claims() {
+        // A backstop must clear its worst case with room, not by a hair: these run on a
+        // TCG-emulated VM with a cold page cache, and the numbers below are computed from
+        // read timeouts and spawn counts, not measured. So the rule is 2x the worst case.
+        // Verified red at NETUP=31 — which clears the raw 26s and still fails here, which
+        // is the point: 31 was the value review proposed as obviously-too-tight.
+        const HEADROOM: u32 = 2;
+        // (value, worst case in seconds, what that worst case is)
+        let floors: [(u32, u32, &str); 6] = [
+            (svc_timeouts::HOSTNAME, 1, "one file read plus sethostname(2)"),
+            (svc_timeouts::FIRSTBOOT, 60, "ed25519 keygen, writes to /var, then sync"),
+            (svc_timeouts::ROOTCHECK, 50, "~50 process spawns incl. su, plus a sync"),
+            (
+                svc_timeouts::NETUP,
+                26,
+                "DHCP 3x2s DISCOVER + 3x2s REQUEST, then a 3s resolve and a 5s connect",
+            ),
+            (
+                svc_timeouts::BOOTSUCCESS,
+                // The loop is clamped to this many iterations; budget a slow one each.
+                (BOOT_SUCCESS_RETRY_MAX_SECS as u32).saturating_mul(30),
+                "clamped iterations of seven su probe blocks plus a td-boot install",
+            ),
+            (
+                svc_timeouts::BOOTFAIL,
+                BOOT_FAIL_PARK_WAIT_SECS as u32,
+                "clamped iterations of a grep and a 1s sleep",
+            ),
+        ];
+        for (value, worst, why) in floors {
+            let floor = worst.saturating_mul(HEADROOM);
+            assert!(
+                value >= floor,
+                "a {value}s bound leaves no headroom over the {worst}s this job can take \
+                 ({why}); a backstop must clear its worst case {HEADROOM}x, or it TERMs a \
+                 healthy job on a slow boot and marks the service failed"
+            );
+            // td-svc's parser rejects anything above MAX_DURATION_SECS, so a value that
+            // large never reaches the boot — it reds `td-svc check` and the image build.
+            assert!(
+                value <= 3600,
+                "a {value}s bound exceeds td-svc's MAX_DURATION_SECS and would be \
+                 REJECTED by `td-svc check`, failing the image build"
+            );
+        }
+    }
+
+    /// The COMPLETE `after=` edge set, pinned.
+    ///
+    /// This is the guard that actually protects the boot order, and it exists because
+    /// the obvious check does not work: td-svc breaks ties in DECLARATION order, so
+    /// deleting `after=td-firstboot` from rootcheck leaves the resolved plan
+    /// byte-identical. Verified by doing exactly that — `td-svc check` still printed
+    /// the same eight lines and exited 0. Only the declared edges distinguish an
+    /// ordering that is guaranteed from one that is currently lucky, so they are
+    /// pinned exactly: a deletion reds here, and so does an addition nobody reviewed.
+    ///
+    /// `hostname -> td-firstboot` is here for a second reason: td-svc starts every unit
+    /// whose edges are settled in one pass, so an edge omitted because "nothing reads
+    /// across them" buys CONCURRENCY that init's serial sysinit never had.
+    #[test]
+    fn the_declared_edges_are_exactly_these() {
+        let sysinit = ["hostname", "td-firstboot", "rootcheck", "netup"];
+        let expected: Vec<(&str, Vec<&str>)> = vec![
+            ("hostname", vec![]),
+            ("td-firstboot", vec!["hostname"]),
+            ("rootcheck", vec!["td-firstboot"]),
+            ("netup", vec!["rootcheck"]),
+            ("bootsuccess", sysinit.to_vec()),
+            ("bootfail", sysinit.to_vec()),
+            ("sshd", sysinit.to_vec()),
+            ("greeter", sysinit.to_vec()),
+        ];
+        for (unit, after) in expected {
+            assert_eq!(
+                unit_after(unit),
+                after.iter().map(|d| d.to_string()).collect::<Vec<_>>(),
+                "{unit}'s after= is not what the boot order was reviewed against"
+            );
+        }
+    }
+
+    /// init ran `::sysinit:` lines ONE AT A TIME, each to completion. td-svc has no such
+    /// rule — it starts everything whose edges are settled in the same pass — so the
+    /// serialization has to be spelled out as a total chain. Without it two sysinit jobs
+    /// overlap, which is a behaviour change no part of a cutover should be making.
+    #[test]
+    fn the_sysinit_chain_is_total_so_no_two_of_them_ever_overlap() {
+        let sysinit = ["hostname", "td-firstboot", "rootcheck", "netup"];
+        for pair in sysinit.windows(2) {
+            let (Some(prev), Some(next)) = (pair.first(), pair.get(1)) else {
+                continue;
+            };
+            assert!(
+                unit_after(next).contains(&(*prev).to_string()),
+                "{next} does not declare after={prev}, so td-svc would start them \
+                 CONCURRENTLY — init ran every sysinit line to completion before the \
+                 next, and this chain is the only thing that still says so"
+            );
+        }
+    }
+
+    /// Everything that was `::once:` or `::respawn:` started only after init had run
+    /// EVERY `::sysinit:` job to completion. That is the edge set those units must
+    /// declare — naming only the last member would silently weaken if the chain is
+    /// ever reordered.
+    #[test]
+    fn the_post_sysinit_units_wait_for_the_whole_sysinit_set() {
+        let sysinit = ["hostname", "td-firstboot", "rootcheck", "netup"];
+        for unit in ["bootsuccess", "bootfail", "sshd", "greeter"] {
+            let after = unit_after(unit);
+            for job in sysinit {
+                assert!(
+                    after.contains(&job.to_string()),
+                    "{unit} does not declare after={job}; under the inittab it could not \
+                     start until every sysinit job had finished, and this is that edge"
+                );
+            }
+        }
+    }
+
+    /// The console keeps td-svc's I5 protection: ordering only, never a strict
+    /// dependency. `requires=` is what makes a unit skippable, and td-svc's table
+    /// parser refuses it on a `tty=` unit — so a table that grew one would red the
+    /// image build, but this says why before it gets there.
+    #[test]
+    fn the_greeter_is_ordered_but_never_made_skippable() {
+        assert!(
+            unit_key("greeter", "requires").is_none(),
+            "a tty= unit may not declare requires=: the console is never skippable, and \
+             td-svc check would reject this table"
+        );
+        assert!(
+            !unit_after("greeter").is_empty(),
+            "the greeter should still PREFER to start after the system is up"
+        );
+        assert_eq!(
+            unit_key("greeter", "restart").as_deref(),
+            Some("always"),
+            "the greeter replaced a `respawn` line and must restart like one"
+        );
+        assert_eq!(
+            unit_key("sshd", "restart").as_deref(),
+            Some("always"),
+            "sshd replaced a `respawn` line and must restart like one"
+        );
+    }
 
     #[test]
     fn deployment_contract_is_recipe_owned() {
@@ -3109,7 +3650,7 @@ mod tests {
     /// every machine booting the image shares both.
     #[test]
     fn the_sshd_service_reads_only_mutable_etc_paths() {
-        let inittab = build_inittab();
+        let exec = unit_key("sshd", "exec").unwrap_or_else(|| unreachable!("no sshd unit"));
         for path in [SSHD_HOST_KEY, SSHD_AUTHORIZED_KEYS] {
             let relative = path
                 .strip_prefix("/etc/")
@@ -3120,54 +3661,45 @@ mod tests {
             );
         }
         assert!(
-            inittab.contains(&format!("--host-key {SSHD_HOST_KEY} ")),
-            "the sshd service line must present the per-machine host key; without --host-key \
+            exec.contains(&format!("--host-key {SSHD_HOST_KEY} ")),
+            "the sshd unit's exec= must present the per-machine host key; without --host-key \
              it falls back to the PUBLIC committed builtin key whenever no client is authorized"
         );
         assert!(
-            inittab.contains(&format!("--authorized-keys {SSHD_AUTHORIZED_KEYS}")),
-            "the sshd service line must authorize from per-machine state"
+            exec.contains(&format!("--authorized-keys {SSHD_AUTHORIZED_KEYS}")),
+            "the sshd unit's exec= must authorize from per-machine state"
         );
     }
 
-    /// td-firstboot must run at sysinit and BEFORE everything that reads or checks
-    /// what it writes. td-init runs sysinit jobs to completion in table order, so
-    /// this ordering IS the guarantee — there is no other synchronisation.
+    /// td-firstboot mints the per-machine identity, so it must be ordered BEFORE
+    /// everything that reads or checks what it writes.
+    ///
+    /// This used to compare line positions in the inittab, because "sysinit runs in
+    /// table order" made position the whole guarantee. It is now a declared edge, and
+    /// the transitive form is what matters: sshd is ordered behind the identity whether
+    /// it names td-firstboot directly or reaches it through netup and rootcheck.
     #[test]
     fn firstboot_provisions_before_anything_reads_the_identity() {
-        let inittab = build_inittab();
-        let position = |needle: &str| {
-            inittab
-                .lines()
-                .position(|line| line.contains(needle))
-                .unwrap_or_else(|| unreachable!("the inittab has no {needle} line"))
-        };
-        let firstboot = position("/bin/td-firstboot");
-        assert!(
-            inittab.contains("::sysinit:/bin/td-firstboot provision"),
-            "td-firstboot must be a sysinit job: `once`/`respawn` run concurrently with the \
-             services that read the identity it mints"
-        );
         for (label, later) in [
             // rootcheck asserts the identity is readable THROUGH the /etc symlinks.
-            ("/etc/rootcheck", position("::sysinit:/etc/rootcheck")),
+            ("rootcheck", "rootcheck"),
             // td-netd writes the volatile /run targets; ordering here is only about
             // keeping the identity ahead of the network coming up.
-            ("/etc/netup", position("::sysinit:/etc/netup")),
+            ("netup", "netup"),
             // sshd reads --host-key and --authorized-keys.
-            ("/bin/sshd", position("::respawn:/bin/sshd")),
+            ("sshd", "sshd"),
         ] {
             assert!(
-                firstboot < later,
-                "td-firstboot runs after {label}, which reads or checks the identity it mints"
+                ordered_before("td-firstboot", later),
+                "{label} is not ordered after td-firstboot, so it can run before the \
+                 identity it reads has been minted"
             );
         }
-        // The sysinit jobs before it are the ones IT needs: /proc (it reads
-        // /proc/mounts to refuse a volatile state dir) must already be mounted.
-        assert!(
-            position("-t proc proc /proc") < firstboot,
-            "td-firstboot reads /proc/mounts to refuse provisioning onto volatile storage, so \
-             /proc must be mounted first"
+        assert_eq!(
+            unit_key("td-firstboot", "type").as_deref(),
+            Some("oneshot"),
+            "td-firstboot must be a oneshot: a daemon releases its dependents when it \
+             SPAWNS, and the identity is not minted until it EXITS"
         );
     }
 
@@ -3301,25 +3833,25 @@ mod tests {
     #[test]
     fn exit_powers_off_and_rootcheck_runs() {
         let inittab = build_inittab();
-        assert!(
-            inittab.contains("ttyS0::respawn:/etc/tty-session"),
-            "inittab must respawn /etc/tty-session on ttyS0 (the getty -> reboot wrapper)"
-        );
-        assert!(
-            inittab.contains("::sysinit:/etc/rootcheck"),
-            "inittab must run /etc/rootcheck at sysinit (the read-only-root self-check)"
-        );
-        assert!(
-            inittab.contains("::sysinit:/etc/netup"),
-            "inittab must run /etc/netup at sysinit (network bring-up + resolve/reach self-test)"
-        );
-        assert!(
-            inittab.contains("::once:/etc/bootsuccess"),
-            "inittab must start the root-owned health target"
-        );
-        assert!(
-            inittab.contains("::once:/etc/bootfail"),
-            "inittab must start the isolated failed-target watchdog"
+        // These moved out of the inittab and into the unit table; each must still be
+        // there, running the same command, or the cutover dropped a job.
+        for (unit, exec) in [
+            ("greeter", "/etc/tty-session"),
+            ("rootcheck", "/etc/rootcheck"),
+            ("netup", "/etc/netup"),
+            ("bootsuccess", "/etc/bootsuccess"),
+            ("bootfail", "/etc/bootfail"),
+        ] {
+            assert_eq!(
+                unit_key(unit, "exec").as_deref(),
+                Some(exec),
+                "the {unit} unit must run {exec}"
+            );
+        }
+        assert_eq!(
+            unit_key("greeter", "tty").as_deref(),
+            Some("ttyS0"),
+            "the greeter must be handed ttyS0, as `ttyS0::respawn:` did"
         );
         // td-init supervises with no signals, so an inittab action it does not implement is
         // not "inert" — it is a line PID 1 reports as unsupported on every boot, and (for
@@ -4571,6 +5103,128 @@ mod tests {
                 "/etc/{name} must be a /run symlink only, never a plain WriteFile"
             );
         }
+    }
+
+    /// No `@PLACEHOLDER@` survives into the shipped shape check.
+    ///
+    /// The script is built by `.replace`-ing tokens into a literal, so a token added to
+    /// the text and not to the replace chain stays in the shell verbatim. That does not
+    /// fail loudly: `for f in ... @TD_SVC_CONF_NAME@ ...` iterates over the literal token
+    /// and asserts a file by that name exists, and `check -f "$root@TD_SVC_CONF@"` reads a
+    /// path that cannot exist. Both would red the build, but for a reason that names the
+    /// token rather than the check, and a token in a position the shell simply ignores
+    /// would verify nothing at all and stay green. Cheaper to assert none survive.
+    #[test]
+    fn the_shape_check_ships_no_unreplaced_placeholders() {
+        let shape = shape_check();
+        let mut left: Vec<String> = Vec::new();
+        let mut rest = shape.as_str();
+        while let Some(open) = rest.find('@') {
+            let after = rest.get(open.saturating_add(1)..).unwrap_or_default();
+            match after.find('@') {
+                Some(close) => {
+                    let token = after.get(..close).unwrap_or_default();
+                    if !token.is_empty()
+                        && token
+                            .chars()
+                            .all(|c| c.is_ascii_uppercase() || c == '_' || c.is_ascii_digit())
+                    {
+                        left.push(format!("@{token}@"));
+                    }
+                    rest = after.get(close.saturating_add(1)..).unwrap_or_default();
+                }
+                None => break,
+            }
+        }
+        assert!(
+            left.is_empty(),
+            "shape_check still contains {left:?}; add each to the .replace chain, or the \
+             shipped script tests a literal token instead of what it names"
+        );
+    }
+
+    /// One path, three consumers, and nothing that lets them drift.
+    ///
+    /// The doc on TD_SVC_CONF used to claim this and it was not true: `etc_files` spelled
+    /// "td-svc.conf" literally and shape_check spelled "$root/etc/td-svc.conf" literally,
+    /// so only the inittab used the const. Moving TD_SVC_CONF left every test green — the
+    /// inittab assertion builds its expected line from the same const, so it is a
+    /// tautology — while the image shipped PID 1 naming a file nothing generated.
+    ///
+    /// That failure is silent AND terminal: td-svc handed a missing table prints one line
+    /// and idles forever with zero units, and since it has no exit path PID 1 never
+    /// respawns it. No console, no sshd, no network, no diagnostic after the first line.
+    /// So the relationship gets a test rather than a comment.
+    #[test]
+    fn the_unit_table_path_has_exactly_one_source_of_truth() {
+        assert!(
+            TD_SVC_CONF.starts_with("/etc/"),
+            "TD_SVC_CONF must live under /etc: etc_files is what generates it, and \
+             td_svc_conf_etc_name derives the filename by stripping that prefix"
+        );
+        let name = td_svc_conf_etc_name();
+        assert_eq!(
+            format!("/etc/{name}"),
+            TD_SVC_CONF,
+            "the generated /etc entry and the path PID 1 names must be the same file"
+        );
+        assert!(
+            !name.contains('/'),
+            "TD_SVC_CONF must sit directly in /etc: etc_files writes a flat name, so a \
+             nested path would generate nothing and PID 1 would name a missing file"
+        );
+        // The inittab's -f, spelled out rather than rebuilt from the const, so this is
+        // not the tautology it replaces.
+        assert!(
+            build_inittab().contains("/bin/td-svc run -f /etc/td-svc.conf"),
+            "PID 1's only respawn line must name the generated table literally"
+        );
+        // And the file really is generated at that name.
+        assert!(
+            etc_files(&SYSTEM).iter().any(|(n, _, _)| *n == name),
+            "no etc_files entry generates {name}, so PID 1 would exec td-svc against a \
+             path that does not exist"
+        );
+    }
+
+    /// td-svc must be PACKED, not merely symlinked and listed as an input.
+    ///
+    /// This test exists because its absence was the bug: the cutover added the /bin/td-svc
+    /// symlink and the native_inputs entry and stopped there, and nothing on the host
+    /// noticed. A store item reaches the erofs root by CopyTree (static) or
+    /// StageRuntimeClosure (dynamic); being a recipe INPUT only makes the path resolvable
+    /// at build time. So the symlink resolved in the recipe text and dangled on the image,
+    /// and since PID 1's only respawn line execs it, the machine would have come up with
+    /// no identity, no network, no sshd and no console — the shape check says exactly
+    /// that, but shape_check runs in the recipe-checks-daily tier, which is deferred
+    /// per-PR. Every other packed binary here has a test of this shape; this one is td-svc
+    /// paying the same rent.
+    #[test]
+    fn td_svc_is_packed_and_not_merely_symlinked() {
+        let steps = real_root_steps(&SYSTEM);
+        assert!(
+            steps.iter().any(|s| matches!(
+                s,
+                Step::CopyTree { from, dest }
+                    if from == "{in:td-svc}" && dest == "{root}/real-root{in:td-svc}"
+            )),
+            "td-svc must be CopyTree'd into the real root (static, empty closure) - a \
+             symlink alone dangles on the image and PID 1's only respawn line execs nothing"
+        );
+        assert!(
+            steps.iter().any(|s| matches!(
+                s,
+                Step::Symlink { target, link }
+                    if target == "{in:td-svc}/bin/td-svc"
+                        && link == "{root}/real-root/bin/td-svc"
+            )),
+            "/bin/td-svc must symlink into the store td-svc package"
+        );
+        let native_inputs = recipe().native_inputs.expect("system native inputs");
+        assert!(
+            native_inputs.iter().any(|i| i == "td-svc"),
+            "td-svc must be a declared native input, or {{in:td-svc}} does not resolve"
+        );
     }
 }
 
