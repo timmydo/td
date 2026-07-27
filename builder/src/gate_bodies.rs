@@ -125,6 +125,24 @@ fn tb() -> Result<PathBuf, String> {
     std::env::current_exe().map_err(|e| format!("cannot resolve td-builder (current_exe): {e}"))
 }
 
+/// Tag a failed child's message as a PROVISIONING gap, so `cli` re-raises it as
+/// exit 69 and gate-run tolerates the gate as a skip. Requires exit
+/// `EXIT_UNPROVISIONED` AND the sentinel only td's provisioning path prints —
+/// the same two-part test gate-run applies, so a bare 69 from an unrelated tool
+/// stays RED and no regression can masquerade as a skip. `output` is the child's
+/// streams alone, never the formatted message, so `ctx` cannot satisfy it.
+fn tag_if_unprovisioned(status: &std::process::ExitStatus, output: &str, msg: String) -> String {
+    if status.code() == Some(crate::check_loop::EXIT_UNPROVISIONED)
+        && output.contains(crate::check_loop::UNPROVISIONED_SENTINEL)
+    {
+        // Drop the FAIL: lead-in; this is reported as a skip, and a SKIP line
+        // reading "unprovisioned — FAIL: ..." is the confusion being removed.
+        let body = msg.strip_prefix("FAIL: ").unwrap_or(&msg);
+        return format!("{UNPROVISIONED_TAG}{body}");
+    }
+    msg
+}
+
 /// Run `tb <args...>`, returning trimmed stdout on success. On a non-zero exit
 /// the error carries `<ctx>` and the child's stderr (the bash `2>&1` tail).
 fn tb_out(tb: &Path, args: &[&str], ctx: &str) -> Result<String, String> {
@@ -148,10 +166,9 @@ fn tb_out_env(
     if !out.status.success() {
         let err = String::from_utf8_lossy(&out.stderr);
         let sout = String::from_utf8_lossy(&out.stdout);
-        return Err(format!(
-            "FAIL: {ctx}: td-builder {args:?} exited {}\n{sout}{err}",
-            out.status
-        ));
+        let body = format!("{sout}{err}");
+        let msg = format!("FAIL: {ctx}: td-builder {args:?} exited {}\n{body}", out.status);
+        return Err(tag_if_unprovisioned(&out.status, &body, msg));
     }
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
@@ -195,10 +212,9 @@ fn run_out_env(
     if !out.status.success() {
         let err = String::from_utf8_lossy(&out.stderr);
         let sout = String::from_utf8_lossy(&out.stdout);
-        return Err(format!(
-            "FAIL: {ctx}: {program} {args:?} exited {}\n{sout}{err}",
-            out.status
-        ));
+        let body = format!("{sout}{err}");
+        let msg = format!("FAIL: {ctx}: {program} {args:?} exited {}\n{body}", out.status);
+        return Err(tag_if_unprovisioned(&out.status, &body, msg));
     }
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
@@ -3071,6 +3087,35 @@ fn toolchain_x86_64_input_addressed(root: &Path) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A native body that shells out to a tool which could not provision a
+    /// toolchain must re-raise that as 69, not 1: `cli` keys off the tag, and
+    /// gate-run keys off the 69, so an untagged message is a hard RED where the
+    /// contract says tolerated skip. Tightness matters as much as the mapping —
+    /// a 69 WITHOUT the sentinel is some other tool's EX_UNAVAILABLE and must
+    /// stay red, or a real regression could hide as a skip.
+    #[test]
+    fn an_unprovisioned_child_is_tagged_but_only_with_the_sentinel() {
+        use std::os::unix::process::ExitStatusExt;
+        let unprov = std::process::ExitStatus::from_raw(crate::check_loop::EXIT_UNPROVISIONED << 8);
+        let other = std::process::ExitStatus::from_raw(1 << 8);
+        let sentinel = crate::check_loop::UNPROVISIONED_SENTINEL;
+
+        let child = format!("no rustc\n{sentinel}\n");
+        let tagged = tag_if_unprovisioned(&unprov, &child, "FAIL: m".into());
+        // Tagged, and the FAIL: lead-in dropped — it is reported as a skip.
+        assert_eq!(tagged.strip_prefix(UNPROVISIONED_TAG), Some("m"), "{tagged:?}");
+        // A bare 69 with no sentinel is not td's provisioning path.
+        assert_eq!(
+            tag_if_unprovisioned(&unprov, "boom\n", "FAIL: m".into()),
+            "FAIL: m"
+        );
+        // The sentinel alone does not license a skip either.
+        assert_eq!(
+            tag_if_unprovisioned(&other, &child, "FAIL: m".into()),
+            "FAIL: m"
+        );
+    }
 
     #[test]
     fn native_gates_match_cli() {

@@ -31,7 +31,9 @@ pub fn gate() -> GateDef {
 echo ">> recipe-check gcc-x86-64-self-test: rebuild gcc with the native recipe output and assert self-hosting"
 : "${TD_RECIPE_EVAL:=}"
 if [ -z "$TD_RECIPE_EVAL" ] || [ ! -x "$TD_RECIPE_EVAL" ]; then
-  TD_RECIPE_EVAL=$(sh tests/recipe-eval-tool.sh "$PWD/.td-build-cache/recipe-eval")
+  # `|| exit $?`: the tool's 69 is a tolerated skip; a dropped status leaves
+  # TD_RECIPE_EVAL empty and the exec below reds 126.
+  TD_RECIPE_EVAL=$(sh tests/recipe-eval-tool.sh "$PWD/.td-build-cache/recipe-eval") || exit $?
 fi
 exec "$TD_RECIPE_EVAL" check-run gcc-x86-64-self-test 1
 "##,
