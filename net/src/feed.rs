@@ -771,15 +771,123 @@ fn write_cargo_home(dir: &Path, addr: &str) -> Result<(), String> {
         .map_err(|e| format!("write cargo config: {e}"))
 }
 
-/// `cargo fetch --locked` in `srcdir` with CARGO_HOME=`ch` (so it routes through the proxy).
-fn cargo_fetch_locked(srcdir: &Path, ch: &Path) -> bool {
-    run_quiet(
-        Command::new("cargo")
-            .arg("fetch")
-            .arg("--locked")
-            .current_dir(srcdir)
-            .env("CARGO_HOME", ch),
-    )
+/// `cargo fetch --locked` in `srcdir` with CARGO_HOME=`ch` (so it routes through the
+/// proxy). `tag` labels the log for whichever warm called.
+///
+/// Surfaces cargo's stderr rather than discarding it: an unsatisfiable lock, a proxy
+/// miss and an ambient workspace claiming the tree all look identical otherwise.
+fn cargo_fetch_locked(srcdir: &Path, ch: &Path, tag: &str) -> bool {
+    match Command::new("cargo")
+        .arg("fetch")
+        .arg("--locked")
+        .current_dir(srcdir)
+        .env("CARGO_HOME", ch)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .output()
+    {
+        Ok(out) if out.status.success() => true,
+        Ok(out) => {
+            let err = String::from_utf8_lossy(&out.stderr);
+            // Drop cargo's retry chatter before capping: an unreachable proxy emits a
+            // long run of `spurious network error (N tries remaining)` AHEAD of the
+            // error, so a head-anchored cap would spend itself on noise and print no
+            // cause at all — the failure this logging exists to end (subagent review).
+            let mut lines = err
+                .lines()
+                .filter(|l| !l.trim().is_empty() && !l.contains("spurious network error"));
+            for line in lines.by_ref().take(12) {
+                eprintln!("td-feed {tag}:   cargo: {line}");
+            }
+            if lines.next().is_some() {
+                eprintln!("td-feed {tag}:   cargo: … (further output truncated)");
+            }
+            false
+        }
+        Err(e) => {
+            eprintln!("td-feed {tag}:   cargo fetch could not run: {e}");
+            false
+        }
+    }
+}
+
+/// Advance the multi-line-string state (`"""` / `'''`) across one line, reporting
+/// whether the line STARTED inside one. Published manifests do carry bracketed
+/// column-0 lines inside `package.metadata.release` changelog templates, and a
+/// `[workspace]` in that body is string content, not a table.
+fn scan_multiline(line: &str, open: &mut Option<&'static str>) -> bool {
+    let started_open = open.is_some();
+    let mut rest = line;
+    loop {
+        match *open {
+            Some(delim) => match rest.find(delim) {
+                Some(i) => {
+                    *open = None;
+                    rest = rest.get(i + delim.len()..).unwrap_or("");
+                }
+                None => return started_open,
+            },
+            None => {
+                let (i, delim) = match (rest.find("\"\"\""), rest.find("'''")) {
+                    (Some(b), Some(s)) if s < b => (s, "'''"),
+                    (Some(b), _) => (b, "\"\"\""),
+                    (None, Some(s)) => (s, "'''"),
+                    (None, None) => return started_open,
+                };
+                *open = Some(delim);
+                rest = rest.get(i + delim.len()..).unwrap_or("");
+            }
+        }
+    }
+}
+
+/// Already a workspace root? A sub-table alone (`[workspace.metadata]`) makes it one.
+fn declares_workspace(text: &str) -> bool {
+    let mut open = None;
+    for line in text.lines() {
+        if !scan_multiline(line, &mut open) && is_workspace_header(line) {
+            return true;
+        }
+    }
+    false
+}
+
+/// A `[workspace]` table header. Tolerates the whitespace and quoting TOML permits:
+/// a header read as ordinary text earns the file a SECOND `[workspace]`, which is a
+/// parse error rather than a detach.
+fn is_workspace_header(line: &str) -> bool {
+    let Some(inner) = line.trim_start().strip_prefix('[') else {
+        return false;
+    };
+    let Some(rest) = inner
+        .trim_start()
+        .trim_start_matches('"')
+        .strip_prefix("workspace")
+    else {
+        return false;
+    };
+    matches!(rest.chars().next(), Some(']' | '.' | '"')) || rest.starts_with(char::is_whitespace)
+}
+
+/// Stop cargo's upward manifest walk at this extracted crate: it lands under the
+/// repo's own `.td-build-cache`, so the walk reaches td's workspace root and cargo
+/// refuses ("current package believes it's in a workspace when it's not"). An empty
+/// `[workspace]` is cargo's own remedy — `tests/sshd/Cargo.toml` already uses it —
+/// and unlike an `exclude` entry it holds wherever the checkout sits.
+///
+/// Only this scratch copy is rewritten; nothing content-addressed reads it.
+fn detach_from_workspace(manifest: &Path) -> Result<(), String> {
+    let text = std::fs::read_to_string(manifest)
+        .map_err(|e| format!("read {}: {e}", manifest.display()))?;
+    if declares_workspace(&text) {
+        return Ok(());
+    }
+    let mut out = text;
+    if !out.ends_with('\n') {
+        out.push('\n');
+    }
+    out.push_str("\n[workspace]\n");
+    std::fs::write(manifest, out).map_err(|e| format!("write {}: {e}", manifest.display()))
 }
 
 /// warm crate CRATE VERSION [DEST] — provision a crates.io package's SOURCE tree + its FULL
@@ -869,13 +977,17 @@ fn warm_crate(root: &Path, krate: &str, ver: &str, dest: &str) {
         );
         return;
     }
+    if let Err(e) = detach_from_workspace(&srcdir.join("Cargo.toml")) {
+        eprintln!("td-feed warm crate: {e} — skipping {krate}-{ver}");
+        return;
+    }
 
     // 3) Fetch the FULL locked closure through the proxy from the source's OWN Cargo.lock, with
     //    a CLEAN proxy cache + a FRESH cargo home (every crate a verified proxy miss).
     let _ = std::fs::remove_dir_all(proxy_store.join("crates"));
     let _ = std::fs::remove_dir_all(proxy_store.join("index"));
     let ch = work.join("ch-deps");
-    if write_cargo_home(&ch, &addr).is_err() || !cargo_fetch_locked(&srcdir, &ch) {
+    if write_cargo_home(&ch, &addr).is_err() || !cargo_fetch_locked(&srcdir, &ch, "warm crate") {
         eprintln!("td-feed warm crate: locked dep fetch failed for {krate}-{ver}");
         return;
     }
@@ -953,7 +1065,7 @@ fn warm_crate_local(root: &Path, srcrel: &str, dest: &str) {
         }
     };
     let ch = work.join("cargo-home");
-    if write_cargo_home(&ch, &addr).is_err() || !cargo_fetch_locked(&srcdir, &ch) {
+    if write_cargo_home(&ch, &addr).is_err() || !cargo_fetch_locked(&srcdir, &ch, "warm crate-local") {
         eprintln!(
             "td-feed warm crate-local: locked dep fetch failed for {dest} (in {})",
             srcdir.display()
@@ -1902,7 +2014,7 @@ pub fn run(a: &[String]) {
 
 #[cfg(test)]
 mod tests {
-    use super::{ensure_serve_daemon, parse_serve_addr, resolve_feed_dir};
+    use super::{detach_from_workspace, ensure_serve_daemon, parse_serve_addr, resolve_feed_dir};
     use std::path::PathBuf;
 
     /// A per-invocation-unique temp dir under $TMPDIR. `cargo test` runs tests
@@ -1915,6 +2027,80 @@ mod tests {
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
         std::env::temp_dir().join(format!("td-feed-{tag}-{}-{n}", std::process::id()))
+    }
+
+    // Detaching must be idempotent (a warm re-runs over an already-extracted tree)
+    // and must leave a crate that is already its own root untouched.
+    #[test]
+    fn an_extracted_crate_is_detached_from_any_ambient_workspace() {
+        let dir = unique_tmp_dir("detach");
+        std::fs::create_dir_all(&dir).unwrap();
+        let manifest = dir.join("Cargo.toml");
+
+        // A plain upstream manifest gains the terminating table.
+        std::fs::write(&manifest, "[package]\nname = \"rg\"\n").unwrap();
+        detach_from_workspace(&manifest).unwrap();
+        let once = std::fs::read_to_string(&manifest).unwrap();
+        assert!(once.contains("[workspace]"), "{once}");
+        assert!(once.contains("name = \"rg\""), "the package must survive: {once}");
+        // Re-running leaves it byte-identical (a warm re-extracts and re-detaches).
+        detach_from_workspace(&manifest).unwrap();
+        assert_eq!(once, std::fs::read_to_string(&manifest).unwrap());
+
+        // A crate that already declares a workspace — including only a sub-table,
+        // which makes it a root just the same — is left exactly as upstream wrote it.
+        // A crate that already declares a workspace — including only a sub-table,
+        // which makes it a root just the same — is left exactly as upstream wrote it.
+        // The last two are TOML the publisher normalizer would not emit but the
+        // parser accepts; a second `[workspace]` there is a parse error, not a detach.
+        for existing in [
+            "[package]\nname = \"a\"\n\n[workspace]\nmembers = [\"x\"]\n",
+            "[package]\nname = \"b\"\n\n[workspace.metadata.thing]\nk = 1\n",
+            "[package]\nname = \"c\"\n\n[ workspace ]\n",
+            "[package]\nname = \"d\"\n\n[\"workspace\"]\n",
+        ] {
+            std::fs::write(&manifest, existing).unwrap();
+            detach_from_workspace(&manifest).unwrap();
+            assert_eq!(existing, std::fs::read_to_string(&manifest).unwrap());
+        }
+
+        // ... but these are NOT workspace tables, and each must still be detached: a
+        // table merely NAMED like one, a comment, and — the case that actually occurs
+        // upstream — a bracketed line inside a `package.metadata.release` changelog
+        // template, which is string body rather than TOML structure.
+        for other in [
+            "[package]\nname = \"e\"\n\n[workspacey]\n",
+            "[package]\nname = \"f\"\n# [workspace]\n",
+            "[package]\nname = \"g\"\n\n[package.metadata.release]\nreplace = \"\"\"\n[workspace]\n\"\"\"\n",
+            "[package]\nname = \"h\"\ndescription = '''\n[workspace.metadata]\n'''\n",
+        ] {
+            std::fs::write(&manifest, other).unwrap();
+            detach_from_workspace(&manifest).unwrap();
+            let text = std::fs::read_to_string(&manifest).unwrap();
+            assert!(text.lines().any(|l| l == "[workspace]"), "{text}");
+        }
+
+        // A one-line `x = """…"""` opens and closes on the same line, so a REAL table
+        // after it is still seen (the scanner must not be left stuck open).
+        std::fs::write(
+            &manifest,
+            "[package]\nname = \"i\"\ndescription = \"\"\"one\"\"\"\n\n[workspace]\n",
+        )
+        .unwrap();
+        let before = std::fs::read_to_string(&manifest).unwrap();
+        detach_from_workspace(&manifest).unwrap();
+        assert_eq!(before, std::fs::read_to_string(&manifest).unwrap());
+
+        // A manifest with no trailing newline still yields a parseable table header
+        // on its own line, not glued to the last key.
+        std::fs::write(&manifest, "[package]\nname = \"c\"").unwrap();
+        detach_from_workspace(&manifest).unwrap();
+        let text = std::fs::read_to_string(&manifest).unwrap();
+        assert!(
+            text.lines().any(|l| l == "[workspace]"),
+            "the table header must stand alone: {text:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

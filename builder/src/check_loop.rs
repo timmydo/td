@@ -1468,11 +1468,24 @@ fn heavy_warms(root: &Path) {
     // td-feed serve daemon when `td-feed ensure-serve` can start/reuse it
     // (native since #318 axis 2 — was tools/feed-ensure.sh).
     let mut src_envs = vec![(s("TD_ROOT"), root.display().to_string())];
+    // `warm sources` resolves the recipe-owned pins by BUILDING td-recipe-eval through
+    // tests/recipe-eval-tool.sh, which hard-requires TD_BUILDER_SELF; without it the
+    // warm dies on the unset variable before fetching anything. Guarded as
+    // warm_kh_arches does, so an unresolvable current_exe() inherits rather than
+    // clobbers.
+    if let Ok(exe) = std::env::current_exe() {
+        src_envs.push((s("TD_BUILDER_SELF"), exe.display().to_string()));
+    }
     let faddr = warm_capture(&[tdfeed.clone(), s("ensure-serve")], root, &[]);
     if !faddr.is_empty() {
         src_envs.push((s("TD_FEED_BASE"), format!("http://{faddr}")));
     }
-    let _ = warm_status(&[tdfeed.clone(), s("warm"), s("sources")], root, &src_envs);
+    if !warm_status(&[tdfeed.clone(), s("warm"), s("sources")], root, &src_envs) {
+        eprintln!(
+            "td-builder check: warm sources failed — the recipe-owned source pins may be cold \
+             (best-effort; the gates enforce presence)"
+        );
+    }
 
     // Corpus crate warms: independent, fanned out in batches of TD_WARM_JOBS.
     let warm_jobs: usize = std::env::var("TD_WARM_JOBS")
