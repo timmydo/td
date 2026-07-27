@@ -116,6 +116,10 @@ pub struct Shell {
     /// order. `call_function` swaps in a fresh list per call, so each invocation
     /// unwinds only its own — including a recursive one's.
     pub locals: Vec<Local>,
+    /// Bindings a terminating unwind left standing, newest first, so an EXIT trap
+    /// still sees the frame the shell died in. Drained by `unwind_pending` at the
+    /// points where the shell recovers instead.
+    pub pending_unwind: Vec<Local>,
     pub loop_depth: u32,
     /// Runtime recursion depth (function calls + command substitution), bounded so
     /// `f() { f; }; f` and `$( $( … ) )` error instead of overflowing the stack.
@@ -201,6 +205,7 @@ impl Shell {
             fds: Fds::new(),
             in_function: false,
             locals: Vec::new(),
+            pending_unwind: Vec::new(),
             loop_depth: 0,
             run_depth: 0,
             cmdsubst_count: 0,
@@ -261,6 +266,7 @@ impl Shell {
             fds: Fds::new(),
             in_function: false,
             locals: Vec::new(),
+            pending_unwind: Vec::new(),
             loop_depth: 0,
             run_depth: 0,
             cmdsubst_count: 0,
@@ -287,20 +293,25 @@ impl Shell {
     /// Assign a shell variable, honouring the readonly attribute. A write to a
     /// readonly name is dash's sh_error, so it goes out as `Sig::Abort` and `?`
     /// carries it to the nearest handler rather than leaving a status to test.
+    /// dash's OPTIND hook (`getoptsreset`): any assignment moves the cursor and
+    /// abandons a half-consumed word. dash's number() takes an all-digit string
+    /// only (so " 2", "+1" and "-1" are all rejected) and coerces 0 up to 1; a
+    /// rejected value parks -1, which `getopts` reports when it next runs.
+    fn var_hook(&mut self, name: &str, value: &str) {
+        if name != "OPTIND" {
+            return;
+        }
+        let digits = !value.is_empty() && value.bytes().all(|b| b.is_ascii_digit());
+        self.getopts_optind =
+            if digits { value.parse::<i64>().unwrap_or(i64::MAX).max(1) } else { -1 };
+        self.getopts_off = -1;
+    }
+
     pub fn set_var(&mut self, name: &str, value: &str) -> R<()> {
         // Assigning OPTIND at all -- even the value it already holds -- restarts
-        // `getopts` at a word boundary, as dash's OPTIND hook does. `getopts`
-        // itself re-establishes the offset after publishing OPTIND.
-        if name == "OPTIND" {
-            // dash's OPTIND hook: any assignment moves the cursor and abandons a
-            // half-consumed word. dash's number() takes an all-digit string only
-            // (so " 2", "+1" and "-1" are all rejected) and coerces 0 up to 1; a
-            // rejected value parks -1, which `getopts` reports when it next runs.
-            let digits = !value.is_empty() && value.bytes().all(|b| b.is_ascii_digit());
-            self.getopts_optind =
-                if digits { value.parse::<i64>().unwrap_or(i64::MAX).max(1) } else { -1 };
-            self.getopts_off = -1;
-        }
+        // `getopts` at a word boundary. `getopts` itself re-establishes the
+        // offset after publishing OPTIND.
+        self.var_hook(name, value);
         match self.vars.get_mut(name) {
             // dash reports this through sh_error, which ends a non-interactive
             // shell with status 2 -- not a status a script can test.
@@ -432,6 +443,10 @@ pub fn run_interactive_unit(sh: &mut Shell, list: &List) -> Option<i32> {
         Ok(()) => None,
         Err(Sig::Exit(code)) => Some(code),
         Err(Sig::Abort(code)) => {
+            // The shell is recovering, not exiting, so whatever the unwind left
+            // standing goes now rather than into the next prompt. Nothing outer
+            // survives a top-level recovery, so the mark is 0.
+            unwind_pending_to(sh, 0);
             sh.set_status(code);
             None
         }
@@ -910,6 +925,9 @@ fn run_builtin(
     // the branch above). Rolling it back here would also undo what `local` itself
     // just assigned to the same name, leaving `x=t local x=l` with neither value.
     let transient = !matches!(bi, builtin::Builtin::Local);
+    // Anything deferred from here on belongs to THIS command, so a swallowed
+    // abort undoes exactly that and leaves an outer unwind's frames alone.
+    let pending_mark = sh.pending_unwind.len();
     let mut saved_vars: Vec<(String, Option<Var>)> = Vec::with_capacity(assigns.len());
     // Closed over so an unwind mid-way -- a readonly target, `>${x:?}` -- still
     // reaches the rollback below; a `?` here used to skip it and leak the binding
@@ -936,6 +954,7 @@ fn run_builtin(
                 // so `command exit 7` still exits.
                 match r {
                     Err(Sig::Abort(code)) if swallows_abort(bi) => {
+                        unwind_pending_to(sh, pending_mark);
                         sh.set_status(code);
                         Ok(())
                     }
@@ -947,15 +966,17 @@ fn run_builtin(
             process::RedirOutcome::Failed => Ok(()),
         }
     })();
-    for (name, prev) in saved_vars.into_iter().rev() {
-        match prev {
-            Some(v) => {
-                sh.vars.insert(name, v);
-            }
-            None => {
-                sh.vars.remove(&name);
-            }
-        }
+    // Same rule as a function's frame: a terminating unwind leaves it standing for
+    // an EXIT trap. A failed redirection is NOT one -- it returns `Ok`, and both
+    // references show the frame already gone by the time the trap runs.
+    if result.as_ref().err().is_some_and(terminating) {
+        defer_vars(sh, saved_vars);
+    } else {
+        // As in `command`'s scratch frame, and unreachable for the same reason:
+        // anything deferred inside is newer than this frame and must come off
+        // before it, or this frame's saved values are stale.
+        unwind_pending_to(sh, pending_mark);
+        restore_vars(sh, saved_vars);
     }
     result
 }
@@ -966,6 +987,13 @@ fn run_builtin(
 /// what follows, hands the error back as a status.
 fn swallows_abort(bi: builtin::Builtin) -> bool {
     matches!(bi, builtin::Builtin::Command)
+}
+
+/// Whether this signal is on its way out of the shell rather than out of a
+/// construct. Only these two skip a frame's cleanup; `return` and `break` unwind
+/// normally and undo it.
+pub fn terminating(sig: &Sig) -> bool {
+    matches!(sig, Sig::Exit(_) | Sig::Abort(_))
 }
 
 fn expand_assignments(
@@ -980,21 +1008,80 @@ fn expand_assignments(
     Ok(out)
 }
 
-/// Put back what a frame's `local`s displaced, newest first -- a function's on
-/// return, or the scratch one `command` runs a builtin in. The writes go straight
-/// to the map: a name made `readonly` inside the frame must not block the restore
-/// of the binding that existed before it.
+/// Put back what one binding displaced. `None` means the name did not exist, so
+/// restoring it is an unset -- and it overwrites whatever the body assigned
+/// through the binding, which is what makes a temp frame vanish entirely. The
+/// write goes into the map rather than through `set_var`: a name made `readonly`
+/// inside the frame must not block the restore of what preceded it.
+fn undo_binding(sh: &mut Shell, entry: Local) {
+    match entry {
+        Local::Var(name, Some(var)) => {
+            // Bypassing `set_var` still owes the hook, which dash runs on the
+            // RESTORE too (`poplocalvars` calls the var's `func`): a frame that
+            // displaced OPTIND has to put the hidden cursor back with it, or
+            // `getopts` resumes at the word the frame's value pointed at.
+            sh.var_hook(&name, &var.value);
+            sh.vars.insert(name, var);
+        }
+        Local::Var(name, None) => {
+            // ash fires it on an UNSET too (`unsetvar` is `setvar(s, NULL, 0)`),
+            // where `getoptsreset` restarts the scan at word 1 for anything that
+            // is not a number (ash.c:2272) rather than parking the error an
+            // assignment parks. dash rejects `unset OPTIND` outright, so ash
+            // decides this one.
+            if name == "OPTIND" {
+                sh.getopts_optind = 1;
+                sh.getopts_off = -1;
+            }
+            sh.vars.remove(&name);
+        }
+        Local::Opts(opts) => sh.opts = opts,
+    }
+}
+
+/// Undo a frame's `local`s, newest first -- a function's on return, or the
+/// scratch one `command` runs a builtin in.
 pub fn pop_locals(sh: &mut Shell) {
     while let Some(entry) = sh.locals.pop() {
-        match entry {
-            Local::Var(name, Some(var)) => {
-                sh.vars.insert(name, var);
-            }
-            Local::Var(name, None) => {
-                sh.vars.remove(&name);
-            }
-            Local::Opts(opts) => sh.opts = opts,
-        }
+        undo_binding(sh, entry);
+    }
+}
+
+/// Undo a temp frame, newest first.
+fn restore_vars(sh: &mut Shell, saved: Vec<(String, Option<Var>)>) {
+    for (name, prev) in saved.into_iter().rev() {
+        undo_binding(sh, Local::Var(name, prev));
+    }
+}
+
+/// Hand a temp frame to `sh.pending_unwind` instead of undoing it, newest first.
+fn defer_vars(sh: &mut Shell, saved: Vec<(String, Option<Var>)>) {
+    sh.pending_unwind
+        .extend(saved.into_iter().rev().map(|(n, v)| Local::Var(n, v)));
+}
+
+/// The same for this scope's `local` frame.
+pub fn defer_locals(sh: &mut Shell) {
+    let mine = std::mem::take(&mut sh.locals);
+    sh.pending_unwind.extend(mine.into_iter().rev());
+}
+
+/// dash's `exitreset` -> `unwindlocalvars(NULL)`, bounded to what was deferred
+/// after `mark` was taken: bindings a terminating unwind left standing go away
+/// once the shell turns out to be recovering rather than exiting, but only the
+/// ones belonging to the command that recovered. Frames deferred BEFORE the mark
+/// belong to an outer unwind that is still on its way out, and undoing those
+/// would take a dying function's bindings away from the EXIT trap.
+///
+/// It must also run before the marking scope undoes its OWN frame, since what it
+/// puts back is what that frame would otherwise have to save again.
+pub fn unwind_pending_to(sh: &mut Shell, mark: usize) {
+    if mark >= sh.pending_unwind.len() {
+        return;
+    }
+    // Deferred newest first within one unwind, so this drains in that order.
+    for entry in sh.pending_unwind.split_off(mark) {
+        undo_binding(sh, entry);
     }
 }
 
@@ -1007,11 +1094,29 @@ fn call_function(
 ) -> R<()> {
     // Recursion is bounded centrally in `run_command` (the function body re-enters
     // there), so `f() { f; }; f` errors instead of overflowing the stack.
-    // Temporary assignments precede the call and are visible inside it; dash
-    // keeps them set afterward for a function, so we do too.
-    for a in assigns {
-        let value = expand::expand_assign(sh, &a.value)?;
-        sh.set_var(&a.name, &value)?;
+    //
+    // A prefix assignment is a TEMP FRAME: visible inside the call, exported for
+    // it as an external command's environment would be, and gone afterwards --
+    // even if the body assigned through it. Restored below `pop_locals`, so a
+    // `local` of the same name unwinds to the binding first and this then takes
+    // the binding away too.
+    let mut saved_vars: Vec<(String, Option<Var>)> = Vec::with_capacity(assigns.len());
+    let applied = (|| -> R<()> {
+        for a in assigns {
+            let value = expand::expand_assign(sh, &a.value)?;
+            saved_vars.push((a.name.clone(), sh.vars.get(&a.name).cloned()));
+            sh.set_var(&a.name, &value)?;
+            sh.export(&a.name);
+        }
+        Ok(())
+    })();
+    if let Err(sig) = applied {
+        if terminating(&sig) {
+            defer_vars(sh, saved_vars);
+        } else {
+            restore_vars(sh, saved_vars);
+        }
+        return Err(sig);
     }
     let new_params = argv.get(1..).unwrap_or(&[]).to_vec();
     let saved_params = std::mem::replace(&mut sh.params, new_params);
@@ -1039,10 +1144,22 @@ fn call_function(
         Ok(process::RedirOutcome::Failed) => Ok(()),
         Err(sig) => Err(sig),
     };
-    pop_locals(sh);
+    // The argument frame is restored either way -- both references show `$#` back
+    // to the caller's inside an EXIT trap. The BINDINGS are not: a terminating
+    // unwind longjmps past dash's `poplocalvars`/`unwindlocalvars`, so the trap
+    // still sees the `local` and the temp binding of the function it died in.
+    (sh.getopts_optind, sh.getopts_off) = saved_getopts;
+    if result.as_ref().err().is_some_and(terminating) {
+        defer_locals(sh);
+        defer_vars(sh, saved_vars);
+    } else {
+        pop_locals(sh);
+        // Below `pop_locals`, so a `local` of the same name unwinds to the binding
+        // first and the frame then takes the binding away too.
+        restore_vars(sh, saved_vars);
+    }
     sh.locals = saved_locals;
     sh.params = saved_params;
-    (sh.getopts_optind, sh.getopts_off) = saved_getopts;
     sh.in_function = was_in_function;
     sh.loop_depth = saved_loop_depth;
     match result {
@@ -1411,6 +1528,157 @@ mod tests {
         for src in ["shift oops", "echo ${undefined_var:?bad}"] {
             let (_, out, _) = run_capturing_interactive_units(&[src, "echo st=$?"]);
             assert_eq!(out, "st=2\n", "{src}");
+        }
+    }
+
+    #[test]
+    fn a_functions_prefix_assignment_is_a_temp_frame() {
+        // Visible inside the call, gone after it -- including a mutation made
+        // through the binding, which is what makes it a FRAME and not just a
+        // save/restore of the value the caller supplied.
+        for (src, want) in [
+            ("f() { :; }; D=dd f; echo [${D-unset}]", "[unset]\n"),
+            ("f() { echo in=$D; }; D=dd f; echo out=[$D]", "in=dd\nout=[]\n"),
+            ("D=orig; f() { echo in=$D; }; D=dd f; echo out=$D", "in=dd\nout=orig\n"),
+            ("D=orig; f() { D=mut; }; D=dd f; echo out=$D", "out=orig\n"),
+            ("D=orig; f() { unset D; }; D=dd f; echo out=${D-UNSET}", "out=orig\n"),
+            // Exported for the call, as an external command's environment is.
+            ("f() { echo $D; }; D=dd f", "dd\n"),
+        ] {
+            let (_, out, _) = run(src);
+            assert_eq!(out, want, "{src}");
+        }
+        // The corpus's own temp-frame case, whose last line is the whole point:
+        // `local` unwinds to the binding, then the frame takes the binding away.
+        let (_, out, _) = run(
+            "x=global; f() { echo x=$x; x=mutated-temp; echo x=$x; local x=local; \
+             echo x=$x; unset x; echo x=$x; }; x=temp-binding f; echo x=$x",
+        );
+        assert_eq!(out, "x=temp-binding\nx=mutated-temp\nx=local\nx=\nx=global\n");
+        // A non-function command word is unaffected: still transient for a regular
+        // builtin, still persistent for a special one.
+        let (_, out, _) = run("D=dd echo hi; echo out=[$D]");
+        assert_eq!(out, "hi\nout=[]\n");
+        let (_, out, _) = run("D=dd export E=1; echo out=[$D]");
+        assert_eq!(out, "out=[dd]\n");
+    }
+
+    #[test]
+    fn a_terminating_unwind_leaves_the_frame_for_the_exit_trap() {
+        // dash longjmps past `poplocalvars`/`unwindlocalvars`, so the trap runs in
+        // the frame the shell died in and sees its bindings. Every value here was
+        // read off the td-built busybox ash.
+        for (src, want) in [
+            ("D=g; trap 'echo t=$D' EXIT; f() { D=body; exit 7; }; D=dd f", "t=body\n"),
+            ("D=g; trap 'echo t=$D' EXIT; f() { exit 7; }; D=dd f", "t=dd\n"),
+            ("D=g; trap 'echo t=$D' EXIT; f() { echo ${u:?bad}; }; D=dd f", "t=dd\n"),
+            ("D=g; trap 'echo t=$D' EXIT; set -e; f() { false; }; D=dd f", "t=dd\n"),
+            // `local` is the same rule, and it applied to `local` first.
+            ("D=g; trap 'echo t=$D' EXIT; f() { local D=loc; exit 4; }; f", "t=loc\n"),
+            ("D=g; trap 'echo t=$D' EXIT; g() { D=in; exit 5; }; f() { D=mid g; }; D=out f",
+             "t=in\n"),
+            // A frame only half applied when a readonly name rejected the next
+            // assignment stays too -- the error is a terminating unwind as well.
+            ("D=g; readonly R=r; trap 'echo t=$D' EXIT; f() { :; }; D=dd R=no f", "t=dd\n"),
+            // A regular builtin's frame follows the same rule -- it is `evalcommand`
+            // that skips the cleanup, not anything about functions.
+            ("D=g; trap 'echo t=$D' EXIT; D=dd command exit 7", "t=dd\n"),
+            ("D=g; readonly R=r; trap 'echo t=$D' EXIT; D=dd R=no true", "t=dd\n"),
+            ("D=g; trap 'echo t=$D' EXIT; D=dd Y=${u:?bad} true", "t=dd\n"),
+            // Not terminating: `return` unwinds normally and undoes the frame.
+            ("D=g; trap 'echo t=$D' EXIT; f() { D=body; return 3; }; D=dd f", "t=g\n"),
+            ("D=g; trap 'echo t=$D' EXIT; f() { local D=loc; }; f", "t=g\n"),
+            // Nor is a failed redirection, which reports rather than raises; nor
+            // `set -e` on a builtin, which fires after the frame is already gone.
+            ("D=g; trap 'echo t=$D' EXIT; D=dd true >/nonexistent/d/f", "t=g\n"),
+            ("D=g; trap 'echo t=$D' EXIT; set -e; D=dd false", "t=g\n"),
+            // `command` wraps a builtin in a scratch `local` frame, which is a
+            // frame like any other and stays standing on the way out.
+            (
+                "D=global; trap \"echo t=\\$D\" EXIT; \
+                 f() { local D=f; command eval 'local D=scratch; exit 7'; }; f",
+                "t=scratch\n",
+            ),
+        ] {
+            let (_, out, _) = run(src);
+            assert_eq!(out, want, "{src}");
+        }
+        // The argument frame is NOT deferred with the bindings: both references
+        // show the caller's `$#` inside the trap.
+        let (_, out, _) = run("trap 'echo [$1] $#' EXIT; f() { exit 3; }; f AA BB");
+        assert_eq!(out, "[] 0\n");
+        // The hidden `getopts` cursor travels with the argument frame, so the trap
+        // resumes the CALLER's scan: `f` consumed two of its own three options, the
+        // caller one of its two, and the trap picks up the caller's second.
+        let (_, out, _) = run(
+            "set -- -a -b; getopts ab o; f() { getopts ab i; getopts ab i; exit 7; }; \
+             trap 'getopts ab o2; echo t=[$o2],$OPTIND' EXIT; f -a -b -a",
+        );
+        assert_eq!(out, "t=[b],3\n");
+        // ...and an interactive shell that RECOVERS drops what was left standing,
+        // rather than carrying it into the next command.
+        for (bad, want) in [
+            ("D=g; f() { echo ${u:?bad}; }; D=dd f", "after=g\n"),
+            // The half-applied frame of the error path, which only a recovering
+            // shell can observe -- a script dies with the binding still standing.
+            ("D=g; readonly R=r; f() { :; }; D=dd R=no f", "after=g\n"),
+            ("D=g; f() { local D=loc; echo ${u:?bad}; }; f", "after=g\n"),
+            ("D=g; readonly R=r; D=dd R=no true", "after=g\n"),
+            ("D=g; D=dd Y=${u:?bad} true", "after=g\n"),
+        ] {
+            let (_, out, _) =
+                crate::process::run_capturing_interactive_units(&[bad, "echo after=$D"]);
+            assert_eq!(out, want, "{bad}");
+        }
+    }
+
+    #[test]
+    fn a_recovery_undoes_only_what_it_deferred() {
+        // A swallowed abort undoes the frames of the command that recovered, and
+        // stops there: an OUTER unwind is still on its way out and its bindings
+        // belong to the EXIT trap. Both values read off the td-built busybox ash.
+        let (_, out, _) = run(
+            "D=global; g() { local D=g; echo ${u:?bad}; }; \
+             f() { local D=f; command eval 'local D=scratch; g'; echo after=$D; }; f",
+        );
+        assert_eq!(out, "after=f\n");
+        // The mark: `f` died with `local D=f` standing, then the EXIT trap
+        // recovered from an abort inside `g`. Only `g`'s frame may go.
+        let (_, out, _) = run(
+            "D=g; X=x; trap 'command eval \"g\"; echo after=$D,$X' EXIT; \
+             g() { local X=gtrap; echo ${u:?bad}; }; f() { local D=f; exit 7; }; f",
+        );
+        assert_eq!(out, "after=f,x\n");
+    }
+
+    #[test]
+    fn restoring_optind_moves_the_hidden_cursor_with_it() {
+        // dash calls a variable's hook on the RESTORE too, so a frame that
+        // displaced OPTIND puts the scan cursor back as well. Without it the
+        // variable reads right and `getopts` still rescans the word the frame
+        // pointed at -- which in a loop never advances.
+        for src in [
+            "set -- -a -b; getopts ab o; f() { :; }; OPTIND=1 f; getopts ab o",
+            "set -- -a -b; getopts ab o; OPTIND=1 true; getopts ab o",
+            "set -- -a -b; getopts ab o; f() { local OPTIND=1; }; f; getopts ab o",
+        ] {
+            let (_, out, _) = run(&format!("{src}; echo $o,$OPTIND"));
+            assert_eq!(out, "b,3\n", "{src}");
+        }
+        // A half-consumed word is abandoned by the restore, as by any assignment.
+        let (_, out, _) =
+            run("set -- -ab; getopts ab o; f() { :; }; OPTIND=1 f; getopts ab o; echo $o,$OPTIND");
+        assert_eq!(out, "?,2\n");
+        // Restoring a name that did NOT exist is an unset, and ash fires the hook
+        // for that too -- restarting at word 1 rather than parking the error a
+        // non-numeric ASSIGNMENT parks. Only a temp value above 1 can tell the two
+        // apart, which is why these use 2.
+        for src in [
+            "unset OPTIND; set -- -a -b; f() { :; }; OPTIND=2 f; getopts ab o",
+            "unset OPTIND; set -- -a -b; OPTIND=2 true; getopts ab o",
+        ] {
+            let (_, out, _) = run(&format!("{src}; echo $o"));
+            assert_eq!(out, "a\n", "{src}");
         }
     }
 

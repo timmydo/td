@@ -149,6 +149,26 @@ fn large_output_case_is_captured_without_deadlock() -> Result<(), Box<dyn std::e
     Ok(())
 }
 
+/// A function's prefix assignment is EXPORTED for the duration of the call, as an
+/// external command's environment would be. Only a real child can observe that,
+/// and the in-process unit-test harness captures stdout in a buffer no child can
+/// write to — so this spawns the built shell and lets it run ITSELF as the child,
+/// which is the one external a target-side gate can count on.
+#[test]
+fn a_functions_temp_binding_is_exported_to_a_child() -> Result<(), Box<dyn std::error::Error>> {
+    let shell = PathBuf::from(env!("CARGO_BIN_EXE_td-sh"));
+    // The path travels in the environment rather than in the script text, so a
+    // build directory containing a quote or a space cannot break the case.
+    let out = std::process::Command::new(&shell)
+        .arg("-c")
+        .arg("f() { \"$TD_SH_BIN\" -c 'echo got=[$TD_SH_TEMP]'; }; TD_SH_TEMP=dd f; f")
+        .env("TD_SH_BIN", &shell)
+        .env_remove("TD_SH_TEMP")
+        .output()?;
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "got=[dd]\ngot=[]\n");
+    Ok(())
+}
+
 /// A case that redirects into a relative filename must not touch the gate's
 /// working tree: `run_case` isolates each case in a throwaway temp working
 /// directory. Corpus cases like `var-num.test.sh::$0 with filename` do exactly

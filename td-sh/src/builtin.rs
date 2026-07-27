@@ -2402,9 +2402,21 @@ fn command(sh: &mut Shell, argv: &[String]) -> R<()> {
         // `command local s=1` leaves `s` as it was while a bare `local s=1` does
         // not. Wrapping every builtin is a no-op by construction: declaring into a
         // frame is what `local` is, so nothing else can observe one.
+        let mark = sh.pending_unwind.len();
         let saved = std::mem::take(&mut sh.locals);
         let result = run(sh, bi, &rest);
-        exec::pop_locals(sh);
+        if result.as_ref().err().is_some_and(exec::terminating) {
+            // The scratch frame follows what it wraps: on the way out it stays
+            // standing for the EXIT trap, like any other frame.
+            exec::defer_locals(sh);
+        } else {
+            // Defence only: no program reaches here with anything pending, since
+            // every recovery below already drains to its own mark. If one ever
+            // does, these are NEWER than the scratch frame and must come off
+            // first, or the frame's saved values are stale.
+            exec::unwind_pending_to(sh, mark);
+            exec::pop_locals(sh);
+        }
         sh.locals = saved;
         return result;
     }

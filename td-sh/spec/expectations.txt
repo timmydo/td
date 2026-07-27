@@ -258,8 +258,6 @@ xfail assign.test.sh::Env value with escaped <
 xfail assign.test.sh::Env value with two quotes
 xfail assign.test.sh::Escaped = in command name
 xfail assign.test.sh::Multiple temporary envs on the stack
-xfail assign.test.sh::Reveal existence of "temp frame" (All shells disagree here!!!)
-xfail assign.test.sh::Test above without 'local' (which is not POSIX)
 xfail assign.test.sh::declare -A dict does not remove existing arrays (OSH regression)
 xfail assign.test.sh::declare -a arr does not remove existing arrays (OSH regression)
 xfail assign.test.sh::export a=1 no_value c=2
@@ -618,7 +616,6 @@ xfail builtin-special.test.sh::Special builtins can't be redefined as shell func
 xfail builtin-special.test.sh::Which shells allow special builtins to be redefined?
 xfail builtin-special.test.sh::bash 'type' gets confused - says 'function', but runs builtin
 xfail builtin-special.test.sh::command, builtin - both can be redefined, not special (regression)
-xfail builtin-special.test.sh::true is not special; prefix assignments don't persist, it can be redefined
 xfail builtin-times.test.sh::times shows two formatted lines
 xfail builtin-trap-bash.test.sh::Combine DEBUG trap and ERR trap
 xfail builtin-trap-bash.test.sh::Combine DEBUG trap and USR1 trap
