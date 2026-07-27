@@ -1196,14 +1196,26 @@ fn parse_status(sh: &mut Shell, s: &str) -> R<i32> {
     }
 }
 
+/// busybox ash's `is_number`: every character a digit, so a sign or a space
+/// disqualifies. dash's `atomax10` takes `+1` and surrounding blanks; the chain
+/// puts ash first, so the stricter reading wins.
+fn is_all_digits(s: &str) -> bool {
+    !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit())
+}
+
 fn loop_ctl(sh: &mut Shell, argv: &[String], is_break: bool) -> R<()> {
     let n = match argv.get(1) {
-        Some(s) => match s.parse::<u32>() {
-            Ok(0) | Err(_) => {
-                err_line(sh, &format!("td-sh: {}: bad loop count", argv.get(1).map(String::as_str).unwrap_or("")));
-                return status(sh, 2);
+        // Fatal, not reported-and-resumed: the one thing that would end the loop is
+        // what just failed, so returning left it spinning. Deliberately not
+        // `special_usage_error` -- its interactive branch returns Ok, which resumes
+        // that loop, and td-sh has no abort-the-command signal to use instead.
+        Some(s) => match s.parse::<u32>().ok().filter(|n| *n > 0 && is_all_digits(s)) {
+            Some(n) => n,
+            None => {
+                let cmd = argv.first().map(String::as_str).unwrap_or("break");
+                err_line(sh, &format!("{cmd}: {s}: bad loop count"));
+                return Err(Sig::Exit(2));
             }
-            Ok(n) => n,
         },
         None => 1,
     };
@@ -1221,15 +1233,19 @@ fn loop_ctl(sh: &mut Shell, argv: &[String], is_break: bool) -> R<()> {
 
 fn shift(sh: &mut Shell, argv: &[String]) -> R<()> {
     let n = match argv.get(1) {
-        Some(s) => match s.parse::<usize>() {
-            Ok(n) => n,
-            Err(_) => {
-                err_line(sh, &format!("shift: {s}: numeric argument required"));
-                return status(sh, 2);
+        // Fatal like `break`'s, but nothing here can loop, so it takes the usual
+        // interactive exemption.
+        Some(s) => match s.parse::<usize>().ok().filter(|_| is_all_digits(s)) {
+            Some(n) => n,
+            None => {
+                return special_usage_error(sh, &format!("shift: {s}: numeric argument required"))
             }
         },
         None => 1,
     };
+    // NOT fatal, unlike the bad-operand case above: busybox ash just `return 1`s
+    // when the count overruns the parameters, and builtin-special.test.sh pins
+    // ash's behaviour (`## N-I …ash`) over dash's abort.
     if n > sh.params.len() {
         err_line(sh, "shift: shift count out of range");
         return status(sh, 1);
@@ -2858,13 +2874,39 @@ mod tests {
 
     #[test]
     fn set_and_shift_errors_do_not_end_the_script() {
-        // Deliberate: busybox ash does NOT apply POSIX 2.8.1 here, and
-        // builtin-special.test.sh pins that for both (`## N-I …ash`). Keep them
-        // non-fatal even though dash aborts.
+        // Deliberate: busybox ash does NOT apply POSIX 2.8.1 to a bad `set` option
+        // or a `shift` that overruns the parameters (`shiftcmd` just `return 1`s),
+        // and builtin-special.test.sh pins that for both (`## N-I …ash`). Keep them
+        // non-fatal even though dash aborts. A non-NUMERIC operand is a different
+        // case and IS fatal in both -- see the test below.
         let (_, out, _) = run_capturing("set -q; echo reached");
         assert_eq!(out, "reached\n");
         let (_, out, _) = run_capturing("set -- a; shift 3; echo reached");
         assert_eq!(out, "reached\n");
+    }
+
+    #[test]
+    fn a_bad_loop_count_is_fatal_so_the_loop_cannot_spin() {
+        // Bounded loops on purpose: if the fatality is ever lost, this fails on the
+        // output it collected instead of hanging the gate.
+        let (status, out, err) =
+            run_capturing("for i in 1 2 3; do echo hi; break oops; done; echo AFTER");
+        assert_eq!((status, out.as_str()), (2, "hi\n"));
+        assert!(err.contains("break: oops"), "{err:?}");
+        let (status, out, err) =
+            run_capturing("for i in 1 2 3; do echo hi; continue oops; done; echo AFTER");
+        assert_eq!((status, out.as_str()), (2, "hi\n"));
+        assert!(err.contains("continue: oops"), "{err:?}");
+        // `is_all_digits` is busybox's rule, so a sign disqualifies either way even
+        // though dash's `atomax10` accepts `+1`.
+        for bad in ["0", "-1", "+1", "1x", "''", "' 1'"] {
+            let (status, _, _) = run_capturing(&format!("for i in 1 2; do break {bad}; done"));
+            assert_eq!(status, 2, "break {bad}");
+        }
+        // Same rule for `shift`, but via the interactive-preserving route.
+        let (status, out, err) = run_capturing("shift oops; echo AFTER");
+        assert_eq!((status, out.as_str()), (2, ""));
+        assert!(err.contains("shift: oops"), "{err:?}");
     }
 
     #[test]

@@ -1693,7 +1693,6 @@ skip introspect.test.sh::Locations when sourcing
 skip introspect.test.sh::Locations with temp frame
 skip introspect.test.sh::Sourcing inside function grows the debug stack
 skip introspect.test.sh::operators on FUNCNAME
-skip loop.test.sh::bad arg to break
 skip loop.test.sh::break/continue within source
 skip loop.test.sh::while in pipe
 skip nameref.test.sh::Unquoted assoc reference on RHS
