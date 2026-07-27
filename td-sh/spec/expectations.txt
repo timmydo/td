@@ -285,9 +285,6 @@ xfail background.test.sh::wait with invalid PID
 xfail background.test.sh::wait with invalid arg
 xfail background.test.sh::wait with jobspec syntax %nonexistent
 xfail ble-features.test.sh::[bash_unset] function call with tempenv vs tempenv-eval
-xfail ble-features.test.sh::[bash_unset] local-unset / dynamic-unset for localvar
-xfail ble-features.test.sh::[bash_unset] local-unset / dynamic-unset for localvar (mutated from tempenv)
-xfail ble-features.test.sh::[bash_unset] local-unset / dynamic-unset for tempenv
 xfail ble-features.test.sh::[bash_unset] localvar-inherit from tempenv
 xfail ble-idioms.test.sh::Issue #1069 [40] BUG: a=(declare v); "${a[@]}" fails
 xfail ble-idioms.test.sh::Issue #1069 [40] BUG: a=declare; "$a" v=1 fails
@@ -301,11 +298,6 @@ xfail ble-idioms.test.sh::recursive arith: short circuit &&, ||
 xfail ble-idioms.test.sh::recursive arith: short circuit ?:
 xfail ble-idioms.test.sh::recursive arith: side effects
 xfail ble-idioms.test.sh::shopt -u expand_aliases and eval
-xfail ble-unset.test.sh::[bash_unset] dynamic-unset for nested localvars
-xfail ble-unset.test.sh::[bash_unset] dynamic-unset for nested tempenvs
-xfail ble-unset.test.sh::[bash_unset] local-unset / dynamic-unset for localvar on nested-context
-xfail ble-unset.test.sh::[bash_unset] local-unset for nested tempenvs
-xfail ble-unset.test.sh::[bash_unset] nested context by tempenv-eval
 xfail blog-other1.test.sh::Blog Post Example
 xfail blog-other1.test.sh::Blog Post Example Fix
 xfail blog-other1.test.sh::Rewrite of Blog Post Example
@@ -1270,7 +1262,6 @@ xfail shell-grammar.test.sh::case item without ;; is not allowed
 xfail shell-grammar.test.sh::case: Using ; instead of ;;
 xfail spec-harness-bug.test.sh::osh-native duplicates stdin - is this a test harness issue?
 xfail strict-options.test.sh::Control flow must be static in YSH (strict_control_flow)
-xfail strict-options.test.sh::shopt -s strict_control_flow
 xfail strict-options.test.sh::strict_parse_slice means you need explicit  length
 xfail subshell.test.sh::Subshell with redirects
 xfail tilde.test.sh::${undef:-~}
@@ -1456,7 +1447,6 @@ xfail word-split.test.sh::4 x 3 table - with for loop
 xfail word-split.test.sh::IFS='' with $@ and $* and printf (bug #627)
 xfail word-split.test.sh::Regression: "${!v*}"x should not be split
 xfail word-split.test.sh::Unicode in IFS
-xfail xtrace.test.sh::PS4 is scoped
 xfail xtrace.test.sh::PS4 with runtime error
 xfail xtrace.test.sh::PS4 with unterminated $(
 xfail xtrace.test.sh::PS4 with unterminated ${
@@ -1469,7 +1459,6 @@ xfail xtrace.test.sh::xtrace with newlines
 xfail xtrace.test.sh::xtrace with tabs
 xfail xtrace.test.sh::xtrace with unicode chars
 xfail xtrace.test.sh::xtrace with unprintable chars
-xfail xtrace.test.sh::xtrace with variables in PS4
 xfail zsh-assoc.test.sh::TODO: SETUP should be shared
 xfail zsh-assoc.test.sh::get length
 xfail zsh-assoc.test.sh::iterate over both keys and values

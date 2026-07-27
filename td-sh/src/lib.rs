@@ -13,11 +13,14 @@
 //! ```text
 //!   #### <description>          begins a case
 //!   ## <key>: <value>           a single-line assertion/metadata on the case
-//!   ## STDOUT:  ...  ## END      a multiline expected-stdout block (verbatim)
-//!   ## STDERR:  ...  ## END      a multiline expected-stderr block (verbatim)
+//!   ## STDOUT:  ...  ## END      a multiline expected-stdout block
+//!   ## STDERR:  ...  ## END      a multiline expected-stderr block
 //!                                 (END is optional/lenient, per Oils: the block
 //!                                 also ends at the next `##`/`####` or EOF, and
-//!                                 `## END:` with trailing text still terminates)
+//!                                 `## END:` with trailing text still terminates.
+//!                                 A `#` line inside a block is a COMMENT, so the
+//!                                 format cannot express expected output whose
+//!                                 first non-blank character is `#`)
 //!   ## <QUAL> <shells> <k>: v    a per-shell override (QUAL ∈ OK|OK-N|BUG|BUG-N|N-I)
 //!   ## <QUAL> <shells> STDOUT:   a per-shell multiline override; shells `/`-separated
 //!   #  (single hash) / blank      an ignored comment (also a no-op shell comment)
@@ -193,11 +196,18 @@ fn is_end_marker(line: &str) -> bool {
     }
 }
 
-/// Collect a `## STDOUT:`/`## STDERR:` block body verbatim (each line plus a
-/// trailing '\n'). The body runs to an explicit `## END` (consumed), OR — since
-/// Oils makes the END token optional — to the next `##` annotation / `####` case
-/// (NOT consumed, so the caller re-reads it) / EOF. Returns the body and the
-/// index at which the caller should resume.
+/// Collect a `## STDOUT:`/`## STDERR:` block body (each kept line plus a trailing
+/// '\n'). The body runs to an explicit `## END` (consumed), OR — since Oils makes
+/// the END token optional — to the next `##` annotation / `####` case (NOT
+/// consumed, so the caller re-reads it) / EOF. Returns the body and the index at
+/// which the caller should resume.
+///
+/// A line whose first non-blank character is `#` is a COMMENT on the expectation,
+/// not expected output — Oils' `_ClassifyLine` drops it with
+/// `line.lstrip().startswith('#')`, so this must too or the goldens it wrote read
+/// differently here. A block therefore cannot express output starting with `#`;
+/// the goldens that need to (`## stdout: ##`) use the single-line form, which
+/// never reaches this function.
 fn read_block(lines: &[&str], start: usize) -> (String, usize) {
     let mut body = String::new();
     let mut j = start;
@@ -206,9 +216,13 @@ fn read_block(lines: &[&str], start: usize) -> (String, usize) {
             return (body, j + 1);
         }
         // Optional-END: a new token (annotation or case header) ends the block
-        // without being consumed. A single-`#` line is shell-comment/plain body.
+        // without being consumed.
         if l.starts_with("##") || l.starts_with("####") {
             return (body, j);
+        }
+        if l.trim_start().starts_with('#') {
+            j += 1;
+            continue;
         }
         body.push_str(l);
         body.push('\n');
@@ -313,9 +327,10 @@ pub fn parse_spec(input: &str) -> Result<Vec<SpecCase>, SpecError> {
         }
 
         // A code line — verbatim, preserving indentation (here-docs depend on it).
-        // A single-`#` line is NOT special-cased: it is a shell comment (a no-op)
-        // AND a possible here-doc/quoted-string body line (e.g. `#!/bin/sh`), so it
-        // must reach the shell verbatim — the same treatment Oils gives it. Only
+        // A `#` line is NOT dropped here, and this is a DELIBERATE divergence: Oils
+        // strips it from code as well as from goldens, but a here-doc or quoted body
+        // line (`#!/bin/sh`) is code too, and truncating one corrupts the case. It
+        // costs the one golden that counts stripped lines; see `read_block`. Only
         // collect code BEFORE a case's first annotation: the lines after the
         // annotations (blank separators before the next `####`) are not code.
         if let Some(c) = cur.as_mut() {
@@ -1036,6 +1051,13 @@ echo real-line
         let cases = parse_spec(spec)?;
         let c = cases.first().ok_or_else(|| SpecError::new(0, "missing case"))?;
         assert_eq!(c.code, "cat <<'EOF2'\n#!/bin/sh\necho real-line\nEOF2");
+        // The GOLDEN cannot say the same thing: a block drops its `#` line, so this
+        // case is unmatchable in block form. Asserted so the limitation is visible
+        // rather than lurking in a fixture -- a real one would use `stdout-json:`.
+        assert_eq!(
+            resolve(c, ASH_DASH_CHAIN)?.stdout.as_deref(),
+            Some("echo real-line\n")
+        );
         Ok(())
     }
 
@@ -1074,6 +1096,31 @@ echo real-line
         assert_eq!(resolve(c, ASH_DASH_CHAIN)?.stdout.as_deref(), Some(""));
         // A chain without dash falls back to the default block.
         assert_eq!(resolve(c, &["mksh"])?.stdout.as_deref(), Some("ideal\n"));
+        Ok(())
+    }
+
+    #[test]
+    fn block_comment_lines_are_not_expected_output() -> Result<(), SpecError> {
+        // A `#` line inside an expectation block annotates the golden; Oils
+        // writes these by running the shells, so treating one as output makes
+        // the case unmatchable by any of them.
+        let spec = "#### x\necho hi\n## STDOUT:\n# a note about dash\nhi\n## END\n";
+        let c = parse_spec(spec)?;
+        let c = c.first().ok_or_else(|| SpecError::new(0, "missing case"))?;
+        assert_eq!(resolve(c, ASH_DASH_CHAIN)?.stdout.as_deref(), Some("hi\n"));
+
+        // Indented too, as Oils' `line.lstrip().startswith('#')` does. The format
+        // therefore cannot express expected output beginning with `#`.
+        let indented = parse_spec("#### y\nx\n## STDOUT:\n  # note\nhi\n## END\n")?;
+        let c = indented.first().ok_or_else(|| SpecError::new(0, "missing case"))?;
+        assert_eq!(resolve(c, ASH_DASH_CHAIN)?.stdout.as_deref(), Some("hi\n"));
+
+        // The corpus closes two blocks with a mistyped `# END`, which this rule
+        // absorbs -- the following annotation is what actually ends the block.
+        let typo = parse_spec("#### z\nx\n## STDOUT:\nhi\n# END\n## status: 0\n")?;
+        let c = typo.first().ok_or_else(|| SpecError::new(0, "missing case"))?;
+        let e = resolve(c, ASH_DASH_CHAIN)?;
+        assert_eq!((e.stdout.as_deref(), e.status), (Some("hi\n"), 0));
         Ok(())
     }
 
