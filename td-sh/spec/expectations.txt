@@ -469,7 +469,6 @@ xfail builtin-dirs.test.sh::dirs to print using tilde-prefix format
 xfail builtin-dirs.test.sh::popd returns error on empty directory stack
 xfail builtin-dirs.test.sh::popd usage error
 xfail builtin-dirs.test.sh::pushd usage
-xfail builtin-echo.test.sh::\0
 xfail builtin-echo.test.sh::\0 \1 \8
 xfail builtin-echo.test.sh::\0377 is the highest octal byte
 xfail builtin-echo.test.sh::\0400 is one more than the highest octal byte
@@ -477,17 +476,11 @@ xfail builtin-echo.test.sh::\0777 is out of range
 xfail builtin-echo.test.sh::\c stops processing input
 xfail builtin-echo.test.sh::\u6
 xfail builtin-echo.test.sh::\x
-xfail builtin-echo.test.sh::echo -e backslashes
 xfail builtin-echo.test.sh::echo -e line continuation
 xfail builtin-echo.test.sh::echo -e with 4 digit unicode escape
 xfail builtin-echo.test.sh::echo -e with 8 digit unicode escape
-xfail builtin-echo.test.sh::echo -e with C escapes
 xfail builtin-echo.test.sh::echo -e with embedded newline
 xfail builtin-echo.test.sh::echo -e with octal escape
-xfail builtin-echo.test.sh::echo -e with whitespace C escapes
-xfail builtin-echo.test.sh::echo -en
-xfail builtin-echo.test.sh::echo -ez (invalid flag)
-xfail builtin-echo.test.sh::echo backslashes
 xfail builtin-echo.test.sh::echo to redirected directory is an error
 xfail builtin-echo.test.sh::incomplete hex escape
 xfail builtin-echo.test.sh::incomplete octal escape
@@ -752,7 +745,6 @@ xfail command-sub.test.sh::Double Quotes in Command Sub in Double Quotes
 xfail command-sub.test.sh::Escaped quote in [[ ]]
 xfail command-sub.test.sh::Here doc with pipeline
 xfail command-sub.test.sh::Making keyword out of command sub should NOT work
-xfail command-sub.test.sh::More levels of double quotes in backticks
 xfail command-sub.test.sh::Nested backticks
 xfail command-sub.test.sh::case in subshell
 xfail command_.test.sh::$PATH lookup
@@ -1116,12 +1108,8 @@ xfail prompt.test.sh::username
 xfail quote.test.sh::$'' octal escapes don't have leading 0
 xfail quote.test.sh::$'' octal escapes with fewer than 3 chars
 xfail quote.test.sh::$'' supports \cA escape for Ctrl-A - mask with 0x1f
-xfail quote.test.sh::$'' with newlines
 xfail quote.test.sh::$? split over multiple lines
-xfail quote.test.sh::C-style backslash escapes inside double quoted string
-xfail quote.test.sh::No tab escapes within single quotes
 xfail quote.test.sh::OSH allows invalid backslashes
-xfail quote.test.sh::Storing backslashes and then echoing them
 xfail quote.test.sh::YSH allows unquoted foo\ bar too
 xfail quote.test.sh::\c' is an escape, unlike bash
 xfail redir-order.test.sh::[[ + redirect order
@@ -1455,7 +1443,6 @@ xfail xtrace.test.sh::Regression: xtrace for "declare -a a+=(v)"
 xfail xtrace.test.sh::[[ ]]
 xfail xtrace.test.sh::set -o verbose prints unevaluated code
 xfail xtrace.test.sh::unset PS4
-xfail xtrace.test.sh::xtrace with newlines
 xfail xtrace.test.sh::xtrace with tabs
 xfail xtrace.test.sh::xtrace with unicode chars
 xfail xtrace.test.sh::xtrace with unprintable chars

@@ -159,30 +159,34 @@ fn err_line(sh: &mut Shell, msg: &str) {
 fn echo(sh: &mut Shell, argv: &[String]) -> R<()> {
     let mut i = 1usize;
     let mut newline = true;
-    // Only `-n` is honoured; dash's echo does not take `-e`/`-E`.
-    while let Some(arg) = argv.get(i) {
-        if arg == "-n" {
-            newline = false;
-            i += 1;
-        } else {
+    // ONE `-n`, as dash's `echocmd` tests it: a single `if`, so `echo -n -n`
+    // prints the second one. There is no `-e`/`-E` -- escapes are always live.
+    if argv.get(i).is_some_and(|a| a == "-n") {
+        newline = false;
+        i += 1;
+    }
+    // Bytes, not a String: an octal escape can name a byte that is not UTF-8.
+    let mut line: Vec<u8> = Vec::new();
+    let mut first = true;
+    let mut stopped = false;
+    for arg in argv.iter().skip(i) {
+        if !first {
+            line.push(b' ');
+        }
+        first = false;
+        // dash's echo runs every operand through the same escape converter `%b`
+        // uses (`conv_escape_str`), so this shares it too.
+        if process_b_escapes(arg, &mut line) {
+            // `\c` ends the output where it stands, newline included.
+            stopped = true;
             break;
         }
     }
-    let mut line = String::new();
-    let mut first = true;
-    while let Some(arg) = argv.get(i) {
-        if !first {
-            line.push(' ');
-        }
-        line.push_str(arg);
-        first = false;
-        i += 1;
-    }
-    if newline {
-        line.push('\n');
+    if newline && !stopped {
+        line.push(b'\n');
     }
     // `out` sets `$?` (0, or 1 on write error); do not overwrite it.
-    out(sh, line.as_bytes())
+    out(sh, &line)
 }
 
 /// POSIX `printf`: format directives with flags/width/precision (including `*`
@@ -993,9 +997,10 @@ fn format_escape(chars: &[char], at: usize, out: &mut Vec<u8>) -> usize {
     j + 1
 }
 
-// %b escapes (dash/ash): the C control escapes, `\\`, `\0ooo`/`\ooo` octal, and
-// `\c` which stops ALL output. `\x`/`\u` are left literal (matching dash/ash).
-// Returns true if `\c` was seen.
+// `%b` escapes (dash/ash), and `echo`'s: the C control escapes, `\\`,
+// `\0ooo`/`\ooo` octal, and `\c` which stops ALL output. `\x`/`\u` are left
+// literal (matching dash/ash). dash shares one converter between the two
+// (`conv_escape_str`) and so does this. Returns true if `\c` was seen.
 fn process_b_escapes(raw: &str, out: &mut Vec<u8>) -> bool {
     let chars: Vec<char> = raw.chars().collect();
     let mut i = 0usize;
@@ -2695,6 +2700,23 @@ mod tests {
     }
 
     #[test]
+    fn echo_always_expands_escapes_and_takes_one_dash_n() {
+        // dash's echo has no `-e`/`-E`: escapes are always live, so `-e` is an
+        // ordinary operand and prints.
+        assert_eq!(run_capturing(r#"echo "a\tb""#).1, "a\tb\n");
+        assert_eq!(run_capturing(r#"echo -e x"#).1, "-e x\n");
+        assert_eq!(run_capturing(r#"echo "\\\\""#).1, "\\\n");
+        // Octal, in both the `\0ooo` and bare `\ooo` forms.
+        assert_eq!(run_capturing(r#"echo "\0101\101""#).1, "AA\n");
+        // An escape it does not know keeps its backslash.
+        assert_eq!(run_capturing(r#"echo "\d\e""#).1, "\\d\\e\n");
+        // `\c` ends the output where it stands -- newline and later operands too.
+        assert_eq!(run_capturing(r#"echo "a\c" b; echo X"#).1, "aX\n");
+        // Only the FIRST `-n` is the flag, matching dash's single `if`.
+        assert_eq!(run_capturing("echo -n -n").1, "-n");
+    }
+
+    #[test]
     fn test_string_and_integer_comparisons() {
         assert_eq!(run_capturing("[ abc = abc ]; echo $?").1, "0\n");
         assert_eq!(run_capturing("[ abc = abd ]; echo $?").1, "1\n");
@@ -3377,8 +3399,12 @@ mod tests {
 
     #[test]
     fn read_takes_only_dashs_option_surface() {
-        // `-r` still works, clustered or not, and `--` ends the options.
-        assert_eq!(run_capturing("printf 'a\\\\b\\n' | { read -r v; echo \"[$v]\"; }").1, "[a\\b]\n");
+        // `-r` still works, clustered or not, and `--` ends the options. Printed
+        // with `printf %s`, not `echo`, which would eat the backslash this asserts.
+        assert_eq!(
+            run_capturing("printf 'a\\\\b\\n' | { read -r v; printf '[%s]\\n' \"$v\"; }").1,
+            "[a\\b]\n"
+        );
         // bash-only flags (and dash's own -t, which needs a timeout td-sh cannot
         // implement) are usage errors, not silently ignored.
         for bad in ["-n 1", "-N 1", "-d :", "-u 3", "-t 1", "-s", "-rn1"] {
