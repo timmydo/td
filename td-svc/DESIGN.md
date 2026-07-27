@@ -202,7 +202,7 @@ port, so it passes while the real listener is dead.
 | service on a real tty | `Stdio::from(File)` |
 | own process group | `CommandExt::process_group(0)` — **not for `tty=`**, see below |
 | signal a service | exec `/bin/kill -TERM -<pgid>` / `-KILL -<pgid>` |
-| liveness / membership | scan `/proc/*/stat` fields 5 (pgrp) and 6 (session) |
+| liveness / membership | scan `/proc/*/stat` fields 5 (pgrp), 6 (session), 7 (tty_nr), 3 (state) |
 | control channel | `std::os::unix::net::UnixListener` |
 | Ctrl-Alt-Del | write `/proc/sys/kernel/ctrl-alt-del` and `/proc/sys/kernel/cad_pid` |
 | identity across restart | `/proc/<pid>/stat` field 22 (starttime) |
@@ -249,22 +249,112 @@ group-or-session match would select every other service and the supervisor's
 own parent — a stop request for one unit tearing down the machine. So:
 
 - no `tty=` — the imposed process group, `pgid == pid` by construction;
-- `tty=` — the session it leads, once `/proc` shows it leading one; else
-  the group it leads, if it made one; else **the pid alone**.
+- `tty=` — **the leader together with the device the unit named**
+  (`Console { leader, tty }`); or, if that device cannot be resolved, the
+  session it leads, else the group it leads, else the pid alone.
 
-**The shipped greeter is the hard case, and it is not solved here.**
-`/etc/tty-session` is a `#!/bin/sh` wrapper that runs `getty`; the *shell*
-never `setsid`s or `setpgid`s — `getty` does, one level down. So the direct
-child td-svc holds leads neither a session nor a group, and its containment
-stays `Process(wrapper_pid)` for the process's whole life. That is the
-correct SAFE answer, and an insufficient one: stopping it TERMs one shell
-and leaves getty, login, and the user's shell running, while **I4**'s
-"containment empty" is then satisfied vacuously. Landing 3 must close this,
-and the two candidates are to follow the child's descendant into the session
-it creates, or to make the greeter unit something that `setsid`s in the
-direct child. Recorded here rather than left implicit, because the stop path
-would otherwise be built on a premise that does not hold for the one unit
-that matters most.
+**The terminal is what solved the shipped greeter, and the obvious answers
+did not.** `/etc/tty-session` is a `#!/bin/sh` wrapper that runs `getty`;
+the *shell* never `setsid`s or `setpgid`s — `getty` does, one level down,
+and unconditionally (`loginutils/getty.c`: "Create new session and pgrp,
+lose controlling tty"). So the direct child td-svc holds leads neither a
+session nor a group, and `login` and the user's shell are in a session
+td-svc never created and cannot name from the pid it spawned. Every
+containment keyed on that pid — `Process`, `Group`, `Session` alike —
+stops at the wrapper, TERMs one shell, and satisfies **I4**'s "containment
+empty" vacuously while the login tree runs on.
+
+Running the wrapper through `cttyhack` was the recorded plan and is the
+trap: it makes the wrapper a session leader, and getty leaves that session
+a moment later, so it buys a `Session` holding exactly the one process
+`Process` already held — at the cost of moving `setsid`/`TIOCSCTTY` onto
+the one boot path whose only verification is the daily oracle.
+
+What getty does not escape is the terminal. `setsid()` drops the
+controlling terminal, and getty immediately re-acquires the SAME one with
+`TIOCSCTTY(1)`, so getty and everything it goes on to exec carry that
+device in `/proc/<pid>/stat` field 7.
+
+**But the leader does not, and that is the trap.** td-svc opens the tty
+`O_NOCTTY` — deliberately, so the supervisor can never acquire a console
+by side effect — so the direct child inherits no controlling terminal and
+its own field 7 stays 0 for its whole life. Reading the device off the
+CHILD therefore yields 0, which matches nothing: a first draft did exactly
+that and the containment was inert, while its test fabricated a wrapper
+that already held the terminal and so passed. Verified against a real pty:
+the leader's field 7 is 0, and a `setsid`-ing grandchild holds the device.
+
+So the device is read from the descriptor `attach_tty` ACTUALLY opened, at
+spawn, and recorded on the service (the same 32-bit `new_encode_dev`
+packing field 7 uses). Not the unit's `tty=` re-resolved later: that path
+falls back to `/dev/console` when the configured terminal cannot be
+opened, so the name and the device diverge exactly when something is
+already wrong, and a containment built from the name would then signal a
+terminal held by somebody else. A unit whose spawn recorded NO device got
+no terminal at all, and is contained by its pid alone rather than by a
+device it does not hold. The containment carries the leader alongside it.
+Both halves are
+needed: the terminal alone misses the one process td-svc waits on, and the
+leader alone misses everything getty exec'd. It is also the one variant
+with two members, and the "never a union" rule still holds where it was
+aimed — that rule forbids group-OR-session because either half would name
+the supervisor, and neither half here can.
+
+Device `0` is never matched: it would select every daemon on the machine.
+`tty_device` will not build one, the scan will not match one, and because
+td-svc's own field 7 IS 0 the ordinary `contains_self` check catches it for
+the right reason rather than as a special case.
+
+### When a stop is finished
+
+**I4 is two conditions and the leader's exit is only one of them.** For the
+greeter it is the misleading one: the leader is a shell whose `getty` child
+holds the console, so it exits on TERM while the login tree runs on. A
+draft that marked the unit `Stopped` there cancelled the pending KILL and
+reported a stopped service with a live console.
+
+The containment a stop was issued against is therefore RECORDED, because
+once the leader is reaped its pid is gone and nothing could otherwise be
+asked. On the leader's exit that scope is re-scanned: empty means stopped;
+anything remaining keeps the unit stopping with its KILL still armed. An
+unreadable scan is not an empty one (**I3**) — `proven_empty` is the only
+reading that fails closed, and a ZOMBIE is not a member: it has already
+exited and holds nothing, but it keeps its pgrp and session, so counting
+one would make a stop wait on whoever gets round to reaping it.
+
+That re-scan cannot be driven by events alone. Survivors are not td-svc's
+children, so nothing wakes the loop when the last of them goes, and a unit
+whose containment outlived its leader would sit `stopping` for good — the
+KILL fires once and no later look ever confirms it worked. So a stop that
+finds its containment occupied schedules a **sweep**, and keeps scheduling
+one until the scope is empty. That timer is the only path from `stopping`
+to `Stopped` for anything that outlives its leader.
+
+Two things follow from the leader's pid stopping being ours the moment it
+is reaped. First, everything keyed on it must be dropped before the scope
+is used again: a `Process` scope names only the leader and is therefore
+provably empty, and `Console`'s leader half goes the same way, leaving the
+terminal. A group or session id STAYS — Linux keeps a pid number reserved
+while it is still in use as a pgid or sid, so it cannot name a different
+group while that group still has a member. Second, the KILL addresses the
+RECORDED scope rather than a freshly derived one. Deriving needs a live
+pid, so a re-derived target is `None` exactly when the leader is gone —
+which is the case the KILL exists for — and it can also be the wrong SET,
+narrowing a `tty=` unit whose device stopped resolving to the wrapper the
+TERM did not go to alone.
+
+A stop in flight is neither running nor stopped, and the phase deliberately
+does not move until it COMPLETES. That is right for **I4** and wrong for
+everyone reading it, so both readers consult the flag instead: `status`
+reports `stopping`, and `requires=` treats the unit as absent — a strict
+dependent must not start against a service that is being torn down.
+
+The initial TERM carries the same `(pid, starttime)` identity check as the
+delayed KILL, and for a sharper reason. A waiter may already have reaped
+the child while its `Exited` event sits in the channel, and the kernel can
+have handed the pid on; a `tty=` unit would then derive a containment from
+a STRANGER and signal everything on its terminal. It fails closed and
+signals nothing, which costs a stop that must be retried.
 
 The pre-`setsid` case is the sharp one. A `tty=` child is deliberately not
 grouped, so until it calls `setsid()` it inherits td-svc's process group
@@ -278,11 +368,16 @@ machine, which is worth a redundant comparison.
 
 The `/proc` read happens at **query** time, not at spawn. A read taken as
 `spawn` returns almost always precedes the child's `exec`, let alone its
-`setsid`, and would record td-svc's own ids.
+`setsid`, and would record td-svc's own ids. That is about the child's
+pgrp and session; the TERMINAL is the opposite case and is recorded at
+spawn, because it is read from td-svc's own open descriptor rather than
+from the child, and because what the child got is not recoverable later.
 
-Sequence per service, in reverse topological order: `TERM` the set, poll
-until **I4** is satisfied or `stop-timeout` elapses, `KILL` the set, poll
+Sequence per service, in reverse topological order: `TERM` the set, sweep
+until **I4** is satisfied or `stop-timeout` elapses, `KILL` the set, sweep
 again. Then close log handles, then `/etc/shutdown`, then the power applet.
+("Sweep" is the scheduled re-scan above, not a busy poll: the loop keeps
+serving events between them.)
 
 The `timeout=` path already uses the first half of that sequence, and must
 use both: a `TERM` alone leaks a process that ignores it, and its waiter
@@ -428,7 +523,78 @@ immediate EOF, exited, and turned a missing device into a restart spin.
 
 `/run/td-svc/control`, a `UnixListener` inside a `0700` directory created
 *before* bind. Newline-delimited commands: `status`, `start|stop|restart
-NAME`, `reload`, `reboot|poweroff|halt`.
+NAME` (landed), `reload`, `reboot|poweroff|halt` (with shutdown).
+
+The directory carries the protection, not the socket: a path that cannot be
+traversed cannot be connected to whatever the socket's own bits say. It is
+created AT `0700` by `mkdir(2)` rather than created and then narrowed —
+`create_dir_all` uses `0777 & ~umask`, and td-svc inherits PID 1's umask,
+which PID 1 never sets, so a create-then-narrow leaves a window in which
+anything can open a descriptor and keep traversal rights forever after.
+umask can only remove bits from the mode `mkdir` is given, so `0700` is a
+ceiling as well as a floor. A directory that already exists was not created
+here, so it is adopted only if this process owns it; narrowing does not
+revoke a descriptor somebody already holds.
+
+A socket left by a supervisor that DIED is unlinked — PID 1 respawns
+td-svc, so finding one is the ordinary case after a crash, and `bind` fails
+with `EADDRINUSE` on an existing path whether or not anyone is listening.
+But unlinking unconditionally is worse than refusing: `0700` keeps out
+other USERS, not a second root td-svc, so a second instance would make the
+first unreachable while both went on supervising and every later `stop`
+addressed the wrong one. Connecting is the test, because it is the same
+question a client asks — refused means a corpse, accepted means an owner.
+
+One thread serves connections one at a time; a request crosses to the main
+loop as a message and the reply crosses back the same way, so nothing
+outside the loop touches a `Service` and there is still no lock (§5).
+Serving serially is what makes the bounds load-bearing rather than tidy.
+The READ is bounded in time and length, so a client that connects and never
+finishes a request cannot hold the thread or grow a buffer inside PID 1's
+only supervisor. The WRITE is bounded for the same reason at the other end
+of the exchange: a client that asks and then stops reading would otherwise
+block `write_all` once the reply outgrew the socket buffer. The client's
+own wait is bounded too. An operator reaching for this socket is usually
+doing so BECAUSE something is wrong, and a control tool that hangs then is
+the least useful thing it could do.
+
+Each bound is pinned by a test that can tell it apart from the others,
+which is harder than it sounds: a client that half-closes is refused by the
+incomplete-request check without the timeout or the length cap ever
+running, so a test written that way passes with either of them deleted.
+
+A requested stop is not a failure. `Phase::Stopped` is distinct from
+`Failed` precisely so the restart policy cannot see it: a `restart=always`
+daemon that an operator stopped has to stay stopped, or `stop` is a no-op
+with extra steps. It still SETTLES, so a dependent waiting on it proceeds
+rather than hanging on a decision that has already been made. Only an
+explicit `start` leaves that phase, and both `start` and `restart` clear
+the failure count — an operator asking again is plainly trying to interrupt
+a backoff, and serving it out anyway would make the verb useless exactly
+when it is most wanted.
+
+`stop` does not WAIT. The TERM goes out, the KILL is scheduled at
+`stop-timeout` through the same `kill_at` the `timeout=` path uses, and the
+phase changes only when the stop COMPLETES in the sense **I4** means it —
+see §4, "When a stop is finished". Replying "stopped" before that would
+claim a death that has not happened, so the reply says what was sent.
+
+Nothing is recorded unless the signal actually went out. An earlier draft
+set `stopping` and armed the KILL before knowing whether the containment
+could be derived or would be refused, so a stop that signalled nothing
+still replied without an `error:` prefix and the client exited 0.
+
+`Stopped` settles for `after=`, which asks whether a decision has been
+reached, and an operator's stop is one. It does NOT satisfy `requires=`,
+which asks whether the dependency is THERE — a service someone stopped is
+exactly as absent as one that failed. `Held` was added to that test with
+the same argument.
+
+A `start` cannot rescue a unit the PLAN dropped. `start_eligible` walks the
+resolved order, and a unit in a dependency cycle is not in it, so setting it
+`Down` would reply "starting" and leave it there forever; it answers with
+the reason instead. §3 assigns cycle recovery to this socket, and that
+remains unbuilt — it needs a `reload`, which lands with shutdown.
 
 `reload` is transactional: on any diagnostic the last-known-good table is
 kept rather than applying the valid fragments.
@@ -526,10 +692,17 @@ started before `/proc` exists comes up unable to signal a group at all.
 `sysinit` runs to completion before any `respawn` line, so that ordering is
 the guarantee.
 
-The control socket, ordered shutdown, Ctrl-Alt-Del arming, and log capture
-land subsequently, in that order. Sections above describe the completed design; anything not yet built
-is specified here so the later landings implement a reviewed target rather
-than an improvised one.
+Landing 3 added the control socket and the stop path: `/run/td-svc/control`
+with `status`, `start`, `stop` and `restart`; `td-svc <verb> [NAME]` as the
+client so the socket is usable from the image without another tool; and
+`Containment::Console`, which is what finally reaches the greeter's login
+tree (§4). `reload` and the power verbs land with ordered shutdown, since
+they are requests to begin a transition that does not exist yet.
+
+Ordered shutdown, Ctrl-Alt-Del arming, and log capture land subsequently,
+in that order. Sections above describe the completed design; anything not
+yet built is specified here so the later landings implement a reviewed
+target rather than an improvised one.
 
 ### A table with no units, and the rescue td-init has but td-svc does not
 
@@ -577,20 +750,28 @@ window (§4, "Stopping") is already the primitive that needs; what is
 missing is the state file and the policy for a partial one. It is a
 feature with its own failure modes, so it gets its own landing.
 
-Three things the next landings must resolve before this is correct, all
+Two things the next landings must resolve before this is correct, both
 found in review and recorded above rather than left to be rediscovered:
-the supervisor-restart eviction contract just described; the shipped
-greeter's containment is its wrapper process alone (§4, "Stopping"), which
-is safe but cannot reach the login tree; and `log=` / `console=` are
-refused by name until log capture exists, so the `tty=`/`log=` exclusion
-has nothing to enforce yet (§3).
+the supervisor-restart eviction contract just described, and `log=` /
+`console=` being refused by name until log capture exists, so the
+`tty=`/`log=` exclusion has nothing to enforce yet (§3).
 
-The greeter one has a known fix that landing 2 deliberately did NOT
-take, because the cutover was kept behaviour-preserving: `td-init`'s
-`cttyhack` applet already does `setsid(2)`, claims the terminal, and
-`exec`s, so a greeter spawned as `cttyhack /etc/tty-session` would make the
-direct child a session leader and give the stop path a session to contain.
-It is not a free change — it moves who calls `setsid` and `TIOCSCTTY`
-relative to `getty`, on the one path whose only verification is the
-qemu oracle — so it belongs with the stop path that needs it, not with a
-cutover whose value is that nothing about the running system changed.
+A third — the shipped greeter's containment reaching only its wrapper
+process — was the reason for this landing and is closed.
+
+The greeter one is RESOLVED, and not the way this document previously said.
+The recorded fix was to spawn the wrapper through `td-init`'s `cttyhack`
+so it would lead a session. That does not work, and the reason is worth
+keeping: `/etc/tty-session` runs `getty` as a CHILD, and busybox getty
+opens with an unconditional `setsid(2)` — `loginutils/getty.c`, "Create
+new session and pgrp, lose controlling tty". So `login` and the user's
+shell end up in a session getty made, not the wrapper's. `cttyhack`
+would have moved `setsid`/`TIOCSCTTY` onto the boot path to buy a
+`Session` containing exactly the one process `Process` already contained.
+
+What getty does not escape is the TERMINAL: it re-acquires the same one
+with `TIOCSCTTY`, so it and everything it execs carry the device in
+`/proc/<pid>/stat` field 7. Hence `Containment::Console`, which is keyed
+on the device the unit's `tty=` names — not on the child's own `tty_nr`,
+which is 0 because td-svc opens the console `O_NOCTTY` — and so reaches
+the login tree without touching the boot path at all.

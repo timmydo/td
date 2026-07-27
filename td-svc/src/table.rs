@@ -223,6 +223,18 @@ pub fn parse(text: &str) -> (Vec<Unit>, Vec<String>) {
                 ));
                 continue;
             }
+            // A leading `-` is refused HERE rather than left to the CLI, which
+            // reads any argument starting with `-` as a flag. Such a unit would
+            // run and then be impossible to name: no `status`, `start`, `stop`
+            // or `restart` could ever address it.
+            if name.starts_with('-') {
+                problems.push(format!(
+                    "line {number}: unit name '{name}' may not begin with '-'; the \
+                     control client would read it as an option and the unit could \
+                     never be named"
+                ));
+                continue;
+            }
             if units.iter().any(|u| u.name == name) {
                 problems.push(format!("line {number}: duplicate unit '{name}'"));
                 continue;
@@ -674,5 +686,28 @@ mod tests {
         // does not run a shell.
         assert_eq!(split_argv("cmd>/dev/log").unwrap(), ["cmd>/dev/log"]);
         assert_eq!(split_argv("$HOME").unwrap(), ["$HOME"]);
+    }
+
+    /// A unit the control client could never name is refused at parse time.
+    ///
+    /// `route()` reads any argument beginning with `-` as an option, so a
+    /// `[-greeter]` would start on boot and then be unreachable by every verb
+    /// the socket offers. The parser is where that is knowable.
+    #[test]
+    fn a_unit_name_may_not_begin_with_a_dash() {
+        let (units, problems) = parse("[-greeter]\ntype=daemon\nexec=/bin/sh\n");
+        assert!(
+            units.is_empty(),
+            "a unit no verb could ever address was admitted"
+        );
+        assert!(
+            problems.iter().any(|p| p.contains("may not begin with")),
+            "{problems:?}"
+        );
+
+        // A dash elsewhere is still fine — the rule is about the FIRST
+        // character, not the character.
+        let (units, problems) = parse("[tty-greeter]\ntype=daemon\nexec=/bin/sh\n");
+        assert_eq!(units.len(), 1, "{problems:?}");
     }
 }

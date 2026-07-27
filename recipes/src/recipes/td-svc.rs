@@ -48,11 +48,29 @@ const MAIN_RS: &str = include_str!("../../../td-svc/src/main.rs");
 // (module basename, source text). rustc resolves `mod NAME;` to `{src}/NAME.rs`.
 const MODULES: &[(&str, &str)] = &[
     ("backoff", include_str!("../../../td-svc/src/backoff.rs")),
+    ("control", include_str!("../../../td-svc/src/control.rs")),
     ("order", include_str!("../../../td-svc/src/order.rs")),
     ("procfs", include_str!("../../../td-svc/src/procfs.rs")),
     ("supervise", include_str!("../../../td-svc/src/supervise.rs")),
     ("table", include_str!("../../../td-svc/src/table.rs")),
 ];
+
+/// The module names `main.rs` actually declares. `MODULES` above must match
+/// them exactly: rustc resolves each `mod NAME;` to `{src}/NAME.rs`, and the
+/// recipe writes only what `MODULES` lists.
+#[cfg(test)]
+fn declared_modules() -> Vec<&'static str> {
+    let mut names = Vec::new();
+    for line in MAIN_RS.lines() {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix("mod ") {
+            if let Some(name) = rest.strip_suffix(';') {
+                names.push(name);
+            }
+        }
+    }
+    names
+}
 
 pub fn recipe() -> Recipe {
     // The self-hosted toolchains install under a nested stage/td/store/<pkg>
@@ -152,4 +170,39 @@ pub fn recipe() -> Recipe {
             "glibc-x86-64",
         ])
         .steps(steps)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `MODULES` and `main.rs`'s `mod` lines must agree exactly.
+    ///
+    /// This test exists because its absence was a build-breaker: landing 3 added
+    /// `mod control;` to the crate and not to `MODULES`, so the recipe wrote out
+    /// five files beside a `main.rs` that declared six and `rustc` failed with
+    /// `file not found for module `control``. Nothing on the per-PR tier saw it —
+    /// host `cargo test` and `clippy` compile from the real `td-svc/src`, where
+    /// the file exists; only the recipe build, which is daily-tier, uses this
+    /// list. td-login and td-firstboot have carried this guard for exactly this
+    /// case; td-svc was the one that did not.
+    #[test]
+    fn the_recipe_writes_out_exactly_the_modules_the_crate_declares() {
+        let mut declared = declared_modules();
+        let mut written: Vec<&str> = MODULES.iter().map(|(name, _)| *name).collect();
+        declared.sort_unstable();
+        written.sort_unstable();
+        assert_eq!(
+            written, declared,
+            "MODULES and src/main.rs's `mod` lines disagree; rustc resolves each \
+             `mod NAME;` to {{src}}/NAME.rs, so every declared module must be written \
+             out and nothing else should be"
+        );
+        assert!(
+            declared.len() >= 6,
+            "only {} modules parsed out of the embedded crate root — the scan has gone \
+             stale and this test is now vacuous",
+            declared.len()
+        );
+    }
 }

@@ -38,11 +38,26 @@ const PROBE_ATTEMPT: Duration = Duration::from_secs(5);
 /// engages when a dependency simply never settles. A console that is waiting
 /// indefinitely is a console that is not there, which is the same outcome by a
 /// slower route, so its wait is bounded and its ordering is a preference.
+const CONSOLE_PATIENCE: Duration = Duration::from_secs(30);
+
 /// How often a supervisor with NO units repeats that fact. Slow, because it is a
 /// standing condition rather than news, but never silent — see `run`.
 const SILENT_TABLE_COMPLAINT: Duration = Duration::from_secs(60);
 
-const CONSOLE_PATIENCE: Duration = Duration::from_secs(30);
+/// How often a stop whose containment is still occupied re-scans `/proc`.
+///
+/// Survivors are not td-svc's children, so their exit produces no event; this
+/// interval is the whole mechanism by which such a stop ever completes. Short
+/// enough that an operator's `status` catches up promptly, long enough that a
+/// wedged containment is not a `/proc` scan per loop pass.
+const STOP_SWEEP_INTERVAL: Duration = Duration::from_secs(1);
+
+/// What the socket answers an unparseable request with.
+const CONTROL_USAGE: &str = "usage: status [NAME] | start NAME | stop NAME | restart NAME\n";
+
+fn unknown(name: &str) -> String {
+    format!("error: no such service {name:?}\n")
+}
 
 /// `O_NOCTTY` — opening a terminal must never make it td-svc's own by side
 /// effect. Same reason td-init's `start` carries it.
@@ -66,6 +81,14 @@ pub enum Phase {
     Failed,
     /// Too many consecutive fast failures; retried only at the capped interval.
     Held,
+    /// Stopped because someone ASKED, over the control socket.
+    ///
+    /// Distinct from `Failed` because the restart policy must not see it: a
+    /// `restart=always` daemon that an operator stopped has to STAY stopped, or
+    /// the socket cannot stop anything. It still settles, so a dependent that
+    /// was waiting on it proceeds rather than hanging on a decision an operator
+    /// already made.
+    Stopped,
 }
 
 impl Phase {
@@ -75,7 +98,22 @@ impl Phase {
     /// binary would block every dependent — the console included — for the ~7
     /// minutes it takes backoff to reach the hold.
     fn settled(self) -> bool {
-        matches!(self, Phase::Ready | Phase::Failed | Phase::Held)
+        matches!(
+            self,
+            Phase::Ready | Phase::Failed | Phase::Held | Phase::Stopped
+        )
+    }
+
+    /// How `status` names it. Stable strings — this is the socket's output.
+    fn label(self) -> &'static str {
+        match self {
+            Phase::Down => "down",
+            Phase::Starting => "starting",
+            Phase::Ready => "ready",
+            Phase::Failed => "failed",
+            Phase::Held => "held",
+            Phase::Stopped => "stopped",
+        }
     }
 }
 
@@ -111,6 +149,48 @@ pub struct Service {
     /// Set when the instance a probe was launched for is gone, so the probe
     /// thread stops forking attempts instead of running out its full timeout.
     cancel: Option<Arc<AtomicBool>>,
+    /// A stop was REQUESTED and the process has not exited yet.
+    ///
+    /// The exit that follows must not be read as a failure — a `restart=always`
+    /// daemon would come straight back and the socket could not stop anything.
+    /// It is a separate flag rather than a phase because the unit is still
+    /// `Starting`/`Ready` until it actually dies, and ordering must keep seeing
+    /// that: claiming it settled before the process is gone is exactly the
+    /// fail-open shape I4 forbids.
+    stopping: bool,
+    /// A `restart` is a stop with an intent. Set only alongside `stopping`, and
+    /// consumed by the exit, so a restart that races a crash still starts once.
+    start_after_stop: bool,
+    /// The containment a stop was issued against, kept until the stop
+    /// COMPLETES.
+    ///
+    /// I4: a service is stopped only when its leader is reaped AND its
+    /// containment is empty. Once the leader is reaped its pid is gone, so
+    /// `containment()` — which needs one — can no longer answer; without this
+    /// there is nothing left to ask, and an earlier draft therefore declared
+    /// the stop finished on the leader's exit alone. For the greeter that means
+    /// TERMing one shell and calling it done while getty, login and a user's
+    /// shell keep the console.
+    stop_scope: Option<Containment>,
+    /// The terminal the RUNNING instance actually got, read from the open
+    /// descriptor at spawn.
+    ///
+    /// Not the same as resolving `tty=` later: `attach_tty` falls back to
+    /// `/dev/console` when the configured terminal cannot be opened, so a
+    /// containment built from the unit's name would signal a terminal this
+    /// service is not on — and the node behind a path can be replaced between
+    /// the spawn and the stop.
+    tty_dev: Option<i32>,
+    /// A KILL has already been attempted for the current teardown, so the
+    /// "killing it" line is not repeated on every retry.
+    killed: bool,
+    /// When to re-scan a containment that was still occupied last time.
+    ///
+    /// The leader's exit is the ONLY event td-svc gets — survivors are not its
+    /// children, so nothing wakes it when the last of them goes. Without a
+    /// timer a unit whose containment outlived its leader would sit `stopping`
+    /// forever, never reaching `Stopped` however long the console stayed idle.
+    next_sweep: Option<Instant>,
 }
 
 impl Service {
@@ -129,6 +209,12 @@ impl Service {
             waiting_since: None,
             forced: false,
             cancel: None,
+            stopping: false,
+            start_after_stop: false,
+            stop_scope: None,
+            tty_dev: None,
+            killed: false,
+            next_sweep: None,
         }
     }
 
@@ -158,6 +244,24 @@ impl Service {
             // Imposed by `process_group(0)`, so pgid == pid by construction.
             return Ok(Some(Containment::Group(pid)));
         }
+        // The device the UNIT named, resolved now. Deliberately not read off
+        // the child: td-svc opens the tty `O_NOCTTY`, so the direct child never
+        // acquires a controlling terminal and its field 7 is 0 for its whole
+        // life — an earlier draft keyed on it and the console containment
+        // therefore never engaged at all.
+        // What the running instance ACTUALLY got, preferred over re-resolving
+        // the configured name: those differ whenever `attach_tty` fell back to
+        // `/dev/console`, and a containment built from the name would then
+        // address a terminal this service is not on.
+        // No `or_else` onto the configured name. `tty_dev` is `None` after a
+        // spawn only when `attach_tty` opened NOTHING — both the unit's `tty=`
+        // and `/dev/console` failed — so the child provably has no controlling
+        // terminal, and addressing the device it merely NAMED would signal a
+        // terminal held by someone else entirely. Fall through to the pid-keyed
+        // chain, which still reaches the process td-svc spawned.
+        if let Some(tty) = self.tty_dev {
+            return Ok(Some(Containment::Console { leader: pid, tty }));
+        }
         let Some(stat) = procfs::stat_of(pid)? else {
             return Ok(None);
         };
@@ -165,9 +269,107 @@ impl Service {
     }
 }
 
+/// The device actually attached to a child, read from the open descriptor
+/// rather than from the path.
+///
+/// `attach_tty` falls back to `/dev/console` when the configured terminal
+/// cannot be opened, so the path a unit NAMES and the device its process got
+/// are not always the same one — and a containment built from the name would
+/// then signal a terminal this service is not on.
+fn attached_device(file: &std::fs::File) -> Option<i32> {
+    use std::os::unix::fs::MetadataExt;
+    packed_device(file.metadata().ok()?.rdev())
+}
+
+/// A `dev_t` in the packing `/proc/<pid>/stat` field 7 uses, or `None`.
+fn packed_device(rdev: u64) -> Option<i32> {
+    // `st_rdev` and field 7 are the same 32-bit `new_encode_dev` packing —
+    // checked against /dev/tty1 (1025), /dev/ttyS0 (1088) and /dev/pts/0
+    // (34816) on a live kernel. 0 is "no controlling terminal", never a target.
+    //
+    // The reinterpret is not a cast for convenience: the kernel holds field 7
+    // in an `int` and prints it signed, so a device whose encoding sets bit 31
+    // appears NEGATIVE in `/proc`. Comparing that against a `try_from` would
+    // simply fail to resolve and silently drop to a containment that cannot
+    // reach the login tree; matching the kernel's own reinterpretation keeps
+    // the two bit-exact over the whole range.
+    let packed = u32::try_from(rdev).ok()? as i32;
+    (packed != 0).then_some(packed)
+}
+
+/// What is left of a recorded stop scope once its leader has been reaped.
+///
+/// The leader's pid stops being ours the moment its waiter reaps it, and the
+/// kernel may hand it straight on. Anything keyed on that pid must therefore
+/// go: a `Process` scope names only the leader, so it empties, and `Console`'s
+/// leader half goes the same way, leaving the terminal.
+///
+/// A group or session id STAYS. It was the leader's pid, but Linux keeps a pid
+/// number reserved for as long as it is still in use as a pgid or sid, so it
+/// cannot name a different group while that group still has a member — and if
+/// it has none there is nothing there to scan or signal anyway.
+fn without_reaped_leader(scope: Option<Containment>) -> Option<Containment> {
+    match scope {
+        // No process has pid 0, so this half now matches nothing.
+        Some(Containment::Console { tty, .. }) => Some(Containment::Console { leader: 0, tty }),
+        Some(Containment::Process(_)) => None,
+        other => other,
+    }
+}
+
+/// How many processes a stop must still account for in one scan.
+///
+/// Split out from `finish_stop` because the arm that matters is the one a test
+/// cannot otherwise reach: making `/proc` unreadable on demand is not
+/// something a unit test can arrange, so without this the I3 reading — an
+/// unreadable scan is NOT an empty one — had nothing pinning it.
+///
+/// A scan that found nothing but hit errors is not empty either; that is what
+/// `proven_empty` distinguishes, and a stop that proceeded on it would tear
+/// down a service that is still running.
+fn occupancy(scan: Result<&procfs::Scan, &io::Error>) -> usize {
+    match scan {
+        Ok(scan) if scan.proven_empty() => 0,
+        Ok(scan) => scan.pids.len().max(1),
+        Err(_) => 1,
+    }
+}
+
+/// Which containment the delayed KILL addresses, or `None` to send nothing.
+///
+/// Split out from `escalate` so the CHOICE is testable without a live child
+/// and a real signal — it is the part that was wrong, not the sending.
+///
+/// A requested stop KILLs the scope its TERM went to. Re-deriving one needs a
+/// live pid, so once the leader is reaped a re-derived target is `None` and the
+/// KILL silently does nothing — which is exactly the case it exists for, since
+/// survivors outliving the leader are why the stop had not finished. It can
+/// also be the WRONG set: a `tty=` unit whose device stopped resolving narrows
+/// to the wrapper alone while the TERM went to the whole terminal.
+///
+/// Without a stop in flight, a leader that is no longer ours means there is
+/// nothing safe left to address: every derivable id is keyed on a pid the
+/// kernel may have handed on.
+fn kill_target(
+    stopping: bool,
+    same: bool,
+    recorded: Option<Containment>,
+    derived: Option<Containment>,
+) -> Option<Containment> {
+    match (stopping, same) {
+        (true, true) => recorded,
+        (true, false) => without_reaped_leader(recorded),
+        (false, true) => derived,
+        (false, false) => None,
+    }
+}
+
 /// Which containment a `tty=` child's `/proc` entry describes. Split out from
 /// the read so the classification is testable without fabricating a `/proc`.
 fn classify(pid: i32, stat: &procfs::Stat) -> Containment {
+    // Reached only when the unit's `tty=` device could not be resolved — see
+    // `containment`, which prefers `Console` because neither the group nor the
+    // session a `tty=` child leads ever contains the login tree getty makes.
     if stat.session == pid {
         Containment::Session(pid)
     } else if stat.pgrp == pid {
@@ -181,6 +383,15 @@ fn classify(pid: i32, stat: &procfs::Stat) -> Containment {
 }
 
 pub enum Event {
+    /// A control-socket request, with the channel its reply goes back on.
+    ///
+    /// The reply travels as a message rather than a shared buffer for the same
+    /// reason everything else does: the main loop owns the state and answers on
+    /// its own thread, so there is nothing to lock.
+    Control {
+        request: String,
+        reply: Sender<String>,
+    },
     Exited {
         name: String,
         generation: u64,
@@ -205,12 +416,15 @@ pub enum Event {
 }
 
 impl Event {
+    /// The service an event is about. A `Control` request is about the
+    /// supervisor, not a service, and `dispatch` peels it off before asking.
     fn name(&self) -> &str {
         match self {
             Event::Exited { name, .. }
             | Event::WaitFailed { name, .. }
             | Event::Ready { name, .. }
             | Event::ProbeFailed { name, .. } => name,
+            Event::Control { .. } => "",
         }
     }
 
@@ -220,6 +434,7 @@ impl Event {
             | Event::WaitFailed { generation, .. }
             | Event::Ready { generation, .. }
             | Event::ProbeFailed { generation, .. } => *generation,
+            Event::Control { .. } => 0,
         }
     }
 }
@@ -232,7 +447,7 @@ enum Verdict {
     Wait(Option<Instant>),
 }
 
-fn log(msg: &str) {
+pub fn log(msg: &str) {
     crate::emit_err(&format!("td-svc: {msg}\n"));
 }
 
@@ -334,10 +549,13 @@ fn open_tty(path: &str) -> io::Result<std::fs::File> {
 /// message is built at all, so a test can assert the result is empty at
 /// `report=false` and non-empty at `report=true` without a log sink. Asserting
 /// on `backoff::should_report` alone tests `backoff`, not this.
-fn attach_tty(cmd: &mut Command, unit: &Unit, report: bool) -> Vec<String> {
+fn attach_tty(cmd: &mut Command, unit: &Unit, report: bool) -> Attached {
     let mut said = Vec::new();
     let Some(tty) = &unit.tty else {
-        return said;
+        return Attached {
+            said,
+            device: None,
+        };
     };
     let path = tty_path(tty);
     // Gated for the same reason as `build`'s: a greeter whose terminal is
@@ -368,7 +586,15 @@ fn attach_tty(cmd: &mut Command, unit: &Unit, report: bool) -> Vec<String> {
             }
         }
     };
-    let Some(file) = opened else { return said };
+    let Some(file) = opened else {
+        return Attached {
+            said,
+            device: None,
+        };
+    };
+    // Read off the OPEN descriptor, before anything can replace the node, and
+    // after the `/dev/console` fallback has had its say.
+    let device = attached_device(&file);
     match file.try_clone() {
         Ok(out) => {
             cmd.stdin(Stdio::from(file)).stdout(Stdio::from(out));
@@ -377,9 +603,20 @@ fn attach_tty(cmd: &mut Command, unit: &Unit, report: bool) -> Vec<String> {
             if report {
                 said.push(format!("{}: {path}: {e}", unit.name));
             }
+            // The child was never wired to this terminal, so it is not its
+            // containment. Recording it anyway would aim a stop at every
+            // process on a device this service does not hold.
+            return Attached { said, device: None };
         }
     }
-    said
+    Attached { said, device }
+}
+
+/// What `attach_tty` did: anything worth saying, and the device it ACTUALLY
+/// attached — which is not always the one the unit named.
+struct Attached {
+    said: Vec<String>,
+    device: Option<i32>,
 }
 
 /// The uutils multicall's `kill`. td-svc takes no `kill(2)` surface at all
@@ -393,7 +630,7 @@ const KILL: &str = "/bin/kill";
 ///
 /// The exit status is discarded on purpose: it reports whether the SEND
 /// succeeded, and I3 forbids reading liveness out of it.
-fn send_signal(target: &str, signal: &str) {
+fn send_signal(target: &str, signal: &str) -> Result<(), String> {
     let sent = Command::new(KILL)
         .arg(format!("-{signal}"))
         .arg(target)
@@ -407,8 +644,11 @@ fn send_signal(target: &str, signal: &str) {
     // means td-svc cannot signal anything, and every "killing it" line above
     // would describe an action that never happened.
     if let Err(e) = sent {
-        log(&format!("cannot run {KILL}: {e}; nothing was signalled"));
+        let why = format!("cannot run {KILL}: {e}; nothing was signalled");
+        log(&why);
+        return Err(why);
     }
+    Ok(())
 }
 
 /// Spawn a helper thread, reporting rather than panicking if the OS refuses.
@@ -447,17 +687,19 @@ pub struct Runtime {
     tx: Sender<Event>,
     rx: Receiver<Event>,
     self_pid: i32,
-    /// td-svc's own group and session, read once at startup — nothing moves it
-    /// between them, since it calls neither `setsid` nor `setpgid`.
+    /// td-svc's own group, session and controlling terminal, read once at
+    /// startup — nothing moves it between them, since it calls neither `setsid`
+    /// nor `setpgid`, and it never claims a terminal (every open it makes
+    /// carries `O_NOCTTY`).
     ///
-    /// `None` means `/proc/self/stat` was unreadable, and then NO group or
-    /// session may be signalled at all: without knowing its own ids td-svc
+    /// `None` means `/proc/self/stat` was unreadable, and then NO group,
+    /// session or terminal may be signalled at all: without knowing its own ids td-svc
     /// cannot prove a target is not itself, and the guard's whole job is to be
     /// sure. (An earlier draft substituted `self_pid` here and called that
     /// stricter. It is the reverse — a pid never equals a real pgid held by
     /// something else, so every comparison passed and the guard was off exactly
     /// when `/proc` was least trustworthy.)
-    self_ids: Option<(i32, i32)>,
+    self_ids: Option<procfs::Stat>,
     /// The table this was loaded from, carried only so the "no units" complaint
     /// can name the file an operator has to go look at.
     table_path: String,
@@ -510,7 +752,7 @@ impl Runtime {
                 tx,
                 rx,
                 self_pid,
-                self_ids: own.map(|s| (s.pgrp, s.session)),
+                self_ids: own,
                 table_path: table_path.to_string(),
             },
             complaints,
@@ -590,10 +832,18 @@ impl Runtime {
             // row that retries are capped at five minutes — strictly worse news
             // than a single failure, and gating on `Failed` alone let a strict
             // dependent start while what it requires was crash-looping.
-            let failed = matches!(
-                self.lookup(dep).map(|s| s.phase),
-                Some(Phase::Failed | Phase::Held)
-            );
+            // `Stopped` counts too. It settles for ORDERING (`after=` waits
+            // for a decision, and an operator's stop is one), but `requires=`
+            // asks whether the dependency is THERE — and a service someone
+            // stopped is exactly as absent as one that failed.
+            // A stop IN FLIGHT counts for the same reason `Stopped` does, and
+            // it has to be read off the flag rather than the phase: the phase
+            // stays `Ready` until the stop completes, so a unit whose leader is
+            // already reaped would otherwise satisfy a strict dependency while
+            // nothing of it is left to depend on.
+            let failed = self.lookup(dep).is_some_and(|s| {
+                s.stopping || matches!(s.phase, Phase::Failed | Phase::Held | Phase::Stopped)
+            });
             if failed {
                 return Some(dep.clone());
             }
@@ -630,8 +880,9 @@ impl Runtime {
                 return;
             }
         };
-        for said in attach_tty(&mut cmd, &unit, report) {
-            log(&said);
+        let attached = attach_tty(&mut cmd, &unit, report);
+        for said in &attached.said {
+            log(said);
         }
 
         match cmd.spawn() {
@@ -645,6 +896,8 @@ impl Runtime {
                 if let Some(service) = self.services.get_mut(index) {
                     service.pid = Some(pid);
                     service.starttime = starttime;
+                    service.tty_dev = attached.device;
+                    service.killed = false;
                     service.generation = generation;
                     service.started = Some(Instant::now());
                     service.retry_at = None;
@@ -694,7 +947,7 @@ impl Runtime {
             "{name}: no waiter thread; killing pid {pid} rather than leaving \
              it unsupervised, and not retrying"
         ));
-        self.signal(mode, "KILL");
+        let _ = self.signal(mode, "KILL");
         if let Some(service) = self.services.get_mut(index) {
             service.phase = Phase::Failed;
             service.pid = None;
@@ -812,7 +1065,9 @@ impl Runtime {
             let eligible = match service.phase {
                 Phase::Down | Phase::Held => true,
                 Phase::Failed => service.retry_at.is_some(),
-                Phase::Starting | Phase::Ready => false,
+                // Stopped is a standing decision by an operator, not a state to
+                // recover from. Only an explicit `start` leaves it.
+                Phase::Starting | Phase::Ready | Phase::Stopped => false,
             };
             if !eligible {
                 continue;
@@ -855,10 +1110,17 @@ impl Runtime {
             }
             self.start(index);
         }
-        // A oneshot's timeout, and the KILL that follows it, are the other
-        // things that can need a wake-up.
+        // A oneshot's timeout, the KILL that follows it, and a stop's pending
+        // re-scan are the other things that can need a wake-up. `next_sweep`
+        // belongs here or it is not a timer at all: nothing else wakes the loop
+        // when a containment drains, so the stop would wait on whatever
+        // unrelated deadline happens to be nearest — a crash-looper parked at
+        // the 5-minute backoff cap, with the console down for all of it.
         for service in &self.services {
-            for at in [service.deadline, service.kill_at].into_iter().flatten() {
+            for at in [service.deadline, service.kill_at, service.next_sweep]
+                .into_iter()
+                .flatten()
+            {
                 next_wake = Some(match next_wake {
                     Some(w) if w < at => w,
                     _ => at,
@@ -884,6 +1146,16 @@ impl Runtime {
                 Some((true, _)) => self.time_out(index),
                 Some((false, true)) => self.escalate(index),
                 _ => {}
+            }
+            // A stop whose leader is already reaped but whose containment was
+            // still occupied. Nothing will wake td-svc when the last survivor
+            // exits — survivors are not its children — so this timer is the
+            // only path from `stopping` to `Stopped` for those units.
+            let sweep = self.services.get(index).is_some_and(|s| {
+                s.stopping && s.pid.is_none() && s.next_sweep.is_some_and(|at| at <= now)
+            });
+            if sweep {
+                self.finish_stop(index);
             }
         }
     }
@@ -916,7 +1188,9 @@ impl Runtime {
         // The waiter thread still owns the `Child`, so the process is reaped
         // through the normal path whenever it does die.
         match containment {
-            Ok(Some(mode)) => self.signal(mode, "TERM"),
+            Ok(Some(mode)) => {
+                let _ = self.signal(mode, "TERM");
+            }
             Ok(None) => {}
             Err(e) => log(&format!("{name}: cannot read /proc to stop it: {e}")),
         }
@@ -933,7 +1207,10 @@ impl Runtime {
             return;
         };
         let name = service.unit.name.clone();
-        let containment = service.containment();
+        let stopping = service.stopping;
+        let killed_before = service.killed;
+        let recorded = service.stop_scope;
+        let derived = service.containment();
         let same = match (service.pid, service.starttime) {
             (Some(pid), Some(starttime)) => procfs::is_same_process(pid, starttime),
             // No recorded identity means no proof it is still the same process,
@@ -942,18 +1219,104 @@ impl Runtime {
             _ => Ok(false),
         };
         service.kill_at = None;
-        match (same, containment) {
-            (Ok(true), Ok(Some(mode))) => {
-                log(&format!("{name}: did not exit on TERM; killing it"));
-                self.signal(mode, "KILL");
+        // Keep the identity. Releasing a pid we could not read means a later
+        // `start` spawns a SECOND instance of a service that may still be
+        // alive — the exact duplicate `abandon` refuses to create. Fails
+        // closed: at worst the KILL is retried on the next sweep.
+        let same = match same {
+            Ok(same) => same,
+            Err(e) => {
+                log(&format!("{name}: cannot read /proc to kill it: {e}"));
+                // Re-arm, or the promised retry never happens: `kill_at` was
+                // cleared above and nothing else would wake this unit.
+                if let Some(service) = self.services.get_mut(index) {
+                    if service.kill_at.is_none() {
+                        service.kill_at = Instant::now().checked_add(service.unit.stop_timeout);
+                    }
+                }
+                return;
             }
-            // Already gone — the TERM worked and the waiter reaped it.
-            (Ok(false), _) | (_, Ok(None)) => {}
-            (Err(e), _) | (_, Err(e)) => {
-                log(&format!("{name}: cannot read /proc to kill it: {e}"))
+        };
+        let target = if stopping {
+            // A requested stop never consults `derived`, so an unreadable
+            // `/proc` there is not a reason to skip the KILL.
+            kill_target(true, same, recorded, None)
+        } else {
+            match derived {
+                Ok(derived) => kill_target(false, same, recorded, derived),
+                Err(e) => {
+                    log(&format!("{name}: cannot read /proc to kill it: {e}"));
+                    // Re-arm here for the same reason as above: `kill_at` was
+                    // cleared, and without a deadline this unit is never
+                    // killed, never retried, and never released.
+                    if let Some(service) = self.services.get_mut(index) {
+                        if service.kill_at.is_none() {
+                            service.kill_at =
+                                Instant::now().checked_add(service.unit.stop_timeout);
+                        }
+                    }
+                    return;
+                }
+            }
+        };
+        // Once a KILL has gone out the containment still has to be confirmed
+        // empty before the unit is `Stopped`, and the survivors' exit is not an
+        // event td-svc gets. Make sure a sweep is pending to do that.
+        if stopping {
+            let Some(service) = self.services.get_mut(index) else {
+                return;
+            };
+            if service.next_sweep.is_none() {
+                service.next_sweep = Instant::now().checked_add(STOP_SWEEP_INTERVAL);
             }
         }
-        if let Some(service) = self.services.get_mut(index) {
+        let sent = match target {
+            Some(mode) => {
+                // Said once per stop. `escalate` re-arms on every failed send
+                // or unreadable `/proc`, so a permanent fault — no `/bin/kill`,
+                // a wedged containment — would otherwise print this every
+                // `stop-timeout`, forever, per unit.
+                if !killed_before {
+                    if same {
+                        log(&format!("{name}: did not exit on TERM; killing it"));
+                    } else {
+                        log(&format!(
+                            "{name}: its containment did not empty on TERM; killing what is left"
+                        ));
+                    }
+                }
+                if let Some(service) = self.services.get_mut(index) {
+                    service.killed = true;
+                }
+                self.signal(mode, "KILL")
+            }
+            None => Ok(()),
+        };
+        let Some(service) = self.services.get_mut(index) else {
+            return;
+        };
+        // A KILL that did not go out — `/bin/kill` missing, an unenumerable
+        // session, or the self-containment refusal — leaves the process ALIVE.
+        // Dropping the identity here would make the supervisor forget it, and
+        // a later `start` would spawn a duplicate beside something still
+        // running. Keep it, and leave a deadline behind: the comment on the
+        // `/proc` error path promised a retry that nothing was scheduling.
+        if let Err(why) = sent {
+            log(&format!("{name}: {why}; keeping its identity to retry"));
+            if service.kill_at.is_none() {
+                service.kill_at = Instant::now().checked_add(service.unit.stop_timeout);
+            }
+            return;
+        }
+        // Only an UNREQUESTED teardown lets go here. For a requested stop the
+        // waiter thread still owns the `Child` and the process may outlive the
+        // KILL by a moment; clearing the pid now would make the sweep read the
+        // containment as empty (a `Console` scope cannot see the leader once
+        // its half is narrowed away), declare `Stopped` over a live leader,
+        // and then let the late exit through `on_exit`'s restart policy —
+        // restarting the very unit an operator stopped. `on_exit` is what
+        // releases the identity for a stop, once the leader really is reaped.
+        if !stopping {
             service.pid = None;
             service.starttime = None;
         }
@@ -967,35 +1330,50 @@ impl Runtime {
     /// down the supervisor and everything it supervises. `containment()` is
     /// written never to produce one; this refuses to send it anyway, because
     /// the cost of the two being out of step once is the machine.
-    fn signal(&self, mode: Containment, signal: &str) {
+    fn signal(&self, mode: Containment, signal: &str) -> Result<(), String> {
         if self.contains_self(mode) {
-            log(&format!(
-                "refusing to send {signal} to {mode:?}: td-svc is inside it"
-            ));
-            return;
+            let why = format!("refusing to send {signal} to {mode:?}: td-svc is inside it");
+            log(&why);
+            return Err(why);
         }
         match mode {
-            Containment::Process(pid) => send_signal(&pid.to_string(), signal),
-            Containment::Group(pgid) => send_signal(&format!("-{pgid}"), signal),
-            Containment::Session(_) => {
-                // A session has no kill(2) target; the members are enumerated
-                // and signalled individually — the `killall5` shape.
+            Containment::Process(pid) => send_signal(&pid.to_string(), signal)?,
+            Containment::Group(pgid) => send_signal(&format!("-{pgid}"), signal)?,
+            // Neither a session nor a terminal has a kill(2) target; the
+            // members are enumerated and signalled individually — the
+            // `killall5` shape.
+            Containment::Session(_) | Containment::Console { .. } => {
                 match procfs::members(mode, self.self_pid) {
                     Ok(scan) => {
                         // Best effort, deliberately: one unreadable stranger
                         // must not stop td-svc signalling the ones it read.
                         // (Liveness is the opposite — see procfs::Scan.)
                         for e in &scan.errors {
-                            log(&format!("scanning to signal a session: {e}"));
+                            log(&format!("scanning to signal {mode:?}: {e}"));
                         }
+                        // Best effort per member, but a `kill` that cannot
+                        // RUN is not a per-member problem — it means nothing
+                        // was signalled at all, and the caller must not treat
+                        // the escalation as done.
+                        let mut failed = None;
                         for pid in scan.pids {
-                            send_signal(&pid.to_string(), signal);
+                            if let Err(why) = send_signal(&pid.to_string(), signal) {
+                                failed = Some(why);
+                            }
+                        }
+                        if let Some(why) = failed {
+                            return Err(why);
                         }
                     }
-                    Err(e) => log(&format!("cannot enumerate a session to signal it: {e}")),
+                    Err(e) => {
+                        let why = format!("cannot enumerate {mode:?} to signal it: {e}");
+                        log(&why);
+                        return Err(why);
+                    }
                 }
             }
         }
+        Ok(())
     }
 
     /// Would signalling this containment reach td-svc itself? Answers TRUE
@@ -1006,14 +1384,342 @@ impl Runtime {
         match mode {
             Containment::Process(pid) => pid == self.self_pid,
             Containment::Group(pgid) => match self.self_ids {
-                Some((own_pgrp, _)) => pgid == own_pgrp || pgid == self.self_pid,
+                Some(own) => pgid == own.pgrp || pgid == self.self_pid,
                 None => true,
             },
             Containment::Session(sid) => match self.self_ids {
-                Some((_, own_session)) => sid == own_session || sid == self.self_pid,
+                Some(own) => sid == own.session || sid == self.self_pid,
                 None => true,
             },
+            // Both halves must miss td-svc. `leader` is a pid it spawned, so
+            // it can only be td-svc's own if something is badly wrong; the
+            // device check is the real one, and it catches tty 0 for free
+            // because td-svc holds no controlling terminal and so its own
+            // field 7 IS 0.
+            // Device 0 is refused OUTRIGHT, not merely because td-svc's own
+            // field 7 happens to be 0: a td-svc run from a terminal (a test, an
+            // operator) has a real one, and then the `own.tty_nr` comparison
+            // would let 0 — the set of every daemon on the machine — through.
+            Containment::Console { leader, tty } => {
+                tty == 0
+                    || leader == self.self_pid
+                    || match self.self_ids {
+                        Some(own) => tty == own.tty_nr,
+                        None => true,
+                    }
+            }
         }
+    }
+
+    /// The leader is reaped — is the STOP finished?
+    ///
+    /// I4 says both halves: reaped AND the containment empty. The leader's exit
+    /// is only the first, and for the greeter it is the misleading one, because
+    /// the wrapper is a shell whose `getty` child holds the console. So the
+    /// recorded scope is re-scanned here, and a stop that still has members
+    /// stays a stop: the KILL remains armed and `escalate` will sweep the
+    /// survivors.
+    ///
+    /// An INCOMPLETE scan (`/proc` entries that could not be read) is not
+    /// emptiness. `proven_empty` is the fail-closed reading, and taking it any
+    /// other way would let the teardown proceed over a service still running.
+    fn finish_stop(&mut self, index: usize) {
+        let (name, scope) = match self.services.get(index) {
+            Some(service) => (service.unit.name.clone(), service.stop_scope),
+            None => return,
+        };
+        // The leader is reaped by the time this runs, so anything keyed on its
+        // pid would ask `/proc` about a pid that is no longer ours — and a
+        // recycled one answers, keeping the containment occupied for good.
+        let scope = without_reaped_leader(scope);
+        let remaining = match scope {
+            // Nothing was ever signalled (no containment to derive), so there
+            // is nothing that could still be running under it.
+            None => 0,
+            Some(mode) => {
+                let scan = procfs::members(mode, self.self_pid);
+                if let Err(e) = &scan {
+                    log(&format!("{name}: cannot confirm it stopped: {e}"));
+                }
+                occupancy(scan.as_ref())
+            }
+        };
+        let Some(service) = self.services.get_mut(index) else {
+            return;
+        };
+        if remaining > 0 {
+            // Still occupied. Keep `stopping` set so a later sweep lands here
+            // again, and leave `kill_at` armed so `escalate` fires on it.
+            if service.kill_at.is_none() {
+                service.kill_at = Instant::now().checked_add(service.unit.stop_timeout);
+            }
+            // Only the FIRST occupied scan says so. `enforce_deadlines` comes
+            // back every `STOP_SWEEP_INTERVAL` until the containment drains,
+            // and a line per pass would bury everything else in the log.
+            let first = service.next_sweep.is_none();
+            service.next_sweep = Instant::now().checked_add(STOP_SWEEP_INTERVAL);
+            if first {
+                log(&format!(
+                    "{name}: leader exited but {remaining} process(es) remain in its \
+                     containment; not stopped yet"
+                ));
+            }
+            return;
+        }
+        service.stopping = false;
+        service.stop_scope = None;
+        service.kill_at = None;
+        service.next_sweep = None;
+        if service.start_after_stop {
+            service.start_after_stop = false;
+            // Down, not Stopped: `start_eligible` picks it up on the next pass.
+            // The failure count is cleared too, so a `restart` of a crash-looping
+            // unit tries immediately rather than serving out a backoff the
+            // operator asked to interrupt.
+            service.phase = Phase::Down;
+            service.fast_failures = 0;
+            log(&format!("{name}: stopped; restarting as asked"));
+        } else {
+            service.phase = Phase::Stopped;
+            log(&format!("{name}: stopped"));
+        }
+    }
+
+    /// A sender for the event channel, so the control thread can reach the loop.
+    pub fn events(&self) -> Sender<Event> {
+        self.tx.clone()
+    }
+
+    /// Apply one control request and return the reply the client sees.
+    ///
+    /// Runs ON the main loop, so it reads and writes supervision state directly
+    /// — there is no lock because there is no second owner (§5). Every reply is
+    /// a complete answer: a request that changed nothing says so rather than
+    /// returning an empty success, because "stopped" and "was not running" are
+    /// different facts to whoever asked.
+    pub fn control(&mut self, request: &str) -> String {
+        let mut words = request.split_whitespace();
+        let Some(verb) = words.next() else {
+            return "error: empty request\n".to_string();
+        };
+        let target = words.next();
+        if words.next().is_some() {
+            return format!("error: {verb}: too many arguments\n");
+        }
+        match (verb, target) {
+            ("status", None) => self.status(),
+            ("status", Some(name)) => match self.index_of(name) {
+                Some(index) => self.status_line(index),
+                None => unknown(name),
+            },
+            ("start", Some(name)) => self.control_start(name),
+            ("stop", Some(name)) => self.control_stop(name, false),
+            ("restart", Some(name)) => self.control_stop(name, true),
+            ("start" | "stop" | "restart", None) => {
+                format!("error: {verb}: needs a service name\n")
+            }
+            _ => format!("error: unknown request {verb:?}\n{CONTROL_USAGE}"),
+        }
+    }
+
+    fn index_of(&self, name: &str) -> Option<usize> {
+        self.services.iter().position(|s| s.unit.name == name)
+    }
+
+    fn status(&self) -> String {
+        // One allocation for the whole reply rather than one per line: this is
+        // not hot, but the shape is the one the rest of the loop uses.
+        let mut out = String::with_capacity(self.services.len().saturating_mul(48));
+        for index in 0..self.services.len() {
+            out.push_str(&self.status_line(index));
+        }
+        if out.is_empty() {
+            // A supervisor with no units is the failure §10 describes; saying
+            // "OK" with an empty list would read as a healthy idle machine.
+            return "no units\n".to_string();
+        }
+        out
+    }
+
+    fn status_line(&self, index: usize) -> String {
+        let Some(service) = self.services.get(index) else {
+            return String::new();
+        };
+        let pid = match service.pid {
+            Some(pid) => pid.to_string(),
+            None => "-".to_string(),
+        };
+        // A stop in flight outranks the phase. The phase deliberately does not
+        // move until the stop COMPLETES (claiming otherwise is the fail-open
+        // I4 forbids), but that leaves a unit whose leader is already reaped
+        // reading `ready` — indistinguishable, to the one person who has to
+        // decide what to do about it, from one that is actually serving.
+        let state = if service.stopping {
+            "stopping"
+        } else {
+            service.phase.label()
+        };
+        format!(
+            "{} {} pid={} failures={}\n",
+            service.unit.name, state, pid, service.fast_failures
+        )
+    }
+
+    fn control_start(&mut self, name: &str) -> String {
+        let Some(index) = self.index_of(name) else {
+            return unknown(name);
+        };
+        // `start_eligible` walks `self.order`, and the plan drops a unit whose
+        // dependencies could not be resolved — a cycle, or anything downstream
+        // of one. Setting it `Down` would reply "starting" and then nothing
+        // would ever pick it up, forever. Answer with the reason instead.
+        if !self.order.contains(&index) {
+            return format!(
+                "error: {name}: the plan could not order it (a dependency cycle, or a \
+                 unit downstream of one), so nothing would start it; fix the table and \
+                 restart the supervisor\n"
+            );
+        }
+        let Some(service) = self.services.get_mut(index) else {
+            return unknown(name);
+        };
+        // Checked BEFORE the pid, not inside it. A stop is still in flight
+        // after its leader is reaped whenever survivors hold the containment
+        // (I4), and that state has `pid == None`. Reading it as "not running"
+        // cleared `stopping` and started a SECOND instance alongside the
+        // processes an operator had just asked to end.
+        if service.stopping {
+            // Replying "already running" and doing nothing would instead leave
+            // the unit STOPPED while the client exited 0 believing it started.
+            service.start_after_stop = true;
+            return format!("{name}: stop in progress; will start again once it exits\n");
+        }
+        if service.pid.is_some() {
+            return format!("{name}: already running\n");
+        }
+        // Clearing the failure count is the point of an explicit start: an
+        // operator asking again should not serve out a backoff they are
+        // plainly trying to interrupt.
+        service.phase = Phase::Down;
+        service.fast_failures = 0;
+        service.retry_at = None;
+        service.stopping = false;
+        service.start_after_stop = false;
+        format!("{name}: starting\n")
+    }
+
+    /// `stop`, and `restart` — the same sequence with an intent recorded.
+    ///
+    /// This does NOT wait. TERM goes out now, the KILL is scheduled at
+    /// `stop-timeout` through the same `kill_at` the timeout path uses, and the
+    /// phase changes when the process actually exits. Reporting "stopped" here
+    /// would be claiming a death that has not happened — the fail-open shape
+    /// I4 exists to forbid — so the reply says what was sent.
+    fn control_stop(&mut self, name: &str, then_start: bool) -> String {
+        let Some(index) = self.index_of(name) else {
+            return unknown(name);
+        };
+        let Some(service) = self.services.get(index) else {
+            return unknown(name);
+        };
+        let verb = if then_start { "restart" } else { "stop" };
+        let Some(pid) = service.pid else {
+            // A stop already in flight is NOT finished just because the leader
+            // is gone: `finish_stop` keeps `stopping` set while survivors still
+            // hold the containment (I4). Falling through would clear it and
+            // `kill_at` with it, stranding those processes with nothing left to
+            // sweep them, and report a stop that had not happened.
+            if service.stopping {
+                let Some(service) = self.services.get_mut(index) else {
+                    return unknown(name);
+                };
+                service.start_after_stop = then_start;
+                return format!(
+                    "{name}: {verb} requested; a stop is already in progress and its \
+                     containment is not empty yet\n"
+                );
+            }
+            // Nothing to signal. A `restart` still has to honour its intent, or
+            // restarting a crashed daemon would quietly leave it down.
+            if then_start {
+                return self.control_start(name);
+            }
+            let Some(service) = self.services.get_mut(index) else {
+                return unknown(name);
+            };
+            // Clear any stop already in flight. Without this a `restart` whose
+            // TERM had gone out, followed by a `stop` before the exit arrived,
+            // would leave `start_after_stop` set — and the old exit would then
+            // consume that stale intent and start the unit an operator had just
+            // asked to stop.
+            service.stopping = false;
+            service.start_after_stop = false;
+            service.stop_scope = None;
+            service.kill_at = None;
+            service.phase = Phase::Stopped;
+            service.retry_at = None;
+            return format!("{name}: was not running; marked stopped\n");
+        };
+
+        // The same identity check the delayed KILL makes, for the same reason
+        // and one step earlier. A waiter may already have reaped this child
+        // while its `Exited` event is still in the channel, and the kernel can
+        // have handed the pid to something else — at which point a `tty=` unit
+        // would derive a containment from a STRANGER and TERM everything on its
+        // terminal. Failing closed costs a stop that must be retried; failing
+        // open costs whatever now holds that pid.
+        match service.starttime {
+            Some(starttime) => match procfs::is_same_process(pid, starttime) {
+                Ok(true) => {}
+                Ok(false) => {
+                    return format!(
+                        "error: {name}: pid {pid} is no longer the process we started; \
+                         nothing signalled\n"
+                    )
+                }
+                Err(e) => {
+                    return format!("error: {name}: cannot confirm pid {pid} from /proc: {e}\n")
+                }
+            },
+            None => {
+                return format!(
+                    "error: {name}: no recorded start time for pid {pid}; nothing signalled\n"
+                )
+            }
+        }
+
+        let containment = match service.containment() {
+            Ok(Some(mode)) => mode,
+            Ok(None) => return format!("{name}: {verb} requested; nothing to signal\n"),
+            // Reported as an error, and NOTHING is recorded: marking the unit
+            // stopping here would arm a KILL for a containment we never derived
+            // and tell the client it worked.
+            Err(e) => return format!("error: {name}: cannot read /proc to stop it: {e}\n"),
+        };
+
+        // Signal FIRST, and only record the stop if it actually went out. An
+        // earlier draft set `stopping` and armed the KILL before knowing, so a
+        // refused or unenumerable containment still replied without an `error:`
+        // prefix — and the CLI exited 0 on a service that was never signalled.
+        if let Err(why) = self.signal(containment, "TERM") {
+            return format!("error: {name}: {why}\n");
+        }
+        let Some(service) = self.services.get_mut(index) else {
+            return unknown(name);
+        };
+        service.stopping = true;
+        service.start_after_stop = then_start;
+        service.stop_scope = Some(containment);
+        service.deadline = None;
+        service.retry_at = None;
+        // A fresh stop, so the first occupied scan reports again.
+        service.next_sweep = None;
+        service.kill_at = Instant::now().checked_add(service.unit.stop_timeout);
+        service.killed = false;
+        if let Some(cancel) = service.cancel.take() {
+            cancel.store(true, Ordering::Relaxed);
+        }
+        format!("{name}: {verb} requested; TERM sent to {containment:?}\n")
     }
 
     fn on_exit(&mut self, name: &str, code: Option<i32>) {
@@ -1037,6 +1743,26 @@ impl Runtime {
         // The instance this probe was following is gone; stop it forking.
         if let Some(cancel) = service.cancel.take() {
             cancel.store(true, Ordering::Relaxed);
+        }
+
+        // A REQUESTED stop short-circuits the restart policy entirely. Reading
+        // this exit as a failure would restart a `restart=always` daemon
+        // immediately, which would make `stop` a no-op with extra steps.
+        if service.stopping {
+            service.retry_at = None;
+            service.starttime = None;
+            self.finish_stop(index);
+            return;
+        }
+        // A stop that already COMPLETED must not be undone by an exit that
+        // arrives after it. `stopping` is cleared the moment the containment
+        // proves empty, so a leader whose exit lands later would otherwise be
+        // read as a crash and restarted — putting back the service an operator
+        // stopped, with `Stopped` still on the screen that said so.
+        if service.phase == Phase::Stopped {
+            service.retry_at = None;
+            service.starttime = None;
+            return;
         }
 
         if kind == Kind::Oneshot {
@@ -1123,10 +1849,29 @@ impl Runtime {
         }
     }
 
+    /// Wait for the next event, or time out. Test-only: it exists so a test can
+    /// pump the loop one event at a time instead of racing `run`, which never
+    /// returns. Not compiled into the shipped binary.
+    #[cfg(test)]
+    pub fn next_event(&self, timeout: Duration) -> Option<Event> {
+        self.rx.recv_timeout(timeout).ok()
+    }
+
     /// Apply one event, ignoring any that describes an instance we have since
     /// replaced. Without the generation check, a probe launched for a dead
     /// instance can mark its replacement ready.
-    fn dispatch(&mut self, event: Event) {
+    pub(crate) fn dispatch(&mut self, event: Event) {
+        // Handled before the generation check, which asks "is this news about
+        // an instance we have replaced?" — a question a control request has no
+        // answer to. Running it through that check would drop every request
+        // whose verb did not happen to name a current generation.
+        if let Event::Control { request, reply } = event {
+            let answer = self.control(&request);
+            // A client that hung up before the answer is not an error: the
+            // request still ran, which is what it asked for.
+            let _ = reply.send(answer);
+            return;
+        }
         let name = event.name().to_string();
         let generation = event.generation();
         if self.lookup(&name).map(|s| s.generation) != Some(generation) {
@@ -1137,7 +1882,18 @@ impl Runtime {
             // produced a false "did not exit on TERM" plus a signal to a pid
             // that had already been reaped. Nothing else can be in flight,
             // because a unit awaiting its KILL is not eligible to restart.
-            if matches!(event, Event::Exited { .. }) {
+            //
+            // Exactly ONE bump, though. `time_out` bumps by one and keeps the
+            // pid, so that is the whole of the case this handles. If the unit
+            // has since restarted the generation has moved further, the pid and
+            // `kill_at` below belong to the NEW instance, and clearing them
+            // would forget a live process and disarm its escalation on the
+            // strength of news about a long-dead one.
+            let one_bump = self
+                .lookup(&name)
+                .is_some_and(|s| s.generation == generation.wrapping_add(1));
+            if matches!(event, Event::Exited { .. }) && one_bump {
+                let index = self.services.iter().position(|s| s.unit.name == name);
                 if let Some(service) = self.lookup_mut(&name) {
                     if service.kill_at.is_some() {
                         service.kill_at = None;
@@ -1145,10 +1901,24 @@ impl Runtime {
                         service.starttime = None;
                     }
                 }
+                // A stop can be in flight across a generation bump: `time_out`
+                // bumps it while keeping the pid, so a unit an operator stopped
+                // AFTER it overran its `timeout=` arrives here rather than in
+                // `on_exit`. Returning without finishing the stop latched
+                // `stopping` forever and left the operator's `status` reading
+                // `failed`, with nothing ever sweeping the containment.
+                if let Some(index) = index {
+                    if self.services.get(index).is_some_and(|s| s.stopping) {
+                        self.finish_stop(index);
+                    }
+                }
             }
             return;
         }
         match event {
+            // Peeled off above; naming it here keeps the match exhaustive
+            // without a catch-all that would swallow a future variant.
+            Event::Control { .. } => {}
             Event::Exited { code, .. } => self.on_exit(&name, code),
             Event::WaitFailed { error, .. } => {
                 // Fails CLOSED: the child may still be running, so its identity
@@ -1179,17 +1949,6 @@ impl Runtime {
         }
     }
 
-    /// Every pid belonging to a service, for the stop path.
-    #[allow(dead_code)]
-    pub fn members_of(&self, name: &str) -> io::Result<procfs::Scan> {
-        let Some(service) = self.lookup(name) else {
-            return Ok(procfs::Scan::default());
-        };
-        match service.containment()? {
-            Some(mode) => procfs::members(mode, self.self_pid),
-            None => Ok(procfs::Scan::default()),
-        }
-    }
 }
 
 /// One readiness attempt, bounded. Returns true only on a clean exit within
@@ -1223,7 +1982,9 @@ fn probe_once(unit: &Unit) -> bool {
             // The probe got its own process group above, so kill the GROUP: a
             // probe that forked helpers would otherwise leak one set per
             // attempt, and attempts repeat until `ready-timeout`.
-            send_signal(&format!("-{}", child.id()), "KILL");
+            // Best effort: the probe is being abandoned either way, and the
+            // `child.kill()` below is the part that must happen.
+            let _ = send_signal(&format!("-{}", child.id()), "KILL");
             let _ = child.kill();
             let _ = child.wait();
             return false;
@@ -1534,7 +2295,7 @@ mod tests {
         };
 
         let (mut loud_cmd, loud_build) = build(&unit, true).unwrap();
-        let loud_tty = attach_tty(&mut loud_cmd, &unit, true);
+        let loud_tty = attach_tty(&mut loud_cmd, &unit, true).said;
         assert!(
             !loud_build.is_empty() || !loud_tty.is_empty(),
             "a REPORTED spawn must say why the terminal could not be opened; with this \
@@ -1542,7 +2303,7 @@ mod tests {
         );
 
         let (mut quiet_cmd, quiet_build) = build(&unit, false).unwrap();
-        let quiet_tty = attach_tty(&mut quiet_cmd, &unit, false);
+        let quiet_tty = attach_tty(&mut quiet_cmd, &unit, false).said;
         assert!(
             quiet_build.is_empty() && quiet_tty.is_empty(),
             "a GATED spawn built {:?}/{:?}; these run once per restart, so an ungated \
@@ -1674,11 +2435,20 @@ mod tests {
         let child = rt.self_pid.wrapping_add(1);
         // The pre-setsid state: the child leads neither its group nor its
         // session, so both fields still hold td-svc's.
-        let (own_pgrp, own_session) = rt.self_ids.unwrap_or((rt.self_pid, rt.self_pid));
+        let own = rt.self_ids.unwrap_or(procfs::Stat {
+            pgrp: rt.self_pid,
+            session: rt.self_pid,
+            tty_nr: 0,
+            starttime: 0,
+            zombie: false,
+        });
+        let (own_pgrp, own_session) = (own.pgrp, own.session);
         let inherited = procfs::Stat {
             pgrp: own_pgrp,
             session: own_session,
+            tty_nr: 0,
             starttime: 1,
+            zombie: false,
         };
         let mode = classify(child, &inherited);
         assert_eq!(mode, Containment::Process(child));
@@ -1691,7 +2461,9 @@ mod tests {
         let grouped = procfs::Stat {
             pgrp: child,
             session: own_session,
+            tty_nr: 0,
             starttime: 1,
+            zombie: false,
         };
         assert_eq!(classify(child, &grouped), Containment::Group(child));
 
@@ -1700,19 +2472,1159 @@ mod tests {
         let sessioned = procfs::Stat {
             pgrp: child,
             session: child,
+            tty_nr: 0,
             starttime: 1,
+            zombie: false,
         };
         assert_eq!(classify(child, &sessioned), Containment::Session(child));
+    }
+
+    /// A real, live child — so the `/proc` identity checks the stop path makes
+    /// have something true to check. Fabricating a pid makes `control_stop`
+    /// refuse (correctly): it will not signal a pid it cannot prove is still
+    /// the process td-svc started.
+    struct Live {
+        child: std::process::Child,
+        pid: i32,
+        starttime: u64,
+    }
+
+    impl Drop for Live {
+        fn drop(&mut self) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+
+    /// The stop path EXECS `/bin/kill`, and since review it reports a `kill`
+    /// it could not run as a failed stop rather than a successful one — which
+    /// is the point, but it means a host without that binary cannot exercise
+    /// what follows a signal that landed. Those tests skip rather than assert
+    /// a precondition the machine does not meet; the shipped image always has
+    /// it (uutils), and td-svc-test drives this path there.
+    fn can_signal() -> bool {
+        if std::path::Path::new(KILL).exists() {
+            return true;
+        }
+        eprintln!("note: no {KILL} on this host; skipping a post-signal assertion");
+        false
+    }
+
+    fn live_child() -> Option<Live> {
+        // Blocks on a read from a pipe nothing writes to; no busy loop, and no
+        // dependency on a `sleep` binary this host may not have.
+        let child = Command::new("/bin/sh")
+            .arg("-c")
+            .arg("read x")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .ok()?;
+        let pid = i32::try_from(child.id()).ok()?;
+        let starttime = procfs::stat_of(pid).ok()??.starttime;
+        Some(Live {
+            child,
+            pid,
+            starttime,
+        })
+    }
+
+    /// The same, but leading its OWN process group.
+    ///
+    /// `Containment::Process` cannot model a survivor — it names one process,
+    /// so a reaped leader empties it by construction. A group can, and it is
+    /// the shape the real cases have: the greeter's console and any
+    /// `process_group` unit outlive their leader through exactly this.
+    fn live_group_leader() -> Option<Live> {
+        use std::os::unix::process::CommandExt;
+        let child = Command::new("/bin/sh")
+            .arg("-c")
+            .arg("read x")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .process_group(0)
+            .spawn()
+            .ok()?;
+        let pid = i32::try_from(child.id()).ok()?;
+        let starttime = procfs::stat_of(pid).ok()??.starttime;
+        Some(Live {
+            child,
+            pid,
+            starttime,
+        })
+    }
+
+    /// `stop` on a `restart=always` daemon must make it STAY stopped.
+    ///
+    /// This is the whole point of the verb, and the restart policy is what
+    /// fights it: the exit a TERM produces looks exactly like a crash, and
+    /// `restart=always` answers a crash by starting it again. Without the
+    /// `stopping` flag the socket's `stop` is a no-op with extra steps —
+    /// TERM, exit, immediate restart, and the operator sees it running.
+    #[test]
+    fn stopping_an_always_restart_daemon_does_not_restart_it() {
+        if !can_signal() {
+            return;
+        }
+        let mut rt = runtime("[sshd]\ntype=daemon\nexec=/bin/x\nrestart=always\n");
+        let Some(live) = live_child() else { return };
+        {
+            let service = rt.lookup_mut("sshd").unwrap();
+            service.phase = Phase::Ready;
+            service.pid = Some(live.pid);
+            service.starttime = Some(live.starttime);
+            service.started = Some(Instant::now());
+        }
+        let reply = rt.control("stop sshd");
+        assert!(reply.contains("stop requested"), "{reply}");
+        assert!(rt.lookup("sshd").unwrap().stopping);
+
+        // The TERM lands and the process exits — indistinguishable from a crash
+        // except for the flag.
+        rt.on_exit("sshd", None);
+        let service = rt.lookup("sshd").unwrap();
+        assert_eq!(service.phase, Phase::Stopped);
+        assert!(service.retry_at.is_none(), "a stopped unit scheduled a retry");
+        assert!(!service.stopping);
+
+        // ...and nothing starts it again.
+        rt.start_eligible();
+        assert_eq!(rt.lookup("sshd").unwrap().phase, Phase::Stopped);
+    }
+
+    /// `restart` is the same sequence with an intent, and the intent survives
+    /// the exit. It also clears the failure count: an operator restarting a
+    /// crash-looping unit is plainly asking to interrupt the backoff, and
+    /// serving it out anyway would make the verb useless exactly when it is
+    /// most wanted.
+    #[test]
+    fn restart_stops_then_starts_and_interrupts_the_backoff() {
+        if !can_signal() {
+            return;
+        }
+        let mut rt = runtime("[sshd]\ntype=daemon\nexec=/bin/x\nrestart=always\n");
+        let Some(live) = live_child() else { return };
+        {
+            let service = rt.lookup_mut("sshd").unwrap();
+            service.phase = Phase::Held;
+            service.pid = Some(live.pid);
+            service.starttime = Some(live.starttime);
+            service.started = Some(Instant::now());
+            service.fast_failures = 12;
+            service.retry_at = Instant::now().checked_add(Duration::from_secs(300));
+        }
+        let reply = rt.control("restart sshd");
+        assert!(reply.contains("restart requested"), "{reply}");
+
+        rt.on_exit("sshd", None);
+        let service = rt.lookup("sshd").unwrap();
+        assert_eq!(
+            service.phase,
+            Phase::Down,
+            "a restarted unit must be eligible again, not Stopped"
+        );
+        assert_eq!(service.fast_failures, 0, "restart did not clear the backoff");
+        assert!(service.retry_at.is_none());
+    }
+
+    /// A stopped unit still SETTLES, so anything ordered after it proceeds.
+    /// Treating an operator's decision as "not decided yet" would hang every
+    /// dependent — the console included — on an answer that already exists.
+    #[test]
+    fn a_stopped_unit_settles_so_its_dependents_still_run() {
+        if !can_signal() {
+            return;
+        }
+        let mut rt = runtime(
+            "[a]\ntype=daemon\nexec=/bin/x\nrestart=always\n\
+             [b]\ntype=oneshot\nexec=/bin/true\nafter=a\n",
+        );
+        let Some(live) = live_child() else { return };
+        {
+            let service = rt.lookup_mut("a").unwrap();
+            service.phase = Phase::Ready;
+            service.pid = Some(live.pid);
+            service.starttime = Some(live.starttime);
+            service.started = Some(Instant::now());
+        }
+        rt.control("stop a");
+        rt.on_exit("a", None);
+        assert_eq!(rt.lookup("a").unwrap().phase, Phase::Stopped);
+        let b = rt.lookup("b").unwrap().unit.clone();
+        assert!(
+            rt.deps_settled(&b),
+            "b is still waiting on a unit an operator already stopped"
+        );
+    }
+
+    /// `start` on a stopped unit is the only way out of that phase, and it
+    /// clears the backoff for the same reason `restart` does.
+    #[test]
+    fn start_is_the_only_way_out_of_stopped() {
+        let mut rt = runtime("[sshd]\ntype=daemon\nexec=/bin/x\nrestart=always\n");
+        {
+            let service = rt.lookup_mut("sshd").unwrap();
+            service.phase = Phase::Stopped;
+            service.fast_failures = 9;
+        }
+        rt.start_eligible();
+        assert_eq!(
+            rt.lookup("sshd").unwrap().phase,
+            Phase::Stopped,
+            "the ordinary loop restarted a unit an operator stopped"
+        );
+        let reply = rt.control("start sshd");
+        assert!(reply.contains("starting"), "{reply}");
+        let service = rt.lookup("sshd").unwrap();
+        assert_eq!(service.phase, Phase::Down);
+        assert_eq!(service.fast_failures, 0);
+    }
+
+    /// Requests that name nothing real, or name too much, get an answer rather
+    /// than silence or a panic. This is a socket an operator types at.
+    #[test]
+    fn malformed_requests_are_answered_not_ignored() {
+        let mut rt = runtime("[a]\ntype=daemon\nexec=/bin/x\n");
+        for (request, expect) in [
+            ("", "empty request"),
+            ("frobnicate", "unknown request"),
+            ("stop", "needs a service name"),
+            ("stop nosuch", "no such service"),
+            ("status a b", "too many arguments"),
+        ] {
+            let reply = rt.control(request);
+            assert!(
+                reply.contains(expect),
+                "request {request:?} answered {reply:?}, expected it to mention {expect:?}"
+            );
+        }
+        // A well-formed status still works after all of that.
+        assert!(rt.control("status").contains("a down"));
+    }
+
+    /// `stop` on something already down is not an error, but it must not claim
+    /// to have signalled anything — and `restart` on it must still start it,
+    /// or restarting a crashed daemon would quietly leave it down.
+    #[test]
+    fn stopping_and_restarting_a_unit_that_is_not_running() {
+        let mut rt = runtime("[a]\ntype=daemon\nexec=/bin/x\nrestart=always\n");
+        let reply = rt.control("stop a");
+        assert!(reply.contains("was not running"), "{reply}");
+        assert_eq!(rt.lookup("a").unwrap().phase, Phase::Stopped);
+
+        let reply = rt.control("restart a");
+        assert!(reply.contains("starting"), "{reply}");
+        assert_eq!(rt.lookup("a").unwrap().phase, Phase::Down);
+    }
+
+    /// `start` on a unit the plan could not order must say so, not lie.
+    ///
+    /// `start_eligible` walks `self.order`, and the plan drops a unit in a
+    /// dependency cycle (and anything downstream of one). Replying "starting"
+    /// left it `Down` with nothing that would ever pick it up — a client that
+    /// exited 0 on a service that never ran, forever.
+    #[test]
+    fn starting_a_unit_the_plan_dropped_answers_with_the_reason() {
+        let mut rt = runtime(
+            "[a]\ntype=oneshot\nexec=/x\nafter=b\n\
+             [b]\ntype=oneshot\nexec=/x\nafter=a\n",
+        );
+        let reply = rt.control("start a");
+        assert!(
+            reply.starts_with("error:") && reply.contains("could not order it"),
+            "a unit the plan dropped was told it was starting: {reply:?}"
+        );
+        // ...and it is still not running three passes later, which is the
+        // outcome the old reply concealed.
+        for _ in 0..3 {
+            rt.start_eligible();
+        }
+        assert!(rt.lookup("a").unwrap().pid.is_none());
+    }
+
+    /// A stop that begins AFTER the unit overran its `timeout=` must still
+    /// finish. `time_out` bumps the generation while keeping the pid, so the
+    /// waiter's exit lands in the stale branch — which used to return without
+    /// finishing the stop, latching `stopping` forever while `status` read
+    /// `failed` and nothing swept the containment.
+    #[test]
+    fn a_stop_that_races_a_timeout_still_completes() {
+        if !can_signal() {
+            return;
+        }
+        let mut rt = runtime("[slow]\ntype=oneshot\nexec=/x\ntimeout=1\n");
+        let Some(live) = live_child() else { return };
+        {
+            let service = rt.lookup_mut("slow").unwrap();
+            service.phase = Phase::Starting;
+            service.pid = Some(live.pid);
+            service.starttime = Some(live.starttime);
+            service.deadline = Instant::now().checked_sub(Duration::from_secs(1));
+        }
+        // The timeout fires: TERM sent, generation bumped, pid kept.
+        rt.enforce_deadlines();
+        let generation = rt.lookup("slow").unwrap().generation;
+        // ...and only then does an operator ask for a stop.
+        rt.control("stop slow");
+        assert!(rt.lookup("slow").unwrap().stopping);
+        // The waiter's exit carries the OLD generation, so it is "stale".
+        drop(live);
+        rt.dispatch(Event::Exited {
+            name: "slow".into(),
+            generation: generation.wrapping_sub(1),
+            code: None,
+        });
+        let service = rt.lookup("slow").unwrap();
+        assert!(
+            !service.stopping,
+            "the stop latched across the generation bump; nothing would ever finish it"
+        );
+    }
+
+    /// A stop must not SETTLE until the process is actually gone.
+    ///
+    /// Found by mutation: adding `phase = Stopped` at TERM time left every test
+    /// green. That is the fail-open shape I4 forbids — the reply says "TERM
+    /// sent", and anything ordered after the unit would proceed while it was
+    /// still running.
+    #[test]
+    fn a_stop_does_not_settle_the_unit_before_the_process_exits() {
+        // Without a working `kill` the stop is REFUSED before anything is
+        // recorded, so the assertions below hold for the wrong reason and the
+        // mutation this test exists to catch (setting `Stopped` at TERM time)
+        // goes unnoticed.
+        if !can_signal() {
+            return;
+        }
+        let mut rt = runtime("[a]\ntype=daemon\nexec=/x\nrestart=always\n");
+        let Some(live) = live_child() else { return };
+        {
+            let service = rt.lookup_mut("a").unwrap();
+            service.phase = Phase::Ready;
+            service.pid = Some(live.pid);
+            service.starttime = Some(live.starttime);
+            service.started = Some(Instant::now());
+        }
+        rt.control("stop a");
+        let service = rt.lookup("a").unwrap();
+        assert_eq!(
+            service.phase,
+            Phase::Ready,
+            "the unit settled at TERM time; the process has not exited yet"
+        );
+        assert!(service.pid.is_some(), "the pid was released before the exit");
+    }
+
+    /// ...and it must ARM the escalation, or a daemon that ignores TERM is left
+    /// running forever while the client is told the TERM went out.
+    ///
+    /// Also found by mutation: deleting the `kill_at` assignment left every test
+    /// green, because the only escalation test covered the `timeout=` path.
+    #[test]
+    fn a_stop_arms_the_kill_that_follows_an_ignored_term() {
+        if !can_signal() {
+            return;
+        }
+        let mut rt = runtime("[a]\ntype=daemon\nexec=/x\nrestart=always\n");
+        let Some(live) = live_child() else { return };
+        {
+            let service = rt.lookup_mut("a").unwrap();
+            service.phase = Phase::Ready;
+            service.pid = Some(live.pid);
+            service.starttime = Some(live.starttime);
+            service.started = Some(Instant::now());
+        }
+        rt.control("stop a");
+        assert!(
+            rt.lookup("a").unwrap().kill_at.is_some(),
+            "a requested stop scheduled no KILL; a process that ignores TERM would \
+             never be escalated on and the unit would sit stopping for good"
+        );
+    }
+
+    /// The fail-closed direction of the console self-check, pinned.
+    ///
+    /// Mutation showed `None => false` passing everything: the `self_ids ==
+    /// None` case was asserted for `Group` and `Session` but not for the variant
+    /// this landing added. Not knowing its own ids is exactly when td-svc must
+    /// refuse, because it cannot prove the target is not itself.
+    #[test]
+    fn a_console_containment_is_refused_when_td_svc_cannot_read_its_own_ids() {
+        let mut rt = runtime("[greeter]\ntype=daemon\nexec=/x\ntty=ttyS0\n");
+        let elsewhere = Containment::Console {
+            leader: rt.self_pid.wrapping_add(7),
+            tty: 1088,
+        };
+        rt.self_ids = None;
+        assert!(
+            rt.contains_self(elsewhere),
+            "with its own ids unknown td-svc signalled a console containment anyway; \
+             it cannot prove that set excludes itself"
+        );
+        // ...and device 0 is refused whatever the ids say, because a td-svc run
+        // from a terminal HAS a real one and the comparison would let 0 through.
+        rt.self_ids = Some(procfs::Stat {
+            pgrp: rt.self_pid,
+            session: rt.self_pid,
+            tty_nr: 1088,
+            starttime: 0,
+            zombie: false,
+        });
+        assert!(
+            rt.contains_self(Containment::Console {
+                leader: rt.self_pid.wrapping_add(7),
+                tty: 0
+            }),
+            "device 0 was accepted; that set is every daemon on the machine"
+        );
+    }
+
+    /// I4, the half a leader's exit does not prove.
+    ///
+    /// A stop is complete when the leader is reaped AND the containment is
+    /// empty. For the greeter the leader is a shell whose `getty` child holds
+    /// the console, so its exit is exactly the misleading signal: an earlier
+    /// draft marked the unit `Stopped` on it and cancelled the KILL, leaving
+    /// getty, login and a user's shell on the terminal while `status` said
+    /// stopped.
+    #[test]
+    fn a_stop_is_not_finished_while_its_containment_still_has_members() {
+        let mut rt = runtime("[greeter]\ntype=daemon\nexec=/x\nrestart=always\n");
+        let Some(mut live) = live_group_leader() else {
+            return;
+        };
+        {
+            let service = rt.lookup_mut("greeter").unwrap();
+            service.phase = Phase::Ready;
+            service.pid = Some(live.pid);
+            service.starttime = Some(live.starttime);
+            service.started = Some(Instant::now());
+            service.stopping = true;
+            // A scope that provably still has a member: the live child itself,
+            // which leads this group.
+            service.stop_scope = Some(Containment::Group(live.pid));
+        }
+        // The leader is reaped...
+        rt.on_exit("greeter", None);
+        let service = rt.lookup("greeter").unwrap();
+        assert_ne!(
+            service.phase,
+            Phase::Stopped,
+            "the unit was declared stopped while its containment still had members"
+        );
+        assert!(service.stopping, "the stop was abandoned mid-flight");
+        assert!(
+            service.kill_at.is_some(),
+            "the KILL was disarmed while survivors remained; nothing would sweep them"
+        );
+        assert!(
+            service.next_sweep.is_some(),
+            "no re-scan was scheduled; survivors produce no event, so the unit \
+             would sit stopping forever"
+        );
+
+        // ...and once the containment really is empty, the SWEEP completes it.
+        // Nothing else can: the survivor is not td-svc's child, so its exit
+        // arrives as no event at all.
+        let _ = live.child.kill();
+        let _ = live.child.wait();
+        rt.lookup_mut("greeter").unwrap().next_sweep = Instant::now().checked_sub(SWEPT_AGO);
+        rt.enforce_deadlines();
+        assert_eq!(
+            rt.lookup("greeter").unwrap().phase,
+            Phase::Stopped,
+            "the containment drained but nothing swept it back to stopped"
+        );
+    }
+
+    /// Far enough in the past that a scheduled sweep is unambiguously due.
+    const SWEPT_AGO: Duration = Duration::from_secs(3600);
+
+    /// The other half of I4: a `Process` scope is empty the moment its leader
+    /// is reaped, and must NOT be scanned for.
+    ///
+    /// That pid is no longer ours once the waiter reaps it, and the kernel can
+    /// hand it straight to something unrelated. Scanning anyway finds the
+    /// stranger, leaves the unit `stopping` with no event that could ever
+    /// finish it, and points the escalation's KILL at whatever now holds the
+    /// pid.
+    #[test]
+    fn a_process_containment_is_empty_once_its_leader_is_reaped() {
+        let mut rt = runtime("[a]\ntype=daemon\nexec=/x\n");
+        let Some(live) = live_child() else { return };
+        {
+            let service = rt.lookup_mut("a").unwrap();
+            service.stopping = true;
+            // Stands in for a recycled pid: a process that is provably ALIVE
+            // and provably not this unit's. A scan would still see it.
+            service.stop_scope = Some(Containment::Process(live.pid));
+        }
+        rt.on_exit("a", None);
+        assert_eq!(
+            rt.lookup("a").unwrap().phase,
+            Phase::Stopped,
+            "a single-process containment was scanned after its leader was \
+             reaped, so a recycled pid kept the unit from ever stopping"
+        );
+        drop(live);
+    }
+
+    /// A `tty=` that names something which is not a device resolves to
+    /// nothing, rather than to device 0.
+    ///
+    /// Device 0 means "no controlling terminal", and `contains_self` refuses a
+    /// `Console` scope carrying it outright — so a unit that built one would be
+    /// permanently unstoppable, its `timeout=` TERM refused along with
+    /// everything else. Dropping the guard left the suite green: the existing
+    /// coverage only exercises a path `metadata` cannot stat at all, which
+    /// fails one step earlier and never reaches this.
+    #[test]
+    fn a_tty_that_is_not_a_device_resolves_to_no_containment() {
+        let path = format!(
+            "{}/td-svc-not-a-device-{}",
+            std::env::temp_dir().display(),
+            std::process::id()
+        );
+        if std::fs::write(&path, b"regular file").is_err() {
+            return;
+        }
+        // A regular file opens fine and has rdev 0 — the case the `!= 0` guard
+        // is for, and the one a path that cannot be opened never reaches.
+        let Ok(file) = std::fs::File::open(&path) else {
+            return;
+        };
+        assert_eq!(
+            attached_device(&file),
+            None,
+            "a non-device tty= resolved to device 0, which makes the unit \
+             unstoppable: every signal to that containment is refused"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A stale exit must not clear a LIVE instance's identity.
+    ///
+    /// The stale-exit branch exists for `time_out`, which bumps the generation
+    /// by one and keeps the pid. If the unit has since RESTARTED, the pid and
+    /// `kill_at` it would clear belong to the new instance — so news about a
+    /// long-dead process would forget a running one and disarm the escalation
+    /// that was going to kill it.
+    #[test]
+    fn a_stale_exit_does_not_forget_a_newer_instance() {
+        let mut rt = runtime("[a]\ntype=daemon\nexec=/x\nrestart=always\n");
+        {
+            let service = rt.lookup_mut("a").unwrap();
+            // Two bumps past the event below: timed out, then restarted.
+            service.generation = 7;
+            service.phase = Phase::Ready;
+            service.pid = Some(4242);
+            service.starttime = Some(99);
+            service.kill_at = Instant::now().checked_add(Duration::from_secs(30));
+        }
+        rt.dispatch(Event::Exited {
+            name: "a".to_string(),
+            generation: 5,
+            code: Some(0),
+        });
+        let service = rt.lookup("a").unwrap();
+        assert_eq!(
+            service.pid,
+            Some(4242),
+            "a stale exit forgot the pid of a newer, live instance"
+        );
+        assert!(
+            service.kill_at.is_some(),
+            "a stale exit disarmed the KILL of a newer, live instance"
+        );
+    }
+
+    /// A requested stop keeps its identity through the KILL.
+    ///
+    /// `escalate` used to release `pid`/`starttime` unconditionally, but the
+    /// waiter thread still owns the `Child` and the leader can outlive the KILL
+    /// by a moment. With the pid gone the sweep reads the containment as empty
+    /// (a `Console` scope cannot see the leader once its half is narrowed
+    /// away), declares `Stopped` over a live leader, and the late exit then
+    /// runs the restart policy — putting back the service an operator stopped.
+    ///
+    /// No `/bin/kill` is needed: an empty scope means nothing is signalled, so
+    /// this isolates the release from the send.
+    #[test]
+    fn escalating_a_requested_stop_does_not_release_the_leader() {
+        let mut rt = runtime("[a]\ntype=daemon\nexec=/x\nrestart=always\n");
+        let index = rt.index_of("a").unwrap();
+        {
+            let service = rt.lookup_mut("a").unwrap();
+            service.phase = Phase::Ready;
+            service.pid = Some(4242);
+            service.starttime = Some(1);
+            service.stopping = true;
+            // Nothing to signal, so `escalate` reaches the release directly.
+            service.stop_scope = None;
+            service.kill_at = Instant::now().checked_sub(SWEPT_AGO);
+        }
+        rt.escalate(index);
+        let service = rt.lookup("a").unwrap();
+        assert_eq!(
+            service.pid,
+            Some(4242),
+            "the leader's identity was released while its waiter still owned the \
+             child; the sweep can now call a live leader stopped"
+        );
+        assert!(service.starttime.is_some(), "the start time went with it");
+    }
+
+    /// An exit that arrives AFTER a stop completed is not a crash.
+    ///
+    /// `stopping` is cleared the moment the containment proves empty, so a
+    /// leader whose exit lands later hits the ordinary restart policy — and a
+    /// `restart=always` daemon comes straight back, with `Stopped` still on the
+    /// screen that reported it.
+    #[test]
+    fn an_exit_after_a_completed_stop_does_not_restart_the_unit() {
+        let mut rt = runtime("[a]\ntype=daemon\nexec=/x\nrestart=always\n");
+        {
+            let service = rt.lookup_mut("a").unwrap();
+            service.phase = Phase::Stopped;
+            service.pid = Some(4242);
+            service.starttime = Some(1);
+            service.stopping = false;
+        }
+        rt.on_exit("a", None);
+        let service = rt.lookup("a").unwrap();
+        assert_eq!(
+            service.phase,
+            Phase::Stopped,
+            "a late exit reopened a stop that had already completed"
+        );
+        assert!(
+            service.retry_at.is_none(),
+            "a restart was scheduled for a service an operator stopped"
+        );
+    }
+
+    /// The KILL is aimed at the RECORDED scope, through the real call site.
+    ///
+    /// `kill_target` is pinned as a function, but nothing pinned that
+    /// `escalate` passes `stop_scope` into it: replacing that argument with
+    /// `None` left every test green while silently restoring the P0. The
+    /// `killed` flag is set exactly when a target was chosen, so it stands in
+    /// for the send on a host with no `/bin/kill`.
+    #[test]
+    fn escalate_aims_at_the_recorded_scope() {
+        let mut rt = runtime("[a]\ntype=daemon\nexec=/x\nrestart=always\n");
+        let index = rt.index_of("a").unwrap();
+        {
+            let service = rt.lookup_mut("a").unwrap();
+            service.phase = Phase::Ready;
+            service.pid = None; // leader reaped; survivors hold the group
+            service.stopping = true;
+            service.stop_scope = Some(Containment::Group(999_998));
+            service.kill_at = Instant::now().checked_sub(SWEPT_AGO);
+        }
+        rt.escalate(index);
+        let service = rt.lookup("a").unwrap();
+        assert!(
+            service.killed,
+            "no KILL was aimed at the recorded scope, so survivors of a stop are \
+             never killed once the leader is reaped"
+        );
+        assert!(
+            service.next_sweep.is_some(),
+            "no re-scan was scheduled after the KILL, so nothing confirms it worked"
+        );
+    }
+
+    /// A pending sweep must WAKE the loop, or it is not a timer.
+    ///
+    /// Nothing else wakes td-svc when a containment drains, so a sweep left out
+    /// of `next_wake` waits on whatever unrelated deadline happens to be
+    /// nearest — a crash-looper parked at the five-minute backoff cap, with the
+    /// console down for all of it.
+    #[test]
+    fn a_pending_sweep_is_a_wake_source() {
+        let mut rt = runtime("[a]\ntype=daemon\nexec=/x\n");
+        let soon = Instant::now().checked_add(Duration::from_secs(1)).unwrap();
+        {
+            let service = rt.lookup_mut("a").unwrap();
+            service.phase = Phase::Ready;
+            service.stopping = true;
+            service.pid = None;
+            service.next_sweep = Some(soon);
+        }
+        let wake = rt.start_eligible();
+        assert!(
+            wake.is_some_and(|at| at <= soon),
+            "a pending sweep did not enter the wake calculation: {wake:?}"
+        );
+    }
+
+    /// A stop in flight is neither running nor stopped, and both readers of
+    /// that state used to see "running".
+    ///
+    /// The phase cannot move until the stop completes — saying `Stopped` before
+    /// the containment is empty is the fail-open I4 exists to refuse — so a
+    /// unit whose leader is reaped but whose survivors remain sits at `Ready`.
+    /// That is right for the invariant and wrong for everyone reading it: the
+    /// operator sees a healthy service, and a strict dependent starts against
+    /// one that is gone.
+    #[test]
+    fn a_stop_in_flight_is_reported_and_does_not_satisfy_a_strict_requires() {
+        let mut rt = runtime(
+            "[a]\ntype=daemon\nexec=/x\nrestart=always\n\
+             [b]\ntype=oneshot\nexec=/bin/true\nrequires=a\n",
+        );
+        {
+            let service = rt.lookup_mut("a").unwrap();
+            // The state a leader-reaped stop leaves behind.
+            service.phase = Phase::Ready;
+            service.pid = None;
+            service.stopping = true;
+        }
+        let index = rt.index_of("a").unwrap();
+        let line = rt.status_line(index);
+        assert!(
+            line.contains("a stopping"),
+            "a unit mid-stop reported its pre-stop phase: {line}"
+        );
+        let b = rt.lookup("b").unwrap().unit.clone();
+        assert_eq!(
+            rt.requires_failed(&b).as_deref(),
+            Some("a"),
+            "a strict dependent started against a service that was being torn down"
+        );
+    }
+
+    /// The KILL half of a requested stop, which a reaped leader used to erase.
+    ///
+    /// `escalate` re-derived its target, and deriving one needs a live pid — so
+    /// the moment the leader was reaped the KILL addressed `None` and did
+    /// nothing at all. The survivors it exists to reach are precisely that
+    /// case: the stop is unfinished BECAUSE something outlived the leader. On
+    /// the shipped greeter that is an auto-logged-in interactive shell, which
+    /// ignores TERM, so `stop greeter` left a live root shell on the console
+    /// and no KILL ever came.
+    #[test]
+    fn a_requested_stop_kills_the_scope_it_termed_even_once_the_leader_is_reaped() {
+        // The leader is gone (`same` false) but the group it led still has
+        // members. A group id cannot be recycled while the group is non-empty,
+        // so it stays a legitimate target.
+        assert_eq!(
+            kill_target(true, false, Some(Containment::Group(4242)), None),
+            Some(Containment::Group(4242)),
+            "the KILL was skipped once the leader was reaped, so a survivor \
+             that ignores TERM is never killed at all"
+        );
+        // Same for a console: the terminal half is keyed on a DEVICE, so it
+        // survives the leader and still names the login tree.
+        assert_eq!(
+            kill_target(
+                true,
+                false,
+                Some(Containment::Console {
+                    leader: 77,
+                    tty: 1088
+                }),
+                None
+            ),
+            Some(Containment::Console {
+                leader: 0,
+                tty: 1088
+            }),
+            "the console's terminal half was dropped with its leader"
+        );
+        // But the pid-keyed half must go: it may already be someone else.
+        assert_eq!(
+            kill_target(true, false, Some(Containment::Process(77)), None),
+            None,
+            "a single-process scope was KILLed after its leader was reaped, so \
+             the signal lands on whatever recycled that pid"
+        );
+    }
+
+    /// The KILL goes to the RECORDED scope, never a freshly derived one.
+    ///
+    /// Recording `stop_scope` is pointless if the escalation re-derives. A
+    /// `tty=` unit whose device stops resolving between the TERM and the KILL
+    /// derives down to its wrapper alone — so the TERM would go to the whole
+    /// terminal and the KILL to one process of it.
+    #[test]
+    fn the_kill_addresses_the_same_set_the_term_did() {
+        let recorded = Containment::Console {
+            leader: 5,
+            tty: 1088,
+        };
+        let derived = Containment::Process(5);
+        assert_eq!(
+            kill_target(true, true, Some(recorded), Some(derived)),
+            Some(recorded),
+            "the KILL re-derived its target instead of using the one the TERM \
+             went to"
+        );
+        // With no stop in flight there is nothing recorded to honour, and a
+        // leader that is no longer ours leaves nothing safe to address.
+        assert_eq!(
+            kill_target(false, true, None, Some(derived)),
+            Some(derived)
+        );
+        assert_eq!(kill_target(false, false, Some(recorded), Some(derived)), None);
+    }
+
+    /// `start` during a stop whose leader is already reaped.
+    ///
+    /// The leader exiting is not the stop finishing (I4), and that state has
+    /// `pid == None`. Reading it as "not running" cleared `stopping` and
+    /// queued a SECOND instance alongside processes the operator had just
+    /// asked to end — with `kill_at` dropped, so nothing swept them either.
+    #[test]
+    fn start_during_a_stop_whose_leader_is_reaped_does_not_double_start() {
+        let mut rt = runtime("[a]\ntype=daemon\nexec=/x\nrestart=always\n");
+        {
+            let service = rt.lookup_mut("a").unwrap();
+            service.phase = Phase::Ready;
+            service.pid = None;
+            service.stopping = true;
+            service.stop_scope = Some(Containment::Group(999_999));
+        }
+        let reply = rt.control("start a");
+        assert!(reply.contains("stop in progress"), "{reply}");
+        let service = rt.lookup("a").unwrap();
+        assert!(
+            service.stopping,
+            "the in-flight stop was cleared; nothing would sweep its survivors"
+        );
+        assert!(
+            service.start_after_stop,
+            "the start was neither honoured now nor recorded for later"
+        );
+        assert_ne!(
+            service.phase,
+            Phase::Down,
+            "the unit was queued to start beside processes still being torn down"
+        );
+    }
+
+    /// An UNREADABLE scan is not an empty one (I3). A stop that cannot confirm
+    /// emptiness must stay a stop, or the teardown proceeds over a live service.
+    #[test]
+    fn a_scan_that_cannot_be_read_does_not_count_as_stopped() {
+        // The arm this is named for. An unreadable `/proc` cannot be arranged
+        // from a unit test, which is why the decision is a function: without
+        // this the I3 reading had nothing pinning it, and returning 0 here —
+        // proceeding with a teardown over a service that may still be running
+        // — left the suite green.
+        let oops = io::Error::other("proc went away");
+        assert_eq!(
+            occupancy(Err(&oops)),
+            1,
+            "an unreadable scan was counted as an empty containment"
+        );
+
+        // A scan that found nothing but could not read everything is not
+        // empty either.
+        let partial = procfs::Scan {
+            pids: Vec::new(),
+            errors: vec!["/proc/9: EACCES".to_string()],
+        };
+        assert_eq!(
+            occupancy(Ok(&partial)),
+            1,
+            "a scan with unread entries was treated as proof of emptiness"
+        );
+
+        // And the control case, or the two above could pass by always
+        // answering 1.
+        let empty = procfs::Scan {
+            pids: Vec::new(),
+            errors: Vec::new(),
+        };
+        assert_eq!(occupancy(Ok(&empty)), 0);
+
+        // End to end: a scope that is provably empty completes the stop.
+        let mut rt = runtime("[a]\ntype=daemon\nexec=/x\n");
+        {
+            let service = rt.lookup_mut("a").unwrap();
+            service.stopping = true;
+            service.stop_scope = None;
+        }
+        rt.on_exit("a", None);
+        assert_eq!(rt.lookup("a").unwrap().phase, Phase::Stopped);
+    }
+
+    /// The TERM gets the same identity check the KILL does, one step earlier.
+    ///
+    /// A waiter can already have reaped the child while its `Exited` event is
+    /// still in the channel, and the kernel can have handed the pid on. For a
+    /// `tty=` unit that would derive a containment from a STRANGER and TERM
+    /// everything on its terminal, so this fails closed and signals nothing.
+    #[test]
+    fn a_stop_refuses_a_pid_it_cannot_prove_is_still_ours() {
+        let mut rt = runtime("[a]\ntype=daemon\nexec=/x\nrestart=always\n");
+        let Some(live) = live_child() else { return };
+        {
+            let service = rt.lookup_mut("a").unwrap();
+            service.phase = Phase::Ready;
+            service.pid = Some(live.pid);
+            // A start time that is not this process's: the shape a recycled pid
+            // presents.
+            service.starttime = Some(live.starttime.wrapping_add(999_999));
+            service.started = Some(Instant::now());
+        }
+        let reply = rt.control("stop a");
+        assert!(
+            reply.starts_with("error:") && reply.contains("no longer the process"),
+            "a recycled pid was signalled anyway: {reply:?}"
+        );
+        let service = rt.lookup("a").unwrap();
+        assert!(!service.stopping, "a refused stop was recorded as in flight");
+        assert!(service.kill_at.is_none(), "a refused stop armed a KILL");
+    }
+
+    /// `stop` during an in-flight stop must not leave a stale restart intent,
+    /// and `start` during one must not silently do nothing.
+    #[test]
+    fn a_second_request_while_a_stop_is_in_flight_does_not_strand_the_unit() {
+        if !can_signal() {
+            return;
+        }
+        let mut rt = runtime("[a]\ntype=daemon\nexec=/x\nrestart=always\n");
+        let Some(live) = live_child() else { return };
+        {
+            let service = rt.lookup_mut("a").unwrap();
+            service.phase = Phase::Ready;
+            service.pid = Some(live.pid);
+            service.starttime = Some(live.starttime);
+            service.started = Some(Instant::now());
+        }
+        // restart arms the intent...
+        assert!(rt.control("restart a").contains("restart requested"));
+        assert!(rt.lookup("a").unwrap().start_after_stop);
+
+        // ...and `start` during the stop keeps it rather than replying
+        // "already running" and doing nothing.
+        let reply = rt.control("start a");
+        assert!(reply.contains("stop in progress"), "{reply}");
+        assert!(rt.lookup("a").unwrap().start_after_stop);
+
+        // A `stop` after the LEADER is gone must clear the restart intent, or
+        // the stop would complete into a start nobody asked for any more...
+        rt.lookup_mut("a").unwrap().pid = None;
+        let reply = rt.control("stop a");
+        assert!(reply.contains("already in progress"), "{reply}");
+        let service = rt.lookup("a").unwrap();
+        assert!(
+            !service.start_after_stop,
+            "a stale restart intent survived a stop"
+        );
+        // ...but it must NOT declare the unit stopped or drop the teardown. A
+        // reaped leader is not an empty containment (I4), and clearing
+        // `stopping` here strands whatever is still in it with nothing left to
+        // sweep it — the fail-open this whole path exists to refuse.
+        assert!(
+            service.stopping,
+            "a second stop abandoned the teardown already in flight"
+        );
+        assert_ne!(
+            service.phase,
+            Phase::Stopped,
+            "the unit reported stopped without its containment being checked"
+        );
+    }
+
+    /// `requires=` asks whether the dependency is THERE. A service an operator
+    /// stopped is exactly as absent as one that failed, so it must not satisfy
+    /// a strict dependency — even though it settles for `after=`, which asks
+    /// only whether a decision has been reached.
+    #[test]
+    fn a_stopped_unit_does_not_satisfy_a_strict_requires() {
+        let mut rt = runtime(
+            "[a]\ntype=daemon\nexec=/x\nrestart=always\n\
+             [b]\ntype=oneshot\nexec=/bin/true\nrequires=a\n",
+        );
+        rt.lookup_mut("a").unwrap().phase = Phase::Stopped;
+        let b = rt.lookup("b").unwrap().unit.clone();
+        assert_eq!(
+            rt.requires_failed(&b).as_deref(),
+            Some("a"),
+            "a strict dependent started while what it requires was stopped"
+        );
+    }
+
+    /// The containment that actually reaches a login tree — keyed on the
+    /// device the UNIT named, because the child never has one.
+    ///
+    /// An earlier draft read field 7 off the child and was inert: td-svc opens
+    /// the tty `O_NOCTTY`, so the wrapper never acquires a controlling terminal
+    /// and its field 7 stays 0 for its whole life. Confirmed by running the
+    /// shipped binary against a real pty. Its test fabricated a wrapper that
+    /// already held the terminal — a state that cannot occur — so it passed
+    /// while the real login tree escaped. This one asks `containment()`, which
+    /// resolves the configured device, rather than asserting on `classify`.
+    #[test]
+    fn a_console_unit_is_contained_by_the_device_it_named_plus_its_leader() {
+        // A device that exists on any Linux host, so this resolves for real.
+        let (unit_tty, path) = ("tty", "/dev/tty");
+        let Ok(meta) = std::fs::metadata(path) else {
+            return; // no /dev/tty in this sandbox; the recipe leg covers it
+        };
+        let expect = i32::try_from(std::os::unix::fs::MetadataExt::rdev(&meta)).unwrap();
+        let mut rt = runtime(&format!(
+            "[greeter]\ntype=daemon\nexec=/x\ntty={unit_tty}\n"
+        ));
+        let child = rt.self_pid.wrapping_add(1);
+        {
+            let service = rt.lookup_mut("greeter").unwrap();
+            service.pid = Some(child);
+            // What `attach_tty` records at spawn, read off the descriptor it
+            // actually opened.
+            service.tty_dev = Some(expect);
+        }
+        let mode = rt.lookup("greeter").unwrap().containment().unwrap().unwrap();
+        assert_eq!(
+            mode,
+            Containment::Console {
+                leader: child,
+                tty: expect
+            },
+            "a console unit must be contained by the device it holds; keying on the \
+             child's own field 7 gives 0, which matches nothing"
+        );
+        assert!(
+            !rt.contains_self(mode),
+            "containment {mode:?} would have signalled td-svc itself"
+        );
+
+        // The ATTACHED device wins over the one the unit named. They differ
+        // whenever `attach_tty` fell back to `/dev/console`, and a containment
+        // built from the name would then signal a terminal this service is not
+        // on — someone else's session.
+        let elsewhere = expect.wrapping_add(1);
+        rt.lookup_mut("greeter").unwrap().tty_dev = Some(elsewhere);
+        assert_eq!(
+            rt.lookup("greeter").unwrap().containment().unwrap().unwrap(),
+            Containment::Console {
+                leader: child,
+                tty: elsewhere
+            },
+            "containment re-resolved the unit's tty= instead of using the device \
+             the running instance actually got"
+        );
+
+        // And with nothing attached there is no console containment at all:
+        // that state means `attach_tty` opened NOTHING, so the child has no
+        // terminal and the device it merely named belongs to someone else.
+        rt.lookup_mut("greeter").unwrap().tty_dev = None;
+        let fallen_back = rt.lookup("greeter").unwrap().containment().unwrap();
+        assert!(
+            !matches!(fallen_back, Some(Containment::Console { .. })),
+            "a unit that got no terminal was contained by the device it named: \
+             {fallen_back:?}"
+        );
+    }
+
+    /// Both halves are needed, and a test that drops either would still pass on
+    /// the other. The leader alone misses everything getty exec'd; the terminal
+    /// alone misses the one process td-svc actually waits on.
+    #[test]
+    fn a_console_containment_reaches_the_leader_and_the_terminal_separately() {
+        let leader = 424_242;
+        let tty = 1088; // /dev/ttyS0
+        let mode = Containment::Console { leader, tty };
+        let on_tty = procfs::Stat {
+            pgrp: 9,
+            session: 9,
+            tty_nr: tty,
+            starttime: 1,
+            zombie: false,
+        };
+        let elsewhere = procfs::Stat {
+            pgrp: 9,
+            session: 9,
+            tty_nr: 0,
+            starttime: 1,
+            zombie: false,
+        };
+        // getty and its descendants: on the terminal, unrelated pid.
+        assert!(procfs::matches(mode, 999, &on_tty));
+        // the wrapper: the leader pid, with NO controlling terminal.
+        assert!(procfs::matches(mode, leader, &elsewhere));
+        // a daemon with neither: must not be selected. This is the one that
+        // matters — every process on the machine has tty_nr 0.
+        assert!(!procfs::matches(mode, 1000, &elsewhere));
+    }
+
+    /// tty 0 is "no controlling terminal", which every daemon on the machine
+    /// has — td-svc and PID 1 included. It must never MATCH: a console
+    /// containment naming device 0 would otherwise select the entire system.
+    #[test]
+    fn no_controlling_terminal_is_never_a_containment() {
+        let rt = runtime("[greeter]\ntype=daemon\nexec=/x\ntty=ttyS0\n");
+        let child = rt.self_pid.wrapping_add(1);
+        let own = rt.self_ids.unwrap_or(procfs::Stat {
+            pgrp: rt.self_pid,
+            session: rt.self_pid,
+            tty_nr: 0,
+            starttime: 0,
+            zombie: false,
+        });
+        let (own_pgrp, own_session) = (own.pgrp, own.session);
+        let no_tty = procfs::Stat {
+            pgrp: own_pgrp,
+            session: own_session,
+            tty_nr: 0,
+            starttime: 1,
+            zombie: false,
+        };
+        assert_eq!(classify(child, &no_tty), Containment::Process(child));
+        // `attached_device` refuses to build a 0, and the scan refuses to match
+        // one that arrived by any other route: an unrelated daemon (tty_nr 0,
+        // not the leader) must not be selected by a Console naming device 0.
+        assert_eq!(packed_device(0), None);
+        let elsewhere = procfs::Stat {
+            pgrp: 9,
+            session: 9,
+            tty_nr: 0,
+            starttime: 1,
+            zombie: false,
+        };
+        assert!(
+            !procfs::matches(
+                Containment::Console {
+                    leader: child,
+                    tty: 0
+                },
+                child.wrapping_add(5),
+                &elsewhere
+            ),
+            "device 0 matched an unrelated daemon; 0 means NO controlling terminal, \
+             so that set is every process on the machine"
+        );
     }
 
     /// ...and the send-side backstop refuses it even if the two ever disagree.
     #[test]
     fn signalling_a_containment_td_svc_is_inside_is_refused() {
         let mut rt = runtime("[a]\ntype=daemon\nexec=/x\n");
-        let (own_pgrp, own_session) = rt.self_ids.unwrap_or((rt.self_pid, rt.self_pid));
+        let own = rt.self_ids.unwrap_or(procfs::Stat {
+            pgrp: rt.self_pid,
+            session: rt.self_pid,
+            tty_nr: 0,
+            starttime: 0,
+            zombie: false,
+        });
+        let (own_pgrp, own_session) = (own.pgrp, own.session);
         assert!(rt.contains_self(Containment::Process(rt.self_pid)));
         assert!(rt.contains_self(Containment::Group(own_pgrp)));
         assert!(rt.contains_self(Containment::Session(own_session)));
+        // td-svc holds no controlling terminal, so its own tty_nr is 0 — which
+        // makes a Console naming device 0, the set that would be every daemon,
+        // self-refusing before the scan is ever reached.
+        assert!(rt.contains_self(Containment::Console {
+            leader: rt.self_pid.wrapping_add(1),
+            tty: own.tty_nr
+        }));
         // A group led by some other pid is not ours.
         assert!(!rt.contains_self(Containment::Group(rt.self_pid.wrapping_add(1))));
 

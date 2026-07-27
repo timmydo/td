@@ -238,8 +238,99 @@ pub fn recipe() -> Recipe {
                          sleep 1; \
                      done; \
                      kill $p 2>/dev/null; \
+                     : 'and WAIT for it to go. This supervisor binds the fixed'; \
+                     : 'control socket path, so a leg that starts the next one'; \
+                     : 'while this is still dying can see a live socket, decline'; \
+                     : 'to bind, and then lose it when this process exits.'; \
+                     wait $p 2>/dev/null || :; \
                      [ -f '{{root}}/ran-first' ] || {{ echo 'td-svc run started no service at all — the event loop is dead in the shipped static binary' >&2; exit 1; }}; \
                      [ -f '{{root}}/ran-second' ] || {{ echo 'td-svc run started the first unit but never released the one ordered after it' >&2; exit 1; }}"
+                ),
+            ],
+        )
+        .env("PATH", &post_bootstrap_path()),
+    );
+
+    // The control socket, driven by the shipped binary on BOTH ends.
+    //
+    // Host tests cover the protocol and the state machine; what they cannot
+    // cover is that this static binary binds a real `AF_UNIX` socket under
+    // `/run` and answers itself over it. The socket path is fixed (an operator
+    // has to be able to find it), so this leg needs a writable `/run` and says
+    // so rather than silently passing when it has none — the same shape as the
+    // `kill` leg below.
+    steps.push(Step::WriteFile {
+        path: "{root}/ctl.conf".into(),
+        content: format!(
+            "[held-open]\ntype=daemon\nexec={POST_BOOTSTRAP_SH} -c 'while : ; do sleep 1; done'\n\
+             restart=always\n"
+        ),
+        exec: false,
+    });
+    steps.push(
+        Step::run(
+            "{root}",
+            &[
+                POST_BOOTSTRAP_SH,
+                "-c",
+                &format!(
+                    "if mkdir -p /run/td-svc 2>/dev/null; then \
+                         '{bin}' run -f '{{root}}/ctl.conf' >/dev/null 2>&1 & \
+                         p=$!; \
+                         i=0; \
+                         while [ $i -lt 30 ]; do \
+                             o=$('{bin}' status 2>/dev/null) && \
+                             case \"$o\" in *'held-open ready'*) break;; esac; \
+                             i=$((i+1)); \
+                             sleep 1; \
+                         done; \
+                         o=$('{bin}' status 2>&1); \
+                         case \"$o\" in \
+                             *'held-open ready'*) : ;; \
+                             *) kill $p 2>/dev/null; echo \"td-svc status never reported the daemon ready over the control socket, got: $o\" >&2; exit 1;; \
+                         esac; \
+                         s=$('{bin}' stop held-open 2>&1) || {{ kill $p 2>/dev/null; echo \"td-svc stop failed: $s\" >&2; exit 1; }}; \
+                         i=0; \
+                         while [ $i -lt 30 ]; do \
+                             o=$('{bin}' status held-open 2>/dev/null); \
+                             case \"$o\" in *'held-open stopped'*) break;; esac; \
+                             i=$((i+1)); \
+                             sleep 1; \
+                         done; \
+                         case \"$o\" in \
+                             *'held-open stopped'*) : ;; \
+                             *) kill $p 2>/dev/null; echo \"a restart=always daemon did not reach stopped after td-svc stop, got: $o\" >&2; exit 1;; \
+                         esac; \
+                         : 'and it must STAY stopped. Reaching `stopped` once proves'; \
+                         : 'the TERM landed; the failure mode this guards is the unit'; \
+                         : 'coming straight back, which only a later look can see.'; \
+                         sleep 3; \
+                         o=$('{bin}' status held-open 2>&1); \
+                         case \"$o\" in \
+                             *'held-open stopped'*) : ;; \
+                             *) kill $p 2>/dev/null; echo \"a stopped restart=always daemon came back on its own, got: $o\" >&2; exit 1;; \
+                         esac; \
+                         r=$('{bin}' restart held-open 2>&1) || {{ kill $p 2>/dev/null; echo \"td-svc restart failed: $r\" >&2; exit 1; }}; \
+                         i=0; \
+                         while [ $i -lt 30 ]; do \
+                             o=$('{bin}' status held-open 2>/dev/null); \
+                             case \"$o\" in *'held-open ready'*) break;; esac; \
+                             i=$((i+1)); \
+                             sleep 1; \
+                         done; \
+                         case \"$o\" in \
+                             *'held-open ready'*) : ;; \
+                             *) kill $p 2>/dev/null; echo \"td-svc restart did not bring a stopped daemon back, got: $o\" >&2; exit 1;; \
+                         esac; \
+                         e=$('{bin}' status nosuchunit 2>&1); \
+                         case \"$e\" in \
+                             *'no such service'*) : ;; \
+                             *) kill $p 2>/dev/null; echo \"an unknown unit must be named, got: $e\" >&2; exit 1;; \
+                         esac; \
+                         kill $p 2>/dev/null; \
+                     else \
+                         echo 'note: /run is not writable in this sandbox; the control socket is re-proved by the boot oracle'; \
+                     fi"
                 ),
             ],
         )
@@ -280,7 +371,7 @@ pub fn recipe() -> Recipe {
     });
     steps.push(Step::WriteFile {
         path: "{out}/result".into(),
-        content: "PASS: td-svc is a statically-linked ELF64 x86-64 executable (ET_EXEC) with no PT_INTERP and no dynamic NEEDED entry; `check` resolves the shipped boot chain in dependency order (td-firstboot before rootcheck before netup before sshd and the greeter), and refuses — each with a distinct named reason and a non-zero exit — a dependency cycle, a dependency on a unit that does not exist, a console unit made skippable by requires=, a key whose behaviour has not landed (log=), a stanza line that is not key=value, restart= on a oneshot, and an unreadable table; an unknown subcommand exits 2; `td-svc run` supervises for real in the shipped static binary — two oneshots, the second ordered after the first, both spawned, the dependent released only once its dependency settled; and where the sandbox stages the uutils multicall over a readable /proc, `kill -CONT -<pgid>` — the same one-signal-name-and-one-negative-operand argv shape td-svc's stop path composes with -TERM/-KILL — exits 0, so the negative process-group operand is not read as a flag\n".into(),
+        content: "PASS: td-svc is a statically-linked ELF64 x86-64 executable (ET_EXEC) with no PT_INTERP and no dynamic NEEDED entry; `check` resolves the shipped boot chain in dependency order (td-firstboot before rootcheck before netup before sshd and the greeter), and refuses — each with a distinct named reason and a non-zero exit — a dependency cycle, a dependency on a unit that does not exist, a console unit made skippable by requires=, a key whose behaviour has not landed (log=), a stanza line that is not key=value, restart= on a oneshot, and an unreadable table; an unknown subcommand exits 2; `td-svc run` supervises for real in the shipped static binary — two oneshots, the second ordered after the first, both spawned, the dependent released only once its dependency settled; where a writable /run lets it, the shipped binary binds the control socket under /run/td-svc and answers ITSELF over it — `status` reports a supervised daemon ready, `stop` drives a restart=always daemon to `stopped` and it is STILL stopped three seconds later (the failure mode being that it comes straight back), `restart` brings it up again, and an unknown unit is named rather than silently accepted; and where the sandbox stages the uutils multicall over a readable /proc, `kill -CONT -<pgid>` — the same one-signal-name-and-one-negative-operand argv shape td-svc's stop path composes with -TERM/-KILL — exits 0, so the negative process-group operand is not read as a flag\n".into(),
         exec: false,
     });
     steps.push(Step::Require {

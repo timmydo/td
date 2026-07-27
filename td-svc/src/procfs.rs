@@ -43,19 +43,58 @@ pub enum Containment {
     /// Every process in this session. POSIX has no kill-by-session primitive,
     /// so membership is enumerated — the `killall5` shape.
     Session(i32),
+    /// A console unit: the process td-svc spawned, PLUS every process whose
+    /// controlling terminal is the device the unit named.
+    ///
+    /// The only containment that reaches a login tree, and it takes both halves.
+    /// `/etc/tty-session` runs `getty` as a child, and getty opens with
+    /// `setsid(2)` — busybox `loginutils/getty.c`, "Create new session and
+    /// pgrp, lose controlling tty" — so `login` and the user's shell are in a
+    /// session td-svc never created and cannot name from the pid it spawned.
+    /// Group and session both stop at the wrapper.
+    ///
+    /// What survives that `setsid` is the terminal: getty re-acquires the same
+    /// device with `TIOCSCTTY`, so it and everything it execs carry it in
+    /// field 7. But the WRAPPER does not — td-svc opens the tty `O_NOCTTY`, so
+    /// the direct child never acquires a controlling terminal and its own
+    /// `tty_nr` stays 0 for its whole life. Verified by running the shipped
+    /// binary against a real pty: the child's field 7 is 0. So the terminal
+    /// alone misses the one process td-svc actually waits on, and the pid alone
+    /// misses everything an operator can see. It is both or neither.
+    ///
+    /// `tty` is the device the running instance ACTUALLY got, read at spawn
+    /// from the descriptor td-svc opened — not something read off the child,
+    /// which never has it, and not the unit's `tty=` re-resolved later, which
+    /// differs whenever the open fell back to `/dev/console`. `tty == 0` means "no controlling terminal" and is NEVER matched:
+    /// it would select every daemon on the machine, td-svc included.
+    ///
+    /// This is the one variant with two members, and the "never a union" rule
+    /// still holds where it was aimed: that rule forbids group-OR-session,
+    /// because a unit td-svc grouped is still in td-svc's session, so either
+    /// half would name the supervisor. Neither half here can: `leader` is a pid
+    /// td-svc spawned, and `tty` is a device td-svc does not hold.
+    Console { leader: i32, tty: i32 },
 }
 
-/// The three `/proc/<pid>/stat` fields this crate reads.
+/// The four `/proc/<pid>/stat` fields this crate reads.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Stat {
     /// Field 5. The process group a signal to `-pgid` would reach.
     pub pgrp: i32,
-    /// Field 6. The session — what a `setsid()` child moves into, and the only
-    /// thing that still identifies a login tree after it does.
+    /// Field 6. The session — what a `setsid()` child moves into.
     pub session: i32,
+    /// Field 7. The controlling terminal as a packed dev_t, or 0 for none. The
+    /// one identity a `setsid()` does not break, because the process that made
+    /// the new session re-acquires the same terminal.
+    pub tty_nr: i32,
     /// Field 22, in clock ticks since boot. Distinguishes a live pid from a
     /// recycled one; a pid alone cannot.
     pub starttime: u64,
+    /// Field 3 is `Z`: exited, not yet reaped by its parent.
+    ///
+    /// A zombie still carries its pgrp and session, so it goes on matching a
+    /// containment long after it stopped being a process in any useful sense.
+    pub zombie: bool,
 }
 
 /// Parse the fields out of one `/proc/<pid>/stat`.
@@ -72,7 +111,10 @@ pub fn parse_stat(text: &str) -> Option<Stat> {
     Some(Stat {
         pgrp: fields.get(2)?.parse().ok()?,
         session: fields.get(3)?.parse().ok()?,
+        tty_nr: fields.get(4)?.parse().ok()?,
         starttime: fields.get(19)?.parse().ok()?,
+        // Field 3, the state, is the first entry of the tail.
+        zombie: *fields.first()? == "Z",
     })
 }
 
@@ -137,7 +179,6 @@ pub struct Scan {
 impl Scan {
     /// Is the containment provably empty? Only when nothing was found AND
     /// nothing was unreadable — an incomplete scan proves nothing.
-    #[allow(dead_code)]
     pub fn proven_empty(&self) -> bool {
         self.pids.is_empty() && self.errors.is_empty()
     }
@@ -162,12 +203,7 @@ pub fn members(mode: Containment, self_pid: i32) -> io::Result<Scan> {
             // we wanted.
             Ok(None) => {}
             Ok(Some(stat)) => {
-                let matches = match mode {
-                    Containment::Process(target) => pid == target,
-                    Containment::Group(pgid) => stat.pgrp == pgid,
-                    Containment::Session(sid) => stat.session == sid,
-                };
-                if matches {
+                if matches(mode, pid, &stat) {
                     scan.pids.push(pid);
                 }
             }
@@ -175,6 +211,31 @@ pub fn members(mode: Containment, self_pid: i32) -> io::Result<Scan> {
         }
     }
     Ok(scan)
+}
+
+/// Is this process inside this containment? Split out from the scan so the
+/// membership rule is testable without fabricating a `/proc`.
+pub fn matches(mode: Containment, pid: i32, stat: &Stat) -> bool {
+    // A zombie is not a member of anything. It has already exited, holds no
+    // resources, and cannot be signalled into doing anything — it is waiting
+    // for a `wait()` that is not td-svc's to make. Counting one keeps a stop
+    // unfinished for as long as its parent takes to reap it, which for the
+    // shell wrappers td-svc supervises is a race decided by the scheduler.
+    if stat.zombie {
+        return false;
+    }
+    match mode {
+        Containment::Process(target) => pid == target,
+        Containment::Group(pgid) => stat.pgrp == pgid,
+        Containment::Session(sid) => stat.session == sid,
+        // Device 0 is "no controlling terminal", so it is never matched: it
+        // would select every daemon on the machine. The leader is still
+        // reached, which is what makes a console unit stoppable before getty
+        // has claimed the device at all.
+        Containment::Console { leader, tty } => {
+            pid == leader || (tty != 0 && stat.tty_nr == tty)
+        }
+    }
 }
 
 /// Is this the same process we started, or a pid the kernel recycled?
@@ -192,17 +253,67 @@ mod tests {
     /// The shape the kernel actually writes: pid, `(comm)`, state, ppid, pgrp,
     /// session, tty_nr, ... with starttime 22nd.
     fn stat_line(comm: &str, pgrp: i32, session: i32, starttime: u64) -> String {
-        let mut fields = vec![format!("7 ({comm}) S 1")];
-        // Fields 5..=21, with pgrp and session in their real places.
+        stat_line_tty(comm, pgrp, session, 0, starttime)
+    }
+
+    fn stat_line_tty(comm: &str, pgrp: i32, session: i32, tty: i32, starttime: u64) -> String {
+        stat_line_state(comm, "S", pgrp, session, tty, starttime)
+    }
+
+    fn stat_line_state(
+        comm: &str,
+        state: &str,
+        pgrp: i32,
+        session: i32,
+        tty: i32,
+        starttime: u64,
+    ) -> String {
+        let mut fields = vec![format!("7 ({comm}) {state} 1")];
+        // Fields 5..=21, with pgrp, session and tty_nr in their real places.
         fields.push(format!("{pgrp}"));
         fields.push(format!("{session}"));
-        for n in 7..=21 {
+        fields.push(format!("{tty}"));
+        for n in 8..=21 {
             fields.push(format!("{n}"));
         }
         fields.push(format!("{starttime}"));
         // A few trailing fields, as the real file has.
         fields.push("0 0 0".into());
         fields.join(" ")
+    }
+
+    /// A zombie keeps its pgrp and session, so it goes on matching a
+    /// containment after it has stopped being a process in any useful sense.
+    ///
+    /// This decides a race the stop path would otherwise lose at random. A
+    /// stopped shell wrapper leaves its `sleep` child briefly unreaped; if the
+    /// scan runs first, the containment looks occupied, the unit does not reach
+    /// `Stopped`, and whether a `stop` works at all comes down to how quickly
+    /// something else called `wait()`.
+    #[test]
+    fn a_zombie_is_not_a_member_of_any_containment() {
+        let stat = parse_stat(&stat_line_state("sleep", "Z", 42, 42, 1088, 9999)).unwrap();
+        assert!(stat.zombie, "field 3 'Z' was not read as a zombie");
+        for mode in [
+            Containment::Process(7),
+            Containment::Group(42),
+            Containment::Session(42),
+            Containment::Console {
+                leader: 7,
+                tty: 1088,
+            },
+        ] {
+            assert!(
+                !matches(mode, 7, &stat),
+                "a zombie counted as a member of {mode:?}, so a stop waits on a \
+                 process that has already exited"
+            );
+        }
+        // The same line in any other state is a member, or the check above
+        // would pass by matching nothing at all.
+        let live = parse_stat(&stat_line_state("sleep", "S", 42, 42, 1088, 9999)).unwrap();
+        assert!(!live.zombie);
+        assert!(matches(Containment::Group(42), 7, &live));
     }
 
     #[test]
@@ -213,7 +324,9 @@ mod tests {
             Stat {
                 pgrp: 42,
                 session: 42,
-                starttime: 9999
+                tty_nr: 0,
+                starttime: 9999,
+                zombie: false,
             }
         );
     }
@@ -237,7 +350,9 @@ mod tests {
                 Stat {
                     pgrp: 7,
                     session: 8,
-                    starttime: 1234
+                    tty_nr: 0,
+                    starttime: 1234,
+                    zombie: false,
                 },
                 "comm {comm:?} shifted the fields"
             );
