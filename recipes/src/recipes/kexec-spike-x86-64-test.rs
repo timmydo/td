@@ -99,11 +99,11 @@ pub fn recipe() -> Recipe {
     Recipe::mesboot("kexec-spike-x86-64-test", "1.0")
         .native_inputs(&["kexec-spike-x86-64", "busybox-x86-64"])
         .steps(steps)
-        .checks(vec![RecipeCheck::daily(
+        .checks(vec![RecipeCheck::new(
             r#"
 echo ">> recipe-check kexec-spike-x86-64-test: build-plan --auto builds kexec-spike-x86-64 (the two-kernel kexec spike artifact: a bootable bzImage + an outer initramfs embedding static busybox, td-kexec, a second-boot bzImage, and a nested inner initramfs) and asserts a complete newc archive carrying every spike member and both /init markers"
 : "${TD_RECIPE_EVAL:=$PWD/target/release/td-recipe-eval}"
-exec "$TD_RECIPE_EVAL" check-run kexec-spike-x86-64-test daily 1
+exec "$TD_RECIPE_EVAL" check-run kexec-spike-x86-64-test 1
 "#,
         )
         .with_runner(CheckRunner::BuildOnly)])

@@ -1500,7 +1500,7 @@ fn warm_kernel_headers_from_pins(arch: &str, pins: &[SourcePin]) {
     // DEFLATE stream is NOT reproducible across zlib/gzip versions, so a
     // compressed tarball hashed to a DIFFERENT seed digest on every host whose
     // gzip differed from the one that blessed the table — reddening the
-    // seed-provenance gate off that host (the daily backstop, any dev box) even
+    // seed-provenance gate off that host (any dev box) even
     // though the header content was identical. The uncompressed tar has no such
     // layer; the seed universe unpacks it via magic-byte sniffing (builder
     // tar::unpack_archive falls through to plain-tar for a non-gzip/xz/bzip2

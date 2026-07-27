@@ -73,12 +73,12 @@
 //! The build-engine smoke tier (`check-engine`) is JUST this — compile the engine,
 //! lint it, and run its unit tests, ~2-4 min, no from-source builds. Anything that
 //! builds a package (bootstrap-build/build-plan/td-check/corpus/…) is NOT smoke; it
-//! stays in the full `check` / daily backstop.
+//! stays in the full `check`.
 //! This gate IS the per-PR engine check: the `cargo-test` preflight of
 //! `td-builder affected-checks` runs `cargo test --frozen` on the dev host's own
 //! rust — no store image, no hosted CI (GitHub is a backup remote only). The
 //! deep from-source gates stay on the dev-machine full `td-builder check` (the
-//! §7.2 step-2 landing gate) + the nightly daily suite.
+//! §7.2 step-2 landing gate).
 
 use crate::gates::{GateDef, Pool};
 

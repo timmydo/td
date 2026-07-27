@@ -63,11 +63,11 @@ pub fn recipe() -> Recipe {
         .native_inputs(&["flex-x86-64", "m4-mesboot"])
         .inputs_owned(mesboot0_inputs(&[]))
         .steps(steps)
-        .checks(vec![RecipeCheck::daily(
+        .checks(vec![RecipeCheck::new(
             r#"
 echo ">> recipe-check flex-x86-64-test: build-plan --auto builds flex-x86-64 (GNU flex 2.6.4, source-built by the native /td/store x86_64 toolchain) and asserts it generates a well-formed m4-expanded scanner"
 : "${TD_RECIPE_EVAL:=$PWD/target/release/td-recipe-eval}"
-exec "$TD_RECIPE_EVAL" check-run flex-x86-64-test daily 1
+exec "$TD_RECIPE_EVAL" check-run flex-x86-64-test 1
 "#,
         )
         .with_runner(CheckRunner::BuildOnly)])

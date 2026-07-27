@@ -50,7 +50,7 @@ use crate::types::{Recipe, Step};
 // behavioural proof that this source-built kernel boots to a real userland is the HOST-SIDE tool
 // `td-recipe-eval qemu-boot linux-x86-64` (checks/qemu_boot.rs): it boots the
 // bzImage + initramfs under host qemu (TCG) and asserts the userland marker
-// reaches the console. It is host-side (not a daily gate check) because a qemu
+// reaches the console. It is host-side (not a sandboxed gate check) because a qemu
 // boot needs host qemu, which the gate's host-free sandbox hides — see the note
 // at the Recipe builder below. In-sandbox CI coverage is the artifact shape
 // checks (this recipe's producer rung + linux-x86-64-test).
@@ -99,7 +99,7 @@ use crate::types::{Recipe, Step};
 // BARE native gcc: kernel code is `-nostdinc` freestanding with its own headers,
 // and vmlinux is linked by `LD` (not gcc), so no glibc byte enters the image.
 // GCC 14.3.0 builds this modern (2026) source with no version-skew shim (unlike
-// the retired 4.14 rung); the daily backstop is the build-truth for a kernel bump
+// the retired 4.14 rung); the full check is the build-truth for a kernel bump
 // and surfaces any new GCC-14 warning or host-tool requirement a 7.x source adds.
 pub fn recipe() -> Recipe {
     let ngcc = "{in:gcc-x86-64-native}/stage/td/store/gcc-14.3.0-x86_64-native/bin/gcc";
@@ -783,14 +783,14 @@ pub fn recipe() -> Recipe {
         .inputs_owned(mesboot0_inputs(&["linux-headers-x86-64"]))
         .steps(steps)
     // No behavioural boot check is registered here: a qemu boot needs HOST qemu,
-    // which the daily gate's host-free `pivot_root` sandbox deliberately hides (the
+    // which the gate's host-free `pivot_root` sandbox deliberately hides (the
     // sandbox exposes only td-built tools by absolute /td/store path — that is why
     // the RustToolchain check can run the td-BUILT rustc, but a host binary like
-    // qemu is unreachable there). Wiring the boot as a sandboxed daily check would
+    // qemu is unreachable there). Wiring the boot as a sandboxed recipe check would
     // make it fail on `find_qemu` on every real runner — a permanently-red, green-
     // washed check. The boot is instead a HOST-SIDE tool, `td-recipe-eval
     // qemu-boot linux-x86-64` (checks/qemu_boot.rs), run OUTSIDE the sandbox by an
     // operator or developer. Automated in-sandbox coverage is the shape checks
-    // above (producer rung) and the linux-x86-64-test BuildOnly daily check, which
+    // above (producer rung) and the linux-x86-64-test BuildOnly check, which
     // build the bzImage + initramfs and assert they are well-formed.
 }

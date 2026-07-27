@@ -13,7 +13,7 @@ use crate::gates::{GateDef, Pool};
 pub fn gate() -> GateDef {
     GateDef {
         name: "store-native-profile",
-        pools: &[Pool::Daily],
+        pools: &[Pool::Heavy],
         needs: &[],
         build_gate: false,
         specs: &[],

@@ -117,11 +117,11 @@ pub fn recipe() -> Recipe {
     Recipe::mesboot("td-txt-test", "1.0")
         .native_inputs(&["td-txt", "binutils-x86-64-self", "busybox-x86-64"])
         .steps(steps)
-        .checks(vec![RecipeCheck::daily(
+        .checks(vec![RecipeCheck::new(
             r#"
 echo ">> recipe-check td-txt-test: build-plan --auto builds td-txt (the target grep/sed multicall, statically linked by the /td/store target Rust + native GCC/binutils/glibc toolchain), asserts a self-contained static ELF64 x86-64 executable (ET_EXEC, no PT_INTERP, no dynamic NEEDED), and runs both applets through argv[0] and explicit dispatch"
 : "${TD_RECIPE_EVAL:=$PWD/target/release/td-recipe-eval}"
-exec "$TD_RECIPE_EVAL" check-run td-txt-test daily 1
+exec "$TD_RECIPE_EVAL" check-run td-txt-test 1
 "#,
         )
         .with_runner(CheckRunner::BuildOnly)])

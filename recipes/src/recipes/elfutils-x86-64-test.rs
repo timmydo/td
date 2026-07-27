@@ -110,11 +110,11 @@ pub fn recipe() -> Recipe {
         ])
         .inputs_owned(mesboot0_inputs(&["linux-headers-x86-64"]))
         .steps(steps)
-        .checks(vec![RecipeCheck::daily(
+        .checks(vec![RecipeCheck::new(
             r#"
 echo ">> recipe-check elfutils-x86-64-test: build-plan --auto builds elfutils-x86-64 (static libelf.a + libeu.a + libz.a, source-built by the native /td/store x86_64 toolchain) and links+runs a libelf program against it"
 : "${TD_RECIPE_EVAL:=$PWD/target/release/td-recipe-eval}"
-exec "$TD_RECIPE_EVAL" check-run elfutils-x86-64-test daily 1
+exec "$TD_RECIPE_EVAL" check-run elfutils-x86-64-test 1
 "#,
         )
         .with_runner(CheckRunner::BuildOnly)])

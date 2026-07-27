@@ -73,11 +73,11 @@ pub fn recipe() -> Recipe {
         .native_inputs(&["busybox-x86-64"])
         .inputs_owned(mesboot0_inputs(&[]))
         .steps(steps)
-        .checks(vec![RecipeCheck::daily(
+        .checks(vec![RecipeCheck::new(
             r#"
 echo ">> recipe-check busybox-test: build-plan --auto builds+validates busybox-test: BusyBox 1.37.0, built by make-x86-64 on the native /td/store toolchain, RUNS installed applet links"
 : "${TD_RECIPE_EVAL:=$PWD/target/release/td-recipe-eval}"
-exec "$TD_RECIPE_EVAL" check-run busybox-test daily 1
+exec "$TD_RECIPE_EVAL" check-run busybox-test 1
 "#,
         )
         .with_runner(CheckRunner::BuildOnly)])

@@ -128,11 +128,11 @@ pub fn recipe() -> Recipe {
     Recipe::mesboot("td-boot-test", "1.0")
         .native_inputs(&["td-boot", "binutils-x86-64-self", "busybox-x86-64"])
         .steps(steps)
-        .checks(vec![RecipeCheck::daily(
+        .checks(vec![RecipeCheck::new(
             r#"
 echo ">> recipe-check td-boot-test: target static boot shim verifies current/previous deployments and rejects tampering"
 : "${TD_RECIPE_EVAL:=$PWD/target/release/td-recipe-eval}"
-exec "$TD_RECIPE_EVAL" check-run td-boot-test daily 1
+exec "$TD_RECIPE_EVAL" check-run td-boot-test 1
 "#,
         )
         .with_runner(CheckRunner::BuildOnly)])

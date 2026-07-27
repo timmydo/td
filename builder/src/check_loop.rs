@@ -38,7 +38,7 @@ fn fatal(msg: &str) -> String {
 /// bootstrap graph still declares host scaffolding, which planning rejects (re
 /// #469) — as
 /// opposed to a gate genuinely going red. It is the stable machine signal the
-/// daily backstop (`td-builder daily`) reads to tell "nothing could run here"
+/// callers read to tell "nothing could run here"
 /// from "a real regression", instead of grepping FATAL prose out of the log
 /// (the coupling that broke twice — #268, then #315). EX_UNAVAILABLE from
 /// sysexits(3): "service unavailable", i.e. this host cannot run the loop.
@@ -62,13 +62,12 @@ pub(crate) const UNPROVISIONED_TAG: &str = "UNPROVISIONED: ";
 pub(crate) const UNPROVISIONED_SENTINEL: &str = "[td-unprovisioned-69:re#469]";
 
 /// The stable stdout/stderr token the gate runner prints when a run finishes
-/// GREEN but with ≥1 gate SKIPPED as Unprovisioned. `td-builder daily` greps its
-/// heavy/system leg log for this: a leg that exited 0 yet carries this token did
-/// NOT run every gate, so it is not a full-suite proof — daily records it PARTIAL
-/// and WITHHOLDS `.td-last-green` + substitute publication (re #469). A distinct,
-/// whole-suite token (not the per-gate [`UNPROVISIONED_SENTINEL`], and a STABLE
-/// machine signal rather than FATAL prose — the daily coupling that broke twice,
-/// #268 then #315, is exactly what a stable token avoids).
+/// GREEN but with ≥1 gate SKIPPED as Unprovisioned. A caller can grep a run's
+/// log for this: a run that exited 0 yet carries this token did NOT run every
+/// gate, so its green is not a full-suite proof. A distinct, whole-suite token
+/// (not the per-gate [`UNPROVISIONED_SENTINEL`], and a STABLE machine signal
+/// rather than FATAL prose — the coupling that broke twice, #268 then #315, is
+/// exactly what a stable token avoids).
 pub(crate) const GATES_SKIPPED_SENTINEL: &str = "[td-gates-skipped:re#469]";
 
 /// Print [`UNPROVISIONED_SENTINEL`] to stderr, then return the process exit code
@@ -883,15 +882,18 @@ fn tree_key(root: &Path) -> Option<String> {
 }
 
 /// The substitute-store exposure (x64-toolchain-subst, human 2026-06-28;
-/// native since #318 axis 2 — was tools/warm-subst.sh): if a prior DAILY run
-/// populated a persistent signed substitute store (~/.td/subst: a stashed
-/// td-subst binary + the published closure narinfos), expose TD_SUBST_* to
-/// the loop sandbox (host-sandbox binds ~/.td/subst ro + preserves
-/// TD_SUBST_*). The toolchain gates then FETCH the lock-keyed closure instead
-/// of rebuilding ~98 min from seed, FALLING BACK to from-seed on ANY miss.
-/// This NEVER fetches or builds td-subst — the DAILY is the sole producer; a
-/// COLD machine (no prior daily) exposes nothing and the gate builds from
-/// seed (the substitute is an optimization, never a correctness dependency).
+/// native since #318 axis 2 — was tools/warm-subst.sh): if a persistent signed
+/// substitute store exists (~/.td/subst: a stashed td-subst binary + published
+/// closure narinfos), expose TD_SUBST_* to the loop sandbox (host-sandbox binds
+/// ~/.td/subst ro + preserves TD_SUBST_*). The toolchain gates then FETCH the
+/// lock-keyed closure instead of rebuilding ~98 min from seed, FALLING BACK to
+/// from-seed on ANY miss. This NEVER fetches or builds td-subst; a COLD machine
+/// exposes nothing and the gate builds from seed (the substitute is an
+/// optimization, never a correctness dependency).
+///
+/// NOTE: nothing in-tree PRODUCES that store today — the publisher retired with
+/// the per-rung shell gates (#444) and the daily runner that drove it. This is
+/// the consumer half, kept live and inert until a producer returns.
 fn subst_env(root: &Path) -> Vec<(String, String)> {
     let store = match std::env::var("TD_SUBST_STORE") {
         Ok(v) if !v.trim().is_empty() => PathBuf::from(v),
@@ -903,8 +905,8 @@ fn subst_env(root: &Path) -> Vec<(String, String)> {
     subst_env_at(&store, &root.join("tests/td-subst.pub"))
 }
 
-/// A USABLE store = the daily's stashed td-subst binary + at least one signed
-/// narinfo + the pinned trust anchor. Any missing piece => expose nothing.
+/// A USABLE store = a stashed td-subst binary + at least one signed narinfo +
+/// the pinned trust anchor. Any missing piece => expose nothing.
 fn subst_env_at(store: &Path, pubkey: &Path) -> Vec<(String, String)> {
     use std::os::unix::fs::PermissionsExt as _;
     let bin = store.join("td-subst");
@@ -992,7 +994,7 @@ fn find_in_frags(frags: &str, bin: &str) -> Option<PathBuf> {
 /// PT_INTERP/DT_NEEDED/run-path — the flake fix), NOT that DNS needs zero runtime
 /// DSOs. td-subst's code compiles into td-net, but the td-subst APPLET is deliberately
 /// NOT resolved here (host_net_applet is called only for the fetch/feed applets): it is
-/// sourced ambiently (`TD_SUBST_BIN`/PATH, `daily::publish_substitutes`) and runs inside
+/// sourced ambiently (`TD_SUBST_BIN`/PATH) and runs inside
 /// the NEWNET-isolated loop sandbox, so its name-resolution/NSS posture is a separate
 /// question (PR #534 discussion) — statically linking that path is out of scope.
 ///

@@ -326,7 +326,7 @@ jemalloc = false
     // `(stageN -> stageM)` build-graph lines in bootstrap's own log), not a byte
     // compare: an uplift skips the stage2 build and never emits those lines. These
     // log strings track the pinned Rust bootstrap's output — re-verify them on a
-    // Rust pin bump. The daily bridge check independently rejects stage0 references
+    // Rust pin bump. The bridge recipe check independently rejects stage0 references
     // and exact stage0 artifact copies in the installed tree.
     steps.push(
         Step::run(
@@ -411,11 +411,11 @@ jemalloc = false
         ])
         .inputs_owned(mesboot0_inputs(&["linux-headers-x86-64"]))
         .steps(steps)
-        .checks(vec![RecipeCheck::daily(
+        .checks(vec![RecipeCheck::new(
             r#"
 echo ">> recipe-check rust-toolchain: full-bootstraps and validates the source-built /td/store Rust 1.96.0 stage2 toolchain"
 : "${TD_RECIPE_EVAL:=$PWD/target/release/td-recipe-eval}"
-exec "$TD_RECIPE_EVAL" check-run rust-toolchain daily 1
+exec "$TD_RECIPE_EVAL" check-run rust-toolchain 1
 "#,
         )
         .with_runner(CheckRunner::RustToolchain)])

@@ -20,7 +20,7 @@ use crate::types::{Recipe, Step};
 // none. `+crt-static` pulls libc.a/libm.a and `relocation-model=static` yields a
 // classic ET_EXEC with no PT_INTERP; the linker is td's native gcc with `-B` at
 // glibc's crt objects and binutils' as/ld. The link needs the full target
-// toolchain, so it is DAILY tier — the sibling td-firstboot-test carries it.
+// toolchain, so the sibling td-firstboot-test carries it.
 //
 // The crate root declares each sibling module with `mod NAME;`, so a single
 // `rustc src/main.rs` pulls them all in — but only if every module file sits beside
@@ -204,7 +204,7 @@ mod tests {
     /// That recipe's output is a proven static ET_EXEC with an empty closure, and
     /// this link cannot be tried on a host without the target toolchain — so
     /// agreeing with the known-good command line is the strongest check available
-    /// per-change, and a mistyped or dropped flag reds here instead of in a daily
+    /// per-change, and a mistyped or dropped flag reds here instead of in a full-toolchain
     /// image build.
     #[test]
     fn the_rustc_link_matches_the_proven_td_util_one() {

@@ -105,11 +105,11 @@ pub fn recipe() -> Recipe {
         ])
         .steps(steps)
         .checks(vec![
-            RecipeCheck::daily(
+            RecipeCheck::new(
                 r#"
 echo ">> recipe-check rust-userland-auto-test: build-plan --auto builds ripgrep and fd with the source-built Rust/native toolchain, verifies their exact dynamic runtime closure, and runs real searches with /gnu/store absent"
 : "${TD_RECIPE_EVAL:=$PWD/target/release/td-recipe-eval}"
-exec "$TD_RECIPE_EVAL" check-run rust-userland-auto-test daily 1
+exec "$TD_RECIPE_EVAL" check-run rust-userland-auto-test 1
 "#,
             )
             .with_runner(CheckRunner::BuildOnly),

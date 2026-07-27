@@ -116,11 +116,11 @@ pub fn recipe() -> Recipe {
         .native_inputs(&["btrfs-progs-x86-64"])
         .inputs_owned(mesboot0_inputs(&[]))
         .steps(steps)
-        .checks(vec![RecipeCheck::daily(
+        .checks(vec![RecipeCheck::new(
             r#"
 echo ">> recipe-check btrfs-progs-x86-64-test: create and populate a Btrfs image with @var, then check and restore it without mounting"
 : "${TD_RECIPE_EVAL:=$PWD/target/release/td-recipe-eval}"
-exec "$TD_RECIPE_EVAL" check-run btrfs-progs-x86-64-test daily 1
+exec "$TD_RECIPE_EVAL" check-run btrfs-progs-x86-64-test 1
 "#,
         )
         .with_runner(CheckRunner::BuildOnly)])

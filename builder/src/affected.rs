@@ -34,7 +34,6 @@
     clippy::indexing_slicing
 )] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
 
-use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
 
@@ -143,10 +142,6 @@ struct Selection {
     preflights: Vec<String>,
     targets: Vec<String>,
     notes: Vec<String>,
-    /// Affected gates that are DAILY/SYSTEM-tier: named for the record but not
-    /// run per-PR — `td-builder daily` covers them nightly with
-    /// fix-or-revert healing (the ~10-min per-PR budget, human 2026-07-04).
-    deferred: Vec<String>,
 }
 
 fn push_unique(v: &mut Vec<String>, x: &str) {
@@ -229,11 +224,11 @@ fn build_gates(_root: &Path) -> Vec<String> {
         .collect()
 }
 
-/// Would a plain `td-builder check` (cheap+heavy+daily gates + build-recipes)
-/// cover `target`? (`check-pr` is a subset of the plain check by construction.)
+/// Would a plain `td-builder check` (cheap+heavy gates + build-recipes) cover
+/// `target`?
 /// The pool question is gates.rs's (`pool_in_full_check`), not a local list.
 fn default_check_covers_target(_root: &Path, target: &str) -> bool {
-    if target == "check-fast" || target == "check-pr" || target == "build-recipes" {
+    if target == "check-fast" || target == "check" || target == "build-recipes" {
         return true;
     }
     crate::gates::defs().into_iter().any(|(_, d)| {
@@ -265,7 +260,7 @@ fn add_recipe_graph_targets(sel: &mut Selection) {
     sel.add_target("bootstrap-x86_64-toolchain-store-native");
     sel.add_target("bootstrap-x86_64-native-gcc-store-native");
     sel.add_target("bootstrap-x86_64-self-gcc-store-native");
-    sel.add_target("recipe-checks-daily");
+    sel.add_target("recipe-checks");
 }
 
 // The 25 per-rung `bootstrap-<rung>.sh` gates that used to prove each i686
@@ -279,7 +274,7 @@ fn add_recipe_graph_targets(sel: &mut Selection) {
 // What's accepted as lost: per-rung double-build reproducibility, the
 // `store-ns` sandboxed no-guix round-trip, and the `subst-export`/`nar-restore`
 // round-trip that some of the deep store-native rungs' scripts also checked —
-// nothing ports those checks elsewhere. The remaining recipe-owned daily checks
+// nothing ports those checks elsewhere. The remaining recipe-owned checks
 // are the live coverage.
 fn add_chain_targets(sel: &mut Selection) {
     add_recipe_graph_targets(sel);
@@ -301,18 +296,17 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
         p,
     ) {
         // The loop spine used to escalate to the FULL loop; it now validates on
-        // the bounded check-pr tier (which exercises the runner/prelude end to
-        // end over the whole PR pool) + the engine unit tests — the daily-tier
-        // gates are the daily backstop's job (the ~10-min per-PR budget, human
+        // the whole behavioral tier (which exercises the runner/prelude end to
+        // end over every gate) + the engine unit tests (the ~10-min per-PR budget, human
         // 2026-07-04).
         sel.add_preflight("shell-syntax");
         sel.add_preflight("cargo-test");
-        // check-pr already contains the cargo-test GATE (Pool::Heavy) — no
+        // `check` already contains the cargo-test GATE (Pool::Heavy) — no
         // explicit target, or spine diffs would run the engine suite twice.
-        sel.add_target("check-pr");
+        sel.add_target("check");
         sel.add_note(&format!(
-            "{p} touches the loop spine: validated by the bounded check-pr tier (the runner \
-             runs itself over the whole PR pool); the daily backstop covers the daily tier."
+            "{p} touches the loop spine: validated by the full check (the runner runs \
+             itself over every gate)."
         ));
         return;
     }
@@ -325,19 +319,17 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
             match target_from_gate_file(&abs) {
                 Some(gate) if !gate.is_empty() => add_gate_file_targets(sel, &gate),
                 _ => {
-                    sel.add_target("check-pr");
+                    sel.add_target("check");
                     sel.add_note(&format!(
-                        "{p} does not register a gate target — running the bounded check-pr \
-                         tier; the daily backstop covers the daily-tier gates."
+                        "{p} does not register a gate target — running the full check."
                     ));
                 }
             }
         } else {
-            sel.add_target("check-pr");
+            sel.add_target("check");
             sel.add_note(&format!(
                 "{p} was deleted; affected-checks cannot infer the removed gate target — \
-                 running the bounded check-pr tier (a stale reference to the gate reds there \
-                 or in the daily backstop)."
+                 running the full check (a stale reference to the gate reds there)."
             ));
         }
         return;
@@ -381,7 +373,7 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
             "store-backend",
             "store-ns",
             "recipe-rs",
-            "recipe-checks-daily",
+            "recipe-checks",
             "store-native-profile",
             "sandbox-hardening",
             "toolchain-input-addressed",
@@ -393,13 +385,17 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
     }
 
     if pattern_matches("builder/Cargo.toml|builder/src/*", p) {
-        // The td-builder build engine validates on the ~2-min check-engine SMOKE tier
-        // (DESIGN §7.2): cargo-test (compile + unit tests), NOT the from-source corpus
-        // (that is the DAILY backstop). cargo-test also runs as a host preflight.
+        // The ~2-min check-engine SMOKE tier (cargo-test: compile + unit tests) is
+        // the FAST signal, but the engine is what the from-source rungs exercise, so
+        // it also takes the whole behavioral tier. It used to stop at the smoke tier
+        // because the daily backstop supplied the from-source coverage eventually;
+        // with that gone, stopping here would leave the engine's own deep coverage
+        // with no runner at all.
         sel.add_preflight("cargo-test");
         sel.add_target("check-engine");
+        sel.add_target("check");
         sel.add_note(&format!(
-            "{p} is the td-builder build engine: validated by the ~2-min check-engine smoke (compile + unit tests); the from-source build coverage is the DAILY backstop (DESIGN §7.2), not a per-PR gate."
+            "{p} is the td-builder build engine: the ~2-min check-engine smoke (compile + unit tests) is the fast signal; the from-source build coverage is the full check (DESIGN §7.2)."
         ));
         return;
     }
@@ -422,7 +418,7 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
         sel.add_target("recipe-rs");
         if p == "engine/src/sha256.rs" {
             // td-boot compiles this exact source into its target static binary.
-            sel.add_target("recipe-checks-daily");
+            sel.add_target("recipe-checks");
         }
         add_build_gate_targets(root, sel);
         let consumers = if p == "engine/src/sha256.rs" {
@@ -496,26 +492,26 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
         sel.add_preflight("cargo-test");
         sel.add_target("recipe-rs");
         if glob_match("recipes/src/recipes/*.rs", p) {
-            sel.add_target("recipe-checks-daily");
+            sel.add_target("recipe-checks");
         }
         add_build_gate_targets(root, sel);
         return;
     }
 
     if p == "tests/recipe-checks.sh" {
-        sel.add_target("recipe-checks-daily");
+        sel.add_target("recipe-checks");
         return;
     }
 
     if pattern_matches("net/*|net/src/*|net/Cargo.toml|net/Cargo.lock", p) {
         // The merged td-net (fetch/feed/subst). It holds the host-PREP warm that feeds the
         // recipe-graph consumers (`warm sources` + `warm kernel-headers`) → the chain targets
-        // (former feed coverage); AND, since the old fetch/* mapped to the bounded check-pr
-        // tier, a net-only change must keep that per-PR validation — the chain targets are
-        // daily-DEFERRED, so without check-pr a net-only diff would run nothing while waiving
-        // the full check. The union of BOTH former rules. No gate builds td-net from source;
+        // (former feed coverage); AND, since the old fetch/* rule mapped to the broad
+        // behavioral tier, a net-only change keeps that too — without it such a diff
+        // would run nothing while waiving the full check. The union of BOTH former
+        // rules. No gate builds td-net from source;
         // the warm compiles it.
-        sel.add_target("check-pr");
+        sel.add_target("check");
         add_chain_targets(sel);
         return;
     }
@@ -598,7 +594,7 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
 
     // --- the i686 mesboot→store-native recipe graph's vendored patches (#397) ---
     // Source pin changes are recipe edits now; patch byte changes still route to
-    // the live graph consumers: recipe-owned checks and the x86_64 daily gates.
+    // the live graph consumers: recipe-owned checks and the x86_64 gates.
     if pattern_matches("seed/patches/binutils-boot-*.patch|seed/patches/gcc-boot-2.95.3.patch|seed/patches/glibc-boot-2.2.5.patch|seed/patches/glibc-bootstrap-system-2.2.5.patch|seed/patches/gcc-boot-4.6.4.patch|seed/patches/glibc-boot-2.16.0.patch|seed/patches/glibc-bootstrap-system-2.16.0.patch", p)
     {
         sel.add_preflight("shell-syntax");
@@ -606,7 +602,7 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
         return;
     }
     // Tombstones for the retired x86_64 shell drivers/libs. The live orchestration is
-    // recipe-owned; these deleting diffs still route to the daily gates that delegate
+    // recipe-owned; these deleting diffs still route to the gates that delegate
     // into td-recipe-eval check-run.
     if pattern_matches("tests/bootstrap-x86_64-native-gcc-store-native.sh", p) {
         sel.add_target("bootstrap-x86_64-native-gcc-store-native");
@@ -618,7 +614,7 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
     }
     // The NATIVE x86_64 toolchain's input-addressed key file: consumed by the native gcc gate (422,
     // builds+interns the native toolchain at these lock paths) and the self-host gate (426, obtains the
-    // native toolchain as its builder) — both Daily/system tier, deferred to the daily backstop.
+    // native toolchain as its builder).
     // (A recipe-rev bump here re-keys the path.) The rust runtime gate (416) that also fetched this as
     // the linker was retired with the rust-toolchain recipe-graph cutover (#410).
     if pattern_matches("tests/td-toolchain-x86_64-native.lock", p) {
@@ -633,7 +629,7 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
         sel.add_target("bootstrap-x86_64-toolchain-store-native");
         // The old shared libs also defined the rung-X2 native driver, fetch-or-build
         // obtainers, and rung-X3 self-host helpers; their deletion still routes to
-        // all three daily x86_64 gates.
+        // all three x86_64 gates.
         sel.add_target("bootstrap-x86_64-native-gcc-store-native");
         sel.add_target("bootstrap-x86_64-self-gcc-store-native");
         return;
@@ -689,14 +685,14 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
 
     // The target guest crates compile offline in the cargo-test preflight. Their
     // sources are embedded into target-static recipes, whose link/behavior tests
-    // live in the daily tier.
+    // live in the recipe-owned checks.
     if pattern_matches(
         "td-kexec/*|td-kexec/src/*|td-kexec/Cargo.toml|td-kexec/Cargo.lock|td-boot/*|td-boot/src/*|td-boot/Cargo.toml|td-boot/Cargo.lock",
         p,
     ) {
         sel.add_preflight("cargo-test");
-        sel.add_target("check-pr");
-        sel.add_target("recipe-checks-daily");
+        sel.add_target("check");
+        sel.add_target("recipe-checks");
         return;
     }
 
@@ -706,23 +702,23 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
     // is `include_str!`'d verbatim into the td-netd RECIPE AND packed into
     // system-x86-64, so a helper-source edit changes the TARGET artifact and a
     // static-link regression is invisible to host cargo; also route to
-    // recipe-checks-daily (the daily backstop statically links + shape-asserts it via
+    // recipe-checks (which statically links + shape-asserts it via
     // td-netd-test). Its RECIPE files under recipes/src/recipes/ are routed by the
     // recipes arm above, not here.
     if pattern_matches("td-netd/*|td-netd/src/*|td-netd/Cargo.toml|td-netd/Cargo.lock", p) {
         sel.add_preflight("cargo-test");
-        sel.add_target("check-pr");
-        sel.add_target("recipe-checks-daily");
+        sel.add_target("check");
+        sel.add_target("recipe-checks");
         return;
     }
 
     // td-sh: the target-built POSIX /bin/sh (busybox-`sh` replacement), a standalone
     // std-only crate OUTSIDE the engine workspace, exactly like td-kexec — same
     // routing. Its lib.rs conformance harness + unit tests lint/test on the host
-    // cargo-test preflight (check-pr). src/main.rs is `include_str!`'d into the td-sh
+    // cargo-test cargo-test preflight. src/main.rs is `include_str!`'d into the td-sh
     // RECIPE, so a stub-source edit changes the TARGET artifact and a static-link
-    // regression is invisible to host cargo — so also route to recipe-checks-daily
-    // (daily backstop statically links it via td-sh-test). Its RECIPE files under
+    // regression is invisible to host cargo — so also route to recipe-checks
+    // (recipe-checks statically links it via td-sh-test). Its RECIPE files under
     // recipes/src/recipes/ are routed by the recipes arm above, not here. The
     // spec/ corpus and tests/ carry no standalone shell scripts, so no shell-syntax.
     if pattern_matches(
@@ -730,21 +726,21 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
         p,
     ) {
         sel.add_preflight("cargo-test");
-        sel.add_target("check-pr");
-        sel.add_target("recipe-checks-daily");
+        sel.add_target("check");
+        sel.add_target("recipe-checks");
         return;
     }
 
     // td-txt: the target-built static TEXT multicall (grep/sed), a standalone
     // std-only crate OUTSIDE the engine workspace — same routing as td-sh. Its
     // lib.rs conformance harness, its unit tests, and the corpus run (the vendored
-    // GNU grep/sed suites in spec/) all ride the host cargo-test preflight
-    // (check-pr). src/main.rs and its modules are `include_str!`'d into the td-txt
+    // GNU grep/sed suites in spec/) all ride the host cargo-test preflight.
+    // src/main.rs and its modules are `include_str!`'d into the td-txt
     // RECIPE, so a source edit changes the TARGET artifact and a static-link
-    // regression is invisible to host cargo — so also route to recipe-checks-daily
-    // (the daily backstop statically links + smoke-runs it via td-txt-test) AND it is
+    // regression is invisible to host cargo — so also route to recipe-checks
+    // (recipe-checks statically links + smoke-runs it via td-txt-test) AND it is
     // packed into system-x86-64, serving /bin/grep and /bin/sed. That farm is on the
-    // BOOT PATH — /etc/rootcheck greps /proc/mounts with it — so recipe-checks-daily
+    // BOOT PATH — /etc/rootcheck greps /proc/mounts with it — so recipe-checks
     // is also what runs the qemu boot oracle that waits for TD_TXT_RUNTIME_MARKER. Its
     // RECIPE files under recipes/src/recipes/ are routed by the recipes arm above,
     // not here. spec/ holds corpus DATA (no standalone shell scripts), so no
@@ -754,18 +750,18 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
         p,
     ) {
         sel.add_preflight("cargo-test");
-        sel.add_target("check-pr");
-        sel.add_target("recipe-checks-daily");
+        sel.add_target("check");
+        sel.add_target("recipe-checks");
         return;
     }
 
     // td-util: the target-built static diagnostics multicall (clear/which/free/ps/
     // dmesg), a standalone std-only crate OUTSIDE the engine workspace — same routing
-    // as td-sh. Its unit tests lint/test on the host cargo-test preflight (check-pr);
+    // as td-sh. Its unit tests lint/test on the host cargo-test preflight;
     // src/main.rs and its modules are `include_str!`'d into the td-util RECIPE, so a
     // source edit changes the TARGET artifact and a static-link regression is
-    // invisible to host cargo — so also route to recipe-checks-daily (the daily
-    // backstop statically links + exercises it via td-util-test) AND it is packed into
+    // invisible to host cargo — so also route to recipe-checks (recipe-checks
+    // statically links + exercises it via td-util-test) AND it is packed into
     // system-x86-64, serving the /bin diagnostics farm. Its RECIPE files under
     // recipes/src/recipes/ are routed by the recipes arm above, not here.
     if pattern_matches(
@@ -773,8 +769,8 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
         p,
     ) {
         sel.add_preflight("cargo-test");
-        sel.add_target("check-pr");
-        sel.add_target("recipe-checks-daily");
+        sel.add_target("check");
+        sel.add_target("recipe-checks");
         return;
     }
 
@@ -782,11 +778,11 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
     // (machine-id, the SSH host key, a deny-all authorized_keys under /var/lib/td),
     // a standalone std-only crate OUTSIDE the engine workspace — same routing as
     // td-util. Its unit tests (the /proc/mounts persistence decision, the machine-id
-    // format, the argv) lint/test on the host cargo-test preflight (check-pr);
+    // format, the argv) lint/test on the host cargo-test preflight;
     // src/main.rs and its modules are `include_str!`'d into the td-firstboot RECIPE,
     // so a source edit changes the TARGET artifact and a static-link regression is
-    // invisible to host cargo — so also route to recipe-checks-daily (the daily
-    // backstop statically links + exercises provisioning twice via
+    // invisible to host cargo — so also route to recipe-checks (recipe-checks
+    // statically links + exercises provisioning twice via
     // td-firstboot-test) AND it is packed into system-x86-64 as the sysinit job that
     // fills the /var targets every MUTABLE_ETC symlink points at, so a source edit
     // here decides whether a booted machine has an identity at all. Its RECIPE files
@@ -796,8 +792,8 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
         p,
     ) {
         sel.add_preflight("cargo-test");
-        sel.add_target("check-pr");
-        sel.add_target("recipe-checks-daily");
+        sel.add_target("check");
+        sel.add_target("recipe-checks");
         return;
     }
 
@@ -805,29 +801,29 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
     // recipe and shipped in system-x86-64. Unlike the crates above it does NOT ride
     // the cargo-test preflight: it is the one target crate with dependencies (the
     // vendored russh closure, incl. a C crate), so it cannot compile in the
-    // dependency-free offline preflight. Its coverage is the daily tier — the sshd
+    // dependency-free offline preflight. Its coverage is recipe-checks — the sshd
     // recipe builds it, and `qemu-boot-system` runs the daemon on the image (the
     // selftest marker, and `keygen` minting this machine's host identity for
-    // td-firstboot). check-pr still runs for the fast repo-wide guards.
+    // td-firstboot). The full check still runs for the fast repo-wide guards.
     if pattern_matches(
         "tests/sshd/*|tests/sshd/src/*|tests/sshd/Cargo.toml|tests/sshd/Cargo.lock",
         p,
     ) {
-        sel.add_target("check-pr");
-        sel.add_target("recipe-checks-daily");
+        sel.add_target("check");
+        sel.add_target("recipe-checks");
         return;
     }
 
     // td-review: the HOST-side integrator TUI. In neither bootstrap graph — no
     // recipe builds it and it never enters a closure — so unlike the crates
-    // above there is no target artifact for the daily backstop to link, and it
-    // deliberately does NOT route to recipe-checks-daily.
+    // above there is no target artifact for recipe-checks to link, and it
+    // deliberately does NOT route to recipe-checks.
     if pattern_matches(
         "td-review/*|td-review/src/*|td-review/tests/*|td-review/Cargo.toml|td-review/Cargo.lock",
         p,
     ) {
         sel.add_preflight("cargo-test");
-        sel.add_target("check-pr");
+        sel.add_target("check");
         return;
     }
 
@@ -835,11 +831,11 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
     // halt/switch_root/cttyhack/hostname), a standalone std-only crate OUTSIDE the
     // engine workspace — same routing as td-util, which it complements. Its unit
     // tests AND its unsafe-confinement test (the scoped-allow count and the syscall
-    // roster, which the compiler cannot check) run on the host cargo-test preflight
-    // (check-pr); src/main.rs and its modules are `include_str!`'d into the td-init
+    // roster, which the compiler cannot check) run on the host cargo-test
+    // preflight; src/main.rs and its modules are `include_str!`'d into the td-init
     // RECIPE, so a source edit changes the TARGET artifact and a static-link
-    // regression is invisible to host cargo — so also route to recipe-checks-daily
-    // (the daily backstop statically links + exercises it via td-init-test) AND it is
+    // regression is invisible to host cargo — so also route to recipe-checks
+    // (recipe-checks statically links + exercises it via td-init-test) AND it is
     // packed into system-x86-64 as /init, the initramfs pivot, and the /bin boot-glue
     // farm, so a source edit here changes what PID 1 IS. Its RECIPE files under
     // recipes/src/recipes/ are routed by the recipes arm above.
@@ -848,8 +844,8 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
         p,
     ) {
         sel.add_preflight("cargo-test");
-        sel.add_target("check-pr");
-        sel.add_target("recipe-checks-daily");
+        sel.add_target("check");
+        sel.add_target("recipe-checks");
         return;
     }
 
@@ -858,10 +854,10 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
     // unsafe-exception shape it shares. Its unit tests AND its confinement tests (the
     // scoped-allow count, the three-syscall roster, and the ORDER the credential
     // syscalls are issued in — none of which the compiler checks) run on the host
-    // cargo-test preflight (check-pr); src/main.rs and its modules are `include_str!`'d
+    // cargo-test cargo-test preflight; src/main.rs and its modules are `include_str!`'d
     // into the td-login RECIPE, so a source edit changes the TARGET artifact and a
     // static-link regression is invisible to host cargo — so also route to
-    // recipe-checks-daily (the daily backstop statically links + exercises it via
+    // recipe-checks (recipe-checks statically links + exercises it via
     // td-login-test) AND it is packed into system-x86-64 as the /bin/{login,su} farm,
     // so a source edit here changes how the machine hands out credentials. Its RECIPE
     // files under recipes/src/recipes/ are routed by the recipes arm above, and
@@ -872,8 +868,8 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
         p,
     ) {
         sel.add_preflight("cargo-test");
-        sel.add_target("check-pr");
-        sel.add_target("recipe-checks-daily");
+        sel.add_target("check");
+        sel.add_target("recipe-checks");
         return;
     }
 
@@ -881,10 +877,10 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
     // OUTSIDE the engine workspace — same routing as td-login/td-init, but NOT an
     // unsafe exception: it `#![forbid(unsafe_code)]`s, and DESIGN.md beside it is
     // the normative spec for why every capability it needs is reachable through
-    // safe std. Its unit tests run on the host cargo-test preflight (check-pr);
+    // safe std. Its unit tests run on the host cargo-test preflight;
     // src/main.rs and its modules are `include_str!`'d into the td-svc RECIPE, so
     // a source edit changes the TARGET artifact and a static-link regression is
-    // invisible to host cargo — hence recipe-checks-daily too (the daily backstop
+    // invisible to host cargo — hence recipe-checks too (which
     // statically links + exercises it via td-svc-test). Its RECIPE files under
     // recipes/src/recipes/ are routed by the recipes arm above, and DESIGN.md by
     // the docs arm — no gate can check prose, so prose alone reds nothing.
@@ -893,18 +889,17 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
         p,
     ) {
         sel.add_preflight("cargo-test");
-        sel.add_target("check-pr");
-        sel.add_target("recipe-checks-daily");
+        sel.add_target("check");
+        sel.add_target("recipe-checks");
         return;
     }
 
     // Catch-all: an unmapped path used to require the FULL loop; it now runs
-    // the bounded check-pr tier (the ~10-min per-PR budget) and leans on the
-    // daily backstop for the daily-tier gates.
-    sel.add_target("check-pr");
+    // the whole behavioral tier — there is no narrower honest answer.
+    sel.add_target("check");
     sel.add_note(&format!(
-        "No mapping for {p} — running the bounded check-pr tier; the daily backstop covers \
-         the daily-tier gates. Update builder/src/affected.rs with a mapping for it."
+        "No mapping for {p} — running the full check. Update \
+         builder/src/affected.rs with a mapping for it."
     ));
 }
 
@@ -949,7 +944,7 @@ fn format_output(header: &Header, changed: &[String], sel: &Selection, run: bool
     }
     o.push('\n');
 
-    if sel.preflights.is_empty() && sel.targets.is_empty() && sel.deferred.is_empty() {
+    if sel.preflights.is_empty() && sel.targets.is_empty() {
         o.push_str("Selected checks: none (docs-only or ignored local metadata)\n");
     } else {
         o.push_str("Selected checks:\n");
@@ -960,14 +955,7 @@ fn format_output(header: &Header, changed: &[String], sel: &Selection, run: bool
             }
         }
         if !sel.targets.is_empty() {
-            o.push_str(&format!("  td-builder check {}\n", sel.targets.join(" ")));
-        }
-        if !sel.deferred.is_empty() {
-            o.push_str(&format!(
-                "Deferred to the daily backstop (daily/system tier — not run per-PR; \
-                 `td-builder daily` heals regressions by fix-or-revert PR):\n  {}\n",
-                sel.deferred.join(" ")
-            ));
+            o.push_str(&format!("  {}\n", check_command(&sel.targets)));
         }
     }
 
@@ -995,24 +983,6 @@ fn format_output(header: &Header, changed: &[String], sel: &Selection, run: bool
     o
 }
 
-/// The gate names that run ONLY in the daily/system tiers (no membership in
-/// any per-PR pool — gates.rs's `pool_runs_per_pr` is the single source of
-/// that taxonomy). Such targets are honest members of the affected set but are
-/// NOT run per-PR — the daily backstop covers them. Built once per selection.
-fn daily_tier_only_names() -> HashSet<String> {
-    use crate::gates::Pool;
-    crate::gates::defs()
-        .into_iter()
-        .filter(|(_, d)| {
-            !d.pools.iter().any(|p| crate::gates::pool_runs_per_pr(*p))
-                && d.pools
-                    .iter()
-                    .any(|p| matches!(p, Pool::Daily | Pool::System))
-        })
-        .map(|(_, d)| d.name.to_string())
-        .collect()
-}
-
 fn compute_selection(root: &Path, changed: &[String]) -> Selection {
     let mut sel = Selection::default();
     for p in changed {
@@ -1020,18 +990,6 @@ fn compute_selection(root: &Path, changed: &[String]) -> Selection {
             map_path(root, p, &mut sel);
         }
     }
-    // The per-PR budget partition: daily/system-tier gates (and the
-    // check-system tier itself) leave the run list and are reported as
-    // deferred — the mapping arms stay honest about what a diff AFFECTS, the
-    // partition decides what runs per-PR. targets is already deduped, so the
-    // partition halves are too.
-    let daily = daily_tier_only_names();
-    let (run, defer): (Vec<String>, Vec<String>) = sel
-        .targets
-        .drain(..)
-        .partition(|t| t != "check-system" && !daily.contains(t));
-    sel.targets = run;
-    sel.deferred = defer;
     sel
 }
 
@@ -1050,9 +1008,8 @@ Select a right-sized check set from the diff against main.
   td-builder affected-checks --self-test  # verify the mapping table
 
 This is the local PR-readiness gate for diffs it can classify. It maps changed
-paths to focused gate targets (daily/system-tier gates are named but deferred
-to the daily backstop — the ~10-min per-PR budget) and prints whether the full
-check is waived or still required.
+paths to focused gate targets and prints whether the full check is waived or
+still required.
 ";
 
 /// The dry-run render for `--path PATH` (explicit mode, run=0) — the exact text
@@ -1071,6 +1028,15 @@ fn path_output(root: &Path, path: &str) -> String {
     format_output(&header, &changed, &sel, false)
 }
 
+/// The command that runs `targets`, printed VERBATIM as `--run` executes it.
+/// `check <gate>` is not redundant even though the tier already selects the gate:
+/// naming it makes it an EXPLICIT goal, and a `non_blocking` gate's failure reds
+/// the run only when it is explicit (`gates::explicit_goal_indices`). Collapsing
+/// the list would print a command that greens where `--run` reds.
+fn check_command(targets: &[String]) -> String {
+    format!("td-builder check {}", targets.join(" "))
+}
+
 fn last_check_targets(output: &str) -> Vec<String> {
     let mut line: Option<&str> = None;
     for l in output.lines() {
@@ -1082,43 +1048,17 @@ fn last_check_targets(output: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// The targets on the "Deferred to the daily backstop" line (the indented line
-/// right after the header).
-fn deferred_targets(output: &str) -> Vec<String> {
-    let mut lines = output.lines();
-    while let Some(l) = lines.next() {
-        if l.starts_with("Deferred to the daily backstop") {
-            return lines
-                .next()
-                .map(|l| l.split_whitespace().map(str::to_string).collect())
-                .unwrap_or_default();
-        }
-    }
-    Vec::new()
-}
-
 pub fn run_self_test(root: &Path) -> Vec<String> {
     let mut failures: Vec<String> = Vec::new();
     let mut fail = |m: String| failures.push(m);
 
-    // A mapping "selects" a target when it either RUNS it per-PR or names it on
-    // the deferred-to-daily line — both prove the diff→gate table is right; the
-    // run/defer split is the tier partition's job, asserted separately below.
+    // The printed command IS the executed one, so one predicate covers both.
     let has_target = |path: &str, target: &str| -> bool {
-        let out = path_output(root, path);
-        last_check_targets(&out).iter().any(|t| t == target)
-            || deferred_targets(&out).iter().any(|t| t == target)
-    };
-    let runs_target = |path: &str, target: &str| -> bool {
         last_check_targets(&path_output(root, path))
             .iter()
             .any(|t| t == target)
     };
-    let defers_target = |path: &str, target: &str| -> bool {
-        deferred_targets(&path_output(root, path))
-            .iter()
-            .any(|t| t == target)
-    };
+    let runs_target = has_target;
     // Preflights are not on the check-target lines at all, so a target
     // assertion cannot see them: read the selection directly.
     let selects_preflight = |path: &str, preflight: &str| -> bool {
@@ -1158,16 +1098,6 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
         ($path:expr, $target:expr) => {
             if has_target($path, $target) {
                 fail(format!("{}: must NOT select target '{}'", $path, $target));
-            }
-        };
-    }
-    macro_rules! assert_deferred {
-        ($path:expr, $target:expr) => {
-            if !defers_target($path, $target) {
-                fail(format!(
-                    "{}: expected DEFERRED-to-daily target '{}'",
-                    $path, $target
-                ));
             }
         };
     }
@@ -1211,14 +1141,20 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
     if !default_check_covers_target(root, "cargo-test") {
         fail("default coverage: missing cargo-test".into());
     }
-    if default_check_covers_target(root, "check-system") {
-        fail("default coverage: check-system is not covered by plain ./check.sh".into());
+    if !default_check_covers_target(root, "check") {
+        fail("default coverage: missing check (the whole behavioral tier)".into());
     }
-    if !default_check_covers_target(root, "check-pr") {
-        fail("default coverage: missing check-pr (a subset of the plain check)".into());
+    // A negative case: the classifier must not answer "covered" for everything.
+    // `check-engine` is a tier keyword the plain `check` does NOT expand to, and it
+    // is not a gate name, so it must classify as NOT covered.
+    if default_check_covers_target(root, "check-engine") {
+        fail("default coverage: check-engine is not covered by the plain check".into());
     }
-    if !default_check_covers_target(root, "recipe-checks-daily") {
-        fail("default coverage: daily gates are covered by the plain check".into());
+    if default_check_covers_target(root, "no-such-gate-xyz") {
+        fail("default coverage: an unknown target must not classify as covered".into());
+    }
+    if !default_check_covers_target(root, "recipe-checks") {
+        fail("default coverage: recipe-checks is covered by the plain check".into());
     }
 
     // Every gate file maps (via the builder/src/gate_defs/*.rs arm) to its own gate target.
@@ -1240,7 +1176,7 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
         assert_target!("tests/cache-lib.sh", &bg);
     }
 
-    assert_target!("tests/recipe-checks.sh", "recipe-checks-daily");
+    assert_target!("tests/recipe-checks.sh", "recipe-checks");
     for tombstone in [
         "tests/chain-cache-lib.sh",
         "tests/chain-cache.sh",
@@ -1248,7 +1184,7 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
         "tests/ladder-lib.sh",
         "tests/repro-lib.sh",
     ] {
-        assert_target!(tombstone, "recipe-checks-daily");
+        assert_target!(tombstone, "recipe-checks");
         assert_target!(tombstone, "bootstrap-x86_64-toolchain-store-native");
         assert_target!(tombstone, "bootstrap-x86_64-native-gcc-store-native");
         assert_target!(tombstone, "bootstrap-x86_64-self-gcc-store-native");
@@ -1271,7 +1207,7 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
     assert_target!("builder/src/gate_bodies.rs", "store-ns");
     assert_target!("builder/src/gate_bodies.rs", "check-engine");
     assert_target!("builder/src/gate_bodies.rs", "recipe-rs");
-    assert_target!("builder/src/gate_bodies.rs", "recipe-checks-daily");
+    assert_target!("builder/src/gate_bodies.rs", "recipe-checks");
     // #460: the four former tests/*.sh gate bodies became native gate_bodies fns.
     assert_target!("builder/src/gate_bodies.rs", "store-native-profile");
     assert_target!("builder/src/gate_bodies.rs", "sandbox-hardening");
@@ -1287,7 +1223,7 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
     // Recipes are one self-registering file each under src/recipes/ (issue #295);
     // the nested path must select the same gate (glob `*` crosses `/`).
     assert_target!("recipes/src/recipes/make-test.rs", "recipe-rs");
-    assert_target!("recipes/src/recipes/make-test.rs", "recipe-checks-daily");
+    assert_target!("recipes/src/recipes/make-test.rs", "recipe-checks");
     assert_target!("recipes/build.rs", "recipe-rs");
     assert_target!("recipes/Cargo.toml", "recipe-rs");
     assert_target!("builder/src/gate_defs/207-recipe-rs.rs", "recipe-rs");
@@ -1299,7 +1235,7 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
     assert_target!("engine/src/json.rs", "check-engine");
     assert_target!("engine/src/json.rs", "recipe-rs");
     assert_target!("engine/src/sha256.rs", "check-engine");
-    assert_target!("engine/src/sha256.rs", "recipe-checks-daily");
+    assert_target!("engine/src/sha256.rs", "recipe-checks");
     assert_target!("engine/Cargo.toml", "check-engine");
     assert_target!("engine/Cargo.toml", "recipe-rs");
     assert_target!("Cargo.toml", "check-engine");
@@ -1314,120 +1250,121 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
     assert_target!("recipes/Cargo.lock", "recipe-rs");
     // The merged td-net gets the union of the former fetch/feed rules: the chain targets
     // (no gate builds it from source; its main.rs holds the warm-sources consumer smoked by
-    // the i686 chain's proof set) AND the bounded check-pr tier (former fetch coverage) so a
-    // net-ONLY diff still runs a per-PR gate rather than only daily-deferred chain targets.
-    assert_target!("net/Cargo.lock", "recipe-checks-daily");
-    assert_target!("net/src/main.rs", "recipe-checks-daily");
-    assert_target!("net/src/fetch.rs", "check-pr");
-    assert_target!("net/Cargo.toml", "check-pr");
+    // the i686 chain's proof set) AND the whole behavioral tier (former fetch coverage).
+    assert_target!("net/Cargo.lock", "recipe-checks");
+    assert_target!("net/src/main.rs", "recipe-checks");
+    assert_target!("net/src/fetch.rs", "check");
+    assert_target!("net/Cargo.toml", "check");
     // td-kexec/src is include_str!'d into the target artifact, so a helper-source edit
-    // rides the host cargo preflight (check-pr) AND is recorded as deferred to the daily
-    // backstop (recipe-checks-daily statically links it via td-kexec-test).
-    assert_target!("td-kexec/src/main.rs", "check-pr");
-    assert_target!("td-kexec/src/main.rs", "recipe-checks-daily");
+    // rides the host cargo preflight AND is recorded against recipe-checks,
+    // which statically links it via td-kexec-test.
+    assert_target!("td-kexec/src/main.rs", "check");
+    assert_target!("td-kexec/src/main.rs", "recipe-checks");
     // td-sh mirrors td-kexec: standalone std-only crate, main.rs include_str!'d into
-    // its recipe, so host cargo preflight (check-pr) + daily static-link backstop.
-    assert_target!("td-sh/src/main.rs", "check-pr");
-    assert_target!("td-sh/src/main.rs", "recipe-checks-daily");
-    assert_target!("td-sh/src/lib.rs", "check-pr");
-    assert_target!("td-sh/src/lib.rs", "recipe-checks-daily");
-    assert_target!("td-sh/spec/smoke.test.sh", "check-pr");
-    assert_target!("td-sh/spec/smoke.test.sh", "recipe-checks-daily");
+    // its recipe, so host cargo preflight + the recipe-checks static-link proof.
+    assert_target!("td-sh/src/main.rs", "check");
+    assert_target!("td-sh/src/main.rs", "recipe-checks");
+    assert_target!("td-sh/src/lib.rs", "check");
+    assert_target!("td-sh/src/lib.rs", "recipe-checks");
+    assert_target!("td-sh/spec/smoke.test.sh", "check");
+    assert_target!("td-sh/spec/smoke.test.sh", "recipe-checks");
 
     // td-txt mirrors td-sh: standalone std-only crate, main.rs + modules
     // include_str!'d into the recipe, corpus DATA under spec/ (including the
     // vendored GNU suites in the two subdirectories).
-    assert_target!("td-txt/src/main.rs", "check-pr");
-    assert_target!("td-txt/src/main.rs", "recipe-checks-daily");
-    assert_target!("td-txt/src/lib.rs", "check-pr");
-    assert_target!("td-txt/spec/grep-cli.test.txt", "check-pr");
-    assert_target!("td-txt/spec/gnu-sed/appquit.sed", "check-pr");
-    assert_target!("td-txt/spec/gnu-grep/bre.tests", "recipe-checks-daily");
-    assert_target!("td-util/src/main.rs", "check-pr");
-    assert_target!("td-util/src/main.rs", "recipe-checks-daily");
-    assert_target!("td-util/src/ps.rs", "check-pr");
-    assert_target!("td-util/src/ps.rs", "recipe-checks-daily");
-    assert_target!("td-util/Cargo.lock", "check-pr");
-    assert_target!("td-util/Cargo.lock", "recipe-checks-daily");
+    assert_target!("td-txt/src/main.rs", "check");
+    assert_target!("td-txt/src/main.rs", "recipe-checks");
+    assert_target!("td-txt/src/lib.rs", "check");
+    assert_target!("td-txt/spec/grep-cli.test.txt", "check");
+    assert_target!("td-txt/spec/gnu-sed/appquit.sed", "check");
+    assert_target!("td-txt/spec/gnu-grep/bre.tests", "recipe-checks");
+    assert_target!("td-util/src/main.rs", "check");
+    assert_target!("td-util/src/main.rs", "recipe-checks");
+    assert_target!("td-util/src/ps.rs", "check");
+    assert_target!("td-util/src/ps.rs", "recipe-checks");
+    assert_target!("td-util/Cargo.lock", "check");
+    assert_target!("td-util/Cargo.lock", "recipe-checks");
     // td-firstboot mirrors td-util: every source is include_str!'d into the
     // td-firstboot recipe and packed into system-x86-64 as a sysinit job, so host
-    // cargo preflight (check-pr) + daily static-link/provisioning backstop.
-    assert_target!("td-firstboot/src/main.rs", "check-pr");
-    assert_target!("td-firstboot/src/main.rs", "recipe-checks-daily");
-    assert_target!("td-firstboot/src/mounts.rs", "check-pr");
-    assert_target!("td-firstboot/src/mounts.rs", "recipe-checks-daily");
-    assert_target!("td-firstboot/src/machineid.rs", "check-pr");
-    assert_target!("td-firstboot/Cargo.lock", "check-pr");
-    assert_target!("td-firstboot/Cargo.lock", "recipe-checks-daily");
-    assert_target!("td-firstboot/clippy.toml", "check-pr");
-    // tests/sshd is the one target crate WITH dependencies, so it rides the daily
+    // cargo cargo-test preflight + the recipe-checks static-link/provisioning proof.
+    assert_target!("td-firstboot/src/main.rs", "check");
+    assert_target!("td-firstboot/src/main.rs", "recipe-checks");
+    assert_target!("td-firstboot/src/mounts.rs", "check");
+    assert_target!("td-firstboot/src/mounts.rs", "recipe-checks");
+    assert_target!("td-firstboot/src/machineid.rs", "check");
+    assert_target!("td-firstboot/Cargo.lock", "check");
+    assert_target!("td-firstboot/Cargo.lock", "recipe-checks");
+    assert_target!("td-firstboot/clippy.toml", "check");
+    // tests/sshd is the one target crate WITH dependencies, so it rides the
     // tier rather than the dependency-free cargo-test preflight.
-    assert_target!("tests/sshd/src/main.rs", "check-pr");
-    assert_target!("tests/sshd/src/main.rs", "recipe-checks-daily");
-    assert_target!("tests/sshd/Cargo.lock", "recipe-checks-daily");
+    assert_target!("tests/sshd/src/main.rs", "check");
+    assert_target!("tests/sshd/src/main.rs", "recipe-checks");
+    assert_target!("tests/sshd/Cargo.lock", "recipe-checks");
     // td-init mirrors td-util, including its confined syscall module: every source
-    // is include_str!'d into the td-init recipe, so host cargo preflight (check-pr)
-    // + daily static-link backstop.
-    assert_target!("td-init/src/main.rs", "check-pr");
-    assert_target!("td-init/src/main.rs", "recipe-checks-daily");
-    assert_target!("td-init/src/sys.rs", "check-pr");
-    assert_target!("td-init/src/sys.rs", "recipe-checks-daily");
-    assert_target!("td-init/Cargo.lock", "check-pr");
-    assert_target!("td-init/Cargo.lock", "recipe-checks-daily");
+    // is include_str!'d into the td-init recipe, so host cargo preflight
+    // + the recipe-checks static-link proof.
+    assert_target!("td-init/src/main.rs", "check");
+    assert_target!("td-init/src/main.rs", "recipe-checks");
+    assert_target!("td-init/src/sys.rs", "check");
+    assert_target!("td-init/src/sys.rs", "recipe-checks");
+    assert_target!("td-init/Cargo.lock", "check");
+    assert_target!("td-init/Cargo.lock", "recipe-checks");
     // td-login mirrors td-init, confined syscall module included: every source is
-    // include_str!'d into the td-login recipe, so the host cargo preflight (check-pr)
-    // and the daily static-link backstop both apply. THREAT-MODEL.md is normative —
+    // include_str!'d into the td-login recipe, so the host cargo preflight
+    // and the recipe-checks static-link proof both apply. THREAT-MODEL.md is normative —
     // the confinement tests assert what it says — so it routes with the sources.
-    assert_target!("td-login/src/main.rs", "check-pr");
-    assert_target!("td-login/src/main.rs", "recipe-checks-daily");
-    assert_target!("td-login/src/creds.rs", "check-pr");
-    assert_target!("td-login/src/creds.rs", "recipe-checks-daily");
-    assert_target!("td-login/src/sys.rs", "check-pr");
-    assert_target!("td-login/src/sys.rs", "recipe-checks-daily");
+    assert_target!("td-login/src/main.rs", "check");
+    assert_target!("td-login/src/main.rs", "recipe-checks");
+    assert_target!("td-login/src/creds.rs", "check");
+    assert_target!("td-login/src/creds.rs", "recipe-checks");
+    assert_target!("td-login/src/sys.rs", "check");
+    assert_target!("td-login/src/sys.rs", "recipe-checks");
     // ...but THREAT-MODEL.md routes as DOCS, like every other `*.md` in the repo:
     // the confinement tests read the crate's SOURCE, so prose that no gate can check
     // is prose that reds nothing. Editing it alone is a documentation change; editing
     // what it specifies routes through the sources above.
-    assert_no_target!("td-login/THREAT-MODEL.md", "check-pr");
-    assert_target!("td-login/Cargo.lock", "check-pr");
-    assert_target!("td-login/Cargo.lock", "recipe-checks-daily");
+    assert_no_target!("td-login/THREAT-MODEL.md", "check");
+    assert_target!("td-login/Cargo.lock", "check");
+    assert_target!("td-login/Cargo.lock", "recipe-checks");
     assert_preflight!("td-login/src/creds.rs", "cargo-test");
     // td-svc mirrors td-login's routing minus the unsafe surface: every source is
-    // include_str!'d into the td-svc recipe, so the host cargo preflight (check-pr)
-    // and the daily static-link backstop both apply. DESIGN.md is normative prose
+    // include_str!'d into the td-svc recipe, so the host cargo preflight
+    // and the recipe-checks static-link proof both apply. DESIGN.md is normative prose
     // and routes as docs, like td-login's THREAT-MODEL.md.
-    assert_target!("td-svc/src/main.rs", "check-pr");
-    assert_target!("td-svc/src/main.rs", "recipe-checks-daily");
-    assert_target!("td-svc/src/supervise.rs", "check-pr");
-    assert_target!("td-svc/src/supervise.rs", "recipe-checks-daily");
-    assert_target!("td-svc/src/procfs.rs", "check-pr");
-    assert_target!("td-svc/src/procfs.rs", "recipe-checks-daily");
-    assert_no_target!("td-svc/DESIGN.md", "check-pr");
-    assert_target!("td-svc/clippy.toml", "check-pr");
-    assert_target!("td-svc/Cargo.lock", "check-pr");
-    assert_target!("td-svc/Cargo.lock", "recipe-checks-daily");
+    assert_target!("td-svc/src/main.rs", "check");
+    assert_target!("td-svc/src/main.rs", "recipe-checks");
+    assert_target!("td-svc/src/supervise.rs", "check");
+    assert_target!("td-svc/src/supervise.rs", "recipe-checks");
+    assert_target!("td-svc/src/procfs.rs", "check");
+    assert_target!("td-svc/src/procfs.rs", "recipe-checks");
+    assert_no_target!("td-svc/DESIGN.md", "check");
+    assert_target!("td-svc/clippy.toml", "check");
+    assert_target!("td-svc/Cargo.lock", "check");
+    assert_target!("td-svc/Cargo.lock", "recipe-checks");
     assert_preflight!("td-svc/src/order.rs", "cargo-test");
     // td-netd/src is include_str!'d into the target artifact (its recipe AND packed
     // into system-x86-64), so a helper-source edit rides the host cargo preflight
-    // (check-pr) AND is recorded as deferred to the daily backstop (recipe-checks-daily
-    // statically links + shape-asserts it via td-netd-test).
-    assert_target!("td-netd/src/main.rs", "check-pr");
-    assert_target!("td-netd/src/main.rs", "recipe-checks-daily");
-    assert_target!("td-netd/Cargo.toml", "check-pr");
-    assert_target!("td-netd/Cargo.toml", "recipe-checks-daily");
-    assert_target!("td-boot/src/main.rs", "check-pr");
-    assert_target!("td-boot/src/main.rs", "recipe-checks-daily");
-    assert_target!("td-boot/Cargo.toml", "check-pr");
-    assert_target!("td-boot/Cargo.toml", "recipe-checks-daily");
-    // Not recipe-checks-daily: nothing builds it as a target artifact.
-    // check-pr alone proves nothing: the catch-all arm adds it to every path.
+    // AND is recorded against recipe-checks, which statically links + shape-asserts
+    // it via td-netd-test.
+    assert_target!("td-netd/src/main.rs", "check");
+    assert_target!("td-netd/src/main.rs", "recipe-checks");
+    assert_target!("td-netd/Cargo.toml", "check");
+    assert_target!("td-netd/Cargo.toml", "recipe-checks");
+    assert_target!("td-boot/src/main.rs", "check");
+    assert_target!("td-boot/src/main.rs", "recipe-checks");
+    assert_target!("td-boot/Cargo.toml", "check");
+    assert_target!("td-boot/Cargo.toml", "recipe-checks");
+    // NOT recorded against recipe-checks: nothing builds td-review as a target
+    // artifact, so no -test recipe links it. (`check` runs recipe-checks anyway —
+    // this asserts the RECORD, not that the gate never executes; and `check` alone
+    // proves nothing here since the catch-all arm adds it to every path.)
     assert_preflight!("td-review/src/main.rs", "cargo-test");
     assert_preflight!("td-review/src/land.rs", "cargo-test");
     assert_preflight!("td-review/tests/land.rs", "cargo-test");
     assert_preflight!("td-review/Cargo.toml", "cargo-test");
     assert_preflight!("td-review/Cargo.lock", "cargo-test");
-    assert_no_target!("td-review/src/main.rs", "recipe-checks-daily");
-    assert_no_target!("td-review/Cargo.toml", "recipe-checks-daily");
+    assert_no_target!("td-review/src/main.rs", "recipe-checks");
+    assert_no_target!("td-review/Cargo.toml", "recipe-checks");
     assert_target!("tests/td-toolchain.lock", "toolchain-input-addressed");
     assert_target!(
         "tests/td-toolchain.lock",
@@ -1479,7 +1416,7 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
     );
     // Recipe-owned source pins route through the recipe-engine gate and the build gates.
     assert_target!("recipes/src/source_pins.rs", "recipe-rs");
-    assert_target!("recipes/src/source_pins.rs", "recipe-checks-daily");
+    assert_target!("recipes/src/source_pins.rs", "recipe-checks");
     assert_target!("recipes/src/source_pins.rs", "bootstrap-seed");
     assert_target!("recipes/src/source_pins.rs", "bootstrap-mes");
     // bootstrap-seed / bootstrap-mes are structured Rust recipes (no shell driver):
@@ -1493,19 +1430,18 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
     assert_branch_policy!("builder/src/main.rs", "the full check would be waived");
     assert_branch_policy!("builder/src/sandbox.rs", "the full check would be waived");
     assert_branch_policy!("builder/Cargo.toml", "the full check would be waived");
-    // The per-PR budget (human 2026-07-04): NOTHING escalates to the FULL loop.
-    // The loop spine and unmapped paths validate on the bounded check-pr tier;
-    // daily/system-tier gates are named but deferred.
-    assert_runs!("builder/src/gates.rs", "check-pr");
+    // The loop spine and unmapped paths have no focused gate to name, so they
+    // escalate to the whole behavioral tier.
+    assert_runs!("builder/src/gates.rs", "check");
     assert_branch_policy!("builder/src/gates.rs", "the full check would be waived");
-    assert_runs!("new/unmapped.file", "check-pr");
+    assert_runs!("new/unmapped.file", "check");
     assert_branch_policy!("new/unmapped.file", "the full check would be waived");
-    // The run/defer partition: a chain diff RUNS its PR-sized target (bootstrap-seed,
-    // Heavy) and DEFERS the daily proof of the whole ladder (recipe-checks-daily, Daily —
-    // #397: the per-rung bootstrap-gcc-mesboot gate this used to name is retired); a
-    // catalog edit RUNS the recipe-engine gate per-PR.
+    // A chain diff names BOTH its focused target (bootstrap-seed) and the proof of
+    // the whole ladder (recipe-checks) — #397: the per-rung bootstrap-gcc-mesboot
+    // gate this used to name is retired. Both RUN now; the tier that used to
+    // hold recipe-checks back is gone.
     assert_runs!("seed/stage0/AMD64/hex0_AMD64.hex0", "bootstrap-seed");
-    assert_deferred!("seed/stage0/AMD64/hex0_AMD64.hex0", "recipe-checks-daily");
+    assert_target!("seed/stage0/AMD64/hex0_AMD64.hex0", "recipe-checks");
     assert_runs!("recipes/src/source_pins.rs", "recipe-rs");
     assert_runs!("recipes/src/catalog.rs", "recipe-rs");
 
@@ -1612,7 +1548,7 @@ fn run_preflight(root: &Path, name: &str) -> i32 {
         // finding: recipes tests + clippy ran in NO automated per-PR tier).
         "cargo-test" => {
             // The target-built guest programs ride the SAME preflight: all are
-            // dependency-free pure std, while their static TARGET links are daily.
+            // dependency-free pure std, while their static TARGET links ride recipe-checks.
             // builder + recipes + the shared engine lib are one cargo workspace,
             // so --workspace lints/tests all three in one invocation; the target
             // programs (td-kexec, td-sh, td-txt, td-netd, td-boot, td-util,
@@ -1812,12 +1748,11 @@ pub fn main(args: &[String]) -> ExitCode {
     }
 
     // Nothing escalates to the full loop: every diff runs its bounded selected
-    // targets; daily/system-tier gates it affects are named + deferred above.
+    // targets.
     if !sel.targets.is_empty() {
         let code = run_self_check(&root, &sel.targets);
         // EXIT_UNPROVISIONED is the loop's documented "nothing could run
-        // here" machine signal (the daily's LegRc treats it as PARTIAL with
-        // no red bit). It is explained loudly here but PROPAGATED UNCHANGED —
+        // here" machine signal. It is explained loudly here but PROPAGATED UNCHANGED —
         // never rewritten to success: the run did not validate the targets,
         // and the exit code must say so (PR review); the caller decides what
         // PARTIAL means for its tier. Today EVERY host is in that state: the
@@ -1829,8 +1764,8 @@ pub fn main(args: &[String]) -> ExitCode {
             println!(
                 "affected-checks: check targets [{}] exited UNPROVISIONED (69) — the loop \
                  cannot run until the bootstrap graph builds its own userland (re #469); \
-                 preflights above are the per-PR coverage, the daily backstop records the \
-                 gap as PARTIAL; exit code 69 propagated unchanged",
+                 preflights above are the coverage until then; exit code 69 propagated \
+                 unchanged",
                 sel.targets.join(" ")
             );
         }
@@ -1926,20 +1861,19 @@ mod tests {
                 "",
                 "Selected checks:",
                 "  cargo test + clippy --frozen --workspace (builder/recipes/engine) + --manifest-path td-kexec/Cargo.toml + --manifest-path td-sh/Cargo.toml + --manifest-path td-txt/Cargo.toml + --manifest-path td-netd/Cargo.toml + --manifest-path td-boot/Cargo.toml + --manifest-path td-util/Cargo.toml + --manifest-path td-init/Cargo.toml + --manifest-path td-firstboot/Cargo.toml + --manifest-path td-login/Cargo.toml + --manifest-path td-svc/Cargo.toml + --manifest-path td-review/Cargo.toml -- --include-ignored",
-                "  td-builder check check-engine",
+                "  td-builder check check-engine check",
                 "",
                 "Waiver: inspection only (--path does not prove the branch diff)",
                 "Branch-mode policy for these paths: the full check would be waived",
                 "",
                 "Notes:",
-                "  - builder/src/main.rs is the td-builder build engine: validated by the ~2-min check-engine smoke (compile + unit tests); the from-source build coverage is the DAILY backstop (DESIGN §7.2), not a per-PR gate.",
+                "  - builder/src/main.rs is the td-builder build engine: the ~2-min check-engine smoke (compile + unit tests) is the fast signal; the from-source build coverage is the full check (DESIGN §7.2).",
                 "",
                 "Dry run only. Re-run with --run to execute.",
             ])
         );
 
-        // Loop spine → the bounded check-pr tier + engine tests (waived; the
-        // daily backstop covers the daily tier — the per-PR budget, 2026-07-04).
+        // Loop spine → the whole behavioral tier + engine tests (waived).
         assert_eq!(
             path_output(&root, "check.sh"),
             expect(&[
@@ -1951,13 +1885,13 @@ mod tests {
                 "Selected checks:",
                 "  bash -n tests/*.sh ci/*.sh tools/*.sh",
                 "  cargo test + clippy --frozen --workspace (builder/recipes/engine) + --manifest-path td-kexec/Cargo.toml + --manifest-path td-sh/Cargo.toml + --manifest-path td-txt/Cargo.toml + --manifest-path td-netd/Cargo.toml + --manifest-path td-boot/Cargo.toml + --manifest-path td-util/Cargo.toml + --manifest-path td-init/Cargo.toml + --manifest-path td-firstboot/Cargo.toml + --manifest-path td-login/Cargo.toml + --manifest-path td-svc/Cargo.toml + --manifest-path td-review/Cargo.toml -- --include-ignored",
-                "  td-builder check check-pr",
+                "  td-builder check check",
                 "",
                 "Waiver: inspection only (--path does not prove the branch diff)",
                 "Branch-mode policy for these paths: the full check would be waived",
                 "",
                 "Notes:",
-                "  - check.sh touches the loop spine: validated by the bounded check-pr tier (the runner runs itself over the whole PR pool); the daily backstop covers the daily tier.",
+                "  - check.sh touches the loop spine: validated by the full check (the runner runs itself over every gate).",
                 "",
                 "Dry run only. Re-run with --run to execute.",
             ])
@@ -1981,8 +1915,7 @@ mod tests {
             ])
         );
 
-        // Catch-all → the bounded check-pr tier (waived; the daily backstop
-        // covers the daily-tier gates — the per-PR budget, 2026-07-04).
+        // Catch-all → the whole behavioral tier (waived).
         assert_eq!(
             path_output(&root, "totally/unmapped/path.xyz"),
             expect(&[
@@ -1992,13 +1925,13 @@ mod tests {
                 "  totally/unmapped/path.xyz",
                 "",
                 "Selected checks:",
-                "  td-builder check check-pr",
+                "  td-builder check check",
                 "",
                 "Waiver: inspection only (--path does not prove the branch diff)",
                 "Branch-mode policy for these paths: the full check would be waived",
                 "",
                 "Notes:",
-                "  - No mapping for totally/unmapped/path.xyz — running the bounded check-pr tier; the daily backstop covers the daily-tier gates. Update builder/src/affected.rs with a mapping for it.",
+                "  - No mapping for totally/unmapped/path.xyz — running the full check. Update builder/src/affected.rs with a mapping for it.",
                 "",
                 "Dry run only. Re-run with --run to execute.",
             ])

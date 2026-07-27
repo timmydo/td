@@ -189,11 +189,11 @@ pub fn recipe() -> Recipe {
                 exec: false,
             },
         ])
-        .checks(vec![RecipeCheck::daily(
+        .checks(vec![RecipeCheck::new(
             r#"
 echo "[td] running gcc-x86-64-self-test recipe check"
 : "${TD_RECIPE_EVAL:=$PWD/target/release/td-recipe-eval}"
-exec "$TD_RECIPE_EVAL" check-run gcc-x86-64-self-test daily 1
+exec "$TD_RECIPE_EVAL" check-run gcc-x86-64-self-test 1
 "#,
         )
         .with_runner(CheckRunner::BuildOnly)])

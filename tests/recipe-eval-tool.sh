@@ -32,7 +32,7 @@ ccpath=`"$td" provision-cc` || { rc=$?; echo "recipe-eval-tool: could not provis
 # ~/.guix-home/profile/lib that a glibc gcc ld-wrapper would otherwise bake in as
 # a runpath and that vanishes while guix-home reconfigures or GCs ("error while
 # loading shared libraries: libgcc_s.so.1", exit 127), flaking this control-plane
-# tool and reddening the daily backstop. Fixing it at the SOURCE (crt-static musl)
+# tool and reddening the check. Fixing it at the SOURCE (crt-static musl)
 # supersedes pinning a runpath (re #469). The recipes crate is dependency-free
 # (pure std, no proc-macros).
 #

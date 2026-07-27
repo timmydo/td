@@ -10,9 +10,11 @@
 # exits 1 so the caller FALLS BACK to the authoritative from-seed build.
 #
 # DELIBERATE directive-1 relaxation (human-approved, surfaced in the gate + PR): with
-# this resolver the per-PR/local loop no longer builds the toolchain from source — the
-# DAILY full suite (td-builder daily, fresh main) is the SOLE remaining from-seed
-# authoritative build AND the publisher of the signed substitute. Trust = the ed25519
+# this resolver a run that gets a HIT no longer builds the toolchain from source, so a
+# from-seed `td-builder check` on a cold store is the authoritative build. NOTE: nothing
+# in-tree PUBLISHES the substitute today — the producer retired with the per-rung shell
+# gates (#444) and the daily runner that drove it, so every run currently MISSES and
+# falls back to from-seed. Trust = the ed25519
 # signature (pinned key) + the input-addressed NAME (the lock-computed StorePath); the
 # toolchain is not byte-reproducible, so repro-equality is NOT the trust basis here
 # (that is task 3).

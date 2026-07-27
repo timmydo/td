@@ -24,7 +24,7 @@ use crate::gates::{GateDef, Pool};
 pub fn gate() -> GateDef {
     GateDef {
         name: "toolchain-x86_64-input-addressed",
-        pools: &[Pool::Daily],
+        pools: &[Pool::Heavy],
         needs: &[],
         build_gate: false,
         specs: &[],

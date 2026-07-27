@@ -25,9 +25,8 @@ use crate::types::{Recipe, Step};
 // runs off its own $ORIGIN-rpath dylibs and the glibc-x86-64 PT_INTERP loader
 // (glibc-x86-64 is a declared input for exactly that reason).
 //
-// The actual static link needs the full target toolchain, so it is DAILY/
-// operator tier (no target rustc in the per-change sandbox); the sibling
-// td-kexec-test carries that daily build+assert check.
+// The actual static link needs the full target toolchain (no target rustc in
+// the loop sandbox); the sibling td-kexec-test carries that build+assert check.
 const MAIN_RS: &str = include_str!("../../../td-kexec/src/main.rs");
 
 pub fn recipe() -> Recipe {

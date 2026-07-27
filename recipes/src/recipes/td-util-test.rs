@@ -163,11 +163,11 @@ pub fn recipe() -> Recipe {
     Recipe::mesboot("td-util-test", "1.0")
         .native_inputs(&["td-util", "binutils-x86-64-self", "busybox-x86-64"])
         .steps(steps)
-        .checks(vec![RecipeCheck::daily(
+        .checks(vec![RecipeCheck::new(
             r#"
 echo ">> recipe-check td-util-test: build-plan --auto builds td-util (td's static diagnostics multicall: clear/dmesg/free/ps/which, statically linked by the /td/store target Rust + native GCC/binutils/glibc toolchain), asserts a self-contained static ELF64 x86-64 executable (ET_EXEC, no PT_INTERP, no dynamic NEEDED), and exercises the applet roster, both dispatch forms, the exit codes, and the /proc parsers"
 : "${TD_RECIPE_EVAL:=$PWD/target/release/td-recipe-eval}"
-exec "$TD_RECIPE_EVAL" check-run td-util-test daily 1
+exec "$TD_RECIPE_EVAL" check-run td-util-test 1
 "#,
         )
         .with_runner(CheckRunner::BuildOnly)])

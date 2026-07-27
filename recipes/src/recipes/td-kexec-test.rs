@@ -81,11 +81,11 @@ pub fn recipe() -> Recipe {
     Recipe::mesboot("td-kexec-test", "1.0")
         .native_inputs(&["td-kexec", "binutils-x86-64-self", "busybox-x86-64"])
         .steps(steps)
-        .checks(vec![RecipeCheck::daily(
+        .checks(vec![RecipeCheck::new(
             r#"
 echo ">> recipe-check td-kexec-test: build-plan --auto builds td-kexec (the guest kexec helper, statically linked by the /td/store target Rust + native GCC/binutils/glibc toolchain) and asserts a self-contained static ELF64 x86-64 executable (ET_EXEC, no PT_INTERP, no dynamic NEEDED)"
 : "${TD_RECIPE_EVAL:=$PWD/target/release/td-recipe-eval}"
-exec "$TD_RECIPE_EVAL" check-run td-kexec-test daily 1
+exec "$TD_RECIPE_EVAL" check-run td-kexec-test 1
 "#,
         )
         .with_runner(CheckRunner::BuildOnly)])

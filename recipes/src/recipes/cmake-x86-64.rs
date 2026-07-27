@@ -145,11 +145,11 @@ pub fn recipe() -> Recipe {
         ])
         .inputs_owned(mesboot0_inputs(&["linux-headers-x86-64"]))
         .steps(steps)
-        .checks(vec![RecipeCheck::daily(
+        .checks(vec![RecipeCheck::new(
             r#"
 echo ">> recipe-check cmake-x86-64: build source CMake with td's POSIX native GCC and validate its static executable"
 : "${TD_RECIPE_EVAL:=$PWD/target/release/td-recipe-eval}"
-exec "$TD_RECIPE_EVAL" check-run cmake-x86-64 daily 1
+exec "$TD_RECIPE_EVAL" check-run cmake-x86-64 1
 "#,
         )
         .with_runner(CheckRunner::BuildOnly)])

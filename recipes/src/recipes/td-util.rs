@@ -33,9 +33,8 @@ use crate::types::{Recipe, Step};
 // classic ET_EXEC with no PT_INTERP. The linker is td's native gcc with `-B` at
 // glibc's crt objects and binutils' as/ld.
 //
-// The actual static link needs the full target toolchain, so it is DAILY/
-// operator tier (no target rustc in the per-change sandbox); the sibling
-// td-util-test carries that daily build+assert check.
+// The actual static link needs the full target toolchain (no target rustc in
+// the loop sandbox); the sibling td-util-test carries that build+assert check.
 //
 // The crate root (`main.rs`) declares each sibling module with `mod NAME;`, so a
 // single `rustc src/main.rs` pulls them all in — but only if every module file is

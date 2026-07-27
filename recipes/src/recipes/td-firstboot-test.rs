@@ -209,11 +209,11 @@ pub fn recipe() -> Recipe {
             "busybox-x86-64",
         ])
         .steps(steps)
-        .checks(vec![RecipeCheck::daily(
+        .checks(vec![RecipeCheck::new(
             r#"
 echo ">> recipe-check td-firstboot-test: build-plan --auto builds td-firstboot (td's static per-machine identity provisioner: machine-id, SSH host key, deny-all authorized_keys under /var/lib/td, which the image's /etc reaches through reviewed per-file symlinks), asserts a self-contained static ELF64 x86-64 executable (ET_EXEC, no PT_INTERP, no dynamic NEEDED), and exercises provisioning twice to prove it mints an identity once and never re-mints it, plus its refusals"
 : "${TD_RECIPE_EVAL:=$PWD/target/release/td-recipe-eval}"
-exec "$TD_RECIPE_EVAL" check-run td-firstboot-test daily 1
+exec "$TD_RECIPE_EVAL" check-run td-firstboot-test 1
 "#,
         )
         .with_runner(CheckRunner::BuildOnly)])

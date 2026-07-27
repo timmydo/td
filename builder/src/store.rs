@@ -265,7 +265,7 @@ pub fn input_addressed_path(key_hex: &str, name: &str) -> String {
 /// observe. A change that CANNOT affect any output (a refactor, a log-message tweak, an
 /// unrelated subcommand) leaves it, so the world is not rebuilt. That is the soundness
 /// burden of dropping the content hash: forgetting to bump on an output-affecting change
-/// yields stale reuse. The `tree_fingerprint` builder-source drift record and the daily
+/// yields stale reuse. The `tree_fingerprint` builder-source drift record and the
 /// rebuild-the-world are the backstops.
 pub const BUILDER_ABI: u64 = 1;
 

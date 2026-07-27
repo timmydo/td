@@ -48,9 +48,8 @@ use crate::types::{Recipe, Step};
 // `relocation-model=static` yields a classic ET_EXEC with no PT_INTERP. The
 // linker is td's native gcc with `-B` at glibc's crt objects and binutils' as/ld.
 //
-// The actual static link needs the full target toolchain, so it is DAILY/
-// operator tier (no target rustc in the per-change sandbox); the sibling
-// td-login-test carries that daily build+assert check.
+// The actual static link needs the full target toolchain (no target rustc in
+// the loop sandbox); the sibling td-login-test carries that build+assert check.
 //
 // The crate root (`main.rs`) declares each sibling module with `mod NAME;`, so a
 // single `rustc src/main.rs` pulls them all in — but only if every module file is
@@ -95,7 +94,7 @@ pub(crate) fn source(name: &str) -> Option<&'static str> {
 
 /// Every `mod NAME;` the embedded crate root declares. `rustc src/main.rs`
 /// resolves each one from the filesystem, so a module `MODULES` does not write
-/// out is a compile error — but one that only surfaces in the DAILY tier, on a
+/// out is a compile error — but one that only surfaces in recipe-checks, on a
 /// rung that needs the whole target toolchain. Deriving the list from the source
 /// makes the mismatch a `cargo test` failure instead.
 #[cfg(test)]
@@ -227,7 +226,7 @@ mod tests {
     /// The recipe writes out exactly the modules the crate root declares.
     ///
     /// A `mod` line with no matching `MODULES` entry is a rustc error deep in the
-    /// daily tier, on the one rung that needs the whole target toolchain; an
+    /// recipe-checks tier, on the one rung that needs the whole target toolchain; an
     /// entry with no `mod` line is a file rustc never compiles, so its contents —
     /// including anything the crate's own confinement tests would have refused —
     /// silently do not reach the shipped binary. Both read as "keep these in

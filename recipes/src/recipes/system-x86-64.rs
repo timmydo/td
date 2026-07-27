@@ -2548,7 +2548,7 @@ mod tests {
     /// the same REQUEST (12s), then under the nettest token a 3s-timeout resolve and a 5s
     /// connect. A oneshot that outruns its bound is TERMed and marked failed, so netup
     /// would silently not configure the link and sshd would start against a half-open
-    /// network — visible only to the daily oracle. Under the inittab these jobs had NO
+    /// network — visible only to the qemu oracle. Under the inittab these jobs had NO
     /// bound, so a too-tight value is a failure mode this landing introduces, and the
     /// values are therefore reviewed constants rather than free parameters.
     #[test]
@@ -3611,7 +3611,7 @@ mod tests {
 
     /// The staged tree must carry one symlink per table entry, with the recorded
     /// target, and the directory to hold it. Asserted on the STEPS, so a table entry
-    /// that never became a staging step reds here rather than in a daily image build.
+    /// that never became a staging step reds here rather than in a full image build.
     #[test]
     fn every_mutable_etc_entry_is_staged_as_a_symlink() {
         let steps = real_root_steps(&SYSTEM);
@@ -4448,7 +4448,7 @@ mod tests {
     /// as stray words: `grep -Eq "^[^ ]+ / erofs ro[, ]"` becomes `grep -Eq ^[^` plus
     /// five loose arguments, `$t` is set in the wrong shell, and the marker can never be
     /// earned. The result still PARSES, so `sh -n` greens it and only the qemu boot
-    /// oracle — a daily-tier check — would ever notice. Hence a unit test.
+    /// oracle — a whole-image check — would ever notice. Hence a unit test.
     ///
     /// Two halves, and both are needed: the probes carry no single quote, and they sit
     /// immediately after the opening quote of the `su -c` argument. The second is what
@@ -4698,7 +4698,7 @@ mod tests {
         // The build-time half. These two legs are the only thing that turns "PID 1 rejects a
         // line of the shipped inittab" and "the pivot's fail-early refusal is gone" into a
         // named per-change failure instead of an image that does not come up; they run in the
-        // daily tier, so nothing else here would notice their deletion.
+        // recipe-checks tier, so nothing else here would notice their deletion.
         let shape = shape_check();
         assert!(
             shape.contains("init --dry-run -f \"$root/etc/inittab\""),
@@ -4985,7 +4985,7 @@ mod tests {
     /// switch", "usage: cttyhack" — copied by hand across a crate boundary. Americanise one
     /// spelling or reword one refusal and the probe stops matching: the marker is withheld on
     /// a HEALTHY image, and the only thing that would have caught it is a manual
-    /// qemu-boot-system run, which is not in check-pr or the daily tier. The recipe already
+    /// qemu-boot-system run, which no gate runs. The recipe already
     /// embeds every applet source via `include_str!`, so the link costs nothing.
     #[test]
     fn every_expected_refusal_is_a_string_the_applet_actually_emits() {
@@ -5200,8 +5200,8 @@ mod tests {
     /// at build time. So the symlink resolved in the recipe text and dangled on the image,
     /// and since PID 1's only respawn line execs it, the machine would have come up with
     /// no identity, no network, no sshd and no console — the shape check says exactly
-    /// that, but shape_check runs in the recipe-checks-daily tier, which is deferred
-    /// per-PR. Every other packed binary here has a test of this shape; this one is td-svc
+    /// that, but shape_check runs in the recipe-checks tier, which needs the loop
+    /// toolchain. Every other packed binary here has a test of this shape; this one is td-svc
     /// paying the same rent.
     #[test]
     fn td_svc_is_packed_and_not_merely_symlinked() {

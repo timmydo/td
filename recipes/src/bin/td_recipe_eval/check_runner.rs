@@ -64,18 +64,17 @@ fn provenance_rejection(stem: &str, input: &str) -> String {
 
 pub fn cli(args: &[String]) -> Result<(), String> {
     let stem = args.first().ok_or_else(usage)?.as_str();
-    let scope = args.get(1).map(String::as_str).unwrap_or("daily");
-    let index = parse_index(args.get(2))?;
-    if args.get(3).is_some() {
+    let index = parse_index(args.get(1))?;
+    if args.get(2).is_some() {
         return Err(usage());
     }
-    let check_runner = selected_check_runner(stem, scope, index)?;
+    let check_runner = selected_check_runner(stem, index)?;
     // Provenance planning FIRST — before the runner exists, so a rejected
     // graph spawns no subprocess at all (re #469).
     ensure_targets_provenance(&[stem])?;
 
     let root = env::current_dir().map_err(|e| format!("current dir: {e}"))?;
-    let scratch_name = scratch_name("check", &[stem, scope, &index.to_string()]);
+    let scratch_name = scratch_name("check", &[stem, &index.to_string()]);
     let runner = RecipeCheckRunner::new(root, &scratch_name)?;
     let _lock = lock_file(&runner.lock_path())?;
     runner.setup()?;
@@ -251,11 +250,11 @@ fn reject_unsafe_clear_target(lw: &Path) -> Result<(), String> {
 }
 
 /// Host-side qemu boot validation (re #529). This is deliberately NOT a gated
-/// recipe check: booting the kernel requires HOST qemu, and the daily gate wraps
+/// recipe check: booting the kernel requires HOST qemu, and the gate wraps
 /// every recipe check in a host-free `pivot_root` sandbox that exposes only
 /// td-built tools by absolute /td/store path — so host qemu is unreachable there
 /// (unlike the RustToolchain check, which runs the td-BUILT rustc). Registering it
-/// as a daily check would therefore fail on `find_qemu` on every real runner. So
+/// as a sandboxed check would therefore fail on `find_qemu` on every real runner. So
 /// the boot is an explicit host-side command an operator or developer runs OUTSIDE
 /// the sandbox: it builds linux-x86-64 (bzImage + initramfs) and boots it under
 /// host qemu, asserting the userland marker reaches ttyS0.
@@ -287,7 +286,7 @@ pub fn qemu_boot_cli(args: &[String]) -> Result<(), String> {
 /// image with the control-plane `mkfs-erofs` writer (#548) and attaches it as a
 /// read-only virtio-blk disk; the guest /init mounts it read-only and the tool
 /// asserts the erofs marker. Host-side (never a gated check) for the same reason
-/// `qemu-boot` is — the daily sandbox has no host qemu. See checks/qemu_boot.rs.
+/// `qemu-boot` is — the gate sandbox has no host qemu. See checks/qemu_boot.rs.
 pub fn qemu_boot_erofs_cli(args: &[String]) -> Result<(), String> {
     const STEM: &str = "linux-x86-64";
     let stem = args.first().map(String::as_str).unwrap_or(STEM);
@@ -318,7 +317,7 @@ pub fn qemu_boot_erofs_cli(args: &[String]) -> Result<(), String> {
 /// and boots it twice through selector, verified kexec, loop-mounted EROFS, and
 /// persistent @var. Boot two must read boot one's synced marker; both prove the
 /// immutable root, target-owned state, clean shutdown, and offline Btrfs checks.
-/// This is host-side because the daily sandbox has no host qemu.
+/// This is host-side because the gate sandbox has no host qemu.
 pub fn qemu_boot_system_cli(args: &[String]) -> Result<(), String> {
     const STEM: &str = "system-x86-64";
     let stem = args.first().map(String::as_str).unwrap_or(STEM);
@@ -380,7 +379,7 @@ pub fn qemu_boot_net_cli(args: &[String]) -> Result<(), String> {
 /// initramfs) and boots it under host qemu (TCG): the outer /init prints STAGE1 then execs
 /// td-kexec to kexec_file_load(2)+reboot(KEXEC) the inner kernel, whose /init prints STAGE2.
 /// It asserts STAGE2 reached (the kexec worked). Host-side (never a gated check) for the
-/// same reason `qemu-boot` is: the daily sandbox has no host qemu. See checks/qemu_boot.rs.
+/// same reason `qemu-boot` is: the gate sandbox has no host qemu. See checks/qemu_boot.rs.
 pub fn qemu_boot_kexec_cli(args: &[String]) -> Result<(), String> {
     const STEM: &str = "kexec-spike-x86-64";
     let stem = args.first().map(String::as_str).unwrap_or(STEM);
@@ -409,7 +408,7 @@ pub fn qemu_boot_kexec_cli(args: &[String]) -> Result<(), String> {
 /// `td-recipe-eval run [system-x86-64]` — the interactive distro runner (re #541).
 /// Builds and verifies the complete `system-x86-64` deployment bundle, then
 /// boots it under host qemu with an interactive serial console. Like `qemu-boot`,
-/// this is a host-side command run OUTSIDE the daily sandbox (which has no host
+/// this is a host-side command run OUTSIDE the gate sandbox (which has no host
 /// qemu and no terminal), never a gated check. See checks/run.rs.
 pub fn run_cli(args: &[String]) -> Result<(), String> {
     const STEM: &str = "system-x86-64";
@@ -575,7 +574,7 @@ pub fn seed_digests_cli() -> Result<(), String> {
 }
 
 fn usage() -> String {
-    "usage: check-run STEM [pr|daily|all] [INDEX]".to_string()
+    "usage: check-run STEM [INDEX]".to_string()
 }
 
 fn build_usage() -> String {
@@ -594,17 +593,6 @@ fn parse_index(arg: Option<&String>) -> Result<usize, String> {
             Ok(n)
         }
         None => Ok(1),
-    }
-}
-
-fn parse_tier(arg: &str) -> Result<Option<td_recipe::types::CheckTier>, String> {
-    match arg {
-        "all" => Ok(None),
-        "pr" => Ok(Some(td_recipe::types::CheckTier::Pr)),
-        "daily" => Ok(Some(td_recipe::types::CheckTier::Daily)),
-        other => Err(format!(
-            "unknown check tier '{other}' (expected pr|daily|all)"
-        )),
     }
 }
 
@@ -936,30 +924,25 @@ fn is_plain_basename(b: &str) -> bool {
         && b != ".."
 }
 
-fn selected_check_runner(stem: &str, scope: &str, index: usize) -> Result<CheckRunner, String> {
-    let tier = parse_tier(scope)?;
+fn selected_check_runner(stem: &str, index: usize) -> Result<CheckRunner, String> {
     let recipe = catalog::lookup(stem)
         .ok_or_else(|| format!("unknown recipe stem '{stem}' (try `list`)"))?;
     let mut count = 0;
     if let Some(checks) = &recipe.checks {
         for check in checks {
-            if tier.map(|t| check.tier == t).unwrap_or(true) {
-                count += 1;
-                if count == index {
-                    return check.runner.ok_or_else(|| {
-                        format!(
-                            "{stem} check index {index} has no Rust check-runner implementation"
-                        )
-                    });
-                }
+            count += 1;
+            if count == index {
+                return check.runner.ok_or_else(|| {
+                    format!("{stem} check index {index} has no Rust check-runner implementation")
+                });
             }
         }
     }
     if count == 0 {
-        return Err(format!("{stem} has no checks in the requested tier"));
+        return Err(format!("{stem} owns no checks"));
     }
     Err(format!(
-        "{stem} has only {count} check(s) in the requested tier; index {index} is out of range"
+        "{stem} owns only {count} check(s); index {index} is out of range"
     ))
 }
 
@@ -2994,7 +2977,7 @@ mod tests {
     fn trailing_pid_parses_only_a_numeric_suffix() {
         // scratch_name appends `-<pid>` — the reaper keys on exactly that.
         assert_eq!(trailing_pid("build-oyacc-4059"), Some(4059));
-        assert_eq!(trailing_pid("check-make-test-daily-1-12345"), Some(12345));
+        assert_eq!(trailing_pid("check-make-test-1-12345"), Some(12345));
         assert_eq!(trailing_pid("seed-digests-7"), Some(7));
         // No numeric suffix ⇒ not a reapable scratch dir (never touched).
         assert_eq!(trailing_pid("build-oyacc"), None);
@@ -3017,7 +3000,7 @@ mod tests {
     fn reapable_dead_pid_requires_our_scratch_prefix() {
         // Our own trees are reapable...
         assert_eq!(reapable_dead_pid("build-oyacc-4059"), Some(4059));
-        assert_eq!(reapable_dead_pid("check-make-test-daily-1-12345"), Some(12345));
+        assert_eq!(reapable_dead_pid("check-make-test-1-12345"), Some(12345));
         // ...including the host-side qemu-boot tool's per-boot scratch (a killed boot's
         // multi-GiB kernel-build tree would otherwise leak forever).
         assert_eq!(reapable_dead_pid("qemu-boot-linux-x86-64-22760"), Some(22760));
@@ -3150,7 +3133,7 @@ mod tests {
         let tomb = clearing_tombstone_path(&store);
         let _ = fs::remove_dir_all(&store);
         let _ = fs::remove_dir_all(&tomb);
-        // A populated store: the stashed td-subst binary + a signed narinfo, as the daily publishes.
+        // A populated store: the stashed td-subst binary + a signed narinfo, as a publisher leaves it.
         fs::create_dir_all(&store).unwrap();
         fs::write(store.join("td-subst"), b"bin").unwrap();
         fs::write(store.join("abc.narinfo"), b"StorePath: /td/store/abc").unwrap();

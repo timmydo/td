@@ -15,10 +15,9 @@ use crate::types::{CheckRunner, Recipe, RecipeCheck, Step};
 // binary (below); the elaborate /gnu/store-absent own-root namespace the corpus checks use
 // buys nothing for a static binary.
 //
-// Validation is the recipe-owned RecipeCheck::daily (below): `build-plan --auto make-test`
+// Validation is the recipe-owned RecipeCheck (below): `build-plan --auto make-test`
 // realizes the native toolchain → make-x86-64 → make-test; make-test's steps run make. HEAVY
-// (from-seed native toolchain, #371) — deferred to the daily backstop, same posture as the
-// rust-toolchain recipe check.
+// (from-seed native toolchain, #371) — same posture as the rust-toolchain recipe check.
 // Host-free scripting tools: mesboot0 (grep-mesboot0 for the no-guix byte grep). re #469.
 pub fn recipe() -> Recipe {
     let make = "{in:make-x86-64}/bin/make";
@@ -85,11 +84,11 @@ pub fn recipe() -> Recipe {
         .native_inputs(&["make-x86-64"])
         .inputs_owned(mesboot0_inputs(&[]))
         .steps(steps)
-        .checks(vec![RecipeCheck::daily(
+        .checks(vec![RecipeCheck::new(
             r#"
 echo ">> recipe-check make-test: build-plan --auto builds+validates make-test — GNU make 4.4.1, built on the native /td/store toolchain (make-x86-64), RUNS a real build; a broken make reds make-test's build"
 : "${TD_RECIPE_EVAL:=$PWD/target/release/td-recipe-eval}"
-exec "$TD_RECIPE_EVAL" check-run make-test daily 1
+exec "$TD_RECIPE_EVAL" check-run make-test 1
 "#,
         )
         .with_runner(CheckRunner::BuildOnly)])

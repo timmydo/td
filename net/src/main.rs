@@ -27,8 +27,8 @@
 //
 // Cargo builds ONLY `td-net`; the applet NAMES are symlinks to it. The check-loop warm
 // (builder/src/check_loop.rs host_net_applet) creates td-fetch/td-feed beside the built
-// binary on demand; the td-subst name is provided by the daily substitute stash
-// (builder/src/daily.rs) and by operators per tools/resolve-toolchain.sh. Invoking a bare
+// binary on demand; the td-subst name is provided by a substitute stash
+// and by operators per tools/resolve-toolchain.sh. Invoking a bare
 // `td-net` with no applet selector is a usage error (exit 2) by design.
 mod feed;
 mod fetch;

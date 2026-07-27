@@ -434,7 +434,7 @@ fn hash_file(path: &Path) -> Result<[u8; 32], String> {
 }
 
 /// Hash a file and scan for a byte sequence in one pass. Final Rust/LLVM
-/// artifacts are large enough that reading each once keeps the daily trust-root
+/// artifacts are large enough that reading each once keeps the trust-root
 /// check bounded without weakening either oracle.
 fn hash_file_and_contains(path: &Path, needle: &[u8]) -> Result<([u8; 32], bool), String> {
     let mut file = File::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;

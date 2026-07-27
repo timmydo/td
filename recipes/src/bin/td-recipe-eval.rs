@@ -4,14 +4,12 @@
 //!   list                  print every recipe's `.ts` file stem, one per line
 //!   emit STEM             print STEM's recipe as canonical JSON (the wire format
 //!                         the build path consumes)
-//!   check-list [pr|daily|all]
-//!                         print recipe stems that own checks in the requested tier
-//!   check-count STEM [pr|daily|all]
-//!                         print how many check bodies STEM owns in the requested tier
-//!   check-script STEM [pr|daily|all] [INDEX]
-//!                         print STEM's owned check bodies for the requested tier;
-//!                         INDEX is 1-based and emits a single body
-//!   check-run STEM [pr|daily|all] [INDEX]
+//!   check-list            print recipe stems that own checks
+//!   check-count STEM      print how many check bodies STEM owns
+//!   check-script STEM [INDEX]
+//!                         print STEM's owned check bodies; INDEX is 1-based and
+//!                         emits a single body
+//!   check-run STEM [INDEX]
 //!                         run one recipe-owned package check through the Rust
 //!                         runner instead of sourcing tests/ ladder helpers
 //!   build-run TARGET [OUTPUT_STEM ...]
@@ -87,35 +85,14 @@ fn lookup_or_die(stem: &str) -> td_recipe::types::Recipe {
     }
 }
 
-fn tier_filter(arg: Option<&String>) -> Option<td_recipe::types::CheckTier> {
-    match arg.map(String::as_str).unwrap_or("all") {
-        "all" => None,
-        "pr" => Some(td_recipe::types::CheckTier::Pr),
-        "daily" => Some(td_recipe::types::CheckTier::Daily),
-        other => die(&format!(
-            "unknown check tier '{other}' (expected pr|daily|all)"
-        )),
-    }
+fn recipe_has_check(r: &td_recipe::types::Recipe) -> bool {
+    !recipe_checks(r).is_empty()
 }
 
-fn recipe_has_check(
-    r: &td_recipe::types::Recipe,
-    tier: Option<td_recipe::types::CheckTier>,
-) -> bool {
-    !recipe_checks(r, tier).is_empty()
-}
-
-fn recipe_checks(
-    r: &td_recipe::types::Recipe,
-    tier: Option<td_recipe::types::CheckTier>,
-) -> Vec<&td_recipe::types::RecipeCheck> {
+fn recipe_checks(r: &td_recipe::types::Recipe) -> Vec<&td_recipe::types::RecipeCheck> {
     r.checks
         .as_ref()
-        .map(|xs| {
-            xs.iter()
-                .filter(|c| tier.map(|t| c.tier == t).unwrap_or(true))
-                .collect()
-        })
+        .map(|xs| xs.iter().collect())
         .unwrap_or_default()
 }
 
@@ -171,34 +148,32 @@ fn main() {
             println!("{}", lookup_or_die(stem).to_json().to_canonical());
         }
         Some("check-list") => {
-            let tier = tier_filter(args.get(2));
             for (stem, r) in catalog::all() {
-                if recipe_has_check(&r, tier) {
+                if recipe_has_check(&r) {
                     println!("{stem}");
                 }
             }
         }
         Some("check-count") => {
-            let stem = args.get(2).unwrap_or_else(|| die("usage: check-count STEM [pr|daily|all]"));
-            let tier = tier_filter(args.get(3));
+            let stem = args.get(2).unwrap_or_else(|| die("usage: check-count STEM"));
             let r = lookup_or_die(stem);
-            println!("{}", recipe_checks(&r, tier).len());
+            println!("{}", recipe_checks(&r).len());
         }
         Some("check-script") => {
-            let stem =
-                args.get(2).unwrap_or_else(|| die("usage: check-script STEM [pr|daily|all] [INDEX]"));
-            let tier = tier_filter(args.get(3));
-            let index = check_index(args.get(4));
+            let stem = args
+                .get(2)
+                .unwrap_or_else(|| die("usage: check-script STEM [INDEX]"));
+            let index = check_index(args.get(3));
             let r = lookup_or_die(stem);
-            let checks = recipe_checks(&r, tier);
+            let checks = recipe_checks(&r);
             if checks.is_empty() {
-                die(&format!("{stem} has no checks in the requested tier"));
+                die(&format!("{stem} owns no checks"));
             }
             if let Some(i) = index {
                 match checks.get(i - 1) {
                     Some(c) => println!("{}", c.script),
                     None => die(&format!(
-                        "{stem} has only {} check(s) in the requested tier; index {i} is out of range",
+                        "{stem} owns only {} check(s); index {i} is out of range",
                         checks.len()
                     )),
                 }
@@ -297,156 +272,35 @@ fn main() {
 mod tests {
     use super::*;
 
+    /// Every recipe that owns checks owns exactly the bodies the catalog
+    /// declares — the count `check-count` reports and `recipe-checks` loops over.
     #[test]
-    fn tier_filter_counts_recipe_check_bodies() {
-        let make = catalog::lookup("make-test").unwrap();
-        assert_eq!(
-            recipe_checks(&make, Some(td_recipe::types::CheckTier::Pr)).len(),
-            0
-        );
-        assert_eq!(
-            recipe_checks(&make, Some(td_recipe::types::CheckTier::Daily)).len(),
-            1
-        );
-        assert_eq!(recipe_checks(&make, None).len(), 1);
-
-        let busybox = catalog::lookup("busybox-test").unwrap();
-        assert_eq!(
-            recipe_checks(&busybox, Some(td_recipe::types::CheckTier::Pr)).len(),
-            0
-        );
-        assert_eq!(
-            recipe_checks(&busybox, Some(td_recipe::types::CheckTier::Daily)).len(),
-            1
-        );
-        assert_eq!(recipe_checks(&busybox, None).len(), 1);
-
-        let gcc_bridge = catalog::lookup("gcc-10-bridge-test").unwrap();
-        assert_eq!(
-            recipe_checks(&gcc_bridge, Some(td_recipe::types::CheckTier::Pr)).len(),
-            0
-        );
-        assert_eq!(
-            recipe_checks(&gcc_bridge, Some(td_recipe::types::CheckTier::Daily)).len(),
-            1
-        );
-        assert_eq!(recipe_checks(&gcc_bridge, None).len(), 1);
-
-        let x86_cross = catalog::lookup("gcc-x86-64-stage2-test").unwrap();
-        assert_eq!(
-            recipe_checks(&x86_cross, Some(td_recipe::types::CheckTier::Pr)).len(),
-            0
-        );
-        assert_eq!(
-            recipe_checks(&x86_cross, Some(td_recipe::types::CheckTier::Daily)).len(),
-            1
-        );
-        assert_eq!(recipe_checks(&x86_cross, None).len(), 1);
-
-        let x86_native = catalog::lookup("gcc-x86-64-native-test").unwrap();
-        assert_eq!(
-            recipe_checks(&x86_native, Some(td_recipe::types::CheckTier::Pr)).len(),
-            0
-        );
-        assert_eq!(
-            recipe_checks(&x86_native, Some(td_recipe::types::CheckTier::Daily)).len(),
-            1
-        );
-        assert_eq!(recipe_checks(&x86_native, None).len(), 1);
-
-        let x86_self = catalog::lookup("gcc-x86-64-self-test").unwrap();
-        assert_eq!(
-            recipe_checks(&x86_self, Some(td_recipe::types::CheckTier::Pr)).len(),
-            0
-        );
-        assert_eq!(
-            recipe_checks(&x86_self, Some(td_recipe::types::CheckTier::Daily)).len(),
-            1
-        );
-        assert_eq!(recipe_checks(&x86_self, None).len(), 1);
-
-        let linux = catalog::lookup("linux-x86-64-test").unwrap();
-        assert_eq!(
-            recipe_checks(&linux, Some(td_recipe::types::CheckTier::Pr)).len(),
-            0
-        );
-        assert_eq!(
-            recipe_checks(&linux, Some(td_recipe::types::CheckTier::Daily)).len(),
-            1
-        );
-        assert_eq!(recipe_checks(&linux, None).len(), 1);
-
-        let flex = catalog::lookup("flex-x86-64-test").unwrap();
-        assert_eq!(
-            recipe_checks(&flex, Some(td_recipe::types::CheckTier::Pr)).len(),
-            0
-        );
-        assert_eq!(
-            recipe_checks(&flex, Some(td_recipe::types::CheckTier::Daily)).len(),
-            1
-        );
-        assert_eq!(recipe_checks(&flex, None).len(), 1);
-
-        let elfutils = catalog::lookup("elfutils-x86-64-test").unwrap();
-        assert_eq!(
-            recipe_checks(&elfutils, Some(td_recipe::types::CheckTier::Pr)).len(),
-            0
-        );
-        assert_eq!(
-            recipe_checks(&elfutils, Some(td_recipe::types::CheckTier::Daily)).len(),
-            1
-        );
-        assert_eq!(recipe_checks(&elfutils, None).len(), 1);
-
-        let btrfs = catalog::lookup("btrfs-progs-x86-64-test").unwrap();
-        assert_eq!(
-            recipe_checks(&btrfs, Some(td_recipe::types::CheckTier::Pr)).len(),
-            0
-        );
-        assert_eq!(
-            recipe_checks(&btrfs, Some(td_recipe::types::CheckTier::Daily)).len(),
-            1
-        );
-        assert_eq!(recipe_checks(&btrfs, None).len(), 1);
-
-        let boot = catalog::lookup("td-boot-test").unwrap();
-        assert_eq!(
-            recipe_checks(&boot, Some(td_recipe::types::CheckTier::Pr)).len(),
-            0
-        );
-        assert_eq!(
-            recipe_checks(&boot, Some(td_recipe::types::CheckTier::Daily)).len(),
-            1
-        );
-        assert_eq!(recipe_checks(&boot, None).len(), 1);
-
-        let hello = catalog::lookup("hello-test").unwrap();
-        assert_eq!(
-            recipe_checks(&hello, Some(td_recipe::types::CheckTier::Pr)).len(),
-            0
-        );
-        assert_eq!(
-            recipe_checks(&hello, Some(td_recipe::types::CheckTier::Daily)).len(),
-            1
-        );
-        assert_eq!(recipe_checks(&hello, None).len(), 1);
-
-        let rust_userland = catalog::lookup("rust-userland-auto-test").unwrap();
-        assert_eq!(
-            recipe_checks(&rust_userland, Some(td_recipe::types::CheckTier::Pr)).len(),
-            0
-        );
-        assert_eq!(
-            recipe_checks(&rust_userland, Some(td_recipe::types::CheckTier::Daily)).len(),
-            1
-        );
-        assert_eq!(recipe_checks(&rust_userland, None).len(), 1);
+    fn checked_recipes_own_their_check_bodies() {
+        for stem in [
+            "make-test",
+            "busybox-test",
+            "gcc-10-bridge-test",
+            "gcc-x86-64-stage2-test",
+            "gcc-x86-64-native-test",
+            "gcc-x86-64-self-test",
+            "linux-x86-64-test",
+            "flex-x86-64-test",
+            "elfutils-x86-64-test",
+            "btrfs-progs-x86-64-test",
+            "td-boot-test",
+            "hello-test",
+            "rust-userland-auto-test",
+        ] {
+            let r = catalog::lookup(stem).unwrap();
+            assert_eq!(recipe_checks(&r).len(), 1, "{stem}");
+            assert!(recipe_has_check(&r), "{stem}");
+        }
     }
 
     #[test]
     fn unchecked_recipes_have_zero_check_bodies() {
         let mes = catalog::lookup("mes").unwrap();
-        assert_eq!(recipe_checks(&mes, None).len(), 0);
+        assert_eq!(recipe_checks(&mes).len(), 0);
     }
 
     #[test]
@@ -460,7 +314,7 @@ mod tests {
             ("gcc-x86-64-native-test", 1),
             ("gcc-x86-64-self-test", 1),
             ("linux-x86-64-test", 1),
-            // linux-x86-64 itself registers NO daily check: its qemu boot is a
+            // linux-x86-64 itself registers NO check: its qemu boot is a
             // host-side tool (`td-recipe-eval qemu-boot`), not a sandboxed gate
             // check, because a qemu boot needs host qemu the gate sandbox hides
             // (re #529). Its in-sandbox coverage is linux-x86-64-test above.
@@ -472,13 +326,13 @@ mod tests {
             ("rust-userland-auto-test", 1),
         ] {
             let recipe = catalog::lookup(stem).unwrap();
-            let checks = recipe_checks(&recipe, Some(td_recipe::types::CheckTier::Daily));
+            let checks = recipe_checks(&recipe);
             assert_eq!(checks.len(), count);
             for (index, check) in checks.iter().enumerate() {
                 let check_index = index + 1;
                 let script = &check.script;
                 assert!(check.runner.is_some());
-                assert!(script.contains(&format!("check-run {stem} daily {check_index}")));
+                assert!(script.contains(&format!("check-run {stem} {check_index}")));
                 assert!(!script.contains(". tests/cache-lib.sh"));
                 assert!(!script.contains(". tests/ladder-lib.sh"));
                 assert!(!script.contains(". tests/x86_64-cross-fns.sh"));

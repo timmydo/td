@@ -121,11 +121,11 @@ pub fn recipe() -> Recipe {
         .native_inputs(&["linux-x86-64", "binutils-x86-64-native", "busybox-x86-64"])
         .inputs_owned(mesboot0_inputs(&[]))
         .steps(steps)
-        .checks(vec![RecipeCheck::daily(
+        .checks(vec![RecipeCheck::new(
             r#"
 echo ">> recipe-check linux-x86-64-test: build-plan --auto builds linux-x86-64 (Linux 7.1.4 vmlinux + bzImage + busybox initramfs, source-built by the native /td/store x86_64 GCC 14 + glibc 2.41 toolchain) and asserts a well-formed ELF64 x86-64 vmlinux with the Linux banner, a bzImage carrying the x86 boot-setup header, and a newc initramfs.cpio carrying the static busybox userland"
 : "${TD_RECIPE_EVAL:=$PWD/target/release/td-recipe-eval}"
-exec "$TD_RECIPE_EVAL" check-run linux-x86-64-test daily 1
+exec "$TD_RECIPE_EVAL" check-run linux-x86-64-test 1
 "#,
         )
         .with_runner(CheckRunner::BuildOnly)])

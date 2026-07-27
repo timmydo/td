@@ -21,7 +21,6 @@ mod build;
 mod build_daemon;
 mod bzip2;
 mod check_loop;
-mod daily;
 mod drv;
 mod elf;
 mod erofs;
@@ -741,7 +740,7 @@ const HARNESS_SUBST_STORE_PATH: &str = "/td/store/td-harness";
 /// Export the harness tree at `harness_dir` (the `.td-build-cache/harness` layout: `store/` +
 /// `rel` + `toolchain`) as a single substitute: one nar of the WHOLE tree + a `td-harness.narinfo`
 /// (StorePath == `HARNESS_SUBST_STORE_PATH`, no References), written under `outdir`. No store DB is
-/// needed — the harness is content-addressed by its NarHash, not by a lock. The old daily
+/// needed — the harness is content-addressed by its NarHash, not by a lock. The old
 /// publisher is retired; this helper is dormant until the recipe-graph harness path has a current
 /// producer again. Returns the written basenames (exactly one: `td-harness`).
 fn harness_subst_export(outdir: &Path, harness_dir: &Path) -> Result<Vec<String>, String> {
@@ -5542,7 +5541,7 @@ fn emit_recipe_json(pkg: &str) -> Result<String, String> {
 
 /// The pre-provisioned NATIVE `/td/store` toolchain `td shell` builds the Rust userland with,
 /// handed in via the `TD_SHELL_NATIVE_*` environment (its provisioning gate `td-shell-userland`
-/// is staged by the rust-toolchain recipe's daily product proof. When present, a vendored rust build (ripgrep,
+/// is staged by the rust-toolchain recipe's product proof. When present, a vendored rust build (ripgrep,
 /// fd, …) links this toolchain — never a host or downloaded-stage0 compiler. Its lock is assembled
 /// from the interned package source plus these recipe outputs, whose physical store and databases
 /// ride the typed `--recipe-output-store` / `--recipe-output-db` argv channels. Exact compiler,
@@ -6509,10 +6508,6 @@ fn main() -> ExitCode {
         // bootstrap shim that execs this. (The drv reproducibility double-build
         // that used to share this verb is `check-drv` now — no argument sniffing.)
         Some("check") => check_loop::cli(args.get(2..).unwrap_or(&[])),
-        // daily [--no-system] [--verdict FILE] — the daily-backstop runner: run the
-        // full suite on fresh origin/main + write a machine verdict (was
-        // ci/daily-full-suite.sh). See builder/src/daily.rs.
-        Some("daily") => daily::cli(args.get(2..).unwrap_or(&[])),
         // check-rung HARNESS [ARGS...] — dev-iteration helper: run a cached-chain
         // bootstrap harness inside the loop sandbox (was tools/check-rung.sh).
         Some("check-rung") => check_loop::check_rung_cli(args.get(2..).unwrap_or(&[])),
@@ -6908,7 +6903,7 @@ fn main() -> ExitCode {
         }
         // harness-subst-export OUTDIR HARNESS-DIR — ship the whole /td/store harness tree
         // (.td-build-cache/harness: store/ + rel + toolchain) to a guix-less runner as ONE nar +
-        // a fixed-name `td-harness.narinfo` (issue #314). The old daily publisher is retired;
+        // a fixed-name `td-harness.narinfo` (issue #314). The old publisher is retired;
         // keep the export helper dormant until the recipe-graph harness path has a current
         // producer again.
         Some("harness-subst-export") if args.len() == 4 => {
@@ -8947,7 +8942,7 @@ fn main() -> ExitCode {
         // caller PATH + TD_SUBST_*/TD_DAEMON_* preserved, chdir into the
         // cwd) so a real rung runs as under `guix shell -C`.
         //
-        // GUIX-LESS provisioning (host-sandbox-stage0 inc2 — the daily-suite VM):
+        // GUIX-LESS provisioning (host-sandbox-stage0 inc2 — the full-suite VM):
         //   --store-from DIR : bind DIR (an UNPACKED SEED store, e.g.
         //                      <seed>/store/gnu/store) at /gnu/store INSIDE the
         //                      sandbox instead of the host /gnu/store, so the loop
@@ -9082,7 +9077,7 @@ fn main() -> ExitCode {
                             }
                         }
                     }
-                    // The persistent signed substitute store (~/.td/subst, populated by the daily) —
+                    // The persistent signed substitute store (~/.td/subst) —
                     // READ-ONLY: the loop FETCHES the lock-keyed toolchain closure from it
                     // (x64-toolchain-subst) over its own loopback netns instead of rebuilding ~98 min
                     // from seed, and never writes it. Like the host /gnu/store + guix cache, it is a

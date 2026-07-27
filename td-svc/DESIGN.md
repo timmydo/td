@@ -591,6 +591,6 @@ take, because the cutover was kept behaviour-preserving: `td-init`'s
 `exec`s, so a greeter spawned as `cttyhack /etc/tty-session` would make the
 direct child a session leader and give the stop path a session to contain.
 It is not a free change — it moves who calls `setsid` and `TIOCSCTTY`
-relative to `getty`, on the one path whose only verification is the daily
+relative to `getty`, on the one path whose only verification is the
 qemu oracle — so it belongs with the stop path that needs it, not with a
 cutover whose value is that nothing about the running system changed.

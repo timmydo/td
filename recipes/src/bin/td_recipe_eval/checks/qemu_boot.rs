@@ -3,8 +3,8 @@
 //! Reached only through the `td-recipe-eval qemu-boot` subcommand
 //! (check_runner::qemu_boot_cli), NOT a gated recipe check.
 //!
-//! Why host-side, not a daily gate check — a qemu boot needs a real
-//! `qemu-system-x86_64`, and td has no such artifact. The daily gate wraps every
+//! Why host-side, not a sandboxed gate check — a qemu boot needs a real
+//! `qemu-system-x86_64`, and td has no such artifact. The gate wraps every
 //! recipe check in a host-free `pivot_root` sandbox that exposes only td-built
 //! tools, each reachable by absolute /td/store path (that is how the RustToolchain
 //! check runs the td-BUILT rustc). A HOST binary like qemu is simply not present
@@ -1382,7 +1382,7 @@ fn validate_persistent_shutdown(result: &BootResult, context: &str) -> Result<()
 /// the greeter self-exits (autotest) and the VM powers off. Host-side (never a gated
 /// check) like the other qemu oracles: it needs host qemu AND outbound DNS/TCP from
 /// the operator host (SLIRP forwards the guest's DNS and NATs its TCP), which the
-/// daily host-free sandbox has neither of.
+/// gate's host-free sandbox has neither of.
 pub(crate) fn run_net(runner: &RecipeCheckRunner) -> Result<(), String> {
     let qemu = find_qemu()?;
     let (bzimage, init_cpio, disk, btrfs) = build_persistent_system(runner)?;
@@ -1499,7 +1499,7 @@ pub(crate) fn run_net(runner: &RecipeCheckRunner) -> Result<(), String> {
 /// unreachable without a working kexec; STAGE1 only refines the FAILURE diagnostic
 /// (and may legitimately have scrolled out of the bounded console buffer once STAGE2
 /// is in). Host-side (never a gated check) for the same reason `qemu-boot` is — the
-/// daily sandbox has no host qemu.
+/// gate sandbox has no host qemu.
 pub(crate) fn run_kexec(runner: &RecipeCheckRunner) -> Result<(), String> {
     // qemu first (fail fast if absent), then the spike artifact.
     let qemu = find_qemu()?;

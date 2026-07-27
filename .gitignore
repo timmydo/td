@@ -39,14 +39,15 @@ tests/*/target/
 # Persistent content-addressed build-recipe cache (skip-if-already-realized).
 .td-build-cache
 
-# Daily-backstop runner state (ci/daily-full-suite.sh): last all-green main commit +
-# the latest machine-readable verdict. Local to the runner host, not versioned.
-.td-last-green
-.td-daily-verdict
-
 # Ad-hoc captured ./check.sh run logs (e.g. a backgrounded full-loop run). Transient
 # host-local output, never versioned.
 .check-*.log
+
+# Retired daily-backstop runner state. No code writes these any more (the runner
+# is gone); the entries stay so a stale file left on an existing dev host is not
+# surfaced as untracked — affected-checks counts untracked paths.
+.td-last-green
+.td-daily-verdict
 
 # Claude Code session runtime state — session-specific, never versioned.
 .claude/scheduled_tasks.lock

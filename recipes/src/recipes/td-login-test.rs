@@ -23,8 +23,8 @@ use crate::types::{CheckRunner, Recipe, RecipeCheck, Step};
 // image's health target depends on — asserted BOTH ways, so a probe that always
 // passed would red here rather than green-light a broken switch on the image.
 //
-// The static link needs the full target toolchain, so this is DAILY/operator
-// tier like its siblings.
+// The static link needs the full target toolchain, so this rides the loop
+// toolchain like its siblings.
 pub fn recipe() -> Recipe {
     let bin = "{in:td-login}/bin/td-login";
     let readelf = "{in:binutils-x86-64-self}/bin/readelf";
@@ -202,11 +202,11 @@ pub fn recipe() -> Recipe {
     Recipe::mesboot("td-login-test", "1.0")
         .native_inputs(&["td-login", "binutils-x86-64-self", "busybox-x86-64"])
         .steps(steps)
-        .checks(vec![RecipeCheck::daily(
+        .checks(vec![RecipeCheck::new(
             r#"
 echo ">> recipe-check td-login-test: build-plan --auto builds td-login (td's static credential multicall: login/su, statically linked by the /td/store target Rust + native GCC/binutils/glibc toolchain), asserts a self-contained static ELF64 x86-64 executable (ET_EXEC, no PT_INTERP, no dynamic NEEDED), and exercises the applet roster, both dispatch forms, the argv refusals, and the credential readback probe the image's TD-LOGIN-RUN-OK marker rests on"
 : "${TD_RECIPE_EVAL:=$PWD/target/release/td-recipe-eval}"
-exec "$TD_RECIPE_EVAL" check-run td-login-test daily 1
+exec "$TD_RECIPE_EVAL" check-run td-login-test 1
 "#,
         )
         .with_runner(CheckRunner::BuildOnly)])

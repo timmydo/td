@@ -24,7 +24,7 @@
 //! and reboots — td's init has no signal surface to ask — so under `-no-reboot` qemu
 //! exits 0. (qemu's own Ctrl-A X still force-quits at any time.)
 //! Because it is interactive it is a host-side command, never a gated check (a gate has
-//! no terminal, and the daily sandbox has no host qemu).
+//! no terminal, and the gate sandbox has no host qemu).
 use std::fs::File;
 use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};

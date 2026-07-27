@@ -781,15 +781,8 @@ pub struct Recipe {
     pub local_source: Option<String>,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum CheckTier {
-    Pr,
-    Daily,
-}
-
 #[derive(Clone)]
 pub struct RecipeCheck {
-    pub tier: CheckTier,
     pub script: String,
     pub runner: Option<CheckRunner>,
 }
@@ -801,17 +794,8 @@ pub enum CheckRunner {
 }
 
 impl RecipeCheck {
-    pub fn pr(script: &str) -> RecipeCheck {
+    pub fn new(script: &str) -> RecipeCheck {
         RecipeCheck {
-            tier: CheckTier::Pr,
-            script: script.into(),
-            runner: None,
-        }
-    }
-
-    pub fn daily(script: &str) -> RecipeCheck {
-        RecipeCheck {
-            tier: CheckTier::Daily,
             script: script.into(),
             runner: None,
         }
@@ -1088,7 +1072,7 @@ mod tests {
 
     #[test]
     fn recipe_checks_are_not_build_json() {
-        let r = Recipe::gnu("fixture", "1.0").checks(vec![RecipeCheck::pr("echo ok")]);
+        let r = Recipe::gnu("fixture", "1.0").checks(vec![RecipeCheck::new("echo ok")]);
         assert_eq!(
             r.to_json().to_canonical(),
             r#"{"buildSystem":"gnu","name":"fixture","version":"1.0"}"#

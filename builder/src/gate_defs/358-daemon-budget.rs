@@ -16,7 +16,7 @@
 //! tb resolution: load_stage0 (the lock-keyed CURRENT stage0), like build-daemon/daemon-recipe —
 //! NOT `ls stage0/store/*/bin/td-builder | head -1`: a warm runner accumulates placements and
 //! lexicographic-first picked a STALE binary predating the `daemon` subcommand, so the socket
-//! never appeared (a latent red hidden while the daily runner was down, #293/#268; fresh
+//! never appeared (a latent red that stayed hidden because nothing ran the full suite, #293/#268; fresh
 //! checkouts have one placement and never saw it).
 //! TD_MIN_FREE_GIB=0 on the daemon spawn disables its memory-reserve admission (a separate
 //! mechanism with its own build_daemon.rs unit test, which also passes 0.0): below the default

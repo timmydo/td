@@ -22,7 +22,7 @@ use crate::gates::{GateDef, Pool};
 pub fn gate() -> GateDef {
     GateDef {
         name: "bootstrap-x86_64-self-gcc-store-native",
-        pools: &[Pool::Daily],
+        pools: &[Pool::Heavy],
         needs: &[],
         build_gate: false,
         specs: &[],
@@ -33,7 +33,7 @@ echo ">> recipe-check gcc-x86-64-self-test: rebuild gcc with the native recipe o
 if [ -z "$TD_RECIPE_EVAL" ] || [ ! -x "$TD_RECIPE_EVAL" ]; then
   TD_RECIPE_EVAL=$(sh tests/recipe-eval-tool.sh "$PWD/.td-build-cache/recipe-eval")
 fi
-exec "$TD_RECIPE_EVAL" check-run gcc-x86-64-self-test daily 1
+exec "$TD_RECIPE_EVAL" check-run gcc-x86-64-self-test 1
 "##,
     }
 }

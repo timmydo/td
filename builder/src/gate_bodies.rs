@@ -45,7 +45,7 @@ const NATIVE: &[&str] = &[
     "store-backend",
     "store-ns",
     "recipe-rs",
-    "recipe-checks-daily",
+    "recipe-checks",
     "store-native-profile",
     "sandbox-hardening",
     "toolchain-input-addressed",
@@ -80,7 +80,7 @@ pub fn cli(name: &str) -> ExitCode {
         "store-backend" => store_backend(&root),
         "store-ns" => store_ns(&root),
         "recipe-rs" => recipe_rs(&root),
-        "recipe-checks-daily" => recipe_checks_daily(&root),
+        "recipe-checks" => recipe_checks(&root),
         "store-native-profile" => store_native_profile(&root),
         "sandbox-hardening" => sandbox_hardening(&root),
         "toolchain-input-addressed" => toolchain_input_addressed(&root),
@@ -1666,32 +1666,23 @@ fn store_ns(root: &Path) -> Result<(), String> {
     Ok(())
 }
 
-// --- recipe-checks-daily (formerly tests/recipe-checks.sh) ----------------------
+// --- recipe-checks (formerly tests/recipe-checks.sh) ---------------------------
 
-fn recipe_checks_daily(root: &Path) -> Result<(), String> {
-    let scope = "daily";
-    println!(
-        ">> recipe-checks: recipe-owned /td/store package checks (scope={scope}; goals=recipe-checks-daily)"
-    );
+fn recipe_checks(root: &Path) -> Result<(), String> {
+    println!(">> recipe-checks: recipe-owned /td/store package checks");
 
     let eval = resolve_recipe_eval(root)?;
     let eval_s = path_str(&eval)?;
     let stage0_base = std::env::var("TD_STAGE0_BASE")
         .unwrap_or_else(|_| root.join(".td-build-cache/stage0").display().to_string());
-    let envs: [(&str, &str); 3] = [
+    let envs: [(&str, &str); 2] = [
         ("TD_RECIPE_EVAL", &eval_s),
-        ("TD_RECIPE_CHECK_SCOPE", scope),
         ("TD_STAGE0_BASE", &stage0_base),
     ];
 
-    let checks = run_out_env(
-        &eval_s,
-        &["check-list", scope],
-        &envs,
-        "td-recipe-eval check-list",
-    )?;
+    let checks = run_out_env(&eval_s, &["check-list"], &envs, "td-recipe-eval check-list")?;
     if checks.trim().is_empty() {
-        return Err(format!("FAIL: no recipe checks selected for scope={scope}"));
+        return Err("FAIL: no recipe checks selected".to_string());
     }
 
     let mut ran = 0usize;
@@ -1699,7 +1690,7 @@ fn recipe_checks_daily(root: &Path) -> Result<(), String> {
     for spec in checks.split_whitespace() {
         let count_text = run_out_env(
             &eval_s,
-            &["check-count", spec, scope],
+            &["check-count", spec],
             &envs,
             &format!("td-recipe-eval check-count {spec}"),
         )?;
@@ -1716,27 +1707,23 @@ fn recipe_checks_daily(root: &Path) -> Result<(), String> {
         }
         for index in 1..=count {
             ran += 1;
-            println!("================ recipe-check {spec}#{index} ({scope}) ================");
-            if run_recipe_check(&eval, spec, scope, index, &eval_s, &stage0_base)? {
-                println!(
-                    "================ recipe-check {spec}#{index} ({scope}): PASS ================"
-                );
+            println!("================ recipe-check {spec}#{index} ================");
+            if run_recipe_check(&eval, spec, index, &eval_s, &stage0_base)? {
+                println!("================ recipe-check {spec}#{index}: PASS ================");
             } else {
                 failures += 1;
-                eprintln!(
-                    "================ recipe-check {spec}#{index} ({scope}): FAIL ================"
-                );
+                eprintln!("================ recipe-check {spec}#{index}: FAIL ================");
             }
         }
     }
 
     if failures != 0 {
         return Err(format!(
-            "FAIL: recipe-checks - {failures} of {ran} recipe-owned check(s) failed (scope={scope})"
+            "FAIL: recipe-checks - {failures} of {ran} recipe-owned check(s) failed"
         ));
     }
     println!(
-        "PASS: recipe-checks - ran {ran} recipe-owned /td/store check(s) from the Rust recipe catalog (scope={scope}); package behavior/repro assertions live with the package recipes."
+        "PASS: recipe-checks - ran {ran} recipe-owned /td/store check(s) from the Rust recipe catalog; package behavior/repro assertions live with the package recipes."
     );
     Ok(())
 }
@@ -1780,7 +1767,6 @@ fn resolve_recipe_eval(root: &Path) -> Result<PathBuf, String> {
 fn run_recipe_check(
     eval: &Path,
     spec: &str,
-    scope: &str,
     index: usize,
     eval_s: &str,
     stage0_base: &str,
@@ -1789,10 +1775,8 @@ fn run_recipe_check(
     let status = Command::new(eval)
         .arg("check-run")
         .arg(spec)
-        .arg(scope)
         .arg(&index_s)
         .env("TD_RECIPE_EVAL", eval_s)
-        .env("TD_RECIPE_CHECK_SCOPE", scope)
         .env("TD_RECIPE_CHECK_SPEC", spec)
         .env("TD_RECIPE_CHECK_INDEX", &index_s)
         .env("TD_STAGE0_BASE", stage0_base)
@@ -1873,7 +1857,7 @@ fn recipe_rs(root: &Path) -> Result<(), String> {
     // a glibc gcc ld-wrapper would otherwise bake in as a runpath and that
     // vanishes while guix-home reconfigures or GCs ("error while loading shared
     // libraries: libgcc_s.so.1", exit 127), flaking this control-plane tool and
-    // reddening the daily backstop. Fixing it at the SOURCE (crt-static musl)
+    // reddening the check. Fixing it at the SOURCE (crt-static musl)
     // supersedes pinning a runpath (re #469). The recipes crate is
     // dependency-free (pure std, no proc-macros).
     //

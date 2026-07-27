@@ -24,9 +24,8 @@ use crate::types::{Recipe, Step};
 // rustc itself runs off its own $ORIGIN-rpath dylibs and glibc-x86-64's PT_INTERP
 // loader (glibc-x86-64 is a declared input for exactly that reason).
 //
-// The static link needs the full target toolchain, so it is DAILY/operator tier
-// (no target rustc in the per-change sandbox); the sibling td-netd-test carries
-// that daily build+assert check.
+// The static link needs the full target toolchain (no target rustc in the loop
+// sandbox); the sibling td-netd-test carries that build+assert check.
 //
 // The embedded source is written out with a WriteFile below, which the ladder
 // `no_bootstrap_step_invokes_host_find_or_xargs` guard scans as a command surface.

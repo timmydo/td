@@ -95,11 +95,11 @@ pub fn recipe() -> Recipe {
     Recipe::mesboot("td-sh-test", "1.0")
         .native_inputs(&["td-sh", "binutils-x86-64-self", "busybox-x86-64"])
         .steps(steps)
-        .checks(vec![RecipeCheck::daily(
+        .checks(vec![RecipeCheck::new(
             r#"
 echo ">> recipe-check td-sh-test: build-plan --auto builds td-sh (the target /bin/sh, statically linked by the /td/store target Rust + native GCC/binutils/glibc toolchain), asserts a self-contained static ELF64 x86-64 executable (ET_EXEC, no PT_INTERP, no dynamic NEEDED), and runs it (-c 'exit 0')"
 : "${TD_RECIPE_EVAL:=$PWD/target/release/td-recipe-eval}"
-exec "$TD_RECIPE_EVAL" check-run td-sh-test daily 1
+exec "$TD_RECIPE_EVAL" check-run td-sh-test 1
 "#,
         )
         .with_runner(CheckRunner::BuildOnly)])
