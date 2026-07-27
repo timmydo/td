@@ -30,8 +30,8 @@ pub fn recipe() -> Recipe {
 
     // Config + empty stub headers. live-bootstrap `touch`es config.h,
     // include/version.h, include/pipesize.h (all absent in the tarball) and
-    // supplies config via -D; td bakes the 45 defines into config.h and keeps
-    // version.h/pipesize.h empty (their values come from config.h).
+    // supplies config via -D; td bakes the configuration defines into config.h
+    // and keeps version.h/pipesize.h empty (their values come from config.h).
     steps.push(Step::WriteFile {
         path: "{src}/config.h".into(),
         content: CONFIG_H.into(),
@@ -196,8 +196,19 @@ pub fn recipe() -> Recipe {
     steps.push(Step::assert_static(&["{out}/bin/bash"]));
 
     // Smoke: the installed shell must actually parse and execute — as bash (the
-    // `test` builtin) and through the `sh` symlink.
+    // `test` builtin), identify its installed symlink, and run through that link.
     steps.push(Step::run("{src}", &["{out}/bin/bash", "-c", "test 1 = 1"]));
+    steps.push(Step::run(
+        "{src}",
+        &[
+            "{out}/bin/bash",
+            "-c",
+            "test -L \"$1\" && test -h \"$1\" && ! test -L \"$2\" && ! test -h \"$2\"",
+            "bash-lstat-probe",
+            "{out}/bin/sh",
+            "{out}/bin/bash",
+        ],
+    ));
     steps.push(Step::run("{src}", &["{out}/bin/sh", "-c", "exit 0"]));
 
     Recipe::mesboot("bash-mesboot", "2.05b")

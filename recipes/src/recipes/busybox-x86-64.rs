@@ -3,6 +3,8 @@ use crate::ladder::{
 };
 use crate::types::{Recipe, Step, TextEdit};
 
+const POST_BOOTSTRAP_TOOL_APPLETS: &str = "sh ls sed grep awk tar gzip cat echo mkdir rm cp chmod true false env printf sleep sort head tail basename dirname mktemp tee touch tr test pwd comm readlink wc od ln cut";
+
 // BusyBox 1.37.0, rung 2 of the #388 build userland: built FROM SOURCE by the
 // /td/store NATIVE x86_64 toolchain and driven by the td-built make-x86-64 rung.
 // Static, matching the make-x86-64 rung: the output has no ELF interpreter. The
@@ -21,6 +23,26 @@ pub fn recipe() -> Recipe {
     let path = format!("{{in:make-x86-64}}/bin:{nbin}:{}", mesboot0_path());
     let cip = "{root}/sysroot/include:{root}/kh";
     let lib = "{root}/sysroot/lib";
+    let install_tool_farm =
+        format!("for a in {POST_BOOTSTRAP_TOOL_APPLETS}; do ln -sf busybox \"$a\"; done");
+    let applet_contract = "h=$('{in:binutils-x86-64-native}/bin/readelf' -h '{out}/bin/busybox'); \
+         printf '%s\\n' \"$h\" | grep -i 'class:'   | grep -qi 'ELF64'  || { echo 'busybox is not ELF64' >&2; exit 1; }; \
+         printf '%s\\n' \"$h\" | grep -i 'machine:' | grep -qi 'x86-64' || { echo 'busybox is not x86-64' >&2; exit 1; }; \
+         b=$('{out}/bin/busybox' 2>&1); \
+         printf '%s\\n' \"$b\" | grep -q '^BusyBox v1[.]37[.]0 (1970-01-01 00:00:01 UTC) multi-call binary[.]$' || { echo 'busybox banner is not reproducible' >&2; exit 1; }; \
+         l=$('{out}/bin/busybox' --list) || { echo 'busybox --list failed' >&2; exit 1; }; \
+         for a in @POST_BOOTSTRAP_TOOL_APPLETS@; do \
+             printf '%s\\n' \"$l\" | grep -q -x -F \"$a\" || { echo \"busybox does not serve post-bootstrap tool '$a'\" >&2; exit 1; }; \
+             [ -L \"{out}/bin/$a\" ] || { echo \"busybox post-bootstrap tool '$a' has no installed symlink\" >&2; exit 1; }; \
+         done; \
+         for a in mount umount losetup; do \
+             printf '%s\\n' \"$l\" | grep -q -x -F \"$a\" || { echo \"busybox does not serve applet '$a' - linux-x86-64's own initramfs /init runs mount, and td-boot runs losetup; a defconfig trim would break the kernel boot test with no other build-time signal\" >&2; exit 1; }; \
+         done; \
+         set -- $('{out}/bin/busybox' od -An -tx1 -j 0 -N1 '{out}/bin/busybox'); \
+         [ \"$1\" = 7f ] || { echo 'busybox od lacks the address, type, or count option surface used after bootstrap' >&2; exit 1; }; \
+         n=$('{out}/bin/busybox' head -c 4 '{out}/bin/busybox' | '{out}/bin/busybox' wc -c); \
+         [ \"$n\" = 4 ] || { echo 'busybox head lacks the byte-count option used after bootstrap' >&2; exit 1; }"
+        .replace("@POST_BOOTSTRAP_TOOL_APPLETS@", POST_BOOTSTRAP_TOOL_APPLETS);
 
     let mut steps = unpack_into("busybox-x86-64-source", "{src}");
     // BusyBox's top-level Makefile probes the build machine with uname even
@@ -167,8 +189,8 @@ pub fn recipe() -> Recipe {
         .env("SHELL", SH)
         .env("CONFIG_SHELL", SH)
         .env("SOURCE_DATE_EPOCH", "1")
-        .env("C_INCLUDE_PATH", &cip)
-        .env("LIBRARY_PATH", &lib),
+        .env("C_INCLUDE_PATH", cip)
+        .env("LIBRARY_PATH", lib),
     );
     // Pin the config symbols we depend on: delete any defconfig line for each, then
     // append the value we want (belt-and-suspenders against a defconfig drift across
@@ -182,7 +204,7 @@ pub fn recipe() -> Recipe {
             &[
                 SH,
                 "-c",
-                "{in:sed-mesboot0}/bin/sed -i -r '/^#? *CONFIG_STATIC[ =]/d; /^#? *CONFIG_PIE[ =]/d; /^#? *CONFIG_EXTRA_LDFLAGS[ =]/d; /^#? *CONFIG_FEATURE_COMPRESS_BBCONFIG[ =]/d; /^#? *CONFIG_FEATURE_SH_EMBEDDED_SCRIPTS[ =]/d; /^#? *CONFIG_FEATURE_COMPRESS_USAGE[ =]/d; /^#? *CONFIG_SWITCH_ROOT[ =]/d' .config && printf '%s\\n' 'CONFIG_STATIC=y' '# CONFIG_PIE is not set' 'CONFIG_EXTRA_LDFLAGS=\"-static\"' '# CONFIG_FEATURE_COMPRESS_BBCONFIG is not set' '# CONFIG_FEATURE_SH_EMBEDDED_SCRIPTS is not set' '# CONFIG_FEATURE_COMPRESS_USAGE is not set' 'CONFIG_SWITCH_ROOT=y' >> .config",
+                "{in:sed-mesboot0}/bin/sed -i -r '/^#? *CONFIG_STATIC[ =]/d; /^#? *CONFIG_PIE[ =]/d; /^#? *CONFIG_EXTRA_LDFLAGS[ =]/d; /^#? *CONFIG_FEATURE_COMPRESS_BBCONFIG[ =]/d; /^#? *CONFIG_FEATURE_SH_EMBEDDED_SCRIPTS[ =]/d; /^#? *CONFIG_FEATURE_COMPRESS_USAGE[ =]/d; /^#? *CONFIG_SWITCH_ROOT[ =]/d; /^#? *CONFIG_DESKTOP[ =]/d; /^#? *CONFIG_FEATURE_FANCY_HEAD[ =]/d' .config && printf '%s\\n' 'CONFIG_STATIC=y' '# CONFIG_PIE is not set' 'CONFIG_EXTRA_LDFLAGS=\"-static\"' '# CONFIG_FEATURE_COMPRESS_BBCONFIG is not set' '# CONFIG_FEATURE_SH_EMBEDDED_SCRIPTS is not set' '# CONFIG_FEATURE_COMPRESS_USAGE is not set' 'CONFIG_SWITCH_ROOT=y' 'CONFIG_DESKTOP=y' 'CONFIG_FEATURE_FANCY_HEAD=y' >> .config",
             ],
         )
         .env("PATH", &mesboot0_path()),
@@ -200,8 +222,8 @@ pub fn recipe() -> Recipe {
         .env("SHELL", SH)
         .env("CONFIG_SHELL", SH)
         .env("SOURCE_DATE_EPOCH", "1")
-        .env("C_INCLUDE_PATH", &cip)
-        .env("LIBRARY_PATH", &lib),
+        .env("C_INCLUDE_PATH", cip)
+        .env("LIBRARY_PATH", lib),
     );
     steps.push(
         Step::run(
@@ -224,8 +246,8 @@ pub fn recipe() -> Recipe {
         .env("GNUMAKEFLAGS", "")
         .env("MAKELEVEL", "")
         .env("SOURCE_DATE_EPOCH", "1")
-        .env("C_INCLUDE_PATH", &cip)
-        .env("LIBRARY_PATH", &lib),
+        .env("C_INCLUDE_PATH", cip)
+        .env("LIBRARY_PATH", lib),
     );
     steps.push(Step::MkDir {
         path: "{out}/bin".into(),
@@ -235,39 +257,13 @@ pub fn recipe() -> Recipe {
         dest: "{out}/bin".into(),
     });
     steps.push(
-        Step::run(
-            "{out}/bin",
-            &[
-                SH,
-                "-c",
-                "for a in sh ls sed grep awk tar gzip cat echo mkdir rm cp chmod true false env printf sleep sort head tail basename dirname mktemp tee touch tr test pwd comm; do ln -sf busybox \"$a\"; done",
-            ],
-        )
-        .env("PATH", &mesboot0_path()),
+        Step::run("{out}/bin", &[SH, "-c", &install_tool_farm]).env("PATH", &mesboot0_path()),
     );
     steps.push(Step::Require {
         paths: vec!["{out}/bin/busybox".into()],
         exec: true,
     });
-    steps.push(
-        Step::run(
-            "{out}",
-            &[
-                SH,
-                "-c",
-                "h=$('{in:binutils-x86-64-native}/bin/readelf' -h '{out}/bin/busybox'); \
-                 printf '%s\\n' \"$h\" | grep -i 'class:'   | grep -qi 'ELF64'  || { echo 'busybox is not ELF64' >&2; exit 1; }; \
-                 printf '%s\\n' \"$h\" | grep -i 'machine:' | grep -qi 'x86-64' || { echo 'busybox is not x86-64' >&2; exit 1; }; \
-                 b=$('{out}/bin/busybox' 2>&1); \
-                 printf '%s\\n' \"$b\" | grep -q '^BusyBox v1[.]37[.]0 (1970-01-01 00:00:01 UTC) multi-call binary[.]$' || { echo 'busybox banner is not reproducible' >&2; exit 1; }; \
-                 l=$('{out}/bin/busybox' --list) || { echo 'busybox --list failed' >&2; exit 1; }; \
-                 for a in mount umount losetup; do \
-                     printf '%s\\n' \"$l\" | grep -q -x -F \"$a\" || { echo \"busybox does not serve applet '$a' - linux-x86-64's own initramfs /init runs mount, and td-boot runs losetup; a defconfig trim would break the kernel boot test with no other build-time signal\" >&2; exit 1; }; \
-                 done",
-            ],
-        )
-        .env("PATH", &mesboot0_path()),
-    );
+    steps.push(Step::run("{out}", &[SH, "-c", &applet_contract]).env("PATH", &mesboot0_path()));
 
     Recipe::mesboot("busybox-x86-64", "1.37.0")
         .source_input("busybox-x86-64-source")

@@ -1,4 +1,4 @@
-use crate::ladder::{mesboot0_inputs, mesboot0_path, SH};
+use crate::ladder::{post_bootstrap_path, POST_BOOTSTRAP_SH};
 use crate::types::{CheckRunner, Recipe, RecipeCheck, Step};
 
 // td-firstboot-test: build-shape AND behavioural validation of the per-machine
@@ -33,15 +33,16 @@ use crate::types::{CheckRunner, Recipe, RecipeCheck, Step};
 // pure decision over /proc/mounts text, unit-tested in td-firstboot's own
 // `mounts` module, and the build sandbox cannot present an arbitrary mount table.
 pub fn recipe() -> Recipe {
+    let post_bootstrap_shebang = format!("#!{POST_BOOTSTRAP_SH}");
     let bin = "{in:td-firstboot}/bin/td-firstboot";
-    let readelf = "{in:binutils-x86-64-native}/bin/readelf";
+    let readelf = "{in:binutils-x86-64-self}/bin/readelf";
     let mut steps = Vec::new();
 
     steps.push(
         Step::run(
             "{root}",
             &[
-                SH,
+                POST_BOOTSTRAP_SH,
                 "-c",
                 &format!(
                     "h=$('{readelf}' -h '{bin}' 2>/dev/null) || {{ echo 'readelf -h failed on td-firstboot' >&2; exit 1; }}; \
@@ -51,13 +52,13 @@ pub fn recipe() -> Recipe {
                 ),
             ],
         )
-        .env("PATH", &mesboot0_path()),
+        .env("PATH", &post_bootstrap_path()),
     );
     steps.push(
         Step::run(
             "{root}",
             &[
-                SH,
+                POST_BOOTSTRAP_SH,
                 "-c",
                 &format!(
                     "lout=$('{readelf}' -l '{bin}' 2>/dev/null) || {{ echo 'readelf -l failed on td-firstboot (cannot verify absence of PT_INTERP)' >&2; exit 1; }}; \
@@ -67,7 +68,7 @@ pub fn recipe() -> Recipe {
                 ),
             ],
         )
-        .env("PATH", &mesboot0_path()),
+        .env("PATH", &post_bootstrap_path()),
     );
 
     // The keygen stub: sshd's `keygen` contract, in the smallest form that can hold
@@ -76,34 +77,35 @@ pub fn recipe() -> Recipe {
     // fingerprint, exactly as the real daemon does.
     steps.push(Step::WriteFile {
         path: "{root}/keygen-stub".into(),
-        content: "#!/bin/sh\n\
-                  # usage: <self> keygen --host-key PATH --public-key PATH\n\
-                  priv=; pub=\n\
-                  while [ $# -gt 0 ]; do\n\
-                    case $1 in\n\
-                      --host-key) priv=$2; shift 2 ;;\n\
-                      --public-key) pub=$2; shift 2 ;;\n\
-                      *) shift ;;\n\
-                    esac\n\
-                  done\n\
-                  [ -n \"$priv\" ] && [ -n \"$pub\" ] || { echo 'stub: missing paths' >&2; exit 1; }\n\
-                  if [ -f \"$priv\" ]; then echo 'existing SHA256:stubfingerprint'; exit 0; fi\n\
-                  printf 'STUB PRIVATE KEY\\n' > \"$priv\"\n\
-                  printf 'ssh-ed25519 STUB stub\\n' > \"$pub\"\n\
-                  echo 'created SHA256:stubfingerprint'\n"
-            .into(),
+        content: format!(
+            "{post_bootstrap_shebang}\n{}",
+            "# usage: <self> keygen --host-key PATH --public-key PATH\n\
+             priv=; pub=\n\
+             while [ $# -gt 0 ]; do\n\
+               case $1 in\n\
+                 --host-key) priv=$2; shift 2 ;;\n\
+                 --public-key) pub=$2; shift 2 ;;\n\
+                 *) shift ;;\n\
+               esac\n\
+             done\n\
+             [ -n \"$priv\" ] && [ -n \"$pub\" ] || { echo 'stub: missing paths' >&2; exit 1; }\n\
+             if [ -f \"$priv\" ]; then echo 'existing SHA256:stubfingerprint'; exit 0; fi\n\
+             printf 'STUB PRIVATE KEY\\n' > \"$priv\"\n\
+             printf 'ssh-ed25519 STUB stub\\n' > \"$pub\"\n\
+             echo 'created SHA256:stubfingerprint'\n"
+        ),
         exec: true,
     });
     // A keygen that fails, and one that lies about having written a key. Both must
     // make td-firstboot refuse rather than report an identity the machine lacks.
     steps.push(Step::WriteFile {
         path: "{root}/keygen-fails".into(),
-        content: "#!/bin/sh\necho 'stub: no entropy' >&2\nexit 3\n".into(),
+        content: format!("{post_bootstrap_shebang}\necho 'stub: no entropy' >&2\nexit 3\n"),
         exec: true,
     });
     steps.push(Step::WriteFile {
         path: "{root}/keygen-lies".into(),
-        content: "#!/bin/sh\necho 'created SHA256:stubfingerprint'\n".into(),
+        content: format!("{post_bootstrap_shebang}\necho 'created SHA256:stubfingerprint'\n"),
         exec: true,
     });
 
@@ -111,7 +113,7 @@ pub fn recipe() -> Recipe {
         Step::run(
             "{root}",
             &[
-                SH,
+                POST_BOOTSTRAP_SH,
                 "-c",
                 &format!(
                     "state='{{root}}/state'; stub='{{root}}/keygen-stub'; \
@@ -152,7 +154,7 @@ pub fn recipe() -> Recipe {
                 ),
             ],
         )
-        .env("PATH", &mesboot0_path()),
+        .env("PATH", &post_bootstrap_path()),
     );
 
     // The refusals. A machine that believes it has an identity it does not have is
@@ -162,7 +164,7 @@ pub fn recipe() -> Recipe {
         Step::run(
             "{root}",
             &[
-                SH,
+                POST_BOOTSTRAP_SH,
                 "-c",
                 &format!(
                     "for case in fails lies; do \
@@ -184,7 +186,7 @@ pub fn recipe() -> Recipe {
                 ),
             ],
         )
-        .env("PATH", &mesboot0_path()),
+        .env("PATH", &post_bootstrap_path()),
     );
 
     steps.push(Step::MkDir {
@@ -201,8 +203,11 @@ pub fn recipe() -> Recipe {
     });
 
     Recipe::mesboot("td-firstboot-test", "1.0")
-        .native_inputs(&["td-firstboot", "binutils-x86-64-native"])
-        .inputs_owned(mesboot0_inputs(&[]))
+        .native_inputs(&[
+            "td-firstboot",
+            "binutils-x86-64-self",
+            "busybox-x86-64",
+        ])
         .steps(steps)
         .checks(vec![RecipeCheck::daily(
             r#"

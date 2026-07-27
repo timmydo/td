@@ -15,9 +15,9 @@
  * `-I`/`-L` paths plus that one flag, keeping every recipe line
  * metacharacter-free.
  *
- * Each macro below is the exact live-bootstrap `-D` flag transcribed: bare
- * feature macros define to 1 (tcc's `-DNAME` == `-DNAME=1`); valued/string/
- * function macros keep their literal value.
+ * Each macro below is either a live-bootstrap `-D` flag or a feature supplied
+ * by td's Mes libc. Bare feature macros define to 1 (tcc's `-DNAME` ==
+ * `-DNAME=1`); valued/string/function macros keep their literal value.
  */
 
 /* Headers / struct feature tests */
@@ -76,6 +76,8 @@
 #define HAVE_BZERO 1
 #define HAVE_GETCWD 1
 #define HAVE_RENAME 1
+/* Mes builds lib/linux/lstat.c; without this Bash hard-disables test -L/-h. */
+#define HAVE_LSTAT 1
 
 /* Stub the functions mes/tcc libc lacks */
 #define endpwent(x) 0

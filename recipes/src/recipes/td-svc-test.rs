@@ -1,4 +1,4 @@
-use crate::ladder::{mesboot0_inputs, mesboot0_path, SH};
+use crate::ladder::{post_bootstrap_path, POST_BOOTSTRAP_SH};
 use crate::types::{CheckRunner, Recipe, RecipeCheck, Step};
 
 // td-svc-test: build-shape AND behavioural validation of the service supervisor.
@@ -38,7 +38,7 @@ use crate::types::{CheckRunner, Recipe, RecipeCheck, Step};
 // exit-1 usage error read as a pass.
 pub fn recipe() -> Recipe {
     let bin = "{in:td-svc}/bin/td-svc";
-    let readelf = "{in:binutils-x86-64-native}/bin/readelf";
+    let readelf = "{in:binutils-x86-64-self}/bin/readelf";
     let uu = "{in:uutils}/bin/coreutils";
     let mut steps = Vec::new();
 
@@ -46,7 +46,7 @@ pub fn recipe() -> Recipe {
         Step::run(
             "{root}",
             &[
-                SH,
+                POST_BOOTSTRAP_SH,
                 "-c",
                 &format!(
                     "h=$('{readelf}' -h '{bin}' 2>/dev/null) || {{ echo 'readelf -h failed on td-svc' >&2; exit 1; }}; \
@@ -56,13 +56,13 @@ pub fn recipe() -> Recipe {
                 ),
             ],
         )
-        .env("PATH", &mesboot0_path()),
+        .env("PATH", &post_bootstrap_path()),
     );
     steps.push(
         Step::run(
             "{root}",
             &[
-                SH,
+                POST_BOOTSTRAP_SH,
                 "-c",
                 &format!(
                     "lout=$('{readelf}' -l '{bin}' 2>/dev/null) || {{ echo 'readelf -l failed on td-svc (cannot verify absence of PT_INTERP)' >&2; exit 1; }}; \
@@ -70,13 +70,13 @@ pub fn recipe() -> Recipe {
                 ),
             ],
         )
-        .env("PATH", &mesboot0_path()),
+        .env("PATH", &post_bootstrap_path()),
     );
     steps.push(
         Step::run(
             "{root}",
             &[
-                SH,
+                POST_BOOTSTRAP_SH,
                 "-c",
                 &format!(
                     "dout=$('{readelf}' -d '{bin}' 2>/dev/null) || {{ echo 'readelf -d failed on td-svc (cannot verify absence of dynamic NEEDED)' >&2; exit 1; }}; \
@@ -84,7 +84,7 @@ pub fn recipe() -> Recipe {
                 ),
             ],
         )
-        .env("PATH", &mesboot0_path()),
+        .env("PATH", &post_bootstrap_path()),
     );
 
     // Fixture tables, written as files rather than heredocs so the shell layer
@@ -151,7 +151,7 @@ pub fn recipe() -> Recipe {
         Step::run(
             "{root}",
             &[
-                SH,
+                POST_BOOTSTRAP_SH,
                 "-c",
                 &format!(
                     "o=$('{bin}' check -f '{{root}}/good.conf') || {{ echo 'check rejected a valid table' >&2; exit 1; }}; \
@@ -168,13 +168,13 @@ pub fn recipe() -> Recipe {
                 ),
             ],
         )
-        .env("PATH", &mesboot0_path()),
+        .env("PATH", &post_bootstrap_path()),
     );
     steps.push(
         Step::run(
             "{root}",
             &[
-                SH,
+                POST_BOOTSTRAP_SH,
                 "-c",
                 &format!(
                     "e=$('{bin}' check -f '{{root}}/cycle.conf' 2>&1); \
@@ -203,7 +203,7 @@ pub fn recipe() -> Recipe {
                 ),
             ],
         )
-        .env("PATH", &mesboot0_path()),
+        .env("PATH", &post_bootstrap_path()),
     );
 
     // `run`, not just `check`. Everything above exercises the VALIDATOR; the
@@ -217,8 +217,8 @@ pub fn recipe() -> Recipe {
     steps.push(Step::WriteFile {
         path: "{root}/run.conf".into(),
         content: format!(
-            "[first]\ntype=oneshot\nexec={SH} -c 'echo 1 > {{root}}/ran-first'\n\n\
-             [second]\ntype=oneshot\nexec={SH} -c 'echo 2 > {{root}}/ran-second'\nafter=first\n"
+            "[first]\ntype=oneshot\nexec={POST_BOOTSTRAP_SH} -c 'echo 1 > {{root}}/ran-first'\n\n\
+             [second]\ntype=oneshot\nexec={POST_BOOTSTRAP_SH} -c 'echo 2 > {{root}}/ran-second'\nafter=first\n"
         ),
         exec: false,
     });
@@ -226,7 +226,7 @@ pub fn recipe() -> Recipe {
         Step::run(
             "{root}",
             &[
-                SH,
+                POST_BOOTSTRAP_SH,
                 "-c",
                 &format!(
                     "'{bin}' run -f '{{root}}/run.conf' >/dev/null 2>&1 & \
@@ -243,7 +243,7 @@ pub fn recipe() -> Recipe {
                 ),
             ],
         )
-        .env("PATH", &mesboot0_path()),
+        .env("PATH", &post_bootstrap_path()),
     );
 
     // The one external assumption the no-unsafe stop path rests on: that the
@@ -252,7 +252,7 @@ pub fn recipe() -> Recipe {
         Step::run(
             "{root}",
             &[
-                SH,
+                POST_BOOTSTRAP_SH,
                 "-c",
                 &format!(
                     "if '{uu}' true >/dev/null 2>&1; then \
@@ -272,7 +272,7 @@ pub fn recipe() -> Recipe {
                 ),
             ],
         )
-        .env("PATH", &mesboot0_path()),
+        .env("PATH", &post_bootstrap_path()),
     );
 
     steps.push(Step::MkDir {
@@ -289,8 +289,12 @@ pub fn recipe() -> Recipe {
     });
 
     Recipe::mesboot("td-svc-test", "1.0")
-        .native_inputs(&["td-svc", "binutils-x86-64-native", "uutils"])
-        .inputs_owned(mesboot0_inputs(&[]))
+        .native_inputs(&[
+            "td-svc",
+            "binutils-x86-64-self",
+            "busybox-x86-64",
+            "uutils",
+        ])
         .steps(steps)
         .checks(vec![RecipeCheck::daily(
             r#"

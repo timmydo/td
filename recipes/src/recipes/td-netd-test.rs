@@ -1,4 +1,4 @@
-use crate::ladder::{mesboot0_inputs, mesboot0_path, SH};
+use crate::ladder::{post_bootstrap_path, POST_BOOTSTRAP_SH};
 use crate::types::{CheckRunner, Recipe, RecipeCheck, Step};
 
 // td-netd-test: shape validation of the target-built network daemon. Its
@@ -16,14 +16,14 @@ use crate::types::{CheckRunner, Recipe, RecipeCheck, Step};
 //      at all) — an EMPTY runtime closure, no libc.so to resolve.
 pub fn recipe() -> Recipe {
     let bin = "{in:td-netd}/bin/td-netd";
-    let readelf = "{in:binutils-x86-64-native}/bin/readelf";
+    let readelf = "{in:binutils-x86-64-self}/bin/readelf";
     let mut steps = Vec::new();
 
     steps.push(
         Step::run(
             "{root}",
             &[
-                SH,
+                POST_BOOTSTRAP_SH,
                 "-c",
                 &format!(
                     "h=$('{readelf}' -h '{bin}' 2>/dev/null) || {{ echo 'readelf -h failed on td-netd' >&2; exit 1; }}; \
@@ -33,13 +33,13 @@ pub fn recipe() -> Recipe {
                 ),
             ],
         )
-        .env("PATH", &mesboot0_path()),
+        .env("PATH", &post_bootstrap_path()),
     );
     steps.push(
         Step::run(
             "{root}",
             &[
-                SH,
+                POST_BOOTSTRAP_SH,
                 "-c",
                 &format!(
                     "lout=$('{readelf}' -l '{bin}' 2>/dev/null) || {{ echo 'readelf -l failed on td-netd (cannot verify absence of PT_INTERP)' >&2; exit 1; }}; \
@@ -47,13 +47,13 @@ pub fn recipe() -> Recipe {
                 ),
             ],
         )
-        .env("PATH", &mesboot0_path()),
+        .env("PATH", &post_bootstrap_path()),
     );
     steps.push(
         Step::run(
             "{root}",
             &[
-                SH,
+                POST_BOOTSTRAP_SH,
                 "-c",
                 &format!(
                     "dout=$('{readelf}' -d '{bin}' 2>/dev/null) || {{ echo 'readelf -d failed on td-netd (cannot verify absence of dynamic NEEDED)' >&2; exit 1; }}; \
@@ -61,7 +61,7 @@ pub fn recipe() -> Recipe {
                 ),
             ],
         )
-        .env("PATH", &mesboot0_path()),
+        .env("PATH", &post_bootstrap_path()),
     );
 
     steps.push(Step::MkDir {
@@ -78,8 +78,7 @@ pub fn recipe() -> Recipe {
     });
 
     Recipe::mesboot("td-netd-test", "1.0")
-        .native_inputs(&["td-netd", "binutils-x86-64-native"])
-        .inputs_owned(mesboot0_inputs(&[]))
+        .native_inputs(&["td-netd", "binutils-x86-64-self", "busybox-x86-64"])
         .steps(steps)
         .checks(vec![RecipeCheck::daily(
             r#"

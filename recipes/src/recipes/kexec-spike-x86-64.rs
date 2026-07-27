@@ -1,4 +1,6 @@
-use crate::ladder::{mesboot0_inputs, mesboot0_path, KEXEC_STAGE1_MARKER, KEXEC_STAGE2_MARKER, SH};
+use crate::ladder::{
+    post_bootstrap_path, KEXEC_STAGE1_MARKER, KEXEC_STAGE2_MARKER, POST_BOOTSTRAP_SH,
+};
 use crate::types::{Recipe, Step};
 
 // kexec-spike-x86-64 — the Phase-0 operator spike proving td's source-built kernel
@@ -48,7 +50,7 @@ pub fn recipe() -> Recipe {
             .into(),
         exec: false,
     });
-    // gen_init_cpio writes the newc cpio to stdout (SH for the `>` redirect). `-t 1`
+    // gen_init_cpio writes the newc cpio to stdout (a shell handles the `>` redirect). `-t 1`
     // pins a fixed mtime on every entry so the cpio is reproducible (the /init files
     // are written fresh by this build, so their stat mtime would otherwise be the
     // wall-clock build time — see linux-x86-64.rs).
@@ -56,12 +58,12 @@ pub fn recipe() -> Recipe {
         Step::run(
             "{root}",
             &[
-                SH,
+                POST_BOOTSTRAP_SH,
                 "-c",
                 "'{in:linux-x86-64}/gen_init_cpio' -t 1 '{root}/inner-spec' > '{root}/inner.cpio'",
             ],
         )
-        .env("PATH", &mesboot0_path()),
+        .env("PATH", &post_bootstrap_path()),
     );
 
     // ── Outer initramfs: static busybox + td-kexec + a copy of the bzImage + the
@@ -101,12 +103,12 @@ pub fn recipe() -> Recipe {
         Step::run(
             "{root}",
             &[
-                SH,
+                POST_BOOTSTRAP_SH,
                 "-c",
                 "'{in:linux-x86-64}/gen_init_cpio' -t 1 '{root}/outer-spec' > '{root}/outer-initramfs.cpio'",
             ],
         )
-        .env("PATH", &mesboot0_path()),
+        .env("PATH", &post_bootstrap_path()),
     );
 
     // ── Land the bootable bzImage + the outer initramfs. ──
@@ -130,6 +132,5 @@ pub fn recipe() -> Recipe {
 
     Recipe::mesboot("kexec-spike-x86-64", "0.1")
         .native_inputs(&["linux-x86-64", "busybox-x86-64", "td-kexec"])
-        .inputs_owned(mesboot0_inputs(&[]))
         .steps(steps)
 }

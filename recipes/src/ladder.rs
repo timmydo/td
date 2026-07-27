@@ -85,6 +85,15 @@ pub fn link_bins(binutils_rung: &str) -> Step {
 /// output, not a host bash.
 pub const SH: &str = "{in:bash-mesboot}/bin/bash";
 
+/// The shell and userland beyond the native self-hosting tool boundary. BusyBox
+/// is a reviewed boundary output and must be a declared `native_input` of every
+/// recipe using these paths.
+pub const POST_BOOTSTRAP_SH: &str = "{in:busybox-x86-64}/bin/sh";
+
+pub fn post_bootstrap_path() -> String {
+    "{in:busybox-x86-64}/bin".into()
+}
+
 /// The exact line the bootable-kernel rung's busybox `/init` prints on ttyS0 once
 /// the kernel has reached userspace, and that the host-side `qemu-boot` tool asserts
 /// on. SINGLE SOURCE OF TRUTH shared by the `/init` script, both initramfs shape
@@ -649,7 +658,66 @@ pub fn glibc241_host_free_fixups() -> Vec<Step> {
 #[cfg(test)]
 mod tests {
     use crate::catalog;
-    use crate::types::Step;
+    use crate::types::{Recipe, Step};
+    use std::collections::HashSet;
+
+    const POST_BOOTSTRAP_BOUNDARY_OUTPUTS: [&str; 5] = [
+        "rust-toolchain",
+        "gcc-x86-64-self",
+        "binutils-x86-64-self",
+        "glibc-x86-64",
+        "busybox-x86-64",
+    ];
+    // These independent target artifacts and checks deliberately run before
+    // self-hosting but are not ancestors of rust-toolchain. New recipes default
+    // to the far side of the boundary and must not grow this list silently.
+    const BOOTSTRAP_SIDE_CONSUMERS: [&str; 18] = [
+        "btrfs-progs-x86-64",
+        "btrfs-progs-x86-64-test",
+        "busybox-test",
+        "elfutils-x86-64",
+        "elfutils-x86-64-test",
+        "flex-x86-64",
+        "flex-x86-64-test",
+        "gcc-10-bridge-test",
+        "gcc-x86-64-native-test",
+        "gcc-x86-64-stage2-test",
+        "glibc-241",
+        "hello",
+        "hello-test",
+        "linux-x86-64",
+        "linux-x86-64-test",
+        "make-test",
+        "sed-mesboot",
+        "util-linux-libs-x86-64",
+    ];
+    const SELF_HOSTED_PHASE_MARKERS: [&str; 3] =
+        ["rust-toolchain", "gcc-x86-64-self", "binutils-x86-64-self"];
+    const POST_BOOTSTRAP_PROTECTED_INPUT_EXCEPTIONS: [(&str, &str); 5] = [
+        // Identity/codegen audits deliberately look back across the boundary.
+        ("rust-userland-auto-test", "rust-stage0"),
+        ("gcc-x86-64-self-test", "gcc-x86-64-native"),
+        ("gcc-x86-64-self-test", "binutils-x86-64-native"),
+        // Later boot artifacts consume the pre-self kernel and its cpio packer.
+        ("kexec-spike-x86-64", "linux-x86-64"),
+        ("system-x86-64", "linux-x86-64"),
+    ];
+    const RECIPE_SHEBANG_INTERPRETERS: [&str; 2] = [super::SH, super::POST_BOOTSTRAP_SH];
+    const GUEST_LITERAL_SHEBANGS: [(&str, &str); 12] = [
+        ("linux-x86-64", "{root}/initramfs/init"),
+        ("kexec-spike-x86-64", "{root}/inner-init"),
+        ("kexec-spike-x86-64", "{root}/outer-init"),
+        ("system-x86-64", "{root}/selector-init"),
+        ("system-x86-64", "{root}/deployment-init"),
+        ("system-x86-64", "{root}/real-root/etc/autologin"),
+        ("system-x86-64", "{root}/real-root/etc/tty-session"),
+        ("system-x86-64", "{root}/real-root/etc/shutdown"),
+        ("system-x86-64", "{root}/real-root/etc/rootcheck"),
+        ("system-x86-64", "{root}/real-root/etc/netup"),
+        ("system-x86-64", "{root}/real-root/etc/bootsuccess"),
+        ("system-x86-64", "{root}/real-root/etc/bootfail"),
+    ];
+    type RunStep<'a> = (&'a [String], &'a [(String, String)], &'a str);
 
     /// True if `cmd` appears in `s` as a whole command word. Splitting on every
     /// non-alphanumeric char means `/usr/bin/find`, `find`, and `find;` all
@@ -683,6 +751,456 @@ mod tests {
                 .collect(),
             Step::SubstituteText { edits, .. } => edits.iter().map(|e| e.to.as_str()).collect(),
             _ => Vec::new(),
+        }
+    }
+
+    fn direct_recipe_inputs(recipe: &Recipe) -> Vec<&str> {
+        recipe
+            .inputs
+            .iter()
+            .flatten()
+            .chain(recipe.native_inputs.iter().flatten())
+            .map(String::as_str)
+            .collect()
+    }
+
+    fn collect_recipe_closure(
+        recipes: &[(&'static str, Recipe)],
+        stem: &str,
+        closure: &mut HashSet<String>,
+    ) {
+        let Some((_, recipe)) = recipes.iter().find(|(candidate, _)| *candidate == stem) else {
+            return;
+        };
+        if !closure.insert(stem.to_string()) {
+            return;
+        }
+        for input in direct_recipe_inputs(recipe) {
+            collect_recipe_closure(recipes, input, closure);
+        }
+    }
+
+    fn bootstrap_partition(
+        recipes: &[(&'static str, Recipe)],
+    ) -> (HashSet<String>, HashSet<String>) {
+        let mut bootstrap_recipes = HashSet::new();
+        collect_recipe_closure(recipes, "rust-toolchain", &mut bootstrap_recipes);
+        let mut bootstrap_interior = bootstrap_recipes.clone();
+        for boundary_output in POST_BOOTSTRAP_BOUNDARY_OUTPUTS {
+            assert!(
+                bootstrap_interior.remove(boundary_output),
+                "post-bootstrap boundary output is absent from rust-toolchain closure: \
+                 {boundary_output}"
+            );
+        }
+        (bootstrap_recipes, bootstrap_interior)
+    }
+
+    #[test]
+    fn bootstrap_side_consumers_remain_pre_self_hosting() {
+        let recipes = catalog::all();
+        let (bootstrap_recipes, bootstrap_interior) = bootstrap_partition(&recipes);
+        for allowed_stem in BOOTSTRAP_SIDE_CONSUMERS {
+            let recipe = recipes
+                .iter()
+                .find(|(stem, _)| *stem == allowed_stem)
+                .map(|(_, recipe)| recipe);
+            assert!(
+                recipe.is_some(),
+                "bootstrap-side consumer must remain in the catalog: {allowed_stem}"
+            );
+            let Some(recipe) = recipe else {
+                continue;
+            };
+            assert!(
+                !bootstrap_recipes.contains(allowed_stem),
+                "bootstrap-side consumer moved into the rust-toolchain closure: {allowed_stem}"
+            );
+            assert!(
+                direct_recipe_inputs(recipe)
+                    .iter()
+                    .any(|input| bootstrap_interior.contains(*input)),
+                "bootstrap-side consumer no longer uses a bootstrap input: {allowed_stem}"
+            );
+            let mut closure = HashSet::new();
+            collect_recipe_closure(&recipes, allowed_stem, &mut closure);
+            assert!(
+                !SELF_HOSTED_PHASE_MARKERS
+                    .iter()
+                    .any(|marker| closure.contains(*marker)),
+                "bootstrap-side consumer crossed the self-hosted boundary: {allowed_stem}"
+            );
+        }
+    }
+
+    fn post_bootstrap_back_edges(recipes: &[(&'static str, Recipe)]) -> Vec<(String, String)> {
+        let (bootstrap_recipes, bootstrap_interior) = bootstrap_partition(recipes);
+        let mut protected_inputs = bootstrap_interior;
+        protected_inputs.extend(BOOTSTRAP_SIDE_CONSUMERS.iter().map(|stem| stem.to_string()));
+        let mut back_edges = Vec::new();
+        for (stem, recipe) in recipes {
+            if bootstrap_recipes.contains(*stem) || BOOTSTRAP_SIDE_CONSUMERS.contains(stem) {
+                continue;
+            }
+            for input in direct_recipe_inputs(recipe) {
+                let boundary_probe = POST_BOOTSTRAP_PROTECTED_INPUT_EXCEPTIONS.iter().any(
+                    |(allowed_stem, allowed_input)| stem == allowed_stem && input == *allowed_input,
+                );
+                if protected_inputs.contains(input) && !boundary_probe {
+                    back_edges.push((stem.to_string(), input.to_string()));
+                }
+            }
+        }
+        back_edges.sort();
+        back_edges
+    }
+
+    /// Only the Rust-toolchain closure and explicitly reviewed bootstrap-side
+    /// consumers may declare an internal tool rung. Every other catalog recipe
+    /// defaults to the far side of the boundary. The exact exceptions are
+    /// separately reviewed audit or boot-artifact edges.
+    #[test]
+    fn post_bootstrap_recipes_use_only_reviewed_boundary_inputs() {
+        let back_edges = post_bootstrap_back_edges(&catalog::all());
+        assert!(
+            back_edges.is_empty(),
+            "post-bootstrap recipes directly use protected bootstrap inputs: {back_edges:?}"
+        );
+    }
+
+    #[test]
+    fn post_bootstrap_boundary_guard_rejects_a_new_back_edge() {
+        let mut recipes = catalog::all();
+        recipes.push((
+            "synthetic-post-bootstrap",
+            Recipe::mesboot("synthetic-post-bootstrap", "0")
+                .native_inputs(&["busybox-x86-64"])
+                .inputs_owned(vec!["bash-mesboot".into(), "binutils-x86-64-native".into()]),
+        ));
+        let mut synthetic_closure = HashSet::new();
+        collect_recipe_closure(&recipes, "synthetic-post-bootstrap", &mut synthetic_closure);
+        for marker in SELF_HOSTED_PHASE_MARKERS {
+            assert!(
+                !synthetic_closure.contains(marker),
+                "the negative control must prove the marker-free boundary"
+            );
+        }
+        assert_eq!(
+            post_bootstrap_back_edges(&recipes),
+            vec![
+                ("synthetic-post-bootstrap".into(), "bash-mesboot".into()),
+                (
+                    "synthetic-post-bootstrap".into(),
+                    "binutils-x86-64-native".into(),
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn executable_write_files_use_declared_shebangs() {
+        let mut seen_guest_shebangs = HashSet::new();
+        let expected_guest_shebangs: HashSet<(String, String)> = GUEST_LITERAL_SHEBANGS
+            .iter()
+            .map(|(stem, path)| (stem.to_string(), path.to_string()))
+            .collect();
+        let mut bad = Vec::new();
+        for (stem, recipe) in catalog::all() {
+            for step in recipe.steps.iter().flatten() {
+                let Step::WriteFile {
+                    path,
+                    content,
+                    exec: true,
+                } = step
+                else {
+                    continue;
+                };
+                let shebang = content.lines().next().unwrap_or_default();
+                if let Some(interpreter) = shebang.strip_prefix("#!{in:") {
+                    let declared = interpreter
+                        .find('}')
+                        .and_then(|end| interpreter.get(..end))
+                        .filter(|input| direct_recipe_inputs(&recipe).contains(input));
+                    let approved = RECIPE_SHEBANG_INTERPRETERS
+                        .iter()
+                        .any(|approved| shebang == format!("#!{approved}"));
+                    if declared.is_some() && approved {
+                        continue;
+                    }
+                }
+                let guest = (stem.to_string(), path.clone());
+                if shebang == "#!/bin/sh" && expected_guest_shebangs.contains(&guest) {
+                    seen_guest_shebangs.insert(guest);
+                    continue;
+                }
+                bad.push((stem, path.clone(), shebang.to_string()));
+            }
+        }
+        assert!(
+            bad.is_empty(),
+            "sandbox-executable WriteFile shebangs must name declared inputs: {bad:?}"
+        );
+        assert_eq!(
+            seen_guest_shebangs, expected_guest_shebangs,
+            "the literal /bin/sh exceptions must remain exact packed-guest scripts"
+        );
+    }
+
+    fn linux_boundary_references_are_boot_artifacts_only(
+        canonical: &str,
+        cpio_references: usize,
+        packed_kernel_references: usize,
+        copied_kernel_references: usize,
+    ) -> bool {
+        let linux_token = "{in:linux-x86-64}";
+        let cpio_use = format!("'{linux_token}/gen_init_cpio' -t 1 ");
+        let packed_kernel = format!("file /kernel/bzImage {linux_token}/bzImage 0644 0 0");
+        let copied_kernel = format!("\"{linux_token}/bzImage\"");
+        canonical.matches(linux_token).count()
+            == cpio_references + packed_kernel_references + copied_kernel_references
+            && canonical.matches(&cpio_use).count() == cpio_references
+            && canonical.matches(&packed_kernel).count() == packed_kernel_references
+            && canonical.matches(&copied_kernel).count() == copied_kernel_references
+    }
+
+    #[test]
+    fn linux_boundary_exceptions_are_boot_artifacts_only() {
+        let recipes = catalog::all();
+        for (stem, cpio_references, packed_kernel_references, copied_kernel_references) in [
+            ("kexec-spike-x86-64", 2, 1, 1),
+            ("system-x86-64", 2, 0, 1),
+        ]
+        {
+            let recipe = recipes
+                .iter()
+                .find(|(candidate, _)| *candidate == stem)
+                .map(|(_, recipe)| recipe);
+            assert!(
+                recipe.is_some(),
+                "boot recipe must remain in the catalog: {stem}"
+            );
+            let Some(recipe) = recipe else {
+                continue;
+            };
+            let canonical = recipe.to_json().to_canonical();
+            assert!(
+                linux_boundary_references_are_boot_artifacts_only(
+                    &canonical,
+                    cpio_references,
+                    packed_kernel_references,
+                    copied_kernel_references,
+                ),
+                "{stem} may use linux-x86-64 only for gen_init_cpio and bzImage"
+            );
+            let bypass = format!("{canonical}{{in:linux-x86-64}}/scripts/host-tool");
+            assert!(
+                !linux_boundary_references_are_boot_artifacts_only(
+                    &bypass,
+                    cpio_references,
+                    packed_kernel_references,
+                    copied_kernel_references,
+                ),
+                "another linux-x86-64 path must not fit the boot-artifact exception"
+            );
+            for artifact in ["gen_init_cpio", "bzImage"] {
+                for suffix in [".unexpected", "-wrapper", "$suffix"] {
+                    let prefix_bypass = canonical.replacen(
+                        &format!("{{in:linux-x86-64}}/{artifact}"),
+                        &format!("{{in:linux-x86-64}}/{artifact}{suffix}"),
+                        1,
+                    );
+                    assert!(
+                        !linux_boundary_references_are_boot_artifacts_only(
+                            &prefix_bypass,
+                            cpio_references,
+                            packed_kernel_references,
+                            copied_kernel_references,
+                        ),
+                        "a same-prefix linux-x86-64 path must not fit the exception"
+                    );
+                }
+            }
+            let quote_concat_bypass = canonical.replacen(
+                "'{in:linux-x86-64}/gen_init_cpio' -t 1 ",
+                "'{in:linux-x86-64}/gen_init_cpio'.unexpected -t 1 ",
+                1,
+            );
+            assert!(
+                !linux_boundary_references_are_boot_artifacts_only(
+                    &quote_concat_bypass,
+                    cpio_references,
+                    packed_kernel_references,
+                    copied_kernel_references,
+                ),
+                "shell quote concatenation must not extend the approved executable"
+            );
+        }
+    }
+
+    fn stage0_command_is_identity_only(command: &str) -> bool {
+        let stage0_token = "{in:rust-stage0}";
+        let identity_read = "stage0='{in:rust-stage0}'; stage0_base=${stage0##*/};";
+        let identity_scan = "'{in:td-txt}/bin/td-txt' grep -a -Fq -- \"$stage0_base\" ";
+        if !command.contains(identity_read) || !command.contains(identity_scan) {
+            return false;
+        }
+        let residue = command
+            .replacen(identity_read, "", 1)
+            .replacen(identity_scan, "", 1);
+        !residue.contains(stage0_token)
+            && !residue.contains("$stage0")
+            && !residue.contains("${stage0")
+    }
+
+    #[test]
+    fn rust_stage0_boundary_exception_is_identity_only() {
+        let recipes = catalog::all();
+        let recipe = recipes
+            .iter()
+            .find(|(stem, _)| *stem == "rust-userland-auto-test")
+            .map(|(_, recipe)| recipe);
+        assert!(
+            recipe.is_some(),
+            "rust-userland-auto-test must remain in the catalog"
+        );
+        let Some(recipe) = recipe else {
+            return;
+        };
+        let stage0_token = "{in:rust-stage0}";
+        assert_eq!(
+            recipe
+                .to_json()
+                .to_canonical()
+                .matches(stage0_token)
+                .count(),
+            2,
+            "the boundary probe may name rust-stage0 once per tested binary"
+        );
+
+        let commands: Vec<&str> = recipe
+            .steps
+            .iter()
+            .flatten()
+            .filter_map(|step| match step {
+                Step::Run { argv, .. } => argv
+                    .iter()
+                    .find(|arg| arg.contains(stage0_token))
+                    .map(String::as_str),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            commands.len(),
+            2,
+            "each tested binary must keep one rust-stage0 identity read"
+        );
+        for command in commands {
+            assert!(
+                stage0_command_is_identity_only(command),
+                "the boundary probe may scan for the basename but must not use rust-stage0"
+            );
+            let bypass = format!("{command}; \"$stage0_base/bin/rustc\" --version");
+            assert!(
+                !stage0_command_is_identity_only(&bypass),
+                "executing a path reconstructed from stage0_base must be rejected"
+            );
+        }
+    }
+
+    fn self_hosted_audit_value(value: &str) -> String {
+        value
+            .replace("{in:gcc-x86-64-native}", "{in:gcc-x86-64-self}")
+            .replace("-x86_64-native", "-x86_64-self")
+            .replace("{in:binutils-x86-64-native}", "{in:binutils-x86-64-self}")
+            .replace("native-c.s", "self-c.s")
+            .replace("native-cxx.s", "self-cxx.s")
+    }
+
+    #[test]
+    fn gcc_native_boundary_exception_is_same_codegen_only() {
+        let recipes = catalog::all();
+        let recipe = recipes
+            .iter()
+            .find(|(stem, _)| *stem == "gcc-x86-64-self-test")
+            .map(|(_, recipe)| recipe);
+        assert!(
+            recipe.is_some(),
+            "gcc-x86-64-self-test must remain in the catalog"
+        );
+        let Some(recipe) = recipe else {
+            return;
+        };
+        let native_gcc_token = "{in:gcc-x86-64-native}";
+        let native_binutils_token = "{in:binutils-x86-64-native}";
+        let native_tokens = [native_gcc_token, native_binutils_token];
+        let canonical = recipe.to_json().to_canonical();
+        assert_eq!(
+            canonical.matches(native_gcc_token).count(),
+            2,
+            "only the C and C++ native compiler probes may name gcc-native"
+        );
+        assert_eq!(
+            canonical.matches(native_binutils_token).count(),
+            4,
+            "only the C and C++ native compiler probes may name binutils-native"
+        );
+        let run_steps: Vec<RunStep<'_>> = recipe
+            .steps
+            .iter()
+            .flatten()
+            .filter_map(|step| match step {
+                Step::Run { argv, env, dir } => {
+                    Some((argv.as_slice(), env.as_slice(), dir.as_str()))
+                }
+                _ => None,
+            })
+            .collect();
+        let native_steps: Vec<RunStep<'_>> = run_steps
+            .iter()
+            .copied()
+            .filter(|(argv, env, dir)| {
+                argv.iter()
+                    .chain(env.iter().flat_map(|(key, value)| [key, value]))
+                    .any(|value| native_tokens.iter().any(|token| value.contains(token)))
+                    || native_tokens.iter().any(|token| dir.contains(token))
+            })
+            .collect();
+        assert_eq!(
+            native_steps.len(),
+            2,
+            "the native exception is exactly the C and C++ same-codegen probes"
+        );
+
+        for (argv, env, dir) in native_steps {
+            assert!(
+                argv.iter().any(|arg| arg == "-S")
+                    && argv
+                        .iter()
+                        .any(|arg| arg.ends_with("/codegen.c") || arg.ends_with("/codegen.cc"))
+                    && argv
+                        .iter()
+                        .any(|arg| arg.ends_with("/native-c.s") || arg.ends_with("/native-cxx.s")),
+                "the native compiler may only emit assembly for the codegen fixture"
+            );
+            let paired_argv: Vec<String> = argv
+                .iter()
+                .map(|value| self_hosted_audit_value(value))
+                .collect();
+            let paired_env: Vec<(String, String)> = env
+                .iter()
+                .map(|(key, value)| (self_hosted_audit_value(key), self_hosted_audit_value(value)))
+                .collect();
+            let paired_dir = self_hosted_audit_value(dir);
+            assert!(
+                run_steps
+                    .iter()
+                    .any(|(candidate_argv, candidate_env, candidate_dir)| {
+                        *candidate_argv == paired_argv.as_slice()
+                            && *candidate_env == paired_env.as_slice()
+                            && *candidate_dir == paired_dir.as_str()
+                    }),
+                "each native codegen probe must retain an identical self-hosted counterpart"
+            );
         }
     }
 

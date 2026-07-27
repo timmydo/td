@@ -1,15 +1,14 @@
 use crate::ladder::{
-    mesboot0_inputs, mesboot0_path, AUTOTEST_CMDLINE_TOKEN, BOOT_FAIL_TARGET_CMDLINE_TOKEN,
+    post_bootstrap_path, AUTOTEST_CMDLINE_TOKEN, BOOT_FAIL_TARGET_CMDLINE_TOKEN,
     BOOT_SUCCESS_WAIT_CMDLINE_PREFIX, DEPLOY_INSTALL_CMDLINE_TOKEN, GREETER_MARKER,
     NETTEST_CMDLINE_TOKEN, NETTEST_DEFAULT_HOST, NETTEST_DEFAULT_PORT, PERSIST_READ_CMDLINE_TOKEN,
-    PERSIST_WRITE_CMDLINE_TOKEN, RIPGREP_FD_RUNTIME_MARKER, SH, SSHD_MARKER,
+    PERSIST_WRITE_CMDLINE_TOKEN, POST_BOOTSTRAP_SH, RIPGREP_FD_RUNTIME_MARKER, SSHD_MARKER,
     SYSTEM_BOOT_SUCCESS_MARKER, SYSTEM_DEPLOY_INSTALL_MARKER, SYSTEM_ETC_MUTABLE_MARKER,
-    SYSTEM_ETC_RO_MARKER,
-    SYSTEM_NET_REACH_MARKER, SYSTEM_NET_RESOLVE_MARKER, SYSTEM_NET_UP_MARKER,
+    SYSTEM_ETC_RO_MARKER, SYSTEM_NET_REACH_MARKER, SYSTEM_NET_RESOLVE_MARKER, SYSTEM_NET_UP_MARKER,
     SYSTEM_PERSIST_READ_MARKER, SYSTEM_PERSIST_WRITE_MARKER, SYSTEM_ROOT_RO_MARKER,
     SYSTEM_SHUTDOWN_MARKER, SYSTEM_STATE_OWNER_MARKER, SYSTEM_STATE_WRITABLE_MARKER,
-    TD_INIT_RUNTIME_MARKER, TD_LOGIN_RUNTIME_MARKER, TD_TXT_RUNTIME_MARKER,
-    TD_UTIL_RUNTIME_MARKER, UUTILS_RUNTIME_MARKER,
+    TD_INIT_RUNTIME_MARKER, TD_LOGIN_RUNTIME_MARKER, TD_TXT_RUNTIME_MARKER, TD_UTIL_RUNTIME_MARKER,
+    UUTILS_RUNTIME_MARKER,
 };
 use crate::types::{Recipe, Step};
 
@@ -2129,9 +2128,8 @@ fn shape_check() -> String {
      for a in bzImage initramfs.cpio root.erofs; do \
          grep -q -E \"^[0-9a-f]{64}  $a$\" \"$manifest\" || { echo \"manifest: missing strict SHA-256 entry for $a\" >&2; exit 1; }; \
      done"
-        // The busybox check names the concrete `{in:busybox-x86-64}` path, not a
-        // `td/store/*/bin/busybox` glob: bash-mesboot 2.05b (this step's shell) can't expand
-        // a wildcard in a non-terminal path component.
+        // Name the declared BusyBox input exactly; a store wildcard could accept
+        // an unrelated or stale BusyBox output.
         //
         // Validate EVERY packed applet, not just the greeter-critical few. Names are all
         // shell-safe identifiers, so a space-joined `for` list is safe unquoted. uutils
@@ -2204,9 +2202,13 @@ pub fn recipe() -> Recipe {
     steps.push(
         Step::run(
             "{out}",
-            &[SH, "-c", "chmod 0600 '{root}/real-root/etc/shadow'"],
+            &[
+                POST_BOOTSTRAP_SH,
+                "-c",
+                "chmod 0600 '{root}/real-root/etc/shadow'",
+            ],
         )
-        .env("PATH", &mesboot0_path()),
+        .env("PATH", &post_bootstrap_path()),
     );
 
     // 2) Pack distinct direct-boot selector and selected-deployment initramfs
@@ -2235,13 +2237,13 @@ pub fn recipe() -> Recipe {
         Step::run(
             "{root}",
             &[
-                SH,
+                POST_BOOTSTRAP_SH,
                 "-c",
                 "'{in:linux-x86-64}/gen_init_cpio' -t 1 '{root}/selector.spec' > '{root}/selector-initramfs.cpio'; \
                  '{in:linux-x86-64}/gen_init_cpio' -t 1 '{root}/deployment.spec' > '{root}/initramfs.cpio'",
             ],
         )
-        .env("PATH", &mesboot0_path()),
+        .env("PATH", &post_bootstrap_path()),
     );
 
     // 3) Materialise the first-class deployment bundle. PackErofs is executed
@@ -2298,7 +2300,10 @@ pub fn recipe() -> Recipe {
         ],
         exec: false,
     });
-    steps.push(Step::run("{out}", &[SH, "-c", &shape_check()]).env("PATH", &mesboot0_path()));
+    steps.push(
+        Step::run("{out}", &[POST_BOOTSTRAP_SH, "-c", &shape_check()])
+            .env("PATH", &post_bootstrap_path()),
+    );
 
     Recipe::mesboot("system-x86-64", "0.2")
         // busybox: the static boot/greeter userland + the `cpio -t`/applet shape check.
@@ -2347,7 +2352,6 @@ pub fn recipe() -> Recipe {
             "td-login",
             "td-svc",
         ])
-        .inputs_owned(mesboot0_inputs(&[]))
         .steps(steps)
 }
 
@@ -5227,4 +5231,3 @@ mod tests {
         );
     }
 }
-

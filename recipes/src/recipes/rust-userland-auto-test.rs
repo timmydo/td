@@ -1,22 +1,33 @@
-use crate::ladder::{mesboot0_inputs, mesboot0_path, SH};
+use crate::ladder::{post_bootstrap_path, POST_BOOTSTRAP_SH};
 use crate::types::{CheckRunner, Recipe, RecipeCheck, Step};
 
 // Keep in lockstep with NATIVE_GLIBC_STAGE and rust_toolchain::GLIBC_STAGE.
 const GLIBC_STAGE: &str = "stage/td/store/glibc-2.41-x86_64";
 
 fn dynamic_contract(label: &str, binary: &str, expected_needed: &str) -> Step {
-    let readelf = "{in:binutils-x86-64-native}/bin/readelf";
+    let readelf = "{in:binutils-x86-64-self}/bin/readelf";
+    let scanner = "{in:td-txt}/bin/td-txt";
     let glibc = format!("{{in:glibc-x86-64}}/{GLIBC_STAGE}");
     Step::run(
         "{root}",
         &[
-            SH,
+            POST_BOOTSTRAP_SH,
             "-c",
             &format!(
                 "[ -x '{binary}' ] || {{ echo '{label} output is not executable' >&2; exit 1; }}; \
-                 if grep -Fq -a /gnu/store '{binary}'; then echo '{label} embeds /gnu/store bytes' >&2; exit 1; fi; \
+                 binary_size=$(wc -c < '{binary}'); \
+                 head -c \"$binary_size\" /dev/zero > '{{root}}/binary-scan-probe' || {{ echo 'could not create binary provenance control' >&2; exit 1; }}; \
+                 printf 'td-binary-scan-positive' >> '{{root}}/binary-scan-probe'; \
+                 set -- $(od -An -tx1 -N1 '{{root}}/binary-scan-probe'); \
+                 [ \"$1\" = 00 ] || {{ echo 'binary provenance control contains no NUL' >&2; exit 1; }}; \
+                 probe_size=$(wc -c < '{{root}}/binary-scan-probe'); \
+                 [ \"$probe_size\" -gt \"$binary_size\" ] || {{ echo 'binary provenance control does not reach beyond the tested binary size' >&2; exit 1; }}; \
+                 '{scanner}' grep -a -Fq -- td-binary-scan-positive '{{root}}/binary-scan-probe' || {{ echo 'binary provenance scanner missed its positive control' >&2; exit 1; }}; \
+                 '{scanner}' grep -a -Fq -- /gnu/store '{binary}'; scan=$?; \
+                 case \"$scan\" in 1) :;; 0) echo '{label} embeds /gnu/store bytes' >&2; exit 1;; *) echo 'binary provenance scan failed for {label}' >&2; exit 1;; esac; \
                  stage0='{{in:rust-stage0}}'; stage0_base=${{stage0##*/}}; \
-                 if grep -Fq -a \"$stage0_base\" '{binary}'; then echo '{label} embeds Rust stage0 bytes' >&2; exit 1; fi; \
+                 '{scanner}' grep -a -Fq -- \"$stage0_base\" '{binary}'; scan=$?; \
+                 case \"$scan\" in 1) :;; 0) echo '{label} embeds Rust stage0 bytes' >&2; exit 1;; *) echo 'Rust stage0 provenance scan failed for {label}' >&2; exit 1;; esac; \
                  h=$('{readelf}' -h '{binary}') || {{ echo 'readelf -h failed on {label}' >&2; exit 1; }}; \
                  printf '%s\\n' \"$h\" | grep -i 'class:' | grep -qi ELF64 || {{ echo '{label} is not ELF64' >&2; exit 1; }}; \
                  printf '%s\\n' \"$h\" | grep -i 'machine:' | grep -qi x86-64 || {{ echo '{label} is not x86-64' >&2; exit 1; }}; \
@@ -32,7 +43,7 @@ fn dynamic_contract(label: &str, binary: &str, expected_needed: &str) -> Step {
             ),
         ],
     )
-    .env("PATH", &mesboot0_path())
+    .env("PATH", &post_bootstrap_path())
 }
 
 pub fn recipe() -> Recipe {
@@ -55,7 +66,7 @@ pub fn recipe() -> Recipe {
         Step::run(
             "{root}",
             &[
-                SH,
+                POST_BOOTSTRAP_SH,
                 "-c",
                 &format!(
                     "actual=$('{rg}' --color never --no-filename '^needle$' '{fixture}') || {{ echo 'ripgrep search failed' >&2; exit 1; }}; \
@@ -65,7 +76,7 @@ pub fn recipe() -> Recipe {
                 ),
             ],
         )
-        .env("PATH", &mesboot0_path()),
+        .env("PATH", &post_bootstrap_path()),
     );
     steps.push(Step::MkDir {
         path: "{out}".into(),
@@ -84,11 +95,14 @@ pub fn recipe() -> Recipe {
         .native_inputs(&[
             "ripgrep",
             "fd",
-            "binutils-x86-64-native",
+            "binutils-x86-64-self",
             "glibc-x86-64",
+            "busybox-x86-64",
+            "td-txt",
+            // This boundary check needs the stage0 basename for its negative
+            // byte scan; it never executes the bootstrap compiler.
             "rust-stage0",
         ])
-        .inputs_owned(mesboot0_inputs(&[]))
         .steps(steps)
         .checks(vec![
             RecipeCheck::daily(
