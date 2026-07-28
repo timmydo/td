@@ -18,28 +18,9 @@ use crate::types::{CheckRunner, Recipe, RecipeCheck, Step};
 // of in the build. Each refusal leg drives a distinct rejection, because a
 // validator that exits 1 for the wrong reason is a validator that will exit 0
 // for the wrong reason later.
-//
-// The `kill` leg is here for a reason worth stating: td-svc's stop path (a
-// later landing) signals a process GROUP by shelling out to the uutils
-// `/bin/kill` with a negative operand, which is the crate's one unverified
-// external assumption — a leading-dash operand can be read as a flag. Proving
-// the pinned uutils accepts it HERE means landing 3 builds on a checked fact
-// rather than on faith. It is gated on the staged multicall actually running,
-// so this recipe stays green wherever it runs.
-//
-// It exercises the argv SHAPE td-svc composes — `kill -SIG -PGID`, one signal
-// name and one negative operand — against this shell's own process group, with
-// SIGCONT, which is a no-op for a group that is not stopped. (td-svc sends
-// -TERM/-KILL; neither can be aimed at this shell's own group without killing
-// the build, and the question under test is how the OPERAND parses, which is
-// the same for every signal name.) Earlier it drove `kill -0 -- -1`, which is
-// neither the form td-svc uses nor a safe operand — `-1` is every process the
-// caller may signal — and it accepted any status but 125/2, so uutils' own
-// exit-1 usage error read as a pass.
 pub fn recipe() -> Recipe {
     let bin = "{in:td-svc}/bin/td-svc";
     let readelf = "{in:binutils-x86-64-self}/bin/readelf";
-    let uu = "{in:uutils}/bin/coreutils";
     let mut steps = Vec::new();
 
     steps.push(
@@ -274,7 +255,7 @@ pub fn recipe() -> Recipe {
                 POST_BOOTSTRAP_SH,
                 "-c",
                 &format!(
-                    "if mkdir -p /run/td-svc 2>/dev/null && {{ [ -x /bin/kill ] || {{ mkdir -p /bin 2>/dev/null && ln -sf '{uu}' /bin/kill 2>/dev/null; }}; }}; then \
+                    "if mkdir -p /run/td-svc 2>/dev/null; then \
                          '{bin}' run -f '{{root}}/ctl.conf' >/dev/null 2>&1 & \
                          p=$!; \
                          i=0; \
@@ -333,7 +314,7 @@ pub fn recipe() -> Recipe {
                          : 'AddrInUse and the next one runs with no socket at all.'; \
                          wait $p 2>/dev/null || :; \
                      else \
-                         echo 'note: this sandbox has no writable /run or /bin; the control socket is re-proved by the boot oracle'; \
+                         echo 'note: /run is not writable in this sandbox; the control socket is re-proved by the boot oracle'; \
                      fi"
                 ),
             ],
@@ -376,7 +357,7 @@ pub fn recipe() -> Recipe {
                 POST_BOOTSTRAP_SH,
                 "-c",
                 &format!(
-                    "if mkdir -p /run/td-svc 2>/dev/null && {{ [ -x /bin/kill ] || {{ mkdir -p /bin 2>/dev/null && ln -sf '{uu}' /bin/kill 2>/dev/null; }}; }}; then \
+                    "if mkdir -p /run/td-svc 2>/dev/null; then \
                          rm -f /run/td-svc/shutdown /run/td-svc/tracer-ran /run/td-svc/held.pid; \
                          '{bin}' run -f '{{root}}/down.conf' >/dev/null 2>&1 & \
                          p=$!; \
@@ -448,7 +429,7 @@ pub fn recipe() -> Recipe {
                          fi; \
                          rm -f /run/td-svc/shutdown /run/td-svc/tracer-ran /run/td-svc/held.pid; \
                      else \
-                         echo 'note: this sandbox has no writable /run or /bin; the shutdown path is re-proved by the boot oracle'; \
+                         echo 'note: /run is not writable in this sandbox; the shutdown path is re-proved by the boot oracle'; \
                      fi"
                 ),
             ],
@@ -456,8 +437,18 @@ pub fn recipe() -> Recipe {
         .env("PATH", &post_bootstrap_path()),
     );
 
-    // The one external assumption the no-unsafe stop path rests on: that the
-    // pinned uutils `kill` reads `-<pgid>` as a process group and not as a flag.
+    // The Ctrl-Alt-Del sentinel, in the SHIPPED binary. Arming turns entirely
+    // on this process being alive while td-svc holds the write end of its
+    // stdin, and dying when that end closes: a sentinel that returned at once
+    // would leave every arming to die instantly, re-arming on the backoff
+    // forever with the kernel's own hard reset already disabled. Unit tests
+    // cannot reach it — under a test harness `current_exe` is libtest, which
+    // reads `cad-sentinel` as a filter and exits — so this is the only place
+    // the applet itself runs.
+    //
+    // A FIFO plus a held fd is exactly td-svc's own mechanism. `exec 9>` also
+    // unblocks the sentinel's `open` for read, so the ordering here is the
+    // ordering arming uses.
     steps.push(
         Step::run(
             "{root}",
@@ -465,19 +456,29 @@ pub fn recipe() -> Recipe {
                 POST_BOOTSTRAP_SH,
                 "-c",
                 &format!(
-                    "if '{uu}' true >/dev/null 2>&1; then \
-                         '{uu}' kill -l >/dev/null 2>&1 || {{ echo 'uutils kill -l failed — the applet is not usable' >&2; exit 1; }}; \
-                         if [ -r /proc/self/stat ]; then \
-                             pg=$(cut -d' ' -f5 /proc/self/stat); \
-                             case \"$pg\" in ''|*[!0-9]*) echo \"could not read this shells process group from /proc (got '$pg')\" >&2; exit 1;; esac; \
-                             '{uu}' kill -CONT \"-$pg\" >/dev/null 2>&1; \
-                             s=$?; \
-                             [ \"$s\" -eq 0 ] || {{ echo \"the pinned uutils kill rejected 'kill -CONT -$pg' (exit $s) — that is the exact argv td-svcs stop path composes, one signal name and one negative process-group operand\" >&2; exit 1; }}; \
-                         else \
-                             echo 'note: /proc is not readable in this sandbox; the negative process-group operand is re-proved by the boot oracle'; \
+                    "d=/tmp/td-svc-cad-$$; \
+                     if mkdir -p \"$d\" 2>/dev/null && mkfifo \"$d/pipe\" 2>/dev/null; then \
+                         '{bin}' cad-sentinel < \"$d/pipe\" & \
+                         p=$!; \
+                         exec 9> \"$d/pipe\"; \
+                         sleep 2; \
+                         : 'Still held: it must be alive, and not a zombie.'; \
+                         st=`cut -d' ' -f3 /proc/$p/stat 2>/dev/null || echo '?'`; \
+                         if [ \"$st\" = Z ] || [ \"$st\" = '?' ]; then \
+                             echo \"FAIL: the sentinel did not block while its pipe was held (state $st)\" >&2; \
+                             exec 9>&-; exit 1; \
                          fi; \
+                         : 'Let go: it must exit promptly, and cleanly.'; \
+                         exec 9>&-; \
+                         wait $p; rc=$?; \
+                         if [ \"$rc\" -ne 0 ]; then \
+                             echo \"FAIL: the sentinel exited $rc when its pipe closed\" >&2; \
+                             exit 1; \
+                         fi; \
+                         echo 'the cad sentinel blocked while the pipe was held and exited 0 when it closed'; \
+                         rm -rf \"$d\"; \
                      else \
-                         echo 'note: staged uutils multicall did not run in this sandbox; the kill operand form is re-proved by the boot oracle'; \
+                         echo 'note: no writable /tmp or no mkfifo in this sandbox; the cad sentinel is re-proved by the boot oracle'; \
                      fi"
                 ),
             ],
@@ -490,7 +491,7 @@ pub fn recipe() -> Recipe {
     });
     steps.push(Step::WriteFile {
         path: "{out}/result".into(),
-        content: "PASS: td-svc is a statically-linked ELF64 x86-64 executable (ET_EXEC) with no PT_INTERP and no dynamic NEEDED entry; `check` resolves the shipped boot chain in dependency order (td-firstboot before rootcheck before netup before sshd and the greeter), and refuses — each with a distinct named reason and a non-zero exit — a dependency cycle, a dependency on a unit that does not exist, a console unit made skippable by requires=, a key whose behaviour has not landed (log=), a stanza line that is not key=value, restart= on a oneshot, and an unreadable table; an unknown subcommand exits 2; `td-svc run` supervises for real in the shipped static binary — two oneshots, the second ordered after the first, both spawned, the dependent released only once its dependency settled; where a writable /run lets it, the shipped binary binds the control socket under /run/td-svc and answers ITSELF over it — `status` reports a supervised daemon ready, `stop` drives a restart=always daemon to `stopped` and it is STILL stopped three seconds later (the failure mode being that it comes straight back), `restart` brings it up again, and an unknown unit is named rather than silently accepted; and where the sandbox stages the uutils multicall over a readable /proc, `kill -CONT -<pgid>` — the same one-signal-name-and-one-negative-operand argv shape td-svc's stop path composes with -TERM/-KILL — exits 0, so the negative process-group operand is not read as a flag\n".into(),
+        content: "PASS: td-svc is a statically-linked ELF64 x86-64 executable (ET_EXEC) with no PT_INTERP and no dynamic NEEDED entry; `check` resolves the shipped boot chain in dependency order (td-firstboot before rootcheck before netup before sshd and the greeter), and refuses — each with a distinct named reason and a non-zero exit — a dependency cycle, a dependency on a unit that does not exist, a console unit made skippable by requires=, a key whose behaviour has not landed (log=), a stanza line that is not key=value, restart= on a oneshot, and an unreadable table; an unknown subcommand exits 2; `td-svc run` supervises for real in the shipped static binary — two oneshots, the second ordered after the first, both spawned, the dependent released only once its dependency settled; where a writable /run lets it, the shipped binary binds the control socket under /run/td-svc and answers ITSELF over it — `status` reports a supervised daemon ready, `stop` drives a restart=always daemon to `stopped` and it is STILL stopped three seconds later (the failure mode being that it comes straight back), `restart` brings it up again, and an unknown unit is named rather than silently accepted; td-svc signals with `kill(2)` itself, so there is no longer an external `kill` whose operand parsing has to be taken on trust, and the teardown leg above drives that in the shipped binary — a restart=always daemon is signalled through its process group and stays down; and the Ctrl-Alt-Del sentinel this landing added blocks for as long as the pipe td-svc holds is open and exits when it is closed, which is the whole arming mechanism\n".into(),
         exec: false,
     });
     steps.push(Step::Require {
@@ -499,16 +500,11 @@ pub fn recipe() -> Recipe {
     });
 
     Recipe::mesboot("td-svc-test", "1.0")
-        .native_inputs(&[
-            "td-svc",
-            "binutils-x86-64-self",
-            "busybox-x86-64",
-            "uutils",
-        ])
+        .native_inputs(&["td-svc", "binutils-x86-64-self", "busybox-x86-64"])
         .steps(steps)
         .checks(vec![RecipeCheck::new(
             r#"
-echo ">> recipe-check td-svc-test: build-plan --auto builds td-svc (td's static service supervisor: dependency ordering, restart backoff, readiness probing, ordered shutdown, and — in later landings — log capture and Ctrl-Alt-Del, statically linked by the /td/store target Rust + native GCC/binutils/glibc toolchain), asserts a self-contained static ELF64 x86-64 executable (ET_EXEC, no PT_INTERP, no dynamic NEEDED), and exercises the table validator: the shipped boot chain's order, the refusal paths for a cycle, an unknown dependency, a skippable console, an unimplemented key, an unparseable stanza line, restart= on a oneshot, and an unreadable table; and `td-svc run` actually supervising two ordered oneshots in the shipped static binary; and the shutdown path end to end - a `reboot` request records its marker and tears a restart=always daemon down, and a supervisor that starts with a marker already on disk resumes the teardown instead of starting anything"
+echo ">> recipe-check td-svc-test: build-plan --auto builds td-svc (td's static service supervisor: dependency ordering, restart backoff, readiness probing, ordered shutdown, Ctrl-Alt-Del, and — in a later landing — log capture, statically linked by the /td/store target Rust + native GCC/binutils/glibc toolchain), asserts a self-contained static ELF64 x86-64 executable (ET_EXEC, no PT_INTERP, no dynamic NEEDED), and exercises the table validator: the shipped boot chain's order, the refusal paths for a cycle, an unknown dependency, a skippable console, an unimplemented key, an unparseable stanza line, restart= on a oneshot, and an unreadable table; and `td-svc run` actually supervising two ordered oneshots in the shipped static binary; and the shutdown path end to end - a `reboot` request records its marker and tears a restart=always daemon down, and a supervisor that starts with a marker already on disk resumes the teardown instead of starting anything; and the Ctrl-Alt-Del sentinel applet, which blocks while the pipe its parent holds is open and exits 0 when it closes"
 : "${TD_RECIPE_EVAL:=$PWD/target/release/td-recipe-eval}"
 exec "$TD_RECIPE_EVAL" check-run td-svc-test 1
 "#,

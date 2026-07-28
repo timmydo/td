@@ -10,10 +10,11 @@
 //! clean under the `[lints]` table each Cargo.toml declares at `deny` — NO panicking
 //! surface (unwrap/expect/panic!/unreachable!/todo!/unimplemented!), `.get(i)` over
 //! panicking `xs[i]`, and `unsafe` confined to the raw-syscall layer (builder's is
-//! sys.rs; td-kexec, td-netd, td-init and td-login carry the four recorded target-side
-//! exceptions — td-init's and td-login's own confinement tests additionally pin their
-//! scoped-allow counts and syscall rosters, and td-login's the ORDER its three
-//! credential syscalls are issued in, none of which the compiler checks).
+//! sys.rs; td-kexec, td-netd, td-init, td-login and td-svc carry the five recorded
+//! target-side exceptions — td-init's, td-login's and td-svc's own confinement tests
+//! additionally pin their scoped-allow counts and syscall rosters, and td-login's the
+//! ORDER its three credential syscalls are issued in, none of which the compiler
+//! checks).
 //! Existing code is grandfathered (per-file `#![allow]` in modules; per-item `#[allow]` on the
 //! crate root's own fns/impls — a crate-root inner `#![allow]` is crate-GLOBAL and
 //! would silently exempt everything), so a denied lint reds ONLY on NEW code. Also
@@ -31,9 +32,9 @@
 //! they lint/test here with the engine crates. td-firstboot and td-svc are linted
 //! `--all-targets`, so their tests are held to the coding rules too — each takes
 //! the AGENTS.md `#[cfg(test)]` panic exemption through its own `clippy.toml`
-//! (`allow-*-in-tests`), which scopes it to tests rather than to a file. td-svc is
-//! the one target crate that is NOT an unsafe exception and must stay that way:
-//! it `#![forbid(unsafe_code)]`s, and DESIGN.md records why every capability it
+//! (`allow-*-in-tests`), which scopes it to tests rather than to a file. td-svc's
+//! unsafe surface is the narrowest of the five — one `kill(2)`, which safe std has
+//! no route to at all; DESIGN.md records that and why every OTHER capability it
 //! needs is reachable through safe std. td-review is the one
 //! HOST-side crate here (in neither bootstrap graph, but pure std and offline), and
 //! only its `--bins` tests run: its integration tests need a `git`, which the

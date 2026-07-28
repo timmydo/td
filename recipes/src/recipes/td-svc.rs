@@ -9,17 +9,18 @@ use crate::types::{Recipe, Step};
 // `recipes/src/recipes/*.rs` catalog glob, so it is not itself a recipe module.
 //
 // SCOPE: service supervision moved OFF PID 1 — dependency ordering, restart
-// backoff, readiness probing, an ordered shutdown, and (in later landings) log
-// capture and Ctrl-Alt-Del. `td-svc/DESIGN.md` is the normative specification.
+// backoff, readiness probing, an ordered shutdown, Ctrl-Alt-Del, and (in a
+// later landing) log capture. `td-svc/DESIGN.md` is the normative specification.
 //
-// td-svc is NOT a target-side unsafe exception, and that is the point: it
-// `#![forbid(unsafe_code)]`s. Everything it needs is reachable through safe
-// `std` — `Command`/`Child` for processes, `CommandExt::process_group` for
-// groups, `/proc` reads for liveness and membership, `UnixListener` for control,
-// and two `/proc/sys/kernel` writes for Ctrl-Alt-Del. Signalling shells out to
-// the uutils `/bin/kill` rather than taking a `kill(2)` surface. DESIGN.md §4
-// records the route for each, so a future edit that reaches for `unsafe` has to
-// argue against a written answer rather than an absence.
+// td-svc is the FIFTH target-side unsafe exception, and only just: one scoped
+// `#[allow]` on a `syscall2` body carrying `kill(2)`, and nothing else. It
+// `#![deny(unsafe_code)]`s, since `forbid` cannot host that allow. Everything
+// else is reachable through safe `std` — `Command`/`Child` for processes,
+// `CommandExt::process_group` for groups, `/proc` reads for liveness and
+// membership, `UnixListener` for control, and two `/proc/sys/kernel` writes for
+// Ctrl-Alt-Del. DESIGN.md §4 records the route for each, so a future edit that
+// reaches for `unsafe` has to argue against a written answer rather than an
+// absence.
 //
 // Why mesboot-style (rustc invoked directly) rather than `Recipe::rust`, and why
 // static: identical to td-util/td-sh/td-kexec. A supervisor that cannot run when
@@ -48,10 +49,12 @@ const MAIN_RS: &str = include_str!("../../../td-svc/src/main.rs");
 // (module basename, source text). rustc resolves `mod NAME;` to `{src}/NAME.rs`.
 const MODULES: &[(&str, &str)] = &[
     ("backoff", include_str!("../../../td-svc/src/backoff.rs")),
+    ("cad", include_str!("../../../td-svc/src/cad.rs")),
     ("control", include_str!("../../../td-svc/src/control.rs")),
     ("order", include_str!("../../../td-svc/src/order.rs")),
     ("procfs", include_str!("../../../td-svc/src/procfs.rs")),
     ("supervise", include_str!("../../../td-svc/src/supervise.rs")),
+    ("sys", include_str!("../../../td-svc/src/sys.rs")),
     ("table", include_str!("../../../td-svc/src/table.rs")),
 ];
 

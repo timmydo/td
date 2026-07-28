@@ -887,10 +887,12 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
     }
 
     // td-svc: the target-built service supervisor, a standalone std-only crate
-    // OUTSIDE the engine workspace — same routing as td-login/td-init, but NOT an
-    // unsafe exception: it `#![forbid(unsafe_code)]`s, and DESIGN.md beside it is
-    // the normative spec for why every capability it needs is reachable through
-    // safe std. Its unit tests run on the host cargo-test preflight;
+    // OUTSIDE the engine workspace — same routing as td-login/td-init, and the
+    // fifth unsafe exception: it `#![deny(unsafe_code)]`s with ONE scoped allow on
+    // src/sys.rs's `syscall2`, carrying `kill(2)` alone. DESIGN.md beside it is
+    // the normative spec for that surface and for why every OTHER capability it
+    // needs is reachable through safe std. Its unit tests run on the host
+    // cargo-test preflight;
     // src/main.rs and its modules are `include_str!`'d into the td-svc RECIPE, so
     // a source edit changes the TARGET artifact and a static-link regression is
     // invisible to host cargo — hence recipe-checks too (which
@@ -1349,7 +1351,7 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
     assert_target!("td-login/Cargo.lock", "check");
     assert_target!("td-login/Cargo.lock", "recipe-checks");
     assert_preflight!("td-login/src/creds.rs", "cargo-test");
-    // td-svc mirrors td-login's routing minus the unsafe surface: every source is
+    // td-svc mirrors td-login's routing, unsafe surface included: every source is
     // include_str!'d into the td-svc recipe, so the host cargo preflight
     // and the recipe-checks static-link proof both apply. DESIGN.md is normative prose
     // and routes as docs, like td-login's THREAT-MODEL.md.
@@ -1359,6 +1361,14 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
     assert_target!("td-svc/src/supervise.rs", "recipe-checks");
     assert_target!("td-svc/src/procfs.rs", "check");
     assert_target!("td-svc/src/procfs.rs", "recipe-checks");
+    // The syscall layer and its one caller-side module, named individually: these
+    // are the crate's whole unsafe surface, and a routing change that stopped
+    // covering them would stop running the confinement tests that hold it.
+    assert_target!("td-svc/src/sys.rs", "check");
+    assert_target!("td-svc/src/sys.rs", "recipe-checks");
+    assert_preflight!("td-svc/src/sys.rs", "cargo-test");
+    assert_target!("td-svc/src/cad.rs", "check");
+    assert_target!("td-svc/src/cad.rs", "recipe-checks");
     assert_no_target!("td-svc/DESIGN.md", "check");
     assert_target!("td-svc/clippy.toml", "check");
     assert_target!("td-svc/Cargo.lock", "check");

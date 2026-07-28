@@ -285,7 +285,7 @@ td's Rust is defensive and minimal-surface.
   raw-syscall layer (`builder/src/sys.rs` and its callers `nar.rs`/`sandbox.rs`),
   which carry `#![allow(unsafe_code)]` so `builder` can be `libc`-free. Every other
   engine crate (the shared `engine` lib and `recipes`/`fetch`/`feed`/`subst`)
-  `forbid`s `unsafe_code`. There are FOUR target-side exceptions, each a standalone
+  `forbid`s `unsafe_code`. There are FIVE target-side exceptions, each a standalone
   crate OUTSIDE the `builder`/`recipes`/`engine` workspace whose only `unsafe` is that
   same `syscall`-instruction layer under a scoped `#[allow]` (the crate itself
   `#![deny(unsafe_code)]`s): (1) the `td-kexec` guest helper, confined to exactly two
@@ -335,7 +335,31 @@ td's Rust is defensive and minimal-surface.
   the normative specification for that crate and its confinement tests assert what it
   says — including the ORDER of the three calls, which no compiler checks; a fourth
   syscall, or relaxing the fail-closed authentication policy, is an amendment there AND
-  here. Do not add `unsafe` anywhere else; a new `unsafe` surface is a reviewed
+  here. And (5) the `td-svc` service supervisor, whose one `syscall2` body in
+  `td-svc/src/sys.rs` carries EXACTLY ONE syscall — `kill(2)` — reached only from the
+  single `send_signal` in `supervise.rs`. td-svc `#![forbid(unsafe_code)]`d until it
+  took this, and shelled out to the uutils `/bin/kill` instead; that traded an `unsafe`
+  block for something worse. The supervisor's ability to stop ANYTHING became a runtime
+  dependency on a third-party multicall existing at an absolute path and reading
+  `-<pgid>` as a process group rather than as a flag, with nothing tying the two
+  together — dropping `kill` from the image's applet list would have left every `stop`,
+  every `restart` and the whole ordered teardown silently unable to signal, with no
+  build-time complaint. It also cost a `fork`+`exec` per signal on the shutdown path and
+  made seven of td-svc's own stop-path tests skip on any host lacking `/bin/kill`, so
+  the code most needing coverage was the code least often run. Deliberately NOT in that
+  surface: `killpg(2)` (it is `kill(2)` with a negated argument), the `rt_sig*` family
+  (td-svc installs no handlers, and DESIGN.md §5 turns on there being none),
+  `getpid`/`getpgid`/`getsid` (`/proc` answers those, and I3 requires reading it
+  anyway), and `waitpid` (`Child::wait`/`try_wait` cover it). A SECOND syscall is an
+  amendment here; `td-svc/src/main.rs`'s confinement tests assert the roster and its
+  one value-pinned number, the whole `asm!` block including which register each
+  argument lands in, that the crate names the unsafe lint exactly twice, that the
+  entry point is private to `sys.rs` and named nowhere else, that `send_signal` is
+  the wrapper's only caller, and that NOTHING imports out of `sys` — an alias would
+  give the one audited call a name none of those scans looks for. `sys.rs`'s own
+  tests then issue the syscall, because every assertion above is about source TEXT
+  and a `kill` that returned `Ok(())` without issuing anything satisfies all of them.
+  Do not add `unsafe` anywhere else; a new `unsafe` surface is a reviewed
   amendment recorded here.
 - **The engine is dependency-free.** `builder`, `recipes`, and the shared std-only
   `engine` lib (the one copy of the hand-rolled JSON + SHA-256 both bins use) form one
@@ -345,12 +369,12 @@ td's Rust is defensive and minimal-surface.
   (path members carry none), so a new registry/git dep OR a new path member both red it.
   The target-side `td-kexec`, `td-sh`, `td-txt`, `td-netd`, `td-boot`, `td-util`,
   `td-init`, `td-firstboot`, `td-login`, and `td-svc` crates outside the workspace
-  each keep their own 1-package lock; `td-sh`, `td-txt`, `td-boot`, `td-util`,
-  `td-firstboot`, and `td-svc` contain no `unsafe`. `td-svc` (the service
-  supervisor: ordering, restart backoff, log capture, ordered shutdown, and
-  Ctrl-Alt-Del) is deliberately NOT a fifth exception — it `#![forbid(unsafe_code)]`s,
-  and `td-svc/DESIGN.md` is its normative specification, recording both why every
-  capability it needs is reachable through safe `std` and the invariants no compiler
+  each keep their own 1-package lock; `td-sh`, `td-txt`, `td-boot`, `td-util`, and
+  `td-firstboot` contain no `unsafe`. `td-svc` (the service supervisor: ordering,
+  restart backoff, log capture, ordered shutdown, and Ctrl-Alt-Del) is the FIFTH
+  exception above, and only for `kill(2)`; everything else it needs is still reachable
+  through safe `std`, which is what keeps that surface at one. `td-svc/DESIGN.md` is
+  its normative specification, recording both that and the invariants no compiler
   checks (no `pre_exec`, liveness read from `/proc` rather than inferred from an exit
   status, and a console that is neither skippable nor indefinitely delayed).
   `td-review` (the host-side integrator branch-review/landing TUI) keeps one

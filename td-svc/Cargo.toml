@@ -24,12 +24,13 @@ path = "src/main.rs"
 # src/main.rs directly with rustc; this manifest exists so the same source is an
 # independently `cargo clippy`/`cargo test`-able crate.
 #
-# Unlike td-init/td-login/td-netd/td-kexec, this crate is NOT an unsafe
-# exception: src/main.rs `#![forbid(unsafe_code)]`s and there is no scoped
-# allow anywhere. DESIGN.md I1 states that as an invariant and I2 states why
-# `pre_exec` is banned even though it needs no `unsafe` of ours — a pre-exec
-# closure runs between fork and exec in a multithreaded process, where an
-# allocation or a lock held elsewhere at fork time deadlocks the child.
+# Like td-init/td-login/td-netd/td-kexec, this crate is an unsafe exception —
+# the fifth, and the narrowest: src/main.rs `#![deny(unsafe_code)]`s and ONE
+# scoped allow, on src/sys.rs's `syscall2`, carries exactly `kill(2)`.
+# DESIGN.md I1 states that surface and I2 states why `pre_exec` stays banned
+# even though it needs no `unsafe` of ours — a pre-exec closure runs between
+# fork and exec in a multithreaded process, where an allocation or a lock held
+# elsewhere at fork time deadlocks the child.
 [lints.clippy]
 unwrap_used = "deny"       # no panicking .unwrap(); return Result/Option, use ?
 expect_used = "deny"       # no panicking .expect()

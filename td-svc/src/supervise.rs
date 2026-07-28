@@ -526,6 +526,18 @@ pub enum Event {
         generation: u64,
         code: Option<i32>,
     },
+    /// The Ctrl-Alt-Del sentinel died. `signal` is what killed it, if a signal
+    /// did — SIGINT means the kernel delivered a press, anything else means the
+    /// sentinel broke and the arming has to be rebuilt from scratch.
+    ///
+    /// `pid` is which sentinel, and it is not decoration: retiring one is done
+    /// by closing its pipe, so every re-arm leaves a watcher thread about to
+    /// report a death that has already been accounted for. Acting on that
+    /// report would retire the sentinel just armed and arm another, forever.
+    SentinelDied {
+        pid: i32,
+        signal: Option<i32>,
+    },
     /// `wait` itself failed. Deliberately distinct from an exit: collapsing it
     /// into one would clear the service's identity while the child may still be
     /// running, and td-svc would then start a duplicate (DESIGN.md I3/I4).
@@ -553,7 +565,9 @@ impl Event {
             | Event::WaitFailed { name, .. }
             | Event::Ready { name, .. }
             | Event::ProbeFailed { name, .. } => name,
-            Event::Control { .. } => "",
+            // Neither is about a service. Named rather than caught by a
+            // wildcard, so a future variant has to answer this question too.
+            Event::Control { .. } | Event::SentinelDied { .. } => "",
         }
     }
 
@@ -563,7 +577,7 @@ impl Event {
             | Event::WaitFailed { generation, .. }
             | Event::Ready { generation, .. }
             | Event::ProbeFailed { generation, .. } => *generation,
-            Event::Control { .. } => 0,
+            Event::Control { .. } | Event::SentinelDied { .. } => 0,
         }
     }
 }
@@ -748,37 +762,45 @@ struct Attached {
     device: Option<i32>,
 }
 
-/// The uutils multicall's `kill`. td-svc takes no `kill(2)` surface at all
-/// (DESIGN.md §4), so signalling is an exec — and a negative operand is how a
-/// whole process group is addressed. That the pinned uutils reads `-<pgid>` as a
-/// group and not as a flag is the crate's one external assumption; td-svc-test
-/// proves it against the exact argv composed here.
-const KILL: &str = "/bin/kill";
-
 /// Send one signal to one target. `target` is a pid, or `-<pgid>` for a group.
 ///
-/// The exit status is discarded on purpose: it reports whether the SEND
-/// succeeded, and I3 forbids reading liveness out of it.
-fn send_signal(target: &str, signal: &str) -> Result<(), String> {
-    let sent = Command::new(KILL)
-        .arg(format!("-{signal}"))
-        .arg(target)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
-    // The exit STATUS is discarded per I3 — it reports whether the send landed,
-    // and inferring liveness from it is exactly what I3 forbids. A failure to
-    // RUN `kill` at all is a different thing and must be said out loud: it
-    // means td-svc cannot signal anything, and every "killing it" line above
-    // would describe an action that never happened.
-    if let Err(e) = sent {
-        let why = format!("cannot run {KILL}: {e}; nothing was signalled");
+/// **ESRCH is success.** I3 forbids inferring liveness from a signal's result,
+/// and "nothing is there" is exactly such an inference — it is also racy by
+/// construction, since the target may die between the `/proc` read that chose
+/// it and this call. The stop path learns a service is down by watching its
+/// containment empty, never from here. What DOES come back as an error is a
+/// signal that could not be sent at all (EPERM, EINVAL): that means td-svc
+/// cannot signal, and every "killing it" line above it would describe an
+/// action that never happened.
+fn send_signal(target: i32, signal: i32) -> Result<(), String> {
+    // Two targets `kill(2)` accepts and td-svc never means. Neither is a
+    // process or a group: `0` is the CALLER's process group — td-svc and every
+    // service sharing it — and `-1` is a broadcast to every process this
+    // process may signal, which is not "process group 1" however it was
+    // arrived at. Both are reachable by arithmetic rather than by intent: a
+    // containment whose pgid read back as 1 negates to -1, and one that read
+    // back as 0 stays 0. Refused here, at the last point before the kernel,
+    // because that is the only place every caller passes through.
+    if target == 0 || target == -1 {
+        let why = format!("refusing to signal {target}: that is not a process or a group");
         log(&why);
         return Err(why);
     }
-    Ok(())
+    match crate::sys::kill(target, signal) {
+        Ok(()) => Ok(()),
+        // ESRCH. `io::ErrorKind` has no variant for it on stable, so match the
+        // raw errno rather than a kind that does not exist yet.
+        Err(e) if e.raw_os_error() == Some(ESRCH) => Ok(()),
+        Err(e) => {
+            let why = format!("cannot signal {target}: {e}; nothing was signalled");
+            log(&why);
+            Err(why)
+        }
+    }
 }
+
+/// `ESRCH` — no such process. Not in `std` as a named constant.
+const ESRCH: i32 = 3;
 
 /// Spawn a helper thread, reporting rather than panicking if the OS refuses.
 /// `std::thread::spawn` PANICS on failure, and `panic=abort` would make that
@@ -895,6 +917,23 @@ pub struct Runtime {
     /// set once and never cleared, so nothing can start a service after the
     /// teardown has touched one.
     shutdown: Option<Shutdown>,
+    /// The armed Ctrl-Alt-Del sentinel, if arming succeeded. Holding it is what
+    /// keeps the sentinel blocked; `None` means presses are not being caught.
+    cad: Option<crate::cad::Armed>,
+    /// The two sysctls arming writes. Fields rather than the constants used
+    /// directly, for the same reason `marker_path` is one — and here it is not
+    /// only about testability: a test that reached the REAL sysctls would
+    /// disarm Ctrl-Alt-Del on the machine running the suite, and point its
+    /// kernel at a pid belonging to the test harness.
+    cad_enabled_path: String,
+    cad_pid_path: String,
+    /// When to try arming again, and how many consecutive attempts have failed.
+    /// A sentinel that cannot stay alive would otherwise be respawned as fast as
+    /// the loop can turn; these throttle that to `backoff::CAP`. The count
+    /// resets when a sentinel lived at least `backoff::MIN_UPTIME` — the same
+    /// evidence, and the same threshold, that resets a service's restart count.
+    cad_retry_at: Option<Instant>,
+    cad_failures: u32,
     /// Where the I6 marker lives. A field, not the constant used directly, for
     /// the same reason `table_path` is one: every interesting property of the
     /// marker — that it is written BEFORE the first stop, that a resume reads
@@ -953,6 +992,11 @@ impl Runtime {
                 self_ids: own,
                 table_path: table_path.to_string(),
                 shutdown: None,
+                cad: None,
+                cad_enabled_path: crate::cad::CAD_ENABLED.to_string(),
+                cad_pid_path: crate::cad::CAD_PID.to_string(),
+                cad_retry_at: None,
+                cad_failures: 0,
                 marker_path: SHUTDOWN_MARKER.to_string(),
             },
             complaints,
@@ -1147,7 +1191,7 @@ impl Runtime {
             "{name}: no waiter thread; killing pid {pid} rather than leaving \
              it unsupervised, and not retrying"
         ));
-        let _ = self.signal(mode, "KILL");
+        let _ = self.signal(mode, crate::sys::SIGKILL);
         if let Some(service) = self.services.get_mut(index) {
             service.phase = Phase::Failed;
             service.pid = None;
@@ -1398,7 +1442,7 @@ impl Runtime {
         // through the normal path whenever it does die.
         match containment {
             Ok(Some(mode)) => {
-                let _ = self.signal(mode, "TERM");
+                let _ = self.signal(mode, crate::sys::SIGTERM);
             }
             Ok(None) => {}
             Err(e) => log(&format!("{name}: cannot read /proc to stop it: {e}")),
@@ -1497,7 +1541,7 @@ impl Runtime {
                 if let Some(service) = self.services.get_mut(index) {
                     service.killed = true;
                 }
-                self.signal(mode, "KILL")
+                self.signal(mode, crate::sys::SIGKILL)
             }
             None => Ok(()),
         };
@@ -1539,15 +1583,17 @@ impl Runtime {
     /// down the supervisor and everything it supervises. `containment()` is
     /// written never to produce one; this refuses to send it anyway, because
     /// the cost of the two being out of step once is the machine.
-    fn signal(&self, mode: Containment, signal: &str) -> Result<(), String> {
+    fn signal(&self, mode: Containment, signal: i32) -> Result<(), String> {
         if self.contains_self(mode) {
             let why = format!("refusing to send {signal} to {mode:?}: td-svc is inside it");
             log(&why);
             return Err(why);
         }
         match mode {
-            Containment::Process(pid) => send_signal(&pid.to_string(), signal)?,
-            Containment::Group(pgid) => send_signal(&format!("-{pgid}"), signal)?,
+            Containment::Process(pid) => send_signal(pid, signal)?,
+            // The kernel's own spelling for "everyone in that group". No argv
+            // between here and it, so nothing can read the minus as a flag.
+            Containment::Group(pgid) => send_signal(-pgid, signal)?,
             // Neither a session nor a terminal has a kill(2) target; the
             // members are enumerated and signalled individually — the
             // `killall5` shape.
@@ -1560,13 +1606,13 @@ impl Runtime {
                         for e in &scan.errors {
                             log(&format!("scanning to signal {mode:?}: {e}"));
                         }
-                        // Best effort per member, but a `kill` that cannot
-                        // RUN is not a per-member problem — it means nothing
-                        // was signalled at all, and the caller must not treat
-                        // the escalation as done.
+                        // Best effort per member, but a signal that is
+                        // REFUSED is not a per-member problem — it means
+                        // nothing was signalled at all, and the caller must
+                        // not treat the escalation as done.
                         let mut failed = None;
                         for pid in scan.pids {
-                            if let Err(why) = send_signal(&pid.to_string(), signal) {
+                            if let Err(why) = send_signal(pid, signal) {
                                 failed = Some(why);
                             }
                         }
@@ -1972,6 +2018,243 @@ impl Runtime {
         Some(power)
     }
 
+    /// Arm Ctrl-Alt-Del, or say why it is not armed and carry on.
+    ///
+    /// Never fatal. A machine that supervises its services but hard-resets on a
+    /// key press is worse than one that does neither, but it is much better than
+    /// one that refuses to boot — and on td's current `allnoconfig` kernel there
+    /// is no CONFIG_VT and no input stack, so `ctrl_alt_del()` has no caller at
+    /// all and a missing sysctl is the ORDINARY case, not a fault.
+    fn arm_cad(&mut self) {
+        // Retire any previous sentinel first. Closing the write end is how it
+        // learns to exit — an explicit `drop`, because the whole mechanism
+        // turns on that handle's lifetime and a field quietly going out of
+        // scope is not where that should be recorded.
+        //
+        // No caller reaches here holding one today: `run` arms once and
+        // `advance_cad` only fires after a death cleared the field. It stays
+        // because arming twice is the one way to leak a sentinel AND leave the
+        // kernel pointed at it, and a future second caller should not have to
+        // rediscover that. A test double-arms to keep the branch honest.
+        if let Some(previous) = self.cad.take() {
+            log(&format!(
+                "retiring the ctrl-alt-del sentinel {}",
+                previous.pid
+            ));
+            drop(previous.keepalive);
+        }
+        if let Err(why) = crate::cad::disable_hard_reset(&self.cad_enabled_path) {
+            // A sysctl that is not THERE is the ordinary case on td's current
+            // `allnoconfig` kernel — no CONFIG_VT, so `ctrl_alt_del()` has no
+            // caller — and it will not appear later. Retrying that forever is a
+            // timer that can only fail, so it is said ONCE, ungated, and left.
+            // Anything else is a fault, and the hard reset is still on, so
+            // another attempt is worth making and the reason is throttled with
+            // every other repeated one.
+            if std::path::Path::new(&self.cad_enabled_path).exists() {
+                self.arming_failed(&why);
+            } else {
+                log(&format!("ctrl-alt-del not armed: {why}"));
+            }
+            return;
+        }
+        // From here the kernel's own hard reset is OFF, so every failure below
+        // leaves the machine in the state this whole module exists to avoid —
+        // no reset AND no sentinel. Each schedules another attempt.
+        let (child, keepalive) = match crate::cad::spawn_sentinel() {
+            Ok(pair) => pair,
+            Err(why) => {
+                self.arming_failed(&why);
+                return;
+            }
+        };
+        let mut child = child;
+        let pid = match i32::try_from(child.id()) {
+            Ok(pid) => pid,
+            Err(_) => {
+                let why = "the sentinel's pid does not fit an i32";
+                // Nothing is waiting on it yet, and a dropped `Child` is never
+                // waited on — td-svc is not PID 1, so an unreaped sentinel
+                // stays a zombie for the supervisor's lifetime.
+                let _ = child.kill();
+                let _ = child.wait();
+                self.arming_failed(why);
+                return;
+            }
+        };
+        // The watcher is started BEFORE the kernel is pointed at the sentinel,
+        // so that from here on the reaping is somebody's job: a later failure
+        // need only drop the pipe, and the sentinel exits into a `wait` that is
+        // already running. The sentinel's death also has to WAKE the loop
+        // rather than be noticed on its next pass — `next_wake` can be minutes
+        // out when a crash-looper sits at the backoff cap, and a press must not
+        // wait on that.
+        //
+        // The child is handed over through a slot rather than moved directly:
+        // `Builder::spawn` consumes the closure whether or not the thread
+        // starts, so a `Child` moved into it is unreachable — and unreaped —
+        // on the one path where no thread exists to reap it.
+        let slot = std::sync::Arc::new(std::sync::Mutex::new(Some(child)));
+        let watched = std::sync::Arc::clone(&slot);
+        let tx = self.tx.clone();
+        if !spawn_thread("cad-sentinel", move || {
+            let mut child = match watched.lock() {
+                Ok(mut held) => match held.take() {
+                    Some(child) => child,
+                    None => return,
+                },
+                Err(_) => return,
+            };
+            let signal = match child.wait() {
+                Ok(status) => {
+                    use std::os::unix::process::ExitStatusExt;
+                    status.signal()
+                }
+                Err(_) => None,
+            };
+            let _ = tx.send(Event::SentinelDied { pid, signal });
+        }) {
+            if let Ok(mut held) = slot.lock() {
+                if let Some(mut child) = held.take() {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                }
+            }
+            self.arming_failed("no thread to watch the sentinel");
+            return;
+        }
+        if let Err(why) = crate::cad::point_kernel_at(&self.cad_pid_path, pid) {
+            // Explicit: closing the write end is what EOFs the sentinel's read
+            // and ends it, and the watcher above then reaps it and reports a
+            // death for a pid this runtime never recorded — which
+            // `on_sentinel_died` discards. Left to fall out of scope it reads
+            // as an unused binding rather than as the teardown it is.
+            drop(keepalive);
+            self.arming_failed(&why);
+            return;
+        }
+        self.cad = Some(crate::cad::Armed {
+            keepalive,
+            pid,
+            since: Instant::now(),
+        });
+        log(&format!("ctrl-alt-del armed (sentinel {pid})"));
+    }
+
+    /// Re-arm after a throttled wait, so a sentinel that cannot survive does not
+    /// spin. Also the one place `cad_retry_at` is cleared.
+    fn advance_cad(&mut self) {
+        let Some(at) = self.cad_retry_at else {
+            return;
+        };
+        // A timer scheduled BEFORE the teardown began still comes due during
+        // it. `schedule_cad_rearm` refuses to make new ones once a shutdown is
+        // in flight, but it cannot retract one already made, and firing it
+        // would spawn a sentinel into a teardown whose whole job is to stop
+        // processes. Dropped rather than deferred: there is nothing left to
+        // arm for.
+        if self.shutdown.is_some() {
+            self.cad_retry_at = None;
+            return;
+        }
+        if Instant::now() < at {
+            return;
+        }
+        self.cad_retry_at = None;
+        self.arm_cad();
+    }
+
+    /// Schedule a re-arm, backing off the way a crash-looping service does.
+    ///
+    /// A sentinel that dies for a PERSISTENT reason — a binary whose
+    /// `cad-sentinel` verb no longer routes, say — dies again as fast as it can
+    /// be spawned. Re-arming inline made that a tight fork loop that starved the
+    /// event loop and filled the console; the same backoff every other repeated
+    /// failure here gets bounds it at `backoff::CAP` instead.
+    /// Report an arming that failed, and schedule another attempt.
+    ///
+    /// One entry point so the console line and the throttle cannot disagree:
+    /// the REASON is gated by the same `should_report` every other repeated
+    /// failure in this crate uses, which is the whole point of the backoff —
+    /// an arm-then-die loop printed two lines a turn otherwise.
+    fn arming_failed(&mut self, why: &str) {
+        let next = self.cad_failures.saturating_add(1);
+        if crate::backoff::should_report(next) {
+            log(&format!("ctrl-alt-del not armed: {why}"));
+        }
+        self.schedule_cad_rearm();
+    }
+
+    fn schedule_cad_rearm(&mut self) {
+        // Re-arm only while there is still a machine to shut down. Once the
+        // teardown has begun a second press must not restart the sequence, and
+        // a fresh sentinel would be one more process to stop.
+        if self.shutdown.is_some() {
+            return;
+        }
+        self.cad_failures = self.cad_failures.saturating_add(1);
+        let delay = crate::backoff::delay(self.cad_failures);
+        if crate::backoff::should_report(self.cad_failures) {
+            log(&format!(
+                "ctrl-alt-del: re-arming in {}ms (attempt {})",
+                delay.as_millis(),
+                self.cad_failures
+            ));
+        }
+        self.cad_retry_at = Instant::now().checked_add(delay);
+    }
+
+    /// A press, or a sentinel that broke. Either way that arming is spent.
+    fn on_sentinel_died(&mut self, pid: i32, signal: Option<i32>) {
+        // News about a sentinel we already replaced. Retiring one is done by
+        // closing its pipe, so a re-arm ALWAYS leaves its predecessor's watcher
+        // thread about to report this; acting on it would drop the sentinel just
+        // armed and arm another, which would retire that one in turn.
+        if self.cad.as_ref().map(|armed| armed.pid) != Some(pid) {
+            return;
+        }
+        // A sentinel that STAYED UP was not a failed arming, so the consecutive
+        // -failure count starts over — the same rule, and the same threshold, a
+        // service that ran long enough gets. Without it the count only ever
+        // grows, and one much later death re-arms at `backoff::CAP`: five
+        // minutes unarmed, with the hard reset off, for a fault unrelated to
+        // the boot-time ones that ran the count up.
+        let stayed_up = self
+            .cad
+            .as_ref()
+            .is_some_and(|armed| armed.since.elapsed() >= crate::backoff::MIN_UPTIME);
+        // The kernel points at a reaped pid now, and `cad_pid` holds a reference
+        // to that dead `struct pid`, so delivery finds no task until a new pid
+        // is written. Whatever happened, this sentinel is gone.
+        self.cad = None;
+        if stayed_up {
+            self.cad_failures = 0;
+        }
+        if signal == Some(crate::sys::SIGINT) {
+            // NOT "Ctrl-Alt-Del pressed": `cad_pid` is 0600 but any root process
+            // can send SIGINT to the sentinel, so this names what was OBSERVED,
+            // not a key nobody saw.
+            log("shutdown requested via the ctrl-alt-del sentinel");
+            let reply = self.begin_shutdown(Power::Reboot);
+            if let Some(why) = reply.strip_prefix("error: ") {
+                log(&format!("ctrl-alt-del: {}", why.trim_end()));
+                // The press was heard and refused, so the machine is still up —
+                // and it is now unarmed, with the kernel's own hard reset
+                // disabled. Leaving it there makes the SECOND press do nothing
+                // at all, which is the one outcome worse than either behaviour
+                // this whole module chooses between.
+                self.schedule_cad_rearm();
+            }
+            return;
+        }
+        let how = signal.map_or_else(
+            || "exited on its own".to_string(),
+            |s| format!("was killed by signal {s}"),
+        );
+        log(&format!("the ctrl-alt-del sentinel {how}"));
+        self.schedule_cad_rearm();
+    }
+
     /// Adopt a shutdown an earlier instance began but did not finish (**I6**).
     ///
     /// Split out of `run` so it can be tested: `run` never returns, so the one
@@ -2268,7 +2551,7 @@ impl Runtime {
         // earlier draft set `stopping` and armed the KILL before knowing, so a
         // refused or unenumerable containment still replied without an `error:`
         // prefix — and the CLI exited 0 on a service that was never signalled.
-        if let Err(why) = self.signal(containment, "TERM") {
+        if let Err(why) = self.signal(containment, crate::sys::SIGTERM) {
             return format!("error: {name}: {why}\n");
         }
         let Some(service) = self.services.get_mut(index) else {
@@ -2381,6 +2664,12 @@ impl Runtime {
         // already stopped is down, and `/etc/shutdown` may be part way through
         // unmounting what the rest are using.
         self.resume_if_marked();
+        // Not while resuming: a supervisor that came back to a marker is on its
+        // way to the power applet, and a sentinel armed now would only have to
+        // be stopped again.
+        if self.shutdown.is_none() {
+            self.arm_cad();
+        }
         let mut complain_at = Some(Instant::now());
         loop {
             // A table that yielded NO units is the one failure this process cannot
@@ -2402,10 +2691,18 @@ impl Runtime {
                 }
             }
             self.enforce_deadlines();
+            self.advance_cad();
             if let Some(power) = self.advance_shutdown() {
                 self.finish_shutdown(power);
             }
-            let next_wake = self.start_eligible();
+            // A pending re-arm is a wake reason like any retry: without it the
+            // loop can sit on the channel for a second while the machine is
+            // unarmed AND the kernel's hard reset is off, which is the gap the
+            // backoff exists to bound rather than to widen.
+            let next_wake = match (self.start_eligible(), self.cad_retry_at) {
+                (Some(a), Some(b)) => Some(a.min(b)),
+                (a, b) => a.or(b),
+            };
             let timeout = match next_wake {
                 Some(at) => at.saturating_duration_since(Instant::now()).max(TICK),
                 None => Duration::from_secs(1),
@@ -2445,6 +2742,13 @@ impl Runtime {
             // A client that hung up before the answer is not an error: the
             // request still ran, which is what it asked for.
             let _ = reply.send(answer);
+            return;
+        }
+        // Also before the check, and for the same reason: the sentinel is not a
+        // service, so it has no generation to be stale against. Its pid is its
+        // generation instead, and `on_sentinel_died` does that check itself.
+        if let Event::SentinelDied { pid, signal } = event {
+            self.on_sentinel_died(pid, signal);
             return;
         }
         let name = event.name().to_string();
@@ -2491,9 +2795,10 @@ impl Runtime {
             return;
         }
         match event {
-            // Peeled off above; naming it here keeps the match exhaustive
-            // without a catch-all that would swallow a future variant.
-            Event::Control { .. } => {}
+            // Both peeled off above; naming them here keeps the match
+            // exhaustive without a catch-all that would swallow a future
+            // variant.
+            Event::Control { .. } | Event::SentinelDied { .. } => {}
             Event::Exited { code, .. } => self.on_exit(&name, code),
             Event::WaitFailed { error, .. } => {
                 // Fails CLOSED: the child may still be running, so its identity
@@ -2559,7 +2864,13 @@ fn probe_once(unit: &Unit) -> bool {
             // attempt, and attempts repeat until `ready-timeout`.
             // Best effort: the probe is being abandoned either way, and the
             // `child.kill()` below is the part that must happen.
-            let _ = send_signal(&format!("-{}", child.id()), "KILL");
+            //
+            // Only when the pid CONVERTS. A fallback of 0 negates to 0, and
+            // `kill(0, SIGKILL)` addresses the caller's own process group —
+            // td-svc and every service it started sharing that group.
+            if let Ok(pid) = i32::try_from(child.id()) {
+                let _ = send_signal(-pid, crate::sys::SIGKILL);
+            }
             let _ = child.kill();
             let _ = child.wait();
             return false;
@@ -3071,18 +3382,150 @@ mod tests {
         }
     }
 
-    /// The stop path EXECS `/bin/kill`, and since review it reports a `kill`
-    /// it could not run as a failed stop rather than a successful one — which
-    /// is the point, but it means a host without that binary cannot exercise
-    /// what follows a signal that landed. Those tests skip rather than assert
-    /// a precondition the machine does not meet; the shipped image always has
-    /// it (uutils), and td-svc-test drives this path there.
-    fn can_signal() -> bool {
-        if std::path::Path::new(KILL).exists() {
-            return true;
+    /// Poll `/proc` until `pid` is no longer a LIVE process, or give up.
+    ///
+    /// Liveness from `/proc`, per I3 — and `matches` already reads a zombie as
+    /// absent, which is what makes this usable before the child is reaped.
+    fn gone_within(pid: i32, patience: Duration) -> bool {
+        let deadline = Instant::now() + patience;
+        loop {
+            let alive = procfs::stat_of(pid)
+                .ok()
+                .flatten()
+                .is_some_and(|st| !st.zombie);
+            if !alive {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(20));
         }
-        eprintln!("note: no {KILL} on this host; skipping a post-signal assertion");
-        false
+    }
+
+    /// The signal actually LANDS on one process.
+    ///
+    /// Nothing else in this suite proved this. The stop-path tests drive the
+    /// bookkeeping — `stopping` set, phase moved, no error returned — and every
+    /// one of them stayed green with the syscall stubbed out to `Ok(())`,
+    /// because a signal that is never sent is indistinguishable from one that
+    /// is until something observes the target. This observes the target.
+    #[test]
+    fn a_signal_reaches_the_process_it_names() {
+        let Some(live) = live_child() else {
+            eprintln!("note: cannot spawn a child here; skipping");
+            return;
+        };
+        assert!(
+            procfs::stat_of(live.pid).ok().flatten().is_some(),
+            "the fixture was not running to begin with"
+        );
+        send_signal(live.pid, crate::sys::SIGTERM).unwrap();
+        assert!(
+            gone_within(live.pid, Duration::from_secs(5)),
+            "TERM did not reach the process it named"
+        );
+    }
+
+    /// And on a whole process GROUP, addressed by a negative target.
+    ///
+    /// This is what the deleted td-svc-test leg used to prove about the uutils
+    /// `kill` — that `-<pgid>` reads as a group and not as a flag. With the
+    /// exec gone there is no argv to misparse, so the claim moves in-crate and
+    /// becomes a property of `kill(2)` itself: the SIGN of the target is what
+    /// selects a group. (Only the low 32 bits of the register reach the kernel,
+    /// so this does not pin the widening cast — nothing can, and `sys.rs` says
+    /// why.)
+    #[test]
+    fn a_negative_target_reaches_a_whole_process_group() {
+        let Some(leader) = live_group_leader() else {
+            eprintln!("note: cannot spawn a group leader here; skipping");
+            return;
+        };
+        // The leader leads its own group, so the group id IS its pid.
+        send_signal(-leader.pid, crate::sys::SIGTERM).unwrap();
+        assert!(
+            gone_within(leader.pid, Duration::from_secs(5)),
+            "TERM to -pgid did not reach the group's leader"
+        );
+    }
+
+    /// A signal to nothing is not an error, and is not evidence of death.
+    ///
+    /// ESRCH comes back as `Ok` deliberately (I3): the stop path must not learn
+    /// liveness here, and the target can die between the `/proc` read that
+    /// chose it and the call itself.
+    #[test]
+    fn signalling_a_pid_that_is_gone_is_not_an_error() {
+        let Some(live) = live_child() else {
+            eprintln!("note: cannot spawn a child here; skipping");
+            return;
+        };
+        let pid = live.pid;
+        drop(live); // killed and REAPED, so the pid names nothing at all
+        assert_eq!(
+            send_signal(pid, crate::sys::SIGTERM),
+            Ok(()),
+            "ESRCH must read as success, or a racing stop reports a failure it did not have"
+        );
+    }
+
+    /// The two targets that are not a process or a group are refused.
+    ///
+    /// `kill(2)` accepts both and means something td-svc never does: `0` is the
+    /// caller's own process group — td-svc and every service sharing it — and
+    /// `-1` is a broadcast to every process this one may signal. Neither is
+    /// reached by naming it; both are reached by ARITHMETIC, since a
+    /// containment is signalled as `-pgid` and a pgid that read back as 1
+    /// negates into the broadcast. Nothing downstream would report it: the
+    /// signal succeeds.
+    #[test]
+    fn a_broadcast_or_a_self_group_target_is_refused() {
+        for target in [0, -1] {
+            let err = send_signal(target, crate::sys::SIGTERM)
+                .err()
+                .unwrap_or_else(|| "sent successfully".to_string());
+            assert!(
+                err.contains("not a process or a group"),
+                "signalling {target} must be refused, got: {err}"
+            );
+        }
+        // And a real target still goes through, or the guard is just a ban.
+        // Our own pid with signal 0, so this half cannot skip and cannot
+        // signal anything: a guard that refused everything would pass the
+        // assertions above and stop the machine from ever shutting down.
+        let Ok(me) = i32::try_from(std::process::id()) else {
+            return;
+        };
+        assert_eq!(
+            send_signal(me, 0),
+            Ok(()),
+            "the guard must refuse only 0 and -1"
+        );
+    }
+
+    /// ESRCH is the ONLY errno that reads as success.
+    ///
+    /// The rule above is a narrow exception, and the danger is that it widens
+    /// into "a signal that failed is fine". A signal td-svc could not send at
+    /// all has to surface: every "killing it" line the stop path logs describes
+    /// an action that then never happened, and the containment it is waiting to
+    /// see empty never will.
+    #[test]
+    fn a_signal_that_could_not_be_sent_is_an_error() {
+        let Ok(me) = i32::try_from(std::process::id()) else {
+            return;
+        };
+        // An invalid signal NUMBER, so the refusal does not depend on whether
+        // the suite runs as root — and it is refused before anything is
+        // delivered, so this test does not signal itself.
+        let err = send_signal(me, 65)
+            .err()
+            .unwrap_or_else(|| "sent successfully".to_string());
+        assert!(
+            err.contains("nothing was signalled"),
+            "a refused signal must be reported as a failure, got: {err}"
+        );
     }
 
     fn live_child() -> Option<Live> {
@@ -3140,9 +3583,6 @@ mod tests {
     /// TERM, exit, immediate restart, and the operator sees it running.
     #[test]
     fn stopping_an_always_restart_daemon_does_not_restart_it() {
-        if !can_signal() {
-            return;
-        }
         let mut rt = runtime("[sshd]\ntype=daemon\nexec=/bin/x\nrestart=always\n");
         let Some(live) = live_child() else { return };
         {
@@ -3176,9 +3616,6 @@ mod tests {
     /// most wanted.
     #[test]
     fn restart_stops_then_starts_and_interrupts_the_backoff() {
-        if !can_signal() {
-            return;
-        }
         let mut rt = runtime("[sshd]\ntype=daemon\nexec=/bin/x\nrestart=always\n");
         let Some(live) = live_child() else { return };
         {
@@ -3209,9 +3646,6 @@ mod tests {
     /// dependent — the console included — on an answer that already exists.
     #[test]
     fn a_stopped_unit_settles_so_its_dependents_still_run() {
-        if !can_signal() {
-            return;
-        }
         let mut rt = runtime(
             "[a]\ntype=daemon\nexec=/bin/x\nrestart=always\n\
              [b]\ntype=oneshot\nexec=/bin/true\nafter=a\n",
@@ -3326,9 +3760,6 @@ mod tests {
     /// `failed` and nothing swept the containment.
     #[test]
     fn a_stop_that_races_a_timeout_still_completes() {
-        if !can_signal() {
-            return;
-        }
         let mut rt = runtime("[slow]\ntype=oneshot\nexec=/x\ntimeout=1\n");
         let Some(live) = live_child() else { return };
         {
@@ -3370,9 +3801,6 @@ mod tests {
         // recorded, so the assertions below hold for the wrong reason and the
         // mutation this test exists to catch (setting `Stopped` at TERM time)
         // goes unnoticed.
-        if !can_signal() {
-            return;
-        }
         let mut rt = runtime("[a]\ntype=daemon\nexec=/x\nrestart=always\n");
         let Some(live) = live_child() else { return };
         {
@@ -3399,9 +3827,6 @@ mod tests {
     /// green, because the only escalation test covered the `timeout=` path.
     #[test]
     fn a_stop_arms_the_kill_that_follows_an_ignored_term() {
-        if !can_signal() {
-            return;
-        }
         let mut rt = runtime("[a]\ntype=daemon\nexec=/x\nrestart=always\n");
         let Some(live) = live_child() else { return };
         {
@@ -4058,6 +4483,381 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir2);
     }
 
+    /// Arm against scratch sysctls and hand back the sentinel's pid.
+    ///
+    /// A REAL `arm_cad`, not a fake: the pid the events below carry has to be
+    /// the one the runtime believes in, and pointing the paths somewhere
+    /// writable is the only part of arming a test may not do for real — the
+    /// true sysctls would disarm the machine running this suite and aim its
+    /// kernel at a pid belonging to the test harness.
+    ///
+    /// The sentinel here is this test binary re-executed with `cad-sentinel`,
+    /// which libtest reads as a filter matching no test, so it exits at once.
+    /// That is fine and is why the pid is returned: arming is complete the
+    /// moment the runtime records it, and every assertion below is about what
+    /// the runtime does with a death, not about how long the child lived.
+    fn arm_at(rt: &mut Runtime, dir: &str) -> i32 {
+        rt.cad_enabled_path = format!("{dir}/enabled");
+        rt.cad_pid_path = format!("{dir}/cad_pid");
+        rt.arm_cad();
+        rt.cad.as_ref().map_or(0, |armed| armed.pid)
+    }
+
+    /// Arming writes both sysctls and leaves a sentinel the runtime holds.
+    ///
+    /// Every other test here starts from a death, which says nothing about
+    /// whether anything was ever armed — and an `arm_cad` that silently gave up
+    /// on every path would satisfy all of them. This is the one that fails if
+    /// Ctrl-Alt-Del is never set up at all.
+    #[test]
+    fn arming_writes_both_sysctls_and_holds_a_sentinel() {
+        let (mut rt, dir) = shutdown_runtime("[a]\ntype=oneshot\nexec=/x\n", "cad-arm");
+        let pid = arm_at(&mut rt, &dir);
+        assert!(pid > 0, "arming did not record a sentinel");
+        assert!(rt.cad.is_some(), "the runtime is not holding the sentinel");
+        // The hard reset is off, so a press is a signal rather than a reset...
+        assert_eq!(
+            std::fs::read_to_string(format!("{dir}/enabled"))
+                .unwrap_or_default()
+                .trim(),
+            "0",
+            "the kernel's own hard reset was left enabled"
+        );
+        // ...and it is aimed at the sentinel this runtime holds, not at PID 1.
+        assert_eq!(
+            std::fs::read_to_string(format!("{dir}/cad_pid"))
+                .unwrap_or_default()
+                .trim(),
+            pid.to_string(),
+            "cad_pid does not name the sentinel that was armed"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A sentinel killed by SIGINT is a shutdown request; anything else is a
+    /// broken sentinel.
+    ///
+    /// The kernel's only way to say "Ctrl-Alt-Del" is to kill `cad_pid` with
+    /// SIGINT, so the SIGNAL is the whole message. Reading any death as a press
+    /// would turn a sentinel that crashed — or that someone killed while
+    /// debugging — into an unannounced reboot of a live machine.
+    #[test]
+    fn only_a_sigint_death_of_the_sentinel_is_a_shutdown_request() {
+        let (mut rt, dir) = shutdown_runtime("[a]\ntype=oneshot\nexec=/x\n", "cad-int");
+        let pid = arm_at(&mut rt, &dir);
+
+        rt.on_sentinel_died(pid, Some(crate::sys::SIGINT));
+        assert!(
+            rt.shutdown.is_some(),
+            "a SIGINT death of the sentinel must begin a shutdown"
+        );
+        assert_eq!(
+            rt.shutdown.as_ref().map(|s| s.power),
+            Some(Power::Reboot),
+            "a press reboots"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_sentinel_that_died_of_anything_else_does_not_shut_the_machine_down() {
+        let (mut rt, dir) = shutdown_runtime("[a]\ntype=oneshot\nexec=/x\n", "cad-other");
+
+        for death in [Some(crate::sys::SIGKILL), None] {
+            rt.shutdown = None;
+            let pid = arm_at(&mut rt, &dir);
+            rt.on_sentinel_died(pid, death);
+            assert!(
+                rt.shutdown.is_none(),
+                "a sentinel that died of {death:?} is a bug to re-arm from, not a press"
+            );
+            assert!(
+                rt.cad_retry_at.is_some(),
+                "a sentinel that died of {death:?} left nothing to re-arm from"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The death of a sentinel we already replaced is not news.
+    ///
+    /// Retiring a sentinel is done by closing its pipe, so EVERY re-arm leaves
+    /// the previous one's watcher thread about to report a death. Acting on
+    /// that report drops the sentinel just armed — whose own watcher then
+    /// reports ITS death, which drops the next one. The loop is unbounded, it
+    /// forks a process per turn, and every sentinel in it is correctly armed at
+    /// the moment it is destroyed.
+    #[test]
+    fn the_death_of_a_replaced_sentinel_is_ignored() {
+        let (mut rt, dir) = shutdown_runtime("[a]\ntype=oneshot\nexec=/x\n", "cad-stale");
+        let first = arm_at(&mut rt, &dir);
+        let second = arm_at(&mut rt, &dir);
+        assert_ne!(first, second, "the re-arm reused the retired sentinel's pid");
+
+        rt.on_sentinel_died(first, None);
+        assert_eq!(
+            rt.cad.as_ref().map(|armed| armed.pid),
+            Some(second),
+            "a retired sentinel's death dropped the live one"
+        );
+        assert!(
+            rt.cad_retry_at.is_none(),
+            "a retired sentinel's death scheduled a re-arm on top of a live sentinel"
+        );
+        // And it is a press for a sentinel nobody holds any more, too: SIGINT
+        // from a stale watcher must not reboot a machine that is armed and well.
+        rt.on_sentinel_died(first, Some(crate::sys::SIGINT));
+        assert!(
+            rt.shutdown.is_none(),
+            "a retired sentinel's SIGINT rebooted the machine"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An arming that fails part way reaps the sentinel and tries again.
+    ///
+    /// Failing AFTER the hard reset is off is the dangerous shape: the machine
+    /// has neither the kernel's reset nor a sentinel, which is worse than
+    /// either state this module chooses between, so it cannot be left there.
+    /// And the sentinel spawned before the failure has to be reaped — td-svc is
+    /// not PID 1, so nothing else will, and a dropped `Child` is never waited
+    /// on.
+    #[test]
+    fn an_arming_that_fails_after_the_sentinel_exists_reaps_it_and_retries() {
+        let (mut rt, dir) = shutdown_runtime("[a]\ntype=oneshot\nexec=/x\n", "cad-halfarm");
+        rt.cad_enabled_path = format!("{dir}/enabled");
+        // A DIRECTORY where cad_pid should be: the write fails (EISDIR) after
+        // the sentinel is already running and the hard reset already off.
+        let blocked = format!("{dir}/cad_pid");
+        let _ = std::fs::create_dir_all(&blocked);
+        rt.cad_pid_path = blocked;
+
+        rt.arm_cad();
+        assert!(rt.cad.is_none(), "a failed arming recorded a sentinel anyway");
+        assert!(
+            rt.cad_retry_at.is_some(),
+            "a failure that left the hard reset disabled did not schedule a retry"
+        );
+        // The watcher only reports once its `wait` returned, so this event IS
+        // the proof the sentinel was reaped rather than left a zombie.
+        assert!(
+            matches!(
+                rt.next_event(Duration::from_secs(10)),
+                Some(Event::SentinelDied { .. })
+            ),
+            "the abandoned sentinel was never waited on; it is a zombie"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A sysctl that does not exist is not a fault, and not retried forever.
+    ///
+    /// On td's current `allnoconfig` kernel there is no CONFIG_VT, so
+    /// `ctrl_alt_del()` has no caller and the sysctl is simply absent. Retrying
+    /// that on a timer until the machine is switched off would be a scheduled
+    /// failure; a write that fails for any OTHER reason is worth retrying,
+    /// because the file is there and something transient stopped it.
+    #[test]
+    fn an_absent_sysctl_is_not_retried_but_a_failing_one_is() {
+        let (mut rt, dir) = shutdown_runtime("[a]\ntype=oneshot\nexec=/x\n", "cad-absent");
+        rt.cad_enabled_path = format!("{dir}/no-such-sysctl/ctrl-alt-del");
+        rt.cad_pid_path = format!("{dir}/cad_pid");
+        rt.arm_cad();
+        assert!(rt.cad.is_none(), "arming succeeded against a missing sysctl");
+        assert!(
+            rt.cad_retry_at.is_none(),
+            "a sysctl that will never appear was put on a retry timer"
+        );
+
+        // Present, but unwritable: a directory in its place.
+        let present = format!("{dir}/enabled");
+        let _ = std::fs::create_dir_all(&present);
+        rt.cad_enabled_path = present;
+        rt.arm_cad();
+        assert!(rt.cad.is_none(), "arming succeeded against an unwritable sysctl");
+        assert!(
+            rt.cad_retry_at.is_some(),
+            "a sysctl that is THERE and failed to take was not retried"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A sentinel that cannot stay alive is retried on a backoff, not a spin.
+    ///
+    /// The failure this bounds is a persistent one — a binary whose
+    /// `cad-sentinel` verb stopped routing, say — where every re-arm dies as
+    /// fast as it is spawned. Re-arming inline made that a fork loop that
+    /// starved the event loop and filled the console.
+    #[test]
+    fn a_sentinel_that_keeps_dying_backs_off_instead_of_spinning() {
+        let (mut rt, dir) = shutdown_runtime("[a]\ntype=oneshot\nexec=/x\n", "cad-backoff");
+        let pid = arm_at(&mut rt, &dir);
+
+        rt.on_sentinel_died(pid, None);
+        assert_eq!(rt.cad_failures, 1, "the first failure was not counted");
+        let first = rt.cad_retry_at.expect("no re-arm was scheduled");
+        assert!(
+            rt.cad.is_none(),
+            "the re-arm happened inline; nothing was throttled"
+        );
+        // Not yet due: the loop must not re-arm early, or the backoff is a
+        // number nobody reads.
+        rt.advance_cad();
+        assert!(rt.cad.is_none(), "re-armed before the backoff elapsed");
+        assert_eq!(rt.cad_retry_at, Some(first), "the schedule was disturbed");
+
+        // Due now.
+        rt.cad_retry_at = Some(Instant::now());
+        rt.advance_cad();
+        let next = rt.cad.as_ref().map(|armed| armed.pid);
+        assert!(next.is_some(), "the scheduled re-arm never armed anything");
+        assert!(rt.cad_retry_at.is_none(), "the schedule was not cleared");
+
+        // A second failure waits longer than the first.
+        rt.on_sentinel_died(next.unwrap_or(0), None);
+        assert_eq!(rt.cad_failures, 2, "consecutive failures are not accumulating");
+        assert!(
+            crate::backoff::delay(2) > crate::backoff::delay(1),
+            "the backoff does not grow, so this test proves nothing"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A sentinel that stayed up clears the count; one that did not, does not.
+    ///
+    /// The count means CONSECUTIVE failures. If it only ever grew, a boot that
+    /// hit a dozen transient arming failures would answer one unrelated death
+    /// hours later at `backoff::CAP` — five minutes unarmed, with the kernel's
+    /// hard reset off, for a fault that had nothing to do with them.
+    #[test]
+    fn a_sentinel_that_stayed_up_clears_the_rearm_backoff() {
+        let (mut rt, dir) = shutdown_runtime("[a]\ntype=oneshot\nexec=/x\n", "cad-reset");
+        let pid = arm_at(&mut rt, &dir);
+        rt.cad_failures = 12;
+        // Armed long enough ago to count as having stayed up.
+        if let Some(armed) = rt.cad.as_mut() {
+            armed.since = Instant::now()
+                .checked_sub(crate::backoff::MIN_UPTIME * 2)
+                .unwrap_or_else(Instant::now);
+        }
+        rt.on_sentinel_died(pid, None);
+        assert_eq!(
+            rt.cad_failures, 1,
+            "a sentinel that stayed up must reset the count, leaving only this failure"
+        );
+
+        // And one that died immediately does NOT clear it: that is exactly the
+        // case the backoff exists to throttle.
+        let pid = arm_at(&mut rt, &dir);
+        rt.cad_failures = 4;
+        rt.on_sentinel_died(pid, None);
+        assert_eq!(
+            rt.cad_failures, 5,
+            "a sentinel that died at once must keep accumulating"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A re-arm scheduled before a shutdown does not fire during it.
+    ///
+    /// `schedule_cad_rearm` refuses to make new timers once a teardown is in
+    /// flight, but a timer made BEFORE it began outlives that check and comes
+    /// due in the middle of the teardown. Firing it spawns a sentinel into a
+    /// sequence whose whole job is to stop processes — one more thing to stop,
+    /// arriving after the walk that decides what to stop was computed.
+    #[test]
+    fn a_rearm_scheduled_before_a_shutdown_is_dropped_not_fired() {
+        let (mut rt, dir) = shutdown_runtime("[a]\ntype=oneshot\nexec=/x\n", "cad-pending");
+        let pid = arm_at(&mut rt, &dir);
+        rt.on_sentinel_died(pid, None);
+        assert!(rt.cad_retry_at.is_some(), "no re-arm was scheduled to test");
+
+        // The teardown begins while that timer is pending, and it comes due.
+        assert!(!rt.begin_shutdown(Power::Reboot).starts_with("error: "));
+        rt.cad_retry_at = Some(Instant::now());
+        rt.advance_cad();
+        assert!(
+            rt.cad.is_none(),
+            "a stale re-arm spawned a sentinel into the teardown"
+        );
+        assert!(
+            rt.cad_retry_at.is_none(),
+            "the stale re-arm is still pending; it will be retried every pass"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A press that could not begin a shutdown must leave the machine armed.
+    ///
+    /// The arming is spent either way — the sentinel is dead. If the shutdown
+    /// then fails, the machine is still up, still running, and now catches no
+    /// presses at all while the kernel's own hard reset is disabled. That is
+    /// strictly worse than both behaviours this module chooses between: the
+    /// keys do nothing whatsoever.
+    #[test]
+    fn a_press_whose_shutdown_is_refused_re_arms() {
+        let (mut rt, dir) = shutdown_runtime("[a]\ntype=oneshot\nexec=/x\n", "cad-refused");
+        // An unwritable marker is how `begin_shutdown` fails: it records the
+        // shutdown BEFORE stopping anything (I6), so a marker it cannot write
+        // means nothing has been stopped and the machine is still live. A FILE
+        // in the parent's place, because the writer creates missing directories
+        // — a merely absent parent is not a failure at all.
+        let blocker = format!("{dir}/blocker");
+        let _ = std::fs::write(&blocker, "not a directory\n");
+        rt.marker_path = format!("{blocker}/shutdown");
+        let pid = arm_at(&mut rt, &dir);
+
+        rt.on_sentinel_died(pid, Some(crate::sys::SIGINT));
+        assert!(
+            rt.shutdown.is_none(),
+            "the shutdown was supposed to fail; this test proves nothing"
+        );
+        assert!(
+            rt.cad_retry_at.is_some(),
+            "a refused press left Ctrl-Alt-Del disarmed forever"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Once the teardown has begun, a sentinel death changes nothing.
+    ///
+    /// Two presses are ordinary — someone holds the keys down, or presses again
+    /// because nothing visible happened yet. The second must not restart the
+    /// sequence (I6 is monotonic), and must not re-arm: a fresh sentinel would
+    /// be one more process for the teardown to stop.
+    #[test]
+    fn a_press_during_a_shutdown_neither_restarts_it_nor_re_arms() {
+        let (mut rt, dir) = shutdown_runtime("[a]\ntype=oneshot\nexec=/x\n", "cad-twice");
+        let pid = arm_at(&mut rt, &dir);
+
+        rt.on_sentinel_died(pid, Some(crate::sys::SIGINT));
+        let first = rt.shutdown.as_ref().map(|s| (s.power, s.cursor));
+        assert!(first.is_some(), "the first press must begin the shutdown");
+        assert!(
+            rt.cad.is_none() && rt.cad_retry_at.is_none(),
+            "a press re-armed instead of letting the teardown proceed"
+        );
+
+        // A second press can only exist if something armed one during the
+        // teardown; arm it by hand so the assertion is about what a press does
+        // then, not about there being nothing to press.
+        let again = arm_at(&mut rt, &dir);
+        rt.on_sentinel_died(again, Some(crate::sys::SIGINT));
+        assert_eq!(
+            rt.shutdown.as_ref().map(|s| (s.power, s.cursor)),
+            first,
+            "a second press restarted the teardown"
+        );
+        // And a non-press death during a shutdown must not build a new sentinel.
+        let again = arm_at(&mut rt, &dir);
+        rt.on_sentinel_died(again, None);
+        assert!(
+            rt.cad.is_none() && rt.cad_retry_at.is_none(),
+            "the supervisor re-armed while a shutdown was in flight"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// The plan a real table produces is the one the reverse walk consumes.
     ///
     /// `next_to_stop` is pinned on synthetic indices above; this is the other
@@ -4429,9 +5229,6 @@ mod tests {
     /// and `start` during one must not silently do nothing.
     #[test]
     fn a_second_request_while_a_stop_is_in_flight_does_not_strand_the_unit() {
-        if !can_signal() {
-            return;
-        }
         let mut rt = runtime("[a]\ntype=daemon\nexec=/x\nrestart=always\n");
         let Some(live) = live_child() else { return };
         {

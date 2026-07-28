@@ -31,11 +31,23 @@ Ctrl-Alt-Del. PID 1 keeps mounts, reaping, and respawning td-svc.
 
 ## 2. Hard invariants
 
-**I1. No `unsafe`, ever.** The crate `#![forbid(unsafe_code)]`s. Every
-capability td-svc needs is reachable through safe `std`; where that required
-a non-obvious route, §4 records which. td-svc is deliberately *not* a
-target-side unsafe exception, and adding one would be an AGENTS.md
-amendment.
+**I1. One `unsafe`, and it is `kill(2)`.** The crate `#![deny(unsafe_code)]`s
+— `deny`, not `forbid`, because `sys.rs` carries a single scoped `#[allow]` on
+the `syscall` body and `forbid` cannot be relaxed from the inside. Every OTHER
+capability td-svc needs is reachable through safe `std`; where that required a
+non-obvious route, §4 records which.
+
+This was `forbid` until the supervisor stopped shelling out to `/bin/kill`.
+The exec was not free of risk, it just moved the risk somewhere unguarded: the
+ability to stop anything became a runtime dependency on a third-party
+multicall being present at an absolute path and reading `-<pgid>` as a group
+rather than a flag, and nothing tied the two together, so removing that applet
+from the image would have disarmed every `stop`, every `restart` and the whole
+ordered teardown with no build-time complaint. It also cost a `fork`+`exec`
+per signal during shutdown, and made seven of this crate's stop-path tests
+skip on a host without `/bin/kill` — the code most needing coverage, least
+often run. One confined syscall is the smaller surface, and `main.rs`'s
+confinement tests hold it to one. A SECOND is an AGENTS.md amendment.
 
 **I2. No `pre_exec`, ever.** td-svc is multithreaded (log drains, waiters).
 A `pre_exec` closure runs between `fork` and `exec` in a multithreaded
@@ -44,13 +56,29 @@ or a lock another thread held at fork time, deadlocks the child. Everything
 needed is reachable through `Command`'s own safe setters, which `std`
 implements inside its async-signal-safe post-fork path.
 
-**I3. Liveness is read from `/proc`, never inferred from an exit status.**
-`kill -0` reports through an exit code, so a spawn failure, an ENOENT, or a
-rejected argv is indistinguishable from ESRCH — i.e. from "not running". A
-liveness test that reads *any* failure as "gone" would declare a live
-service dead and let the teardown unmount underneath it. `/proc` fails
-closed: unreadable is an error, not an emptiness. `kill(1)` is used only to
-*send* signals, and even its exit status is discarded.
+**I3. Liveness is read from `/proc`, never inferred from a signal's result.**
+A `kill -0` probe answers through one channel for two questions, so "the
+target is gone" is indistinguishable from "the signal was refused" — and,
+when it was a `kill(1)` exit code, from a spawn failure, an ENOENT, or a
+rejected argv as well. A liveness test that reads *any* failure as "gone"
+would declare a live service dead and let the teardown unmount underneath it.
+`/proc` fails closed: unreadable is an error, not an emptiness. `kill(2)` is
+used only to *send* signals. Its one policy — that **ESRCH reads as success**
+— follows from the same rule rather than bending it: the target may die
+between the `/proc` read that chose it and the signal, so "nothing was there"
+is not news about liveness and must not be reported as a failure. Every other
+errno is, because a signal that could not be sent means the stop it was part
+of never happened.
+
+Two targets are refused outright, before the syscall: `0` and `-1`. `kill(2)`
+accepts both and means by them something td-svc never does — `0` is the
+caller's own process group, and `-1` is a broadcast to every process this one
+may signal, which is *not* "process group 1" however it was arrived at.
+Neither is reachable by naming it; both are reachable by ARITHMETIC, because a
+containment is signalled as `-pgid` and a pgid that read back as 1 negates
+into the broadcast. Nothing downstream would report it, because the signal
+succeeds. The refusal lives in `send_signal` rather than in the callers: that
+is the one point every signal passes through.
 
 **I4. A service is stopped only when both its leader is reaped and its
 containment (§4) is empty.** Neither half suffices. An unreaped
@@ -207,7 +235,7 @@ port, so it passes while the real listener is dead.
 | capture output | `Stdio::piped()` + a drain thread per stream |
 | service on a real tty | `Stdio::from(File)` |
 | own process group | `CommandExt::process_group(0)` — **not for `tty=`**, see below |
-| signal a service | exec `/bin/kill -TERM -<pgid>` / `-KILL -<pgid>` |
+| signal a service | `kill(2)` via `sys::kill`, negative target for a group (§2 I1) |
 | liveness / membership | scan `/proc/*/stat` fields 5 (pgrp), 6 (session), 7 (tty_nr), 3 (state) |
 | control channel | `std::os::unix::net::UnixListener` |
 | Ctrl-Alt-Del | write `/proc/sys/kernel/ctrl-alt-del` and `/proc/sys/kernel/cad_pid` |
@@ -729,17 +757,67 @@ needs to **die, observably**. td-svc:
    other order leaves a window in which a press still hard-resets;
 2. spawns `td-svc cad-sentinel` with a pipe on its stdin, **retaining the
    write end**, so the sentinel's `read` blocks rather than seeing EOF;
-3. writes the sentinel's pid to `cad_pid`. A failed *write* of ESRCH means
-   the sentinel is already gone — retry. A successful write and read-back
-   prove only that the kernel stored the pid, not that the sentinel lives;
-   liveness comes from `try_wait`;
-4. watches it like any other child. Death by **SIGINT specifically** is the
-   press; any other death is a bug to log and re-arm from.
+3. writes the sentinel's pid to `cad_pid`, reading it back. A failed *write*
+   of ESRCH means the sentinel died between spawn and here, and is reported
+   as such rather than retried in place: the answer is a whole fresh arming,
+   which is what the re-arm path already does. A successful write and
+   read-back prove only that the kernel stored the pid, not that the sentinel
+   lives; liveness comes from the watcher below;
+4. watches it like any other child — a thread blocked in `wait`, so a death
+   *wakes* the event loop rather than being noticed on its next pass, which
+   can be minutes out when a crash-looper sits at the backoff cap. Death by
+   **SIGINT specifically** is the press; any other death is a bug to log and
+   re-arm from.
 
 Re-arming is required after each press — `cad_pid` holds a reference to the
 reaped sentinel's `struct pid`, so delivery finds no task until a new pid is
 written — and is suppressed once a shutdown is in flight, so a second press
-cannot restart the sequence.
+cannot restart the sequence. Two things shape it:
+
+- **It is scheduled, not immediate, and backs off.** A sentinel that dies for
+  a persistent reason dies again as fast as it can be spawned; re-arming
+  inline made that a fork loop that starved the event loop and filled the
+  console. It rides `backoff::delay`, the same curve a crash-looping service
+  gets, so repeated failure settles at `backoff::CAP` instead. The pending
+  re-arm is a wake reason like any retry — the machine is unarmed *and* the
+  kernel's hard reset is off until it fires, so the loop must not sit on the
+  channel through it. The count is CONSECUTIVE: a sentinel that lived at
+  least `backoff::MIN_UPTIME` clears it, the same evidence and the same
+  threshold that clears a service's restart count. Without that it only ever
+  grows, and one unrelated death hours later is answered at the cap — five
+  minutes unarmed for a fault that has nothing to do with the boot-time ones.
+  A timer already pending when a shutdown begins is DROPPED rather than
+  fired: refusing to schedule new ones cannot retract one already made, and
+  firing it would spawn a sentinel into a teardown whose walk is computed.
+- **A death is only news about the sentinel currently held.** Retiring one is
+  done by closing its pipe, so every re-arm leaves the previous sentinel's
+  watcher about to report a death. Acting on that report would drop the
+  sentinel just armed, whose watcher then reports *its* death — an unbounded
+  loop that forks a process per turn and in which every sentinel is correctly
+  armed at the moment it is destroyed. The pid in the event is what closes it.
+
+A press whose shutdown is **refused** re-arms too. The arming is spent either
+way, but if `begin_shutdown` fails, nothing has been stopped and the machine
+is still live — now catching no presses while the kernel's own hard reset is
+disabled, which is worse than either behaviour this section chooses between.
+
+Arming that fails **part way** is the same hazard, so it is handled the same
+way. Once step 1 has taken, the reset is off; every later failure therefore
+schedules another attempt rather than giving up. Step 1 failing is the one
+exception, and only when the sysctl is *absent*: on the current kernel that is
+the ordinary case and the file will not appear later, so retrying it would be
+a timer that can only fail. A sysctl that is present and refuses the write is
+retried like anything else.
+
+Two consequences for the sentinel spawned along the way. It must be **reaped**
+— td-svc is not PID 1, and a dropped `Child` is never waited on, so an
+abandoned sentinel is a zombie for the supervisor's lifetime. And the watcher
+thread is therefore started *before* step 3, so that from that point the
+reaping is already somebody's job and a failure need only close the pipe. The
+one path that spawns a sentinel with no watcher to hand it to is a thread that
+would not start, which reaps it in place; the child is passed to the watcher
+through a slot rather than moved into the closure, because `Builder::spawn`
+consumes the closure whether or not the thread starts.
 
 **Two honest limits.** The trigger is not authenticated: any root process
 can `kill -INT` the sentinel, so the console should say "shutdown requested
@@ -748,10 +826,51 @@ via CAD sentinel", not "Ctrl-Alt-Del pressed". And on td's current
 `ctrl_alt_del()` has no caller at all — the mechanism is testable and
 correct, but a real key press needs a separate kernel-config increment.
 
-Testing separates what is proven from what is not: the **arming** is
-verified by reading both sysctls back; the **reaction** by `kill -INT` on
-the sentinel; the kernel path joining them is *not* covered, and only a
-VT-enabled `sendkey` test would cover it.
+Testing separates what is proven from what is not, and the split is
+deliberate rather than a gap someone forgot to close:
+
+- **Arming** is proven, and proven to *happen*. Both writers read the sysctl
+  back and report a value that did not take as a failure, because the write
+  SUCCEEDS either way and nothing else distinguishes an armed machine from one
+  that will hard-reset with `/var` mounted. The mismatch branch is exercised
+  against `/dev/null`, which is exactly that shape — the write returns `Ok`
+  and the read-back gives nothing. Separately, a test runs the real `arm_cad`
+  and asserts both sysctls hold what they should and that the runtime is
+  holding a sentinel: every other test here starts from a *death*, and an
+  `arm_cad` that quietly gave up on every path would satisfy all of them.
+- **The reaction** is proven: a sentinel death by SIGINT begins a reboot, any
+  other death does not, a death arriving once a teardown is already in flight
+  neither restarts the sequence nor re-arms, a *retired* sentinel's death —
+  including a SIGINT — changes nothing, a refused shutdown still re-arms, and
+  repeated failure schedules rather than spins.
+- **The sentinel applet** is proven, and it needs saying where: a unit test
+  cannot run it, because under a test harness `current_exe` is libtest, which
+  reads `cad-sentinel` as a filter and exits. So the applet is covered twice
+  over instead. In-crate, the read-to-EOF shape it is built from is driven
+  against a real pipe — held, it must not finish; closed, it must finish —
+  and `route()` is asserted to map `cad::SENTINEL_VERB`, since a verb that
+  stopped routing would make every arming "succeed" into a sentinel that
+  exits at once. End to end, a `td-svc-test` leg runs the SHIPPED static
+  binary against a FIFO with the write end held on fd 9, which is td-svc's
+  own mechanism: it must still be alive and not a zombie after two seconds,
+  and must exit 0 once the fd closes.
+- **The syscall itself** is proven, which the confinement tests cannot do:
+  they assert things about `sys.rs`'s *text*, and a `kill` that returned
+  `Ok(())` without issuing anything satisfies all of them and every stop
+  td-svc performs. Signal 0 is the kernel's own probe for this — it delivers
+  nothing and runs the existence and permission checks — so the wrapper is
+  exercised against our own pid, against a pid above the kernel's ceiling
+  (ESRCH), and against an invalid signal number (EINVAL, the one refusal that
+  does not depend on whether the suite runs as root).
+- **The kernel path joining them is not covered.** `ctrl_alt_del()` delivering
+  SIGINT to `cad_pid` is taken on the kernel's word; only a VT-enabled
+  `sendkey` test would close it, and on td's `allnoconfig` kernel there is no
+  caller to test.
+
+Because the sysctl paths are `Runtime` fields rather than the constants used
+directly, the tests cannot reach the real ones — a suite that did would disarm
+Ctrl-Alt-Del on the machine running it and point that kernel at a pid
+belonging to the test harness.
 
 ## 10. Status
 
@@ -811,10 +930,19 @@ invariant test that used to demand each initiator run `/etc/shutdown` itself
 now demands the opposite, because the teardown became a sequence only td-svc
 knows.
 
-Ctrl-Alt-Del arming and log capture land subsequently, in that order.
-Sections above describe the completed design; anything not yet built is
-specified here so the later landings implement a reviewed target rather than
-an improvised one.
+Landing 5 (this one) armed Ctrl-Alt-Del and moved signalling in-crate. The
+supervisor now issues `kill(2)` itself rather than exec'ing the uutils
+`/bin/kill` — §2 I1 records why that is the smaller surface, not the larger —
+and arms a sentinel at startup. Re-arming is for a sentinel that *broke*, and
+for a press whose shutdown was refused; a press that lands begins a teardown
+and wants no new sentinel. It is scheduled on `backoff::delay` rather than run
+inline, and keyed to the sentinel's pid — §9 records the two loops those two
+choices close. td-svc is consequently the fifth target-side unsafe exception
+AGENTS.md lists, for exactly one syscall.
+
+Log capture (§7) is what remains. Sections above describe the completed
+design; anything not yet built is specified here so the later landing
+implements a reviewed target rather than an improvised one.
 
 ### A table with no units, and the rescue td-init has but td-svc does not
 
