@@ -35,6 +35,11 @@ pub struct Unit {
     pub restart: Restart,
     /// The terminal this unit owns, if any.
     pub tty: Option<String>,
+    /// Where this unit's output is captured, if anywhere.
+    pub log: Option<String>,
+    /// `console=yes`: copy captured lines to `/dev/console` as well. Only
+    /// meaningful with `log=`, and refused without it.
+    pub console: bool,
     pub timeout: Option<Duration>,
     pub ready: Vec<String>,
     pub ready_timeout: Duration,
@@ -62,6 +67,8 @@ impl Default for Unit {
             requires: Vec::new(),
             restart: Restart::Never,
             tty: None,
+            log: None,
+            console: false,
             timeout: None,
             ready: Vec::new(),
             ready_timeout: DEFAULT_READY_TIMEOUT,
@@ -277,6 +284,40 @@ pub fn parse(text: &str) -> (Vec<Unit>, Vec<String>) {
     if let Some(unit) = current.take() {
         finish(unit, stanza, &mut units, &mut problems);
     }
+    // Two units sharing one `log=` is the exact race §7 forbids for restarts,
+    // reached across units instead: two sinks, two writer threads, two size
+    // counters and two rotators on one file — both rename, and one reopens a
+    // file the other has already moved. Refused where duplicate unit names
+    // already are, because this needs the whole table to see.
+    let mut seen: Vec<(&str, &str)> = Vec::new();
+    let mut clashes: Vec<String> = Vec::new();
+    for unit in &units {
+        let Some(path) = unit.log.as_deref() else {
+            continue;
+        };
+        let prior = seen
+            .iter()
+            .position(|(p, _)| *p == path)
+            .and_then(|i| seen.get(i))
+            .map(|(_, first)| *first);
+        match prior {
+            Some(first) => clashes.push(format!(
+                "{}: log={path} is already used by '{first}'; two writers on one \
+                 file rotate it out from under each other",
+                unit.name
+            )),
+            None => seen.push((path, &unit.name)),
+        }
+    }
+    if !clashes.is_empty() {
+        let named: Vec<&str> = clashes
+            .iter()
+            .filter_map(|c| c.split(':').next())
+            .collect();
+        units.retain(|u| !named.iter().any(|n| *n == u.name));
+        problems.extend(clashes);
+    }
+
     (units, problems)
 }
 
@@ -327,23 +368,34 @@ fn apply(unit: &mut Unit, key: &str, value: &str, stanza: &mut Stanza) -> Result
             }
             unit.tty = Some(value.to_string());
         }
-        // Known keys with no implementation YET. Named rather than left to the
-        // "unknown key" arm so the message says which landing brings them, and
-        // REJECTED rather than accepted-and-ignored: a table that takes `log=`
-        // while output still goes to td-svc's stderr promises a file that will
-        // not exist.
-        "log" | "console" => {
-            return Err(format!(
-                "'{key}' arrives with log capture; it is not implemented yet and \
-                 would silently do nothing"
-            ))
+        "log" => {
+            // An absolute path, because the value names a file the supervisor
+            // opens: a relative one would resolve against whatever directory
+            // PID 1 happened to leave td-svc in.
+            if !value.starts_with('/') {
+                return Err("log= needs an absolute path".into());
+            }
+            unit.log = Some(value.to_string());
         }
+        "console" => unit.console = parse_bool(value)?,
         "timeout" => unit.timeout = Some(parse_duration(value)?),
         "ready-timeout" => unit.ready_timeout = parse_duration(value)?,
         "stop-timeout" => unit.stop_timeout = parse_duration(value)?,
         other => return Err(format!("unknown key '{other}'")),
     }
     Ok(())
+}
+
+/// `yes`/`no`, and nothing else.
+///
+/// No `true`/`1`/`on` synonyms: every spelling admitted is a spelling the next
+/// reader has to know, and a rejected value says what it wanted.
+fn parse_bool(value: &str) -> Result<bool, String> {
+    match value {
+        "yes" => Ok(true),
+        "no" => Ok(false),
+        other => Err(format!("expected yes or no, got '{other}'")),
+    }
 }
 
 /// Per-unit checks that need the whole stanza, run as it closes.
@@ -364,6 +416,23 @@ fn finish(unit: Unit, stanza: Stanza, units: &mut Vec<Unit>, problems: &mut Vec<
         problems.push(format!(
             "{name}: a console unit (tty=) may not declare requires= — the console is never skippable"
         ));
+        ok = false;
+    }
+    // DESIGN.md §7. A captured stream is a PIPE, and a pipe is not a terminal:
+    // the shell behind a getty would lose job control, and the greeter would
+    // come up subtly broken rather than obviously so.
+    if unit.is_console() && unit.log.is_some() {
+        problems.push(format!(
+            "{name}: tty= and log= are mutually exclusive — a captured stream is a pipe, \
+             and job control needs a terminal"
+        ));
+        ok = false;
+    }
+    // Without capture there is no line to copy, and a service that inherits
+    // td-svc's stderr already reaches the console. Accepting this would be the
+    // accepted-and-ignored key the table forbids.
+    if unit.console && unit.log.is_none() {
+        problems.push(format!("{name}: console= needs log=; there is nothing to copy"));
         ok = false;
     }
     // A unit cannot require itself: that is a cycle stated in one line, and
@@ -488,19 +557,101 @@ mod tests {
         assert_eq!(units[0].after, ["netup"]);
     }
 
-    /// A key whose behaviour has not landed is REFUSED, not accepted and
-    /// ignored. `log=` in a table while output still goes to td-svc's stderr
-    /// promises a file that will never exist.
+    /// `log=` names where output is captured, and `console=` copies it.
     #[test]
-    fn keys_whose_implementation_has_not_landed_are_refused() {
-        for key in ["log=/var/log/g.log", "console=yes"] {
-            let (units, problems) = parse(&format!("[g]\ntype=daemon\nexec=/x\n{key}\n"));
-            assert!(units.is_empty(), "{key} was admitted");
+    fn a_unit_can_declare_where_its_output_goes() {
+        let (units, problems) = parse(
+            "[g]\ntype=daemon\nexec=/x\nlog=/var/log/svc/g.log\nconsole=yes\n",
+        );
+        assert!(problems.is_empty(), "{problems:?}");
+        assert_eq!(
+            units.first().and_then(|u| u.log.as_deref()),
+            Some("/var/log/svc/g.log")
+        );
+        assert_eq!(units.first().map(|u| u.console), Some(true));
+    }
+
+    /// A relative `log=` would resolve against whatever directory PID 1 left
+    /// td-svc in, which is not a place a table can name.
+    #[test]
+    fn a_relative_log_path_is_refused() {
+        let (units, problems) = parse("[g]\ntype=daemon\nexec=/x\nlog=var/g.log\n");
+        assert!(units.is_empty(), "a relative log path was admitted");
+        assert!(
+            problems.iter().any(|p| p.contains("absolute")),
+            "{problems:?}"
+        );
+    }
+
+    /// `console=` takes yes or no, and says so when it does not get one.
+    #[test]
+    fn console_takes_only_yes_or_no() {
+        for value in ["true", "1", "on", ""] {
+            let (units, problems) = parse(&format!(
+                "[g]\ntype=daemon\nexec=/x\nlog=/var/g.log\nconsole={value}\n"
+            ));
+            assert!(units.is_empty(), "console={value} was admitted");
             assert!(
-                problems.iter().any(|p| p.contains("not implemented yet")),
-                "{key}: {problems:?}"
+                problems.iter().any(|p| p.contains("expected yes or no")),
+                "console={value}: {problems:?}"
             );
         }
+    }
+
+    /// Two units may not share one `log=`.
+    ///
+    /// The same race the module refuses for restarts, reached across units
+    /// instead: two sinks, two writer threads, two size counters and two
+    /// rotators on one file.
+    #[test]
+    fn two_units_may_not_write_to_the_same_log() {
+        let (units, problems) = parse(
+            "[a]\ntype=daemon\nexec=/x\nlog=/var/log/one.log\n\n\
+             [b]\ntype=daemon\nexec=/y\nlog=/var/log/one.log\n",
+        );
+        assert!(
+            !units.iter().any(|u| u.name == "b"),
+            "the second claimant on one log file was admitted"
+        );
+        assert!(
+            problems.iter().any(|p| p.contains("already used by")),
+            "{problems:?}"
+        );
+
+        // Different paths are of course fine.
+        let (units, problems) = parse(
+            "[a]\ntype=daemon\nexec=/x\nlog=/var/log/one.log\n\n\
+             [b]\ntype=daemon\nexec=/y\nlog=/var/log/two.log\n",
+        );
+        assert!(problems.is_empty(), "{problems:?}");
+        assert_eq!(units.len(), 2);
+    }
+
+    /// DESIGN.md §7: a captured stream is a pipe, and job control needs a
+    /// terminal. Accepting both would produce a greeter that comes up subtly
+    /// broken instead of obviously so.
+    #[test]
+    fn a_console_unit_may_not_also_be_captured() {
+        let (units, problems) =
+            parse("[g]\ntype=daemon\nexec=/x\ntty=ttyS0\nlog=/var/log/g.log\n");
+        assert!(units.is_empty(), "tty= and log= were admitted together");
+        assert!(
+            problems.iter().any(|p| p.contains("mutually exclusive")),
+            "{problems:?}"
+        );
+    }
+
+    /// `console=yes` with nothing captured is the accepted-and-ignored key the
+    /// table forbids: there is no line to copy, and inheriting td-svc's stderr
+    /// already reaches the console.
+    #[test]
+    fn copying_to_the_console_needs_something_to_copy() {
+        let (units, problems) = parse("[g]\ntype=daemon\nexec=/x\nconsole=yes\n");
+        assert!(units.is_empty(), "console= without log= was admitted");
+        assert!(
+            problems.iter().any(|p| p.contains("needs log=")),
+            "{problems:?}"
+        );
     }
 
     /// `/dev/` + "" is a directory. Left to spawn time the only symptom is a

@@ -130,7 +130,8 @@ exec=/bin/sshd serve --listen 0.0.0.0:22 --host-key <KEY> --authorized-keys <AUT
 after=netup,td-firstboot
 ready=/bin/td-netd reach 127.0.0.1 22
 ready-timeout=30
-log=/var/log/svc/sshd.log   # rejected until log capture lands — see below
+log=/var/log/svc/sshd.log
+console=no
 
 [greeter]
 type=daemon
@@ -141,8 +142,8 @@ restart=always
 ```
 
 Keys: `type` (`oneshot` | `daemon`), `exec`, `after`, `requires`, `restart`
-(`always` | `on-failure` | `never`), `tty`, `timeout`, `ready`,
-`ready-timeout`, `stop-timeout`.
+(`always` | `on-failure` | `never`), `tty`, `log`, `console` (`yes` | `no`),
+`timeout`, `ready`, `ready-timeout`, `stop-timeout`.
 
 **Nothing is accepted-and-ignored.** A key the supervisor would silently
 drop reads in the table as a guarantee it does not make, so each is
@@ -150,11 +151,14 @@ rejected instead:
 
 - a key that does not apply to the unit's `type` — `ready=` and `restart=`
   on a `oneshot`, `timeout=` on a `daemon`;
-- a key whose behaviour has not LANDED — `log=` and `console=` arrive with
-  log capture and are refused by name until then, so `log=` never names a
-  file that will not exist. (When they land, so does the rule that `tty=`
-  and `log=` are mutually exclusive: a pipe would break job control on a
-  terminal.)
+- a key whose value cannot be honoured — a relative `log=` would resolve
+  against whatever directory PID 1 left td-svc in, and `console=` takes
+  `yes` or `no` and no synonyms, because every spelling admitted is one the
+  next reader has to know;
+- a PAIR that cannot both be honoured — `tty=` with `log=` (a captured
+  stream is a pipe and job control needs a terminal), and `console=yes`
+  without `log=` (there is nothing to copy, and a service that inherits
+  td-svc's stderr already reaches the console);
 - a key whose *value* was refused — which is why one bad key fails its
   whole stanza rather than leaving the unit admitted with that key's
   default. A refused `type=` used to run the unit as the wrong kind.
@@ -525,24 +529,119 @@ occurrence of a *new* diagnostic, not only repeats of an old one.
 
 Drain threads must never block the service, which rules out writing straight
 through a shared writer — a stalled write backs up into the pipe and blocks
-the service before any error surfaces. Drains feed a bounded per-service
-queue emptied by one writer thread; when the queue is full, lines are
-**dropped and counted**, with a `... N lines dropped` marker when it drains.
+the service before any error surfaces. A service that stops making progress
+because its LOG is slow is a worse failure than losing the log. Drains feed a
+bounded per-service queue emptied by one writer thread; when the queue is
+full, lines are **dropped and counted**, with a `... N lines dropped` marker
+written where the gap actually is. `CAPACITY` is 1024 lines: unbounded would
+move the failure from "the log lost lines" to "td-svc grew until the machine
+died", and td-svc is the one child PID 1 has that must not do that.
 
-Rotation is by size, N bytes × M generations. `/var` is a persistent Btrfs
-volume and an unbounded log is a way to fill it.
+**One writer per SERVICE, not per instance.** A restarting daemon would
+otherwise acquire a second writer with its own handle on the same path, and
+two writers rotating one file race — both rename, and one then reopens a file
+the other has already moved. The queue and its writer are created on first
+spawn and reused; each new instance's drains push into the queue already
+there. Drains ARE per instance and end at EOF.
+
+Rotation is by size, `MAX_BYTES` (256 KiB) × `GENERATIONS` (4), a ceiling of
+1.25 MiB per service. `/var` is a persistent Btrfs volume and an unbounded log
+is a way to fill it — at which point every service that writes anywhere stops
+working, which is a far bigger outage than a truncated log. The live file is
+closed BEFORE the renames: writing through a handle whose name has moved
+appends to the rotated generation, so the live file would stay empty and the
+cap would never bind again. A single line larger than the whole budget is
+written anyway rather than rotating forever trying to make room for it. The
+file is opened before the size is consulted, because the size of a PERSISTED
+log is only known once it has been stat'd: a supervisor restarting onto an
+already-full file would otherwise append one line to it before the first
+rotation, and if that were the only line it wrote the file would stay over the
+ceiling for the life of the boot.
+
+**Neither the reader nor the mode is left to the producer.** `read_line` is
+unusable on both counts: it fails on output that is not UTF-8, so a service
+printing a binary blob would end its own capture, and it has no length bound,
+so a service printing without newlines would allocate until the machine died.
+Invalid bytes are replaced and lines longer than 8 KiB are split. The file is
+opened 0600 and a directory `log=` names is created 0700, for the reason the
+control socket and the eviction record already state: td-svc inherits PID 1's
+umask, which PID 1 never sets, so `create_dir_all`'s `0777 & ~umask` would
+leave anyone able to replace the file td-svc then appends to.
+
+**No writer means no pipe.** The pipes are wired only once the capture exists,
+which is why the capture is created BEFORE the spawn rather than after it. A
+pipe td-svc holds and never reads is the worst outcome this feature has
+available: the service blocks in `write(2)` the moment it fills the buffer,
+which is precisely the wedge the bounded queue exists to prevent. Without a
+writer the unit inherits td-svc's own stdio, exactly as it did before capture
+existed — degraded, but running. (A DRAIN that cannot start is past that
+point: the pipe is already wired, so its stream is dropped and the service
+gets EPIPE. That is the better of the two failures still available.)
+
+**A reload retires a capture it no longer owns.** Two cases, both of which
+would otherwise leave a writer waiting forever on a queue nothing can reach —
+still holding the `/var` descriptor, and no longer reachable from `captures()`
+for `close_logs` to stop. A service DROPPED by a reload is the last holder of
+its handle. A service whose `log=` or `console=` CHANGED is keyed to a
+destination that is no longer the one the table names, so keeping it would send
+output to the previous file and make the reload silently not apply; it is
+retired and the next start opens the new one. Retiring does not wait for the
+writer: the main loop is answering a control request, and a wedged filesystem
+must not hold the supervisor there.
+
+**Two units may not share one `log=`.** The same race this module refuses for
+restarts, reached across units instead — two sinks, two writer threads, two
+size counters, two rotators on one file. It needs the whole table to see, so it
+is refused where duplicate unit names already are.
+
+**The queue is bounded in BYTES as well as lines.** A line count is not a
+memory bound: a drained line can be `MAX_LINE` plus whatever the reader had
+buffered, and a lossy conversion of non-UTF-8 input trebles it, so 1024 lines
+is tens of megabytes per service in the worst case — reachable by any service
+printing binary faster than a slow `/var` drains. `CAPACITY_BYTES` (1 MiB) is
+what makes the claim above true.
+
+**The log path is opened `O_NOFOLLOW`.** The modes protect only what td-svc
+CREATES, so a `log=` naming a file inside a pre-existing writable directory is
+otherwise a way to have root-owned service output appended to a file of
+somebody else's choosing. Refusing to follow the link is cheaper than reasoning
+about which directories are safe.
+
+**A sink that cannot write says so once.** Latched, not rate-limited: a
+read-only or full `/var` fails on every line, and a complaint per line would
+scroll the console with the message that explains it. Once is what the reader
+needs, and the log's own absence is the rest of the evidence.
+
+`console=yes` copies each line to `/dev/console`, prefixed with the service
+name so a console carrying several services can be read. Each copy is ONE
+`write_all` of one buffer: `writeln!` issues a write per format fragment, and
+two copying services would interleave mid-line, defeating the prefix that makes
+a shared console readable. The shipped sshd sets it — capture alone would take
+its failures out of the serial output the boot oracle prints when sshd is why
+the boot failed. It is refused without
+`log=`: there is nothing to copy, and a service that inherits td-svc's stderr
+already reaches the console.
 
 Two ordering rules:
 
 - **Close every `/var` log handle before `/etc/shutdown` runs.** `umount
   /var` fails EBUSY against an open file, `/etc/shutdown` withholds its
   marker on a failed unmount, and the boot oracle greps for that marker — so
-  a stray handle presents as a mount bug. This is best-effort by nature: a
-  writer wedged in `write(2)` on a stalled filesystem still holds its fd
-  after a deadline-join abandons it. The marker tripwire is what catches
-  that case.
-- **Never join a drain thread without a deadline.** A descendant holding the
-  pipe write end keeps it open after the leader exits.
+  a stray handle presents as a mount bug. `close_logs` asks every writer to
+  finish and waits `LOG_CLOSE_GRACE` (3s) for all of them together, then
+  proceeds regardless and NAMES what would not let go. Best-effort by
+  nature: a writer wedged in `write(2)` on a stalled filesystem still holds
+  its fd after the deadline abandons it, and blocking the shutdown on it
+  would trade a lost log for a machine that never powers off. The marker
+  tripwire is what catches that case, and the named service is what saves
+  the next reader from diagnosing it as a mount bug.
+- **A drain thread is never joined at all.** The original rule said "not
+  without a deadline"; building it showed there is nothing to wait for. A
+  descendant that inherited the pipe write end holds it open after the
+  leader exits, so the drain is blocked in `read(2)` on a process td-svc
+  does not supervise and cannot signal. It is left running and the writer is
+  stopped instead — the writer is the one that holds the `/var` fd, which is
+  the only part of this the unmount cares about.
 
 `tty=` and `log=` are mutually exclusive: a pipe would break job control. A
 `tty=` service's stderr points at `/dev/console` so its own startup failures
@@ -940,7 +1039,7 @@ inline, and keyed to the sentinel's pid — §9 records the two loops those two
 choices close. td-svc is consequently the fifth target-side unsafe exception
 AGENTS.md lists, for exactly one syscall.
 
-Landing 6 (this one) is the supervisor-restart eviction contract §11
+Landing 6 is the supervisor-restart eviction contract §11
 describes: td-svc records what it started under `/run` and, on startup,
 kills whatever a previous instance left running before starting anything.
 Without it every td-svc death produced a machine running two of
@@ -990,9 +1089,11 @@ reaching this state takes a signal or an abort.
 That is a reason it is unlikely, not a reason it was left unhandled. The
 fix is **eviction**, and it is described in §11.
 
-One thing the next landing must resolve before this document is fully
-built: `log=` / `console=` are refused by name until log capture exists,
-so the `tty=`/`log=` exclusion has nothing to enforce yet (§3).
+Landing 7 (this one) builds §7, and with it this document describes
+nothing that is not implemented. `log=` and `console=` are accepted,
+the `tty=`/`log=` exclusion has something to enforce, and the shipped
+table captures sshd — the one service that talks to the network, and so
+the one whose output a failed login has to be reconstructed from.
 
 The shipped greeter's containment reaching only its wrapper process is
 RESOLVED, and not the way this document previously said.

@@ -1371,6 +1371,8 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
     assert_target!("td-svc/src/cad.rs", "recipe-checks");
     assert_target!("td-svc/src/evict.rs", "check");
     assert_target!("td-svc/src/evict.rs", "recipe-checks");
+    assert_target!("td-svc/src/logs.rs", "check");
+    assert_target!("td-svc/src/logs.rs", "recipe-checks");
     assert_no_target!("td-svc/DESIGN.md", "check");
     assert_target!("td-svc/clippy.toml", "check");
     assert_target!("td-svc/Cargo.lock", "check");

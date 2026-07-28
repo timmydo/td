@@ -63,6 +63,13 @@ const CONTROL_USAGE: &str = "usage: status [NAME] | start NAME | stop NAME | res
 /// `/etc/shutdown` is unmounting filesystems underneath them.
 const SHUTDOWN_MARKER: &str = "/run/td-svc/shutdown";
 
+/// How long the shutdown waits for log writers to close their files.
+///
+/// Bounded for the same reason every other deadline here is: a writer wedged in
+/// `write(2)` on a stalled filesystem cannot be recovered, and blocking the
+/// shutdown on it trades a lost log for a machine that never powers off.
+const LOG_CLOSE_GRACE: Duration = Duration::from_secs(3);
+
 /// How long every orphan of a previous supervisor gets between TERM and KILL,
 /// TOTAL rather than each: they are signalled together and waited on together,
 /// so a machine with eight wedged services is delayed once, not eight times.
@@ -191,6 +198,11 @@ pub struct Service {
     /// a gate: the complaint says "with its ordering ignored", and waiting on
     /// dependencies the plan already called unsatisfiable would make that false.
     forced: bool,
+    /// This service's log capture, created on its first spawn and kept for the
+    /// life of the supervisor. Per-service and NOT per-instance: a restarting
+    /// daemon would otherwise get a second writer with its own handle on the
+    /// same path, and two writers rotating one file race (§7).
+    log: Option<Arc<crate::logs::Capture>>,
     /// Set when the instance a probe was launched for is gone, so the probe
     /// thread stops forking attempts instead of running out its full timeout.
     cancel: Option<Arc<AtomicBool>>,
@@ -253,6 +265,7 @@ impl Service {
             fast_failures: 0,
             waiting_since: None,
             forced: false,
+            log: None,
             cancel: None,
             stopping: false,
             start_after_stop: false,
@@ -656,7 +669,7 @@ pub fn log(msg: &str) {
 /// scrolling DESIGN.md §6 says the backoff gate exists to prevent. The restart
 /// message is gated and these were not, which is worse than it sounds: the
 /// ungated one is the message that explains WHY.
-fn build(unit: &Unit, report: bool) -> Result<(Command, Vec<String>), String> {
+fn build(unit: &Unit, report: bool, captured: bool) -> Result<(Command, Vec<String>), String> {
     let mut said: Vec<String> = Vec::new();
     let prog = unit.argv.first().ok_or_else(|| "empty exec".to_string())?;
     let mut cmd = Command::new(prog);
@@ -695,6 +708,19 @@ fn build(unit: &Unit, report: bool) -> Result<(Command, Vec<String>), String> {
             cmd.process_group(0);
         }
     }
+    // Captured output goes through pipes rather than td-svc's own stdio. A
+    // `tty=` unit never reaches here with a log: the table refuses the pair,
+    // because a pipe is not a terminal and job control needs one (§7).
+    //
+    // `captured` is the writer EXISTING, not the unit merely asking for one. A
+    // pipe td-svc holds and never reads is the worst outcome available here:
+    // the service blocks in `write(2)` the moment it fills the buffer, which
+    // is precisely the wedge the whole bounded-queue design exists to prevent.
+    // Without a writer the unit inherits td-svc's stdio, exactly as it did
+    // before capture existed.
+    if unit.log.is_some() && captured {
+        cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    }
     Ok((cmd, said))
 }
 
@@ -716,6 +742,18 @@ fn open_tty(path: &str) -> io::Result<std::fs::File> {
         .write(true)
         .custom_flags(O_NOCTTY)
         .open(path)
+}
+
+/// Stop a service's log writer, so it closes its file and exits.
+///
+/// Called whenever a `Service` stops being the thing that owns that capture —
+/// dropped by a reload, or re-pointed at a different destination. Without it
+/// the writer waits on a queue nothing can reach, holding a `/var` descriptor
+/// that `close_logs` no longer reaches and so cannot release.
+fn release_capture(service: &Service) {
+    if let Some(capture) = &service.log {
+        crate::logs::retire(capture);
+    }
 }
 
 /// Hand a terminal to a unit that asked for one.
@@ -856,7 +894,7 @@ const ESRCH: i32 = 3;
 /// event that never arrives — and the unit would sit at `Starting` forever,
 /// blocking its dependents with no diagnostic beyond this one line.
 #[must_use]
-fn spawn_thread<F: FnOnce() + Send + 'static>(what: &str, body: F) -> bool {
+pub fn spawn_thread<F: FnOnce() + Send + 'static>(what: &str, body: F) -> bool {
     // Named so `ps -T` can tell one waiter from another. Sanitised rather than
     // passed through: `Builder::name` PANICS on an interior NUL, and relying on
     // the table's charset validation puts a no-panic guarantee in another
@@ -1170,7 +1208,10 @@ impl Runtime {
         // the loud spawn off the escalation attempt, and no test would notice.
         let report = backoff::should_report(service.fast_failures.saturating_add(1));
 
-        let mut cmd = match build(&unit, report) {
+        // BEFORE the build, because the build decides whether to wire pipes
+        // and that decision has to know whether anything will read them.
+        let captured = self.ensure_capture(index, &unit, report);
+        let mut cmd = match build(&unit, report, captured) {
             Ok((cmd, said)) => {
                 for line in said {
                     log(&line);
@@ -1188,7 +1229,7 @@ impl Runtime {
         }
 
         match cmd.spawn() {
-            Ok(child) => {
+            Ok(mut child) => {
                 let pid = child.id() as i32;
                 let cancel = Arc::new(AtomicBool::new(false));
                 // Read before anything else: field 22 is set at fork, so it is
@@ -1210,6 +1251,10 @@ impl Runtime {
                         _ => None,
                     };
                 }
+                // Drained before the waiter, which MOVES the child: the pipe
+                // ends live on it, and an unread pipe fills and blocks the
+                // service.
+                //
                 // Recorded as soon as the identity is known, and before the
                 // waiter: everything after this point can fail, and a service
                 // that is already RUNNING has to be in the record whether or
@@ -1218,6 +1263,7 @@ impl Runtime {
                 // killed inside it leaves an orphan its successor never hears
                 // about — and it is unclosable, because the pid does not exist
                 // to record until `spawn` returns.
+                self.attach_logs(index, &mut child, &unit);
                 self.persist_started();
                 if !self.watch(child, unit.name.clone(), generation) {
                     self.abandon(index, pid, &unit.name);
@@ -1865,6 +1911,17 @@ impl Runtime {
         // `self.order` is rebuilt from scratch below, so this is the one place
         // a `Service` can be removed without invalidating an index somebody
         // holds.
+        // A dropped `Service` is the last holder of its capture's handle, so
+        // its writer would wait forever on a queue nothing can reach — still
+        // holding the /var descriptor that makes `umount` fail, and no longer
+        // reachable from `captures()` for `close_logs` to stop.
+        for service in self
+            .services
+            .iter()
+            .filter(|s| s.retired && s.pid.is_none() && !s.stopping)
+        {
+            release_capture(service);
+        }
         self.services
             .retain(|s| !(s.retired && s.pid.is_none() && !s.stopping));
 
@@ -1877,6 +1934,14 @@ impl Runtime {
             let mut service = match existing {
                 Some(at) => {
                     let mut service = self.services.remove(at);
+                    // A capture is keyed to the destination it was opened for,
+                    // so one whose `log=`/`console=` changed is retired here:
+                    // keeping it would send output to the previous file and
+                    // make the reload silently not apply.
+                    if service.unit.log != unit.log || service.unit.console != unit.console {
+                        release_capture(&service);
+                        service.log = None;
+                    }
                     service.unit = unit;
                     // Declared again, so no longer retired. If the stop this
                     // unit's REMOVAL started is still in flight, the table now
@@ -1911,6 +1976,7 @@ impl Runtime {
         for mut service in leftover {
             if service.pid.is_none() && !service.stopping {
                 log(&format!("{}: no longer in the table", service.unit.name));
+                release_capture(&service);
                 continue;
             }
             retired.push(service.unit.name.clone());
@@ -2245,6 +2311,102 @@ impl Runtime {
                 self.started_path
             ));
         }
+    }
+
+    /// Point this instance's stdout and stderr at the service's capture.
+    ///
+    /// The capture is created on first use and then REUSED across restarts —
+    /// see `Service::log`. Failing to create it is not a start failure: a
+    /// service that runs without its log recorded is a better outcome than a
+    /// service that does not run, which is the same trade `attach_tty` makes
+    /// for a missing terminal.
+    fn ensure_capture(&mut self, index: usize, unit: &Unit, report: bool) -> bool {
+        let Some(path) = unit.log.clone() else {
+            // Nothing asked for; nothing to fail. `build` wires no pipes.
+            return false;
+        };
+        let Some(service) = self.services.get_mut(index) else {
+            return false;
+        };
+        if service.log.is_none() {
+            // `console=yes` copies to the same last-resort terminal every other
+            // diagnostic here uses, opened O_NOCTTY for the same reason: td-svc
+            // must never acquire a controlling terminal as a side effect.
+            let console = if unit.console {
+                match open_tty(CONSOLE) {
+                    Ok(file) => Some(file),
+                    Err(e) => {
+                        if report {
+                            log(&format!("{}: {CONSOLE}: {e}; not copying there", unit.name));
+                        }
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+            let sink = crate::logs::Sink::new(&unit.name, &path, console);
+            match crate::logs::start(&unit.name, sink) {
+                Some(capture) => service.log = Some(capture),
+                None => {
+                    if report {
+                        log(&format!(
+                            "{}: no writer thread for {path}; running it without capture",
+                            unit.name
+                        ));
+                    }
+                    return false;
+                }
+            }
+        }
+        service.log.is_some()
+    }
+
+    /// Hand this instance's pipe ends to the service's drains.
+    ///
+    /// Only reached when `ensure_capture` succeeded, so the streams are only
+    /// present when something is going to read them. A drain thread that
+    /// cannot START drops the stream it was given, closing the read end: the
+    /// service then gets EPIPE rather than blocking forever on a pipe nobody
+    /// empties, which is the better of the two failures available by then.
+    fn attach_logs(&mut self, index: usize, child: &mut Child, unit: &Unit) {
+        let Some(capture) = self
+            .services
+            .get(index)
+            .and_then(|service| service.log.clone())
+        else {
+            return;
+        };
+        if let Some(out) = child.stdout.take() {
+            crate::logs::drain(&unit.name, out, Arc::clone(&capture));
+        }
+        if let Some(err) = child.stderr.take() {
+            crate::logs::drain(&unit.name, err, capture);
+        }
+    }
+
+    /// Every live capture, for the shutdown close.
+    fn captures(&self) -> Vec<Arc<crate::logs::Capture>> {
+        self.services
+            .iter()
+            .filter_map(|service| service.log.clone())
+            .collect()
+    }
+
+    /// Release every `/var` log handle, and name what would not let go.
+    ///
+    /// Split out of `finish_shutdown` so it can be tested — `finish_shutdown`
+    /// execs and does not return, and this is the step that decides whether
+    /// `umount /var` succeeds.
+    fn close_logs(&mut self) -> Vec<String> {
+        let stuck = crate::logs::close_all(&self.captures(), LOG_CLOSE_GRACE);
+        for name in &stuck {
+            log(&format!(
+                "{name}: its log writer did not close in time; if /var will not \
+                 unmount, this is why"
+            ));
+        }
+        stuck
     }
 
     /// Kill whatever a previous supervisor started, before starting anything.
@@ -2620,6 +2782,11 @@ impl Runtime {
     /// and the marker in place, so the handoff still completes if whatever was
     /// wrong is repaired.
     fn finish_shutdown(&mut self, power: Power) -> ! {
+        // BEFORE the teardown, not after: `umount /var` fails EBUSY against an
+        // open file, `/etc/shutdown` withholds its marker on a failed unmount,
+        // and the boot oracle greps for that marker — so one stray descriptor
+        // presents as a mount bug rather than a log one (§7).
+        self.close_logs();
         run_teardown(SHUTDOWN_SCRIPT);
         let applet = power.applet();
         log(&format!("handing off to {applet}"));
@@ -3522,7 +3689,7 @@ mod tests {
                 .clone()
         };
 
-        let (mut loud_cmd, loud_build) = build(&unit, true).unwrap();
+        let (mut loud_cmd, loud_build) = build(&unit, true, false).unwrap();
         let loud_tty = attach_tty(&mut loud_cmd, &unit, true).said;
         assert!(
             !loud_build.is_empty() || !loud_tty.is_empty(),
@@ -3530,7 +3697,7 @@ mod tests {
              gate stuck closed a greeter that can never start explains itself nowhere"
         );
 
-        let (mut quiet_cmd, quiet_build) = build(&unit, false).unwrap();
+        let (mut quiet_cmd, quiet_build) = build(&unit, false, false).unwrap();
         let quiet_tty = attach_tty(&mut quiet_cmd, &unit, false).said;
         assert!(
             quiet_build.is_empty() && quiet_tty.is_empty(),
@@ -5196,6 +5363,270 @@ mod tests {
         );
         drop(live);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn log_scratch(tag: &str) -> String {
+        let dir = format!(
+            "{}/td-svc-capture-{}-{tag}",
+            std::env::temp_dir().display(),
+            std::process::id()
+        );
+        let _ = std::fs::create_dir_all(&dir);
+        dir
+    }
+
+    /// Poll a log until it holds what was asked for, or give up.
+    fn log_reaches(path: &str, wanted: &[&str]) -> String {
+        for _ in 0..500 {
+            let text = std::fs::read_to_string(path).unwrap_or_default();
+            if wanted.iter().all(|w| text.contains(w)) {
+                return text;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        std::fs::read_to_string(path).unwrap_or_default()
+    }
+
+    /// A service with `log=` really has its output captured — through the whole
+    /// path, from `build` wiring a pipe to a line in the file.
+    ///
+    /// BOTH streams: stdout and stderr are separate pipes and separate drains,
+    /// and a service's failures arrive on the one it is easiest to forget.
+    #[test]
+    fn a_captured_service_writes_both_its_streams_to_its_log() {
+        let dir = log_scratch("both");
+        let path = format!("{dir}/a.log");
+        let mut rt = runtime(&format!(
+            "[a]\ntype=oneshot\nexec=/bin/sh -c 'echo to-stdout; echo to-stderr >&2'\nlog={path}\n"
+        ));
+        rt.start_eligible();
+        if rt.lookup("a").and_then(|service| service.pid).is_none() {
+            eprintln!("note: the unit did not spawn here; skipping");
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        }
+        let text = log_reaches(&path, &["to-stdout", "to-stderr"]);
+        assert!(
+            text.contains("to-stdout"),
+            "stdout was not captured: {text:?}"
+        );
+        assert!(
+            text.contains("to-stderr"),
+            "stderr was not captured: {text:?}"
+        );
+        rt.close_logs();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A restart does NOT get a second writer.
+    ///
+    /// Two writers on one path race their rotations: both rename, and one then
+    /// reopens a file the other has already moved. The capture is per SERVICE
+    /// and outlives the instance, so a crash-looping daemon keeps one.
+    #[test]
+    fn a_restarted_service_keeps_the_one_writer_it_already_had() {
+        let dir = log_scratch("restart");
+        let path = format!("{dir}/a.log");
+        let mut rt = runtime(&format!(
+            "[a]\ntype=oneshot\nexec=/bin/sh -c 'echo once'\nlog={path}\n"
+        ));
+        rt.start_eligible();
+        let Some(first) = rt.lookup("a").and_then(|service| service.log.clone()) else {
+            eprintln!("note: the unit did not spawn here; skipping");
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        };
+        // The first instance is reaped before the second starts: leaving it
+        // running would put a stray child behind every run of the suite.
+        if let Some(pid) = rt.lookup("a").and_then(|service| service.pid) {
+            let _ = rt.signal(Containment::Process(pid), crate::sys::SIGKILL);
+        }
+        rt.start(0);
+        let second = rt.lookup("a").and_then(|service| service.log.clone());
+        assert!(
+            second.is_some_and(|s| Arc::ptr_eq(&s, &first)),
+            "the restart created a second writer on the same file"
+        );
+        rt.close_logs();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The shutdown releases every /var handle, and that is what `umount /var`
+    /// needs. Ordering matters as much as the act: this runs BEFORE
+    /// `/etc/shutdown`, which is where the unmount happens.
+    #[test]
+    fn the_shutdown_releases_every_log_handle() {
+        let dir = log_scratch("close");
+        let path = format!("{dir}/a.log");
+        let mut rt = runtime(&format!(
+            "[a]\ntype=oneshot\nexec=/bin/sh -c 'echo hello'\nlog={path}\n"
+        ));
+        rt.start_eligible();
+        if rt.lookup("a").and_then(|service| service.log.clone()).is_none() {
+            eprintln!("note: the unit did not spawn here; skipping");
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        }
+        let _ = log_reaches(&path, &["hello"]);
+        let stuck = rt.close_logs();
+        assert!(stuck.is_empty(), "a writer would not let go: {stuck:?}");
+        let held = std::fs::read_dir("/proc/self/fd")
+            .map(|entries| {
+                entries.flatten().any(|entry| {
+                    std::fs::read_link(entry.path())
+                        .is_ok_and(|t| t == std::path::Path::new(&path))
+                })
+            })
+            .unwrap_or(false);
+        assert!(
+            !held,
+            "a log descriptor outlived the shutdown close; umount /var would fail EBUSY"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A reload that drops a service stops its writer.
+    ///
+    /// The `Service` is the last holder of that handle, so a writer left
+    /// running waits forever on a queue nothing can reach — still holding the
+    /// `/var` descriptor that makes `umount` fail, and no longer reachable
+    /// from `captures()` for the shutdown to stop.
+    #[test]
+    fn a_service_dropped_by_a_reload_takes_its_log_writer_with_it() {
+        let dir = log_scratch("reload-drop");
+        let path = format!("{dir}/a.log");
+        let table = format!("{dir}/table.conf");
+        let _ = std::fs::write(
+            &table,
+            format!("[a]\ntype=oneshot\nexec=/bin/sh -c ':'\nlog={path}\n"),
+        );
+        let mut rt = runtime(&format!(
+            "[a]\ntype=oneshot\nexec=/bin/sh -c ':'\nlog={path}\n"
+        ));
+        rt.table_path = table.clone();
+        rt.start_eligible();
+        let Some(capture) = rt.lookup("a").and_then(|service| service.log.clone()) else {
+            eprintln!("note: the unit did not spawn here; skipping");
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        };
+        // The oneshot has run; its exit event is processed by the loop this
+        // test does not run, so the pid is cleared here. What is being tested
+        // is the reload's disposal of a service that is DOWN and no longer
+        // declared, which is the path that drops the `Service` outright.
+        if let Some(service) = rt.lookup_mut("a") {
+            service.pid = None;
+        }
+        let _ = std::fs::write(&table, "[b]\ntype=oneshot\nexec=/bin/sh -c ':'\n");
+        let reply = rt.control("reload");
+        assert!(!reply.starts_with("error:"), "{reply}");
+        assert!(
+            rt.lookup("a").is_none(),
+            "the dropped unit is still in the table"
+        );
+        // Observed DIRECTLY, not through `close_all` — that stops the writer
+        // itself, so asking through it could not tell a writer the reload
+        // retired from one the question had just stopped.
+        let mut closed = false;
+        for _ in 0..500 {
+            if capture.is_closed() {
+                closed = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            closed,
+            "the dropped service's writer is still running and still holding its file; \
+             the shutdown can no longer reach it to close"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A reload that MOVES a service's log is honoured on the next start.
+    ///
+    /// A capture is keyed to the destination it was opened for, so reusing it
+    /// would keep writing to the previous file and make the reload silently
+    /// not apply.
+    #[test]
+    fn a_reload_that_changes_where_output_goes_retires_the_old_writer() {
+        let dir = log_scratch("reload-move");
+        let first = format!("{dir}/first.log");
+        let second = format!("{dir}/second.log");
+        let table = format!("{dir}/table.conf");
+        let unit = |log: &str| format!("[a]\ntype=daemon\nexec=/bin/sh -c 'sleep 30'\nlog={log}\n");
+        let _ = std::fs::write(&table, unit(&first));
+        let mut rt = runtime(&unit(&first));
+        rt.table_path = table.clone();
+        rt.start_eligible();
+        let Some(before) = rt.lookup("a").and_then(|service| service.log.clone()) else {
+            eprintln!("note: the unit did not spawn here; skipping");
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        };
+
+        let _ = std::fs::write(&table, unit(&second));
+        let reply = rt.control("reload");
+        assert!(!reply.starts_with("error:"), "{reply}");
+        assert!(
+            rt.lookup("a").and_then(|service| service.log.clone()).is_none(),
+            "the capture opened on the OLD path survived the reload; output would keep going there"
+        );
+        let mut closed = false;
+        for _ in 0..500 {
+            if before.is_closed() {
+                closed = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(closed, "the writer on the old path is still running");
+        if let Some(pid) = rt.lookup("a").and_then(|service| service.pid) {
+            let _ = rt.signal(Containment::Process(pid), crate::sys::SIGKILL);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// No writer means NO PIPE. A pipe td-svc holds and never reads is the
+    /// worst outcome this feature has available: the service blocks in
+    /// `write(2)` the moment it fills the buffer, and a service wedged by its
+    /// own logging is exactly what the bounded queue exists to prevent.
+    ///
+    /// The unit then runs with td-svc's own stdio, as it did before capture
+    /// existed — degraded, but running and not blocked.
+    #[test]
+    fn a_unit_whose_writer_could_not_start_gets_no_pipe_to_block_on() {
+        let unit = crate::table::Unit {
+            name: "a".to_string(),
+            argv: vec!["/bin/sh".to_string(), "-c".to_string(), ":".to_string()],
+            log: Some("/var/log/a.log".to_string()),
+            ..Default::default()
+        };
+        // Spawned, because the pipe ends only exist on a real `Child`.
+        // Distinguished from a spawn failure so a missing /bin/sh cannot
+        // report itself as a wiring bug.
+        let piped = |captured: bool| -> Option<(bool, bool)> {
+            let (mut cmd, _) = build(&unit, false, captured).ok()?;
+            let mut child = cmd.spawn().ok()?;
+            let wired = (child.stdout.is_some(), child.stderr.is_some());
+            let _ = child.wait();
+            Some(wired)
+        };
+        let Some(without) = piped(false) else {
+            eprintln!("note: cannot spawn a child here; skipping");
+            return;
+        };
+        assert_eq!(
+            without,
+            (false, false),
+            "a pipe was wired with no writer to empty it; the service would wedge"
+        );
+        // And WITH a writer it is piped, or nothing would be captured at all.
+        assert_eq!(
+            piped(true),
+            Some((true, true)),
+            "a captured unit was not given pipes"
+        );
     }
 
     /// A group whose LEADER is already gone is still evicted.

@@ -102,13 +102,19 @@ pub fn recipe() -> Recipe {
             .into(),
         exec: false,
     });
-    // A key whose behaviour has not landed is REFUSED, not accepted and
-    // ignored — a table that takes log= while output still goes to td-svc's
-    // stderr promises a file that will never exist.
+    // A captured stream is a pipe and job control needs a terminal, so a unit
+    // cannot be both a console and captured (DESIGN.md §7).
     steps.push(Step::WriteFile {
-        path: "{root}/unimplemented-key.conf".into(),
+        path: "{root}/tty-and-log.conf".into(),
         content: "[greeter]\ntype=daemon\nexec=/etc/tty-session\ntty=ttyS0\nlog=/var/log/g.log\n"
             .into(),
+        exec: false,
+    });
+    // Nothing to copy: `console=` without `log=` is the accepted-and-ignored
+    // key the table forbids.
+    steps.push(Step::WriteFile {
+        path: "{root}/console-without-log.conf".into(),
+        content: "[a]\ntype=daemon\nexec=/bin/true\nconsole=yes\n".into(),
         exec: false,
     });
     // A line the parser cannot read has an UNKNOWN intent, so it must fail its
@@ -167,9 +173,12 @@ pub fn recipe() -> Recipe {
                      e=$('{bin}' check -f '{{root}}/skippable-console.conf' 2>&1); \
                      [ $? -ne 0 ] || {{ echo 'check accepted a console unit made skippable by requires= — DESIGN.md I5' >&2; exit 1; }}; \
                      printf '%s\\n' \"$e\" | grep -q 'never skippable' || {{ echo \"the console invariant must be named, got: $e\" >&2; exit 1; }}; \
-                     e=$('{bin}' check -f '{{root}}/unimplemented-key.conf' 2>&1); \
-                     [ $? -ne 0 ] || {{ echo 'check accepted log=, whose behaviour has not landed — it would silently do nothing' >&2; exit 1; }}; \
-                     printf '%s\\n' \"$e\" | grep -q 'not implemented yet' || {{ echo \"an unimplemented key must be named as one, got: $e\" >&2; exit 1; }}; \
+                     e=$('{bin}' check -f '{{root}}/tty-and-log.conf' 2>&1); \
+                     [ $? -ne 0 ] || {{ echo 'check accepted tty= with log= — a captured stream is a pipe, and job control needs a terminal' >&2; exit 1; }}; \
+                     printf '%s\\n' \"$e\" | grep -q 'mutually exclusive' || {{ echo \"the tty=/log= exclusion must be named, got: $e\" >&2; exit 1; }}; \
+                     e=$('{bin}' check -f '{{root}}/console-without-log.conf' 2>&1); \
+                     [ $? -ne 0 ] || {{ echo 'check accepted console= with nothing captured to copy' >&2; exit 1; }}; \
+                     printf '%s\\n' \"$e\" | grep -q 'needs log=' || {{ echo \"console= without log= must be named, got: $e\" >&2; exit 1; }}; \
                      e=$('{bin}' check -f '{{root}}/malformed-line.conf' 2>&1); \
                      [ $? -ne 0 ] || {{ echo 'check accepted a stanza with an unparseable line — the service would run without the requires= it names' >&2; exit 1; }}; \
                      printf '%s\\n' \"$e\" | grep -q 'expected key=value' || {{ echo \"an unparseable line must be named, got: $e\" >&2; exit 1; }}; \
@@ -437,6 +446,63 @@ pub fn recipe() -> Recipe {
         .env("PATH", &post_bootstrap_path()),
     );
 
+    // Log capture, in the SHIPPED binary: a unit with log= has BOTH its
+    // streams captured into the file it names, in a directory td-svc creates
+    // 0700. Rotation and the shutdown close are crate tests — this leg is the
+    // one that runs the real static binary against a real filesystem.
+    steps.push(Step::WriteFile {
+        path: "{root}/capture.conf".into(),
+        content: format!(
+            "[talker]\ntype=oneshot\n\
+             exec={POST_BOOTSTRAP_SH} -c 'echo out-line; echo err-line >&2'\n\
+             log={{root}}/captured/talker.log\n"
+        ),
+        exec: false,
+    });
+    steps.push(
+        Step::run(
+            "{root}",
+            &[
+                POST_BOOTSTRAP_SH,
+                "-c",
+                &format!(
+                    "if mkdir -p /run/td-svc 2>/dev/null; then \
+                         rm -f /run/td-svc/started /run/td-svc/shutdown; \
+                         rm -rf '{{root}}/captured'; \
+                         '{bin}' run -f '{{root}}/capture.conf' >/dev/null 2>&1 & \
+                         p=$!; \
+                         log='{{root}}/captured/talker.log'; \
+                         i=0; \
+                         while [ $i -lt 60 ]; do \
+                             if [ -f \"$log\" ] && grep -q out-line \"$log\" && grep -q err-line \"$log\"; then break; fi; \
+                             i=$((i+1)); sleep 1; \
+                         done; \
+                         kill $p 2>/dev/null; wait $p 2>/dev/null || :; \
+                         [ -f \"$log\" ] || {{ echo 'no log file was created' >&2; exit 1; }}; \
+                         grep -q out-line \"$log\" || {{ echo \"stdout was not captured, log holds: $(cat \"$log\")\" >&2; exit 1; }}; \
+                         : 'stderr is the stream a services failures arrive on, and'; \
+                         : 'the one it is easiest to leave unwired: separate pipe,'; \
+                         : 'separate drain thread.'; \
+                         grep -q err-line \"$log\" || {{ echo \"stderr was not captured, log holds: $(cat \"$log\")\" >&2; exit 1; }}; \
+                         : 'And the directory td-svc created for it is not one'; \
+                         : 'anyone else may drop a file into: PID 1 leaves a'; \
+                         : 'permissive umask, so the mode has to be stated.'; \
+                         d=$(ls -ld '{{root}}/captured' | cut -c1-10); \
+                         case \"$d\" in \
+                             drwx------) : ;; \
+                             *) echo \"the log directory is $d, not drwx------\" >&2; exit 1;; \
+                         esac; \
+                         rm -rf '{{root}}/captured'; \
+                         echo 'the shipped supervisor captured both streams into its log'; \
+                     else \
+                         echo 'note: no writable /run here; capture is covered by the crate tests'; \
+                     fi"
+                ),
+            ],
+        )
+        .env("PATH", &post_bootstrap_path()),
+    );
+
     // Eviction, in the SHIPPED binary: a supervisor that starts with a record
     // of what a PREVIOUS one left running kills it before starting anything.
     // Without this a td-svc death leaves the machine running two of
@@ -567,7 +633,7 @@ pub fn recipe() -> Recipe {
     });
     steps.push(Step::WriteFile {
         path: "{out}/result".into(),
-        content: "PASS: td-svc is a statically-linked ELF64 x86-64 executable (ET_EXEC) with no PT_INTERP and no dynamic NEEDED entry; `check` resolves the shipped boot chain in dependency order (td-firstboot before rootcheck before netup before sshd and the greeter), and refuses — each with a distinct named reason and a non-zero exit — a dependency cycle, a dependency on a unit that does not exist, a console unit made skippable by requires=, a key whose behaviour has not landed (log=), a stanza line that is not key=value, restart= on a oneshot, and an unreadable table; an unknown subcommand exits 2; `td-svc run` supervises for real in the shipped static binary — two oneshots, the second ordered after the first, both spawned, the dependent released only once its dependency settled; where a writable /run lets it, the shipped binary binds the control socket under /run/td-svc and answers ITSELF over it — `status` reports a supervised daemon ready, `stop` drives a restart=always daemon to `stopped` and it is STILL stopped three seconds later (the failure mode being that it comes straight back), `restart` brings it up again, and an unknown unit is named rather than silently accepted; td-svc signals with `kill(2)` itself, so there is no longer an external `kill` whose operand parsing has to be taken on trust, and the teardown leg above drives that in the shipped binary — a restart=always daemon is signalled through its process group and stays down; and the Ctrl-Alt-Del sentinel this landing added blocks for as long as the pipe td-svc holds is open and exits when it is closed, which is the whole arming mechanism\n".into(),
+        content: "PASS: td-svc is a statically-linked ELF64 x86-64 executable (ET_EXEC) with no PT_INTERP and no dynamic NEEDED entry; `check` resolves the shipped boot chain in dependency order (td-firstboot before rootcheck before netup before sshd and the greeter), and refuses — each with a distinct named reason and a non-zero exit — a dependency cycle, a dependency on a unit that does not exist, a console unit made skippable by requires=, tty= together with log= (a captured stream is a pipe, and job control needs a terminal), console= with nothing captured to copy, a stanza line that is not key=value, restart= on a oneshot, and an unreadable table; an unknown subcommand exits 2; `td-svc run` supervises for real in the shipped static binary — two oneshots, the second ordered after the first, both spawned, the dependent released only once its dependency settled; where a writable /run lets it, the shipped binary binds the control socket under /run/td-svc and answers ITSELF over it — `status` reports a supervised daemon ready, `stop` drives a restart=always daemon to `stopped` and it is STILL stopped three seconds later (the failure mode being that it comes straight back), `restart` brings it up again, and an unknown unit is named rather than silently accepted; td-svc signals with `kill(2)` itself, so there is no longer an external `kill` whose operand parsing has to be taken on trust, and the teardown leg above drives that in the shipped binary — a restart=always daemon is signalled through its process group and stays down; the Ctrl-Alt-Del sentinel blocks for as long as the pipe td-svc holds is open and exits when it is closed, which is the whole arming mechanism; and log capture this landing added puts BOTH of a unit's streams into the file its log= names, in a directory td-svc creates drwx------\n".into(),
         exec: false,
     });
     steps.push(Step::Require {

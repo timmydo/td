@@ -22,6 +22,7 @@ mod backoff;
 mod cad;
 mod control;
 mod evict;
+mod logs;
 mod order;
 mod procfs;
 mod supervise;
@@ -713,8 +714,8 @@ mod confinement {
         }
         assert_eq!(
             declared.len(),
-            9,
-            "expected nine modules beside the crate root"
+            10,
+            "expected ten modules beside the crate root"
         );
         // ...and nothing scanned is orphaned: a file present but declared by no
         // `mod` line is either dead or reached a way this scan does not model.
@@ -726,7 +727,7 @@ mod confinement {
         }
     }
 
-    /// `src/` holds these ten files and nothing else.
+    /// `src/` holds these eleven files and nothing else.
     ///
     /// The scan above proves every `mod` line has a file and every file has a
     /// `mod` line, which is a closed loop that says nothing about WHICH files:
@@ -737,7 +738,7 @@ mod confinement {
     /// skipping them: `src/sys.inc` is invisible to a `.rs`-only scan and
     /// compiles perfectly well through the constructs refused below.
     #[test]
-    fn src_holds_exactly_the_ten_scanned_modules() {
+    fn src_holds_exactly_the_eleven_scanned_modules() {
         let (rs, other) = walk();
         let paths: Vec<&str> = rs.iter().map(|(p, _)| p.as_str()).collect();
         assert_eq!(
@@ -747,6 +748,7 @@ mod confinement {
                 "cad.rs",
                 "control.rs",
                 "evict.rs",
+                "logs.rs",
                 "main.rs",
                 "order.rs",
                 "procfs.rs",
@@ -1183,6 +1185,34 @@ mod confinement {
                 "{name} names the raw syscall entry point; only sys.rs may"
             );
         }
+    }
+
+    /// The shutdown closes its logs BEFORE it runs `/etc/shutdown`.
+    ///
+    /// A source-text assertion because no test can observe the ordering:
+    /// `finish_shutdown` execs and does not return, so the tests drive
+    /// `close_logs` directly and would still pass if the call in
+    /// `finish_shutdown` were deleted outright. The consequence of deleting it
+    /// is not a failing test — it is `umount /var` failing EBUSY inside
+    /// `/etc/shutdown`, which withholds the marker the boot oracle greps for,
+    /// so the symptom surfaces a whole layer away and reads as a mount bug.
+    #[test]
+    fn the_shutdown_closes_its_logs_before_it_runs_the_teardown() {
+        // `match_indices` rather than the obvious `str` search, whose name is a
+        // bare token the ladder guard scans this embedded source for.
+        let at = |hay: &str, what: &str| hay.match_indices(what).next().map(|(i, _)| i);
+        let body = source("supervise.rs");
+        let start = at(&body, "fn finish_shutdown").expect("finish_shutdown must exist");
+        let rest = body.get(start..).unwrap_or_default();
+        let closed = at(rest, "self.close_logs()")
+            .expect("finish_shutdown must close the logs; /var will not unmount otherwise");
+        let teardown =
+            at(rest, "run_teardown(").expect("finish_shutdown must run the teardown");
+        assert!(
+            closed < teardown,
+            "close_logs must come BEFORE run_teardown: /etc/shutdown is what unmounts /var, \
+             and an open descriptor under it fails the unmount"
+        );
     }
 
     /// Only the one signal helper reaches the wrapper.

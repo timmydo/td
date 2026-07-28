@@ -778,6 +778,16 @@ fn build_td_svc_conf() -> String {
          exec=/bin/sshd serve --listen 0.0.0.0:22 --host-key {host_key} --authorized-keys {authorized_keys}\n\
          after={sysinit}\n\
          restart=always\n\
+         # sshd is the one shipped service that talks to the network, so its\n\
+         # output is what a failed login has to be reconstructed from. Rotated\n\
+         # by td-svc, because /var is a persistent volume this could fill.\n\
+         log=/var/log/svc/sshd.log\n\
+         # ...and COPIED to the console, because before capture existed sshd\n\
+         # inherited td-svc's stderr and its failures reached the serial line.\n\
+         # The boot oracle prints \"Last serial output\" when sshd's marker is\n\
+         # missing; capturing alone would take sshd's reason out of exactly the\n\
+         # text that gets printed when sshd is why the boot failed.\n\
+         console=yes\n\
          \n\
          # The auto-login greeter. tty= hands it /dev/ttyS0 and, per td-svc/DESIGN.md,\n\
          # exempts it from process_group(0) so getty's setsid() succeeds — grouping it\n\
@@ -2508,6 +2518,34 @@ mod tests {
             TD_SVC_UNITS.iter().map(|u| u.to_string()).collect::<Vec<_>>(),
             "TD_SVC_UNITS is what shape_check greps `td-svc check`'s plan for; a unit \
              missing from it is a unit whose absence from the plan nothing would catch"
+        );
+    }
+
+    /// sshd's output is captured AND copied to the console.
+    ///
+    /// Both halves matter and neither is implied by the other. Without `log=`,
+    /// the one shipped service that talks to the network writes to a console
+    /// that scrolls and is never kept. Without `console=yes`, capture takes
+    /// sshd's failures OUT of the serial output the qemu boot oracle prints
+    /// when sshd is the reason the boot failed — which is exactly when they
+    /// are needed.
+    #[test]
+    fn the_sshd_unit_is_captured_and_still_reaches_the_console() {
+        let table = build_td_svc_conf();
+        let sshd = table
+            .split("[sshd]")
+            .nth(1)
+            .and_then(|rest| rest.split("\n[").next())
+            .unwrap_or_default()
+            .to_string();
+        assert!(
+            sshd.contains("log=/var/log/svc/sshd.log"),
+            "sshd's output is not captured: {sshd}"
+        );
+        assert!(
+            sshd.contains("console=yes"),
+            "sshd is captured but no longer reaches the console; the boot oracle's \
+             'Last serial output' would stop carrying the reason sshd failed: {sshd}"
         );
     }
 

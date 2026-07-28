@@ -52,6 +52,7 @@ const MODULES: &[(&str, &str)] = &[
     ("cad", include_str!("../../../td-svc/src/cad.rs")),
     ("control", include_str!("../../../td-svc/src/control.rs")),
     ("evict", include_str!("../../../td-svc/src/evict.rs")),
+    ("logs", include_str!("../../../td-svc/src/logs.rs")),
     ("order", include_str!("../../../td-svc/src/order.rs")),
     ("procfs", include_str!("../../../td-svc/src/procfs.rs")),
     ("supervise", include_str!("../../../td-svc/src/supervise.rs")),
