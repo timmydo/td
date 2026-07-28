@@ -217,9 +217,10 @@ const SYSTEM: SystemDef = SystemDef {
 /// any step text and can't tell a cpio member NAME from a host invocation; they stay
 /// reachable as `busybox find` / `busybox xargs`.
 ///
-/// `mount`/`umount` LEFT this list with td-init's `mount(2)`/`umount2(2)` amendment. They
-/// were the last thing on the boot path only busybox could do, and moving them is what lets
-/// both `/init` scripts stop calling the multiplexer.
+/// `mount`/`umount` LEFT this list with td-init's `mount(2)`/`umount2(2)` amendment, and
+/// `losetup` with the `LOOP_SET_FD` one. Those three were the boot-path jobs needing a
+/// syscall no safe `std` reaches, which is what a 1 MiB C multicall was being carried for;
+/// what busybox still serves here is ordinary userland.
 const BUSYBOX_APPLETS: &[&str] = &["sh", "ash", "getty", "more", "awk"];
 
 /// The text userland, served by the static td-txt multicall — the `grep` and `sed` busybox
@@ -299,6 +300,17 @@ const TD_INIT_FARM: &[(&str, Probe)] = &[
     ("hostname", Probe::ReadsBackHostname),
     // The shipped table, parsed by the binary that will be PID 1 next boot.
     ("init", Probe::Runs("--dry-run -f /etc/inittab")),
+    // Probed by REFUSAL for the same reason `mount` is: attaching a loop device SUCCEEDS
+    // destructively, and the greeter is unprivileged so a real attach would EPERM anyway.
+    // The refusal proves the packed name and the argv[0] dispatch, and that arguments are
+    // parsed before any ioctl — which is what stops a mistyped device from being bound.
+    // The BOOT use is initramfs-only (the deployment phase binds the root loop), so this
+    // probe on the real root is the only automated exercise the applet's dispatch gets:
+    // the ioctl itself needs privilege no test here has.
+    (
+        "losetup",
+        Probe::Refuses("--not-an-option", "usage: losetup"),
+    ),
     // Probed by REFUSAL, though for the opposite reason to the three below: mount SUCCEEDS
     // destructively. A probe that mounted something would change the running system's mount
     // table to prove a symlink, and the greeter is unprivileged so the interesting paths
@@ -408,7 +420,6 @@ const INITRAMFS_APPLETS: &[&str] = &[
     "chmod",
     "chown",
     "ln",
-    "losetup",
     "mkdir",
     "mknod",
     "printf",
@@ -837,6 +848,7 @@ fn build_deployment_init(sys: &SystemDef) -> String {
      set -f\n\
      /bin/mount -t devtmpfs dev /dev\n\
      /bin/mount -t proc proc /proc\n\
+     /bin/mount -t sysfs sysfs /sys\n\
      n=0\n\
      while /bin/busybox test \"$n\" -lt 5 && ! /bin/busybox test -b /dev/vda; do /bin/busybox sleep 1; n=$((n+1)); done\n\
      deployment=\n\
@@ -856,6 +868,7 @@ fn build_deployment_init(sys: &SystemDef) -> String {
      /bin/mount -t btrfs -o rw,nodev,nosuid,subvol=@var /dev/vda /sysroot/var\n\
      /bin/umount /proc\n\
      /bin/umount /dev\n\
+     /bin/umount /sys\n\
      /bin/mount -t tmpfs -o mode=0755 tmpfs /sysroot/run\n\
      /bin/busybox printf '%s\\n' \"$deployment\" > /sysroot/run/td-deployment\n\
      /bin/busybox chmod 0600 /sysroot/run/td-deployment\n\
@@ -1649,9 +1662,9 @@ fn etc_files(sys: &SystemDef) -> Vec<(&'static str, String, bool)> {
 ///
 /// The line is drawn at the /bin NAME, not at the binary: since the `mount(2)` amendment
 /// BOTH phases pack td-init, because both mount devtmpfs and proc before doing anything
-/// else. Only the deployment phase links `switch_root` to it, which is the capability the
-/// selector must not have — and the same test that pins that pins the selector's
-/// `bin/switch_root` absent.
+/// else. Only the deployment phase links `switch_root` and `losetup` to it — the pivot
+/// and the loop bind are the capabilities the selector must not have — and the same test
+/// that pins those pins the selector's `bin/switch_root` and `bin/losetup` absent.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Phase {
     Selector,
@@ -1661,7 +1674,13 @@ enum Phase {
 /// A gen_init_cpio spec for one of the two structurally distinct boot phases.
 fn build_initramfs_spec(init: &str, phase: Phase) -> String {
     let mut s = String::new();
-    for d in ["/dev", "/proc", "/run", "/sysroot", "/td", "/td/store"] {
+    // /sys is here for one reason: td-init's `losetup` reads
+    // /sys/dev/block/<major>:<minor>/ro back to confirm the kernel really made
+    // the root loop read-only. Without it the attach cannot be checked, and an
+    // unchecked attach is a writable loop over a verified root. Only the
+    // deployment /init mounts anything on it — the selector binds no loop — but
+    // the directory list is shared, as it already is for /sysroot.
+    for d in ["/dev", "/proc", "/run", "/sys", "/sysroot", "/td", "/td/store"] {
         s.push_str(&format!("dir {d} 0755 0 0\n"));
     }
     s.push_str("dir /volume 0700 0 0\n");
@@ -1694,10 +1713,15 @@ fn build_initramfs_spec(init: &str, phase: Phase) -> String {
             s.push_str("file {in:td-kexec}/bin/td-kexec {in:td-kexec}/bin/td-kexec 0755 0 0\n");
             s.push_str("slink /bin/td-kexec {in:td-kexec}/bin/td-kexec 0777 0 0\n");
         }
-        // The pivot applet, and ONLY here: /init execs `/bin/switch_root`, and the selector
-        // has no branch that enters a root, so this is the name that must not exist there.
+        // The pivot applet and the loop applet, and ONLY here. /init execs
+        // `/bin/switch_root`, and the selector has no branch that enters a root.
+        // `losetup` is the same shape of decision: only `td-boot root-loop` binds
+        // the verified image, and only the deployment /init runs it — the selector
+        // runs `td-boot boot`, which kexecs. Carrying either name there would give
+        // an initramfs a capability its /init has no branch for.
         Phase::Deployment => {
             s.push_str("slink /bin/switch_root {in:td-init}/bin/td-init 0777 0 0\n");
+            s.push_str("slink /bin/losetup {in:td-init}/bin/td-init 0777 0 0\n");
         }
     }
     s.push_str("nod /dev/console 0600 0 0 c 5 1\n");
@@ -2008,6 +2032,8 @@ fn shape_check() -> String {
      printf '%s\\n' \"$init_list\" | grep -q -x -F bin/switch_root || { echo 'deployment initramfs: bin/switch_root missing - its /init would exec nothing and the boot would end in a 300s timeout with no cause' >&2; exit 1; }; \
      printf '%s\\n' \"$init_list\" | grep -qE '^td/store/[^/]+/bin/td-init$' || { echo 'deployment initramfs: td-init store member missing - the switch_root and mount/umount symlinks would dangle' >&2; exit 1; }; \
      if printf '%s\\n' \"$selector_list\" | grep -q -x -F bin/switch_root; then echo 'selector initramfs: switch_root must be deployment-only - the selector kexecs, it never pivots' >&2; exit 1; fi; \
+     printf '%s\\n' \"$init_list\" | grep -q -x -F bin/losetup || { echo 'deployment initramfs: bin/losetup missing - td-boot root-loop could not bind the verified root and the boot would stop there' >&2; exit 1; }; \
+     if printf '%s\\n' \"$selector_list\" | grep -q -x -F bin/losetup; then echo 'selector initramfs: losetup must be deployment-only - the selector kexecs, it never binds a root loop' >&2; exit 1; fi; \
      [ \"$(wc -l < \"$selector_manifest\")\" -eq 2 ] || { echo 'selector manifest: expected header plus one payload entry' >&2; exit 1; }; \
      [ \"$(head -n 1 \"$selector_manifest\")\" = td-deployment-v1 ] || { echo 'selector manifest: unsupported header' >&2; exit 1; }; \
      grep -q -E '^[0-9a-f]{64}  selector-initramfs\\.cpio$' \"$selector_manifest\" || { echo 'selector manifest: missing strict SHA-256 entry' >&2; exit 1; }; \
@@ -3026,6 +3052,10 @@ mod tests {
                 "'{a}' is td-init's since the mount(2)/umount2(2) amendment"
             );
         }
+        assert!(
+            !BUSYBOX_APPLETS.contains(&"losetup"),
+            "'losetup' is td-init's since the LOOP_SET_FD amendment"
+        );
     }
 
     /// The /bin farms must be DISJOINT — a name in both would pack two conflicting symlinks
@@ -3280,11 +3310,9 @@ mod tests {
         // so those are justified by the protocol constant instead.
         for a in INITRAMFS_APPLETS {
             assert!(
-                seen.iter().any(|s| s == a)
-                    || td_boot_protocol::REQUIRED_BUSYBOX_APPLETS.contains(a),
+                seen.iter().any(|s| s == a),
                 "INITRAMFS_APPLETS lists '{a}', but no generated script invokes `busybox {a}` \
-                 and td-boot does not require it - drop it, or move it to the /bin farm if it \
-                 needs a symlink"
+                 - drop it, or move it to the /bin farm if it needs a symlink"
             );
         }
     }
@@ -4344,6 +4372,7 @@ mod tests {
             "dir /volume 0700 0 0",
             "dir /proc 0755 0 0",
             "dir /run 0755 0 0",
+            "dir /sys 0755 0 0",
         ] {
             assert!(
                 selector.contains(entry) && deployment.contains(entry),
@@ -4371,25 +4400,80 @@ mod tests {
                  /init mounts devtmpfs and proc before it does anything else"
             );
         }
+        // The read-back that makes the root loop's read-only status a CHECKED fact
+        // rather than an assumed one reads /sys/dev/block/<maj>:<min>/ro, so sysfs
+        // has to be mounted before `td-boot root-loop` runs. Asserted here because
+        // the symptom otherwise is an ENOENT that stops the boot, a layer away from
+        // this decision. Deployment only: the selector never binds a loop, so it
+        // mounts no sysfs and the pair is pinned together — a sysfs that reappeared
+        // there would be a mount nothing reads.
+        assert!(
+            deployment.contains("dir /sys 0755 0 0"),
+            "the deployment initramfs has no /sys for sysfs to be mounted on"
+        );
+        let init = build_deployment_init(&SYSTEM);
+        let sysfs = init
+            .match_indices("mount -t sysfs sysfs /sys")
+            .next()
+            .map(|(at, _)| at);
+        let boot = init.match_indices("/bin/td-boot").next().map(|(at, _)| at);
+        assert!(
+            sysfs.is_some(),
+            "/init must mount sysfs; losetup's read-back has nothing to read otherwise"
+        );
+        assert!(
+            boot.is_none() || sysfs < boot,
+            "sysfs must be mounted BEFORE td-boot runs, not after"
+        );
+        // ...and released before the pivot, with /proc and /dev. switch_root MOVES
+        // whatever of the API mounts it finds, so leaving this one behind stacks a
+        // second sysfs under the one sysinit mounts on the real root.
+        let released = |m: &str| {
+            init.match_indices(&format!("/bin/umount {m}"))
+                .next()
+                .map(|(at, _)| at)
+        };
+        for api in ["/proc", "/dev", "/sys"] {
+            let at = released(api);
+            assert!(
+                at.is_some() && at < init.match_indices("switch_root").next().map(|(p, _)| p),
+                "the deployment /init must umount {api} before it pivots"
+            );
+        }
+        assert!(
+            !build_selector_init().contains("sysfs"),
+            "the selector binds no loop, so it must mount no sysfs"
+        );
         assert!(
             deployment.contains("slink /bin/switch_root {in:td-init}/bin/td-init 0777 0 0")
                 && !selector.contains("switch_root"),
             "only the deployment initramfs may expose the pivot as /bin/switch_root"
         );
-        for applet in td_boot_protocol::REQUIRED_BUSYBOX_APPLETS {
-            assert!(
-                INITRAMFS_APPLETS.contains(applet),
-                "td-boot invokes uncovered busybox applet {applet}"
-            );
-        }
-        // td-boot calls mount/umount by their /bin names, so each must be a td-init farm
-        // entry AND actually linked into both cpios — td-boot runs in both phases.
+        // td-boot invokes NO busybox applet now: `losetup` was the last, and it is a
+        // td-init applet since the LOOP_SET_FD amendment. Asserted rather than left to
+        // review, because re-introducing one would put the ability to boot back on a
+        // third-party multicall's argv parsing with no build-time signal.
+        assert!(
+            !INITRAMFS_APPLETS.contains(&"losetup"),
+            "losetup is td-init's now; a busybox entry for it would be the dependency \
+             the amendment removed, silently restored"
+        );
+        // td-boot calls mount/umount/losetup by their /bin names, so each must be a
+        // td-init farm entry AND actually linked into the cpio of every phase that
+        // runs it. Which phases those are is NOT uniform: `td-boot boot` and
+        // `td-boot root-loop` mount, but only `root-loop` binds the loop, and only
+        // the deployment /init runs it.
         let td_init = td_init_applets();
         for applet in td_boot_protocol::REQUIRED_TD_INIT_APPLETS {
             assert!(
                 td_init.contains(applet),
                 "td-boot invokes /bin/{applet}, which the td-init farm does not serve"
             );
+        }
+        for applet in [
+            td_boot_protocol::MOUNT_APPLET,
+            td_boot_protocol::UMOUNT_APPLET,
+        ] {
             for (phase, spec) in [("selector", &selector), ("deployment", &deployment)] {
                 assert!(
                     spec.contains(&format!("slink /bin/{applet} ")),
@@ -4397,6 +4481,12 @@ mod tests {
                 );
             }
         }
+        let losetup = format!("slink /bin/{} ", td_boot_protocol::LOSETUP_APPLET);
+        assert!(
+            deployment.contains(&losetup) && !selector.contains(&losetup),
+            "the loop bind is a deployment capability: `td-boot root-loop` runs only there, \
+             and the selector must not carry the name that would let it bind one"
+        );
     }
 
     /// td-txt is packed, serves both /bin names, and each is exercised by the greeter — the

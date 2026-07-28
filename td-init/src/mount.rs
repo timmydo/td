@@ -3,16 +3,16 @@
 //! `mount(2)` and `umount2(2)`, the pair the ninth-syscall amendment bought.
 //! Both `/init` scripts, `/etc/inittab`'s sysinit lines, `/etc/shutdown` and
 //! td-boot's own helpers mount every filesystem the machine has; until this
-//! module existed that was the one job on td's boot path only busybox could do,
-//! which is why a 1 MiB C multicall rode in the initramfs to make four calls.
+//! module existed no td program could, which is why a 1 MiB C multicall rode in
+//! the initramfs to make four calls.
 //!
 //! Deliberately absent, each because td has no use for it rather than to save
 //! work: `/etc/fstab` (td writes its mount table into the scripts that run it,
 //! so the one-operand `mount TARGET` form has nothing to resolve the remaining
 //! operands against and is refused, not silently ignored); `/etc/mtab` and its
-//! `-n` (`/proc/self/mounts` IS the table both applets read); and loop-device
-//! setup, since `losetup` needs `ioctl(2)` requests outside this crate's
-//! amendment — td-boot still reaches busybox for that one.
+//! `-n` (`/proc/self/mounts` IS the table both applets read). Loop-device setup
+//! is NOT absent, but it is not here either: `losetup` is its own applet, on
+//! `ioctl(2)` rather than on this pair.
 
 use crate::sys;
 use std::ffi::CString;

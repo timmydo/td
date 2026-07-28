@@ -16,6 +16,9 @@
 //! The amended surface is exactly the nine syscalls below, one per boot-glue
 //! applet requirement that safe `std` does not expose. A TENTH is a reviewed
 //! amendment, not an edit; `main.rs`'s confinement test asserts the roster.
+//! `ioctl(2)` is the one with TWO permitted requests — `TIOCSCTTY` for
+//! cttyhack and `LOOP_SET_FD` for losetup — and both are pinned by value, so
+//! widening the roster is as reviewable as adding a syscall to it.
 //! Notably absent: `pivot_root(2)` (it fails on the initramfs rootfs, so
 //! switch_root moves the mount instead, as util-linux and busybox do),
 //! `fork`/`execve` (`Command` plus the SAFE `CommandExt::exec` cover both), and
@@ -223,6 +226,37 @@ pub fn set_controlling_tty(fd: RawFd) -> io::Result<()> {
 /// so a `1` here would change who owns an operator's terminal with every test
 /// still green. `main.rs`'s confinement test pins this line.
 const NO_STEAL: usize = 0;
+
+// ── losetup's one request ───────────────────────────────────────────────────
+
+/// `ioctl(loop_fd, LOOP_SET_FD, backing_fd)` — attach a backing file to a loop
+/// device. The SECOND request this crate's `ioctl` is restricted to.
+///
+/// `LOOP_SET_FD` rather than the newer `LOOP_CONFIGURE`, and that choice is the
+/// safety argument: `LOOP_CONFIGURE` takes a `struct loop_config` — a `__u32`,
+/// a nested `loop_info64`, and eight reserved `__u64`s — that this crate would
+/// have to lay out by hand and pass as a pointer, and a field at the wrong
+/// offset is a kernel operation nobody can see from the call site.
+/// `LOOP_SET_FD`'s argument is the backing descriptor itself, an integer, so
+/// there is no layout to get wrong.
+///
+/// Read-only is not a flag here, which is BETTER than passing one: the kernel
+/// marks the loop read-only when the backing file was opened without write
+/// access, so `losetup`'s `-r` cannot be forgotten — it is a property of the
+/// descriptor td-boot verified and handed over. `losetup.rs` reads it back out
+/// of sysfs and refuses rather than trusting that.
+pub fn attach_loop(loop_fd: RawFd, backing_fd: RawFd) -> io::Result<()> {
+    const LOOP_SET_FD: usize = 0x4c00;
+    check(syscall5(
+        SYS_IOCTL,
+        loop_fd as usize,
+        LOOP_SET_FD,
+        backing_fd as usize,
+        0,
+        0,
+    ))
+    .map(|_| ())
+}
 
 // ── init's reaper ───────────────────────────────────────────────────────────
 

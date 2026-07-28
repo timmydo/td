@@ -61,6 +61,7 @@ const MODULES: &[(&str, &str)] = &[
     ("halt", include_str!("../../../td-init/src/halt.rs")),
     ("hostname", include_str!("../../../td-init/src/hostname.rs")),
     ("init", include_str!("../../../td-init/src/init.rs")),
+    ("losetup", include_str!("../../../td-init/src/losetup.rs")),
     ("mount", include_str!("../../../td-init/src/mount.rs")),
     ("switchroot", include_str!("../../../td-init/src/switchroot.rs")),
     ("sys", include_str!("../../../td-init/src/sys.rs")),

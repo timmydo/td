@@ -297,10 +297,29 @@ td's Rust is defensive and minimal-surface.
   multicall, whose one `syscall5` body in `td-init/src/sys.rs` carries EXACTLY these
   nine syscalls, one per applet that safe `std` cannot reach: `reboot(2)` + `sync(2)`
   (reboot/poweroff/halt), `mount(2)` + `umount2(2)` (mount/umount, and switch_root's
-  `MS_MOVE`), `chroot(2)` (switch_root), `setsid(2)` + `ioctl(2)` restricted to
-  `TIOCSCTTY` (cttyhack), `sethostname(2)` (`hostname -F`, the flag uutils lacks), and
+  `MS_MOVE`), `chroot(2)` (switch_root), `setsid(2)` + `ioctl(2)` (cttyhack and
+  losetup), `sethostname(2)` (`hostname -F`, the flag uutils lacks), and
   `wait4(2)` (init, which as PID 1 must reap the orphans a targeted `Child::wait`
-  cannot see). `mount(2)` was restricted to `MS_MOVE` until the `mount`/`umount`
+  cannot see). `ioctl(2)` is the one with TWO permitted requests — `TIOCSCTTY`
+  for cttyhack and `LOOP_SET_FD` for the `losetup` applet — both pinned by value,
+  so widening that roster is as reviewable as adding a syscall to it. `losetup`
+  is why `td-boot` no longer runs any third-party program: attaching the
+  verified root loop had rested on busybox existing at an absolute path and
+  parsing `-r <device> <file>` as expected, with nothing tying the two together,
+  so dropping that applet would have stopped every boot with no build-time
+  complaint — the same argument that moved `kill(2)` into td-svc.
+  `LOOP_SET_FD` rather than `LOOP_CONFIGURE` deliberately: its argument is the
+  backing descriptor, an integer, where `LOOP_CONFIGURE` would need a
+  `struct loop_config` laid out by hand, and a field at the wrong offset is a
+  kernel operation invisible at the call site. Read-only is not passed as a flag
+  but follows from the descriptor td-boot verified and handed over, which is why
+  it cannot be forgotten the way `-r` can; `losetup.rs` then reads it back out of
+  `/sys/dev/block/<major>:<minor>/ro` — by the number off the OPENED device, not
+  by the path string, so the answer cannot be about a different device than the
+  one the ioctl went to — and refuses unless the kernel agrees, because nothing
+  observable distinguishes a read-only loop from a writable one at attach time
+  and a writable loop over the verified root is a root whose contents no longer
+  match the hash that admitted it. `mount(2)` was restricted to `MS_MOVE` until the `mount`/`umount`
   applets landed; they need the real flag word, so the restriction moved from the
   syscall to `td-init/src/mount.rs`, the only module that composes one. Because the
   flags are a runtime parameter now rather than a frozen constant, FOUR assertions
@@ -310,8 +329,11 @@ td's Rust is defensive and minimal-surface.
   `0x4000` cannot reach the kernel); and no module but `mount.rs` — plus
   `switch_root`'s two `MS_MOVE` moves — may name one or call the two wrappers.
   That amendment is what lets both initramfses and `/etc/inittab` mount without
-  busybox; `losetup` (ioctl requests not in this surface) is the one boot-path job
-  still left to it. Deliberately NOT in that surface: `pivot_root(2)` (it fails on the
+  busybox, and the `LOOP_SET_FD` request above is what lets `td-boot` attach the
+  verified root loop without it — so nothing td-boot runs is a third-party
+  program any more. Busybox is still the `/init` interpreter and still serves
+  the shell utilities those scripts call; what left is the privileged work.
+  Deliberately NOT in that surface: `pivot_root(2)` (it fails on the
   initramfs rootfs, so switch_root moves the mount as util-linux and busybox do),
   `fork`/`execve` (`Command` plus the safe `CommandExt::exec` cover both), `dup2`
   (`Stdio::from(File)` wires the console), and any signal handler — which is why td's

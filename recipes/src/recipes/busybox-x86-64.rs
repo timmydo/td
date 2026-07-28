@@ -35,8 +35,8 @@ pub fn recipe() -> Recipe {
              printf '%s\\n' \"$l\" | grep -q -x -F \"$a\" || { echo \"busybox does not serve post-bootstrap tool '$a'\" >&2; exit 1; }; \
              [ -L \"{out}/bin/$a\" ] || { echo \"busybox post-bootstrap tool '$a' has no installed symlink\" >&2; exit 1; }; \
          done; \
-         for a in mount umount losetup; do \
-             printf '%s\\n' \"$l\" | grep -q -x -F \"$a\" || { echo \"busybox does not serve applet '$a' - linux-x86-64's own initramfs /init runs mount, and td-boot runs losetup; a defconfig trim would break the kernel boot test with no other build-time signal\" >&2; exit 1; }; \
+         for a in mount umount; do \
+             printf '%s\\n' \"$l\" | grep -q -x -F \"$a\" || { echo \"busybox does not serve applet '$a' - linux-x86-64's own initramfs /init runs it; a defconfig trim would break the kernel boot test with no other build-time signal\" >&2; exit 1; }; \
          done; \
          set -- $('{out}/bin/busybox' od -An -tx1 -j 0 -N1 '{out}/bin/busybox'); \
          [ \"$1\" = 7f ] || { echo 'busybox od lacks the address, type, or count option surface used after bootstrap' >&2; exit 1; }; \

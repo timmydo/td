@@ -18,13 +18,15 @@ use std::os::unix::fs::{
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
 
-// The last job td-boot still reaches busybox for: `losetup` needs ioctl(2)
-// requests outside td-init's confined syscall amendment. mount/umount moved to
-// td-init's own applets, which is what lets the deployment initramfs drop the
-// multicall from its `/init`.
-const BUSYBOX: &str = "/bin/busybox";
+// td-boot reaches no third-party program at all now. `losetup` was the last
+// one: the ability to BOOT rested on busybox existing at an absolute path and
+// parsing `-r <device> <file>` as expected, with nothing tying the two
+// together, so dropping that applet from the image would have stopped every
+// boot at the root loop with no build-time complaint. It is a td-init applet
+// beside mount/umount, under one pinned `LOOP_SET_FD` request.
 const TD_MOUNT: &str = "/bin/mount";
 const TD_UMOUNT: &str = "/bin/umount";
+const TD_LOSETUP: &str = "/bin/losetup";
 const TD_KEXEC: &str = "/bin/td-kexec";
 // root-loop requires procfs so losetup reopens the verified inode, not its path.
 const STDIN_PATH: &str = "/proc/self/fd/0";
@@ -1353,10 +1355,9 @@ fn kexec_command(kernel: File, initramfs: File, cmdline: &OsStr) -> Command {
 }
 
 fn loop_command(root: File, loop_device: &Path) -> Command {
-    let mut command = Command::new(BUSYBOX);
+    let mut command = Command::new(TD_LOSETUP);
     command
         .args([
-            OsStr::new(protocol::LOSETUP_APPLET),
             OsStr::new("-r"),
             loop_device.as_os_str(),
             OsStr::new(STDIN_PATH),
@@ -3082,6 +3083,7 @@ mod tests {
         // symlink the image does not pack.
         assert_eq!(TD_MOUNT, format!("/bin/{}", protocol::MOUNT_APPLET));
         assert_eq!(TD_UMOUNT, format!("/bin/{}", protocol::UMOUNT_APPLET));
+        assert_eq!(TD_LOSETUP, format!("/bin/{}", protocol::LOSETUP_APPLET));
         let mount = mount_command(Path::new("/dev/vda"), Path::new("/run/td-volume"));
         assert_eq!(mount.get_program(), OsStr::new(TD_MOUNT));
         assert_eq!(
@@ -3130,11 +3132,14 @@ mod tests {
 
         let root = verify_root_payload(&fixture.root, &id).unwrap();
         let command = loop_command(root, Path::new("/dev/loop0"));
-        assert_eq!(command.get_program(), OsStr::new(BUSYBOX));
+        assert_eq!(
+            command.get_program(),
+            OsStr::new(TD_LOSETUP),
+            "the root loop must be attached by td's own applet, not a third-party multicall"
+        );
         assert_eq!(
             command.get_args().collect::<Vec<_>>(),
             vec![
-                OsStr::new("losetup"),
                 OsStr::new("-r"),
                 OsStr::new("/dev/loop0"),
                 OsStr::new(STDIN_PATH),

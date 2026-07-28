@@ -26,6 +26,7 @@ mod cttyhack;
 mod halt;
 mod hostname;
 mod init;
+mod losetup;
 mod mount;
 mod switchroot;
 mod sys;
@@ -43,6 +44,7 @@ const APPLETS: &[(&str, Applet)] = &[
     ("halt", halt::halt),
     ("hostname", hostname::run),
     ("init", init::run),
+    ("losetup", losetup::run),
     ("mount", mount::mount),
     ("poweroff", halt::poweroff),
     ("reboot", halt::reboot),
@@ -370,7 +372,7 @@ mod tests {
     /// The roster is the shipped /bin symlink farm, so a rename is a visible
     /// change to the image, not an internal one.
     #[test]
-    fn the_roster_is_the_amended_nine() {
+    fn the_roster_is_the_amended_ten() {
         assert_eq!(
             names(),
             vec![
@@ -378,6 +380,7 @@ mod tests {
                 "halt",
                 "hostname",
                 "init",
+                "losetup",
                 "mount",
                 "poweroff",
                 "reboot",
@@ -766,7 +769,7 @@ mod confinement {
                 declared.push(target);
             }
         }
-        assert_eq!(declared.len(), 7, "expected seven modules beside the crate root");
+        assert_eq!(declared.len(), 8, "expected eight modules beside the crate root");
         // ...and nothing scanned is orphaned: a file present but declared by no
         // `mod` line is either dead or reached a way this scan does not model,
         // and either way the counts above stop meaning what they say. Matching on
@@ -793,7 +796,7 @@ mod confinement {
     /// skipping them: `src/sys.inc` is invisible to a `.rs`-only scan and
     /// compiles perfectly well through the constructs refused below.
     #[test]
-    fn src_holds_exactly_the_eight_scanned_modules() {
+    fn src_holds_exactly_the_nine_scanned_modules() {
         let (rs, other) = walk();
         let paths: Vec<&str> = rs.iter().map(|(p, _)| p.as_str()).collect();
         assert_eq!(
@@ -803,6 +806,7 @@ mod confinement {
                 "halt.rs",
                 "hostname.rs",
                 "init.rs",
+                "losetup.rs",
                 "main.rs",
                 "mount.rs",
                 "switchroot.rs",
@@ -1005,6 +1009,27 @@ mod confinement {
         );
     }
 
+    /// Neither ioctl REQUEST can be shadowed out from under its pin.
+    ///
+    /// The value pins below assert a pinned line is PRESENT; they do not bound
+    /// how many bindings of that name exist, and an inner one wins. Leave the
+    /// pinned line where it is, add a second `const LOOP_SET_FD` inside
+    /// `attach_loop` set to `0x4c04`, and the call becomes `LOOP_SET_STATUS64`,
+    /// which reads the third argument as a POINTER to a struct — a wild kernel
+    /// read at the address of a file descriptor — with every other assertion in
+    /// this module still green. Two mentions each: one declaration, one use.
+    #[test]
+    fn neither_ioctl_request_can_be_shadowed() {
+        let sys = source("sys.rs");
+        for request in ["TIOCSCTTY", "LOOP_SET_FD"] {
+            assert_eq!(
+                sys.matches(request).count(),
+                2,
+                "{request} is declared once and used once; a second binding shadows the pin"
+            );
+        }
+    }
+
     /// All nine calls, pinned WHOLE — every register, not just the selector.
     ///
     /// `every_syscall_call_site_uses_a_named_constant` reads argument ONE and
@@ -1030,9 +1055,16 @@ mod confinement {
             "(SYS_SETHOSTNAME,name.as_ptr()asusize,name.len(),0,0,0,)",
             "(SYS_SETSID,0,0,0,0,0)",
             "(SYS_IOCTL,fdasusize,TIOCSCTTY,NO_STEAL,0,0)",
+            "(SYS_IOCTL,loop_fdasusize,LOOP_SET_FD,backing_fdasusize,0,0,)",
             "(SYS_WAIT4,PID_ANY,ptr::addr_of_mut!(status)asusize,opts,0,0,)",
         ];
-        assert_eq!(ARGUMENTS.len(), AMENDED.len(), "one pin per amended syscall");
+        // One pin per CALL SITE, which is one more than the roster: `ioctl` is
+        // issued twice, once per permitted request.
+        assert_eq!(
+            ARGUMENTS.len(),
+            AMENDED.len() + 1,
+            "one pin per call site; ioctl has two"
+        );
         let sys = squeeze(&source("sys.rs"));
         for arguments in ARGUMENTS {
             assert_eq!(
@@ -1074,6 +1106,7 @@ mod confinement {
             "pub const MNT_FORCE: usize = 0x1;",
             "pub const MNT_DETACH: usize = 0x2;",
             "const TIOCSCTTY: usize = 0x540e;",
+            "const LOOP_SET_FD: usize = 0x4c00;",
             "const LINUX_REBOOT_MAGIC1: usize = 0xfee1_dead;",
             "const LINUX_REBOOT_MAGIC2: usize = 0x2812_1969;",
             "pub const REBOOT_RESTART: usize = 0x0123_4567;",
@@ -1149,6 +1182,10 @@ mod confinement {
         for (call, permitted) in [
             (concat!("sys::", "mount"), &["mount.rs", "switchroot.rs"][..]),
             (concat!("sys::", "umount"), &["mount.rs"][..]),
+            // `attach_loop` takes two raw descriptors, so any module that can
+            // call it can bind an arbitrary open file to an arbitrary loop
+            // device. One caller is what keeps the read-back below meaningful.
+            (concat!("sys::", "attach_loop"), &["losetup.rs"][..]),
         ] {
             for (path, text) in sources() {
                 if path == "sys.rs" || path == "main.rs" || permitted.contains(&path.as_str()) {
@@ -1158,6 +1195,34 @@ mod confinement {
                     text.matches(call).count(),
                     0,
                     "'{path}' calls {call}; only {permitted:?} may"
+                );
+            }
+        }
+        // A NAMED import defeats it the same way a glob does: `use
+        // crate::sys::attach_loop;` then a bare `attach_loop(...)` matches
+        // nothing the loop above looks for. No module but the permitted ones
+        // may import out of `sys` at all, so every reach is qualified and
+        // therefore visible.
+        for (path, text) in sources() {
+            if path == "sys.rs" || path == "main.rs" {
+                continue;
+            }
+            let squeezed: String = text.chars().filter(|c| !c.is_whitespace()).collect();
+            // Whitespace is already squeezed out of the text, so these forms
+            // carry none either — `use crate::sys as raw` becomes
+            // `usecrate::sysas`, and a pattern with a space in it would match
+            // nothing at all while looking like it did.
+            for form in [
+                concat!("use", "crate::sys::"),
+                concat!("use", "super::sys::"),
+                concat!("use", "crate::sysas"),
+                concat!("use", "super::sysas"),
+            ] {
+                assert_eq!(
+                    squeezed.matches(form).count(),
+                    0,
+                    "'{path}' imports out of the syscall module ('{form}'); every reach \
+                     must be spelled `sys::<wrapper>` where the caller scan can see it"
                 );
             }
         }
@@ -1287,7 +1352,7 @@ mod confinement {
                 .collect();
             assert!(
                 AMENDED.iter().any(|(name, _)| *name == selector),
-                "called with '{selector}', which is not one of the amended eight"
+                "called with '{selector}', which is not one of the amended nine"
             );
             // The constant must BE the argument, not the start of an expression:
             // `SYS_REBOOT - 130` selects getpid(2) while spelling an audited
@@ -1299,22 +1364,30 @@ mod confinement {
             );
             selected.push(selector);
         }
-        // Each of the nine EXACTLY once. Membership alone would let all nine
-        // sites name SYS_REBOOT while a wrapper quietly issued a different call
-        // than the one it is named for.
+        // Each of the nine exactly once, EXCEPT ioctl, which is issued twice
+        // because it is the one syscall with two permitted requests
+        // (`TIOCSCTTY` for cttyhack, `LOOP_SET_FD` for losetup). Membership
+        // alone would let every site name SYS_REBOOT while a wrapper quietly
+        // issued a different call than the one it is named for; spelling the
+        // expected multiset out keeps that closed while the roster widens.
         selected.sort();
-        let roster: Vec<String> = AMENDED.iter().map(|(n, _)| (*n).to_string()).collect();
-        assert_eq!(selected, roster, "each amended syscall is issued exactly once");
+        let mut roster: Vec<String> = AMENDED.iter().map(|(n, _)| (*n).to_string()).collect();
+        roster.push("SYS_IOCTL".to_string());
+        roster.sort();
+        assert_eq!(
+            selected, roster,
+            "each amended syscall is issued exactly once, and ioctl exactly twice"
+        );
         // One call per wrapper: reboot, sync, mount, umount2, chroot,
-        // sethostname, setsid, ioctl, wait4.
-        assert_eq!(sites, 9, "expected exactly nine call sites");
+        // sethostname, setsid, ioctl x2, wait4.
+        assert_eq!(sites, 10, "expected exactly ten call sites");
         // ...and the definition, and NOTHING else. The loop skips any mention
         // not followed by `(`, which is the function ITEM: bind it once and
         // every later call goes through a name this scan does not know.
         assert_eq!(
             mentions,
             sites + 1,
-            "mentioned somewhere that is not one of the eight calls or its definition"
+            "mentioned somewhere that is not one of the ten calls or its definition"
         );
     }
 

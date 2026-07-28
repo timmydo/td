@@ -1331,6 +1331,8 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
     assert_target!("td-init/src/main.rs", "recipe-checks");
     assert_target!("td-init/src/sys.rs", "check");
     assert_target!("td-init/src/sys.rs", "recipe-checks");
+    assert_target!("td-init/src/losetup.rs", "check");
+    assert_target!("td-init/src/losetup.rs", "recipe-checks");
     assert_target!("td-init/Cargo.lock", "check");
     assert_target!("td-init/Cargo.lock", "recipe-checks");
     // td-login mirrors td-init, confined syscall module included: every source is

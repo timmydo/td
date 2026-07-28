@@ -102,11 +102,11 @@ pub fn recipe() -> Recipe {
                 "-c",
                 &format!(
                     "l=$('{bin}' --list) || {{ echo 'td-init --list failed' >&2; exit 1; }}; \
-                     for a in cttyhack halt hostname init mount poweroff reboot switch_root umount; do \
+                     for a in cttyhack halt hostname init losetup mount poweroff reboot switch_root umount; do \
                          printf '%s\\n' \"$l\" | grep -q -x -F \"$a\" || {{ echo \"td-init does not serve applet '$a'\" >&2; exit 1; }}; \
                      done; \
                      n=$(printf '%s\\n' \"$l\" | wc -l); \
-                     [ \"$n\" -eq 9 ] || {{ echo \"td-init serves $n applets, expected exactly 9 — update this check deliberately when adding one\" >&2; exit 1; }}"
+                     [ \"$n\" -eq 10 ] || {{ echo \"td-init serves $n applets, expected exactly 10 — update this check deliberately when adding one\" >&2; exit 1; }}"
                 ),
             ],
         )
@@ -154,7 +154,12 @@ pub fn recipe() -> Recipe {
                      ln -sf '{bin}' \"$d/init\" || {{ echo 'could not build the argv[0] symlink' >&2; exit 1; }}; \
                      e=$(\"$d/switch_root\" 2>&1); \
                      [ $? -eq 1 ] || {{ echo 'argv[0] dispatch: /sbin/switch_root -> td-init did not reach the applet' >&2; exit 1; }}; \
-                     printf '%s\\n' \"$e\" | grep -q 'usage: switch_root' || {{ echo \"argv[0] dispatch produced '$e', expected the switch_root usage\" >&2; exit 1; }}"
+                     printf '%s\\n' \"$e\" | grep -q 'usage: switch_root' || {{ echo \"argv[0] dispatch produced '$e', expected the switch_root usage\" >&2; exit 1; }}; \
+                     e=$('{bin}' losetup --not-an-option 2>&1); \
+                     [ $? -eq 1 ] || {{ echo 'losetup must reject a bad argument with exit 1 — reaching LOOP_SET_FD on a typo would bind a device nobody named' >&2; exit 1; }}; \
+                     printf '%s\\n' \"$e\" | grep -q 'usage: losetup' || {{ echo \"losetup rejected the argument without saying so: '$e'\" >&2; exit 1; }}; \
+                     e=$('{bin}' losetup -r dev/loop0 /img 2>&1); \
+                     [ $? -eq 1 ] || {{ echo 'losetup must refuse a relative path with exit 1' >&2; exit 1; }}"
                 ),
             ],
         )
