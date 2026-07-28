@@ -19,7 +19,7 @@
 //! not a syntactic one.
 
 use std::collections::BTreeMap;
-use std::io::Write;
+use std::io::{Read, Seek, Write};
 use std::path::{Path, PathBuf};
 
 use crate::regex::{Captures, Options, Regex};
@@ -103,9 +103,12 @@ enum Kind {
     Branch(Target),
     BranchIfSub(Target),
     BranchIfNoSub(Target),
-    Append(Vec<u8>),
-    Insert(Vec<u8>),
-    Change(Vec<u8>),
+    /// `None` is a text GNU writes NOTHING for, which only a script ENDING in a
+    /// bare backslash produces: `sed 'a\\'` appends no line at all where `sed 'a\\\\'`
+    /// appends an empty one, and `sed 'c\\'` still deletes.
+    Append(Option<Vec<u8>>),
+    Insert(Option<Vec<u8>>),
+    Change(Option<Vec<u8>>),
     Delete,
     DeleteFirstLine,
     Get,
@@ -163,6 +166,14 @@ struct ScriptParser<'a> {
     src: &'a [u8],
     pos: usize,
     ere: bool,
+    /// `-z`. Only the `M` flag reads it: see `Options::reg_newline`.
+    null_data: bool,
+    /// Offsets of the newlines that JOIN `-e`/`-f` parts. GNU ends a script part
+    /// like it ends the script for one question only -- whether `a`/`i`/`c` was
+    /// given any text -- so `sed -e a -e p` is an error where the one-argument
+    /// `sed 'a<newline>p'` is not, while `sed -e 'a\' -e text` still spans the
+    /// boundary because the backslash asked to. See `parse_text`.
+    part_ends: Vec<usize>,
     regexes: Vec<Regex>,
 }
 
@@ -187,6 +198,11 @@ impl ScriptParser<'_> {
         false
     }
 
+    /// Is the parser at a newline that ENDS an `-e`/`-f` part? See `part_ends`.
+    fn at_part_end(&self) -> bool {
+        self.peek() == Some(b'\n') && self.part_ends.contains(&self.pos)
+    }
+
     fn skip_blank(&mut self) {
         while matches!(self.peek(), Some(b' ' | b'\t')) {
             self.pos += 1;
@@ -196,6 +212,18 @@ impl ScriptParser<'_> {
     fn skip_separators(&mut self) {
         while matches!(self.peek(), Some(b' ' | b'\t' | b'\n' | b';')) {
             self.pos += 1;
+        }
+    }
+
+    /// A command that does not consume the rest of the line must be SEPARATED from
+    /// the next one: `sed -n 'gp'` is an error in GNU, not `g` then `p`, and so is
+    /// `g p`. `}` and `#` end a command as much as `;` and a newline do, and none of
+    /// them is consumed here — the caller's loop handles them.
+    fn end_of_cmd(&mut self) -> Result<(), String> {
+        self.skip_blank();
+        match self.peek() {
+            None | Some(b'\n' | b';' | b'}' | b'#') => Ok(()),
+            Some(_) => Err("extra characters after command".to_string()),
         }
     }
 
@@ -226,10 +254,23 @@ impl ScriptParser<'_> {
     }
 
     fn add_regex(&mut self, raw: &[u8], icase: bool, multiline: bool) -> Result<Option<usize>, String> {
-        if raw.is_empty() && !icase && !multiline {
-            return Ok(None); // `//` — reuse whatever matched last
+        if raw.is_empty() {
+            // `//` reuses whatever matched last, which has its own flags — so GNU
+            // refuses to be given new ones rather than silently dropping them.
+            if icase || multiline {
+                return Err("cannot specify modifiers on empty regexp".to_string());
+            }
+            return Ok(None);
         }
-        let re = Regex::compile(raw, Options { ere: self.ere, icase, escapes: true, multiline })
+        // `M` is relative to the RECORD separator, which `N` can put inside the
+        // pattern space: under `-z`, `N` joins with a NUL and GNU anchors there.
+        let opts = Options {
+            ere: self.ere,
+            icase,
+            escapes: true,
+            reg_newline: multiline.then_some(separator_for(self.null_data)),
+        };
+        let re = Regex::compile(raw, opts)
             .map_err(|e| e.msg)?;
         self.regexes.push(re);
         Ok(Some(self.regexes.len() - 1))
@@ -376,11 +417,22 @@ impl ScriptParser<'_> {
 
     /// Text of an `a`/`i`/`c`: GNU's one-line form (`a text`) and the POSIX `a\`
     /// continuation form, where a trailing backslash keeps the text open.
-    fn parse_text(&mut self) -> Vec<u8> {
+    /// `a`/`i`/`c` text. GNU requires SOME text where the script (or the `-e` part)
+    /// ENDS -- `sed a` and `sed 1a` are `expected \\ after `a', `c' or `i'`, and a
+    /// blank does not count -- while a newline with more script after it is an EMPTY
+    /// text, which appends an empty line. A script ending in the command's own
+    /// backslash is accepted and writes NOTHING at all, which `None` is; an empty
+    /// LINE (`sed 'a\\\\'`) is `Some("")`.
+    fn parse_text(&mut self) -> Result<Option<Vec<u8>>, String> {
         self.skip_blank();
         let mut out = Vec::new();
         if self.eat(b'\\') {
-            self.eat(b'\n');
+            // The backslash asked for the next line, so it crosses a part boundary.
+            if !self.eat(b'\n') && self.peek().is_none() {
+                return Ok(None);
+            }
+        } else if self.peek().is_none() || self.at_part_end() {
+            return Err("expected \\ after `a', `c' or `i'".to_string());
         }
         loop {
             match self.bump() {
@@ -396,20 +448,20 @@ impl ScriptParser<'_> {
         // No terminator here: the writer appends the RECORD separator, which
         // under -z is NUL. Parsing cannot know it — the option is read first,
         // but the text belongs to the script.
-        out
+        Ok(Some(out))
     }
 
+    /// A label ends at a BLANK as much as at `;`, `}`, `#` or a newline, so `sed -n
+    /// ':a p'` is the label `a` and then `p` -- reading to the end of the command
+    /// instead swallows commands that follow one on the same line. Leading blanks are
+    /// skipped, which is why `b lbl` names `lbl`. Also `v`'s optional version.
     fn parse_label(&mut self) -> Vec<u8> {
         self.skip_blank();
         let start = self.pos;
-        while !matches!(self.peek(), None | Some(b'\n' | b';' | b'}')) {
+        while !matches!(self.peek(), None | Some(b'\n' | b' ' | b'\t' | b';' | b'}' | b'#')) {
             self.pos += 1;
         }
-        let mut label = self.src.get(start..self.pos).unwrap_or_default().to_vec();
-        while matches!(label.last(), Some(b' ' | b'\t')) {
-            label.pop();
-        }
-        label
+        self.src.get(start..self.pos).unwrap_or_default().to_vec()
     }
 
     /// r/R/w/W and the `s///w` flag all take a file name to end of line. An
@@ -439,11 +491,19 @@ impl ScriptParser<'_> {
         let mut wfile = None;
         loop {
             match self.peek() {
+                // GNU rejects a REPEAT of the three flags that carry a value, and
+                // `i`/`I`/`m`/`M` are the ones it lets you say twice.
                 Some(b'g') => {
+                    if global {
+                        return Err("multiple `g' options to `s' command".to_string());
+                    }
                     global = true;
                     self.pos += 1;
                 }
                 Some(b'p') => {
+                    if print {
+                        return Err("multiple `p' options to `s' command".to_string());
+                    }
                     print = true;
                     self.pos += 1;
                 }
@@ -462,12 +522,21 @@ impl ScriptParser<'_> {
                     break;
                 }
                 Some(b) if b.is_ascii_digit() => {
+                    if occurrence != 0 {
+                        return Err("multiple number options to `s' command".to_string());
+                    }
                     occurrence = self.parse_number().unwrap_or(0);
                     if occurrence == 0 {
                         return Err("number option to `s' command may not be zero".to_string());
                     }
                 }
-                _ => break,
+                // A blank SEPARATES flags rather than ending them (`s/a/b/ g p` is
+                // both), and anything that is not a flag or a command terminator is
+                // an error rather than the next command: `s/a/b/x` is `unknown option
+                // to `s'` in GNU, not a substitution followed by an exchange.
+                Some(b' ' | b'\t') => self.pos += 1,
+                None | Some(b'\n' | b';' | b'}' | b'#') => break,
+                Some(_) => return Err("unknown option to `s'".to_string()),
             }
         }
         let re = self.add_regex(&pattern, icase, multiline)?;
@@ -667,9 +736,23 @@ fn max_group(repl: &[Repl]) -> Option<usize> {
         .max()
 }
 
+/// The record separator `-z` selects. `M` needs it at PARSE time (it decides what
+/// `^`/`.` mean) and the executor needs it at run time, so the mapping lives once.
+fn separator_for(null_data: bool) -> u8 {
+    match null_data {
+        true => 0,
+        false => b'\n',
+    }
+}
+
 /// Parse a whole script: a flat command list, its regex table, and its labels.
-fn parse_script(src: &[u8], ere: bool) -> Result<Script, String> {
-    let mut p = ScriptParser { src, pos: 0, ere, regexes: Vec::new() };
+fn parse_script(
+    src: &[u8],
+    ere: bool,
+    null_data: bool,
+    part_ends: Vec<usize>,
+) -> Result<Script, String> {
+    let mut p = ScriptParser { src, pos: 0, ere, null_data, part_ends, regexes: Vec::new() };
     let mut cmds: Vec<Cmd> = Vec::new();
     let mut labels: BTreeMap<Vec<u8>, usize> = BTreeMap::new();
     let mut open_blocks: Vec<usize> = Vec::new();
@@ -702,9 +785,9 @@ fn parse_script(src: &[u8], ere: bool) -> Result<Script, String> {
                 Kind::Comment
             }
             b'=' => Kind::LineNumber,
-            b'a' => Kind::Append(p.parse_text()),
-            b'i' => Kind::Insert(p.parse_text()),
-            b'c' => Kind::Change(p.parse_text()),
+            b'a' => Kind::Append(p.parse_text()?),
+            b'i' => Kind::Insert(p.parse_text()?),
+            b'c' => Kind::Change(p.parse_text()?),
             b'b' => Kind::Branch(Target::Name(p.parse_label())),
             b't' => Kind::BranchIfSub(Target::Name(p.parse_label())),
             b'T' => Kind::BranchIfNoSub(Target::Name(p.parse_label())),
@@ -753,12 +836,43 @@ fn parse_script(src: &[u8], ere: bool) -> Result<Script, String> {
             b'z' => Kind::Zap,
             b'F' => Kind::FileName,
             b'v' => {
-                p.rest_of_line();
+                // `v` does nothing except REFUSE a script written for a newer sed, so
+                // its argument ends where a label does -- `v;p` runs the `p`, which
+                // swallowing the line lost. GNU compares against its own version, so
+                // td-txt compares against the GNU level it implements: comparing
+                // against its OWN 0.1.0 would refuse `v 4.2`, which real scripts use.
+                if version_is_newer(&p.parse_label()) {
+                    return Err("expected newer version of sed".to_string());
+                }
                 Kind::Comment
             }
             b'e' => return Err("the `e' command is not supported".to_string()),
             other => return Err(format!("unknown command: `{}'", char::from(other))),
         };
+        // The commands NOT listed here have already consumed everything that could
+        // need separating, each in its own way: a filename, `a`/`i`/`c` text and a
+        // comment run to the end of the line; a LABEL and `v`'s version stop at a
+        // blank, and GNU asks for nothing after them (`:a p` is a label then a
+        // command); and `s`'s flag loop enforces this same terminator set itself,
+        // with its own `unknown option to `s'`. `{` needs no separator, but its
+        // `}` does.
+        match &kind {
+            Kind::Comment
+            | Kind::Label
+            | Kind::Block(_)
+            | Kind::Branch(_)
+            | Kind::BranchIfSub(_)
+            | Kind::BranchIfNoSub(_)
+            | Kind::Append(_)
+            | Kind::Insert(_)
+            | Kind::Change(_)
+            | Kind::ReadFile(_)
+            | Kind::ReadLine(_)
+            | Kind::Write(_)
+            | Kind::WriteFirstLine(_)
+            | Kind::Subst(_) => {}
+            _ => p.end_of_cmd()?,
+        }
         cmds.push(Cmd { addr, kind });
     }
     if !open_blocks.is_empty() {
@@ -839,7 +953,10 @@ impl Stream {
 
 enum Append {
     Text(Vec<u8>),
+    /// `r`: the FILENAME, read when the queue is flushed.
     File(Vec<u8>),
+    /// `R`: the bytes, already read — GNU takes its line when the command runs, so a
+    /// source that cannot be READ fails before the cycle's own output.
     Line(Vec<u8>),
 }
 
@@ -849,25 +966,48 @@ enum Dest<'a> {
     Buffer(Vec<u8>),
 }
 
+/// Which logical stream a write belongs to, for the purpose of the owed separator.
+///
+/// GNU keeps the debt per OUTPUT STRUCT, and `w /dev/stdout` is a different struct
+/// from the auto-print stream even though both reach the same fd. The two debts are
+/// therefore independent: `printf x | sed -n -e 'w /dev/stdout' -e p` writes `xx`,
+/// because `p` does not pay what `w` owes, and neither does `q`'s settle.
+#[derive(Clone, Copy)]
+enum Chan {
+    /// Auto-print, `p`/`P`, `=`, `l`, `i`/`c`, and the append queue.
+    Main,
+    /// `w`/`W` aimed at `/dev/stdout`.
+    WFile,
+}
+
 /// The output stream, which OWES a separator rather than dropping one.
 ///
 /// GNU sed omits the trailing separator only at the very END of its output: with
 /// input `a\nb` (no final newline), `sed p` writes `a\na\nb\nb` — the first copy
 /// of the unterminated line still gets its newline, because more output followed.
-/// So an unterminated line sets `owed`, and the next write pays it.
+/// So an unterminated line sets `owed`, and the next write on the SAME channel
+/// pays it.
 struct Sink<'a> {
     dest: Dest<'a>,
     separator: u8,
     owed: bool,
+    owed_wfile: bool,
 }
 
 impl<'a> Sink<'a> {
     fn stdout(out: &'a mut Out, separator: u8) -> Self {
-        Self { dest: Dest::Stdout(out), separator, owed: false }
+        Self { dest: Dest::Stdout(out), separator, owed: false, owed_wfile: false }
     }
 
     fn buffer(separator: u8) -> Self {
-        Self { dest: Dest::Buffer(Vec::new()), separator, owed: false }
+        Self { dest: Dest::Buffer(Vec::new()), separator, owed: false, owed_wfile: false }
+    }
+
+    fn debt(&mut self, chan: Chan) -> &mut bool {
+        match chan {
+            Chan::Main => &mut self.owed,
+            Chan::WFile => &mut self.owed_wfile,
+        }
     }
 
     fn put(&mut self, bytes: &[u8]) -> Result<(), String> {
@@ -880,13 +1020,19 @@ impl<'a> Sink<'a> {
         }
     }
 
+    /// Pay a separator the channel's previous line left owed, if any.
+    fn pay(&mut self, chan: Chan) -> Result<(), String> {
+        if *self.debt(chan) {
+            *self.debt(chan) = false;
+            let sep = self.separator;
+            return self.put(&[sep]);
+        }
+        Ok(())
+    }
+
     /// Write, paying any separator the previous line left owed.
     fn write(&mut self, bytes: &[u8]) -> Result<(), String> {
-        if self.owed {
-            self.owed = false;
-            let sep = self.separator;
-            self.put(&[sep])?;
-        }
+        self.pay(Chan::Main)?;
         self.put(bytes)
     }
 
@@ -898,15 +1044,36 @@ impl<'a> Sink<'a> {
         self.put(b"\n")
     }
 
-    /// Write one line; an unterminated one owes its separator to the next write.
-    fn write_line(&mut self, bytes: &[u8], terminated: bool) -> Result<(), String> {
-        self.write(bytes)?;
+    /// Write one line; an unterminated one owes its separator to the next write on
+    /// the same channel.
+    fn write_line_on(&mut self, chan: Chan, bytes: &[u8], terminated: bool) -> Result<(), String> {
+        self.pay(chan)?;
+        self.put(bytes)?;
         if terminated {
             let sep = self.separator;
             return self.put(&[sep]);
         }
-        self.owed = true;
+        *self.debt(chan) = true;
         Ok(())
+    }
+
+    fn write_line(&mut self, bytes: &[u8], terminated: bool) -> Result<(), String> {
+        self.write_line_on(Chan::Main, bytes, terminated)
+    }
+
+    /// Pay a separator that an unterminated line left owed. Reaching end of input
+    /// leaves it owed forever, which is how a file with no final newline keeps that
+    /// shape; `q` settles the debt instead — the MAIN channel's only, since GNU's
+    /// `q` leaves an unterminated `w /dev/stdout` write bare.
+    fn settle(&mut self) -> Result<(), String> {
+        self.pay(Chan::Main)
+    }
+
+    fn flush(&mut self) -> Result<(), String> {
+        match &mut self.dest {
+            Dest::Stdout(out) => out.flush().map_err(|e| format!("write error: {}", errmsg(&e))),
+            Dest::Buffer(_) => Ok(()),
+        }
     }
 
     fn into_buffer(self) -> Vec<u8> {
@@ -914,6 +1081,47 @@ impl<'a> Sink<'a> {
             Dest::Buffer(buf) => buf,
             Dest::Stdout(_) => Vec::new(),
         }
+    }
+}
+
+/// One `w` target. GNU keeps an output per FILENAME, each with its OWN missing
+/// separator debt, so `printf x | sed -n -e 'w f' -e 'w f'` writes `x\nx` while the
+/// last write stays bare. `/dev/stderr` is an ordinary target to GNU too: raw
+/// bytes, no forced newline, its own debt.
+struct WFile {
+    dest: WDest,
+    owed: bool,
+}
+
+enum WDest {
+    File(std::fs::File),
+    Stderr,
+    /// `/dev/stdout` under `-i` only; otherwise it rides the auto-print sink.
+    Stdout,
+}
+
+impl WFile {
+    fn put(&mut self, bytes: &[u8]) -> Result<(), String> {
+        use std::io::Write as _;
+        let wrote = match &mut self.dest {
+            WDest::File(f) => f.write_all(bytes),
+            WDest::Stderr => std::io::stderr().write_all(bytes),
+            WDest::Stdout => std::io::stdout().write_all(bytes),
+        };
+        wrote.map_err(|e| format!("write error: {}", errmsg(&e)))
+    }
+
+    fn write_line(&mut self, bytes: &[u8], terminated: bool, separator: u8) -> Result<(), String> {
+        if self.owed {
+            self.owed = false;
+            self.put(&[separator])?;
+        }
+        self.put(bytes)?;
+        if terminated {
+            return self.put(&[separator]);
+        }
+        self.owed = true;
+        Ok(())
     }
 }
 
@@ -941,16 +1149,21 @@ struct Sed {
     /// so `G` on an unterminated last line still emits one.
     hold_terminated: bool,
     line_number: u64,
+    /// `-i`. Only `w /dev/stdout` reads it: the auto-print stream is then the
+    /// replacement buffer, and that write still has to reach standard output.
+    in_place: bool,
     terminated: bool,
     appends: Vec<Append>,
     replaced: bool,
     quit: Option<i32>,
     /// Index in the regex table of the last regex applied — what `//` reuses.
     last_regex: Option<usize>,
-    wfiles: BTreeMap<Vec<u8>, std::fs::File>,
+    wfiles: BTreeMap<Vec<u8>, WFile>,
     /// `R` reads ONE line per invocation, so the file is parsed once and the
-    /// cursor kept; re-reading per line would be quadratic.
-    rfiles: BTreeMap<Vec<u8>, (Vec<Line>, usize)>,
+    /// cursor kept; re-reading per line would be quadratic. Keyed by NAME, not
+    /// per command: two `R f` commands share one cursor in GNU, and advance it
+    /// twice in a cycle.
+    rfiles: BTreeMap<Vec<u8>, RFile>,
     file_name: Vec<u8>,
 }
 
@@ -1158,9 +1371,13 @@ impl Sed {
 fn escape_for_l(bytes: &[u8], width: usize, separator: u8, out: &mut Vec<u8>) {
     let mut col = 0usize;
     let push = |chunk: &[u8], col: &mut usize, out: &mut Vec<u8>| {
-        if width > 1 && *col + chunk.len() > width - 1 {
+        // `l 0` never wraps; `l 1` wraps before EVERY chunk, which GNU shows as a
+        // leading `\` on its own since the test already holds at column 0.
+        if width > 0 && *col + chunk.len() >= width {
             out.push(b'\\');
-            out.push(b'\n');
+            // The WRAP ends with the record separator, like the `$` below: under `-z`
+            // GNU breaks a long `l` line with a backslash and a NUL, not a newline.
+            out.push(separator);
             *col = 0;
         }
         out.extend_from_slice(chunk);
@@ -1294,8 +1511,14 @@ pub fn main(args: &[Vec<u8>]) -> i32 {
 
 /// Parse a script and resolve its branches. Split from `parse_script` so the two
 /// failures keep their own exit statuses (see `Fatal`).
-fn compile_script(src: &[u8], ere: bool, sandbox: bool) -> Result<Script, Fatal> {
-    let mut script = parse_script(src, ere)?;
+fn compile_script(
+    src: &[u8],
+    ere: bool,
+    sandbox: bool,
+    null_data: bool,
+    part_ends: Vec<usize>,
+) -> Result<Script, Fatal> {
+    let mut script = parse_script(src, ere, null_data, part_ends)?;
     if sandbox {
         check_sandbox(&script.cmds)?;
     }
@@ -1566,8 +1789,10 @@ fn run(args: &[Vec<u8>]) -> Result<i32, Fatal> {
     let files: Vec<Vec<u8>> = operands.collect();
 
     let mut source: Vec<u8> = Vec::new();
+    let mut part_ends: Vec<usize> = Vec::new();
     for (n, part) in script_parts.iter().enumerate() {
         if n > 0 {
+            part_ends.push(source.len());
             source.push(b'\n');
         }
         source.extend_from_slice(part);
@@ -1577,8 +1802,8 @@ fn run(args: &[Vec<u8>]) -> Result<i32, Fatal> {
         conf.suppress = true;
     }
 
-    let script = compile_script(&source, conf.ere, conf.sandbox)?;
-    let separator = if conf.null_data { 0u8 } else { b'\n' };
+    let script = compile_script(&source, conf.ere, conf.sandbox, conf.null_data, part_ends)?;
+    let separator = separator_for(conf.null_data);
     let seed = seed_ranges(&script.cmds);
     let mut sed = Sed {
         script,
@@ -1590,6 +1815,7 @@ fn run(args: &[Vec<u8>]) -> Result<i32, Fatal> {
         hold: Vec::new(),
         hold_terminated: true,
         line_number: 0,
+        in_place: conf.in_place.is_some(),
         terminated: true,
         appends: Vec::new(),
         replaced: false,
@@ -1614,6 +1840,11 @@ fn run(args: &[Vec<u8>]) -> Result<i32, Fatal> {
     let mut status = 0;
 
     if conf.separate || conf.in_place.is_some() {
+        // ONE stdout sink for every operand: `-s` restarts line numbers and range
+        // state per file, but stdout is still one stream, so a separator the last
+        // record of one file left owed is paid by the first write of the next.
+        // (`-i` writes each file's own buffer, where the debt IS per file.)
+        let mut sink = Sink::stdout(&mut out, separator);
         for path in &inputs {
             // Under `-i` an operand names the file to REWRITE, so `-` is an
             // ordinary name here rather than stdin — there is no rewriting a
@@ -1631,24 +1862,44 @@ fn run(args: &[Vec<u8>]) -> Result<i32, Fatal> {
                 }
             };
             let mut stream = to_stream(path, &data, separator);
-            // Line numbers and range state restart per file under -s / -i.
+            // Line numbers, range state, the HOLD SPACE and every REWINDABLE `R`
+            // read position restart per file under -s / -i. The output streams and
+            // their owed separators do not: those belong to the whole run. GNU
+            // clears the hold's TEXT but not its terminator flag, which is visible
+            // only after an unterminated file: `sed -s -n 'x;p'` over an
+            // unterminated `a` then `b\n` writes ONE separator, because the emptied
+            // hold still counts as unterminated and the second `p` leaves its
+            // separator owed.
             sed.line_number = 0;
             sed.ranges = seed_ranges(&sed.script.cmds);
+            sed.hold.clear();
+            for rfile in sed.rfiles.values_mut() {
+                if rfile.rewindable {
+                    rfile.pos = 0;
+                }
+            }
             let quit = match &conf.in_place {
                 Some(suffix) => {
-                    let mut sink = Sink::buffer(separator);
-                    let quit = sed.run_stream(&mut stream, &mut sink).map_err(Fatal::runtime)?;
-                    write_in_place(path, suffix, &sink.into_buffer())?;
+                    let mut buf = Sink::buffer(separator);
+                    let quit = sed.run_stream(&mut stream, &mut buf).map_err(Fatal::runtime)?;
+                    write_in_place(path, suffix, &buf.into_buffer())?;
                     quit
                 }
-                _ => {
-                    let mut sink = Sink::stdout(&mut out, separator);
-                    sed.run_stream(&mut stream, &mut sink).map_err(Fatal::runtime)?
-                }
+                _ => sed.run_stream(&mut stream, &mut sink).map_err(Fatal::runtime)?,
             };
             if let Some(code) = quit {
-                out.flush().map_err(|e| Fatal::runtime(format!("write error: {}", errmsg(&e))))?;
-                return Ok(code);
+                sink.flush().map_err(Fatal::runtime)?;
+                // A read failure that has ALREADY happened outranks the quit code,
+                // whatever it is: `sed -s -n Q7 /nosuch A` is 2 in GNU, not 7, while
+                // `sed -s -n Q7 A /nosuch` is 7 because the quit fires before the
+                // second operand is ever opened. Only this path may consult `status`,
+                // since it opens one operand at a time; the branch below reads every
+                // operand BEFORE the first cycle to resolve `$`, so its `status` can
+                // describe a file GNU would have quit before opening.
+                return Ok(match status {
+                    0 => code,
+                    _ => status,
+                });
             }
         }
     } else {
@@ -1677,6 +1928,88 @@ fn run(args: &[Vec<u8>]) -> Result<i32, Fatal> {
     }
     out.flush().map_err(|e| Fatal::runtime(format!("write error: {}", errmsg(&e))))?;
     Ok(status)
+}
+
+/// One `R` source: the lines, the cursor, and whether the per-operand reset may
+/// REWIND it. GNU rewinds with `rewind(3)`, which fails silently on a stream that
+/// cannot seek, so a pipe or fifo keeps its place across an `-s` boundary while a
+/// regular file restarts.
+struct RFile {
+    lines: Vec<Line>,
+    pos: usize,
+    rewindable: bool,
+}
+
+/// Read a file named by `r`/`R`. Unlike an operand or `-f`, `-` is NOT stdin here:
+/// GNU opens the name literally, so `R -` reads a file called `-` and reads nothing
+/// when there is none (`w -` already wrote one). The bool is whether the source can
+/// be rewound — `rewind(3)`'s own test, applied to the handle just read.
+///
+/// An OPEN failure is not an error, which is what makes `r /nonexistent` silent; a
+/// READ failure IS one, exit 4, and a DIRECTORY is how you get one.
+fn read_source(path: &[u8]) -> Result<(Vec<u8>, bool), String> {
+    let mut data = Vec::new();
+    let Ok(mut file) = std::fs::File::open(crate::util::path_from_bytes(path)) else {
+        return Ok((data, false));
+    };
+    if let Err(e) = file.read_to_end(&mut data) {
+        return Err(format!("read error on {}: {}", show(path), errmsg(&e)));
+    }
+    // GNU aliases the literal `/dev/stdin` to its own stdin stream, which is not
+    // among the streams it rewinds, however seekable that stream happens to be.
+    let rewindable = path != b"/dev/stdin" && file.seek(std::io::SeekFrom::Start(0)).is_ok();
+    Ok((data, rewindable))
+}
+
+/// Is `want` newer than the GNU sed level td-txt implements? GNU's `v` runs glibc's
+/// `strverscmp` against its own version, where runs of digits compare NUMERICALLY --
+/// which is what makes `4.10` newer than `4.9` -- and everything else compares
+/// bytewise: `v 4a` is refused because `a` > `.`, `v 4-9` is not because `-` < `.`,
+/// and a leading zero is an ordinary byte below every other digit rather than the
+/// start of a number. An empty argument is GNU's own 4.0, i.e. older.
+fn version_is_newer(want: &[u8]) -> bool {
+    // The GNU sed this program is written against, which is the corpus's oracle
+    // (spec/README names the store path). Moving that pin moves this.
+    const LEVEL: &[u8] = b"4.9";
+    let byte = |s: &[u8], i: usize| s.get(i).copied().unwrap_or(0);
+    // Both sides share everything up to the first difference, so one index serves.
+    let mut i = 0usize;
+    while byte(want, i) == byte(LEVEL, i) && byte(want, i) != 0 {
+        i += 1;
+    }
+    let (x, y) = (byte(want, i), byte(LEVEL, i));
+    if x == y {
+        return false;
+    }
+    // The digit run that still has digits where the other stops is the longer, and so
+    // the greater, number; runs of equal length are decided by the byte that differs.
+    let longer_run = || {
+        let count = |s: &[u8]| {
+            let mut n = i;
+            while s.get(n).is_some_and(u8::is_ascii_digit) {
+                n += 1;
+            }
+            n - i
+        };
+        match count(want).cmp(&count(LEVEL)) {
+            std::cmp::Ordering::Equal => x > y,
+            other => other == std::cmp::Ordering::Greater,
+        }
+    };
+    if i > 0 && byte(LEVEL, i - 1).is_ascii_digit() {
+        // INSIDE a run: whichever side keeps going has the longer number, and a side
+        // that has left it compares as the byte it left with.
+        return match (x.is_ascii_digit(), y.is_ascii_digit()) {
+            (true, true) => longer_run(),
+            (xd, yd) if xd != yd => xd,
+            _ => x > y,
+        };
+    }
+    // Between runs: two numbers BEGIN here only if neither begins with a zero.
+    match (x, y) {
+        (b'1'..=b'9', b'1'..=b'9') => longer_run(),
+        _ => x > y,
+    }
 }
 
 fn to_lines(data: &[u8], separator: u8) -> Vec<Line> {
@@ -1860,37 +2193,58 @@ impl Sed {
         sink.write_line(bytes, terminated)
     }
 
+    /// Take `R`'s next line from `path` and queue the bytes. GNU reads it when the
+    /// command runs, not when the queue is flushed, so `R` over a directory fails
+    /// BEFORE the cycle prints while `r` over one fails after.
+    fn queue_line(&mut self, path: &[u8]) -> Result<(), String> {
+        let separator = self.separator;
+        let entry = match self.rfiles.get_mut(path) {
+            Some(e) => e,
+            None => {
+                // A missing file is not an error for `R`: cache it as exhausted so it
+                // is opened at most once.
+                let (data, rewindable) = read_source(path)?;
+                let lines = to_lines(&data, separator);
+                self.rfiles.entry(path.to_vec()).or_insert(RFile { lines, pos: 0, rewindable })
+            }
+        };
+        let RFile { lines, pos, .. } = entry;
+        let Some(line) = lines.get(*pos) else {
+            return Ok(());
+        };
+        // `R` writes the line as it found it and owes NOTHING of its own: over a
+        // source with no final newline, `sed -n -e '1R f' -e '2p'` runs the two
+        // together in GNU. It still PAYS a debt the pattern space left, which the
+        // ordinary write does.
+        let mut bytes = line.text.clone();
+        if line.terminated {
+            bytes.push(separator);
+        }
+        *pos += 1;
+        self.appends.push(Append::Line(bytes));
+        Ok(())
+    }
+
     fn flush_appends(&mut self, sink: &mut Sink) -> Result<(), String> {
         let appends = std::mem::take(&mut self.appends);
         for a in appends {
             match a {
                 Append::Text(text) => sink.write_text(&text)?,
-                // A missing file is not an error for `r`/`R`, as in GNU sed.
+                // A missing file is not an error for `r`/`R`, as in GNU sed — but
+                // GNU pays the owed separator BEFORE it finds out, so `printf x |
+                // sed 'r /nonexistent'` still ends with one. Writing the empty
+                // content pays it and adds nothing, which is what an existing but
+                // empty file already did.
                 Append::File(path) => {
-                    if let Ok(data) = read_input(&path) {
-                        sink.write(&data)?;
-                    }
+                    // The owed separator is paid BEFORE the file's fate is known, so
+                    // `printf x | sed 'r /nonexistent'` still ends with one -- and so
+                    // does `r` over a directory, which then fails with exit 4.
+                    sink.write(&[])?;
+                    let (data, _) = read_source(&path)?;
+                    sink.write(&data)?;
                 }
-                Append::Line(path) => {
-                    let separator = self.separator;
-                    let entry = match self.rfiles.get_mut(&path) {
-                        Some(e) => e,
-                        None => {
-                            // A missing file is not an error for `R`: cache it as
-                            // exhausted so it is opened at most once.
-                            let lines = read_input(&path)
-                                .map(|d| to_lines(&d, separator))
-                                .unwrap_or_default();
-                            self.rfiles.entry(path).or_insert((lines, 0))
-                        }
-                    };
-                    let (lines, idx) = entry;
-                    if let Some(line) = lines.get(*idx) {
-                        let (text, terminated) = (line.text.clone(), line.terminated);
-                        *idx += 1;
-                        sink.write_line(&text, terminated)?;
-                    }
-                }
+                // `R` resolved its line when the command RAN — see `queue_line`.
+                Append::Line(bytes) => sink.write(&bytes)?,
             }
         }
         Ok(())
@@ -1903,28 +2257,29 @@ impl Sed {
         terminated: bool,
         sink: &mut Sink,
     ) -> Result<(), String> {
-        if path == b"/dev/stdout" {
-            return self.emit(sink, bytes, terminated);
-        }
-        if path == b"/dev/stderr" {
-            eprintln!("{}", show(bytes));
-            return Ok(());
-        }
-        use std::io::Write as _;
-        if !self.wfiles.contains_key(path) {
-            let file = std::fs::File::create(crate::util::path_from_bytes(path))
-                .map_err(|e| format!("couldn't open file {}: {}", show(path), errmsg(&e)))?;
-            self.wfiles.insert(path.to_vec(), file);
+        // `/dev/stdout` must share the auto-print stream's sink, or a `w` and a `p`
+        // in one script interleave wrongly. Under `-i` that sink is the replacement
+        // buffer, and GNU still writes to the real standard output — so there it is
+        // an ordinary target with a debt of its own, like every other one.
+        if path == b"/dev/stdout" && !self.in_place {
+            return sink.write_line_on(Chan::WFile, bytes, terminated);
         }
         let separator = self.separator;
-        let Some(file) = self.wfiles.get_mut(path) else {
+        if !self.wfiles.contains_key(path) {
+            let dest = if path == b"/dev/stdout" {
+                WDest::Stdout
+            } else if path == b"/dev/stderr" {
+                WDest::Stderr
+            } else {
+                WDest::File(std::fs::File::create(crate::util::path_from_bytes(path))
+                    .map_err(|e| format!("couldn't open file {}: {}", show(path), errmsg(&e)))?)
+            };
+            self.wfiles.insert(path.to_vec(), WFile { dest, owed: false });
+        }
+        let Some(w) = self.wfiles.get_mut(path) else {
             return Err(format!("couldn't open file {}", show(path)));
         };
-        file.write_all(bytes).map_err(|e| format!("write error: {}", errmsg(&e)))?;
-        if !terminated {
-            return Ok(()); // the input line had none either
-        }
-        file.write_all(&[separator]).map_err(|e| format!("write error: {}", errmsg(&e)))
+        w.write_line(bytes, terminated, separator)
     }
 
     /// One pass over the script for the current pattern space.
@@ -1977,12 +2332,14 @@ impl Sed {
                     return Err(format!("unresolved branch to `{}'", show(n)))
                 }
                 Some(Kind::Append(text)) => {
-                    let text = text.clone();
-                    self.appends.push(Append::Text(text));
+                    if let Some(text) = text.clone() {
+                        self.appends.push(Append::Text(text));
+                    }
                 }
                 Some(Kind::Insert(text)) => {
-                    let text = text.clone();
-                    sink.write_line(&text, true)?;
+                    if let Some(text) = text.clone() {
+                        sink.write_line(&text, true)?;
+                    }
                 }
                 Some(Kind::Change(text)) => {
                     let text = text.clone();
@@ -1991,7 +2348,8 @@ impl Sed {
                         .ranges
                         .get(pc)
                         .is_none_or(|r| !matches!(r, RangeState::Active(_)));
-                    if ends {
+                    // A `c` with no text still deletes; it just writes no line.
+                    if let (true, Some(text)) = (ends, text) {
                         sink.write_line(&text, true)?;
                     }
                     self.pattern.clear();
@@ -2058,15 +2416,20 @@ impl Sed {
                     self.terminated = line.terminated;
                 }
                 Some(Kind::NextAppend) => {
-                    self.flush_appends(sink)?;
+                    // At END of input GNU prints the pattern space and only THEN
+                    // flushes the append queue, so the flush waits until a line is
+                    // known to exist: `sed -e 'r f' -e N` over a one-line input
+                    // writes the line before f's text. Both flows the early returns
+                    // take already flush, in that order. (`--posix` drops the
+                    // pattern space instead, and `n` never had the problem.)
                     let Some(line) = stream.next_line() else {
-                        // GNU prints the pattern space and exits; POSIX drops it.
                         if self.posix {
                             self.pattern.clear();
                             return Ok(Flow::Deleted);
                         }
                         return Ok(Flow::Done);
                     };
+                    self.flush_appends(sink)?;
                     self.line_number += 1;
                     self.pattern.push(self.separator);
                     self.pattern.extend_from_slice(&line.text);
@@ -2092,8 +2455,23 @@ impl Sed {
                 Some(Kind::Quit(code, autoprint)) => {
                     let (code, autoprint) = (*code, *autoprint);
                     self.quit = Some(code);
-                    if autoprint && !self.suppress {
-                        self.emit_pattern(sink)?;
+                    if autoprint {
+                        if !self.suppress {
+                            self.emit_pattern(sink)?;
+                        }
+                        // `q` pays the separator a missing one is OWED, which reaching
+                        // end of input does not: `printf x | sed q` writes `x\n` and
+                        // `printf x | sed -n 'p;q'` does too, while `printf x | sed 2q`
+                        // and `-n 'p;Q'` write a bare `x`. So it is quitting through `q`
+                        // that settles it, not the auto-print — `-n 'p;q'` settles
+                        // although the `q` itself printed nothing.
+                        sink.settle()?;
+                    } else {
+                        // `Q` quits WITHOUT flushing the append queue, so a pending
+                        // `a` text is discarded: GNU prints nothing for `a\ntext` then
+                        // `Q`, while `q` prints the text. `Q` is "quit now", and the
+                        // queue is part of finishing the cycle it never finishes.
+                        self.appends.clear();
                     }
                     return Ok(Flow::Quit);
                 }
@@ -2103,7 +2481,7 @@ impl Sed {
                 }
                 Some(Kind::ReadLine(path)) => {
                     let path = path.clone();
-                    self.appends.push(Append::Line(path));
+                    self.queue_line(&path)?;
                 }
                 Some(Kind::Write(path)) => {
                     let path = path.clone();
@@ -2155,7 +2533,7 @@ impl Sed {
                         if let Some(path) = wfile {
                             let pattern = self.pattern.clone();
                             let terminated = self.terminated;
-                    self.write_to_file(&path, &pattern, terminated, sink)?;
+                            self.write_to_file(&path, &pattern, terminated, sink)?;
                         }
                     }
                 }
@@ -2192,7 +2570,9 @@ impl Sed {
         let mut changed = false;
         let mut last_end: Option<usize> = None;
         loop {
-            let caps = match re.search(&hay, pos) {
+            // A SUBSTITUTION is confined to one segment under `M` with a
+            // non-newline separator; an address is not. See `search_subst`.
+            let caps = match re.search_subst(&hay, pos) {
                 Ok(Some(c)) => c,
                 Ok(None) => break,
                 Err(e) => {
@@ -2254,19 +2634,22 @@ mod tests {
     /// Run a script over `input` and return what it wrote.
     fn sed(script: &str, input: &str, opts: &[&str]) -> Vec<u8> {
         let ere = opts.contains(&"-E") || opts.contains(&"-r");
-        let script = compile_script(script.as_bytes(), ere, false).unwrap();
+        let null_data = opts.contains(&"-z");
+        let sep = separator_for(null_data);
+        let script = compile_script(script.as_bytes(), ere, false, null_data, Vec::new()).unwrap();
         let nranges = script.cmds.len();
         let seed = seed_ranges(&script.cmds);
         let mut sed = Sed {
             script,
             ranges: seed,
             suppress: opts.contains(&"-n"),
-            separator: b'\n',
+            separator: sep,
             posix: false,
             pattern: Vec::new(),
             hold: Vec::new(),
             hold_terminated: true,
             line_number: 0,
+            in_place: false,
             terminated: true,
             appends: Vec::new(),
             replaced: false,
@@ -2276,10 +2659,74 @@ mod tests {
             rfiles: BTreeMap::new(),
             file_name: b"-".to_vec(),
         };
-        let mut stream = to_stream(b"-", input.as_bytes(), b'\n');
-        let mut sink = Sink::buffer(b'\n');
+        let mut stream = to_stream(b"-", input.as_bytes(), sep);
+        let mut sink = Sink::buffer(sep);
         sed.run_stream(&mut stream, &mut sink).unwrap();
         sink.into_buffer()
+    }
+
+    /// `l` wraps with a backslash and the RECORD separator, and its guard is `> 0`:
+    /// width 1 wraps before every chunk (so the line opens with a bare backslash),
+    /// width 0 never wraps. Both were wrong: the wrap was hardcoded to a newline and
+    /// the guard was `> 1`, so `l 1` behaved like `l 0`.
+    #[test]
+    fn list_wraps_on_the_record_separator_at_every_width() {
+        let mut out = Vec::new();
+        escape_for_l(b"abcdef", 1, b'\n', &mut out);
+        assert_eq!(out, b"\\\na\\\nb\\\nc\\\nd\\\ne\\\nf$\n");
+        out.clear();
+        escape_for_l(b"abcdef", 0, b'\n', &mut out);
+        assert_eq!(out, b"abcdef$\n");
+        out.clear();
+        escape_for_l(b"abcdef", 3, b'\n', &mut out);
+        assert_eq!(out, b"ab\\\ncd\\\nef$\n");
+        // Under `-z` both the wrap and the terminator are NUL.
+        out.clear();
+        escape_for_l(b"abcd", 3, 0, &mut out);
+        assert_eq!(out, b"ab\\\0cd$\0");
+    }
+
+    /// `q` pays a separator the record left OWED; `Q` does not, and `Q` also throws
+    /// away the append queue that `q` flushes.
+    #[test]
+    fn quit_settles_the_owed_separator_but_quit_silent_does_not() {
+        assert_eq!(sed("q", "x", &[]), b"x\n");
+        assert_eq!(sed("2q", "x", &[]), b"x");
+        assert_eq!(sed("p;q", "x", &["-n"]), b"x\n");
+        assert_eq!(sed("p;Q", "x", &["-n"]), b"x");
+        assert_eq!(sed("a text\nQ", "x\n", &[]), b"");
+        assert_eq!(sed("a text\nq", "x\n", &[]), b"x\ntext\n");
+    }
+
+    /// `M` is relative to the RECORD separator, and `N` is how one gets inside the
+    /// pattern space: under `-z` it joins with a NUL, and both halves move there.
+    #[test]
+    fn the_m_flag_follows_the_null_separator_that_next_append_inserted() {
+        assert_eq!(sed("N;s/^b/X/M", "a\0b\0", &["-z"]), b"a\0X\0");
+        assert_eq!(sed("N;s/a$/X/M", "a\0b\0", &["-z"]), b"X\0b\0");
+        // The exclusion half keeps `.` and a non-matching list off that NUL...
+        assert_eq!(sed("N;s/a.b/X/M", "a\0b\0", &["-z"]), b"a\0b\0");
+        assert_eq!(sed("N;s/[^a]/Y/M", "a\0b\0", &["-z"]), b"a\0Y\0");
+        // ...and off a newline too, which is not the separator here.
+        assert_eq!(sed("s/c.d/Z/M", "abc\ndef\0", &["-z"]), b"abc\ndef\0");
+        // Without `M` both bytes are ordinary.
+        assert_eq!(sed("N;s/a.b/X/", "a\0b\0", &["-z"]), b"X\0");
+        // And the anchor half does NOT fire at a newline under `-z`.
+        assert_eq!(sed("s/^d/X/M", "abc\ndef\0", &["-z"]), b"abc\ndef\0");
+    }
+
+    /// `w /dev/stdout` shares the fd with auto-print but not the debt, so neither
+    /// stream pays the other's and `q` settles only the auto-print stream's.
+    #[test]
+    fn the_owed_separator_is_per_output_stream() {
+        assert_eq!(sed("w /dev/stdout\np", "x", &["-n"]), b"xx");
+        assert_eq!(sed("p\nw /dev/stdout", "x", &["-n"]), b"xx");
+        assert_eq!(sed("w /dev/stdout\nw /dev/stdout", "x", &["-n"]), b"x\nx");
+        assert_eq!(sed("p\nw /dev/stdout\nq", "x", &["-n"]), b"xx\n");
+        assert_eq!(sed("w /dev/stdout\nq", "x", &["-n"]), b"x");
+        assert_eq!(sed("w /dev/stdout\nw /dev/stdout\nq", "x", &["-n"]), b"x\nx");
+        // A terminated record leaves no debt on either stream.
+        assert_eq!(sed("w /dev/stdout\np", "x\n", &["-n"]), b"x\nx\n");
     }
 
     #[test]
@@ -2427,9 +2874,28 @@ mod tests {
         // A bad script is status 1; an unresolvable branch is a RUNTIME error,
         // which GNU reports as 4.
         for bad in [&b"k"[..], b"s/a/b", b"{p"] {
-            let err = compile_script(bad, false, false).err().map(|f| f.status);
+            let err = compile_script(bad, false, false, false, Vec::new()).err().map(|f| f.status);
             assert_eq!(err, Some(1), "{:?} must be a status-1 script error", bad);
         }
-        assert_eq!(compile_script(b"bnowhere", false, false).err().map(|f| f.status), Some(4));
+        assert_eq!(
+            compile_script(b"bnowhere", false, false, false, Vec::new()).err().map(|f| f.status),
+            Some(4)
+        );
+    }
+
+    /// `a`/`i`/`c` need text where the script ENDS, and an `-e` part ends there for
+    /// that question only -- the same bytes as one argument are legal.
+    #[test]
+    fn a_text_command_needs_text_only_where_its_part_ends() {
+        let compile = |src: &[u8], parts: Vec<usize>| {
+            compile_script(src, false, false, false, parts).err().map(|f| f.status)
+        };
+        // `sed a` and `sed -e a -e p`: nothing after the command in its own part.
+        assert_eq!(compile(b"a", Vec::new()), Some(1));
+        assert_eq!(compile(b"a\np", vec![1]), Some(1));
+        // The same bytes as ONE argument are an empty text and a following command.
+        assert_eq!(compile(b"a\np", Vec::new()), None);
+        // A backslash asks for the next line, so it crosses the boundary.
+        assert_eq!(compile(b"a\\\ntext", vec![2]), None);
     }
 }

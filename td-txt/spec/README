@@ -147,6 +147,201 @@ td-txt-authored case files
   the oracle is the only comparison. The long-line block below is that regression
   test.
 
+  The same campaign against SED, whose corpus had had none, found six — and its
+  noise bucket was one flag rather than a regex corner. `--posix` dominated every
+  early run, because GNU's `--posix` disables GNU's own extensions and refuses
+  twelve constructs td-txt accepts (`first~step`, `addr,+N`, `addr,~N`, `0,/re/`,
+  `s///I`, `s///M`, `Q`, `T`, `z`, `F`, one-liner `a text`, `q5`) while turning
+  `\U\L\u\l\E` and BRE `\+ \? \| \w` into literals. td-txt implements `--posix`
+  for exactly ONE of those (`N` at end of input) and silently ignores the rest, so
+  every script that mixed the flag with an extension read as a divergence.
+  Excluding the flag took 750 cases from 20 divergences to 1. Make it the first
+  thing you bucket, and note that the gap it hides is itself a finding: an option
+  accepted and mostly ignored is the "silent no-op" ../src/sed.rs's header says
+  this program never has. Fixing that is its own landing.
+
+  Sed rewards fuzzing the SEPARATOR, not just the script. Four of the six bugs
+  needed `-z` or an input with no final newline to show at all: `l` wrapped with a
+  newline where GNU wraps with the record separator, `M` anchored at a newline
+  under `-z` where GNU anchors at the NUL, and `q` paid a separator debt that
+  reaching end of input must leave unpaid. Generate unterminated inputs and
+  NUL-separated ones as a matter of course; a corpus of newline-terminated lines
+  cannot see any of it.
+
+  Two refinements of that, each of which cost a round of review to learn. First,
+  fuzz the commands that put a separator INSIDE the pattern space. `M` is POSIX
+  REG_NEWLINE relative to the record separator, and the first pass concluded that
+  its anchor half must go inert under `-z` because no record contains its own
+  separator -- true of a record, false of a pattern space, because `N` joins two
+  records WITH one. Every `-z`+`M` case in the first pass omitted `N`, so 232 green
+  cases agreed with a wrong rule. Second, fuzz more than one output stream and more
+  than one input file, because sed's state is a mix of per-run and per-file and a
+  single-file, single-stream generator cannot tell which is which.
+
+  What `M` actually is, since two rounds of this branch got it wrong: GNU
+  implements it as TWO mechanisms, and a pattern can tell them apart.
+
+  - libc's REG_NEWLINE, bound to `\n` whatever the separator is. `^`/`$` gain the
+    embedded newlines and `.` / a non-matching bracket list lose them -- but
+    NOTHING else does, so `\W` and an explicit `[\n]` still match one.
+  - Confinement to the segments between separators, which GNU needs only when the
+    separator is not a newline, libc having no way to express it. There the anchors
+    move to that byte and nothing consumes it: not `.`, not `\W`, not `\s`, not a
+    named `\x00`, and no backreference spans one.
+
+  Both of those are properties of the CALL, not of the pattern -- which is the third
+  thing this branch got wrong about `M`, and the missing fuzz axis was the COMMAND
+  FORM. GNU confines a SUBSTITUTION to the segment it is working in; an ADDRESS
+  matches the whole pattern space. So `sed -z -n -e N -e '/a.b/Mp'` matches across
+  the NUL while `s/a.b/X/M` on the same space does not, and the same split holds for
+  `\W`, a named `\x00` and `[^x]`. The BUFFER ANCHORS split the same way, and not as
+  you would guess from any other regex flavour: to an address ``\` ``/`\'` are
+  indistinguishable from `^`/`$` and move to the record separator with them, while a
+  substitution moves them only for a SEGMENT. So with a newline separator `/\`b/M`
+  matches the pattern space `a\nb` and `s/\`b/X/M` finds nothing in it, and
+  `s/\`a/X/Mg` over `a\na` rewrites ONE `a` where `s/^a/X/Mg` rewrites both. Under
+  `-z` the segment moves them for both callers. The REG_NEWLINE rules above (`.` and
+  a non-matching list losing `\n`) apply to both callers either way.
+
+  One more thing splits the two paths, and no rule about `M` predicts it: a
+  BACKREFERENCE anywhere in the pattern confines an ADDRESS as well. `sed -z -n -e
+  'N;N' -e '/\(.\)\1/Mp'` over `a\0\0b\0` finds nothing, while `/../Mp` and
+  `/\(a\)\x00/Mp` over the same pattern space both match -- and `/\(a\)\x00\1*/Mp`
+  does not, though `\1*` need consume nothing, so it is the PRESENCE of a backref and
+  not its own match that does it. That is glibc's backref matcher, not something sed
+  documents; td-txt reproduces it with one compile-time flag rather than recording a
+  divergence, because the corpus's oracle is what GNU 4.9 does here. A match wholly
+  inside one segment is unaffected, and with a newline separator (no segment) a
+  doubled NUL is an ordinary pair to a backref.
+
+  So under `-z` a newline inside a record stays ordinary to `\W` while the NUL is
+  invisible to everything a substitution can consume. Probing only `.` and `[^...]`
+  cannot distinguish the two mechanisms, because those are the one place both apply
+  -- probe `\W` against BOTH separators, which is the single cheapest
+  discriminator. And confinement has to hold for the greedy-repeat fast path too,
+  which consumes bytes without taking the ordinary single-byte step: `s/a.b/X/M`
+  refused a NUL that `s/.*/X/M` swallowed.
+
+  One ordering rule that only `r`/`R` against the quit commands can expose: `N` at
+  END of input prints the pattern space BEFORE flushing the append queue, the
+  reverse of every other path, `n` at end of input included. Two commands that both
+  write, in the same cycle, is the shape to generate -- a queue and a print each
+  look right alone.
+
+  The inventory of per-run versus per-file state, which the `-s` bugs came out of:
+
+  - Per RUN, surviving every operand: the output streams and their owed
+    separators. The debt is per output TARGET (GNU keeps one per filename), so `w
+    /dev/stdout` is a different stream from auto-print even though both reach the
+    same fd, a `w` file has its own, and `/dev/stderr` is an ordinary target with
+    raw bytes and no forced newline. `q` settles the auto-print stream alone.
+  - Per FILE under `-s`/`-i`: line numbers, range state, the hold space and every
+    REWINDABLE `R` read position. GNU clears the hold's TEXT but keeps its
+    terminator flag, which shows only after an unterminated file. And it restarts an
+    `R` source with `rewind(3)`, which fails silently on a stream that cannot seek:
+    a pipe or fifo keeps its place across the boundary while a regular file starts
+    over. GNU also aliases the literal `/dev/stdin` to its own stdin stream, which
+    is not among the streams it rewinds however seekable that stream is -- so with
+    stdin redirected FROM A REGULAR FILE, `R /dev/stdin` does not rewind while `R
+    /proc/self/fd/0` and `R /dev/fd/0`, naming the same file, do. That last pair
+    cannot go in the corpus: which of the two answers is right depends on whether
+    the harness hands the case a pipe or a file.
+  - `R` cursors are keyed by NAME, not per command: two `R f` commands share one
+    cursor and advance it twice in a cycle, while an `r f` beside them is unrelated.
+  - And `w /dev/stdout` still means the real standard output under `-i`, where the
+    auto-print stream is the replacement buffer.
+
+  What ends a command's ARGUMENT is the same question one step in, and the answer is
+  not "the end of the command" for any of the three arguments that look like text. A
+  LABEL (`:`, `b`, `t`, `T`) ends at a BLANK as much as at `;`, `}`, `#` or a newline,
+  so `sed -n ':a p'` is the label `a` and then `p`, and `b a p` jumps to `a`. `v`'s
+  optional version ends there too -- `v;p` runs the `p` -- and GNU compares it with
+  glibc's `strverscmp` against its OWN version, so `v 4.10` is refused while `v 4.9`
+  is not, `v 4a` is refused because `a` sorts above `.` while `v 4-9` is accepted
+  because `-` sorts below it, and an empty argument compares as 4.0. td-txt compares
+  against the GNU LEVEL it implements rather than its own version number, since
+  comparing against 0.1.0 would refuse the `v 4.2` real scripts carry. And `s`'s
+  FLAGS end only at a command terminator: a blank separates flags rather than ending
+  them (`s/a/b/ g p` is both), an unknown letter is `unknown option to `s'` rather
+  than the next command, and `g`, `p` and the occurrence number may not repeat while
+  `i`/`I`/`m`/`M` may.
+
+  One acceptance rule the command-form axis turned up on its own: GNU requires a
+  command SEPARATOR after every command that does not consume the rest of the line,
+  so `sed -n 'gp'` is an error and not `g` then `p`, and so is `g p`. `;`, a newline,
+  `}`, `#` and end-of-script separate. A filename, `a`/`i`/`c` text and a comment
+  need nothing because they swallow the line; a label and `v`'s version need nothing
+  because GNU asks for nothing after them (`:a p` is a label then a command); and
+  `s` needs nothing because its own flag loop enforces the same terminator set with
+  its own diagnostic, while `y` has no flags and does need a separator. td-txt accepted all twenty of those juxtapositions, which is how a
+  generator emitting `/re/Mgp` -- `g` is no address flag -- produced 34 divergences
+  in one seed and looked like a regex bug.
+
+  `-` is not stdin everywhere it can appear. It is stdin as an OPERAND and for `-f`
+  (where GNU prefers stdin even when a file called `-` exists), and an ordinary
+  filename to `r`, `R` and `w` (where it always was) and to an operand under `-i`
+  (there being no rewriting a pipe). So `R -` reads a file named `-` and reads
+  nothing at all when there is none, silently, because a missing `R` source is not
+  an error.
+
+  Five gaps this campaign found and did NOT fix, recorded here so the next round
+  starts from the probe results rather than re-deriving them. All but the first
+  have corpus cases carrying GNU's goldens, listed as xfail; `--posix`'s two cases
+  PASS, because what is missing there is a restriction rather than an answer, and
+  the probe table below is its specification instead:
+
+  - `--posix`, above: implemented for one behaviour of twelve-plus, silently
+    ignored for the rest. `POSIXLY_CORRECT` selects the same mode in GNU and is not
+    read at all here (`POSIXLY_CORRECT=1 sed '$!d;N'` over two lines prints nothing
+    in GNU and the second line here), and GNU refuses `v` outright under the flag
+    (`unknown command: `v'`) while clearing posix mode is `v`'s documented side
+    effect when it is allowed -- neither of which td-txt has anywhere to put until
+    the mode exists.
+
+  - GNU opens a `w` target while it PARSES the command, not on first write. So the
+    file is created (and an existing one truncated) even if no write ever reaches
+    it, an unopenable target is exit 4 from a command no cycle runs, and it
+    outranks a script error LATER in the script while an EARLIER one outranks it
+    (`sed -n -e 'w /nodir/f' -e '{'` is exit 4; `-e ZZ -e 'w /nodir/f'` is exit 1).
+    That last ordering is the constraint: it means opening after the parse finishes
+    is not a fix, and td-txt's parser cannot currently fail with any status but 1.
+    It covers the `s///w` FLAG by the same route, which is the second thing (with
+    `[\n]`) a parser-shape generator keeps rediscovering: a `w` filename runs to the
+    end of the line, so any generator that puts a `/` after one hands GNU a path
+    whose directory does not exist and gets exit 4 from a command no cycle runs.
+
+  - GNU opens each operand only when it reaches it, so a `q` early in the script
+    means a later unreadable operand is never opened and never reported. td-txt's
+    non-`-s` path reads every operand up front to resolve `$`, so it cannot tell a
+    failure GNU would have seen from one it would have quit before reaching. Two
+    consequences, both pinned as cases: it prints a diagnostic GNU never does, and
+    where the failure comes FIRST the quit code wins there while GNU's failure wins.
+    The rule, which the `-s`/`-i` path does honour, is that a failure ALREADY SEEN
+    outranks the quit code whatever it is -- `sed -s -n Q7 /nosuch A` is 2, not 7 --
+    while a quit reached first keeps its own code. Making the eager path lazy means
+    teaching `$` to look ahead one operand.
+
+    A third consequence, and the cheapest probe for the whole gap: `F` names the
+    wrong file as soon as the script contains a `$`. GNU's lookahead has ALREADY
+    opened the next operand and `F` reports whatever is open, so `sed -n -e '$d' -e
+    F in0 in1 in2` prints `in1 in2` in GNU and `in0 in1` here; without the `$` both
+    print all three. It is one xfail case, and it is the shape to check first if
+    anyone makes the eager read lazy, because getting `F` right is the same question
+    as getting the lookahead right.
+
+  - GNU applies its escape vocabulary BEFORE compiling, so the escapes work in
+    places td-txt does not decode them. In a bracket expression: `[\n]`, `[\t]`,
+    `[\x41]`, `[\o101]` and `[\d065]` all match one byte, where td-txt decodes per
+    atom and POSIX makes a backslash inside a bracket an ordinary member, so
+    `[\d065]` matches any of `\ d 0 6 5`. `[\w]` and `[\\]` agree already and are
+    the controls a fix must not break. It is NOT only brackets, which is why the
+    fix is a pass rather than a patch: `a`/`i`/`c` text takes them too, `sed 'a
+    T\tU'` emitting a real tab where td-txt emits a `t`. FILENAMES do not --
+    neither implementation decodes an escape in an `r`/`w` target, so `r \x72f`
+    reads a file literally named `\x72f` in both. An earlier draft of this note
+    claimed otherwise and a reviewer caught it; the probe is one line, so run it
+    rather than reasoning by analogy from the bracket case.
+
   Goldens are C-locale. Under LC_ALL=C — the only locale td's image sets, and what
   every case here was captured under — GNU `grep -w '\.*'` selects `.a`; under a
   UTF-8 locale the same GNU binary selects nothing. Re-derive a `-w` golden without

@@ -839,7 +839,10 @@ fn compile(conf: &Conf, lines: &[Vec<u8>]) -> Result<Patterns, String> {
         ere: conf.syntax == Syntax::Extended,
         icase: conf.icase,
         escapes: false,
-        multiline: false,
+        // GNU grep never sets REG_NEWLINE, not even under `-z`, where a record can
+        // hold newlines: `grep -z 'a.c'` matches across one and `-z '^c'` does not
+        // anchor after one. sed's `M` is the only way into that rule.
+        reg_newline: None,
     };
     let mut res = Vec::with_capacity(lines.len());
     for line in lines {

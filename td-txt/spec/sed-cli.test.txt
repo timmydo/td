@@ -2531,7 +2531,7 @@ ALPHA
 ## stderr-json: ""
 ## status: 0
 
-#### a w file that will not open is a RUNTIME failure, exit 4, with no expression blamed
+#### a w file that will not open is exit 4, with no expression blamed
 ## argv: sed -n "w /nosuchdir/out"
 ## stdin:
 alpha
@@ -2555,6 +2555,894 @@ sed: couldn't open file /nosuchdir/out: No such file or directory
 
 
 
+# `\`` and `\'` are BUFFER anchors: `M` does not move them, which is the whole
+# point of having them alongside `^`/`$`. Separator confinement DOES move them,
+# because GNU then matches inside one segment and that segment's ends are the
+# buffer's as far as the match can see -- the same asymmetry `\W` has.
+
+#### M does not move the buffer anchor backtick
+## argv: sed -n -e N;s/\\`a/X/Mgp
+## stdin-json: "a\na\n"
+## stdout-json: "X\na\n"
+## stderr-json: ""
+## status: 0
+
+#### nor without M
+## argv: sed -n -e N;s/\\`a/X/gp
+## stdin-json: "a\na\n"
+## stdout-json: "X\na\n"
+## stderr-json: ""
+## status: 0
+
+#### while ^ under M does move, which is the difference
+## argv: sed -n -e N;s/^a/X/Mgp
+## stdin-json: "a\na\n"
+## stdout-json: "X\nX\n"
+## stderr-json: ""
+## status: 0
+
+#### the end buffer anchor is the same
+## argv: sed -n -e N;s/\\\'/<>/Mgp
+## stdin-json: "ab\ncd\n"
+## stdout-json: "ab\ncd<>\n"
+## stderr-json: ""
+## status: 0
+
+#### while $ under M moves
+## argv: sed -n -e N;s/a\$/Y/Mgp
+## stdin-json: "a\na\n"
+## stdout-json: "Y\nY\n"
+## stderr-json: ""
+## status: 0
+
+#### but separator CONFINEMENT does move the buffer anchors under -z
+## argv: sed -z -n -e N;s/\\`a/X/Mgp
+## stdin-json: "a\u0000a\u0000"
+## stdout-json: "X\u0000X\u0000"
+## stderr-json: ""
+## status: 0
+
+#### and the end one with it
+## argv: sed -z -n -e N;s/a\\\'/Y/Mgp
+## stdin-json: "a\u0000a\u0000"
+## stdout-json: "Y\u0000Y\u0000"
+## stderr-json: ""
+## status: 0
+
+#### without M under -z they stay at the buffer ends
+## argv: sed -z -n -e N;s/\\`a/X/gp
+## stdin-json: "a\u0000a\u0000"
+## stdout-json: "X\u0000a\u0000"
+## stderr-json: ""
+## status: 0
+
+# GNU pays an owed separator BEFORE it discovers an `r` file cannot be opened, so
+# a missing file still terminates the line that preceded it. An existing but empty
+# one already did; the two now go through the same write.
+
+#### r pays an owed separator even when the file cannot be opened
+## argv: sed -e r\ nosuchfile
+## stdin-json: "x"
+## stdout-json: "x\n"
+## stderr-json: ""
+## status: 0
+
+#### the same under -z, with the record separator
+## argv: sed -z -e r\ nosuchfile
+## stdin-json: "x"
+## stdout-json: "x\u0000"
+## stderr-json: ""
+## status: 0
+
+#### and over a last line with no separator of its own
+## argv: sed -e r\ nosuchfile
+## stdin-json: "a\nb"
+## stdout-json: "a\nb\n"
+## stderr-json: ""
+## status: 0
+
+#### an existing file pays it too, which already worked
+## argv: sed -e r\ rf
+## file-json rf: "R1\n"
+## stdin-json: "x"
+## stdout-json: "x\nR1\n"
+## stderr-json: ""
+## status: 0
+
+#### R of a missing file queues nothing and pays nothing
+## argv: sed -e R\ nosuchfile
+## stdin-json: "x"
+## stdout-json: "x"
+## stderr-json: ""
+## status: 0
+
+# Recorded, not fixed: a backreference to a group that did not participate. GNU
+# fails the match; td-txt treats the unset group as the empty string. Pre-existing
+# and unrelated to the separator work -- found by fuzzing this branch -- and
+# changing it touches every backreference, so it is its own landing.
+
+#### a backreference to a group that did not participate does not match
+## argv: sed -n -e s/\\(x\\)\\?a\\1/<&>/p
+## stdin-json: "ab\n"
+## stdout-json: ""
+## stderr-json: ""
+## status: 0
+
+#### where the group DID participate it matches as usual
+## argv: sed -n -e s/\\(x\\)\\?a\\1/<&>/p
+## stdin-json: "xax\n"
+## stdout-json: "<xax>\n"
+## stderr-json: ""
+## status: 0
+
+# `N` at END of input is a GNU extension -- it prints the pattern space and exits
+# rather than dropping it -- and the print comes BEFORE the append queue flushes,
+# the reverse of every other path. A `N` that finds a line flushes first, as GNU's
+# read does; `n` already had the order right. Found by fuzzing `r`/`R` against the
+# quit commands, which is the only way the two orders produce different bytes.
+
+#### N at end of input prints the pattern space BEFORE the append queue
+## argv: sed -e 'r rf' -e N Ft
+## file-json rf: "R1\n"
+## file-json Ft: "a\n"
+## stdin-json: ""
+## stdout-json: "a\nR1\n"
+## stderr-json: ""
+## status: 0
+
+#### the same with no final newline, where the print pays the separator
+## argv: sed -e 'r rf' -e N Fu
+## file-json rf: "R1\n"
+## file-json Fu: "a"
+## stdin-json: ""
+## stdout-json: "a\nR1\n"
+## stderr-json: ""
+## status: 0
+
+#### and with a queued a text rather than a file
+## argv: sed -e 'a T' -e N Ft
+## file-json rf: "R1\n"
+## file-json Ft: "a\n"
+## stdin-json: ""
+## stdout-json: "a\nT\n"
+## stderr-json: ""
+## status: 0
+
+#### under --posix the pattern space is dropped and the queue still flushes
+## argv: sed --posix -e 'r rf' -e N Ft
+## file-json rf: "R1\n"
+## file-json Ft: "a\n"
+## stdin-json: ""
+## stdout-json: "R1\n"
+## stderr-json: ""
+## status: 0
+
+#### a N that DOES find a line flushes the queue first, as before
+## argv: sed -e 'r rf' -e N F2
+## file-json rf: "R1\n"
+## file-json F2: "a\nb\n"
+## stdin-json: ""
+## stdout-json: "R1\na\nb\n"
+## stderr-json: ""
+## status: 0
+
+#### n at end of input already had that order
+## argv: sed -e 'r rf' -e n Ft
+## file-json rf: "R1\n"
+## file-json Ft: "a\n"
+## stdin-json: ""
+## stdout-json: "a\nR1\n"
+## stderr-json: ""
+## status: 0
+
+#### and -n leaves only the queue
+## argv: sed -n -e 'a T' -e N Ft
+## file-json rf: "R1\n"
+## file-json Ft: "a\n"
+## stdin-json: ""
+## stdout-json: "T\n"
+## stderr-json: ""
+## status: 0
+
+# Exit status when a quit meets a read failure. A failure ALREADY SEEN outranks
+# the quit code, whatever it is -- `sed -s -n Q7 /nosuch A` is 2, not 7 -- while a
+# quit reached before the unreadable operand keeps its own code, GNU opening each
+# operand only when it gets there. GNU does not distinguish a bare `q` from `q0`.
+# Only the `-s`/`-i` path can honour this; the block below says why.
+
+#### a read failure already seen outranks a zero quit code
+## argv: sed -s -n 2q A nosuch B
+## file-json A: "a\n"
+## file-json B: "b\nc\n"
+## stdin-json: ""
+## stdout-json: ""
+## stderr-json: "sed: can't read nosuch: No such file or directory\n"
+## status: 2
+
+#### and outranks an EXPLICIT non-zero one just the same
+## argv: sed -s -n Q7 nosuch A
+## file-json A: "a\n"
+## stdin-json: ""
+## stdout-json: ""
+## stderr-json: "sed: can't read nosuch: No such file or directory\n"
+## status: 2
+
+#### q5 after a failed operand reports the failure, not 5
+## argv: sed -s -n q5 nosuch A
+## file-json A: "a\n"
+## stdin-json: ""
+## stdout-json: ""
+## stderr-json: "sed: can't read nosuch: No such file or directory\n"
+## status: 2
+
+#### a bare q after one reports it too
+## argv: sed -s -n q nosuch A
+## file-json A: "a\n"
+## stdin-json: ""
+## stdout-json: ""
+## stderr-json: "sed: can't read nosuch: No such file or directory\n"
+## status: 2
+
+#### as does q0, GNU not distinguishing it from a bare q
+## argv: sed -s -n q0 nosuch A
+## file-json A: "a\n"
+## stdin-json: ""
+## stdout-json: ""
+## stderr-json: "sed: can't read nosuch: No such file or directory\n"
+## status: 2
+
+#### but a quit reached BEFORE the unreadable operand keeps its own code
+## argv: sed -s -n q5 A nosuch B
+## file-json A: "a\n"
+## file-json B: "b\nc\n"
+## stdin-json: ""
+## stdout-json: ""
+## stderr-json: ""
+## status: 5
+
+#### Q7 likewise, the second operand never being opened
+## argv: sed -s -n Q7 A nosuch
+## file-json A: "a\n"
+## stdin-json: ""
+## stdout-json: ""
+## stderr-json: ""
+## status: 7
+
+#### and a zero quit code reached first is still 0
+## argv: sed -s -n q A nosuch
+## file-json A: "a\n"
+## stdin-json: ""
+## stdout-json: ""
+## stderr-json: ""
+## status: 0
+
+#### with nothing unreadable a zero quit code stays 0
+## argv: sed -s -n 2q A B
+## file-json A: "a\n"
+## file-json B: "b\nc\n"
+## stdin-json: ""
+## stdout-json: ""
+## stderr-json: ""
+## status: 0
+
+#### and without any quit the failure reports itself
+## argv: sed -s -n '' A nosuch B
+## file-json A: "a\n"
+## file-json B: "b\nc\n"
+## stdin-json: ""
+## stdout-json: ""
+## stderr-json: "sed: can't read nosuch: No such file or directory\n"
+## status: 2
+
+# Recorded, not fixed: without `-s`, td-txt reads every operand before the first
+# cycle to resolve `$`, so it cannot tell a failure GNU would have seen from one it
+# would have quit before reaching. Two consequences, both pinned here: it reports a
+# diagnostic GNU never prints, and where the failure comes FIRST -- so GNU does see
+# it -- the quit code wins here where GNU's failure wins. Making the read lazy means
+# teaching `$` to look ahead one operand, which is its own landing.
+
+#### without -s a failure on the FIRST operand outranks the quit code too
+## argv: sed -n Q7 nosuch A
+## file-json A: "a\n"
+## stdin-json: ""
+## stdout-json: ""
+## stderr-json: "sed: can't read nosuch: No such file or directory\n"
+## status: 2
+
+#### and q5 reports it rather than 5
+## argv: sed -n q5 nosuch A
+## file-json A: "a\n"
+## stdin-json: ""
+## stdout-json: ""
+## stderr-json: "sed: can't read nosuch: No such file or directory\n"
+## status: 2
+
+# `R` writes its line as it found it and owes NOTHING of its own, though it still
+# pays a separator the pattern space left owed. `r` (whole file) always worked that
+# way; only `R` owed, and it took a `p` AFTER the `R` to see it -- a first-round
+# review raised this and the probe that answered it put the `R` last, where no
+# later write could reveal the debt.
+
+#### R owes nothing when its source line has no final separator
+## argv: sed -n -e '1R rf' -e 2p
+## file-json rf: "R"
+## stdin-json: "x\ny\n"
+## stdout-json: "Ry\n"
+## stderr-json: ""
+## status: 0
+
+#### R writes the separator when its source line had one
+## argv: sed -n -e '1R rt' -e 2p
+## file-json rt: "R\n"
+## stdin-json: "x\ny\n"
+## stdout-json: "R\ny\n"
+## stderr-json: ""
+## status: 0
+
+#### R still PAYS a separator the pattern space left owed
+## argv: sed -n -e p -e 'R rf'
+## file-json rf: "R"
+## stdin-json: "x"
+## stdout-json: "x\nR"
+## stderr-json: ""
+## status: 0
+
+#### r behaves the same way for a whole file with no final separator
+## argv: sed -n -e '1r rf' -e 2p
+## file-json rf: "R"
+## stdin-json: "x\ny\n"
+## stdout-json: "Ry\n"
+## stderr-json: ""
+## status: 0
+
+# `//` reuses the last regex, which has its own flags, so GNU refuses to be handed
+# new ones rather than silently dropping them. A bare `//` stays legal.
+
+#### a modifier on an empty regexp is refused
+## argv: sed -n -e s/a/A/ -e s//X/Mp A
+## file-json A: "a\n"
+## stdin-json: ""
+## stdout-json: ""
+## stderr-contains: cannot specify modifiers on empty regexp
+## status: 1
+
+#### the same for I
+## argv: sed -n -e s/a/A/ -e s//X/Ip A
+## file-json A: "a\n"
+## stdin-json: ""
+## stdout-json: ""
+## stderr-contains: cannot specify modifiers on empty regexp
+## status: 1
+
+#### and for an empty ADDRESS regexp
+## argv: sed -n -e /a/p -e //Mp A
+## file-json A: "a\n"
+## stdin-json: ""
+## stdout-json: ""
+## stderr-contains: cannot specify modifiers on empty regexp
+## status: 1
+
+#### a bare empty regexp is still legal and reuses the last one
+## argv: sed -n -e s/a/A/ -e s//X/p A
+## file-json A: "a\n"
+## stdin-json: ""
+## stdout-json: ""
+## stderr-json: ""
+## status: 0
+
+#### as is an empty address
+## argv: sed -n -e /a/p -e //p A
+## file-json A: "a\n"
+## stdin-json: ""
+## stdout-json: "a\na\n"
+## stderr-json: ""
+## status: 0
+
+# Recorded, not fixed: GNU opens each operand only when it reaches it, so a `q`
+# early in the script means a later unreadable operand is never opened and never
+# reported. td-txt's non-`-s` path reads every operand before the first cycle to
+# resolve `$`, so it reports the failure GNU never sees. The exit status agrees;
+# only the diagnostic differs. Making it lazy means teaching `$` to look ahead one
+# operand, which is its own landing.
+
+#### q stops before a later operand is opened, so it is never reported
+## argv: sed -n q A nosuch
+## file-json A: "a\n"
+## stdin-json: ""
+## stdout-json: ""
+## stderr-json: ""
+## status: 0
+
+
+# The debt is per output TARGET, not per descriptor and not one flag for the run.
+# GNU keeps an output per filename, each with its own, so two unterminated writes
+# to one `w` file are separated while the last stays bare -- and `/dev/stderr` is
+# an ordinary target to GNU: raw bytes, no forced newline, its own debt. A target's
+# debt belongs to the whole run, so unlike the hold space it survives `-s`.
+
+#### a w file owes its separator to the next write on the SAME file
+## argv: sed -n -e 'w out' -e 'w out'
+## stdin-json: "x"
+## stdout-json: ""
+## file-after-json out: "x\nx"
+## stderr-json: ""
+## status: 0
+
+#### the s///w flag shares that file's debt
+## argv: sed -n -e 's/x/y/w out' -e 'w out'
+## stdin-json: "x"
+## stdout-json: ""
+## file-after-json out: "y\ny"
+## stderr-json: ""
+## status: 0
+
+#### a w file's debt survives the file boundary of one stream
+## argv: sed -n -e 'w out' f1 f2
+## file-json f1: "a"
+## file-json f2: "b\n"
+## stdin-json: ""
+## stdout-json: ""
+## file-after-json out: "a\nb\n"
+## stderr-json: ""
+## status: 0
+
+#### and survives it under -s too, where the hold space does not
+## argv: sed -s -n -e 'w out' f1 f2
+## file-json f1: "a"
+## file-json f2: "b\n"
+## stdin-json: ""
+## stdout-json: ""
+## file-after-json out: "a\nb\n"
+## stderr-json: ""
+## status: 0
+
+#### a terminated record leaves a w file no debt
+## argv: sed -n -e 'w out' -e 'w out'
+## stdin-json: "x\n"
+## stdout-json: ""
+## file-after-json out: "x\nx\n"
+## stderr-json: ""
+## status: 0
+
+#### w /dev/stderr writes raw bytes with no separator of its own
+## argv: sed -n -e 'w /dev/stderr'
+## stdin-json: "a\tb"
+## stdout-json: ""
+## stderr-json: "a\tb"
+## status: 0
+
+#### and owes its separator to its own next write
+## argv: sed -n -e 'w /dev/stderr' -e 'w /dev/stderr'
+## stdin-json: "x"
+## stdout-json: ""
+## stderr-json: "x\nx"
+## status: 0
+
+#### a w to stderr and one to stdout keep separate debts
+## argv: sed -n -e 'w /dev/stderr' -e 'w /dev/stdout'
+## stdin-json: "x"
+## stdout-json: "x"
+## stderr-json: "x"
+## status: 0
+
+# `w /dev/stdout` has to reach the real standard output even under `-i`, where the
+# auto-print stream is the replacement buffer. So `-i` is the one case where
+# `/dev/stdout` is an ordinary target rather than a second channel on the sink.
+
+#### -i sends w /dev/stdout to standard output, not into the edited file
+## argv: sed -i -n -e 'w /dev/stdout' f1
+## file-json f1: "x"
+## stdin-json: ""
+## stdout-json: "x"
+## file-after-json f1: ""
+## stderr-json: ""
+## status: 0
+
+#### -i with p writes the file and w /dev/stdout the terminal
+## argv: sed -i -n -e p -e 'w /dev/stdout' f1
+## file-json f1: "x\n"
+## stdin-json: ""
+## stdout-json: "x\n"
+## file-after-json f1: "x\n"
+## stderr-json: ""
+## status: 0
+
+# What restarts per operand under `-s`/`-i`, and what does not. Line numbers, range
+# state, the hold space and every `R` read position restart; the output streams and
+# their owed separators do not. GNU clears the hold's TEXT but keeps its terminator
+# flag, which shows only after an unterminated file.
+
+#### -s clears the hold space between files
+## argv: sed -s -n -e x;p f1 f2
+## file-json f1: "a"
+## file-json f2: "b\n"
+## stdin-json: ""
+## stdout-json: "\n"
+## stderr-json: ""
+## status: 0
+
+#### -s clears it even when the previous file was terminated
+## argv: sed -s -n -e x;p A f2
+## file-json A: "a\n"
+## file-json f2: "b\n"
+## stdin-json: ""
+## stdout-json: "\n\n"
+## stderr-json: ""
+## status: 0
+
+#### without -s the hold space carries across files
+## argv: sed -n -e x;p f1 f2
+## file-json f1: "a"
+## file-json f2: "b\n"
+## stdin-json: ""
+## stdout-json: "\na"
+## stderr-json: ""
+## status: 0
+
+#### -s rewinds an R read position between files
+## argv: sed -s -e 'R rf' f1 f2
+## file-json f1: "a"
+## file-json f2: "b\n"
+## file-json rf: "R1\nR2\n"
+## stdin-json: ""
+## stdout-json: "a\nR1\nb\nR1\n"
+## stderr-json: ""
+## status: 0
+
+#### without -s the R position keeps advancing
+## argv: sed -e 'R rf' f1 f2
+## file-json f1: "a"
+## file-json f2: "b\n"
+## file-json rf: "R1\nR2\n"
+## stdin-json: ""
+## stdout-json: "a\nR1\nb\nR2\n"
+## stderr-json: ""
+## status: 0
+
+#### -s keeps the emptied hold space's terminator, so one separator is owed
+## argv: sed -s -n -e x;G;p f1 f2
+## file-json f1: "a"
+## file-json f2: "b\n"
+## stdin-json: ""
+## stdout-json: "\na\n\nb\n"
+## stderr-json: ""
+## status: 0
+
+# Under `M` with a separator that is NOT a newline, GNU matches within
+# separator-delimited segments, so nothing at all matches the separator: not `.`,
+# not `\W`, not `\s`, not a named `\x00`, and no backreference spans one. That is a
+# different mechanism from the newline half, which is libc's REG_NEWLINE and
+# touches only `.` and a non-matching list -- so `\W` still matches an embedded
+# NEWLINE under the same flag, whether or not the newline is the separator. The
+# asymmetry is GNU's, and only these cases pin it.
+
+#### under -z with M nothing matches the NUL, not even a named one
+## argv: sed -z -n -e N -e 's/\x00/X/Mp'
+## stdin-json: "a\u0000b\u0000"
+## stdout-json: ""
+## stderr-json: ""
+## status: 0
+
+#### nor \W, which DOES match an embedded newline under the same flag
+## argv: sed -z -n -e N -e 's/\W/X/Mp'
+## stdin-json: "a\u0000b\u0000"
+## stdout-json: ""
+## stderr-json: ""
+## status: 0
+
+#### \W matches a newline inside a -z record under M
+## argv: sed -z -n -e 's/\W/X/Mp'
+## stdin-json: "a\nb\u0000"
+## stdout-json: "aXb\u0000"
+## stderr-json: ""
+## status: 0
+
+#### and \W matches an embedded newline when the newline IS the separator
+## argv: sed -n -e N -e 's/\W/X/Mp'
+## stdin-json: "a\nb\n"
+## stdout-json: "aXb\n"
+## stderr-json: ""
+## status: 0
+
+#### \s does not match the NUL under M either
+## argv: sed -z -n -e N -e 's/\s/X/Mp'
+## stdin-json: "a\u0000b\u0000"
+## stdout-json: ""
+## stderr-json: ""
+## status: 0
+
+#### a backreference cannot span the NUL under M
+## argv: sed -z -n -e N -e 's/\(.\)\1/X/Mp'
+## stdin-json: "a\u0000a\u0000"
+## stdout-json: ""
+## stderr-json: ""
+## status: 0
+
+#### without M the NUL is an ordinary byte again
+## argv: sed -z -n -e N -e 's/\x00/X/p'
+## stdin-json: "a\u0000b\u0000"
+## stdout-json: "aXb\u0000"
+## stderr-json: ""
+## status: 0
+
+
+# The greedy-repeat fast path consumes bytes without going through the ordinary
+# single-byte step, so it needs the same confinement -- a fuzzer found `s/.*/X/M`
+# swallowing a NUL that `s/a.b/X/M` correctly refused. These pin the repeat forms.
+
+#### a greedy repeat stops at the NUL under M, not past it
+## argv: sed -z -n -e N -e s/.*/X/Mp
+## stdin-json: "a\u0000b\nc\u0000"
+## stdout-json: "X\u0000b\nc\u0000"
+## stderr-json: ""
+## status: 0
+
+#### a negated-list repeat stops there too
+## argv: sed -z -n -e N -e s/[^ab]*/X/Mp
+## stdin-json: "\u0000\u0000"
+## stdout-json: "X\u0000\u0000"
+## stderr-json: ""
+## status: 0
+
+#### a \W repeat stops at the NUL under M
+## argv: sed -z -n -e N -e 's/\W*/X/Mp'
+## stdin-json: "\n\u0000b\u0000"
+## stdout-json: "X\u0000b\u0000"
+## stderr-json: ""
+## status: 0
+
+#### and spans it without M
+## argv: sed -z -n -e N -e 's/\W*/X/p'
+## stdin-json: "\n\u0000b\u0000"
+## stdout-json: "Xb\u0000"
+## stderr-json: ""
+## status: 0
+
+#### a bounded repeat cannot reach across the NUL either
+## argv: sed -z -n -e N -e 's/a.\{1,3\}b/X/Mp'
+## stdin-json: "a\u0000b\u0000"
+## stdout-json: ""
+## stderr-json: ""
+## status: 0
+
+#### without M the same repeat spans it
+## argv: sed -z -n -e N -e s/.*/X/p
+## stdin-json: "a\u0000b\nc\u0000"
+## stdout-json: "X\u0000"
+## stderr-json: ""
+## status: 0
+
+#### and with a newline separator the repeat only loses the newline
+## argv: sed -n -e N -e s/.*/X/Mp
+## stdin-json: "a\nb\n"
+## stdout-json: "X\nb\n"
+## stderr-json: ""
+## status: 0
+
+# `-s` (and `-i`) restart line numbers and range state per operand, but stdout is
+# still ONE stream: a separator the last record of one file left owed is paid by
+# the first write of the next, exactly as within a file. td-txt built a fresh sink
+# per file, so the debt was discarded at every boundary and `sed -s '' f1 f2` over
+# an unterminated `f1` ran the two together. `-i` is the case where the debt IS per
+# file, because each operand's output is its own file.
+
+#### -s pays the previous FILE's owed separator
+## argv: sed -s '' f1 f2
+## file-json f1: "a"
+## file-json f2: "b\n"
+## stdin-json: ""
+## stdout-json: "a\nb\n"
+## stderr-json: ""
+## status: 0
+
+#### -s with q settles only after the last file written
+## argv: sed -s 2q f1 f2
+## file-json f1: "a"
+## file-json f2: "b\n"
+## stdin-json: ""
+## stdout-json: "a\nb\n"
+## stderr-json: ""
+## status: 0
+
+#### without -s the same two files read as one stream
+## argv: sed '' f1 f2
+## file-json f1: "a"
+## file-json f2: "b\n"
+## stdin-json: ""
+## stdout-json: "a\nb\n"
+## stderr-json: ""
+## status: 0
+
+#### -s over three files, the middle one unterminated
+## argv: sed -s '' f1 f3 f2
+## file-json f1: "a"
+## file-json f3: "c"
+## file-json f2: "b\n"
+## stdin-json: ""
+## stdout-json: "a\nc\nb\n"
+## stderr-json: ""
+## status: 0
+
+#### -s -n p pays it the same way
+## argv: sed -s -n p f1 f2
+## file-json f1: "a"
+## file-json f2: "b\n"
+## stdin-json: ""
+## stdout-json: "a\nb\n"
+## stderr-json: ""
+## status: 0
+
+#### q on the FIRST of several -s files settles there
+## argv: sed -s q f1 f2
+## file-json f1: "a"
+## file-json f2: "b\n"
+## stdin-json: ""
+## stdout-json: "a\n"
+## stderr-json: ""
+## status: 0
+
+# The escape gap is not only bracket expressions: `a`/`i`/`c` text takes the same
+# vocabulary, so the first two are xfail with the bracket forms. FILENAMES do not
+# -- neither implementation decodes one, so the third passes and is the control
+# that keeps a fix from over-reaching into `r`/`w` targets.
+
+#### a text takes the escape vocabulary too
+## argv: sed -e a\ T\\tU
+## stdin-json: "a\n"
+## stdout-json: "a\nT\tU\n"
+## stderr-json: ""
+## status: 0
+
+#### as does i text
+## argv: sed -e i\ T\\tU
+## stdin-json: "a\n"
+## stdout-json: "T\tU\na\n"
+## stderr-json: ""
+## status: 0
+
+#### but an r filename does NOT, in either implementation
+## argv: sed -n -e r\ \\x72f -e p
+## stdin-json: "a\n"
+## stdout-json: "a\n"
+## stderr-json: ""
+## status: 0
+
+# GNU's sed escapes are applied to the pattern BEFORE the regex is compiled, so
+# they work inside a bracket expression too: `[\n]` is the newline, `[\x41]` is
+# `A`. td-txt decodes them per atom in the parser, where POSIX says a backslash
+# inside a bracket expression is an ordinary member -- so `[\d065]` matches any of
+# `\ d 0 6 5`. These are xfail, recording the gap: closing it means moving the
+# escape pass ahead of the parser, which changes every pattern rather than just
+# these, and that is its own landing. `\w` and `\\` agree already and are the
+# controls that keep the fix from over-reaching.
+
+#### a bracket list honours the \n escape
+## argv: sed -e 'N;s/[\n]/-/g'
+## stdin-json: "a\nb\tcAd\n"
+## stdout-json: "a-b\tcAd\n"
+## stderr-json: ""
+## status: 0
+
+#### a bracket list honours the \t escape
+## argv: sed -e 's/[\t]/-/g'
+## stdin-json: "a\nb\tcAd\n"
+## stdout-json: "a\nb-cAd\n"
+## stderr-json: ""
+## status: 0
+
+#### a bracket list honours a \xHH escape
+## argv: sed -e 's/[\x41]/-/g'
+## stdin-json: "a\nb\tcAd\n"
+## stdout-json: "a\nb\tc-d\n"
+## stderr-json: ""
+## status: 0
+
+#### a bracket list honours a \oNNN escape
+## argv: sed -e 's/[\o101]/-/g'
+## stdin-json: "a\nb\tcAd\n"
+## stdout-json: "a\nb\tc-d\n"
+## stderr-json: ""
+## status: 0
+
+#### a bracket list honours a \dNNN escape
+## argv: sed -e 's/[\d065]/-/g'
+## stdin-json: "a\nb\tcAd\n"
+## stdout-json: "a\nb\tc-d\n"
+## stderr-json: ""
+## status: 0
+
+#### but \w in a bracket list is a literal backslash and w
+## argv: sed -e 's/[\w]/-/g'
+## stdin-json: "a\\wb\n"
+## stdout-json: "a--b\n"
+## stderr-json: ""
+## status: 0
+
+#### and a doubled backslash is one backslash
+## argv: sed -e 's/[\\]/-/g'
+## stdin-json: "a\\b\n"
+## stdout-json: "a-b\n"
+## stderr-json: ""
+## status: 0
+
+#### the same escape outside a bracket list already works
+## argv: sed -e 's/\t/-/g'
+## stdin-json: "a\nb\tcAd\n"
+## stdout-json: "a\nb-cAd\n"
+## stderr-json: ""
+## status: 0
+
+# GNU opens every `w` target while it PARSES the command, not when a write first
+# happens. Four things follow, and td-txt (which opens lazily on first write) gets
+# all four wrong -- so these cases are xfail, recording the divergence rather than
+# fixing it: the target is created even if no write ever reaches it, an existing
+# one is truncated, an unopenable one is exit 4 from a command no cycle runs, and
+# it outranks a script error LATER in the script while an EARLIER one outranks it.
+# Fixing that needs the parser to be able to fail with a status other than 1,
+# which is its own landing; spec/README carries the probe table.
+
+#### a w whose address is never taken still creates its file
+## argv: sed -n -e '2w out'
+## stdin-json: "x\n"
+## stdout-json: ""
+## file-after-json out: ""
+## stderr-json: ""
+## status: 0
+
+#### and truncates one that was already there
+## argv: sed -n -e '2w out'
+## file-json out: "old\n"
+## stdin-json: "x\n"
+## stdout-json: ""
+## file-after-json out: ""
+## stderr-json: ""
+## status: 0
+
+#### a w file is created even when no cycle runs at all
+## argv: sed -n -e 'w out'
+## stdin-json: ""
+## stdout-json: ""
+## file-after-json out: ""
+## stderr-json: ""
+## status: 0
+
+#### the s///w flag creates its file the same way
+## argv: sed -n -e 's/a/b/w out'
+## stdin-json: ""
+## stdout-json: ""
+## file-after-json out: ""
+## stderr-json: ""
+## status: 0
+
+#### a w target that will not open is exit 4 even behind a Q
+## argv: sed -n -e Q -e 'w /nosuchdir/out'
+## stdin-json: "x\n"
+## stdout-json: ""
+## stderr-json: "sed: couldn't open file /nosuchdir/out: No such file or directory\n"
+## status: 4
+
+#### a w target that will not open outranks a LATER script error
+## argv: sed -n -e 'w /nosuchdir/out' -e {
+## stdin-json: "x\n"
+## stdout-json: ""
+## stderr-json: "sed: couldn't open file /nosuchdir/out: No such file or directory\n"
+## status: 4
+
+#### but an EARLIER script error outranks the w target
+## argv: sed -n -e ZZ -e 'w /nosuchdir/out'
+## stdin-json: "x\n"
+## stdout-json: ""
+## stderr-contains: unknown command: `Z'
+## status: 1
+
+#### the first of two unopenable w targets is the one reported
+## argv: sed -n -e 'w /nodirA/out' -e 'w /nodirB/out'
+## stdin-json: "x\n"
+## stdout-json: ""
+## stderr-json: "sed: couldn't open file /nodirA/out: No such file or directory\n"
+## status: 4
+
+
 # Long-line cases for the SPAN-consuming callers. Searching every end for POSIX
 # leftmost-longest can exhaust the step budget on a line of a thousand-odd bytes
 # with three or more sliding repeats, and `sed`/`grep -o` cannot answer from a
@@ -2570,5 +3458,990 @@ sed: couldn't open file /nosuchdir/out: No such file or directory
 ## stdout:
 [v]xxxxxxxxxx
 ## END
+## stderr-json: ""
+## status: 0
+
+
+# `q` pays a separator the last record left OWED; reaching end of input does not.
+# GNU only carries a missing final newline into its output when it processed the
+# input to the end -- `printf x | sed q` writes `x` AND a newline, while
+# `printf x | sed 2q` writes a bare `x` because the `q` never runs. `Q` quits
+# without paying, so the debt survives it. Found by differential fuzzing.
+
+#### q terminates a record that arrived unterminated
+## argv: sed q
+## stdin-json: "x"
+## stdout:
+x
+## END
+## stderr-json: ""
+## status: 0
+
+#### q not reached leaves the missing separator missing
+## argv: sed 2q
+## stdin-json: "x"
+## stdout-json: "x"
+## stderr-json: ""
+## status: 0
+
+#### q on the unterminated LAST line of several
+## argv: sed 2q
+## stdin-json: "a\nx"
+## stdout:
+a
+x
+## END
+## stderr-json: ""
+## status: 0
+
+#### p then q terminates even under -n, where q prints nothing
+## argv: sed -n -e p -e q
+## stdin-json: "x"
+## stdout:
+x
+## END
+## stderr-json: ""
+## status: 0
+
+#### p then Q does NOT terminate
+## argv: sed -n -e p -e Q
+## stdin-json: "x"
+## stdout-json: "x"
+## stderr-json: ""
+## status: 0
+
+#### q pays the NUL separator under -z
+## argv: sed -z q
+## stdin-json: "x"
+## stdout-json: "x\u0000"
+## stderr-json: ""
+## status: 0
+
+#### two p commands terminate the first, as more output follows
+## argv: sed -n -e p -e p
+## stdin-json: "x"
+## stdout-json: "x\nx"
+## stderr-json: ""
+## status: 0
+
+# The owed separator is per OUTPUT STREAM, not per file descriptor. GNU keeps the
+# flag on its output struct, and `w /dev/stdout` is a different struct from the
+# auto-print stream even though both reach the same fd -- so `p` never pays what
+# `w` owes, `w` never pays what `p` owes, and `q` settles only the auto-print
+# stream's debt.
+
+#### w /dev/stdout owes its separator to the NEXT w, not to p
+## argv: sed -n -e 'w /dev/stdout' -e p
+## stdin-json: "x"
+## stdout-json: "xx"
+## stderr-json: ""
+## status: 0
+
+#### and p owes its separator to the next p, not to w /dev/stdout
+## argv: sed -n -e p -e 'w /dev/stdout'
+## stdin-json: "x"
+## stdout-json: "xx"
+## stderr-json: ""
+## status: 0
+
+#### two w /dev/stdout writes do pay each other
+## argv: sed -n -e 'w /dev/stdout' -e 'w /dev/stdout'
+## stdin-json: "x"
+## stdout-json: "x\nx"
+## stderr-json: ""
+## status: 0
+
+#### q settles the main stream's debt, not the w file's
+## argv: sed -n -e p -e 'w /dev/stdout' -e q
+## stdin-json: "x"
+## stdout-json: "xx\n"
+## stderr-json: ""
+## status: 0
+
+#### q leaves an unterminated w /dev/stdout write bare
+## argv: sed -n -e 'w /dev/stdout' -e q
+## stdin-json: "x"
+## stdout-json: "x"
+## stderr-json: ""
+## status: 0
+
+#### two unterminated w writes and a q settle nothing
+## argv: sed -n -e 'w /dev/stdout' -e 'w /dev/stdout' -e q
+## stdin-json: "x"
+## stdout-json: "x\nx"
+## stderr-json: ""
+## status: 0
+
+#### W /dev/stdout keeps the same separate debt
+## argv: sed -n -e 'W /dev/stdout' -e p
+## stdin-json: "x"
+## stdout-json: "xx"
+## stderr-json: ""
+## status: 0
+
+#### a terminated record leaves no debt on either stream
+## argv: sed -n -e 'w /dev/stdout' -e p
+## stdin-json: "x\n"
+## stdout-json: "x\nx\n"
+## stderr-json: ""
+## status: 0
+
+# sed's `M` flag is POSIX REG_NEWLINE, which is TWO rules and td-txt implemented
+# only one: `^`/`$` gained the embedded newlines, but `.` and a non-matching
+# bracket list kept them. GNU reads `s/c.d/Z/M` over `abc\ndef` as no match.
+
+#### M keeps . from matching a newline
+## argv: sed -z s/c.d/Z/M
+## stdin-json: "abc\ndef\n"
+## stdout:
+abc
+def
+## END
+## stderr-json: ""
+## status: 0
+
+#### without M the same . spans the newline
+## argv: sed -z s/c.d/Z/
+## stdin-json: "abc\ndef\n"
+## stdout:
+abZef
+## END
+## stderr-json: ""
+## status: 0
+
+#### M keeps a non-matching list from matching a newline
+## argv: sed -z 's/[^abc]/Y/M'
+## stdin-json: "abc\ndef\n"
+## stdout:
+abc
+Yef
+## END
+## stderr-json: ""
+## status: 0
+
+#### without M the same list matches the newline
+## argv: sed -z 's/[^abc]/Y/'
+## stdin-json: "abc\ndef\n"
+## stdout:
+abcYdef
+## END
+## stderr-json: ""
+## status: 0
+
+#### M stops .* at the newline
+## argv: sed -z 's/.*/X/M'
+## stdin-json: "abc\ndef\n"
+## stdout:
+X
+def
+## END
+## stderr-json: ""
+## status: 0
+
+#### M keeps a spanning match from crossing the newline
+## argv: sed -z 's/a.*f/W/M'
+## stdin-json: "abc\ndef\n"
+## stdout:
+abc
+def
+## END
+## stderr-json: ""
+## status: 0
+
+# Both halves of `M` are relative to the RECORD separator, so under `-z` neither
+# one fires at a newline. The halves are NOT symmetric in which byte they use,
+# though: the anchor half takes the separator alone, while the exclusion half
+# drops the separator AND the newline -- REG_NEWLINE being a libc regex flag
+# bound to `\n` whatever the separator is. Below the separator is a NUL and no
+# record contains one; the block after this puts one in the pattern space.
+
+#### M does not anchor at a newline under -z
+## argv: sed -z 's/^d/X/M'
+## stdin-json: "abc\ndef\n"
+## stdout:
+abc
+def
+## END
+## stderr-json: ""
+## status: 0
+
+#### M does not end-anchor at a newline under -z
+## argv: sed -z 's/c$/X/M'
+## stdin-json: "abc\ndef\n"
+## stdout:
+abc
+def
+## END
+## stderr-json: ""
+## status: 0
+
+#### M still anchors at the start of the record under -z
+## argv: sed -z 's/^a/X/M'
+## stdin-json: "abc\ndef\n"
+## stdout:
+Xbc
+def
+## END
+## stderr-json: ""
+## status: 0
+
+#### M DOES anchor at a newline when the separator is one
+## argv: sed -n -e N -e '/^def/Mp'
+## stdin-json: "abc\ndef\n"
+## stdout:
+abc
+def
+## END
+## stderr-json: ""
+## status: 0
+
+#### M end-anchors at a newline when the separator is one
+## argv: sed -n -e N -e '/abc$/Mp'
+## stdin-json: "abc\ndef\n"
+## stdout:
+abc
+def
+## END
+## stderr-json: ""
+## status: 0
+
+# `N` is how a record separator gets INSIDE the pattern space: it joins two
+# records with one. So the anchor half is not unreachable under `-z` after all --
+# it fires at that NUL, and the exclusion half keeps `.` off it too. This is the
+# case the rule above was derived without, and it is why the two halves each
+# carry the separator rather than a hardcoded newline.
+
+#### M anchors at the NUL that N put in the pattern space
+## argv: sed -z -n -e N -e /^b/Mp
+## stdin-json: "a\u0000b\u0000"
+## stdout-json: "a\u0000b\u0000"
+## stderr-json: ""
+## status: 0
+
+#### M end-anchors at that NUL too
+## argv: sed -z -n -e N -e '/a$/Mp'
+## stdin-json: "a\u0000b\u0000"
+## stdout-json: "a\u0000b\u0000"
+## stderr-json: ""
+## status: 0
+
+#### a substitution anchored at that NUL replaces the second record
+## argv: sed -z -n -e N -e s/^b/X/Mp
+## stdin-json: "a\u0000b\u0000"
+## stdout-json: "a\u0000X\u0000"
+## stderr-json: ""
+## status: 0
+
+#### M keeps . off the NUL that N put in the pattern space
+## argv: sed -z -n -e N -e s/a.b/X/Mp
+## stdin-json: "a\u0000b\u0000"
+## stdout-json: ""
+## stderr-json: ""
+## status: 0
+
+#### M keeps a non-matching list off that NUL
+## argv: sed -z -n -e N -e s/[^a]/Y/Mp
+## stdin-json: "a\u0000b\u0000"
+## stdout-json: "a\u0000Y\u0000"
+## stderr-json: ""
+## status: 0
+
+#### without M the same . spans that NUL
+## argv: sed -z -n -e N -e s/a.b/X/p
+## stdin-json: "a\u0000b\u0000"
+## stdout-json: "X\u0000"
+## stderr-json: ""
+## status: 0
+
+#### without M the same list matches that NUL
+## argv: sed -z -n -e N -e s/[^a]/Y/p
+## stdin-json: "a\u0000b\u0000"
+## stdout-json: "aYb\u0000"
+## stderr-json: ""
+## status: 0
+
+#### under -z M still keeps . off a newline, which is not the separator
+## argv: sed -z -n -e s/c.d/Z/Mp
+## stdin-json: "abc\ndef\u0000"
+## stdout-json: ""
+## stderr-json: ""
+## status: 0
+
+#### under -z M keeps a non-matching list off a newline as well
+## argv: sed -z -n -e s/[^abc]/Y/Mp
+## stdin-json: "abc\ndef\u0000"
+## stdout-json: "abc\nYef\u0000"
+## stderr-json: ""
+## status: 0
+
+#### a NUL inside a line is not a separator without -z, so . spans it
+## argv: sed -n -e s/a.b/X/Mp
+## stdin-json: "a\u0000b\n"
+## stdout-json: "X\n"
+## stderr-json: ""
+## status: 0
+
+#### nor does M anchor at it
+## argv: sed -n -e /^b/Mp
+## stdin-json: "a\u0000b\n"
+## stdout-json: ""
+## stderr-json: ""
+## status: 0
+
+# `Q` quits WITHOUT flushing the append queue; `q` flushes it. `Q` is "quit now",
+# and the queue belongs to finishing the cycle it never finishes.
+
+#### Q discards a queued a text
+## argv: sed -e 'a text' -e Q
+## stdin-json: "x\n"
+## stdout-json: ""
+## stderr-json: ""
+## status: 0
+
+#### q flushes a queued a text
+## argv: sed -e 'a text' -e q
+## stdin-json: "x\n"
+## stdout:
+x
+text
+## END
+## stderr-json: ""
+## status: 0
+
+#### d flushes a queued a text
+## argv: sed -e 'a text' -e d
+## stdin-json: "x\n"
+## stdout:
+text
+## END
+## stderr-json: ""
+## status: 0
+
+# `l` wraps with a backslash and the RECORD separator, not always a newline, and
+# its width guard is `> 0`: `l 1` wraps before EVERY chunk, which shows up as a
+# leading backslash because the test already holds at column zero. `l 0` never
+# wraps.
+
+#### l wraps with the NUL separator under -z
+## argv: sed -z -n l
+## stdin-json: "ab\nab\nab\nab\nab\nab\nab\nab\nab\nab\nab\nab\nab\nab\nab\nab\nab\nab\nab\nab\nab\nab\nab\nab\nab\nab\nab\nab\nab\nab\nab\nab\nab\nab\nab\nab\nab\nab\nab\nab\n"
+## stdout-json: "ab\\nab\\nab\\nab\\nab\\nab\\nab\\nab\\nab\\nab\\nab\\nab\\nab\\nab\\nab\\nab\\nab\\na\\\u0000b\\nab\\nab\\nab\\nab\\nab\\nab\\nab\\nab\\nab\\nab\\nab\\nab\\nab\\nab\\nab\\nab\\nab\\\u0000\\nab\\nab\\nab\\nab\\nab\\n$\u0000"
+## stderr-json: ""
+## status: 0
+
+#### l 1 wraps before every character
+## argv: sed -n 'l 1'
+## stdin-json: "abcdef\n"
+## stdout:
+\
+a\
+b\
+c\
+d\
+e\
+f$
+## END
+## stderr-json: ""
+## status: 0
+
+#### l 1 wraps before a multi-byte escape too
+## argv: sed -n 'l 1'
+## stdin-json: "a\tb\n"
+## stdout:
+\
+a\
+\t\
+b$
+## END
+## stderr-json: ""
+## status: 0
+
+#### l 0 never wraps
+## argv: sed -n 'l 0'
+## stdin-json: "abcdef\n"
+## stdout:
+abcdef$
+## END
+## stderr-json: ""
+## status: 0
+
+#### l 2 wraps after one character
+## argv: sed -n 'l 2'
+## stdin-json: "abcdef\n"
+## stdout:
+a\
+b\
+c\
+d\
+e\
+f$
+## END
+## stderr-json: ""
+## status: 0
+
+# --- `r`/`R` name a FILE: `-` is literal there, and a source that cannot seek
+# --- is not rewound by -s (GNU resets with rewind(3), a no-op on a pipe).
+
+#### -s does not rewind an R source that cannot seek
+## argv: sed -s -e 'R /dev/stdin' f1 f2
+## file-json f1: "a"
+## file-json f2: "b\n"
+## stdin-json: "R1\nR2\n"
+## stdout-json: "a\nR1\nb\nR2\n"
+## stderr-json: ""
+## status: 0
+
+#### R - reads a file literally named -, not standard input
+## argv: sed -e 'R -' f1
+## file-json f1: "a\n"
+## file-json -: "DASH\n"
+## stdin-json: "S1\n"
+## stdout-json: "a\nDASH\n"
+## stderr-json: ""
+## status: 0
+
+#### r - reads a file literally named -, not standard input
+## argv: sed -e 'r -' f1
+## file-json f1: "a\n"
+## file-json -: "DASH\n"
+## stdin-json: "S1\n"
+## stdout-json: "a\nDASH\n"
+## stderr-json: ""
+## status: 0
+
+#### R - with no such file reads nothing and owes nothing
+## argv: sed -e 'R -' f1
+## file-json f1: "a"
+## stdin-json: "S1\n"
+## stdout-json: "a"
+## stderr-json: ""
+## status: 0
+
+#### r - with no such file still pays the owed separator
+## argv: sed -e 'r -' f1
+## file-json f1: "a"
+## stdin-json: "S1\n"
+## stdout-json: "a\n"
+## stderr-json: ""
+## status: 0
+
+# --- An ADDRESS matches the whole pattern space; only a substitution is
+# --- confined to the segment between separators. The same patterns, both paths.
+
+#### an M address matches across the separator N inserted
+## argv: sed -z -n -e N -e /a.b/Mp
+## stdin-json: "a\u0000b\u0000"
+## stdout-json: "a\u0000b\u0000"
+## stderr-json: ""
+## status: 0
+
+#### an M address lets .* span the separator
+## argv: sed -z -n -e N -e /a.*b/Mp
+## stdin-json: "a\u0000b\u0000"
+## stdout-json: "a\u0000b\u0000"
+## stderr-json: ""
+## status: 0
+
+#### an M address reaches the separator through \W
+## argv: sed -z -n -e N -e '/\W/Mp'
+## stdin-json: "a\u0000b\u0000"
+## stdout-json: "a\u0000b\u0000"
+## stderr-json: ""
+## status: 0
+
+#### an M address reaches the separator named explicitly
+## argv: sed -z -n -e N -e '/\x00/Mp'
+## stdin-json: "a\u0000b\u0000"
+## stdout-json: "a\u0000b\u0000"
+## stderr-json: ""
+## status: 0
+
+#### an M address anchors on the separator while . crosses it
+## argv: sed -z -n -e N -e /^a.b$/Mp
+## stdin-json: "a\u0000b\u0000"
+## stdout-json: "a\u0000b\u0000"
+## stderr-json: ""
+## status: 0
+
+#### an M address reaches the separator through a negated list
+## argv: sed -z -n -e N -e /[^x]/Mp
+## stdin-json: "a\u0000b\u0000"
+## stdout-json: "a\u0000b\u0000"
+## stderr-json: ""
+## status: 0
+
+#### a buffer anchor at the real buffer start matches in an M address
+## argv: sed -z -n -e N -e '/\`a/Mp'
+## stdin-json: "a\u0000b\u0000"
+## stdout-json: "a\u0000b\u0000"
+## stderr-json: ""
+## status: 0
+
+#### and one at the real buffer end likewise
+## argv: sed -z -n -e N -e '/b\'\''/Mp'
+## stdin-json: "a\u0000b\u0000"
+## stdout-json: "a\u0000b\u0000"
+## stderr-json: ""
+## status: 0
+
+#### a substitution is confined where the same address is not
+## argv: sed -z -n -e N -e s/a.b/X/M -e p
+## stdin-json: "a\u0000b\u0000"
+## stdout-json: "a\u0000b\u0000"
+## stderr-json: ""
+## status: 0
+
+#### confinement does not reach \W either, in a substitution
+## argv: sed -z -n -e N -e 's/\W/X/M' -e p
+## stdin-json: "a\u0000b\u0000"
+## stdout-json: "a\u0000b\u0000"
+## stderr-json: ""
+## status: 0
+
+#### a buffer anchor at the real start matches in a confined substitution too
+## argv: sed -z -n -e N -e 's/\`a/X/M' -e p
+## stdin-json: "a\u0000b\u0000"
+## stdout-json: "X\u0000b\u0000"
+## stderr-json: ""
+## status: 0
+
+# --- A command that does not consume the rest of the line must be SEPARATED
+# --- from the next one. GNU rejects the juxtaposition; `}` and `#` separate as
+# --- much as `;` and a newline, and `s`'s trailing letters are its FLAGS.
+
+#### two commands juxtaposed without a separator are refused
+## argv: sed -n gp
+## stdin-json: "a\n"
+## stdout-json: ""
+## status: 1
+## stderr-contains: extra characters after command
+
+#### a blank is not a separator either
+## argv: sed -n 'g p'
+## stdin-json: "a\n"
+## stdout-json: ""
+## status: 1
+## stderr-contains: extra characters after command
+
+#### the rule covers a command that takes a number
+## argv: sed -n l2p
+## stdin-json: "a\n"
+## stdout-json: ""
+## status: 1
+## stderr-contains: extra characters after command
+
+#### and the exit code of a quit it would otherwise have run
+## argv: sed -n q5p
+## stdin-json: "a\n"
+## stdout-json: ""
+## status: 1
+## stderr-contains: extra characters after command
+
+#### y takes no flags, so a letter after it is extra
+## argv: sed -n y/a/b/p
+## stdin-json: "a\n"
+## stdout-json: ""
+## status: 1
+## stderr-contains: extra characters after command
+
+#### a closing brace needs a separator after it too
+## argv: sed -n '{p;}p'
+## stdin-json: "a\n"
+## stdout-json: ""
+## status: 1
+## stderr-contains: extra characters after command
+
+#### a semicolon after a blank separates
+## argv: sed -n 'g ;p'
+## stdin-json: "a\n"
+## stdout-json: "\n"
+## stderr-json: ""
+## status: 0
+
+#### a comment ends a command
+## argv: sed -n 'g#c'
+## stdin-json: "a\n"
+## stdout-json: ""
+## stderr-json: ""
+## status: 0
+
+#### a closing brace ends a command without a semicolon
+## argv: sed -n '{g}'
+## stdin-json: "a\n"
+## stdout-json: ""
+## stderr-json: ""
+## status: 0
+
+#### but s takes trailing letters as flags, so a space then p is the p flag
+# Two lines, because over one input line the `p` FLAG and a `p` COMMAND print the
+# same bytes: only the line the substitution does NOT match tells them apart.
+## argv: sed -n 's/a/b/ p'
+## stdin-json: "a\nb\n"
+## stdout-json: "b\n"
+## stderr-json: ""
+## status: 0
+
+#### an adjacent label is still a label, so t p is a jump to `p'
+## argv: sed -n tp
+## stdin-json: "a\n"
+## stdout-json: ""
+## status: 4
+## stderr-contains: label
+
+# --- ``\` ``/`\'` under M are indistinguishable from `^`/`$` in an ADDRESS, and
+# --- move to the record separator with them. In a SUBSTITUTION only a SEGMENT
+# --- moves them, so a newline separator leaves them at the buffer's real ends.
+
+#### an M address moves the opening buffer anchor to an embedded newline
+## argv: sed -n -e N -e '/\`b/Mp'
+## stdin-json: "a\nb\n"
+## stdout-json: "a\nb\n"
+## stderr-json: ""
+## status: 0
+
+#### an M address moves the closing buffer anchor there too
+## argv: sed -n -e N -e '/a\'\''/Mp'
+## stdin-json: "a\nb\n"
+## stdout-json: "a\nb\n"
+## stderr-json: ""
+## status: 0
+
+#### but a substitution does not, with a newline separator
+## argv: sed -n -e N -e 's/\`b/X/M' -e p
+## stdin-json: "a\nb\n"
+## stdout-json: "a\nb\n"
+## stderr-json: ""
+## status: 0
+
+#### so M g rewrites only the first, where ^ rewrites both
+## argv: sed -n -e N -e 's/\`a/X/Mg' -e p
+## stdin-json: "a\na\n"
+## stdout-json: "X\na\n"
+## stderr-json: ""
+## status: 0
+
+#### the ^ contrast, same input
+## argv: sed -n -e N -e 's/^a/X/Mg' -e p
+## stdin-json: "a\na\n"
+## stdout-json: "X\nX\n"
+## stderr-json: ""
+## status: 0
+
+#### a segment DOES move it in a substitution
+## argv: sed -z -n -e N -e 's/\`b/X/M' -e p
+## stdin-json: "a\u0000b\u0000"
+## stdout-json: "a\u0000X\u0000"
+## stderr-json: ""
+## status: 0
+
+#### and in an address, for the same separator
+## argv: sed -z -n -e N -e '/\`b/Mp'
+## stdin-json: "a\u0000b\u0000"
+## stdout-json: "a\u0000b\u0000"
+## stderr-json: ""
+## status: 0
+
+#### without M the buffer anchor stays put in an address
+## argv: sed -n -e N -e '/\`b/p'
+## stdin-json: "a\nb\n"
+## stdout-json: ""
+## stderr-json: ""
+## status: 0
+
+#### and in a substitution
+## argv: sed -n -e N -e 's/\`b/X/' -e p
+## stdin-json: "a\nb\n"
+## stdout-json: "a\nb\n"
+## stderr-json: ""
+## status: 0
+
+# --- A BACKREFERENCE in the pattern confines an ADDRESS to a segment as well,
+# --- which is glibc's backref matcher and not a rule sed documents: even `\1*`,
+# --- which need consume nothing, is enough to stop the match crossing a NUL.
+
+#### a backreference stops an M address crossing the separator
+## argv: sed -z -n -e N;N -e '/\(.\)\1/Mp'
+## stdin-json: "a\u0000\u0000b\u0000"
+## stdout-json: ""
+## stderr-json: ""
+## status: 0
+
+#### the same doubled separator without a backreference matches
+## argv: sed -z -n -e N;N -e /../Mp
+## stdin-json: "a\u0000\u0000b\u0000"
+## stdout-json: "a\u0000\u0000b\u0000"
+## stderr-json: ""
+## status: 0
+
+#### a backreference that need not consume anything still confines
+## argv: sed -z -n -e N;N -e '/\(a\)\x00\1*/Mp'
+## stdin-json: "a\u0000\u0000b\u0000"
+## stdout-json: ""
+## stderr-json: ""
+## status: 0
+
+#### while the same pattern without the backreference crosses
+## argv: sed -z -n -e N;N -e '/\(a\)\x00/Mp'
+## stdin-json: "a\u0000\u0000b\u0000"
+## stdout-json: "a\u0000\u0000b\u0000"
+## stderr-json: ""
+## status: 0
+
+#### a match INSIDE one segment is unaffected by the backreference
+## argv: sed -z -n -e N;N -e '/\(b\)\1*/Mp'
+## stdin-json: "a\u0000\u0000b\u0000"
+## stdout-json: "a\u0000\u0000b\u0000"
+## stderr-json: ""
+## status: 0
+
+#### and with a newline separator a doubled NUL is an ordinary pair
+## argv: sed -n '/\(.\)\1/Mp'
+## stdin-json: "a\u0000\u0000b\n"
+## stdout-json: "a\u0000\u0000b\n"
+## stderr-json: ""
+## status: 0
+
+#### without M nothing is confined, so the doubled separator matches
+## argv: sed -z -n -e N;N -e '/\(.\)\1/p'
+## stdin-json: "a\u0000\u0000b\u0000"
+## stdout-json: "a\u0000\u0000b\u0000"
+## stderr-json: ""
+## status: 0
+
+# --- The same family as the separator rule: what ends a command's ARGUMENT.
+# --- A label and `v`'s version end at a BLANK; `s`'s flags end at a command
+# --- terminator and nothing else, so an unknown or repeated one is an error.
+
+#### an unknown s flag is refused, not read as the next command
+## argv: sed -n s/a/b/x
+## stdin-json: "a\n"
+## stdout-json: ""
+## status: 1
+## stderr-contains: unknown option to `s'
+
+#### a letter after a blank is still an s flag, so junk there is refused too
+## argv: sed -n 's/a/b/p q'
+## stdin-json: "a\n"
+## stdout-json: ""
+## status: 1
+## stderr-contains: unknown option to `s'
+
+#### but blanks BETWEEN flags are allowed
+## argv: sed -n 's/a/b/ g p'
+## stdin-json: "a\n"
+## stdout-json: "b\n"
+## stderr-json: ""
+## status: 0
+
+#### a repeated p flag is refused
+## argv: sed -n s/a/b/pp
+## stdin-json: "a\n"
+## stdout-json: ""
+## status: 1
+## stderr-contains: multiple `p' options
+
+#### a repeated g flag likewise
+## argv: sed -n s/a/b/gg
+## stdin-json: "a\n"
+## stdout-json: ""
+## status: 1
+## stderr-contains: multiple `g' options
+
+#### and a second occurrence number
+## argv: sed -n s/a/b/2p3
+## stdin-json: "a\n"
+## stdout-json: ""
+## status: 1
+## stderr-contains: multiple number options
+
+#### a label ends at a blank, so the p after it is a command
+## argv: sed -n ':a p'
+## stdin-json: "a\n"
+## stdout-json: "a\n"
+## stderr-json: ""
+## status: 0
+
+#### which is how x can follow a label on one line
+## argv: sed -n ':lbl x;p'
+## stdin-json: "a\n"
+## stdout-json: "\n"
+## stderr-json: ""
+## status: 0
+
+#### a branch target ends there too, so this jumps to a and not to "a p"
+# `b a p` alone is exit 4 under EITHER reading (`a' and `a p' are both undefined),
+# so the label has to exist: then the blank-terminated target resolves and the `p`
+# after it is a command the jump skips.
+## argv: sed -n 'b a p;:a'
+## stdin-json: "a\n"
+## stdout-json: ""
+## stderr-json: ""
+## status: 0
+
+#### v does nothing and does not swallow the rest of the line
+## argv: sed -n 'v;p'
+## stdin-json: "a\n"
+## stdout-json: "a\n"
+## stderr-json: ""
+## status: 0
+
+#### v takes an optional version, which ends at a blank
+## argv: sed -n 'v 4.2 p'
+## stdin-json: "a\n"
+## stdout-json: "a\n"
+## stderr-json: ""
+## status: 0
+
+#### a version newer than the GNU level implemented is refused
+## argv: sed -n 'v 4.10;p'
+## stdin-json: "a\n"
+## stdout-json: ""
+## status: 1
+## stderr-contains: expected newer version of sed
+
+#### 4.9 itself is not newer
+## argv: sed -n 'v 4.9;p'
+## stdin-json: "a\n"
+## stdout-json: "a\n"
+## stderr-json: ""
+## status: 0
+
+#### the comparison is strverscmp, so a byte below the dot is older
+## argv: sed -n 'v 4-9;p'
+## stdin-json: "a\n"
+## stdout-json: "a\n"
+## stderr-json: ""
+## status: 0
+
+#### and one above it is newer
+## argv: sed -n 'v 4a;p'
+## stdin-json: "a\n"
+## stdout-json: ""
+## status: 1
+## stderr-contains: expected newer version of sed
+
+# --- An `r`/`R` source that OPENS but cannot be READ is exit 4, where a source
+# --- that does not open at all is silent. A directory is how you get one, and
+# --- `.` is one in every case's own temp directory.
+
+#### r over a directory is a read error, after the owed separator is paid
+## argv: sed -e 'r .'
+## stdin-json: "x"
+## stdout-json: "x\n"
+## status: 4
+## stderr-contains: read error on .
+
+#### R over a directory fails BEFORE the cycle prints, because R reads then
+## argv: sed -e 'R .'
+## stdin-json: "x"
+## stdout-json: ""
+## status: 4
+## stderr-contains: read error on .
+
+#### and the pattern space still reaches stdout when r is the one that fails
+## argv: sed -n -e 'r .' -e p
+## stdin-json: "x"
+## stdout-json: "x\n"
+## status: 4
+## stderr-contains: read error on .
+
+# --- `a`/`i`/`c` need TEXT. The one exception is a script ending in the
+# --- command's own backslash, which GNU accepts and writes nothing for.
+
+#### a with no text at all is a script error
+## argv: sed a
+## stdin-json: "X\nY\n"
+## stdout-json: ""
+## status: 1
+## stderr-contains: expected \ after `a', `c' or `i'
+
+#### nor does an address make one legal
+## argv: sed 1a
+## stdin-json: "X\nY\n"
+## stdout-json: ""
+## status: 1
+## stderr-contains: expected \ after `a', `c' or `i'
+
+#### a blank is not text either
+## argv: sed 'a '
+## stdin-json: "X\nY\n"
+## stdout-json: ""
+## status: 1
+## stderr-contains: expected \ after `a', `c' or `i'
+
+#### i and c the same
+## argv: sed i
+## stdin-json: "X\nY\n"
+## stdout-json: ""
+## status: 1
+## stderr-contains: expected \ after `a', `c' or `i'
+
+#### but a script ending in a's own backslash appends NOTHING
+## argv: sed 'a\'
+## stdin-json: "X\nY\n"
+## stdout-json: "X\nY\n"
+## stderr-json: ""
+## status: 0
+
+#### where a second backslash appends an EMPTY line
+## argv: sed 'a\\'
+## stdin-json: "X\nY\n"
+## stdout-json: "X\n\nY\n\n"
+## stderr-json: ""
+## status: 0
+
+#### i likewise inserts nothing
+## argv: sed 'i\'
+## stdin-json: "X\nY\n"
+## stdout-json: "X\nY\n"
+## stderr-json: ""
+## status: 0
+
+#### and c with no text still deletes
+## argv: sed 'c\'
+## stdin-json: "X\nY\n"
+## stdout-json: ""
+## stderr-json: ""
+## status: 0
+
+#### while its empty line is written once per line
+## argv: sed 'c\\'
+## stdin-json: "X\nY\n"
+## stdout-json: "\n\n"
+## stderr-json: ""
+## status: 0
+
+#### F names the file GNU's $ lookahead has already opened
+# Recorded gap, not a fix: GNU opens each operand only when it reaches it, but `$`
+# forces a lookahead that has ALREADY opened the next one, and `F` reports whatever
+# is open. td-txt reads every operand up front to resolve `$`, so it names the file
+# the line came from. Without a `$` in the script both agree.
+## argv: sed -n -e '$d' -e F in0 in1 in2
+## file-json in0: "a\n"
+## file-json in1: "b\n"
+## file-json in2: "c\n"
+## stdin-json: ""
+## stdout-json: "in1\nin2\n"
+## stderr-json: ""
+## status: 0
+
+#### a with a newline after it is an EMPTY text, not a missing one
+## argv: sed "a\np"
+## stdin-json: "X\n"
+## stdout-json: "X\nX\n\n"
+## stderr-json: ""
+## status: 0
+
+#### but the END of an -e part is the end of the script for that question
+## argv: sed -e a -e p
+## stdin-json: "X\n"
+## stdout-json: ""
+## status: 1
+## stderr-contains: expected \ after `a', `c' or `i'
+
+#### while a backslash still carries the text across the same boundary
+## argv: sed -e 'a\' -e text
+## stdin-json: "X\n"
+## stdout-json: "X\ntext\n"
 ## stderr-json: ""
 ## status: 0

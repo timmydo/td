@@ -26,3 +26,21 @@ xfail grep-cli.test.txt::-w over sliding greedy repeats on a long line
 xfail grep-cli.test.txt::-o -w prints a shrunk span only at the first search position
 xfail grep-cli.test.txt::-o -w skips two shrinkable spans in the middle of the line
 xfail grep-cli.test.txt::-o -w after a shrunk span at the line start
+xfail sed-cli.test.txt::a backreference to a group that did not participate does not match
+xfail sed-cli.test.txt::without -s a failure on the FIRST operand outranks the quit code too
+xfail sed-cli.test.txt::and q5 reports it rather than 5
+xfail sed-cli.test.txt::q stops before a later operand is opened, so it is never reported
+xfail sed-cli.test.txt::a text takes the escape vocabulary too
+xfail sed-cli.test.txt::as does i text
+xfail sed-cli.test.txt::a bracket list honours the \n escape
+xfail sed-cli.test.txt::a bracket list honours the \t escape
+xfail sed-cli.test.txt::a bracket list honours a \xHH escape
+xfail sed-cli.test.txt::a bracket list honours a \oNNN escape
+xfail sed-cli.test.txt::a bracket list honours a \dNNN escape
+xfail sed-cli.test.txt::a w whose address is never taken still creates its file
+xfail sed-cli.test.txt::and truncates one that was already there
+xfail sed-cli.test.txt::a w file is created even when no cycle runs at all
+xfail sed-cli.test.txt::the s///w flag creates its file the same way
+xfail sed-cli.test.txt::a w target that will not open is exit 4 even behind a Q
+xfail sed-cli.test.txt::a w target that will not open outranks a LATER script error
+xfail sed-cli.test.txt::F names the file GNU's $ lookahead has already opened

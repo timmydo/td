@@ -44,8 +44,24 @@ pub struct Options {
     pub ere: bool,
     pub icase: bool,
     pub escapes: bool,
-    /// `^`/`$` also match at an embedded newline (sed's `M` flag).
-    pub multiline: bool,
+    /// POSIX REG_NEWLINE (sed's `M` flag), carrying the RECORD SEPARATOR it is
+    /// relative to: `\n` normally, NUL under `-z`. GNU implements it as TWO
+    /// mechanisms, and a pattern can tell them apart:
+    ///
+    /// - libc's REG_NEWLINE, bound to `\n` whatever the separator is. `^`/`$` gain
+    ///   the embedded newlines and `.` / a non-matching bracket list lose them —
+    ///   but nothing else does, so `\W` and an explicit `[\n]` still match one.
+    ///   Compiled into the pattern; see `parse_atom` and `parse_bracket`.
+    /// - Segments, when the separator is NOT a newline (libc cannot express it).
+    ///   The anchors move to that byte — `^`/`$` AND `\``/`\'` — for every caller.
+    ///   Whether the separator can be CONSUMED depends on the caller: a
+    ///   substitution works within one segment, an address over the whole pattern
+    ///   space. See `search_subst`, which is the only way to ask for the first.
+    ///
+    /// So under `-z` a `\n` inside a record stays ordinary to `\W` while the NUL is
+    /// unmatchable by `s///` and ordinary to an address, and `s/^d/X/M` does not
+    /// match after a `\n`.
+    pub reg_newline: Option<u8>,
 }
 
 /// A 256-bit byte set.
@@ -63,6 +79,13 @@ impl ByteSet {
         let word = usize::from(b >> 6);
         if let Some(w) = self.bits.get_mut(word) {
             *w |= 1u64 << (b & 63);
+        }
+    }
+
+    fn remove(&mut self, b: u8) {
+        let word = usize::from(b >> 6);
+        if let Some(w) = self.bits.get_mut(word) {
+            *w &= !(1u64 << (b & 63));
         }
     }
 
@@ -113,6 +136,11 @@ enum Node {
     Class(ByteSet),
     Bol,
     Eol,
+    /// `\\``/`\\'` — the BUFFER ends, which `M` does not move (that is what
+    /// distinguishes them from `^`/`$`). Separator confinement does move them,
+    /// because GNU then matches within a segment and its ends ARE the buffer's.
+    BufStart,
+    BufEnd,
     /// `\b` (true) / `\B` (false).
     WordBoundary(bool),
     /// `\<` (true) / `\>` (false).
@@ -134,7 +162,19 @@ pub struct Regex {
     root: Node,
     ngroups: usize,
     icase: bool,
-    multiline: bool,
+    reg_newline: Option<u8>,
+    /// The record separator when it is not a newline, i.e. when GNU works in
+    /// SEGMENTS. It moves `\`` and `\'` (both match paths) and is what nothing may
+    /// consume in a substitution. See `Options::reg_newline`.
+    segment: Option<u8>,
+    /// Whether the pattern contains a BACKREFERENCE. Not a matching rule of its own,
+    /// but GNU is confined to a segment in an ADDRESS too when the pattern has one --
+    /// even `\1*`, which need consume nothing, so it is the presence of a backref in
+    /// the compiled pattern and not the backref's own match that does it. That is
+    /// glibc's backref matcher rather than anything sed documents: `sed -z -n -e
+    /// 'N;N' -e '/\(.\)\1/Mp'` over `a\0\0b\0` finds nothing while `/../Mp` and
+    /// `/\(a\)\x00/Mp` over the same space both match.
+    has_backref: bool,
     /// Bytes that can begin a match, when that is knowable — a cheap skip for the
     /// scan loop. `None` means "anything".
     first: Option<ByteSet>,
@@ -402,7 +442,7 @@ impl<'a> Parser<'a> {
         if min > RE_DUP_MAX || max.is_some_and(|m| m > RE_DUP_MAX) {
             return Err(Error::new("Regular expression too big"));
         }
-        if matches!(atom, Node::Bol | Node::Eol) {
+        if matches!(atom, Node::Bol | Node::Eol | Node::BufStart | Node::BufEnd) {
             // `^\{1\}` — GNU rejects a repeated anchor in BRE.
             return Err(Error::new("Invalid preceding regular expression"));
         }
@@ -432,7 +472,13 @@ impl<'a> Parser<'a> {
     fn parse_atom(&mut self, depth: usize, first: bool, bol_ok: bool) -> Result<Node, Error> {
         let b = self.bump().ok_or_else(|| Error::new("unexpected end of pattern"))?;
         match b {
-            b'.' => Ok(Node::Any),
+            // sed's `M` flag is POSIX REG_NEWLINE, which is two rules, not one: `^`/`$`
+            // gain the embedded separators (see `State::at_bol`) AND `.` loses them.
+            // GNU reads `s/c.d/Z/M` over `abc\ndef` as no match at all.
+            b'.' => Ok(match self.opts.reg_newline.is_some() {
+                true => Node::Class(all_but_newline()),
+                false => Node::Any,
+            }),
             b'[' => self.parse_bracket(),
             b'^' => {
                 if self.opts.ere || bol_ok {
@@ -530,8 +576,8 @@ impl<'a> Parser<'a> {
             b'B' => Ok(Node::WordBoundary(false)),
             b'<' => Ok(Node::WordEdge(true)),
             b'>' => Ok(Node::WordEdge(false)),
-            b'`' => Ok(Node::Bol),
-            b'\'' => Ok(Node::Eol),
+            b'`' => Ok(Node::BufStart),
+            b'\'' => Ok(Node::BufEnd),
             _ => {
                 if self.opts.escapes {
                     if let Some(c) = self.escape_byte(b) {
@@ -630,6 +676,13 @@ impl<'a> Parser<'a> {
         }
         if negated {
             set.negate();
+            // The other half of REG_NEWLINE: a NON-MATCHING list does not match a
+            // newline either, so `s/[^abc]/Y/M` over `abc\ndef` reaches the `d`.
+            // Only `.` and this form lose it -- `\W` and an explicit `[\n]` still
+            // match one, which is why the rule lives here and not in `negate`.
+            if self.opts.reg_newline.is_some() {
+                set.remove(b'\n');
+            }
         }
         Ok(Node::Class(set))
     }
@@ -725,27 +778,45 @@ impl Regex {
         }
         let first = first_bytes(&root);
         let has_alt = has_alt(&root);
+        let has_backref = has_backref(&root);
         Ok(Self {
             root,
             ngroups: p.ngroups,
             icase: opts.icase,
-            multiline: opts.multiline,
+            reg_newline: opts.reg_newline,
+            segment: opts.reg_newline.filter(|sep| *sep != b'\n'),
             first,
             has_alt,
+            has_backref,
         })
     }
 
     /// Leftmost match at or after `from`, or `None`. `Err` means the step budget
     /// was exhausted.
     pub fn search(&self, hay: &[u8], from: usize) -> Result<Option<Captures>, Error> {
-        self.scan(hay, from, None, OnBudget::Fail)
+        self.scan(hay, from, None, OnBudget::Fail, false)
+    }
+
+    /// As `search`, but for a SUBSTITUTION, which GNU matches differently from an
+    /// address under `M` in two ways.
+    ///
+    /// It works within the segments between record separators, where an address
+    /// matches the whole pattern space: `printf 'a\0b\0' | sed -z -n -e N -e
+    /// '/a.b/Mp'` matches and `s/a.b/X/Mp` over the same space does not. And the
+    /// buffer anchors ``\` ``/`\'` follow `M`'s separator in an ADDRESS, where they
+    /// are indistinguishable from `^`/`$`, but in a substitution only a segment moves
+    /// them -- `s/\`a/X/Mg` over `a\na` rewrites only the first `a` while
+    /// `/\`a/M` matches at both. So confinement and the anchor policy are properties
+    /// of the CALL, not of the compiled pattern.
+    pub fn search_subst(&self, hay: &[u8], from: usize) -> Result<Option<Captures>, Error> {
+        self.scan(hay, from, None, OnBudget::Fail, true)
     }
 
     /// As `search`, but a budget exhausted with a match in hand answers with that
     /// match instead of failing. Only for callers that ask WHETHER `hay` matches —
     /// the span may not be the longest. See `OnBudget`.
     pub fn search_existence(&self, hay: &[u8], from: usize) -> Result<Option<Captures>, Error> {
-        self.scan(hay, from, None, OnBudget::Existence)
+        self.scan(hay, from, None, OnBudget::Existence, false)
     }
 
     /// Leftmost-then-longest match at or after `from` whose span satisfies `filter`.
@@ -763,7 +834,7 @@ impl Regex {
         filter: &Filter<'_>,
         on_budget: OnBudget,
     ) -> Result<Option<Captures>, Error> {
-        self.scan(hay, from, Some(filter), on_budget)
+        self.scan(hay, from, Some(filter), on_budget, false)
     }
 
     /// `scan_once`, with the PREVIOUS release's algorithm as a floor beneath it.
@@ -786,11 +857,12 @@ impl Regex {
         from: usize,
         filter: Option<&Filter<'_>>,
         on_budget: OnBudget,
+        subst: bool,
     ) -> Result<Option<Captures>, Error> {
-        match self.scan_once(hay, from, filter, on_budget) {
+        match self.scan_once(hay, from, filter, on_budget, subst) {
             Err(e) => match on_budget == OnBudget::Fail && !self.has_alt {
                 // One retry, so the worst case stays a bounded multiple of the budget.
-                true => self.scan_once(hay, from, filter, OnBudget::Existence),
+                true => self.scan_once(hay, from, filter, OnBudget::Existence, subst),
                 false => Err(e),
             },
             found => found,
@@ -806,6 +878,7 @@ impl Regex {
         from: usize,
         filter: Option<&Filter<'_>>,
         on_budget: OnBudget,
+        subst: bool,
     ) -> Result<Option<Captures>, Error> {
         let mut steps = 0u64;
         let mut at = from;
@@ -826,7 +899,7 @@ impl Regex {
             // rediscover spans the word test then throws away.
             skippable = skippable || filter.is_some_and(|f| !(f.start)(at));
             if !skippable {
-                if let Some(caps) = self.match_from(hay, at, &mut steps, filter, on_budget)? {
+                if let Some(caps) = self.match_from(hay, at, &mut steps, filter, on_budget, subst)? {
                     return Ok(Some(caps));
                 }
             }
@@ -850,7 +923,7 @@ impl Regex {
     /// seen even when a greedier one does not.
     pub fn matches_whole(&self, hay: &[u8]) -> Result<bool, Error> {
         let mut steps = 0u64;
-        match self.match_from(hay, 0, &mut steps, None, OnBudget::Fail)? {
+        match self.match_from(hay, 0, &mut steps, None, OnBudget::Fail, false)? {
             Some(caps) => Ok(caps.end() == hay.len()),
             None => Ok(false),
         }
@@ -880,11 +953,15 @@ impl Regex {
         steps: &mut u64,
         filter: Option<&Filter<'_>>,
         on_budget: OnBudget,
+        subst: bool,
     ) -> Result<Option<Captures>, Error> {
         let mut st = State {
             hay,
             icase: self.icase,
-            multiline: self.multiline,
+            reg_newline: self.reg_newline,
+            segment: self.segment,
+            subst,
+            has_backref: self.has_backref,
             caps: vec![None; self.ngroups + 1],
             best: None,
             steps: *steps,
@@ -924,12 +1001,31 @@ impl Regex {
     }
 }
 
+/// Every byte but the newline — what `.` means under REG_NEWLINE.
+fn all_but_newline() -> ByteSet {
+    let mut set = ByteSet::empty();
+    set.negate();
+    set.remove(b'\n');
+    set
+}
+
 /// Does the pattern contain an alternation anywhere?
 fn has_alt(node: &Node) -> bool {
     match node {
         Node::Alt(_) => true,
         Node::Group(_, inner) | Node::Repeat { node: inner, .. } => has_alt(inner),
         Node::Concat(items) => items.iter().any(has_alt),
+        _ => false,
+    }
+}
+
+/// Does the pattern contain a backreference anywhere? See `Regex::has_backref`.
+fn has_backref(node: &Node) -> bool {
+    match node {
+        Node::Backref(_) => true,
+        Node::Group(_, inner) | Node::Repeat { node: inner, .. } => has_backref(inner),
+        Node::Concat(items) => items.iter().any(has_backref),
+        Node::Alt(branches) => branches.iter().any(has_backref),
         _ => false,
     }
 }
@@ -971,7 +1067,16 @@ fn first_bytes(node: &Node) -> Option<ByteSet> {
 struct State<'a> {
     hay: &'a [u8],
     icase: bool,
-    multiline: bool,
+    reg_newline: Option<u8>,
+    /// Compile-time: the record separator, when it is not a newline. This is the
+    /// half of `M` libc cannot express, so GNU splits on it itself.
+    segment: Option<u8>,
+    /// Per CALL: is this a SUBSTITUTION? It is confined to one segment, and its
+    /// buffer anchors follow only a segment; an address sees the whole pattern space
+    /// and its buffer anchors follow the separator. See `Regex::search_subst`.
+    subst: bool,
+    /// See `Regex::has_backref`: it confines an address as a substitution already is.
+    has_backref: bool,
     caps: Spans,
     /// The longest match seen so far and where it ended.
     best: Option<(Spans, usize)>,
@@ -983,12 +1088,46 @@ impl State<'_> {
         self.hay.get(pos).copied()
     }
 
+    /// The byte at `pos`, if THIS CALL may consume it. Every byte-consuming step goes
+    /// through here, so nothing in a substitution crosses a separator — including the
+    /// greedy-repeat fast path and a backreference, which is where it leaked twice.
+    fn consumable(&self, pos: usize) -> Option<u8> {
+        match self.byte(pos) {
+            Some(b) if (self.subst || self.has_backref) && Some(b) == self.segment => None,
+            got => got,
+        }
+    }
+
     fn at_bol(&self, pos: usize) -> bool {
-        pos == 0 || (self.multiline && self.byte(pos.wrapping_sub(1)) == Some(b'\n'))
+        pos == 0
+            || self
+                .reg_newline
+                .is_some_and(|sep| self.byte(pos.wrapping_sub(1)) == Some(sep))
     }
 
     fn at_eol(&self, pos: usize) -> bool {
-        pos == self.hay.len() || (self.multiline && self.byte(pos) == Some(b'\n'))
+        pos == self.hay.len() || self.reg_newline.is_some_and(|sep| self.byte(pos) == Some(sep))
+    }
+
+    /// Which separator moves ``\` `` and `\'`, which is not the same for both callers.
+    /// In an ADDRESS they are indistinguishable from `^`/`$` and move to the record
+    /// separator with them. In a SUBSTITUTION only a segment moves them: `sed -n
+    /// 'N;s/\`a/X/Mg'` over `a\na` rewrites only the first `a`, where `/\`a/M`
+    /// matches at both, so REG_NEWLINE alone leaves them at the buffer's real ends.
+    fn buf_anchor(&self) -> Option<u8> {
+        match self.subst {
+            true => self.segment,
+            false => self.reg_newline,
+        }
+    }
+
+    fn at_buf_start(&self, pos: usize) -> bool {
+        pos == 0
+            || self.buf_anchor().is_some_and(|sep| self.byte(pos.wrapping_sub(1)) == Some(sep))
+    }
+
+    fn at_buf_end(&self, pos: usize) -> bool {
+        pos == self.hay.len() || self.buf_anchor().is_some_and(|sep| self.byte(pos) == Some(sep))
     }
 
     fn word_at(&self, pos: usize) -> bool {
@@ -1018,15 +1157,15 @@ fn m(st: &mut State, node: &Node, pos: usize, k: &mut dyn FnMut(&mut State, usiz
     }
     match node {
         Node::Empty => k(st, pos),
-        Node::Byte(b) => match st.byte(pos) {
+        Node::Byte(b) => match st.consumable(pos) {
             Some(got) if st.eq(got, *b) => k(st, pos + 1),
             _ => false,
         },
-        Node::Any => match st.byte(pos) {
+        Node::Any => match st.consumable(pos) {
             Some(_) => k(st, pos + 1),
             None => false,
         },
-        Node::Class(set) => match st.byte(pos) {
+        Node::Class(set) => match st.consumable(pos) {
             Some(got) if set.contains(got) => k(st, pos + 1),
             _ => false,
         },
@@ -1039,6 +1178,20 @@ fn m(st: &mut State, node: &Node, pos: usize, k: &mut dyn FnMut(&mut State, usiz
         }
         Node::Eol => {
             if st.at_eol(pos) {
+                k(st, pos)
+            } else {
+                false
+            }
+        }
+        Node::BufStart => {
+            if st.at_buf_start(pos) {
+                k(st, pos)
+            } else {
+                false
+            }
+        }
+        Node::BufEnd => {
+            if st.at_buf_end(pos) {
                 k(st, pos)
             } else {
                 false
@@ -1106,7 +1259,7 @@ fn m(st: &mut State, node: &Node, pos: usize, k: &mut dyn FnMut(&mut State, usiz
                 if st.steps >= STEP_BUDGET {
                     return false;
                 }
-                let (Some(a), Some(b)) = (st.byte(s + i), st.byte(pos + i)) else {
+                let (Some(a), Some(b)) = (st.byte(s + i), st.consumable(pos + i)) else {
                     return false;
                 };
                 if !st.eq(a, b) {
@@ -1173,7 +1326,7 @@ fn m_repeat_flat(
     let mut taken: u32 = 0;
     let mut end = pos;
     while max.is_none_or(|m| taken < m) {
-        let Some(b) = st.byte(end) else { break };
+        let Some(b) = st.consumable(end) else { break };
         if !single_byte_matches(st, node, b) {
             break;
         }
@@ -1376,6 +1529,143 @@ mod tests {
             easy.search(hay.as_bytes(), 0).unwrap().unwrap().end(),
             easy.search_existence(hay.as_bytes(), 0).unwrap().unwrap().end(),
         );
+    }
+
+    /// sed's `M` is POSIX REG_NEWLINE, and this is the half td-txt was missing: `.`
+    /// and a NON-MATCHING bracket list stop at a separator.
+    #[test]
+    fn reg_newline_keeps_dot_and_negated_lists_off_the_newline() {
+        let opts = Options { reg_newline: Some(b'\n'), ..Options::default() };
+        let dot = Regex::compile(b"c.d", opts).unwrap();
+        assert!(dot.search(b"abc\ndef", 0).unwrap().is_none());
+        let neg = Regex::compile(b"[^abc]", opts).unwrap();
+        // Reaches the `d`, stepping over the newline rather than matching it.
+        assert_eq!(neg.search(b"abc\ndef", 0).unwrap().unwrap().start(), 4);
+        let star = Regex::compile(b".*", opts).unwrap();
+        assert_eq!(star.search(b"abc\ndef", 0).unwrap().unwrap().end(), 3);
+        // Without the flag, all three cross it.
+        let plain = Options::default();
+        assert!(Regex::compile(b"c.d", plain).unwrap().search(b"abc\ndef", 0).unwrap().is_some());
+        assert_eq!(
+            Regex::compile(b"[^abc]", plain).unwrap().search(b"abc\ndef", 0).unwrap().unwrap().start(),
+            3
+        );
+        // A newline named EXPLICITLY in a positive list still matches under the flag.
+        let lit = Regex::compile(b"[\n]", opts).unwrap();
+        assert!(lit.search(b"abc\ndef", 0).unwrap().is_some());
+    }
+
+    /// The two halves of REG_NEWLINE do not use the same byte when the record
+    /// separator is not a newline (sed `-z`, where `N` joins records with a NUL):
+    /// the anchor half takes the separator ALONE, the exclusion half takes both.
+    #[test]
+    fn reg_newline_anchors_on_the_separator_but_excludes_the_newline_too() {
+        let nul = Options { reg_newline: Some(0), ..Options::default() };
+        // Anchors at the NUL, for EITHER caller...
+        assert!(Regex::compile(b"^b", nul).unwrap().search(b"a\0b", 0).unwrap().is_some());
+        assert!(Regex::compile(b"^b", nul).unwrap().search_subst(b"a\0b", 0).unwrap().is_some());
+        assert!(Regex::compile(b"a$", nul).unwrap().search(b"a\0b", 0).unwrap().is_some());
+        // ...but not at a newline, which is not the separator here.
+        assert!(Regex::compile(b"^d", nul).unwrap().search(b"abc\ndef", 0).unwrap().is_none());
+        assert!(Regex::compile(b"c$", nul).unwrap().search(b"abc\ndef", 0).unwrap().is_none());
+        // REG_NEWLINE drops the NEWLINE from `.` and a non-matching list in either
+        // path, while the SEPARATOR is only out of reach in a substitution.
+        assert!(Regex::compile(b"c.d", nul).unwrap().search(b"abc\ndef", 0).unwrap().is_none());
+        assert!(Regex::compile(b"a.b", nul).unwrap().search_subst(b"a\0b", 0).unwrap().is_none());
+        assert!(Regex::compile(b"a.b", nul).unwrap().search(b"a\0b", 0).unwrap().is_some());
+        assert!(Regex::compile(b"[^a]", nul).unwrap().search_subst(b"a\0b", 0).unwrap()
+            .is_some_and(|c| c.start() == 2));
+        // Without the flag both bytes are ordinary.
+        let plain = Options::default();
+        assert!(Regex::compile(b"a.b", plain).unwrap().search(b"a\0b", 0).unwrap().is_some());
+        assert!(Regex::compile(b"^b", plain).unwrap().search(b"a\0b", 0).unwrap().is_none());
+    }
+
+    /// A separator that is not a newline confines a SUBSTITUTION to the segments
+    /// between them, so nothing consumes one there — while the same pattern used as
+    /// an ADDRESS matches the whole space, and the newline half of the flag (libc's
+    /// REG_NEWLINE, touching only `.` and a non-matching list) applies to both.
+    #[test]
+    fn a_non_newline_separator_is_consumed_by_nothing_in_a_substitution() {
+        let nul = Options { reg_newline: Some(0), escapes: true, ..Options::default() };
+        // Nothing may cover the separator at index 1 in a substitution. `[\x00]` is
+        // here for the fast paths' sake even though an escape inside a bracket is a
+        // recorded gap, and `\s` because a NUL is not whitespace either way.
+        for pat in [&b"\\x00"[..], b"[\\x00]", b"\\W", b"\\s", b"[^a]", b".", b"\\(.\\)\\1"] {
+            let re = Regex::compile(pat, nul).unwrap();
+            assert!(
+                re.search_subst(b"a\0a", 0).unwrap().is_none_or(|c| c.end() <= 1 || c.start() >= 2),
+                "{:?} consumed the separator",
+                String::from_utf8_lossy(pat)
+            );
+        }
+        // The ADDRESS path reaches it, which is what makes confinement a property of
+        // the call and not of the compiled pattern. Only patterns that can match a
+        // NUL at all show it — not `\s`, and not `[\x00]` while the escape gap stands.
+        for pat in [&b"\\x00"[..], b"\\W", b"[^a]", b"."] {
+            let re = Regex::compile(pat, nul).unwrap();
+            let hit = re.search(b"a\0a", 0).unwrap();
+            assert!(hit.is_some(), "{:?} found nothing", String::from_utf8_lossy(pat));
+        }
+        assert!(Regex::compile(b"a.a", nul).unwrap().search(b"a\0a", 0).unwrap().is_some());
+        assert!(Regex::compile(b"a.a", nul).unwrap().search_subst(b"a\0a", 0).unwrap().is_none());
+        // The newline is NOT confined either way: `\W` matches one under the flag,
+        // which is what makes the two mechanisms distinguishable.
+        let nl = Regex::compile(b"\\W", nul).unwrap();
+        assert_eq!(nl.search_subst(b"a\nb", 0).unwrap().unwrap().start(), 1);
+        assert_eq!(nl.search(b"a\nb", 0).unwrap().unwrap().start(), 1);
+        // ...while `.` and a non-matching list still lose it, in EITHER path.
+        assert!(Regex::compile(b"a.b", nul).unwrap().search(b"a\nb", 0).unwrap().is_none());
+        assert!(Regex::compile(b"a.b", nul).unwrap().search_subst(b"a\nb", 0).unwrap().is_none());
+        // With a NEWLINE separator nothing is confined; REG_NEWLINE alone applies.
+        let opts = Options { reg_newline: Some(b'\n'), ..Options::default() };
+        let w = Regex::compile(b"\\W", opts).unwrap();
+        assert_eq!(w.search(b"a\nb", 0).unwrap().unwrap().start(), 1);
+        assert_eq!(w.search_subst(b"a\nb", 0).unwrap().unwrap().start(), 1);
+    }
+
+    /// The buffer anchors are `^`/`$` to an ADDRESS and true buffer anchors to a
+    /// SUBSTITUTION, which is the third thing about `M` this engine had wrong.
+    #[test]
+    fn the_buffer_anchors_follow_the_separator_only_where_gnu_moves_them() {
+        for (sep, hay) in [(b'\n', &b"a\nb"[..]), (0, b"a\0b")] {
+            let opts = Options { reg_newline: Some(sep), ..Options::default() };
+            let (open, close) = (Regex::compile(b"\\`b", opts).unwrap(), Regex::compile(b"a\\'", opts).unwrap());
+            // An address moves them to the record separator, whatever it is.
+            assert!(open.search(hay, 0).unwrap().is_some(), "sep {sep}: address lost \\`");
+            assert!(close.search(hay, 0).unwrap().is_some(), "sep {sep}: address lost \\'");
+            // A substitution moves them only for a SEGMENT, which a newline is not.
+            let moved = sep != b'\n';
+            assert_eq!(open.search_subst(hay, 0).unwrap().is_some(), moved);
+            assert_eq!(close.search_subst(hay, 0).unwrap().is_some(), moved);
+        }
+        // Without the flag neither caller moves them, and `^` is the contrast that
+        // does move: `s/\`a/X/Mg` over `a\na` rewrites one `a`, `s/^a/X/Mg` both.
+        let plain = Options::default();
+        assert!(Regex::compile(b"\\`b", plain).unwrap().search(b"a\nb", 0).unwrap().is_none());
+        let m = Options { reg_newline: Some(b'\n'), ..Options::default() };
+        assert!(Regex::compile(b"^b", m).unwrap().search_subst(b"a\nb", 0).unwrap().is_some());
+    }
+
+    /// A backreference confines an ADDRESS too, which no rule about `M` predicts —
+    /// see `Regex::has_backref`.
+    #[test]
+    fn a_backreference_confines_the_address_path_as_well() {
+        let nul = Options { reg_newline: Some(0), escapes: true, ..Options::default() };
+        let hay = &b"a\0\0b"[..];
+        // Nothing crosses the separator once a backref is in the pattern, whether the
+        // backref does the crossing or a literal does.
+        for pat in [&b"\\(.\\)\\1"[..], b"\\(a\\)\\x00\\1*"] {
+            let re = Regex::compile(pat, nul).unwrap();
+            assert!(re.search(hay, 0).unwrap().is_none(), "{:?} crossed", String::from_utf8_lossy(pat));
+        }
+        // Without one, an address crosses; and a match inside a segment is unaffected.
+        assert!(Regex::compile(b"..", nul).unwrap().search(hay, 0).unwrap().is_some());
+        assert!(Regex::compile(b"\\(a\\)\\x00", nul).unwrap().search(hay, 0).unwrap().is_some());
+        assert!(Regex::compile(b"\\(b\\)\\1*", nul).unwrap().search(hay, 0).unwrap().is_some());
+        // A newline separator has no segment, so a doubled NUL is an ordinary pair.
+        let nl = Options { reg_newline: Some(b'\n'), ..Options::default() };
+        assert!(Regex::compile(b"\\(.\\)\\1", nl).unwrap().search(hay, 0).unwrap().is_some());
     }
 
     #[test]
