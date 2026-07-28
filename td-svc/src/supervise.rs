@@ -63,6 +63,22 @@ const CONTROL_USAGE: &str = "usage: status [NAME] | start NAME | stop NAME | res
 /// `/etc/shutdown` is unmounting filesystems underneath them.
 const SHUTDOWN_MARKER: &str = "/run/td-svc/shutdown";
 
+/// How long every orphan of a previous supervisor gets between TERM and KILL,
+/// TOTAL rather than each: they are signalled together and waited on together,
+/// so a machine with eight wedged services is delayed once, not eight times.
+///
+/// Short, and bounded, because this is the boot path and **I5** applies —
+/// nothing here may delay a console indefinitely. It is deliberately less than
+/// a unit's own `stop-timeout`: an orphan has already lost its supervisor, so
+/// there is nobody left for a graceful exit to report to.
+const EVICT_GRACE: Duration = Duration::from_secs(5);
+
+/// How long to keep looking after the KILL before giving up and saying so.
+/// SIGKILL is not instantaneous — the task still has to be scheduled and torn
+/// down — so declaring failure the moment it is sent would report a survivor
+/// that is merely on its way out.
+const EVICT_SETTLE: Duration = Duration::from_secs(2);
+
 /// The teardown script, run once every service is down and before the power
 /// applet. It is what actually syncs and unmounts.
 const SHUTDOWN_SCRIPT: &str = "/etc/shutdown";
@@ -495,6 +511,35 @@ fn kill_target(
 
 /// Which containment a `tty=` child's `/proc` entry describes. Split out from
 /// the read so the classification is testable without fabricating a `/proc`.
+/// Is this containment provably empty? An incomplete scan is NOT emptiness
+/// (I3) — it reads as "still there", the direction that refuses to start a
+/// duplicate rather than the one that starts a second copy.
+fn scan_is_empty(scan: procfs::Scan) -> bool {
+    scan.proven_empty()
+}
+
+/// How to address a recorded orphan.
+///
+/// The recorded terminal comes FIRST, because it is the one thing that cannot
+/// be recovered: the child never carries it (td-svc opens the console
+/// `O_NOCTTY`, so its field 7 is 0 for life), so re-deriving from `/proc` would
+/// narrow a console unit to its wrapper and leave the login tree running.
+/// Everything else IS recoverable and is read fresh rather than trusted.
+fn containment_of(entry: &crate::evict::Entry) -> Containment {
+    if entry.tty != 0 {
+        return Containment::Console {
+            leader: entry.pid,
+            tty: entry.tty,
+        };
+    }
+    match procfs::stat_of(entry.pid) {
+        Ok(Some(stat)) => classify(entry.pid, &stat),
+        // It leads nothing we can prove, so address it alone rather than
+        // guessing at a group that might be td-svc's own.
+        _ => Containment::Process(entry.pid),
+    }
+}
+
 fn classify(pid: i32, stat: &procfs::Stat) -> Containment {
     // Reached only when the unit's `tty=` device could not be resolved — see
     // `containment`, which prefers `Console` because neither the group nor the
@@ -934,6 +979,17 @@ pub struct Runtime {
     /// evidence, and the same threshold, that resets a service's restart count.
     cad_retry_at: Option<Instant>,
     cad_failures: u32,
+    /// Where this supervisor records what it started, so its SUCCESSOR can
+    /// evict it. A field for the same reason `marker_path` is one: the whole
+    /// interesting behaviour is what happens to a machine that already has a
+    /// record, and a test that reached the real path would evict processes
+    /// belonging to the host running the suite.
+    started_path: String,
+    /// Orphans this supervisor could NOT prove gone: signalled and still there,
+    /// or unverifiable. They stay in the record so the NEXT supervisor tries
+    /// again — dropping them would let a td-svc that dies after a failed
+    /// eviction hand its successor a clean file and a running duplicate.
+    unevicted: Vec<crate::evict::Entry>,
     /// Where the I6 marker lives. A field, not the constant used directly, for
     /// the same reason `table_path` is one: every interesting property of the
     /// marker — that it is written BEFORE the first stop, that a resume reads
@@ -997,6 +1053,8 @@ impl Runtime {
                 cad_pid_path: crate::cad::CAD_PID.to_string(),
                 cad_retry_at: None,
                 cad_failures: 0,
+                started_path: crate::evict::STATE.to_string(),
+                unevicted: Vec::new(),
                 marker_path: SHUTDOWN_MARKER.to_string(),
             },
             complaints,
@@ -1152,6 +1210,15 @@ impl Runtime {
                         _ => None,
                     };
                 }
+                // Recorded as soon as the identity is known, and before the
+                // waiter: everything after this point can fail, and a service
+                // that is already RUNNING has to be in the record whether or
+                // not the rest of the start succeeds. The window this cannot
+                // close is between `spawn` returning and this write — a td-svc
+                // killed inside it leaves an orphan its successor never hears
+                // about — and it is unclosable, because the pid does not exist
+                // to record until `spawn` returns.
+                self.persist_started();
                 if !self.watch(child, unit.name.clone(), generation) {
                     self.abandon(index, pid, &unit.name);
                     return;
@@ -2141,6 +2208,269 @@ impl Runtime {
         log(&format!("ctrl-alt-del armed (sentinel {pid})"));
     }
 
+    /// Record what is running, so a REPLACEMENT supervisor can evict it.
+    ///
+    /// Written from the live set on every spawn, whole, rather than appended
+    /// to: an append-only record grows without bound under a crash-looping
+    /// service and this lives in `/run`, which is RAM. Rewriting also makes it
+    /// self-cleaning, so no exit path has to remember to remove an entry — a
+    /// stale one is filtered by the identity check on the way back in.
+    ///
+    /// A service whose `starttime` could not be read is deliberately LEFT OUT.
+    /// Recording a pid nothing can verify would hand the successor a number to
+    /// kill on faith, and the whole safety of this mechanism is that it never
+    /// does that. The cost is an orphan that outlives its supervisor; the
+    /// alternative is signalling a stranger.
+    ///
+    /// Best effort. A supervisor that cannot write this still supervises — what
+    /// is lost is its successor's ability to clean up after it, which is not
+    /// worth refusing to run a machine over.
+    fn persist_started(&self) {
+        let mut entries: Vec<crate::evict::Entry> = self.unevicted.clone();
+        entries.extend(self
+            .services
+            .iter()
+            .filter_map(|service| {
+                Some(crate::evict::Entry {
+                    pid: service.pid?,
+                    starttime: service.starttime?,
+                    tty: service.tty_dev.unwrap_or(0),
+                    name: service.unit.name.clone(),
+                })
+            }));
+        if let Err(e) = crate::evict::write(&self.started_path, &entries) {
+            log(&format!(
+                "cannot record what is running in {}: {e}; a replacement \
+                 supervisor will not know to evict it",
+                self.started_path
+            ));
+        }
+    }
+
+    /// Kill whatever a previous supervisor started, before starting anything.
+    ///
+    /// Returns the unit names it could NOT clear. Those must not be started:
+    /// an unsupervised copy is still running, and a second one is the duplicate
+    /// this whole mechanism exists to prevent — the same trade `abandon` makes,
+    /// "better one degraded service than a duplicate nobody owns".
+    ///
+    /// **I5 is not violated by refusing a console here.** A greeter that
+    /// survived eviction is still holding its terminal, so the machine is still
+    /// repairable from its own console — what it lacks is supervision, not a
+    /// console. Starting a second getty on the same device would take the
+    /// working one away.
+    fn evict_orphans(&mut self) -> Vec<String> {
+        let (entries, problems) = crate::evict::read(&self.started_path);
+        for problem in problems {
+            log(&problem);
+        }
+        if entries.is_empty() {
+            return Vec::new();
+        }
+        let mut live: Vec<(crate::evict::Entry, Containment)> = Vec::new();
+        let mut refused: Vec<String> = Vec::new();
+        for entry in entries {
+            match procfs::is_same_process(entry.pid, entry.starttime) {
+                // The recorded process is not there. Usually that is the whole
+                // story — a supervisor that exited cleanly leaves a record full
+                // of these — but its CHILDREN may still hold the group or the
+                // terminal, which is the case containment exists for.
+                Ok(false) => match self.survivors_of(&entry) {
+                    Some(mode) => {
+                        log(&format!(
+                            "{}: pid {} is gone but its {mode:?} is not empty; evicting that",
+                            entry.name, entry.pid
+                        ));
+                        live.push((entry, mode));
+                        continue;
+                    }
+                    None => continue,
+                },
+                Ok(true) => {}
+                Err(e) => {
+                    // I3: unreadable is an error, not an emptiness. Not knowing
+                    // whether the recorded process is there is not permission to
+                    // assume it is not.
+                    log(&format!(
+                        "{}: cannot tell whether pid {} is still the process that \
+                         was recorded ({e}); not starting it",
+                        entry.name, entry.pid
+                    ));
+                    refused.push(entry.name.clone());
+                    self.carry_forward(entry);
+                    continue;
+                }
+            }
+            let mode = containment_of(&entry);
+            log(&format!(
+                "{}: a previous supervisor left pid {} running; evicting {mode:?}",
+                entry.name, entry.pid
+            ));
+            live.push((entry, mode));
+        }
+        if live.is_empty() {
+            // Nothing to signal. Rewrite rather than delete: an entry that
+            // could not be VERIFIED is still carried, and a later read
+            // re-deciding about it is the point.
+            self.persist_started();
+            return refused;
+        }
+
+        // Signalled together and waited on together: a machine with eight
+        // wedged services is delayed once, not eight times (I5).
+        for (_, mode) in &live {
+            let _ = self.signal(*mode, crate::sys::SIGTERM);
+        }
+        self.wait_until_evicted(&live, EVICT_GRACE);
+        let stubborn: Vec<(crate::evict::Entry, Containment)> = live
+            .into_iter()
+            .filter(|(_, mode)| !self.evicted(*mode))
+            .collect();
+        // The grace period is long enough for the recorded process to exit, be
+        // reaped by PID 1, and have its number reissued — and every containment
+        // but a console's is keyed off that number. Re-verified before the
+        // escalation, because a KILL is the one signal nothing survives to
+        // complain about.
+        let stubborn: Vec<(crate::evict::Entry, Containment)> = stubborn
+            .into_iter()
+            .filter(|(entry, mode)| match *mode {
+                Containment::Console { .. } => true,
+                _ => match procfs::is_same_process(entry.pid, entry.starttime) {
+                    Ok(true) => true,
+                    // Gone during the grace: whatever holds that number now was
+                    // never ours. Its own survivors were covered by the TERM.
+                    Ok(false) => false,
+                    // I3: unreadable is not emptiness, but it is not a licence
+                    // to KILL a number we can no longer vouch for either.
+                    Err(_) => false,
+                },
+            })
+            .collect();
+        for (entry, mode) in &stubborn {
+            log(&format!("{}: still there after TERM; killing it", entry.name));
+            let _ = self.signal(*mode, crate::sys::SIGKILL);
+        }
+        self.wait_until_evicted(&stubborn, EVICT_SETTLE);
+        refused.extend(self.refuse_unevicted(stubborn));
+        // Rewrite, never delete: everything proven gone drops out, everything
+        // that survived stays, and the successor inherits the difference.
+        self.persist_started();
+        refused
+    }
+
+    /// Of the orphans just signalled, which are still there?
+    ///
+    /// Split out because this is the branch's headline safety property — "what
+    /// could not be cleared must not be started" — and a test that supplies the
+    /// names itself proves only the spelling of the refusal, never the
+    /// decision. Signals nothing, so a test may point it at a process it wants
+    /// to keep.
+    fn refuse_unevicted(
+        &mut self,
+        signalled: Vec<(crate::evict::Entry, Containment)>,
+    ) -> Vec<String> {
+        let mut refused = Vec::new();
+        for (entry, mode) in signalled {
+            if !self.evicted(mode) {
+                log(&format!(
+                    "{}: could NOT be evicted; not starting it, because a second \
+                     copy of a service nobody supervises is worse than none",
+                    entry.name
+                ));
+                refused.push(entry.name.clone());
+                self.carry_forward(entry);
+            }
+        }
+        refused
+    }
+
+    /// The containment of a recorded process that is no longer there, IF
+    /// something is still in it.
+    ///
+    ///
+    /// Safe only because the pid is wholly absent. A process group keeps its id
+    /// as long as a member lives, and nothing can create group N without first
+    /// holding pid N — so with pid N unused, members of group N must be what is
+    /// left of the recorded service. If the number has been REISSUED that
+    /// argument collapses (the new holder may lead a new group N), and this
+    /// answers `None` rather than guess.
+    ///
+    /// Requires the scan to have actually FOUND something: an unreadable
+    /// `/proc` must not turn into a teardown and a refused unit (I5).
+    fn survivors_of(&self, entry: &crate::evict::Entry) -> Option<Containment> {
+        if !matches!(procfs::stat_of(entry.pid), Ok(None)) {
+            return None;
+        }
+        // A console's device is the recorded tty; every other unit is put in
+        // its own group at spawn, so the group id is the recorded pid.
+        let mode = if entry.tty != 0 {
+            Containment::Console {
+                leader: entry.pid,
+                tty: entry.tty,
+            }
+        } else {
+            Containment::Group(entry.pid)
+        };
+        let found = procfs::members(mode, self.self_pid)
+            .is_ok_and(|scan| !scan.pids.is_empty());
+        found.then_some(mode)
+    }
+
+    /// Keep an orphan in the record because it was not proven gone.
+    ///
+    /// Deduplicated by pid: `evict_orphans` runs once per boot, but a record
+    /// naming the same pid twice must not make the successor's file grow each
+    /// time a supervisor fails to clear it.
+    fn carry_forward(&mut self, entry: crate::evict::Entry) {
+        if !self.unevicted.iter().any(|u| u.pid == entry.pid) {
+            self.unevicted.push(entry);
+        }
+    }
+
+    /// Refuse to start units whose previous copy is still running.
+    ///
+    /// Split out of `run` so it can be tested — `run` never returns, and this
+    /// is the step that decides whether a boot starts a second sshd. Same
+    /// reason `resume_if_marked` is its own method.
+    ///
+    /// `Failed` with no `retry_at` is the one state `start_eligible` will not
+    /// leave on its own, so nothing brings the duplicate back behind the
+    /// operator's back; an explicit `start` still can, once they have dealt
+    /// with the copy that is still there.
+    fn refuse_duplicates(&mut self, names: &[String]) {
+        for name in names {
+            if let Some(service) = self.lookup_mut(name) {
+                service.phase = Phase::Failed;
+                service.retry_at = None;
+            }
+        }
+    }
+
+    /// Is this containment provably empty? An unreadable scan proves nothing
+    /// and is NOT emptiness (I3) — so it reads as "still there", which is the
+    /// direction that refuses to start a duplicate.
+    fn evicted(&self, mode: Containment) -> bool {
+        procfs::members(mode, self.self_pid).is_ok_and(scan_is_empty)
+    }
+
+    /// Poll until every containment is empty, or the deadline passes.
+    ///
+    /// Polling rather than waiting: these are PID 1's children, not td-svc's,
+    /// so there is nothing to `wait` on — which is also why **I4** cannot be
+    /// satisfied for them and an empty containment is the most that can be
+    /// observed.
+    fn wait_until_evicted(&self, live: &[(crate::evict::Entry, Containment)], within: Duration) {
+        let Some(deadline) = Instant::now().checked_add(within) else {
+            return;
+        };
+        while Instant::now() < deadline {
+            if live.iter().all(|(_, mode)| self.evicted(*mode)) {
+                return;
+            }
+            std::thread::sleep(TICK);
+        }
+    }
+
     /// Re-arm after a throttled wait, so a sentinel that cannot survive does not
     /// spin. Also the one place `cad_retry_at` is cleared.
     fn advance_cad(&mut self) {
@@ -2659,17 +2989,29 @@ impl Runtime {
     /// Run until killed. td-svc is respawned by PID 1, so returning is not a
     /// normal outcome — but unlike PID 1 it is not fatal either.
     pub fn run(&mut self) -> ! {
+        // Whatever a previous instance left running is running RIGHT NOW,
+        // unsupervised, and it is running whichever way this boot goes: if we
+        // go on to supervise, starting a second copy is the duplicate this
+        // prevents; if we go on to finish a teardown, an orphan still holding
+        // /var is a mount that will not come away. So it is evicted before
+        // anything starts.
         // I6: a marker means an earlier instance began a teardown and did not
         // finish it. Resume rather than supervise — every service it had
         // already stopped is down, and `/etc/shutdown` may be part way through
-        // unmounting what the rest are using.
+        // unmounting what the rest are using. Reading it changes no process, so
+        // it can precede the eviction; what must not precede it is starting
+        // anything.
         self.resume_if_marked();
-        // Not while resuming: a supervisor that came back to a marker is on its
-        // way to the power applet, and a sentinel armed now would only have to
-        // be stopped again.
+        // Before the eviction, which can take EVICT_GRACE + EVICT_SETTLE: until
+        // this runs, Ctrl-Alt-Del is the kernel's own hard reset, and a boot
+        // that spends seconds evicting is exactly when someone reaches for it.
+        // The sentinel is this supervisor's child and is in no record, so the
+        // eviction that follows cannot touch it.
         if self.shutdown.is_none() {
             self.arm_cad();
         }
+        let surviving = self.evict_orphans();
+        self.refuse_duplicates(&surviving);
         let mut complain_at = Some(Instant::now());
         loop {
             // A table that yielded NO units is the one failure this process cannot
@@ -4719,6 +5061,466 @@ mod tests {
         assert!(
             crate::backoff::delay(2) > crate::backoff::delay(1),
             "the backoff does not grow, so this test proves nothing"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A runtime whose eviction record is a scratch file, not `/run`.
+    fn evict_runtime(text: &str, tag: &str) -> (Runtime, String) {
+        let (mut rt, dir) = shutdown_runtime(text, tag);
+        rt.started_path = format!("{dir}/started");
+        (rt, dir)
+    }
+
+    /// Starting a service RECORDS it. Without this the whole mechanism is
+    /// inert: a supervisor that records nothing leaves its successor an empty
+    /// file and nothing to evict.
+    ///
+    /// Every other test here hand-writes the record, so this is the one that
+    /// exercises the writer, and it needs a unit that really spawns.
+    #[test]
+    fn starting_a_service_records_it_for_the_next_supervisor() {
+        let (mut rt, dir) = evict_runtime(
+            "[a]\ntype=daemon\nexec=/bin/sh -c 'sleep 30'\n",
+            "evict-writer",
+        );
+        rt.start_eligible();
+        let Some(pid) = rt.lookup("a").and_then(|service| service.pid) else {
+            eprintln!("note: the unit did not spawn here; skipping");
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        };
+        let (entries, problems) = crate::evict::read(&rt.started_path);
+        assert!(problems.is_empty(), "{problems:?}");
+        assert!(
+            entries.iter().any(|e| e.pid == pid && e.name == "a"),
+            "the spawn was not recorded, so a successor has nothing to evict: {entries:?}"
+        );
+        let _ = rt.signal(Containment::Process(pid), crate::sys::SIGKILL);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The recorded terminal — not `/proc` — decides how a console orphan is
+    /// addressed.
+    ///
+    /// This is the module's headline claim and the reason `tty` is in the file
+    /// at all: the child never carries the device (td-svc opens consoles
+    /// `O_NOCTTY`), so a containment re-derived from `/proc` narrows to the
+    /// wrapper and leaves the login tree running.
+    #[test]
+    fn a_recorded_terminal_decides_how_a_console_orphan_is_addressed() {
+        let console = crate::evict::Entry {
+            pid: 4242,
+            starttime: 7,
+            tty: 1032,
+            name: "greeter".to_string(),
+        };
+        assert_eq!(
+            containment_of(&console),
+            Containment::Console {
+                leader: 4242,
+                tty: 1032,
+            },
+            "a recorded terminal was ignored; the login tree would survive"
+        );
+        // With no terminal recorded there is nothing to prefer, so it is read
+        // fresh — and an absent pid leads nothing we can prove.
+        let plain = crate::evict::Entry {
+            tty: 0,
+            ..console.clone()
+        };
+        assert_eq!(containment_of(&plain), Containment::Process(4242));
+    }
+
+    /// I3 at the eviction's decision point: an incomplete scan is not
+    /// emptiness. Reading it the other way turns an unreadable `/proc` into
+    /// "already evicted" and starts the duplicate.
+    #[test]
+    fn an_incomplete_scan_is_not_an_evicted_containment() {
+        assert!(
+            scan_is_empty(procfs::Scan::default()),
+            "a clean empty scan is emptiness"
+        );
+        assert!(
+            !scan_is_empty(procfs::Scan {
+                pids: Vec::new(),
+                errors: vec!["/proc/7: boom".to_string()],
+            }),
+            "an unreadable scan was read as evicted"
+        );
+    }
+
+    /// The refusal DECISION, not its spelling: a name is refused because its
+    /// containment is still occupied, and is carried forward for the next
+    /// supervisor at the same time.
+    ///
+    /// `refuse_unevicted` signals nothing, which is what lets this point at a
+    /// process the test wants to keep.
+    #[test]
+    fn an_orphan_still_in_its_containment_refuses_its_unit() {
+        let (mut rt, dir) = evict_runtime("[a]\ntype=oneshot\nexec=/x\n", "evict-refuse");
+        let Some(live) = live_child() else {
+            eprintln!("note: cannot spawn a child here; skipping");
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        };
+        let entry = crate::evict::Entry {
+            pid: live.pid,
+            starttime: live.starttime,
+            tty: 0,
+            name: "a".to_string(),
+        };
+        let refused = rt.refuse_unevicted(vec![(entry, Containment::Process(live.pid))]);
+        assert_eq!(
+            refused,
+            vec!["a".to_string()],
+            "a unit whose orphan is still running was not refused"
+        );
+        assert!(
+            rt.unevicted.iter().any(|e| e.pid == live.pid),
+            "the refused orphan was not carried forward: {:?}",
+            rt.unevicted
+        );
+
+        // And one that IS gone is neither refused nor carried.
+        let gone = crate::evict::Entry {
+            pid: i32::MAX,
+            starttime: 1,
+            tty: 0,
+            name: "b".to_string(),
+        };
+        let refused = rt.refuse_unevicted(vec![(gone, Containment::Process(i32::MAX))]);
+        assert!(
+            refused.is_empty(),
+            "an empty containment refused its unit anyway: {refused:?}"
+        );
+        drop(live);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A group whose LEADER is already gone is still evicted.
+    ///
+    /// The dangerous shape: sshd forks its children into its own process group
+    /// and then dies. The recorded pid is unfindable, but the group is exactly
+    /// what `Containment` exists to reach — and skipping the entry because the
+    /// leader is missing leaves those children running and starts a second
+    /// sshd beside them.
+    #[test]
+    fn a_dead_leader_does_not_hide_its_surviving_group() {
+        use std::os::unix::process::CommandExt;
+        let (mut rt, dir) = evict_runtime("[a]\ntype=oneshot\nexec=/x\n", "evict-orphaned-group");
+        // A group leader that backgrounds a child and exits. The child stays in
+        // the leader's group, which keeps its id as long as a member lives.
+        let Ok(mut leader) = Command::new("/bin/sh")
+            .arg("-c")
+            .arg("sh -c 'sleep 30' & exit 0")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .process_group(0)
+            .spawn()
+        else {
+            eprintln!("note: cannot spawn a child here; skipping");
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        };
+        let Ok(pid) = i32::try_from(leader.id()) else {
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        };
+        let starttime = procfs::stat_of(pid)
+            .ok()
+            .flatten()
+            .map_or(0, |st| st.starttime);
+        // Reaped, so the number is FREE — which is what makes addressing the
+        // group by it sound. (If the kernel reissues it to a stranger between
+        // here and the scan, `survivors_of` answers None and this test skips
+        // rather than misfires.)
+        let _ = leader.wait();
+        if !matches!(procfs::stat_of(pid), Ok(None)) {
+            eprintln!("note: the leader's pid did not free up; skipping");
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        }
+
+        crate::evict::write(
+            &rt.started_path,
+            &[crate::evict::Entry {
+                pid,
+                starttime,
+                tty: 0,
+                name: "a".to_string(),
+            }],
+        )
+        .unwrap();
+        let refused = rt.evict_orphans();
+        assert!(
+            refused.is_empty(),
+            "the group was reachable, so its unit should not be refused: {refused:?}"
+        );
+        assert!(
+            procfs::members(Containment::Group(pid), rt.self_pid)
+                .is_ok_and(|scan| scan.proven_empty()),
+            "the leader's children outlived the eviction; a duplicate would follow"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An orphan that could NOT be cleared stays in the record.
+    ///
+    /// Otherwise the failure compounds: this supervisor refuses to start the
+    /// unit, then dies, and its successor reads a clean file and starts the
+    /// duplicate the refusal was protecting against.
+    #[test]
+    fn an_orphan_that_survived_stays_in_the_record() {
+        let (mut rt, dir) = evict_runtime("[a]\ntype=oneshot\nexec=/x\n", "evict-carry");
+        rt.carry_forward(crate::evict::Entry {
+            pid: 4242,
+            starttime: 99,
+            tty: 1032,
+            name: "a".to_string(),
+        });
+        // Twice with the same pid must not grow the file: `carry_forward` is
+        // reached once per boot, but the record it writes outlives the boot.
+        rt.carry_forward(crate::evict::Entry {
+            pid: 4242,
+            starttime: 99,
+            tty: 1032,
+            name: "a".to_string(),
+        });
+        rt.persist_started();
+
+        let (entries, problems) = crate::evict::read(&rt.started_path);
+        assert!(problems.is_empty(), "{problems:?}");
+        assert_eq!(
+            entries,
+            vec![crate::evict::Entry {
+                pid: 4242,
+                starttime: 99,
+                tty: 1032,
+                name: "a".to_string(),
+            }],
+            "the unevicted orphan did not survive into the successor's record"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A record anyone can write is not a list of processes root will signal.
+    ///
+    /// The directory is the barrier: `/run/td-svc` is created 0700 so that the
+    /// only writer is td-svc itself. A reader that runs BEFORE the socket is
+    /// bound — eviction does — has to check that for itself.
+    #[test]
+    fn a_record_in_a_directory_others_can_write_is_ignored() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = format!(
+            "{}/td-svc-untrusted-{}",
+            std::env::temp_dir().display(),
+            std::process::id()
+        );
+        let _ = std::fs::create_dir_all(&dir);
+        let path = format!("{dir}/started");
+        crate::evict::write(
+            &path,
+            &[crate::evict::Entry {
+                pid: 4242,
+                starttime: 99,
+                tty: 0,
+                name: "a".to_string(),
+            }],
+        )
+        .unwrap();
+        let (entries, _) = crate::evict::read(&path);
+        assert_eq!(entries.len(), 1, "a 0700 directory should be readable");
+
+        // Readable-but-not-writable is fine: only root can put a record in a
+        // root-owned 0755 directory, and refusing it would disable eviction on
+        // a machine that is not under attack.
+        let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755));
+        let (entries, problems) = crate::evict::read(&path);
+        assert_eq!(
+            entries.len(),
+            1,
+            "a directory others can only READ was refused: {problems:?}"
+        );
+
+        let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777));
+        let (entries, problems) = crate::evict::read(&path);
+        assert!(
+            entries.is_empty(),
+            "a record anyone could have written was believed: {entries:?}"
+        );
+        assert_eq!(problems.len(), 1, "the refusal was silent: {problems:?}");
+        let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An orphan a previous supervisor left running is killed.
+    ///
+    /// The whole point: PID 1 respawns td-svc, so without this the replacement
+    /// starts a second copy of everything the first one was running.
+    #[test]
+    fn an_orphan_from_a_previous_supervisor_is_evicted() {
+        let (mut rt, dir) = evict_runtime("[a]\ntype=oneshot\nexec=/x\n", "evict-live");
+        let Some(orphan) = live_group_leader() else {
+            eprintln!("note: cannot spawn a child here; skipping");
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        };
+        let pid = orphan.pid;
+        crate::evict::write(
+            &rt.started_path,
+            &[crate::evict::Entry {
+                pid,
+                starttime: orphan.starttime,
+                tty: 0,
+                name: "a".to_string(),
+            }],
+        )
+        .unwrap();
+
+        let refused = rt.evict_orphans();
+        assert!(
+            refused.is_empty(),
+            "a killable orphan should not have refused its unit: {refused:?}"
+        );
+        assert!(
+            gone_within(pid, Duration::from_secs(10)),
+            "the orphan is still running; a duplicate is about to be started"
+        );
+        // And it drops out of the record, so a later read is not re-deciding
+        // about a pid that is already gone. The file itself stays: entries that
+        // were NOT cleared have to survive in it.
+        assert!(
+            rt.unevicted.is_empty(),
+            "a cleared orphan was carried forward: {:?}",
+            rt.unevicted
+        );
+        let (left, _) = crate::evict::read(&rt.started_path);
+        assert!(
+            !left.iter().any(|e| e.pid == pid),
+            "the evicted pid is still in the record: {left:?}"
+        );
+        drop(orphan);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A recorded pid whose starttime does NOT match is left alone.
+    ///
+    /// This is the safety property, and it is the reason the record carries a
+    /// starttime at all. Pids are reissued; a record naming one that has been
+    /// reused points at a stranger, and this file is a list of things td-svc
+    /// is about to KILL. Getting it wrong once means killing an unrelated
+    /// process on every boot after a supervisor crash.
+    #[test]
+    fn a_recorded_pid_whose_starttime_differs_is_not_touched() {
+        let (mut rt, dir) = evict_runtime("[a]\ntype=oneshot\nexec=/x\n", "evict-reuse");
+        let Some(bystander) = live_group_leader() else {
+            eprintln!("note: cannot spawn a child here; skipping");
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        };
+        let pid = bystander.pid;
+        // The same pid, a different process: exactly what pid reuse looks like
+        // from a record written before the reuse.
+        crate::evict::write(
+            &rt.started_path,
+            &[crate::evict::Entry {
+                pid,
+                starttime: bystander.starttime.wrapping_add(1),
+                tty: 0,
+                name: "a".to_string(),
+            }],
+        )
+        .unwrap();
+
+        let refused = rt.evict_orphans();
+        assert!(
+            refused.is_empty(),
+            "a pid that is not ours must not refuse a unit either: {refused:?}"
+        );
+        // Give any (wrong) signal time to land before believing it did not.
+        std::thread::sleep(Duration::from_millis(300));
+        // ALIVE, not merely present. A killed child whose `Child` nothing has
+        // reaped is a ZOMBIE, and `/proc/<pid>/stat` still exists for one — so
+        // an is-it-there assertion is satisfied by the very corpse it is
+        // supposed to rule out, and passes whether or not the identity check
+        // is doing anything.
+        let stat = procfs::stat_of(pid).ok().flatten();
+        assert!(
+            stat.as_ref().is_some_and(|st| !st.zombie),
+            "td-svc killed a process that was NOT the one recorded (state: {})",
+            match stat {
+                Some(st) if st.zombie => "zombie",
+                Some(_) => "alive",
+                None => "reaped",
+            }
+        );
+        drop(bystander);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A unit whose previous copy survived eviction is not started again.
+    ///
+    /// The residue case, and the one where a duplicate hurts most: something
+    /// is still holding the port or the terminal. `Failed` with no `retry_at`
+    /// is the state `start_eligible` will not leave on its own.
+    #[test]
+    fn a_unit_whose_orphan_survived_is_not_started() {
+        let (mut rt, dir) = evict_runtime("[a]\ntype=oneshot\nexec=/x\n", "evict-refuse");
+        rt.refuse_duplicates(&["a".to_string()]);
+        let service = rt.lookup("a").expect("the unit vanished");
+        assert_eq!(service.phase, Phase::Failed, "the unit was not refused");
+        assert!(
+            service.retry_at.is_none(),
+            "a retry would start the duplicate anyway, on a timer"
+        );
+        // And a pass of the loop's own start logic leaves it alone. This is
+        // the assertion that matters: the phase above is only how the refusal
+        // is spelled, and `start_eligible` is what reads it.
+        let _ = rt.start_eligible();
+        assert!(
+            rt.lookup("a").is_some_and(|s| s.pid.is_none()),
+            "the refused unit was started anyway"
+        );
+        assert_eq!(
+            rt.lookup("a").map(|s| s.phase),
+            Some(Phase::Failed),
+            "the refusal did not survive a pass of start_eligible"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// What is running is recorded, and what cannot be verified is not.
+    #[test]
+    fn the_record_holds_the_live_set_and_only_the_verifiable_part_of_it() {
+        let (mut rt, dir) = evict_runtime(
+            "[a]\ntype=oneshot\nexec=/x\n[b]\ntype=oneshot\nexec=/x\n",
+            "evict-record",
+        );
+        if let Some(service) = rt.lookup_mut("a") {
+            service.pid = Some(4242);
+            service.starttime = Some(99);
+            service.tty_dev = Some(1032);
+        }
+        // No starttime: running, but nothing can prove which process it is.
+        if let Some(service) = rt.lookup_mut("b") {
+            service.pid = Some(4243);
+            service.starttime = None;
+        }
+        rt.persist_started();
+
+        let (entries, problems) = crate::evict::read(&rt.started_path);
+        assert!(problems.is_empty(), "the record did not parse: {problems:?}");
+        assert_eq!(
+            entries,
+            vec![crate::evict::Entry {
+                pid: 4242,
+                starttime: 99,
+                tty: 1032,
+                name: "a".to_string(),
+            }],
+            "an unverifiable pid must not be handed to a successor to kill"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

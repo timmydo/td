@@ -437,6 +437,82 @@ pub fn recipe() -> Recipe {
         .env("PATH", &post_bootstrap_path()),
     );
 
+    // Eviction, in the SHIPPED binary: a supervisor that starts with a record
+    // of what a PREVIOUS one left running kills it before starting anything.
+    // Without this a td-svc death leaves the machine running two of
+    // everything, and the second copy is unsupervised.
+    //
+    // The record is written by hand here because the failure being proved is
+    // the SUCCESSOR's, not the writer's: what matters is that a td-svc which
+    // finds a live pid in that file acts on it. `starttime` is read out of
+    // /proc the same way the crate does — everything after the `) ` that ends
+    // comm, then field 20 — because a record with the wrong one is exactly
+    // what td-svc is supposed to ignore.
+    steps.push(Step::WriteFile {
+        path: "{root}/evict.conf".into(),
+        content: format!(
+            "[tracer]\ntype=oneshot\nexec={POST_BOOTSTRAP_SH} -c 'echo ran > /run/td-svc/evict-ran'\n"
+        ),
+        exec: false,
+    });
+    steps.push(
+        Step::run(
+            "{root}",
+            &[
+                POST_BOOTSTRAP_SH,
+                "-c",
+                &format!(
+                    "if mkdir -p /run/td-svc 2>/dev/null && [ -r /proc/self/stat ]; then \
+                         rm -f /run/td-svc/started /run/td-svc/shutdown /run/td-svc/evict-ran; \
+                         '{POST_BOOTSTRAP_SH}' -c 'while : ; do sleep 1; done' & \
+                         op=$!; \
+                         sleep 1; \
+                         s=$(cat /proc/$op/stat 2>/dev/null); \
+                         case \"$s\" in '') echo 'the stand-in orphan never started' >&2; exit 1;; esac; \
+                         r=${{s#*') '}}; \
+                         st=$(echo \"$r\" | cut -d' ' -f20); \
+                         case \"$st\" in ''|*[!0-9]*) echo \"no starttime for the orphan, got: '$st'\" >&2; exit 1;; esac; \
+                         echo \"$op $st 0 tracer\" > /run/td-svc/started; \
+                         '{bin}' run -f '{{root}}/evict.conf' >/dev/null 2>&1 & \
+                         p=$!; \
+                         : 'A background job of a non-interactive shell leads no group,'; \
+                         : 'so td-svc classifies it Process(pid) and signals it alone.'; \
+                         : 'It is this shells child, so the kill leaves a zombie until'; \
+                         : 'the wait below - hence state Z counts as evicted, not alive.'; \
+                         i=0; alive=yes; \
+                         while [ $i -lt 60 ]; do \
+                             s=$(cat /proc/$op/stat 2>/dev/null); \
+                             case \"$s\" in '') alive=no; break;; esac; \
+                             r=${{s#*') '}}; \
+                             case \"$(echo \"$r\" | cut -d' ' -f1)\" in Z) alive=no; break;; esac; \
+                             i=$((i+1)); sleep 1; \
+                         done; \
+                         : 'And the unit still runs: eviction cleared the way, it did'; \
+                         : 'not refuse the very unit it had just cleared.'; \
+                         j=0; ran=no; \
+                         while [ $j -lt 30 ]; do \
+                             if [ -f /run/td-svc/evict-ran ]; then ran=yes; break; fi; \
+                             j=$((j+1)); sleep 1; \
+                         done; \
+                         kill $p 2>/dev/null; wait $p 2>/dev/null || :; \
+                         kill $op 2>/dev/null; wait $op 2>/dev/null || :; \
+                         if [ \"$alive\" = yes ]; then \
+                             echo 'the recorded orphan survived; a duplicate would have followed' >&2; exit 1; \
+                         fi; \
+                         if [ \"$ran\" != yes ]; then \
+                             echo 'the unit never started after its orphan was evicted' >&2; exit 1; \
+                         fi; \
+                         rm -f /run/td-svc/started /run/td-svc/evict-ran; \
+                         echo 'the shipped supervisor evicted a recorded orphan, then started its unit'; \
+                     else \
+                         echo 'note: no writable /run or no /proc here; eviction is covered by the crate tests'; \
+                     fi"
+                ),
+            ],
+        )
+        .env("PATH", &post_bootstrap_path()),
+    );
+
     // The Ctrl-Alt-Del sentinel, in the SHIPPED binary. Arming turns entirely
     // on this process being alive while td-svc holds the write end of its
     // stdin, and dying when that end closes: a sentinel that returned at once

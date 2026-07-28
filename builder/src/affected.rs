@@ -1369,6 +1369,8 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
     assert_preflight!("td-svc/src/sys.rs", "cargo-test");
     assert_target!("td-svc/src/cad.rs", "check");
     assert_target!("td-svc/src/cad.rs", "recipe-checks");
+    assert_target!("td-svc/src/evict.rs", "check");
+    assert_target!("td-svc/src/evict.rs", "recipe-checks");
     assert_no_target!("td-svc/DESIGN.md", "check");
     assert_target!("td-svc/clippy.toml", "check");
     assert_target!("td-svc/Cargo.lock", "check");

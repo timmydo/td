@@ -930,7 +930,7 @@ invariant test that used to demand each initiator run `/etc/shutdown` itself
 now demands the opposite, because the teardown became a sequence only td-svc
 knows.
 
-Landing 5 (this one) armed Ctrl-Alt-Del and moved signalling in-crate. The
+Landing 5 armed Ctrl-Alt-Del and moved signalling in-crate. The
 supervisor now issues `kill(2)` itself rather than exec'ing the uutils
 `/bin/kill` — §2 I1 records why that is the smaller surface, not the larger —
 and arms a sentinel at startup. Re-arming is for a sentinel that *broke*, and
@@ -939,6 +939,12 @@ and wants no new sentinel. It is scheduled on `backoff::delay` rather than run
 inline, and keyed to the sentinel's pid — §9 records the two loops those two
 choices close. td-svc is consequently the fifth target-side unsafe exception
 AGENTS.md lists, for exactly one syscall.
+
+Landing 6 (this one) is the supervisor-restart eviction contract §11
+describes: td-svc records what it started under `/run` and, on startup,
+kills whatever a previous instance left running before starting anything.
+Without it every td-svc death produced a machine running two of
+everything, unsupervised copies included.
 
 Log capture (§7) is what remains. Sections above describe the completed
 design; anything not yet built is specified here so the later landing
@@ -981,25 +987,15 @@ exiting into a respawn spin (§5 records the `Disconnected` arm choosing to
 idle for exactly this reason). Nothing here voluntarily terminates, so
 reaching this state takes a signal or an abort.
 
-That is a reason it is unlikely, not a reason it is handled. The fix is
-not adoption — orphans are PID 1's children and td-svc cannot `wait4` them
-— but *eviction*: record each spawned `(pid, starttime)` under `/run`, and
-on startup kill anything still alive whose starttime still matches. The
-`(pid, starttime)` identity check that closes the TERM→KILL pid-reuse
-window (§4, "Stopping") is already the primitive that needs; what is
-missing is the state file and the policy for a partial one. It is a
-feature with its own failure modes, so it gets its own landing.
+That is a reason it is unlikely, not a reason it was left unhandled. The
+fix is **eviction**, and it is described in §11.
 
-Two things the next landings must resolve before this is correct, both
-found in review and recorded above rather than left to be rediscovered:
-the supervisor-restart eviction contract just described, and `log=` /
-`console=` being refused by name until log capture exists, so the
-`tty=`/`log=` exclusion has nothing to enforce yet (§3).
+One thing the next landing must resolve before this document is fully
+built: `log=` / `console=` are refused by name until log capture exists,
+so the `tty=`/`log=` exclusion has nothing to enforce yet (§3).
 
-A third — the shipped greeter's containment reaching only its wrapper
-process — was the reason for this landing and is closed.
-
-The greeter one is RESOLVED, and not the way this document previously said.
+The shipped greeter's containment reaching only its wrapper process is
+RESOLVED, and not the way this document previously said.
 The recorded fix was to spawn the wrapper through `td-init`'s `cttyhack`
 so it would lead a session. That does not work, and the reason is worth
 keeping: `/etc/tty-session` runs `getty` as a CHILD, and busybox getty
@@ -1015,3 +1011,132 @@ with `TIOCSCTTY`, so it and everything it execs carry the device in
 on the device the unit's `tty=` names — not on the child's own `tty_nr`,
 which is 0 because td-svc opens the console `O_NOCTTY` — and so reaches
 the login tree without touching the boot path at all.
+
+## 11. Evicting a previous supervisor's services
+
+PID 1 respawns td-svc unconditionally, so a td-svc that dies leaves its
+services running — reparented to PID 1, which does not supervise them. The
+replacement knows nothing about them and starts its own copies: two sshds on
+one port, two greeters on one terminal. It is the same duplicate `abandon`
+refuses to create (§4), reached by a different road, and the same trade
+applies — **better one degraded service than a duplicate nobody owns**.
+
+The fix is not adoption. Orphans are PID 1's children and td-svc cannot
+`wait4` them, so **I4** ("stopped" needs the leader REAPED) is unreachable
+for them by construction; emptying the containment is the most that can be
+observed, and saying so when it cannot is the rest of the contract.
+
+**The record.** `/run/td-svc/started`, one line per live service, `pid
+starttime tty name`. `/run` is tmpfs, so a fresh boot has no file and nothing
+to evict — the ordinary case, not a special one. It is written from the live
+set on every spawn, whole, rather than appended to: an append-only record
+grows without bound under a crash-looping service and this lives in RAM.
+Rewriting also makes it self-cleaning, so no exit path has to remember to
+remove an entry — a stale one is filtered on the way back in.
+
+Three things about what is in a line:
+
+- **`starttime` is what makes this safe.** A pid alone is a promise the
+  kernel does not keep: the recorded process may be gone and its number
+  reissued to something td-svc must not touch. This file is a list of things
+  the supervisor is about to KILL, so it carries the same `(pid, starttime)`
+  identity check that closes the TERM→KILL reuse window (§4). Field 22 is set
+  at fork and never changes, so a match means that process, not its number.
+- **`tty` is recorded because it cannot be recovered.** The device a console
+  unit actually got lived in the dead supervisor's memory, and the child never
+  carries it — td-svc opens the console `O_NOCTTY`, so its field 7 is 0 for
+  life. Re-deriving from `/proc` would narrow a console unit to its wrapper
+  and leave the login tree `Containment::Console` exists to reach still
+  running. Everything else in the line IS recoverable and is read fresh.
+- **A service whose `starttime` could not be read is left out.** Recording a
+  pid nothing can verify would hand the successor a number to kill on faith,
+  which is the one thing this must never do. The cost is an orphan that
+  outlives its supervisor; the alternative is signalling a stranger.
+
+**A torn record is skipped line by line, never refused whole.** Refusing over
+one bad line leaves every orphan it named running, which is the failure this
+exists to prevent. Skipping is safe precisely because parsing is not the
+check that matters: a line that parses still has to name a process that is
+really there. Reader-side, a pid that is not positive is refused outright —
+`0` and `-1` are the two `kill(2)` targets that mean something td-svc never
+does, and the record is the one input here a foreign writer can shape.
+
+**A missing leader is not an empty containment.** The dangerous shape is a
+service that forks its children into its own process group and then dies: the
+recorded pid is unfindable, but the group is exactly what `Containment` exists
+to reach, and skipping the entry leaves those children running and starts a
+second copy beside them. So a vanished leader is followed by a scan of its
+containment — but only when the pid is WHOLLY ABSENT rather than reissued. A
+process group keeps its id as long as a member lives, and nothing can create
+group N without first holding pid N; with the number unused, members of group N
+must be what is left of the recorded service. If it has been reissued that
+argument collapses — the new holder may lead a new group N — and td-svc drops
+the entry rather than guess. The scan must also have FOUND something: an
+unreadable `/proc` must not turn into a teardown and a refused unit (I5).
+
+**Identity is re-checked before the KILL, not only before the TERM.** The grace
+period is long enough for the recorded process to exit, be reaped by PID 1, and
+have its number reissued — and every containment but a console's is keyed off
+that number. Escalating on the strength of a check that old is how this
+mechanism would kill the stranger it was written to protect. A console keeps
+its escalation because its device, not the pid, is what addresses it.
+
+**Who may write the record is part of the design.** These lines name processes
+td-svc signals as root, so writing them is choosing them. `/run/td-svc` is
+created at 0700 by whichever of `control::bind` and the record reaches it
+first, which since eviction runs before the socket is bound is usually the
+record — hence not `create_dir_all`, whose `0777 & ~umask` would be world
+writable under the umask PID 1 never sets. A record found in a directory that
+fails that test is IGNORED rather than narrowed, for the reason `bind` already
+gives: narrowing does not revoke a descriptor somebody already holds.
+
+**Ctrl-Alt-Del is armed before the eviction, not after.** Until §9's sentinel
+is in place the key combination is the kernel's own hard reset, and a boot that
+can now spend `EVICT_GRACE + EVICT_SETTLE` killing orphans is exactly when
+somebody reaches for it. Reading the I6 marker still comes first — it changes
+no process, and arming depends on knowing whether this is a resume — but the
+sentinel is armed before anything is signalled. It is this supervisor's child
+and appears in no record, so the eviction that follows cannot touch it.
+
+**Eviction runs first**, before anything starts.
+Whatever the last instance left is running right now whichever way this boot
+goes: if td-svc goes on to supervise, a second copy is the duplicate; if it
+goes on to finish a teardown, an orphan holding `/var` is a mount that will
+not come away. Orphans are signalled together and waited on together, so a
+machine with eight wedged services is delayed once rather than eight times —
+TERM, `EVICT_GRACE`, KILL, `EVICT_SETTLE`. Both bounds exist because this is
+the boot path and **I5** forbids delaying a console indefinitely; the grace is
+deliberately shorter than a unit's own `stop-timeout`, because an orphan has
+already lost the supervisor a graceful exit would report to.
+
+**A unit whose orphan survives is not started**, and is left `Failed` with no
+`retry_at` — the one state `start_eligible` will not leave on its own, so
+nothing brings the duplicate back on a timer, while an explicit `start` still
+can once an operator has dealt with the copy that is there. An unreadable
+`/proc` counts as surviving: **I3** says unreadable is an error, not an
+emptiness, and not knowing whether the recorded process is there is not
+permission to assume it is not.
+
+This does not violate I5 when the refused unit is the console. A greeter that
+survived eviction is still holding its terminal, so the machine is still
+repairable from its own console — what it lacks is supervision, not a
+console. Starting a second getty on that device would take the working one
+away.
+
+**An orphan that could not be cleared stays in the record.** Whole-file
+rewriting would otherwise drop it on the next spawn, and the failure would
+compound: this supervisor refuses to start the unit, then dies, and its
+successor reads a clean file and starts the very duplicate the refusal was
+protecting against. Only a process proven gone leaves the record, so the file
+is never deleted — it is rewritten, and the difference is what the successor
+inherits.
+
+**The window this cannot close** is between `spawn` returning and the record
+being written. A td-svc killed inside it leaves an orphan its successor never
+hears about. It is unclosable rather than merely unclosed: the pid does not
+exist to record until `spawn` returns.
+
+`td-svc-test` proves this against the SHIPPED binary and not only in-crate: it
+hand-writes a record naming a live process, starts td-svc on a table holding
+that unit, and requires both that the process is gone and that the unit then
+ran — the second half being what separates evicting from refusing everything.

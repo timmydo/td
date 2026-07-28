@@ -21,6 +21,7 @@
 mod backoff;
 mod cad;
 mod control;
+mod evict;
 mod order;
 mod procfs;
 mod supervise;
@@ -712,8 +713,8 @@ mod confinement {
         }
         assert_eq!(
             declared.len(),
-            8,
-            "expected eight modules beside the crate root"
+            9,
+            "expected nine modules beside the crate root"
         );
         // ...and nothing scanned is orphaned: a file present but declared by no
         // `mod` line is either dead or reached a way this scan does not model.
@@ -725,7 +726,7 @@ mod confinement {
         }
     }
 
-    /// `src/` holds these nine files and nothing else.
+    /// `src/` holds these ten files and nothing else.
     ///
     /// The scan above proves every `mod` line has a file and every file has a
     /// `mod` line, which is a closed loop that says nothing about WHICH files:
@@ -736,7 +737,7 @@ mod confinement {
     /// skipping them: `src/sys.inc` is invisible to a `.rs`-only scan and
     /// compiles perfectly well through the constructs refused below.
     #[test]
-    fn src_holds_exactly_the_nine_scanned_modules() {
+    fn src_holds_exactly_the_ten_scanned_modules() {
         let (rs, other) = walk();
         let paths: Vec<&str> = rs.iter().map(|(p, _)| p.as_str()).collect();
         assert_eq!(
@@ -745,6 +746,7 @@ mod confinement {
                 "backoff.rs",
                 "cad.rs",
                 "control.rs",
+                "evict.rs",
                 "main.rs",
                 "order.rs",
                 "procfs.rs",

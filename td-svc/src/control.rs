@@ -124,6 +124,17 @@ fn clear_stale(path: &Path) -> std::io::Result<()> {
 /// all. `mkdir(2)` applies the mode atomically and umask can only REMOVE bits
 /// from it, so 0700 is a ceiling as well as a floor.
 pub fn bind(dir: &str, path: &str) -> std::io::Result<UnixListener> {
+    ensure_dir(dir)?;
+    clear_stale(Path::new(path))?;
+    UnixListener::bind(path)
+}
+
+/// The directory half of `bind`, shared with the eviction record.
+///
+/// Eviction writes into this directory BEFORE the socket is bound, so if it
+/// created the directory itself with `create_dir_all` the 0700 reasoning above
+/// would be defeated by the one caller that runs first.
+pub fn ensure_dir(dir: &str) -> std::io::Result<()> {
     match std::fs::DirBuilder::new().mode(DIR_MODE).create(dir) {
         Ok(()) => {}
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
@@ -148,8 +159,25 @@ pub fn bind(dir: &str, path: &str) -> std::io::Result<UnixListener> {
         }
         Err(e) => return Err(e),
     }
-    clear_stale(Path::new(path))?;
-    UnixListener::bind(path)
+    Ok(())
+}
+
+/// Is this directory a place a root process may take instructions from?
+///
+/// The eviction record names pids that td-svc will signal as root, so a
+/// directory anyone else can WRITE is a way to choose them. `ensure_dir`
+/// establishes this for a directory td-svc created; a reader that runs before
+/// the socket is bound has to establish it for itself.
+///
+/// Write bits only, not `DIR_MODE`: a root-owned 0755 `/run/td-svc` that some
+/// earlier boot step made is still a directory only root can put a record in,
+/// and refusing it would disable eviction on a machine that is not under
+/// attack. Being readable is not the threat here — the socket, where traversal
+/// is what grants `stop`, is the stricter case and keeps 0700.
+pub fn dir_is_trusted(dir: &str) -> bool {
+    std::fs::symlink_metadata(dir).is_ok_and(|meta| {
+        meta.is_dir() && meta.uid() == nix_getuid() && meta.permissions().mode() & 0o022 == 0
+    })
 }
 
 /// This process's effective uid, without `libc`. `/proc/self/status` carries
