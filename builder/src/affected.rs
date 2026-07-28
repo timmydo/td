@@ -685,6 +685,11 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
         return;
     }
 
+    if p == "start" {
+        sel.add_preflight("shell-syntax");
+        return;
+    }
+
     if pattern_matches("*.md|DESIGN.md|CLAUDE.md|.gitignore", p) {
         return; // docs — no checks
     }
@@ -939,7 +944,7 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
 
 fn preflight_cmd(name: &str) -> Option<&'static str> {
     match name {
-        "shell-syntax" => Some("  bash -n tests/*.sh ci/*.sh tools/*.sh"),
+        "shell-syntax" => Some("  bash -n start tests/*.sh ci/*.sh tools/*.sh"),
         "heal-revert" => Some("  bash tests/heal-revert.sh"),
         "cargo-test" => {
             Some("  cargo test + clippy --frozen --workspace (builder/recipes/engine) + --manifest-path td-kexec/Cargo.toml + --manifest-path td-sh/Cargo.toml + --manifest-path td-txt/Cargo.toml + --manifest-path td-netd/Cargo.toml + --manifest-path td-boot/Cargo.toml + --manifest-path td-util/Cargo.toml + --manifest-path td-init/Cargo.toml + --manifest-path td-firstboot/Cargo.toml + --manifest-path td-login/Cargo.toml + --manifest-path td-svc/Cargo.toml + --manifest-path td-seatd/Cargo.toml + --manifest-path td-compositor/Cargo.toml + --manifest-path td-review/Cargo.toml -- --include-ignored")
@@ -1420,6 +1425,7 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
     assert_preflight!("td-compositor/src/sys.rs", "cargo-test");
     assert_target!("td-compositor/Cargo.lock", "recipe-checks");
     assert_no_target!("td-compositor/DESIGN.md", "check");
+    assert_preflight!("start", "shell-syntax");
     // td-netd/src is include_str!'d into the target artifact (its recipe AND packed
     // into system-x86-64), so a helper-source edit rides the host cargo preflight
     // AND is recorded against recipe-checks, which statically links + shape-asserts
@@ -1628,7 +1634,7 @@ fn shell_quote(p: &Path) -> Option<String> {
 
 fn run_preflight(root: &Path, name: &str) -> i32 {
     match name {
-        "shell-syntax" => run_shell(root, "bash -n tests/*.sh ci/*.sh tools/*.sh"),
+        "shell-syntax" => run_shell(root, "bash -n start tests/*.sh ci/*.sh tools/*.sh"),
         "heal-revert" => run_shell(root, "bash tests/heal-revert.sh"),
         // BOTH engine crates, tests AND clippy: the AGENTS.md deny-lints only
         // fire under the clippy driver, and the in-loop cargo-test gate (325)
@@ -1996,7 +2002,7 @@ mod tests {
                 "  check.sh",
                 "",
                 "Selected checks:",
-                "  bash -n tests/*.sh ci/*.sh tools/*.sh",
+                "  bash -n start tests/*.sh ci/*.sh tools/*.sh",
                 "  cargo test + clippy --frozen --workspace (builder/recipes/engine) + --manifest-path td-kexec/Cargo.toml + --manifest-path td-sh/Cargo.toml + --manifest-path td-txt/Cargo.toml + --manifest-path td-netd/Cargo.toml + --manifest-path td-boot/Cargo.toml + --manifest-path td-util/Cargo.toml + --manifest-path td-init/Cargo.toml + --manifest-path td-firstboot/Cargo.toml + --manifest-path td-login/Cargo.toml + --manifest-path td-svc/Cargo.toml + --manifest-path td-seatd/Cargo.toml + --manifest-path td-compositor/Cargo.toml + --manifest-path td-review/Cargo.toml -- --include-ignored",
                 "  td-builder check check",
                 "",

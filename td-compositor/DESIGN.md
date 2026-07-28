@@ -13,7 +13,7 @@ The target stack is:
 Linux devtmpfs + sysfs + fbdev + evdev
   -> td-seatd
   -> td-compositor
-  -> wl_shm Wayland clients
+  -> td-ui-demo and later wl_shm Wayland clients
 ```
 
 `td-seatd` is not compatible with seatd or libseat. It is a root oneshot for
@@ -39,10 +39,17 @@ does not run as root and has no device-broker protocol. Readiness is not
 announced until the framebuffer has accepted an initial paint and every
 enumerated input node has been opened.
 
-Both programs are dependency-free Rust built by td's source-built stage2
-toolchain. The target closure contains no Mesa, libdrm userspace, libinput,
-libudev, libseat, libwayland, Cairo, Pango, fontconfig, Meson, Ninja, or
-pkg-config.
+All target-side UI code is dependency-free Rust built by td's source-built
+stage2 toolchain. The target closure contains no Mesa, libdrm userspace,
+libinput, libudev, libseat, libwayland, Cairo, Pango, fontconfig, Meson,
+Ninja, or pkg-config.
+
+`td-ui-demo` is the second argv[0] entry point of the same dependency-free
+multicall executable as `td-compositor`; the package installs it as a relative
+symlink rather than storing or compiling the artifact twice. The invoked name
+selects the client protocol loop, but the artifact contains both sides and is
+not a privilege-separation boundary. Keeping the pair in one package avoids a
+second unsafe exception for the client half of wl_shm.
 
 ## 2. Hardware profile
 
@@ -95,6 +102,18 @@ required empty initial wl_surface commit and acknowledges the resulting
 xdg_surface configure serial. A buffer attached before that handshake is a
 client protocol failure.
 
+The boot profile starts one 512x320 `td-ui-demo` toplevel. It discovers and
+binds globals rather than depending on registry names, completes the XDG
+configure/ack handshake, sends a dependency-free software pattern in an
+XRGB8888 wl_shm pool, requests a frame callback, and stays connected so the
+surface remains mapped. It exposes its mode-0600 readiness socket and prints
+`TD-UI-CLIENT-READY` only after both wl_buffer release and that first callback
+arrive. The client has no toolkit, fonts, input handling, animation, or
+application model; it is the first live protocol proof and a visible boot
+fixture. Its presentation handshake has a 20-second absolute deadline, shorter
+than the supervisor's 30-second readiness deadline, so a stalled compositor
+makes the client exit and permits `restart=always` to retry.
+
 The layout is one horizontal row of columns. Each toplevel is a column;
 left/right focus changes which columns are visible. Decoration, clipboard,
 drag-and-drop, subsurfaces, popups, output reconfiguration, fractional scale,
@@ -118,7 +137,7 @@ approved one new target-side exception for this transport.
 `td-compositor/src/sys.rs` contains the sole scoped `unsafe` block. One raw
 `syscall3` body carries exactly:
 
-- sendmsg(2), to send a descriptor-bearing event or test request;
+- sendmsg(2), to send the demo client's wl_shm descriptor or a test request;
 - recvmsg(2), to receive wl_shm pool descriptors; and
 - close(2), to release a received descriptor after it has been safely
   duplicated through `/proc/self/fd/N`.
@@ -133,9 +152,11 @@ scoped allow amends this document and the repository-wide unsafe inventory.
 
 PID 1 still mounts devtmpfs, procfs, sysfs, tmpfs, and the immutable root.
 `td-svc` starts `td-seatd` after root checking, then starts
-`td-compositor` through td-login's credential switch. The compositor is
-restartable with backoff. Graphical failure never suppresses or owns the
-serial `ttyS0` greeter; that remains the recovery console.
+`td-compositor` and `td-ui-demo`, in that order, through td-login's credential
+switch. Both long-running processes are restartable with backoff. Client
+readiness is probed through its private socket, so deployment health cannot
+race ahead of the first committed frame. Graphical failure never suppresses
+or owns the serial `ttyS0` greeter; that remains the recovery console.
 
 The serial greeter remains independent of graphical readiness and can recover
 when the graphical daemon fails. The automated deployment-success transaction
@@ -143,8 +164,8 @@ strictly requires td-svc to declare the graphical service ready, however, so a
 broken UI cannot mark an update healthy or let QEMU power off before testing
 the new boot seam. The
 graphical service prints `TD-WAYLAND-READY` only after the framebuffer has
-been painted and the Wayland socket is listening; the QEMU system oracle
-requires that marker.
+been painted and the Wayland socket is listening. The QEMU system oracle
+requires that marker and the client's later `TD-UI-CLIENT-READY` marker.
 
 ## 6. Required proof
 
@@ -152,21 +173,24 @@ The landing must prove:
 
 - the kernel pins fbdev, virtio-gpu, PS/2, and evdev built in;
 - interactive QEMU attaches virtio-vga and preserves ttyS0 on stdio;
-- both new target binaries are static ELF64 ET_EXEC files;
+- the seat and compositor multicall artifacts are static ELF64 ET_EXEC files,
+  and the demo entry point is a relative symlink to that static multicall;
 - the seat assigner rejects symlinks/non-devices and verifies ownership/mode;
 - wire parsing rejects truncation, overflow, invalid object use, and a
   descriptor-less wl_shm request;
 - an SCM_RIGHTS-backed wl_shm buffer commits and is copied into the scene;
+- the boot client discovers globals, completes XDG configure/ack, receives
+  wl_buffer release and its first frame callback, and remains mapped;
 - software composition clips surfaces and never indexes outside a frame;
-- the image contains both binaries, the service order is checkable, and the
-  compositor runs as uid 1000;
+- the image contains all three binaries, the service order is checkable, and
+  the compositor and client run as uid 1000;
 - existing serial boot checks remain green.
 
 ## 7. Deferred UI stack
 
-The next increments may add a td-native demo client, client input, a bitmap
-font and launcher, clipboard, a terminal, hotplug, and real DRM/KMS profiles.
-General Wayland toolkit compatibility is not claimed until the missing core
-protocols have explicit tests. Hardware acceleration, niri, portals,
-PipeWire, Xwayland, and a C desktop stack remain optional consumers rather
-than foundations of td's UI.
+The next increments may add client input, a bitmap font and launcher,
+clipboard, a terminal, hotplug, and real DRM/KMS profiles. General Wayland
+toolkit compatibility is not claimed until the missing core protocols have
+explicit tests. Hardware acceleration, niri, portals, PipeWire, Xwayland, and
+a C desktop stack remain optional consumers rather than foundations of td's
+UI.

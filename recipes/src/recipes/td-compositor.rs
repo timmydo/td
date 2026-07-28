@@ -2,6 +2,7 @@ use crate::types::{Recipe, Step};
 
 const MAIN_RS: &str = include_str!("../../../td-compositor/src/main.rs");
 const MODULES: &[(&str, &str)] = &[
+    ("client", include_str!("../../../td-compositor/src/client.rs")),
     (
         "framebuffer",
         include_str!("../../../td-compositor/src/framebuffer.rs"),
@@ -16,6 +17,7 @@ const MODULES: &[(&str, &str)] = &[
         "server",
         include_str!("../../../td-compositor/src/server.rs"),
     ),
+    ("socket", include_str!("../../../td-compositor/src/socket.rs")),
     ("sys", include_str!("../../../td-compositor/src/sys.rs")),
     ("wire", include_str!("../../../td-compositor/src/wire.rs")),
 ];
@@ -105,11 +107,18 @@ pub fn recipe() -> Recipe {
         )
         .env("PATH", &path)
         .env("SOURCE_DATE_EPOCH", "1"),
+        Step::Symlink {
+            target: "td-compositor".into(),
+            link: "{out}/bin/td-ui-demo".into(),
+        },
         Step::Require {
-            paths: vec!["{out}/bin/td-compositor".into()],
+            paths: vec![
+                "{out}/bin/td-compositor".into(),
+                "{out}/bin/td-ui-demo".into(),
+            ],
             exec: true,
         },
-        Step::assert_static(&["{out}/bin/td-compositor"]),
+        Step::assert_static(&["{out}/bin/td-compositor", "{out}/bin/td-ui-demo"]),
     ]);
 
     Recipe::mesboot("td-compositor", "0.1")
@@ -125,7 +134,7 @@ pub fn recipe() -> Recipe {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ladder::TD_WAYLAND_RUNTIME_MARKER;
+    use crate::ladder::{TD_UI_CLIENT_RUNTIME_MARKER, TD_WAYLAND_RUNTIME_MARKER};
 
     #[test]
     fn recipe_writes_every_declared_module() {
@@ -141,6 +150,13 @@ mod tests {
             .expect("server source");
         assert!(server.contains(&format!(
             "println!(\"{TD_WAYLAND_RUNTIME_MARKER} socket={{}}\""
+        )));
+        let client = MODULES
+            .iter()
+            .find_map(|(name, source)| (*name == "client").then_some(*source))
+            .expect("client source");
+        assert!(client.contains(&format!(
+            "println!(\"{TD_UI_CLIENT_RUNTIME_MARKER} surface={{}}x{{}}\""
         )));
     }
 }

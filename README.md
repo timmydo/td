@@ -54,11 +54,14 @@ The examples use `td-recipe-eval`, shorthand for `cargo run --release
 Build the system and boot it under QEMU:
 
 ```sh
-td-recipe-eval run system-x86-64
+./start
 ```
 
+`./start` is the repository-root convenience wrapper for
+`td-recipe-eval run system-x86-64`.
 It boots a selector initramfs, verifies the current deployment on a persistent
-Btrfs volume, kexecs that deployment, loop-mounts its read-only EROFS root, and
+Btrfs volume, kexecs that deployment, loop-mounts its read-only EROFS root,
+starts the software Wayland compositor and visible td-native demo, and
 auto-logs you in as `tester` on the serial console. Type `exit` (or Ctrl-D) to
 power off; Ctrl-A X force-quits QEMU. The private test volume lasts for this
 interactive session and is discarded when QEMU exits; the headless

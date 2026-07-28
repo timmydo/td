@@ -6,24 +6,30 @@ pub fn recipe() -> Recipe {
             paths: vec![
                 "{in:td-seatd}/bin/td-seatd".into(),
                 "{in:td-compositor}/bin/td-compositor".into(),
+                "{in:td-compositor}/bin/td-ui-demo".into(),
             ],
             exec: true,
         },
         Step::assert_static(&[
             "{in:td-seatd}/bin/td-seatd",
             "{in:td-compositor}/bin/td-compositor",
+            "{in:td-compositor}/bin/td-ui-demo",
         ]),
         Step::run("{root}", &["{in:td-seatd}/bin/td-seatd", "selftest"]),
         Step::run(
             "{root}",
             &["{in:td-compositor}/bin/td-compositor", "selftest"],
         ),
+        Step::run(
+            "{root}",
+            &["{in:td-compositor}/bin/td-ui-demo", "selftest"],
+        ),
         Step::MkDir {
             path: "{out}".into(),
         },
         Step::WriteFile {
             path: "{out}/result".into(),
-            content: "PASS: td-seatd and td-compositor are static target executables whose target-side selftests run\n".into(),
+            content: "PASS: td-seatd, td-compositor, and td-ui-demo are static target executables whose target-side selftests run\n".into(),
             exec: false,
         },
         Step::Require {
@@ -38,7 +44,7 @@ pub fn recipe() -> Recipe {
         .checks(vec![
             RecipeCheck::new(
                 r#"
-echo ">> recipe-check td-ui-test: build the dependency-free target seat assigner and software Wayland compositor, assert both are static, and execute their target-side selftests"
+echo ">> recipe-check td-ui-test: build the dependency-free target seat assigner, software Wayland compositor, and demo client; assert all are static and execute their target-side selftests"
 : "${TD_RECIPE_EVAL:=$PWD/target/release/td-recipe-eval}"
 exec "$TD_RECIPE_EVAL" check-run td-ui-test 1
 "#,

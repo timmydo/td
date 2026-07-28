@@ -1,12 +1,10 @@
 use std::fs::File;
 use std::io;
-#[cfg(test)]
 use std::io::Write;
 use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::net::UnixStream;
 
 const SYS_CLOSE: usize = 3;
-#[cfg(test)]
 const SYS_SENDMSG: usize = 46;
 const SYS_RECVMSG: usize = 47;
 const SOL_SOCKET: i32 = 1;
@@ -265,7 +263,6 @@ pub fn recv_with_fds(stream: &UnixStream, bytes: &mut [u8]) -> Result<Received, 
     Ok(Received { count, fds })
 }
 
-#[cfg(test)]
 pub fn send_with_fd(stream: &UnixStream, bytes: &[u8], fd: RawFd) -> Result<(), String> {
     if bytes.is_empty() {
         return Err("refusing descriptor-only Wayland message".into());

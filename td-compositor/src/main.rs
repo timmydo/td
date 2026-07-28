@@ -1,10 +1,12 @@
 #![deny(unsafe_code)]
 
+mod client;
 mod framebuffer;
 mod input;
 mod runtime;
 mod scene;
 mod server;
+mod socket;
 mod sys;
 mod wire;
 
@@ -18,6 +20,12 @@ use std::sync::{Arc, Mutex};
 fn usage() -> String {
     "usage: td-compositor run --framebuffer PATH --input DIR --socket PATH | \
      td-compositor probe SOCKET | td-compositor selftest"
+        .into()
+}
+
+fn client_usage() -> String {
+    "usage: td-ui-demo run --socket PATH --ready-socket PATH | \
+     td-ui-demo probe READY_SOCKET | td-ui-demo selftest"
         .into()
 }
 
@@ -128,10 +136,72 @@ fn run(args: &[String]) -> Result<(), String> {
     }
 }
 
+fn parse_client_run(args: &[String]) -> Result<client::Options, String> {
+    let mut socket = None;
+    let mut ready_socket = None;
+    let mut index = 0;
+    while index < args.len() {
+        let flag = args
+            .get(index)
+            .ok_or_else(|| "missing UI client flag".to_string())?;
+        let value = args
+            .get(index + 1)
+            .ok_or_else(|| format!("{flag} requires a value"))?;
+        match flag.as_str() {
+            "--socket" if socket.is_none() => socket = Some(PathBuf::from(value)),
+            "--ready-socket" if ready_socket.is_none() => ready_socket = Some(PathBuf::from(value)),
+            "--socket" | "--ready-socket" => return Err(format!("duplicate flag '{flag}'")),
+            _ => return Err(format!("unrecognised argument '{flag}'")),
+        }
+        index += 2;
+    }
+    Ok(client::Options {
+        socket: socket.ok_or_else(|| "--socket is required".to_string())?,
+        ready_socket: ready_socket.ok_or_else(|| "--ready-socket is required".to_string())?,
+    })
+}
+
+fn run_client(args: &[String]) -> Result<(), String> {
+    let command = args.first().ok_or_else(client_usage)?;
+    match command.as_str() {
+        "run" => client::run(&parse_client_run(args.get(1..).ok_or_else(client_usage)?)?),
+        "probe" => {
+            let socket = args.get(1).ok_or_else(client_usage)?;
+            if args.get(2).is_some() {
+                return Err(client_usage());
+            }
+            client::probe(Path::new(socket))
+        }
+        "selftest" => {
+            if args.get(1).is_some() {
+                return Err(client_usage());
+            }
+            client::selftest()
+        }
+        _ => Err(client_usage()),
+    }
+}
+
 fn main() {
-    let args: Vec<String> = env::args().skip(1).collect();
-    if let Err(error) = run(&args) {
-        eprintln!("td-compositor: {error}");
+    let mut argv = env::args();
+    let executable = argv.next().unwrap_or_default();
+    let args: Vec<String> = argv.collect();
+    let is_client = Path::new(&executable)
+        .file_name()
+        .and_then(|name| name.to_str())
+        == Some("td-ui-demo");
+    let result = if is_client {
+        run_client(&args)
+    } else {
+        run(&args)
+    };
+    if let Err(error) = result {
+        let program = if is_client {
+            "td-ui-demo"
+        } else {
+            "td-compositor"
+        };
+        eprintln!("{program}: {error}");
         process::exit(1);
     }
 }
@@ -141,11 +211,13 @@ mod confinement {
     const MAIN: &str = include_str!("main.rs");
     const SYS: &str = include_str!("sys.rs");
     const OTHER: &[(&str, &str)] = &[
+        ("client.rs", include_str!("client.rs")),
         ("framebuffer.rs", include_str!("framebuffer.rs")),
         ("input.rs", include_str!("input.rs")),
         ("runtime.rs", include_str!("runtime.rs")),
         ("scene.rs", include_str!("scene.rs")),
         ("server.rs", include_str!("server.rs")),
+        ("socket.rs", include_str!("socket.rs")),
         ("wire.rs", include_str!("wire.rs")),
     ];
 
@@ -225,6 +297,37 @@ fn syscall3(number: usize, a1: usize, a2: usize, a3: usize) -> isize {
             "pub fn send_with_fd(",
         ] {
             assert!(SYS.contains(operation), "{operation}");
+        }
+    }
+
+    #[test]
+    fn descriptor_transport_is_reachable_only_from_the_server_and_demo_client() {
+        let production_main = MAIN
+            .split_once("\n#[cfg(test)]")
+            .map_or(MAIN, |(source, _)| source);
+        for (name, source) in
+            std::iter::once(("main.rs", production_main)).chain(OTHER.iter().copied())
+        {
+            if matches!(name, "client.rs" | "server.rs") {
+                continue;
+            }
+            assert!(
+                !source.contains("sys::"),
+                "{name} reached the descriptor transport outside the protocol endpoints"
+            );
+        }
+        let client = include_str!("client.rs");
+        let server = include_str!("server.rs");
+        for operation in [
+            "sys::send_with_fd(",
+            "sys::recv_with_fds(",
+            "sys::duplicate_received(",
+            "sys::discard_received(",
+        ] {
+            assert!(
+                client.contains(operation) || server.contains(operation),
+                "{operation}"
+            );
         }
     }
 

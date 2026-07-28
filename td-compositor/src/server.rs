@@ -1,11 +1,11 @@
 use crate::runtime::Runtime;
 use crate::scene::{Surface, SurfaceKey, SHM_ARGB8888, SHM_XRGB8888};
-use crate::{sys, wire};
+use crate::{socket, sys, wire};
 use std::collections::{BTreeMap, VecDeque};
 use std::fs::{self, File, Permissions};
 use std::io::Write;
 use std::os::fd::RawFd;
-use std::os::unix::fs::{FileExt, FileTypeExt, PermissionsExt};
+use std::os::unix::fs::{FileExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -1046,34 +1046,8 @@ fn serve_client(stream: UnixStream, id: u64, runtime: Arc<Mutex<Runtime>>) -> Re
     }
 }
 
-fn remove_stale_socket(path: &Path) -> Result<(), String> {
-    match fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_socket() => match UnixStream::connect(path) {
-            Ok(_) => Err(format!(
-                "refusing to replace live Wayland socket {}",
-                path.display()
-            )),
-            Err(error) if error.kind() == std::io::ErrorKind::ConnectionRefused => {
-                fs::remove_file(path)
-                    .map_err(|e| format!("remove stale socket {}: {e}", path.display()))
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(format!(
-                "probe existing Wayland socket {}: {error}",
-                path.display()
-            )),
-        },
-        Ok(_) => Err(format!(
-            "refusing to replace non-socket Wayland path {}",
-            path.display()
-        )),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(format!("stat Wayland socket {}: {error}", path.display())),
-    }
-}
-
 pub fn serve(path: &Path, runtime: Arc<Mutex<Runtime>>) -> Result<(), String> {
-    remove_stale_socket(path)?;
+    socket::remove_stale(path, "Wayland")?;
     let listener = UnixListener::bind(path)
         .map_err(|e| format!("bind Wayland socket {}: {e}", path.display()))?;
     fs::set_permissions(path, Permissions::from_mode(0o600))
@@ -1255,6 +1229,30 @@ mod tests {
         worker.join().unwrap().unwrap();
         fs::remove_file(framebuffer_path).unwrap();
         fs::remove_file(pool_path).unwrap();
+    }
+
+    #[test]
+    fn td_ui_demo_completes_the_real_server_handshake_and_frame() {
+        let stem = format!(
+            "td-ui-demo-integration-{}-{}",
+            std::process::id(),
+            TEST_SEQ.fetch_add(1, Ordering::Relaxed)
+        );
+        let framebuffer_path = std::env::temp_dir().join(format!("{stem}.fb"));
+        let framebuffer = Framebuffer::test_file(&framebuffer_path, 640, 400, 640 * 4).unwrap();
+        let runtime = Arc::new(Mutex::new(Runtime::new(framebuffer)));
+        runtime.lock().unwrap().repaint().unwrap();
+        let (server, client) = UnixStream::pair().unwrap();
+        let thread_runtime = Arc::clone(&runtime);
+        let worker = thread::spawn(move || serve_client(server, 77, thread_runtime));
+
+        let connected = crate::client::present_for_test(client, &std::env::temp_dir()).unwrap();
+        let frame = fs::read(&framebuffer_path).unwrap();
+        assert!(frame.as_chunks::<4>().0.contains(&[0x78, 0x46, 0xe8, 0]));
+
+        drop(connected);
+        worker.join().unwrap().unwrap();
+        fs::remove_file(framebuffer_path).unwrap();
     }
 
     #[test]

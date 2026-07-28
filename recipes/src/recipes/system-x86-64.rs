@@ -747,13 +747,14 @@ fn td_svc_conf_etc_name() -> &'static str {
 /// on a table it cannot parse, but a unit SILENTLY dropped from the plan — skipped for
 /// an unsatisfiable dependency — is a clean exit with a shorter list, and that is the
 /// regression this catches: the boot comes up missing a service and says nothing.
-const TD_SVC_UNITS: [&str; 10] = [
+const TD_SVC_UNITS: [&str; 11] = [
     "hostname",
     "td-firstboot",
     "rootcheck",
     "seat",
     "netup",
     "wayland",
+    "ui-demo",
     "bootsuccess",
     "bootfail",
     "sshd",
@@ -880,11 +881,22 @@ fn build_td_svc_conf() -> String {
          ready-timeout=30\n\
          restart=always\n\
          \n\
+         # The first td-native client stays mapped. Its readiness probe is exposed\n\
+         # only after the configure/ack, wl_shm commit, release, and frame callback.\n\
+         [ui-demo]\n\
+         type=daemon\n\
+         exec=/bin/su -s /bin/sh {ui_user} -c '/bin/td-ui-demo run --socket /run/user/{ui_uid}/wayland-0 --ready-socket /run/user/{ui_uid}/td-ui-demo-ready'\n\
+         after=wayland\n\
+         requires=wayland\n\
+         ready=/bin/su -s /bin/sh {ui_user} -c '/bin/td-ui-demo probe /run/user/{ui_uid}/td-ui-demo-ready'\n\
+         ready-timeout=30\n\
+         restart=always\n\
+         \n\
          [bootsuccess]\n\
          type=oneshot\n\
          exec=/etc/bootsuccess\n\
-         after={sysinit},wayland\n\
-         requires=wayland\n\
+         after={sysinit},wayland,ui-demo\n\
+         requires=ui-demo\n\
          timeout={bootsuccess}\n\
          \n\
          [bootfail]\n\
@@ -2044,6 +2056,10 @@ fn real_root_steps(sys: &SystemDef) -> Vec<Step> {
         target: "{in:td-compositor}/bin/td-compositor".into(),
         link: "{root}/real-root/bin/td-compositor".into(),
     });
+    steps.push(Step::Symlink {
+        target: "{in:td-compositor}/bin/td-ui-demo".into(),
+        link: "{root}/real-root/bin/td-ui-demo".into(),
+    });
     // /bin/td-util is the multicall's own entry (`td-util <applet>`, and `--list`); the loop
     // below is the argv[0] farm the diagnostics names resolve through.
     steps.push(Step::Symlink {
@@ -2261,6 +2277,8 @@ fn shape_check() -> String {
      seat=\"{root}/real-root{in:td-seatd}/bin/td-seatd\"; { [ -f \"$seat\" ] && [ -x \"$seat\" ]; } || { echo 'root tree: td-seatd is not packed and executable' >&2; exit 1; }; \
      [ \"$(readlink \"$root/bin/td-compositor\" 2>/dev/null)\" = \"{in:td-compositor}/bin/td-compositor\" ] || { echo 'root tree: /bin/td-compositor is not a symlink to the staged software Wayland compositor' >&2; exit 1; }; \
      compositor=\"{root}/real-root{in:td-compositor}/bin/td-compositor\"; { [ -f \"$compositor\" ] && [ -x \"$compositor\" ]; } || { echo 'root tree: td-compositor is not packed and executable' >&2; exit 1; }; \
+     [ \"$(readlink \"$root/bin/td-ui-demo\" 2>/dev/null)\" = \"{in:td-compositor}/bin/td-ui-demo\" ] || { echo 'root tree: /bin/td-ui-demo is not a symlink to the staged td-native Wayland client' >&2; exit 1; }; \
+     uidemo=\"{root}/real-root{in:td-compositor}/bin/td-ui-demo\"; { [ -f \"$uidemo\" ] && [ -x \"$uidemo\" ]; } || { echo 'root tree: td-ui-demo is not packed and executable' >&2; exit 1; }; \
      tdsplan=$(\"$tds\" check -f \"$root@TD_SVC_CONF@\" 2>&1) || { echo 'td-svc check REJECTED the unit table this image ships - the boot would run a table the supervisor only partly understood. Its diagnostics:' >&2; printf '%s\\n' \"$tdsplan\" >&2; exit 1; }; \
      for u in @TD_SVC_UNITS@; do \
          printf '%s\\n' \"$tdsplan\" | grep -q -E \"^[0-9]+\\. $u\\$\" || { echo \"td-svc check resolved a start order without '$u' - a unit the inittab used to run is missing from the plan\" >&2; exit 1; }; \
@@ -2270,13 +2288,14 @@ fn shape_check() -> String {
      : 'the plan identical. the_declared_edges_are_exactly_these pins the edge set on'; \
      : 'the host; this pins that td-svc itself still resolves them this way.'; \
      svcpos() { printf '%s\\n' \"$tdsplan\" | grep -n -E \"^[0-9]+\\. $1\\$\" | cut -d: -f1; }; \
-     hn=$(svcpos hostname); fb=$(svcpos td-firstboot); rc=$(svcpos rootcheck); nu=$(svcpos netup); sd=$(svcpos sshd); gr=$(svcpos greeter); \
+     hn=$(svcpos hostname); fb=$(svcpos td-firstboot); rc=$(svcpos rootcheck); st=$(svcpos seat); nu=$(svcpos netup); wl=$(svcpos wayland); ui=$(svcpos ui-demo); bs=$(svcpos bootsuccess); sd=$(svcpos sshd); gr=$(svcpos greeter); \
      [ \"$hn\" -lt \"$fb\" ] || { echo 'td-svc would not serialize hostname before td-firstboot - init ran every sysinit line to completion before the next, and td-svc starts settled units in the same pass' >&2; exit 1; }; \
      [ \"$fb\" -lt \"$rc\" ] || { echo 'td-svc would start rootcheck before td-firstboot - rootcheck asserts the identity td-firstboot mints is readable' >&2; exit 1; }; \
      [ \"$rc\" -lt \"$nu\" ] || { echo 'td-svc would start netup before rootcheck - networking must follow the read-only-root self-check' >&2; exit 1; }; \
      [ \"$nu\" -lt \"$sd\" ] || { echo 'td-svc would start sshd before netup - sshd binds loopback, which netup brings up' >&2; exit 1; }; \
      [ \"$fb\" -lt \"$sd\" ] || { echo 'td-svc would start sshd before td-firstboot - sshd is fail-closed on the host key td-firstboot mints, so it would refuse to start on every boot' >&2; exit 1; }; \
      [ \"$nu\" -lt \"$gr\" ] || { echo 'td-svc would start the greeter before netup' >&2; exit 1; }; \
+     [ \"$rc\" -lt \"$st\" ] && [ \"$st\" -lt \"$wl\" ] && [ \"$wl\" -lt \"$ui\" ] && [ \"$ui\" -lt \"$bs\" ] || { echo 'td-svc would not serialize rootcheck -> seat -> wayland -> ui-demo -> bootsuccess' >&2; exit 1; }; \
      mkdir -p '{root}/pivot-probe' && cp \"$tdi\" '{root}/pivot-probe/init' || { echo 'root tree: could not build the switch_root probe NEWROOT' >&2; exit 1; }; \
      tdipiv=$(\"$tdi\" switch_root '{root}/pivot-probe' /init 2>&1) && { echo 'td-init switch_root ACCEPTED a NEWROOT that is not a mount point - the last refusal standing between a bad pivot and a panicked kernel is gone' >&2; exit 1; }; \
      case \"$tdipiv\" in *'not a mount point'*) : ;; *) echo \"td-init switch_root refused a non-mount NEWROOT for the WRONG reason, so the mount-point guard is untested: $tdipiv\" >&2; exit 1;; esac; \
@@ -2530,7 +2549,8 @@ pub fn recipe() -> Recipe {
         //   probe-only like td-util: `login -f` is how the greeter is reached and `su` is
         //   how every unprivileged health leg runs. See td-login/THREAT-MODEL.md.
         // td-svc: the static service supervisor that starts every real-root job.
-        // td-seatd/td-compositor: the static single-user UI substrate, copied directly.
+        // td-seatd/td-compositor: the static single-user UI substrate and demo client,
+        // copied directly.
         .native_inputs(&[
             "busybox-x86-64",
             "linux-x86-64",
@@ -2681,6 +2701,7 @@ mod tests {
             "/bin/td-seatd assign",
             "/etc/netup",
             "/bin/td-compositor run",
+            "/bin/td-ui-demo run",
             "/etc/bootsuccess",
             "/etc/bootfail",
             "/bin/sshd serve",
@@ -2856,12 +2877,13 @@ mod tests {
             ("seat", vec!["rootcheck"]),
             ("netup", vec!["rootcheck"]),
             ("wayland", vec!["seat"]),
+            ("ui-demo", vec!["wayland"]),
             (
                 "bootsuccess",
                 sysinit
                     .iter()
                     .copied()
-                    .chain(std::iter::once("wayland"))
+                    .chain(["wayland", "ui-demo"])
                     .collect(),
             ),
             ("bootfail", sysinit.to_vec()),
@@ -2918,10 +2940,14 @@ mod tests {
             unit_after("bootsuccess").contains(&"wayland".to_string()),
             "bootsuccess must be ordered after the graphical readiness decision"
         );
+        assert!(
+            unit_after("bootsuccess").contains(&"ui-demo".to_string()),
+            "bootsuccess must wait for the first client frame"
+        );
         assert_eq!(
             unit_key("bootsuccess", "requires").as_deref(),
-            Some("wayland"),
-            "deployment health must be skipped when the graphical daemon failed; \
+            Some("ui-demo"),
+            "deployment health must be skipped when the graphical client failed; \
              after= alone settles on either success or failure"
         );
     }
@@ -2960,6 +2986,16 @@ mod tests {
             unit_key("wayland", "restart").as_deref(),
             Some("always"),
             "the graphical session is supervised and restartable"
+        );
+        assert_eq!(
+            unit_key("ui-demo", "requires").as_deref(),
+            Some("wayland"),
+            "the demo client must not start without its compositor"
+        );
+        assert_eq!(
+            unit_key("ui-demo", "restart").as_deref(),
+            Some("always"),
+            "the graphical client is supervised and restartable"
         );
     }
 

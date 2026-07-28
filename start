@@ -1,0 +1,9 @@
+#!/bin/sh
+set -eu
+
+case "$0" in
+    */*) start_dir=${0%/*} ;;
+    *) start_dir=. ;;
+esac
+cd "$start_dir"
+exec cargo run --release --manifest-path recipes/Cargo.toml --bin td-recipe-eval -- run system-x86-64
