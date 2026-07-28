@@ -267,10 +267,9 @@ impl ScriptParser<'_> {
         let opts = Options {
             ere: self.ere,
             icase,
-            escapes: true,
             reg_newline: multiline.then_some(separator_for(self.null_data)),
         };
-        let re = Regex::compile(raw, opts)
+        let re = Regex::compile(&normalize_regex(raw)?, opts)
             .map_err(|e| e.msg)?;
         self.regexes.push(re);
         Ok(Some(self.regexes.len() - 1))
@@ -434,21 +433,42 @@ impl ScriptParser<'_> {
         } else if self.peek().is_none() || self.at_part_end() {
             return Err("expected \\ after `a', `c' or `i'".to_string());
         }
+        // A text whose last character is an unpaired backslash is not decoded at
+        // all: GNU emits `a\<newline>A\n\` as the three bytes `A\n`, where the
+        // same text without that backslash appends a newline.
+        let mut undecoded = false;
         loop {
             match self.bump() {
                 None => break,
+                // Carrying the text into the next `-e` part collapses the escape,
+                // because the joiner's own newline is what lands in the buffer.
+                // Inside ONE part both bytes reach the decoder instead, which is
+                // why `a\<newline>A\c\<newline>B` is an error and not a `J`.
+                Some(b'\\') if self.at_part_end() => {
+                    self.pos += 1;
+                    out.push(b'\n');
+                }
                 Some(b'\\') => match self.bump() {
-                    None => break,
-                    Some(c) => out.push(c), // `\<newline>` continues the text
+                    None => {
+                        undecoded = true;
+                        break;
+                    }
+                    Some(c) => {
+                        out.push(b'\\');
+                        out.push(c);
+                    }
                 },
                 Some(b'\n') => break,
                 Some(c) => out.push(c),
             }
         }
+        if undecoded {
+            return Ok(Some(out));
+        }
         // No terminator here: the writer appends the RECORD separator, which
         // under -z is NUL. Parsing cannot know it — the option is read first,
         // but the text belongs to the script.
-        Ok(Some(out))
+        Ok(Some(normalize_buffer(&out)?))
     }
 
     /// A label ends at a BLANK as much as at `;`, `}`, `#` or a newline, so `sed -n
@@ -540,7 +560,7 @@ impl ScriptParser<'_> {
             }
         }
         let re = self.add_regex(&pattern, icase, multiline)?;
-        let replacement = compile_replacement(&raw_repl);
+        let replacement = compile_replacement(&raw_repl)?;
         // A `\N` naming a group the pattern does not have is a script error, not
         // an empty expansion. `s//.../` reuses the LAST regex, unknowable here,
         // so it is checked at run time instead (GNU does the same).
@@ -575,6 +595,10 @@ impl ScriptParser<'_> {
                 };
                 if n == delim && delim != b'\\' {
                     out.push(n);
+                } else if n == b'\n' {
+                    // A continuation collapses before the decoder runs, which is
+                    // the only way `\c` can control a newline: `s/X/\c\<nl>/` is `J`.
+                    out.push(b'\n');
                 } else {
                     out.push(b'\\');
                     out.push(n);
@@ -590,8 +614,8 @@ impl ScriptParser<'_> {
 
     fn parse_transliterate(&mut self) -> Result<Box<[u8; 256]>, String> {
         let delim = self.bump().ok_or_else(|| "unterminated `y' command".to_string())?;
-        let from = unescape_y(&self.read_replacement(delim)?);
-        let to = unescape_y(&self.read_replacement(delim)?);
+        let from = normalize_buffer(&self.read_replacement(delim)?)?;
+        let to = normalize_buffer(&self.read_replacement(delim)?)?;
         if from.len() != to.len() {
             return Err("strings for `y' command are different lengths".to_string());
         }
@@ -608,8 +632,91 @@ impl ScriptParser<'_> {
     }
 }
 
-fn unescape_y(raw: &[u8]) -> Vec<u8> {
-    let mut out = Vec::new();
+/// What GNU's escape decoder makes of one backslash pair.
+enum Esc {
+    /// A byte from GNU's vocabulary, whose operand is consumed.
+    Byte(u8),
+    /// Not GNU's (`\\`, `\w`, `\1`, `\U`, `\<newline>`): the escape stands, and
+    /// what it means is the next parser's business.
+    Other,
+    /// Nothing left to escape -- the text ends in a backslash, or in a `\c` with
+    /// no character to control. GNU leaves a bare backslash, which each caller
+    /// resolves its own way: the regex compiler rejects it, a replacement keeps
+    /// it, a text buffer drops it.
+    Bare,
+}
+
+/// One backslash escape from GNU's vocabulary: `\n`, `\t`, `\r`, `\f`, `\v`, `\a`,
+/// `\cX`, `\dNNN`, `\oNNN`, `\xHH` -- and NOT `\e`, which GNU has never taken.
+/// `i` indexes the byte AFTER the backslash, and ends past the whole escape for
+/// every answer but `Esc::Other`: there the caller decides what the escape means,
+/// so it is left ON the character and the caller steps over it.
+fn escape_byte(raw: &[u8], i: &mut usize) -> Result<Esc, String> {
+    let Some(b) = raw.get(*i).copied() else {
+        return Ok(Esc::Bare);
+    };
+    let byte = match b {
+        b'n' => b'\n',
+        b't' => b'\t',
+        b'r' => b'\r',
+        b'f' => 0x0c,
+        b'v' => 0x0b,
+        b'a' => 0x07,
+        b'c' => {
+            return match raw.get(*i + 1).copied() {
+                None => {
+                    *i += 1;
+                    Ok(Esc::Bare)
+                }
+                // A backslash is the one character `\c` cannot take plainly:
+                // `\c\\` is 0x1c and any other escape after it is refused.
+                Some(b'\\') => match raw.get(*i + 2) {
+                    Some(b'\\') => {
+                        *i += 3;
+                        Ok(Esc::Byte(0x1c))
+                    }
+                    _ => Err("recursive escaping after \\c not allowed".to_string()),
+                },
+                Some(c) => {
+                    *i += 2;
+                    Ok(Esc::Byte(c.to_ascii_uppercase() ^ 0x40))
+                }
+            };
+        }
+        b'd' | b'o' | b'x' => {
+            let (radix, digits) = match b {
+                b'd' => (10, 3),
+                b'o' => (8, 3),
+                _ => (16, 2),
+            };
+            let mut j = *i + 1;
+            return match radix_escape(raw, &mut j, radix, digits) {
+                Some(byte) => {
+                    *i = j;
+                    Ok(Esc::Byte(byte))
+                }
+                // With no digit the escape is still GNU's, and it sheds the
+                // backslash rather than keeping it: `[\x]` is the set `x`, where
+                // the unknown `[\w]` is a backslash AND a `w`.
+                None => {
+                    *i += 1;
+                    Ok(Esc::Byte(b))
+                }
+            };
+        }
+        _ => return Ok(Esc::Other),
+    };
+    *i += 1;
+    Ok(Esc::Byte(byte))
+}
+
+/// GNU decodes its escape vocabulary BEFORE compiling a pattern, and inserts the
+/// decoded byte RAW -- so it arrives as regex SYNTAX, not as a literal. `\x2e` is
+/// the metacharacter dot, `[a\x2dz]` is a range, `\x5b` is an unmatched bracket
+/// and `\x5cw` is the word class. That is also why an escape works inside a
+/// bracket expression, where the regex parser itself would take `\` literally.
+fn normalize_regex(raw: &[u8]) -> Result<Vec<u8>, String> {
+    let mut out = Vec::with_capacity(raw.len());
     let mut i = 0usize;
     while let Some(b) = raw.get(i).copied() {
         i += 1;
@@ -617,20 +724,45 @@ fn unescape_y(raw: &[u8]) -> Vec<u8> {
             out.push(b);
             continue;
         }
-        match raw.get(i).copied() {
-            None => out.push(b'\\'),
-            Some(n) => {
-                i += 1;
-                out.push(match n {
-                    b'n' => b'\n',
-                    b't' => b'\t',
-                    b'r' => b'\r',
-                    other => other,
-                });
+        match escape_byte(raw, &mut i)? {
+            Esc::Byte(c) => out.push(c),
+            Esc::Other => {
+                out.push(b'\\');
+                if let Some(c) = raw.get(i).copied() {
+                    out.push(c);
+                    i += 1;
+                }
             }
+            Esc::Bare => out.push(b'\\'),
         }
     }
-    out
+    Ok(out)
+}
+
+/// The same vocabulary for text that no other parser reads: `a`/`i`/`c` text and
+/// the two halves of `y///`. Here an escape GNU does not know just loses its
+/// backslash, as POSIX asks, and `y`'s operands are measured AFTER this runs.
+fn normalize_buffer(raw: &[u8]) -> Result<Vec<u8>, String> {
+    let mut out = Vec::with_capacity(raw.len());
+    let mut i = 0usize;
+    while let Some(b) = raw.get(i).copied() {
+        i += 1;
+        if b != b'\\' {
+            out.push(b);
+            continue;
+        }
+        match escape_byte(raw, &mut i)? {
+            Esc::Byte(c) => out.push(c),
+            Esc::Other => {
+                if let Some(c) = raw.get(i).copied() {
+                    out.push(c);
+                    i += 1;
+                }
+            }
+            Esc::Bare => {}
+        }
+    }
+    Ok(out)
 }
 
 /// Read up to `max_digits` of a `\d`/`\o`/`\x` escape's operand, advancing `i`.
@@ -652,7 +784,7 @@ fn radix_escape(raw: &[u8], i: &mut usize, radix: u32, max_digits: usize) -> Opt
 }
 
 /// Split a replacement into literals, group references and case operators.
-fn compile_replacement(raw: &[u8]) -> Vec<Repl> {
+fn compile_replacement(raw: &[u8]) -> Result<Vec<Repl>, String> {
     let mut out: Vec<Repl> = Vec::new();
     let mut lit: Vec<u8> = Vec::new();
     fn flush(lit: &mut Vec<u8>, out: &mut Vec<Repl>) {
@@ -673,13 +805,14 @@ fn compile_replacement(raw: &[u8]) -> Vec<Repl> {
                     lit.push(b'\\');
                     break;
                 };
-                i += 1;
                 match n {
                     b'0'..=b'9' => {
+                        i += 1;
                         flush(&mut lit, &mut out);
                         out.push(Repl::Group(usize::from(n - b'0')));
                     }
                     b'U' | b'L' | b'u' | b'l' | b'E' => {
+                        i += 1;
                         flush(&mut lit, &mut out);
                         out.push(Repl::Case(match n {
                             b'U' => CaseOp::Upper,
@@ -689,41 +822,24 @@ fn compile_replacement(raw: &[u8]) -> Vec<Repl> {
                             _ => CaseOp::End,
                         }));
                     }
-                    b'n' => lit.push(b'\n'),
-                    b't' => lit.push(b'\t'),
-                    b'r' => lit.push(b'\r'),
-                    b'f' => lit.push(0x0c),
-                    b'v' => lit.push(0x0b),
-                    b'a' => lit.push(0x07),
-                    b'e' => lit.push(0x1b),
-                    // The numeric/control escapes GNU sed takes on both sides of
-                    // an `s///` (`\x26` for a literal `&`, which is how the
-                    // corpus's amp-escape case writes one).
-                    b'c' => {
-                        if let Some(c) = raw.get(i).copied() {
+                    // Unlike a pattern, a decoded byte lands here as a LITERAL:
+                    // `\x26` is an ampersand that does not stand for the match,
+                    // which is how the corpus's amp-escape case writes one.
+                    _ => match escape_byte(raw, &mut i)? {
+                        Esc::Byte(c) => lit.push(c),
+                        Esc::Other => {
+                            lit.push(n); // `\&`, `\\` and `\<newline>` shed the backslash
                             i += 1;
-                            lit.push(c.to_ascii_uppercase() ^ 0x40);
                         }
-                    }
-                    b'd' | b'o' | b'x' => {
-                        let (radix, digits) = match n {
-                            b'd' => (10, 3),
-                            b'o' => (8, 3),
-                            _ => (16, 2),
-                        };
-                        match radix_escape(raw, &mut i, radix, digits) {
-                            Some(byte) => lit.push(byte),
-                            None => lit.push(n),
-                        }
-                    }
-                    other => lit.push(other), // includes `\&`, `\\` and `\<newline>`
+                        Esc::Bare => lit.push(b'\\'),
+                    },
                 }
             }
             _ => lit.push(b),
         }
     }
     flush(&mut lit, &mut out);
-    out
+    Ok(out)
 }
 
 /// The highest `\N` a replacement names, for validation against the pattern.
@@ -2897,5 +3013,34 @@ mod tests {
         assert_eq!(compile(b"a\np", Vec::new()), None);
         // A backslash asks for the next line, so it crosses the boundary.
         assert_eq!(compile(b"a\\\ntext", vec![2]), None);
+    }
+
+    /// The vocabulary is decoded before any parser reads the text, and the byte it
+    /// leaves means different things to different readers — syntax to the regex
+    /// compiler, a plain byte to a text buffer. One rule the two REALLY share is
+    /// the bare backslash `\c` leaves behind, whose three outcomes (a rejected
+    /// pattern, a kept backslash, a dropped one) no single value can show.
+    #[test]
+    fn the_escape_vocabulary_is_decoded_before_anything_else_reads_the_text() {
+        let rx = |p: &[u8]| normalize_regex(p).unwrap();
+        assert_eq!(rx(b"\\x41\\d066\\o103\\t"), b"ABC\t");
+        assert_eq!(rx(b"[a\\x2dz]"), b"[a-z]"); // a decoded dash RANGES
+        assert_eq!(rx(b"\\x5cw"), b"\\w"); // ... and a decoded backslash escapes
+        assert_eq!(rx(b"\\\\n"), b"\\\\n"); // while an ESCAPED one just stands
+        assert_eq!(rx(b"\\w\\1\\e"), b"\\w\\1\\e"); // none of these are GNU's
+        assert_eq!(rx(b"[\\x]"), b"[x]"); // ... but a digitless `\x` IS, and sheds it
+        assert_eq!(rx(b"\\c\\\\"), b"\x1c");
+        assert_eq!(rx(b"\\c"), b"\\"); // bare: `Trailing backslash` from the compiler
+        assert!(normalize_regex(b"\\c\\q").is_err());
+
+        let buf = |p: &[u8]| normalize_buffer(p).unwrap();
+        assert_eq!(buf(b"\\c"), b""); // ... which a text drops instead
+        assert_eq!(buf(b"A\\"), b"A");
+        assert_eq!(buf(b"\\x5cx41"), b"\\x41"); // a decoded byte is not read again
+        assert_eq!(buf(b"\\\\x41"), b"\\x41");
+        assert_eq!(buf(b"A\\qB\\e"), b"AqBe"); // an unknown escape sheds its backslash
+        // A text ending in an unpaired backslash never reaches the decoder at all
+        // (`parse_text` returns it raw), which is why this shape is an error here.
+        assert!(normalize_buffer(b"X\\c\\").is_err());
     }
 }

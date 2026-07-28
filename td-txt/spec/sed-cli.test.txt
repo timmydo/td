@@ -4445,3 +4445,822 @@ f$
 ## stdout-json: "X\ntext\n"
 ## stderr-json: ""
 ## status: 0
+
+#### a bracket list honours a \cX escape
+## argv: sed 's/[\cO]/-/'
+## stdin-json: "a\u000fb\n"
+## stdout-json: "a-b\n"
+## stderr-json: ""
+## status: 0
+
+#### a decoded dash in a bracket list makes a RANGE
+## argv: sed 's/[a\x2dz]/-/g'
+## stdin-json: "abz\n"
+## stdout-json: "---\n"
+## stderr-json: ""
+## status: 0
+
+#### a decoded caret breaks the bracket list open
+## argv: sed 's/[\x5e]/-/'
+## stdin-json: "a^b\n"
+## stdout-json: ""
+## stderr-contains: Unmatched [, [^, [:, [., or [=
+## status: 1
+
+#### a decoded bracket closes the list it is in
+## argv: sed 's/[\x5d]/-/'
+## stdin-json: "a]b\n"
+## stdout-json: "a-b\n"
+## stderr-json: ""
+## status: 0
+
+#### a bracket range may be written entirely in escapes
+## argv: sed 's/[\x61-\x63]/-/g'
+## stdin-json: "abcd\n"
+## stdout-json: "---d\n"
+## stderr-json: ""
+## status: 0
+
+#### a decoded dot is the metacharacter, not a literal
+## argv: sed 's/\x2e/-/'
+## stdin-json: "aXb\n"
+## stdout-json: "-Xb\n"
+## stderr-json: ""
+## status: 0
+
+#### a decoded star quantifies what precedes it
+## argv: sed 's/a\x2a/-/'
+## stdin-json: "a*b\n"
+## stdout-json: "-*b\n"
+## stderr-json: ""
+## status: 0
+
+#### a decoded caret anchors
+## argv: sed 's/\x5ex/-/'
+## stdin-json: "x^y\n"
+## stdout-json: "-^y\n"
+## stderr-json: ""
+## status: 0
+
+#### a decoded backslash starts an escape the regex reads
+## argv: sed 's/a\x5cwb/-/'
+## stdin-json: "axb\n"
+## stdout-json: "-\n"
+## stderr-json: ""
+## status: 0
+
+#### a decoded [ is an unmatched bracket, not a literal
+## argv: sed 's/\x5bb/-/'
+## stdin-json: "a[b\n"
+## stdout-json: ""
+## stderr-contains: Unmatched [, [^, [:, [., or [=
+## status: 1
+
+#### a decoded backslash with nothing after it is a trailing backslash
+## argv: sed 's/\x5c/-/'
+## stdin-json: "aXb\n"
+## stdout-json: ""
+## stderr-contains: Trailing backslash
+## status: 1
+
+#### a group may be written entirely in escapes
+## argv: sed 's/\x5c\x28a\x5c\x29/[\1]/'
+## stdin-json: "a\n"
+## stdout-json: "[a]\n"
+## stderr-json: ""
+## status: 0
+
+#### an ERE group may be too
+## argv: sed '-E' 's/\x28a\x29/[\1]/'
+## stdin-json: "a\n"
+## stdout-json: "[a]\n"
+## stderr-json: ""
+## status: 0
+
+#### an address takes the vocabulary as a pattern does
+## argv: sed '-n' '/[\x41]/p'
+## stdin-json: "aAb\nzz\n"
+## stdout-json: "aAb\n"
+## stderr-json: ""
+## status: 0
+
+#### the vocabulary reaches an address after a bracket too
+## argv: sed '-n' '/a\x5cwb/p'
+## stdin-json: "axb\nzz\n"
+## stdout-json: "axb\n"
+## stderr-json: ""
+## status: 0
+
+#### \e is not in the vocabulary: a pattern reads it as e
+## argv: sed 's/\e/-/'
+## stdin-json: "a\u001bb\n"
+## stdout-json: "a\u001bb\n"
+## stderr-json: ""
+## status: 0
+
+#### nor in a replacement
+## argv: sed 's/X/\e/'
+## stdin-json: "aXb\n"
+## stdout-json: "aeb\n"
+## stderr-json: ""
+## status: 0
+
+#### nor in y
+## argv: sed 'y/X/\e/'
+## stdin-json: "aXb\n"
+## stdout-json: "aeb\n"
+## stderr-json: ""
+## status: 0
+
+#### nor in a text
+## argv: sed "a\\\n\\e"
+## stdin-json: "X\n"
+## stdout-json: "X\ne\n"
+## stderr-json: ""
+## status: 0
+
+#### a hex escape with no digit is not an escape
+## argv: sed 's/\xZ/-/'
+## stdin-json: "axZb\n"
+## stdout-json: "a-b\n"
+## stderr-json: ""
+## status: 0
+
+#### a hex escape takes what digits there are
+## argv: sed 's/\x4/-/'
+## stdin-json: "a\u0004b\n"
+## stdout-json: "a-b\n"
+## stderr-json: ""
+## status: 0
+
+#### a hex escape takes at most two digits
+## argv: sed 's/\x411/-/'
+## stdin-json: "aA1b\n"
+## stdout-json: "a-b\n"
+## stderr-json: ""
+## status: 0
+
+#### hex digits may be upper case
+## argv: sed 's/\xAB/-/'
+## stdin-json: "a\u00abb\n"
+## stdout-json: "a-b\n"
+## stderr-json: ""
+## status: 0
+
+#### a decimal escape takes at most three digits
+## argv: sed 's/\d0651/-/'
+## stdin-json: "aA1b\n"
+## stdout-json: "a-b\n"
+## stderr-json: ""
+## status: 0
+
+#### an octal escape takes at most three digits
+## argv: sed 's/\o1011/-/'
+## stdin-json: "aA1b\n"
+## stdout-json: "a-b\n"
+## stderr-json: ""
+## status: 0
+
+#### a decimal escape may be short
+## argv: sed 's/\d65/-/'
+## stdin-json: "aAb\n"
+## stdout-json: "a-b\n"
+## stderr-json: ""
+## status: 0
+
+#### \cX is control-X
+## argv: sed 's/\cA/-/'
+## stdin-json: "a\u0001b\n"
+## stdout-json: "a-b\n"
+## stderr-json: ""
+## status: 0
+
+#### \cx upper-cases before controlling
+## argv: sed 's/\ca/-/'
+## stdin-json: "a\u0001b\n"
+## stdout-json: "a-b\n"
+## stderr-json: ""
+## status: 0
+
+#### \c\\ is the only way to control a backslash
+## argv: sed 's/\c\\/-/'
+## stdin-json: "a\u001cb\n"
+## stdout-json: "a-b\n"
+## stderr-json: ""
+## status: 0
+
+#### any other escape after \c is refused
+## argv: sed 's/\c\q/-/'
+## stdin-json: "aXb\n"
+## stdout-json: ""
+## stderr-contains: recursive escaping after \c not allowed
+## status: 1
+
+#### and refused in a replacement as well
+## argv: sed 's/X/\c\q/'
+## stdin-json: "aXb\n"
+## stdout-json: ""
+## stderr-contains: recursive escaping after \c not allowed
+## status: 1
+
+#### \c with nothing to control leaves a bare backslash
+## argv: sed 's/\c/-/'
+## stdin-json: "aXb\n"
+## stdout-json: ""
+## stderr-contains: Trailing backslash
+## status: 1
+
+#### which a replacement keeps as a literal backslash
+## argv: sed 's/X/A\c/'
+## stdin-json: "aXb\n"
+## stdout-json: "aA\\b\n"
+## stderr-json: ""
+## status: 0
+
+#### and which y counts as no character at all
+## argv: sed 'y/X/A\c/'
+## stdin-json: "aXb\n"
+## stdout-json: "aAb\n"
+## stderr-json: ""
+## status: 0
+
+#### y refuses the length that leaves
+## argv: sed 'y/X/\c/'
+## stdin-json: "aXb\n"
+## stdout-json: ""
+## stderr-contains: strings for `y' command are different lengths
+## status: 1
+
+#### y decodes the vocabulary in both halves
+## argv: sed 'y/\x58/\x41/'
+## stdin-json: "aXb\n"
+## stdout-json: "aAb\n"
+## stderr-json: ""
+## status: 0
+
+#### y measures its operands after decoding, not before
+## argv: sed 'y/X\x59/12/'
+## stdin-json: "aXYb\n"
+## stdout-json: "a12b\n"
+## stderr-json: ""
+## status: 0
+
+#### a decoded delimiter in y is a plain byte
+## argv: sed 'y/X/\x2f/'
+## stdin-json: "aXb\n"
+## stdout-json: "a/b\n"
+## stderr-json: ""
+## status: 0
+
+#### a decoded delimiter is a literal, the scan having ended
+## argv: sed 's/\x2f/-/'
+## stdin-json: "a/b\n"
+## stdout-json: "a-b\n"
+## stderr-json: ""
+## status: 0
+
+#### with a custom delimiter too
+## argv: sed 's,\x2c,-,'
+## stdin-json: "a,b\n"
+## stdout-json: "a-b\n"
+## stderr-json: ""
+## status: 0
+
+#### the one-liner text form eats a LEADING backslash before decoding
+## argv: sed 'a \\x41'
+## stdin-json: "X\n"
+## stdout-json: "X\nA\n"
+## stderr-json: ""
+## status: 0
+
+#### so a leading escape is only a protected character
+## argv: sed 'a \t.'
+## stdin-json: "X\n"
+## stdout-json: "X\nt.\n"
+## stderr-json: ""
+## status: 0
+
+#### but an escape later in the line decodes
+## argv: sed 'a A\tB'
+## stdin-json: "X\n"
+## stdout-json: "X\nA\tB\n"
+## stderr-json: ""
+## status: 0
+
+#### a text decodes the vocabulary on a continuation line
+## argv: sed "a\\\n\\x41"
+## stdin-json: "X\n"
+## stdout-json: "X\nA\n"
+## stderr-json: ""
+## status: 0
+
+#### i text decodes it too
+## argv: sed "i\\\n\\d065"
+## stdin-json: "X\n"
+## stdout-json: "A\nX\n"
+## stderr-json: ""
+## status: 0
+
+#### c text decodes it too
+## argv: sed "c\\\n\\o101"
+## stdin-json: "X\n"
+## stdout-json: "A\n"
+## stderr-json: ""
+## status: 0
+
+#### a decoded backslash in a text is not read again
+## argv: sed "a\\\n\\x5cx41"
+## stdin-json: "X\n"
+## stdout-json: "X\n\\x41\n"
+## stderr-json: ""
+## status: 0
+
+#### an escaped backslash in a text is one backslash
+## argv: sed "a\\\n\\\\x41"
+## stdin-json: "X\n"
+## stdout-json: "X\n\\x41\n"
+## stderr-json: ""
+## status: 0
+
+#### an unknown escape in a text just sheds its backslash
+## argv: sed "a\\\nA\\qB"
+## stdin-json: "X\n"
+## stdout-json: "X\nAqB\n"
+## stderr-json: ""
+## status: 0
+
+#### a refused \c escape in a text is a script error
+## argv: sed "a\\\nA\\c\\q"
+## stdin-json: "X\n"
+## stdout-json: ""
+## stderr-contains: recursive escaping after \c not allowed
+## status: 1
+
+#### \c at the end of a text controls the text's own terminator
+## argv: sed "a\\\n\\c"
+## stdin-json: "X\n"
+## stdout-json: "X\nJ"
+## stderr-json: ""
+## status: 0
+
+#### which i shows the same way
+## argv: sed "i\\\nA\\c"
+## stdin-json: "X\n"
+## stdout-json: "A\nX\n"
+## stderr-json: ""
+## status: 0
+
+#### and c the same way as a
+## argv: sed "c\\\nA\\c"
+## stdin-json: "X\n"
+## stdout-json: "A\n"
+## stderr-json: ""
+## status: 0
+
+#### a decoded backslash inside a bracket list is a backslash
+## argv: sed 's/[\x5c]/-/'
+## stdin-json: "a\\b\n"
+## stdout-json: "a-b\n"
+## stderr-json: ""
+## status: 0
+
+#### a decoded [ inside a bracket list is a plain [
+## argv: sed 's/[\x5b]/-/'
+## stdin-json: "a[b\n"
+## stdout-json: "a-b\n"
+## stderr-json: ""
+## status: 0
+
+#### an octal escape stops at a digit it cannot take
+## argv: sed 's/\o189/-/'
+## stdin-json: "a\u000189b\n"
+## stdout-json: "a-b\n"
+## stderr-json: ""
+## status: 0
+
+#### a decimal escape stops at a non-digit
+## argv: sed 's/\d65x/-/'
+## stdin-json: "aAxb\n"
+## stdout-json: "a-b\n"
+## stderr-json: ""
+## status: 0
+
+#### the vocabulary decodes before the M flag reads the pattern
+## argv: sed '-n' 'N;s/a\x24/-/Mp'
+## stdin-json: "a\nb\n"
+## stdout-json: "-\nb\n"
+## stderr-json: ""
+## status: 0
+
+#### an escape may be the whole pattern of an address
+## argv: sed '-n' '/\x62/p'
+## stdin-json: "abc\nzzz\n"
+## stdout-json: "abc\n"
+## stderr-json: ""
+## status: 0
+
+#### y takes a decoded newline
+## argv: sed 'y/X/\x0a/'
+## stdin-json: "aXb\n"
+## stdout-json: "a\nb\n"
+## stderr-json: ""
+## status: 0
+
+#### a text may be written entirely in escapes
+## argv: sed "a\\\n\\x41\\d066\\o103"
+## stdin-json: "X\n"
+## stdout-json: "X\nABC\n"
+## stderr-json: ""
+## status: 0
+
+#### an escape works after the s flags too
+## argv: sed 's/X/-/;s/\x62/+/'
+## stdin-json: "aXb\n"
+## stdout-json: "a-+\n"
+## stderr-json: ""
+## status: 0
+
+#### a doubled star is a script error in a BRE
+## argv: sed 's/A**/-/'
+## stdin-json: "aAb\n"
+## stdout-json: ""
+## stderr-contains: Invalid preceding regular expression
+## status: 1
+
+#### as is a star after any other quantifier
+## argv: sed 's/a\+*/-/'
+## stdin-json: "aAb\n"
+## stdout-json: ""
+## stderr-contains: Invalid preceding regular expression
+## status: 1
+
+#### and an interval after one
+## argv: sed 's/a\{2\}\{3\}/-/'
+## stdin-json: "aAb\n"
+## stdout-json: ""
+## stderr-contains: Invalid preceding regular expression
+## status: 1
+
+#### a group counts as quantified for that rule
+## argv: sed 's/\(a\)**/-/'
+## stdin-json: "aAb\n"
+## stdout-json: ""
+## stderr-contains: Invalid preceding regular expression
+## status: 1
+
+#### so does a bracket list
+## argv: sed 's/[ab]**/-/'
+## stdin-json: "aAb\n"
+## stdout-json: ""
+## stderr-contains: Invalid preceding regular expression
+## status: 1
+
+#### but a plus or question mark after a quantifier is fine
+## argv: sed 's/a*\+/-/'
+## stdin-json: "aAb\n"
+## stdout-json: "-Ab\n"
+## stderr-json: ""
+## status: 0
+
+#### as is a question mark after a question mark
+## argv: sed 's/a\?\?/-/'
+## stdin-json: "aAb\n"
+## stdout-json: "-Ab\n"
+## stderr-json: ""
+## status: 0
+
+#### and an interval followed by a plus
+## argv: sed 's/a\{2\}\+/-/'
+## stdin-json: "aAb\n"
+## stdout-json: "aAb\n"
+## stderr-json: ""
+## status: 0
+
+#### a leading star is a literal, so nothing is doubled
+## argv: sed 's/**a/-/'
+## stdin-json: "aAb\n"
+## stdout-json: "-Ab\n"
+## stderr-json: ""
+## status: 0
+
+#### a quantifier INSIDE a group leaves the group unquantified
+## argv: sed 's/\(a*\)*/-/'
+## stdin-json: "aAb\n"
+## stdout-json: "-Ab\n"
+## stderr-json: ""
+## status: 0
+
+#### an ERE doubles quantifiers freely
+## argv: sed '-E' 's/a**/-/'
+## stdin-json: "aAb\n"
+## stdout-json: "-Ab\n"
+## stderr-json: ""
+## status: 0
+
+#### and an ERE interval may follow an interval
+## argv: sed '-E' 's/a{1,2}{1,2}/-/'
+## stdin-json: "aAb\n"
+## stdout-json: "-Ab\n"
+## stderr-json: ""
+## status: 0
+
+#### but an ERE refuses a quantifier on an anchor
+## argv: sed '-E' 's/^+a/-/'
+## stdin-json: "aAb\n"
+## stdout-json: ""
+## stderr-contains: Invalid preceding regular expression
+## status: 1
+
+#### including a star on a dollar
+## argv: sed '-E' 's/$*a/-/'
+## stdin-json: "aAb\n"
+## stdout-json: ""
+## stderr-contains: Invalid preceding regular expression
+## status: 1
+
+#### while an anchor inside a group may be quantified
+## argv: sed '-E' 's/(^)*a/-/'
+## stdin-json: "aAb\n"
+## stdout-json: "-Ab\n"
+## stderr-json: ""
+## status: 0
+
+#### an interval on a zero-width assertion is refused in a BRE too
+## argv: sed 's/\<\{2\}a/-/'
+## stdin-json: "aAb\n"
+## stdout-json: ""
+## stderr-contains: Invalid preceding regular expression
+## status: 1
+
+#### a star on one compiles, and then matches nothing
+## argv: sed 's/\<*a/-/'
+## stdin-json: "aAb\n"
+## stdout-json: "aAb\n"
+## stderr-json: ""
+## status: 0
+
+#### an ERE refuses an interval with nothing to repeat
+## argv: sed '-E' 's/{2}a/-/'
+## stdin-json: "aAb\n"
+## stdout-json: ""
+## stderr-contains: Invalid preceding regular expression
+## status: 1
+
+#### a BRE interval with nothing to repeat is refused as well
+## argv: sed 's/\{2\}a/-/'
+## stdin-json: "a{2}ab\n"
+## stdout-json: ""
+## stderr-contains: Invalid preceding regular expression
+## status: 1
+
+#### a lone \} in a BRE is the character, closing nothing
+## argv: sed 's/a\}/-/'
+## stdin-json: "a}b\n"
+## stdout-json: "-b\n"
+## stderr-json: ""
+## status: 0
+
+#### even where it trails what looks like an interval
+## argv: sed 's/{1,2\}/-/'
+## stdin-json: "a{1,2}b\n"
+## stdout-json: "a-b\n"
+## stderr-json: ""
+## status: 0
+
+#### while an unclosed \{ is still an error
+## argv: sed 's/a\{/-/'
+## stdin-json: "a{b\n"
+## stdout-json: ""
+## stderr-contains: Unmatched \{
+## status: 1
+
+#### and a real interval still parses
+## argv: sed 's/ab\{1,2\}/-/'
+## stdin-json: "abb\n"
+## stdout-json: "-\n"
+## stderr-json: ""
+## status: 0
+
+#### an ERE brace needs no escape either way
+## argv: sed '-E' 's/a\}/-/'
+## stdin-json: "a}b\n"
+## stdout-json: "-b\n"
+## stderr-json: ""
+## status: 0
+
+#### a trailing \c\ leaves the escape standing
+## argv: sed "a\\\nA\\c\\"
+## stdin-json: "X\n"
+## stdout-json: "X\nA\\c\n"
+## stderr-json: ""
+## status: 0
+
+#### and a trailing \\c\ keeps both backslashes
+## argv: sed "a\\\nA\\\\c\\"
+## stdin-json: "X\n"
+## stdout-json: "X\nA\\\\c\n"
+## stderr-json: ""
+## status: 0
+
+#### but a \c\ with more text after it is still refused
+## argv: sed "a\\\nA\\c\\ B"
+## stdin-json: "X\n"
+## stdout-json: ""
+## stderr-contains: recursive escaping after \c not allowed
+## status: 1
+
+#### a digitless radix escape sheds its backslash in a bracket list
+## argv: sed 's/[\x]/-/g'
+## stdin-json: "a\\xdb\n"
+## stdout-json: "a\\-db\n"
+## stderr-json: ""
+## status: 0
+
+#### as does one whose operand is not a digit
+## argv: sed 's/[\xG]/-/g'
+## stdin-json: "a\\xdb\n"
+## stdout-json: "a\\-db\n"
+## stderr-json: ""
+## status: 0
+
+#### and one in a NEGATED list
+## argv: sed 's/[^\x]/-/g'
+## stdin-json: "a\\xdb\n"
+## stdout-json: "--x--\n"
+## stderr-json: ""
+## status: 0
+
+#### while an unknown escape keeps its backslash there
+## argv: sed 's/[\q]/-/g'
+## stdin-json: "a\\qb\n"
+## stdout-json: "a--b\n"
+## stderr-json: ""
+## status: 0
+
+#### outside a bracket list the two are indistinguishable
+## argv: sed 's/\x/-/g'
+## stdin-json: "a\\xdb\n"
+## stdout-json: "a\\-db\n"
+## stderr-json: ""
+## status: 0
+
+#### an interval that closes is judged on its content
+## argv: sed 's/a\{1x\}/-/'
+## stdin-json: "ab\n"
+## stdout-json: ""
+## stderr-contains: Invalid content of \{\}
+## status: 1
+
+#### and so is one with a bad upper bound
+## argv: sed 's/a\{1,x\}/-/'
+## stdin-json: "ab\n"
+## stdout-json: ""
+## stderr-contains: Invalid content of \{\}
+## status: 1
+
+#### while one that never closes is unmatched, whatever is in it
+## argv: sed 's/a\{1x/-/'
+## stdin-json: "ab\n"
+## stdout-json: ""
+## stderr-contains: Unmatched \{
+## status: 1
+
+#### an escaped backslash does not close an interval
+## argv: sed 's/a\{x\\}/-/'
+## stdin-json: "ab\n"
+## stdout-json: ""
+## stderr-contains: Unmatched \{
+## status: 1
+
+#### but an escaped backslash before a real close does not hide it
+## argv: sed 's/a\{x\\\}/-/'
+## stdin-json: "ab\n"
+## stdout-json: ""
+## stderr-contains: Invalid content of \{\}
+## status: 1
+
+#### an escaped ALPHANUMERIC delimiter is still just the delimiter
+## argv: sed 'sx\x5bxYx'
+## stdin-json: "a[b\n"
+## stdout-json: "a[b\n"
+## stderr-json: ""
+## status: 0
+
+#### the same in an address
+## argv: sed '-n' '\x\x5bxp'
+## stdin-json: "a[b\n"
+## stdout-json: ""
+## stderr-json: ""
+## status: 0
+
+#### an escaped & delimiter keeps its backslash in a replacement
+## argv: sed 's&x&\&&'
+## stdin-json: "axb\n"
+## stdout-json: "a&b\n"
+## stderr-json: ""
+## status: 0
+
+#### a backslash may not be an address delimiter
+## argv: sed '-n' '\\^\p'
+## stdin-json: "a\n"
+## stdout-json: "a\n"
+## stderr-json: ""
+## status: 0
+
+#### a backreference to a group still OPEN is invalid
+## argv: sed 's/\(\1\)/-/'
+## stdin-json: "aab\n"
+## stdout-json: ""
+## stderr-contains: Invalid back reference
+## status: 1
+
+#### including from inside a nested group
+## argv: sed 's/\(a\(b\)\1\)/-/'
+## stdin-json: "aab\n"
+## stdout-json: ""
+## stderr-contains: Invalid back reference
+## status: 1
+
+#### but a CLOSED nested group may be named
+## argv: sed 's/\(\(a\)\2\)/-/'
+## stdin-json: "aab\n"
+## stdout-json: "-b\n"
+## stderr-json: ""
+## status: 0
+
+#### and a forward reference is invalid in both
+## argv: sed 's/\2\(a\)/-/'
+## stdin-json: "aab\n"
+## stdout-json: ""
+## stderr-contains: Invalid back reference
+## status: 1
+
+#### and an ERE says the same
+## argv: sed '-E' 's/(\1)/-/'
+## stdin-json: "aab\n"
+## stdout-json: ""
+## stderr-contains: Invalid back reference
+## status: 1
+
+#### a continuation collapses before the decoder in a replacement
+## argv: sed "s/X/\\c\\\n/"
+## stdin-json: "X\n"
+## stdout-json: "J\n"
+## stderr-json: ""
+## status: 0
+
+#### and in y
+## argv: sed "y/X/\\c\\\n/"
+## stdin-json: "X\n"
+## stdout-json: "J\n"
+## stderr-json: ""
+## status: 0
+
+#### a text ending in an unpaired backslash is not decoded at all
+## argv: sed "a\\\nA\\n\\"
+## stdin-json: "X\n"
+## stdout-json: "X\nA\\n\n"
+## stderr-json: ""
+## status: 0
+
+#### nor is one ending that way after a tab escape
+## argv: sed "a\\\nA\\t\\"
+## stdin-json: "X\n"
+## stdout-json: "X\nA\\t\n"
+## stderr-json: ""
+## status: 0
+
+#### nor a one-liner text ending that way
+## argv: sed 'a A\t\'
+## stdin-json: "X\n"
+## stdout-json: "X\nA\\t\n"
+## stderr-json: ""
+## status: 0
+
+#### while the same text without it decodes
+## argv: sed "a\\\nA\\n"
+## stdin-json: "X\n"
+## stdout-json: "X\nA\n\n"
+## stderr-json: ""
+## status: 0
+
+#### a continuation INSIDE one script part does not collapse
+## argv: sed "a\\\nA\\c\\\nB"
+## stdin-json: "X\n"
+## stdout-json: ""
+## stderr-contains: recursive escaping after \c not allowed
+## status: 1
+
+#### but carrying a text into the next -e part does
+## argv: sed '-e' 'a Q\c\' '-e' 'p'
+## stdin-json: "X\n"
+## stdout-json: "X\nQJp\n"
+## stderr-json: ""
+## status: 0
+
+#### a plain continuation still splits the text in two
+## argv: sed "a\\\nA\\\nB"
+## stdin-json: "X\n"
+## stdout-json: "X\nA\nB\n"
+## stderr-json: ""
+## status: 0

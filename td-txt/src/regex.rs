@@ -37,13 +37,13 @@ impl std::fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
-/// Dialect and matching knobs. `escapes` enables the GNU *sed* escape vocabulary
-/// (`\n`, `\t`, `\o101`, `\x41`, …) inside the pattern; grep does not take it.
+/// Dialect and matching knobs. GNU sed's escape vocabulary is NOT one of them: it
+/// is decoded into the pattern text before compiling (see `sed::normalize_regex`),
+/// so by the time a pattern arrives here every escape left in it is regex syntax.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Options {
     pub ere: bool,
     pub icase: bool,
-    pub escapes: bool,
     /// POSIX REG_NEWLINE (sed's `M` flag), carrying the RECORD SEPARATOR it is
     /// relative to: `\n` normally, NUL under `-z`. GNU implements it as TWO
     /// mechanisms, and a pattern can tell them apart:
@@ -394,6 +394,25 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// Whether a `\}` closes the interval opened before `pos`. Only the BRE
+    /// diagnostic needs it; see `parse_interval`. An escaped backslash consumes
+    /// both its bytes, so the `}` in `a\{x\\}` closes nothing.
+    fn interval_closes(&self) -> bool {
+        let mut i = self.pos;
+        while let Some(b) = self.pat.get(i).copied() {
+            if b == b'\\' {
+                match self.pat.get(i + 1) {
+                    Some(b'}') => return true,
+                    Some(_) => i += 2,
+                    None => return false,
+                }
+                continue;
+            }
+            i += 1;
+        }
+        false
+    }
+
     /// `{n}`, `{n,}`, `{n,m}` (ERE) / `\{…\}` (BRE). Returns `None` when what
     /// follows is not an interval at all, which in ERE means a literal `{`.
     fn parse_interval(&mut self, atom: &Node) -> Result<Option<Node>, Error> {
@@ -414,12 +433,16 @@ impl<'a> Parser<'a> {
             None if self.peek() == Some(b',') => 0,
             None => {
                 // A `{` that opens no valid interval is a literal in ERE, but in
-                // BRE `\{` must be one.
+                // BRE `\{` must be one. GNU asks whether it CLOSES before it judges
+                // the content, so `a\{x\}` is bad content and `a\{x` is unmatched.
                 if self.opts.ere {
                     self.pos = save;
                     return Ok(None);
                 }
-                return Err(Error::new("Invalid content of \\{\\}"));
+                return Err(Error::new(match self.interval_closes() {
+                    true => "Invalid content of \\{\\}",
+                    false => "Unmatched \\{",
+                }));
             }
         };
         let max = if self.eat(b',') {
@@ -432,7 +455,10 @@ impl<'a> Parser<'a> {
                 self.pos = save;
                 return Ok(None);
             }
-            return Err(Error::new("Unmatched \\{"));
+            return Err(Error::new(match self.interval_closes() {
+                true => "Invalid content of \\{\\}",
+                false => "Unmatched \\{",
+            }));
         }
         if let Some(m) = max {
             if m < min {
@@ -542,7 +568,9 @@ impl<'a> Parser<'a> {
             }
             b')' if !self.opts.ere => Err(Error::new("Unmatched ) or \\)")),
             b'{' if !self.opts.ere => Err(Error::new("Invalid preceding regular expression")),
-            b'}' if !self.opts.ere => Err(Error::new("Unmatched \\{")),
+            // An interval consumes its own `\}`, so one reaching here closes nothing
+            // and GNU reads it as the character: `s/a\}/-/` matches `a}`.
+            b'}' if !self.opts.ere => Ok(self.literal(b'}')),
             b'1'..=b'9' => {
                 let n = usize::from(b - b'0');
                 if n > self.ngroups {
@@ -578,53 +606,8 @@ impl<'a> Parser<'a> {
             b'>' => Ok(Node::WordEdge(false)),
             b'`' => Ok(Node::BufStart),
             b'\'' => Ok(Node::BufEnd),
-            _ => {
-                if self.opts.escapes {
-                    if let Some(c) = self.escape_byte(b) {
-                        return Ok(self.literal(c));
-                    }
-                }
-                Ok(self.literal(b))
-            }
+            _ => Ok(self.literal(b)),
         }
-    }
-
-    /// The GNU sed escape vocabulary for a single byte, consuming any operand.
-    fn escape_byte(&mut self, b: u8) -> Option<u8> {
-        match b {
-            b'n' => Some(b'\n'),
-            b't' => Some(b'\t'),
-            b'r' => Some(b'\r'),
-            b'f' => Some(0x0c),
-            b'v' => Some(0x0b),
-            b'a' => Some(0x07),
-            b'e' => Some(0x1b),
-            b'c' => {
-                let c = self.bump()?;
-                Some(c.to_ascii_uppercase() ^ 0x40)
-            }
-            b'd' => self.radix_operand(10, 3),
-            b'o' => self.radix_operand(8, 3),
-            b'x' => self.radix_operand(16, 2),
-            _ => None,
-        }
-    }
-
-    fn radix_operand(&mut self, radix: u32, max_digits: usize) -> Option<u8> {
-        let mut value: u32 = 0;
-        let mut digits = 0;
-        while digits < max_digits {
-            let Some(d) = self.peek().and_then(|c| char::from(c).to_digit(radix)) else {
-                break;
-            };
-            value = value * radix + d;
-            self.pos += 1;
-            digits += 1;
-        }
-        if digits == 0 {
-            return None;
-        }
-        u8::try_from(value & 0xff).ok()
     }
 
     /// A bracket expression: ranges, negation, `[:class:]`, `[.c.]`, `[=c=]`.
@@ -1587,11 +1570,12 @@ mod tests {
     /// REG_NEWLINE, touching only `.` and a non-matching list) applies to both.
     #[test]
     fn a_non_newline_separator_is_consumed_by_nothing_in_a_substitution() {
-        let nul = Options { reg_newline: Some(0), escapes: true, ..Options::default() };
-        // Nothing may cover the separator at index 1 in a substitution. `[\x00]` is
-        // here for the fast paths' sake even though an escape inside a bracket is a
-        // recorded gap, and `\s` because a NUL is not whitespace either way.
-        for pat in [&b"\\x00"[..], b"[\\x00]", b"\\W", b"\\s", b"[^a]", b".", b"\\(.\\)\\1"] {
+        let nul = Options { reg_newline: Some(0), ..Options::default() };
+        // Nothing may cover the separator at index 1 in a substitution. The NUL is
+        // written raw because sed decodes `\x00` before a pattern reaches this layer;
+        // `[\0]` is here for the fast paths' sake, and `\s` because a NUL is not
+        // whitespace either way.
+        for pat in [&b"\0"[..], b"[\0]", b"\\W", b"\\s", b"[^a]", b".", b"\\(.\\)\\1"] {
             let re = Regex::compile(pat, nul).unwrap();
             assert!(
                 re.search_subst(b"a\0a", 0).unwrap().is_none_or(|c| c.end() <= 1 || c.start() >= 2),
@@ -1601,8 +1585,8 @@ mod tests {
         }
         // The ADDRESS path reaches it, which is what makes confinement a property of
         // the call and not of the compiled pattern. Only patterns that can match a
-        // NUL at all show it — not `\s`, and not `[\x00]` while the escape gap stands.
-        for pat in [&b"\\x00"[..], b"\\W", b"[^a]", b"."] {
+        // NUL at all show it — not `\s`.
+        for pat in [&b"\0"[..], b"[\0]", b"\\W", b"[^a]", b"."] {
             let re = Regex::compile(pat, nul).unwrap();
             let hit = re.search(b"a\0a", 0).unwrap();
             assert!(hit.is_some(), "{:?} found nothing", String::from_utf8_lossy(pat));
@@ -1651,17 +1635,17 @@ mod tests {
     /// see `Regex::has_backref`.
     #[test]
     fn a_backreference_confines_the_address_path_as_well() {
-        let nul = Options { reg_newline: Some(0), escapes: true, ..Options::default() };
+        let nul = Options { reg_newline: Some(0), ..Options::default() };
         let hay = &b"a\0\0b"[..];
         // Nothing crosses the separator once a backref is in the pattern, whether the
         // backref does the crossing or a literal does.
-        for pat in [&b"\\(.\\)\\1"[..], b"\\(a\\)\\x00\\1*"] {
+        for pat in [&b"\\(.\\)\\1"[..], b"\\(a\\)\0\\1*"] {
             let re = Regex::compile(pat, nul).unwrap();
             assert!(re.search(hay, 0).unwrap().is_none(), "{:?} crossed", String::from_utf8_lossy(pat));
         }
         // Without one, an address crosses; and a match inside a segment is unaffected.
         assert!(Regex::compile(b"..", nul).unwrap().search(hay, 0).unwrap().is_some());
-        assert!(Regex::compile(b"\\(a\\)\\x00", nul).unwrap().search(hay, 0).unwrap().is_some());
+        assert!(Regex::compile(b"\\(a\\)\0", nul).unwrap().search(hay, 0).unwrap().is_some());
         assert!(Regex::compile(b"\\(b\\)\\1*", nul).unwrap().search(hay, 0).unwrap().is_some());
         // A newline separator has no segment, so a doubled NUL is an ordinary pair.
         let nl = Options { reg_newline: Some(b'\n'), ..Options::default() };

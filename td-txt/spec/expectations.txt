@@ -30,13 +30,6 @@ xfail sed-cli.test.txt::a backreference to a group that did not participate does
 xfail sed-cli.test.txt::without -s a failure on the FIRST operand outranks the quit code too
 xfail sed-cli.test.txt::and q5 reports it rather than 5
 xfail sed-cli.test.txt::q stops before a later operand is opened, so it is never reported
-xfail sed-cli.test.txt::a text takes the escape vocabulary too
-xfail sed-cli.test.txt::as does i text
-xfail sed-cli.test.txt::a bracket list honours the \n escape
-xfail sed-cli.test.txt::a bracket list honours the \t escape
-xfail sed-cli.test.txt::a bracket list honours a \xHH escape
-xfail sed-cli.test.txt::a bracket list honours a \oNNN escape
-xfail sed-cli.test.txt::a bracket list honours a \dNNN escape
 xfail sed-cli.test.txt::a w whose address is never taken still creates its file
 xfail sed-cli.test.txt::and truncates one that was already there
 xfail sed-cli.test.txt::a w file is created even when no cycle runs at all
@@ -44,3 +37,21 @@ xfail sed-cli.test.txt::the s///w flag creates its file the same way
 xfail sed-cli.test.txt::a w target that will not open is exit 4 even behind a Q
 xfail sed-cli.test.txt::a w target that will not open outranks a LATER script error
 xfail sed-cli.test.txt::F names the file GNU's $ lookahead has already opened
+xfail sed-cli.test.txt::\c at the end of a text controls the text's own terminator
+xfail sed-cli.test.txt::a doubled star is a script error in a BRE
+xfail sed-cli.test.txt::as is a star after any other quantifier
+xfail sed-cli.test.txt::and an interval after one
+xfail sed-cli.test.txt::a group counts as quantified for that rule
+xfail sed-cli.test.txt::so does a bracket list
+xfail sed-cli.test.txt::but an ERE refuses a quantifier on an anchor
+xfail sed-cli.test.txt::including a star on a dollar
+xfail sed-cli.test.txt::an interval on a zero-width assertion is refused in a BRE too
+xfail sed-cli.test.txt::a star on one compiles, and then matches nothing
+xfail sed-cli.test.txt::an ERE refuses an interval with nothing to repeat
+xfail sed-cli.test.txt::an escaped ALPHANUMERIC delimiter is still just the delimiter
+xfail sed-cli.test.txt::the same in an address
+xfail sed-cli.test.txt::an escaped & delimiter keeps its backslash in a replacement
+xfail sed-cli.test.txt::a backslash may not be an address delimiter
+xfail sed-cli.test.txt::a backreference to a group still OPEN is invalid
+xfail sed-cli.test.txt::including from inside a nested group
+xfail sed-cli.test.txt::and an ERE says the same

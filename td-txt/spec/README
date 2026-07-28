@@ -284,7 +284,37 @@ td-txt-authored case files
   nothing at all when there is none, silently, because a missing `R` source is not
   an error.
 
-  Five gaps this campaign found and did NOT fix, recorded here so the next round
+  The escape VOCABULARY is decoded before anything else parses the text, and what
+  the decoded byte means then depends on who reads it. GNU knows `\n`, `\t`, `\r`,
+  `\f`, `\v`, `\a`, `\cX`, `\dNNN`, `\oNNN` and `\xHH` -- and NOT `\e`, worth
+  pinning because it is the one every other tool has. In a PATTERN the byte is
+  inserted RAW, arriving as regex SYNTAX rather than as a literal: `\x2e` is the
+  metacharacter dot, `\x2a` quantifies, `\x5e` anchors, `\x5b` is an unmatched
+  bracket, `\x5c` is a trailing backslash, `\x5cw` is the word class, and
+  `[a\x2dz]` is a RANGE. That is also why an escape works inside a bracket
+  expression, where the regex parser itself takes a backslash literally: the
+  decoder ran first, so the bracket never sees one. A REPLACEMENT decodes to a
+  LITERAL instead -- `\x26` is an ampersand that does not stand for the match and
+  `\x5c1` is a backslash and a `1`, not a backreference -- while `a`/`i`/`c` text
+  and both halves of `y///` decode to plain bytes, `y`'s operand lengths being
+  measured AFTER the decoding (`y/X\x59/12/` is two for two). An escape GNU does
+  not know keeps its backslash for the next parser in a pattern (`\w`, `\1`) and
+  sheds it everywhere else (`a A\qB` appends `AqB`). Three more rules earn their
+  place: the one-liner `a text` form eats a LEADING backslash before decoding, so
+  `a \t.` appends `t.` while `a \\x41` appends `A`; a decoded byte is never read
+  again, so `\x5cx41` is a backslash and `x41`; and `\c` takes exactly one
+  character, refusing a nested escape (`\c\q` is `recursive escaping after \c not
+  allowed`) except the doubled `\c\\`, which is 0x1c. A `\c` with NOTHING to
+  control leaves a BARE BACKSLASH, and one rule covers all three readers because
+  each resolves that differently: the regex compiler rejects it (`Trailing
+  backslash`), a replacement keeps it, a text buffer drops it -- which is why
+  `y/X/\c/` is a length error and `s/X/A\c/` emits `A\`. FILENAMES decode
+  nothing: neither implementation reads an escape in an `r`/`w` target, so `r
+  \x72f` reads a file literally named `\x72f` in both. An earlier draft of that
+  last note claimed otherwise and a reviewer caught it; the probe is one line, so
+  run it rather than reasoning by analogy from the bracket case.
+
+  The gaps this campaign found and did NOT fix, recorded here so the next round
   starts from the probe results rather than re-deriving them. All but the first
   have corpus cases carrying GNU's goldens, listed as xfail; `--posix`'s two cases
   PASS, because what is missing there is a restriction rather than an answer, and
@@ -305,8 +335,8 @@ td-txt-authored case files
     (`sed -n -e 'w /nodir/f' -e '{'` is exit 4; `-e ZZ -e 'w /nodir/f'` is exit 1).
     That last ordering is the constraint: it means opening after the parse finishes
     is not a fix, and td-txt's parser cannot currently fail with any status but 1.
-    It covers the `s///w` FLAG by the same route, which is the second thing (with
-    `[\n]`) a parser-shape generator keeps rediscovering: a `w` filename runs to the
+    It covers the `s///w` FLAG by the same route, which is the thing a
+    parser-shape generator keeps rediscovering: a `w` filename runs to the
     end of the line, so any generator that puts a `/` after one hands GNU a path
     whose directory does not exist and gets exit 4 from a command no cycle runs.
 
@@ -329,18 +359,61 @@ td-txt-authored case files
     anyone makes the eager read lazy, because getting `F` right is the same question
     as getting the lookahead right.
 
-  - GNU applies its escape vocabulary BEFORE compiling, so the escapes work in
-    places td-txt does not decode them. In a bracket expression: `[\n]`, `[\t]`,
-    `[\x41]`, `[\o101]` and `[\d065]` all match one byte, where td-txt decodes per
-    atom and POSIX makes a backslash inside a bracket an ordinary member, so
-    `[\d065]` matches any of `\ d 0 6 5`. `[\w]` and `[\\]` agree already and are
-    the controls a fix must not break. It is NOT only brackets, which is why the
-    fix is a pass rather than a patch: `a`/`i`/`c` text takes them too, `sed 'a
-    T\tU'` emitting a real tab where td-txt emits a `t`. FILENAMES do not --
-    neither implementation decodes an escape in an `r`/`w` target, so `r \x72f`
-    reads a file literally named `\x72f` in both. An earlier draft of this note
-    claimed otherwise and a reviewer caught it; the probe is one line, so run it
-    rather than reasoning by analogy from the bracket case.
+  - A `\c` with nothing to control eats an `a` text's own TERMINATOR: GNU
+    accumulates the text WITH its trailing newline and decodes that whole buffer,
+    so `a\<newline>\c` appends `J` -- the newline upper-cased and XORed with 0x40
+    -- and no newline after it. td-txt's buffer ends where the newline begins, the
+    separator being appended by the writer, so there is nothing there to consume.
+    One xfail case, `a` only: `i` and `c` substitute the separator for the text's
+    last byte and so agree whatever it ends with. Matching it means the text
+    carrying its own terminator, which puts back in play the `-z` asymmetry td-txt
+    matches today (`i foo` ends in a NUL where `a foo` ends in a newline). The
+    neighbouring shapes are NOT gaps: a text ending in an unpaired backslash is
+    emitted raw, and a continuation collapses only across an `-e` boundary.
+
+  - A backreference to a group that is not CLOSED yet is `Invalid back reference`
+    in GNU and accepted here: `\(\1\)` matches everywhere, as does `\(a\(b\)\1\)`
+    and ERE `(\1)`. Naming a closed group from inside a later one is fine in both
+    (`\(\(a\)\2\)`), and a forward reference already errors here, so what is
+    missing is only that a group counts as nameable before its `\)`. Three xfail
+    cases; found re-fuzzing after the reviews, and unrelated to escapes.
+
+  - What an escaped DELIMITER means, in three shapes that predate this campaign
+    and share one cause: GNU's `match_slash` collapses `\<delim>` for EVERY
+    delimiter, having special-cased a regex `\n` first, while td-txt decides from
+    the delimiter's character class. So an alphanumeric delimiter does not
+    collapse here (`sed 'sx\x5bxYx'` is the pattern `x5b` in GNU and, since the
+    escape pass, `Unmatched [` here -- it used to be a wrong line, which is why
+    this landing makes the shape louder rather than newer), and `&` as an `s///`
+    delimiter is the reverse: GNU KEEPS the backslash there, so `sed 's&x&\&&'`
+    emits a literal `&` where td-txt emits the whole match. A backslash as an
+    ADDRESS delimiter (`sed -n '\\^\p'`) is a third: GNU ends the address at the
+    backslash, td-txt reports an unterminated regex. Four xfail cases. Fixing
+    means porting `match_slash`'s condition rather than approximating it.
+
+  - A quantifier applied to a quantifier, or to a zero-width assertion. Fuzzing the
+    escape work above found it (a decoded `\x2a` is a `*`), but it has nothing to
+    do with escapes -- `sed 's/A**/-/'` shows it -- and it is a separate axis, so
+    it is recorded rather than folded in. Four rules, every one of them `Invalid
+    preceding regular expression` in GNU and accepted here:
+
+    * a BRE refuses a second `*` or interval after ANY operator (`a**`, `a\+*`,
+      `a\?*`, `a\{2\}*`, `\(a\)**`, `[ab]**`, `a\{2\}\{3\}`) while TAKING `\+`
+      and `\?` there: `a*\+`, `a\?\?` and `a\{2\}\+` all compile;
+    * an ERE stacks all four freely (`a**`, `a+*`, `a{1,2}{1,2}`) but refuses any
+      of them on a zero-width assertion -- `^*`, `^?`, `^{2}`, `$*`, `\`*`, `\'*`,
+      `\b+`, `\B*`, `\<*`, `\>*` -- mid-pattern included (`(a)^*b`), which a group
+      around the assertion lifts (`(^)*a` compiles);
+    * an INTERVAL on a zero-width assertion is refused in a BRE too (`\<\{2\}a`),
+      where a `*` on one is not;
+    * an ERE refuses an interval with nothing to repeat (`{2}a`); a BRE refuses
+      `\{2\}a` as well, and that one already agrees.
+
+    A leading `*` is a literal and quantifies normally, so `**a` and `^**a` both
+    compile in a BRE, and a quantifier INSIDE a group leaves the group unquantified
+    (`\(a*\)*`). One member of the family is semantic rather than a diagnostic and
+    will not be fixed by the parse rule alone: GNU compiles a BRE `\<*a` and then
+    matches NOTHING with it, where td-txt matches the `a`.
 
   Goldens are C-locale. Under LC_ALL=C — the only locale td's image sets, and what
   every case here was captured under — GNU `grep -w '\.*'` selects `.a`; under a
