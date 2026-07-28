@@ -132,9 +132,7 @@ fn tb() -> Result<PathBuf, String> {
 /// stays RED and no regression can masquerade as a skip. `output` is the child's
 /// streams alone, never the formatted message, so `ctx` cannot satisfy it.
 fn tag_if_unprovisioned(status: &std::process::ExitStatus, output: &str, msg: String) -> String {
-    if status.code() == Some(crate::check_loop::EXIT_UNPROVISIONED)
-        && output.contains(crate::check_loop::UNPROVISIONED_SENTINEL)
-    {
+    if td_engine::exit::child_reported_host_gap(status.code(), b"", output.as_bytes()) {
         // Drop the FAIL: lead-in; this is reported as a skip, and a SKIP line
         // reading "unprovisioned — FAIL: ..." is the confusion being removed.
         let body = msg.strip_prefix("FAIL: ").unwrap_or(&msg);
@@ -1703,6 +1701,7 @@ fn recipe_checks(root: &Path) -> Result<(), String> {
 
     let mut ran = 0usize;
     let mut failures = 0usize;
+    let mut skipped: Vec<String> = Vec::new();
     for spec in checks.split_whitespace() {
         let count_text = run_out_env(
             &eval_s,
@@ -1724,24 +1723,91 @@ fn recipe_checks(root: &Path) -> Result<(), String> {
         for index in 1..=count {
             ran += 1;
             println!("================ recipe-check {spec}#{index} ================");
-            if run_recipe_check(&eval, spec, index, &eval_s, &stage0_base)? {
-                println!("================ recipe-check {spec}#{index}: PASS ================");
-            } else {
-                failures += 1;
-                eprintln!("================ recipe-check {spec}#{index}: FAIL ================");
+            match run_recipe_check(&eval, spec, index, &eval_s, &stage0_base)? {
+                CheckOutcome::Passed => {
+                    println!("================ recipe-check {spec}#{index}: PASS ================");
+                }
+                CheckOutcome::HostGap => {
+                    skipped.push(format!("{spec}#{index}"));
+                    println!(
+                        "================ recipe-check {spec}#{index}: SKIPPED (unprovisioned \
+                         — nothing on this host can run it) ================"
+                    );
+                }
+                CheckOutcome::Failed => {
+                    failures += 1;
+                    eprintln!("================ recipe-check {spec}#{index}: FAIL ================");
+                }
             }
         }
     }
 
-    if failures != 0 {
-        return Err(format!(
-            "FAIL: recipe-checks - {failures} of {ran} recipe-owned check(s) failed"
-        ));
+    let (report, verdict) = recipe_checks_verdict(ran, failures, &skipped);
+    for line in report {
+        println!("{line}");
     }
-    println!(
-        "PASS: recipe-checks - ran {ran} recipe-owned /td/store check(s) from the Rust recipe catalog; package behavior/repro assertions live with the package recipes."
-    );
-    Ok(())
+    verdict
+}
+
+/// The gate's verdict, split out so the three endings are testable without
+/// running 25 package builds. Returns an optional extra report line plus the
+/// verdict itself.
+///
+/// A skip is NOT a pass. If every check was unrunnable here the gate asserted
+/// nothing, so it reports its own unprovisioned skip rather than green — a
+/// green that proved nothing is the vacuous gate this contract exists to stop.
+/// A PARTIAL skip stays green, because that is the same bargain gate-run
+/// already makes suite-wide, but every skipped check is NAMED: a count alone
+/// reads like full coverage to anyone scanning the log.
+fn recipe_checks_verdict(
+    ran: usize,
+    failures: usize,
+    skipped: &[String],
+) -> (Vec<String>, Result<(), String>) {
+    // The caveat rides the FAIL arm too: "1 of 25 failed" alongside 20 silent
+    // skips reads as though 24 checks vouched for the tree.
+    let caveat = (!skipped.is_empty()).then(|| {
+        format!(
+            ">> recipe-checks: {} {} of {ran} check(s) SKIPPED as unprovisioned (nothing on \
+             this host can run them), so this run is NOT full coverage: {}",
+            crate::check_loop::GATES_SKIPPED_SENTINEL,
+            skipped.len(),
+            skipped.join(" ")
+        )
+    });
+    if failures != 0 {
+        return (
+            caveat.into_iter().collect(),
+            Err(format!(
+                "FAIL: recipe-checks - {failures} of {ran} recipe-owned check(s) failed"
+            )),
+        );
+    }
+    if ran == 0 {
+        return (
+            Vec::new(),
+            Err("FAIL: recipe-checks - no checks ran".to_string()),
+        );
+    }
+    if skipped.len() == ran {
+        return (
+            Vec::new(),
+            Err(format!(
+                "{UNPROVISIONED_TAG}recipe-checks - all {ran} recipe-owned check(s) need a \
+                 toolchain no host here reaches: {}",
+                skipped.join(" ")
+            )),
+        );
+    }
+    // The caveat carries the TOKEN, not just prose: this gate exits 0, so
+    // without a stable machine signal automation cannot tell a partial run from
+    // a full one — and prose coupling is what broke twice (#268, #315).
+    let mut lines: Vec<String> = caveat.into_iter().collect();
+    lines.push(format!(
+        "PASS: recipe-checks - ran {} of {ran} recipe-owned /td/store check(s) from the Rust recipe catalog; package behavior/repro assertions live with the package recipes.",
+        ran.saturating_sub(skipped.len())
+    ));
+    (lines, Ok(()))
 }
 
 fn resolve_recipe_eval(root: &Path) -> Result<PathBuf, String> {
@@ -1775,15 +1841,33 @@ fn resolve_recipe_eval(root: &Path) -> Result<PathBuf, String> {
     Ok(path)
 }
 
+/// How one recipe-owned check ended. `HostGap` is not a failure: the evaluator
+/// reported that nothing on THIS machine can do the work (no toolchain in the
+/// jail), which is the same class gate-run tolerates suite-wide. It is a
+/// distinct code from a provenance rejection, which stays a failure — see
+/// td_engine::exit.
+enum CheckOutcome {
+    Passed,
+    Failed,
+    HostGap,
+}
+
+/// Stderr is TEED rather than inherited: these checks run for minutes and their
+/// progress has to keep streaming, but the skip verdict needs the sentinel, and
+/// an inherited pipe cannot be read. Draining to EOF before `wait` is what keeps
+/// a chatty check from filling the pipe and deadlocking. The cost is ordering —
+/// stdout still goes straight to the log fd, so a stderr line can now land after
+/// the stdout it described. Nothing is lost; both still reach the same log.
 fn run_recipe_check(
     eval: &Path,
     spec: &str,
     index: usize,
     eval_s: &str,
     stage0_base: &str,
-) -> Result<bool, String> {
+) -> Result<CheckOutcome, String> {
+    use std::io::{BufRead, BufReader, Write};
     let index_s = index.to_string();
-    let status = Command::new(eval)
+    let mut child = Command::new(eval)
         .arg("check-run")
         .arg(spec)
         .arg(&index_s)
@@ -1791,9 +1875,42 @@ fn run_recipe_check(
         .env("TD_RECIPE_CHECK_SPEC", spec)
         .env("TD_RECIPE_CHECK_INDEX", &index_s)
         .env("TD_STAGE0_BASE", stage0_base)
-        .status()
+        .stderr(Stdio::piped())
+        .spawn()
         .map_err(|e| format!("FAIL: cannot spawn td-recipe-eval check-run {spec}: {e}"))?;
-    Ok(status.success())
+    let mut saw_sentinel = false;
+    if let Some(err) = child.stderr.take() {
+        // BYTES, not lines: `BufRead::lines` errors on invalid UTF-8, and a
+        // compiler that emits one stray byte would then fail a check that was
+        // passing. Forwarding raw also keeps the child's output verbatim.
+        let mut reader = BufReader::new(err);
+        let mut buf = Vec::new();
+        let sentinel = crate::check_loop::UNPROVISIONED_SENTINEL.as_bytes();
+        loop {
+            buf.clear();
+            match reader.read_until(b'\n', &mut buf) {
+                Ok(0) => break,
+                Ok(_) => {}
+                // A broken pipe mid-check must not fail a check that is
+                // otherwise fine; the exit status below is the verdict.
+                Err(_) => break,
+            }
+            if buf.windows(sentinel.len()).any(|w| w == sentinel) {
+                saw_sentinel = true;
+            }
+            let _ = std::io::stderr().write_all(&buf);
+        }
+    }
+    let status = child
+        .wait()
+        .map_err(|e| format!("FAIL: wait check-run {spec}: {e}"))?;
+    if status.success() {
+        return Ok(CheckOutcome::Passed);
+    }
+    if td_engine::exit::host_gap_from_parts(status.code(), saw_sentinel) {
+        return Ok(CheckOutcome::HostGap);
+    }
+    Ok(CheckOutcome::Failed)
 }
 
 fn is_executable_file(path: &Path) -> bool {
@@ -3076,6 +3193,120 @@ fn toolchain_x86_64_input_addressed(root: &Path) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A check that could not run HERE is not a check that passed. All-skipped
+    /// must report the gate's own unprovisioned skip (green would be a gate
+    /// asserting nothing), and a partial skip must NAME what was missed —
+    /// "ran 25" over 5 silent skips is how a shrinking suite goes unnoticed.
+    #[test]
+    fn recipe_checks_never_reports_a_skip_as_coverage() {
+        let s = |xs: &[&str]| xs.iter().map(|x| (*x).to_string()).collect::<Vec<_>>();
+
+        // A real failure outranks any number of skips.
+        let (_, v) = recipe_checks_verdict(25, 1, &s(&["a#1"]));
+        assert!(v.unwrap_err().starts_with("FAIL: "));
+
+        // Nothing ran anywhere here → the gate's own tolerated skip, tagged so
+        // `cli` maps it to 69 + sentinel rather than a bare failure.
+        let (_, v) = recipe_checks_verdict(3, 0, &s(&["a#1", "b#1", "c#1"]));
+        let err = v.unwrap_err();
+        assert!(err.starts_with(UNPROVISIONED_TAG), "{err:?}");
+        assert!(err.contains("a#1 b#1 c#1"), "names them: {err:?}");
+        assert!(!err.starts_with("FAIL: "));
+
+        // A failure does not excuse dropping the caveat: "1 of 25 failed" over
+        // 20 silent skips reads as though 24 checks vouched for the tree.
+        let (lines, v) = recipe_checks_verdict(25, 1, &s(&["a#1", "b#1"]));
+        assert!(v.is_err() && lines.len() == 1, "{lines:?}");
+        assert!(lines[0].contains(crate::check_loop::GATES_SKIPPED_SENTINEL));
+        assert!(lines[0].contains("a#1 b#1"));
+
+        // Nothing ran at all is never a pass.
+        let (_, v) = recipe_checks_verdict(0, 0, &[]);
+        assert!(v.is_err(), "0 checks must not report green");
+
+        // Partial → green, but the caveat comes FIRST and names every skip.
+        let (lines, v) = recipe_checks_verdict(3, 0, &s(&["b#1"]));
+        assert!(v.is_ok());
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert!(lines[0].contains("NOT full coverage") && lines[0].contains("b#1"));
+        // Prose is not a signal: automation greps the token, and this gate
+        // exits 0, so without it a partial reads as a full green.
+        assert!(
+            lines[0].contains(crate::check_loop::GATES_SKIPPED_SENTINEL),
+            "a partial skip must carry the incomplete-coverage token: {:?}",
+            lines[0]
+        );
+        assert!(lines[1].starts_with("PASS: ") && lines[1].contains("ran 2 of 3"));
+
+        // Clean run → one PASS line, no caveat.
+        let (lines, v) = recipe_checks_verdict(3, 0, &[]);
+        assert!(v.is_ok() && lines.len() == 1 && lines[0].starts_with("PASS: "));
+        assert!(
+            !lines[0].contains(crate::check_loop::GATES_SKIPPED_SENTINEL),
+            "a full run must NOT claim incomplete coverage"
+        );
+    }
+
+    /// The skip verdict is EVIDENCE, not the exit code alone: a 69 without the
+    /// sentinel is some other tool's EX_UNAVAILABLE and must stay a failure, or
+    /// a regression hides as "nothing to run here". Runs real children, because
+    /// the tee-and-scan is the part that can break.
+    #[test]
+    fn a_recipe_check_skips_only_on_a_69_that_carries_the_sentinel() {
+        let dir = std::env::temp_dir().join(format!("td-rcv-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let sentinel = crate::check_loop::UNPROVISIONED_SENTINEL;
+        let code = crate::check_loop::EXIT_UNPROVISIONED;
+
+        let write = |name: &str, body: &str| {
+            let p = dir.join(name);
+            std::fs::write(&p, format!("#!/bin/sh\n{body}\n")).unwrap();
+            let mut perm = std::fs::metadata(&p).unwrap().permissions();
+            std::os::unix::fs::PermissionsExt::set_mode(&mut perm, 0o755);
+            std::fs::set_permissions(&p, perm).unwrap();
+            p
+        };
+        let run = |p: &Path| run_recipe_check(p, "spec", 1, "e", "s").unwrap();
+
+        assert!(matches!(run(&write("ok", "exit 0")), CheckOutcome::Passed));
+        assert!(matches!(
+            run(&write("gap", &format!("echo '{sentinel}' >&2; exit {code}"))),
+            CheckOutcome::HostGap
+        ));
+        assert!(
+            matches!(run(&write("bare", &format!("exit {code}"))), CheckOutcome::Failed),
+            "a bare 69 is not proof of a host gap"
+        );
+        assert!(
+            matches!(
+                run(&write("wrong", &format!("echo '{sentinel}' >&2; exit 1"))),
+                CheckOutcome::Failed
+            ),
+            "the sentinel alone does not license a skip"
+        );
+        // Invalid UTF-8 on stderr must not fail a check that passed: the tee
+        // forwards bytes, so one stray byte from a compiler cannot red a green.
+        assert!(
+            matches!(
+                run(&write("binary", "printf '\\377\\376 noise\\n' >&2; exit 0")),
+                CheckOutcome::Passed
+            ),
+            "non-UTF-8 stderr must not turn a passing check into an error"
+        );
+        assert!(
+            matches!(
+                run(&write(
+                    "bingap",
+                    &format!("printf '\\377\\376\\n' >&2; echo '{sentinel}' >&2; exit {code}")
+                )),
+                CheckOutcome::HostGap
+            ),
+            "the sentinel is still found alongside undecodable bytes"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// A native body that shells out to a tool which could not provision a
     /// toolchain must re-raise that as 69, not 1: `cli` keys off the tag, and

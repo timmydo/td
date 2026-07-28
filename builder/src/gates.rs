@@ -1033,8 +1033,10 @@ fn run_gate(
                 // accidental exit) has no token and stays a real failure, so a
                 // genuine regression can never masquerade as a skip (Codex review).
                 if !breached
-                    && st.code() == Some(crate::check_loop::EXIT_UNPROVISIONED)
-                    && log_has_unprovisioned_sentinel(log_path)
+                    && td_engine::exit::host_gap_from_parts(
+                        st.code(),
+                        log_has_unprovisioned_sentinel(log_path),
+                    )
                 {
                     let _ = writeln!(
                         logf,

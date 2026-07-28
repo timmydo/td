@@ -143,10 +143,7 @@ fn forward_to_stderr(out: &std::process::Output) {
 /// out. The verb re-emits that sentinel downstream, so trusting the code alone
 /// would let any other 69 mint one and turn a regression into a tolerated skip.
 fn tag_child_failure(out: &std::process::Output, msg: String) -> String {
-    let sentinel = crate::check_loop::UNPROVISIONED_SENTINEL;
-    let saw_sentinel = String::from_utf8_lossy(&out.stderr).contains(sentinel)
-        || String::from_utf8_lossy(&out.stdout).contains(sentinel);
-    if out.status.code() == Some(crate::check_loop::EXIT_UNPROVISIONED) && saw_sentinel {
+    if td_engine::exit::child_reported_host_gap(out.status.code(), &out.stdout, &out.stderr) {
         return format!("{}{msg}", crate::check_loop::UNPROVISIONED_TAG);
     }
     msg

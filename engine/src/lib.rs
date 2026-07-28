@@ -7,6 +7,8 @@
 //! representation (numbers as raw lexemes, objects as order-preserving `Vec`
 //! entries, canonical writer with SORTED keys) plus the builder's read
 //! accessors; the SHA-256 module is the lint-clean implementation plus the
-//! builder's streaming file helper.
+//! builder's streaming file helper. `exit` is the third shared thing: the
+//! status codes the two bins exchange when one runs the other.
+pub mod exit;
 pub mod json;
 pub mod sha256;

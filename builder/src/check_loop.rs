@@ -33,16 +33,17 @@ fn fatal(msg: &str) -> String {
     format!("td-builder check: FATAL: {msg}")
 }
 
-/// Exit code `td-builder check` uses when it aborts because the loop cannot be
-/// provisioned at all — today: the td-built userland is unbuildable because the
-/// bootstrap graph still declares host scaffolding, which planning rejects (re
-/// #469) — as
-/// opposed to a gate genuinely going red. It is the stable machine signal the
-/// callers read to tell "nothing could run here"
-/// from "a real regression", instead of grepping FATAL prose out of the log
-/// (the coupling that broke twice — #268, then #315). EX_UNAVAILABLE from
-/// sysexits(3): "service unavailable", i.e. this host cannot run the loop.
-pub const EXIT_UNPROVISIONED: i32 = 69;
+/// Exit code `td-builder check` uses when it aborts because THIS HOST cannot
+/// provision the loop — no toolchain reachable — as opposed to a gate genuinely
+/// going red. It is the stable machine signal the callers read to tell "nothing
+/// could run here" from "a real regression", instead of grepping FATAL prose
+/// out of the log (the coupling that broke twice — #268, then #315).
+/// EX_UNAVAILABLE from sysexits(3): "service unavailable".
+///
+/// A graph that no host can build is NOT this: that is
+/// `EXIT_PROVENANCE_REJECTED`, and it reds.
+/// Defined in td-engine so td-recipe-eval speaks the identical contract.
+pub use td_engine::exit::EXIT_UNPROVISIONED;
 
 /// The error-string half of the same signal: a control-plane routine (a gate
 /// body, a `provision-*`/`stage0-place` verb) prefixes its `Err` with this when
@@ -59,15 +60,16 @@ pub(crate) const UNPROVISIONED_TAG: &str = "UNPROVISIONED: ";
 /// the 69 came from td's own provisioning path, not a coincidental
 /// EX_UNAVAILABLE from an unrelated tool or an accidental `exit 69`. Distinctive
 /// on purpose so it never collides with build-log noise (Codex review, re #469).
-pub(crate) const UNPROVISIONED_SENTINEL: &str = "[td-unprovisioned-69:re#469]";
+pub(crate) use td_engine::exit::UNPROVISIONED_SENTINEL;
 
-/// The stable stdout/stderr token the gate runner prints when a run finishes
-/// GREEN but with ≥1 gate SKIPPED as Unprovisioned. A caller can grep a run's
-/// log for this: a run that exited 0 yet carries this token did NOT run every
-/// gate, so its green is not a full-suite proof. A distinct, whole-suite token
-/// (not the per-gate [`UNPROVISIONED_SENTINEL`], and a STABLE machine signal
-/// rather than FATAL prose — the coupling that broke twice, #268 then #315, is
-/// exactly what a stable token avoids).
+/// The stable stdout/stderr token for GREEN THAT IS NOT FULL COVERAGE. The gate
+/// runner prints it when a run finishes green with ≥1 gate SKIPPED as
+/// Unprovisioned; a gate that skipped some of its own sub-checks prints it too,
+/// since the property a caller greps for — "this exit 0 did NOT run everything"
+/// — is the same one, and one token for one property beats two that can drift.
+/// A distinct token from the per-gate [`UNPROVISIONED_SENTINEL`], and a STABLE
+/// machine signal rather than FATAL prose — the coupling that broke twice, #268
+/// then #315, is exactly what a stable token avoids.
 pub(crate) const GATES_SKIPPED_SENTINEL: &str = "[td-gates-skipped:re#469]";
 
 /// Print [`UNPROVISIONED_SENTINEL`] to stderr, then return the process exit code
@@ -281,9 +283,11 @@ fn userland_fingerprint(root: &Path, eval: &str) -> Result<String, String> {
 /// realizes the recipe chain (replayed from the warm chain cache when
 /// provisioned; built from the seed when not — that first build is the
 /// long one and says so loudly). The evaluator REJECTS the graph at planning
-/// while any rung still declares host scaffolding (exit 69 → Unprovisioned
-/// here): the loop fails closed until busybox/make build solely from audited
-/// seeds and prior td recipe outputs (re #469). On success, publish each
+/// while any rung still declares host scaffolding (exit 78 → Fatal here — no
+/// host can fix it, so it is not a skip): the loop fails closed until
+/// busybox/make build solely from audited seeds and prior td recipe outputs (re
+/// #469). A host gap (69 + sentinel) degrades to Unprovisioned instead. On
+/// success, publish each
 /// `TD_RECIPE_RUN_OUT` item
 /// into the durable dir and rewrite the map atomically. Items are
 /// input-addressed (the basename embeds the recipe+input key), so an
@@ -338,18 +342,26 @@ fn provision_userland(root: &Path) -> Result<LoopUserland, CheckError> {
             .take(8)
             .collect();
         let tail: Vec<&str> = tail.into_iter().rev().collect();
-        // Exit 69 (EX_UNAVAILABLE) is td-recipe-eval's PLANNING-time
-        // provenance rejection: the bootstrap graph still declares host
-        // scaffolding, which is no longer an admissible input class (re
-        // #469), so NO host can provision this userland. The loop fails
-        // CLOSED as Unprovisioned — there is no host-tool fallback and no
-        // grandfathered userland (the fingerprint keys the map to the
-        // current, rejecting evaluator).
-        if out.status.code() == Some(69) {
+        // A HOST gap — the evaluator could not place a stage0 td-builder, or
+        // otherwise found nothing here to run the work with. Genuinely
+        // "nothing to run on this machine", so it degrades to a skip.
+        if td_engine::exit::child_reported_host_gap(out.status.code(), &out.stdout, &out.stderr) {
             return Err(CheckError::Unprovisioned(fatal(&format!(
-                "the loop userland ({}) cannot be provisioned: the recipe chain rejected \
-                 its own inputs' provenance — the bootstrap rungs still declare host \
-                 scaffolding, and only audited seeds and prior td recipe outputs are \
+                "the loop userland ({}) cannot be provisioned on this host:\n{}",
+                LOOP_USERLAND_STEMS.join(" "),
+                tail.join("\n")
+            ))));
+        }
+        // A PROVENANCE rejection is the opposite: the bootstrap rungs still
+        // declare host scaffolding, which is not an admissible input class (re
+        // #469), so NO host can provision this userland. That is a gap in the
+        // chain, not in the machine, and it reds — a skip here would report a
+        // regression nobody can fix by changing hosts as a tolerated absence.
+        if out.status.code() == Some(td_engine::exit::EXIT_PROVENANCE_REJECTED) {
+            return Err(CheckError::Fatal(fatal(&format!(
+                "the loop userland ({}) cannot be provisioned ANYWHERE: the recipe chain \
+                 rejected its own inputs' provenance — the bootstrap rungs still declare \
+                 host scaffolding, and only audited seeds and prior td recipe outputs are \
                  admissible (re #469). The loop runs NO gates until the chain builds \
                  its scaffolding as recipe outputs:\n{}",
                 LOOP_USERLAND_STEMS.join(" "),

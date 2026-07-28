@@ -41,13 +41,24 @@ fn timed_phase(label: &'static str) -> HarnessTimer {
 }
 
 /// The stable in-crate marker for a planning-time provenance rejection.
-/// `main` maps an error carrying it to exit 69 (EX_UNAVAILABLE — the same
-/// "nothing can run here" signal td-builder's loop uses for
-/// EXIT_UNPROVISIONED): the graph is structurally unbuildable on EVERY host
-/// until the rejected input exists as a td recipe output — a bootstrap gap,
-/// not a code regression. The cross-process contract is the exit code; this
-/// prose never crosses a process boundary as an interface.
+/// `main` maps an error carrying it to `EXIT_PROVENANCE_REJECTED` (78): the
+/// graph is structurally unbuildable on EVERY host until the rejected input
+/// exists as a td recipe output. It shared 69 with the HOST gap until the
+/// codes were split, which made the two indistinguishable to a caller holding
+/// only the number — and they must be treated as opposites, since only the
+/// host gap is a tolerable skip. The cross-process contract is the exit code;
+/// this prose never crosses a process boundary as an interface.
 pub(crate) const PROVENANCE_REJECTED: &str = "provenance rejected: ";
+
+/// The stable in-crate marker for a HOST gap: a child reported that nothing on
+/// THIS machine can do the work. `main` maps an error carrying it to
+/// `EXIT_UNPROVISIONED` + the sentinel, which gate-run tolerates as a skip —
+/// the opposite of [`PROVENANCE_REJECTED`], which no host can fix and which
+/// must never read as one. Like that marker, the prose is in-crate only; the
+/// cross-process contract is the exit code and the sentinel. It must reach
+/// `die_runner` UNWRAPPED — a caller that adds context in front of it turns the
+/// skip back into a plain exit 2.
+pub(crate) const HOST_GAP: &str = "host gap: ";
 
 /// A graph input with no admissible provenance (issue #469): not a recipe
 /// output, not a pinned seed source. Names the recipe and the input so the
@@ -1159,8 +1170,8 @@ fn gate_local_source_candidate(key: &str, candidate_path: &str) -> Result<(), St
     if crate::seed_digests::require(key, candidate).is_ok() {
         return Ok(());
     }
-    // PROVENANCE_REJECTED, not the literal: `die_runner` keys the 69/UNPROVISIONED
-    // exit on this prefix, so a drifted copy would silently reclassify the failure.
+    // PROVENANCE_REJECTED, not the literal: `die_runner` keys the 78 exit on this
+    // prefix, so a drifted copy would silently reclassify the failure.
     Err(match crate::seed_digests::expected(key)? {
         Some(exp) => format!(
             "{PROVENANCE_REJECTED}local source `{key}' hashes to {candidate} but the compiled \
@@ -1941,7 +1952,7 @@ impl RecipeCheckRunner {
             // Scan the FULL stderr bytes, not just the 40-line tail, for the retained-seed
             // markers — a long build log could scroll the auth red out of the tail. Byte-level
             // so a huge or non-UTF-8 log costs no lossy full-buffer allocation on the error path.
-            return Err(if stale_seed_in(&stderr_bytes) {
+            let msg = if stale_seed_in(&stderr_bytes) {
                 // Which hint is chosen reads the FULL stderr too: the unpinned-basename
                 // marker is what distinguishes a prune from a ladder-destroying reset, and
                 // it can sit well above the tail.
@@ -1949,7 +1960,20 @@ impl RecipeCheckRunner {
                 format!("{base}\n{hint}")
             } else {
                 base
-            });
+            };
+            // Same rule the other child-runners apply: a host gap the child
+            // reported must survive into the exit code, not flatten into prose.
+            return Err(
+                if td_engine::exit::child_reported_host_gap(
+                    status.code(),
+                    &stdout_bytes,
+                    &stderr_bytes,
+                ) {
+                    format!("{HOST_GAP}{msg}")
+                } else {
+                    msg
+                },
+            );
         }
         // The streaming path already tee'd stdout live; only the buffered path flushes it here.
         if !stream {
@@ -2861,11 +2885,7 @@ fn spawn_capture_tee(
 fn command_output(cmd: &mut Command, label: &str) -> Result<String, String> {
     let out = cmd.output().map_err(|e| format!("spawn {label}: {e}"))?;
     if !out.status.success() {
-        return Err(format!(
-            "{label} failed\nstdout:\n{}\nstderr:\n{}",
-            String::from_utf8_lossy(&out.stdout),
-            String::from_utf8_lossy(&out.stderr)
-        ));
+        return Err(child_failure(label, &out));
     }
     String::from_utf8(out.stdout).map_err(|e| format!("{label} output not UTF-8: {e}"))
 }
@@ -2899,13 +2919,29 @@ fn command_output_with_stdin_bytes(
         .wait_with_output()
         .map_err(|e| format!("wait {label}: {e}"))?;
     if !out.status.success() {
-        return Err(format!(
-            "{label} failed\nstdout:\n{}\nstderr:\n{}",
-            String::from_utf8_lossy(&out.stdout),
-            String::from_utf8_lossy(&out.stderr)
-        ));
+        return Err(child_failure(label, &out));
     }
     String::from_utf8(out.stdout).map_err(|e| format!("{label} output not UTF-8: {e}"))
+}
+
+/// The failed-child message for every runner here that CAPTURES both streams,
+/// so the HOST GAP a child reported cannot be flattened away by whichever one
+/// happened to run it. `td-builder` exits 69 + sentinel when no toolchain is
+/// reachable in the jail; without the marker that becomes an ordinary error and
+/// `die_runner` reds on something no host could have avoided. `build_plan`
+/// applies the same rule inline, on its own captured bytes. `store_verify_pair`
+/// cannot: it runs on `.status()` with no stream to scan, and the verb it drives
+/// does not exit 69.
+fn child_failure(label: &str, out: &std::process::Output) -> String {
+    let msg = format!(
+        "{label} failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    if td_engine::exit::child_reported_host_gap(out.status.code(), &out.stdout, &out.stderr) {
+        return format!("{HOST_GAP}{msg}");
+    }
+    msg
 }
 
 /// Hex SHA-256 of a byte string. In-process (`crate::sha256`) — pin

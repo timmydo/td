@@ -56,15 +56,28 @@ fn die(msg: &str) -> ! {
     exit(2);
 }
 
-/// check-run/build-run errors: a planning-time provenance rejection exits 69
-/// (EX_UNAVAILABLE) so callers — td-builder's loop prelude provisioning the
-/// userland — can branch on "the bootstrap graph cannot be realized with
-/// admissible inputs anywhere" (re #469) without parsing stderr prose. Every
-/// other error keeps the usage exit (2).
+/// check-run/build-run errors, as a code a caller can branch on without
+/// parsing stderr prose. The two unhappy endings that look alike from outside
+/// get DIFFERENT codes, because a caller must tolerate one and never the other:
+///
+/// - a HOST gap (`HOST_GAP`) — nothing here can do the work, e.g. no toolchain
+///   reachable in the loop sandbox. Exits `EXIT_UNPROVISIONED` and prints the
+///   sentinel, which is what gate-run reads as a tolerated skip.
+/// - a planning-time provenance rejection (`PROVENANCE_REJECTED`) — the
+///   bootstrap graph cannot be realized with admissible inputs on ANY host (re
+///   #469). Exits `EXIT_PROVENANCE_REJECTED`. It shared 69 with the host gap
+///   until this split, so a caller reading the number alone could not tell a
+///   machine that cannot run the work from a chain that nothing can build.
+///
+/// Every other error keeps the usage exit (2).
 fn die_runner(msg: &str) -> ! {
     eprintln!("td-recipe-eval: {msg}");
+    if msg.starts_with(check_runner::HOST_GAP) {
+        eprintln!("{}", td_engine::exit::UNPROVISIONED_SENTINEL);
+        exit(td_engine::exit::EXIT_UNPROVISIONED);
+    }
     if msg.starts_with(check_runner::PROVENANCE_REJECTED) {
-        exit(69);
+        exit(td_engine::exit::EXIT_PROVENANCE_REJECTED);
     }
     exit(2);
 }
