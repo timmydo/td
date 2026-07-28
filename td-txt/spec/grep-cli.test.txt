@@ -2847,3 +2847,323 @@ abc
 ## END
 ## stderr-json: ""
 ## status: 0
+
+#### grep DROPS a leading quantifier where sed refuses it
+## argv: grep '-Ec' '*a'
+## stdin-json: "a\nb\n"
+## stdout-json: "1\n"
+## status: 0
+
+#### a leading interval too
+## argv: grep '-Ec' '{2}a'
+## stdin-json: "a\nb\n"
+## stdout-json: "1\n"
+## status: 0
+
+#### and a run of them
+## argv: grep '-Ec' '*+a'
+## stdin-json: "a\nb\n"
+## stdout-json: "1\n"
+## status: 0
+
+#### dropping one may leave the branch empty
+## argv: grep '-Ec' '*'
+## stdin-json: "a\nb\n"
+## stdout-json: "2\n"
+## status: 0
+
+#### after an alternation bar as much as at the start
+## argv: grep '-Ec' 'b|*a'
+## stdin-json: "a\nb\n"
+## stdout-json: "2\n"
+## status: 0
+
+#### a BRE takes the same character as a literal, in both tools
+## argv: grep '-c' '*a'
+## stdin-json: "*a\na\n"
+## stdout-json: "1\n"
+## stderr-json: ""
+## status: 0
+
+#### a BRE stacks quantifiers freely in grep
+## argv: grep '-c' 'a**'
+## stdin-json: "a\nb\n"
+## stdout-json: "2\n"
+## stderr-json: ""
+## status: 0
+
+#### including an interval before a star
+## argv: grep '-c' 'a\{2\}*'
+## stdin-json: "aa\nb\n"
+## stdout-json: "2\n"
+## stderr-json: ""
+## status: 0
+
+#### an interval on an assertion is a stray brace, not an error
+## argv: grep -c '\B\{2\}a'
+## stdin-json: "{2}a\nb\n"
+## stdout-json: "1\n"
+## status: 0
+
+#### and a star after a leading assertion is a literal star, not a repeat
+## argv: grep -c '\B*a'
+## stdin-json: "*a\nb\n"
+## stdout-json: "1\n"
+## stderr-json: ""
+## status: 0
+
+#### while an ERE assertion repeats normally in grep
+## argv: grep '-Ec' '^*a'
+## stdin-json: "a\nb\n"
+## stdout-json: "1\n"
+## status: 0
+
+#### a backreference into an open group is invalid in both tools
+## argv: grep '-c' '\(\1\)'
+## stdin-json: "a\nb\n"
+## stdout-json: ""
+## status: 2
+
+#### an empty group is fine but a dropped quantifier in one is not
+## argv: grep '-Ec' '(*)'
+## stdin-json: "a\nb\n"
+## stdout-json: ""
+## status: 2
+
+#### an interval with nothing to repeat is a stray brace, not an error
+## argv: grep -c '\{2\}'
+## stdin-json: "a{2}\nb\n"
+## stdout-json: "1\n"
+## status: 0
+
+#### a BRE operator after a leading assertion is a literal here too
+## argv: grep -c '\B\?a'
+## stdin-json: "?ab\nb\n"
+## stdout-json: "1\n"
+## status: 0
+
+#### past the start of a branch grep REPEATS the assertion rather than collapsing it
+## argv: grep -c 'a\b\?b'
+## stdin-json: "ab\n"
+## stdout-json: "1\n"
+## stderr-json: ""
+## status: 0
+
+#### so a lower bound of one still requires the assertion to hold
+## argv: grep -c 'a\b\+b'
+## stdin-json: "ab\n"
+## stdout-json: "0\n"
+## stderr-json: ""
+## status: 1
+
+#### which a non-boundary between the same two bytes does satisfy
+## argv: grep -c 'x\B\+b'
+## stdin-json: "xb\n"
+## stdout-json: "1\n"
+## stderr-json: ""
+## status: 0
+
+#### and a real boundary in the same position does not satisfy it
+## argv: grep -c '.\B\+b'
+## stdin-json: "-b\n"
+## stdout-json: "0\n"
+## stderr-json: ""
+## status: 1
+
+#### an interval on an assertion repeats it as well
+## argv: grep -c 'x\b\{0,2\}b'
+## stdin-json: "xb\n"
+## stdout-json: "1\n"
+## stderr-json: ""
+## status: 0
+
+#### with a lower bound of two asserting it once
+## argv: grep -c 'x\b\{2\}b'
+## stdin-json: "xb\n"
+## stdout-json: "0\n"
+## stderr-json: ""
+## status: 1
+
+#### an ERE assertion that may occur zero times leaves nothing behind
+## argv: grep -Ec '\b*a'
+## stdin-json: "xab\n"
+## stdout-json: "1\n"
+## status: 0
+
+#### while one that must occur once still anchors the match
+## argv: grep -Ec '\b+a'
+## stdin-json: "xab\n"
+## stdout-json: "0\n"
+## status: 1
+
+#### a backreference to a group that matched zero times matches nothing here too
+## argv: grep -c '\(x\)*\1'
+## stdin-json: "ab\n"
+## stdout-json: "0\n"
+## stderr-json: ""
+## status: 1
+
+#### while a group that matched empty on purpose is referenced normally
+## argv: grep -c '\(x*\)\1'
+## stdin-json: "ab\n"
+## stdout-json: "1\n"
+## stderr-json: ""
+## status: 0
+
+#### a backreference into another branch of an alternation is refused
+## argv: grep -Ec '(a)|b\1'
+## stdin-json: "b\n"
+## stdout-json: ""
+## stderr-contains: Invalid back reference
+## status: 2
+
+#### while the same reference after the alternation compiles
+## argv: grep -Ec '((a)|b)\2'
+## stdin-json: "b\n"
+## stdout-json: "0\n"
+## stderr-json: ""
+## status: 1
+
+#### a dollar before a bare pipe anchors in grep, where the pipe is a literal
+## argv: grep -c 'x$|*'
+## stdin-json: "x\n"
+## stdout-json: "1\n"
+## stderr-json: ""
+## status: 0
+
+#### so the text it looks like it wants is what it does NOT select
+## argv: grep -c 'x$|*'
+## stdin-json: "x$\n"
+## stdout-json: "0\n"
+## stderr-json: ""
+## status: 1
+
+#### and the same at the start of a pattern
+## argv: grep -c '$|*'
+## stdin-json: "ab\n"
+## stdout-json: "1\n"
+## stderr-json: ""
+## status: 0
+
+#### a group whose body matches EMPTY still participates, so the reference holds
+## argv: grep -Ec '^(x*)*\1$'
+## stdin-json: "\n"
+## stdout-json: "1\n"
+## stderr-json: ""
+## status: 0
+
+#### and the same under an optional group
+## argv: grep -Ec '^(x*)?\1$'
+## stdin-json: "\n"
+## stdout-json: "1\n"
+## stderr-json: ""
+## status: 0
+
+#### where a body that CANNOT match empty leaves the group unset
+## argv: grep -Ec '^(x)*\1$'
+## stdin-json: "\n"
+## stdout-json: "0\n"
+## stderr-json: ""
+## status: 1
+
+#### and the participating group is referenced normally when it took text
+## argv: grep -Ec '^(x*)*\1$'
+## stdin-json: "xx\n"
+## stdout-json: "1\n"
+## stderr-json: ""
+## status: 0
+
+#### grep refuses a quantified assertion INSIDE a group, which td accepts
+## argv: grep -Ec '(a$?)'
+## stdin-json: "a\n"
+## stdout-json: ""
+## status: 2
+
+#### an anchor spells it the same way
+## argv: grep -Ec '(^*)+'
+## stdin-json: "a\n"
+## stdout-json: ""
+## status: 2
+
+#### and a word boundary too
+## argv: grep -Ec '(\b*)+'
+## stdin-json: "a\n"
+## stdout-json: ""
+## status: 2
+
+#### a fuzz composite that diverges where each of its parts agrees
+## argv: grep -c '\(b\|b\)\{2\}*\'\''\1\+\?\`*\{2\}'
+## stdin-json: "aa\nbb\n"
+## stdout-json: "0\n"
+## stderr-json: ""
+## status: 1
+
+#### a leading INTERVAL dropped in a group does not unmatch the paren
+## argv: grep -Ec '({2})'
+## stdin-json: "a\n"
+## stdout-json: "1\n"
+## status: 0
+
+#### nor in a later branch of one
+## argv: grep -Ec '(a|{2})'
+## stdin-json: "a\n"
+## stdout-json: "1\n"
+## status: 0
+
+#### while a dropped star there still does
+## argv: grep -Ec '(*)'
+## stdin-json: "a\n"
+## stdout-json: ""
+## status: 2
+
+#### an interval too big to build is refused for its SIZE, not read as text
+## argv: grep -Ec '{32768}a'
+## stdin-json: "a\n"
+## stdout-json: ""
+## status: 2
+
+#### and the dropped interval does not make its group participate
+## argv: grep -Ec '^({2}|a)\1$'
+## stdin-json: "\n"
+## stdout-json: "0\n"
+## status: 1
+
+#### a second fuzz composite in the same family
+## argv: grep -c '\(.\|\w\)\?\([ab]\|\W\)\{1,2\}\1*\b*'
+## stdin-json: "aAb\n"
+## stdout-json: "0\n"
+## stderr-json: ""
+## status: 1
+
+#### a BACKREFERENCE switches grep to glibc's reading of the same pattern
+## argv: grep -c '\(a\)\1\b*'
+## stdin-json: "aa\n"
+## stdout-json: "0\n"
+## stderr-json: ""
+## status: 1
+
+#### so the operator is a literal there, exactly as sed reads it
+## argv: grep -c '\(.\)\1*\b*'
+## stdin-json: "a\naa\na*\nx*\n"
+## stdout-json: "2\n"
+## stderr-json: ""
+## status: 0
+
+#### while the same pattern WITHOUT one keeps grep's repeat reading
+## argv: grep -c '\(.\)\b*'
+## stdin-json: "a\naa\na*\nx*\n"
+## stdout-json: "4\n"
+## stderr-json: ""
+## status: 0
+
+#### a dropped token immediately before a paren is what grep refuses
+## argv: grep -Ec '(a\b*)'
+## stdin-json: "a\n"
+## stdout-json: ""
+## status: 2
+
+#### which the same token further from it is not
+## argv: grep -Ec '(\b*a)'
+## stdin-json: "a\n"
+## stdout-json: "1\n"
+## status: 0

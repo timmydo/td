@@ -41,13 +41,13 @@ fn bin() -> PathBuf {
 /// missing vendored `.inp`/`.good`, or a typo'd annotation reds in-loop — without
 /// depending on the behavioral run below.
 /// Raise this with the corpus; it exists to catch a corpus that SHRANK.
-const CORPUS_FLOOR: usize = 1156;
+const CORPUS_FLOOR: usize = 1243;
 
 #[test]
 fn corpus_is_well_formed() -> Result<(), Box<dyn std::error::Error>> {
     let cases = load_corpus(&spec_dir())?;
-    // A floor just under today's count: a vendored file that stops parsing, or a
-    // reader that starts skipping rows, shrinks the corpus silently otherwise.
+    // Today's count exactly: a vendored file that stops parsing, or a reader that
+    // starts skipping rows, shrinks the corpus silently otherwise.
     assert!(
         cases.len() >= CORPUS_FLOOR,
         "corpus shrank to {} cases (floor {CORPUS_FLOOR}) — is a vendored file missing or unparsed?",

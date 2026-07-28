@@ -119,10 +119,13 @@ td-txt-authored case files
       run `grep [-E] <flags> -e PAT file` under both binaries with LC_ALL=C, and
       compare status + stdout + stderr;
     - BUCKET the divergences before reading them. Raw counts are dominated by
-      noise: a deliberate refusal (`-b`), GNU's own `warning:` notices, and the
-      corner where a quantifier is applied to a zero-width assertion (`\<*`,
-      `\b?`) which POSIX leaves undefined and GNU itself warns about. Excluding
-      that corner is what took a run from ~450 divergences to 3, all real;
+      noise: a deliberate refusal (`-b`) and GNU's own `warning:` notices. The
+      quantifier-on-a-zero-width-assertion corner (`\<*`, `\b?`) used to belong on
+      that list -- excluding it took one run from ~450 divergences to 3 -- and no
+      longer does: it is modelled now, in all four dialects, and what remains is
+      recorded below. Bucketing it away is how one campaign hands the next a
+      corner nobody has read; the model that replaced it was got WRONG twice
+      first, both times by probing it through a single syntactic frame;
     - the bucket that matters is "both accepted the pattern and the ANSWERS
       differ". Everything else is a refusal-text question.
 
@@ -314,6 +317,55 @@ td-txt-authored case files
   last note claimed otherwise and a reviewer caught it; the probe is one line, so
   run it rather than reasoning by analogy from the bracket case.
 
+  A REPETITION OPERATOR needs something to repeat, and the two tools disagree
+  about what happens when it has nothing -- which is the first place their regex
+  grammars are not one grammar with two spellings. `Options::strict_repeats` is
+  that split (sed true, grep false); it is not a knob but which syntax bits glibc
+  was handed. A zero-width assertion is never something to repeat, so an operator
+  after one is in the same position as an operator after nothing at all:
+
+    * in a BRE the operator is then a LITERAL character -- `\B\?a` reads its `\?`
+      exactly as `\?a` does and selects the text `?a`, and `\B*a` selects `*a`.
+      grep says `warning: stray \ before ?` where sed says nothing, and neither
+      refuses. A leading `^` behaves the same way (`^*` selects lines starting
+      with `*`), which is the older rule this one generalizes;
+    * sed reads it that way ANYWHERE, not only at the start of a branch: `x\b*`
+      selects the `x*` in `x*y`, `[x]\b*` too, and a second operator quantifies
+      the LITERAL, so `q\b**` selects `q*` where `qa**` is refused. grep parts
+      company past the branch start and repeats the assertion instead (`x\B\+b`
+      selects `xb` and not `x b`);
+    * an INTERVAL is the exception: sed refuses `\{` with nothing to repeat
+      (`\{2\}a`, `\<\{2\}a`, `x\b\{2\}y`) where grep warns `stray \ before {` and
+      reads a literal brace, so `grep '\{2\}'` selects lines containing `{2}`;
+    * an ERE keeps its operators operators, so the two dialects part again: sed
+      refuses every one of them on an assertion -- `^*`, `^?`, `^{2}`, `$*`,
+      `\`*`, `\b+`, `\B*`, `\<*` -- mid-pattern included (`x\b*b`), which a group
+      around the assertion lifts (`(^)*a` compiles); grep REPEATS the assertion,
+      and asserting a position n times at one position asserts it once, so only
+      the lower bound survives: `\b*a` leaves nothing behind, `\b+a` still
+      anchors. An operator with nothing at all before it is DROPPED there rather
+      than made literal (`grep -E '*a'` is the pattern `a`), except that a branch
+      emptied by dropping may not close a group: `(*)` and `(a|*)` are an
+      unmatched `(` where `(*|a)` and `()` are fine. A brace grep cannot read as
+      an interval is a literal, content and all, so `-E '{}a'` selects `{}a`
+      while `-E 'a{}'` -- a brace WITH something to repeat -- is an error.
+
+  Stacking is otherwise unchanged and is the same two rules as before, both of
+  them SED's: its BRE refuses a second `*` or interval after ANY operator (`a**`,
+  `a\+*`, `a\{2\}*`, `\(a\)**`) while TAKING `\+` and `\?` there (`a*\+`, `a\?\?`),
+  and its ERE stacks all four freely (`a**`, `a+*`, `a{1,2}{1,2}`). grep refuses
+  none of them in either dialect.
+
+  A BACKREFERENCE names a group that must be in scope AND must have participated.
+  Out of scope is a compile error in both tools: a group whose `\)` is unreached
+  (`\(\1\)`, ERE `(\1)`), and a group in an EARLIER branch of an alternation the
+  reference is not in (`(a)|b\1`, `(a)|(b)\1`) -- the second becomes legal again
+  once the alternation closes, so `((a)|b)\2` compiles. Participation is a
+  matching rule instead: a group that matched zero times has no text and the
+  reference FAILS rather than matching the empty string it has no claim to, so
+  `(x)*\1` selects nothing in a line without an `x`, while `(x*)\1` -- a group
+  that matched empty on purpose -- matches.
+
   The gaps this campaign found and did NOT fix, recorded here so the next round
   starts from the probe results rather than re-deriving them. All but the first
   have corpus cases carrying GNU's goldens, listed as xfail; `--posix`'s two cases
@@ -371,13 +423,6 @@ td-txt-authored case files
     neighbouring shapes are NOT gaps: a text ending in an unpaired backslash is
     emitted raw, and a continuation collapses only across an `-e` boundary.
 
-  - A backreference to a group that is not CLOSED yet is `Invalid back reference`
-    in GNU and accepted here: `\(\1\)` matches everywhere, as does `\(a\(b\)\1\)`
-    and ERE `(\1)`. Naming a closed group from inside a later one is fine in both
-    (`\(\(a\)\2\)`), and a forward reference already errors here, so what is
-    missing is only that a group counts as nameable before its `\)`. Three xfail
-    cases; found re-fuzzing after the reviews, and unrelated to escapes.
-
   - What an escaped DELIMITER means, in three shapes that predate this campaign
     and share one cause: GNU's `match_slash` collapses `\<delim>` for EVERY
     delimiter, having special-cased a regex `\n` first, while td-txt decides from
@@ -391,29 +436,76 @@ td-txt-authored case files
     backslash, td-txt reports an unterminated regex. Four xfail cases. Fixing
     means porting `match_slash`'s condition rather than approximating it.
 
-  - A quantifier applied to a quantifier, or to a zero-width assertion. Fuzzing the
-    escape work above found it (a decoded `\x2a` is a `*`), but it has nothing to
-    do with escapes -- `sed 's/A**/-/'` shows it -- and it is a separate axis, so
-    it is recorded rather than folded in. Four rules, every one of them `Invalid
-    preceding regular expression` in GNU and accepted here:
+  - A backreference to a group under a repetition whose BODY can match empty,
+    which POSIX leaves undefined and where GNU's answers do not follow a rule.
+    Participation itself is modelled -- the body runs once so `^(x*)*\1$` and
+    `^(x*)?\1$` select an empty line while `^(x)*\1$` does not -- but GNU splits
+    the family in a way nothing here predicts: `*`, `?`, `{0,1}` and `{1}`
+    participate, and `+`, `{0,2}`, `{1,2}` and `{2}` do not, so GNU selects an
+    empty line for `^(x*)*\1$` and refuses it for `^(x*)+\1$`. Over the 81
+    body/quantifier/subject shapes probed, main answered 22 wrongly and this
+    landing answers 15, regressing none of them; the remaining 15 are that split.
+    Encoding it would be a lookup table keyed on the bounds with no principle
+    behind it, so what is implemented is the engine rule instead: an empty
+    iteration runs once, to record participation, and never twice.
 
-    * a BRE refuses a second `*` or interval after ANY operator (`a**`, `a\+*`,
-      `a\?*`, `a\{2\}*`, `\(a\)**`, `[ab]**`, `a\{2\}\{3\}`) while TAKING `\+`
-      and `\?` there: `a*\+`, `a\?\?` and `a\{2\}\+` all compile;
-    * an ERE stacks all four freely (`a**`, `a+*`, `a{1,2}{1,2}`) but refuses any
-      of them on a zero-width assertion -- `^*`, `^?`, `^{2}`, `$*`, `\`*`, `\'*`,
-      `\b+`, `\B*`, `\<*`, `\>*` -- mid-pattern included (`(a)^*b`), which a group
-      around the assertion lifts (`(^)*a` compiles);
-    * an INTERVAL on a zero-width assertion is refused in a BRE too (`\<\{2\}a`),
-      where a `*` on one is not;
-    * an ERE refuses an interval with nothing to repeat (`{2}a`); a BRE refuses
-      `\{2\}a` as well, and that one already agrees.
+  - A `$` before a BARE `|` in a BRE, where the pipe is an ordinary character
+    (`a|b` selects the text `a|b` in both tools). GNU stops reading the `$` as the
+    literal it is everywhere else: `grep 'x$|*'` selects a line `x` and NOT a line
+    `x$`, and sed's `s@x$|*@<&>@` matches NEITHER -- so the anchor reading and the
+    literal reading are each contradicted by one of the two, and no third reading
+    covers both. Fifteen probes, no model. At the START of a pattern the literal
+    reading holds and both tools agree (`s@$|*@<&>@` replaces the `$` in `a$`).
+    Six xfail cases carrying the goldens. This one is PRE-EXISTING -- the binary
+    built from the parent commit answers identically -- and it is a different
+    axis (when an anchor is an anchor); it is recorded here because a reviewer's
+    cross-product found it while reviewing this branch, not because this branch
+    caused it.
 
-    A leading `*` is a literal and quantifies normally, so `**a` and `^**a` both
-    compile in a BRE, and a quantifier INSIDE a group leaves the group unquantified
-    (`\(a*\)*`). One member of the family is semantic rather than a diagnostic and
-    will not be fixed by the parse rule alone: GNU compiles a BRE `\<*a` and then
-    matches NOTHING with it, where td-txt matches the `a`.
+  - A token grep DROPS for having nothing to repeat, sitting immediately before a
+    `)`. `(a\b*)`, `(\b*)`, `(z|\b*)` and `({)` are `Unmatched ( or \(` there and
+    td-txt compiles them, while `(\b*a)` and `(a{*)` -- the same tokens with
+    something after them -- are fine in both. So it is the `)`, not the group and
+    not the quantifier; the earlier draft of this entry said "inside a group" and
+    was wrong. Only `*`/`+`/`?` do it, never `{n}`. Pre-existing (main answers
+    identically), and it is the same rule this landing DID implement for a branch
+    emptied by dropping -- implementing it uniformly would close these xfails and
+    `({)` together.
+
+  - WHAT FOLLOWS a sed BRE assertion-plus-operator, where the parse rule above is
+    uniform and glibc's MATCHER is not. `s|x\b\?|<&>|` selects the `x?` in `x?y`
+    and `s|x\b\?y|<&>|` -- the same pattern with a `y` appended -- selects nothing
+    at all, from any input; so do `x\b\?[y]`, `x\b\?[qy]`, `x\b\?\w`, `x\b\?yz`
+    and `x\b\?y$`, while `x\b\?.`, `x\b\?y*` and `x\b\?[^q]` match. `x\b*$` and
+    `x\b*\'` fail too, so it is not a matter of the follower being mandatory or
+    single-byte -- an earlier draft of this entry said both and a reviewer showed
+    counterexamples in each direction. The follower decides and no property that
+    survives probing has been found: the nearest is "the follower can also match
+    the operator character" (`x\b*[*qy]` matches, `x\b*[qy]` does not), and
+    `x\b*.y` on `x*zy` breaks that too. Two xfail cases; 78 of the 2400 patterns
+    in the sed-BRE grid, the other three dialects being 0 of 2400 each.
+
+  - A BACKREFERENCE anywhere in a grep pattern, which switches the whole of it to
+    glibc's reading -- that is, to sed's. `grep '\(.\)\1*\b*'` selects exactly
+    what `sed 's|\(.\)\1*\b*|[&]|'` marks, while the same pattern WITHOUT the
+    `\1` selects every line, the repeat reading modelled above. The minimal
+    witness is `grep '\(a\)\1\b*'` on `aa`, which GNU does not select and
+    td-txt does; it holds in the ERE too. This is grep choosing between its own
+    dfa.c and glibc per PATTERN, and the same split shows up per INVOCATION:
+    `grep -o` uses glibc where `-c` and `-q` use the dfa, so GNU itself answers
+    `-c '\b*a'` and `-o '\b*a'` differently on `xab` -- the corpus pins `-c`,
+    and td-txt, having one engine, cannot satisfy both. Three cases carry the
+    goldens. The landing's own METHOD warning applies to its own model here: a
+    corner probed through one frame confirms whatever that frame implies.
+
+    This gap is where an earlier draft of this landing went wrong, and the shape
+    of the mistake is worth keeping. Every probe of the corner used a follower of
+    exactly that form (`x\B\?b`, `x\B\+*y`), so the quirk looked like the RULE:
+    the model became "the assertion and its operator collapse into an atom that
+    never matches, and a later zero-minimum operator brings the assertion back",
+    which fitted forty probes and was still wrong. Dropping the follower is what
+    showed it -- `x\b*` matches where `x\b*y` does not. A corner probed only
+    through one syntactic frame will confirm whatever that frame implies.
 
   Goldens are C-locale. Under LC_ALL=C — the only locale td's image sets, and what
   every case here was captured under — GNU `grep -w '\.*'` selects `.a`; under a

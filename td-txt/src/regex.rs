@@ -18,6 +18,10 @@
 
 /// A compile error. The message follows GNU's wording where the corpus asserts a
 /// diagnostic; callers prefix it with the program name.
+/// The one interval diagnostic that is NOT a brace grep can read as a literal:
+/// `-E '{32768}a'` is refused for its SIZE where `-E '{}a'` is text.
+const TOO_BIG: &str = "Regular expression too big";
+
 #[derive(Clone, Debug)]
 pub struct Error {
     pub msg: String,
@@ -44,6 +48,14 @@ impl std::error::Error for Error {}
 pub struct Options {
     pub ere: bool,
     pub icase: bool,
+    /// Whether a repetition operator with nothing to repeat, stacked on another,
+    /// or applied to a zero-width assertion is REFUSED. GNU sed refuses all three
+    /// (`Invalid preceding regular expression`) -- so `a**` is its BRE's error and
+    /// a quantified assertion its ERE's. GNU grep refuses NONE of them in either
+    /// dialect: it prints `warning: * at start of expression` and compiles, which
+    /// the vendored Spencer cases pin. Not a knob: it is which tool's syntax bits
+    /// glibc was handed.
+    pub strict_repeats: bool,
     /// POSIX REG_NEWLINE (sed's `M` flag), carrying the RECORD SEPARATOR it is
     /// relative to: `\n` normally, NUL under `-z`. GNU implements it as TWO
     /// mechanisms, and a pattern can tell them apart:
@@ -156,6 +168,28 @@ enum Node {
     },
 }
 
+/// One postfix repetition operator, as written.
+enum Op {
+    Star,
+    Plus,
+    Quest,
+    Interval(u32, Option<u32>),
+}
+
+/// Whether a node asserts a POSITION rather than consuming input. A repetition
+/// operator finds nothing to repeat in one, in either grammar.
+fn is_assertion(node: &Node) -> bool {
+    matches!(
+        node,
+        Node::Bol
+            | Node::Eol
+            | Node::BufStart
+            | Node::BufEnd
+            | Node::WordBoundary(_)
+            | Node::WordEdge(_)
+    )
+}
+
 /// A compiled pattern.
 #[derive(Clone, Debug)]
 pub struct Regex {
@@ -253,6 +287,15 @@ struct Parser<'a> {
     pos: usize,
     opts: Options,
     ngroups: usize,
+    /// Groups whose `)` has not been reached. A backreference may not name one:
+    /// GNU refuses `\(\1\)` as an invalid back reference, where naming a group
+    /// that HAS closed is fine from anywhere later in the pattern.
+    open: Vec<usize>,
+    /// Half-open group-number ranges belonging to EARLIER branches of the
+    /// alternations still open here. GNU refuses a backreference into one
+    /// (`(a)|b\1`), and allows the same reference once the alternation has
+    /// closed (`((a)|b)\2` compiles, and fails to match instead).
+    sibling: Vec<(usize, usize)>,
 }
 
 impl<'a> Parser<'a> {
@@ -308,9 +351,16 @@ impl<'a> Parser<'a> {
         if depth > MAX_NESTING {
             return Err(Error::new("regular expression is too complex"));
         }
+        let start = self.ngroups;
         let mut branches = vec![self.parse_concat(depth)?];
         while self.eat_op(b'|') {
-            branches.push(self.parse_concat(depth)?);
+            // Every group opened so far in THIS alternation belongs to a branch
+            // this one is not in, and is out of scope for a backreference until
+            // the alternation closes again.
+            self.sibling.push((start, self.ngroups));
+            let branch = self.parse_concat(depth);
+            self.sibling.pop();
+            branches.push(branch?);
         }
         if branches.len() == 1 {
             return branches.pop().ok_or_else(|| Error::new("empty alternation"));
@@ -338,10 +388,77 @@ impl<'a> Parser<'a> {
             if items.len() >= MAX_CONCAT {
                 return Err(Error::new("regular expression is too complex"));
             }
+            // An ERE has nothing to repeat at the START of a branch. sed refuses
+            // that; grep DROPS the operator, so `grep -E '*a'` is the pattern `a`
+            // and `-E '*+a'` still is. A BRE reads the same characters as literals
+            // in both tools (`sed 's/*a/-/'` matches `*a`). Only `*` and the
+            // interval are named here: `parse_atom` already refuses a leading ERE
+            // `+`/`?`, which grep's drop loop below consumes before reaching it.
+            if self.opts.ere && first {
+                if self.opts.strict_repeats {
+                    // A brace with nothing to repeat is refused for THAT, before its
+                    // content is judged: `-E '{}a'` is `Invalid preceding regular
+                    // expression` where `-E 'a{}'` is `Invalid content of \{\}`.
+                    let dup = match self.parse_interval() {
+                        Ok(found) => found.is_some(),
+                        Err(_) => true,
+                    };
+                    if self.peek() == Some(b'*') || dup {
+                        return Err(Error::new("Invalid preceding regular expression"));
+                    }
+                } else {
+                    let mut dropped = false;
+                    // An INTERVAL dropped here does not count for the group rule
+                    // below: `-E '({2})'` compiles where `-E '(*)'` does not.
+                    let mut dropped_op = false;
+                    loop {
+                        if matches!(self.peek(), Some(b'*' | b'+' | b'?')) {
+                            self.pos += 1;
+                            dropped = true;
+                            dropped_op = true;
+                            continue;
+                        }
+                        // A brace GNU cannot read as an interval is a literal here,
+                        // content and all: `grep -E '{}a'` selects the text `{}a`.
+                        // Its SIZE limit is not that kind of complaint and stands.
+                        let save = self.pos;
+                        match self.parse_interval() {
+                            Ok(Some(_)) => {
+                                dropped = true;
+                                continue;
+                            }
+                            Ok(None) => {}
+                            Err(e) if e.msg == TOO_BIG => return Err(e),
+                            Err(_) => self.pos = save,
+                        }
+                        break;
+                    }
+                    // A branch emptied by dropping cannot CLOSE a group: GNU reads
+                    // `(*)` and `(a|*)` as an unmatched `(`, where `(*|a)`, `()`
+                    // and a bare `*` are all fine.
+                    if dropped_op && depth > 0 && self.at_op(b')') {
+                        return Err(Error::new("Unmatched ( or \\("));
+                    }
+                    // What is left may be the end of the branch: `-E '*'` is empty.
+                    if dropped {
+                        continue;
+                    }
+                }
+            }
             let atom = self.parse_atom(depth, first, bol_ok)?;
-            let anchor = !self.opts.ere && first && matches!(atom, Node::Bol);
-            let atom = if anchor { atom } else { self.parse_repeats(atom)? };
-            first = anchor;
+            // An assertion is not something to repeat, so it does not give a
+            // following operator one either. In a BRE that makes the operator a
+            // LITERAL: GNU reads `\B\?a` the way it reads `\?a`, and `x\b*` selects
+            // the `x*` in `x*y`. sed reads it that way ANYWHERE; grep only at the
+            // start of a branch, repeating the assertion past it. An ERE keeps its
+            // operators operators in both.
+            let assertion = is_assertion(&atom);
+            let bare = assertion && !self.opts.ere && (self.opts.strict_repeats || first);
+            let atom = match bare {
+                true => atom,
+                false => self.parse_repeats(atom)?,
+            };
+            first = first && assertion;
             bol_ok = false;
             items.push(atom);
         }
@@ -352,46 +469,98 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// Apply every postfix repetition operator that follows an atom (`a**` and
-    /// `a*\{2\}` are legal stacked operators in GNU's grammar).
-    fn parse_repeats(&mut self, mut atom: Node) -> Result<Node, Error> {
-        loop {
-            if self.eat(b'*') {
-                atom = Node::Repeat { node: Box::new(atom), min: 0, max: None };
-                continue;
-            }
-            if self.opts.ere && self.peek() == Some(b'+') {
-                self.pos += 1;
-                atom = Node::Repeat { node: Box::new(atom), min: 1, max: None };
-                continue;
-            }
-            if self.opts.ere && self.peek() == Some(b'?') {
-                self.pos += 1;
-                atom = Node::Repeat { node: Box::new(atom), min: 0, max: Some(1) };
-                continue;
-            }
-            // GNU BRE: `\+` and `\?` are the one-or-more / optional operators.
-            if !self.opts.ere && self.peek() == Some(b'\\') {
-                match self.peek_at(1) {
-                    Some(b'+') => {
-                        self.pos += 2;
-                        atom = Node::Repeat { node: Box::new(atom), min: 1, max: None };
-                        continue;
-                    }
-                    Some(b'?') => {
-                        self.pos += 2;
-                        atom = Node::Repeat { node: Box::new(atom), min: 0, max: Some(1) };
-                        continue;
-                    }
-                    _ => {}
-                }
-            }
-            if let Some(node) = self.parse_interval(&atom)? {
-                atom = node;
-                continue;
-            }
-            return Ok(atom);
+    /// The next postfix repetition operator, consumed. `None` when what follows is
+    /// not one in this dialect.
+    fn next_op(&mut self) -> Result<Option<Op>, Error> {
+        if self.peek() == Some(b'*') {
+            self.pos += 1;
+            return Ok(Some(Op::Star));
         }
+        if self.opts.ere && matches!(self.peek(), Some(b'+' | b'?')) {
+            let plus = self.peek() == Some(b'+');
+            self.pos += 1;
+            return Ok(Some(match plus {
+                true => Op::Plus,
+                false => Op::Quest,
+            }));
+        }
+        // GNU BRE: `\+` and `\?` are the one-or-more / optional operators, and are
+        // the two a second operator may follow.
+        if !self.opts.ere && self.peek() == Some(b'\\') {
+            match self.peek_at(1) {
+                Some(b'+') => {
+                    self.pos += 2;
+                    return Ok(Some(Op::Plus));
+                }
+                Some(b'?') => {
+                    self.pos += 2;
+                    return Ok(Some(Op::Quest));
+                }
+                _ => {}
+            }
+        }
+        match self.parse_interval()? {
+            Some((min, max)) => Ok(Some(Op::Interval(min, max))),
+            None => Ok(None),
+        }
+    }
+
+    /// One repetition operator applied to a zero-width assertion, which only grep's
+    /// BRE past the start of a branch, and both ERE dialects, ever reach: sed's BRE
+    /// hands the operator back as a literal, and sed's ERE refuses it. grep repeats
+    /// the assertion itself, and asserting a position n times at one position
+    /// asserts it once, so only the lower bound survives -- vacuous when the
+    /// assertion may hold zero times, otherwise whatever is already there
+    /// (`x\B\+b` selects `xb` and not `x b`).
+    fn quantified_assertion(atom: Node, min: u32) -> Node {
+        match min {
+            0 => Node::Empty,
+            _ => atom,
+        }
+    }
+
+    /// Apply every postfix repetition operator that follows an atom. Neither
+    /// grammar is the permissive one. A BRE refuses a second `*` or interval after
+    /// ANY operator (`a**`, `a\{2\}*`, `\(a\)**`) while taking `\+` and `\?`
+    /// there (`a*\+` and `a\?\?` compile). An ERE stacks all four freely, but sed
+    /// refuses every one of them on a zero-width assertion (`^*`, `\b+`).
+    /// A zero-width atom reaches here only from grep's BRE past the start of a
+    /// branch, or from either ERE; sed's BRE hands the operator back as a literal
+    /// before the call.
+    fn parse_repeats(&mut self, mut atom: Node) -> Result<Node, Error> {
+        let zero_width = is_assertion(&atom);
+        // A brace on an assertion has nothing to repeat, and sed reports THAT
+        // before it reads the brace at all: `-E '^{}'`, `-E '^{2,1}'` and even
+        // `-E '^{a}'` -- which after any other atom would be a literal -- are all
+        // `Invalid preceding regular expression`, where `-E 'a{}'` is content.
+        if self.opts.strict_repeats && zero_width && self.at_op(b'{') {
+            return Err(Error::new("Invalid preceding regular expression"));
+        }
+        let mut repeated = false;
+        while let Some(op) = self.next_op()? {
+            let stacked = match op {
+                Op::Star => (self.opts.ere && zero_width) || (!self.opts.ere && repeated),
+                Op::Plus | Op::Quest => self.opts.ere && zero_width,
+                Op::Interval(..) => zero_width || (!self.opts.ere && repeated),
+            };
+            if self.opts.strict_repeats && stacked {
+                return Err(Error::new("Invalid preceding regular expression"));
+            }
+            let (min, max) = match op {
+                Op::Star => (0, None),
+                Op::Plus => (1, None),
+                Op::Quest => (0, Some(1)),
+                Op::Interval(min, max) => (min, max),
+            };
+            if zero_width {
+                atom = Self::quantified_assertion(atom, min);
+                repeated = false;
+                continue;
+            }
+            atom = Node::Repeat { node: Box::new(atom), min, max };
+            repeated = true;
+        }
+        Ok(atom)
     }
 
     /// Whether a `\}` closes the interval opened before `pos`. Only the BRE
@@ -415,7 +584,7 @@ impl<'a> Parser<'a> {
 
     /// `{n}`, `{n,}`, `{n,m}` (ERE) / `\{…\}` (BRE). Returns `None` when what
     /// follows is not an interval at all, which in ERE means a literal `{`.
-    fn parse_interval(&mut self, atom: &Node) -> Result<Option<Node>, Error> {
+    fn parse_interval(&mut self) -> Result<Option<(u32, Option<u32>)>, Error> {
         let save = self.pos;
         if !self.eat_op(b'{') {
             return Ok(None);
@@ -466,13 +635,9 @@ impl<'a> Parser<'a> {
             }
         }
         if min > RE_DUP_MAX || max.is_some_and(|m| m > RE_DUP_MAX) {
-            return Err(Error::new("Regular expression too big"));
+            return Err(Error::new(TOO_BIG));
         }
-        if matches!(atom, Node::Bol | Node::Eol | Node::BufStart | Node::BufEnd) {
-            // `^\{1\}` — GNU rejects a repeated anchor in BRE.
-            return Err(Error::new("Invalid preceding regular expression"));
-        }
-        Ok(Some(Node::Repeat { node: Box::new(atom.clone()), min, max }))
+        Ok(Some((min, max)))
     }
 
     fn parse_number(&mut self) -> Option<u32> {
@@ -529,7 +694,10 @@ impl<'a> Parser<'a> {
             b'(' if self.opts.ere => {
                 self.ngroups += 1;
                 let idx = self.ngroups;
-                let inner = self.parse_alt(depth + 1)?;
+                self.open.push(idx);
+                let inner = self.parse_alt(depth + 1);
+                self.open.pop();
+                let inner = inner?;
                 if !self.eat(b')') {
                     return Err(Error::new("Unmatched ( or \\("));
                 }
@@ -560,20 +728,30 @@ impl<'a> Parser<'a> {
             b'(' if !self.opts.ere => {
                 self.ngroups += 1;
                 let idx = self.ngroups;
-                let inner = self.parse_alt(depth + 1)?;
+                self.open.push(idx);
+                let inner = self.parse_alt(depth + 1);
+                self.open.pop();
+                let inner = inner?;
                 if !self.eat_op(b')') {
                     return Err(Error::new("Unmatched ( or \\("));
                 }
                 Ok(Node::Group(idx, Box::new(inner)))
             }
             b')' if !self.opts.ere => Err(Error::new("Unmatched ) or \\)")),
-            b'{' if !self.opts.ere => Err(Error::new("Invalid preceding regular expression")),
+            // An interval reaching here has nothing to repeat (`\{2\}a`, `\<\{2\}a`).
+            // sed refuses that; grep warns `stray \ before {` and reads the brace as
+            // the character, so `grep '\{2\}'` matches the text `{2}`.
+            b'{' if !self.opts.ere => match self.opts.strict_repeats {
+                true => Err(Error::new("Invalid preceding regular expression")),
+                false => Ok(self.literal(b'{')),
+            },
             // An interval consumes its own `\}`, so one reaching here closes nothing
             // and GNU reads it as the character: `s/a\}/-/` matches `a}`.
             b'}' if !self.opts.ere => Ok(self.literal(b'}')),
             b'1'..=b'9' => {
                 let n = usize::from(b - b'0');
-                if n > self.ngroups {
+                let sibling = self.sibling.iter().any(|(lo, hi)| n > *lo && n <= *hi);
+                if n > self.ngroups || self.open.contains(&n) || sibling {
                     return Err(Error::new("Invalid back reference"));
                 }
                 Ok(Node::Backref(n))
@@ -753,7 +931,8 @@ const STEP_BUDGET: u64 = 40_000_000;
 
 impl Regex {
     pub fn compile(pattern: &[u8], opts: Options) -> Result<Self, Error> {
-        let mut p = Parser { pat: pattern, pos: 0, opts, ngroups: 0 };
+        let mut p =
+            Parser { pat: pattern, pos: 0, opts, ngroups: 0, open: Vec::new(), sibling: Vec::new() };
         let root = p.parse_alt(0)?;
         if p.pos < pattern.len() {
             // Only an unbalanced `)` can stop the top-level parse early.
@@ -1225,8 +1404,10 @@ fn m(st: &mut State, node: &Node, pos: usize, k: &mut dyn FnMut(&mut State, usiz
         }
         Node::Backref(n) => {
             let Some((s, e)) = st.caps.get(*n).copied().flatten() else {
-                // An unset group matches the empty string, as glibc does.
-                return k(st, pos);
+                // A group that did not PARTICIPATE has no text, and GNU makes the
+                // reference fail rather than match the empty string it has no claim
+                // to: `(x)*\1` matches nothing in a line without an `x`.
+                return false;
             };
             let len = e.saturating_sub(s);
             if pos + len > st.hay.len() {
@@ -1374,6 +1555,14 @@ fn m_repeat(
         return true;
     }
     if count >= min {
+        // A body that matches EMPTY still PARTICIPATES, and that is observable
+        // now that an unset group makes a backreference fail: `^(x*)*\1$` selects
+        // an empty line because the group ran once and captured the empty string,
+        // where never running it leaves `\1` with nothing to name. Once only -- a
+        // second iteration could not progress either.
+        if count == 0 && may_more && m(st, node, pos, &mut |st, next| next == pos && k(st, pos)) {
+            return true;
+        }
         return k(st, pos);
     }
     // The minimum is not met yet, but an EMPTY-matching body still satisfies it:
@@ -1404,6 +1593,41 @@ mod tests {
 
     fn matched(re: &Regex, s: &str) -> bool {
         re.is_match(s.as_bytes()).unwrap()
+    }
+
+    /// `Options::default()` is grep's grammar, so every helper above tests only
+    /// that one. These two compile sed's.
+    fn sed_bre(pat: &str) -> Result<Regex, Error> {
+        Regex::compile(pat.as_bytes(), Options { strict_repeats: true, ..Options::default() })
+    }
+
+    fn sed_ere(pat: &str) -> Result<Regex, Error> {
+        Regex::compile(
+            pat.as_bytes(),
+            Options { ere: true, strict_repeats: true, ..Options::default() },
+        )
+    }
+
+    /// The three places `strict_repeats` changes an ANSWER rather than a
+    /// diagnostic, none of which the grep-shaped helpers above can reach.
+    #[test]
+    fn seds_grammar_differs_from_greps_where_nothing_is_repeatable() {
+        // An operator after an assertion is a literal ANYWHERE in sed's BRE,
+        // where grep repeats the assertion past the start of a branch.
+        assert!(matched(&sed_bre("x\\b*").unwrap(), "x*y"), "sed reads a literal star");
+        // Both dialects select `x*y` for that one, by different readings and over
+        // different spans; `\B\+` is where the two readings disagree outright.
+        assert!(!matched(&sed_bre("x\\B\\+b").unwrap(), "xb"), "a literal + needs one");
+        assert!(matched(&bre("x\\B\\+b"), "xb"), "grep asserts the boundary instead");
+        // Stacking, and an interval with nothing to repeat, are sed's refusals.
+        assert!(sed_bre("a**").is_err());
+        assert!(bre("a**").is_match(b"a").unwrap());
+        assert!(sed_bre("\\{2\\}a").is_err());
+        // An assertion may not be quantified at all in sed's ERE, and a brace on
+        // one is refused before it is read.
+        assert!(sed_ere("x\\b*b").is_err());
+        assert!(sed_ere("^{a}").is_err());
+        assert!(sed_ere("a{a}").is_ok(), "the same brace after an atom is a literal");
     }
 
     #[test]

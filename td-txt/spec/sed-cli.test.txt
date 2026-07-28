@@ -4992,12 +4992,54 @@ f$
 ## stderr-contains: Invalid preceding regular expression
 ## status: 1
 
-#### a star on one compiles, and then matches nothing
-## argv: sed 's/\<*a/-/'
-## stdin-json: "aAb\n"
-## stdout-json: "aAb\n"
+#### while a star there is a literal, not an operator at all
+## argv: sed 's/\B*a/-/'
+## stdin-json: "*a\n"
+## stdout-json: "-\n"
 ## stderr-json: ""
 ## status: 0
+
+#### a BRE operator after a leading assertion is a literal, as after nothing
+## argv: sed 's/\B\?a/-/'
+## stdin-json: "?ab\n"
+## stdout-json: "-b\n"
+## stderr-json: ""
+## status: 0
+
+#### which is visible only where the literal can match
+## argv: sed 's/\B\+a/-/'
+## stdin-json: "+ab\n"
+## stdout-json: "-b\n"
+## stderr-json: ""
+## status: 0
+
+#### and holds after a bar
+## argv: sed 's/a\|\B\?b/-/'
+## stdin-json: "?b\n"
+## stdout-json: "-\n"
+## stderr-json: ""
+## status: 0
+
+#### and inside a group
+## argv: sed 's/\(\B\?b\)/-/'
+## stdin-json: "?b\n"
+## stdout-json: "-\n"
+## stderr-json: ""
+## status: 0
+
+#### an ERE refuses a quantified assertion as it refuses a quantified anchor
+## argv: sed -E 's/\b*a/-/'
+## stdin-json: "ab\n"
+## stdout-json: ""
+## stderr-contains: Invalid preceding regular expression
+## status: 1
+
+#### and refuses it past the start of a branch too
+## argv: sed -E 's/x\b*b/-/'
+## stdin-json: "xb\n"
+## stdout-json: ""
+## stderr-contains: Invalid preceding regular expression
+## status: 1
 
 #### an ERE refuses an interval with nothing to repeat
 ## argv: sed '-E' 's/{2}a/-/'
@@ -5264,3 +5306,227 @@ f$
 ## stdout-json: "X\nA\nB\n"
 ## stderr-json: ""
 ## status: 0
+
+#### an ERE branch after a bar has nothing to repeat either
+## argv: sed '-E' 's/b|*a/-/'
+## stdin-json: "aAb\n"
+## stdout-json: ""
+## stderr-contains: Invalid preceding regular expression
+## status: 1
+
+#### nor has one inside a group
+## argv: sed '-E' 's/(*a)/-/'
+## stdin-json: "aAb\n"
+## stdout-json: ""
+## stderr-contains: Invalid preceding regular expression
+## status: 1
+
+#### an interval after a plus is refused like one after a star
+## argv: sed 's/a\+\{2\}/-/'
+## stdin-json: "aAb\n"
+## stdout-json: ""
+## stderr-contains: Invalid preceding regular expression
+## status: 1
+
+#### a backreference into the group it lives in, via a bar
+## argv: sed 's/\(a\|\1\)/-/'
+## stdin-json: "aAb\n"
+## stdout-json: ""
+## stderr-contains: Invalid back reference
+## status: 1
+
+#### and the ERE spelling of that
+## argv: sed '-E' 's/(a|\1)/-/'
+## stdin-json: "aAb\n"
+## stdout-json: ""
+## stderr-contains: Invalid back reference
+## status: 1
+
+#### a plus after a star is still fine
+## argv: sed 's/a*\+/-/'
+## stdin-json: "aAb\n"
+## stdout-json: "-Ab\n"
+## stderr-json: ""
+## status: 0
+
+#### a backreference to a group that matched zero times matches nothing
+## argv: sed 's|\(x\)*\1|<&>|'
+## stdin-json: "ab\n"
+## stdout-json: "ab\n"
+## stderr-json: ""
+## status: 0
+
+#### nor does an optional group that did not take
+## argv: sed -E 's|(x)?\1|<&>|'
+## stdin-json: "ab\n"
+## stdout-json: "ab\n"
+## stderr-json: ""
+## status: 0
+
+#### though the same group matching empty ON PURPOSE does
+## argv: sed -E 's|(x*)\1|<&>|'
+## stdin-json: "ab\n"
+## stdout-json: "<>ab\n"
+## stderr-json: ""
+## status: 0
+
+#### and a group that did take is referenced normally
+## argv: sed -E 's|(x)*\1|<&>|'
+## stdin-json: "axxb\n"
+## stdout-json: "a<xx>b\n"
+## stderr-json: ""
+## status: 0
+
+#### a backreference into an EARLIER branch of an alternation is refused
+## argv: sed -E 's/(a)|b\1/</'
+## stdin-json: "ab\n"
+## stdout-json: ""
+## stderr-contains: Invalid back reference
+## status: 1
+
+#### and the BRE spelling of that
+## argv: sed 's/\(a\)\|b\1/</'
+## stdin-json: "ab\n"
+## stdout-json: ""
+## stderr-contains: Invalid back reference
+## status: 1
+
+#### naming a group in the branch it lives in is fine
+## argv: sed -E 's/(a)\1|b/</'
+## stdin-json: "aab\n"
+## stdout-json: "<b\n"
+## stderr-json: ""
+## status: 0
+
+#### as is naming the group of the branch the reference is in
+## argv: sed -E 's/(a)|(b)\2/</'
+## stdin-json: "ab\n"
+## stdout-json: "<b\n"
+## stderr-json: ""
+## status: 0
+
+#### and once the alternation closes the reference is legal again
+## argv: sed -E 's/((a)|b)\2/</'
+## stdin-json: "ab\n"
+## stdout-json: "ab\n"
+## stderr-json: ""
+## status: 0
+
+#### though it then matches nothing when that branch did not run
+## argv: sed -E 's/((a)|b)\2/</'
+## stdin-json: "baa\n"
+## stdout-json: "b<\n"
+## stderr-json: ""
+## status: 0
+
+#### a dollar before a bare pipe is not the literal it looks like
+## argv: sed 's@x$|*@<&>@'
+## stdin-json: "x$\n"
+## stdout-json: "x$\n"
+## stderr-json: ""
+## status: 0
+
+#### nor does it anchor: GNU matches nothing here at all
+## argv: sed 's@x$|*@<&>@'
+## stdin-json: "x\n"
+## stdout-json: "x\n"
+## stderr-json: ""
+## status: 0
+
+#### at the start of the pattern it IS the literal, and that one agrees
+## argv: sed 's@$|*@<&>@'
+## stdin-json: "a$\n"
+## stdout-json: "a<$>\n"
+## stderr-json: ""
+## status: 0
+
+#### and past the start of a branch too, which is where sed and grep part
+## argv: sed 's|x\b*|<&>|'
+## stdin-json: "x*y\n"
+## stdout-json: "<x*>y\n"
+## stderr-json: ""
+## status: 0
+
+#### a plus reads the same way there
+## argv: sed 's|x\b\+|<&>|'
+## stdin-json: "x+y\n"
+## stdout-json: "<x+>y\n"
+## stderr-json: ""
+## status: 0
+
+#### and a question mark
+## argv: sed 's|x\b\?|<&>|'
+## stdin-json: "x?y\n"
+## stdout-json: "<x?>y\n"
+## stderr-json: ""
+## status: 0
+
+#### the atom before the assertion does not matter
+## argv: sed 's|[x]\b*|<&>|'
+## stdin-json: "x*y\n"
+## stdout-json: "<x*>y\n"
+## stderr-json: ""
+## status: 0
+
+#### nor does a second operator, which quantifies the literal
+## argv: sed 's|x\b*\+|<&>|'
+## stdin-json: "x*y\n"
+## stdout-json: "<x*>y\n"
+## stderr-json: ""
+## status: 0
+
+#### so a star may follow a star here, where `a**` is refused
+## argv: sed 's|q\b**|<&>|'
+## stdin-json: "q*ab\n"
+## stdout-json: "<q*>ab\n"
+## stderr-json: ""
+## status: 0
+
+#### an interval is still the exception and is refused
+## argv: sed 's|x\b\{2\}y|<&>|'
+## stdin-json: "xy\n"
+## stdout-json: ""
+## stderr-contains: Invalid preceding regular expression
+## status: 1
+
+#### but a MANDATORY single-byte matcher after the pair matches nothing at all
+## argv: sed 's|x\b\?y|<&>|'
+## stdin-json: "x?y\n"
+## stdout-json: "x?y\n"
+## stderr-json: ""
+## status: 0
+
+#### which a bracket spells the same way
+## argv: sed 's|x\b\?[y]|<&>|'
+## stdin-json: "x?y\n"
+## stdout-json: "x?y\n"
+## stderr-json: ""
+## status: 0
+
+#### while any other follower matches, on the same input
+## argv: sed 's|x\b\?.|<&>|'
+## stdin-json: "x?y\n"
+## stdout-json: "<x?y>\n"
+## stderr-json: ""
+## status: 0
+
+#### including one that can match empty
+## argv: sed 's|x\b\?y*|<&>|'
+## stdin-json: "x?y\n"
+## stdout-json: "<x?y>\n"
+## stderr-json: ""
+## status: 0
+
+#### a brace on an assertion is refused before it is even read
+## argv: sed -E 's/^{a}/-/'
+## stdin-json: "a{a}\n"
+## stdout-json: ""
+## stderr-contains: Invalid preceding regular expression
+## status: 1
+
+#### where the same brace after an ordinary atom is content
+## argv: sed -E 's/a{}/-/'
+## stdin-json: "a{a}\n"
+## stdout-json: ""
+## stderr-contains: Invalid content
+## status: 1

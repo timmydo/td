@@ -838,6 +838,9 @@ fn compile(conf: &Conf, lines: &[Vec<u8>]) -> Result<Patterns, String> {
     let opts = Options {
         ere: conf.syntax == Syntax::Extended,
         icase: conf.icase,
+        // grep warns and compiles where sed refuses: `grep -E '*a'` is `warning: *
+        // at start of expression` and a working pattern, which spencer1 pins.
+        strict_repeats: false,
         // GNU grep never sets REG_NEWLINE, not even under `-z`, where a record can
         // hold newlines: `grep -z 'a.c'` matches across one and `-z '^c'` does not
         // anchor after one. sed's `M` is the only way into that rule.

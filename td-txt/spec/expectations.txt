@@ -26,7 +26,18 @@ xfail grep-cli.test.txt::-w over sliding greedy repeats on a long line
 xfail grep-cli.test.txt::-o -w prints a shrunk span only at the first search position
 xfail grep-cli.test.txt::-o -w skips two shrinkable spans in the middle of the line
 xfail grep-cli.test.txt::-o -w after a shrunk span at the line start
-xfail sed-cli.test.txt::a backreference to a group that did not participate does not match
+xfail grep-cli.test.txt::a dollar before a bare pipe anchors in grep, where the pipe is a literal
+xfail grep-cli.test.txt::so the text it looks like it wants is what it does NOT select
+xfail grep-cli.test.txt::and the same at the start of a pattern
+xfail grep-cli.test.txt::grep refuses a quantified assertion INSIDE a group, which td accepts
+xfail grep-cli.test.txt::an anchor spells it the same way
+xfail grep-cli.test.txt::and a word boundary too
+xfail grep-cli.test.txt::a fuzz composite that diverges where each of its parts agrees
+xfail grep-cli.test.txt::and the dropped interval does not make its group participate
+xfail grep-cli.test.txt::a second fuzz composite in the same family
+xfail grep-cli.test.txt::a BACKREFERENCE switches grep to glibc's reading of the same pattern
+xfail grep-cli.test.txt::so the operator is a literal there, exactly as sed reads it
+xfail grep-cli.test.txt::a dropped token immediately before a paren is what grep refuses
 xfail sed-cli.test.txt::without -s a failure on the FIRST operand outranks the quit code too
 xfail sed-cli.test.txt::and q5 reports it rather than 5
 xfail sed-cli.test.txt::q stops before a later operand is opened, so it is never reported
@@ -38,20 +49,10 @@ xfail sed-cli.test.txt::a w target that will not open is exit 4 even behind a Q
 xfail sed-cli.test.txt::a w target that will not open outranks a LATER script error
 xfail sed-cli.test.txt::F names the file GNU's $ lookahead has already opened
 xfail sed-cli.test.txt::\c at the end of a text controls the text's own terminator
-xfail sed-cli.test.txt::a doubled star is a script error in a BRE
-xfail sed-cli.test.txt::as is a star after any other quantifier
-xfail sed-cli.test.txt::and an interval after one
-xfail sed-cli.test.txt::a group counts as quantified for that rule
-xfail sed-cli.test.txt::so does a bracket list
-xfail sed-cli.test.txt::but an ERE refuses a quantifier on an anchor
-xfail sed-cli.test.txt::including a star on a dollar
-xfail sed-cli.test.txt::an interval on a zero-width assertion is refused in a BRE too
-xfail sed-cli.test.txt::a star on one compiles, and then matches nothing
-xfail sed-cli.test.txt::an ERE refuses an interval with nothing to repeat
 xfail sed-cli.test.txt::an escaped ALPHANUMERIC delimiter is still just the delimiter
 xfail sed-cli.test.txt::the same in an address
 xfail sed-cli.test.txt::an escaped & delimiter keeps its backslash in a replacement
 xfail sed-cli.test.txt::a backslash may not be an address delimiter
-xfail sed-cli.test.txt::a backreference to a group still OPEN is invalid
-xfail sed-cli.test.txt::including from inside a nested group
-xfail sed-cli.test.txt::and an ERE says the same
+xfail sed-cli.test.txt::a dollar before a bare pipe is not the literal it looks like
+xfail sed-cli.test.txt::but a MANDATORY single-byte matcher after the pair matches nothing at all
+xfail sed-cli.test.txt::which a bracket spells the same way

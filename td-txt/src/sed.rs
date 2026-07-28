@@ -267,6 +267,7 @@ impl ScriptParser<'_> {
         let opts = Options {
             ere: self.ere,
             icase,
+            strict_repeats: true,
             reg_newline: multiline.then_some(separator_for(self.null_data)),
         };
         let re = Regex::compile(&normalize_regex(raw)?, opts)
