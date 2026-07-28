@@ -1674,37 +1674,62 @@ pub fn cli(args: &[String]) -> ExitCode {
 mod tests {
     use super::*;
 
-    /// Every compiled gate_def that builds the evaluator must propagate that
-    /// build's exit status. `tests/recipe-eval-tool.sh` exits 69 with the
-    /// unprovisioned sentinel when no toolchain is reachable in the jail, and
-    /// run_gate reads exactly that as a tolerated SKIP; a command substitution
-    /// that drops the status leaves TD_RECIPE_EVAL empty, so the gate execs an
-    /// empty path and dies 126 — RED where the contract says skip.
+    /// Every compiled gate_def that resolves the evaluator must propagate that
+    /// step's exit status. It exits 69 with the unprovisioned sentinel when no
+    /// toolchain is reachable in the jail, and run_gate reads exactly that as a
+    /// tolerated SKIP; a command substitution that drops the status leaves
+    /// TD_RECIPE_EVAL empty, so the gate execs an empty name and dies 126 under
+    /// the jail's busybox ash — RED where the contract says skip.
     ///
     /// The rule is unconditional, with no `set -e` exemption: whether errexit is
     /// in force at the call is not decidable from the line (a later `set +e`, a
-    /// `||` context, or a subshell all suspend it) and a substring test for it is
-    /// satisfied by a comment. Scope is the compiled registry — the synthesized
-    /// build-recipes node's body is not covered here.
+    /// `||` context, or a subshell all suspend it). Scope is the compiled
+    /// registry — the synthesized build-recipes node's body is not covered here.
+    ///
+    /// Both spellings are checked so the rule cannot go vacuous: the gates route
+    /// through `recipe-eval-place` now, and a future one reaching for the tool
+    /// script directly must still propagate.
     #[test]
     fn a_gate_that_builds_the_evaluator_propagates_its_exit_status() {
+        let mut resolvers = std::collections::BTreeSet::new();
         for (stem, def) in defs() {
             for line in def.script.lines() {
-                // Only what FOLLOWS the invocation can propagate it: these scripts
-                // put several `;`-separated commands on one physical line, so an
-                // earlier command's `|| exit $?` must not vouch for this one.
-                let Some((_, after)) = line.split_once("recipe-eval-tool.sh") else {
+                // A comment naming the verb is prose, not an invocation: auditing
+                // one would fail on a sentence, and counting one would let a real
+                // resolution go missing under the floor below.
+                if line.trim_start().starts_with('#') {
                     continue;
-                };
-                assert!(
-                    after.contains("|| exit $?"),
-                    "src/gate_defs/{stem}.rs runs recipe-eval-tool.sh without propagating its \
-                     exit status:\n    {}\nA 69 (unprovisioned) then reds the gate instead of \
-                     skipping it. Add `|| exit $?` — `set -e` does not count.",
-                    line.trim()
-                );
+                }
+                // EVERY occurrence is audited, not just the first, and each is
+                // judged on its own command — these scripts put several
+                // `;`-separated commands on one physical line, so neither an
+                // earlier command's `|| exit $?` nor a later one may vouch for it.
+                for tok in ["recipe-eval-place", "recipe-eval-tool.sh"] {
+                    for (at, _) in line.match_indices(tok) {
+                        let rest = line.get(at + tok.len()..).unwrap_or("");
+                        let cmd = rest.split_once(';').map_or(rest, |(c, _)| c);
+                        resolvers.insert(stem.clone());
+                        assert!(
+                            cmd.contains("|| exit $?"),
+                            "src/gate_defs/{stem}.rs resolves td-recipe-eval without \
+                             propagating its exit status:\n    {}\nA 69 (unprovisioned) then \
+                             reds the gate instead of skipping it. Add `|| exit $?` — `set -e` \
+                             does not count.",
+                            line.trim()
+                        );
+                    }
+                }
             }
         }
+        // The ladder gates that resolve an evaluator are 360/364/414/422/426.
+        // Counted by STEM, so no amount of prose in one gate can stand in for
+        // another that stopped resolving — the rule cannot quietly go vacuous.
+        assert!(
+            resolvers.len() >= 5,
+            "only {} gate defs resolve td-recipe-eval ({resolvers:?}); the rule is guarding \
+             less than it was written for",
+            resolvers.len()
+        );
     }
 
     #[test]

@@ -138,6 +138,20 @@ fn forward_to_stderr(out: &std::process::Output) {
     let _ = err.write_all(&out.stderr);
 }
 
+/// Tag a failed child's message as a provisioning gap only on gate-run's OWN
+/// two-part test: code 69 AND the sentinel `unprovisioned_exit` prints on its way
+/// out. The verb re-emits that sentinel downstream, so trusting the code alone
+/// would let any other 69 mint one and turn a regression into a tolerated skip.
+fn tag_child_failure(out: &std::process::Output, msg: String) -> String {
+    let sentinel = crate::check_loop::UNPROVISIONED_SENTINEL;
+    let saw_sentinel = String::from_utf8_lossy(&out.stderr).contains(sentinel)
+        || String::from_utf8_lossy(&out.stdout).contains(sentinel);
+    if out.status.code() == Some(crate::check_loop::EXIT_UNPROVISIONED) && saw_sentinel {
+        return format!("{}{msg}", crate::check_loop::UNPROVISIONED_TAG);
+    }
+    msg
+}
+
 /// Why [`provision_rust`]/[`provision_cc`] could not return a toolchain. The two
 /// cases map to DIFFERENT exit codes so an in-jail compile gate can tell "nothing
 /// to run here" from "a real failure", instead of silencing both as a skip:
@@ -826,12 +840,7 @@ pub(crate) fn recipe_eval_place(root: &Path, base: &Path) -> Result<String, Stri
     if !out.status.success() {
         forward_to_stderr(&out);
         let msg = "recipe-eval-tool.sh could not build td-recipe-eval (see stderr)".to_string();
-        // Keep the script's 69 TYPED: an absent toolchain is the tolerated skip,
-        // not a regression, and the verb must re-raise it rather than red.
-        if out.status.code() == Some(crate::check_loop::EXIT_UNPROVISIONED) {
-            return Err(format!("{}{msg}", crate::check_loop::UNPROVISIONED_TAG));
-        }
-        return Err(msg);
+        return Err(tag_child_failure(&out, msg));
     }
     let stdout = String::from_utf8_lossy(&out.stdout);
     let bin = stdout
@@ -1339,6 +1348,40 @@ mod tests {
                 "{crate_dir} is embedded by a recipe but absent from the fingerprint roots"
             );
         }
+    }
+
+    /// A tolerated skip must stay EVIDENCE, not inference. `recipe-eval-place`
+    /// re-emits the sentinel for whatever it tags, so tagging on the exit code
+    /// alone would let any other 69 in the tool script mint a skip and hide a
+    /// regression behind it — the exact failure the two-part test exists to stop.
+    #[test]
+    fn only_a_69_that_carries_the_sentinel_is_tagged_unprovisioned() {
+        use std::os::unix::process::ExitStatusExt;
+        let sentinel = crate::check_loop::UNPROVISIONED_SENTINEL;
+        let tag = crate::check_loop::UNPROVISIONED_TAG;
+        // ExitStatus::from_raw takes a wait(2) status word: code << 8.
+        let out = |code: i32, stdout: &str, stderr: &str| std::process::Output {
+            status: std::process::ExitStatus::from_raw(code << 8),
+            stdout: stdout.as_bytes().to_vec(),
+            stderr: stderr.as_bytes().to_vec(),
+        };
+        let m = || "boom".to_string();
+
+        let tagged = tag_child_failure(&out(69, "", &format!("nope\n{sentinel}\n")), m());
+        assert_eq!(tagged, format!("{tag}boom"), "69 + sentinel on stderr is the skip");
+        let tagged = tag_child_failure(&out(69, sentinel, ""), m());
+        assert_eq!(tagged, format!("{tag}boom"), "the sentinel counts on stdout too");
+
+        assert_eq!(
+            tag_child_failure(&out(69, "", "cargo: error: linker not found\n"), m()),
+            "boom",
+            "a 69 with no sentinel is SOME OTHER failure and must red, not skip"
+        );
+        assert_eq!(
+            tag_child_failure(&out(1, "", &format!("{sentinel}\n")), m()),
+            "boom",
+            "the sentinel alone does not make a skip; the code must agree"
+        );
     }
 
     /// The evaluator memo is the reason a warm tree needs no toolchain, so it

@@ -31,9 +31,9 @@ pub fn gate() -> GateDef {
 echo ">> recipe-check gcc-x86-64-native-test: build the native x86_64 gcc recipe graph and assert its output"
 : "${TD_RECIPE_EVAL:=}"
 if [ -z "$TD_RECIPE_EVAL" ] || [ ! -x "$TD_RECIPE_EVAL" ]; then
-  # `|| exit $?`: the tool's 69 is a tolerated skip; a dropped status leaves
-  # TD_RECIPE_EVAL empty and the exec below reds 126.
-  TD_RECIPE_EVAL=$(sh tests/recipe-eval-tool.sh "$PWD/.td-build-cache/recipe-eval") || exit $?
+  # `|| exit $?`: a 69 is a tolerated skip; a dropped status leaves
+  # TD_RECIPE_EVAL empty and the exec below reds 126 (busybox ash).
+  TD_RECIPE_EVAL=$("${TD_BUILDER_SELF:?gate-run exports TD_BUILDER_SELF}" recipe-eval-place "$PWD/.td-build-cache/recipe-eval") || exit $?
 fi
 exec "$TD_RECIPE_EVAL" check-run gcc-x86-64-native-test 1
 "##,

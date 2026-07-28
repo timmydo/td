@@ -2246,9 +2246,8 @@ fn source_pin_sha(pins_text: &str, file: &str) -> Option<String> {
 }
 
 /// The recipe-owned source pins (`td-recipe-eval source-pins`). Resolves the
-/// evaluator from `$TD_RECIPE_EVAL` when set, else builds td's OWN dependency-free
-/// td-recipe-eval via `tests/recipe-eval-tool.sh` (the guix-free host-prep the
-/// recipe-rs gate also shells out to). The pin PARSING + comparison is typed Rust.
+/// evaluator from `$TD_RECIPE_EVAL` when set, else through `recipe_eval_place`,
+/// the same memo the ladder gates use. The pin PARSING + comparison is typed Rust.
 fn recipe_eval_source_pins(root: &Path) -> Result<String, String> {
     let eval = match std::env::var_os("TD_RECIPE_EVAL") {
         // Set to a non-empty value: use it VERBATIM — no fallback. A non-executable
