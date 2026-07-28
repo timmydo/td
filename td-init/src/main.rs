@@ -29,6 +29,7 @@ mod init;
 mod losetup;
 mod mount;
 mod switchroot;
+mod syncfs;
 mod sys;
 
 use std::io::Write;
@@ -49,6 +50,7 @@ const APPLETS: &[(&str, Applet)] = &[
     ("poweroff", halt::poweroff),
     ("reboot", halt::reboot),
     ("switch_root", switchroot::run),
+    ("sync", syncfs::run),
     ("umount", mount::umount),
 ];
 
@@ -372,7 +374,7 @@ mod tests {
     /// The roster is the shipped /bin symlink farm, so a rename is a visible
     /// change to the image, not an internal one.
     #[test]
-    fn the_roster_is_the_amended_ten() {
+    fn the_roster_is_the_amended_eleven() {
         assert_eq!(
             names(),
             vec![
@@ -385,6 +387,7 @@ mod tests {
                 "poweroff",
                 "reboot",
                 "switch_root",
+                "sync",
                 "umount"
             ]
         );
@@ -769,7 +772,7 @@ mod confinement {
                 declared.push(target);
             }
         }
-        assert_eq!(declared.len(), 8, "expected eight modules beside the crate root");
+        assert_eq!(declared.len(), 9, "expected nine modules beside the crate root");
         // ...and nothing scanned is orphaned: a file present but declared by no
         // `mod` line is either dead or reached a way this scan does not model,
         // and either way the counts above stop meaning what they say. Matching on
@@ -796,7 +799,7 @@ mod confinement {
     /// skipping them: `src/sys.inc` is invisible to a `.rs`-only scan and
     /// compiles perfectly well through the constructs refused below.
     #[test]
-    fn src_holds_exactly_the_nine_scanned_modules() {
+    fn src_holds_exactly_the_ten_scanned_modules() {
         let (rs, other) = walk();
         let paths: Vec<&str> = rs.iter().map(|(p, _)| p.as_str()).collect();
         assert_eq!(
@@ -810,6 +813,7 @@ mod confinement {
                 "main.rs",
                 "mount.rs",
                 "switchroot.rs",
+                "syncfs.rs",
                 "sys.rs",
             ],
             "the crate's file set changed"

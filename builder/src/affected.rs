@@ -1313,6 +1313,16 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
     assert_target!("td-util/src/main.rs", "recipe-checks");
     assert_target!("td-util/src/ps.rs", "check");
     assert_target!("td-util/src/ps.rs", "recipe-checks");
+    assert_target!("td-util/src/cat.rs", "check");
+    assert_target!("td-util/src/cat.rs", "recipe-checks");
+    assert_target!("td-util/src/fileattr.rs", "check");
+    assert_target!("td-util/src/fileattr.rs", "recipe-checks");
+    assert_target!("td-util/src/fileops.rs", "check");
+    assert_target!("td-util/src/fileops.rs", "recipe-checks");
+    assert_target!("td-util/src/printf.rs", "check");
+    assert_target!("td-util/src/printf.rs", "recipe-checks");
+    assert_target!("td-util/src/sleep.rs", "check");
+    assert_target!("td-util/src/sleep.rs", "recipe-checks");
     assert_target!("td-util/Cargo.lock", "check");
     assert_target!("td-util/Cargo.lock", "recipe-checks");
     // td-firstboot mirrors td-util: every source is include_str!'d into the
@@ -1348,6 +1358,8 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
     assert_target!("td-init/src/sys.rs", "recipe-checks");
     assert_target!("td-init/src/losetup.rs", "check");
     assert_target!("td-init/src/losetup.rs", "recipe-checks");
+    assert_target!("td-init/src/syncfs.rs", "check");
+    assert_target!("td-init/src/syncfs.rs", "recipe-checks");
     assert_target!("td-init/Cargo.lock", "check");
     assert_target!("td-init/Cargo.lock", "recipe-checks");
     // td-login mirrors td-init, confined syscall module included: every source is

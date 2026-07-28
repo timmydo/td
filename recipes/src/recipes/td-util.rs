@@ -8,16 +8,24 @@ use crate::types::{Recipe, Step};
 // ONE source of truth and cannot drift; the path escapes the
 // `recipes/src/recipes/*.rs` catalog glob, so it is not itself a recipe module.
 //
-// SCOPE: the busybox applets uutils' coreutils does not provide and that need no
-// syscall surface beyond safe `std` — `clear`, `which`, `free`, `ps`, `dmesg`.
+// SCOPE: the applets that must run where uutils' coreutils cannot, and that need no
+// syscall surface beyond safe `std`. Two kinds. `clear`, `which`, `free`, `ps` and
+// `dmesg` are names uutils does not provide at all, and get `/bin` symlinks.
+// `cat`, `chmod`, `chown`, `ln`, `mkdir`, `printf`, `readlink`, `rm` and `sleep` it
+// DOES provide — dynamically linked, which the pre-pivot initramfs has no loader for
+// and which `/etc/rootcheck` must not depend on, since reporting a broken runtime
+// closure is its job. Those nine carry no `/bin` name here (uutils owns them and the
+// farms are disjoint) and are reached as `td-util <applet>`.
 // `free`/`ps` read /proc and `dmesg` reads /dev/kmsg O_NONBLOCK, all ordinary
 // file I/O, so the crate stays `#![deny(unsafe_code)]` and adds NO target-side
 // unsafe exception to AGENTS.md. The applets that would (reboot/poweroff/halt,
-// switch_root, cttyhack, init) are deliberately out of scope: each needs a raw
-// syscall, which is a reviewed unsafe-surface amendment, not a drive-by.
+// switch_root, cttyhack, init, and `sync`, which is td-init's) are deliberately out
+// of scope: each needs a raw syscall, which is a reviewed unsafe-surface amendment,
+// not a drive-by.
 //
-// system-x86-64 packs td-util and routes /bin/{clear,which,free,ps,dmesg} here, off
-// busybox. The greeter runs each by its /bin path and emits TD_UTIL_RUNTIME_MARKER
+// system-x86-64 packs td-util into the real root AND both initramfs cpios, routes
+// /bin/{clear,which,free,ps,dmesg} here, and calls the other nine as `td-util <applet>`
+// where it used to call `busybox <applet>`. The greeter runs each by its /bin path and emits TD_UTIL_RUNTIME_MARKER
 // only if all five exit 0, so `td-recipe-eval qemu-boot-system` re-proves the whole
 // farm on every boot — including the /proc and /dev/kmsg applets whose legs below
 // are skipped when the build sandbox lacks /proc. That oracle is operator-run (qemu
@@ -50,10 +58,15 @@ const MAIN_RS: &str = include_str!("../../../td-util/src/main.rs");
 
 // (module basename, source text). rustc resolves `mod NAME;` to `{src}/NAME.rs`.
 const MODULES: &[(&str, &str)] = &[
+    ("cat", include_str!("../../../td-util/src/cat.rs")),
     ("dmesg", include_str!("../../../td-util/src/dmesg.rs")),
+    ("fileattr", include_str!("../../../td-util/src/fileattr.rs")),
+    ("fileops", include_str!("../../../td-util/src/fileops.rs")),
     ("free", include_str!("../../../td-util/src/free.rs")),
+    ("printf", include_str!("../../../td-util/src/printf.rs")),
     ("procfs", include_str!("../../../td-util/src/procfs.rs")),
     ("ps", include_str!("../../../td-util/src/ps.rs")),
+    ("sleep", include_str!("../../../td-util/src/sleep.rs")),
     ("which", include_str!("../../../td-util/src/which.rs")),
 ];
 

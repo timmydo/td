@@ -373,6 +373,87 @@ enum Probe {
     ReadsBackHostname,
 }
 
+/// Whether the text a token follows leaves it in shell COMMAND position.
+///
+/// A heuristic, and stated as one: deciding this exactly needs a shell grammar.
+/// It errs toward CALLING it a command (an unrecognised introducer is treated as
+/// one only when the token starts a word after nothing else), so the guard that
+/// uses it fails closed. Enough for generated scripts, whose shapes this file
+/// writes itself.
+#[cfg(test)]
+fn in_command_position(before: &str) -> bool {
+    let head = before.trim_end_matches([' ', '\t']);
+    // A trailing backslash is a shell line-continuation, so what decides position
+    // is whatever precedes IT. Stripped before the separator test but never
+    // together with the newline: doing both at once removes the very `\n` that
+    // says "start of line", which is the commonest command position there is.
+    let head = if head.ends_with('\\') {
+        head.trim_end_matches('\\').trim_end_matches([' ', '\t'])
+    } else {
+        head
+    };
+    if head.is_empty() {
+        return true;
+    }
+    // `)` closes a `case` pattern, and this file writes that shape.
+    for sep in ["\n", "\r", ";", "&", "|", "(", ")", "`", "{", "&&", "||", "!"] {
+        if head.ends_with(sep) {
+            return true;
+        }
+    }
+    // An opening quote is command position ONLY as the body of `-c`. Treating every
+    // quote that way would flag `echo "td-util: ..."`, which is prose, not a call —
+    // and a guard that cries wolf on its own diagnostics gets deleted.
+    if let Some(rest) = head.strip_suffix(['\'', '"']) {
+        if rest.trim_end_matches([' ', '\t']).ends_with("-c") {
+            return true;
+        }
+    }
+    // An assignment prefix (`VAR=value cmd`) also leaves a command next.
+    if head.rsplit([' ', '\t', '\n']).next().is_some_and(|w| {
+        let mut parts = w.splitn(2, '=');
+        parts.next().is_some_and(|n| {
+            !n.is_empty() && n.chars().all(|c| c.is_alphanumeric() || c == '_')
+        }) && parts.next().is_some()
+    }) {
+        return true;
+    }
+    // Keywords that introduce a command WITHOUT being punctuation. Matched on a
+    // word boundary, so a mention ending in one (`motif`, `ado`) is not read as
+    // an introducer — the punctuation above cannot collide that way, these can.
+    for word in [
+        "if", "elif", "then", "else", "while", "until", "do", "done", "exec", "command", "env",
+    ] {
+        if let Some(rest) = head.strip_suffix(word) {
+            if rest.is_empty() || !rest.ends_with(|c: char| c.is_alphanumeric() || c == '_') {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// The applet names a multicall's own `APPLETS` table lists, read from its source.
+///
+/// The shipped roster is that table; restating it here would be a second list to drift.
+#[cfg(test)]
+fn applet_table(source: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    let Some(start) = source.match_indices("const APPLETS").next().map(|(i, _)| i) else {
+        return names;
+    };
+    let body = source.get(start..).unwrap_or("");
+    let end = body.match_indices("];").next().map(|(i, _)| i).unwrap_or(body.len());
+    for (idx, _) in body.get(..end).unwrap_or("").match_indices("(\"") {
+        let rest = body.get(idx.saturating_add(2)..).unwrap_or("");
+        let name: String = rest.chars().take_while(|c| *c != '"').collect();
+        if !name.is_empty() {
+            names.push(name);
+        }
+    }
+    names
+}
+
 fn td_init_applets() -> Vec<&'static str> {
     TD_INIT_FARM.iter().map(|(name, _)| *name).collect()
 }
@@ -411,29 +492,33 @@ fn td_init_probe(applet: &str, probe: &Probe, sys: &SystemDef) -> String {
     }
 }
 
-/// Applets reached through the packed BusyBox multicall as `/bin/busybox <applet>`, whether
-/// or not they also get a `/bin` symlink — `rootcheck` reaches `chown`, `mkdir`, `readlink`,
-/// `rm` and `test` this way, all names uutils serves in `/bin`. They must still EXIST in
-/// busybox, so `shape_check` probes them against `busybox --list` like the farm names;
-/// otherwise a config drift breaks sysinit with no build-time signal. Unlike the three /bin farms
-/// this is deliberately NOT disjoint from BUSYBOX_APPLETS. `script_applets_are_covered`
-/// derives it from the script text both ways, so neither an uncovered call nor a stale
-/// entry survives; td-boot's own invocations are justified by its protocol constant.
-const INITRAMFS_APPLETS: &[&str] = &[
-    "cat",
-    "chmod",
-    "chown",
-    "ln",
-    "mkdir",
-    "mknod",
-    "printf",
-    "readlink",
-    "rm",
-    "sh",
-    "sleep",
-    "sync",
-    "test",
-];
+/// Applets still reached through the packed BusyBox multicall as `/bin/busybox <applet>`.
+/// They must EXIST in busybox, so `shape_check` probes them against `busybox --list` like
+/// the farm names; otherwise a config drift breaks sysinit with no build-time signal.
+/// Unlike the three /bin farms this is deliberately NOT disjoint from BUSYBOX_APPLETS.
+/// `script_applets_are_covered` derives it from the script text both ways, so neither an
+/// uncovered call nor a stale entry survives; td-boot's own invocations are justified by
+/// its protocol constant.
+///
+/// The nine that LEFT — cat, chmod, chown, ln, mkdir, printf, readlink, rm, sleep — are
+/// td-util applets now, and `sync` is td-init's. All ten were reached here rather than
+/// through uutils' `/bin/<name>` because they run where a dynamic closure is not safe to
+/// assume; td-util and td-init are static with empty closures, so the property is kept
+/// while the third-party multicall goes.
+///
+/// What is left, and why each is still here:
+///
+/// - `sh` is the /init and /etc script interpreter; td-sh is not shipped yet.
+/// - `test` because POSIX `-w` is `access(2)`, which safe `std` cannot reach.
+///   rootcheck runs its `-w` probes under `su ... <user>`, so they ask whether THAT
+///   caller may write: `/var` is root-owned 0755 and mounted rw, and a mode-bits
+///   approximation blind to the caller's euid/egid/supplementary groups reads the
+///   owner bit and answers "writable", inverting `test ! -w /var` — the check would
+///   then pass for a system that had actually failed.
+/// - `mknod` because `mknod(2)` is likewise a syscall.
+///
+/// The last two are reviewed amendments, not approximations to be slipped in.
+const INITRAMFS_APPLETS: &[&str] = &["mknod", "sh", "test"];
 
 /// The diagnostics userland, served by the static td-util multicall — the busybox names
 /// uutils does not provide. Like busybox and uutils it dispatches on argv[0]'s basename, so
@@ -862,8 +947,8 @@ fn build_selector_init() -> String {
      /bin/mount -t devtmpfs dev /dev\n\
      /bin/mount -t proc proc /proc\n\
      n=0\n\
-     while /bin/busybox test \"$n\" -lt 5 && ! /bin/busybox test -b /dev/vda; do /bin/busybox sleep 1; n=$((n+1)); done\n\
-     exec /bin/td-boot boot /dev/vda /volume \"$(/bin/busybox cat /proc/cmdline)\"\n"
+     while /bin/busybox test \"$n\" -lt 5 && ! /bin/busybox test -b /dev/vda; do /bin/td-util sleep 1; n=$((n+1)); done\n\
+     exec /bin/td-boot boot /dev/vda /volume \"$(/bin/td-util cat /proc/cmdline)\"\n"
         .into()
 }
 
@@ -882,10 +967,10 @@ fn build_deployment_init(sys: &SystemDef) -> String {
      /bin/mount -t proc proc /proc\n\
      /bin/mount -t sysfs sysfs /sys\n\
      n=0\n\
-     while /bin/busybox test \"$n\" -lt 5 && ! /bin/busybox test -b /dev/vda; do /bin/busybox sleep 1; n=$((n+1)); done\n\
+     while /bin/busybox test \"$n\" -lt 5 && ! /bin/busybox test -b /dev/vda; do /bin/td-util sleep 1; n=$((n+1)); done\n\
      deployment=\n\
      deployment_seen=\n\
-     for word in $(/bin/busybox cat /proc/cmdline); do\n\
+     for word in $(/bin/td-util cat /proc/cmdline); do\n\
        case \"$word\" in\n\
          td.deployment=*) \
            /bin/busybox test -z \"$deployment_seen\" || { echo 'td-init: duplicate td.deployment handoff' >&2; exit 1; }; \
@@ -902,12 +987,12 @@ fn build_deployment_init(sys: &SystemDef) -> String {
      /bin/umount /dev\n\
      /bin/umount /sys\n\
      /bin/mount -t tmpfs -o mode=0755 tmpfs /sysroot/run\n\
-     /bin/busybox printf '%s\\n' \"$deployment\" > /sysroot/run/td-deployment\n\
-     /bin/busybox chmod 0600 /sysroot/run/td-deployment\n\
-     /bin/busybox mkdir -p /sysroot/run/td-volume\n\
+     /bin/td-util printf '%s\\n' \"$deployment\" > /sysroot/run/td-deployment\n\
+     /bin/td-util chmod 0600 /sysroot/run/td-deployment\n\
+     /bin/td-util mkdir -p /sysroot/run/td-volume\n\
      /bin/mount -o move /volume /sysroot/run/td-volume\n\
      /bin/mount -t tmpfs -o mode=1777 tmpfs /sysroot/tmp\n\
-     /bin/busybox mkdir -p /sysroot/var/log /sysroot/var/home"
+     /bin/td-util mkdir -p /sysroot/var/log /sysroot/var/home"
         .to_string();
     for user in sys.users {
         if user.home != "/root" {
@@ -915,12 +1000,12 @@ fn build_deployment_init(sys: &SystemDef) -> String {
         }
     }
     init.push_str(
-        "\n/bin/busybox sh -c 'umask 077; /bin/busybox mkdir -p /sysroot/var/root'\n\
-         /bin/busybox rm -rf /sysroot/var/run\n\
-         /bin/busybox ln -s /run /sysroot/var/run\n\
-         /bin/busybox chown 0:0 /sysroot/var /sysroot/var/log /sysroot/var/home /sysroot/var/root\n\
-         /bin/busybox chmod 0755 /sysroot/var /sysroot/var/log /sysroot/var/home\n\
-         /bin/busybox chmod 0700 /sysroot/var/root\n\
+        "\n/bin/busybox sh -c 'umask 077; /bin/td-util mkdir -p /sysroot/var/root'\n\
+         /bin/td-util rm -rf /sysroot/var/run\n\
+         /bin/td-util ln -s /run /sysroot/var/run\n\
+         /bin/td-util chown 0:0 /sysroot/var /sysroot/var/log /sysroot/var/home /sysroot/var/root\n\
+         /bin/td-util chmod 0755 /sysroot/var /sysroot/var/log /sysroot/var/home\n\
+         /bin/td-util chmod 0700 /sysroot/var/root\n\
          exec /bin/switch_root /sysroot /init\n",
     );
     init
@@ -980,7 +1065,7 @@ fn build_shutdown() -> String {
     format!(
         "#!/bin/sh\n\
          ok=1\n\
-         /bin/busybox sync || {{ echo 'td-shutdown: sync failed' >&2; ok=0; }}\n\
+         /bin/td-init sync || {{ echo 'td-shutdown: sync failed' >&2; ok=0; }}\n\
          /bin/umount /var || {{ echo 'td-shutdown: umount /var failed' >&2; ok=0; }}\n\
          /bin/umount -a -r --exclude /run || {{ echo 'td-shutdown: final unmount failed' >&2; ok=0; }}\n\
          /bin/busybox test \"$ok\" = 1 && echo {SYSTEM_SHUTDOWN_MARKER}\n"
@@ -1004,7 +1089,7 @@ fn build_rootcheck(sys: &SystemDef) -> String {
     for u in sys.users {
         if u.uid != 0 {
             s.push_str(&format!(
-                "/bin/busybox chown {}:{} {} 2>/dev/null || ok=0\n",
+                "/bin/td-util chown {}:{} {} 2>/dev/null || ok=0\n",
                 u.uid, u.gid, u.home
             ));
         }
@@ -1032,7 +1117,7 @@ fn build_rootcheck(sys: &SystemDef) -> String {
     // child shell: ash exits a non-interactive shell when a special builtin redirection
     // fails, instead of returning control to the parent `if`.
     s.push_str(&format!(
-        "if /bin/busybox sh -c ': > /etc/.tdwr' 2>/dev/null; then /bin/busybox rm -f /etc/.tdwr; ok=0; else echo {SYSTEM_ETC_RO_MARKER}; fi\n"
+        "if /bin/busybox sh -c ': > /etc/.tdwr' 2>/dev/null; then /bin/td-util rm -f /etc/.tdwr; ok=0; else echo {SYSTEM_ETC_RO_MARKER}; fi\n"
     ));
     // State is the persistent Btrfs @var subvolume; only run/tmp are volatile.
     // Homes remain stable paths through immutable symlinks into /var.
@@ -1052,9 +1137,9 @@ fn build_rootcheck(sys: &SystemDef) -> String {
          done\n",
     );
     s.push_str(
-        "[ \"$(/bin/busybox readlink /home)\" = var/home ] || ok=0\n\
-         [ \"$(/bin/busybox readlink /root)\" = var/root ] || ok=0\n\
-         [ \"$(/bin/busybox readlink /var/run)\" = /run ] || ok=0\n",
+        "[ \"$(/bin/td-util readlink /home)\" = var/home ] || ok=0\n\
+         [ \"$(/bin/td-util readlink /root)\" = var/root ] || ok=0\n\
+         [ \"$(/bin/td-util readlink /var/run)\" = /run ] || ok=0\n",
     );
     s.push_str(&build_mutable_etc_check(sys));
     let mut probe_paths = "/var /run /tmp /home /root".to_string();
@@ -1066,15 +1151,15 @@ fn build_rootcheck(sys: &SystemDef) -> String {
     }
     s.push_str(&format!(
         "for d in {probe_paths}; do \
-         if /bin/busybox sh -c ': > \"$1/.tdwr\"' td-probe \"$d\" 2>/dev/null; then /bin/busybox rm -f \"$d/.tdwr\"; else ok=0; fi; \
+         if /bin/busybox sh -c ': > \"$1/.tdwr\"' td-probe \"$d\" 2>/dev/null; then /bin/td-util rm -f \"$d/.tdwr\"; else ok=0; fi; \
          done\n"
     ));
     if let Some(user) = sys.users.iter().find(|user| user.name == sys.autologin) {
         s.push_str(&format!(
             "if /bin/grep -q -F '{BOOT_FAIL_TARGET_CMDLINE_TOKEN}' /proc/cmdline; then \
-             /bin/busybox printf '%s\\n' waiting > /run/td-boot-parked \
-             && /bin/busybox chown {}:{} /run/td-boot-parked \
-             && /bin/busybox chmod 0600 /run/td-boot-parked || ok=0; \
+             /bin/td-util printf '%s\\n' waiting > /run/td-boot-parked \
+             && /bin/td-util chown {}:{} /run/td-boot-parked \
+             && /bin/td-util chmod 0600 /run/td-boot-parked || ok=0; \
              fi\n",
             user.uid, user.gid
         ));
@@ -1082,20 +1167,20 @@ fn build_rootcheck(sys: &SystemDef) -> String {
     s.push_str(&format!(
         "if [ \"$ok\" = 1 ]; then \
          echo {SYSTEM_STATE_WRITABLE_MARKER}; \
-         /bin/busybox printf '%s\\n' td-rootcheck-v1 > /run/td-rootcheck-ok \
-         && /bin/busybox chmod 0600 /run/td-rootcheck-ok; \
+         /bin/td-util printf '%s\\n' td-rootcheck-v1 > /run/td-rootcheck-ok \
+         && /bin/td-util chmod 0600 /run/td-rootcheck-ok; \
          fi\n"
     ));
     s.push_str(&format!(
         "if /bin/grep -q -F '{PERSIST_WRITE_CMDLINE_TOKEN}' /proc/cmdline; then \
          if /bin/busybox test ! -e /var/lib/td/boot-marker \
-         && /bin/busybox mkdir -p /var/lib/td \
-         && /bin/busybox printf '%s\\n' td-persistent-v1 > /var/lib/td/boot-marker \
-         && /bin/busybox sync; then \
+         && /bin/td-util mkdir -p /var/lib/td \
+         && /bin/td-util printf '%s\\n' td-persistent-v1 > /var/lib/td/boot-marker \
+         && /bin/td-init sync; then \
          echo {SYSTEM_PERSIST_WRITE_MARKER}; fi; \
          fi\n\
          if /bin/grep -q -F '{PERSIST_READ_CMDLINE_TOKEN}' /proc/cmdline \
-         && /bin/busybox test \"$(/bin/busybox cat /var/lib/td/boot-marker 2>/dev/null)\" = td-persistent-v1; then \
+         && /bin/busybox test \"$(/bin/td-util cat /var/lib/td/boot-marker 2>/dev/null)\" = td-persistent-v1; then \
          echo {SYSTEM_PERSIST_READ_MARKER}; \
          fi\n"
     ));
@@ -1121,7 +1206,7 @@ fn build_mutable_etc_check(sys: &SystemDef) -> String {
         // Every entry: the symlink must say exactly what the table records. A
         // symlink that moved is a file whose writes land somewhere unreviewed.
         s.push_str(&format!(
-            "[ \"$(/bin/busybox readlink /etc/{})\" = {} ] || me=0\n",
+            "[ \"$(/bin/td-util readlink /etc/{})\" = {} ] || me=0\n",
             entry.etc, entry.target
         ));
         // Persistent entries only: td-firstboot has already run, so these must
@@ -1148,8 +1233,8 @@ fn build_mutable_etc_check(sys: &SystemDef) -> String {
             // both halves — the private key is NOT readable and the `.pub` IS.
             s.push_str(&format!(
                 "if /bin/su -s /bin/sh {name} -c \
-                 'if /bin/busybox cat {key} >/dev/null 2>&1; then exit 1; fi; \
-                 /bin/busybox cat {key}.pub >/dev/null 2>&1'; then :; else me=0; fi\n",
+                 'if /bin/td-util cat {key} >/dev/null 2>&1; then exit 1; fi; \
+                 /bin/td-util cat {key}.pub >/dev/null 2>&1'; then :; else me=0; fi\n",
                 name = user.name,
                 key = SSHD_HOST_KEY,
             ));
@@ -1304,15 +1389,15 @@ fn build_bootsuccess(sys: &SystemDef) -> String {
     format!(
         "#!/bin/sh\n\
          set -f\n\
-         finish() {{ /bin/busybox printf '%s\\n' \"$1\" > /run/td-boot-success-ok; \
-         /bin/busybox chmod 0644 /run/td-boot-success-ok; }}\n\
+         finish() {{ /bin/td-util printf '%s\\n' \"$1\" > /run/td-boot-success-ok; \
+         /bin/td-util chmod 0644 /run/td-boot-success-ok; }}\n\
          fail() {{ finish td-boot-failure-v1; exit 1; }}\n\
          /bin/grep -q -F '{BOOT_FAIL_TARGET_CMDLINE_TOKEN}' /proc/cmdline && exit 0\n\
-         /bin/busybox test \"$(/bin/busybox cat /run/td-rootcheck-ok 2>/dev/null)\" = td-rootcheck-v1 || fail\n\
-         deployment=$(/bin/busybox cat /run/td-deployment 2>/dev/null)\n\
+         /bin/busybox test \"$(/bin/td-util cat /run/td-rootcheck-ok 2>/dev/null)\" = td-rootcheck-v1 || fail\n\
+         deployment=$(/bin/td-util cat /run/td-deployment 2>/dev/null)\n\
          /bin/busybox test -n \"$deployment\" || fail\n\
          wait={BOOT_SUCCESS_RETRY_SECS}\n\
-         for token in $(/bin/busybox cat /proc/cmdline); do \
+         for token in $(/bin/td-util cat /proc/cmdline); do \
          case \"$token\" in {BOOT_SUCCESS_WAIT_CMDLINE_PREFIX}*) \
          wait=${{token#{BOOT_SUCCESS_WAIT_CMDLINE_PREFIX}}};; esac; done\n\
          case \"$wait\" in ''|*[!0-9]*|0) wait={BOOT_SUCCESS_RETRY_SECS};; esac\n\
@@ -1371,7 +1456,7 @@ fn build_bootsuccess(sys: &SystemDef) -> String {
          echo {SYSTEM_BOOT_SUCCESS_MARKER}; \
          finish td-boot-success-v1; exit 0; fi; \
          fi; \
-         n=$((n+1)); /bin/busybox sleep 1; \
+         n=$((n+1)); /bin/td-util sleep 1; \
          done\n\
          fail\n",
         sys.autologin,
@@ -1394,9 +1479,9 @@ fn build_bootfail() -> String {
         "#!/bin/sh\n\
          set -f\n\
          /bin/grep -q -F '{BOOT_FAIL_TARGET_CMDLINE_TOKEN}' /proc/cmdline || exit 0\n\
-         /bin/busybox test \"$(/bin/busybox cat /run/td-rootcheck-ok 2>/dev/null)\" = td-rootcheck-v1 || exit 1\n\
+         /bin/busybox test \"$(/bin/td-util cat /run/td-rootcheck-ok 2>/dev/null)\" = td-rootcheck-v1 || exit 1\n\
          wait={BOOT_FAIL_PARK_WAIT_SECS}\n\
-         for token in $(/bin/busybox cat /proc/cmdline); do \
+         for token in $(/bin/td-util cat /proc/cmdline); do \
          case \"$token\" in {BOOT_SUCCESS_WAIT_CMDLINE_PREFIX}*) \
          wait=${{token#{BOOT_SUCCESS_WAIT_CMDLINE_PREFIX}}};; esac; done\n\
          case \"$wait\" in ''|*[!0-9]*|0) wait={BOOT_FAIL_PARK_WAIT_SECS};; esac\n\
@@ -1405,7 +1490,7 @@ fn build_bootfail() -> String {
          while [ \"$n\" -lt \"$wait\" ]; do \
          /bin/grep -q -x '{BOOT_FAIL_PARKED}' /run/td-boot-parked 2>/dev/null && \
          exec /bin/td-svc reboot >/dev/console 2>&1; \
-         n=$((n+1)); /bin/busybox sleep 1; \
+         n=$((n+1)); /bin/td-util sleep 1; \
          done\n\
          echo 'td-boot: greeter park handshake timed out' >&2\n\
          exit 1\n"
@@ -1428,9 +1513,9 @@ fn build_profile(sys: &SystemDef) -> String {
         "if /bin/grep -q -F '{BOOT_FAIL_TARGET_CMDLINE_TOKEN}' /proc/cmdline; then \
          exec /bin/busybox sh -c 'cd / \
          || exit 1; \
-         if ! /bin/busybox printf \"%s\\n\" {BOOT_FAIL_PARKED} > /run/td-boot-parked; then \
+         if ! /bin/td-util printf \"%s\\n\" {BOOT_FAIL_PARKED} > /run/td-boot-parked; then \
          echo \"td-boot: could not park greeter\" >&2; fi; \
-         while :; do /bin/busybox sleep 300; done'; fi\n"
+         while :; do /bin/td-util sleep 300; done'; fi\n"
     ));
     // The terminal hand-over, checked where it actually happened. `login` chowns the
     // session's terminal to the user and chmods it 0600, and a FAILED hand-over is
@@ -1469,15 +1554,15 @@ fn build_profile(sys: &SystemDef) -> String {
     // Autotest waits for the independent root-owned health transaction.
     s.push_str(&format!(
         "if /bin/grep -q -F '{AUTOTEST_CMDLINE_TOKEN}' /proc/cmdline 2>/dev/null; then \
-         set -f; wait=0; for token in $(/bin/busybox cat /proc/cmdline); do \
+         set -f; wait=0; for token in $(/bin/td-util cat /proc/cmdline); do \
          case \"$token\" in {BOOT_SUCCESS_WAIT_CMDLINE_PREFIX}*) \
          wait=${{token#{BOOT_SUCCESS_WAIT_CMDLINE_PREFIX}}};; esac; done; \
          case \"$wait\" in ''|*[!0-9]*|0) wait=1;; esac; \
          n=0; while [ \"$n\" -lt \"$wait\" ]; do \
-         status=$(/bin/busybox cat /run/td-boot-success-ok 2>/dev/null); \
+         status=$(/bin/td-util cat /run/td-boot-success-ok 2>/dev/null); \
          [ \"$status\" = td-boot-success-v1 ] && break; \
          [ \"$status\" = td-boot-failure-v1 ] && break; \
-         n=$((n+1)); /bin/busybox sleep 1; done; \
+         n=$((n+1)); /bin/td-util sleep 1; done; \
          exit 0; fi\n"
     ));
     s
@@ -1740,6 +1825,15 @@ fn build_initramfs_spec(init: &str, phase: Phase) -> String {
     s.push_str("file {in:td-init}/bin/td-init {in:td-init}/bin/td-init 0755 0 0\n");
     s.push_str("slink /bin/mount {in:td-init}/bin/td-init 0777 0 0\n");
     s.push_str("slink /bin/umount {in:td-init}/bin/td-init 0777 0 0\n");
+    // td-util, for the same reason td-init is here: /init needs cat, printf, mkdir,
+    // chmod, chown, ln, rm and sleep BEFORE the pivot, and uutils serves every one
+    // of those names dynamically — against a closure no loader has been mounted for
+    // yet. It is reached as `td-util <applet>`, not through /bin/<applet>, because
+    // uutils owns those names on the real root and the farms are disjoint.
+    s.push_str("dir {in:td-util} 0755 0 0\n");
+    s.push_str("dir {in:td-util}/bin 0755 0 0\n");
+    s.push_str("file {in:td-util}/bin/td-util {in:td-util}/bin/td-util 0755 0 0\n");
+    s.push_str("slink /bin/td-util {in:td-util}/bin/td-util 0777 0 0\n");
     match phase {
         Phase::Selector => {
             s.push_str("dir {in:td-kexec} 0755 0 0\n");
@@ -2069,7 +2163,7 @@ fn shape_check() -> String {
      done; \
      selector_list=$(\"$bb\" cpio -t < \"$selector\" 2>/dev/null); \
      init_list=$(\"$bb\" cpio -t < \"$init\" 2>/dev/null); \
-     for m in init bin/busybox bin/sh bin/td-boot bin/mount bin/umount dev/console proc run volume sysroot; do \
+     for m in init bin/busybox bin/sh bin/td-boot bin/mount bin/umount bin/td-util dev/console proc run volume sysroot; do \
          printf '%s\\n' \"$selector_list\" | grep -q -x -F \"$m\" || { echo \"selector initramfs: cpio member '$m' missing\" >&2; exit 1; }; \
          printf '%s\\n' \"$init_list\" | grep -q -x -F \"$m\" || { echo \"deployment initramfs: cpio member '$m' missing\" >&2; exit 1; }; \
      done; \
@@ -2082,6 +2176,7 @@ fn shape_check() -> String {
      if printf '%s\\n' \"$init_list\" | grep -qE '^td/store/[^/]+/bin/td-kexec$'; then echo 'deployment initramfs: td-kexec store member must be selector-only' >&2; exit 1; fi; \
      printf '%s\\n' \"$init_list\" | grep -q -x -F bin/switch_root || { echo 'deployment initramfs: bin/switch_root missing - its /init would exec nothing and the boot would end in a 300s timeout with no cause' >&2; exit 1; }; \
      printf '%s\\n' \"$init_list\" | grep -qE '^td/store/[^/]+/bin/td-init$' || { echo 'deployment initramfs: td-init store member missing - the switch_root and mount/umount symlinks would dangle' >&2; exit 1; }; \
+     for l in \"$selector_list\" \"$init_list\"; do printf '%s\\n' \"$l\" | grep -qE '^td/store/[^/]+/bin/td-util$' || { echo 'initramfs: td-util store member missing - /bin/td-util would dangle and the /init would stop at its first cat/sleep under set -e, with no cause on the console' >&2; exit 1; }; done; \
      if printf '%s\\n' \"$selector_list\" | grep -q -x -F bin/switch_root; then echo 'selector initramfs: switch_root must be deployment-only - the selector kexecs, it never pivots' >&2; exit 1; fi; \
      printf '%s\\n' \"$init_list\" | grep -q -x -F bin/losetup || { echo 'deployment initramfs: bin/losetup missing - td-boot root-loop could not bind the verified root and the boot would stop there' >&2; exit 1; }; \
      if printf '%s\\n' \"$selector_list\" | grep -q -x -F bin/losetup; then echo 'selector initramfs: losetup must be deployment-only - the selector kexecs, it never binds a root loop' >&2; exit 1; fi; \
@@ -3340,6 +3435,143 @@ mod tests {
         sources
     }
 
+    /// `in_command_position` itself, which nothing else pins.
+    ///
+    /// Its only consumer is a NEGATIVE assertion no current script trips, so replacing
+    /// the whole body with `false` disables the guard while leaving every test green —
+    /// the guard can be switched off without being deleted. These are the shapes this
+    /// file actually writes, in both directions.
+    #[test]
+    fn command_position_is_recognised_in_the_shapes_this_file_writes() {
+        for yes in [
+            "",                      // start of text
+            "foo\n",                 // start of line
+            "cmd; ",                 // after a separator
+            "a && ",
+            "a || ",
+            "a | ",
+            "if ! ",                 // negation
+            "if ",
+            "while ",
+            "then ",
+            "do ",
+            "case x in x) ",         // a case arm's body
+            "exec ",
+            "env ",
+            "TDVAR=1 ",              // an assignment prefix
+            "sh -c '",               // the -c body this file writes five times
+            "/bin/busybox sh -c \"",
+            "cmd \\\n     ",          // a line continuation
+        ] {
+            assert!(
+                in_command_position(yes),
+                "{yes:?} leaves a command next, but the guard would let a bare token there pass"
+            );
+        }
+        for no in [
+            "echo \"td-util: ",       // prose — the diagnostics this file emits
+            "echo 'td-init: ",
+            "dir {in:",              // a store-path component
+            "TD_UTIL",               // a marker name
+            "/bin/",                 // handled by the caller, not here
+            "grep -q ",              // an operand, not a command
+            "motif ",                // ends with a keyword but is not one
+            "ado ",
+        ] {
+            assert!(
+                !in_command_position(no),
+                "{no:?} is not command position; flagging it makes the guard cry wolf on \
+                 prose and invites its deletion"
+            );
+        }
+    }
+
+    /// Every `td-util <applet>` / `td-init <applet>` a generated script invokes must be an
+    /// applet that multicall actually serves.
+    ///
+    /// The busybox scan below has covered its own multiplexer since it existed. When the
+    /// nine coreutils names moved to `td-util` and `sync` to `td-init`, those call sites
+    /// left that scan's reach and landed under NO check at all: `/bin/td-util cta` would
+    /// have shipped, and the first sign would have been a boot script failing at run time.
+    /// Same discipline, same failure mode, so the same shape of test — read from each
+    /// crate's own APPLETS table, not from a list restated here, since a restated one drifts.
+    ///
+    /// These are invoked as `td-util <applet>` rather than `/bin/<applet>` because uutils
+    /// owns those `/bin` names and the farms are disjoint.
+    #[test]
+    fn scripted_multicall_applets_are_served() {
+        for (token, source) in [
+            ("td-util", include_str!("../../../td-util/src/main.rs")),
+            ("td-init", include_str!("../../../td-init/src/main.rs")),
+        ] {
+            let served = applet_table(source);
+            assert!(
+                served.len() > 1,
+                "could not read {token}'s APPLETS table; the scan below would vacuously pass"
+            );
+            let mut calls = 0usize;
+            for (name, text, _) in script_sources() {
+                for (idx, _) in text.match_indices(token) {
+                    let before = text.get(..idx).unwrap_or("");
+                    if !before.ends_with("/bin/") {
+                        // Not a call through the absolute path. Unlike `busybox`, this
+                        // token is also a store-path component, a marker name and a
+                        // word in diagnostics, so the busybox scan's blanket refusal
+                        // would reject prose that is not an invocation at all. What
+                        // must not escape is a bare token in COMMAND position, which
+                        // would resolve through $PATH unchecked — so that is what is
+                        // asserted, rather than skipping every non-`/bin/` mention.
+                        assert!(
+                            !in_command_position(before),
+                            "{name} runs `{token}` as a bare token rather than \
+                             `/bin/{token} <applet>`. In command position that resolves \
+                             through $PATH, invisibly to this scan, so its applet would \
+                             never be checked against the roster; write the absolute form"
+                        );
+                        continue;
+                    }
+                    let Some(rest) = text.get(idx + token.len()..) else {
+                        continue;
+                    };
+                    let rest = rest.trim_start();
+                    let applet: String = rest
+                        .chars()
+                        .take_while(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-'))
+                        .collect();
+                    // Fail CLOSED on a form this cannot resolve statically, for the reason
+                    // the busybox scan gives: the one call that most needs review is
+                    // exactly the one an unresolvable form would let through.
+                    assert!(
+                        !applet.is_empty(),
+                        "{name} invokes /bin/{token} with a form this scan cannot resolve \
+                         ({:?}); invoke the applet under a literal name",
+                        rest.chars().take(24).collect::<String>()
+                    );
+                    // `--list` is the multicall's own flag, not an applet. Named
+                    // explicitly rather than skipping every dash-led operand, so a
+                    // mistyped flag still reds instead of being read as "not an applet".
+                    if applet.starts_with('-') {
+                        assert_eq!(
+                            applet, "--list",
+                            "{name} invokes /bin/{token} with an unknown multicall flag"
+                        );
+                        continue;
+                    }
+                    assert!(
+                        served.iter().any(|a| a == &applet),
+                        "{name} invokes `{token} {applet}`, which {token} does not serve \
+                         (it serves {served:?})"
+                    );
+                    calls = calls.saturating_add(1);
+                }
+            }
+            // A scan that matched nothing proves nothing. Both multicalls ARE called by
+            // the generated scripts, so zero here means the spelling moved and the check
+            // silently stopped looking.
+            assert!(calls > 0, "no /bin/{token} <applet> call sites found; the scan is inert");
+        }
+    }
+
     /// Every `busybox <applet>` the generated scripts invoke through the multiplexer must be
     /// one `shape_check` verifies against `busybox --list` — a packed farm name or an
     /// INITRAMFS_APPLETS entry. Derived from the script TEXT, so adding a `busybox
@@ -4090,7 +4322,7 @@ mod tests {
         );
         let shutdown = build_shutdown();
         assert!(
-            shutdown.contains("/bin/busybox sync || {")
+            shutdown.contains("/bin/td-init sync || {")
                 && shutdown.contains("/bin/umount /var || {")
                 && shutdown.contains("/bin/umount -a -r --exclude /run || {")
                 && shutdown.contains("/bin/busybox test \"$ok\" = 1")
@@ -4260,7 +4492,7 @@ mod tests {
         );
         assert!(
             rootcheck.contains("test ! -e /var/lib/td/boot-marker")
-                && rootcheck.contains("&& /bin/busybox sync"),
+                && rootcheck.contains("&& /bin/td-init sync"),
             "the write marker must require a fresh path and a successful sync"
         );
         let bootsuccess = build_bootsuccess(&SYSTEM);
@@ -4379,7 +4611,7 @@ mod tests {
                 && bootfail.contains("while [ \"$n\" -lt \"$wait\" ]")
                 && profile.contains("cd /")
                 && profile.contains("> /run/td-boot-parked")
-                && profile.contains("while :; do /bin/busybox sleep 300; done"),
+                && profile.contains("while :; do /bin/td-util sleep 300; done"),
             "the failed-target injection must park outside /var before its watchdog reboots"
         );
         assert!(

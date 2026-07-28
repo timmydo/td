@@ -102,11 +102,11 @@ pub fn recipe() -> Recipe {
                 "-c",
                 &format!(
                     "l=$('{bin}' --list) || {{ echo 'td-init --list failed' >&2; exit 1; }}; \
-                     for a in cttyhack halt hostname init losetup mount poweroff reboot switch_root umount; do \
+                     for a in cttyhack halt hostname init losetup mount poweroff reboot switch_root sync umount; do \
                          printf '%s\\n' \"$l\" | grep -q -x -F \"$a\" || {{ echo \"td-init does not serve applet '$a'\" >&2; exit 1; }}; \
                      done; \
                      n=$(printf '%s\\n' \"$l\" | wc -l); \
-                     [ \"$n\" -eq 10 ] || {{ echo \"td-init serves $n applets, expected exactly 10 — update this check deliberately when adding one\" >&2; exit 1; }}"
+                     [ \"$n\" -eq 11 ] || {{ echo \"td-init serves $n applets, expected exactly 11 — update this check deliberately when adding one\" >&2; exit 1; }}"
                 ),
             ],
         )

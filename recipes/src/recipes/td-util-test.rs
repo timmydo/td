@@ -79,11 +79,11 @@ pub fn recipe() -> Recipe {
                 "-c",
                 &format!(
                     "l=$('{bin}' --list) || {{ echo 'td-util --list failed' >&2; exit 1; }}; \
-                     for a in clear dmesg free ps which; do \
+                     for a in cat chmod chown clear dmesg free ln mkdir printf ps readlink rm sleep which; do \
                          printf '%s\\n' \"$l\" | grep -q -x -F \"$a\" || {{ echo \"td-util does not serve applet '$a'\" >&2; exit 1; }}; \
                      done; \
                      n=$(printf '%s\\n' \"$l\" | wc -l); \
-                     [ \"$n\" -eq 5 ] || {{ echo \"td-util serves $n applets, expected exactly 5 — update this check deliberately when adding one\" >&2; exit 1; }}"
+                     [ \"$n\" -eq 14 ] || {{ echo \"td-util serves $n applets, expected exactly 14 — update this check deliberately when adding one\" >&2; exit 1; }}"
                 ),
             ],
         )

@@ -1,7 +1,18 @@
 #![forbid(unsafe_code)]
-//! td-util — the static, dependency-free multicall behind td's diagnostics
-//! userland: the busybox applets uutils' coreutils does not provide and that
-//! need no syscall surface beyond what safe `std` already exposes.
+//! td-util — the static, dependency-free multicall behind td's diagnostics and
+//! PRE-PIVOT userland: the applets that must run where uutils' coreutils cannot,
+//! and that need no syscall surface beyond what safe `std` already exposes.
+//!
+//! Two kinds of caller, one reason. `clear`/`which`/`free`/`ps`/`dmesg` are names
+//! uutils does not provide at all. `cat`/`chmod`/`chown`/`ln`/`mkdir`/`printf`/
+//! `readlink`/`rm`/`sleep` it DOES provide — dynamically linked, against a
+//! runtime closure that the pre-pivot initramfs has no loader for and that the
+//! boot self-check exists to report the breakage of. Both sets need a binary
+//! that works when the closure does not, which is what this one is.
+//!
+//! uutils owns those `/bin` names (the farms are disjoint), so these are reached
+//! as `td-util <applet>` — the same explicit form the `busybox <applet>` calls
+//! they replace used.
 //!
 //! Dispatch is on argv[0]'s basename, the busybox/uutils convention, so a
 //! `/bin/<applet> -> td-util` symlink runs that applet. An explicit
@@ -14,10 +25,15 @@
 //! cttyhack, init) are deliberately absent — adding them is a reviewed
 //! `unsafe`-surface amendment, not a drive-by.
 
+mod cat;
 mod dmesg;
+mod fileattr;
+mod fileops;
 mod free;
+mod printf;
 mod procfs;
 mod ps;
+mod sleep;
 mod which;
 
 use std::io::Write;
@@ -29,10 +45,19 @@ type Applet = fn(&[String]) -> Result<u8, String>;
 /// ONE table, so a name cannot exist without an arm or an arm without a name —
 /// `--list`, argv[0] dispatch, and the shipped /bin symlink farm all read it.
 const APPLETS: &[(&str, Applet)] = &[
+    ("cat", cat::run),
+    ("chmod", fileattr::chmod),
+    ("chown", fileattr::chown),
     ("clear", clear),
     ("dmesg", dmesg::run),
     ("free", free::run),
+    ("ln", fileops::ln),
+    ("mkdir", fileops::mkdir),
+    ("printf", printf::run),
     ("ps", ps::run),
+    ("readlink", fileops::readlink),
+    ("rm", fileops::rm),
+    ("sleep", sleep::run),
     ("which", which::run),
 ];
 
