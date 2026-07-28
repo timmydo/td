@@ -51,6 +51,11 @@ pub enum Local {
     Var(String, Option<Var>),
     /// `local -`, which saves the option set rather than a variable.
     Opts(Opts),
+    /// Only ever in `pending_unwind`: the `in_function` a terminating unwind did
+    /// NOT put back, so a recovery can. Carrying it here rather than at each
+    /// recovery site is what makes "undo everything that unwind deferred" one
+    /// operation, and what gets the OUTERMOST frame's value when several nest.
+    InFunction(bool),
 }
 
 /// The `set -o` flags the interpreter honours.
@@ -1036,6 +1041,7 @@ fn undo_binding(sh: &mut Shell, entry: Local) {
             sh.vars.remove(&name);
         }
         Local::Opts(opts) => sh.opts = opts,
+        Local::InFunction(was) => sh.in_function = was,
     }
 }
 
@@ -1149,9 +1155,12 @@ fn call_function(
     // unwind longjmps past dash's `poplocalvars`/`unwindlocalvars`, so the trap
     // still sees the `local` and the temp binding of the function it died in.
     (sh.getopts_optind, sh.getopts_off) = saved_getopts;
-    if result.as_ref().err().is_some_and(terminating) {
+    let dying = result.as_ref().err().is_some_and(terminating);
+    if dying {
         defer_locals(sh);
         defer_vars(sh, saved_vars);
+        // Oldest entry of this frame's deferral, so a drain applies it LAST.
+        sh.pending_unwind.push(Local::InFunction(was_in_function));
     } else {
         pop_locals(sh);
         // Below `pop_locals`, so a `local` of the same name unwinds to the binding
@@ -1160,7 +1169,12 @@ fn call_function(
     }
     sh.locals = saved_locals;
     sh.params = saved_params;
-    sh.in_function = was_in_function;
+    // Same rule as the bindings, so an EXIT trap can declare a `local`. Deferred
+    // above rather than dropped, because a shell that RECOVERS instead of exiting
+    // must not keep running inside a function that is gone.
+    if !dying {
+        sh.in_function = was_in_function;
+    }
     sh.loop_depth = saved_loop_depth;
     match result {
         Err(Sig::Return(code)) => {
@@ -1561,6 +1575,80 @@ mod tests {
         assert_eq!(out, "hi\nout=[]\n");
         let (_, out, _) = run("D=dd export E=1; echo out=[$D]");
         assert_eq!(out, "out=[dd]\n");
+    }
+
+    #[test]
+    fn an_exit_trap_runs_inside_the_frame_the_shell_died_in() {
+        // The bindings of that frame already survived; being IN a function has to
+        // survive with them, or `local` in the trap errors and the trap never
+        // runs at all. Every value read off the td-built busybox ash.
+        for (src, want) in [
+            ("f() { exit 7; }; trap 'local Q=1; echo t=ok' EXIT; f", "t=ok\n"),
+            ("f() { echo ${u:?bad}; }; trap 'local Q=1; echo t=ok' EXIT; f", "t=ok\n"),
+            ("g() { exit 7; }; f() { local D=f; g; }; trap 'local Q=1; echo t=ok' EXIT; f",
+             "t=ok\n"),
+            // The trap sees the dead frame's `local`, and can shadow it with one
+            // of its own.
+            ("D=g; f() { local D=f; exit 7; }; trap 'echo t=$D; local D=x; echo u=$D' EXIT; f",
+             "t=f\nu=x\n"),
+            // Not inside one: at the top level, after a plain `exit`, and after a
+            // function that RETURNED, `local` is still an error in all three.
+            ("trap 'local Q=1; echo BAD' EXIT; true", ""),
+            ("trap 'local Q=1; echo BAD' EXIT; exit 3", ""),
+            ("f() { return 3; }; trap 'local Q=1; echo BAD' EXIT; f; exit 4", ""),
+        ] {
+            let (_, out, _) = run(src);
+            assert_eq!(out, want, "{src}");
+        }
+        // The status is the dying one, not the trap's: a trap that now RUNS must
+        // not change what the shell reports.
+        assert_eq!(run("f() { exit 7; }; trap 'local Q=1' EXIT; f").0, 7);
+        // ...and the error case still reports the failed `local`, as before.
+        assert_eq!(run("trap 'local Q=1' EXIT; exit 3").0, 2);
+    }
+
+    #[test]
+    fn a_recovery_puts_back_the_function_it_unwound_out_of() {
+        // Deferring `in_function` is only safe because every recovery undoes it:
+        // a shell that keeps running must not still think it is in the function
+        // it just unwound out of, or `local` works where both references reject
+        // it. `command` is the non-interactive recovery...
+        let (_, out, err) =
+            run("f() { echo ${u:?bad}; }; command eval 'f'; local R=1; echo after=$?");
+        assert_eq!(out, "");
+        assert!(err.contains("not in a function"), "{err}");
+        // ...and the prompt loop is the other. Same program, one unit per line.
+        let (_, out, err) = crate::process::run_capturing_interactive_units(&[
+            "f() { echo ${u:?bad}; }",
+            "f",
+            "local R=1",
+            "echo after=$?",
+        ]);
+        assert_eq!(out, "after=2\n");
+        assert!(err.contains("not in a function"), "{err}");
+        // Several frames dying at once each leave a marker, so the drain order is
+        // load-bearing: applied newest first, the OUTERMOST value lands last.
+        // Reverse it and this is the case that notices.
+        let (_, out, err) = run(
+            "h() { echo ${u:?bad}; }; g() { h; }; f() { g; }; \
+             command eval 'f'; local R=1; echo BAD",
+        );
+        assert_eq!(out, "");
+        assert!(err.contains("not in a function"), "{err}");
+        // A swallow INSIDE a function that is still running must not take its
+        // frame away: `local` there still works, and only the caller's does not.
+        let (_, out, _) = run(
+            "f() { command eval 'echo ${u:?bad}'; local Q=1; echo in=ok; }; f; echo done",
+        );
+        assert_eq!(out, "in=ok\ndone\n");
+        // Same, but with an inner function dying, so a marker really is pushed and
+        // carries `true`. This is what makes the value load-bearing rather than the
+        // marker's presence: applying a hard-coded `false` reds only here.
+        let (_, out, _) = run(
+            "g() { echo ${u:?bad}; }; \
+             f() { command eval 'g'; local Q=1; echo in=ok; }; f; echo done",
+        );
+        assert_eq!(out, "in=ok\ndone\n");
     }
 
     #[test]
