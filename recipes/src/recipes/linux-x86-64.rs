@@ -381,6 +381,14 @@ pub fn recipe() -> Recipe {
     //    BLK_DEV_LOOP under `menuconfig BLK_DEV` (already =y), so no new menuconfig
     //    parent is required.
     //
+    //    SOFTWARE UI: the first graphical profile writes XRGB8888 through the
+    //    virtio-gpu driver's fbdev client and reads QEMU's PS/2 devices through
+    //    evdev. Every driver is built in because modules remain forbidden.
+    //    DRM_CLIENT_SELECTION is selected by DRM_VIRTIO_GPU; the explicit pins
+    //    on its fbdev client and default keep /dev/fb0 from depending on a
+    //    Kconfig default. The VT/fbcon path leaves a visible recovery console
+    //    available even though ttyS0 remains the boot console.
+    //
     //    SECURITY_DMESG_RESTRICT (pinned OFF): with it on, an unprivileged
     //    /dev/kmsg open is EPERM, so the /bin/dmesg system-x86-64 ships from
     //    TD_UTIL_APPLETS breaks for ordinary users. Its `menu "Security options"`
@@ -448,6 +456,24 @@ pub fn recipe() -> Recipe {
                   /^#? *CONFIG_ETHERNET[ =]/d; \
                   /^#? *CONFIG_NET_VENDOR_INTEL[ =]/d; \
                   /^#? *CONFIG_E1000[ =]/d; \
+                  /^#? *CONFIG_INPUT[ =]/d; \
+                  /^#? *CONFIG_INPUT_EVDEV[ =]/d; \
+                  /^#? *CONFIG_INPUT_KEYBOARD[ =]/d; \
+                  /^#? *CONFIG_KEYBOARD_ATKBD[ =]/d; \
+                  /^#? *CONFIG_INPUT_MOUSE[ =]/d; \
+                  /^#? *CONFIG_MOUSE_PS2[ =]/d; \
+                  /^#? *CONFIG_SERIO[ =]/d; \
+                  /^#? *CONFIG_SERIO_I8042[ =]/d; \
+                  /^#? *CONFIG_VT[ =]/d; \
+                  /^#? *CONFIG_VT_CONSOLE[ =]/d; \
+                  /^#? *CONFIG_HW_CONSOLE_BINDING[ =]/d; \
+                  /^#? *CONFIG_FB[ =]/d; \
+                  /^#? *CONFIG_FRAMEBUFFER_CONSOLE[ =]/d; \
+                  /^#? *CONFIG_DRM[ =]/d; \
+                  /^#? *CONFIG_DRM_VIRTIO_GPU[ =]/d; \
+                  /^#? *CONFIG_DRM_VIRTIO_GPU_KMS[ =]/d; \
+                  /^#? *CONFIG_DRM_FBDEV_EMULATION[ =]/d; \
+                  /^#? *CONFIG_DRM_CLIENT_DEFAULT_FBDEV[ =]/d; \
                   /^#? *CONFIG_SECURITY_DMESG_RESTRICT[ =]/d' .config && \
                  printf '%s\\n' \
                    'CONFIG_UNWINDER_FRAME_POINTER=y' \
@@ -497,6 +523,24 @@ pub fn recipe() -> Recipe {
                    'CONFIG_ETHERNET=y' \
                    'CONFIG_NET_VENDOR_INTEL=y' \
                    'CONFIG_E1000=y' \
+                   'CONFIG_INPUT=y' \
+                   'CONFIG_INPUT_EVDEV=y' \
+                   'CONFIG_INPUT_KEYBOARD=y' \
+                   'CONFIG_KEYBOARD_ATKBD=y' \
+                   'CONFIG_INPUT_MOUSE=y' \
+                   'CONFIG_MOUSE_PS2=y' \
+                   'CONFIG_SERIO=y' \
+                   'CONFIG_SERIO_I8042=y' \
+                   'CONFIG_VT=y' \
+                   'CONFIG_VT_CONSOLE=y' \
+                   'CONFIG_HW_CONSOLE_BINDING=y' \
+                   'CONFIG_FB=y' \
+                   'CONFIG_FRAMEBUFFER_CONSOLE=y' \
+                   'CONFIG_DRM=y' \
+                   'CONFIG_DRM_VIRTIO_GPU=y' \
+                   'CONFIG_DRM_VIRTIO_GPU_KMS=y' \
+                   'CONFIG_DRM_FBDEV_EMULATION=y' \
+                   'CONFIG_DRM_CLIENT_DEFAULT_FBDEV=y' \
                    '# CONFIG_SECURITY_DMESG_RESTRICT is not set' >> .config",
             ],
         )
@@ -545,6 +589,16 @@ pub fn recipe() -> Recipe {
                  grep -q '^CONFIG_NETDEVICES=y' .config || { echo 'NETDEVICES off (menuconfig parent dropped) — no NIC drivers are visible' >&2; exit 1; }; \
                  grep -q '^CONFIG_VIRTIO_NET=y' .config || { echo 'VIRTIO_NET off — the qemu user-net virtio NIC would not appear' >&2; exit 1; }; \
                  grep -q '^CONFIG_E1000=y' .config || { echo 'E1000 off (ETHERNET/NET_VENDOR_INTEL menuconfig parents likely dropped) — no real Intel NIC driver' >&2; exit 1; }; \
+                 grep -q '^CONFIG_INPUT_EVDEV=y' .config || { echo 'INPUT_EVDEV off — td-compositor cannot read /dev/input/eventN' >&2; exit 1; }; \
+                 grep -q '^CONFIG_KEYBOARD_ATKBD=y' .config || { echo 'KEYBOARD_ATKBD off — the qemu PS/2 keyboard would not appear' >&2; exit 1; }; \
+                 grep -q '^CONFIG_MOUSE_PS2=y' .config || { echo 'MOUSE_PS2 off — the qemu PS/2 pointer would not appear' >&2; exit 1; }; \
+                 grep -q '^CONFIG_SERIO_I8042=y' .config || { echo 'SERIO_I8042 off — qemu PS/2 input has no controller' >&2; exit 1; }; \
+                 grep -q '^CONFIG_VT_CONSOLE=y' .config || { echo 'VT_CONSOLE off — the framebuffer recovery console is unavailable' >&2; exit 1; }; \
+                 grep -q '^CONFIG_FRAMEBUFFER_CONSOLE=y' .config || { echo 'FRAMEBUFFER_CONSOLE off — virtio fbdev cannot host the recovery console' >&2; exit 1; }; \
+                 grep -q '^CONFIG_DRM_VIRTIO_GPU=y' .config || { echo 'DRM_VIRTIO_GPU off — qemu virtio-vga cannot expose /dev/fb0' >&2; exit 1; }; \
+                 grep -q '^CONFIG_DRM_VIRTIO_GPU_KMS=y' .config || { echo 'DRM_VIRTIO_GPU_KMS off — virtio-gpu has no scanout' >&2; exit 1; }; \
+                 grep -q '^CONFIG_DRM_FBDEV_EMULATION=y' .config || { echo 'DRM_FBDEV_EMULATION off — td-compositor has no /dev/fb0 software scanout' >&2; exit 1; }; \
+                 grep -q '^CONFIG_DRM_CLIENT_DEFAULT_FBDEV=y' .config || { echo 'DRM_CLIENT_DEFAULT_FBDEV off — the selected virtio DRM client will not create fb0' >&2; exit 1; }; \
                  if grep -q '^CONFIG_KEXEC=y' .config; then echo 'KEXEC (legacy segment-based kexec_load) on — only KEXEC_FILE is used; the legacy syscall is kept off to not widen the surface' >&2; exit 1; fi; \
                  if grep -q '^CONFIG_KEXEC_SIG=y' .config; then echo 'KEXEC_SIG on — would demand a trusted-keyring signature policy td does not ship' >&2; exit 1; fi; \
                  if grep -q '^CONFIG_RANDOMIZE_BASE=y' .config; then echo 'RANDOMIZE_BASE (KASLR) on — pinned off for a deterministic kexec boot' >&2; exit 1; fi; \

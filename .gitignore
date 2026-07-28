@@ -72,3 +72,8 @@ td-svc/target/
 # rustc build, but compiled here by the cargo-test gate and by hand when
 # validating the login chain.
 td-login/target/
+
+# td's minimal graphical stack is built directly during development and by
+# rustc in its recipes; the gate uses a scratch CARGO_TARGET_DIR.
+td-compositor/target/
+td-seatd/target/

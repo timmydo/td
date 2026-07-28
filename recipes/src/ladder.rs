@@ -276,6 +276,13 @@ pub const TD_INIT_RUNTIME_MARKER: &str = "TD-INIT-RUN-OK";
 /// columns, and the supplementary set exactly. See td-login/THREAT-MODEL.md.
 pub const TD_LOGIN_RUNTIME_MARKER: &str = "TD-LOGIN-RUN-OK";
 
+/// Printed by the unprivileged compositor only after its first framebuffer
+/// paint succeeded and its mode-0600 Wayland socket is listening.
+///
+/// DUPLICATED as the ready line in td-compositor/src/server.rs. The compositor
+/// recipe pins the source literal to this value.
+pub const TD_WAYLAND_RUNTIME_MARKER: &str = "TD-WAYLAND-READY";
+
 /// Kernel-cmdline token the headless `qemu-boot-system` oracle appends so the greeter
 /// waits for the root-owned health/update transaction and then exits. `tty-session`
 /// turns that exit into a clean VM poweroff. Without it, the greeter is interactive.

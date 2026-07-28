@@ -181,6 +181,10 @@ const SYSTEM: SystemDef = SystemDef {
         },
     ],
 };
+
+const UI_USER: &str = "tester";
+const UI_UID: u32 = 1000;
+const UI_GID: u32 = 1000;
 // ────────────────────────────────────────────────────────────────────────────────
 
 /// The real-root `/bin` is a symlink farm split across SIX multicall binaries, each
@@ -658,11 +662,13 @@ fn td_svc_conf_etc_name() -> &'static str {
 /// on a table it cannot parse, but a unit SILENTLY dropped from the plan — skipped for
 /// an unsatisfiable dependency — is a clean exit with a shorter list, and that is the
 /// regression this catches: the boot comes up missing a service and says nothing.
-const TD_SVC_UNITS: [&str; 8] = [
+const TD_SVC_UNITS: [&str; 10] = [
     "hostname",
     "td-firstboot",
     "rootcheck",
+    "seat",
     "netup",
+    "wayland",
     "bootsuccess",
     "bootfail",
     "sshd",
@@ -686,6 +692,8 @@ mod svc_timeouts {
     pub const FIRSTBOOT: u32 = 300;
     /// Dozens of greps over /proc/mounts, several `su` runs, and write probes.
     pub const ROOTCHECK: u32 = 120;
+    /// Validates and assigns one framebuffer plus the built-in evdev nodes.
+    pub const SEAT: u32 = 30;
     /// `td-netd up` is DHCP with bounded retries (2s reads); under the nettest token it
     /// also resolves (3s x 3) and reaches (5s connect) a real host.
     pub const NETUP: u32 = 300;
@@ -724,10 +732,11 @@ mod svc_timeouts {
 /// had run to completion. Naming the set rather than just its last member keeps that
 /// true if the chain is ever reordered.
 ///
-/// `after=` throughout, never `requires=`: these are the ORDERING edges the inittab
-/// already had. A failed job did not stop the ones behind it under init, and it must
-/// not here — td-svc/DESIGN.md records why strictness would never engage where it
-/// would help on these particular scripts, and would strip the console where it hurts.
+/// Existing boot jobs keep their ordering-only `after=` edges. The graphical daemon
+/// additionally requires the seat assignment: starting an unprivileged compositor
+/// without its device capability can only crash-loop. Deployment success strictly
+/// requires graphical readiness, so a broken UI cannot mark an update healthy. The
+/// serial console has no such dependency and remains available when graphics fail.
 fn build_td_svc_conf() -> String {
     // The sysinit set, in one place: every post-sysinit unit names all of it.
     let sysinit = "hostname,td-firstboot,rootcheck,netup";
@@ -761,6 +770,13 @@ fn build_td_svc_conf() -> String {
          after=td-firstboot\n\
          timeout={rootcheck}\n\
          \n\
+         # The one graphical user owns the fixed framebuffer and evdev seat.\n\
+         [seat]\n\
+         type=oneshot\n\
+         exec=/bin/td-seatd assign --uid {ui_uid} --gid {ui_gid}\n\
+         after=rootcheck\n\
+         timeout={seat}\n\
+         \n\
          # Networking after the read-only-root self-check.\n\
          [netup]\n\
          type=oneshot\n\
@@ -768,10 +784,22 @@ fn build_td_svc_conf() -> String {
          after=rootcheck\n\
          timeout={netup}\n\
          \n\
+         # No shell-owned device setup: td-seatd assigned the nodes, td-login drops\n\
+         # credentials, and the compositor opens only those fixed paths.\n\
+         [wayland]\n\
+         type=daemon\n\
+         exec=/bin/su -s /bin/sh {ui_user} -c '/bin/td-compositor run --framebuffer /dev/fb0 --input /dev/input --socket /run/user/{ui_uid}/wayland-0'\n\
+         after=seat\n\
+         requires=seat\n\
+         ready=/bin/su -s /bin/sh {ui_user} -c '/bin/td-compositor probe /run/user/{ui_uid}/wayland-0'\n\
+         ready-timeout=30\n\
+         restart=always\n\
+         \n\
          [bootsuccess]\n\
          type=oneshot\n\
          exec=/etc/bootsuccess\n\
-         after={sysinit}\n\
+         after={sysinit},wayland\n\
+         requires=wayland\n\
          timeout={bootsuccess}\n\
          \n\
          [bootfail]\n\
@@ -812,9 +840,13 @@ fn build_td_svc_conf() -> String {
         hostname = svc_timeouts::HOSTNAME,
         firstboot = svc_timeouts::FIRSTBOOT,
         rootcheck = svc_timeouts::ROOTCHECK,
+        seat = svc_timeouts::SEAT,
         netup = svc_timeouts::NETUP,
         bootsuccess = svc_timeouts::BOOTSUCCESS,
         bootfail = svc_timeouts::BOOTFAIL,
+        ui_user = UI_USER,
+        ui_uid = UI_UID,
+        ui_gid = UI_GID,
         host_key = SSHD_HOST_KEY,
         authorized_keys = SSHD_AUTHORIZED_KEYS,
     )
@@ -1389,6 +1421,8 @@ fn build_profile(sys: &SystemDef) -> String {
     // Just /bin — the store-native symlink farm. There is no /usr or /sbin in this image
     // (every /bin entry resolves into /td/store), so keep PATH honest and minimal.
     s.push_str("export PATH=/bin\n");
+    s.push_str(&format!("export XDG_RUNTIME_DIR=/run/user/{UI_UID}\n"));
+    s.push_str("export WAYLAND_DISPLAY=wayland-0\n");
     s.push_str("export PS1='\\u@\\h:\\w\\$ '\n");
     s.push_str(&format!(
         "if /bin/grep -q -F '{BOOT_FAIL_TARGET_CMDLINE_TOKEN}' /proc/cmdline; then \
@@ -1826,6 +1860,15 @@ fn real_root_steps(sys: &SystemDef) -> Vec<Step> {
         from: "{in:td-svc}".into(),
         dest: "{root}/real-root{in:td-svc}".into(),
     });
+    // The software UI is static and owns no dynamic runtime closure.
+    steps.push(Step::CopyTree {
+        from: "{in:td-seatd}".into(),
+        dest: "{root}/real-root{in:td-seatd}".into(),
+    });
+    steps.push(Step::CopyTree {
+        from: "{in:td-compositor}".into(),
+        dest: "{root}/real-root{in:td-compositor}".into(),
+    });
     // Stage the dynamically linked userland and every transitively referenced store item
     // at its canonical absolute path. uutils, ripgrep, and fd pull their td glibc closure;
     // sshd additionally pulls the aws-lc crypto C lib. The engine admits only direct recipe
@@ -1898,6 +1941,14 @@ fn real_root_steps(sys: &SystemDef) -> Vec<Step> {
     steps.push(Step::Symlink {
         target: "{in:td-svc}/bin/td-svc".into(),
         link: "{root}/real-root/bin/td-svc".into(),
+    });
+    steps.push(Step::Symlink {
+        target: "{in:td-seatd}/bin/td-seatd".into(),
+        link: "{root}/real-root/bin/td-seatd".into(),
+    });
+    steps.push(Step::Symlink {
+        target: "{in:td-compositor}/bin/td-compositor".into(),
+        link: "{root}/real-root/bin/td-compositor".into(),
     });
     // /bin/td-util is the multicall's own entry (`td-util <applet>`, and `--list`); the loop
     // below is the argv[0] farm the diagnostics names resolve through.
@@ -2111,6 +2162,10 @@ fn shape_check() -> String {
      tditab=$(\"$tdi\" init --dry-run -f \"$root/etc/inittab\" 2>&1) || { echo 'td-init init --dry-run REJECTED the inittab this image ships - PID 1 would come up having understood only part of its table. Its per-line diagnostics:' >&2; printf '%s\\n' \"$tditab\" >&2; exit 1; }; \
      [ \"$(readlink \"$root/bin/td-svc\" 2>/dev/null)\" = \"{in:td-svc}/bin/td-svc\" ] || { echo 'root tree: /bin/td-svc is not a symlink to the staged service supervisor - PID 1s only respawn line would exec nothing and the machine would have no userland at all' >&2; exit 1; }; \
      tds=\"{root}/real-root{in:td-svc}/bin/td-svc\"; { [ -f \"$tds\" ] && [ -x \"$tds\" ]; } || { echo 'root tree: the td-svc binary is not packed/executable at real-root{in:td-svc}/bin/td-svc - no identity, no network, no sshd and no console' >&2; exit 1; }; \
+     [ \"$(readlink \"$root/bin/td-seatd\" 2>/dev/null)\" = \"{in:td-seatd}/bin/td-seatd\" ] || { echo 'root tree: /bin/td-seatd is not a symlink to the staged single-user seat assigner' >&2; exit 1; }; \
+     seat=\"{root}/real-root{in:td-seatd}/bin/td-seatd\"; { [ -f \"$seat\" ] && [ -x \"$seat\" ]; } || { echo 'root tree: td-seatd is not packed and executable' >&2; exit 1; }; \
+     [ \"$(readlink \"$root/bin/td-compositor\" 2>/dev/null)\" = \"{in:td-compositor}/bin/td-compositor\" ] || { echo 'root tree: /bin/td-compositor is not a symlink to the staged software Wayland compositor' >&2; exit 1; }; \
+     compositor=\"{root}/real-root{in:td-compositor}/bin/td-compositor\"; { [ -f \"$compositor\" ] && [ -x \"$compositor\" ]; } || { echo 'root tree: td-compositor is not packed and executable' >&2; exit 1; }; \
      tdsplan=$(\"$tds\" check -f \"$root@TD_SVC_CONF@\" 2>&1) || { echo 'td-svc check REJECTED the unit table this image ships - the boot would run a table the supervisor only partly understood. Its diagnostics:' >&2; printf '%s\\n' \"$tdsplan\" >&2; exit 1; }; \
      for u in @TD_SVC_UNITS@; do \
          printf '%s\\n' \"$tdsplan\" | grep -q -E \"^[0-9]+\\. $u\\$\" || { echo \"td-svc check resolved a start order without '$u' - a unit the inittab used to run is missing from the plan\" >&2; exit 1; }; \
@@ -2379,6 +2434,8 @@ pub fn recipe() -> Recipe {
         //   serving the /bin/{login,su} farm. Load-bearing like td-init rather than
         //   probe-only like td-util: `login -f` is how the greeter is reached and `su` is
         //   how every unprivileged health leg runs. See td-login/THREAT-MODEL.md.
+        // td-svc: the static service supervisor that starts every real-root job.
+        // td-seatd/td-compositor: the static single-user UI substrate, copied directly.
         .native_inputs(&[
             "busybox-x86-64",
             "linux-x86-64",
@@ -2396,6 +2453,8 @@ pub fn recipe() -> Recipe {
             "td-firstboot",
             "td-login",
             "td-svc",
+            "td-seatd",
+            "td-compositor",
         ])
         .steps(steps)
 }
@@ -2524,7 +2583,9 @@ mod tests {
             "/bin/hostname -F /etc/hostname",
             "/bin/td-firstboot provision",
             "/etc/rootcheck",
+            "/bin/td-seatd assign",
             "/etc/netup",
+            "/bin/td-compositor run",
             "/etc/bootsuccess",
             "/etc/bootfail",
             "/bin/sshd serve",
@@ -2633,10 +2694,15 @@ mod tests {
         // is the point: 31 was the value review proposed as obviously-too-tight.
         const HEADROOM: u32 = 2;
         // (value, worst case in seconds, what that worst case is)
-        let floors: [(u32, u32, &str); 6] = [
+        let floors: [(u32, u32, &str); 7] = [
             (svc_timeouts::HOSTNAME, 1, "one file read plus sethostname(2)"),
             (svc_timeouts::FIRSTBOOT, 60, "ed25519 keygen, writes to /var, then sync"),
             (svc_timeouts::ROOTCHECK, 50, "~50 process spawns incl. su, plus a sync"),
+            (
+                svc_timeouts::SEAT,
+                1,
+                "one sysfs/devtmpfs scan plus ownership and mode verification",
+            ),
             (
                 svc_timeouts::NETUP,
                 26,
@@ -2692,8 +2758,17 @@ mod tests {
             ("hostname", vec![]),
             ("td-firstboot", vec!["hostname"]),
             ("rootcheck", vec!["td-firstboot"]),
+            ("seat", vec!["rootcheck"]),
             ("netup", vec!["rootcheck"]),
-            ("bootsuccess", sysinit.to_vec()),
+            ("wayland", vec!["seat"]),
+            (
+                "bootsuccess",
+                sysinit
+                    .iter()
+                    .copied()
+                    .chain(std::iter::once("wayland"))
+                    .collect(),
+            ),
             ("bootfail", sysinit.to_vec()),
             ("sshd", sysinit.to_vec()),
             ("greeter", sysinit.to_vec()),
@@ -2744,6 +2819,16 @@ mod tests {
                 );
             }
         }
+        assert!(
+            unit_after("bootsuccess").contains(&"wayland".to_string()),
+            "bootsuccess must be ordered after the graphical readiness decision"
+        );
+        assert_eq!(
+            unit_key("bootsuccess", "requires").as_deref(),
+            Some("wayland"),
+            "deployment health must be skipped when the graphical daemon failed; \
+             after= alone settles on either success or failure"
+        );
     }
 
     /// The console keeps td-svc's I5 protection: ordering only, never a strict
@@ -2770,6 +2855,16 @@ mod tests {
             unit_key("sshd", "restart").as_deref(),
             Some("always"),
             "sshd replaced a `respawn` line and must restart like one"
+        );
+        assert_eq!(
+            unit_key("wayland", "requires").as_deref(),
+            Some("seat"),
+            "the unprivileged compositor must not start when seat assignment failed"
+        );
+        assert_eq!(
+            unit_key("wayland", "restart").as_deref(),
+            Some("always"),
+            "the graphical session is supervised and restartable"
         );
     }
 
@@ -2911,6 +3006,18 @@ mod tests {
                 .is_some_and(|user| user.uid != 0),
             "autologin user '{}' must resolve uniquely to an unprivileged user",
             SYSTEM.autologin
+        );
+        assert!(
+            SYSTEM
+                .users
+                .iter()
+                .find(|user| user.name == SYSTEM.autologin)
+                .is_some_and(|user| {
+                    user.name == UI_USER && user.uid == UI_UID && user.gid == UI_GID
+                }),
+            "the first UI profile is deliberately one fixed seat: build_td_svc_conf, \
+             td-seatd, XDG_RUNTIME_DIR, and WAYLAND_DISPLAY all bind tester 1000:1000; \
+             make those generated before changing the graphical account"
         );
         // td-login refuses `login -f` for a LOCKED account — stricter than busybox, whose
         // `-f` skips the account database entirely (td-login/THREAT-MODEL.md section 3). So a
@@ -4302,6 +4409,12 @@ mod tests {
         assert!(
             profile.contains(GREETER_MARKER),
             "profile must emit the greeter marker"
+        );
+        assert!(
+            profile.contains("export XDG_RUNTIME_DIR=/run/user/1000")
+                && profile.contains("export WAYLAND_DISPLAY=wayland-0"),
+            "the graphical login environment must name the seat-owned runtime \
+             directory and compositor socket"
         );
         assert!(
             profile.contains(AUTOTEST_CMDLINE_TOKEN)

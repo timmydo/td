@@ -1,0 +1,26 @@
+[package]
+name = "td-compositor"
+version = "0.1.0"
+edition = "2021"
+description = "Software-rendered minimal Wayland compositor for td"
+license = "GPL-3.0-or-later"
+
+[[bin]]
+name = "td-compositor"
+path = "src/main.rs"
+
+[workspace]
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+unreachable = "deny"
+todo = "deny"
+unimplemented = "deny"
+indexing_slicing = "deny"
+
+[profile.release]
+opt-level = "s"
+panic = "abort"
+strip = true

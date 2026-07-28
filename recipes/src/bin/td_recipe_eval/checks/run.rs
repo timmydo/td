@@ -1,6 +1,6 @@
 //! Host-side interactive distro runner (re #541, #550): build the td-source-built
 //! `system-x86-64` deployment bundle and boot it under HOST qemu with an
-//! INTERACTIVE serial console, so an operator can
+//! graphical virtio framebuffer plus an INTERACTIVE serial console, so an operator can
 //! watch it boot, mount the read-only erofs root, `switch_root` into it, auto-log-in as
 //! the test user, and use the shell. Reached only through the `td-recipe-eval run`
 //! subcommand (check_runner::run_cli).
@@ -17,7 +17,7 @@
 //! qemu is a control-plane TEST tool that only RUNS the td-built artifact and never
 //! enters a target closure). The difference is the console: qemu_boot is a headless
 //! PASS/FAIL oracle that scans ttyS0 for a marker and kills qemu; this hands the guest a
-//! real terminal (`-nographic` wires ttyS0 <-> the operator's stdio) and does NOT scan,
+//! real terminal (`-serial mon:stdio` wires ttyS0 <-> the operator's stdio) and does NOT scan,
 //! time out, or kill. The operator exits the guest by typing `exit` / Ctrl-D at the
 //! greeter shell: the ttyS0 session is wrapped by `/etc/tty-session`, which runs the
 //! login flow AS ROOT (init's child) and, when the session ends, runs `/etc/shutdown`
@@ -173,7 +173,7 @@ pub(crate) fn run(runner: &RecipeCheckRunner, lock: File) -> Result<(), String> 
     drop(lock);
 
     println!(
-        "   [run] booting the td distro through its persistent selector under {qemu} (TCG) - interactive serial console\n         \
+        "   [run] booting the td distro through its persistent selector under {qemu} (TCG) - virtio framebuffer + interactive serial console\n         \
          shim kernel:   {}\n         initramfs:     {}\n         Btrfs volume:  {}\n         \
          The initramfs verifies + kexecs current, loop-mounts its EROFS root, mounts @var,\n         \
          and switch_roots into the deployment. This private test volume lasts for the\n         \
@@ -190,7 +190,10 @@ pub(crate) fn run(runner: &RecipeCheckRunner, lock: File) -> Result<(), String> 
 }
 
 /// Boot the selector plus deployment under qemu with the guest's ttyS0 wired to THIS process's
-/// stdio (`-nographic`), inherited so the operator drives the console directly. The
+/// stdio (`-serial mon:stdio`), inherited so the operator drives the console directly while
+/// qemu's display frontend shows the virtio framebuffer when a host X11 or Wayland display is
+/// reachable. A terminal-only host adds `-display none`; the same virtio output remains attached
+/// and the serial console remains interactive. The
 /// selector initramfs boots with a writable Btrfs volume attached as `/dev/vda`.
 /// It selects and kexecs current; the deployment initramfs mounts root.erofs and @var. No
 /// marker scan, no timeout, no kill — the guest owns the terminal until the operator
@@ -209,9 +212,16 @@ fn boot_interactive(
     // token either, so the greeter is a normal interactive shell (it powers off on `exit`,
     // not immediately).
     let append = "console=ttyS0 rdinit=/init";
-    let status = Command::new(qemu)
+    let mut command = Command::new(qemu);
+    command
         .args(["-M", "pc", "-accel", "tcg", "-m", "512", "-no-reboot"])
-        .args(["-no-user-config", "-nic", "none", "-nographic"])
+        .args(["-no-user-config", "-nic", "none", "-vga", "none"])
+        .args(["-device", "virtio-vga"]);
+    if !host_display_available() {
+        command.args(["-display", "none"]);
+    }
+    let status = command
+        .args(["-serial", "mon:stdio"])
         .arg("-kernel")
         .arg(bzimage)
         .arg("-initrd")
@@ -236,4 +246,21 @@ fn boot_interactive(
         ));
     }
     Ok(())
+}
+
+fn host_display_available() -> bool {
+    let nonempty = |name| {
+        std::env::var_os(name)
+            .is_some_and(|value| !value.is_empty())
+    };
+    if nonempty("DISPLAY") {
+        return true;
+    }
+    let Some(runtime) = std::env::var_os("XDG_RUNTIME_DIR").filter(|value| !value.is_empty()) else {
+        return false;
+    };
+    let Some(display) = std::env::var_os("WAYLAND_DISPLAY").filter(|value| !value.is_empty()) else {
+        return false;
+    };
+    Path::new(&runtime).join(display).exists()
 }

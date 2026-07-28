@@ -34,6 +34,10 @@
 #                     through one reviewed symlink each). Pure safe std: it
 #                     delegates ed25519 generation to `sshd keygen` and reads
 #                     its entropy from /dev/urandom as an ordinary file.
+#   td-seatd/       — the target-built single-user framebuffer/evdev seat
+#                     assigner; pure safe std with no broker daemon.
+#   td-compositor/  — the target-built software Wayland compositor; its only
+#                     unsafe is the confined SCM_RIGHTS syscall layer.
 #   td-review/      — a HOST-side integrator utility (branch review + squash
 #                     landing TUI). In neither bootstrap graph: it is not a
 #                     control-plane build program and never enters a closure.
@@ -42,7 +46,7 @@
 [workspace]
 resolver = "2"
 members = ["builder", "recipes", "engine"]
-exclude = ["net", "td-kexec", "td-sh", "td-txt", "td-netd", "td-boot", "td-util", "td-init", "td-firstboot", "td-review", "td-svc", "tests/sshd"]
+exclude = ["net", "td-kexec", "td-sh", "td-txt", "td-netd", "td-boot", "td-util", "td-init", "td-firstboot", "td-seatd", "td-compositor", "td-review", "td-svc", "tests/sshd"]
 
 [profile.release]
 # Keep the release profile explicit and minimal so the reproducibility oracle

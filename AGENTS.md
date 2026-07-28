@@ -285,7 +285,7 @@ td's Rust is defensive and minimal-surface.
   raw-syscall layer (`builder/src/sys.rs` and its callers `nar.rs`/`sandbox.rs`),
   which carry `#![allow(unsafe_code)]` so `builder` can be `libc`-free. Every other
   engine crate (the shared `engine` lib and `recipes`/`fetch`/`feed`/`subst`)
-  `forbid`s `unsafe_code`. There are FIVE target-side exceptions, each a standalone
+  `forbid`s `unsafe_code`. There are SIX target-side exceptions, each a standalone
   crate OUTSIDE the `builder`/`recipes`/`engine` workspace whose only `unsafe` is that
   same `syscall`-instruction layer under a scoped `#[allow]` (the crate itself
   `#![deny(unsafe_code)]`s): (1) the `td-kexec` guest helper, confined to exactly two
@@ -381,6 +381,17 @@ td's Rust is defensive and minimal-surface.
   give the one audited call a name none of those scans looks for. `sys.rs`'s own
   tests then issue the syscall, because every assertion above is about source TEXT
   and a `kill` that returned `Ok(())` without issuing anything satisfies all of them.
+  And (6) the `td-compositor` software Wayland server, whose one `syscall3` body in
+  `td-compositor/src/sys.rs` carries `recvmsg(2)` for wl_shm SCM_RIGHTS reception,
+  `close(2)` for the received descriptor after safe duplication through
+  `/proc/self/fd/N`, and a test-only `sendmsg(2)` that drives the descriptor path
+  end-to-end. Stable Rust exposes no stable ancillary-data API. Deliberately NOT in
+  that surface: framebuffer and evdev I/O (ordinary files), Unix socket setup and
+  byte I/O (`std`), mmap (wl_shm pixels are copied with `FileExt`), or device
+  ownership (safe `td-seatd`). `td-compositor/DESIGN.md` is the normative UI-stack
+  specification. Its confinement tests pin the allow count, assembly body, syscall
+  numbers, callers, and absence of unsafe from every other module; adding another
+  syscall or scoped allow is an amendment there AND here.
   Do not add `unsafe` anywhere else; a new `unsafe` surface is a reviewed
   amendment recorded here.
 - **The engine is dependency-free.** `builder`, `recipes`, and the shared std-only
@@ -390,15 +401,18 @@ td's Rust is defensive and minimal-surface.
   `[[package]]` entries (the known path members) AND no external `source = ` line
   (path members carry none), so a new registry/git dep OR a new path member both red it.
   The target-side `td-kexec`, `td-sh`, `td-txt`, `td-netd`, `td-boot`, `td-util`,
-  `td-init`, `td-firstboot`, `td-login`, and `td-svc` crates outside the workspace
-  each keep their own 1-package lock; `td-sh`, `td-txt`, `td-boot`, `td-util`, and
-  `td-firstboot` contain no `unsafe`. `td-svc` (the service supervisor: ordering,
+  `td-init`, `td-firstboot`, `td-login`, `td-svc`, `td-seatd`, and `td-compositor`
+  crates outside the workspace each keep their own 1-package lock; `td-sh`, `td-txt`,
+  `td-boot`, `td-util`, `td-firstboot`, and `td-seatd` contain no `unsafe`. `td-svc`
+  (the service supervisor: ordering,
   restart backoff, log capture, ordered shutdown, and Ctrl-Alt-Del) is the FIFTH
   exception above, and only for `kill(2)`; everything else it needs is still reachable
   through safe `std`, which is what keeps that surface at one. `td-svc/DESIGN.md` is
   its normative specification, recording both that and the invariants no compiler
   checks (no `pre_exec`, liveness read from `/proc` rather than inferred from an exit
   status, and a console that is neither skippable nor indefinitely delayed).
+  `td-compositor` is the SIXTH exception above and only for Wayland descriptor
+  transport; its UI and confinement contract lives in `td-compositor/DESIGN.md`.
   `td-review` (the host-side integrator branch-review/landing TUI) keeps one
   too: it is in NEITHER bootstrap graph — no recipe builds it and it never
   enters a closure — but it is pure `std`, `forbid`s

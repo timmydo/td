@@ -99,6 +99,8 @@ const TD_INIT_RUNTIME_MARKER: &str = td_recipe::ladder::TD_INIT_RUNTIME_MARKER;
 /// `/proc/self/status` and they matched exactly. This is the only marker that asserts the
 /// RESULT of a credential change rather than that something ran.
 const TD_LOGIN_RUNTIME_MARKER: &str = td_recipe::ladder::TD_LOGIN_RUNTIME_MARKER;
+/// Printed after the unprivileged software compositor paints and listens.
+const TD_WAYLAND_RUNTIME_MARKER: &str = td_recipe::ladder::TD_WAYLAND_RUNTIME_MARKER;
 
 /// The line `/etc/rootcheck` prints once it has confirmed `/` is a READ-ONLY erofs
 /// mount (re #550). `qemu-boot-system` asserts it to prove the switched-into root is
@@ -229,6 +231,7 @@ struct ConsoleEvidence {
     td_txt_runtime: bool,
     td_init_runtime: bool,
     td_login_runtime: bool,
+    td_wayland_runtime: bool,
     persist_write: bool,
     persist_read: bool,
     boot_success: bool,
@@ -782,7 +785,8 @@ pub(crate) fn run_system(runner: &RecipeCheckRunner) -> Result<(), String> {
          ({TD_UTIL_RUNTIME_MARKER}), td-txt's grep+sed answering correctly over the live \
          /proc ({TD_TXT_RUNTIME_MARKER}), the td-init boot glue ({TD_INIT_RUNTIME_MARKER}) and a \
          td-login credential switch the switched process read back and confirmed \
-         ({TD_LOGIN_RUNTIME_MARKER}), \
+         ({TD_LOGIN_RUNTIME_MARKER}), then assigned the single-user graphical seat and brought \
+         the software Wayland socket up on virtio-gpu ({TD_WAYLAND_RUNTIME_MARKER}), \
          and unmounted state \
          before exit ({SYSTEM_SHUTDOWN_MARKER})",
         td_boot_protocol::DEFAULT_BOOT_ATTEMPTS,
@@ -1156,6 +1160,16 @@ fn validate_system_boot(
              before `setgroups(2)` drops the uid and silently keeps root's supplementary \
              groups, and every other marker here still prints. See \
              td-login/THREAT-MODEL.md. Last serial output:\n{}",
+            tail(&result.console, 80)
+        ));
+    }
+    if !result.evidence.td_wayland_runtime {
+        return Err(format!(
+            "the serial boot and userland health checks passed, but the graphical runtime \
+             marker ({TD_WAYLAND_RUNTIME_MARKER:?}) was absent — td-seatd did not assign \
+             /dev/fb0 and the evdev seat to uid 1000, the unprivileged compositor could not \
+             paint the virtio-gpu framebuffer, or its mode-0600 Wayland socket never began \
+             listening. The serial greeter remains the recovery path. Last serial output:\n{}",
             tail(&result.console, 80)
         ));
     }
@@ -2215,7 +2229,8 @@ fn boot(
     //   expose it either; TCG always works and a tiny kernel boots fast).
     // -serial file:<console>: route ttyS0 straight to a file — deterministic, no
     //   tty/stdio games (unlike -nographic, which wants a terminal on stdin).
-    // -display none / -monitor none: fully headless.
+    // -display none / -monitor none: fully headless. The attached virtio-vga still
+    //   exercises fbdev and the software compositor; only its host display is hidden.
     // Networking is attached conditionally below (a user-mode NIC for qemu-boot-net,
     // else `-nic none`) — qemu's default is an implicit user-mode NIC, so every mode
     // sets one explicitly.
@@ -2247,7 +2262,8 @@ fn boot(
     let mut cmd = Command::new(qemu);
     cmd.args(["-M", "pc", "-accel", "tcg", "-m", plan.mem, "-no-reboot"])
         .args(["-display", "none", "-monitor", "none"])
-        .args(["-no-user-config"])
+        .args(["-no-user-config", "-vga", "none"])
+        .args(["-device", "virtio-vga"])
         .args(["-serial", &serial])
         .arg("-kernel")
         .arg(bzimage)
@@ -2556,6 +2572,7 @@ fn evidence_marker_max_len(target: &[u8]) -> usize {
         TD_UTIL_RUNTIME_MARKER.len(),
         TD_INIT_RUNTIME_MARKER.len(),
         TD_LOGIN_RUNTIME_MARKER.len(),
+        TD_WAYLAND_RUNTIME_MARKER.len(),
         SYSTEM_PERSIST_WRITE_MARKER.len(),
         SYSTEM_PERSIST_READ_MARKER.len(),
         SYSTEM_BOOT_SUCCESS_MARKER.len(),
@@ -2684,6 +2701,11 @@ fn latch_console_evidence(evidence: &mut ConsoleEvidence, buf: &[u8], target: &[
         &mut evidence.td_login_runtime,
         buf,
         TD_LOGIN_RUNTIME_MARKER.as_bytes(),
+    );
+    latch_marker(
+        &mut evidence.td_wayland_runtime,
+        buf,
+        TD_WAYLAND_RUNTIME_MARKER.as_bytes(),
     );
     latch_marker(
         &mut evidence.persist_write,
@@ -3124,7 +3146,7 @@ mod tests {
     /// this: its result is dominated by the id-bearing markers (marker + space + 64-char
     /// hex), so a "no marker exceeds the max" assertion cannot fail and would only look like
     /// a guard. The rescan window is covered behaviourally instead, by the split tests below.
-    fn all_console_markers() -> [&'static str; 31] {
+    fn all_console_markers() -> [&'static str; 32] {
         [
             MARKER,
             EROFS_MARKER,
@@ -3157,6 +3179,7 @@ mod tests {
             TD_TXT_RUNTIME_MARKER,
             TD_INIT_RUNTIME_MARKER,
             TD_LOGIN_RUNTIME_MARKER,
+            TD_WAYLAND_RUNTIME_MARKER,
         ]
     }
 
