@@ -32,9 +32,10 @@ echo ">> build-recipes: the build_gate PRELUDE — stage0 td-builder (env rust) 
 export CACHE="$PWD/.td-build-cache/pkg" TD_STAGE0_BASE="$PWD/.td-build-cache/stage0"; mkdir -p "$CACHE"
 . tests/cache-lib.sh; load_stage0
 echo ">> builds run on the td-bootstrapped stage0 td-builder ($TD_BUILDER_PATH) — compiled from source with the environment's rust, no guix-built td-builder"
-# Preserve recipe-eval-tool's exit code: 69 (no toolchain in the jail) degrades
-# this prelude to Unprovisioned/tolerated in gate-run rather than RED (#469).
-sh tests/recipe-eval-tool.sh "$PWD/.td-build-cache/recipe-eval" >/dev/null \
+# Memoized on the recipes source: a warm tree reuses the built evaluator with no
+# toolchain, which is the only way this passes in the sandbox. A real MISS there
+# still exits 69, degrading the prelude to Unprovisioned/tolerated (#469).
+"$TB" recipe-eval-place "$PWD/.td-build-cache/recipe-eval" >/dev/null \
   || { rc=$?; echo "ERROR: could not build td's Rust recipe evaluator (recipes/ crate)" >&2; exit $rc; }
 load_recipe_eval
 echo ">> recipes EVALUATE with td's OWN Rust td-recipe-eval ($TD_RECIPE_EVAL)"

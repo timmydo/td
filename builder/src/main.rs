@@ -8548,6 +8548,31 @@ fn main() -> ExitCode {
                 }
             }
         }
+        // td-builder recipe-eval-place BASEDIR — the evaluator's counterpart to
+        // stage0-place: print td-recipe-eval's path, memoized on the recipes
+        // source so a warm tree reuses it with NO toolchain (the loop sandbox has
+        // none). Usage: recipe-eval-place BASEDIR   (cwd must be the repo root)
+        Some("recipe-eval-place") if args.len() == 3 => {
+            let run = || -> Result<String, String> {
+                let root = std::env::current_dir().map_err(|e| format!("getcwd: {e}"))?;
+                stage0::recipe_eval_place(&root, Path::new(&args[2]))
+            };
+            match run() {
+                Ok(bin) => {
+                    println!("{bin}");
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    if let Some(rest) = e.strip_prefix(crate::check_loop::UNPROVISIONED_TAG) {
+                        eprintln!("td-builder: recipe-eval-place: unprovisioned — {rest}");
+                        crate::check_loop::unprovisioned_exit()
+                    } else {
+                        eprintln!("td-builder: recipe-eval-place: {e}");
+                        ExitCode::FAILURE
+                    }
+                }
+            }
+        }
         // td-builder provision-rust / provision-cc — resolve the SEED build's
         // guix-free toolchain and print a PATH fragment (the Rust port of
         // tools/provision-{rust,cc}.sh; resolution order in stage0.rs). An ABSENT
@@ -9501,6 +9526,7 @@ fn main() -> ExitCode {
             eprintln!("       td-builder build-recipe RECIPE-JSON LOCK SCRATCH-DIR STORE-DIR [SRC-STORE-DIR SRC-DB] [--recipe-output-store STORE] [--recipe-output-db DB]...");
             eprintln!("       td-builder build-plan --auto TARGET RECIPE-DIR MAP-FILE SEED-STORE SEED-DB SCRATCH");
             eprintln!("       td-builder stage0-place BASEDIR        # compile+place the guix-free stage0 (memoized)");
+            eprintln!("       td-builder recipe-eval-place BASEDIR   # build td-recipe-eval (memoized on recipes/)");
             eprintln!("       td-builder provision-rust              # print the guix-free rust toolchain PATH fragment");
             eprintln!("       td-builder provision-cc                # print the guix-free C toolchain PATH fragment");
             eprintln!("       td-builder assert-static PATH          # fail unless PATH is a fully static binary");

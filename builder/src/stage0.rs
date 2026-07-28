@@ -599,17 +599,272 @@ fn ensure_builder_lineage(db: &Path, cb: &str, source_fp: &str) -> Result<(), St
 
 /// A valid memo: the recorded fingerprint matches AND the placement + db are
 /// present and intact. Returns the memoized canonical store path.
-fn stage0_memo_hit(meta: &Path, fp: &str, store: &Path, db: &Path) -> Option<String> {
-    let text = std::fs::read_to_string(meta).ok()?;
+/// The memo, or WHY it could not be reused. A miss costs a compile, which in the
+/// loop sandbox is not merely slow but impossible (no toolchain there), so the
+/// reason has to be legible — "unprovisioned" alone sends the reader looking for
+/// a missing toolchain when the real event is a memo that did not match.
+fn stage0_memo_hit(meta: &Path, fp: &str, store: &Path, db: &Path) -> Result<String, String> {
+    let text = std::fs::read_to_string(meta)
+        .map_err(|e| format!("no memo at {}: {e}", meta.display()))?;
     let mut lines = text.lines();
-    let old_fp = lines.next()?;
-    let cb = lines.next()?.trim();
-    if old_fp != fp || cb.is_empty() {
-        return None;
+    let old_fp = lines
+        .next()
+        .ok_or_else(|| format!("memo {} is empty", meta.display()))?;
+    let cb = lines
+        .next()
+        .ok_or_else(|| format!("memo {} has no placement line", meta.display()))?
+        .trim();
+    if cb.is_empty() {
+        return Err(format!("memo {} names no placement", meta.display()));
     }
-    let placed = store.join(Path::new(cb).file_name()?).join("bin/td-builder");
-    let db_ok = std::fs::metadata(db).is_ok_and(|m| m.is_file() && m.len() > 0);
-    (is_exec(&placed) && db_ok).then(|| cb.to_string())
+    if old_fp != fp {
+        return Err(format!(
+            "builder source fingerprint moved (memo {old_fp}, tree {fp})"
+        ));
+    }
+    let name = Path::new(cb)
+        .file_name()
+        .ok_or_else(|| format!("memo names a malformed placement `{cb}'"))?;
+    let placed = store.join(name).join("bin/td-builder");
+    if !is_exec(&placed) {
+        return Err(format!("placement {} is missing", placed.display()));
+    }
+    if !std::fs::metadata(db).is_ok_and(|m| m.is_file() && m.len() > 0) {
+        return Err(format!("builder db {} is missing or empty", db.display()));
+    }
+    Ok(cb.to_string())
+}
+
+/// Every path an `include_str!`/`include_bytes!` in `files` names, resolved
+/// against the file that names it, keeping only those that exist (so a literal
+/// in a comment cannot invent a root).
+///
+/// DERIVED, not listed: the recipes crate embeds TARGET-crate sources from
+/// outside `recipes/` — td-init, td-login, td-util and eight more — and a fixed
+/// root list would silently miss them, leaving the memo to serve an evaluator
+/// that emits yesterday's source as this build's recipe. Deriving it means a new
+/// `include_str!` is covered without anyone remembering to edit this.
+fn embedded_include_paths(files: &[PathBuf]) -> Result<Vec<String>, String> {
+    let mut out = Vec::new();
+    for f in files {
+        let (Some(dir), Ok(text)) = (f.parent(), std::fs::read_to_string(f)) else {
+            continue;
+        };
+        for mac in ["include_str!", "include_bytes!"] {
+            let mut rest = text.as_str();
+            while let Some(i) = rest.find(mac) {
+                let after = rest.get(i + mac.len()..).unwrap_or("");
+                let arg = after.trim_start_matches(|c: char| c == '(' || c.is_whitespace());
+                // Fail CLOSED on a composed path (`concat!`/`env!`): the literal
+                // scan cannot resolve one, and dropping it silently is how a
+                // compile input escapes the fingerprint — the whole hazard here.
+                // The crate already composes an `include!` this way, so treat a
+                // nested macro as a demand to extend this, not as no input.
+                if arg.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
+                    && arg
+                        .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                        .is_some_and(|k| arg.get(k..k + 1) == Some("!"))
+                {
+                    return Err(format!(
+                        "{}: {mac} takes a composed path, which the fingerprint scan cannot \
+                         resolve — extend embedded_include_paths before using this form",
+                        f.display()
+                    ));
+                }
+                let Some(open) = after.find('"') else { break };
+                let tail = after.get(open + 1..).unwrap_or("");
+                let Some(end) = tail.find('"') else { break };
+                if let Some(p) = tail.get(..end) {
+                    // A literal naming nothing on disk is prose (`include_str!` in
+                    // a comment), not an input; canonicalize so one file reached
+                    // by two spellings hashes once.
+                    let joined = dir.join(p);
+                    if joined.is_file() {
+                        let c = std::fs::canonicalize(&joined).unwrap_or(joined);
+                        out.push(c.to_string_lossy().into_owned());
+                    }
+                }
+                rest = tail.get(end + 1..).unwrap_or("");
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// The evaluator's compile inputs — the mirror of the stage0 roots below, with
+/// `recipes/` in place of `builder/`, PLUS everything the crate embeds (above)
+/// and the tool script itself, whose static-linking contract a memo hit skips.
+/// The seed-digest table is `include_str!`d into td-recipe-eval too, so a new
+/// seed pin must not leave a stale compiled table in force.
+fn recipe_eval_fp_roots(root: &Path) -> Result<Vec<String>, String> {
+    let mut roots: Vec<String> = [
+        "recipes/src",
+        "recipes/build.rs",
+        "recipes/Cargo.toml",
+        "engine/src",
+        "engine/Cargo.toml",
+        "Cargo.toml",
+        "Cargo.lock",
+        "seed/seed-digests.txt",
+        "tests/recipe-eval-tool.sh",
+    ]
+    .iter()
+    .map(|p| root.join(p).to_string_lossy().into_owned())
+    .collect();
+    // Scan the two crates compiled INTO the evaluator. Only `.rs` can carry a
+    // macro, and the fingerprint reads every file again to hash it.
+    let scan: Vec<String> = ["recipes/src", "engine/src"]
+        .iter()
+        .map(|p| root.join(p).to_string_lossy().into_owned())
+        .collect();
+    let rs: Vec<PathBuf> = crate::regular_files_under(&scan)?
+        .into_iter()
+        .filter(|p| p.extension().is_some_and(|e| e == "rs"))
+        .collect();
+    let mut embedded = embedded_include_paths(&rs)?;
+    embedded.sort();
+    embedded.dedup();
+    roots.extend(embedded);
+    Ok(roots)
+}
+
+/// The evaluator memo, or WHY it cannot serve.
+fn recipe_eval_memo_hit(meta: &Path, fp: &str) -> Result<String, String> {
+    let text =
+        std::fs::read_to_string(meta).map_err(|e| format!("no memo at {}: {e}", meta.display()))?;
+    let mut lines = text.lines();
+    let old_fp = lines
+        .next()
+        .ok_or_else(|| format!("memo {} is empty", meta.display()))?;
+    let bin = lines
+        .next()
+        .ok_or_else(|| format!("memo {} has no binary line", meta.display()))?
+        .trim();
+    if bin.is_empty() {
+        return Err(format!("memo {} names no binary", meta.display()));
+    }
+    if old_fp != fp {
+        return Err(format!(
+            "recipes source fingerprint moved (memo {old_fp}, tree {fp})"
+        ));
+    }
+    if !is_exec(Path::new(bin)) {
+        return Err(format!("built evaluator {bin} is missing"));
+    }
+    // Unlike stage0's, this memo names a REWRITABLE path, so the path alone
+    // vouches for nothing: a later build that lands bytes there and then fails
+    // its static assertion writes no memo, and a revert would serve those bytes
+    // under this fingerprint. Bind the contents.
+    let want = lines
+        .next()
+        .ok_or_else(|| format!("memo {} records no digest", meta.display()))?
+        .trim();
+    let got = crate::sha256::sha256_file(Path::new(bin))
+        .map_err(|e| format!("sha256 {bin}: {e}"))?;
+    if got != want {
+        return Err(format!("built evaluator {bin} is not the one memoized"));
+    }
+    Ok(bin.to_string())
+}
+
+/// Build td-recipe-eval under BASE and return its path, memoized on the recipes
+/// source exactly as [`stage0_place`] memoizes the builder.
+///
+/// Speed is not the point: a HIT needs no toolchain, so the loop sandbox — which
+/// has none, by design — can reuse what the host prelude built. A MISS still
+/// needs a compiler, so only the prelude can serve one.
+pub(crate) fn recipe_eval_place(root: &Path, base: &Path) -> Result<String, String> {
+    let meta = base.join(".recipe-eval-meta");
+    let fp = crate::tree_fingerprint(&recipe_eval_fp_roots(root)?)?;
+
+    // Fast path: a valid memo needs no lock (warm loops skip the compile AND the
+    // lock wait).
+    if let Ok(bin) = recipe_eval_memo_hit(&meta, &fp) {
+        ensure_recipe_eval_sentinel(base, &bin)?;
+        return Ok(bin);
+    }
+
+    // Slow path: serialize builders sharing BASE, then re-check — a waiter may
+    // now find the holder's fresh memo.
+    std::fs::create_dir_all(base).map_err(|e| format!("mkdir {}: {e}", base.display()))?;
+    let lock_path = base.join(".recipe-eval.lock");
+    let lock_file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&lock_path)
+        .map_err(|e| format!("open {}: {e}", lock_path.display()))?;
+    lock_file
+        .lock()
+        .map_err(|e| format!("lock {}: {e}", lock_path.display()))?;
+    let why = match recipe_eval_memo_hit(&meta, &fp) {
+        Ok(bin) => {
+            ensure_recipe_eval_sentinel(base, &bin)?;
+            return Ok(bin);
+        }
+        Err(why) => why,
+    };
+    eprintln!(
+        "td-builder: recipe-eval-place: rebuilding under {} — {why}",
+        base.display()
+    );
+
+    let mut cmd = Command::new("sh");
+    cmd.arg("tests/recipe-eval-tool.sh")
+        .arg(base)
+        .current_dir(root)
+        .stdin(Stdio::null());
+    // The tool resolves its toolchain through `$TD_BUILDER_SELF provision-{rust,cc}`.
+    // We ARE a td-builder: name ourselves rather than rely on the gate-run export,
+    // so a dev invocation works too.
+    if let Ok(self_exe) = std::env::current_exe() {
+        cmd.env("TD_BUILDER_SELF", self_exe);
+    }
+    let out = cmd
+        .output()
+        .map_err(|e| format!("spawn sh tests/recipe-eval-tool.sh: {e}"))?;
+    if !out.status.success() {
+        forward_to_stderr(&out);
+        let msg = "recipe-eval-tool.sh could not build td-recipe-eval (see stderr)".to_string();
+        // Keep the script's 69 TYPED: an absent toolchain is the tolerated skip,
+        // not a regression, and the verb must re-raise it rather than red.
+        if out.status.code() == Some(crate::check_loop::EXIT_UNPROVISIONED) {
+            return Err(format!("{}{msg}", crate::check_loop::UNPROVISIONED_TAG));
+        }
+        return Err(msg);
+    }
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let bin = stdout
+        .lines()
+        .rev()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .ok_or_else(|| "recipe-eval-tool.sh printed no td-recipe-eval path".to_string())?;
+    if !is_exec(Path::new(bin)) {
+        return Err(format!(
+            "recipe-eval-tool.sh printed `{bin}', which is not executable"
+        ));
+    }
+    let digest = crate::sha256::sha256_file(Path::new(bin))
+        .map_err(|e| format!("sha256 {bin}: {e}"))?;
+    std::fs::write(&meta, format!("{fp}\n{bin}\n{digest}\n"))
+        .map_err(|e| format!("write {}: {e}", meta.display()))?;
+    ensure_recipe_eval_sentinel(base, bin)?;
+    Ok(bin.to_string())
+}
+
+/// Keep `recipe-eval-path` naming the binary the memo just served. The tool
+/// script writes it on a BUILD, but a memo hit skips the script — and cache-lib's
+/// `load_recipe_eval` and `resolve_recipe_eval` both read the sentinel, not the
+/// memo, so a hit that left it absent or stale would send them elsewhere.
+fn ensure_recipe_eval_sentinel(base: &Path, bin: &str) -> Result<(), String> {
+    let sentinel = base.join("recipe-eval-path");
+    if std::fs::read_to_string(&sentinel).is_ok_and(|t| t.trim() == bin) {
+        return Ok(());
+    }
+    // Atomic: the fast path runs WITHOUT the place lock, and a truncating write
+    // lets a concurrent gate read an empty sentinel and red with no cause.
+    crate::write_atomic(&sentinel, format!("{bin}\n").as_bytes())
 }
 
 /// Produce a stage0 td-builder and PLACE it into a td-owned store under BASE
@@ -663,7 +918,7 @@ pub(crate) fn stage0_place(root: &Path, base: &Path) -> Result<String, String> {
 
     // Fast path: a valid memo needs no lock (warm loops skip the compile AND
     // the lock wait).
-    if let Some(cb) = stage0_memo_hit(&meta, &fp, &store, &db) {
+    if let Ok(cb) = stage0_memo_hit(&meta, &fp, &store, &db) {
         ensure_builder_lineage(&db, &cb, &fp)?;
         return Ok(cb);
     }
@@ -682,10 +937,17 @@ pub(crate) fn stage0_place(root: &Path, base: &Path) -> Result<String, String> {
         .map_err(|e| format!("lock {}: {e}", lock_path.display()))?;
     // Double-checked: a placer that waited for the lock may now find the
     // holder's fresh memo — reuse it rather than rebuild+re-place.
-    if let Some(cb) = stage0_memo_hit(&meta, &fp, &store, &db) {
-        ensure_builder_lineage(&db, &cb, &fp)?;
-        return Ok(cb);
-    }
+    let why = match stage0_memo_hit(&meta, &fp, &store, &db) {
+        Ok(cb) => {
+            ensure_builder_lineage(&db, &cb, &fp)?;
+            return Ok(cb);
+        }
+        Err(why) => why,
+    };
+    // About to COMPILE. Say so and say why the memo did not serve, because in the
+    // loop sandbox this cannot succeed and the bare provisioning error that
+    // follows names a missing toolchain rather than the reuse that failed.
+    eprintln!("td-builder: stage0-place: rebuilding under {} — {why}", base.display());
 
     // 1. cargo-compile stage0 from builder/ source (guix/Guile-free, offline).
     let work = scratch_dir("stage0-place")?;
@@ -999,12 +1261,118 @@ mod tests {
         exec_file(&store.join("abc123-td-builder-0.1.0/bin/td-builder"));
         std::fs::write(&db, "x").unwrap();
         std::fs::write(&meta, format!("fp1\n{cb}\n")).unwrap();
-        assert_eq!(stage0_memo_hit(&meta, "fp1", &store, &db), Some(cb.to_string()));
-        // A CHANGED builder-source fingerprint must rebuild.
-        assert_eq!(stage0_memo_hit(&meta, "fp2", &store, &db), None);
+        assert_eq!(
+            stage0_memo_hit(&meta, "fp1", &store, &db),
+            Ok(cb.to_string())
+        );
+        // A CHANGED builder-source fingerprint must rebuild — and SAY so. A miss
+        // costs a compile, which in the loop sandbox is impossible, so the reason
+        // is what tells the reader this was reuse and not a missing toolchain.
+        let moved = stage0_memo_hit(&meta, "fp2", &store, &db).unwrap_err();
+        assert!(moved.contains("fingerprint moved"), "{moved}");
         // A memo whose placement bytes are gone must rebuild, not be trusted.
         std::fs::remove_dir_all(store.join("abc123-td-builder-0.1.0")).unwrap();
-        assert_eq!(stage0_memo_hit(&meta, "fp1", &store, &db), None);
+        let gone = stage0_memo_hit(&meta, "fp1", &store, &db).unwrap_err();
+        assert!(gone.contains("is missing"), "{gone}");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// The evaluator's fingerprint must follow `include_str!` OUT of recipes/:
+    /// the recipe files embed target-crate sources (td-init, td-util, …) that
+    /// live elsewhere in the tree, and a root set that stopped at recipes/ would
+    /// reuse an evaluator emitting yesterday's source as this build's recipe.
+    #[test]
+    fn embedded_sources_outside_the_crate_join_the_fingerprint() {
+        let d = scratch("embed");
+        let crate_src = d.join("recipes/src/recipes");
+        let outside = d.join("td-util/src");
+        std::fs::create_dir_all(&crate_src).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("free.rs"), "// embedded\n").unwrap();
+        std::fs::write(crate_src.join("local.h"), "// local\n").unwrap();
+        let recipe = crate_src.join("td-util.rs");
+        std::fs::write(
+            &recipe,
+            "const A: &str = include_str!(\"../../../td-util/src/free.rs\");\n\
+             const B: &str = include_str!(\"local.h\");\n\
+             const C: &str = include_str!(\"../../../td-util/src/gone.rs\");\n",
+        )
+        .unwrap();
+
+        let found = embedded_include_paths(&[recipe.clone()]).unwrap();
+        let has = |needle: &str| found.iter().any(|p| p.ends_with(needle));
+        assert!(has("td-util/src/free.rs"), "must follow the crate: {found:?}");
+        assert!(has("local.h"), "and keep in-tree includes: {found:?}");
+        // A literal naming nothing on disk invents no root (a commented-out or
+        // stale include must not make the fingerprint unresolvable).
+        assert!(!has("gone.rs"), "absent target must be dropped: {found:?}");
+
+        // A COMPOSED path is a compile input the scan cannot resolve. Dropping it
+        // silently is the stale-evaluator hazard itself, so it must fail closed.
+        std::fs::write(
+            &recipe,
+            "const D: &str = include_str!(concat!(env!(\"OUT_DIR\"), \"/gen.rs\"));\n",
+        )
+        .unwrap();
+        let err = embedded_include_paths(&[recipe]).unwrap_err();
+        assert!(err.contains("composed path"), "{err}");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// The real invariant, against the real tree: every literal include under the
+    /// scanned crates resolves. A synthetic fixture cannot catch a form the tree
+    /// grows later — this reds the first time one appears.
+    #[test]
+    fn every_literal_include_in_the_tree_resolves() {
+        let Ok(cwd) = std::env::current_dir() else {
+            return;
+        };
+        // builder/ is the cargo cwd under `cargo test`; the repo root is its parent.
+        let root = cwd.parent().unwrap_or(&cwd).to_path_buf();
+        if !root.join("recipes/src").is_dir() {
+            return; // not a repo checkout (packaged build) — nothing to assert
+        }
+        let roots = recipe_eval_fp_roots(&root).expect("composed include, or unreadable tree");
+        for crate_dir in ["td-init", "td-login", "td-util", "td-sh"] {
+            assert!(
+                roots.iter().any(|r| r.contains(crate_dir)),
+                "{crate_dir} is embedded by a recipe but absent from the fingerprint roots"
+            );
+        }
+    }
+
+    /// The evaluator memo is the reason a warm tree needs no toolchain, so it
+    /// must reuse ONLY an intact placement of the CURRENT recipes source — and
+    /// name the reason when it will not, for the same reason stage0 does.
+    #[test]
+    fn recipe_eval_memo_reuses_only_a_matching_intact_build() {
+        let d = scratch("re-memo");
+        let base = d.join("re");
+        let meta = base.join(".recipe-eval-meta");
+        let bin = base.join("target/x86_64-unknown-linux-musl/release/td-recipe-eval");
+        exec_file(&bin);
+        let bin_s = bin.to_string_lossy().into_owned();
+        let digest = crate::sha256::sha256_file(&bin).unwrap();
+        std::fs::write(&meta, format!("fp1\n{bin_s}\n{digest}\n")).unwrap();
+        assert_eq!(recipe_eval_memo_hit(&meta, "fp1"), Ok(bin_s.clone()));
+        // The memo names a REWRITABLE path, so the contents are what it vouches
+        // for: bytes that changed under a matching fingerprint are not the ones
+        // memoized (a build that landed here and then failed assert-static).
+        write_exec(&bin, "different bytes");
+        let swapped = recipe_eval_memo_hit(&meta, "fp1").unwrap_err();
+        assert!(swapped.contains("not the one memoized"), "{swapped}");
+        std::fs::write(&meta, format!("fp1\n{bin_s}\n{}\n", crate::sha256::sha256_file(&bin).unwrap())).unwrap();
+        // An edited recipes tree must rebuild rather than evaluate with the old
+        // binary — a stale evaluator would emit yesterday's recipes.
+        let moved = recipe_eval_memo_hit(&meta, "fp2").unwrap_err();
+        assert!(moved.contains("fingerprint moved"), "{moved}");
+        // A memo naming a binary that is gone must not be trusted.
+        std::fs::remove_file(&bin).unwrap();
+        let gone = recipe_eval_memo_hit(&meta, "fp1").unwrap_err();
+        assert!(gone.contains("is missing"), "{gone}");
+        // No memo at all is a miss, not a panic.
+        let absent = recipe_eval_memo_hit(&base.join("nope"), "fp1").unwrap_err();
+        assert!(absent.contains("no memo"), "{absent}");
         let _ = std::fs::remove_dir_all(&d);
     }
 

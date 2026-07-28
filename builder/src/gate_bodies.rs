@@ -1747,23 +1747,18 @@ fn recipe_checks(root: &Path) -> Result<(), String> {
 fn resolve_recipe_eval(root: &Path) -> Result<PathBuf, String> {
     let path = match std::env::var_os("TD_RECIPE_EVAL") {
         Some(value) => PathBuf::from(value),
-        None => {
-            let sentinel = root.join(".td-build-cache/recipe-eval/recipe-eval-path");
-            let text = std::fs::read_to_string(&sentinel).map_err(|_| {
-                format!(
-                    "FAIL: no td-recipe-eval sentinel ({}) - the build-recipes prelude must run first",
-                    sentinel.display()
-                )
-            })?;
-            let trimmed = text.trim();
-            if trimmed.is_empty() {
-                return Err(format!(
-                    "FAIL: empty td-recipe-eval sentinel {}",
-                    sentinel.display()
-                ));
-            }
-            PathBuf::from(trimmed)
-        }
+        // Through the memo, not the raw sentinel: the sentinel records only WHICH
+        // binary, never which SOURCE built it, so reading it directly would
+        // evaluate with a stale evaluator whenever the tree moved ahead of it.
+        None => crate::stage0::recipe_eval_place(root, &root.join(".td-build-cache/recipe-eval"))
+            .map(PathBuf::from)
+            .map_err(|e| {
+                if e.starts_with(UNPROVISIONED_TAG) {
+                    e
+                } else {
+                    format!("FAIL: {e}")
+                }
+            })?,
     };
     if !is_executable_file(&path) {
         return Err(format!(
@@ -2263,25 +2258,20 @@ fn recipe_eval_source_pins(root: &Path) -> Result<String, String> {
         // falls through to the build path.
         Some(v) if !v.is_empty() => PathBuf::from(v),
         _ => {
+            // Memoized on the recipes source: a warm tree reuses the prelude's
+            // evaluator with no toolchain, so this no longer dies in the sandbox
+            // on a build it cannot do. The tag survives so a genuine MISS with no
+            // toolchain is still the tolerated skip, not a red.
             let base = root.join(".td-build-cache/recipe-eval");
-            let base_s = path_str(&base)?;
-            // The tool resolves its toolchain via `$TD_BUILDER_SELF provision-{rust,cc}`;
-            // we ARE a td-builder, so pass ourselves explicitly rather than relying on
-            // the gate-run export (this body is also reachable from dev invocations).
-            let self_exe = std::env::current_exe()
-                .map_err(|e| format!("FAIL: cannot resolve current td-builder: {e}"))?;
-            let self_s = path_str(&self_exe)?;
-            let printed = run_out_env(
-                "sh",
-                &["tests/recipe-eval-tool.sh", &base_s],
-                &[("TD_BUILDER_SELF", &self_s)],
-                "recipe-eval-tool.sh (build td-recipe-eval from the current worktree)",
-            )?;
-            let bin = printed.lines().last().unwrap_or("").trim();
-            if bin.is_empty() {
-                return Err("FAIL: recipe-eval-tool.sh printed no td-recipe-eval path".into());
-            }
-            PathBuf::from(bin)
+            crate::stage0::recipe_eval_place(root, &base)
+                .map(PathBuf::from)
+                .map_err(|e| {
+                    if e.starts_with(UNPROVISIONED_TAG) {
+                        e
+                    } else {
+                        format!("FAIL: {e}")
+                    }
+                })?
         }
     };
     if !is_executable_file(&eval) {

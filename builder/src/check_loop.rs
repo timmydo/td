@@ -1630,6 +1630,37 @@ fn run(args: &[String]) -> Result<i32, CheckError> {
     });
 
     let tb = provision_stage0(&root)?;
+    // Place the EVALUATOR here too, for the same reason as stage0: the gates run
+    // in the sandbox, which has no toolchain, so a build inside it cannot
+    // succeed. Seeding the memo out here is what lets a warm tree reuse it in
+    // there.
+    //
+    // ONLY a toolchain gap is tolerated. A host that HAS a toolchain and still
+    // fails to build — a recipes regression, a non-static link — must red here:
+    // swallowing it would let the sandbox retry, get 69 for want of a compiler,
+    // and report the regression as a tolerated skip.
+    // ... but a goal that only PRINTS needs no evaluator, and must not pay a
+    // compile — or die on an unrelated fault — to list gates.
+    let listing_only = goals
+        .iter()
+        .all(|g| matches!(g.as_str(), "list-gates" | "gate-timing-report"));
+    if let Err(e) = if listing_only {
+        Ok(String::new())
+    } else {
+        crate::stage0::recipe_eval_place(&root, &root.join(".td-build-cache/recipe-eval"))
+    } {
+        match e.strip_prefix(UNPROVISIONED_TAG) {
+            Some(why) => eprintln!(
+                "td-builder check: no td-recipe-eval for the gates — {why} \
+                 (they degrade to their own Unprovisioned skip)"
+            ),
+            None => {
+                return Err(CheckError::Fatal(fatal(&format!(
+                    "could not build td-recipe-eval for the gates ({e})"
+                ))))
+            }
+        }
+    }
     let ul = provision_userland(&root)?;
     let toolchain = loop_path_with_native_applets(&root, &tb, &ul.path).map_err(|e| {
         CheckError::Fatal(fatal(&format!(
