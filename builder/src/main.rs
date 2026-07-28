@@ -1966,6 +1966,60 @@ fn persist_receipt_path(persist_db: &Path, deriver: &str) -> Option<std::path::P
     Some(Path::new(&dir).join(format!("{base}.receipt")))
 }
 
+/// The sidecar of a STEP's scratch `td.db`: exactly ONE receipt, fixed name.
+///
+/// Shares the LAYOUT `authenticate_recipe_output_db` reads — the `.receipts` dir
+/// suffix and the `.receipt` extension, both load-bearing — but deliberately NOT
+/// `persist_receipt_path`'s drv-basename key. That key exists because one
+/// PERSISTENT db accumulates many derivations' receipts and each must stay
+/// separately addressable. A step's scratch db holds exactly one drv's outputs and
+/// is rewritten whole on every build, so keying there only lets SUPERSEDED receipts
+/// pile up in a scratch reused across recipe edits, widening the backing set from
+/// "this build's receipt" to "any receipt this scratch has ever held". The reader
+/// unions every `*.receipt` in the dir and never inspects a filename, so one fixed
+/// name is strictly tighter and indistinguishable to it.
+fn step_receipt_path(db: &Path) -> std::path::PathBuf {
+    let mut dir = db.as_os_str().to_owned();
+    dir.push(".receipts");
+    Path::new(&dir).join("step.receipt")
+}
+
+/// Write the engine-issued receipt sidecar beside a STEP's scratch `td.db`.
+///
+/// `commit_scratch_to_store` writes this beside the PERSISTENT db; nothing wrote
+/// it beside a scratch db, so `authenticate_recipe_output_db` — which reads only
+/// this layout — could never type a per-step db `RecipeOutput`. That is the whole
+/// `--recipe-output-db` channel, i.e. the `td shell` product proof, refused on a
+/// sidecar the engine simply never placed.
+///
+/// The dir is CLEARED first, so what backs the db is this build's receipt and
+/// nothing else: `write_output_db` clobbers `td.db` from the current outputs, and
+/// the provenance beside it must be replaced on exactly the same terms. It also
+/// self-heals a warm scratch still holding keyed receipts from an earlier build.
+///
+/// Best-effort by DESIGN, not by neglect: a scratch that cannot hold the sidecar
+/// still holds a valid db for the downstream closure resolution that motivated
+/// writing it, and only the `--recipe-output-db` intake — which fails CLOSED,
+/// naming the missing sidecar — depends on it. Failing the build here would turn
+/// an unused channel's absence into a hard stop. The failure is REPORTED, though:
+/// silence would surface later as a refusal whose stated cause (a missing file) is
+/// not its real one (this write, and why it failed).
+fn write_step_receipt_sidecar(scratch: &Path, expect: &ReceiptExpect, regs: &[OutputReg]) {
+    if regs.is_empty() {
+        return;
+    }
+    let rp = step_receipt_path(&scratch.join("td.db"));
+    let Some(dir) = rp.parent() else { return };
+    let _ = std::fs::remove_dir_all(dir);
+    if let Err(e) = std::fs::create_dir_all(dir) {
+        eprintln!("td-builder: receipt sidecar {}: {e}", dir.display());
+        return;
+    }
+    if let Err(e) = write_atomic(&rp, receipt_text(expect, regs).as_bytes()) {
+        eprintln!("td-builder: receipt sidecar {}: {e}", rp.display());
+    }
+}
+
 /// The parsed, PATH-INDEXED view of a persistent store db a warm hit needs: fully-registered
 /// paths → (nar-hash, nar-size, deriver), plus the reference edges. Reading + parsing the whole
 /// db and rebuilding these maps ONCE PER RUNG is the dominant per-rung cost of a warm
@@ -4055,6 +4109,10 @@ fn realize_drv(
     };
     std::fs::write(scratch.join("receipt"), receipt_text(&expect, &regs))
         .map_err(|e| e.to_string())?;
+    // ...and beside the db it just wrote, where the `--recipe-output-db` reader
+    // looks. Both copies, because they answer different questions: `receipt` is
+    // keyed to this scratch for cache reuse, the sidecar to the db for intake.
+    write_step_receipt_sidecar(scratch, &expect, &regs);
     eprintln!(
         "td-builder: {disp}: built {} output(s), registered in {}",
         regs.len(),
@@ -4288,6 +4346,10 @@ fn build_recipe(
         // downstream build-plan step reads this step's td.db to resolve the closure
         // of a td-built dependency, so it must exist whether or not we rebuilt.
         write_output_db(&regs, &scratch.join("td.db"))?;
+        // The db is rewritten on a hit, so its sidecar must be too — a db whose
+        // provenance depended on having been built THIS run would make intake a
+        // function of cache state rather than of what produced the bytes.
+        write_step_receipt_sidecar(scratch, &expect, &regs);
         println!("CACHE=hit");
         return Ok(regs);
     }
@@ -4319,6 +4381,10 @@ fn build_recipe(
             std::fs::write(scratch.join("registration"), registration_text(&regs))
                 .map_err(|e| e.to_string())?;
             write_output_db(&regs, &scratch.join("td.db"))?;
+            // Same rule on the persist path, and this is the one that mattered in
+            // practice: a warm ladder resolves nearly every rung here, so without
+            // it the sidecar was absent for almost every step of a real climb.
+            write_step_receipt_sidecar(scratch, &expect, &regs);
             println!("CACHE=persist");
             return Ok(regs);
         }
@@ -10833,6 +10899,149 @@ daemon build START (2/2 active)
         std::fs::create_dir_all(rp.parent().unwrap()).unwrap();
         std::fs::write(&rp, receipt_text(&expect, std::slice::from_ref(&reg))).unwrap();
         authenticate_recipe_output_db(&db.to_string_lossy()).unwrap();
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    /// ...and something actually WRITES that sidecar beside a step's scratch db.
+    ///
+    /// The test above proves the engine's layout is the one intake reads, which is
+    /// a statement about `persist_receipt_path` — it hand-writes the sidecar, so it
+    /// held while NOTHING placed one next to a scratch `td.db`. That was the defect:
+    /// `commit_scratch_to_store` wrote it beside the PERSISTENT db only, so every
+    /// per-step db handed to `--recipe-output-db` was refused for a sidecar the
+    /// engine never placed, and the `td shell` product proof could not run at all.
+    /// This asserts the WRITER the three build paths call, which is the half that
+    /// was missing.
+    #[test]
+    fn a_step_scratch_db_authenticates_through_its_written_sidecar() {
+        let d = std::env::temp_dir().join(format!("td-step-sidecar-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let out_path = format!("/td/store/{}-out-1.0", "d".repeat(32));
+        let deriver = format!("/td/store/{}-out-1.0.drv", "e".repeat(32));
+        let reg = OutputReg {
+            store_path: out_path.clone(),
+            nar_hash: "sha256:feedface".to_string(),
+            nar_size: 11,
+            refs: vec![],
+            deriver,
+        };
+        let expect = ReceiptExpect {
+            drv_sha256: "44".repeat(32),
+            manifest_sha256: "55".repeat(32),
+            builder: "b".to_string(),
+        };
+        // Exactly what a build path does: the db, then the sidecar beside it.
+        write_output_db(std::slice::from_ref(&reg), &d.join("td.db")).unwrap();
+        let dbp = d.join("td.db").to_string_lossy().into_owned();
+        // Red first, so the assertion below is known to be load-bearing rather
+        // than passing on a sidecar some earlier test left behind.
+        let err = authenticate_recipe_output_db(&dbp).unwrap_err();
+        assert!(
+            err.contains("no engine-issued receipts"),
+            "a step db with no sidecar must be refused, not typed RecipeOutput: {err}"
+        );
+        write_step_receipt_sidecar(&d, &expect, std::slice::from_ref(&reg));
+        authenticate_recipe_output_db(&dbp).unwrap();
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    /// Every scratch `td.db` writer is PAIRED with a sidecar writer.
+    ///
+    /// The test above exercises `write_step_receipt_sidecar` directly, which is
+    /// what the reader needs — and is exactly what the pre-fix tree would have
+    /// passed too, because the defect was never in the writer. It was that NO
+    /// BUILD PATH CALLED ONE. Delete all three calls and the suite stayed green
+    /// while every warm ladder rung silently lost its provenance again.
+    ///
+    /// Nothing here can drive `build_recipe`/`realize_drv` — they build — so this
+    /// counts the two writes in the source instead, the same way `td-init` and
+    /// `td-svc` pin what no compiler checks. The db write is the anchor: it is the
+    /// act that creates something needing provenance, so a fourth one appearing
+    /// without its sidecar reds here rather than in a multi-hour recipe check.
+    #[test]
+    fn every_scratch_db_write_is_paired_with_its_receipt_sidecar() {
+        let src = include_str!("main.rs");
+        let body = src
+            .split_once("mod tests {")
+            .map(|(before, _)| before)
+            .unwrap_or(src);
+        let dbs = body.matches("write_output_db(&regs, &scratch.join(\"td.db\"))").count();
+        let sidecars = body
+            .matches("write_step_receipt_sidecar(scratch, &expect, &regs)")
+            .count();
+        assert_eq!(
+            dbs, 3,
+            "expected the three scratch td.db writes (build, cache hit, persist hit)"
+        );
+        assert_eq!(
+            sidecars, dbs,
+            "{dbs} scratch db write(s) but {sidecars} sidecar write(s) — a db written \
+             without its receipt cannot be typed RecipeOutput, and the only thing that \
+             notices is the td shell product proof"
+        );
+    }
+
+    /// A scratch reused across builds is backed by THIS build's receipt only.
+    ///
+    /// The sidecar dir is unioned by the reader, so a keyed filename would let a
+    /// superseded receipt from an earlier drv keep vouching in a warm scratch —
+    /// the backing set drifting from "what produced these bytes" to "whatever this
+    /// directory has ever held". Fixed name plus a cleared dir is what keeps the
+    /// two equal.
+    #[test]
+    fn a_reused_scratch_keeps_only_the_current_receipt() {
+        let d = std::env::temp_dir().join(format!("td-step-sidecar-reuse-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let mk = |tag: &str, hash: &str| OutputReg {
+            store_path: format!("/td/store/{}-out-1.0", tag.repeat(32)),
+            nar_hash: hash.to_string(),
+            nar_size: 11,
+            refs: vec![],
+            deriver: format!("/td/store/{}-out-1.0.drv", tag.repeat(32)),
+        };
+        let expect = ReceiptExpect {
+            drv_sha256: "44".repeat(32),
+            manifest_sha256: "55".repeat(32),
+            builder: "b".to_string(),
+        };
+        // First build in this scratch.
+        let first = mk("d", "sha256:feedface");
+        write_output_db(std::slice::from_ref(&first), &d.join("td.db")).unwrap();
+        write_step_receipt_sidecar(&d, &expect, std::slice::from_ref(&first));
+        authenticate_recipe_output_db(&d.join("td.db").to_string_lossy()).unwrap();
+        // A receipt left by the KEYED writer this replaced — what a warm scratch
+        // on a machine that ran the earlier code actually holds. The fixed name
+        // alone does not displace it (different filename), and the reader unions
+        // the directory, so without the clear it would vouch forever.
+        let stale = d.join("td.db.receipts").join("aaaa-out-1.0.drv.receipt");
+        std::fs::write(&stale, receipt_text(&expect, std::slice::from_ref(&first))).unwrap();
+        // The recipe changes: a different drv, different output, same scratch.
+        let second = mk("f", "sha256:0badcafe");
+        write_output_db(std::slice::from_ref(&second), &d.join("td.db")).unwrap();
+        write_step_receipt_sidecar(&d, &expect, std::slice::from_ref(&second));
+        authenticate_recipe_output_db(&d.join("td.db").to_string_lossy()).unwrap();
+        let receipts: Vec<_> = std::fs::read_dir(d.join("td.db.receipts"))
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("receipt"))
+            .collect();
+        assert_eq!(
+            receipts.len(),
+            1,
+            "a reused scratch accumulated {} receipts; the superseded one still vouches",
+            receipts.len()
+        );
+        let text = std::fs::read_to_string(d.join("td.db.receipts").join("step.receipt")).unwrap();
+        assert!(
+            text.contains(&second.store_path) && !text.contains(&first.store_path),
+            "the surviving receipt must be the current build's"
+        );
+        assert!(
+            !stale.exists(),
+            "a keyed receipt from the earlier writer survived and still vouches"
+        );
         std::fs::remove_dir_all(&d).ok();
     }
 
