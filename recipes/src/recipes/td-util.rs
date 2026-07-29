@@ -46,7 +46,9 @@ use crate::types::{Recipe, Step};
 //
 // The crate root (`main.rs`) declares each sibling module with `mod NAME;`, so a
 // single `rustc src/main.rs` pulls them all in — but only if every module file is
-// present next to it in {src}. Keep MODULES in sync with `main.rs`'s `mod` lines.
+// present next to it in {src}. `modules_match_the_mod_lines_in_main_rs` holds the
+// two in sync: a module named but not embedded is a build that fails only in the
+// heavy recipe leg, minutes after a `cargo test` that stayed green.
 //
 // Every source below is written out with a WriteFile, which the ladder
 // `no_bootstrap_step_invokes_host_find_or_xargs` guard scans as a command
@@ -67,6 +69,7 @@ const MODULES: &[(&str, &str)] = &[
     ("procfs", include_str!("../../../td-util/src/procfs.rs")),
     ("ps", include_str!("../../../td-util/src/ps.rs")),
     ("sleep", include_str!("../../../td-util/src/sleep.rs")),
+    ("test", include_str!("../../../td-util/src/test.rs")),
     ("which", include_str!("../../../td-util/src/which.rs")),
 ];
 
@@ -175,4 +178,43 @@ pub fn recipe() -> Recipe {
             "glibc-x86-64",
         ])
         .steps(steps)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{MAIN_RS, MODULES};
+
+    /// Every `mod NAME;` in main.rs must have its source embedded here.
+    ///
+    /// The recipe writes `{src}/NAME.rs` per MODULES entry and rustc resolves the
+    /// `mod` line against that directory, so a name declared but not embedded is a
+    /// compile error inside the sandbox — surfacing only in the heavy recipe leg,
+    /// long after a green `cargo test`. The reverse (an embedded module nothing
+    /// declares) is dead source shipped into the build, so both directions red.
+    #[test]
+    fn modules_match_the_mod_lines_in_main_rs() {
+        let mut declared: Vec<&str> = MAIN_RS
+            .lines()
+            .map(str::trim)
+            .filter_map(|l| l.strip_prefix("mod ").and_then(|r| r.strip_suffix(';')))
+            .collect();
+        declared.sort_unstable();
+        // `#[cfg(test)] mod tests { ... }` is a brace form, so the `;` suffix above
+        // already excludes it; assert that rather than trusting it.
+        assert!(
+            !declared.contains(&"tests"),
+            "the inline test module is not a file and must not be embedded"
+        );
+        let mut embedded: Vec<&str> = MODULES.iter().map(|(n, _)| *n).collect();
+        embedded.sort_unstable();
+        assert_eq!(
+            declared, embedded,
+            "MODULES and main.rs's `mod` lines disagree — a name in one and not the \
+             other only reds when the recipe builds"
+        );
+        assert!(
+            !declared.is_empty(),
+            "parsing found no `mod` lines at all, so this test would pass vacuously"
+        );
+    }
 }

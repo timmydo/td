@@ -79,11 +79,11 @@ pub fn recipe() -> Recipe {
                 "-c",
                 &format!(
                     "l=$('{bin}' --list) || {{ echo 'td-util --list failed' >&2; exit 1; }}; \
-                     for a in cat chmod chown clear dmesg free ln mkdir printf ps readlink rm sleep which; do \
+                     for a in cat chmod chown clear dmesg free ln mkdir printf ps readlink rm sleep test which; do \
                          printf '%s\\n' \"$l\" | grep -q -x -F \"$a\" || {{ echo \"td-util does not serve applet '$a'\" >&2; exit 1; }}; \
                      done; \
                      n=$(printf '%s\\n' \"$l\" | wc -l); \
-                     [ \"$n\" -eq 14 ] || {{ echo \"td-util serves $n applets, expected exactly 14 — update this check deliberately when adding one\" >&2; exit 1; }}"
+                     [ \"$n\" -eq 15 ] || {{ echo \"td-util serves $n applets, expected exactly 15 — update this check deliberately when adding one\" >&2; exit 1; }}"
                 ),
             ],
         )
@@ -113,7 +113,18 @@ pub fn recipe() -> Recipe {
                      ln -sf '{bin}' \"$d/clear\" || {{ echo 'could not build the argv[0] symlink' >&2; exit 1; }}; \
                      out=$(PATH=\"$p\" \"$d/which\" td-util) || {{ echo 'argv[0] dispatch: /bin/which -> td-util failed — this is the form the shipped symlink farm uses' >&2; exit 1; }}; \
                      [ \"$out\" = \"$p/td-util\" ] || {{ echo \"argv[0] dispatch resolved '$out', expected '$p/td-util'\" >&2; exit 1; }}; \
-                     \"$d/clear\" >/dev/null || {{ echo 'argv[0] dispatch: /bin/clear -> td-util failed' >&2; exit 1; }}"
+                     \"$d/clear\" >/dev/null || {{ echo 'argv[0] dispatch: /bin/clear -> td-util failed' >&2; exit 1; }}; \
+                     '{bin}' test -d / || {{ echo 'test -d / must exit 0 (true)' >&2; exit 1; }}; \
+                     '{bin}' test -d /no-such-dir-xyz; \
+                     [ $? -eq 1 ] || {{ echo 'test must exit 1 for false, not 2 — a boot script reads that as an error' >&2; exit 1; }}; \
+                     '{bin}' test 1 -lt 5 || {{ echo 'test 1 -lt 5 must be true' >&2; exit 1; }}; \
+                     '{bin}' test '' -lt 5 >/dev/null 2>&1; \
+                     [ $? -eq 2 ] || {{ echo 'a non-numeric integer operand must be an error, not false: `while test \"$n\" -lt 5` with n unset would never end' >&2; exit 1; }}; \
+                     for op in -r -w -x; do \
+                       '{bin}' test \"$op\" / >/dev/null 2>&1; \
+                       [ $? -eq 2 ] || {{ echo \"the SHIPPED binary must refuse $op: it is access(2), and a mode-bits answer reads root own bit on 0755 /var, passing a system that had failed\" >&2; exit 1; }}; \
+                     done; \
+                     '{bin}' test ' 1 ' -eq 1 || {{ echo 'surrounding blanks must parse, as busybox does — this landing swapped the implementation under live boot conditionals' >&2; exit 1; }}"
                 ),
             ],
         )
@@ -152,7 +163,7 @@ pub fn recipe() -> Recipe {
     });
     steps.push(Step::WriteFile {
         path: "{out}/result".into(),
-        content: "PASS: td-util is a statically-linked ELF64 x86-64 executable (ET_EXEC) with no PT_INTERP and no dynamic NEEDED entry; it serves exactly the five applets clear/dmesg/free/ps/which, dispatches through both the argv[0] and `td-util <applet>` forms, honours its exit codes (1 = not resolved, 2 = usage), and parses /proc for free/ps where /proc is mounted\n".into(),
+        content: "PASS: td-util is a statically-linked ELF64 x86-64 executable (ET_EXEC) with no PT_INTERP and no dynamic NEEDED entry; it serves exactly the fifteen applets cat/chmod/chown/clear/dmesg/free/ln/mkdir/printf/ps/readlink/rm/sleep/test/which, dispatches through both the argv[0] and `td-util <applet>` forms, honours its exit codes (`which` 1 = not resolved, 2 = usage; `test` 0 = true, 1 = false, 2 = bad expression), and parses /proc for free/ps where /proc is mounted\n".into(),
         exec: false,
     });
     steps.push(Step::Require {
@@ -165,7 +176,7 @@ pub fn recipe() -> Recipe {
         .steps(steps)
         .checks(vec![RecipeCheck::new(
             r#"
-echo ">> recipe-check td-util-test: build-plan --auto builds td-util (td's static diagnostics multicall: clear/dmesg/free/ps/which, statically linked by the /td/store target Rust + native GCC/binutils/glibc toolchain), asserts a self-contained static ELF64 x86-64 executable (ET_EXEC, no PT_INTERP, no dynamic NEEDED), and exercises the applet roster, both dispatch forms, the exit codes, and the /proc parsers"
+echo ">> recipe-check td-util-test: build-plan --auto builds td-util (td's static diagnostics and initramfs userland multicall: cat/chmod/chown/clear/dmesg/free/ln/mkdir/printf/ps/readlink/rm/sleep/test/which, statically linked by the /td/store target Rust + native GCC/binutils/glibc toolchain), asserts a self-contained static ELF64 x86-64 executable (ET_EXEC, no PT_INTERP, no dynamic NEEDED), and exercises the applet roster, both dispatch forms, the exit codes, and the /proc parsers"
 : "${TD_RECIPE_EVAL:=$PWD/target/release/td-recipe-eval}"
 exec "$TD_RECIPE_EVAL" check-run td-util-test 1
 "#,

@@ -1328,6 +1328,8 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
     assert_target!("td-util/src/printf.rs", "recipe-checks");
     assert_target!("td-util/src/sleep.rs", "check");
     assert_target!("td-util/src/sleep.rs", "recipe-checks");
+    assert_target!("td-util/src/test.rs", "check");
+    assert_target!("td-util/src/test.rs", "recipe-checks");
     assert_target!("td-util/Cargo.lock", "check");
     assert_target!("td-util/Cargo.lock", "recipe-checks");
     // td-firstboot mirrors td-util: every source is include_str!'d into the

@@ -500,25 +500,23 @@ fn td_init_probe(applet: &str, probe: &Probe, sys: &SystemDef) -> String {
 /// uncovered call nor a stale entry survives; td-boot's own invocations are justified by
 /// its protocol constant.
 ///
-/// The nine that LEFT — cat, chmod, chown, ln, mkdir, printf, readlink, rm, sleep — are
-/// td-util applets now, and `sync` is td-init's. All ten were reached here rather than
-/// through uutils' `/bin/<name>` because they run where a dynamic closure is not safe to
-/// assume; td-util and td-init are static with empty closures, so the property is kept
+/// The ten that LEFT — cat, chmod, chown, ln, mkdir, printf, readlink, rm, sleep, test —
+/// are td-util applets now, and `sync` is td-init's. All eleven were reached here rather
+/// than through uutils' `/bin/<name>` because they run where a dynamic closure is not safe
+/// to assume; td-util and td-init are static with empty closures, so the property is kept
 /// while the third-party multicall goes.
+///
+/// `test` was the one that looked like it needed a syscall amendment: rootcheck asked
+/// `test ! -w /var` under `su ... <user>`, and `-w` is access(2). It moved instead by
+/// deleting the question — those probes WRITE now (see `build_rootcheck`), which is
+/// ground truth rather than a prediction of it, so the applet never serves `-w`.
 ///
 /// What is left, and why each is still here:
 ///
 /// - `sh` is the /init and /etc script interpreter; td-sh is not shipped yet.
-/// - `test` because POSIX `-w` is `access(2)`, which safe `std` cannot reach.
-///   rootcheck runs its `-w` probes under `su ... <user>`, so they ask whether THAT
-///   caller may write: `/var` is root-owned 0755 and mounted rw, and a mode-bits
-///   approximation blind to the caller's euid/egid/supplementary groups reads the
-///   owner bit and answers "writable", inverting `test ! -w /var` — the check would
-///   then pass for a system that had actually failed.
-/// - `mknod` because `mknod(2)` is likewise a syscall.
-///
-/// The last two are reviewed amendments, not approximations to be slipped in.
-const INITRAMFS_APPLETS: &[&str] = &["mknod", "sh", "test"];
+/// - `mknod` because `mknod(2)` is a syscall no safe `std` reaches; moving it is a
+///   reviewed amendment to td-init's roster, not an approximation to slip in.
+const INITRAMFS_APPLETS: &[&str] = &["mknod", "sh"];
 
 /// The diagnostics userland, served by the static td-util multicall — the busybox names
 /// uutils does not provide. Like busybox and uutils it dispatches on argv[0]'s basename, so
@@ -959,7 +957,7 @@ fn build_selector_init() -> String {
      /bin/mount -t devtmpfs dev /dev\n\
      /bin/mount -t proc proc /proc\n\
      n=0\n\
-     while /bin/busybox test \"$n\" -lt 5 && ! /bin/busybox test -b /dev/vda; do /bin/td-util sleep 1; n=$((n+1)); done\n\
+     while /bin/td-util test \"$n\" -lt 5 && ! /bin/td-util test -b /dev/vda; do /bin/td-util sleep 1; n=$((n+1)); done\n\
      exec /bin/td-boot boot /dev/vda /volume \"$(/bin/td-util cat /proc/cmdline)\"\n"
         .into()
 }
@@ -979,19 +977,19 @@ fn build_deployment_init(sys: &SystemDef) -> String {
      /bin/mount -t proc proc /proc\n\
      /bin/mount -t sysfs sysfs /sys\n\
      n=0\n\
-     while /bin/busybox test \"$n\" -lt 5 && ! /bin/busybox test -b /dev/vda; do /bin/td-util sleep 1; n=$((n+1)); done\n\
+     while /bin/td-util test \"$n\" -lt 5 && ! /bin/td-util test -b /dev/vda; do /bin/td-util sleep 1; n=$((n+1)); done\n\
      deployment=\n\
      deployment_seen=\n\
      for word in $(/bin/td-util cat /proc/cmdline); do\n\
        case \"$word\" in\n\
          td.deployment=*) \
-           /bin/busybox test -z \"$deployment_seen\" || { echo 'td-init: duplicate td.deployment handoff' >&2; exit 1; }; \
+           /bin/td-util test -z \"$deployment_seen\" || { echo 'td-init: duplicate td.deployment handoff' >&2; exit 1; }; \
            deployment_seen=1; deployment=${word#td.deployment=} ;;\n\
        esac\n\
      done\n\
-     /bin/busybox test -n \"$deployment\" || { echo 'td-init: missing td.deployment handoff' >&2; exit 1; }\n\
+     /bin/td-util test -n \"$deployment\" || { echo 'td-init: missing td.deployment handoff' >&2; exit 1; }\n\
      /bin/mount -t btrfs -o ro,nodev,nosuid,noexec /dev/vda /volume\n\
-     if ! /bin/busybox test -b /dev/loop0; then /bin/busybox mknod /dev/loop0 b 7 0; fi\n\
+     if ! /bin/td-util test -b /dev/loop0; then /bin/busybox mknod /dev/loop0 b 7 0; fi\n\
      /bin/td-boot root-loop /volume \"$deployment\" /dev/loop0\n\
      /bin/mount -t erofs -o ro /dev/loop0 /sysroot\n\
      /bin/mount -t btrfs -o rw,nodev,nosuid,subvol=@var /dev/vda /sysroot/var\n\
@@ -1080,7 +1078,7 @@ fn build_shutdown() -> String {
          /bin/td-init sync || {{ echo 'td-shutdown: sync failed' >&2; ok=0; }}\n\
          /bin/umount /var || {{ echo 'td-shutdown: umount /var failed' >&2; ok=0; }}\n\
          /bin/umount -a -r --exclude /run || {{ echo 'td-shutdown: final unmount failed' >&2; ok=0; }}\n\
-         /bin/busybox test \"$ok\" = 1 && echo {SYSTEM_SHUTDOWN_MARKER}\n"
+         /bin/td-util test \"$ok\" = 1 && echo {SYSTEM_SHUTDOWN_MARKER}\n"
     )
 }
 
@@ -1108,14 +1106,31 @@ fn build_rootcheck(sys: &SystemDef) -> String {
     }
     if let Some(user) = sys.users.iter().find(|user| user.name == sys.autologin) {
         if user.uid != 0 {
+            let (name, home) = (user.name, user.home);
+            // These probes WRITE rather than ask `test -w`: POSIX `-w` is access(2),
+            // and a mode-bits answer would read root's own bit on 0755 `/var` and
+            // report success for a system that had failed. Each attempt runs in a
+            // CHILD shell because ash exits a non-interactive shell when a special
+            // builtin's redirection fails (the /etc probe below documents the same
+            // constraint; it spells the shell `/bin/busybox sh` where this spells it
+            // `/bin/sh` — the same static binary today, and the spelling that follows
+            // `sh` wherever it goes next).
+            //
+            // Root clears the probe files on BOTH sides, and the pre-clear is
+            // load-bearing: a stale root-owned `/var/.tdwr-su` makes the unprivileged
+            // write fail with EACCES even where `/var` is world-writable, and that
+            // failure would read as a pass. `home` sits inside DOUBLE quotes, so `$`
+            // and `"` would be live; `valid_home` admits only `/home/<alnum . _ ->`,
+            // which is what makes that safe.
             s.push_str(&format!(
-                "if /bin/su -s /bin/sh {} -c \
-                 '/bin/busybox test -d /var/root \
-                 && /bin/busybox test ! -w /var \
-                 && /bin/busybox test ! -w /var/root \
-                 && /bin/busybox test -w {}'; then \
-                 echo {SYSTEM_STATE_OWNER_MARKER}; else ok=0; fi\n",
-                user.name, user.home
+                "/bin/td-util rm -f /var/.tdwr-su /var/root/.tdwr-su {home}/.tdwr-su || ok=0\n\
+                 if /bin/su -s /bin/sh {name} -c \
+                 '/bin/td-util test -d /var/root || exit 1; \
+                 /bin/sh -c \": > /var/.tdwr-su\" 2>/dev/null && exit 1; \
+                 /bin/sh -c \": > /var/root/.tdwr-su\" 2>/dev/null && exit 1; \
+                 /bin/sh -c \": > {home}/.tdwr-su\" 2>/dev/null || exit 1'; then \
+                 echo {SYSTEM_STATE_OWNER_MARKER}; else ok=0; fi\n\
+                 /bin/td-util rm -f /var/.tdwr-su /var/root/.tdwr-su {home}/.tdwr-su || ok=0\n"
             ));
         }
     }
@@ -1185,14 +1200,14 @@ fn build_rootcheck(sys: &SystemDef) -> String {
     ));
     s.push_str(&format!(
         "if /bin/grep -q -F '{PERSIST_WRITE_CMDLINE_TOKEN}' /proc/cmdline; then \
-         if /bin/busybox test ! -e /var/lib/td/boot-marker \
+         if /bin/td-util test ! -e /var/lib/td/boot-marker \
          && /bin/td-util mkdir -p /var/lib/td \
          && /bin/td-util printf '%s\\n' td-persistent-v1 > /var/lib/td/boot-marker \
          && /bin/td-init sync; then \
          echo {SYSTEM_PERSIST_WRITE_MARKER}; fi; \
          fi\n\
          if /bin/grep -q -F '{PERSIST_READ_CMDLINE_TOKEN}' /proc/cmdline \
-         && /bin/busybox test \"$(/bin/td-util cat /var/lib/td/boot-marker 2>/dev/null)\" = td-persistent-v1; then \
+         && /bin/td-util test \"$(/bin/td-util cat /var/lib/td/boot-marker 2>/dev/null)\" = td-persistent-v1; then \
          echo {SYSTEM_PERSIST_READ_MARKER}; \
          fi\n"
     ));
@@ -1226,7 +1241,7 @@ fn build_mutable_etc_check(sys: &SystemDef) -> String {
         // reaches writable /var.
         if entry.state == State::Persistent {
             s.push_str(&format!(
-                "/bin/busybox test -f /etc/{} || me=0\n",
+                "/bin/td-util test -f /etc/{} || me=0\n",
                 entry.etc
             ));
         }
@@ -1405,9 +1420,9 @@ fn build_bootsuccess(sys: &SystemDef) -> String {
          /bin/td-util chmod 0644 /run/td-boot-success-ok; }}\n\
          fail() {{ finish td-boot-failure-v1; exit 1; }}\n\
          /bin/grep -q -F '{BOOT_FAIL_TARGET_CMDLINE_TOKEN}' /proc/cmdline && exit 0\n\
-         /bin/busybox test \"$(/bin/td-util cat /run/td-rootcheck-ok 2>/dev/null)\" = td-rootcheck-v1 || fail\n\
+         /bin/td-util test \"$(/bin/td-util cat /run/td-rootcheck-ok 2>/dev/null)\" = td-rootcheck-v1 || fail\n\
          deployment=$(/bin/td-util cat /run/td-deployment 2>/dev/null)\n\
-         /bin/busybox test -n \"$deployment\" || fail\n\
+         /bin/td-util test -n \"$deployment\" || fail\n\
          wait={BOOT_SUCCESS_RETRY_SECS}\n\
          for token in $(/bin/td-util cat /proc/cmdline); do \
          case \"$token\" in {BOOT_SUCCESS_WAIT_CMDLINE_PREFIX}*) \
@@ -1491,7 +1506,7 @@ fn build_bootfail() -> String {
         "#!/bin/sh\n\
          set -f\n\
          /bin/grep -q -F '{BOOT_FAIL_TARGET_CMDLINE_TOKEN}' /proc/cmdline || exit 0\n\
-         /bin/busybox test \"$(/bin/td-util cat /run/td-rootcheck-ok 2>/dev/null)\" = td-rootcheck-v1 || exit 1\n\
+         /bin/td-util test \"$(/bin/td-util cat /run/td-rootcheck-ok 2>/dev/null)\" = td-rootcheck-v1 || exit 1\n\
          wait={BOOT_FAIL_PARK_WAIT_SECS}\n\
          for token in $(/bin/td-util cat /proc/cmdline); do \
          case \"$token\" in {BOOT_SUCCESS_WAIT_CMDLINE_PREFIX}*) \
@@ -3522,6 +3537,131 @@ mod tests {
         }
     }
 
+
+    /// The words of the `test` expression starting at `rest`, up to the first shell
+    /// separator OUTSIDE quotes and `$( )`.
+    ///
+    /// A naive `split_whitespace` turns `"$(/bin/td-util cat /f)" = v` into five words
+    /// and reads `cat` as the operator, so the scan above would either miss a bad
+    /// operator or reject a good one.
+    #[cfg(test)]
+    fn test_words(rest: &str) -> Vec<String> {
+        let (mut words, mut cur) = (Vec::new(), String::new());
+        let (mut dquote, mut depth) = (false, 0usize);
+        let mut chars = rest.chars().peekable();
+        while let Some(c) = chars.next() {
+            match c {
+                '"' => {
+                    dquote = !dquote;
+                    cur.push(c);
+                }
+                '$' if chars.peek() == Some(&'(') => {
+                    depth += 1;
+                    cur.push(c);
+                }
+                '(' if depth > 0 => cur.push(c),
+                ')' if depth > 0 => {
+                    depth -= 1;
+                    cur.push(c);
+                }
+                ';' | '&' | '|' | '\n' if !dquote && depth == 0 => break,
+                c if c.is_whitespace() && !dquote && depth == 0 => {
+                    if !cur.is_empty() {
+                        words.push(std::mem::take(&mut cur));
+                    }
+                }
+                c => cur.push(c),
+            }
+        }
+        if !cur.is_empty() {
+            words.push(cur);
+        }
+        words
+    }
+
+    /// One of td-util `test`'s operator rosters, read out of the applet's own source.
+    ///
+    /// Restating them here is what the sibling applet scan avoids by deriving from
+    /// `applet_table`: a roster copied into this file lets `-s` disappear from the
+    /// applet while this scan stays green and a `test -s` call site breaks at boot.
+    #[cfg(test)]
+    fn test_operators(name: &str) -> Vec<String> {
+        const SRC: &str = include_str!("../../../td-util/src/test.rs");
+        let Some(after) = SRC.split_once(&format!("const {name}: &[&str] = &[")) else {
+            return Vec::new();
+        };
+        let Some((body, _)) = after.1.split_once(']') else {
+            return Vec::new();
+        };
+        body.split(',')
+            .filter_map(|tok| {
+                let t = tok.trim();
+                t.strip_prefix('"')?.strip_suffix('"').map(str::to_string)
+            })
+            .collect()
+    }
+
+    /// Every operator a generated script hands `/bin/td-util test` must be one the
+    /// applet SERVES.
+    ///
+    /// An unserved operator is not a build error and not a loud runtime one either:
+    /// the applet reports it on stderr and exits 2, and `if test -w /var; then A; else
+    /// B; fi` takes the ELSE branch on a 2 exactly as it does on a 1. So re-adding
+    /// `test -w` — the prediction this landing deleted — would silently answer "no"
+    /// at every call site while the console scrolled past the reason. A whitelist,
+    /// not a `-r`/`-w`/`-x` denylist, so an operator nobody has thought about yet
+    /// reds too.
+    #[test]
+    fn every_scripted_test_operator_is_one_the_applet_serves() {
+        let unary = test_operators("UNARY");
+        let binary = test_operators("BINARY");
+        let refused = test_operators("REFUSED");
+        assert!(
+            unary.len() >= 5 && binary.len() >= 5 && refused.len() == 3,
+            "could not read the operator rosters out of td-util's test.rs \
+             ({unary:?} {binary:?} {refused:?}); the scan below would vacuously pass"
+        );
+        let mut checked = 0usize;
+        for (name, text, _) in script_sources() {
+            for (idx, _) in text.match_indices("/bin/td-util test ") {
+                let Some(rest) = text.get(idx + "/bin/td-util test ".len()..) else {
+                    continue;
+                };
+                let words = test_words(rest);
+                let mut words = words.iter().map(String::as_str).peekable();
+                if words.peek() == Some(&"!") {
+                    words.next();
+                }
+                let Some(first) = words.next() else {
+                    panic!("{name}: `/bin/td-util test` with an empty expression")
+                };
+                // Mirrors the applet's own dispatch: a leading `-token` is a unary
+                // operator, anything else is an operand and the operator follows it.
+                if first.starts_with('-') {
+                    assert!(
+                        unary.iter().any(|op| op == first),
+                        "{name} asks `test {first}`, which td-util does not serve — it \
+                         exits 2 and every `if` around it silently takes the else branch"
+                    );
+                } else {
+                    let op = words.next().unwrap_or("");
+                    assert!(
+                        binary.iter().any(|b| b == op),
+                        "{name} asks `test {first} {op}`, whose operator td-util does not \
+                         serve — it exits 2 and every `if` around it silently takes the \
+                         else branch"
+                    );
+                }
+                checked += 1;
+            }
+        }
+        assert!(
+            checked >= 16,
+            "only {checked} `/bin/td-util test` call sites found (18 today); the scan is not \
+             reaching the generated scripts and would pass vacuously"
+        );
+    }
+
     /// Every `td-util <applet>` / `td-init <applet>` a generated script invokes must be an
     /// applet that multicall actually serves.
     ///
@@ -4361,7 +4501,7 @@ mod tests {
             shutdown.contains("/bin/td-init sync || {")
                 && shutdown.contains("/bin/umount /var || {")
                 && shutdown.contains("/bin/umount -a -r --exclude /run || {")
-                && shutdown.contains("/bin/busybox test \"$ok\" = 1")
+                && shutdown.contains("/bin/td-util test \"$ok\" = 1")
                 && shutdown.contains(SYSTEM_SHUTDOWN_MARKER),
             "the teardown must attempt every safety step and emit its marker only when all pass"
         );
@@ -4480,6 +4620,11 @@ mod tests {
             "/home/.",
             "/home/a b",
             "/home/a;b",
+            // rootcheck's write probe embeds the home inside DOUBLE quotes
+            // (`sh -c ": > <home>/.tdwr"`), where these two are live where the
+            // old single-quoted `test -w <home>` made them inert.
+            "/home/a$b",
+            "/home/a\"b",
             "/home/a/b",
             "/srv/user",
             "/root",
@@ -4513,11 +4658,46 @@ mod tests {
             rootcheck.contains("readlink /var/run)\" = /run"),
             "rootcheck must prove /var/run resolves into volatile /run"
         );
+        // The two negative probes must ABORT the su script on success (`&& exit 1`)
+        // and the positive one on failure (`|| exit 1`); a probe whose status is
+        // discarded proves nothing.
         assert!(
             rootcheck.contains(SYSTEM_STATE_OWNER_MARKER)
-                && rootcheck.contains("test ! -w /var")
-                && rootcheck.contains("test ! -w /var/root"),
-            "rootcheck must prove the login user cannot own system state"
+                && rootcheck.contains("/bin/sh -c \": > /var/.tdwr-su\" 2>/dev/null && exit 1")
+                && rootcheck
+                    .contains("/bin/sh -c \": > /var/root/.tdwr-su\" 2>/dev/null && exit 1")
+                && rootcheck.contains(".tdwr-su\" 2>/dev/null || exit 1"),
+            "rootcheck must prove the login user cannot own system state by WRITING"
+        );
+        // The pre-clear must come BEFORE the su, and its failure must count. A stale
+        // root-owned probe file makes the unprivileged write fail with EACCES even
+        // where `/var` is world-writable, and that failure reads as a pass — so
+        // moving both clears after the su, or letting one fail quietly, reopens the
+        // hole while leaving the assertion above green.
+        let clear = "/bin/td-util rm -f /var/.tdwr-su /var/root/.tdwr-su";
+        let (Some(first_clear), Some(su), Some(last_clear)) = (
+            rootcheck.find(clear),
+            rootcheck.find("if /bin/su -s /bin/sh"),
+            rootcheck.rfind(clear),
+        ) else {
+            panic!("rootcheck lost either the probe clears or the su block")
+        };
+        assert!(
+            first_clear < su && last_clear > su,
+            "the probe files must be cleared on BOTH sides of the su ({first_clear} \
+             {su} {last_clear})"
+        );
+        assert_eq!(
+            rootcheck.matches(&format!("{clear} /home/tester/.tdwr-su || ok=0")).count(),
+            2,
+            "a clear that fails is the one case the clear exists for; it must set ok=0"
+        );
+        // `-w` must not come back. It is access(2), which no td multicall serves, and
+        // the mode-bits stand-in reads root's own bit on 0755 `/var`. Spelled with the
+        // surrounding characters so a `grep -w` elsewhere is not what trips it.
+        assert!(
+            !rootcheck.contains(" -w /") && !rootcheck.contains(" -w \""),
+            "rootcheck must not ask `-w`: the write attempts above replaced that prediction"
         );
         assert!(
             rootcheck.contains(PERSIST_WRITE_CMDLINE_TOKEN)

@@ -5,7 +5,7 @@
 //!
 //! Two kinds of caller, one reason. `clear`/`which`/`free`/`ps`/`dmesg` are names
 //! uutils does not provide at all. `cat`/`chmod`/`chown`/`ln`/`mkdir`/`printf`/
-//! `readlink`/`rm`/`sleep` it DOES provide — dynamically linked, against a
+//! `readlink`/`rm`/`sleep`/`test` it DOES provide — dynamically linked, against a
 //! runtime closure that the pre-pivot initramfs has no loader for and that the
 //! boot self-check exists to report the breakage of. Both sets need a binary
 //! that works when the closure does not, which is what this one is.
@@ -34,6 +34,7 @@ mod printf;
 mod procfs;
 mod ps;
 mod sleep;
+mod test;
 mod which;
 
 use std::io::Write;
@@ -58,6 +59,7 @@ const APPLETS: &[(&str, Applet)] = &[
     ("readlink", fileops::readlink),
     ("rm", fileops::rm),
     ("sleep", sleep::run),
+    ("test", test::run),
     ("which", which::run),
 ];
 
