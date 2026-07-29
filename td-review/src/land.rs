@@ -531,8 +531,10 @@ fn remotes_carrying(
 }
 
 /// Delete branch `short` from every pushable remote that has it. Deleting a
-/// published ref is irreversible for anyone who has not fetched it, so the
-/// callers gate this behind an explicit confirmation.
+/// published ref is irreversible for anyone who has not fetched it: a
+/// hand-picked branch (`D`, `--delete`) is gated behind an explicit
+/// confirmation, and the post-push sweep by the checks in `delete_plan` plus
+/// the per-target lease below.
 pub fn delete_branch(
     git: &Git,
     base: &str,

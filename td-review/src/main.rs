@@ -45,7 +45,8 @@ keys (TUI):
   f fetch the base's remote   F fetch every remote
   p push the base to its remote   P push the base to every remote
   in review: j/k or space/b scroll, p pager, a approve + land
-  landing commits only; p publishes it afterwards
+  landing commits only; p publishes it afterwards, unconfirmed, and
+  deletes the branches it published from the remotes it reached
 ";
 
 struct Args {

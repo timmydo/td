@@ -24,17 +24,12 @@ enum Screen {
 /// A pending yes/no decision, shown as a bar across the bottom row.
 enum Prompt {
     Land,
-    /// Publish the base. The target list and the commit are pinned when the
-    /// prompt is raised: a remote added while it is open cannot be pushed to
-    /// unseen, and a base that moves meanwhile is refused by `push_all`. The
-    /// push still goes by remote NAME, so a retargeted url is followed.
-    Push { remotes: Vec<(String, String)>, sha: String },
     Conflict,
-    /// Delete a landed (or hand-picked) branch. The targets are pinned when the
-    /// prompt is raised, so confirming cannot delete more than was shown. The
-    /// landing rides along: the answer decides whether it is done with (a
-    /// remote it reached still carries the branch) or can be dropped.
-    Delete { short: String, targets: Vec<land::DeleteTarget>, landing: Option<Landed> },
+    /// Delete a hand-picked branch (`D`), whose relation to anything landed is
+    /// unknown. The targets are pinned when the prompt is raised, so confirming
+    /// cannot delete more than was shown. Branches landed in this session are
+    /// swept by the push that publishes them and never come through here.
+    Delete { short: String, targets: Vec<land::DeleteTarget> },
 }
 
 /// Names of the remotes a push would actually reach.
@@ -48,22 +43,11 @@ fn pushable(remotes: &[(String, String)]) -> Vec<&str> {
 
 /// A branch squash-landed this session. The tip is what its remote copies are
 /// checked against before a delete; the landing commit is what a push has to
-/// have published before that delete may be offered at all.
+/// have published before that delete may happen at all.
 struct Landed {
     refname: String,
     oid: String,
     sha: String,
-}
-
-/// What one push put out, and where it reached.
-struct Published {
-    sha: String,
-    remotes: Vec<String>,
-    /// Landings already put to the user in this sweep. A delete that failed
-    /// (a stale lease, a remote refusing its default branch) leaves the branch
-    /// in place, and without this the same confirmation would come straight
-    /// back.
-    offered: Vec<String>,
 }
 
 /// How many of a target's missing commits the push pane names before it says
@@ -72,14 +56,6 @@ const SHOWN_COMMITS: usize = 10;
 
 /// Widest the branch-name column may grow, however long the longest name is.
 const MAX_NAME_COL: usize = 48;
-
-/// How wide a delete casts. `D` on a row deletes from the remote that row names;
-/// the post-push sweep spans the remotes that push just reached — a mirror it
-/// did not reach must not lose the branch before it has the commit replacing it.
-enum Only {
-    RefsRemote,
-    Reached(Vec<String>),
-}
 
 struct Reviewing {
     refname: String,
@@ -112,13 +88,9 @@ pub struct App {
     prompt: Option<Prompt>,
     just_prompted: bool,
     /// Branches squash-landed this session. Landing no longer publishes, so
-    /// their remote copies are only offered for cleanup once a push has put the
-    /// commit carrying that work on a remote.
+    /// their remote copies are only swept once a push has put the commit
+    /// carrying that work on a remote.
     landed: VecDeque<Landed>,
-    /// What the last push published, and the remotes it reached. Cleanup is
-    /// offered only for landings that commit carries, and deletes only from
-    /// those remotes.
-    pushed: Option<Published>,
     status: String,
     status_style: Style,
     now: i64,
@@ -148,7 +120,6 @@ impl App {
             prompt: None,
             just_prompted: false,
             landed: VecDeque::new(),
-            pushed: None,
             status: String::new(),
             status_style: Style::PLAIN,
             now: now_unix(),
@@ -237,36 +208,22 @@ impl App {
                     let name = self.reviewing.as_ref().map_or("?", |r| r.refname.as_str());
                     format!(" land {name} into {} ?  [y] squash + commit   [n] cancel", self.base)
                 }
-                Prompt::Push { remotes, sha } => format!(
-                    " push {} at {} to {} ?  [y] push   [n] cancel",
-                    self.base,
-                    land::short(sha),
-                    pushable(remotes).join(", ")
-                ),
                 Prompt::Conflict => {
                     " unfinished squash:  [l]/Esc leave it and quit   [d] discard (reset --hard HEAD)"
                         .to_string()
                 }
-                Prompt::Delete { short, targets, landing } => {
+                Prompt::Delete { short, targets } => {
                     // The bar clips from the right, so it reads warning first,
                     // then WHAT is being deleted and from WHERE. The key hints
                     // are last: they are constant, and the log pane above
                     // carries the full target list either way.
                     let first = targets.first().map(|t| &t.oid);
                     let mixed = targets.iter().any(|t| Some(&t.oid) != first);
-                    let where_ = if landing.is_some() {
-                        // The pane above lists them in full and is on screen.
-                        format!("{} remote{}", targets.len(), if targets.len() == 1 { "" } else { "s" })
-                    } else {
-                        targets.iter().map(|t| t.remote.as_str()).collect::<Vec<_>>().join(", ")
-                    };
+                    let where_ =
+                        targets.iter().map(|t| t.remote.as_str()).collect::<Vec<_>>().join(", ");
                     format!(
-                        "{}{} delete {short} from {where_} ?  [y] delete  [n] keep{}",
-                        if landing.is_some() { " landed." } else { " NOT VERIFIED AS LANDED." },
+                        " NOT VERIFIED AS LANDED.{} delete {short} from {where_} ?  [y] delete  [n] keep",
                         if mixed { " REMOTES DIFFER." } else { "" },
-                        // Only when there is a rest to stop: the bar clips from
-                        // the right, so an inapplicable hint costs a real one.
-                        if landing.is_some() && !self.landed.is_empty() { "  [esc] stop" } else { "" }
                     )
                 }
             };
@@ -357,7 +314,7 @@ impl App {
         }
         self.footer(
             f,
-            " enter review · f/F fetch · p/P push · / filter · D delete · ? help · q quit",
+            " enter review · f/F fetch · p/P push+clean up · / filter · D delete · ? help · q quit",
         );
     }
 
@@ -490,14 +447,14 @@ impl App {
             }
             Key::Char('f') => self.fetch(false, term)?,
             Key::Char('F') => self.fetch(true, term)?,
-            Key::Char('p') => self.offer_push(false, term)?,
-            Key::Char('P') => self.offer_push(true, term)?,
+            Key::Char('p') => self.push_base(false, term)?,
+            Key::Char('P') => self.push_base(true, term)?,
             Key::Char('D') => {
                 if let Some(refname) =
                     self.view.get(self.sel).and_then(|&i| self.branches.get(i)).map(|b| b.refname.clone())
                 {
                     self.log.clear();
-                    self.offer_delete(&refname, Only::RefsRemote, None, term);
+                    self.offer_delete(&refname, term);
                 }
             }
             Key::Enter | Key::Char('l') | Key::Right => self.open_review()?,
@@ -568,10 +525,12 @@ impl App {
         }
     }
 
-    /// `p` publishes the base to its own remote, `P` to every remote. A push
-    /// carries every local commit the target lacks, not only the last landing,
-    /// so the pane names them per target before the confirmation.
-    fn offer_push(&mut self, all: bool, term: &mut dyn Ui) -> io::Result<()> {
+    /// `p` publishes the base to its own remote, `P` to every remote — no
+    /// confirmation: the keystroke is the decision. A push carries every local
+    /// commit the target lacks, not only the last landing, so the pane records
+    /// them per target, and `push_all` still refuses if the base moved since
+    /// the commit was read below.
+    fn push_base(&mut self, all: bool, term: &mut dyn Ui) -> io::Result<()> {
         let remotes = match self.push_targets(all) {
             Ok(Some(remotes)) => remotes,
             // push_targets said why on the status bar.
@@ -599,16 +558,15 @@ impl App {
                 return Ok(());
             }
         };
-        // The bar is one clipped row, so the full plan goes in the pane —
-        // appended, since the landing record above it is worth keeping.
+        // What went out, per target, ahead of the push's own output — appended,
+        // since the landing record above it is worth keeping.
         self.screen = Screen::Log;
-        self.log_title = format!("push {} ?", self.base);
         if !self.log.is_empty() {
             self.log.push(Line::blank());
         }
         self.log.push(Line::new(
             format!(
-                "will push {} at {} to: {}",
+                "pushing {} at {} to: {}",
                 self.base,
                 land::short(&sha),
                 pushable(&remotes).join(", ")
@@ -670,8 +628,7 @@ impl App {
         }
         self.log_scroll = 0;
         self.log_to_end(term);
-        self.ask(Prompt::Push { remotes, sha });
-        Ok(())
+        self.run_push(&remotes, &sha, term)
     }
 
     fn handle_review(&mut self, key: Key, term: &mut dyn Ui) -> io::Result<Flow> {
@@ -728,77 +685,27 @@ impl App {
                     self.note("cancelled", Style::dim());
                 }
             },
-            // Scrolling the plan is not answering it: these panes list every
-            // commit a push would publish and every remote a delete would
-            // reach, and both can be longer than the screen.
-            Some(Prompt::Push { .. }) | Some(Prompt::Delete { .. }) if is_scroll(key) => {
+            // Scrolling the plan is not answering it: the pane lists every
+            // remote the delete would reach, and that can be longer than the
+            // screen.
+            Some(Prompt::Delete { .. }) if is_scroll(key) => {
                 self.log_scroll = scroll_by(self.log_scroll, key, self.log.len(), term.size().0);
             }
-            Some(Prompt::Push { .. }) => match key {
-                Key::Char('y') | Key::Char('Y') => {
-                    let Some(Prompt::Push { remotes, sha }) = self.prompt.take() else {
-                        return Ok(Flow::Continue);
-                    };
-                    self.run_push(&remotes, &sha, term)?;
-                }
-                _ => {
-                    self.prompt = None;
-                    self.screen = Screen::List;
-                    self.note("not pushed", Style::dim());
-                }
-            },
             Some(Prompt::Delete { .. }) => {
-                let Some(Prompt::Delete { short, targets, landing }) = self.prompt.take() else {
+                let Some(Prompt::Delete { short, targets }) = self.prompt.take() else {
                     return Ok(Flow::Continue);
                 };
-                let sweeping = landing.is_some();
+                // Anything that is not a yes keeps the branch: the safe reading
+                // of an ambiguous answer to an irreversible delete is "no".
                 match key {
-                    Key::Char('y') | Key::Char('Y') => {
-                        self.run_delete(&short, &targets, term)?;
-                        // Deleted where this push reached; a remote it did not
-                        // reach may still carry the branch, so the landing goes
-                        // back in the queue for the push that does reach it.
-                        if let Some(entry) = landing {
-                            if self.still_carried(&entry) {
-                                self.landed.push_back(entry);
-                            }
-                        }
-                    }
-                    // One key has to end a sweep: a session that landed ten
-                    // branches would otherwise ask ten times. The rest stay
-                    // queued — this ends the sweep, not the session's cleanup.
-                    Key::Esc if sweeping => {
-                        self.pushed = None;
-                        self.log.push(Line::new(format!("kept {short}"), Style::dim()));
-                        self.log_to_end(term);
-                        self.note("sweep ended", Style::dim());
-                    }
-                    // The note is hidden by the next prompt in a sweep, so the
-                    // pane has to carry the record of what was kept.
-                    Key::Char('n') | Key::Char('N') => {
-                        self.log.push(Line::new(format!("kept {short}"), Style::dim()));
-                        self.log_to_end(term);
-                        self.note(format!("kept {short}"), Style::dim());
-                    }
-                    // Anything else is not an answer: keep the branch, and keep
-                    // the landing too — a stray key must not be what makes a
-                    // pending cleanup disappear for the rest of the session.
+                    Key::Char('y') | Key::Char('Y') => self.run_delete(&short, &targets, term)?,
                     _ => {
-                        if let Some(entry) = landing {
-                            if self.still_carried(&entry) {
-                                self.landed.push_back(entry);
-                            }
-                        }
+                        // The pane still says what the delete would have done,
+                        // so it has to carry the record of what was kept.
                         self.log.push(Line::new(format!("kept {short}"), Style::dim()));
                         self.log_to_end(term);
                         self.note(format!("kept {short}"), Style::dim());
                     }
-                }
-                // A push can publish several landings at once; each one's
-                // cleanup is offered in turn, and only after the one before it
-                // has been answered.
-                if sweeping {
-                    self.offer_landed_cleanup(term);
                 }
             }
             Some(Prompt::Conflict) => match key {
@@ -899,17 +806,28 @@ impl App {
         self.log_to_end(term);
         match landing.outcome {
             Outcome::Committed { sha } => {
-                // The branch's remote copies stay put until a push publishes
-                // the commit that now carries their work.
-                self.landed.push_back(Landed { refname, oid, sha: sha.clone() });
                 self.log.push(Line::new(
                     format!("landed {} on {} — nothing published yet", land::short(&sha), self.base),
                     Style::fg(GREEN).with_bold(),
                 ));
+                // Named here because p asks nothing once pressed: what it will
+                // do has to be readable before it is pressed. The short name,
+                // and "the remotes it reaches": the sweep matches by branch
+                // NAME across every remote the push got to, not just the one
+                // this refname happens to be qualified by.
+                let names = self.git.remote_names().unwrap_or_default();
+                let (_, short) = git::split_remote(&refname, &names);
                 self.log.push(Line::new(
-                    format!("q then p pushes {} to its remote, P to every remote", self.base),
+                    format!(
+                        "q then p pushes {} to its remote (P: every remote) and deletes {short} \
+                         from the remotes it reaches",
+                        self.base
+                    ),
                     Style::fg(CYAN),
                 ));
+                // The branch's remote copies stay put until a push publishes
+                // the commit that now carries their work.
+                self.landed.push_back(Landed { refname, oid, sha: sha.clone() });
                 self.log_to_end(term);
                 // A listing hiccup must not tear down the TUI after a good land.
                 self.refresh_quietly();
@@ -960,7 +878,7 @@ impl App {
                 Style::fg(RED).with_bold(),
             ),
             // Published somewhere, so "still local" would be a lie — and the
-            // cleanup offer stays down, since not every target has the work.
+            // sweep still runs, over those remotes alone.
             (false, n) => Line::new(
                 format!("published to {n}, but some remotes rejected the push"),
                 Style::fg(RED).with_bold(),
@@ -969,88 +887,105 @@ impl App {
         self.log_to_end(term);
         // A listing hiccup must not tear down the TUI after a successful push.
         self.refresh_quietly();
-        // Only offer cleanup once the work is genuinely published somewhere.
-        // Cleanup rides on the remotes the push actually reached — a mirror
-        // that rejected it must not lose the branch, but the ones that took it
-        // are done with theirs.
+        // Only sweep once the work is genuinely published somewhere, and only
+        // over the remotes the push actually reached — a mirror that rejected
+        // it must not lose the branch, but the ones that took it are done with
+        // theirs.
         if !pushed.reached.is_empty() {
-            self.pushed = Some(Published {
-                sha: sha.to_string(),
-                remotes: pushed.reached.clone(),
-                offered: Vec::new(),
-            });
-            self.offer_landed_cleanup(term);
+            self.sweep_landed(sha, &pushed.reached, term)?;
         }
         Ok(())
     }
 
-    /// Offer to delete each branch landed this session, now that a push has
-    /// published the commits carrying their work. One at a time: the
-    /// confirmation names a single branch, so the next is offered only once
-    /// this one has been answered.
-    fn offer_landed_cleanup(&mut self, term: &mut dyn Ui) {
-        let Some(Published { sha, remotes, mut offered }) = self.pushed.take() else {
-            return;
-        };
+    /// Delete every branch landed this session that this push published, from
+    /// the remotes it reached. Unconfirmed, because each delete is already
+    /// pinned four ways: the branch was landed here, the pushed commit contains
+    /// that landing, the remote copy is still at the tip that was reviewed
+    /// (`delete_plan`'s `landed_oid`), and the delete itself rides a lease on
+    /// that oid. Anything that fails a check keeps its branch.
+    fn sweep_landed(&mut self, sha: &str, reached: &[String], term: &mut dyn Ui) -> io::Result<()> {
         // Bounded by the queue length: an entry this push did not publish goes
-        // back for a later one rather than being dropped unasked.
+        // back for a later one rather than being dropped unswept.
         for _ in 0..self.landed.len() {
             let Some(entry) = self.landed.pop_front() else {
                 break;
             };
             // Only a push carrying the commit that took over the branch's work
             // clears it for deletion: HEAD can have been rebuilt since.
-            let published = self.git.contains(&sha, &entry.sha).unwrap_or(false)
-                && !offered.contains(&entry.refname);
-            if published && !self.still_carried(&entry) {
-                continue; // no remote carries it any more: nothing left to ask
+            if self.git.contains(sha, &entry.sha).unwrap_or(false) {
+                self.delete_landed(&entry, reached, term)?;
             }
-            if published && self.carried_by(&entry, Some(&remotes)).unwrap_or(false) {
-                let refname = entry.refname.clone();
-                self.offer_delete(&refname, Only::Reached(remotes.clone()), Some(&entry.oid), term);
-                // The prompt owns the landing from here: its answer decides
-                // whether the entry is done with or waits for another push.
-                if matches!(self.prompt, Some(Prompt::Delete { .. })) {
-                    offered.push(refname);
-                    if let Some(Prompt::Delete { landing, .. }) = self.prompt.as_mut() {
-                        *landing = Some(entry);
-                    }
-                    self.pushed = Some(Published { sha, remotes, offered });
-                    return;
-                }
+            // Requeued while any remote still has it: a mirror this push did
+            // not reach, or a delete the remote refused, is for a later push.
+            // An unanswerable git requeues too — a transient failure must not
+            // be what makes a pending cleanup disappear for the session.
+            if self.landed_plan(&entry, None).map_or(true, |(_, t, _)| !t.is_empty()) {
+                self.landed.push_back(entry);
             }
-            self.landed.push_back(entry);
         }
+        Ok(())
     }
 
-    /// Whether any pushable remote still carries the landed branch at the tip
-    /// the landing took — i.e. whether there is any cleanup left to offer. An
-    /// unanswerable git reads as "yes": the answer decides whether to forget
-    /// the landing, and a transient failure must not do that.
-    fn still_carried(&self, entry: &Landed) -> bool {
-        self.carried_by(entry, None).unwrap_or(true)
+    /// Delete one landed branch from the remotes `reached` names, recording on
+    /// the pane both what went and what was left alone.
+    fn delete_landed(
+        &mut self,
+        entry: &Landed,
+        reached: &[String],
+        term: &mut dyn Ui,
+    ) -> io::Result<()> {
+        // A plan we cannot compute is not a plan to delete anything — but it is
+        // a query, so it is downgraded to a line rather than ending the session
+        // after a good push, and it must not be a SILENT skip: the pane just
+        // promised this delete, and nothing else would say it did not happen.
+        let (short, targets, diverged) = match self.landed_plan(entry, Some(reached)) {
+            Ok(plan) => plan,
+            Err(e) => {
+                self.log.push(Line::new(
+                    format!("could not check {}: {e} — left alone", entry.refname),
+                    Style::fg(YELLOW),
+                ));
+                self.log_to_end(term);
+                return Ok(());
+            }
+        };
+        // Before the early return, not after: a branch every reached remote has
+        // moved off is left alone AND dropped from the queue, so this line is
+        // the only thing that will ever say why — and nothing is confirmed now
+        // that would have shown it.
+        for d in &diverged {
+            self.log.push(Line::new(
+                format!("{}/{short} is not the landed commit — left alone", d.remote),
+                Style::fg(YELLOW),
+            ));
+        }
+        if targets.is_empty() {
+            self.log_to_end(term);
+            return Ok(());
+        }
+        self.run_delete(&short, &targets, term)
     }
 
-    /// Whether the remotes `only` names carry it. Used to decide whether to
-    /// raise the confirmation now, so here an unanswerable git reads as "no" —
-    /// the entry then waits for a later push rather than being asked about.
-    fn carried_by(&self, entry: &Landed, only: Option<&[String]>) -> io::Result<bool> {
+    /// What deleting a landed branch would touch: its short name, the remotes
+    /// carrying it at the tip the landing took, and those that have moved past
+    /// it. `only` limits which remotes are considered.
+    fn landed_plan(
+        &self,
+        entry: &Landed,
+        only: Option<&[String]>,
+    ) -> io::Result<(String, Vec<land::DeleteTarget>, Vec<land::DeleteTarget>)> {
         let names = self.git.remote_names()?;
         let (_, short) = git::split_remote(&entry.refname, &names);
-        let (targets, _) = land::delete_plan(&self.git, short, only, Some(&entry.oid))?;
-        Ok(!targets.is_empty())
+        let (targets, diverged) =
+            land::delete_plan(&self.git, short, only, Some(&entry.oid))?;
+        Ok((short.to_string(), targets, diverged))
     }
 
-    /// Raise the delete confirmation for `refname`, naming the remotes that
-    /// actually carry it. `only` limits which remotes it may reach. Silent when
-    /// none of them carry it.
-    fn offer_delete(
-        &mut self,
-        refname: &str,
-        only: Only,
-        landed_oid: Option<&str>,
-        term: &mut dyn Ui,
-    ) {
+    /// Raise the delete confirmation for the `D` key, naming the remotes that
+    /// actually carry `refname` — the remote its own row names, and no other.
+    /// Silent when none of them carry it. This branch's relation to anything
+    /// landed is unknown, which is why it is the one delete still confirmed.
+    fn offer_delete(&mut self, refname: &str, term: &mut dyn Ui) {
         let remotes = self.git.remote_names().unwrap_or_default();
         let (named, short) = git::split_remote(refname, &remotes);
         let short = short.to_string();
@@ -1061,15 +996,11 @@ impl App {
             self.note("refusing to delete the base branch", Style::fg(RED));
             return;
         }
-        let only = match only {
-            Only::RefsRemote => named.map(|n| vec![n.to_string()]),
-            Only::Reached(names) => Some(names),
+        let only = named.map(|n| vec![n.to_string()]);
+        let (targets, _) = match land::delete_plan(&self.git, &short, only.as_deref(), None) {
+            Ok(t) => t,
+            Err(e) => return self.note(format!("{e}"), Style::fg(RED)),
         };
-        let (targets, diverged) =
-            match land::delete_plan(&self.git, &short, only.as_deref(), landed_oid) {
-                Ok(t) => t,
-                Err(e) => return self.note(format!("{e}"), Style::fg(RED)),
-            };
         if targets.is_empty() {
             return self.note(format!("no pushable remote carries {short}"), Style::dim());
         }
@@ -1077,12 +1008,6 @@ impl App {
         // of what `y` will delete — and be the pane on screen.
         self.screen = Screen::Log;
         self.log_title = format!("delete {short}?");
-        for d in &diverged {
-            self.log.push(Line::new(
-                format!("{}/{short} is not the landed commit — left alone", d.remote),
-                Style::fg(YELLOW),
-            ));
-        }
         self.log.push(Line::new(format!("will delete {short} from:"), Style::fg(CYAN)));
         for t in &targets {
             self.log.push(Line::new(
@@ -1091,7 +1016,7 @@ impl App {
             ));
         }
         self.log_to_end(term);
-        self.ask(Prompt::Delete { short, targets, landing: None })
+        self.ask(Prompt::Delete { short, targets })
     }
 
     fn run_delete(
@@ -1155,8 +1080,9 @@ fn help_lines() -> Vec<Line> {
             ("enter", "review the selected branch against the base"),
             ("f", "fetch + prune the base's remote (else origin)"),
             ("F", "fetch + prune every remote, mirrors included"),
-            ("p", "push the base to its remote (else origin)"),
-            ("P", "push the base to every remote (no_push skipped)"),
+            ("p", "push the base to its remote (else origin), then delete"),
+            ("", "the branches that push published — no confirmation"),
+            ("P", "the same, to every remote (no_push skipped)"),
             ("r", "re-read branches"),
             ("/", "filter by branch name (esc clears)"),
             ("D", "delete the selected branch from the remote its row names"),
@@ -1178,9 +1104,9 @@ fn help_lines() -> Vec<Line> {
         "landing",
         &[
             ("a then y", "squash + commit, message from the branch's commits"),
-            ("q, then p then y", "publish it: push the base (P = every remote)"),
-            ("after the push", "y deletes the landed branch, n keeps it"),
-            ("esc", "keep it and end the sweep (the rest wait for a push)"),
+            ("q, then p", "publish it: push the base (P = every remote)"),
+            ("after the push", "the branches it published are deleted from the"),
+            ("", "remotes it reached — no further confirmation"),
         ],
     );
     for prose in [
@@ -1188,7 +1114,10 @@ fn help_lines() -> Vec<Line> {
         "before you approve, the landing refuses rather than committing work",
         "you have not seen. Landing only commits — the push is a separate,",
         "deliberate step, and it publishes every local commit on the base.",
-        "Branches landed this session are offered for deletion after it.",
+        "p and P push straight away: the keystroke is the decision, and the",
+        "branches this session landed onto what it published go with it. A",
+        "remote copy that has moved off the commit you reviewed is left, as",
+        "is one on a mirror the push did not reach — until a push does.",
         "",
         "Landing needs a clean work tree with the base branch checked out.",
     ] {
@@ -1517,35 +1446,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
-    /// The confirmation lists the remotes it will reach, so the push must go to
-    /// those and not to whatever the config says a keystroke later.
-    #[test]
-    #[ignore = "drives a real git repo; the sandbox gate has no git, the host preflight does"]
-    fn a_remote_added_after_the_confirmation_is_not_pushed_to() {
-        let (root, work) = repo("late-remote");
-        let mut app = app_on(&work);
-        let mut ui = FakeUi::new();
-        for key in [Key::Enter, Key::Char('a'), Key::Char('y'), Key::Char('q'), Key::Char('P')] {
-            app.handle(key, &mut ui).unwrap();
-        }
-        let late = root.join("late.git");
-        git_in(&root, &["init", "--bare", "-b", "main", &late.to_string_lossy()]);
-        git_in(&work, &["remote", "add", "late", &late.to_string_lossy()]);
-
-        app.handle(Key::Char('y'), &mut ui).unwrap();
-
-        let refs = git_in(&late, &["for-each-ref"]);
-        assert!(refs.trim().is_empty(), "pushed to a remote the prompt never showed: {refs}");
-        assert!(
-            !git_in(&work, &["rev-parse", "origin/main"]).trim().is_empty(),
-            "origin should still have been pushed"
-        );
-        let _ = std::fs::remove_dir_all(root);
-    }
-
     /// Landing commits and stops. Publishing is `p`, a separate deliberate
     /// step — so `a y` must leave every remote exactly where it was, and must
-    /// not offer to delete a branch whose work is still only local.
+    /// not delete a branch whose work is still only local.
     #[test]
     #[ignore = "drives a real git repo; the sandbox gate has no git, the host preflight does"]
     fn landing_commits_but_publishes_nothing_until_p() {
@@ -1559,7 +1462,7 @@ mod tests {
             app.handle(key, &mut ui).unwrap();
         }
 
-        assert!(app.prompt.is_none(), "landing must not raise a push or delete confirmation");
+        assert!(app.prompt.is_none(), "landing must not raise a confirmation of its own");
         assert_eq!(git_in(&origin, &["rev-parse", "main"]).trim(), before, "landing published");
         assert!(
             git_in(&origin, &["rev-parse", "--verify", "work-0001-feature"]).trim().len() >= 40,
@@ -1568,11 +1471,37 @@ mod tests {
         let landed = git_in(&work, &["rev-parse", "main"]).trim().to_string();
         assert_ne!(landed, before, "landing did not commit");
 
-        for key in [Key::Char('q'), Key::Char('p'), Key::Char('y')] {
+        for key in [Key::Char('q'), Key::Char('p')] {
             app.handle(key, &mut ui).unwrap();
         }
 
         assert_eq!(git_in(&origin, &["rev-parse", "main"]).trim(), landed, "p did not publish");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// `p` is the decision: it publishes on the keystroke, with no confirmation
+    /// to answer, and the branch whose landing it published goes with it.
+    #[test]
+    #[ignore = "drives a real git repo; the sandbox gate has no git, the host preflight does"]
+    fn p_publishes_and_sweeps_without_asking() {
+        let (root, work) = repo("push-unasked");
+        let origin = root.join("origin.git");
+        let mut app = app_on(&work);
+        let mut ui = FakeUi::new();
+
+        for key in [Key::Enter, Key::Char('a'), Key::Char('y'), Key::Char('q')] {
+            app.handle(key, &mut ui).unwrap();
+        }
+        let landed = git_in(&work, &["rev-parse", "main"]).trim().to_string();
+
+        app.handle(Key::Char('p'), &mut ui).unwrap();
+
+        assert!(app.prompt.is_none(), "p must not raise a confirmation");
+        assert_eq!(git_in(&origin, &["rev-parse", "main"]).trim(), landed, "p did not publish");
+        let heads = git_in(&origin, &["for-each-ref", "--format=%(refname:short)", "refs/heads"]);
+        assert!(!heads.contains("work-0001-feature"), "the landed branch survived: {heads}");
+        // Nothing left waiting: origin was the only remote and it is done.
+        assert!(app.landed.is_empty(), "the swept landing is still queued");
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -1594,14 +1523,11 @@ mod tests {
         }
         let landed = git_in(&work, &["rev-parse", "main"]).trim().to_string();
         app.handle(Key::Char('p'), &mut ui).unwrap();
-        app.handle(Key::Char('y'), &mut ui).unwrap();
 
         assert_eq!(git_in(&origin, &["rev-parse", "main"]).trim(), landed, "p missed origin");
         assert_ne!(git_in(&backup, &["rev-parse", "main"]).trim(), landed, "p reached the mirror");
 
-        // The cleanup offer stands on the push; answer it, then sweep with P.
-        app.handle(Key::Char('n'), &mut ui).unwrap();
-        for key in [Key::Char('q'), Key::Char('P'), Key::Char('y')] {
+        for key in [Key::Char('q'), Key::Char('P')] {
             app.handle(key, &mut ui).unwrap();
         }
 
@@ -1611,11 +1537,11 @@ mod tests {
 
     /// A push only clears a branch for deletion if it published THAT branch's
     /// landing. If the base was rebuilt in between, the push carries something
-    /// else and the branch must survive it — then be offered once the landing
-    /// really does go out.
+    /// else and the branch must survive it — then go once the landing really
+    /// does go out.
     #[test]
     #[ignore = "drives a real git repo; the sandbox gate has no git, the host preflight does"]
-    fn a_push_that_does_not_carry_the_landing_does_not_offer_its_branch() {
+    fn a_push_that_does_not_carry_the_landing_does_not_delete_its_branch() {
         let (root, work) = repo("cleanup-gate");
         let origin = root.join("origin.git");
         let mut app = app_on(&work);
@@ -1632,28 +1558,24 @@ mod tests {
         git_in(&work, &["add", "other"]);
         git_in(&work, &["commit", "-m", "someone else's commit"]);
 
-        for key in [Key::Char('p'), Key::Char('y')] {
-            app.handle(key, &mut ui).unwrap();
-        }
+        app.handle(Key::Char('p'), &mut ui).unwrap();
 
-        assert!(app.prompt.is_none(), "cleanup was offered for an unpublished landing");
         assert!(
             git_in(&origin, &["rev-parse", "--verify", "work-0001-feature"]).trim().len() >= 40,
             "the branch was cleaned up though its landing never went out"
         );
 
-        // Put the landing back and publish it: now the offer stands.
+        // Put the landing back and publish it: now the sweep may take it.
         git_in(&work, &["reset", "--hard", &landing]);
         git_in(&work, &["push", "--force", "origin", "main"]);
-        for key in [Key::Char('q'), Key::Char('p'), Key::Char('y')] {
+        for key in [Key::Char('q'), Key::Char('p')] {
             app.handle(key, &mut ui).unwrap();
         }
-        app.redraw(&mut ui).unwrap();
 
+        let heads = git_in(&origin, &["for-each-ref", "--format=%(refname:short)", "refs/heads"]);
         assert!(
-            ui.last().contains("delete work-0001-feature"),
-            "the landing was forgotten by the push that skipped it:\n{}",
-            ui.last()
+            !heads.contains("work-0001-feature"),
+            "the landing was forgotten by the push that skipped it: {heads}"
         );
         let _ = std::fs::remove_dir_all(root);
     }
@@ -1677,31 +1599,9 @@ mod tests {
         let mut app = app_on(&work);
         let mut ui = FakeUi::new();
 
-        for key in [
-            Key::Enter,
-            Key::Char('a'),
-            Key::Char('y'),
-            Key::Char('q'),
-            Key::Char('p'),
-            Key::Char('y'),
-        ] {
+        for key in [Key::Enter, Key::Char('a'), Key::Char('y'), Key::Char('q'), Key::Char('p')] {
             app.handle(key, &mut ui).unwrap();
         }
-        app.redraw(&mut ui).unwrap();
-
-        let frame = ui.last();
-        assert!(frame.contains("will delete work-0001-feature"), "no cleanup offered:\n{frame}");
-        // The prompt itself, not just what fits on the pane: these are the
-        // remotes confirming would actually delete from.
-        let targets = match &app.prompt {
-            Some(Prompt::Delete { targets, .. }) => {
-                targets.iter().map(|t| t.remote.clone()).collect::<Vec<_>>()
-            }
-            _ => Vec::new(),
-        };
-        assert_eq!(targets, vec!["origin".to_string()], "an unreached mirror is a delete target");
-
-        app.handle(Key::Char('y'), &mut ui).unwrap();
 
         let heads = |dir: &Path| git_in(dir, &["for-each-ref", "--format=%(refname:short)", "refs/heads"]);
         let origin_heads = heads(&root.join("origin.git"));
@@ -1710,19 +1610,11 @@ mod tests {
         assert!(backup_heads.contains("work-0001-feature"), "the mirror lost it: {backup_heads}");
 
         // The mirror still carries it, so the landing is not done with: the
-        // push that does reach the mirror offers the rest of the cleanup.
-        for key in [Key::Char('q'), Key::Char('P'), Key::Char('y')] {
+        // push that does reach the mirror takes the rest.
+        for key in [Key::Char('q'), Key::Char('P')] {
             app.handle(key, &mut ui).unwrap();
         }
-        let targets = match &app.prompt {
-            Some(Prompt::Delete { targets, .. }) => {
-                targets.iter().map(|t| t.remote.clone()).collect::<Vec<_>>()
-            }
-            _ => Vec::new(),
-        };
-        assert_eq!(targets, vec!["backup".to_string()], "the mirror's copy was orphaned");
 
-        app.handle(Key::Char('y'), &mut ui).unwrap();
         assert!(
             !heads(&backup).contains("work-0001-feature"),
             "the mirror kept it: {}",
@@ -1732,57 +1624,54 @@ mod tests {
     }
 
     /// The plan a confirmation is about can be longer than the screen, so the
-    /// keys that read it must not count as answering it.
+    /// keys that read it must not count as answering it. `D` is the one prompt
+    /// left with a plan behind it.
     #[test]
     #[ignore = "drives a real git repo; the sandbox gate has no git, the host preflight does"]
     fn scrolling_the_plan_does_not_answer_the_confirmation() {
         let (root, work) = repo("scroll-prompt");
-        let origin = root.join("origin.git");
-        let before = git_in(&origin, &["rev-parse", "main"]).trim().to_string();
         let mut app = app_on(&work);
         let mut ui = FakeUi::new();
 
-        for key in [Key::Enter, Key::Char('a'), Key::Char('y'), Key::Char('q'), Key::Char('p')] {
-            app.handle(key, &mut ui).unwrap();
-        }
+        app.handle(Key::Char('D'), &mut ui).unwrap();
         for key in [Key::Char('j'), Key::Char('k'), Key::PageDown, Key::Char('g')] {
             app.handle(key, &mut ui).unwrap();
-            assert!(matches!(app.prompt, Some(Prompt::Push { .. })), "{key:?} answered the prompt");
+            assert!(matches!(app.prompt, Some(Prompt::Delete { .. })), "{key:?} answered it");
         }
-        assert_eq!(git_in(&origin, &["rev-parse", "main"]).trim(), before, "a scroll key pushed");
+        let refs = git_in(&work, &["ls-remote", "--heads", "origin"]);
+        assert!(refs.contains("work-0001-feature"), "a scroll key deleted the branch: {refs}");
 
         // And a real answer still lands: the pane is readable, not inert.
         app.handle(Key::Char('n'), &mut ui).unwrap();
-        assert!(app.prompt.is_none(), "n did not cancel the push");
+        assert!(app.prompt.is_none(), "n did not answer the delete");
         let _ = std::fs::remove_dir_all(root);
     }
 
-    /// A delete that the remote rejects leaves the branch in place, and the
-    /// sweep must not walk straight back into the same confirmation.
+    /// A delete the remote rejects leaves the branch in place, and the sweep
+    /// must neither loop on it nor forget it: the next push tries again.
     #[test]
     #[ignore = "drives a real git repo; the sandbox gate has no git, the host preflight does"]
-    fn a_delete_the_remote_rejects_is_not_asked_again_in_the_same_sweep() {
+    fn a_delete_the_remote_rejects_leaves_the_branch_for_the_next_push() {
         let (root, work) = repo("delete-rejected");
         let origin = root.join("origin.git");
         let mut app = app_on(&work);
         let mut ui = FakeUi::new();
 
-        for key in [Key::Enter, Key::Char('a'), Key::Char('y'), Key::Char('q'), Key::Char('p')] {
+        for key in [Key::Enter, Key::Char('a'), Key::Char('y'), Key::Char('q')] {
             app.handle(key, &mut ui).unwrap();
         }
-        app.handle(Key::Char('y'), &mut ui).unwrap();
-        assert!(app.prompt.is_some(), "cleanup was not offered");
-
-        // The branch moves on the remote after the targets were pinned: the
-        // delete's lease no longer matches and the remote refuses it.
+        // The branch moves on the remote behind our tracking ref: the delete's
+        // lease no longer matches what is there and the remote refuses it.
         git_in(&origin, &["branch", "-f", "work-0001-feature", "main"]);
-        app.handle(Key::Char('y'), &mut ui).unwrap();
 
-        assert!(app.prompt.is_none(), "the rejected delete was asked again immediately");
+        app.handle(Key::Char('p'), &mut ui).unwrap();
+
+        assert!(app.prompt.is_none(), "the sweep must not ask");
         assert!(
             git_in(&origin, &["rev-parse", "--verify", "work-0001-feature"]).trim().len() >= 40,
             "the branch went despite the refusal"
         );
+        assert_eq!(app.landed.len(), 1, "the landing was dropped by a refused delete");
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -1790,30 +1679,21 @@ mod tests {
     /// done with their copy of the branch even though the push was not all_ok.
     #[test]
     #[ignore = "drives a real git repo; the sandbox gate has no git, the host preflight does"]
-    fn a_partial_push_still_offers_cleanup_on_the_remotes_it_reached() {
+    fn a_partial_push_still_sweeps_the_remotes_it_reached() {
         let (root, work) = repo("partial-push");
         git_in(&work, &["remote", "add", "backup", &root.join("gone.git").to_string_lossy()]);
         let mut app = app_on(&work);
         let mut ui = FakeUi::new();
 
-        for key in [
-            Key::Enter,
-            Key::Char('a'),
-            Key::Char('y'),
-            Key::Char('q'),
-            Key::Char('P'),
-            Key::Char('y'),
-        ] {
+        for key in [Key::Enter, Key::Char('a'), Key::Char('y'), Key::Char('q'), Key::Char('P')] {
             app.handle(key, &mut ui).unwrap();
         }
 
-        let targets = match &app.prompt {
-            Some(Prompt::Delete { targets, .. }) => {
-                targets.iter().map(|t| t.remote.clone()).collect::<Vec<_>>()
-            }
-            _ => Vec::new(),
-        };
-        assert_eq!(targets, vec!["origin".to_string()], "the reached remote was not offered");
+        let heads = git_in(
+            &root.join("origin.git"),
+            &["for-each-ref", "--format=%(refname:short)", "refs/heads"],
+        );
+        assert!(!heads.contains("work-0001-feature"), "the reached remote kept it: {heads}");
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -1851,32 +1731,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
-    /// The typeahead guard covers the push too: `py` arriving in one read may
-    /// not publish anything.
-    #[test]
-    #[ignore = "drives a real git repo; the sandbox gate has no git, the host preflight does"]
-    fn a_batched_p_and_y_cannot_push_unseen() {
-        let (root, work) = repo("batch-py");
-        let origin = root.join("origin.git");
-        let before = git_in(&origin, &["rev-parse", "main"]).trim().to_string();
-        let mut app = app_on(&work);
-        let mut ui = FakeUi::new();
-        for key in [Key::Enter, Key::Char('a'), Key::Char('y'), Key::Char('q')] {
-            app.handle(key, &mut ui).unwrap();
-        }
-
-        app.feed(vec![Key::Char('p'), Key::Char('y')], &mut ui).unwrap();
-
-        assert!(app.prompt.is_some(), "the push prompt was consumed by its own batch");
-        assert_eq!(git_in(&origin, &["rev-parse", "main"]).trim(), before, "pushed unseen");
-        let _ = std::fs::remove_dir_all(root);
-    }
-
     /// Cleanup rides on the push, not the land — and one push can publish
-    /// several landings, so every branch waiting on it is offered in turn.
+    /// several landings, so every branch waiting on it goes in the same sweep.
     #[test]
     #[ignore = "drives a real git repo; the sandbox gate has no git, the host preflight does"]
-    fn every_branch_landed_before_the_push_is_offered_for_cleanup_after_it() {
+    fn every_branch_landed_before_the_push_is_deleted_after_it() {
         let (root, work) = repo("cleanup-queue");
         let origin = root.join("origin.git");
         // A second branch touching a different file, so landing both cannot
@@ -1904,123 +1763,16 @@ mod tests {
         assert!(app.prompt.is_none(), "two landings must still not have prompted");
 
         app.handle(Key::Char('p'), &mut ui).unwrap();
-        app.handle(Key::Char('y'), &mut ui).unwrap();
-        app.redraw(&mut ui).unwrap();
-        assert!(
-            ui.last().contains("delete work-0001-feature"),
-            "the first landing was not offered for cleanup:\n{}",
-            ui.last()
-        );
 
-        app.handle(Key::Char('n'), &mut ui).unwrap();
-        app.redraw(&mut ui).unwrap();
-        assert!(
-            ui.last().contains("delete work-0002-second"),
-            "the second landing was forgotten:\n{}",
-            ui.last()
-        );
-
-        app.handle(Key::Char('y'), &mut ui).unwrap();
-
+        assert!(app.prompt.is_none(), "the sweep must not ask");
         let heads = git_in(&origin, &["for-each-ref", "--format=%(refname:short)", "refs/heads"]);
-        assert!(heads.contains("work-0001-feature"), "a kept branch was deleted: {heads}");
-        assert!(!heads.contains("work-0002-second"), "the deleted branch is still there: {heads}");
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    /// A sweep has to be endable in one key: esc keeps the branch it is asking
-    /// about and stops asking about the others.
-    #[test]
-    #[ignore = "drives a real git repo; the sandbox gate has no git, the host preflight does"]
-    fn esc_ends_the_cleanup_sweep_instead_of_moving_to_the_next_branch() {
-        let (root, work) = repo("cleanup-esc");
-        git_in(&work, &["checkout", "-b", "work-0002-second"]);
-        std::fs::write(work.join("g"), "gee\n").unwrap();
-        git_in(&work, &["add", "g"]);
-        git_in(&work, &["commit", "-m", "second: step"]);
-        git_in(&work, &["push", "origin", "work-0002-second"]);
-        git_in(&work, &["checkout", "main"]);
-        git_in(&work, &["branch", "-D", "work-0002-second"]);
-        let mut app = app_on(&work);
-        let mut ui = FakeUi::new();
-
-        for name in ["work-0001-feature", "work-0002-second"] {
-            app.sel = app
-                .view
-                .iter()
-                .position(|&i| app.branches.get(i).is_some_and(|b| b.refname.ends_with(name)))
-                .unwrap();
-            for key in [Key::Enter, Key::Char('a'), Key::Char('y'), Key::Char('q')] {
-                app.handle(key, &mut ui).unwrap();
-            }
-        }
-        for key in [Key::Char('p'), Key::Char('y'), Key::Esc] {
-            app.handle(key, &mut ui).unwrap();
-        }
-
-        assert!(app.prompt.is_none(), "esc must not step to the next branch");
-        let heads = git_in(&root.join("origin.git"), &["for-each-ref", "--format=%(refname:short)"]);
-        assert!(heads.contains("work-0001-feature"), "esc deleted something: {heads}");
-        assert!(heads.contains("work-0002-second"), "esc deleted something: {heads}");
-
-        // Esc ended the sweep, not the session's cleanup: what it never asked
-        // about comes back with the next push, as the help says it does.
-        std::fs::write(work.join("later"), "more\n").unwrap();
-        git_in(&work, &["add", "later"]);
-        git_in(&work, &["commit", "-m", "a later commit on the base"]);
-        for key in [Key::Char('q'), Key::Char('p'), Key::Char('y')] {
-            app.handle(key, &mut ui).unwrap();
-        }
-        app.redraw(&mut ui).unwrap();
-        assert!(
-            ui.last().contains("delete work-0002-second"),
-            "the branch esc skipped was forgotten:\n{}",
-            ui.last()
-        );
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    /// The typeahead guard covers the sweep too: `yy` in one read may delete
-    /// the branch it was raised for and nothing else.
-    #[test]
-    #[ignore = "drives a real git repo; the sandbox gate has no git, the host preflight does"]
-    fn a_batched_yy_cannot_answer_the_next_branch_in_the_sweep() {
-        let (root, work) = repo("batch-sweep");
-        git_in(&work, &["checkout", "-b", "work-0002-second"]);
-        std::fs::write(work.join("g"), "gee\n").unwrap();
-        git_in(&work, &["add", "g"]);
-        git_in(&work, &["commit", "-m", "second: step"]);
-        git_in(&work, &["push", "origin", "work-0002-second"]);
-        git_in(&work, &["checkout", "main"]);
-        git_in(&work, &["branch", "-D", "work-0002-second"]);
-        let mut app = app_on(&work);
-        let mut ui = FakeUi::new();
-
-        for name in ["work-0001-feature", "work-0002-second"] {
-            app.sel = app
-                .view
-                .iter()
-                .position(|&i| app.branches.get(i).is_some_and(|b| b.refname.ends_with(name)))
-                .unwrap();
-            for key in [Key::Enter, Key::Char('a'), Key::Char('y'), Key::Char('q')] {
-                app.handle(key, &mut ui).unwrap();
-            }
-        }
-        app.handle(Key::Char('p'), &mut ui).unwrap();
-
-        app.feed(vec![Key::Char('y'), Key::Char('y')], &mut ui).unwrap();
-
-        let heads = git_in(&root.join("origin.git"), &["for-each-ref", "--format=%(refname:short)"]);
-        assert!(
-            heads.contains("work-0002-second"),
-            "the second branch was deleted by a key typed before its prompt: {heads}"
-        );
-        assert!(app.prompt.is_some(), "the sweep must still be waiting on an answer");
+        assert!(!heads.contains("work-0001-feature"), "the first landing was skipped: {heads}");
+        assert!(!heads.contains("work-0002-second"), "the second landing was skipped: {heads}");
         let _ = std::fs::remove_dir_all(root);
     }
 
     /// The push publishes exactly the commit that was approved. If the base
-    /// moved while the confirmation was open, nothing goes out.
+    /// moved since it was read, nothing goes out.
     #[test]
     #[ignore = "drives a real git repo; the sandbox gate has no git, the host preflight does"]
     fn a_base_that_moved_since_the_approval_is_not_pushed() {
@@ -2040,11 +1792,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
-    /// The push confirmation is the one prompt with no target list of its own,
-    /// so the remotes it will reach have to be on the pane behind it.
+    /// Nothing is confirmed any more, so the pane is the whole record of what
+    /// went out: the commit, the remotes, and what each of them lacked.
     #[test]
     #[ignore = "drives a real git repo; the sandbox gate has no git, the host preflight does"]
-    fn the_push_confirmation_names_the_remotes_it_would_reach() {
+    fn the_push_pane_records_the_remotes_and_commits_it_published() {
         let (root, work) = repo("push-names");
         let mut app = app_on(&work);
         let mut ui = FakeUi::new();
@@ -2052,15 +1804,58 @@ mod tests {
         for key in [Key::Enter, Key::Char('a'), Key::Char('y'), Key::Char('q'), Key::Char('p')] {
             app.handle(key, &mut ui).unwrap();
         }
-        app.redraw(&mut ui).unwrap();
 
-        let frame = ui.last();
-        assert!(frame.contains("[y] push"), "the push prompt was not raised:\n{frame}");
-        assert!(frame.contains("will push main at"), "the commit is not named:\n{frame}");
-        assert!(frame.contains("to: origin"), "remotes not named:\n{frame}");
-        assert!(frame.contains("as of the last fetch"), "the pane must date its data:\n{frame}");
-        // The squash commit it is about to publish, named before the y.
-        assert!(frame.contains("feature: step"), "the commits are not named:\n{frame}");
+        // The whole buffer, not the frame: the pane parks on its tail, and by
+        // the time the sweep has run the plan has scrolled off a 24-row screen.
+        let log = app.log.iter().map(|l| l.text.as_str()).collect::<Vec<_>>().join("\n");
+        assert!(log.contains("pushing main at"), "the commit is not named:\n{log}");
+        assert!(log.contains("to: origin"), "remotes not named:\n{log}");
+        assert!(log.contains("as of the last fetch"), "the pane must date its data:\n{log}");
+        assert!(log.contains("feature: step"), "the commits are not named:\n{log}");
+        assert!(log.contains("published main to 1 remote"), "the outcome is not named:\n{log}");
+        assert!(log.contains("deleted work-0001-feature"), "the sweep is not recorded:\n{log}");
+        // The pane is titled by what is happening, not by a question nobody is
+        // asked: `run_push` sets the title before the frame it draws over the
+        // network call, and `run_delete` before its own.
+        assert_eq!(app.log_title, "deleting work-0001-feature from the remotes");
+        assert!(
+            !ui.frames.iter().any(|f| f.contains("push main ?")),
+            "a frame was titled with a question nobody was asked"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A branch every reached remote has moved off is left alone and dropped
+    /// from the queue. With nothing confirmed, the pane is the only thing that
+    /// can say why, so it must say it.
+    #[test]
+    #[ignore = "drives a real git repo; the sandbox gate has no git, the host preflight does"]
+    fn a_branch_that_moved_everywhere_is_left_alone_and_the_pane_says_so() {
+        let (root, work) = repo("sweep-diverged");
+        let origin = root.join("origin.git");
+        let mut app = app_on(&work);
+        let mut ui = FakeUi::new();
+
+        for key in [Key::Enter, Key::Char('a'), Key::Char('y'), Key::Char('q')] {
+            app.handle(key, &mut ui).unwrap();
+        }
+        // Someone pushes to the branch after it was reviewed, and we see it:
+        // the copy on origin is no longer the commit the landing took.
+        git_in(&origin, &["branch", "-f", "work-0001-feature", "main"]);
+        git_in(&work, &["fetch", "origin"]);
+
+        app.handle(Key::Char('p'), &mut ui).unwrap();
+
+        let log = app.log.iter().map(|l| l.text.as_str()).collect::<Vec<_>>().join("\n");
+        assert!(
+            log.contains("origin/work-0001-feature is not the landed commit"),
+            "the skip must be reported, not silent:\n{log}"
+        );
+        assert!(
+            git_in(&origin, &["rev-parse", "--verify", "work-0001-feature"]).trim().len() >= 40,
+            "a branch that moved off the landing was deleted"
+        );
+        assert!(app.landed.is_empty(), "nothing can be deleted for it, so it must not requeue");
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -2233,7 +2028,7 @@ mod tests {
         let mut app = app_on(&work);
         let mut ui = FakeUi::new();
 
-        app.offer_delete("origin/main", Only::RefsRemote, None, &mut ui);
+        app.offer_delete("origin/main", &mut ui);
         assert!(app.prompt.is_none(), "no confirmation may be offered for the base");
         assert!(app.status.contains("base branch"), "status was {:?}", app.status);
         let _ = std::fs::remove_dir_all(root);
