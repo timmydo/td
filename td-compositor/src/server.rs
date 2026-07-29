@@ -167,10 +167,25 @@ impl Client {
         }
     }
 
-    fn unmap_surface(&mut self, surface: u32) -> Result<(), String> {
+    fn clear_surface_bytes(&mut self, surface: u32) {
         if let Some(bytes) = self.mapped_bytes.remove(&surface) {
             self.mapped_total = self.mapped_total.saturating_sub(bytes);
         }
+    }
+
+    fn unmap_surface(&mut self, surface: u32) -> Result<(), String> {
+        self.clear_surface_bytes(surface);
+        self.runtime
+            .lock()
+            .map_err(|_| "runtime lock poisoned".to_string())?
+            .unmap(SurfaceKey {
+                client: self.id,
+                object: surface,
+            })
+    }
+
+    fn remove_surface(&mut self, surface: u32) -> Result<(), String> {
+        self.clear_surface_bytes(surface);
         self.runtime
             .lock()
             .map_err(|_| "runtime lock poisoned".to_string())?
@@ -744,7 +759,7 @@ impl Client {
                             message.object
                         ));
                     }
-                    self.unmap_surface(message.object)?;
+                    self.remove_surface(message.object)?;
                     self.remove_object(message.object)
                 }
                 1 => {
@@ -1122,6 +1137,7 @@ pub fn probe(path: &Path) -> Result<(), String> {
 mod tests {
     use super::*;
     use crate::framebuffer::Framebuffer;
+    use crate::layout::Command;
     use std::io::Read;
     use std::os::fd::AsRawFd;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -1136,7 +1152,7 @@ mod tests {
     }
 
     #[test]
-    fn shm_descriptor_commits_pixels_to_the_framebuffer() {
+    fn shm_commit_and_transient_remap_preserve_pixels_and_workspace() {
         let stem = format!(
             "td-wayland-test-{}-{}",
             std::process::id(),
@@ -1256,6 +1272,51 @@ mod tests {
         }
         let frame = fs::read(&framebuffer_path).unwrap();
         assert!(frame.as_chunks::<4>().0.contains(&[0x11, 0x22, 0x33, 0]));
+
+        runtime
+            .lock()
+            .unwrap()
+            .command(Command::MoveToWorkspace(2))
+            .unwrap();
+        let mut detach = wire::Builder::new();
+        detach.u32(0);
+        detach.i32(0);
+        detach.i32(0);
+        send(&mut client, 5, 1, detach);
+        send(&mut client, 5, 6, wire::Builder::new());
+
+        let mut attach = wire::Builder::new();
+        attach.u32(7);
+        attach.i32(0);
+        attach.i32(0);
+        send(&mut client, 5, 1, attach);
+        send(&mut client, 5, 6, wire::Builder::new());
+        let mut saw_second_release = false;
+        while !saw_second_release {
+            let count = client.read(&mut scratch).unwrap();
+            assert!(count > 0);
+            received.extend_from_slice(scratch.get(..count).unwrap());
+            while let Some(message) = wire::take(&mut received).unwrap() {
+                if message.object == 7 && message.opcode == 0 {
+                    saw_second_release = true;
+                }
+            }
+        }
+        let inactive_frame = fs::read(&framebuffer_path).unwrap();
+        assert!(!inactive_frame
+            .as_chunks::<4>()
+            .0
+            .contains(&[0x11, 0x22, 0x33, 0]));
+        runtime
+            .lock()
+            .unwrap()
+            .command(Command::SwitchWorkspace(2))
+            .unwrap();
+        let restored_frame = fs::read(&framebuffer_path).unwrap();
+        assert!(restored_frame
+            .as_chunks::<4>()
+            .0
+            .contains(&[0x11, 0x22, 0x33, 0]));
 
         drop(client);
         worker.join().unwrap().unwrap();

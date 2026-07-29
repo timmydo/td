@@ -61,9 +61,25 @@ that interpretation against a file-backed framebuffer.
 
 Input is QEMU's PS/2 keyboard and pointer through evdev. The compositor
 supports EV_KEY, EV_REL, and EV_SYN. It has a fixed US key map for compositor
-bindings only. Left and right arrow move focus across columns. Client keyboard
-and pointer delivery, arbitrary keymaps, touch, calibration, gestures, and
-real GPUs are later increments.
+bindings only. The bindings deliberately follow Emacs navigation:
+
+- `Super+b`, `Super+f`, `Super+p`, and `Super+n` focus left, right, up, and
+  down;
+- adding Shift to a focus binding moves the focused tile in that direction;
+- `Super+1` through `Super+9` switch workspaces, and adding Shift moves the
+  focused tile to that workspace;
+- `Super+x 2` selects a vertical split for the next toplevel, `Super+x 3`
+  selects a horizontal split, and `Super+x 1` toggles fullscreen.
+
+The `Super+x` prefix survives key and modifier release, as an Emacs prefix
+does, and is consumed by the next non-modifier key press. Left and right
+modifier keys are tracked independently. Ctrl remains available for future
+client input. Client keyboard and pointer delivery, arbitrary keymaps, touch,
+calibration, gestures, and real GPUs are later increments.
+
+Compositor commands act only on key presses. Evdev autorepeat records are
+ignored so a held `Super+x 2` cannot fall through into repeated workspace
+switches after consuming the prefix.
 
 The framebuffer is single-buffered from userspace's perspective. The renderer
 allocates its frame storage once, composes a full frame after scene changes,
@@ -114,12 +130,30 @@ fixture. Its presentation handshake has a 20-second absolute deadline, shorter
 than the supervisor's 30-second readiness deadline, so a stalled compositor
 makes the client exit and permits `restart=always` to retry.
 
-The layout is one horizontal row of columns. Each toplevel is a column;
-left/right focus changes which columns are visible. Decoration, clipboard,
-drag-and-drop, subsurfaces, popups, output reconfiguration, fractional scale,
-screen capture, data devices, and client input are not yet advertised.
-Unknown objects, malformed sizes, invalid object reuse, missing file
-descriptors, and unsupported requests disconnect only that client.
+The one supported output owns workspaces 1 through 9. Each workspace owns an
+n-ary split tree whose leaves are mapped XDG toplevels. A new toplevel is
+inserted after the focused leaf using the selected split axis and becomes
+focused. Directional focus chooses the closest cross-axis-aligned tile with a
+stable surface-key tie break. Directional move swaps two leaves while focus
+stays with the moved toplevel. Unmapping a leaf collapses one-child
+containers. A transient buffer detach remembers the toplevel's workspace and
+reinserts it there on remap; destroying its wl_surface or disconnecting the
+client forgets that assignment. A new mapping exits fullscreen so focus never
+points behind a fullscreen tile.
+
+Geometry uses a fixed outer and inner gap and divides remainders from the
+first child onward. Undersized splits reserve a pixel for as many children as
+the axis can show before budgeting gaps, and zero-area tiles draw neither
+decoration nor client pixels. Borders are composed before all client buffers
+so overlapping decorations cannot overwrite a neighboring client. These
+rules make every result stable for odd and undersized output dimensions.
+wl_shm buffers are clipped to their tiles; the compositor does not yet send
+replacement XDG configure sizes when layout changes, so clients are not
+scaled to fill a tile. Decoration, clipboard, drag-and-drop, subsurfaces,
+popups, output reconfiguration, fractional scale, screen capture, data
+devices, and client input are not yet advertised. Unknown
+objects, malformed sizes, invalid object reuse, missing file descriptors, and
+unsupported requests disconnect only that client.
 
 Resource ceilings are part of the protocol boundary: at most 32 clients run
 at once, each has at most 512 objects, 64 queued descriptors, and 32 MiB of
@@ -187,20 +221,27 @@ The landing must prove:
 - an SCM_RIGHTS-backed wl_shm buffer commits and is copied into the scene;
 - the boot client discovers globals, completes XDG configure/ack, receives
   wl_buffer release and its first frame callback, and remains mapped;
-- software composition clips surfaces and never indexes outside a frame;
+- every tiling command, split geometry edge case, workspace transition, tree
+  collapse, fullscreen transition, and Emacs binding is a deterministic host
+  test;
+- parsed key chords and complete pointer frames cross the evdev adapter into
+  a recording target, while the runtime integration test proves a layout
+  command repaints a file-backed framebuffer;
+- software composition clips surfaces to tiles and never indexes outside a
+  frame;
 - the image contains all three binaries, the service order is checkable, and
   the compositor and client run as uid 1000;
 - existing serial boot checks remain green.
 
-## 7. Testability contract for the tiling increment
+## 7. Testability contract for tiling
 
-The next policy layer will be a keyboard-driven tiling shell. Outputs will own
-workspaces, workspaces will own split-container trees, and leaf containers will
-own mapped XDG toplevels. Layout, focus, move, split, fullscreen, and workspace
-operations must be deterministic state transitions over ordinary Rust data.
-They must not read devices, sockets, clocks, or global process state. Geometry
-calculation and hit testing will consume explicit output dimensions and return
-values that tests can inspect without a framebuffer.
+The keyboard-driven tiling shell is a pure policy layer. Workspaces own
+split-container trees, and leaf containers own mapped XDG toplevels. Layout,
+focus, move, split, fullscreen, and workspace operations are deterministic
+state transitions over ordinary Rust data. They do not read devices, sockets,
+clocks, or global process state. Geometry calculation consumes explicit
+output dimensions and returns placements that tests inspect without a
+framebuffer.
 
 Linux evdev readers and Wayland connections will remain adapters around that
 state machine. Parsed input events, generated serials, and elapsed time must
@@ -215,13 +256,17 @@ reset as a distinct result while an orderly close remains a zero-length read.
 Event writes record disconnected client state, and the dispatch loop consumes
 all three outcomes without depending on which side of a socket race wins.
 
-Every layout operation must have table-driven model tests covering focus,
-geometry, tree collapse, and conservation of mapped views. Protocol tests then
-prove that the relevant Wayland request or input event produces that model
-transition and the expected configure or input events. Target selftests cover
-the packaged binary and QEMU covers only the final device, service, and boot
-seams. This keeps most policy failures reproducible as fast host tests while
-retaining an end-to-end proof of the shipped image.
+Every layout operation has table-driven model tests covering focus, geometry,
+tree collapse, and conservation of mapped views. Each tested command sequence
+checks the global invariants: one occurrence per mapped surface, live focus
+and fullscreen references, and no degenerate split containers. Input parsing,
+chord state, pointer coalescing, scene composition, and runtime repaint each
+have a separate adapter test, so failures identify the seam they cross.
+Protocol tests then prove that a Wayland commit maps pixels and that teardown
+removes them. Target selftests cover the packaged binary and QEMU covers only
+the final device, service, and boot seams. This keeps policy failures
+reproducible as fast host tests while retaining an end-to-end proof of the
+shipped image.
 
 ## 8. Deferred UI stack
 

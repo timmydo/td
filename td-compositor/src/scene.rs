@@ -1,3 +1,4 @@
+use crate::layout::{Command, Layout, Rect};
 use std::collections::BTreeMap;
 
 pub const SHM_ARGB8888: u32 = 0;
@@ -21,8 +22,7 @@ pub struct Surface {
 
 pub struct Scene {
     surfaces: BTreeMap<SurfaceKey, Surface>,
-    order: Vec<SurfaceKey>,
-    focused: usize,
+    layout: Layout,
     pointer_x: i32,
     pointer_y: i32,
     surface_bytes: usize,
@@ -32,8 +32,7 @@ impl Scene {
     pub fn new() -> Scene {
         Scene {
             surfaces: BTreeMap::new(),
-            order: Vec::new(),
-            focused: 0,
+            layout: Layout::new(),
             pointer_x: 0,
             pointer_y: 0,
             surface_bytes: 0,
@@ -41,6 +40,7 @@ impl Scene {
     }
 
     pub fn commit(&mut self, key: SurfaceKey, surface: Surface) -> Result<(), String> {
+        let is_new = !self.surfaces.contains_key(&key);
         let prior = self
             .surfaces
             .get(&key)
@@ -58,25 +58,28 @@ impl Scene {
                 "scene surfaces need {next} bytes, exceeding {MAX_SCENE_BYTES}"
             ));
         }
-        if !self.surfaces.contains_key(&key) {
-            self.order.push(key);
-        }
         self.surfaces.insert(key, surface);
         self.surface_bytes = next;
-        if self.focused >= self.order.len() {
-            self.focused = self.order.len().saturating_sub(1);
+        if is_new {
+            self.layout.map(key);
         }
         Ok(())
     }
 
-    pub fn remove(&mut self, key: SurfaceKey) {
+    fn discard_pixels(&mut self, key: SurfaceKey) {
         if let Some(surface) = self.surfaces.remove(&key) {
             self.surface_bytes = self.surface_bytes.saturating_sub(surface.pixels.len());
         }
-        self.order.retain(|candidate| *candidate != key);
-        if self.focused >= self.order.len() {
-            self.focused = self.order.len().saturating_sub(1);
-        }
+    }
+
+    pub fn unmap(&mut self, key: SurfaceKey) {
+        self.discard_pixels(key);
+        self.layout.unmap(key);
+    }
+
+    pub fn remove(&mut self, key: SurfaceKey) {
+        self.discard_pixels(key);
+        self.layout.forget(key);
     }
 
     pub fn remove_client(&mut self, client: u64) {
@@ -89,20 +92,11 @@ impl Scene {
             });
         self.surfaces.retain(|key, _| key.client != client);
         self.surface_bytes = self.surface_bytes.saturating_sub(removed);
-        self.order.retain(|key| key.client != client);
-        if self.focused >= self.order.len() {
-            self.focused = self.order.len().saturating_sub(1);
-        }
+        self.layout.unmap_client(client);
     }
 
-    pub fn focus_left(&mut self) {
-        self.focused = self.focused.saturating_sub(1);
-    }
-
-    pub fn focus_right(&mut self) {
-        if self.focused.saturating_add(1) < self.order.len() {
-            self.focused += 1;
-        }
+    pub fn command(&mut self, command: Command) {
+        self.layout.apply(command);
     }
 
     pub fn move_pointer(&mut self, dx: i32, dy: i32, width: usize, height: usize) {
@@ -125,62 +119,36 @@ impl Scene {
             }
         }
 
-        let mut positions: Vec<(SurfaceKey, i64, i64)> = Vec::new();
-        let mut focused_width = 0usize;
-        if let Some(key) = self.order.get(self.focused) {
-            if let Some(surface) = self.surfaces.get(key) {
-                focused_width = surface
-                    .width
-                    .min(width.saturating_sub(GAP.saturating_mul(2)));
+        let placements = self.layout.placements(width, height, GAP);
+        for placement in &placements {
+            if placement.rect.width == 0 || placement.rect.height == 0 {
+                continue;
             }
-        }
-        let center_x = width
-            .saturating_sub(focused_width)
-            .checked_div(2)
-            .unwrap_or(0);
-        let mut x = i64::try_from(center_x).unwrap_or(i64::MAX);
-        for key in self.order.iter().take(self.focused) {
-            let Some(surface) = self.surfaces.get(key) else {
+            if !self.surfaces.contains_key(&placement.key) {
                 continue;
-            };
-            let column = surface
-                .width
-                .min(width.saturating_sub(GAP.saturating_mul(2)))
-                .saturating_add(GAP);
-            x = x.saturating_sub(i64::try_from(column).unwrap_or(i64::MAX));
-        }
-        for key in &self.order {
-            let Some(surface) = self.surfaces.get(key) else {
-                continue;
-            };
-            let visible_height = surface
-                .height
-                .min(height.saturating_sub(GAP.saturating_mul(2)));
-            let y = height.saturating_sub(visible_height) / 2;
-            positions.push((key.to_owned(), x, i64::try_from(y).unwrap_or(i64::MAX)));
-            let column = surface
-                .width
-                .min(width.saturating_sub(GAP.saturating_mul(2)))
-                .saturating_add(GAP);
-            x = x.saturating_add(i64::try_from(column).unwrap_or(i64::MAX));
-        }
-
-        for (index, (key, x, y)) in positions.iter().enumerate() {
-            let Some(surface) = self.surfaces.get(key) else {
-                continue;
-            };
+            }
+            let x = i64::try_from(placement.rect.x).unwrap_or(i64::MAX);
+            let y = i64::try_from(placement.rect.y).unwrap_or(i64::MAX);
             draw_border(
                 frame,
                 width,
                 height,
                 stride,
-                *x,
-                *y,
-                surface.width,
-                surface.height,
-                index == self.focused,
+                x,
+                y,
+                placement.rect.width,
+                placement.rect.height,
+                placement.focused,
             );
-            draw_surface(frame, width, height, stride, *x, *y, surface);
+        }
+        for placement in placements {
+            if placement.rect.width == 0 || placement.rect.height == 0 {
+                continue;
+            }
+            let Some(surface) = self.surfaces.get(&placement.key) else {
+                continue;
+            };
+            draw_surface(frame, width, height, stride, placement.rect, surface);
         }
         draw_pointer(frame, width, height, stride, self.pointer_x, self.pointer_y);
     }
@@ -300,14 +268,17 @@ fn draw_surface(
     width: usize,
     height: usize,
     stride: usize,
-    x: i64,
-    y: i64,
+    rect: Rect,
     surface: &Surface,
 ) {
-    let Some((source_x_start, visible_columns)) = visible_span(x, surface.width, width) else {
+    let x = i64::try_from(rect.x).unwrap_or(i64::MAX);
+    let y = i64::try_from(rect.y).unwrap_or(i64::MAX);
+    let draw_width = surface.width.min(rect.width);
+    let draw_height = surface.height.min(rect.height);
+    let Some((source_x_start, visible_columns)) = visible_span(x, draw_width, width) else {
         return;
     };
-    let Some((source_y_start, visible_rows)) = visible_span(y, surface.height, height) else {
+    let Some((source_y_start, visible_rows)) = visible_span(y, draw_height, height) else {
         return;
     };
     for (source_y, row) in surface
@@ -473,6 +444,18 @@ mod tests {
         }
     }
 
+    fn pixel(frame: &[u8], stride: usize, x: usize, y: usize) -> [u8; 4] {
+        let offset = y
+            .checked_mul(stride)
+            .and_then(|row| x.checked_mul(4).and_then(|column| row.checked_add(column)))
+            .unwrap();
+        frame
+            .get(offset..offset.saturating_add(4))
+            .unwrap()
+            .try_into()
+            .unwrap()
+    }
+
     #[test]
     fn clipped_surface_never_grows_or_escapes_frame() {
         let mut scene = Scene::new();
@@ -514,6 +497,11 @@ mod tests {
             .unwrap();
         scene.remove_client(1);
         assert_eq!(scene.surfaces.len(), 1);
+        assert!(!scene.layout.contains(SurfaceKey {
+            client: 1,
+            object: 4
+        }));
+        assert!(scene.layout.check_invariants().is_ok());
         assert!(scene.surfaces.contains_key(&SurfaceKey {
             client: 2,
             object: 4
@@ -521,28 +509,121 @@ mod tests {
     }
 
     #[test]
-    fn focused_surface_stays_centered_without_overlapping_its_neighbors() {
+    fn renderer_uses_tiling_geometry_gaps_and_focus_borders() {
+        let mut scene = Scene::new();
+        for (object, color) in [(1, [1, 2, 3, 0]), (2, [4, 5, 6, 0])] {
+            scene
+                .commit(SurfaceKey { client: 1, object }, surface(color, 100, 100))
+                .unwrap();
+        }
+        let width = 120usize;
+        let height = 80usize;
+        let stride = width * 4;
+        let mut frame = vec![0; stride * height];
+        scene.render(&mut frame, width, height, stride);
+
+        assert_eq!(pixel(&frame, stride, 24, 24), [1, 2, 3, 0]);
+        assert_eq!(pixel(&frame, stride, 72, 24), [4, 5, 6, 0]);
+        assert_eq!(pixel(&frame, stride, 60, 30), [0x30, 0x25, 0x20, 0]);
+        assert_eq!(pixel(&frame, stride, 68, 30), [0xc0, 0x70, 0xf0, 0]);
+        assert_eq!(pixel(&frame, stride, 20, 30), [0x70, 0x70, 0x70, 0]);
+
+        scene.command(Command::Focus(crate::layout::Direction::Left));
+        scene.render(&mut frame, width, height, stride);
+        assert_eq!(pixel(&frame, stride, 20, 30), [0xc0, 0x70, 0xf0, 0]);
+        assert_eq!(pixel(&frame, stride, 68, 30), [0x70, 0x70, 0x70, 0]);
+    }
+
+    #[test]
+    fn committing_an_existing_surface_updates_without_mapping_twice() {
+        let mut scene = Scene::new();
+        let key = SurfaceKey {
+            client: 1,
+            object: 9,
+        };
+        scene.commit(key, surface([1, 2, 3, 0], 1, 1)).unwrap();
+        scene.commit(key, surface([4, 5, 6, 0], 2, 2)).unwrap();
+        assert_eq!(scene.surfaces.len(), 1);
+        assert_eq!(scene.layout.placements(100, 100, 0).len(), 1);
+        assert_eq!(scene.surface_bytes, 16);
+        assert!(scene.layout.check_invariants().is_ok());
+    }
+
+    #[test]
+    fn workspaces_render_only_their_own_surfaces() {
+        let mut scene = Scene::new();
+        scene
+            .commit(
+                SurfaceKey {
+                    client: 1,
+                    object: 1,
+                },
+                surface([1, 2, 3, 0], 100, 100),
+            )
+            .unwrap();
+        scene
+            .commit(
+                SurfaceKey {
+                    client: 1,
+                    object: 2,
+                },
+                surface([4, 5, 6, 0], 100, 100),
+            )
+            .unwrap();
+        scene.command(Command::MoveToWorkspace(2));
+        let mut frame = vec![0; 100 * 100 * 4];
+        scene.command(Command::SwitchWorkspace(2));
+        scene.render(&mut frame, 100, 100, 100 * 4);
+        assert!(frame.as_chunks::<4>().0.contains(&[4, 5, 6, 0]));
+        assert!(!frame.as_chunks::<4>().0.contains(&[1, 2, 3, 0]));
+        scene.command(Command::SwitchWorkspace(1));
+        scene.render(&mut frame, 100, 100, 100 * 4);
+        assert!(frame.as_chunks::<4>().0.contains(&[1, 2, 3, 0]));
+        assert!(!frame.as_chunks::<4>().0.contains(&[4, 5, 6, 0]));
+    }
+
+    #[test]
+    fn pointer_motion_clamps_to_the_output() {
+        let mut scene = Scene::new();
+        scene.move_pointer(-9, -4, 10, 8);
+        assert_eq!((scene.pointer_x, scene.pointer_y), (0, 0));
+        scene.move_pointer(i32::MAX, i32::MAX, 10, 8);
+        assert_eq!((scene.pointer_x, scene.pointer_y), (9, 7));
+        scene.move_pointer(1, 1, 0, 0);
+        assert_eq!((scene.pointer_x, scene.pointer_y), (0, 0));
+    }
+
+    #[test]
+    fn tiny_split_preserves_client_pixels_and_zero_area_tiles_draw_nothing() {
         let mut scene = Scene::new();
         for (object, color) in [(1, [1, 2, 3, 0]), (2, [4, 5, 6, 0]), (3, [7, 8, 9, 0])] {
             scene
                 .commit(SurfaceKey { client: 1, object }, surface(color, 2, 2))
                 .unwrap();
         }
-        scene.focus_right();
-        let width = 200usize;
-        let height = 100usize;
-        let stride = width * 4;
-        let mut frame = vec![0; stride * height];
-        scene.render(&mut frame, width, height, stride);
-        let y = 49usize;
-        for (x, expected) in [
-            (73usize, [1, 2, 3, 0]),
-            (99usize, [4, 5, 6, 0]),
-            (125usize, [7, 8, 9, 0]),
-        ] {
-            let offset = y * stride + x * 4;
-            assert_eq!(frame.get(offset..offset + 4), Some(expected.as_slice()));
-        }
+        let mut frame = vec![0; 2 * 20 * 4];
+        scene.render(&mut frame, 2, 20, 2 * 4);
+        assert_eq!(pixel(&frame, 2 * 4, 0, 9), [1, 2, 3, 0]);
+        assert_eq!(pixel(&frame, 2 * 4, 1, 9), [4, 5, 6, 0]);
+        assert!(!frame.as_chunks::<4>().0.contains(&[7, 8, 9, 0]));
+    }
+
+    #[test]
+    fn transient_unmap_remembers_workspace_while_remove_forgets_it() {
+        let mut scene = Scene::new();
+        let key = SurfaceKey {
+            client: 1,
+            object: 4,
+        };
+        scene.commit(key, surface([1, 2, 3, 0], 1, 1)).unwrap();
+        scene.command(Command::MoveToWorkspace(2));
+        scene.unmap(key);
+        scene.commit(key, surface([1, 2, 3, 0], 1, 1)).unwrap();
+        assert!(scene.layout.placements(100, 100, 0).is_empty());
+        scene.remove(key);
+        scene.commit(key, surface([1, 2, 3, 0], 1, 1)).unwrap();
+        assert_eq!(scene.layout.placements(100, 100, 0).len(), 1);
+        assert!(scene.layout.check_invariants().is_ok());
     }
 
     #[test]

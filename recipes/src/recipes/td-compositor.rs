@@ -8,6 +8,7 @@ const MODULES: &[(&str, &str)] = &[
         include_str!("../../../td-compositor/src/framebuffer.rs"),
     ),
     ("input", include_str!("../../../td-compositor/src/input.rs")),
+    ("layout", include_str!("../../../td-compositor/src/layout.rs")),
     (
         "runtime",
         include_str!("../../../td-compositor/src/runtime.rs"),

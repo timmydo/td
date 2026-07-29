@@ -3,6 +3,7 @@
 mod client;
 mod framebuffer;
 mod input;
+mod layout;
 mod runtime;
 mod scene;
 mod server;
@@ -214,6 +215,7 @@ mod confinement {
         ("client.rs", include_str!("client.rs")),
         ("framebuffer.rs", include_str!("framebuffer.rs")),
         ("input.rs", include_str!("input.rs")),
+        ("layout.rs", include_str!("layout.rs")),
         ("runtime.rs", include_str!("runtime.rs")),
         ("scene.rs", include_str!("scene.rs")),
         ("server.rs", include_str!("server.rs")),
