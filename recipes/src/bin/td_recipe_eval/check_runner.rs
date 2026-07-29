@@ -282,11 +282,13 @@ pub fn qemu_boot_cli(args: &[String]) -> Result<(), String> {
     }
     // Provenance planning FIRST — before the runner exists, so a rejected graph
     // spawns no subprocess at all (re #469), matching `cli`/`build_cli`.
-    ensure_targets_provenance(&[stem])?;
+    let targets = [stem];
+    ensure_targets_provenance(&targets)?;
 
     let root = env::current_dir().map_err(|e| format!("current dir: {e}"))?;
     let scratch_name = scratch_name("qemu-boot", &[stem]);
     let runner = RecipeCheckRunner::new(root, &scratch_name)?.with_streamed_progress();
+    warm_operator_inputs(&runner, &targets);
     let _lock = lock_file(&runner.lock_path())?;
     runner.setup()?;
     crate::checks::qemu_boot::run(&runner)
@@ -311,13 +313,15 @@ pub fn qemu_boot_erofs_cli(args: &[String]) -> Result<(), String> {
     }
     // Provenance planning FIRST — before the runner exists (re #469), matching
     // `qemu_boot_cli`: a rejected graph spawns no subprocess.
-    ensure_targets_provenance(&[stem])?;
+    let targets = [stem];
+    ensure_targets_provenance(&targets)?;
 
     let root = env::current_dir().map_err(|e| format!("current dir: {e}"))?;
     // Reuse the `qemu-boot-` scratch prefix so the stale-scratch reaper still cleans
     // a killed erofs boot's per-boot directories.
     let scratch_name = scratch_name("qemu-boot", &[stem]);
     let runner = RecipeCheckRunner::new(root, &scratch_name)?.with_streamed_progress();
+    warm_operator_inputs(&runner, &targets);
     let _lock = lock_file(&runner.lock_path())?;
     runner.setup()?;
     crate::checks::qemu_boot::run_erofs(&runner)
@@ -342,13 +346,15 @@ pub fn qemu_boot_system_cli(args: &[String]) -> Result<(), String> {
     }
     // Provenance planning FIRST — before the runner exists (re #469), matching
     // `qemu_boot_cli`: a rejected graph spawns no subprocess.
-    ensure_targets_provenance(&[stem, "btrfs-progs-x86-64"])?;
+    let targets = [stem, "btrfs-progs-x86-64"];
+    ensure_targets_provenance(&targets)?;
 
     let root = env::current_dir().map_err(|e| format!("current dir: {e}"))?;
     // Reuse the `qemu-boot-` scratch prefix so the stale-scratch reaper still cleans
     // a killed system boot's per-boot directories (it can hold a multi-GiB kernel build).
     let scratch_name = scratch_name("qemu-boot", &[stem]);
     let runner = RecipeCheckRunner::new(root, &scratch_name)?.with_streamed_progress();
+    warm_operator_inputs(&runner, &targets);
     let _lock = lock_file(&runner.lock_path())?;
     runner.setup()?;
     crate::checks::qemu_boot::run_system(&runner)
@@ -372,13 +378,15 @@ pub fn qemu_boot_net_cli(args: &[String]) -> Result<(), String> {
     }
     // Provenance planning FIRST — before the runner exists (re #469), matching
     // `qemu_boot_cli`: a rejected graph spawns no subprocess.
-    ensure_targets_provenance(&[stem, "btrfs-progs-x86-64"])?;
+    let targets = [stem, "btrfs-progs-x86-64"];
+    ensure_targets_provenance(&targets)?;
 
     let root = env::current_dir().map_err(|e| format!("current dir: {e}"))?;
     // Reuse the `qemu-boot-` scratch prefix so the stale-scratch reaper still cleans
     // a killed net boot's per-boot directories (it can hold a multi-GiB kernel build).
     let scratch_name = scratch_name("qemu-boot", &[stem]);
     let runner = RecipeCheckRunner::new(root, &scratch_name)?.with_streamed_progress();
+    warm_operator_inputs(&runner, &targets);
     let _lock = lock_file(&runner.lock_path())?;
     runner.setup()?;
     crate::checks::qemu_boot::run_net(&runner)
@@ -404,13 +412,15 @@ pub fn qemu_boot_kexec_cli(args: &[String]) -> Result<(), String> {
     }
     // Provenance planning FIRST — before the runner exists (re #469), matching
     // `qemu_boot_cli`: a rejected graph spawns no subprocess.
-    ensure_targets_provenance(&[stem])?;
+    let targets = [stem];
+    ensure_targets_provenance(&targets)?;
 
     let root = env::current_dir().map_err(|e| format!("current dir: {e}"))?;
     // Reuse the `qemu-boot-` scratch prefix so the stale-scratch reaper still cleans a
     // killed kexec boot's per-boot directories (it can hold a multi-GiB kernel build).
     let scratch_name = scratch_name("qemu-boot", &[stem]);
     let runner = RecipeCheckRunner::new(root, &scratch_name)?.with_streamed_progress();
+    warm_operator_inputs(&runner, &targets);
     let _lock = lock_file(&runner.lock_path())?;
     runner.setup()?;
     crate::checks::qemu_boot::run_kexec(&runner)
@@ -449,11 +459,13 @@ pub fn run_cli(args: &[String]) -> Result<(), String> {
     }
     // Provenance planning FIRST — before the runner exists, so a rejected graph
     // spawns no subprocess at all (re #469), matching `cli`/`build_cli`/`qemu_boot`.
-    ensure_targets_provenance(&[stem, "btrfs-progs-x86-64"])?;
+    let targets = [stem, "btrfs-progs-x86-64"];
+    ensure_targets_provenance(&targets)?;
 
     let root = env::current_dir().map_err(|e| format!("current dir: {e}"))?;
     let scratch_name = scratch_name("run", &[stem]);
     let runner = RecipeCheckRunner::new(root, &scratch_name)?.with_streamed_progress();
+    warm_operator_inputs(&runner, &targets);
     let lock = lock_file(&runner.lock_path())?;
     runner.setup()?;
     // The interactive boot runs unbounded (until the operator quits qemu), so hand the
@@ -461,6 +473,37 @@ pub fn run_cli(args: &[String]) -> Result<(), String> {
     // whole ladder is not blocked for the entire session (re #541, Codex review). setup()
     // above and the build inside run() still hold it.
     crate::checks::run::run(&runner, lock)
+}
+
+/// `td-recipe-eval warm [TARGET]` — fetch every declared input TARGET's closure
+/// needs and the caches lack, and build nothing. The same prep the operator
+/// commands now do for themselves, as a standalone step: for preparing a tree
+/// ahead of a build, or from a script, where the absent terminal holds the
+/// automatic prep back. Asking for it IS the consent it needs, so this is the
+/// one entry point that does not condition on a terminal.
+pub fn warm_cli(args: &[String]) -> Result<(), String> {
+    const STEM: &str = "system-x86-64";
+    // Arity before the stem lookup: `warm a b` is a usage error, not a report
+    // that `a' is an unknown recipe.
+    if args.get(1).is_some() {
+        return Err("usage: warm [TARGET]".to_string());
+    }
+    let stem = args.first().map(String::as_str).unwrap_or(STEM);
+    if catalog::lookup(stem).is_none() {
+        return Err(format!("unknown recipe stem '{stem}' (try `list`)"));
+    }
+    // Same order as every other host-side command: a graph with an inadmissible
+    // input is rejected before anything is placed, spawned, or fetched.
+    let targets = [stem];
+    ensure_targets_provenance(&targets)?;
+
+    let root = env::current_dir().map_err(|e| format!("current dir: {e}"))?;
+    let scratch_name = scratch_name("warm", &targets);
+    let runner = RecipeCheckRunner::new(root, &scratch_name)?;
+    // Unlike the piggy-backed callers, a residual cold input IS this command's
+    // failure — warming is the whole job, and a script gating an offline build
+    // on it needs the exit code to say so.
+    crate::warm::preflight(&runner, &targets)
 }
 
 pub fn build_cli(args: &[String]) -> Result<(), String> {
@@ -1064,9 +1107,9 @@ pub(crate) struct RecipeCheckRunner {
     stream_progress: bool,
 }
 
-struct RecipeNode {
-    stem: String,
-    recipe: Recipe,
+pub(crate) struct RecipeNode {
+    pub(crate) stem: String,
+    pub(crate) recipe: Recipe,
 }
 
 /// Gate one local source's freshly computed content address against the compiled
@@ -1190,7 +1233,7 @@ fn gate_local_source_candidate(key: &str, candidate_path: &str) -> Result<(), St
 }
 
 #[derive(Debug)]
-enum SeedInput {
+pub(crate) enum SeedInput {
     Stage0 { key: String },
     Source { key: String, pin: SourcePin },
     LinuxHeaders { key: String, arch: &'static str },
@@ -2050,6 +2093,17 @@ impl RecipeCheckRunner {
         &self.tb
     }
 
+    /// The repo checkout this run reads recipes, patches, and committed locks from.
+    pub(crate) fn repo_root(&self) -> &Path {
+        &self.root
+    }
+
+    /// The shared warmed-source cache the pinned tarballs and generated
+    /// kernel-header seeds are interned from.
+    pub(crate) fn sources_dir(&self) -> &Path {
+        &self.sources_dir
+    }
+
     fn build_recipe_target(&self, target: &str, outputs: &[&str]) -> Result<(), String> {
         let staged = self.build_and_stage(target, outputs)?;
         println!("TD_RECIPE_RUN_WORK {}", self.lw.display());
@@ -2366,7 +2420,7 @@ impl RecipeCheckRunner {
     }
 }
 
-fn recipe_closure(targets: &[&str]) -> Result<Vec<RecipeNode>, String> {
+pub(crate) fn recipe_closure(targets: &[&str]) -> Result<Vec<RecipeNode>, String> {
     let mut visiting = HashSet::new();
     let mut emitted = HashSet::new();
     let mut out = Vec::new();
@@ -2436,7 +2490,7 @@ fn push_seed_input(inputs: &mut Vec<SeedInput>, seen: &mut HashSet<String>, inpu
 /// that tool exists as a recipe output. Deliberately pure — no subprocess, no
 /// filesystem — so the entry points run it BEFORE any ambient execution
 /// (stage0 placement, interning): a rejected graph executes NOTHING.
-fn classify_graph_inputs(nodes: &[RecipeNode]) -> Result<Vec<SeedInput>, String> {
+pub(crate) fn classify_graph_inputs(nodes: &[RecipeNode]) -> Result<Vec<SeedInput>, String> {
     let mut seen = HashSet::new();
     let mut seed_inputs = Vec::new();
     for node in nodes {
@@ -2511,6 +2565,27 @@ fn ensure_targets_provenance(targets: &[&str]) -> Result<(), String> {
     classify_graph_inputs(&graph).map(|_| ())
 }
 
+/// Fetch what TARGETS' closures declare and no cache holds, before the ladder
+/// lock — the prep an operator would otherwise be told to run by hand.
+///
+/// What keeps this off every gate is that no gate invokes `run`/`qemu-boot*` at
+/// all: they need a host qemu and a terminal the sandbox does not have, which is
+/// why they are commands and not checks. The stdin condition is a second belt —
+/// nothing nulls stdin for a gate subprocess, so a future gate shelling out to
+/// one of these from an operator's terminal would still warm; it would also be a
+/// gate reaching for a host-side command, which is the thing to notice.
+///
+/// A warm that could not happen is reported and then ignored: these callers came
+/// to BUILD, the cold-input errors downstream are precise, and a memo hit needs
+/// no inputs at all.
+fn warm_operator_inputs(runner: &RecipeCheckRunner, targets: &[&str]) {
+    if io::stdin().is_terminal() {
+        if let Err(e) = crate::warm::preflight(runner, targets) {
+            eprintln!("   [warm] {e} — continuing; the build reports what it cannot resolve");
+        }
+    }
+}
+
 fn special_seed_input(key: &str) -> Result<Option<SeedInput>, String> {
     if key == "stage0-source" {
         return Ok(Some(SeedInput::Stage0 {
@@ -2549,7 +2624,7 @@ fn special_seed_input(key: &str) -> Result<Option<SeedInput>, String> {
     Ok(None)
 }
 
-fn source_pin_for_key(key: &str) -> Result<SourcePin, String> {
+pub(crate) fn source_pin_for_key(key: &str) -> Result<SourcePin, String> {
     source_pins::by_key(key).ok_or_else(|| format!("no recipe source pin for `{key}'"))
 }
 

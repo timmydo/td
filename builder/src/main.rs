@@ -8688,6 +8688,30 @@ fn main() -> ExitCode {
                 }
             }
         }
+        // td-builder provision-net — resolve the host td-net multicall (td's own
+        // fetcher) the same way the check prelude does, building it statically if
+        // needed, and print its path. Same shape as provision-{rust,cc}: a
+        // resolver a caller outside this binary can reach. The interactive
+        // evaluator's source warm is that caller — it must not grow a second,
+        // weaker copy of this build, which would hand the fetch a DYNAMIC binary
+        // (see host_cargo_bin on the mutable guix-home runpath).
+        Some("provision-net") if args.len() == 2 => {
+            let run = || -> Result<PathBuf, String> {
+                let root = std::env::current_dir().map_err(|e| format!("getcwd: {e}"))?;
+                crate::check_loop::host_td_net(&root)
+                    .ok_or_else(|| "no host td-net could be built".to_string())
+            };
+            match run() {
+                Ok(path) => {
+                    println!("{}", path.display());
+                    ExitCode::SUCCESS
+                }
+                Err(m) => {
+                    eprintln!("td-builder: provision-net: {m}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
         // td-builder assert-static PATH — verify a host-built control-plane binary
         // is FULLY static: no PT_INTERP, no DT_NEEDED, no run-path. The no-leakage
         // invariant enforced at every host build site (re #469) so a dynamically

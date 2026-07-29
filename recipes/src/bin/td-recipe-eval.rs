@@ -18,6 +18,10 @@
 //!   clear-store           reset the ladder work dir (seed store/db + shared
 //!                         build-cache); the next build re-derives seeds and
 //!                         cold-climbs. The only path that clears persisted state
+//!   warm [TARGET]         fetch every declared input TARGET's closure needs and
+//!                         the caches lack (default system-x86-64), building
+//!                         nothing. The host-side operator commands (`run`,
+//!                         `qemu-boot*`) do this for themselves from a terminal
 //!   source-pins           print recipe-owned fixed-output source pins as:
 //!                         <key>\t<url>\t<sha256>\t<file>
 //!   source-pin STEM       print the fixed-output source pin(s) owned by STEM
@@ -37,6 +41,8 @@ mod check_runner;
 mod checks;
 #[path = "td_recipe_eval/seed_digests.rs"]
 mod seed_digests;
+#[path = "td_recipe_eval/warm.rs"]
+mod warm;
 // SHA-256 lives in the shared, std-only td-engine (one copy for td-recipe-eval +
 // td-builder). Re-exported at crate root so existing `crate::sha256::` paths are
 // unchanged.
@@ -250,6 +256,12 @@ fn main() {
                 die_runner(&e);
             }
         }
+        Some("warm") => {
+            let rest = args.get(2..).unwrap_or(&[]);
+            if let Err(e) = check_runner::warm_cli(rest) {
+                die_runner(&e);
+            }
+        }
         Some("verify-store") => {
             let rest = args.get(2..).unwrap_or(&[]);
             if let Err(e) = check_runner::verify_store_cli(rest) {
@@ -289,7 +301,7 @@ fn main() {
                 die(&e);
             }
         }
-        _ => die("usage: td-recipe-eval list|emit|check-list|check-count|check-script|check-run|build-run|clear-store|qemu-boot|qemu-boot-erofs|qemu-boot-system|qemu-boot-net|qemu-boot-kexec|run|verify-store|source-pins|source-pin|seed-digests|local-source-digests ..."),
+        _ => die("usage: td-recipe-eval list|emit|check-list|check-count|check-script|check-run|build-run|clear-store|qemu-boot|qemu-boot-erofs|qemu-boot-system|qemu-boot-net|qemu-boot-kexec|run|warm|verify-store|source-pins|source-pin|seed-digests|local-source-digests ..."),
     }
 }
 

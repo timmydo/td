@@ -1152,6 +1152,15 @@ fn host_cargo_bin(root: &Path, dir: &str, bin: &str, deadline: Option<Instant>) 
     Some(p)
 }
 
+/// The host td-net multicall itself (no applet link): the `provision-net` verb's
+/// resolver, so a caller outside this binary — the evaluator's interactive source
+/// warm — gets the SAME statically linked build the prelude uses rather than a
+/// second copy of it. Applet dispatch is by argv there (`td-net feed …`), which is
+/// why this returns the multicall and `host_net_applet` returns a link.
+pub(crate) fn host_td_net(root: &Path) -> Option<PathBuf> {
+    host_cargo_bin(root, "net", "td-net", None)
+}
+
 /// Build the merged `net` control-plane crate (td-net) with the host cargo, statically,
 /// then return an APPLET-named link to it (td-fetch/td-feed/td-subst) beside the binary —
 /// so argv[0] basename multicall dispatch selects the applet with the caller's argv
