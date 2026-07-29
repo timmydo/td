@@ -92,10 +92,6 @@ xfail arith.test.sh::s[0] with string 42
 xfail arith.test.sh::s[0] with string abc
 xfail arith.test.sh::undef[0]
 xfail arith.test.sh::undef[0] with nounset
-xfail array-assign.test.sh::LHS array is protected with shopt -s eval_unsafe_arith, e.g. 'a[$(echo 2)]'
-xfail array-assign.test.sh::Tricky parsing - a[ a[0]=1 ]=X  a[ a[0]+=1 ]+=X
-xfail array-assign.test.sh::declare builtin doesn't allow spaces
-xfail array-assign.test.sh::file named a[ is  not executed
 xfail array-assoc.test.sh::${!ref} and assoc array
 xfail array-assoc.test.sh::${A[@]#prefix}
 xfail array-assoc.test.sh::${A[@]/b/B}
@@ -282,21 +278,12 @@ xfail background.test.sh::wait for N parallel jobs and check failure
 xfail background.test.sh::wait with invalid PID
 xfail background.test.sh::wait with invalid arg
 xfail background.test.sh::wait with jobspec syntax %nonexistent
-xfail ble-idioms.test.sh::Issue #1069 [40] BUG: a=(declare v); "${a[@]}" fails
-xfail ble-idioms.test.sh::Issue #1069 [40] BUG: a=declare; "$a" v=1 fails
-xfail ble-idioms.test.sh::Issue #1069 [52] BUG: \builtin local v=1 fails
-xfail ble-idioms.test.sh::Issue #1069 [53] - LHS array parsing a[1 + 2]=3 (see spec/array-assign for more)
-xfail ble-idioms.test.sh::Issue #1069 [53] BUG: a[1 + 1]=2, etc. fails
 xfail ble-idioms.test.sh::Issue #1069 [56] BUG: declare -p unset does not print any error message
-xfail ble-idioms.test.sh::Issue #1069 [59] - Assigning Str to BashArray/BashAssoc should not remove BashArray/BashAssoc
-xfail ble-idioms.test.sh::is-array with ${var@a}
 xfail ble-idioms.test.sh::recursive arith: one level
 xfail ble-idioms.test.sh::recursive arith: short circuit &&, ||
 xfail ble-idioms.test.sh::recursive arith: short circuit ?:
 xfail ble-idioms.test.sh::recursive arith: side effects
 xfail ble-idioms.test.sh::recursive arith: two levels
-xfail ble-idioms.test.sh::shift unshift reverse
-xfail ble-idioms.test.sh::shopt -u expand_aliases and eval
 xfail blog-other1.test.sh::Blog Post Example
 xfail blog-other1.test.sh::Blog Post Example Fix
 xfail blog-other1.test.sh::Rewrite of Blog Post Example
@@ -364,11 +351,7 @@ xfail brace-expansion.test.sh::triple expansion
 xfail brace-expansion.test.sh::triple nested brace expansion
 xfail brace-expansion.test.sh::} in expansion
 xfail bugs.test.sh::#2640 Hanging when reading from character devices
-xfail bugs.test.sh::(( status bug
-xfail bugs.test.sh::OSH can use ARGV name
 xfail bugs.test.sh::file with NUL byte
-xfail bugs.test.sh::for loop (issue #1446)
-xfail bugs.test.sh::for loop 2 (issue #1446)
 xfail bugs.test.sh::other builtins fail on writing to full disk
 xfail bugs.test.sh::subshell while running a script (regression)
 xfail builtin-bash.test.sh::bad help topic
@@ -500,7 +483,6 @@ xfail builtin-eval-source.test.sh::eval YSH block with 'break continue return er
 xfail builtin-eval-source.test.sh::source doesn't crash when targeting a directory
 xfail builtin-eval-source.test.sh::source finds files in PATH before current dir
 xfail builtin-eval-source.test.sh::source looks in PATH for files
-xfail builtin-eval-source.test.sh::source works for files in current directory (bash only)
 xfail builtin-eval-source.test.sh::source works for files in subdirectory
 xfail builtin-fc.test.sh::fc -l [first] [last] where first and last are indexes
 xfail builtin-fc.test.sh::fc -l [first] [last] where first and last are offsets from current command
@@ -551,12 +533,6 @@ xfail builtin-kill.test.sh::kill -terM -SigterM isn't case sensitive
 xfail builtin-kill.test.sh::kill HUP pid gives the correct error
 xfail builtin-kill.test.sh::kill multiple pids at once
 xfail builtin-kill.test.sh::kill pid and job at once
-xfail builtin-meta-assign.test.sh::\builtin declare - ble.sh relies on it
-xfail builtin-meta-assign.test.sh::builtin declare a=(x y) is allowed
-xfail builtin-meta-assign.test.sh::builtin declare,local
-xfail builtin-meta-assign.test.sh::builtin typeset, export,readonly
-xfail builtin-meta-assign.test.sh::dynamic builtin command ASSIGN, command builtin ASSIGN
-xfail builtin-meta-assign.test.sh::static builtin command ASSIGN, command builtin ASSIGN
 xfail builtin-meta.test.sh::$(command type ls)
 xfail builtin-meta.test.sh::command -V
 xfail builtin-meta.test.sh::command -p (find hidden tool in default path)
@@ -570,11 +546,8 @@ xfail builtin-misc.test.sh::Shifting too far
 xfail builtin-misc.test.sh::time pipeline
 xfail builtin-printf.test.sh::Invalid UTF-8
 xfail builtin-printf.test.sh::Too large
-xfail builtin-printf.test.sh::bash truncates long strftime string at 128
 xfail builtin-printf.test.sh::printf %b does backslash escaping
 xfail builtin-printf.test.sh::printf %b with truncated octal escapes
-xfail builtin-printf.test.sh::printf %c unicode - prints the first BYTE of a string - it does not respect UTF-8
-xfail builtin-printf.test.sh::printf -v dynamic scope
 xfail builtin-printf.test.sh::unsigned / octal / hex big
 xfail builtin-process.test.sh::Changing resource limit is denied
 xfail builtin-process.test.sh::YSH readability: ulimit --all the same as ulimit -a
@@ -592,17 +565,10 @@ xfail builtin-process.test.sh::ulimit of 2**32, 2**31 (int overflow)
 xfail builtin-process.test.sh::ulimit that is 64 bits
 xfail builtin-process.test.sh::ulimit with no flags is like -f
 xfail builtin-process.test.sh::write big file with ulimit
-xfail builtin-read.test.sh::mapfile from directory (bash doesn't handle errors)
-xfail builtin-read.test.sh::read -N doesn't respect delimiter, while read -n does
-xfail builtin-read.test.sh::read -N ignores delimiters
 xfail builtin-read.test.sh::read -d '' (null-separated records)
-xfail builtin-read.test.sh::read -d -n - respects delimiter and splits
 xfail builtin-read.test.sh::read -d : (colon-separated records)
 xfail builtin-read.test.sh::read -d when there's no delimiter
 xfail builtin-read.test.sh::read -n doesn't strip whitespace (bug fix)
-xfail builtin-read.test.sh::read -n from directory
-xfail builtin-read.test.sh::read -n from pipe
-xfail builtin-read.test.sh::read -n vs. -N
 xfail builtin-read.test.sh::read -p (not fully tested)
 xfail builtin-read.test.sh::read -r -d '' for NUL strings, e.g. find -print0
 xfail builtin-read.test.sh::read -rd
@@ -612,7 +578,6 @@ xfail builtin-read.test.sh::read -t 0.5
 xfail builtin-read.test.sh::read -u
 xfail builtin-read.test.sh::read -u -s
 xfail builtin-read.test.sh::read -u 3 -d 5
-xfail builtin-read.test.sh::read -u 3 -d b -N 6
 xfail builtin-read.test.sh::read /dev/null
 xfail builtin-read.test.sh::read does not respect C backslash escapes
 xfail builtin-read.test.sh::read multiple lines with IFS=:
@@ -634,12 +599,7 @@ xfail builtin-special.test.sh::Prefix assignments persist after readonly, but NO
 xfail builtin-special.test.sh::Prefix binding for exec is a special case (versus e.g. readonly)
 xfail builtin-special.test.sh::Special builtins can't be redefined as shell functions (set -o posix)
 xfail builtin-special.test.sh::Which shells allow special builtins to be redefined?
-xfail builtin-special.test.sh::bash 'type' gets confused - says 'function', but runs builtin
-xfail builtin-special.test.sh::command, builtin - both can be redefined, not special (regression)
 xfail builtin-times.test.sh::times shows two formatted lines
-xfail builtin-trap-bash.test.sh::Combine DEBUG trap and ERR trap
-xfail builtin-trap-bash.test.sh::Combine DEBUG trap and USR1 trap
-xfail builtin-trap-bash.test.sh::Combine ERR trap and USR1 trap
 xfail builtin-trap-bash.test.sh::Compare trap DEBUG vs. trap ERR
 xfail builtin-trap-bash.test.sh::One 'echo' in first pipeline part - why does bash behave differently from case above?
 xfail builtin-trap-bash.test.sh::but trap DEBUG respects errexit
@@ -666,14 +626,12 @@ xfail builtin-trap-err.test.sh::set -o errtrace: trap ERR runs in subprograms
 xfail builtin-trap-err.test.sh::trap ERR
 xfail builtin-trap-err.test.sh::trap ERR and errexit disabled context
 xfail builtin-trap-err.test.sh::trap ERR and pipeline
-xfail builtin-trap-err.test.sh::trap ERR and pipelines - PIPESTATUS difference
 xfail builtin-trap-err.test.sh::trap ERR and set -o errexit
 xfail builtin-trap-err.test.sh::trap ERR and || conditional
 xfail builtin-trap-err.test.sh::trap ERR does not run in errexit situations
 xfail builtin-trap-err.test.sh::trap ERR doesn't run in subprograms - subshell, command sub, async
 xfail builtin-trap-err.test.sh::trap ERR pipelines without simple commands
 xfail builtin-trap-err.test.sh::trap ERR with "atoms": assignment (( [[
-xfail builtin-trap-err.test.sh::trap ERR with YSH proc
 xfail builtin-trap-err.test.sh::trap ERR with for,  case, { }
 xfail builtin-trap-err.test.sh::trap ERR with redirect
 xfail builtin-trap-err.test.sh::trap can use original $LINENO
@@ -837,18 +795,14 @@ xfail dparen.test.sh::set associative array
 xfail empty-bodies.test.sh::Empty do/done
 xfail empty-bodies.test.sh::Empty then/fi
 xfail errexit-osh.test.sh::OLD: command sub in redirect in conditional
-xfail errexit-osh.test.sh::Regression
 xfail errexit-osh.test.sh::command sub with command_sub_errexit only
 xfail errexit-osh.test.sh::command sub with inherit_errexit and command_sub_errexit
 xfail errexit-osh.test.sh::command sub with inherit_errexit only
 xfail errexit-osh.test.sh::command sub: errexit is NOT inherited and outer shell keeps going
-xfail errexit-osh.test.sh::command_sub_errexit stops at first error
 xfail errexit-osh.test.sh::global assignment with command sub: middle command fails
 xfail errexit-osh.test.sh::if pipeline doesn't fail fatally
 xfail errexit-osh.test.sh::local and inherit_errexit / command_sub_errexit
 xfail errexit-osh.test.sh::local: middle command fails and keeps going
-xfail errexit-osh.test.sh::strict_errexit and command sub in export / readonly
-xfail errexit-osh.test.sh::strict_errexit and errexit disabled
 xfail errexit-osh.test.sh::strict_errexit disallows pipeline
 xfail errexit-osh.test.sh::strict_errexit prevents errexit from being disabled in function
 xfail errexit.test.sh::More && ||
@@ -926,7 +880,6 @@ xfail glob.test.sh::Glob unicode char
 xfail glob.test.sh::PatSub of negated unescaped [[] and []]
 xfail glob.test.sh::PatSub of unescaped [[] and []]
 xfail glob.test.sh::pattern starting with . does not return . and ..
-xfail glob.test.sh::shopt -u globskipdots shows . and ..
 xfail globignore.test.sh::. and .. always filtered when GLOBIGNORE is set
 xfail globignore.test.sh::Extended glob expansion combined with GLOBIGNORE
 xfail globignore.test.sh::Ignore *.o:*.h
@@ -1039,7 +992,6 @@ xfail nocasematch-match.test.sh::[[ equality matching
 xfail nocasematch-match.test.sh::[[ regex matching
 xfail nocasematch-match.test.sh::case matching
 xfail nul-bytes.test.sh::Compare \x00 byte versus \x01 byte - command sub
-xfail nul-bytes.test.sh::Compare \x00 byte versus \x01 byte - mapfile builtin
 xfail nul-bytes.test.sh::Compare \x00 byte versus \x01 byte - read -n
 xfail nul-bytes.test.sh::Compare \x00 byte versus \x01 byte - read builtin
 xfail nul-bytes.test.sh::Issue 2269 - Do NUL bytes match ? in ${a#?}
@@ -1052,7 +1004,6 @@ xfail nul-bytes.test.sh::NUL bytes with test -n
 xfail nul-bytes.test.sh::Strip ops # ## % %% with NUL bytes
 xfail nul-bytes.test.sh::printf - NUL byte in value (OSH and zsh agree)
 xfail nul-bytes.test.sh::printf - \0 escape shows NUL byte
-xfail nul-bytes.test.sh::printf - literal NUL in format string
 xfail osh-bugs.test.sh::YSH $[expr_sub] in OSH should not do dynamic globbing
 xfail osh-bugs.test.sh::var x = $(echo bad; false) in OSH
 xfail osh-bugs.test.sh::var x = $(echo one; false; echo two) in OSH
@@ -1127,7 +1078,6 @@ xfail prompt.test.sh::username
 xfail quote.test.sh::$''
 xfail quote.test.sh::$'' octal escapes don't have leading 0
 xfail quote.test.sh::$'' octal escapes with fewer than 3 chars
-xfail quote.test.sh::$'' supports \cA escape for Ctrl-A - mask with 0x1f
 xfail quote.test.sh::$'' with newlines
 xfail quote.test.sh::$'' with quotes
 xfail quote.test.sh::$? split over multiple lines
@@ -1136,8 +1086,6 @@ xfail quote.test.sh::No tab escapes within single quotes
 xfail quote.test.sh::OSH allows invalid backslashes
 xfail quote.test.sh::Storing backslashes and then echoing them
 xfail quote.test.sh::YSH allows unquoted foo\ bar too
-xfail quote.test.sh::\c' is an escape, unlike bash
-xfail redir-order.test.sh::[[ + redirect order
 xfail redir-order.test.sh::case word + redirect order
 xfail redir-order.test.sh::echo `cat OSCFLAGS` "world" > OSCFLAGS (from Alpine imap)
 xfail redir-order.test.sh::for word + redirect order
@@ -1220,14 +1168,6 @@ xfail regex.test.sh::regex with ?
 xfail regex.test.sh::regex with unprintable characters
 xfail regex.test.sh::unquoted (a  b) as pattern, (a  b|c)
 xfail regex.test.sh::unquoted [a  b] as pattern, [a  b|c]
-xfail serialize.test.sh::${var@Q}
-xfail serialize.test.sh::declare
-xfail serialize.test.sh::printf %q invalid unicode
-xfail serialize.test.sh::printf %q newline
-xfail serialize.test.sh::printf %q quotes
-xfail serialize.test.sh::printf %q spaces
-xfail serialize.test.sh::printf %q unicode
-xfail serialize.test.sh::printf %q unprintable
 xfail serialize.test.sh::set
 xfail serialize.test.sh::xtrace
 xfail sh-func.test.sh::Subshell function
@@ -1306,9 +1246,7 @@ xfail type-compat.test.sh::declare -i with arithmetic inside strings (Nix, issue
 xfail type-compat.test.sh::declare -l -u
 xfail unicode.test.sh::$'' does NOT check that 0x110000 is too big at parse time
 xfail unicode.test.sh::$'' does not check for surrogate range at parse time
-xfail unicode.test.sh::Max code point U+10ffff can escaped with $''  printf  echo -e
 xfail unicode.test.sh::OSH source code doesn't have to be valid Unicode (like other shells)
-xfail unicode.test.sh::Unicode escapes \u03bc \U000003bc in $'', echo -e, printf
 xfail unicode.test.sh::printf / echo -e do NOT check max code point at runtime
 xfail unicode.test.sh::printf / echo -e do NOT check surrogates at runtime
 xfail var-num.test.sh::$0 with -c
@@ -1383,7 +1321,6 @@ xfail var-op-slice.test.sh::Slice with an index that's an array -- silent a[0] d
 xfail var-op-slice.test.sh::String slice
 xfail var-op-slice.test.sh::String slice with math
 xfail var-op-strip.test.sh::Strip unicode prefix
-xfail var-op-strip.test.sh::extglob in pattern
 xfail var-op-strip.test.sh::strip all unicode
 xfail var-op-test.test.sh::"${a[@]+foo}" and "${a[@]:+foo}" - operators are equivalent on arrays?
 xfail var-op-test.test.sh::"${array[@]} with set -u (bash is outlier)
@@ -1458,7 +1395,6 @@ xfail vars-special.test.sh::Vars set interactively only: $HISTFILE
 xfail whitespace.test.sh::whitespace in string to integer conversion
 xfail word-split.test.sh::4 x 3 table - with for loop
 xfail word-split.test.sh::IFS='' with $@ and $* and printf (bug #627)
-xfail word-split.test.sh::Regression: "${!v*}"x should not be split
 xfail word-split.test.sh::Unicode in IFS
 xfail xtrace.test.sh::PS4 with runtime error
 xfail xtrace.test.sh::PS4 with unterminated $(
@@ -1492,10 +1428,6 @@ skip append.test.sh::error: typeset myarray+=s
 skip append.test.sh::myarray[-1]+=s - Append to last element
 skip append.test.sh::myarray[1]+=s - Append to element
 skip append.test.sh::typeset s+=(my array)
-skip array-assign.test.sh::Indexed LHS with spaces
-skip array-assign.test.sh::Multiple LHS array words
-skip array-assign.test.sh::Nested a[i[0]]=0
-skip array-assign.test.sh::argv.py a[1 + 2]=
 skip array-assoc.test.sh::Append to associative array value A['x']+='suffix'
 skip array-assoc.test.sh::Array stored in associative array gets converted to string (without strict_array)
 skip array-assoc.test.sh::Empty value (doesn't use EmptyWord?)
@@ -1595,10 +1527,6 @@ skip assign.test.sh::local a=loc $var c=loc
 skip assign.test.sh::readonly array should not be modified by a+=(1)
 skip assign.test.sh::readonly x= gives empty string (regression)
 skip assign.test.sh::static assignment doesn't split
-skip ble-features.test.sh::[compat_array] ${arr} is ${arr[0]}
-skip ble-features.test.sh::[compat_array] scalar write to arrays
-skip ble-features.test.sh::[compat_array] scalar write to associative arrays
-skip ble-idioms.test.sh::Issue #1069 [59] N-I: arr=s should set RHS to arr[0]
 skip brace-expansion.test.sh::Empty alternative
 skip brace-expansion.test.sh::Empty alternative with empty string suffix
 skip builtin-bracket.test.sh::test -b -c -S (block, character, socket)
@@ -1630,11 +1558,8 @@ skip builtin-read.test.sh::"backslash + newline" should be swallowed regardless 
 skip builtin-read.test.sh::IFS= read -n (OSH regression: value saved in tempenv)
 skip builtin-read.test.sh::IFS='\ ' and backslash escaping
 skip builtin-read.test.sh::IFS='x ' incomplete backslash
-skip builtin-read.test.sh::IFS='x ' read -a: intermediate spaces (unlimited split)
-skip builtin-read.test.sh::IFS='x ' read -a: trailing spaces (unlimited split)
 skip builtin-read.test.sh::IFS='x ' read a b: trailing spaces (with max_split)
 skip builtin-read.test.sh::IFS=x read a b <<< xxxxxx
-skip builtin-read.test.sh::empty input and splitting
 skip builtin-read.test.sh::max_split and backslash escaping
 skip builtin-read.test.sh::read -n (with $REPLY)
 skip builtin-read.test.sh::read -n 0
@@ -1672,7 +1597,6 @@ skip command-sub.test.sh::Command Sub trailing whitespace not removed
 skip command-sub.test.sh::Command Sub word split
 skip command_.test.sh::Executing command with same name as directory in PATH (#2429)
 skip divergence.test.sh::Changing PATH will invalidate PATH cache
-skip errexit-osh.test.sh::command_sub_errexit and command sub in array
 skip extglob-files.test.sh::Escaping of pipe (glibc bug, see demo/glibc_fnmatch.c)
 skip extglob-files.test.sh::Extended glob in same word as array
 skip extglob-files.test.sh::Extended glob patterns with spaces
@@ -1842,9 +1766,6 @@ skip word-split.test.sh::IFS is scoped
 skip word-split.test.sh::IFS unset behaves like $' \t\n'
 skip word-split.test.sh::IFS with whitespace and non-whitepace.
 skip word-split.test.sh::IFS='' with $@ and $* (bug #627)
-skip word-split.test.sh::IFS='' with ${!a[@]} and ${!a[*]} (bug #627)
-skip word-split.test.sh::IFS='' with ${!prefix@} and ${!prefix*} (bug #627)
-skip word-split.test.sh::IFS='' with ${a[@]} and ${a[*]} (bug #627)
 skip word-split.test.sh::IFS='\ '
 skip word-split.test.sh::IFS='\'
 skip word-split.test.sh::IFS=x and '' and $@ (#2)

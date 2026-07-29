@@ -718,7 +718,11 @@ impl CaseWorkdir {
     fn new() -> std::io::Result<Self> {
         use std::os::unix::fs::DirBuilderExt;
         static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let base = std::env::temp_dir();
+        // Absolute, because the child's cwd MOVES into this dir: a relative
+        // `TMPDIR` would make the exported `PATH` resolve against the case cwd
+        // instead of naming the sibling that holds the shell, and every `$SH`
+        // would 127 with nothing to say why.
+        let base = std::path::absolute(std::env::temp_dir())?;
         let pid = std::process::id();
         // Exclusive create (not `create_dir_all`): the name is predictable, so a
         // symlink planted at it, or a dir leaked by a crashed run whose pid the OS
@@ -754,15 +758,13 @@ pub fn run_case(
 ) -> Result<CaseOutcome, Box<dyn std::error::Error>> {
     let expected = resolve(case, chain)?;
     // env_clear for determinism; a case that execs an external will fail closed
-    // (no PATH) rather than leak the host environment into the result. `$SH` is
-    // the one variable Oils sets — the path to the shell under test, used by
-    // cases that re-invoke it (`$SH -c ...`); point it at this same binary. The
-    // workdir is a throwaway temp dir (dropped after the run) so a case that
-    // writes a file cannot touch the gate's tree.
+    // (a PATH holding only the shell itself) rather than leak the host
+    // environment into the result. The workdir is a throwaway temp dir (dropped
+    // after the run) so a case that writes a file cannot touch the gate's tree.
     //
     // Absolutize the shell first: `current_dir` moves the child's cwd, so a
-    // relative `shell` (and the `$SH` we export) would otherwise resolve against
-    // the temp dir and not be found.
+    // relative `shell` would otherwise resolve against the temp dir and not be
+    // found.
     let shell = std::fs::canonicalize(shell)?;
     let workdir = CaseWorkdir::new()?;
     // `$TMP` is what Oils' own runner exports; without it every `$TMP/f` in the
@@ -774,11 +776,48 @@ pub fn run_case(
     let tmpdir = workdir.0.join("tmp");
     std::fs::create_dir(&cwd)?;
     std::fs::create_dir(&tmpdir)?;
-    let child = Command::new(&shell)
+    // `$SH` is the shell's IDENTITY, not its path, because 359 cases across 74
+    // corpus files open with `case $SH in dash|ash) exit ;; esac` and compare it
+    // to a bare name. Exporting an absolute path makes every one of those guards
+    // miss and run a body the golden says was never reached. It has to stay
+    // executable too (682 uses, mostly `$SH -c ...`), so a third sibling dir holds
+    // a link under that name and is the whole of PATH -- which keeps `env_clear`'s
+    // point, since a case reaching for `ls` still finds nothing.
+    let identity = chain.first().copied().unwrap_or("sh");
+    // `chain` is caller-supplied, and the identity is about to become a path
+    // component AND the value of `$SH`. An absolute one would make `join` discard
+    // the bindir entirely, `..` would escape it, and any slash would make `$SH`
+    // bypass PATH and name a host file directly.
+    if identity.is_empty() || identity.contains('/') || identity == "." || identity == ".." {
+        return Err(format!("shell identity {identity:?} is not a single path component").into());
+    }
+    let bindir = workdir.0.join("bin");
+    std::fs::create_dir(&bindir)?;
+    // A COPY, not a link: a case needs no external to do `: > "$PATH/$SH"`, and
+    // through a link that truncates the real binary under test -- the build
+    // artifact, outside the throwaway dir the rest of this is careful about.
+    // A link, not a copy. A copy looks safer -- a case could truncate the entry
+    // without touching the binary under test -- but the kernel already closes
+    // that: the entry IS the executable the case is running, so a write to it is
+    // ETXTBSY (asserted below in tests). What a per-case copy does buy is a
+    // second `fs::copy` holding a write fd while cargo's other test threads fork,
+    // and their inherited fd turns unrelated execs into "Text file busy": 1 to 4
+    // of the 11 conformance tests failed per run, differently each time, and it
+    // woke the same latent race in `ProbeDir`.
+    let entry = bindir.join(identity);
+    std::os::unix::fs::symlink(&shell, &entry)?;
+    // Spawn the ENTRY, not the canonicalized original, so the top-level shell and
+    // a nested `$SH -c ..` are the same argv[0]. It matters for a multicall
+    // binary: `canonicalize` resolves a busybox `ash` link back to `busybox`,
+    // which then answers `-c: applet not found` and grades as a wrecked shell,
+    // while the nested call through this entry works. Identical overlay for a
+    // single-purpose shell; the difference is only that consistency.
+    let child = Command::new(&entry)
         .arg("-c")
         .arg(&case.code)
         .env_clear()
-        .env("SH", &shell)
+        .env("SH", identity)
+        .env("PATH", &bindir)
         .env("TMP", &tmpdir)
         .current_dir(&cwd)
         .stdin(Stdio::null())

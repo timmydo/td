@@ -101,6 +101,110 @@ fn corpus_is_well_formed() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// The runner's ENVIRONMENT contract, which 359 corpus guards turn on and which
+/// only a real child can demonstrate. Written as a spec so each expectation is
+/// the golden itself: `$SH` is the chain's identity rather than a path, it is
+/// still executable under that name, and PATH holds it and nothing else — so a
+/// case reaching for an ordinary external still finds none. Pinned here because
+/// the corpus overlay would catch a regression in any of these only as a
+/// scattered count, which says nothing about which property broke.
+#[test]
+fn a_case_meets_the_shell_by_identity_on_a_path_of_its_own(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let shell = PathBuf::from(env!("CARGO_BIN_EXE_td-sh"));
+    let spec = "\
+#### the identity guard fires
+case $SH in ash) echo GUARD ;; *) echo MISS ;; esac
+## STDOUT:
+GUARD
+## END
+
+#### the identity is executable under that name
+$SH -c 'echo nested'
+## STDOUT:
+nested
+## END
+
+#### PATH holds the shell and nothing else
+command -v ash >/dev/null && echo found-shell
+ls / >/dev/null 2>&1 || echo no-externals
+## STDOUT:
+found-shell
+no-externals
+## END
+";
+    for case in parse_spec(spec)? {
+        let outcome = run_case(&shell, &case, ASH_DASH_CHAIN)?;
+        assert!(outcome.passed, "{}: {}", case.name, outcome.detail.unwrap_or_default());
+    }
+    // And the identity FOLLOWS the chain rather than being a fixed `ash`.
+    let spec = "\
+#### the chain head decides the identity
+case $SH in dash) echo DASH ;; *) echo OTHER ;; esac
+## STDOUT:
+DASH
+## END
+";
+    for case in parse_spec(spec)? {
+        let outcome = run_case(&shell, &case, &["dash"])?;
+        assert!(outcome.passed, "{}: {}", case.name, outcome.detail.unwrap_or_default());
+    }
+
+    // The identity comes from the chain HEAD, not from the file's
+    // `compare_shells`, even where the two disagree — so a dash-only file still
+    // meets `$SH=ash` while `pick` grades it against dash's block. That
+    // mismatch is the known remaining half of this bug (49 files, 88 guards);
+    // pinned here so the increment that closes it has to change this line
+    // rather than drift through it.
+    let spec = "\
+## compare_shells: bash dash mksh
+
+#### the identity does not follow compare_shells yet
+case $SH in ash) echo ASH ;; dash) echo DASH ;; *) echo OTHER ;; esac
+## STDOUT:
+ASH
+## END
+";
+    for case in parse_spec(spec)? {
+        let outcome = run_case(&shell, &case, ASH_DASH_CHAIN)?;
+        assert!(outcome.passed, "{}: {}", case.name, outcome.detail.unwrap_or_default());
+    }
+
+    // The PATH entry is a symlink to the binary under test, so `: > "$PATH/$SH"`
+    // aims a truncation straight at the build artifact — and cannot land it,
+    // because that binary is the one this very case is executing and the kernel
+    // answers ETXTBSY. That is why the entry does not need to be a copy. The
+    // assertion is on the artifact's SIZE rather than on the case's status: a
+    // failed redirection on `:` is POSIX-fatal, so the case is expected to die.
+    let before = std::fs::metadata(&shell)?.len();
+    let spec = "\
+#### a case cannot truncate the binary under test
+: > \"$PATH/$SH\"
+## status: 1
+";
+    for case in parse_spec(spec)? {
+        let outcome = run_case(&shell, &case, ASH_DASH_CHAIN)?;
+        assert!(outcome.passed, "{}: {}", case.name, outcome.detail.unwrap_or_default());
+    }
+    assert_eq!(
+        std::fs::metadata(&shell)?.len(),
+        before,
+        "the shell under test was truncated through its own PATH entry"
+    );
+
+    // The identity becomes both a path component and the value of `$SH`, and the
+    // chain is caller-supplied, so a path cannot be smuggled through it.
+    let cases = parse_spec("#### identity is validated\ntrue\n")?;
+    let case = cases.first().ok_or("missing case")?;
+    for bad in ["../escape", "/abs", "a/b", "", ".", ".."] {
+        assert!(
+            run_case(&shell, case, &[bad]).is_err(),
+            "identity {bad:?} was accepted as a path component"
+        );
+    }
+    Ok(())
+}
+
 /// Build `td-sh` and run every spec case, classified against the overlay. Green
 /// iff there is no regression (an unlisted case that fails), no unexpected pass
 /// (a listed `xfail` that now passes — promote it), and no stale overlay entry.
