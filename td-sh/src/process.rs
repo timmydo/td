@@ -25,7 +25,6 @@ use std::sync::{Arc, Mutex};
 
 use crate::ast::{Cmd, List, Redir, RedirKind};
 use crate::exec::{self, Shell, Sig, R};
-use crate::builtin;
 
 /// One entry in the shell's descriptor table. Everything shareable is behind an
 /// `Arc<Mutex<…>>` so a subshell or pipeline stage inherits the same open file
@@ -444,6 +443,8 @@ pub fn fork_shell(sh: &Shell) -> Shell {
         locals: sh.locals.clone(),
         pending_unwind: Vec::new(),
         pending_floor: 0,
+        // A subshell's children inherit them too.
+        opaque_env: sh.opaque_env.clone(),
         loop_depth: 0,
         run_depth: sh.run_depth,
         cmdsubst_count: sh.cmdsubst_count,
@@ -509,7 +510,7 @@ pub fn exec_replace(sh: &mut Shell, argv: &[String]) -> R<()> {
     let Some(program) = argv.first() else {
         return Ok(());
     };
-    let Some(resolved) = resolve_program(sh, program) else {
+    let Some(resolved) = resolve_program(sh, program, None) else {
         let _ = exec::write_stderr(sh, &format!("td-sh: exec: {program}: not found"));
         return failed_exec(sh, 127);
     };
@@ -525,7 +526,7 @@ pub fn exec_replace(sh: &mut Shell, argv: &[String]) -> R<()> {
         // emulation has to drop it too -- otherwise this shell runs an EXIT trap
         // the exec'd program could never have run.
         sh.traps.clear();
-        exec_external(sh, argv, &[])?;
+        exec_external(sh, argv, None)?;
         return Err(Sig::Exit(sh.status));
     }
 
@@ -533,6 +534,10 @@ pub fn exec_replace(sh: &mut Shell, argv: &[String]) -> R<()> {
     cmd.args(argv.iter().skip(1));
     cmd.env_clear();
     for (k, v) in sh.exported_env() {
+        cmd.env(k, v);
+    }
+    // Names the shell cannot spell still belong to the environment it was handed.
+    for (k, v) in &sh.opaque_env {
         cmd.env(k, v);
     }
     cmd.current_dir(&sh.cwd);
@@ -565,16 +570,12 @@ fn failed_exec(sh: &mut Shell, code: i32) -> R<()> {
 /// Without this an external consumer would read the shell's real inherited stdin
 /// (blocking the shell forever on a live terminal) and `x=$(external)` would lose
 /// the command's output.
-pub fn exec_external(
-    sh: &mut Shell,
-    argv: &[String],
-    env_overrides: &[(String, String)],
-) -> R<()> {
+pub fn exec_external(sh: &mut Shell, argv: &[String], path: Option<&str>) -> R<()> {
     let Some(program) = argv.first() else {
         sh.set_status(0);
         return Ok(());
     };
-    let resolved = match resolve_program(sh, program) {
+    let resolved = match resolve_program(sh, program, path) {
         Some(p) => p,
         None => {
             let _ = exec::write_stderr(sh, &format!("td-sh: {program}: not found"));
@@ -589,7 +590,8 @@ pub fn exec_external(
     for (k, v) in sh.exported_env() {
         cmd.env(k, v);
     }
-    for (k, v) in env_overrides {
+    // Names the shell cannot spell still belong to the environment it was handed.
+    for (k, v) in &sh.opaque_env {
         cmd.env(k, v);
     }
     cmd.current_dir(&sh.cwd);
@@ -741,16 +743,36 @@ fn inherit_stream(n: u8) -> Stdio {
     }
 }
 
+/// `command -p`'s default utility path: ash's `bb_default_path`, which is
+/// `BB_PATH_ROOT_PATH` (libbb.h) less its `/sbin` pair. The supplied busybox
+/// leaves `BB_ADDITIONAL_PATH` -- the CFLAGS hook that can extend it -- empty, and
+/// its strings confirm the result. A td image has `/bin` and no `/usr/bin`.
+pub const DEFAULT_UTILITY_PATH: &str = "/bin:/usr/bin";
+
 /// Locate an external program: a path containing `/` is used directly, otherwise
-/// each `PATH` element is tried. Relative `PATH` elements resolve against the
-/// shell cwd (not the process cwd) so the lookup agrees with the child, which runs
-/// with `current_dir(sh.cwd)`.
-pub fn resolve_program(sh: &Shell, program: &str) -> Option<std::path::PathBuf> {
+/// each element of `path` -- or of `PATH` when it is `None` -- is tried. Relative
+/// elements resolve against the shell cwd (not the process cwd) so the lookup
+/// agrees with the child, which runs with `current_dir(sh.cwd)`.
+///
+/// `path` is `command -p`'s override: only the LOOKUP moves, never the variable a
+/// child inherits, as ash's `path` local does.
+pub fn resolve_program(
+    sh: &Shell,
+    program: &str,
+    path: Option<&str>,
+) -> Option<std::path::PathBuf> {
     if program.contains('/') {
         let p = sh.resolve(program);
         return if p.is_file() { Some(p) } else { None };
     }
-    let path = sh.get_var("PATH").unwrap_or_default();
+    let owned;
+    let path = match path {
+        Some(p) => p,
+        None => {
+            owned = sh.get_var("PATH").unwrap_or_default();
+            &owned
+        }
+    };
     for dir in path.split(':') {
         let dir = if dir.is_empty() { "." } else { dir };
         let candidate = sh.resolve(dir).join(program);
@@ -819,6 +841,3 @@ pub fn run_capturing_interactive_units(units: &[&str]) -> (i32, String, String) 
     (sh.status, text(&out), text(&err))
 }
 
-pub fn is_builtin(name: &str) -> bool {
-    builtin::lookup(name).is_some()
-}

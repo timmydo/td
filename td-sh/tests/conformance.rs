@@ -244,6 +244,357 @@ fn a_localised_name_still_exports_once_assigned() -> Result<(), Box<dyn std::err
     Ok(())
 }
 
+/// ash prints only the part of a name that IS a name (`endofname`, ash.c:11580),
+/// so an environment entry no shell can name -- which td-sh still passes through
+/// to its children -- cannot turn `export -p` into something `eval` rejects. Only
+/// a real child can carry such a name in, so this cannot be a unit test.
+///
+/// One entry ash does NOT survive is an empty name: it prints `export ='v'`,
+/// which `eval` rejects. td-sh cannot emit that line at all, because it needs a
+/// name that is BOTH empty and whole, and no import produces one -- Rust's
+/// environment parse looks for the `=` from offset 1, so the name it yields is
+/// never empty, and `export ''` is a usage error. The cost of answering it that
+/// way is `=a=b`, which imports as a name of `=a` and lists as a bare `export`
+/// where ash prints `export ='a=b'`. That and an undecodable name -- which ash
+/// lists truncated and td-sh does not list at all, not being a variable -- are
+/// the two entries whose listing is not ash's.
+#[test]
+fn the_export_listing_is_eval_safe() -> Result<(), Box<dyn std::error::Error>> {
+    let shell = PathBuf::from(env!("CARGO_BIN_EXE_td-sh"));
+    let run = |src: &str| -> Result<String, Box<dyn std::error::Error>> {
+        let out = std::process::Command::new(&shell)
+            .arg("-c")
+            .arg(src)
+            .env_clear()
+            .env("PATH", "/usr/bin")
+            .env("test-test", "v")
+            .env("TD_SH_Q", "it's")
+            .env("1digit", "v")
+            .env("TD_SH_A", "1")
+            .env("az", "1")
+            .env("a\u{e9}", "2")
+            // A leading `_` starts a name and an interior digit continues one --
+            // the two halves of `is_name`/`is_in_name` that nothing else here
+            // exercises, and each of which a wrong scan drops silently.
+            .env("_ok", "1")
+            .env("a1", "2")
+            .output()?;
+        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    };
+    // Byte for byte what ash prints for this environment, PWD dropped because it
+    // is the test's own directory. Asserted as a SEQUENCE, since the ordering is
+    // half the rule: ash sorts the RAW names and truncates when it prints, so
+    // `az` comes out before the line `a\u{e9}` renders as -- the visible names are
+    // not in order, and an implementation that sorted what it printed would be
+    // wrong in exactly this shape.
+    let listing = run("export -p")?;
+    let lines: Vec<&str> = listing.lines().filter(|l| !l.starts_with("export PWD=")).collect();
+    assert_eq!(
+        lines,
+        [
+            // A leading digit is not a name START, so the prefix is empty and the
+            // whole entry is a bare `export`; a non-ASCII first byte is the same.
+            "export ",
+            "export PATH='/usr/bin'",
+            "export TD_SH_A='1'",
+            // A quote closes the run and re-opens it around a `"`-quoted one.
+            "export TD_SH_Q='it'\"'\"'s'",
+            "export _ok='1'",
+            "export a1='2'",
+            "export az='1'",
+            "export a",
+            "export test",
+        ],
+        "{listing}"
+    );
+    // So the whole listing is something the shell can read back: the value with
+    // the quote in it survives the round trip. It is not IDEMPOTENT -- the bare
+    // `export` line lists again when evaluated -- but ash does that too, and the
+    // point of `endofname` is that the text parses at all.
+    let round_trip = run("eval \"$(export -p)\"; echo \"[$TD_SH_Q]\"")?;
+    assert!(round_trip.ends_with("[it's]\n"), "{round_trip}");
+    Ok(())
+}
+
+/// An environment entry that is not valid UTF-8 used to ABORT the shell before it
+/// ran a line, because `std::env::vars` unwraps. Only a real child can carry one
+/// in, so this cannot be a unit test.
+#[test]
+fn a_non_utf8_environment_entry_does_not_abort_the_shell() -> Result<(), Box<dyn std::error::Error>>
+{
+    use std::os::unix::ffi::OsStrExt;
+    let shell = PathBuf::from(env!("CARGO_BIN_EXE_td-sh"));
+    let osb = std::ffi::OsStr::from_bytes;
+    let run = |src: &str| -> Result<std::process::Output, Box<dyn std::error::Error>> {
+        Ok(std::process::Command::new(&shell)
+            .arg("-c")
+            .arg(src)
+            // TWO undecodable names, the first with an undecodable VALUE as well:
+            // one entry with a clean value cannot show that the whole pair is
+            // replayed, and a single entry cannot show that the SECOND one is.
+            .env(osb(b"TD_SH_\xff"), osb(b"N\xfe"))
+            .env(osb(b"TD_SH_\xfd"), "M")
+            .env("TD_SH_BADVAL", osb(b"x\xfe"))
+            .output()?)
+    };
+    // The shell RUNS. This is the whole point: the abort came before any line of
+    // the script, so every invocation died, not just one that named the entry.
+    let out = run("echo ok")?;
+    assert_eq!((out.status.code(), out.stdout.as_slice()), (Some(0), b"ok\n".as_slice()));
+
+    // A VALUE that does not decode reads back as U+FFFD, which is what `read` and
+    // `$( )` already do with one. ash keeps the byte; that difference is the whole
+    // shell's, not this import's, and is deliberate here rather than incidental.
+    let out = run("printf %s \"$TD_SH_BADVAL\"")?;
+    assert_eq!(out.stdout, "x\u{fffd}".as_bytes());
+
+    // A NAME that does not decode is NOT a variable -- nothing can spell it -- but
+    // it still reaches a child byte for byte, which is where mangling it would do
+    // real damage. `cat` rather than the shell itself, because reading the entry
+    // back through the shell is exactly what cannot preserve it.
+    let child_env = |src: &str| -> Result<Vec<Vec<u8>>, Box<dyn std::error::Error>> {
+        let out = run(src)?;
+        assert!(out.status.success(), "{src}: {:?}", out.status);
+        Ok(out.stdout.split(|&b| b == 0).map(<[u8]>::to_vec).collect())
+    };
+    let entries = child_env("exec cat /proc/self/environ")?;
+    assert!(entries.contains(&b"TD_SH_\xff=N\xfe".to_vec()), "{entries:?}");
+    assert!(entries.contains(&b"TD_SH_\xfd=M".to_vec()), "{entries:?}");
+    // The lossy value is what a CHILD gets too. Reading it back through `printf`
+    // above cannot show that: an implementation that decoded lossily AND kept the
+    // raw bytes aside would satisfy that assertion and still hand the child the
+    // original, since the opaque entries are applied after the exported ones.
+    assert!(entries.contains(&"TD_SH_BADVAL=x\u{fffd}".as_bytes().to_vec()), "{entries:?}");
+    assert!(!entries.contains(&b"TD_SH_BADVAL=x\xfe".to_vec()), "{entries:?}");
+    // And nothing EXTRA: an import that both carried the entry and inserted a
+    // lossy-named variable for it would pass every `contains` above while sending
+    // the child a name ash never sends.
+    assert!(
+        !entries.iter().any(|e| e.starts_with("TD_SH_\u{fffd}".as_bytes())),
+        "{entries:?}"
+    );
+    // Again from a subshell, which reaches a child through the OTHER spawn site.
+    let entries = child_env("( cat /proc/self/environ )")?;
+    assert!(entries.contains(&b"TD_SH_\xff=N\xfe".to_vec()), "{entries:?}");
+    assert!(entries.contains(&b"TD_SH_\xfd=M".to_vec()), "{entries:?}");
+    Ok(())
+}
+
+/// A throwaway directory holding a COPY of the shell under test, named
+/// `td_sh_probe`. A copy rather than a `#!/bin/sh` script, so no gate needs a host
+/// interpreter to exist at an absolute path.
+struct ProbeDir(PathBuf);
+
+impl ProbeDir {
+    fn new(tag: &str) -> Result<Self, Box<dyn std::error::Error>> {
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+        // Exclusive create at 0700, not `create_dir_all`, and no pre-emptive
+        // remove: the name is predictable, so anything already there must RED the
+        // create rather than be adopted -- this directory holds a program the gate
+        // then executes. Same argument as `CaseWorkdir` in lib.rs.
+        let base = std::env::temp_dir();
+        let mut dir = None;
+        for seq in 0..64u32 {
+            let candidate = base.join(format!("td-sh-{tag}-{}-{seq}", std::process::id()));
+            match std::fs::DirBuilder::new().mode(0o700).create(&candidate) {
+                Ok(()) => {
+                    dir = Some(candidate);
+                    break;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(e) => return Err(e.into()),
+            }
+        }
+        let dir = dir.ok_or("no free temp directory name")?;
+        let probe = dir.join("td_sh_probe");
+        std::fs::copy(PathBuf::from(env!("CARGO_BIN_EXE_td-sh")), &probe)?;
+        std::fs::set_permissions(&probe, std::fs::Permissions::from_mode(0o755))?;
+        Ok(Self(dir))
+    }
+
+    fn run(&self, src: &str) -> Result<(i32, String), Box<dyn std::error::Error>> {
+        let out = std::process::Command::new(PathBuf::from(env!("CARGO_BIN_EXE_td-sh")))
+            .arg("-c")
+            .arg(src)
+            .output()?;
+        Ok((
+            out.status.code().unwrap_or(-1),
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+        ))
+    }
+}
+
+impl Drop for ProbeDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// A prefix assignment is applied to the SHELL for the command's duration, not
+/// merely handed to the child, so `PATH=dir prog` locates `prog` in `dir`. Only a
+/// real child shows it: the builtin route already applied prefixes to shell state,
+/// so nothing in-process could tell the two models apart.
+#[test]
+fn a_prefix_assignment_reaches_the_external_lookup()
+-> Result<(), Box<dyn std::error::Error>> {
+    let probe = ProbeDir::new("prefix")?;
+    let path = probe.0.display();
+    let ran = (0, "RAN\n".to_string());
+    assert_eq!(probe.run(&format!("PATH={path} td_sh_probe -c 'echo RAN'"))?, ran);
+    // ... and the child sees it too, since it is EXPORTED for that run rather than
+    // passed alongside.
+    assert_eq!(
+        probe.run(&format!("PATH={path} td_sh_probe -c 'echo $PATH'"))?,
+        (0, format!("{path}\n"))
+    );
+    // The shell's own binding is restored afterwards -- on the failing path as
+    // well, where the lookup never resolved.
+    assert_eq!(
+        probe.run(&format!("PATH=orig; PATH={path} td_sh_probe -c ':'; echo [$PATH]"))?,
+        (0, "[orig]\n".into())
+    );
+    assert_eq!(
+        probe.run("PATH=orig; PATH=zz td_sh_probe -c ':'; echo [$PATH]")?.1,
+        "[orig]\n"
+    );
+    assert_eq!(
+        probe.run("x=1 td_sh_no_such_69; echo \"$? [$x]\"")?,
+        (0, "127 []\n".into())
+    );
+    // A name the shell did not have reaches the child EXPORTED, and is gone from
+    // the shell -- exported and unset are separate halves and both are asserted.
+    assert_eq!(
+        probe.run(&format!(
+            "PATH={path} x=1 td_sh_probe -c 'echo [$x]'; echo after=[$x]"
+        ))?,
+        (0, "[1]\nafter=[]\n".into())
+    );
+    // Applied left to right AS THEY GO, so a later one sees what an earlier one
+    // just set -- the other half of "set on the shell" rather than "collected and
+    // handed over", and what `ash_test/ash-vars/var_serial.tests` checks.
+    assert_eq!(
+        probe.run(&format!(
+            "PATH={path}; a=a; b=b; c=c; b=$a c=$b td_sh_probe -c 'echo c=$c b=$b'"
+        ))?,
+        (0, "c=a b=a\n".into())
+    );
+    // Redirections are applied BEFORE the assignments, so a target that names one
+    // of them expands to the value it had before the command -- and this one then
+    // fails, skipping the command entirely.
+    assert_eq!(
+        probe.run(&format!(
+            "X=/no/such/dir-td-sh-70/f; PATH={path} X=/dev/null td_sh_probe -c 'echo RAN' >\"$X\"; echo st=$?"
+        ))?.1,
+        "st=1\n"
+    );
+    // ... and one that fails to EXPAND leaves the old value standing, which is what
+    // an EXIT trap then sees. Both halves of the order are observable.
+    assert_eq!(
+        probe.run(&format!(
+            "trap 'echo trap=[$X]' EXIT; X=old; PATH={path} X=new td_sh_probe -c ':' >${{u:?boom}}"
+        ))?.1,
+        "trap=[old]\n"
+    );
+    // The assignment's own expansion runs with the redirections already in force.
+    assert_eq!(
+        probe.run(&format!(
+            "PATH={path} y=$(echo E >&2) td_sh_probe -c ':' 2>/dev/null; echo done"
+        ))?,
+        (0, "done\n".into())
+    );
+    // The LAST of a repeated name wins, as it would in a plain assignment.
+    assert_eq!(
+        probe.run(&format!("PATH={path} v=1 v=2 td_sh_probe -c 'echo [$v]'"))?.1,
+        "[2]\n"
+    );
+    // The export FLAG is restored, both directions: a variable that was not
+    // exported does not stay exported, and one that WAS keeps its old value AND
+    // its export. A second child is the probe for both -- host-free, where reading
+    // `export -p` through a pipe would need a `grep` on the machine.
+    assert_eq!(
+        probe.run(&format!(
+            "PATH={path}; u=1; u=2 td_sh_probe -c ':'; td_sh_probe -c 'echo [$u]'"
+        ))?.1,
+        "[]\n"
+    );
+    assert_eq!(
+        probe.run(&format!(
+            "PATH={path}; export x=orig; x=1 td_sh_probe -c ':'; td_sh_probe -c 'echo [$x]'"
+        ))?.1,
+        "[orig]\n"
+    );
+    // A repeated name is rolled back to what it was BEFORE the first of them, not
+    // to what the first one set.
+    assert_eq!(
+        probe.run(&format!("PATH={path} x=1 x=2 td_sh_probe -c ':'; echo \"[$x]\""))?.1,
+        "[]\n"
+    );
+    // An unwind part-way through the list leaves the frame standing for the EXIT
+    // trap, so the assignments that DID take are still visible there -- the
+    // `defer_vars` branch, which the redirect-word case above cannot reach because
+    // nothing has been assigned by then.
+    assert_eq!(
+        probe.run(&format!(
+            "trap 'echo t=[$x]' EXIT; PATH={path} x=1 y=${{u:?boom}} td_sh_probe -c ':'"
+        ))?.1,
+        "t=[1]\n"
+    );
+    // A readonly target is fatal before anything runs, as it is for a builtin.
+    assert_eq!(
+        probe.run(&format!("readonly PATH=zz; PATH={path} td_sh_probe -c ':'"))?.0,
+        2
+    );
+    Ok(())
+}
+
+/// `command -p` must move the EXECUTION lookup, not only the query. Only a real
+/// child can show it: the assertion needs a program that exists on `PATH` and not
+/// on the default utility path, which means creating one.
+#[test]
+fn command_p_moves_the_execution_lookup() -> Result<(), Box<dyn std::error::Error>> {
+    let probe = ProbeDir::new("cmd-p")?;
+    let run = |src: &str| probe.run(src);
+    let path = probe.0.display();
+    // Without `-p` the probe runs; with it the lookup no longer reads PATH, so it
+    // is not there to run -- and the QUERY answers the same way, which is the
+    // property that makes `command -pv` honest about `command -p`.
+    let ran = (0, "RAN\n".to_string());
+    let probe_run = "td_sh_probe -c 'echo RAN'";
+    assert_eq!(run(&format!("PATH={path} command {probe_run}"))?, ran);
+    assert_eq!(run(&format!("PATH={path} command -p {probe_run}"))?.0, 127);
+    assert_eq!(
+        run(&format!("PATH={path} command -v td_sh_probe"))?.1,
+        format!("{path}/td_sh_probe\n")
+    );
+    assert_eq!(run(&format!("PATH={path} command -pv td_sh_probe"))?.0, 127);
+    // `-p` moves the LOOKUP and nothing else, so a child still inherits the PATH
+    // the shell has. A slash in the name skips the search entirely, which is the
+    // only way to run something under `-p` that is not on the default path.
+    let echo_path = format!("{path}/td_sh_probe -c 'echo $PATH'");
+    assert_eq!(
+        run(&format!("PATH={path} command -p {echo_path}"))?,
+        (0, format!("{path}\n"))
+    );
+    // A `command` wrapper inside another one keeps the outer `-p`, as ash's own
+    // loop does -- but a QUERY inside one does not, because that re-parses.
+    assert_eq!(run(&format!("PATH={path} command -p command {probe_run}"))?.0, 127);
+    assert_eq!(run(&format!("PATH={path} command -p command command {probe_run}"))?.0, 127);
+    assert_eq!(
+        run(&format!("PATH={path} command -p command -v td_sh_probe"))?.1,
+        format!("{path}/td_sh_probe\n")
+    );
+    assert_eq!(run(&format!("PATH={path} command -- command {probe_run}"))?, ran);
+    // `--` ends the level's options; it does not undo the `-p` already read.
+    assert_eq!(run(&format!("PATH={path} command -p -- {probe_run}"))?.0, 127);
+    // A slash skips the search on BOTH sides, so the query answers under `-p` too
+    // -- the half that would otherwise disagree with the execution above.
+    assert_eq!(
+        run(&format!("PATH={path} command -pv {path}/td_sh_probe"))?,
+        (0, format!("{path}/td_sh_probe\n"))
+    );
+    Ok(())
+}
+
 /// A case that redirects into a relative filename must not touch the gate's
 /// working tree: `run_case` isolates each case in a throwaway temp working
 /// directory. Corpus cases like `var-num.test.sh::$0 with filename` do exactly

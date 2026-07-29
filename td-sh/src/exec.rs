@@ -8,6 +8,7 @@
 //! command just leaves its status in `Shell::status`.
 
 use std::collections::{BTreeMap, HashMap};
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -141,6 +142,10 @@ pub struct Shell {
     /// trap's top level repeats that frame's -- but a function the trap calls gets
     /// a frame of its own, and must not read the dying one as already declared.
     pub pending_floor: usize,
+    /// Environment entries whose NAME does not decode as UTF-8. They are not
+    /// variables -- no expansion can spell one -- but a child still inherits them,
+    /// so they are carried verbatim rather than dropped or mangled.
+    pub opaque_env: Vec<(OsString, OsString)>,
     pub loop_depth: u32,
     /// Runtime recursion depth (function calls + command substitution), bounded so
     /// `f() { f; }; f` and `$( $( … ) )` error instead of overflowing the stack.
@@ -203,11 +208,23 @@ impl Shell {
     pub fn new() -> Self {
         let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
         let mut vars = HashMap::new();
-        for (k, v) in std::env::vars() {
+        let mut opaque_env = Vec::new();
+        // `vars_os`, because `vars` ABORTS on an entry that does not decode. An
+        // undecodable VALUE then becomes U+FFFD, the rule `read` and `$( )` already
+        // follow; an undecodable NAME is kept verbatim instead, since no expansion
+        // can spell one and rewriting it could only corrupt what a child inherits.
+        for (k, v) in std::env::vars_os() {
+            let k = match k.into_string() {
+                Ok(name) => name,
+                Err(raw) => {
+                    opaque_env.push((raw, v));
+                    continue;
+                }
+            };
             vars.insert(
                 k,
                 Var {
-                    value: Some(v),
+                    value: Some(v.to_string_lossy().into_owned()),
                     exported: true,
                     readonly: false,
                     localised: false,
@@ -229,6 +246,7 @@ impl Shell {
             locals: Vec::new(),
             pending_unwind: Vec::new(),
             pending_floor: 0,
+            opaque_env,
             loop_depth: 0,
             run_depth: 0,
             cmdsubst_count: 0,
@@ -291,6 +309,7 @@ impl Shell {
             locals: Vec::new(),
             pending_unwind: Vec::new(),
             pending_floor: 0,
+            opaque_env: Vec::new(),
             loop_depth: 0,
             run_depth: 0,
             cmdsubst_count: 0,
@@ -918,7 +937,7 @@ fn run_simple(
     redirs: &[Redir],
 ) -> R<()> {
     let cmdsubst_before = sh.cmdsubst_count;
-    let argv = expand::expand_word_list(sh, words)?;
+    let argv = expand::expand_command_words(sh, words)?;
     // No command name — either none was given (`a=1 b=2`) or every word field-split
     // away (`x=new $empty`). POSIX: the assignments affect the CURRENT shell,
     // redirections are performed then dropped (`>file` truncates), and the exit
@@ -1002,15 +1021,48 @@ fn dispatch_simple(
         return run_builtin(sh, bi, argv, assigns, redirs);
     }
 
-    // External command: assignments become part of its environment only.
-    let env_overrides = expand_assignments(sh, assigns)?;
-    let saved = match process::apply_redirs(sh, redirs)? {
-        process::RedirOutcome::Applied(s) => s,
+    // External command: the assignments are transient, but they are SET on the shell
+    // rather than merely handed to the child. ash puts them in a localvar frame with
+    // `VEXPORT` (ash.c:10497) and locates the command only afterwards, so
+    // `PATH=dir prog` finds `prog` in `dir` -- and the child inherits them because
+    // they are exported, not through a separate list.
+    let pending_mark = sh.pending_unwind.len();
+    let mut saved_vars: Vec<(String, Option<Var>)> = Vec::with_capacity(assigns.len());
+    // Redirections FIRST, then the assignments -- ash's order (`redirectsafe` at
+    // ash.c:10477, the assignment loop at 10490). It is observable both ways: a
+    // target naming one of these names expands to the value it had BEFORE the
+    // command, and a target that fails to expand leaves the old value for the EXIT
+    // trap to see. `?` here is that second case, and it is correct that it skips
+    // the rollback below: nothing was assigned yet.
+    let result = match process::apply_redirs(sh, redirs)? {
         // A failed redirection skips the command without exiting the shell.
-        process::RedirOutcome::Failed => return Ok(()),
+        process::RedirOutcome::Failed => Ok(()),
+        process::RedirOutcome::Applied(saved) => {
+            // Closed over so an unwind part-way through -- a readonly target --
+            // still reaches the rollback below.
+            let r = (|| {
+                for a in assigns {
+                    let value = expand::expand_assign(sh, &a.value)?;
+                    saved_vars.push((a.name.clone(), sh.vars.get(&a.name).cloned()));
+                    sh.set_var(&a.name, &value)?;
+                    sh.export(&a.name);
+                }
+                process::exec_external(sh, argv, None)
+            })();
+            process::restore_redirs(sh, saved);
+            r
+        }
     };
-    let result = process::exec_external(sh, argv, &env_overrides);
-    process::restore_redirs(sh, saved);
+    // Same rule as the regular-builtin frame above: a terminating unwind leaves it
+    // standing for an EXIT trap, anything else takes it off here. The mark is
+    // defensive rather than load-bearing -- nothing an external command reaches can
+    // defer onto this shell's list, since every nested evaluation here forks.
+    if result.as_ref().err().is_some_and(terminating) {
+        defer_vars(sh, saved_vars);
+    } else {
+        unwind_pending_to(sh, pending_mark);
+        restore_vars(sh, saved_vars);
+    }
     result
 }
 
@@ -1068,30 +1120,49 @@ fn run_builtin(
     // abort undoes exactly that and leaves an outer unwind's frames alone.
     let pending_mark = sh.pending_unwind.len();
     let mut saved_vars: Vec<(String, Option<Var>)> = Vec::with_capacity(assigns.len());
-    // Closed over so an unwind mid-way -- a readonly target, `>${x:?}` -- still
-    // reaches the rollback below; a `?` here used to skip it and leak the binding
-    // into the next command, which only became visible once the shell survived.
-    let result = (|| {
-        for a in assigns {
-            let value = expand::expand_assign(sh, &a.value)?;
-            if transient {
-                saved_vars.push((a.name.clone(), sh.vars.get(&a.name).cloned()));
-            }
-            sh.set_var(&a.name, &value)?;
-            if transient {
-                sh.export(&a.name);
-            }
+    // Redirections FIRST, then the assignments -- ash's order (`redirectsafe` at
+    // ash.c:10477, the assignment loop at 10490), and already what the special
+    // branch above does. It is observable both ways: a target that NAMES one of
+    // these expands to the value it had before the command, and a target that
+    // fails to expand leaves the old value for an EXIT trap to see. The `?` on
+    // `apply_redirs` is that second case, and it correctly skips the rollback:
+    // nothing has been assigned yet.
+    let result = match process::apply_redirs(sh, redirs)? {
+        // `local` is in ash's `spclbltin` set even though POSIX's special list
+        // omits it, and that set -- not the POSIX one -- is what makes a
+        // redirection error fatal (ash.c:10484). It reaches this branch rather
+        // than the one above because td-sh keys the PERSISTENT-assignment split
+        // on the POSIX list, where `local` genuinely differs.
+        process::RedirOutcome::Failed if builtin::is_ash_special(bi) => {
+            return Err(Sig::Abort(sh.status));
         }
-        match process::apply_redirs(sh, redirs)? {
-            process::RedirOutcome::Applied(saved) => {
-                let r = builtin::run(sh, bi, argv);
-                process::restore_redirs(sh, saved);
+        // A failed redirection skips a regular builtin; `$?` is already 1.
+        process::RedirOutcome::Failed => Ok(()),
+        process::RedirOutcome::Applied(saved) => {
+            // Closed over so an unwind mid-way -- a readonly target -- still reaches
+            // the rollback below; a `?` here used to skip it and leak the binding
+            // into the next command, which only became visible once the shell
+            // survived.
+            let r = (|| {
+                for a in assigns {
+                    let value = expand::expand_assign(sh, &a.value)?;
+                    if transient {
+                        saved_vars.push((a.name.clone(), sh.vars.get(&a.name).cloned()));
+                    }
+                    sh.set_var(&a.name, &value)?;
+                    if transient {
+                        sh.export(&a.name);
+                    }
+                }
+                Ok(())
+            })()
+            .and_then(|()| {
                 // dash re-raises EXERROR from `evalbltin` only for a SPECIAL
                 // builtin, and only for an error raised in the builtin's own BODY
-                // -- an error from the assignments or redirect words above is
-                // `evalcommand`'s and stays fatal. `Exit` propagates regardless,
-                // so `command exit 7` still exits.
-                match r {
+                // -- an error from the assignments or redirect words is
+                // `evalcommand`'s and stays fatal. `Exit` propagates regardless, so
+                // `command exit 7` still exits.
+                match builtin::run(sh, bi, argv) {
                     Err(Sig::Abort(code)) if swallows_abort(bi) => {
                         unwind_pending_to(sh, pending_mark);
                         sh.set_status(code);
@@ -1099,12 +1170,11 @@ fn run_builtin(
                     }
                     other => other,
                 }
-            }
-            // A failed redirection skips a regular builtin; `$?` is already 1. The
-            // transient prefix assignments are still rolled back below.
-            process::RedirOutcome::Failed => Ok(()),
+            });
+            process::restore_redirs(sh, saved);
+            r
         }
-    })();
+    };
     // Same rule as a function's frame: a terminating unwind leaves it standing for
     // an EXIT trap. A failed redirection is NOT one -- it returns `Ok`, and both
     // references show the frame already gone by the time the trap runs.
@@ -1137,17 +1207,6 @@ pub fn terminating(sig: &Sig) -> bool {
     matches!(sig, Sig::Exit(_) | Sig::Abort(_))
 }
 
-fn expand_assignments(
-    sh: &mut Shell,
-    assigns: &[crate::ast::Assign],
-) -> R<Vec<(String, String)>> {
-    let mut out = Vec::with_capacity(assigns.len());
-    for a in assigns {
-        let value = expand::expand_assign(sh, &a.value)?;
-        out.push((a.name.clone(), value));
-    }
-    Ok(out)
-}
 
 /// Put back what one binding displaced. `None` means the name did not exist, so
 /// restoring it is an unset -- and it overwrites whatever the body assigned
@@ -1542,10 +1601,99 @@ mod tests {
     }
 
     #[test]
+    fn a_redirection_is_in_force_before_the_prefix_is_assigned() {
+        // ash's order: `redirectsafe` (ash.c:10477) precedes the assignment loop
+        // (10490). Three things turn on it, and all three were wrong here.
+        //
+        // A target that NAMES one of the assignments expands to the value it had
+        // BEFORE the command, so this target is the empty one and the redirection
+        // fails -- taking the builtin with it.
+        let (_, out, _) = run("X=; X=/dev/null echo hi >\"$X\"; echo st=$?");
+        assert_eq!(out, "st=1\n");
+        // The assignment's own expansion runs with the redirection already applied.
+        let (_, out, err) = run("y=$(echo E >&2) true 2>/dev/null; echo done");
+        assert_eq!((out.as_str(), err.as_str()), ("done\n", ""));
+        // A target that fails to EXPAND leaves the old value standing, which is
+        // what an EXIT trap then finds.
+        let (_, out, _) = run("trap 'echo t=[$X]' EXIT; X=old; X=new true >${u:?boom}");
+        assert_eq!(out, "t=[old]\n");
+        // The same for a SPECIAL builtin, whose branch already had this order --
+        // and where the failed redirection is POSIX-fatal, so nothing after it
+        // runs at all.
+        let (_, out, err) = run("X=; X=/dev/null : >\"$X\"; echo st=$?");
+        assert_eq!(out, "");
+        assert!(!err.is_empty(), "expected a redirection diagnostic");
+    }
+
+    #[test]
     fn prefix_assignment_persists_for_special_builtins() {
         // A prefix on a special builtin (`:`) stays set in the current shell.
         let (_, out, _) = run("FOO=bar :; echo \"[${FOO}]\"");
         assert_eq!(out, "[bar]\n");
+    }
+
+    #[test]
+    fn a_failed_redirection_leaves_the_prefix_unexpanded() {
+        // ash `goto out`s at the failure (ash.c:10487) without ever reaching the
+        // assignment loop. Redirecting FIRST is not enough on its own -- the
+        // assignments have to be skipped too, and only a value with a side effect
+        // can tell the two apart, since a rolled-back binding looks the same
+        // either way.
+        let (_status, out, err) =
+            run("A=$(echo SIDE >&2) true >/no/such/td-dir/f; echo after st=$?");
+        assert_eq!(out, "after st=1\n");
+        assert!(!err.contains("SIDE"), "err: {err:?}");
+        // The other tell: an assignment that would ITSELF raise stays silent.
+        let (_status, out, err) =
+            run("readonly B=b; A=1 B=2 true >/no/such/td-dir/f; echo alive st=$?");
+        assert_eq!(out, "alive st=1\n");
+        assert!(!err.contains("read only"), "err: {err:?}");
+    }
+
+    #[test]
+    fn the_redirections_are_restored_however_the_builtin_left() {
+        // `restore_redirs` is unconditional in the applied arm, which only the two
+        // shapes that reach it with an `Err` can show. A non-terminating signal:
+        // if fd 1 stayed on /dev/null, `alive` would vanish rather than fail.
+        let (_status, out, _) = run("f() { command return 3 >/dev/null; }; f; echo alive");
+        assert_eq!(out, "alive\n");
+        // And a terminating one, whose EXIT trap has to reach the real stdout.
+        let (status, out, _) =
+            run("trap 'echo TRAPOUT' EXIT; readonly B=b; B=B2 true >/dev/null; echo unreached");
+        assert_eq!((status, out.as_str()), (2, "TRAPOUT\n"));
+    }
+
+    #[test]
+    fn a_failed_redirection_on_local_is_fatal() {
+        // `local` is special in ash's sense (`spclbltin`) though not in POSIX's,
+        // and that is the set the fatality turns on -- so this aborts where a
+        // regular builtin's failed redirection would only report.
+        let (status, out, err) =
+            run("f() { local X=1 >/no/such/td-dir/f; echo survived; }; f; echo outer");
+        assert_eq!((status, out.as_str()), (1, ""));
+        assert!(!err.is_empty(), "expected a redirection diagnostic");
+        // Not under `command`: ash locks that decision to the command WORD, which
+        // is then `command`, a regular builtin.
+        let (_status, out, _) =
+            run("f() { command local X=1 >/no/such/td-dir/f; echo survived; }; f; echo outer");
+        assert_eq!(out, "survived\nouter\n");
+    }
+
+    #[test]
+    fn command_swallows_its_bodys_abort_but_not_the_prefixs() {
+        // Both surface as an `Abort` and only one is caught: ash re-raises what
+        // `evalcommand` itself raised, so a bad prefix assignment stays fatal.
+        let (status, out, _) = run("A=1 B=${u:?boom} command true; echo after");
+        assert_eq!((status, out.as_str()), (2, ""));
+        // The body's is swallowed -- here with a redirection already applied, so
+        // the restore has to survive the swallow too.
+        let (status, out, _) = run("command shift bad 2>/dev/null; echo after=$?");
+        assert_eq!((status, out.as_str()), (0, "after=2\n"));
+        // An assignment abort under an applied redirection leaves the old value
+        // standing for the EXIT trap, and does not take the trap's stdout with it.
+        let (status, out, _) =
+            run("X=old; trap 'echo t=[$X]' EXIT; A=${u:?boom} true >/dev/null; echo after");
+        assert_eq!((status, out.as_str()), (2, "t=[old]\n"));
     }
 
     #[test]

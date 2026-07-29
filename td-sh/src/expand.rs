@@ -68,6 +68,140 @@ pub fn expand_word_list(sh: &mut Shell, words: &[Word]) -> R<Vec<String>> {
     Ok(out)
 }
 
+/// Split a word at the `name=` its RAW text begins with. ash decides this on the
+/// unexpanded text (`isassignment`, ash.c:6180), so a quote anywhere in the
+/// prefix disqualifies it -- `export "n"=$x` and `export n"="$x` are ordinary
+/// words that field-split, and only a bare `Lit` can carry the name.
+fn assignment_split(w: &Word) -> Option<(String, Word)> {
+    let Some(Seg::Lit(first)) = w.0.first() else {
+        return None;
+    };
+    let eq = first.bytes().position(|b| b == b'=')?;
+    let name = first.get(..eq)?;
+    if !crate::ast::is_name(name) {
+        return None;
+    }
+    let mut rest = Vec::new();
+    match first.get(eq + 1..) {
+        Some(tail) if !tail.is_empty() => rest.push(Seg::Lit(tail.to_string())),
+        _ => {}
+    }
+    rest.extend(w.0.iter().skip(1).cloned());
+    Some((format!("{name}="), Word(rest)))
+}
+
+/// The builtins whose assignment-form operands are expanded as assignments:
+/// ash's `BUILTIN_ASSIGN` table entries (ash.c:10160), the only ones for which
+/// `pseudovarflag` is set.
+fn is_assignment_builtin(word: &str) -> bool {
+    matches!(word, "export" | "readonly" | "local" | "alias")
+}
+
+/// Expand words until at least one field exists, as ash's `fill_arglist`
+/// (ash.c:8839) does. A word can expand to nothing, so "the next field" is not
+/// "the next word", and the command word cannot be resolved until one appears.
+fn fill_fields(
+    sh: &mut Shell,
+    argv: &mut Vec<String>,
+    words: &mut std::slice::Iter<'_, Word>,
+) -> R<bool> {
+    let start = argv.len();
+    for w in words.by_ref() {
+        argv.extend(expand_fields(sh, w)?);
+        if argv.len() > start {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Walk `command`'s options to the word it wraps, as ash's `parse_command_args`
+/// (ash.c:8857) does: `-p` clusters are consumed, `--` ends them, and a bare `-`
+/// is the operand. Any other option letter -- or running out of words -- means
+/// the `command` builtin itself runs and nothing is wrapped, so this answers
+/// `None` and the walk stops.
+fn command_operand(
+    sh: &mut Shell,
+    argv: &mut Vec<String>,
+    words: &mut std::slice::Iter<'_, Word>,
+    head: usize,
+) -> R<Option<usize>> {
+    let mut i = head;
+    loop {
+        if argv.get(i + 1).is_none() && !fill_fields(sh, argv, words)? {
+            return Ok(None);
+        }
+        i += 1;
+        let Some(field) = argv.get(i) else {
+            return Ok(None);
+        };
+        match field.as_bytes().split_first() {
+            Some((b'-', opts)) if !opts.is_empty() => {
+                if opts == b"-" {
+                    if argv.get(i + 1).is_none() && !fill_fields(sh, argv, words)? {
+                        return Ok(None);
+                    }
+                    return Ok(Some(i + 1));
+                }
+                if opts.iter().any(|&c| c != b'p') {
+                    return Ok(None);
+                }
+            }
+            _ => return Ok(Some(i)),
+        }
+    }
+}
+
+/// Expand a simple command's words. Identical to `expand_word_list` except for
+/// the declaration builtins, whose `name=value` operands skip field splitting and
+/// pathname expansion and take tilde expansion after the `=` -- the same handling
+/// a real assignment gets, which is what makes `export n=$(cmd)` keep a value with
+/// a space in it and `export PATH=~/bin` mean what it says. ash cannot decide this
+/// until the command word is expanded and looked up, and neither can this.
+pub fn expand_command_words(sh: &mut Shell, words: &[Word]) -> R<Vec<String>> {
+    let mut argv: Vec<String> = Vec::new();
+    let mut words = words.iter();
+    let mut protect = false;
+    if fill_fields(sh, &mut argv, &mut words)? {
+        let mut head = 0;
+        let mut nofunc = false;
+        // ash's resolution loop (ash.c:10402): follow `command` through its options
+        // to whatever it wraps, however many times it is repeated. Once one has been
+        // followed the lookup drops functions (`DO_NOFUNC`), so `command export`
+        // reaches the builtin past a function of that name -- while a function named
+        // `command` is not the builtin and stops the walk before it starts.
+        while let Some(name) = argv.get(head) {
+            if !nofunc && sh.funcs.contains_key(name.as_str()) {
+                break;
+            }
+            if name != "command" {
+                protect = is_assignment_builtin(name);
+                break;
+            }
+            match command_operand(sh, &mut argv, &mut words, head)? {
+                Some(next) => {
+                    head = next;
+                    nofunc = true;
+                }
+                // `command` is a regular builtin, not an assignment one, so running
+                // it rather than what it wraps protects nothing.
+                None => break,
+            }
+        }
+    }
+    for w in words {
+        if protect {
+            if let Some((name, value)) = assignment_split(w) {
+                let value = expand_assign(sh, &value)?;
+                argv.push(format!("{name}{value}"));
+                continue;
+            }
+        }
+        argv.extend(expand_fields(sh, w)?);
+    }
+    Ok(argv)
+}
+
 /// Expansion in a context that takes exactly one word: a redirection target, a
 /// `case` subject, an assignment value. No splitting, no pathname expansion.
 pub fn expand_single(sh: &mut Shell, w: &Word) -> R<String> {

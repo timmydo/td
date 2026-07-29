@@ -51,7 +51,7 @@ const MAX_ALIAS_EXPANSIONS: u32 = 4096;
 
 /// Reserved words. dash resolves these BEFORE aliases, so `alias if=…` never fires
 /// where a keyword is recognized.
-fn is_reserved(w: &str) -> bool {
+pub fn is_reserved(w: &str) -> bool {
     matches!(
         w,
         "if" | "then"

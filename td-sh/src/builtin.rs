@@ -40,6 +40,7 @@ pub enum Builtin {
     Exec,
     Trap,
     Local,
+    Type,
 }
 
 pub fn lookup(name: &str) -> Option<Builtin> {
@@ -72,6 +73,7 @@ pub fn lookup(name: &str) -> Option<Builtin> {
         "exec" => Builtin::Exec,
         "trap" => Builtin::Trap,
         "local" => Builtin::Local,
+        "type" => Builtin::Type,
         _ => return None,
     })
 }
@@ -99,6 +101,15 @@ pub fn is_special(bi: Builtin) -> bool {
     )
 }
 
+/// ash's `spclbltin` (`IS_BUILTIN_SPECIAL`, ash.c:10419): the POSIX list above
+/// plus `local`. ash decides two things from that one value -- whether a
+/// redirection error is fatal (10484) and whether the prefix assignments get a
+/// local frame (10420) -- so both call sites read it here rather than each
+/// restating the exception.
+pub fn is_ash_special(bi: Builtin) -> bool {
+    is_special(bi) || matches!(bi, Builtin::Local)
+}
+
 /// Whether this command WORD blocks the local-var frame `evalcommand` pushes.
 /// ash's `spclbltin` set: the POSIX list above, plus `local` itself -- which is
 /// what keeps a top-level `local` an error rather than a frame that authorises
@@ -106,8 +117,7 @@ pub fn is_special(bi: Builtin) -> bool {
 /// not implement, so without naming them here they reach the external path and are
 /// framed. Taken by word, not by `Builtin`, so those two can be named at all.
 pub fn blocks_localvar_frame(word: &str) -> bool {
-    lookup(word).is_some_and(|bi| is_special(bi) || matches!(bi, Builtin::Local))
-        || matches!(word, "source" | "times")
+    lookup(word).is_some_and(is_ash_special) || matches!(word, "source" | "times")
 }
 
 pub fn run(sh: &mut Shell, bi: Builtin, argv: &[String]) -> R<()> {
@@ -134,6 +144,7 @@ pub fn run(sh: &mut Shell, bi: Builtin, argv: &[String]) -> R<()> {
         Builtin::Pwd => pwd(sh, argv),
         Builtin::Dot => dot(sh, argv),
         Builtin::Command => command(sh, argv),
+        Builtin::Type => type_of(sh, argv),
         Builtin::Wait => ok(sh),
         Builtin::Alias => alias(sh, argv),
         Builtin::Unalias => unalias(sh, argv),
@@ -1463,9 +1474,10 @@ fn export(sh: &mut Shell, argv: &[String], readonly: bool) -> R<()> {
             options = false;
             continue;
         }
-        // dash's nextopt knows only `-p` here, and reads a cluster letter by
-        // letter, so `-px` reports the `x`. An unknown one is fatal: that is what
-        // makes bash's `export -n` end a dash script rather than warn.
+        // ash reads the cluster letter by letter and an unknown one is fatal, so
+        // `export -px` is a usage error here. dash instead calls `nextopt` ONCE
+        // and never looks at the rest, so `-px` lists and exits 0; this follows
+        // ash. (`-n`, which ash also takes, is not implemented yet.)
         if options && arg.len() > 1 && arg.starts_with('-') {
             // A plain loop, not a search combinator: this source is embedded
             // verbatim in the td-sh recipe, whose ladder guard rejects that tool's
@@ -1508,8 +1520,50 @@ fn export(sh: &mut Shell, argv: &[String], readonly: bool) -> R<()> {
             }
         }
     }
-    let _ = any;
-    ok(sh)
+    if any {
+        return ok(sh);
+    }
+    // No operands: list. ash returns the moment it has one, so `export -p NAME`
+    // prints nothing at all -- its own source notes bash differs there.
+    let mut listed: Vec<(&str, Option<&str>)> = sh
+        .vars
+        .iter()
+        .filter(|(_, v)| if readonly { v.readonly } else { v.exported })
+        .map(|(n, v)| (n.as_str(), v.value.as_deref()))
+        .collect();
+    listed.sort_by(|a, b| a.0.cmp(b.0));
+    let mut text = String::new();
+    for (name, value) in &listed {
+        // ash prints only the part of the name that IS a name and then drops the
+        // value (`endofname`, ash.c:11580), so an environment entry like
+        // `test-test=v` cannot turn the listing into something `eval` chokes on.
+        // A valueless name prints bare for the same reason: `eval` must restore
+        // the attribute without inventing a value the name does not have.
+        // Bytes, not chars: this is an index into `name` below, and a char count
+        // only happens to be one while every accepted char is ASCII.
+        let end = match name.as_bytes().first() {
+            Some(&b) if b == b'_' || b.is_ascii_alphabetic() => name
+                .bytes()
+                .position(|b| b != b'_' && !b.is_ascii_alphanumeric())
+                .unwrap_or(name.len()),
+            _ => 0,
+        };
+        text.push_str(cmd);
+        text.push(' ');
+        text.push_str(name.get(..end).unwrap_or(""));
+        if let Some(v) = value.filter(|_| end == name.len()) {
+            text.push('=');
+            text.push_str(&single_quote(v));
+        }
+        text.push('\n');
+    }
+    if text.is_empty() {
+        // ash reaches `out1fmt` zero times and returns 0. Writing an empty buffer
+        // instead would report the write error a CLOSED stdout gives back, so
+        // `readonly -p >&-` with nothing readonly would fail where ash succeeds.
+        return ok(sh);
+    }
+    out(sh, text.as_bytes())
 }
 
 /// `local [name[=value]... | -]`, dash's. Not POSIX, but dash, busybox ash and
@@ -2413,40 +2467,194 @@ fn dot(sh: &mut Shell, argv: &[String]) -> R<()> {
     }
 }
 
+/// Where a name would be located on `PATH`, spelled the way ash spells it: the
+/// element JOINED to the name rather than a resolved path (`padvance`), an EMPTY
+/// element contributing nothing, and only a stat -- ash checks the execute bit
+/// when a command RUNS, not when it is described.
+fn describe_path(sh: &Shell, name: &str, path: Option<&str>) -> Option<String> {
+    if name.contains('/') {
+        // A name with a slash is answered as given, and merely has to EXIST --
+        // `DO_ABS` stats it and does not ask what it is, so a directory answers.
+        return sh.resolve(name).exists().then(|| name.to_string());
+    }
+    let owned;
+    let path = match path {
+        Some(p) => p,
+        None => {
+            owned = sh.get_var("PATH").unwrap_or_default();
+            &owned
+        }
+    };
+    for dir in path.split(':') {
+        let joined = if dir.is_empty() {
+            name.to_string()
+        } else {
+            format!("{dir}/{name}")
+        };
+        if sh.resolve(&joined).is_file() {
+            return Some(joined);
+        }
+    }
+    None
+}
+
+/// One name's line of ash's `describe_command` (ash.c:8734), with its status.
+/// Keywords first, then aliases, then the command lookup -- so `alias q=w` on top
+/// of a function named `q` reports the alias, and no alias can hide `while`.
+fn describe_one(sh: &Shell, name: &str, verbose: bool, path: Option<&str>) -> (String, i32) {
+    let mut text = String::new();
+    if verbose {
+        text.push_str(name);
+    }
+    if crate::parser::is_reserved(name) {
+        text.push_str(if verbose { " is a shell keyword" } else { name });
+    } else if let Some(value) = sh.aliases.get(name) {
+        if !verbose {
+            // The brief form prints a definition that can be read back, and
+            // returns without the trailing name the other answers carry.
+            return (format!("alias {name}={}\n", single_quote(value)), 0);
+        }
+        text.push_str(" is an alias for ");
+        text.push_str(value);
+    } else if sh.funcs.contains_key(name) {
+        text.push_str(if verbose { " is a function" } else { name });
+    } else if lookup(name).is_some() {
+        if verbose {
+            // ash's `IS_BUILTIN_SPECIAL` set is exactly the set that blocks the
+            // local-var frame, `local` included.
+            text.push_str(if blocks_localvar_frame(name) {
+                " is a special shell builtin"
+            } else {
+                " is a shell builtin"
+            });
+        } else {
+            text.push_str(name);
+        }
+    } else if let Some(found) = describe_path(sh, name, path) {
+        if verbose {
+            text.push_str(" is ");
+        }
+        text.push_str(&found);
+    } else {
+        // The verbose form says so on STDOUT, not stderr, and the brief form says
+        // nothing at all; both are 127.
+        let text = if verbose {
+            format!("{name}: not found\n")
+        } else {
+            String::new()
+        };
+        return (text, 127);
+    }
+    text.push('\n');
+    (text, 0)
+}
+
+/// Describe each name, answering the worst status any of them gave.
+fn describe(sh: &mut Shell, names: &[String], verbose: bool, path: Option<&str>) -> R<()> {
+    let mut text = String::new();
+    let mut code = 0;
+    for name in names {
+        let (line, one) = describe_one(sh, name, verbose, path);
+        text.push_str(&line);
+        code |= one;
+    }
+    if text.is_empty() {
+        return status(sh, code);
+    }
+    out(sh, text.as_bytes())?;
+    // ash ORS a write failure into whatever the description answered
+    // (`exitstatus |= ferror(stdout)`), so `type cd >&-` is 1 while `type zz >&-`
+    // is still 127 -- the failure does not outrank the answer, it joins it.
+    let write_failed = i32::from(sh.status != 0);
+    sh.set_status(code | write_failed);
+    Ok(())
+}
+
+/// `type name...`: ash's `typecmd`. A FIRST argument beginning with `-` turns the
+/// verbose wording off and is otherwise ignored -- ash never asks WHICH option it
+/// was, so `type -p` and `type -x` are the same request.
+fn type_of(sh: &mut Shell, argv: &[String]) -> R<()> {
+    let mut i = 1usize;
+    let mut verbose = true;
+    if argv.get(1).is_some_and(|a| a.starts_with('-')) {
+        i = 2;
+        verbose = false;
+    }
+    describe(sh, argv.get(i..).unwrap_or(&[]), verbose, None)
+}
+
 /// `command name args`: run `name` as an external/builtin, bypassing functions.
 /// The `-v`/`-V` query forms are supported enough for scripts that probe.
 fn command(sh: &mut Shell, argv: &[String]) -> R<()> {
     let mut i = 1usize;
-    let mut query = false;
-    while let Some(arg) = argv.get(i) {
-        match arg.as_str() {
-            "-v" | "-V" => query = true,
-            "-p" => {}
-            "--" => {
-                i += 1;
+    let mut exec_path = false;
+    // ash's `evalcommand` loop collapses `command` wrappers before dispatching, and
+    // the path `-p` sets persists across them into the EXECUTION lookup -- while a
+    // query option ends the walk and `commandcmd` re-parses from THERE with its own
+    // fresh path. That asymmetry is why `command -p command X` refuses to run an X
+    // that is only on PATH, and `command -p command -v X` reports one.
+    let (query, verbose, query_path) = loop {
+        let mut query = false;
+        let mut verbose = false;
+        let mut level_path = false;
+        // `nextopt("pvV")`: letters cluster in one word, `--` ends them, a bare `-`
+        // is an operand. An unknown letter is a usage error -- but `command` is a
+        // REGULAR builtin, so it is status 2 and the shell lives, unlike `export`'s.
+        while let Some(arg) = argv.get(i) {
+            let Some(opts) = arg.strip_prefix('-').filter(|o| !o.is_empty()) else {
+                break;
+            };
+            i += 1;
+            if opts == "-" {
                 break;
             }
-            s if s.starts_with('-') && s.len() > 1 => {}
-            _ => break,
+            // A plain loop, not a search combinator: this source is embedded
+            // verbatim in the td-sh recipe, whose ladder guard rejects that tool's
+            // bare name as a token (see the note in arith.rs).
+            let mut bad = None;
+            for c in opts.chars() {
+                match c {
+                    // `-V` only ever SETS the verbose wording, so `-vV` and `-Vv`
+                    // are both verbose: ash ors the bit in and `-v` never clears it.
+                    'v' => query = true,
+                    'V' => {
+                        query = true;
+                        verbose = true;
+                    }
+                    'p' => level_path = true,
+                    _ => {
+                        bad = Some(c);
+                        break;
+                    }
+                }
+            }
+            if let Some(c) = bad {
+                err_line(sh, &format!("td-sh: command: Illegal option -{c}"));
+                return status(sh, 2);
+            }
         }
-        i += 1;
-    }
+        exec_path |= level_path;
+        if !query && argv.get(i).is_some_and(|n| n == "command") {
+            i += 1;
+            continue;
+        }
+        break (query, verbose, level_path);
+    };
     let rest: Vec<String> = argv.iter().skip(i).cloned().collect();
     let Some(name) = rest.first() else {
         return ok(sh);
     };
     if query {
-        // A builtin or function reports its bare name; an external reports its
-        // resolved path; an unresolved name fails silently.
-        // `out` sets `$?` (0, or 1 on write error); do not overwrite it.
-        if crate::process::is_builtin(name) || sh.funcs.contains_key(name) {
-            return out(sh, format!("{name}\n").as_bytes());
-        }
-        if let Some(path) = crate::process::resolve_program(sh, name) {
-            return out(sh, format!("{}\n", path.display()).as_bytes());
-        }
-        return status(sh, 1);
+        // Only the FIRST operand is described; the rest are ash's `argptr` tail and
+        // go unread.
+        let one = [name.clone()];
+        let path = query_path.then_some(crate::process::DEFAULT_UTILITY_PATH);
+        return describe(sh, &one, verbose, path);
     }
+    // `-p` moves only the LOOKUP, and it has to move the query and the execution
+    // together at one level, or `command -pv` describes what `command -p` will not
+    // run.
+    let path = exec_path.then_some(crate::process::DEFAULT_UTILITY_PATH);
     if let Some(bi) = lookup(name) {
         // POSIX: `command` strips a builtin's special properties, which in dash
         // means the builtin runs inside a scratch local frame -- which is why
@@ -2472,7 +2680,7 @@ fn command(sh: &mut Shell, argv: &[String]) -> R<()> {
         sh.locals = saved;
         return result;
     }
-    crate::process::exec_external(sh, &rest, &[])
+    crate::process::exec_external(sh, &rest, path)
 }
 
 // ---- test / [ ------------------------------------------------------------
@@ -3465,7 +3673,14 @@ mod tests {
     fn an_unknown_option_to_export_or_readonly_is_fatal() {
         // bash's `export -n` is not dash's, and on a special builtin an unknown
         // option ends the script.
-        for src in ["export -n undef; echo reached", "readonly -q x; echo reached"] {
+        for src in [
+            "export -n undef; echo reached",
+            "readonly -q x; echo reached",
+            // ash reads the WHOLE cluster, so a bad letter after a good one is
+            // still fatal. dash calls nextopt once and would list and exit 0.
+            "export -px; echo reached",
+            "readonly -pq; echo reached",
+        ] {
             let (status, out, err) = run_capturing(src);
             assert_eq!((status, out.as_str()), (2, ""), "{src}");
             assert!(err.contains("Illegal option"), "{src}: {err:?}");
@@ -3473,6 +3688,296 @@ mod tests {
         // `-p` and `--` stay options, and everything after `--` is a name.
         let (status, out, _) = run_capturing("export -p; readonly -- a=1; echo \"[$a]\"");
         assert_eq!((status, out.as_str()), (0, "[1]\n"));
+    }
+
+    #[test]
+    fn a_declaration_builtins_assignment_operand_is_not_field_split() {
+        // ash's `pseudovarflag` (ash.c:10416): for these four, a word whose RAW
+        // text starts `name=` is expanded as an assignment -- no splitting, no
+        // globbing, and tilde after the `=` and after each unquoted `:`.
+        for (src, want) in [
+            ("x='a b'; export n=$x; echo \"[$n]\"", "[a b]\n"),
+            ("x='a b'; readonly n=$x; echo \"[$n]\"", "[a b]\n"),
+            ("x='a b'; f() { local n=$x; echo \"[$n]\"; }; f", "[a b]\n"),
+            // `command` defers the decision to the word after it, as ash does.
+            ("x='a b'; command export n=$x; echo \"[$n]\"", "[a b]\n"),
+            // ... however many times it is repeated, and through `-p`, `--` and a
+            // cluster, which is where ash's loop goes round again.
+            ("x='a b'; command command export n=$x; echo \"[$n]\"", "[a b]\n"),
+            ("x='a b'; command -p export n=$x; echo \"[$n]\"", "[a b]\n"),
+            ("x='a b'; command -pp export n=$x; echo \"[$n]\"", "[a b]\n"),
+            ("x='a b'; command -- export n=$x; echo \"[$n]\"", "[a b]\n"),
+            // The wrapper need not be one word, or one field per word: ash resolves
+            // FIELDS, expanding only as many words as it takes to get one.
+            (
+                "x='a b'; set -- command -p; \"$@\" export n=$x; echo \"[$n]\"",
+                "[a b]\n",
+            ),
+            ("x='a b'; e=; command $e export n=$x; echo \"[$n]\"", "[a b]\n"),
+            // An option `command` does not take, or a bare `-`, means `command`
+            // itself runs -- and it is a regular builtin, so nothing is spared.
+            ("x='a b'; command -pv export n=$x; echo \"[$n]\"", "export\n[]\n"),
+            ("x='a b'; command -x export n=$x 2>/dev/null; echo \"[$n]\"", "[]\n"),
+            ("x='a b'; command - export n=$x 2>/dev/null; echo \"[$n]\"", "[]\n"),
+            // A function named `command` is not the builtin, so the walk never
+            // starts and all three fields reach it.
+            (
+                "x='a b'; command() { echo \"[$#]\"; }; command export n=$x",
+                "[3]\n",
+            ),
+            // ... while past one `command` the lookup drops functions, so a
+            // function named `export` no longer shadows the builtin.
+            (
+                "x='a b'; export() { echo F; }; command export n=$x; echo \"[$n]\"",
+                "[a b]\n",
+            ),
+            // Several operands, and only the assignment-shaped ones are spared.
+            ("x='a b'; export a=1 n=$x b=2; echo \"[$a][$n][$b]\"", "[1][a b][2]\n"),
+            // HOME after `=` and after an unquoted `:`, which plain assignment
+            // already did and these did not.
+            ("HOME=/h; export n=~/x; echo \"[$n]\"", "[/h/x]\n"),
+            ("HOME=/h; export n=a:~/x; echo \"[$n]\"", "[a:/h/x]\n"),
+            // `alias` is the fourth, and the only one that is not special.
+            ("x='a b'; alias n=$x; alias n", "n='a b'\n"),
+            // NOT an assignment: ash tests the unexpanded text, so quoting any
+            // part of `name=` puts the word back under ordinary splitting --
+            // including the `=` itself, which is why all three of these split.
+            ("x='a b'; export \"n\"=$x; echo \"[$n]\"", "[a]\n"),
+            ("x='a b'; export n\"=\"$x; echo \"[$n]\"", "[a]\n"),
+            ("x='a b'; export \"n=\"$x; echo \"[$n]\"", "[a]\n"),
+            // Nor is a word whose prefix is not a NAME. Only `alias` shows it:
+            // `export` rejects the name either way, so the split is invisible
+            // there, but an alias may be called `a-b` and the stray field lands
+            // as a second operand.
+            ("x='a b'; alias a-b=$x 2>/dev/null; alias a-b", "a-b='a'\n"),
+            // ... and a word that only BECOMES `name=` after expansion never was.
+            ("x='n=a b'; export $x; echo \"[$n]\"", "[a]\n"),
+            // The name ends at the FIRST `=`; the rest is value, `=` and all.
+            ("x='p q'; export n=a=$x; echo \"[$n]\"", "[a=p q]\n"),
+            // A function of the name is not the builtin and gets no such rule.
+            ("x='a b'; export() { echo \"[$#]\"; }; export n=$x", "[2]\n"),
+            // An ordinary command is untouched -- including one that merely has a
+            // declaration builtin's name among its LATER words, since the command
+            // word is resolved once and nothing re-decides it.
+            ("x='a b'; f() { echo \"[$#]\"; }; f n=$x", "[2]\n"),
+            ("x='a b'; f() { echo \"[$#]\"; }; f export n=$x", "[3]\n"),
+            ("x='a b'; printf '[%s]' export n=$x; echo", "[export][n=a][b]\n"),
+            // The walk stops at the FIRST field that is not `command`, even when
+            // one word carried several and a later one names a declaration builtin.
+            (
+                "x='a b'; set -- printf '[%s]' export; \"$@\" n=$x; echo",
+                "[export][n=a][b]\n",
+            ),
+        ] {
+            let (_, out, err) = run_capturing(src);
+            assert_eq!(out, want, "{src}: {err}");
+        }
+    }
+
+    #[test]
+    fn type_describes_what_a_name_is() {
+        // ash's `describe_command` wording, and its order: keyword, then alias,
+        // then the command lookup -- so an alias outranks a function of the name
+        // and nothing can hide a keyword.
+        for (src, want) in [
+            ("type while", "while is a shell keyword\n"),
+            ("type cd", "cd is a shell builtin\n"),
+            ("type eval", "eval is a special shell builtin\n"),
+            // ash's special set includes `local`, which POSIX's does not.
+            ("type local", "local is a special shell builtin\n"),
+            ("alias q='ls -l'; type q", "q is an alias for ls -l\n"),
+            ("q() { :; }; alias q=w; type q", "q is an alias for w\n"),
+            ("f() { :; }; type f", "f is a function\n"),
+            // A function outranks the BUILTIN of the same name, which is the
+            // other half of the ordering the alias case pins.
+            ("cd() { :; }; type cd", "cd is a function\n"),
+            (
+                "type while cd",
+                "while is a shell keyword\ncd is a shell builtin\n",
+            ),
+        ] {
+            let (status, out, err) = run_capturing(src);
+            assert_eq!((status, out.as_str()), (0, want), "{src}: {err}");
+        }
+    }
+
+    #[test]
+    fn type_answers_a_path_as_given() {
+        // cargo runs a test with the package root as its cwd, so these exist.
+        // A name with a slash is answered AS GIVEN and merely has to EXIST: ash
+        // stats it and does not ask whether it is executable, or even a file.
+        assert_eq!(
+            run_capturing("type ./Cargo.toml").1,
+            "./Cargo.toml is ./Cargo.toml\n"
+        );
+        assert_eq!(run_capturing("type ./src").1, "./src is ./src\n");
+        assert_eq!(run_capturing("type ./no-such-td-sh").0, 127);
+        // A PATH element is JOINED to the name rather than resolved, and an empty
+        // element contributes nothing at all -- `plain`, not `./plain`.
+        assert_eq!(
+            run_capturing("PATH=. type Cargo.toml").1,
+            "Cargo.toml is ./Cargo.toml\n"
+        );
+        assert_eq!(
+            run_capturing("PATH= type Cargo.toml").1,
+            "Cargo.toml is Cargo.toml\n"
+        );
+        // A trailing slash is not normalised away -- it is concatenation, not a
+        // path join, which is the only thing that tells the two apart.
+        assert_eq!(
+            run_capturing("PATH=./ type Cargo.toml").1,
+            "Cargo.toml is .//Cargo.toml\n"
+        );
+    }
+
+    #[test]
+    fn type_reports_a_name_it_cannot_place() {
+        // The verbose form says so on STDOUT, not stderr, and answers 127.
+        let (status, out, err) = run_capturing("type td_sh_zz");
+        assert_eq!(
+            (status, out.as_str(), err.as_str()),
+            (127, "td_sh_zz: not found\n", "")
+        );
+        // The worst status wins, and the names that DID place still print.
+        let (status, out, _) = run_capturing("type cd td_sh_zz cd");
+        assert_eq!(status, 127);
+        assert_eq!(
+            out,
+            "cd is a shell builtin\ntd_sh_zz: not found\ncd is a shell builtin\n"
+        );
+        // No names at all is silence and 0.
+        assert_eq!(run_capturing("type"), (0, String::new(), String::new()));
+        // Nothing to say and a CLOSED stdout is still 0: ash writes nothing at
+        // all, where writing an empty buffer would report the closed descriptor.
+        assert_eq!(run_capturing("type >&-").0, 0);
+        // A write failure is ORED into the answer rather than replacing it: a name
+        // that could not be placed is still 127 when the write failed too, and a
+        // name that WAS placed becomes 1.
+        assert_eq!(run_capturing("type td_sh_zz >&-").0, 127);
+        assert_eq!(run_capturing("type cd >&-").0, 1);
+        assert_eq!(run_capturing("type cd td_sh_zz >&-").0, 127);
+    }
+
+    #[test]
+    fn types_first_option_only_turns_the_wording_off() {
+        // ash never asks WHICH option it was, so these are one request; and only
+        // the FIRST argument is read as an option, so the second `-p` is a name
+        // that cannot be placed -- silently, since the wording is off.
+        for src in ["type -p cd", "type -- cd", "type -x cd"] {
+            assert_eq!(run_capturing(src).1, "cd\n", "{src}");
+        }
+        assert_eq!(run_capturing("type -p -p"), (127, String::new(), String::new()));
+        // A bare `-` IS that first option: ash tests the first byte and never
+        // asks how long the word is, so it is not a name that cannot be placed.
+        assert_eq!(run_capturing("type -"), (0, String::new(), String::new()));
+        assert_eq!(run_capturing("type - cd").1, "cd\n");
+        assert_eq!(run_capturing("type -p td_sh_zz"), (127, String::new(), String::new()));
+    }
+
+    #[test]
+    fn command_v_and_big_v_answer_as_type_does() {
+        assert_eq!(run_capturing("command -v while").1, "while\n");
+        assert_eq!(
+            run_capturing("command -V while").1,
+            "while is a shell keyword\n"
+        );
+        // The brief form of an alias prints a definition that reads back, and no
+        // trailing name -- the one answer that is not just `type`'s with the
+        // wording removed.
+        assert_eq!(
+            run_capturing("alias q='ls -l'; command -v q").1,
+            "alias q='ls -l'\n"
+        );
+        assert_eq!(
+            run_capturing("alias q='ls -l'; command -V q").1,
+            "q is an alias for ls -l\n"
+        );
+        // `-V` only ever SETS the verbose wording: `-v` after it cannot clear it.
+        for src in ["command -vV export", "command -Vv export", "command -VV export"] {
+            assert_eq!(
+                run_capturing(src).1,
+                "export is a special shell builtin\n",
+                "{src}"
+            );
+        }
+        // Only the FIRST operand is described.
+        assert_eq!(run_capturing("command -v cd echo").1, "cd\n");
+        // A query ENDS the walk: `command` is then the name being described, not
+        // a wrapper to look through, so this describes `command` and runs nothing.
+        assert_eq!(run_capturing("command -v command echo").1, "command\n");
+        assert_eq!(
+            run_capturing("command -V command echo").1,
+            "command is a shell builtin\n"
+        );
+    }
+
+    #[test]
+    fn command_p_moves_the_lookup_and_only_the_lookup() {
+        // ash's `bb_default_path`. Both halves have to move together: a query that
+        // searched a different path from the execution would describe a command
+        // that is not the one `command -p` runs.
+        let probe = "td_sh_no_such_utility_69";
+        assert_eq!(run_capturing(&format!("command -p {probe}")).0, 127);
+        assert_eq!(run_capturing(&format!("command -pv {probe}")).0, 127);
+        assert_eq!(
+            run_capturing(&format!("command -pV {probe}")).1,
+            format!("{probe}: not found\n")
+        );
+        // ... and PATH is what they stop reading: a name that IS on PATH is found
+        // without `-p` and not with it.
+        let src = "PATH=. command -v Cargo.toml";
+        assert_eq!(run_capturing(src).1, "./Cargo.toml\n");
+        assert_eq!(run_capturing("PATH=. command -pv Cargo.toml").0, 127);
+        // `-p` reaches a BUILTIN regardless -- it is a path, not a bypass -- and
+        // leaves the variable a child would inherit alone.
+        assert_eq!(run_capturing("command -pv cd").1, "cd\n");
+        assert_eq!(run_capturing("PATH=. command -p echo hi").1, "hi\n");
+        assert_eq!(run_capturing("PATH=zz; command -p :; echo $PATH").1, "zz\n");
+        // `type` has no such option: its lone flag only turns the wording off.
+        assert_eq!(run_capturing("PATH=. type -p Cargo.toml").1, "./Cargo.toml\n");
+        // `-p` counts wherever it sits in the cluster, including after a query
+        // letter -- the two are read independently.
+        for src in ["command -vp Cargo.toml", "command -Vp Cargo.toml"] {
+            assert_eq!(run_capturing(&format!("PATH=. {src}")).0, 127, "{src}");
+        }
+        // The constant itself, since no host-independent case can tell it from
+        // dash's `_PATH_STDPATH`: ash's `bb_default_path` is `BB_PATH_ROOT_PATH`
+        // (libbb.h) less its `/sbin` pair, with the `BB_ADDITIONAL_PATH` hook that
+        // appends to it left empty in the reference binary.
+        assert_eq!(crate::process::DEFAULT_UTILITY_PATH, "/bin:/usr/bin");
+    }
+
+    #[test]
+    fn command_reads_its_options_as_a_cluster() {
+        // `nextopt("pvV")`, so `-pv` is two options and not an unknown one.
+        for src in ["command -pv export", "command -v export"] {
+            let (status, out, err) = run_capturing(src);
+            assert_eq!((status, out.as_str()), (0, "export\n"), "{src}: {err}");
+        }
+        // `-V` reads as a cluster too. What that costs is asserted and nothing
+        // else: td-sh's `-V` still answers as `-v` does, and ash's wording (`export
+        // is a special shell builtin`) is `describe_command`'s whole output table,
+        // which is a separate increment. Pinning either spelling here would pin the
+        // part this test is not about.
+        let (status, out, err) = run_capturing("command -Vp export");
+        assert_eq!((status, err.as_str()), (0, ""), "{out:?}");
+        assert!(!out.is_empty(), "-Vp described nothing");
+        // An unknown letter is a usage error -- but `command` is REGULAR, so the
+        // shell survives it, unlike `export -x`.
+        let (status, out, err) = run_capturing("command -x export n=1; echo \"after=$?\"");
+        assert_eq!((status, out.as_str()), (0, "after=2\n"), "{err}");
+        assert!(err.contains("Illegal option -x"), "{err:?}");
+        // A name that resolves to nothing is 127, not 1: `command -v` reports what
+        // `describe_command` returns.
+        assert_eq!(run_capturing("command -v td_sh_no_such_thing").0, 127);
+        // `--` and a bare `-` end the options; the second is then an operand.
+        assert_eq!(run_capturing("command -v -- export").1, "export\n");
+        assert_eq!(run_capturing("command -- true; echo st=$?").1, "st=0\n");
+        // No operand at all is a no-op, not an error.
+        for src in ["command", "command -p", "command --", "command -v"] {
+            let (status, out, err) = run_capturing(src);
+            assert_eq!((status, out.as_str()), (0, ""), "{src}: {err}");
+        }
     }
 
     #[test]
@@ -3861,7 +4366,7 @@ mod tests {
         assert_eq!(run_capturing("command -v echo").1, "echo\n");
         assert_eq!(
             run_capturing("command -v no_such_cmd_xyz; echo $?").1,
-            "1\n"
+            "127\n"
         );
     }
 
@@ -4119,6 +4624,73 @@ mod tests {
         assert_eq!(run_capturing("trap 'exit 42' EXIT\nexit 3").0, 42);
         // ... and outside a trap a bare `exit` still reports the last command.
         assert_eq!(run_capturing("false\nexit").0, 1);
+    }
+
+    #[test]
+    fn export_p_lists_sorted_and_single_quoted() {
+        // ash's `showvars`: one line per name in lexicographic order, the value
+        // single-quoted, and no `=` at all for a name that has no value.
+        for (src, want) in [
+            ("export a=1; export b; export -p", "export a='1'\nexport b\n"),
+            // Sorted, not insertion-ordered -- the table is a hash.
+            ("export z=1; export a=2; export -p", "export a='2'\nexport z='1'\n"),
+            // Bare `export` is the same listing; `-p` only suppresses nothing.
+            ("export z=1; export a=2; export", "export a='2'\nexport z='1'\n"),
+            ("export z=1; export a=2; export -pp", "export a='2'\nexport z='1'\n"),
+            // `--` ends the options and is NOT an operand, so this still lists.
+            ("export z=1; export a=2; export --", "export a='2'\nexport z='1'\n"),
+            ("export e=; export -p", "export e=''\n"),
+            // The value goes in raw: single quotes are literal for everything but
+            // a quote, which closes and re-opens around a `"`-quoted run.
+            ("export s='a\\b$c'; export -p", "export s='a\\b$c'\n"),
+            ("export q=\"it's\"; export -p", "export q='it'\"'\"'s'\n"),
+            ("export n='x\ny'; export -p", "export n='x\ny'\n"),
+            // Nothing exported, so nothing listed -- not a blank line.
+            ("a=1; export -p", ""),
+            // `unset` of an exported name takes the attribute, so it drops out.
+            ("export a=A; unset a; export -p", ""),
+        ] {
+            let (status, out, err) = run_capturing(src);
+            assert_eq!((status, out.as_str()), (0, want), "{src}: {err}");
+        }
+    }
+
+    #[test]
+    fn readonly_p_lists_only_readonly_names() {
+        for (src, want) in [
+            ("readonly r=5; readonly -p", "readonly r='5'\n"),
+            ("readonly r=5; readonly", "readonly r='5'\n"),
+            ("readonly r=5; readonly --", "readonly r='5'\n"),
+            // Nothing readonly is a listing of nothing, which is NOT a write --
+            // so a closed stdout is not an error the way a real line would be.
+            ("export a=1; readonly -p >&-; echo rc=$?", "rc=0\n"),
+            // The two attributes are listed by two different builtins, and a name
+            // carrying both appears under each.
+            ("export a=1; readonly a; readonly -p", "readonly a='1'\n"),
+            ("export a=1; readonly a; export -p", "export a='1'\n"),
+            ("export a=1; readonly -p", ""),
+            ("readonly r; readonly -p", "readonly r\n"),
+        ] {
+            let (status, out, err) = run_capturing(src);
+            assert_eq!((status, out.as_str()), (0, want), "{src}: {err}");
+        }
+    }
+
+    #[test]
+    fn an_operand_suppresses_the_listing() {
+        // ash's `exportcmd` returns as soon as it has one operand, so `-p` with a
+        // name prints nothing -- its own comment records that bash differs.
+        for src in [
+            "export a=1 b=2; export -p a",
+            "export a=1; export -p a",
+            "readonly r=5; readonly -p r",
+            // The option is read letter by letter, so a repeat is still just `-p`
+            // -- and still loses to the operand.
+            "export a=1; export -pp a",
+        ] {
+            let (status, out, err) = run_capturing(src);
+            assert_eq!((status, out.as_str()), (0, ""), "{src}: {err}");
+        }
     }
 
     #[test]

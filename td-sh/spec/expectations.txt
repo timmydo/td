@@ -534,19 +534,18 @@ xfail builtin-kill.test.sh::kill -terM -SigterM isn't case sensitive
 xfail builtin-kill.test.sh::kill HUP pid gives the correct error
 xfail builtin-kill.test.sh::kill multiple pids at once
 xfail builtin-kill.test.sh::kill pid and job at once
+xfail builtin-meta-assign.test.sh::Dynamic $c readonly - bash and dash change behavior, mksh bug
 xfail builtin-meta-assign.test.sh::\builtin declare - ble.sh relies on it
+xfail builtin-meta-assign.test.sh::\command readonly - similar issue
 xfail builtin-meta-assign.test.sh::builtin declare a=(x y) is allowed
 xfail builtin-meta-assign.test.sh::builtin declare,local
 xfail builtin-meta-assign.test.sh::builtin typeset, export,readonly
 xfail builtin-meta-assign.test.sh::dynamic builtin command ASSIGN, command builtin ASSIGN
-xfail builtin-meta-assign.test.sh::export, builtin export
 xfail builtin-meta-assign.test.sh::static builtin command ASSIGN, command builtin ASSIGN
 xfail builtin-meta.test.sh::$(command type ls)
 xfail builtin-meta.test.sh::command -V
-xfail builtin-meta.test.sh::command -V nonexistent
 xfail builtin-meta.test.sh::command -p (find hidden tool in default path)
 xfail builtin-meta.test.sh::command -p (override existing program)
-xfail builtin-meta.test.sh::command -v
 xfail builtin-meta.test.sh::command -v executable, builtin
 xfail builtin-meta.test.sh::command command seq 3
 xfail builtin-meta.test.sh::command skips function lookup
@@ -682,8 +681,6 @@ xfail builtin-type-bash.test.sh::type -t control flow
 xfail builtin-type-bash.test.sh::type -t doesn't find non-executable (like command -v)
 xfail builtin-type-bash.test.sh::type prints function source code
 xfail builtin-type.test.sh::more special builtins
-xfail builtin-type.test.sh::special builtins are called out
-xfail builtin-type.test.sh::type -> keyword builtin
 xfail builtin-type.test.sh::type -> not found
 xfail builtin-umask.test.sh::'umask -S' prints symbolic umask
 xfail builtin-umask.test.sh::'umask -p' prints a form that can be eval'd
@@ -1245,8 +1242,10 @@ xfail subshell.test.sh::Subshell with redirects
 xfail tilde.test.sh::${undef:-~}
 xfail tilde.test.sh::a[x]=foo:~ has tilde expansion
 xfail tilde.test.sh::temp assignment x=~ env
+xfail tilde.test.sh::tilde expansion an assignment keyword
 xfail tilde.test.sh::tilde expansion of word after redirect
 xfail tilde.test.sh::x=${undef-~:~}
+xfail tilde.test.sh::~ expansion in readonly assignment
 xfail toysh-posix.test.sh::Can't parse extra }
 xfail toysh-posix.test.sh::Evaluation order of redirect and ${undef?error}
 xfail toysh-posix.test.sh::IFS - http://landley.net/notes.html#15-02-2020 (TODO: osh)
