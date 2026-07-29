@@ -438,9 +438,10 @@ pub fn fork_shell(sh: &Shell) -> Shell {
         logical_cwd: sh.logical_cwd.clone(),
         fds: sh.fds.clone(),
         localvar_depth: sh.localvar_depth,
-        // A clone unwinds only what it declares itself; the caller's frame belongs
-        // to the shell that keeps running.
-        locals: Vec::new(),
+        // Carried, not dropped: a fork copies the frame, so a subshell is still
+        // inside it and a `local` there for a name the function already declared
+        // is a REPEAT. Restoring these only ever touches the clone's own map.
+        locals: sh.locals.clone(),
         pending_unwind: Vec::new(),
         loop_depth: 0,
         run_depth: sh.run_depth,

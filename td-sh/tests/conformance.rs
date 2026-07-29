@@ -169,6 +169,40 @@ fn a_functions_temp_binding_is_exported_to_a_child() -> Result<(), Box<dyn std::
     Ok(())
 }
 
+/// A bare `local x` clears the VALUE and keeps the entry, so the name is absent
+/// from a child's environment while localised but exports again the moment the
+/// function assigns it — the `local PATH; PATH=...; cmd` idiom. The `unset`
+/// builtin drops the attribute with the name instead. Only a child can see any of
+/// that, so this runs the built shell as its own child, as the test above does.
+#[test]
+fn a_localised_name_still_exports_once_assigned() -> Result<(), Box<dyn std::error::Error>> {
+    let shell = PathBuf::from(env!("CARGO_BIN_EXE_td-sh"));
+    let child = "\"$TD_SH_BIN\" -c 'echo [${TD_SH_X-UNSET}]'";
+    for (body, want) in [
+        // Localised and reassigned: the child sees the NEW value.
+        (format!("f() {{ local TD_SH_X; TD_SH_X=H; {child}; }}; f"), "[H]\n"),
+        // Localised and left alone: absent, not the outer value and not empty.
+        (format!("f() {{ local TD_SH_X; {child}; }}; f"), "[UNSET]\n"),
+        // `unset` takes the attribute with it, so a later assignment does NOT
+        // reach the child.
+        (format!("unset TD_SH_X; TD_SH_X=H; {child}"), "[UNSET]\n"),
+        // Restored on the way out.
+        (format!("f() {{ local TD_SH_X; }}; f; {child}"), "[G]\n"),
+        // `export NAME` before any value is the same state from the other side.
+        (format!("unset TD_SH_X; export TD_SH_X; {child}"), "[UNSET]\n"),
+        (format!("unset TD_SH_X; export TD_SH_X; TD_SH_X=H; {child}"), "[H]\n"),
+    ] {
+        let out = std::process::Command::new(&shell)
+            .arg("-c")
+            .arg(&body)
+            .env("TD_SH_BIN", &shell)
+            .env("TD_SH_X", "G")
+            .output()?;
+        assert_eq!(String::from_utf8_lossy(&out.stdout), want, "{body}");
+    }
+    Ok(())
+}
+
 /// A case that redirects into a relative filename must not touch the gate's
 /// working tree: `run_case` isolates each case in a throwaway temp working
 /// directory. Corpus cases like `var-num.test.sh::$0 with filename` do exactly

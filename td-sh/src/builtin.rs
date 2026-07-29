@@ -1492,11 +1492,10 @@ fn export(sh: &mut Shell, argv: &[String], readonly: bool) -> R<()> {
 /// cannot run them.
 ///
 /// Each name's current binding is saved for the function's return to restore.
-/// Only the `=` form ASSIGNS; a bare `local x` declares and leaves whatever the
-/// name held, so it starts out unset only when there was no prior binding (which
-/// is why `set -u; f() { local x; echo $x; }` is an error, not a blank line).
-/// `unset` on a local then leaves it unset for the rest of the call instead of
-/// revealing the global, because the outer binding only comes back on unwind.
+/// A bare `local x` starts the name UNSET whatever it held before, which is ash's
+/// rule and not dash's -- see the match below. `unset` on a local then leaves it
+/// unset for the rest of the call instead of revealing the global, because the
+/// outer binding only comes back on unwind.
 fn local(sh: &mut Shell, argv: &[String]) -> R<()> {
     if sh.localvar_depth == 0 {
         return special_usage_error(sh, "local: not in a function");
@@ -1522,27 +1521,38 @@ fn local(sh: &mut Shell, argv: &[String]) -> R<()> {
             // can name again. td-sh rejects both rather than store that.)
             return special_usage_error(sh, &format!("local: {name}: bad variable name"));
         }
-        let existed = sh.vars.contains_key(name);
-        if !sh
-            .locals
-            .iter()
-            .any(|l| matches!(l, Local::Var(n, _) if n == name))
-        {
+        // First declaration of this name in this frame, which is the only one that
+        // does anything: ash walks the frame and skips a name already in it. A
+        // frame a terminating unwind DEFERRED counts as well -- an EXIT trap runs
+        // inside the frame the shell died in, so a `local` there is a repeat.
+        let declared = |l: &Local| matches!(l, Local::Var(n, _) if n == name);
+        let fresh = !sh.locals.iter().any(declared) && !sh.pending_unwind.iter().any(declared);
+        if fresh {
             sh.locals
                 .push(Local::Var(name.to_string(), sh.vars.get(name).cloned()));
         }
-        match value {
+        // Readonly is answered here for BOTH forms rather than left to `set_var`,
+        // so each names the builtin as both references do; `set_var`'s own message
+        // is shared with plain assignment, which must NOT grow a `local:` prefix.
+        let rejected = match value {
             // `local x=v` keeps the attributes of the name it shadows, since
             // set_var writes through the existing entry.
-            Some(v) => sh.set_var(name, v)?,
-            // A valueless `local x` only DECLARES: dash assigns nothing unless the
-            // argument carries `=`, so an existing value survives being localised
-            // (`local x=1; local x` is still 1) and only a name that did not exist
-            // starts out unset.
-            None if !existed => {
-                sh.vars.remove(name);
+            Some(v) => {
+                let readonly = sh.vars.get(name).is_some_and(|old| old.readonly);
+                if !readonly {
+                    sh.set_var(name, v)?;
+                }
+                readonly
             }
-            None => {}
+            // A valueless `local x` UNSETS x -- ash's `mklocal` says so in as many
+            // words ("local VAR unsets VAR") and dash, alone, leaves the outer value
+            // showing through instead. The repeat declaration is what ash skips, so
+            // `local x=1; local x` is still 1.
+            None if fresh => !sh.unset_value(name),
+            None => false,
+        };
+        if rejected {
+            return special_usage_error(sh, &format!("local: {name}: is read only"));
         }
     }
     ok(sh)
@@ -2809,8 +2819,8 @@ mod tests {
         let (_, out, _) = run_capturing(
             "x=g; y=g; f() { local x=l y; y=mut; echo \"in $x $y\"; }; f; echo \"out $x $y\"",
         );
-        // `local y` declares without assigning, so y keeps `g` until the function
-        // writes to it -- and that write does not escape.
+        // `local y` starts y UNSET, so `y=mut` is what it shows -- and neither
+        // that write nor the shadowing of x escapes the call.
         assert_eq!(out, "in l mut\nout g g\n");
         // A name that did not exist before is removed again, not left empty.
         let (_, out, _) = run_capturing("f() { local n=1; }; f; echo \"[${n-unset}]\"");
@@ -2819,7 +2829,9 @@ mod tests {
 
     #[test]
     fn a_bare_local_leaves_the_name_unset() {
-        // Only a name that did not exist starts out unset; `set -u` is then fatal.
+        // Every name starts unset, whether or not it existed; `set -u` is then
+        // fatal. What it HELD is the case `a_valueless_local_starts_the_name_unset`
+        // covers; this one is the name that never existed.
         let (_, out, _) = run_capturing("f() { local x; echo \"[${x-default}]\"; }; f");
         assert_eq!(out, "[default]\n");
         let (status, out, _) = run_capturing("set -u; f() { local x; echo $x; }; f");
@@ -2833,6 +2845,127 @@ mod tests {
         let (_, out, _) =
             run_capturing("x=g; f() { local x=l; unset x; echo \"[${x-gone}]\"; }; f; echo $x");
         assert_eq!(out, "[gone]\ng\n");
+    }
+
+    #[test]
+    fn a_valueless_local_starts_the_name_unset() {
+        // ash's `mklocal` unsets the name outright ("local VAR unsets VAR");
+        // dash leaves the outer value visible, and td-sh followed dash. ash is the
+        // first reference, and every expectation here was read off it.
+        for (src, want) in [
+            ("a=A; f() { local a; echo \"[$a]\"; }; f; echo \"after[$a]\"", "[]\nafter[A]\n"),
+            // Only the valueless form: `=` still assigns, and a later plain
+            // assignment is unaffected.
+            ("a=A; f() { local a=B; echo \"[$a]\"; }; f", "[B]\n"),
+            ("a=A; f() { local a; a=C; echo \"[$a]\"; }; f; echo \"after[$a]\"", "[C]\nafter[A]\n"),
+            // Every name in the list, not just the first.
+            ("a=A; f() { local b a c; echo \"[$a][$b][$c]\"; }; f", "[][][]\n"),
+            // A REPEAT declaration in the same frame is the one case ash skips, so
+            // this must NOT unset what the first one assigned.
+            ("x=0; f() { local x=1; echo $x; local x; echo $x; }; f; echo $x", "1\n1\n0\n"),
+            // ...and a repeat that DOES carry a value still assigns.
+            ("x=0; f() { local x; local x=9; echo \"[$x]\"; }; f; echo $x", "[9]\n0\n"),
+            // A nested frame unsets what the outer frame localised.
+            ("x=0; g() { local x; echo \"g[$x]\"; }; f() { local x=1; g; echo \"f[$x]\"; }; f",
+             "g[]\nf[1]\n"),
+        ] {
+            let (_, out, err) = run_capturing(src);
+            assert_eq!(out, want, "{src}: {err}");
+        }
+        // The name is gone, not merely empty -- so it leaves the environment too.
+        let (_, out, _) = run_capturing("export a=A; f() { local a; echo \"[${a-UNSET}]\"; }; f");
+        assert_eq!(out, "[UNSET]\n");
+    }
+
+    #[test]
+    fn a_declared_but_unset_name_reads_as_absent() {
+        // ash's `mklocal` clears the VALUE and keeps the `struct var`, so a
+        // localised name reads unset while its attributes survive. Only a child can
+        // see the attribute half; `a_localised_name_still_exports_once_assigned` in
+        // tests/conformance.rs covers that. These are the in-process half.
+        assert_eq!(run_capturing("export x=G; f() { local x; echo \"[${x-UNSET}]\"; }; f").1,
+                   "[UNSET]\n");
+        assert_eq!(run_capturing("export x=G; f() { local x; }; f; echo \"[$x]\"").1, "[G]\n");
+        // The same state reached the other way: `export x` before any value.
+        assert_eq!(run_capturing("export x; echo \"[${x-UNSET}]\"").1, "[UNSET]\n");
+        assert_eq!(run_capturing("export x; x=H; echo \"[$x]\"").1, "[H]\n");
+        // An attributes-only entry is still a VARIABLE, so `unset` takes it and
+        // leaves a function of the same name alone.
+        assert_eq!(run_capturing("export x; x() { echo fn; }; unset x; x").1, "fn\n");
+    }
+
+    #[test]
+    fn a_repeat_local_is_recognised_across_a_fork_and_an_unwind() {
+        // The "only the first declaration acts" rule is about the FRAME, so it has
+        // to survive both ways td-sh moves one: a subshell forks the frame, and a
+        // terminating unwind defers it for the EXIT trap. Miss either and the
+        // repeat looks fresh and wrongly unsets. All measured on ash.
+        for (src, want) in [
+            ("x=G; f() { local x=F; (local x; echo \"${x-UNSET}\"); }; f", "F\n"),
+            ("x=G; f() { local x=F; echo \"$(local x; echo ${x-UNSET})\"; }; f", "F\n"),
+            ("x=G; trap 'local x; echo ${x-UNSET}' EXIT; f() { local x=F; exit 7; }; f", "F\n"),
+            // A name the dead frame did NOT declare is still a fresh declaration.
+            ("x=G; trap 'local y; echo ${y-UNSET}' EXIT; f() { local x=F; exit 7; }; f",
+             "UNSET\n"),
+            // A subshell's own `local` is still its own: it does not escape.
+            ("x=G; f() { (local x=S; echo \"in[$x]\"); echo \"out[$x]\"; }; f", "in[S]\nout[G]\n"),
+        ] {
+            let (_, out, err) = run_capturing(src);
+            assert_eq!(out, want, "{src}: {err}");
+        }
+    }
+
+    #[test]
+    fn a_prefix_assignment_is_already_a_declaration_in_the_frame() {
+        // ash's `evalcommand` applies a call's prefix assignments with `mklocal`
+        // INTO the frame it just pushed (ash.c:10497), so a valueless `local` for
+        // that name in the body is a repeat and leaves the binding alone. td-sh
+        // kept them in a list of their own, where the repeat check could not see
+        // them; they are in the frame's list now. All measured on ash.
+        for (src, want) in [
+            ("a=A; f() { local a; echo \"[${a-U}]\"; }; a=B f; echo \"after[$a]\"",
+             "[B]\nafter[A]\n"),
+            ("a=A; f() { local a b; echo \"[${a-U}][${b-U}]\"; }; a=B b=C f", "[B][C]\n"),
+            // The `=` form assigns over it, as it always did.
+            ("f() { local a=C; echo \"[$a]\"; }; a=B f", "[C]\n"),
+            // A name the call did NOT prefix is still a fresh declaration.
+            ("a=A; f() { local a; echo \"[${a-U}]\"; }; b=B f", "[U]\n"),
+            // The binding is still the frame's: gone after the call either way.
+            ("a=A; f() { local a; }; a=B f; echo \"[$a]\"", "[A]\n"),
+            ("a=A; f() { local a; a=X; }; a=B f; echo \"[$a]\"", "[A]\n"),
+        ] {
+            let (_, out, err) = run_capturing(src);
+            assert_eq!(out, want, "{src}: {err}");
+        }
+    }
+
+    #[test]
+    fn a_bare_local_of_optind_restarts_getopts() {
+        // ash reaches the unset through `unsetvar`, which fires `getoptsreset` and
+        // moves the hidden cursor back to word 1. dash never unsets here at all, so
+        // it resumes mid-scan; ash decides it.
+        let (_, out, err) =
+            run_capturing("f() { getopts ab o; local OPTIND; getopts ab o; echo $o; }; f -a -b");
+        assert_eq!(out, "a\n", "{err}");
+    }
+
+    #[test]
+    fn local_names_itself_when_a_readonly_rejects_it() {
+        // Both references prefix the builtin here, and both forms reach it: the
+        // valueless one because it now unsets, the `=` one because it assigns.
+        // Plain assignment shares set_var's message and must NOT gain the prefix.
+        // `; echo REACHED` is what tells a FATAL error from a status of 2: ash
+        // ends the script here, so nothing after the call runs.
+        for src in [
+            "readonly r=1; f() { local r; }; f; echo REACHED",
+            "readonly r=1; f() { local r=2; }; f; echo REACHED",
+        ] {
+            let (code, out, err) = run_capturing(src);
+            assert_eq!((code, out.as_str()), (2, ""), "{src}: {err}");
+            assert!(err.contains("local: r: is read only"), "{src}: {err}");
+        }
+        let (_, _, err) = run_capturing("readonly r=1; r=2");
+        assert!(err.contains("r: is read only") && !err.contains("local:"), "{err}");
     }
 
     #[test]

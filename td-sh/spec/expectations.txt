@@ -282,8 +282,6 @@ xfail background.test.sh::wait for N parallel jobs and check failure
 xfail background.test.sh::wait with invalid PID
 xfail background.test.sh::wait with invalid arg
 xfail background.test.sh::wait with jobspec syntax %nonexistent
-xfail ble-features.test.sh::[bash_unset] function call with tempenv vs tempenv-eval
-xfail ble-features.test.sh::[bash_unset] localvar-inherit from tempenv
 xfail ble-idioms.test.sh::Issue #1069 [40] BUG: a=(declare v); "${a[@]}" fails
 xfail ble-idioms.test.sh::Issue #1069 [40] BUG: a=declare; "$a" v=1 fails
 xfail ble-idioms.test.sh::Issue #1069 [52] BUG: \builtin local v=1 fails

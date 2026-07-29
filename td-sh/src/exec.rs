@@ -39,7 +39,11 @@ pub type R<T> = Result<T, Sig>;
 
 #[derive(Clone, Debug)]
 pub struct Var {
-    pub value: String,
+    /// `None` is DECLARED BUT UNSET: the name reads as absent and stays out of a
+    /// child's environment, but keeps its attributes, so `export x` before any
+    /// value -- and the name a bare `local` just unset -- still export once
+    /// assigned. ash's `struct var` with `VUNSET` is the same state.
+    pub value: Option<String>,
     pub exported: bool,
     pub readonly: bool,
 }
@@ -193,7 +197,7 @@ impl Shell {
             vars.insert(
                 k,
                 Var {
-                    value: v,
+                    value: Some(v),
                     exported: true,
                     readonly: false,
                 },
@@ -294,7 +298,7 @@ impl Shell {
     }
 
     pub fn get_var(&self, name: &str) -> Option<String> {
-        self.vars.get(name).map(|v| v.value.clone())
+        self.vars.get(name).and_then(|v| v.value.clone())
     }
 
     /// Assign a shell variable, honouring the readonly attribute. A write to a
@@ -314,6 +318,18 @@ impl Shell {
         self.getopts_off = -1;
     }
 
+    /// The same hook for the value going AWAY. ash fires it on an unset too
+    /// (`unsetvar` is `setvar(s, NULL, 0)`), where `getoptsreset` restarts the
+    /// scan at word 1 for anything that is not a number (ash.c:2272) rather than
+    /// parking the error an assignment parks. dash rejects `unset OPTIND`
+    /// outright, so ash decides this one.
+    fn unset_hook(&mut self, name: &str) {
+        if name == "OPTIND" {
+            self.getopts_optind = 1;
+            self.getopts_off = -1;
+        }
+    }
+
     pub fn set_var(&mut self, name: &str, value: &str) -> R<()> {
         // Assigning OPTIND at all -- even the value it already holds -- restarts
         // `getopts` at a word boundary. `getopts` itself re-establishes the
@@ -326,14 +342,14 @@ impl Shell {
                 return Err(self.fatal(&format!("{name}: is read only"), 2));
             }
             Some(v) => {
-                v.value = value.to_string();
+                v.value = Some(value.to_string());
                 v.exported |= self.opts.allexport;
             }
             None => {
                 self.vars.insert(
                     name.to_string(),
                     Var {
-                        value: value.to_string(),
+                        value: Some(value.to_string()),
                         // `set -a` is exactly this: every name an assignment
                         // touches is marked for export as it is written.
                         exported: self.opts.allexport,
@@ -352,7 +368,7 @@ impl Shell {
             self.vars.insert(
                 name.to_string(),
                 Var {
-                    value: String::new(),
+                    value: None,
                     exported: true,
                     readonly: false,
                 },
@@ -367,7 +383,7 @@ impl Shell {
             self.vars.insert(
                 name.to_string(),
                 Var {
-                    value: String::new(),
+                    value: None,
                     exported: false,
                     readonly: true,
                 },
@@ -388,10 +404,25 @@ impl Shell {
         match self.vars.get(name) {
             Some(v) if v.readonly => false,
             _ => {
+                self.unset_hook(name);
                 self.vars.remove(name);
                 true
             }
         }
+    }
+
+    /// What a bare `local x` does: clear the VALUE but keep the entry, so the
+    /// name's export attribute survives being localised and a later assignment
+    /// still reaches a child. The `unset` builtin drops the attributes with the
+    /// name; ash's `mklocal` keeps them, and this is that difference.
+    pub fn unset_value(&mut self, name: &str) -> bool {
+        match self.vars.get_mut(name) {
+            Some(v) if v.readonly => return false,
+            Some(v) => v.value = None,
+            None => {}
+        }
+        self.unset_hook(name);
+        true
     }
 
     /// The environment a child process inherits: every exported variable.
@@ -399,7 +430,7 @@ impl Shell {
         self.vars
             .iter()
             .filter(|(_, v)| v.exported)
-            .map(|(k, v)| (k.clone(), v.value.clone()))
+            .filter_map(|(k, v)| Some((k.clone(), v.value.clone()?)))
             .collect()
     }
 
@@ -1066,20 +1097,16 @@ fn undo_binding(sh: &mut Shell, entry: Local) {
             // Bypassing `set_var` still owes the hook, which dash runs on the
             // RESTORE too (`poplocalvars` calls the var's `func`): a frame that
             // displaced OPTIND has to put the hidden cursor back with it, or
-            // `getopts` resumes at the word the frame's value pointed at.
-            sh.var_hook(&name, &var.value);
+            // `getopts` resumes at the word the frame's value pointed at. An
+            // attributes-only entry restores as the unset it is.
+            match var.value.as_deref() {
+                Some(v) => sh.var_hook(&name, v),
+                None => sh.unset_hook(&name),
+            }
             sh.vars.insert(name, var);
         }
         Local::Var(name, None) => {
-            // ash fires it on an UNSET too (`unsetvar` is `setvar(s, NULL, 0)`),
-            // where `getoptsreset` restarts the scan at word 1 for anything that
-            // is not a number (ash.c:2272) rather than parking the error an
-            // assignment parks. dash rejects `unset OPTIND` outright, so ash
-            // decides this one.
-            if name == "OPTIND" {
-                sh.getopts_optind = 1;
-                sh.getopts_off = -1;
-            }
+            sh.unset_hook(&name);
             sh.vars.remove(&name);
         }
         Local::Opts(opts) => sh.opts = opts,
@@ -1145,14 +1172,16 @@ fn call_function(
     //
     // A prefix assignment is a TEMP FRAME: visible inside the call, exported for
     // it as an external command's environment would be, and gone afterwards --
-    // even if the body assigned through it. Restored below `pop_locals`, so a
-    // `local` of the same name unwinds to the binding first and this then takes
-    // the binding away too.
-    let mut saved_vars: Vec<(String, Option<Var>)> = Vec::with_capacity(assigns.len());
+    // even if the body assigned through it. It goes into the frame's OWN list, as
+    // ash's `evalcommand` does it (`mklocal` at ash.c:10497 into the frame pushed
+    // at 10446), so a `local` of the same name in the body sees it already
+    // declared and leaves it alone. Being the oldest entries, they unwind last.
+    let saved_locals = std::mem::take(&mut sh.locals);
     let applied = (|| -> R<()> {
         for a in assigns {
             let value = expand::expand_assign(sh, &a.value)?;
-            saved_vars.push((a.name.clone(), sh.vars.get(&a.name).cloned()));
+            sh.locals
+                .push(Local::Var(a.name.clone(), sh.vars.get(&a.name).cloned()));
             sh.set_var(&a.name, &value)?;
             sh.export(&a.name);
         }
@@ -1160,10 +1189,11 @@ fn call_function(
     })();
     if let Err(sig) = applied {
         if terminating(&sig) {
-            defer_vars(sh, saved_vars);
+            defer_locals(sh);
         } else {
-            restore_vars(sh, saved_vars);
+            pop_locals(sh);
         }
+        sh.locals = saved_locals;
         return Err(sig);
     }
     let new_params = argv.get(1..).unwrap_or(&[]).to_vec();
@@ -1175,7 +1205,6 @@ fn call_function(
     sh.getopts_optind = 1;
     sh.getopts_off = -1;
     let saved_loop_depth = sh.loop_depth;
-    let saved_locals = std::mem::take(&mut sh.locals);
     sh.loop_depth = 0;
     // Not `?`: a fatal error in a redirection WORD (`f 2>${u:?}`) must still unwind
     // the argument frame below, or the caller -- or an EXIT trap -- sees the
@@ -1197,12 +1226,8 @@ fn call_function(
     (sh.getopts_optind, sh.getopts_off) = saved_getopts;
     if result.as_ref().err().is_some_and(terminating) {
         defer_locals(sh);
-        defer_vars(sh, saved_vars);
     } else {
         pop_locals(sh);
-        // Below `pop_locals`, so a `local` of the same name unwinds to the binding
-        // first and the frame then takes the binding away too.
-        restore_vars(sh, saved_vars);
     }
     sh.locals = saved_locals;
     sh.params = saved_params;
