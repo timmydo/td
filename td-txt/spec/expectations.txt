@@ -38,6 +38,9 @@ xfail grep-cli.test.txt::a second fuzz composite in the same family
 xfail grep-cli.test.txt::a BACKREFERENCE switches grep to glibc's reading of the same pattern
 xfail grep-cli.test.txt::so the operator is a literal there, exactly as sed reads it
 xfail grep-cli.test.txt::a dropped token immediately before a paren is what grep refuses
+xfail grep-cli.test.txt::grep drops a leading interval but the NEXT one then has something to repeat
+xfail grep-cli.test.txt::and an empty brace after an anchor is the literal it is at a branch start
+xfail grep-cli.test.txt::as it is after a literal brace
 xfail sed-cli.test.txt::without -s a failure on the FIRST operand outranks the quit code too
 xfail sed-cli.test.txt::and q5 reports it rather than 5
 xfail sed-cli.test.txt::q stops before a later operand is opened, so it is never reported
@@ -52,8 +55,6 @@ xfail sed-cli.test.txt::\c at the end of a text controls the text's own terminat
 xfail sed-cli.test.txt::a dollar before a bare pipe is not the literal it looks like
 xfail sed-cli.test.txt::but a MANDATORY single-byte matcher after the pair matches nothing at all
 xfail sed-cli.test.txt::which a bracket spells the same way
-xfail sed-cli.test.txt::sed refuses a bare { in an ERE, where nothing precedes it
-xfail sed-cli.test.txt::and Unmatched \{ where something does
 xfail sed-cli.test.txt::a [ consumed as a closer test leaves the reader somewhere unmodelled
 xfail sed-cli.test.txt::and the same shape after an earlier sub-expression
 xfail sed-cli.test.txt::the same with a class

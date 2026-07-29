@@ -421,6 +421,21 @@ td-txt-authored case files
       an interval is a literal, content and all, so `-E '{}a'` selects `{}a`
       while `-E 'a{}'` -- a brace WITH something to repeat -- is an error.
 
+  Two more places sed's ERE is the strict one where grep's reads TEXT, both
+  turning on the same `strict_repeats` flag. A `{` in sed's ERE always opens an
+  interval, so an unusable one is an error and never a literal: with nothing to
+  repeat it is `Invalid preceding regular expression` whatever follows the brace
+  (`{`, `{2`, `{x}`), and with something to repeat GNU asks whether it CLOSES
+  before judging content -- `a{` and `a{2` are `Unmatched \{` where `a{x}` is
+  `Invalid content of \{\}`. That question skips escaped pairs, so `a{x\}` is
+  unmatched, `a{x\}}` is bad content, and `a{x\\}` is bad content again because
+  the escaped BACKSLASH is what got skipped. And an unmatched `)` is
+  `Unmatched ) or \)` there (`)`, `a)`, `(a))`), where grep makes it the character
+  it is at depth 0; an EMPTY group `()` is not that and still matches empty in
+  both. That second rule is a GNU EXTENSION, so `--posix` drops it and the
+  character is ordinary again -- while leaving the interval rules alone, which is
+  why the two halves of this paragraph need different treatment under the flag.
+
   Stacking is otherwise unchanged and is the same two rules as before, both of
   them SED's: its BRE refuses a second `*` or interval after ANY operator (`a**`,
   `a\+*`, `a\{2\}*`, `\(a\)**`) while TAKING `\+` and `\?` there (`a*\+`, `a\?\?`),
@@ -439,9 +454,13 @@ td-txt-authored case files
 
   The gaps this campaign found and did NOT fix, recorded here so the next round
   starts from the probe results rather than re-deriving them. All but the first
-  have corpus cases carrying GNU's goldens, listed as xfail; `--posix`'s two cases
-  PASS, because what is missing there is a restriction rather than an answer, and
-  the probe table below is its specification instead:
+  have corpus cases carrying GNU's goldens, listed as xfail; `--posix`'s cases
+  PASS, and the probe table below is its specification instead. What is missing
+  under that flag is MOSTLY a restriction rather than an answer -- but not
+  entirely: the flag also DROPS a GNU extension, making an unmatched `)` ordinary
+  in an ERE, and td-txt reads it for that one rule. An earlier draft of this
+  paragraph said the flag never changes an answer here, which was true only until
+  something GNU's `--posix` relaxes got modelled.
 
   - `--posix`, above: implemented for one behaviour of twelve-plus, silently
     ignored for the rest. `POSIXLY_CORRECT` selects the same mode in GNU and is not
@@ -537,14 +556,15 @@ td-txt-authored case files
     refutes it). Recorded rather than guessed at, because a fourth reading fitted
     to two more probes would be the mistake this file already records once.
 
-  - A bare `{` in a sed ERE, which GNU refuses and td-txt reads as a literal
-    brace: `sed -E 's/{/./'` is `Invalid preceding regular expression` there and
-    a no-op here, and `s/a{/./` is `Unmatched \{`. This is the SED half of the
-    brace rule recorded above for grep, where reading an unusable brace as a
-    literal IS correct; sed's ERE does not, and `strict_repeats` does not
-    currently reach the brace-with-no-interval-body case. Two xfail cases. Also
-    pre-existing, but the delimiter fix gives it new spellings -- `s\{\.\` used to
-    die as `unterminated` before the regex compiler ever saw the brace.
+  - What grep does with an EMPTY brace that has something before it, where the
+    something was itself dropped or literal. `grep -E '^{}'` and `-E '{{}'`
+    compile there and are `Invalid content of \{\}` here, while `-E '{2}{}a'` is
+    the reverse -- GNU refuses it and td-txt compiles. `{}` alone, `{}a`, `({})`,
+    `{}$`, `a{}`, `x{}` and `{}{}` all agree, so it is not the empty brace itself
+    but what a DROPPED leading token leaves behind for the next one to repeat: an
+    anchor and a literal brace count as nothing to GNU and as something here, and
+    a dropped interval is the other way round. Three xfail cases. Grep-side and
+    pre-existing; the sed half of the same axis is modelled above.
 
   - A token grep DROPS for having nothing to repeat, sitting immediately before a
     `)`. `(a\b*)`, `(\b*)`, `(z|\b*)` and `({)` are `Unmatched ( or \(` there and

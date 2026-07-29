@@ -5991,3 +5991,150 @@ b/p'
 ## stdout-json: ""
 ## stderr-contains: Unmatched [, [^, [:, [., or [=
 ## status: 1
+
+#### a brace in sed's ERE always opens an interval, so a bare one has nothing to repeat
+## argv: sed -E 's@{@X@'
+## stdin-json: "a{2}\n"
+## stdout-json: ""
+## stderr-contains: Invalid preceding regular expression
+## status: 1
+
+#### and so does one that does not close
+## argv: sed -E 's@{2@X@'
+## stdin-json: "a{2}\n"
+## stdout-json: ""
+## stderr-contains: Invalid preceding regular expression
+## status: 1
+
+#### or whose content is not a bound
+## argv: sed -E 's@{x}@X@'
+## stdin-json: "a{2}\n"
+## stdout-json: ""
+## stderr-contains: Invalid preceding regular expression
+## status: 1
+
+#### with something to repeat it is judged on whether it CLOSES
+## argv: sed -E 's@a{@X@'
+## stdin-json: "a{2}\n"
+## stdout-json: ""
+## stderr-contains: Unmatched \{
+## status: 1
+
+#### an unclosed one after a bound is the same
+## argv: sed -E 's@a{2@X@'
+## stdin-json: "a{2}\n"
+## stdout-json: ""
+## stderr-contains: Unmatched \{
+## status: 1
+
+#### and a closed one with unreadable content is bad content instead
+## argv: sed -E 's@a{x}@X@'
+## stdin-json: "a{2}\n"
+## stdout-json: ""
+## stderr-contains: Invalid content of \{\}
+## status: 1
+
+#### a readable interval is still an interval
+## argv: sed -E 's@a{1,2}@X@'
+## stdin-json: "a{2}\n"
+## stdout-json: "X{2}\n"
+## stderr-json: ""
+## status: 0
+
+#### and an omitted lower bound still reads as zero
+## argv: sed -E 's@a{,}@X@'
+## stdin-json: "a{2}\n"
+## stdout-json: "X{2}\n"
+## stderr-json: ""
+## status: 0
+
+#### a closing brace alone is the literal it always was
+## argv: sed -E 's@}@X@'
+## stdin-json: "a{2}\n"
+## stdout-json: "a{2X\n"
+## stderr-json: ""
+## status: 0
+
+#### sed's ERE refuses an unmatched ) as well, where grep reads it as text
+## argv: sed -E 's@)@X@'
+## stdin-json: "a)b\n"
+## stdout-json: ""
+## stderr-contains: Unmatched ) or \)
+## status: 1
+
+#### with something before it too
+## argv: sed -E 's@a)@X@'
+## stdin-json: "a)b\n"
+## stdout-json: ""
+## stderr-contains: Unmatched ) or \)
+## status: 1
+
+#### and one closing a group that already closed
+## argv: sed -E 's@(a))@X@'
+## stdin-json: "a)b\n"
+## stdout-json: ""
+## stderr-contains: Unmatched ) or \)
+## status: 1
+
+#### an EMPTY group is not that, and still matches empty
+## argv: sed -E 's@()@X@'
+## stdin-json: "a)b\n"
+## stdout-json: "Xa)b\n"
+## stderr-json: ""
+## status: 0
+
+#### an ESCAPED brace closes nothing, so the interval is still unmatched
+## argv: sed -E 's@a{x\}@X@'
+## stdin-json: "a\n"
+## stdout-json: ""
+## stderr-contains: Unmatched \{
+## status: 1
+
+#### a real one after it does close, and the content is judged then
+## argv: sed -E 's@a{x\}}@X@'
+## stdin-json: "a\n"
+## stdout-json: ""
+## stderr-contains: Invalid content of \{\}
+## status: 1
+
+#### an escaped BACKSLASH is skipped whole, so the brace after it closes
+## argv: sed -E 's@a{x\\}@X@'
+## stdin-json: "a\n"
+## stdout-json: ""
+## stderr-contains: Invalid content of \{\}
+## status: 1
+
+#### and a third backslash escapes the brace again
+## argv: sed -E 's@a{x\\\}@X@'
+## stdin-json: "a\n"
+## stdout-json: ""
+## stderr-contains: Unmatched \{
+## status: 1
+
+#### --posix makes an unmatched ) ordinary again, which is the rule inverted
+## argv: sed --posix -E 's@)@X@'
+## stdin-json: "a)b\n"
+## stdout-json: "aXb\n"
+## stderr-json: ""
+## status: 0
+
+#### with something before it too
+## argv: sed --posix -E 's@a)@X@'
+## stdin-json: "a)b\n"
+## stdout-json: "Xb\n"
+## stderr-json: ""
+## status: 0
+
+#### but it leaves the INTERVAL rules alone
+## argv: sed --posix -E 's@a{x}@X@'
+## stdin-json: "a)b\n"
+## stdout-json: ""
+## stderr-contains: Invalid content of \{\}
+## status: 1
+
+#### including a brace with nothing to repeat
+## argv: sed --posix -E 's@{@X@'
+## stdin-json: "a)b\n"
+## stdout-json: ""
+## stderr-contains: Invalid preceding regular expression
+## status: 1

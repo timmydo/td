@@ -56,6 +56,11 @@ pub struct Options {
     /// the vendored Spencer cases pin. Not a knob: it is which tool's syntax bits
     /// glibc was handed.
     pub strict_repeats: bool,
+    /// sed's `--posix`, which drops GNU extensions. Only one rule reads it: an
+    /// unmatched `)` is ORDINARY there, the opposite of what sed's ERE does
+    /// otherwise. The interval rules are unaffected -- `--posix -E 'a{x}'` is
+    /// still bad content -- so this is not a second `strict_repeats`.
+    pub posix: bool,
     /// POSIX REG_NEWLINE (sed's `M` flag), carrying the RECORD SEPARATOR it is
     /// relative to: `\n` normally, NUL under `-z`. GNU implements it as TWO
     /// mechanisms, and a pattern can tell them apart:
@@ -387,8 +392,17 @@ impl<'a> Parser<'a> {
             if self.peek().is_none() || self.at_op(b'|') || (depth > 0 && self.at_op(b')')) {
                 break;
             }
-            // An ERE `)` with no open group is a literal in GNU's grammar only at
-            // depth 0; POSIX leaves it undefined. Treat it as literal, matching GNU.
+            // POSIX leaves an ERE `)` with no open group undefined and the two
+            // tools took different readings: grep makes it a literal at depth 0,
+            // sed refuses it. Same split as the brace below, and the same flag.
+            if depth == 0
+                && self.opts.ere
+                && self.opts.strict_repeats
+                && !self.opts.posix
+                && self.at_op(b')')
+            {
+                return Err(Error::new("Unmatched ) or \\)"));
+            }
             if items.len() >= MAX_CONCAT {
                 return Err(Error::new("regular expression is too complex"));
             }
@@ -567,19 +581,28 @@ impl<'a> Parser<'a> {
         Ok(atom)
     }
 
-    /// Whether a `\}` closes the interval opened before `pos`. Only the BRE
-    /// diagnostic needs it; see `parse_interval`. An escaped backslash consumes
-    /// both its bytes, so the `}` in `a\{x\\}` closes nothing.
+    /// Whether the interval opened before `pos` CLOSES. Both BRE diagnostics need
+    /// it and, since sed's ERE stopped falling back to a literal brace, so does
+    /// that one -- which is the only difference between the two arms below: a BRE
+    /// spells the closer `\}` and an ERE `}`. An escaped pair is consumed whole
+    /// either way, so the `}` in BRE `a\{x\\}` and in ERE `a{x\}` closes nothing.
     fn interval_closes(&self) -> bool {
         let mut i = self.pos;
         while let Some(b) = self.pat.get(i).copied() {
             if b == b'\\' {
+                // An escaped pair is skipped whole. In a BRE the closer IS such a
+                // pair; in an ERE `\}` is an escaped brace and closes nothing, so
+                // `a{x\}` is `Unmatched \{` and `a{x\}}` is bad content.
                 match self.pat.get(i + 1) {
-                    Some(b'}') => return true,
+                    Some(b'}') if !self.opts.ere => return true,
                     Some(_) => i += 2,
                     None => return false,
                 }
                 continue;
+            }
+            // An ERE spells the closer with a bare brace.
+            if self.opts.ere && b == b'}' {
+                return true;
             }
             i += 1;
         }
@@ -587,7 +610,8 @@ impl<'a> Parser<'a> {
     }
 
     /// `{n}`, `{n,}`, `{n,m}` (ERE) / `\{…\}` (BRE). Returns `None` when what
-    /// follows is not an interval at all, which in ERE means a literal `{`.
+    /// follows is not an interval at all, which only GREP's ERE has a reading for
+    /// (a literal `{`); sed's ERE and both BREs must have one, and say so.
     fn parse_interval(&mut self) -> Result<Option<(u32, Option<u32>)>, Error> {
         let save = self.pos;
         if !self.eat_op(b'{') {
@@ -605,10 +629,12 @@ impl<'a> Parser<'a> {
             Some(n) => n,
             None if self.peek() == Some(b',') => 0,
             None => {
-                // A `{` that opens no valid interval is a literal in ERE, but in
-                // BRE `\{` must be one. GNU asks whether it CLOSES before it judges
-                // the content, so `a\{x\}` is bad content and `a\{x` is unmatched.
-                if self.opts.ere {
+                // A `{` that opens no valid interval is a literal to GREP, whose
+                // ERE reads it and its content as text. Everywhere else -- both
+                // BREs and SED's ERE -- a `{` must open one, and GNU asks whether
+                // it CLOSES before it judges the content, so `a{x}` is bad content
+                // and `a{x` is unmatched.
+                if self.opts.ere && !self.opts.strict_repeats {
                     self.pos = save;
                     return Ok(None);
                 }
@@ -624,7 +650,7 @@ impl<'a> Parser<'a> {
             Some(min)
         };
         if !self.eat_op(b'}') {
-            if self.opts.ere {
+            if self.opts.ere && !self.opts.strict_repeats {
                 self.pos = save;
                 return Ok(None);
             }
@@ -1850,7 +1876,75 @@ mod tests {
         // one is refused before it is read.
         assert!(sed_ere("x\\b*b").is_err());
         assert!(sed_ere("^{a}").is_err());
-        assert!(sed_ere("a{a}").is_ok(), "the same brace after an atom is a literal");
+        // A brace in sed's ERE is always an interval, so an unreadable one is bad
+        // CONTENT rather than the literal grep reads. An earlier draft of this
+        // test asserted the literal and was wrong: `sed -E 's@a{a}@X@'` is
+        // `Invalid content of \{\}`.
+        assert_eq!(
+            sed_ere("a{a}").err().map(|e| e.msg),
+            Some("Invalid content of \\{\\}".to_string())
+        );
+        assert_eq!(sed_ere("a{a").err().map(|e| e.msg), Some("Unmatched \\{".to_string()));
+        // grep reads both as text.
+        assert!(matched(&ere("a{a}"), "a{a}"));
+        assert!(matched(&ere("a{a"), "a{a"));
+    }
+
+    /// sed's ERE is the strict one twice over: a `{` always opens an interval, and
+    /// an unmatched `)` is an error where grep reads the character.
+    #[test]
+    fn seds_ere_refuses_the_braces_and_parens_greps_reads_as_text() {
+        // Nothing to repeat wins over whatever the brace contains.
+        for pat in ["{", "{2", "{x}", "{}", "{2}"] {
+            assert_eq!(
+                sed_ere(pat).err().map(|e| e.msg),
+                Some("Invalid preceding regular expression".to_string()),
+                "{pat}"
+            );
+        }
+        // With something to repeat, whether it CLOSES decides which error.
+        assert_eq!(sed_ere("a{").err().map(|e| e.msg), Some("Unmatched \\{".to_string()));
+        assert_eq!(sed_ere("a{2").err().map(|e| e.msg), Some("Unmatched \\{".to_string()));
+        assert_eq!(
+            sed_ere("a{x}").err().map(|e| e.msg),
+            Some("Invalid content of \\{\\}".to_string())
+        );
+        // An ESCAPED brace closes nothing; a real one after it does, and an
+        // escaped backslash is skipped whole so the brace behind it counts.
+        assert_eq!(sed_ere(r"a{x\}").err().map(|e| e.msg), Some("Unmatched \\{".to_string()));
+        assert_eq!(
+            sed_ere(r"a{x\}}").err().map(|e| e.msg),
+            Some("Invalid content of \\{\\}".to_string())
+        );
+        assert_eq!(
+            sed_ere(r"a{x\\}").err().map(|e| e.msg),
+            Some("Invalid content of \\{\\}".to_string())
+        );
+        assert_eq!(sed_ere(r"a{x\\\}").err().map(|e| e.msg), Some("Unmatched \\{".to_string()));
+        // A readable one is still an interval, and `{,}` still reads as `{0,}`.
+        assert!(sed_ere("a{1,2}").is_ok());
+        assert!(sed_ere("a{,}").is_ok());
+        for pat in [")", "a)", "(a))"] {
+            assert_eq!(
+                sed_ere(pat).err().map(|e| e.msg),
+                Some("Unmatched ) or \\)".to_string()),
+                "{pat}"
+            );
+            // `--posix` drops that extension and the character is ordinary again;
+            // it does NOT relax the interval rules above.
+            let posix =
+                Options { ere: true, strict_repeats: true, posix: true, ..Options::default() };
+            assert!(Regex::compile(pat.as_bytes(), posix).is_ok(), "--posix {pat}");
+        }
+        assert!(sed_ere("()").is_ok(), "an empty group is not an unmatched paren");
+        let posix = Options { ere: true, strict_repeats: true, posix: true, ..Options::default() };
+        assert!(Regex::compile(b"a{x}", posix).is_err(), "--posix leaves intervals alone");
+        // grep reads every one of them as text, which is why this is a flag and
+        // not a fix.
+        assert!(matched(&ere("a{"), "a{"));
+        assert!(matched(&ere("a{x}"), "a{x}"));
+        assert!(matched(&ere(")"), "a)b"));
+        assert!(matched(&ere("a)"), "a)b"));
     }
 
     #[test]

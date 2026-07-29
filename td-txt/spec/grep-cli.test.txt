@@ -3272,3 +3272,59 @@ abc
 ## stdout-json: "]\n"
 ## stderr-json: ""
 ## status: 0
+
+#### grep's ERE reads the same unusable brace as TEXT, content and all
+## argv: grep -c -E 'a{x}'
+## stdin-json: "a{x}\n"
+## stdout-json: "1\n"
+## stderr-json: ""
+## status: 0
+
+#### and a bare one likewise
+## argv: grep -c -E '{x}'
+## stdin-json: "{x}\n"
+## stdout-json: "1\n"
+## stderr-json: ""
+## status: 0
+
+#### which is why the two tools need different answers here
+## argv: grep -c -E 'a{'
+## stdin-json: "a{\n"
+## stdout-json: "1\n"
+## stderr-json: ""
+## status: 0
+
+#### grep reads the same unmatched ) as the character it is
+## argv: grep -c -E ')'
+## stdin-json: "a)b\n"
+## stdout-json: "1\n"
+## stderr-json: ""
+## status: 0
+
+#### and selects nothing when the text has none
+## argv: grep -c -E ')a'
+## stdin-json: "a)b\n"
+## stdout-json: "0\n"
+## stderr-json: ""
+## status: 1
+
+#### grep drops a leading interval but the NEXT one then has something to repeat
+## argv: grep -c -E '{2}{}a'
+## stdin-json: "{}\n"
+## stdout-json: ""
+## stderr-contains: Invalid content of \{\}
+## status: 2
+
+#### and an empty brace after an anchor is the literal it is at a branch start
+## argv: grep -c -E '^{}'
+## stdin-json: "{}\n"
+## stdout-json: "1\n"
+## stderr-json: ""
+## status: 0
+
+#### as it is after a literal brace
+## argv: grep -c -E '{{}'
+## stdin-json: "{}\n"
+## stdout-json: "0\n"
+## stderr-json: ""
+## status: 1

@@ -166,6 +166,8 @@ struct ScriptParser<'a> {
     src: &'a [u8],
     pos: usize,
     ere: bool,
+    /// `--posix`. Reaches the regex compiler for one rule; see `Options::posix`.
+    posix: bool,
     /// `-z`. Only the `M` flag reads it: see `Options::reg_newline`.
     null_data: bool,
     /// Offsets of the newlines that JOIN `-e`/`-f` parts. GNU ends a script part
@@ -268,6 +270,7 @@ impl ScriptParser<'_> {
             ere: self.ere,
             icase,
             strict_repeats: true,
+            posix: self.posix,
             reg_newline: multiline.then_some(separator_for(self.null_data)),
         };
         let re = Regex::compile(&normalize_regex(raw)?, opts)
@@ -916,8 +919,10 @@ fn parse_script(
     ere: bool,
     null_data: bool,
     part_ends: Vec<usize>,
+    posix: bool,
 ) -> Result<Script, String> {
-    let mut p = ScriptParser { src, pos: 0, ere, null_data, part_ends, regexes: Vec::new() };
+    let mut p =
+        ScriptParser { src, pos: 0, ere, posix, null_data, part_ends, regexes: Vec::new() };
     let mut cmds: Vec<Cmd> = Vec::new();
     let mut labels: BTreeMap<Vec<u8>, usize> = BTreeMap::new();
     let mut open_blocks: Vec<usize> = Vec::new();
@@ -1686,8 +1691,9 @@ fn compile_script(
     sandbox: bool,
     null_data: bool,
     part_ends: Vec<usize>,
+    posix: bool,
 ) -> Result<Script, Fatal> {
-    let mut script = parse_script(src, ere, null_data, part_ends)?;
+    let mut script = parse_script(src, ere, null_data, part_ends, posix)?;
     if sandbox {
         check_sandbox(&script.cmds)?;
     }
@@ -1971,7 +1977,7 @@ fn run(args: &[Vec<u8>]) -> Result<i32, Fatal> {
         conf.suppress = true;
     }
 
-    let script = compile_script(&source, conf.ere, conf.sandbox, conf.null_data, part_ends)?;
+    let script = compile_script(&source, conf.ere, conf.sandbox, conf.null_data, part_ends, conf.posix)?;
     let separator = separator_for(conf.null_data);
     let seed = seed_ranges(&script.cmds);
     let mut sed = Sed {
@@ -2805,7 +2811,7 @@ mod tests {
         let ere = opts.contains(&"-E") || opts.contains(&"-r");
         let null_data = opts.contains(&"-z");
         let sep = separator_for(null_data);
-        let script = compile_script(script.as_bytes(), ere, false, null_data, Vec::new()).unwrap();
+        let script = compile_script(script.as_bytes(), ere, false, null_data, Vec::new(), false).unwrap();
         let nranges = script.cmds.len();
         let seed = seed_ranges(&script.cmds);
         let mut sed = Sed {
@@ -3067,7 +3073,7 @@ mod tests {
             (b"y/a\n/xy/", "unterminated `y' command"),
             (b"/a\nb/p", "unterminated address regex"),
         ] {
-            let err = compile_script(script, false, false, false, Vec::new()).err();
+            let err = compile_script(script, false, false, false, Vec::new(), false).err();
             assert_eq!(
                 err.map(|f| f.msg),
                 Some(msg.to_string()),
@@ -3095,13 +3101,13 @@ mod tests {
         // closer overlapping it is missed and the parity shows.
         // An even name-length CLOSES, and is then rejected for its name.
         assert_eq!(
-            compile_script(b"s/[[....]]/X/", false, false, false, Vec::new())
+            compile_script(b"s/[[....]]/X/", false, false, false, Vec::new(), false)
                 .err()
                 .map(|f| f.msg),
             Some("Invalid collation character".to_string())
         );
         for script in [&b"s/[[...]]/X/"[..], b"s/[[.....]]/X/", b"s/[[:::]]/X/", b"s/[[===]]/X/"] {
-            let err = compile_script(script, false, false, false, Vec::new()).err();
+            let err = compile_script(script, false, false, false, Vec::new(), false).err();
             assert_eq!(
                 err.map(|f| f.msg),
                 Some("unterminated `s' command".to_string()),
@@ -3112,7 +3118,7 @@ mod tests {
         // The closer must be the character that opened it, so these run off the
         // end of the script rather than closing a set.
         for script in [&b"s/[[:alpha:]/X/"[..], b"s/[[:alpha.]]/X/", b"s/[[:]]/X/"] {
-            let err = compile_script(script, false, false, false, Vec::new()).err();
+            let err = compile_script(script, false, false, false, Vec::new(), false).err();
             assert_eq!(
                 err.map(|f| f.msg),
                 Some("unterminated `s' command".to_string()),
@@ -3126,10 +3132,10 @@ mod tests {
     /// exits 4, alone among pattern errors.
     #[test]
     fn the_bare_class_syntax_refusal_is_exit_4_where_other_pattern_errors_are_1() {
-        let f = compile_script(b"s@[:alpha:]@X@", false, false, false, Vec::new()).err();
+        let f = compile_script(b"s@[:alpha:]@X@", false, false, false, Vec::new(), false).err();
         assert_eq!(f.as_ref().map(|f| f.status), Some(4));
         assert_eq!(f.map(|f| f.msg), Some(crate::regex::CLASS_SYNTAX.to_string()));
-        let f = compile_script(b"s@[[:a:]]@X@", false, false, false, Vec::new()).err();
+        let f = compile_script(b"s@[[:a:]]@X@", false, false, false, Vec::new(), false).err();
         assert_eq!(f.map(|f| f.status), Some(1));
     }
 
@@ -3138,11 +3144,11 @@ mod tests {
         // A bad script is status 1; an unresolvable branch is a RUNTIME error,
         // which GNU reports as 4.
         for bad in [&b"k"[..], b"s/a/b", b"{p"] {
-            let err = compile_script(bad, false, false, false, Vec::new()).err().map(|f| f.status);
+            let err = compile_script(bad, false, false, false, Vec::new(), false).err().map(|f| f.status);
             assert_eq!(err, Some(1), "{:?} must be a status-1 script error", bad);
         }
         assert_eq!(
-            compile_script(b"bnowhere", false, false, false, Vec::new()).err().map(|f| f.status),
+            compile_script(b"bnowhere", false, false, false, Vec::new(), false).err().map(|f| f.status),
             Some(4)
         );
     }
@@ -3152,7 +3158,7 @@ mod tests {
     #[test]
     fn a_text_command_needs_text_only_where_its_part_ends() {
         let compile = |src: &[u8], parts: Vec<usize>| {
-            compile_script(src, false, false, false, parts).err().map(|f| f.status)
+            compile_script(src, false, false, false, parts, false).err().map(|f| f.status)
         };
         // `sed a` and `sed -e a -e p`: nothing after the command in its own part.
         assert_eq!(compile(b"a", Vec::new()), Some(1));
