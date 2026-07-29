@@ -30,6 +30,7 @@ use std::fs::File;
 use std::io;
 use std::os::fd::AsRawFd;
 
+use crate::devt;
 use crate::sys;
 
 /// `losetup -r <loop-device> <backing-file>`.
@@ -115,9 +116,9 @@ fn refuse_if_writable(device: &str, readonly: bool) -> io::Result<()> {
 /// number comes off the OPENED device, so the answer cannot be about a
 /// different device than the one the ioctl was issued to.
 fn read_only(loop_device: &File) -> io::Result<bool> {
-    use std::os::linux::fs::MetadataExt;
-    let rdev = loop_device.metadata()?.st_rdev();
-    let path = format!("/sys/dev/block/{}:{}/ro", major(rdev), minor(rdev));
+    use std::os::unix::fs::MetadataExt;
+    let rdev = loop_device.metadata()?.rdev();
+    let path = format!("/sys/dev/block/{}:{}/ro", devt::major(rdev), devt::minor(rdev));
     let text = std::fs::read_to_string(&path)
         .map_err(|e| io::Error::new(e.kind(), format!("{path}: {e}")))?;
     Ok(ro_flag(&text))
@@ -128,16 +129,6 @@ fn read_only(loop_device: &File) -> io::Result<bool> {
 /// generous about it.
 fn ro_flag(text: &str) -> bool {
     text.trim() == "1"
-}
-
-/// glibc's `gnu_dev_major`/`gnu_dev_minor`, which is how Linux packs a `dev_t`.
-/// Spelled out because getting these wrong reads a DIFFERENT device's `ro`.
-fn major(rdev: u64) -> u64 {
-    ((rdev >> 8) & 0xfff) | ((rdev >> 32) & !0xfff)
-}
-
-fn minor(rdev: u64) -> u64 {
-    (rdev & 0xff) | ((rdev >> 12) & !0xff)
 }
 
 #[cfg(test)]
@@ -222,19 +213,6 @@ mod tests {
                 .is_some_and(|e| e.to_string().contains("/dev/loop0")),
             "the refusal must name the device"
         );
-    }
-
-    /// The device numbers are unpacked the way Linux packs them. Getting these
-    /// wrong reads a DIFFERENT device's `ro` and still answers confidently.
-    #[test]
-    fn device_numbers_are_unpacked_the_way_the_kernel_packs_them() {
-        // loop0 is 7:0, loop9 is 7:9 — the pairs this applet actually meets.
-        assert_eq!((major(0x0700), minor(0x0700)), (7, 0));
-        assert_eq!((major(0x0709), minor(0x0709)), (7, 9));
-        // A minor above 255 spills into the high bits; a naive `rdev & 0xff`
-        // would report 0 for 7:256 and read loop0's flag instead.
-        let big = (7u64 << 8) | (256u64 & 0xff) | ((256u64 & !0xff) << 12);
-        assert_eq!((major(big), minor(big)), (7, 256));
     }
 
     /// Something with no block sysfs node at all is an ERROR, not a silent

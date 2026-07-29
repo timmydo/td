@@ -1365,6 +1365,10 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
     assert_target!("td-init/src/sys.rs", "recipe-checks");
     assert_target!("td-init/src/losetup.rs", "check");
     assert_target!("td-init/src/losetup.rs", "recipe-checks");
+    assert_target!("td-init/src/devt.rs", "check");
+    assert_target!("td-init/src/devt.rs", "recipe-checks");
+    assert_target!("td-init/src/mknod.rs", "check");
+    assert_target!("td-init/src/mknod.rs", "recipe-checks");
     assert_target!("td-init/src/syncfs.rs", "check");
     assert_target!("td-init/src/syncfs.rs", "recipe-checks");
     assert_target!("td-init/Cargo.lock", "check");

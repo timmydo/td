@@ -511,12 +511,11 @@ fn td_init_probe(applet: &str, probe: &Probe, sys: &SystemDef) -> String {
 /// deleting the question — those probes WRITE now (see `build_rootcheck`), which is
 /// ground truth rather than a prediction of it, so the applet never serves `-w`.
 ///
-/// What is left, and why each is still here:
-///
-/// - `sh` is the /init and /etc script interpreter; td-sh is not shipped yet.
-/// - `mknod` because `mknod(2)` is a syscall no safe `std` reaches; moving it is a
-///   reviewed amendment to td-init's roster, not an approximation to slip in.
-const INITRAMFS_APPLETS: &[&str] = &["mknod", "sh"];
+/// `mknod` left with td-init's tenth syscall — the amendment that also gave the
+/// crate one `dev_t` packing instead of two, and a readback that unlinks a node
+/// the kernel disagrees about. What remains is `sh`: the /init and /etc script
+/// interpreter, until td-sh ships.
+const INITRAMFS_APPLETS: &[&str] = &["sh"];
 
 /// The diagnostics userland, served by the static td-util multicall — the busybox names
 /// uutils does not provide. Like busybox and uutils it dispatches on argv[0]'s basename, so
@@ -965,6 +964,12 @@ fn build_selector_init() -> String {
 /// The selected deployment initramfs requires exactly one td.deployment handoff,
 /// validates that manifest and root payload, and enters the immutable root.
 fn build_deployment_init(sys: &SystemDef) -> String {
+    // The loop node is created at RUNTIME, not by a `nod` line in the cpio: /dev is
+    // devtmpfs from the first line below, which shadows whatever the cpio put at
+    // /dev/loop0. So it has to be made in the devtmpfs, after the mount — and it
+    // has to be made at all, because the kernel only populates loop0 there when the
+    // loop driver registered it, which is a config away from not happening.
+    //
     // /dev/vda is one Btrfs filesystem. The top-level vfsmount stays read-only,
     // while the shared Btrfs superblock becomes writable for the @var mount. The
     // mount flag prevents accidental writes, not a privileged remount by root.
@@ -989,7 +994,7 @@ fn build_deployment_init(sys: &SystemDef) -> String {
      done\n\
      /bin/td-util test -n \"$deployment\" || { echo 'td-init: missing td.deployment handoff' >&2; exit 1; }\n\
      /bin/mount -t btrfs -o ro,nodev,nosuid,noexec /dev/vda /volume\n\
-     if ! /bin/td-util test -b /dev/loop0; then /bin/busybox mknod /dev/loop0 b 7 0; fi\n\
+     if ! /bin/td-util test -b /dev/loop0; then /bin/mknod /dev/loop0 b 7 0; fi\n\
      /bin/td-boot root-loop /volume \"$deployment\" /dev/loop0\n\
      /bin/mount -t erofs -o ro /dev/loop0 /sysroot\n\
      /bin/mount -t btrfs -o rw,nodev,nosuid,subvol=@var /dev/vda /sysroot/var\n\
@@ -1877,6 +1882,9 @@ fn build_initramfs_spec(init: &str, phase: Phase) -> String {
         Phase::Deployment => {
             s.push_str("slink /bin/switch_root {in:td-init}/bin/td-init 0777 0 0\n");
             s.push_str("slink /bin/losetup {in:td-init}/bin/td-init 0777 0 0\n");
+            // `mknod` joins them for the same reason: only this /init creates
+            // /dev/loop0, because only this one has a loop to bind.
+            s.push_str("slink /bin/mknod {in:td-init}/bin/td-init 0777 0 0\n");
         }
     }
     s.push_str("nod /dev/console 0600 0 0 c 5 1\n");
@@ -4986,6 +4994,22 @@ mod tests {
             boot.is_none() || sysfs < boot,
             "sysfs must be mounted BEFORE td-boot runs, not after"
         );
+        // The loop node is created INTO the devtmpfs, so the mount must come first:
+        // before it, the node lands in the initramfs rootfs and is then shadowed by
+        // the mount, leaving td-boot with nothing to open and no error saying why.
+        let devtmpfs = init
+            .match_indices("mount -t devtmpfs dev /dev")
+            .next()
+            .map(|(at, _)| at);
+        let mknod = init.match_indices("/bin/mknod ").next().map(|(at, _)| at);
+        assert!(
+            devtmpfs.is_some() && mknod.is_some(),
+            "/init must mount devtmpfs and create the loop node"
+        );
+        assert!(
+            devtmpfs < mknod && mknod < boot,
+            "mknod must run AFTER the devtmpfs mount and BEFORE td-boot binds the loop"
+        );
         // ...and released before the pivot, with /proc and /dev. switch_root MOVES
         // whatever of the API mounts it finds, so leaving this one behind stacks a
         // second sysfs under the one sysinit mounts on the real root.
@@ -5009,6 +5033,11 @@ mod tests {
             deployment.contains("slink /bin/switch_root {in:td-init}/bin/td-init 0777 0 0")
                 && !selector.contains("switch_root"),
             "only the deployment initramfs may expose the pivot as /bin/switch_root"
+        );
+        assert!(
+            deployment.contains("slink /bin/mknod {in:td-init}/bin/td-init 0777 0 0")
+                && !selector.contains("mknod"),
+            "only the deployment initramfs creates /dev/loop0, so only it may carry mknod"
         );
         // td-boot invokes NO busybox applet now: `losetup` was the last, and it is a
         // td-init applet since the LOOP_SET_FD amendment. Asserted rather than left to

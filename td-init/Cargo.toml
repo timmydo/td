@@ -24,7 +24,7 @@ path = "src/main.rs"
 #
 # unsafe is confined in SOURCE, not here: src/main.rs `#![deny(unsafe_code)]`s the
 # whole crate and src/sys.rs scopes a `#[allow]` to `syscall5` — the one raw
-# syscall body, through which the nine amended syscalls go. This is the THIRD
+# syscall body, through which the ten amended syscalls go. This is the THIRD
 # target-side unsafe surface after td-kexec and td-netd (a recorded AGENTS.md
 # amendment). The `deny` reds an added `unsafe`, but a module can demote that
 # lint without using `unsafe` at all, so `main.rs`'s confinement tests are the

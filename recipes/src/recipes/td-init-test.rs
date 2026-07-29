@@ -102,11 +102,11 @@ pub fn recipe() -> Recipe {
                 "-c",
                 &format!(
                     "l=$('{bin}' --list) || {{ echo 'td-init --list failed' >&2; exit 1; }}; \
-                     for a in cttyhack halt hostname init losetup mount poweroff reboot switch_root sync umount; do \
+                     for a in cttyhack halt hostname init losetup mknod mount poweroff reboot switch_root sync umount; do \
                          printf '%s\\n' \"$l\" | grep -q -x -F \"$a\" || {{ echo \"td-init does not serve applet '$a'\" >&2; exit 1; }}; \
                      done; \
                      n=$(printf '%s\\n' \"$l\" | wc -l); \
-                     [ \"$n\" -eq 11 ] || {{ echo \"td-init serves $n applets, expected exactly 11 — update this check deliberately when adding one\" >&2; exit 1; }}"
+                     [ \"$n\" -eq 12 ] || {{ echo \"td-init serves $n applets, expected exactly 12 — update this check deliberately when adding one\" >&2; exit 1; }}"
                 ),
             ],
         )
@@ -158,6 +158,15 @@ pub fn recipe() -> Recipe {
                      e=$('{bin}' losetup --not-an-option 2>&1); \
                      [ $? -eq 1 ] || {{ echo 'losetup must reject a bad argument with exit 1 — reaching LOOP_SET_FD on a typo would bind a device nobody named' >&2; exit 1; }}; \
                      printf '%s\\n' \"$e\" | grep -q 'usage: losetup' || {{ echo \"losetup rejected the argument without saying so: '$e'\" >&2; exit 1; }}; \
+                     e=$('{bin}' mknod {{root}}/mknod-probe c 7 0 2>&1); \
+                     [ $? -eq 1 ] || {{ echo 'mknod must refuse a non-block type with exit 1' >&2; exit 1; }}; \
+                     printf '%s\\n' \"$e\" | grep -q 'BLOCK nodes only' || {{ echo \"mknod refused the type without saying so: '$e'\" >&2; exit 1; }}; \
+                     e=$('{bin}' mknod {{root}}/mknod-probe b 4096 0 2>&1); \
+                     [ $? -eq 1 ] || {{ echo 'mknod must refuse an unencodable major with exit 1 — truncating it silently would create a node for driver 0' >&2; exit 1; }}; \
+                     printf '%s\\n' \"$e\" | grep -q 'does not fit' || {{ echo \"mknod refused the major without saying so: '$e'\" >&2; exit 1; }}; \
+                     [ ! -e {{root}}/mknod-probe ] || {{ echo 'a refused mknod must not have created anything' >&2; exit 1; }}; \
+                     e=$('{bin}' mknod {{root}}/mknod-probe b 7 2>&1); \
+                     [ $? -eq 1 ] || {{ echo 'mknod must refuse a short operand list with exit 1' >&2; exit 1; }}; \
                      e=$('{bin}' losetup -r dev/loop0 /img 2>&1); \
                      [ $? -eq 1 ] || {{ echo 'losetup must refuse a relative path with exit 1' >&2; exit 1; }}"
                 ),
@@ -332,7 +341,7 @@ pub fn recipe() -> Recipe {
     });
     steps.push(Step::WriteFile {
         path: "{out}/result".into(),
-        content: "PASS: td-init is a statically-linked ELF64 x86-64 executable (ET_EXEC) with no PT_INTERP and no dynamic NEEDED entry; it serves exactly the nine applets cttyhack/halt/hostname/init/mount/poweroff/reboot/switch_root/umount, dispatches through both the argv[0] and `td-init <applet>` forms, rejects an unknown reboot option before reaching reboot(2), validates an inittab through `init --dry-run` (exit 1 on a rejected line), refuses a switch_root into a new root with no executable init, refuses an unknown mount/umount argument before reaching mount(2)/umount2(2) and a lone mount operand td has no fstab to resolve, and prints the mount table and the hostname where /proc is mounted\n".into(),
+        content: "PASS: td-init is a statically-linked ELF64 x86-64 executable (ET_EXEC) with no PT_INTERP and no dynamic NEEDED entry; it serves exactly the twelve applets cttyhack/halt/hostname/init/losetup/mknod/mount/poweroff/reboot/switch_root/sync/umount, dispatches through both the argv[0] and `td-init <applet>` forms, rejects an unknown reboot option before reaching reboot(2), validates an inittab through `init --dry-run` (exit 1 on a rejected line), refuses a switch_root into a new root with no executable init, refuses a non-block or unencodable mknod before reaching mknod(2), refuses an unknown mount/umount argument before reaching mount(2)/umount2(2) and a lone mount operand td has no fstab to resolve, and prints the mount table and the hostname where /proc is mounted\n".into(),
         exec: false,
     });
     steps.push(Step::Require {
@@ -345,7 +354,7 @@ pub fn recipe() -> Recipe {
         .steps(steps)
         .checks(vec![RecipeCheck::new(
             r#"
-echo ">> recipe-check td-init-test: build-plan --auto builds td-init (td's static boot-glue multicall: init/reboot/poweroff/halt/switch_root/mount/umount/cttyhack/hostname, statically linked by the /td/store target Rust + native GCC/binutils/glibc toolchain), asserts a self-contained static ELF64 x86-64 executable (ET_EXEC, no PT_INTERP, no dynamic NEEDED), and exercises the applet roster, both dispatch forms, the inittab validator, the mount-table listing, and the fail-early/reject paths of the irreversible applets"
+echo ">> recipe-check td-init-test: build-plan --auto builds td-init (td's static boot-glue multicall: init/reboot/poweroff/halt/switch_root/mount/umount/cttyhack/hostname/losetup/mknod/sync, statically linked by the /td/store target Rust + native GCC/binutils/glibc toolchain), asserts a self-contained static ELF64 x86-64 executable (ET_EXEC, no PT_INTERP, no dynamic NEEDED), and exercises the applet roster, both dispatch forms, the inittab validator, the mount-table listing, and the fail-early/reject paths of the irreversible applets"
 : "${TD_RECIPE_EVAL:=$PWD/target/release/td-recipe-eval}"
 exec "$TD_RECIPE_EVAL" check-run td-init-test 1
 "#,

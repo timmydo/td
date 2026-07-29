@@ -295,12 +295,34 @@ td's Rust is defensive and minimal-surface.
   (SIOCSIFFLAGS/ADDR/NETMASK, SIOCGIFHWADDR, SIOCADDRT) go — all its socket I/O rides
   `std`, so DHCP needs no AF_PACKET raw socket; and (3) the `td-init` boot-glue
   multicall, whose one `syscall5` body in `td-init/src/sys.rs` carries EXACTLY these
-  nine syscalls, one per applet that safe `std` cannot reach: `reboot(2)` + `sync(2)`
+  ten syscalls, one per applet that safe `std` cannot reach: `reboot(2)` + `sync(2)`
   (reboot/poweroff/halt), `mount(2)` + `umount2(2)` (mount/umount, and switch_root's
   `MS_MOVE`), `chroot(2)` (switch_root), `setsid(2)` + `ioctl(2)` (cttyhack and
-  losetup), `sethostname(2)` (`hostname -F`, the flag uutils lacks), and
+  losetup), `sethostname(2)` (`hostname -F`, the flag uutils lacks),
   `wait4(2)` (init, which as PID 1 must reap the orphans a targeted `Child::wait`
-  cannot see). `ioctl(2)` is the one with TWO permitted requests — `TIOCSCTTY`
+  cannot see), and `mknod(2)` — the tenth, and the last privileged busybox job on
+  the boot path. The deployment initramfs mounts devtmpfs on `/dev` first thing, so
+  `/dev/loop0` normally comes from the kernel; this is the fallback for when the
+  loop driver registered none, and it cannot come from a cpio `nod` line because
+  the devtmpfs mount shadows whatever was there. Unlike `losetup` and `kill`, the
+  busybox spelling here WAS build-time checked — `INITRAMFS_APPLETS` names are
+  swept against `busybox --list` — so this is not that argument. What it buys is
+  narrower and real, and it is all about the ARGUMENT rather than the call: `dev`
+  is one integer with major and minor packed into disjoint bit ranges, and a wrong
+  packing is a well-formed node pointing at a DIFFERENT driver, which `mknod(2)`
+  creates and reports success for. So the crate now has exactly one `dev_t`
+  packing (`td-init/src/devt.rs`, replacing the private copy `losetup` carried),
+  an encode that REFUSES an unencodable pair rather than truncating it, and a
+  readback that stats the created node and unlinks it — reporting BOTH failures if
+  the unlink also fails — unless the kernel agrees about both numbers. Same
+  "nothing observable distinguishes the wrong outcome" argument that made
+  `losetup` re-read its read-only flag out of sysfs. `mknod.rs` is the only
+  permitted caller of `sys::mknod`, asserted like `mount`'s and `attach_loop`'s,
+  because `mode`'s top bits are the node type and so choose the driver class.
+  Only BLOCK nodes are served; `c`/`u`/`p` are refused, since nothing on td's
+  boot path creates one and the type is the part of `mode` that picks the driver.
+  An ELEVENTH syscall is an amendment here.
+  `ioctl(2)` is the one with TWO permitted requests — `TIOCSCTTY`
   for cttyhack and `LOOP_SET_FD` for the `losetup` applet — both pinned by value,
   so widening that roster is as reviewable as adding a syscall to it. `losetup`
   is why `td-boot` no longer runs any third-party program: attaching the
@@ -337,8 +359,9 @@ td's Rust is defensive and minimal-surface.
   initramfs rootfs, so switch_root moves the mount as util-linux and busybox do),
   `fork`/`execve` (`Command` plus the safe `CommandExt::exec` cover both), `dup2`
   (`Stdio::from(File)` wires the console), and any signal handler — which is why td's
-  init supports no `ctrlaltdel`, `shutdown` or `restart` inittab action. A tenth
-  syscall, a new `MS_*` bit, or a second scoped `#[allow]` is an amendment here;
+  init supports no `ctrlaltdel`, `shutdown` or `restart` inittab action. An
+  ELEVENTH syscall, a new `MS_*` bit, or a second scoped `#[allow]` is an
+  amendment here;
   `td-init/src/main.rs`'s confinement tests assert all three against the crate's own
   source, since the compiler alone cannot. And (4) the
   `td-login` credential multicall (`login`/`su`), whose one `syscall2` body in

@@ -9,9 +9,10 @@ use crate::types::{Recipe, Step};
 // `recipes/src/recipes/*.rs` catalog glob, so it is not itself a recipe module.
 //
 // SCOPE: the busybox applets that need a RAW SYSCALL — `init` (wait4), `reboot`/
-// `poweroff`/`halt` (reboot), `switch_root` (mount MS_MOVE + chroot), `mount`/
-// `umount` (mount + umount2), `cttyhack` (setsid + TIOCSCTTY), and `hostname`
-// (sethostname, the `-F` flag uutils lacks). That is the complement of td-util,
+// `poweroff`/`halt` (reboot), `sync` (sync), `switch_root` (mount MS_MOVE +
+// chroot), `mount`/`umount` (mount + umount2), `cttyhack` (setsid + TIOCSCTTY),
+// `losetup` (ioctl LOOP_SET_FD), `mknod` (mknod), and `hostname` (sethostname,
+// the `-F` flag uutils lacks). That is the complement of td-util,
 // which covers the applets safe `std` already reaches and is
 // `#![forbid(unsafe_code)]` as a result. The crate confines its `unsafe` to one
 // `syscall5` body under a scoped `#[allow]` beneath a crate-level `deny` — the
@@ -19,7 +20,7 @@ use crate::types::{Recipe, Step};
 // td-netd.
 //
 // system-x86-64 SHIPS this: /init (PID 1), both initramfses' mount pair, the
-// deployment initramfs' switch_root pivot, and a /bin farm of all nine names.
+// deployment initramfs' switch_root/losetup/mknod trio, and a /bin farm.
 // Unlike the td-util cutover, most of these applets cannot be probed from the
 // greeter — running `reboot` successfully ends the boot, `mount` mutates the
 // running system, and `init`/`switch_root` have already done their work by the
@@ -58,10 +59,12 @@ const MAIN_RS: &str = include_str!("../../../td-init/src/main.rs");
 // (module basename, source text). rustc resolves `mod NAME;` to `{src}/NAME.rs`.
 const MODULES: &[(&str, &str)] = &[
     ("cttyhack", include_str!("../../../td-init/src/cttyhack.rs")),
+    ("devt", include_str!("../../../td-init/src/devt.rs")),
     ("halt", include_str!("../../../td-init/src/halt.rs")),
     ("hostname", include_str!("../../../td-init/src/hostname.rs")),
     ("init", include_str!("../../../td-init/src/init.rs")),
     ("losetup", include_str!("../../../td-init/src/losetup.rs")),
+    ("mknod", include_str!("../../../td-init/src/mknod.rs")),
     ("mount", include_str!("../../../td-init/src/mount.rs")),
     ("switchroot", include_str!("../../../td-init/src/switchroot.rs")),
     ("syncfs", include_str!("../../../td-init/src/syncfs.rs")),
@@ -182,4 +185,47 @@ pub fn recipe() -> Recipe {
             "glibc-x86-64",
         ])
         .steps(steps)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{MAIN_RS, MODULES};
+
+    /// Every `mod NAME;` in main.rs must have its source embedded here.
+    ///
+    /// The recipe writes `{src}/NAME.rs` per MODULES entry and rustc resolves the
+    /// `mod` line against that directory, so a name declared but not embedded is a
+    /// compile error inside the sandbox — surfacing only in the heavy recipe leg,
+    /// long after a green `cargo test`. The reverse (an embedded module nothing
+    /// declares) is dead source shipped into the build, so both directions red.
+    /// Same guard as td-util's, added here for the same reason.
+    #[test]
+    fn modules_match_the_mod_lines_in_main_rs() {
+        let mut declared: Vec<&str> = MAIN_RS
+            .lines()
+            .map(str::trim)
+            .filter_map(|l| l.strip_prefix("mod ").and_then(|r| r.strip_suffix(';')))
+            .collect();
+        declared.sort_unstable();
+        // `#[cfg(test)] mod tests { ... }` and `mod confinement { ... }` are brace
+        // forms, so the `;` suffix above already excludes them; assert that rather
+        // than trusting it.
+        for inline in ["tests", "confinement"] {
+            assert!(
+                !declared.contains(&inline),
+                "`mod {inline}` is inline, not a file, and must not be embedded"
+            );
+        }
+        let mut embedded: Vec<&str> = MODULES.iter().map(|(n, _)| *n).collect();
+        embedded.sort_unstable();
+        assert_eq!(
+            declared, embedded,
+            "MODULES and main.rs's `mod` lines disagree — a name in one and not the \
+             other only reds when the recipe builds"
+        );
+        assert!(
+            !declared.is_empty(),
+            "parsing found no `mod` lines at all, so this test would pass vacuously"
+        );
+    }
 }

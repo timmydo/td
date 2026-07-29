@@ -14,7 +14,7 @@
 //! to `sys.rs` — one `syscall5` body under a scoped `#[allow]`. That is the THIRD
 //! target-side unsafe exception AGENTS.md records, after td-kexec and td-netd.
 //! The `deny` above is the first line of that, not the last: `mod confinement`
-//! below is what actually holds the surface to nine syscalls and one asm body,
+//! below is what actually holds the surface to ten syscalls and one asm body,
 //! because a lint level can be demoted and the compiler cannot count syscalls.
 //!
 //! Dispatch is on argv[0]'s basename, the busybox/uutils convention, so a
@@ -23,10 +23,12 @@
 //! covers the un-symlinked case.
 
 mod cttyhack;
+mod devt;
 mod halt;
 mod hostname;
 mod init;
 mod losetup;
+mod mknod;
 mod mount;
 mod switchroot;
 mod syncfs;
@@ -46,6 +48,7 @@ const APPLETS: &[(&str, Applet)] = &[
     ("hostname", hostname::run),
     ("init", init::run),
     ("losetup", losetup::run),
+    ("mknod", mknod::run),
     ("mount", mount::mount),
     ("poweroff", halt::poweroff),
     ("reboot", halt::reboot),
@@ -374,7 +377,7 @@ mod tests {
     /// The roster is the shipped /bin symlink farm, so a rename is a visible
     /// change to the image, not an internal one.
     #[test]
-    fn the_roster_is_the_amended_eleven() {
+    fn the_roster_is_the_amended_twelve() {
         assert_eq!(
             names(),
             vec![
@@ -383,6 +386,7 @@ mod tests {
                 "hostname",
                 "init",
                 "losetup",
+                "mknod",
                 "mount",
                 "poweroff",
                 "reboot",
@@ -605,8 +609,8 @@ mod confinement {
     }
 
     /// The syscalls AGENTS.md records for this crate, with the x86_64 number
-    /// each name must carry. A ninth is a reviewed amendment; this test is what
-    /// makes that more than an aspiration.
+    /// each name must carry. An ELEVENTH is a reviewed amendment; this test is
+    /// what makes that more than an aspiration.
     ///
     /// The NUMBERS are pinned, not just the names: renumbering `SYS_MOUNT` to
     /// 165's neighbour would otherwise change which kernel call this crate makes
@@ -614,6 +618,7 @@ mod confinement {
     const AMENDED: &[(&str, &str)] = &[
         ("SYS_CHROOT", "161"),
         ("SYS_IOCTL", "16"),
+        ("SYS_MKNOD", "133"),
         ("SYS_MOUNT", "165"),
         ("SYS_REBOOT", "169"),
         ("SYS_SETHOSTNAME", "170"),
@@ -772,7 +777,7 @@ mod confinement {
                 declared.push(target);
             }
         }
-        assert_eq!(declared.len(), 9, "expected nine modules beside the crate root");
+        assert_eq!(declared.len(), 11, "expected eleven modules beside the crate root");
         // ...and nothing scanned is orphaned: a file present but declared by no
         // `mod` line is either dead or reached a way this scan does not model,
         // and either way the counts above stop meaning what they say. Matching on
@@ -799,18 +804,20 @@ mod confinement {
     /// skipping them: `src/sys.inc` is invisible to a `.rs`-only scan and
     /// compiles perfectly well through the constructs refused below.
     #[test]
-    fn src_holds_exactly_the_ten_scanned_modules() {
+    fn src_holds_exactly_the_twelve_scanned_modules() {
         let (rs, other) = walk();
         let paths: Vec<&str> = rs.iter().map(|(p, _)| p.as_str()).collect();
         assert_eq!(
             paths,
             [
                 "cttyhack.rs",
+                "devt.rs",
                 "halt.rs",
                 "hostname.rs",
                 "init.rs",
                 "losetup.rs",
                 "main.rs",
+                "mknod.rs",
                 "mount.rs",
                 "switchroot.rs",
                 "syncfs.rs",
@@ -960,7 +967,7 @@ mod confinement {
     /// and call-site assertion here still green. Squeezed, position on a line
     /// stops existing.
     #[test]
-    fn the_syscall_surface_is_the_amended_nine() {
+    fn the_syscall_surface_is_the_amended_ten() {
         const DECL: &str = concat!("const", "SYS_");
         let sys = squeeze(&source("sys.rs"));
         let mut declared = Vec::new();
@@ -978,7 +985,7 @@ mod confinement {
             }
         }
         // Nothing was dropped by the parse: an entry the loop skipped would
-        // leave a roster that matches while a ninth declaration exists.
+        // leave a roster that matches while an eleventh declaration exists.
         assert_eq!(
             declared.len(),
             sys.matches(DECL).count(),
@@ -1034,7 +1041,7 @@ mod confinement {
         }
     }
 
-    /// All nine calls, pinned WHOLE — every register, not just the selector.
+    /// All ten calls, pinned WHOLE — every register, not just the selector.
     ///
     /// `every_syscall_call_site_uses_a_named_constant` reads argument ONE and
     /// stops. The other five are where the amendment's restrictions actually
@@ -1058,6 +1065,7 @@ mod confinement {
             "(SYS_CHROOT,path.as_ptr()asusize,0,0,0,0)",
             "(SYS_SETHOSTNAME,name.as_ptr()asusize,name.len(),0,0,0,)",
             "(SYS_SETSID,0,0,0,0,0)",
+            "(SYS_MKNOD,path.as_ptr()asusize,mode,dev,0,0)",
             "(SYS_IOCTL,fdasusize,TIOCSCTTY,NO_STEAL,0,0)",
             "(SYS_IOCTL,loop_fdasusize,LOOP_SET_FD,backing_fdasusize,0,0,)",
             "(SYS_WAIT4,PID_ANY,ptr::addr_of_mut!(status)asusize,opts,0,0,)",
@@ -1190,6 +1198,10 @@ mod confinement {
             // call it can bind an arbitrary open file to an arbitrary loop
             // device. One caller is what keeps the read-back below meaningful.
             (concat!("sys::", "attach_loop"), &["losetup.rs"][..]),
+            // `mknod` takes `mode`, whose top bits are the node TYPE and so choose
+            // the driver class. A caller outside `mknod.rs` could compose a
+            // character node and skip the readback that makes this applet safe.
+            (concat!("sys::", "mknod"), &["mknod.rs"][..]),
         ] {
             for (path, text) in sources() {
                 if path == "sys.rs" || path == "main.rs" || permitted.contains(&path.as_str()) {
@@ -1356,7 +1368,7 @@ mod confinement {
                 .collect();
             assert!(
                 AMENDED.iter().any(|(name, _)| *name == selector),
-                "called with '{selector}', which is not one of the amended nine"
+                "called with '{selector}', which is not one of the amended ten"
             );
             // The constant must BE the argument, not the start of an expression:
             // `SYS_REBOOT - 130` selects getpid(2) while spelling an audited
@@ -1368,7 +1380,7 @@ mod confinement {
             );
             selected.push(selector);
         }
-        // Each of the nine exactly once, EXCEPT ioctl, which is issued twice
+        // Each of the ten exactly once, EXCEPT ioctl, which is issued twice
         // because it is the one syscall with two permitted requests
         // (`TIOCSCTTY` for cttyhack, `LOOP_SET_FD` for losetup). Membership
         // alone would let every site name SYS_REBOOT while a wrapper quietly
@@ -1384,19 +1396,19 @@ mod confinement {
         );
         // One call per wrapper: reboot, sync, mount, umount2, chroot,
         // sethostname, setsid, ioctl x2, wait4.
-        assert_eq!(sites, 10, "expected exactly ten call sites");
+        assert_eq!(sites, 11, "expected exactly eleven call sites");
         // ...and the definition, and NOTHING else. The loop skips any mention
         // not followed by `(`, which is the function ITEM: bind it once and
         // every later call goes through a name this scan does not know.
         assert_eq!(
             mentions,
             sites + 1,
-            "mentioned somewhere that is not one of the ten calls or its definition"
+            "mentioned somewhere that is not one of the eleven calls or its definition"
         );
     }
 
     /// The raw entry point is private to `sys.rs`, and the module header says so
-    /// — "its confinement is module privacy plus the eight typed wrappers being
+    /// — "its confinement is module privacy plus the typed wrappers being
     /// its only callers". Nothing checked it: the scan above reads `sys.rs`
     /// alone, so exporting the function and calling it from another module put
     /// a ninth syscall in the binary with all eight audited sites intact.

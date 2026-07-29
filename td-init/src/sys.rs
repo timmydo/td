@@ -13,8 +13,8 @@
 //! — then compiles. `main.rs`'s confinement tests are what close that, and they
 //! are the durable enforcement here.
 //!
-//! The amended surface is exactly the nine syscalls below, one per boot-glue
-//! applet requirement that safe `std` does not expose. A TENTH is a reviewed
+//! The amended surface is exactly the ten syscalls below, one per boot-glue
+//! applet requirement that safe `std` does not expose. An ELEVENTH is a reviewed
 //! amendment, not an edit; `main.rs`'s confinement test asserts the roster.
 //! `ioctl(2)` is the one with TWO permitted requests — `TIOCSCTTY` for
 //! cttyhack and `LOOP_SET_FD` for losetup — and both are pinned by value, so
@@ -32,8 +32,9 @@ use std::ptr;
 #[cfg(not(all(target_arch = "x86_64", target_os = "linux")))]
 compile_error!("td-init is x86_64-linux only (raw syscall ABI)");
 
-// The amended nine (x86_64 syscall numbers).
+// The amended ten (x86_64 syscall numbers).
 const SYS_IOCTL: usize = 16;
+const SYS_MKNOD: usize = 133;
 const SYS_WAIT4: usize = 61;
 const SYS_SETSID: usize = 112;
 const SYS_CHROOT: usize = 161;
@@ -47,7 +48,7 @@ const SYS_SETHOSTNAME: usize = 170;
 /// `builder/src/sys.rs`. Its body is the ONLY `unsafe` in the crate. The scoped
 /// `#[allow]` under the crate `#![deny(unsafe_code)]` covers where `unsafe` may
 /// appear, not what may be passed here — this fn is safe to CALL, so its
-/// confinement is module privacy plus the eight typed wrappers below being its
+/// confinement is module privacy plus the typed wrappers below being its
 /// only callers. Syscalls taking fewer than five arguments pass 0 in the unused
 /// registers, which the kernel ignores.
 #[inline]
@@ -198,6 +199,23 @@ pub fn sethostname(name: &[u8]) -> io::Result<()> {
         0,
     ))
     .map(|_| ())
+}
+
+// ── mknod's one node ───────────────────────────────────────────────────────
+
+/// `mknod(path, mode, dev)`.
+///
+/// `dev` is a plain `usize` here rather than a major/minor pair, and that is
+/// deliberate: the packing is a decision about which driver the kernel routes to,
+/// so it belongs in `mknod.rs` next to the readback that CHECKS it, not hidden in
+/// a wrapper where a wrong shift would be invisible. `mode` carries the node type
+/// in its top bits; `mknod.rs` is the only composer of both, the same split the
+/// `mount` flags use.
+/// `mode` is a `usize` for register uniformity, but the kernel parameter is a
+/// 16-bit `umode_t`: anything above 0xffff is dropped. `mknod.rs` composes only
+/// `S_IFBLK | 0o600`, which fits.
+pub fn mknod(path: &CStr, mode: usize, dev: usize) -> io::Result<()> {
+    check(syscall5(SYS_MKNOD, path.as_ptr() as usize, mode, dev, 0, 0)).map(|_| ())
 }
 
 // ── cttyhack's two syscalls ─────────────────────────────────────────────────
