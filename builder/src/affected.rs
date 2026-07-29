@@ -1318,6 +1318,13 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
     assert_target!("td-util/src/main.rs", "recipe-checks");
     assert_target!("td-util/src/ps.rs", "check");
     assert_target!("td-util/src/ps.rs", "recipe-checks");
+    assert_target!("td-util/src/less.rs", "check");
+    assert_target!("td-util/src/less.rs", "recipe-checks");
+    // The crate's one unsafe surface and the module that owns the struct offsets.
+    assert_target!("td-util/src/sys.rs", "check");
+    assert_target!("td-util/src/sys.rs", "recipe-checks");
+    assert_target!("td-util/src/term.rs", "check");
+    assert_target!("td-util/src/term.rs", "recipe-checks");
     assert_target!("td-util/src/cat.rs", "check");
     assert_target!("td-util/src/cat.rs", "recipe-checks");
     assert_target!("td-util/src/fileattr.rs", "check");

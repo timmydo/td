@@ -285,7 +285,7 @@ td's Rust is defensive and minimal-surface.
   raw-syscall layer (`builder/src/sys.rs` and its callers `nar.rs`/`sandbox.rs`),
   which carry `#![allow(unsafe_code)]` so `builder` can be `libc`-free. Every other
   engine crate (the shared `engine` lib and `recipes`/`fetch`/`feed`/`subst`)
-  `forbid`s `unsafe_code`. There are SIX target-side exceptions, each a standalone
+  `forbid`s `unsafe_code`. There are SEVEN target-side exceptions, each a standalone
   crate OUTSIDE the `builder`/`recipes`/`engine` workspace whose only `unsafe` is that
   same `syscall`-instruction layer under a scoped `#[allow]` (the crate itself
   `#![deny(unsafe_code)]`s): (1) the `td-kexec` guest helper, confined to exactly two
@@ -416,6 +416,61 @@ td's Rust is defensive and minimal-surface.
   specification. Its confinement tests pin the allow count, assembly body, syscall
   numbers, callers, and absence of unsafe from every other module; adding another
   syscall or scoped allow is an amendment there AND here.
+  And (7) the `td-util` diagnostics multicall, whose one `syscall3` body in
+  `td-util/src/sys.rs` carries EXACTLY ONE syscall — `ioctl(2)` — with THREE
+  value-pinned requests, reached only from `term.rs`: `TCGETS`/`TCSETS`
+  (0x5401/0x5402) to take a keystroke without waiting for Enter, and
+  `TIOCGWINSZ` (0x5413) to ask how many rows a page is. td-util
+  `#![forbid(unsafe_code)]`d until it grew `less`, the pager that let busybox's
+  `more` (and with it `vi` and `awk`) leave the image. Neither operation is
+  reachable through safe `std`: there is no stable API for terminal modes at
+  all, and `IsTerminal` answers only whether a descriptor is a terminal, never
+  how big. Because `ioctl(2)` is one syscall onto an unbounded space of
+  operations, the number in `rax` is not the surface — the request in `rsi` is,
+  so all three are pinned by VALUE and each call site is pinned whole, the same
+  argument that pinned `LOOP_SET_FD` rather than trusting the name. Deliberately
+  NOT in that surface: `TIOCSWINSZ` (the setter; nothing td ships has a reason
+  to resize an operator's terminal), `TCSETSW`/`TCSETSF` (they drain or discard
+  pending terminal I/O another process may own — a pager has no business
+  throwing away what someone else wrote), `TIOCSTI` (it injects input into a
+  terminal, the classic escape from a restricted session), `TIOCSCTTY` (that is
+  td-init's, for cttyhack), and `isatty`, which `std::io::IsTerminal` already
+  answers safely. The termios buffer is OPAQUE BYTES in `sys.rs`; `term.rs` is
+  the only module that knows what a field means, it never CONSTRUCTS a termios
+  (the kernel's own bytes are read, two `c_lflag` bits and two `c_cc` slots are
+  patched, and the untouched original is what `Drop` writes back), and it
+  re-reads the whole struct and refuses to page unless the kernel agrees: the
+  two flag bits cleared, `VMIN`/`VTIME` took, and NO OTHER BYTE moved. All three
+  are load-bearing. `TCSETS` can succeed having applied only part of what was
+  asked, and a terminal still in canonical mode is indistinguishable from one
+  whose reader has not typed yet, so that failure presents as a hung pager
+  rather than as anything about terminal modes; control bytes that did not take
+  make a command read wait for several keystrokes or time out and read EOF,
+  which this pager treats as `q`; and the third is what makes "never constructs
+  a termios" a property rather than a claim, since a ZEROED buffer passes the
+  other two — a zeroed `c_lflag` has ICANON and ECHO clear — while `c_cflag = 0`
+  is B0, a hang-up on a serial console, and `c_oflag = 0` drops ONLCR so every
+  line staircases. The guard holds a `BorrowedFd`, not a bare `RawFd`: it issues
+  a syscall from `Drop` on a descriptor it does not own, so the borrow checker
+  is what stops the terminal being closed — or closed and RECYCLED — before the
+  restore reaches it. `ISIG` is deliberately left ON, so Ctrl-C still ends a
+  pager stuck on a huge file. An eighth syscall, a fourth
+  request, or a second scoped `#[allow]` is an amendment here;
+  `td-util/src/main.rs`'s confinement tests assert the roster and its one
+  value-pinned number, the three request values and that each is named exactly
+  twice, the whole `asm!` block including which register each argument lands in
+  (and that `options(nomem)` stays absent, since two of the three requests have
+  the kernel write through a pointer), that the crate names the unsafe lint
+  exactly twice, that `term.rs` is the wrappers' only caller, and that no module
+  names the syscall module any way but plain `use crate::sys;` — an alias would
+  give the audited calls a name none of those scans looks for. Two of those
+  assertions are about an ARGUMENT rather than a call, which is where this
+  surface's real risk lives: `WINSIZE_LEN` is pinned because TIOCGWINSZ copies
+  `sizeof(struct winsize)` through the pointer with no length negotiation, so a
+  shorter buffer is an out-of-bounds kernel write from code the compiler reads
+  as safe; and `raw()` patching the kernel's own bytes is pinned because the
+  runtime check that would catch a constructed termios can only fire against a
+  real terminal, which the gate has none of.
   Do not add `unsafe` anywhere else; a new `unsafe` surface is a reviewed
   amendment recorded here.
 - **The engine is dependency-free.** `builder`, `recipes`, and the shared std-only
@@ -427,7 +482,11 @@ td's Rust is defensive and minimal-surface.
   The target-side `td-kexec`, `td-sh`, `td-txt`, `td-netd`, `td-boot`, `td-util`,
   `td-init`, `td-firstboot`, `td-login`, `td-svc`, `td-seatd`, and `td-compositor`
   crates outside the workspace each keep their own 1-package lock; `td-sh`, `td-txt`,
-  `td-boot`, `td-util`, `td-firstboot`, and `td-seatd` contain no `unsafe`. `td-svc`
+  `td-boot`, `td-firstboot`, and `td-seatd` contain no `unsafe`. `td-util` (the
+  static diagnostics and pre-pivot multicall) is the SEVENTH exception above, and
+  only for `ioctl(2)`'s three terminal requests: every other applet it serves reads
+  `/proc` or `/dev/kmsg` as an ordinary file, which is what keeps that surface at
+  one syscall. `td-svc`
   (the service supervisor: ordering,
   restart backoff, log capture, ordered shutdown, and Ctrl-Alt-Del) is the FIFTH
   exception above, and only for `kill(2)`; everything else it needs is still reachable

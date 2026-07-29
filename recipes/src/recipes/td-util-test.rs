@@ -79,11 +79,11 @@ pub fn recipe() -> Recipe {
                 "-c",
                 &format!(
                     "l=$('{bin}' --list) || {{ echo 'td-util --list failed' >&2; exit 1; }}; \
-                     for a in cat chmod chown clear dmesg free ln mkdir printf ps readlink rm sleep test which; do \
+                     for a in cat chmod chown clear dmesg free less ln mkdir printf ps readlink rm sleep test which; do \
                          printf '%s\\n' \"$l\" | grep -q -x -F \"$a\" || {{ echo \"td-util does not serve applet '$a'\" >&2; exit 1; }}; \
                      done; \
                      n=$(printf '%s\\n' \"$l\" | wc -l); \
-                     [ \"$n\" -eq 15 ] || {{ echo \"td-util serves $n applets, expected exactly 15 — update this check deliberately when adding one\" >&2; exit 1; }}"
+                     [ \"$n\" -eq 16 ] || {{ echo \"td-util serves $n applets, expected exactly 16 — update this check deliberately when adding one\" >&2; exit 1; }}"
                 ),
             ],
         )
@@ -124,7 +124,23 @@ pub fn recipe() -> Recipe {
                        '{bin}' test \"$op\" / >/dev/null 2>&1; \
                        [ $? -eq 2 ] || {{ echo \"the SHIPPED binary must refuse $op: it is access(2), and a mode-bits answer reads root own bit on 0755 /var, passing a system that had failed\" >&2; exit 1; }}; \
                      done; \
-                     '{bin}' test ' 1 ' -eq 1 || {{ echo 'surrounding blanks must parse, as busybox does — this landing swapped the implementation under live boot conditionals' >&2; exit 1; }}"
+                     '{bin}' test ' 1 ' -eq 1 || {{ echo 'surrounding blanks must parse, as busybox does — this landing swapped the implementation under live boot conditionals' >&2; exit 1; }}; \
+                     i=1; while [ $i -le 100 ]; do echo $i; i=$((i+1)); done > '{{root}}/less-in'; \
+                     out=$('{bin}' less '{{root}}/less-in' </dev/null) || {{ echo 'less failed on a file' >&2; exit 1; }}; \
+                     [ \"$(printf '%s\\n' \"$out\" | wc -l)\" -eq 100 ] || {{ echo 'less must copy through UNPAGED when stdout is not a terminal — otherwise its prompts land in the data of every pipeline' >&2; exit 1; }}; \
+                     printf '%s\\n' \"$out\" | grep -q -x -F 100 || {{ echo 'less dropped the last line of a non-terminal copy' >&2; exit 1; }}; \
+                     printf '%s\\n' \"$out\" | grep -q -- '--More--' && {{ echo 'less emitted a pager prompt into a pipe' >&2; exit 1; }}; \
+                     '{bin}' less -N '{{root}}/less-in' >/dev/null 2>&1; \
+                     [ $? -eq 2 ] || {{ echo 'less must refuse an option it cannot honour rather than silently ignoring it, and exit 2 for a usage error as the rest of this multicall does' >&2; exit 1; }}; \
+                     '{bin}' printf 'a\\nb\\n' > '{{root}}/-N'; \
+                     out=$(cd '{{root}}' && '{bin}' less -- -N </dev/null) || {{ echo 'less -- must page a file whose name looks like an option' >&2; exit 1; }}; \
+                     [ \"$out\" = \"$(printf 'a\\nb')\" ] || {{ echo 'less -- consumed the wrong operand' >&2; exit 1; }}; \
+                     (cd '{{root}}' && '{bin}' less -N </dev/null) >/dev/null 2>&1; \
+                     [ $? -eq 2 ] || {{ echo 'without -- the same argument must still be refused as an option, or the leg above proves nothing' >&2; exit 1; }}; \
+                     printf 'x\\000y\\n' > '{{root}}/less-bin'; \
+                     '{bin}' less '{{root}}/less-bin' </dev/null | grep -q -a -- y || {{ echo 'less must pass NON-TEXT bytes through rather than refusing the file — a pager is pointed at logs' >&2; exit 1; }}; \
+                     '{bin}' less '{{root}}/no-such-file' >/dev/null 2>&1; \
+                     [ $? -eq 1 ] || {{ echo 'less must exit 1 on an unreadable operand' >&2; exit 1; }}"
                 ),
             ],
         )
@@ -163,7 +179,7 @@ pub fn recipe() -> Recipe {
     });
     steps.push(Step::WriteFile {
         path: "{out}/result".into(),
-        content: "PASS: td-util is a statically-linked ELF64 x86-64 executable (ET_EXEC) with no PT_INTERP and no dynamic NEEDED entry; it serves exactly the fifteen applets cat/chmod/chown/clear/dmesg/free/ln/mkdir/printf/ps/readlink/rm/sleep/test/which, dispatches through both the argv[0] and `td-util <applet>` forms, honours its exit codes (`which` 1 = not resolved, 2 = usage; `test` 0 = true, 1 = false, 2 = bad expression), and parses /proc for free/ps where /proc is mounted\n".into(),
+        content: "PASS: td-util is a statically-linked ELF64 x86-64 executable (ET_EXEC) with no PT_INTERP and no dynamic NEEDED entry; it serves exactly the sixteen applets cat/chmod/chown/clear/dmesg/free/less/ln/mkdir/printf/ps/readlink/rm/sleep/test/which, dispatches through both the argv[0] and `td-util <applet>` forms, honours its exit codes (`which` 1 = not resolved, 2 = usage; `test` 0 = true, 1 = false, 2 = bad expression), and parses /proc for free/ps where /proc is mounted\n".into(),
         exec: false,
     });
     steps.push(Step::Require {
@@ -176,7 +192,7 @@ pub fn recipe() -> Recipe {
         .steps(steps)
         .checks(vec![RecipeCheck::new(
             r#"
-echo ">> recipe-check td-util-test: build-plan --auto builds td-util (td's static diagnostics and initramfs userland multicall: cat/chmod/chown/clear/dmesg/free/ln/mkdir/printf/ps/readlink/rm/sleep/test/which, statically linked by the /td/store target Rust + native GCC/binutils/glibc toolchain), asserts a self-contained static ELF64 x86-64 executable (ET_EXEC, no PT_INTERP, no dynamic NEEDED), and exercises the applet roster, both dispatch forms, the exit codes, and the /proc parsers"
+echo ">> recipe-check td-util-test: build-plan --auto builds td-util (td's static diagnostics, pager and initramfs userland multicall: cat/chmod/chown/clear/dmesg/free/less/ln/mkdir/printf/ps/readlink/rm/sleep/test/which, statically linked by the /td/store target Rust + native GCC/binutils/glibc toolchain), asserts a self-contained static ELF64 x86-64 executable (ET_EXEC, no PT_INTERP, no dynamic NEEDED), and exercises the applet roster, both dispatch forms, the exit codes, and the /proc parsers"
 : "${TD_RECIPE_EVAL:=$PWD/target/release/td-recipe-eval}"
 exec "$TD_RECIPE_EVAL" check-run td-util-test 1
 "#,

@@ -196,25 +196,25 @@ const UI_GID: u32 = 1000;
 /// (the core file/text userland — #547's cutover). A name goes in exactly one list;
 /// `shape_check` asserts the owning binary actually provides it.
 ///
-/// BUSYBOX now keeps only what no Rust multicall serves: the shell (`sh`/`ash`), `getty`
-/// (the tty setup half of the login chain — `login`/`su` moved to td-login), `awk`, and
-/// `more`, whose uutils feature would compile a crossterm pager stack into the shipped
-/// multicall — a dependency call, not a farm move.
+/// BUSYBOX now keeps only what no Rust multicall serves: the shell (`sh`/`ash`) and
+/// `getty` (the tty setup half of the login chain — `login`/`su` moved to td-login).
+/// Those are the last two, and only `sh` and `getty` have a call site at all.
 ///
 /// `grep`/`sed` LEFT this list for td-txt (see `TD_TXT_APPLETS`) once the conformance corpus
 /// covered the shapes the image's own scripts use — which is also why those scripts stopped
 /// spelling them `/bin/busybox grep` and now call `/bin/grep`: with the name off this list,
 /// the multiplexer spelling would name an applet `shape_check` no longer verifies.
 ///
-/// `awk` stays only as a utility a user may reach for: NO generated script invokes it now
-/// that `rootcheck`'s one field test is an ERE, and `no_generated_script_invokes_awk` keeps
-/// it that way by banning the name outright — being in this list is what makes `/bin/awk`
-/// a real symlink, so a caller would have several spellings and only a shell grammar could
-/// tell which are command position. Dropping it is a one-line change nothing on the image
-/// blocks. It is not the only caller-less entry (`ash` and `more` have no call site either;
-/// only `sh` and `getty` do), but it is the only one whose absence is ASSERTED, because it
-/// is the only one whose return would put a boot-path text decision back on a farm no
-/// conformance corpus scores.
+/// `awk` and `more` LEFT this list, and neither was replaced in kind. No generated script
+/// invoked `awk` once `rootcheck`'s one field test became an ERE, so it was a name a user
+/// might reach for and nothing else; `no_generated_script_invokes_awk` still bans it, and
+/// the ban matters MORE now that `/bin/awk` is not a symlink — a script naming it would
+/// fail at run time instead of quietly running a farm no conformance corpus scores.
+/// `more` is served by td-util's `less` (see `TD_UTIL_APPLETS`): the uutils pager is
+/// behind a feature that compiles a crossterm stack into the shipped multicall, which is a
+/// dependency call rather than a farm move, and busybox was being carried for that one
+/// name. What td's own pager gives up to stay dependency-free — single-keystroke commands
+/// and backward scrolling — is recorded in `td-util/src/less.rs`.
 ///
 /// `find`/`xargs` are intentionally NOT bare symlinks either: the ladder's findutils
 /// dead-axis lock (`no_bootstrap_step_invokes_host_find_or_xargs`) forbids those tokens in
@@ -225,7 +225,7 @@ const UI_GID: u32 = 1000;
 /// `losetup` with the `LOOP_SET_FD` one. Those three were the boot-path jobs needing a
 /// syscall no safe `std` reaches, which is what a 1 MiB C multicall was being carried for;
 /// what busybox still serves here is ordinary userland.
-const BUSYBOX_APPLETS: &[&str] = &["sh", "ash", "getty", "more", "awk"];
+const BUSYBOX_APPLETS: &[&str] = &["sh", "ash", "getty"];
 
 /// The text userland, served by the static td-txt multicall — the `grep` and `sed` busybox
 /// used to own, because uutils ships neither. Like every other farm here it dispatches on
@@ -249,11 +249,18 @@ const BUSYBOX_APPLETS: &[&str] = &["sh", "ash", "getty", "more", "awk"];
 /// greeter probe below re-proves it on the booted image against the real `/proc/mounts`.
 const TD_TXT_APPLETS: &[&str] = &["grep", "sed"];
 
-/// Names the busybox retirement DROPS rather than reimplementing as a td app: nothing on the
-/// image calls either, and `more` remains the pager. Listed rather than merely absent so the
-/// drop is checkable — `shape_check` asserts the staged root packs no such `/bin` entry, and
+/// Names the busybox retirement DROPS rather than reimplementing as a td app: nothing on
+/// the image calls any of them. Listed rather than merely absent so the drop is checkable —
+/// `shape_check` asserts the staged root packs no such `/bin` entry, and
 /// `dropped_applets_stay_dropped` makes putting one back a deliberate deletion here.
-const DROPPED_APPLETS: &[&str] = &["vi", "less"];
+///
+/// `less` LEFT this list: it was dropped only because `more` was the pager, and `more` is
+/// what the busybox binary was being carried for once the shell and getty are discounted.
+/// td-util serves `less` now, so the pager name that survives is the one people type, and
+/// `more`/`awk` join the drops — `awk` because no generated script may name it anyway
+/// (`no_generated_script_invokes_awk`), `more` because there is no reason to ship two
+/// pagers. Neither has a call site to break.
+const DROPPED_APPLETS: &[&str] = &["vi", "more", "awk"];
 /// The credential switch, served by the static td-login multicall — the two busybox applets
 /// that change WHO A PROCESS IS. They are their own binary, and their own AGENTS.md unsafe
 /// exception, because a credential-ordering bug in them is privilege escalation rather than
@@ -525,7 +532,7 @@ const INITRAMFS_APPLETS: &[&str] = &["sh"];
 /// needed. `shape_check` probes each name against the packed binary's own `--list`, so an
 /// entry td-util does not serve reds the build rather than shipping a `/bin` name that
 /// dispatches to nothing.
-const TD_UTIL_APPLETS: &[&str] = &["clear", "which", "free", "ps", "dmesg"];
+const TD_UTIL_APPLETS: &[&str] = &["clear", "which", "free", "ps", "dmesg", "less"];
 
 /// The core file/text userland, served by the uutils `coreutils` multicall (#547). Every
 /// name must be a coreutils utility the built binary implements. The recipe sandbox cannot
@@ -1391,6 +1398,25 @@ fn build_td_txt_probes() -> String {
     p
 }
 
+/// What each td-util health probe is given to work on, if anything.
+///
+/// Shared with the test that asserts the generated script, which would otherwise
+/// restate it — and a restated mapping is one that stays green while the script it
+/// describes changes underneath it.
+///
+/// `which` needs a name to resolve. `less`'s operand is not cosmetic: with none it
+/// reads STDIN, and the only reason that does not hang the whole boot today is that
+/// td-svc hands a unit with no `tty=` a null stdin — a fact stated in supervise.rs,
+/// nowhere near here, and true of `[bootsuccess]` only for as long as nobody gives
+/// it a tty. An operand ties the probe to nothing but itself.
+fn td_util_probe_args(applet: &str) -> &'static str {
+    match applet {
+        "which" => " sh",
+        "less" => " /etc/os-release",
+        _ => "",
+    }
+}
+
 fn build_bootsuccess(sys: &SystemDef) -> String {
     let mut uutils_behavior_probes = String::new();
     for probe in UUTILS_BEHAVIOR_PROBES {
@@ -1401,7 +1427,7 @@ fn build_bootsuccess(sys: &SystemDef) -> String {
     // off. Drop dmesg from the farm and that pin is orphaned.
     let mut td_util_probes = String::new();
     for applet in TD_UTIL_APPLETS {
-        let args = if *applet == "which" { " sh" } else { "" };
+        let args = td_util_probe_args(applet);
         td_util_probes.push_str(&format!(
             "/bin/{applet}{args} >/dev/null 2>&1 || \
              {{ echo \"td-util: /bin/{applet} failed\"; u=0; }}; "
@@ -3840,9 +3866,11 @@ mod tests {
         }
     }
 
-    /// `awk` is in the farm for a user, not for a caller: no generated script invokes it,
-    /// and re-introducing a call would put a boot-path text decision back on a farm the
-    /// td-txt corpus does not cover — so the absence is asserted rather than left to review.
+    /// `awk` is DROPPED now, and this is what keeps it dropped: no generated script
+    /// invokes it, and re-introducing a call would put a boot-path text decision back on
+    /// a farm the td-txt corpus does not cover. The ban matters more since the applet
+    /// left — a script naming `awk` used to run busybox's, and would now simply fail at
+    /// run time, on the boot path, with nothing red at build time.
     ///
     /// The assertion is the whole SUBSTRING, not a scan of call spellings, because
     /// deciding "is this `awk` in command position" needs a shell grammar and every
@@ -5261,7 +5289,7 @@ mod tests {
             // command could be deleted and this would pass. And matching everything except
             // `u=0` leaves the gate defeatable: drop that one assignment and the marker
             // prints unconditionally, so the oracle greens with a broken applet.
-            let args = if *applet == "which" { " sh" } else { "" };
+            let args = td_util_probe_args(applet);
             assert!(
                 bootsuccess.contains(&format!(
                     "/bin/{applet}{args} >/dev/null 2>&1 || {{ echo \"td-util: /bin/{applet} \
@@ -5272,6 +5300,15 @@ mod tests {
                  the oracle passes a broken applet"
             );
         }
+        // A pager with no operand reads stdin. Deriving the args above means the
+        // assertion follows whatever the generator does, so state the one property
+        // the derivation cannot: that `less` is given something to page.
+        assert!(
+            !td_util_probe_args("less").trim().is_empty(),
+            "the less probe must carry an operand: with none it reads STDIN, and the \
+             probe would then pass or hang depending on what td-svc happens to wire \
+             /dev/stdin to for a unit with no tty"
+        );
         // The marker is emitted by THIS leg, so match the whole gate: the `else healthy=0`
         // keeps a failure out of the deployment transaction, and the marker echo sits inside
         // the success branch, which is what makes an absent TD-UTIL-RUN-OK mean td-util

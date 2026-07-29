@@ -8,25 +8,33 @@ use crate::types::{Recipe, Step};
 // ONE source of truth and cannot drift; the path escapes the
 // `recipes/src/recipes/*.rs` catalog glob, so it is not itself a recipe module.
 //
-// SCOPE: the applets that must run where uutils' coreutils cannot, and that need no
-// syscall surface beyond safe `std`. Two kinds. `clear`, `which`, `free`, `ps` and
-// `dmesg` are names uutils does not provide at all, and get `/bin` symlinks.
-// `cat`, `chmod`, `chown`, `ln`, `mkdir`, `printf`, `readlink`, `rm` and `sleep` it
-// DOES provide — dynamically linked, which the pre-pivot initramfs has no loader for
-// and which `/etc/rootcheck` must not depend on, since reporting a broken runtime
-// closure is its job. Those nine carry no `/bin` name here (uutils owns them and the
-// farms are disjoint) and are reached as `td-util <applet>`.
-// `free`/`ps` read /proc and `dmesg` reads /dev/kmsg O_NONBLOCK, all ordinary
-// file I/O, so the crate stays `#![deny(unsafe_code)]` and adds NO target-side
-// unsafe exception to AGENTS.md. The applets that would (reboot/poweroff/halt,
-// switch_root, cttyhack, init, and `sync`, which is td-init's) are deliberately out
-// of scope: each needs a raw syscall, which is a reviewed unsafe-surface amendment,
-// not a drive-by.
+// SCOPE: the applets that must run where uutils' coreutils cannot. Two kinds.
+// `clear`, `which`, `free`, `ps`, `dmesg` and `less` are names uutils does not
+// provide at all, and get `/bin` symlinks — `less` not quite: uutils has a pager
+// behind a feature flag that compiles a crossterm stack in, which is a dependency
+// this image does not take, so busybox was being carried for `more` alone.
+// `cat`, `chmod`, `chown`, `ln`, `mkdir`, `printf`, `readlink`, `rm`, `sleep` and
+// `test` it DOES provide — dynamically linked, which the pre-pivot initramfs has no
+// loader for and which `/etc/rootcheck` must not depend on, since reporting a broken
+// runtime closure is its job. Those ten carry no `/bin` name here (uutils owns them
+// and the farms are disjoint) and are reached as `td-util <applet>`.
+//
+// `free`/`ps` read /proc and `dmesg` reads /dev/kmsg O_NONBLOCK, all ordinary file
+// I/O. `less` is the one that is not: taking a keystroke without waiting for Enter,
+// and asking how many rows a screen has, are `ioctl(2)`, and nothing in safe `std`
+// reaches them. That is the SEVENTH target-side unsafe exception AGENTS.md records —
+// ONE syscall, THREE pinned requests (TCGETS/TCSETS/TIOCGWINSZ), confined to
+// `sys.rs` with `term.rs` its only caller — so the crate root is `#![deny]` rather
+// than `#![forbid]` and `main.rs`'s `mod confinement` tests hold the surface at that.
+// The applets that would widen it further (reboot/poweroff/halt, switch_root,
+// cttyhack, init, and `sync`, which is td-init's) stay out of scope: each needs a
+// syscall this roster does not have, which is a further reviewed amendment.
 //
 // system-x86-64 packs td-util into the real root AND both initramfs cpios, routes
-// /bin/{clear,which,free,ps,dmesg} here, and calls the other nine as `td-util <applet>`
-// where it used to call `busybox <applet>`. The greeter runs each by its /bin path and emits TD_UTIL_RUNTIME_MARKER
-// only if all five exit 0, so `td-recipe-eval qemu-boot-system` re-proves the whole
+// /bin/{clear,which,free,ps,dmesg,less} here, and calls the other ten as
+// `td-util <applet>` where it used to call `busybox <applet>`. The greeter runs each
+// by its /bin path and emits TD_UTIL_RUNTIME_MARKER only if all six exit 0, so
+// `td-recipe-eval qemu-boot-system` re-proves the whole
 // farm on every boot — including the /proc and /dev/kmsg applets whose legs below
 // are skipped when the build sandbox lacks /proc. That oracle is operator-run (qemu
 // is absent from the host-free gate sandbox), so it is a release gate, not a
@@ -65,10 +73,13 @@ const MODULES: &[(&str, &str)] = &[
     ("fileattr", include_str!("../../../td-util/src/fileattr.rs")),
     ("fileops", include_str!("../../../td-util/src/fileops.rs")),
     ("free", include_str!("../../../td-util/src/free.rs")),
+    ("less", include_str!("../../../td-util/src/less.rs")),
     ("printf", include_str!("../../../td-util/src/printf.rs")),
     ("procfs", include_str!("../../../td-util/src/procfs.rs")),
     ("ps", include_str!("../../../td-util/src/ps.rs")),
     ("sleep", include_str!("../../../td-util/src/sleep.rs")),
+    ("sys", include_str!("../../../td-util/src/sys.rs")),
+    ("term", include_str!("../../../td-util/src/term.rs")),
     ("test", include_str!("../../../td-util/src/test.rs")),
     ("which", include_str!("../../../td-util/src/which.rs")),
 ];
@@ -201,10 +212,12 @@ mod tests {
         declared.sort_unstable();
         // `#[cfg(test)] mod tests { ... }` is a brace form, so the `;` suffix above
         // already excludes it; assert that rather than trusting it.
-        assert!(
-            !declared.contains(&"tests"),
-            "the inline test module is not a file and must not be embedded"
-        );
+        for inline in ["tests", "confinement"] {
+            assert!(
+                !declared.contains(&inline),
+                "the inline `{inline}` module is not a file and must not be embedded"
+            );
+        }
         let mut embedded: Vec<&str> = MODULES.iter().map(|(n, _)| *n).collect();
         embedded.sort_unstable();
         assert_eq!(
@@ -216,5 +229,50 @@ mod tests {
             !declared.is_empty(),
             "parsing found no `mod` lines at all, so this test would pass vacuously"
         );
+    }
+
+    /// The crate root must DENY, not FORBID, the unsafe lint.
+    ///
+    /// `less` needs `ioctl(2)`, whose one scoped `#[allow]` a `forbid` cannot host:
+    /// reverting this line to `forbid` does not red here, it reds inside the sandbox
+    /// minutes into the heavy leg. The SIZE of that surface is held by `main.rs`'s
+    /// own `mod confinement` tests; this only holds the door open.
+    #[test]
+    fn the_embedded_crate_root_denies_rather_than_forbids() {
+        let lint = concat!("unsafe_", "code");
+        assert!(
+            MAIN_RS.contains(&format!("{}![deny({lint})]", "#")),
+            "the embedded crate root must deny the unsafe lint"
+        );
+        assert!(
+            !MAIN_RS.contains(&format!("{}![forbid({lint})]", "#")),
+            "forbid cannot host the scoped allow sys.rs needs"
+        );
+    }
+
+    /// Every embedded source IS the file that sits beside `main.rs` on disk.
+    ///
+    /// `MODULES` pins module NAMES against `main.rs`'s `mod` lines; it says nothing
+    /// about where each `include_str!` points. That gap matters now that `sys.rs`
+    /// and `term.rs` are the crate's unsafe surface: a path aimed at a file outside
+    /// `td-util/src/` would ship bytes that `main.rs`'s `mod confinement` — which
+    /// walks `CARGO_MANIFEST_DIR/src` — never reads, so the whole confinement would
+    /// be asserting about source the build does not use, with every test green.
+    #[test]
+    fn every_embedded_source_is_the_file_on_disk() {
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../td-util/src");
+        let read = |name: &str| std::fs::read_to_string(src.join(name)).unwrap_or_default();
+        let main = read("main.rs");
+        assert!(!main.is_empty(), "td-util/src/main.rs must be readable, or this is vacuous");
+        assert_eq!(MAIN_RS, main, "the embedded crate root is not td-util/src/main.rs");
+        for (name, source) in MODULES {
+            let on_disk = read(&format!("{name}.rs"));
+            assert!(!on_disk.is_empty(), "td-util/src/{name}.rs must be readable");
+            assert_eq!(
+                *source, on_disk,
+                "the embedded '{name}' is not td-util/src/{name}.rs; the confinement \
+                 tests read the file, the build ships these bytes"
+            );
+        }
     }
 }
