@@ -51,11 +51,11 @@ pub enum Local {
     Var(String, Option<Var>),
     /// `local -`, which saves the option set rather than a variable.
     Opts(Opts),
-    /// Only ever in `pending_unwind`: the `in_function` a terminating unwind did
-    /// NOT put back, so a recovery can. Carrying it here rather than at each
-    /// recovery site is what makes "undo everything that unwind deferred" one
-    /// operation, and what gets the OUTERMOST frame's value when several nest.
-    InFunction(bool),
+    /// Only ever in `pending_unwind`: the frame depth a terminating unwind did NOT
+    /// put back, so a recovery can. Carrying it here rather than at each recovery
+    /// site is what makes "undo everything that unwind deferred" one operation, and
+    /// what gets the OUTERMOST frame's value when several nest.
+    Depth(u32),
 }
 
 /// The `set -o` flags the interpreter honours.
@@ -116,7 +116,9 @@ pub struct Shell {
     /// by. Only `cd` moves it.
     pub logical_cwd: PathBuf,
     pub fds: Fds,
-    pub in_function: bool,
+    /// ash's `localvar_stack` depth. `local` is an error at zero and nowhere else,
+    /// so this is the whole of "am I somewhere a `local` may be declared".
+    pub localvar_depth: u32,
     /// Bindings this function invocation's `local`s displaced, in declaration
     /// order. `call_function` swaps in a fresh list per call, so each invocation
     /// unwinds only its own — including a recursive one's.
@@ -208,7 +210,7 @@ impl Shell {
             logical_cwd: cwd.clone(),
             cwd,
             fds: Fds::new(),
-            in_function: false,
+            localvar_depth: 0,
             locals: Vec::new(),
             pending_unwind: Vec::new(),
             loop_depth: 0,
@@ -269,7 +271,7 @@ impl Shell {
                 .unwrap_or_else(|_| PathBuf::from("/")),
             cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/")),
             fds: Fds::new(),
-            in_function: false,
+            localvar_depth: 0,
             locals: Vec::new(),
             pending_unwind: Vec::new(),
             loop_depth: 0,
@@ -856,16 +858,54 @@ fn run_simple(
         return result;
     }
 
+    // ash pushes a local-var frame in `evalcommand` for every command that HAS a
+    // command word, unless that word is a special builtin -- and it is always the
+    // FIRST word, since `spclbltin` is locked to it. That single rule is why
+    // `command eval 'local x=1'` works while `eval 'local x=1'` does not, and why
+    // the frame is already standing when a prefix assignment or a redirection word
+    // dies. The words above expanded first, so `true ${u:?e}` dies without one.
+    // Above `trace` because ash pushes before its xtrace block, and td-sh expands a
+    // `$( )` in PS4 for real.
+    let saved_depth = sh.localvar_depth;
+    let framed = argv.first().is_some_and(|w| {
+        // Resolved the way `dispatch_simple` resolves it below: a function shadowing
+        // a special builtin's NAME is still a function, and ash gives it a frame.
+        sh.funcs.contains_key(w) || !builtin::blocks_localvar_frame(w)
+    });
+    if framed {
+        sh.localvar_depth = sh.localvar_depth.saturating_add(1);
+    }
     trace(sh, &argv, None);
+    let result = dispatch_simple(sh, &argv, assigns, redirs);
+    // Same rule as the frame's bindings: a terminating unwind leaves it standing so
+    // an EXIT trap can still declare a `local`, and the recovery that drains those
+    // bindings puts the depth back along with them. Pushed after the callee's own
+    // deferrals, so a forward drain applies the OUTERMOST depth last.
+    if framed {
+        if result.as_ref().err().is_some_and(terminating) {
+            sh.pending_unwind.push(Local::Depth(saved_depth));
+        } else {
+            sh.localvar_depth = saved_depth;
+        }
+    }
+    result
+}
 
+/// The three kinds of command word, once the frame around them is decided.
+fn dispatch_simple(
+    sh: &mut Shell,
+    argv: &[String],
+    assigns: &[crate::ast::Assign],
+    redirs: &[Redir],
+) -> R<()> {
     // A function call runs in the current shell with the assignments applied for
     // its duration and the words as its positional parameters.
     if let Some(cmd) = argv.first().and_then(|name| sh.funcs.get(name)).cloned() {
-        return call_function(sh, &cmd, &argv, assigns, redirs);
+        return call_function(sh, &cmd, argv, assigns, redirs);
     }
 
     if let Some(bi) = builtin::lookup(argv.first().map(String::as_str).unwrap_or("")) {
-        return run_builtin(sh, bi, &argv, assigns, redirs);
+        return run_builtin(sh, bi, argv, assigns, redirs);
     }
 
     // External command: assignments become part of its environment only.
@@ -875,7 +915,7 @@ fn run_simple(
         // A failed redirection skips the command without exiting the shell.
         process::RedirOutcome::Failed => return Ok(()),
     };
-    let result = process::exec_external(sh, &argv, &env_overrides);
+    let result = process::exec_external(sh, argv, &env_overrides);
     process::restore_redirs(sh, saved);
     result
 }
@@ -977,9 +1017,11 @@ fn run_builtin(
     if result.as_ref().err().is_some_and(terminating) {
         defer_vars(sh, saved_vars);
     } else {
-        // As in `command`'s scratch frame, and unreachable for the same reason:
-        // anything deferred inside is newer than this frame and must come off
-        // before it, or this frame's saved values are stale.
+        // As in `command`'s scratch frame, and load-bearing for the same reason: a
+        // builtin run from an EXIT trap has the dying frame deferred beneath it, so
+        // the mark is what stops this from taking that frame off too. Anything
+        // deferred inside is newer than this frame and must come off before it, or
+        // this frame's saved values are stale.
         unwind_pending_to(sh, pending_mark);
         restore_vars(sh, saved_vars);
     }
@@ -1041,7 +1083,7 @@ fn undo_binding(sh: &mut Shell, entry: Local) {
             sh.vars.remove(&name);
         }
         Local::Opts(opts) => sh.opts = opts,
-        Local::InFunction(was) => sh.in_function = was,
+        Local::Depth(was) => sh.localvar_depth = was,
     }
 }
 
@@ -1132,10 +1174,8 @@ fn call_function(
     let saved_getopts = (sh.getopts_optind, sh.getopts_off);
     sh.getopts_optind = 1;
     sh.getopts_off = -1;
-    let was_in_function = sh.in_function;
     let saved_loop_depth = sh.loop_depth;
     let saved_locals = std::mem::take(&mut sh.locals);
-    sh.in_function = true;
     sh.loop_depth = 0;
     // Not `?`: a fatal error in a redirection WORD (`f 2>${u:?}`) must still unwind
     // the argument frame below, or the caller -- or an EXIT trap -- sees the
@@ -1155,12 +1195,9 @@ fn call_function(
     // unwind longjmps past dash's `poplocalvars`/`unwindlocalvars`, so the trap
     // still sees the `local` and the temp binding of the function it died in.
     (sh.getopts_optind, sh.getopts_off) = saved_getopts;
-    let dying = result.as_ref().err().is_some_and(terminating);
-    if dying {
+    if result.as_ref().err().is_some_and(terminating) {
         defer_locals(sh);
         defer_vars(sh, saved_vars);
-        // Oldest entry of this frame's deferral, so a drain applies it LAST.
-        sh.pending_unwind.push(Local::InFunction(was_in_function));
     } else {
         pop_locals(sh);
         // Below `pop_locals`, so a `local` of the same name unwinds to the binding
@@ -1169,12 +1206,6 @@ fn call_function(
     }
     sh.locals = saved_locals;
     sh.params = saved_params;
-    // Same rule as the bindings, so an EXIT trap can declare a `local`. Deferred
-    // above rather than dropped, because a shell that RECOVERS instead of exiting
-    // must not keep running inside a function that is gone.
-    if !dying {
-        sh.in_function = was_in_function;
-    }
     sh.loop_depth = saved_loop_depth;
     match result {
         Err(Sig::Return(code)) => {
@@ -1626,14 +1657,25 @@ mod tests {
         ]);
         assert_eq!(out, "after=2\n");
         assert!(err.contains("not in a function"), "{err}");
-        // Several frames dying at once each leave a marker, so the drain order is
-        // load-bearing: applied newest first, the OUTERMOST value lands last.
-        // Reverse it and this is the case that notices.
         let (_, out, err) = run(
             "h() { echo ${u:?bad}; }; g() { h; }; f() { g; }; \
              command eval 'f'; local R=1; echo BAD",
         );
         assert_eq!(out, "");
+        assert!(err.contains("not in a function"), "{err}");
+        // Several frames dying at once each leave a marker, so the drain ORDER is
+        // load-bearing: applied newest first, the OUTERMOST depth lands last. The
+        // prompt is where that shows, because unlike the `command` case above there
+        // is no surrounding command whose own restore would mask a wrong order.
+        let (_, out, err) = crate::process::run_capturing_interactive_units(&[
+            "h() { echo ${u:?bad}; }",
+            "g() { h; }",
+            "f() { g; }",
+            "f",
+            "local R=1",
+            "echo after=$?",
+        ]);
+        assert_eq!(out, "after=2\n");
         assert!(err.contains("not in a function"), "{err}");
         // A swallow INSIDE a function that is still running must not take its
         // frame away: `local` there still works, and only the caller's does not.
@@ -1649,6 +1691,119 @@ mod tests {
              f() { command eval 'g'; local Q=1; echo in=ok; }; f; echo done",
         );
         assert_eq!(out, "in=ok\ndone\n");
+    }
+
+    #[test]
+    fn a_local_var_frame_comes_from_the_command_word() {
+        // `local` tests only whether `evalcommand` pushed a frame (ash's
+        // `localvar_stack`, ash.c:10047), and it pushes one for EVERY command with a
+        // command word that is not a special builtin -- a regular builtin and an
+        // external get one too, not just a function call. Every expectation below
+        // was read off the td-built busybox ash and matches dash.
+        for (body, framed) in [
+            // Pushed: regular builtin, function, external. `command`'s own word is
+            // regular, and `spclbltin` latches on the FIRST word, so what it goes on
+            // to resolve cannot take the frame away again.
+            ("A=${u:?e} true", true),
+            ("A=${u:?e} f", true),
+            ("A=${u:?e} /nonexistent/x", true),
+            ("A=${u:?e} command true", true),
+            ("A=${u:?e} command eval :", true),
+            // Not pushed: a special builtin as that first word -- `local` included,
+            // which is what keeps a top-level `local` an error.
+            ("A=${u:?e} eval :", false),
+            ("A=${u:?e} export X=1", false),
+            ("A=${u:?e} local X=1", false),
+            // Not pushed: no command word at all.
+            ("${u:?e}", false),
+            ("A=1 B=${u:?e}", false),
+            // The words expand BEFORE the frame goes up, so an argument that dies
+            // never sees one -- unlike a prefix assignment or a redirection word,
+            // which are both processed after it.
+            ("true ${u:?e}", false),
+            ("f ${u:?e}", false),
+            ("true >${u:?e}", true),
+            ("f >${u:?e}", true),
+            ("command >${u:?e} true", true),
+            ("eval >${u:?e} :", false),
+            (">${u:?e}", false),
+        ] {
+            let src = format!("f() {{ :; }}; trap 'local Q=1; echo FRAME' EXIT; {body}");
+            let (_, out, err) = run(&src);
+            assert_eq!(out.contains("FRAME"), framed, "{body}: out={out} err={err}");
+            assert_eq!(err.contains("not in a function"), !framed, "{body}: {err}");
+        }
+        // The frame follows how the word RESOLVES, not how it is spelled: a function
+        // shadowing a special builtin's name is a function and gets one. Measured on
+        // ash alone -- dash rejects these function names with a syntax error.
+        let (code, out, err) = run("eval() { exit 7; }; trap 'local Q=1; echo FRAME' EXIT; eval");
+        assert_eq!((code, out.as_str()), (7, "FRAME\n"), "{err}");
+        assert_eq!(run("export() { local Q=1; echo ok; }; export").1, "ok\n");
+        // `source` and `times` are special to ash but unimplemented here, so without
+        // naming them they would reach the external path and be framed. A function
+        // of the same name still is, by the rule just above.
+        for w in ["times", "source"] {
+            let (_, out, err) = run(&format!(
+                "trap 'local Q=1; echo FRAME' EXIT; A=${{u:?e}} {w}"
+            ));
+            assert_eq!(out, "", "{w}");
+            assert!(err.contains("not in a function"), "{w}: {err}");
+            assert_eq!(run(&format!("{w}() {{ local Q=1; echo ok; }}; {w}")).1, "ok\n", "{w}");
+        }
+    }
+
+    #[test]
+    fn a_child_shell_inherits_the_frame_it_was_forked_inside() {
+        // A subshell keeps the depth (its `local` is the enclosing function's to
+        // declare) but not the bindings, and one forked at the top level has no
+        // frame to inherit. Both measured on ash and dash.
+        assert_eq!(run("f() { (local Q=1; echo ok); }; f").1, "ok\n");
+        assert!(run("(local Q=1)").2.contains("not in a function"));
+        // The child's own `local` must not follow the fork back out.
+        assert_eq!(run("D=out; f() { (local D=in); echo [$D]; }; f").1, "[out]\n");
+    }
+
+    #[test]
+    fn the_frame_is_standing_before_ps4_expands() {
+        // ash's `pushlocalvars` precedes its xtrace block, and td-sh runs a `$( )` in
+        // PS4 for real, so the order is observable here even though it is not in
+        // either reference (both fail to re-parse such a PS4 at all). The
+        // regular/special split still applies inside it.
+        assert_eq!(run("PS4='$(local Q=1; echo F)'; set -x; true").2, "Ftrue\n");
+        assert!(run("PS4='$(local Q=1; echo F)'; set -x; eval :")
+            .2
+            .contains("not in a function"));
+    }
+
+    #[test]
+    fn command_carries_a_frame_that_a_special_builtin_never_gets() {
+        // The live half of the same rule: `command` is regular, so everything it
+        // resolves runs inside the frame it pushed, while `eval` reaching the very
+        // same `local` directly has none. This is the pair that makes the frame a
+        // property of the command word rather than of being inside a function.
+        for (src, want, errors) in [
+            ("command eval 'local Q=1; echo ok'", "ok\n", false),
+            ("command local Q=1; echo ok", "ok\n", false),
+            ("command command eval 'local Q=1; echo ok'", "ok\n", false),
+            ("A=1 command eval 'local Q=1; echo ok'", "ok\n", false),
+            ("eval 'local Q=1; echo BAD'", "", true),
+            ("A=1 eval 'local Q=1; echo BAD'", "", true),
+            ("local Q=1; echo BAD", "", true),
+        ] {
+            let (_, out, err) = run(src);
+            assert_eq!(out, want, "{src}: {err}");
+            assert_eq!(err.contains("not in a function"), errors, "{src}: {err}");
+        }
+        // It is still a SCRATCH frame: what it declares must not outlive it.
+        assert_eq!(run("D=out; command eval 'local D=in'; echo [$D]").1, "[out]\n");
+        // ...and its drain stops at its OWN mark. Run from an EXIT trap it sits on
+        // top of the dying function's deferred frame, which it must leave standing:
+        // drain to zero instead and the trap reads the global `X` rather than the
+        // `local` the function died holding.
+        assert_eq!(
+            run("X=g; f() { local X=fn; ${u:?e}; }; trap 'command true; echo t=[$X]' EXIT; f").1,
+            "t=[fn]\n",
+        );
     }
 
     #[test]

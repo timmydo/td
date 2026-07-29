@@ -437,7 +437,7 @@ pub fn fork_shell(sh: &Shell) -> Shell {
         cwd: sh.cwd.clone(),
         logical_cwd: sh.logical_cwd.clone(),
         fds: sh.fds.clone(),
-        in_function: sh.in_function,
+        localvar_depth: sh.localvar_depth,
         // A clone unwinds only what it declares itself; the caller's frame belongs
         // to the shell that keeps running.
         locals: Vec::new(),

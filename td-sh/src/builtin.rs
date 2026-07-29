@@ -99,6 +99,17 @@ pub fn is_special(bi: Builtin) -> bool {
     )
 }
 
+/// Whether this command WORD blocks the local-var frame `evalcommand` pushes.
+/// ash's `spclbltin` set: the POSIX list above, plus `local` itself -- which is
+/// what keeps a top-level `local` an error rather than a frame that authorises
+/// itself -- plus `source` and `times`, which ash also makes special and td-sh does
+/// not implement, so without naming them here they reach the external path and are
+/// framed. Taken by word, not by `Builtin`, so those two can be named at all.
+pub fn blocks_localvar_frame(word: &str) -> bool {
+    lookup(word).is_some_and(|bi| is_special(bi) || matches!(bi, Builtin::Local))
+        || matches!(word, "source" | "times")
+}
+
 pub fn run(sh: &mut Shell, bi: Builtin, argv: &[String]) -> R<()> {
     match bi {
         Builtin::Colon | Builtin::True => ok(sh),
@@ -1487,7 +1498,7 @@ fn export(sh: &mut Shell, argv: &[String], readonly: bool) -> R<()> {
 /// `unset` on a local then leaves it unset for the rest of the call instead of
 /// revealing the global, because the outer binding only comes back on unwind.
 fn local(sh: &mut Shell, argv: &[String]) -> R<()> {
-    if !sh.in_function {
+    if sh.localvar_depth == 0 {
         return special_usage_error(sh, "local: not in a function");
     }
     // Only the FIRST save of a name matters -- the frame unwinds newest-first, so
@@ -2410,9 +2421,10 @@ fn command(sh: &mut Shell, argv: &[String]) -> R<()> {
             // standing for the EXIT trap, like any other frame.
             exec::defer_locals(sh);
         } else {
-            // Defence only: no program reaches here with anything pending, since
-            // every recovery below already drains to its own mark. If one ever
-            // does, these are NEWER than the scratch frame and must come off
+            // Load-bearing inside an EXIT trap, which runs with the dying frame
+            // still deferred: draining to THIS mark takes off only what the
+            // scratch frame contains and leaves that outer frame standing. Anything
+            // deferred inside is newer than the scratch frame and must come off
             // first, or the frame's saved values are stale.
             exec::unwind_pending_to(sh, mark);
             exec::pop_locals(sh);
