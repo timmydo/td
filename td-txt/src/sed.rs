@@ -297,9 +297,11 @@ impl ScriptParser<'_> {
         Ok(AddrKind::Rx(self.add_regex(&raw, icase, multiline)?))
     }
 
-    /// Text up to the next unescaped `delim`, with `\delim` collapsed to a plain
-    /// `delim` and every other escape preserved for the regex compiler. A `delim`
-    /// inside a bracket expression is literal, as in GNU sed.
+    /// Text up to the next unescaped `delim`, every escape but `\delim` preserved
+    /// for the regex compiler. The order of the three tests below IS the rule GNU's
+    /// `match_slash` implements: a bare newline ends the half, then the delimiter,
+    /// then a backslash -- so `\<delim>` collapses whatever class the delimiter is,
+    /// and a `\` may itself delimit (`sed -n '\\^\p'`).
     fn read_delimited(&mut self, delim: u8, unterminated: &str) -> Result<Vec<u8>, String> {
         let mut out = Vec::new();
         let mut in_bracket = false;
@@ -308,11 +310,18 @@ impl ScriptParser<'_> {
             let Some(b) = self.bump() else {
                 return Err(unterminated.to_string());
             };
+            // Ahead of bracket state too, so `s/[<newline>]/X/` is refused.
+            if b == b'\n' {
+                return Err(unterminated.to_string());
+            }
+            if b == delim && !in_bracket {
+                return Ok(out);
+            }
             if b == b'\\' && !in_bracket {
                 let Some(n) = self.bump() else {
                     return Err(unterminated.to_string());
                 };
-                if n == delim && delim != b'\\' && !delim.is_ascii_alphanumeric() {
+                if n == delim {
                     out.push(n); // `\/` in a `/…/` is a literal delimiter
                 } else if n == b'\n' {
                     out.push(b'\n');
@@ -328,12 +337,6 @@ impl ScriptParser<'_> {
                     in_bracket = false;
                 }
                 continue;
-            }
-            if b == delim {
-                return Ok(out);
-            }
-            if b == b'\n' {
-                return Err(unterminated.to_string());
             }
             if b == b'[' {
                 in_bracket = true;
@@ -499,11 +502,13 @@ impl ScriptParser<'_> {
 
     fn parse_subst(&mut self) -> Result<Subst, String> {
         let delim = self.bump().ok_or_else(|| "unterminated `s' command".to_string())?;
-        if delim == b'\n' || delim == b'\\' {
+        // A backslash CAN delimit (`s\a\b\` is `s/a/b/`); a newline cannot, and
+        // GNU says so before reading anything else.
+        if delim == b'\n' {
             return Err("unterminated `s' command".to_string());
         }
         let pattern = self.read_delimited(delim, "unterminated `s' command")?;
-        let raw_repl = self.read_replacement(delim)?;
+        let raw_repl = self.read_replacement(delim, "unterminated `s' command")?;
         let mut global = false;
         let mut print = false;
         let mut icase = false;
@@ -582,19 +587,28 @@ impl ScriptParser<'_> {
         })
     }
 
-    /// The replacement half of `s///`: raw bytes with `\delim` collapsed, every
-    /// other escape left for `compile_replacement`.
-    fn read_replacement(&mut self, delim: u8) -> Result<Vec<u8>, String> {
+    /// The replacement half of `s///`, and either half of `y///`: `read_delimited`'s
+    /// ordering over raw bytes, every other escape left for `compile_replacement`.
+    /// `unterminated` is the caller's diagnostic, `y` naming itself rather than `s`.
+    fn read_replacement(&mut self, delim: u8, unterminated: &str) -> Result<Vec<u8>, String> {
         let mut out = Vec::new();
         loop {
             let Some(b) = self.bump() else {
-                return Err("unterminated `s' command".to_string());
+                return Err(unterminated.to_string());
             };
+            if b == b'\n' {
+                return Err(unterminated.to_string());
+            }
+            if b == delim {
+                return Ok(out);
+            }
             if b == b'\\' {
                 let Some(n) = self.bump() else {
-                    return Err("unterminated `s' command".to_string());
+                    return Err(unterminated.to_string());
                 };
-                if n == delim && delim != b'\\' {
+                // One exception to the collapse: an `&` delimiter keeps its
+                // backslash, `\&` being how a replacement says a literal ampersand.
+                if n == delim && delim != b'&' {
                     out.push(n);
                 } else if n == b'\n' {
                     // A continuation collapses before the decoder runs, which is
@@ -606,17 +620,15 @@ impl ScriptParser<'_> {
                 }
                 continue;
             }
-            if b == delim {
-                return Ok(out);
-            }
             out.push(b);
         }
     }
 
     fn parse_transliterate(&mut self) -> Result<Box<[u8; 256]>, String> {
-        let delim = self.bump().ok_or_else(|| "unterminated `y' command".to_string())?;
-        let from = normalize_buffer(&self.read_replacement(delim)?)?;
-        let to = normalize_buffer(&self.read_replacement(delim)?)?;
+        const UNTERM_Y: &str = "unterminated `y' command";
+        let delim = self.bump().ok_or_else(|| UNTERM_Y.to_string())?;
+        let from = normalize_buffer(&self.read_replacement(delim, UNTERM_Y)?)?;
+        let to = normalize_buffer(&self.read_replacement(delim, UNTERM_Y)?)?;
         if from.len() != to.len() {
             return Err("strings for `y' command are different lengths".to_string());
         }
@@ -2984,6 +2996,47 @@ mod tests {
         assert_eq!(Fatal::runtime("couldn't open file x: nope".into()).status, 4);
         assert_eq!(Fatal::runtime("write error: nope".into()).status, 4);
         assert_eq!(Fatal::runtime(NO_PREVIOUS_REGEX.into()).status, 1);
+    }
+
+    /// The delimiter is tested before the backslash, so `\<delim>` is that
+    /// delimiter as a literal whatever it is -- and a `\` may itself delimit.
+    /// GNU's `match_slash` is one rule; deciding from the character class is not.
+    #[test]
+    fn any_delimiter_collapses_its_own_escape_and_a_backslash_is_one() {
+        assert_eq!(sed(r"sxa\xbxXx", "axb\n", &[]), b"X\n");
+        assert_eq!(sed(r"\xa\xbxd", "axb\n", &[]), b"");
+        // `\n` is a newline only where `n` is not the delimiter.
+        assert_eq!(sed(r"sna\nbnXn", "anb\n", &[]), b"X\n");
+        assert_eq!(sed(r"sxa\nbxXx", "anb\n", &[]), b"anb\n");
+        assert_eq!(sed(r"s\a\b\", "ab\n", &[]), b"bb\n");
+        assert_eq!(sed(r"y\ab\ba\", "ab\n", &[]), b"ba\n");
+        // A replacement keeps the backslash for `&` alone, where it means the
+        // character rather than the match.
+        assert_eq!(sed(r"s&x&\&&", "x\n", &[]), b"&\n");
+        assert_eq!(sed(r"s&a\&b&X&", "a&b\n", &[]), b"X\n");
+    }
+
+    /// A bare newline ends a delimited half ahead of the delimiter AND of bracket
+    /// state, which is why no newline can delimit and `s/[<nl>]/X/` is refused.
+    #[test]
+    fn a_bare_newline_is_unterminated_before_it_is_anything_else() {
+        for (script, msg) in [
+            (&b"s\na\nb\n"[..], "unterminated `s' command"),
+            (b"s/[\n]/X/", "unterminated `s' command"),
+            (b"s/a/x\ny/", "unterminated `s' command"),
+            (b"y/a\n/xy/", "unterminated `y' command"),
+            (b"/a\nb/p", "unterminated address regex"),
+        ] {
+            let err = compile_script(script, false, false, false, Vec::new()).err();
+            assert_eq!(
+                err.map(|f| f.msg),
+                Some(msg.to_string()),
+                "{:?} must be {msg}",
+                String::from_utf8_lossy(script)
+            );
+        }
+        // The backslash that makes it a continuation is what makes it legal.
+        assert_eq!(sed("s/a/x\\\ny/", "ab\n", &[]), b"x\nyb\n");
     }
 
     #[test]

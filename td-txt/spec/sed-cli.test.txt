@@ -5530,3 +5530,163 @@ f$
 ## stdout-json: ""
 ## stderr-contains: Invalid content
 ## status: 1
+
+#### an ALPHANUMERIC delimiter collapses its own escape like any other
+## argv: sed 'sxa\xbxXx'
+## stdin-json: "axb\n"
+## stdout-json: "X\n"
+## stderr-json: ""
+## status: 0
+
+#### and in an address
+## argv: sed -n '\xa\xbxp'
+## stdin-json: "axb\n"
+## stdout-json: "axb\n"
+## stderr-json: ""
+## status: 0
+
+#### with `n` for a delimiter the collapse beats the newline `\n` usually spells
+## argv: sed 'sna\nbnXn'
+## stdin-json: "anb\n"
+## stdout-json: "X\n"
+## stderr-json: ""
+## status: 0
+
+#### where any OTHER delimiter leaves that newline alone
+## argv: sed 'sxa\nbxXx'
+## stdin-json: "anb\n"
+## stdout-json: "anb\n"
+## stderr-json: ""
+## status: 0
+
+#### a BACKSLASH delimits too, ending the half rather than escaping past it
+## argv: sed 's\a\b\'
+## stdin-json: "ab\n"
+## stdout-json: "bb\n"
+## stderr-json: ""
+## status: 0
+
+#### the y command takes one as well
+## argv: sed 'y\ab\ba\'
+## stdin-json: "ab\n"
+## stdout-json: "ba\n"
+## stderr-json: ""
+## status: 0
+
+#### and an address, which is the shape the manual spells `\%regexp%`
+## argv: sed -n '\\^\p'
+## stdin-json: "ab\n"
+## stdout-json: "ab\n"
+## stderr-json: ""
+## status: 0
+
+#### but a NEWLINE still cannot delimit, being tested before the delimiter is
+## argv:
+sed 's
+a
+b
+'
+## END
+## stdin-json: "ab\n"
+## stdout-json: ""
+## stderr-contains: unterminated `s' command
+## status: 1
+
+#### nor may one sit INSIDE a bracket expression, where no delimiter could end it
+## argv:
+sed 's/[
+]/X/'
+## END
+## stdin-json: "ab\n"
+## stdout-json: ""
+## stderr-contains: unterminated `s' command
+## status: 1
+
+#### nor in a REPLACEMENT, where a continuation needs its backslash
+## argv:
+sed 's/a/x
+y/'
+## END
+## stdin-json: "ab\n"
+## stdout-json: ""
+## stderr-contains: unterminated `s' command
+## status: 1
+
+#### which that backslash then makes legal, and a real newline in the output
+## argv:
+sed 's/a/x\
+y/'
+## END
+## stdin-json: "ab\n"
+## stdout-json: "x\nyb\n"
+## stderr-json: ""
+## status: 0
+
+#### y names ITSELF in that diagnostic rather than borrowing s's
+## argv:
+sed 'y/a
+/xy/'
+## END
+## stdin-json: "ab\n"
+## stdout-json: ""
+## stderr-contains: unterminated `y' command
+## status: 1
+
+#### and an address names the regex
+## argv:
+sed -n '/a
+b/p'
+## END
+## stdin-json: "ab\n"
+## stdout-json: ""
+## stderr-contains: unterminated address regex
+## status: 1
+
+#### an & delimiter keeps the backslash in a REPLACEMENT, where it means the character
+## argv: sed 's&x&\&&'
+## stdin-json: "x\n"
+## stdout-json: "&\n"
+## stderr-json: ""
+## status: 0
+
+#### while the same escape in the PATTERN half collapses
+## argv: sed 's&a\&b&X&'
+## stdin-json: "a&b\n"
+## stdout-json: "X\n"
+## stderr-json: ""
+## status: 0
+
+#### a delimiter inside a bracket expression is still literal
+## argv: sed 's/[/]/X/'
+## stdin-json: "a/b\n"
+## stdout-json: "aXb\n"
+## stderr-json: ""
+## status: 0
+
+#### a POSIX sub-expression inside a ]-delimited set does not close the set
+## argv: sed 's][[:alpha:]]]Q]'
+## stdin-json: "ab\n"
+## stdout-json: "Qb\n"
+## stderr-json: ""
+## status: 0
+
+#### nor does a collating element
+## argv: sed 's][[.a.]]]Q]'
+## stdin-json: "ab\n"
+## stdout-json: "Qb\n"
+## stderr-json: ""
+## status: 0
+
+#### sed refuses a bare { in an ERE, where nothing precedes it
+## argv: sed -E 's/{/./'
+## stdin-json: "ab\n"
+## stdout-json: ""
+## stderr-contains: Invalid preceding regular expression
+## status: 1
+
+#### and Unmatched \{ where something does
+## argv: sed -E 's/a{/./'
+## stdin-json: "ab\n"
+## stdout-json: ""
+## stderr-contains: Unmatched \{
+## status: 1

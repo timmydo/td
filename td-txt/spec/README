@@ -287,6 +287,33 @@ td-txt-authored case files
   nothing at all when there is none, silently, because a missing `R` source is not
   an error.
 
+  BEFORE any of that, the DELIMITER is found, and it is found by one rule with no
+  regard for what character it is: GNU's `match_slash` tests the delimiter FIRST
+  and the backslash second, so `\<delim>` is the delimiter as a literal for EVERY
+  delimiter class -- `sed 'sxa\xbxXx'` replaces `axb` and `sed -n '\xa\xbxp'`
+  selects it, an alphanumeric being no different from a `/`. Two consequences fall
+  out of the ordering rather than being separate rules. A BACKSLASH is a usable
+  delimiter, ending its half instead of escaping past it, which is how the manual's
+  `\%regexp%` address reads when `%` is itself a backslash: `s\a\b\`, `y\ab\ba\`
+  and `-n '\\^\p'` all parse. And `\n` is a newline only when `n` is NOT the
+  delimiter, so `sna\nbnXn` matches the text `anb` where `sxa\nbxXx` matches a real
+  newline.
+
+  One byte is tested BEFORE the delimiter, and it is a bare NEWLINE: it ends the
+  half as `unterminated`, ahead of bracket state too. So a newline is the one
+  character that cannot be a delimiter (`s<nl>a<nl>b<nl>`), a bracket expression
+  cannot contain one (`s/[<nl>]/X/` is refused, where a `/` there is fine), and a
+  replacement needs the backslash that makes it a continuation (`s/a/x<nl>y/` is
+  refused; `s/a/x\<nl>y/` inserts the newline). The diagnostic names the command
+  that read the half, so `y/a<nl>/xy/` is `unterminated `y' command` and an address
+  is `unterminated address regex`.
+
+  A REPLACEMENT differs in exactly one place: the backslash is kept when the
+  delimiter is `&`, because there it is the escape that means the character rather
+  than the match, so `s&x&\&&` emits a literal `&`. The pattern half of that same
+  command collapses as everything else does (`s&a\&b&X&` matches the text `a&b`).
+  A delimiter inside a bracket expression is not a delimiter at all (`s/[/]/X/`).
+
   The escape VOCABULARY is decoded before anything else parses the text, and what
   the decoded byte means then depends on who reads it. GNU knows `\n`, `\t`, `\r`,
   `\f`, `\v`, `\a`, `\cX`, `\dNNN`, `\oNNN` and `\xHH` -- and NOT `\e`, worth
@@ -423,19 +450,6 @@ td-txt-authored case files
     neighbouring shapes are NOT gaps: a text ending in an unpaired backslash is
     emitted raw, and a continuation collapses only across an `-e` boundary.
 
-  - What an escaped DELIMITER means, in three shapes that predate this campaign
-    and share one cause: GNU's `match_slash` collapses `\<delim>` for EVERY
-    delimiter, having special-cased a regex `\n` first, while td-txt decides from
-    the delimiter's character class. So an alphanumeric delimiter does not
-    collapse here (`sed 'sx\x5bxYx'` is the pattern `x5b` in GNU and, since the
-    escape pass, `Unmatched [` here -- it used to be a wrong line, which is why
-    this landing makes the shape louder rather than newer), and `&` as an `s///`
-    delimiter is the reverse: GNU KEEPS the backslash there, so `sed 's&x&\&&'`
-    emits a literal `&` where td-txt emits the whole match. A backslash as an
-    ADDRESS delimiter (`sed -n '\\^\p'`) is a third: GNU ends the address at the
-    backslash, td-txt reports an unterminated regex. Four xfail cases. Fixing
-    means porting `match_slash`'s condition rather than approximating it.
-
   - A backreference to a group under a repetition whose BODY can match empty,
     which POSIX leaves undefined and where GNU's answers do not follow a rule.
     Participation itself is modelled -- the body runs once so `^(x*)*\1$` and
@@ -461,6 +475,24 @@ td-txt-authored case files
     axis (when an anchor is an anchor); it is recorded here because a reviewer's
     cross-product found it while reviewing this branch, not because this branch
     caused it.
+
+  - A POSIX SUB-EXPRESSION inside a bracket set, when the set's own `]` is also
+    the delimiter: `read_delimited`'s bracket tracker ends the set at the `]` of
+    `[:alpha:]`, so `s][[:alpha:]]]Q]` is `unknown option to `s'` here and `Qb` in
+    GNU. `[[.a.]]` and `[[=a=]]` are the same shape; under any other delimiter all
+    of them agree, which is why this surfaces only now that the delimiter rule
+    above asserts the general case. Two xfail cases. Pre-existing -- main answers
+    identically -- and the fix is teaching that tracker the three sub-expression
+    forms, which the regex compiler already knows.
+
+  - A bare `{` in a sed ERE, which GNU refuses and td-txt reads as a literal
+    brace: `sed -E 's/{/./'` is `Invalid preceding regular expression` there and
+    a no-op here, and `s/a{/./` is `Unmatched \{`. This is the SED half of the
+    brace rule recorded above for grep, where reading an unusable brace as a
+    literal IS correct; sed's ERE does not, and `strict_repeats` does not
+    currently reach the brace-with-no-interval-body case. Two xfail cases. Also
+    pre-existing, but the delimiter fix gives it new spellings -- `s\{\.\` used to
+    die as `unterminated` before the regex compiler ever saw the brace.
 
   - A token grep DROPS for having nothing to repeat, sitting immediately before a
     `)`. `(a\b*)`, `(\b*)`, `(z|\b*)` and `({)` are `Unmatched ( or \(` there and
