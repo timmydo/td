@@ -333,6 +333,29 @@ impl ScriptParser<'_> {
             }
             if in_bracket {
                 out.push(b);
+                // `[:`, `[.` and `[=` open a sub-expression running to that same
+                // character before a `]`, so the `]` of `[:alpha:]` does not end
+                // the set and a delimiter after one is still a member. GNU's
+                // reader CONSUMES the byte it tests after the kind character and
+                // does not put it back, where the regex compiler peeks it — which
+                // is why `[[...]]` is a set holding `.` to grep and unterminated
+                // to sed, the reader having eaten the `.]` its name needed.
+                if b == b'[' {
+                    if let Some(kind) = self.peek().filter(|c| matches!(c, b':' | b'.' | b'=')) {
+                        self.pos += 1;
+                        out.push(kind);
+                        loop {
+                            let c = self.sub_expr_byte(&mut out, unterminated)?;
+                            if c != kind {
+                                continue;
+                            }
+                            if self.sub_expr_byte(&mut out, unterminated)? == b']' {
+                                break;
+                            }
+                        }
+                    }
+                    continue;
+                }
                 if b == b']' && out.len() > bracket_body + 1 {
                     in_bracket = false;
                 }
@@ -349,6 +372,19 @@ impl ScriptParser<'_> {
             }
             out.push(b);
         }
+    }
+
+    /// One byte of a bracket sub-expression, kept in `out`. A bare newline ends
+    /// the half here as it does everywhere else in `read_delimited`.
+    fn sub_expr_byte(&mut self, out: &mut Vec<u8>, unterminated: &str) -> Result<u8, String> {
+        let Some(c) = self.bump() else {
+            return Err(unterminated.to_string());
+        };
+        if c == b'\n' {
+            return Err(unterminated.to_string());
+        }
+        out.push(c);
+        Ok(c)
     }
 
     fn parse_addr_kind(&mut self) -> Result<Option<AddrKind>, String> {
@@ -1586,7 +1622,11 @@ struct Fatal {
 
 impl From<String> for Fatal {
     fn from(msg: String) -> Self {
-        Self { msg, status: 1 }
+        // GNU reports the `[:alpha:]`-for-`[[:alpha:]]` refusal bare and exits 4,
+        // alone among pattern errors; classified here by text for the same reason
+        // NO_PREVIOUS_REGEX is, so the raising site and this boundary cannot drift.
+        let status = if msg == crate::regex::CLASS_SYNTAX { 4 } else { 1 };
+        Self { msg, status }
     }
 }
 
@@ -3037,6 +3077,60 @@ mod tests {
         }
         // The backslash that makes it a continuation is what makes it legal.
         assert_eq!(sed("s/a/x\\\ny/", "ab\n", &[]), b"x\nyb\n");
+    }
+
+    /// A `]` inside a POSIX sub-expression is a member, not the end of the set,
+    /// so a delimiter after one is still a member too.
+    #[test]
+    fn a_posix_sub_expression_does_not_end_the_set_the_delimiter_reader_is_in() {
+        assert_eq!(sed("s/[[:alpha:]/]/X/g", "a/b\n", &[]), b"XXX\n");
+        assert_eq!(sed("s,[[:alpha:],],X,g", "a,b\n", &[]), b"XXX\n");
+        // With `]` for a delimiter the set ends right after the class, so the
+        // `]` in the subject is not a member -- but reaching the set's end at all
+        // is what needed fixing.
+        assert_eq!(sed("s][[:alpha:]]]X]g", "a]b\n", &[]), b"X]X\n");
+        assert_eq!(sed("s/[[.a.]/]/X/g", "a/b\n", &[]), b"XXb\n");
+        assert_eq!(sed("s/[[=a=]/]/X/g", "a/b\n", &[]), b"XXb\n");
+        // The reader CONSUMES the byte it tests after the kind character, so a
+        // closer overlapping it is missed and the parity shows.
+        // An even name-length CLOSES, and is then rejected for its name.
+        assert_eq!(
+            compile_script(b"s/[[....]]/X/", false, false, false, Vec::new())
+                .err()
+                .map(|f| f.msg),
+            Some("Invalid collation character".to_string())
+        );
+        for script in [&b"s/[[...]]/X/"[..], b"s/[[.....]]/X/", b"s/[[:::]]/X/", b"s/[[===]]/X/"] {
+            let err = compile_script(script, false, false, false, Vec::new()).err();
+            assert_eq!(
+                err.map(|f| f.msg),
+                Some("unterminated `s' command".to_string()),
+                "{:?}",
+                String::from_utf8_lossy(script)
+            );
+        }
+        // The closer must be the character that opened it, so these run off the
+        // end of the script rather than closing a set.
+        for script in [&b"s/[[:alpha:]/X/"[..], b"s/[[:alpha.]]/X/", b"s/[[:]]/X/"] {
+            let err = compile_script(script, false, false, false, Vec::new()).err();
+            assert_eq!(
+                err.map(|f| f.msg),
+                Some("unterminated `s' command".to_string()),
+                "{:?}",
+                String::from_utf8_lossy(script)
+            );
+        }
+    }
+
+    /// GNU reports the bare-class-syntax refusal without an expression prefix and
+    /// exits 4, alone among pattern errors.
+    #[test]
+    fn the_bare_class_syntax_refusal_is_exit_4_where_other_pattern_errors_are_1() {
+        let f = compile_script(b"s@[:alpha:]@X@", false, false, false, Vec::new()).err();
+        assert_eq!(f.as_ref().map(|f| f.status), Some(4));
+        assert_eq!(f.map(|f| f.msg), Some(crate::regex::CLASS_SYNTAX.to_string()));
+        let f = compile_script(b"s@[[:a:]]@X@", false, false, false, Vec::new()).err();
+        assert_eq!(f.map(|f| f.status), Some(1));
     }
 
     #[test]

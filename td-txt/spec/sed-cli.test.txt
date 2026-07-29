@@ -5690,3 +5690,304 @@ b/p'
 ## stdout-json: ""
 ## stderr-contains: Unmatched \{
 ## status: 1
+
+#### a POSIX class does not end the set, so a delimiter after one is a member
+## argv: sed 's/[[:alpha:]/]/X/g'
+## stdin-json: "a/b\n"
+## stdout-json: "XXX\n"
+## stderr-json: ""
+## status: 0
+
+#### the same under a comma delimiter
+## argv: sed 's,[[:alpha:],],X,g'
+## stdin-json: "a,b\n"
+## stdout-json: "XXX\n"
+## stderr-json: ""
+## status: 0
+
+#### and under a ] delimiter, where the set's own ] is the delimiter too
+## argv: sed 's][[:alpha:]]]X]g'
+## stdin-json: "a]b\n"
+## stdout-json: "X]X\n"
+## stderr-json: ""
+## status: 0
+
+#### a collating element behaves the same
+## argv: sed 's/[[.a.]/]/X/g'
+## stdin-json: "a/b\n"
+## stdout-json: "XXb\n"
+## stderr-json: ""
+## status: 0
+
+#### as does an equivalence class
+## argv: sed 's/[[=a=]/]/X/g'
+## stdin-json: "a/b\n"
+## stdout-json: "XXb\n"
+## stderr-json: ""
+## status: 0
+
+#### an address reads its set the same way
+## argv: sed -n '\%[[:alpha:]%]%p'
+## stdin-json: "a%b\n"
+## stdout-json: "a%b\n"
+## stderr-json: ""
+## status: 0
+
+#### a set left open by a class runs to the end of the script
+## argv: sed 's/[[:alpha:]/X/'
+## stdin-json: "a/b\n"
+## stdout-json: ""
+## stderr-contains: unterminated `s' command
+## status: 1
+
+#### the sub-expression's closer must be the character that opened it
+## argv: sed 's/[[:alpha.]]/X/'
+## stdin-json: "a/b\n"
+## stdout-json: ""
+## stderr-contains: unterminated `s' command
+## status: 1
+
+#### so [[:]] never closes either
+## argv: sed 's/[[:]]/X/'
+## stdin-json: "a/b\n"
+## stdout-json: ""
+## stderr-contains: unterminated `s' command
+## status: 1
+
+#### while a ] inside a collating element is a member and the set still closes
+## argv: sed 's/[[.].]]/X/'
+## stdin-json: "]a\n"
+## stdout-json: "Xa\n"
+## stderr-json: ""
+## status: 0
+
+#### a collating element may bound a range
+## argv: sed 's/[[.a.]-z]/X/'
+## stdin-json: "m\n"
+## stdout-json: "X\n"
+## stderr-json: ""
+## status: 0
+
+#### on the high side too
+## argv: sed 's/[a-[.z.]]/X/'
+## stdin-json: "m\n"
+## stdout-json: "X\n"
+## stderr-json: ""
+## status: 0
+
+#### and it is a RANGE, not the three characters spelling it
+## argv: sed 's/[[.a.]-z]/X/'
+## stdin-json: "-\n"
+## stdout-json: "-\n"
+## stderr-json: ""
+## status: 0
+
+#### a character class may not bound one
+## argv: sed 's/[[:alpha:]-z]/X/'
+## stdin-json: "m\n"
+## stdout-json: ""
+## stderr-contains: Invalid range end
+## status: 1
+
+#### nor an equivalence class
+## argv: sed 's/[[=a=]-z]/X/'
+## stdin-json: "m\n"
+## stdout-json: ""
+## stderr-contains: Invalid range end
+## status: 1
+
+#### nor either of them on the high side
+## argv: sed 's/[a-[:digit:]]/X/'
+## stdin-json: "m\n"
+## stdout-json: ""
+## stderr-contains: Invalid range end
+## status: 1
+
+#### a trailing - after a class is still the literal it is anywhere
+## argv: sed 's/[[:alpha:]-]/X/'
+## stdin-json: "-\n"
+## stdout-json: "X\n"
+## stderr-json: ""
+## status: 0
+
+#### and the reversed-range refusal is unchanged
+## argv: sed 's/[z-a]/X/'
+## stdin-json: "m\n"
+## stdout-json: ""
+## stderr-contains: Invalid range end
+## status: 1
+
+#### a class written without its outer bracket is refused, and exits 4
+## argv: sed 's@[:alpha:]@X@'
+## stdin-json: "a\n"
+## stdout-json: ""
+## stderr-contains: character class syntax is [[:space:]], not [:space:]
+## status: 4
+
+#### it is the SHAPE of the list, not the name in it
+## argv: sed 's@[:*:]@X@'
+## stdin-json: "a\n"
+## stdout-json: ""
+## stderr-contains: character class syntax is [[:space:]], not [:space:]
+## status: 4
+
+#### a leading ^ does not hide it
+## argv: sed 's@[^:a:]@X@'
+## stdin-json: "a\n"
+## stdout-json: ""
+## stderr-contains: character class syntax is [[:space:]], not [:space:]
+## status: 4
+
+#### but colons with nothing between them are just colons
+## argv: sed 's@[::]@X@'
+## stdin-json: ":a\n"
+## stdout-json: "Xa\n"
+## stderr-json: ""
+## status: 0
+
+#### and a sub-expression in the list disqualifies the whole heuristic
+## argv: sed 's@[:a[.b.]:]@X@'
+## stdin-json: "a\n"
+## stdout-json: "X\n"
+## stderr-json: ""
+## status: 0
+
+#### a member error is reported ahead of it
+## argv: sed 's@[:a-:]@X@'
+## stdin-json: "a\n"
+## stdout-json: ""
+## stderr-contains: Invalid range end
+## status: 1
+
+#### GNU names the class NAME in its invalid-class message
+## argv: sed 's@[[:a:]]@X@'
+## stdin-json: "a\n"
+## stdout-json: ""
+## stderr-contains: Invalid character class name
+## status: 1
+
+#### the reader CONSUMES the byte it tests after the kind character
+## argv: sed 's/[[...]]/X/'
+## stdin-json: ".\n"
+## stdout-json: ""
+## stderr-contains: unterminated `s' command
+## status: 1
+
+#### one more dot and the reader finds the closer it just missed
+## argv: sed 's/[[....]]/X/'
+## stdin-json: ".\n"
+## stdout-json: ""
+## stderr-contains: Invalid collation character
+## status: 1
+
+#### and one more after that misses it again
+## argv: sed 's/[[.....]]/X/'
+## stdin-json: ".\n"
+## stdout-json: ""
+## stderr-contains: unterminated `s' command
+## status: 1
+
+#### the same alternation with colons
+## argv: sed 's/[[:::]]/X/'
+## stdin-json: "a\n"
+## stdout-json: ""
+## stderr-contains: unterminated `s' command
+## status: 1
+
+#### and with equals signs
+## argv: sed 's/[[===]]/X/'
+## stdin-json: "a\n"
+## stdout-json: ""
+## stderr-contains: unterminated `s' command
+## status: 1
+
+#### a lone [ in the content is content, not an opener
+## argv: sed 's/[[.[.]]/X/'
+## stdin-json: "[\n"
+## stdout-json: "X\n"
+## stderr-json: ""
+## status: 0
+
+#### so the set closes and the element is that bracket
+## argv: sed 's/[[.[]]/X/'
+## stdin-json: "[\n"
+## stdout-json: ""
+## stderr-contains: unterminated `s' command
+## status: 1
+
+#### colons with only colons between them are just colons
+## argv: sed 's@[:::]@X@'
+## stdin-json: ":\n"
+## stdout-json: "X\n"
+## stderr-json: ""
+## status: 0
+
+#### however many of them there are
+## argv: sed 's@[::::]@X@'
+## stdin-json: ":\n"
+## stdout-json: "X\n"
+## stderr-json: ""
+## status: 0
+
+#### and a RANGE in the list disqualifies the heuristic too
+## argv: sed 's@[:a-z:]@X@'
+## stdin-json: "b\n"
+## stdout-json: "X\n"
+## stderr-json: ""
+## status: 0
+
+#### as does one written with the dash first
+## argv: sed 's@[:-z:]@X@'
+## stdin-json: "b\n"
+## stdout-json: "X\n"
+## stderr-json: ""
+## status: 0
+
+#### a completed range cannot bound the next one
+## argv: sed 's@[a-b-c]@X@'
+## stdin-json: "b\n"
+## stdout-json: ""
+## stderr-contains: Invalid range end
+## status: 1
+
+#### nor can one whose low end was a collating element
+## argv: sed 's@[[.a.]-z-x]@X@'
+## stdin-json: "b\n"
+## stdout-json: ""
+## stderr-contains: Invalid range end
+## status: 1
+
+#### but a trailing dash after a range is still a literal
+## argv: sed 's@[a-b-]@X@'
+## stdin-json: "-\n"
+## stdout-json: "X\n"
+## stderr-json: ""
+## status: 0
+
+#### a [ consumed as a closer test leaves the reader somewhere unmodelled
+## argv: sed 's/[[..[]]/X/'
+## stdin-json: "a\n"
+## stdout-json: ""
+## stderr-contains: Unmatched [, [^, [:, [., or [=
+## status: 1
+
+#### and the same shape after an earlier sub-expression
+## argv: sed 's/[[...][.[.]]/X/'
+## stdin-json: "a\n"
+## stdout-json: ""
+## stderr-contains: unterminated `s' command
+## status: 1
+
+#### the same with a class
+## argv: sed 's/[[::[]]/X/'
+## stdin-json: "a\n"
+## stdout-json: ""
+## stderr-contains: Unmatched [, [^, [:, [., or [=
+## status: 1
+
+#### and with an equivalence class
+## argv: sed 's/[[==[]]/X/'
+## stdin-json: "a\n"
+## stdout-json: ""
+## stderr-contains: Unmatched [, [^, [:, [., or [=
+## status: 1

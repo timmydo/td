@@ -296,6 +296,10 @@ struct Parser<'a> {
     /// (`(a)|b\1`), and allows the same reference once the alternation has
     /// closed (`((a)|b)\2` compiles, and fails to match instead).
     sibling: Vec<(usize, usize)>,
+    /// A bracket list shaped like a class that lost its outer bracket. GNU lints
+    /// this only once the WHOLE pattern has compiled, so any other error outranks
+    /// it -- `[:alpha:]\` is `Trailing backslash`, not this.
+    class_syntax: bool,
 }
 
 impl<'a> Parser<'a> {
@@ -792,43 +796,62 @@ impl<'a> Parser<'a> {
     fn parse_bracket(&mut self) -> Result<Node, Error> {
         let mut set = ByteSet::empty();
         let negated = self.eat(b'^');
+        let body = self.pos;
+        let mut sub = false;
+        let mut ranged = false;
         let mut first = true;
         loop {
             let Some(b) = self.bump() else {
-                return Err(Error::new("Unmatched [, [^, [:, [., or [="));
+                // An EMPTY body that runs out is not an unmatched bracket to GNU
+                // but a bad pattern: `[` and `[^` differ from `[a` and `[]`.
+                return Err(Error::new(if first {
+                    "Invalid regular expression"
+                } else {
+                    "Unmatched [, [^, [:, [., or [="
+                }));
             };
             if b == b']' && !first {
+                // GNU refuses the `[:alpha:]` that was meant to be `[[:alpha:]]`,
+                // by the shape of the list rather than by the name in it: colons
+                // at both ends, a NON-COLON somewhere between them, and neither a
+                // sub-expression nor a range in it. So `[:*:]` is refused while
+                // `[::]`, `[::::]`, `[:a[.b.]:]` and `[:a-z:]` are ordinary lists.
+                let raw = self.pat.get(body..self.pos.saturating_sub(1)).unwrap_or_default();
+                if !sub
+                    && !ranged
+                    && raw.first() == Some(&b':')
+                    && raw.last() == Some(&b':')
+                    && raw.iter().any(|&c| c != b':')
+                {
+                    self.class_syntax = true;
+                }
                 break;
             }
             first = false;
-            if b == b'[' {
-                if let Some(kind @ (b':' | b'.' | b'=')) = self.peek() {
-                    self.pos += 1;
-                    let name = self.bracket_name(kind)?;
-                    match kind {
-                        b':' => self.add_named_class(&mut set, &name)?,
-                        // A collating element / equivalence class of one byte is
-                        // that byte in the C locale; anything longer has no
-                        // C-locale meaning.
-                        _ => match name.as_slice() {
-                            [one] => set.insert(*one),
-                            _ => return Err(Error::new("Invalid collation character")),
-                        },
-                    }
-                    continue;
-                }
-            }
+            let lo = self.bracket_member(b, &mut set, false)?;
+            sub = sub || lo.is_sub_expr();
             // A range, unless `-` is the last character before `]`.
             if self.peek() == Some(b'-') && self.peek_at(1).is_some_and(|c| c != b']') {
                 self.pos += 1;
-                let hi = self.bump().ok_or_else(|| Error::new("Unmatched [, [^, [:, [., or [="))?;
-                if hi < b {
+                let h = self.bump().ok_or_else(|| Error::new("Unmatched [, [^, [:, [., or [="))?;
+                let hi = self.bracket_member(h, &mut set, true)?;
+                sub = sub || hi.is_sub_expr();
+                match (lo.bound(), hi.bound()) {
+                    (Some(lo), Some(hi)) if hi >= lo => set.insert_range(lo, hi),
+                    _ => return Err(Error::new("Invalid range end")),
+                }
+                ranged = true;
+                // A completed range names no single character either, so it
+                // cannot bound the next one: `[a-b-c]` is an error where the
+                // trailing `-` of `[a-b-]` is the literal it always is.
+                if self.peek() == Some(b'-') && self.peek_at(1).is_some_and(|c| c != b']') {
                     return Err(Error::new("Invalid range end"));
                 }
-                set.insert_range(b, hi);
                 continue;
             }
-            set.insert(b);
+            if let Some(one) = lo.bound() {
+                set.insert(one);
+            }
         }
         // Fold BEFORE negating: `[^a]` under -i must reject `a` AND `A`. Folding
         // the negated set would re-add both cases and make it match everything.
@@ -846,6 +869,48 @@ impl<'a> Parser<'a> {
             }
         }
         Ok(Node::Class(set))
+    }
+
+    /// One member of a bracket list. `Some(byte)` may bound a range; `None` is a
+    /// whole set already added, which POSIX forbids as a range end. Only a
+    /// COLLATING ELEMENT names a single character, so `[[.a.]-z]` is the range
+    /// `a-z` while `[[:alpha:]-z]` and `[[=a=]-z]` are `Invalid range end`.
+    fn bracket_member(
+        &mut self,
+        b: u8,
+        set: &mut ByteSet,
+        range_end: bool,
+    ) -> Result<Member, Error> {
+        if b != b'[' {
+            return Ok(Member::Byte(b));
+        }
+        let Some(kind @ (b':' | b'.' | b'=')) = self.peek() else {
+            return Ok(Member::Byte(b));
+        };
+        self.pos += 1;
+        // As the HIGH end of a range the kind alone decides, ahead of the name: a
+        // class or equivalence class cannot end one whatever it is called, so
+        // `[a-[:bogus:]]` is `Invalid range end` and not a bad class name. The LOW
+        // end is a member first and is named before any `-` is seen, which is why
+        // `[[:bogus:]-a]` reports the name instead.
+        if range_end && kind != b'.' {
+            return Err(Error::new("Invalid range end"));
+        }
+        let name = self.bracket_name(kind)?;
+        if kind == b':' {
+            self.add_named_class(set, &name)?;
+            return Ok(Member::Set);
+        }
+        // A collating element / equivalence class of one byte is that byte in the
+        // C locale; anything longer has no C-locale meaning.
+        let [one] = name.as_slice() else {
+            return Err(Error::new("Invalid collation character"));
+        };
+        if kind == b'=' {
+            set.insert(*one);
+            return Ok(Member::Set);
+        }
+        Ok(Member::Collating(*one))
     }
 
     /// Contents of `[:name:]` / `[.name.]` / `[=name=]`, positioned after the
@@ -885,9 +950,36 @@ impl<'a> Parser<'a> {
             b"graph" => add(|c| (0x21..=0x7e).contains(&c)),
             b"cntrl" => add(|c| c < 0x20 || c == 0x7f),
             b"xdigit" => add(|c| c.is_ascii_hexdigit()),
-            _ => return Err(Error::new("Invalid character class")),
+            _ => return Err(Error::new("Invalid character class name")),
         }
         Ok(())
+    }
+}
+
+/// One member of a bracket list, and whether it may bound a range. Named rather
+/// than inferred from how far the parser moved: a future member that consumes
+/// bytes for some other reason would silently read as a sub-expression.
+#[derive(Clone, Copy)]
+enum Member {
+    /// An ordinary character.
+    Byte(u8),
+    /// `[.x.]` -- one character, spelled the long way, so it may bound a range.
+    Collating(u8),
+    /// `[:class:]` or `[=equiv=]`, already added: a set, never a range bound.
+    Set,
+}
+
+impl Member {
+    /// The single character this member names, if it names one.
+    fn bound(self) -> Option<u8> {
+        match self {
+            Member::Byte(b) | Member::Collating(b) => Some(b),
+            Member::Set => None,
+        }
+    }
+
+    fn is_sub_expr(self) -> bool {
+        !matches!(self, Member::Byte(_))
     }
 }
 
@@ -899,6 +991,12 @@ const RE_DUP_MAX: u32 = 32767;
 /// and reports its own `stack overflow` past that; td-txt refuses one step
 /// earlier with a diagnosed error instead of aborting.
 const MAX_NESTING: usize = 5_000;
+
+/// GNU's own words for a `[:alpha:]` written without its outer bracket. Named
+/// because sed classifies it by text: it is the one PATTERN error GNU reports
+/// bare and exits 4 for, where every other one is exit 1 behind an `-e
+/// expression #N' prefix.
+pub const CLASS_SYNTAX: &str = "character class syntax is [[:space:]], not [:space:]";
 
 /// How many iterations a repetition whose body is NOT a single byte may take.
 /// Such a body recurses once per iteration; the cap turns what would be a stack
@@ -932,11 +1030,22 @@ const STEP_BUDGET: u64 = 40_000_000;
 impl Regex {
     pub fn compile(pattern: &[u8], opts: Options) -> Result<Self, Error> {
         let mut p =
-            Parser { pat: pattern, pos: 0, opts, ngroups: 0, open: Vec::new(), sibling: Vec::new() };
+            Parser {
+                pat: pattern,
+                pos: 0,
+                opts,
+                ngroups: 0,
+                open: Vec::new(),
+                sibling: Vec::new(),
+                class_syntax: false,
+            };
         let root = p.parse_alt(0)?;
         if p.pos < pattern.len() {
             // Only an unbalanced `)` can stop the top-level parse early.
             return Err(Error::new("Unmatched ) or \\)"));
+        }
+        if p.class_syntax {
+            return Err(Error::new(CLASS_SYNTAX));
         }
         let first = first_bytes(&root);
         let has_alt = has_alt(&root);
@@ -1606,6 +1715,120 @@ mod tests {
             pat.as_bytes(),
             Options { ere: true, strict_repeats: true, ..Options::default() },
         )
+    }
+
+    /// Only a COLLATING ELEMENT names a single character, so only it may bound a
+    /// range; a class or equivalence class there is an error on either side.
+    #[test]
+    fn a_range_may_be_bounded_by_a_collating_element_and_by_nothing_else() {
+        // A range, not the three characters that spell one.
+        assert!(matched(&bre("[[.a.]-z]"), "m"));
+        assert!(!matched(&bre("[[.a.]-z]"), "-"));
+        assert!(matched(&bre("[a-[.z.]]"), "m"));
+        assert!(matched(&bre("[[.a.]-[.z.]]"), "m"));
+        for bad in ["[[:alpha:]-z]", "[[=a=]-z]", "[a-[:digit:]]", "[a-[=z=]]", "[z-a]"] {
+            assert_eq!(
+                Regex::compile(bad.as_bytes(), Options::default()).err().map(|e| e.msg),
+                Some("Invalid range end".to_string()),
+                "{bad}"
+            );
+        }
+        // A completed range names no single character either.
+        for bad in ["[a-b-c]", "[a-z-9]", "[[.a.]-z-x]"] {
+            assert_eq!(
+                Regex::compile(bad.as_bytes(), Options::default()).err().map(|e| e.msg),
+                Some("Invalid range end".to_string()),
+                "{bad}"
+            );
+        }
+        // A `-` last in the list is the literal it is anywhere else.
+        assert!(matched(&bre("[a-b-]"), "-"));
+        assert!(matched(&bre("[[:alpha:]-]"), "-"));
+        assert!(matched(&bre("[[.a.]-]"), "a"));
+    }
+
+    /// GNU refuses `[:alpha:]` written without its outer bracket by the SHAPE of
+    /// the list: colons at both ends, something between, no sub-expression.
+    #[test]
+    fn a_class_missing_its_outer_bracket_is_refused_by_shape_not_by_name() {
+        for bad in ["[:alpha:]", "[:bogus:]", "[:*:]", "[:0:]", "[^:a:]", "[:a[b:]"] {
+            assert_eq!(
+                Regex::compile(bad.as_bytes(), Options::default()).err().map(|e| e.msg),
+                Some(CLASS_SYNTAX.to_string()),
+                "{bad}"
+            );
+        }
+        // Only colons between the colons, or a range in the list, and it is an
+        // ordinary set again -- both found by fuzzing, not by reading.
+        assert!(matched(&bre("[:::]"), ":"));
+        assert!(matched(&bre("[::::]"), ":"));
+        assert!(matched(&bre("[:a-z:]"), "b"));
+        assert!(matched(&bre("[:-z:]"), "b"));
+        // Nothing between the colons, or a sub-expression in the list, and it is
+        // an ordinary set again.
+        assert!(matched(&bre("[::]"), ":"));
+        assert!(matched(&bre("[:]"), ":"));
+        assert!(matched(&bre("[:alpha]"), "a"));
+        assert!(matched(&bre("[:a[.b.]:]"), "a"));
+        // A member error outranks the heuristic.
+        assert_eq!(
+            Regex::compile(b"[:a-:]", Options::default()).err().map(|e| e.msg),
+            Some("Invalid range end".to_string())
+        );
+        // And the class-name message is GNU's, which says `name`.
+        assert_eq!(
+            Regex::compile(b"[[:a:]]", Options::default()).err().map(|e| e.msg),
+            Some("Invalid character class name".to_string())
+        );
+        // GNU lints this only once the WHOLE pattern compiles, so any other
+        // error -- anywhere, before or after -- outranks it.
+        for (pat, msg) in [
+            (&b"[:alpha:]\\"[..], "Trailing backslash"),
+            (b"[:alpha:]\\(", "Unmatched ( or \\("),
+            (b"[:alpha:][z-a]", "Invalid range end"),
+            (b"[z-a][:alpha:]", "Invalid range end"),
+        ] {
+            assert_eq!(
+                Regex::compile(pat, Options::default()).err().map(|e| e.msg),
+                Some(msg.to_string()),
+                "{:?}",
+                String::from_utf8_lossy(pat)
+            );
+        }
+    }
+
+    /// The kind of a sub-expression decides a range's HIGH end before its name is
+    /// read; at the LOW end it is a member first, so the name is read first.
+    #[test]
+    fn a_range_end_is_refused_by_kind_where_a_member_is_refused_by_name() {
+        for (pat, msg) in [
+            (&b"[a-[:bogus:]]"[..], "Invalid range end"),
+            (b"[a-[=ab=]]", "Invalid range end"),
+            (b"[a-[.ab.]]", "Invalid collation character"),
+            (b"[[:bogus:]-a]", "Invalid character class name"),
+            (b"[[==]-a]", "Invalid collation character"),
+        ] {
+            assert_eq!(
+                Regex::compile(pat, Options::default()).err().map(|e| e.msg),
+                Some(msg.to_string()),
+                "{:?}",
+                String::from_utf8_lossy(pat)
+            );
+        }
+        // An empty body that runs out is a bad pattern, not an unmatched bracket.
+        for (pat, msg) in [
+            (&b"["[..], "Invalid regular expression"),
+            (b"[^", "Invalid regular expression"),
+            (b"[a", "Unmatched [, [^, [:, [., or [="),
+            (b"[]", "Unmatched [, [^, [:, [., or [="),
+        ] {
+            assert_eq!(
+                Regex::compile(pat, Options::default()).err().map(|e| e.msg),
+                Some(msg.to_string()),
+                "{:?}",
+                String::from_utf8_lossy(pat)
+            );
+        }
     }
 
     /// The three places `strict_repeats` changes an ANSWER rather than a

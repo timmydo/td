@@ -3167,3 +3167,108 @@ abc
 ## stdin-json: "a\n"
 ## stdout-json: "1\n"
 ## status: 0
+
+#### grep refuses it too, at its own exit 2
+## argv: grep '[:alpha:]'
+## stdin-json: "a\n"
+## stdout-json: ""
+## stderr-contains: character class syntax is [[:space:]], not [:space:]
+## status: 2
+
+#### and an unterminated one is still just unterminated
+## argv: grep '[:a:'
+## stdin-json: "a\n"
+## stdout-json: ""
+## stderr-contains: Unmatched [, [^, [:, [., or [=
+## status: 2
+
+#### where the compiler PEEKS it, so grep reads the same text as a set holding a dot
+## argv: grep -c '[[...]]'
+## stdin-json: ".\n"
+## stdout-json: "1\n"
+## stderr-json: ""
+## status: 0
+
+#### as the HIGH end of a range the KIND decides ahead of the name
+## argv: grep '[a-[:bogus:]]'
+## stdin-json: "a\n"
+## stdout-json: ""
+## stderr-contains: Invalid range end
+## status: 2
+
+#### an equivalence class there is refused before its name is read too
+## argv: grep '[a-[=ab=]]'
+## stdin-json: "a\n"
+## stdout-json: ""
+## stderr-contains: Invalid range end
+## status: 2
+
+#### but a COLLATING element there is named first, since it could have bounded one
+## argv: grep '[a-[.ab.]]'
+## stdin-json: "a\n"
+## stdout-json: ""
+## stderr-contains: Invalid collation character
+## status: 2
+
+#### and at the LOW end the name always comes first
+## argv: grep '[[:bogus:]-a]'
+## stdin-json: "a\n"
+## stdout-json: ""
+## stderr-contains: Invalid character class name
+## status: 2
+
+#### the missing-outer-bracket lint waits for the whole pattern to compile
+## argv: grep '[:alpha:]\'
+## stdin-json: "a\n"
+## stdout-json: ""
+## stderr-contains: Trailing backslash
+## status: 2
+
+#### so an unmatched group later in it wins
+## argv: grep '[:alpha:]\('
+## stdin-json: "a\n"
+## stdout-json: ""
+## stderr-contains: Unmatched ( or \(
+## status: 2
+
+#### as does a bad range
+## argv: grep '[:alpha:][z-a]'
+## stdin-json: "a\n"
+## stdout-json: ""
+## stderr-contains: Invalid range end
+## status: 2
+
+#### while a pattern that otherwise compiles still gets the lint
+## argv: grep 'a[:alpha:]'
+## stdin-json: "a\n"
+## stdout-json: ""
+## stderr-contains: character class syntax is [[:space:]], not [:space:]
+## status: 2
+
+#### an EMPTY bracket body that runs out is a bad pattern, not an unmatched one
+## argv: grep '['
+## stdin-json: "a\n"
+## stdout-json: ""
+## stderr-contains: Invalid regular expression
+## status: 2
+
+#### negation does not give it a body
+## argv: grep '[^'
+## stdin-json: "a\n"
+## stdout-json: ""
+## stderr-contains: Invalid regular expression
+## status: 2
+
+#### one member is enough to make it unmatched instead
+## argv: grep '[a'
+## stdin-json: "a\n"
+## stdout-json: ""
+## stderr-contains: Unmatched [, [^, [:, [., or [=
+## status: 2
+
+#### and a leading ] is that member
+## argv: grep ']'
+## stdin-json: "]\n"
+## stdout-json: "]\n"
+## stderr-json: ""
+## status: 0

@@ -344,6 +344,50 @@ td-txt-authored case files
   last note claimed otherwise and a reviewer caught it; the probe is one line, so
   run it rather than reasoning by analogy from the bracket case.
 
+  A POSIX SUB-EXPRESSION -- `[:class:]`, `[.collating.]`, `[=equivalence=]` --
+  runs to the character that OPENED it followed by a `]`, and both of sed's
+  readers have to know that. To the delimiter reader it means the `]` of
+  `[:alpha:]` does not end the set, so a delimiter after one is still a member
+  (`s/[[:alpha:]/]/X/`, `s][[:alpha:]]]X]`), a closer that does not match its
+  opener never closes (`[[:alpha.]]` runs to the end of the script and is
+  `unterminated`, as is `[[:]]`), and a `]` inside a collating element is a
+  member with the set still open (`[[.].]]`). To the regex compiler it decides
+  what may BOUND A RANGE: only a collating element names a single character, so
+  `[[.a.]-z]` is the range `a-z` -- it selects `m` and not `-` -- while
+  `[[:alpha:]-z]` and `[[=a=]-z]` are `Invalid range end`, on either side of the
+  `-`. A completed RANGE names no single character either, which is the same rule
+  and the reason `[a-b-c]` is refused; a trailing `-` before the `]` is the
+  literal it is anywhere else, so `[a-b-]` is not.
+
+  The two readers part company on ONE thing, and it is why `[[...]]` is a set
+  holding a dot to grep and `unterminated` to sed. Looking for the closer, sed's
+  reader CONSUMES the byte it tests after the kind character and does not put it
+  back; the regex compiler peeks it. So the reader misses a closer that overlaps
+  the byte it just ate, and the parity shows: `[[..]]`, `[[....]]` close, while
+  `[[...]]` and `[[.....]]` run to the end of the script. Same for `[[:::]]` and
+  `[[===]]`.
+
+  GNU also refuses the `[:alpha:]` that was meant to be `[[:alpha:]]`, and by the
+  SHAPE of the list rather than the name in it: colons at both ends, a NON-COLON
+  somewhere between them, and neither a sub-expression nor a range in the list.
+  So `[:*:]` and `[^:a:]` are refused while `[:]`, `[::]`, `[::::]`, `[:alpha]`,
+  `[:a[.b.]:]` and `[:a-z:]` are all ordinary lists. A member error outranks it
+  (`[:a-:]` is `Invalid range end`), and so does EVERY other error, anywhere in
+  the pattern: it is a lint on something that otherwise compiles, so
+  `[:alpha:]\` is `Trailing backslash` and `[:alpha:][z-a]` is `Invalid range
+  end`. Its message is GNU's own -- `character class syntax is [[:space:]], not
+  [:space:]` -- and in sed it is the one PATTERN error reported BARE and exiting
+  4, where every other one is exit 1 behind an `-e expression #N' prefix; grep
+  reports it at its usual exit 2.
+
+  Two smaller orderings came out of the same sweep. A sub-expression at a range's
+  HIGH end is judged by its KIND before its name is read, so `[a-[:bogus:]]` is
+  `Invalid range end` rather than a bad class name, while at the LOW end it is a
+  member first and `[[:bogus:]-a]` reports the name; a collating element is named
+  at either end, being the one kind that could have bounded the range. And a
+  bracket whose body is still EMPTY when the pattern runs out is `Invalid regular
+  expression`, not `Unmatched [` -- `[` and `[^` against `[a` and `[]`.
+
   A REPETITION OPERATOR needs something to repeat, and the two tools disagree
   about what happens when it has nothing -- which is the first place their regex
   grammars are not one grammar with two spellings. `Options::strict_repeats` is
@@ -476,14 +520,22 @@ td-txt-authored case files
     cross-product found it while reviewing this branch, not because this branch
     caused it.
 
-  - A POSIX SUB-EXPRESSION inside a bracket set, when the set's own `]` is also
-    the delimiter: `read_delimited`'s bracket tracker ends the set at the `]` of
-    `[:alpha:]`, so `s][[:alpha:]]]Q]` is `unknown option to `s'` here and `Qb` in
-    GNU. `[[.a.]]` and `[[=a=]]` are the same shape; under any other delimiter all
-    of them agree, which is why this surfaces only now that the delimiter rule
-    above asserts the general case. Two xfail cases. Pre-existing -- main answers
-    identically -- and the fix is teaching that tracker the three sub-expression
-    forms, which the regex compiler already knows.
+  - A `[` that sed's reader CONSUMES as the byte it tests after a sub-expression's
+    kind character. The consume-don't-peek rule above holds everywhere else; where
+    the byte eaten is a `[`, no reading fits the answers. Measured exhaustively
+    over the 55,980 bracket bodies of length 2-6 spellable in `[ ] : . = a`, the
+    rule makes 16,967 shapes agree with GNU that did not, and 52 disagree that
+    did; 8 are wrong either way. Every one of the 52 puts a `[` at the position
+    the closer test eats, in any of the three kinds -- `[[..[]]`, `[[::[]]` and
+    `[[==[]]` are `Unmatched [` in GNU and `unterminated` here -- so it is a
+    family, not the collating-element corner an earlier draft of this entry
+    claimed. Four xfail cases: those three, plus `[[...][.[.]]` for the reverse
+    direction, where GNU is `unterminated` and td-txt compiles. Three readings
+    were tried and each is contradicted by one of four probes: abandon the
+    sub-expression on a consumed `[` (`[[..[a]]` refutes it), open a nested one
+    (`[[...][.a.]]` refutes it), and treat `[` as ordinary content (`[[..[]]`
+    refutes it). Recorded rather than guessed at, because a fourth reading fitted
+    to two more probes would be the mistake this file already records once.
 
   - A bare `{` in a sed ERE, which GNU refuses and td-txt reads as a literal
     brace: `sed -E 's/{/./'` is `Invalid preceding regular expression` there and
