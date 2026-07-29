@@ -72,6 +72,24 @@ fn corpus_is_well_formed() -> Result<(), Box<dyn std::error::Error>> {
                 case.name,
                 unknown,
             );
+            // An unrecognisable `compare_shells` token does not fail, it silently
+            // stops bounding the identity chain for the whole file. The two
+            // spellings a human would plausibly write are the `/`-separated one
+            // (which is how the shell list two lines below is written) and a
+            // capitalised name; both are rejected here so they red rather than
+            // disappear. Versioned names (`bash-4.4`, `zsh-5.9`) are real.
+            for token in case.compare_shells() {
+                let ok = token.starts_with(|c: char| c.is_ascii_lowercase())
+                    && token
+                        .chars()
+                        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '.');
+                assert!(
+                    ok,
+                    "{}: `## compare_shells:` token {token:?} is not a plain shell identity — \
+                     it would silently stop bounding the golden chain for this file",
+                    path.display(),
+                );
+            }
             resolve(case, ASH_DASH_CHAIN)
                 .map_err(|e| format!("{} [case: {}]: {e}", path.display(), case.name))?;
         }

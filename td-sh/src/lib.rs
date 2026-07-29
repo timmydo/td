@@ -26,13 +26,16 @@
 //!   #  (single hash) / blank      an ignored comment (also a no-op shell comment)
 //!   <anything else>              a line of the case's shell code (verbatim)
 //! ```
-//! Bare `## key: value` lines before the first `####` are file-level metadata
-//! (e.g. `## compare_shells: bash dash mksh ash`) and are ignored here.
+//! Bare `## key: value` lines before the first `####` are file-level metadata.
+//! All are ignored except `## compare_shells:`, which names the shells Oils ran
+//! the file against and so bounds how far the identity chain may fall through
+//! (see `effective_chain`).
 //!
 //! Golden resolution: for each of {status, stdout, stderr} independently, the
 //! effective expectation is the qualified annotation whose shell list contains
-//! the earliest identity in the target chain (ash, then dash), else the
-//! unqualified (default/ideal) annotation. Matching dash/ash — not the osh ideal —
+//! the earliest identity in the target chain (ash, then dash) — but the chain
+//! reaches only as far as the first identity the FILE compared
+//! (`effective_chain`) — else the unqualified (default/ideal) annotation. Matching dash/ash — not the osh ideal —
 //! is what a busybox-`sh` replacement must do. Unspecified stdout/stderr is "not
 //! asserted"; unspecified status defaults to 0 (Oils semantics). The qualifier
 //! kind (OK/N-I/BUG) does not change WHICH value applies to a shell, only records
@@ -104,6 +107,9 @@ pub struct SpecCase {
     pub name: String,
     pub code: String,
     pub line: usize, // 1-based line of the `####` header, for reporting
+    /// The file's `## compare_shells:` list, stamped onto every case in it.
+    /// Empty when the file declares none. See `effective_chain`.
+    compare_shells: Vec<String>,
     annotations: Vec<Annotation>,
 }
 
@@ -248,6 +254,7 @@ pub fn parse_spec(input: &str) -> Result<Vec<SpecCase>, SpecError> {
     let mut cases: Vec<SpecCase> = Vec::new();
     let mut cur: Option<SpecCase> = None;
     let mut code_inline = false; // this case's code came from `## code:` (Oils: exclusive with body code)
+    let mut compare_shells: Vec<String> = Vec::new();
     let mut i = 0;
 
     while let Some(line) = lines.get(i) {
@@ -255,7 +262,13 @@ pub fn parse_spec(input: &str) -> Result<Vec<SpecCase>, SpecError> {
         if line.starts_with("####") {
             push_case(&mut cases, cur.take());
             let name = line.trim_start_matches('#').trim().to_string();
-            cur = Some(SpecCase { name, code: String::new(), line: i + 1, annotations: Vec::new() });
+            cur = Some(SpecCase {
+                name,
+                code: String::new(),
+                line: i + 1,
+                compare_shells: compare_shells.clone(),
+                annotations: Vec::new(),
+            });
             code_inline = false;
             i += 1;
             continue;
@@ -297,6 +310,26 @@ pub fn parse_spec(input: &str) -> Result<Vec<SpecCase>, SpecError> {
                     c.code = head.value;
                     code_inline = true;
                 }
+                i += 1;
+                continue;
+            }
+            // The one piece of file-level metadata that is not prose: the shells
+            // Oils actually ran this file against. It decides how far the identity
+            // chain may fall through (`effective_chain`), so it is read rather
+            // than skipped with the rest.
+            // `cur.is_none()` is load-bearing: inside a case this key is not a
+            // header but an unrecognized assertion, and swallowing it would both
+            // hide it from `unrecognized_keys` and silently re-aim every LATER
+            // case in the file. The qualifier/shells check mirrors `## code:`
+            // above, so `## OK ash compare_shells: ..` is not read as a header
+            // with its qualifier quietly dropped.
+            if head.has_colon
+                && cur.is_none()
+                && head.key == "compare_shells"
+                && head.qualifier == Qualifier::Default
+                && head.shells.is_empty()
+            {
+                compare_shells = head.value.split_whitespace().map(str::to_string).collect();
                 i += 1;
                 continue;
             }
@@ -390,6 +423,13 @@ impl SpecCase {
     /// `is_assertion_key`): empty for a well-formed case, non-empty when a typo
     /// or unsupported assertion would silently pick the wrong golden. A corpus
     /// validator should reject any case whose result here is non-empty.
+    /// The file's `## compare_shells:` tokens, for a corpus validator to check
+    /// the spelling of: an unrecognisable one does not fail, it silently stops
+    /// bounding the chain for that whole file.
+    pub fn compare_shells(&self) -> &[String] {
+        &self.compare_shells
+    }
+
     pub fn unrecognized_keys(&self) -> Vec<&str> {
         self.annotations
             .iter()
@@ -399,12 +439,44 @@ impl SpecCase {
     }
 }
 
-/// Pick the annotation that applies to `chain` for `field`: the earliest chain
-/// identity that some annotation names wins; otherwise the unqualified default.
+/// Whether a `compare_shells` token names `id`. Oils writes versioned identities
+/// (`bash-4.4` and `zsh-5.9` are both in this corpus), and a file that compared
+/// one compared that shell; without this an `ash-1.37` header would switch the
+/// bound off for its whole file with nothing to show for it.
+fn names_identity(token: &str, id: &str) -> bool {
+    token.strip_prefix(id).is_some_and(|rest| rest.is_empty() || rest.starts_with('-'))
+}
+
+/// `chain`, truncated after the first identity the FILE actually compared.
+///
+/// For a shell the file compared, the format already designates that shell's
+/// golden: its own annotation if it has one, the unqualified block otherwise.
+/// A LATER identity's block is another shell's divergence and was never a
+/// statement about this one, so the chain must not reach it. (The tempting
+/// stronger reading -- that silence means agreement -- is false, and this same
+/// corpus refutes it: ash still fails 1263 cases whose files list ash. Silence
+/// says nothing about whether ash MATCHES the default block, only that the
+/// default block is the golden it is held to.) A file that never ran the shell
+/// designates nothing, so there the fallthrough stands as the same-lineage
+/// heuristic it always was.
+fn effective_chain<'a>(case: &SpecCase, chain: &'a [&'a str]) -> &'a [&'a str] {
+    match chain
+        .iter()
+        .position(|id| case.compare_shells.iter().any(|t| names_identity(t, id)))
+    {
+        Some(i) => chain.get(..=i).unwrap_or(chain),
+        None => chain,
+    }
+}
+
+/// Pick the annotation that applies to `chain` for `field`: the earliest
+/// identity of the EFFECTIVE chain that some annotation names wins; otherwise
+/// the unqualified default. Per field, so one field may resolve to a per-shell
+/// block while another falls to the default.
 fn pick<'a>(case: &'a SpecCase, chain: &[&str], field: Field) -> Option<&'a Annotation> {
     let candidates: Vec<&Annotation> =
         case.annotations.iter().filter(|a| key_in_field(&a.key, field)).collect();
-    for id in chain {
+    for id in effective_chain(case, chain) {
         if let Some(a) = candidates.iter().find(|a| a.shells.iter().any(|s| s == id)) {
             return Some(a);
         }
@@ -1165,15 +1237,183 @@ false
     }
 
     #[test]
-    fn dash_override_wins_over_default_block() -> Result<(), SpecError> {
+    fn a_dash_override_does_not_outrank_a_file_that_compared_ash() -> Result<(), SpecError> {
+        // SAMPLE's `## compare_shells:` lists ash, so Oils RAN ash here and wrote
+        // no block for it -- which is evidence that the default block is ash's own
+        // answer. The `## OK dash` block records where dash left it, not where we
+        // should be, so it must not be inherited.
         let cases = parse_spec(SAMPLE)?;
         let c = cases.get(2).ok_or_else(|| SpecError::new(0, "missing case"))?;
-        // Our chain is [ash, dash]; no ash block, so the dash override applies.
-        let e = resolve(c, ASH_DASH_CHAIN)?;
-        assert_eq!(e.stdout.as_deref(), Some("dash-says\n"));
+        assert_eq!(resolve(c, ASH_DASH_CHAIN)?.stdout.as_deref(), Some("default-ideal\n"));
+
+        // The same case in a file that never ran ash says nothing about ash, so the
+        // chain still falls through to its same-lineage neighbour.
+        let without = SAMPLE.replace("mksh ash", "mksh");
+        let cases = parse_spec(&without)?;
+        let c = cases.get(2).ok_or_else(|| SpecError::new(0, "missing case"))?;
+        assert_eq!(resolve(c, ASH_DASH_CHAIN)?.stdout.as_deref(), Some("dash-says\n"));
         // A chain without dash falls back to the unqualified default.
-        let e2 = resolve(c, &["mksh"])?;
-        assert_eq!(e2.stdout.as_deref(), Some("default-ideal\n"));
+        assert_eq!(resolve(c, &["mksh"])?.stdout.as_deref(), Some("default-ideal\n"));
+        Ok(())
+    }
+
+    #[test]
+    fn an_explicit_ash_block_still_wins_in_a_file_that_compared_ash() -> Result<(), SpecError> {
+        // Truncating the chain only removes the FALLTHROUGH. Where ash diverged,
+        // Oils wrote the block down, and that block is still what applies.
+        let spec = "\
+## compare_shells: dash ash
+
+#### ash has its own answer
+echo x
+## STDOUT:
+default-ideal
+## END
+## BUG ash STDOUT:
+ash-says
+## END
+## OK dash STDOUT:
+dash-says
+## END
+";
+        let cases = parse_spec(spec)?;
+        let c = cases.first().ok_or_else(|| SpecError::new(0, "missing case"))?;
+        assert_eq!(resolve(c, ASH_DASH_CHAIN)?.stdout.as_deref(), Some("ash-says\n"));
+        Ok(())
+    }
+
+    #[test]
+    fn a_file_that_compared_only_dash_still_reaches_its_block() -> Result<(), SpecError> {
+        // The truncation is keyed on the file's list, not on position: with ash
+        // absent from it, `dash` is the first compared identity and the chain runs
+        // to there and stops.
+        let spec = "\
+## compare_shells: bash dash mksh
+
+#### only dash was compared
+echo x
+## STDOUT:
+default-ideal
+## END
+## OK dash STDOUT:
+dash-says
+## END
+";
+        let cases = parse_spec(spec)?;
+        let c = cases.first().ok_or_else(|| SpecError::new(0, "missing case"))?;
+        assert_eq!(resolve(c, ASH_DASH_CHAIN)?.stdout.as_deref(), Some("dash-says\n"));
+        Ok(())
+    }
+
+    #[test]
+    fn compare_shells_inside_a_case_is_not_a_header() -> Result<(), SpecError> {
+        // Two losses if the `cur.is_none()` guard goes: a misplaced header stops
+        // being reported as an unrecognized key, and it silently re-aims every
+        // LATER case in the file.
+        let spec = "\
+#### first
+echo x
+## compare_shells: ash
+## STDOUT:
+default-ideal
+## END
+## OK dash STDOUT:
+dash-says
+## END
+
+#### second
+echo y
+## STDOUT:
+default-ideal
+## END
+## OK dash STDOUT:
+dash-says
+## END
+";
+        let cases = parse_spec(spec)?;
+        let first = cases.first().ok_or_else(|| SpecError::new(0, "missing case"))?;
+        assert_eq!(first.unrecognized_keys(), vec!["compare_shells"]);
+        let second = cases.get(1).ok_or_else(|| SpecError::new(0, "missing case"))?;
+        assert_eq!(resolve(second, ASH_DASH_CHAIN)?.stdout.as_deref(), Some("dash-says\n"));
+        // Same for a qualified spelling, which the `## code:` hook also refuses.
+        let spec = spec.replace("## compare_shells: ash", "## OK ash compare_shells: ash");
+        let cases = parse_spec(&spec)?;
+        let first = cases.first().ok_or_else(|| SpecError::new(0, "missing case"))?;
+        assert_eq!(first.unrecognized_keys(), vec!["compare_shells"]);
+        Ok(())
+    }
+
+    #[test]
+    fn a_versioned_identity_still_names_its_shell() -> Result<(), SpecError> {
+        // `bash-4.4` and `zsh-5.9` are already in this corpus, so the spelling is
+        // established; an `ash-1.37` must bound the chain, not silently stop it.
+        assert!(names_identity("ash", "ash"));
+        assert!(names_identity("ash-1.37", "ash"));
+        assert!(!names_identity("ashx", "ash"));
+        assert!(!names_identity("bash", "ash"));
+        // Case-SENSITIVE deliberately. Being lenient here would quietly accept a
+        // spelling the corpus validator is there to reject, so the two would
+        // disagree about the same token.
+        assert!(!names_identity("ASH", "ash"));
+        let spec = "\
+## compare_shells: bash-4.4 ash-1.37
+
+#### versioned header still bounds the chain
+echo x
+## STDOUT:
+default-ideal
+## END
+## OK dash STDOUT:
+dash-says
+## END
+";
+        let cases = parse_spec(spec)?;
+        let c = cases.first().ok_or_else(|| SpecError::new(0, "missing case"))?;
+        assert_eq!(resolve(c, ASH_DASH_CHAIN)?.stdout.as_deref(), Some("default-ideal\n"));
+        Ok(())
+    }
+
+    #[test]
+    fn truncation_can_leave_a_field_unasserted_and_that_is_the_rule() -> Result<(), SpecError> {
+        // A field whose ONLY annotation names a later identity, with no
+        // unqualified block, resolves to "not asserted" rather than inheriting
+        // that shell's. Pinned deliberately: it is the format's own reading (the
+        // unqualified block is the golden, and there is none), and it is the one
+        // shape where the bound LOSES an assertion rather than correcting one.
+        // No corpus case does this today -- 0 of 2798 go Some -> None -- so this
+        // test is what keeps a future vendored drop from changing it in silence.
+        let spec = "\
+## compare_shells: bash mksh ash
+
+#### only dash has a block, and there is no default
+echo x
+## OK dash STDOUT:
+dash-says
+## END
+";
+        let cases = parse_spec(spec)?;
+        let c = cases.first().ok_or_else(|| SpecError::new(0, "missing case"))?;
+        assert_eq!(resolve(c, ASH_DASH_CHAIN)?.stdout, None);
+        Ok(())
+    }
+
+    #[test]
+    fn a_file_with_no_compare_shells_line_keeps_the_whole_chain() -> Result<(), SpecError> {
+        // Three of the corpus's files declare none. Nothing is known about either
+        // identity there, so the heuristic stands unchanged.
+        let spec = "\
+#### no metadata at all
+echo x
+## STDOUT:
+default-ideal
+## END
+## OK dash STDOUT:
+dash-says
+## END
+";
+        let cases = parse_spec(spec)?;
+        let c = cases.first().ok_or_else(|| SpecError::new(0, "missing case"))?;
+        assert_eq!(resolve(c, ASH_DASH_CHAIN)?.stdout.as_deref(), Some("dash-says\n"));
         Ok(())
     }
 
