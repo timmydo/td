@@ -4,6 +4,10 @@ const MAIN_RS: &str = include_str!("../../../td-compositor/src/main.rs");
 const MODULES: &[(&str, &str)] = &[
     ("client", include_str!("../../../td-compositor/src/client.rs")),
     (
+        "configure",
+        include_str!("../../../td-compositor/src/configure.rs"),
+    ),
+    (
         "framebuffer",
         include_str!("../../../td-compositor/src/framebuffer.rs"),
     ),

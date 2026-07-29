@@ -1,6 +1,7 @@
 #![deny(unsafe_code)]
 
 mod client;
+mod configure;
 mod framebuffer;
 mod input;
 mod layout;
@@ -17,6 +18,9 @@ use std::env;
 use std::path::{Path, PathBuf};
 use std::process;
 use std::sync::{Arc, Mutex};
+
+const MAX_UI_DIMENSION: usize = 16_384;
+const MAX_UI_FRAME_BYTES: usize = 32 * 1024 * 1024;
 
 fn usage() -> String {
     "usage: td-compositor run --framebuffer PATH --input DIR --socket PATH | \
@@ -213,6 +217,7 @@ mod confinement {
     const SYS: &str = include_str!("sys.rs");
     const OTHER: &[(&str, &str)] = &[
         ("client.rs", include_str!("client.rs")),
+        ("configure.rs", include_str!("configure.rs")),
         ("framebuffer.rs", include_str!("framebuffer.rs")),
         ("input.rs", include_str!("input.rs")),
         ("layout.rs", include_str!("layout.rs")),

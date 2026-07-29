@@ -46,6 +46,15 @@ pub struct Placement {
     pub focused: bool,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ViewLayout {
+    pub key: SurfaceKey,
+    pub rect: Rect,
+    pub visible: bool,
+    pub activated: bool,
+    pub fullscreen: bool,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum Node {
     Leaf(SurfaceKey),
@@ -318,32 +327,33 @@ impl Layout {
         let Some(workspace) = self.workspaces.get(&self.active) else {
             return Vec::new();
         };
-        let Some(root) = &workspace.root else {
-            return Vec::new();
-        };
-        if let Some(fullscreen) = workspace.fullscreen {
-            return vec![Placement {
-                key: fullscreen,
-                rect: Rect {
-                    x: 0,
-                    y: 0,
-                    width,
-                    height,
-                },
-                focused: workspace.focused == Some(fullscreen),
-            }];
+        visible_placements(workspace, width, height, gap)
+    }
+
+    pub fn views(&self, width: usize, height: usize, gap: usize) -> Vec<ViewLayout> {
+        let mut views = Vec::new();
+        for (number, workspace) in &self.workspaces {
+            let workspace_visible = *number == self.active;
+            for mut placement in tiled_placements(workspace, width, height, gap) {
+                let fullscreen = workspace.fullscreen == Some(placement.key);
+                if fullscreen {
+                    placement.rect = Rect {
+                        x: 0,
+                        y: 0,
+                        width,
+                        height,
+                    };
+                }
+                views.push(ViewLayout {
+                    key: placement.key,
+                    rect: placement.rect,
+                    visible: workspace_visible && (workspace.fullscreen.is_none() || fullscreen),
+                    activated: workspace_visible && placement.focused,
+                    fullscreen: workspace_visible && fullscreen,
+                });
+            }
         }
-        let inset_x = gap.min(width.saturating_sub(1) / 2);
-        let inset_y = gap.min(height.saturating_sub(1) / 2);
-        let rect = Rect {
-            x: inset_x,
-            y: inset_y,
-            width: width.saturating_sub(inset_x.saturating_mul(2)),
-            height: height.saturating_sub(inset_y.saturating_mul(2)),
-        };
-        let mut placements = Vec::new();
-        place_node(root, rect, gap, workspace.focused, &mut placements);
-        placements
+        views
     }
 
     #[cfg(test)]
@@ -452,6 +462,49 @@ impl Layout {
         self.workspace_mut(number).map(key);
         self.homes.insert(key, number);
     }
+}
+
+fn visible_placements(
+    workspace: &Workspace,
+    width: usize,
+    height: usize,
+    gap: usize,
+) -> Vec<Placement> {
+    if let Some(fullscreen) = workspace.fullscreen {
+        return vec![Placement {
+            key: fullscreen,
+            rect: Rect {
+                x: 0,
+                y: 0,
+                width,
+                height,
+            },
+            focused: workspace.focused == Some(fullscreen),
+        }];
+    }
+    tiled_placements(workspace, width, height, gap)
+}
+
+fn tiled_placements(
+    workspace: &Workspace,
+    width: usize,
+    height: usize,
+    gap: usize,
+) -> Vec<Placement> {
+    let Some(root) = &workspace.root else {
+        return Vec::new();
+    };
+    let inset_x = gap.min(width.saturating_sub(1) / 2);
+    let inset_y = gap.min(height.saturating_sub(1) / 2);
+    let rect = Rect {
+        x: inset_x,
+        y: inset_y,
+        width: width.saturating_sub(inset_x.saturating_mul(2)),
+        height: height.saturating_sub(inset_y.saturating_mul(2)),
+    };
+    let mut placements = Vec::new();
+    place_node(root, rect, gap, workspace.focused, &mut placements);
+    placements
 }
 
 fn valid_workspace(number: u8) -> bool {
@@ -756,6 +809,74 @@ mod tests {
         layout.apply(Command::SwitchWorkspace(3));
         assert_eq!(layout.focused(), None);
         layout.check_invariants().unwrap();
+    }
+
+    #[test]
+    fn view_layouts_distinguish_visible_hidden_active_and_fullscreen() {
+        let mut layout = Layout::new();
+        layout.map(key(1));
+        layout.map(key(2));
+        layout.apply(Command::MoveToWorkspace(2));
+        assert_eq!(
+            layout.views(100, 80, 0),
+            [
+                ViewLayout {
+                    key: key(1),
+                    rect: Rect {
+                        x: 0,
+                        y: 0,
+                        width: 100,
+                        height: 80,
+                    },
+                    visible: true,
+                    activated: true,
+                    fullscreen: false,
+                },
+                ViewLayout {
+                    key: key(2),
+                    rect: Rect {
+                        x: 0,
+                        y: 0,
+                        width: 100,
+                        height: 80,
+                    },
+                    visible: false,
+                    activated: false,
+                    fullscreen: false,
+                },
+            ]
+        );
+        layout.apply(Command::SwitchWorkspace(2));
+        layout.apply(Command::ToggleFullscreen);
+        assert_eq!(
+            layout.views(100, 80, 0),
+            [
+                ViewLayout {
+                    key: key(1),
+                    rect: Rect {
+                        x: 0,
+                        y: 0,
+                        width: 100,
+                        height: 80,
+                    },
+                    visible: false,
+                    activated: false,
+                    fullscreen: false,
+                },
+                ViewLayout {
+                    key: key(2),
+                    rect: Rect {
+                        x: 0,
+                        y: 0,
+                        width: 100,
+                        height: 80,
+                    },
+                    visible: true,
+                    activated: true,
+                    fullscreen: true,
+                },
+            ]
+        );
     }
 
     #[test]

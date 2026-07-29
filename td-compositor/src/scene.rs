@@ -1,4 +1,4 @@
-use crate::layout::{Command, Layout, Rect};
+use crate::layout::{Command, Layout, Rect, ViewLayout};
 use std::collections::BTreeMap;
 
 pub const SHM_ARGB8888: u32 = 0;
@@ -39,7 +39,7 @@ impl Scene {
         }
     }
 
-    pub fn commit(&mut self, key: SurfaceKey, surface: Surface) -> Result<(), String> {
+    pub fn commit(&mut self, key: SurfaceKey, surface: Surface) -> Result<bool, String> {
         let is_new = !self.surfaces.contains_key(&key);
         let prior = self
             .surfaces
@@ -63,26 +63,33 @@ impl Scene {
         if is_new {
             self.layout.map(key);
         }
-        Ok(())
+        Ok(is_new)
     }
 
-    fn discard_pixels(&mut self, key: SurfaceKey) {
+    fn discard_pixels(&mut self, key: SurfaceKey) -> bool {
         if let Some(surface) = self.surfaces.remove(&key) {
             self.surface_bytes = self.surface_bytes.saturating_sub(surface.pixels.len());
+            return true;
         }
+        false
     }
 
-    pub fn unmap(&mut self, key: SurfaceKey) {
+    pub fn unmap(&mut self, key: SurfaceKey) -> bool {
+        let layout_changed = self.layout.contains(key);
         self.discard_pixels(key);
         self.layout.unmap(key);
+        layout_changed
     }
 
-    pub fn remove(&mut self, key: SurfaceKey) {
+    pub fn remove(&mut self, key: SurfaceKey) -> bool {
+        let layout_changed = self.layout.contains(key);
         self.discard_pixels(key);
         self.layout.forget(key);
+        layout_changed
     }
 
-    pub fn remove_client(&mut self, client: u64) {
+    pub fn remove_client(&mut self, client: u64) -> bool {
+        let layout_changed = self.surfaces.keys().any(|key| key.client == client);
         let removed = self
             .surfaces
             .iter()
@@ -93,10 +100,22 @@ impl Scene {
         self.surfaces.retain(|key, _| key.client != client);
         self.surface_bytes = self.surface_bytes.saturating_sub(removed);
         self.layout.unmap_client(client);
+        layout_changed
     }
 
     pub fn command(&mut self, command: Command) {
         self.layout.apply(command);
+    }
+
+    pub fn views(&self, width: usize, height: usize) -> Vec<ViewLayout> {
+        self.layout.views(width, height, GAP)
+    }
+
+    #[cfg(test)]
+    pub fn surface_size(&self, key: SurfaceKey) -> Option<(usize, usize)> {
+        self.surfaces
+            .get(&key)
+            .map(|surface| (surface.width, surface.height))
     }
 
     pub fn move_pointer(&mut self, dx: i32, dy: i32, width: usize, height: usize) {
@@ -495,7 +514,8 @@ mod tests {
                 surface([4, 5, 6, 0], 1, 1),
             )
             .unwrap();
-        scene.remove_client(1);
+        assert!(scene.remove_client(1));
+        assert!(!scene.remove_client(3));
         assert_eq!(scene.surfaces.len(), 1);
         assert!(!scene.layout.contains(SurfaceKey {
             client: 1,
@@ -617,10 +637,12 @@ mod tests {
         };
         scene.commit(key, surface([1, 2, 3, 0], 1, 1)).unwrap();
         scene.command(Command::MoveToWorkspace(2));
-        scene.unmap(key);
+        assert!(scene.unmap(key));
+        assert!(!scene.unmap(key));
         scene.commit(key, surface([1, 2, 3, 0], 1, 1)).unwrap();
         assert!(scene.layout.placements(100, 100, 0).is_empty());
-        scene.remove(key);
+        assert!(scene.remove(key));
+        assert!(!scene.remove(key));
         scene.commit(key, surface([1, 2, 3, 0], 1, 1)).unwrap();
         assert_eq!(scene.layout.placements(100, 100, 0).len(), 1);
         assert!(scene.layout.check_invariants().is_ok());

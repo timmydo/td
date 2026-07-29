@@ -118,17 +118,26 @@ required empty initial wl_surface commit and acknowledges the resulting
 xdg_surface configure serial. A buffer attached before that handshake is a
 client protocol failure.
 
-The boot profile starts one 512x320 `td-ui-demo` toplevel. It discovers and
-binds globals rather than depending on registry names, completes the XDG
-configure/ack handshake, sends a dependency-free software pattern in an
-XRGB8888 wl_shm pool, requests a frame callback, and stays connected so the
-surface remains mapped. It exposes its mode-0600 readiness socket and prints
-`TD-UI-CLIENT-READY` only after both wl_buffer release and that first callback
-arrive. The client has no toolkit, fonts, input handling, animation, or
-application model; it is the first live protocol proof and a visible boot
-fixture. Its presentation handshake has a 20-second absolute deadline, shorter
-than the supervisor's 30-second readiness deadline, so a stalled compositor
-makes the client exit and permits `restart=always` to retry.
+The boot profile starts one `td-ui-demo` toplevel. It discovers and binds
+globals rather than depending on registry names, completes the initial XDG
+configure/ack handshake, and uses 512x320 only for the first client-selected
+buffer. Once mapped, it acknowledges the compositor's nonzero tile configure,
+regenerates its dependency-free software pattern at that exact size, and
+replaces its XRGB8888 wl_shm buffer. Later layout configures do the same.
+Dynamic wl_shm pool, buffer, and frame-callback ids are reused only after
+wl_display.delete_id. A zero width or height in a third-party compositor's
+configure independently keeps the demo's current or default dimension, as the
+XDG protocol requires. A bare xdg_surface.configure reuses the last applied
+toplevel size and states.
+
+The demo exposes its mode-0600 readiness socket and prints
+`TD-UI-CLIENT-READY` only after the tile-sized replacement receives both
+wl_buffer release and its frame callback. The client has no toolkit, fonts,
+input handling, animation, or application model; it is the live resize proof
+and a visible boot fixture. Its presentation handshake has a 20-second
+absolute deadline, shorter than the supervisor's 30-second readiness deadline,
+so a stalled compositor makes the client exit and permits `restart=always` to
+retry.
 
 The one supported output owns workspaces 1 through 9. Each workspace owns an
 n-ary split tree whose leaves are mapped XDG toplevels. A new toplevel is
@@ -147,26 +156,67 @@ the axis can show before budgeting gaps, and zero-area tiles draw neither
 decoration nor client pixels. Borders are composed before all client buffers
 so overlapping decorations cannot overwrite a neighboring client. These
 rules make every result stable for odd and undersized output dimensions.
-wl_shm buffers are clipped to their tiles; the compositor does not yet send
-replacement XDG configure sizes when layout changes, so clients are not
-scaled to fill a tile. Decoration, clipboard, drag-and-drop, subsurfaces,
-popups, output reconfiguration, fractional scale, screen capture, data
-devices, and client input are not yet advertised. Unknown
-objects, malformed sizes, invalid object reuse, missing file descriptors, and
-unsupported requests disconnect only that client.
+The runtime publishes changed view snapshots through a capacity-one wakeup
+per client. The runtime computes and indexes one immutable snapshot per layout
+change; workers clone its shared handle rather than rebuilding it. A pending
+wakeup represents the latest snapshot rather than a queue of intermediate
+layouts. The client's configure worker converts that snapshot into nonzero
+xdg_toplevel sizes and the fullscreen and activated states, followed by an
+xdg_surface serial. Every mapped leaf carries the tile size from its home
+workspace, including when hidden, so the first coalesced post-map snapshot
+cannot lose its configure. Hidden views lose active states. An observed unmap
+clears the last layout state without emitting an event. Repeated states are
+deduplicated.
+
+Clients may acknowledge any known outstanding serial; that acknowledgement
+also supersedes every older serial. Attaching the first buffer remains blocked
+until the initial serial is acknowledged, while later unacknowledged layout
+configures leave the previous copied buffer visible and clipped. This avoids
+freezing a client during resize without accepting an unknown ACK. Once 32
+serials are outstanding, newer states remain implicit in the latest runtime
+snapshot. An ACK wakes the worker to send that latest state after space opens.
+A null buffer that unmaps a mapped surface resets the initial handshake, so a
+remap needs another null-buffer or empty commit, initial configure, and ACK. A
+null attach on an already-unmapped surface is itself a valid initial commit.
+Configures still in flight at the mapped-to-unmapped transition remain
+acknowledgeable until the new initial serial is acknowledged; they cannot
+authorize a buffer in the new mapping generation.
+Decoration, clipboard, drag-and-drop, subsurfaces, popups, output
+reconfiguration, fractional scale, screen capture, data devices, and client
+input are not yet advertised. Unknown objects, malformed sizes, invalid object
+reuse, missing file descriptors, and unsupported requests disconnect only that
+client.
 
 Resource ceilings are part of the protocol boundary: at most 32 clients run
-at once, each has at most 512 objects, 64 queued descriptors, and 32 MiB of
-committed pixels, and the complete scene retains at most 128 MiB. Rendering
+at once, each has at most 512 objects, 64 queued descriptors, one pending
+layout wakeup, and 32 MiB of committed pixels. Each XDG surface has at most 32
+current-generation configures. During remap it may additionally retain the
+previous generation's bounded set while the one new initial serial is pending,
+for at most 33 serials total; the tracker enforces the retained-generation
+bound itself. Output pixels, the bundled demo's generated buffer, and one
+client's aggregate committed pixels share the same 32 MiB ceiling, so every
+accepted output has a representable single-client tile. A framebuffer's
+stride-padded shadow allocation has a separate 64 MiB ceiling. Framebuffer and
+buffer dimensions share a 16,384-pixel ceiling. At four bytes per pixel the
+area ceiling is 8,388,608 pixels: tight 3840x2160 is accepted, while
+4096x2160 is rejected. The complete scene retains at most 128 MiB. Rendering
 clips rows and columns to the output before visiting pixels. These are
 availability bounds against a same-user client, not isolation between
 mutually distrusting users.
 
 These ceilings do not yet bound time. A connected client that stops reading
-events can block its worker on a socket write and retain one client slot. This
-first profile accepts that availability gap. A future write deadline must be
-an explicit, injectable connection policy with deterministic tests that do not
-wait for elapsed wall time.
+events can block its configure worker on a socket write and retain one client
+slot. It does not hold the runtime or framebuffer lock while writing, so it
+cannot block input or other clients. The write deliberately retains that
+client's configure-registration and tracker locks to keep event pairs ordered,
+so the same client's ACK, role mutation, and request dispatch can also wait for
+the write. This can park both of that client's threads and retain its slot
+until the peer reads events or closes; there is no self-heal. If dispatch exits
+for another reason, it shuts down its socket clone before joining, which
+interrupts a blocked write. This first profile accepts the remaining
+per-client availability gap. A future write deadline must be an explicit,
+injectable connection policy with deterministic tests that do not wait for
+elapsed wall time.
 
 ## 4. Unsafe confinement
 
@@ -219,14 +269,22 @@ The landing must prove:
 - wire parsing rejects truncation, overflow, invalid object use, and a
   descriptor-less wl_shm request;
 - an SCM_RIGHTS-backed wl_shm buffer commits and is copied into the scene;
-- the boot client discovers globals, completes XDG configure/ack, receives
-  wl_buffer release and its first frame callback, and remains mapped;
+- the boot client discovers globals, completes both initial and tile-sized XDG
+  configure/ack cycles, replaces its buffer at the requested size, receives
+  wl_buffer release and a frame callback, and remains mapped;
 - every tiling command, split geometry edge case, workspace transition, tree
   collapse, fullscreen transition, and Emacs binding is a deterministic host
   test;
 - parsed key chords and complete pointer frames cross the evdev adapter into
   a recording target, while the runtime integration test proves a layout
   command repaints a file-backed framebuffer;
+- configure model tests cover initial gating, stale and superseding ACKs,
+  deduplication, the remap handshake, hidden state, fullscreen, focus, invalid
+  sizes, and backpressure at the outstanding-serial ceiling;
+- a worker/dispatch socket test proves an ACK at that ceiling wakes and emits
+  the latest deferred layout rather than stalling;
+- a real server/client socket test resizes the demo after a second map, changes
+  activation without resizing, enters fullscreen, and crosses workspaces;
 - software composition clips surfaces to tiles and never indexes outside a
   frame;
 - the image contains all three binaries, the service order is checkable, and
@@ -256,6 +314,13 @@ reset as a distinct result while an orderly close remains a zero-length read.
 Event writes record disconnected client state, and the dispatch loop consumes
 all three outcomes without depending on which side of a socket race wins.
 
+Layout notification follows the same rule. Runtime mutations publish only
+when mapped-view geometry or state changes. The capacity-one channel
+coalesces bursts without losing the latest snapshot, and a stop flag plus the
+same wake channel terminates the configure worker without polling or sleeps.
+The configure tracker is a pure state machine whose tests inject serials and
+view states; socket tests cover only encoding and cross-thread delivery.
+
 Every layout operation has table-driven model tests covering focus, geometry,
 tree collapse, and conservation of mapped views. Each tested command sequence
 checks the global invariants: one occurrence per mapped surface, live focus
@@ -270,9 +335,9 @@ shipped image.
 
 ## 8. Deferred UI stack
 
-The next increments may add client input, a bitmap font and launcher,
-clipboard, a terminal, hotplug, and real DRM/KMS profiles. General Wayland
-toolkit compatibility is not claimed until the missing core protocols have
-explicit tests. Hardware acceleration, niri, portals, PipeWire, Xwayland, and
-a C desktop stack remain optional consumers rather than foundations of td's
-UI.
+The next increment is wl_seat with focused wl_keyboard and wl_pointer
+delivery. A bitmap font and launcher, clipboard, terminal, hotplug, and real
+DRM/KMS profiles follow. General Wayland toolkit compatibility is not claimed
+until the missing core protocols have explicit tests. Hardware acceleration,
+niri, portals, PipeWire, Xwayland, and a C desktop stack remain optional
+consumers rather than foundations of td's UI.

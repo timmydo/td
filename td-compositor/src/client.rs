@@ -1,4 +1,5 @@
-use crate::{socket, sys, wire};
+use crate::{socket, sys, wire, MAX_UI_DIMENSION, MAX_UI_FRAME_BYTES};
+use std::collections::BTreeSet;
 use std::fs::{self, File, OpenOptions, Permissions};
 use std::io::{Read, Write};
 use std::os::fd::AsRawFd;
@@ -17,12 +18,10 @@ const XDG_WM_BASE: u32 = 6;
 const SURFACE: u32 = 7;
 const XDG_SURFACE: u32 = 8;
 const XDG_TOPLEVEL: u32 = 9;
-const SHM_POOL: u32 = 10;
-const BUFFER: u32 = 11;
-const FRAME_CALLBACK: u32 = 12;
+const FIRST_DYNAMIC_ID: u32 = 10;
 
-const WIDTH: usize = 512;
-const HEIGHT: usize = 320;
+const DEFAULT_WIDTH: usize = 512;
+const DEFAULT_HEIGHT: usize = 320;
 const BYTES_PER_PIXEL: usize = 4;
 const SHM_XRGB8888: u32 = 1;
 const CONNECT_ATTEMPTS: usize = 300;
@@ -93,6 +92,8 @@ struct Connection {
     stream: UnixStream,
     buffered: Vec<u8>,
     deadline: Option<Instant>,
+    next_id: u32,
+    free_ids: BTreeSet<u32>,
 }
 
 impl Connection {
@@ -109,6 +110,8 @@ impl Connection {
                         stream,
                         buffered: Vec::with_capacity(16 * 1024),
                         deadline: Some(deadline),
+                        next_id: FIRST_DYNAMIC_ID,
+                        free_ids: BTreeSet::new(),
                     });
                 }
                 Err(error)
@@ -192,13 +195,15 @@ impl Connection {
                     .map_err(|e| format!("set Wayland handshake timeout: {e}"))?;
             }
             let count = self.stream.read(&mut incoming).map_err(|e| {
-                if self.deadline.is_some()
-                    && matches!(
-                        e.kind(),
-                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-                    )
-                {
-                    "Wayland presentation handshake timed out".to_string()
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) {
+                    if self.deadline.is_some() {
+                        "Wayland presentation handshake timed out".to_string()
+                    } else {
+                        "Wayland event wait timed out".to_string()
+                    }
                 } else {
                     format!("read Wayland event: {e}")
                 }
@@ -233,7 +238,34 @@ impl Connection {
             self.send(XDG_WM_BASE, 3, pong)?;
             return Ok(true);
         }
+        if message.object == DISPLAY && message.opcode == 1 {
+            let mut args = wire::Cursor::new(&message.payload);
+            let id = args.u32()?;
+            args.finish()?;
+            if id >= FIRST_DYNAMIC_ID {
+                if id >= self.next_id {
+                    return Err(format!("compositor deleted unallocated object {id}"));
+                }
+                if !self.free_ids.insert(id) {
+                    return Err(format!("compositor deleted object {id} twice"));
+                }
+            }
+            return Ok(true);
+        }
         Ok(false)
+    }
+
+    fn allocate_id(&mut self) -> Result<u32, String> {
+        if let Some(id) = self.free_ids.pop_first() {
+            return Ok(id);
+        }
+        let id = self.next_id;
+        self.next_id = self
+            .next_id
+            .checked_add(1)
+            .filter(|next| *next != 0)
+            .ok_or_else(|| "Wayland object id space exhausted".to_string())?;
+        Ok(id)
     }
 }
 
@@ -327,20 +359,45 @@ fn discover_globals(connection: &mut Connection) -> Result<Globals, String> {
     }
 }
 
-fn build_pixels() -> Result<Vec<u8>, String> {
-    let count = WIDTH
-        .checked_mul(HEIGHT)
+fn build_pixels(width: usize, height: usize) -> Result<Vec<u8>, String> {
+    if width == 0 || height == 0 {
+        return Err("demo surface dimensions must be positive".into());
+    }
+    if width > MAX_UI_DIMENSION || height > MAX_UI_DIMENSION {
+        return Err(format!(
+            "demo surface {width}x{height} exceeds the dimension limit"
+        ));
+    }
+    let count = width
+        .checked_mul(height)
         .and_then(|pixels| pixels.checked_mul(BYTES_PER_PIXEL))
         .ok_or_else(|| "demo surface size overflow".to_string())?;
+    if count > MAX_UI_FRAME_BYTES {
+        return Err(format!(
+            "demo surface needs {count} bytes, exceeding {MAX_UI_FRAME_BYTES}"
+        ));
+    }
+    let inset_x = width / 16;
+    let inset_y = height / 12;
+    let card_right = width.saturating_sub(inset_x);
+    let card_bottom = height.saturating_sub(inset_y);
+    let header_end = inset_y.saturating_add(height / 6);
+    let footer_start = card_bottom.saturating_sub(height / 5);
+    let stripe_top = header_end.saturating_add(height / 24);
+    let stripe_bottom = footer_start.saturating_sub(height / 24);
+    let stripe_left = inset_x.saturating_add(width / 20);
+    let stripe_right = card_right.saturating_sub(width / 20);
+    let stripe_width = stripe_right.saturating_sub(stripe_left).max(1);
     let mut pixels = vec![0u8; count];
     for (index, pixel) in pixels.as_chunks_mut::<4>().0.iter_mut().enumerate() {
-        let x = index % WIDTH;
-        let y = index / WIDTH;
-        let card = (32..WIDTH - 32).contains(&x) && (28..HEIGHT - 28).contains(&y);
-        let header = card && y < 82;
-        let footer = card && y >= HEIGHT - 72;
-        let column = x.saturating_sub(56) / 136;
-        let stripe = card && (96..HEIGHT - 88).contains(&y) && (56..WIDTH - 48).contains(&x);
+        let x = index % width;
+        let y = index / width;
+        let card = (inset_x..card_right).contains(&x) && (inset_y..card_bottom).contains(&y);
+        let header = card && y < header_end;
+        let footer = card && y >= footer_start;
+        let stripe = card
+            && (stripe_top..stripe_bottom).contains(&y)
+            && (stripe_left..stripe_right).contains(&x);
         let gradient =
             u8::try_from((x + y) % 48).map_err(|_| "demo gradient escaped u8".to_string())?;
         let color = if header {
@@ -348,6 +405,7 @@ fn build_pixels() -> Result<Vec<u8>, String> {
         } else if footer {
             [0x3c, 0xc8, 0xa0, 0]
         } else if stripe {
+            let column = x.saturating_sub(stripe_left).saturating_mul(3) / stripe_width;
             match column {
                 0 => [0xd8, 0x78, 0x40, 0],
                 1 => [0x68, 0xb8, 0xf0, 0],
@@ -404,7 +462,7 @@ fn backing_file(directory: &Path, pixels: &[u8]) -> Result<File, String> {
     ))
 }
 
-fn configure_surface(connection: &mut Connection) -> Result<(), String> {
+fn create_surface(connection: &mut Connection) -> Result<(), String> {
     let mut surface = wire::Builder::new();
     surface.u32(SURFACE);
     connection.send(COMPOSITOR, 0, surface)?;
@@ -421,90 +479,313 @@ fn configure_surface(connection: &mut Connection) -> Result<(), String> {
     let mut title = wire::Builder::new();
     title.string("td software Wayland demo")?;
     connection.send(XDG_TOPLEVEL, 2, title)?;
-    connection.send(SURFACE, 6, wire::Builder::new())?;
+    connection.send(SURFACE, 6, wire::Builder::new())
+}
 
-    loop {
-        let message = connection.next()?;
-        if connection.handle_common(&message)? {
-            continue;
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct Size {
+    width: usize,
+    height: usize,
+}
+
+#[derive(Clone, Copy)]
+struct PendingConfigure {
+    width: Option<usize>,
+    height: Option<usize>,
+    activated: bool,
+    fullscreen: bool,
+}
+
+impl PendingConfigure {
+    fn resolve_size(self, current: Option<Size>) -> Size {
+        let fallback = current.unwrap_or(Size {
+            width: DEFAULT_WIDTH,
+            height: DEFAULT_HEIGHT,
+        });
+        Size {
+            width: self.width.unwrap_or(fallback.width),
+            height: self.height.unwrap_or(fallback.height),
+        }
+    }
+
+    fn selects_layout_size(self) -> bool {
+        self.width.is_some() || self.height.is_some()
+    }
+}
+
+struct TargetFrame {
+    buffer: u32,
+    callback: u32,
+    released: bool,
+    presented: bool,
+}
+
+struct Demo {
+    current_size: Option<Size>,
+    pending_configure: Option<PendingConfigure>,
+    target: Option<TargetFrame>,
+    live_buffers: BTreeSet<u32>,
+    live_callbacks: BTreeSet<u32>,
+    layout_configured: bool,
+    xrgb_advertised: bool,
+    activated: bool,
+    fullscreen: bool,
+}
+
+impl Demo {
+    fn new() -> Demo {
+        Demo {
+            current_size: None,
+            pending_configure: None,
+            target: None,
+            live_buffers: BTreeSet::new(),
+            live_callbacks: BTreeSet::new(),
+            layout_configured: false,
+            xrgb_advertised: false,
+            activated: false,
+            fullscreen: false,
+        }
+    }
+
+    fn ready(&self) -> bool {
+        self.layout_configured
+            && self
+                .target
+                .as_ref()
+                .is_some_and(|frame| frame.released && frame.presented)
+    }
+
+    fn configure_toplevel(&mut self, message: &wire::Message) -> Result<(), String> {
+        let mut args = wire::Cursor::new(&message.payload);
+        let width = args.i32()?;
+        let height = args.i32()?;
+        if width < 0 || height < 0 {
+            return Err(format!(
+                "compositor configured a negative demo size {width}x{height}"
+            ));
+        }
+        let state_bytes = usize::try_from(args.u32()?)
+            .map_err(|_| "XDG state array length overflow".to_string())?;
+        if !state_bytes.is_multiple_of(4) {
+            return Err(format!("XDG state array has invalid length {state_bytes}"));
+        }
+        let mut activated = false;
+        let mut fullscreen = false;
+        for _ in 0..state_bytes / 4 {
+            match args.u32()? {
+                2 => fullscreen = true,
+                4 => activated = true,
+                _ => {}
+            }
+        }
+        args.finish()?;
+        let width =
+            usize::try_from(width).map_err(|_| "configured width escaped usize".to_string())?;
+        let height =
+            usize::try_from(height).map_err(|_| "configured height escaped usize".to_string())?;
+        let width = (width != 0).then_some(width);
+        let height = (height != 0).then_some(height);
+        self.pending_configure = Some(PendingConfigure {
+            width,
+            height,
+            activated,
+            fullscreen,
+        });
+        Ok(())
+    }
+
+    fn acknowledge(
+        &mut self,
+        connection: &mut Connection,
+        message: &wire::Message,
+        runtime_directory: &Path,
+    ) -> Result<(), String> {
+        let mut args = wire::Cursor::new(&message.payload);
+        let serial = args.u32()?;
+        args.finish()?;
+        let configure = self.take_configure();
+        let mut ack = wire::Builder::new();
+        ack.u32(serial);
+        connection.send(XDG_SURFACE, 4, ack)?;
+
+        let size = configure.resolve_size(self.current_size);
+        if configure.selects_layout_size() {
+            self.layout_configured = true;
+        }
+        self.activated = configure.activated;
+        self.fullscreen = configure.fullscreen;
+        if self.current_size == Some(size) {
+            connection.send(SURFACE, 6, wire::Builder::new())?;
+        } else {
+            self.commit_frame(connection, runtime_directory, size)?;
+        }
+        Ok(())
+    }
+
+    fn take_configure(&mut self) -> PendingConfigure {
+        self.pending_configure.take().unwrap_or(PendingConfigure {
+            width: None,
+            height: None,
+            activated: self.activated,
+            fullscreen: self.fullscreen,
+        })
+    }
+
+    fn commit_frame(
+        &mut self,
+        connection: &mut Connection,
+        runtime_directory: &Path,
+        size: Size,
+    ) -> Result<(), String> {
+        if !self.xrgb_advertised {
+            return Err("compositor did not advertise wl_shm XRGB8888".into());
+        }
+        let pixels = build_pixels(size.width, size.height)?;
+        let file = backing_file(runtime_directory, &pixels)?;
+        let pool_id = connection.allocate_id()?;
+        let buffer_id = connection.allocate_id()?;
+        let callback_id = connection.allocate_id()?;
+        let bytes =
+            i32::try_from(pixels.len()).map_err(|_| "demo wl_shm pool exceeds i32".to_string())?;
+        let width = i32::try_from(size.width).map_err(|_| "demo width exceeds i32".to_string())?;
+        let height =
+            i32::try_from(size.height).map_err(|_| "demo height exceeds i32".to_string())?;
+        let stride = size
+            .width
+            .checked_mul(BYTES_PER_PIXEL)
+            .and_then(|value| i32::try_from(value).ok())
+            .ok_or_else(|| "demo stride exceeds i32".to_string())?;
+
+        let mut pool = wire::Builder::new();
+        pool.u32(pool_id);
+        pool.i32(bytes);
+        connection.send_with_fd(SHM, 0, pool, &file)?;
+
+        let mut buffer = wire::Builder::new();
+        buffer.u32(buffer_id);
+        buffer.i32(0);
+        buffer.i32(width);
+        buffer.i32(height);
+        buffer.i32(stride);
+        buffer.u32(SHM_XRGB8888);
+        connection.send(pool_id, 0, buffer)?;
+        connection.send(pool_id, 1, wire::Builder::new())?;
+
+        let mut attach = wire::Builder::new();
+        attach.u32(buffer_id);
+        attach.i32(0);
+        attach.i32(0);
+        connection.send(SURFACE, 1, attach)?;
+
+        let mut damage = wire::Builder::new();
+        damage.i32(0);
+        damage.i32(0);
+        damage.i32(width);
+        damage.i32(height);
+        connection.send(SURFACE, 9, damage)?;
+
+        let mut frame = wire::Builder::new();
+        frame.u32(callback_id);
+        connection.send(SURFACE, 3, frame)?;
+        connection.send(SURFACE, 6, wire::Builder::new())?;
+
+        if !self.live_buffers.insert(buffer_id) {
+            return Err(format!(
+                "demo buffer object {buffer_id} was reused while live"
+            ));
+        }
+        if !self.live_callbacks.insert(callback_id) {
+            return Err(format!(
+                "demo callback object {callback_id} was reused while live"
+            ));
+        }
+        self.current_size = Some(size);
+        self.target = Some(TargetFrame {
+            buffer: buffer_id,
+            callback: callback_id,
+            released: false,
+            presented: false,
+        });
+        Ok(())
+    }
+
+    fn release_buffer(
+        &mut self,
+        connection: &mut Connection,
+        message: &wire::Message,
+    ) -> Result<(), String> {
+        wire::Cursor::new(&message.payload).finish()?;
+        if !self.live_buffers.remove(&message.object) {
+            return Err(format!(
+                "compositor released unknown demo buffer {}",
+                message.object
+            ));
+        }
+        if let Some(target) = self.target.as_mut() {
+            if target.buffer == message.object {
+                target.released = true;
+            }
+        }
+        connection.send(message.object, 0, wire::Builder::new())
+    }
+
+    fn finish_callback(&mut self, message: &wire::Message) -> Result<(), String> {
+        let mut args = wire::Cursor::new(&message.payload);
+        args.u32()?;
+        args.finish()?;
+        if !self.live_callbacks.remove(&message.object) {
+            return Err(format!(
+                "compositor completed unknown demo callback {}",
+                message.object
+            ));
+        }
+        if let Some(target) = self.target.as_mut() {
+            if target.callback == message.object {
+                target.presented = true;
+            }
+        }
+        Ok(())
+    }
+
+    fn dispatch(
+        &mut self,
+        connection: &mut Connection,
+        message: &wire::Message,
+        runtime_directory: &Path,
+    ) -> Result<(), String> {
+        if message.object == XDG_TOPLEVEL && message.opcode == 0 {
+            return self.configure_toplevel(message);
+        }
+        if message.object == SHM && message.opcode == 0 {
+            let mut args = wire::Cursor::new(&message.payload);
+            if args.u32()? == SHM_XRGB8888 {
+                self.xrgb_advertised = true;
+            }
+            return args.finish();
         }
         if message.object == XDG_SURFACE && message.opcode == 0 {
-            let mut args = wire::Cursor::new(&message.payload);
-            let serial = args.u32()?;
-            args.finish()?;
-            let mut ack = wire::Builder::new();
-            ack.u32(serial);
-            connection.send(XDG_SURFACE, 4, ack)?;
-            return Ok(());
+            return self.acknowledge(connection, message, runtime_directory);
         }
+        if self.live_buffers.contains(&message.object) && message.opcode == 0 {
+            return self.release_buffer(connection, message);
+        }
+        if self.live_callbacks.contains(&message.object) && message.opcode == 0 {
+            return self.finish_callback(message);
+        }
+        if message.object == XDG_TOPLEVEL && message.opcode == 1 {
+            return Err("compositor requested that the demo close".into());
+        }
+        Err(format!(
+            "unexpected Wayland event object={} opcode={}",
+            message.object, message.opcode
+        ))
     }
 }
 
-fn commit_first_frame(connection: &mut Connection, runtime_directory: &Path) -> Result<(), String> {
-    let pixels = build_pixels()?;
-    let file = backing_file(runtime_directory, &pixels)?;
-    let size =
-        i32::try_from(pixels.len()).map_err(|_| "demo wl_shm pool exceeds i32".to_string())?;
-    let width = i32::try_from(WIDTH).map_err(|_| "demo width exceeds i32".to_string())?;
-    let height = i32::try_from(HEIGHT).map_err(|_| "demo height exceeds i32".to_string())?;
-    let stride = WIDTH
-        .checked_mul(BYTES_PER_PIXEL)
-        .and_then(|value| i32::try_from(value).ok())
-        .ok_or_else(|| "demo stride exceeds i32".to_string())?;
-
-    let mut pool = wire::Builder::new();
-    pool.u32(SHM_POOL);
-    pool.i32(size);
-    connection.send_with_fd(SHM, 0, pool, &file)?;
-
-    let mut buffer = wire::Builder::new();
-    buffer.u32(BUFFER);
-    buffer.i32(0);
-    buffer.i32(width);
-    buffer.i32(height);
-    buffer.i32(stride);
-    buffer.u32(SHM_XRGB8888);
-    connection.send(SHM_POOL, 0, buffer)?;
-
-    let mut attach = wire::Builder::new();
-    attach.u32(BUFFER);
-    attach.i32(0);
-    attach.i32(0);
-    connection.send(SURFACE, 1, attach)?;
-
-    let mut damage = wire::Builder::new();
-    damage.i32(0);
-    damage.i32(0);
-    damage.i32(width);
-    damage.i32(height);
-    connection.send(SURFACE, 9, damage)?;
-
-    let mut frame = wire::Builder::new();
-    frame.u32(FRAME_CALLBACK);
-    connection.send(SURFACE, 3, frame)?;
-    connection.send(SURFACE, 6, wire::Builder::new())?;
-
-    let mut released = false;
-    let mut presented = false;
-    while !released || !presented {
-        let message = connection.next()?;
-        if connection.handle_common(&message)? {
-            continue;
-        }
-        if message.object == BUFFER && message.opcode == 0 {
-            wire::Cursor::new(&message.payload).finish()?;
-            released = true;
-        } else if message.object == FRAME_CALLBACK && message.opcode == 0 {
-            let mut args = wire::Cursor::new(&message.payload);
-            args.u32()?;
-            args.finish()?;
-            presented = true;
-        }
-    }
-    Ok(())
-}
-
-fn present(mut connection: Connection, runtime_directory: &Path) -> Result<Connection, String> {
+fn present(
+    mut connection: Connection,
+    runtime_directory: &Path,
+) -> Result<(Connection, Demo), String> {
     let globals = discover_globals(&mut connection)?;
     let (compositor_name, compositor_version) =
         Globals::require(globals.compositor, "wl_compositor", 4, 4)?;
@@ -525,9 +806,17 @@ fn present(mut connection: Connection, runtime_directory: &Path) -> Result<Conne
         xdg_version,
         XDG_WM_BASE,
     )?;
-    configure_surface(&mut connection)?;
-    commit_first_frame(&mut connection, runtime_directory)?;
-    Ok(connection)
+    create_surface(&mut connection)?;
+
+    let mut demo = Demo::new();
+    while !demo.ready() {
+        let message = connection.next()?;
+        if connection.handle_common(&message)? {
+            continue;
+        }
+        demo.dispatch(&mut connection, &message, runtime_directory)?;
+    }
+    Ok((connection, demo))
 }
 
 pub fn run(options: &Options) -> Result<(), String> {
@@ -539,11 +828,14 @@ pub fn run(options: &Options) -> Result<(), String> {
         .checked_add(PRESENT_TIMEOUT)
         .ok_or_else(|| "could not bound the Wayland presentation handshake".to_string())?;
     let connection = Connection::connect(&options.socket, deadline)?;
-    let mut connection = present(connection, runtime_directory)?;
+    let (mut connection, mut demo) = present(connection, runtime_directory)?;
+    let size = demo
+        .current_size
+        .ok_or_else(|| "demo became ready without a configured size".to_string())?;
     connection.finish_handshake()?;
 
     let _ready = start_ready_socket(&options.ready_socket)?;
-    println!("TD-UI-CLIENT-READY surface={}x{}", WIDTH, HEIGHT);
+    println!("TD-UI-CLIENT-READY surface={}x{}", size.width, size.height);
     std::io::stdout()
         .flush()
         .map_err(|e| format!("flush UI client ready marker: {e}"))?;
@@ -553,8 +845,48 @@ pub fn run(options: &Options) -> Result<(), String> {
         if connection.handle_common(&message)? {
             continue;
         }
-        if message.object == XDG_TOPLEVEL && message.opcode == 1 {
-            return Err("compositor requested that the demo close".into());
+        demo.dispatch(&mut connection, &message, runtime_directory)?;
+    }
+}
+
+#[cfg(test)]
+pub struct TestPresentation {
+    connection: Connection,
+    demo: Demo,
+    runtime_directory: PathBuf,
+}
+
+#[cfg(test)]
+impl TestPresentation {
+    pub fn wait_for(
+        &mut self,
+        size: (usize, usize),
+        activated: bool,
+        fullscreen: bool,
+    ) -> Result<(), String> {
+        loop {
+            let settled = self
+                .demo
+                .target
+                .as_ref()
+                .is_some_and(|frame| frame.released && frame.presented);
+            if self.demo.current_size
+                == Some(Size {
+                    width: size.0,
+                    height: size.1,
+                })
+                && self.demo.activated == activated
+                && self.demo.fullscreen == fullscreen
+                && settled
+            {
+                return Ok(());
+            }
+            let message = self.connection.next()?;
+            if self.connection.handle_common(&message)? {
+                continue;
+            }
+            self.demo
+                .dispatch(&mut self.connection, &message, &self.runtime_directory)?;
         }
     }
 }
@@ -563,14 +895,25 @@ pub fn run(options: &Options) -> Result<(), String> {
 pub fn present_for_test(
     stream: UnixStream,
     runtime_directory: &Path,
-) -> Result<UnixStream, String> {
-    let mut connection = Connection {
+) -> Result<TestPresentation, String> {
+    let connection = Connection {
         stream,
         buffered: Vec::with_capacity(16 * 1024),
-        deadline: None,
+        deadline: Instant::now().checked_add(Duration::from_secs(5)),
+        next_id: FIRST_DYNAMIC_ID,
+        free_ids: BTreeSet::new(),
     };
-    connection = present(connection, runtime_directory)?;
-    Ok(connection.stream)
+    let (mut connection, demo) = present(connection, runtime_directory)?;
+    connection.finish_handshake()?;
+    connection
+        .stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .map_err(|e| format!("set Wayland test event timeout: {e}"))?;
+    Ok(TestPresentation {
+        connection,
+        demo,
+        runtime_directory: runtime_directory.to_path_buf(),
+    })
 }
 
 pub fn probe(path: &Path) -> Result<(), String> {
@@ -580,7 +923,7 @@ pub fn probe(path: &Path) -> Result<(), String> {
 }
 
 pub fn selftest() -> Result<(), String> {
-    let pixels = build_pixels()?;
+    let pixels = build_pixels(DEFAULT_WIDTH, DEFAULT_HEIGHT)?;
     let first = pixels
         .get(..4)
         .ok_or_else(|| "demo pattern has no first pixel".to_string())?;
@@ -624,9 +967,127 @@ mod tests {
 
     #[test]
     fn pattern_is_exactly_one_xrgb_surface() {
-        let pixels = build_pixels().unwrap();
-        assert_eq!(pixels.len(), WIDTH * HEIGHT * BYTES_PER_PIXEL);
+        let pixels = build_pixels(DEFAULT_WIDTH, DEFAULT_HEIGHT).unwrap();
+        assert_eq!(
+            pixels.len(),
+            DEFAULT_WIDTH * DEFAULT_HEIGHT * BYTES_PER_PIXEL
+        );
         assert!(pixels.as_chunks::<4>().0.iter().all(|pixel| pixel[3] == 0));
+        assert_eq!(build_pixels(1, 1).unwrap().len(), BYTES_PER_PIXEL);
+        assert!(build_pixels(0, 1).is_err());
+        assert!(build_pixels(MAX_UI_DIMENSION + 1, 1).is_err());
+        assert!(build_pixels(MAX_UI_DIMENSION, MAX_UI_DIMENSION).is_err());
+    }
+
+    #[test]
+    fn dynamic_object_ids_are_reused_only_after_delete_id() {
+        let (stream, _peer) = UnixStream::pair().unwrap();
+        let mut connection = Connection {
+            stream,
+            buffered: Vec::new(),
+            deadline: None,
+            next_id: FIRST_DYNAMIC_ID,
+            free_ids: BTreeSet::new(),
+        };
+        assert_eq!(connection.allocate_id().unwrap(), 10);
+        assert_eq!(connection.allocate_id().unwrap(), 11);
+
+        let mut deleted = wire::Builder::new();
+        deleted.u32(10);
+        let mut bytes = deleted.message(DISPLAY, 1).unwrap();
+        let event = wire::take(&mut bytes).unwrap().unwrap();
+        assert!(connection.handle_common(&event).unwrap());
+        assert_eq!(connection.allocate_id().unwrap(), 10);
+
+        let mut duplicate = wire::Builder::new();
+        duplicate.u32(10);
+        let mut bytes = duplicate.message(DISPLAY, 1).unwrap();
+        let event = wire::take(&mut bytes).unwrap().unwrap();
+        assert!(connection.handle_common(&event).unwrap());
+        let mut bytes = {
+            let mut duplicate = wire::Builder::new();
+            duplicate.u32(10);
+            duplicate.message(DISPLAY, 1).unwrap()
+        };
+        let event = wire::take(&mut bytes).unwrap().unwrap();
+        assert!(connection.handle_common(&event).is_err());
+
+        let mut future = wire::Builder::new();
+        future.u32(99);
+        let mut bytes = future.message(DISPLAY, 1).unwrap();
+        let event = wire::take(&mut bytes).unwrap().unwrap();
+        assert!(connection.handle_common(&event).is_err());
+    }
+
+    #[test]
+    fn toplevel_configure_parses_states_and_rejects_invalid_dimensions() {
+        let mut states = Vec::new();
+        states.extend_from_slice(&2u32.to_ne_bytes());
+        states.extend_from_slice(&4u32.to_ne_bytes());
+        let mut configured = wire::Builder::new();
+        configured.i32(320);
+        configured.i32(200);
+        configured.array(&states).unwrap();
+        let mut bytes = configured.message(XDG_TOPLEVEL, 0).unwrap();
+        let event = wire::take(&mut bytes).unwrap().unwrap();
+        let mut demo = Demo::new();
+        demo.configure_toplevel(&event).unwrap();
+        let pending = demo.pending_configure.unwrap();
+        assert_eq!(
+            pending.resolve_size(None),
+            Size {
+                width: 320,
+                height: 200
+            }
+        );
+        assert_eq!(pending.width, Some(320));
+        assert_eq!(pending.height, Some(200));
+        assert!(pending.activated);
+        assert!(pending.fullscreen);
+
+        for (width, height) in [(-1, 10), (10, -1)] {
+            let mut invalid = wire::Builder::new();
+            invalid.i32(width);
+            invalid.i32(height);
+            invalid.array(&[]).unwrap();
+            let mut bytes = invalid.message(XDG_TOPLEVEL, 0).unwrap();
+            let event = wire::take(&mut bytes).unwrap().unwrap();
+            assert!(demo.configure_toplevel(&event).is_err());
+        }
+
+        for (width, height, expected) in [
+            (
+                0,
+                10,
+                Size {
+                    width: 20,
+                    height: 10,
+                },
+            ),
+            (
+                10,
+                0,
+                Size {
+                    width: 10,
+                    height: 30,
+                },
+            ),
+        ] {
+            let mut partial = wire::Builder::new();
+            partial.i32(width);
+            partial.i32(height);
+            partial.array(&[]).unwrap();
+            let mut bytes = partial.message(XDG_TOPLEVEL, 0).unwrap();
+            let event = wire::take(&mut bytes).unwrap().unwrap();
+            demo.configure_toplevel(&event).unwrap();
+            assert_eq!(
+                demo.pending_configure.unwrap().resolve_size(Some(Size {
+                    width: 20,
+                    height: 30
+                })),
+                expected
+            );
+        }
     }
 
     #[test]
@@ -654,10 +1115,53 @@ mod tests {
             stream,
             buffered: Vec::new(),
             deadline: Some(Instant::now()),
+            next_id: FIRST_DYNAMIC_ID,
+            free_ids: BTreeSet::new(),
         };
         assert_eq!(
             connection.next().unwrap_err(),
             "Wayland presentation handshake timed out"
         );
+    }
+
+    #[test]
+    fn test_event_timeout_is_distinct_from_the_handshake_deadline() {
+        let (stream, _peer) = UnixStream::pair().unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_millis(1)))
+            .unwrap();
+        let mut connection = Connection {
+            stream,
+            buffered: Vec::new(),
+            deadline: None,
+            next_id: FIRST_DYNAMIC_ID,
+            free_ids: BTreeSet::new(),
+        };
+        assert_eq!(
+            connection.next().unwrap_err(),
+            "Wayland event wait timed out"
+        );
+    }
+
+    #[test]
+    fn bare_surface_configure_reuses_current_toplevel_state() {
+        let mut demo = Demo::new();
+        demo.current_size = Some(Size {
+            width: 320,
+            height: 200,
+        });
+        demo.activated = true;
+        demo.fullscreen = true;
+        let configure = demo.take_configure();
+        assert_eq!(
+            configure.resolve_size(demo.current_size),
+            Size {
+                width: 320,
+                height: 200,
+            }
+        );
+        assert!(configure.activated);
+        assert!(configure.fullscreen);
+        assert!(!configure.selects_layout_size());
     }
 }

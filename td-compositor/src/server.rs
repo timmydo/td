@@ -1,14 +1,18 @@
-use crate::runtime::Runtime;
+use crate::configure::{Configure, ConfigureTracker, ToplevelState, ViewStatus};
+use crate::layout::ViewLayout;
+use crate::runtime::{Runtime, SubscriptionStop};
 use crate::scene::{Surface, SurfaceKey, SHM_ARGB8888, SHM_XRGB8888};
-use crate::{socket, sys, wire};
+use crate::{socket, sys, wire, MAX_UI_DIMENSION, MAX_UI_FRAME_BYTES};
 use std::collections::{BTreeMap, VecDeque};
 use std::fs::{self, File, Permissions};
 use std::io::Write;
+use std::net::Shutdown;
 use std::os::fd::RawFd;
 use std::os::unix::fs::{FileExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Mutex};
 use std::thread;
 
@@ -19,9 +23,7 @@ const GLOBAL_XDG_WM_BASE: u32 = 4;
 const MAX_POOL_BYTES: usize = 64 * 1024 * 1024;
 const MAX_CLIENT_BUFFER: usize = 256 * 1024;
 const MAX_PENDING_FDS: usize = 64;
-const MAX_SURFACE_DIMENSION: usize = 16_384;
 const MAX_OBJECTS: usize = 512;
-const MAX_CLIENT_SURFACE_BYTES: usize = 32 * 1024 * 1024;
 const MAX_CLIENTS: usize = 32;
 
 static NEXT_CLIENT: AtomicU64 = AtomicU64::new(1);
@@ -77,18 +79,51 @@ enum Object {
     XdgSurface {
         surface: u32,
         toplevel: Option<u32>,
-        configure_serial: Option<u32>,
-        configured: bool,
+        configure: Arc<Mutex<ConfigureTracker>>,
     },
     XdgToplevel {
         xdg_surface: u32,
     },
 }
 
+#[derive(Clone)]
+struct ConfigureRegistration {
+    xdg_surface: u32,
+    toplevel: u32,
+    tracker: Arc<Mutex<ConfigureTracker>>,
+}
+
+struct Outbound {
+    stream: UnixStream,
+    disconnected: bool,
+}
+
+impl Outbound {
+    fn send(&mut self, message: &[u8]) -> Result<(), String> {
+        if self.disconnected {
+            return Ok(());
+        }
+        match self.stream.write_all(message) {
+            Ok(()) => Ok(()),
+            Err(error) if sys::write_peer_disconnected(&error) => {
+                self.disconnected = true;
+                Ok(())
+            }
+            Err(error) => Err(format!("write Wayland event: {error}")),
+        }
+    }
+
+    fn disconnect(&mut self) {
+        self.disconnected = true;
+        let _ = self.stream.shutdown(Shutdown::Both);
+    }
+}
+
 struct Client {
     id: u64,
     stream: UnixStream,
-    disconnected: bool,
+    outbound: Arc<Mutex<Outbound>>,
+    configurations: Arc<Mutex<BTreeMap<SurfaceKey, ConfigureRegistration>>>,
     objects: BTreeMap<u32, Object>,
     runtime: Arc<Mutex<Runtime>>,
     mapped_bytes: BTreeMap<u32, usize>,
@@ -131,6 +166,128 @@ fn next_serial() -> u32 {
     u32::try_from(folded).unwrap_or(1).max(1)
 }
 
+fn configure_state_bytes(state: ToplevelState) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(8);
+    if state.fullscreen {
+        bytes.extend_from_slice(&2u32.to_ne_bytes());
+    }
+    if state.activated {
+        bytes.extend_from_slice(&4u32.to_ne_bytes());
+    }
+    bytes
+}
+
+fn send_configure(
+    outbound: &Arc<Mutex<Outbound>>,
+    registration: &ConfigureRegistration,
+    configure: Configure,
+) -> Result<(), String> {
+    let states = configure_state_bytes(configure.state);
+    let mut toplevel = wire::Builder::new();
+    toplevel.i32(configure.state.width);
+    toplevel.i32(configure.state.height);
+    toplevel.array(&states)?;
+    let toplevel = toplevel.message(registration.toplevel, 0)?;
+
+    let mut surface = wire::Builder::new();
+    surface.u32(configure.serial);
+    let surface = surface.message(registration.xdg_surface, 0)?;
+
+    let mut outbound = outbound
+        .lock()
+        .map_err(|_| "Wayland outbound lock poisoned".to_string())?;
+    outbound.send(&toplevel)?;
+    outbound.send(&surface)
+}
+
+fn send_initial_configure(
+    outbound: &Arc<Mutex<Outbound>>,
+    registration: &ConfigureRegistration,
+) -> Result<(), String> {
+    let mut tracker = registration
+        .tracker
+        .lock()
+        .map_err(|_| "XDG configure tracker lock poisoned".to_string())?;
+    let configure = tracker.initial(next_serial())?;
+    let sent = send_configure(outbound, registration, configure);
+    drop(tracker);
+    sent
+}
+
+fn view_status(
+    snapshot: &BTreeMap<SurfaceKey, ViewLayout>,
+    key: SurfaceKey,
+) -> Result<ViewStatus, String> {
+    let Some(view) = snapshot.get(&key) else {
+        return Ok(ViewStatus::Unmapped);
+    };
+    let width = i32::try_from(view.rect.width.max(1))
+        .map_err(|_| "tile width exceeds XDG i32".to_string())?;
+    let height = i32::try_from(view.rect.height.max(1))
+        .map_err(|_| "tile height exceeds XDG i32".to_string())?;
+    let state = ToplevelState {
+        width,
+        height,
+        activated: view.activated,
+        fullscreen: view.fullscreen,
+    };
+    Ok(if view.visible {
+        ViewStatus::Visible(state)
+    } else {
+        ViewStatus::Hidden(state)
+    })
+}
+
+fn update_configure(
+    outbound: &Arc<Mutex<Outbound>>,
+    registration: &ConfigureRegistration,
+    status: ViewStatus,
+) -> Result<(), String> {
+    let mut tracker = registration
+        .tracker
+        .lock()
+        .map_err(|_| "XDG configure tracker lock poisoned".to_string())?;
+    let configure = tracker.update(status, next_serial())?;
+    if let Some(configure) = configure {
+        let sent = send_configure(outbound, registration, configure);
+        drop(tracker);
+        sent?;
+    }
+    Ok(())
+}
+
+fn configure_worker(
+    receiver: Receiver<()>,
+    stop: SubscriptionStop,
+    runtime: Arc<Mutex<Runtime>>,
+    configurations: Arc<Mutex<BTreeMap<SurfaceKey, ConfigureRegistration>>>,
+    outbound: Arc<Mutex<Outbound>>,
+) -> Result<(), String> {
+    while receiver.recv().is_ok() {
+        if stop.is_stopped() {
+            return Ok(());
+        }
+        let snapshot = runtime
+            .lock()
+            .map_err(|_| "runtime lock poisoned".to_string())?
+            .layout_snapshot();
+        let configurations = configurations
+            .lock()
+            .map_err(|_| "configure registration lock poisoned".to_string())?;
+        for (key, registration) in configurations.iter() {
+            update_configure(&outbound, registration, view_status(&snapshot, *key)?)?;
+        }
+        if outbound
+            .lock()
+            .map_err(|_| "Wayland outbound lock poisoned".to_string())?
+            .disconnected
+        {
+            return Ok(());
+        }
+    }
+    Ok(())
+}
+
 fn client_surface_total(current: usize, prior: usize, proposed: usize) -> Result<usize, String> {
     let retained = current
         .checked_sub(prior)
@@ -138,9 +295,9 @@ fn client_surface_total(current: usize, prior: usize, proposed: usize) -> Result
     let next = retained
         .checked_add(proposed)
         .ok_or_else(|| "client surface byte accounting overflow".to_string())?;
-    if next > MAX_CLIENT_SURFACE_BYTES {
+    if next > MAX_UI_FRAME_BYTES {
         return Err(format!(
-            "client surfaces need {next} bytes, exceeding {MAX_CLIENT_SURFACE_BYTES}"
+            "client surfaces need {next} bytes, exceeding {MAX_UI_FRAME_BYTES}"
         ));
     }
     Ok(next)
@@ -153,18 +310,25 @@ fn request(object: u32, opcode: u16, builder: wire::Builder) -> Result<wire::Mes
 }
 
 impl Client {
-    fn new(id: u64, stream: UnixStream, runtime: Arc<Mutex<Runtime>>) -> Client {
+    fn new(id: u64, stream: UnixStream, runtime: Arc<Mutex<Runtime>>) -> Result<Client, String> {
         let mut objects = BTreeMap::new();
         objects.insert(1, Object::Display);
-        Client {
+        let writer = stream
+            .try_clone()
+            .map_err(|e| format!("clone Wayland client stream: {e}"))?;
+        Ok(Client {
             id,
             stream,
-            disconnected: false,
+            outbound: Arc::new(Mutex::new(Outbound {
+                stream: writer,
+                disconnected: false,
+            })),
+            configurations: Arc::new(Mutex::new(BTreeMap::new())),
             objects,
             runtime,
             mapped_bytes: BTreeMap::new(),
             mapped_total: 0,
-        }
+        })
     }
 
     fn clear_surface_bytes(&mut self, surface: u32) {
@@ -197,17 +361,28 @@ impl Client {
 
     fn send(&mut self, object: u32, opcode: u16, builder: wire::Builder) -> Result<(), String> {
         let message = builder.message(object, opcode)?;
-        if self.disconnected {
-            return Ok(());
-        }
-        match self.stream.write_all(&message) {
-            Ok(()) => Ok(()),
-            Err(error) if sys::write_peer_disconnected(&error) => {
-                self.disconnected = true;
-                Ok(())
-            }
-            Err(error) => Err(format!("write Wayland event: {error}")),
-        }
+        self.outbound
+            .lock()
+            .map_err(|_| "Wayland outbound lock poisoned".to_string())?
+            .send(&message)
+    }
+
+    fn disconnected(&self) -> Result<bool, String> {
+        self.outbound
+            .lock()
+            .map(|outbound| outbound.disconnected)
+            .map_err(|_| "Wayland outbound lock poisoned".to_string())
+    }
+
+    fn unregister_surface(&mut self, surface: u32) -> Result<(), String> {
+        self.configurations
+            .lock()
+            .map_err(|_| "configure registration lock poisoned".to_string())?
+            .remove(&SurfaceKey {
+                client: self.id,
+                object: surface,
+            });
+        Ok(())
     }
 
     fn delete_id(&mut self, id: u32) -> Result<(), String> {
@@ -409,7 +584,7 @@ impl Client {
         let width = usize::try_from(width).map_err(|_| "buffer width overflow".to_string())?;
         let height = usize::try_from(height).map_err(|_| "buffer height overflow".to_string())?;
         let stride = usize::try_from(stride).map_err(|_| "buffer stride overflow".to_string())?;
-        if width > MAX_SURFACE_DIMENSION || height > MAX_SURFACE_DIMENSION {
+        if width > MAX_UI_DIMENSION || height > MAX_UI_DIMENSION {
             return Err(format!(
                 "wl_shm buffer {width}x{height} exceeds the dimension limit"
             ));
@@ -504,6 +679,8 @@ impl Client {
 
     fn commit_surface(&mut self, id: u32, state: SurfaceState) -> Result<(), String> {
         let attaching_buffer = matches!(state.pending_buffer, Some(PendingBuffer::Buffer { .. }));
+        let was_mapped = self.mapped_bytes.contains_key(&id);
+        let mut xdg_configure = None;
         if let Some(role) = state.role {
             let xdg = self
                 .objects
@@ -512,8 +689,7 @@ impl Client {
                 .ok_or_else(|| format!("wl_surface {id} has a destroyed xdg_surface role"))?;
             let Object::XdgSurface {
                 toplevel,
-                configure_serial,
-                configured,
+                configure,
                 ..
             } = xdg
             else {
@@ -521,23 +697,31 @@ impl Client {
             };
             let toplevel =
                 toplevel.ok_or_else(|| format!("xdg_surface {role} has no role object"))?;
-            if configure_serial.is_none() {
+            xdg_configure = Some(Arc::clone(&configure));
+            let initial_sent = configure
+                .lock()
+                .map_err(|_| "XDG configure tracker lock poisoned".to_string())?
+                .initial_sent();
+            if !initial_sent {
                 if attaching_buffer {
                     return Err(format!(
                         "xdg_surface {role} attached a buffer before its initial configure"
                     ));
                 }
-                let serial = self.configure_xdg(role, toplevel)?;
-                self.objects.insert(
-                    role,
-                    Object::XdgSurface {
-                        surface: id,
-                        toplevel: Some(toplevel),
-                        configure_serial: Some(serial),
-                        configured: false,
+                send_initial_configure(
+                    &self.outbound,
+                    &ConfigureRegistration {
+                        xdg_surface: role,
+                        toplevel,
+                        tracker: Arc::clone(&configure),
                     },
-                );
-            } else if attaching_buffer && !configured {
+                )?;
+            } else if attaching_buffer
+                && !configure
+                    .lock()
+                    .map_err(|_| "XDG configure tracker lock poisoned".to_string())?
+                    .can_attach()
+            {
                 return Err(format!(
                     "xdg_surface {role} attached a buffer before acknowledging configure"
                 ));
@@ -552,6 +736,14 @@ impl Client {
             };
             match pending {
                 PendingBuffer::Detach => {
+                    if was_mapped {
+                        if let Some(configure) = xdg_configure {
+                            configure
+                                .lock()
+                                .map_err(|_| "XDG configure tracker lock poisoned".to_string())?
+                                .unmap()?;
+                        }
+                    }
                     self.unmap_surface(id)?;
                 }
                 PendingBuffer::Buffer { object, buffer } => {
@@ -590,20 +782,6 @@ impl Client {
             current.frame_callbacks.clear();
         }
         Ok(())
-    }
-
-    fn configure_xdg(&mut self, xdg_surface: u32, toplevel: u32) -> Result<u32, String> {
-        let mut toplevel_configure = wire::Builder::new();
-        toplevel_configure.i32(0);
-        toplevel_configure.i32(0);
-        toplevel_configure.array(&[])?;
-        self.send(toplevel, 0, toplevel_configure)?;
-
-        let serial = next_serial();
-        let mut surface_configure = wire::Builder::new();
-        surface_configure.u32(serial);
-        self.send(xdg_surface, 0, surface_configure)?;
-        Ok(serial)
     }
 
     fn dispatch(
@@ -866,8 +1044,7 @@ impl Client {
                         Object::XdgSurface {
                             surface,
                             toplevel: None,
-                            configure_serial: None,
-                            configured: false,
+                            configure: Arc::new(Mutex::new(ConfigureTracker::new())),
                         },
                     )?;
                     state.role = Some(id);
@@ -887,8 +1064,7 @@ impl Client {
             Object::XdgSurface {
                 surface,
                 toplevel,
-                configure_serial,
-                configured,
+                configure,
             } => match message.opcode {
                 0 => {
                     args.finish()?;
@@ -920,13 +1096,33 @@ impl Client {
                             xdg_surface: message.object,
                         },
                     )?;
+                    let key = SurfaceKey {
+                        client: self.id,
+                        object: surface,
+                    };
+                    let prior = self
+                        .configurations
+                        .lock()
+                        .map_err(|_| "configure registration lock poisoned".to_string())?
+                        .insert(
+                            key,
+                            ConfigureRegistration {
+                                xdg_surface: message.object,
+                                toplevel: new_toplevel,
+                                tracker: Arc::clone(&configure),
+                            },
+                        );
+                    if prior.is_some() {
+                        return Err(format!(
+                            "wl_surface {surface} already has a configure registration"
+                        ));
+                    }
                     self.objects.insert(
                         message.object,
                         Object::XdgSurface {
                             surface,
                             toplevel: Some(new_toplevel),
-                            configure_serial,
-                            configured,
+                            configure,
                         },
                     );
                     Ok(())
@@ -940,21 +1136,15 @@ impl Client {
                 4 => {
                     let serial = args.u32()?;
                     args.finish()?;
-                    if configure_serial != Some(serial) {
-                        return Err(format!(
-                            "xdg_surface {} acknowledged unknown configure {serial}",
-                            message.object
-                        ));
-                    }
-                    self.objects.insert(
-                        message.object,
-                        Object::XdgSurface {
-                            surface,
-                            toplevel,
-                            configure_serial,
-                            configured: true,
-                        },
-                    );
+                    configure
+                        .lock()
+                        .map_err(|_| "XDG configure tracker lock poisoned".to_string())?
+                        .acknowledge(serial)
+                        .map_err(|error| format!("xdg_surface {} {error}", message.object))?;
+                    self.runtime
+                        .lock()
+                        .map_err(|_| "runtime lock poisoned".to_string())?
+                        .wake_layout(self.id);
                     Ok(())
                 }
                 2 => Err("xdg_popup is not supported".into()),
@@ -966,7 +1156,6 @@ impl Client {
             Object::XdgToplevel { xdg_surface } => match message.opcode {
                 0 => {
                     args.finish()?;
-                    self.remove_object(message.object)?;
                     let Some(Object::XdgSurface { surface, .. }) =
                         self.objects.get(&xdg_surface).cloned()
                     else {
@@ -975,14 +1164,15 @@ impl Client {
                             message.object
                         ));
                     };
+                    self.unregister_surface(surface)?;
+                    self.remove_object(message.object)?;
                     self.unmap_surface(surface)?;
                     self.objects.insert(
                         xdg_surface,
                         Object::XdgSurface {
                             surface,
                             toplevel: None,
-                            configure_serial: None,
-                            configured: false,
+                            configure: Arc::new(Mutex::new(ConfigureTracker::new())),
                         },
                     );
                     Ok(())
@@ -1039,14 +1229,51 @@ fn dispatch_buffered(
             client.protocol_error(object, &error);
             return Err(error);
         }
-        if client.disconnected {
+        if client.disconnected()? {
             return Ok(DispatchOutcome::Disconnected);
         }
     }
 }
 
 fn serve_client(stream: UnixStream, id: u64, runtime: Arc<Mutex<Runtime>>) -> Result<(), String> {
-    let mut client = Client::new(id, stream, Arc::clone(&runtime));
+    let mut client = Client::new(id, stream, Arc::clone(&runtime))?;
+    let subscription = runtime
+        .lock()
+        .map_err(|_| "runtime lock poisoned".to_string())?
+        .subscribe(id)?;
+    let (receiver, stop) = subscription.split();
+    let worker_stop = stop.clone();
+    let worker_runtime = Arc::clone(&runtime);
+    let configurations = Arc::clone(&client.configurations);
+    let outbound = Arc::clone(&client.outbound);
+    let worker_outbound = Arc::clone(&outbound);
+    let configure_thread = match thread::Builder::new()
+        .name(format!("wayland-configure-{id}"))
+        .spawn(move || {
+            let result = configure_worker(
+                receiver,
+                worker_stop,
+                worker_runtime,
+                configurations,
+                worker_outbound,
+            );
+            if let Err(error) = &result {
+                eprintln!("td-compositor: client {id} configure: {error}");
+                if let Ok(mut outbound) = outbound.lock() {
+                    outbound.disconnect();
+                }
+            }
+            result
+        }) {
+        Ok(worker) => worker,
+        Err(error) => {
+            stop.stop();
+            if let Ok(mut runtime) = runtime.lock() {
+                runtime.unsubscribe(id);
+            }
+            return Err(format!("spawn Wayland configure worker {id}: {error}"));
+        }
+    };
     let mut bytes = Vec::with_capacity(64 * 1024);
     let mut incoming = [0u8; 64 * 1024];
     let mut fds: VecDeque<RawFd> = VecDeque::new();
@@ -1082,14 +1309,30 @@ fn serve_client(stream: UnixStream, id: u64, runtime: Arc<Mutex<Runtime>>) -> Re
     };
     let raw: Vec<RawFd> = fds.into_iter().collect();
     sys::discard_received(&raw);
-    let cleanup = runtime
-        .lock()
-        .map_err(|_| "runtime lock poisoned".to_string())?
-        .remove_client(id);
-    match (outcome, cleanup) {
-        (Ok(()), Ok(())) => Ok(()),
-        (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
-        (Err(error), Err(cleanup)) => Err(format!("{error}; client cleanup failed: {cleanup}")),
+    let _ = client.stream.shutdown(Shutdown::Both);
+    stop.stop();
+    let cleanup = match runtime.lock() {
+        Ok(mut runtime) => {
+            let cleanup = runtime.remove_client(id);
+            runtime.unsubscribe(id);
+            cleanup
+        }
+        Err(_) => Err("runtime lock poisoned".to_string()),
+    };
+    let joined = configure_thread
+        .join()
+        .map_err(|_| format!("Wayland configure worker {id} panicked"))
+        .and_then(|result| result);
+    let mut errors = Vec::new();
+    for result in [outcome, cleanup, joined] {
+        if let Err(error) = result {
+            errors.push(error);
+        }
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("; "))
     }
 }
 
@@ -1137,7 +1380,7 @@ pub fn probe(path: &Path) -> Result<(), String> {
 mod tests {
     use super::*;
     use crate::framebuffer::Framebuffer;
-    use crate::layout::Command;
+    use crate::layout::{Command, Direction, Layout};
     use std::io::Read;
     use std::os::fd::AsRawFd;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -1149,6 +1392,70 @@ mod tests {
         stream
             .write_all(&builder.message(object, opcode).unwrap())
             .unwrap();
+    }
+
+    fn receive_configure(
+        stream: &mut UnixStream,
+        received: &mut Vec<u8>,
+        xdg_surface: u32,
+        toplevel: u32,
+    ) -> ((i32, i32), u32, bool) {
+        let mut scratch = [0u8; 4096];
+        let mut size = None;
+        let mut serial = None;
+        let mut activated = false;
+        while size.is_none() || serial.is_none() {
+            let count = stream.read(&mut scratch).unwrap();
+            assert!(count > 0);
+            received.extend_from_slice(scratch.get(..count).unwrap());
+            while let Some(message) = wire::take(received).unwrap() {
+                if message.object == toplevel && message.opcode == 0 {
+                    let mut args = wire::Cursor::new(&message.payload);
+                    let width = args.i32().unwrap();
+                    let height = args.i32().unwrap();
+                    let state_bytes = args.u32().unwrap();
+                    for _ in 0..state_bytes / 4 {
+                        activated |= args.u32().unwrap() == 4;
+                    }
+                    args.finish().unwrap();
+                    size = Some((width, height));
+                } else if message.object == xdg_surface && message.opcode == 0 {
+                    let mut args = wire::Cursor::new(&message.payload);
+                    serial = Some(args.u32().unwrap());
+                    args.finish().unwrap();
+                }
+            }
+        }
+        (
+            size.unwrap_or_default(),
+            serial.unwrap_or_default(),
+            activated,
+        )
+    }
+
+    #[test]
+    fn a_first_hidden_snapshot_keeps_its_home_workspace_tile_size() {
+        let key = SurfaceKey {
+            client: 1,
+            object: 7,
+        };
+        let mut layout = Layout::new();
+        layout.map(key);
+        layout.apply(Command::MoveToWorkspace(2));
+        let snapshot = layout
+            .views(320, 200, 0)
+            .into_iter()
+            .map(|view| (view.key, view))
+            .collect();
+        assert_eq!(
+            view_status(&snapshot, key).unwrap(),
+            ViewStatus::Hidden(ToplevelState {
+                width: 320,
+                height: 200,
+                activated: false,
+                fullscreen: false,
+            })
+        );
     }
 
     #[test]
@@ -1207,6 +1514,11 @@ mod tests {
         let mut get_toplevel = wire::Builder::new();
         get_toplevel.u32(10);
         send(&mut client, 9, 1, get_toplevel);
+        let mut initial_detach = wire::Builder::new();
+        initial_detach.u32(0);
+        initial_detach.i32(0);
+        initial_detach.i32(0);
+        send(&mut client, 5, 1, initial_detach);
         send(&mut client, 5, 6, wire::Builder::new());
 
         let mut received = Vec::new();
@@ -1278,12 +1590,83 @@ mod tests {
             .unwrap()
             .command(Command::MoveToWorkspace(2))
             .unwrap();
+        let mut saw_hidden = false;
+        let hidden_configure = loop {
+            let count = client.read(&mut scratch).unwrap();
+            assert!(count > 0);
+            received.extend_from_slice(scratch.get(..count).unwrap());
+            let mut serial = None;
+            while let Some(message) = wire::take(&mut received).unwrap() {
+                if message.object == 10 && message.opcode == 0 {
+                    let mut args = wire::Cursor::new(&message.payload);
+                    assert!(args.i32().unwrap() > 0);
+                    assert!(args.i32().unwrap() > 0);
+                    let state_bytes = args.u32().unwrap();
+                    for _ in 0..state_bytes / 4 {
+                        args.u32().unwrap();
+                    }
+                    saw_hidden = state_bytes == 0;
+                    args.finish().unwrap();
+                } else if message.object == 9 && message.opcode == 0 {
+                    let mut args = wire::Cursor::new(&message.payload);
+                    let candidate = args.u32().unwrap();
+                    args.finish().unwrap();
+                    if saw_hidden {
+                        serial = Some(candidate);
+                    }
+                    saw_hidden = false;
+                }
+            }
+            if let Some(serial) = serial {
+                break serial;
+            }
+        };
+        let mut ack = wire::Builder::new();
+        ack.u32(hidden_configure);
+        send(&mut client, 9, 4, ack);
+
         let mut detach = wire::Builder::new();
         detach.u32(0);
         detach.i32(0);
         detach.i32(0);
         send(&mut client, 5, 1, detach);
         send(&mut client, 5, 6, wire::Builder::new());
+
+        let mut remap_detach = wire::Builder::new();
+        remap_detach.u32(0);
+        remap_detach.i32(0);
+        remap_detach.i32(0);
+        send(&mut client, 5, 1, remap_detach);
+        send(&mut client, 5, 6, wire::Builder::new());
+        let mut saw_initial = false;
+        let initial_configure = loop {
+            let count = client.read(&mut scratch).unwrap();
+            assert!(count > 0);
+            received.extend_from_slice(scratch.get(..count).unwrap());
+            let mut serial = None;
+            while let Some(message) = wire::take(&mut received).unwrap() {
+                if message.object == 10 && message.opcode == 0 {
+                    let mut args = wire::Cursor::new(&message.payload);
+                    saw_initial = args.i32().unwrap() == 0 && args.i32().unwrap() == 0;
+                    assert_eq!(args.u32().unwrap(), 0);
+                    args.finish().unwrap();
+                } else if message.object == 9 && message.opcode == 0 {
+                    let mut args = wire::Cursor::new(&message.payload);
+                    let candidate = args.u32().unwrap();
+                    args.finish().unwrap();
+                    if saw_initial {
+                        serial = Some(candidate);
+                    }
+                    saw_initial = false;
+                }
+            }
+            if let Some(serial) = serial {
+                break serial;
+            }
+        };
+        let mut ack = wire::Builder::new();
+        ack.u32(initial_configure);
+        send(&mut client, 9, 4, ack);
 
         let mut attach = wire::Builder::new();
         attach.u32(7);
@@ -1339,12 +1722,186 @@ mod tests {
         let thread_runtime = Arc::clone(&runtime);
         let worker = thread::spawn(move || serve_client(server, 77, thread_runtime));
 
-        let connected = crate::client::present_for_test(client, &std::env::temp_dir()).unwrap();
+        let mut connected = crate::client::present_for_test(client, &std::env::temp_dir()).unwrap();
         let frame = fs::read(&framebuffer_path).unwrap();
         assert!(frame.as_chunks::<4>().0.contains(&[0x78, 0x46, 0xe8, 0]));
+        assert_eq!(
+            runtime.lock().unwrap().surface_size(SurfaceKey {
+                client: 77,
+                object: 7,
+            }),
+            Some((592, 352))
+        );
+
+        runtime
+            .lock()
+            .unwrap()
+            .commit(
+                SurfaceKey {
+                    client: 88,
+                    object: 1,
+                },
+                Surface {
+                    width: 1,
+                    height: 1,
+                    pixels: vec![1, 2, 3, 0],
+                    format: SHM_XRGB8888,
+                },
+            )
+            .unwrap();
+        connected.wait_for((284, 352), false, false).unwrap();
+        assert_eq!(
+            runtime.lock().unwrap().surface_size(SurfaceKey {
+                client: 77,
+                object: 7,
+            }),
+            Some((284, 352))
+        );
+
+        runtime
+            .lock()
+            .unwrap()
+            .command(Command::Focus(Direction::Left))
+            .unwrap();
+        connected.wait_for((284, 352), true, false).unwrap();
+        runtime
+            .lock()
+            .unwrap()
+            .command(Command::ToggleFullscreen)
+            .unwrap();
+        connected.wait_for((640, 400), true, true).unwrap();
+        runtime
+            .lock()
+            .unwrap()
+            .command(Command::SwitchWorkspace(2))
+            .unwrap();
+        connected.wait_for((640, 400), false, false).unwrap();
+        runtime
+            .lock()
+            .unwrap()
+            .command(Command::SwitchWorkspace(1))
+            .unwrap();
+        connected.wait_for((640, 400), true, true).unwrap();
 
         drop(connected);
         worker.join().unwrap().unwrap();
+        fs::remove_file(framebuffer_path).unwrap();
+    }
+
+    #[test]
+    fn ack_dispatch_wakes_the_latest_configure_after_backpressure() {
+        let stem = format!(
+            "td-wayland-configure-backpressure-{}-{}",
+            std::process::id(),
+            TEST_SEQ.fetch_add(1, Ordering::Relaxed)
+        );
+        let framebuffer_path = std::env::temp_dir().join(format!("{stem}.fb"));
+        let framebuffer = Framebuffer::test_file(&framebuffer_path, 120, 80, 120 * 4).unwrap();
+        let runtime = Arc::new(Mutex::new(Runtime::new(framebuffer)));
+        let key = SurfaceKey {
+            client: 88,
+            object: 5,
+        };
+        runtime
+            .lock()
+            .unwrap()
+            .commit(
+                key,
+                Surface {
+                    width: 1,
+                    height: 1,
+                    pixels: vec![1, 2, 3, 0],
+                    format: SHM_XRGB8888,
+                },
+            )
+            .unwrap();
+
+        let (server, mut peer) = UnixStream::pair().unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let mut client = Client::new(88, server, Arc::clone(&runtime)).unwrap();
+        let tracker = Arc::new(Mutex::new(ConfigureTracker::new()));
+        {
+            let mut tracker = tracker.lock().unwrap();
+            tracker.initial(999).unwrap();
+            tracker.acknowledge(999).unwrap();
+        }
+        client
+            .insert(
+                9,
+                Object::XdgSurface {
+                    surface: 5,
+                    toplevel: Some(10),
+                    configure: Arc::clone(&tracker),
+                },
+            )
+            .unwrap();
+        client
+            .insert(10, Object::XdgToplevel { xdg_surface: 9 })
+            .unwrap();
+        client.configurations.lock().unwrap().insert(
+            key,
+            ConfigureRegistration {
+                xdg_surface: 9,
+                toplevel: 10,
+                tracker: Arc::clone(&tracker),
+            },
+        );
+
+        let subscription = runtime.lock().unwrap().subscribe(88).unwrap();
+        let (receiver, stop) = subscription.split();
+        let worker_stop = stop.clone();
+        let worker_runtime = Arc::clone(&runtime);
+        let configurations = Arc::clone(&client.configurations);
+        let outbound = Arc::clone(&client.outbound);
+        let worker = thread::spawn(move || {
+            configure_worker(
+                receiver,
+                worker_stop,
+                worker_runtime,
+                configurations,
+                outbound,
+            )
+        });
+
+        let mut received = Vec::new();
+        let (primed_size, primed_serial, primed_activated) =
+            receive_configure(&mut peer, &mut received, 9, 10);
+        assert_eq!(primed_size, (72, 32));
+        assert!(primed_activated);
+        {
+            let mut tracker = tracker.lock().unwrap();
+            tracker.acknowledge(primed_serial).unwrap();
+            for offset in 0..crate::configure::MAX_OUTSTANDING {
+                let width = i32::try_from(offset).unwrap().saturating_add(1);
+                let serial = u32::try_from(offset).unwrap().saturating_add(1000);
+                assert!(tracker
+                    .update(
+                        ViewStatus::Visible(ToplevelState {
+                            width,
+                            height: 10,
+                            activated: false,
+                            fullscreen: false,
+                        }),
+                        serial,
+                    )
+                    .unwrap()
+                    .is_some());
+            }
+        }
+
+        let mut ack = wire::Builder::new();
+        ack.u32(1000);
+        client
+            .dispatch(request(9, 4, ack).unwrap(), &mut VecDeque::new())
+            .unwrap();
+        let (size, serial, activated) = receive_configure(&mut peer, &mut received, 9, 10);
+        assert_eq!(size, (72, 32));
+        assert!(activated);
+        assert_ne!(serial, 0);
+
+        stop.stop();
+        worker.join().unwrap().unwrap();
+        runtime.lock().unwrap().unsubscribe(88);
         fs::remove_file(framebuffer_path).unwrap();
     }
 
@@ -1358,13 +1915,13 @@ mod tests {
         let framebuffer = Framebuffer::test_file(&framebuffer_path, 4, 4, 16).unwrap();
         let runtime = Arc::new(Mutex::new(Runtime::new(framebuffer)));
         let (server, peer) = UnixStream::pair().unwrap();
-        let mut client = Client::new(1, server, runtime);
+        let mut client = Client::new(1, server, runtime).unwrap();
         drop(peer);
 
         let mut first = wire::Builder::new();
         first.u32(2);
         client.send(1, 1, first).unwrap();
-        assert!(client.disconnected);
+        assert!(client.disconnected().unwrap());
         let mut second = wire::Builder::new();
         second.u32(3);
         client.send(1, 1, second).unwrap();
@@ -1384,8 +1941,8 @@ mod tests {
         let runtime = Arc::new(Mutex::new(Runtime::new(framebuffer)));
         let (server, mut peer) = UnixStream::pair().unwrap();
         peer.set_nonblocking(true).unwrap();
-        let mut client = Client::new(1, server, runtime);
-        client.disconnected = true;
+        let mut client = Client::new(1, server, runtime).unwrap();
+        client.outbound.lock().unwrap().disconnected = true;
         let mut event = wire::Builder::new();
         event.u32(2);
 
@@ -1425,7 +1982,7 @@ mod tests {
         let framebuffer = Framebuffer::test_file(&framebuffer_path, 4, 4, 16).unwrap();
         let runtime = Arc::new(Mutex::new(Runtime::new(framebuffer)));
         let (server, peer) = UnixStream::pair().unwrap();
-        let mut client = Client::new(1, server, runtime);
+        let mut client = Client::new(1, server, runtime).unwrap();
         let mut get_registry = wire::Builder::new();
         get_registry.u32(2);
         let mut bytes = get_registry.message(1, 1).unwrap();
@@ -1437,7 +1994,7 @@ mod tests {
             DispatchOutcome::Disconnected
         );
         assert!(bytes.is_empty());
-        assert!(client.disconnected);
+        assert!(client.disconnected().unwrap());
 
         fs::remove_file(framebuffer_path).unwrap();
     }
@@ -1479,7 +2036,7 @@ mod tests {
         let framebuffer = Framebuffer::test_file(&framebuffer_path, 4, 4, 16).unwrap();
         let (server, _peer) = UnixStream::pair().unwrap();
         let runtime = Arc::new(Mutex::new(Runtime::new(framebuffer)));
-        let mut client = Client::new(1, server, runtime);
+        let mut client = Client::new(1, server, runtime).unwrap();
         assert!(client
             .create_buffer(pool.clone(), 2, 0, 4, 4, 15, SHM_XRGB8888)
             .is_err());
@@ -1504,7 +2061,10 @@ mod tests {
         let framebuffer = Framebuffer::test_file(&framebuffer_path, 8, 8, 32).unwrap();
         let (server, _peer) = UnixStream::pair().unwrap();
         let runtime = Arc::new(Mutex::new(Runtime::new(framebuffer)));
-        let mut client = Client::new(2, server, runtime);
+        let mut client = Client::new(2, server, runtime).unwrap();
+        let mut configure = ConfigureTracker::new();
+        configure.initial(44).unwrap();
+        configure.acknowledge(44).unwrap();
         client
             .insert(
                 5,
@@ -1520,8 +2080,7 @@ mod tests {
                 Object::XdgSurface {
                     surface: 5,
                     toplevel: Some(10),
-                    configure_serial: Some(44),
-                    configured: true,
+                    configure: Arc::new(Mutex::new(configure)),
                 },
             )
             .unwrap();
@@ -1574,15 +2133,17 @@ mod tests {
             .unwrap();
         let frame = fs::read(&framebuffer_path).unwrap();
         assert!(!frame.as_chunks::<4>().0.contains(&pixels));
-        assert!(matches!(
-            client.objects.get(&9),
+        let reset = match client.objects.get(&9) {
             Some(Object::XdgSurface {
                 toplevel: None,
-                configure_serial: None,
-                configured: false,
+                configure,
                 ..
-            })
-        ));
+            }) => Some(Arc::clone(configure)),
+            _ => None,
+        }
+        .unwrap();
+        assert!(!reset.lock().unwrap().initial_sent());
+        assert!(!reset.lock().unwrap().can_attach());
 
         let mut new_toplevel = wire::Builder::new();
         new_toplevel.u32(11);
@@ -1602,15 +2163,17 @@ mod tests {
                 &mut VecDeque::new(),
             )
             .unwrap();
-        assert!(matches!(
-            client.objects.get(&9),
+        let configured = match client.objects.get(&9) {
             Some(Object::XdgSurface {
                 toplevel: Some(11),
-                configure_serial: Some(_),
-                configured: false,
+                configure,
                 ..
-            })
-        ));
+            }) => Some(Arc::clone(configure)),
+            _ => None,
+        }
+        .unwrap();
+        assert!(configured.lock().unwrap().initial_sent());
+        assert!(!configured.lock().unwrap().can_attach());
         fs::remove_file(framebuffer_path).unwrap();
         fs::remove_file(pool_path).unwrap();
     }
@@ -1658,10 +2221,10 @@ mod tests {
     #[test]
     fn client_memory_and_connection_limits_fail_closed() {
         assert_eq!(
-            client_surface_total(MAX_CLIENT_SURFACE_BYTES, 4096, 4096).unwrap(),
-            MAX_CLIENT_SURFACE_BYTES
+            client_surface_total(MAX_UI_FRAME_BYTES, 4096, 4096).unwrap(),
+            MAX_UI_FRAME_BYTES
         );
-        assert!(client_surface_total(MAX_CLIENT_SURFACE_BYTES, 0, 1).is_err());
+        assert!(client_surface_total(MAX_UI_FRAME_BYTES, 0, 1).is_err());
         let mut permits = Vec::new();
         for _ in 0..MAX_CLIENTS {
             permits.push(ClientPermit::acquire().unwrap());

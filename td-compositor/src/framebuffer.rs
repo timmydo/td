@@ -1,9 +1,10 @@
 use crate::scene::Scene;
+use crate::{MAX_UI_DIMENSION, MAX_UI_FRAME_BYTES};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
-const MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
+const MAX_FRAMEBUFFER_BYTES: usize = 64 * 1024 * 1024;
 
 pub struct Framebuffer {
     file: File,
@@ -43,6 +44,11 @@ fn validate_geometry(width: usize, height: usize, stride: usize) -> Result<usize
     if width == 0 || height == 0 {
         return Err("framebuffer dimensions must be non-zero".into());
     }
+    if width > MAX_UI_DIMENSION || height > MAX_UI_DIMENSION {
+        return Err(format!(
+            "framebuffer {width}x{height} exceeds the {MAX_UI_DIMENSION}-pixel dimension limit"
+        ));
+    }
     let row = width
         .checked_mul(4)
         .ok_or_else(|| "framebuffer row size overflow".to_string())?;
@@ -51,12 +57,20 @@ fn validate_geometry(width: usize, height: usize, stride: usize) -> Result<usize
             "framebuffer stride {stride} is smaller than {width} XRGB pixels"
         ));
     }
+    let pixels = row
+        .checked_mul(height)
+        .ok_or_else(|| "framebuffer pixel size overflow".to_string())?;
+    if pixels > MAX_UI_FRAME_BYTES {
+        return Err(format!(
+            "framebuffer pixels need {pixels} bytes, above the {MAX_UI_FRAME_BYTES}-byte client limit"
+        ));
+    }
     let size = stride
         .checked_mul(height)
         .ok_or_else(|| "framebuffer size overflow".to_string())?;
-    if size > MAX_FRAME_BYTES {
+    if size > MAX_FRAMEBUFFER_BYTES {
         return Err(format!(
-            "framebuffer needs {size} bytes, above the {MAX_FRAME_BYTES}-byte limit"
+            "framebuffer needs {size} bytes, above the {MAX_FRAMEBUFFER_BYTES}-byte shadow limit"
         ));
     }
     Ok(size)
@@ -157,5 +171,16 @@ mod tests {
         assert!(validate_geometry(0, 1, 4).is_err());
         assert!(validate_geometry(10, 1, 39).is_err());
         assert!(validate_geometry(usize::MAX, 2, usize::MAX).is_err());
+        assert!(validate_geometry(MAX_UI_DIMENSION + 1, 1, (MAX_UI_DIMENSION + 1) * 4).is_err());
+        assert_eq!(
+            validate_geometry(4096, 2048, 4096 * 4),
+            Ok(MAX_UI_FRAME_BYTES)
+        );
+        assert_eq!(
+            validate_geometry(4096, 2048, 4096 * 4 + 256),
+            Ok(MAX_UI_FRAME_BYTES + 2048 * 256)
+        );
+        assert!(validate_geometry(4096, 2049, 4096 * 4).is_err());
+        assert!(validate_geometry(1, 1, MAX_FRAMEBUFFER_BYTES + 1).is_err());
     }
 }
