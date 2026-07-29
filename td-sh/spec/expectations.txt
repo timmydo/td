@@ -718,7 +718,6 @@ xfail builtin-vars.test.sh::Export existing local variable
 xfail builtin-vars.test.sh::Export sets a global variable
 xfail builtin-vars.test.sh::Export sets a global variable that persists after export -n
 xfail builtin-vars.test.sh::Exporting a parent func variable (dynamic scope)
-xfail builtin-vars.test.sh::Unset a function without -f
 xfail builtin-vars.test.sh::Unset exported variable, then define it again.  It's NOT still exported.
 xfail builtin-vars.test.sh::can't export associative array (strict_array)
 xfail builtin-vars.test.sh::unset -v assoc (related to issue #661)

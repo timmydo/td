@@ -191,12 +191,53 @@ fn a_localised_name_still_exports_once_assigned() -> Result<(), Box<dyn std::err
         // `export NAME` before any value is the same state from the other side.
         (format!("unset TD_SH_X; export TD_SH_X; {child}"), "[UNSET]\n"),
         (format!("unset TD_SH_X; export TD_SH_X; TD_SH_X=H; {child}"), "[H]\n"),
-    ] {
+        // `unset` of a LOCALISED name keeps the entry the way a bare `local` does,
+        // so a reassignment still exports; on a global it takes the attribute away
+        // and the reassignment does not.
+        (format!("f() {{ local TD_SH_X; unset TD_SH_X; TD_SH_X=H; {child}; }}; f"), "[H]\n"),
+        // Being INSIDE a function is not the test -- only the declaration is, so an
+        // undeclared name loses the attribute at depth just as it does at the top.
+        (format!("f() {{ unset TD_SH_X; TD_SH_X=H; {child}; }}; f"), "[UNSET]\n"),
+        // The EXIT trap runs inside the frame the shell died in, so the name it
+        // declared still reads as declared there.
+        // (through a helper, so the child's single quotes do not nest in the trap's)
+        (format!("c() {{ {child}; }}; trap 'unset TD_SH_X; TD_SH_X=H; c' EXIT; f() {{ local TD_SH_X; exit 0; }}; f"), "[H]\n"),
+        // `set -a` ORs VEXPORT into what an unset writes (ash.c:2417), so the free
+        // test can never hold and the entry survives -- marked for export whether
+        // or not it ever was, and whether or not it was declared.
+        (format!("set -a; unset TD_SH_X; set +a; TD_SH_X=H; {child}"), "[H]\n"),
+        (format!("f() {{ local TD_SH_X; set -a; unset TD_SH_X; set +a; TD_SH_X=H; {child}; }}; f"), "[H]\n"),
+        // The declaration lives on the VARIABLE, so an INNER function's `unset`
+        // sees an outer frame's `local` too -- and a subshell, which gets a copy
+        // of the variables, carries the answer with it.
+        (format!("i() {{ unset TD_SH_X; }}; f() {{ local TD_SH_X; i; TD_SH_X=H; {child}; }}; f"), "[H]\n"),
+        (format!("f() {{ local TD_SH_X; ( unset TD_SH_X; TD_SH_X=H; {child} ); }}; f"), "[H]\n"),
+        // ... and unwinds with the frame: after `f` returns the name is global
+        // again, so `unset` there takes the attribute with it.
+        (format!("f() {{ local TD_SH_X; }}; f; unset TD_SH_X; TD_SH_X=H; {child}"), "[UNSET]\n"),
+    ]
+    .into_iter()
+    // A name the shell has never seen: `local` still has to record the
+    // declaration, which means creating the entry to hold it (ash's
+    // `setvar(name, NULL, VSTRFIXED)`). Kept apart because the cases above all
+    // start from an environment variable, which pre-creates it.
+    .chain({
+        let child = "\"$TD_SH_BIN\" -c 'echo [${TD_SH_Y-UNSET}]'";
+        [
+            (format!("f() {{ local TD_SH_Y; export TD_SH_Y; unset TD_SH_Y; TD_SH_Y=H; {child}; }}; f"), "[H]\n"),
+            (format!("i() {{ unset TD_SH_Y; }}; f() {{ local TD_SH_Y; export TD_SH_Y; i; TD_SH_Y=H; {child}; }}; f"), "[H]\n"),
+            // `set -a` creates the entry outright for a name the shell never had.
+            (format!("set -a; unset TD_SH_Y; set +a; TD_SH_Y=H; {child}"), "[H]\n"),
+        ]
+    }) {
         let out = std::process::Command::new(&shell)
             .arg("-c")
             .arg(&body)
             .env("TD_SH_BIN", &shell)
             .env("TD_SH_X", "G")
+            // The TD_SH_Y cases test a name the shell has never seen, so it must
+            // not arrive from whatever environment the gate itself ran in.
+            .env_remove("TD_SH_Y")
             .output()?;
         assert_eq!(String::from_utf8_lossy(&out.stdout), want, "{body}");
     }

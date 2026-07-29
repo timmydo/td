@@ -1391,16 +1391,28 @@ fn special_usage_error(sh: &mut Shell, msg: &str) -> R<()> {
 
 fn unset(sh: &mut Shell, argv: &[String]) -> R<()> {
     let mut i = 1usize;
-    // `-v` (variable) / `-f` (function); default is variable-then-function. dash's
-    // option loop keeps the LAST one given, so `-f -v` means `-v`.
+    // `nextopt("vf")`: flags may be clustered in one word, `--` ends them, and a
+    // bare `-` is an operand rather than an option. The caller loop keeps the LAST
+    // flag seen (`while ((i = nextopt("vf")) != '\0') flag = i;`), so `-fv` means
+    // `-v`. No flag at all means the variable and nothing else.
     let mut mode = None;
     while let Some(arg) = argv.get(i) {
-        match arg.as_str() {
-            "-f" => mode = Some('f'),
-            "-v" => mode = Some('v'),
-            _ => break,
+        let Some(flags) = arg.strip_prefix('-') else {
+            break;
+        };
+        if flags.is_empty() {
+            break;
         }
         i += 1;
+        if flags == "-" {
+            break;
+        }
+        for c in flags.chars() {
+            match c {
+                'f' | 'v' => mode = Some(c),
+                _ => return special_usage_error(sh, &format!("td-sh: unset: Illegal option -{c}")),
+            }
+        }
     }
     while let Some(arg) = argv.get(i) {
         i += 1;
@@ -1417,10 +1429,23 @@ fn unset(sh: &mut Shell, argv: &[String]) -> R<()> {
         if !ast::is_name(name) {
             return special_usage_error(sh, &format!("unset: {arg}: bad variable name"));
         }
-        if mode.is_none() && !sh.vars.contains_key(name) {
-            sh.funcs.remove(name);
-        }
-        if !sh.unset_var(name) {
+        // No flag means the VARIABLE and nothing else: both references gate the
+        // function on `-f` alone (`if (flag != 'f') { unsetvar(*ap); continue; }`,
+        // the same lines in ash.c:14207 and dash's var.c:595). POSIX leaves the
+        // no-variable case unspecified and bash unsets the function there; the
+        // chain does not, so neither does this.
+        //
+        // A LOCALISED name keeps its entry, exactly as a bare `local` leaves one:
+        // ash frees the `struct var` only when the flags come to exactly `VUNSET`
+        // (ash.c:2440), which `mklocal`'s `VSTRFIXED` rules out. So `local a; unset
+        // a; a=X` still exports where a global `unset a` takes the attribute away.
+        // `set -a` is the other term in that test and `unset_var` answers it.
+        let gone = if sh.is_local(name) {
+            sh.unset_value(name)
+        } else {
+            sh.unset_var(name)
+        };
+        if !gone {
             // dash unsets through setvar too, so a readonly name aborts the shell
             // rather than reporting a status.
             return special_usage_error(sh, &format!("unset: {name}: is read only"));
@@ -1525,11 +1550,16 @@ fn local(sh: &mut Shell, argv: &[String]) -> R<()> {
         // does anything: ash walks the frame and skips a name already in it. A
         // frame a terminating unwind DEFERRED counts as well -- an EXIT trap runs
         // inside the frame the shell died in, so a `local` there is a repeat.
+        // THIS frame, not `is_local`: a name an OUTER frame declared is still
+        // fresh here, and must be saved again so each return restores its own.
         let declared = |l: &Local| matches!(l, Local::Var(n, _) if n == name);
-        let fresh = !sh.locals.iter().any(declared) && !sh.pending_unwind.iter().any(declared);
+        let deferred = sh.pending_unwind.get(sh.pending_floor..).unwrap_or(&[]);
+        let fresh = !sh.locals.iter().any(declared) && !deferred.iter().any(declared);
         if fresh {
             sh.locals
                 .push(Local::Var(name.to_string(), sh.vars.get(name).cloned()));
+            // After the save, so the restore puts back the flag as it was.
+            sh.mark_local(name);
         }
         // Readonly is answered here for BOTH forms rather than left to `set_var`,
         // so each names the builtin as both references do; `set_var`'s own message
@@ -2836,6 +2866,96 @@ mod tests {
         assert_eq!(out, "[default]\n");
         let (status, out, _) = run_capturing("set -u; f() { local x; echo $x; }; f");
         assert_eq!((status, out.as_str()), (2, ""));
+    }
+
+    #[test]
+    fn unset_without_f_never_touches_a_function() {
+        // Both references gate the function on `-f` alone -- the same three lines
+        // in ash.c:14207 and dash's var.c:595. POSIX leaves the no-variable case
+        // unspecified and bash unsets the function there; the chain does not.
+        for (src, want) in [
+            ("a() { echo FUNC; }; unset a; a", "FUNC\n"),
+            ("a=v; a() { echo FUNC; }; unset a; a; echo \"[${a-U}]\"", "FUNC\n[U]\n"),
+            ("a=v; a() { echo FUNC; }; unset -v a; a; echo \"[${a-U}]\"", "FUNC\n[U]\n"),
+            // `-f` still takes it, and the LAST flag wins as the option loop keeps it.
+            ("a() { echo FUNC; }; unset -f a; a; echo done", "done\n"),
+            ("a() { echo FUNC; }; unset -v -f a; a; echo done", "done\n"),
+            ("a() { echo FUNC; }; unset -f -v a; a", "FUNC\n"),
+        ] {
+            let (_, out, err) = run_capturing(src);
+            assert_eq!(out, want, "{src}: {err}");
+        }
+    }
+
+    #[test]
+    fn unsetting_a_localised_name_keeps_its_attributes() {
+        // ash frees the `struct var` only when it has no `VSTRFIXED`
+        // (ash.c:2440), and `mklocal` sets exactly that -- so `unset` on a name the
+        // frame declared leaves the entry standing, the same state a bare `local`
+        // leaves, while `unset` on a global takes the attribute with the name.
+        // Only a child sees the difference; the in-process half is that both read
+        // as absent.
+        for (src, want) in [
+            ("a=A; f() { local a=L; unset a; echo \"[${a-U}]\"; }; f; echo \"after[$a]\"",
+             "[U]\nafter[A]\n"),
+            ("a=A; f() { local a; unset a; echo \"[${a-U}]\"; }; f; echo \"after[$a]\"",
+             "[U]\nafter[A]\n"),
+            ("export a=A; unset a; echo \"[${a-U}]\"", "[U]\n"),
+        ] {
+            let (_, out, err) = run_capturing(src);
+            assert_eq!(out, want, "{src}: {err}");
+        }
+    }
+
+    #[test]
+    fn an_inner_frame_sees_an_outer_frames_declaration() {
+        // ash keeps the answer on the variable (`VSTRFIXED`, ash.c:10020), not per
+        // frame, so a function called from one that localised the name still reads
+        // it as declared -- while `local` itself must NOT, or the inner
+        // declaration is skipped and never restored.
+        for (src, want) in [
+            // The inner `local` still shadows and still unwinds.
+            ("a=G; i() { local a=I; echo \"i=$a\"; }; o() { local a=O; i; echo \"o=$a\"; }; o; echo \"g=$a\"",
+             "i=I\no=O\ng=G\n"),
+            // The inner `unset` leaves the entry standing, so the outer frame's
+            // restore still has something to put back.
+            ("a=G; i() { unset a; }; o() { local a=O; i; echo \"o=[${a-U}]\"; }; o; echo \"g=$a\"",
+             "o=[U]\ng=G\n"),
+        ] {
+            let (_, out, err) = run_capturing(src);
+            assert_eq!(out, want, "{src}: {err}");
+        }
+    }
+
+    #[test]
+    fn a_function_called_from_an_exit_trap_gets_its_own_frame() {
+        // The trap runs inside the frame the shell died in, so a `local` at the
+        // trap's TOP level repeats that frame's declaration -- but one inside a
+        // function the trap calls is fresh, and has to unwind back to the dying
+        // frame's value rather than leak.
+        let (_, out, err) = run_capturing(
+            "trap 'g; echo after=$x' EXIT; g() { local x=I; echo in=$x; }; f() { local x=F; exit 7; }; f",
+        );
+        assert_eq!(out, "in=I\nafter=F\n", "{err}");
+    }
+
+    #[test]
+    fn unset_takes_clustered_options_and_a_double_dash() {
+        // `nextopt("vf")`: flags cluster in one word with the last winning, `--`
+        // ends them, and a bare `-` falls through to be a (bad) name.
+        for (src, want) in [
+            ("a=1; unset -- a; echo \"[${a-U}]\"", "[U]\n"),
+            ("f() { echo FUNC; }; unset -fv f; f", "FUNC\n"),
+            ("a=1; f() { echo FUNC; }; unset -vf a f; echo \"a=[$a]\"", "a=[1]\n"),
+            ("a=1; unset -v -- a; echo \"[${a-U}]\"", "[U]\n"),
+        ] {
+            let (_, out, err) = run_capturing(src);
+            assert_eq!(out, want, "{src}: {err}");
+        }
+        for bad in ["a=1; unset - a", "a=1; unset -x a", "a=1; unset -- -- a"] {
+            let (status, _, err) = run_capturing(bad);
+            assert_eq!(status, 2, "{bad}: {err}");
+        }
     }
 
     #[test]

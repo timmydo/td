@@ -46,6 +46,11 @@ pub struct Var {
     pub value: Option<String>,
     pub exported: bool,
     pub readonly: bool,
+    /// Declared by `local` in SOME live frame, not necessarily the current one:
+    /// ash sets `VSTRFIXED` on the variable rather than tracking it per frame
+    /// (ash.c:10020), so an inner function's `unset` sees an outer function's
+    /// declaration. The frame's own restore puts the flag back with the binding.
+    pub localised: bool,
 }
 
 /// A binding displaced by `local`, kept so the function's return can put it back.
@@ -131,6 +136,11 @@ pub struct Shell {
     /// still sees the frame the shell died in. Drained by `unwind_pending` at the
     /// points where the shell recovers instead.
     pub pending_unwind: Vec<Local>,
+    /// How much of `pending_unwind` belongs to a frame OUTSIDE the running call.
+    /// An EXIT trap runs inside the frame the shell died in, so a `local` at the
+    /// trap's top level repeats that frame's -- but a function the trap calls gets
+    /// a frame of its own, and must not read the dying one as already declared.
+    pub pending_floor: usize,
     pub loop_depth: u32,
     /// Runtime recursion depth (function calls + command substitution), bounded so
     /// `f() { f; }; f` and `$( $( … ) )` error instead of overflowing the stack.
@@ -200,6 +210,7 @@ impl Shell {
                     value: Some(v),
                     exported: true,
                     readonly: false,
+                    localised: false,
                 },
             );
         }
@@ -217,6 +228,7 @@ impl Shell {
             localvar_depth: 0,
             locals: Vec::new(),
             pending_unwind: Vec::new(),
+            pending_floor: 0,
             loop_depth: 0,
             run_depth: 0,
             cmdsubst_count: 0,
@@ -278,6 +290,7 @@ impl Shell {
             localvar_depth: 0,
             locals: Vec::new(),
             pending_unwind: Vec::new(),
+            pending_floor: 0,
             loop_depth: 0,
             run_depth: 0,
             cmdsubst_count: 0,
@@ -354,6 +367,7 @@ impl Shell {
                         // touches is marked for export as it is written.
                         exported: self.opts.allexport,
                         readonly: false,
+                        localised: false,
                     },
                 );
             }
@@ -371,6 +385,7 @@ impl Shell {
                     value: None,
                     exported: true,
                     readonly: false,
+                    localised: false,
                 },
             );
         }
@@ -386,6 +401,7 @@ impl Shell {
                     value: None,
                     exported: false,
                     readonly: true,
+                    localised: false,
                 },
             );
         }
@@ -401,12 +417,44 @@ impl Shell {
     }
 
     pub fn unset_var(&mut self, name: &str) -> bool {
-        match self.vars.get(name) {
-            Some(v) if v.readonly => false,
-            _ => {
-                self.unset_hook(name);
-                self.vars.remove(name);
-                true
+        if self.vars.get(name).is_some_and(|v| v.readonly) {
+            return false;
+        }
+        // Under `set -a`, `setvareq` ORs `VEXPORT` into the flags an unset writes
+        // (ash.c:2417), so the free test below it can never hold: the entry
+        // survives -- created, if the name was new -- and only the value goes.
+        if self.opts.allexport {
+            return self.unset_value(name);
+        }
+        self.unset_hook(name);
+        self.vars.remove(name);
+        true
+    }
+
+    /// Whether some live frame declared this name with `local`. Deliberately not
+    /// read off `locals`, which holds only the CURRENT frame: ash keeps the answer
+    /// on the variable, so a function called from one that localised the name sees
+    /// the declaration too.
+    pub fn is_local(&self, name: &str) -> bool {
+        self.vars.get(name).is_some_and(|v| v.localised)
+    }
+
+    /// `local NAME`'s effect on the variable itself, whatever form it took: the
+    /// entry exists and is flagged from here on, even if the name was new and has
+    /// no value yet (ash's `setvar(name, NULL, VSTRFIXED)`).
+    pub fn mark_local(&mut self, name: &str) {
+        match self.vars.get_mut(name) {
+            Some(v) => v.localised = true,
+            None => {
+                self.vars.insert(
+                    name.to_string(),
+                    Var {
+                        value: None,
+                        exported: false,
+                        readonly: false,
+                        localised: true,
+                    },
+                );
             }
         }
     }
@@ -416,10 +464,25 @@ impl Shell {
     /// still reaches a child. The `unset` builtin drops the attributes with the
     /// name; ash's `mklocal` keeps them, and this is that difference.
     pub fn unset_value(&mut self, name: &str) -> bool {
-        match self.vars.get_mut(name) {
-            Some(v) if v.readonly => return false,
-            Some(v) => v.value = None,
-            None => {}
+        if self.vars.get(name).is_some_and(|v| v.readonly) {
+            return false;
+        }
+        // The `VEXPORT` that `set -a` ORs in is written to the entry too, so an
+        // unset under it leaves the name marked for export even if it never was.
+        let allexport = self.opts.allexport;
+        if let Some(v) = self.vars.get_mut(name) {
+            v.value = None;
+            v.exported |= allexport;
+        } else if allexport {
+            self.vars.insert(
+                name.to_string(),
+                Var {
+                    value: None,
+                    exported: true,
+                    readonly: false,
+                    localised: false,
+                },
+            );
         }
         self.unset_hook(name);
         true
@@ -1177,6 +1240,9 @@ fn call_function(
     // at 10446), so a `local` of the same name in the body sees it already
     // declared and leaves it alone. Being the oldest entries, they unwind last.
     let saved_locals = std::mem::take(&mut sh.locals);
+    // The callee's frame starts empty in BOTH halves: what a dying outer frame
+    // deferred is not something this call has declared.
+    let saved_floor = std::mem::replace(&mut sh.pending_floor, sh.pending_unwind.len());
     let applied = (|| -> R<()> {
         for a in assigns {
             let value = expand::expand_assign(sh, &a.value)?;
@@ -1194,6 +1260,7 @@ fn call_function(
             pop_locals(sh);
         }
         sh.locals = saved_locals;
+        sh.pending_floor = saved_floor;
         return Err(sig);
     }
     let new_params = argv.get(1..).unwrap_or(&[]).to_vec();
@@ -1230,6 +1297,7 @@ fn call_function(
         pop_locals(sh);
     }
     sh.locals = saved_locals;
+    sh.pending_floor = saved_floor;
     sh.params = saved_params;
     sh.loop_depth = saved_loop_depth;
     match result {

@@ -443,6 +443,7 @@ pub fn fork_shell(sh: &Shell) -> Shell {
         // is a REPEAT. Restoring these only ever touches the clone's own map.
         locals: sh.locals.clone(),
         pending_unwind: Vec::new(),
+        pending_floor: 0,
         loop_depth: 0,
         run_depth: sh.run_depth,
         cmdsubst_count: sh.cmdsubst_count,
