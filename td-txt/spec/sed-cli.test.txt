@@ -3442,6 +3442,152 @@ sed: couldn't open file /nosuchdir/out: No such file or directory
 ## stderr-json: "sed: couldn't open file /nodirA/out: No such file or directory\n"
 ## status: 4
 
+#### W opens its target at parse time the same way
+## argv: sed -n -e '2W out'
+## stdin-json: "x\n"
+## stdout-json: ""
+## file-after-json out: ""
+## stderr-json: ""
+## status: 0
+
+#### and a w inside a block whose address never matches still creates it
+## argv: sed -n -e '/zzz/{w out' -e '}'
+## stdin-json: "x\n"
+## stdout-json: ""
+## file-after-json out: ""
+## stderr-json: ""
+## status: 0
+
+#### an unopenable s///w target is exit 4 like the command's own
+## argv: sed -n -e 's/a/b/w /nosuchdir/o'
+## stdin-json: "x\n"
+## stdout-json: ""
+## stderr-json: "sed: couldn't open file /nosuchdir/o: No such file or directory\n"
+## status: 4
+
+#### and it is opened BEFORE the pattern is compiled, so it beats a bad regex
+## argv: sed -n -e 's/\(/b/w /nosuchdir/o'
+## stdin-json: "a\n"
+## stdout-json: ""
+## stderr-json: "sed: couldn't open file /nosuchdir/o: No such file or directory\n"
+## status: 4
+
+#### an openable one is therefore created before that same regex is refused
+## argv: sed -n -e 's/\(/b/w out'
+## stdin-json: "a\n"
+## stdout-json: ""
+## file-after-json out: ""
+## stderr-contains: Unmatched ( or \(
+## status: 1
+
+#### and before a backreference the replacement cannot have
+## argv: sed -n -e 's/a/\2/w out'
+## stdin-json: "a\n"
+## stdout-json: ""
+## file-after-json out: ""
+## stderr-contains: invalid reference \2
+## status: 1
+
+#### --sandbox refuses the w FLAG before it even reads the filename
+## argv: sed --sandbox -n -e 's/a/b/w'
+## stdin-json: "a\n"
+## stdout-json: ""
+## stderr-contains: sandbox
+## status: 1
+
+#### labels resolve after the parse, so a w BEFORE an unresolvable one still wins
+## argv: sed -n -e 'b nope' -e 'w /nosuchdir/o'
+## stdin-json: "x\n"
+## stdout-json: ""
+## stderr-json: "sed: couldn't open file /nosuchdir/o: No such file or directory\n"
+## status: 4
+
+#### and an openable one is created before that label is even looked up
+## argv: sed -n -e 'b nope' -e 'w out'
+## stdin-json: "x\n"
+## stdout-json: ""
+## file-after-json out: ""
+## stderr-contains: label
+## status: 4
+
+#### an unopenable w is reported before an operand that cannot be read
+## argv: sed -n -e 'w /nosuchdir/o' /nosuchfile
+## stdout-json: ""
+## stderr-json: "sed: couldn't open file /nosuchdir/o: No such file or directory\n"
+## status: 4
+
+
+# `--sandbox` refuses the command that names a file at the point the parse reaches
+# it -- BEFORE the target is opened, so nothing is created, and in script order, so
+# it outranks a later error and loses to an earlier one.
+
+#### --sandbox refuses the w before opening it, so no file is created
+## argv: sed --sandbox -n -e 'w out'
+## stdin-json: "x\n"
+## stdout-json: ""
+## no-file-after: out
+## stderr-contains: sandbox
+## status: 1
+
+#### and it outranks a LATER script error, where the open would have preceded it
+## argv: sed --sandbox -n -e 'w out' -e ZZ
+## stdin-json: "x\n"
+## stdout-json: ""
+## no-file-after: out
+## stderr-contains: sandbox
+## status: 1
+
+#### while an EARLIER one outranks the refusal
+## argv: sed --sandbox -n -e ZZ -e 'w out'
+## stdin-json: "x\n"
+## stdout-json: ""
+## no-file-after: out
+## stderr-contains: unknown command: `Z'
+## status: 1
+
+#### without --sandbox that same script creates the file before failing
+## argv: sed -n -e 'w out' -e ZZ
+## stdin-json: "x\n"
+## stdout-json: ""
+## file-after-json out: ""
+## stderr-contains: unknown command: `Z'
+## status: 1
+
+# GNU's `w` output is stdio-BUFFERED, so an `r` of the same file in the same run
+# reads what has been flushed rather than what has been written. Recorded as a gap
+# rather than matched: the answer is a function of how many bytes have piled up,
+# not a rule -- see ../spec/README.
+
+#### GNU's own r cannot see what its w has written, because the write is buffered
+## argv: sed -n -e 'w out' -e 'r out'
+## stdin-json: "x\n"
+## stdout-json: ""
+## file-after-json out: "x\n"
+## stderr-json: ""
+## status: 0
+
+# GNU compiles each `-e` as it SCANS the options, so a flag that follows one is
+# not in effect for it -- `--sandbox` after a `w` does not refuse it, and the file
+# is written. td-txt joins the parts and compiles once, after every option is
+# known. Pre-existing, and a separate axis; see ../spec/README.
+
+#### a --sandbox that FOLLOWS the w it would refuse comes too late in GNU
+## argv: sed -n -e 'w out' --sandbox
+## stdin-json: "a\n"
+## stdout-json: ""
+## file-after-json out: "a\n"
+## stderr-json: ""
+## status: 0
+
+#### and a w naming the -f script truncates it before GNU reads it
+## argv: sed -n -e 'w s.sed' -f s.sed
+## file-json s.sed: "p\n"
+## stdin-json: "a\n"
+## stdout-json: ""
+## file-after-json s.sed: "a\n"
+## stderr-json: ""
+## status: 0
+
 
 # Long-line cases for the SPAN-consuming callers. Searching every end for POSIX
 # leftmost-longest can exhaust the step budget on a line of a thousand-odd bytes

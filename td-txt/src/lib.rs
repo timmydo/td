@@ -40,6 +40,7 @@
 //!   ## file f.txt:  …  ## END an input file to materialize in the case dir
 //!   ## file-json f.txt: "a\0"     that file's exact bytes (NUL, no newline, …)
 //!   ## file-after f.txt: … ## END   that file's REQUIRED content afterwards
+//!   ## no-file-after: f.txt   that file must NOT exist afterwards
 //!   #  (single hash)          a comment
 //! ```
 //!
@@ -102,6 +103,10 @@ pub struct Expect {
     pub stderr: Option<Stream>,
     /// Files whose content is checked after the run (`sed -i`, `s///w`).
     pub files_after: Vec<(String, Vec<u8>)>,
+    /// Files that must NOT exist after the run. The complement of `files_after`,
+    /// and not reachable through it: a `w` target GNU refuses to open differs from
+    /// one it opens and never writes to only by whether the file is THERE.
+    pub no_files_after: Vec<String>,
 }
 
 /// One executable conformance case, normalized from whichever corpus format it
@@ -372,6 +377,7 @@ fn apply_annotation(
         "stderr" => case.expect.stderr = Some(Stream::Exact(value)),
         "stderr-json" => case.expect.stderr = Some(Stream::Exact(json_decode(&text(), line)?)),
         "stderr-contains" => case.expect.stderr = Some(Stream::Contains(text().into_bytes())),
+        "no-file-after" => case.expect.no_files_after.push(text()),
         "status" => {
             let n = text()
                 .parse::<i32>()
@@ -774,6 +780,11 @@ pub fn run_case(bin: &Path, case: &Case) -> Result<CaseOutcome, Box<dyn std::err
             Err(e) => problems.push(format!("file {name}: unreadable after the run ({e})")),
         }
     }
+    for name in &case.expect.no_files_after {
+        if cwd.join(name).symlink_metadata().is_ok() {
+            problems.push(format!("file {name}: exists after the run, and must not"));
+        }
+    }
     if timed_out {
         problems.insert(0, format!("timed out after {}s", CASE_TIMEOUT.as_secs()));
     }
@@ -800,6 +811,7 @@ impl Expect {
             || self.stdout.is_some()
             || self.stderr.is_some()
             || !self.files_after.is_empty()
+            || !self.no_files_after.is_empty()
     }
 }
 
@@ -1028,6 +1040,17 @@ b
         let second = cases.get(1).unwrap();
         assert_eq!(second.files, vec![("f.txt".to_string(), b"a\n".to_vec())]);
         assert_eq!(second.expect.files_after, vec![("f.txt".to_string(), b"b\n".to_vec())]);
+    }
+
+    #[test]
+    fn no_file_after_names_a_file_and_is_an_assertion_on_its_own() {
+        let text = "#### x\n## argv: sed --sandbox 'w out'\n## no-file-after: out\n";
+        let cases = parse_cases(text, "s.test.txt").unwrap();
+        let case = cases.first().unwrap();
+        assert_eq!(case.expect.no_files_after, vec!["out".to_string()]);
+        // Without this the case would be rejected for asserting nothing, and the
+        // one property it exists to check would never be looked at.
+        assert!(case.expect.asserts_something());
     }
 
     #[test]

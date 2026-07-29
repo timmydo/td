@@ -44,12 +44,9 @@ xfail grep-cli.test.txt::as it is after a literal brace
 xfail sed-cli.test.txt::without -s a failure on the FIRST operand outranks the quit code too
 xfail sed-cli.test.txt::and q5 reports it rather than 5
 xfail sed-cli.test.txt::q stops before a later operand is opened, so it is never reported
-xfail sed-cli.test.txt::a w whose address is never taken still creates its file
-xfail sed-cli.test.txt::and truncates one that was already there
-xfail sed-cli.test.txt::a w file is created even when no cycle runs at all
-xfail sed-cli.test.txt::the s///w flag creates its file the same way
-xfail sed-cli.test.txt::a w target that will not open is exit 4 even behind a Q
-xfail sed-cli.test.txt::a w target that will not open outranks a LATER script error
+xfail sed-cli.test.txt::GNU's own r cannot see what its w has written, because the write is buffered
+xfail sed-cli.test.txt::a --sandbox that FOLLOWS the w it would refuse comes too late in GNU
+xfail sed-cli.test.txt::and a w naming the -f script truncates it before GNU reads it
 xfail sed-cli.test.txt::F names the file GNU's $ lookahead has already opened
 xfail sed-cli.test.txt::\c at the end of a text controls the text's own terminator
 xfail sed-cli.test.txt::a dollar before a bare pipe is not the literal it looks like

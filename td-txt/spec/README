@@ -254,6 +254,42 @@ td-txt-authored case files
   - And `w /dev/stdout` still means the real standard output under `-i`, where the
     auto-print stream is the replacement buffer.
 
+  WHEN those targets are opened is a separate question from how many there are, and
+  the answer is that COMPILING the script opens them: GNU opens a `w` target while
+  it parses the command that names it, not on first write. So the file exists and
+  has been truncated even though no write ever reaches it -- `sed -n '2w out'` over
+  one line leaves an empty `out` -- and a target that will not open is exit 4 from a
+  command no cycle runs, reported bare because the script was well formed and the
+  filesystem refused. The `s///w` FLAG goes the same way and is the sharper case,
+  because the open happens AT THE FLAG -- before the pattern is compiled and before
+  the replacement's backreferences are checked, both of which GNU does at the end of
+  the `s`. So an unopenable target beats a bad regex in the same command (`s/\(/b/w
+  /nodir/o` is exit 4, not `Unmatched (`), and an openable one is created before that
+  regex is refused. It is also what a parser-shape generator keeps rediscovering: a
+  `w` filename runs to end of line, so any generator that puts a `/` after one hands
+  sed a path whose directory does not exist. Only the `w` family; `r`/`R` are opened
+  when they RUN, and a target that never opens is not an error at all.
+
+  Position in the script is therefore what orders that failure against everything
+  else, and it is the whole of the rule. A script error LATER loses to it and an
+  EARLIER one wins (`-e 'w /nodir/f' -e '{'` is exit 4, `-e ZZ -e 'w /nodir/f'` is
+  exit 1); the first of two unopenable targets is the one reported; an operand that
+  cannot be read is never even opened. Labels are the case that looks like an
+  exception and is not: they resolve only after the WHOLE parse, so a `w` failure
+  beats an unresolvable label in EITHER order, and an openable one is created before
+  the label is looked up. `--sandbox` is the other way round -- it refuses the
+  command at the point the parse reaches it, BEFORE the open, so nothing is created,
+  and in script order too, which is how `--sandbox -e 'w out' -e ZZ` reports the
+  sandbox refusal while the same script without the flag creates `out` and reports
+  the `ZZ`. The two device names are not files and nothing is created for either.
+
+  The consequence for td-txt is that its PARSER can fail with a status other than 1.
+  Compiling a script now touches the filesystem, so `parse_script` returns the same
+  two-bucket error the runtime does: a malformed script is exit 1 behind an `-e
+  expression #N' prefix, a refusal by the filesystem is a bare exit 4. Opening after
+  the parse finished would be simpler and is wrong -- it cannot lose to an earlier
+  script error, because by then there are no earlier errors left.
+
   What ends a command's ARGUMENT is the same question one step in, and the answer is
   not "the end of the command" for any of the three arguments that look like text. A
   LABEL (`:`, `b`, `t`, `T`) ends at a BLANK as much as at `;`, `}`, `#` or a newline,
@@ -470,17 +506,45 @@ td-txt-authored case files
     effect when it is allowed -- neither of which td-txt has anywhere to put until
     the mode exists.
 
-  - GNU opens a `w` target while it PARSES the command, not on first write. So the
-    file is created (and an existing one truncated) even if no write ever reaches
-    it, an unopenable target is exit 4 from a command no cycle runs, and it
-    outranks a script error LATER in the script while an EARLIER one outranks it
-    (`sed -n -e 'w /nodir/f' -e '{'` is exit 4; `-e ZZ -e 'w /nodir/f'` is exit 1).
-    That last ordering is the constraint: it means opening after the parse finishes
-    is not a fix, and td-txt's parser cannot currently fail with any status but 1.
-    It covers the `s///w` FLAG by the same route, which is the thing a
-    parser-shape generator keeps rediscovering: a `w` filename runs to the
-    end of the line, so any generator that puts a `/` after one hands GNU a path
-    whose directory does not exist and gets exit 4 from a command no cycle runs.
+  - WHEN a script part is compiled relative to the OPTIONS around it. GNU compiles
+    each `-e` and `-f` as it scans the command line, so a flag that follows one is
+    not in effect for it and a failure inside one outranks anything a later option
+    hits. td-txt collects the parts and compiles once, after every option is known.
+    Invisible until `w` targets started opening at compile time, and now not:
+    `sed -n -e 'w out' --sandbox` writes the file and exits 0 in GNU because sandbox
+    mode was not set when that `-e` compiled, where td-txt refuses it; `-e 'w
+    /nodir/o' --badopt` is GNU's exit 4 and td-txt's exit 1; and `-e 'w out' -f
+    /nosuch` creates `out` in GNU before failing on the script file. The same rule
+    scopes `-E`, which is why `sed -e 's/a+/X/p' -E` does not apply the flag to that
+    expression. Two sharper witnesses than any of those: `-e 'w /nodir/o' -f
+    /nosuch` is exit 4 in BOTH, naming a different file in each, which is the
+    status-identical message-divergent pair this corpus normally pins; and where a
+    `w` target names the `-f` SCRIPT, `sed -n -e 'w s.sed' -f s.sed` truncates the
+    script before reading it, so GNU runs an empty program and prints nothing while
+    td-txt reads the `p` and prints -- the axis reaches STDOUT, not just files,
+    which the other witnesses make it easy to assume otherwise. Two xfail cases,
+    that one and the `--sandbox` one. Pre-existing -- the parent commit's binary
+    answers identically -- and closing it means compiling per part rather than per
+    run, which changes what every mode flag applies to and so is its own increment,
+    not a corner of this one.
+
+  - `R /dev/stdout` and `R /dev/stderr` HANG when the named stream is a pipe, where
+    GNU is `read error on stdout: Bad file descriptor` and exit 4; with that stream
+    on a regular file td-txt exits 0 and GNU still exits 4. A hang rather than a
+    wrong answer, so it is recorded here even though no case can carry it -- the
+    corpus would only see its 10s timeout. Pre-existing and a different axis (`r`/`R`
+    open when they RUN, which is why the `w` work above does not touch it); a
+    reviewer's cross-product found it here.
+
+  - An `r` of the file a `w` in the SAME run is writing. GNU's `w` output is
+    stdio-buffered, so `sed -n -e 'w out' -e 'r out'` appends nothing while td-txt,
+    which writes through, appends the line it just wrote. It is not a rule and
+    cannot be made into one: raise the volume past the buffer and GNU's `r` starts
+    seeing the bytes, so the answer is a function of how many have piled up. Found
+    by differential fuzzing the `w` axis, pre-existing (the parent commit's binary
+    answers the same), and one xfail case carries the minimal witness. Matching it
+    means reproducing stdio's buffer size, which is a worse thing to depend on than
+    the divergence.
 
   - GNU opens each operand only when it reaches it, so a `q` early in the script
     means a later unreadable operand is never opened and never reported. td-txt's

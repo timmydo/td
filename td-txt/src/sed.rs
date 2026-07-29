@@ -145,6 +145,10 @@ struct Script {
     cmds: Vec<Cmd>,
     regexes: Vec<Regex>,
     labels: BTreeMap<Vec<u8>, usize>,
+    /// The `w` targets, ALREADY OPEN: GNU opens one while it parses the command
+    /// that names it, so compiling a script is what creates and truncates them.
+    /// Keyed by filename because GNU keeps one output per name, not per command.
+    wfiles: BTreeMap<Vec<u8>, WFile>,
 }
 
 /// GNU's tri-state. `Closed` is not `Inactive`: a range whose start address is a
@@ -168,6 +172,10 @@ struct ScriptParser<'a> {
     ere: bool,
     /// `--posix`. Reaches the regex compiler for one rule; see `Options::posix`.
     posix: bool,
+    /// `--sandbox`. Read at the `r`/`R`/`w`/`W` commands and the `s///w` flag, and
+    /// checked BEFORE the target is opened, because refusing the command is GNU's
+    /// answer whether or not the file could have been opened.
+    sandbox: bool,
     /// `-z`. Only the `M` flag reads it: see `Options::reg_newline`.
     null_data: bool,
     /// Offsets of the newlines that JOIN `-e`/`-f` parts. GNU ends a script part
@@ -177,6 +185,7 @@ struct ScriptParser<'a> {
     /// boundary because the backslash asked to. See `parse_text`.
     part_ends: Vec<usize>,
     regexes: Vec<Regex>,
+    wfiles: BTreeMap<Vec<u8>, WFile>,
 }
 
 impl ScriptParser<'_> {
@@ -539,12 +548,61 @@ impl ScriptParser<'_> {
         Ok(name)
     }
 
-    fn parse_subst(&mut self) -> Result<Subst, String> {
+    /// `--sandbox` refuses the command that names a file, at the point the parse
+    /// reaches it — so it outranks a LATER script error and loses to an EARLIER
+    /// one, and the target is never opened. Exit 1: the script is what is wrong.
+    ///
+    /// GNU bans `e` here too. td-txt refuses `e` and the `s///e` flag outright, so
+    /// the ban has nothing left to catch — but the DIAGNOSTIC differs under the
+    /// flag, GNU naming sandbox mode where td-txt names the unsupported command.
+    fn deny_in_sandbox(&self) -> Result<(), Fatal> {
+        if self.sandbox {
+            return Err(Fatal {
+                msg: "e/r/w commands disabled in sandbox mode".to_string(),
+                status: 1,
+            });
+        }
+        Ok(())
+    }
+
+    /// Open a `w` target, which GNU does WHILE PARSING the command that names it.
+    /// So the file exists and is truncated even if no cycle ever writes to it, and
+    /// one that will not open is exit 4 from a command that never runs. Position in
+    /// the script is therefore what orders this failure against a script error:
+    /// everything parsed before it has already had its say.
+    ///
+    /// The two device names are not files and GNU creates nothing for them; they
+    /// are registered here anyway so the write path never has to open anything.
+    fn open_wfile(&mut self, path: &[u8]) -> Result<(), Fatal> {
+        if self.wfiles.contains_key(path) {
+            return Ok(());
+        }
+        let dest = match path {
+            b"/dev/stdout" => WDest::Stdout,
+            b"/dev/stderr" => WDest::Stderr,
+            _ => WDest::File(
+                std::fs::File::create(crate::util::path_from_bytes(path)).map_err(|e| {
+                    Fatal::runtime(format!(
+                        "couldn't open file {}: {}",
+                        show(path),
+                        errmsg(&e)
+                    ))
+                })?,
+            ),
+        };
+        self.wfiles.insert(path.to_vec(), WFile { dest, owed: false });
+        Ok(())
+    }
+
+    /// Returns `Fatal` because the `w` FLAG opens its target here, mid-command:
+    /// GNU reaches that flag before it compiles the pattern, so an unopenable
+    /// target beats a bad regex or a bad backreference in the same `s`.
+    fn parse_subst(&mut self) -> Result<Subst, Fatal> {
         let delim = self.bump().ok_or_else(|| "unterminated `s' command".to_string())?;
         // A backslash CAN delimit (`s\a\b\` is `s/a/b/`); a newline cannot, and
         // GNU says so before reading anything else.
         if delim == b'\n' {
-            return Err("unterminated `s' command".to_string());
+            return Err("unterminated `s' command".to_string().into());
         }
         let pattern = self.read_delimited(delim, "unterminated `s' command")?;
         let raw_repl = self.read_replacement(delim, "unterminated `s' command")?;
@@ -560,14 +618,14 @@ impl ScriptParser<'_> {
                 // `i`/`I`/`m`/`M` are the ones it lets you say twice.
                 Some(b'g') => {
                     if global {
-                        return Err("multiple `g' options to `s' command".to_string());
+                        return Err("multiple `g' options to `s' command".to_string().into());
                     }
                     global = true;
                     self.pos += 1;
                 }
                 Some(b'p') => {
                     if print {
-                        return Err("multiple `p' options to `s' command".to_string());
+                        return Err("multiple `p' options to `s' command".to_string().into());
                     }
                     print = true;
                     self.pos += 1;
@@ -580,19 +638,22 @@ impl ScriptParser<'_> {
                     multiline = true;
                     self.pos += 1;
                 }
-                Some(b'e') => return Err("the `e' flag is not supported".to_string()),
+                Some(b'e') => return Err("the `e' flag is not supported".to_string().into()),
                 Some(b'w') => {
                     self.pos += 1;
-                    wfile = Some(self.parse_filename()?);
+                    self.deny_in_sandbox()?;
+                    let name = self.parse_filename()?;
+                    self.open_wfile(&name)?;
+                    wfile = Some(name);
                     break;
                 }
                 Some(b) if b.is_ascii_digit() => {
                     if occurrence != 0 {
-                        return Err("multiple number options to `s' command".to_string());
+                        return Err("multiple number options to `s' command".to_string().into());
                     }
                     occurrence = self.parse_number().unwrap_or(0);
                     if occurrence == 0 {
-                        return Err("number option to `s' command may not be zero".to_string());
+                        return Err("number option to `s' command may not be zero".to_string().into());
                     }
                 }
                 // A blank SEPARATES flags rather than ending them (`s/a/b/ g p` is
@@ -601,7 +662,7 @@ impl ScriptParser<'_> {
                 // to `s'` in GNU, not a substitution followed by an exchange.
                 Some(b' ' | b'\t') => self.pos += 1,
                 None | Some(b'\n' | b';' | b'}' | b'#') => break,
-                Some(_) => return Err("unknown option to `s'".to_string()),
+                Some(_) => return Err("unknown option to `s'".to_string().into()),
             }
         }
         let re = self.add_regex(&pattern, icase, multiline)?;
@@ -612,7 +673,7 @@ impl ScriptParser<'_> {
         if let Some(groups) = re.and_then(|i| self.regexes.get(i)).map(Regex::group_count) {
             if let Some(n) = max_group(&replacement) {
                 if n > groups {
-                    return Err(format!("invalid reference \\{n} on `s' command's RHS"));
+                    return Err(format!("invalid reference \\{n} on `s' command's RHS").into());
                 }
             }
         }
@@ -913,16 +974,29 @@ fn separator_for(null_data: bool) -> u8 {
     }
 }
 
-/// Parse a whole script: a flat command list, its regex table, and its labels.
+/// Parse a whole script: a flat command list, its regex table, its labels, and the
+/// `w` targets opened along the way. Returns `Fatal` rather than a bare message
+/// because opening those targets means a PARSE can now fail the way the filesystem
+/// does — exit 4, reported bare — and not only the way a bad script does.
 fn parse_script(
     src: &[u8],
     ere: bool,
     null_data: bool,
     part_ends: Vec<usize>,
     posix: bool,
-) -> Result<Script, String> {
-    let mut p =
-        ScriptParser { src, pos: 0, ere, posix, null_data, part_ends, regexes: Vec::new() };
+    sandbox: bool,
+) -> Result<Script, Fatal> {
+    let mut p = ScriptParser {
+        src,
+        pos: 0,
+        ere,
+        posix,
+        sandbox,
+        null_data,
+        part_ends,
+        regexes: Vec::new(),
+        wfiles: BTreeMap::new(),
+    };
     let mut cmds: Vec<Cmd> = Vec::new();
     let mut labels: BTreeMap<Vec<u8>, usize> = BTreeMap::new();
     let mut open_blocks: Vec<usize> = Vec::new();
@@ -933,7 +1007,7 @@ fn parse_script(
         }
         let addr = p.parse_addr()?;
         let Some(c) = p.bump() else {
-            return Err("missing command".to_string());
+            return Err("missing command".to_string().into());
         };
         let kind = match c {
             b'{' => {
@@ -942,7 +1016,7 @@ fn parse_script(
             }
             b'}' => {
                 let Some(open) = open_blocks.pop() else {
-                    return Err("unexpected `}'".to_string());
+                    return Err("unexpected `}'".to_string().into());
                 };
                 let after = cmds.len() + 1;
                 if let Some(cmd) = cmds.get_mut(open) {
@@ -965,11 +1039,11 @@ fn parse_script(
                 // The only two address restrictions GNU enforces at compile
                 // time: `:` takes none, `q`/`Q` take one.
                 if addr.a1.is_some() {
-                    return Err(": doesn't want any addresses".to_string());
+                    return Err(": doesn't want any addresses".to_string().into());
                 }
                 let name = p.parse_label();
                 if name.is_empty() {
-                    return Err("\":\" lacks a label".to_string());
+                    return Err("\":\" lacks a label".to_string().into());
                 }
                 labels.insert(name, cmds.len());
                 Kind::Label
@@ -991,16 +1065,29 @@ fn parse_script(
             b'P' => Kind::PrintFirstLine,
             b'q' | b'Q' => {
                 if addr.is_range() {
-                    return Err("command only uses one address".to_string());
+                    return Err("command only uses one address".to_string().into());
                 }
                 p.skip_blank();
                 let code = i32::try_from(p.parse_number().unwrap_or(0)).unwrap_or(0);
                 Kind::Quit(code, c == b'q')
             }
-            b'r' => Kind::ReadFile(p.parse_filename()?),
-            b'R' => Kind::ReadLine(p.parse_filename()?),
-            b'w' => Kind::Write(p.parse_filename()?),
-            b'W' => Kind::WriteFirstLine(p.parse_filename()?),
+            b'r' | b'R' => {
+                p.deny_in_sandbox()?;
+                let name = p.parse_filename()?;
+                match c {
+                    b'r' => Kind::ReadFile(name),
+                    _ => Kind::ReadLine(name),
+                }
+            }
+            b'w' | b'W' => {
+                p.deny_in_sandbox()?;
+                let name = p.parse_filename()?;
+                p.open_wfile(&name)?;
+                match c {
+                    b'w' => Kind::Write(name),
+                    _ => Kind::WriteFirstLine(name),
+                }
+            }
             b's' => Kind::Subst(p.parse_subst()?),
             b'y' => Kind::Transliterate(p.parse_transliterate()?),
             b'z' => Kind::Zap,
@@ -1012,12 +1099,12 @@ fn parse_script(
                 // td-txt compares against the GNU level it implements: comparing
                 // against its OWN 0.1.0 would refuse `v 4.2`, which real scripts use.
                 if version_is_newer(&p.parse_label()) {
-                    return Err("expected newer version of sed".to_string());
+                    return Err("expected newer version of sed".to_string().into());
                 }
                 Kind::Comment
             }
-            b'e' => return Err("the `e' command is not supported".to_string()),
-            other => return Err(format!("unknown command: `{}'", char::from(other))),
+            b'e' => return Err("the `e' command is not supported".to_string().into()),
+            other => return Err(format!("unknown command: `{}'", char::from(other)).into()),
         };
         // The commands NOT listed here have already consumed everything that could
         // need separating, each in its own way: a filename, `a`/`i`/`c` text and a
@@ -1046,9 +1133,9 @@ fn parse_script(
         cmds.push(Cmd { addr, kind });
     }
     if !open_blocks.is_empty() {
-        return Err("unmatched `{'".to_string());
+        return Err("unmatched `{'".to_string().into());
     }
-    Ok(Script { cmds, regexes: p.regexes, labels })
+    Ok(Script { cmds, regexes: p.regexes, labels, wfiles: p.wfiles })
 }
 
 /// Turn every branch's label name into a command index. Done after the whole
@@ -1258,11 +1345,13 @@ impl<'a> Sink<'a> {
 /// separator debt, so `printf x | sed -n -e 'w f' -e 'w f'` writes `x\nx` while the
 /// last write stays bare. `/dev/stderr` is an ordinary target to GNU too: raw
 /// bytes, no forced newline, its own debt.
+#[derive(Debug)]
 struct WFile {
     dest: WDest,
     owed: bool,
 }
 
+#[derive(Debug)]
 enum WDest {
     File(std::fs::File),
     Stderr,
@@ -1643,10 +1732,12 @@ impl From<String> for Fatal {
 const NO_PREVIOUS_REGEX: &str = "no previous regular expression";
 
 impl Fatal {
-    /// A failure surfaced while RUNNING the script — a `w` file that will not open,
-    /// a write that fails. Exit 4, and no `-e expression #N' prefix: the script
-    /// compiled, the filesystem refused. `From<String>` stamps 1 for the COMPILE
-    /// errors `parse_script` raises, so every runtime `String` has to come through
+    /// A failure the FILESYSTEM raised rather than the script — a `w` file that will
+    /// not open, a write that fails. Exit 4, and no `-e expression #N' prefix: the
+    /// script was well formed and something outside it refused. Most of these
+    /// happen while running, but a `w` target opens during the PARSE, so this is
+    /// reachable from there too. `From<String>` stamps 1 for the malformed-script
+    /// errors `parse_script` raises, so every such `String` has to come through
     /// here or it lands in the wrong bucket wearing the wrong prefix.
     fn runtime(msg: String) -> Self {
         let status = if msg == NO_PREVIOUS_REGEX { 1 } else { 4 };
@@ -1693,31 +1784,10 @@ fn compile_script(
     part_ends: Vec<usize>,
     posix: bool,
 ) -> Result<Script, Fatal> {
-    let mut script = parse_script(src, ere, null_data, part_ends, posix)?;
-    if sandbox {
-        check_sandbox(&script.cmds)?;
-    }
+    let mut script = parse_script(src, ere, null_data, part_ends, posix, sandbox)?;
     let labels = std::mem::take(&mut script.labels);
     resolve_labels(&mut script.cmds, &labels).map_err(|msg| Fatal { msg, status: 4 })?;
     Ok(script)
-}
-
-/// `--sandbox` forbids every command that reads, writes, or executes outside the
-/// stream. `e` is rejected by the parser regardless, so it cannot appear here.
-fn check_sandbox(cmds: &[Cmd]) -> Result<(), Fatal> {
-    let banned = cmds.iter().any(|c| {
-        matches!(
-            c.kind,
-            Kind::ReadFile(_) | Kind::ReadLine(_) | Kind::Write(_) | Kind::WriteFirstLine(_)
-        ) || matches!(&c.kind, Kind::Subst(s) if s.wfile.is_some())
-    });
-    if banned {
-        return Err(Fatal {
-            msg: "e/r/w commands disabled in sandbox mode".to_string(),
-            status: 1,
-        });
-    }
-    Ok(())
 }
 
 /// Every long option sed knows, so an unambiguous PREFIX resolves the way GNU's
@@ -1977,9 +2047,11 @@ fn run(args: &[Vec<u8>]) -> Result<i32, Fatal> {
         conf.suppress = true;
     }
 
-    let script = compile_script(&source, conf.ere, conf.sandbox, conf.null_data, part_ends, conf.posix)?;
+    let mut script =
+        compile_script(&source, conf.ere, conf.sandbox, conf.null_data, part_ends, conf.posix)?;
     let separator = separator_for(conf.null_data);
     let seed = seed_ranges(&script.cmds);
+    let wfiles = std::mem::take(&mut script.wfiles);
     let mut sed = Sed {
         script,
         ranges: seed,
@@ -1996,7 +2068,7 @@ fn run(args: &[Vec<u8>]) -> Result<i32, Fatal> {
         replaced: false,
         quit: None,
         last_regex: None,
-        wfiles: BTreeMap::new(),
+        wfiles,
         rfiles: BTreeMap::new(),
         file_name: b"-".to_vec(),
     };
@@ -2440,19 +2512,11 @@ impl Sed {
             return sink.write_line_on(Chan::WFile, bytes, terminated);
         }
         let separator = self.separator;
-        if !self.wfiles.contains_key(path) {
-            let dest = if path == b"/dev/stdout" {
-                WDest::Stdout
-            } else if path == b"/dev/stderr" {
-                WDest::Stderr
-            } else {
-                WDest::File(std::fs::File::create(crate::util::path_from_bytes(path))
-                    .map_err(|e| format!("couldn't open file {}: {}", show(path), errmsg(&e)))?)
-            };
-            self.wfiles.insert(path.to_vec(), WFile { dest, owed: false });
-        }
+        // Every target was opened by the parser, so a miss is a command whose name
+        // never reached `open_wfile` — not a filesystem failure, and saying so
+        // would send the reader to the one place that is working.
         let Some(w) = self.wfiles.get_mut(path) else {
-            return Err(format!("couldn't open file {}", show(path)));
+            return Err(format!("no output was opened for {}", show(path)));
         };
         w.write_line(bytes, terminated, separator)
     }
@@ -2811,9 +2875,11 @@ mod tests {
         let ere = opts.contains(&"-E") || opts.contains(&"-r");
         let null_data = opts.contains(&"-z");
         let sep = separator_for(null_data);
-        let script = compile_script(script.as_bytes(), ere, false, null_data, Vec::new(), false).unwrap();
+        let mut script =
+            compile_script(script.as_bytes(), ere, false, null_data, Vec::new(), false).unwrap();
         let nranges = script.cmds.len();
         let seed = seed_ranges(&script.cmds);
+        let wfiles = std::mem::take(&mut script.wfiles);
         let mut sed = Sed {
             script,
             ranges: seed,
@@ -2830,7 +2896,7 @@ mod tests {
             replaced: false,
             quit: None,
             last_regex: None,
-            wfiles: BTreeMap::new(),
+            wfiles,
             rfiles: BTreeMap::new(),
             file_name: b"-".to_vec(),
         };
