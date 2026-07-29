@@ -128,6 +128,12 @@ clips rows and columns to the output before visiting pixels. These are
 availability bounds against a same-user client, not isolation between
 mutually distrusting users.
 
+These ceilings do not yet bound time. A connected client that stops reading
+events can block its worker on a socket write and retain one client slot. This
+first profile accepts that availability gap. A future write deadline must be
+an explicit, injectable connection policy with deterministic tests that do not
+wait for elapsed wall time.
+
 ## 4. Unsafe confinement
 
 Wayland carries wl_shm descriptors as SCM_RIGHTS ancillary data on its Unix
@@ -186,7 +192,38 @@ The landing must prove:
   the compositor and client run as uid 1000;
 - existing serial boot checks remain green.
 
-## 7. Deferred UI stack
+## 7. Testability contract for the tiling increment
+
+The next policy layer will be a keyboard-driven tiling shell. Outputs will own
+workspaces, workspaces will own split-container trees, and leaf containers will
+own mapped XDG toplevels. Layout, focus, move, split, fullscreen, and workspace
+operations must be deterministic state transitions over ordinary Rust data.
+They must not read devices, sockets, clocks, or global process state. Geometry
+calculation and hit testing will consume explicit output dimensions and return
+values that tests can inspect without a framebuffer.
+
+Linux evdev readers and Wayland connections will remain adapters around that
+state machine. Parsed input events, generated serials, and elapsed time must
+cross those adapters as explicit values. Tests use file-backed framebuffers,
+byte-backed evdev records, Unix socket pairs, and injected serials or
+deadlines. A concurrency test synchronizes the state it needs with messages or
+socket events; elapsed sleeps and scheduler luck are not correctness
+conditions.
+
+Connection teardown is the existing example: the read side preserves a peer
+reset as a distinct result while an orderly close remains a zero-length read.
+Event writes record disconnected client state, and the dispatch loop consumes
+all three outcomes without depending on which side of a socket race wins.
+
+Every layout operation must have table-driven model tests covering focus,
+geometry, tree collapse, and conservation of mapped views. Protocol tests then
+prove that the relevant Wayland request or input event produces that model
+transition and the expected configure or input events. Target selftests cover
+the packaged binary and QEMU covers only the final device, service, and boot
+seams. This keeps most policy failures reproducible as fast host tests while
+retaining an end-to-end proof of the shipped image.
+
+## 8. Deferred UI stack
 
 The next increments may add client input, a bitmap font and launcher,
 clipboard, a terminal, hotplug, and real DRM/KMS profiles. General Wayland

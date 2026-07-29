@@ -1,3 +1,4 @@
+use std::fmt;
 use std::fs::File;
 use std::io;
 use std::io::Write;
@@ -12,6 +13,10 @@ const SCM_RIGHTS: i32 = 1;
 const MSG_CTRUNC: i32 = 0x08;
 const MSG_CMSG_CLOEXEC: i32 = 0x4000_0000;
 const ERRNO_EINTR: isize = -4;
+#[cfg(test)]
+const ERRNO_ECONNABORTED: isize = -103;
+#[cfg(test)]
+const ERRNO_ECONNRESET: isize = -104;
 const CMSG_HEADER: usize = 16;
 const CMSG_ALIGN: usize = 8;
 const CONTROL_CAPACITY: usize = 1024;
@@ -33,16 +38,21 @@ struct MsgHdr {
     flags: i32,
 }
 
-fn errno_result(value: isize, operation: &str) -> Result<usize, String> {
-    if value < 0 {
+fn raw_errno(value: isize) -> Option<io::Error> {
+    if value >= 0 {
+        None
+    } else {
         let raw = value
             .checked_neg()
             .and_then(|number| i32::try_from(number).ok())
             .unwrap_or(i32::MAX);
-        return Err(format!(
-            "{operation}: {}",
-            io::Error::from_raw_os_error(raw)
-        ));
+        Some(io::Error::from_raw_os_error(raw))
+    }
+}
+
+fn errno_result(value: isize, operation: &str) -> Result<usize, String> {
+    if let Some(error) = raw_errno(value) {
+        return Err(format!("{operation}: {error}"));
     }
     usize::try_from(value).map_err(|_| format!("{operation}: invalid result {value}"))
 }
@@ -221,9 +231,42 @@ pub struct Received {
     pub fds: Vec<RawFd>,
 }
 
-pub fn recv_with_fds(stream: &UnixStream, bytes: &mut [u8]) -> Result<Received, String> {
+#[derive(Debug, Eq, PartialEq)]
+pub enum ReceiveError {
+    Disconnected,
+    Failure(String),
+}
+
+impl fmt::Display for ReceiveError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ReceiveError::Disconnected => formatter.write_str("recvmsg: Wayland peer disconnected"),
+            ReceiveError::Failure(error) => formatter.write_str(error),
+        }
+    }
+}
+
+pub fn write_peer_disconnected(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::BrokenPipe | io::ErrorKind::ConnectionReset
+    )
+}
+
+fn receive_result(value: isize) -> Result<usize, ReceiveError> {
+    if let Some(error) = raw_errno(value) {
+        if error.kind() == io::ErrorKind::ConnectionReset {
+            return Err(ReceiveError::Disconnected);
+        }
+        return Err(ReceiveError::Failure(format!("recvmsg: {error}")));
+    }
+    usize::try_from(value)
+        .map_err(|_| ReceiveError::Failure(format!("recvmsg: invalid result {value}")))
+}
+
+pub fn recv_with_fds(stream: &UnixStream, bytes: &mut [u8]) -> Result<Received, ReceiveError> {
     if bytes.is_empty() {
-        return Err("recv buffer is empty".into());
+        return Err(ReceiveError::Failure("recv buffer is empty".into()));
     }
     let mut control = [0u8; CONTROL_CAPACITY];
     let mut iov = IoVec {
@@ -247,18 +290,20 @@ pub fn recv_with_fds(stream: &UnixStream, bytes: &mut [u8]) -> Result<Received, 
             MSG_CMSG_CLOEXEC as usize,
         );
         if result != ERRNO_EINTR {
-            break errno_result(result, "recvmsg")?;
+            break receive_result(result)?;
         }
     };
     let control_len = message.control_len.min(control.len());
-    let fds = parse_fds(
-        control
-            .get(..control_len)
-            .ok_or_else(|| "kernel returned invalid ancillary length".to_string())?,
-    )?;
+    let fds =
+        parse_fds(control.get(..control_len).ok_or_else(|| {
+            ReceiveError::Failure("kernel returned invalid ancillary length".into())
+        })?)
+        .map_err(ReceiveError::Failure)?;
     if message.flags & MSG_CTRUNC != 0 {
         close_all(&fds);
-        return Err("ancillary descriptor data was truncated".into());
+        return Err(ReceiveError::Failure(
+            "ancillary descriptor data was truncated".into(),
+        ));
     }
     Ok(Received { count, fds })
 }
@@ -377,5 +422,32 @@ mod tests {
         duplicate.read_to_end(&mut content).unwrap();
         assert_eq!(content, b"pixels");
         fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn write_peer_departure_error_kinds_are_explicit() {
+        for kind in [io::ErrorKind::BrokenPipe, io::ErrorKind::ConnectionReset] {
+            assert!(write_peer_disconnected(&io::Error::from(kind)), "{kind:?}");
+        }
+        for kind in [
+            io::ErrorKind::ConnectionAborted,
+            io::ErrorKind::NotConnected,
+            io::ErrorKind::PermissionDenied,
+            io::ErrorKind::UnexpectedEof,
+        ] {
+            assert!(!write_peer_disconnected(&io::Error::from(kind)), "{kind:?}");
+        }
+    }
+
+    #[test]
+    fn recvmsg_connection_reset_is_a_typed_disconnect() {
+        assert_eq!(
+            receive_result(ERRNO_ECONNRESET),
+            Err(ReceiveError::Disconnected)
+        );
+        assert!(matches!(
+            receive_result(ERRNO_ECONNABORTED),
+            Err(ReceiveError::Failure(_))
+        ));
     }
 }

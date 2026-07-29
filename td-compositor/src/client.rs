@@ -596,7 +596,7 @@ pub fn selftest() -> Result<(), String> {
     let file = backing_file(&std::env::temp_dir(), first)?;
     sys::send_with_fd(&sender, b"demo", file.as_raw_fd())?;
     let mut bytes = [0u8; 16];
-    let received = sys::recv_with_fds(&receiver, &mut bytes)?;
+    let received = sys::recv_with_fds(&receiver, &mut bytes).map_err(|error| error.to_string())?;
     if received.count != 4 || bytes.get(..4) != Some(b"demo") || received.fds.len() != 1 {
         sys::discard_received(&received.fds);
         return Err("demo descriptor transport did not preserve its message".into());

@@ -88,6 +88,7 @@ enum Object {
 struct Client {
     id: u64,
     stream: UnixStream,
+    disconnected: bool,
     objects: BTreeMap<u32, Object>,
     runtime: Arc<Mutex<Runtime>>,
     mapped_bytes: BTreeMap<u32, usize>,
@@ -158,6 +159,7 @@ impl Client {
         Client {
             id,
             stream,
+            disconnected: false,
             objects,
             runtime,
             mapped_bytes: BTreeMap::new(),
@@ -180,9 +182,17 @@ impl Client {
 
     fn send(&mut self, object: u32, opcode: u16, builder: wire::Builder) -> Result<(), String> {
         let message = builder.message(object, opcode)?;
-        self.stream
-            .write_all(&message)
-            .map_err(|e| format!("write Wayland event: {e}"))
+        if self.disconnected {
+            return Ok(());
+        }
+        match self.stream.write_all(&message) {
+            Ok(()) => Ok(()),
+            Err(error) if sys::write_peer_disconnected(&error) => {
+                self.disconnected = true;
+                Ok(())
+            }
+            Err(error) => Err(format!("write Wayland event: {error}")),
+        }
     }
 
     fn delete_id(&mut self, id: u32) -> Result<(), String> {
@@ -989,26 +999,47 @@ impl Client {
     }
 }
 
+#[derive(Debug, Eq, PartialEq)]
+enum DispatchOutcome {
+    NeedInput,
+    Disconnected,
+}
+
+fn dispatch_buffered(
+    client: &mut Client,
+    bytes: &mut Vec<u8>,
+    fds: &mut VecDeque<RawFd>,
+) -> Result<DispatchOutcome, String> {
+    loop {
+        let message = match wire::take(bytes) {
+            Ok(Some(message)) => message,
+            Ok(None) => return Ok(DispatchOutcome::NeedInput),
+            Err(error) => {
+                client.protocol_error(1, &error);
+                return Err(error);
+            }
+        };
+        let object = message.object;
+        if let Err(error) = client.dispatch(message, fds) {
+            client.protocol_error(object, &error);
+            return Err(error);
+        }
+        if client.disconnected {
+            return Ok(DispatchOutcome::Disconnected);
+        }
+    }
+}
+
 fn serve_client(stream: UnixStream, id: u64, runtime: Arc<Mutex<Runtime>>) -> Result<(), String> {
     let mut client = Client::new(id, stream, Arc::clone(&runtime));
     let mut bytes = Vec::with_capacity(64 * 1024);
     let mut incoming = [0u8; 64 * 1024];
     let mut fds: VecDeque<RawFd> = VecDeque::new();
-    let outcome = 'connection: loop {
-        loop {
-            let message = match wire::take(&mut bytes) {
-                Ok(Some(message)) => message,
-                Ok(None) => break,
-                Err(error) => {
-                    client.protocol_error(1, &error);
-                    break 'connection Err(error);
-                }
-            };
-            let object = message.object;
-            if let Err(error) = client.dispatch(message, &mut fds) {
-                client.protocol_error(object, &error);
-                break 'connection Err(error);
-            }
+    let outcome = loop {
+        match dispatch_buffered(&mut client, &mut bytes, &mut fds) {
+            Ok(DispatchOutcome::NeedInput) => {}
+            Ok(DispatchOutcome::Disconnected) => break Ok(()),
+            Err(error) => break Err(error),
         }
         if bytes.len() > MAX_CLIENT_BUFFER {
             break Err(format!(
@@ -1017,7 +1048,8 @@ fn serve_client(stream: UnixStream, id: u64, runtime: Arc<Mutex<Runtime>>) -> Re
         }
         let received = match sys::recv_with_fds(&client.stream, &mut incoming) {
             Ok(value) => value,
-            Err(error) => break Err(error),
+            Err(sys::ReceiveError::Disconnected) => break Ok(()),
+            Err(sys::ReceiveError::Failure(error)) => break Err(error),
         };
         if received.count == 0 {
             break Ok(());
@@ -1252,6 +1284,121 @@ mod tests {
 
         drop(connected);
         worker.join().unwrap().unwrap();
+        fs::remove_file(framebuffer_path).unwrap();
+    }
+
+    #[test]
+    fn event_write_after_peer_departure_is_clean_disconnect() {
+        let framebuffer_path = std::env::temp_dir().join(format!(
+            "td-wayland-disconnect-{}-{}",
+            std::process::id(),
+            TEST_SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let framebuffer = Framebuffer::test_file(&framebuffer_path, 4, 4, 16).unwrap();
+        let runtime = Arc::new(Mutex::new(Runtime::new(framebuffer)));
+        let (server, peer) = UnixStream::pair().unwrap();
+        let mut client = Client::new(1, server, runtime);
+        drop(peer);
+
+        let mut first = wire::Builder::new();
+        first.u32(2);
+        client.send(1, 1, first).unwrap();
+        assert!(client.disconnected);
+        let mut second = wire::Builder::new();
+        second.u32(3);
+        client.send(1, 1, second).unwrap();
+        assert!(client.send(0, 1, wire::Builder::new()).is_err());
+
+        fs::remove_file(framebuffer_path).unwrap();
+    }
+
+    #[test]
+    fn disconnected_client_suppresses_later_writes() {
+        let framebuffer_path = std::env::temp_dir().join(format!(
+            "td-wayland-suppress-write-{}-{}",
+            std::process::id(),
+            TEST_SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let framebuffer = Framebuffer::test_file(&framebuffer_path, 4, 4, 16).unwrap();
+        let runtime = Arc::new(Mutex::new(Runtime::new(framebuffer)));
+        let (server, mut peer) = UnixStream::pair().unwrap();
+        peer.set_nonblocking(true).unwrap();
+        let mut client = Client::new(1, server, runtime);
+        client.disconnected = true;
+        let mut event = wire::Builder::new();
+        event.u32(2);
+
+        client.send(1, 1, event).unwrap();
+
+        let mut received = [0u8; 16];
+        let error = peer.read(&mut received).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
+        fs::remove_file(framebuffer_path).unwrap();
+    }
+
+    #[test]
+    fn unread_event_makes_peer_reset_a_clean_server_exit() {
+        let framebuffer_path = std::env::temp_dir().join(format!(
+            "td-wayland-recv-reset-{}-{}",
+            std::process::id(),
+            TEST_SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let framebuffer = Framebuffer::test_file(&framebuffer_path, 4, 4, 16).unwrap();
+        let runtime = Arc::new(Mutex::new(Runtime::new(framebuffer)));
+        let (mut server, peer) = UnixStream::pair().unwrap();
+        server.write_all(b"unread event").unwrap();
+        drop(peer);
+
+        serve_client(server, 1, runtime).unwrap();
+
+        fs::remove_file(framebuffer_path).unwrap();
+    }
+
+    #[test]
+    fn queued_request_stops_dispatch_when_its_reply_finds_closed_peer() {
+        let framebuffer_path = std::env::temp_dir().join(format!(
+            "td-wayland-dispatch-disconnect-{}-{}",
+            std::process::id(),
+            TEST_SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let framebuffer = Framebuffer::test_file(&framebuffer_path, 4, 4, 16).unwrap();
+        let runtime = Arc::new(Mutex::new(Runtime::new(framebuffer)));
+        let (server, peer) = UnixStream::pair().unwrap();
+        let mut client = Client::new(1, server, runtime);
+        let mut get_registry = wire::Builder::new();
+        get_registry.u32(2);
+        let mut bytes = get_registry.message(1, 1).unwrap();
+        let mut fds = VecDeque::new();
+        drop(peer);
+
+        assert_eq!(
+            dispatch_buffered(&mut client, &mut bytes, &mut fds).unwrap(),
+            DispatchOutcome::Disconnected
+        );
+        assert!(bytes.is_empty());
+        assert!(client.disconnected);
+
+        fs::remove_file(framebuffer_path).unwrap();
+    }
+
+    #[test]
+    fn queued_request_with_closed_peer_makes_clean_server_exit() {
+        let framebuffer_path = std::env::temp_dir().join(format!(
+            "td-wayland-server-disconnect-{}-{}",
+            std::process::id(),
+            TEST_SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let framebuffer = Framebuffer::test_file(&framebuffer_path, 4, 4, 16).unwrap();
+        let runtime = Arc::new(Mutex::new(Runtime::new(framebuffer)));
+        let (server, mut peer) = UnixStream::pair().unwrap();
+        let mut get_registry = wire::Builder::new();
+        get_registry.u32(2);
+        peer.write_all(&get_registry.message(1, 1).unwrap())
+            .unwrap();
+        drop(peer);
+
+        serve_client(server, 1, runtime).unwrap();
+
         fs::remove_file(framebuffer_path).unwrap();
     }
 
