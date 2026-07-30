@@ -14,12 +14,17 @@ const MSG_CTRUNC: i32 = 0x08;
 const MSG_CMSG_CLOEXEC: i32 = 0x4000_0000;
 const ERRNO_EINTR: isize = -4;
 #[cfg(test)]
+const ERRNO_EBADF: isize = -9;
+#[cfg(test)]
 const ERRNO_ECONNABORTED: isize = -103;
 #[cfg(test)]
 const ERRNO_ECONNRESET: isize = -104;
 const CMSG_HEADER: usize = 16;
 const CMSG_ALIGN: usize = 8;
 const CONTROL_CAPACITY: usize = 1024;
+
+#[repr(align(8))]
+struct ControlBuffer<const N: usize>([u8; N]);
 
 #[repr(C)]
 struct IoVec {
@@ -253,6 +258,19 @@ pub fn write_peer_disconnected(error: &io::Error) -> bool {
     )
 }
 
+fn sendmsg_result(value: isize) -> io::Result<Option<usize>> {
+    if let Some(error) = raw_errno(value) {
+        return if error.kind() == io::ErrorKind::Interrupted {
+            Ok(None)
+        } else {
+            Err(error)
+        };
+    }
+    usize::try_from(value)
+        .map(Some)
+        .map_err(|_| io::Error::other(format!("sendmsg returned invalid result {value}")))
+}
+
 fn receive_result(value: isize) -> Result<usize, ReceiveError> {
     if let Some(error) = raw_errno(value) {
         if error.kind() == io::ErrorKind::ConnectionReset {
@@ -268,7 +286,7 @@ pub fn recv_with_fds(stream: &UnixStream, bytes: &mut [u8]) -> Result<Received, 
     if bytes.is_empty() {
         return Err(ReceiveError::Failure("recv buffer is empty".into()));
     }
-    let mut control = [0u8; CONTROL_CAPACITY];
+    let mut control = ControlBuffer([0u8; CONTROL_CAPACITY]);
     let mut iov = IoVec {
         base: bytes.as_mut_ptr(),
         len: bytes.len(),
@@ -278,8 +296,8 @@ pub fn recv_with_fds(stream: &UnixStream, bytes: &mut [u8]) -> Result<Received, 
         name_len: 0,
         iov: &mut iov,
         iov_len: 1,
-        control: control.as_mut_ptr(),
-        control_len: control.len(),
+        control: control.0.as_mut_ptr(),
+        control_len: control.0.len(),
         flags: 0,
     };
     let count = loop {
@@ -293,9 +311,9 @@ pub fn recv_with_fds(stream: &UnixStream, bytes: &mut [u8]) -> Result<Received, 
             break receive_result(result)?;
         }
     };
-    let control_len = message.control_len.min(control.len());
+    let control_len = message.control_len.min(control.0.len());
     let fds =
-        parse_fds(control.get(..control_len).ok_or_else(|| {
+        parse_fds(control.0.get(..control_len).ok_or_else(|| {
             ReceiveError::Failure("kernel returned invalid ancillary length".into())
         })?)
         .map_err(ReceiveError::Failure)?;
@@ -308,31 +326,41 @@ pub fn recv_with_fds(stream: &UnixStream, bytes: &mut [u8]) -> Result<Received, 
     Ok(Received { count, fds })
 }
 
-pub fn send_with_fd(stream: &UnixStream, bytes: &[u8], fd: RawFd) -> Result<(), String> {
+pub fn send_with_fd(stream: &UnixStream, bytes: &[u8], fd: RawFd) -> io::Result<()> {
     if bytes.is_empty() {
-        return Err("refusing descriptor-only Wayland message".into());
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "refusing descriptor-only Wayland message",
+        ));
     }
     if fd < 0 {
-        return Err(format!("refusing to send invalid descriptor {fd}"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("refusing to send invalid descriptor {fd}"),
+        ));
     }
-    let mut control = [0u8; 24];
+    let mut control = ControlBuffer([0u8; 24]);
     let cmsg_len = 20usize;
     let len_bytes = cmsg_len.to_ne_bytes();
     control
+        .0
         .get_mut(..8)
-        .ok_or_else(|| "control header is too small".to_string())?
+        .ok_or_else(|| io::Error::other("control header is too small"))?
         .copy_from_slice(&len_bytes);
     control
+        .0
         .get_mut(8..12)
-        .ok_or_else(|| "control header is too small".to_string())?
+        .ok_or_else(|| io::Error::other("control header is too small"))?
         .copy_from_slice(&SOL_SOCKET.to_ne_bytes());
     control
+        .0
         .get_mut(12..16)
-        .ok_or_else(|| "control header is too small".to_string())?
+        .ok_or_else(|| io::Error::other("control header is too small"))?
         .copy_from_slice(&SCM_RIGHTS.to_ne_bytes());
     control
+        .0
         .get_mut(16..20)
-        .ok_or_else(|| "control data is too small".to_string())?
+        .ok_or_else(|| io::Error::other("control data is too small"))?
         .copy_from_slice(&fd.to_ne_bytes());
 
     let mut iov = IoVec {
@@ -344,30 +372,32 @@ pub fn send_with_fd(stream: &UnixStream, bytes: &[u8], fd: RawFd) -> Result<(), 
         name_len: 0,
         iov: &mut iov,
         iov_len: 1,
-        control: control.as_mut_ptr(),
-        control_len: control.len(),
+        control: control.0.as_mut_ptr(),
+        control_len: control.0.len(),
         flags: 0,
     };
-    let sent = errno_result(
-        syscall3(
+    let sent = loop {
+        let result = syscall3(
             SYS_SENDMSG,
             stream.as_raw_fd() as usize,
             (&message as *const MsgHdr) as usize,
             0,
-        ),
-        "sendmsg",
-    )?;
+        );
+        if let Some(sent) = sendmsg_result(result)? {
+            break sent;
+        }
+    };
     if sent == 0 || sent > bytes.len() {
-        return Err(format!("sendmsg returned invalid byte count {sent}"));
+        return Err(io::Error::other(format!(
+            "sendmsg returned invalid byte count {sent}"
+        )));
     }
     if sent < bytes.len() {
         let tail = bytes
             .get(sent..)
-            .ok_or_else(|| "sendmsg byte count escaped message".to_string())?;
+            .ok_or_else(|| io::Error::other("sendmsg byte count escaped message"))?;
         let mut borrowed = stream;
-        borrowed
-            .write_all(tail)
-            .map_err(|e| format!("write Wayland message tail: {e}"))?;
+        borrowed.write_all(tail)?;
     }
     Ok(())
 }
@@ -437,6 +467,19 @@ mod tests {
         ] {
             assert!(!write_peer_disconnected(&io::Error::from(kind)), "{kind:?}");
         }
+    }
+
+    #[test]
+    fn interrupted_sendmsg_is_retried_but_other_errors_are_not() {
+        assert_eq!(sendmsg_result(ERRNO_EINTR).unwrap(), None);
+        assert!(sendmsg_result(ERRNO_EBADF).is_err());
+        assert_eq!(sendmsg_result(7).unwrap(), Some(7));
+    }
+
+    #[test]
+    fn ancillary_buffers_are_aligned_for_message_headers() {
+        let control = ControlBuffer([0u8; 24]);
+        assert_eq!((control.0.as_ptr() as usize) % CMSG_ALIGN, 0);
     }
 
     #[test]

@@ -111,6 +111,10 @@ impl Scene {
         self.layout.views(width, height, GAP)
     }
 
+    pub fn focused(&self) -> Option<SurfaceKey> {
+        self.layout.focused()
+    }
+
     #[cfg(test)]
     pub fn surface_size(&self, key: SurfaceKey) -> Option<(usize, usize)> {
         self.surfaces

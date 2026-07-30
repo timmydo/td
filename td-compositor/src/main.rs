@@ -4,6 +4,7 @@ mod client;
 mod configure;
 mod framebuffer;
 mod input;
+mod keyboard;
 mod layout;
 mod runtime;
 mod scene;
@@ -220,6 +221,7 @@ mod confinement {
         ("configure.rs", include_str!("configure.rs")),
         ("framebuffer.rs", include_str!("framebuffer.rs")),
         ("input.rs", include_str!("input.rs")),
+        ("keyboard.rs", include_str!("keyboard.rs")),
         ("layout.rs", include_str!("layout.rs")),
         ("runtime.rs", include_str!("runtime.rs")),
         ("scene.rs", include_str!("scene.rs")),
@@ -230,6 +232,27 @@ mod confinement {
 
     fn occurrences(source: &str, needle: &str) -> usize {
         source.match_indices(needle).count()
+    }
+
+    #[test]
+    fn confinement_inventory_covers_every_module() {
+        let mut declared: Vec<&str> = MAIN
+            .lines()
+            .filter_map(|line| {
+                line.strip_prefix("pub ")
+                    .unwrap_or(line)
+                    .strip_prefix("mod ")?
+                    .strip_suffix(';')
+            })
+            .collect();
+        let mut inventoried: Vec<&str> = OTHER
+            .iter()
+            .filter_map(|(name, _)| name.strip_suffix(".rs"))
+            .chain(std::iter::once("sys"))
+            .collect();
+        declared.sort_unstable();
+        inventoried.sort_unstable();
+        assert_eq!(inventoried, declared);
     }
 
     #[test]

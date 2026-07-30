@@ -175,6 +175,7 @@ impl Connection {
     ) -> Result<(), String> {
         let bytes = builder.message(object, opcode)?;
         sys::send_with_fd(&self.stream, &bytes, file.as_raw_fd())
+            .map_err(|e| format!("send Wayland request descriptor: {e}"))
     }
 
     fn next(&mut self) -> Result<wire::Message, String> {
@@ -937,7 +938,8 @@ pub fn selftest() -> Result<(), String> {
     let (sender, receiver) =
         UnixStream::pair().map_err(|e| format!("create descriptor test socket: {e}"))?;
     let file = backing_file(&std::env::temp_dir(), first)?;
-    sys::send_with_fd(&sender, b"demo", file.as_raw_fd())?;
+    sys::send_with_fd(&sender, b"demo", file.as_raw_fd())
+        .map_err(|e| format!("send descriptor self-test: {e}"))?;
     let mut bytes = [0u8; 16];
     let received = sys::recv_with_fds(&receiver, &mut bytes).map_err(|error| error.to_string())?;
     if received.count != 4 || bytes.get(..4) != Some(b"demo") || received.fds.len() != 1 {

@@ -408,8 +408,8 @@ td's Rust is defensive and minimal-surface.
   `td-compositor/src/sys.rs` carries `recvmsg(2)` for wl_shm SCM_RIGHTS reception,
   `close(2)` for the received descriptor after safe duplication through
   `/proc/self/fd/N`, and `sendmsg(2)` for the td-native demo client's wl_shm pool
-  descriptor (also driven by the transport selftest). Stable Rust exposes no stable
-  ancillary-data API. Deliberately NOT in
+  descriptor, the server's wl_keyboard keymap descriptor, and the transport
+  selftest. Stable Rust exposes no stable ancillary-data API. Deliberately NOT in
   that surface: framebuffer and evdev I/O (ordinary files), Unix socket setup and
   byte I/O (`std`), mmap (wl_shm pixels are copied with `FileExt`), or device
   ownership (safe `td-seatd`). `td-compositor/DESIGN.md` is the normative UI-stack

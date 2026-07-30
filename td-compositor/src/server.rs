@@ -1,17 +1,20 @@
 use crate::configure::{Configure, ConfigureTracker, ToplevelState, ViewStatus};
+use crate::keyboard::{KeyboardEvent, KeyboardSnapshot, XKB_KEYMAP};
 use crate::layout::ViewLayout;
-use crate::runtime::{Runtime, SubscriptionStop};
+use crate::runtime::{KeyboardDelivery, KeyboardSubscriptionStop, Runtime, SubscriptionStop};
 use crate::scene::{Surface, SurfaceKey, SHM_ARGB8888, SHM_XRGB8888};
 use crate::{socket, sys, wire, MAX_UI_DIMENSION, MAX_UI_FRAME_BYTES};
 use std::collections::{BTreeMap, VecDeque};
-use std::fs::{self, File, Permissions};
+use std::fs::{self, File, OpenOptions, Permissions};
 use std::io::Write;
 use std::net::Shutdown;
-use std::os::fd::RawFd;
-use std::os::unix::fs::{FileExt, PermissionsExt};
+use std::os::fd::{AsRawFd, RawFd};
+use std::os::unix::fs::{FileExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+#[cfg(test)]
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -20,6 +23,9 @@ const GLOBAL_COMPOSITOR: u32 = 1;
 const GLOBAL_SHM: u32 = 2;
 const GLOBAL_OUTPUT: u32 = 3;
 const GLOBAL_XDG_WM_BASE: u32 = 4;
+const GLOBAL_SEAT: u32 = 5;
+const WL_DISPLAY_ERROR_IMPLEMENTATION: u32 = 3;
+const WL_SEAT_ERROR_MISSING_CAPABILITY: u32 = 0;
 const MAX_POOL_BYTES: usize = 64 * 1024 * 1024;
 const MAX_CLIENT_BUFFER: usize = 256 * 1024;
 const MAX_PENDING_FDS: usize = 64;
@@ -29,6 +35,7 @@ const MAX_CLIENTS: usize = 32;
 static NEXT_CLIENT: AtomicU64 = AtomicU64::new(1);
 static NEXT_SERIAL: AtomicU64 = AtomicU64::new(1);
 static NEXT_BUFFER_SERIAL: AtomicU64 = AtomicU64::new(1);
+static NEXT_KEYMAP_FILE: AtomicU64 = AtomicU64::new(1);
 static ACTIVE_CLIENTS: AtomicUsize = AtomicUsize::new(0);
 
 #[derive(Clone)]
@@ -75,6 +82,12 @@ enum Object {
     Output {
         version: u32,
     },
+    Seat {
+        version: u32,
+    },
+    Keyboard {
+        version: u32,
+    },
     XdgWmBase,
     XdgSurface {
         surface: u32,
@@ -91,6 +104,20 @@ struct ConfigureRegistration {
     xdg_surface: u32,
     toplevel: u32,
     tracker: Arc<Mutex<ConfigureTracker>>,
+}
+
+#[derive(Clone, Copy)]
+struct KeyboardRegistration {
+    after_revision: u64,
+}
+
+type DeleteReservation = Arc<Mutex<()>>;
+type PendingDeletes = Arc<Mutex<BTreeMap<u32, DeleteReservation>>>;
+
+#[derive(Clone)]
+struct KeymapFile {
+    file: Arc<File>,
+    size: u32,
 }
 
 struct Outbound {
@@ -113,6 +140,20 @@ impl Outbound {
         }
     }
 
+    fn send_with_fd(&mut self, message: &[u8], fd: RawFd) -> Result<(), String> {
+        if self.disconnected {
+            return Ok(());
+        }
+        match sys::send_with_fd(&self.stream, message, fd) {
+            Ok(()) => Ok(()),
+            Err(error) if sys::write_peer_disconnected(&error) => {
+                self.disconnected = true;
+                Ok(())
+            }
+            Err(error) => Err(format!("send Wayland descriptor event: {error}")),
+        }
+    }
+
     fn disconnect(&mut self) {
         self.disconnected = true;
         let _ = self.stream.shutdown(Shutdown::Both);
@@ -124,8 +165,13 @@ struct Client {
     stream: UnixStream,
     outbound: Arc<Mutex<Outbound>>,
     configurations: Arc<Mutex<BTreeMap<SurfaceKey, ConfigureRegistration>>>,
+    keyboards: Arc<Mutex<BTreeMap<u32, KeyboardRegistration>>>,
+    keyboard_active: Arc<AtomicBool>,
+    pending_deletes: PendingDeletes,
     objects: BTreeMap<u32, Object>,
     runtime: Arc<Mutex<Runtime>>,
+    keymap: KeymapFile,
+    protocol_error_code: u32,
     mapped_bytes: BTreeMap<u32, usize>,
     mapped_total: usize,
 }
@@ -288,6 +334,259 @@ fn configure_worker(
     Ok(())
 }
 
+fn keymap_file(directory: &Path) -> Result<KeymapFile, String> {
+    let mut bytes = Vec::with_capacity(XKB_KEYMAP.len().saturating_add(1));
+    bytes.extend_from_slice(XKB_KEYMAP.as_bytes());
+    bytes.push(0);
+    let size = u32::try_from(bytes.len()).map_err(|_| "XKB keymap exceeds u32".to_string())?;
+    for _ in 0..32 {
+        let sequence = NEXT_KEYMAP_FILE.fetch_add(1, Ordering::Relaxed);
+        let path = directory.join(format!(".td-keymap-{}-{sequence}", std::process::id()));
+        let file = match OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)
+        {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(format!("create XKB keymap {}: {error}", path.display())),
+        };
+        let read_only = (|| {
+            // Restore owner access that an unusual umask may remove.
+            file.set_permissions(Permissions::from_mode(0o600))
+                .map_err(|e| format!("chmod XKB keymap {}: {e}", path.display()))?;
+            file.write_all_at(&bytes, 0)
+                .map_err(|e| format!("write XKB keymap: {e}"))?;
+            File::open(format!("/proc/self/fd/{}", file.as_raw_fd()))
+                .map_err(|e| format!("reopen XKB keymap read-only: {e}"))
+        })();
+        let unlink = fs::remove_file(&path)
+            .map_err(|e| format!("unlink XKB keymap {}: {e}", path.display()));
+        return match (read_only, unlink) {
+            (Ok(read_only), Ok(())) => Ok(KeymapFile {
+                file: Arc::new(read_only),
+                size,
+            }),
+            (Err(error), Ok(())) => Err(error),
+            (Ok(_), Err(error)) => Err(error),
+            (Err(error), Err(unlink_error)) => Err(format!("{error}; {unlink_error}")),
+        };
+    }
+    Err("could not reserve a unique XKB keymap file".into())
+}
+
+fn keyboard_message(object: u32, serial: u32, event: &KeyboardEvent) -> Result<Vec<u8>, String> {
+    let (opcode, builder) = match event {
+        KeyboardEvent::Enter { surface, keys } => {
+            let mut bytes = Vec::with_capacity(keys.len().saturating_mul(4));
+            for key in keys {
+                bytes.extend_from_slice(&key.to_ne_bytes());
+            }
+            let mut builder = wire::Builder::new();
+            builder.u32(serial);
+            builder.u32(surface.object);
+            builder.array(&bytes)?;
+            (1, builder)
+        }
+        KeyboardEvent::Leave { surface } => {
+            let mut builder = wire::Builder::new();
+            builder.u32(serial);
+            builder.u32(surface.object);
+            (2, builder)
+        }
+        KeyboardEvent::Key { input, .. } => {
+            let mut builder = wire::Builder::new();
+            builder.u32(serial);
+            builder.u32(input.time);
+            builder.u32(input.key);
+            builder.u32(input.state.wire());
+            (3, builder)
+        }
+        KeyboardEvent::Modifiers { state, .. } => {
+            let mut builder = wire::Builder::new();
+            builder.u32(serial);
+            builder.u32(state.depressed);
+            builder.u32(state.latched);
+            builder.u32(state.locked);
+            builder.u32(state.group);
+            (4, builder)
+        }
+    };
+    builder.message(object, opcode)
+}
+
+fn send_keyboard_event(
+    outbound: &Arc<Mutex<Outbound>>,
+    object: u32,
+    serial: u32,
+    event: &KeyboardEvent,
+) -> Result<(), String> {
+    let message = keyboard_message(object, serial, event)?;
+    outbound
+        .lock()
+        .map_err(|_| "Wayland outbound lock poisoned".to_string())?
+        .send(&message)
+}
+
+fn send_keyboard_initial(
+    outbound: &Arc<Mutex<Outbound>>,
+    object: u32,
+    version: u32,
+    client: u64,
+    snapshot: &KeyboardSnapshot,
+    file: &File,
+    size: u32,
+) -> Result<(), String> {
+    let mut keymap = wire::Builder::new();
+    keymap.u32(1);
+    keymap.u32(size);
+    let keymap = keymap.message(object, 0)?;
+    let mut outbound = outbound
+        .lock()
+        .map_err(|_| "Wayland outbound lock poisoned".to_string())?;
+    outbound.send_with_fd(&keymap, file.as_raw_fd())?;
+    if version >= 4 {
+        let mut repeat = wire::Builder::new();
+        repeat.i32(25);
+        repeat.i32(600);
+        outbound.send(&repeat.message(object, 5)?)?;
+    }
+    if let Some(surface) = snapshot.focus.filter(|surface| surface.client == client) {
+        outbound.send(&keyboard_message(
+            object,
+            next_serial(),
+            &KeyboardEvent::Enter {
+                surface,
+                keys: snapshot.keys.clone(),
+            },
+        )?)?;
+        outbound.send(&keyboard_message(
+            object,
+            next_serial(),
+            &KeyboardEvent::Modifiers {
+                surface,
+                state: snapshot.modifiers,
+            },
+        )?)?;
+    }
+    Ok(())
+}
+
+fn send_reserved_delete_id(
+    outbound: &Arc<Mutex<Outbound>>,
+    pending_deletes: &PendingDeletes,
+    id: u32,
+) -> Result<(), String> {
+    let reservation = pending_deletes
+        .lock()
+        .map_err(|_| "pending object deletion lock poisoned".to_string())?
+        .get(&id)
+        .cloned()
+        .ok_or_else(|| format!("object {id} has no pending deletion"))?;
+    let _reservation = reservation
+        .lock()
+        .map_err(|_| format!("object {id} deletion lock poisoned"))?;
+    let mut event = wire::Builder::new();
+    event.u32(id);
+    let message = event.message(1, 1)?;
+    outbound
+        .lock()
+        .map_err(|_| "Wayland outbound lock poisoned".to_string())?
+        .send(&message)?;
+    let removed = pending_deletes
+        .lock()
+        .map_err(|_| "pending object deletion lock poisoned".to_string())?
+        .remove(&id);
+    if removed.is_some() {
+        Ok(())
+    } else {
+        Err(format!("object {id} deletion reservation disappeared"))
+    }
+}
+
+fn keyboard_worker(
+    receiver: Receiver<KeyboardDelivery>,
+    stop: KeyboardSubscriptionStop,
+    keyboards: Arc<Mutex<BTreeMap<u32, KeyboardRegistration>>>,
+    pending_deletes: PendingDeletes,
+    outbound: Arc<Mutex<Outbound>>,
+) -> Result<(), String> {
+    while let Ok(delivery) = receiver.recv() {
+        if stop.is_stopped() {
+            let mut pending = pending_deletes
+                .lock()
+                .map_err(|_| "pending object deletion lock poisoned".to_string())?;
+            for delivery in std::iter::once(delivery).chain(receiver.try_iter()) {
+                if let KeyboardDelivery::DeleteId(id) = delivery {
+                    pending.remove(&id);
+                }
+            }
+            return Ok(());
+        }
+        let event = match delivery {
+            KeyboardDelivery::Event(event) => event,
+            KeyboardDelivery::DeleteId(id) => {
+                send_reserved_delete_id(&outbound, &pending_deletes, id)?;
+                if outbound
+                    .lock()
+                    .map_err(|_| "Wayland outbound lock poisoned".to_string())?
+                    .disconnected
+                {
+                    return Ok(());
+                }
+                continue;
+            }
+        };
+        let keyboards = keyboards
+            .lock()
+            .map_err(|_| "keyboard registration lock poisoned".to_string())?;
+        let serial = next_serial();
+        for (object, registration) in keyboards.iter() {
+            if event.revision > registration.after_revision {
+                send_keyboard_event(&outbound, *object, serial, &event.event)?;
+            }
+        }
+        if outbound
+            .lock()
+            .map_err(|_| "Wayland outbound lock poisoned".to_string())?
+            .disconnected
+        {
+            return Ok(());
+        }
+    }
+    if stop.is_stopped() {
+        Ok(())
+    } else {
+        Err("keyboard event queue closed before client teardown".into())
+    }
+}
+
+fn supervise_keyboard_worker(
+    client: u64,
+    receiver: Receiver<KeyboardDelivery>,
+    stop: KeyboardSubscriptionStop,
+    keyboards: Arc<Mutex<BTreeMap<u32, KeyboardRegistration>>>,
+    pending_deletes: PendingDeletes,
+    outbound: Arc<Mutex<Outbound>>,
+) -> Result<(), String> {
+    let result = keyboard_worker(
+        receiver,
+        stop,
+        keyboards,
+        pending_deletes,
+        Arc::clone(&outbound),
+    );
+    if let Err(error) = &result {
+        eprintln!("td-compositor: client {client} keyboard: {error}");
+        if let Ok(mut outbound) = outbound.lock() {
+            outbound.disconnect();
+        }
+    }
+    result
+}
+
 fn client_surface_total(current: usize, prior: usize, proposed: usize) -> Result<usize, String> {
     let retained = current
         .checked_sub(prior)
@@ -310,7 +609,12 @@ fn request(object: u32, opcode: u16, builder: wire::Builder) -> Result<wire::Mes
 }
 
 impl Client {
-    fn new(id: u64, stream: UnixStream, runtime: Arc<Mutex<Runtime>>) -> Result<Client, String> {
+    fn new(
+        id: u64,
+        stream: UnixStream,
+        runtime: Arc<Mutex<Runtime>>,
+        keymap: KeymapFile,
+    ) -> Result<Client, String> {
         let mut objects = BTreeMap::new();
         objects.insert(1, Object::Display);
         let writer = stream
@@ -324,8 +628,13 @@ impl Client {
                 disconnected: false,
             })),
             configurations: Arc::new(Mutex::new(BTreeMap::new())),
+            keyboards: Arc::new(Mutex::new(BTreeMap::new())),
+            keyboard_active: Arc::new(AtomicBool::new(false)),
+            pending_deletes: Arc::new(Mutex::new(BTreeMap::new())),
             objects,
             runtime,
+            keymap,
+            protocol_error_code: WL_DISPLAY_ERROR_IMPLEMENTATION,
             mapped_bytes: BTreeMap::new(),
             mapped_total: 0,
         })
@@ -367,6 +676,54 @@ impl Client {
             .send(&message)
     }
 
+    fn create_keyboard(&mut self, id: u32, version: u32) -> Result<(), String> {
+        self.insert(id, Object::Keyboard { version })?;
+        let mut keyboards = self
+            .keyboards
+            .lock()
+            .map_err(|_| "keyboard registration lock poisoned".to_string())?;
+        self.keyboard_active.store(true, Ordering::Release);
+        let snapshot = self
+            .runtime
+            .lock()
+            .map_err(|_| "runtime lock poisoned".to_string())?
+            .keyboard_snapshot();
+        // This guard orders initial state against worker events for this object.
+        if keyboards
+            .insert(
+                id,
+                KeyboardRegistration {
+                    after_revision: snapshot.revision,
+                },
+            )
+            .is_some()
+        {
+            return Err(format!("keyboard object {id} was already registered"));
+        }
+        send_keyboard_initial(
+            &self.outbound,
+            id,
+            version,
+            self.id,
+            &snapshot,
+            &self.keymap.file,
+            self.keymap.size,
+        )
+    }
+
+    fn remove_keyboard(&mut self, id: u32) -> Result<(), String> {
+        let mut keyboards = self
+            .keyboards
+            .lock()
+            .map_err(|_| "keyboard registration lock poisoned".to_string())?;
+        keyboards.remove(&id);
+        if keyboards.is_empty() {
+            self.keyboard_active.store(false, Ordering::Release);
+        }
+        drop(keyboards);
+        self.remove_object(id)
+    }
+
     fn disconnected(&self) -> Result<bool, String> {
         self.outbound
             .lock()
@@ -391,13 +748,46 @@ impl Client {
         self.send(1, 1, event)
     }
 
-    fn protocol_error(&mut self, object: u32, error: &str) {
+    fn remove_surface_object(&mut self, id: u32) -> Result<(), String> {
+        if id <= 1 {
+            return Err(format!("refusing to delete reserved object {id}"));
+        }
+        if self.objects.remove(&id).is_none() {
+            return Err(format!("object {id} does not exist"));
+        }
+        let mut pending = self
+            .pending_deletes
+            .lock()
+            .map_err(|_| "pending object deletion lock poisoned".to_string())?;
+        if pending.contains_key(&id) {
+            return Err(format!("object {id} already has a pending deletion"));
+        }
+        pending.insert(id, Arc::new(Mutex::new(())));
+        drop(pending);
+        let queued = self
+            .runtime
+            .lock()
+            .map_err(|_| "runtime lock poisoned".to_string())?
+            .queue_keyboard_delete(self.id, id)?;
+        if queued {
+            Ok(())
+        } else {
+            send_reserved_delete_id(&self.outbound, &self.pending_deletes, id)
+        }
+    }
+
+    fn protocol_error(&mut self, object: u32, code: u32, error: &str) {
         let mut event = wire::Builder::new();
         event.u32(object);
-        event.u32(3);
+        event.u32(code);
         if event.string(error).is_ok() {
             let _ = self.send(1, 0, event);
         }
+    }
+
+    fn fail_protocol(&mut self, code: u32, error: &str) -> Result<(), String> {
+        self.protocol_error_code = code;
+        Err(error.into())
     }
 
     fn remove_object(&mut self, id: u32) -> Result<(), String> {
@@ -413,6 +803,25 @@ impl Client {
     fn insert(&mut self, id: u32, object: Object) -> Result<(), String> {
         if id <= 1 {
             return Err(format!("new object id {id} is reserved"));
+        }
+        let reservation = self
+            .pending_deletes
+            .lock()
+            .map_err(|_| "pending object deletion lock poisoned".to_string())?
+            .get(&id)
+            .cloned();
+        if let Some(reservation) = reservation {
+            let _reservation = reservation
+                .lock()
+                .map_err(|_| format!("object {id} deletion lock poisoned"))?;
+            let pending = self
+                .pending_deletes
+                .lock()
+                .map_err(|_| "pending object deletion lock poisoned".to_string())?
+                .contains_key(&id);
+            if pending {
+                return Err(format!("object id {id} was reused before delete_id"));
+            }
         }
         if self.objects.contains_key(&id) {
             return Err(format!("object id {id} was reused before delete_id"));
@@ -442,7 +851,8 @@ impl Client {
         self.global(registry, GLOBAL_COMPOSITOR, "wl_compositor", 4)?;
         self.global(registry, GLOBAL_SHM, "wl_shm", 1)?;
         self.global(registry, GLOBAL_OUTPUT, "wl_output", 4)?;
-        self.global(registry, GLOBAL_XDG_WM_BASE, "xdg_wm_base", 1)
+        self.global(registry, GLOBAL_XDG_WM_BASE, "xdg_wm_base", 1)?;
+        self.global(registry, GLOBAL_SEAT, "wl_seat", 7)
     }
 
     fn bind_global(
@@ -471,6 +881,18 @@ impl Client {
             }
             (GLOBAL_XDG_WM_BASE, "xdg_wm_base") if version == 1 => {
                 self.insert(id, Object::XdgWmBase)
+            }
+            (GLOBAL_SEAT, "wl_seat") if (1..=7).contains(&version) => {
+                self.insert(id, Object::Seat { version })?;
+                let mut capabilities = wire::Builder::new();
+                capabilities.u32(2);
+                self.send(id, 0, capabilities)?;
+                if version >= 2 {
+                    let mut name = wire::Builder::new();
+                    name.string("td-seat0")?;
+                    self.send(id, 1, name)?;
+                }
+                Ok(())
             }
             _ => Err(format!(
                 "global {name} does not provide {interface} version {version}"
@@ -789,6 +1211,7 @@ impl Client {
         message: wire::Message,
         fds: &mut VecDeque<RawFd>,
     ) -> Result<(), String> {
+        self.protocol_error_code = WL_DISPLAY_ERROR_IMPLEMENTATION;
         let object = self
             .objects
             .get(&message.object)
@@ -938,7 +1361,7 @@ impl Client {
                         ));
                     }
                     self.remove_surface(message.object)?;
-                    self.remove_object(message.object)
+                    self.remove_surface_object(message.object)
                 }
                 1 => {
                     let buffer = args.u32()?;
@@ -1018,6 +1441,44 @@ impl Client {
                     self.remove_object(message.object)
                 }
                 _ => Err(format!("unsupported wl_output request {}", message.opcode)),
+            },
+            Object::Seat { version } => match message.opcode {
+                1 => {
+                    let keyboard = args.u32()?;
+                    args.finish()?;
+                    self.create_keyboard(keyboard, version)
+                }
+                3 if version >= 5 => {
+                    args.finish()?;
+                    self.remove_object(message.object)
+                }
+                0 => {
+                    args.u32()?;
+                    args.finish()?;
+                    self.fail_protocol(
+                        WL_SEAT_ERROR_MISSING_CAPABILITY,
+                        "wl_pointer is not supported yet",
+                    )
+                }
+                2 => {
+                    args.u32()?;
+                    args.finish()?;
+                    self.fail_protocol(
+                        WL_SEAT_ERROR_MISSING_CAPABILITY,
+                        "wl_touch is not supported",
+                    )
+                }
+                _ => Err(format!("unsupported wl_seat request {}", message.opcode)),
+            },
+            Object::Keyboard { version } => match message.opcode {
+                0 if version >= 3 => {
+                    args.finish()?;
+                    self.remove_keyboard(message.object)
+                }
+                _ => Err(format!(
+                    "unsupported wl_keyboard request {}",
+                    message.opcode
+                )),
             },
             Object::XdgWmBase => match message.opcode {
                 0 => {
@@ -1220,13 +1681,13 @@ fn dispatch_buffered(
             Ok(Some(message)) => message,
             Ok(None) => return Ok(DispatchOutcome::NeedInput),
             Err(error) => {
-                client.protocol_error(1, &error);
+                client.protocol_error(1, WL_DISPLAY_ERROR_IMPLEMENTATION, &error);
                 return Err(error);
             }
         };
         let object = message.object;
         if let Err(error) = client.dispatch(message, fds) {
-            client.protocol_error(object, &error);
+            client.protocol_error(object, client.protocol_error_code, &error);
             return Err(error);
         }
         if client.disconnected()? {
@@ -1235,13 +1696,39 @@ fn dispatch_buffered(
     }
 }
 
-fn serve_client(stream: UnixStream, id: u64, runtime: Arc<Mutex<Runtime>>) -> Result<(), String> {
-    let mut client = Client::new(id, stream, Arc::clone(&runtime))?;
+fn serve_client(
+    stream: UnixStream,
+    id: u64,
+    runtime: Arc<Mutex<Runtime>>,
+    keymap: KeymapFile,
+) -> Result<(), String> {
+    let mut client = Client::new(id, stream, Arc::clone(&runtime), keymap)?;
     let subscription = runtime
         .lock()
         .map_err(|_| "runtime lock poisoned".to_string())?
         .subscribe(id)?;
     let (receiver, stop) = subscription.split();
+    let keyboard_subscription = match runtime.lock() {
+        Ok(mut runtime) => {
+            runtime.subscribe_keyboard_with_activity(id, Arc::clone(&client.keyboard_active))
+        }
+        Err(poisoned) => {
+            stop.stop();
+            poisoned.into_inner().unsubscribe(id);
+            return Err("runtime lock poisoned".into());
+        }
+    };
+    let keyboard_subscription = match keyboard_subscription {
+        Ok(subscription) => subscription,
+        Err(error) => {
+            stop.stop();
+            if let Ok(mut runtime) = runtime.lock() {
+                runtime.unsubscribe(id);
+            }
+            return Err(error);
+        }
+    };
+    let (keyboard_receiver, keyboard_stop) = keyboard_subscription.split();
     let worker_stop = stop.clone();
     let worker_runtime = Arc::clone(&runtime);
     let configurations = Arc::clone(&client.configurations);
@@ -1268,10 +1755,44 @@ fn serve_client(stream: UnixStream, id: u64, runtime: Arc<Mutex<Runtime>>) -> Re
         Ok(worker) => worker,
         Err(error) => {
             stop.stop();
+            keyboard_stop.stop();
             if let Ok(mut runtime) = runtime.lock() {
                 runtime.unsubscribe(id);
+                runtime.unsubscribe_keyboard(id);
             }
             return Err(format!("spawn Wayland configure worker {id}: {error}"));
+        }
+    };
+    let worker_keyboard_stop = keyboard_stop.clone();
+    let keyboards = Arc::clone(&client.keyboards);
+    let pending_deletes = Arc::clone(&client.pending_deletes);
+    let outbound = Arc::clone(&client.outbound);
+    let worker_outbound = Arc::clone(&outbound);
+    let keyboard_thread = match thread::Builder::new()
+        .name(format!("wayland-keyboard-{id}"))
+        .spawn(move || {
+            supervise_keyboard_worker(
+                id,
+                keyboard_receiver,
+                worker_keyboard_stop,
+                keyboards,
+                pending_deletes,
+                worker_outbound,
+            )
+        }) {
+        Ok(worker) => worker,
+        Err(error) => {
+            if let Ok(mut outbound) = client.outbound.lock() {
+                outbound.disconnect();
+            }
+            stop.stop();
+            keyboard_stop.stop();
+            if let Ok(mut runtime) = runtime.lock() {
+                runtime.unsubscribe(id);
+                runtime.unsubscribe_keyboard(id);
+            }
+            let _ = configure_thread.join();
+            return Err(format!("spawn Wayland keyboard worker {id}: {error}"));
         }
     };
     let mut bytes = Vec::with_capacity(64 * 1024);
@@ -1311,10 +1832,12 @@ fn serve_client(stream: UnixStream, id: u64, runtime: Arc<Mutex<Runtime>>) -> Re
     sys::discard_received(&raw);
     let _ = client.stream.shutdown(Shutdown::Both);
     stop.stop();
+    keyboard_stop.stop();
     let cleanup = match runtime.lock() {
         Ok(mut runtime) => {
             let cleanup = runtime.remove_client(id);
             runtime.unsubscribe(id);
+            runtime.unsubscribe_keyboard(id);
             cleanup
         }
         Err(_) => Err("runtime lock poisoned".to_string()),
@@ -1323,8 +1846,12 @@ fn serve_client(stream: UnixStream, id: u64, runtime: Arc<Mutex<Runtime>>) -> Re
         .join()
         .map_err(|_| format!("Wayland configure worker {id} panicked"))
         .and_then(|result| result);
+    let keyboard_joined = keyboard_thread
+        .join()
+        .map_err(|_| format!("Wayland keyboard worker {id} panicked"))
+        .and_then(|result| result);
     let mut errors = Vec::new();
-    for result in [outcome, cleanup, joined] {
+    for result in [outcome, cleanup, joined, keyboard_joined] {
         if let Err(error) = result {
             errors.push(error);
         }
@@ -1336,7 +1863,17 @@ fn serve_client(stream: UnixStream, id: u64, runtime: Arc<Mutex<Runtime>>) -> Re
     }
 }
 
+fn keymap_directory(path: &Path) -> Result<&Path, String> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .ok_or_else(|| format!("Wayland socket {} has no parent directory", path.display()))?;
+    Ok(parent)
+}
+
 pub fn serve(path: &Path, runtime: Arc<Mutex<Runtime>>) -> Result<(), String> {
+    let keymap_dir = keymap_directory(path)?.to_path_buf();
+    let keymap = keymap_file(&keymap_dir)?;
     socket::remove_stale(path, "Wayland")?;
     let listener = UnixListener::bind(path)
         .map_err(|e| format!("bind Wayland socket {}: {e}", path.display()))?;
@@ -1357,11 +1894,12 @@ pub fn serve(path: &Path, runtime: Arc<Mutex<Runtime>>) -> Result<(), String> {
         };
         let id = NEXT_CLIENT.fetch_add(1, Ordering::Relaxed);
         let runtime = Arc::clone(&runtime);
+        let keymap = keymap.clone();
         thread::Builder::new()
             .name(format!("wayland-client-{id}"))
             .spawn(move || {
                 let _permit = permit;
-                if let Err(error) = serve_client(stream, id, runtime) {
+                if let Err(error) = serve_client(stream, id, runtime, keymap) {
                     eprintln!("td-compositor: client {id}: {error}");
                 }
             })
@@ -1380,6 +1918,7 @@ pub fn probe(path: &Path) -> Result<(), String> {
 mod tests {
     use super::*;
     use crate::framebuffer::Framebuffer;
+    use crate::keyboard::{KeyInput, KeyState, ModifierState, RoutedKeyboardEvent, MOD_LOGO};
     use crate::layout::{Command, Direction, Layout};
     use std::io::Read;
     use std::os::fd::AsRawFd;
@@ -1388,10 +1927,43 @@ mod tests {
 
     static TEST_SEQ: AtomicU64 = AtomicU64::new(0);
 
+    fn test_directory(label: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "td-{label}-{}-{}",
+            std::process::id(),
+            TEST_SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir(&path).unwrap();
+        path
+    }
+
+    fn test_keymap() -> KeymapFile {
+        let directory = test_directory("shared-keymap");
+        let keymap = keymap_file(&directory).unwrap();
+        fs::remove_dir(directory).unwrap();
+        keymap
+    }
+
     fn send(stream: &mut UnixStream, object: u32, opcode: u16, builder: wire::Builder) {
         stream
             .write_all(&builder.message(object, opcode).unwrap())
             .unwrap();
+    }
+
+    fn receive_messages(stream: &mut UnixStream, count: usize) -> Vec<wire::Message> {
+        let mut bytes = Vec::new();
+        let mut messages = Vec::new();
+        let mut scratch = [0u8; 4096];
+        while messages.len() < count {
+            let received = stream.read(&mut scratch).unwrap();
+            assert!(received > 0);
+            bytes.extend_from_slice(scratch.get(..received).unwrap());
+            while let Some(message) = wire::take(&mut bytes).unwrap() {
+                messages.push(message);
+            }
+        }
+        assert_eq!(messages.len(), count);
+        messages
     }
 
     fn receive_configure(
@@ -1459,6 +2031,918 @@ mod tests {
     }
 
     #[test]
+    fn seat_binding_and_keyboard_initialization_are_self_contained() {
+        let stem = format!(
+            "td-keyboard-protocol-test-{}-{}",
+            std::process::id(),
+            TEST_SEQ.fetch_add(1, Ordering::Relaxed)
+        );
+        let framebuffer_path = std::env::temp_dir().join(format!("{stem}.fb"));
+        let framebuffer = Framebuffer::test_file(&framebuffer_path, 32, 32, 32 * 4).unwrap();
+        let runtime = Arc::new(Mutex::new(Runtime::new(framebuffer)));
+        let focused = SurfaceKey {
+            client: 12,
+            object: 40,
+        };
+        runtime
+            .lock()
+            .unwrap()
+            .commit(
+                focused,
+                Surface {
+                    width: 1,
+                    height: 1,
+                    pixels: vec![1, 2, 3, 0],
+                    format: SHM_XRGB8888,
+                },
+            )
+            .unwrap();
+        runtime
+            .lock()
+            .unwrap()
+            .key(KeyInput {
+                time: 1,
+                key: 125,
+                state: KeyState::Pressed,
+            })
+            .unwrap();
+        runtime
+            .lock()
+            .unwrap()
+            .modifiers(ModifierState {
+                depressed: MOD_LOGO,
+                ..ModifierState::default()
+            })
+            .unwrap();
+
+        let (server, mut peer) = UnixStream::pair().unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let mut client = Client::new(12, server, runtime, test_keymap()).unwrap();
+        client.advertise_globals(2).unwrap();
+        let globals = receive_messages(&mut peer, 5);
+        let seat = globals.last().unwrap();
+        let mut seat_global = wire::Cursor::new(&seat.payload);
+        assert_eq!(seat_global.u32().unwrap(), GLOBAL_SEAT);
+        assert_eq!(seat_global.string().unwrap(), "wl_seat");
+        assert_eq!(seat_global.u32().unwrap(), 7);
+        seat_global.finish().unwrap();
+
+        client.bind_global(GLOBAL_SEAT, "wl_seat", 7, 5).unwrap();
+        let seat_events = receive_messages(&mut peer, 2);
+        let mut capabilities = wire::Cursor::new(&seat_events.first().unwrap().payload);
+        assert_eq!(capabilities.u32().unwrap(), 2);
+        capabilities.finish().unwrap();
+        let mut name = wire::Cursor::new(&seat_events.get(1).unwrap().payload);
+        assert_eq!(name.string().unwrap(), "td-seat0");
+        name.finish().unwrap();
+
+        let mut get_keyboard = wire::Builder::new();
+        get_keyboard.u32(6);
+        assert!(!client.keyboard_active.load(Ordering::Acquire));
+        client
+            .dispatch(request(5, 1, get_keyboard).unwrap(), &mut VecDeque::new())
+            .unwrap();
+        assert!(client.keyboard_active.load(Ordering::Acquire));
+        let mut bytes = Vec::new();
+        let mut messages = Vec::new();
+        let mut descriptors = Vec::new();
+        let mut scratch = [0u8; 16 * 1024];
+        while messages.len() < 4 {
+            let received = sys::recv_with_fds(&peer, &mut scratch).unwrap();
+            assert!(received.count > 0);
+            bytes.extend_from_slice(scratch.get(..received.count).unwrap());
+            descriptors.extend(received.fds);
+            while let Some(message) = wire::take(&mut bytes).unwrap() {
+                messages.push(message);
+            }
+        }
+        assert_eq!(messages.len(), 4);
+        assert_eq!(descriptors.len(), 1);
+
+        let keymap = messages.first().unwrap();
+        assert_eq!((keymap.object, keymap.opcode), (6, 0));
+        let mut keymap_args = wire::Cursor::new(&keymap.payload);
+        assert_eq!(keymap_args.u32().unwrap(), 1);
+        let size = keymap_args.u32().unwrap();
+        keymap_args.finish().unwrap();
+        let file = sys::duplicate_received(*descriptors.first().unwrap()).unwrap();
+        assert_eq!(file.metadata().unwrap().permissions().mode() & 0o777, 0o600);
+        let mut keymap_bytes = vec![0; usize::try_from(size).unwrap()];
+        file.read_exact_at(&mut keymap_bytes, 0).unwrap();
+        assert_eq!(keymap_bytes.last(), Some(&0));
+        assert_eq!(
+            keymap_bytes.get(..keymap_bytes.len().saturating_sub(1)),
+            Some(XKB_KEYMAP.as_bytes())
+        );
+
+        assert_eq!(
+            (
+                messages.get(1).unwrap().object,
+                messages.get(1).unwrap().opcode
+            ),
+            (6, 5)
+        );
+        let mut enter = wire::Cursor::new(&messages.get(2).unwrap().payload);
+        assert_ne!(enter.u32().unwrap(), 0);
+        assert_eq!(enter.u32().unwrap(), focused.object);
+        assert_eq!(enter.u32().unwrap(), 4);
+        assert_eq!(enter.u32().unwrap(), 125);
+        enter.finish().unwrap();
+        let mut modifiers = wire::Cursor::new(&messages.get(3).unwrap().payload);
+        assert_ne!(modifiers.u32().unwrap(), 0);
+        assert_eq!(modifiers.u32().unwrap(), MOD_LOGO);
+        assert_eq!(modifiers.u32().unwrap(), 0);
+        assert_eq!(modifiers.u32().unwrap(), 0);
+        assert_eq!(modifiers.u32().unwrap(), 0);
+        modifiers.finish().unwrap();
+
+        let mut pointer = wire::Builder::new();
+        pointer.u32(9);
+        assert!(client
+            .dispatch(request(5, 0, pointer).unwrap(), &mut VecDeque::new())
+            .unwrap_err()
+            .contains("not supported"));
+        assert_eq!(client.protocol_error_code, WL_SEAT_ERROR_MISSING_CAPABILITY);
+        client
+            .dispatch(
+                request(6, 0, wire::Builder::new()).unwrap(),
+                &mut VecDeque::new(),
+            )
+            .unwrap();
+        assert!(!client.keyboard_active.load(Ordering::Acquire));
+        assert!(!client.keyboards.lock().unwrap().contains_key(&6));
+        let deleted = receive_messages(&mut peer, 1);
+        let mut deleted_id = wire::Cursor::new(&deleted.first().unwrap().payload);
+        assert_eq!(deleted_id.u32().unwrap(), 6);
+        deleted_id.finish().unwrap();
+        fs::remove_file(framebuffer_path).unwrap();
+    }
+
+    #[test]
+    fn seat_versions_gate_names_repeat_and_release() {
+        let stem = format!(
+            "td-keyboard-version-test-{}-{}",
+            std::process::id(),
+            TEST_SEQ.fetch_add(1, Ordering::Relaxed)
+        );
+        let framebuffer_path = std::env::temp_dir().join(format!("{stem}.fb"));
+        let framebuffer = Framebuffer::test_file(&framebuffer_path, 16, 16, 16 * 4).unwrap();
+        let runtime = Arc::new(Mutex::new(Runtime::new(framebuffer)));
+        let (server, mut peer) = UnixStream::pair().unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let mut client = Client::new(13, server, runtime, test_keymap()).unwrap();
+        client.bind_global(GLOBAL_SEAT, "wl_seat", 1, 5).unwrap();
+        let seat_events = receive_messages(&mut peer, 1);
+        assert_eq!(
+            (
+                seat_events.first().unwrap().object,
+                seat_events.first().unwrap().opcode
+            ),
+            (5, 0)
+        );
+
+        let mut get_keyboard = wire::Builder::new();
+        get_keyboard.u32(6);
+        client
+            .dispatch(request(5, 1, get_keyboard).unwrap(), &mut VecDeque::new())
+            .unwrap();
+        let mut scratch = [0u8; 4096];
+        let received = sys::recv_with_fds(&peer, &mut scratch).unwrap();
+        assert_eq!(received.fds.len(), 1);
+        let mut bytes = scratch.get(..received.count).unwrap().to_vec();
+        let keymap = wire::take(&mut bytes).unwrap().unwrap();
+        assert_eq!((keymap.object, keymap.opcode), (6, 0));
+        assert!(bytes.is_empty());
+        sys::discard_received(&received.fds);
+
+        assert!(client
+            .dispatch(
+                request(6, 0, wire::Builder::new()).unwrap(),
+                &mut VecDeque::new(),
+            )
+            .unwrap_err()
+            .contains("unsupported wl_keyboard"));
+        let mut touch = wire::Builder::new();
+        touch.u32(8);
+        assert!(client
+            .dispatch(request(5, 2, touch).unwrap(), &mut VecDeque::new())
+            .unwrap_err()
+            .contains("wl_touch"));
+        assert_eq!(client.protocol_error_code, WL_SEAT_ERROR_MISSING_CAPABILITY);
+        assert!(client
+            .dispatch(
+                request(5, 3, wire::Builder::new()).unwrap(),
+                &mut VecDeque::new(),
+            )
+            .unwrap_err()
+            .contains("unsupported wl_seat"));
+
+        client.bind_global(GLOBAL_SEAT, "wl_seat", 5, 7).unwrap();
+        receive_messages(&mut peer, 2);
+        client
+            .dispatch(
+                request(7, 3, wire::Builder::new()).unwrap(),
+                &mut VecDeque::new(),
+            )
+            .unwrap();
+        let deleted = receive_messages(&mut peer, 1);
+        let mut args = wire::Cursor::new(&deleted.first().unwrap().payload);
+        assert_eq!(args.u32().unwrap(), 7);
+        args.finish().unwrap();
+        fs::remove_file(framebuffer_path).unwrap();
+    }
+
+    #[test]
+    fn missing_seat_capability_uses_the_wl_seat_error_code() {
+        let stem = format!(
+            "td-seat-error-test-{}-{}",
+            std::process::id(),
+            TEST_SEQ.fetch_add(1, Ordering::Relaxed)
+        );
+        let framebuffer_path = std::env::temp_dir().join(format!("{stem}.fb"));
+        let framebuffer = Framebuffer::test_file(&framebuffer_path, 8, 8, 8 * 4).unwrap();
+        let runtime = Arc::new(Mutex::new(Runtime::new(framebuffer)));
+        let (server, mut peer) = UnixStream::pair().unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let mut client = Client::new(14, server, runtime, test_keymap()).unwrap();
+        client.bind_global(GLOBAL_SEAT, "wl_seat", 7, 5).unwrap();
+        receive_messages(&mut peer, 2);
+
+        let mut pointer = wire::Builder::new();
+        pointer.u32(6);
+        let mut bytes = pointer.message(5, 0).unwrap();
+        let error = dispatch_buffered(&mut client, &mut bytes, &mut VecDeque::new()).unwrap_err();
+        assert!(error.contains("wl_pointer"));
+        let events = receive_messages(&mut peer, 1);
+        assert_eq!(
+            (
+                events.first().unwrap().object,
+                events.first().unwrap().opcode
+            ),
+            (1, 0)
+        );
+        let mut error = wire::Cursor::new(&events.first().unwrap().payload);
+        assert_eq!(error.u32().unwrap(), 5);
+        assert_eq!(error.u32().unwrap(), WL_SEAT_ERROR_MISSING_CAPABILITY);
+        assert!(error.string().unwrap().contains("wl_pointer"));
+        error.finish().unwrap();
+
+        fs::remove_file(framebuffer_path).unwrap();
+    }
+
+    #[test]
+    fn threaded_server_delivers_and_tears_down_a_bound_keyboard() {
+        let stem = format!(
+            "td-keyboard-threaded-test-{}-{}",
+            std::process::id(),
+            TEST_SEQ.fetch_add(1, Ordering::Relaxed)
+        );
+        let framebuffer_path = std::env::temp_dir().join(format!("{stem}.fb"));
+        let framebuffer = Framebuffer::test_file(&framebuffer_path, 16, 16, 16 * 4).unwrap();
+        let runtime = Arc::new(Mutex::new(Runtime::new(framebuffer)));
+        let (server, mut peer) = UnixStream::pair().unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let thread_runtime = Arc::clone(&runtime);
+        let worker = thread::spawn(move || serve_client(server, 91, thread_runtime, test_keymap()));
+
+        let mut get_registry = wire::Builder::new();
+        get_registry.u32(2);
+        send(&mut peer, 1, 1, get_registry);
+        receive_messages(&mut peer, 5);
+
+        let mut bind_compositor = wire::Builder::new();
+        bind_compositor.u32(GLOBAL_COMPOSITOR);
+        bind_compositor.string("wl_compositor").unwrap();
+        bind_compositor.u32(4);
+        bind_compositor.u32(3);
+        send(&mut peer, 2, 0, bind_compositor);
+        let mut create_surface = wire::Builder::new();
+        create_surface.u32(4);
+        send(&mut peer, 3, 0, create_surface);
+
+        let mut bind_seat = wire::Builder::new();
+        bind_seat.u32(GLOBAL_SEAT);
+        bind_seat.string("wl_seat").unwrap();
+        bind_seat.u32(7);
+        bind_seat.u32(5);
+        send(&mut peer, 2, 0, bind_seat);
+        receive_messages(&mut peer, 2);
+
+        let mut get_keyboard = wire::Builder::new();
+        get_keyboard.u32(6);
+        send(&mut peer, 5, 1, get_keyboard);
+        let mut bytes = Vec::new();
+        let mut initial = Vec::new();
+        let mut descriptors = Vec::new();
+        let mut scratch = [0u8; 4096];
+        while initial.len() < 2 {
+            let received = sys::recv_with_fds(&peer, &mut scratch).unwrap();
+            assert!(received.count > 0);
+            bytes.extend_from_slice(scratch.get(..received.count).unwrap());
+            descriptors.extend(received.fds);
+            while let Some(message) = wire::take(&mut bytes).unwrap() {
+                initial.push(message);
+            }
+        }
+        assert_eq!(
+            initial
+                .iter()
+                .map(|message| (message.object, message.opcode))
+                .collect::<Vec<_>>(),
+            [(6, 0), (6, 5)]
+        );
+        assert_eq!(descriptors.len(), 1);
+        sys::discard_received(&descriptors);
+
+        let surface = SurfaceKey {
+            client: 91,
+            object: 4,
+        };
+        runtime
+            .lock()
+            .unwrap()
+            .commit(
+                surface,
+                Surface {
+                    width: 1,
+                    height: 1,
+                    pixels: vec![1, 2, 3, 0],
+                    format: SHM_XRGB8888,
+                },
+            )
+            .unwrap();
+        let focus = receive_messages(&mut peer, 2);
+        assert_eq!(
+            focus
+                .iter()
+                .map(|message| (message.object, message.opcode))
+                .collect::<Vec<_>>(),
+            [(6, 1), (6, 4)]
+        );
+        let mut enter = wire::Cursor::new(&focus.first().unwrap().payload);
+        assert_ne!(enter.u32().unwrap(), 0);
+        assert_eq!(enter.u32().unwrap(), surface.object);
+        assert_eq!(enter.u32().unwrap(), 0);
+        enter.finish().unwrap();
+
+        runtime
+            .lock()
+            .unwrap()
+            .key(KeyInput {
+                time: 73,
+                key: 30,
+                state: KeyState::Pressed,
+            })
+            .unwrap();
+        let key = receive_messages(&mut peer, 1);
+        assert_eq!(
+            (key.first().unwrap().object, key.first().unwrap().opcode),
+            (6, 3)
+        );
+        let mut args = wire::Cursor::new(&key.first().unwrap().payload);
+        assert_ne!(args.u32().unwrap(), 0);
+        assert_eq!(args.u32().unwrap(), 73);
+        assert_eq!(args.u32().unwrap(), 30);
+        assert_eq!(args.u32().unwrap(), 1);
+        args.finish().unwrap();
+
+        peer.shutdown(Shutdown::Both).unwrap();
+        assert!(worker.join().unwrap().is_ok());
+        assert!(runtime.lock().unwrap().keyboard_snapshot().focus.is_none());
+        fs::remove_file(framebuffer_path).unwrap();
+    }
+
+    #[test]
+    fn duplicate_keyboard_subscription_releases_the_runtime_lock() {
+        let stem = format!(
+            "td-keyboard-subscribe-test-{}-{}",
+            std::process::id(),
+            TEST_SEQ.fetch_add(1, Ordering::Relaxed)
+        );
+        let framebuffer_path = std::env::temp_dir().join(format!("{stem}.fb"));
+        let framebuffer = Framebuffer::test_file(&framebuffer_path, 8, 8, 8 * 4).unwrap();
+        let runtime = Arc::new(Mutex::new(Runtime::new(framebuffer)));
+        let subscription = runtime.lock().unwrap().subscribe_keyboard(92).unwrap();
+        let (server, _peer) = UnixStream::pair().unwrap();
+        let error = serve_client(server, 92, Arc::clone(&runtime), test_keymap()).unwrap_err();
+        assert!(error.contains("keyboard subscriber 92 already exists"));
+
+        let (_, stop) = subscription.split();
+        stop.stop();
+        runtime.lock().unwrap().unsubscribe_keyboard(92);
+        fs::remove_file(framebuffer_path).unwrap();
+    }
+
+    #[test]
+    fn keymap_file_is_unlinked_mode_0600_and_read_only() {
+        let directory = test_directory("keymap-file-test");
+        let keymap = keymap_file(&directory).unwrap();
+        assert_eq!(
+            usize::try_from(keymap.size).unwrap(),
+            XKB_KEYMAP.len().saturating_add(1)
+        );
+        assert_eq!(
+            keymap.file.metadata().unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert!(keymap.file.write_all_at(b"x", 0).is_err());
+        assert_eq!(fs::read_dir(&directory).unwrap().count(), 0);
+        let second = keymap.clone();
+        assert!(Arc::ptr_eq(&keymap.file, &second.file));
+        drop(keymap);
+        drop(second);
+        fs::remove_dir(directory).unwrap();
+    }
+
+    #[test]
+    fn keymap_directory_rejects_a_relative_socket_without_a_parent() {
+        assert!(keymap_directory(Path::new("wayland-0")).is_err());
+        assert_eq!(
+            keymap_directory(Path::new("/run/user/1000/wayland-0")).unwrap(),
+            Path::new("/run/user/1000")
+        );
+    }
+
+    #[test]
+    fn descriptor_send_treats_peer_departure_as_a_clean_disconnect() {
+        let (server, peer) = UnixStream::pair().unwrap();
+        drop(peer);
+        let directory = test_directory("descriptor-disconnect-test");
+        let keymap = keymap_file(&directory).unwrap();
+        fs::remove_dir(directory).unwrap();
+        let mut outbound = Outbound {
+            stream: server,
+            disconnected: false,
+        };
+        assert!(outbound
+            .send_with_fd(b"event", keymap.file.as_raw_fd())
+            .is_ok());
+        assert!(outbound.disconnected);
+    }
+
+    #[test]
+    fn surface_delete_id_follows_its_queued_keyboard_leave() {
+        let stem = format!(
+            "td-keyboard-surface-barrier-test-{}-{}",
+            std::process::id(),
+            TEST_SEQ.fetch_add(1, Ordering::Relaxed)
+        );
+        let framebuffer_path = std::env::temp_dir().join(format!("{stem}.fb"));
+        let framebuffer = Framebuffer::test_file(&framebuffer_path, 8, 8, 8 * 4).unwrap();
+        let runtime = Arc::new(Mutex::new(Runtime::new(framebuffer)));
+        let subscription = runtime.lock().unwrap().subscribe_keyboard(88).unwrap();
+        let (receiver, stop) = subscription.split();
+        let surface = SurfaceKey {
+            client: 88,
+            object: 7,
+        };
+        runtime
+            .lock()
+            .unwrap()
+            .commit(
+                surface,
+                Surface {
+                    width: 1,
+                    height: 1,
+                    pixels: vec![1, 2, 3, 0],
+                    format: SHM_XRGB8888,
+                },
+            )
+            .unwrap();
+        let revision = runtime.lock().unwrap().keyboard_snapshot().revision;
+
+        let (server, mut peer) = UnixStream::pair().unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let mut client = Client::new(88, server, Arc::clone(&runtime), test_keymap()).unwrap();
+        client
+            .objects
+            .insert(surface.object, Object::Surface(SurfaceState::default()));
+        client.keyboards.lock().unwrap().insert(
+            9,
+            KeyboardRegistration {
+                after_revision: revision,
+            },
+        );
+        let worker_stop = stop.clone();
+        let worker_keyboards = Arc::clone(&client.keyboards);
+        let worker_pending_deletes = Arc::clone(&client.pending_deletes);
+        let worker_outbound = Arc::clone(&client.outbound);
+        let worker = thread::spawn(move || {
+            keyboard_worker(
+                receiver,
+                worker_stop,
+                worker_keyboards,
+                worker_pending_deletes,
+                worker_outbound,
+            )
+        });
+
+        client
+            .dispatch(
+                request(surface.object, 0, wire::Builder::new()).unwrap(),
+                &mut VecDeque::new(),
+            )
+            .unwrap();
+        let events = receive_messages(&mut peer, 2);
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| (event.object, event.opcode))
+                .collect::<Vec<_>>(),
+            [(9, 2), (1, 1)]
+        );
+        let mut leave = wire::Cursor::new(&events.first().unwrap().payload);
+        leave.u32().unwrap();
+        assert_eq!(leave.u32().unwrap(), surface.object);
+        leave.finish().unwrap();
+        let mut deleted = wire::Cursor::new(&events.get(1).unwrap().payload);
+        assert_eq!(deleted.u32().unwrap(), surface.object);
+        deleted.finish().unwrap();
+        assert!(client.insert(surface.object, Object::Region).is_ok());
+
+        stop.stop();
+        runtime.lock().unwrap().unsubscribe_keyboard(88);
+        assert!(worker.join().unwrap().is_ok());
+        fs::remove_file(framebuffer_path).unwrap();
+    }
+
+    #[test]
+    fn surface_destroy_does_not_wait_for_the_keyboard_worker() {
+        let stem = format!(
+            "td-keyboard-surface-nonblocking-test-{}-{}",
+            std::process::id(),
+            TEST_SEQ.fetch_add(1, Ordering::Relaxed)
+        );
+        let framebuffer_path = std::env::temp_dir().join(format!("{stem}.fb"));
+        let framebuffer = Framebuffer::test_file(&framebuffer_path, 8, 8, 8 * 4).unwrap();
+        let runtime = Arc::new(Mutex::new(Runtime::new(framebuffer)));
+        let subscription = runtime.lock().unwrap().subscribe_keyboard(89).unwrap();
+        let (receiver, stop) = subscription.split();
+        let surface = SurfaceKey {
+            client: 89,
+            object: 7,
+        };
+        runtime
+            .lock()
+            .unwrap()
+            .commit(
+                surface,
+                Surface {
+                    width: 1,
+                    height: 1,
+                    pixels: vec![1, 2, 3, 0],
+                    format: SHM_XRGB8888,
+                },
+            )
+            .unwrap();
+
+        let (server, _peer) = UnixStream::pair().unwrap();
+        let mut client = Client::new(89, server, Arc::clone(&runtime), test_keymap()).unwrap();
+        client
+            .objects
+            .insert(surface.object, Object::Surface(SurfaceState::default()));
+        client
+            .dispatch(
+                request(surface.object, 0, wire::Builder::new()).unwrap(),
+                &mut VecDeque::new(),
+            )
+            .unwrap();
+        let reservation = client
+            .pending_deletes
+            .lock()
+            .unwrap()
+            .get(&surface.object)
+            .cloned()
+            .unwrap();
+        let blocked_delete = reservation.lock().unwrap();
+        assert!(client.insert(8, Object::Region).is_ok());
+        drop(blocked_delete);
+        assert!(client
+            .insert(surface.object, Object::Region)
+            .unwrap_err()
+            .contains("before delete_id"));
+
+        let deliveries: Vec<KeyboardDelivery> = (0..4).map(|_| receiver.recv().unwrap()).collect();
+        assert!(matches!(
+            deliveries.get(2),
+            Some(KeyboardDelivery::Event(RoutedKeyboardEvent {
+                event: KeyboardEvent::Leave { surface: left },
+                ..
+            })) if *left == surface
+        ));
+        assert!(matches!(
+            deliveries.get(3),
+            Some(KeyboardDelivery::DeleteId(7))
+        ));
+
+        stop.stop();
+        runtime.lock().unwrap().unsubscribe_keyboard(89);
+        fs::remove_file(framebuffer_path).unwrap();
+    }
+
+    #[test]
+    fn surface_delete_without_a_worker_clears_its_id_reservation() {
+        let stem = format!(
+            "td-keyboard-surface-direct-delete-test-{}-{}",
+            std::process::id(),
+            TEST_SEQ.fetch_add(1, Ordering::Relaxed)
+        );
+        let framebuffer_path = std::env::temp_dir().join(format!("{stem}.fb"));
+        let framebuffer = Framebuffer::test_file(&framebuffer_path, 8, 8, 8 * 4).unwrap();
+        let runtime = Arc::new(Mutex::new(Runtime::new(framebuffer)));
+        let (server, mut peer) = UnixStream::pair().unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let mut client = Client::new(90, server, runtime, test_keymap()).unwrap();
+        client
+            .objects
+            .insert(7, Object::Surface(SurfaceState::default()));
+
+        client
+            .dispatch(
+                request(7, 0, wire::Builder::new()).unwrap(),
+                &mut VecDeque::new(),
+            )
+            .unwrap();
+        let events = receive_messages(&mut peer, 1);
+        assert_eq!(
+            (
+                events.first().unwrap().object,
+                events.first().unwrap().opcode
+            ),
+            (1, 1)
+        );
+        assert!(client.insert(7, Object::Region).is_ok());
+        assert!(client.pending_deletes.lock().unwrap().is_empty());
+
+        fs::remove_file(framebuffer_path).unwrap();
+    }
+
+    #[test]
+    fn keyboard_worker_filters_pre_registration_events_and_preserves_order() {
+        let stem = format!(
+            "td-keyboard-worker-test-{}-{}",
+            std::process::id(),
+            TEST_SEQ.fetch_add(1, Ordering::Relaxed)
+        );
+        let framebuffer_path = std::env::temp_dir().join(format!("{stem}.fb"));
+        let framebuffer = Framebuffer::test_file(&framebuffer_path, 32, 32, 32 * 4).unwrap();
+        let mut runtime = Runtime::new(framebuffer);
+        let subscription = runtime.subscribe_keyboard(88).unwrap();
+        let (receiver, stop) = subscription.split();
+        let first = SurfaceKey {
+            client: 88,
+            object: 7,
+        };
+        runtime
+            .commit(
+                first,
+                Surface {
+                    width: 1,
+                    height: 1,
+                    pixels: vec![1, 2, 3, 0],
+                    format: SHM_XRGB8888,
+                },
+            )
+            .unwrap();
+        let snapshot = runtime.keyboard_snapshot();
+        let mut registrations = BTreeMap::new();
+        registrations.insert(
+            9,
+            KeyboardRegistration {
+                after_revision: snapshot.revision,
+            },
+        );
+        registrations.insert(
+            10,
+            KeyboardRegistration {
+                after_revision: snapshot.revision,
+            },
+        );
+        let registrations = Arc::new(Mutex::new(registrations));
+        let (server, mut peer) = UnixStream::pair().unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let outbound = Arc::new(Mutex::new(Outbound {
+            stream: server,
+            disconnected: false,
+        }));
+        let worker_stop = stop.clone();
+        let worker_registrations = Arc::clone(&registrations);
+        let worker_outbound = Arc::clone(&outbound);
+        let worker = thread::spawn(move || {
+            keyboard_worker(
+                receiver,
+                worker_stop,
+                worker_registrations,
+                Arc::new(Mutex::new(BTreeMap::new())),
+                worker_outbound,
+            )
+        });
+
+        runtime
+            .key(KeyInput {
+                time: 54,
+                key: 30,
+                state: KeyState::Pressed,
+            })
+            .unwrap();
+        let key_events = receive_messages(&mut peer, 2);
+        let key_event = key_events.first().unwrap();
+        assert_eq!((key_event.object, key_event.opcode), (9, 3));
+        let mut key = wire::Cursor::new(&key_event.payload);
+        let serial = key.u32().unwrap();
+        assert_ne!(serial, 0);
+        assert_eq!(key.u32().unwrap(), 54);
+        assert_eq!(key.u32().unwrap(), 30);
+        assert_eq!(key.u32().unwrap(), 1);
+        key.finish().unwrap();
+        let second_key_event = key_events.get(1).unwrap();
+        assert_eq!((second_key_event.object, second_key_event.opcode), (10, 3));
+        let mut second_key = wire::Cursor::new(&second_key_event.payload);
+        assert_eq!(second_key.u32().unwrap(), serial);
+        assert_eq!(second_key.u32().unwrap(), 54);
+        assert_eq!(second_key.u32().unwrap(), 30);
+        assert_eq!(second_key.u32().unwrap(), 1);
+        second_key.finish().unwrap();
+
+        let second = SurfaceKey {
+            client: 88,
+            object: 8,
+        };
+        runtime
+            .commit(
+                second,
+                Surface {
+                    width: 1,
+                    height: 1,
+                    pixels: vec![4, 5, 6, 0],
+                    format: SHM_XRGB8888,
+                },
+            )
+            .unwrap();
+        let focus = receive_messages(&mut peer, 6);
+        assert_eq!(
+            focus
+                .iter()
+                .map(|event| (event.object, event.opcode))
+                .collect::<Vec<_>>(),
+            [(9, 2), (10, 2), (9, 1), (10, 1), (9, 4), (10, 4)]
+        );
+        let mut leave = wire::Cursor::new(&focus.first().unwrap().payload);
+        let leave_serial = leave.u32().unwrap();
+        assert_eq!(leave.u32().unwrap(), first.object);
+        leave.finish().unwrap();
+        let mut second_leave = wire::Cursor::new(&focus.get(1).unwrap().payload);
+        assert_eq!(second_leave.u32().unwrap(), leave_serial);
+        assert_eq!(second_leave.u32().unwrap(), first.object);
+        second_leave.finish().unwrap();
+        let mut enter = wire::Cursor::new(&focus.get(2).unwrap().payload);
+        let enter_serial = enter.u32().unwrap();
+        assert_eq!(enter.u32().unwrap(), second.object);
+        assert_eq!(enter.u32().unwrap(), 4);
+        assert_eq!(enter.u32().unwrap(), 30);
+        enter.finish().unwrap();
+        let mut second_enter = wire::Cursor::new(&focus.get(3).unwrap().payload);
+        assert_eq!(second_enter.u32().unwrap(), enter_serial);
+        assert_eq!(second_enter.u32().unwrap(), second.object);
+        assert_eq!(second_enter.u32().unwrap(), 4);
+        assert_eq!(second_enter.u32().unwrap(), 30);
+        second_enter.finish().unwrap();
+
+        stop.stop();
+        runtime.unsubscribe_keyboard(88);
+        assert!(worker.join().unwrap().is_ok());
+        fs::remove_file(framebuffer_path).unwrap();
+    }
+
+    #[test]
+    fn keyboard_worker_distinguishes_overflow_from_requested_stop() {
+        let stem = format!(
+            "td-keyboard-stop-test-{}-{}",
+            std::process::id(),
+            TEST_SEQ.fetch_add(1, Ordering::Relaxed)
+        );
+        let framebuffer_path = std::env::temp_dir().join(format!("{stem}.fb"));
+        let framebuffer = Framebuffer::test_file(&framebuffer_path, 8, 8, 8 * 4).unwrap();
+        let mut runtime = Runtime::new(framebuffer);
+        let subscription = runtime.subscribe_keyboard(99).unwrap();
+        let (receiver, stop) = subscription.split();
+        runtime.unsubscribe_keyboard(99);
+        let (server, _peer) = UnixStream::pair().unwrap();
+        let error = keyboard_worker(
+            receiver,
+            stop,
+            Arc::new(Mutex::new(BTreeMap::new())),
+            Arc::new(Mutex::new(BTreeMap::new())),
+            Arc::new(Mutex::new(Outbound {
+                stream: server,
+                disconnected: false,
+            })),
+        )
+        .unwrap_err();
+        assert!(error.contains("before client teardown"));
+        fs::remove_file(framebuffer_path).unwrap();
+    }
+
+    #[test]
+    fn bound_keyboard_worker_disconnects_after_queue_overflow() {
+        let stem = format!(
+            "td-keyboard-overflow-test-{}-{}",
+            std::process::id(),
+            TEST_SEQ.fetch_add(1, Ordering::Relaxed)
+        );
+        let framebuffer_path = std::env::temp_dir().join(format!("{stem}.fb"));
+        let framebuffer = Framebuffer::test_file(&framebuffer_path, 8, 8, 8 * 4).unwrap();
+        let mut runtime = Runtime::new(framebuffer);
+        let subscription = runtime.subscribe_keyboard(99).unwrap();
+        let (receiver, stop) = subscription.split();
+        runtime
+            .commit(
+                SurfaceKey {
+                    client: 99,
+                    object: 7,
+                },
+                Surface {
+                    width: 1,
+                    height: 1,
+                    pixels: vec![1, 2, 3, 0],
+                    format: SHM_XRGB8888,
+                },
+            )
+            .unwrap();
+        for time in 0..=crate::runtime::MAX_PENDING_KEYBOARD_DELIVERIES {
+            runtime
+                .key(KeyInput {
+                    time: u32::try_from(time).unwrap(),
+                    key: 30,
+                    state: if time % 2 == 0 {
+                        KeyState::Pressed
+                    } else {
+                        KeyState::Released
+                    },
+                })
+                .unwrap();
+        }
+
+        let registrations = Arc::new(Mutex::new(BTreeMap::from([(
+            9,
+            KeyboardRegistration { after_revision: 0 },
+        )])));
+        let (server, _peer) = UnixStream::pair().unwrap();
+        let outbound = Arc::new(Mutex::new(Outbound {
+            stream: server,
+            disconnected: false,
+        }));
+        let error = supervise_keyboard_worker(
+            99,
+            receiver,
+            stop,
+            registrations,
+            Arc::new(Mutex::new(BTreeMap::new())),
+            Arc::clone(&outbound),
+        )
+        .unwrap_err();
+        assert!(error.contains("before client teardown"));
+        assert!(outbound.lock().unwrap().disconnected);
+        runtime.unsubscribe_keyboard(99);
+        fs::remove_file(framebuffer_path).unwrap();
+    }
+
+    #[test]
+    fn stopped_keyboard_worker_clears_queued_delete_reservations() {
+        let stem = format!(
+            "td-keyboard-stop-delete-test-{}-{}",
+            std::process::id(),
+            TEST_SEQ.fetch_add(1, Ordering::Relaxed)
+        );
+        let framebuffer_path = std::env::temp_dir().join(format!("{stem}.fb"));
+        let framebuffer = Framebuffer::test_file(&framebuffer_path, 8, 8, 8 * 4).unwrap();
+        let mut runtime = Runtime::new(framebuffer);
+        let subscription = runtime.subscribe_keyboard(99).unwrap();
+        let (receiver, stop) = subscription.split();
+        let pending = Arc::new(Mutex::new(BTreeMap::new()));
+        for id in [7, 8] {
+            pending.lock().unwrap().insert(id, Arc::new(Mutex::new(())));
+            assert!(runtime.queue_keyboard_delete(99, id).unwrap());
+        }
+        stop.stop();
+        let (server, _peer) = UnixStream::pair().unwrap();
+        assert!(keyboard_worker(
+            receiver,
+            stop,
+            Arc::new(Mutex::new(BTreeMap::new())),
+            Arc::clone(&pending),
+            Arc::new(Mutex::new(Outbound {
+                stream: server,
+                disconnected: false,
+            })),
+        )
+        .is_ok());
+        assert!(pending.lock().unwrap().is_empty());
+        runtime.unsubscribe_keyboard(99);
+        fs::remove_file(framebuffer_path).unwrap();
+    }
+
+    #[test]
     fn shm_commit_and_transient_remap_preserve_pixels_and_workspace() {
         let stem = format!(
             "td-wayland-test-{}-{}",
@@ -1475,7 +2959,8 @@ mod tests {
             .set_read_timeout(Some(Duration::from_secs(2)))
             .unwrap();
         let thread_runtime = Arc::clone(&runtime);
-        let worker = thread::spawn(move || serve_client(server, 7, thread_runtime));
+        let keymap = test_keymap();
+        let worker = thread::spawn(move || serve_client(server, 7, thread_runtime, keymap));
 
         let mut get_registry = wire::Builder::new();
         get_registry.u32(2);
@@ -1720,7 +3205,8 @@ mod tests {
         runtime.lock().unwrap().repaint().unwrap();
         let (server, client) = UnixStream::pair().unwrap();
         let thread_runtime = Arc::clone(&runtime);
-        let worker = thread::spawn(move || serve_client(server, 77, thread_runtime));
+        let keymap = test_keymap();
+        let worker = thread::spawn(move || serve_client(server, 77, thread_runtime, keymap));
 
         let mut connected = crate::client::present_for_test(client, &std::env::temp_dir()).unwrap();
         let frame = fs::read(&framebuffer_path).unwrap();
@@ -1818,7 +3304,7 @@ mod tests {
 
         let (server, mut peer) = UnixStream::pair().unwrap();
         peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
-        let mut client = Client::new(88, server, Arc::clone(&runtime)).unwrap();
+        let mut client = Client::new(88, server, Arc::clone(&runtime), test_keymap()).unwrap();
         let tracker = Arc::new(Mutex::new(ConfigureTracker::new()));
         {
             let mut tracker = tracker.lock().unwrap();
@@ -1915,7 +3401,7 @@ mod tests {
         let framebuffer = Framebuffer::test_file(&framebuffer_path, 4, 4, 16).unwrap();
         let runtime = Arc::new(Mutex::new(Runtime::new(framebuffer)));
         let (server, peer) = UnixStream::pair().unwrap();
-        let mut client = Client::new(1, server, runtime).unwrap();
+        let mut client = Client::new(1, server, runtime, test_keymap()).unwrap();
         drop(peer);
 
         let mut first = wire::Builder::new();
@@ -1941,7 +3427,7 @@ mod tests {
         let runtime = Arc::new(Mutex::new(Runtime::new(framebuffer)));
         let (server, mut peer) = UnixStream::pair().unwrap();
         peer.set_nonblocking(true).unwrap();
-        let mut client = Client::new(1, server, runtime).unwrap();
+        let mut client = Client::new(1, server, runtime, test_keymap()).unwrap();
         client.outbound.lock().unwrap().disconnected = true;
         let mut event = wire::Builder::new();
         event.u32(2);
@@ -1967,7 +3453,7 @@ mod tests {
         server.write_all(b"unread event").unwrap();
         drop(peer);
 
-        serve_client(server, 1, runtime).unwrap();
+        serve_client(server, 1, runtime, test_keymap()).unwrap();
 
         fs::remove_file(framebuffer_path).unwrap();
     }
@@ -1982,7 +3468,7 @@ mod tests {
         let framebuffer = Framebuffer::test_file(&framebuffer_path, 4, 4, 16).unwrap();
         let runtime = Arc::new(Mutex::new(Runtime::new(framebuffer)));
         let (server, peer) = UnixStream::pair().unwrap();
-        let mut client = Client::new(1, server, runtime).unwrap();
+        let mut client = Client::new(1, server, runtime, test_keymap()).unwrap();
         let mut get_registry = wire::Builder::new();
         get_registry.u32(2);
         let mut bytes = get_registry.message(1, 1).unwrap();
@@ -2015,7 +3501,7 @@ mod tests {
             .unwrap();
         drop(peer);
 
-        serve_client(server, 1, runtime).unwrap();
+        serve_client(server, 1, runtime, test_keymap()).unwrap();
 
         fs::remove_file(framebuffer_path).unwrap();
     }
@@ -2036,7 +3522,7 @@ mod tests {
         let framebuffer = Framebuffer::test_file(&framebuffer_path, 4, 4, 16).unwrap();
         let (server, _peer) = UnixStream::pair().unwrap();
         let runtime = Arc::new(Mutex::new(Runtime::new(framebuffer)));
-        let mut client = Client::new(1, server, runtime).unwrap();
+        let mut client = Client::new(1, server, runtime, test_keymap()).unwrap();
         assert!(client
             .create_buffer(pool.clone(), 2, 0, 4, 4, 15, SHM_XRGB8888)
             .is_err());
@@ -2061,7 +3547,7 @@ mod tests {
         let framebuffer = Framebuffer::test_file(&framebuffer_path, 8, 8, 32).unwrap();
         let (server, _peer) = UnixStream::pair().unwrap();
         let runtime = Arc::new(Mutex::new(Runtime::new(framebuffer)));
-        let mut client = Client::new(2, server, runtime).unwrap();
+        let mut client = Client::new(2, server, runtime, test_keymap()).unwrap();
         let mut configure = ConfigureTracker::new();
         configure.initial(44).unwrap();
         configure.acknowledge(44).unwrap();
@@ -2206,7 +3692,8 @@ mod tests {
             .unwrap();
         let (server, mut peer) = UnixStream::pair().unwrap();
         let thread_runtime = Arc::clone(&runtime);
-        let worker = thread::spawn(move || serve_client(server, 77, thread_runtime));
+        let keymap = test_keymap();
+        let worker = thread::spawn(move || serve_client(server, 77, thread_runtime, keymap));
         let mut malformed = Vec::new();
         malformed.extend_from_slice(&1u32.to_ne_bytes());
         malformed.extend_from_slice(&(7u32 << 16).to_ne_bytes());

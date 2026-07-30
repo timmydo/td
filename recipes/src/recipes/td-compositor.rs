@@ -12,6 +12,10 @@ const MODULES: &[(&str, &str)] = &[
         include_str!("../../../td-compositor/src/framebuffer.rs"),
     ),
     ("input", include_str!("../../../td-compositor/src/input.rs")),
+    (
+        "keyboard",
+        include_str!("../../../td-compositor/src/keyboard.rs"),
+    ),
     ("layout", include_str!("../../../td-compositor/src/layout.rs")),
     (
         "runtime",

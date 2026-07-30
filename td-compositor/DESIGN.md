@@ -60,8 +60,8 @@ from `/sys/class/graphics/fb0`; the compositor refuses any format other than
 that interpretation against a file-backed framebuffer.
 
 Input is QEMU's PS/2 keyboard and pointer through evdev. The compositor
-supports EV_KEY, EV_REL, and EV_SYN. It has a fixed US key map for compositor
-bindings only. The bindings deliberately follow Emacs navigation:
+supports EV_KEY, EV_REL, and EV_SYN. It has a fixed US key map. The
+compositor bindings deliberately follow Emacs navigation:
 
 - `Super+b`, `Super+f`, `Super+p`, and `Super+n` focus left, right, up, and
   down;
@@ -73,13 +73,18 @@ bindings only. The bindings deliberately follow Emacs navigation:
 
 The `Super+x` prefix survives key and modifier release, as an Emacs prefix
 does, and is consumed by the next non-modifier key press. Left and right
-modifier keys are tracked independently. Ctrl remains available for future
-client input. Client keyboard and pointer delivery, arbitrary keymaps, touch,
-calibration, gestures, and real GPUs are later increments.
+modifier keys are tracked independently. A compositor chord consumes both
+the press and release of its command key. Its modifier transitions still
+reach the focused client, as do ordinary keys and their releases.
+Arbitrary keymaps, touch, calibration, gestures, and real GPUs are later
+increments.
 
 Compositor commands act only on key presses. Evdev autorepeat records are
-ignored so a held `Super+x 2` cannot fall through into repeated workspace
-switches after consuming the prefix.
+ignored for both compositor and client delivery. A held `Super+x 2` therefore
+cannot fall through into repeated workspace switches after consuming the
+prefix. Ordinary keys omit XKB's `repeat=no` property and libxkbcommon 1.11
+treats symbol keys as repeatable by default. Clients combine that per-key
+property with `wl_keyboard.repeat_info`.
 
 The framebuffer is single-buffered from userspace's perspective. The renderer
 allocates its frame storage once, composes a full frame after scene changes,
@@ -90,6 +95,9 @@ Pointer motion is a scene change: each evdev `SYN_REPORT` currently performs
 that full repaint while holding the runtime lock. This is bounded enough for
 the supported QEMU PS/2 profile but is not a high-rate input design. Damage
 tracking or a throttled render loop is required before adding such hardware.
+The shared logical-seat boundary spans a key decision through its runtime
+delivery, so complete input deliveries serialize behind that lock; partial
+pointer records return before acquiring either lock.
 
 ## 3. Wayland surface
 
@@ -103,6 +111,7 @@ The first protocol surface is:
 - wl_compositor, wl_surface, and wl_region
 - wl_shm, wl_shm_pool, and wl_buffer
 - wl_output
+- wl_seat and wl_keyboard
 - xdg_wm_base, xdg_surface, and xdg_toplevel
 - wl_callback completion and wl_buffer release
 
@@ -183,26 +192,90 @@ acknowledgeable until the new initial serial is acknowledged; they cannot
 authorize a buffer in the new mapping generation.
 Decoration, clipboard, drag-and-drop, subsurfaces, popups, output
 reconfiguration, fractional scale, screen capture, data devices, and client
-input are not yet advertised. Unknown objects, malformed sizes, invalid object
-reuse, missing file descriptors, and unsupported requests disconnect only that
-client.
+pointer input are not yet advertised. Unknown objects, malformed sizes,
+invalid object reuse, missing file descriptors, and unsupported requests
+disconnect only that client.
+
+The server advertises `wl_seat` version 7 as `td-seat0` with only the keyboard
+capability. Every `wl_keyboard` receives a dependency-free, self-contained US
+XKB v1 keymap through a descriptor for one process-wide backing file. The
+file is created beside the Wayland socket in its private runtime directory,
+created owner-only and normalized to mode 0600 so an unusual umask cannot
+remove owner read access, reopened read-only, and unlinked before the server
+accepts clients. Repeated `get_keyboard` requests send descriptors for that
+same inode rather than creating unbounded keymap files. Repeat information is
+25 keys per second after a 600 millisecond delay. The map covers the PC
+alphanumeric block, modifiers, function keys, navigation keys, keypad, and
+the supported media keys. It uses the standard XKB masks: Shift, Control,
+Mod1 for Alt, Mod2 for Num Lock, and Mod4 for Super. Caps Lock and Num Lock
+are sent as locked rather than depressed modifiers. Modifier and lock keys
+are explicitly non-repeating. The first profile's keypad is digits-only:
+Num Lock state is reported but does not select navigation symbols.
+
+Only the visible activated XDG toplevel has keyboard focus. Focus changes
+produce an ordered leave, enter, and modifier snapshot; enter carries the
+forwarded keys that remain physically held. A keyboard bound after focus
+already exists receives the same enter/modifier snapshot after its keymap.
+One routed seat event receives one serial shared by every existing keyboard
+resource to which that event is delivered. A newly bound keyboard's initial
+enter and modifier snapshot are separate events with fresh serials.
+The per-client runtime queue is active only while that client owns at least
+one keyboard resource, so keyboard-agnostic clients receive no deliveries.
+Evdev timestamps cross the adapter as explicit milliseconds modulo 2^32.
+They retain evdev's default realtime clock and can step when wall time changes;
+selecting a monotonic clock would require a separately reviewed ioctl surface.
+All event nodes contribute to one logical seat state. Duplicate presses and
+unmatched releases are suppressed, a key held on two devices remains down
+until both release it, and an event node that closes releases its contribution.
+That synthetic release burst holds the same seat-ordering boundary as normal
+events, so another device cannot interleave halfway through it.
+For a modifier key, the forwarded key transition precedes the resulting
+modifier snapshot, matching the ordering established by wlroots.
+After `SYN_DROPPED`, the adapter releases that node's state, cancels a partial
+prefix, discards records through the next `SYN_REPORT`, and resumes without
+guessing the lost state.
+Before a surface id is released, its `wl_display.delete_id` is placed in the
+bounded keyboard queue after the focus update. The worker therefore writes
+the queued leave first without making request dispatch wait for socket
+backpressure. The numeric object id has an independent reservation until that
+ordered `delete_id` write completes, so its premature reuse cannot stall
+unrelated ids. Queue saturation closes the subscription and makes deletion
+fail closed rather than allowing a stale surface reference onto the wire.
+Keyboard objects may be released at their negotiated protocol version.
+`get_pointer` and `get_touch` fail with `wl_seat.missing_capability` because
+neither capability is advertised.
 
 Resource ceilings are part of the protocol boundary: at most 32 clients run
 at once, each has at most 512 objects, 64 queued descriptors, one pending
-layout wakeup, and 32 MiB of committed pixels. Each XDG surface has at most 32
-current-generation configures. During remap it may additionally retain the
-previous generation's bounded set while the one new initial serial is pending,
-for at most 33 serials total; the tracker enforces the retained-generation
-bound itself. Output pixels, the bundled demo's generated buffer, and one
-client's aggregate committed pixels share the same 32 MiB ceiling, so every
-accepted output has a representable single-client tile. A framebuffer's
-stride-padded shadow allocation has a separate 64 MiB ceiling. Framebuffer and
-buffer dimensions share a 16,384-pixel ceiling. At four bytes per pixel the
-area ceiling is 8,388,608 pixels: tight 3840x2160 is accepted, while
-4096x2160 is rejected. The complete scene retains at most 128 MiB. Rendering
-clips rows and columns to the output before visiting pixels. These are
-availability bounds against a same-user client, not isolation between
-mutually distrusting users.
+layout wakeup, 64 pending keyboard deliveries, and 32 MiB of committed pixels.
+Each XDG surface has at most 32 current-generation configures. During remap it
+may additionally retain the previous generation's bounded set while the one
+new initial serial is pending, for at most 33 serials total; the tracker
+enforces the retained-generation bound itself. Output pixels, the bundled
+demo's generated buffer, and one client's aggregate committed pixels share
+the same 32 MiB ceiling, so every accepted output has a representable
+single-client tile. A framebuffer's stride-padded shadow allocation has a
+separate 64 MiB ceiling. Framebuffer and buffer dimensions share a
+16,384-pixel ceiling. At four bytes per pixel the area ceiling is 8,388,608
+pixels: tight 3840x2160 is accepted, while 4096x2160 is rejected. The complete
+scene retains at most 128 MiB. Rendering clips rows and columns to the output
+before visiting pixels. These are availability bounds against a same-user
+client, not isolation between mutually distrusting users.
+
+A full keyboard queue closes that client's runtime subscription instead of
+blocking the evdev reader. The keyboard worker drains the bounded queue and
+disconnects the client when it observes the closed subscription. If that
+worker is already blocked writing to a client that does not read, the
+disconnect waits for the same accepted per-client availability gap as the
+configure worker; other clients and the input reader continue.
+A request that illegally reuses the exact id whose ordered `delete_id` is
+blocked on that socket also waits for the write, preserving ordering instead
+of letting request dispatch overtake it.
+A client that stalls during the initial keymap and focus burst holds its
+keyboard-registration ordering guard; its worker queues behind that guard
+until saturation closes the subscription. The worker cannot observe that
+closure or disconnect the client until the blocked initial write and guard
+unblock, so this is part of the accepted per-client availability gap below.
 
 These ceilings do not yet bound time. A connected client that stops reading
 events can block its configure worker on a socket write and retain one client
@@ -220,14 +293,16 @@ elapsed wall time.
 
 ## 4. Unsafe confinement
 
-Wayland carries wl_shm descriptors as SCM_RIGHTS ancillary data on its Unix
-stream. Stable Rust 1.96 exposes no stable ancillary-data API. The user
-approved one new target-side exception for this transport.
+Wayland carries wl_shm and wl_keyboard keymap descriptors as SCM_RIGHTS
+ancillary data on its Unix stream. Stable Rust 1.96 exposes no stable
+ancillary-data API. The user approved one new target-side exception for this
+transport.
 
 `td-compositor/src/sys.rs` contains the sole scoped `unsafe` block. One raw
 `syscall3` body carries exactly:
 
-- sendmsg(2), to send the demo client's wl_shm descriptor or a test request;
+- sendmsg(2), to send the demo client's wl_shm descriptor, the server's XKB
+  keymap descriptor, or a test request;
 - recvmsg(2), to receive wl_shm pool descriptors; and
 - close(2), to release a received descriptor after it has been safely
   duplicated through `/proc/self/fd/N`.
@@ -285,6 +360,20 @@ The landing must prove:
   the latest deferred layout rather than stalling;
 - a real server/client socket test resizes the demo after a second map, changes
   activation without resizing, enters fullscreen, and crosses workspaces;
+- wl_seat advertises only keyboard, sends a structurally validated
+  self-contained keymap descriptor, repeat information, held keys, and all
+  four modifier fields;
+- the exact serialized keymap parses with libxkbcommon 1.11, where an ordinary
+  key reports repeatable and an excluded modifier reports non-repeating;
+  in-tree tests also pin its delimiter, type, explicit repeat exclusions,
+  ordinary-key omissions, symbol, and evdev-code invariants without adding
+  libxkbcommon to the target graph;
+- focus changes and ordinary evdev keys cross the bounded keyboard worker in
+  order, while pre-registration events and intercepted Emacs chords do not;
+- a threaded server/client socket test binds the seat and keyboard, receives
+  focus and key events, and tears down a live keyboard registration;
+- keyboard model tests cover held-key snapshots, cross-client focus, modifier
+  locks, key releases, registration cutoffs, and queue saturation;
 - software composition clips surfaces to tiles and never indexes outside a
   frame;
 - the image contains all three binaries, the service order is checkable, and
@@ -319,7 +408,12 @@ when mapped-view geometry or state changes. The capacity-one channel
 coalesces bursts without losing the latest snapshot, and a stop flag plus the
 same wake channel terminates the configure worker without polling or sleeps.
 The configure tracker is a pure state machine whose tests inject serials and
-view states; socket tests cover only encoding and cross-thread delivery.
+view states; socket tests cover only encoding and cross-thread delivery. The
+keyboard state machine similarly consumes explicit focus, key, and modifier
+values and returns routed events. It has no evdev, socket, file, clock, or
+global serial access. Runtime tests cover focus routing and bounded queues;
+protocol tests cover XKB descriptor and event encoding, while one narrow
+threaded socket test proves registration, delivery, and teardown compose.
 
 Every layout operation has table-driven model tests covering focus, geometry,
 tree collapse, and conservation of mapped views. Each tested command sequence
@@ -335,9 +429,9 @@ shipped image.
 
 ## 8. Deferred UI stack
 
-The next increment is wl_seat with focused wl_keyboard and wl_pointer
-delivery. A bitmap font and launcher, clipboard, terminal, hotplug, and real
-DRM/KMS profiles follow. General Wayland toolkit compatibility is not claimed
-until the missing core protocols have explicit tests. Hardware acceleration,
-niri, portals, PipeWire, Xwayland, and a C desktop stack remain optional
-consumers rather than foundations of td's UI.
+The next increment is focused `wl_pointer` delivery from the existing evdev
+motion path. A bitmap font and launcher, clipboard, terminal, hotplug, and
+real DRM/KMS profiles follow. General Wayland toolkit compatibility is not
+claimed until the missing core protocols have explicit tests. Hardware
+acceleration, niri, portals, PipeWire, Xwayland, and a C desktop stack remain
+optional consumers rather than foundations of td's UI.

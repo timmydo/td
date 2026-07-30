@@ -393,6 +393,9 @@ impl Layout {
             }) {
                 return Err(format!("workspace {number} fullscreen leaf is absent"));
             }
+            if workspace.fullscreen.is_some() && workspace.fullscreen != workspace.focused {
+                return Err(format!("workspace {number} fullscreen leaf is not focused"));
+            }
         }
         for (key, number) in &self.homes {
             if !valid_workspace(*number) || !self.workspaces.contains_key(number) {
@@ -401,6 +404,14 @@ impl Layout {
                     key.client, key.object
                 ));
             }
+        }
+        let mut activated = self
+            .views(VIRTUAL_EXTENT, VIRTUAL_EXTENT, 0)
+            .into_iter()
+            .filter(|view| view.visible && view.activated)
+            .map(|view| view.key);
+        if activated.next() != self.focused() || activated.next().is_some() {
+            return Err("layout focus does not match exactly one activated view".into());
         }
         Ok(())
     }
