@@ -67,6 +67,8 @@ impl Fds {
             Some(Fd::Inherit(0)) => std::io::stdin().is_terminal(),
             Some(Fd::Inherit(1)) => std::io::stdout().is_terminal(),
             Some(Fd::Inherit(2)) => std::io::stderr().is_terminal(),
+            // An opened `/dev/tty` is one too, which `read -p` turns on.
+            Some(Fd::File(f)) => f.lock().is_ok_and(|g| g.is_terminal()),
             _ => false,
         }
     }
@@ -166,6 +168,24 @@ pub fn read_byte(sh: &Shell, fd: u32) -> std::io::Result<Option<u8>> {
         }
     };
     Ok(if n == 0 { None } else { Some(one[0]) })
+}
+
+/// Whether a read on `fd` is READY -- meaning it would not block, which is what
+/// `poll(2)` answers and hence what `read -t 0` and `-t N` turn on. NOT "bytes
+/// remain": a file at EOF, an exhausted buffer and a closed descriptor are all
+/// ready, because a read on them returns (0, or an error) immediately. `None`
+/// means td-sh cannot tell, which is exactly the inherited descriptor -- it may
+/// be a pipe or a terminal with nothing in it, and only `poll(2)` distinguishes
+/// that from one holding data. td-sh has no syscall surface (AGENTS.md makes one
+/// an amendment), so the caller reports the limit rather than guessing.
+pub fn read_ready(sh: &Shell, fd: u32) -> Option<bool> {
+    match sh.fds.get(fd) {
+        // Everything td-sh's own table holds is ready; only what it inherited
+        // from the host can block.
+        Some(Fd::Null) | Some(Fd::File(_)) | Some(Fd::ReadBuf(_)) | Some(Fd::Closed)
+        | Some(Fd::WriteBuf(_)) | None => Some(true),
+        Some(Fd::Inherit(_)) => None,
+    }
 }
 
 /// A descriptor saved by `apply_redirs` so `restore_redirs` can put it back.

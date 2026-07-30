@@ -7,7 +7,7 @@
 //! the redirections in force.
 
 use crate::exec::{Local, Shell, Sig, R};
-use crate::process::{self, read_byte, write_fd};
+use crate::process::{self, write_fd};
 use crate::{ast, exec};
 
 #[derive(Clone, Copy, Debug)]
@@ -1007,8 +1007,6 @@ fn read_dec(chars: &[char], start: usize) -> (i64, usize) {
     (v, j)
 }
 
-
-
 /// One escape, from `bb_process_escape_sequence`
 /// (libbb/process_escape_sequence.c). `i` points just PAST the backslash.
 /// Returns the byte and the index to resume at; an unrecognised sequence returns
@@ -1096,7 +1094,6 @@ fn process_escapes(raw: &str, out: &mut Vec<u8>) -> bool {
     }
     false
 }
-
 
 // The `'c`/`"c` printf char-code form: a leading `'` or `"` makes the value the
 // first BYTE after the quote (0 if nothing follows). Shared by the integer and
@@ -1811,15 +1808,22 @@ fn getopts_lookup(optstring: &str, c: char) -> Option<bool> {
     None
 }
 
-/// POSIX `read`, with dash's option surface: `-r` and `-p prompt`, clustered
-/// (`-rp x`) or smooshed (`-pfoo`), `--` ending them. Every other letter is a
-/// usage error (status 2, which does NOT end the shell -- `read` is not a
-/// special builtin). That includes dash's own `-t`: rejecting a timeout td-sh
-/// cannot implement is a deliberate DEVIATION from dash, not its surface.
+/// ash's `read`: busybox's `shell_builtin_read` (shell/shell_common.c), driven by
+/// `readcmd`'s `nextopt("p:u:rt:n:sd:")` (ash.c:14297). Options cluster and a
+/// value-taking letter swallows the rest of its word (`-rn1`) or the next one.
+/// Where dash has only `-r`/`-p` and insists on a variable name, this takes
+/// `-n -s -t -u -d` and, given NO names, sets `REPLY` unsplit and untrimmed. An
+/// unknown letter is status 2, which does NOT end the shell -- `read` is not a
+/// special builtin.
 fn read(sh: &mut Shell, argv: &[String]) -> R<()> {
     let mut i = 1usize;
     let mut raw = false;
-    let mut prompt: Option<String> = None;
+    let mut silent = false;
+    let mut opt_p: Option<String> = None;
+    let mut opt_u: Option<String> = None;
+    let mut opt_t: Option<String> = None;
+    let mut opt_n: Option<String> = None;
+    let mut opt_d: Option<String> = None;
     while let Some(arg) = argv.get(i) {
         let bytes = arg.as_bytes();
         if bytes.first() != Some(&b'-') || bytes.len() < 2 {
@@ -1833,27 +1837,37 @@ fn read(sh: &mut Shell, argv: &[String]) -> R<()> {
         let mut k = 1usize;
         while let Some(&c) = bytes.get(k) {
             k += 1;
+            // A value-taking letter swallows the rest of its word, else the next
+            // word -- which is why `read -rn1 v` and `read -r -n 1 v` agree, and
+            // why `-d ''` reaches us as an empty string rather than a missing arg.
+            let value = if matches!(c, b'p' | b'u' | b't' | b'n' | b'd') {
+                let rest = arg.get(k..).unwrap_or("");
+                k = bytes.len();
+                if rest.is_empty() {
+                    match argv.get(i) {
+                        Some(next) => {
+                            i += 1;
+                            Some(next.clone())
+                        }
+                        None => {
+                            err_line(sh, &format!("read: No arg for -{} option", c as char));
+                            return status(sh, 2);
+                        }
+                    }
+                } else {
+                    Some(rest.to_string())
+                }
+            } else {
+                None
+            };
             match c {
                 b'r' => raw = true,
-                b'p' => {
-                    // The rest of the word is the prompt, else the next word is.
-                    let rest = arg.get(k..).unwrap_or("");
-                    if rest.is_empty() {
-                        match argv.get(i) {
-                            Some(next) => {
-                                prompt = Some(next.clone());
-                                i += 1;
-                            }
-                            None => {
-                                err_line(sh, "read: No arg for -p option");
-                                return status(sh, 2);
-                            }
-                        }
-                    } else {
-                        prompt = Some(rest.to_string());
-                    }
-                    k = bytes.len();
-                }
+                b's' => silent = true,
+                b'p' => opt_p = value,
+                b'u' => opt_u = value,
+                b't' => opt_t = value,
+                b'n' => opt_n = value,
+                b'd' => opt_d = value,
                 _ => {
                     err_line(sh, &format!("read: Illegal option -{}", c as char));
                     return status(sh, 2);
@@ -1861,156 +1875,276 @@ fn read(sh: &mut Shell, argv: &[String]) -> R<()> {
             }
         }
     }
-    // dash prompts before validating the operands, only when it is actually
-    // reading from a terminal, and writes the prompt bare (no newline).
-    if let Some(p) = &prompt {
-        if sh.fds.is_terminal(0) {
+
+    let names: Vec<String> = argv.iter().skip(i).cloned().collect();
+    // Every name is checked BEFORE anything is read, and a bad one is status 1
+    // with the name quoted -- ash copies bash's message here, and it is NOT the
+    // usage 2 that a bad option gets.
+    for name in &names {
+        if !ast::is_name(name) {
+            err_line(sh, &format!("read: '{name}': bad variable name"));
+            return status(sh, 1);
+        }
+    }
+
+    // `bb_strtou`: decimal digits and nothing else -- no sign, no space, no
+    // trailing junk. `-n 0` is "no limit", as bash 3.2 also has it.
+    let nchars = match &opt_n {
+        Some(s) => match bb_strtoi(s) {
+            Some(v) => i64::from(v),
+            None => {
+                err_line(sh, "read: invalid count");
+                return status(sh, 2);
+            }
+        },
+        None => 0,
+    };
+    let timeout = match &opt_t {
+        Some(s) => match parse_read_timeout(s) {
+            Some(ms) => Some(ms),
+            None => {
+                err_line(sh, "read: invalid timeout");
+                return status(sh, 2);
+            }
+        },
+        None => None,
+    };
+    let fd: u32 = match &opt_u {
+        Some(s) => match bb_strtoi(s) {
+            Some(v) => v.unsigned_abs(),
+            None => {
+                err_line(sh, "read: invalid file descriptor");
+                return status(sh, 2);
+            }
+        },
+        None => 0,
+    };
+
+    // `-t 0` asks whether a read would block and reads NOTHING, not even setting
+    // REPLY. A nonzero `-t` needs the same answer, just later: without it the read
+    // cannot be abandoned. So both are answered from the descriptor table, and
+    // where it cannot answer -- an inherited descriptor, which may be a pipe or an
+    // idle terminal -- both say so rather than guess. Guessing "ready" would pass
+    // the corpus case while misleading every caller, and for a nonzero timeout it
+    // would HANG where ash returns.
+    if let Some(ms) = timeout {
+        match process::read_ready(sh, fd) {
+            // A read that cannot block reaches the same answer with or without a
+            // deadline, so a nonzero timeout is simply never reached.
+            Some(true) if ms > 0 => {}
+            Some(true) => return ok(sh),
+            Some(false) => return status(sh, 1),
+            None => {
+                let what = if ms == 0 { "-t 0" } else { "-t" };
+                err_line(
+                    sh,
+                    &format!("read: {what}: cannot time this descriptor without poll(2)"),
+                );
+                return status(sh, 2);
+            }
+        }
+    }
+
+    // The prompt goes to stderr, and ONLY when the source is a terminal.
+    if let Some(p) = &opt_p {
+        if sh.fds.is_terminal(fd) {
             let _ = write_fd(sh, 2, p.as_bytes());
         }
     }
-    let names: Vec<String> = argv.iter().skip(i).cloned().collect();
-    if names.is_empty() {
-        // dash requires at least one variable name; there is no bare-`read`
-        // fallback to $REPLY (that is a bash/ksh extension).
-        err_line(sh, "read: arg count");
+
+    // `-s` (no echo) and `-n` (return without a newline) are both termios work,
+    // which td-sh has no syscall surface for. On anything but a terminal they need
+    // none and the byte semantics below are complete; ON one they cannot be
+    // honoured, and failing loudly beats the two silent wrong answers -- echoing a
+    // password, or waiting for the Enter the caller was told not to need.
+    if sh.fds.is_terminal(fd) && (silent || nchars > 0) {
+        let what = if silent { "-s" } else { "-n" };
+        err_line(sh, &format!("read: {what}: needs termios on a terminal"));
         return status(sh, 2);
     }
-    for bad in &names {
-        if !ast::is_name(bad) {
-            err_line(sh, &format!("read: {bad}: bad variable name"));
-            return status(sh, 2);
-        }
-    }
-
-    let (line, terminated) = match read_logical_line(sh, raw)? {
-        Some(l) => l,
-        None => {
-            // EOF with nothing read at all: clear the named variables and fail.
-            for name in &names {
-                sh.set_var(name, "")?;
-            }
-            return status(sh, 1);
-        }
+    let ifs = sh.get_var("IFS").unwrap_or_else(|| " \t\n".to_string());
+    let ifs_bytes: Vec<u8> = ifs.as_bytes().to_vec();
+    let is_ifs = |c: u8| ifs_bytes.contains(&c);
+    // C's `isspace` in the C locale, which is what `shell_builtin_read` uses to
+    // tell a whitespace IFS char from a delimiting one.
+    let is_space = |c: u8| matches!(c, b' ' | b'\t' | b'\n' | 0x0b | 0x0c | b'\r');
+    // `-d ''` leaves `opt_d[0]` at the terminator, so the delimiter is NUL -- and
+    // because the NUL skip below comes AFTER the delimiter test, that works.
+    let delim: u8 = match &opt_d {
+        Some(d) => d.as_bytes().first().copied().unwrap_or(0),
+        None => b'\n',
     };
 
-    {
-        let ifs = sh.get_var("IFS").unwrap_or_else(|| " \t\n".to_string());
-        let fields = split_read(&line, &ifs, names.len());
-        for (idx, name) in names.iter().enumerate() {
-            let value = fields.get(idx).cloned().unwrap_or_default();
-            sh.set_var(name, &value)?;
-        }
+    let mut buffer: Vec<u8> = Vec::new();
+    let mut startword = 1i32;
+    let mut backslash = false;
+    let mut vi = 0usize;
+    let mut code = 0i32;
+    // `-n 0` is no limit at all, so it is the absence of one rather than a count.
+    let mut remaining: Option<i64> = if nchars > 0 { Some(nchars) } else { None };
+    // What one input byte does. `Stop` is the C `break` -- it does NOT tick the
+    // `-n` count -- while `Skip` is its `continue`, which does.
+    enum Step {
+        Put,
+        Skip,
+        Stop,
     }
-    // A line ended by EOF rather than a newline still assigns, but reports failure.
-    if terminated {
-        ok(sh)
-    } else {
-        status(sh, 1)
-    }
-}
-
-/// Read one input line, honouring backslash-newline continuation unless `-r`.
-/// Returns `None` only at end-of-input with nothing read (so a blank line reads as
-/// an empty, successful line). The bool is whether a newline terminated the line: a
-/// partial line at EOF returns `false`, which makes `read` report failure. `None`
-/// is end of input with nothing read -- or a reported I/O error, which dash also
-/// leaves the destinations empty for.
-fn read_logical_line(sh: &mut Shell, raw: bool) -> R<Option<(String, bool)>> {
-    let mut bytes: Vec<u8> = Vec::new();
-    let mut read_anything = false;
     loop {
-        let seg_start = bytes.len();
-        let mut got_newline = false;
-        loop {
-            match read_byte(sh, 0) {
-                Ok(Some(b'\n')) => {
-                    read_anything = true;
-                    got_newline = true;
-                    break;
-                }
-                Ok(Some(byte)) => {
-                    read_anything = true;
-                    bytes.push(byte);
-                }
-                Ok(None) => break,
-                Err(e) => {
-                    // A read error fails the BUILTIN; it does not kill the shell
-                    // (`read x < some-directory` is EISDIR). dash breaks out of
-                    // its read loop and falls into the ordinary assignment path,
-                    // so the destinations end up empty -- which is what returning
-                    // end-of-input here does.
-                    err_line(sh, &format!("read: {e}"));
-                    return Ok(None);
-                }
-            }
-        }
-        // A trailing backslash on this physical line (unless `-r`) splices the next.
-        let seg_ends_bs = bytes.get(seg_start..).is_some_and(|s| s.last() == Some(&b'\\'));
-        if !raw && seg_ends_bs {
-            bytes.pop();
-            if got_newline {
-                continue;
-            }
-        }
-        if !read_anything {
-            return Ok(None);
-        }
-        // Bytes are decoded as UTF-8 (lossy) so multibyte input is not mangled.
-        return Ok(Some((String::from_utf8_lossy(&bytes).into_owned(), got_newline)));
-    }
-}
-
-/// Split a read line into at most `n` fields on IFS, with the last field taking
-/// the unsplit remainder (POSIX `read` semantics).
-fn split_read(line: &str, ifs: &str, n: usize) -> Vec<String> {
-    if n == 0 {
-        return Vec::new();
-    }
-    let ws: Vec<char> = ifs.chars().filter(|c| *c == ' ' || *c == '\t' || *c == '\n').collect();
-    let all: Vec<char> = ifs.chars().collect();
-    let is_ws = |c: char| ws.contains(&c);
-    let is_sep = |c: char| all.contains(&c);
-
-    let chars: Vec<char> = line.chars().collect();
-    let mut fields: Vec<String> = Vec::new();
-    let mut i = 0usize;
-    // Trim leading IFS whitespace.
-    while chars.get(i).is_some_and(|&c| is_ws(c)) {
-        i += 1;
-    }
-    while i < chars.len() {
-        if fields.len() == n - 1 {
-            // Last field: the remainder, with trailing IFS whitespace removed.
-            let mut end = chars.len();
-            while end > i && chars.get(end - 1).is_some_and(|&c| is_ws(c)) {
-                end -= 1;
-            }
-            let rest: String = chars.get(i..end).unwrap_or(&[]).iter().collect();
-            fields.push(rest);
-            return fields;
-        }
-        let mut field = String::new();
-        while let Some(&c) = chars.get(i) {
-            if is_sep(c) {
+        let c = match process::read_byte(sh, fd) {
+            Ok(Some(b)) => b,
+            Ok(None) => {
+                // EOF still assigns what was read; only a timeout would not.
+                code = 1;
                 break;
             }
-            field.push(c);
-            i += 1;
+            // A read error is SILENT, as in ash: the descriptor being unreadable
+            // (`-u` naming a closed one) reports only through the status.
+            Err(_) => {
+                code = 1;
+                break;
+            }
+        };
+        let step = 'step: {
+            if !raw {
+                if backslash {
+                    backslash = false;
+                    // Backslash-newline is a continuation: both bytes vanish.
+                    // Anything else is taken literally, which is why an escaped
+                    // delimiter or IFS char does not end a field.
+                    break 'step if c == b'\n' { Step::Skip } else { Step::Put };
+                }
+                if c == b'\\' {
+                    backslash = true;
+                    break 'step Step::Skip;
+                }
+            }
+            if c == delim {
+                break 'step Step::Stop;
+            }
+            if c == 0 {
+                break 'step Step::Skip;
+            }
+            // Splitting happens ONLY with names: `read` and `read REPLY` differ.
+            if !names.is_empty() {
+                let ifs_here = is_ifs(c);
+                if startword > 0 && ifs_here {
+                    if is_space(c) {
+                        break 'step Step::Skip;
+                    }
+                    // A non-space IFS char: the first one after a field still
+                    // separates, a second one starts an empty field.
+                    startword -= 1;
+                    if startword == 1 {
+                        break 'step Step::Skip;
+                    }
+                }
+                startword = 0;
+                if vi + 1 < names.len() && ifs_here {
+                    let value = String::from_utf8_lossy(&buffer).into_owned();
+                    buffer.clear();
+                    if let Some(name) = names.get(vi) {
+                        sh.set_var(name, &value)?;
+                    }
+                    vi += 1;
+                    startword = if is_space(c) { 2 } else { 1 };
+                    break 'step Step::Skip;
+                }
+            }
+            Step::Put
+        };
+        match step {
+            Step::Stop => break,
+            Step::Put => buffer.push(c),
+            Step::Skip => {}
         }
-        fields.push(field);
-        // Consume the separator: whitespace run, or a single non-ws separator
-        // plus surrounding whitespace.
-        while chars.get(i).is_some_and(|&c| is_ws(c)) {
-            i += 1;
-        }
-        if chars.get(i).is_some_and(|&c| is_sep(c) && !is_ws(c)) {
-            i += 1;
-            while chars.get(i).is_some_and(|&c| is_ws(c)) {
-                i += 1;
+        if let Some(left) = remaining.as_mut() {
+            *left -= 1;
+            if *left == 0 {
+                break;
             }
         }
     }
-    fields
+    let _ = silent; // -s only suppresses terminal echo, which needs no termios here
+
+    if names.is_empty() {
+        // No names, no IFS removal of any kind.
+        let value = String::from_utf8_lossy(&buffer).into_owned();
+        sh.set_var("REPLY", &value)?;
+    } else {
+        while buffer.last().is_some_and(|&b| is_space(b) && is_ifs(b)) {
+            buffer.pop();
+        }
+        // The last variable takes the remainder INCLUDING delimiters, but a
+        // single trailing non-space delimiter is eaten when there were exactly
+        // as many fields as names: `IFS=: read x y` gives `Y` for `X:Y:` and
+        // `Y:Z:` for `X:Y:Z:`.
+        if buffer.last().is_some_and(|&b| is_ifs(b)) {
+            let mut keep = buffer.len() - 1;
+            while keep > 0 {
+                let prev = buffer.get(keep - 1).copied().unwrap_or(0);
+                if is_space(prev) && is_ifs(prev) {
+                    keep -= 1;
+                } else {
+                    break;
+                }
+            }
+            let first_ifs = buffer.iter().position(|&b| is_ifs(b)).unwrap_or(buffer.len());
+            if first_ifs >= keep {
+                buffer.truncate(keep);
+            }
+        }
+        let value = String::from_utf8_lossy(&buffer).into_owned();
+        if let Some(name) = names.get(vi) {
+            sh.set_var(name, &value)?;
+        }
+        for name in names.iter().skip(vi + 1) {
+            sh.set_var(name, "")?;
+        }
+    }
+    if code == 0 {
+        ok(sh)
+    } else {
+        status(sh, code)
+    }
+}
+
+/// busybox's `bb_strtou` as `read` uses it: decimal digits only. No sign, no
+/// leading space, no trailing junk -- `+2`, ` 2` and `2x` are all errors. It
+/// returns an `unsigned`, so a value past `u32::MAX` is one too.
+fn bb_strtou(s: &str) -> Option<u32> {
+    if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    s.parse::<u32>().ok()
+}
+
+/// `bb_strtou` for the two options busybox stores in an `int` and then rejects
+/// when negative: `-n`'s count and `-u`'s descriptor stop at `INT_MAX`, where
+/// `-t`'s milliseconds keep the full unsigned range.
+fn bb_strtoi(s: &str) -> Option<i32> {
+    bb_strtou(s).and_then(|v| i32::try_from(v).ok())
+}
+
+/// `-t`'s timeout in milliseconds. bash 4.3 takes `N.NNN`, and busybox reads at
+/// most THREE fractional digits: a non-digit AMONG THOSE THREE is an error, while
+/// the fourth character on is never examined at all -- so `0.12x` is invalid and
+/// `0.123x` is not. A bare trailing `.` is fine.
+fn parse_read_timeout(s: &str) -> Option<u64> {
+    let (whole, frac) = match s.split_once('.') {
+        Some((w, f)) => (w, Some(f)),
+        None => (s, None),
+    };
+    let mut ms = bb_strtou(whole)? as u64;
+    ms = ms.saturating_mul(1000);
+    if let Some(frac) = frac {
+        let mut scale = 100u64;
+        for b in frac.bytes().take(3) {
+            let d = (b as char).to_digit(10)?;
+            ms = ms.saturating_add(u64::from(d) * scale);
+            scale /= 10;
+        }
+    }
+    Some(ms)
 }
 
 /// Signal numbers and the names `trap` accepts and prints, Linux/x86-64 order.
@@ -4349,35 +4483,184 @@ mod tests {
 
     #[test]
     fn read_rejects_a_bad_variable_name() {
-        // dash validates the operands; `getopts` in this file does too.
-        let (status, _, err) = run_capturing("echo hi | read 1bad");
-        assert_eq!(status, 2);
-        assert!(err.contains("bad variable name"), "err: {err:?}");
+        // ash checks every name BEFORE reading and copies bash's message, which
+        // QUOTES the name -- and it is status 1, not the usage 2 a bad option gets.
+        for bad in ["1bad", "a-b", ""] {
+            let (status, _, err) = run_capturing(&format!("echo hi | read '{bad}'"));
+            assert_eq!(status, 1, "read '{bad}'");
+            assert!(err.contains(&format!("'{bad}': bad variable name")), "err: {err:?}");
+        }
     }
 
     #[test]
-    fn read_takes_only_dashs_option_surface() {
-        // `-r` still works, clustered or not, and `--` ends the options. Printed
-        // with `printf %s`, not `echo`, which would eat the backslash this asserts.
+    fn read_takes_ashs_option_surface() {
+        // `-r` keeps the backslash. Printed with `printf %s`, not `echo`, which
+        // would expand it again.
         assert_eq!(
             run_capturing("printf 'a\\\\b\\n' | { read -r v; printf '[%s]\\n' \"$v\"; }").1,
             "[a\\b]\n"
         );
-        // bash-only flags (and dash's own -t, which needs a timeout td-sh cannot
-        // implement) are usage errors, not silently ignored.
-        for bad in ["-n 1", "-N 1", "-d :", "-u 3", "-t 1", "-s", "-rn1"] {
+        // A value-taking letter swallows the rest of its word, so `-rn1` is `-r -n 1`.
+        assert_eq!(run_capturing("echo hi | { read -rn1 v; echo var=$v; }").1, "var=h\n");
+        assert_eq!(run_capturing("echo hi | { read -pfoo v; echo $v; }").1, "hi\n");
+        assert_eq!(run_capturing("echo hi | { read -p 'x? ' v; echo $v; }"), (0, "hi\n".into(), String::new()));
+        // An unknown letter is still a usage error rather than silently ignored.
+        for bad in ["-N 1", "-q", "-zz"] {
             let (status, _, err) = run_capturing(&format!("echo hi | {{ read {bad} v; }}"));
-            assert_eq!(status, 2, "read {bad} should be a usage error");
+            assert_eq!(status, 2, "read {bad}");
             assert!(err.contains("Illegal option"), "read {bad} err: {err:?}");
         }
-        // dash requires a variable name; there is no bare-`read` $REPLY fallback.
-        let (status, _, err) = run_capturing("echo hi | read");
+    }
+
+    #[test]
+    fn read_without_names_sets_reply_unsplit() {
+        // With no names there is no field splitting AND no IFS trimming, so the
+        // surrounding blanks survive -- `read` and `read REPLY` are not the same
+        // command, which is the whole point of the `argv[0]` test in ash.
+        assert_eq!(run_capturing("printf ' a \\n' | { read; printf '[%s]' \"$REPLY\"; }").1, "[ a ]");
+        assert_eq!(run_capturing("printf ' a \\n' | { read REPLY; printf '[%s]' \"$REPLY\"; }").1, "[a]");
+    }
+
+    #[test]
+    fn read_counts_bytes_for_dash_n() {
+        assert_eq!(run_capturing("printf abcd | { read -n 2 v; echo \"[$v] $?\"; }").1, "[ab] 0\n");
+        // `-n 0` is no limit, not "read nothing" (bash 3.2 does this too).
+        assert_eq!(run_capturing("printf abcd | { read -n 0 v; echo \"[$v] $?\"; }").1, "[abcd] 1\n");
+        // The count ticks on a SWALLOWED byte too -- ash's `continue` reaches the
+        // `while (--nchars)` -- so the backslash of `\ab` spends one of the two.
+        assert_eq!(run_capturing("printf '\\\\ab\\n' | { read -n 2 v; echo \"[$v]\"; }").1, "[a]\n");
+        // A delimiter still ends it early, and that is not a failure.
+        assert_eq!(run_capturing("echo b | { read -n 2 v; echo \"[$v] $?\"; }").1, "[b] 0\n");
+    }
+
+    #[test]
+    fn read_delimiter_is_dash_d() {
+        assert_eq!(run_capturing("printf 'a:b' | { read -d : v; echo \"[$v] $?\"; }").1, "[a] 0\n");
+        // `-d ''` leaves the delimiter at the string terminator, so it is NUL --
+        // and it works only because ash tests the delimiter BEFORE skipping NULs.
+        assert_eq!(run_capturing("printf 'a\\0b\\n' | { read -d '' v; echo \"[$v] $?\"; }").1, "[a] 0\n");
+        // The value may look like an option; it is consumed as `-d`'s argument.
+        assert_eq!(run_capturing("echo foo-bar | { read -d -; echo reply=$REPLY; }").1, "reply=foo\n");
+        // An ESCAPED delimiter is literal and does not end the read -- ash tests
+        // the backslash before the delimiter, so `\:` survives a `-d :`. Under
+        // `-r` there is no escape and the backslash itself is the value's last byte.
+        assert_eq!(
+            run_capturing("printf 'a\\\\:b:c\\n' | { read -d : v; printf '[%s]' \"$v\"; }").1,
+            "[a:b]"
+        );
+        assert_eq!(
+            run_capturing("printf 'a\\\\:b:c\\n' | { read -rd : v; printf '[%s]' \"$v\"; }").1,
+            "[a\\]"
+        );
+    }
+
+    #[test]
+    fn read_ifs_follows_the_c_locale_and_the_two_step_word_state() {
+        // `isspace` in the C locale, which is what decides a whitespace IFS byte
+        // from a delimiting one, includes CR -- so a doubled `\r` separates two
+        // fields rather than leaving one in the second.
+        assert_eq!(
+            run_capturing("printf 'a\\r\\rb\\n' | { IFS=$(printf '\\r') read p q; printf '[%s][%s]' \"$p\" \"$q\"; }").1,
+            "[a][b]"
+        );
+        // After a field ends on a WHITESPACE delimiter, one following non-space
+        // delimiter still separates rather than opening an empty field: ash tracks
+        // that with a two-step `startword`, and collapsing it to one step makes
+        // this `[X][:Y]`.
+        assert_eq!(
+            run_capturing("printf 'X :Y\\n' | { IFS=': ' read x y; printf '[%s][%s]' \"$x\" \"$y\"; }").1,
+            "[X][Y]"
+        );
+        // A NUL byte is DROPPED, not stored -- and not merely tested after the
+        // delimiter, which is a weaker property that `-d ''` alone would show.
+        assert_eq!(run_capturing("printf 'a\\0b\\n' | { read v; printf '[%s]' \"$v\"; }").1, "[ab]");
+    }
+
+    #[test]
+    fn read_last_name_eats_one_trailing_delimiter() {
+        // The last name takes the remainder WITH its delimiters, except that a
+        // single trailing non-space delimiter is dropped when the fields exactly
+        // filled the names.
+        let f = |s: &str| run_capturing(&format!("printf '{s}' | {{ IFS=: read x y; echo \"|$x|$y|\"; }}")).1;
+        assert_eq!(f("X:Y:\\n"), "|X|Y|\n");
+        assert_eq!(f("X:Y:Z:\\n"), "|X|Y:Z:|\n");
+        assert_eq!(f("X:Y:Z\\n"), "|X|Y:Z|\n");
+        // Trailing whitespace IFS goes regardless, and an unfilled name is empty.
+        assert_eq!(run_capturing("printf 'a b \\n' | { read v; echo \"[$v]\"; }").1, "[a b]\n");
+        assert_eq!(run_capturing("printf 'one\\n' | { read a b c; echo \"|$a|$b|$c|\"; }").1, "|one|||\n");
+    }
+
+    #[test]
+    fn read_option_values_are_bb_strtou() {
+        // busybox's `bb_strtou` takes decimal digits and nothing else, so a sign,
+        // a leading space or a trailing letter is an error -- with a message naming
+        // which option, and status 2.
+        for (opt, msg) in [("n", "invalid count"), ("u", "invalid file descriptor"), ("t", "invalid timeout")] {
+            for bad in ["-1", "+2", " 2", "2x", "x"] {
+                let (status, _, err) = run_capturing(&format!("read -{opt} '{bad}' v </dev/null"));
+                assert_eq!(status, 2, "read -{opt} '{bad}'");
+                assert!(err.contains(msg), "read -{opt} '{bad}' err: {err:?}");
+            }
+        }
+        // `-t` also takes bash 4.3's fractional form: THREE fractional digits are
+        // read, a non-digit among those three is an error, and anything past them
+        // is ignored. So `0.123x` is invalid while `0.123456xyz` is not.
+        for good in ["1", "0.5", "1.", "00.5", "0.123x", "0.123456xyz"] {
+            let (status, _, err) = run_capturing(&format!("read -t {good} v </dev/null; echo rc=$?"));
+            assert_eq!((status, err.as_str()), (0, ""), "read -t {good}");
+        }
+        // `-n` and `-u` land in an `int` and stop at INT_MAX; `-t`'s milliseconds
+        // are unsigned and go to UINT_MAX, so the ceilings are NOT the same.
+        for (opt, msg) in [("n", "invalid count"), ("u", "invalid file descriptor")] {
+            let (status, _, err) = run_capturing(&format!("read -{opt} 2147483648 v </dev/null"));
+            assert_eq!(status, 2, "read -{opt} 2147483648");
+            assert!(err.contains(msg), "err: {err:?}");
+        }
+        assert_eq!(run_capturing("read -t 2147483648 v </dev/null; echo $?").1, "1\n");
+        let (status, _, err) = run_capturing("read -t 4294967296 v </dev/null");
         assert_eq!(status, 2);
-        assert!(err.contains("arg count"), "err: {err:?}");
-        // `-p` is accepted with its argument attached or separate (the prompt only
-        // prints on a terminal, which the test harness is not).
-        assert_eq!(run_capturing("echo hi | { read -p 'x? ' v; echo $v; }"), (0, "hi\n".into(), String::new()));
-        assert_eq!(run_capturing("echo hi | { read -pfoo v; echo $v; }").1, "hi\n");
+        assert!(err.contains("invalid timeout"), "err: {err:?}");
+        for bad in [".5", "0.x", "0.1x", "0.12x", "1e3"] {
+            let (status, _, err) = run_capturing(&format!("read -t {bad} v </dev/null"));
+            assert_eq!(status, 2, "read -t {bad}");
+            assert!(err.contains("invalid timeout"), "read -t {bad} err: {err:?}");
+        }
+    }
+
+    #[test]
+    fn read_dash_t_asks_whether_a_read_would_block() {
+        // `-t 0` reads NOTHING -- not even $REPLY -- and reports whether a read
+        // would block. That is poll's question, not "are bytes left": a file at
+        // EOF and an exhausted pipe are both READY, which is why ash answers 0
+        // for `/dev/zero`, for `: | read -t 0` and even for a closed descriptor.
+        assert_eq!(run_capturing("echo foo | { read -t 0; echo \"reply=$REPLY $?\"; }").1, "reply= 0\n");
+        assert_eq!(run_capturing("read -t 0 </dev/null; echo $?").1, "0\n");
+        assert_eq!(run_capturing("read -t 0.0 </dev/null; echo $?").1, "0\n");
+        assert_eq!(run_capturing(": | { read -t 0; echo $?; }").1, "0\n");
+        // A nonzero timeout needs the same answer, only later, so it is refused
+        // on the same descriptors -- and refusing beats ash's behaviour going
+        // unmatched by HANGING, which is what ignoring the timeout would do.
+        for cmd in ["read -t 0 v", "read -t 1 v", "read -t 0.5 v"] {
+            let (status, _, err) = run_capturing(cmd);
+            assert_eq!(status, 2, "{cmd}");
+            assert!(err.contains("without poll(2)"), "{cmd} err: {err:?}");
+        }
+        // Where a read cannot block, a nonzero timeout is simply never reached.
+        assert_eq!(run_capturing("read -t 5 x </dev/null; echo $?").1, "1\n");
+        assert_eq!(run_capturing("echo x | { read -t 5 v; echo \"[$v] $?\"; }").1, "[x] 0\n");
+    }
+
+    #[test]
+    fn read_takes_a_descriptor_with_dash_u() {
+        assert_eq!(
+            run_capturing("exec 3<<EOF\nzz\nEOF\nread -u 3 w; echo $w").1,
+            "zz\n"
+        );
+        // `-u` and `-d` compose, and with no names the value lands in REPLY.
+        assert_eq!(
+            run_capturing("read -u 3 -d 5 3<<EOF\n123456789\nEOF\necho reply=$REPLY").1,
+            "reply=1234\n"
+        );
     }
 
     #[test]

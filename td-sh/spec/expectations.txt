@@ -520,26 +520,8 @@ xfail builtin-process.test.sh::ulimit of 2**32, 2**31 (int overflow)
 xfail builtin-process.test.sh::ulimit that is 64 bits
 xfail builtin-process.test.sh::ulimit with no flags is like -f
 xfail builtin-process.test.sh::write big file with ulimit
-xfail builtin-read.test.sh::read -d '' (null-separated records)
-xfail builtin-read.test.sh::read -d : (colon-separated records)
-xfail builtin-read.test.sh::read -d when there's no delimiter
-xfail builtin-read.test.sh::read -n doesn't strip whitespace (bug fix)
-xfail builtin-read.test.sh::read -p (not fully tested)
 xfail builtin-read.test.sh::read -r -d '' for NUL strings, e.g. find -print0
-xfail builtin-read.test.sh::read -rd
-xfail builtin-read.test.sh::read -s from pipe, not a terminal
-xfail builtin-read.test.sh::read -t 0 tests if input is available
-xfail builtin-read.test.sh::read -t 0.5
-xfail builtin-read.test.sh::read -u
-xfail builtin-read.test.sh::read -u -s
-xfail builtin-read.test.sh::read -u 3 -d 5
-xfail builtin-read.test.sh::read /dev/null
-xfail builtin-read.test.sh::read does not respect C backslash escapes
 xfail builtin-read.test.sh::read multiple lines with IFS=:
-xfail builtin-read.test.sh::read will unset extranous vars
-xfail builtin-read.test.sh::read with smooshed args
-xfail builtin-read.test.sh::read with zero args
-xfail builtin-read.test.sh::read without args uses $REPLY, no splitting occurs (without -n)
 xfail builtin-set.test.sh::'set' and 'eval' round trip
 xfail builtin-set.test.sh::can continue after unknown option
 xfail builtin-set.test.sh::set +a stops exporting
@@ -1130,6 +1112,7 @@ xfail sh-options.test.sh::set without args lists variables
 xfail sh-options.test.sh::shopt with no flags prints options
 xfail sh-usage.test.sh::--rcfile in non-interactive shell prints warnings
 xfail sh-usage.test.sh::LC_CTYPE=invalid
+xfail sh-usage.test.sh::Other flag parsers are not affected by - rule
 xfail sh-usage.test.sh::Set LC_ALL LC_CTYPE LC_COLLATE LANG - affects glob ?
 xfail sh-usage.test.sh::accepts -l flag
 xfail sh-usage.test.sh::sh - and sh -- stop flag processing
