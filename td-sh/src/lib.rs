@@ -793,9 +793,6 @@ pub fn run_case(
     }
     let bindir = workdir.0.join("bin");
     std::fs::create_dir(&bindir)?;
-    // A COPY, not a link: a case needs no external to do `: > "$PATH/$SH"`, and
-    // through a link that truncates the real binary under test -- the build
-    // artifact, outside the throwaway dir the rest of this is careful about.
     // A link, not a copy. A copy looks safer -- a case could truncate the entry
     // without touching the binary under test -- but the kernel already closes
     // that: the entry IS the executable the case is running, so a write to it is

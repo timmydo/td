@@ -181,10 +181,24 @@ fn err_line(sh: &mut Shell, msg: &str) {
 fn echo(sh: &mut Shell, argv: &[String]) -> R<()> {
     let mut i = 1usize;
     let mut newline = true;
-    // ONE `-n`, as dash's `echocmd` tests it: a single `if`, so `echo -n -n`
-    // prints the second one. There is no `-e`/`-E` -- escapes are always live.
-    if argv.get(i).is_some_and(|a| a == "-n") {
-        newline = false;
+    let mut escapes = false;
+    // busybox's option loop (coreutils/echo.c): a `-` word is options only if
+    // EVERY letter is `n`, `e` or `E`; one bad letter -- or a bare `-`, or `--`
+    // -- makes that word and everything after it an operand. Flags accumulate
+    // across words. `E` is accepted and does NOTHING: it never clears the flag,
+    // so `echo -e -E` still interprets. That is busybox, not bash.
+    while let Some(arg) = argv.get(i) {
+        let Some(letters) = arg.strip_prefix('-') else { break };
+        if letters.is_empty() || !letters.chars().all(|c| matches!(c, 'n' | 'e' | 'E')) {
+            break;
+        }
+        for c in letters.chars() {
+            match c {
+                'n' => newline = false,
+                'e' => escapes = true,
+                _ => {}
+            }
+        }
         i += 1;
     }
     // Bytes, not a String: an octal escape can name a byte that is not UTF-8.
@@ -196,9 +210,11 @@ fn echo(sh: &mut Shell, argv: &[String]) -> R<()> {
             line.push(b' ');
         }
         first = false;
-        // dash's echo runs every operand through the same escape converter `%b`
-        // uses (`conv_escape_str`), so this shares it too.
-        if process_b_escapes(arg, &mut line) {
+        if !escapes {
+            line.extend_from_slice(arg.as_bytes());
+            continue;
+        }
+        if process_escapes(arg, &mut line) {
             // `\c` ends the output where it stands, newline included.
             stopped = true;
             break;
@@ -206,6 +222,13 @@ fn echo(sh: &mut Shell, argv: &[String]) -> R<()> {
     }
     if newline && !stopped {
         line.push(b'\n');
+    }
+    // Nothing to write is not a write: busybox's `full_write` returns before the
+    // syscall on a zero count, so a closed stdout cannot fail `echo -e '\c'` or
+    // `echo -n ''`. printf, which goes through stdio, still reports on flush.
+    if line.is_empty() {
+        sh.set_status(0);
+        return Ok(());
     }
     // `out` sets `$?` (0, or 1 on write error); do not overwrite it.
     out(sh, &line)
@@ -215,8 +238,9 @@ fn echo(sh: &mut Shell, argv: &[String]) -> R<()> {
 /// width/precision from arguments), the integer conversions `d i o u x X` (C
 /// base-0 parsing, the `'c` char-code form, ash's i64/u64 range rules), the
 /// float conversions `f F e E g G` (C `strtod` operands, C-exact output), plus
-/// `c`, `s`, `b` (its own escape set with `\c` early stop), and format-string
-/// backslash escapes. The format cycles over the remaining arguments (POSIX).
+/// `c`, `s`, `b`, and format-string backslash escapes -- `%b` and the format
+/// string share `echo -e`'s converter, as they do in busybox. The format
+/// cycles over the remaining arguments (POSIX).
 /// Matched to the dash/ash goldens (spec/builtin-printf), not bash: no `-v`, and
 /// `%q`/`%(..)T` are rejected like dash/ash.
 fn printf(sh: &mut Shell, argv: &[String]) -> R<()> {
@@ -254,7 +278,8 @@ fn printf(sh: &mut Shell, argv: &[String]) -> R<()> {
 struct Pf {
     ai: usize,           // next argument index
     error: bool,         // a conversion/parse error occurred => exit status 1
-    stop: bool,          // %b `\c`: stop ALL further output (and format cycling)
+    stop: bool,          // `\c`, from `%b` or the format string: stop ALL
+    // further output, format cycling included
     errors: Vec<String>, // stderr lines, emitted once after the walk
 }
 
@@ -280,7 +305,18 @@ fn format_once(format: &str, args: &[&str], out: &mut Vec<u8>, st: &mut Pf) {
     let mut i = 0usize;
     while let Some(&c) = chars.get(i) {
         match c {
-            '\\' => i = format_escape(&chars, i, out),
+            '\\' => {
+                // The format string handles `\c` itself, BEFORE the converter,
+                // and abandons the whole run rather than just this cycle
+                // (printf.c:391). It also has no `\0` marker, unlike `%b`.
+                if chars.get(i + 1) == Some(&'c') {
+                    st.stop = true;
+                    return;
+                }
+                let (byte, next) = echo_escape(&chars, i + 1);
+                out.push(byte);
+                i = next;
+            }
             '%' => {
                 i = conversion(&chars, i + 1, args, out, st);
                 if st.stop {
@@ -410,7 +446,7 @@ fn emit_char(out: &mut Vec<u8>, args: &[&str], st: &mut Pf, spec: &Spec) {
 fn emit_b(out: &mut Vec<u8>, args: &[&str], st: &mut Pf, spec: &Spec) {
     let raw = take_arg(args, &mut st.ai).unwrap_or("");
     let mut body: Vec<u8> = Vec::new();
-    let hit_c = process_b_escapes(raw, &mut body);
+    let hit_c = process_escapes(raw, &mut body);
     let shown: &[u8] = match spec.prec {
         Some(p) if p >= 0 => body.get(0..p as usize).unwrap_or(&body),
         _ => &body,
@@ -971,59 +1007,72 @@ fn read_dec(chars: &[char], start: usize) -> (i64, usize) {
     (v, j)
 }
 
-fn read_octal(chars: &[char], start: usize, max: usize) -> (u8, usize) {
-    let mut val: u32 = 0;
-    let mut j = start;
-    let mut n = 0usize;
-    while n < max {
-        match chars.get(j) {
-            Some(&c) if ('0'..='7').contains(&c) => {
-                val = val * 8 + (c as u32 - '0' as u32);
-                j += 1;
-                n += 1;
+
+
+/// One escape, from `bb_process_escape_sequence`
+/// (libbb/process_escape_sequence.c). `i` points just PAST the backslash.
+/// Returns the byte and the index to resume at; an unrecognised sequence returns
+/// a literal backslash and the SAME index, so the offending char is emitted next
+/// as ordinary text.
+///
+/// Every backslash td-sh expands now comes through here, as in busybox, where
+/// `echo -e`, `printf %b` and printf's format string all call this. It knows
+/// `\e`, takes `\xHH` (two digits, where `\x` with no digit is literal), accepts
+/// an octal run without the leading `0`, and stops a digit run at the first
+/// digit that would carry the value past a byte -- leaving that digit as text,
+/// which is why `\0400` is a space followed by `0`.
+fn echo_escape(chars: &[char], i: usize) -> (u8, usize) {
+    let start = i;
+    let mut i = i;
+    let mut base = 8u32;
+    let mut digits = 0u32;
+    if chars.get(i) == Some(&'x') {
+        i += 1;
+        base = 16;
+        digits = 1; // so hex takes two digits where octal takes three
+    }
+    let mut n = 0u32;
+    while digits < 3 {
+        let Some(d) = chars.get(i).and_then(|c| c.to_digit(base)) else {
+            if base == 16 {
+                // Cannot underflow: the hex branch seeds `digits` at 1.
+                digits -= 1;
+                if digits == 0 {
+                    return (b'\\', start); // `\x` with no hex digit: literal
+                }
             }
-            _ => break,
+            break;
+        };
+        let r = n * base + d;
+        if r > u32::from(u8::MAX) {
+            break;
         }
+        n = r;
+        i += 1;
+        digits += 1;
     }
-    ((val & 0xff) as u8, j)
+    if digits > 0 {
+        return (n as u8, i);
+    }
+    let byte = match chars.get(i) {
+        Some('a') => 0x07,
+        Some('b') => 0x08,
+        Some('e') => 0x1b,
+        Some('f') => 0x0c,
+        Some('n') => b'\n',
+        Some('r') => b'\r',
+        Some('t') => b'\t',
+        Some('v') => 0x0b,
+        Some('\\') => b'\\',
+        _ => return (b'\\', i),
+    };
+    (byte, i + 1)
 }
 
-// Format-string backslash escapes (dash/ash): the C control escapes, `\\`, and
-// `\ooo` octal (1-3 digits). `\x`, `\u`, `\U` and any other escape are left
-// literal (backslash kept), matching dash.
-fn format_escape(chars: &[char], at: usize, out: &mut Vec<u8>) -> usize {
-    let j = at + 1;
-    match chars.get(j) {
-        Some('a') => out.push(0x07),
-        Some('b') => out.push(0x08),
-        Some('f') => out.push(0x0c),
-        Some('n') => out.push(b'\n'),
-        Some('r') => out.push(b'\r'),
-        Some('t') => out.push(b'\t'),
-        Some('v') => out.push(0x0b),
-        Some('\\') => out.push(b'\\'),
-        Some(&c) if ('0'..='7').contains(&c) => {
-            let (byte, nj) = read_octal(chars, j, 3);
-            out.push(byte);
-            return nj;
-        }
-        Some(&other) => {
-            out.push(b'\\');
-            push_char(out, other);
-        }
-        None => {
-            out.push(b'\\');
-            return j;
-        }
-    }
-    j + 1
-}
-
-// `%b` escapes (dash/ash), and `echo`'s: the C control escapes, `\\`,
-// `\0ooo`/`\ooo` octal, and `\c` which stops ALL output. `\x`/`\u` are left
-// literal (matching dash/ash). dash shares one converter between the two
-// (`conv_escape_str`) and so does this. Returns true if `\c` was seen.
-fn process_b_escapes(raw: &str, out: &mut Vec<u8>) -> bool {
+/// Run one `echo -e` operand or `printf %b` argument into `out`. One function
+/// because busybox has one: echo.c's loop and printf.c's `print_esc_string` are
+/// the same code down to the `\0` marker. True when `\c` cut the output short.
+fn process_escapes(raw: &str, out: &mut Vec<u8>) -> bool {
     let chars: Vec<char> = raw.chars().collect();
     let mut i = 0usize;
     while let Some(&c) = chars.get(i) {
@@ -1033,42 +1082,21 @@ fn process_b_escapes(raw: &str, out: &mut Vec<u8>) -> bool {
             continue;
         }
         i += 1;
-        match chars.get(i) {
-            Some('a') => out.push(0x07),
-            Some('b') => out.push(0x08),
-            Some('c') => return true,
-            Some('f') => out.push(0x0c),
-            Some('n') => out.push(b'\n'),
-            Some('r') => out.push(b'\r'),
-            Some('t') => out.push(b'\t'),
-            Some('v') => out.push(0x0b),
-            Some('\\') => out.push(b'\\'),
-            Some('0') => {
-                // `\0ooo`: a leading-0 marker, then up to 3 octal digits.
-                let (byte, ni) = read_octal(&chars, i + 1, 3);
-                out.push(byte);
-                i = ni;
-                continue;
-            }
-            Some(&d) if ('1'..='7').contains(&d) => {
-                let (byte, ni) = read_octal(&chars, i, 3);
-                out.push(byte);
-                i = ni;
-                continue;
-            }
-            Some(&other) => {
-                out.push(b'\\');
-                push_char(out, other);
-            }
-            None => {
-                out.push(b'\\');
-                return false;
-            }
+        if chars.get(i) == Some(&'c') {
+            return true;
         }
-        i += 1;
+        // `\0` before an octal digit is a marker, not a digit: echo.c drops it so
+        // `\0101` reaches the converter as `101`.
+        if chars.get(i) == Some(&'0') && chars.get(i + 1).is_some_and(|c| ('0'..='7').contains(c)) {
+            i += 1;
+        }
+        let (byte, next) = echo_escape(&chars, i);
+        out.push(byte);
+        i = next;
     }
     false
 }
+
 
 // The `'c`/`"c` printf char-code form: a leading `'` or `"` makes the value the
 // first BYTE after the quote (0 if nothing follows). Shared by the integer and
@@ -2978,7 +3006,7 @@ impl TestParser<'_> {
 
 #[cfg(test)]
 mod tests {
-    use crate::process::run_capturing;
+    use crate::process::{run_capturing, run_capturing_bytes};
 
     #[test]
     fn echo_joins_with_spaces_and_newline() {
@@ -2989,20 +3017,57 @@ mod tests {
     }
 
     #[test]
-    fn echo_always_expands_escapes_and_takes_one_dash_n() {
-        // dash's echo has no `-e`/`-E`: escapes are always live, so `-e` is an
-        // ordinary operand and prints.
-        assert_eq!(run_capturing(r#"echo "a\tb""#).1, "a\tb\n");
-        assert_eq!(run_capturing(r#"echo -e x"#).1, "-e x\n");
-        assert_eq!(run_capturing(r#"echo "\\\\""#).1, "\\\n");
-        // Octal, in both the `\0ooo` and bare `\ooo` forms.
-        assert_eq!(run_capturing(r#"echo "\0101\101""#).1, "AA\n");
+    fn echo_expands_escapes_only_under_dash_e() {
+        // ash's echo is busybox's, not dash's: escapes are OFF until `-e`.
+        assert_eq!(run_capturing(r#"echo "a\tb""#).1, "a\\tb\n");
+        assert_eq!(run_capturing(r#"echo -e "a\tb""#).1, "a\tb\n");
+        // `-E` is accepted and does nothing -- it never CLEARS the flag, so this
+        // still interprets. The obvious reading (bash's) would print `a\tb`.
+        assert_eq!(run_capturing(r#"echo -e -E "a\tb""#).1, "a\tb\n");
+        // Clusters, and flags accumulating across words.
+        assert_eq!(run_capturing(r#"echo -en "a\tb""#).1, "a\tb");
+        assert_eq!(run_capturing(r#"echo -n -e "a\tb""#).1, "a\tb");
+        // One bad letter makes the whole word an operand, and a bare `-` or `--`
+        // is an operand rather than a flag or a terminator.
+        assert_eq!(run_capturing("echo -ez foo").1, "-ez foo\n");
+        assert_eq!(run_capturing("echo --").1, "--\n");
+        assert_eq!(run_capturing("echo -").1, "-\n");
+        // Octal with and without the `\0` marker, and hex, which dash's `%b` has
+        // no notion of.
+        assert_eq!(run_capturing(r#"echo -e "\0101\101\x41""#).1, "AAA\n");
+        // A digit that would carry past a byte ends the run and stays as text.
+        assert_eq!(run_capturing(r#"echo -e "\0400""#).1, " 0\n");
+        // `\x` with no hex digit is literal, and so is a partial run's tail.
+        assert_eq!(run_capturing(r#"echo -e "\x""#).1, "\\x\n");
+        assert_eq!(run_capturing(r#"echo -e "\x4z""#).1, "\u{4}z\n");
+        // Hex takes at most TWO digits where octal takes three, and only a third
+        // that WOULD have converted shows it: in `\x4z` the run ends at `z`
+        // either way.
+        assert_eq!(run_capturing(r#"echo -e "\x041""#).1, "\u{4}1\n");
+        // 255 is the largest byte a run may reach, and only a run that lands on
+        // it exactly tells `>` from `>=` -- `\0400` and `\777` break either way.
+        // Bytes, not a lossy `String`: 0xff is not UTF-8.
+        assert_eq!(
+            run_capturing_bytes(r#"echo -e "\377|\xff""#).1,
+            b"\xff|\xff\n"
+        );
+        // The `\0` marker is dropped before an OCTAL digit, not any digit: `\08`
+        // is the NUL the bare `\0` converts to, then `8` as text.
+        assert_eq!(run_capturing(r#"echo -e "\08""#).1, "\u{0}8\n");
+        // Nothing to write is not a write, so a closed stdout is not an error
+        // here -- unlike printf, which reports one.
+        assert_eq!(run_capturing("echo -e '\\c' >&-; echo $?").1, "0\n");
+        assert_eq!(run_capturing("echo -n '' >&-; echo $?").1, "0\n");
+        assert_eq!(run_capturing("printf '' >&-; echo $?").1, "1\n");
+        // `\e` is ESC here; `\u` is not an escape at all, unlike bash.
+        assert_eq!(run_capturing(r#"echo -e "\e|\u6""#).1, "\u{1b}|\\u6\n");
         // An escape it does not know keeps its backslash.
-        assert_eq!(run_capturing(r#"echo "\d\e""#).1, "\\d\\e\n");
+        assert_eq!(run_capturing(r#"echo -e "\d\8""#).1, "\\d\\8\n");
         // `\c` ends the output where it stands -- newline and later operands too.
-        assert_eq!(run_capturing(r#"echo "a\c" b; echo X"#).1, "aX\n");
-        // Only the FIRST `-n` is the flag, matching dash's single `if`.
-        assert_eq!(run_capturing("echo -n -n").1, "-n");
+        assert_eq!(run_capturing(r#"echo -e "a\c" b; echo X"#).1, "aX\n");
+        // Every `-n` is read, not just the first: the option loop keeps going
+        // while a word is all flag letters.
+        assert_eq!(run_capturing("echo -n -n").1, "");
     }
 
     #[test]
@@ -4071,6 +4136,23 @@ mod tests {
         assert_eq!(out, "a");
         assert_eq!(status, 1);
         assert!(err.contains("invalid directive"), "err: {err:?}");
+    }
+
+    #[test]
+    fn printf_escapes_are_the_echo_converter() {
+        // Both printf paths take busybox's converter, so both know `\e`, take a
+        // two-digit `\xHH`, and stop an octal run before it leaves a byte.
+        assert_eq!(run_capturing("printf '[\\x41\\e\\777]'").1, "[A\x1b?7]");
+        assert_eq!(run_capturing("printf '[%b]' '\\x41\\e\\777'").1, "[A\x1b?7]");
+        // The `\0` marker is `%b`'s alone: in a format string `\0101` is the
+        // three-digit `\010` and a literal `1`, not `\101`.
+        assert_eq!(run_capturing("printf '[\\0101][%b]' '\\0101'").1, "[\u{8}1][A]");
+        // Format-string `\c` abandons the whole run -- the rest of the format,
+        // and the cycling that would consume the remaining arguments -- but is
+        // not an error.
+        let (status, out, _) = run_capturing("printf '%s\\c%s\\n' 1 2 3 4");
+        assert_eq!(out, "1");
+        assert_eq!(status, 0);
     }
 
     #[test]

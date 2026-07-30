@@ -813,6 +813,19 @@ pub fn run_capturing(src: &str) -> (i32, String, String) {
     (status, out_s, err_s)
 }
 
+/// `run_capturing`'s stdout as raw BYTES. `echo`/`printf` escapes can name a
+/// byte that is not UTF-8, which the lossy `String` above folds to U+FFFD --
+/// so an assertion about, say, `\377` cannot tell 0xff from any other bad byte.
+#[cfg(test)]
+pub fn run_capturing_bytes(src: &str) -> (i32, Vec<u8>) {
+    let out = Arc::new(Mutex::new(Vec::new()));
+    let mut sh = Shell::new_for_test();
+    sh.fds.set(1, Fd::WriteBuf(out.clone()));
+    let status = exec::run_program(&mut sh, src);
+    let bytes = out.lock().map(|v| v.clone()).unwrap_or_default();
+    (status, bytes)
+}
+
 /// Drive several units through the INTERACTIVE handler, as the prompt loop does,
 /// returning `$?` plus captured stdout/stderr. Distinct from `run_capturing`:
 /// only this path can show that a shell survives an aborted command.
