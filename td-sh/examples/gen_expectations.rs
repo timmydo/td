@@ -32,7 +32,7 @@
 //! clean.
 use std::collections::BTreeSet;
 use std::path::PathBuf;
-use td_sh::{case_keys, parse_spec, run_case, spec_paths, ASH_DASH_CHAIN};
+use td_sh::{case_keys, graded_identity, parse_spec, run_case, spec_paths, ASH_DASH_CHAIN};
 
 // Header emitted verbatim atop the overlay. Documents the xfail/skip contract for
 // a maintainer reading `expectations.txt` directly; kept in sync with this tool.
@@ -121,6 +121,33 @@ fn reads_repo_tree(code: &str) -> bool {
         || code.contains("_tmp/")
 }
 
+/// Identities this shell CANNOT be staged as. Each probe is a real case run
+/// through `run_case`, so it exercises the same staging the corpus run does; a
+/// probe whose spec does not actually resolve to the identity it names would
+/// prove nothing, so that is checked too and reported as a generation error.
+fn probe_identities(
+    shell: &std::path::Path,
+    errors: &mut Vec<String>,
+) -> Result<Vec<&'static str>, Box<dyn std::error::Error>> {
+    let mut bad = Vec::new();
+    for id in ASH_DASH_CHAIN {
+        let src = format!("## compare_shells: {id}\n\n#### probe\n:\n");
+        let cases = parse_spec(&src)?;
+        let Some(case) = cases.first() else {
+            errors.push(format!("identity probe for `{id}` parsed to no case"));
+            continue;
+        };
+        if graded_identity(case, ASH_DASH_CHAIN) != Some(id) {
+            errors.push(format!("identity probe for `{id}` does not resolve to it"));
+            continue;
+        }
+        if !run_case(shell, case, ASH_DASH_CHAIN)?.passed {
+            bad.push(*id);
+        }
+    }
+    Ok(bad)
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args().skip(1);
     let shell = PathBuf::from(
@@ -139,6 +166,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // WITHOUT emitting, so a failed regeneration can never overwrite the committed
     // file with silent-partial output (it exits non-zero instead).
     let mut errors: Vec<String> = Vec::new();
+
+    // A case is staged under the identity it is GRADED as, and a MULTICALL shell
+    // reads that name out of argv[0] to choose an applet -- so pointing this at
+    // busybox makes every dash-graded case die with `applet not found`, and the
+    // overlay that comes out looks like 500 wrong answers instead of one
+    // unusable pairing. Probe each identity once with `:` and fail closed.
+    for id in probe_identities(&shell, &mut errors)? {
+        errors.push(format!(
+            "{} cannot run as `{id}`: a case graded as `{id}` is staged under that \
+             name, and a multicall binary reads it from argv[0]. Grade this shell \
+             only on the cases whose identity it can take.",
+            shell.display()
+        ));
+    }
 
     for path in &spec_paths(&dir)? {
         let file =

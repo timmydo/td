@@ -447,7 +447,17 @@ fn names_identity(token: &str, id: &str) -> bool {
     token.strip_prefix(id).is_some_and(|rest| rest.is_empty() || rest.starts_with('-'))
 }
 
-/// `chain`, truncated after the first identity the FILE actually compared.
+/// Whether the case designates a golden for `id`: its file named it in
+/// `compare_shells`, or the case carries an annotation block for it. One
+/// predicate because the chain bound and the graded identity must agree about
+/// what "the file ran this shell" means -- reading it two ways is what let a
+/// case be graded on a hybrid of two shells' goldens.
+fn designates(case: &SpecCase, id: &str) -> bool {
+    case.compare_shells.iter().any(|t| names_identity(t, id))
+        || case.annotations.iter().any(|a| a.shells.iter().any(|s| s == id))
+}
+
+/// `chain`, truncated after the first identity the case actually designates.
 ///
 /// For a shell the file compared, the format already designates that shell's
 /// golden: its own annotation if it has one, the unqualified block otherwise.
@@ -460,12 +470,27 @@ fn names_identity(token: &str, id: &str) -> bool {
 /// designates nothing, so there the fallthrough stands as the same-lineage
 /// heuristic it always was.
 fn effective_chain<'a>(case: &SpecCase, chain: &'a [&'a str]) -> &'a [&'a str] {
-    match chain
-        .iter()
-        .position(|id| case.compare_shells.iter().any(|t| names_identity(t, id)))
-    {
+    match chain.iter().position(|id| designates(case, id)) {
         Some(i) => chain.get(..=i).unwrap_or(chain),
         None => chain,
+    }
+}
+
+/// The identity the case is GRADED as: the earliest chain element the file
+/// designates a golden for, whether by naming it in `compare_shells` or by
+/// carrying an annotation block for it. Falls back to the chain head, which is
+/// all a file that designates nothing says.
+///
+/// This has to agree with `pick`, because `$SH` is what a case's own
+/// `case $SH in dash) ... esac` guard reads and `pick` is what chooses the
+/// golden that guard's outcome is measured against. Running as `ash` while
+/// graded on dash's block makes the guard take a branch the golden says was
+/// never reached. Sharing `designates` with `effective_chain` is what makes the
+/// two agree: the same element that bounds the chain is the one exported.
+pub fn graded_identity<'a>(case: &SpecCase, chain: &'a [&'a str]) -> Option<&'a str> {
+    match chain.iter().position(|id| designates(case, id)) {
+        Some(i) => chain.get(i).copied(),
+        None => chain.first().copied(),
     }
 }
 
@@ -783,7 +808,7 @@ pub fn run_case(
     // executable too (682 uses, mostly `$SH -c ...`), so a third sibling dir holds
     // a link under that name and is the whole of PATH -- which keeps `env_clear`'s
     // point, since a case reaching for `ls` still finds nothing.
-    let identity = chain.first().copied().unwrap_or("sh");
+    let identity = graded_identity(case, chain).unwrap_or("sh");
     // `chain` is caller-supplied, and the identity is about to become a path
     // component AND the value of `$SH`. An absolute one would make `join` discard
     // the bindir entirely, `..` would escape it, and any slash would make `$SH`

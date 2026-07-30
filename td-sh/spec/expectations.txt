@@ -86,12 +86,7 @@ xfail arith-context.test.sh::Slicing of string with expressions
 xfail arith-context.test.sh::Slicing of string with variables
 xfail arith-context.test.sh::Triple parens should be disambiguated
 xfail arith.test.sh::Comma operator (borrowed from C)
-xfail arith.test.sh::More 64-bit ops
 xfail arith.test.sh::Negative numbers with bit shift
-xfail arith.test.sh::s[0] with string 42
-xfail arith.test.sh::s[0] with string abc
-xfail arith.test.sh::undef[0]
-xfail arith.test.sh::undef[0] with nounset
 xfail array-assoc.test.sh::${!ref} and assoc array
 xfail array-assoc.test.sh::${A[@]#prefix}
 xfail array-assoc.test.sh::${A[@]/b/B}
@@ -241,9 +236,6 @@ xfail assign-extended.test.sh::typeset -p
 xfail assign-extended.test.sh::typeset -r makes a string readonly
 xfail assign-extended.test.sh::typeset -x makes it exported
 xfail assign-extended.test.sh::unset and shell funcs
-xfail assign.test.sh::"declare -a arr" and "readonly -a a" creates an empty array (OSH)
-xfail assign.test.sh::"readonly -a arr" and "readonly -A dict" should not not remove existing arrays
-xfail assign.test.sh::"var d = {}; declare -p d" does not print anything (OSH)
 xfail assign.test.sh::Empty env binding
 xfail assign.test.sh::Env binding can use preceding bindings, but not subsequent ones
 xfail assign.test.sh::Env binding in readonly/declare is NOT exported!  (pitfall)
@@ -254,25 +246,17 @@ xfail assign.test.sh::Env value with escaped <
 xfail assign.test.sh::Env value with two quotes
 xfail assign.test.sh::Escaped = in command name
 xfail assign.test.sh::Multiple temporary envs on the stack
-xfail assign.test.sh::declare -A dict does not remove existing arrays (OSH regression)
-xfail assign.test.sh::declare -a arr does not remove existing arrays (OSH regression)
 xfail assign.test.sh::export a=1 no_value c=2
 xfail assign.test.sh::redirect after assignment builtin (eval redirects after evaluating arguments)
 xfail assign.test.sh::redirect after command sub (like case above but without assignment builtin)
-xfail assign.test.sh::redirect after declare -p
 xfail background.test.sh::Background process and then a singleton pipeline
 xfail background.test.sh::No stderr spew when shell is not interactive
-xfail background.test.sh::Signal message for killed background job
 xfail background.test.sh::Start background pipeline, wait $pid
 xfail background.test.sh::Start background pipeline, wait %job_spec
 xfail background.test.sh::Wait on background process PID
 xfail background.test.sh::Wait on multiple specific IDs returns last status
-xfail background.test.sh::YSH wait --all
-xfail background.test.sh::YSH wait --verbose
 xfail background.test.sh::jobs -p prints one line per job
 xfail background.test.sh::jobs prints one line per job
-xfail background.test.sh::wait -n
-xfail background.test.sh::wait -n with arguments - arguments are respected
 xfail background.test.sh::wait -n with nothing to wait for
 xfail background.test.sh::wait for N parallel jobs and check failure
 xfail background.test.sh::wait with invalid PID
@@ -296,7 +280,6 @@ xfail blog1.test.sh::${###}
 xfail blog1.test.sh::${##2}
 xfail blog1.test.sh::${##}
 xfail blog1.test.sh::${#1#'###'}
-xfail blog1.test.sh::Julia example from spec/oil-user-feedback
 xfail blog2.test.sh::-a -a
 xfail blog2.test.sh::-a -a -a -a
 xfail blog2.test.sh::-a -a -a -a -a -a
@@ -375,7 +358,6 @@ xfail builtin-bracket.test.sh::-r
 xfail builtin-bracket.test.sh::-u for setuid, -g too
 xfail builtin-bracket.test.sh::-w
 xfail builtin-bracket.test.sh::-x
-xfail builtin-bracket.test.sh::More negative numbers
 xfail builtin-bracket.test.sh::operator/operand ambiguity with -a
 xfail builtin-cd.test.sh::$OLDPWD
 xfail builtin-cd.test.sh::'unset PWD; pwd' before any cd (tickles a rare corner case)
@@ -465,7 +447,6 @@ xfail builtin-echo.test.sh::echo to redirected directory is an error
 xfail builtin-echo.test.sh::incomplete hex escape
 xfail builtin-echo.test.sh::incomplete octal escape
 xfail builtin-echo.test.sh::incomplete unicode escape
-xfail builtin-eval-source.test.sh::eval YSH block with 'break continue return error'
 xfail builtin-eval-source.test.sh::source doesn't crash when targeting a directory
 xfail builtin-eval-source.test.sh::source finds files in PATH before current dir
 xfail builtin-eval-source.test.sh::source looks in PATH for files
@@ -504,19 +485,12 @@ xfail builtin-kill.test.sh::Numeric signal out of range - OSH may send it anyway
 xfail builtin-kill.test.sh::kill -15 %% kills current job
 xfail builtin-kill.test.sh::kill -15 %- kills previous job
 xfail builtin-kill.test.sh::kill -15 kills the process with SIGTERM
-xfail builtin-kill.test.sh::kill -9999 is an invalid signal
 xfail builtin-kill.test.sh::kill -KILL kills the process with SIGKILL
-xfail builtin-kill.test.sh::kill -L also shows signals
-xfail builtin-kill.test.sh::kill -L checks for invalid input
 xfail builtin-kill.test.sh::kill -l 0 INT lists both signals
 xfail builtin-kill.test.sh::kill -l 0 returns EXIT
-xfail builtin-kill.test.sh::kill -l 10 TERM translates between names and numbers
-xfail builtin-kill.test.sh::kill -l shows signals
 xfail builtin-kill.test.sh::kill -l with exit code
 xfail builtin-kill.test.sh::kill -n 9 specifies the signal number
 xfail builtin-kill.test.sh::kill -s TERM specifies the signal name
-xfail builtin-kill.test.sh::kill -terM -SigterM isn't case sensitive
-xfail builtin-kill.test.sh::kill HUP pid gives the correct error
 xfail builtin-kill.test.sh::kill multiple pids at once
 xfail builtin-kill.test.sh::kill pid and job at once
 xfail builtin-meta.test.sh::$(command type ls)
@@ -526,7 +500,6 @@ xfail builtin-meta.test.sh::command -p (override existing program)
 xfail builtin-meta.test.sh::command -v executable, builtin
 xfail builtin-meta.test.sh::command command seq 3
 xfail builtin-meta.test.sh::command skips function lookup
-xfail builtin-misc.test.sh::Print shell strings with normal chars: set and printf %q and ${x@Q}
 xfail builtin-misc.test.sh::Print shell strings with weird chars: set and printf %q and ${x@Q}
 xfail builtin-misc.test.sh::Shifting too far
 xfail builtin-misc.test.sh::time pipeline
@@ -534,12 +507,9 @@ xfail builtin-printf.test.sh::Invalid UTF-8
 xfail builtin-printf.test.sh::Too large
 xfail builtin-printf.test.sh::printf %b with truncated octal escapes
 xfail builtin-printf.test.sh::unsigned / octal / hex big
-xfail builtin-process.test.sh::Changing resource limit is denied
-xfail builtin-process.test.sh::YSH readability: ulimit --all the same as ulimit -a
 xfail builtin-process.test.sh::arg that would overflow 64 bits is detected
 xfail builtin-process.test.sh::exec builtin
 xfail builtin-process.test.sh::time with brace group argument
-xfail builtin-process.test.sh::ulimit -S for soft limit (default), -H for hard limit
 xfail builtin-process.test.sh::ulimit -f 1 prevents files larger 512 bytes
 xfail builtin-process.test.sh::ulimit -n limits file descriptors
 xfail builtin-process.test.sh::ulimit accepts 'unlimited'
@@ -685,12 +655,7 @@ xfail builtin-vars.test.sh::Export sets a global variable that persists after ex
 xfail builtin-vars.test.sh::Exporting a parent func variable (dynamic scope)
 xfail builtin-vars.test.sh::Unset exported variable, then define it again.  It's NOT still exported.
 xfail builtin-vars.test.sh::can't export associative array (strict_array)
-xfail builtin-vars.test.sh::unset -v assoc (related to issue #661)
-xfail builtin-vars.test.sh::unset a[-1] (bf.bash regression)
-xfail builtin-vars.test.sh::unset a[-1] in sparse array (bf.bash regression)
-xfail builtin-vars.test.sh::unset assoc errors
 xfail case_.test.sh::Pattern ? matches 1 code point (many bytes), but not multiple code points
-xfail case_.test.sh::\(\) in pattern (regression)
 xfail case_.test.sh::matching every byte against itself
 xfail command-sub-ksh.test.sh::${ echo hi }  without semi-colon
 xfail command-sub-ksh.test.sh::${ echo hi;}
@@ -939,7 +904,6 @@ xfail let.test.sh::let with ()
 xfail loop.test.sh::break in condition of loop
 xfail loop.test.sh::break in condition of nested loop
 xfail loop.test.sh::break/continue within eval
-xfail loop.test.sh::builtin,command break,continue,return,exit
 xfail loop.test.sh::continue in subshell
 xfail loop.test.sh::continue in subshell aborts with errexit
 xfail loop.test.sh::while in pipe with subshell
@@ -1003,14 +967,11 @@ xfail pipeline.test.sh::Brace group in pipeline
 xfail pipeline.test.sh::Evaluation of argv[0] in pipeline occurs in child
 xfail pipeline.test.sh::Exit code is last status
 xfail pipeline.test.sh::For loop starts pipeline
-xfail pipeline.test.sh::Initial value of PIPESTATUS is empty string
 xfail pipeline.test.sh::Nested pipelines
-xfail pipeline.test.sh::PIPESTATUS is set on simple commands
 xfail pipeline.test.sh::Pipeline comments
 xfail pipeline.test.sh::Pipeline in eval
 xfail pipeline.test.sh::Redirect in Pipeline
 xfail pipeline.test.sh::While Loop ends pipeline
-xfail pipeline.test.sh::shopt -s lastpipe and shopt -s no_last_fork interaction
 xfail posix.test.sh::Command substitution in default
 xfail posix.test.sh::Multiple here docs on one line
 xfail posix.test.sh::cat here doc; echo; cat here doc
@@ -1081,7 +1042,6 @@ xfail redirect-command.test.sh::Redirect function stdout
 xfail redirect-command.test.sh::Redirect in assignment
 xfail redirect-command.test.sh::Redirect in the middle of a simple command
 xfail redirect-command.test.sh::Redirect in the middle of two assignments
-xfail redirect-command.test.sh::redirect bash extensions:   [[  ((  for ((
 xfail redirect-command.test.sh::redirect case
 xfail redirect-command.test.sh::redirect for loop
 xfail redirect-command.test.sh::redirect if
@@ -1092,7 +1052,6 @@ xfail redirect-multi.test.sh::File redirects have word splitting too!
 xfail redirect-multi.test.sh::File redirects with glob args (bash and zsh only)
 xfail redirect-multi.test.sh::Redirect with brace expansion isn't allowed
 xfail redirect.test.sh::&> redirects stdout and stderr
-xfail redirect.test.sh::&>> appends stdout and stderr
 xfail redirect.test.sh::1>&- to close file descriptor
 xfail redirect.test.sh::1>&2- (Bash bug: fail to restore closed fd)
 xfail redirect.test.sh::1>&2- to move file descriptor
@@ -1103,7 +1062,6 @@ xfail redirect.test.sh::: 9> fdleak (OSH regression)
 xfail redirect.test.sh::: >/dev/null 2> / (OSH regression: fail to pop fd frame)
 xfail redirect.test.sh::<> for read/write
 xfail redirect.test.sh::<> for read/write named pipes
-xfail redirect.test.sh::>&word redirects stdout and stderr when word is not a number or -
 xfail redirect.test.sh::>| to clobber
 xfail redirect.test.sh::Descriptor redirect with filename
 xfail redirect.test.sh::Filename redirect with spaces
@@ -1117,7 +1075,6 @@ xfail redirect.test.sh::Redirect to file descriptor that's not open
 xfail redirect.test.sh::can't mention big file descriptor
 xfail redirect.test.sh::echo foo >&100 (OSH regression: does not fail with invalid fd 100)
 xfail redirect.test.sh::echo foo >&N where N is first unused fd
-xfail redirect.test.sh::exec {fd}>&- (OSH regression: fails to close fd)
 xfail redirect.test.sh::xtrace not affected by redirects
 xfail regex.test.sh::Bug: Nix idiom with closing ) next to pattern
 xfail regex.test.sh::Double quoting pat variable -- again bash doesn't like it.
@@ -1163,28 +1120,18 @@ xfail sh-options-bash.test.sh::export SHELLOPTS does cross-process tracing with 
 xfail sh-options-bash.test.sh::shopt -s progcomp hostcomplete are stubs (bash-completion)
 xfail sh-options.test.sh::$- with interactive shell
 xfail sh-options.test.sh::$- with pipefail
-xfail sh-options.test.sh::Unimplemented options - OSH shopt -s ignore_shopt_not_impl
-xfail sh-options.test.sh::Unimplemented options - print, query, set, unset
-xfail sh-options.test.sh::interactive shell starts with emacs mode on
 xfail sh-options.test.sh::noclobber off
 xfail sh-options.test.sh::noclobber on
-xfail sh-options.test.sh::noclobber on &> >
-xfail sh-options.test.sh::noclobber on &>> >>
 xfail sh-options.test.sh::noclobber on <>
 xfail sh-options.test.sh::noclobber on >>
 xfail sh-options.test.sh::pipefail
 xfail sh-options.test.sh::set without args and assoc array variables (not in OSH)
 xfail sh-options.test.sh::set without args lists variables
-xfail sh-options.test.sh::shopt -o prints 'set' options
-xfail sh-options.test.sh::shopt -p -o prints 'set' options
-xfail sh-options.test.sh::shopt -p exit code (regression)
-xfail sh-options.test.sh::shopt -s nounset works in YSH, not in bash
 xfail sh-options.test.sh::shopt with no flags prints options
 xfail sh-usage.test.sh::--rcfile in non-interactive shell prints warnings
 xfail sh-usage.test.sh::LC_CTYPE=invalid
 xfail sh-usage.test.sh::Set LC_ALL LC_CTYPE LC_COLLATE LANG - affects glob ?
 xfail sh-usage.test.sh::accepts -l flag
-xfail sh-usage.test.sh::osh --eval
 xfail sh-usage.test.sh::sh - and sh -- stop flag processing
 xfail sh-usage.test.sh::sh -c -- 'echo hi' does not run anything (#2637)
 xfail shell-bugs.test.sh::./configure idiom
@@ -1194,11 +1141,8 @@ xfail shell-grammar.test.sh::Prefix redirect
 xfail shell-grammar.test.sh::case item without ;; is not allowed
 xfail shell-grammar.test.sh::case: Using ; instead of ;;
 xfail spec-harness-bug.test.sh::osh-native duplicates stdin - is this a test harness issue?
-xfail strict-options.test.sh::Control flow must be static in YSH (strict_control_flow)
-xfail strict-options.test.sh::strict_parse_slice means you need explicit  length
 xfail subshell.test.sh::Subshell with redirects
 xfail tilde.test.sh::${undef:-~}
-xfail tilde.test.sh::a[x]=foo:~ has tilde expansion
 xfail tilde.test.sh::temp assignment x=~ env
 xfail tilde.test.sh::tilde expansion an assignment keyword
 xfail tilde.test.sh::tilde expansion of word after redirect
@@ -1213,7 +1157,6 @@ xfail toysh-posix.test.sh::IFS 4
 xfail toysh-posix.test.sh::Pipeline - http://landley.net/notes-2019.html#16-12-2019
 xfail toysh-posix.test.sh::dynamic glob - http://landley.net/notes.html#08-05-2020
 xfail toysh-posix.test.sh::no shebang
-xfail toysh.test.sh::@Q
 xfail toysh.test.sh::Brace Expansion
 xfail toysh.test.sh::char class / extglob
 xfail toysh.test.sh::extglob $IFS 1
@@ -1255,7 +1198,6 @@ xfail var-op-bash.test.sh::argv array and @P @Q @a
 xfail var-op-bash.test.sh::assoc array and @P @Q @a
 xfail var-op-bash.test.sh::undef and @P @Q @a
 xfail var-op-bash.test.sh::undef vs. empty string in var ops
-xfail var-op-len.test.sh::${#s} respects LC_ALL - length in bytes or code points
 xfail var-op-len.test.sh::Length of undefined variable with nounset
 xfail var-op-len.test.sh::Length operator can't be followed by test operator
 xfail var-op-patsub.test.sh::${v//} is empty search and replacement
@@ -1304,17 +1246,9 @@ xfail var-op-slice.test.sh::String slice
 xfail var-op-slice.test.sh::String slice with math
 xfail var-op-strip.test.sh::Strip unicode prefix
 xfail var-op-strip.test.sh::strip all unicode
-xfail var-op-test.test.sh::"${a[@]+foo}" and "${a[@]:+foo}" - operators are equivalent on arrays?
-xfail var-op-test.test.sh::"${array[@]} with set -u (bash is outlier)
-xfail var-op-test.test.sh::"${undefined[@]+foo}" and "${undefined[@]:+foo}", with set -u
 xfail var-op-test.test.sh::"\e" as arg
 xfail var-op-test.test.sh::"\z" as arg
 xfail var-op-test.test.sh::$* ("" "") and - and + (IFS=)
-xfail var-op-test.test.sh::assoc array and - and +
-xfail var-op-test.test.sh::op-test for ${!array} with array="a" and array="a[0]"
-xfail var-op-test.test.sh::op-test for ${!array} with array="a[@]" or array="a[*]"
-xfail var-op-test.test.sh::op-test for ${a[@]} and ${a[*]}
-xfail var-op-test.test.sh::op-test for ${a} and ${a[0]}
 xfail var-ref.test.sh::${!OPTIND} (used by bash completion
 xfail var-ref.test.sh::${!ref-default}
 xfail var-ref.test.sh::${!undef:-}
@@ -1364,16 +1298,8 @@ xfail vars-special.test.sh::$PWD is set
 xfail vars-special.test.sh::$RANDOM
 xfail vars-special.test.sh::$SECONDS
 xfail vars-special.test.sh::$UID and $EUID
-xfail vars-special.test.sh::$_ and ${_}
-xfail vars-special.test.sh::$_ is not reset with (( and [[
-xfail vars-special.test.sh::$_ with && and ||
-xfail vars-special.test.sh::$_ with assignments, arrays, etc.
-xfail vars-special.test.sh::$_ with loop
-xfail vars-special.test.sh::$_ with pipeline and subshell
-xfail vars-special.test.sh::$_ with word splitting
 xfail vars-special.test.sh::Background PID $! looks like a PID
 xfail vars-special.test.sh::UID EUID PPID can't be changed
-xfail vars-special.test.sh::Vars set interactively only: $HISTFILE
 xfail whitespace.test.sh::whitespace in string to integer conversion
 xfail word-split.test.sh::4 x 3 table - with for loop
 xfail word-split.test.sh::IFS='' with $@ and $* and printf (bug #627)
@@ -1381,15 +1307,8 @@ xfail word-split.test.sh::Unicode in IFS
 xfail xtrace.test.sh::PS4 with runtime error
 xfail xtrace.test.sh::PS4 with unterminated $(
 xfail xtrace.test.sh::PS4 with unterminated ${
-xfail xtrace.test.sh::Regression: xtrace for "a+=(v)"
-xfail xtrace.test.sh::Regression: xtrace for "declare -a a+=(v)"
-xfail xtrace.test.sh::[[ ]]
 xfail xtrace.test.sh::set -o verbose prints unevaluated code
-xfail xtrace.test.sh::unset PS4
 xfail xtrace.test.sh::xtrace with newlines
-xfail xtrace.test.sh::xtrace with tabs
-xfail xtrace.test.sh::xtrace with unicode chars
-xfail xtrace.test.sh::xtrace with unprintable chars
 xfail zsh-assoc.test.sh::TODO: SETUP should be shared
 xfail zsh-assoc.test.sh::get length
 xfail zsh-assoc.test.sh::iterate over both keys and values
@@ -1400,7 +1319,6 @@ xfail zsh-idioms.test.sh::git-completion snippet
 xfail zsh-idioms.test.sh::zsh var sub is rejected at runtime
 
 # ---- skip: not evaluated here (see header) ----
-skip alias.test.sh::Alias and PS4
 skip alias.test.sh::Alias and arithmetic
 skip alias.test.sh::Alias and command sub (bug regression)
 skip append.test.sh::Append array to array
@@ -1507,7 +1425,6 @@ skip assign.test.sh::assignment using dynamic keyword (splits in most shells, no
 skip assign.test.sh::assignment using dynamic var names doesn't split
 skip assign.test.sh::declare and glob
 skip assign.test.sh::local a=loc $var c=loc
-skip assign.test.sh::readonly array should not be modified by a+=(1)
 skip assign.test.sh::readonly x= gives empty string (regression)
 skip assign.test.sh::static assignment doesn't split
 skip brace-expansion.test.sh::Empty alternative
@@ -1675,11 +1592,8 @@ skip var-op-strip.test.sh::strip none
 skip var-op-strip.test.sh::strip none unicode
 skip var-op-test.test.sh::"${x+foo}" quoted (regression)
 skip var-op-test.test.sh::Assign default with array
-skip var-op-test.test.sh::Nix idiom ${!hooksSlice+"${!hooksSlice}"} - was workaround for obsolete bash 4.3 bug
 skip var-op-test.test.sh::Quoted with array as default value
 skip var-op-test.test.sh::Unquoted with array as default value
-skip var-op-test.test.sh::array and - and +
-skip var-op-test.test.sh::op-test for unquoted ${a[*]:-empty} with IFS=
 skip var-ref.test.sh::${!a[@]-'default'} is legal but fails with more than one element
 skip var-ref.test.sh::${!array_ref:-set} and ${!array_ref:=assign}
 skip var-ref.test.sh::Array indirect expansion with @? conversion

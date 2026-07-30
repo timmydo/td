@@ -31,8 +31,8 @@
 use std::path::{Path, PathBuf};
 
 use td_sh::{
-    parse_spec, resolve, run_case, run_dir_classified, summarize, Disposition, Expectations,
-    ASH_DASH_CHAIN,
+    graded_identity, parse_spec, resolve, run_case, run_dir_classified, summarize,
+    Disposition, Expectations, ASH_DASH_CHAIN,
 };
 
 fn spec_dir() -> PathBuf {
@@ -103,11 +103,11 @@ fn corpus_is_well_formed() -> Result<(), Box<dyn std::error::Error>> {
 
 /// The runner's ENVIRONMENT contract, which 359 corpus guards turn on and which
 /// only a real child can demonstrate. Written as a spec so each expectation is
-/// the golden itself: `$SH` is the chain's identity rather than a path, it is
-/// still executable under that name, and PATH holds it and nothing else — so a
-/// case reaching for an ordinary external still finds none. Pinned here because
-/// the corpus overlay would catch a regression in any of these only as a
-/// scattered count, which says nothing about which property broke.
+/// the golden itself: `$SH` is the identity the case is GRADED as rather than a
+/// path, it is still executable under that name, and PATH holds it and nothing
+/// else — so a case reaching for an ordinary external still finds none. Pinned
+/// here because the corpus overlay would catch a regression in any of these only
+/// as a scattered count, which says nothing about which property broke.
 #[test]
 fn a_case_meets_the_shell_by_identity_on_a_path_of_its_own(
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -137,9 +137,9 @@ no-externals
         let outcome = run_case(&shell, &case, ASH_DASH_CHAIN)?;
         assert!(outcome.passed, "{}: {}", case.name, outcome.detail.unwrap_or_default());
     }
-    // And the identity FOLLOWS the chain rather than being a fixed `ash`.
+    // And it follows the chain rather than being a fixed `ash`.
     let spec = "\
-#### the chain head decides the identity
+#### the chain head decides it when the case designates nothing
 case $SH in dash) echo DASH ;; *) echo OTHER ;; esac
 ## STDOUT:
 DASH
@@ -150,20 +150,100 @@ DASH
         assert!(outcome.passed, "{}: {}", case.name, outcome.detail.unwrap_or_default());
     }
 
-    // The identity comes from the chain HEAD, not from the file's
-    // `compare_shells`, even where the two disagree — so a dash-only file still
-    // meets `$SH=ash` while `pick` grades it against dash's block. That
-    // mismatch is the known remaining half of this bug (49 files, 88 guards);
-    // pinned here so the increment that closes it has to change this line
-    // rather than drift through it.
+    // The identity follows the golden. A file that designates no ash grades
+    // against dash's block, so the case must MEET dash — running as `ash` there
+    // makes the guard take a branch the golden says was never reached. Written
+    // as separate cases because the rule is a priority order: the header alone,
+    // an annotation alone (a real corpus shape — a file whose header omits ash
+    // still carrying an `ash` block, which `pick` reaches), and a file that
+    // designates neither, where the chain head stands.
     let spec = "\
 ## compare_shells: bash dash mksh
 
-#### the identity does not follow compare_shells yet
+#### the header decides when no annotation names a chain shell
+case $SH in ash) echo ASH ;; dash) echo DASH ;; *) echo OTHER ;; esac
+## STDOUT:
+DASH
+## END
+
+#### a dash-graded case can still exec $SH
+$SH -c 'echo nested'
+## STDOUT:
+nested
+## END
+
+#### an ash annotation outranks a header that omits ash
+case $SH in ash) echo ASH ;; dash) echo DASH ;; *) echo OTHER ;; esac
+## STDOUT:
+DASH
+## END
+## OK ash STDOUT:
+ASH
+## END
+";
+    for case in parse_spec(spec)? {
+        let outcome = run_case(&shell, &case, ASH_DASH_CHAIN)?;
+        assert!(outcome.passed, "{}: {}", case.name, outcome.detail.unwrap_or_default());
+    }
+    let spec = "\
+## compare_shells: bash mksh
+
+#### a file that designates neither leaves the chain head
 case $SH in ash) echo ASH ;; dash) echo DASH ;; *) echo OTHER ;; esac
 ## STDOUT:
 ASH
 ## END
+";
+    for case in parse_spec(spec)? {
+        let outcome = run_case(&shell, &case, ASH_DASH_CHAIN)?;
+        assert!(outcome.passed, "{}: {}", case.name, outcome.detail.unwrap_or_default());
+    }
+    // And the identity a case is graded as is readable without running it, so an
+    // analysis can tell which reference shell is the right one to grade a case
+    // against — see the note on multicall references in the landing message.
+    let cases = parse_spec(
+        "## compare_shells: bash dash mksh\n\n#### x\ntrue\n## OK ash STDOUT:\n## END\n",
+    )?;
+    assert_eq!(
+        cases.first().and_then(|c| graded_identity(c, ASH_DASH_CHAIN)),
+        Some("ash")
+    );
+    // A block for a LATER chain element decides it when nothing earlier is
+    // designated — the mirror of the case above, and the shape that would
+    // otherwise grade a dash divergence while running as ash.
+    let cases = parse_spec("#### x\ntrue\n## N-I dash status: 2\n")?;
+    assert_eq!(
+        cases.first().and_then(|c| graded_identity(c, ASH_DASH_CHAIN)),
+        Some("dash")
+    );
+    // An annotation's shell name matches EXACTLY, because `pick` matches it
+    // exactly; the `-version` tolerance belongs to `compare_shells` tokens
+    // alone. Tolerating it here would designate a shell whose block `pick`
+    // would then decline to use.
+    let cases = parse_spec("#### x\ntrue\n## N-I dash-0.5.12 status: 2\n")?;
+    assert_eq!(
+        cases.first().and_then(|c| graded_identity(c, ASH_DASH_CHAIN)),
+        Some("ash")
+    );
+
+    // The identity bounds EVERY field, not just the one that named it. This is
+    // `var-sub-quote::single quotes work inside character classes` in miniature:
+    // ash has its own stdout block, dash has a status block, and the header
+    // omits ash. Grading stdout as ash while taking dash's status would be a
+    // golden no shell ever produced — so the status here must be the default 0,
+    // and reaching dash's `2` is the failure this pins.
+    let spec = "\
+## compare_shells: dash bash mksh
+
+#### a later shell's block for another field does not reach us
+echo \"$SH\"
+## STDOUT:
+dash
+## END
+## BUG ash STDOUT:
+ash
+## END
+## N-I dash status: 2
 ";
     for case in parse_spec(spec)? {
         let outcome = run_case(&shell, &case, ASH_DASH_CHAIN)?;
