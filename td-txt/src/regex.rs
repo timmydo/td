@@ -305,6 +305,17 @@ struct Parser<'a> {
     /// this only once the WHOLE pattern has compiled, so any other error outranks
     /// it -- `[:alpha:]\` is `Trailing backslash`, not this.
     class_syntax: bool,
+    /// Groups left unclosed because a grep ERE drop ATE the `)` they needed (see
+    /// `drop_eats_paren`), settled by a `)` no drop has eaten. Judged after the
+    /// pattern parses, so an error found further on wins -- `(a\b*)\` is
+    /// `Trailing backslash` -- but this outranks the whole-pattern
+    /// `class_syntax` lint, as GNU orders them.
+    paren_debt: usize,
+    /// The `)` most recently eaten. Eating is idempotent, and an eaten `)` is
+    /// SPENT: it cannot also settle a debt, which is what separates `(*))` from
+    /// `(*)\b*)`. One slot is enough -- the parser scans forward, so the paren
+    /// just eaten is the next one anything asks about.
+    eaten: Option<usize>,
 }
 
 impl<'a> Parser<'a> {
@@ -353,6 +364,50 @@ impl<'a> Parser<'a> {
         self.peek() == Some(b'\\') && self.peek_at(1) == Some(ch)
     }
 
+    /// Which `)` a grep ERE drop EATS, if it eats one. gnulib drops an operator
+    /// with nothing to repeat and recurses on the next token, and an unmatched
+    /// `)` reached that way is an ordinary character -- so the drop consumes it,
+    /// and it neither closes a group nor pays for one. Asked where there is
+    /// nothing to repeat: a branch start, and again just after an assertion,
+    /// which puts the parser back in that state -- so `(*)` and `(a\b*)` eat
+    /// alike while `(\b*a)` eats nothing, and it is the INNER paren that goes.
+    ///
+    /// `op` says an operator was dropped; a brace left with nothing to repeat
+    /// eats one without an operator at all (`({)`, `(\b*{)`, but not `({a)` or
+    /// `(a{)`). A valid INTERVAL earlier in the branch stops a bare operator and
+    /// a brace eating anything (`({2}*)`, `(*{2})`, `({2}{)`), but not an
+    /// assertion's own operator (`({2}\b*)` still eats) -- so the assertion site
+    /// passes `interval: false`.
+    ///
+    /// Depth is NOT a condition, and that is the whole of why `(*)\b*)` is
+    /// refused where `(*))` compiles: the second drop eats the paren the group
+    /// was still waiting for, at depth 0 as readily as inside.
+    fn drop_eats_paren(&self, at: usize, op: bool, interval: bool) -> Option<usize> {
+        if !self.opts.ere || self.opts.strict_repeats || interval {
+            return None;
+        }
+        match (self.pat.get(at), self.pat.get(at + 1)) {
+            (Some(&b'{'), Some(&b')')) => Some(at + 1),
+            (Some(&b')'), _) if op => Some(at),
+            _ => None,
+        }
+    }
+
+    /// Eat the `)` at `close`, owing one if it was a paren a group needed.
+    /// Idempotent because the same paren is reached from more than one place: a
+    /// branch start runs twice over `(*{)`, dropping the operator on the first
+    /// pass and meeting the brace on the second, and an assertion hands `(\b*{)`
+    /// to that same block. Each eats one `)`, so `(*{))` and `(\b*{))` compile.
+    fn eat_paren(&mut self, close: usize, depth: usize) {
+        if self.eaten == Some(close) {
+            return;
+        }
+        self.eaten = Some(close);
+        if depth > 0 {
+            self.paren_debt += 1;
+        }
+    }
+
     fn parse_alt(&mut self, depth: usize) -> Result<Node, Error> {
         // Groups nest by recursion here and in every AST walk below, so a pattern
         // of 20k `(` would exhaust the stack — which aborts, and an abort is not
@@ -379,6 +434,8 @@ impl<'a> Parser<'a> {
 
     fn parse_concat(&mut self, depth: usize) -> Result<Node, Error> {
         let mut items: Vec<Node> = Vec::new();
+        // Per BRANCH, not per pattern: `parse_alt` calls this once for each.
+        let mut saw_interval = false;
         // In BRE a repetition operator has nothing to repeat at the start of a
         // branch, so it is a LITERAL there — and a leading `^` anchor does not
         // give it one: `^*` matches a line starting with `*`, not every line.
@@ -443,6 +500,7 @@ impl<'a> Parser<'a> {
                         match self.parse_interval() {
                             Ok(Some(_)) => {
                                 dropped = true;
+                                saw_interval = true;
                                 continue;
                             }
                             Ok(None) => {}
@@ -451,11 +509,10 @@ impl<'a> Parser<'a> {
                         }
                         break;
                     }
-                    // A branch emptied by dropping cannot CLOSE a group: GNU reads
-                    // `(*)` and `(a|*)` as an unmatched `(`, where `(*|a)`, `()`
-                    // and a bare `*` are all fine.
-                    if dropped_op && depth > 0 && self.at_op(b')') {
-                        return Err(Error::new("Unmatched ( or \\("));
+                    if let Some(close) =
+                        self.drop_eats_paren(self.pos, dropped_op, saw_interval)
+                    {
+                        self.eat_paren(close, depth);
                     }
                     // What is left may be the end of the branch: `-E '*'` is empty.
                     if dropped {
@@ -471,10 +528,26 @@ impl<'a> Parser<'a> {
             // start of a branch, repeating the assertion past it. An ERE keeps its
             // operators operators in both.
             let assertion = is_assertion(&atom);
+            // An assertion gives its operators nothing to repeat, so a grep ERE
+            // drops them and is back where a branch start is -- which is why
+            // `(a\b*)` refuses like `(*)`, and `(\b*a)` does not.
+            if assertion {
+                let mut at = self.pos;
+                while matches!(self.pat.get(at), Some(b'*' | b'+' | b'?')) {
+                    at += 1;
+                }
+                if let Some(close) = self.drop_eats_paren(at, at > self.pos, false) {
+                    self.eat_paren(close, depth);
+                }
+            }
             let bare = assertion && !self.opts.ere && (self.opts.strict_repeats || first);
             let atom = match bare {
                 true => atom,
-                false => self.parse_repeats(atom)?,
+                false => {
+                    let (atom, interval) = self.parse_repeats(atom)?;
+                    saw_interval = saw_interval || interval;
+                    atom
+                }
             };
             first = first && assertion;
             bol_ok = false;
@@ -545,7 +618,9 @@ impl<'a> Parser<'a> {
     /// A zero-width atom reaches here only from grep's BRE past the start of a
     /// branch, or from either ERE; sed's BRE hands the operator back as a literal
     /// before the call.
-    fn parse_repeats(&mut self, mut atom: Node) -> Result<Node, Error> {
+    /// The bool reports a valid INTERVAL among the operators consumed, which is
+    /// what stops `drop_eats_paren` eating for the rest of the branch.
+    fn parse_repeats(&mut self, mut atom: Node) -> Result<(Node, bool), Error> {
         let zero_width = is_assertion(&atom);
         // A brace on an assertion has nothing to repeat, and sed reports THAT
         // before it reads the brace at all: `-E '^{}'`, `-E '^{2,1}'` and even
@@ -555,7 +630,9 @@ impl<'a> Parser<'a> {
             return Err(Error::new("Invalid preceding regular expression"));
         }
         let mut repeated = false;
+        let mut interval = false;
         while let Some(op) = self.next_op()? {
+            interval = interval || matches!(op, Op::Interval(..));
             let stacked = match op {
                 Op::Star => (self.opts.ere && zero_width) || (!self.opts.ere && repeated),
                 Op::Plus | Op::Quest => self.opts.ere && zero_width,
@@ -578,7 +655,7 @@ impl<'a> Parser<'a> {
             atom = Node::Repeat { node: Box::new(atom), min, max };
             repeated = true;
         }
-        Ok(atom)
+        Ok((atom, interval))
     }
 
     /// Whether the interval opened before `pos` CLOSES. Both BRE diagnostics need
@@ -733,7 +810,15 @@ impl<'a> Parser<'a> {
                 }
                 Ok(Node::Group(idx, Box::new(inner)))
             }
-            b')' if self.opts.ere && depth == 0 => Ok(self.literal(b')')),
+            b')' if self.opts.ere && depth == 0 => {
+                // Ordinary here, and it settles a group a drop left open -- unless a
+                // drop ATE this very paren, which spends it. `({))` compiles where
+                // `)({)` (the spare coming first) and `(*)\b*)` (eaten) do not.
+                if self.eaten != Some(self.pos.saturating_sub(1)) {
+                    self.paren_debt = self.paren_debt.saturating_sub(1);
+                }
+                Ok(self.literal(b')'))
+            }
             b'+' | b'?' if self.opts.ere => Err(Error::new("Invalid preceding regular expression")),
             b'\\' => self.parse_escape(depth),
             _ => Ok(self.literal(b)),
@@ -1064,11 +1149,16 @@ impl Regex {
                 open: Vec::new(),
                 sibling: Vec::new(),
                 class_syntax: false,
+                paren_debt: 0,
+                eaten: None,
             };
         let root = p.parse_alt(0)?;
         if p.pos < pattern.len() {
             // Only an unbalanced `)` can stop the top-level parse early.
             return Err(Error::new("Unmatched ) or \\)"));
+        }
+        if p.paren_debt > 0 {
+            return Err(Error::new("Unmatched ( or \\("));
         }
         if p.class_syntax {
             return Err(Error::new(CLASS_SYNTAX));

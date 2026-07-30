@@ -3073,7 +3073,7 @@ abc
 ## stderr-json: ""
 ## status: 0
 
-#### grep refuses a quantified assertion INSIDE a group, which td accepts
+#### grep refuses a quantified assertion whose operator lands on the paren
 ## argv: grep -Ec '(a$?)'
 ## stdin-json: "a\n"
 ## stdout-json: ""
@@ -3164,6 +3164,420 @@ abc
 
 #### which the same token further from it is not
 ## argv: grep -Ec '(\b*a)'
+## stdin-json: "a\n"
+## stdout-json: "1\n"
+## status: 0
+
+#### and what follows the group does not save it
+## argv: grep -Ec '(\b*)a'
+## stdin-json: "a\n"
+## stdout-json: ""
+## status: 2
+
+#### a branch ending at the paren refuses where one ending at a pipe does not
+## argv: grep -Ec '(a|\b*)'
+## stdin-json: "a\n"
+## stdout-json: ""
+## status: 2
+
+#### an INTERVAL against the paren is dropped without refusing
+## argv: grep -Ec '(\b*{2})'
+## stdin-json: "a\n"
+## stdout-json: "1\n"
+## status: 0
+
+#### as it is when the assertion carries it directly
+## argv: grep -Ec '(\b{2}*)'
+## stdin-json: "a\n"
+## stdout-json: "1\n"
+## status: 0
+
+#### a brace left with nothing to repeat refuses with no operator at all
+## argv: grep -Ec '({)'
+## stdin-json: "a\n"
+## stdout-json: ""
+## status: 2
+
+#### including the one a dropped assertion leaves nothing to repeat
+## argv: grep -Ec '(\b*{)'
+## stdin-json: "a\n"
+## stdout-json: ""
+## status: 2
+
+#### and an empty branch before it is still a branch start
+## argv: grep -Ec '(|{)'
+## stdin-json: "a\n"
+## stdout-json: ""
+## status: 2
+
+#### but a brace with anything after it is the literal it looks like
+## argv: grep -Ec '({a)'
+## stdin-json: "a\n"
+## stdout-json: "0\n"
+## status: 1
+
+#### as is one with something BEFORE it to repeat
+## argv: grep -Ec '(a{)'
+## stdin-json: "a\n"
+## stdout-json: "0\n"
+## status: 1
+
+#### and one whose branch ends at a pipe
+## argv: grep -Ec '({|a)'
+## stdin-json: "a\n"
+## stdout-json: "1\n"
+## status: 0
+
+#### none of which a BRE does at all, where the operator is a literal
+## argv: grep -c '\(a\b*\)'
+## stdin-json: "a\n"
+## stdout-json: "1\n"
+## status: 0
+
+# The drop costs the pattern one `)`. A SPARE one -- unmatched, and so ordinary in
+# a grep ERE -- pays that debt, and then nothing is refused. The group still closes
+# at the FIRST paren, which is what these select.
+
+#### a spare paren pays for the drop, so the group is not refused
+## argv: grep -Ec '({))'
+## stdin-json: "{)\na\n)\n"
+## stdout-json: "1\n"
+## status: 0
+
+#### the group having closed at the first paren, leaving the second a literal
+## argv: grep -Ec '(\b*))'
+## stdin-json: ")\na\n"
+## stdout-json: "1\n"
+## status: 0
+
+#### which is why an alternation does not reach past it
+## argv: grep -Ec '(a|{))'
+## stdin-json: "{)\na\n"
+## stdout-json: "1\n"
+## status: 0
+
+#### and the atom before the dropped token is still inside the group
+## argv: grep -Ec '(a\b*))'
+## stdin-json: "a)\nab\n"
+## stdout-json: "1\n"
+## status: 0
+
+#### a paren an ENCLOSING group needs is not spare
+## argv: grep -Ec '((a\b*))'
+## stdin-json: "a\n"
+## stdout-json: ""
+## status: 2
+
+#### nor is one inside a bracket expression, where it is content
+## argv: grep -Ec '([)]\b*)'
+## stdin-json: "a\n"
+## stdout-json: ""
+## status: 2
+
+# The debt COUNTS, and it is spent left to right: two drops want two spares, a
+# leftover spare is harmless, and a spare reached BEFORE the drop pays nothing.
+
+#### two drops want two spares, and one will not do
+## argv: grep -Ec '({)({))'
+## stdin-json: "a\n"
+## stdout-json: ""
+## status: 2
+
+#### the same pattern with the second spare compiles
+## argv: grep -Ec '({)({)))'
+## stdin-json: "{{))\n{{)\na\n"
+## stdout-json: "1\n"
+## status: 0
+
+#### and a spare left over after the debt is paid is just a literal
+## argv: grep -Ec '({)))'
+## stdin-json: "{))\n{)\na\n"
+## stdout-json: "1\n"
+## status: 0
+
+#### a spare BEFORE the drop pays nothing, having been spent as a literal already
+## argv: grep -Ec ')({)'
+## stdin-json: "a\n"
+## stdout-json: ""
+## status: 2
+
+# What the drop does to that `)` is EAT it, and an eaten one is spent: it cannot
+# also settle a group. Depth is no condition -- a drop at DEPTH 0 eats a paren no
+# group needed, and the group waiting for it is what goes unclosed. That is the
+# difference between `(*))`, where nothing eats the second paren, and `(*)\b*)`,
+# where the assertion's operator does.
+
+#### a second drop eats the paren the group was still waiting for
+## argv: grep -Ec '(*)\b*)'
+## stdin-json: "a\n)\n))\n"
+## stdout-json: ""
+## status: 2
+## stderr-contains: Unmatched ( or \(
+
+#### where with nothing to eat it, that paren settles the group
+## argv: grep -Ec '(*))'
+## stdin-json: ")\na\n"
+## stdout-json: "1\n"
+## status: 0
+
+#### and a third paren settles it once the second has been eaten
+## argv: grep -Ec '(*)\b*))'
+## stdin-json: ")\n))\na\n"
+## stdout-json: "1\n"
+## status: 0
+
+#### the eaten one being spent even where the debt was already settled
+## argv: grep -Ec '({))\b*)'
+## stdin-json: "{)\n{))\na\n"
+## stdout-json: "1\n"
+## status: 0
+
+#### and an interval between the two drops does not rescue the second
+## argv: grep -Ec '(*){2}\b*)'
+## stdin-json: "a\n)\n"
+## stdout-json: ""
+## status: 2
+
+# Pairing a group this rule now accepts with one of the LITERAL-BRACE shapes it
+# still gets wrong (../spec/README's own gap entry) makes that gap visible where
+# it was not before: main refused these because its rule refused `(*)`, which
+# happened to agree with grep refusing them for the brace. Removing the wrong
+# refusal leaves the brace one uncovered. Grep-side and recorded there.
+
+#### an accepted group beside a brace shape grep still refuses
+## argv: grep -Ec '({*)(*))'
+## stdin-json: "a\n"
+## stdout-json: ""
+## status: 2
+
+#### in either order
+## argv: grep -Ec '({2}*)({*)'
+## stdin-json: "a\n"
+## stdout-json: ""
+## status: 2
+
+# A BACKREFERENCE names the group whose `)` was eaten, and grep answers from
+# glibc there rather than its own dfa -- the split already recorded in
+# ../spec/README. Two consequences, both grep-side and both xfails: what the
+# group CONTAINS differs, and so does the message for a group that never closed.
+
+#### what an eaten paren leaves in the group, which a backreference reads
+## argv: grep -Ec '(*))\1'
+## stdin-json: ")\n))\n)))\na\n"
+## stdout-json: "2\n"
+## status: 0
+
+#### and the group never having closed is a backreference complaint, not a paren one
+## argv: grep -Ec '(a\b*)\1'
+## stdin-json: "a\naa\n"
+## stdout-json: ""
+## status: 2
+## stderr-contains: Invalid back reference
+
+# What is charged is the closing PAREN, once, however many drops reach it. A
+# branch start runs twice over `(*{)` -- dropping the operator, then meeting the
+# brace -- and an assertion hands `(\b*{)` to that same block; each costs one
+# paren, so each needs exactly one spare.
+
+#### an operator and a brace against one paren cost that paren once
+## argv: grep -Ec '(*{))'
+## stdin-json: "{)\na\n"
+## stdout-json: "1\n"
+## status: 0
+
+#### and without the spare it is still refused, the debt being one and not zero
+## argv: grep -Ec '(*{)'
+## stdin-json: "a\n"
+## stdout-json: ""
+## status: 2
+
+#### an assertion's operator and a brace likewise cost one between them
+## argv: grep -Ec '(\b*{))'
+## stdin-json: "{)\na\n"
+## stdout-json: "1\n"
+## status: 0
+
+#### which the assertion, still in the pattern, is what stops matching here
+## argv: grep -Ec '(\b{))'
+## stdin-json: "{)\na\n"
+## stdout-json: "0\n"
+## status: 1
+
+#### and one spare is not enough for two parens each charged once
+## argv: grep -Ec '(*{)(*{))'
+## stdin-json: "a\n"
+## stdout-json: ""
+## status: 2
+
+#### which holds for an assertion's drop too
+## argv: grep -Ec ')(\b*)'
+## stdin-json: "a\n"
+## stdout-json: ""
+## status: 2
+
+# A bracket expression is content, so neither the `)` nor the `(` inside one is
+# spare -- including inside a bracket that CONTAINS a class, whose `]` does not
+# end it.
+
+#### a paren inside a bracket carrying a class does not pay the debt
+## argv: grep -Ec '((a\b*)[[:alpha:])])'
+## stdin-json: "a\n"
+## stdout-json: ""
+## status: 2
+
+#### and a `(` inside one does not deepen the debt either
+## argv: grep -Ec '((a\b*)[[:alpha:](]))'
+## stdin-json: "ab)\na()\nab\n"
+## stdout-json: "2\n"
+## status: 0
+
+# An unpaid debt is judged once the WHOLE pattern has parsed, so an error found
+# further along outranks it -- but it outranks the whole-pattern class lint,
+# which is judged later still.
+
+#### a trailing backslash after the drop is the error reported
+## argv: grep -Ec '(a\b*)\'
+## stdin-json: "a\n"
+## stdout-json: ""
+## status: 2
+## stderr-contains: Trailing backslash
+
+#### as is a bad range in a bracket after it
+## argv: grep -Ec '(a\b*)[z-a]'
+## stdin-json: "a\n"
+## stdout-json: ""
+## status: 2
+## stderr-contains: Invalid range end
+
+#### and an interval too large to build
+## argv: grep -Ec '(a\b*){32768}'
+## stdin-json: "a\n"
+## stdout-json: ""
+## status: 2
+## stderr-contains: Regular expression too big
+
+#### yet the unpaid debt outranks the class-syntax lint
+## argv: grep -Ec '(a\b*)[:alpha:]'
+## stdin-json: "a\n"
+## stdout-json: ""
+## status: 2
+## stderr-contains: Unmatched ( or \(
+
+#### which is what is reported once a spare pays that debt
+## argv: grep -Ec '(a\b*))[:alpha:]'
+## stdin-json: "a\n"
+## stdout-json: ""
+## status: 2
+## stderr-contains: character class syntax is
+
+# An INTERVAL earlier in the branch rescues a BARE dropped operator and a brace,
+# but not an assertion's own operator. That asymmetry is the whole of the rule's
+# interaction with intervals, and each half needs its own case.
+
+#### an interval earlier in the branch rescues a bare dropped operator
+## argv: grep -Ec '({2}*)'
+## stdin-json: "a\n"
+## stdout-json: "1\n"
+## status: 0
+
+#### in either order
+## argv: grep -Ec '(*{2})'
+## stdin-json: "a\n"
+## stdout-json: "1\n"
+## status: 0
+
+#### and it rescues a brace against the paren too
+## argv: grep -Ec '({2}{)'
+## stdin-json: "a\n"
+## stdout-json: "0\n"
+## status: 1
+
+# Those pin STATUS. What the rescued pattern then SELECTS is the recorded
+# `-o`-versus-`-c` split: GNU answers the two from different engines and so
+# disagrees with itself here, `-c` counting every line where `-o` finds two
+# occurrences in the whole file. The corpus pins `-c`, which td-txt matches; the
+# `-o` goldens below are GNU's and are xfails. The no-paren control is what shows
+# this is the dropped interval rather than anything the group rule did -- it
+# answers identically on main, where the pattern above does not compile at all.
+
+#### the count is what td-txt matches, every line having a bare `a`
+## argv: grep -Ec '({2}*)a'
+## stdin-json: "2a\n{2}a\na\n"
+## stdout-json: "3\n"
+## status: 0
+
+#### while GNU's own -o reads the dropped interval as text
+## argv: grep -Eo '({2}*)a'
+## stdin-json: "2a\n{2}a\na\n"
+## stdout-json: "2a\n2}a\n"
+## status: 0
+
+#### which it does with no group in the pattern at all
+## argv: grep -Eo '{2}a'
+## stdin-json: "2a\n{2}a\na\n"
+## stdout-json: "2}a\n"
+## status: 0
+
+#### the same pattern's count agreeing, as the split predicts
+## argv: grep -Ec '{2}a'
+## stdin-json: "2a\n{2}a\na\n"
+## stdout-json: "3\n"
+## status: 0
+
+#### even when a dropped operator preceded the interval
+## argv: grep -Ec '(\b*{2}{)'
+## stdin-json: "a\n"
+## stdout-json: "0\n"
+## status: 1
+
+#### but an ASSERTION's own operator is not rescued by it
+## argv: grep -Ec '({2}\b*)'
+## stdin-json: "a\n"
+## stdout-json: ""
+## status: 2
+
+#### nor when the assertion is what carried the interval
+## argv: grep -Ec '(\b{2}\b*)'
+## stdin-json: "a\n"
+## stdout-json: ""
+## status: 2
+
+#### nor with a real atom between the two
+## argv: grep -Ec '({2}a\b*)'
+## stdin-json: "a\n"
+## stdout-json: ""
+## status: 2
+
+# The brace half of this rule stops short of GNU: a LITERAL brace that is itself
+# followed by another dropped token refuses there and compiles here. Same axis as
+# the empty-brace entry in ../spec/README, and pre-existing.
+
+#### a literal brace before another one refuses in grep, which td compiles
+## argv: grep -Ec '({{)'
+## stdin-json: "a\n"
+## stdout-json: ""
+## status: 2
+
+#### as it does before an operator with nothing to repeat
+## argv: grep -Ec '({*)'
+## stdin-json: "a\n"
+## stdout-json: ""
+## status: 2
+
+#### and before either of the other two operators
+## argv: grep -Ec '({+)'
+## stdin-json: "a\n"
+## stdout-json: ""
+## status: 2
+
+#### including when a dropped assertion put the brace there
+## argv: grep -Ec '(\b{*)'
+## stdin-json: "a\n"
+## stdout-json: ""
+## status: 2
+
+#### yet the operator plainly APPLIED to that brace, which is why no rule fits
+## argv: grep -Ec '({*a)'
 ## stdin-json: "a\n"
 ## stdout-json: "1\n"
 ## status: 0

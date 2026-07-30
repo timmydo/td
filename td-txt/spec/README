@@ -451,11 +451,72 @@ td-txt-authored case files
       and asserting a position n times at one position asserts it once, so only
       the lower bound survives: `\b*a` leaves nothing behind, `\b+a` still
       anchors. An operator with nothing at all before it is DROPPED there rather
-      than made literal (`grep -E '*a'` is the pattern `a`), except that a branch
-      emptied by dropping may not close a group: `(*)` and `(a|*)` are an
-      unmatched `(` where `(*|a)` and `()` are fine. A brace grep cannot read as
+      than made literal (`grep -E '*a'` is the pattern `a`), except that the drop
+      costs the pattern one `)`: `(*)` and `(a|*)` are an unmatched `(` where
+      `(*|a)` and `()` are fine. A brace grep cannot read as
       an interval is a literal, content and all, so `-E '{}a'` selects `{}a`
       while `-E 'a{}'` -- a brace WITH something to repeat -- is an error.
+
+  That last refusal is not about branch starts, which is what makes it a rule
+  rather than a special case: an ASSERTION gives its operators nothing to repeat
+  either, so a grep ERE drops them and is back exactly where a branch start is.
+  Hence `(a\b*)` refuses like `(*)` though its branch is not empty, `(\b*a)` is
+  fine because something follows, and it is the INNER paren that decides --
+  `((a\b*))` refuses, `(\b*)a` refuses, `(z|\b*)` refuses and `(\b*|z)` does
+  not. A brace left with nothing to repeat refuses the same way without any
+  operator at all: `({)` and `(\b*{)`, against `({a)` and `(a{)`. Only `*`/`+`/`?`
+  drop; `{n}` does not, and a BRE never does this at all (`\(a\b*\)` compiles),
+  which is why this is `strict_repeats`-and-ERE territory.
+
+  What the drop does to that `)` is EAT it. gnulib drops the operator and
+  recurses on the next token, and an unmatched `)` reached that way is an
+  ordinary character, so the paren is consumed: it neither closes the group nor
+  is available to anything else. A `)` no drop has eaten then closes the group,
+  which is why `({))`, `(\b*))` and `(a\b*))` all compile while `({)`, `(\b*)`
+  and `(a\b*)` do not. One an ENCLOSING group needs is not available either
+  (`((a\b*))` refuses), and neither is one inside a bracket expression, where it
+  is content (`([)]\b*)` refuses).
+
+  Eating is what DEPTH has nothing to do with, and that is the part two drafts of
+  this paragraph got wrong. A drop at depth 0 eats a paren no group needed --
+  nothing is owed for it -- but it is eaten all the same, so it cannot settle the
+  group still waiting behind it: `(*)\b*)` refuses, where `(*))` compiles and
+  `(*)\b*))`, with a third paren, compiles again. The first draft read the rule
+  as "what it dropped may not sit against a `)`", which a reviewer's sweep put at
+  ~860 wrongly refused patterns, every one carrying an extra `)`; the second read
+  it as a debt any spare `)` could pay, which wrongly ACCEPTED 50 that a paren
+  eaten at depth 0 should have left unclosed, and which main had right. Adjacency
+  and balance are both the wrong frame; consumption is the right one.
+
+  Eating is also idempotent, per paren rather than per drop, because two drops
+  reach the same one in more shapes than is obvious: a branch start runs twice
+  over `(*{)`, dropping the operator and then meeting the brace, and an assertion
+  hands `(\b*{)` to that same branch start. Each of those eats one `)`, so
+  `(*{))` and `(\b*{))` compile. Groups still count separately: `({)({))` leaves
+  two waiting against one paren and refuses, `({)({)))` has two of each and
+  compiles, `(*{)(*{))` refuses. And it is spent left to right, so a `)` reached
+  BEFORE the drop settles nothing -- `)({)` refuses, that paren having already
+  been read as a literal.
+
+  The complaint is raised only once the WHOLE pattern has parsed, so an error
+  found further along outranks it -- `(a\b*)\` is `Trailing backslash`,
+  `(a\b*)[z-a]` is `Invalid range end` -- while it outranks the class-syntax
+  lint, which is judged later still: `(a\b*)[:alpha:]` is the unmatched paren and
+  `(a\b*))[:alpha:]`, its group settled, is the lint. Same deferred shape as
+  `class_syntax` itself, and the same reason: a rule about the whole pattern
+  cannot report before the whole pattern has been read.
+
+  An INTERVAL earlier in the branch then RESCUES what would otherwise refuse --
+  but not uniformly, and the asymmetry is the part no reading predicts. It
+  rescues a bare dropped operator and a brace (`({2}*)`, `(*{2})`, `({2}{)` and
+  `(\b*{2}{)` all compile, where every one of them without the interval
+  refuses), and it does NOT rescue an assertion's own operator: `({2}\b*)`
+  refuses where `({2}*)` compiles, and so do `(\b{2}\b*)` and `({2}a\b*)`. So
+  the interval is not simply "a token that counts"; which drop it covers depends
+  on what did the dropping. Probing only the bare-operator half would have
+  confirmed "an interval turns the rule off", which is what an earlier draft of
+  this paragraph said -- differential fuzzing against the oracle is what produced
+  the counterexample.
 
   Two more places sed's ERE is the strict one where grep's reads TEXT, both
   turning on the same `strict_repeats` flag. A `{` in sed's ERE always opens an
@@ -630,15 +691,57 @@ td-txt-authored case files
     a dropped interval is the other way round. Three xfail cases. Grep-side and
     pre-existing; the sed half of the same axis is modelled above.
 
-  - A token grep DROPS for having nothing to repeat, sitting immediately before a
-    `)`. `(a\b*)`, `(\b*)`, `(z|\b*)` and `({)` are `Unmatched ( or \(` there and
-    td-txt compiles them, while `(\b*a)` and `(a{*)` -- the same tokens with
-    something after them -- are fine in both. So it is the `)`, not the group and
-    not the quantifier; the earlier draft of this entry said "inside a group" and
-    was wrong. Only `*`/`+`/`?` do it, never `{n}`. Pre-existing (main answers
-    identically), and it is the same rule this landing DID implement for a branch
-    emptied by dropping -- implementing it uniformly would close these xfails and
-    `({)` together.
+  - A LITERAL brace at a branch start with another token behind it, reaching a
+    `)`. `({{)`, `({*)`, `({+)`, `({?)`, `(\b{*)`, `({**)`, `(|{*)` and `({*)a`
+    are `Unmatched ( or \(` in grep and compile here, where `({)` -- one brace
+    against the paren -- now agrees, and so do `({}{)`, `({{a)` and `({*|a)`.
+    There is no model, and one probe shows why a drop cannot be it: `({*a)`
+    MATCHES a bare `a`, so the `*` did apply to the literal `{` rather than being
+    dropped, which leaves nothing for the refusal in `({*)` to be about. Same
+    axis as the empty-brace entry above -- what a leading token leaves behind for
+    the next one to repeat -- and pre-existing, the parent binary answering
+    identically. Four xfail cases.
+
+    The SIZE of this family is a method note rather than a number. The campaign
+    fuzzer put 1708 patterns through it and found thirteen shapes; a reviewer's
+    generator, crossing the same tokens to depth four, reached `({+)`, `({?)`,
+    `(\b{*)` and more that the first grammar could not spell. Twice now this file
+    has recorded that a generator only covers the shapes its grammar produces,
+    and this is the first time the correction came from someone else's grammar
+    rather than from reading. Do not read thirteen as the count of anything but
+    what one grammar emitted.
+
+    That lesson then repeated inside one landing, which is worth the extra line.
+    The charge-once rule above was got wrong first, and FOUR generators run
+    against a binary built from main -- 16,104 token patterns, 1,708 grammar
+    patterns, 1,105 alternation patterns, 840 bracket patterns -- all reported
+    zero regressions, because the witness needs an assertion, an operator, a
+    brace and TWO closing parens at once and no grammar reached that far. A
+    reviewer found `(\b*{))` by reading; a fifth generator, written afterwards to
+    cross exactly those axes, found twenty more in the `(*{))` family that
+    reading had not. Neither method subsumed the other. A sweep reporting zero is
+    evidence about its own grammar and nothing else.
+
+    The family also GREW when the eaten-paren rule landed, and that is worth a
+    line because nothing about the shapes themselves changed. Pairing one of them
+    with a group the rule now accepts -- `({*)(*))`, `({2}*)({*)` and about 28
+    more -- used to agree with grep by accident, main refusing them because its
+    rule refused `(*)` where grep refuses them for the brace. Removing the wrong
+    refusal left the right one uncovered. Two cases carry it. A gap entry that
+    lists shapes reads as though the shapes are the extent of it; what is
+    uncovered is a RULE, and it reaches every pattern that contains one.
+
+  - The group a grep ERE drop left unclosed, once a BACKREFERENCE names it. Grep
+    answers backreference patterns from glibc rather than its own dfa -- the split
+    recorded below -- and glibc keeps the eaten `)` INSIDE the group where td-txt
+    closes the group before it. So `(*))\1` counts 2 lines of `)`/`))`/`)))`/`a`
+    in grep and 5 here, and `({2}*)\1` selects nothing in grep and 7 here. The
+    message differs on the same axis: a group that never closed is `Invalid back
+    reference` to grep, because the group was still open when `\1` was read,
+    against `Unmatched ( or \(` here -- `(a\b*)\1` and `({)\1`, where the STATUS
+    agrees at 2 and main wrongly compiled both. Four xfail cases. Not reachable
+    without a backreference: `-c` cannot tell the two boundaries apart, since
+    `(a\b*))` is `a` then `)` either way.
 
   - WHAT FOLLOWS a sed BRE assertion-plus-operator, where the parse rule above is
     uniform and glibc's MATCHER is not. `s|x\b\?|<&>|` selects the `x?` in `x?y`
@@ -662,8 +765,14 @@ td-txt-authored case files
     dfa.c and glibc per PATTERN, and the same split shows up per INVOCATION:
     `grep -o` uses glibc where `-c` and `-q` use the dfa, so GNU itself answers
     `-c '\b*a'` and `-o '\b*a'` differently on `xab` -- the corpus pins `-c`,
-    and td-txt, having one engine, cannot satisfy both. Three cases carry the
-    goldens. The landing's own METHOD warning applies to its own model here: a
+    and td-txt, having one engine, cannot satisfy both. Five cases carry the
+    goldens, two of them a DROPPED INTERVAL, where the disagreement is with
+    itself and plain: on `2a`/`{2}a`/`a`, GNU counts all three lines for `{2}a`
+    and its `-o` finds one occurrence in the file. A reviewer read this as
+    something the group rule had newly exposed, since `({2}*)a` compiles only
+    since that rule landed; the no-paren control is why it is filed here
+    instead -- `{2}a` answers identically on main, so what the rule changed is
+    which patterns reach the split, not the split. The landing's own METHOD warning applies to its own model here: a
     corner probed through one frame confirms whatever that frame implies.
 
     This gap is where an earlier draft of this landing went wrong, and the shape

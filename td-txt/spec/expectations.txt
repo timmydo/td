@@ -29,15 +29,21 @@ xfail grep-cli.test.txt::-o -w after a shrunk span at the line start
 xfail grep-cli.test.txt::a dollar before a bare pipe anchors in grep, where the pipe is a literal
 xfail grep-cli.test.txt::so the text it looks like it wants is what it does NOT select
 xfail grep-cli.test.txt::and the same at the start of a pattern
-xfail grep-cli.test.txt::grep refuses a quantified assertion INSIDE a group, which td accepts
-xfail grep-cli.test.txt::an anchor spells it the same way
-xfail grep-cli.test.txt::and a word boundary too
 xfail grep-cli.test.txt::a fuzz composite that diverges where each of its parts agrees
 xfail grep-cli.test.txt::and the dropped interval does not make its group participate
 xfail grep-cli.test.txt::a second fuzz composite in the same family
 xfail grep-cli.test.txt::a BACKREFERENCE switches grep to glibc's reading of the same pattern
 xfail grep-cli.test.txt::so the operator is a literal there, exactly as sed reads it
-xfail grep-cli.test.txt::a dropped token immediately before a paren is what grep refuses
+xfail grep-cli.test.txt::an accepted group beside a brace shape grep still refuses
+xfail grep-cli.test.txt::in either order
+xfail grep-cli.test.txt::what an eaten paren leaves in the group, which a backreference reads
+xfail grep-cli.test.txt::and the group never having closed is a backreference complaint, not a paren one
+xfail grep-cli.test.txt::while GNU's own -o reads the dropped interval as text
+xfail grep-cli.test.txt::which it does with no group in the pattern at all
+xfail grep-cli.test.txt::a literal brace before another one refuses in grep, which td compiles
+xfail grep-cli.test.txt::as it does before an operator with nothing to repeat
+xfail grep-cli.test.txt::and before either of the other two operators
+xfail grep-cli.test.txt::including when a dropped assertion put the brace there
 xfail grep-cli.test.txt::grep drops a leading interval but the NEXT one then has something to repeat
 xfail grep-cli.test.txt::and an empty brace after an anchor is the literal it is at a branch start
 xfail grep-cli.test.txt::as it is after a literal brace
