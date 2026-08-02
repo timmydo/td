@@ -990,9 +990,24 @@ fn parse_param(inner: &str, quoted: bool, depth: u32) -> Syn<Param> {
         return Err(format!("bad substitution: `${{{inner}}}`"));
     };
     i += 1;
-    let doubled = chars.get(i) == Some(&opc) && matches!(opc, '%' | '#');
+    let doubled = chars.get(i) == Some(&opc) && matches!(opc, '%' | '#' | '/');
     if doubled {
         i += 1;
+    }
+    // patsub splits before expanding, so it needs the RAW operand; every other
+    // operator takes the whole remainder as one word.
+    if opc == '/' && !colon {
+        let rest = chars.get(i..).unwrap_or_default();
+        let (pat, repl) = split_patsub(rest);
+        return Ok(Param {
+            name,
+            op: Some(ParamOp::Replace {
+                pat: word_from_str_at(&pat, depth + 1)?,
+                repl: word_from_str_at(&repl, depth + 1)?,
+                all: doubled,
+            }),
+            quoted,
+        });
     }
     let operand: String = chars.iter().skip(i).collect();
     let word = word_from_str_at(&operand, depth + 1)?;
@@ -1018,6 +1033,94 @@ fn parse_param(inner: &str, quoted: bool, depth: u32) -> Syn<Param> {
     })
 }
 
+/// Split a patsub operand into pattern and replacement at the first delimiting
+/// `/`. ash finds it in the RAW text, before the pattern is expanded, so a `/`
+/// arriving from a value is data: `a=a/; ${v/$a/r}` has the whole of `$a` as its
+/// pattern. A LEADING `/` is data too, since the pattern cannot be empty --
+/// that is what makes `${v////-}` replace `/` rather than nothing. No delimiter
+/// at all means an empty replacement, so `${v/a}` deletes.
+fn split_patsub(operand: &[char]) -> (String, String) {
+    let text = |r: Option<&[char]>| -> String { r.unwrap_or_default().iter().collect() };
+    let mut i = usize::from(operand.first() == Some(&'/'));
+    while let Some(&c) = operand.get(i) {
+        match c {
+            '\\' => i += 2,
+            '\'' | '"' => {
+                i += 1;
+                while let Some(&q) = operand.get(i) {
+                    // Inside DOUBLE quotes a backslash escapes what follows, so
+                    // `\"` is data and does not end the region. Single quotes
+                    // have no escapes, which is why this turns on `c`.
+                    if c == '"' && q == '\\' {
+                        i += 2;
+                        continue;
+                    }
+                    i += 1;
+                    if q == c {
+                        break;
+                    }
+                }
+            }
+            // A `/` inside a substitution is data. ash agrees for `$( )` and
+            // backticks (by then control bytes, not text) but mis-splits a
+            // nested `${ }`; treating all three as data is the reading that
+            // does not corrupt.
+            '$' => i += skip_substitution(operand, i),
+            '`' => {
+                i += 1;
+                while let Some(&q) = operand.get(i) {
+                    i += 1;
+                    if q == '`' {
+                        break;
+                    }
+                }
+            }
+            '/' => return (text(operand.get(..i)), text(operand.get(i + 1..))),
+            _ => i += 1,
+        }
+    }
+    (text(Some(operand)), String::new())
+}
+
+/// How far to step over a `$`-substitution starting at `at`, counting nesting so
+/// the delimiter scan cannot stop inside one. A lone `$` advances by 1.
+fn skip_substitution(operand: &[char], at: usize) -> usize {
+    if !matches!(operand.get(at + 1), Some('{') | Some('(')) {
+        return 1;
+    }
+    // Both bracket kinds are counted together: `$((n))` and `${a-$(f)}` nest
+    // either way, and the scan only needs to know where the outermost one ends.
+    // Quoted and escaped brackets do not count, since the `)` in
+    // `$(printf ")")` closes nothing.
+    let mut depth = 0u32;
+    let mut i = at + 1;
+    while let Some(&c) = operand.get(i) {
+        match c {
+            '\\' => i += 1,
+            '\'' | '"' => {
+                i += 1;
+                while let Some(&q) = operand.get(i) {
+                    if q == c {
+                        break;
+                    }
+                    i += 1;
+                }
+            }
+            '{' | '(' => depth += 1,
+            '}' | ')' => {
+                depth -= u32::from(depth > 0);
+                if depth == 0 {
+                    return i + 1 - at;
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    // Unbalanced: the rest is one blob, so no `/` in it can be a delimiter.
+    operand.len() - at
+}
+
 fn is_special_param_name(s: &str) -> bool {
     s.chars().next().is_some_and(is_special_param) || s.chars().all(|c| c.is_ascii_digit())
 }
@@ -1035,6 +1138,49 @@ mod tests {
                 _ => None,
             })
             .collect())
+    }
+
+    #[test]
+    fn patsub_delimiter_is_found_in_the_raw_text() {
+        let split = |s: &str| {
+            let cs: Vec<char> = s.chars().collect();
+            split_patsub(&cs)
+        };
+        assert_eq!(split("b/X"), ("b".into(), "X".into()));
+        // No delimiter: the replacement is empty, so `${v/a}` deletes.
+        assert_eq!(split("b"), ("b".into(), String::new()));
+        assert_eq!(split("b/"), ("b".into(), String::new()));
+        // A LEADING slash is pattern data -- the pattern cannot be empty. These
+        // two operands are what `${v////-}` and `${v///r/-}` leave after the
+        // `//` that selected replace-all, and they replace `/` and `/r`.
+        assert_eq!(split("//-"), ("/".into(), "-".into()));
+        assert_eq!(split("/r/-"), ("/r".into(), "-".into()));
+        // Quoted and escaped slashes are data, not the delimiter.
+        assert_eq!(split("'/'/X"), ("'/'".into(), "X".into()));
+        assert_eq!(split("\"/\"/X"), ("\"/\"".into(), "X".into()));
+        assert_eq!(split("\\//X"), ("\\/".into(), "X".into()));
+        // And so is a slash inside a substitution: it is the value that carries
+        // it, not the operand, so the delimiter is the one AFTER the closer.
+        assert_eq!(split("$(echo a/b)/Y"), ("$(echo a/b)".into(), "Y".into()));
+        assert_eq!(split("${x-a/b}/Y"), ("${x-a/b}".into(), "Y".into()));
+        // A bracket inside quotes closes nothing, so the `)` of `printf ")"` must
+        // not end the substitution -- otherwise the delimiter is taken from
+        // inside it and the pattern is cut in half.
+        assert_eq!(split("$(printf \")\")/X"), ("$(printf \")\")".into(), "X".into()));
+        assert_eq!(split("$(printf ')')/X"), ("$(printf ')')".into(), "X".into()));
+        // An escaped `"` does not end a double-quoted region; a single-quoted one
+        // has no escapes, so there the backslash is just data.
+        assert_eq!(split("\"a\\\"b\"/X"), ("\"a\\\"b\"".into(), "X".into()));
+        assert_eq!(split("'a\\'/X"), ("'a\\'".into(), "X".into()));
+        // Backticks are a substitution too.
+        assert_eq!(split("`echo a/b`/X"), ("`echo a/b`".into(), "X".into()));
+        // `$(( ))` is skipped here, which is bash's answer and NOT ash's: ash
+        // treats the `/` inside as the delimiter, a divergence its own source
+        // marks as a bug. See the commit message.
+        assert_eq!(split("$((1/1))/Y"), ("$((1/1))".into(), "Y".into()));
+        // An unbalanced opener leaves no delimiter after it at all.
+        assert_eq!(split("$(echo a/b"), ("$(echo a/b".into(), String::new()));
+        assert_eq!(split("`echo a/b"), ("`echo a/b".into(), String::new()));
     }
 
     fn nth(ws: &[Word], i: usize) -> Syn<&Word> {
@@ -1146,6 +1292,18 @@ mod tests {
         let mut s = String::new();
         for _ in 0..500 {
             s.push_str("${x:-");
+        }
+        s.push('y');
+        for _ in 0..500 {
+            s.push('}');
+        }
+        assert!(word_from_str_at(&s, 0).is_err());
+        // patsub re-enters TWICE per level, once for the pattern and once for the
+        // replacement, so it needs the same cap -- and it is charged separately
+        // from the operator above, since nothing else reaches these two words.
+        let mut s = String::new();
+        for _ in 0..500 {
+            s.push_str("${x/");
         }
         s.push('y');
         for _ in 0..500 {

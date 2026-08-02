@@ -421,6 +421,21 @@ fn expand_param(
             let units = pattern::compile(&expand_pattern(sh, pat)?);
             Some(pattern::strip_suffix(&units, &subject, *longest).unwrap_or(subject))
         }
+        Some(ParamOp::Replace { pat, repl, all }) => {
+            let subject = raw.unwrap_or_default();
+            let units = pattern::compile(&expand_pattern(sh, pat)?);
+            // The replacement is expanded even when the pattern turns out empty:
+            // ash expands both before deciding, so `${v/$unset/${x:=y}}` still
+            // assigns and a command substitution in it still runs.
+            let rep = QChar::text(&expand_chars(sh, repl, quoted)?);
+            if units.is_empty() {
+                // No pattern: ash returns the value untouched rather than
+                // matching the empty string everywhere.
+                Some(subject)
+            } else {
+                Some(pattern::replace(&units, &subject, &rep, *all))
+            }
+        }
     };
 
     push_expanded(&mut cur.chars, &value.unwrap_or_default(), quoted);
@@ -748,6 +763,37 @@ mod tests {
         assert!(fields(&mut sh, "$x").is_empty());
         assert_eq!(fields(&mut sh, "\"$x\""), vec![""]);
         assert_eq!(fields(&mut sh, "''"), vec![""]);
+    }
+
+    #[test]
+    fn patsub_is_ashs_with_no_bash_anchors() {
+        let mut sh = sh_with(&[("s", "xx_xx_xx"), ("v", "a/b/c"), ("e", "")]);
+        assert_eq!(fields(&mut sh, "${s/xx?/yy_}"), vec!["yy_xx_xx"]);
+        assert_eq!(fields(&mut sh, "${s//xx?/yy_}"), vec!["yy_yy_xx"]);
+        // ash has no `#`/`%` anchors, so those are ordinary pattern characters
+        // and a pattern starting with one simply does not match.
+        assert_eq!(fields(&mut sh, "${s/#?xx/_yy}"), vec!["xx_xx_xx"]);
+        assert_eq!(fields(&mut sh, "${s/%?xx/_yy}"), vec!["xx_xx_xx"]);
+        // A leading slash is pattern data, so these replace `/` and `/b`.
+        assert_eq!(fields(&mut sh, "${v////-}"), vec!["a-b-c"]);
+        assert_eq!(fields(&mut sh, "${v///b/-}"), vec!["a-/c"]);
+        // No replacement word deletes; an empty PATTERN returns the value whole.
+        assert_eq!(fields(&mut sh, "${v//\\/}"), vec!["abc"]);
+        assert_eq!(fields(&mut sh, "${v/}"), vec!["a/b/c"]);
+        assert_eq!(fields(&mut sh, "${v//}"), vec!["a/b/c"]);
+        // An unset name is the empty subject, not an error.
+        assert_eq!(fields(&mut sh, "\"${nope/a/X}\""), vec![""]);
+        assert_eq!(fields(&mut sh, "\"${e//a/X}\""), vec![""]);
+        // An empty pattern against an EMPTY subject is the one place the two
+        // empty-cases meet: the pattern wins, so nothing is replaced. Dropping
+        // the empty-pattern guard shows up only here, because everywhere else an
+        // empty pattern matches only the empty string and so never applies.
+        assert_eq!(fields(&mut sh, "\"${e/${nope}/X}\""), vec![""]);
+        assert_eq!(fields(&mut sh, "\"${e//${nope}/X}\""), vec![""]);
+        // The REPLACEMENT is expanded even when the pattern came out empty, so an
+        // assignment inside it still takes: ash expands both before deciding.
+        assert_eq!(fields(&mut sh, "\"${e/${nope}/${w:=SIDE}}\""), vec![""]);
+        assert_eq!(sh.get_var("w").as_deref(), Some("SIDE"));
     }
 
     #[test]

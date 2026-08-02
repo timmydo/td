@@ -209,6 +209,78 @@ pub fn matches(units: &[Unit], text: &str) -> bool {
     match_all(units, &chars)
 }
 
+/// The LONGEST match of `units` starting exactly at `from`, as the index just
+/// past it. ash's `scanright` shortens the candidate until one matches, so
+/// `${s/<*>/[]}` swallows all of `<html></html>` rather than the first tag.
+fn match_at(units: &[Unit], chars: &[char], from: usize) -> Option<usize> {
+    let mut k = chars.len();
+    loop {
+        if chars.get(from..k).is_some_and(|seg| match_all(units, seg)) {
+            return Some(k);
+        }
+        if k <= from {
+            return None;
+        }
+        k -= 1;
+    }
+}
+
+/// `${x/pat/repl}` (`all` false) and `${x//pat/repl}`: scan left to right,
+/// replacing the longest match at each position. The single form copies the
+/// rest of the subject verbatim after the one replacement.
+///
+/// Only a match that CONSUMED something advances the scan, and only positions
+/// that still have a character are tried. ash instead retries the empty match
+/// at the end of the subject forever, which is why `${v//*/X}` hangs it.
+pub fn replace(units: &[Unit], text: &str, repl: &str, all: bool) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    let mut out = String::new();
+    // An empty subject still gets one attempt, since `*` matches it: bash gives
+    // `X` for `${v//*/X}` with `v` empty, and so does ash for the single form.
+    if chars.is_empty() {
+        if match_at(units, &chars, 0).is_some() {
+            out.push_str(repl);
+        }
+        return out;
+    }
+    // A pattern that opens with `*` can be abandoned the moment it fails: any
+    // prefix of the remainder that would match from i+1 is also a prefix of the
+    // remainder at i, so failing here means failing everywhere after. ash relies
+    // on this (`if (str[0] == '*') goto skip_matching`) and it is not merely a
+    // saving -- without it `${x//*z/Q}` is cubic in the value's length.
+    let leading_star = matches!(units.first(), Some(Unit::Star));
+    let mut i = 0usize;
+    while i < chars.len() {
+        match match_at(units, &chars, i) {
+            Some(end) if end > i => {
+                out.push_str(repl);
+                i = end;
+                if !all {
+                    break;
+                }
+            }
+            // No match, or one that consumed nothing: keep the character and
+            // move on, which is what guarantees the scan terminates.
+            _ => {
+                if leading_star {
+                    break;
+                }
+                match chars.get(i) {
+                    Some(&c) => {
+                        out.push(c);
+                        i += 1;
+                    }
+                    None => break,
+                }
+            }
+        }
+    }
+    if let Some(rest) = chars.get(i..) {
+        out.extend(rest);
+    }
+    out
+}
+
 /// `${x#pat}` / `${x##pat}`: drop the shortest (or longest) prefix of `text`
 /// that `units` matches. Returns `None` when nothing matches.
 pub fn strip_prefix(units: &[Unit], text: &str, longest: bool) -> Option<String> {
@@ -248,6 +320,40 @@ mod tests {
 
     fn pat(s: &str) -> Vec<Unit> {
         compile(&QChar::literal_str(s))
+    }
+
+    #[test]
+    fn replace_takes_the_longest_match_at_each_position() {
+        // Longest, not first: a shortest match would stop at the opening tag.
+        assert_eq!(
+            replace(&pat("<*>"), "begin <html></html> end", "[]", false),
+            "begin [] end"
+        );
+        // `*b` at position 0 reaches the LAST b, so one replacement eats `abcab`.
+        assert_eq!(replace(&pat("*b"), "abcabc", "X", true), "Xc");
+        assert_eq!(replace(&pat("*b"), "abcabc", "X", false), "Xc");
+        // The single form copies the tail verbatim; the global form keeps scanning.
+        assert_eq!(replace(&pat("b"), "abcabc", "X", false), "aXcabc");
+        assert_eq!(replace(&pat("b"), "abcabc", "X", true), "aXcaXc");
+        // Scanning resumes AFTER the match, so `xx?` cannot re-consume its own `_`.
+        assert_eq!(replace(&pat("xx?"), "xx_xx_xx", "yy_", true), "yy_yy_xx");
+        assert_eq!(replace(&pat("a"), "aaa", "X", true), "XXX");
+        assert_eq!(replace(&pat("z"), "abc", "X", true), "abc");
+    }
+
+    #[test]
+    fn replace_terminates_where_ash_spins_on_an_empty_match() {
+        // `*` matches the empty string at the end of the subject, and ash retries
+        // it there forever. Trying only positions that still have a character
+        // terminates AND gives bash's answer. Without that these three hang.
+        assert_eq!(replace(&pat("*"), "abc", "X", true), "X");
+        assert_eq!(replace(&pat("b*"), "abc", "X", true), "aX");
+        assert_eq!(replace(&pat("*b"), "abcabc", "X", true), "Xc");
+        // The empty subject is the one place an empty match must still replace:
+        // skipping it outright would print nothing where both shells print X.
+        assert_eq!(replace(&pat("*"), "", "X", true), "X");
+        assert_eq!(replace(&pat("*"), "", "X", false), "X");
+        assert_eq!(replace(&pat("a"), "", "X", true), "");
     }
 
     #[test]

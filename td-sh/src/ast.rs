@@ -88,6 +88,9 @@ pub enum ParamOp {
     TrimSuffix { pat: Word, longest: bool },
     /// `${name#pat}` / `${name##pat}`
     TrimPrefix { pat: Word, longest: bool },
+    /// `${name/pat/repl}` / `${name//pat/repl}`. ash has no bash `#`/`%`
+    /// anchors, so a leading `#` or `%` is an ordinary pattern character.
+    Replace { pat: Word, repl: Word, all: bool },
 }
 
 #[derive(Clone, Debug)]

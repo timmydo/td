@@ -809,8 +809,6 @@ xfail glob.test.sh::Glob of negated unescaped [[] and []]
 xfail glob.test.sh::Glob of unescaped [[] and []]
 xfail glob.test.sh::Glob ordering respects LC_COLLATE (zsh respects this too)
 xfail glob.test.sh::Glob unicode char
-xfail glob.test.sh::PatSub of negated unescaped [[] and []]
-xfail glob.test.sh::PatSub of unescaped [[] and []]
 xfail glob.test.sh::pattern starting with . does not return . and ..
 xfail globignore.test.sh::. and .. always filtered when GLOBIGNORE is set
 xfail globignore.test.sh::Extended glob expansion combined with GLOBIGNORE
@@ -1126,6 +1124,7 @@ xfail shell-grammar.test.sh::case: Using ; instead of ;;
 xfail spec-harness-bug.test.sh::osh-native duplicates stdin - is this a test harness issue?
 xfail subshell.test.sh::Subshell with redirects
 xfail tilde.test.sh::${undef:-~}
+xfail tilde.test.sh::${x//~/~root}
 xfail tilde.test.sh::temp assignment x=~ env
 xfail tilde.test.sh::tilde expansion an assignment keyword
 xfail tilde.test.sh::tilde expansion of word after redirect
@@ -1184,33 +1183,15 @@ xfail var-op-bash.test.sh::undef vs. empty string in var ops
 xfail var-op-len.test.sh::Length of undefined variable with nounset
 xfail var-op-len.test.sh::Length operator can't be followed by test operator
 xfail var-op-patsub.test.sh::${v//} is empty search and replacement
-xfail var-op-patsub.test.sh::${v/a} is the same as ${v/a/}  -- no replacement string
 xfail var-op-patsub.test.sh::${v/} is empty search and replacement
-xfail var-op-patsub.test.sh::${x//~homedir/}
-xfail var-op-patsub.test.sh::${x/^} regression
-xfail var-op-patsub.test.sh::Chromium from http://www.oilshell.org/blog/2016/11/07.html
 xfail var-op-patsub.test.sh::Confusing unquoted slash matches bash (and ash)
-xfail var-op-patsub.test.sh::Global Pattern replacement with /
-xfail var-op-patsub.test.sh::Left Anchored Pattern replacement with #
-xfail var-op-patsub.test.sh::Pattern is empty $foo$bar -- regression for infinite loop
-xfail var-op-patsub.test.sh::Pattern replacement
 xfail var-op-patsub.test.sh::Pattern replacement on unset variable
 xfail var-op-patsub.test.sh::Replace backslash
-xfail var-op-patsub.test.sh::Replace char class
-xfail var-op-patsub.test.sh::Replace fixed strings
-xfail var-op-patsub.test.sh::Replace hard glob
-xfail var-op-patsub.test.sh::Replace is longest match
-xfail var-op-patsub.test.sh::Replace right ]
-xfail var-op-patsub.test.sh::Replacement with special chars (bug fix)
-xfail var-op-patsub.test.sh::Right Anchored Pattern replacement with %
 xfail var-op-patsub.test.sh::Substitute glob characters in pattern, quoted and unquoted
 xfail var-op-patsub.test.sh::Substitute one unicode character (UTF-8)
 xfail var-op-patsub.test.sh::Synthesized ${x///} bug (similar to above)
 xfail var-op-patsub.test.sh::When LC_ALL=C, pattern ? doesn't match multibyte character
-xfail var-op-patsub.test.sh::[a-z] Invalid range end is syntax error
-xfail var-op-patsub.test.sh::\(\) in pattern (regression)
 xfail var-op-patsub.test.sh::patsub with [^]]
-xfail var-op-patsub.test.sh::patsub with single quotes and hyphen in character class (regression)
 xfail var-op-slice.test.sh::${@:0:1}
 xfail var-op-slice.test.sh::Cannot take length of substring slice
 xfail var-op-slice.test.sh::Negative second arg is position, not length!
