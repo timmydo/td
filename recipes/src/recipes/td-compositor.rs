@@ -28,6 +28,7 @@ const MODULES: &[(&str, &str)] = &[
     ),
     ("socket", include_str!("../../../td-compositor/src/socket.rs")),
     ("sys", include_str!("../../../td-compositor/src/sys.rs")),
+    ("term", include_str!("../../../td-compositor/src/term.rs")),
     ("wire", include_str!("../../../td-compositor/src/wire.rs")),
 ];
 

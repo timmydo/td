@@ -9,6 +9,10 @@ license = "GPL-3.0-or-later"
 name = "td-compositor"
 path = "src/main.rs"
 
+[[bin]]
+name = "td-term-import-libvterm"
+path = "tools/import-libvterm.rs"
+
 [workspace]
 
 [lints.clippy]

@@ -1,0 +1,1558 @@
+use super::*;
+use std::collections::{BTreeMap, BTreeSet};
+
+#[allow(dead_code)]
+#[path = "../../engine/src/sha256.rs"]
+mod migration_sha256;
+
+const CORPUS: &[(&str, &str)] = &[
+    ("color.term", include_str!("../spec/term/color.term")),
+    ("cursor.term", include_str!("../spec/term/cursor.term")),
+    ("editing.term", include_str!("../spec/term/editing.term")),
+    (
+        "libvterm-0.3.3.term",
+        include_str!("../spec/term/libvterm-0.3.3.term"),
+    ),
+    ("modes.term", include_str!("../spec/term/modes.term")),
+    ("parser.term", include_str!("../spec/term/parser.term")),
+    ("replies.term", include_str!("../spec/term/replies.term")),
+    ("resize.term", include_str!("../spec/term/resize.term")),
+    ("unicode.term", include_str!("../spec/term/unicode.term")),
+    ("wrapping.term", include_str!("../spec/term/wrapping.term")),
+];
+const EXPECTATIONS: &str = include_str!("../spec/term/expectations.txt");
+const LIBVTERM_REPORT: &str = include_str!("../spec/term/libvterm-0.3.3.report");
+const LIBVTERM_SOURCE_MANIFEST: &str = include_str!("../tools/libvterm-0.3.3.sources");
+const KNOWN_TAGS: &[&str] = &[
+    "alternate-screen",
+    "bounds",
+    "charset",
+    "color",
+    "core",
+    "editing",
+    "modes",
+    "replies",
+    "resize",
+    "utf8",
+    "wrapping",
+];
+
+#[derive(Clone, Debug)]
+struct Case {
+    id: String,
+    source: String,
+    tags: Vec<String>,
+    rows: usize,
+    columns: usize,
+    steps: Vec<Step>,
+}
+
+#[derive(Clone, Debug)]
+enum Step {
+    Write(Vec<u8>),
+    Resize(usize, usize),
+    Expect(Expectation),
+}
+
+#[derive(Clone, Debug)]
+enum Expectation {
+    Cell {
+        row: usize,
+        column: usize,
+        cell: Cell,
+    },
+    Glyph {
+        row: usize,
+        column: usize,
+        scalar: char,
+    },
+    Cursor {
+        row: usize,
+        column: usize,
+        pending_wrap: bool,
+    },
+    History(usize),
+    Mode {
+        name: String,
+        enabled: bool,
+    },
+    Reply(Vec<u8>),
+    Row {
+        row: usize,
+        text: String,
+    },
+    Text {
+        row: usize,
+        text: String,
+    },
+    Size {
+        rows: usize,
+        columns: usize,
+    },
+}
+
+struct CaseBuilder {
+    id: String,
+    source: Option<String>,
+    tags: Vec<String>,
+    size: Option<(usize, usize)>,
+    steps: Vec<Step>,
+    operations: usize,
+    expectations: usize,
+}
+
+impl CaseBuilder {
+    fn new(id: String) -> Self {
+        Self {
+            id,
+            source: None,
+            tags: Vec::new(),
+            size: None,
+            steps: Vec::new(),
+            operations: 0,
+            expectations: 0,
+        }
+    }
+
+    fn finish(self, file: &str, line: usize) -> Result<Case, String> {
+        let source = self
+            .source
+            .ok_or_else(|| at(file, line, &format!("case {} has no source", self.id)))?;
+        let (rows, columns) = self
+            .size
+            .ok_or_else(|| at(file, line, &format!("case {} has no size", self.id)))?;
+        if self.operations == 0 {
+            return Err(at(
+                file,
+                line,
+                &format!("case {} has no operation", self.id),
+            ));
+        }
+        if self.expectations == 0 {
+            return Err(at(
+                file,
+                line,
+                &format!("case {} has no expectation", self.id),
+            ));
+        }
+        if self.tags.is_empty() {
+            return Err(at(
+                file,
+                line,
+                &format!("case {} has no feature tags", self.id),
+            ));
+        }
+        let mut active_size = (rows, columns);
+        for step in &self.steps {
+            match step {
+                Step::Resize(next_rows, next_columns) => {
+                    active_size = (*next_rows, *next_columns);
+                }
+                Step::Expect(expectation) => {
+                    validate_expectation_bounds(expectation, active_size.0, active_size.1)
+                        .map_err(|error| at(file, line, &format!("case {}: {error}", self.id)))?;
+                }
+                Step::Write(_) => {}
+            }
+        }
+        Ok(Case {
+            id: self.id,
+            source,
+            tags: self.tags,
+            rows,
+            columns,
+            steps: self.steps,
+        })
+    }
+}
+
+fn validate_expectation_bounds(
+    expectation: &Expectation,
+    rows: usize,
+    columns: usize,
+) -> Result<(), String> {
+    match expectation {
+        Expectation::Cell { row, column, .. }
+        | Expectation::Glyph { row, column, .. }
+        | Expectation::Cursor { row, column, .. } => {
+            if *row >= rows || *column >= columns {
+                return Err(format!(
+                    "expectation coordinate {row},{column} escapes {rows}x{columns}"
+                ));
+            }
+        }
+        Expectation::Row { row, text } | Expectation::Text { row, text } => {
+            if *row >= rows {
+                return Err(format!("expectation row {row} escapes {rows}x{columns}"));
+            }
+            let width = text.chars().count();
+            if width != columns {
+                return Err(format!(
+                    "row expectation has {width} cells for a {columns}-column grid"
+                ));
+            }
+        }
+        Expectation::History(_)
+        | Expectation::Mode { .. }
+        | Expectation::Reply(_)
+        | Expectation::Size { .. } => {}
+    }
+    Ok(())
+}
+
+fn at(file: &str, line: usize, message: &str) -> String {
+    format!("{file}:{line}: {message}")
+}
+
+fn word(input: &str) -> Option<(&str, &str)> {
+    let input = input.trim_start();
+    let split = input.find(char::is_whitespace).unwrap_or(input.len());
+    let head = input.get(..split)?;
+    let tail = input.get(split..)?.trim_start();
+    Some((head, tail))
+}
+
+fn parse_usize(file: &str, line: usize, value: &str, what: &str) -> Result<usize, String> {
+    value
+        .parse::<usize>()
+        .map_err(|_| at(file, line, &format!("invalid {what} {value:?}")))
+}
+
+fn parse_pair(file: &str, line: usize, input: &str, what: &str) -> Result<(usize, usize), String> {
+    let (first, rest) =
+        word(input).ok_or_else(|| at(file, line, &format!("{what} requires two integers")))?;
+    let (second, trailing) =
+        word(rest).ok_or_else(|| at(file, line, &format!("{what} requires two integers")))?;
+    if !trailing.is_empty() {
+        return Err(at(
+            file,
+            line,
+            &format!("{what} has trailing input {trailing:?}"),
+        ));
+    }
+    Ok((
+        parse_usize(file, line, first, what)?,
+        parse_usize(file, line, second, what)?,
+    ))
+}
+
+fn scalar_bytes(scalar: char, output: &mut Vec<u8>) {
+    let mut encoded = [0u8; 4];
+    output.extend_from_slice(scalar.encode_utf8(&mut encoded).as_bytes());
+}
+
+fn decode_literal_body(file: &str, line: usize, body: &str) -> Result<Vec<u8>, String> {
+    let mut output = Vec::new();
+    let mut chars = body.chars();
+    while let Some(scalar) = chars.next() {
+        if scalar != '\\' {
+            scalar_bytes(scalar, &mut output);
+            continue;
+        }
+        let escaped = chars
+            .next()
+            .ok_or_else(|| at(file, line, "literal ends in a backslash"))?;
+        match escaped {
+            '\\' => output.push(b'\\'),
+            '"' => output.push(b'"'),
+            '0' => output.push(0),
+            'e' => output.push(0x1b),
+            'n' => output.push(b'\n'),
+            'r' => output.push(b'\r'),
+            't' => output.push(b'\t'),
+            'x' => {
+                let high = chars
+                    .next()
+                    .and_then(|value| value.to_digit(16))
+                    .ok_or_else(|| at(file, line, "\\x requires two hexadecimal digits"))?;
+                let low = chars
+                    .next()
+                    .and_then(|value| value.to_digit(16))
+                    .ok_or_else(|| at(file, line, "\\x requires two hexadecimal digits"))?;
+                let value = high
+                    .checked_mul(16)
+                    .and_then(|value| value.checked_add(low))
+                    .and_then(|value| u8::try_from(value).ok())
+                    .ok_or_else(|| at(file, line, "hexadecimal escape is not a byte"))?;
+                output.push(value);
+            }
+            _ => return Err(at(file, line, &format!("unsupported escape \\{escaped}"))),
+        }
+    }
+    Ok(output)
+}
+
+fn literal_prefix<'a>(
+    file: &str,
+    line: usize,
+    input: &'a str,
+    bytes: bool,
+) -> Result<(Vec<u8>, &'a str), String> {
+    let input = input.trim_start();
+    let prefix = if bytes { "b\"" } else { "\"" };
+    let body_start = prefix.len();
+    if !input.starts_with(prefix) {
+        return Err(at(
+            file,
+            line,
+            &format!("expected {} literal", if bytes { "byte" } else { "text" }),
+        ));
+    }
+    let body = input
+        .get(body_start..)
+        .ok_or_else(|| at(file, line, "literal prefix escaped input"))?;
+    let mut escaped = false;
+    let mut closing = None;
+    for (offset, scalar) in body.char_indices() {
+        if escaped {
+            escaped = false;
+        } else if scalar == '\\' {
+            escaped = true;
+        } else if scalar == '"' {
+            closing = Some(offset);
+            break;
+        }
+    }
+    let closing = closing.ok_or_else(|| at(file, line, "unterminated literal"))?;
+    let encoded = body
+        .get(..closing)
+        .ok_or_else(|| at(file, line, "literal body escaped input"))?;
+    let trailing = body
+        .get(closing.saturating_add(1)..)
+        .ok_or_else(|| at(file, line, "literal end escaped input"))?
+        .trim_start();
+    Ok((decode_literal_body(file, line, encoded)?, trailing))
+}
+
+fn text_literal(file: &str, line: usize, input: &str) -> Result<String, String> {
+    let (bytes, trailing) = literal_prefix(file, line, input, false)?;
+    if !trailing.is_empty() {
+        return Err(at(
+            file,
+            line,
+            &format!("text literal has trailing input {trailing:?}"),
+        ));
+    }
+    String::from_utf8(bytes).map_err(|_| at(file, line, "text literal is not UTF-8"))
+}
+
+fn byte_literal(file: &str, line: usize, input: &str) -> Result<Vec<u8>, String> {
+    let (bytes, trailing) = literal_prefix(file, line, input, true)?;
+    if !trailing.is_empty() {
+        return Err(at(
+            file,
+            line,
+            &format!("byte literal has trailing input {trailing:?}"),
+        ));
+    }
+    Ok(bytes)
+}
+
+fn valid_id(id: &str) -> bool {
+    !id.is_empty()
+        && !id.starts_with('/')
+        && id.chars().all(|scalar| {
+            scalar.is_ascii_lowercase()
+                || scalar.is_ascii_digit()
+                || matches!(scalar, '/' | '-' | '_' | '.')
+        })
+}
+
+fn parse_source(file: &str, line: usize, input: &str) -> Result<String, String> {
+    if input == "td" {
+        return Ok("td".into());
+    }
+    let source = text_literal(file, line, input)?;
+    if source.is_empty() {
+        return Err(at(file, line, "source may not be empty"));
+    }
+    Ok(source)
+}
+
+fn parse_tags(file: &str, line: usize, input: &str) -> Result<Vec<String>, String> {
+    let mut tags = Vec::new();
+    for tag in input.split_whitespace() {
+        if !KNOWN_TAGS.contains(&tag) {
+            return Err(at(file, line, &format!("unknown feature tag {tag:?}")));
+        }
+        if tags.iter().any(|existing| existing == tag) {
+            return Err(at(file, line, &format!("duplicate feature tag {tag:?}")));
+        }
+        tags.push(tag.to_string());
+    }
+    if tags.is_empty() {
+        return Err(at(file, line, "tags requires at least one feature tag"));
+    }
+    Ok(tags)
+}
+
+fn parse_color(file: &str, line: usize, input: &str) -> Result<Color, String> {
+    if input == "default" {
+        return Ok(Color::Default);
+    }
+    if let Some(value) = input.strip_prefix("indexed:") {
+        let index = value
+            .parse::<u8>()
+            .map_err(|_| at(file, line, &format!("invalid indexed color {input:?}")))?;
+        return Ok(Color::Indexed(index));
+    }
+    if let Some(value) = input.strip_prefix("rgb:") {
+        if value.len() != 6 || !value.chars().all(|scalar| scalar.is_ascii_hexdigit()) {
+            return Err(at(file, line, &format!("invalid RGB color {input:?}")));
+        }
+        let component = |range: std::ops::Range<usize>| -> Result<u8, String> {
+            let digits = value
+                .get(range)
+                .ok_or_else(|| at(file, line, "RGB component escaped color"))?;
+            u8::from_str_radix(digits, 16)
+                .map_err(|_| at(file, line, &format!("invalid RGB color {input:?}")))
+        };
+        return Ok(Color::Rgb(
+            component(0..2)?,
+            component(2..4)?,
+            component(4..6)?,
+        ));
+    }
+    Err(at(file, line, &format!("invalid color {input:?}")))
+}
+
+fn parse_attributes(file: &str, line: usize, input: &str) -> Result<Attributes, String> {
+    let mut attributes = Attributes::default();
+    if input == "none" {
+        return Ok(attributes);
+    }
+    let mut seen = BTreeSet::new();
+    for name in input.split(',') {
+        if !seen.insert(name) {
+            return Err(at(file, line, &format!("duplicate attribute {name:?}")));
+        }
+        match name {
+            "bold" => attributes.bold = true,
+            "faint" => attributes.faint = true,
+            "italic" => attributes.italic = true,
+            "underline" => attributes.underline = true,
+            "inverse" => attributes.inverse = true,
+            "strike" => attributes.strike = true,
+            _ => return Err(at(file, line, &format!("unknown attribute {name:?}"))),
+        }
+    }
+    Ok(attributes)
+}
+
+fn parse_cell(file: &str, line: usize, input: &str) -> Result<Expectation, String> {
+    let (row, rest) = word(input).ok_or_else(|| at(file, line, "cell requires row and column"))?;
+    let (column, rest) =
+        word(rest).ok_or_else(|| at(file, line, "cell requires row and column"))?;
+    let row = parse_usize(file, line, row, "cell row")?;
+    let column = parse_usize(file, line, column, "cell column")?;
+    let (encoded, trailing) = literal_prefix(file, line, rest, false)?;
+    let text =
+        String::from_utf8(encoded).map_err(|_| at(file, line, "cell scalar is not UTF-8"))?;
+    let mut scalars = text.chars();
+    let scalar = scalars
+        .next()
+        .ok_or_else(|| at(file, line, "cell requires one scalar"))?;
+    if scalars.next().is_some() {
+        return Err(at(file, line, "cell requires exactly one scalar"));
+    }
+    let mut foreground = None;
+    let mut background = None;
+    let mut attributes = None;
+    for option in trailing.split_whitespace() {
+        if let Some(value) = option.strip_prefix("fg=") {
+            if foreground
+                .replace(parse_color(file, line, value)?)
+                .is_some()
+            {
+                return Err(at(file, line, "cell repeats fg"));
+            }
+        } else if let Some(value) = option.strip_prefix("bg=") {
+            if background
+                .replace(parse_color(file, line, value)?)
+                .is_some()
+            {
+                return Err(at(file, line, "cell repeats bg"));
+            }
+        } else if let Some(value) = option.strip_prefix("attrs=") {
+            if attributes
+                .replace(parse_attributes(file, line, value)?)
+                .is_some()
+            {
+                return Err(at(file, line, "cell repeats attrs"));
+            }
+        } else {
+            return Err(at(file, line, &format!("unknown cell option {option:?}")));
+        }
+    }
+    let mut attributes = attributes.ok_or_else(|| at(file, line, "cell requires attrs="))?;
+    attributes.foreground = foreground.ok_or_else(|| at(file, line, "cell requires fg="))?;
+    attributes.background = background.ok_or_else(|| at(file, line, "cell requires bg="))?;
+    Ok(Expectation::Cell {
+        row,
+        column,
+        cell: Cell { scalar, attributes },
+    })
+}
+
+fn parse_glyph(file: &str, line: usize, input: &str) -> Result<Expectation, String> {
+    let (row, rest) = word(input).ok_or_else(|| at(file, line, "glyph requires row and column"))?;
+    let (column, rest) =
+        word(rest).ok_or_else(|| at(file, line, "glyph requires row and column"))?;
+    let (encoded, trailing) = literal_prefix(file, line, rest, false)?;
+    if !trailing.is_empty() {
+        return Err(at(file, line, "glyph has trailing input"));
+    }
+    let text =
+        String::from_utf8(encoded).map_err(|_| at(file, line, "glyph scalar is not UTF-8"))?;
+    let mut scalars = text.chars();
+    let scalar = scalars
+        .next()
+        .ok_or_else(|| at(file, line, "glyph requires one scalar"))?;
+    if scalars.next().is_some() {
+        return Err(at(file, line, "glyph requires exactly one scalar"));
+    }
+    Ok(Expectation::Glyph {
+        row: parse_usize(file, line, row, "glyph row")?,
+        column: parse_usize(file, line, column, "glyph column")?,
+        scalar,
+    })
+}
+
+fn parse_expectation(file: &str, line: usize, input: &str) -> Result<Expectation, String> {
+    let (kind, rest) = word(input).ok_or_else(|| at(file, line, "expect requires a kind"))?;
+    match kind {
+        "cell" => parse_cell(file, line, rest),
+        "glyph" => parse_glyph(file, line, rest),
+        "cursor" => {
+            let (row, rest) =
+                word(rest).ok_or_else(|| at(file, line, "cursor requires row and column"))?;
+            let (column, trailing) =
+                word(rest).ok_or_else(|| at(file, line, "cursor requires row and column"))?;
+            let pending_wrap = match trailing {
+                "" => false,
+                "pending-wrap" => true,
+                _ => {
+                    return Err(at(
+                        file,
+                        line,
+                        &format!("invalid cursor suffix {trailing:?}"),
+                    ));
+                }
+            };
+            Ok(Expectation::Cursor {
+                row: parse_usize(file, line, row, "cursor row")?,
+                column: parse_usize(file, line, column, "cursor column")?,
+                pending_wrap,
+            })
+        }
+        "history" => Ok(Expectation::History(parse_usize(
+            file,
+            line,
+            rest,
+            "history cell count",
+        )?)),
+        "mode" => {
+            let (name, enabled) =
+                word(rest).ok_or_else(|| at(file, line, "mode requires a name and state"))?;
+            let enabled = match enabled {
+                "on" => true,
+                "off" => false,
+                _ => return Err(at(file, line, "mode state must be on or off")),
+            };
+            if !matches!(
+                name,
+                "alternate-screen"
+                    | "application-cursor"
+                    | "autowrap"
+                    | "cursor-visible"
+                    | "origin"
+            ) {
+                return Err(at(file, line, &format!("unknown mode {name:?}")));
+            }
+            Ok(Expectation::Mode {
+                name: name.to_string(),
+                enabled,
+            })
+        }
+        "reply" => Ok(Expectation::Reply(byte_literal(file, line, rest)?)),
+        "row" => {
+            let (row, text) =
+                word(rest).ok_or_else(|| at(file, line, "row requires an index and text"))?;
+            Ok(Expectation::Row {
+                row: parse_usize(file, line, row, "row index")?,
+                text: text_literal(file, line, text)?,
+            })
+        }
+        "text" => {
+            let (row, text) =
+                word(rest).ok_or_else(|| at(file, line, "text requires an index and text"))?;
+            Ok(Expectation::Text {
+                row: parse_usize(file, line, row, "text row index")?,
+                text: text_literal(file, line, text)?,
+            })
+        }
+        "size" => {
+            let (rows, columns) = parse_pair(file, line, rest, "size expectation")?;
+            Ok(Expectation::Size { rows, columns })
+        }
+        _ => Err(at(
+            file,
+            line,
+            &format!("unknown expectation kind {kind:?}"),
+        )),
+    }
+}
+
+fn parse_file(file: &str, input: &str) -> Result<Vec<Case>, String> {
+    let mut cases = Vec::new();
+    let mut current: Option<CaseBuilder> = None;
+    for (offset, raw) in input.lines().enumerate() {
+        let line = offset.saturating_add(1);
+        let text = raw.trim();
+        if text.is_empty() || text.starts_with('#') {
+            continue;
+        }
+        if let Some(id) = text.strip_prefix("case ") {
+            if current.is_some() {
+                return Err(at(file, line, "nested case"));
+            }
+            if !valid_id(id) {
+                return Err(at(file, line, &format!("invalid case id {id:?}")));
+            }
+            current = Some(CaseBuilder::new(id.to_string()));
+            continue;
+        }
+        if text == "end" {
+            let builder = current
+                .take()
+                .ok_or_else(|| at(file, line, "end outside a case"))?;
+            cases.push(builder.finish(file, line)?);
+            continue;
+        }
+        let builder = current
+            .as_mut()
+            .ok_or_else(|| at(file, line, "content outside a case"))?;
+        if let Some(source) = text.strip_prefix("source ") {
+            if builder.source.is_some() {
+                return Err(at(file, line, "duplicate source"));
+            }
+            if builder.size.is_some() {
+                return Err(at(file, line, "source must precede size"));
+            }
+            builder.source = Some(parse_source(file, line, source)?);
+        } else if let Some(tags) = text.strip_prefix("tags ") {
+            if !builder.tags.is_empty() {
+                return Err(at(file, line, "duplicate tags"));
+            }
+            if builder.size.is_some() {
+                return Err(at(file, line, "tags must precede size"));
+            }
+            builder.tags = parse_tags(file, line, tags)?;
+        } else if let Some(size) = text.strip_prefix("size ") {
+            if builder.size.is_some() {
+                return Err(at(file, line, "duplicate size"));
+            }
+            let (rows, columns) = parse_pair(file, line, size, "size")?;
+            checked_cell_count(rows, columns).map_err(|error| at(file, line, &error))?;
+            builder.size = Some((rows, columns));
+        } else if let Some(bytes) = text.strip_prefix("write ") {
+            if builder.size.is_none() {
+                return Err(at(file, line, "write precedes size"));
+            }
+            builder
+                .steps
+                .push(Step::Write(byte_literal(file, line, bytes)?));
+            builder.operations += 1;
+        } else if let Some(size) = text.strip_prefix("resize ") {
+            if builder.size.is_none() {
+                return Err(at(file, line, "resize precedes size"));
+            }
+            let (rows, columns) = parse_pair(file, line, size, "resize")?;
+            checked_cell_count(rows, columns).map_err(|error| at(file, line, &error))?;
+            builder.steps.push(Step::Resize(rows, columns));
+            builder.operations += 1;
+        } else if let Some(expectation) = text.strip_prefix("expect ") {
+            if builder.size.is_none() {
+                return Err(at(file, line, "expectation precedes size"));
+            }
+            builder
+                .steps
+                .push(Step::Expect(parse_expectation(file, line, expectation)?));
+            builder.expectations += 1;
+        } else {
+            return Err(at(file, line, &format!("unknown statement {text:?}")));
+        }
+    }
+    if let Some(builder) = current {
+        return Err(at(
+            file,
+            input.lines().count().saturating_add(1),
+            &format!("unterminated case {}", builder.id),
+        ));
+    }
+    if cases.is_empty() {
+        return Err(at(file, 1, "file contains no cases"));
+    }
+    Ok(cases)
+}
+
+fn corpus() -> Result<Vec<Case>, String> {
+    let mut cases = Vec::new();
+    let mut ids = BTreeMap::new();
+    for (file, input) in CORPUS {
+        for case in parse_file(file, input)? {
+            if let Some(previous) = ids.insert(case.id.clone(), *file) {
+                return Err(format!(
+                    "{file}: duplicate case id {} already defined in {previous}",
+                    case.id
+                ));
+            }
+            cases.push(case);
+        }
+    }
+    Ok(cases)
+}
+
+#[derive(Clone, Copy)]
+enum Chunking {
+    Whole,
+    Bytes,
+    Split { operation: usize, at: usize },
+    Random { round: u64 },
+}
+
+fn feed_random(terminal: &mut Terminal, bytes: &[u8], seed: &mut u64) {
+    let mut offset = 0usize;
+    while offset < bytes.len() {
+        *seed = seed
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        let width = usize::try_from((*seed >> 32) % 8)
+            .unwrap_or(0)
+            .saturating_add(1);
+        let end = offset.saturating_add(width).min(bytes.len());
+        if let Some(chunk) = bytes.get(offset..end) {
+            terminal.feed(chunk);
+        }
+        offset = end;
+    }
+}
+
+fn feed_operation(
+    terminal: &mut Terminal,
+    bytes: &[u8],
+    operation: usize,
+    chunking: Chunking,
+    seed: &mut u64,
+) {
+    match chunking {
+        Chunking::Whole => terminal.feed(bytes),
+        Chunking::Bytes => {
+            for byte in bytes {
+                terminal.feed(std::slice::from_ref(byte));
+            }
+        }
+        Chunking::Split {
+            operation: selected,
+            at,
+        } if operation == selected => {
+            if let Some(first) = bytes.get(..at.min(bytes.len())) {
+                terminal.feed(first);
+            }
+            if let Some(second) = bytes.get(at.min(bytes.len())..) {
+                terminal.feed(second);
+            }
+        }
+        Chunking::Split { .. } => terminal.feed(bytes),
+        Chunking::Random { round } => {
+            *seed ^= round.wrapping_mul(0x9e37_79b9_7f4a_7c15);
+            feed_random(terminal, bytes, seed);
+        }
+    }
+}
+
+fn check_expectation(
+    case: &Case,
+    terminal: &Terminal,
+    expected: &Expectation,
+) -> Result<(), String> {
+    let failure = |detail: String| format!("{}: {detail}", case.id);
+    match expected {
+        Expectation::Cell { row, column, cell } => {
+            let actual = terminal.cell(*row, *column);
+            if actual != Some(*cell) {
+                return Err(failure(format!(
+                    "cell {row},{column}: expected {cell:?}, got {actual:?}"
+                )));
+            }
+        }
+        Expectation::Glyph {
+            row,
+            column,
+            scalar,
+        } => {
+            let actual = terminal.cell(*row, *column).map(|cell| cell.scalar);
+            if actual != Some(*scalar) {
+                return Err(failure(format!(
+                    "glyph {row},{column}: expected {scalar:?}, got {actual:?}"
+                )));
+            }
+        }
+        Expectation::Cursor {
+            row,
+            column,
+            pending_wrap,
+        } => {
+            let actual = terminal.cursor();
+            if actual != (*row, *column, *pending_wrap) {
+                return Err(failure(format!(
+                    "cursor: expected ({row},{column},{pending_wrap}), got {actual:?}"
+                )));
+            }
+        }
+        Expectation::History(expected) => {
+            let actual = terminal.history_cells();
+            if actual != *expected {
+                return Err(failure(format!(
+                    "history: expected {expected} cells, got {actual}"
+                )));
+            }
+        }
+        Expectation::Mode { name, enabled } => {
+            let actual = terminal.mode(name);
+            if actual != Some(*enabled) {
+                return Err(failure(format!(
+                    "mode {name}: expected {enabled}, got {actual:?}"
+                )));
+            }
+        }
+        Expectation::Reply(expected) => {
+            if terminal.replies() != expected {
+                return Err(failure(format!(
+                    "reply: expected {expected:?}, got {:?}",
+                    terminal.replies()
+                )));
+            }
+        }
+        Expectation::Row { row, text } => {
+            let actual = terminal.row_text(*row).map_err(failure)?;
+            if actual != *text {
+                return Err(failure(format!(
+                    "row {row}: expected {text:?}, got {actual:?}"
+                )));
+            }
+            for (column, scalar) in text.chars().enumerate() {
+                let expected = Cell {
+                    scalar,
+                    attributes: Attributes::default(),
+                };
+                let actual = terminal.cell(*row, column);
+                if actual != Some(expected) {
+                    return Err(failure(format!(
+                        "row {row} cell {column}: expected {expected:?}, got {actual:?}"
+                    )));
+                }
+            }
+        }
+        Expectation::Text { row, text } => {
+            let actual = terminal.row_text(*row).map_err(failure)?;
+            if actual != *text {
+                return Err(failure(format!(
+                    "text {row}: expected {text:?}, got {actual:?}"
+                )));
+            }
+        }
+        Expectation::Size { rows, columns } => {
+            if terminal.rows() != *rows || terminal.columns() != *columns {
+                return Err(failure(format!(
+                    "size: expected {rows}x{columns}, got {}x{}",
+                    terminal.rows(),
+                    terminal.columns()
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn case_seed(case: &Case) -> u64 {
+    let mut seed = 0xcbf2_9ce4_8422_2325u64;
+    for byte in case.id.as_bytes() {
+        seed ^= u64::from(*byte);
+        seed = seed.wrapping_mul(0x100_0000_01b3);
+    }
+    seed
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct Gap {
+    case: String,
+    expectation: usize,
+}
+
+impl Gap {
+    fn display(&self) -> String {
+        format!("{} expectation {}", self.case, self.expectation)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct Mismatch {
+    gap: Gap,
+    detail: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct CaseRun {
+    terminal: Terminal,
+    mismatches: Vec<Mismatch>,
+}
+
+fn run_case(case: &Case, chunking: Chunking) -> Result<CaseRun, String> {
+    let mut terminal = Terminal::new(case.rows, case.columns)?;
+    terminal.screen_mut().damaged_rows.fill(false);
+    let mut operation = 0usize;
+    let mut expectation = 0usize;
+    let mut seed = case_seed(case);
+    let mut mismatches = Vec::new();
+    for step in &case.steps {
+        match step {
+            Step::Write(bytes) => {
+                feed_operation(&mut terminal, bytes, operation, chunking, &mut seed);
+                operation += 1;
+            }
+            Step::Resize(rows, columns) => {
+                terminal.resize(*rows, *columns)?;
+                operation += 1;
+            }
+            Step::Expect(expected) => {
+                expectation = expectation.saturating_add(1);
+                if let Err(error) = check_expectation(case, &terminal, expected) {
+                    mismatches.push(Mismatch {
+                        gap: Gap {
+                            case: case.id.clone(),
+                            expectation,
+                        },
+                        detail: error,
+                    });
+                }
+            }
+        }
+    }
+    Ok(CaseRun {
+        terminal,
+        mismatches,
+    })
+}
+
+fn parse_expectations(input: &str) -> Result<BTreeSet<Gap>, String> {
+    let mut xfails = BTreeSet::new();
+    for (offset, raw) in input.lines().enumerate() {
+        let line = offset.saturating_add(1);
+        let text = raw.trim();
+        if text.is_empty() || text.starts_with('#') {
+            continue;
+        }
+        let Some(disposition) = text.strip_prefix("xfail ") else {
+            return Err(format!(
+                "expectations.txt:{line}: unknown disposition {text:?}"
+            ));
+        };
+        let Some((id, expectation)) = disposition.rsplit_once(" expectation ") else {
+            return Err(format!(
+                "expectations.txt:{line}: xfail requires a case and expectation"
+            ));
+        };
+        if !valid_id(id) {
+            return Err(format!("expectations.txt:{line}: invalid case id {id:?}"));
+        }
+        let expectation = expectation
+            .parse::<usize>()
+            .ok()
+            .filter(|value| *value > 0)
+            .ok_or_else(|| format!("expectations.txt:{line}: invalid expectation index"))?;
+        let gap = Gap {
+            case: id.to_string(),
+            expectation,
+        };
+        if !xfails.insert(gap) {
+            return Err(format!(
+                "expectations.txt:{line}: duplicate xfail {disposition:?}"
+            ));
+        }
+    }
+    Ok(xfails)
+}
+
+fn expectation_inventory(cases: &[Case]) -> BTreeSet<Gap> {
+    let mut inventory = BTreeSet::new();
+    for case in cases {
+        let mut expectation = 0usize;
+        for step in &case.steps {
+            if matches!(step, Step::Expect(_)) {
+                expectation = expectation.saturating_add(1);
+                inventory.insert(Gap {
+                    case: case.id.clone(),
+                    expectation,
+                });
+            }
+        }
+    }
+    inventory
+}
+
+fn grade(cases: &[Case], xfails: &BTreeSet<Gap>) -> Result<(), String> {
+    let inventory = expectation_inventory(cases);
+    let mut actual = BTreeSet::new();
+    let mut failures = Vec::new();
+    for case in cases {
+        match run_case(case, Chunking::Whole) {
+            Ok(run) => {
+                for mismatch in run.mismatches {
+                    actual.insert(mismatch.gap.clone());
+                    if !xfails.contains(&mismatch.gap) {
+                        failures.push(format!(
+                            "unexpected failure {}: {}",
+                            mismatch.gap.display(),
+                            mismatch.detail
+                        ));
+                    }
+                }
+            }
+            Err(error) => failures.push(error),
+        }
+    }
+    for stale in xfails.difference(&inventory) {
+        failures.push(format!("stale xfail {}", stale.display()));
+    }
+    for xpass in xfails.intersection(&inventory) {
+        if !actual.contains(xpass) {
+            failures.push(format!("xpass {}", xpass.display()));
+        }
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(failures.join("\n"))
+    }
+}
+
+fn semantic_gaps(cases: &[Case]) -> Result<BTreeSet<Gap>, String> {
+    let mut gaps = BTreeSet::new();
+    for case in cases {
+        let run = run_case(case, Chunking::Whole)?;
+        for mismatch in run.mismatches {
+            gaps.insert(mismatch.gap);
+        }
+    }
+    Ok(gaps)
+}
+
+fn operation_lengths(case: &Case) -> Vec<(usize, usize)> {
+    let mut operation = 0usize;
+    let mut lengths = Vec::new();
+    for step in &case.steps {
+        match step {
+            Step::Write(bytes) => {
+                lengths.push((operation, bytes.len()));
+                operation += 1;
+            }
+            Step::Resize(_, _) => operation += 1,
+            Step::Expect(_) => {}
+        }
+    }
+    lengths
+}
+
+#[test]
+fn native_corpus_is_structurally_valid_and_green() {
+    let cases = corpus().unwrap();
+    assert!(!cases.is_empty());
+    assert!(cases.iter().all(|case| !case.source.is_empty()));
+    assert!(cases.iter().all(|case| !case.tags.is_empty()));
+    let xfails = parse_expectations(EXPECTATIONS).unwrap();
+    grade(&cases, &xfails).unwrap();
+}
+
+fn report_fields(input: &str) -> Result<BTreeMap<&str, &str>, String> {
+    let mut fields = BTreeMap::new();
+    for (offset, line) in input.lines().enumerate().skip(1) {
+        if line.is_empty() {
+            break;
+        }
+        let number = offset.saturating_add(1);
+        let Some((name, value)) = line.split_once(' ') else {
+            return Err(format!("migration report:{number}: malformed field"));
+        };
+        if fields.insert(name, value).is_some() {
+            return Err(format!("migration report:{number}: duplicate {name}"));
+        }
+    }
+    Ok(fields)
+}
+
+fn numeric_report_field(fields: &BTreeMap<&str, &str>, name: &str) -> Result<usize, String> {
+    fields
+        .get(name)
+        .ok_or_else(|| format!("migration report: missing {name}"))?
+        .parse::<usize>()
+        .map_err(|_| format!("migration report: invalid {name}"))
+}
+
+#[test]
+fn libvterm_migration_is_attributed_and_self_consistent() {
+    assert_eq!(
+        migration_sha256::hex_digest(LIBVTERM_REPORT.as_bytes()),
+        "3dfcb15a9d9070d5248b4ccd4f962fecf8e6a78025af5a8038325a21dd1bf098"
+    );
+    let fields = report_fields(LIBVTERM_REPORT).unwrap();
+    assert_eq!(fields.get("release"), Some(&"libvterm-0.3.3"));
+    assert_eq!(
+        fields.get("tag-commit"),
+        Some(&"9d6d2112335080312ef8c36667fa717ded4f7daf")
+    );
+    assert_eq!(
+        fields.get("archive-url"),
+        Some(&"https://github.com/neovim/libvterm/archive/refs/tags/v0.3.3.tar.gz")
+    );
+    assert_eq!(
+        fields.get("archive-sha256"),
+        Some(&"0babe3ab42c354925dadede90d352f054aa9c4ae6842ea803a20c9741e172e56")
+    );
+    assert_eq!(numeric_report_field(&fields, "source-files").unwrap(), 42);
+    assert_eq!(numeric_report_field(&fields, "source-cases").unwrap(), 386);
+    assert_eq!(
+        numeric_report_field(&fields, "source-assertions-raw").unwrap(),
+        1_230
+    );
+    assert_eq!(
+        numeric_report_field(&fields, "source-assertions-expanded").unwrap(),
+        1_248
+    );
+    let imported = corpus()
+        .unwrap()
+        .into_iter()
+        .filter(|case| case.source.starts_with("libvterm-0.3.3:t/"))
+        .collect::<Vec<_>>();
+    assert_eq!(imported.len(), 121);
+    assert_eq!(
+        numeric_report_field(&fields, "native-cases").unwrap(),
+        imported.len()
+    );
+    let excluded_cases = numeric_report_field(&fields, "excluded-cases").unwrap();
+    assert_eq!(excluded_cases, 265);
+    assert_eq!(imported.len().saturating_add(excluded_cases), 386);
+    let converted = numeric_report_field(&fields, "converted-assertions").unwrap();
+    let excluded = numeric_report_field(&fields, "excluded-assertions").unwrap();
+    assert_eq!(converted, 422);
+    assert_eq!(excluded, 826);
+    assert_eq!(converted.saturating_add(excluded), 1_248);
+    let native_sha256 =
+        migration_sha256::hex_digest(include_str!("../spec/term/libvterm-0.3.3.term").as_bytes());
+    assert_eq!(
+        fields.get("native-sha256").copied(),
+        Some(native_sha256.as_str())
+    );
+    let manifest_sha256 = migration_sha256::hex_digest(LIBVTERM_SOURCE_MANIFEST.as_bytes());
+    assert_eq!(
+        fields.get("source-manifest-sha256").copied(),
+        Some(manifest_sha256.as_str())
+    );
+    assert!(imported.iter().all(|case| case.id.starts_with("libvterm/")));
+    assert_eq!(
+        imported
+            .iter()
+            .flat_map(|case| &case.steps)
+            .filter(|step| matches!(step, Step::Write(_)))
+            .count(),
+        1_068
+    );
+    for case in &imported {
+        let mut awaiting_reply_check = false;
+        for step in &case.steps {
+            match step {
+                Step::Write(_) => {
+                    assert!(
+                        !awaiting_reply_check,
+                        "{} has a write without a reply checkpoint",
+                        case.id
+                    );
+                    awaiting_reply_check = true;
+                }
+                Step::Expect(Expectation::Reply(_)) => awaiting_reply_check = false,
+                Step::Resize(_, _) | Step::Expect(_) => {}
+            }
+        }
+        assert!(
+            !awaiting_reply_check,
+            "{} ends without a reply checkpoint",
+            case.id
+        );
+    }
+}
+
+#[test]
+fn generated_expectations_exactly_match_imported_semantic_gaps() {
+    let cases = corpus().unwrap();
+    let gaps = semantic_gaps(&cases).unwrap();
+    let expected = parse_expectations(EXPECTATIONS).unwrap();
+    assert_eq!(gaps, expected);
+    assert_eq!(gaps.len(), 0);
+}
+
+#[test]
+#[ignore = "developer-facing expectations generator"]
+fn print_semantic_expectations_overlay() {
+    for gap in semantic_gaps(&corpus().unwrap()).unwrap() {
+        println!("xfail {}", gap.display());
+    }
+}
+
+#[test]
+fn every_seed_case_is_independent_of_input_chunking() {
+    for case in corpus().unwrap() {
+        let expected = run_case(&case, Chunking::Whole).unwrap();
+        assert_eq!(
+            run_case(&case, Chunking::Bytes).unwrap(),
+            expected,
+            "{} changed when written bytewise",
+            case.id
+        );
+        for round in 0..4 {
+            assert_eq!(
+                run_case(&case, Chunking::Random { round }).unwrap(),
+                expected,
+                "{} changed under deterministic random chunks in round {round}",
+                case.id
+            );
+        }
+        for (operation, length) in operation_lengths(&case) {
+            for at in 0..=length {
+                assert_eq!(
+                    run_case(&case, Chunking::Split { operation, at }).unwrap(),
+                    expected,
+                    "{} changed when operation {operation} split at {at}",
+                    case.id
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn malformed_streams_resynchronize_within_fixed_bounds() {
+    assert!(Terminal::new(0, 1).is_err());
+    assert!(Terminal::new(1, 0).is_err());
+    assert!(Terminal::new(crate::MAX_UI_DIMENSION, crate::MAX_UI_DIMENSION).is_err());
+
+    let mut terminal = Terminal::new(2, 8).unwrap();
+    let mut too_many = b"\x1b[".to_vec();
+    for _ in 0..=MAX_CSI_PARAMS {
+        too_many.extend_from_slice(b"1;");
+    }
+    too_many.extend_from_slice(b"1mX");
+    terminal.feed(&too_many);
+    assert_eq!(terminal.row_text(0).unwrap(), "X       ");
+
+    let mut ignored = b"\x1b]".to_vec();
+    ignored.extend(std::iter::repeat_n(b'x', 8 * 1024));
+    ignored.extend_from_slice(b"\x1b\\OK");
+    terminal.feed(&ignored);
+    assert_eq!(terminal.row_text(0).unwrap(), "XOK     ");
+
+    for _ in 0..20_000 {
+        terminal.feed(b"\x1b[6n");
+    }
+    assert!(terminal.replies().len() <= MAX_REPLY_BYTES);
+}
+
+#[test]
+fn replies_are_bounded_drainable_and_reusable() {
+    let mut terminal = Terminal::new(1, 1).unwrap();
+    for _ in 0..20_000 {
+        terminal.feed(b"\x1b[6n");
+    }
+    let replies = terminal.take_replies();
+    assert!(!replies.is_empty());
+    assert!(replies.len() <= MAX_REPLY_BYTES);
+    assert!(terminal.take_bell());
+    assert!(terminal.replies().is_empty());
+    terminal.feed(b"\x1b[5n");
+    assert_eq!(terminal.take_replies(), b"\x1b[0n");
+    assert!(terminal.replies().is_empty());
+}
+
+#[test]
+fn bell_is_coalesced_and_drainable() {
+    let mut terminal = Terminal::new(1, 1).unwrap();
+    terminal.feed(b"\x07\x07");
+    assert!(terminal.take_bell());
+    assert!(!terminal.take_bell());
+    terminal.feed(b"\x07");
+    assert!(terminal.take_bell());
+}
+
+fn assert_terminal_invariants(terminal: &Terminal) {
+    for screen in [&terminal.primary, &terminal.alternate] {
+        assert_eq!(
+            screen.cells.len(),
+            screen.rows.checked_mul(screen.columns).unwrap()
+        );
+        assert!(screen.cursor_row < screen.rows);
+        assert!(screen.cursor_column < screen.columns);
+        assert!(screen.scroll_top < screen.scroll_bottom);
+        assert!(screen.scroll_bottom <= screen.rows);
+        assert_eq!(screen.tabs.len(), screen.columns);
+        assert_eq!(screen.wrapped_rows.len(), screen.rows);
+        assert_eq!(screen.damaged_rows.len(), screen.rows);
+        assert_eq!(
+            screen.history.cells,
+            screen
+                .history
+                .lines
+                .iter()
+                .map(|line| line.length)
+                .sum::<usize>()
+        );
+        assert!(screen.history.cells <= MAX_HISTORY_CELLS);
+        assert!(
+            screen.history.storage_bytes()
+                <= MAX_HISTORY_BYTES.saturating_sub(HISTORY_ALLOCATOR_MARGIN)
+        );
+        assert!(
+            screen
+                .history
+                .lines
+                .iter()
+                .all(|line| line.start < screen.history.max_cells)
+        );
+    }
+    assert!(terminal.replies().len() <= MAX_REPLY_BYTES);
+}
+
+#[test]
+fn history_evicts_whole_non_reflowing_lines_within_its_byte_ceiling() {
+    let width = 4_096;
+    let mut terminal = Terminal::new(1, width).unwrap();
+    let row = vec![b'x'; width];
+    for _ in 0..400 {
+        terminal.feed(&row);
+    }
+    let history = &terminal.primary.history;
+    assert!(history.storage_bytes() <= MAX_HISTORY_BYTES.saturating_sub(HISTORY_ALLOCATOR_MARGIN));
+    assert!(history.cells <= MAX_HISTORY_CELLS);
+    assert_eq!(history.cells % width, 0);
+    assert!(
+        history
+            .lines
+            .iter()
+            .all(|line| line.length == width && line.wrapped)
+    );
+    terminal.resize(1, 64).unwrap();
+    assert!(
+        terminal
+            .primary
+            .history
+            .lines
+            .iter()
+            .all(|line| line.length == width)
+    );
+}
+
+#[test]
+fn history_lines_remain_readable_across_the_ring_boundary() {
+    let mut history = History::new(true);
+    history.arena = Vec::with_capacity(5);
+    history.max_cells = 5;
+    history.max_lines = 4;
+    let first = [
+        Cell {
+            scalar: 'a',
+            attributes: Attributes::default(),
+        },
+        Cell {
+            scalar: 'b',
+            attributes: Attributes::default(),
+        },
+        Cell {
+            scalar: 'c',
+            attributes: Attributes::default(),
+        },
+    ];
+    history.push_line(&first, 0, first.len(), false);
+    let second = [
+        Cell {
+            scalar: 'd',
+            attributes: Attributes::default(),
+        },
+        Cell {
+            scalar: 'e',
+            attributes: Attributes::default(),
+        },
+        Cell {
+            scalar: 'f',
+            attributes: Attributes::default(),
+        },
+        Cell {
+            scalar: 'g',
+            attributes: Attributes::default(),
+        },
+    ];
+    history.push_line(&second, 0, second.len(), true);
+    assert_eq!(history.lines.len(), 1);
+    assert_eq!(history.line_cell(0, 0).map(|cell| cell.scalar), Some('d'));
+    assert_eq!(history.line_cell(0, 1).map(|cell| cell.scalar), Some('e'));
+    assert_eq!(history.line_cell(0, 2).map(|cell| cell.scalar), Some('f'));
+    assert_eq!(history.line_cell(0, 3).map(|cell| cell.scalar), Some('g'));
+    assert_eq!(history.line_cell(0, 4), None);
+}
+
+#[test]
+fn deterministic_arbitrary_bytes_are_total_bounded_and_chunk_invariant() {
+    for case in 0..64u64 {
+        let mut seed = case.saturating_add(1);
+        let mut bytes = Vec::with_capacity(1_024);
+        for _ in 0..1_024 {
+            seed = seed
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            bytes.push((seed >> 32) as u8);
+        }
+
+        let mut whole = Terminal::new(7, 19).unwrap();
+        whole.screen_mut().damaged_rows.fill(false);
+        whole.feed(&bytes);
+        assert_terminal_invariants(&whole);
+
+        let mut bytewise = Terminal::new(7, 19).unwrap();
+        bytewise.screen_mut().damaged_rows.fill(false);
+        for byte in &bytes {
+            bytewise.feed(std::slice::from_ref(byte));
+        }
+        assert_eq!(bytewise, whole, "arbitrary stream {case} changed bytewise");
+
+        let mut random = Terminal::new(7, 19).unwrap();
+        random.screen_mut().damaged_rows.fill(false);
+        let mut chunk_seed = case ^ 0x5eed_5eed;
+        feed_random(&mut random, &bytes, &mut chunk_seed);
+        assert_eq!(random, whole, "arbitrary stream {case} changed by chunks");
+    }
+}
+
+#[test]
+fn corpus_parser_rejects_silent_coverage_loss() {
+    let unknown = "case parser/unknown\nsource td\ntags core\nsize 1 1\nwat b\"x\"\nend\n";
+    assert!(
+        parse_file("bad.term", unknown)
+            .unwrap_err()
+            .contains("unknown statement")
+    );
+
+    let unknown_tag = "case parser/tag\nsource td\ntags surprise\nsize 1 1\nwrite b\"x\"\nexpect row 0 \"x\"\nend\n";
+    assert!(
+        parse_file("bad.term", unknown_tag)
+            .unwrap_err()
+            .contains("unknown feature tag")
+    );
+
+    let bad_escape = "case parser/escape\nsource td\ntags core\nsize 1 1\nwrite b\"\\q\"\nexpect row 0 \"x\"\nend\n";
+    assert!(
+        parse_file("bad.term", bad_escape)
+            .unwrap_err()
+            .contains("unsupported escape")
+    );
+
+    let missing_tags =
+        "case parser/tags\nsource td\nsize 1 1\nwrite b\"x\"\nexpect row 0 \"x\"\nend\n";
+    assert!(
+        parse_file("bad.term", missing_tags)
+            .unwrap_err()
+            .contains("has no feature tags")
+    );
+
+    let escaped_grid = "case parser/grid\nsource td\ntags core\nsize 1 2\nwrite b\"x\"\nexpect cell 1 0 \"x\" fg=default bg=default attrs=none\nend\n";
+    assert!(
+        parse_file("bad.term", escaped_grid)
+            .unwrap_err()
+            .contains("escapes 1x2")
+    );
+
+    let short_row =
+        "case parser/row\nsource td\ntags core\nsize 1 2\nwrite b\"x\"\nexpect row 0 \"x\"\nend\n";
+    assert!(
+        parse_file("bad.term", short_row)
+            .unwrap_err()
+            .contains("has 1 cells for a 2-column grid")
+    );
+
+    let long_glyph =
+        "case parser/glyph\nsource td\ntags core\nsize 1 2\nwrite b\"x\"\nexpect glyph 0 0 \"xy\"\nend\n";
+    assert!(parse_file("bad.term", long_glyph)
+        .unwrap_err()
+        .contains("requires exactly one scalar"));
+
+    let short_text =
+        "case parser/text\nsource td\ntags core\nsize 1 2\nwrite b\"x\"\nexpect text 0 \"x\"\nend\n";
+    assert!(parse_file("bad.term", short_text)
+        .unwrap_err()
+        .contains("has 1 cells for a 2-column grid"));
+}
+
+#[test]
+fn corpus_inventory_covers_every_native_case_file() {
+    let directory = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("spec/term");
+    let mut actual = std::fs::read_dir(&directory)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| path.extension().and_then(|value| value.to_str()) == Some("term"))
+        .map(|path| path.file_name().unwrap().to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    actual.sort();
+    let mut embedded = CORPUS
+        .iter()
+        .map(|(name, _)| (*name).to_string())
+        .collect::<Vec<_>>();
+    embedded.sort();
+    assert_eq!(
+        embedded, actual,
+        "every native .term file must be embedded in CORPUS"
+    );
+}
+
+#[test]
+fn expectations_overlay_rejects_xpass_and_stale_entries() {
+    let cases = parse_file(
+        "one.term",
+        "case parser/one\nsource td\ntags core\nsize 1 1\nwrite b\"x\"\nexpect row 0 \"x\"\nend\n",
+    )
+    .unwrap();
+    let xpass = parse_expectations("xfail parser/one expectation 1\n").unwrap();
+    assert_eq!(
+        grade(&cases, &xpass).unwrap_err(),
+        "xpass parser/one expectation 1"
+    );
+    let stale = parse_expectations("xfail parser/missing expectation 1\n").unwrap();
+    assert_eq!(
+        grade(&cases, &stale).unwrap_err(),
+        "stale xfail parser/missing expectation 1"
+    );
+
+    let mismatch = parse_file(
+        "mismatch.term",
+        "case parser/mismatch\nsource td\ntags core\nsize 1 1\nwrite b\"x\"\nexpect row 0 \"y\"\nexpect cursor 0 0\nend\n",
+    )
+    .unwrap();
+    let incomplete = parse_expectations("xfail parser/mismatch expectation 1\n").unwrap();
+    assert!(grade(&mismatch, &incomplete)
+        .unwrap_err()
+        .contains("unexpected failure parser/mismatch expectation 2"));
+    let expected = parse_expectations(
+        "xfail parser/mismatch expectation 1\nxfail parser/mismatch expectation 2\n",
+    )
+    .unwrap();
+    grade(&mismatch, &expected).unwrap();
+    assert_eq!(
+        run_case(&mismatch[0], Chunking::Whole).unwrap(),
+        run_case(&mismatch[0], Chunking::Bytes).unwrap()
+    );
+}

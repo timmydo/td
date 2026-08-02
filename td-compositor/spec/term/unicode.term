@@ -1,0 +1,35 @@
+case unicode/scalars
+source td
+tags core utf8
+size 1 5
+write b"éλ"
+expect row 0 "éλ   "
+expect cursor 0 2
+end
+
+case unicode/malformed-sequence
+source td
+tags core utf8 bounds
+size 1 4
+write b"\xC3("
+expect row 0 "�(  "
+expect cursor 0 2
+end
+
+case unicode/c0-and-del-inside-scalar
+source td
+tags core utf8
+size 1 4
+write b"A\xC3\r\xA9\xC3\x7F\xA9\xC3\x19\xA9"
+expect row 0 "ééé "
+expect cursor 0 3
+end
+
+case unicode/cancel-inside-scalar
+source td
+tags core utf8
+size 1 6
+write b"\xC3\x18\xA9\xC3\x1A\xA9\xC3\eA"
+expect row 0 "����� "
+expect cursor 0 5
+end

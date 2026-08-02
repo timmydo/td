@@ -1,0 +1,79 @@
+# Cursor operations use zero-based expectations and one-based CSI parameters.
+
+case cursor/absolute-and-relative
+source td
+tags core
+size 4 6
+write b"\e[3;4H@\e[2A\e[2DZ"
+expect row 0 "  Z   "
+expect row 2 "   @  "
+expect cursor 0 3
+end
+
+case cursor/tabs-save-and-restore
+source td
+tags core
+size 2 12
+write b"A\tB\e7\e[2;2HX\e8Y"
+expect row 0 "A       BY  "
+expect row 1 " X          "
+expect cursor 0 10
+end
+
+case cursor/origin-mode
+source td
+tags core modes
+size 5 5
+write b"\e[2;4r\e[?6h\e[2;3H@"
+expect row 2 "  @  "
+expect cursor 2 3
+expect mode origin on
+end
+
+case cursor/motion-stops-at-margins
+source td
+tags core
+size 5 4
+write b"\e[2;4r\e[2;1H\e[9AA\e[4;2H\e[9BB"
+expect row 1 "A   "
+expect row 3 " B  "
+expect cursor 3 2
+end
+
+case cursor/hpb-and-vpb
+source td
+tags core
+size 5 8
+write b"\e[4;6H\e[3j\e[2k"
+expect cursor 1 2
+end
+
+case cursor/vertical-motion-clamps-by-margin-side
+source td
+tags core
+size 10 4
+write b"\e[5;8r\e[1;1H\e[20B"
+expect cursor 7 0
+write b"\e[3;6r\e[9;1H\e[20A"
+expect cursor 2 0
+end
+
+case cursor/restored-origin-cursor-moves-outside-margins
+source td
+tags core modes
+size 10 4
+write b"\e[?6h\e7\e[5;8r\e8\e[A"
+expect cursor 0 0
+expect mode origin on
+write b"\ec\e[?6h\e[9;1H\e7\e[3;6r\e8\e[B"
+expect cursor 9 0
+expect mode origin on
+end
+
+case cursor/dec-save-restores-rendition-and-charset
+source td
+tags core color charset
+size 1 4
+write b"\e[31m\e(0\e7\e[32m\e(B\e8q"
+expect cell 0 0 "─" fg=indexed:1 bg=default attrs=none
+end

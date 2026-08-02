@@ -1,0 +1,31 @@
+case wrapping/right-margin
+source td
+tags core wrapping
+size 2 5
+write b"ABCDE"
+expect row 0 "ABCDE"
+expect cursor 0 4 pending-wrap
+write b"F"
+expect row 1 "F    "
+expect cursor 1 1
+end
+
+case wrapping/scrolls-into-history
+source td
+tags core wrapping
+size 2 5
+write b"ABCDEFGHIJK"
+expect row 0 "FGHIJ"
+expect row 1 "K    "
+expect cursor 1 1
+expect history 5
+end
+
+case wrapping/repeat-last-scalar
+source td
+tags core wrapping
+size 1 6
+write b"A\e[4b"
+expect row 0 "AAAAA "
+expect cursor 0 5
+end

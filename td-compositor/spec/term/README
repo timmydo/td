@@ -1,0 +1,22 @@
+td-term native conformance corpus
+=================================
+
+This is td-term's normative behavioral corpus. Imported and td-authored cases
+use the same line-oriented format and live together by subject. Every case has
+a stable id, a source, feature tags, an initial size, at least one operation,
+and at least one observable expectation.
+
+libvterm-0.3.3.term is generated from the pinned MIT-licensed v0.3.3 archive.
+Its report accounts for every source case and assertion; LICENSE.libvterm
+retains the upstream license. The archive and legacy Perl/C harness are not
+build inputs.
+
+The std-only importer verifies every source-file hash before generating output:
+
+  cargo run --manifest-path td-compositor/Cargo.toml \
+    --bin td-term-import-libvterm -- check LIBVTERM-0.3.3 \
+    td-compositor/spec/term
+
+Run the ignored `print_semantic_expectations_overlay` test to regenerate the
+exact xfail set. Unexpected failures, passes, stale entries, unknown tags, and
+malformed input all red the gate.

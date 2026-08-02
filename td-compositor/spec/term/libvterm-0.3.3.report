@@ -1,0 +1,348 @@
+td-term libvterm migration report
+release libvterm-0.3.3
+tag-commit 9d6d2112335080312ef8c36667fa717ded4f7daf
+archive-url https://github.com/neovim/libvterm/archive/refs/tags/v0.3.3.tar.gz
+archive-sha256 0babe3ab42c354925dadede90d352f054aa9c4ae6842ea803a20c9741e172e56
+source-manifest-sha256 f84eeb3d0e9bc347dbd554b88ed65c7dab66fb21e36b0c50694ed46f6bf4139a
+native-sha256 851db51d81f819fc74e9ad486b580327f0521ab97e3f585fc7089aa556ab206e
+source-files 42
+source-cases 386
+source-assertions-raw 1230
+source-assertions-expanded 1248
+native-cases 121
+converted-assertions 422
+excluded-cases 265
+excluded-assertions 826
+
+case-exclusion-counts
+1 DEC screen alignment is outside the first profile
+1 alternate font
+1 attribute extent callbacks are not a td-term surface
+16 callback damage geometry belongs to renderer parity
+2 colon-separated color
+3 cursor blink, cursor shape, and title properties are outside the first profile
+1 cursor shape
+1 custom default palette is outside the first profile
+9 double-width and double-height lines are outside the first profile
+7 fallback callbacks are not a td-term product surface
+3 font, script, reverse-screen, and default-palette controls are outside the first profile
+15 horizontal margins and selective or column edits are outside the first profile
+6 horizontal margins and status-string queries are outside the first profile
+1 host-managed scrollback callback injects content
+3 host-managed scrollback callbacks are not a td-term surface
+4 insert, newline, query, and horizontal-margin modes are outside the first profile
+19 key encoding belongs to the later input-profile stack
+24 mouse input is outside the first profile
+25 no supported externally observable assertion
+9 only primary DA and standard status and cursor reports are in the first profile
+66 parser callback API is not a td-term product surface
+2 screen term-property callbacks await title support
+16 selection is outside the first profile
+2 selective erase protection is outside the first profile
+1 superscript
+4 td-term deliberately retains non-reflowing history
+8 the first profile has only G0/G1 ASCII and DEC graphics
+1 unsupported terminal property query is outside the first profile
+5 wide or combining cell semantics are outside the first profile
+9 wide, combining, or protected glyph semantics are outside the first profile
+
+assertion-exclusion-counts
+4 apc
+12 control
+17 csi
+56 cursor
+39 damage
+8 dcs
+20 encout
+52 erase
+8 escape
+16 lineinfo
+3 movecursor
+22 moverect
+11 osc
+144 output
+65 pen
+4 pm
+76 putglyph
+1 sb_clear
+5 sb_popline
+19 sb_pushline
+5 screen_attrs_extent
+28 screen_cell
+15 screen_chars
+3 screen_eol
+69 screen_row
+10 screen_text
+37 scrollrect
+1 selection-query
+14 selection-set
+43 settermprop
+6 sos
+13 text
+
+excluded-cases-detail
+libvterm-0.3.3:t/02parser.test:102:Mixed CSI	parser callback API is not a td-term product surface
+libvterm-0.3.3:t/02parser.test:108:Split write	parser callback API is not a td-term product surface
+libvterm-0.3.3:t/02parser.test:120:Escape cancels CSI, starts Escape	parser callback API is not a td-term product surface
+libvterm-0.3.3:t/02parser.test:124:CAN cancels CSI, returns to normal mode	parser callback API is not a td-term product surface
+libvterm-0.3.3:t/02parser.test:128:C0 in Escape interrupts and continues	parser callback API is not a td-term product surface
+libvterm-0.3.3:t/02parser.test:133:OSC BEL	parser callback API is not a td-term product surface
+libvterm-0.3.3:t/02parser.test:137:OSC ST (7bit)	parser callback API is not a td-term product surface
+libvterm-0.3.3:t/02parser.test:141:OSC ST (8bit)	parser callback API is not a td-term product surface
+libvterm-0.3.3:t/02parser.test:145:OSC in parts	parser callback API is not a td-term product surface
+libvterm-0.3.3:t/02parser.test:153:OSC BEL without semicolon	parser callback API is not a td-term product surface
+libvterm-0.3.3:t/02parser.test:157:OSC ST without semicolon	parser callback API is not a td-term product surface
+libvterm-0.3.3:t/02parser.test:161:Escape cancels OSC, starts Escape	parser callback API is not a td-term product surface
+libvterm-0.3.3:t/02parser.test:165:CAN cancels OSC, returns to normal mode	parser callback API is not a td-term product surface
+libvterm-0.3.3:t/02parser.test:169:C0 in OSC interrupts and continues	parser callback API is not a td-term product surface
+libvterm-0.3.3:t/02parser.test:16:C1 8bit	parser callback API is not a td-term product surface
+libvterm-0.3.3:t/02parser.test:175:DCS BEL	parser callback API is not a td-term product surface
+libvterm-0.3.3:t/02parser.test:179:DCS ST (7bit)	parser callback API is not a td-term product surface
+libvterm-0.3.3:t/02parser.test:183:DCS ST (8bit)	parser callback API is not a td-term product surface
+libvterm-0.3.3:t/02parser.test:187:Split write of 7bit ST	parser callback API is not a td-term product surface
+libvterm-0.3.3:t/02parser.test:193:Escape cancels DCS, starts Escape	parser callback API is not a td-term product surface
+libvterm-0.3.3:t/02parser.test:197:CAN cancels DCS, returns to normal mode	parser callback API is not a td-term product surface
+libvterm-0.3.3:t/02parser.test:201:C0 in OSC interrupts and continues	parser callback API is not a td-term product surface
+libvterm-0.3.3:t/02parser.test:207:APC BEL	parser callback API is not a td-term product surface
+libvterm-0.3.3:t/02parser.test:211:APC ST (7bit)	parser callback API is not a td-term product surface
+libvterm-0.3.3:t/02parser.test:215:APC ST (8bit)	parser callback API is not a td-term product surface
+libvterm-0.3.3:t/02parser.test:219:PM BEL	parser callback API is not a td-term product surface
+libvterm-0.3.3:t/02parser.test:223:PM ST (7bit)	parser callback API is not a td-term product surface
+libvterm-0.3.3:t/02parser.test:227:PM ST (8bit)	parser callback API is not a td-term product surface
+libvterm-0.3.3:t/02parser.test:231:SOS BEL	parser callback API is not a td-term product surface
+libvterm-0.3.3:t/02parser.test:235:SOS ST (7bit)	parser callback API is not a td-term product surface
+libvterm-0.3.3:t/02parser.test:239:SOS ST (8bit)	parser callback API is not a td-term product surface
+libvterm-0.3.3:t/02parser.test:23:C1 7bit	parser callback API is not a td-term product surface
+libvterm-0.3.3:t/02parser.test:243:SOS can contain any C0 or C1 code	parser callback API is not a td-term product surface
+libvterm-0.3.3:t/02parser.test:249:NUL ignored	parser callback API is not a td-term product surface
+libvterm-0.3.3:t/02parser.test:252:NUL ignored within CSI	parser callback API is not a td-term product surface
+libvterm-0.3.3:t/02parser.test:256:DEL ignored	parser callback API is not a td-term product surface
+libvterm-0.3.3:t/02parser.test:259:DEL ignored within CSI	parser callback API is not a td-term product surface
+libvterm-0.3.3:t/02parser.test:263:DEL inside text"	parser callback API is not a td-term product surface
+libvterm-0.3.3:t/02parser.test:30:High bytes	parser callback API is not a td-term product surface
+libvterm-0.3.3:t/02parser.test:34:Mixed	parser callback API is not a td-term product surface
+libvterm-0.3.3:t/02parser.test:40:Escape	parser callback API is not a td-term product surface
+libvterm-0.3.3:t/02parser.test:44:Escape 2-byte	parser callback API is not a td-term product surface
+libvterm-0.3.3:t/02parser.test:48:Split write Escape	parser callback API is not a td-term product surface
+libvterm-0.3.3:t/02parser.test:53:Escape cancels Escape, starts another	parser callback API is not a td-term product surface
+libvterm-0.3.3:t/02parser.test:57:CAN cancels Escape, returns to normal mode	parser callback API is not a td-term product surface
+libvterm-0.3.3:t/02parser.test:5:Basic text	parser callback API is not a td-term product surface
+libvterm-0.3.3:t/02parser.test:61:C0 in Escape interrupts and continues	parser callback API is not a td-term product surface
+libvterm-0.3.3:t/02parser.test:66:CSI 0 args	parser callback API is not a td-term product surface
+libvterm-0.3.3:t/02parser.test:70:CSI 1 arg	parser callback API is not a td-term product surface
+libvterm-0.3.3:t/02parser.test:74:CSI 2 args	parser callback API is not a td-term product surface
+libvterm-0.3.3:t/02parser.test:78:CSI 1 arg 1 sub	parser callback API is not a td-term product surface
+libvterm-0.3.3:t/02parser.test:82:CSI many digits	parser callback API is not a td-term product surface
+libvterm-0.3.3:t/02parser.test:86:CSI leading zero	parser callback API is not a td-term product surface
+libvterm-0.3.3:t/02parser.test:90:CSI qmark	parser callback API is not a td-term product surface
+libvterm-0.3.3:t/02parser.test:94:CSI greater	parser callback API is not a td-term product surface
+libvterm-0.3.3:t/02parser.test:98:CSI SP	parser callback API is not a td-term product surface
+libvterm-0.3.3:t/02parser.test:9:C0	parser callback API is not a td-term product surface
+libvterm-0.3.3:t/03encoding_utf8.test:102:Split write	parser callback API is not a td-term product surface
+libvterm-0.3.3:t/03encoding_utf8.test:33:2 byte	parser callback API is not a td-term product surface
+libvterm-0.3.3:t/03encoding_utf8.test:37:3 byte	parser callback API is not a td-term product surface
+libvterm-0.3.3:t/03encoding_utf8.test:41:4 byte	parser callback API is not a td-term product surface
+libvterm-0.3.3:t/03encoding_utf8.test:49:Early termination	parser callback API is not a td-term product surface
+libvterm-0.3.3:t/03encoding_utf8.test:4:Low	parser callback API is not a td-term product surface
+libvterm-0.3.3:t/03encoding_utf8.test:59:Early restart	parser callback API is not a td-term product surface
+libvterm-0.3.3:t/03encoding_utf8.test:87:Overlong	parser callback API is not a td-term product surface
+libvterm-0.3.3:t/03encoding_utf8.test:98:UTF-16 Surrogates	parser callback API is not a td-term product surface
+libvterm-0.3.3:t/10state_putglyph.test:26:UTF-8 wide char	wide, combining, or protected glyph semantics are outside the first profile
+libvterm-0.3.3:t/10state_putglyph.test:33:UTF-8 emoji wide char	wide, combining, or protected glyph semantics are outside the first profile
+libvterm-0.3.3:t/10state_putglyph.test:40:UTF-8 combining chars	wide, combining, or protected glyph semantics are outside the first profile
+libvterm-0.3.3:t/10state_putglyph.test:47:Combining across buffers	wide, combining, or protected glyph semantics are outside the first profile
+libvterm-0.3.3:t/10state_putglyph.test:55:Spare combining chars get truncated	wide, combining, or protected glyph semantics are outside the first profile
+libvterm-0.3.3:t/10state_putglyph.test:69:DECSCA protected	wide, combining, or protected glyph semantics are outside the first profile
+libvterm-0.3.3:t/12state_scroll.test:102:SD/SU in DECSTBM	no supported externally observable assertion
+libvterm-0.3.3:t/12state_scroll.test:111:SD/SU in DECSTBM+DECSLRM	horizontal margins and status-string queries are outside the first profile
+libvterm-0.3.3:t/12state_scroll.test:123:Invalid boundaries	no supported externally observable assertion
+libvterm-0.3.3:t/12state_scroll.test:14:Index	no supported externally observable assertion
+libvterm-0.3.3:t/12state_scroll.test:21:Reverse Index	no supported externally observable assertion
+libvterm-0.3.3:t/12state_scroll.test:57:Linefeed in DECSTBM+DECSLRM	horizontal margins and status-string queries are outside the first profile
+libvterm-0.3.3:t/12state_scroll.test:63:IND/RI in DECSTBM+DECSLRM	horizontal margins and status-string queries are outside the first profile
+libvterm-0.3.3:t/12state_scroll.test:69:DECRQSS on DECSTBM	horizontal margins and status-string queries are outside the first profile
+libvterm-0.3.3:t/12state_scroll.test:73:DECRQSS on DECSLRM	horizontal margins and status-string queries are outside the first profile
+libvterm-0.3.3:t/12state_scroll.test:77:Setting invalid DECSLRM with !DECVSSM is still rejected	horizontal margins and status-string queries are outside the first profile
+libvterm-0.3.3:t/13state_edit.test:117:DL with DECSTBM	no supported externally observable assertion
+libvterm-0.3.3:t/13state_edit.test:122:DL outside DECSTBM	no supported externally observable assertion
+libvterm-0.3.3:t/13state_edit.test:126:DL with DECSTBM+DECSLRM	horizontal margins and selective or column edits are outside the first profile
+libvterm-0.3.3:t/13state_edit.test:132:DECIC	horizontal margins and selective or column edits are outside the first profile
+libvterm-0.3.3:t/13state_edit.test:138:DECIC with DECSTBM+DECSLRM	horizontal margins and selective or column edits are outside the first profile
+libvterm-0.3.3:t/13state_edit.test:144:DECIC outside DECSLRM	horizontal margins and selective or column edits are outside the first profile
+libvterm-0.3.3:t/13state_edit.test:148:DECDC	horizontal margins and selective or column edits are outside the first profile
+libvterm-0.3.3:t/13state_edit.test:154:DECDC with DECSTBM+DECSLRM	horizontal margins and selective or column edits are outside the first profile
+libvterm-0.3.3:t/13state_edit.test:160:DECDC outside DECSLRM	horizontal margins and selective or column edits are outside the first profile
+libvterm-0.3.3:t/13state_edit.test:197:SEL	horizontal margins and selective or column edits are outside the first profile
+libvterm-0.3.3:t/13state_edit.test:20:ICH with DECSLRM	horizontal margins and selective or column edits are outside the first profile
+libvterm-0.3.3:t/13state_edit.test:245:ED 3	no supported externally observable assertion
+libvterm-0.3.3:t/13state_edit.test:249:SED	horizontal margins and selective or column edits are outside the first profile
+libvterm-0.3.3:t/13state_edit.test:266:DECRQSS on DECSCA	horizontal margins and selective or column edits are outside the first profile
+libvterm-0.3.3:t/13state_edit.test:26:ICH outside DECSLRM	horizontal margins and selective or column edits are outside the first profile
+libvterm-0.3.3:t/13state_edit.test:44:DCH with DECSLRM	horizontal margins and selective or column edits are outside the first profile
+libvterm-0.3.3:t/13state_edit.test:50:DCH outside DECSLRM	horizontal margins and selective or column edits are outside the first profile
+libvterm-0.3.3:t/13state_edit.test:87:IL with DECSTBM	no supported externally observable assertion
+libvterm-0.3.3:t/13state_edit.test:92:IL outside DECSTBM	no supported externally observable assertion
+libvterm-0.3.3:t/13state_edit.test:96:IL with DECSTBM+DECSLRM	horizontal margins and selective or column edits are outside the first profile
+libvterm-0.3.3:t/14state_encoding.test:34:Designate G2 + LS2	the first profile has only G0/G1 ASCII and DEC graphics
+libvterm-0.3.3:t/14state_encoding.test:45:Designate G3 + LS3	the first profile has only G0/G1 ASCII and DEC graphics
+libvterm-0.3.3:t/14state_encoding.test:56:SS2	the first profile has only G0/G1 ASCII and DEC graphics
+libvterm-0.3.3:t/14state_encoding.test:62:SS3	the first profile has only G0/G1 ASCII and DEC graphics
+libvterm-0.3.3:t/14state_encoding.test:68:LS1R	the first profile has only G0/G1 ASCII and DEC graphics
+libvterm-0.3.3:t/14state_encoding.test:77:LS2R	the first profile has only G0/G1 ASCII and DEC graphics
+libvterm-0.3.3:t/14state_encoding.test:86:LS3R	the first profile has only G0/G1 ASCII and DEC graphics
+libvterm-0.3.3:t/14state_encoding.test:9:Designate G0=UK	the first profile has only G0/G1 ASCII and DEC graphics
+libvterm-0.3.3:t/15state_mode.test:26:Insert mode only happens once for UTF-8 combining	wide, combining, or protected glyph semantics are outside the first profile
+libvterm-0.3.3:t/15state_mode.test:34:Newline/Linefeed mode	insert, newline, query, and horizontal-margin modes are outside the first profile
+libvterm-0.3.3:t/15state_mode.test:59:DECRQM on DECOM	insert, newline, query, and horizontal-margin modes are outside the first profile
+libvterm-0.3.3:t/15state_mode.test:5:Insert/Replace Mode	insert, newline, query, and horizontal-margin modes are outside the first profile
+libvterm-0.3.3:t/15state_mode.test:67:Origin mode with DECSLRM	insert, newline, query, and horizontal-margin modes are outside the first profile
+libvterm-0.3.3:t/16state_resize.test:34:Resize shrink moves cursor	no supported externally observable assertion
+libvterm-0.3.3:t/17state_mouse.test:101:Non-drag motion events	mouse input is outside the first profile
+libvterm-0.3.3:t/17state_mouse.test:108:DECRQM on mouse motion mode	mouse input is outside the first profile
+libvterm-0.3.3:t/17state_mouse.test:116:Bounds checking	mouse input is outside the first profile
+libvterm-0.3.3:t/17state_mouse.test:124:DECRQM on standard encoding mode	mouse input is outside the first profile
+libvterm-0.3.3:t/17state_mouse.test:12:Mouse in simple button report mode	mouse input is outside the first profile
+libvterm-0.3.3:t/17state_mouse.test:132:UTF-8 extended encoding mode	mouse input is outside the first profile
+libvterm-0.3.3:t/17state_mouse.test:140:DECRQM on UTF-8 extended encoding mode	mouse input is outside the first profile
+libvterm-0.3.3:t/17state_mouse.test:148:SGR extended encoding mode	mouse input is outside the first profile
+libvterm-0.3.3:t/17state_mouse.test:155:DECRQM on SGR extended encoding mode	mouse input is outside the first profile
+libvterm-0.3.3:t/17state_mouse.test:163:rxvt extended encoding mode	mouse input is outside the first profile
+libvterm-0.3.3:t/17state_mouse.test:170:DECRQM on rxvt extended encoding mode	mouse input is outside the first profile
+libvterm-0.3.3:t/17state_mouse.test:178:Mouse disabled reports nothing	mouse input is outside the first profile
+libvterm-0.3.3:t/17state_mouse.test:187:DECSM can set multiple modes at once	mouse input is outside the first profile
+libvterm-0.3.3:t/17state_mouse.test:20:Press 1	mouse input is outside the first profile
+libvterm-0.3.3:t/17state_mouse.test:25:Release 1	mouse input is outside the first profile
+libvterm-0.3.3:t/17state_mouse.test:29:Ctrl-Press 1	mouse input is outside the first profile
+libvterm-0.3.3:t/17state_mouse.test:35:Button 2	mouse input is outside the first profile
+libvterm-0.3.3:t/17state_mouse.test:41:Position	mouse input is outside the first profile
+libvterm-0.3.3:t/17state_mouse.test:4:DECRQM on with mouse off	mouse input is outside the first profile
+libvterm-0.3.3:t/17state_mouse.test:51:Wheel events	mouse input is outside the first profile
+libvterm-0.3.3:t/17state_mouse.test:63:DECRQM on mouse button mode	mouse input is outside the first profile
+libvterm-0.3.3:t/17state_mouse.test:71:Drag events	mouse input is outside the first profile
+libvterm-0.3.3:t/17state_mouse.test:93:DECRQM on mouse drag mode	mouse input is outside the first profile
+libvterm-0.3.3:t/18state_termprops.test:19:Cursor blink	unsupported terminal property query is outside the first profile
+libvterm-0.3.3:t/18state_termprops.test:29:Cursor shape	cursor blink, cursor shape, and title properties are outside the first profile
+libvterm-0.3.3:t/18state_termprops.test:34:Title	cursor blink, cursor shape, and title properties are outside the first profile
+libvterm-0.3.3:t/18state_termprops.test:38:Title split write	cursor blink, cursor shape, and title properties are outside the first profile
+libvterm-0.3.3:t/22state_save.test:15:Save	no supported externally observable assertion
+libvterm-0.3.3:t/22state_save.test:18:Change state	cursor shape
+libvterm-0.3.3:t/25state_input.test:105:Enter in linefeed mode	key encoding belongs to the later input-profile stack
+libvterm-0.3.3:t/25state_input.test:109:Enter in newline mode	key encoding belongs to the later input-profile stack
+libvterm-0.3.3:t/25state_input.test:10:Ctrl modifier on ASCII letters	key encoding belongs to the later input-profile stack
+libvterm-0.3.3:t/25state_input.test:114:Unmodified F1 is SS3 P	key encoding belongs to the later input-profile stack
+libvterm-0.3.3:t/25state_input.test:118:Modified F1 is CSI P	key encoding belongs to the later input-profile stack
+libvterm-0.3.3:t/25state_input.test:126:Keypad in DECKPNM	key encoding belongs to the later input-profile stack
+libvterm-0.3.3:t/25state_input.test:130:Keypad in DECKPAM	key encoding belongs to the later input-profile stack
+libvterm-0.3.3:t/25state_input.test:135:Bracketed paste mode off	key encoding belongs to the later input-profile stack
+libvterm-0.3.3:t/25state_input.test:139:Bracketed paste mode on	key encoding belongs to the later input-profile stack
+libvterm-0.3.3:t/25state_input.test:146:Focus reporting disabled	key encoding belongs to the later input-profile stack
+libvterm-0.3.3:t/25state_input.test:150:Focus reporting enabled	key encoding belongs to the later input-profile stack
+libvterm-0.3.3:t/25state_input.test:16:Alt modifier on ASCII letters	key encoding belongs to the later input-profile stack
+libvterm-0.3.3:t/25state_input.test:22:Ctrl-Alt modifier on ASCII letters	key encoding belongs to the later input-profile stack
+libvterm-0.3.3:t/25state_input.test:28:Special handling of Ctrl-I	key encoding belongs to the later input-profile stack
+libvterm-0.3.3:t/25state_input.test:46:Special handling of Space	key encoding belongs to the later input-profile stack
+libvterm-0.3.3:t/25state_input.test:4:Unmodified ASCII	key encoding belongs to the later input-profile stack
+libvterm-0.3.3:t/25state_input.test:64:Cursor keys in reset (cursor) mode	key encoding belongs to the later input-profile stack
+libvterm-0.3.3:t/25state_input.test:82:Cursor keys in application mode	key encoding belongs to the later input-profile stack
+libvterm-0.3.3:t/25state_input.test:93:Shift-Tab should be different	key encoding belongs to the later input-profile stack
+libvterm-0.3.3:t/26state_query.test:25:DECCPR	only primary DA and standard status and cursor reports are in the first profile
+libvterm-0.3.3:t/26state_query.test:29:DECRQSS on DECSCUSR	only primary DA and standard status and cursor reports are in the first profile
+libvterm-0.3.3:t/26state_query.test:34:DECRQSS on SGR	only primary DA and standard status and cursor reports are in the first profile
+libvterm-0.3.3:t/26state_query.test:39:DECRQSS on SGR ANSI colours	only primary DA and standard status and cursor reports are in the first profile
+libvterm-0.3.3:t/26state_query.test:44:DECRQSS on SGR ANSI hi-bright colours	only primary DA and standard status and cursor reports are in the first profile
+libvterm-0.3.3:t/26state_query.test:49:DECRQSS on SGR 256-palette colours	only primary DA and standard status and cursor reports are in the first profile
+libvterm-0.3.3:t/26state_query.test:54:DECRQSS on SGR RGB8 colours	only primary DA and standard status and cursor reports are in the first profile
+libvterm-0.3.3:t/26state_query.test:59:S8C1T on DSR	only primary DA and standard status and cursor reports are in the first profile
+libvterm-0.3.3:t/26state_query.test:9:XTVERSION	only primary DA and standard status and cursor reports are in the first profile
+libvterm-0.3.3:t/27state_reset.test:14:RIS cancels scrolling region	no supported externally observable assertion
+libvterm-0.3.3:t/27state_reset.test:21:RIS erases screen	no supported externally observable assertion
+libvterm-0.3.3:t/28state_dbl_wh.test:14:Double Width, Single Height	double-width and double-height lines are outside the first profile
+libvterm-0.3.3:t/28state_dbl_wh.test:29:Double Height	double-width and double-height lines are outside the first profile
+libvterm-0.3.3:t/28state_dbl_wh.test:48:Double Width scrolling	double-width and double-height lines are outside the first profile
+libvterm-0.3.3:t/28state_dbl_wh.test:4:Single Width, Single Height	double-width and double-height lines are outside the first profile
+libvterm-0.3.3:t/29state_fallback.test:13:Unrecognised OSC	fallback callbacks are not a td-term product surface
+libvterm-0.3.3:t/29state_fallback.test:17:Unrecognised DCS	fallback callbacks are not a td-term product surface
+libvterm-0.3.3:t/29state_fallback.test:21:Unrecognised APC	fallback callbacks are not a td-term product surface
+libvterm-0.3.3:t/29state_fallback.test:25:Unrecognised PM	fallback callbacks are not a td-term product surface
+libvterm-0.3.3:t/29state_fallback.test:29:Unrecognised SOS	fallback callbacks are not a td-term product surface
+libvterm-0.3.3:t/29state_fallback.test:5:Unrecognised control	fallback callbacks are not a td-term product surface
+libvterm-0.3.3:t/29state_fallback.test:9:Unrecognised CSI	fallback callbacks are not a td-term product surface
+libvterm-0.3.3:t/30state_pen.test:108:Bold+ANSI colour == highbright	no supported externally observable assertion
+libvterm-0.3.3:t/30state_pen.test:116:Super/Subscript	superscript
+libvterm-0.3.3:t/30state_pen.test:127:DECSTR resets pen attributes	no supported externally observable assertion
+libvterm-0.3.3:t/30state_pen.test:16:Bold	no supported externally observable assertion
+libvterm-0.3.3:t/30state_pen.test:24:Underline	no supported externally observable assertion
+libvterm-0.3.3:t/30state_pen.test:42:Italic	no supported externally observable assertion
+libvterm-0.3.3:t/30state_pen.test:50:Blink	no supported externally observable assertion
+libvterm-0.3.3:t/30state_pen.test:58:Reverse	no supported externally observable assertion
+libvterm-0.3.3:t/30state_pen.test:5:Reset	no supported externally observable assertion
+libvterm-0.3.3:t/30state_pen.test:66:Font Selection	alternate font
+libvterm-0.3.3:t/30state_pen.test:76:Foreground	colon-separated color
+libvterm-0.3.3:t/30state_pen.test:92:Background	colon-separated color
+libvterm-0.3.3:t/31state_rep.test:31:REP with UTF-8 wide char	wide, combining, or protected glyph semantics are outside the first profile
+libvterm-0.3.3:t/31state_rep.test:38:REP with UTF-8 combining character	wide, combining, or protected glyph semantics are outside the first profile
+libvterm-0.3.3:t/32state_flow.test:14:CRLF in column 80 does not mark continuation	host-managed scrollback callbacks are not a td-term surface
+libvterm-0.3.3:t/32state_flow.test:23:EL cancels continuation of following line	host-managed scrollback callbacks are not a td-term surface
+libvterm-0.3.3:t/32state_flow.test:7:Spillover text marks continuation on second line	host-managed scrollback callbacks are not a td-term surface
+libvterm-0.3.3:t/40state_selection.test:13:Set clipboard; final chunk len 2	selection is outside the first profile
+libvterm-0.3.3:t/40state_selection.test:17:Set clipboard; split between chunks	selection is outside the first profile
+libvterm-0.3.3:t/40state_selection.test:23:Set clipboard; split within chunk	selection is outside the first profile
+libvterm-0.3.3:t/40state_selection.test:29:Set clipboard; empty first chunk	selection is outside the first profile
+libvterm-0.3.3:t/40state_selection.test:34:Set clipboard; empty final chunk	selection is outside the first profile
+libvterm-0.3.3:t/40state_selection.test:40:Set clipboard; longer than buffer	selection is outside the first profile
+libvterm-0.3.3:t/40state_selection.test:45:Clear clipboard	selection is outside the first profile
+libvterm-0.3.3:t/40state_selection.test:49:Set invalid data clears and ignores	selection is outside the first profile
+libvterm-0.3.3:t/40state_selection.test:53:Query clipboard	selection is outside the first profile
+libvterm-0.3.3:t/40state_selection.test:57:Send clipboard; final chunk len 4	selection is outside the first profile
+libvterm-0.3.3:t/40state_selection.test:5:Set clipboard; final chunk len 4	selection is outside the first profile
+libvterm-0.3.3:t/40state_selection.test:63:Send clipboard; final chunk len 3	selection is outside the first profile
+libvterm-0.3.3:t/40state_selection.test:69:Send clipboard; final chunk len 2	selection is outside the first profile
+libvterm-0.3.3:t/40state_selection.test:75:Send clipboard; split between chunks	selection is outside the first profile
+libvterm-0.3.3:t/40state_selection.test:83:Send clipboard; split within chunk	selection is outside the first profile
+libvterm-0.3.3:t/40state_selection.test:9:Set clipboard; final chunk len 3	selection is outside the first profile
+libvterm-0.3.3:t/60screen_ascii.test:36:Copycell	no supported externally observable assertion
+libvterm-0.3.3:t/60screen_ascii.test:54:Linefeed padding	no supported externally observable assertion
+libvterm-0.3.3:t/61screen_unicode.test:14:Wide char	wide or combining cell semantics are outside the first profile
+libvterm-0.3.3:t/61screen_unicode.test:23:Combining char	wide or combining cell semantics are outside the first profile
+libvterm-0.3.3:t/61screen_unicode.test:32:10 combining accents should not crash	wide or combining cell semantics are outside the first profile
+libvterm-0.3.3:t/61screen_unicode.test:37:40 combining accents in two split writes of 20 should not crash	wide or combining cell semantics are outside the first profile
+libvterm-0.3.3:t/61screen_unicode.test:43:Outputing CJK doublewidth in 80th column should wraparound to next line and not crash"	wide or combining cell semantics are outside the first profile
+libvterm-0.3.3:t/62screen_damage.test:108:Merge scroll with damage	callback damage geometry belongs to renderer parity
+libvterm-0.3.3:t/62screen_damage.test:117:Merge scroll with damage past region	callback damage geometry belongs to renderer parity
+libvterm-0.3.3:t/62screen_damage.test:122:Damage entirely outside scroll region	callback damage geometry belongs to renderer parity
+libvterm-0.3.3:t/62screen_damage.test:129:Damage overlapping scroll region	callback damage geometry belongs to renderer parity
+libvterm-0.3.3:t/62screen_damage.test:12:Erase	callback damage geometry belongs to renderer parity
+libvterm-0.3.3:t/62screen_damage.test:140:Merge scroll*2 with damage	callback damage geometry belongs to renderer parity
+libvterm-0.3.3:t/62screen_damage.test:17:Scroll damages entire line in two chunks	callback damage geometry belongs to renderer parity
+libvterm-0.3.3:t/62screen_damage.test:22:Scroll down damages entire screen in two chunks	callback damage geometry belongs to renderer parity
+libvterm-0.3.3:t/62screen_damage.test:27:Altscreen damages entire area	callback damage geometry belongs to renderer parity
+libvterm-0.3.3:t/62screen_damage.test:35:Scroll invokes moverect but not damage	callback damage geometry belongs to renderer parity
+libvterm-0.3.3:t/62screen_damage.test:42:Merge to cells	callback damage geometry belongs to renderer parity
+libvterm-0.3.3:t/62screen_damage.test:4:Putglyph	callback damage geometry belongs to renderer parity
+libvterm-0.3.3:t/62screen_damage.test:54:Merge entire rows	callback damage geometry belongs to renderer parity
+libvterm-0.3.3:t/62screen_damage.test:68:Merge entire screen	callback damage geometry belongs to renderer parity
+libvterm-0.3.3:t/62screen_damage.test:80:Merge entire screen with moverect	callback damage geometry belongs to renderer parity
+libvterm-0.3.3:t/62screen_damage.test:94:Merge scroll	callback damage geometry belongs to renderer parity
+libvterm-0.3.3:t/63screen_resize.test:15:Resize wider allows print in new area	no supported externally observable assertion
+libvterm-0.3.3:t/63screen_resize.test:5:Resize wider preserves cells	no supported externally observable assertion
+libvterm-0.3.3:t/63screen_resize.test:88:Resize taller attempts to pop scrollback	host-managed scrollback callback injects content
+libvterm-0.3.3:t/64screen_pen.test:26:Font	font, script, reverse-screen, and default-palette controls are outside the first profile
+libvterm-0.3.3:t/64screen_pen.test:38:Super/subscript	font, script, reverse-screen, and default-palette controls are outside the first profile
+libvterm-0.3.3:t/64screen_pen.test:49:DECSCNM xors reverse for entire screen	font, script, reverse-screen, and default-palette controls are outside the first profile
+libvterm-0.3.3:t/64screen_pen.test:61:Set default colours	custom default palette is outside the first profile
+libvterm-0.3.3:t/65screen_protect.test:11:Non-selective erase	selective erase protection is outside the first profile
+libvterm-0.3.3:t/65screen_protect.test:4:Selective erase	selective erase protection is outside the first profile
+libvterm-0.3.3:t/66screen_extent.test:4:Bold extent	attribute extent callbacks are not a td-term surface
+libvterm-0.3.3:t/67screen_dbl_wh.test:12:Double Width, Single Height	double-width and double-height lines are outside the first profile
+libvterm-0.3.3:t/67screen_dbl_wh.test:18:Double Height	double-width and double-height lines are outside the first profile
+libvterm-0.3.3:t/67screen_dbl_wh.test:27:Late change	double-width and double-height lines are outside the first profile
+libvterm-0.3.3:t/67screen_dbl_wh.test:34:DWL doesn't spill over on scroll	double-width and double-height lines are outside the first profile
+libvterm-0.3.3:t/67screen_dbl_wh.test:6:Single Width, Single Height	double-width and double-height lines are outside the first profile
+libvterm-0.3.3:t/68screen_termprops.test:15:Title	screen term-property callbacks await title support
+libvterm-0.3.3:t/68screen_termprops.test:9:Cursor visibility	screen term-property callbacks await title support
+libvterm-0.3.3:t/69screen_reflow.test:27:Resize narrower can create continuation lines	td-term deliberately retains non-reflowing history
+libvterm-0.3.3:t/69screen_reflow.test:46:Shell wrapped prompt behaviour	td-term deliberately retains non-reflowing history
+libvterm-0.3.3:t/69screen_reflow.test:81:Cursor goes missing	td-term deliberately retains non-reflowing history
+libvterm-0.3.3:t/69screen_reflow.test:9:Resize wider reflows wide lines	td-term deliberately retains non-reflowing history
+libvterm-0.3.3:t/90vttest_01-movement-1.test:71:Output	DEC screen alignment is outside the first profile
+libvterm-0.3.3:t/92lp1640917.test:4:Mouse reporting should not break by idempotent DECSM 1002	mouse input is outside the first profile

@@ -1,0 +1,93 @@
+case resize/preserves-overlap
+source td
+tags core resize
+size 2 3
+write b"abc\e[2;1Hde"
+resize 3 5
+expect size 3 5
+expect row 0 "abc  "
+expect row 1 "de   "
+expect row 2 "     "
+expect cursor 1 2
+end
+
+case resize/clamps-cursor
+source td
+tags core resize
+size 3 5
+write b"\e[3;5HX"
+resize 2 3
+expect size 2 3
+expect cursor 1 2
+expect row 0 "   "
+expect row 1 "   "
+end
+
+case resize/preserves-tab-stops
+source td
+tags core resize
+size 1 10
+write b"\e[4G\eH\e[9G\e[g"
+resize 1 12
+write b"\r\tX\e[4G\e[g\r\tY"
+expect row 0 "   X       Y"
+expect cursor 0 11 pending-wrap
+end
+
+case resize/shrink-keeps-lowest-content-and-cursor
+source td
+tags core resize
+size 4 4
+write b"A\e[3;1HC\e[4;1HD"
+resize 2 4
+expect row 0 "C   "
+expect row 1 "D   "
+expect cursor 1 1
+expect history 8
+end
+
+case resize/saved-cursor-shifts-with-content
+source td
+tags core resize
+size 4 4
+write b"A\e[2;1HB\e[3;1HC\e[4;2H\e[s"
+resize 2 4
+write b"\e[1;1H\e[u"
+expect cursor 1 1
+end
+
+case resize/preserves-pending-wrap-at-same-width
+source td
+tags core resize wrapping
+size 2 4
+write b"ABCD"
+expect cursor 0 3 pending-wrap
+resize 3 4
+write b"E"
+expect row 0 "ABCD"
+expect row 1 "E   "
+expect cursor 1 1
+end
+
+case resize/materializes-pending-wrap-when-widened
+source td
+tags core resize wrapping
+size 2 4
+write b"ABCD"
+resize 3 6
+expect cursor 0 4
+write b"E"
+expect row 0 "ABCDE "
+expect cursor 0 5
+end
+
+case resize/shrink-cancels-pending-wrap
+source td
+tags core resize wrapping
+size 2 8
+write b"ABCDEFGH"
+resize 2 4
+expect cursor 0 3
+write b"Z"
+expect row 0 "ABCZ"
+end

@@ -298,6 +298,10 @@ ancillary data on its Unix stream. Stable Rust 1.96 exposes no stable
 ancillary-data API. The user approved one new target-side exception for this
 transport.
 
+This section records the current compositor surface. Section 12 specifies a
+proposed PTY widening; its implementation landing must update this roster, the
+repository-wide inventory, and the confinement assertions atomically.
+
 `td-compositor/src/sys.rs` contains the sole scoped `unsafe` block. One raw
 `syscall3` body carries exactly:
 
@@ -310,10 +314,17 @@ transport.
 No framebuffer, input, socket, allocation, process, or filesystem operation
 passes through that surface. The crate denies unsafe globally; confinement
 tests pin the allow count, assembly body, syscall numbers, callers, and the
-absence of unsafe from every other source file. Adding a syscall or another
+absence of unsafe from every other target source file. Each developer tool is
+a separate crate root that also denies unsafe. Adding a syscall or another
 scoped allow amends this document and the repository-wide unsafe inventory.
 
 ## 5. Boot and recovery
+
+This section records the current demo-client boot profile. When the td-term
+cutover specified in sections 12 and 14 lands, it replaces the demo service,
+marker, and final-image symlink and adds the specified devpts setup to the
+early mount sequence. The compositor ordering, readiness, restart, and
+serial-recovery guarantees remain in force.
 
 PID 1 still mounts devtmpfs, procfs, sysfs, tmpfs, and the immutable root.
 `td-svc` starts `td-seatd` after root checking, then starts
@@ -333,6 +344,10 @@ been painted and the Wayland socket is listening. The QEMU system oracle
 requires that marker and the client's later `TD-UI-CLIENT-READY` marker.
 
 ## 6. Required proof
+
+These are the current compositor and demo proofs. When the td-term proof in
+section 14 lands, it supersedes the demo-specific entry-point, image-roster,
+and `TD-UI-CLIENT-READY` requirements without waiving the remaining checks.
 
 The landing must prove:
 
@@ -430,8 +445,457 @@ shipped image.
 ## 8. Deferred UI stack
 
 The next increment is focused `wl_pointer` delivery from the existing evdev
-motion path. A bitmap font and launcher, clipboard, terminal, hotplug, and
-real DRM/KMS profiles follow. General Wayland toolkit compatibility is not
-claimed until the missing core protocols have explicit tests. Hardware
-acceleration, niri, portals, PipeWire, Xwayland, and a C desktop stack remain
-optional consumers rather than foundations of td's UI.
+motion path. A bitmap launcher, clipboard, hotplug, and real DRM/KMS profiles
+follow. The planned terminal increment has the separate contract below.
+General Wayland toolkit compatibility is not claimed until the missing core
+protocols have explicit tests. Hardware acceleration, niri, portals, PipeWire,
+Xwayland, and a C desktop stack remain optional consumers rather than
+foundations of td's UI.
+
+## 9. td-term boundary and philosophy
+
+`td-term` is td's native terminal for this compositor. Its product reference
+is foot: one process per terminal, native Wayland, immediate startup, a quiet
+interface, and no server process or application framework. It is not a foot
+reimplementation and does not inherit foot's implementation or compatibility
+claims.
+
+The terminal is the third argv[0] entry point of the existing compositor
+multicall, alongside `td-compositor` and `td-ui-demo`. The package installs a
+relative `td-term -> td-compositor` symlink. This reuses the one Wayland wire
+implementation and the existing confined SCM_RIGHTS transport instead of
+creating a second target-side unsafe surface. The client and server run as the
+same graphical user, and the shared artifact is not a privilege boundary.
+`td-ui-demo` remains a source and target-recipe protocol fixture. The boot
+cutover removes its final-image symlink when td-term replaces it as the visible
+client.
+
+All terminal code is dependency-free Rust built by td's source-built stage2
+toolchain. It has no toolkit, GPU API, dynamic font system, terminal daemon,
+configuration language, plugin interface, or external crate. Its first
+renderer is software XRGB8888 into persistent `wl_shm` buffers.
+
+The implementation has four separable layers:
+
+- a byte-stream parser that emits bounded terminal actions;
+- a terminal model that owns grids, modes, cursor, history, and replies;
+- a bitmap renderer that converts an explicit model snapshot to pixels; and
+- PTY, Wayland, keyboard, and clock adapters around those pure layers.
+
+The parser, terminal model, and renderer read no descriptors, sockets, clocks,
+environment, or global process state. Tests can therefore drive every state
+transition with explicit bytes, sizes, keys, and time values. Adapter failures
+close the affected terminal without corrupting model state.
+
+## 10. First terminal profile
+
+The first profile is a bounded, keyboard-first ECMA-48/DEC terminal sufficient
+for td's shell and userland. It implements:
+
+- streaming UTF-8 decoding with replacement of malformed input;
+- a primary grid, an alternate grid, a cursor, tab stops, scrolling margins,
+  origin mode, autowrap, and bounded primary-screen history;
+- C0 bell as a coalesced visual notification, backspace, tab, line feed,
+  vertical tab, form feed, carriage return, shift-in, shift-out, escape,
+  cancel, and substitute controls;
+- index, next-line, reverse-index, tab-set, save/restore, and reset escape
+  operations, plus G0/G1 ASCII and DEC special-graphics designation;
+- cursor movement and position, erase in display and line, insert/delete/erase
+  characters, insert/delete lines, scroll, margins, tab clearing, and repeat;
+- SGR reset, bold, faint, italic, underline, inverse, strike, default colors,
+  the 16-color palette, indexed 256 colors, and 24-bit colors;
+- normal and application cursor keys, primary device attributes, cursor
+  position reports, and the replies required by the claimed profile; and
+- DEC cursor preservation for mode 1048 and alternate-screen mode 1049.
+
+UTF-8 scalars are initially single-cell glyphs. Wide cells, combining
+sequences, grapheme clustering, bidi, shaping, and emoji presentation require
+a separately pinned Unicode-data design. A missing glyph renders a visible
+replacement cell. This limitation is part of the claimed profile rather than
+an accidental difference hidden by the test overlay.
+
+Ordinary C0 controls and DEL execute or are ignored without cancelling a
+partially received UTF-8 scalar; ESC, CAN, SUB, and malformed non-continuation
+bytes retain their parser recovery behavior. Color parameters use the
+semicolon forms in the native corpus; colon subparameter forms are deferred.
+
+The initial cursor is steady rather than clock-blinking. Shift+PageUp and
+Shift+PageDown navigate scrollback. Ordinary text input returns to the live
+bottom. An unmodified End key is consumed for the same purpose while viewing
+scrollback and is forwarded in the selected cursor-key mode at the live
+bottom. Mouse reporting, selection, clipboard, hyperlinks, images, sixel,
+ligatures, search, and shell integration are deferred. A protocol is not
+parsed merely because another terminal implements it.
+
+Unsupported CSI operations are ignored as complete sequences. OSC, DCS, SOS,
+APC, and PM strings enter allocation-free streaming ignore states and cannot
+execute commands or open paths. BEL or ST terminates an ignored string; CAN
+and SUB cancel one. ESC either begins ST or recovers through the normal escape
+state. Unsupported input must not leak printable fragments or desynchronize
+subsequent supported input.
+
+Resource ceilings are part of the model contract:
+
+- at most 32 CSI parameters;
+- at most 1,048,576 history cells, 16,384 history lines, and 16 MiB of history
+  storage;
+- at most 1 MiB of queued PTY output, 64 KiB of queued keyboard input, and
+  64 KiB of queued terminal replies; and
+- screen dimensions bounded by the compositor's existing dimension and pixel
+  ceilings.
+
+Exceeding a syntactic ceiling transitions to a sink state that consumes through
+the sequence's final byte before returning to ground. A full PTY-output channel
+blocks its reader thread, applying kernel PTY backpressure without dropping
+bytes. A keyboard sequence is enqueued atomically; if the complete sequence
+cannot fit, td-term drops that whole input event and marks the visual bell
+rather than truncating stream bytes or closing the session. History evicts
+only complete oldest lines. A reply is also admitted atomically; if it cannot
+fit, td-term drops that whole reply and marks the visual bell rather than
+deadlocking the child's input and output paths. No queue or storage grows
+without limit.
+
+The child environment is cleared and reconstructed. A bounded parse of
+`/proc/self/status` selects the matching unique `/etc/passwd` entry and
+supplies `HOME`, `USER`, and `LOGNAME`; a missing, duplicate, malformed, or
+mismatched account closes the terminal before child creation. The remaining
+values are `TERM=td-term`, `COLORTERM=truecolor`, `PATH=/bin`,
+`SHELL=/bin/sh`, and `TERMINFO=/etc/terminfo`. The package carries its td-owned
+entry under its store `share/terminfo`, and the system closure exposes that
+immutable directory through `/etc/terminfo`; no new top-level image root is
+needed. `XDG_RUNTIME_DIR=/run/user/UID` comes from the verified numeric uid and
+`WAYLAND_DISPLAY=wayland-0` names the compositor socket. A dependency-free
+encoder produces the entry from a human-readable capability source; `tic`,
+ncurses, and a host terminfo database are not build inputs. Every boolean,
+number, output sequence, and input key in that entry names a blocking native
+case. A structural test decodes the installed entry and compares it
+field-for-field with the source capabilities.
+
+An outer `TERM=foot`, `TERM=linux`, or other value describes the parent
+terminal and is never an oracle or a capability claim for td-term. An optional
+developer check may ask a pinned host `infocmp` to decode the generated entry,
+but neither that tool nor its result participates in the required gate. The
+check remains green when the optional host tool is absent.
+
+## 11. Font, keyboard, and rendering
+
+The first implementation pins one licensed PSF2 bitmap font with a Unicode
+table. Its exact bytes and license are committed under `td-compositor`, while
+the archive hash and upstream provenance are recorded in the asset landing.
+Host tests and the target recipe consume those same bytes; no host font lookup
+or fetched-only test input participates. The PSF2 reader checks headers,
+dimensions, glyph counts, table bounds, scalar validity, and all pixel
+arithmetic before use.
+
+The renderer gives every claimed rendition a deterministic presentation from
+that one face. Bold adds a clipped one-pixel rightward copy of set glyph bits,
+faint blends foreground halfway toward background with integer channel
+arithmetic, and italic applies a bounded row-dependent one-pixel shear.
+Underline and strike draw fixed clipped cell rows, and inverse exchanges
+foreground and background. Blocking PPM cases prove that each claimed
+attribute differs from an otherwise identical normal cell.
+
+The renderer consumes a complete terminal snapshot, a fixed palette, focus
+state, and cursor state. It performs no allocation in the cell loop. A full
+redraw is acceptable for the initial QEMU profile, but rendering is coalesced
+behind at most one frame callback. A submitted persistent buffer is reused or
+mutated only after its `wl_buffer.release`; the initial fill precedes its first
+submission. Resizing creates a replacement while retaining the old buffer
+until release. Every glyph and decoration is clipped to the surface before
+pixels are visited.
+
+C0 BEL, an atomically dropped keyboard event, or an atomically dropped reply
+sets one coalesced visual-bell bit in the snapshot. The next submitted frame
+inverts the one-pixel ring inside the client surface and clears the bit after
+release; repeated notifications before that release do not queue additional
+frames. A blocking PPM case and the file-backed gallery cover the exact
+presentation.
+
+td-term binds the compositor's keyboard and validates that the received
+keymap descriptor contains exactly the shared `keyboard::XKB_KEYMAP` string
+followed by its NUL terminator, matching the server's advertised size. A
+mismatch closes the client before child creation; running under another
+Wayland compositor is outside the first profile. The terminal translates the
+fixed evdev key codes and standard XKB modifier masks itself; it does not
+import libxkbcommon. A pinned in-tree table marks text and navigation keys
+repeatable and modifiers non-repeating, mirroring the exact keymap's repeat
+exclusions. Validation uses positioned `FileExt::read_at` calls so reading one
+SCM_RIGHTS duplicate cannot advance the shared open-file-description offset
+seen by a restarted or second client.
+
+The input adapter covers text keys, Enter, Tab, Backspace, Escape, arrows,
+Home, End, PageUp, PageDown, Insert, Delete, and F1 through F12. It selects
+normal or application sequences from explicit terminal modes. Ctrl produces
+the specified ASCII C0 bytes, Alt prefixes the resulting sequence with ESC,
+and Shift selects the defined text or navigation variant; unlisted modifier
+combinations produce no bytes. Backspace emits DEL (`0x7f`) to match the
+slave's Linux-default canonical `VERASE`; Alt prefixes that byte with ESC. The
+compositor suppresses evdev repeat and publishes a repeat rate of 25 Hz with a
+600 millisecond delay, so td-term implements repeat from an injected clock.
+Release, focus loss, or any modifier snapshot change cancels the corresponding
+repeat; this also covers compositor chords whose command-key events are
+intercepted.
+
+## 12. PTY and process lifecycle
+
+After mounting devtmpfs and before graphical services, the system creates
+`/dev/pts`, mounts devpts there with
+`newinstance,ptmxmode=0666,mode=0620,gid=5`, removes devtmpfs's existing
+`/dev/ptmx` node, and creates the relative `ptmx -> pts/ptmx` symlink. The
+image pins `CONFIG_UNIX98_PTYS=y` and its existing `tty` group owns gid 5.
+td-term opens `/dev/ptmx` with safe `std` file operations, unlocks it, and
+obtains the slave as an owned descriptor with `TIOCGPTPEER` and
+`O_RDWR | O_NOCTTY | O_CLOEXEC`. No `/dev/pts/N` path is reopened.
+The image proof pins the startup mount command and checks the effective slave
+gid/mode plus `pts/ptmx` mode; it does not require `/proc/mounts` to echo the
+modern kernel's accepted no-op `newinstance` token.
+
+Stable Rust does not expose the required PTY operations. The PTY
+implementation landing must amend the repository unsafe inventory together
+with `td-compositor/src/sys.rs`; this design alone grants no new unsafe
+surface. The proposed widening adds x86-64 `SYS_IOCTL=16` to the existing raw
+body. Its safe wrapper accepts exactly four request values:
+
+- `TIOCSPTLCK=0x40045431`, to unlock the slave;
+- `TIOCGPTPEER=0x5441`, to obtain the slave as a new owned descriptor;
+- `TIOCSWINSZ=0x5414`, to publish rows and columns; and
+- `TIOCGWINSZ=0x5413`, to verify every published size before it becomes
+  visible to the child.
+
+The same landing updates the confinement tests that pin the `SYS_` constant
+count, raw-body call count, request values, and callers. This setter applies
+only to td-term's newly created PTY; it does not weaken the separate
+repository prohibition on resizing an operator's terminal.
+
+The wrappers use a four-byte native-endian `int` for `TIOCSPTLCK` and an
+eight-byte `#[repr(C)]` winsize of four native-endian `u16` fields for both
+winsize requests. The kernel never receives a pointer to a temporary or
+shorter object, and the existing assembly body remains memory-aware: it does
+not acquire `options(nomem)`. `TIOCGPTPEER` receives the open flags as an
+immediate value rather than a pointer; its nonnegative return is adopted into
+one `OwnedFd` exactly once. Confinement tests pin both operand shapes and the
+returned-descriptor conversion.
+
+No termios construction, signal syscall, process creation, or descriptor
+duplication enters that unsafe surface. The slave's kernel defaults provide
+canonical input and echo. Safe `Command` and `Stdio` operations wire three
+slave clones to the child.
+
+All SCM_RIGHTS operations for td-term remain in the existing `client.rs`
+transport boundary, including keymap receipt and wl_shm submission. The
+client landing updates that caller inventory and §4's recvmsg and sendmsg
+descriptions; terminal parser, model, renderer, keyboard, and PTY policy
+modules do not call the descriptor-transport wrappers.
+
+Safe `Command` cannot call `setsid(2)`, and `pre_exec` would introduce a second
+unsafe surface. The declared td-init input therefore extends `cttyhack` with
+an explicit `--stdin` mode. That mode always creates a new session and claims
+descriptor zero without stealing a terminal, even when the wrapper inherited
+an outer controlling terminal. Unlike rescue mode, `--stdin` exits nonzero if
+`setsid(2)` or `TIOCSCTTY` fails. td-term invokes
+`/bin/cttyhack --stdin /bin/sh`, or the command supplied on its own command
+line. The td-term recipe and system integration tests assert that the staged
+td-init advertises and exercises this exact flag, tying the absolute path to
+the declared runtime input. Ordinary rescue-console behavior remains
+unchanged. Immediately after a successful spawn, td-term drops the original
+slave and all three parent-side `Stdio` clones, retaining only the master.
+Closing that master produces the kernel's normal PTY hangup; child exit unmaps
+the surface and terminates the client.
+
+The client first completes the required empty XDG commit and initial
+configure/ack. It maps a bounded blank placeholder and waits up to the same
+20-second absolute startup deadline as the existing demo for the compositor's
+nonzero tile configure. Expiry closes the client before child creation; tests
+inject the clock and never sleep. The client derives the exact cell grid, sets
+and verifies the PTY winsize, and only then starts the child. A tile smaller
+than one font cell uses a logical 1-by-1 grid whose pixels remain clipped to
+the actual surface. Later nonzero configures preserve horizontal overlap
+without reflow. On primary-screen vertical shrink, blank tail rows disappear
+first; otherwise top rows move to primary history so the lowest content and
+cursor survive. The alternate screen discards removed rows, and resizing the
+hidden grid never adds history. Growth appends blank rows to both grids. The
+client updates and verifies the PTY size before rendering the replacement
+buffer.
+
+A blocking Wayland reader, PTY reader, PTY writer, and child waiter send
+bounded messages to one main loop. A full PTY-output channel blocks its reader
+thread and lets the kernel PTY buffer backpressure the child. The main loop
+alone mutates the terminal model and writes Wayland requests. No correctness
+condition relies on poll, elapsed sleeps, or scheduler order; the startup
+deadline bounds failure detection rather than ordering state transitions.
+
+td-term exposes a mode-0600 readiness socket and prints `TD-TERM-READY` with
+its rows and columns only after the exact tile-sized buffer receives both
+`wl_buffer.release` and its frame callback. td-svc's `ready=` command uses the
+existing credential-switch pattern to invoke
+`/bin/td-term probe /run/user/1000/td-term-ready` as the graphical user. The
+probe requires a ready state and nonzero internally consistent rows and
+columns; its output and the matching `TD-TERM-READY` QEMU diagnostic are
+compared in integration tests. The boot profile atomically replaces the
+visible `td-ui-demo` service and removes its final-image symlink when this proof
+is complete. The compositor and serial recovery greeter remain independently
+restartable.
+
+## 13. Native terminal corpus
+
+td-term behavior is specified in one td-native text corpus. Imported and
+td-authored cases use the same format and live together by subject:
+
+```
+td-compositor/spec/term/
+  README
+  parser.term
+  cursor.term
+  editing.term
+  wrapping.term
+  modes.term
+  color.term
+  replies.term
+  input.term
+  resize.term
+  unicode.term
+  expectations.txt
+  LICENSE.libvterm
+  visual/*.ppm
+```
+
+The model starts with a small td-authored seed corpus. The bulk migration then
+converts a source archive and SHA-256 pin of the MIT-licensed libvterm 0.3.3
+suite. A sibling license file retains the complete upstream copyright and
+permission notice. The archive and original harness do not enter td's build or
+repository. A dependency-free Rust importer accepts an explicitly supplied
+verifies its source-file manifest, rejects every unknown source command or
+assertion, and emits deterministic native cases. Its migration report counts
+source files, cases, assertions, converted assertions, and every intentional
+exclusion. The landing records those counts and reasons.
+
+Each derived case retains its source release, path, and original case identity.
+The conversion targets externally observable cells, cursor, modes, history,
+properties, and replies rather than libvterm callback names. After the
+migration the native cases are normative and maintained with td-authored
+cases; provenance remains even when a derived case is clarified. There is no
+separate upstream test directory or legacy-format reader in the blocking
+corpus or target artifact; the developer-only importer is the reproducer.
+Pinned cases are classified against the first-profile feature matrix:
+upstream-positive tests for deferred protocols are exclusions, not product
+xfails, excluded sections roll back to their last reset, and retained cases
+never replay deferred control sequences. Primary DA is normalized from
+libvterm's identity to td's. The first profile accepts semicolon-delimited SGR
+colors; colon-separated color subparameters remain an explicit exclusion.
+
+The std-only importer remains a non-shipped developer provenance tool, not a
+runtime or build reader. Its unit tests and committed complete source manifest
+exercise the upstream parser without the archive; when an explicitly supplied
+tree is available, its exact check verifies all source hashes and reproduces
+the committed corpus and report. No upstream-format case runs in the gate.
+
+The native language has stable case identifiers and a deliberately small
+vocabulary:
+
+- `case`, `source`, `tags`, `size`, and `end`;
+- `write`, `resize`, and `key` operations; and
+- `expect` statements for rows, imported text and glyph observations, cells,
+  cursor, modes, cumulative terminal replies, cumulative keyboard input,
+  history, and an optional rendered PPM. Cursor expectations accept only the
+  optional `pending-wrap` flag.
+
+Every case has a source. td-authored cases use `source td`; derived cases name
+the pinned release, path, and original case. `size` is rows followed by
+columns, byte strings use Rust-like ASCII escapes, and cursor coordinates are
+zero-based. A representative case is:
+
+```
+case wrapping/right-margin
+source "libvterm-0.3.3:t/20state_wrapping.test:right margin"
+tags core wrapping
+size 2 5
+write b"ABCDE"
+expect cursor 0 4 pending-wrap
+write b"F"
+expect row 0 "ABCDE"
+expect row 1 "F    "
+expect cursor 1 1
+end
+```
+
+Byte literals use one specified escape syntax and reject ambiguous or invalid
+escapes. Row expectations are shorthand for default single-width cells; cell
+expectations state scalars, colors, and attributes explicitly. Imported
+character-only observations use `text` and `glyph`, which deliberately ignore
+rendition absent from the source oracle. Replies are ordered byte strings. The
+parser rejects unknown fields, duplicate stable identifiers, empty cases,
+assertions before initialization, and expectations that escape the declared
+grid. Reply expectations name the complete byte stream emitted since case
+initialization; the PTY adapter drains that bounded stream after each
+successful master write. Input expectations separately name the keyboard
+adapter's complete generated byte stream, making `key` operations observable
+before the PTY writer merges the two bounded sources.
+
+Feature tags distinguish deliberate profile exclusions such as mouse or
+double-width cells from missing behavior inside the first profile. A generated
+`expectations.txt` records in-profile known failures by case and expectation,
+so another observation cannot regress behind an existing failure. Every
+in-profile case still runs. An unlisted failure, unexpected pass, stale entry,
+unmatched case, unknown tag, or malformed corpus reds the gate.
+
+Every byte-stream case runs as one write, one byte per write, at every
+two-piece split, and under deterministic pseudorandom chunkings. All forms
+must produce identical cells, cursor, modes, history, and replies.
+Deterministic arbitrary-byte cases additionally enforce total parsing,
+resource ceilings, valid cursor/grid relationships, and absence of panics.
+
+The committed native expectations are the blocking semantic oracle. No host
+terminal or external emulator runs in the gate. `$TERM` is only a capability
+label. Foot remains a product reference and an optional black-box comparison,
+not the normative state model.
+
+## 14. Visual and end-to-end proof
+
+The pure renderer's blocking visual oracle is exact P6 PPM output. Selected
+native cases render with the pinned font, palette, surface size, focus, and
+cursor. A mismatch reports the first differing coordinate and writes an
+actual image plus a high-contrast PPM diff beneath the build's temporary
+output; no PNG encoder or image library is required.
+
+A smaller integration gallery runs td-term against a real td-compositor with
+a file-backed framebuffer. It compares the compositor's exact final XRGB8888
+frame, including tile geometry, borders, clipping, buffer replacement, and
+frame-callback lifecycle. This is the pixel-parity gate for the shipped stack.
+
+Foot comparison is a separate, non-blocking developer operation. It uses a
+pinned foot binary, font, configuration, fixture, geometry, and isolated
+headless Wayland environment to produce side-by-side captures. Different font
+and rasterization stacks make exact cross-terminal pixels a false contract;
+the gallery adjudicates taste and exposes behavioral disagreements for a
+native semantic case to settle. The required check remains green when these
+optional host-side comparison tools are absent.
+
+The complete terminal landing must prove:
+
+- the native corpus is structurally valid, attributed, consistent with the
+  committed migration counts and digests, and guarded by a generated
+  no-regression expectations overlay;
+- parser and model results are invariant under every required input chunking
+  and remain bounded for malformed streams;
+- exact model-renderer PPM and full-compositor framebuffer goldens pass;
+- the shipped artifact is static, the `td-term` entry point is a relative
+  symlink, and target selftests run without host paths or libraries;
+- the installed `td-term` terminfo entry decodes to exactly the capabilities
+  exercised by the native corpus;
+- a PTY fixture sees the peer descriptor's `/dev/pts/N` as its controlling
+  terminal and reads back the grid's exact winsize;
+- focused keyboard input reaches the PTY, echoed output changes the framebuffer,
+  and repeat cancellation is deterministic;
+- two sequential clients validate the shared keymap descriptor without
+  advancing its open-file-description offset;
+- a compositor configure replaces the wl_shm buffer, preserves the specified
+  grid overlap, and updates the PTY size before the child observes it;
+- child exit, PTY hangup, compositor disconnect, queue saturation, and malformed
+  Wayland input terminate without a stuck worker or leaked surface;
+- the image creates the devpts mountpoint after devtmpfs, replaces its
+  `/dev/ptmx` node with the specified symlink, mounts devpts with the specified
+  options, contains the selected font and required multicall entry points,
+  starts td-term as uid 1000, passes the readiness-socket probe, and observes
+  the matching `TD-TERM-READY` diagnostic; and
+- graphical failure leaves the serial recovery path and existing compositor
+  readiness proof intact.

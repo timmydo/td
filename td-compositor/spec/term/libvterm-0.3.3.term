@@ -1,0 +1,3297 @@
+# Generated from libvterm-0.3.3 (9d6d2112335080312ef8c36667fa717ded4f7daf).
+# Regenerate with tools/import-libvterm.rs; do not edit imported cases by hand.
+
+case libvterm/10state-putglyph/low
+source "libvterm-0.3.3:t/10state_putglyph.test:5:Low"
+tags core utf8
+size 25 80
+write b"ABC"
+expect glyph 0 0 "A"
+expect glyph 0 1 "B"
+expect glyph 0 2 "C"
+expect reply b""
+end
+
+case libvterm/10state-putglyph/utf-8-1-char
+source "libvterm-0.3.3:t/10state_putglyph.test:12:UTF-8 1 char"
+tags core utf8
+size 25 80
+write b"\xc3\x81\xc3\xa9"
+expect glyph 0 0 "Á"
+expect glyph 0 1 "é"
+expect reply b""
+end
+
+case libvterm/10state-putglyph/utf-8-split-writes
+source "libvterm-0.3.3:t/10state_putglyph.test:20:UTF-8 split writes"
+tags core utf8
+size 25 80
+write b"\xc3"
+expect reply b""
+write b"\x81"
+expect glyph 0 0 "Á"
+expect reply b""
+end
+
+case libvterm/11state-movecursor/backspace
+source "libvterm-0.3.3:t/11state_movecursor.test:8:Backspace"
+tags core
+size 25 80
+write b"ABC"
+expect reply b""
+write b"\x08"
+expect cursor 0 2
+expect reply b""
+end
+
+case libvterm/11state-movecursor/backspace-bounded-by-lefthand-edge
+source "libvterm-0.3.3:t/11state_movecursor.test:21:Backspace bounded by lefthand edge"
+tags core
+size 25 80
+write b"ABC"
+expect reply b""
+write b"\x08"
+expect reply b""
+write b"\t"
+expect reply b""
+write b"\r"
+expect reply b""
+write b"\n"
+expect reply b""
+write b"\e[4;2H"
+expect cursor 3 1
+expect reply b""
+write b"\x08"
+expect cursor 3 0
+expect reply b""
+write b"\x08"
+expect cursor 3 0
+expect reply b""
+end
+
+case libvterm/11state-movecursor/backspace-cancels-phantom
+source "libvterm-0.3.3:t/11state_movecursor.test:29:Backspace cancels phantom"
+tags core
+size 25 80
+write b"ABC"
+expect reply b""
+write b"\x08"
+expect reply b""
+write b"\t"
+expect reply b""
+write b"\r"
+expect reply b""
+write b"\n"
+expect reply b""
+write b"\e[4;2H"
+expect reply b""
+write b"\x08"
+expect reply b""
+write b"\x08"
+expect reply b""
+write b"\e[4;80H"
+expect reply b""
+write b"X"
+expect reply b""
+write b"\x08"
+expect cursor 3 78
+expect reply b""
+end
+
+case libvterm/11state-movecursor/bounds-checking
+source "libvterm-0.3.3:t/11state_movecursor.test:144:Bounds Checking"
+tags core
+size 25 80
+write b"\e[A"
+expect cursor 0 0
+expect reply b""
+write b"\e[D"
+expect cursor 0 0
+expect reply b""
+write b"\e[25;80H"
+expect reply b""
+write b"\e[B"
+expect reply b""
+write b"\e[C"
+expect reply b""
+write b"\e[E"
+expect cursor 24 0
+expect reply b""
+write b"\e[H"
+expect cursor 0 0
+expect reply b""
+write b"\e[F"
+expect cursor 0 0
+expect reply b""
+write b"\e[999G"
+expect reply b""
+write b"\e[99;99H"
+expect reply b""
+end
+
+case libvterm/11state-movecursor/carriage-return
+source "libvterm-0.3.3:t/11state_movecursor.test:14:Carriage Return"
+tags core
+size 25 80
+write b"ABC"
+expect reply b""
+write b"\x08"
+expect reply b""
+write b"\t"
+expect reply b""
+write b"\r"
+expect cursor 0 0
+expect reply b""
+end
+
+case libvterm/11state-movecursor/cursor-backward
+source "libvterm-0.3.3:t/11state_movecursor.test:83:Cursor Backward"
+tags core
+size 25 80
+write b"\e[B"
+expect reply b""
+write b"\e[3B"
+expect reply b""
+write b"\e[0B"
+expect reply b""
+write b"\e[C"
+expect reply b""
+write b"\e[3C"
+expect reply b""
+write b"\e[0C"
+expect reply b""
+write b"\e[A"
+expect reply b""
+write b"\e[3A"
+expect reply b""
+write b"\e[0A"
+expect reply b""
+write b"\e[D"
+expect cursor 0 4
+expect reply b""
+write b"\e[3D"
+expect cursor 0 1
+expect reply b""
+write b"\e[0D"
+expect cursor 0 0
+expect reply b""
+end
+
+case libvterm/11state-movecursor/cursor-backward-tab
+source "libvterm-0.3.3:t/11state_movecursor.test:220:Cursor Backward Tab"
+tags core
+size 25 80
+write b"\t"
+expect reply b""
+write b"   "
+expect reply b""
+write b"\t"
+expect reply b""
+write b"       "
+expect reply b""
+write b"\t"
+expect reply b""
+write b"        "
+expect reply b""
+write b"\t"
+expect reply b""
+write b"\e[I"
+expect reply b""
+write b"\e[2I"
+expect reply b""
+write b"\e[Z"
+expect cursor 0 56
+expect reply b""
+write b"\e[2Z"
+expect cursor 0 40
+expect reply b""
+end
+
+case libvterm/11state-movecursor/cursor-down
+source "libvterm-0.3.3:t/11state_movecursor.test:67:Cursor Down"
+tags core
+size 25 80
+write b"\e[B"
+expect reply b""
+write b"\e[3B"
+expect reply b""
+write b"\e[0B"
+expect reply b""
+write b"\e[C"
+expect cursor 5 1
+expect reply b""
+write b"\e[3C"
+expect cursor 5 4
+expect reply b""
+write b"\e[0C"
+expect cursor 5 5
+expect reply b""
+end
+
+case libvterm/11state-movecursor/cursor-forward
+source "libvterm-0.3.3:t/11state_movecursor.test:59:Cursor Forward"
+tags core
+size 25 80
+write b"\e[B"
+expect cursor 1 0
+expect reply b""
+write b"\e[3B"
+expect cursor 4 0
+expect reply b""
+write b"\e[0B"
+expect cursor 5 0
+expect reply b""
+end
+
+case libvterm/11state-movecursor/cursor-horizonal-absolute
+source "libvterm-0.3.3:t/11state_movecursor.test:115:Cursor Horizonal Absolute"
+tags core
+size 25 80
+write b"\e[B"
+expect reply b""
+write b"\e[3B"
+expect reply b""
+write b"\e[0B"
+expect reply b""
+write b"\e[C"
+expect reply b""
+write b"\e[3C"
+expect reply b""
+write b"\e[0C"
+expect reply b""
+write b"\e[A"
+expect reply b""
+write b"\e[3A"
+expect reply b""
+write b"\e[0A"
+expect reply b""
+write b"\e[D"
+expect reply b""
+write b"\e[3D"
+expect reply b""
+write b"\e[0D"
+expect reply b""
+write b"   "
+expect reply b""
+write b"\e[E"
+expect reply b""
+write b"   "
+expect reply b""
+write b"\e[2E"
+expect reply b""
+write b"\e[0E"
+expect reply b""
+write b"   "
+expect reply b""
+write b"\e[F"
+expect reply b""
+write b"   "
+expect reply b""
+write b"\e[2F"
+expect reply b""
+write b"\e[0F"
+expect reply b""
+write b"\n"
+expect cursor 1 0
+expect reply b""
+write b"\e[20G"
+expect cursor 1 19
+expect reply b""
+write b"\e[G"
+expect cursor 1 0
+expect reply b""
+end
+
+case libvterm/11state-movecursor/cursor-horizontal-tab
+source "libvterm-0.3.3:t/11state_movecursor.test:214:Cursor Horizontal Tab"
+tags core
+size 25 80
+write b"\t"
+expect reply b""
+write b"   "
+expect reply b""
+write b"\t"
+expect reply b""
+write b"       "
+expect reply b""
+write b"\t"
+expect reply b""
+write b"        "
+expect reply b""
+write b"\t"
+expect reply b""
+write b"\e[I"
+expect cursor 0 48
+expect reply b""
+write b"\e[2I"
+expect cursor 0 64
+expect reply b""
+end
+
+case libvterm/11state-movecursor/cursor-next-line
+source "libvterm-0.3.3:t/11state_movecursor.test:91:Cursor Next Line"
+tags core
+size 25 80
+write b"\e[B"
+expect reply b""
+write b"\e[3B"
+expect reply b""
+write b"\e[0B"
+expect reply b""
+write b"\e[C"
+expect reply b""
+write b"\e[3C"
+expect reply b""
+write b"\e[0C"
+expect reply b""
+write b"\e[A"
+expect reply b""
+write b"\e[3A"
+expect reply b""
+write b"\e[0A"
+expect reply b""
+write b"\e[D"
+expect reply b""
+write b"\e[3D"
+expect reply b""
+write b"\e[0D"
+expect reply b""
+write b"   "
+expect cursor 0 3
+expect reply b""
+write b"\e[E"
+expect cursor 1 0
+expect reply b""
+write b"   "
+expect cursor 1 3
+expect reply b""
+write b"\e[2E"
+expect cursor 3 0
+expect reply b""
+write b"\e[0E"
+expect cursor 4 0
+expect reply b""
+end
+
+case libvterm/11state-movecursor/cursor-position
+source "libvterm-0.3.3:t/11state_movecursor.test:123:Cursor Position"
+tags core
+size 25 80
+write b"\e[B"
+expect reply b""
+write b"\e[3B"
+expect reply b""
+write b"\e[0B"
+expect reply b""
+write b"\e[C"
+expect reply b""
+write b"\e[3C"
+expect reply b""
+write b"\e[0C"
+expect reply b""
+write b"\e[A"
+expect reply b""
+write b"\e[3A"
+expect reply b""
+write b"\e[0A"
+expect reply b""
+write b"\e[D"
+expect reply b""
+write b"\e[3D"
+expect reply b""
+write b"\e[0D"
+expect reply b""
+write b"   "
+expect reply b""
+write b"\e[E"
+expect reply b""
+write b"   "
+expect reply b""
+write b"\e[2E"
+expect reply b""
+write b"\e[0E"
+expect reply b""
+write b"   "
+expect reply b""
+write b"\e[F"
+expect reply b""
+write b"   "
+expect reply b""
+write b"\e[2F"
+expect reply b""
+write b"\e[0F"
+expect reply b""
+write b"\n"
+expect reply b""
+write b"\e[20G"
+expect reply b""
+write b"\e[G"
+expect reply b""
+write b"\e[10;5H"
+expect cursor 9 4
+expect reply b""
+write b"\e[8H"
+expect cursor 7 0
+expect reply b""
+write b"\e[H"
+expect cursor 0 0
+expect reply b""
+end
+
+case libvterm/11state-movecursor/cursor-position-cancels-phantom
+source "libvterm-0.3.3:t/11state_movecursor.test:131:Cursor Position cancels phantom"
+tags core
+size 25 80
+write b"\e[B"
+expect reply b""
+write b"\e[3B"
+expect reply b""
+write b"\e[0B"
+expect reply b""
+write b"\e[C"
+expect reply b""
+write b"\e[3C"
+expect reply b""
+write b"\e[0C"
+expect reply b""
+write b"\e[A"
+expect reply b""
+write b"\e[3A"
+expect reply b""
+write b"\e[0A"
+expect reply b""
+write b"\e[D"
+expect reply b""
+write b"\e[3D"
+expect reply b""
+write b"\e[0D"
+expect reply b""
+write b"   "
+expect reply b""
+write b"\e[E"
+expect reply b""
+write b"   "
+expect reply b""
+write b"\e[2E"
+expect reply b""
+write b"\e[0E"
+expect reply b""
+write b"   "
+expect reply b""
+write b"\e[F"
+expect reply b""
+write b"   "
+expect reply b""
+write b"\e[2F"
+expect reply b""
+write b"\e[0F"
+expect reply b""
+write b"\n"
+expect reply b""
+write b"\e[20G"
+expect reply b""
+write b"\e[G"
+expect reply b""
+write b"\e[10;5H"
+expect reply b""
+write b"\e[8H"
+expect reply b""
+write b"\e[H"
+expect reply b""
+write b"\e[10;78H"
+expect cursor 9 77
+expect reply b""
+write b"ABC"
+expect reply b""
+write b"\e[10;80H"
+expect reply b""
+write b"C"
+expect reply b""
+write b"X"
+expect cursor 10 1
+expect reply b""
+end
+
+case libvterm/11state-movecursor/cursor-previous-line
+source "libvterm-0.3.3:t/11state_movecursor.test:103:Cursor Previous Line"
+tags core
+size 25 80
+write b"\e[B"
+expect reply b""
+write b"\e[3B"
+expect reply b""
+write b"\e[0B"
+expect reply b""
+write b"\e[C"
+expect reply b""
+write b"\e[3C"
+expect reply b""
+write b"\e[0C"
+expect reply b""
+write b"\e[A"
+expect reply b""
+write b"\e[3A"
+expect reply b""
+write b"\e[0A"
+expect reply b""
+write b"\e[D"
+expect reply b""
+write b"\e[3D"
+expect reply b""
+write b"\e[0D"
+expect reply b""
+write b"   "
+expect reply b""
+write b"\e[E"
+expect reply b""
+write b"   "
+expect reply b""
+write b"\e[2E"
+expect reply b""
+write b"\e[0E"
+expect reply b""
+write b"   "
+expect cursor 4 3
+expect reply b""
+write b"\e[F"
+expect cursor 3 0
+expect reply b""
+write b"   "
+expect cursor 3 3
+expect reply b""
+write b"\e[2F"
+expect cursor 1 0
+expect reply b""
+write b"\e[0F"
+expect cursor 0 0
+expect reply b""
+end
+
+case libvterm/11state-movecursor/cursor-up
+source "libvterm-0.3.3:t/11state_movecursor.test:75:Cursor Up"
+tags core
+size 25 80
+write b"\e[B"
+expect reply b""
+write b"\e[3B"
+expect reply b""
+write b"\e[0B"
+expect reply b""
+write b"\e[C"
+expect reply b""
+write b"\e[3C"
+expect reply b""
+write b"\e[0C"
+expect reply b""
+write b"\e[A"
+expect cursor 4 5
+expect reply b""
+write b"\e[3A"
+expect cursor 1 5
+expect reply b""
+write b"\e[0A"
+expect cursor 0 5
+expect reply b""
+end
+
+case libvterm/11state-movecursor/horizontal-and-vertical-position
+source "libvterm-0.3.3:t/11state_movecursor.test:180:Horizontal and Vertical Position"
+tags core
+size 25 80
+write b"\e[5`"
+expect reply b""
+write b"\e[3a"
+expect reply b""
+write b"\e[3j"
+expect reply b""
+write b"\e[3;3f"
+expect cursor 2 2
+expect reply b""
+end
+
+case libvterm/11state-movecursor/horizontal-position-absolute
+source "libvterm-0.3.3:t/11state_movecursor.test:168:Horizontal Position Absolute"
+tags core
+size 25 80
+write b"\e[5`"
+expect cursor 0 4
+expect reply b""
+end
+
+case libvterm/11state-movecursor/horizontal-position-backward
+source "libvterm-0.3.3:t/11state_movecursor.test:176:Horizontal Position Backward"
+tags core
+size 25 80
+write b"\e[5`"
+expect reply b""
+write b"\e[3a"
+expect reply b""
+write b"\e[3j"
+expect cursor 0 4
+expect reply b""
+end
+
+case libvterm/11state-movecursor/horizontal-position-relative
+source "libvterm-0.3.3:t/11state_movecursor.test:172:Horizontal Position Relative"
+tags core
+size 25 80
+write b"\e[5`"
+expect reply b""
+write b"\e[3a"
+expect cursor 0 7
+expect reply b""
+end
+
+case libvterm/11state-movecursor/horizontal-tab
+source "libvterm-0.3.3:t/11state_movecursor.test:11:Horizontal Tab"
+tags core
+size 25 80
+write b"ABC"
+expect reply b""
+write b"\x08"
+expect reply b""
+write b"\t"
+expect cursor 0 8
+expect reply b""
+end
+
+case libvterm/11state-movecursor/horizontal-tab-2
+source "libvterm-0.3.3:t/11state_movecursor.test:198:Horizontal Tab"
+tags core
+size 25 80
+write b"\t"
+expect cursor 0 8
+expect reply b""
+write b"   "
+expect cursor 0 11
+expect reply b""
+write b"\t"
+expect cursor 0 16
+expect reply b""
+write b"       "
+expect cursor 0 23
+expect reply b""
+write b"\t"
+expect cursor 0 24
+expect reply b""
+write b"        "
+expect cursor 0 32
+expect reply b""
+write b"\t"
+expect cursor 0 40
+expect reply b""
+end
+
+case libvterm/11state-movecursor/ht-bounded-by-righthand-edge
+source "libvterm-0.3.3:t/11state_movecursor.test:37:HT bounded by righthand edge"
+tags core
+size 25 80
+write b"ABC"
+expect reply b""
+write b"\x08"
+expect reply b""
+write b"\t"
+expect reply b""
+write b"\r"
+expect reply b""
+write b"\n"
+expect reply b""
+write b"\e[4;2H"
+expect reply b""
+write b"\x08"
+expect reply b""
+write b"\x08"
+expect reply b""
+write b"\e[4;80H"
+expect reply b""
+write b"X"
+expect reply b""
+write b"\x08"
+expect reply b""
+write b"\e[1;78H"
+expect cursor 0 77
+expect reply b""
+write b"\t"
+expect reply b""
+write b"\t"
+expect reply b""
+end
+
+case libvterm/11state-movecursor/implicit
+source "libvterm-0.3.3:t/11state_movecursor.test:5:Implicit"
+tags core
+size 25 80
+write b"ABC"
+expect cursor 0 3
+expect reply b""
+end
+
+case libvterm/11state-movecursor/index
+source "libvterm-0.3.3:t/11state_movecursor.test:47:Index"
+tags core
+size 25 80
+write b"ABC\eD"
+expect cursor 1 3
+expect reply b""
+end
+
+case libvterm/11state-movecursor/linefeed
+source "libvterm-0.3.3:t/11state_movecursor.test:17:Linefeed"
+tags core
+size 25 80
+write b"ABC"
+expect reply b""
+write b"\x08"
+expect reply b""
+write b"\t"
+expect reply b""
+write b"\r"
+expect reply b""
+write b"\n"
+expect cursor 1 0
+expect reply b""
+end
+
+case libvterm/11state-movecursor/newline
+source "libvterm-0.3.3:t/11state_movecursor.test:53:Newline"
+tags core
+size 25 80
+write b"ABC\eD"
+expect reply b""
+write b"\eM"
+expect reply b""
+write b"\eE"
+expect cursor 1 0
+expect reply b""
+end
+
+case libvterm/11state-movecursor/reverse-index
+source "libvterm-0.3.3:t/11state_movecursor.test:50:Reverse Index"
+tags core
+size 25 80
+write b"ABC\eD"
+expect reply b""
+write b"\eM"
+expect cursor 0 3
+expect reply b""
+end
+
+case libvterm/11state-movecursor/vertical-position-absolute
+source "libvterm-0.3.3:t/11state_movecursor.test:184:Vertical Position Absolute"
+tags core
+size 25 80
+write b"\e[5`"
+expect reply b""
+write b"\e[3a"
+expect reply b""
+write b"\e[3j"
+expect reply b""
+write b"\e[3;3f"
+expect reply b""
+write b"\e[5d"
+expect cursor 4 2
+expect reply b""
+end
+
+case libvterm/11state-movecursor/vertical-position-backward
+source "libvterm-0.3.3:t/11state_movecursor.test:192:Vertical Position Backward"
+tags core
+size 25 80
+write b"\e[5`"
+expect reply b""
+write b"\e[3a"
+expect reply b""
+write b"\e[3j"
+expect reply b""
+write b"\e[3;3f"
+expect reply b""
+write b"\e[5d"
+expect reply b""
+write b"\e[2e"
+expect reply b""
+write b"\e[2k"
+expect cursor 4 2
+expect reply b""
+end
+
+case libvterm/11state-movecursor/vertical-position-relative
+source "libvterm-0.3.3:t/11state_movecursor.test:188:Vertical Position Relative"
+tags core
+size 25 80
+write b"\e[5`"
+expect reply b""
+write b"\e[3a"
+expect reply b""
+write b"\e[3j"
+expect reply b""
+write b"\e[3;3f"
+expect reply b""
+write b"\e[5d"
+expect reply b""
+write b"\e[2e"
+expect cursor 6 2
+expect reply b""
+end
+
+case libvterm/12state-scroll/decstbm-resets-cursor-position
+source "libvterm-0.3.3:t/12state_scroll.test:152:DECSTBM resets cursor position"
+tags core
+size 25 80
+write b"\e[S"
+expect reply b""
+write b"\e[2S"
+expect reply b""
+write b"\e[T"
+expect reply b""
+write b"\e[2T"
+expect reply b""
+write b"\e[5;5H"
+expect cursor 4 4
+expect reply b""
+write b"\e[r"
+expect cursor 0 0
+expect reply b""
+end
+
+case libvterm/12state-scroll/index-in-decstbm
+source "libvterm-0.3.3:t/12state_scroll.test:42:Index in DECSTBM"
+tags core
+size 25 80
+write b"\e[1;10r"
+expect reply b""
+write b"\n\n\n\n\n\n\n\n\n"
+expect reply b""
+write b"\n"
+expect reply b""
+write b"\e[20H"
+expect reply b""
+write b"\n"
+expect reply b""
+write b"\e[9;10r"
+expect reply b""
+write b"\e[10H"
+expect reply b""
+write b"\eM"
+expect cursor 8 0
+expect reply b""
+write b"\eM"
+expect reply b""
+end
+
+case libvterm/12state-scroll/linefeed
+source "libvterm-0.3.3:t/12state_scroll.test:5:Linefeed"
+tags core
+size 25 80
+write b"\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n"
+expect cursor 24 0
+expect reply b""
+write b"\n"
+expect cursor 24 0
+expect reply b""
+end
+
+case libvterm/12state-scroll/linefeed-in-decstbm
+source "libvterm-0.3.3:t/12state_scroll.test:27:Linefeed in DECSTBM"
+tags core
+size 25 80
+write b"\e[1;10r"
+expect cursor 0 0
+expect reply b""
+write b"\n\n\n\n\n\n\n\n\n"
+expect cursor 9 0
+expect reply b""
+write b"\n"
+expect cursor 9 0
+expect reply b""
+end
+
+case libvterm/12state-scroll/linefeed-outside-decstbm
+source "libvterm-0.3.3:t/12state_scroll.test:36:Linefeed outside DECSTBM"
+tags core
+size 25 80
+write b"\e[1;10r"
+expect reply b""
+write b"\n\n\n\n\n\n\n\n\n"
+expect reply b""
+write b"\n"
+expect reply b""
+write b"\e[20H"
+expect cursor 19 0
+expect reply b""
+write b"\n"
+expect cursor 20 0
+expect reply b""
+end
+
+case libvterm/12state-scroll/reverse-index-in-decstbm
+source "libvterm-0.3.3:t/12state_scroll.test:50:Reverse Index in DECSTBM"
+tags core
+size 25 80
+write b"\e[1;10r"
+expect reply b""
+write b"\n\n\n\n\n\n\n\n\n"
+expect reply b""
+write b"\n"
+expect reply b""
+write b"\e[20H"
+expect reply b""
+write b"\n"
+expect reply b""
+write b"\e[9;10r"
+expect reply b""
+write b"\e[10H"
+expect reply b""
+write b"\eM"
+expect reply b""
+write b"\eM"
+expect reply b""
+write b"\e[25H"
+expect cursor 24 0
+expect reply b""
+write b"\n"
+expect cursor 24 0
+expect reply b""
+end
+
+case libvterm/12state-scroll/scroll-down
+source "libvterm-0.3.3:t/12state_scroll.test:82:Scroll Down"
+tags core
+size 25 80
+write b"\e[S"
+expect cursor 0 0
+expect reply b""
+write b"\e[2S"
+expect cursor 0 0
+expect reply b""
+write b"\e[100S"
+expect reply b""
+end
+
+case libvterm/12state-scroll/scroll-down-move-erase-emulation
+source "libvterm-0.3.3:t/12state_scroll.test:132:Scroll Down move+erase emulation"
+tags core
+size 25 80
+write b"\e[S"
+expect cursor 0 0
+expect reply b""
+write b"\e[2S"
+expect cursor 0 0
+expect reply b""
+end
+
+case libvterm/12state-scroll/scroll-up
+source "libvterm-0.3.3:t/12state_scroll.test:92:Scroll Up"
+tags core
+size 25 80
+write b"\e[S"
+expect reply b""
+write b"\e[2S"
+expect reply b""
+write b"\e[100S"
+expect reply b""
+write b"\e[T"
+expect cursor 0 0
+expect reply b""
+write b"\e[2T"
+expect cursor 0 0
+expect reply b""
+write b"\e[100T"
+expect reply b""
+end
+
+case libvterm/12state-scroll/scroll-up-move-erase-emulation
+source "libvterm-0.3.3:t/12state_scroll.test:142:Scroll Up move+erase emulation"
+tags core
+size 25 80
+write b"\e[S"
+expect reply b""
+write b"\e[2S"
+expect reply b""
+write b"\e[T"
+expect cursor 0 0
+expect reply b""
+write b"\e[2T"
+expect cursor 0 0
+expect reply b""
+end
+
+case libvterm/13state-edit/dch
+source "libvterm-0.3.3:t/13state_edit.test:30:DCH"
+tags core editing
+size 25 80
+expect cursor 0 0
+write b"ABBC"
+expect reply b""
+write b"\e[3D"
+expect cursor 0 1
+expect reply b""
+write b"\e[P"
+expect cursor 0 1
+expect reply b""
+write b"\e[3P"
+expect cursor 0 1
+expect reply b""
+end
+
+case libvterm/13state-edit/dch-move-erase-emulation
+source "libvterm-0.3.3:t/13state_edit.test:290:DCH move+erase emulation"
+tags core editing
+size 25 80
+expect cursor 0 0
+write b"ABBC"
+expect reply b""
+write b"\e[3D"
+expect cursor 0 1
+expect reply b""
+write b"\e[P"
+expect cursor 0 1
+expect reply b""
+write b"\e[3P"
+expect cursor 0 1
+expect reply b""
+end
+
+case libvterm/13state-edit/dl
+source "libvterm-0.3.3:t/13state_edit.test:102:DL"
+tags core editing
+size 25 80
+expect cursor 0 0
+write b"A\r\nB\r\nB\r\nC"
+expect cursor 3 1
+expect reply b""
+write b"\e[2H"
+expect cursor 1 0
+expect reply b""
+write b"\e[M"
+expect cursor 1 0
+expect reply b""
+write b"\e[3M"
+expect cursor 1 0
+expect reply b""
+end
+
+case libvterm/13state-edit/ech
+source "libvterm-0.3.3:t/13state_edit.test:54:ECH"
+tags core editing
+size 25 80
+expect cursor 0 0
+write b"ABC"
+expect reply b""
+write b"\e[2D"
+expect cursor 0 1
+expect reply b""
+write b"\e[X"
+expect cursor 0 1
+expect reply b""
+write b"\e[3X"
+expect cursor 0 1
+expect reply b""
+write b"\e[100X"
+expect reply b""
+end
+
+case libvterm/13state-edit/ed-0
+source "libvterm-0.3.3:t/13state_edit.test:213:ED 0"
+tags core editing
+size 25 80
+expect cursor 0 0
+write b"\e[2;2H"
+expect cursor 1 1
+expect reply b""
+write b"\e[0J"
+expect cursor 1 1
+expect reply b""
+end
+
+case libvterm/13state-edit/ed-1
+source "libvterm-0.3.3:t/13state_edit.test:224:ED 1"
+tags core editing
+size 25 80
+expect cursor 0 0
+write b"\e[2;2H"
+expect cursor 1 1
+expect reply b""
+write b"\e[1J"
+expect cursor 1 1
+expect reply b""
+end
+
+case libvterm/13state-edit/ed-2
+source "libvterm-0.3.3:t/13state_edit.test:235:ED 2"
+tags core editing
+size 25 80
+expect cursor 0 0
+write b"\e[2;2H"
+expect cursor 1 1
+expect reply b""
+write b"\e[2J"
+expect cursor 1 1
+expect reply b""
+end
+
+case libvterm/13state-edit/el-0
+source "libvterm-0.3.3:t/13state_edit.test:164:EL 0"
+tags core editing
+size 25 80
+expect cursor 0 0
+write b"ABCDE"
+expect reply b""
+write b"\e[3D"
+expect cursor 0 2
+expect reply b""
+write b"\e[0K"
+expect cursor 0 2
+expect reply b""
+end
+
+case libvterm/13state-edit/el-1
+source "libvterm-0.3.3:t/13state_edit.test:175:EL 1"
+tags core editing
+size 25 80
+expect cursor 0 0
+write b"ABCDE"
+expect reply b""
+write b"\e[3D"
+expect cursor 0 2
+expect reply b""
+write b"\e[1K"
+expect cursor 0 2
+expect reply b""
+end
+
+case libvterm/13state-edit/el-2
+source "libvterm-0.3.3:t/13state_edit.test:186:EL 2"
+tags core editing
+size 25 80
+expect cursor 0 0
+write b"ABCDE"
+expect reply b""
+write b"\e[3D"
+expect cursor 0 2
+expect reply b""
+write b"\e[2K"
+expect cursor 0 2
+expect reply b""
+end
+
+case libvterm/13state-edit/ich
+source "libvterm-0.3.3:t/13state_edit.test:5:ICH"
+tags core editing
+size 25 80
+expect cursor 0 0
+write b"ACD"
+expect reply b""
+write b"\e[2D"
+expect cursor 0 1
+expect reply b""
+write b"\e[@"
+expect cursor 0 1
+expect reply b""
+write b"B"
+expect cursor 0 2
+expect reply b""
+write b"\e[3@"
+expect reply b""
+end
+
+case libvterm/13state-edit/ich-move-erase-emuation
+source "libvterm-0.3.3:t/13state_edit.test:273:ICH move+erase emuation"
+tags core editing
+size 25 80
+expect cursor 0 0
+write b"ACD"
+expect reply b""
+write b"\e[2D"
+expect cursor 0 1
+expect reply b""
+write b"\e[@"
+expect cursor 0 1
+expect reply b""
+write b"B"
+expect cursor 0 2
+expect reply b""
+write b"\e[3@"
+expect reply b""
+end
+
+case libvterm/13state-edit/il
+source "libvterm-0.3.3:t/13state_edit.test:71:IL"
+tags core editing
+size 25 80
+expect cursor 0 0
+write b"A\r\nC"
+expect cursor 1 1
+expect reply b""
+write b"\e[L"
+expect cursor 1 1
+expect reply b""
+write b"\rB"
+expect cursor 1 1
+expect reply b""
+write b"\e[3L"
+expect reply b""
+end
+
+case libvterm/14state-encoding/default
+source "libvterm-0.3.3:t/14state_encoding.test:4:Default"
+tags core charset
+size 25 80
+write b"#"
+expect glyph 0 0 "#"
+expect reply b""
+end
+
+case libvterm/14state-encoding/designate-g0-dec-drawing
+source "libvterm-0.3.3:t/14state_encoding.test:15:Designate G0=DEC drawing"
+tags core charset
+size 25 80
+write b"\e(0"
+expect reply b""
+write b"a"
+expect glyph 0 0 "▒"
+expect reply b""
+end
+
+case libvterm/14state-encoding/designate-g1-ls1
+source "libvterm-0.3.3:t/14state_encoding.test:21:Designate G1 + LS1"
+tags core charset
+size 25 80
+write b"\e)0"
+expect reply b""
+write b"a"
+expect glyph 0 0 "a"
+expect reply b""
+write b"\x0e"
+expect reply b""
+write b"a"
+expect glyph 0 1 "▒"
+expect reply b""
+end
+
+case libvterm/14state-encoding/ls0
+source "libvterm-0.3.3:t/14state_encoding.test:29:LS0"
+tags core charset
+size 25 80
+write b"\e)0"
+expect reply b""
+write b"a"
+expect reply b""
+write b"\x0e"
+expect reply b""
+write b"a"
+expect reply b""
+write b"\x0f"
+expect reply b""
+write b"a"
+expect glyph 0 2 "a"
+expect reply b""
+end
+
+case libvterm/14state-encoding/mixed-us-ascii-and-utf-8
+source "libvterm-0.3.3:t/14state_encoding.test:97:Mixed US-ASCII and UTF-8"
+tags core charset
+size 25 80
+write b"\e(B"
+expect reply b""
+write b"AB\xc4\x88D"
+expect glyph 0 0 "A"
+expect glyph 0 1 "B"
+expect glyph 0 2 "Ĉ"
+expect glyph 0 3 "D"
+expect reply b""
+end
+
+case libvterm/15state-mode/dec-origin-mode
+source "libvterm-0.3.3:t/15state_mode.test:44:DEC origin mode"
+tags core modes
+size 25 80
+expect cursor 0 0
+write b"\e[5;15r"
+expect reply b""
+write b"\e[H"
+expect cursor 0 0
+expect reply b""
+write b"\e[3;3H"
+expect cursor 2 2
+expect reply b""
+write b"\e[?6h"
+expect reply b""
+write b"\e[H"
+expect cursor 4 0
+expect reply b""
+write b"\e[3;3H"
+expect cursor 6 2
+expect reply b""
+end
+
+case libvterm/15state-mode/origin-mode-bounds-cursor-to-scrolling-region
+source "libvterm-0.3.3:t/15state_mode.test:76:Origin mode bounds cursor to scrolling region"
+tags core modes
+size 25 80
+write b"\e[5;15r"
+expect reply b""
+write b"\e[H"
+expect reply b""
+write b"\e[3;3H"
+expect reply b""
+write b"\e[?6h"
+expect reply b""
+write b"\e[H"
+expect reply b""
+write b"\e[3;3H"
+expect reply b""
+write b"\e[H"
+expect reply b""
+write b"\e[10A"
+expect cursor 4 0
+expect reply b""
+write b"\e[20B"
+expect cursor 14 0
+expect reply b""
+end
+
+case libvterm/15state-mode/origin-mode-without-scroll-region
+source "libvterm-0.3.3:t/15state_mode.test:83:Origin mode without scroll region"
+tags core modes
+size 25 80
+write b"\e[5;15r"
+expect reply b""
+write b"\e[H"
+expect reply b""
+write b"\e[3;3H"
+expect reply b""
+write b"\e[?6h"
+expect reply b""
+write b"\e[H"
+expect reply b""
+write b"\e[3;3H"
+expect reply b""
+write b"\e[H"
+expect reply b""
+write b"\e[10A"
+expect reply b""
+write b"\e[20B"
+expect reply b""
+write b"\e[?6l"
+expect reply b""
+write b"\e[r\e[?6h"
+expect cursor 0 0
+expect reply b""
+end
+
+case libvterm/16state-resize/placement
+source "libvterm-0.3.3:t/16state_resize.test:4:Placement"
+tags core resize
+size 25 80
+write b"AB\e[79GCDE"
+expect glyph 0 0 "A"
+expect glyph 0 1 "B"
+expect glyph 0 78 "C"
+expect glyph 0 79 "D"
+expect glyph 1 0 "E"
+expect reply b""
+end
+
+case libvterm/16state-resize/resize
+source "libvterm-0.3.3:t/16state_resize.test:13:Resize"
+tags core resize
+size 25 80
+resize 27 85
+write b"AB\e[79GCDE"
+expect glyph 0 0 "A"
+expect glyph 0 1 "B"
+expect glyph 0 78 "C"
+expect glyph 0 79 "D"
+expect glyph 0 80 "E"
+expect cursor 0 81
+expect reply b""
+end
+
+case libvterm/16state-resize/resize-grow-doesn-t-cancel-phantom
+source "libvterm-0.3.3:t/16state_resize.test:38:Resize grow doesn't cancel phantom"
+tags core resize
+size 25 80
+write b"\e[79GAB"
+expect glyph 0 78 "A"
+expect glyph 0 79 "B"
+expect reply b""
+resize 30 100
+expect cursor 0 80
+write b"C"
+expect glyph 0 80 "C"
+expect cursor 0 81
+expect reply b""
+end
+
+case libvterm/16state-resize/resize-without-reset
+source "libvterm-0.3.3:t/16state_resize.test:24:Resize without reset"
+tags core resize
+size 25 80
+resize 27 85
+write b"AB\e[79GCDE"
+expect reply b""
+resize 28 90
+expect cursor 0 81
+write b"FGHI"
+expect glyph 0 81 "F"
+expect glyph 0 82 "G"
+expect glyph 0 83 "H"
+expect glyph 0 84 "I"
+expect cursor 0 85
+expect reply b""
+end
+
+case libvterm/18state-termprops/cursor-visibility
+source "libvterm-0.3.3:t/18state_termprops.test:9:Cursor visibility"
+tags core modes
+size 25 80
+write b"\e[?25h"
+expect mode cursor-visible on
+expect reply b""
+write b"\e[?25l"
+expect mode cursor-visible off
+expect reply b""
+end
+
+case libvterm/20state-wrapping/79th-column
+source "libvterm-0.3.3:t/20state_wrapping.test:5:79th Column"
+tags core wrapping
+size 25 80
+write b"\e[75G"
+expect reply b""
+write b"AAAAA"
+expect glyph 0 74 "A"
+expect glyph 0 75 "A"
+expect glyph 0 76 "A"
+expect glyph 0 77 "A"
+expect glyph 0 78 "A"
+expect reply b""
+end
+
+case libvterm/20state-wrapping/80th-column-causes-linefeed-on-wraparound
+source "libvterm-0.3.3:t/20state_wrapping.test:52:80th column causes linefeed on wraparound"
+tags core wrapping
+size 25 80
+write b"\e[?7l"
+expect reply b""
+write b"\e[75G"
+expect reply b""
+write b"DDDDDD"
+expect reply b""
+write b"D"
+expect reply b""
+write b"\e[?7h"
+expect reply b""
+write b"\e[25;78HABC"
+expect glyph 24 77 "A"
+expect glyph 24 78 "B"
+expect glyph 24 79 "C"
+expect reply b""
+write b"D"
+expect glyph 24 0 "D"
+expect reply b""
+end
+
+case libvterm/20state-wrapping/80th-column-phantom
+source "libvterm-0.3.3:t/20state_wrapping.test:15:80th Column Phantom"
+tags core wrapping
+size 25 80
+write b"\e[75G"
+expect reply b""
+write b"AAAAA"
+expect reply b""
+write b"A"
+expect glyph 0 79 "A"
+expect reply b""
+end
+
+case libvterm/20state-wrapping/80th-column-phantom-linefeed-phantom-cancelled-by-explicit-cursor-move
+source "libvterm-0.3.3:t/20state_wrapping.test:62:80th column phantom linefeed phantom cancelled by explicit cursor move"
+tags core wrapping
+size 25 80
+write b"\e[?7l"
+expect reply b""
+write b"\e[75G"
+expect reply b""
+write b"DDDDDD"
+expect reply b""
+write b"D"
+expect reply b""
+write b"\e[?7h"
+expect reply b""
+write b"\e[25;78HABC"
+expect reply b""
+write b"D"
+expect reply b""
+write b"\e[25;78HABC"
+expect glyph 24 77 "A"
+expect glyph 24 78 "B"
+expect glyph 24 79 "C"
+expect reply b""
+write b"\e[25;1HD"
+expect glyph 24 0 "D"
+expect reply b""
+end
+
+case libvterm/20state-wrapping/dec-auto-wrap-mode
+source "libvterm-0.3.3:t/20state_wrapping.test:35:DEC Auto Wrap Mode"
+tags core wrapping
+size 25 80
+write b"\e[?7l"
+expect reply b""
+write b"\e[75G"
+expect reply b""
+write b"DDDDDD"
+expect glyph 0 74 "D"
+expect glyph 0 75 "D"
+expect glyph 0 76 "D"
+expect glyph 0 77 "D"
+expect glyph 0 78 "D"
+expect glyph 0 79 "D"
+expect reply b""
+write b"D"
+expect glyph 0 79 "D"
+expect reply b""
+end
+
+case libvterm/20state-wrapping/line-wraparound
+source "libvterm-0.3.3:t/20state_wrapping.test:20:Line Wraparound"
+tags core wrapping
+size 25 80
+write b"\e[75G"
+expect reply b""
+write b"AAAAA"
+expect reply b""
+write b"A"
+expect reply b""
+write b"B"
+expect glyph 1 0 "B"
+expect cursor 1 1
+expect reply b""
+end
+
+case libvterm/20state-wrapping/line-wraparound-during-combined-write
+source "libvterm-0.3.3:t/20state_wrapping.test:25:Line Wraparound during combined write"
+tags core wrapping
+size 25 80
+write b"\e[75G"
+expect reply b""
+write b"AAAAA"
+expect reply b""
+write b"A"
+expect reply b""
+write b"B"
+expect reply b""
+write b"\e[78G"
+expect reply b""
+write b"BBBCC"
+expect glyph 1 77 "B"
+expect glyph 1 78 "B"
+expect glyph 1 79 "B"
+expect glyph 2 0 "C"
+expect glyph 2 1 "C"
+expect cursor 2 2
+expect reply b""
+end
+
+case libvterm/21state-tabstops/hts
+source "libvterm-0.3.3:t/21state_tabstops.test:12:HTS"
+tags core
+size 25 80
+write b"\tX"
+expect reply b""
+write b"\tX"
+expect reply b""
+write b"\e[5G\eH"
+expect reply b""
+write b"\e[G\tX"
+expect glyph 0 4 "X"
+expect cursor 0 5
+expect reply b""
+end
+
+case libvterm/21state-tabstops/initial
+source "libvterm-0.3.3:t/21state_tabstops.test:4:Initial"
+tags core
+size 25 80
+write b"\tX"
+expect glyph 0 8 "X"
+expect reply b""
+write b"\tX"
+expect glyph 0 16 "X"
+expect cursor 0 17
+expect reply b""
+end
+
+case libvterm/21state-tabstops/tabstops-after-resize
+source "libvterm-0.3.3:t/21state_tabstops.test:32:Tabstops after resize"
+tags core
+size 25 80
+resize 30 100
+write b"\tX"
+expect glyph 0 8 "X"
+expect reply b""
+write b"\tX"
+expect glyph 0 16 "X"
+expect reply b""
+write b"\tX"
+expect glyph 0 24 "X"
+expect reply b""
+write b"\tX"
+expect glyph 0 32 "X"
+expect reply b""
+write b"\tX"
+expect glyph 0 40 "X"
+expect reply b""
+write b"\tX"
+expect glyph 0 48 "X"
+expect reply b""
+write b"\tX"
+expect glyph 0 56 "X"
+expect reply b""
+write b"\tX"
+expect glyph 0 64 "X"
+expect reply b""
+write b"\tX"
+expect glyph 0 72 "X"
+expect reply b""
+write b"\tX"
+expect glyph 0 80 "X"
+expect reply b""
+write b"\tX"
+expect glyph 0 88 "X"
+expect reply b""
+write b"\tX"
+expect glyph 0 96 "X"
+expect cursor 0 97
+expect reply b""
+end
+
+case libvterm/21state-tabstops/tbc-0
+source "libvterm-0.3.3:t/21state_tabstops.test:18:TBC 0"
+tags core
+size 25 80
+write b"\tX"
+expect reply b""
+write b"\tX"
+expect reply b""
+write b"\e[5G\eH"
+expect reply b""
+write b"\e[G\tX"
+expect reply b""
+write b"\e[9G\e[g"
+expect reply b""
+write b"\e[G\tX\tX"
+expect glyph 0 16 "X"
+expect glyph 0 4 "X"
+expect cursor 0 17
+expect reply b""
+end
+
+case libvterm/21state-tabstops/tbc-3
+source "libvterm-0.3.3:t/21state_tabstops.test:25:TBC 3"
+tags core
+size 25 80
+write b"\tX"
+expect reply b""
+write b"\tX"
+expect reply b""
+write b"\e[5G\eH"
+expect reply b""
+write b"\e[G\tX"
+expect reply b""
+write b"\e[9G\e[g"
+expect reply b""
+write b"\e[G\tX\tX"
+expect reply b""
+write b"\e[3g\e[50G\eH\e[G"
+expect cursor 0 0
+expect reply b""
+write b"\tX"
+expect glyph 0 49 "X"
+expect cursor 0 50
+expect reply b""
+end
+
+case libvterm/22state-save/restore
+source "libvterm-0.3.3:t/22state_save.test:28:Restore"
+tags core modes
+size 25 80
+write b"\e[2;2H"
+expect reply b""
+write b"\e[1m"
+expect reply b""
+write b"\e[?1048h"
+expect reply b""
+write b"\e[?1048l"
+expect cursor 1 1
+expect mode cursor-visible on
+expect reply b""
+end
+
+case libvterm/22state-save/save-restore-using-decsc-decrc
+source "libvterm-0.3.3:t/22state_save.test:37:Save/restore using DECSC/DECRC"
+tags core modes
+size 25 80
+write b"\e[2;2H"
+expect reply b""
+write b"\e[1m"
+expect reply b""
+write b"\e[?1048h"
+expect reply b""
+write b"\e[?1048l"
+expect reply b""
+write b"\e[2;2H\e7"
+expect cursor 1 1
+expect reply b""
+write b"\e[5;5H"
+expect cursor 4 4
+expect reply b""
+write b"\e8"
+expect cursor 1 1
+expect mode cursor-visible on
+expect reply b""
+end
+
+case libvterm/22state-save/save-twice-restore-twice-happens-on-both-edge-transitions
+source "libvterm-0.3.3:t/22state_save.test:49:Save twice, restore twice happens on both edge transitions"
+tags core modes
+size 25 80
+write b"\e[2;2H"
+expect reply b""
+write b"\e[1m"
+expect reply b""
+write b"\e[?1048h"
+expect reply b""
+write b"\e[?1048l"
+expect reply b""
+write b"\e[2;2H\e7"
+expect reply b""
+write b"\e[5;5H"
+expect reply b""
+write b"\e8"
+expect reply b""
+write b"\e[2;10H\e[?1048h\e[6;10H\e[?1048h"
+expect reply b""
+write b"\e[H"
+expect cursor 0 0
+expect reply b""
+write b"\e[?1048l"
+expect cursor 5 9
+expect mode cursor-visible on
+expect reply b""
+write b"\e[H"
+expect cursor 0 0
+expect reply b""
+write b"\e[?1048l"
+expect cursor 5 9
+expect mode cursor-visible on
+expect reply b""
+end
+
+case libvterm/22state-save/set-up-state
+source "libvterm-0.3.3:t/22state_save.test:9:Set up state"
+tags core modes
+size 25 80
+write b"\e[2;2H"
+expect cursor 1 1
+expect reply b""
+write b"\e[1m"
+expect reply b""
+end
+
+case libvterm/26state-query/cpr
+source "libvterm-0.3.3:t/26state_query.test:19:CPR"
+tags core replies
+size 25 80
+write b"\e[5n"
+expect reply b"\e[0n"
+write b"\e[6n"
+expect reply b"\e[0n\e[1;1R"
+write b"\e[10;10H\e[6n"
+expect reply b"\e[0n\e[1;1R\e[10;10R"
+end
+
+case libvterm/26state-query/da
+source "libvterm-0.3.3:t/26state_query.test:4:DA"
+tags core replies
+size 25 80
+write b"\e[c"
+expect reply b"\e[?1;0c"
+end
+
+case libvterm/26state-query/dsr
+source "libvterm-0.3.3:t/26state_query.test:14:DSR"
+tags core replies
+size 25 80
+write b"\e[5n"
+expect reply b"\e[0n"
+end
+
+case libvterm/27state-reset/ris-clears-tabstops
+source "libvterm-0.3.3:t/27state_reset.test:28:RIS clears tabstops"
+tags core modes
+size 25 80
+write b"\e[5;5H"
+expect reply b""
+write b"\ec"
+expect reply b""
+write b"\e[5;10r"
+expect reply b""
+write b"\ec\e[25H\n"
+expect reply b""
+write b"ABCDE"
+expect reply b""
+write b"\ec"
+expect reply b""
+write b"\e[5G\eH\e[G\t"
+expect cursor 0 4
+expect reply b""
+write b"\ec\t"
+expect cursor 0 8
+expect reply b""
+end
+
+case libvterm/27state-reset/ris-homes-cursor
+source "libvterm-0.3.3:t/27state_reset.test:6:RIS homes cursor"
+tags core modes
+size 25 80
+write b"\e[5;5H"
+expect cursor 4 4
+expect reply b""
+write b"\ec"
+expect cursor 0 0
+expect reply b""
+end
+
+case libvterm/31state-rep/rep-lowercase-a-times-two
+source "libvterm-0.3.3:t/31state_rep.test:17:REP lowercase a times two"
+tags core editing
+size 25 80
+write b"a\e[2b"
+expect glyph 0 0 "a"
+expect glyph 0 1 "a"
+expect glyph 0 2 "a"
+expect reply b""
+end
+
+case libvterm/31state-rep/rep-no-argument
+source "libvterm-0.3.3:t/31state_rep.test:5:REP no argument"
+tags core editing
+size 25 80
+write b"a\e[b"
+expect glyph 0 0 "a"
+expect glyph 0 1 "a"
+expect reply b""
+end
+
+case libvterm/31state-rep/rep-till-end-of-line
+source "libvterm-0.3.3:t/31state_rep.test:44:REP till end of line"
+tags core editing
+size 25 80
+write b"a\e[1000bb"
+expect glyph 0 0 "a"
+expect glyph 0 1 "a"
+expect glyph 0 10 "a"
+expect glyph 0 11 "a"
+expect glyph 0 12 "a"
+expect glyph 0 13 "a"
+expect glyph 0 14 "a"
+expect glyph 0 15 "a"
+expect glyph 0 16 "a"
+expect glyph 0 17 "a"
+expect glyph 0 18 "a"
+expect glyph 0 19 "a"
+expect glyph 0 2 "a"
+expect glyph 0 20 "a"
+expect glyph 0 21 "a"
+expect glyph 0 22 "a"
+expect glyph 0 23 "a"
+expect glyph 0 24 "a"
+expect glyph 0 25 "a"
+expect glyph 0 26 "a"
+expect glyph 0 27 "a"
+expect glyph 0 28 "a"
+expect glyph 0 29 "a"
+expect glyph 0 3 "a"
+expect glyph 0 30 "a"
+expect glyph 0 31 "a"
+expect glyph 0 32 "a"
+expect glyph 0 33 "a"
+expect glyph 0 34 "a"
+expect glyph 0 35 "a"
+expect glyph 0 36 "a"
+expect glyph 0 37 "a"
+expect glyph 0 38 "a"
+expect glyph 0 39 "a"
+expect glyph 0 4 "a"
+expect glyph 0 40 "a"
+expect glyph 0 41 "a"
+expect glyph 0 42 "a"
+expect glyph 0 43 "a"
+expect glyph 0 44 "a"
+expect glyph 0 45 "a"
+expect glyph 0 46 "a"
+expect glyph 0 47 "a"
+expect glyph 0 48 "a"
+expect glyph 0 49 "a"
+expect glyph 0 5 "a"
+expect glyph 0 50 "a"
+expect glyph 0 51 "a"
+expect glyph 0 52 "a"
+expect glyph 0 53 "a"
+expect glyph 0 54 "a"
+expect glyph 0 55 "a"
+expect glyph 0 56 "a"
+expect glyph 0 57 "a"
+expect glyph 0 58 "a"
+expect glyph 0 59 "a"
+expect glyph 0 6 "a"
+expect glyph 0 60 "a"
+expect glyph 0 61 "a"
+expect glyph 0 62 "a"
+expect glyph 0 63 "a"
+expect glyph 0 64 "a"
+expect glyph 0 65 "a"
+expect glyph 0 66 "a"
+expect glyph 0 67 "a"
+expect glyph 0 68 "a"
+expect glyph 0 69 "a"
+expect glyph 0 7 "a"
+expect glyph 0 70 "a"
+expect glyph 0 71 "a"
+expect glyph 0 72 "a"
+expect glyph 0 73 "a"
+expect glyph 0 74 "a"
+expect glyph 0 75 "a"
+expect glyph 0 76 "a"
+expect glyph 0 77 "a"
+expect glyph 0 78 "a"
+expect glyph 0 79 "a"
+expect glyph 0 8 "a"
+expect glyph 0 9 "a"
+expect glyph 1 0 "b"
+expect reply b""
+end
+
+case libvterm/31state-rep/rep-with-utf-8-1-char
+source "libvterm-0.3.3:t/31state_rep.test:24:REP with UTF-8 1 char"
+tags core editing
+size 25 80
+write b"\xc3\xa9\e[b"
+expect glyph 0 0 "é"
+expect glyph 0 1 "é"
+expect reply b""
+end
+
+case libvterm/31state-rep/rep-zero-zero-should-be-interpreted-as-one
+source "libvterm-0.3.3:t/31state_rep.test:11:REP zero (zero should be interpreted as one)"
+tags core editing
+size 25 80
+write b"a\e[0b"
+expect glyph 0 0 "a"
+expect glyph 0 1 "a"
+expect reply b""
+end
+
+case libvterm/60screen-ascii/altscreen
+source "libvterm-0.3.3:t/60screen_ascii.test:60:Altscreen"
+tags core alternate-screen
+size 25 80
+write b"P"
+expect reply b""
+expect text 0 "P                                                                               "
+write b"\e[?1049h"
+expect reply b""
+expect text 0 "                                                                                "
+write b"\e[2K\e[HA"
+expect reply b""
+expect text 0 "A                                                                               "
+write b"\e[?1049l"
+expect reply b""
+expect text 0 "P                                                                               "
+end
+
+case libvterm/60screen-ascii/erase
+source "libvterm-0.3.3:t/60screen_ascii.test:30:Erase"
+tags core alternate-screen
+size 25 80
+write b"ABCDE\e[H\e[K"
+expect reply b""
+expect text 0 "                                                                                "
+end
+
+case libvterm/60screen-ascii/get
+source "libvterm-0.3.3:t/60screen_ascii.test:4:Get"
+tags core alternate-screen
+size 25 80
+write b"ABC"
+expect cell 0 0 "A" fg=default bg=default attrs=none
+expect cell 0 1 "B" fg=default bg=default attrs=none
+expect cell 0 2 "C" fg=default bg=default attrs=none
+expect reply b""
+expect text 0 "ABC                                                                             "
+write b"\e[H"
+expect reply b""
+expect text 0 "ABC                                                                             "
+write b"E"
+expect reply b""
+expect text 0 "EBC                                                                             "
+end
+
+case libvterm/60screen-ascii/space-padding
+source "libvterm-0.3.3:t/60screen_ascii.test:48:Space padding"
+tags core alternate-screen
+size 25 80
+write b"Hello\e[CWorld"
+expect reply b""
+expect text 0 "Hello World                                                                     "
+end
+
+case libvterm/61screen-unicode/single-width-utf-8
+source "libvterm-0.3.3:t/61screen_unicode.test:5:Single width UTF-8"
+tags core utf8
+size 25 80
+write b"\xc3\x81\xc3\xa9"
+expect cell 0 0 "Á" fg=default bg=default attrs=none
+expect reply b""
+end
+
+case libvterm/63screen-resize/resize-can-operate-on-altscreen
+source "libvterm-0.3.3:t/63screen_resize.test:109:Resize can operate on altscreen"
+tags core resize
+size 20 80
+resize 25 80
+write b"Main screen\e[?1049h\e[HAlt screen"
+expect reply b""
+resize 30 80
+expect text 0 "Alt screen                                                                      "
+write b"\e[?1049l"
+expect reply b""
+expect text 0 "Main screen                                                                     "
+end
+
+case libvterm/63screen-resize/resize-shorter-does-not-lose-line-with-cursor
+source "libvterm-0.3.3:t/63screen_resize.test:57:Resize shorter does not lose line with cursor"
+tags core resize
+size 20 80
+resize 25 80
+write b"\e[24HLine 24\r\nLine 25\r\n"
+expect cursor 24 0
+expect reply b""
+expect text 23 "Line 25                                                                         "
+resize 24 80
+expect cursor 23 0
+expect text 22 "Line 25                                                                         "
+end
+
+case libvterm/63screen-resize/resize-shorter-does-not-send-the-cursor-to-a-negative-row
+source "libvterm-0.3.3:t/63screen_resize.test:72:Resize shorter does not send the cursor to a negative row"
+tags core resize
+size 24 80
+resize 25 80
+write b"\e[24HLine 24\r\nLine 25\e[H"
+expect cursor 0 0
+expect reply b""
+resize 20 80
+expect cursor 0 0
+end
+
+case libvterm/63screen-resize/resize-shorter-with-blanks-just-truncates
+source "libvterm-0.3.3:t/63screen_resize.test:27:Resize shorter with blanks just truncates"
+tags core resize
+size 25 100
+resize 25 80
+write b"Top\e[10HLine 10"
+expect cursor 9 7
+expect reply b""
+expect text 0 "Top                                                                             "
+expect text 9 "Line 10                                                                         "
+resize 20 80
+expect cursor 9 7
+expect text 0 "Top                                                                             "
+expect text 9 "Line 10                                                                         "
+end
+
+case libvterm/63screen-resize/resize-shorter-with-content-must-scroll
+source "libvterm-0.3.3:t/63screen_resize.test:39:Resize shorter with content must scroll"
+tags core resize
+size 20 80
+resize 25 80
+write b"Top\e[25HLine 25\e[15H"
+expect cursor 14 0
+expect reply b""
+expect text 0 "Top                                                                             "
+expect text 24 "Line 25                                                                         "
+resize 20 80
+expect cursor 9 0
+expect text 0 "                                                                                "
+expect text 19 "Line 25                                                                         "
+end
+
+case libvterm/64screen-pen/background
+source "libvterm-0.3.3:t/64screen_pen.test:34:Background"
+tags core color
+size 25 80
+write b"A"
+expect reply b""
+write b"\e[1mB"
+expect reply b""
+write b"\e[3mC"
+expect reply b""
+write b"\e[4mD"
+expect reply b""
+write b"\e[mE"
+expect reply b""
+write b"F"
+expect reply b""
+write b"\e[31mG\e[m"
+expect reply b""
+write b"\e[42mH\e[m"
+expect cell 0 7 "H" fg=default bg=indexed:2 attrs=none
+expect reply b""
+end
+
+case libvterm/64screen-pen/bold
+source "libvterm-0.3.3:t/64screen_pen.test:10:Bold"
+tags core color
+size 25 80
+write b"A"
+expect reply b""
+write b"\e[1mB"
+expect cell 0 1 "B" fg=default bg=default attrs=bold
+expect reply b""
+end
+
+case libvterm/64screen-pen/el-sets-only-colours-to-end-of-line-not-other-attrs
+source "libvterm-0.3.3:t/64screen_pen.test:44:EL sets only colours to end of line, not other attrs"
+tags core color
+size 25 80
+write b"A"
+expect reply b""
+write b"\e[1mB"
+expect reply b""
+write b"\e[3mC"
+expect reply b""
+write b"\e[4mD"
+expect reply b""
+write b"\e[mE"
+expect reply b""
+write b"F"
+expect reply b""
+write b"\e[31mG\e[m"
+expect reply b""
+write b"\e[42mH\e[m"
+expect reply b""
+write b"x02"
+expect reply b""
+write b"\e[H\e[7;33;44m\e[K"
+expect cell 0 0 " " fg=indexed:3 bg=indexed:4 attrs=none
+expect cell 0 79 " " fg=indexed:3 bg=indexed:4 attrs=none
+expect reply b""
+end
+
+case libvterm/64screen-pen/foreground
+source "libvterm-0.3.3:t/64screen_pen.test:30:Foreground"
+tags core color
+size 25 80
+write b"A"
+expect reply b""
+write b"\e[1mB"
+expect reply b""
+write b"\e[3mC"
+expect reply b""
+write b"\e[4mD"
+expect reply b""
+write b"\e[mE"
+expect reply b""
+write b"F"
+expect reply b""
+write b"\e[31mG\e[m"
+expect cell 0 6 "G" fg=indexed:1 bg=default attrs=none
+expect reply b""
+end
+
+case libvterm/64screen-pen/italic
+source "libvterm-0.3.3:t/64screen_pen.test:14:Italic"
+tags core color
+size 25 80
+write b"A"
+expect reply b""
+write b"\e[1mB"
+expect reply b""
+write b"\e[3mC"
+expect cell 0 2 "C" fg=default bg=default attrs=bold,italic
+expect reply b""
+end
+
+case libvterm/64screen-pen/plain
+source "libvterm-0.3.3:t/64screen_pen.test:6:Plain"
+tags core color
+size 25 80
+write b"A"
+expect cell 0 0 "A" fg=default bg=default attrs=none
+expect reply b""
+end
+
+case libvterm/64screen-pen/reset
+source "libvterm-0.3.3:t/64screen_pen.test:22:Reset"
+tags core color
+size 25 80
+write b"A"
+expect reply b""
+write b"\e[1mB"
+expect reply b""
+write b"\e[3mC"
+expect reply b""
+write b"\e[4mD"
+expect reply b""
+write b"\e[mE"
+expect cell 0 4 "E" fg=default bg=default attrs=none
+expect reply b""
+end
+
+case libvterm/64screen-pen/underline
+source "libvterm-0.3.3:t/64screen_pen.test:18:Underline"
+tags core color
+size 25 80
+write b"A"
+expect reply b""
+write b"\e[1mB"
+expect reply b""
+write b"\e[3mC"
+expect reply b""
+write b"\e[4mD"
+expect cell 0 3 "D" fg=default bg=default attrs=bold,underline,italic
+expect reply b""
+end
+
+case libvterm/90vttest-01-movement-2/output
+source "libvterm-0.3.3:t/90vttest_01-movement-2.test:18:Output"
+tags core
+size 25 80
+write b"\e[3;21r"
+expect reply b""
+write b"\e[?6h"
+expect reply b""
+write b"\e[19;1HA\e[19;80Ha\n\e[18;80HaB\e[19;80HB\x08 b\n\e[19;80HC\x08\x08\t\tc\e[19;2H\x08C\n\e[19;80H\n\e[18;1HD\e[18;80Hd"
+expect reply b""
+write b"\e[19;1HE\e[19;80He\n\e[18;80HeF\e[19;80HF\x08 f\n\e[19;80HG\x08\x08\t\tg\e[19;2H\x08G\n\e[19;80H\n\e[18;1HH\e[18;80Hh"
+expect reply b""
+write b"\e[19;1HI\e[19;80Hi\n\e[18;80HiJ\e[19;80HJ\x08 j\n\e[19;80HK\x08\x08\t\tk\e[19;2H\x08K\n\e[19;80H\n\e[18;1HL\e[18;80Hl"
+expect reply b""
+write b"\e[19;1HM\e[19;80Hm\n\e[18;80HmN\e[19;80HN\x08 n\n\e[19;80HO\x08\x08\t\to\e[19;2H\x08O\n\e[19;80H\n\e[18;1HP\e[18;80Hp"
+expect reply b""
+write b"\e[19;1HQ\e[19;80Hq\n\e[18;80HqR\e[19;80HR\x08 r\n\e[19;80HS\x08\x08\t\ts\e[19;2H\x08S\n\e[19;80H\n\e[18;1HT\e[18;80Ht"
+expect reply b""
+write b"\e[19;1HU\e[19;80Hu\n\e[18;80HuV\e[19;80HV\x08 v\n\e[19;80HW\x08\x08\t\tw\e[19;2H\x08W\n\e[19;80H\n\e[18;1HX\e[18;80Hx"
+expect reply b""
+write b"\e[19;1HY\e[19;80Hy\n\e[18;80HyZ\e[19;80HZ\x08 z\n"
+expect reply b""
+expect text 10 "Q                                                                              q"
+expect text 11 "R                                                                              r"
+expect text 12 "S                                                                              s"
+expect text 13 "T                                                                              t"
+expect text 14 "U                                                                              u"
+expect text 15 "V                                                                              v"
+expect text 16 "W                                                                              w"
+expect text 17 "X                                                                              x"
+expect text 18 "Y                                                                              y"
+expect text 19 "Z                                                                              z"
+expect text 2 "I                                                                              i"
+expect text 20 "                                                                                "
+expect text 3 "J                                                                              j"
+expect text 4 "K                                                                              k"
+expect text 5 "L                                                                              l"
+expect text 6 "M                                                                              m"
+expect text 7 "N                                                                              n"
+expect text 8 "O                                                                              o"
+expect text 9 "P                                                                              p"
+end
+
+case libvterm/90vttest-01-movement-3/output
+source "libvterm-0.3.3:t/90vttest_01-movement-3.test:16:Output"
+tags core
+size 25 80
+write b"A B C D E F G H I"
+expect reply b""
+write b"\r\n"
+expect reply b""
+write b"A\e[2\x08CB\e[2\x08CC\e[2\x08CD\e[2\x08CE\e[2\x08CF\e[2\x08CG\e[2\x08CH\e[2\x08CI"
+expect reply b""
+write b"\r\n"
+expect reply b""
+write b"A \e[\r2CB\e[\r4CC\e[\r6CD\e[\r8CE\e[\r10CF\e[\r12CG\e[\r14CH\e[\r16CI"
+expect reply b""
+write b"\r\n"
+expect reply b""
+write b"A \e[1\x0bAB \e[1\x0bAC \e[1\x0bAD \e[1\x0bAE \e[1\x0bAF \e[1\x0bAG \e[1\x0bAH \e[1\x0bAI \e[1\x0bA"
+expect reply b""
+expect cursor 3 18
+expect text 0 "A B C D E F G H I                                                               "
+expect text 1 "A B C D E F G H I                                                               "
+expect text 2 "A B C D E F G H I                                                               "
+expect text 3 "A B C D E F G H I                                                               "
+end
+
+case libvterm/90vttest-01-movement-4/output
+source "libvterm-0.3.3:t/90vttest_01-movement-4.test:34:Output"
+tags core
+size 25 80
+write b"\e[00000000004;000000001HT"
+expect reply b""
+write b"\e[00000000004;000000002Hh"
+expect reply b""
+write b"\e[00000000004;000000003Hi"
+expect reply b""
+write b"\e[00000000004;000000004Hs"
+expect reply b""
+write b"\e[00000000004;000000005H "
+expect reply b""
+write b"\e[00000000004;000000006Hi"
+expect reply b""
+write b"\e[00000000004;000000007Hs"
+expect reply b""
+write b"\e[00000000004;000000008H "
+expect reply b""
+write b"\e[00000000004;000000009Ha"
+expect reply b""
+write b"\e[00000000004;0000000010H "
+expect reply b""
+write b"\e[00000000004;0000000011Hc"
+expect reply b""
+write b"\e[00000000004;0000000012Ho"
+expect reply b""
+write b"\e[00000000004;0000000013Hr"
+expect reply b""
+write b"\e[00000000004;0000000014Hr"
+expect reply b""
+write b"\e[00000000004;0000000015He"
+expect reply b""
+write b"\e[00000000004;0000000016Hc"
+expect reply b""
+write b"\e[00000000004;0000000017Ht"
+expect reply b""
+write b"\e[00000000004;0000000018H "
+expect reply b""
+write b"\e[00000000004;0000000019Hs"
+expect reply b""
+write b"\e[00000000004;0000000020He"
+expect reply b""
+write b"\e[00000000004;0000000021Hn"
+expect reply b""
+write b"\e[00000000004;0000000022Ht"
+expect reply b""
+write b"\e[00000000004;0000000023He"
+expect reply b""
+write b"\e[00000000004;0000000024Hn"
+expect reply b""
+write b"\e[00000000004;0000000025Hc"
+expect reply b""
+write b"\e[00000000004;0000000026He"
+expect reply b""
+expect text 3 "This is a correct sentence                                                      "
+end
+
+case libvterm/90vttest-02-screen-1/output
+source "libvterm-0.3.3:t/90vttest_02-screen-1.test:15:Output"
+tags core
+size 25 80
+write b"\e[?7h"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"\e[?7l\e[3;1H"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"*"
+expect reply b""
+write b"\e[?7h\e[5;1HOK"
+expect reply b""
+expect text 0 "********************************************************************************"
+expect text 1 "********************************************************************************"
+expect text 2 "********************************************************************************"
+expect text 3 "                                                                                "
+expect text 4 "OK                                                                              "
+end
+
+case libvterm/90vttest-02-screen-2/output
+source "libvterm-0.3.3:t/90vttest_02-screen-2.test:25:Output"
+tags core
+size 25 80
+write b"\e[2J\e[3g"
+expect reply b""
+write b"\e[1;1H"
+expect reply b""
+write b"\e[3C\eH"
+expect reply b""
+write b"\e[3C\eH"
+expect reply b""
+write b"\e[3C\eH"
+expect reply b""
+write b"\e[3C\eH"
+expect reply b""
+write b"\e[3C\eH"
+expect reply b""
+write b"\e[3C\eH"
+expect reply b""
+write b"\e[3C\eH"
+expect reply b""
+write b"\e[3C\eH"
+expect reply b""
+write b"\e[3C\eH"
+expect reply b""
+write b"\e[3C\eH"
+expect reply b""
+write b"\e[3C\eH"
+expect reply b""
+write b"\e[3C\eH"
+expect reply b""
+write b"\e[3C\eH"
+expect reply b""
+write b"\e[3C\eH"
+expect reply b""
+write b"\e[3C\eH"
+expect reply b""
+write b"\e[3C\eH"
+expect reply b""
+write b"\e[3C\eH"
+expect reply b""
+write b"\e[3C\eH"
+expect reply b""
+write b"\e[3C\eH"
+expect reply b""
+write b"\e[3C\eH"
+expect reply b""
+write b"\e[3C\eH"
+expect reply b""
+write b"\e[3C\eH"
+expect reply b""
+write b"\e[3C\eH"
+expect reply b""
+write b"\e[3C\eH"
+expect reply b""
+write b"\e[3C\eH"
+expect reply b""
+write b"\e[3C\eH"
+expect reply b""
+write b"\e[1;4H"
+expect reply b""
+write b"\e[0g\e[6C"
+expect reply b""
+write b"\e[0g\e[6C"
+expect reply b""
+write b"\e[0g\e[6C"
+expect reply b""
+write b"\e[0g\e[6C"
+expect reply b""
+write b"\e[0g\e[6C"
+expect reply b""
+write b"\e[0g\e[6C"
+expect reply b""
+write b"\e[0g\e[6C"
+expect reply b""
+write b"\e[0g\e[6C"
+expect reply b""
+write b"\e[0g\e[6C"
+expect reply b""
+write b"\e[0g\e[6C"
+expect reply b""
+write b"\e[0g\e[6C"
+expect reply b""
+write b"\e[0g\e[6C"
+expect reply b""
+write b"\e[0g\e[6C"
+expect reply b""
+write b"\e[1;7H"
+expect reply b""
+write b"\e[1g\e[2g"
+expect reply b""
+write b"\e[1;1H"
+expect reply b""
+write b"\t*"
+expect reply b""
+write b"\t*"
+expect reply b""
+write b"\t*"
+expect reply b""
+write b"\t*"
+expect reply b""
+write b"\t*"
+expect reply b""
+write b"\t*"
+expect reply b""
+write b"\t*"
+expect reply b""
+write b"\t*"
+expect reply b""
+write b"\t*"
+expect reply b""
+write b"\t*"
+expect reply b""
+write b"\t*"
+expect reply b""
+write b"\t*"
+expect reply b""
+write b"\t*"
+expect reply b""
+write b"\e[2;2H"
+expect reply b""
+write b"     *"
+expect reply b""
+write b"     *"
+expect reply b""
+write b"     *"
+expect reply b""
+write b"     *"
+expect reply b""
+write b"     *"
+expect reply b""
+write b"     *"
+expect reply b""
+write b"     *"
+expect reply b""
+write b"     *"
+expect reply b""
+write b"     *"
+expect reply b""
+write b"     *"
+expect reply b""
+write b"     *"
+expect reply b""
+write b"     *"
+expect reply b""
+write b"     *"
+expect reply b""
+expect text 0 "      *     *     *     *     *     *     *     *     *     *     *     *     * "
+expect text 1 "      *     *     *     *     *     *     *     *     *     *     *     *     * "
+end
+
+case libvterm/90vttest-02-screen-3/output
+source "libvterm-0.3.3:t/90vttest_02-screen-3.test:14:Output"
+tags core
+size 25 80
+write b"\e[?6h"
+expect reply b""
+write b"\e[23;24r"
+expect reply b""
+write b"\n"
+expect reply b""
+write b"Bottom"
+expect reply b""
+write b"\e[1;1H"
+expect reply b""
+write b"Above"
+expect reply b""
+expect text 22 "Above                                                                           "
+expect text 23 "Bottom                                                                          "
+end
+
+case libvterm/90vttest-02-screen-4/output
+source "libvterm-0.3.3:t/90vttest_02-screen-4.test:14:Output"
+tags core
+size 25 80
+write b"\e[?6l"
+expect reply b""
+write b"\e[23;24r"
+expect reply b""
+write b"\e[24;1H"
+expect reply b""
+write b"Bottom"
+expect reply b""
+write b"\e[1;1H"
+expect reply b""
+write b"Top"
+expect reply b""
+expect text 0 "Top                                                                             "
+expect text 23 "Bottom                                                                          "
+end

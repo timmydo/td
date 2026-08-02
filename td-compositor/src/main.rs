@@ -11,6 +11,7 @@ mod scene;
 mod server;
 mod socket;
 mod sys;
+mod term;
 mod wire;
 
 use framebuffer::Framebuffer;
@@ -58,7 +59,7 @@ fn parse_run(args: &[String]) -> Result<RunOptions, String> {
             "--input" if input.is_none() => input = Some(PathBuf::from(value)),
             "--socket" if socket.is_none() => socket = Some(PathBuf::from(value)),
             "--framebuffer" | "--input" | "--socket" => {
-                return Err(format!("duplicate flag '{flag}'"))
+                return Err(format!("duplicate flag '{flag}'"));
             }
             _ => return Err(format!("unrecognised argument '{flag}'")),
         }
@@ -88,6 +89,8 @@ fn run_compositor(options: RunOptions) -> Result<(), String> {
 }
 
 fn selftest() -> Result<(), String> {
+    term::selftest()?;
+
     let mut payload = wire::Builder::new();
     payload.u32(7);
     let mut encoded = payload.message(1, 0)?;
@@ -227,8 +230,10 @@ mod confinement {
         ("scene.rs", include_str!("scene.rs")),
         ("server.rs", include_str!("server.rs")),
         ("socket.rs", include_str!("socket.rs")),
+        ("term.rs", include_str!("term.rs")),
         ("wire.rs", include_str!("wire.rs")),
     ];
+    const TEST_ONLY: &[(&str, &str)] = &[("term_spec.rs", include_str!("term_spec.rs"))];
 
     fn occurrences(source: &str, needle: &str) -> usize {
         source.match_indices(needle).count()
@@ -287,7 +292,7 @@ fn syscall3(number: usize, a1: usize, a2: usize, a3: usize) -> isize {
             assert!(SYS.contains(syscall), "{syscall}");
         }
         assert_eq!(occurrences(SYS, "const SYS_"), 3);
-        for (name, source) in OTHER {
+        for (name, source) in OTHER.iter().chain(TEST_ONLY) {
             assert!(
                 !source.contains("unsafe"),
                 "{name} introduced a second unsafe surface"
@@ -297,6 +302,40 @@ fn syscall3(number: usize, a1: usize, a2: usize, a3: usize) -> isize {
                 "{name} introduced another raw syscall body"
             );
         }
+    }
+
+    #[test]
+    fn test_only_module_inventory_matches_path_declarations() {
+        for (name, _) in TEST_ONLY {
+            let declaration = format!("#[path = \"{name}\"]");
+            assert!(
+                OTHER
+                    .iter()
+                    .any(|(_, source)| source.contains(&declaration)),
+                "{name} is not declared from an inventoried module"
+            );
+        }
+    }
+
+    #[test]
+    fn confinement_inventory_covers_every_source_file() {
+        let directory = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut actual = std::fs::read_dir(directory)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| path.extension().and_then(|value| value.to_str()) == Some("rs"))
+            .map(|path| path.file_name().unwrap().to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        actual.sort();
+        let mut inventoried = vec!["main.rs".to_string(), "sys.rs".to_string()];
+        inventoried.extend(
+            OTHER
+                .iter()
+                .chain(TEST_ONLY)
+                .map(|(name, _)| (*name).to_string()),
+        );
+        inventoried.sort();
+        assert_eq!(inventoried, actual);
     }
 
     #[test]
@@ -373,12 +412,14 @@ fn syscall3(number: usize, a1: usize, a2: usize, a3: usize) -> isize {
         ])
         .unwrap();
         assert_eq!(options.framebuffer, std::path::PathBuf::from("/dev/fb0"));
-        assert!(super::parse_run(&[
-            "--framebuffer".into(),
-            "/dev/fb0".into(),
-            "--socket".into(),
-            "/run/user/1000/wayland-0".into(),
-        ])
-        .is_err());
+        assert!(
+            super::parse_run(&[
+                "--framebuffer".into(),
+                "/dev/fb0".into(),
+                "--socket".into(),
+                "/run/user/1000/wayland-0".into(),
+            ])
+            .is_err()
+        );
     }
 }

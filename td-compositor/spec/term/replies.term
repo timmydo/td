@@ -1,0 +1,24 @@
+case replies/status-and-position
+source td
+tags core replies
+size 3 5
+write b"\e[2;3H\e[5n\e[6n"
+expect reply b"\e[0n\e[2;3R"
+end
+
+case replies/device-attributes
+source td
+tags core replies
+size 1 1
+write b"\e[c"
+expect reply b"\e[?1;0c"
+end
+
+case replies/origin-position-is-margin-relative
+source td
+tags core replies modes
+size 5 5
+write b"\e[2;4r\e[?6h\e[1;3H\e[6n"
+expect cursor 1 2
+expect reply b"\e[1;3R"
+end

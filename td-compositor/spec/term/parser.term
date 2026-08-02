@@ -1,0 +1,118 @@
+case parser/controls
+source td
+tags core
+size 2 5
+write b"abc"
+expect row 0 "abc  "
+expect cursor 0 3
+write b"\rZ"
+expect row 0 "Zbc  "
+expect cursor 0 1
+write b"\nQ"
+expect row 1 " Q   "
+expect cursor 1 2
+end
+
+case parser/split-csi
+source td
+tags core
+size 2 5
+write b"\e[2;3H@"
+expect row 1 "  @  "
+expect cursor 1 3
+end
+
+case parser/bounded-ignored-string
+source td
+tags core bounds
+size 1 5
+write b"A\e]0;ignored\x07B\ePignored\e\\C"
+expect row 0 "ABC  "
+end
+
+case parser/ignored-strings-accept-bel
+source td
+tags core bounds
+size 1 5
+write b"A\eXignored\x07B\ePignored\x07C\e_ignored\x07D\e^ignored\x07E"
+expect row 0 "ABCDE"
+expect cursor 0 4 pending-wrap
+end
+
+case parser/escape-aborts-ignored-string
+source td
+tags core bounds
+size 2 5
+write b"A\e]unterminated\e[2;3H@"
+expect row 0 "A    "
+expect row 1 "  @  "
+expect cursor 1 3
+end
+
+case parser/cancel-recovery
+source td
+tags core bounds
+size 1 5
+write b"\e[99;99\x18OK"
+expect row 0 "OK   "
+end
+
+case parser/dec-special-graphics
+source td
+tags core charset
+size 1 5
+write b"\e(0lqk\e(B"
+expect row 0 "┌─┐  "
+end
+
+case parser/dec-special-graphics-controls
+source td
+tags core charset
+size 1 5
+write b"\e(0_bcde"
+expect row 0 " ␉␌␍␊"
+end
+
+case parser/private-csi-is-a-separate-namespace
+source td
+tags core bounds
+size 2 5
+write b"\e[2;2H\e[?9A@"
+expect row 0 "     "
+expect row 1 " @   "
+expect cursor 1 2
+end
+
+case parser/charset-intermediates-are-consumed
+source td
+tags core charset bounds
+size 1 6
+write b"A\e((0X"
+expect row 0 "AX    "
+end
+
+case parser/charset-cancel-recovers
+source td
+tags core charset bounds
+size 1 5
+write b"\e(\x18OK"
+expect row 0 "OK   "
+end
+
+case parser/charset-escape-restarts
+source td
+tags core charset bounds
+size 2 6
+write b"A\e(\e[2;2H@"
+expect row 0 "A     "
+expect row 1 " @    "
+end
+
+case parser/c0-executes-inside-escape-and-csi
+source td
+tags core bounds
+size 1 6
+write b"A\e\x087XBC\e[\x08qY"
+expect row 0 "XBY   "
+expect cursor 0 3
+end

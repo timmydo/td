@@ -1,0 +1,80 @@
+case modes/alternate-screen-restores-primary
+source td
+tags core modes alternate-screen
+size 2 4
+write b"MAIN"
+expect cursor 0 3 pending-wrap
+write b"\e[?1049hALT"
+expect mode alternate-screen on
+expect row 0 "ALT "
+write b"\e[?1049l"
+expect mode alternate-screen off
+expect row 0 "MAIN"
+expect cursor 0 3 pending-wrap
+end
+
+case modes/autowrap-off-overwrites-margin
+source td
+tags core modes wrapping
+size 1 4
+write b"\e[?7lABCDE"
+expect mode autowrap off
+expect row 0 "ABCE"
+expect cursor 0 3
+end
+
+case modes/cursor-and-application-state
+source td
+tags core modes
+size 1 2
+write b"\e[?1h\e[?25l"
+expect mode application-cursor on
+expect mode cursor-visible off
+write b"\e[?1l\e[?25h"
+expect mode application-cursor off
+expect mode cursor-visible on
+end
+
+case modes/alternate-screen-restores-rendition
+source td
+tags core modes alternate-screen color
+size 1 3
+write b"\e[31mP\e[?1049hA"
+expect cell 0 0 "A" fg=indexed:1 bg=default attrs=none
+write b"\e[32mB\e[?1049lQ"
+expect cell 0 0 "P" fg=indexed:1 bg=default attrs=none
+expect cell 0 1 "Q" fg=indexed:1 bg=default attrs=none
+end
+
+case modes/save-and-restore-cursor-1048
+source td
+tags core modes
+size 3 4
+write b"\e[2;3H\e[?1048h\e[1;1H\e[?1048l"
+expect cursor 1 2
+end
+
+case modes/hidden-primary-resize-adds-no-history
+source td
+tags core modes alternate-screen resize
+size 4 4
+write b"A\e[2;1HB\e[3;1HC\e[4;1HD\e[?1049h"
+resize 2 4
+expect history 0
+write b"\e[?1049l"
+expect row 0 "C   "
+expect row 1 "D   "
+expect cursor 1 1
+expect history 0
+end
+
+case modes/alternate-ed3-clears-primary-history
+source td
+tags core modes alternate-screen editing
+size 1 2
+write b"ABCD"
+expect history 2
+write b"\e[?1049h\e[3J"
+expect mode alternate-screen on
+expect history 0
+end

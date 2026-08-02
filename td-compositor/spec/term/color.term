@@ -1,0 +1,48 @@
+# Cell rendition and color are observable state, not renderer policy.
+
+case color/indexed-and-rgb
+source td
+tags core color
+size 1 4
+write b"\e[1;4;38;5;196;48;2;1;2;3mX"
+expect cell 0 0 "X" fg=indexed:196 bg=rgb:010203 attrs=bold,underline
+write b"\e[0mY"
+expect cell 0 1 "Y" fg=default bg=default attrs=none
+end
+
+case color/bright-and-reset
+source td
+tags core color
+size 1 4
+write b"\e[94;103mA\e[39;49mB"
+expect cell 0 0 "A" fg=indexed:12 bg=indexed:11 attrs=none
+expect cell 0 1 "B" fg=default bg=default attrs=none
+end
+
+case color/incomplete-rgb-does-not-leak-operands
+source td
+tags core color
+size 1 1
+write b"\e[38;2;1;4mX"
+expect cell 0 0 "X" fg=default bg=default attrs=none
+end
+
+case color/erase-retains-only-colors
+source td
+tags core color editing
+size 1 2
+write b"\e[1;4;31;44mX\e[2K"
+expect cell 0 0 " " fg=indexed:1 bg=indexed:4 attrs=none
+expect cell 0 1 " " fg=indexed:1 bg=indexed:4 attrs=none
+end
+
+case color/ignored-color-forms-do-not-leak-operands
+source td
+tags core color bounds
+size 1 4
+write b"\e[58;2;1;4;7mA\e[58;5;9mB\e[38;9mC\e[38:2::1:2:3mD"
+expect cell 0 0 "A" fg=default bg=default attrs=none
+expect cell 0 1 "B" fg=default bg=default attrs=none
+expect cell 0 2 "C" fg=default bg=default attrs=none
+expect cell 0 3 "D" fg=default bg=default attrs=none
+end

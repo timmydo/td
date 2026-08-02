@@ -1,0 +1,4 @@
+# td-term conformance expectations overlay
+#
+# Generated semantic gaps for imported in-profile observations. Every xfail
+# still runs; unexpected passes, failures, duplicates, and stale entries red.

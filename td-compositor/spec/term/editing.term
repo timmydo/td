@@ -1,0 +1,89 @@
+case editing/characters
+source td
+tags core editing
+size 2 8
+write b"ABCDEF\e[1;3H\e[2@"
+expect row 0 "AB  CDEF"
+expect cursor 0 2
+write b"\e[2P"
+expect row 0 "ABCDEF  "
+write b"\e[2X"
+expect row 0 "AB  EF  "
+end
+
+case editing/scroll-region
+source td
+tags core editing
+size 4 4
+write b"1111\e[2;1H2222\e[3;1H3333\e[4;1H4444"
+write b"\e[2;4r\e[4;1H\n"
+expect row 0 "1111"
+expect row 1 "3333"
+expect row 2 "4444"
+expect row 3 "    "
+expect cursor 3 0
+end
+
+case editing/insert-and-delete-lines
+source td
+tags core editing
+size 4 4
+write b"aaaa\e[2;1Hbbbb\e[3;1Hcccc\e[4;1Hdddd"
+write b"\e[2;3H\e[L"
+expect row 0 "aaaa"
+expect row 1 "    "
+expect row 2 "bbbb"
+expect row 3 "cccc"
+expect cursor 1 2
+write b"\e[2;3H\e[M"
+expect row 1 "bbbb"
+expect row 2 "cccc"
+expect row 3 "    "
+expect cursor 1 2
+end
+
+case editing/repeat-and-tabs-are-screen-bounded
+source td
+tags core editing bounds
+size 1 8
+write b"A\e[65535b"
+expect row 0 "AAAAAAAA"
+expect cursor 0 7 pending-wrap
+write b"\r\e[65535I"
+expect cursor 0 7
+end
+
+case editing/scroll-region-clamps-bottom
+source td
+tags core editing bounds
+size 5 4
+write b"\e[5;3H\e[2;65535r"
+expect cursor 0 0
+end
+
+case editing/rejects-single-line-scroll-region
+source td
+tags core editing bounds
+size 4 4
+write b"\e[4;3H\e[2;2r"
+expect cursor 3 2
+end
+
+case editing/ed3-preserves-pending-wrap
+source td
+tags core editing wrapping
+size 1 2
+write b"AB\e[3J"
+expect cursor 0 1 pending-wrap
+write b"C"
+expect row 0 "C "
+expect history 2
+end
+
+case editing/zero-bottom-resets-scroll-region
+source td
+tags core editing bounds
+size 5 4
+write b"\e[2;4r\e[4;3H\e[1;0r"
+expect cursor 0 0
+end
