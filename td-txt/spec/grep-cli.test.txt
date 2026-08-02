@@ -3548,11 +3548,11 @@ abc
 ## stdout-json: ""
 ## status: 2
 
-# The brace half of this rule stops short of GNU: a LITERAL brace that is itself
-# followed by another dropped token refuses there and compiles here. Same axis as
-# the empty-brace entry in ../spec/README, and pre-existing.
+# A second literal brace behind the first is refused alike, the state surviving
+# the first so the second meets the paren with nothing to repeat. The operators a
+# brace carries are refused with it, the eat reaching past them.
 
-#### a literal brace before another one refuses in grep, which td compiles
+#### a literal brace before another one is refused for the second one's paren
 ## argv: grep -Ec '({{)'
 ## stdin-json: "a\n"
 ## stdout-json: ""
@@ -3576,7 +3576,7 @@ abc
 ## stdout-json: ""
 ## status: 2
 
-#### yet the operator plainly APPLIED to that brace, which is why no rule fits
+#### yet the operator plainly APPLIED to that brace, which is the inconsistency
 ## argv: grep -Ec '({*a)'
 ## stdin-json: "a\n"
 ## stdout-json: "1\n"
@@ -3742,3 +3742,343 @@ abc
 ## stdout-json: "0\n"
 ## stderr-json: ""
 ## status: 1
+
+# An unusable brace -- one that CLOSES on content no interval can have, `{}` and
+# `{2,1}` -- is the text it is while there is nothing to repeat, and the complaint
+# about its content once there is. grep's ERE carries that "nothing to repeat"
+# state past an anchor, an assertion, a dropped operator and a brace it could not
+# read as an interval, so `^{}`, `\b{}` and `{{}` all compile where `a{}` and
+# `{}{}` do not. A VALID interval ends the state even though it may be dropped,
+# which is the asymmetry no reading predicts: `^{2}{}` is the error `^{}` is not.
+# It ends it only until the next assertion, not for the branch -- the cases below
+# `an assertion establishes the state` carry that half. A brace that never closes
+# at all rewinds to text on its own and needs none of this.
+
+#### an unusable brace at a branch start is the text it is, as it always was
+## argv: grep -c -E '{}'
+## stdin-json: "a\n{}\n{}a\n"
+## stdout-json: "2\n"
+## status: 0
+
+#### and an ANCHOR leaves it nothing to repeat, so it stays text there
+## argv: grep -c -E '^{}'
+## stdin-json: "a\n{}\n{}a\nx{}\n"
+## stdout-json: "2\n"
+## status: 0
+
+#### which is what it selects, the anchor still anchoring
+## argv: grep -n -E '^{}'
+## stdin-json: "a\n{}\n{}a\nx{}\n"
+## stdout-json: "2:{}\n3:{}a\n"
+## status: 0
+
+#### an END anchor does it too
+## argv: grep -c -E '${}'
+## stdin-json: "a\n{}\n"
+## stdout-json: "0\n"
+## status: 1
+
+#### as does an assertion
+## argv: grep -c -E '\b{}'
+## stdin-json: "a\n{}\na{}\n"
+## stdout-json: "1\n"
+## status: 0
+
+#### and the other assertions with it
+## argv: grep -c -E '\B{}'
+## stdin-json: "a\n{}\na{}\n"
+## stdout-json: "1\n"
+## status: 0
+
+#### including one whose operator was dropped
+## argv: grep -c -E '\b*{}'
+## stdin-json: "a\n{}\na{}\n"
+## stdout-json: "2\n"
+## status: 0
+
+#### and an operator dropped at the branch start with no assertion at all
+## argv: grep -c -E '*{}'
+## stdin-json: "a\n{}\n"
+## stdout-json: "1\n"
+## status: 0
+
+#### a brace GNU could not read as an interval leaves nothing to repeat as well
+## argv: grep -c -E '{{}'
+## stdin-json: "a\n{}\n{{}\n"
+## stdout-json: "1\n"
+## status: 0
+
+#### which is the text it selects
+## argv: grep -n -E '{{}'
+## stdin-json: "a\n{}\n{{}\n"
+## stdout-json: "3:{{}\n"
+## status: 0
+
+#### and a RUN of them keeps it, however long
+## argv: grep -c -E '{{{{}'
+## stdin-json: "a\n{{{{}\n"
+## stdout-json: "1\n"
+## status: 0
+
+#### a `}` is an ordinary atom, so it ends the state
+## argv: grep -c -E '}{}'
+## stdin-json: "a\n"
+## stdout-json: ""
+## stderr-contains: Invalid content of \{\}
+## status: 2
+
+#### which is why a COMPLETE brace pair does, ending on one
+## argv: grep -c -E '{}{}'
+## stdin-json: "a\n"
+## stdout-json: ""
+## stderr-contains: Invalid content of \{\}
+## status: 2
+
+#### an ordinary atom ends it, as it always did
+## argv: grep -c -E 'a{}'
+## stdin-json: "a\n"
+## stdout-json: ""
+## stderr-contains: Invalid content of \{\}
+## status: 2
+
+#### and so does a group, empty or not
+## argv: grep -c -E '(){}'
+## stdin-json: "a\n"
+## stdout-json: ""
+## stderr-contains: Invalid content of \{\}
+## status: 2
+
+#### the one with something in it as much as the empty one
+## argv: grep -c -E '(a){}'
+## stdin-json: "a\n"
+## stdout-json: ""
+## stderr-contains: Invalid content of \{\}
+## status: 2
+
+#### a VALID interval ends it, though it is itself dropped
+## argv: grep -c -E '{2}{}a'
+## stdin-json: "a\n"
+## stdout-json: ""
+## stderr-contains: Invalid content of \{\}
+## status: 2
+
+#### even where an anchor had just established the state
+## argv: grep -c -E '^{2}{}'
+## stdin-json: "a\n"
+## stdout-json: ""
+## stderr-contains: Invalid content of \{\}
+## status: 2
+
+#### in every spelling of the interval
+## argv: grep -c -E '{2,}{}'
+## stdin-json: "a\n"
+## stdout-json: ""
+## stderr-contains: Invalid content of \{\}
+## status: 2
+
+#### but only across the branch that saw it
+## argv: grep -c -E '{2}a|^{}'
+## stdin-json: "a\n{}\n"
+## stdout-json: "2\n"
+## status: 0
+
+#### a brace that never CLOSES needs none of this, rewinding to text on its own
+## argv: grep -c -E '{2}{'
+## stdin-json: "a\n{\n"
+## stdout-json: "1\n"
+## status: 0
+
+#### the other unusable brace answers alike
+## argv: grep -c -E '^{2,1}'
+## stdin-json: "a\n{2,1}\n"
+## stdout-json: "1\n"
+## status: 0
+
+#### against the ordinary atom that refuses it
+## argv: grep -c -E 'a{2,1}'
+## stdin-json: "a\n"
+## stdout-json: ""
+## stderr-contains: Invalid content of \{\}
+## status: 2
+
+#### and sed's ERE refuses the lot, its braces always opening an interval
+## argv: sed -nE 's/^{}/X/p'
+## stdin-json: "a\n{}\n"
+## stdout-json: ""
+## stderr-contains: Invalid preceding regular expression
+## status: 1
+
+#### its BRE reading a brace as the text grep's does
+## argv: sed -n 's/^{}/X/p'
+## stdin-json: "a\n{}\n"
+## stdout-json: "X\n"
+## status: 0
+
+#### where a grep BRE reads a brace as text wherever it sits
+## argv: grep -c '^{}'
+## stdin-json: "a\n{}\n"
+## stdout-json: "1\n"
+## status: 0
+
+# The operators the brace carries ride along with its eat: `({*)` goes the way
+# `({)` does, and so do the other two and any run of them. They are NOT dropped,
+# which is what the selections below hold -- `{*a` still repeats the brace, and
+# `{{*a` repeats only the second, the first being ordinary text. An earlier draft
+# of this landing read the refusal as evidence the operator HAD been dropped,
+# concluded that no one parse could both refuse `({*)` and repeat the brace, and
+# wrote that into ../spec/README as a proof. It was a false dichotomy: `({)` is
+# refused with no operator in the pattern at all, so an eaten paren never needed
+# one. A reviewer supplied the parse and it closes the family.
+
+#### the operator is not dropped, this selecting a line with no brace at all
+## argv: grep -n -E '{*a'
+## stdin-json: "a\n{a\n{{a\n"
+## stdout-json: "1:a\n2:{a\n3:{{a\n"
+## status: 0
+
+#### and repeats only the brace it follows, which is what tells the two apart
+## argv: grep -n -E '{{*a'
+## stdin-json: "a\n{a\n{{a\n"
+## stdout-json: "2:{a\n3:{{a\n"
+## status: 0
+
+#### while the same operator against a `)` is refused, the brace eating it
+## argv: grep -c -E '({*)'
+## stdin-json: "a\n"
+## stdout-json: ""
+## stderr-contains: Unmatched ( or \(
+## status: 2
+
+#### and one more paren compiles it, which is what an eaten paren predicts
+## argv: grep -c -E '({*))'
+## stdin-json: "a\n"
+## stdout-json: "0\n"
+## status: 1
+
+# An ASSERTION establishes that state rather than merely keeping it, which is the
+# half a first draft of this rule had wrong: it tracked a flag that could only be
+# lost, so `a\b{}` was refused here and is text in grep. Anchors and assertions
+# set it wherever they stand -- after an atom, a group, or an interval -- an
+# operator leaves it alone, and an INTERVAL ends it whether it was applied or
+# dropped. The last of them to speak decides.
+
+#### an assertion establishes the state wherever it stands, not only at a start
+## argv: grep -n -E 'a\b{}'
+## stdin-json: "a{}\n{}\naa\n"
+## stdout-json: "1:a{}\n"
+## status: 0
+
+#### which an anchor does too, mid-pattern
+## argv: grep -c -E 'a${}'
+## stdin-json: "a{}\n{}\n"
+## stdout-json: "0\n"
+## status: 1
+
+#### and one whose operator was dropped, the operator leaving the state alone
+## argv: grep -c -E 'a\b*{}'
+## stdin-json: "a{}\n{}\naa\n"
+## stdout-json: "1\n"
+## status: 0
+
+#### after a GROUP as readily as after an atom
+## argv: grep -c -E '(a)\b{}'
+## stdin-json: "a{}\n{}\n"
+## stdout-json: "1\n"
+## status: 0
+
+#### and after an interval, which the assertion undoes
+## argv: grep -c -E 'a{2}\b{}'
+## stdin-json: "aa{}\n{}\n"
+## stdout-json: "1\n"
+## status: 0
+
+#### where the interval BEHIND the assertion still ends it
+## argv: grep -c -E '\b{2}{}'
+## stdin-json: "a\n"
+## stdout-json: ""
+## stderr-contains: Invalid content of \{\}
+## status: 2
+
+#### so the two compose, the last of them deciding
+## argv: grep -c -E '\b{2}\b{}'
+## stdin-json: "a{}\n{}\n"
+## stdout-json: "1\n"
+## status: 0
+
+#### an ordinary atom after the assertion ends it again
+## argv: grep -c -E '\ba{}'
+## stdin-json: "a\n"
+## stdout-json: ""
+## stderr-contains: Invalid content of \{\}
+## status: 2
+
+
+# A BACKREFERENCE anywhere in the pattern reads the whole of it glibc's way, the
+# split recorded in ../spec/README, and a brace this rule newly accepts is read
+# there too. One xfail with its control beside it: drop the anchor and the two
+# agree again, so it is the anchored brace glibc reads differently and not the
+# alternation.
+
+#### a backreference in ANOTHER branch reads the whole pattern glibc's way
+## argv: grep -c -E '(a)\1|^{}'
+## stdin-json: "aa\n{}\n{}a\n"
+## stdout-json: "1\n"
+## status: 0
+
+#### where the same alternation without the anchor agrees
+## argv: grep -c -E '(a)\1|{}'
+## stdin-json: "aa\n{}\n{}a\n"
+## stdout-json: "3\n"
+## status: 0
+
+# The rule lands on the dfa side, which the corpus pins, so it widens the recorded
+# `-o`-versus-`-c` split to a whole new family: grep counts these lines and then
+# its own `-o` selects nothing in them. One xfail with the count beside it.
+
+#### the count grep answers from its dfa, which td-txt matches
+## argv: grep -cE '^{}'
+## stdin-json: "a\n{}\n{}a\nx{}\n"
+## stdout-json: "2\n"
+## status: 0
+
+#### where its -o, reading glibc, selects nothing in those same lines
+## argv: grep -oE '^{}'
+## stdin-json: "a\n{}\n{}a\nx{}\n"
+## stdout-json: ""
+## status: 0
+
+# The eat reads that same state, so an ASSERTION re-arms it for the whole run of
+# braces behind it rather than only the one it touches. A first draft routed the
+# eat through `first`, which cannot be re-established, and these four are what
+# showed it.
+
+#### an assertion re-arms the eat for the braces behind it, not just the first
+## argv: grep -c -E '(a\b{{*)'
+## stdin-json: "a{{\na\n"
+## stdout-json: ""
+## stderr-contains: Unmatched ( or \(
+## status: 2
+
+
+#### with no operator to carry either
+## argv: grep -c -E '(a\b{{)'
+## stdin-json: "a{{\na\n"
+## stdout-json: ""
+## stderr-contains: Unmatched ( or \(
+## status: 2
+
+
+#### and an interval between them does not survive the assertion
+## argv: grep -c -E '(\b{2}\b{{*)'
+## stdin-json: "a{{\na\n"
+## stdout-json: ""
+## stderr-contains: Unmatched ( or \(
+## status: 2
+
+
+#### where without the assertion there is nothing to re-arm it
+## argv: grep -c -E '(a{{*)'
+## stdin-json: "a{{\na\n"
+## stdout-json: "1\n"
+## status: 0
+

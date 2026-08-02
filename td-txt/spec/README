@@ -518,6 +518,38 @@ td-txt-authored case files
   this paragraph said -- differential fuzzing against the oracle is what produced
   the counterexample.
 
+  All of that turns on the NOTHING-TO-REPEAT state, and where it holds is a rule
+  of its own with a second consequence. An unusable brace -- one that CLOSES on
+  content no interval can have, `{}` and `{2,1}` -- is the text it is while that
+  state holds, and the complaint about its content once it does not. So `{}` and
+  `a{}` differ, and the state is what says which a pattern gets.
+
+  It is decided by the token just before the brace, and only that one. An
+  ASSERTION or ANCHOR ESTABLISHES it wherever it stands, which is the part that
+  reads as preservation and is not: `a\b{}` is text though `a{}` is a complaint,
+  and so are `a${}`, `(a)\b{}` and `a{2}\b{}` -- after an atom, after a group,
+  after an interval alike. `*`/`+`/`?` leave it alone, applied to an assertion or
+  dropped at a branch start (`\b*{}`, `*{}`). A brace already made text PRESERVES
+  it without establishing it, so `{{}` compiles and a run does too (`{{{{}`)
+  while `a{{}` does not. Everything else ends it: an ordinary atom (`a{}`,
+  `\ba{}`), a group (`(){}`), a `}` -- an ordinary atom like any other, which is
+  why `}{}` refuses and therefore `{}{}` does, a complete pair ending on one.
+
+  A VALID interval ends it too although it may be dropped, and that is the
+  asymmetry no reading predicts: `{2}{}a` is `Invalid content of \{\}` where
+  `{}a` compiles, `^{2}{}` and `\b{2}{}` are errors where `^{}` and `\b{}` are
+  not, and every spelling does it (`{2,}{}`). But it ends it only until the next
+  assertion, not for the branch: `\b{2}\b{}` and `a{2}\b{}` compile. An earlier
+  draft of this entry said "for the rest of the branch" and tracked a latch to
+  match; a reviewer's `a\b{}` is what showed the state has no memory at all.
+  A brace that never CLOSES needs none of this and rewinds to text on its own,
+  which is why `{2}{` compiles where `{2}{}` does not.
+
+  This is grep's ERE alone. Its BRE reads a brace as text wherever it sits, and
+  sed's ERE refuses the lot, a brace there always opening an interval -- so
+  `sed -E 's/^{}/X/p'` is `Invalid preceding regular expression` while the BRE
+  spelling substitutes. Both are cases rather than left to the reader.
+
   Two more places sed's ERE is the strict one where grep's reads TEXT, both
   turning on the same `strict_repeats` flag. A `{` in sed's ERE always opens an
   interval, so an unusable one is an error and never a literal: with nothing to
@@ -681,35 +713,41 @@ td-txt-authored case files
     refutes it). Recorded rather than guessed at, because a fourth reading fitted
     to two more probes would be the mistake this file already records once.
 
-  - What grep does with an EMPTY brace that has something before it, where the
-    something was itself dropped or literal. `grep -E '^{}'` and `-E '{{}'`
-    compile there and are `Invalid content of \{\}` here, while `-E '{2}{}a'` is
-    the reverse -- GNU refuses it and td-txt compiles. `{}` alone, `{}a`, `({})`,
-    `{}$`, `a{}`, `x{}` and `{}{}` all agree, so it is not the empty brace itself
-    but what a DROPPED leading token leaves behind for the next one to repeat: an
-    anchor and a literal brace count as nothing to GNU and as something here, and
-    a dropped interval is the other way round. Three xfail cases. Grep-side and
-    pre-existing; the sed half of the same axis is modelled above.
+  - Nothing here now: the literal-brace family this entry described is closed,
+    and the shape of getting there is the entry's remaining value.
 
-  - A LITERAL brace at a branch start with another token behind it, reaching a
-    `)`. `({{)`, `({*)`, `({+)`, `({?)`, `(\b{*)`, `({**)`, `(|{*)` and `({*)a`
-    are `Unmatched ( or \(` in grep and compile here, where `({)` -- one brace
-    against the paren -- now agrees, and so do `({}{)`, `({{a)` and `({*|a)`.
-    There is no model, and one probe shows why a drop cannot be it: `({*a)`
-    MATCHES a bare `a`, so the `*` did apply to the literal `{` rather than being
-    dropped, which leaves nothing for the refusal in `({*)` to be about. Same
-    axis as the empty-brace entry above -- what a leading token leaves behind for
-    the next one to repeat -- and pre-existing, the parent binary answering
-    identically. Four xfail cases.
+    The brace against a `)` was closed by the eaten-paren rule; the OPERATOR
+    after it looked unclosable, and a draft of that landing wrote a proof into
+    this file saying so. The proof ran: refusing `({*)` requires the `*` to be
+    DROPPED so that it eats the paren, and grep's own selections say it was not
+    dropped, since `{*a` selects a bare `a` and `{{*a` repeats only the second
+    brace -- so no one parse does both, and grep manages only by answering the
+    refusal and the selection from different engines. Every measurement in it was
+    right and the conclusion was wrong, because the first step is a false
+    dichotomy: an eaten paren never needed a dropped operator. `({)` is refused
+    with no operator in the pattern at all, by the rule three paragraphs up. The
+    parse that does everything at once is the brace's own eat reaching PAST the
+    operators it carries -- `({*)` going the way `({)` does -- while those
+    operators still repeat it. A reviewer built it, put 55,986 exhaustive
+    patterns over `( ) { } * a` through it at zero disagreements, and six xfails
+    went with it.
 
-    The SIZE of this family is a method note rather than a number. The campaign
-    fuzzer put 1708 patterns through it and found thirteen shapes; a reviewer's
+    Two lessons, and the first is not "measure more". Every probe behind that
+    proof was sound; what failed was reaching a NEGATIVE conclusion from them
+    without asking what else the file already did. The rule that refuted it was
+    forty lines above the one being reasoned about. The second is about how such
+    a claim should be written: "cannot be closed" is a claim about all parses,
+    and a gap entry has no way to check one. Prefer recording what was measured
+    and what was tried.
+
+    The SIZE of this family was a method note and stays one. The campaign fuzzer
+    put 1708 patterns through it and found thirteen shapes; a reviewer's
     generator, crossing the same tokens to depth four, reached `({+)`, `({?)`,
-    `(\b{*)` and more that the first grammar could not spell. Twice now this file
-    has recorded that a generator only covers the shapes its grammar produces,
-    and this is the first time the correction came from someone else's grammar
-    rather than from reading. Do not read thirteen as the count of anything but
-    what one grammar emitted.
+    `(\b{*)` and more that the first grammar could not spell. Twice this file had
+    recorded that a generator only covers the shapes its grammar produces, and
+    that was the first time the correction came from someone else's grammar
+    rather than from reading. Do not read any of these counts as the count of
+    anything but what one grammar emitted.
 
     That lesson then repeated inside one landing, which is worth the extra line.
     The charge-once rule above was got wrong first, and FOUR generators run
@@ -757,7 +795,11 @@ td-txt-authored case files
     in the sed-BRE grid, the other three dialects being 0 of 2400 each.
 
   - A BACKREFERENCE anywhere in a grep pattern, which switches the whole of it to
-    glibc's reading -- that is, to sed's. `grep '\(.\)\1*\b*'` selects exactly
+    glibc's reading -- that is, to sed's. It reaches the brace rule above too:
+    `(a)\1|^{}` selects one line of `aa`/`{}`/`{}a` in grep and three here,
+    though `(a)\1|{}` -- the same alternation with the anchor dropped -- agrees
+    at three, so it is the anchored brace glibc reads differently. One xfail with
+    that control beside it. `grep '\(.\)\1*\b*'` selects exactly
     what `sed 's|\(.\)\1*\b*|[&]|'` marks, while the same pattern WITHOUT the
     `\1` selects every line, the repeat reading modelled above. The minimal
     witness is `grep '\(a\)\1\b*'` on `aa`, which GNU does not select and
@@ -765,8 +807,10 @@ td-txt-authored case files
     dfa.c and glibc per PATTERN, and the same split shows up per INVOCATION:
     `grep -o` uses glibc where `-c` and `-q` use the dfa, so GNU itself answers
     `-c '\b*a'` and `-o '\b*a'` differently on `xab` -- the corpus pins `-c`,
-    and td-txt, having one engine, cannot satisfy both. Five cases carry the
-    goldens, two of them a DROPPED INTERVAL, where the disagreement is with
+    and td-txt, having one engine, cannot satisfy both. The brace rule above
+    lands on the dfa side too, so this split now covers that whole family --
+    grep counts the lines of `^{}` and its own `-o` selects nothing in them.
+    Seven cases carry the goldens, two of them a DROPPED INTERVAL, where the disagreement is with
     itself and plain: on `2a`/`{2}a`/`a`, GNU counts all three lines for `{2}a`
     and its `-o` finds one occurrence in the file. A reviewer read this as
     something the group rule had newly exposed, since `({2}*)a` compiles only

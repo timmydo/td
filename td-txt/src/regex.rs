@@ -374,21 +374,36 @@ impl<'a> Parser<'a> {
     ///
     /// `op` says an operator was dropped; a brace left with nothing to repeat
     /// eats one without an operator at all (`({)`, `(\b*{)`, but not `({a)` or
-    /// `(a{)`). A valid INTERVAL earlier in the branch stops a bare operator and
-    /// a brace eating anything (`({2}*)`, `(*{2})`, `({2}{)`), but not an
-    /// assertion's own operator (`({2}\b*)` still eats) -- so the assertion site
-    /// passes `interval: false`.
+    /// `(a{)`). `repeatable` says something an operator could repeat stands here,
+    /// which stops the eat: an INTERVAL puts it there even when dropped
+    /// (`({2}*)`, `(*{2})`, `({2}{)`), and an assertion takes it away again, so
+    /// `({2}\b*)` eats. It is the same per-token state the brace rule reads,
+    /// which is why one assertion re-arms both -- `(a\b{{*)` is refused where
+    /// `(a{{*)` is not.
     ///
     /// Depth is NOT a condition, and that is the whole of why `(*)\b*)` is
     /// refused where `(*))` compiles: the second drop eats the paren the group
     /// was still waiting for, at depth 0 as readily as inside.
-    fn drop_eats_paren(&self, at: usize, op: bool, interval: bool) -> Option<usize> {
-        if !self.opts.ere || self.opts.strict_repeats || interval {
+    fn drop_eats_paren(&self, at: usize, op: bool, repeatable: bool) -> Option<usize> {
+        if !self.opts.ere || self.opts.strict_repeats || repeatable {
             return None;
         }
-        match (self.pat.get(at), self.pat.get(at + 1)) {
-            (Some(&b'{'), Some(&b')')) => Some(at + 1),
-            (Some(&b')'), _) if op => Some(at),
+        match self.pat.get(at) {
+            // A brace with nothing to repeat eats the paren behind it, and the
+            // operators it DOES carry ride along: `({*)` and `({**)` go the way
+            // `({)` does. They are not dropped -- `{*a` still repeats the brace --
+            // so this is the brace's own eat reaching past them, not theirs.
+            Some(&b'{') => {
+                let mut i = at + 1;
+                while matches!(self.pat.get(i), Some(b'*' | b'+' | b'?')) {
+                    i += 1;
+                }
+                match self.pat.get(i) {
+                    Some(&b')') => Some(i),
+                    _ => None,
+                }
+            }
+            Some(&b')') if op => Some(at),
             _ => None,
         }
     }
@@ -434,8 +449,11 @@ impl<'a> Parser<'a> {
 
     fn parse_concat(&mut self, depth: usize) -> Result<Node, Error> {
         let mut items: Vec<Node> = Vec::new();
-        // Per BRANCH, not per pattern: `parse_alt` calls this once for each.
-        let mut saw_interval = false;
+        // Whether grep's ERE would read an unusable brace here as TEXT. Distinct
+        // from `first`, which BRE and sed also read: an ASSERTION establishes this
+        // state wherever it stands, so `a\b{}` is text where `a{}` is a complaint
+        // about content, and `first` -- which can only be lost -- cannot say that.
+        let mut brace_text = true;
         // In BRE a repetition operator has nothing to repeat at the start of a
         // branch, so it is a LITERAL there — and a leading `^` anchor does not
         // give it one: `^*` matches a line starting with `*`, not every line.
@@ -500,17 +518,23 @@ impl<'a> Parser<'a> {
                         match self.parse_interval() {
                             Ok(Some(_)) => {
                                 dropped = true;
-                                saw_interval = true;
+                                // Dropped, and it still ends the state: `{2}{}`
+                                // complains where `{}` and `*{}` do not.
+                                brace_text = false;
                                 continue;
                             }
                             Ok(None) => {}
-                            Err(e) if e.msg == TOO_BIG => return Err(e),
+                            // A brace that closes on bad content is the text it is
+                            // while there is nothing to repeat, and the complaint it
+                            // is once something to repeat has appeared: `{}` and
+                            // `*{}` compile, `{2}{}` does not.
+                            Err(e) if e.msg == TOO_BIG || !brace_text => return Err(e),
                             Err(_) => self.pos = save,
                         }
                         break;
                     }
                     if let Some(close) =
-                        self.drop_eats_paren(self.pos, dropped_op, saw_interval)
+                        self.drop_eats_paren(self.pos, dropped_op, !brace_text)
                     {
                         self.eat_paren(close, depth);
                     }
@@ -520,6 +544,13 @@ impl<'a> Parser<'a> {
                     }
                 }
             }
+            // grep's ERE carries its nothing-to-repeat state past a brace it could
+            // not read as an interval, exactly as it does past an assertion, so a
+            // run of them keeps it: `{{{{}` compiles. Reaching `parse_atom` with a
+            // `{` ahead is itself the test -- a brace that opened an interval was
+            // consumed as one long before this.
+            let brace_lit =
+                self.opts.ere && !self.opts.strict_repeats && self.peek() == Some(b'{');
             let atom = self.parse_atom(depth, first, bol_ok)?;
             // An assertion is not something to repeat, so it does not give a
             // following operator one either. In a BRE that makes the operator a
@@ -540,16 +571,29 @@ impl<'a> Parser<'a> {
                     self.eat_paren(close, depth);
                 }
             }
+            // A brace reached with nothing to repeat eats the paren behind it
+            // wherever it stands, not only at a branch start: `(a\b{{*)` is
+            // refused, the assertion having re-armed the state for the run of
+            // braces after it, where `(a{{*)` has nothing to re-arm it.
+            if brace_lit && brace_text {
+                if let Some(close) = self.drop_eats_paren(self.pos, false, false) {
+                    self.eat_paren(close, depth);
+                }
+            }
             let bare = assertion && !self.opts.ere && (self.opts.strict_repeats || first);
             let atom = match bare {
                 true => atom,
                 false => {
-                    let (atom, interval) = self.parse_repeats(atom)?;
-                    saw_interval = saw_interval || interval;
+                    // The state this atom leaves: an assertion ESTABLISHES it, a
+                    // brace already text only preserves it, anything else ends it.
+                    let after = assertion || (brace_text && brace_lit);
+                    let ere_text = after && self.opts.ere && !self.opts.strict_repeats;
+                    let (atom, interval) = self.parse_repeats(atom, ere_text)?;
+                    brace_text = after && !interval;
                     atom
                 }
             };
-            first = first && assertion;
+            first = first && (assertion || brace_lit);
             bol_ok = false;
             items.push(atom);
         }
@@ -562,7 +606,12 @@ impl<'a> Parser<'a> {
 
     /// The next postfix repetition operator, consumed. `None` when what follows is
     /// not one in this dialect.
-    fn next_op(&mut self) -> Result<Option<Op>, Error> {
+    /// `brace_literal` says grep's ERE has nothing to repeat here, where a brace
+    /// that CLOSES on bad content is the text it is rather than a complaint about
+    /// it -- `^{}` and `{{}` compile where `a{}` does not. A brace that never
+    /// closes already rewinds itself in `parse_interval`, which is why `{2}{`
+    /// needs none of this.
+    fn next_op(&mut self, brace_literal: bool) -> Result<Option<Op>, Error> {
         if self.peek() == Some(b'*') {
             self.pos += 1;
             return Ok(Some(Op::Star));
@@ -590,9 +639,17 @@ impl<'a> Parser<'a> {
                 _ => {}
             }
         }
-        match self.parse_interval()? {
-            Some((min, max)) => Ok(Some(Op::Interval(min, max))),
-            None => Ok(None),
+        let save = self.pos;
+        match self.parse_interval() {
+            Ok(Some((min, max))) => Ok(Some(Op::Interval(min, max))),
+            Ok(None) => Ok(None),
+            // A size limit is not a complaint about content and stands either way,
+            // as it does at a branch start.
+            Err(e) if !brace_literal || e.msg == TOO_BIG => Err(e),
+            Err(_) => {
+                self.pos = save;
+                Ok(None)
+            }
         }
     }
 
@@ -620,7 +677,11 @@ impl<'a> Parser<'a> {
     /// before the call.
     /// The bool reports a valid INTERVAL among the operators consumed, which is
     /// what stops `drop_eats_paren` eating for the rest of the branch.
-    fn parse_repeats(&mut self, mut atom: Node) -> Result<(Node, bool), Error> {
+    fn parse_repeats(
+        &mut self,
+        mut atom: Node,
+        brace_literal: bool,
+    ) -> Result<(Node, bool), Error> {
         let zero_width = is_assertion(&atom);
         // A brace on an assertion has nothing to repeat, and sed reports THAT
         // before it reads the brace at all: `-E '^{}'`, `-E '^{2,1}'` and even
@@ -631,8 +692,14 @@ impl<'a> Parser<'a> {
         }
         let mut repeated = false;
         let mut interval = false;
-        while let Some(op) = self.next_op()? {
+        // An INTERVAL ends the nothing-to-repeat state as it is consumed, so a
+        // second brace behind it is judged with the state it leaves, not the one
+        // it found: `\b{2}{}` is the complaint `\b{}` is not. `*`/`+`/`?` leave
+        // the state alone, which is why `\b*{}` stays text.
+        let mut brace_literal = brace_literal;
+        while let Some(op) = self.next_op(brace_literal)? {
             interval = interval || matches!(op, Op::Interval(..));
+            brace_literal = brace_literal && !interval;
             let stacked = match op {
                 Op::Star => (self.opts.ere && zero_width) || (!self.opts.ere && repeated),
                 Op::Plus | Op::Quest => self.opts.ere && zero_width,
