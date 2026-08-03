@@ -101,16 +101,11 @@ fn write_atomic(dst: &Path, bytes: &[u8]) -> Result<(), String> {
     std::fs::rename(&tmp, dst).map_err(|e| format!("rename {}: {e}", dst.display()))
 }
 
-/// GET `url` (http/https), returning the body or an error string.
+/// GET `url` (http/https), returning the body or an error string. Carries the shared
+/// read timeout + bounded retry (`http`) — warming a cold source set is exactly where
+/// one silent peer used to stall the whole ladder climb.
 fn try_get(url: &str) -> Result<Vec<u8>, String> {
-    let resp = ureq::get(url)
-        .call()
-        .map_err(|e| format!("GET {url}: {e}"))?;
-    let mut body = Vec::new();
-    resp.into_reader()
-        .read_to_end(&mut body)
-        .map_err(|e| format!("read {url}: {e}"))?;
-    Ok(body)
+    crate::http::get_body(url)
 }
 
 /// Warm one entry into `store` (+ its sidecar); Ok(true) if fetched, Ok(false) if already

@@ -23,17 +23,14 @@ use sha2::{Digest, Sha256};
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 
-/// GET `url` and return its body, or exit(1) with a message.
+/// GET `url` and return its body, or exit(1) with a message. The transfer carries
+/// the shared read timeout + bounded retry (`http`): a peer that stops sending
+/// mid-body used to block this call forever.
 fn get_body(url: &str) -> Vec<u8> {
-    let resp = ureq::get(url).call().unwrap_or_else(|e| {
-        eprintln!("td-fetch: GET {url}: {e}");
+    crate::http::get_body(url).unwrap_or_else(|e| {
+        eprintln!("td-fetch: {e}");
         std::process::exit(1);
-    });
-    let mut body = Vec::new();
-    resp.into_reader()
-        .read_to_end(&mut body)
-        .expect("read body");
-    body
+    })
 }
 
 fn hex_sha256(bytes: &[u8]) -> String {

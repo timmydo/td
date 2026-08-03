@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::env;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, IsTerminal, Read, Write};
+use std::ffi::OsStr;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{symlink, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -2745,8 +2746,152 @@ fn find_td_builder_self(root: &Path) -> Result<PathBuf, String> {
     if is_executable(&release) {
         return Ok(release);
     }
+    // Nothing built yet — do the host `cargo build` rather than print it as an
+    // instruction: this is the same host-brings-cargo seed the stage0 provision
+    // uses, and the same fallback check_loop::resolve_recipe_eval_bin already does
+    // for this binary's sibling. A host WITHOUT cargo still gets the manual line,
+    // and the probe comes FIRST so it is not preceded by a "building it" notice
+    // for a build that never starts.
+    let Some(cargo) = cargo_on_path(env::var_os("PATH").as_deref()) else {
+        return Err(format!(
+            "TD_BUILDER_SELF is unset, {} is not executable, and this host has no cargo to build \
+             it with; run `cargo build --release --manifest-path builder/Cargo.toml`",
+            release.display()
+        ));
+    };
+    eprintln!(
+        "td-recipe-eval: td-builder is not built yet; building it \
+         (cargo build --release --manifest-path builder/Cargo.toml)"
+    );
+    build_td_builder(&cargo, root, &release)
+}
+
+/// The first executable `cargo` on `path`, house style rather than letting
+/// `Command::new("cargo")` search implicitly — the caller needs to distinguish "no
+/// cargo here" from "cargo failed" BEFORE it announces a build. The PATH is an
+/// argument so the absent-cargo branch is testable without mutating process env
+/// the same shape `stage0::rustup_add_musl_target` uses.
+fn cargo_on_path(path: Option<&OsStr>) -> Option<PathBuf> {
+    env::split_paths(path?)
+        // An EMPTY component means the cwd, and `PathBuf::new().join("cargo")` is the
+        // relative `cargo` — which `Command::…current_dir(root)` would then resolve
+        // against `root`, i.e. a different file than the one probed here. Dropped, as
+        // `stage0::find_in_path` drops them.
+        .filter(|dir| !dir.as_os_str().is_empty())
+        .map(|dir| dir.join("cargo"))
+        .find(|c| is_executable(c))
+}
+
+/// Prove the built binary runs on THIS host before handing it back: the caller execs
+/// it immediately, and the executable BIT says nothing about architecture or ABI. A
+/// `build.target` or `CARGO_BUILD_TARGET` naming another triple cross-builds happily,
+/// and without this the failure surfaces two calls later as `Exec format error`
+/// against a path nobody suspects. td-builder's bare invocation is its own sentinel
+/// and exits 0.
+fn runs_here(exe: &Path) -> Result<(), String> {
+    match Command::new(exe).stdin(Stdio::null()).output() {
+        Ok(out) if out.status.success() => Ok(()),
+        Ok(out) => Err(format!(
+            "{} was built but does not run here ({}) — a cross-target `build.target` or \
+             CARGO_BUILD_TARGET would produce a binary for another host",
+            exe.display(),
+            out.status
+                .code()
+                .map_or_else(|| "killed by a signal".to_string(), |c| format!("exit {c}"))
+        )),
+        Err(e) => Err(format!("{} was built but does not run here: {e}", exe.display())),
+    }
+}
+
+/// The binary cargo says it produced, read out of its own JSON artifact stream.
+/// Asking is the only reliable way: `--target-dir` fixes the target ROOT, but an
+/// ambient `CARGO_BUILD_TARGET` or a `build.target` in `.cargo/config.toml` moves the
+/// artifact to `target/<triple>/release/`, and a path guess would report a successful
+/// build as missing.
+fn cargo_reported_executable(stdout: &str, bin: &str) -> Option<PathBuf> {
+    stdout.lines().rev().find_map(|line| {
+        let msg = td_engine::json::parse(line).ok()?;
+        if msg.get("reason")?.as_str()? != "compiler-artifact" {
+            return None;
+        }
+        if msg.get("target")?.get("name")?.as_str()? != bin {
+            return None;
+        }
+        // `executable` is null for a non-binary artifact; `as_str` filters those.
+        msg.get("executable")?.as_str().map(PathBuf::from)
+    })
+}
+
+/// `cargo build --release` of builder/. Split out of [`find_td_builder_self`] so the
+/// outcomes are testable against a fake cargo: built, exited 0
+/// without producing a binary, and failed.
+///
+/// The nested build assumes the `cargo run` entry point, which `exec`-replaces itself
+/// on Unix and so has RELEASED the build-directory lock before td-recipe-eval starts.
+/// Reaching here from under `cargo test` — which holds that lock for the whole run —
+/// would block on the parent that is waiting for this child; no
+/// current caller does, and the fake-cargo tests below drive this function directly
+/// rather than through a real cargo. Two concurrent check legs both finding
+/// `target/release/td-builder` absent is the residual case: the second waits on
+/// cargo's build lock, which is bounded and announces itself on the inherited stderr.
+fn build_td_builder(cargo: &Path, root: &Path, release: &Path) -> Result<PathBuf, String> {
+    // `--target-dir` is PINNED at the dir the caller looks in: an ambient
+    // CARGO_TARGET_DIR would otherwise land the binary elsewhere.
+    // `--locked` because gate 325 pins this workspace's Cargo.lock at exactly three
+    // packages, and nothing reached from a check may rewrite it.
+    // `json-render-diagnostics` keeps cargo's human-readable errors on the inherited
+    // stderr while the machine-readable artifact list comes back on stdout.
+    let out = Command::new(cargo)
+        .args([
+            "build",
+            "--release",
+            "--locked",
+            "--message-format",
+            "json-render-diagnostics",
+            "--manifest-path",
+        ])
+        .arg(root.join("builder/Cargo.toml"))
+        .arg("--target-dir")
+        .arg(root.join("target"))
+        .current_dir(root)
+        .stdin(Stdio::null())
+        .stderr(Stdio::inherit())
+        .output()
+        .map_err(|e| format!("spawn {} build (builder): {e}", cargo.display()))?;
+    if !out.status.success() {
+        // Deliberately NOT asserting a compile error: a read-only tree, a wrong
+        // root, a cargo without a matching rustc and a full disk all land here too
+        // Report what happened and let the operator read cargo's
+        // own diagnostics, which went straight to the inherited stderr.
+        return Err(format!(
+            "`cargo build --release --locked --manifest-path builder/Cargo.toml` exited with {} \
+             (its diagnostics are on stderr above)",
+            out.status
+                .code()
+                .map_or_else(|| "a signal".to_string(), |c| format!("status {c}"))
+        ));
+    }
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let named = cargo_reported_executable(&stdout, "td-builder");
+    if let Some(exe) = &named {
+        if is_executable(exe) {
+            return runs_here(exe).map(|()| exe.clone());
+        }
+    }
+    // Fall back to the conventional path: a cargo too old to report artifacts still
+    // built something, and the caller's location is where it would be.
+    if is_executable(release) {
+        return runs_here(release).map(|()| release.to_path_buf());
+    }
+    // Say which of the two it was; "cargo named none" is a different diagnosis from
+    // "cargo named a path that is not executable" and sends the reader elsewhere.
+    let named = match &named {
+        Some(exe) => format!("cargo named {}, which is not executable", exe.display()),
+        None => "cargo named no executable".to_string(),
+    };
     Err(format!(
-        "TD_BUILDER_SELF is unset and {} is not executable; run `cargo build --release --manifest-path builder/Cargo.toml`",
+        "`cargo build --release --locked --manifest-path builder/Cargo.toml` succeeded but no \
+         td-builder executable resulted ({named}, and {} is not executable)",
         release.display()
     ))
 }
@@ -3245,6 +3390,138 @@ fn tail_bytes(bytes: &[u8], lines: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A fake `cargo` at `path`: `body` runs with the real cargo's argv, so a test
+    /// can make it produce the binary, exit 0 producing nothing, or fail.
+    fn write_fake_cargo(path: &Path, body: &str) {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        fs::write(path, format!("#!/bin/sh\n{body}")).unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+        // Same ETXTBSY race `stage0::tests::write_exec` documents: a fork in another
+        // test thread holds our write fd until it execs, and this script is exec'd by
+        // the code under test. Prove it runs before handing it over.
+        for _ in 0..400 {
+            match Command::new(path).arg("--td-fixture-probe").stdin(Stdio::null()).output() {
+                Err(e) if e.raw_os_error() == Some(26) => {
+                    std::thread::sleep(std::time::Duration::from_millis(5))
+                }
+                _ => return,
+            }
+        }
+        panic!("fixture {} never stopped being Text-file-busy", path.display());
+    }
+
+    /// The auto-build's three outcomes. `find_td_builder_self` runs a real host
+    /// cargo, so the outcome handling is what a test can pin — and the middle case
+    /// (exit 0, no binary) is the one an ambient CARGO_TARGET_DIR used to produce.
+    #[test]
+    fn the_auto_build_reports_its_three_outcomes_apart() {
+        let d = env::temp_dir().join(format!("td-autobuild-{}", process::id()));
+        let _ = fs::remove_dir_all(&d);
+        let release = d.join("target/release/td-builder");
+        let cargo = d.join("bin/cargo");
+
+        // Built: the fake cargo materializes the binary where the caller looks.
+        write_fake_cargo(
+            &cargo,
+            &format!(
+                "mkdir -p '{}' && printf '#!/bin/sh\\n' > '{}' && chmod 755 '{}'\n",
+                release.parent().unwrap().display(),
+                release.display(),
+                release.display()
+            ),
+        );
+        assert_eq!(build_td_builder(&cargo, &d, &release).unwrap(), release);
+
+        // Exited 0 and produced nothing: NOT reported as a build failure, because
+        // the build did not fail — the binary is simply not where we look.
+        fs::remove_file(&release).unwrap();
+        write_fake_cargo(&cargo, "exit 0\n");
+        let quiet = build_td_builder(&cargo, &d, &release).unwrap_err();
+        assert!(quiet.contains("succeeded but"), "{quiet}");
+
+        // Failed: report the status, and do NOT assert a compile error — a
+        // read-only tree or a wrong root lands here too.
+        write_fake_cargo(&cargo, "exit 101\n");
+        let failed = build_td_builder(&cargo, &d, &release).unwrap_err();
+        assert!(failed.contains("status 101"), "{failed}");
+        assert!(!failed.contains("regression"), "{failed}");
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    /// A `build.target` in `.cargo/config.toml` (or an ambient CARGO_BUILD_TARGET)
+    /// moves the artifact to `target/<triple>/release/`, which `--target-dir` does
+    /// NOT prevent — it pins the target ROOT, not the triple subdir under it. A path
+    /// guess would report a successful build as missing, so cargo is asked.
+    #[test]
+    fn the_artifact_is_taken_from_cargo_not_guessed() {
+        let d = env::temp_dir().join(format!("td-autobuild-triple-{}", process::id()));
+        let _ = fs::remove_dir_all(&d);
+        let guessed = d.join("target/release/td-builder");
+        let actual = d.join("target/x86_64-unknown-linux-musl/release/td-builder");
+        let cargo = d.join("bin/cargo");
+        write_fake_cargo(
+            &cargo,
+            &format!(
+                "mkdir -p '{}' && printf '#!/bin/sh\\n' > '{}' && chmod 755 '{}'\n\
+                 printf '{{\"reason\":\"compiler-artifact\",\"target\":{{\"name\":\
+                 \"td-builder\"}},\"executable\":\"{}\"}}\\n'\n",
+                actual.parent().unwrap().display(),
+                actual.display(),
+                actual.display(),
+                actual.display()
+            ),
+        );
+        assert_eq!(build_td_builder(&cargo, &d, &guessed).unwrap(), actual);
+        assert!(!guessed.exists(), "the guessed path must not be what answered");
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    /// Honouring `build.target` means a cross-target build lands an artifact that is
+    /// executable and still cannot run here, and the caller execs what it gets back.
+    /// A binary that does not run must be named at the build, not two calls later as
+    /// `Exec format error`.
+    #[test]
+    fn a_binary_that_does_not_run_here_is_refused() {
+        let d = env::temp_dir().join(format!("td-autobuild-foreign-{}", process::id()));
+        let _ = fs::remove_dir_all(&d);
+        let release = d.join("target/release/td-builder");
+        let cargo = d.join("bin/cargo");
+        // Stands in for a foreign-architecture binary: present, +x, and unrunnable.
+        write_fake_cargo(
+            &cargo,
+            &format!(
+                "mkdir -p '{}'
+printf '#!/bin/sh\nexit 1\n' > '{}'
+chmod 755 '{}'
+",
+                release.parent().unwrap().display(),
+                release.display(),
+                release.display()
+            ),
+        );
+        let err = build_td_builder(&cargo, &d, &release).unwrap_err();
+        assert!(err.contains("does not run here"), "{err}");
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    /// The absent-cargo branch decides whether the operator is told to build by hand,
+    /// and it used to read the real PATH, so nothing could cover it. The PATH is an
+    /// argument now.
+    #[test]
+    fn an_empty_path_finds_no_cargo() {
+        assert_eq!(cargo_on_path(None), None);
+        assert_eq!(cargo_on_path(Some(OsStr::new(""))), None);
+        let d = env::temp_dir().join(format!("td-cargo-probe-{}", process::id()));
+        let _ = fs::remove_dir_all(&d);
+        fs::create_dir_all(&d).unwrap();
+        assert_eq!(cargo_on_path(Some(d.as_os_str())), None);
+        write_fake_cargo(&d.join("cargo"), "exit 0\n");
+        assert_eq!(cargo_on_path(Some(d.as_os_str())), Some(d.join("cargo")));
+        let _ = fs::remove_dir_all(&d);
+    }
 
     // build-run reads every requested output's STEP line from the ONE plan it
     // builds (`build-plan --auto TARGET`), so a stem outside TARGET's recipe

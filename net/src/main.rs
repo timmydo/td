@@ -32,6 +32,7 @@
 // `td-net` with no applet selector is a usage error (exit 2) by design.
 mod feed;
 mod fetch;
+mod http;
 mod subst;
 
 fn main() {

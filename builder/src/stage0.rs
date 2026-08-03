@@ -89,13 +89,8 @@ fn emit_frag(a: &str, b: &str) -> String {
     }
 }
 
-/// The provisioned rust MUST ship [`MUSL_TARGET`]'s self-contained static std
-/// (`rust-std-x86_64-unknown-linux-musl`) — the source of the `+crt-static`
-/// `libc.a` that replaced the guix glibc:static pin. Verify it once, up front,
-/// with a clear message rather than a cryptic link failure deep in the build.
-fn ensure_musl_target(rust_bin_dir: &str) -> Result<(), String> {
-    let rustc = Path::new(rust_bin_dir).join("rustc");
-    let out = Command::new(&rustc)
+fn rustc_sysroot(rustc: &Path) -> Result<String, String> {
+    let out = Command::new(rustc)
         .arg("--print")
         .arg("sysroot")
         .stdin(Stdio::null())
@@ -105,20 +100,175 @@ fn ensure_musl_target(rust_bin_dir: &str) -> Result<(), String> {
         return Err(format!("`rustc --print sysroot` failed for {}", rustc.display()));
     }
     let sysroot = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    let libc_a = Path::new(&sysroot)
+    // A wrapper rustc that exits 0 without handling `--print sysroot` answers with
+    // nothing, and `Path::new("").join("bin")` is the RELATIVE path `bin`. That would
+    // both choose a PATH fragment and decide whether the musl std is missing — the
+    // second of which spends a network fetch and mutates the host — off a directory
+    // this process happens to be standing in.
+    if !Path::new(&sysroot).is_absolute() {
+        return Err(format!(
+            "`rustc --print sysroot` from {} answered {sysroot:?}, which is not an absolute path",
+            rustc.display()
+        ));
+    }
+    Ok(sysroot)
+}
+
+/// A resolved toolchain: the bin dir to put on the cleared-env PATH, and the sysroot
+/// its rustc reported. The two travel together because asking twice is both a second
+/// subprocess and an unchecked assumption that the two answers agree.
+struct Toolchain {
+    bin: String,
+    sysroot: String,
+}
+
+/// The toolchain `rustc` belongs to. A `rustc` is usually a rustup SHIM
+/// (`~/.cargo/bin/rustc`) that re-enters rustup to pick a toolchain, and
+/// [`bootstrap_stage0`] runs cargo under a CLEARED environment with `HOME` pointed at
+/// its own scratch — where the shim finds neither a `RUSTUP_HOME` nor a default and
+/// exits before cargo starts. So `bin` is the SYSROOT's bin dir whenever that holds a
+/// complete rustc+cargo, which is what turns a shim into the toolchain it stands for.
+/// A sysroot with no such dir falls back to where `rustc` was found, which is what
+/// keeps guix and nix (cargo in a separate output) on their own layout. It is not
+/// shim-specific: any rustc whose sysroot bin holds both binaries is followed there,
+/// so a flag-injecting wrapper is bypassed in favour of what it wraps. Shims are a
+/// property of the BINARIES,
+/// not of how they were found, so `TD_RUST_HOME` goes through this too — pointing it
+/// at `~/.cargo` is a plausible reading of "the rust home" and used to fail exactly
+/// like the PATH case, deep in the build.
+fn toolchain_at(rustc: &Path) -> Result<Toolchain, String> {
+    let sysroot = rustc_sysroot(rustc)?;
+    let sysbin = Path::new(&sysroot).join("bin");
+    let bin = if is_exec(&sysbin.join("rustc")) && is_exec(&sysbin.join("cargo")) {
+        sysbin.to_string_lossy().into_owned()
+    } else {
+        rustc
+            .parent()
+            .map(|d| d.to_string_lossy().into_owned())
+            .unwrap_or_default()
+    };
+    Ok(Toolchain { bin, sysroot })
+}
+
+/// Add [`MUSL_TARGET`] to the toolchain `rust_bin_dir` came from, when rustup owns
+/// it. Resolution path 3 already does this for a toolchain rustup INSTALLS; a host
+/// that brought its own rustup toolchain takes path 2 instead and used to get a hard
+/// error telling it to run this very command by hand. `rustup which rustc` names the
+/// ACTIVE toolchain's rustc: only when that is the toolchain we resolved may we add
+/// to it, otherwise the target lands somewhere this build never looks. The add itself
+/// takes no `--toolchain` (unlike path 3, which names the one it just installed), so
+/// what closes the gap between the two calls is the caller re-checking the sysroot
+/// afterwards — an add that landed elsewhere leaves the std still missing and reds.
+///
+/// This fetches over the network and mutates the host toolchain. `TD_RUST_HOME` is the
+/// way to decline: it resolves at path 1, which never reaches rustup.
+fn rustup_add_musl_target(search_path: &str, rust_bin_dir: &str) -> Result<(), String> {
+    let rustup =
+        find_in_path(search_path, "rustup").ok_or_else(|| "no rustup on PATH".to_string())?;
+    let which = Command::new(&rustup)
+        .args(["which", "rustc"])
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|e| format!("spawn {}: {e}", rustup.display()))?;
+    if !which.status.success() {
+        // Path 3 forwards on the identical call: WHY rustup refused is the entire
+        // content of this failure, and capturing it drops it.
+        forward_to_stderr(&which);
+        return Err("`rustup which rustc` failed".to_string());
+    }
+    // Compare the two rustc paths RESOLVED, never lexically: rustup answers out of
+    // `$HOME` while the sysroot answer comes from rustc itself, and this very host
+    // reaches one toolchain as both /home/timmy/.rustup/… and
+    // /var/home/timmy/.rustup/… because /home is a symlink. A lexical compare
+    // refuses the add on exactly the stock rustup host it exists for.
+    // A path that will not canonicalize is `None`, and two `None`s must not read as
+    // agreement, so an unresolvable side refuses.
+    let active = PathBuf::from(String::from_utf8_lossy(&which.stdout).trim());
+    let resolved = Path::new(rust_bin_dir).join("rustc");
+    let same = match (active.canonicalize(), resolved.canonicalize()) {
+        (Ok(a), Ok(r)) => a == r,
+        _ => false,
+    };
+    if !same {
+        return Err(format!(
+            "rustup's active rustc ({}) is not the resolved toolchain ({})",
+            active.display(),
+            resolved.display()
+        ));
+    }
+    eprintln!("td-builder: adding the {MUSL_TARGET} target to rustup's active toolchain");
+    let add = Command::new(&rustup)
+        .args(["target", "add", MUSL_TARGET])
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|e| format!("spawn {}: {e}", rustup.display()))?;
+    forward_to_stderr(&add);
+    if !add.status.success() {
+        return Err(format!("`rustup target add {MUSL_TARGET}` failed"));
+    }
+    Ok(())
+}
+
+/// Why the musl check said no, split by whether an ABSENCE was actually diagnosed.
+/// Only `Missing` may be answered with a host-mutating `rustup target add`; anything
+/// else would install a target nobody established was missing.
+enum MuslErr {
+    /// The self-contained `libc.a` is not there.
+    Missing(String),
+    /// The question could not be answered: rustc would not report a sysroot, or the
+    /// `libc.a` could not be stat'd (permissions, I/O, a symlink loop), or something
+    /// that is not a file sits at its path.
+    Undiagnosed(String),
+}
+
+impl MuslErr {
+    fn into_message(self) -> String {
+        match self {
+            MuslErr::Missing(m) | MuslErr::Undiagnosed(m) => m,
+        }
+    }
+}
+
+/// The provisioned rust MUST ship [`MUSL_TARGET`]'s self-contained static std
+/// (`rust-std-x86_64-unknown-linux-musl`) — the source of the `+crt-static`
+/// `libc.a` that replaced the guix glibc:static pin. Verify it once, up front,
+/// with a clear message rather than a cryptic link failure deep in the build.
+fn musl_std_in(sysroot: &str) -> Result<(), MuslErr> {
+    let libc_a = Path::new(sysroot)
         .join("lib/rustlib")
         .join(MUSL_TARGET)
         .join("lib/self-contained/libc.a");
-    if std::fs::metadata(&libc_a).is_ok_and(|m| m.is_file()) {
-        Ok(())
-    } else {
-        Err(format!(
+    // Only a NotFound is an absence. A permission error, an I/O error or a symlink
+    // loop all leave the question open, and answering them by installing the target
+    // is a host mutation on top of a fault nobody diagnosed.
+    match std::fs::metadata(&libc_a) {
+        Ok(m) if m.is_file() => Ok(()),
+        Ok(_) => Err(MuslErr::Undiagnosed(format!(
+            "{} exists but is not a file; the toolchain's musl rust-std is unusable",
+            libc_a.display()
+        ))),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(MuslErr::Missing(format!(
             "the provisioned rust toolchain lacks the {MUSL_TARGET} static std (missing {}) — \
              add it with `rustup target add {MUSL_TARGET}` or provide a TD_RUST_HOME whose \
              rust-std ships the self-contained musl libc.a",
             libc_a.display()
-        ))
+        ))),
+        Err(e) => Err(MuslErr::Undiagnosed(format!("stat {}: {e}", libc_a.display()))),
     }
+}
+
+/// `musl_std_in` for a caller holding a bin dir rather than a sysroot (resolution
+/// path 3, whose toolchain rustup just named): ask rustc, then check.
+fn ensure_musl_target(rust_bin_dir: &str) -> Result<(), MuslErr> {
+    let sysroot =
+        rustc_sysroot(&Path::new(rust_bin_dir).join("rustc")).map_err(MuslErr::Undiagnosed)?;
+    musl_std_in(&sysroot)
+}
+
+/// `ensure_musl_target` for the callers that have no retry to gate: any failure is
+/// simply Broken.
+fn require_musl_target(rust_bin_dir: &str) -> Result<(), ProvisionErr> {
+    ensure_musl_target(rust_bin_dir).map_err(|e| ProvisionErr::Broken(e.into_message()))
 }
 
 fn find_in_path(search_path: &str, bin: &str) -> Option<PathBuf> {
@@ -207,8 +357,9 @@ pub(crate) fn provision_rust(env: &ProvisionEnv) -> Result<String, ProvisionErr>
                 "TD_RUST_HOME={home} has no bin/rustc + bin/cargo"
             )));
         }
-        ensure_musl_target(&b).map_err(ProvisionErr::Broken)?;
-        return Ok(b);
+        let tc = toolchain_at(&bp.join("rustc")).map_err(ProvisionErr::Broken)?;
+        musl_std_in(&tc.sysroot).map_err(|e| ProvisionErr::Broken(e.into_message()))?;
+        return Ok(tc.bin);
     }
 
     // 2. rustc + cargo already on PATH — a host-supplied toolchain (rustup's
@@ -220,8 +371,40 @@ pub(crate) fn provision_rust(env: &ProvisionEnv) -> Result<String, ProvisionErr>
     ) {
         if let (Some(rd), Some(cd)) = (rustc.parent(), cargo.parent()) {
             let (rb, cb) = (rd.to_string_lossy(), cd.to_string_lossy());
-            ensure_musl_target(&rb).map_err(ProvisionErr::Broken)?;
-            return Ok(emit_frag(&rb, &cb));
+            let tc = toolchain_at(&rustc).map_err(ProvisionErr::Broken)?;
+            // Both PATH dirs survive only when the sysroot supplied no bin dir of its
+            // own: rustc and cargo can legitimately live apart on a distro host, but a
+            // resolved toolchain's bin holds them both.
+            let frag = if tc.bin == rb {
+                emit_frag(&rb, &cb)
+            } else {
+                tc.bin.clone()
+            };
+            // Only a MISSING std is worth a `rustup target add`; a sysroot that could
+            // not be asked is a different fault and reds as it stands.
+            match musl_std_in(&tc.sysroot) {
+                Ok(()) => {}
+                Err(MuslErr::Undiagnosed(m)) => return Err(ProvisionErr::Broken(m)),
+                Err(MuslErr::Missing(_)) => {
+                    // The refused-add case gets its OWN message: `missing` ends with
+                    // "add it with `rustup target add …`", and appending "that would
+                    // install into a different toolchain" to it tells the operator to
+                    // run a command the same sentence just said would not help.
+                    rustup_add_musl_target(&env.search_path, &tc.bin).map_err(|why| {
+                        ProvisionErr::Broken(format!(
+                            "the resolved rust toolchain ({}) lacks the {MUSL_TARGET} static \
+                             std and td could not add it: {why}. Add it to THAT toolchain \
+                             (`rustup target add --toolchain <its name> {MUSL_TARGET}`), make \
+                             it rustup's active toolchain, or set TD_RUST_HOME to a toolchain \
+                             whose rust-std already ships the self-contained musl libc.a",
+                            tc.bin
+                        ))
+                    })?;
+                    musl_std_in(&tc.sysroot)
+                        .map_err(|e| ProvisionErr::Broken(e.into_message()))?;
+                }
+            }
+            return Ok(frag);
         }
     }
 
@@ -274,7 +457,7 @@ pub(crate) fn provision_rust(env: &ProvisionEnv) -> Result<String, ProvisionErr>
             )));
         }
         let db = d.to_string_lossy().into_owned();
-        ensure_musl_target(&db).map_err(ProvisionErr::Broken)?;
+        require_musl_target(&db)?;
         return Ok(db);
     }
 
@@ -1075,15 +1258,71 @@ mod tests {
     }
 
     /// Write an executable shell fixture (a fake `cc`/`gcc`) with a shebang that
-    /// resolves in this environment (see `sh_shebang`).
+    /// resolves in this environment (see `sh_shebang`), then PROVE it execs before
+    /// handing it to the code under test.
+    ///
+    /// The proof is not ceremony. Another test thread that forks while our write fd
+    /// is open inherits that fd, and until the child reaches `execve` the file has a
+    /// writer — so exec'ing it fails with ETXTBSY, "Text file busy". The window is
+    /// milliseconds and closes for good once those children exec (nothing else ever
+    /// opens these files for writing), but this binary spawns constantly and the
+    /// failure lands inside whatever production call the fixture was written for,
+    /// where it reads as a resolver bug: `spawn …/rustc: Text file busy` surfaced as
+    /// a Broken toolchain. Retrying belongs here rather than in `provision_rust`,
+    /// which would then carry a retry loop existing only for its tests. The probe
+    /// argument matches no `case` arm in any fixture body, so running one is inert.
     fn write_exec(p: &Path, body: &str) {
         std::fs::create_dir_all(p.parent().unwrap()).unwrap();
         std::fs::write(p, format!("{}{body}", sh_shebang())).unwrap();
         std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        for _ in 0..400 {
+            match Command::new(p)
+                .arg("--td-fixture-probe")
+                .stdin(Stdio::null())
+                .output()
+            {
+                Err(e) if e.raw_os_error() == Some(26) => {
+                    std::thread::sleep(std::time::Duration::from_millis(5))
+                }
+                _ => return,
+            }
+        }
+        panic!("fixture {} never stopped being Text-file-busy", p.display());
     }
 
     fn exec_file(p: &Path) {
         write_exec(p, "");
+    }
+
+    fn musl_libc_path(sysroot: &Path) -> PathBuf {
+        sysroot
+            .join("lib/rustlib")
+            .join(MUSL_TARGET)
+            .join("lib/self-contained/libc.a")
+    }
+
+    fn write_musl_libc(sysroot: &Path) {
+        let libc = musl_libc_path(sysroot);
+        std::fs::create_dir_all(libc.parent().unwrap()).unwrap();
+        std::fs::write(&libc, b"!<arch>\n").unwrap();
+    }
+
+    /// A fake `rustup` for the path-2 target-add leg: `which` names `active_rustc`
+    /// (whatever the caller wants rustup's active toolchain to be) and `target add`
+    /// materializes the musl std under `adds_to`. Splitting the two is what lets a
+    /// test assert the add is REFUSED when they disagree.
+    fn write_fake_rustup(dir: &Path, active_rustc: &Path, adds_to: &Path) {
+        let libc = musl_libc_path(adds_to);
+        write_exec(
+            &dir.join("rustup"),
+            &format!(
+                "case \"$1\" in\n  which) echo '{}' ;;\n  target) mkdir -p '{}' && printf \
+                 '!<arch>\\n' > '{}' ;;\nesac\n",
+                active_rustc.display(),
+                libc.parent().unwrap().display(),
+                libc.display(),
+            ),
+        );
     }
 
     /// Write a fake rust toolchain at `bin/` whose `rustc` answers `--print
@@ -1100,12 +1339,7 @@ mod tests {
             ),
         );
         exec_file(&bin.join("cargo"));
-        let libc = sysroot
-            .join("lib/rustlib")
-            .join(MUSL_TARGET)
-            .join("lib/self-contained/libc.a");
-        std::fs::create_dir_all(libc.parent().unwrap()).unwrap();
-        std::fs::write(&libc, b"!<arch>\n").unwrap();
+        write_musl_libc(sysroot);
     }
 
     /// A hermetic resolver env: no homes, an EMPTY search path — so no host
@@ -1155,15 +1389,72 @@ mod tests {
         // A rustc reporting a sysroot that HAS the musl libc.a passes.
         write_rust_toolchain(&bin, &sysroot);
         assert!(ensure_musl_target(&bin.to_string_lossy()).is_ok());
-        // Remove the libc.a → the same toolchain now reds with guidance.
-        let libc = sysroot
-            .join("lib/rustlib")
-            .join(MUSL_TARGET)
-            .join("lib/self-contained/libc.a");
-        std::fs::remove_file(&libc).unwrap();
-        assert!(ensure_musl_target(&bin.to_string_lossy())
-            .unwrap_err()
-            .contains(MUSL_TARGET));
+        // Remove the libc.a → the same toolchain now reds with guidance, and the
+        // failure is discriminated as MISSING: that is the only one path 2 may
+        // answer with a host-mutating `rustup target add`.
+        std::fs::remove_file(musl_libc_path(&sysroot)).unwrap();
+        let err = ensure_musl_target(&bin.to_string_lossy()).unwrap_err();
+        assert!(matches!(&err, MuslErr::Missing(m) if m.contains(MUSL_TARGET)));
+        // A rustc that cannot answer `--print sysroot` at all is a DIFFERENT fault:
+        // nothing diagnosed a target as missing, so nothing may be installed.
+        write_exec(&bin.join("rustc"), "exit 1\n");
+        assert!(matches!(
+            ensure_musl_target(&bin.to_string_lossy()).unwrap_err(),
+            MuslErr::Undiagnosed(_)
+        ));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// The other half of the same rule, and the one that reaches the path-2 match
+    /// arm: the sysroot resolves fine, but the `libc.a` path is occupied by something
+    /// that is not a file. Nothing was diagnosed as ABSENT, so nothing may be
+    /// installed — `rustup target add` would not fix a directory sitting there.
+    #[test]
+    fn an_undiagnosable_libc_a_never_reaches_rustup() {
+        let d = scratch("musl-undiagnosable");
+        let toolchain = d.join("toolchain");
+        let rbin = toolchain.join("bin");
+        write_exec(
+            &rbin.join("rustc"),
+            &format!(
+                "case \"$*\" in *'--print sysroot'*) echo '{}' ;; esac\n",
+                toolchain.display()
+            ),
+        );
+        exec_file(&rbin.join("cargo"));
+        // A DIRECTORY where the libc.a belongs.
+        std::fs::create_dir_all(musl_libc_path(&toolchain)).unwrap();
+        let rustup = d.join("rustup");
+        write_fake_rustup(&rustup, &rbin.join("rustc"), &toolchain);
+        let mut env = base_env();
+        env.search_path = format!("{}:{}", rbin.display(), rustup.display());
+        let err = provision_rust(&env).unwrap_err();
+        assert!(
+            matches!(&err, ProvisionErr::Broken(m) if m.contains("not a file")),
+            "unexpected error: {err}"
+        );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// A shim that cannot resolve a toolchain fails `--print sysroot`, and answering
+    /// THAT by installing a musl target would be a host mutation in response to an
+    /// unrelated fault. Refused before the musl question is even asked.
+    #[test]
+    fn a_sysroot_failure_never_reaches_rustup() {
+        let d = scratch("musl-sysroot-fault");
+        let rbin = d.join("bin");
+        write_exec(&rbin.join("rustc"), "exit 1\n");
+        exec_file(&rbin.join("cargo"));
+        // A rustup that WOULD add the target if it were ever asked.
+        let rustup = d.join("rustup");
+        write_fake_rustup(&rustup, &rbin.join("rustc"), &d.join("toolchain"));
+        let mut env = base_env();
+        env.search_path = format!("{}:{}", rbin.display(), rustup.display());
+        assert!(matches!(provision_rust(&env).unwrap_err(), ProvisionErr::Broken(_)));
+        assert!(
+            !musl_libc_path(&d.join("toolchain")).exists(),
+            "a sysroot failure triggered a target install"
+        );
         let _ = std::fs::remove_dir_all(&d);
     }
 
@@ -1253,6 +1544,178 @@ mod tests {
         let mut env3 = base_env();
         env3.search_path = sysd.to_string_lossy().into_owned();
         assert_eq!(provision_cc(&env3).unwrap(), sysd.to_string_lossy());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// A `rustc` on PATH is usually a rustup SHIM, and `bootstrap_stage0` runs cargo
+    /// with a CLEARED environment where a shim finds neither a rustup home nor a
+    /// default toolchain and exits before cargo starts. Resolution must hand back the
+    /// toolchain the shim stands for, not the shim dir.
+    #[test]
+    fn a_shim_on_path_resolves_to_the_toolchain_it_stands_for() {
+        let d = scratch("shim");
+        let toolchain = d.join("toolchain");
+        write_rust_toolchain(&toolchain.join("bin"), &toolchain);
+        let shim = d.join("shim");
+        write_exec(
+            &shim.join("rustc"),
+            &format!(
+                "case \"$*\" in *'--print sysroot'*) echo '{}' ;; esac\n",
+                toolchain.display()
+            ),
+        );
+        exec_file(&shim.join("cargo"));
+        let mut env = base_env();
+        env.search_path = shim.to_string_lossy().into_owned();
+        assert_eq!(
+            provision_rust(&env).unwrap(),
+            toolchain.join("bin").to_string_lossy()
+        );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// Being a shim is a property of the BINARIES, not of how they were found, so an
+    /// explicitly PROVIDED home gets the same rewrite: `TD_RUST_HOME=~/.cargo` is a
+    /// plausible reading of "the rust home", and it used to pass the bin/rustc +
+    /// bin/cargo check and then fail deep in the cleared-env build.
+    #[test]
+    fn a_provided_home_that_is_a_shim_dir_resolves_too() {
+        let d = scratch("provided-shim");
+        let toolchain = d.join("toolchain");
+        write_rust_toolchain(&toolchain.join("bin"), &toolchain);
+        let home = d.join("cargo");
+        write_exec(
+            &home.join("bin/rustc"),
+            &format!(
+                "case \"$*\" in *'--print sysroot'*) echo '{}' ;; esac\n",
+                toolchain.display()
+            ),
+        );
+        exec_file(&home.join("bin/cargo"));
+        let mut env = base_env();
+        env.rust_home = Some(home.to_string_lossy().into_owned());
+        assert_eq!(
+            provision_rust(&env).unwrap(),
+            toolchain.join("bin").to_string_lossy()
+        );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// The shim rewrite is a PREFERENCE, not a requirement: a toolchain whose sysroot
+    /// ships no `bin/` (a distro or guix rust) must keep the PATH dirs it resolved to
+    /// rather than be pointed at a directory holding no toolchain at all.
+    #[test]
+    fn a_sysroot_without_rustc_and_cargo_keeps_the_path_dirs() {
+        let d = scratch("nobin");
+        let rbin = d.join("bin");
+        let sysroot = d.join("sysroot");
+        write_exec(
+            &rbin.join("rustc"),
+            &format!(
+                "case \"$*\" in *'--print sysroot'*) echo '{}' ;; esac\n",
+                sysroot.display()
+            ),
+        );
+        exec_file(&rbin.join("cargo"));
+        write_musl_libc(&sysroot);
+        let mut env = base_env();
+        env.search_path = rbin.to_string_lossy().into_owned();
+        assert_eq!(provision_rust(&env).unwrap(), rbin.to_string_lossy());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// Resolution path 3 already `rustup target add`s the musl std for a toolchain
+    /// rustup INSTALLS. A host that brought its own rustup toolchain takes path 2, and
+    /// used to be told to run that identical command by hand — the difference between
+    /// a stock rustup host building out of the box and one that stops.
+    #[test]
+    fn a_missing_musl_std_is_added_through_rustup_rather_than_refused() {
+        let d = scratch("musl-add");
+        let toolchain = d.join("toolchain");
+        let rbin = toolchain.join("bin");
+        write_exec(
+            &rbin.join("rustc"),
+            &format!(
+                "case \"$*\" in *'--print sysroot'*) echo '{}' ;; esac\n",
+                toolchain.display()
+            ),
+        );
+        exec_file(&rbin.join("cargo"));
+        let libc = musl_libc_path(&toolchain);
+        let rustup = d.join("rustup");
+        write_fake_rustup(&rustup, &rbin.join("rustc"), &toolchain);
+        let mut env = base_env();
+        env.search_path = format!("{}:{}", rbin.display(), rustup.display());
+        assert_eq!(provision_rust(&env).unwrap(), rbin.to_string_lossy());
+        assert!(libc.is_file(), "the musl std was not added");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// rustup answers `which` out of `$HOME` while the sysroot answer comes from
+    /// rustc, and those two spellings of one toolchain need not match as TEXT: this
+    /// repo's own host reaches it as both /home/timmy/… and /var/home/timmy/…
+    /// because /home is a symlink. A lexical compare refuses the add on exactly the
+    /// stock rustup host it exists for.
+    #[test]
+    fn a_symlinked_home_is_still_the_same_toolchain() {
+        let d = scratch("musl-symlink");
+        let toolchain = d.join("real/toolchain");
+        let rbin = toolchain.join("bin");
+        write_exec(
+            &rbin.join("rustc"),
+            &format!(
+                "case \"$*\" in *'--print sysroot'*) echo '{}' ;; esac\n",
+                toolchain.display()
+            ),
+        );
+        exec_file(&rbin.join("cargo"));
+        // rustup names the SAME rustc through a symlinked parent.
+        std::os::unix::fs::symlink(d.join("real"), d.join("link")).unwrap();
+        let rustup = d.join("rustup");
+        write_fake_rustup(
+            &rustup,
+            &d.join("link/toolchain/bin/rustc"),
+            &toolchain,
+        );
+        let mut env = base_env();
+        env.search_path = format!("{}:{}", rbin.display(), rustup.display());
+        assert_eq!(provision_rust(&env).unwrap(), rbin.to_string_lossy());
+        assert!(musl_libc_path(&toolchain).is_file(), "the musl std was not added");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// `rustup target add` acts on the ACTIVE toolchain. When that is not the one
+    /// resolved off PATH, the std would land where this build never looks — so the
+    /// add is refused and the original missing-std error stands.
+    #[test]
+    fn the_target_is_never_added_to_a_toolchain_this_build_will_not_use() {
+        let d = scratch("musl-elsewhere");
+        let toolchain = d.join("toolchain");
+        let rbin = toolchain.join("bin");
+        write_exec(
+            &rbin.join("rustc"),
+            &format!(
+                "case \"$*\" in *'--print sysroot'*) echo '{}' ;; esac\n",
+                toolchain.display()
+            ),
+        );
+        exec_file(&rbin.join("cargo"));
+        let libc = musl_libc_path(&toolchain);
+        // rustup's active rustc is a DIFFERENT toolchain's; adding there is useless.
+        // It must EXIST, or the refusal would come from an unresolvable path instead
+        // of from two real toolchains disagreeing.
+        let other = d.join("other/bin/rustc");
+        exec_file(&other);
+        let rustup = d.join("rustup");
+        write_fake_rustup(&rustup, &other, &toolchain);
+        let mut env = base_env();
+        env.search_path = format!("{}:{}", rbin.display(), rustup.display());
+        let err = provision_rust(&env).unwrap_err();
+        assert!(
+            matches!(&err, ProvisionErr::Broken(m) if m.contains(MUSL_TARGET)),
+            "unexpected error: {err}"
+        );
+        assert!(!libc.is_file(), "the musl std was added to the wrong toolchain");
         let _ = std::fs::remove_dir_all(&d);
     }
 

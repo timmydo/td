@@ -28,7 +28,7 @@
 use ring::rand::SystemRandom;
 use ring::signature::{Ed25519KeyPair, KeyPair, UnparsedPublicKey, ED25519};
 use sha2::{Digest, Sha256};
-use std::io::{self, BufRead, BufReader, Read, Write};
+use std::io::{self, BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -119,12 +119,7 @@ fn write_atomic(dst: &Path, bytes: &[u8]) -> Result<(), String> {
 // ---- HTTP (mirror of td-feed) ----
 
 fn try_get(url: &str) -> Result<Vec<u8>, String> {
-    let resp = ureq::get(url).call().map_err(|e| format!("GET {url}: {e}"))?;
-    let mut body = Vec::new();
-    resp.into_reader()
-        .read_to_end(&mut body)
-        .map_err(|e| format!("read {url}: {e}"))?;
-    Ok(body)
+    crate::http::get_body(url)
 }
 
 fn respond(conn: &mut TcpStream, code: u16, reason: &str, body: &[u8]) -> io::Result<()> {
