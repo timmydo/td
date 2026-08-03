@@ -69,7 +69,11 @@ compositor bindings deliberately follow Emacs navigation:
 - `Super+1` through `Super+9` switch workspaces, and adding Shift moves the
   focused tile to that workspace;
 - `Super+x 2` selects a vertical split for the next toplevel, `Super+x 3`
-  selects a horizontal split, and `Super+x 1` toggles fullscreen.
+  selects a horizontal split, and `Super+x 1` toggles fullscreen;
+- `Super+x l` opens the launcher. `Control+n` and `Control+p`, or Down and Up,
+  move its selection; Enter activates it; Escape and `Control+g` close it.
+  ASCII letters, digits, space, and hyphen filter its registry, and Backspace
+  edits that filter.
 
 The `Super+x` prefix survives key and modifier release, as an Emacs prefix
 does, and is consumed by the next non-modifier key press. Left and right
@@ -96,8 +100,17 @@ that full repaint while holding the runtime lock. This is bounded enough for
 the supported QEMU PS/2 profile but is not a high-rate input design. Damage
 tracking or a throttled render loop is required before adding such hardware.
 The shared logical-seat boundary spans a key decision through its runtime
-delivery, so complete input deliveries serialize behind that lock; partial
-pointer records return before acquiring either lock.
+adapter delivery, so evdev inputs remain ordered behind that lock; partial
+pointer records return before acquiring either lock. Each adapter operation
+reacquires the scene runtime lock, so a Wayland commit may interleave between
+command, launcher, key, modifier, and pointer operations from one report. This
+keeps process launch outside the scene lock without changing evdev ordering.
+An input parse, runtime-delivery, or framebuffer-repaint error closes that
+device's reader after releasing its seat contribution. The first fixed-device
+QEMU profile deliberately fails stopped instead of retrying a potentially
+persistent error in a hot loop; the serial recovery console remains available.
+Launch and reap failures are contained inside the process adapter and leave
+the reader active so the launcher can be closed or retried.
 
 ## 3. Wayland surface
 
@@ -111,7 +124,7 @@ The first protocol surface is:
 - wl_compositor, wl_surface, and wl_region
 - wl_shm, wl_shm_pool, and wl_buffer
 - wl_output
-- wl_seat and wl_keyboard
+- wl_seat, wl_keyboard, and wl_pointer
 - xdg_wm_base, xdg_surface, and xdg_toplevel
 - wl_callback completion and wl_buffer release
 
@@ -128,12 +141,16 @@ xdg_surface configure serial. A buffer attached before that handshake is a
 client protocol failure.
 
 The boot profile starts one `td-ui-demo` toplevel. It discovers and binds
-globals rather than depending on registry names, completes the initial XDG
-configure/ack handshake, and uses 512x320 only for the first client-selected
-buffer. Once mapped, it acknowledges the compositor's nonzero tile configure,
-regenerates its dependency-free software pattern at that exact size, and
-replaces its XRGB8888 wl_shm buffer. Later layout configures do the same.
-Dynamic wl_shm pool, buffer, and frame-callback ids are reused only after
+globals rather than depending on registry names, binds the version-5-or-newer
+seat, and completes the initial XDG configure/ack handshake. It accepts only a
+seat with both keyboard and pointer capabilities, requests those devices only
+after receiving that capability event, and verifies the keymap descriptor
+byte-for-byte against td's pinned map before becoming ready. It uses 512x320
+only for the first client-selected buffer. Once mapped, it acknowledges the
+compositor's nonzero tile configure, regenerates its dependency-free software
+pattern at that exact size, and replaces its XRGB8888 wl_shm buffer. Later
+layout configures do the same. Dynamic wl_shm pool, buffer, and frame-callback
+ids are reused only after
 wl_display.delete_id. A zero width or height in a third-party compositor's
 configure independently keeps the demo's current or default dimension, as the
 XDG protocol requires. A bare xdg_surface.configure reuses the last applied
@@ -141,12 +158,54 @@ toplevel size and states.
 
 The demo exposes its mode-0600 readiness socket and prints
 `TD-UI-CLIENT-READY` only after the tile-sized replacement receives both
-wl_buffer release and its frame callback. The client has no toolkit, fonts,
-input handling, animation, or application model; it is the live resize proof
-and a visible boot fixture. Its presentation handshake has a 20-second
-absolute deadline, shorter than the supervisor's 30-second readiness deadline,
-so a stalled compositor makes the client exit and permits `restart=always` to
-retry.
+wl_buffer release and its frame callback and its seat and keymap are ready.
+The client has no toolkit. Its pure UI model tracks keyboard focus, held and
+last keys, modifier masks, pointer focus and 24.8 coordinates, and held
+buttons. A built-in 5x7 bitmap font paints that state without a font library.
+Keyboard events update the model individually. Pointer events are bounded and
+applied transactionally only at `wl_pointer.frame`, so an incomplete frame is
+never rendered. An evdev report retains at most 64 button transitions.
+Pointer routing can add at most an initial motion plus one leave and enter
+when an implicit grab ends, so the client accepts the composed maximum of 67
+events per frame. At most one input-driven replacement is in flight; further
+updates coalesce into the latest model revision until both buffer release and
+frame completion arrive. Configure-driven replacement retains the existing
+XDG behavior. The presentation handshake has a 20-second absolute deadline,
+shorter than the supervisor's 30-second readiness deadline, so a stalled
+compositor makes the client exit and permits `restart=always` to retry.
+
+The launcher is a compositor-owned overlay, so opening it never depends on an
+already-running client. Its registry currently has an input-monitor entry
+that starts another `td-ui-demo` and an explicit close entry. Each entry owns
+a label, lowercase search terms, and a typed launch request. The pure launcher
+model stores a bounded 64-byte ASCII filter, requires every whitespace-
+separated term to occur in an entry's search text, and resets selection to the
+first match after an edit. An empty result is explicit and Enter leaves it
+open; Backspace can recover it. Opening clears the previous filter. While the
+overlay is open, all non-modifier keys are consumed by the compositor, and
+modified keys that are not launcher commands do not become text. Activation
+with a match closes the overlay before process creation; activation with no
+matches keeps both the overlay and input capture active. The input adapter
+updates its capture state from the model's post-action visibility instead of
+guessing which action opened or closed it. It never enables capture before a
+successful open. An overlay action is transactional with its framebuffer
+paint: a failed paint restores the complete prior launcher model, so another
+input device cannot observe model state with stale capture.
+The compositor receives the client executable as an explicit
+`--launcher-client` argument, requires both it and the Wayland socket to be
+absolute, derives a unique readiness-socket name beside the socket, and passes
+both paths as literal argv values without a shell. It reaps exited children
+before each launch and retains at most 16 live launched clients. A launch or
+reap failure is reported without terminating the evdev reader, so the user
+can close or retry the launcher. Reaping also removes a dead child's private
+readiness socket and reports any path that cannot be safely removed. Opening
+the modal overlay immediately withdraws ungrabbed pointer focus; closing it
+immediately restores focus under the stationary cursor. An existing implicit
+grab remains routed through the overlay until release, but unmapping its
+surface clears the grab and sends leave before object deletion. If the
+compositor exits while a launched child is still live, its readiness socket
+may remain until logout clears the runtime-directory tmpfs. Names carry the
+compositor pid, so that residual path cannot block a later compositor.
 
 The one supported output owns workspaces 1 through 9. Each workspace owns an
 n-ary split tree whose leaves are mapped XDG toplevels. A new toplevel is
@@ -191,26 +250,27 @@ Configures still in flight at the mapped-to-unmapped transition remain
 acknowledgeable until the new initial serial is acknowledged; they cannot
 authorize a buffer in the new mapping generation.
 Decoration, clipboard, drag-and-drop, subsurfaces, popups, output
-reconfiguration, fractional scale, screen capture, data devices, and client
-pointer input are not yet advertised. Unknown objects, malformed sizes,
+reconfiguration, fractional scale, screen capture, data devices, pointer
+axes, and touch are not yet advertised. Unknown objects, malformed sizes,
 invalid object reuse, missing file descriptors, and unsupported requests
 disconnect only that client.
 
-The server advertises `wl_seat` version 7 as `td-seat0` with only the keyboard
-capability. Every `wl_keyboard` receives a dependency-free, self-contained US
-XKB v1 keymap through a descriptor for one process-wide backing file. The
-file is created beside the Wayland socket in its private runtime directory,
-created owner-only and normalized to mode 0600 so an unusual umask cannot
-remove owner read access, reopened read-only, and unlinked before the server
-accepts clients. Repeated `get_keyboard` requests send descriptors for that
-same inode rather than creating unbounded keymap files. Repeat information is
-25 keys per second after a 600 millisecond delay. The map covers the PC
-alphanumeric block, modifiers, function keys, navigation keys, keypad, and
-the supported media keys. It uses the standard XKB masks: Shift, Control,
-Mod1 for Alt, Mod2 for Num Lock, and Mod4 for Super. Caps Lock and Num Lock
-are sent as locked rather than depressed modifiers. Modifier and lock keys
-are explicitly non-repeating. The first profile's keypad is digits-only:
-Num Lock state is reported but does not select navigation symbols.
+The server advertises `wl_seat` version 7 as `td-seat0` with keyboard and
+pointer capabilities. Every `wl_keyboard` receives a dependency-free,
+self-contained US XKB v1 keymap through a descriptor for one process-wide
+backing file. The file is created beside the Wayland socket in its private
+runtime directory, created owner-only and normalized to mode 0600 so an
+unusual umask cannot remove owner read access, reopened read-only, and
+unlinked before the server accepts clients. Repeated `get_keyboard` requests
+send descriptors for that same inode rather than creating unbounded keymap
+files. Repeat information is 25 keys per second after a 600 millisecond
+delay. The map covers the PC alphanumeric block, modifiers, function keys,
+navigation keys, keypad, and the supported media keys. It uses the standard
+XKB masks: Shift, Control, Mod1 for Alt, Mod2 for Num Lock, and Mod4 for
+Super. Caps Lock and Num Lock are sent as locked rather than depressed
+modifiers. Modifier and lock keys are explicitly non-repeating. The first
+profile's keypad is digits-only: Num Lock state is reported but does not
+select navigation symbols.
 
 Only the visible activated XDG toplevel has keyboard focus. Focus changes
 produce an ordered leave, enter, and modifier snapshot; enter carries the
@@ -219,8 +279,9 @@ already exists receives the same enter/modifier snapshot after its keymap.
 One routed seat event receives one serial shared by every existing keyboard
 resource to which that event is delivered. A newly bound keyboard's initial
 enter and modifier snapshot are separate events with fresh serials.
-The per-client runtime queue is active only while that client owns at least
-one keyboard resource, so keyboard-agnostic clients receive no deliveries.
+The keyboard side of the per-client seat queue is active only while that
+client owns at least one keyboard resource, so keyboard-agnostic clients
+receive no keyboard deliveries.
 Evdev timestamps cross the adapter as explicit milliseconds modulo 2^32.
 They retain evdev's default realtime clock and can step when wall time changes;
 selecting a monotonic clock would require a separately reviewed ioctl surface.
@@ -235,26 +296,86 @@ After `SYN_DROPPED`, the adapter releases that node's state, cancels a partial
 prefix, discards records through the next `SYN_REPORT`, and resumes without
 guessing the lost state.
 Before a surface id is released, its `wl_display.delete_id` is placed in the
-bounded keyboard queue after the focus update. The worker therefore writes
+bounded seat queue after the focus update. The worker therefore writes
 the queued leave first without making request dispatch wait for socket
 backpressure. The numeric object id has an independent reservation until that
 ordered `delete_id` write completes, so its premature reuse cannot stall
 unrelated ids. Queue saturation closes the subscription and makes deletion
 fail closed rather than allowing a stale surface reference onto the wire.
 Keyboard objects may be released at their negotiated protocol version.
-`get_pointer` and `get_touch` fail with `wl_seat.missing_capability` because
-neither capability is advertised.
+`get_touch` fails with `wl_seat.missing_capability` because touch is not
+advertised.
+
+Pointer focus is the visible surface pixel under the software cursor. Gaps,
+borders, clipped-away pixels, empty tile space, and pixels excluded by the
+surface's committed input region have no pointer focus. A region retains at
+most 256 nondegenerate add/subtract operations and one client can retain at
+most 4,096 operations across surface snapshots. Overflow and degenerate
+requests are bounded no-ops. `set_input_region` takes an immutable
+copy-on-write snapshot immediately, and the pending snapshot takes effect
+atomically on the next surface commit; later mutation or destruction of the
+region object cannot change it. A null region restores the default infinite
+input region. Enter and motion coordinates are surface-local integers encoded
+as checked 24.8 `wl_fixed` values. Motion is coalesced through the evdev
+`SYN_REPORT` boundary, preserving its explicit timestamp. Pointer objects at
+version 5 or newer receive one `wl_pointer.frame` after each logical delivery;
+a leave and enter caused by one focus transition form one delivery. Objects
+before version 5 receive the same events without a frame, and `release` is
+accepted only from version 3 onward.
+When a retile changes local coordinates under a stationary cursor, the
+synthetic motion reuses the most recent evdev timestamp, or zero before the
+first evdev frame; it is a coordinate refresh rather than a gesture clock.
+
+Mouse buttons from `BTN_MOUSE` through `BTN_TASK` retain their Linux evdev
+codes on the wire. Duplicate physical presses and unmatched releases are
+suppressed across the logical seat. Logical edges are derived from global
+physical and delivered state only when a device reaches `SYN_REPORT`, so
+reports from two devices cannot reorder a replacement press behind the last
+release. A press starts Wayland's implicit grab: motion and further buttons
+continue to the pressed surface until every button is released. If another
+press follows the last release in the same frame, focus first reconciles with
+the surface under the cursor and the new grab starts there. Removing or hiding
+the grabbed surface cancels the grab and reconciles focus without leaving a
+stale surface reference. Partial button or motion records are discarded on
+`SYN_DROPPED`; delivered button state is tracked separately so recovery
+releases only buttons the client had actually seen. A report retains at most
+64 button transitions; crossing that limit performs the same fail-closed
+release and resynchronization through the next `SYN_REPORT`. Hiding or
+destroying a grabbed surface instead cancels its delivered state and sends
+leave, because an unmapped surface is no longer a valid button target.
+
+`set_cursor` accepts a null surface or assigns the cursor role to a
+`wl_surface`, preventing later XDG-role reuse, only when its serial matches the
+latest enter sent to that client for the seat and the runtime still focuses
+that entered surface. Late pointer resources reuse the client-wide serial.
+Stale, pre-enter, and logically post-leave requests are ignored without
+consuming a role even when socket delivery of the leave is delayed; a valid
+incompatible role uses `wl_pointer.error.role`. Cursor buffers are immediately
+released and never enter the tiling scene. The first renderer continues to
+draw its fixed software cursor and deliberately ignores the requested image
+and hotspot; themed client cursors are a later rendering increment. There are
+no axis events in the PS/2 profile.
+
+Keyboard and pointer deliveries share one bounded per-client seat queue.
+Each event serial is shared by all matching resources, and a resource bound
+after an event receives an exact current snapshot rather than queued history.
+A client with neither resource receives no seat deliveries. Surface leave,
+pointer frame, and `wl_display.delete_id` therefore retain one order, and the
+object ID reservation remains held until every earlier keyboard or pointer
+event naming that surface is serialized.
 
 Resource ceilings are part of the protocol boundary: at most 32 clients run
 at once, each has at most 512 objects, 64 queued descriptors, one pending
-layout wakeup, 64 pending keyboard deliveries, and 32 MiB of committed pixels.
+layout wakeup, 64 pending seat deliveries, and 32 MiB of retained toplevel
+pixels.
 Each XDG surface has at most 32 current-generation configures. During remap it
 may additionally retain the previous generation's bounded set while the one
 new initial serial is pending, for at most 33 serials total; the tracker
 enforces the retained-generation bound itself. Output pixels, the bundled
-demo's generated buffer, and one client's aggregate committed pixels share
-the same 32 MiB ceiling, so every accepted output has a representable
-single-client tile. A framebuffer's stride-padded shadow allocation has a
+demo's generated buffer, and one client's aggregate retained toplevel pixels
+share the same 32 MiB ceiling, so every accepted output has a representable
+single-client tile. Cursor-role buffers are released without retaining their
+pixels. A framebuffer's stride-padded shadow allocation has a
 separate 64 MiB ceiling. Framebuffer and buffer dimensions share a
 16,384-pixel ceiling. At four bytes per pixel the area ceiling is 8,388,608
 pixels: tight 3840x2160 is accepted, while 4096x2160 is rejected. The complete
@@ -262,8 +383,8 @@ scene retains at most 128 MiB. Rendering clips rows and columns to the output
 before visiting pixels. These are availability bounds against a same-user
 client, not isolation between mutually distrusting users.
 
-A full keyboard queue closes that client's runtime subscription instead of
-blocking the evdev reader. The keyboard worker drains the bounded queue and
+A full seat queue closes that client's runtime subscription instead of
+blocking the evdev reader. The seat worker drains the bounded queue and
 disconnects the client when it observes the closed subscription. If that
 worker is already blocked writing to a client that does not read, the
 disconnect waits for the same accepted per-client availability gap as the
@@ -298,6 +419,14 @@ ancillary data on its Unix stream. Stable Rust 1.96 exposes no stable
 ancillary-data API. The user approved one new target-side exception for this
 transport.
 
+The demo client reads only enough stream bytes to complete its next Wayland
+event. SCM_RIGHTS descriptors can arrive with bytes that begin an earlier
+non-descriptor event, so descriptors remain in one bounded stream-order queue
+until the next event whose signature consumes one. The completed presentation
+handshake rejects any descriptor left over after all expected events. The
+descriptor queue and keymap read are bounded, and every overflow or abandoned
+connection closes all descriptors it owns.
+
 This section records the current compositor surface. Section 12 specifies a
 proposed PTY widening; its implementation landing must update this roster, the
 repository-wide inventory, and the confinement assertions atomically.
@@ -307,7 +436,8 @@ repository-wide inventory, and the confinement assertions atomically.
 
 - sendmsg(2), to send the demo client's wl_shm descriptor, the server's XKB
   keymap descriptor, or a test request;
-- recvmsg(2), to receive wl_shm pool descriptors; and
+- recvmsg(2), to receive wl_shm pool descriptors or the demo client's XKB
+  keymap descriptor; and
 - close(2), to release a received descriptor after it has been safely
   duplicated through `/proc/self/fd/N`.
 
@@ -317,6 +447,9 @@ tests pin the allow count, assembly body, syscall numbers, callers, and the
 absence of unsafe from every other target source file. Each developer tool is
 a separate crate root that also denies unsafe. Adding a syscall or another
 scoped allow amends this document and the repository-wide unsafe inventory.
+This paragraph describes the implemented surface today. The PTY adapter in
+section 12 is a gated future amendment; its ioctl requests do not enter the
+crate until that adapter and its confinement tests land together.
 
 ## 5. Boot and recovery
 
@@ -361,7 +494,9 @@ The landing must prove:
 - an SCM_RIGHTS-backed wl_shm buffer commits and is copied into the scene;
 - the boot client discovers globals, completes both initial and tile-sized XDG
   configure/ack cycles, replaces its buffer at the requested size, receives
-  wl_buffer release and a frame callback, and remains mapped;
+  wl_buffer release and a frame callback, verifies its exact keymap
+  descriptor, consumes focused keyboard and framed pointer input, redraws the
+  resulting model, and remains mapped;
 - every tiling command, split geometry edge case, workspace transition, tree
   collapse, fullscreen transition, and Emacs binding is a deterministic host
   test;
@@ -375,7 +510,7 @@ The landing must prove:
   the latest deferred layout rather than stalling;
 - a real server/client socket test resizes the demo after a second map, changes
   activation without resizing, enters fullscreen, and crosses workspaces;
-- wl_seat advertises only keyboard, sends a structurally validated
+- wl_seat advertises keyboard and pointer, sends a structurally validated
   self-contained keymap descriptor, repeat information, held keys, and all
   four modifier fields;
 - the exact serialized keymap parses with libxkbcommon 1.11, where an ordinary
@@ -383,12 +518,25 @@ The landing must prove:
   in-tree tests also pin its delimiter, type, explicit repeat exclusions,
   ordinary-key omissions, symbol, and evdev-code invariants without adding
   libxkbcommon to the target graph;
-- focus changes and ordinary evdev keys cross the bounded keyboard worker in
+- focus changes and ordinary evdev keys cross the bounded seat worker in
   order, while pre-registration events and intercepted Emacs chords do not;
-- a threaded server/client socket test binds the seat and keyboard, receives
-  focus and key events, and tears down a live keyboard registration;
 - keyboard model tests cover held-key snapshots, cross-client focus, modifier
   locks, key releases, registration cutoffs, and queue saturation;
+- pointer model tests cover enter, leave, motion, cross-client routing,
+  duplicate buttons, mid-frame re-grabs, implicit grabs, surface removal,
+  workspace cancellation, snapshots, and revision exhaustion;
+- scene tests prove pointer hit testing excludes gaps and clipped-away
+  pixels while retaining local coordinates for an implicit grab, and server
+  tests pin per-region and aggregate retained-operation ceilings;
+- evdev tests prove relative motion and logical multi-device buttons flush
+  only at `SYN_REPORT`, while EOF, `SYN_DROPPED`, and an oversized partial
+  report cannot strand a delivered button;
+- pointer wire tests cover checked fixed-point coordinates, event payloads,
+  shared serials, version-gated frame and release, cursor roles, queue
+  saturation, and leave/frame/delete ordering;
+- a threaded server/client socket test binds keyboard and pointer, receives
+  focus, motion and button delivery, releases the resources, and tears down
+  the live registrations;
 - software composition clips surfaces to tiles and never indexes outside a
   frame;
 - the image contains all three binaries, the service order is checkable, and
@@ -442,11 +590,45 @@ the final device, service, and boot seams. This keeps policy failures
 reproducible as fast host tests while retaining an end-to-end proof of the
 shipped image.
 
+The pointer state machine consumes explicit time, hover target, grabbed
+target, and button values and returns per-client event frames. It has no
+evdev, layout, socket, serial, file, or clock access. Scene hit testing maps
+the current software-cursor position to those explicit targets. Runtime tests
+compose both models with bounded subscriptions; socket tests cover only
+encoding, registration, ordering, cursor roles, and teardown.
+
+The demo UI follows the same split. Its model consumes typed keyboard updates
+and complete pointer-frame slices, has no socket, descriptor, filesystem, or
+clock access, and increments one checked revision per visible transition.
+Bitmap painting consumes an explicit XRGB slice and dimensions and clips every
+glyph. Model tests cover focus, held-state bounds, transactional rollback, and
+revision exhaustion; raster tests pin deterministic pixels, clipping, glyph
+coverage, the XRGB byte, and state-dependent pixels. Client adapter tests
+separately cover exact and growth-raced keymap descriptors, split and
+coalesced event framing, descriptor association and cleanup, event validation,
+frame boundaries, and one-in-flight render coalescing. One real server/client
+socket test composes keyboard and pointer delivery, a changed framebuffer,
+wl_shm replacement, release, and callback completion.
+
+The launcher follows the same boundary. Its pure model consumes typed actions,
+owns the query and matching indices, and returns an optional launch request;
+its renderer consumes an explicit frame slice, dimensions, and stride. Input
+tests route parsed Emacs chords and the complete accepted character set through
+a recording target, while runtime tests prove that overlay repaints do not
+mutate the tiling tree. Process policy turns a launch request and explicit
+paths into literal argv, with its active-child ceiling tested independently.
+Every overlay pixel is clipped to the computed card rectangle, including on
+an output too short for its normal layout. No launcher model or renderer reads
+input devices, sockets, clocks, the filesystem, or ambient environment.
+
 ## 8. Deferred UI stack
 
-The next increment is focused `wl_pointer` delivery from the existing evdev
-motion path. A bitmap launcher, clipboard, hotplug, and real DRM/KMS profiles
-follow. The planned terminal increment has the separate contract below.
+Focused keyboard and pointer delivery now connect the demo client to the
+existing evdev input path, and the Emacs-style launcher has a filterable
+application registry. A terminal launcher entry follows after the native
+terminal client is packaged. Clipboard, pointer axes, client cursor rendering,
+hotplug, and real DRM/KMS profiles follow. The terminal stack has the separate
+contract below.
 General Wayland toolkit compatibility is not claimed until the missing core
 protocols have explicit tests. Hardware acceleration, niri, portals, PipeWire,
 Xwayland, and a C desktop stack remain optional consumers rather than

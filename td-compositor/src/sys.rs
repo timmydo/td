@@ -16,6 +16,8 @@ const ERRNO_EINTR: isize = -4;
 #[cfg(test)]
 const ERRNO_EBADF: isize = -9;
 #[cfg(test)]
+const ERRNO_EAGAIN: isize = -11;
+#[cfg(test)]
 const ERRNO_ECONNABORTED: isize = -103;
 #[cfg(test)]
 const ERRNO_ECONNRESET: isize = -104;
@@ -239,6 +241,7 @@ pub struct Received {
 #[derive(Debug, Eq, PartialEq)]
 pub enum ReceiveError {
     Disconnected,
+    TimedOut,
     Failure(String),
 }
 
@@ -246,6 +249,7 @@ impl fmt::Display for ReceiveError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             ReceiveError::Disconnected => formatter.write_str("recvmsg: Wayland peer disconnected"),
+            ReceiveError::TimedOut => formatter.write_str("recvmsg: Wayland receive timed out"),
             ReceiveError::Failure(error) => formatter.write_str(error),
         }
     }
@@ -275,6 +279,12 @@ fn receive_result(value: isize) -> Result<usize, ReceiveError> {
     if let Some(error) = raw_errno(value) {
         if error.kind() == io::ErrorKind::ConnectionReset {
             return Err(ReceiveError::Disconnected);
+        }
+        if matches!(
+            error.kind(),
+            io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+        ) {
+            return Err(ReceiveError::TimedOut);
         }
         return Err(ReceiveError::Failure(format!("recvmsg: {error}")));
     }
@@ -488,6 +498,7 @@ mod tests {
             receive_result(ERRNO_ECONNRESET),
             Err(ReceiveError::Disconnected)
         );
+        assert_eq!(receive_result(ERRNO_EAGAIN), Err(ReceiveError::TimedOut));
         assert!(matches!(
             receive_result(ERRNO_ECONNABORTED),
             Err(ReceiveError::Failure(_))

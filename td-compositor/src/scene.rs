@@ -1,11 +1,14 @@
-use crate::layout::{Command, Layout, Rect, ViewLayout};
+use crate::launcher::{LaunchRequest, Launcher, LauncherAction};
+use crate::layout::{Command, Layout, Placement, Rect, ViewLayout};
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 pub const SHM_ARGB8888: u32 = 0;
 pub const SHM_XRGB8888: u32 = 1;
 const GAP: usize = 24;
 const BORDER: usize = 4;
 const MAX_SCENE_BYTES: usize = 128 * 1024 * 1024;
+pub const MAX_INPUT_REGION_OPERATIONS: usize = 256;
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct SurfaceKey {
@@ -20,22 +23,99 @@ pub struct Surface {
     pub format: u32,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SurfacePoint {
+    pub key: SurfaceKey,
+    pub x: i32,
+    pub y: i32,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct InputRegion {
+    operations: Vec<InputRegionOperation>,
+}
+
+pub type SharedInputRegion = Arc<InputRegion>;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct InputRegionOperation {
+    add: bool,
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+}
+
+impl InputRegion {
+    pub fn new() -> InputRegion {
+        InputRegion {
+            operations: Vec::new(),
+        }
+    }
+
+    pub fn add(&mut self, x: i32, y: i32, width: i32, height: i32) -> bool {
+        self.push(true, x, y, width, height)
+    }
+
+    pub fn subtract(&mut self, x: i32, y: i32, width: i32, height: i32) -> bool {
+        self.push(false, x, y, width, height)
+    }
+
+    pub fn len(&self) -> usize {
+        self.operations.len()
+    }
+
+    fn push(&mut self, add: bool, x: i32, y: i32, width: i32, height: i32) -> bool {
+        if width <= 0 || height <= 0 || self.operations.len() >= MAX_INPUT_REGION_OPERATIONS {
+            return false;
+        }
+        self.operations.push(InputRegionOperation {
+            add,
+            x,
+            y,
+            width,
+            height,
+        });
+        true
+    }
+
+    fn contains(&self, x: i32, y: i32) -> bool {
+        let x = i64::from(x);
+        let y = i64::from(y);
+        let mut contains = false;
+        for operation in &self.operations {
+            let left = i64::from(operation.x);
+            let top = i64::from(operation.y);
+            let right = left.saturating_add(i64::from(operation.width));
+            let bottom = top.saturating_add(i64::from(operation.height));
+            if x >= left && x < right && y >= top && y < bottom {
+                contains = operation.add;
+            }
+        }
+        contains
+    }
+}
+
 pub struct Scene {
     surfaces: BTreeMap<SurfaceKey, Surface>,
+    input_regions: BTreeMap<SurfaceKey, SharedInputRegion>,
     layout: Layout,
     pointer_x: i32,
     pointer_y: i32,
     surface_bytes: usize,
+    launcher: Launcher,
 }
 
 impl Scene {
     pub fn new() -> Scene {
         Scene {
             surfaces: BTreeMap::new(),
+            input_regions: BTreeMap::new(),
             layout: Layout::new(),
             pointer_x: 0,
             pointer_y: 0,
             surface_bytes: 0,
+            launcher: Launcher::new(),
         }
     }
 
@@ -66,7 +146,20 @@ impl Scene {
         Ok(is_new)
     }
 
+    pub fn set_input_region(&mut self, key: SurfaceKey, region: Option<SharedInputRegion>) -> bool {
+        if !self.surfaces.contains_key(&key) {
+            return false;
+        }
+        if let Some(region) = region {
+            self.input_regions.insert(key, region);
+        } else {
+            self.input_regions.remove(&key);
+        }
+        true
+    }
+
     fn discard_pixels(&mut self, key: SurfaceKey) -> bool {
+        self.input_regions.remove(&key);
         if let Some(surface) = self.surfaces.remove(&key) {
             self.surface_bytes = self.surface_bytes.saturating_sub(surface.pixels.len());
             return true;
@@ -98,6 +191,7 @@ impl Scene {
                 total.saturating_add(surface.pixels.len())
             });
         self.surfaces.retain(|key, _| key.client != client);
+        self.input_regions.retain(|key, _| key.client != client);
         self.surface_bytes = self.surface_bytes.saturating_sub(removed);
         self.layout.unmap_client(client);
         layout_changed
@@ -105,6 +199,22 @@ impl Scene {
 
     pub fn command(&mut self, command: Command) {
         self.layout.apply(command);
+    }
+
+    pub fn launcher(&mut self, action: LauncherAction) -> Option<LaunchRequest> {
+        self.launcher.apply(action)
+    }
+
+    pub fn launcher_visible(&self) -> bool {
+        self.launcher.visible()
+    }
+
+    pub fn launcher_checkpoint(&self) -> Launcher {
+        self.launcher.clone()
+    }
+
+    pub fn restore_launcher(&mut self, launcher: Launcher) {
+        self.launcher = launcher;
     }
 
     pub fn views(&self, width: usize, height: usize) -> Vec<ViewLayout> {
@@ -127,6 +237,94 @@ impl Scene {
         let max_y = i32::try_from(height.saturating_sub(1)).unwrap_or(i32::MAX);
         self.pointer_x = self.pointer_x.saturating_add(dx).clamp(0, max_x);
         self.pointer_y = self.pointer_y.saturating_add(dy).clamp(0, max_y);
+    }
+
+    #[cfg(test)]
+    pub fn pointer_target(&self, width: usize, height: usize) -> Option<SurfacePoint> {
+        let placements = self.layout.placements(width, height, GAP);
+        self.pointer_target_from(&placements)
+    }
+
+    fn pointer_target_from(&self, placements: &[Placement]) -> Option<SurfacePoint> {
+        let x = usize::try_from(self.pointer_x).ok()?;
+        let y = usize::try_from(self.pointer_y).ok()?;
+        for placement in placements {
+            let Some(surface) = self.surfaces.get(&placement.key) else {
+                continue;
+            };
+            let surface_width = surface.width.min(placement.rect.width);
+            let surface_height = surface.height.min(placement.rect.height);
+            let Some(end_x) = placement.rect.x.checked_add(surface_width) else {
+                continue;
+            };
+            let Some(end_y) = placement.rect.y.checked_add(surface_height) else {
+                continue;
+            };
+            if x < placement.rect.x || x >= end_x || y < placement.rect.y || y >= end_y {
+                continue;
+            }
+            let local_x = i32::try_from(x.saturating_sub(placement.rect.x)).ok()?;
+            let local_y = i32::try_from(y.saturating_sub(placement.rect.y)).ok()?;
+            if self
+                .input_regions
+                .get(&placement.key)
+                .is_some_and(|region| !region.contains(local_x, local_y))
+            {
+                continue;
+            }
+            return Some(SurfacePoint {
+                key: placement.key,
+                x: local_x,
+                y: local_y,
+            });
+        }
+        None
+    }
+
+    #[cfg(test)]
+    pub fn pointer_target_for(
+        &self,
+        key: SurfaceKey,
+        width: usize,
+        height: usize,
+    ) -> Option<SurfacePoint> {
+        let placements = self.layout.placements(width, height, GAP);
+        self.pointer_target_for_from(key, &placements)
+    }
+
+    fn pointer_target_for_from(
+        &self,
+        key: SurfaceKey,
+        placements: &[Placement],
+    ) -> Option<SurfacePoint> {
+        placements
+            .iter()
+            .filter(|placement| placement.key == key)
+            .map(|placement| placement.rect)
+            .next()
+            .and_then(|rect| {
+                self.surfaces.get(&key)?;
+                let origin_x = i32::try_from(rect.x).ok()?;
+                let origin_y = i32::try_from(rect.y).ok()?;
+                Some(SurfacePoint {
+                    key,
+                    x: self.pointer_x.saturating_sub(origin_x),
+                    y: self.pointer_y.saturating_sub(origin_y),
+                })
+            })
+    }
+
+    pub fn pointer_targets(
+        &self,
+        grab: Option<SurfaceKey>,
+        width: usize,
+        height: usize,
+    ) -> (Option<SurfacePoint>, Option<SurfacePoint>) {
+        let placements = self.layout.placements(width, height, GAP);
+        (
+            self.pointer_target_from(&placements),
+            grab.and_then(|key| self.pointer_target_for_from(key, &placements)),
+        )
     }
 
     pub fn render(&self, frame: &mut [u8], width: usize, height: usize, stride: usize) {
@@ -173,6 +371,7 @@ impl Scene {
             };
             draw_surface(frame, width, height, stride, placement.rect, surface);
         }
+        self.launcher.paint(frame, width, height, stride);
         draw_pointer(frame, width, height, stride, self.pointer_x, self.pointer_y);
     }
 }
@@ -615,6 +814,86 @@ mod tests {
         assert_eq!((scene.pointer_x, scene.pointer_y), (9, 7));
         scene.move_pointer(1, 1, 0, 0);
         assert_eq!((scene.pointer_x, scene.pointer_y), (0, 0));
+    }
+
+    #[test]
+    fn pointer_hit_testing_uses_visible_surface_pixels_and_local_coordinates() {
+        let mut scene = Scene::new();
+        let key = SurfaceKey {
+            client: 4,
+            object: 9,
+        };
+        scene
+            .commit(
+                key,
+                Surface {
+                    width: 10,
+                    height: 8,
+                    pixels: vec![0; 10 * 8 * 4],
+                    format: SHM_XRGB8888,
+                },
+            )
+            .unwrap();
+        let view = scene.views(100, 80).first().copied().unwrap();
+        let x = i32::try_from(view.rect.x.saturating_add(3)).unwrap();
+        let y = i32::try_from(view.rect.y.saturating_add(4)).unwrap();
+        scene.move_pointer(x, y, 100, 80);
+        assert_eq!(
+            scene.pointer_target(100, 80),
+            Some(SurfacePoint { key, x: 3, y: 4 })
+        );
+
+        scene.move_pointer(20, 0, 100, 80);
+        assert_eq!(scene.pointer_target(100, 80), None);
+        assert_eq!(
+            scene.pointer_target_for(key, 100, 80),
+            Some(SurfacePoint { key, x: 23, y: 4 })
+        );
+        scene.unmap(key);
+        assert_eq!(scene.pointer_target_for(key, 100, 80), None);
+    }
+
+    #[test]
+    fn input_regions_include_additions_exclude_holes_and_reset_to_infinite() {
+        let mut scene = Scene::new();
+        let key = SurfaceKey {
+            client: 4,
+            object: 9,
+        };
+        scene.commit(key, surface([1, 2, 3, 0], 10, 8)).unwrap();
+        let view = scene.views(100, 80).first().copied().unwrap();
+        let x = i32::try_from(view.rect.x.saturating_add(3)).unwrap();
+        let y = i32::try_from(view.rect.y.saturating_add(4)).unwrap();
+        scene.move_pointer(x, y, 100, 80);
+
+        let empty = InputRegion::new();
+        assert!(scene.set_input_region(key, Some(Arc::new(empty))));
+        assert_eq!(scene.pointer_target(100, 80), None);
+
+        let mut region = InputRegion::new();
+        assert!(region.add(0, 0, 10, 8));
+        assert!(region.subtract(2, 3, 3, 3));
+        assert!(scene.set_input_region(key, Some(Arc::new(region))));
+        assert_eq!(scene.pointer_target(100, 80), None);
+        scene.move_pointer(-2, -3, 100, 80);
+        assert_eq!(
+            scene.pointer_target(100, 80),
+            Some(SurfacePoint { key, x: 1, y: 1 })
+        );
+
+        assert!(scene.set_input_region(key, None));
+        scene.move_pointer(2, 3, 100, 80);
+        assert_eq!(
+            scene.pointer_target(100, 80),
+            Some(SurfacePoint { key, x: 3, y: 4 })
+        );
+        let mut bounded = InputRegion::new();
+        assert!(!bounded.add(0, 0, 0, 1));
+        for x in 0..MAX_INPUT_REGION_OPERATIONS {
+            assert!(bounded.add(i32::try_from(x).unwrap(), 0, 1, 1));
+        }
+        assert!(!bounded.add(0, 0, 1, 1));
+        assert_eq!(bounded.len(), MAX_INPUT_REGION_OPERATIONS);
     }
 
     #[test]

@@ -5,13 +5,16 @@ mod configure;
 mod framebuffer;
 mod input;
 mod keyboard;
+mod launcher;
 mod layout;
+mod pointer;
 mod runtime;
 mod scene;
 mod server;
 mod socket;
 mod sys;
 mod term;
+mod ui;
 mod wire;
 
 use framebuffer::Framebuffer;
@@ -25,8 +28,8 @@ const MAX_UI_DIMENSION: usize = 16_384;
 const MAX_UI_FRAME_BYTES: usize = 32 * 1024 * 1024;
 
 fn usage() -> String {
-    "usage: td-compositor run --framebuffer PATH --input DIR --socket PATH | \
-     td-compositor probe SOCKET | td-compositor selftest"
+    "usage: td-compositor run --framebuffer PATH --input DIR --socket PATH \
+     --launcher-client PATH | td-compositor probe SOCKET | td-compositor selftest"
         .into()
 }
 
@@ -40,12 +43,14 @@ struct RunOptions {
     framebuffer: PathBuf,
     input: PathBuf,
     socket: PathBuf,
+    launcher_client: PathBuf,
 }
 
 fn parse_run(args: &[String]) -> Result<RunOptions, String> {
     let mut framebuffer = None;
     let mut input = None;
     let mut socket = None;
+    let mut launcher_client = None;
     let mut index = 0;
     while index < args.len() {
         let flag = args
@@ -58,8 +63,11 @@ fn parse_run(args: &[String]) -> Result<RunOptions, String> {
             "--framebuffer" if framebuffer.is_none() => framebuffer = Some(PathBuf::from(value)),
             "--input" if input.is_none() => input = Some(PathBuf::from(value)),
             "--socket" if socket.is_none() => socket = Some(PathBuf::from(value)),
-            "--framebuffer" | "--input" | "--socket" => {
-                return Err(format!("duplicate flag '{flag}'"));
+            "--launcher-client" if launcher_client.is_none() => {
+                launcher_client = Some(PathBuf::from(value))
+            }
+            "--framebuffer" | "--input" | "--socket" | "--launcher-client" => {
+                return Err(format!("duplicate flag '{flag}'"))
             }
             _ => return Err(format!("unrecognised argument '{flag}'")),
         }
@@ -69,6 +77,8 @@ fn parse_run(args: &[String]) -> Result<RunOptions, String> {
         framebuffer: framebuffer.ok_or_else(|| "--framebuffer is required".to_string())?,
         input: input.ok_or_else(|| "--input is required".to_string())?,
         socket: socket.ok_or_else(|| "--socket is required".to_string())?,
+        launcher_client: launcher_client
+            .ok_or_else(|| "--launcher-client is required".to_string())?,
     })
 }
 
@@ -80,7 +90,14 @@ fn run_compositor(options: RunOptions) -> Result<(), String> {
         .lock()
         .map_err(|_| "runtime lock poisoned".to_string())?
         .repaint()?;
-    let inputs = input::start(&options.input, Arc::clone(&runtime))?;
+    let inputs = input::start(
+        &options.input,
+        Arc::clone(&runtime),
+        launcher::LaunchOptions {
+            socket: options.socket.clone(),
+            client: options.launcher_client,
+        },
+    )?;
     eprintln!(
         "td-compositor: software output {}x{} stride={} inputs={inputs}",
         geometry.0, geometry.1, geometry.2
@@ -216,8 +233,41 @@ fn main() {
 }
 
 #[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn launcher_command_round_trips_through_the_client_parser() {
+        let launch = launcher::LaunchOptions {
+            socket: PathBuf::from("/run/user/1000/wayland-0"),
+            client: PathBuf::from("/bin/td-ui-demo"),
+        };
+        let (program, arguments, ready_socket) =
+            launcher::launch_command(&launch, launcher::LaunchRequest::UiDemo, 7).unwrap();
+        let arguments: Vec<String> = arguments
+            .into_iter()
+            .map(|argument| argument.into_string().unwrap())
+            .collect();
+        assert_eq!(program, launch.client);
+        assert_eq!(arguments.first().map(String::as_str), Some("run"));
+        let parsed = parse_client_run(arguments.get(1..).unwrap()).unwrap();
+        assert_eq!(parsed.socket, launch.socket);
+        assert_eq!(parsed.ready_socket, ready_socket);
+        assert_eq!(
+            parsed.ready_socket.parent(),
+            Some(Path::new("/run/user/1000"))
+        );
+        let ready_name = parsed.ready_socket.file_name().unwrap().to_string_lossy();
+        assert!(ready_name.starts_with("td-launcher-"));
+        assert!(ready_name.ends_with("-7.ready"));
+    }
+}
+
+#[cfg(test)]
 mod confinement {
+    const IMPORTER: &str = include_str!("../tools/import-libvterm.rs");
     const MAIN: &str = include_str!("main.rs");
+    const SHARED_SHA256: &str = include_str!("../../engine/src/sha256.rs");
     const SYS: &str = include_str!("sys.rs");
     const OTHER: &[(&str, &str)] = &[
         ("client.rs", include_str!("client.rs")),
@@ -225,12 +275,15 @@ mod confinement {
         ("framebuffer.rs", include_str!("framebuffer.rs")),
         ("input.rs", include_str!("input.rs")),
         ("keyboard.rs", include_str!("keyboard.rs")),
+        ("launcher.rs", include_str!("launcher.rs")),
         ("layout.rs", include_str!("layout.rs")),
+        ("pointer.rs", include_str!("pointer.rs")),
         ("runtime.rs", include_str!("runtime.rs")),
         ("scene.rs", include_str!("scene.rs")),
         ("server.rs", include_str!("server.rs")),
         ("socket.rs", include_str!("socket.rs")),
         ("term.rs", include_str!("term.rs")),
+        ("ui.rs", include_str!("ui.rs")),
         ("wire.rs", include_str!("wire.rs")),
     ];
     const TEST_ONLY: &[(&str, &str)] = &[("term_spec.rs", include_str!("term_spec.rs"))];
@@ -258,6 +311,16 @@ mod confinement {
         declared.sort_unstable();
         inventoried.sort_unstable();
         assert_eq!(inventoried, declared);
+    }
+
+    #[test]
+    fn importer_is_a_safe_standalone_crate_root() {
+        assert!(IMPORTER.starts_with("#![deny(unsafe_code)]"));
+        assert_eq!(occurrences(IMPORTER, "unsafe"), 1);
+        assert_eq!(occurrences(IMPORTER, "#[allow(unsafe_code)]"), 0);
+        assert_eq!(occurrences(IMPORTER, "core::arch::asm!"), 0);
+        assert_eq!(occurrences(SHARED_SHA256, "unsafe"), 0);
+        assert_eq!(occurrences(SHARED_SHA256, "core::arch::asm!"), 0);
     }
 
     #[test]
@@ -409,17 +472,30 @@ fn syscall3(number: usize, a1: usize, a2: usize, a3: usize) -> isize {
             "/dev/input".into(),
             "--socket".into(),
             "/run/user/1000/wayland-0".into(),
+            "--launcher-client".into(),
+            "/bin/td-ui-demo".into(),
         ])
         .unwrap();
         assert_eq!(options.framebuffer, std::path::PathBuf::from("/dev/fb0"));
-        assert!(
-            super::parse_run(&[
-                "--framebuffer".into(),
-                "/dev/fb0".into(),
-                "--socket".into(),
-                "/run/user/1000/wayland-0".into(),
-            ])
-            .is_err()
+        assert_eq!(
+            options.launcher_client,
+            std::path::PathBuf::from("/bin/td-ui-demo")
         );
+        assert!(super::parse_run(&[
+            "--framebuffer".into(),
+            "/dev/fb0".into(),
+            "--input".into(),
+            "/dev/input".into(),
+            "--socket".into(),
+            "/run/user/1000/wayland-0".into(),
+        ])
+        .is_err());
+        assert!(super::parse_run(&[
+            "--framebuffer".into(),
+            "/dev/fb0".into(),
+            "--socket".into(),
+            "/run/user/1000/wayland-0".into(),
+        ])
+        .is_err());
     }
 }

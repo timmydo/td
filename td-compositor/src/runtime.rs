@@ -2,8 +2,13 @@ use crate::framebuffer::Framebuffer;
 use crate::keyboard::{
     KeyInput, KeyboardSnapshot, KeyboardState, ModifierState, RoutedKeyboardEvent,
 };
+use crate::launcher::{LaunchRequest, LauncherAction};
 use crate::layout::{Command, ViewLayout};
-use crate::scene::{Scene, Surface, SurfaceKey};
+use crate::pointer::{
+    PointerButtonInput, PointerButtonState, PointerSnapshot, PointerState, PointerTarget,
+    RoutedPointerFrame,
+};
+use crate::scene::{Scene, SharedInputRegion, Surface, SurfaceKey};
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
@@ -59,11 +64,13 @@ impl KeyboardSubscriptionStop {
 #[derive(Clone)]
 struct KeyboardSender {
     channel: Arc<Mutex<KeyboardChannel>>,
-    active: Arc<AtomicBool>,
+    keyboard_active: Arc<AtomicBool>,
+    pointer_active: Arc<AtomicBool>,
 }
 
 pub enum KeyboardDelivery {
     Event(RoutedKeyboardEvent),
+    Pointer(RoutedPointerFrame),
     DeleteId(u32),
 }
 
@@ -82,10 +89,17 @@ enum KeyboardQueueResult {
 
 impl KeyboardSender {
     fn try_send_event(&self, event: RoutedKeyboardEvent) -> KeyboardQueueResult {
-        if !self.active.load(Ordering::Acquire) {
+        if !self.keyboard_active.load(Ordering::Acquire) {
             return KeyboardQueueResult::Sent;
         }
         self.try_send(KeyboardDelivery::Event(event))
+    }
+
+    fn try_send_pointer(&self, frame: RoutedPointerFrame) -> KeyboardQueueResult {
+        if !self.pointer_active.load(Ordering::Acquire) {
+            return KeyboardQueueResult::Sent;
+        }
+        self.try_send(KeyboardDelivery::Pointer(frame))
     }
 
     fn try_send(&self, delivery: KeyboardDelivery) -> KeyboardQueueResult {
@@ -138,6 +152,7 @@ pub struct Runtime {
     layout: Arc<BTreeMap<SurfaceKey, ViewLayout>>,
     subscribers: BTreeMap<u64, SyncSender<()>>,
     keyboard: KeyboardState,
+    pointer: PointerState,
     keyboard_subscribers: BTreeMap<u64, KeyboardSender>,
 }
 
@@ -149,6 +164,7 @@ impl Runtime {
             layout: Arc::new(BTreeMap::new()),
             subscribers: BTreeMap::new(),
             keyboard: KeyboardState::default(),
+            pointer: PointerState::default(),
             keyboard_subscribers: BTreeMap::new(),
         }
     }
@@ -165,11 +181,39 @@ impl Runtime {
         self.framebuffer.paint(&self.scene)
     }
 
+    #[cfg(test)]
     pub fn commit(&mut self, key: SurfaceKey, surface: Surface) -> Result<(), String> {
         let layout_changed = self.scene.commit(key, surface)?;
+        self.finish_commit(layout_changed)
+    }
+
+    pub fn commit_with_input_region(
+        &mut self,
+        key: SurfaceKey,
+        surface: Surface,
+        input_region: Option<SharedInputRegion>,
+    ) -> Result<(), String> {
+        let layout_changed = self.scene.commit(key, surface)?;
+        self.scene.set_input_region(key, input_region);
+        self.finish_commit(layout_changed)
+    }
+
+    fn finish_commit(&mut self, layout_changed: bool) -> Result<(), String> {
         self.repaint()?;
+        self.refresh_focus()?;
         if layout_changed && self.refresh_layout()? {
             self.publish_layout();
+        }
+        Ok(())
+    }
+
+    pub fn set_input_region(
+        &mut self,
+        key: SurfaceKey,
+        input_region: Option<SharedInputRegion>,
+    ) -> Result<(), String> {
+        if self.scene.set_input_region(key, input_region) {
+            self.refresh_focus()?;
         }
         Ok(())
     }
@@ -177,6 +221,7 @@ impl Runtime {
     pub fn remove(&mut self, key: SurfaceKey) -> Result<(), String> {
         let layout_changed = self.scene.remove(key);
         self.repaint()?;
+        self.refresh_focus()?;
         if layout_changed && self.refresh_layout()? {
             self.publish_layout();
         }
@@ -186,6 +231,7 @@ impl Runtime {
     pub fn unmap(&mut self, key: SurfaceKey) -> Result<(), String> {
         let layout_changed = self.scene.unmap(key);
         self.repaint()?;
+        self.refresh_focus()?;
         if layout_changed && self.refresh_layout()? {
             self.publish_layout();
         }
@@ -195,6 +241,7 @@ impl Runtime {
     pub fn remove_client(&mut self, client: u64) -> Result<(), String> {
         let layout_changed = self.scene.remove_client(client);
         self.repaint()?;
+        self.refresh_focus()?;
         if layout_changed && self.refresh_layout()? {
             self.publish_layout();
         }
@@ -204,16 +251,70 @@ impl Runtime {
     pub fn command(&mut self, command: Command) -> Result<(), String> {
         self.scene.command(command);
         self.repaint()?;
+        self.refresh_focus()?;
         if self.refresh_layout()? {
             self.publish_layout();
         }
         Ok(())
     }
 
-    pub fn move_pointer(&mut self, dx: i32, dy: i32) -> Result<(), String> {
+    pub fn launcher(&mut self, action: LauncherAction) -> Result<Option<LaunchRequest>, String> {
+        let checkpoint = self.scene.launcher_checkpoint();
+        let request = self.scene.launcher(action);
+        if let Err(error) = self.repaint() {
+            self.scene.restore_launcher(checkpoint);
+            return Err(error);
+        }
+        if let Err(error) = self.refresh_focus() {
+            self.scene.restore_launcher(checkpoint);
+            if let Err(restore_error) = self.repaint() {
+                return Err(format!(
+                    "{error}; restore launcher after focus failure: {restore_error}"
+                ));
+            }
+            return Err(error);
+        }
+        Ok(request)
+    }
+
+    pub fn launcher_visible(&self) -> bool {
+        self.scene.launcher_visible()
+    }
+
+    #[cfg(test)]
+    pub fn fail_next_repaint(&mut self) {
+        self.framebuffer.fail_next_paint();
+    }
+
+    pub fn pointer_frame(
+        &mut self,
+        time: u32,
+        dx: i32,
+        dy: i32,
+        buttons: &[PointerButtonInput],
+    ) -> Result<(), String> {
         self.scene
             .move_pointer(dx, dy, self.framebuffer.width, self.framebuffer.height);
-        self.repaint()
+        let modal = self.scene.launcher_visible();
+        let (hover, grab) = self.routed_pointer_targets();
+        let mut modal_buttons = Vec::new();
+        let buttons = if modal {
+            modal_buttons.extend(
+                buttons
+                    .iter()
+                    .copied()
+                    .filter(|button| button.state == PointerButtonState::Released),
+            );
+            &modal_buttons
+        } else {
+            buttons
+        };
+        let frames = self.pointer.frame(time, hover, grab, buttons)?;
+        self.publish_pointer(frames);
+        if dx != 0 || dy != 0 {
+            self.repaint()?;
+        }
+        Ok(())
     }
 
     pub fn key(&mut self, input: KeyInput) -> Result<(), String> {
@@ -232,6 +333,10 @@ impl Runtime {
 
     pub fn keyboard_snapshot(&self) -> KeyboardSnapshot {
         self.keyboard.snapshot()
+    }
+
+    pub fn pointer_snapshot(&self) -> PointerSnapshot {
+        self.pointer.snapshot()
     }
 
     pub fn layout_snapshot(&self) -> Arc<BTreeMap<SurfaceKey, ViewLayout>> {
@@ -269,10 +374,20 @@ impl Runtime {
         self.subscribe_keyboard_with_activity(id, Arc::new(AtomicBool::new(true)))
     }
 
+    #[cfg(test)]
     pub fn subscribe_keyboard_with_activity(
         &mut self,
         id: u64,
-        active: Arc<AtomicBool>,
+        keyboard_active: Arc<AtomicBool>,
+    ) -> Result<KeyboardSubscription, String> {
+        self.subscribe_input_with_activity(id, keyboard_active, Arc::new(AtomicBool::new(false)))
+    }
+
+    pub fn subscribe_input_with_activity(
+        &mut self,
+        id: u64,
+        keyboard_active: Arc<AtomicBool>,
+        pointer_active: Arc<AtomicBool>,
     ) -> Result<KeyboardSubscription, String> {
         if self.keyboard_subscribers.contains_key(&id) {
             return Err(format!("keyboard subscriber {id} already exists"));
@@ -280,7 +395,8 @@ impl Runtime {
         let (sender, receiver) = mpsc::sync_channel(MAX_PENDING_KEYBOARD_DELIVERIES);
         let sender = KeyboardSender {
             channel: Arc::new(Mutex::new(KeyboardChannel::Open(sender))),
-            active,
+            keyboard_active,
+            pointer_active,
         };
         self.keyboard_subscribers.insert(id, sender.clone());
         Ok(KeyboardSubscription {
@@ -302,14 +418,16 @@ impl Runtime {
         let Some(sender) = self.keyboard_subscribers.get(&id).cloned() else {
             return Ok(false);
         };
-        if !sender.active.load(Ordering::Acquire) {
+        if !sender.keyboard_active.load(Ordering::Acquire)
+            && !sender.pointer_active.load(Ordering::Acquire)
+        {
             return Ok(false);
         }
         match sender.try_send(KeyboardDelivery::DeleteId(object)) {
             KeyboardQueueResult::Sent => Ok(true),
             KeyboardQueueResult::Closed => Ok(false),
             KeyboardQueueResult::Overflowed => Err(format!(
-                "keyboard event queue overflowed before deleting object {object}"
+                "seat event queue overflowed before deleting object {object}"
             )),
         }
     }
@@ -331,8 +449,6 @@ impl Runtime {
             .into_iter()
             .map(|view| (view.key, view))
             .collect();
-        let events = self.keyboard.set_focus(self.scene.focused())?;
-        self.publish_keyboard(events);
         if self.layout.as_ref() == &next {
             return Ok(false);
         }
@@ -364,6 +480,56 @@ impl Runtime {
             self.keyboard_subscribers.remove(&client);
         }
     }
+
+    fn refresh_focus(&mut self) -> Result<(), String> {
+        let keyboard = self.keyboard.set_focus(self.scene.focused())?;
+        self.publish_keyboard(keyboard);
+        let (hover, grab) = self.routed_pointer_targets();
+        let pointer = self.pointer.refresh(hover, grab)?;
+        self.publish_pointer(pointer);
+        Ok(())
+    }
+
+    fn routed_pointer_targets(&self) -> (Option<PointerTarget>, Option<PointerTarget>) {
+        if !self.scene.launcher_visible() {
+            return self.pointer_targets();
+        }
+        let (_, grab) = self.pointer_targets();
+        (None, grab)
+    }
+
+    fn pointer_targets(&self) -> (Option<PointerTarget>, Option<PointerTarget>) {
+        let (hover, grab) = self.scene.pointer_targets(
+            self.pointer.grab_surface(),
+            self.framebuffer.width,
+            self.framebuffer.height,
+        );
+        (
+            hover.map(|point| PointerTarget {
+                surface: point.key,
+                x: point.x,
+                y: point.y,
+            }),
+            grab.map(|point| PointerTarget {
+                surface: point.key,
+                x: point.x,
+                y: point.y,
+            }),
+        )
+    }
+
+    fn publish_pointer(&mut self, frames: Vec<RoutedPointerFrame>) {
+        for frame in frames {
+            let client = frame.client;
+            let result = self
+                .keyboard_subscribers
+                .get(&client)
+                .map(|sender| sender.try_send_pointer(frame));
+            if matches!(result, Some(KeyboardQueueResult::Closed)) {
+                self.keyboard_subscribers.remove(&client);
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -371,6 +537,7 @@ mod tests {
     use super::*;
     use crate::keyboard::{KeyState, KeyboardEvent, MOD_SHIFT};
     use crate::layout::{Axis, Direction};
+    use crate::pointer::{PointerButtonState, PointerEvent};
     use crate::scene::SHM_XRGB8888;
     use std::fs;
     use std::path::PathBuf;
@@ -398,6 +565,21 @@ mod tests {
     fn recv_event(receiver: &Receiver<KeyboardDelivery>) -> RoutedKeyboardEvent {
         match receiver.recv().unwrap() {
             KeyboardDelivery::Event(event) => event,
+            KeyboardDelivery::Pointer(frame) => {
+                panic!("unexpected pointer frame for client {}", frame.client);
+            }
+            KeyboardDelivery::DeleteId(id) => {
+                panic!("unexpected queued delete_id for {id}");
+            }
+        }
+    }
+
+    fn recv_pointer(receiver: &Receiver<KeyboardDelivery>) -> RoutedPointerFrame {
+        match receiver.recv().unwrap() {
+            KeyboardDelivery::Pointer(frame) => frame,
+            KeyboardDelivery::Event(event) => {
+                panic!("unexpected keyboard event revision {}", event.revision);
+            }
             KeyboardDelivery::DeleteId(id) => {
                 panic!("unexpected queued delete_id for {id}");
             }
@@ -436,6 +618,63 @@ mod tests {
         runtime.command(Command::Focus(Direction::Left)).unwrap();
         let first_focused = fs::read(&cleanup.0).unwrap();
         assert_ne!(first_focused, second_focused);
+    }
+
+    #[test]
+    fn launcher_actions_repaint_without_mutating_layout() {
+        let path = std::env::temp_dir().join(format!(
+            "td-runtime-launcher-test-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let cleanup = Cleanup(path);
+        let framebuffer = Framebuffer::test_file(&cleanup.0, 640, 240, 640 * 4).unwrap();
+        let mut runtime = Runtime::new(framebuffer);
+        runtime.repaint().unwrap();
+        let layout = runtime.layout_snapshot();
+        let hidden = fs::read(&cleanup.0).unwrap();
+
+        assert_eq!(runtime.launcher(LauncherAction::Open).unwrap(), None);
+        let first = fs::read(&cleanup.0).unwrap();
+        assert_ne!(first, hidden);
+        assert!(Arc::ptr_eq(&layout, &runtime.layout_snapshot()));
+
+        assert_eq!(runtime.launcher(LauncherAction::Next).unwrap(), None);
+        let second = fs::read(&cleanup.0).unwrap();
+        assert_ne!(second, first);
+        assert_eq!(runtime.launcher(LauncherAction::Activate).unwrap(), None);
+        assert_eq!(fs::read(&cleanup.0).unwrap(), hidden);
+
+        runtime.launcher(LauncherAction::Open).unwrap();
+        assert_eq!(
+            runtime.launcher(LauncherAction::Activate).unwrap(),
+            Some(LaunchRequest::UiDemo)
+        );
+        assert_eq!(fs::read(&cleanup.0).unwrap(), hidden);
+    }
+
+    #[test]
+    fn launcher_repaint_failure_restores_visibility_and_activation() {
+        let path = std::env::temp_dir().join(format!(
+            "td-runtime-launcher-failure-test-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let cleanup = Cleanup(path);
+        let framebuffer = Framebuffer::test_file(&cleanup.0, 640, 240, 640 * 4).unwrap();
+        let mut runtime = Runtime::new(framebuffer);
+        runtime.repaint().unwrap();
+        runtime.launcher(LauncherAction::Open).unwrap();
+        assert!(runtime.launcher_visible());
+
+        runtime.framebuffer.fail_next_paint();
+        assert!(runtime.launcher(LauncherAction::Activate).is_err());
+        assert!(runtime.launcher_visible());
+        assert_eq!(
+            runtime.launcher(LauncherAction::Activate).unwrap(),
+            Some(LaunchRequest::UiDemo)
+        );
+        assert!(!runtime.launcher_visible());
     }
 
     #[test]
@@ -516,7 +755,7 @@ mod tests {
         receiver.try_recv().unwrap();
         let layout = runtime.layout_snapshot();
         runtime.commit(key, surface([4, 5, 6, 0])).unwrap();
-        runtime.move_pointer(1, 1).unwrap();
+        runtime.pointer_frame(1, 1, 1, &[]).unwrap();
         assert!(Arc::ptr_eq(&layout, &runtime.layout_snapshot()));
         assert!(receiver.try_recv().is_err());
         stop.stop();
@@ -638,6 +877,452 @@ mod tests {
     }
 
     #[test]
+    fn pointer_frames_follow_hit_testing_and_implicit_grab_across_clients() {
+        let path = std::env::temp_dir().join(format!(
+            "td-runtime-pointer-test-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let cleanup = Cleanup(path);
+        let framebuffer = Framebuffer::test_file(&cleanup.0, 240, 120, 240 * 4).unwrap();
+        let mut runtime = Runtime::new(framebuffer);
+        let first_active = Arc::new(AtomicBool::new(true));
+        let second_active = Arc::new(AtomicBool::new(true));
+        let first = runtime
+            .subscribe_input_with_activity(
+                1,
+                Arc::new(AtomicBool::new(false)),
+                Arc::clone(&first_active),
+            )
+            .unwrap();
+        let second = runtime
+            .subscribe_input_with_activity(
+                2,
+                Arc::new(AtomicBool::new(false)),
+                Arc::clone(&second_active),
+            )
+            .unwrap();
+        let (first_events, first_stop) = first.split();
+        let (second_events, second_stop) = second.split();
+        let first_key = SurfaceKey {
+            client: 1,
+            object: 10,
+        };
+        let second_key = SurfaceKey {
+            client: 2,
+            object: 20,
+        };
+        runtime.commit(first_key, surface([1, 2, 3, 0])).unwrap();
+        runtime.commit(second_key, surface([4, 5, 6, 0])).unwrap();
+        let layout = runtime.layout_snapshot();
+        let first_rect = layout.get(&first_key).unwrap().rect;
+        let second_rect = layout.get(&second_key).unwrap().rect;
+
+        runtime
+            .pointer_frame(
+                10,
+                i32::try_from(first_rect.x.saturating_add(2)).unwrap(),
+                i32::try_from(first_rect.y.saturating_add(3)).unwrap(),
+                &[],
+            )
+            .unwrap();
+        assert_eq!(
+            recv_pointer(&first_events).events,
+            vec![PointerEvent::Enter {
+                target: PointerTarget {
+                    surface: first_key,
+                    x: 2,
+                    y: 3,
+                },
+            }]
+        );
+
+        let press = PointerButtonInput {
+            time: 11,
+            button: 272,
+            state: PointerButtonState::Pressed,
+        };
+        runtime.pointer_frame(11, 0, 0, &[press]).unwrap();
+        assert_eq!(
+            recv_pointer(&first_events).events,
+            vec![PointerEvent::Button {
+                surface: first_key,
+                input: press,
+            }]
+        );
+
+        let dx = i32::try_from(second_rect.x)
+            .unwrap()
+            .saturating_sub(i32::try_from(first_rect.x.saturating_add(2)).unwrap())
+            .saturating_add(1);
+        let dy = i32::try_from(second_rect.y)
+            .unwrap()
+            .saturating_sub(i32::try_from(first_rect.y.saturating_add(3)).unwrap())
+            .saturating_add(1);
+        runtime.pointer_frame(12, dx, dy, &[]).unwrap();
+        assert!(matches!(
+            recv_pointer(&first_events).events.as_slice(),
+            [PointerEvent::Motion { time: 12, target }]
+                if target.surface == first_key
+        ));
+        assert!(second_events.try_recv().is_err());
+
+        let release = PointerButtonInput {
+            time: 13,
+            button: 272,
+            state: PointerButtonState::Released,
+        };
+        runtime.pointer_frame(13, 0, 0, &[release]).unwrap();
+        assert_eq!(
+            recv_pointer(&first_events).events,
+            vec![
+                PointerEvent::Button {
+                    surface: first_key,
+                    input: release,
+                },
+                PointerEvent::Leave { surface: first_key },
+            ]
+        );
+        assert!(matches!(
+            recv_pointer(&second_events).events.as_slice(),
+            [PointerEvent::Enter { target }] if target.surface == second_key
+        ));
+
+        first_active.store(false, Ordering::Release);
+        runtime.unmap(first_key).unwrap();
+        assert!(first_events.try_recv().is_err());
+        first_stop.stop();
+        second_stop.stop();
+        runtime.unsubscribe_keyboard(1);
+        runtime.unsubscribe_keyboard(2);
+    }
+
+    #[test]
+    fn launcher_modal_pointer_releases_an_existing_grab_without_new_presses() {
+        let path = std::env::temp_dir().join(format!(
+            "td-runtime-launcher-pointer-test-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let cleanup = Cleanup(path);
+        let framebuffer = Framebuffer::test_file(&cleanup.0, 120, 80, 120 * 4).unwrap();
+        let mut runtime = Runtime::new(framebuffer);
+        let subscription = runtime
+            .subscribe_input_with_activity(
+                5,
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(AtomicBool::new(true)),
+            )
+            .unwrap();
+        let (events, stop) = subscription.split();
+        let key = SurfaceKey {
+            client: 5,
+            object: 1,
+        };
+        runtime.commit(key, surface([1, 2, 3, 0])).unwrap();
+        let rect = runtime.layout_snapshot().get(&key).unwrap().rect;
+        runtime
+            .pointer_frame(
+                1,
+                i32::try_from(rect.x.saturating_add(2)).unwrap(),
+                i32::try_from(rect.y.saturating_add(2)).unwrap(),
+                &[],
+            )
+            .unwrap();
+        assert!(matches!(
+            recv_pointer(&events).events.as_slice(),
+            [PointerEvent::Enter { target }] if target.surface == key
+        ));
+
+        let press = PointerButtonInput {
+            time: 2,
+            button: 272,
+            state: PointerButtonState::Pressed,
+        };
+        runtime.pointer_frame(2, 0, 0, &[press]).unwrap();
+        assert!(matches!(
+            recv_pointer(&events).events.as_slice(),
+            [PointerEvent::Button { input, .. }] if *input == press
+        ));
+        runtime.launcher(LauncherAction::Open).unwrap();
+        runtime.pointer_frame(3, 5, 0, &[]).unwrap();
+        assert!(matches!(
+            recv_pointer(&events).events.as_slice(),
+            [PointerEvent::Motion { target, .. }] if target.surface == key
+        ));
+
+        let modal_press = PointerButtonInput {
+            time: 4,
+            button: 273,
+            state: PointerButtonState::Pressed,
+        };
+        runtime.pointer_frame(4, 0, 0, &[modal_press]).unwrap();
+        assert!(events.try_recv().is_err());
+
+        let release = PointerButtonInput {
+            time: 5,
+            button: 272,
+            state: PointerButtonState::Released,
+        };
+        runtime.pointer_frame(5, 0, 0, &[release]).unwrap();
+        assert_eq!(
+            recv_pointer(&events).events,
+            vec![
+                PointerEvent::Button {
+                    surface: key,
+                    input: release,
+                },
+                PointerEvent::Leave { surface: key },
+            ]
+        );
+        runtime.launcher(LauncherAction::Close).unwrap();
+        assert!(matches!(
+            recv_pointer(&events).events.as_slice(),
+            [PointerEvent::Enter { target }] if target.surface == key
+        ));
+        runtime.pointer_frame(6, 0, 0, &[]).unwrap();
+        assert!(events.try_recv().is_err());
+
+        stop.stop();
+        runtime.unsubscribe_keyboard(5);
+    }
+
+    #[test]
+    fn launcher_modal_unmap_clears_an_existing_grab_immediately() {
+        let path = std::env::temp_dir().join(format!(
+            "td-runtime-launcher-pointer-test-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let cleanup = Cleanup(path);
+        let framebuffer = Framebuffer::test_file(&cleanup.0, 120, 80, 120 * 4).unwrap();
+        let mut runtime = Runtime::new(framebuffer);
+        let subscription = runtime
+            .subscribe_input_with_activity(
+                5,
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(AtomicBool::new(true)),
+            )
+            .unwrap();
+        let (events, stop) = subscription.split();
+        let key = SurfaceKey {
+            client: 5,
+            object: 1,
+        };
+        runtime.commit(key, surface([1, 2, 3, 0])).unwrap();
+        let rect = runtime.layout_snapshot().get(&key).unwrap().rect;
+        runtime
+            .pointer_frame(
+                1,
+                i32::try_from(rect.x.saturating_add(2)).unwrap(),
+                i32::try_from(rect.y.saturating_add(2)).unwrap(),
+                &[],
+            )
+            .unwrap();
+        assert!(matches!(
+            recv_pointer(&events).events.as_slice(),
+            [PointerEvent::Enter { target }] if target.surface == key
+        ));
+        let press = PointerButtonInput {
+            time: 2,
+            button: 272,
+            state: PointerButtonState::Pressed,
+        };
+        runtime.pointer_frame(2, 0, 0, &[press]).unwrap();
+        assert!(matches!(
+            recv_pointer(&events).events.as_slice(),
+            [PointerEvent::Button { input, .. }] if *input == press
+        ));
+        runtime.launcher(LauncherAction::Open).unwrap();
+
+        runtime.unmap(key).unwrap();
+        assert_eq!(
+            recv_pointer(&events).events,
+            [PointerEvent::Leave { surface: key }]
+        );
+        assert_eq!(runtime.pointer.snapshot().focus, None);
+        assert_eq!(runtime.pointer.grab_surface(), None);
+
+        stop.stop();
+        runtime.unsubscribe_keyboard(5);
+    }
+
+    #[test]
+    fn launcher_visibility_refreshes_ungrabbed_pointer_focus_immediately() {
+        let path = std::env::temp_dir().join(format!(
+            "td-runtime-launcher-pointer-test-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let cleanup = Cleanup(path);
+        let framebuffer = Framebuffer::test_file(&cleanup.0, 120, 80, 120 * 4).unwrap();
+        let mut runtime = Runtime::new(framebuffer);
+        let subscription = runtime
+            .subscribe_input_with_activity(
+                5,
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(AtomicBool::new(true)),
+            )
+            .unwrap();
+        let (events, stop) = subscription.split();
+        let key = SurfaceKey {
+            client: 5,
+            object: 1,
+        };
+        runtime.commit(key, surface([1, 2, 3, 0])).unwrap();
+        let rect = runtime.layout_snapshot().get(&key).unwrap().rect;
+        runtime
+            .pointer_frame(
+                1,
+                i32::try_from(rect.x.saturating_add(2)).unwrap(),
+                i32::try_from(rect.y.saturating_add(2)).unwrap(),
+                &[],
+            )
+            .unwrap();
+        assert!(matches!(
+            recv_pointer(&events).events.as_slice(),
+            [PointerEvent::Enter { target }] if target.surface == key
+        ));
+
+        runtime.launcher(LauncherAction::Open).unwrap();
+        assert_eq!(
+            recv_pointer(&events).events,
+            [PointerEvent::Leave { surface: key }]
+        );
+        runtime.launcher(LauncherAction::Close).unwrap();
+        assert!(matches!(
+            recv_pointer(&events).events.as_slice(),
+            [PointerEvent::Enter { target }] if target.surface == key
+        ));
+
+        stop.stop();
+        runtime.unsubscribe_keyboard(5);
+    }
+
+    #[test]
+    fn workspace_switch_cancels_a_grab_through_runtime_focus_refresh() {
+        let path = std::env::temp_dir().join(format!(
+            "td-runtime-workspace-grab-test-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let cleanup = Cleanup(path);
+        let framebuffer = Framebuffer::test_file(&cleanup.0, 120, 80, 120 * 4).unwrap();
+        let mut runtime = Runtime::new(framebuffer);
+        let subscription = runtime
+            .subscribe_input_with_activity(
+                5,
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(AtomicBool::new(true)),
+            )
+            .unwrap();
+        let (events, stop) = subscription.split();
+        let key = SurfaceKey {
+            client: 5,
+            object: 1,
+        };
+        runtime.commit(key, surface([1, 2, 3, 0])).unwrap();
+        let rect = runtime.layout_snapshot().get(&key).unwrap().rect;
+        runtime
+            .pointer_frame(
+                1,
+                i32::try_from(rect.x.saturating_add(1)).unwrap(),
+                i32::try_from(rect.y.saturating_add(1)).unwrap(),
+                &[],
+            )
+            .unwrap();
+        assert!(matches!(
+            recv_pointer(&events).events.as_slice(),
+            [PointerEvent::Enter { target }] if target.surface == key
+        ));
+        runtime
+            .pointer_frame(
+                2,
+                0,
+                0,
+                &[PointerButtonInput {
+                    time: 2,
+                    button: 272,
+                    state: PointerButtonState::Pressed,
+                }],
+            )
+            .unwrap();
+        recv_pointer(&events);
+
+        runtime.command(Command::SwitchWorkspace(2)).unwrap();
+        assert_eq!(
+            recv_pointer(&events).events,
+            [PointerEvent::Leave { surface: key }]
+        );
+        assert_eq!(runtime.pointer_snapshot().focus, None);
+        runtime.command(Command::SwitchWorkspace(1)).unwrap();
+        assert!(matches!(
+            recv_pointer(&events).events.as_slice(),
+            [PointerEvent::Enter { target }] if target.surface == key
+        ));
+
+        stop.stop();
+        runtime.unsubscribe_keyboard(5);
+    }
+
+    #[test]
+    fn inactive_pointer_delivery_is_quiet_and_pointer_overflow_fails_closed() {
+        let path = std::env::temp_dir().join(format!(
+            "td-runtime-pointer-bound-test-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let cleanup = Cleanup(path);
+        let framebuffer = Framebuffer::test_file(&cleanup.0, 120, 80, 120 * 4).unwrap();
+        let mut runtime = Runtime::new(framebuffer);
+        let pointer_active = Arc::new(AtomicBool::new(false));
+        let subscription = runtime
+            .subscribe_input_with_activity(
+                5,
+                Arc::new(AtomicBool::new(false)),
+                Arc::clone(&pointer_active),
+            )
+            .unwrap();
+        let (events, stop) = subscription.split();
+        let key = SurfaceKey {
+            client: 5,
+            object: 1,
+        };
+        runtime.commit(key, surface([1, 2, 3, 0])).unwrap();
+        let rect = runtime.layout_snapshot().get(&key).unwrap().rect;
+        runtime
+            .pointer_frame(
+                1,
+                i32::try_from(rect.x.saturating_add(2)).unwrap(),
+                i32::try_from(rect.y.saturating_add(2)).unwrap(),
+                &[],
+            )
+            .unwrap();
+        assert!(events.try_recv().is_err());
+        assert!(!runtime.queue_keyboard_delete(5, 8).unwrap());
+
+        pointer_active.store(true, Ordering::Release);
+        for time in 2..=u32::try_from(MAX_PENDING_KEYBOARD_DELIVERIES)
+            .unwrap()
+            .saturating_add(2)
+        {
+            let dx = if time % 2 == 0 { 1 } else { -1 };
+            runtime.pointer_frame(time, dx, 0, &[]).unwrap();
+        }
+        let retained: Vec<RoutedPointerFrame> = events
+            .iter()
+            .filter_map(|delivery| match delivery {
+                KeyboardDelivery::Pointer(frame) => Some(frame),
+                KeyboardDelivery::Event(_) | KeyboardDelivery::DeleteId(_) => None,
+            })
+            .collect();
+        assert_eq!(retained.len(), MAX_PENDING_KEYBOARD_DELIVERIES);
+        assert!(runtime.queue_keyboard_delete(5, 9).is_err());
+        stop.stop();
+        runtime.unsubscribe_keyboard(5);
+    }
+
+    #[test]
     fn a_full_keyboard_queue_is_dropped_without_blocking_input() {
         let path = std::env::temp_dir().join(format!(
             "td-runtime-keyboard-bound-test-{}-{}",
@@ -677,7 +1362,7 @@ mod tests {
             .iter()
             .filter_map(|delivery| match delivery {
                 KeyboardDelivery::Event(event) => Some(event),
-                KeyboardDelivery::DeleteId(_) => None,
+                KeyboardDelivery::Pointer(_) | KeyboardDelivery::DeleteId(_) => None,
             })
             .collect();
         assert_eq!(retained.len(), MAX_PENDING_KEYBOARD_DELIVERIES);

@@ -16,7 +16,15 @@ const MODULES: &[(&str, &str)] = &[
         "keyboard",
         include_str!("../../../td-compositor/src/keyboard.rs"),
     ),
+    (
+        "launcher",
+        include_str!("../../../td-compositor/src/launcher.rs"),
+    ),
     ("layout", include_str!("../../../td-compositor/src/layout.rs")),
+    (
+        "pointer",
+        include_str!("../../../td-compositor/src/pointer.rs"),
+    ),
     (
         "runtime",
         include_str!("../../../td-compositor/src/runtime.rs"),
@@ -29,6 +37,7 @@ const MODULES: &[(&str, &str)] = &[
     ("socket", include_str!("../../../td-compositor/src/socket.rs")),
     ("sys", include_str!("../../../td-compositor/src/sys.rs")),
     ("term", include_str!("../../../td-compositor/src/term.rs")),
+    ("ui", include_str!("../../../td-compositor/src/ui.rs")),
     ("wire", include_str!("../../../td-compositor/src/wire.rs")),
 ];
 

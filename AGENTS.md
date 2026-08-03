@@ -405,7 +405,8 @@ td's Rust is defensive and minimal-surface.
   tests then issue the syscall, because every assertion above is about source TEXT
   and a `kill` that returned `Ok(())` without issuing anything satisfies all of them.
   And (6) the `td-compositor` software Wayland server, whose one `syscall3` body in
-  `td-compositor/src/sys.rs` carries `recvmsg(2)` for wl_shm SCM_RIGHTS reception,
+  `td-compositor/src/sys.rs` carries `recvmsg(2)` for wl_shm and demo-client
+  keymap SCM_RIGHTS reception,
   `close(2)` for the received descriptor after safe duplication through
   `/proc/self/fd/N`, and `sendmsg(2)` for the td-native demo client's wl_shm pool
   descriptor, the server's wl_keyboard keymap descriptor, and the transport

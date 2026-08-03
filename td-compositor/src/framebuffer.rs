@@ -12,6 +12,8 @@ pub struct Framebuffer {
     pub height: usize,
     pub stride: usize,
     frame: Vec<u8>,
+    #[cfg(test)]
+    fail_next_paint: bool,
 }
 
 fn parse_number(path: &Path) -> Result<usize, String> {
@@ -103,6 +105,8 @@ impl Framebuffer {
             height,
             stride,
             frame: vec![0; size],
+            #[cfg(test)]
+            fail_next_paint: false,
         })
     }
 
@@ -129,10 +133,20 @@ impl Framebuffer {
             height,
             stride,
             frame: vec![0; size],
+            fail_next_paint: false,
         })
     }
 
+    #[cfg(test)]
+    pub fn fail_next_paint(&mut self) {
+        self.fail_next_paint = true;
+    }
+
     pub fn paint(&mut self, scene: &Scene) -> Result<(), String> {
+        #[cfg(test)]
+        if std::mem::take(&mut self.fail_next_paint) {
+            return Err("injected framebuffer paint failure".to_string());
+        }
         scene.render(&mut self.frame, self.width, self.height, self.stride);
         self.file
             .seek(SeekFrom::Start(0))

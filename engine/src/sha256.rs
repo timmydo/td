@@ -1,5 +1,6 @@
 //! SHA-256 (FIPS 180-4), pure `std` — the one copy shared by td-builder,
-//! td-recipe-eval, and the target-built td-boot verifier.
+//! td-recipe-eval, the target-built td-boot verifier, and td-compositor's
+//! developer-only terminal corpus verifier and importer.
 //!
 //! Kept dependency-free on purpose: the engine crates compile OFFLINE with
 //! nothing fetched, and correctness is pinned two ways — the FIPS/CAVP test

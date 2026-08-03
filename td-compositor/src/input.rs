@@ -1,7 +1,11 @@
 use crate::keyboard::{
     KeyInput, KeyState, ModifierState, MOD_ALT, MOD_CAPS, MOD_CONTROL, MOD_LOGO, MOD_NUM, MOD_SHIFT,
 };
+use crate::launcher::{LaunchOptions, LaunchProcesses, LauncherAction};
 use crate::layout::{Axis, Command, Direction};
+use crate::pointer::{
+    PointerButtonInput, PointerButtonState, MAX_POINTER_BUTTON_TRANSITIONS_PER_FRAME,
+};
 use crate::runtime::Runtime;
 use std::collections::BTreeSet;
 use std::fs::{self, File};
@@ -18,6 +22,7 @@ const SYN_REPORT: u16 = 0;
 const SYN_DROPPED: u16 = 3;
 const REL_X: u16 = 0;
 const REL_Y: u16 = 1;
+const KEY_ESC: u16 = 1;
 const KEY_1: u16 = 2;
 const KEY_2: u16 = 3;
 const KEY_3: u16 = 4;
@@ -27,21 +32,52 @@ const KEY_6: u16 = 7;
 const KEY_7: u16 = 8;
 const KEY_8: u16 = 9;
 const KEY_9: u16 = 10;
+const KEY_0: u16 = 11;
+const KEY_MINUS: u16 = 12;
+const KEY_BACKSPACE: u16 = 14;
+const KEY_Q: u16 = 16;
+const KEY_W: u16 = 17;
+const KEY_E: u16 = 18;
+const KEY_R: u16 = 19;
+const KEY_T: u16 = 20;
+const KEY_Y: u16 = 21;
+const KEY_U: u16 = 22;
+const KEY_I: u16 = 23;
+const KEY_O: u16 = 24;
 const KEY_P: u16 = 25;
+const KEY_ENTER: u16 = 28;
 const KEY_LEFTCTRL: u16 = 29;
+const KEY_A: u16 = 30;
+const KEY_S: u16 = 31;
+const KEY_D: u16 = 32;
 const KEY_F: u16 = 33;
+const KEY_G: u16 = 34;
+const KEY_H: u16 = 35;
+const KEY_J: u16 = 36;
+const KEY_K: u16 = 37;
+const KEY_L: u16 = 38;
+const KEY_LEFTSHIFT: u16 = 42;
+const KEY_Z: u16 = 44;
 const KEY_X: u16 = 45;
+const KEY_C: u16 = 46;
+const KEY_V: u16 = 47;
 const KEY_B: u16 = 48;
 const KEY_N: u16 = 49;
-const KEY_LEFTSHIFT: u16 = 42;
-const KEY_LEFTALT: u16 = 56;
+const KEY_M: u16 = 50;
 const KEY_RIGHTSHIFT: u16 = 54;
+const KEY_LEFTALT: u16 = 56;
+const KEY_SPACE: u16 = 57;
 const KEY_CAPSLOCK: u16 = 58;
 const KEY_NUMLOCK: u16 = 69;
+const KEY_KPENTER: u16 = 96;
 const KEY_RIGHTCTRL: u16 = 97;
 const KEY_RIGHTALT: u16 = 100;
+const KEY_UP: u16 = 103;
+const KEY_DOWN: u16 = 108;
 const KEY_LEFTMETA: u16 = 125;
 const KEY_RIGHTMETA: u16 = 126;
+const BTN_MOUSE: u16 = 0x110;
+const BTN_TASK: u16 = 0x117;
 const MAX_XKB_EVDEV_KEY: u16 = 247;
 const KEY_RELEASE: i32 = 0;
 const KEY_PRESS: i32 = 1;
@@ -62,12 +98,16 @@ struct KeyBindings {
     caps_lock: bool,
     num_lock: bool,
     prefix_device: Option<usize>,
+    launcher_open: bool,
     consumed: BTreeSet<(usize, u16)>,
+    pointer_pressed: BTreeSet<(usize, u16)>,
+    pointer_forwarded: BTreeSet<u16>,
 }
 
 #[derive(Debug, Eq, PartialEq)]
 struct KeyDecision {
     command: Option<Command>,
+    launcher: Option<LauncherAction>,
     forward: Option<KeyInput>,
     modifiers: Option<ModifierState>,
 }
@@ -81,6 +121,7 @@ impl KeyBindings {
     fn feed_device(&mut self, device: usize, event: Event) -> KeyDecision {
         let mut decision = KeyDecision {
             command: None,
+            launcher: None,
             forward: None,
             modifiers: None,
         };
@@ -146,6 +187,27 @@ impl KeyBindings {
             decision.forward = self.forward(physical, event);
             return decision;
         }
+        if self.launcher_open {
+            self.consumed.insert(physical);
+            let control = self.pressed(KEY_LEFTCTRL) || self.pressed(KEY_RIGHTCTRL);
+            let alt = self.pressed(KEY_LEFTALT) || self.pressed(KEY_RIGHTALT);
+            let meta = self.pressed(KEY_LEFTMETA) || self.pressed(KEY_RIGHTMETA);
+            decision.launcher = match event.code {
+                KEY_DOWN => Some(LauncherAction::Next),
+                KEY_UP => Some(LauncherAction::Previous),
+                KEY_N if control => Some(LauncherAction::Next),
+                KEY_P if control => Some(LauncherAction::Previous),
+                KEY_ENTER | KEY_KPENTER => Some(LauncherAction::Activate),
+                KEY_ESC => Some(LauncherAction::Close),
+                KEY_G if control => Some(LauncherAction::Close),
+                KEY_BACKSPACE if !control && !alt && !meta => Some(LauncherAction::Backspace),
+                code if !control && !alt && !meta => {
+                    launcher_character(code).map(LauncherAction::Insert)
+                }
+                _ => None,
+            };
+            return decision;
+        }
         let meta = self.pressed(KEY_LEFTMETA) || self.pressed(KEY_RIGHTMETA);
         if meta && event.code == KEY_X {
             self.prefix_device = Some(device);
@@ -155,12 +217,15 @@ impl KeyBindings {
         if self.prefix_device.is_some() {
             self.prefix_device = None;
             self.consumed.insert(physical);
-            decision.command = match event.code {
-                KEY_1 => Some(Command::ToggleFullscreen),
-                KEY_2 => Some(Command::SetSplit(Axis::Vertical)),
-                KEY_3 => Some(Command::SetSplit(Axis::Horizontal)),
-                _ => None,
-            };
+            match event.code {
+                KEY_1 => decision.command = Some(Command::ToggleFullscreen),
+                KEY_2 => decision.command = Some(Command::SetSplit(Axis::Vertical)),
+                KEY_3 => decision.command = Some(Command::SetSplit(Axis::Horizontal)),
+                KEY_L => {
+                    decision.launcher = Some(LauncherAction::Open);
+                }
+                _ => {}
+            }
             return decision;
         }
         if !meta {
@@ -210,6 +275,12 @@ impl KeyBindings {
         self.pressed.iter().any(|(_, pressed)| *pressed == code)
     }
 
+    fn settle_launcher(&mut self, visible: Option<bool>) {
+        if let Some(visible) = visible {
+            self.launcher_open = visible;
+        }
+    }
+
     fn modifiers(&self) -> ModifierState {
         let mut depressed = 0;
         if self.pressed(KEY_LEFTSHIFT) || self.pressed(KEY_RIGHTSHIFT) {
@@ -238,6 +309,116 @@ impl KeyBindings {
             group: 0,
         }
     }
+
+    fn pointer_changes(&self, time: u32) -> Vec<PointerButtonInput> {
+        self.pointer_changes_with(time, |code| {
+            self.pointer_pressed
+                .iter()
+                .any(|(_, pressed)| *pressed == code)
+        })
+    }
+
+    fn pointer_device_changes(
+        &self,
+        device: usize,
+        transitions: &[PointerButtonTransition],
+        time: u32,
+    ) -> Vec<PointerButtonInput> {
+        if transitions.is_empty() {
+            return Vec::new();
+        }
+        let mut device_pressed: BTreeSet<u16> = self
+            .pointer_pressed
+            .iter()
+            .filter_map(|(owner, code)| (*owner == device).then_some(*code))
+            .collect();
+        let mut forwarded = self.pointer_forwarded.clone();
+        let mut changes = Vec::new();
+        for transition in transitions {
+            if transition.pressed {
+                device_pressed.insert(transition.code);
+            } else {
+                device_pressed.remove(&transition.code);
+            }
+            let physical = device_pressed.contains(&transition.code)
+                || self
+                    .pointer_pressed
+                    .iter()
+                    .any(|(owner, code)| *owner != device && *code == transition.code);
+            if physical == forwarded.contains(&transition.code) {
+                continue;
+            }
+            let state = if physical {
+                forwarded.insert(transition.code);
+                PointerButtonState::Pressed
+            } else {
+                forwarded.remove(&transition.code);
+                PointerButtonState::Released
+            };
+            changes.push(PointerButtonInput {
+                time,
+                button: u32::from(transition.code),
+                state,
+            });
+        }
+        changes
+    }
+
+    fn pointer_changes_with(
+        &self,
+        time: u32,
+        mut physical: impl FnMut(u16) -> bool,
+    ) -> Vec<PointerButtonInput> {
+        let mut changes = Vec::new();
+        for code in BTN_MOUSE..=BTN_TASK {
+            let pressed = physical(code);
+            if pressed == self.pointer_forwarded.contains(&code) {
+                continue;
+            }
+            changes.push(PointerButtonInput {
+                time,
+                button: u32::from(code),
+                state: if pressed {
+                    PointerButtonState::Pressed
+                } else {
+                    PointerButtonState::Released
+                },
+            });
+        }
+        changes
+    }
+
+    fn commit_pointer(&mut self, buttons: &[PointerButtonInput]) {
+        for button in buttons {
+            let Ok(code) = u16::try_from(button.button) else {
+                continue;
+            };
+            match button.state {
+                PointerButtonState::Pressed => {
+                    self.pointer_forwarded.insert(code);
+                }
+                PointerButtonState::Released => {
+                    self.pointer_forwarded.remove(&code);
+                }
+            }
+        }
+    }
+
+    fn commit_pointer_device(
+        &mut self,
+        device: usize,
+        pressed: &BTreeSet<u16>,
+        buttons: &[PointerButtonInput],
+    ) {
+        self.remove_pointer_device(device);
+        self.pointer_pressed
+            .extend(pressed.iter().map(|code| (device, *code)));
+        self.commit_pointer(buttons);
+    }
+
+    fn remove_pointer_device(&mut self, device: usize) {
+        self.pointer_pressed.retain(|(owner, _)| *owner != device);
+    }
 }
 
 impl Event {
@@ -258,40 +439,138 @@ impl Event {
 struct PointerMotion {
     dx: i32,
     dy: i32,
+    pressed: BTreeSet<u16>,
+    buttons: Vec<PointerButtonTransition>,
+    overflowed: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PointerButtonTransition {
+    code: u16,
+    pressed: bool,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct PointerFrame {
+    time: u32,
+    dx: i32,
+    dy: i32,
+    buttons: Vec<PointerButtonTransition>,
 }
 
 trait InputTarget {
     fn command(&mut self, command: Command) -> Result<(), String>;
+    fn launcher(&mut self, action: LauncherAction) -> Result<bool, String>;
     fn key(&mut self, input: KeyInput) -> Result<(), String>;
     fn modifiers(&mut self, modifiers: ModifierState) -> Result<(), String>;
-    fn move_pointer(&mut self, dx: i32, dy: i32) -> Result<(), String>;
+    fn pointer_frame(
+        &mut self,
+        time: u32,
+        dx: i32,
+        dy: i32,
+        buttons: &[PointerButtonInput],
+    ) -> Result<(), String>;
 }
 
-impl InputTarget for Runtime {
+struct LiveInputTarget {
+    runtime: Arc<Mutex<Runtime>>,
+    launches: LaunchProcesses,
+}
+
+impl InputTarget for LiveInputTarget {
     fn command(&mut self, command: Command) -> Result<(), String> {
-        Runtime::command(self, command)
+        self.runtime
+            .lock()
+            .map_err(|_| "runtime lock poisoned".to_string())?
+            .command(command)
+    }
+
+    fn launcher(&mut self, action: LauncherAction) -> Result<bool, String> {
+        let (request, visible) = {
+            let mut runtime = self
+                .runtime
+                .lock()
+                .map_err(|_| "runtime lock poisoned".to_string())?;
+            let request = runtime.launcher(action)?;
+            (request, runtime.launcher_visible())
+        };
+        if let Some(request) = request {
+            match self.launches.launch(request) {
+                Ok(failures) => {
+                    for failure in failures {
+                        eprintln!("td-compositor: {failure}");
+                    }
+                }
+                Err(error) => eprintln!("td-compositor: {error}"),
+            }
+        }
+        Ok(visible)
     }
 
     fn key(&mut self, input: KeyInput) -> Result<(), String> {
-        Runtime::key(self, input)
+        self.runtime
+            .lock()
+            .map_err(|_| "runtime lock poisoned".to_string())?
+            .key(input)
     }
 
     fn modifiers(&mut self, modifiers: ModifierState) -> Result<(), String> {
-        Runtime::modifiers(self, modifiers)
+        self.runtime
+            .lock()
+            .map_err(|_| "runtime lock poisoned".to_string())?
+            .modifiers(modifiers)
     }
 
-    fn move_pointer(&mut self, dx: i32, dy: i32) -> Result<(), String> {
-        Runtime::move_pointer(self, dx, dy)
+    fn pointer_frame(
+        &mut self,
+        time: u32,
+        dx: i32,
+        dy: i32,
+        buttons: &[PointerButtonInput],
+    ) -> Result<(), String> {
+        self.runtime
+            .lock()
+            .map_err(|_| "runtime lock poisoned".to_string())?
+            .pointer_frame(time, dx, dy, buttons)
     }
 }
 
 impl PointerMotion {
-    fn feed(&mut self, event: Event) -> Option<(i32, i32)> {
+    fn feed(&mut self, event: Event) -> Option<PointerFrame> {
         match (event.kind, event.code) {
             (EV_REL, REL_X) => self.dx = self.dx.saturating_add(event.value),
             (EV_REL, REL_Y) => self.dy = self.dy.saturating_add(event.value),
-            (EV_SYN, SYN_REPORT) if self.dx != 0 || self.dy != 0 => {
-                return Some((std::mem::take(&mut self.dx), std::mem::take(&mut self.dy)));
+            (EV_KEY, BTN_MOUSE..=BTN_TASK)
+                if event.value == KEY_PRESS || event.value == KEY_RELEASE =>
+            {
+                let pressed = event.value == KEY_PRESS;
+                let changed = if pressed {
+                    self.pressed.insert(event.code)
+                } else {
+                    self.pressed.remove(&event.code)
+                };
+                if changed {
+                    if self.buttons.len() >= MAX_POINTER_BUTTON_TRANSITIONS_PER_FRAME {
+                        self.dx = 0;
+                        self.dy = 0;
+                        self.pressed.clear();
+                        self.buttons.clear();
+                        self.overflowed = true;
+                    } else {
+                        self.buttons.push(PointerButtonTransition {
+                            code: event.code,
+                            pressed,
+                        });
+                    }
+                }
+            }
+            (EV_SYN, SYN_REPORT) if self.dx != 0 || self.dy != 0 || !self.buttons.is_empty() => {
+                return Some(PointerFrame {
+                    time: event.time,
+                    dx: std::mem::take(&mut self.dx),
+                    dy: std::mem::take(&mut self.dy),
+                    buttons: std::mem::take(&mut self.buttons),
+                });
             }
             _ => {}
         }
@@ -320,6 +599,50 @@ fn workspace(code: u16) -> Option<u8> {
         KEY_7 => Some(7),
         KEY_8 => Some(8),
         KEY_9 => Some(9),
+        _ => None,
+    }
+}
+
+fn launcher_character(code: u16) -> Option<char> {
+    match code {
+        KEY_A => Some('a'),
+        KEY_B => Some('b'),
+        KEY_C => Some('c'),
+        KEY_D => Some('d'),
+        KEY_E => Some('e'),
+        KEY_F => Some('f'),
+        KEY_G => Some('g'),
+        KEY_H => Some('h'),
+        KEY_I => Some('i'),
+        KEY_J => Some('j'),
+        KEY_K => Some('k'),
+        KEY_L => Some('l'),
+        KEY_M => Some('m'),
+        KEY_N => Some('n'),
+        KEY_O => Some('o'),
+        KEY_P => Some('p'),
+        KEY_Q => Some('q'),
+        KEY_R => Some('r'),
+        KEY_S => Some('s'),
+        KEY_T => Some('t'),
+        KEY_U => Some('u'),
+        KEY_V => Some('v'),
+        KEY_W => Some('w'),
+        KEY_X => Some('x'),
+        KEY_Y => Some('y'),
+        KEY_Z => Some('z'),
+        KEY_1 => Some('1'),
+        KEY_2 => Some('2'),
+        KEY_3 => Some('3'),
+        KEY_4 => Some('4'),
+        KEY_5 => Some('5'),
+        KEY_6 => Some('6'),
+        KEY_7 => Some('7'),
+        KEY_8 => Some('8'),
+        KEY_9 => Some('9'),
+        KEY_0 => Some('0'),
+        KEY_MINUS => Some('-'),
+        KEY_SPACE => Some(' '),
         _ => None,
     }
 }
@@ -422,8 +745,8 @@ fn apply<T: InputTarget>(
     bindings: &Mutex<KeyBindings>,
     pointer: &mut PointerMotion,
 ) -> Result<(), String> {
-    let motion = pointer.feed(event);
-    if event.kind != EV_KEY && motion.is_none() {
+    let frame = pointer.feed(event);
+    if event.kind != EV_KEY && frame.is_none() {
         return Ok(());
     }
     let mut bindings = bindings
@@ -431,9 +754,10 @@ fn apply<T: InputTarget>(
         .map_err(|_| "input bindings lock poisoned".to_string())?;
     let decision = bindings.feed_device(device, event);
     if decision.command.is_none()
+        && decision.launcher.is_none()
         && decision.forward.is_none()
         && decision.modifiers.is_none()
-        && motion.is_none()
+        && frame.is_none()
     {
         return Ok(());
     }
@@ -441,19 +765,34 @@ fn apply<T: InputTarget>(
     let mut runtime = runtime
         .lock()
         .map_err(|_| "runtime lock poisoned".to_string())?;
-    deliver_key_decision(&mut *runtime, decision)?;
-    if let Some((dx, dy)) = motion {
-        runtime.move_pointer(dx, dy)?;
+    deliver_key_decision(&mut *runtime, &mut bindings, decision)?;
+    if let Some(frame) = frame {
+        let mut buttons = bindings.pointer_device_changes(device, &frame.buttons, frame.time);
+        if bindings.launcher_open {
+            buttons.retain(|button| button.state == PointerButtonState::Released);
+        }
+        let delivery = if frame.dx != 0 || frame.dy != 0 || !buttons.is_empty() {
+            runtime.pointer_frame(frame.time, frame.dx, frame.dy, &buttons)
+        } else {
+            Ok(())
+        };
+        bindings.commit_pointer_device(device, &pointer.pressed, &buttons);
+        delivery?;
     }
     Ok(())
 }
 
 fn deliver_key_decision<T: InputTarget>(
     runtime: &mut T,
+    bindings: &mut KeyBindings,
     decision: KeyDecision,
 ) -> Result<(), String> {
     if let Some(command) = decision.command {
         runtime.command(command)?;
+    }
+    if let Some(action) = decision.launcher {
+        let visible = runtime.launcher(action)?;
+        bindings.settle_launcher(Some(visible));
     }
     if let Some(input) = decision.forward {
         runtime.key(input)?;
@@ -462,6 +801,33 @@ fn deliver_key_decision<T: InputTarget>(
         runtime.modifiers(modifiers)?;
     }
     Ok(())
+}
+
+fn retain_failure(failure: &mut Option<String>, error: String) {
+    match failure {
+        Some(current) => {
+            current.push_str("; ");
+            current.push_str(&error);
+        }
+        None => *failure = Some(error),
+    }
+}
+
+fn deliver_key_cleanup<T: InputTarget>(
+    target: &mut T,
+    decision: KeyDecision,
+    failure: &mut Option<String>,
+) {
+    if let Some(input) = decision.forward {
+        if let Err(error) = target.key(input) {
+            retain_failure(failure, error);
+        }
+    }
+    if let Some(modifiers) = decision.modifiers {
+        if let Err(error) = target.modifiers(modifiers) {
+            retain_failure(failure, error);
+        }
+    }
 }
 
 fn release_device<T: InputTarget>(
@@ -481,12 +847,21 @@ fn release_device<T: InputTarget>(
         .iter()
         .filter_map(|(owner, code)| (*owner == device).then_some(*code))
         .collect();
-    if codes.is_empty() {
+    let had_pointer_state = bindings
+        .pointer_pressed
+        .iter()
+        .any(|(owner, _)| *owner == device);
+    if codes.is_empty() && !had_pointer_state && bindings.pointer_forwarded.is_empty() {
         return Ok(());
     }
-    let mut runtime = runtime
-        .lock()
-        .map_err(|_| "runtime lock poisoned".to_string())?;
+    let mut failure = None;
+    let mut runtime = match runtime.lock() {
+        Ok(runtime) => Some(runtime),
+        Err(_) => {
+            retain_failure(&mut failure, "runtime lock poisoned".to_string());
+            None
+        }
+    };
     for code in codes {
         let decision = bindings.feed_device(
             device,
@@ -497,9 +872,26 @@ fn release_device<T: InputTarget>(
                 value: KEY_RELEASE,
             },
         );
-        deliver_key_decision(&mut *runtime, decision)?;
+        if let Some(target) = runtime.as_deref_mut() {
+            deliver_key_cleanup(target, decision, &mut failure);
+        }
     }
-    Ok(())
+    bindings.remove_pointer_device(device);
+    let mut buttons = bindings.pointer_changes(time);
+    buttons.retain(|button| button.state == PointerButtonState::Released);
+    if !buttons.is_empty() {
+        let delivery = runtime
+            .as_deref_mut()
+            .map(|target| target.pointer_frame(time, 0, 0, &buttons));
+        bindings.commit_pointer(&buttons);
+        if let Some(Err(error)) = delivery {
+            retain_failure(&mut failure, error);
+        }
+    }
+    match failure {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
 }
 
 fn apply_device_event<T: InputTarget>(
@@ -517,19 +909,25 @@ fn apply_device_event<T: InputTarget>(
         return Ok(());
     }
     if event.kind == EV_SYN && event.code == SYN_DROPPED {
-        release_device(runtime, device, bindings, event.time)?;
         *pointer = PointerMotion::default();
+        release_device(runtime, device, bindings, event.time)?;
         *dropped = true;
         return Ok(());
     }
-    apply(runtime, event, device, bindings, pointer)
+    apply(runtime, event, device, bindings, pointer)?;
+    if pointer.overflowed {
+        *pointer = PointerMotion::default();
+        release_device(runtime, device, bindings, event.time)?;
+        *dropped = true;
+    }
+    Ok(())
 }
 
 fn read_device(
     path: &Path,
     mut file: File,
     device: usize,
-    runtime: Arc<Mutex<Runtime>>,
+    target: Arc<Mutex<LiveInputTarget>>,
     bindings: Arc<Mutex<KeyBindings>>,
 ) -> Result<(), String> {
     let mut bytes = [0u8; EVENT_SIZE];
@@ -545,7 +943,7 @@ fn read_device(
                 };
                 last_time = event.time;
                 if let Err(error) = apply_device_event(
-                    runtime.as_ref(),
+                    target.as_ref(),
                     event,
                     device,
                     bindings.as_ref(),
@@ -559,7 +957,7 @@ fn read_device(
             Err(error) => break Err(format!("read input {}: {error}", path.display())),
         }
     };
-    let cleanup = release_device(runtime.as_ref(), device, bindings.as_ref(), last_time);
+    let cleanup = release_device(target.as_ref(), device, bindings.as_ref(), last_time);
     match (result, cleanup) {
         (Ok(()), Ok(())) => Ok(()),
         (Err(error), Ok(())) => Err(error),
@@ -570,14 +968,20 @@ fn read_device(
     }
 }
 
-pub fn start(input_dir: &Path, runtime: Arc<Mutex<Runtime>>) -> Result<usize, String> {
+pub fn start(
+    input_dir: &Path,
+    runtime: Arc<Mutex<Runtime>>,
+    launch_options: LaunchOptions,
+) -> Result<usize, String> {
+    let launches = LaunchProcesses::new(launch_options)?;
     let paths = event_paths(input_dir)?;
     let bindings = Arc::new(Mutex::new(KeyBindings::default()));
+    let target = Arc::new(Mutex::new(LiveInputTarget { runtime, launches }));
     for (device, path) in paths.iter().enumerate() {
         let file = File::open(path).map_err(|e| format!("open input {}: {e}", path.display()))?;
         let path = path.clone();
         let label = path.display().to_string();
-        let runtime = Arc::clone(&runtime);
+        let target = Arc::clone(&target);
         let bindings = Arc::clone(&bindings);
         thread::Builder::new()
             .name(format!(
@@ -587,7 +991,7 @@ pub fn start(input_dir: &Path, runtime: Arc<Mutex<Runtime>>) -> Result<usize, St
                     .unwrap_or("event")
             ))
             .spawn(move || {
-                if let Err(error) = read_device(&path, file, device, runtime, bindings) {
+                if let Err(error) = read_device(&path, file, device, target, bindings) {
                     eprintln!("td-compositor: {error}");
                 }
             })
@@ -599,6 +1003,17 @@ pub fn start(input_dir: &Path, runtime: Arc<Mutex<Runtime>>) -> Result<usize, St
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static TEST_SEQ: AtomicU64 = AtomicU64::new(0);
+
+    struct Cleanup(PathBuf);
+
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
 
     fn key(code: u16, value: i32) -> Event {
         Event {
@@ -628,10 +1043,14 @@ mod tests {
     #[derive(Default)]
     struct RecordingTarget {
         commands: Vec<Command>,
+        launcher_actions: Vec<LauncherAction>,
+        launcher_visible: bool,
         keys: Vec<KeyInput>,
+        key_error: Option<String>,
         modifiers: Vec<ModifierState>,
         keyboard_calls: Vec<KeyboardCall>,
-        motions: Vec<(i32, i32)>,
+        pointer_frames: Vec<(u32, i32, i32, Vec<PointerButtonInput>)>,
+        pointer_error: Option<String>,
     }
 
     impl InputTarget for RecordingTarget {
@@ -640,10 +1059,26 @@ mod tests {
             Ok(())
         }
 
+        fn launcher(&mut self, action: LauncherAction) -> Result<bool, String> {
+            self.launcher_actions.push(action);
+            match action {
+                LauncherAction::Open => self.launcher_visible = true,
+                LauncherAction::Close | LauncherAction::Activate => self.launcher_visible = false,
+                LauncherAction::Next
+                | LauncherAction::Previous
+                | LauncherAction::Insert(_)
+                | LauncherAction::Backspace => {}
+            }
+            Ok(self.launcher_visible)
+        }
+
         fn key(&mut self, input: KeyInput) -> Result<(), String> {
             self.keys.push(input);
             self.keyboard_calls.push(KeyboardCall::Key(input));
-            Ok(())
+            match self.key_error.take() {
+                Some(error) => Err(error),
+                None => Ok(()),
+            }
         }
 
         fn modifiers(&mut self, modifiers: ModifierState) -> Result<(), String> {
@@ -652,9 +1087,62 @@ mod tests {
             Ok(())
         }
 
-        fn move_pointer(&mut self, dx: i32, dy: i32) -> Result<(), String> {
-            self.motions.push((dx, dy));
-            Ok(())
+        fn pointer_frame(
+            &mut self,
+            time: u32,
+            dx: i32,
+            dy: i32,
+            buttons: &[PointerButtonInput],
+        ) -> Result<(), String> {
+            self.pointer_frames.push((time, dx, dy, buttons.to_vec()));
+            match self.pointer_error.take() {
+                Some(error) => Err(error),
+                None => Ok(()),
+            }
+        }
+    }
+
+    struct LauncherModelTarget {
+        launcher: crate::launcher::Launcher,
+        recording: RecordingTarget,
+    }
+
+    impl LauncherModelTarget {
+        fn new() -> Self {
+            Self {
+                launcher: crate::launcher::Launcher::new(),
+                recording: RecordingTarget::default(),
+            }
+        }
+    }
+
+    impl InputTarget for LauncherModelTarget {
+        fn command(&mut self, command: Command) -> Result<(), String> {
+            self.recording.command(command)
+        }
+
+        fn launcher(&mut self, action: LauncherAction) -> Result<bool, String> {
+            self.recording.launcher_actions.push(action);
+            self.launcher.apply(action);
+            Ok(self.launcher.visible())
+        }
+
+        fn key(&mut self, input: KeyInput) -> Result<(), String> {
+            self.recording.key(input)
+        }
+
+        fn modifiers(&mut self, modifiers: ModifierState) -> Result<(), String> {
+            self.recording.modifiers(modifiers)
+        }
+
+        fn pointer_frame(
+            &mut self,
+            time: u32,
+            dx: i32,
+            dy: i32,
+            buttons: &[PointerButtonInput],
+        ) -> Result<(), String> {
+            self.recording.pointer_frame(time, dx, dy, buttons)
         }
     }
 
@@ -801,6 +1289,161 @@ mod tests {
     }
 
     #[test]
+    fn emacs_launcher_prefix_navigation_activation_and_cancel_are_consumed() {
+        let mut bindings = KeyBindings::default();
+        press(&mut bindings, KEY_LEFTMETA);
+        press(&mut bindings, KEY_X);
+        let opened = bindings.feed(key(KEY_L, KEY_PRESS));
+        assert_eq!(opened.launcher, Some(LauncherAction::Open));
+        assert!(opened.forward.is_none());
+        bindings.settle_launcher(Some(true));
+        assert!(bindings.feed(key(KEY_L, KEY_RELEASE)).forward.is_none());
+        bindings.feed(key(KEY_LEFTMETA, KEY_RELEASE));
+
+        press(&mut bindings, KEY_LEFTMETA);
+        let nested_prefix = bindings.feed(key(KEY_X, KEY_PRESS));
+        assert!(nested_prefix.command.is_none());
+        assert!(nested_prefix.launcher.is_none());
+        assert!(nested_prefix.forward.is_none());
+        bindings.feed(key(KEY_X, KEY_RELEASE));
+        bindings.feed(key(KEY_LEFTMETA, KEY_RELEASE));
+        let blocked_command = bindings.feed(key(KEY_2, KEY_PRESS));
+        assert!(blocked_command.command.is_none());
+        assert!(blocked_command.forward.is_none());
+        assert_eq!(blocked_command.launcher, Some(LauncherAction::Insert('2')));
+        bindings.feed(key(KEY_2, KEY_RELEASE));
+
+        press(&mut bindings, KEY_LEFTCTRL);
+        let next = bindings.feed(key(KEY_N, KEY_PRESS));
+        assert_eq!(next.launcher, Some(LauncherAction::Next));
+        assert!(next.forward.is_none());
+        bindings.feed(key(KEY_N, KEY_RELEASE));
+        let previous = bindings.feed(key(KEY_P, KEY_PRESS));
+        assert_eq!(previous.launcher, Some(LauncherAction::Previous));
+        bindings.feed(key(KEY_P, KEY_RELEASE));
+        bindings.feed(key(KEY_LEFTCTRL, KEY_RELEASE));
+
+        let activated = bindings.feed(key(KEY_ENTER, KEY_PRESS));
+        assert_eq!(activated.launcher, Some(LauncherAction::Activate));
+        bindings.settle_launcher(Some(false));
+        bindings.feed(key(KEY_ENTER, KEY_RELEASE));
+        assert!(bindings.feed(key(KEY_N, KEY_PRESS)).forward.is_some());
+
+        let mut keypad = KeyBindings {
+            launcher_open: true,
+            ..KeyBindings::default()
+        };
+        let activated = keypad.feed(key(KEY_KPENTER, KEY_PRESS));
+        assert_eq!(activated.launcher, Some(LauncherAction::Activate));
+        assert!(activated.forward.is_none());
+
+        let mut bindings = KeyBindings::default();
+        press(&mut bindings, KEY_RIGHTMETA);
+        press(&mut bindings, KEY_X);
+        assert_eq!(
+            bindings.feed(key(KEY_L, KEY_PRESS)).launcher,
+            Some(LauncherAction::Open)
+        );
+        bindings.settle_launcher(Some(true));
+        bindings.feed(key(KEY_L, KEY_RELEASE));
+        bindings.feed(key(KEY_RIGHTMETA, KEY_RELEASE));
+        assert_eq!(
+            bindings.feed(key(KEY_DOWN, KEY_PRESS)).launcher,
+            Some(LauncherAction::Next)
+        );
+        bindings.feed(key(KEY_DOWN, KEY_RELEASE));
+        assert_eq!(
+            bindings.feed(key(KEY_UP, KEY_PRESS)).launcher,
+            Some(LauncherAction::Previous)
+        );
+        bindings.feed(key(KEY_UP, KEY_RELEASE));
+        assert_eq!(
+            bindings.feed(key(KEY_ESC, KEY_PRESS)).launcher,
+            Some(LauncherAction::Close)
+        );
+
+        let mut bindings = KeyBindings::default();
+        press(&mut bindings, KEY_LEFTMETA);
+        press(&mut bindings, KEY_X);
+        bindings.feed(key(KEY_L, KEY_PRESS));
+        bindings.settle_launcher(Some(true));
+        bindings.feed(key(KEY_L, KEY_RELEASE));
+        bindings.feed(key(KEY_LEFTMETA, KEY_RELEASE));
+        press(&mut bindings, KEY_LEFTCTRL);
+        assert_eq!(
+            bindings.feed(key(KEY_G, KEY_PRESS)).launcher,
+            Some(LauncherAction::Close)
+        );
+        assert!(bindings.feed(key(KEY_G, KEY_RELEASE)).forward.is_none());
+    }
+
+    #[test]
+    fn launcher_text_backspace_and_modified_keys_are_consumed() {
+        let mut bindings = KeyBindings::default();
+        press(&mut bindings, KEY_LEFTMETA);
+        press(&mut bindings, KEY_X);
+        assert_eq!(
+            bindings.feed(key(KEY_L, KEY_PRESS)).launcher,
+            Some(LauncherAction::Open)
+        );
+        bindings.settle_launcher(Some(true));
+        bindings.feed(key(KEY_L, KEY_RELEASE));
+        bindings.feed(key(KEY_LEFTMETA, KEY_RELEASE));
+
+        for (code, expected) in [
+            (KEY_T, 't'),
+            (KEY_E, 'e'),
+            (KEY_R, 'r'),
+            (KEY_M, 'm'),
+            (KEY_SPACE, ' '),
+            (KEY_1, '1'),
+            (KEY_MINUS, '-'),
+        ] {
+            let decision = bindings.feed(key(code, KEY_PRESS));
+            assert_eq!(decision.launcher, Some(LauncherAction::Insert(expected)));
+            assert!(decision.forward.is_none());
+            assert!(bindings.feed(key(code, KEY_RELEASE)).forward.is_none());
+        }
+        assert_eq!(
+            bindings.feed(key(KEY_BACKSPACE, KEY_PRESS)).launcher,
+            Some(LauncherAction::Backspace)
+        );
+        bindings.feed(key(KEY_BACKSPACE, KEY_RELEASE));
+
+        press(&mut bindings, KEY_LEFTCTRL);
+        let modified = bindings.feed(key(KEY_A, KEY_PRESS));
+        assert!(modified.launcher.is_none());
+        assert!(modified.forward.is_none());
+        bindings.feed(key(KEY_A, KEY_RELEASE));
+        bindings.feed(key(KEY_LEFTCTRL, KEY_RELEASE));
+        assert_eq!(
+            bindings.feed(key(KEY_A, KEY_PRESS)).launcher,
+            Some(LauncherAction::Insert('a'))
+        );
+    }
+
+    #[test]
+    fn launcher_character_map_covers_ascii_registry_input() {
+        let letters = [
+            KEY_A, KEY_B, KEY_C, KEY_D, KEY_E, KEY_F, KEY_G, KEY_H, KEY_I, KEY_J, KEY_K, KEY_L,
+            KEY_M, KEY_N, KEY_O, KEY_P, KEY_Q, KEY_R, KEY_S, KEY_T, KEY_U, KEY_V, KEY_W, KEY_X,
+            KEY_Y, KEY_Z,
+        ];
+        let mapped: String = letters.into_iter().filter_map(launcher_character).collect();
+        assert_eq!(mapped, "abcdefghijklmnopqrstuvwxyz");
+        let digits: String = [
+            KEY_1, KEY_2, KEY_3, KEY_4, KEY_5, KEY_6, KEY_7, KEY_8, KEY_9, KEY_0,
+        ]
+        .into_iter()
+        .filter_map(launcher_character)
+        .collect();
+        assert_eq!(digits, "1234567890");
+        assert_eq!(launcher_character(KEY_SPACE), Some(' '));
+        assert_eq!(launcher_character(KEY_MINUS), Some('-'));
+        assert_eq!(launcher_character(KEY_ENTER), None);
+    }
+
+    #[test]
     fn prefix_survives_modifier_release_and_is_cancelled_by_an_unknown_key() {
         let mut bindings = KeyBindings::default();
         press(&mut bindings, KEY_LEFTMETA);
@@ -859,12 +1502,17 @@ mod tests {
         });
         assert_eq!(
             pointer.feed(Event {
-                time: 0,
+                time: 9,
                 kind: EV_SYN,
                 code: SYN_REPORT,
                 value: 0
             }),
-            Some((i32::MAX, -7))
+            Some(PointerFrame {
+                time: 9,
+                dx: i32::MAX,
+                dy: -7,
+                buttons: Vec::new(),
+            })
         );
         assert_eq!(
             pointer.feed(Event {
@@ -874,6 +1522,311 @@ mod tests {
                 value: 0
             }),
             None
+        );
+    }
+
+    #[test]
+    fn oversized_pointer_report_is_dropped_and_recovers_at_next_sync() {
+        let target = Mutex::new(RecordingTarget::default());
+        let bindings = Mutex::new(KeyBindings::default());
+        let mut pointer = PointerMotion::default();
+        let mut dropped = false;
+        for index in 0..=MAX_POINTER_BUTTON_TRANSITIONS_PER_FRAME {
+            apply_device_event(
+                &target,
+                key(
+                    BTN_MOUSE,
+                    if index % 2 == 0 {
+                        KEY_PRESS
+                    } else {
+                        KEY_RELEASE
+                    },
+                ),
+                0,
+                &bindings,
+                &mut pointer,
+                &mut dropped,
+            )
+            .unwrap();
+        }
+        assert!(dropped);
+        assert!(pointer.buttons.is_empty());
+        assert!(target.lock().unwrap().pointer_frames.is_empty());
+
+        for event in [
+            Event {
+                time: 7,
+                kind: EV_REL,
+                code: REL_X,
+                value: 99,
+            },
+            Event {
+                time: 8,
+                kind: EV_SYN,
+                code: SYN_REPORT,
+                value: 0,
+            },
+            Event {
+                time: 9,
+                kind: EV_REL,
+                code: REL_X,
+                value: 3,
+            },
+            Event {
+                time: 10,
+                kind: EV_SYN,
+                code: SYN_REPORT,
+                value: 0,
+            },
+        ] {
+            apply_device_event(&target, event, 0, &bindings, &mut pointer, &mut dropped).unwrap();
+        }
+        assert_eq!(
+            target.lock().unwrap().pointer_frames,
+            [(10, 3, 0, Vec::new())]
+        );
+    }
+
+    #[test]
+    fn pointer_buttons_are_logical_across_devices_and_flush_with_syn_report() {
+        let target = Arc::new(Mutex::new(RecordingTarget::default()));
+        let bindings = Mutex::new(KeyBindings::default());
+        let mut first = PointerMotion::default();
+        let mut second = PointerMotion::default();
+        for (device, event) in [
+            (0, key(BTN_MOUSE, KEY_PRESS)),
+            (1, key(BTN_MOUSE, KEY_PRESS)),
+            (
+                0,
+                Event {
+                    time: 5,
+                    kind: EV_SYN,
+                    code: SYN_REPORT,
+                    value: 0,
+                },
+            ),
+            (
+                1,
+                Event {
+                    time: 5,
+                    kind: EV_SYN,
+                    code: SYN_REPORT,
+                    value: 0,
+                },
+            ),
+            (0, key(BTN_MOUSE, KEY_RELEASE)),
+            (
+                0,
+                Event {
+                    time: 6,
+                    kind: EV_SYN,
+                    code: SYN_REPORT,
+                    value: 0,
+                },
+            ),
+            (1, key(BTN_MOUSE, KEY_RELEASE)),
+            (
+                1,
+                Event {
+                    time: 7,
+                    kind: EV_SYN,
+                    code: SYN_REPORT,
+                    value: 0,
+                },
+            ),
+        ] {
+            let pointer = if device == 0 { &mut first } else { &mut second };
+            apply(target.as_ref(), event, device, &bindings, pointer).unwrap();
+        }
+        assert_eq!(
+            target.lock().unwrap().pointer_frames,
+            [
+                (
+                    5,
+                    0,
+                    0,
+                    vec![PointerButtonInput {
+                        time: 5,
+                        button: u32::from(BTN_MOUSE),
+                        state: PointerButtonState::Pressed,
+                    }],
+                ),
+                (
+                    7,
+                    0,
+                    0,
+                    vec![PointerButtonInput {
+                        time: 7,
+                        button: u32::from(BTN_MOUSE),
+                        state: PointerButtonState::Released,
+                    }],
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn launcher_capture_drops_new_pointer_buttons_but_keeps_motion_local() {
+        let target = Mutex::new(RecordingTarget::default());
+        let bindings = Mutex::new(KeyBindings::default());
+        let mut pointer = PointerMotion::default();
+        let apply_event = |event, pointer: &mut PointerMotion| {
+            apply(&target, event, 0, &bindings, pointer).unwrap();
+        };
+        apply_event(key(KEY_LEFTMETA, KEY_PRESS), &mut pointer);
+        apply_event(key(KEY_X, KEY_PRESS), &mut pointer);
+        apply_event(key(KEY_L, KEY_PRESS), &mut pointer);
+        assert!(bindings.lock().unwrap().launcher_open);
+
+        apply_event(key(BTN_MOUSE, KEY_PRESS), &mut pointer);
+        apply_event(
+            Event {
+                time: 1,
+                kind: EV_SYN,
+                code: SYN_REPORT,
+                value: 0,
+            },
+            &mut pointer,
+        );
+        assert!(target.lock().unwrap().pointer_frames.is_empty());
+
+        apply_event(
+            Event {
+                time: 2,
+                kind: EV_REL,
+                code: REL_X,
+                value: 5,
+            },
+            &mut pointer,
+        );
+        apply_event(
+            Event {
+                time: 2,
+                kind: EV_SYN,
+                code: SYN_REPORT,
+                value: 0,
+            },
+            &mut pointer,
+        );
+        assert_eq!(
+            target.lock().unwrap().pointer_frames,
+            [(2, 5, 0, Vec::new())]
+        );
+
+        apply_event(key(BTN_MOUSE, KEY_RELEASE), &mut pointer);
+        apply_event(
+            Event {
+                time: 3,
+                kind: EV_SYN,
+                code: SYN_REPORT,
+                value: 0,
+            },
+            &mut pointer,
+        );
+        assert_eq!(target.lock().unwrap().pointer_frames.len(), 1);
+    }
+
+    #[test]
+    fn replacement_button_press_survives_cross_device_syn_reordering() {
+        let target = Mutex::new(RecordingTarget::default());
+        let bindings = Mutex::new(KeyBindings::default());
+        let mut first = PointerMotion::default();
+        let mut second = PointerMotion::default();
+        let syn = |time| Event {
+            time,
+            kind: EV_SYN,
+            code: SYN_REPORT,
+            value: 0,
+        };
+
+        apply(&target, key(BTN_MOUSE, KEY_PRESS), 0, &bindings, &mut first).unwrap();
+        apply(&target, syn(1), 0, &bindings, &mut first).unwrap();
+        apply(
+            &target,
+            key(BTN_MOUSE, KEY_RELEASE),
+            0,
+            &bindings,
+            &mut first,
+        )
+        .unwrap();
+        apply(
+            &target,
+            key(BTN_MOUSE, KEY_PRESS),
+            1,
+            &bindings,
+            &mut second,
+        )
+        .unwrap();
+        apply(&target, syn(2), 1, &bindings, &mut second).unwrap();
+        apply(&target, syn(3), 0, &bindings, &mut first).unwrap();
+        assert_eq!(target.lock().unwrap().pointer_frames.len(), 1);
+
+        apply(
+            &target,
+            key(BTN_MOUSE, KEY_RELEASE),
+            1,
+            &bindings,
+            &mut second,
+        )
+        .unwrap();
+        apply(&target, syn(4), 1, &bindings, &mut second).unwrap();
+        assert_eq!(
+            target.lock().unwrap().pointer_frames,
+            [
+                (
+                    1,
+                    0,
+                    0,
+                    vec![PointerButtonInput {
+                        time: 1,
+                        button: u32::from(BTN_MOUSE),
+                        state: PointerButtonState::Pressed,
+                    }],
+                ),
+                (
+                    4,
+                    0,
+                    0,
+                    vec![PointerButtonInput {
+                        time: 4,
+                        button: u32::from(BTN_MOUSE),
+                        state: PointerButtonState::Released,
+                    }],
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_button_edge_waits_for_its_own_device_syn_report() {
+        let target = Mutex::new(RecordingTarget::default());
+        let bindings = Mutex::new(KeyBindings::default());
+        let mut first = PointerMotion::default();
+        let mut second = PointerMotion::default();
+        let syn = |time| Event {
+            time,
+            kind: EV_SYN,
+            code: SYN_REPORT,
+            value: 0,
+        };
+
+        apply(&target, key(BTN_MOUSE, KEY_PRESS), 0, &bindings, &mut first).unwrap();
+        apply(&target, syn(1), 1, &bindings, &mut second).unwrap();
+        assert!(target.lock().unwrap().pointer_frames.is_empty());
+
+        apply(&target, syn(2), 0, &bindings, &mut first).unwrap();
+        assert_eq!(
+            target.lock().unwrap().pointer_frames,
+            [(
+                2,
+                0,
+                0,
+                vec![PointerButtonInput {
+                    time: 2,
+                    button: u32::from(BTN_MOUSE),
+                    state: PointerButtonState::Pressed,
+                }],
+            )]
         );
     }
 
@@ -898,7 +1851,7 @@ mod tests {
                 value: -2,
             },
             Event {
-                time: 0,
+                time: 17,
                 kind: EV_SYN,
                 code: SYN_REPORT,
                 value: 0,
@@ -937,7 +1890,181 @@ mod tests {
                 }),
             ]
         );
-        assert_eq!(target.motions, [(3, -2)]);
+        assert_eq!(target.pointer_frames, [(17, 3, -2, Vec::new())]);
+    }
+
+    #[test]
+    fn adapter_delivers_launcher_actions_in_input_order() {
+        let target = Mutex::new(RecordingTarget::default());
+        let bindings = Mutex::new(KeyBindings::default());
+        let mut pointer = PointerMotion::default();
+        for event in [
+            key(KEY_LEFTMETA, KEY_PRESS),
+            key(KEY_X, KEY_PRESS),
+            key(KEY_L, KEY_PRESS),
+            key(KEY_L, KEY_RELEASE),
+            key(KEY_LEFTMETA, KEY_RELEASE),
+            key(KEY_DOWN, KEY_PRESS),
+            key(KEY_DOWN, KEY_RELEASE),
+            key(KEY_ENTER, KEY_PRESS),
+        ] {
+            apply(&target, event, 0, &bindings, &mut pointer).unwrap();
+        }
+        assert_eq!(
+            target.lock().unwrap().launcher_actions,
+            [
+                LauncherAction::Open,
+                LauncherAction::Next,
+                LauncherAction::Activate,
+            ]
+        );
+    }
+
+    #[test]
+    fn empty_activation_keeps_input_captured_until_backspace_recovers() {
+        let target = Mutex::new(LauncherModelTarget::new());
+        let bindings = Mutex::new(KeyBindings::default());
+        let mut pointer = PointerMotion::default();
+        for event in [
+            key(KEY_LEFTMETA, KEY_PRESS),
+            key(KEY_X, KEY_PRESS),
+            key(KEY_L, KEY_PRESS),
+            key(KEY_L, KEY_RELEASE),
+            key(KEY_LEFTMETA, KEY_RELEASE),
+            key(KEY_Z, KEY_PRESS),
+            key(KEY_Z, KEY_RELEASE),
+            key(KEY_ENTER, KEY_PRESS),
+            key(KEY_ENTER, KEY_RELEASE),
+            key(KEY_BACKSPACE, KEY_PRESS),
+            key(KEY_BACKSPACE, KEY_RELEASE),
+        ] {
+            apply(&target, event, 0, &bindings, &mut pointer).unwrap();
+        }
+        {
+            let target = target.lock().unwrap();
+            assert!(target.launcher.visible());
+            assert_eq!(target.launcher.query(), "");
+            assert_eq!(
+                target.recording.launcher_actions,
+                [
+                    LauncherAction::Open,
+                    LauncherAction::Insert('z'),
+                    LauncherAction::Activate,
+                    LauncherAction::Backspace,
+                ]
+            );
+            assert!(target.recording.keys.iter().all(|input| {
+                !matches!(
+                    input.key,
+                    key if key == u32::from(KEY_Z)
+                        || key == u32::from(KEY_ENTER)
+                        || key == u32::from(KEY_BACKSPACE)
+                )
+            }));
+        }
+        assert!(bindings.lock().unwrap().launcher_open);
+
+        for event in [key(KEY_ENTER, KEY_PRESS), key(KEY_ENTER, KEY_RELEASE)] {
+            apply(&target, event, 0, &bindings, &mut pointer).unwrap();
+        }
+        assert!(!target.lock().unwrap().launcher.visible());
+        assert!(!bindings.lock().unwrap().launcher_open);
+    }
+
+    #[test]
+    fn failed_open_repaint_never_enables_launcher_capture() {
+        let path = std::env::temp_dir().join(format!(
+            "td-input-launcher-open-failure-{}-{}",
+            std::process::id(),
+            TEST_SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let cleanup = Cleanup(path);
+        let framebuffer =
+            crate::framebuffer::Framebuffer::test_file(&cleanup.0, 640, 240, 640 * 4).unwrap();
+        let runtime = Arc::new(Mutex::new(Runtime::new(framebuffer)));
+        runtime.lock().unwrap().repaint().unwrap();
+        let launches = LaunchProcesses::new(LaunchOptions {
+            socket: PathBuf::from("/run/user/1000/wayland-0"),
+            client: PathBuf::from("/bin/td-ui-demo"),
+        })
+        .unwrap();
+        let target = Mutex::new(LiveInputTarget {
+            runtime: Arc::clone(&runtime),
+            launches,
+        });
+        let bindings = Mutex::new(KeyBindings::default());
+        let mut pointer = PointerMotion::default();
+        for event in [key(KEY_LEFTMETA, KEY_PRESS), key(KEY_X, KEY_PRESS)] {
+            apply(&target, event, 0, &bindings, &mut pointer).unwrap();
+        }
+        runtime.lock().unwrap().fail_next_repaint();
+        assert!(apply(&target, key(KEY_L, KEY_PRESS), 0, &bindings, &mut pointer).is_err());
+        assert!(!runtime.lock().unwrap().launcher_visible());
+        assert!(!bindings.lock().unwrap().launcher_open);
+    }
+
+    #[test]
+    fn failed_pointer_repaint_retains_state_for_device_cleanup() {
+        let path = std::env::temp_dir().join(format!(
+            "td-input-pointer-repaint-failure-{}-{}",
+            std::process::id(),
+            TEST_SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let cleanup = Cleanup(path);
+        let framebuffer =
+            crate::framebuffer::Framebuffer::test_file(&cleanup.0, 120, 80, 120 * 4).unwrap();
+        let runtime = Arc::new(Mutex::new(Runtime::new(framebuffer)));
+        runtime.lock().unwrap().repaint().unwrap();
+        let launches = LaunchProcesses::new(LaunchOptions {
+            socket: PathBuf::from("/run/user/1000/wayland-0"),
+            client: PathBuf::from("/bin/td-ui-demo"),
+        })
+        .unwrap();
+        let target = Mutex::new(LiveInputTarget {
+            runtime: Arc::clone(&runtime),
+            launches,
+        });
+        let bindings = Mutex::new(KeyBindings::default());
+        let mut pointer = PointerMotion::default();
+        apply(&target, key(BTN_MOUSE, KEY_PRESS), 0, &bindings, &mut pointer).unwrap();
+        apply(
+            &target,
+            Event {
+                time: 3,
+                kind: EV_REL,
+                code: REL_X,
+                value: 1,
+            },
+            0,
+            &bindings,
+            &mut pointer,
+        )
+        .unwrap();
+        runtime.lock().unwrap().fail_next_repaint();
+        assert!(apply(
+            &target,
+            Event {
+                time: 4,
+                kind: EV_SYN,
+                code: SYN_REPORT,
+                value: 0,
+            },
+            0,
+            &bindings,
+            &mut pointer,
+        )
+        .is_err());
+        {
+            let bindings = bindings.lock().unwrap();
+            assert!(bindings.pointer_pressed.contains(&(0, BTN_MOUSE)));
+            assert!(bindings.pointer_forwarded.contains(&BTN_MOUSE));
+        }
+
+        release_device(&target, 0, &bindings, 5).unwrap();
+
+        let bindings = bindings.lock().unwrap();
+        assert!(bindings.pointer_pressed.is_empty());
+        assert!(bindings.pointer_forwarded.is_empty());
     }
 
     #[test]
@@ -986,6 +2113,33 @@ mod tests {
             assert_eq!(decision.forward, None);
             assert_eq!(decision.modifiers, None);
         }
+        let mut pointer = PointerMotion::default();
+        assert_eq!(pointer.feed(key(BTN_MOUSE, KEY_PRESS)), None);
+        assert_eq!(pointer.feed(key(BTN_MOUSE, KEY_REPEAT)), None);
+        assert_eq!(pointer.feed(key(BTN_MOUSE, KEY_RELEASE)), None);
+        assert_eq!(
+            pointer.feed(Event {
+                time: 9,
+                kind: EV_SYN,
+                code: SYN_REPORT,
+                value: 0,
+            }),
+            Some(PointerFrame {
+                time: 9,
+                dx: 0,
+                dy: 0,
+                buttons: vec![
+                    PointerButtonTransition {
+                        code: BTN_MOUSE,
+                        pressed: true,
+                    },
+                    PointerButtonTransition {
+                        code: BTN_MOUSE,
+                        pressed: false,
+                    },
+                ],
+            })
+        );
     }
 
     #[test]
@@ -1008,6 +2162,7 @@ mod tests {
             ("RALT", KEY_RIGHTALT),
             ("CAPS", KEY_CAPSLOCK),
             ("NMLK", KEY_NUMLOCK),
+            ("KPEN", KEY_KPENTER),
             ("LWIN", KEY_LEFTMETA),
             ("RWIN", KEY_RIGHTMETA),
         ] {
@@ -1198,6 +2353,75 @@ mod tests {
     }
 
     #[test]
+    fn device_teardown_never_forwards_another_devices_press() {
+        let target = Mutex::new(RecordingTarget::default());
+        let mut state = KeyBindings {
+            launcher_open: true,
+            ..KeyBindings::default()
+        };
+        state.pointer_pressed.insert((1, BTN_MOUSE));
+        state.pointer_pressed.insert((2, BTN_MOUSE));
+        state.settle_launcher(Some(false));
+        let bindings = Mutex::new(state);
+
+        release_device(&target, 1, &bindings, 77).unwrap();
+
+        assert!(target.lock().unwrap().pointer_frames.is_empty());
+        let bindings = bindings.lock().unwrap();
+        assert_eq!(bindings.pointer_pressed, BTreeSet::from([(2, BTN_MOUSE)]));
+        assert!(bindings.pointer_forwarded.is_empty());
+    }
+
+    #[test]
+    fn device_teardown_commits_releases_before_delivery_failure() {
+        let target = Mutex::new(RecordingTarget {
+            key_error: Some("injected key failure".into()),
+            pointer_error: Some("injected pointer failure".into()),
+            ..RecordingTarget::default()
+        });
+        let mut state = KeyBindings::default();
+        state.pressed.insert((1, KEY_LEFTSHIFT));
+        state.forwarded.insert((1, KEY_LEFTSHIFT));
+        state.pointer_pressed.insert((1, BTN_MOUSE));
+        state.pointer_forwarded.insert(BTN_MOUSE);
+        let bindings = Mutex::new(state);
+
+        let error = release_device(&target, 1, &bindings, 77).unwrap_err();
+        assert!(error.contains("injected key failure"));
+        assert!(error.contains("injected pointer failure"));
+
+        let target = target.lock().unwrap();
+        assert_eq!(
+            target.pointer_frames,
+            [(
+                77,
+                0,
+                0,
+                vec![PointerButtonInput {
+                    time: 77,
+                    button: u32::from(BTN_MOUSE),
+                    state: PointerButtonState::Released,
+                }],
+            )]
+        );
+        assert_eq!(
+            target.keys.last(),
+            Some(&KeyInput {
+                time: 77,
+                key: u32::from(KEY_LEFTSHIFT),
+                state: KeyState::Released,
+            })
+        );
+        assert_eq!(target.modifiers.last(), Some(&ModifierState::default()));
+        drop(target);
+        let bindings = bindings.lock().unwrap();
+        assert!(bindings.pressed.is_empty());
+        assert!(bindings.forwarded.is_empty());
+        assert!(bindings.pointer_pressed.is_empty());
+        assert!(bindings.pointer_forwarded.is_empty());
+    }
+
+    #[test]
     fn unrelated_device_teardown_does_not_cancel_a_prefix() {
         let target = Mutex::new(RecordingTarget::default());
         let bindings = Mutex::new(KeyBindings::default());
@@ -1289,7 +2513,70 @@ mod tests {
                 ModifierState::default(),
             ]
         );
-        assert!(target.motions.is_empty());
+        assert!(target.pointer_frames.is_empty());
+    }
+
+    #[test]
+    fn syn_dropped_discards_partial_pointer_data_and_releases_forwarded_buttons() {
+        let target = Mutex::new(RecordingTarget::default());
+        let bindings = Mutex::new(KeyBindings::default());
+        let mut pointer = PointerMotion::default();
+        let mut dropped = false;
+        for event in [
+            key(BTN_MOUSE, KEY_PRESS),
+            Event {
+                time: 1,
+                kind: EV_SYN,
+                code: SYN_REPORT,
+                value: 0,
+            },
+            key(BTN_MOUSE, KEY_RELEASE),
+            Event {
+                time: 2,
+                kind: EV_REL,
+                code: REL_X,
+                value: 20,
+            },
+            Event {
+                time: 3,
+                kind: EV_SYN,
+                code: SYN_DROPPED,
+                value: 0,
+            },
+            Event {
+                time: 4,
+                kind: EV_SYN,
+                code: SYN_REPORT,
+                value: 0,
+            },
+        ] {
+            apply_device_event(&target, event, 5, &bindings, &mut pointer, &mut dropped).unwrap();
+        }
+        assert_eq!(
+            target.lock().unwrap().pointer_frames,
+            [
+                (
+                    1,
+                    0,
+                    0,
+                    vec![PointerButtonInput {
+                        time: 1,
+                        button: u32::from(BTN_MOUSE),
+                        state: PointerButtonState::Pressed,
+                    }],
+                ),
+                (
+                    3,
+                    0,
+                    0,
+                    vec![PointerButtonInput {
+                        time: 3,
+                        button: u32::from(BTN_MOUSE),
+                        state: PointerButtonState::Released,
+                    }],
+                ),
+            ]
+        );
     }
 
     #[test]

@@ -422,7 +422,7 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
         }
         add_build_gate_targets(root, sel);
         let consumers = if p == "engine/src/sha256.rs" {
-            "td-builder, td-recipe-eval, and target-static td-boot"
+            "td-builder, td-recipe-eval, target-static td-boot, and the td-compositor terminal corpus verifier/importer"
         } else {
             "td-builder and td-recipe-eval"
         };
@@ -1436,6 +1436,15 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
     assert_target!("td-compositor/src/server.rs", "recipe-checks");
     assert_target!("td-compositor/src/sys.rs", "recipe-checks");
     assert_preflight!("td-compositor/src/sys.rs", "cargo-test");
+    assert_target!("td-compositor/tools/import-libvterm.rs", "check");
+    assert_preflight!("td-compositor/tools/import-libvterm.rs", "cargo-test");
+    assert_target!("td-compositor/tools/libvterm-0.3.3.sources", "check");
+    assert_preflight!(
+        "td-compositor/tools/libvterm-0.3.3.sources",
+        "cargo-test"
+    );
+    assert_target!("td-compositor/spec/term/cursor.term", "check");
+    assert_preflight!("td-compositor/spec/term/cursor.term", "cargo-test");
     assert_target!("td-compositor/Cargo.lock", "recipe-checks");
     assert_no_target!("td-compositor/DESIGN.md", "check");
     assert_preflight!("start", "shell-syntax");

@@ -1,8 +1,11 @@
+use crate::keyboard::XKB_KEYMAP;
+use crate::pointer::MAX_POINTER_FRAME_EVENTS;
+use crate::ui::{KeyboardUpdate, PointerUpdate, UiKeyState, UiModel, UiModifiers};
 use crate::{socket, sys, wire, MAX_UI_DIMENSION, MAX_UI_FRAME_BYTES};
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, VecDeque};
 use std::fs::{self, File, OpenOptions, Permissions};
 use std::io::{Read, Write};
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
@@ -18,14 +21,18 @@ const XDG_WM_BASE: u32 = 6;
 const SURFACE: u32 = 7;
 const XDG_SURFACE: u32 = 8;
 const XDG_TOPLEVEL: u32 = 9;
-const FIRST_DYNAMIC_ID: u32 = 10;
+const SEAT: u32 = 10;
+const KEYBOARD: u32 = 11;
+const POINTER: u32 = 12;
+const FIRST_DYNAMIC_ID: u32 = 13;
 
 const DEFAULT_WIDTH: usize = 512;
 const DEFAULT_HEIGHT: usize = 320;
 const BYTES_PER_PIXEL: usize = 4;
 const SHM_XRGB8888: u32 = 1;
 const CONNECT_ATTEMPTS: usize = 300;
-const MAX_EVENT_BUFFER: usize = 128 * 1024;
+const MAX_PENDING_FDS: usize = 8;
+const RECEIVE_BUFFER_BYTES: usize = 16 * 1024;
 const PRESENT_TIMEOUT: Duration = Duration::from_secs(20);
 
 pub struct Options {
@@ -44,6 +51,7 @@ struct Globals {
     compositor: Option<Global>,
     shm: Option<Global>,
     xdg_wm_base: Option<Global>,
+    seat: Option<Global>,
 }
 
 impl Globals {
@@ -66,6 +74,9 @@ impl Globals {
                     .is_none_or(|current| version > current.version) =>
             {
                 self.xdg_wm_base = Some(global)
+            }
+            "wl_seat" if self.seat.is_none_or(|current| version > current.version) => {
+                self.seat = Some(global)
             }
             _ => {}
         }
@@ -94,6 +105,14 @@ struct Connection {
     deadline: Option<Instant>,
     next_id: u32,
     free_ids: BTreeSet<u32>,
+    pending_fds: VecDeque<RawFd>,
+    incoming: [u8; RECEIVE_BUFFER_BYTES],
+}
+
+impl Drop for Connection {
+    fn drop(&mut self) {
+        self.discard_pending_fds();
+    }
 }
 
 impl Connection {
@@ -112,6 +131,8 @@ impl Connection {
                         deadline: Some(deadline),
                         next_id: FIRST_DYNAMIC_ID,
                         free_ids: BTreeSet::new(),
+                        pending_fds: VecDeque::new(),
+                        incoming: [0; RECEIVE_BUFFER_BYTES],
                     });
                 }
                 Err(error)
@@ -184,38 +205,54 @@ impl Connection {
             if let Some(message) = wire::take(&mut self.buffered)? {
                 return Ok(message);
             }
-            if self.buffered.len() > MAX_EVENT_BUFFER {
-                return Err(format!(
-                    "Wayland event buffer exceeded {MAX_EVENT_BUFFER} bytes"
-                ));
+            let wanted = match wire::header(&self.buffered)? {
+                Some((_, _, size)) => size.saturating_sub(self.buffered.len()),
+                None => wire::HEADER_SIZE.saturating_sub(self.buffered.len()),
+            };
+            if wanted == 0 {
+                return Err("Wayland event parser made no progress".into());
             }
-            let mut incoming = [0u8; 16 * 1024];
+            let capacity = wanted.min(self.incoming.len());
+            let input = self
+                .incoming
+                .get_mut(..capacity)
+                .ok_or_else(|| "Wayland receive bound escaped input buffer".to_string())?;
             if let Some(remaining) = remaining {
                 self.stream
                     .set_read_timeout(Some(remaining))
                     .map_err(|e| format!("set Wayland handshake timeout: {e}"))?;
             }
-            let count = self.stream.read(&mut incoming).map_err(|e| {
-                if matches!(
-                    e.kind(),
-                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-                ) {
-                    if self.deadline.is_some() {
-                        "Wayland presentation handshake timed out".to_string()
-                    } else {
-                        "Wayland event wait timed out".to_string()
-                    }
-                } else {
-                    format!("read Wayland event: {e}")
+            let received = match sys::recv_with_fds(&self.stream, input) {
+                Ok(received) => received,
+                Err(sys::ReceiveError::Disconnected) => {
+                    return Err("Wayland compositor closed the connection".into())
                 }
-            })?;
-            if count == 0 {
+                Err(sys::ReceiveError::TimedOut) if self.deadline.is_some() => {
+                    return Err("Wayland presentation handshake timed out".into())
+                }
+                Err(sys::ReceiveError::TimedOut) => {
+                    return Err("Wayland event wait timed out".into())
+                }
+                Err(sys::ReceiveError::Failure(error)) => {
+                    return Err(format!("receive Wayland event: {error}"))
+                }
+            };
+            if received.count == 0 {
+                sys::discard_received(&received.fds);
                 return Err("Wayland compositor closed the connection".into());
             }
-            let bytes = incoming
-                .get(..count)
+            if self.pending_fds.len().saturating_add(received.fds.len()) > MAX_PENDING_FDS {
+                sys::discard_received(&received.fds);
+                self.discard_pending_fds();
+                return Err(format!(
+                    "Wayland client queued more than {MAX_PENDING_FDS} descriptors"
+                ));
+            }
+            let bytes = input
+                .get(..received.count)
                 .ok_or_else(|| "Wayland read count escaped input buffer".to_string())?;
             self.buffered.extend_from_slice(bytes);
+            self.pending_fds.extend(received.fds);
         }
     }
 
@@ -267,6 +304,20 @@ impl Connection {
             .filter(|next| *next != 0)
             .ok_or_else(|| "Wayland object id space exhausted".to_string())?;
         Ok(id)
+    }
+
+    fn take_fd(&mut self, purpose: &str) -> Result<File, String> {
+        let fd = self
+            .pending_fds
+            .pop_front()
+            .ok_or_else(|| format!("{purpose} event arrived without a descriptor"))?;
+        sys::duplicate_received(fd)
+    }
+
+    fn discard_pending_fds(&mut self) {
+        while let Some(fd) = self.pending_fds.pop_front() {
+            sys::discard_received(&[fd]);
+        }
     }
 }
 
@@ -360,7 +411,7 @@ fn discover_globals(connection: &mut Connection) -> Result<Globals, String> {
     }
 }
 
-fn build_pixels(width: usize, height: usize) -> Result<Vec<u8>, String> {
+fn build_pixels(width: usize, height: usize, ui: &UiModel) -> Result<Vec<u8>, String> {
     if width == 0 || height == 0 {
         return Err("demo surface dimensions must be positive".into());
     }
@@ -424,6 +475,7 @@ fn build_pixels(width: usize, height: usize) -> Result<Vec<u8>, String> {
         };
         pixel.copy_from_slice(&color);
     }
+    ui.paint(&mut pixels, width, height)?;
     Ok(pixels)
 }
 
@@ -529,6 +581,13 @@ struct Demo {
     live_callbacks: BTreeSet<u32>,
     layout_configured: bool,
     xrgb_advertised: bool,
+    seat_capabilities: Option<u32>,
+    seat_devices_requested: bool,
+    keymap_verified: bool,
+    repeat: Option<(i32, i32)>,
+    ui: UiModel,
+    pending_pointer: Vec<PointerUpdate>,
+    rendered_revision: u64,
     activated: bool,
     fullscreen: bool,
 }
@@ -543,6 +602,13 @@ impl Demo {
             live_callbacks: BTreeSet::new(),
             layout_configured: false,
             xrgb_advertised: false,
+            seat_capabilities: None,
+            seat_devices_requested: false,
+            keymap_verified: false,
+            repeat: None,
+            ui: UiModel::default(),
+            pending_pointer: Vec::new(),
+            rendered_revision: 0,
             activated: false,
             fullscreen: false,
         }
@@ -551,9 +617,37 @@ impl Demo {
     fn ready(&self) -> bool {
         self.layout_configured
             && self
+                .seat_capabilities
+                .is_some_and(|capabilities| capabilities & 3 == 3)
+            && self.keymap_verified
+            && self
                 .target
                 .as_ref()
                 .is_some_and(|frame| frame.released && frame.presented)
+    }
+
+    fn target_settled(&self) -> bool {
+        self.target
+            .as_ref()
+            .is_none_or(|frame| frame.released && frame.presented)
+    }
+
+    fn input_pending(&self) -> bool {
+        self.rendered_revision != self.ui.revision()
+    }
+
+    fn maybe_commit_input(
+        &mut self,
+        connection: &mut Connection,
+        runtime_directory: &Path,
+    ) -> Result<(), String> {
+        if !self.input_pending() || !self.target_settled() {
+            return Ok(());
+        }
+        let Some(size) = self.current_size else {
+            return Ok(());
+        };
+        self.commit_frame(connection, runtime_directory, size)
     }
 
     fn configure_toplevel(&mut self, message: &wire::Message) -> Result<(), String> {
@@ -641,7 +735,7 @@ impl Demo {
         if !self.xrgb_advertised {
             return Err("compositor did not advertise wl_shm XRGB8888".into());
         }
-        let pixels = build_pixels(size.width, size.height)?;
+        let pixels = build_pixels(size.width, size.height, &self.ui)?;
         let file = backing_file(runtime_directory, &pixels)?;
         let pool_id = connection.allocate_id()?;
         let buffer_id = connection.allocate_id()?;
@@ -701,12 +795,264 @@ impl Demo {
             ));
         }
         self.current_size = Some(size);
+        self.rendered_revision = self.ui.revision();
         self.target = Some(TargetFrame {
             buffer: buffer_id,
             callback: callback_id,
             released: false,
             presented: false,
         });
+        Ok(())
+    }
+
+    fn seat_event(
+        &mut self,
+        connection: &mut Connection,
+        message: &wire::Message,
+    ) -> Result<(), String> {
+        let mut args = wire::Cursor::new(&message.payload);
+        match message.opcode {
+            0 => {
+                let capabilities = args.u32()?;
+                args.finish()?;
+                self.seat_capabilities = Some(capabilities);
+                if capabilities & 3 == 3 && !self.seat_devices_requested {
+                    let mut keyboard = wire::Builder::new();
+                    keyboard.u32(KEYBOARD);
+                    connection.send(SEAT, 1, keyboard)?;
+                    let mut pointer = wire::Builder::new();
+                    pointer.u32(POINTER);
+                    connection.send(SEAT, 0, pointer)?;
+                    self.seat_devices_requested = true;
+                }
+                Ok(())
+            }
+            1 => {
+                args.string()?;
+                args.finish()
+            }
+            _ => Err(format!(
+                "unexpected wl_seat event opcode={}",
+                message.opcode
+            )),
+        }
+    }
+
+    fn keyboard_event(
+        &mut self,
+        connection: &mut Connection,
+        message: &wire::Message,
+    ) -> Result<(), String> {
+        let mut args = wire::Cursor::new(&message.payload);
+        match message.opcode {
+            0 => {
+                let format = args.u32()?;
+                let size = args.u32()?;
+                args.finish()?;
+                let mut file = connection.take_fd("wl_keyboard.keymap")?;
+                if format != 1 {
+                    return Err(format!("unsupported wl_keyboard keymap format {format}"));
+                }
+                let expected_size = XKB_KEYMAP
+                    .len()
+                    .checked_add(1)
+                    .ok_or_else(|| "expected XKB keymap size overflow".to_string())?;
+                let announced_size = usize::try_from(size)
+                    .map_err(|_| "wl_keyboard keymap size escaped usize".to_string())?;
+                if announced_size != expected_size {
+                    return Err(format!(
+                        "wl_keyboard keymap has size {announced_size}, expected {expected_size}"
+                    ));
+                }
+                let metadata_size = usize::try_from(
+                    file.metadata()
+                        .map_err(|e| format!("stat wl_keyboard keymap: {e}"))?
+                        .len(),
+                )
+                .map_err(|_| "wl_keyboard keymap file size escaped usize".to_string())?;
+                if metadata_size != expected_size {
+                    return Err(format!(
+                        "wl_keyboard keymap file has size {metadata_size}, expected {expected_size}"
+                    ));
+                }
+                let bytes = read_keymap_bytes(&mut file, expected_size)?;
+                let body = bytes
+                    .get(..XKB_KEYMAP.len())
+                    .ok_or_else(|| "wl_keyboard keymap is truncated".to_string())?;
+                if body != XKB_KEYMAP.as_bytes() || bytes.last().copied() != Some(0) {
+                    return Err("wl_keyboard keymap differs from td's pinned keymap".into());
+                }
+                self.keymap_verified = true;
+                Ok(())
+            }
+            1 => {
+                args.u32()?;
+                let surface = args.u32()?;
+                if surface != SURFACE {
+                    return Err(format!("wl_keyboard entered unexpected surface {surface}"));
+                }
+                let byte_count = usize::try_from(args.u32()?)
+                    .map_err(|_| "wl_keyboard key array size escaped usize".to_string())?;
+                if !byte_count.is_multiple_of(4) || byte_count / 4 > 256 {
+                    return Err(format!(
+                        "wl_keyboard key array has invalid length {byte_count}"
+                    ));
+                }
+                let mut keys = BTreeSet::new();
+                for _ in 0..byte_count / 4 {
+                    keys.insert(args.u32()?);
+                }
+                args.finish()?;
+                self.ui.keyboard(KeyboardUpdate::Enter { keys })?;
+                Ok(())
+            }
+            2 => {
+                args.u32()?;
+                let surface = args.u32()?;
+                args.finish()?;
+                if surface != SURFACE {
+                    return Err(format!("wl_keyboard left unexpected surface {surface}"));
+                }
+                self.ui.keyboard(KeyboardUpdate::Leave)?;
+                Ok(())
+            }
+            3 => {
+                args.u32()?;
+                args.u32()?;
+                let key = args.u32()?;
+                let state = key_state(args.u32()?, "wl_keyboard key")?;
+                args.finish()?;
+                self.ui.keyboard(KeyboardUpdate::Key { key, state })?;
+                Ok(())
+            }
+            4 => {
+                args.u32()?;
+                let modifiers = UiModifiers {
+                    depressed: args.u32()?,
+                    latched: args.u32()?,
+                    locked: args.u32()?,
+                    group: args.u32()?,
+                };
+                args.finish()?;
+                self.ui.keyboard(KeyboardUpdate::Modifiers(modifiers))?;
+                Ok(())
+            }
+            5 => {
+                let rate = args.i32()?;
+                let delay = args.i32()?;
+                args.finish()?;
+                if rate < 0 || delay < 0 {
+                    return Err(format!(
+                        "wl_keyboard supplied invalid repeat rate={rate} delay={delay}"
+                    ));
+                }
+                self.repeat = Some((rate, delay));
+                Ok(())
+            }
+            _ => Err(format!(
+                "unexpected wl_keyboard event opcode={}",
+                message.opcode
+            )),
+        }
+    }
+
+    fn pointer_event(&mut self, message: &wire::Message) -> Result<(), String> {
+        let mut args = wire::Cursor::new(&message.payload);
+        let update = match message.opcode {
+            0 => {
+                args.u32()?;
+                let surface = args.u32()?;
+                if surface != SURFACE {
+                    return Err(format!("wl_pointer entered unexpected surface {surface}"));
+                }
+                PointerUpdate::Enter {
+                    x: args.i32()?,
+                    y: args.i32()?,
+                }
+            }
+            1 => {
+                args.u32()?;
+                let surface = args.u32()?;
+                if surface != SURFACE {
+                    return Err(format!("wl_pointer left unexpected surface {surface}"));
+                }
+                PointerUpdate::Leave
+            }
+            2 => {
+                args.u32()?;
+                PointerUpdate::Motion {
+                    x: args.i32()?,
+                    y: args.i32()?,
+                }
+            }
+            3 => {
+                args.u32()?;
+                args.u32()?;
+                let button = args.u32()?;
+                let state = key_state(args.u32()?, "wl_pointer button")?;
+                PointerUpdate::Button { button, state }
+            }
+            5 => {
+                args.finish()?;
+                let mut pending = std::mem::take(&mut self.pending_pointer);
+                let result = self.ui.pointer_frame(&pending);
+                pending.clear();
+                self.pending_pointer = pending;
+                result?;
+                return Ok(());
+            }
+            4 => {
+                args.u32()?;
+                pointer_axis(args.u32()?)?;
+                args.i32()?;
+                args.finish()?;
+                return Ok(());
+            }
+            6 => {
+                let source = args.u32()?;
+                args.finish()?;
+                if source > 3 {
+                    return Err(format!("wl_pointer supplied invalid axis source {source}"));
+                }
+                return Ok(());
+            }
+            7 => {
+                args.u32()?;
+                pointer_axis(args.u32()?)?;
+                args.finish()?;
+                return Ok(());
+            }
+            8 | 9 => {
+                pointer_axis(args.u32()?)?;
+                args.i32()?;
+                args.finish()?;
+                return Ok(());
+            }
+            10 => {
+                pointer_axis(args.u32()?)?;
+                let direction = args.u32()?;
+                args.finish()?;
+                if direction > 1 {
+                    return Err(format!(
+                        "wl_pointer supplied invalid axis relative direction {direction}"
+                    ));
+                }
+                return Ok(());
+            }
+            _ => {
+                return Err(format!(
+                    "unexpected wl_pointer event opcode={}",
+                    message.opcode
+                ))
+            }
+        };
+        args.finish()?;
+        if self.pending_pointer.len() >= MAX_POINTER_FRAME_EVENTS {
+            return Err(format!(
+                "wl_pointer frame exceeds {MAX_POINTER_FRAME_EVENTS} events"
+            ));
+        }
+        self.pending_pointer.push(update);
         Ok(())
     }
 
@@ -757,6 +1103,15 @@ impl Demo {
         if message.object == XDG_TOPLEVEL && message.opcode == 0 {
             return self.configure_toplevel(message);
         }
+        if message.object == SEAT {
+            return self.seat_event(connection, message);
+        }
+        if message.object == KEYBOARD {
+            return self.keyboard_event(connection, message);
+        }
+        if message.object == POINTER {
+            return self.pointer_event(message);
+        }
         if message.object == SHM && message.opcode == 0 {
             let mut args = wire::Cursor::new(&message.payload);
             if args.u32()? == SHM_XRGB8888 {
@@ -781,6 +1136,51 @@ impl Demo {
             message.object, message.opcode
         ))
     }
+
+    fn dispatch_and_render(
+        &mut self,
+        connection: &mut Connection,
+        message: &wire::Message,
+        runtime_directory: &Path,
+    ) -> Result<(), String> {
+        self.dispatch(connection, message, runtime_directory)?;
+        self.maybe_commit_input(connection, runtime_directory)
+    }
+}
+
+fn key_state(value: u32, event: &str) -> Result<UiKeyState, String> {
+    match value {
+        0 => Ok(UiKeyState::Released),
+        1 => Ok(UiKeyState::Pressed),
+        _ => Err(format!("{event} has invalid state {value}")),
+    }
+}
+
+fn pointer_axis(axis: u32) -> Result<(), String> {
+    if axis <= 1 {
+        Ok(())
+    } else {
+        Err(format!("wl_pointer supplied invalid axis {axis}"))
+    }
+}
+
+fn read_keymap_bytes(file: &mut File, expected_size: usize) -> Result<Vec<u8>, String> {
+    let read_bound = expected_size
+        .checked_add(1)
+        .and_then(|value| u64::try_from(value).ok())
+        .ok_or_else(|| "wl_keyboard keymap read bound overflow".to_string())?;
+    let mut bytes = Vec::with_capacity(expected_size);
+    Read::by_ref(file)
+        .take(read_bound)
+        .read_to_end(&mut bytes)
+        .map_err(|e| format!("read wl_keyboard keymap: {e}"))?;
+    if bytes.len() != expected_size {
+        return Err(format!(
+            "wl_keyboard keymap read {} bytes, expected {expected_size}",
+            bytes.len()
+        ));
+    }
+    Ok(bytes)
 }
 
 fn present(
@@ -792,6 +1192,7 @@ fn present(
         Globals::require(globals.compositor, "wl_compositor", 4, 4)?;
     let (shm_name, shm_version) = Globals::require(globals.shm, "wl_shm", 1, 1)?;
     let (xdg_name, xdg_version) = Globals::require(globals.xdg_wm_base, "xdg_wm_base", 1, 1)?;
+    let (seat_name, seat_version) = Globals::require(globals.seat, "wl_seat", 5, 7)?;
     bind(
         &mut connection,
         compositor_name,
@@ -807,6 +1208,7 @@ fn present(
         xdg_version,
         XDG_WM_BASE,
     )?;
+    bind(&mut connection, seat_name, "wl_seat", seat_version, SEAT)?;
     create_surface(&mut connection)?;
 
     let mut demo = Demo::new();
@@ -815,7 +1217,13 @@ fn present(
         if connection.handle_common(&message)? {
             continue;
         }
-        demo.dispatch(&mut connection, &message, runtime_directory)?;
+        demo.dispatch_and_render(&mut connection, &message, runtime_directory)?;
+    }
+    if !connection.pending_fds.is_empty() {
+        return Err(format!(
+            "Wayland presentation retained {} unexpected descriptors",
+            connection.pending_fds.len()
+        ));
     }
     Ok((connection, demo))
 }
@@ -846,7 +1254,7 @@ pub fn run(options: &Options) -> Result<(), String> {
         if connection.handle_common(&message)? {
             continue;
         }
-        demo.dispatch(&mut connection, &message, runtime_directory)?;
+        demo.dispatch_and_render(&mut connection, &message, runtime_directory)?;
     }
 }
 
@@ -886,8 +1294,54 @@ impl TestPresentation {
             if self.connection.handle_common(&message)? {
                 continue;
             }
-            self.demo
-                .dispatch(&mut self.connection, &message, &self.runtime_directory)?;
+            self.demo.dispatch_and_render(
+                &mut self.connection,
+                &message,
+                &self.runtime_directory,
+            )?;
+        }
+    }
+
+    pub fn wait_for_pointer(&mut self, pointer: (i32, i32), button: u32) -> Result<(), String> {
+        loop {
+            if self
+                .demo
+                .ui
+                .pointer_has_button(pointer.0, pointer.1, button)
+                && self.demo.rendered_revision == self.demo.ui.revision()
+                && self.demo.target_settled()
+            {
+                return Ok(());
+            }
+            let message = self.connection.next()?;
+            if self.connection.handle_common(&message)? {
+                continue;
+            }
+            self.demo.dispatch_and_render(
+                &mut self.connection,
+                &message,
+                &self.runtime_directory,
+            )?;
+        }
+    }
+
+    pub fn wait_for_key(&mut self, key: u32, state: UiKeyState) -> Result<(), String> {
+        loop {
+            if self.demo.ui.last_key() == Some((key, state))
+                && self.demo.rendered_revision == self.demo.ui.revision()
+                && self.demo.target_settled()
+            {
+                return Ok(());
+            }
+            let message = self.connection.next()?;
+            if self.connection.handle_common(&message)? {
+                continue;
+            }
+            self.demo.dispatch_and_render(
+                &mut self.connection,
+                &message,
+                &self.runtime_directory,
+            )?;
         }
     }
 }
@@ -903,6 +1357,8 @@ pub fn present_for_test(
         deadline: Instant::now().checked_add(Duration::from_secs(5)),
         next_id: FIRST_DYNAMIC_ID,
         free_ids: BTreeSet::new(),
+        pending_fds: VecDeque::new(),
+        incoming: [0; RECEIVE_BUFFER_BYTES],
     };
     let (mut connection, demo) = present(connection, runtime_directory)?;
     connection.finish_handshake()?;
@@ -924,7 +1380,7 @@ pub fn probe(path: &Path) -> Result<(), String> {
 }
 
 pub fn selftest() -> Result<(), String> {
-    let pixels = build_pixels(DEFAULT_WIDTH, DEFAULT_HEIGHT)?;
+    let pixels = build_pixels(DEFAULT_WIDTH, DEFAULT_HEIGHT, &UiModel::default())?;
     let first = pixels
         .get(..4)
         .ok_or_else(|| "demo pattern has no first pixel".to_string())?;
@@ -966,19 +1422,48 @@ pub fn selftest() -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::fd::IntoRawFd;
+
+    fn test_connection(stream: UnixStream) -> Connection {
+        Connection {
+            stream,
+            buffered: Vec::new(),
+            deadline: None,
+            next_id: FIRST_DYNAMIC_ID,
+            free_ids: BTreeSet::new(),
+            pending_fds: VecDeque::new(),
+            incoming: [0; RECEIVE_BUFFER_BYTES],
+        }
+    }
+
+    fn event(object: u32, opcode: u16, builder: wire::Builder) -> wire::Message {
+        let mut bytes = builder.message(object, opcode).unwrap();
+        wire::take(&mut bytes).unwrap().unwrap()
+    }
+
+    fn assert_socket_eof(mut stream: UnixStream) {
+        stream
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        let mut byte = [0u8; 1];
+        assert_eq!(stream.read(&mut byte).unwrap(), 0);
+    }
 
     #[test]
     fn pattern_is_exactly_one_xrgb_surface() {
-        let pixels = build_pixels(DEFAULT_WIDTH, DEFAULT_HEIGHT).unwrap();
+        let pixels = build_pixels(DEFAULT_WIDTH, DEFAULT_HEIGHT, &UiModel::default()).unwrap();
         assert_eq!(
             pixels.len(),
             DEFAULT_WIDTH * DEFAULT_HEIGHT * BYTES_PER_PIXEL
         );
         assert!(pixels.as_chunks::<4>().0.iter().all(|pixel| pixel[3] == 0));
-        assert_eq!(build_pixels(1, 1).unwrap().len(), BYTES_PER_PIXEL);
-        assert!(build_pixels(0, 1).is_err());
-        assert!(build_pixels(MAX_UI_DIMENSION + 1, 1).is_err());
-        assert!(build_pixels(MAX_UI_DIMENSION, MAX_UI_DIMENSION).is_err());
+        assert_eq!(
+            build_pixels(1, 1, &UiModel::default()).unwrap().len(),
+            BYTES_PER_PIXEL
+        );
+        assert!(build_pixels(0, 1, &UiModel::default()).is_err());
+        assert!(build_pixels(MAX_UI_DIMENSION + 1, 1, &UiModel::default()).is_err());
+        assert!(build_pixels(MAX_UI_DIMENSION, MAX_UI_DIMENSION, &UiModel::default()).is_err());
     }
 
     #[test]
@@ -990,25 +1475,27 @@ mod tests {
             deadline: None,
             next_id: FIRST_DYNAMIC_ID,
             free_ids: BTreeSet::new(),
+            pending_fds: VecDeque::new(),
+            incoming: [0; RECEIVE_BUFFER_BYTES],
         };
-        assert_eq!(connection.allocate_id().unwrap(), 10);
-        assert_eq!(connection.allocate_id().unwrap(), 11);
+        assert_eq!(connection.allocate_id().unwrap(), 13);
+        assert_eq!(connection.allocate_id().unwrap(), 14);
 
         let mut deleted = wire::Builder::new();
-        deleted.u32(10);
+        deleted.u32(13);
         let mut bytes = deleted.message(DISPLAY, 1).unwrap();
         let event = wire::take(&mut bytes).unwrap().unwrap();
         assert!(connection.handle_common(&event).unwrap());
-        assert_eq!(connection.allocate_id().unwrap(), 10);
+        assert_eq!(connection.allocate_id().unwrap(), 13);
 
         let mut duplicate = wire::Builder::new();
-        duplicate.u32(10);
+        duplicate.u32(13);
         let mut bytes = duplicate.message(DISPLAY, 1).unwrap();
         let event = wire::take(&mut bytes).unwrap().unwrap();
         assert!(connection.handle_common(&event).unwrap());
         let mut bytes = {
             let mut duplicate = wire::Builder::new();
-            duplicate.u32(10);
+            duplicate.u32(13);
             duplicate.message(DISPLAY, 1).unwrap()
         };
         let event = wire::take(&mut bytes).unwrap().unwrap();
@@ -1108,6 +1595,465 @@ mod tests {
             Globals::require(globals.compositor, "wl_compositor", 4, 4).unwrap(),
             (9, 4)
         );
+
+        let mut globals = Globals::default();
+        globals.record(10, "wl_seat", 4);
+        assert!(Globals::require(globals.seat, "wl_seat", 5, 7).is_err());
+        globals.record(11, "wl_seat", 9);
+        assert_eq!(
+            Globals::require(globals.seat, "wl_seat", 5, 7).unwrap(),
+            (11, 7)
+        );
+    }
+
+    #[test]
+    fn readiness_requires_layout_seat_keymap_release_and_presentation() {
+        let mut demo = Demo::new();
+        demo.target = Some(TargetFrame {
+            buffer: 20,
+            callback: 21,
+            released: false,
+            presented: false,
+        });
+        assert!(!demo.ready());
+        demo.layout_configured = true;
+        assert!(!demo.ready());
+        demo.seat_capabilities = Some(3);
+        assert!(!demo.ready());
+        demo.keymap_verified = true;
+        assert!(!demo.ready());
+        demo.target.as_mut().unwrap().released = true;
+        assert!(!demo.ready());
+        demo.target.as_mut().unwrap().presented = true;
+        assert!(demo.ready());
+        demo.seat_capabilities = Some(2);
+        assert!(!demo.ready());
+    }
+
+    #[test]
+    fn seat_events_validate_capabilities_name_and_opcode() {
+        let (stream, mut peer) = UnixStream::pair().unwrap();
+        let mut connection = test_connection(stream);
+        let mut demo = Demo::new();
+        let mut keyboard_only = wire::Builder::new();
+        keyboard_only.u32(2);
+        demo.seat_event(&mut connection, &event(SEAT, 0, keyboard_only))
+            .unwrap();
+        assert_eq!(demo.seat_capabilities, Some(2));
+        assert!(!demo.seat_devices_requested);
+        peer.set_nonblocking(true).unwrap();
+        let mut unexpected = [0; 1];
+        assert_eq!(
+            peer.read(&mut unexpected).unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        peer.set_nonblocking(false).unwrap();
+
+        let mut capabilities = wire::Builder::new();
+        capabilities.u32(3);
+        demo.seat_event(&mut connection, &event(SEAT, 0, capabilities))
+            .unwrap();
+        assert_eq!(demo.seat_capabilities, Some(3));
+        assert!(demo.seat_devices_requested);
+
+        let mut repeated = wire::Builder::new();
+        repeated.u32(3);
+        demo.seat_event(&mut connection, &event(SEAT, 0, repeated))
+            .unwrap();
+        let mut requests = vec![0; 24];
+        peer.read_exact(&mut requests).unwrap();
+        let keyboard = wire::take(&mut requests).unwrap().unwrap();
+        let pointer = wire::take(&mut requests).unwrap().unwrap();
+        assert_eq!((keyboard.object, keyboard.opcode), (SEAT, 1));
+        assert_eq!((pointer.object, pointer.opcode), (SEAT, 0));
+        assert!(requests.is_empty());
+        let mut keyboard_args = wire::Cursor::new(&keyboard.payload);
+        assert_eq!(keyboard_args.u32().unwrap(), KEYBOARD);
+        keyboard_args.finish().unwrap();
+        let mut pointer_args = wire::Cursor::new(&pointer.payload);
+        assert_eq!(pointer_args.u32().unwrap(), POINTER);
+        pointer_args.finish().unwrap();
+        peer.set_nonblocking(true).unwrap();
+        let mut unexpected = [0; 1];
+        assert_eq!(
+            peer.read(&mut unexpected).unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+
+        let mut name = wire::Builder::new();
+        name.string("seat0").unwrap();
+        demo.seat_event(&mut connection, &event(SEAT, 1, name))
+            .unwrap();
+
+        let mut missing_pointer = wire::Builder::new();
+        missing_pointer.u32(2);
+        demo.seat_event(&mut connection, &event(SEAT, 0, missing_pointer))
+            .unwrap();
+        assert_eq!(demo.seat_capabilities, Some(2));
+        assert!(demo.seat_devices_requested);
+        assert!(demo
+            .seat_event(&mut connection, &event(SEAT, 9, wire::Builder::new()))
+            .unwrap_err()
+            .contains("unexpected"));
+    }
+
+    #[test]
+    fn pinned_keymap_descriptor_is_required_and_verified_exactly() {
+        let expected = {
+            let mut bytes = XKB_KEYMAP.as_bytes().to_vec();
+            bytes.push(0);
+            bytes
+        };
+        let (stream, peer) = UnixStream::pair().unwrap();
+        let mut connection = test_connection(stream);
+        let file = backing_file(&std::env::temp_dir(), &expected).unwrap();
+        let mut keymap = wire::Builder::new();
+        keymap.u32(1);
+        keymap.u32(u32::try_from(expected.len()).unwrap());
+        let bytes = keymap.message(KEYBOARD, 0).unwrap();
+        sys::send_with_fd(&peer, &bytes, file.as_raw_fd()).unwrap();
+        let message = connection.next().unwrap();
+        let mut demo = Demo::new();
+        demo.keyboard_event(&mut connection, &message).unwrap();
+        assert!(demo.keymap_verified);
+        assert!(connection.pending_fds.is_empty());
+
+        let (stream, peer) = UnixStream::pair().unwrap();
+        let mut connection = test_connection(stream);
+        let mut changed = expected.clone();
+        changed[0] ^= 1;
+        let file = backing_file(&std::env::temp_dir(), &changed).unwrap();
+        let mut keymap = wire::Builder::new();
+        keymap.u32(1);
+        keymap.u32(u32::try_from(changed.len()).unwrap());
+        let bytes = keymap.message(KEYBOARD, 0).unwrap();
+        sys::send_with_fd(&peer, &bytes, file.as_raw_fd()).unwrap();
+        let message = connection.next().unwrap();
+        assert!(Demo::new()
+            .keyboard_event(&mut connection, &message)
+            .is_err());
+        assert!(connection.pending_fds.is_empty());
+
+        let (stream, _peer) = UnixStream::pair().unwrap();
+        let mut connection = test_connection(stream);
+        let mut keymap = wire::Builder::new();
+        keymap.u32(1);
+        keymap.u32(u32::try_from(expected.len()).unwrap());
+        let message = event(KEYBOARD, 0, keymap);
+        assert!(Demo::new()
+            .keyboard_event(&mut connection, &message)
+            .is_err());
+    }
+
+    #[test]
+    fn keymap_rejects_format_and_announced_size_after_consuming_fd() {
+        let mut expected = XKB_KEYMAP.as_bytes().to_vec();
+        expected.push(0);
+        for (format, size, expected_error) in [
+            (
+                0,
+                u32::try_from(expected.len()).unwrap(),
+                "unsupported wl_keyboard keymap format",
+            ),
+            (1, 1, "wl_keyboard keymap has size"),
+        ] {
+            let (stream, peer) = UnixStream::pair().unwrap();
+            let mut connection = test_connection(stream);
+            let file = backing_file(&std::env::temp_dir(), &expected).unwrap();
+            let mut keymap = wire::Builder::new();
+            keymap.u32(format);
+            keymap.u32(size);
+            let bytes = keymap.message(KEYBOARD, 0).unwrap();
+            sys::send_with_fd(&peer, &bytes, file.as_raw_fd()).unwrap();
+            let message = connection.next().unwrap();
+            let error = Demo::new()
+                .keyboard_event(&mut connection, &message)
+                .unwrap_err();
+            assert!(error.contains(expected_error));
+            assert!(connection.pending_fds.is_empty());
+        }
+    }
+
+    #[test]
+    fn keymap_read_is_bounded_against_growth_after_metadata() {
+        let bytes = vec![7u8; 18];
+        let file = backing_file(&std::env::temp_dir(), &bytes).unwrap();
+        let mut file = sys::duplicate_received(file.into_raw_fd()).unwrap();
+        let error = read_keymap_bytes(&mut file, 16).unwrap_err();
+        assert!(error.contains("read 17 bytes, expected 16"));
+    }
+
+    #[test]
+    fn framed_reads_keep_descriptors_with_their_event() {
+        let (stream, mut peer) = UnixStream::pair().unwrap();
+        let mut connection = test_connection(stream);
+        let first = wire::Builder::new().message(SEAT, 1).unwrap();
+        let second = wire::Builder::new().message(SEAT, 1).unwrap();
+        let mut ordinary = first.clone();
+        ordinary.extend_from_slice(&second);
+        peer.write_all(ordinary.get(..3).unwrap()).unwrap();
+        peer.write_all(ordinary.get(3..).unwrap()).unwrap();
+
+        let descriptor_bytes = b"descriptor-order";
+        let file = backing_file(&std::env::temp_dir(), descriptor_bytes).unwrap();
+        let mut descriptor_event = wire::Builder::new();
+        descriptor_event.u32(1);
+        descriptor_event.u32(u32::try_from(descriptor_bytes.len()).unwrap());
+        let descriptor_event = descriptor_event.message(KEYBOARD, 0).unwrap();
+        sys::send_with_fd(&peer, &descriptor_event, file.as_raw_fd()).unwrap();
+
+        for _ in 0..2 {
+            let message = connection.next().unwrap();
+            assert_eq!((message.object, message.opcode), (SEAT, 1));
+            assert!(connection.pending_fds.is_empty());
+        }
+        let message = connection.next().unwrap();
+        assert_eq!((message.object, message.opcode), (KEYBOARD, 0));
+        let mut received = connection.take_fd("test descriptor").unwrap();
+        let mut bytes = Vec::new();
+        received.read_to_end(&mut bytes).unwrap();
+        assert_eq!(bytes, descriptor_bytes);
+        assert!(connection.pending_fds.is_empty());
+    }
+
+    #[test]
+    fn descriptor_overflow_closes_every_received_descriptor() {
+        let (stream, peer) = UnixStream::pair().unwrap();
+        let mut connection = test_connection(stream);
+        let mut event = wire::Builder::new();
+        event.u32(0);
+        let bytes = event.message(KEYBOARD, 0).unwrap();
+        let mut sources = Vec::new();
+        let mut observers = Vec::new();
+        for byte in bytes.iter().take(MAX_PENDING_FDS + 1) {
+            let (source, observer) = UnixStream::pair().unwrap();
+            sys::send_with_fd(&peer, std::slice::from_ref(byte), source.as_raw_fd()).unwrap();
+            sources.push(source);
+            observers.push(observer);
+        }
+        drop(sources);
+
+        let error = connection.next().unwrap_err();
+        assert!(error.contains("queued more than"));
+        assert!(connection.pending_fds.is_empty());
+        for observer in observers {
+            assert_socket_eof(observer);
+        }
+    }
+
+    #[test]
+    fn a_coalesced_descriptor_waits_for_its_following_event() {
+        let (stream, peer) = UnixStream::pair().unwrap();
+        let mut connection = test_connection(stream);
+        let first = wire::Builder::new().message(SEAT, 1).unwrap();
+        let second = wire::Builder::new().message(KEYBOARD, 0).unwrap();
+        let mut events = first;
+        events.extend_from_slice(&second);
+        let source = backing_file(&std::env::temp_dir(), b"coalesced-fd").unwrap();
+        sys::send_with_fd(&peer, &events, source.as_raw_fd()).unwrap();
+        drop(source);
+
+        let message = connection.next().unwrap();
+        assert_eq!((message.object, message.opcode), (SEAT, 1));
+        assert_eq!(connection.pending_fds.len(), 1);
+        let message = connection.next().unwrap();
+        assert_eq!((message.object, message.opcode), (KEYBOARD, 0));
+        assert_eq!(connection.pending_fds.len(), 1);
+        let mut received = connection.take_fd("coalesced test").unwrap();
+        let mut contents = Vec::new();
+        received.read_to_end(&mut contents).unwrap();
+        assert_eq!(contents, b"coalesced-fd");
+        assert!(connection.pending_fds.is_empty());
+    }
+
+    #[test]
+    fn dropping_a_connection_closes_an_unclaimed_descriptor() {
+        let (stream, _peer) = UnixStream::pair().unwrap();
+        let mut connection = test_connection(stream);
+        let (owned, observer) = UnixStream::pair().unwrap();
+        connection.pending_fds.push_back(owned.into_raw_fd());
+        drop(connection);
+        assert_socket_eof(observer);
+    }
+
+    #[test]
+    fn keyboard_events_validate_focus_state_and_repeat_metadata() {
+        let (stream, _peer) = UnixStream::pair().unwrap();
+        let mut connection = test_connection(stream);
+        let mut demo = Demo::new();
+        let mut held = Vec::new();
+        held.extend_from_slice(&30u32.to_ne_bytes());
+        held.extend_from_slice(&31u32.to_ne_bytes());
+        let mut enter = wire::Builder::new();
+        enter.u32(1);
+        enter.u32(SURFACE);
+        enter.array(&held).unwrap();
+        demo.keyboard_event(&mut connection, &event(KEYBOARD, 1, enter))
+            .unwrap();
+        assert_eq!(demo.ui.revision(), 1);
+
+        let mut key = wire::Builder::new();
+        key.u32(2);
+        key.u32(10);
+        key.u32(30);
+        key.u32(0);
+        demo.keyboard_event(&mut connection, &event(KEYBOARD, 3, key))
+            .unwrap();
+        assert_eq!(demo.ui.last_key(), Some((30, UiKeyState::Released)));
+
+        let mut modifiers = wire::Builder::new();
+        modifiers.u32(3);
+        modifiers.u32(4);
+        modifiers.u32(5);
+        modifiers.u32(6);
+        modifiers.u32(7);
+        demo.keyboard_event(&mut connection, &event(KEYBOARD, 4, modifiers))
+            .unwrap();
+
+        let mut repeat = wire::Builder::new();
+        repeat.i32(25);
+        repeat.i32(600);
+        demo.keyboard_event(&mut connection, &event(KEYBOARD, 5, repeat))
+            .unwrap();
+        assert_eq!(demo.repeat, Some((25, 600)));
+
+        let mut invalid = wire::Builder::new();
+        invalid.u32(4);
+        invalid.u32(11);
+        invalid.u32(31);
+        invalid.u32(2);
+        let revision = demo.ui.revision();
+        assert!(demo
+            .keyboard_event(&mut connection, &event(KEYBOARD, 3, invalid))
+            .is_err());
+        assert_eq!(demo.ui.revision(), revision);
+    }
+
+    #[test]
+    fn pointer_updates_are_bounded_and_atomic_at_frame() {
+        let mut demo = Demo::new();
+        let mut enter = wire::Builder::new();
+        enter.u32(1);
+        enter.u32(SURFACE);
+        enter.i32(20 * 256);
+        enter.i32(30 * 256);
+        demo.pointer_event(&event(POINTER, 0, enter)).unwrap();
+
+        let mut motion = wire::Builder::new();
+        motion.u32(2);
+        motion.i32(24 * 256);
+        motion.i32(34 * 256);
+        demo.pointer_event(&event(POINTER, 2, motion)).unwrap();
+        assert_eq!(demo.ui.revision(), 0);
+        assert_eq!(demo.pending_pointer.len(), 2);
+        let capacity = demo.pending_pointer.capacity();
+
+        demo.pointer_event(&event(POINTER, 5, wire::Builder::new()))
+            .unwrap();
+        assert_eq!(demo.ui.revision(), 1);
+        assert!(demo.pending_pointer.is_empty());
+        assert!(demo.pending_pointer.capacity() >= capacity);
+
+        let mut axis = wire::Builder::new();
+        axis.u32(3);
+        axis.u32(0);
+        axis.i32(-256);
+        demo.pointer_event(&event(POINTER, 4, axis)).unwrap();
+        let mut source = wire::Builder::new();
+        source.u32(0);
+        demo.pointer_event(&event(POINTER, 6, source)).unwrap();
+        let mut stop = wire::Builder::new();
+        stop.u32(4);
+        stop.u32(1);
+        demo.pointer_event(&event(POINTER, 7, stop)).unwrap();
+        let mut discrete = wire::Builder::new();
+        discrete.u32(1);
+        discrete.i32(-1);
+        demo.pointer_event(&event(POINTER, 8, discrete)).unwrap();
+        assert_eq!(demo.ui.revision(), 1);
+        assert!(demo.pending_pointer.is_empty());
+
+        let mut invalid = wire::Builder::new();
+        invalid.u32(3);
+        invalid.u32(4);
+        invalid.u32(0x110);
+        invalid.u32(2);
+        assert!(demo.pointer_event(&event(POINTER, 3, invalid)).is_err());
+        assert!(demo.pending_pointer.is_empty());
+
+        demo.pending_pointer =
+            vec![PointerUpdate::Leave; MAX_POINTER_FRAME_EVENTS.saturating_sub(1)];
+        let mut leave = wire::Builder::new();
+        leave.u32(5);
+        leave.u32(SURFACE);
+        demo.pointer_event(&event(POINTER, 1, leave)).unwrap();
+        assert_eq!(demo.pending_pointer.len(), MAX_POINTER_FRAME_EVENTS);
+        let mut overflow = wire::Builder::new();
+        overflow.u32(6);
+        overflow.u32(SURFACE);
+        assert!(demo.pointer_event(&event(POINTER, 1, overflow)).is_err());
+        assert_eq!(demo.pending_pointer.len(), MAX_POINTER_FRAME_EVENTS);
+
+        let mut invalid_axis = wire::Builder::new();
+        invalid_axis.u32(5);
+        invalid_axis.u32(2);
+        invalid_axis.i32(1);
+        assert!(demo
+            .pointer_event(&event(POINTER, 4, invalid_axis))
+            .is_err());
+    }
+
+    #[test]
+    fn input_rendering_coalesces_while_a_frame_is_in_flight() {
+        let (stream, _peer) = UnixStream::pair().unwrap();
+        let mut connection = test_connection(stream);
+        connection.next_id = 20;
+        let mut demo = Demo::new();
+        demo.xrgb_advertised = true;
+        demo.current_size = Some(Size {
+            width: 96,
+            height: 64,
+        });
+        demo.target = Some(TargetFrame {
+            buffer: 18,
+            callback: 19,
+            released: false,
+            presented: false,
+        });
+        demo.ui
+            .keyboard(KeyboardUpdate::Enter {
+                keys: BTreeSet::new(),
+            })
+            .unwrap();
+        demo.maybe_commit_input(&mut connection, &std::env::temp_dir())
+            .unwrap();
+        assert_eq!(connection.next_id, 20);
+        assert_eq!(demo.rendered_revision, 0);
+
+        let target = demo.target.as_mut().unwrap();
+        target.released = true;
+        target.presented = true;
+        demo.maybe_commit_input(&mut connection, &std::env::temp_dir())
+            .unwrap();
+        assert_eq!(connection.next_id, 23);
+        assert_eq!(demo.rendered_revision, demo.ui.revision());
+
+        demo.ui
+            .keyboard(KeyboardUpdate::Key {
+                key: 30,
+                state: UiKeyState::Pressed,
+            })
+            .unwrap();
+        demo.ui
+            .keyboard(KeyboardUpdate::Key {
+                key: 31,
+                state: UiKeyState::Pressed,
+            })
+            .unwrap();
+        demo.maybe_commit_input(&mut connection, &std::env::temp_dir())
+            .unwrap();
+        assert_eq!(connection.next_id, 23);
+        assert!(demo.input_pending());
     }
 
     #[test]
@@ -1119,6 +2065,8 @@ mod tests {
             deadline: Some(Instant::now()),
             next_id: FIRST_DYNAMIC_ID,
             free_ids: BTreeSet::new(),
+            pending_fds: VecDeque::new(),
+            incoming: [0; RECEIVE_BUFFER_BYTES],
         };
         assert_eq!(
             connection.next().unwrap_err(),
@@ -1138,6 +2086,8 @@ mod tests {
             deadline: None,
             next_id: FIRST_DYNAMIC_ID,
             free_ids: BTreeSet::new(),
+            pending_fds: VecDeque::new(),
+            incoming: [0; RECEIVE_BUFFER_BYTES],
         };
         assert_eq!(
             connection.next().unwrap_err(),

@@ -878,7 +878,7 @@ fn build_td_svc_conf() -> String {
          # credentials, and the compositor opens only those fixed paths.\n\
          [wayland]\n\
          type=daemon\n\
-         exec=/bin/su -s /bin/sh {ui_user} -c '/bin/td-compositor run --framebuffer /dev/fb0 --input /dev/input --socket /run/user/{ui_uid}/wayland-0'\n\
+         exec=/bin/su -s /bin/sh {ui_user} -c '/bin/td-compositor run --framebuffer /dev/fb0 --input /dev/input --socket /run/user/{ui_uid}/wayland-0 --launcher-client /bin/td-ui-demo'\n\
          after=seat\n\
          requires=seat\n\
          ready=/bin/su -s /bin/sh {ui_user} -c '/bin/td-compositor probe /run/user/{ui_uid}/wayland-0'\n\
@@ -2770,6 +2770,19 @@ mod tests {
             TD_SVC_UNITS.iter().map(|u| u.to_string()).collect::<Vec<_>>(),
             "TD_SVC_UNITS is what shape_check greps `td-svc check`'s plan for; a unit \
              missing from it is a unit whose absence from the plan nothing would catch"
+        );
+    }
+
+    #[test]
+    fn wayland_service_supplies_the_explicit_launcher_client() {
+        assert_eq!(
+            unit_key("wayland", "exec").as_deref(),
+            Some(
+                "/bin/su -s /bin/sh tester -c '/bin/td-compositor run \
+                 --framebuffer /dev/fb0 --input /dev/input \
+                 --socket /run/user/1000/wayland-0 \
+                 --launcher-client /bin/td-ui-demo'"
+            )
         );
     }
 

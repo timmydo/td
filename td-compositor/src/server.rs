@@ -1,10 +1,14 @@
 use crate::configure::{Configure, ConfigureTracker, ToplevelState, ViewStatus};
 use crate::keyboard::{KeyboardEvent, KeyboardSnapshot, XKB_KEYMAP};
 use crate::layout::ViewLayout;
+use crate::pointer::{PointerEvent, PointerSnapshot, RoutedPointerFrame};
 use crate::runtime::{KeyboardDelivery, KeyboardSubscriptionStop, Runtime, SubscriptionStop};
-use crate::scene::{Surface, SurfaceKey, SHM_ARGB8888, SHM_XRGB8888};
+use crate::scene::{
+    InputRegion, SharedInputRegion, Surface, SurfaceKey, MAX_INPUT_REGION_OPERATIONS, SHM_ARGB8888,
+    SHM_XRGB8888,
+};
 use crate::{socket, sys, wire, MAX_UI_DIMENSION, MAX_UI_FRAME_BYTES};
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs::{self, File, OpenOptions, Permissions};
 use std::io::Write;
 use std::net::Shutdown;
@@ -26,11 +30,13 @@ const GLOBAL_XDG_WM_BASE: u32 = 4;
 const GLOBAL_SEAT: u32 = 5;
 const WL_DISPLAY_ERROR_IMPLEMENTATION: u32 = 3;
 const WL_SEAT_ERROR_MISSING_CAPABILITY: u32 = 0;
+const WL_POINTER_ERROR_ROLE: u32 = 0;
 const MAX_POOL_BYTES: usize = 64 * 1024 * 1024;
 const MAX_CLIENT_BUFFER: usize = 256 * 1024;
 const MAX_PENDING_FDS: usize = 64;
 const MAX_OBJECTS: usize = 512;
 const MAX_CLIENTS: usize = 32;
+const MAX_CLIENT_INPUT_REGION_OPERATIONS: usize = 4_096;
 
 static NEXT_CLIENT: AtomicU64 = AtomicU64::new(1);
 static NEXT_SERIAL: AtomicU64 = AtomicU64::new(1);
@@ -61,11 +67,19 @@ enum PendingBuffer {
     Buffer { object: u32, buffer: Buffer },
 }
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum SurfaceRole {
+    Xdg(u32),
+    Cursor,
+}
+
 #[derive(Clone, Default)]
 struct SurfaceState {
     pending_buffer: Option<PendingBuffer>,
+    pending_input_region: Option<Option<SharedInputRegion>>,
+    input_region: Option<SharedInputRegion>,
     frame_callbacks: Vec<u32>,
-    role: Option<u32>,
+    role: Option<SurfaceRole>,
 }
 
 #[derive(Clone)]
@@ -73,7 +87,7 @@ enum Object {
     Display,
     Registry,
     Compositor,
-    Region,
+    Region(SharedInputRegion),
     Shm,
     Pool(Pool),
     Buffer(Buffer),
@@ -86,6 +100,9 @@ enum Object {
         version: u32,
     },
     Keyboard {
+        version: u32,
+    },
+    Pointer {
         version: u32,
     },
     XdgWmBase,
@@ -111,8 +128,22 @@ struct KeyboardRegistration {
     after_revision: u64,
 }
 
+#[derive(Clone, Copy)]
+struct PointerRegistration {
+    after_revision: u64,
+    version: u32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PointerEnterAuthority {
+    serial: u32,
+    surface: u32,
+    after_revision: u64,
+}
+
 type DeleteReservation = Arc<Mutex<()>>;
 type PendingDeletes = Arc<Mutex<BTreeMap<u32, DeleteReservation>>>;
+type PointerAuthority = Arc<Mutex<Option<PointerEnterAuthority>>>;
 
 #[derive(Clone)]
 struct KeymapFile {
@@ -166,7 +197,10 @@ struct Client {
     outbound: Arc<Mutex<Outbound>>,
     configurations: Arc<Mutex<BTreeMap<SurfaceKey, ConfigureRegistration>>>,
     keyboards: Arc<Mutex<BTreeMap<u32, KeyboardRegistration>>>,
+    pointers: Arc<Mutex<BTreeMap<u32, PointerRegistration>>>,
+    pointer_authority: PointerAuthority,
     keyboard_active: Arc<AtomicBool>,
+    pointer_active: Arc<AtomicBool>,
     pending_deletes: PendingDeletes,
     objects: BTreeMap<u32, Object>,
     runtime: Arc<Mutex<Runtime>>,
@@ -474,6 +508,143 @@ fn send_keyboard_initial(
     Ok(())
 }
 
+fn pointer_fixed(value: i32) -> Result<i32, String> {
+    value
+        .checked_mul(256)
+        .ok_or_else(|| format!("pointer coordinate {value} exceeds wl_fixed"))
+}
+
+fn pointer_message(
+    object: u32,
+    serial: Option<u32>,
+    event: &PointerEvent,
+) -> Result<Vec<u8>, String> {
+    let (opcode, builder) = match event {
+        PointerEvent::Enter { target } => {
+            let mut builder = wire::Builder::new();
+            builder.u32(serial.ok_or_else(|| "pointer enter lacks serial".to_string())?);
+            builder.u32(target.surface.object);
+            builder.i32(pointer_fixed(target.x)?);
+            builder.i32(pointer_fixed(target.y)?);
+            (0, builder)
+        }
+        PointerEvent::Leave { surface } => {
+            let mut builder = wire::Builder::new();
+            builder.u32(serial.ok_or_else(|| "pointer leave lacks serial".to_string())?);
+            builder.u32(surface.object);
+            (1, builder)
+        }
+        PointerEvent::Motion { time, target } => {
+            let mut builder = wire::Builder::new();
+            builder.u32(*time);
+            builder.i32(pointer_fixed(target.x)?);
+            builder.i32(pointer_fixed(target.y)?);
+            (2, builder)
+        }
+        PointerEvent::Button { input, .. } => {
+            let mut builder = wire::Builder::new();
+            builder.u32(serial.ok_or_else(|| "pointer button lacks serial".to_string())?);
+            builder.u32(input.time);
+            builder.u32(input.button);
+            builder.u32(input.state.wire());
+            (3, builder)
+        }
+    };
+    builder.message(object, opcode)
+}
+
+fn pointer_event_serial(
+    event: &PointerEvent,
+    authority: Option<PointerEnterAuthority>,
+) -> Option<u32> {
+    match event {
+        PointerEvent::Enter { target } => Some(
+            authority
+                .filter(|candidate| candidate.surface == target.surface.object)
+                .map_or_else(next_serial, |candidate| candidate.serial),
+        ),
+        PointerEvent::Leave { .. } | PointerEvent::Button { .. } => Some(next_serial()),
+        PointerEvent::Motion { .. } => None,
+    }
+}
+
+fn send_pointer_initial(
+    outbound: &Arc<Mutex<Outbound>>,
+    object: u32,
+    version: u32,
+    client: u64,
+    snapshot: PointerSnapshot,
+    serial: Option<u32>,
+) -> Result<(), String> {
+    let Some(target) = snapshot
+        .focus
+        .filter(|target| target.surface.client == client)
+    else {
+        return Ok(());
+    };
+    let serial = serial.ok_or_else(|| "pointer enter lacks an authority serial".to_string())?;
+    let enter = pointer_message(object, Some(serial), &PointerEvent::Enter { target })?;
+    let mut outbound = outbound
+        .lock()
+        .map_err(|_| "Wayland outbound lock poisoned".to_string())?;
+    outbound.send(&enter)?;
+    if version >= 5 {
+        outbound.send(&wire::Builder::new().message(object, 5)?)?;
+    }
+    Ok(())
+}
+
+fn send_pointer_frame(
+    outbound: &Arc<Mutex<Outbound>>,
+    pointers: &BTreeMap<u32, PointerRegistration>,
+    authority: &mut Option<PointerEnterAuthority>,
+    frame: &RoutedPointerFrame,
+) -> Result<(), String> {
+    let serials: Vec<Option<u32>> = frame
+        .events
+        .iter()
+        .map(|event| pointer_event_serial(event, *authority))
+        .collect();
+    let mut sent = false;
+    let mut outbound = outbound
+        .lock()
+        .map_err(|_| "Wayland outbound lock poisoned".to_string())?;
+    for (object, registration) in pointers {
+        if frame.revision <= registration.after_revision {
+            continue;
+        }
+        sent = true;
+        for (event, serial) in frame.events.iter().zip(&serials) {
+            outbound.send(&pointer_message(*object, *serial, event)?)?;
+        }
+        if registration.version >= 5 {
+            outbound.send(&wire::Builder::new().message(*object, 5)?)?;
+        }
+    }
+    if sent
+        && authority
+            .as_ref()
+            .is_none_or(|current| frame.revision > current.after_revision)
+    {
+        for (event, serial) in frame.events.iter().zip(&serials) {
+            match event {
+                PointerEvent::Enter { target } => {
+                    let serial =
+                        serial.ok_or_else(|| "pointer enter lacks generated serial".to_string())?;
+                    *authority = Some(PointerEnterAuthority {
+                        serial,
+                        surface: target.surface.object,
+                        after_revision: frame.revision,
+                    });
+                }
+                PointerEvent::Leave { .. } => *authority = None,
+                _ => {}
+            }
+        }
+    }
+    Ok(())
+}
+
 fn send_reserved_delete_id(
     outbound: &Arc<Mutex<Outbound>>,
     pending_deletes: &PendingDeletes,
@@ -506,10 +677,12 @@ fn send_reserved_delete_id(
     }
 }
 
-fn keyboard_worker(
+fn seat_worker(
     receiver: Receiver<KeyboardDelivery>,
     stop: KeyboardSubscriptionStop,
     keyboards: Arc<Mutex<BTreeMap<u32, KeyboardRegistration>>>,
+    pointers: Arc<Mutex<BTreeMap<u32, PointerRegistration>>>,
+    pointer_authority: PointerAuthority,
     pending_deletes: PendingDeletes,
     outbound: Arc<Mutex<Outbound>>,
 ) -> Result<(), String> {
@@ -526,7 +699,24 @@ fn keyboard_worker(
             return Ok(());
         }
         let event = match delivery {
-            KeyboardDelivery::Event(event) => event,
+            KeyboardDelivery::Event(event) => Some(event),
+            KeyboardDelivery::Pointer(frame) => {
+                let pointers = pointers
+                    .lock()
+                    .map_err(|_| "pointer registration lock poisoned".to_string())?;
+                let mut authority = pointer_authority
+                    .lock()
+                    .map_err(|_| "pointer authority lock poisoned".to_string())?;
+                send_pointer_frame(&outbound, &pointers, &mut authority, &frame)?;
+                if outbound
+                    .lock()
+                    .map_err(|_| "Wayland outbound lock poisoned".to_string())?
+                    .disconnected
+                {
+                    return Ok(());
+                }
+                None
+            }
             KeyboardDelivery::DeleteId(id) => {
                 send_reserved_delete_id(&outbound, &pending_deletes, id)?;
                 if outbound
@@ -538,6 +728,9 @@ fn keyboard_worker(
                 }
                 continue;
             }
+        };
+        let Some(event) = event else {
+            continue;
         };
         let keyboards = keyboards
             .lock()
@@ -559,27 +752,32 @@ fn keyboard_worker(
     if stop.is_stopped() {
         Ok(())
     } else {
-        Err("keyboard event queue closed before client teardown".into())
+        Err("seat event queue closed before client teardown".into())
     }
 }
 
-fn supervise_keyboard_worker(
+#[allow(clippy::too_many_arguments)]
+fn supervise_seat_worker(
     client: u64,
     receiver: Receiver<KeyboardDelivery>,
     stop: KeyboardSubscriptionStop,
     keyboards: Arc<Mutex<BTreeMap<u32, KeyboardRegistration>>>,
+    pointers: Arc<Mutex<BTreeMap<u32, PointerRegistration>>>,
+    pointer_authority: PointerAuthority,
     pending_deletes: PendingDeletes,
     outbound: Arc<Mutex<Outbound>>,
 ) -> Result<(), String> {
-    let result = keyboard_worker(
+    let result = seat_worker(
         receiver,
         stop,
         keyboards,
+        pointers,
+        pointer_authority,
         pending_deletes,
         Arc::clone(&outbound),
     );
     if let Err(error) = &result {
-        eprintln!("td-compositor: client {client} keyboard: {error}");
+        eprintln!("td-compositor: client {client} seat: {error}");
         if let Ok(mut outbound) = outbound.lock() {
             outbound.disconnect();
         }
@@ -629,7 +827,10 @@ impl Client {
             })),
             configurations: Arc::new(Mutex::new(BTreeMap::new())),
             keyboards: Arc::new(Mutex::new(BTreeMap::new())),
+            pointers: Arc::new(Mutex::new(BTreeMap::new())),
+            pointer_authority: Arc::new(Mutex::new(None)),
             keyboard_active: Arc::new(AtomicBool::new(false)),
+            pointer_active: Arc::new(AtomicBool::new(false)),
             pending_deletes: Arc::new(Mutex::new(BTreeMap::new())),
             objects,
             runtime,
@@ -721,6 +922,61 @@ impl Client {
             self.keyboard_active.store(false, Ordering::Release);
         }
         drop(keyboards);
+        self.remove_object(id)
+    }
+
+    fn create_pointer(&mut self, id: u32, version: u32) -> Result<(), String> {
+        self.insert(id, Object::Pointer { version })?;
+        let mut pointers = self
+            .pointers
+            .lock()
+            .map_err(|_| "pointer registration lock poisoned".to_string())?;
+        self.pointer_active.store(true, Ordering::Release);
+        let snapshot = self
+            .runtime
+            .lock()
+            .map_err(|_| "runtime lock poisoned".to_string())?
+            .pointer_snapshot();
+        let target = snapshot
+            .focus
+            .filter(|target| target.surface.client == self.id);
+        let mut authority = self
+            .pointer_authority
+            .lock()
+            .map_err(|_| "pointer authority lock poisoned".to_string())?;
+        let serial = target.map(|target| {
+            authority
+                .filter(|candidate| candidate.surface == target.surface.object)
+                .map_or_else(next_serial, |candidate| candidate.serial)
+        });
+        let registration = PointerRegistration {
+            after_revision: snapshot.revision,
+            version,
+        };
+        send_pointer_initial(&self.outbound, id, version, self.id, snapshot, serial)?;
+        if let (Some(target), Some(serial)) = (target, serial) {
+            *authority = Some(PointerEnterAuthority {
+                serial,
+                surface: target.surface.object,
+                after_revision: snapshot.revision,
+            });
+        }
+        if pointers.insert(id, registration).is_some() {
+            return Err(format!("pointer object {id} was already registered"));
+        }
+        Ok(())
+    }
+
+    fn remove_pointer(&mut self, id: u32) -> Result<(), String> {
+        let mut pointers = self
+            .pointers
+            .lock()
+            .map_err(|_| "pointer registration lock poisoned".to_string())?;
+        pointers.remove(&id);
+        if pointers.is_empty() {
+            self.pointer_active.store(false, Ordering::Release);
+        }
+        drop(pointers);
         self.remove_object(id)
     }
 
@@ -885,7 +1141,7 @@ impl Client {
             (GLOBAL_SEAT, "wl_seat") if (1..=7).contains(&version) => {
                 self.insert(id, Object::Seat { version })?;
                 let mut capabilities = wire::Builder::new();
-                capabilities.u32(2);
+                capabilities.u32(3);
                 self.send(id, 0, capabilities)?;
                 if version >= 2 {
                     let mut name = wire::Builder::new();
@@ -1099,11 +1355,19 @@ impl Client {
         })
     }
 
-    fn commit_surface(&mut self, id: u32, state: SurfaceState) -> Result<(), String> {
+    fn commit_surface(&mut self, id: u32, mut state: SurfaceState) -> Result<(), String> {
+        let input_region_changed = if let Some(region) = state.pending_input_region.take() {
+            state.input_region = region;
+            true
+        } else {
+            false
+        };
+        let input_region = state.input_region.clone();
         let attaching_buffer = matches!(state.pending_buffer, Some(PendingBuffer::Buffer { .. }));
         let was_mapped = self.mapped_bytes.contains_key(&id);
+        let cursor = state.role == Some(SurfaceRole::Cursor);
         let mut xdg_configure = None;
-        if let Some(role) = state.role {
+        if let Some(SurfaceRole::Xdg(role)) = state.role {
             let xdg = self
                 .objects
                 .get(&role)
@@ -1148,41 +1412,12 @@ impl Client {
                     "xdg_surface {role} attached a buffer before acknowledging configure"
                 ));
             }
-        } else if attaching_buffer {
+        } else if state.role.is_none() && attaching_buffer {
             return Err(format!("wl_surface {id} attached a buffer without a role"));
         }
         if let Some(pending) = state.pending_buffer {
-            let key = SurfaceKey {
-                client: self.id,
-                object: id,
-            };
-            match pending {
-                PendingBuffer::Detach => {
-                    if was_mapped {
-                        if let Some(configure) = xdg_configure {
-                            configure
-                                .lock()
-                                .map_err(|_| "XDG configure tracker lock poisoned".to_string())?
-                                .unmap()?;
-                        }
-                    }
-                    self.unmap_surface(id)?;
-                }
-                PendingBuffer::Buffer { object, buffer } => {
-                    let surface_bytes = buffer
-                        .width
-                        .checked_mul(buffer.height)
-                        .and_then(|pixels| pixels.checked_mul(4))
-                        .ok_or_else(|| "client surface byte count overflow".to_string())?;
-                    let prior = self.mapped_bytes.get(&id).copied().unwrap_or(0);
-                    let next = client_surface_total(self.mapped_total, prior, surface_bytes)?;
-                    let surface = Self::copy_buffer(&buffer)?;
-                    self.runtime
-                        .lock()
-                        .map_err(|_| "runtime lock poisoned".to_string())?
-                        .commit(key, surface)?;
-                    self.mapped_bytes.insert(id, surface_bytes);
-                    self.mapped_total = next;
+            if cursor {
+                if let PendingBuffer::Buffer { object, buffer } = pending {
                     if matches!(
                         self.objects.get(&object),
                         Some(Object::Buffer(current)) if current.serial == buffer.serial
@@ -1190,7 +1425,58 @@ impl Client {
                         self.send(object, 0, wire::Builder::new())?;
                     }
                 }
+            } else {
+                let key = SurfaceKey {
+                    client: self.id,
+                    object: id,
+                };
+                match pending {
+                    PendingBuffer::Detach => {
+                        if was_mapped {
+                            if let Some(configure) = xdg_configure {
+                                configure
+                                    .lock()
+                                    .map_err(|_| "XDG configure tracker lock poisoned".to_string())?
+                                    .unmap()?;
+                            }
+                        }
+                        self.unmap_surface(id)?;
+                    }
+                    PendingBuffer::Buffer { object, buffer } => {
+                        let surface_bytes = buffer
+                            .width
+                            .checked_mul(buffer.height)
+                            .and_then(|pixels| pixels.checked_mul(4))
+                            .ok_or_else(|| "client surface byte count overflow".to_string())?;
+                        let prior = self.mapped_bytes.get(&id).copied().unwrap_or(0);
+                        let next = client_surface_total(self.mapped_total, prior, surface_bytes)?;
+                        let surface = Self::copy_buffer(&buffer)?;
+                        self.runtime
+                            .lock()
+                            .map_err(|_| "runtime lock poisoned".to_string())?
+                            .commit_with_input_region(key, surface, input_region.clone())?;
+                        self.mapped_bytes.insert(id, surface_bytes);
+                        self.mapped_total = next;
+                        if matches!(
+                            self.objects.get(&object),
+                            Some(Object::Buffer(current)) if current.serial == buffer.serial
+                        ) {
+                            self.send(object, 0, wire::Builder::new())?;
+                        }
+                    }
+                }
             }
+        } else if input_region_changed && !cursor {
+            self.runtime
+                .lock()
+                .map_err(|_| "runtime lock poisoned".to_string())?
+                .set_input_region(
+                    SurfaceKey {
+                        client: self.id,
+                        object: id,
+                    },
+                    input_region.clone(),
+                )?;
         }
         for callback in state.frame_callbacks {
             let mut done = wire::Builder::new();
@@ -1201,9 +1487,83 @@ impl Client {
         }
         if let Some(Object::Surface(current)) = self.objects.get_mut(&id) {
             current.pending_buffer = None;
+            current.pending_input_region = None;
+            current.input_region = input_region;
             current.frame_callbacks.clear();
         }
         Ok(())
+    }
+
+    fn retained_input_region_operations(&self) -> usize {
+        let mut seen = BTreeSet::new();
+        let mut retained = 0usize;
+        let mut count = |region: &SharedInputRegion| {
+            let identity = Arc::as_ptr(region) as usize;
+            if seen.insert(identity) {
+                retained = retained.saturating_add(region.len());
+            }
+        };
+        for object in self.objects.values() {
+            match object {
+                Object::Region(region) => count(region),
+                Object::Surface(surface) => {
+                    if let Some(region) = &surface.input_region {
+                        count(region);
+                    }
+                    if let Some(Some(region)) = &surface.pending_input_region {
+                        count(region);
+                    }
+                }
+                _ => {}
+            }
+        }
+        retained
+    }
+
+    fn dispatch_region(&mut self, message: &wire::Message) -> Result<(), String> {
+        let mut args = wire::Cursor::new(&message.payload);
+        match message.opcode {
+            0 => {
+                args.finish()?;
+                self.remove_object(message.object)
+            }
+            1 | 2 => {
+                let x = args.i32()?;
+                let y = args.i32()?;
+                let width = args.i32()?;
+                let height = args.i32()?;
+                args.finish()?;
+                let Some(Object::Region(region)) = self.objects.get(&message.object) else {
+                    return Err(format!("request for non-region object {}", message.object));
+                };
+                if width <= 0 || height <= 0 || region.len() >= MAX_INPUT_REGION_OPERATIONS {
+                    return Ok(());
+                }
+                let additional = if Arc::strong_count(region) > 1 {
+                    region.len().saturating_add(1)
+                } else {
+                    1
+                };
+                if self
+                    .retained_input_region_operations()
+                    .saturating_add(additional)
+                    > MAX_CLIENT_INPUT_REGION_OPERATIONS
+                {
+                    return Ok(());
+                }
+                let Some(Object::Region(region)) = self.objects.get_mut(&message.object) else {
+                    return Err(format!("request for non-region object {}", message.object));
+                };
+                let region = Arc::make_mut(region);
+                if message.opcode == 1 {
+                    region.add(x, y, width, height);
+                } else {
+                    region.subtract(x, y, width, height);
+                }
+                Ok(())
+            }
+            _ => Err(format!("unsupported wl_region request {}", message.opcode)),
+        }
     }
 
     fn dispatch(
@@ -1212,6 +1572,9 @@ impl Client {
         fds: &mut VecDeque<RawFd>,
     ) -> Result<(), String> {
         self.protocol_error_code = WL_DISPLAY_ERROR_IMPLEMENTATION;
+        if matches!(self.objects.get(&message.object), Some(Object::Region(_))) {
+            return self.dispatch_region(&message);
+        }
         let object = self
             .objects
             .get(&message.object)
@@ -1261,26 +1624,14 @@ impl Client {
                 1 => {
                     let region = args.u32()?;
                     args.finish()?;
-                    self.insert(region, Object::Region)
+                    self.insert(region, Object::Region(Arc::new(InputRegion::new())))
                 }
                 _ => Err(format!(
                     "unsupported wl_compositor request {}",
                     message.opcode
                 )),
             },
-            Object::Region => match message.opcode {
-                0 => {
-                    args.finish()?;
-                    self.remove_object(message.object)
-                }
-                1 | 2 => {
-                    for _ in 0..4 {
-                        args.i32()?;
-                    }
-                    args.finish()
-                }
-                _ => Err(format!("unsupported wl_region request {}", message.opcode)),
-            },
+            Object::Region(_) => Err("wl_region dispatch bypassed its bounded path".into()),
             Object::Shm => match message.opcode {
                 0 => {
                     let id = args.u32()?;
@@ -1351,9 +1702,9 @@ impl Client {
             Object::Surface(mut state) => match message.opcode {
                 0 => {
                     args.finish()?;
-                    if state
-                        .role
-                        .is_some_and(|role| self.objects.contains_key(&role))
+                    if state.role.is_some_and(|role| {
+                        matches!(role, SurfaceRole::Xdg(object) if self.objects.contains_key(&object))
+                    })
                     {
                         return Err(format!(
                             "wl_surface {} was destroyed before its role object",
@@ -1401,12 +1752,27 @@ impl Client {
                     self.objects.insert(message.object, Object::Surface(state));
                     Ok(())
                 }
-                4 | 5 => {
+                4 => {
                     let region = args.u32()?;
                     args.finish()?;
-                    if region != 0 && !matches!(self.objects.get(&region), Some(Object::Region)) {
+                    if region != 0 && !matches!(self.objects.get(&region), Some(Object::Region(_)))
+                    {
                         return Err(format!("surface references non-region {region}"));
                     }
+                    Ok(())
+                }
+                5 => {
+                    let region = args.u32()?;
+                    args.finish()?;
+                    state.pending_input_region = if region == 0 {
+                        Some(None)
+                    } else {
+                        match self.objects.get(&region) {
+                            Some(Object::Region(region)) => Some(Some(region.clone())),
+                            _ => return Err(format!("surface references non-region {region}")),
+                        }
+                    };
+                    self.objects.insert(message.object, Object::Surface(state));
                     Ok(())
                 }
                 6 => {
@@ -1443,6 +1809,11 @@ impl Client {
                 _ => Err(format!("unsupported wl_output request {}", message.opcode)),
             },
             Object::Seat { version } => match message.opcode {
+                0 => {
+                    let pointer = args.u32()?;
+                    args.finish()?;
+                    self.create_pointer(pointer, version)
+                }
                 1 => {
                     let keyboard = args.u32()?;
                     args.finish()?;
@@ -1451,14 +1822,6 @@ impl Client {
                 3 if version >= 5 => {
                     args.finish()?;
                     self.remove_object(message.object)
-                }
-                0 => {
-                    args.u32()?;
-                    args.finish()?;
-                    self.fail_protocol(
-                        WL_SEAT_ERROR_MISSING_CAPABILITY,
-                        "wl_pointer is not supported yet",
-                    )
                 }
                 2 => {
                     args.u32()?;
@@ -1479,6 +1842,64 @@ impl Client {
                     "unsupported wl_keyboard request {}",
                     message.opcode
                 )),
+            },
+            Object::Pointer { version } => match message.opcode {
+                0 => {
+                    let serial = args.u32()?;
+                    let surface = args.u32()?;
+                    args.i32()?;
+                    args.i32()?;
+                    args.finish()?;
+                    let authority = *self
+                        .pointer_authority
+                        .lock()
+                        .map_err(|_| "pointer authority lock poisoned".to_string())?;
+                    let focus = self
+                        .runtime
+                        .lock()
+                        .map_err(|_| "runtime lock poisoned".to_string())?
+                        .pointer_snapshot()
+                        .focus;
+                    let authorized = authority.is_some_and(|candidate| {
+                        candidate.serial == serial
+                            && focus.is_some_and(|target| {
+                                target.surface.client == self.id
+                                    && target.surface.object == candidate.surface
+                            })
+                    });
+                    if !authorized {
+                        return Ok(());
+                    }
+                    if surface != 0 {
+                        let mut state = match self.objects.get(&surface).cloned() {
+                            Some(Object::Surface(state)) => state,
+                            _ => {
+                                return Err(format!(
+                                    "wl_pointer cursor references non-surface {surface}"
+                                ))
+                            }
+                        };
+                        match state.role {
+                            None => state.role = Some(SurfaceRole::Cursor),
+                            Some(SurfaceRole::Cursor) => {}
+                            Some(SurfaceRole::Xdg(_)) => {
+                                return self.fail_protocol(
+                                    WL_POINTER_ERROR_ROLE,
+                                    &format!(
+                                        "wl_surface {surface} already has an incompatible role"
+                                    ),
+                                );
+                            }
+                        }
+                        self.objects.insert(surface, Object::Surface(state));
+                    }
+                    Ok(())
+                }
+                1 if version >= 3 => {
+                    args.finish()?;
+                    self.remove_pointer(message.object)
+                }
+                _ => Err(format!("unsupported wl_pointer request {}", message.opcode)),
             },
             Object::XdgWmBase => match message.opcode {
                 0 => {
@@ -1508,7 +1929,7 @@ impl Client {
                             configure: Arc::new(Mutex::new(ConfigureTracker::new())),
                         },
                     )?;
-                    state.role = Some(id);
+                    state.role = Some(SurfaceRole::Xdg(id));
                     self.objects.insert(surface, Object::Surface(state));
                     Ok(())
                 }
@@ -1709,9 +2130,11 @@ fn serve_client(
         .subscribe(id)?;
     let (receiver, stop) = subscription.split();
     let keyboard_subscription = match runtime.lock() {
-        Ok(mut runtime) => {
-            runtime.subscribe_keyboard_with_activity(id, Arc::clone(&client.keyboard_active))
-        }
+        Ok(mut runtime) => runtime.subscribe_input_with_activity(
+            id,
+            Arc::clone(&client.keyboard_active),
+            Arc::clone(&client.pointer_active),
+        ),
         Err(poisoned) => {
             stop.stop();
             poisoned.into_inner().unsubscribe(id);
@@ -1763,19 +2186,23 @@ fn serve_client(
             return Err(format!("spawn Wayland configure worker {id}: {error}"));
         }
     };
-    let worker_keyboard_stop = keyboard_stop.clone();
+    let worker_seat_stop = keyboard_stop.clone();
     let keyboards = Arc::clone(&client.keyboards);
+    let pointers = Arc::clone(&client.pointers);
+    let pointer_authority = Arc::clone(&client.pointer_authority);
     let pending_deletes = Arc::clone(&client.pending_deletes);
     let outbound = Arc::clone(&client.outbound);
     let worker_outbound = Arc::clone(&outbound);
-    let keyboard_thread = match thread::Builder::new()
-        .name(format!("wayland-keyboard-{id}"))
+    let seat_thread = match thread::Builder::new()
+        .name(format!("wayland-seat-{id}"))
         .spawn(move || {
-            supervise_keyboard_worker(
+            supervise_seat_worker(
                 id,
                 keyboard_receiver,
-                worker_keyboard_stop,
+                worker_seat_stop,
                 keyboards,
+                pointers,
+                pointer_authority,
                 pending_deletes,
                 worker_outbound,
             )
@@ -1792,7 +2219,7 @@ fn serve_client(
                 runtime.unsubscribe_keyboard(id);
             }
             let _ = configure_thread.join();
-            return Err(format!("spawn Wayland keyboard worker {id}: {error}"));
+            return Err(format!("spawn Wayland seat worker {id}: {error}"));
         }
     };
     let mut bytes = Vec::with_capacity(64 * 1024);
@@ -1812,6 +2239,9 @@ fn serve_client(
         let received = match sys::recv_with_fds(&client.stream, &mut incoming) {
             Ok(value) => value,
             Err(sys::ReceiveError::Disconnected) => break Ok(()),
+            Err(sys::ReceiveError::TimedOut) => {
+                break Err("recvmsg: unexpected Wayland receive timeout".into())
+            }
             Err(sys::ReceiveError::Failure(error)) => break Err(error),
         };
         if received.count == 0 {
@@ -1846,12 +2276,12 @@ fn serve_client(
         .join()
         .map_err(|_| format!("Wayland configure worker {id} panicked"))
         .and_then(|result| result);
-    let keyboard_joined = keyboard_thread
+    let seat_joined = seat_thread
         .join()
-        .map_err(|_| format!("Wayland keyboard worker {id} panicked"))
+        .map_err(|_| format!("Wayland seat worker {id} panicked"))
         .and_then(|result| result);
     let mut errors = Vec::new();
-    for result in [outcome, cleanup, joined, keyboard_joined] {
+    for result in [outcome, cleanup, joined, seat_joined] {
         if let Err(error) = result {
             errors.push(error);
         }
@@ -1920,6 +2350,7 @@ mod tests {
     use crate::framebuffer::Framebuffer;
     use crate::keyboard::{KeyInput, KeyState, ModifierState, RoutedKeyboardEvent, MOD_LOGO};
     use crate::layout::{Command, Direction, Layout};
+    use crate::pointer::{PointerButtonInput, PointerButtonState, PointerTarget};
     use std::io::Read;
     use std::os::fd::AsRawFd;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -2074,6 +2505,23 @@ mod tests {
                 ..ModifierState::default()
             })
             .unwrap();
+        let pointer_origin = runtime
+            .lock()
+            .unwrap()
+            .layout_snapshot()
+            .get(&focused)
+            .map(|view| (view.rect.x, view.rect.y))
+            .unwrap();
+        runtime
+            .lock()
+            .unwrap()
+            .pointer_frame(
+                2,
+                i32::try_from(pointer_origin.0).unwrap(),
+                i32::try_from(pointer_origin.1).unwrap(),
+                &[],
+            )
+            .unwrap();
 
         let (server, mut peer) = UnixStream::pair().unwrap();
         peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
@@ -2090,7 +2538,7 @@ mod tests {
         client.bind_global(GLOBAL_SEAT, "wl_seat", 7, 5).unwrap();
         let seat_events = receive_messages(&mut peer, 2);
         let mut capabilities = wire::Cursor::new(&seat_events.first().unwrap().payload);
-        assert_eq!(capabilities.u32().unwrap(), 2);
+        assert_eq!(capabilities.u32().unwrap(), 3);
         capabilities.finish().unwrap();
         let mut name = wire::Cursor::new(&seat_events.get(1).unwrap().payload);
         assert_eq!(name.string().unwrap(), "td-seat0");
@@ -2158,11 +2606,37 @@ mod tests {
 
         let mut pointer = wire::Builder::new();
         pointer.u32(9);
-        assert!(client
+        assert!(!client.pointer_active.load(Ordering::Acquire));
+        client
             .dispatch(request(5, 0, pointer).unwrap(), &mut VecDeque::new())
-            .unwrap_err()
-            .contains("not supported"));
-        assert_eq!(client.protocol_error_code, WL_SEAT_ERROR_MISSING_CAPABILITY);
+            .unwrap();
+        assert!(client.pointer_active.load(Ordering::Acquire));
+        let pointer_events = receive_messages(&mut peer, 2);
+        let mut pointer_enter = wire::Cursor::new(&pointer_events.first().unwrap().payload);
+        assert_ne!(pointer_enter.u32().unwrap(), 0);
+        assert_eq!(pointer_enter.u32().unwrap(), focused.object);
+        assert_eq!(pointer_enter.i32().unwrap(), 0);
+        assert_eq!(pointer_enter.i32().unwrap(), 0);
+        pointer_enter.finish().unwrap();
+        assert_eq!(
+            (
+                pointer_events.get(1).unwrap().object,
+                pointer_events.get(1).unwrap().opcode
+            ),
+            (9, 5)
+        );
+        client
+            .dispatch(
+                request(9, 1, wire::Builder::new()).unwrap(),
+                &mut VecDeque::new(),
+            )
+            .unwrap();
+        assert!(!client.pointer_active.load(Ordering::Acquire));
+        assert!(!client.pointers.lock().unwrap().contains_key(&9));
+        let pointer_deleted = receive_messages(&mut peer, 1);
+        let mut pointer_deleted = wire::Cursor::new(&pointer_deleted.first().unwrap().payload);
+        assert_eq!(pointer_deleted.u32().unwrap(), 9);
+        pointer_deleted.finish().unwrap();
         client
             .dispatch(
                 request(6, 0, wire::Builder::new()).unwrap(),
@@ -2222,8 +2696,20 @@ mod tests {
             )
             .unwrap_err()
             .contains("unsupported wl_keyboard"));
+        let mut get_pointer = wire::Builder::new();
+        get_pointer.u32(8);
+        client
+            .dispatch(request(5, 0, get_pointer).unwrap(), &mut VecDeque::new())
+            .unwrap();
+        assert!(client
+            .dispatch(
+                request(8, 1, wire::Builder::new()).unwrap(),
+                &mut VecDeque::new(),
+            )
+            .unwrap_err()
+            .contains("unsupported wl_pointer"));
         let mut touch = wire::Builder::new();
-        touch.u32(8);
+        touch.u32(9);
         assert!(client
             .dispatch(request(5, 2, touch).unwrap(), &mut VecDeque::new())
             .unwrap_err()
@@ -2239,6 +2725,21 @@ mod tests {
 
         client.bind_global(GLOBAL_SEAT, "wl_seat", 5, 7).unwrap();
         receive_messages(&mut peer, 2);
+        let mut get_pointer = wire::Builder::new();
+        get_pointer.u32(10);
+        client
+            .dispatch(request(7, 0, get_pointer).unwrap(), &mut VecDeque::new())
+            .unwrap();
+        client
+            .dispatch(
+                request(10, 1, wire::Builder::new()).unwrap(),
+                &mut VecDeque::new(),
+            )
+            .unwrap();
+        let pointer_deleted = receive_messages(&mut peer, 1);
+        let mut pointer_deleted = wire::Cursor::new(&pointer_deleted.first().unwrap().payload);
+        assert_eq!(pointer_deleted.u32().unwrap(), 10);
+        pointer_deleted.finish().unwrap();
         client
             .dispatch(
                 request(7, 3, wire::Builder::new()).unwrap(),
@@ -2253,7 +2754,7 @@ mod tests {
     }
 
     #[test]
-    fn missing_seat_capability_uses_the_wl_seat_error_code() {
+    fn missing_touch_capability_uses_the_wl_seat_error_code() {
         let stem = format!(
             "td-seat-error-test-{}-{}",
             std::process::id(),
@@ -2268,11 +2769,11 @@ mod tests {
         client.bind_global(GLOBAL_SEAT, "wl_seat", 7, 5).unwrap();
         receive_messages(&mut peer, 2);
 
-        let mut pointer = wire::Builder::new();
-        pointer.u32(6);
-        let mut bytes = pointer.message(5, 0).unwrap();
+        let mut touch = wire::Builder::new();
+        touch.u32(6);
+        let mut bytes = touch.message(5, 2).unwrap();
         let error = dispatch_buffered(&mut client, &mut bytes, &mut VecDeque::new()).unwrap_err();
-        assert!(error.contains("wl_pointer"));
+        assert!(error.contains("wl_touch"));
         let events = receive_messages(&mut peer, 1);
         assert_eq!(
             (
@@ -2284,21 +2785,21 @@ mod tests {
         let mut error = wire::Cursor::new(&events.first().unwrap().payload);
         assert_eq!(error.u32().unwrap(), 5);
         assert_eq!(error.u32().unwrap(), WL_SEAT_ERROR_MISSING_CAPABILITY);
-        assert!(error.string().unwrap().contains("wl_pointer"));
+        assert!(error.string().unwrap().contains("wl_touch"));
         error.finish().unwrap();
 
         fs::remove_file(framebuffer_path).unwrap();
     }
 
     #[test]
-    fn threaded_server_delivers_and_tears_down_a_bound_keyboard() {
+    fn threaded_server_delivers_and_tears_down_bound_keyboard_and_pointer() {
         let stem = format!(
             "td-keyboard-threaded-test-{}-{}",
             std::process::id(),
             TEST_SEQ.fetch_add(1, Ordering::Relaxed)
         );
         let framebuffer_path = std::env::temp_dir().join(format!("{stem}.fb"));
-        let framebuffer = Framebuffer::test_file(&framebuffer_path, 16, 16, 16 * 4).unwrap();
+        let framebuffer = Framebuffer::test_file(&framebuffer_path, 80, 80, 80 * 4).unwrap();
         let runtime = Arc::new(Mutex::new(Runtime::new(framebuffer)));
         let (server, mut peer) = UnixStream::pair().unwrap();
         peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
@@ -2354,6 +2855,10 @@ mod tests {
         assert_eq!(descriptors.len(), 1);
         sys::discard_received(&descriptors);
 
+        let mut get_pointer = wire::Builder::new();
+        get_pointer.u32(7);
+        send(&mut peer, 5, 0, get_pointer);
+
         let surface = SurfaceKey {
             client: 91,
             object: 4,
@@ -2385,6 +2890,73 @@ mod tests {
         assert_eq!(enter.u32().unwrap(), 0);
         enter.finish().unwrap();
 
+        let rect = runtime
+            .lock()
+            .unwrap()
+            .layout_snapshot()
+            .get(&surface)
+            .unwrap()
+            .rect;
+        runtime
+            .lock()
+            .unwrap()
+            .pointer_frame(
+                72,
+                i32::try_from(rect.x).unwrap(),
+                i32::try_from(rect.y).unwrap(),
+                &[],
+            )
+            .unwrap();
+        let pointer = receive_messages(&mut peer, 2);
+        assert_eq!(
+            pointer
+                .iter()
+                .map(|message| (message.object, message.opcode))
+                .collect::<Vec<_>>(),
+            [(7, 0), (7, 5)]
+        );
+        let mut enter = wire::Cursor::new(&pointer.first().unwrap().payload);
+        assert_ne!(enter.u32().unwrap(), 0);
+        assert_eq!(enter.u32().unwrap(), surface.object);
+        assert_eq!(enter.i32().unwrap(), 0);
+        assert_eq!(enter.i32().unwrap(), 0);
+        enter.finish().unwrap();
+
+        runtime
+            .lock()
+            .unwrap()
+            .pointer_frame(
+                73,
+                0,
+                0,
+                &[PointerButtonInput {
+                    time: 73,
+                    button: 272,
+                    state: PointerButtonState::Pressed,
+                }],
+            )
+            .unwrap();
+        let pointer = receive_messages(&mut peer, 2);
+        assert_eq!(
+            pointer
+                .iter()
+                .map(|message| (message.object, message.opcode))
+                .collect::<Vec<_>>(),
+            [(7, 3), (7, 5)]
+        );
+        let mut button = wire::Cursor::new(&pointer.first().unwrap().payload);
+        assert_ne!(button.u32().unwrap(), 0);
+        assert_eq!(button.u32().unwrap(), 73);
+        assert_eq!(button.u32().unwrap(), 272);
+        assert_eq!(button.u32().unwrap(), 1);
+        button.finish().unwrap();
+
+        send(&mut peer, 7, 1, wire::Builder::new());
+        let deleted = receive_messages(&mut peer, 1);
+        let mut deleted = wire::Cursor::new(&deleted.first().unwrap().payload);
+        assert_eq!(deleted.u32().unwrap(), 7);
+        deleted.finish().unwrap();
+
         runtime
             .lock()
             .unwrap()
@@ -2409,6 +2981,7 @@ mod tests {
         peer.shutdown(Shutdown::Both).unwrap();
         assert!(worker.join().unwrap().is_ok());
         assert!(runtime.lock().unwrap().keyboard_snapshot().focus.is_none());
+        assert!(runtime.lock().unwrap().pointer_snapshot().focus.is_none());
         fs::remove_file(framebuffer_path).unwrap();
     }
 
@@ -2528,10 +3101,12 @@ mod tests {
         let worker_pending_deletes = Arc::clone(&client.pending_deletes);
         let worker_outbound = Arc::clone(&client.outbound);
         let worker = thread::spawn(move || {
-            keyboard_worker(
+            seat_worker(
                 receiver,
                 worker_stop,
                 worker_keyboards,
+                Arc::new(Mutex::new(BTreeMap::new())),
+                Arc::new(Mutex::new(None)),
                 worker_pending_deletes,
                 worker_outbound,
             )
@@ -2558,7 +3133,9 @@ mod tests {
         let mut deleted = wire::Cursor::new(&events.get(1).unwrap().payload);
         assert_eq!(deleted.u32().unwrap(), surface.object);
         deleted.finish().unwrap();
-        assert!(client.insert(surface.object, Object::Region).is_ok());
+        assert!(client
+            .insert(surface.object, Object::Region(Arc::new(InputRegion::new())),)
+            .is_ok());
 
         stop.stop();
         runtime.lock().unwrap().unsubscribe_keyboard(88);
@@ -2567,7 +3144,139 @@ mod tests {
     }
 
     #[test]
-    fn surface_destroy_does_not_wait_for_the_keyboard_worker() {
+    fn surface_delete_id_follows_its_queued_modal_grab_leave_and_frame() {
+        let stem = format!(
+            "td-pointer-surface-barrier-test-{}-{}",
+            std::process::id(),
+            TEST_SEQ.fetch_add(1, Ordering::Relaxed)
+        );
+        let framebuffer_path = std::env::temp_dir().join(format!("{stem}.fb"));
+        let framebuffer = Framebuffer::test_file(&framebuffer_path, 80, 80, 80 * 4).unwrap();
+        let runtime = Arc::new(Mutex::new(Runtime::new(framebuffer)));
+        let (server, mut peer) = UnixStream::pair().unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let mut client = Client::new(88, server, Arc::clone(&runtime), test_keymap()).unwrap();
+        let subscription = runtime
+            .lock()
+            .unwrap()
+            .subscribe_input_with_activity(
+                88,
+                Arc::clone(&client.keyboard_active),
+                Arc::clone(&client.pointer_active),
+            )
+            .unwrap();
+        let (receiver, stop) = subscription.split();
+        let surface = SurfaceKey {
+            client: 88,
+            object: 7,
+        };
+        runtime
+            .lock()
+            .unwrap()
+            .commit(
+                surface,
+                Surface {
+                    width: 32,
+                    height: 32,
+                    pixels: vec![1; 32 * 32 * 4],
+                    format: SHM_XRGB8888,
+                },
+            )
+            .unwrap();
+        let rect = runtime
+            .lock()
+            .unwrap()
+            .layout_snapshot()
+            .get(&surface)
+            .unwrap()
+            .rect;
+        runtime
+            .lock()
+            .unwrap()
+            .pointer_frame(
+                1,
+                i32::try_from(rect.x).unwrap(),
+                i32::try_from(rect.y).unwrap(),
+                &[],
+            )
+            .unwrap();
+        let press = PointerButtonInput {
+            time: 2,
+            button: 272,
+            state: PointerButtonState::Pressed,
+        };
+        runtime
+            .lock()
+            .unwrap()
+            .pointer_frame(2, 0, 0, &[press])
+            .unwrap();
+        runtime
+            .lock()
+            .unwrap()
+            .launcher(crate::launcher::LauncherAction::Open)
+            .unwrap();
+        let revision = runtime.lock().unwrap().pointer_snapshot().revision;
+        client
+            .objects
+            .insert(surface.object, Object::Surface(SurfaceState::default()));
+        client.pointers.lock().unwrap().insert(
+            9,
+            PointerRegistration {
+                after_revision: revision,
+                version: 7,
+            },
+        );
+        client.pointer_active.store(true, Ordering::Release);
+        let worker_stop = stop.clone();
+        let worker_pointers = Arc::clone(&client.pointers);
+        let worker_authority = Arc::clone(&client.pointer_authority);
+        let worker_pending_deletes = Arc::clone(&client.pending_deletes);
+        let worker_outbound = Arc::clone(&client.outbound);
+        let worker = thread::spawn(move || {
+            seat_worker(
+                receiver,
+                worker_stop,
+                Arc::new(Mutex::new(BTreeMap::new())),
+                worker_pointers,
+                worker_authority,
+                worker_pending_deletes,
+                worker_outbound,
+            )
+        });
+
+        client
+            .dispatch(
+                request(surface.object, 0, wire::Builder::new()).unwrap(),
+                &mut VecDeque::new(),
+            )
+            .unwrap();
+        let events = receive_messages(&mut peer, 3);
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| (event.object, event.opcode))
+                .collect::<Vec<_>>(),
+            [(9, 1), (9, 5), (1, 1)]
+        );
+        let mut leave = wire::Cursor::new(&events.first().unwrap().payload);
+        leave.u32().unwrap();
+        assert_eq!(leave.u32().unwrap(), surface.object);
+        leave.finish().unwrap();
+        let mut deleted = wire::Cursor::new(&events.get(2).unwrap().payload);
+        assert_eq!(deleted.u32().unwrap(), surface.object);
+        deleted.finish().unwrap();
+        assert!(client
+            .insert(surface.object, Object::Region(Arc::new(InputRegion::new())),)
+            .is_ok());
+
+        stop.stop();
+        runtime.lock().unwrap().unsubscribe_keyboard(88);
+        assert!(worker.join().unwrap().is_ok());
+        fs::remove_file(framebuffer_path).unwrap();
+    }
+
+    #[test]
+    fn surface_destroy_does_not_wait_for_the_seat_worker() {
         let stem = format!(
             "td-keyboard-surface-nonblocking-test-{}-{}",
             std::process::id(),
@@ -2615,10 +3324,12 @@ mod tests {
             .cloned()
             .unwrap();
         let blocked_delete = reservation.lock().unwrap();
-        assert!(client.insert(8, Object::Region).is_ok());
+        assert!(client
+            .insert(8, Object::Region(Arc::new(InputRegion::new())))
+            .is_ok());
         drop(blocked_delete);
         assert!(client
-            .insert(surface.object, Object::Region)
+            .insert(surface.object, Object::Region(Arc::new(InputRegion::new())),)
             .unwrap_err()
             .contains("before delete_id"));
 
@@ -2671,14 +3382,16 @@ mod tests {
             ),
             (1, 1)
         );
-        assert!(client.insert(7, Object::Region).is_ok());
+        assert!(client
+            .insert(7, Object::Region(Arc::new(InputRegion::new())))
+            .is_ok());
         assert!(client.pending_deletes.lock().unwrap().is_empty());
 
         fs::remove_file(framebuffer_path).unwrap();
     }
 
     #[test]
-    fn keyboard_worker_filters_pre_registration_events_and_preserves_order() {
+    fn seat_worker_filters_keyboard_history_and_preserves_order() {
         let stem = format!(
             "td-keyboard-worker-test-{}-{}",
             std::process::id(),
@@ -2729,10 +3442,12 @@ mod tests {
         let worker_registrations = Arc::clone(&registrations);
         let worker_outbound = Arc::clone(&outbound);
         let worker = thread::spawn(move || {
-            keyboard_worker(
+            seat_worker(
                 receiver,
                 worker_stop,
                 worker_registrations,
+                Arc::new(Mutex::new(BTreeMap::new())),
+                Arc::new(Mutex::new(None)),
                 Arc::new(Mutex::new(BTreeMap::new())),
                 worker_outbound,
             )
@@ -2815,7 +3530,301 @@ mod tests {
     }
 
     #[test]
-    fn keyboard_worker_distinguishes_overflow_from_requested_stop() {
+    fn pointer_worker_encodes_frames_versions_and_shared_serials() {
+        let stem = format!(
+            "td-pointer-worker-test-{}-{}",
+            std::process::id(),
+            TEST_SEQ.fetch_add(1, Ordering::Relaxed)
+        );
+        let framebuffer_path = std::env::temp_dir().join(format!("{stem}.fb"));
+        let framebuffer = Framebuffer::test_file(&framebuffer_path, 80, 80, 80 * 4).unwrap();
+        let mut runtime = Runtime::new(framebuffer);
+        let pointer_active = Arc::new(AtomicBool::new(true));
+        let subscription = runtime
+            .subscribe_input_with_activity(88, Arc::new(AtomicBool::new(false)), pointer_active)
+            .unwrap();
+        let (receiver, stop) = subscription.split();
+        let surface = SurfaceKey {
+            client: 88,
+            object: 7,
+        };
+        runtime
+            .commit(
+                surface,
+                Surface {
+                    width: 32,
+                    height: 32,
+                    pixels: vec![1; 32 * 32 * 4],
+                    format: SHM_XRGB8888,
+                },
+            )
+            .unwrap();
+        let rect = runtime.layout_snapshot().get(&surface).unwrap().rect;
+        let pointers = Arc::new(Mutex::new(BTreeMap::from([
+            (
+                9,
+                PointerRegistration {
+                    after_revision: 0,
+                    version: 7,
+                },
+            ),
+            (
+                10,
+                PointerRegistration {
+                    after_revision: 0,
+                    version: 4,
+                },
+            ),
+        ])));
+        let pointer_authority = Arc::new(Mutex::new(None));
+        let (server, mut peer) = UnixStream::pair().unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let outbound = Arc::new(Mutex::new(Outbound {
+            stream: server,
+            disconnected: false,
+        }));
+        let worker_stop = stop.clone();
+        let worker_pointers = Arc::clone(&pointers);
+        let worker_authority = Arc::clone(&pointer_authority);
+        let worker_outbound = Arc::clone(&outbound);
+        let worker = thread::spawn(move || {
+            seat_worker(
+                receiver,
+                worker_stop,
+                Arc::new(Mutex::new(BTreeMap::new())),
+                worker_pointers,
+                worker_authority,
+                Arc::new(Mutex::new(BTreeMap::new())),
+                worker_outbound,
+            )
+        });
+
+        runtime
+            .pointer_frame(
+                40,
+                i32::try_from(rect.x.saturating_add(2)).unwrap(),
+                i32::try_from(rect.y.saturating_add(3)).unwrap(),
+                &[],
+            )
+            .unwrap();
+        let enter = receive_messages(&mut peer, 3);
+        assert_eq!(
+            enter
+                .iter()
+                .map(|event| (event.object, event.opcode))
+                .collect::<Vec<_>>(),
+            [(9, 0), (9, 5), (10, 0)]
+        );
+        let mut first = wire::Cursor::new(&enter.first().unwrap().payload);
+        let serial = first.u32().unwrap();
+        assert_ne!(serial, 0);
+        assert_eq!(first.u32().unwrap(), surface.object);
+        assert_eq!(first.i32().unwrap(), 2 * 256);
+        assert_eq!(first.i32().unwrap(), 3 * 256);
+        first.finish().unwrap();
+        let mut second = wire::Cursor::new(&enter.get(2).unwrap().payload);
+        assert_eq!(second.u32().unwrap(), serial);
+        assert_eq!(second.u32().unwrap(), surface.object);
+        assert_eq!(second.i32().unwrap(), 2 * 256);
+        assert_eq!(second.i32().unwrap(), 3 * 256);
+        second.finish().unwrap();
+        assert_eq!(
+            *pointer_authority.lock().unwrap(),
+            Some(PointerEnterAuthority {
+                serial,
+                surface: surface.object,
+                after_revision: 1,
+            })
+        );
+
+        runtime.pointer_frame(41, 1, 2, &[]).unwrap();
+        let motion = receive_messages(&mut peer, 3);
+        assert_eq!(
+            motion
+                .iter()
+                .map(|event| (event.object, event.opcode))
+                .collect::<Vec<_>>(),
+            [(9, 2), (9, 5), (10, 2)]
+        );
+        let mut first = wire::Cursor::new(&motion.first().unwrap().payload);
+        assert_eq!(first.u32().unwrap(), 41);
+        assert_eq!(first.i32().unwrap(), 3 * 256);
+        assert_eq!(first.i32().unwrap(), 5 * 256);
+        first.finish().unwrap();
+
+        let button = PointerButtonInput {
+            time: 42,
+            button: 272,
+            state: PointerButtonState::Pressed,
+        };
+        runtime.pointer_frame(42, 0, 0, &[button]).unwrap();
+        let buttons = receive_messages(&mut peer, 3);
+        assert_eq!(
+            buttons
+                .iter()
+                .map(|event| (event.object, event.opcode))
+                .collect::<Vec<_>>(),
+            [(9, 3), (9, 5), (10, 3)]
+        );
+        let mut first = wire::Cursor::new(&buttons.first().unwrap().payload);
+        let serial = first.u32().unwrap();
+        assert_eq!(first.u32().unwrap(), 42);
+        assert_eq!(first.u32().unwrap(), 272);
+        assert_eq!(first.u32().unwrap(), 1);
+        first.finish().unwrap();
+        let mut second = wire::Cursor::new(&buttons.get(2).unwrap().payload);
+        assert_eq!(second.u32().unwrap(), serial);
+        assert_eq!(second.u32().unwrap(), 42);
+        assert_eq!(second.u32().unwrap(), 272);
+        assert_eq!(second.u32().unwrap(), 1);
+        second.finish().unwrap();
+
+        stop.stop();
+        runtime.unsubscribe_keyboard(88);
+        assert!(worker.join().unwrap().is_ok());
+        fs::remove_file(framebuffer_path).unwrap();
+    }
+
+    #[test]
+    fn queued_split_transition_preserves_a_new_pointer_initial_authority() {
+        let (server, mut peer) = UnixStream::pair().unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let outbound = Arc::new(Mutex::new(Outbound {
+            stream: server,
+            disconnected: false,
+        }));
+        let pointers = BTreeMap::from([
+            (
+                9,
+                PointerRegistration {
+                    after_revision: 0,
+                    version: 7,
+                },
+            ),
+            (
+                10,
+                PointerRegistration {
+                    after_revision: 7,
+                    version: 7,
+                },
+            ),
+        ]);
+        let target = PointerTarget {
+            surface: SurfaceKey {
+                client: 88,
+                object: 7,
+            },
+            x: 3,
+            y: 5,
+        };
+        let leave = RoutedPointerFrame {
+            revision: 6,
+            client: 88,
+            events: vec![PointerEvent::Leave {
+                surface: SurfaceKey {
+                    client: 88,
+                    object: 6,
+                },
+            }],
+        };
+        let enter = RoutedPointerFrame {
+            revision: 7,
+            client: 88,
+            events: vec![PointerEvent::Enter { target }],
+        };
+        let mut authority = Some(PointerEnterAuthority {
+            serial: 4242,
+            surface: target.surface.object,
+            after_revision: 7,
+        });
+
+        send_pointer_frame(&outbound, &pointers, &mut authority, &leave).unwrap();
+        let leave_events = receive_messages(&mut peer, 2);
+        assert_eq!(
+            leave_events
+                .iter()
+                .map(|event| (event.object, event.opcode))
+                .collect::<Vec<_>>(),
+            [(9, 1), (9, 5)]
+        );
+        assert_eq!(
+            authority,
+            Some(PointerEnterAuthority {
+                serial: 4242,
+                surface: target.surface.object,
+                after_revision: 7,
+            })
+        );
+
+        send_pointer_frame(&outbound, &pointers, &mut authority, &enter).unwrap();
+        let enter_events = receive_messages(&mut peer, 2);
+        assert_eq!(
+            enter_events
+                .iter()
+                .map(|event| (event.object, event.opcode))
+                .collect::<Vec<_>>(),
+            [(9, 0), (9, 5)]
+        );
+        let mut enter_event = wire::Cursor::new(&enter_events.first().unwrap().payload);
+        assert_eq!(enter_event.u32().unwrap(), 4242);
+        assert_eq!(enter_event.u32().unwrap(), target.surface.object);
+        assert_eq!(enter_event.i32().unwrap(), 3 * 256);
+        assert_eq!(enter_event.i32().unwrap(), 5 * 256);
+        enter_event.finish().unwrap();
+        assert_eq!(
+            authority,
+            Some(PointerEnterAuthority {
+                serial: 4242,
+                surface: target.surface.object,
+                after_revision: 7,
+            })
+        );
+    }
+
+    #[test]
+    fn initial_pointer_enter_gates_frame_at_version_five() {
+        let target = PointerTarget {
+            surface: SurfaceKey {
+                client: 8,
+                object: 4,
+            },
+            x: 3,
+            y: 5,
+        };
+        for (version, count) in [(4, 1), (5, 2)] {
+            let (server, mut peer) = UnixStream::pair().unwrap();
+            let outbound = Arc::new(Mutex::new(Outbound {
+                stream: server,
+                disconnected: false,
+            }));
+            send_pointer_initial(
+                &outbound,
+                9,
+                version,
+                8,
+                PointerSnapshot {
+                    revision: 7,
+                    focus: Some(target),
+                },
+                Some(33),
+            )
+            .unwrap();
+            let events = receive_messages(&mut peer, count);
+            assert_eq!(
+                events.first().map(|event| (event.object, event.opcode)),
+                Some((9, 0))
+            );
+            if version >= 5 {
+                assert_eq!(
+                    events.get(1).map(|event| (event.object, event.opcode)),
+                    Some((9, 5))
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn seat_worker_distinguishes_overflow_from_requested_stop() {
         let stem = format!(
             "td-keyboard-stop-test-{}-{}",
             std::process::id(),
@@ -2828,10 +3837,12 @@ mod tests {
         let (receiver, stop) = subscription.split();
         runtime.unsubscribe_keyboard(99);
         let (server, _peer) = UnixStream::pair().unwrap();
-        let error = keyboard_worker(
+        let error = seat_worker(
             receiver,
             stop,
             Arc::new(Mutex::new(BTreeMap::new())),
+            Arc::new(Mutex::new(BTreeMap::new())),
+            Arc::new(Mutex::new(None)),
             Arc::new(Mutex::new(BTreeMap::new())),
             Arc::new(Mutex::new(Outbound {
                 stream: server,
@@ -2844,7 +3855,7 @@ mod tests {
     }
 
     #[test]
-    fn bound_keyboard_worker_disconnects_after_queue_overflow() {
+    fn bound_seat_worker_disconnects_after_queue_overflow() {
         let stem = format!(
             "td-keyboard-overflow-test-{}-{}",
             std::process::id(),
@@ -2892,11 +3903,13 @@ mod tests {
             stream: server,
             disconnected: false,
         }));
-        let error = supervise_keyboard_worker(
+        let error = supervise_seat_worker(
             99,
             receiver,
             stop,
             registrations,
+            Arc::new(Mutex::new(BTreeMap::new())),
+            Arc::new(Mutex::new(None)),
             Arc::new(Mutex::new(BTreeMap::new())),
             Arc::clone(&outbound),
         )
@@ -2908,7 +3921,7 @@ mod tests {
     }
 
     #[test]
-    fn stopped_keyboard_worker_clears_queued_delete_reservations() {
+    fn stopped_seat_worker_clears_queued_delete_reservations() {
         let stem = format!(
             "td-keyboard-stop-delete-test-{}-{}",
             std::process::id(),
@@ -2926,10 +3939,12 @@ mod tests {
         }
         stop.stop();
         let (server, _peer) = UnixStream::pair().unwrap();
-        assert!(keyboard_worker(
+        assert!(seat_worker(
             receiver,
             stop,
             Arc::new(Mutex::new(BTreeMap::new())),
+            Arc::new(Mutex::new(BTreeMap::new())),
+            Arc::new(Mutex::new(None)),
             Arc::clone(&pending),
             Arc::new(Mutex::new(Outbound {
                 stream: server,
@@ -3268,6 +4283,43 @@ mod tests {
             .command(Command::SwitchWorkspace(1))
             .unwrap();
         connected.wait_for((640, 400), true, true).unwrap();
+        let before_input = fs::read(&framebuffer_path).unwrap();
+        runtime
+            .lock()
+            .unwrap()
+            .pointer_frame(
+                100,
+                40,
+                40,
+                &[PointerButtonInput {
+                    time: 100,
+                    button: 0x110,
+                    state: PointerButtonState::Pressed,
+                }],
+            )
+            .unwrap();
+        let compositor_pointer_frame = fs::read(&framebuffer_path).unwrap();
+        assert_ne!(compositor_pointer_frame, before_input);
+        connected
+            .wait_for_pointer((40 * 256, 40 * 256), 0x110)
+            .unwrap();
+        let pointer_frame = fs::read(&framebuffer_path).unwrap();
+        assert_ne!(pointer_frame, compositor_pointer_frame);
+
+        runtime
+            .lock()
+            .unwrap()
+            .key(KeyInput {
+                time: 101,
+                key: 30,
+                state: KeyState::Pressed,
+            })
+            .unwrap();
+        connected
+            .wait_for_key(30, crate::ui::UiKeyState::Pressed)
+            .unwrap();
+        let frame = fs::read(&framebuffer_path).unwrap();
+        assert_ne!(frame, pointer_frame);
 
         drop(connected);
         worker.join().unwrap().unwrap();
@@ -3555,7 +4607,7 @@ mod tests {
             .insert(
                 5,
                 Object::Surface(SurfaceState {
-                    role: Some(9),
+                    role: Some(SurfaceRole::Xdg(9)),
                     ..SurfaceState::default()
                 }),
             )
@@ -3665,6 +4717,424 @@ mod tests {
     }
 
     #[test]
+    fn input_region_state_is_copied_on_set_and_applied_on_commit() {
+        let stem = format!(
+            "td-wayland-input-region-{}-{}",
+            std::process::id(),
+            TEST_SEQ.fetch_add(1, Ordering::Relaxed)
+        );
+        let framebuffer_path = std::env::temp_dir().join(format!("{stem}.fb"));
+        let framebuffer = Framebuffer::test_file(&framebuffer_path, 80, 80, 80 * 4).unwrap();
+        let runtime = Arc::new(Mutex::new(Runtime::new(framebuffer)));
+        let (server, _peer) = UnixStream::pair().unwrap();
+        let mut client = Client::new(2, server, Arc::clone(&runtime), test_keymap()).unwrap();
+        client
+            .insert(5, Object::Surface(SurfaceState::default()))
+            .unwrap();
+        client
+            .insert(6, Object::Region(Arc::new(InputRegion::new())))
+            .unwrap();
+
+        let mut add = wire::Builder::new();
+        for value in [1, 2, 3, 4] {
+            add.i32(value);
+        }
+        client
+            .dispatch(request(6, 1, add).unwrap(), &mut VecDeque::new())
+            .unwrap();
+        let expected = match client.objects.get(&6) {
+            Some(Object::Region(region)) => region.clone(),
+            _ => Arc::new(InputRegion::new()),
+        };
+        let key = SurfaceKey {
+            client: 2,
+            object: 5,
+        };
+        runtime
+            .lock()
+            .unwrap()
+            .commit(
+                key,
+                Surface {
+                    width: 32,
+                    height: 32,
+                    pixels: vec![1; 32 * 32 * 4],
+                    format: SHM_XRGB8888,
+                },
+            )
+            .unwrap();
+        let rect = runtime
+            .lock()
+            .unwrap()
+            .layout_snapshot()
+            .get(&key)
+            .unwrap()
+            .rect;
+        runtime
+            .lock()
+            .unwrap()
+            .pointer_frame(
+                1,
+                i32::try_from(rect.x).unwrap(),
+                i32::try_from(rect.y).unwrap(),
+                &[],
+            )
+            .unwrap();
+        assert_eq!(
+            runtime
+                .lock()
+                .unwrap()
+                .pointer_snapshot()
+                .focus
+                .map(|target| target.surface),
+            Some(key)
+        );
+        let mut set = wire::Builder::new();
+        set.u32(6);
+        client
+            .dispatch(request(5, 5, set).unwrap(), &mut VecDeque::new())
+            .unwrap();
+        let mut later_add = wire::Builder::new();
+        for value in [0, 0, 1, 1] {
+            later_add.i32(value);
+        }
+        client
+            .dispatch(request(6, 1, later_add).unwrap(), &mut VecDeque::new())
+            .unwrap();
+        client
+            .dispatch(
+                request(6, 0, wire::Builder::new()).unwrap(),
+                &mut VecDeque::new(),
+            )
+            .unwrap();
+        assert!(matches!(
+            client.objects.get(&5),
+            Some(Object::Surface(SurfaceState {
+                pending_input_region: Some(Some(region)),
+                ..
+            })) if region == &expected
+        ));
+
+        client
+            .dispatch(
+                request(5, 6, wire::Builder::new()).unwrap(),
+                &mut VecDeque::new(),
+            )
+            .unwrap();
+        assert_eq!(runtime.lock().unwrap().pointer_snapshot().focus, None);
+        assert!(matches!(
+            client.objects.get(&5),
+            Some(Object::Surface(SurfaceState {
+                pending_input_region: None,
+                input_region: Some(region),
+                ..
+            })) if region == &expected
+        ));
+
+        let mut reset = wire::Builder::new();
+        reset.u32(0);
+        client
+            .dispatch(request(5, 5, reset).unwrap(), &mut VecDeque::new())
+            .unwrap();
+        client
+            .dispatch(
+                request(5, 6, wire::Builder::new()).unwrap(),
+                &mut VecDeque::new(),
+            )
+            .unwrap();
+        assert!(matches!(
+            client.objects.get(&5),
+            Some(Object::Surface(SurfaceState {
+                pending_input_region: None,
+                input_region: None,
+                ..
+            }))
+        ));
+        fs::remove_file(framebuffer_path).unwrap();
+    }
+
+    #[test]
+    fn input_region_limits_are_bounded_noops_without_disconnect() {
+        let stem = format!(
+            "td-wayland-input-region-limit-{}-{}",
+            std::process::id(),
+            TEST_SEQ.fetch_add(1, Ordering::Relaxed)
+        );
+        let framebuffer_path = std::env::temp_dir().join(format!("{stem}.fb"));
+        let framebuffer = Framebuffer::test_file(&framebuffer_path, 8, 8, 8 * 4).unwrap();
+        let runtime = Arc::new(Mutex::new(Runtime::new(framebuffer)));
+        let (server, _peer) = UnixStream::pair().unwrap();
+        let mut client = Client::new(3, server, runtime, test_keymap()).unwrap();
+
+        for object in 10..26 {
+            client
+                .insert(object, Object::Region(Arc::new(InputRegion::new())))
+                .unwrap();
+            for _ in 0..MAX_INPUT_REGION_OPERATIONS {
+                let mut add = wire::Builder::new();
+                for value in [0, 0, 1, 1] {
+                    add.i32(value);
+                }
+                client
+                    .dispatch(request(object, 1, add).unwrap(), &mut VecDeque::new())
+                    .unwrap();
+            }
+        }
+        assert_eq!(
+            client.retained_input_region_operations(),
+            MAX_CLIENT_INPUT_REGION_OPERATIONS
+        );
+
+        client
+            .insert(26, Object::Region(Arc::new(InputRegion::new())))
+            .unwrap();
+        for values in [[0, 0, 0, 1], [0, 0, 1, 1]] {
+            let mut add = wire::Builder::new();
+            for value in values {
+                add.i32(value);
+            }
+            client
+                .dispatch(request(26, 1, add).unwrap(), &mut VecDeque::new())
+                .unwrap();
+        }
+        assert!(matches!(
+            client.objects.get(&26),
+            Some(Object::Region(region)) if region.len() == 0
+        ));
+
+        let mut excess = wire::Builder::new();
+        for value in [0, 0, 1, 1] {
+            excess.i32(value);
+        }
+        client
+            .dispatch(request(10, 1, excess).unwrap(), &mut VecDeque::new())
+            .unwrap();
+        assert!(matches!(
+            client.objects.get(&10),
+            Some(Object::Region(region)) if region.len() == MAX_INPUT_REGION_OPERATIONS
+        ));
+        fs::remove_file(framebuffer_path).unwrap();
+    }
+
+    #[test]
+    fn cursor_role_accepts_commits_without_mapping_a_toplevel() {
+        let stem = format!(
+            "td-wayland-cursor-role-{}-{}",
+            std::process::id(),
+            TEST_SEQ.fetch_add(1, Ordering::Relaxed)
+        );
+        let framebuffer_path = std::env::temp_dir().join(format!("{stem}.fb"));
+        let pool_path = std::env::temp_dir().join(format!("{stem}.pool"));
+        fs::write(&pool_path, [1, 2, 3, 0]).unwrap();
+        let framebuffer = Framebuffer::test_file(&framebuffer_path, 80, 80, 80 * 4).unwrap();
+        let runtime = Arc::new(Mutex::new(Runtime::new(framebuffer)));
+        let focused = SurfaceKey {
+            client: 2,
+            object: 9,
+        };
+        runtime
+            .lock()
+            .unwrap()
+            .commit(
+                focused,
+                Surface {
+                    width: 32,
+                    height: 32,
+                    pixels: vec![1; 32 * 32 * 4],
+                    format: SHM_XRGB8888,
+                },
+            )
+            .unwrap();
+        let rect = runtime
+            .lock()
+            .unwrap()
+            .layout_snapshot()
+            .get(&focused)
+            .unwrap()
+            .rect;
+        runtime
+            .lock()
+            .unwrap()
+            .pointer_frame(
+                1,
+                i32::try_from(rect.x.saturating_add(2)).unwrap(),
+                i32::try_from(rect.y.saturating_add(3)).unwrap(),
+                &[],
+            )
+            .unwrap();
+        let (server, mut peer) = UnixStream::pair().unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let mut client = Client::new(2, server, Arc::clone(&runtime), test_keymap()).unwrap();
+        let subscription = runtime
+            .lock()
+            .unwrap()
+            .subscribe_input_with_activity(
+                2,
+                Arc::clone(&client.keyboard_active),
+                Arc::clone(&client.pointer_active),
+            )
+            .unwrap();
+        let (_receiver, stop) = subscription.split();
+        client
+            .insert(5, Object::Surface(SurfaceState::default()))
+            .unwrap();
+        client.insert(6, Object::Pointer { version: 7 }).unwrap();
+
+        let mut set_cursor = wire::Builder::new();
+        set_cursor.u32(44);
+        set_cursor.u32(5);
+        set_cursor.i32(1);
+        set_cursor.i32(2);
+        client
+            .dispatch(request(6, 0, set_cursor).unwrap(), &mut VecDeque::new())
+            .unwrap();
+        assert!(matches!(
+            client.objects.get(&5),
+            Some(Object::Surface(SurfaceState { role: None, .. }))
+        ));
+        client.objects.remove(&6);
+        client.create_pointer(6, 7).unwrap();
+        let first_enter = receive_messages(&mut peer, 2);
+        let mut first = wire::Cursor::new(&first_enter.first().unwrap().payload);
+        let serial = first.u32().unwrap();
+        assert_eq!(first.u32().unwrap(), focused.object);
+        client.create_pointer(10, 7).unwrap();
+        let second_enter = receive_messages(&mut peer, 2);
+        let mut second = wire::Cursor::new(&second_enter.first().unwrap().payload);
+        assert_eq!(second.u32().unwrap(), serial);
+        assert_eq!(second.u32().unwrap(), focused.object);
+        assert_eq!(
+            *client.pointer_authority.lock().unwrap(),
+            Some(PointerEnterAuthority {
+                serial,
+                surface: focused.object,
+                after_revision: 1,
+            })
+        );
+
+        runtime
+            .lock()
+            .unwrap()
+            .pointer_frame(2, 1_000, 1_000, &[])
+            .unwrap();
+        let mut after_leave = wire::Builder::new();
+        after_leave.u32(serial);
+        after_leave.u32(5);
+        after_leave.i32(1);
+        after_leave.i32(2);
+        client
+            .dispatch(request(6, 0, after_leave).unwrap(), &mut VecDeque::new())
+            .unwrap();
+        assert!(matches!(
+            client.objects.get(&5),
+            Some(Object::Surface(SurfaceState { role: None, .. }))
+        ));
+        runtime
+            .lock()
+            .unwrap()
+            .pointer_frame(3, -1_000, -1_000, &[])
+            .unwrap();
+        runtime
+            .lock()
+            .unwrap()
+            .pointer_frame(
+                4,
+                i32::try_from(rect.x.saturating_add(2)).unwrap(),
+                i32::try_from(rect.y.saturating_add(3)).unwrap(),
+                &[],
+            )
+            .unwrap();
+        let mut set_cursor = wire::Builder::new();
+        set_cursor.u32(serial);
+        set_cursor.u32(5);
+        set_cursor.i32(1);
+        set_cursor.i32(2);
+        client
+            .dispatch(request(6, 0, set_cursor).unwrap(), &mut VecDeque::new())
+            .unwrap();
+        assert!(matches!(
+            client.objects.get(&5),
+            Some(Object::Surface(SurfaceState {
+                role: Some(SurfaceRole::Cursor),
+                ..
+            }))
+        ));
+        client
+            .insert(
+                12,
+                Object::Surface(SurfaceState {
+                    role: Some(SurfaceRole::Xdg(9)),
+                    ..SurfaceState::default()
+                }),
+            )
+            .unwrap();
+        let mut stale = wire::Builder::new();
+        stale.u32(serial.wrapping_sub(1));
+        stale.u32(12);
+        stale.i32(0);
+        stale.i32(0);
+        client
+            .dispatch(request(6, 0, stale).unwrap(), &mut VecDeque::new())
+            .unwrap();
+        let mut conflict = wire::Builder::new();
+        conflict.u32(serial);
+        conflict.u32(12);
+        conflict.i32(0);
+        conflict.i32(0);
+        assert!(client
+            .dispatch(request(6, 0, conflict).unwrap(), &mut VecDeque::new())
+            .is_err());
+        assert_eq!(client.protocol_error_code, WL_POINTER_ERROR_ROLE);
+
+        let buffer = Buffer {
+            serial: 1,
+            file: Arc::new(File::open(&pool_path).unwrap()),
+            offset: 0,
+            width: 1,
+            height: 1,
+            stride: 4,
+            format: SHM_XRGB8888,
+        };
+        client.insert(7, Object::Buffer(buffer.clone())).unwrap();
+        let state = SurfaceState {
+            pending_buffer: Some(PendingBuffer::Buffer { object: 7, buffer }),
+            role: Some(SurfaceRole::Cursor),
+            ..SurfaceState::default()
+        };
+        client.objects.insert(5, Object::Surface(state.clone()));
+        client.commit_surface(5, state).unwrap();
+        let release = receive_messages(&mut peer, 1);
+        assert_eq!(
+            (
+                release.first().unwrap().object,
+                release.first().unwrap().opcode
+            ),
+            (7, 0)
+        );
+        assert_eq!(
+            runtime.lock().unwrap().surface_size(SurfaceKey {
+                client: 2,
+                object: 5,
+            }),
+            None
+        );
+        assert_eq!(client.mapped_total, 0);
+
+        client.insert(8, Object::XdgWmBase).unwrap();
+        let mut xdg = wire::Builder::new();
+        xdg.u32(9);
+        xdg.u32(5);
+        assert!(client
+            .dispatch(request(8, 2, xdg).unwrap(), &mut VecDeque::new())
+            .unwrap_err()
+            .contains("already has a role"));
+        stop.stop();
+        runtime.lock().unwrap().unsubscribe_keyboard(2);
+        fs::remove_file(framebuffer_path).unwrap();
+        fs::remove_file(pool_path).unwrap();
+    }
+
+    #[test]
     fn malformed_wire_input_still_removes_the_clients_scene() {
         let stem = format!(
             "td-wayland-cleanup-{}-{}",
@@ -3728,5 +5198,14 @@ mod tests {
         let message = request(1, 1, builder).unwrap();
         assert_eq!(message.object, 1);
         assert_eq!(message.opcode, 1);
+    }
+
+    #[test]
+    fn pointer_fixed_encoding_is_exact_and_checked() {
+        assert_eq!(pointer_fixed(0).unwrap(), 0);
+        assert_eq!(pointer_fixed(17).unwrap(), 17 * 256);
+        assert_eq!(pointer_fixed(-9).unwrap(), -9 * 256);
+        assert!(pointer_fixed(i32::MAX).is_err());
+        assert!(pointer_fixed(i32::MIN).is_err());
     }
 }
