@@ -56,10 +56,15 @@ pub struct Options {
     /// the vendored Spencer cases pin. Not a knob: it is which tool's syntax bits
     /// glibc was handed.
     pub strict_repeats: bool,
-    /// sed's `--posix`, which drops GNU extensions. Only one rule reads it: an
-    /// unmatched `)` is ORDINARY there, the opposite of what sed's ERE does
-    /// otherwise. The interval rules are unaffected -- `--posix -E 'a{x}'` is
-    /// still bad content -- so this is not a second `strict_repeats`.
+    /// sed's `--posix`, which drops GNU's regex extensions: each is read as the
+    /// LITERAL character rather than refused, so `\w` matches a `w` and `a\+`
+    /// the text `a+`. Three places read it -- `at_op` for the branch-level `\|`,
+    /// `next_op` for the postfix `\+`/`\?`, and `parse_escape` for the class and
+    /// anchor escapes -- plus the unmatched close-paren, ordinary here in BOTH
+    /// spellings. What POSIX itself defines is untouched: `\(`, `\)` around a
+    /// real group, the interval, and backreferences all still work, and
+    /// `--posix -E 'a{x}'` is still bad content, so this is not a second
+    /// `strict_repeats`.
     pub posix: bool,
     /// Which of GNU's two engines reads the MID-BRANCH `$` that `stray_anchor`
     /// creates. grep's dfa satisfies one at a true end of line, so `grep 'x$|*'`
@@ -368,6 +373,9 @@ impl<'a> Parser<'a> {
         if self.opts.ere {
             return self.eat(ch);
         }
+        if self.posix_drops(ch) {
+            return false;
+        }
         if self.peek() == Some(b'\\') && self.peek_at(1) == Some(ch) {
             self.pos += 2;
             return true;
@@ -379,7 +387,21 @@ impl<'a> Parser<'a> {
         if self.opts.ere {
             return self.peek() == Some(ch);
         }
+        if self.posix_drops(ch) {
+            return false;
+        }
         self.peek() == Some(b'\\') && self.peek_at(1) == Some(ch)
+    }
+
+    /// The BRE operators `--posix` drops, leaving the character ordinary. `\(`,
+    /// `\)` and the interval are POSIX's own and stay operators there. Shared so
+    /// the test and the CONSUMER cannot disagree: only `\|` reaches either today
+    /// (`next_op` handles the postfix pair, and `parse_concat` under the flag
+    /// never leaves the parser sitting on one), but a consumer that took what the
+    /// test beside it had just refused would restore GNU alternation under the
+    /// flag with nothing anywhere to notice.
+    fn posix_drops(&self, ch: u8) -> bool {
+        self.opts.posix && matches!(ch, b'|' | b'+' | b'?')
     }
 
     /// Whether a BRE `$` anchors DESPITE more pattern following it. GNU tests the
@@ -656,8 +678,10 @@ impl<'a> Parser<'a> {
             }));
         }
         // GNU BRE: `\+` and `\?` are the one-or-more / optional operators, and are
-        // the two a second operator may follow.
-        if !self.opts.ere && self.peek() == Some(b'\\') {
+        // the two a second operator may follow. `--posix` drops both, and this is
+        // the second place that has to know -- `at_op` covers the branch-level
+        // `\|`, this the postfix pair.
+        if !self.opts.ere && !self.opts.posix && self.peek() == Some(b'\\') {
             match self.peek_at(1) {
                 Some(b'+') => {
                     self.pos += 2;
@@ -955,7 +979,13 @@ impl<'a> Parser<'a> {
                 }
                 Ok(Node::Group(idx, Box::new(inner)))
             }
-            b')' if !self.opts.ere => Err(Error::new("Unmatched ) or \\)")),
+            // A `\)` with nothing open. Both tools refuse it, unlike the ERE `)`
+            // above that grep reads as the character -- but `--posix` drops the
+            // extension for this spelling too, and then it is ordinary.
+            b')' if !self.opts.ere => match self.opts.posix {
+                true => Ok(self.literal(b')')),
+                false => Err(Error::new("Unmatched ) or \\)")),
+            },
             // An interval reaching here has nothing to repeat (`\{2\}a`, `\<\{2\}a`).
             // sed refuses that; grep warns `stray \ before {` and reads the brace as
             // the character, so `grep '\{2\}'` matches the text `{2}`.
@@ -973,6 +1003,15 @@ impl<'a> Parser<'a> {
                     return Err(Error::new("Invalid back reference"));
                 }
                 Ok(Node::Backref(n))
+            }
+            // The character-class and anchor escapes are GNU extensions too, and
+            // `--posix` reads each as the LITERAL character rather than refusing
+            // it: `\w` matches a `w`, `` \` `` a backtick. Listed rather than
+            // caught by the fallthrough so a new escape must decide for itself.
+            b'w' | b'W' | b's' | b'S' | b'b' | b'B' | b'<' | b'>' | b'`' | b'\''
+                if self.opts.posix =>
+            {
+                Ok(self.literal(b))
             }
             b'w' | b'W' => {
                 let mut set = ByteSet::empty();

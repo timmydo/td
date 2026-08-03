@@ -156,9 +156,12 @@ td-txt-authored case files
   early run, because GNU's `--posix` disables GNU's own extensions and refuses
   twelve constructs td-txt accepts (`first~step`, `addr,+N`, `addr,~N`, `0,/re/`,
   `s///I`, `s///M`, `Q`, `T`, `z`, `F`, one-liner `a text`, `q5`) while turning
-  `\U\L\u\l\E` and BRE `\+ \? \| \w` into literals. td-txt implements `--posix`
-  for exactly ONE of those (`N` at end of input) and silently ignores the rest, so
-  every script that mixed the flag with an extension read as a divergence.
+  `\U\L\u\l\E` and BRE `\+ \? \| \w` into literals. When this campaign ran,
+  td-txt implemented `--posix` for exactly ONE of those (`N` at end of input) and
+  silently ignored the rest, so every script that mixed the flag with an extension
+  read as a divergence. All three sides of that are now implemented -- regex,
+  replacement and the command refusals -- so the `--posix` entry below records
+  what is LEFT rather than what is missing.
   Excluding the flag took 750 cases from 20 divergences to 1. Make it the first
   thing you bucket, and note that the gap it hides is itself a finding: an option
   accepted and mostly ignored is the "silent no-op" ../src/sed.rs's header says
@@ -770,9 +773,8 @@ td-txt-authored case files
   both. That second rule is a GNU EXTENSION, so `--posix` drops it and the
   character is ordinary again -- while leaving the interval rules alone, which is
   why the two halves of this paragraph need different treatment under the flag.
-  td-txt drops it for the ERE spelling `)` ONLY: GNU relaxes the BRE `\)` under
-  the flag too, so `sed --posix 's/a\)/X/'` runs there and is refused here. Its
-  own gap, below.
+  td-txt drops it for BOTH spellings, as GNU does: `sed --posix 's/a\)/X/'` and
+  the ERE `s/a)/X/` each read the paren as the character.
 
   Stacking is otherwise unchanged and is the same two rules as before, both of
   them SED's: its BRE refuses a second `*` or interval after ANY operator (`a**`,
@@ -792,21 +794,66 @@ td-txt-authored case files
 
   The gaps this campaign found and did NOT fix, recorded here so the next round
   starts from the probe results rather than re-deriving them. All but the first
-  have corpus cases carrying GNU's goldens, listed as xfail; `--posix`'s cases
+  have corpus cases carrying GNU's goldens, listed as xfail -- with the
+  exceptions that say so in their own entry, where capturing the behaviour is
+  what the case cannot do; `--posix`'s cases
   PASS, and the probe table below is its specification instead. What is missing
   under that flag is MOSTLY a restriction rather than an answer -- but not
-  entirely: the flag also DROPS a GNU extension, making an unmatched `)` ordinary
-  in an ERE, and td-txt reads it for that one rule. An earlier draft of this
-  paragraph said the flag never changes an answer here, which was true only until
-  something GNU's `--posix` relaxes got modelled.
+  entirely, and the exceptions have now caught this paragraph out TWICE. An
+  early draft said the flag never changes an answer here; a later one said
+  every answer it does change is modelled. Both were the same mistake, which is
+  reaching for a tidy summary of a flag that has no tidy summary. What is true
+  as measured: FIVE answer-changing rules are modelled (the entry below names
+  four, and `N` at end of input is the fifth -- `sed --posix N` on a one-line
+  file prints nothing where the default prints the line) and at least one is
+  NOT -- `--posix` stops GNU aliasing `/dev/stdout` to its own stdout and opens
+  it as an ordinary, separately buffered file, so
+  `sed --posix -n 'p;w /dev/stdout'` over three lines prints them grouped
+  `1 2 3 1 2 3` in GNU and interleaved `1 1 2 2 3 3` here. An xfail case
+  carries GNU's golden. An earlier draft said there could be no case because
+  the harness captures stdout -- but it captures it through a PIPE, which is
+  exactly the condition the divergence needs, so the rationale was wrong and
+  the case was writable all along. A reviewer read the harness and checked.
 
-  - `--posix`, above: implemented for one behaviour of twelve-plus, silently
-    ignored for the rest. `POSIXLY_CORRECT` selects a POSIX mode in GNU too,
-    but a WEAKER one, and td-txt does not drive this flag from it at all; that
-    is its own entry below. GNU refuses `v` outright under the flag
-    (`unknown command: `v'`) while clearing posix mode is `v`'s documented side
-    effect when it is allowed -- neither of which td-txt has anywhere to put until
-    the mode exists.
+  - `--posix`: its REGEX half is implemented, in both halves of what that
+    means -- the GNU operator extensions the compiler drops (`\|`, `\+`, `\?`,
+    the class and anchor escapes, and the unmatched `\)`), and the escape
+    decoding `normalize_regex` stops inside a bracket expression, which is a
+    rule of its own and not a consequence of the first. Its COMMAND half is
+    implemented: `N` at EOF followed the flag from the start, and the
+    withdrawals now do too -- the eight commands GNU stops knowing (`v`, `Q`,
+    `T`, `z`, `F`, `W`, `R`, `e`), the step and `+N`/`~N` addresses, line
+    address 0, `l`'s width, `q`'s exit code, the one-line `a text`, a text
+    whose backslash ends its `-e` part -- one after the TEXT as much as the
+    command's own -- the `I`/`M` modifiers on a regex ADDRESS, which are a
+    different parser from the `s` flags of the same names, the `s` flags
+    `I`/`i`/`M`/`m`/`e`, and
+    a one-address limit on `=`, `a`, `i`, `l` and `r`, for which GNU otherwise
+    takes a range (`q`/`Q` are limited in BOTH modes; `c` is not limited at
+    all, a range being the point of it). "POSIX's limit" is right for four of
+    the five and NOT for `l`, which POSIX.1 defines as `[2addr]l` -- the limit
+    there is GNU's posix-mode behaviour rather than the standard's, measured
+    from the oracle and not inferred from the spec.
+    Almost none of that needed a new message: withdrawing the EXTENSION leaves
+    the parser's ordinary complaint, and GNU's wording is the ordinary
+    complaint too, which is why `--posix '1~2d'` is `unknown command: `~''
+    rather than anything about steps. Its REPLACEMENT
+    half is implemented, and existed only because a review asked what the
+    two-half split left out -- "regex half" and "command half" sound
+    exhaustive and are not, which is a reminder that a tidy taxonomy is a
+    claim like any other. It is two rules: `\U`, `\L`, `\u`, `\l` and `\E`
+    become the LITERAL letter (`s/a/\Ux/` substitutes `Ux`), and a group
+    reference the pattern does not have stops being the error `invalid
+    reference \1 on `s' command's RHS` and expands to nothing instead. That
+    second one is the only `--posix` rule anywhere that turns a REFUSAL into
+    an answer rather than an operator into a character, and nothing but a
+    sweep of the replacement would have found it.
+    `POSIXLY_CORRECT` selects a POSIX mode in GNU too, but a WEAKER one, and
+    td-txt does not drive this flag from it at all; that is its own entry
+    below. GNU refuses `v` outright under the flag (`unknown command: `v'`)
+    while clearing posix mode is `v`'s documented side effect when it is
+    allowed -- neither of which td-txt has anywhere to put until the mode
+    exists.
 
   - WHEN a script part is compiled relative to the OPTIONS around it. GNU compiles
     each `-e` and `-f` as it scans the command line, so a flag that follows one is
@@ -928,12 +975,20 @@ td-txt-authored case files
   - `POSIXLY_CORRECT` selects a POSIX MODE in GNU sed, on top of the option
     order it now decides. td-txt does not drive its `--posix` flag from the
     variable, and the reason is measured rather than assumed: across 200
-    script/input probes the two spellings DISAGREE on 76 of them, and every
-    PURE disagreement is the same shape -- `POSIXLY_CORRECT` behaves like the
-    default while `--posix` refuses a GNU extension outright (`1~2d`, `0~2p`,
-    `l 5`, `v`). (A third class exists and is rarer: a script combining a
-    refused extension with a shared rule, like `N;s/^b$/X/M`, differs all three
-    ways.) So `--posix` is the strictly stronger switch, and wiring one flag to
+    script/input probes the two spellings DISAGREE on 76 of them. The
+    COMMONEST shape is `POSIXLY_CORRECT` behaving like the default while
+    `--posix` refuses a GNU extension outright (`1~2d`, `0~2p`, `l 5`, `v`).
+    An earlier draft said EVERY pure disagreement had that shape; measuring the
+    rules this campaign added shows it does not, and the split runs THROUGH a
+    rule rather than between rules. `POSIXLY_CORRECT` follows `--posix` for the
+    unmatched `\)`, for the bracket escape suppression, and for the
+    out-of-range group reference; it follows the DEFAULT for `\|`, `\w` and
+    the replacement's case operators. So within the operator family the
+    RELAXATION is shared and the DROPS are not, and td-txt -- which wires the
+    variable to nothing -- is on the default side of all three shared ones.
+    (A further class is rarer still: a script combining a refused extension
+    with a shared rule, like `N;s/^b$/X/M`, differs all three ways.) So
+    `--posix` is the strictly stronger switch, and wiring one flag to
     both would make td-txt refuse, under a variable build systems routinely
     set, scripts GNU accepts -- as soon as any `--posix` refusal is
     implemented. It would also regress `v` TODAY: GNU's `v` CLEARS posix mode,
@@ -953,12 +1008,119 @@ td-txt-authored case files
     REFUSED at exit 1 here, a worse failure than a wrong line. Closing it wants
     a second flag for the shared behaviours, not a rename of this one.
 
-  - `sed --posix` relaxes the BRE `\)` as well as the ERE `)`, and td-txt
-    relaxes only the ERE one, so `sed --posix 's/a\)/X/'` runs in GNU and is
-    refused at exit 1 here. The one rule the flag DOES implement turns out to
-    be half a rule. Found while measuring the entry above; it is the flag's
-    gap, not the variable's, and the second-flag landing has this to implement
-    too.
+  - `--posix`'s bracket suppression carries across a closed sub-expression in
+    a way td-txt does not model. `sed --posix 's/[::][]\x41]/Z/g'` has GNU
+    suppress the SECOND bracket entirely -- class {], \, x, 4, 1} -- where the
+    same `[]\x41]` standing alone stops at its leading `]` in both tools, which
+    is the rule the passing cases pin. So GNU carries some state across the
+    first bracket, and what it is cannot be read off from the outside; a rule
+    guessed to fit this one shape would be worse than the gap. The `.` and `=`
+    spellings behave IDENTICALLY -- GNU suppresses, td-txt decodes -- so the one
+    xfail witnesses a family of three; they are not separately cased. Both an
+    earlier draft here and a reviewer got that wrong in opposite directions (it
+    said GNU matches nothing; the review said the two agree), each from a
+    fixture with no line the `.`/`=` spellings could match. The same trap, twice
+    over, from two directions. Found by a reviewer, and the three neighbouring
+    shapes flagged with
+    it (`[[:]\x41]`, `[[.]\x41]`, `[[=]\x41]`) are NOT divergences: both tools
+    refuse all three, differing only in the missing `char N:` offset -- which is
+    a reminder to normalise that before believing a stderr comparison.
+
+  - `#n` is a PREFIX rule in GNU, not a whole-line one. POSIX says the default
+    output is suppressed if the first two characters of the script are `#n`;
+    td-txt additionally requires a newline or end of script after them, so
+    `sed '#nx'` prints nothing in GNU and echoes its input here (`#xn`
+    suppresses in neither -- it must be the first two bytes). A WRONG ANSWER
+    rather than a refusal, which makes it the more serious of the gaps recorded
+    here; both modes, predates the branch. Found by a reviewer fuzzing around
+    `--posix`.
+
+  - An address left dangling at the end of an `-e` part: `sed -e '2' -e 'p'` is
+    `missing command` in GNU and `unknown command: `\n'` here. Both modes,
+    predates the branch, exit 1 either way -- same family as the other
+    diagnostic-wording gaps above.
+
+  - A bare address 0 is legal in GNU for exactly ONE command, `r`: `sed '0r F'`
+    prepends F, which is what the address is FOR outside a `0,/re/` range.
+    Every other command refuses it (`0R`, `0w`, `0p`, `0d`, `0=`, `0a` all say
+    `invalid usage of line address 0`), and `--posix '0r F'` refuses too. td-txt
+    refuses in both modes, so this is fail-CLOSED and predates the branch;
+    closing it means deferring the address-0 check until the command letter is
+    known, which is where GNU makes it. One knock-on this branch DID change:
+    `0~0r F` used to do nothing silently and now takes the refusal -- still not
+    GNU's answer, but no longer a silent no-op. Found by a reviewer, and it is
+    why the claim that GNU takes address 0 "only" with a regex range end is
+    wrong: it takes it with `r` as well.
+
+  - `s//\N/` -- the empty regex reusing the last one -- is unchecked here and
+    only half-unchecked in GNU: `/\(a\)/s//\2/` and `/a/s//\1/` are refused
+    there (at `char 0`, so it is the command's OWN address regex being
+    consulted) and expand to empty here, while `s/\(a\)/x/;s//\2/`, where the
+    last regex came from an EARLIER command, is accepted by both. Predates the
+    branch. Found because a review caught a comment claiming both tools always
+    expand it empty -- which was what my own probe showed, the probe having
+    reused a group-LESS regex and so never reaching the case that matters.
+
+  - A diagnostic locates a `-f` script differently: GNU says `file s line 2:`
+    where td-txt says `-e expression #1:`, so a refusal inside a `-f` script
+    names neither the file nor the line. Same family as the missing `char N:`
+    offset, and the corpus cases for `--posix`'s text-continuation rule assert
+    by substring because of it.
+
+  - `sed -e '1a\<newline>foo' -e 'bar'` is `can't find label for jump to `ar''
+    in GNU and `can't operate on label `ar'` here -- the same refusal, worded
+    differently. Both modes, predates the branch.
+
+  - Five divergences a sweep of every command letter x {bare, addressed,
+    ranged} x {flag, no flag} turned up, none of them about `--posix` and all
+    of them predating this branch, recorded here because that sweep is how the
+    one-address rule above was found and these came with it:
+    an ADDRESSED comment (`sed '1#'`) is `comments don't accept any addresses`
+    in GNU and accepted here, which is fail-open; a leading `+` or `~` is
+    its own family, understated in an earlier draft of this entry and set out
+    separately below; a bare `\` is
+    `unterminated address regex` there and `unterminated address` here; the
+    usage line after a bad option is `Usage: sed [OPTION]...` there and
+    `usage: sed [-nrEsz]...` here, differing in capital and in content; and
+    `sed L` is `sed: INTERNAL ERROR: Bad cmd L` at exit 4 in GNU, an obsolete
+    command left in its table, where td-txt says `unknown command: `L''.
+
+  - A leading `+` or `~` is THREE answers in GNU, not one, and only the first
+    is the diagnostic-wording gap an earlier draft above called it. GNU's
+    `compile_address` absorbs a `+`/`~` whose number is ABSENT and reports
+    "not an address", so the rest of the script runs: `sed '+p'` and `sed '~p'`
+    exit 0 having printed every line twice, where td-txt refuses -- a
+    behavioural divergence, not wording. With a number it is a third message
+    td-txt has no spelling of at all: `sed '+2p'` is `invalid usage of +N or
+    ~N as first address`. Only the bare `sed '+'` is the `missing command` vs
+    `unknown command` wording difference. All of it predates the branch and is
+    identical on the branch point; the entry is corrected because a reviewer
+    measured what the earlier wording had asserted.
+
+  - Address NUMBERS overflow differently. GNU's `in_integer` accumulates into a
+    signed counter that WRAPS; `parse_number` here saturates. So
+    `sed -n '1,+18446744073709551616p'` is `+0` in GNU (printing line 1 alone)
+    and a range that never ends here, and a line address of 2^64 wraps to 0 in
+    GNU -- `invalid usage of line address 0` -- where it saturates to a line
+    number no file reaches here, and the script is a silent no-op. Predates the
+    branch. It sits exactly where this landing's cited model -- GNU reads all
+    three number spellings with `in_integer(in_nonblank())` -- stops being
+    followed, which is why it is recorded beside it.
+
+  - An unterminated `\{` after a QUANTIFIED atom picks the other complaint:
+    `sed 's/a*\{b/Z/'` is `Invalid preceding regular expression` in GNU and
+    `Unmatched \{` here, while `sed 's/a\{b/Z/'` -- no quantifier -- is
+    `Unmatched \{` in both. So it is the stacking error outranking the
+    unterminated-brace one, not the brace wording. Identical with and without
+    `--posix`, and every rule on this branch is posix-gated, which is what
+    places it before the branch rather than in it.
+
+  - `sed -E 's/a*\B/X/'` over a line `ba` selects `baX` in GNU and `bXa` here:
+    a starred atom followed by an assertion picks a different empty match.
+    Predates this campaign -- byte-identical on a build of the branch point --
+    and found by a reviewer fuzzing ERE patterns rather than by any sweep here,
+    which is the argument for the fuzz: 2918 random EREs turned up exactly this
+    one, and no hand-written probe had the shape.
 
   - A PERMUTED multi-digit `-NUM` loses its FIRST digit in GNU, and td-txt
     keeps the whole run. Deliberate. `grep MATCH f -12 -A0` takes two lines of

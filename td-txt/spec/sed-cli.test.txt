@@ -6510,3 +6510,1126 @@ a
 ## stdout-json: "b\n"
 ## stderr-json: ""
 ## status: 0
+
+# ---- --posix drops the BRE GNU extensions ---------------------------------
+
+#### --posix drops the BRE alternation extension, making the bar ordinary
+# POSIX BRE has no alternation; `\|' is GNU's. Under --posix the whole escape
+# is the LITERAL character, so this matches the text `a|b' and nothing else --
+# the shape of every rule in this family: not refused, read as the character.
+# Three harness traps this block was written wrong for first, each caught by
+# MUTATION rather than by review: an unquoted backslash in a `## argv:' line
+# is an escape the harness eats (hence the quotes); a script with no FILE
+# operand reads empty stdin, so every golden came out empty and every case
+# vacuous; and the fixture needs a line each operator can tell apart, or the
+# case passes whatever the code does. A fourth trap outlived all three and is
+# why `aa' is in the fixture -- see the interval and backreference cases at
+# the end of the block. The fixture also carries a line for every operator's
+# LITERAL spelling -- `aW', `aS', `aB', a backtick, an apostrophe -- because
+# an operator whose literal has nothing to match asserts nothing either.
+## argv: sed --posix 's/a\|b/X/' h
+## file-json h: "a\nab\na|b\na+\na?\naw\n<a>\na)\na b\nas\naa\naW\naS\naB\n`a\nb'\n"
+## stdout-json: "a\nab\nX\na+\na?\naw\n<a>\na)\na b\nas\naa\naW\naS\naB\n`a\nb'\n"
+## stderr-json: ""
+## status: 0
+
+#### and without the flag it is alternation, as it always was
+## argv: sed 's/a\|b/X/' h
+## file-json h: "a\nab\na|b\na+\na?\naw\n<a>\na)\na b\nas\naa\naW\naS\naB\n`a\nb'\n"
+## stdout-json: "X\nXb\nX|b\nX+\nX?\nXw\n<X>\nX)\nX b\nXs\nXa\nXW\nXS\nXB\n`X\nX'\n"
+## stderr-json: ""
+## status: 0
+
+#### --posix drops the one-or-more operator
+## argv: sed --posix 's/a\+/X/' h
+## file-json h: "a\nab\na|b\na+\na?\naw\n<a>\na)\na b\nas\naa\naW\naS\naB\n`a\nb'\n"
+## stdout-json: "a\nab\na|b\nX\na?\naw\n<a>\na)\na b\nas\naa\naW\naS\naB\n`a\nb'\n"
+## stderr-json: ""
+## status: 0
+
+#### and the optional operator with it
+## argv: sed --posix 's/a\?/X/' h
+## file-json h: "a\nab\na|b\na+\na?\naw\n<a>\na)\na b\nas\naa\naW\naS\naB\n`a\nb'\n"
+## stdout-json: "a\nab\na|b\na+\nX\naw\n<a>\na)\na b\nas\naa\naW\naS\naB\n`a\nb'\n"
+## stderr-json: ""
+## status: 0
+
+#### --posix drops the word-character class
+## argv: sed --posix 's/\w/X/' h
+## file-json h: "a\nab\na|b\na+\na?\naw\n<a>\na)\na b\nas\naa\naW\naS\naB\n`a\nb'\n"
+## stdout-json: "a\nab\na|b\na+\na?\naX\n<a>\na)\na b\nas\naa\naW\naS\naB\n`a\nb'\n"
+## stderr-json: ""
+## status: 0
+
+#### and its negation
+## argv: sed --posix 's/\W/X/' h
+## file-json h: "a\nab\na|b\na+\na?\naw\n<a>\na)\na b\nas\naa\naW\naS\naB\n`a\nb'\n"
+## stdout-json: "a\nab\na|b\na+\na?\naw\n<a>\na)\na b\nas\naa\naX\naS\naB\n`a\nb'\n"
+## stderr-json: ""
+## status: 0
+
+#### --posix drops the whitespace class
+## argv: sed --posix 's/\s/X/' h
+## file-json h: "a\nab\na|b\na+\na?\naw\n<a>\na)\na b\nas\naa\naW\naS\naB\n`a\nb'\n"
+## stdout-json: "a\nab\na|b\na+\na?\naw\n<a>\na)\na b\naX\naa\naW\naS\naB\n`a\nb'\n"
+## stderr-json: ""
+## status: 0
+
+#### and its negation too
+## argv: sed --posix 's/\S/X/' h
+## file-json h: "a\nab\na|b\na+\na?\naw\n<a>\na)\na b\nas\naa\naW\naS\naB\n`a\nb'\n"
+## stdout-json: "a\nab\na|b\na+\na?\naw\n<a>\na)\na b\nas\naa\naW\naX\naB\n`a\nb'\n"
+## stderr-json: ""
+## status: 0
+
+#### --posix drops the word-boundary assertion
+## argv: sed --posix 's/\b/X/' h
+## file-json h: "a\nab\na|b\na+\na?\naw\n<a>\na)\na b\nas\naa\naW\naS\naB\n`a\nb'\n"
+## stdout-json: "a\naX\na|X\na+\na?\naw\n<a>\na)\na X\nas\naa\naW\naS\naB\n`a\nX'\n"
+## stderr-json: ""
+## status: 0
+
+#### and its negation as well
+## argv: sed --posix 's/\B/X/' h
+## file-json h: "a\nab\na|b\na+\na?\naw\n<a>\na)\na b\nas\naa\naW\naS\naB\n`a\nb'\n"
+## stdout-json: "a\nab\na|b\na+\na?\naw\n<a>\na)\na b\nas\naa\naW\naS\naX\n`a\nb'\n"
+## stderr-json: ""
+## status: 0
+
+#### --posix drops the word-edge assertions
+## argv: sed --posix 's/\<a/X/' h
+## file-json h: "a\nab\na|b\na+\na?\naw\n<a>\na)\na b\nas\naa\naW\naS\naB\n`a\nb'\n"
+## stdout-json: "a\nab\na|b\na+\na?\naw\nX>\na)\na b\nas\naa\naW\naS\naB\n`a\nb'\n"
+## stderr-json: ""
+## status: 0
+
+#### and the closing edge with it
+## argv: sed --posix 's/a\>/X/' h
+## file-json h: "a\nab\na|b\na+\na?\naw\n<a>\na)\na b\nas\naa\naW\naS\naB\n`a\nb'\n"
+## stdout-json: "a\nab\na|b\na+\na?\naw\n<X\na)\na b\nas\naa\naW\naS\naB\n`a\nb'\n"
+## stderr-json: ""
+## status: 0
+
+#### --posix drops the buffer-start anchor
+## argv: sed --posix 's/\`a/X/' h
+## file-json h: "a\nab\na|b\na+\na?\naw\n<a>\na)\na b\nas\naa\naW\naS\naB\n`a\nb'\n"
+## stdout-json: "a\nab\na|b\na+\na?\naw\n<a>\na)\na b\nas\naa\naW\naS\naB\nX\nb'\n"
+## stderr-json: ""
+## status: 0
+
+#### and the buffer-end anchor
+## argv: sed --posix 's/b\'"'"'/X/' h
+## file-json h: "a\nab\na|b\na+\na?\naw\n<a>\na)\na b\nas\naa\naW\naS\naB\n`a\nb'\n"
+## stdout-json: "a\nab\na|b\na+\na?\naw\n<a>\na)\na b\nas\naa\naW\naS\naB\n`a\nX\n"
+## stderr-json: ""
+## status: 0
+
+#### --posix makes an unmatched BRE close-paren ordinary too
+# The ERE `)' was already ordinary under the flag; the BRE `\)' is the same
+# rule in the other spelling, and both tools refuse it without the flag.
+## argv: sed --posix 's/a\)/X/' h
+## file-json h: "a\nab\na|b\na+\na?\naw\n<a>\na)\na b\nas\naa\naW\naS\naB\n`a\nb'\n"
+## stdout-json: "a\nab\na|b\na+\na?\naw\n<a>\nX\na b\nas\naa\naW\naS\naB\n`a\nb'\n"
+## stderr-json: ""
+## status: 0
+
+#### and that spelling is still refused without the flag
+# GNU names the character offset and td-txt does not, a pre-existing
+# omission, so the wording is asserted by substring; the REFUSAL is the
+# point.
+## argv: sed 's/a\)/X/' h
+## file-json h: "a\nab\na|b\na+\na?\naw\n<a>\na)\na b\nas\naa\naW\naS\naB\n`a\nb'\n"
+## stdout-json: ""
+## stderr-contains: Unmatched ) or \)
+## status: 1
+
+#### but a POSIX group still groups under the flag
+## argv: sed --posix 's/\(a\)/X/' h
+## file-json h: "a\nab\na|b\na+\na?\naw\n<a>\na)\na b\nas\naa\naW\naS\naB\n`a\nb'\n"
+## stdout-json: "X\nXb\nX|b\nX+\nX?\nXw\n<X>\nX)\nX b\nXs\nXa\nXW\nXS\nXB\n`X\nb'\n"
+## stderr-json: ""
+## status: 0
+
+#### and a POSIX interval is still an interval
+# The fixture carries `aa' for this case and the next. Without it the
+# golden was the input unchanged, and a mutation making `\{'/`\}' literal
+# under the flag passed this case verbatim -- it asserted nothing about
+# intervals at all. Found by a reviewer running exactly that mutation.
+## argv: sed --posix 's/a\{2\}/X/' h
+## file-json h: "a\nab\na|b\na+\na?\naw\n<a>\na)\na b\nas\naa\naW\naS\naB\n`a\nb'\n"
+## stdout-json: "a\nab\na|b\na+\na?\naw\n<a>\na)\na b\nas\nX\naW\naS\naB\n`a\nb'\n"
+## stderr-json: ""
+## status: 0
+
+#### and a backreference still refers
+# Vacuous for the same reason until `aa' arrived: a mutant reading `\1' as
+# a literal digit under the flag reddened NOTHING in the whole corpus.
+## argv: sed --posix 's/\(a\)\1/X/' h
+## file-json h: "a\nab\na|b\na+\na?\naw\n<a>\na)\na b\nas\naa\naW\naS\naB\n`a\nb'\n"
+## stdout-json: "a\nab\na|b\na+\na?\naw\n<a>\na)\na b\nas\nX\naW\naS\naB\n`a\nb'\n"
+## stderr-json: ""
+## status: 0
+
+# ---- --posix stops escape decoding inside a bracket -----------------------
+
+#### --posix stops decoding inside a bracket expression
+# GNU decodes `\x41' to an `A' before compiling, so plainly this class is
+# {A}. Under --posix the decoding does not happen INSIDE a bracket, and
+# the four raw bytes are four ordinary members: `\', `x', `4', `1'.
+## argv: sed --posix 's/[\x41]/Z/g' h
+## file-json h: "A\nx\n4\n1\n\\\nn\nd\no\n0\n6\n5\n7\n2\na\nz\n]\n[\nq\nqA\nqx\n.x41\n.A\n=x41\n=A\n"
+## stdout-json: "A\nZ\nZ\nZ\nZ\nn\nd\no\n0\n6\n5\n7\n2\na\nz\n]\n[\nq\nqA\nqZ\n.ZZZ\n.A\n=ZZZ\n=A\n"
+## stderr-json: ""
+## status: 0
+
+#### and without the flag the same class is the decoded byte
+## argv: sed 's/[\x41]/Z/g' h
+## file-json h: "A\nx\n4\n1\n\\\nn\nd\no\n0\n6\n5\n7\n2\na\nz\n]\n[\nq\nqA\nqx\n.x41\n.A\n=x41\n=A\n"
+## stdout-json: "Z\nx\n4\n1\n\\\nn\nd\no\n0\n6\n5\n7\n2\na\nz\n]\n[\nq\nqZ\nqx\n.x41\n.Z\n=x41\n=Z\n"
+## stderr-json: ""
+## status: 0
+
+#### the octal spelling stops with it
+## argv: sed --posix 's/[\o101]/Z/g' h
+## file-json h: "A\nx\n4\n1\n\\\nn\nd\no\n0\n6\n5\n7\n2\na\nz\n]\n[\nq\nqA\nqx\n.x41\n.A\n=x41\n=A\n"
+## stdout-json: "A\nx\n4\nZ\nZ\nn\nd\nZ\nZ\n6\n5\n7\n2\na\nz\n]\n[\nq\nqA\nqx\n.x4Z\n.A\n=x4Z\n=A\n"
+## stderr-json: ""
+## status: 0
+
+#### and the decimal one
+## argv: sed --posix 's/[\d065]/Z/g' h
+## file-json h: "A\nx\n4\n1\n\\\nn\nd\no\n0\n6\n5\n7\n2\na\nz\n]\n[\nq\nqA\nqx\n.x41\n.A\n=x41\n=A\n"
+## stdout-json: "A\nx\n4\n1\nZ\nn\nZ\no\nZ\nZ\nZ\n7\n2\na\nz\n]\n[\nq\nqA\nqx\n.x41\n.A\n=x41\n=A\n"
+## stderr-json: ""
+## status: 0
+
+#### a C escape inside a bracket is its two characters under the flag
+# `[\n]' is the newline class plainly -- which no line of input can hold
+# -- and the members `\' and `n' under --posix.
+## argv: sed --posix 's/[\n]/Z/g' h
+## file-json h: "A\nx\n4\n1\n\\\nn\nd\no\n0\n6\n5\n7\n2\na\nz\n]\n[\nq\nqA\nqx\n.x41\n.A\n=x41\n=A\n"
+## stdout-json: "A\nx\n4\n1\nZ\nZ\nd\no\n0\n6\n5\n7\n2\na\nz\n]\n[\nq\nqA\nqx\n.x41\n.A\n=x41\n=A\n"
+## stderr-json: ""
+## status: 0
+
+#### a decoded byte cannot make a RANGE under the flag
+# `[A\x2d\x7a]' is the range A-z plainly. Under --posix no `-' is ever
+# produced, so the class is the seven literal bytes instead.
+## argv: sed --posix 's/[A\x2d\x7a]/Z/g' h
+## file-json h: "A\nx\n4\n1\n\\\nn\nd\no\n0\n6\n5\n7\n2\na\nz\n]\n[\nq\nqA\nqx\n.x41\n.A\n=x41\n=A\n"
+## stdout-json: "Z\nZ\n4\n1\nZ\nn\nZ\no\n0\n6\n5\nZ\nZ\nZ\nz\n]\n[\nq\nqZ\nqZ\n.Z41\n.Z\n=Z41\n=Z\n"
+## stderr-json: ""
+## status: 0
+
+#### and a negated class suppresses the same way
+## argv: sed --posix 's/[^\x41]/Z/g' h
+## file-json h: "A\nx\n4\n1\n\\\nn\nd\no\n0\n6\n5\n7\n2\na\nz\n]\n[\nq\nqA\nqx\n.x41\n.A\n=x41\n=A\n"
+## stdout-json: "Z\nx\n4\n1\n\\\nZ\nZ\nZ\nZ\nZ\nZ\nZ\nZ\nZ\nZ\nZ\nZ\nZ\nZZ\nZx\nZx41\nZZ\nZx41\nZZ\n"
+## stderr-json: ""
+## status: 0
+
+#### but the suppression is judged on the RAW `[', not a decoded one
+# Why the scan reads the pattern TEXT rather than its own output: an
+# opening bracket that is itself an escape opens nothing, so `\x5b\x41]'
+# decodes under --posix exactly as it does without it. --posix does not
+# change GNU's answer here, so only MUTATION shows this holds: suppress
+# on the decoded `[' instead and this case reds.
+## argv: sed --posix 's/\x5b\x41]/Z/g' h
+## file-json h: "A\nx\n4\n1\n\\\nn\nd\no\n0\n6\n5\n7\n2\na\nz\n]\n[\nq\nqA\nqx\n.x41\n.A\n=x41\n=A\n"
+## stdout-json: "Z\nx\n4\n1\n\\\nn\nd\no\n0\n6\n5\n7\n2\na\nz\n]\n[\nq\nqZ\nqx\n.x41\n.Z\n=x41\n=Z\n"
+## stderr-json: ""
+## status: 0
+
+#### and the suppressed region ends at the FIRST `]', not where POSIX ends it
+# The scan is not a bracket parse and must not become one. POSIX makes a
+# LEADING `]' an ordinary member, so this class really runs to the second
+# one -- but GNU stops suppressing at the first, the `\x41' after it
+# decodes anyway, and the class is {], A}. Again --posix does not change
+# GNU's answer; honouring the leading `]' is what reds this case.
+## argv: sed --posix 's/[]\x41]/Z/g' h
+## file-json h: "A\nx\n4\n1\n\\\nn\nd\no\n0\n6\n5\n7\n2\na\nz\n]\n[\nq\nqA\nqx\n.x41\n.A\n=x41\n=A\n"
+## stdout-json: "Z\nx\n4\n1\n\\\nn\nd\no\n0\n6\n5\n7\n2\na\nz\nZ\n[\nq\nqZ\nqx\n.x41\n.Z\n=x41\n=Z\n"
+## stderr-json: ""
+## status: 0
+
+#### while a class-name sub-bracket does NOT end it early
+# The other direction of the same rule: `[:digit:]' carries a `]' of its
+# own and that one closes nothing. A scan stopping there would resume
+# decoding inside the class and turn the `\x41' back into an `A'.
+## argv: sed --posix 's/[[:digit:]\x41]/Z/g' h
+## file-json h: "A\nx\n4\n1\n\\\nn\nd\no\n0\n6\n5\n7\n2\na\nz\n]\n[\nq\nqA\nqx\n.x41\n.A\n=x41\n=A\n"
+## stdout-json: "A\nZ\nZ\nZ\nZ\nn\nd\no\nZ\nZ\nZ\nZ\nZ\na\nz\n]\n[\nq\nqA\nqZ\n.ZZZ\n.A\n=ZZZ\n=A\n"
+## stderr-json: ""
+## status: 0
+
+#### a collating sub-bracket keeps it open too
+## argv: sed --posix 's/[[.a.]\x41]/Z/g' h
+## file-json h: "A\nx\n4\n1\n\\\nn\nd\no\n0\n6\n5\n7\n2\na\nz\n]\n[\nq\nqA\nqx\n.x41\n.A\n=x41\n=A\n"
+## stdout-json: "A\nZ\nZ\nZ\nZ\nn\nd\no\n0\n6\n5\n7\n2\nZ\nz\n]\n[\nq\nqA\nqZ\n.ZZZ\n.A\n=ZZZ\n=A\n"
+## stderr-json: ""
+## status: 0
+
+#### and an equivalence-class one
+## argv: sed --posix 's/[[=a=]\x41]/Z/g' h
+## file-json h: "A\nx\n4\n1\n\\\nn\nd\no\n0\n6\n5\n7\n2\na\nz\n]\n[\nq\nqA\nqx\n.x41\n.A\n=x41\n=A\n"
+## stdout-json: "A\nZ\nZ\nZ\nZ\nn\nd\no\n0\n6\n5\n7\n2\nZ\nz\n]\n[\nq\nqA\nqZ\n.ZZZ\n.A\n=ZZZ\n=A\n"
+## stderr-json: ""
+## status: 0
+
+#### the bracket's OWN `[' can open a sub-expression, and then it carries on
+# `[.]' is a collating element, not the empty class, so the `\x41' after it
+# is still suppressed -- where `[x]\x41' would have ended at the `]'. I got
+# this wrong first: `copy_bracket' began scanning AFTER the opening bracket,
+# so the one pair GNU sees that nothing else does was the one pair it could
+# not see. Found by a reviewer, not by the sweep, which had no pattern of
+# this shape in it.
+## argv: sed --posix 's/[.]\x41/Z/g' h
+## file-json h: "A\nx\n4\n1\n\\\nn\nd\no\n0\n6\n5\n7\n2\na\nz\n]\n[\nq\nqA\nqx\n.x41\n.A\n=x41\n=A\n"
+## stdout-json: "A\nx\n4\n1\n\\\nn\nd\no\n0\n6\n5\n7\n2\na\nz\n]\n[\nq\nqA\nqx\nZ\n.A\n=x41\n=A\n"
+## stderr-json: ""
+## status: 0
+
+#### the `=' spelling of the same thing
+## argv: sed --posix 's/[=a=]\x41/Z/g' h
+## file-json h: "A\nx\n4\n1\n\\\nn\nd\no\n0\n6\n5\n7\n2\na\nz\n]\n[\nq\nqA\nqx\n.x41\n.A\n=x41\n=A\n"
+## stdout-json: "A\nx\n4\n1\n\\\nn\nd\no\n0\n6\n5\n7\n2\na\nz\n]\n[\nq\nqA\nqx\n.x41\n.A\nZ\n=A\n"
+## stderr-json: ""
+## status: 0
+
+#### and a sub-expression ends at the NEXT `]', not at its own `.]'
+# `[[.].]' is a collating element holding a `]'. POSIX ends it at the `.]'
+# and GNU's suppression does not: it ends at the `]' right after the `[.',
+# so the class is {], A} and the `\x41' decoded. Scanning for the `.]'
+# instead is what reds this case; --posix does not change GNU's answer.
+## argv: sed --posix 's/[[.].]\x41]/Z/g' h
+## file-json h: "A\nx\n4\n1\n\\\nn\nd\no\n0\n6\n5\n7\n2\na\nz\n]\n[\nq\nqA\nqx\n.x41\n.A\n=x41\n=A\n"
+## stdout-json: "Z\nx\n4\n1\n\\\nn\nd\no\n0\n6\n5\n7\n2\na\nz\nZ\n[\nq\nqZ\nqx\n.x41\n.Z\n=x41\n=Z\n"
+## stderr-json: ""
+## status: 0
+
+#### decoding resumes once the bracket closes
+## argv: sed --posix 's/[qz]\x41/Z/g' h
+## file-json h: "A\nx\n4\n1\n\\\nn\nd\no\n0\n6\n5\n7\n2\na\nz\n]\n[\nq\nqA\nqx\n.x41\n.A\n=x41\n=A\n"
+## stdout-json: "A\nx\n4\n1\n\\\nn\nd\no\n0\n6\n5\n7\n2\na\nz\n]\n[\nq\nZ\nqx\n.x41\n.A\n=x41\n=A\n"
+## stderr-json: ""
+## status: 0
+
+#### outside a bracket the escape still decodes under the flag
+# The guard against suppressing too much: --posix drops the decoding only
+# INSIDE a bracket, so this is still the byte `A'.
+## argv: sed --posix 's/\x41/Z/g' h
+## file-json h: "A\nx\n4\n1\n\\\nn\nd\no\n0\n6\n5\n7\n2\na\nz\n]\n[\nq\nqA\nqx\n.x41\n.A\n=x41\n=A\n"
+## stdout-json: "Z\nx\n4\n1\n\\\nn\nd\no\n0\n6\n5\n7\n2\na\nz\n]\n[\nq\nqZ\nqx\n.x41\n.Z\n=x41\n=Z\n"
+## stderr-json: ""
+## status: 0
+
+#### and the REPLACEMENT still decodes under the flag too
+## argv: sed --posix 's/q/\x42/' h
+## file-json h: "A\nx\n4\n1\n\\\nn\nd\no\n0\n6\n5\n7\n2\na\nz\n]\n[\nq\nqA\nqx\n.x41\n.A\n=x41\n=A\n"
+## stdout-json: "A\nx\n4\n1\n\\\nn\nd\no\n0\n6\n5\n7\n2\na\nz\n]\n[\nB\nBA\nBx\n.x41\n.A\n=x41\n=A\n"
+## stderr-json: ""
+## status: 0
+
+#### --posix: a bracket AFTER a closed sub-expression keeps suppressing
+# The one shape of this rule td-txt does not model, carrying GNU's golden as an
+# xfail. Standalone, `[]\x41]' stops suppressing at its leading `]' -- the case
+# above pins that. Here the same bracket follows a closed `[::]' and GNU does
+# NOT stop: its class is {], \, x, 4, 1} where td-txt's is {], A}. Which state
+# GNU carries across the first bracket is not derivable from the outside, and
+# guessing a rule that fits one shape would be worse than recording it. Found by
+# a reviewer; three neighbouring shapes it also flagged (`[[:]\x41]' and the
+# `.'/`=' spellings) turned out to be refusals in BOTH, differing only in the
+# pre-existing missing `char N:' offset.
+## argv: sed --posix 's/[::][]\x41]/Z/g' h
+## file-json h: ":A\n:x\n:4\n:]\n"
+## stdout-json: ":A\nZ\nZ\nZ\n"
+## stderr-json: ""
+## status: 0
+
+# ---- --posix in the REPLACEMENT -------------------------------------------
+
+#### --posix drops the case-conversion operators from a replacement
+# GNU's third `--posix' rule, after the compiler's and the one in
+# `normalize_regex'. `\U' is not an operator under the flag: the backslash
+# is shed and the LETTER kept, so this substitutes the text `Ux'. That is
+# exactly what an escape GNU does not know already does (`\z' is `z'), so
+# the five need no arm of their own -- they only need to stop having one.
+## argv: sed --posix 's/\(a\)b/\Ux/' h
+## file-json h: "abc\nABC\naBc\nxyz\n"
+## stdout-json: "Uxc\nABC\naBc\nxyz\n"
+## stderr-json: ""
+## status: 0
+
+#### and without the flag it upper-cases, as it always did
+## argv: sed 's/\(a\)b/\Ux/' h
+## file-json h: "abc\nABC\naBc\nxyz\n"
+## stdout-json: "Xc\nABC\naBc\nxyz\n"
+## stderr-json: ""
+## status: 0
+
+#### the lower-case run operator goes with it
+## argv: sed --posix 's/\(a\)b/\Lx/' h
+## file-json h: "abc\nABC\naBc\nxyz\n"
+## stdout-json: "Lxc\nABC\naBc\nxyz\n"
+## stderr-json: ""
+## status: 0
+
+#### and the one-character forms
+## argv: sed --posix 's/\(a\)b/\ux/' h
+## file-json h: "abc\nABC\naBc\nxyz\n"
+## stdout-json: "uxc\nABC\naBc\nxyz\n"
+## stderr-json: ""
+## status: 0
+
+#### both of them
+## argv: sed --posix 's/\(a\)b/\lx/' h
+## file-json h: "abc\nABC\naBc\nxyz\n"
+## stdout-json: "lxc\nABC\naBc\nxyz\n"
+## stderr-json: ""
+## status: 0
+
+#### and the terminator
+## argv: sed --posix 's/\(a\)b/\Ex/' h
+## file-json h: "abc\nABC\naBc\nxyz\n"
+## stdout-json: "Exc\nABC\naBc\nxyz\n"
+## stderr-json: ""
+## status: 0
+
+#### a whole run reads as its letters under the flag
+## argv: sed --posix 's/\(a\)\(b\)/\U&\E-/' h
+## file-json h: "abc\nABC\naBc\nxyz\n"
+## stdout-json: "UabE-c\nABC\naBc\nxyz\n"
+## stderr-json: ""
+## status: 0
+
+#### but a group reference still refers under the flag
+# The guard against dropping too much: only the five case operators go.
+## argv: sed --posix 's/\(a\)b/[\1]/' h
+## file-json h: "abc\nABC\naBc\nxyz\n"
+## stdout-json: "[a]c\nABC\naBc\nxyz\n"
+## stderr-json: ""
+## status: 0
+
+#### and the ampersand is still the whole match
+## argv: sed --posix 's/\(a\)b/[&]/' h
+## file-json h: "abc\nABC\naBc\nxyz\n"
+## stdout-json: "[ab]c\nABC\naBc\nxyz\n"
+## stderr-json: ""
+## status: 0
+
+#### and a decoded byte is still decoded
+## argv: sed --posix 's/\(a\)b/\x42/' h
+## file-json h: "abc\nABC\naBc\nxyz\n"
+## stdout-json: "Bc\nABC\naBc\nxyz\n"
+## stderr-json: ""
+## status: 0
+
+#### --posix also accepts a group reference the pattern does not have
+# GNU's fourth rule for the flag, and the only one that turns an ERROR
+# into an answer rather than an operator into a letter: `\1' with no group
+# to name is `invalid reference \1 on `s' command's RHS' normally, and
+# under --posix it is accepted and expands to nothing. Found by sweeping
+# the replacement rather than by reading the manual, which is how the
+# first three were found too.
+## argv: sed --posix 's/./\1/' h
+## file-json h: "abc\nABC\naBc\nxyz\n"
+## stdout-json: "bc\nBC\nBc\nyz\n"
+## stderr-json: ""
+## status: 0
+
+#### and that IS refused without the flag
+# GNU names the character offset and td-txt does not, a pre-existing
+# omission, so the wording is asserted by substring.
+## argv: sed 's/./\1/' h
+## file-json h: "abc\nABC\naBc\nxyz\n"
+## stdout-json: ""
+## stderr-contains: invalid reference \1 on `s' command's RHS
+## status: 1
+
+#### the same for a reference past the groups there are
+## argv: sed --posix 's/\(a\)/\2/' h
+## file-json h: "abc\nABC\naBc\nxyz\n"
+## stdout-json: "bc\nABC\nBc\nxyz\n"
+## stderr-json: ""
+## status: 0
+
+#### and for the highest one
+## argv: sed --posix 's/./\9/' h
+## file-json h: "abc\nABC\naBc\nxyz\n"
+## stdout-json: "bc\nBC\nBc\nyz\n"
+## stderr-json: ""
+## status: 0
+
+# ---- --posix withdraws the GNU commands -----------------------------------
+
+#### --posix withdraws the step address
+# `first~step' is GNU's. The `~' is simply not read under the flag, so the
+# refusal is the parser's ordinary one for a character that is not a
+# command -- which is how GNU words it too.
+## argv: sed --posix '1~2d' h
+## file-json h: "a\nb\nc\nd\nabc\n"
+## stdout-json: ""
+## stderr-contains: unknown command: `~'
+## status: 1
+
+#### and a step address starting at line 0 is the OTHER complaint
+# Address 0 is judged before the unread `~' can be met as a command, so
+# this is not `unknown command' -- GNU agrees, and the order is the case.
+## argv: sed --posix '0~2p' h
+## file-json h: "a\nb\nc\nd\nabc\n"
+## stdout-json: ""
+## stderr-contains: invalid usage of line address 0
+## status: 1
+
+#### --posix withdraws the +N range end
+## argv: sed --posix '2,+1d' h
+## file-json h: "a\nb\nc\nd\nabc\n"
+## stdout-json: ""
+## stderr-contains: unexpected `,'
+## status: 1
+
+#### and the ~N one
+## argv: sed --posix '2,~3d' h
+## file-json h: "a\nb\nc\nd\nabc\n"
+## stdout-json: ""
+## stderr-contains: unexpected `,'
+## status: 1
+
+#### --posix stops `/dev/stdout' aliasing the program's own stdout
+# GNU opens it as an ordinary, separately buffered file under the flag, so the
+# `w' output arrives in one group after the `p' output; here the two interleave.
+# xfail with GNU's golden. This was recorded as UNCASEABLE on the grounds that
+# the harness captures stdout -- it captures it through a pipe, which is the
+# very condition the divergence needs.
+## argv: sed '--posix' '-n' 'p;w /dev/stdout' h
+## file-json h: "1\n2\n3\n"
+## stdout-json: "1\n2\n3\n1\n2\n3\n"
+## stderr-json: ""
+## status: 0
+
+#### --posix withdraws line address 0 entirely
+# `0,/re/' is itself GNU's, so under the flag address 0 has no valid use.
+## argv: sed --posix '0,/b/d' h
+## file-json h: "a\nb\nc\nd\nabc\n"
+## stdout-json: ""
+## stderr-contains: invalid usage of line address 0
+## status: 1
+
+#### --posix withdraws l's width argument
+# The digit goes unread, and the leftover is what GNU reports.
+## argv: sed --posix 'l 5' h
+## file-json h: "a\nb\nc\nd\nabc\n"
+## stdout-json: ""
+## stderr-contains: extra characters after command
+## status: 1
+
+#### and q's exit code
+## argv: sed --posix 'q5' h
+## file-json h: "a\nb\nc\nd\nabc\n"
+## stdout-json: ""
+## stderr-contains: extra characters after command
+## status: 1
+
+#### --posix withdraws the one-line a text form
+# Only the POSIX `a\' continuation form is left.
+## argv: sed --posix '1a text' h
+## file-json h: "a\nb\nc\nd\nabc\n"
+## stdout-json: ""
+## stderr-contains: expected \ after `a', `c' or `i'
+## status: 1
+
+#### --posix withdraws s///I
+## argv: sed --posix 's/a/X/I' h
+## file-json h: "a\nb\nc\nd\nabc\n"
+## stdout-json: ""
+## stderr-contains: unknown option to `s'
+## status: 1
+
+#### and s///i, the lower-case spelling
+# Both spellings go, which the gap entry that recorded this did not say.
+## argv: sed --posix 's/a/X/i' h
+## file-json h: "a\nb\nc\nd\nabc\n"
+## stdout-json: ""
+## stderr-contains: unknown option to `s'
+## status: 1
+
+#### and s///M
+## argv: sed --posix 's/a/X/M' h
+## file-json h: "a\nb\nc\nd\nabc\n"
+## stdout-json: ""
+## stderr-contains: unknown option to `s'
+## status: 1
+
+#### and s///m
+## argv: sed --posix 's/a/X/m' h
+## file-json h: "a\nb\nc\nd\nabc\n"
+## stdout-json: ""
+## stderr-contains: unknown option to `s'
+## status: 1
+
+#### and the s///e flag
+# td-txt refuses `e' anyway, not shelling out at all -- but with its OWN
+# wording. Under the flag the wording has to be GNU's, because here the
+# flag is the reason.
+## argv: sed --posix 's/a/X/e' h
+## file-json h: "a\nb\nc\nd\nabc\n"
+## stdout-json: ""
+## stderr-contains: unknown option to `s'
+## status: 1
+
+#### --posix withdraws the v command
+## argv: sed --posix 'v' h
+## file-json h: "a\nb\nc\nd\nabc\n"
+## stdout-json: ""
+## stderr-contains: unknown command: `v'
+## status: 1
+
+#### and Q
+## argv: sed --posix '2Q' h
+## file-json h: "a\nb\nc\nd\nabc\n"
+## stdout-json: ""
+## stderr-contains: unknown command: `Q'
+## status: 1
+
+#### and T
+## argv: sed --posix 'T x;:x' h
+## file-json h: "a\nb\nc\nd\nabc\n"
+## stdout-json: ""
+## stderr-contains: unknown command: `T'
+## status: 1
+
+#### and z
+## argv: sed --posix 'z' h
+## file-json h: "a\nb\nc\nd\nabc\n"
+## stdout-json: ""
+## stderr-contains: unknown command: `z'
+## status: 1
+
+#### and F
+## argv: sed --posix 'F' h
+## file-json h: "a\nb\nc\nd\nabc\n"
+## stdout-json: ""
+## stderr-contains: unknown command: `F'
+## status: 1
+
+#### and W
+## argv: sed --posix 'W /dev/null' h
+## file-json h: "a\nb\nc\nd\nabc\n"
+## stdout-json: ""
+## stderr-contains: unknown command: `W'
+## status: 1
+
+#### and R
+## argv: sed --posix 'R /dev/null' h
+## file-json h: "a\nb\nc\nd\nabc\n"
+## stdout-json: ""
+## stderr-contains: unknown command: `R'
+## status: 1
+
+#### and the e command
+## argv: sed --posix 'e' h
+## file-json h: "a\nb\nc\nd\nabc\n"
+## stdout-json: ""
+## stderr-contains: unknown command: `e'
+## status: 1
+
+#### but q without a code still quits
+## argv: sed --posix '2q' h
+## file-json h: "a\nb\nc\nd\nabc\n"
+## stdout-json: "a\nb\n"
+## stderr-json: ""
+## status: 0
+
+#### and t is still a command, only T going
+## argv: sed --posix '1t x;:x;s/a/X/' h
+## file-json h: "a\nb\nc\nd\nabc\n"
+## stdout-json: "X\nb\nc\nd\nXbc\n"
+## stderr-json: ""
+## status: 0
+
+#### and a plain two-line range still deletes
+## argv: sed --posix '2,3d' h
+## file-json h: "a\nb\nc\nd\nabc\n"
+## stdout-json: "a\nd\nabc\n"
+## stderr-json: ""
+## status: 0
+
+#### and l without a width still lists
+## argv: sed --posix '2l' h
+## file-json h: "a\nb\nc\nd\nabc\n"
+## stdout-json: "a\nb$\nb\nc\nd\nabc\n"
+## stderr-json: ""
+## status: 0
+
+#### and the s flags POSIX defines still work
+## argv: sed --posix 's/a/X/g' h
+## file-json h: "a\nb\nc\nd\nabc\n"
+## stdout-json: "X\nb\nc\nd\nXbc\n"
+## stderr-json: ""
+## status: 0
+
+#### and a numeric occurrence flag with it
+## argv: sed --posix 's/./X/2' h
+## file-json h: "a\nb\nc\nd\nabc\n"
+## stdout-json: "a\nb\nc\nd\naXc\n"
+## stderr-json: ""
+## status: 0
+
+#### and the last-line address
+## argv: sed --posix '$d' h
+## file-json h: "a\nb\nc\nd\nabc\n"
+## stdout-json: "a\nb\nc\nd\n"
+## stderr-json: ""
+## status: 0
+
+#### and a regex range
+## argv: sed --posix '/b/,/c/d' h
+## file-json h: "a\nb\nc\nd\nabc\n"
+## stdout-json: "a\nd\n"
+## stderr-json: ""
+## status: 0
+
+#### and the POSIX a\ continuation form, its text in the SAME part
+## argv: sed --posix '-f' 's' h
+## file-json s: "1a\\\ntext\n"
+## file-json h: "a\nb\nc\nd\nabc\n"
+## stdout-json: "a\ntext\nb\nc\nd\nabc\n"
+## stderr-json: ""
+## status: 0
+
+#### --posix wants an a text in the SAME script part as its backslash
+# Without the flag the backslash reaches across an `-e' boundary and this
+# appends `text'; with it GNU calls the first part incomplete. The guard
+# above shows the same text, in one part, still working.
+## argv: sed --posix '-e' '1a\' '-e' 'text' h
+## file-json h: "a\nb\nc\nd\nabc\n"
+## stdout-json: ""
+## stderr-contains: incomplete command
+## status: 1
+
+#### and a script that ENDS in the backslash is incomplete too
+# Plainly this appends nothing at all and succeeds.
+## argv: sed --posix '1a\' h
+## file-json h: "a\nb\nc\nd\nabc\n"
+## stdout-json: ""
+## stderr-contains: incomplete command
+## status: 1
+
+#### --posix withdraws the I modifier on a regex ADDRESS
+# Distinct from the s/// flag of the same name and reached by a different
+# parser: the modifier goes unread, so the `I' is met as a command. My
+# first pass gated the s flags and missed these; a review caught it.
+## argv: sed --posix '-n' '/A/Ip' h
+## file-json h: "a\nb\nc\nd\nabc\n"
+## stdout-json: ""
+## stderr-contains: unknown command: `I'
+## status: 1
+
+#### and the M modifier
+## argv: sed --posix '-n' '/A/Mp' h
+## file-json h: "a\nb\nc\nd\nabc\n"
+## stdout-json: ""
+## stderr-contains: unknown command: `M'
+## status: 1
+
+#### in the alternate-delimiter spelling too
+## argv: sed --posix '-n' '\%A%Ip' h
+## file-json h: "a\nb\nc\nd\nabc\n"
+## stdout-json: ""
+## stderr-contains: unknown command: `I'
+## status: 1
+
+#### but an unmodified regex address is POSIX's own
+## argv: sed --posix '-n' '/b/p' h
+## file-json h: "a\nb\nc\nd\nabc\n"
+## stdout-json: "b\nabc\n"
+## stderr-json: ""
+## status: 0
+
+#### --posix gives = at most one address, as POSIX does
+# A range for these is GNU's extension, and the flag withdraws it. `q' and
+# `Q' are restricted in BOTH modes and always were; `c' is NOT restricted,
+# a range being the whole point of it. Found by sweeping every command
+# letter x {one address, a range} x {flag, no flag} -- the eight-command
+# withdrawal list had nothing to say about address COUNTS, and neither did
+# the gap entry that described this half.
+## argv: sed --posix '1,2=' h
+## file-json h: "a\nb\nc\nd\nabc\n"
+## stdout-json: ""
+## stderr-contains: command only uses one address
+## status: 1
+
+#### and a, whose text needs a script file to be valid plainly
+# `1,2a' bare is refused with OR without the flag (no text), so it cannot
+# show what the flag does; the generator refused to emit it that way.
+## argv: sed --posix '-f' 'sa' h
+## file-json sa: "1,2a\\\ntext\n"
+## file-json h: "a\nb\nc\nd\nabc\n"
+## stdout-json: ""
+## stderr-contains: command only uses one address
+## status: 1
+
+#### and i
+## argv: sed --posix '-f' 'si' h
+## file-json si: "1,2i\\\ntext\n"
+## file-json h: "a\nb\nc\nd\nabc\n"
+## stdout-json: ""
+## stderr-contains: command only uses one address
+## status: 1
+
+#### and l
+## argv: sed --posix '1,2l' h
+## file-json h: "a\nb\nc\nd\nabc\n"
+## stdout-json: ""
+## stderr-contains: command only uses one address
+## status: 1
+
+#### and r
+## argv: sed --posix '1,2r /dev/null' h
+## file-json h: "a\nb\nc\nd\nabc\n"
+## stdout-json: ""
+## stderr-contains: command only uses one address
+## status: 1
+
+#### but ONE address is what they take, not none
+## argv: sed --posix '2=' h
+## file-json h: "a\nb\nc\nd\nabc\n"
+## stdout-json: "a\n2\nb\nc\nd\nabc\n"
+## stderr-json: ""
+## status: 0
+
+#### and a range is still fine for the commands POSIX gives two
+## argv: sed --posix '1,2d' h
+## file-json h: "a\nb\nc\nd\nabc\n"
+## stdout-json: "c\nd\nabc\n"
+## stderr-json: ""
+## status: 0
+
+#### a second address of 0 ends the range at once
+# Not a --posix rule and the worst thing this landing found: `1,0d' deletes
+# ONE line in GNU and emptied the whole file here. Line 0 is behind every
+# start, so the range closes on the line after its own -- td-txt let `Zero'
+# fall through to the matcher, where it never matches and so never ends.
+# Found by a reviewer sweeping address 0 while this branch was tightening
+# the OTHER address-0 rule.
+## argv: sed '1,0d' h
+## file-json h: "a\nb\nc\nd\nabc\n"
+## stdout-json: "b\nc\nd\nabc\n"
+## stderr-json: ""
+## status: 0
+
+#### from a regex start too
+# The fixture needs ADJACENT matching lines or the case cannot fail: with a
+# lone match the range's close always lands on a non-matching line, so it
+# passed against the broken code too. A reviewer caught that.
+## argv: sed '/a/,0d' h
+## file-json h: "a\nab\nc\nd\nabc\n"
+## stdout-json: "c\nd\n"
+## stderr-json: ""
+## status: 0
+
+#### and it selects only the start line, not the rest
+## argv: sed '2,0s/./X/' h
+## file-json h: "a\nb\nc\nd\nabc\n"
+## stdout-json: "a\nX\nc\nd\nabc\n"
+## stderr-json: ""
+## status: 0
+
+#### and `c' on such a range still prints its text
+# The shape that caught a HALF fix. `d' never asks when the range closed, so
+# a `Zero' arm in the stepping seam alone made every `d' case above pass
+# while the range stayed open forever; `c' emits only on the closing line,
+# so it printed nothing. Both seams now read one parse-time `Line(0)'.
+## argv: sed '1,0cX' h
+## file-json h: "a\nb\nc\nd\nabc\n"
+## stdout-json: "X\nb\nc\nd\nabc\n"
+## stderr-json: ""
+## status: 0
+
+#### from a regex start -- which re-opens on every match, so it fires twice
+## argv: sed '/b/,0cX' h
+## file-json h: "a\nb\nc\nd\nabc\n"
+## stdout-json: "a\nX\nc\nd\nX\n"
+## stderr-json: ""
+## status: 0
+
+#### and on the last line
+## argv: sed '$,0cX' h
+## file-json h: "a\nb\nc\nd\nabc\n"
+## stdout-json: "a\nb\nc\nd\nX\n"
+## stderr-json: ""
+## status: 0
+
+#### the address is judged BEFORE the `!', so `0!!p' is the address complaint
+# A regression this branch introduced and a reviewer caught: the new single-`!'
+# rule ran first, so a doubled `!' on address 0 reported the bang instead. GNU
+# refuses the address at `char 2' -- the byte after the `0', before any `!' is
+# read. Both a1 and a2 are parsed by then, so the check simply moves up.
+## argv: sed '0!!p' h
+## file-json h: "1\n2\n3\n"
+## stdout-json: ""
+## stderr-contains: invalid usage of line address 0
+## status: 1
+
+#### but a doubled `!' on a LEGAL address is still the bang complaint
+## argv: sed '0,/2/!!p' h
+## file-json h: "1\n2\n3\n"
+## stdout-json: ""
+## stderr-contains: multiple `!'s
+## status: 1
+
+#### `addr,~N' end -- the fourth non-regex end the refusal names
+# Named in the rule above and in spec/README but never cased; `Addr2::Multiple'
+# is a different variant from `Addr2::Plus', so `0,+2' did not cover it.
+## argv: sed '0,~2d' h
+## file-json h: "1\n2\n3\n"
+## stdout-json: ""
+## stderr-contains: invalid usage of line address 0
+## status: 1
+
+#### `addr,+N' and `addr,~N' take blanks and an absent number too
+# The same `in_integer(in_nonblank())' as the step -- GNU uses that one routine
+# for all three, and this branch had applied it to only one of them.
+## argv: sed '-n' '1,+ 2p' h
+## file-json h: "1\n2\n3\n4\n5\n"
+## stdout-json: "1\n2\n3\n"
+## stderr-json: ""
+## status: 0
+
+#### an absent number is 0, so the range ends on its own start line
+## argv: sed '-n' '1,+p' h
+## file-json h: "1\n2\n3\n4\n5\n"
+## stdout-json: "1\n"
+## stderr-json: ""
+## status: 0
+
+#### an absent number after `~' too, which `+' alone did not cover
+# `Addr2::Multiple' is a different variant from `Addr2::Plus', so restoring the
+# refusal in the `~' branch ALONE left the corpus green. Found by a reviewer
+# reverting one branch at a time -- the same one-at-a-time check that showed
+# `1,1~0d' witnesses neither half of the stride fix by itself.
+## argv: sed '-n' '1,~p' h
+## file-json h: "1\n2\n3\n4\n5\n"
+## stdout-json: "1\n"
+## stderr-json: ""
+## status: 0
+
+#### and the same for the multiple form
+## argv: sed '2,~ 4d' h
+## file-json h: "1\n2\n3\n4\n5\n"
+## stdout-json: "1\n5\n"
+## stderr-json: ""
+## status: 0
+
+#### an ABSENT or blank-separated step is still an address
+# GNU reads it with `in_integer(in_nonblank())': blanks fall either side of
+# the `~', and no digits at all means 0 -- which by the rule above is the
+# plain line `first'. td-txt refused all three. Same family as `0~0', found
+# by a reviewer sweeping the step spellings this branch had just touched.
+## argv: sed '-n' '2~p' h
+## file-json h: "1\n2\n3\n4\n5\n"
+## stdout-json: "2\n"
+## stderr-json: ""
+## status: 0
+
+#### blanks after the tilde
+## argv: sed '-n' '1~ 2p' h
+## file-json h: "1\n2\n3\n4\n5\n"
+## stdout-json: "1\n3\n5\n"
+## stderr-json: ""
+## status: 0
+
+#### and either side of it
+## argv: sed '-n' '2 ~ 2p' h
+## file-json h: "1\n2\n3\n4\n5\n"
+## stdout-json: "2\n4\n"
+## stderr-json: ""
+## status: 0
+
+#### --posix withdraws the whole form, blanks or not
+## argv: sed '--posix' '-n' '2 ~ 2p' h
+## file-json h: "1\n2\n3\n4\n5\n"
+## stdout-json: ""
+## stderr-contains: unknown command: `~'
+## status: 1
+
+#### a `first~step' range END is numeric too, so it closes on the start line
+# The same runaway as address 0, in the last numeric spelling: `1,1~0d'
+# emptied the file. GNU tests every NUMERIC end on the start line and only a
+# REGEX end gets its "at least two lines" rule. Step 0 degenerates to the
+# plain line `first', which is why this is address 0's family and not the
+# stride's -- and why `first~0' is now normalised to a line at parse time.
+## argv: sed '1,1~0d' h
+## file-json h: "1\n2\n3\n4\n5\n6\n"
+## stdout-json: "2\n3\n4\n5\n6\n"
+## stderr-json: ""
+## status: 0
+
+#### with the end behind the start, which closes at once
+## argv: sed '2,1~0d' h
+## file-json h: "1\n2\n3\n4\n5\n6\n"
+## stdout-json: "1\n3\n4\n5\n6\n"
+## stderr-json: ""
+## status: 0
+
+#### and `c' on one, which is what a `d'-only case cannot catch
+## argv: sed '/2/,1~0cX' h
+## file-json h: "1\n2\n3\n4\n5\n6\n"
+## stdout-json: "1\nX\n3\n4\n5\n6\n"
+## stderr-json: ""
+## status: 0
+
+#### a stride end that matches the START line closes there
+# These are what discriminate the numeric-end rule: `1,3~2d' does NOT, since
+# 3~2 misses line 1 either way, so an all-`d'-and-misses corpus stayed green
+# with the rule deleted. 136 scripts disagreed with GNU under that mutation
+# and not one case saw it -- the same blindness that hid the `1,0c' half fix.
+## argv: sed '2,2~2d' h
+## file-json h: "1\n2\n3\n4\n5\n6\n"
+## stdout-json: "1\n3\n4\n5\n6\n"
+## stderr-json: ""
+## status: 0
+
+#### likewise when the stride starts at the start line
+## argv: sed '1,1~3d' h
+## file-json h: "1\n2\n3\n4\n5\n6\n"
+## stdout-json: "2\n3\n4\n5\n6\n"
+## stderr-json: ""
+## status: 0
+
+#### a regex start re-arms, so every line closes its own range
+## argv: sed '/./,1~1cX' h
+## file-json h: "1\n2\n3\n4\n5\n6\n"
+## stdout-json: "X\nX\nX\nX\nX\nX\n"
+## stderr-json: ""
+## status: 0
+
+#### a stride MISSING the start line leaves the range open to EOF
+# And `c' on a range still open at EOF prints nothing at all -- the line is
+# consumed and no text is emitted.
+## argv: sed '$,1~2cX' h
+## file-json h: "1\n2\n3\n4\n5\n6\n"
+## stdout-json: "1\n2\n3\n4\n5\n"
+## stderr-json: ""
+## status: 0
+
+#### a real stride still runs to its own end
+## argv: sed '1,3~2d' h
+## file-json h: "1\n2\n3\n4\n5\n6\n"
+## stdout-json: "4\n5\n6\n"
+## stderr-json: ""
+## status: 0
+
+#### and `first~0' as a lone address is just that line
+## argv: sed '-n' '1~0p' h
+## file-json h: "1\n2\n3\n"
+## stdout-json: "1\n"
+## stderr-json: ""
+## status: 0
+
+#### 0~0 is line 0, so it is the address-0 refusal
+# Step 0 degenerates to the line `first' itself, so this is a bare 0. Every
+# other pairing (`0~2', `1~0') is a real address and still works.
+## argv: sed '-n' '0~0p' h
+## file-json h: "a\nb\nc\nd\nabc\n"
+## stdout-json: ""
+## stderr-contains: invalid usage of line address 0
+## status: 1
+
+#### but 1~0 is the line itself
+## argv: sed '-n' '1~0p' h
+## file-json h: "a\nb\nc\nd\nabc\n"
+## stdout-json: "a\n"
+## stderr-json: ""
+## status: 0
+
+#### and 0~2 is still the step address
+## argv: sed '-n' '0~2p' h
+## file-json h: "a\nb\nc\nd\nabc\n"
+## stdout-json: "b\nd\n"
+## stderr-json: ""
+## status: 0
+
+#### a doubled ! is refused, not toggled
+# GNU takes at most one; td-txt looped, so `1,2!!p' double-negated back to
+# the plain range.
+## argv: sed '-n' '1,2!!p' h
+## file-json h: "a\nb\nc\nd\nabc\n"
+## stdout-json: ""
+## stderr-contains: multiple `!'s
+## status: 1
+
+#### while a single one still negates
+## argv: sed '-n' '1,2!p' h
+## file-json h: "a\nb\nc\nd\nabc\n"
+## stdout-json: "c\nd\nabc\n"
+## stderr-json: ""
+## status: 0
+
+#### line address 0 needs a REGEX end, not just a range
+# Not a --posix rule: GNU refuses this WITHOUT the flag too, and td-txt
+# accepted it -- fail-open, a range starting a line early. Address 0 exists
+# only so a range's end regex may match on line 1, so an end that is not a
+# regex has nothing to justify it.
+## argv: sed '0,5d' h
+## file-json h: "a\nb\nc\nd\nabc\n"
+## stdout-json: ""
+## stderr-contains: invalid usage of line address 0
+## status: 1
+
+#### nor a $ end
+## argv: sed '0,$d' h
+## file-json h: "a\nb\nc\nd\nabc\n"
+## stdout-json: ""
+## stderr-contains: invalid usage of line address 0
+## status: 1
+
+#### nor a +N end
+## argv: sed '0,+2d' h
+## file-json h: "a\nb\nc\nd\nabc\n"
+## stdout-json: ""
+## stderr-contains: invalid usage of line address 0
+## status: 1
+
+#### but a regex end is exactly what it is for
+## argv: sed '0,/b/d' h
+## file-json h: "a\nb\nc\nd\nabc\n"
+## stdout-json: "c\nd\nabc\n"
+## stderr-json: ""
+## status: 0
+
+#### in either spelling
+## argv: sed '0,\%b%d' h
+## file-json h: "a\nb\nc\nd\nabc\n"
+## stdout-json: "c\nd\nabc\n"
+## stderr-json: ""
+## status: 0
+
+#### --posix refuses a text continued past the end of its part
+# Not just the command's own backslash: one after the TEXT crosses the same
+# boundary and is refused the same way. Through `-f' because the newline
+# this needs cannot live in a `## argv:' line. GNU locates it as `file s
+# line 2' where td-txt says `-e expression #1', a pre-existing gap, so the
+# message is asserted by substring.
+## argv: sed --posix '-f' 's' h
+## file-json s: "1a\\\nfoo\\"
+## file-json h: "a\nb\nc\nd\nabc\n"
+## stdout-json: ""
+## stderr-contains: incomplete command
+## status: 1
+
+#### and the same with another part following it
+## argv: sed --posix '-f' 's' '-e' 'bar' h
+## file-json s: "1a\\\nfoo\\"
+## file-json h: "a\nb\nc\nd\nabc\n"
+## stdout-json: ""
+## stderr-contains: incomplete command
+## status: 1
+
+#### while the same text WITHOUT the trailing backslash is fine
+## argv: sed --posix '-f' 's2' h
+## file-json s2: "1a\\\nfoo\n"
+## file-json h: "a\nb\nc\nd\nabc\n"
+## stdout-json: "a\nfoo\nb\nc\nd\nabc\n"
+## stderr-json: ""
+## status: 0

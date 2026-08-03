@@ -59,3 +59,5 @@ xfail sed-cli.test.txt::and with an equivalence class
 xfail sed-cli.test.txt::POSIXLY_CORRECT also selects a POSIX mode, which td-txt does not drive
 xfail sed-cli.test.txt::N;P;D under the variable, the other half of that same rule
 xfail sed-cli.test.txt::POSIX mode makes an unmatched ) ordinary in an ERE, so GNU compiles this
+xfail sed-cli.test.txt::--posix: a bracket AFTER a closed sub-expression keeps suppressing
+xfail sed-cli.test.txt::--posix stops `/dev/stdout' aliasing the program's own stdout

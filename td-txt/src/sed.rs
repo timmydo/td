@@ -172,7 +172,9 @@ struct ScriptParser<'a> {
     src: &'a [u8],
     pos: usize,
     ere: bool,
-    /// `--posix`. Reaches the regex compiler for one rule; see `Options::posix`.
+    /// `--posix`. Reaches the regex compiler, which drops GNU's extensions under
+    /// it (see `Options::posix`), and `normalize_regex`, which stops decoding the
+    /// escape vocabulary inside a bracket expression.
     posix: bool,
     /// `--sandbox`. Read at the `r`/`R`/`w`/`W` commands and the `s///w` flag, and
     /// checked BEFORE the target is opened, because refusing the command is GNU's
@@ -288,18 +290,23 @@ impl ScriptParser<'_> {
             lex_continues: false,
             reg_newline: multiline.then_some(separator_for(self.null_data)),
         };
-        let re = Regex::compile(&normalize_regex(raw)?, opts)
+        let re = Regex::compile(&normalize_regex(raw, self.posix)?, opts)
             .map_err(|e| e.msg)?;
         self.regexes.push(re);
         Ok(Some(self.regexes.len() - 1))
     }
 
-    /// A `/re/` or `\cREc` address, consuming the `I`/`M` flags that follow.
+    /// A `/re/` or `\cREc` address, consuming the `I`/`M` modifiers that follow --
+    /// except under `--posix`, which withdraws them; see the body.
     fn parse_regex_addr(&mut self, delim: u8) -> Result<AddrKind, String> {
         let raw = self.read_delimited(delim, "unterminated address regex")?;
         let mut icase = false;
         let mut multiline = false;
-        loop {
+        // `I` and `M` after an address regex are GNU's, so `--posix` leaves them
+        // unread and each is met as a command: `--posix -n '/A/Ip'` is
+        // `unknown command: `I''. The s/// flags of the same names go too, but
+        // through the `s` parser's own catch-all rather than here.
+        while !self.posix {
             match self.peek() {
                 Some(b'I') => {
                     icase = true;
@@ -405,6 +412,24 @@ impl ScriptParser<'_> {
         Ok(c)
     }
 
+    /// The command spellings `--posix` withdraws, each then reported by the
+    /// parser's ordinary "not a command" path rather than a message of its own --
+    /// which is also how GNU words it. `q`, `r`, `w` and `t` stay; only their
+    /// upper-case GNU siblings go, so the combined arms below cannot be gated as
+    /// a whole and this is asked BEFORE the dispatch instead.
+    fn posix_drops_command(&self, c: u8) -> bool {
+        self.posix && matches!(c, b'v' | b'Q' | b'T' | b'z' | b'F' | b'W' | b'R' | b'e')
+    }
+
+    /// The commands `--posix` gives at most ONE address, GNU otherwise taking a
+    /// range. Four are POSIX's own; `l` is NOT -- POSIX.1 defines it `[2addr]l`,
+    /// so that one is GNU's posix-mode behaviour, taken from the oracle rather
+    /// than from the standard. `q`/`Q` are restricted in both modes and check
+    /// themselves; `c` is not in the list, a range being the whole point of it.
+    fn posix_limits_addresses(&self, c: u8) -> bool {
+        self.posix && matches!(c, b'=' | b'a' | b'i' | b'l' | b'r')
+    }
+
     fn parse_addr_kind(&mut self) -> Result<Option<AddrKind>, String> {
         match self.peek() {
             Some(b'$') => {
@@ -422,18 +447,43 @@ impl ScriptParser<'_> {
             }
             Some(b) if b.is_ascii_digit() => {
                 let n = self.parse_number().unwrap_or(0);
-                if self.eat(b'~') {
-                    let step = self
-                        .parse_number()
-                        .ok_or_else(|| "expected a number after `~'".to_string())?;
-                    return Ok(Some(AddrKind::Step { first: n, step }));
+                if !self.posix {
+                    // GNU reads the step with `in_integer(in_nonblank())`, so
+                    // blanks fall either side of the `~` and ABSENT digits are
+                    // 0 rather than an error -- `2 ~ 2`, `1~ 2` and a bare `2~`
+                    // are all addresses. Rewind when there is no `~` at all, so
+                    // nothing else sees the blanks eaten here.
+                    let save = self.pos;
+                    self.skip_blank();
+                    if self.eat(b'~') {
+                        self.skip_blank();
+                        let step = self.parse_number().unwrap_or(0);
+                        // Step 0 degenerates to the plain line `first`, so `1~0`
+                        // IS line 1 and `0~0` IS line 0, taking the address-0
+                        // refusal. Normalising here rather than at the matcher
+                        // is what makes it absolute everywhere: as a range END a
+                        // line number behind the start closes at once, where a
+                        // `Step` that only matched `first` never closed and
+                        // `2,1~0d` ran away.
+                        if step == 0 {
+                            return Ok(Some(self.line_addr(n)));
+                        }
+                        return Ok(Some(AddrKind::Step { first: n, step }));
+                    }
+                    self.pos = save;
                 }
-                if n == 0 {
-                    return Ok(Some(AddrKind::Zero));
-                }
-                Ok(Some(AddrKind::Line(n)))
+                Ok(Some(self.line_addr(n)))
             }
             _ => Ok(None),
+        }
+    }
+
+    /// A literal line number. `0` is its own kind because it alone may start a
+    /// range whose end regex matches on line 1; every other number is `Line`.
+    fn line_addr(&self, n: u64) -> AddrKind {
+        match n {
+            0 => AddrKind::Zero,
+            _ => AddrKind::Line(n),
         }
     }
 
@@ -443,16 +493,15 @@ impl ScriptParser<'_> {
             self.skip_blank();
             if self.eat(b',') {
                 self.skip_blank();
-                if self.eat(b'+') {
-                    let n = self
-                        .parse_number()
-                        .ok_or_else(|| "expected a number after `+'".to_string())?;
-                    addr.a2 = Some(Addr2::Plus(n));
-                } else if self.eat(b'~') {
-                    let n = self
-                        .parse_number()
-                        .ok_or_else(|| "expected a number after `~'".to_string())?;
-                    addr.a2 = Some(Addr2::Multiple(n));
+                // Same `in_integer(in_nonblank())` as the step: blanks after the
+                // operator, and no digits at all reads as 0. `1,+p` is `+0`, a
+                // range ending on its own start line.
+                if !self.posix && self.eat(b'+') {
+                    self.skip_blank();
+                    addr.a2 = Some(Addr2::Plus(self.parse_number().unwrap_or(0)));
+                } else if !self.posix && self.eat(b'~') {
+                    self.skip_blank();
+                    addr.a2 = Some(Addr2::Multiple(self.parse_number().unwrap_or(0)));
                 } else {
                     let k = self
                         .parse_addr_kind()?
@@ -461,13 +510,33 @@ impl ScriptParser<'_> {
                 }
             }
         }
-        self.skip_blank();
-        while self.eat(b'!') {
-            addr.negate = !addr.negate;
-            self.skip_blank();
+        // `Zero` is distinct only as a range START (`0,/re/`); as an END it is
+        // the line number 0, behind every start. Normalising to `Line(0)` here
+        // is what stops the two range seams disagreeing: a second `Zero` arm in
+        // `range_step` alone left `range_opens` holding the range open, so
+        // `1,0d` looked right while `1,0c` never closed and swallowed its text.
+        if matches!(addr.a2, Some(Addr2::Kind(AddrKind::Zero))) {
+            addr.a2 = Some(Addr2::Kind(AddrKind::Line(0)));
         }
-        if matches!(addr.a1, Some(AddrKind::Zero)) && !addr.is_range() {
+        // Checked BEFORE the `!`: GNU judges the address first, so `0!!p` is
+        // `invalid usage of line address 0` and not `multiple `!'s`. Both a1 and
+        // a2 are parsed by now, so nothing here depends on what follows.
+        // Address 0 exists ONLY to let a range's end regex match on line 1, so it
+        // needs a REGEX end: `0,/b/` and `0,\%b%` are the whole of what GNU takes,
+        // and `0,5`, `0,$`, `0,+2`, `0,~2` are refused like a bare `0`. `0,/re/`
+        // is itself GNU's, so under `--posix` address 0 has no valid use at all.
+        let ends_in_regex = matches!(addr.a2, Some(Addr2::Kind(AddrKind::Rx(_))));
+        if matches!(addr.a1, Some(AddrKind::Zero)) && (self.posix || !ends_in_regex) {
             return Err("invalid usage of line address 0".to_string());
+        }
+        self.skip_blank();
+        // One `!` and no more: GNU refuses a second rather than toggling back.
+        if self.eat(b'!') {
+            addr.negate = true;
+            self.skip_blank();
+            if self.peek() == Some(b'!') {
+                return Err("multiple `!'s".to_string());
+            }
         }
         Ok(addr)
     }
@@ -485,10 +554,19 @@ impl ScriptParser<'_> {
         let mut out = Vec::new();
         if self.eat(b'\\') {
             // The backslash asked for the next line, so it crosses a part boundary.
+            // Crossing one is GNU's, and `--posix` wants the text in the SAME part:
+            // `-e 'a\' -e 'text'` appends without the flag and is refused with it,
+            // as is a script ending in the backslash, which otherwise appends
+            // nothing. Asked BEFORE the newline is eaten, since eating it is what
+            // makes the two parts look like one.
+            if self.posix && (self.at_part_end() || self.peek().is_none()) {
+                return Err("incomplete command".to_string());
+            }
             if !self.eat(b'\n') && self.peek().is_none() {
                 return Ok(None);
             }
-        } else if self.peek().is_none() || self.at_part_end() {
+        } else if self.posix || self.peek().is_none() || self.at_part_end() {
+            // The one-line `a text` form is GNU's; `--posix` leaves only `a\`.
             return Err("expected \\ after `a', `c' or `i'".to_string());
         }
         // A text whose last character is an unpaired backslash is not decoded at
@@ -503,11 +581,19 @@ impl ScriptParser<'_> {
                 // Inside ONE part both bytes reach the decoder instead, which is
                 // why `a\<newline>A\c\<newline>B` is an error and not a `J`.
                 Some(b'\\') if self.at_part_end() => {
+                    // Same rule as the command's own backslash: crossing into the
+                    // next `-e` is GNU's, and `--posix` will not have it.
+                    if self.posix {
+                        return Err("incomplete command".to_string());
+                    }
                     self.pos += 1;
                     out.push(b'\n');
                 }
                 Some(b'\\') => match self.bump() {
                     None => {
+                        if self.posix {
+                            return Err("incomplete command".to_string());
+                        }
                         undecoded = true;
                         break;
                     }
@@ -636,15 +722,19 @@ impl ScriptParser<'_> {
                     print = true;
                     self.pos += 1;
                 }
-                Some(b'i' | b'I') => {
+                Some(b'i' | b'I') if !self.posix => {
                     icase = true;
                     self.pos += 1;
                 }
-                Some(b'm' | b'M') => {
+                Some(b'm' | b'M') if !self.posix => {
                     multiline = true;
                     self.pos += 1;
                 }
-                Some(b'e') => return Err("the `e' flag is not supported".to_string().into()),
+                // Under the flag these are not flags at all, so the catch-all
+                // below answers with GNU's `unknown option to `s''.
+                Some(b'e') if !self.posix => {
+                    return Err("the `e' flag is not supported".to_string().into())
+                }
                 Some(b'w') => {
                     self.pos += 1;
                     self.deny_in_sandbox()?;
@@ -672,11 +762,19 @@ impl ScriptParser<'_> {
             }
         }
         let re = self.add_regex(&pattern, icase, multiline)?;
-        let replacement = compile_replacement(&raw_repl)?;
+        let replacement = compile_replacement(&raw_repl, self.posix)?;
         // A `\N` naming a group the pattern does not have is a script error, not
-        // an empty expansion. `s//.../` reuses the LAST regex, unknowable here,
-        // so it is checked at run time instead (GNU does the same).
-        if let Some(groups) = re.and_then(|i| self.regexes.get(i)).map(Regex::group_count) {
+        // an empty expansion -- except under `--posix`, GNU's fourth rule for the
+        // flag, where it is accepted and expands to nothing. Checked only when
+        // the regex is known here; `s//.../` reuses the LAST one and goes
+        // unchecked, which is a DIVERGENCE rather than a shared rule: GNU still
+        // refuses when the command carries its own address regex, so
+        // `/\(a\)/s//\2/` is an error there and empty here. See spec/README.
+        if let Some(groups) = re
+            .filter(|_| !self.posix)
+            .and_then(|i| self.regexes.get(i))
+            .map(Regex::group_count)
+        {
             if let Some(n) = max_group(&replacement) {
                 if n > groups {
                     return Err(format!("invalid reference \\{n} on `s' command's RHS").into());
@@ -834,11 +932,21 @@ fn escape_byte(raw: &[u8], i: &mut usize) -> Result<Esc, String> {
 /// the metacharacter dot, `[a\x2dz]` is a range, `\x5b` is an unmatched bracket
 /// and `\x5cw` is the word class. That is also why an escape works inside a
 /// bracket expression, where the regex parser itself would take `\` literally.
-fn normalize_regex(raw: &[u8]) -> Result<Vec<u8>, String> {
+fn normalize_regex(raw: &[u8], posix: bool) -> Result<Vec<u8>, String> {
     let mut out = Vec::with_capacity(raw.len());
     let mut i = 0usize;
     while let Some(b) = raw.get(i).copied() {
         i += 1;
+        // `--posix` drops the decoding INSIDE a bracket expression, so `[\x41]`
+        // holds four ordinary members there rather than an `A`. GNU judges
+        // "inside" on the pattern TEXT, not on what decoding produces: a `[`
+        // that is itself an escape opens nothing, and `\x5b\x41]` decodes under
+        // the flag exactly as it does without it.
+        if posix && b == b'[' {
+            out.push(b);
+            copy_bracket(raw, &mut i, &mut out);
+            continue;
+        }
         if b != b'\\' {
             out.push(b);
             continue;
@@ -856,6 +964,50 @@ fn normalize_regex(raw: &[u8]) -> Result<Vec<u8>, String> {
         }
     }
     Ok(out)
+}
+
+/// Copy the suppressed region through verbatim, leaving `i` past its `]`. This is
+/// NOT a bracket parse and must not become one: GNU stops at the FIRST `]`, so
+/// POSIX's rule that a leading `]` is an ordinary member does not hold here, and
+/// the region can end before the bracket itself does. `[]\x41]` is the observable
+/// case -- suppression covers only `[]`, the `\x41` after it decodes, and the
+/// class is {], A}. The one thing that carries it PAST a `]` is a `[:`/`[.`/`[=`
+/// sub-expression, and that runs to the NEXT `]` rather than to its own
+/// `:]`/`.]`/`=]` -- so `[[.].]` ends at the second `]`, not the third character
+/// from the end. The bracket's OWN `[` opens one like any other, which is why
+/// `[.]\x41` suppresses the `\x41` where `[x]\x41` does not. A backslash means
+/// nothing either way, POSIX giving it no role inside a bracket. Unterminated,
+/// this runs to the end and the regex parser reports it, as without the flag.
+/// One shape is NOT modelled: after a closed sub-expression, GNU keeps
+/// suppressing a following bracket whose leading `]` would otherwise end it
+/// (`[::][]\x41]`). See spec/README; it is an xfail, not an oversight.
+fn copy_bracket(raw: &[u8], i: &mut usize, out: &mut Vec<u8>) {
+    // The `[` the caller has already emitted, which pairs like any other.
+    let mut after_open = true;
+    while let Some(b) = raw.get(*i).copied() {
+        *i += 1;
+        out.push(b);
+        if after_open && matches!(b, b':' | b'.' | b'=') {
+            copy_past_close(raw, i, out);
+            after_open = false;
+            continue;
+        }
+        if b == b']' {
+            return;
+        }
+        after_open = b == b'[';
+    }
+}
+
+/// Consume through the next `]`, where a `[:`/`[.`/`[=` sub-expression ends.
+fn copy_past_close(raw: &[u8], i: &mut usize, out: &mut Vec<u8>) {
+    while let Some(c) = raw.get(*i).copied() {
+        *i += 1;
+        out.push(c);
+        if c == b']' {
+            return;
+        }
+    }
 }
 
 /// The same vocabulary for text that no other parser reads: `a`/`i`/`c` text and
@@ -903,7 +1055,14 @@ fn radix_escape(raw: &[u8], i: &mut usize, radix: u32, max_digits: usize) -> Opt
 }
 
 /// Split a replacement into literals, group references and case operators.
-fn compile_replacement(raw: &[u8]) -> Result<Vec<Repl>, String> {
+/// `posix` drops the five case operators, GNU's third `--posix` rule after the
+/// compiler's and `normalize_regex`'s (the fourth is at the caller, where an
+/// out-of-range group reference stops being an error): each becomes the LITERAL letter,
+/// so `s/a/\Ux/` yields `Ux`. Nothing else in a replacement moves -- `\1`, `&`,
+/// `\&`, the `\x`/`\o`/`\d` bytes and `\n` are the same either way -- and the
+/// five need no arm of their own here, an unknown escape ALREADY shedding its
+/// backslash and keeping its letter, which is exactly the answer.
+fn compile_replacement(raw: &[u8], posix: bool) -> Result<Vec<Repl>, String> {
     let mut out: Vec<Repl> = Vec::new();
     let mut lit: Vec<u8> = Vec::new();
     fn flush(lit: &mut Vec<u8>, out: &mut Vec<Repl>) {
@@ -930,7 +1089,7 @@ fn compile_replacement(raw: &[u8]) -> Result<Vec<Repl>, String> {
                         flush(&mut lit, &mut out);
                         out.push(Repl::Group(usize::from(n - b'0')));
                     }
-                    b'U' | b'L' | b'u' | b'l' | b'E' => {
+                    b'U' | b'L' | b'u' | b'l' | b'E' if !posix => {
                         i += 1;
                         flush(&mut lit, &mut out);
                         out.push(Repl::Case(match n {
@@ -1015,6 +1174,12 @@ fn parse_script(
         let Some(c) = p.bump() else {
             return Err("missing command".to_string().into());
         };
+        if p.posix_drops_command(c) {
+            return Err(format!("unknown command: `{}'", char::from(c)).into());
+        }
+        if p.posix_limits_addresses(c) && addr.is_range() {
+            return Err("command only uses one address".to_string().into());
+        }
         let kind = match c {
             b'{' => {
                 open_blocks.push(cmds.len());
@@ -1063,7 +1228,13 @@ fn parse_script(
             b'x' => Kind::Exchange,
             b'l' => {
                 p.skip_blank();
-                Kind::List(usize::try_from(p.parse_number().unwrap_or(70)).unwrap_or(70))
+                // The width argument is GNU's, and an unread digit is what makes
+                // `--posix 'l 5'` the `extra characters after command` GNU gives.
+                let w = match p.posix {
+                    true => None,
+                    false => p.parse_number(),
+                };
+                Kind::List(usize::try_from(w.unwrap_or(70)).unwrap_or(70))
             }
             b'n' => Kind::Next,
             b'N' => Kind::NextAppend,
@@ -1074,8 +1245,12 @@ fn parse_script(
                     return Err("command only uses one address".to_string().into());
                 }
                 p.skip_blank();
-                let code = i32::try_from(p.parse_number().unwrap_or(0)).unwrap_or(0);
-                Kind::Quit(code, c == b'q')
+                // Likewise the exit code: `--posix 'q5'` leaves the `5` unread.
+                let n = match p.posix {
+                    true => None,
+                    false => p.parse_number(),
+                };
+                Kind::Quit(i32::try_from(n.unwrap_or(0)).unwrap_or(0), c == b'q')
             }
             b'r' | b'R' => {
                 p.deny_in_sandbox()?;
@@ -1468,10 +1643,9 @@ fn kind_matches(
         AddrKind::Line(n) => Ok((line_number == *n, None)),
         AddrKind::Zero => Ok((false, None)),
         AddrKind::Last => Ok((at_last, None)),
+        // `step` is never 0 here: `first~0` is normalised to a plain line at
+        // parse time, so this arm is only ever a real stride.
         AddrKind::Step { first, step } => {
-            if *step == 0 {
-                return Ok((line_number == *first, None));
-            }
             Ok((line_number >= *first && (line_number - *first).is_multiple_of(*step), None))
         }
         AddrKind::Rx(slot) => {
@@ -1574,9 +1748,17 @@ impl Sed {
                 Ok((line >= n, select))
             }
             // `$` is absolute like a line number: `1,$c\TEXT` on a one-line
-            // file must CLOSE on that line, or `c` never prints. Only a REGEX
-            // end gets GNU's "at least two lines" rule.
-            Some(Some(Addr2::Plus(_) | Addr2::Multiple(_) | Addr2::Kind(AddrKind::Last))) => {
+            // file must CLOSE on that line, or `c` never prints. So is a
+            // `first~step` end, which is why it is here and not below: GNU
+            // tests every NUMERIC end on the start line, and only a REGEX end
+            // gets its "at least two lines" rule. Untested, `1,1~0d` emptied
+            // the file -- the same shape as the address-0 bug, in the last
+            // numeric spelling.
+            Some(Some(
+                Addr2::Plus(_)
+                | Addr2::Multiple(_)
+                | Addr2::Kind(AddrKind::Last | AddrKind::Step { .. }),
+            )) => {
                 let (ends, _) = self.range_step(idx, start, at_last)?;
                 Ok((ends, true))
             }
@@ -1592,6 +1774,11 @@ impl Sed {
             Some(Some(Addr2::Multiple(n))) => return Ok((line >= multiple_end(start, *n), true)),
             // Past the end line the range closes WITHOUT selecting: reachable
             // when `b`/`t`/`N` jumped over the end.
+            // A second address of `0` arrives here as `Line(0)`, normalised at
+            // parse time: behind every start, so it closes at once and selects
+            // nothing past the start line. Untreated it fell through to
+            // `kind_matches`, never matched, never ended, and `1,0d` emptied
+            // the file.
             Some(Some(Addr2::Kind(AddrKind::Line(n)))) => return Ok((line >= *n, line <= *n)),
             Some(Some(Addr2::Kind(k))) => k,
             _ => return Ok((true, true)),
@@ -3255,7 +3442,7 @@ mod tests {
     /// pattern, a kept backslash, a dropped one) no single value can show.
     #[test]
     fn the_escape_vocabulary_is_decoded_before_anything_else_reads_the_text() {
-        let rx = |p: &[u8]| normalize_regex(p).unwrap();
+        let rx = |p: &[u8]| normalize_regex(p, false).unwrap();
         assert_eq!(rx(b"\\x41\\d066\\o103\\t"), b"ABC\t");
         assert_eq!(rx(b"[a\\x2dz]"), b"[a-z]"); // a decoded dash RANGES
         assert_eq!(rx(b"\\x5cw"), b"\\w"); // ... and a decoded backslash escapes
@@ -3264,7 +3451,7 @@ mod tests {
         assert_eq!(rx(b"[\\x]"), b"[x]"); // ... but a digitless `\x` IS, and sheds it
         assert_eq!(rx(b"\\c\\\\"), b"\x1c");
         assert_eq!(rx(b"\\c"), b"\\"); // bare: `Trailing backslash` from the compiler
-        assert!(normalize_regex(b"\\c\\q").is_err());
+        assert!(normalize_regex(b"\\c\\q", false).is_err());
 
         let buf = |p: &[u8]| normalize_buffer(p).unwrap();
         assert_eq!(buf(b"\\c"), b""); // ... which a text drops instead
