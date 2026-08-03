@@ -16,6 +16,15 @@ pub fn os_from_bytes(bytes: &[u8]) -> OsString {
     OsString::from_vec(bytes.to_vec())
 }
 
+/// Whether `POSIXLY_CORRECT` is set. GNU reads only whether it is THERE -- an
+/// empty value, `0` and `no` all count. GNU gives it two jobs; td-txt uses it
+/// for ONE, ending option parsing at the first operand. The other, sed's POSIX
+/// mode, is deliberately not driven from here -- see spec/README's gap entry,
+/// which measures why it is not the same switch as `--posix`.
+pub fn posixly_correct() -> bool {
+    std::env::var_os("POSIXLY_CORRECT").is_some()
+}
+
 pub fn path_from_bytes(bytes: &[u8]) -> PathBuf {
     PathBuf::from(os_from_bytes(bytes))
 }

@@ -41,6 +41,8 @@
 //!   ## file-json f.txt: "a\0"     that file's exact bytes (NUL, no newline, …)
 //!   ## file-after f.txt: … ## END   that file's REQUIRED content afterwards
 //!   ## no-file-after: f.txt   that file must NOT exist afterwards
+//!   ## env NAME: value        added to the otherwise-cleared environment
+//!   ## env NAME:  … ## END    the block form, and the only way to set it EMPTY
 //!   #  (single hash)          a comment
 //! ```
 //!
@@ -121,6 +123,9 @@ pub struct Case {
     pub argv: Vec<Vec<u8>>,
     /// Files to materialize in the case's working directory before the run.
     pub files: Vec<(String, Vec<u8>)>,
+    /// Added to the otherwise-cleared environment. An applet that reads one is
+    /// a case the argv alone cannot express.
+    pub env: Vec<(String, Vec<u8>)>,
     pub stdin: Vec<u8>,
     pub expect: Expect,
 }
@@ -316,6 +321,7 @@ pub fn parse_cases(text: &str, file: &str) -> Result<Vec<Case>, SpecError> {
                 name: desc.trim().to_string(),
                 argv: Vec::new(),
                 files: Vec::new(),
+                env: Vec::new(),
                 stdin: Vec::new(),
                 expect: Expect::default(),
             });
@@ -405,6 +411,12 @@ fn apply_annotation(
                 case.files.push((name.trim().to_string(), value));
                 return Ok(());
             }
+            // An EMPTY value is written as the block form, `## env NAME:' then
+            // `## END' -- and it is not the same as leaving the variable out.
+            if let Some(name) = other.strip_prefix("env ") {
+                case.env.push((name.trim().to_string(), value));
+                return Ok(());
+            }
             return Err(SpecError::new(
                 line,
                 format!(
@@ -464,6 +476,7 @@ pub fn parse_spencer(text: &str, file: &str, ere: bool) -> Result<Vec<Case>, Spe
             name: raw.trim_end().to_string(),
             argv,
             files: Vec::new(),
+            env: Vec::new(),
             stdin,
             // Only the status: upstream's driver discards the output.
             expect: Expect { status: Some(status), ..Expect::default() },
@@ -578,6 +591,7 @@ pub fn load_corpus(spec_dir: &Path) -> Result<Vec<Case>, Box<dyn std::error::Err
             ("khadafy.regexp".to_string(), regexp),
             ("khadafy.lines".to_string(), lines.clone()),
         ],
+        env: Vec::new(),
         stdin: Vec::new(),
         expect: Expect { status: Some(0), stdout: Some(lines), ..Expect::default() },
     });
@@ -593,6 +607,7 @@ pub fn load_corpus(spec_dir: &Path) -> Result<Vec<Case>, Box<dyn std::error::Err
             name: (*stem).to_string(),
             argv: vec![b"sed".to_vec(), b"-f".to_vec(), format!("{stem}.sed").into_bytes()],
             files: vec![(format!("{stem}.sed"), script)],
+            env: Vec::new(),
             stdin: input,
             expect: Expect { status: Some(0), stdout: Some(good), ..Expect::default() },
         });
@@ -726,9 +741,14 @@ pub fn run_case(bin: &Path, case: &Case) -> Result<CaseOutcome, Box<dyn std::err
     }
     // env_clear for determinism, plus the C locale these applets are written for:
     // a case must not change meaning because the host runs a UTF-8 locale.
+    cmd.env_clear();
+    for (name, value) in &case.env {
+        cmd.env(name, os_string(value));
+    }
+    // LC_ALL goes on LAST so a case cannot take it back: the promise above is
+    // unconditional, not a convention every case author has to keep.
+    cmd.env("LC_ALL", "C");
     let mut child = cmd
-        .env_clear()
-        .env("LC_ALL", "C")
         .current_dir(&cwd)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -1128,11 +1148,23 @@ b
             name: name.into(),
             argv: vec![b"grep".to_vec()],
             files: Vec::new(),
+            env: Vec::new(),
             stdin: Vec::new(),
             expect: Expect::default(),
         };
         let keys = case_keys(&[mk("a"), mk("b"), mk("a")]);
         assert_eq!(keys, vec!["f::a", "f::b", "f::a ##2"]);
+    }
+
+    /// The EMPTY value is the reason this needs its own test: a corpus case
+    /// cannot tell it from any other value, since what the applet reads is
+    /// whether the variable is there.
+    #[test]
+    fn env_takes_a_value_inline_and_an_empty_one_as_a_block() {
+        let text = "#### c\n## argv: grep a\n## env A: 1\n## env B:\n## END\n";
+        let cases = parse_cases(text, "f").unwrap();
+        let env = &cases.first().unwrap().env;
+        assert_eq!(env, &[("A".to_string(), b"1".to_vec()), ("B".to_string(), Vec::new())]);
     }
 
     #[test]

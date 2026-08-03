@@ -41,7 +41,7 @@ fn bin() -> PathBuf {
 /// missing vendored `.inp`/`.good`, or a typo'd annotation reds in-loop — without
 /// depending on the behavioral run below.
 /// Raise this with the corpus; it exists to catch a corpus that SHRANK.
-const CORPUS_FLOOR: usize = 1585;
+const CORPUS_FLOOR: usize = 1649;
 
 #[test]
 fn corpus_is_well_formed() -> Result<(), Box<dyn std::error::Error>> {
@@ -150,6 +150,7 @@ fn a_large_case_streams_without_deadlocking() -> Result<(), Box<dyn std::error::
         name: "large input and output".into(),
         argv: vec![b"grep".to_vec(), b"0".to_vec()],
         files: Vec::new(),
+        env: Vec::new(),
         stdin: input.clone(),
         expect: Expect { status: Some(0), stdout: Some(input), ..Expect::default() },
     };
@@ -178,6 +179,7 @@ fn a_long_line_does_not_overflow_the_matcher_stack() -> Result<(), Box<dyn std::
         name: "starred single byte over a 200 KB line".into(),
         argv: vec![b"grep".to_vec(), b"-c".to_vec(), b"a*".to_vec()],
         files: Vec::new(),
+        env: Vec::new(),
         stdin: line.clone(),
         expect: Expect { status: Some(0), stdout: Some(b"1\n".to_vec()), ..Expect::default() },
     };
@@ -191,6 +193,7 @@ fn a_long_line_does_not_overflow_the_matcher_stack() -> Result<(), Box<dyn std::
         name: "starred group over a 200 KB line".into(),
         argv: vec![b"grep".to_vec(), b"-c".to_vec(), br"\(ab\)*".to_vec()],
         files: Vec::new(),
+        env: Vec::new(),
         stdin: line,
         expect: Expect::default(),
     };
@@ -216,6 +219,7 @@ fn a_repetition_just_under_the_depth_cap_does_not_abort(
         name: "19999 iterations of a two-byte body".into(),
         argv: vec![b"grep".to_vec(), b"-c".to_vec(), br"\(ab\)*".to_vec()],
         files: Vec::new(),
+        env: Vec::new(),
         stdin: line,
         expect: Expect { status: Some(0), stdout: Some(b"1\n".to_vec()), ..Expect::default() },
     };
@@ -234,6 +238,7 @@ fn a_pattern_past_the_concat_cap_is_refused() -> Result<(), Box<dyn std::error::
         name: "100001 concatenated atoms".into(),
         argv: vec![b"grep".to_vec(), vec![b'.'; 100_001]],
         files: Vec::new(),
+        env: Vec::new(),
         stdin: b"a\n".to_vec(),
         expect: Expect {
             status: Some(2),
@@ -265,6 +270,7 @@ fn nesting_past_the_cap_is_refused_rather_than_aborting() -> Result<(), Box<dyn 
         name: "5001 nested groups".into(),
         argv: vec![b"grep".to_vec(), deep],
         files: Vec::new(),
+        env: Vec::new(),
         stdin: b"a\n".to_vec(),
         expect: Expect {
             status: Some(2),
@@ -301,6 +307,7 @@ fn a_file_writing_case_does_not_pollute_the_working_tree() -> Result<(), Box<dyn
             marker.clone().into_bytes(),
         ],
         files: vec![(marker.clone(), b"a\n".to_vec())],
+        env: Vec::new(),
         stdin: Vec::new(),
         expect: Expect {
             status: Some(0),

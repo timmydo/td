@@ -6,12 +6,14 @@
 # somebody can quietly delete. A case here that starts failing means td-txt
 # drifted from a decision, not from upstream.
 #
-# The refusals here all fail CLOSED — a diagnosed error and a non-zero status,
-# never a silent no-op — so a script written for GNU cannot mistake a refusal for
-# success. One case is not a refusal but a different ANSWER (the anchor inside a
-# repeated group, last); it is here because the reason is the same — a decision,
-# not a gap — and a differing answer needs pinning more than a refusal does, since
-# nothing about it is self-announcing.
+# Most cases here are refusals and fail CLOSED — a diagnosed error and a non-zero
+# status, never a silent no-op — so a script written for GNU cannot mistake a
+# refusal for success. Several are not refusals but different ANSWERS (the anchor
+# inside a repeated group, and the permuted `-NUM` family at the end); they are
+# here because the reason is the same — a decision, not a gap — and a differing
+# answer needs pinning more than a refusal does, since nothing about it is
+# self-announcing. One differs in KIND rather than in value: a permuted `-NUM`
+# past the digit cap is a refusal here and a wait that never ends there.
 
 #### sed refuses the e command, which would need a shell
 # GNU sed's `e` runs its argument through /bin/sh. td-txt is a static binary
@@ -101,7 +103,7 @@ sed (td-txt) 0.1.0
 # include/exclude globs this applet refuses two cases below.
 ## argv: grep --help
 ## stdout:
-usage: grep [-EFGHhicLlnoqsvwxrzZ] [-m NUM] [-A NUM] [-B NUM] [-C NUM] [-e PATTERN] [-f FILE] [PATTERN] [FILE]...
+usage: grep [-aEFGHhicLlnoqRrsvwxyzZ] [-NUM] [-m NUM] [-A NUM] [-B NUM] [-C NUM] [-e PATTERN] [-f FILE] [PATTERN] [FILE]...
 ## END
 ## stderr-json: ""
 ## status: 0
@@ -127,7 +129,7 @@ grep (td-txt) 0.1.0
 #### --help outranks what comes after the scan, a bad pattern included
 ## argv: grep --help -e [
 ## stdout:
-usage: grep [-EFGHhicLlnoqsvwxrzZ] [-m NUM] [-A NUM] [-B NUM] [-C NUM] [-e PATTERN] [-f FILE] [PATTERN] [FILE]...
+usage: grep [-aEFGHhicLlnoqRrsvwxyzZ] [-NUM] [-m NUM] [-A NUM] [-B NUM] [-C NUM] [-e PATTERN] [-f FILE] [PATTERN] [FILE]...
 ## END
 ## stderr-json: ""
 ## status: 0
@@ -139,16 +141,6 @@ usage: grep [-EFGHhicLlnoqsvwxrzZ] [-m NUM] [-A NUM] [-B NUM] [-C NUM] [-e PATTE
 ## argv: grep --help -b a
 ## stdout-json: ""
 ## stderr-contains: invalid option -- 'b'
-## status: 2
-
-#### grep refuses -NUM, GNU's fourth spelling of a context count
-# `grep -2 a` is `-C2` in GNU. td-txt has -A/-B/-C and not this, so a digit is
-# refused rather than silently ignored -- which for a context flag would print
-# the right lines with the wrong ones missing.
-## argv: grep -2 a
-## stdin-json: "a\n"
-## stdout-json: ""
-## stderr-contains: invalid option -- '2'
 ## status: 2
 
 #### grep refuses -b rather than reporting a byte offset it does not track
@@ -281,5 +273,922 @@ a
 ## stdout:
 a
 ## END
+## stderr-json: ""
+## status: 0
+
+#### a context count too big to wait for is answered, not waited on
+# Exactly AT -NUM's cap of 21 significant digits (the five leading zeros are not
+# among them), so the count is accepted -- and GNU then walks its before-count
+# down in a loop whose cost is linear in the NUMBER, so it does not return
+# (still running after 20s), which is why this golden is td-txt's own and not
+# captured from it. td-txt indexes input it has already read, so the count costs
+# nothing and the answer is the one GNU is computing: every line, the context
+# covering the file. One more digit is the refusal two cases up in grep-cli.
+## argv: grep -00000111111111111111111111 -n a h
+## file h:
+a
+b
+b
+b
+b
+a
+## END
+## stdout-json: "1:a\n2-b\n3-b\n4-b\n5-b\n6:a\n"
+## stderr-json: ""
+## status: 0
+
+#### a permuted -NUM keeps every digit, where GNU drops the first
+# GNU's `-NUM' loses its FIRST digit when the run is the first option element
+# after an operand: `grep MATCH f -12 -A0' takes two lines of context there and
+# twelve here, and `-123' is 23 rather than 123. It is positional and nothing
+# else: the FIRST element of every option block that follows an operand loses
+# a digit, so `-12 MATCH f' and `MATCH f -A0 -12' keep the whole run while
+# `MATCH -A0 f -12' does not, and it recurs per block rather than firing once.
+# Two runs are safe only while ADJACENT. That shape comes from
+# getopt's permutation bookkeeping resetting the digit buffer once, mid-run;
+# no reading of the option makes a count mean one thing after a filename and
+# another before it. Not reproduced: a count that silently loses a digit by
+# position is not a behaviour a caller can want, and every position agrees here.
+## argv: grep MATCH f -12 -A0
+## file f:
+L01
+L02
+L03
+L04
+L05
+L06
+L07
+L08
+L09
+L10
+L11
+L12
+L13
+MATCH
+## END
+## stdout-json: "L02\nL03\nL04\nL05\nL06\nL07\nL08\nL09\nL10\nL11\nL12\nL13\nMATCH\n"
+## stderr-json: ""
+## status: 0
+
+#### and the three-digit form, where the divergence is not a coincidence
+# Two-digit runs make `drops the first' and `keeps the last' look alike; this is
+# where they part: GNU takes 23 and td-txt takes 123. The fixture is 130 lines
+# before the match ON PURPOSE -- both counts have to be UNCLAMPED for the two to
+# differ, and a shorter file is how this very divergence got measured wrong twice.
+## argv: grep MATCH big -123 -A0
+## file big:
+L001
+L002
+L003
+L004
+L005
+L006
+L007
+L008
+L009
+L010
+L011
+L012
+L013
+L014
+L015
+L016
+L017
+L018
+L019
+L020
+L021
+L022
+L023
+L024
+L025
+L026
+L027
+L028
+L029
+L030
+L031
+L032
+L033
+L034
+L035
+L036
+L037
+L038
+L039
+L040
+L041
+L042
+L043
+L044
+L045
+L046
+L047
+L048
+L049
+L050
+L051
+L052
+L053
+L054
+L055
+L056
+L057
+L058
+L059
+L060
+L061
+L062
+L063
+L064
+L065
+L066
+L067
+L068
+L069
+L070
+L071
+L072
+L073
+L074
+L075
+L076
+L077
+L078
+L079
+L080
+L081
+L082
+L083
+L084
+L085
+L086
+L087
+L088
+L089
+L090
+L091
+L092
+L093
+L094
+L095
+L096
+L097
+L098
+L099
+L100
+L101
+L102
+L103
+L104
+L105
+L106
+L107
+L108
+L109
+L110
+L111
+L112
+L113
+L114
+L115
+L116
+L117
+L118
+L119
+L120
+L121
+L122
+L123
+L124
+L125
+L126
+L127
+L128
+L129
+L130
+MATCH
+## END
+## stdout-json: "L008\nL009\nL010\nL011\nL012\nL013\nL014\nL015\nL016\nL017\nL018\nL019\nL020\nL021\nL022\nL023\nL024\nL025\nL026\nL027\nL028\nL029\nL030\nL031\nL032\nL033\nL034\nL035\nL036\nL037\nL038\nL039\nL040\nL041\nL042\nL043\nL044\nL045\nL046\nL047\nL048\nL049\nL050\nL051\nL052\nL053\nL054\nL055\nL056\nL057\nL058\nL059\nL060\nL061\nL062\nL063\nL064\nL065\nL066\nL067\nL068\nL069\nL070\nL071\nL072\nL073\nL074\nL075\nL076\nL077\nL078\nL079\nL080\nL081\nL082\nL083\nL084\nL085\nL086\nL087\nL088\nL089\nL090\nL091\nL092\nL093\nL094\nL095\nL096\nL097\nL098\nL099\nL100\nL101\nL102\nL103\nL104\nL105\nL106\nL107\nL108\nL109\nL110\nL111\nL112\nL113\nL114\nL115\nL116\nL117\nL118\nL119\nL120\nL121\nL122\nL123\nL124\nL125\nL126\nL127\nL128\nL129\nL130\nMATCH\n"
+## stderr-json: ""
+## status: 0
+
+#### a LATER option block after another operand is truncated the same way
+# It is not the first operand that arms this once and for all: every option block
+# that follows an operand loses the first digit of its FIRST element, so the run
+# after a second file is truncated too. GNU takes 56 here and td-txt 456, clamped
+# to the file. An earlier draft of this decision said a second run is never the
+# truncated one; that is true only while the two runs are ADJACENT, in one block.
+## argv: grep MATCH big -123 /dev/null -456 -A0
+## file big:
+L001
+L002
+L003
+L004
+L005
+L006
+L007
+L008
+L009
+L010
+L011
+L012
+L013
+L014
+L015
+L016
+L017
+L018
+L019
+L020
+L021
+L022
+L023
+L024
+L025
+L026
+L027
+L028
+L029
+L030
+L031
+L032
+L033
+L034
+L035
+L036
+L037
+L038
+L039
+L040
+L041
+L042
+L043
+L044
+L045
+L046
+L047
+L048
+L049
+L050
+L051
+L052
+L053
+L054
+L055
+L056
+L057
+L058
+L059
+L060
+L061
+L062
+L063
+L064
+L065
+L066
+L067
+L068
+L069
+L070
+L071
+L072
+L073
+L074
+L075
+L076
+L077
+L078
+L079
+L080
+L081
+L082
+L083
+L084
+L085
+L086
+L087
+L088
+L089
+L090
+L091
+L092
+L093
+L094
+L095
+L096
+L097
+L098
+L099
+L100
+L101
+L102
+L103
+L104
+L105
+L106
+L107
+L108
+L109
+L110
+L111
+L112
+L113
+L114
+L115
+L116
+L117
+L118
+L119
+L120
+L121
+L122
+L123
+L124
+L125
+L126
+L127
+L128
+L129
+L130
+MATCH
+## END
+## stdout-json: "big-L001\nbig-L002\nbig-L003\nbig-L004\nbig-L005\nbig-L006\nbig-L007\nbig-L008\nbig-L009\nbig-L010\nbig-L011\nbig-L012\nbig-L013\nbig-L014\nbig-L015\nbig-L016\nbig-L017\nbig-L018\nbig-L019\nbig-L020\nbig-L021\nbig-L022\nbig-L023\nbig-L024\nbig-L025\nbig-L026\nbig-L027\nbig-L028\nbig-L029\nbig-L030\nbig-L031\nbig-L032\nbig-L033\nbig-L034\nbig-L035\nbig-L036\nbig-L037\nbig-L038\nbig-L039\nbig-L040\nbig-L041\nbig-L042\nbig-L043\nbig-L044\nbig-L045\nbig-L046\nbig-L047\nbig-L048\nbig-L049\nbig-L050\nbig-L051\nbig-L052\nbig-L053\nbig-L054\nbig-L055\nbig-L056\nbig-L057\nbig-L058\nbig-L059\nbig-L060\nbig-L061\nbig-L062\nbig-L063\nbig-L064\nbig-L065\nbig-L066\nbig-L067\nbig-L068\nbig-L069\nbig-L070\nbig-L071\nbig-L072\nbig-L073\nbig-L074\nbig-L075\nbig-L076\nbig-L077\nbig-L078\nbig-L079\nbig-L080\nbig-L081\nbig-L082\nbig-L083\nbig-L084\nbig-L085\nbig-L086\nbig-L087\nbig-L088\nbig-L089\nbig-L090\nbig-L091\nbig-L092\nbig-L093\nbig-L094\nbig-L095\nbig-L096\nbig-L097\nbig-L098\nbig-L099\nbig-L100\nbig-L101\nbig-L102\nbig-L103\nbig-L104\nbig-L105\nbig-L106\nbig-L107\nbig-L108\nbig-L109\nbig-L110\nbig-L111\nbig-L112\nbig-L113\nbig-L114\nbig-L115\nbig-L116\nbig-L117\nbig-L118\nbig-L119\nbig-L120\nbig-L121\nbig-L122\nbig-L123\nbig-L124\nbig-L125\nbig-L126\nbig-L127\nbig-L128\nbig-L129\nbig-L130\nbig:MATCH\n"
+## stderr-json: ""
+## status: 0
+
+#### and an option before the operand does not protect a run after it
+# `-A0' sits in the block BEFORE the file operand, so the block after it still
+# starts with the digit run and still loses a digit. Compare the agreeing case
+# where `-A0' comes AFTER the operand and the run no longer starts its block:
+# the difference between them is one argument's position.
+## argv: grep MATCH -A0 big -123
+## file big:
+L001
+L002
+L003
+L004
+L005
+L006
+L007
+L008
+L009
+L010
+L011
+L012
+L013
+L014
+L015
+L016
+L017
+L018
+L019
+L020
+L021
+L022
+L023
+L024
+L025
+L026
+L027
+L028
+L029
+L030
+L031
+L032
+L033
+L034
+L035
+L036
+L037
+L038
+L039
+L040
+L041
+L042
+L043
+L044
+L045
+L046
+L047
+L048
+L049
+L050
+L051
+L052
+L053
+L054
+L055
+L056
+L057
+L058
+L059
+L060
+L061
+L062
+L063
+L064
+L065
+L066
+L067
+L068
+L069
+L070
+L071
+L072
+L073
+L074
+L075
+L076
+L077
+L078
+L079
+L080
+L081
+L082
+L083
+L084
+L085
+L086
+L087
+L088
+L089
+L090
+L091
+L092
+L093
+L094
+L095
+L096
+L097
+L098
+L099
+L100
+L101
+L102
+L103
+L104
+L105
+L106
+L107
+L108
+L109
+L110
+L111
+L112
+L113
+L114
+L115
+L116
+L117
+L118
+L119
+L120
+L121
+L122
+L123
+L124
+L125
+L126
+L127
+L128
+L129
+L130
+MATCH
+## END
+## stdout-json: "L008\nL009\nL010\nL011\nL012\nL013\nL014\nL015\nL016\nL017\nL018\nL019\nL020\nL021\nL022\nL023\nL024\nL025\nL026\nL027\nL028\nL029\nL030\nL031\nL032\nL033\nL034\nL035\nL036\nL037\nL038\nL039\nL040\nL041\nL042\nL043\nL044\nL045\nL046\nL047\nL048\nL049\nL050\nL051\nL052\nL053\nL054\nL055\nL056\nL057\nL058\nL059\nL060\nL061\nL062\nL063\nL064\nL065\nL066\nL067\nL068\nL069\nL070\nL071\nL072\nL073\nL074\nL075\nL076\nL077\nL078\nL079\nL080\nL081\nL082\nL083\nL084\nL085\nL086\nL087\nL088\nL089\nL090\nL091\nL092\nL093\nL094\nL095\nL096\nL097\nL098\nL099\nL100\nL101\nL102\nL103\nL104\nL105\nL106\nL107\nL108\nL109\nL110\nL111\nL112\nL113\nL114\nL115\nL116\nL117\nL118\nL119\nL120\nL121\nL122\nL123\nL124\nL125\nL126\nL127\nL128\nL129\nL130\nMATCH\n"
+## stderr-json: ""
+## status: 0
+
+#### the dropped digit can turn a refusal into a wait, which is a STATUS divergence
+# The sharpest shape in this family, because the two answers differ in KIND. The
+# run is 22 significant digits, over `-NUM's 21-digit cap, so both refuse it
+# BEFORE an operand -- identically, same message and exit 2. After one, GNU drops
+# a digit FIRST, leaving 21, which is within the cap: it accepts, and then walks a
+# before-count of 10^21 that never finishes (still going at 8s, and a careless
+# measurement misses even that, since a /dev/null stdout is treated as `-q').
+# td-txt refuses in every position. This is where the cap and the drop compose,
+# so a refactor of either could move it.
+## argv: grep MATCH big -1111111111111111111111
+## file big:
+L001
+L002
+L003
+L004
+L005
+L006
+L007
+L008
+L009
+L010
+L011
+L012
+L013
+L014
+L015
+L016
+L017
+L018
+L019
+L020
+L021
+L022
+L023
+L024
+L025
+L026
+L027
+L028
+L029
+L030
+L031
+L032
+L033
+L034
+L035
+L036
+L037
+L038
+L039
+L040
+L041
+L042
+L043
+L044
+L045
+L046
+L047
+L048
+L049
+L050
+L051
+L052
+L053
+L054
+L055
+L056
+L057
+L058
+L059
+L060
+L061
+L062
+L063
+L064
+L065
+L066
+L067
+L068
+L069
+L070
+L071
+L072
+L073
+L074
+L075
+L076
+L077
+L078
+L079
+L080
+L081
+L082
+L083
+L084
+L085
+L086
+L087
+L088
+L089
+L090
+L091
+L092
+L093
+L094
+L095
+L096
+L097
+L098
+L099
+L100
+L101
+L102
+L103
+L104
+L105
+L106
+L107
+L108
+L109
+L110
+L111
+L112
+L113
+L114
+L115
+L116
+L117
+L118
+L119
+L120
+L121
+L122
+L123
+L124
+L125
+L126
+L127
+L128
+L129
+L130
+MATCH
+## END
+## stdout-json: ""
+## stderr-json: "grep: 111111111111111111111...: invalid context length argument\n"
+## status: 2
+
+#### and it can turn a large count into no context at all
+# `-100' loses its 1 and is a context of ZERO in GNU: the match alone, where the
+# count asked for a hundred lines. No reading of `-100' yields nothing, which is
+# the clearest single answer to whether a caller could want the GNU result.
+## argv: grep MATCH big -100
+## file big:
+L001
+L002
+L003
+L004
+L005
+L006
+L007
+L008
+L009
+L010
+L011
+L012
+L013
+L014
+L015
+L016
+L017
+L018
+L019
+L020
+L021
+L022
+L023
+L024
+L025
+L026
+L027
+L028
+L029
+L030
+L031
+L032
+L033
+L034
+L035
+L036
+L037
+L038
+L039
+L040
+L041
+L042
+L043
+L044
+L045
+L046
+L047
+L048
+L049
+L050
+L051
+L052
+L053
+L054
+L055
+L056
+L057
+L058
+L059
+L060
+L061
+L062
+L063
+L064
+L065
+L066
+L067
+L068
+L069
+L070
+L071
+L072
+L073
+L074
+L075
+L076
+L077
+L078
+L079
+L080
+L081
+L082
+L083
+L084
+L085
+L086
+L087
+L088
+L089
+L090
+L091
+L092
+L093
+L094
+L095
+L096
+L097
+L098
+L099
+L100
+L101
+L102
+L103
+L104
+L105
+L106
+L107
+L108
+L109
+L110
+L111
+L112
+L113
+L114
+L115
+L116
+L117
+L118
+L119
+L120
+L121
+L122
+L123
+L124
+L125
+L126
+L127
+L128
+L129
+L130
+MATCH
+## END
+## stdout-json: "L031\nL032\nL033\nL034\nL035\nL036\nL037\nL038\nL039\nL040\nL041\nL042\nL043\nL044\nL045\nL046\nL047\nL048\nL049\nL050\nL051\nL052\nL053\nL054\nL055\nL056\nL057\nL058\nL059\nL060\nL061\nL062\nL063\nL064\nL065\nL066\nL067\nL068\nL069\nL070\nL071\nL072\nL073\nL074\nL075\nL076\nL077\nL078\nL079\nL080\nL081\nL082\nL083\nL084\nL085\nL086\nL087\nL088\nL089\nL090\nL091\nL092\nL093\nL094\nL095\nL096\nL097\nL098\nL099\nL100\nL101\nL102\nL103\nL104\nL105\nL106\nL107\nL108\nL109\nL110\nL111\nL112\nL113\nL114\nL115\nL116\nL117\nL118\nL119\nL120\nL121\nL122\nL123\nL124\nL125\nL126\nL127\nL128\nL129\nL130\nMATCH\n"
+## stderr-json: ""
+## status: 0
+
+#### the digit run must START the element, so a cluster diverges only one way round
+# `-123i' is a digit run then `i', so the run starts the element and loses its
+# first digit: 23 in GNU. `-i123' is pinned as an agreeing case next door -- there
+# the element starts with a letter and the run keeps every digit. Nothing else
+# distinguishes them, so a parser that scanned letters before digits would move
+# both with no other case failing.
+## argv: grep MATCH big -123i
+## file big:
+L001
+L002
+L003
+L004
+L005
+L006
+L007
+L008
+L009
+L010
+L011
+L012
+L013
+L014
+L015
+L016
+L017
+L018
+L019
+L020
+L021
+L022
+L023
+L024
+L025
+L026
+L027
+L028
+L029
+L030
+L031
+L032
+L033
+L034
+L035
+L036
+L037
+L038
+L039
+L040
+L041
+L042
+L043
+L044
+L045
+L046
+L047
+L048
+L049
+L050
+L051
+L052
+L053
+L054
+L055
+L056
+L057
+L058
+L059
+L060
+L061
+L062
+L063
+L064
+L065
+L066
+L067
+L068
+L069
+L070
+L071
+L072
+L073
+L074
+L075
+L076
+L077
+L078
+L079
+L080
+L081
+L082
+L083
+L084
+L085
+L086
+L087
+L088
+L089
+L090
+L091
+L092
+L093
+L094
+L095
+L096
+L097
+L098
+L099
+L100
+L101
+L102
+L103
+L104
+L105
+L106
+L107
+L108
+L109
+L110
+L111
+L112
+L113
+L114
+L115
+L116
+L117
+L118
+L119
+L120
+L121
+L122
+L123
+L124
+L125
+L126
+L127
+L128
+L129
+L130
+MATCH
+## END
+## stdout-json: "L008\nL009\nL010\nL011\nL012\nL013\nL014\nL015\nL016\nL017\nL018\nL019\nL020\nL021\nL022\nL023\nL024\nL025\nL026\nL027\nL028\nL029\nL030\nL031\nL032\nL033\nL034\nL035\nL036\nL037\nL038\nL039\nL040\nL041\nL042\nL043\nL044\nL045\nL046\nL047\nL048\nL049\nL050\nL051\nL052\nL053\nL054\nL055\nL056\nL057\nL058\nL059\nL060\nL061\nL062\nL063\nL064\nL065\nL066\nL067\nL068\nL069\nL070\nL071\nL072\nL073\nL074\nL075\nL076\nL077\nL078\nL079\nL080\nL081\nL082\nL083\nL084\nL085\nL086\nL087\nL088\nL089\nL090\nL091\nL092\nL093\nL094\nL095\nL096\nL097\nL098\nL099\nL100\nL101\nL102\nL103\nL104\nL105\nL106\nL107\nL108\nL109\nL110\nL111\nL112\nL113\nL114\nL115\nL116\nL117\nL118\nL119\nL120\nL121\nL122\nL123\nL124\nL125\nL126\nL127\nL128\nL129\nL130\nMATCH\n"
 ## stderr-json: ""
 ## status: 0

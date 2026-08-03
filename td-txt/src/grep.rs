@@ -5,17 +5,21 @@
 //! inputs are read whole, so a pattern never straddles a read boundary.
 //!
 //! Deliberate omissions: no `-P` (PCRE — a second regex engine), no `--color`,
-//! no `--include`/`--exclude` globs, no `-b` byte offsets, and no `-NUM` context
-//! count (`-A`/`-B`/`-C` spell it). Each is a diagnosed `invalid option`, never a
-//! silent no-op, and each is pinned in spec/divergence.test.txt.
+//! no `--include`/`--exclude` globs, and no `-b` byte offsets. Each is a
+//! diagnosed `invalid option`, never a silent no-op, and each is pinned in
+//! spec/divergence.test.txt.
 
 use crate::regex::{Filter, OnBudget, Options, Regex};
 use crate::util::{
-    errmsg, number, path_bytes, print_line, read_input, read_search, records, show, walk, Diag,
-    Out, VERSION,
+    errmsg, number, path_bytes, posixly_correct, print_line, read_input, read_search, records,
+    show, walk, Diag, Out, VERSION,
 };
 
-const USAGE: &str = "usage: grep [-EFGHhicLlnoqsvwxrzZ] [-m NUM] [-A NUM] [-B NUM] [-C NUM] \
+/// How many significant digits `-NUM` takes before refusing the run. GNU's own
+/// scanner stops there; the `-A`/`-B`/`-C` argument has no such limit.
+const NUM_DIGIT_CAP: usize = 21;
+
+const USAGE: &str = "usage: grep [-aEFGHhicLlnoqRrsvwxyzZ] [-NUM] [-m NUM] [-A NUM] [-B NUM] [-C NUM] \
                      [-e PATTERN] [-f FILE] [PATTERN] [FILE]...";
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -379,12 +383,17 @@ pub fn main(args: &[Vec<u8>]) -> i32 {
     let mut files: Vec<Vec<u8>> = Vec::new();
     let mut operands: Vec<Vec<u8>> = Vec::new();
     let mut no_more_options = false;
+    // grep gets only the option-order half: its ERE rules do not change with it.
+    let posixly = posixly_correct();
 
     let mut i = 1usize;
     while let Some(arg) = args.get(i) {
         i += 1;
         if no_more_options || arg.first() != Some(&b'-') || arg.len() == 1 {
             operands.push(arg.clone());
+            // Under POSIXLY_CORRECT the first operand ends options, so what
+            // follows is a FILE -- `--` and a `-NUM` included.
+            no_more_options |= posixly;
             continue;
         }
         if arg.as_slice() == b"--" {
@@ -466,6 +475,40 @@ pub fn main(args: &[Vec<u8>]) -> i32 {
         let mut j = 1usize;
         while let Some(opt) = arg.get(j).copied() {
             j += 1;
+            // `-NUM` is GNU's fourth spelling of a context count, and it is an
+            // ordinary cluster element: the RUN of digits is the count, and
+            // parsing goes on after it (`-2n`, `-n2`, `-2A1` all work). It sets
+            // what `-C` sets, so an explicit `-A`/`-B` still outranks it.
+            if opt.is_ascii_digit() {
+                let start = j - 1;
+                while arg.get(j).is_some_and(u8::is_ascii_digit) {
+                    j += 1;
+                }
+                // `start < j <= arg.len()`, so the run is always there.
+                let digits = arg.get(start..j).unwrap_or_default();
+                // This spelling caps the run at 21 SIGNIFICANT digits where the
+                // `-A`/`-B`/`-C` argument does not, and echoes the digits it
+                // took before giving up. Leading zeros are not significant.
+                let significant = digits.iter().skip_while(|b| **b == b'0').count();
+                if significant > NUM_DIGIT_CAP {
+                    let kept: Vec<u8> = digits
+                        .iter()
+                        .skip_while(|b| **b == b'0')
+                        .take(NUM_DIGIT_CAP)
+                        .copied()
+                        .collect();
+                    err(&format!("{}...: invalid context length argument", show(&kept)));
+                    return 2;
+                }
+                // Under the cap a run of digits always reads -- the shared
+                // reader saturates rather than failing -- so this is a floor.
+                let Some(n) = parse_count(digits) else {
+                    err(&format!("{}: invalid context length argument", show(digits)));
+                    return 2;
+                };
+                conf.both = Some(n);
+                continue;
+            }
             let value_of = |j: &mut usize, i: &mut usize| -> Option<Vec<u8>> {
                 if let Some(rest) = arg.get(*j..) {
                     if !rest.is_empty() {
@@ -936,24 +979,67 @@ fn apply_count(conf: &mut Conf, opt: u8, n: usize) {
     }
 }
 
-/// `-m`'s argument. GNU reads a NEGATIVE count as no limit at all, so it must
-/// not go through the unsigned context parser.
-fn parse_max_count(v: &[u8]) -> Option<Option<u64>> {
-    if let Some(rest) = v.strip_prefix(b"-") {
-        return parse_count(rest).map(|_| None);
-    }
-    parse_count(v).map(|n| Some(n as u64))
+/// A numeric option argument as GNU's reader takes one: leading whitespace, an
+/// optional SIGN, decimal digits (leading zeros and all), and nothing after
+/// them. What a negative MEANS is the caller's question -- `-m` reads one as no
+/// limit where a context count refuses it -- so the sign is returned rather
+/// than judged here.
+struct Num {
+    negative: bool,
+    value: u64,
 }
 
-fn parse_count(v: &[u8]) -> Option<usize> {
-    if v.is_empty() || !v.iter().all(u8::is_ascii_digit) {
+/// A value past what fits SATURATES rather than failing. GNU's reader does, and
+/// any count past the input's length already means what the largest one means.
+fn parse_num(v: &[u8]) -> Option<Num> {
+    let mut i = 0usize;
+    while matches!(v.get(i), Some(b' ' | b'\t' | b'\n' | 0x0b | 0x0c | b'\r')) {
+        i += 1;
+    }
+    let negative = match v.get(i) {
+        Some(b'-') => {
+            i += 1;
+            true
+        }
+        Some(b'+') => {
+            i += 1;
+            false
+        }
+        _ => false,
+    };
+    let digits = v.get(i..)?;
+    if digits.is_empty() || !digits.iter().all(u8::is_ascii_digit) {
         return None;
     }
-    let mut n: usize = 0;
-    for b in v {
-        n = n.checked_mul(10)?.checked_add(usize::from(b - b'0'))?;
+    let mut value: u64 = 0;
+    for b in digits {
+        // The guard above makes every byte a digit, so the subtraction cannot
+        // wrap; it saturates rather than `-` only because a bare `-` would
+        // panic in debug if that guard were ever widened.
+        value = value.saturating_mul(10).saturating_add(u64::from(b.saturating_sub(b'0')));
     }
-    Some(n)
+    Some(Num { negative, value })
+}
+
+/// `-m`'s argument. A NEGATIVE count is no limit at all -- but `-0` is a zero
+/// like any other, since only the VALUE being negative makes it unbounded.
+fn parse_max_count(v: &[u8]) -> Option<Option<u64>> {
+    let n = parse_num(v)?;
+    if n.negative && n.value != 0 {
+        return Some(None);
+    }
+    Some(Some(n.value))
+}
+
+/// A context count. Negative is refused, `-0` again excepted.
+fn parse_count(v: &[u8]) -> Option<usize> {
+    let n = parse_num(v)?;
+    if n.negative && n.value != 0 {
+        return None;
+    }
+    // Saturating, not `try_from(..).ok()?`: a count past `usize` is still a
+    // count, and td-txt counts rather than allocating for it.
+    Some(usize::try_from(n.value).unwrap_or(usize::MAX))
 }
 
 /// A `-e` argument is a pattern LIST, and its final newline is a separator like
@@ -1372,5 +1458,48 @@ mod tests {
         assert_eq!(parse_count(b"12"), Some(12));
         assert_eq!(parse_count(b"1x"), None);
         assert_eq!(parse_count(b""), None);
+    }
+
+    /// The whole numeric grammar, byte by byte. Only LF is impossible in a
+    /// corpus `## argv:` line -- it is ONE line -- but a raw VT/FF/CR there is
+    /// an invisible byte in a file people read and edit, so all six live here.
+    #[test]
+    fn parse_num_takes_every_c_whitespace_byte_before_the_digits() {
+        for ws in [b' ', b'\t', b'\n', 0x0b, 0x0c, b'\r'] {
+            let arg = [ws, b'1'];
+            assert_eq!(parse_count(&arg), Some(1), "leading {ws:#04x}");
+            let signed = [ws, b'+', b'1'];
+            assert_eq!(parse_count(&signed), Some(1), "leading {ws:#04x} then +");
+            // Trailing is not leading: the same byte after the digits is fatal.
+            let trailing = [b'1', ws];
+            assert_eq!(parse_count(&trailing), None, "trailing {ws:#04x}");
+        }
+    }
+
+    #[test]
+    fn parse_num_saturates_rather_than_failing() {
+        assert_eq!(parse_count(b"18446744073709551616"), Some(usize::MAX));
+        assert_eq!(parse_count(b"99999999999999999999999999"), Some(usize::MAX));
+        assert_eq!(parse_max_count(b"18446744073709551616"), Some(Some(u64::MAX)));
+    }
+
+    #[test]
+    fn a_negative_means_what_the_option_says_it_means() {
+        // A context count refuses one; `-m` reads it as no limit at all.
+        assert_eq!(parse_count(b"-1"), None);
+        assert_eq!(parse_max_count(b"-1"), Some(None));
+        // `-0` is the negative whose VALUE is not, so both take it as a zero.
+        assert_eq!(parse_count(b"-0"), Some(0));
+        assert_eq!(parse_count(b"-00"), Some(0));
+        assert_eq!(parse_max_count(b"-0"), Some(Some(0)));
+    }
+
+    #[test]
+    fn parse_num_refuses_what_is_not_a_plain_decimal() {
+        for bad in [&b"++1"[..], b"+-1", b"- 1", b"0x10", b"1e2", b"1_0", b"+", b"-", b".", b" "] {
+            assert_eq!(parse_count(bad), None, "{}", show(bad));
+        }
+        // Leading zeros are decimal, not octal.
+        assert_eq!(parse_count(b"010"), Some(10));
     }
 }

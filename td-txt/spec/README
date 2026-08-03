@@ -515,6 +515,40 @@ td-txt-authored case files
   keeps two lines after and takes zero before, `-C0 -A2` is the same thing, and
   `-A2 -B1 -C3` ignores the `-C` outright. Among themselves each is
   last-one-wins: a second `-A` replaces the first, a second `-C` the first.
+  `-NUM` is a fourth spelling of `-C` and shares its slot, so `-C3 -1` is one
+  and `-1 -C3` is three; it is an ordinary cluster element, a RUN of digits
+  making one count (`-12` is twelve, not one then two) with parsing going on
+  after it, so `-2n`, `-n2` and `-2m1` all mean what they look like. It is one
+  count in every POSITION too, which GNU is not -- see the permuted-`-NUM`
+  divergence below, where GNU drops a run's first digit and reads the rest as
+  one number all the same. That run
+  is capped at 21 SIGNIFICANT digits -- leading zeros not counting -- and the
+  22nd is `<the 21 it took>...: invalid context length argument` at exit 2. The
+  cap belongs to the spelling and not to the number: the same value handed to
+  `-A`/`-B`/`-C` is read without complaint.
+
+  WHERE an option may SIT is decided by the environment. GNU permutes: it
+  collects options wherever they appear, so `grep a h -n` numbers its output
+  even though the flag came after the file. POSIX says the first operand ends
+  the options, and `POSIXLY_CORRECT` is what asks GNU for that -- so with it set
+  the same command reports `-n: No such file or directory` at exit 2, having
+  read it as a third operand. Both applets do this, sed with its SCRIPT in the
+  first operand's place. The variable is read for PRESENCE and never for a
+  value: empty, `0` and `no` all stop the permutation, so nothing but unsetting
+  it turns the permutation back on. What "operand" means here is positional and
+  nothing else -- an option-ARGUMENT is not one, so the `a` in `-e a -n h` and
+  the `2` in `-m 2 a h -n` do not end anything, and each flag that PRECEDES the
+  first operand is still taken; a bare `-` is one, being stdin's name; and which
+  operand SLOT is being filled does not matter, so in `-n h a` the pattern `h`
+  ends the options and `a` is a file. Past that point `--` has no marker
+  meaning left to have and names a file like anything else, and so does a
+  `-NUM`. BEFORE the first operand everything parses as it always did.
+
+  Option ORDER is all td-txt reads the variable for. In sed GNU gives it a
+  second job -- a POSIX mode -- which td-txt does NOT drive from it; that is
+  the gap recorded below, and the reason is that the variable and `--posix` are
+  not the same switch. grep gets only the option-order half in GNU too: its ERE
+  rules do not change with the variable.
 
   WHICH lines `-o` prints is a third thing, and it is not "the ones that
   match". GNU prints the spans of the MATCHING lines it prints -- the selected
@@ -525,6 +559,17 @@ td-txt-authored case files
   which is why the rule reads as "`-o` drops context lines" on almost every
   input; `-m` is where they come apart, since a context line PAST the limit can
   match and still print nothing. `-m` never shortens the drain itself.
+
+  A NUMERIC option argument goes through ONE reader, shared by `-A`, `-B`,
+  `-C` and `-m`: leading whitespace (the C set, tab through carriage return and
+  space), an optional SIGN, decimal digits with leading zeros allowed and no
+  octal reading of them, and nothing at all after them -- so ` +1` and `010`
+  are counts where `1 ` and `0x10` are `invalid context length argument`. A
+  value past what fits SATURATES rather than failing, since any count past the
+  input's length already means what the largest one means. What a NEGATIVE
+  means is the option's question rather than the reader's: `-m -1` is no limit
+  at all, a context count refuses one -- and `-0` is a zero to both, being the
+  one negative whose value is not.
 
   `--help` and `--version` are answered AFTER that scan rather than where they
   are read, so anything the scan itself raises outranks them from either side:
@@ -725,6 +770,9 @@ td-txt-authored case files
   both. That second rule is a GNU EXTENSION, so `--posix` drops it and the
   character is ordinary again -- while leaving the interval rules alone, which is
   why the two halves of this paragraph need different treatment under the flag.
+  td-txt drops it for the ERE spelling `)` ONLY: GNU relaxes the BRE `\)` under
+  the flag too, so `sed --posix 's/a\)/X/'` runs there and is refused here. Its
+  own gap, below.
 
   Stacking is otherwise unchanged and is the same two rules as before, both of
   them SED's: its BRE refuses a second `*` or interval after ANY operator (`a**`,
@@ -753,9 +801,9 @@ td-txt-authored case files
   something GNU's `--posix` relaxes got modelled.
 
   - `--posix`, above: implemented for one behaviour of twelve-plus, silently
-    ignored for the rest. `POSIXLY_CORRECT` selects the same mode in GNU and is not
-    read at all here (`POSIXLY_CORRECT=1 sed '$!d;N'` over two lines prints nothing
-    in GNU and the second line here), and GNU refuses `v` outright under the flag
+    ignored for the rest. `POSIXLY_CORRECT` selects a POSIX mode in GNU too,
+    but a WEAKER one, and td-txt does not drive this flag from it at all; that
+    is its own entry below. GNU refuses `v` outright under the flag
     (`unknown command: `v'`) while clearing posix mode is `v`'s documented side
     effect when it is allowed -- neither of which td-txt has anywhere to put until
     the mode exists.
@@ -849,20 +897,25 @@ td-txt-authored case files
     is `2` in GNU and `1` here. The `-x` entry below is a different question
     about the same byte and does not cover this. Pre-existing.
 
-  - A context COUNT past what fits: `grep -A 99999999999999999999` clamps in
-    GNU and is `invalid context length argument` at exit 2 here. The corpus
-    pins a NON-NUMERIC argument, where GNU errors too, so it does not cover
-    this. Pre-existing.
-
   - GNU's extra EMPTY span under `-o` with `-x` and `-w` together: `grep -o -w
     -x a` over `a/ab` is `a` and an empty line in GNU and just `a` here. It
     needs no context flag, so it is not part of the range rule above, and the
     `-w -o` case in the corpus is one where the two AGREE. Pre-existing.
 
-  - `-NUM`, the fourth context spelling: `grep -2 a f` is `-C2` in GNU and
-    `invalid option -- '2'` at exit 2 here. It obeys the resolution rule above
-    like the others (`-A2 -1` is one line before and two after), so it is a
-    spelling this applet lacks rather than a rule it gets wrong. Pre-existing.
+  - A huge `-B`/`-C`/`-NUM` count costs GNU TIME, not memory, and past a point it
+    stops finishing at all. Its output path walks back the before-count in a
+    loop that runs to the full count however little input there is, so the
+    cost is linear in the NUMBER rather than in the file: `-B 100000000` takes
+    119ms, `-B 200000000` 204ms, `-B 999999999` 1024ms, and
+    `-B 99999999999999999999` was still going at 20 seconds. It is not an
+    allocation -- under a 200 MiB address-space cap `-B 999999999` still
+    completes in 1027ms. `-A`, which only counts down, is 2ms at any count.
+    (A careless measurement sees none of this: GNU treats a `/dev/null`
+    stdout as `-q`, so the same command is 6ms there.) td-txt indexes input
+    it has already read, so every count costs the same 4ms, and what it prints
+    is what GNU prints for every count GNU finishes. Deliberate: a wait with
+    no end is not a behaviour to reproduce, and this is the answer GNU is
+    computing.
 
   - A missing OPTION-ARGUMENT prints no usage line after the diagnostic for
     `-m`/`-A`/`-B`/`-C`, where `-e`, `-f`, an unknown short option and every
@@ -872,11 +925,70 @@ td-txt-authored case files
     sweeps, whose classifier strips each side's usage pointer before
     comparing.
 
-  - `POSIXLY_CORRECT`, which stops GNU permuting options after the first
-    operand: `POSIXLY_CORRECT=1 grep -l a f -L g` is `f` plus `-L: No such file
-    or directory` at exit 2 in GNU, and `g` at exit 0 here, which permutes
-    unconditionally. spec/README records the variable as unread by `sed`; grep
-    reads it and this does not.
+  - `POSIXLY_CORRECT` selects a POSIX MODE in GNU sed, on top of the option
+    order it now decides. td-txt does not drive its `--posix` flag from the
+    variable, and the reason is measured rather than assumed: across 200
+    script/input probes the two spellings DISAGREE on 76 of them, and every
+    PURE disagreement is the same shape -- `POSIXLY_CORRECT` behaves like the
+    default while `--posix` refuses a GNU extension outright (`1~2d`, `0~2p`,
+    `l 5`, `v`). (A third class exists and is rarer: a script combining a
+    refused extension with a shared rule, like `N;s/^b$/X/M`, differs all three
+    ways.) So `--posix` is the strictly stronger switch, and wiring one flag to
+    both would make td-txt refuse, under a variable build systems routinely
+    set, scripts GNU accepts -- as soon as any `--posix` refusal is
+    implemented. It would also regress `v` TODAY: GNU's `v` CLEARS posix mode,
+    so `POSIXLY_CORRECT=1 sed 'v;$!d;N'` prints `a` in GNU, and a td-txt with
+    the two wired together printed nothing.
+    Both sides of that measurement, for whoever closes this: over 972 argv the
+    wiring FIXES 99 and BREAKS 48, and all 48 breaks contain `v` -- so it is
+    net positive, and `v` clearing the new flag is the whole of what stands
+    between here and there. `v` clears the mode even as the LAST command, and
+    GNU clears it mid-COMPILE, so later regexes compile differently; td-txt's
+    `posix` is an immutable parameter threaded through `compile_script` into
+    each regex's `Options` and copied to the executor, so this wants a mutable
+    compile-time flag rather than a second constant.
+    What the variable DOES change and `--posix` already gets right here is
+    pinned as three xfails in sed-cli.test.txt with GNU's goldens, including
+    the sharp one: `POSIXLY_CORRECT=1 sed -E 's/a)/X/'` runs in GNU and is
+    REFUSED at exit 1 here, a worse failure than a wrong line. Closing it wants
+    a second flag for the shared behaviours, not a rename of this one.
+
+  - `sed --posix` relaxes the BRE `\)` as well as the ERE `)`, and td-txt
+    relaxes only the ERE one, so `sed --posix 's/a\)/X/'` runs in GNU and is
+    refused at exit 1 here. The one rule the flag DOES implement turns out to
+    be half a rule. Found while measuring the entry above; it is the flag's
+    gap, not the variable's, and the second-flag landing has this to implement
+    too.
+
+  - A PERMUTED multi-digit `-NUM` loses its FIRST digit in GNU, and td-txt
+    keeps the whole run. Deliberate. `grep MATCH f -12 -A0` takes two lines of
+    context there and twelve here; `-123` is 23, `-1234` is 234, `-210` is 10.
+    It is positional and nothing else. Argv reads as alternating OPERAND and
+    OPTION blocks, and the FIRST element of every option block that follows an
+    operand loses its first digit if it is a digit run. So `-12 MATCH f` keeps
+    every digit (its block precedes any operand); `MATCH f -A0 -12` and `MATCH
+    f -n -12 -A0` keep every digit (the run does not START its block); and a
+    single digit has none to lose. But it recurs per BLOCK rather than once per
+    command: `MATCH f -123 /dev/null -456` truncates the SECOND run too, to 56,
+    and `MATCH -A0 f -123` truncates, because there the `-A0` is in the block
+    BEFORE the operand. Two runs are safe only while ADJACENT, in one block --
+    `-12 -34` is 34 because the truncated `-12` loses to last-one-wins. That shape is getopt's
+    permutation bookkeeping resetting the digit buffer mid-run, once per run -- no
+    reading of the option makes a count mean one thing after a filename and
+    another before it. Reproducing it would mean emulating getopt's optind
+    state to reproduce a count that silently drops a digit by position, which
+    is not a behaviour a caller can want; td-txt answers every position with
+    the number that was written. Pinned in divergence.test.txt with td-txt's
+    goldens, and the five agreeing positions are pinned in grep-cli.test.txt
+    with GNU's.
+    Recorded because two earlier readings of this were wrong in the same way:
+    first "keeps only its LAST digit", then a review's correction agreeing on
+    "last" with `-123`->3 and `-1234`->4. Both were measured on files so small
+    that any context past 4 covered the whole file, so 23 and 234 were
+    indistinguishable from 3 and 4. Both counts must be UNCLAMPED for the
+    answers to differ at all, which is why the pinned cases put 130 lines
+    before the match -- a third instance of the same too-small fixture reached
+    review inside this very landing.
 
   - `-x` over a file holding a NUL, where GNU reports `binary file matches` at
     exit 0 and td-txt selects nothing and exits 1. The whole-line test and the
@@ -1132,6 +1244,20 @@ td-txt-authored case files
   goldens are td-txt's, pinning behavior it chooses differently on purpose (no
   shell-executing `sed e`, no PCRE `grep -P`, no `sed --debug`). Its cases are
   the record of those decisions.
+
+  A case here carries an assertion the gate CANNOT check: that GNU answers
+  differently. The goldens are td-txt's, so a case whose divergence has
+  quietly evaporated -- or never existed, the fixture being too weak to show
+  it -- passes forever while asserting nothing. The oracles are not available
+  offline, so this cannot be a test; it is a rule for adding one. RUN the
+  oracle against a new case and confirm it does NOT match, comparing status,
+  stdout AND stderr: for every refusal here the whole divergence is the
+  diagnostic, so a check that reads only status and stdout reports agreement.
+  All 32 cases were verified this way when the `-NUM` decision landed -- 30
+  differ, and the other TWO are counts GNU never finishes, so they are not
+  comparable by construction and their divergence is the non-finishing itself.
+  Re-run it when adding one: the count in this sentence is part of what it
+  asserts, and it was wrong once already between writing it and checking it.
 
 
 Overlay

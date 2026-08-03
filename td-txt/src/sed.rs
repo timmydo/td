@@ -23,7 +23,9 @@ use std::io::{Read, Seek, Write};
 use std::path::{Path, PathBuf};
 
 use crate::regex::{Captures, Options, Regex};
-use crate::util::{errmsg, number, print_line, read_input, records, show, Out, VERSION};
+use crate::util::{
+    errmsg, number, posixly_correct, print_line, read_input, records, show, Out, VERSION,
+};
 
 const USAGE: &str = "usage: sed [-nrEsz] [-i[SUFFIX]] [-e SCRIPT] [-f FILE] [SCRIPT] [FILE]...";
 
@@ -1851,18 +1853,25 @@ fn run(args: &[Vec<u8>]) -> Result<i32, Fatal> {
         separate: false,
         null_data: false,
         in_place: None,
+        // NOT driven from POSIXLY_CORRECT: that variable and `--posix` are
+        // different switches in GNU, and `conf.posix` is `--posix`'s. See the
+        // POSIXLY_CORRECT gap in spec/README.
         posix: false,
     };
     let mut script_parts: Vec<Vec<u8>> = Vec::new();
     let mut script_given = false;
     let mut operands: Vec<Vec<u8>> = Vec::new();
     let mut no_more_options = false;
+    let posixly = posixly_correct();
 
     let mut i = 1usize;
     while let Some(arg) = args.get(i) {
         i += 1;
         if no_more_options || arg.first() != Some(&b'-') || arg.len() == 1 {
             operands.push(arg.clone());
+            // Under POSIXLY_CORRECT the first operand ends options, so what
+            // follows is a FILE, `--` included. (sed has no `-NUM` spelling.)
+            no_more_options |= posixly;
             continue;
         }
         if arg.as_slice() == b"--" {

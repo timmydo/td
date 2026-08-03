@@ -56,3 +56,6 @@ xfail sed-cli.test.txt::a [ consumed as a closer test leaves the reader somewher
 xfail sed-cli.test.txt::and the same shape after an earlier sub-expression
 xfail sed-cli.test.txt::the same with a class
 xfail sed-cli.test.txt::and with an equivalence class
+xfail sed-cli.test.txt::POSIXLY_CORRECT also selects a POSIX mode, which td-txt does not drive
+xfail sed-cli.test.txt::N;P;D under the variable, the other half of that same rule
+xfail sed-cli.test.txt::POSIX mode makes an unmatched ) ordinary in an ERE, so GNU compiles this

@@ -6340,3 +6340,173 @@ b/p'
 ## stdout-json: ""
 ## stderr-contains: Invalid preceding regular expression
 ## status: 1
+
+# ---- POSIXLY_CORRECT ------------------------------------------------------
+
+#### POSIXLY_CORRECT stops sed's permutation too
+# The same getopt rule grep has: the SCRIPT is the first operand, so `-n' after the
+# file is a filename. Without the variable sed permutes and `-n' suppresses the
+# automatic print, which is the difference between one copy of each line and two.
+## argv: sed p h -n
+## file h:
+a
+b
+a
+## END
+## env POSIXLY_CORRECT: 1
+## stdout-json: "a\na\nb\nb\na\na\n"
+## stderr-json: "sed: can't read -n: No such file or directory\n"
+## status: 2
+
+#### and the same argv permutes with the variable unset
+## argv: sed p h -n
+## file h:
+a
+b
+a
+## END
+## stdout-json: "a\nb\na\n"
+## stderr-json: ""
+## status: 0
+
+#### empty is still set, for sed as for grep
+## argv: sed p h -n
+## file h:
+a
+b
+a
+## END
+## env POSIXLY_CORRECT:
+## END
+## stdout-json: "a\na\nb\nb\na\na\n"
+## stderr-json: "sed: can't read -n: No such file or directory\n"
+## status: 2
+
+#### an option before the script operand is still an option
+## argv: sed -n p h
+## file h:
+a
+b
+a
+## END
+## env POSIXLY_CORRECT: 1
+## stdout-json: "a\nb\na\n"
+## stderr-json: ""
+## status: 0
+
+#### -e's script is an option-argument, so it does not end the options
+## argv: sed -e p -n h
+## file h:
+a
+b
+a
+## END
+## env POSIXLY_CORRECT: 1
+## stdout-json: "a\nb\na\n"
+## stderr-json: ""
+## status: 0
+
+#### POSIXLY_CORRECT also selects a POSIX mode, which td-txt does not drive
+# XFAIL, and the golden is GNU's. The variable's second job: `N' at end of input
+# prints the pattern space in GNU's default mode and does not in POSIX mode.
+# td-txt has `--posix' and gets this right under it, but does NOT drive that flag
+# from the variable -- the two are different switches in GNU, so one flag cannot
+# serve both. See the POSIXLY_CORRECT gap in spec/README for the measurement.
+## argv: sed $!d;N h
+## file h:
+a
+b
+a
+## END
+## env POSIXLY_CORRECT: 1
+## stdout-json: ""
+## stderr-json: ""
+## status: 0
+
+#### and the same script without the variable keeps GNU's default
+## argv: sed $!d;N h
+## file h:
+a
+b
+a
+## END
+## stdout-json: "a\n"
+## stderr-json: ""
+## status: 0
+
+#### N;P;D under the variable, the other half of that same rule
+## argv: sed N;P;D h
+## file h:
+a
+b
+a
+## END
+## env POSIXLY_CORRECT: 1
+## stdout-json: "a\nb\n"
+## stderr-json: ""
+## status: 0
+
+#### POSIX mode makes an unmatched ) ordinary in an ERE, so GNU compiles this
+# XFAIL, and the sharp one: td-txt REFUSES at exit 1 a script GNU runs, which is a
+# worse failure than a wrong line. GNU's ERE takes an unmatched `)' as an error by
+# extension and POSIX says it is ordinary; `sed --posix -E s/a)/X/' is already
+# right here -- for THAT spelling only: the BRE `\)' is a second gap, see README. What is missing is a SECOND flag for the behaviours both spellings
+# share -- not this one driven from the variable; see README and the two guard
+# cases at the end of this file for why that shortcut is wrong.
+## argv: sed -E s/a)/X/ h
+## file h:
+a
+b
+a
+## END
+## env POSIXLY_CORRECT: 1
+## stdout-json: "a\nb\na\n"
+## stderr-json: ""
+## status: 0
+
+#### and without the variable that same ERE is still refused
+## argv: sed -E s/a)/X/ h
+## file h:
+a
+b
+a
+## END
+## stdout-json: ""
+# The `, char 7' GNU puts in this diagnostic is a pre-existing omission here,
+# so the wording is asserted by substring; the REFUSAL is what this pins.
+## stderr-contains: Unmatched ) or \)
+## status: 1
+
+#### the variable is NOT --posix: v is accepted under it and clears the mode
+# This case exists to stop the three xfails above being 'fixed' by wiring the
+# variable to the --posix flag. GNU refuses `v' under --posix but ACCEPTS it under
+# the variable, where its documented side effect is to clear posix mode -- so the
+# `$!d;N' after it runs in DEFAULT mode and prints `a'. One flag driving both
+# spellings prints nothing here, which is how that mistake announces itself.
+## argv: sed v;$!d;N h
+## file h:
+a
+b
+a
+## END
+## env POSIXLY_CORRECT: 1
+## stdout-json: "a\n"
+## stderr-json: ""
+## status: 0
+
+#### nor for a GNU address extension: 1~2 works under the variable
+# The same guard from the other side. `--posix' refuses `~' outright; the variable
+# leaves it alone. Across 200 probes the two spellings disagreed on 76, all of this
+# shape, which is why they cannot share a flag. Unlike the `v' case above this one
+# does not discriminate TODAY -- td-txt's --posix does not refuse `~' either, so
+# wiring the flag would not red it. It is here for when that refusal lands.
+## argv: sed 1~2d h
+## file h:
+a
+b
+a
+## END
+## env POSIXLY_CORRECT: 1
+## stdout-json: "b\n"
+## stderr-json: ""
+## status: 0

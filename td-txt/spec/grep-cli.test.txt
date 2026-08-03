@@ -5006,3 +5006,929 @@ zz
 ## stdout-json: "txt:a\n--\ntxt:a\n"
 ## stderr-json: ""
 ## status: 0
+
+#### a context count takes a leading + as GNU's reader does
+# The argument goes through one reader shared with -m: leading whitespace, an
+# optional sign, decimal digits, and nothing after them.
+## argv: grep -A +1 -n a h
+## file h:
+a
+b
+b
+b
+b
+a
+## END
+## stdout-json: "1:a\n2-b\n--\n6:a\n"
+## stderr-json: ""
+## status: 0
+
+#### and leading WHITESPACE before it
+## argv: grep -A ' 1' -n a h
+## file h:
+a
+b
+b
+b
+b
+a
+## END
+## stdout-json: "1:a\n2-b\n--\n6:a\n"
+## stderr-json: ""
+## status: 0
+
+#### a tab counts as that whitespace
+## argv: grep -A '	1' -n a h
+## file h:
+a
+b
+b
+b
+b
+a
+## END
+## stdout-json: "1:a\n2-b\n--\n6:a\n"
+## stderr-json: ""
+## status: 0
+
+#### but a trailing byte does not, space included
+## argv: grep -A '1 ' -n a h
+## file h:
+a
+b
+b
+b
+b
+a
+## END
+## stdout-json: ""
+## stderr-contains: 1 : invalid context length argument
+## status: 2
+
+#### leading zeros are decimal, not octal
+## argv: grep -A 010 -n a h
+## file h:
+a
+b
+b
+b
+b
+a
+## END
+## stdout-json: "1:a\n2-b\n3-b\n4-b\n5-b\n6:a\n"
+## stderr-json: ""
+## status: 0
+
+#### a NEGATIVE context count is refused
+## argv: grep -A -1 -n a h
+## file h:
+a
+b
+b
+b
+b
+a
+## END
+## stdout-json: ""
+## stderr-contains: -1: invalid context length argument
+## status: 2
+
+#### except -0, the one negative that is not one
+## argv: grep -A -0 -n a h
+## file h:
+a
+b
+b
+b
+b
+a
+## END
+## stdout-json: "1:a\n--\n6:a\n"
+## stderr-json: ""
+## status: 0
+
+#### -m reads the same argument but takes a negative as NO limit
+# Where a context count refuses it. The shared reader returns the sign and
+# leaves the meaning to the option.
+## argv: grep -m -1 -n a h
+## file h:
+a
+b
+b
+b
+b
+a
+## END
+## stdout-json: "1:a\n6:a\n"
+## stderr-json: ""
+## status: 0
+
+#### and -m -0 is a zero like any other
+## argv: grep -m -0 -n a h
+## file h:
+a
+b
+b
+b
+b
+a
+## END
+## stdout-json: ""
+## stderr-json: ""
+## status: 1
+
+#### a count past what fits SATURATES rather than failing
+# Any count past the input's length already means what the largest one means.
+## argv: grep -A 18446744073709551616 -n a h
+## file h:
+a
+b
+b
+b
+b
+a
+## END
+## stdout-json: "1:a\n2-b\n3-b\n4-b\n5-b\n6:a\n"
+## stderr-json: ""
+## status: 0
+
+#### -m saturates the same way
+## argv: grep -m 99999999999999999999 -n a h
+## file h:
+a
+b
+b
+b
+b
+a
+## END
+## stdout-json: "1:a\n6:a\n"
+## stderr-json: ""
+## status: 0
+
+#### the long spelling reads it the same
+## argv: grep --after-context=+2 -n a h
+## file h:
+a
+b
+b
+b
+b
+a
+## END
+## stdout-json: "1:a\n2-b\n3-b\n--\n6:a\n"
+## stderr-json: ""
+## status: 0
+
+#### -NUM is GNU's fourth spelling of a context count
+# It sets what -C sets, so the resolution rule holds: an explicit -A or -B
+# still outranks it, and among the two of them the last one wins.
+## argv: grep -1 -n a h
+## file h:
+a
+b
+b
+b
+b
+a
+## END
+## stdout-json: "1:a\n2-b\n--\n5-b\n6:a\n"
+## stderr-json: ""
+## status: 0
+
+#### a run of digits is one count, not one per digit
+## argv: grep -12 -n a h
+## file h:
+a
+b
+b
+b
+b
+a
+## END
+## stdout-json: "1:a\n2-b\n3-b\n4-b\n5-b\n6:a\n"
+## stderr-json: ""
+## status: 0
+
+#### with a leading zero read as decimal
+## argv: grep -02 -n a h
+## file h:
+a
+b
+b
+b
+b
+a
+## END
+## stdout-json: "1:a\n2-b\n3-b\n4-b\n5-b\n6:a\n"
+## stderr-json: ""
+## status: 0
+
+#### it is an ordinary cluster element, so parsing goes on after the run
+## argv: grep -2n a h
+## file h:
+a
+b
+b
+b
+b
+a
+## END
+## stdout-json: "1:a\n2-b\n3-b\n4-b\n5-b\n6:a\n"
+## stderr-json: ""
+## status: 0
+
+#### and can follow one
+## argv: grep -n2 a h
+## file h:
+a
+b
+b
+b
+b
+a
+## END
+## stdout-json: "1:a\n2-b\n3-b\n4-b\n5-b\n6:a\n"
+## stderr-json: ""
+## status: 0
+
+#### two runs in one cluster are two counts, the last winning
+## argv: grep -1n3 a h
+## file h:
+a
+b
+b
+b
+b
+a
+## END
+## stdout-json: "1:a\n2-b\n3-b\n4-b\n5-b\n6:a\n"
+## stderr-json: ""
+## status: 0
+
+#### an explicit -A outranks it whichever side it is written
+## argv: grep -A2 -1 -n a h
+## file h:
+a
+b
+b
+b
+b
+a
+## END
+## stdout-json: "1:a\n2-b\n3-b\n--\n5-b\n6:a\n"
+## stderr-json: ""
+## status: 0
+
+#### and from the other side too
+## argv: grep -1 -A2 -n a h
+## file h:
+a
+b
+b
+b
+b
+a
+## END
+## stdout-json: "1:a\n2-b\n3-b\n--\n5-b\n6:a\n"
+## stderr-json: ""
+## status: 0
+
+#### but -C and -NUM are the same slot, so the last one wins
+## argv: grep -C3 -1 -n a h
+## file h:
+a
+b
+b
+b
+b
+a
+## END
+## stdout-json: "1:a\n2-b\n--\n5-b\n6:a\n"
+## stderr-json: ""
+## status: 0
+
+#### in that order too
+## argv: grep -1 -C3 -n a h
+## file h:
+a
+b
+b
+b
+b
+a
+## END
+## stdout-json: "1:a\n2-b\n3-b\n4-b\n5-b\n6:a\n"
+## stderr-json: ""
+## status: 0
+
+#### and a digit run beside an option that takes a value
+## argv: grep -2m1 -n a h
+## file h:
+a
+b
+b
+b
+b
+a
+## END
+## stdout-json: "1:a\n2-b\n3-b\n"
+## stderr-json: ""
+## status: 0
+
+#### -NUM caps its run at 21 significant digits, where -A does not
+# GNU's shorthand scanner gives up at the 22nd and echoes the 21 it took.
+# The same value reaches -A/-B/-C without complaint, so the cap belongs to
+# this spelling and not to the number.
+## argv: grep -1111111111111111111111 a h
+## file h:
+a
+b
+b
+b
+b
+a
+## END
+## stdout-json: ""
+## stderr-contains: 111111111111111111111...: invalid context length argument
+## status: 2
+
+#### and leading zeros are not among those significant digits
+## argv: grep -000001111111111111111111111 a h
+## file h:
+a
+b
+b
+b
+b
+a
+## END
+## stdout-json: ""
+## stderr-contains: 111111111111111111111...: invalid context length argument
+## status: 2
+
+# ---- POSIXLY_CORRECT: the first operand ends the options ------------------
+
+#### POSIXLY_CORRECT stops the permutation, so a flag after the first operand is a FILE
+# GNU permutes by default: it collects options wherever they sit, so `grep a h -n'
+# numbers its output. POSIX says the first operand ends the options, and setting
+# POSIXLY_CORRECT is what asks GNU for that -- `-n' is then a filename that is not
+# there, which is a diagnostic and exit 2 rather than a numbered line.
+## argv: grep a h -n
+## file h:
+a
+b
+a
+## END
+## env POSIXLY_CORRECT: 1
+## stdout-json: "h:a\nh:a\n"
+## stderr-json: "grep: -n: No such file or directory\n"
+## status: 2
+
+#### and the same argv permutes with the variable unset
+## argv: grep a h -n
+## file h:
+a
+b
+a
+## END
+## stdout-json: "1:a\n3:a\n"
+## stderr-json: ""
+## status: 0
+
+#### it is read for PRESENCE, not for a value: empty still stops the permutation
+# The value is never looked at, so there is no way to spell "off" but unsetting it.
+## argv: grep a h -n
+## file h:
+a
+b
+a
+## END
+## env POSIXLY_CORRECT:
+## END
+## stdout-json: "h:a\nh:a\n"
+## stderr-json: "grep: -n: No such file or directory\n"
+## status: 2
+
+#### and a value that reads like a denial does not turn it off either
+## argv: grep a h -n
+## file h:
+a
+b
+a
+## END
+## env POSIXLY_CORRECT: 0
+## stdout-json: "h:a\nh:a\n"
+## stderr-json: "grep: -n: No such file or directory\n"
+## status: 2
+
+#### an option BEFORE the first operand is still an option
+# The rule is about what follows the first operand, not about options at all.
+## argv: grep -n a h
+## file h:
+a
+b
+a
+## END
+## env POSIXLY_CORRECT: 1
+## stdout-json: "1:a\n3:a\n"
+## stderr-json: ""
+## status: 0
+
+#### the pattern is the first operand, so a flag after it is a file even so
+# `h' takes the PATTERN slot and ends the options; `a' is then a file, not the
+# pattern. Nothing about the rule looks at which operand slot is being filled.
+## argv: grep -n h a
+## file h:
+a
+b
+a
+## END
+## env POSIXLY_CORRECT: 1
+## stdout-json: ""
+## stderr-json: "grep: a: No such file or directory\n"
+## status: 2
+
+#### an OPTION-ARGUMENT is not an operand, so -e's pattern does not end them
+## argv: grep -e a -n h
+## file h:
+a
+b
+a
+## END
+## env POSIXLY_CORRECT: 1
+## stdout-json: "1:a\n3:a\n"
+## stderr-json: ""
+## status: 0
+
+#### nor does a separated -m argument
+## argv: grep -m 2 a h -n
+## file h:
+a
+b
+a
+## END
+## env POSIXLY_CORRECT: 1
+## stdout-json: "h:a\nh:a\n"
+## stderr-json: "grep: -n: No such file or directory\n"
+## status: 2
+
+#### -- after the first operand is a FILE, not an end-of-options marker
+# Options already ended at `h', so `--' has no marker meaning left to have and is
+# reported as the missing file it names.
+## argv: grep a h -- -n
+## file h:
+a
+b
+a
+## END
+## env POSIXLY_CORRECT: 1
+## stdout-json: "h:a\nh:a\n"
+## stderr-json: "grep: --: No such file or directory\ngrep: -n: No such file or directory\n"
+## status: 2
+
+#### and -- BEFORE the first operand still ends the options
+## argv: grep -- a h
+## file h:
+a
+b
+a
+## END
+## env POSIXLY_CORRECT: 1
+## stdout-json: "a\na\n"
+## stderr-json: ""
+## status: 0
+
+#### a bare - is an operand, so it ends the options too
+# It names stdin rather than a file, but it is an operand like any other.
+## argv: grep a - -n
+## file h:
+a
+b
+a
+## END
+## env POSIXLY_CORRECT: 1
+## stdout-json: ""
+## stderr-json: "grep: -n: No such file or directory\n"
+## status: 2
+
+#### a -NUM after the first operand is a file, not a context count
+## argv: grep a h -0
+## file h:
+a
+b
+a
+## END
+## env POSIXLY_CORRECT: 1
+## stdout-json: "h:a\nh:a\n"
+## stderr-json: "grep: -0: No such file or directory\n"
+## status: 2
+
+#### two flags after the first operand are two missing files
+## argv: grep a h -n -c
+## file h:
+a
+b
+a
+## END
+## env POSIXLY_CORRECT: 1
+## stdout-json: "h:a\nh:a\n"
+## stderr-json: "grep: -n: No such file or directory\ngrep: -c: No such file or directory\n"
+## status: 2
+
+#### a -NUM BEFORE the operands keeps every digit in GNU too
+# The divergence next door is positional; this is the position where GNU agrees.
+## argv: grep -12 MATCH f -A0
+## file f:
+L01
+L02
+L03
+L04
+L05
+L06
+L07
+L08
+L09
+L10
+L11
+L12
+L13
+MATCH
+## END
+## stdout-json: "L02\nL03\nL04\nL05\nL06\nL07\nL08\nL09\nL10\nL11\nL12\nL13\nMATCH\n"
+## stderr-json: ""
+## status: 0
+
+#### and so does one that follows another option rather than an operand
+## argv: grep MATCH f -A0 -12
+## file f:
+L01
+L02
+L03
+L04
+L05
+L06
+L07
+L08
+L09
+L10
+L11
+L12
+L13
+MATCH
+## END
+## stdout-json: "L02\nL03\nL04\nL05\nL06\nL07\nL08\nL09\nL10\nL11\nL12\nL13\nMATCH\n"
+## stderr-json: ""
+## status: 0
+
+#### a non-digit option ahead of it is enough as well
+## argv: grep MATCH f -n -12 -A0
+## file f:
+L01
+L02
+L03
+L04
+L05
+L06
+L07
+L08
+L09
+L10
+L11
+L12
+L13
+MATCH
+## END
+## stdout-json: "2-L02\n3-L03\n4-L04\n5-L05\n6-L06\n7-L07\n8-L08\n9-L09\n10-L10\n11-L11\n12-L12\n13-L13\n14:MATCH\n"
+## stderr-json: ""
+## status: 0
+
+#### two ADJACENT runs agree, the truncated one losing to last-one-wins
+# Both are in ONE option block, so only the first loses a digit -- and
+# last-one-wins then picks the second, which kept all of its. Adjacency is the
+# whole of why this agrees: put an operand between the two runs and the second
+# starts a new block and is truncated in its turn, which divergence.test.txt
+# pins.
+## argv: grep MATCH f -12 -34 -A0
+## file f:
+L01
+L02
+L03
+L04
+L05
+L06
+L07
+L08
+L09
+L10
+L11
+L12
+L13
+MATCH
+## END
+## stdout-json: "L01\nL02\nL03\nL04\nL05\nL06\nL07\nL08\nL09\nL10\nL11\nL12\nL13\nMATCH\n"
+## stderr-json: ""
+## status: 0
+
+#### a single digit after an operand has no first digit to lose
+## argv: grep MATCH f -5 -A0
+## file f:
+L01
+L02
+L03
+L04
+L05
+L06
+L07
+L08
+L09
+L10
+L11
+L12
+L13
+MATCH
+## END
+## stdout-json: "L09\nL10\nL11\nL12\nL13\nMATCH\n"
+## stderr-json: ""
+## status: 0
+
+#### a leading-zero run hides the drop, so this agrees by coincidence
+# The dropped digit is the leading ZERO, so 0123 and 123 are the same count and
+# the two agree. Pinned because the agreement is an accident of the value rather
+# than of the position: a td-txt that STARTED dropping would still pass this.
+## argv: grep MATCH big -0123
+## file big:
+L001
+L002
+L003
+L004
+L005
+L006
+L007
+L008
+L009
+L010
+L011
+L012
+L013
+L014
+L015
+L016
+L017
+L018
+L019
+L020
+L021
+L022
+L023
+L024
+L025
+L026
+L027
+L028
+L029
+L030
+L031
+L032
+L033
+L034
+L035
+L036
+L037
+L038
+L039
+L040
+L041
+L042
+L043
+L044
+L045
+L046
+L047
+L048
+L049
+L050
+L051
+L052
+L053
+L054
+L055
+L056
+L057
+L058
+L059
+L060
+L061
+L062
+L063
+L064
+L065
+L066
+L067
+L068
+L069
+L070
+L071
+L072
+L073
+L074
+L075
+L076
+L077
+L078
+L079
+L080
+L081
+L082
+L083
+L084
+L085
+L086
+L087
+L088
+L089
+L090
+L091
+L092
+L093
+L094
+L095
+L096
+L097
+L098
+L099
+L100
+L101
+L102
+L103
+L104
+L105
+L106
+L107
+L108
+L109
+L110
+L111
+L112
+L113
+L114
+L115
+L116
+L117
+L118
+L119
+L120
+L121
+L122
+L123
+L124
+L125
+L126
+L127
+L128
+L129
+L130
+MATCH
+## END
+## stdout-json: "L008\nL009\nL010\nL011\nL012\nL013\nL014\nL015\nL016\nL017\nL018\nL019\nL020\nL021\nL022\nL023\nL024\nL025\nL026\nL027\nL028\nL029\nL030\nL031\nL032\nL033\nL034\nL035\nL036\nL037\nL038\nL039\nL040\nL041\nL042\nL043\nL044\nL045\nL046\nL047\nL048\nL049\nL050\nL051\nL052\nL053\nL054\nL055\nL056\nL057\nL058\nL059\nL060\nL061\nL062\nL063\nL064\nL065\nL066\nL067\nL068\nL069\nL070\nL071\nL072\nL073\nL074\nL075\nL076\nL077\nL078\nL079\nL080\nL081\nL082\nL083\nL084\nL085\nL086\nL087\nL088\nL089\nL090\nL091\nL092\nL093\nL094\nL095\nL096\nL097\nL098\nL099\nL100\nL101\nL102\nL103\nL104\nL105\nL106\nL107\nL108\nL109\nL110\nL111\nL112\nL113\nL114\nL115\nL116\nL117\nL118\nL119\nL120\nL121\nL122\nL123\nL124\nL125\nL126\nL127\nL128\nL129\nL130\nMATCH\n"
+## stderr-json: ""
+## status: 0
+
+#### and a cluster whose element starts with a letter keeps every digit
+## argv: grep MATCH big -i123
+## file big:
+L001
+L002
+L003
+L004
+L005
+L006
+L007
+L008
+L009
+L010
+L011
+L012
+L013
+L014
+L015
+L016
+L017
+L018
+L019
+L020
+L021
+L022
+L023
+L024
+L025
+L026
+L027
+L028
+L029
+L030
+L031
+L032
+L033
+L034
+L035
+L036
+L037
+L038
+L039
+L040
+L041
+L042
+L043
+L044
+L045
+L046
+L047
+L048
+L049
+L050
+L051
+L052
+L053
+L054
+L055
+L056
+L057
+L058
+L059
+L060
+L061
+L062
+L063
+L064
+L065
+L066
+L067
+L068
+L069
+L070
+L071
+L072
+L073
+L074
+L075
+L076
+L077
+L078
+L079
+L080
+L081
+L082
+L083
+L084
+L085
+L086
+L087
+L088
+L089
+L090
+L091
+L092
+L093
+L094
+L095
+L096
+L097
+L098
+L099
+L100
+L101
+L102
+L103
+L104
+L105
+L106
+L107
+L108
+L109
+L110
+L111
+L112
+L113
+L114
+L115
+L116
+L117
+L118
+L119
+L120
+L121
+L122
+L123
+L124
+L125
+L126
+L127
+L128
+L129
+L130
+MATCH
+## END
+## stdout-json: "L008\nL009\nL010\nL011\nL012\nL013\nL014\nL015\nL016\nL017\nL018\nL019\nL020\nL021\nL022\nL023\nL024\nL025\nL026\nL027\nL028\nL029\nL030\nL031\nL032\nL033\nL034\nL035\nL036\nL037\nL038\nL039\nL040\nL041\nL042\nL043\nL044\nL045\nL046\nL047\nL048\nL049\nL050\nL051\nL052\nL053\nL054\nL055\nL056\nL057\nL058\nL059\nL060\nL061\nL062\nL063\nL064\nL065\nL066\nL067\nL068\nL069\nL070\nL071\nL072\nL073\nL074\nL075\nL076\nL077\nL078\nL079\nL080\nL081\nL082\nL083\nL084\nL085\nL086\nL087\nL088\nL089\nL090\nL091\nL092\nL093\nL094\nL095\nL096\nL097\nL098\nL099\nL100\nL101\nL102\nL103\nL104\nL105\nL106\nL107\nL108\nL109\nL110\nL111\nL112\nL113\nL114\nL115\nL116\nL117\nL118\nL119\nL120\nL121\nL122\nL123\nL124\nL125\nL126\nL127\nL128\nL129\nL130\nMATCH\n"
+## stderr-json: ""
+## status: 0
