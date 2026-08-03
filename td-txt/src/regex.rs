@@ -61,6 +61,21 @@ pub struct Options {
     /// otherwise. The interval rules are unaffected -- `--posix -E 'a{x}'` is
     /// still bad content -- so this is not a second `strict_repeats`.
     pub posix: bool,
+    /// Which of GNU's two engines reads the MID-BRANCH `$` that `stray_anchor`
+    /// creates. grep's dfa satisfies one at a true end of line, so `grep 'x$|*'`
+    /// selects a line `x`; glibc satisfies one never, so the branch is dead and
+    /// `sed 's/x$|*/X/'` matches nothing. Not a dialect difference -- `grep -o`
+    /// and any pattern carrying a backreference run glibc too, which td-txt does
+    /// not model (see `spec/README`) -- so this carries the caller's USUAL engine,
+    /// and it is the only rule that reads it.
+    pub glibc_engine: bool,
+    /// Whether more of the LEX follows this pattern, which `stray_anchor` -- the
+    /// only rule that reads this -- counts as a further byte. Two things put it
+    /// there, and grep is the only caller with either: it joins its `-e`/`-f`
+    /// patterns with `\n` and lexes the result as one, and `-x`/`-w` wrap the
+    /// pattern in context. So `grep -e 'x$|' -e zz`, `grep -x 'x$|'` and
+    /// `grep -w 'x$|'` all anchor a `$` that `grep 'x$|'` leaves a literal.
+    pub lex_continues: bool,
     /// POSIX REG_NEWLINE (sed's `M` flag), carrying the RECORD SEPARATOR it is
     /// relative to: `\n` normally, NUL under `-z`. GNU implements it as TWO
     /// mechanisms, and a pattern can tell them apart:
@@ -153,6 +168,8 @@ enum Node {
     Class(ByteSet),
     Bol,
     Eol,
+    /// A position that never holds: glibc's reading of the mid-branch `$` above.
+    Never,
     /// `\\``/`\\'` — the BUFFER ends, which `M` does not move (that is what
     /// distinguishes them from `^`/`$`). Separator confinement does move them,
     /// because GNU then matches within a segment and its ends ARE the buffer's.
@@ -188,6 +205,7 @@ fn is_assertion(node: &Node) -> bool {
         node,
         Node::Bol
             | Node::Eol
+            | Node::Never
             | Node::BufStart
             | Node::BufEnd
             | Node::WordBoundary(_)
@@ -362,6 +380,19 @@ impl<'a> Parser<'a> {
             return self.peek() == Some(ch);
         }
         self.peek() == Some(b'\\') && self.peek_at(1) == Some(ch)
+    }
+
+    /// Whether a BRE `$` anchors DESPITE more pattern following it. GNU tests the
+    /// byte after the `$` against `|` and `)` -- the ERE spellings of the two
+    /// operators whose BRE spellings (`\|`, `\)`) legitimately end a branch -- but
+    /// keeps the length test those two-byte spellings need. So a BARE `|`/`)`
+    /// anchors it too, unless that byte is the pattern's last: `x$|` selects the
+    /// text `x$|`, while `x$||` and `x$|a` anchor and `x$a` does not. "Last" is of
+    /// the whole LEX, which for grep is every `-e`/`-f` pattern joined by `\n`.
+    fn stray_anchor(&self) -> bool {
+        !self.opts.ere
+            && matches!(self.peek(), Some(b'|' | b')'))
+            && (self.peek_at(1).is_some() || self.opts.lex_continues)
     }
 
     /// Which `)` a grep ERE drop EATS, if it eats one. gnulib drops an operator
@@ -860,6 +891,11 @@ impl<'a> Parser<'a> {
                     || (depth > 0 && self.at_op(b')'));
                 if anchors {
                     Ok(Node::Eol)
+                } else if self.stray_anchor() {
+                    Ok(match self.opts.glibc_engine {
+                        true => Node::Never,
+                        false => Node::Eol,
+                    })
                 } else {
                     Ok(self.literal(b'$'))
                 }
@@ -1637,6 +1673,7 @@ fn m(st: &mut State, node: &Node, pos: usize, k: &mut dyn FnMut(&mut State, usiz
                 false
             }
         }
+        Node::Never => false,
         Node::BufStart => {
             if st.at_buf_start(pos) {
                 k(st, pos)
@@ -1890,13 +1927,21 @@ mod tests {
     /// `Options::default()` is grep's grammar, so every helper above tests only
     /// that one. These two compile sed's.
     fn sed_bre(pat: &str) -> Result<Regex, Error> {
-        Regex::compile(pat.as_bytes(), Options { strict_repeats: true, ..Options::default() })
+        Regex::compile(
+            pat.as_bytes(),
+            Options { strict_repeats: true, glibc_engine: true, ..Options::default() },
+        )
     }
 
     fn sed_ere(pat: &str) -> Result<Regex, Error> {
         Regex::compile(
             pat.as_bytes(),
-            Options { ere: true, strict_repeats: true, ..Options::default() },
+            Options {
+                ere: true,
+                strict_repeats: true,
+                glibc_engine: true,
+                ..Options::default()
+            },
         )
     }
 
@@ -2366,6 +2411,53 @@ mod tests {
         // ERE anchors anywhere, so there the same pattern matches everything.
         let ere = Regex::compile(b"^^", Options { ere: true, ..Options::default() }).unwrap();
         assert!(matched(&ere, "x"));
+    }
+
+    /// A BARE `|`/`)` anchors the `$` before it, though neither is an operator in a
+    /// BRE. GNU tests the byte after the `$` against the ERE spellings of the two
+    /// operators whose BRE spellings (`\|`, `\)`) end a branch, but keeps the length
+    /// test those two-byte spellings need -- so the last byte of a pattern does not
+    /// reach it, and `x$|` stays the literal a `$` is everywhere else.
+    #[test]
+    fn a_bare_pipe_or_paren_anchors_the_dollar_before_it() {
+        assert!(matched(&bre("x$|"), "ax$|z"));
+        assert!(matched(&bre("x$)"), "ax$)z"));
+        // One byte further it anchors, so the text it looks like is NOT selected.
+        assert!(!matched(&bre("x$||"), "x$||"));
+        assert!(!matched(&bre("x$|a"), "x$|a"));
+        assert!(!matched(&bre("x$))"), "x$))"));
+        // Only those two bytes do it; an ordinary one leaves the `$` alone.
+        assert!(matched(&bre("x$az"), "x$az"));
+        assert!(matched(&bre("x$$|"), "x$$|"));
+        // To grep's dfa the anchor is a true end of line, which `|*` can reach by
+        // taking none of the pipe.
+        assert!(matched(&bre("x$|*"), "x"));
+        assert!(!matched(&bre("x$|*"), "x$"));
+        // The count is of BYTES left in the PATTERN, not of the branch: an operator
+        // after the bare byte does not hand the literal back.
+        assert!(!matched(&bre(r"x$|\|zz"), "x$|"));
+        assert!(matched(&bre(r"x$|\|zz"), "zz"));
+        assert!(!matched(&bre(r"\(x$|\)"), "x$|"));
+        // grep lexes its `-e`/`-f` patterns JOINED by `\n`, so for every one but the
+        // last there is a further byte and the literal is gone.
+        let joined = Options { lex_continues: true, ..Options::default() };
+        assert!(!matched(&Regex::compile(b"x$|", joined).unwrap(), "ax$|z"));
+        assert!(!matched(&Regex::compile(b"x$)", joined).unwrap(), "ax$)z"));
+    }
+
+    /// sed reaches that anchor through glibc, which satisfies a mid-branch one
+    /// never, so the branch carrying it is dead where grep selects a line.
+    #[test]
+    fn glibc_leaves_the_mid_branch_dollar_unsatisfiable() {
+        let dead = sed_bre("x$|*").unwrap();
+        assert!(!matched(&dead, "x"));
+        assert!(!matched(&dead, "x$"));
+        // Only that branch dies; a sibling still matches.
+        let alt = sed_bre(r"x$|a\|zz").unwrap();
+        assert!(matched(&alt, "zz"));
+        assert!(!matched(&alt, "x$|a"));
+        // The rule is the BRE's: an ERE `$` anchors anywhere and `|` alternates.
+        assert!(matched(&sed_ere("x$|a").unwrap(), "a"));
     }
 
     #[test]

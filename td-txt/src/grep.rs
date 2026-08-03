@@ -5,13 +5,14 @@
 //! inputs are read whole, so a pattern never straddles a read boundary.
 //!
 //! Deliberate omissions: no `-P` (PCRE — a second regex engine), no `--color`,
-//! no `--include`/`--exclude` globs, and no `-b` byte offsets. Each is a diagnosed
-//! `invalid option`, never a silent no-op, and each is pinned in
-//! spec/divergence.test.txt.
+//! no `--include`/`--exclude` globs, no `-b` byte offsets, and no `-NUM` context
+//! count (`-A`/`-B`/`-C` spell it). Each is a diagnosed `invalid option`, never a
+//! silent no-op, and each is pinned in spec/divergence.test.txt.
 
 use crate::regex::{Filter, OnBudget, Options, Regex};
 use crate::util::{
-    errmsg, number, path_bytes, print_line, read_input, records, show, walk, Out, VERSION,
+    errmsg, number, path_bytes, print_line, read_input, read_search, records, show, walk, Diag,
+    Out, VERSION,
 };
 
 const USAGE: &str = "usage: grep [-EFGHhicLlnoqsvwxrzZ] [-m NUM] [-A NUM] [-B NUM] [-C NUM] \
@@ -31,6 +32,8 @@ struct Conf {
     word: bool,
     whole_line: bool,
     count: bool,
+    /// `-l`/`-L`, and never both: they are opposite questions and GNU keeps the
+    /// last one given.
     files_with: bool,
     files_without: bool,
     /// `-Z`: terminate a FILE NAME with NUL instead of the byte that would
@@ -44,9 +47,16 @@ struct Conf {
     /// `None` until `-H`/`-h` or the file count decides it.
     with_filename: Option<bool>,
     recursive: bool,
+    /// `-R`: follow every symlink the walk finds, not only the operand.
+    logical: bool,
     max_count: Option<u64>,
-    after: usize,
-    before: usize,
+    /// `-A`/`-B` as GIVEN, and `-C` separately: `-C` does not override an
+    /// explicit `-A`, it supplies the default for whichever was not given, so
+    /// `-A2 -C0` and `-C0 -A2` are the same thing. `None` is "not given" and is
+    /// not the same as `Some(0)`, which still groups.
+    after: Option<usize>,
+    before: Option<usize>,
+    both: Option<usize>,
     null_data: bool,
     /// `-a`: treat a file containing NUL as text instead of reporting a match.
     text: bool,
@@ -70,9 +80,11 @@ impl Default for Conf {
             line_number: false,
             with_filename: None,
             recursive: false,
+            logical: false,
             max_count: None,
-            after: 0,
-            before: 0,
+            after: None,
+            before: None,
+            both: None,
             null_data: false,
             text: false,
         }
@@ -88,18 +100,47 @@ enum Patterns {
 
 impl Grep {
     /// Whether NO line of any file can be selected, so the file need not be
-    /// read: `-m 0`, an empty pattern list, or an every-line pattern that `-v`
-    /// inverts. GNU short-circuits all three — even `-c` prints no count line.
+    /// read: `-m 0`, a list of NO patterns, or a list of nothing but empty
+    /// patterns under `-v`.
+    /// GNU short-circuits all three — even `-c` prints no count line.
     /// `-L` reports the ABSENCE of a match, so it is handled separately.
     fn settled(&self) -> bool {
         self.conf.max_count == Some(0)
             || (self.pats.is_empty() && !self.conf.invert)
             // `-x`/`-w` narrow an empty pattern to empty/word-bounded lines, so
             // it no longer selects everything and nothing can be concluded.
-            || (self.match_all
+            || (self.only_empty
                 && self.conf.invert
                 && !self.conf.whole_line
                 && !self.conf.word)
+    }
+}
+
+impl Conf {
+    /// Which lines `-o` prints spans for: GNU asks whether the line is a
+    /// MATCHING one, which is the selected line without `-v` and the CONTEXT
+    /// line with it. Not "does it match" -- past `-m` a context line can match
+    /// and still print nothing.
+    fn prints_selected_spans(&self) -> bool {
+        !self.invert
+    }
+
+    fn prints_context_spans(&self) -> bool {
+        self.invert
+    }
+
+    fn after_lines(&self) -> usize {
+        self.after.or(self.both).unwrap_or(0)
+    }
+
+    fn before_lines(&self) -> usize {
+        self.before.or(self.both).unwrap_or(0)
+    }
+
+    /// Whether a context flag was GIVEN at all. `-B0` still groups, so this
+    /// cannot be decided from the counts being non-zero.
+    fn has_context(&self) -> bool {
+        self.after.is_some() || self.before.is_some() || self.both.is_some()
     }
 }
 
@@ -115,9 +156,10 @@ impl Patterns {
 struct Grep {
     conf: Conf,
     pats: Patterns,
-    /// Some pattern is empty, so every line matches unless `-w`/`-x` narrows it.
+    /// Every pattern is empty, and there is one -- narrower than "every line
+    /// matches", which `-e '' -e a` does too without GNU taking the short cut.
     /// Only `settled` reads this; matching compiles an empty pattern like any other.
-    match_all: bool,
+    only_empty: bool,
 }
 
 fn is_word(b: u8) -> bool {
@@ -328,6 +370,12 @@ pub fn main(args: &[Vec<u8>]) -> i32 {
     let mut conf = Conf::default();
     let mut patterns: Vec<Vec<u8>> = Vec::new();
     let mut pattern_seen = false;
+    // Which matcher was CHOSEN, as against the `Basic` that is merely the
+    // default; only `choose_syntax` reads it.
+    let mut syntax_chosen: Option<Syntax> = None;
+    // Answered once the scan finishes without error, not where they are read.
+    let mut show_help = false;
+    let mut show_version = false;
     let mut files: Vec<Vec<u8>> = Vec::new();
     let mut operands: Vec<Vec<u8>> = Vec::new();
     let mut no_more_options = false;
@@ -380,25 +428,25 @@ pub fn main(args: &[Vec<u8>]) -> i32 {
                     }
                 },
             };
-            // Both answer on stdout and exit 0 the moment they are seen, before
-            // any later option is applied — but AFTER the arity check above, so
-            // `--version=x` is still the error GNU makes it. The TEXT is td-txt's
-            // own: reporting a GNU banner would be a lie a caller could act on.
-            if name == b"help" || name == b"version" {
-                let line = if name == b"help" {
-                    USAGE.to_string()
-                } else {
-                    format!("grep (td-txt) {VERSION}")
-                };
-                return match print_line(&line) {
-                    Ok(()) => 0,
-                    Err(e) => {
-                        err(&format!("write error: {}", errmsg(&e)));
-                        2
-                    }
-                };
+            // Neither answers here: GNU defers both to AFTER the scan, so an
+            // error the scan itself raises outranks them whichever side of it
+            // was written. Answered below the loop.
+            if name == b"help" {
+                show_help = true;
+                continue;
             }
-            match parse_long(&mut conf, name, value.as_deref(), &mut patterns, &mut pattern_seen) {
+            if name == b"version" {
+                show_version = true;
+                continue;
+            }
+            match parse_long(
+                &mut conf,
+                name,
+                value.as_deref(),
+                &mut patterns,
+                &mut pattern_seen,
+                &mut syntax_chosen,
+            ) {
                 Ok(()) => continue,
                 // `resolve_long` already rejected an unknown name.
                 Err(LongErr::Unknown) => {
@@ -410,6 +458,7 @@ pub fn main(args: &[Vec<u8>]) -> i32 {
                     err(&m);
                     return 2;
                 }
+                Err(LongErr::Handled) => return 2,
             }
         }
         // A short-option cluster; an option that takes a value consumes the rest
@@ -431,16 +480,30 @@ pub fn main(args: &[Vec<u8>]) -> i32 {
                 v
             };
             match opt {
-                b'E' => conf.syntax = Syntax::Extended,
-                b'F' => conf.syntax = Syntax::Fixed,
-                b'G' => conf.syntax = Syntax::Basic,
+                // One arm each rather than a catch-all mapping back to a
+                // syntax: a fourth selector must then name what it chooses.
+                b'E' => {
+                    if !choose_syntax(&mut conf, &mut syntax_chosen, Syntax::Extended) {
+                        return 2;
+                    }
+                }
+                b'F' => {
+                    if !choose_syntax(&mut conf, &mut syntax_chosen, Syntax::Fixed) {
+                        return 2;
+                    }
+                }
+                b'G' => {
+                    if !choose_syntax(&mut conf, &mut syntax_chosen, Syntax::Basic) {
+                        return 2;
+                    }
+                }
                 b'i' | b'y' => conf.icase = true,
                 b'v' => conf.invert = true,
                 b'w' => conf.word = true,
                 b'x' => conf.whole_line = true,
                 b'c' => conf.count = true,
-                b'l' => conf.files_with = true,
-                b'L' => conf.files_without = true,
+                b'l' => (conf.files_with, conf.files_without) = (true, false),
+                b'L' => (conf.files_with, conf.files_without) = (false, true),
                 b'Z' => conf.null_name = true,
                 b'o' => conf.only = true,
                 b'q' => conf.quiet = true,
@@ -448,7 +511,11 @@ pub fn main(args: &[Vec<u8>]) -> i32 {
                 b'n' => conf.line_number = true,
                 b'h' => conf.with_filename = Some(false),
                 b'H' => conf.with_filename = Some(true),
-                b'r' | b'R' => conf.recursive = true,
+                b'r' => conf.recursive = true,
+                b'R' => {
+                    conf.recursive = true;
+                    conf.logical = true;
+                }
                 b'z' => conf.null_data = true,
                 b'a' => conf.text = true,
                 b'e' => match value_of(&mut j, &mut i) {
@@ -511,6 +578,26 @@ pub fn main(args: &[Vec<u8>]) -> i32 {
         }
     }
 
+    // The scan finished clean, so `--help`/`--version` are answered here --
+    // before the pattern and operands are looked at, which is why a bad PATTERN
+    // or a missing FILE loses to them where a bad `-m` (read above) wins.
+    // `--version` outranks `--help` whichever order they came in. The text is
+    // td-txt's own: reporting a GNU banner would be a lie a caller could act on.
+    if show_version || show_help {
+        let line = if show_version {
+            format!("grep (td-txt) {VERSION}")
+        } else {
+            USAGE.to_string()
+        };
+        return match print_line(&line) {
+            Ok(()) => 0,
+            Err(e) => {
+                err(&format!("write error: {}", errmsg(&e)));
+                2
+            }
+        };
+    }
+
     // Without -e/-f the first operand is the pattern.
     let mut operands = operands.into_iter();
     if !pattern_seen {
@@ -531,11 +618,16 @@ pub fn main(args: &[Vec<u8>]) -> i32 {
             return 2;
         }
     };
-    let match_all = patterns.iter().any(Vec::is_empty);
+    let only_empty = !patterns.is_empty() && patterns.iter().all(Vec::is_empty);
 
     // Recursion expands directories; a bare `grep -r pat` reads the working tree.
-    let mut inputs: Vec<Vec<u8>> = Vec::new();
+    // The flag is "the walk produced this", which is what keeps a FILE named `-`
+    // found under the tree from being read as stdin -- GNU searches it.
+    let mut inputs: Vec<(Vec<u8>, bool)> = Vec::new();
     let mut status_error = false;
+    // Whether `-r` descended into a directory; with the operand count it decides
+    // the NAME below. `walk` reports it rather than grep re-testing the operand.
+    let mut descended = false;
     if conf.recursive {
         // A bare `grep -r PAT` walks the working tree but names its hits
         // `d/x`, not `./d/x` — the synthesized operand must not reach the
@@ -545,32 +637,49 @@ pub fn main(args: &[Vec<u8>]) -> i32 {
             files.push(b".".to_vec());
         }
         for f in &files {
-            let (mut paths, mut errs) = (Vec::new(), Vec::new());
-            walk(&crate::util::path_from_bytes(f), &mut paths, &mut errs);
-            inputs.extend(paths.iter().map(|p| {
+            // `-` is stdin under `-r` too; there is nothing to walk and no
+            // directory, so it neither descends nor names on its own.
+            if f == b"-" {
+                inputs.push((f.clone(), false));
+                continue;
+            }
+            let found = walk(&crate::util::path_from_bytes(f), conf.logical);
+            descended |= found.descended;
+            // The synthesized `.` must not reach a DIAGNOSTIC either: GNU names the
+            // same file the same way whether it is reporting it or matching in it.
+            let shown = |p: &std::path::Path| -> Vec<u8> {
                 let b = path_bytes(p);
                 match implied_cwd {
                     true => b.strip_prefix(b"./".as_slice()).unwrap_or(&b).to_vec(),
                     false => b,
                 }
-            }));
-            for (path, e) in &errs {
+            };
+            inputs.extend(found.files.iter().map(|p| (shown(p), true)));
+            for (path, diag) in &found.diags {
+                let text = match diag {
+                    // A cycle is a WARNING in GNU: reported, walked around, and the
+                    // exit status left to whatever the search itself concluded.
+                    Diag::Loop => "warning: recursive directory loop".to_string(),
+                    Diag::Failed(e) => {
+                        status_error = true;
+                        errmsg(e)
+                    }
+                };
                 if !conf.no_messages {
-                    err(&format!("{}: {}", show(&path_bytes(path)), errmsg(e)));
+                    err(&format!("{}: {}", show(&shown(path)), text));
                 }
-                status_error = true;
             }
         }
     } else if files.is_empty() {
-        inputs.push(b"-".to_vec());
+        inputs.push((b"-".to_vec(), false));
     } else {
-        inputs = files.clone();
+        inputs = files.iter().map(|f| (f.clone(), false)).collect();
     }
 
-    let show_name = conf
-        .with_filename
-        .unwrap_or(inputs.len() > 1 || (conf.recursive && !files.is_empty()));
-    let grep = Grep { conf, pats, match_all };
+    // GNU decides the name from the OPERANDS, not from how many files the walk
+    // turned them into.
+    let show_name = conf.with_filename.unwrap_or(files.len() > 1 || descended);
+    let grep = Grep { conf, pats, only_empty };
     let mut out = Out::new();
     let mut any_match = false;
     let mut printed_groups = false;
@@ -578,25 +687,35 @@ pub fn main(args: &[Vec<u8>]) -> i32 {
     // Nothing to look for and no `-v` to invert it: GNU never OPENS the
     // operands, so a nonexistent one is not an error either. `-L` is the
     // exception — it must still report the file, so it still stats it.
-    // `-L` must still report each file, so it reads (stats) them even when the
-    // answer is already known.
     let settled = grep.settled() && !grep.conf.files_without;
-    for path in &inputs {
+    for (path, from_walk) in &inputs {
+        // Named before the read, because a failure names it too: GNU reports
+        // `(standard input): Is a directory`, not `-: Is a directory`.
+        let display: &[u8] = match path.as_slice() == b"-" && !from_walk {
+            true => b"(standard input)",
+            false => path,
+        };
         let data = if settled {
             Vec::new()
         } else {
-            match read_input(path) {
+            match read_search(path, *from_walk) {
                 Ok(d) => d,
-                Err(e) => {
+                Err(f) => {
                     if !grep.conf.no_messages {
-                        err(&format!("{}: {}", show(path), errmsg(&e)));
+                        err(&format!("{}: {}", show(display), errmsg(&f.err)));
                     }
                     status_error = true;
-                    continue;
+                    if !f.opened {
+                        continue;
+                    }
+                    // Opened and unreadable: GNU has processed the file, and found
+                    // in it whatever the read managed to return -- nothing, for a
+                    // directory, which is what makes `-c` print its zero.
+                    f.partial
                 }
             }
         };
-        match search_file(&grep, &mut out, path, &data, show_name, &mut printed_groups) {
+        match search_file(&grep, &mut out, display, &data, show_name, &mut printed_groups) {
             Ok(hit) => any_match |= hit,
             Err(msg) => {
                 err(&msg);
@@ -630,6 +749,8 @@ pub fn main(args: &[Vec<u8>]) -> i32 {
 enum LongErr {
     Unknown,
     Message(String),
+    /// Already reported by the handler; the caller only supplies the status.
+    Handled,
 }
 
 fn split_long(arg: &[u8]) -> (Vec<u8>, Option<Vec<u8>>) {
@@ -717,6 +838,7 @@ fn parse_long(
     value: Option<&[u8]>,
     patterns: &mut Vec<Vec<u8>>,
     pattern_seen: &mut bool,
+    syntax_chosen: &mut Option<Syntax>,
 ) -> Result<(), LongErr> {
     let need = |value: Option<&[u8]>| -> Result<Vec<u8>, LongErr> {
         value
@@ -728,16 +850,28 @@ fn parse_long(
         parse_count(&v).ok_or_else(|| LongErr::Message(format!("{}: invalid context length argument", show(&v))))
     };
     match name {
-        b"extended-regexp" => conf.syntax = Syntax::Extended,
-        b"fixed-strings" => conf.syntax = Syntax::Fixed,
-        b"basic-regexp" => conf.syntax = Syntax::Basic,
+        b"extended-regexp" => {
+            if !choose_syntax(conf, syntax_chosen, Syntax::Extended) {
+                return Err(LongErr::Handled);
+            }
+        }
+        b"fixed-strings" => {
+            if !choose_syntax(conf, syntax_chosen, Syntax::Fixed) {
+                return Err(LongErr::Handled);
+            }
+        }
+        b"basic-regexp" => {
+            if !choose_syntax(conf, syntax_chosen, Syntax::Basic) {
+                return Err(LongErr::Handled);
+            }
+        }
         b"ignore-case" => conf.icase = true,
         b"invert-match" => conf.invert = true,
         b"word-regexp" => conf.word = true,
         b"line-regexp" => conf.whole_line = true,
         b"count" => conf.count = true,
-        b"files-with-matches" => conf.files_with = true,
-        b"files-without-match" => conf.files_without = true,
+        b"files-with-matches" => (conf.files_with, conf.files_without) = (true, false),
+        b"files-without-match" => (conf.files_with, conf.files_without) = (false, true),
         b"null" => conf.null_name = true,
         b"only-matching" => conf.only = true,
         b"quiet" | b"silent" => conf.quiet = true,
@@ -745,7 +879,11 @@ fn parse_long(
         b"line-number" => conf.line_number = true,
         b"with-filename" => conf.with_filename = Some(true),
         b"no-filename" => conf.with_filename = Some(false),
-        b"recursive" | b"dereference-recursive" => conf.recursive = true,
+        b"recursive" => conf.recursive = true,
+        b"dereference-recursive" => {
+            conf.recursive = true;
+            conf.logical = true;
+        }
         b"null-data" => conf.null_data = true,
         b"text" => conf.text = true,
         b"regexp" => {
@@ -764,25 +902,36 @@ fn parse_long(
             conf.max_count = parse_max_count(&v)
                 .ok_or_else(|| LongErr::Message("invalid max count".to_string()))?;
         }
-        b"after-context" => conf.after = count(value)?,
-        b"before-context" => conf.before = count(value)?,
+        b"after-context" => conf.after = Some(count(value)?),
+        b"before-context" => conf.before = Some(count(value)?),
         b"context" => {
             let n = count(value)?;
-            conf.after = n;
-            conf.before = n;
+            conf.both = Some(n);
         }
         _ => return Err(LongErr::Unknown),
     }
     Ok(())
 }
 
+/// GNU refuses two DIFFERENT matchers rather than keeping the last as `-l`/`-L`
+/// do. Tested against what was CHOSEN, so `-EE` is fine and the defaulted
+/// `Basic` is not a choice.
+fn choose_syntax(conf: &mut Conf, chosen: &mut Option<Syntax>, want: Syntax) -> bool {
+    if chosen.is_some_and(|had| had != want) {
+        err("conflicting matchers specified");
+        return false;
+    }
+    *chosen = Some(want);
+    conf.syntax = want;
+    true
+}
+
 fn apply_count(conf: &mut Conf, opt: u8, n: usize) {
     match opt {
-        b'A' => conf.after = n,
-        b'B' => conf.before = n,
+        b'A' => conf.after = Some(n),
+        b'B' => conf.before = Some(n),
         _ => {
-            conf.after = n;
-            conf.before = n;
+            conf.both = Some(n);
         }
     }
 }
@@ -831,9 +980,12 @@ fn push_file(patterns: &mut Vec<Vec<u8>>, content: &[u8]) {
 }
 
 fn compile(conf: &Conf, lines: &[Vec<u8>]) -> Result<Patterns, String> {
+    // GNU drops a duplicate pattern, keeping the first. Only `lex_continues` can
+    // see it, so this must precede the loop that decides which pattern ends the lex.
+    let mut seen = std::collections::HashSet::with_capacity(lines.len());
+    let lines: Vec<&Vec<u8>> = lines.iter().filter(|l| seen.insert(l.as_slice())).collect();
     if conf.syntax == Syntax::Fixed {
-        let lines = lines.to_vec();
-        return Ok(Patterns::Fixed(lines));
+        return Ok(Patterns::Fixed(lines.into_iter().cloned().collect()));
     }
     let opts = Options {
         ere: conf.syntax == Syntax::Extended,
@@ -843,13 +995,22 @@ fn compile(conf: &Conf, lines: &[Vec<u8>]) -> Result<Patterns, String> {
         strict_repeats: false,
         // grep has no `--posix`; the one rule that reads it is sed's.
         posix: false,
+        // grep matches with its own dfa, which satisfies a mid-branch `$`. It falls
+        // back to glibc for `-o` and for any pattern with a backreference, where GNU
+        // then disagrees with itself; td-txt keeps the dfa reading throughout.
+        glibc_engine: false,
+        // Set per line below: GNU lexes the patterns JOINED, and `-x`/`-w` wrap
+        // what it lexes, so a pattern ends the lex only when neither applies.
+        lex_continues: false,
         // GNU grep never sets REG_NEWLINE, not even under `-z`, where a record can
         // hold newlines: `grep -z 'a.c'` matches across one and `-z '^c'` does not
         // anchor after one. sed's `M` is the only way into that rule.
         reg_newline: None,
     };
     let mut res = Vec::with_capacity(lines.len());
-    for line in lines {
+    let wrapped = conf.whole_line || conf.word;
+    for (i, line) in lines.iter().enumerate() {
+        let opts = Options { lex_continues: wrapped || i + 1 < lines.len(), ..opts };
         res.push(Regex::compile(line, opts).map_err(|e| e.msg)?);
     }
     Ok(Patterns::Regex(res))
@@ -857,7 +1018,17 @@ fn compile(conf: &Conf, lines: &[Vec<u8>]) -> Result<Patterns, String> {
 
 /// Emit `file:` / `line:` prefixes. `sep` is `:` on a selected line and `-` on a
 /// context line, as GNU prints them.
-fn prefix(out: &mut Out, grep: &Grep, path: &[u8], show_name: bool, lineno: u64, sep: u8) -> std::io::Result<()> {
+/// `lineno` is `None` where the output has no line to name -- a `-c` count line
+/// takes the file name under `-n` but never a number, since the count is of the
+/// whole file.
+fn prefix(
+    out: &mut Out,
+    grep: &Grep,
+    path: &[u8],
+    show_name: bool,
+    lineno: Option<u64>,
+    sep: u8,
+) -> std::io::Result<()> {
     if show_name {
         out.write(path)?;
         // -Z replaces only the byte after the NAME; a following line number
@@ -865,8 +1036,43 @@ fn prefix(out: &mut Out, grep: &Grep, path: &[u8], show_name: bool, lineno: u64,
         out.write(&[if grep.conf.null_name { 0 } else { sep }])?;
     }
     if grep.conf.line_number {
-        out.write(&number(lineno))?;
-        out.write(&[sep])?;
+        if let Some(n) = lineno {
+            out.write(&number(n))?;
+            out.write(&[sep])?;
+        }
+    }
+    Ok(())
+}
+
+/// `-o` reduces a line to its matched spans. `sep` is the prefix byte, `:` on a
+/// selected line and `-` on a context one; WHICH lines get here is the caller's
+/// decision, and it is not "the ones that match" -- see `prints_spans`.
+fn write_spans(
+    grep: &Grep,
+    out: &mut Out,
+    display: &[u8],
+    show_name: bool,
+    lineno: u64,
+    sep: u8,
+    line: &[u8],
+) -> Result<(), String> {
+    let io = |r: std::io::Result<()>| -> Result<(), String> {
+        r.map_err(|e| format!("write error: {}", errmsg(&e)))
+    };
+    let data_sep = if grep.conf.null_data { 0u8 } else { b'\n' };
+    let mut at = 0usize;
+    while let Some((s, e)) = grep.match_at(line, at, OnBudget::Fail)? {
+        if e == s {
+            at = s + 1;
+            if at > line.len() {
+                break;
+            }
+            continue;
+        }
+        io(prefix(out, grep, display, show_name, Some(lineno), sep))?;
+        io(out.write(line.get(s..e).unwrap_or_default()))?;
+        io(out.write(&[data_sep]))?;
+        at = e;
     }
     Ok(())
 }
@@ -874,7 +1080,9 @@ fn prefix(out: &mut Out, grep: &Grep, path: &[u8], show_name: bool, lineno: u64,
 fn search_file(
     grep: &Grep,
     out: &mut Out,
-    path: &[u8],
+    // The NAME to print, already resolved: only an operand spells stdin `-`, so
+    // the caller is the one that knows whether this came from the walk.
+    display: &[u8],
     data: &[u8],
     show_name: bool,
     // Whether an earlier FILE already printed a context group. `printed_upto`
@@ -882,7 +1090,6 @@ fn search_file(
     printed_before: &mut bool,
 ) -> Result<bool, String> {
     let sep = if grep.conf.null_data { 0u8 } else { b'\n' };
-    let display: &[u8] = if path == b"-" { b"(standard input)" } else { path };
     // A binary file's MATCHING LINES are replaced by a notice — so `-o`, which
     // prints matched text, is suppressed too. `-c`/`-l`/`-L`/`-q` print no line
     // content at all, so they run normally and emit no notice.
@@ -893,7 +1100,9 @@ fn search_file(
     let binary = !grep.conf.text && !counts_only && data.contains(&0) && sep != 0;
     let lines = records(data, sep);
     let mut count: u64 = 0;
-    let mut printed_upto: usize = 0; // 1-based line number already emitted
+    // How far the output reaches, 1-based: the last line printed OR covered by
+    // context. `-o` drops context lines but not the range they cover.
+    let mut covered: usize = 0;
     let mut pending_after: usize = 0;
     let mut any = false;
 
@@ -925,13 +1134,16 @@ fn search_file(
                 // clean, so a pipeline gets no stray bytes; `-a` opts out by
                 // clearing `binary` (everything is text). One notice per file.
                 err(&format!("{}: binary file matches", show(display)));
+                // The notice goes to stderr, but GNU still counts the file as
+                // having produced output, so the NEXT file opens with `--`.
+                *printed_before = true;
                 return Ok(true);
             }
             if !grep.conf.count {
                 // Trailing context of the previous group, then leading context.
-                let start = idx.saturating_sub(grep.conf.before);
-                if grep.conf.before > 0 || grep.conf.after > 0 {
-                    let gap = match printed_upto {
+                let start = idx.saturating_sub(grep.conf.before_lines());
+                if grep.conf.has_context() {
+                    let gap = match covered {
                         0 => *printed_before,
                         upto => start > upto,
                     };
@@ -939,9 +1151,15 @@ fn search_file(
                         io(out.write(b"--\n"))?;
                     }
                     *printed_before = true;
-                    let ctx_start = start.max(printed_upto);
+                    let ctx_start = start.max(covered);
                     for (k, (ctx, ctx_term)) in lines.iter().enumerate().take(idx).skip(ctx_start) {
-                        io(prefix(out, grep, display, show_name, (k + 1) as u64, b'-'))?;
+                        if grep.conf.only {
+                            if grep.conf.prints_context_spans() {
+                                write_spans(grep, out, display, show_name, (k + 1) as u64, b'-', ctx)?;
+                            }
+                            continue;
+                        }
+                        io(prefix(out, grep, display, show_name, Some((k + 1) as u64), b'-'))?;
                         io(out.write(ctx))?;
                         if *ctx_term || k + 1 < lines.len() {
                             io(out.write(&[sep]))?;
@@ -949,42 +1167,39 @@ fn search_file(
                     }
                 }
                 if grep.conf.only {
-                    let mut at = 0usize;
-                    while let Some((s, e)) = grep.match_at(line, at, OnBudget::Fail)? {
-                        if e == s {
-                            at = s + 1;
-                            if at > line.len() {
-                                break;
-                            }
-                            continue;
-                        }
-                        io(prefix(out, grep, display, show_name, lineno, b':'))?;
-                        io(out.write(line.get(s..e).unwrap_or_default()))?;
-                        io(out.write(&[sep]))?;
-                        at = e;
+                    if grep.conf.prints_selected_spans() {
+                        write_spans(grep, out, display, show_name, lineno, b':', line)?;
                     }
                 } else {
-                    io(prefix(out, grep, display, show_name, lineno, b':'))?;
+                    io(prefix(out, grep, display, show_name, Some(lineno), b':'))?;
                     io(out.write(line))?;
                     // GNU terminates every line it prints, including a final
                     // input line that carried no newline of its own.
                     io(out.write(&[sep]))?;
                 }
-                printed_upto = idx + 1;
-                pending_after = grep.conf.after;
+                covered = idx + 1;
+                pending_after = grep.conf.after_lines();
             }
             if grep.conf.max_count.is_some_and(|m| count >= m) {
-                // GNU still prints the trailing context of that last match.
+                // GNU still prints the trailing context of that last match,
+                // `-o` included: what `-o` changes is which lines print, not
+                // how far the drain runs.
                 if pending_after == 0 {
                     break;
                 }
                 limit_reached = true;
             }
-        } else if pending_after > 0 && !grep.conf.count && !grep.conf.only {
-            io(prefix(out, grep, display, show_name, lineno, b'-'))?;
-            io(out.write(line))?;
-            io(out.write(&[sep]))?;
-            printed_upto = idx + 1;
+        } else if pending_after > 0 && !grep.conf.count {
+            if grep.conf.only {
+                if grep.conf.prints_context_spans() {
+                    write_spans(grep, out, display, show_name, lineno, b'-', line)?;
+                }
+            } else {
+                io(prefix(out, grep, display, show_name, Some(lineno), b'-'))?;
+                io(out.write(line))?;
+                io(out.write(&[sep]))?;
+            }
+            covered = idx + 1;
             pending_after -= 1;
         }
         if out.is_broken() {
@@ -996,8 +1211,10 @@ fn search_file(
     if grep.conf.quiet {
         return Ok(any);
     }
-    if grep.conf.count {
-        io(prefix(out, grep, display, show_name, 0, b':'))?;
+    // `-l`/`-L` outrank `-c` the same way: GNU goes quiet for everything but the
+    // NAME, so `grep -cl a f` prints `f` and not the count before it.
+    if grep.conf.count && !grep.conf.files_with && !grep.conf.files_without {
+        io(prefix(out, grep, display, show_name, None, b':'))?;
         io(out.write(&number(count)))?;
         io(out.write(b"\n"))?;
     }
@@ -1022,8 +1239,8 @@ mod tests {
             push_expr(&mut patterns, e.as_bytes());
         }
         let pats = compile(&conf, &patterns).unwrap();
-        let match_all = patterns.iter().any(Vec::is_empty);
-        Grep { conf, pats, match_all }
+        let only_empty = !patterns.is_empty() && patterns.iter().all(Vec::is_empty);
+        Grep { conf, pats, only_empty }
     }
 
     #[test]

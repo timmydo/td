@@ -136,8 +136,9 @@ td-txt-authored case files
 
   What the fuzzer did NOT reach is worth knowing too. Its grammar never emits an
   EMPTY pattern, and an empty pattern short-circuited the regex engine entirely,
-  so the whole `match_all` path was outside the search space — and that path had
-  the same `-w` bug in its own form. A reviewer found it by reading. A generator
+  so the whole empty-pattern short cut was outside the search space — and the
+  MATCHING one of the two (since removed, see `match_at`) had the same `-w`
+  bug in its own form. A reviewer found it by reading. A generator
   only covers the shapes its grammar can produce, so the block below it
   (`-w` over an empty pattern) exists because someone looked at the code instead.
 
@@ -424,6 +425,166 @@ td-txt-authored case files
   bracket whose body is still EMPTY when the pattern runs out is `Invalid regular
   expression`, not `Unmatched [` -- `[` and `[^` against `[a` and `[]`.
 
+  A BRE `$` is an ANCHOR at the end of the pattern and before the `\)` or `\|`
+  that ends a branch, and the LITERAL it looks like anywhere else -- except that
+  GNU tests the byte after it against `|` and `)`, the ERE spellings of those two
+  operators, while keeping the length test their two-byte BRE spellings need. So
+  a BARE `|` or `)` anchors it too, and only where it is not the pattern's LAST
+  byte: `x$|` and `x$)` select the text they look like, `x$||`, `x$|a` and `x$))`
+  select nothing, and an ordinary byte never reaches the rule (`x$az`). What is
+  counted is the bytes left in the PATTERN, not in the branch, so neither
+  `x$|\|zz` nor `\(x$|\)` hands the literal back. GNU's two engines then read
+  that mid-branch anchor differently and `Options::glibc_engine` is that split:
+  grep's dfa satisfies it at a true end of line, so `grep 'x$|\?'` selects a line
+  `x`, while glibc satisfies one never, so the branch carrying it is dead and
+  sed's `s@x$|\?@<&>@` replaces nothing. "Last byte" is of the whole LEX, which
+  is wider than the pattern in two ways, both grep's and both carried by
+  `Options::lex_continues`: it joins its `-e`/`-f` patterns with `\n` before
+  lexing one, and `-x`/`-w` wrap what it lexes in context. So `grep -e 'x$|' -e
+  zz`, `grep -x 'x$|'` and `grep -w 'x$|'` all anchor the `$` that `grep 'x$|'`
+  alone leaves a literal, and an empty `-e ''` after it counts as a byte too.
+
+  One thing SHORTENS that lex: GNU drops a DUPLICATE pattern before lexing it,
+  keeping the FIRST. Matching cannot see that -- a repeat selects nothing its
+  first copy did not -- but the rule above can, because dropping a repeat can
+  change which pattern ENDS the lex. So `grep -c -e 'x$|' -e q -e 'x$|'` answers
+  as `-e 'x$|' -e q` does and `-e q -e 'x$|' -e q` as `-e q -e 'x$|'` does. The
+  test is on BYTES rather than meaning, so `-i` does not make `X$|` a repeat of
+  `x$|`, and there is ONE list: `-e`, `-f` and the newlines inside a single
+  argument all contribute to it.
+
+  One more property of the list as a whole decides whether grep reads the input
+  at all. With `-v`, an EMPTY pattern selects every line and so leaves nothing to
+  select, and GNU takes a short cut that suppresses even `-c`'s count line -- but
+  only where EVERY pattern is empty. That is narrower than "every line matches":
+  `-e '' -e a` matches every line too, and `.*` and `^` match every line without
+  being empty, yet all three print `0`. So `grep -cv -e ''` prints nothing while
+  `grep -cv -e a -e ''` prints `0`. The syntax does not matter (`-F` and `-E`
+  read alike) and `-x`/`-w` take the short cut away from both, having narrowed
+  the empty pattern to something that no longer selects every line.
+
+  What an output line carries in FRONT of it is decided per LINE: a name, then a
+  number under `-n`, each followed by `:` on a selected line and `-` on a context
+  line, with `-Z` replacing the byte after the NAME only. `-H` and `-h` decide
+  whether there is a name at all, and absent either it follows from the OPERANDS
+  rather than from how many files were searched: more than one operand, or one
+  that was a DIRECTORY descended into under `-r` (GNU descends under `-d recurse`
+  too, which td-txt does not have -- see the walk gap below). So `grep -rn a sd` names the
+  single file it finds under `sd` while `grep -rn a sd/only` does not, and a bare
+  `grep -r a` names too, the `.` it walks being a descended directory.
+
+  What counts as a file PROCESSED is decided at the OPEN -- with one exception
+  below -- rather than at the read. An
+  operand grep opened and then could not read is one it processed and found
+  nothing in, so `grep -c alpha d` prints `0` for a directory and `grep -L alpha
+  d` names it, both beside the `d: Is a directory` diagnostic and exit 2, and
+  `grep -c alpha d f` prints `d:0` before `f:1`. An operand it could not open at
+  all earns none of that: a missing file and one refusing permission print no
+  count line. `-l` and a plain search have nothing to say either way, having
+  found no match. `-l` and `-L` are ONE question -- does this file match, or does
+  it not -- so GNU answers whichever was asked LAST and a third flag does not
+  reopen the first: `grep -lL a f g` answers as `-L`, `-Ll` as `-l`, `-lLl` as
+  `-l` again, and the long spellings mix with the short ones. Whichever won still
+  outranks `-c`, and `-q` outranks all of them, printing nothing at all. `-s`
+  silences the diagnostic and leaves the count line, the two being different
+  questions. The exception is GNU's `fstat` after the open: a descriptor it
+  opened but cannot stat earns no count line either, which is reachable only as
+  a CLOSED stdin (`grep -c alpha - 0<&-`) and not reachable at all from here,
+  since Rust's runtime re-points a closed descriptor 0 at `/dev/null` before
+  `main`. It is in the gap list rather than this rule.
+
+  The MATCHER selectors have the same shape and the opposite answer: `-E`, `-F`
+  and `-G` choose one thing, and GNU REFUSES two different ones -- `conflicting
+  matchers specified`, exit 2 -- rather than keeping the last. Repeating one is
+  fine (`-EE`), so the rule is not "at most one selector"; and the test is per
+  TOKEN against what was already CHOSEN, so `-EEF` refuses too, while the
+  `Basic` that is merely the default is not a choice and a bare `-E` is fine
+  where `-G -E` is not. The long spellings choose the same thing and conflict
+  with the short ones. It is raised where the second selector is READ, so an
+  error before it wins (`grep -m x -EF` is `invalid max count`) and everything
+  after it loses -- a bad pattern and a missing file among them.
+
+  CONTEXT is a range, and three rules follow from that rather than from what
+  gets printed. The group separator marks where the RANGES break, so `-o`
+  suppresses no `--` at all: `grep -o -B1 a f` over `a/b/A/aa` prints `a`,
+  `--`, `a`, `a`, the `--` standing between ranges whose context line printed
+  nothing. A ZERO count is still a range, so `grep -B0 a h` separates where a
+  bare `grep` does not -- the question is whether a context flag was GIVEN, not
+  whether its count is non-zero. And `-C` does not override an explicit
+  `-A`/`-B`: it supplies the default for whichever was not given, so `-A2 -C0`
+  keeps two lines after and takes zero before, `-C0 -A2` is the same thing, and
+  `-A2 -B1 -C3` ignores the `-C` outright. Among themselves each is
+  last-one-wins: a second `-A` replaces the first, a second `-C` the first.
+
+  WHICH lines `-o` prints is a third thing, and it is not "the ones that
+  match". GNU prints the spans of the MATCHING lines it prints -- the selected
+  line without `-v`, the CONTEXT line with it. So `grep -o -B1 -n -v a m` over
+  `a/aa/b/aaa` prints `2-a` twice, the two spans of `aa`, prefixed `-` like any
+  context line, while the selected lines print nothing at all, having no match
+  to print by definition. Without `-v` the two questions have the same answer,
+  which is why the rule reads as "`-o` drops context lines" on almost every
+  input; `-m` is where they come apart, since a context line PAST the limit can
+  match and still print nothing. `-m` never shortens the drain itself.
+
+  `--help` and `--version` are answered AFTER that scan rather than where they
+  are read, so anything the scan itself raises outranks them from either side:
+  `grep --help -EF` is the conflict above and `grep --help -m x` is `invalid max
+  count`, both at exit 2, and so is `grep --help -f /nonexistent` -- a `-f` file
+  is READ during the scan, which is what puts it on this side of the line. What
+  comes after the scan loses instead, so `grep --help -e '['` and `grep --help
+  nosuchpat nosuchfile` both print the usage and exit 0. Asking for both, in
+  either order, answers `--version`. The TEXT of either answer is td-txt's own
+  and is pinned in divergence.test.txt.
+
+  That rule is what makes td-txt's REFUSALS visible from both sides. td-txt's
+  scan raises on options GNU accepts -- `-b`, `-D`, `--color` and the rest of
+  the deliberate omissions below -- so `grep --help -b` is a refusal at exit 2
+  here where GNU prints its usage at exit 0. The refusal is the pinned decision
+  and the deferral only decides WHEN it is reached; before it, the same command
+  written the other way round (`grep -b --help`) already refused, so this makes
+  the two orders agree with each other rather than one of them agree with GNU.
+
+  `-r`'s WALK admits the ROOT and the tree below it by different rules. The root
+  is FOLLOWED, so a symlinked directory named as an operand is descended and a
+  device named as one is read; below it nothing is followed and only REGULAR
+  files are collected, so a symlink the walk finds is skipped and so is a FIFO --
+  an open that would never return. `-` is stdin under `-r` as it is without it,
+  being neither a directory to descend nor a name to walk, and it does not name
+  on its own -- but only as an OPERAND: a file the walk finds that happens to be
+  called `-` is searched like any other.
+
+  `-R` is the LOGICAL walk, and it is not `-r` with a longer name: EVERY symlink
+  is followed rather than only the operand, and the non-regular files `-r` skips
+  are READ, the two flags' `--devices` defaults being opposite. So `grep -R` over
+  a tree holding a FIFO blocks where `grep -r` finishes, and that is GNU's
+  behaviour rather than a defect in either.
+
+  Following what the walk finds is the usual way a directory becomes reachable
+  from inside itself, but NOT the only one -- a bind mount does it with no
+  symlink at all -- so BOTH walks carry the ancestor chain and refuse to
+  re-enter one, as GNU's do. Identity is device and inode rather than the path:
+  two names for one directory are equal without being the same string, and that
+  bind mount is the case where no comparison of strings could tell. The refusal
+  is a WARNING, `X: warning: recursive directory loop`, after which the walk
+  carries on and the exit status is whatever the search concluded; `-s` silences
+  it like any other message. Only an ANCESTOR is a cycle: a link to a SIBLING is
+  followed, and the file under it is searched twice under its two names. The
+  warnings and the walk's ERRORS are one stream in the order the walk met them,
+  which is how GNU emits them -- not all of one kind and then all of the other.
+
+  A name that EXISTS without RESOLVING -- a dangling symlink, a loop -- is passed
+  to the search rather than reported by the walk, wherever it is found. That is
+  what keeps a search which never OPENS it silent: where a match is reached
+  first, `grep -Rq a t` says nothing while `grep -Rl a t` reports `No such file
+  or directory`, and GNU draws the line in the same place. Reached first is the
+  whole of it -- with the dangling link alone in the tree, both tools report
+  under `-q` too.
+
+  A COUNT line is the exception to the number -- it takes the name, `-Z` and all,
+  but never a number, having no line to number. So `grep -cn a one two` prints
+  `one:2` where `grep -n a one two` prints `one:1:a`, and `-cnZ` ends the name
+  with the NUL that `-n` would otherwise have preceded.
+
   A REPETITION OPERATOR needs something to repeat, and the two tools disagree
   about what happens when it has nothing -- which is the first place their regex
   grammars are not one grammar with two spellings. `Options::strict_repeats` is
@@ -683,18 +844,126 @@ td-txt-authored case files
     behind it, so what is implemented is the engine rule instead: an empty
     iteration runs once, to record participation, and never twice.
 
-  - A `$` before a BARE `|` in a BRE, where the pipe is an ordinary character
-    (`a|b` selects the text `a|b` in both tools). GNU stops reading the `$` as the
-    literal it is everywhere else: `grep 'x$|*'` selects a line `x` and NOT a line
-    `x$`, and sed's `s@x$|*@<&>@` matches NEITHER -- so the anchor reading and the
-    literal reading are each contradicted by one of the two, and no third reading
-    covers both. Fifteen probes, no model. At the START of a pattern the literal
-    reading holds and both tools agree (`s@$|*@<&>@` replaces the `$` in `a$`).
-    Six xfail cases carrying the goldens. This one is PRE-EXISTING -- the binary
-    built from the parent commit answers identically -- and it is a different
-    axis (when an anchor is an anchor); it is recorded here because a reviewer's
-    cross-product found it while reviewing this branch, not because this branch
-    caused it.
+  - A file holding a NUL under `-c` and `-v`, where GNU zaps the NUL to a
+    record end and so counts more lines than td-txt does: `printf 'a\0b\0aa\0'`
+    is `2` in GNU and `1` here. The `-x` entry below is a different question
+    about the same byte and does not cover this. Pre-existing.
+
+  - A context COUNT past what fits: `grep -A 99999999999999999999` clamps in
+    GNU and is `invalid context length argument` at exit 2 here. The corpus
+    pins a NON-NUMERIC argument, where GNU errors too, so it does not cover
+    this. Pre-existing.
+
+  - GNU's extra EMPTY span under `-o` with `-x` and `-w` together: `grep -o -w
+    -x a` over `a/ab` is `a` and an empty line in GNU and just `a` here. It
+    needs no context flag, so it is not part of the range rule above, and the
+    `-w -o` case in the corpus is one where the two AGREE. Pre-existing.
+
+  - `-NUM`, the fourth context spelling: `grep -2 a f` is `-C2` in GNU and
+    `invalid option -- '2'` at exit 2 here. It obeys the resolution rule above
+    like the others (`-A2 -1` is one line before and two after), so it is a
+    spelling this applet lacks rather than a rule it gets wrong. Pre-existing.
+
+  - A missing OPTION-ARGUMENT prints no usage line after the diagnostic for
+    `-m`/`-A`/`-B`/`-C`, where `-e`, `-f`, an unknown short option and every
+    long-option error all print one and GNU prints one for all of them. So
+    `grep -m` is one line here and three in GNU. Pre-existing, and td-txt is
+    inconsistent with itself rather than only with GNU. Invisible to the
+    sweeps, whose classifier strips each side's usage pointer before
+    comparing.
+
+  - `POSIXLY_CORRECT`, which stops GNU permuting options after the first
+    operand: `POSIXLY_CORRECT=1 grep -l a f -L g` is `f` plus `-L: No such file
+    or directory` at exit 2 in GNU, and `g` at exit 0 here, which permutes
+    unconditionally. spec/README records the variable as unread by `sed`; grep
+    reads it and this does not.
+
+  - `-x` over a file holding a NUL, where GNU reports `binary file matches` at
+    exit 0 and td-txt selects nothing and exits 1. The whole-line test and the
+    binary rule interact somewhere td-txt does not follow -- with one line
+    `a\0b`, `-x a` matches nothing by the anchored reading, so GNU is finding
+    its match another way. Pre-existing and not characterized; it wants its own
+    probe before any fix.
+
+  - A CLOSED stdin, which GNU reports as `(standard input): Bad file descriptor`
+    at exit 2 where td-txt prints `0` and exits 1. Not reachable as a bug in the
+    read path: Rust's runtime opens `/dev/null` onto any of the three standard
+    descriptors that is closed before `main` runs, so the applet genuinely reads
+    an empty file. Recorded because the processed-file rule above is otherwise
+    absolute, and this is the one case where GNU's answer comes from a stat it
+    makes and this cannot.
+
+  - The ORDER of a `-r` listing, which td-txt sorts and GNU takes from the
+    directory: `grep -rl a tree` answers `tree/sub/g` before `tree/f` in GNU and
+    the other way here. Deliberate -- a sorted walk is reproducible where a
+    directory's own order is not -- but recorded because the walk sweeps cannot
+    SEE it: they compare listings order-insensitively, so a zero from one is a
+    statement about content alone. It was a review that found this, not a sweep.
+    It is not confined to the order of the output either: `-q` and `-m` stop at
+    the first match, so which files are opened AT ALL follows from it, and
+    `grep -Rq a tree` beside a dangling symlink reports it here and not in GNU
+    purely because sorted order reaches it before the match. Underneath both is a
+    second difference the order makes visible: td-txt WALKS THE WHOLE TREE and
+    then searches, where GNU interleaves the two. So a `-q` match cannot preempt
+    a diagnostic the walk has already printed -- `grep -Rq a t` over a matching
+    file and a cycle warns here and is silent in GNU even when the match sorts
+    first, which is not an ordering effect at all.
+
+  - An ENDLESS input read whole. td-txt reads a whole file before searching it
+    (util.rs `read_input`, and the applet header says so), so `grep -q a
+    /dev/urandom` never returns where GNU streams and stops at the first match --
+    and against `/dev/zero` it is not a hang but an OOM, the buffer growing until
+    the allocation fails (`out of memory`, exit 2, under a `ulimit -v`) or the
+    kernel kills it, where GNU searches at constant memory.
+    Pre-existing for an operand -- the parent build hangs identically -- and `-R`
+    widens the reach rather than causing it, since a logical walk collects the
+    devices a physical one skips. Not a `-R` bug: the same command without `-R`
+    hangs the same way. Fixing it is a streaming reader, not a walk rule.
+
+  - `-d`/`--directories` is an `invalid option` here, so GNU's other spelling of
+    a descent (`grep -d recurse a .`) is unavailable, as is `-d skip`. No xfail
+    case: it is a diagnosed refusal, pinned in divergence.test.txt like the other
+    unimplemented options.
+
+  - The `-v` short cut above under `-r`, which GNU takes before it expands
+    operands and td-txt takes after: `grep -rcv -e '' /nosuchdir` is exit 1 and
+    silent in GNU, exit 2 with `No such file or directory` here, and the same
+    holds for the `-m 0` and empty-list clauses (`grep -rcm0 a /nosuchdir`,
+    `grep -rc -f /dev/null /nosuchdir`). `Grep::settled` is consulted after
+    `walk` has already reported. Pre-existing, and the part of this axis the
+    landing that closed it did NOT close. `-R`'s cycle WARNING joins the same
+    entry: `grep -Rlm0 a t` says nothing in GNU, which never traverses, and warns
+    here, which traverses first and consults the short cut after.
+
+  - A `^$` whose `$` is followed by MORE pattern, which grep's dfa answers as
+    though that `$` were not there: `grep -c '^$|$'` selects a line `|` and
+    `'^$|a$'` selects `|a`, where reading both anchors selects neither. It needs
+    the `^` IMMEDIATELY before the `$` and the pattern to END in `$` -- `^$|a`,
+    `^x$|$` and `.*^$|a$` all agree -- and `grep -o` prints nothing for them, so
+    it is the dfa's alone. NOT the bare-`|` rule above, though that is how it was
+    found: `grep -c '\(^$\)a$'` selects a line `a` with no stray anchor anywhere
+    in it, and the binary built from this branch's parent answers every one of
+    them identically. Ten patterns of a 170-pattern `^` sweep. Recorded, not
+    modelled: it is a different axis (what an EMPTY line assertion does to the
+    rest of a branch) and nothing here reads a second anchor that way.
+
+  - WHETHER sed's dead mid-branch `$` is OBSERVABLE, which is not a property of
+    the pattern at all. glibc's reading is the dead one and td-txt reads it that
+    way throughout, but for some patterns the LITERAL reading shows through
+    instead and the `$` IS replaced: `s@$|*@<&>@` marks the `$` in `a$`. Three
+    readings of that boundary were tried and a further probe refuted each --
+    "dead everywhere", which `$|*` refutes; "literal only where the `$` starts a
+    branch", where `.$|*` is literal past one and `$|a` dead at one; and "an
+    unconstrained prefix AND a tail that can match empty", where `\|x$|a` is
+    literal though neither holds (an empty sibling branch is enough) and
+    `[^a]$|*` is literal while `[^a]$|.` is dead on the same prefix. What the
+    boundary tracks is whether GNU's SEARCH visits the position at all rather
+    than what the pattern means, so modelling it would mean growing a fastmap in
+    order to reproduce where GNU's goes wrong. A fourth reading fitted to the
+    probes above is the mistake this file already records twice. 32 of the 667
+    patterns swept here, and 8 of 2345 in a wider BRE/ERE fuzz whose grep half
+    is clean; three xfail cases carry the goldens, one of them a case that
+    passed before this landing.
 
   - A `[` that sed's reader CONSUMES as the byte it tests after a sub-expression's
     kind character. The consume-don't-peek rule above holds everywhere else; where
@@ -795,7 +1064,19 @@ td-txt-authored case files
     in the sed-BRE grid, the other three dialects being 0 of 2400 each.
 
   - A BACKREFERENCE anywhere in a grep pattern, which switches the whole of it to
-    glibc's reading -- that is, to sed's. It reaches the brace rule above too:
+    glibc's reading -- that is, to sed's. It reaches the mid-branch `$` above, so
+    `grep -c '\(x\)\1$|*'` answers 0 where `grep -c 'x$|*'` selects the line, and
+    so does `-o`, which runs glibc for the same pattern `-c` gives the dfa. td-txt
+    keeps the dfa reading for grep throughout, that being the one `-c` pins, and
+    a pattern LIST is where that costs most. Swept over duplicate-bearing lists
+    and sixteen flag sets, every divergence left is a list GNU hands to glibc:
+    under `-o`, or because some pattern in it carries a BACKREFERENCE, which
+    switches the whole list and so is not confined to `-o` at all --
+    `grep -c -e 'x$|' -e '\(x\)\1$|'` selects five lines of seven where td-txt
+    selects one, and dropping the `\1` makes both agree. The counts depend on
+    which alphabet is swept, so they are not quoted here; the shape does not,
+    each being a list the naive literal reading this rule replaced happened to
+    agree with glibc about. It reaches the brace rule above too:
     `(a)\1|^{}` selects one line of `aa`/`{}`/`{}a` in grep and three here,
     though `(a)\1|{}` -- the same alternation with the anchor dropped -- agrees
     at three, so it is the anchored brace glibc reads differently. One xfail with
@@ -892,8 +1173,8 @@ Overlay
                      rather than only adding cases by reading the option list.
 
                      A FOURTH came from review rather than from either: `-w`
-                     over an empty pattern, on the `match_all` path the fuzzer's
-                     grammar could not reach. Same rule, second implementation
+                     over an empty pattern, on the empty-pattern MATCHING short
+                     cut the fuzzer's grammar could not reach. Same rule, second implementation
                      of it — which is the more useful lesson than the bug.
 
                      A FIFTH and SIXTH came from reviewing the FIX for the third,

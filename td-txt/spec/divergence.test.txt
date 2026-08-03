@@ -106,6 +106,51 @@ usage: grep [-EFGHhicLlnoqsvwxrzZ] [-m NUM] [-A NUM] [-B NUM] [-C NUM] [-e PATTE
 ## stderr-json: ""
 ## status: 0
 
+#### asking for both answers --version, whichever order they came in
+# The ORDER rule is GNU's and conforms; only the banner text below is td-txt's,
+# which is why these live here rather than in grep-cli.test.txt.
+## argv: grep --help --version
+## stdout:
+grep (td-txt) 0.1.0
+## END
+## stderr-json: ""
+## status: 0
+
+#### and the other order answers --version too
+## argv: grep --version --help
+## stdout:
+grep (td-txt) 0.1.0
+## END
+## stderr-json: ""
+## status: 0
+
+#### --help outranks what comes after the scan, a bad pattern included
+## argv: grep --help -e [
+## stdout:
+usage: grep [-EFGHhicLlnoqsvwxrzZ] [-m NUM] [-A NUM] [-B NUM] [-C NUM] [-e PATTERN] [-f FILE] [PATTERN] [FILE]...
+## END
+## stderr-json: ""
+## status: 0
+
+#### but an option td-txt REFUSES is raised during the scan, so it outranks --help
+# GNU accepts -b and prints its usage at exit 0. The refusal is the decision
+# pinned below; this case pins that --help does not smuggle a refused option
+# past it, the same answer `grep -b --help` has always given.
+## argv: grep --help -b a
+## stdout-json: ""
+## stderr-contains: invalid option -- 'b'
+## status: 2
+
+#### grep refuses -NUM, GNU's fourth spelling of a context count
+# `grep -2 a` is `-C2` in GNU. td-txt has -A/-B/-C and not this, so a digit is
+# refused rather than silently ignored -- which for a context flag would print
+# the right lines with the wrong ones missing.
+## argv: grep -2 a
+## stdin-json: "a\n"
+## stdout-json: ""
+## stderr-contains: invalid option -- '2'
+## status: 2
+
 #### grep refuses -b rather than reporting a byte offset it does not track
 # GNU's -b prefixes each output line with its byte offset. Nothing on the image
 # or in td's recipes uses it — glibc's build wants `grep -ob U', and the ladder
@@ -130,6 +175,50 @@ a
 ## stdout-json: ""
 ## status: 1
 ## stderr-contains: invalid option -- 'l'
+
+#### grep refuses -d rather than guessing which of its three actions was meant
+# GNU's -d ACTION is read/skip/recurse for a DIRECTORY operand, and `-d recurse'
+# is a second spelling of -r. Accepting only that spelling would fail open on the
+# other two, and `-d skip' in particular asks for silence about a directory this
+# applet reports; -r and -R are the spellings td's own scripts use.
+## argv: grep -d recurse a
+## stdin:
+a
+## END
+## stdout-json: ""
+## status: 2
+## stderr-contains: invalid option -- 'd'
+
+#### and --directories, its long spelling
+## argv: grep --directories=skip a
+## stdin:
+a
+## END
+## stdout-json: ""
+## status: 2
+## stderr-contains: unrecognized option
+
+#### grep refuses -D rather than guessing which of its two actions was meant
+# GNU's -D ACTION is read/skip for a device, FIFO or socket operand, and it is
+# what makes -r and -R differ over them: -r's default is skip and -R's is read.
+# Both defaults are implemented; naming the override is not, so it is refused
+# rather than accepted as whichever default was already in force.
+## argv: grep -D skip a
+## stdin:
+a
+## END
+## stdout-json: ""
+## status: 2
+## stderr-contains: invalid option -- 'D'
+
+#### and --devices, its long spelling
+## argv: grep --devices=read a
+## stdin:
+a
+## END
+## stdout-json: ""
+## status: 2
+## stderr-contains: unrecognized option
 
 #### grep refuses --color rather than emitting or dropping escapes
 ## argv: grep --color=auto a

@@ -2415,7 +2415,7 @@ sed: couldn't open file nosuch.sed: No such file or directory
 ## END
 ## status: 4
 
-#### -f reads the script from a file
+#### -f reads the script from a file, a second script beside it
 ## argv: sed -f edit.sed in.txt
 ## file edit.sed:
 s/alpha/ALPHA/
@@ -5565,24 +5565,80 @@ f$
 ## stderr-json: ""
 ## status: 0
 
-#### a dollar before a bare pipe is not the literal it looks like
+#### a dollar before a bare pipe is not the literal it looks like: it anchors
 ## argv: sed 's@x$|*@<&>@'
 ## stdin-json: "x$\n"
 ## stdout-json: "x$\n"
 ## stderr-json: ""
 ## status: 0
 
-#### nor does it anchor: GNU matches nothing here at all
+#### and glibc never satisfies that anchor, so this matches nothing at all
 ## argv: sed 's@x$|*@<&>@'
 ## stdin-json: "x\n"
 ## stdout-json: "x\n"
 ## stderr-json: ""
 ## status: 0
 
-#### at the start of the pattern it IS the literal, and that one agrees
+#### where nothing before the dollar pins where a match may start, GNU's literal shows through
 ## argv: sed 's@$|*@<&>@'
 ## stdin-json: "a$\n"
 ## stdout-json: "a<$>\n"
+## stderr-json: ""
+## status: 0
+
+#### sed reaches that anchor through glibc, which satisfies a mid-branch one never
+## argv: sed 's@x$|\?@<&>@'
+## stdin-json: "x\n"
+## stdout-json: "x\n"
+## stderr-json: ""
+## status: 0
+
+#### so neither is the text it looks like replaced
+## argv: sed 's@x$|a@<&>@'
+## stdin-json: "x$|a\n"
+## stdout-json: "x$|a\n"
+## stderr-json: ""
+## status: 0
+
+#### as the pattern's last byte it is the literal, and there the two tools agree
+## argv: sed 's@x$|@<&>@'
+## stdin-json: "ax$|z\n"
+## stdout-json: "a<x$|>z\n"
+## stderr-json: ""
+## status: 0
+
+#### only the branch carrying the anchor is dead
+## argv: sed 's@x$|a\|zz@<&>@'
+## stdin-json: "zz\n"
+## stdout-json: "<zz>\n"
+## stderr-json: ""
+## status: 0
+
+#### a bare paren reads the same way here
+## argv: sed 's@x$))@<&>@'
+## stdin-json: "x$))\n"
+## stdout-json: "x$))\n"
+## stderr-json: ""
+## status: 0
+
+#### a dot pins no byte either, so the same pattern past a branch start still does
+## argv: sed 's@.$|*@<&>@'
+## stdin-json: "x$\n"
+## stdout-json: "<x$>\n"
+## stderr-json: ""
+## status: 0
+
+#### nor does a star that can take none of its atom
+## argv: sed 's@x*$|*@<&>@'
+## stdin-json: "x$\n"
+## stdout-json: "<x$>\n"
+## stderr-json: ""
+## status: 0
+
+#### but a tail that cannot match empty is dead even at the pattern's start
+## argv: sed 's@$|a@<&>@'
+## stdin-json: "$|a\n"
+## stdout-json: "$|a\n"
 ## stderr-json: ""
 ## status: 0
 
@@ -6264,7 +6320,7 @@ b/p'
 ## stderr-json: ""
 ## status: 0
 
-#### with something before it too
+#### with something before that too
 ## argv: sed --posix -E 's@a)@X@'
 ## stdin-json: "a)b\n"
 ## stdout-json: "Xb\n"

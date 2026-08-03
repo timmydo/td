@@ -41,7 +41,7 @@ fn bin() -> PathBuf {
 /// missing vendored `.inp`/`.good`, or a typo'd annotation reds in-loop — without
 /// depending on the behavioral run below.
 /// Raise this with the corpus; it exists to catch a corpus that SHRANK.
-const CORPUS_FLOOR: usize = 1472;
+const CORPUS_FLOOR: usize = 1585;
 
 #[test]
 fn corpus_is_well_formed() -> Result<(), Box<dyn std::error::Error>> {
@@ -453,5 +453,226 @@ fn a_failed_in_place_backup_is_exit_4_and_leaves_no_scratch_file(
         .collect();
     assert_eq!(names, vec!["f".to_string()], "a scratch file was left behind");
     assert_eq!(std::fs::read(dir.join("f"))?, b"a\n", "the original was modified anyway");
+    Ok(())
+}
+
+fn grep_in(dir: &TempDir, args: &[&str]) -> std::io::Result<std::process::Output> {
+    std::process::Command::new(bin())
+        .arg("grep")
+        .args(args)
+        .current_dir(&dir.0)
+        .output()
+}
+
+/// `-r` collects REGULAR files only. The case that forced this is a FIFO, whose
+/// open blocks until a writer arrives — `grep -r` in a tree holding one hung
+/// forever where GNU skips it and finishes. `std` cannot make a FIFO, so the
+/// test uses the other non-regular file it CAN make; both are the same rule, and
+/// a socket fails the open loudly (`No such device or address`) where the FIFO
+/// fails silently by never returning.
+#[test]
+fn grep_r_skips_a_non_regular_file_it_finds() -> Result<(), Box<dyn std::error::Error>> {
+    let dir = TempDir::new("grep-r-socket")?;
+    std::fs::create_dir(dir.join("t"))?;
+    std::fs::write(dir.join("t").join("f"), b"a\n")?;
+    let _sock = std::os::unix::net::UnixListener::bind(dir.join("t").join("s"))?;
+
+    let out = grep_in(&dir, &["-rl", "a", "t"])?;
+    assert_eq!(out.status.code(), Some(0), "want exit 0, got {out:?}");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "t/f\n");
+    assert_eq!(String::from_utf8_lossy(&out.stderr), "", "the socket was opened anyway");
+    Ok(())
+}
+
+/// The root of the walk is FOLLOWED and everything under it is not, which is
+/// GNU's `-r`: a symlinked directory named as an OPERAND is descended, and one
+/// found by the walk is skipped. `-R` follows both, and is still a bare synonym
+/// for `-r` here (spec/README's walk gap).
+#[test]
+fn grep_r_follows_a_symlinked_directory_operand_but_not_one_it_finds(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let dir = TempDir::new("grep-r-symlink")?;
+    std::fs::create_dir(dir.join("real"))?;
+    std::fs::write(dir.join("real").join("f"), b"a\n")?;
+    std::fs::create_dir(dir.join("t"))?;
+    std::fs::write(dir.join("t").join("g"), b"a\n")?;
+    std::os::unix::fs::symlink("../real", dir.join("t").join("link"))?;
+    std::os::unix::fs::symlink("real", dir.join("operand"))?;
+
+    let named = grep_in(&dir, &["-rl", "a", "operand"])?;
+    assert_eq!(named.status.code(), Some(0), "want exit 0, got {named:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&named.stdout),
+        "operand/f\n",
+        "a symlinked directory named as an operand was not descended"
+    );
+
+    let found = grep_in(&dir, &["-rl", "a", "t"])?;
+    assert_eq!(found.status.code(), Some(0), "want exit 0, got {found:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&found.stdout),
+        "t/g\n",
+        "a symlink found by the walk was descended"
+    );
+    Ok(())
+}
+
+/// Only an OPERAND spells stdin. A file the walk found that happens to be named
+/// `-` is searched like any other, which GNU does and reading stdin for it would
+/// not -- with a live writer on stdin that substitution never returns.
+#[test]
+fn grep_r_searches_a_walked_file_named_dash() -> Result<(), Box<dyn std::error::Error>> {
+    let dir = TempDir::new("grep-r-dashfile")?;
+    std::fs::write(dir.join("-"), b"a\n")?;
+    std::fs::write(dir.join("other"), b"a\n")?;
+
+    let out = grep_in(&dir, &["-rn", "a"])?;
+    assert_eq!(out.status.code(), Some(0), "want exit 0, got {out:?}");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "-:1:a\nother:1:a\n");
+    Ok(())
+}
+
+/// `-` is stdin under `-r` as much as without it. It is not a directory, so it
+/// neither descends nor names on its own — the name here comes from there being
+/// two operands.
+#[test]
+fn grep_r_reads_stdin_for_a_dash_operand() -> Result<(), Box<dyn std::error::Error>> {
+    use std::io::Write;
+    let dir = TempDir::new("grep-r-stdin")?;
+    std::fs::write(dir.join("f"), b"a\n")?;
+
+    let mut child = std::process::Command::new(bin())
+        .arg("grep")
+        .args(["-rn", "a", "-", "f"])
+        .current_dir(&dir.0)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()?;
+    // Not `if let`: a missing pipe would leave the child blocking on stdin, so the
+    // one test here that could hang the gate must fail instead.
+    child.stdin.take().ok_or("no stdin pipe")?.write_all(b"a\nb\n")?;
+    let out = child.wait_with_output()?;
+    assert_eq!(out.status.code(), Some(0), "want exit 0, got {out:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "(standard input):1:a\nf:1:a\n"
+    );
+    Ok(())
+}
+
+/// `-R` is the LOGICAL walk: every symlink is followed, not only the operand,
+/// and the non-regular files `-r` skips are read. The socket here is the same
+/// stand-in for a device as above — GNU's `-R` opens it and reports, where its
+/// `-r` skips it silently, because the two flags' `--devices` defaults differ.
+#[test]
+fn grep_upper_r_follows_what_the_walk_finds_and_reads_devices(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let dir = TempDir::new("grep-R-logical")?;
+    std::fs::create_dir(dir.join("real"))?;
+    std::fs::write(dir.join("real").join("f"), b"a\n")?;
+    std::fs::create_dir(dir.join("t"))?;
+    std::fs::write(dir.join("t").join("g"), b"a\n")?;
+    std::os::unix::fs::symlink("../real", dir.join("t").join("link"))?;
+
+    let logical = grep_in(&dir, &["-Rl", "a", "t"])?;
+    assert_eq!(logical.status.code(), Some(0), "want exit 0, got {logical:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&logical.stdout),
+        "t/g\nt/link/f\n",
+        "-R did not follow the symlink the walk found"
+    );
+
+    let _sock = std::os::unix::net::UnixListener::bind(dir.join("t").join("s"))?;
+    let physical = grep_in(&dir, &["-rl", "a", "t"])?;
+    assert_eq!(String::from_utf8_lossy(&physical.stdout), "t/g\n");
+    assert_eq!(String::from_utf8_lossy(&physical.stderr), "", "-r opened the socket");
+    let read_devices = grep_in(&dir, &["-Rl", "a", "t"])?;
+    assert!(
+        String::from_utf8_lossy(&read_devices.stderr).contains("t/s:"),
+        "-R skipped the socket instead of reading it: {read_devices:?}"
+    );
+    Ok(())
+}
+
+/// Following symlinks is what lets a directory be reached from inside itself, so
+/// the logical walk carries its ancestor chain. GNU WARNS and carries on — the
+/// exit status is whatever the search concluded, here a match.
+#[test]
+fn grep_upper_r_warns_on_a_directory_loop_and_keeps_going(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let dir = TempDir::new("grep-R-loop")?;
+    std::fs::create_dir(dir.join("t"))?;
+    std::fs::write(dir.join("t").join("f"), b"a\n")?;
+    std::os::unix::fs::symlink(".", dir.join("t").join("self"))?;
+
+    let out = grep_in(&dir, &["-Rl", "a", "t"])?;
+    assert_eq!(out.status.code(), Some(0), "a loop made the status an error: {out:?}");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "t/f\n");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr),
+        "grep: t/self: warning: recursive directory loop\n"
+    );
+
+    // A link to a SIBLING is two names for one directory without being a cycle,
+    // and it is followed. Only an ancestor is refused -- which is why the test
+    // above uses `.` and this one does not point back into `t`.
+    std::fs::remove_file(dir.join("t").join("self"))?;
+    std::fs::create_dir(dir.join("sib"))?;
+    std::fs::write(dir.join("sib").join("g"), b"a\n")?;
+    std::os::unix::fs::symlink("../sib", dir.join("t").join("side"))?;
+    let sibling = grep_in(&dir, &["-Rl", "a", "t"])?;
+    assert_eq!(
+        String::from_utf8_lossy(&sibling.stdout),
+        "t/f\nt/side/g\n",
+        "a link to a sibling was refused as a cycle: {sibling:?}"
+    );
+    assert_eq!(String::from_utf8_lossy(&sibling.stderr), "");
+    Ok(())
+}
+
+/// The line is drawn at the OPEN, not at the read: a directory grep opened and
+/// could not read counts as a file it processed and found nothing in, while a
+/// file it could not open at all does not. The corpus cannot express the second
+/// half -- its harness materializes readable files -- so it lives here.
+#[test]
+fn grep_counts_what_it_opened_and_could_not_read_but_not_what_it_could_not_open(
+) -> Result<(), Box<dyn std::error::Error>> {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = TempDir::new("grep-unreadable")?;
+    std::fs::create_dir(dir.join("d"))?;
+    std::fs::write(dir.join("shut"), b"alpha\n")?;
+    std::fs::set_permissions(dir.join("shut"), std::fs::Permissions::from_mode(0o000))?;
+
+    // Running as root defeats the mode, and then the file is simply readable.
+    let readable = std::fs::File::open(dir.join("shut")).is_ok();
+    if !readable {
+        let shut = grep_in(&dir, &["-c", "alpha", "shut"])?;
+        assert_eq!(shut.status.code(), Some(2), "want exit 2, got {shut:?}");
+        assert_eq!(
+            String::from_utf8_lossy(&shut.stdout),
+            "",
+            "a file that never opened earned a count line"
+        );
+    }
+
+    let opened = grep_in(&dir, &["-c", "alpha", "d"])?;
+    assert_eq!(opened.status.code(), Some(2), "want exit 2, got {opened:?}");
+    assert_eq!(String::from_utf8_lossy(&opened.stdout), "0\n");
+    assert!(String::from_utf8_lossy(&opened.stderr).contains("Is a directory"));
+
+    // The same rule reached through stdin, which is where the NAME in the
+    // diagnostic matters: GNU blames `(standard input)`, never the `-`.
+    let as_stdin = std::process::Command::new(bin())
+        .arg("grep")
+        .args(["-c", "alpha", "-"])
+        .current_dir(&dir.0)
+        .stdin(std::process::Stdio::from(std::fs::File::open(dir.join("d"))?))
+        .output()?;
+    assert_eq!(as_stdin.status.code(), Some(2), "want exit 2, got {as_stdin:?}");
+    assert_eq!(String::from_utf8_lossy(&as_stdin.stdout), "0\n");
+    assert_eq!(
+        String::from_utf8_lossy(&as_stdin.stderr),
+        "grep: (standard input): Is a directory\n"
+    );
     Ok(())
 }

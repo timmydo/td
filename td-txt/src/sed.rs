@@ -280,6 +280,10 @@ impl ScriptParser<'_> {
             icase,
             strict_repeats: true,
             posix: self.posix,
+            // sed has only glibc, which never satisfies a mid-branch `$`.
+            glibc_engine: true,
+            // sed lexes one regex at a time, and has no `-x`/`-w` to wrap it.
+            lex_continues: false,
             reg_newline: multiline.then_some(separator_for(self.null_data)),
         };
         let re = Regex::compile(&normalize_regex(raw)?, opts)

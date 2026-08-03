@@ -1981,6 +1981,300 @@ grep: d: Is a directory
 ## END
 ## status: 2
 
+#### a directory operand still COUNTS as a file read empty, so -c prints its zero
+## argv: grep -c alpha d
+## file d/x.txt:
+alpha
+## END
+## stdout-json: "0\n"
+## stderr-json: "grep: d: Is a directory\n"
+## status: 2
+
+#### and -L names it, having found no match in it
+## argv: grep -L alpha d
+## file d/x.txt:
+alpha
+## END
+## stdout-json: "d\n"
+## stderr-json: "grep: d: Is a directory\n"
+## status: 2
+
+#### a directory operand counts BEFORE a file that follows it
+## argv: grep -c alpha d f
+## file d/x.txt:
+alpha
+## END
+## file f:
+alpha
+## END
+## stdout-json: "d:0\nf:1\n"
+## stderr-json: "grep: d: Is a directory\n"
+## status: 2
+
+#### -L names it there too, and the file with a match is left off
+## argv: grep -L alpha d f
+## file d/x.txt:
+alpha
+## END
+## file f:
+alpha
+## END
+## stdout-json: "d\n"
+## stderr-json: "grep: d: Is a directory\n"
+## status: 2
+
+#### -s silences the diagnostic and leaves the count line it earned
+## argv: grep -cs alpha d
+## file d/x.txt:
+alpha
+## END
+## stdout-json: "0\n"
+## stderr-json: ""
+## status: 2
+
+#### a missing operand was never opened, so it earns no count line
+## argv: grep -c alpha d nosuch
+## file d/x.txt:
+alpha
+## END
+## stdout-json: "d:0\n"
+## stderr-json: "grep: d: Is a directory\ngrep: nosuch: No such file or directory\n"
+## status: 2
+
+#### -l and -L are one question, and the LAST one asked is the one answered
+## argv: grep -lL a f g
+## file f:
+a
+b
+## END
+## file g:
+b
+## END
+## stdout-json: "g\n"
+## stderr-json: ""
+## status: 0
+
+#### the other order answers the other way
+## argv: grep -Ll a f g
+## file f:
+a
+b
+## END
+## file g:
+b
+## END
+## stdout-json: "f\n"
+## stderr-json: ""
+## status: 0
+
+#### a third flag does not reopen the first: -l -L -l is -l
+## argv: grep -lLl a f g
+## file f:
+a
+b
+## END
+## file g:
+b
+## END
+## stdout-json: "f\n"
+## stderr-json: ""
+## status: 0
+
+#### the long spellings are the same one question
+## argv: grep --files-with-matches --files-without-match a f g
+## file f:
+a
+b
+## END
+## file g:
+b
+## END
+## stdout-json: "g\n"
+## stderr-json: ""
+## status: 0
+
+#### and -c is still outranked by whichever of them won
+## argv: grep -clL a f g
+## file f:
+a
+b
+## END
+## file g:
+b
+## END
+## stdout-json: "g\n"
+## stderr-json: ""
+## status: 0
+
+#### `-l` outranks `-c`: GNU prints the NAME and not the count before it
+## argv: grep -cl a f
+## file f:
+a
+b
+## END
+## stdout-json: "f\n"
+## stderr-json: ""
+## status: 0
+
+#### and `-L` the same, for a file with no match
+## argv: grep -cL zz f
+## file f:
+a
+b
+## END
+## stdout-json: "f\n"
+## stderr-json: ""
+## status: 1
+
+#### while `-c` alone still counts
+## argv: grep -c a f
+## file f:
+a
+b
+## END
+## stdout-json: "1\n"
+## stderr-json: ""
+## status: 0
+
+#### a count line carries the NAME but never a line number
+## argv: grep -cn a
+## stdin-json: "a\nb\n"
+## stdout-json: "1\n"
+## stderr-json: ""
+## status: 0
+
+#### the name a count line does carry is not followed by a number
+## argv: grep -cn a one two
+## file one:
+a
+b
+a
+## END
+## file two:
+b
+c
+## END
+## stdout-json: "one:2\ntwo:0\n"
+## stderr-json: ""
+## status: 0
+
+#### -Z still ends that name with a NUL, the byte -n would have preceded
+## argv: grep -cnZ a one two
+## file one:
+a
+b
+a
+## END
+## file two:
+b
+c
+## END
+## stdout-json: "one\u00002\ntwo\u00000\n"
+## stderr-json: ""
+## status: 0
+
+#### -v counts the other lines, and still names no line
+## argv: grep -cnv a one two
+## file one:
+a
+b
+a
+## END
+## file two:
+b
+c
+## END
+## stdout-json: "one:1\ntwo:2\n"
+## stderr-json: ""
+## status: 0
+
+#### a context flag names lines again as soon as there is a line to name
+## argv: grep -nA1 a one
+## file one:
+a
+b
+a
+## END
+## stdout-json: "1:a\n2-b\n3:a\n"
+## stderr-json: ""
+## status: 0
+
+#### a name, a number and a context line all at once, the NUL after the name only
+## argv: grep -nHZA1 a one
+## file one:
+a
+b
+a
+## END
+## stdout-json: "one\u00001:a\none\u00002-b\none\u00003:a\n"
+## stderr-json: ""
+## status: 0
+
+#### -r does not name a single non-directory operand
+## argv: grep -rn a one
+## file one:
+a
+b
+a
+## END
+## stdout-json: "1:a\n3:a\n"
+## stderr-json: ""
+## status: 0
+
+#### nor does the count line under it
+## argv: grep -rcn a one
+## file one:
+a
+b
+a
+## END
+## stdout-json: "2\n"
+## stderr-json: ""
+## status: 0
+
+#### but a DIRECTORY operand is descended, and then the one file it finds is named
+## argv: grep -rn a d
+## file d/g:
+a
+## END
+## stdout-json: "d/g:1:a\n"
+## stderr-json: ""
+## status: 0
+
+#### two operands name whether either is descended or not
+## argv: grep -rn a one two
+## file one:
+a
+b
+a
+## END
+## file two:
+a
+## END
+## stdout-json: "one:1:a\none:3:a\ntwo:1:a\n"
+## stderr-json: ""
+## status: 0
+
+#### -H names the single operand -r would not
+## argv: grep -rHn a one
+## file one:
+a
+b
+a
+## END
+## stdout-json: "one:1:a\none:3:a\n"
+## stderr-json: ""
+## status: 0
+
+#### -h takes the name off the descent
+## argv: grep -rhn a d
+## file d/g:
+a
+## END
+## stdout-json: "1:a\n"
+## stderr-json: ""
+## status: 0
+
 #### a missing operand file with nothing matched anywhere is exit 2
 ## argv: grep alpha nosuch present
 ## file present:
@@ -3045,6 +3339,252 @@ abc
 ## stderr-json: ""
 ## status: 0
 
+#### a bare pipe as the pattern's LAST byte leaves the dollar the literal it is elsewhere
+## argv: grep -c 'x$|'
+## stdin-json: "ax$|z\n"
+## stdout-json: "1\n"
+## stderr-json: ""
+## status: 0
+
+#### one byte further and the same dollar anchors, so that text is NOT selected
+## argv: grep -c 'x$||'
+## stdin-json: "x$||\n"
+## stdout-json: "0\n"
+## stderr-json: ""
+## status: 1
+
+#### a bare paren reads the same way
+## argv: grep -c 'x$)a'
+## stdin-json: "x$)a\n"
+## stdout-json: "0\n"
+## stderr-json: ""
+## status: 1
+
+#### and is likewise the literal as the last byte
+## argv: grep -c 'x$)'
+## stdin-json: "ax$)z\n"
+## stdout-json: "1\n"
+## stderr-json: ""
+## status: 0
+
+#### an ordinary byte after the dollar does not reach the rule at all
+## argv: grep -c 'x$az'
+## stdin-json: "x$az\n"
+## stdout-json: "1\n"
+## stderr-json: ""
+## status: 0
+
+#### what is counted is the bytes left in the PATTERN, not in the branch
+## argv: grep -c 'x$|\|zz'
+## stdin-json: "x$|\nzz\n"
+## stdout-json: "1\n"
+## stderr-json: ""
+## status: 0
+
+#### so closing the group does not hand the literal back either
+## argv: grep -c '\(x$|\)'
+## stdin-json: "x$|\n"
+## stdout-json: "0\n"
+## stderr-json: ""
+## status: 1
+
+#### of two dollars only the second is one byte from the end
+## argv: grep -c 'x$$|'
+## stdin-json: "x$$|\n"
+## stdout-json: "1\n"
+## stderr-json: ""
+## status: 0
+
+#### and one byte more anchors that one too
+## argv: grep -c 'x$$||'
+## stdin-json: "x$$||\n"
+## stdout-json: "0\n"
+## stderr-json: ""
+## status: 1
+
+#### grep's dfa satisfies the anchor at a true end of line, the pipe taken zero times
+## argv: grep -c 'x$|\?'
+## stdin-json: "x\n"
+## stdout-json: "1\n"
+## stderr-json: ""
+## status: 0
+
+#### but not where the pipe must be taken
+## argv: grep -c 'x$|\{1\}'
+## stdin-json: "x$|\n"
+## stdout-json: "0\n"
+## stderr-json: ""
+## status: 1
+
+#### and `-o` runs glibc for the same pattern, which disagrees with the dfa `-c` uses
+## argv: grep -o 'x$|*'
+## stdin-json: "x\nx$\n"
+## stdout-json: ""
+## stderr-json: ""
+## status: 0
+
+#### grep lexes its pattern list JOINED, so a trailing pipe is not the last byte
+## argv: grep -c -e 'x$|' -e 'zz'
+## stdin-json: "ax$|z\nzz\n"
+## stdout-json: "1\n"
+## stderr-json: ""
+## status: 0
+
+#### the same list the other way round, where the pipe really does end the lex
+## argv: grep -c -e 'zz' -e 'x$|'
+## stdin-json: "ax$|z\nzz\n"
+## stdout-json: "2\n"
+## stderr-json: ""
+## status: 0
+
+#### even an EMPTY pattern after it is another byte
+## argv: grep -c -e 'x$|' -e ''
+## stdin-json: "ax$|z\nzz\n"
+## stdout-json: "2\n"
+## stderr-json: ""
+## status: 0
+
+#### GNU drops a DUPLICATE pattern before lexing, which changes which one is last
+## argv: grep -c -e 'x$|' -e 'q' -e 'x$|'
+## stdin-json: "x$|\nax$|z\nx$|a\nx$||\nq\n"
+## stdout-json: "1\n"
+## stderr-json: ""
+## status: 0
+
+#### dropping a repeat keeps the FIRST, so this list ends where `-e q -e 'x$|'` does
+## argv: grep -c -e 'q' -e 'x$|' -e 'q'
+## stdin-json: "x$|\nax$|z\nx$|a\nx$||\nq\nX$|\n"
+## stdout-json: "5\n"
+## stderr-json: ""
+## status: 0
+
+#### the test is on BYTES, not on meaning, so -i does not make these one pattern
+## argv: grep -ic -e 'x$|' -e 'q' -e 'X$|'
+## stdin-json: "x$|\nax$|z\nx$|a\nx$||\nq\nX$|\n"
+## stdout-json: "6\n"
+## stderr-json: ""
+## status: 0
+
+#### nor are they one without it
+## argv: grep -c -e 'x$|' -e 'q' -e 'X$|'
+## stdin-json: "x$|\nax$|z\nx$|a\nx$||\nq\nX$|\n"
+## stdout-json: "2\n"
+## stderr-json: ""
+## status: 0
+
+#### an adjacent repeat leaves a one-pattern lex, so the pipe ends it
+## argv: grep -c -e 'x$|' -e 'x$|'
+## stdin-json: "x$|\nax$|z\nx$|a\nx$||\nq\nX$|\n"
+## stdout-json: "4\n"
+## stderr-json: ""
+## status: 0
+
+#### and the list a `-f` file contributes to is the same list
+## argv: grep -c -f pats.txt -e 'q' -e 'x$|'
+## file-json pats.txt: "x$|\n"
+## stdin-json: "x$|\nax$|z\nx$|a\nx$||\nq\nX$|\n"
+## stdout-json: "1\n"
+## stderr-json: ""
+## status: 0
+
+#### and the newlines INSIDE one argument feed that same list, not a list per argument
+## argv: grep -c "x$|\nq\nx$|"
+## stdin-json: "x$|\nax$|z\nx$|a\nx$||\nq\nX$|\n"
+## stdout-json: "1\n"
+## stderr-json: ""
+## status: 0
+
+#### a BACKREFERENCE anywhere in the list hands the whole list to glibc, which reads the pipe rule differently
+## argv: grep -c -e 'x$|' -e '\(x\)\1$|'
+## stdin-json: "x$|\nax$|z\nx$|a\nx$||\nq\nX$|\nxx$|\n"
+## stdout-json: "5\n"
+## stderr-json: ""
+## status: 0
+
+#### drop the reference and the two engines agree again
+## argv: grep -c -e 'x$|' -e '\(x\)$|'
+## stdin-json: "x$|\nax$|z\nx$|a\nx$||\nq\nX$|\nxx$|\n"
+## stdout-json: "5\n"
+## stderr-json: ""
+## status: 0
+
+#### the -v short cut needs EVERY pattern empty, so a mixed list still prints its count
+## argv: grep -cv -e 'a' -e ''
+## stdin-json: "a\nb\n\nab\n"
+## stdout-json: "0\n"
+## stderr-json: ""
+## status: 1
+
+#### with every one empty GNU suppresses even the count line
+## argv: grep -cv -e '' -e ''
+## stdin-json: "a\nb\n\nab\n"
+## stdout-json: ""
+## stderr-json: ""
+## status: 1
+
+#### a pattern that matches every line without being EMPTY does not qualify
+## argv: grep -cv -e '.*'
+## stdin-json: "a\nb\n\nab\n"
+## stdout-json: "0\n"
+## stderr-json: ""
+## status: 1
+
+#### nor does it beside an empty one
+## argv: grep -cv -e '' -e '.*'
+## stdin-json: "a\nb\n\nab\n"
+## stdout-json: "0\n"
+## stderr-json: ""
+## status: 1
+
+#### the syntax does not decide it either
+## argv: grep -cv -F -e 'a' -e ''
+## stdin-json: "a\nb\n\nab\n"
+## stdout-json: "0\n"
+## stderr-json: ""
+## status: 1
+
+#### and -x takes the short cut away, having narrowed the empty pattern
+## argv: grep -cvx -e 'a' -e ''
+## stdin-json: "a\nb\n\nab\n"
+## stdout-json: "2\n"
+## stderr-json: ""
+## status: 0
+
+#### `-x` wraps what grep lexes, so the trailing pipe is not the last byte either
+## argv: grep -xc 'x$|'
+## stdin-json: "x$|\nax$|z\nx$)\nx\n"
+## stdout-json: "0\n"
+## stderr-json: ""
+## status: 1
+
+#### `-w` wraps it the same way
+## argv: grep -wc 'x$|'
+## stdin-json: "x$|\nax$|z\nx$)\nx\n"
+## stdout-json: "0\n"
+## stderr-json: ""
+## status: 1
+
+#### and the long spellings are the same option
+## argv: grep --line-regexp -c 'x$)'
+## stdin-json: "x$|\nax$|z\nx$)\nx\n"
+## stdout-json: "0\n"
+## stderr-json: ""
+## status: 1
+
+#### --word-regexp too
+## argv: grep --word-regexp -c 'x$)'
+## stdin-json: "x$|\nax$|z\nx$)\nx\n"
+## stdout-json: "0\n"
+## stderr-json: ""
+## status: 1
+
+#### while without either the same pattern keeps the literal
+## argv: grep -c 'x$|'
+## stdin-json: "x$|\nax$|z\nx$)\nx\n"
+## stdout-json: "2\n"
+## stderr-json: ""
+## status: 0
+
 #### a group whose body matches EMPTY still participates, so the reference holds
 ## argv: grep -Ec '^(x*)*\1$'
 ## stdin-json: "\n"
@@ -3350,7 +3890,7 @@ abc
 ## stdout-json: ""
 ## status: 2
 
-#### in either order
+#### in either order, the unusable brace still ending the pattern
 ## argv: grep -Ec '({2}*)({*)'
 ## stdin-json: "a\n"
 ## stdout-json: ""
@@ -4082,3 +4622,387 @@ abc
 ## stdout-json: "1\n"
 ## status: 0
 
+#### two DIFFERENT matchers are refused, where -l and -L would take the last
+## argv: grep -EF a
+## stdin-json: "a\nb\n"
+## stdout-json: ""
+## stderr-contains: conflicting matchers specified
+## status: 2
+
+#### the same one twice is not a conflict
+## argv: grep -EEc a
+## stdin-json: "a\nb\n"
+## stdout-json: "1\n"
+## stderr-json: ""
+## status: 0
+
+#### nor is it about adjacency: -EEF still refuses, the test being per token
+## argv: grep -EEF a
+## stdin-json: "a\nb\n"
+## stdout-json: ""
+## stderr-contains: conflicting matchers specified
+## status: 2
+
+#### separated is the same as clustered
+## argv: grep -G -E a
+## stdin-json: "a\nb\n"
+## stdout-json: ""
+## stderr-contains: conflicting matchers specified
+## status: 2
+
+#### but the DEFAULT basic syntax is not a choice, so a bare -E is fine
+## argv: grep -Ec 'a|b'
+## stdin-json: "a\nb\n"
+## stdout-json: "2\n"
+## stderr-json: ""
+## status: 0
+
+#### the long spellings choose the same thing and conflict with the short
+## argv: grep --fixed-strings -E a
+## stdin-json: "a\nb\n"
+## stdout-json: ""
+## stderr-contains: conflicting matchers specified
+## status: 2
+
+#### an error BEFORE the second matcher still outranks it
+## argv: grep -m x -EF a
+## stdin-json: "a\nb\n"
+## stdout-json: ""
+## stderr-contains: invalid max count
+## status: 2
+
+#### and everything AFTER the second matcher loses, --help included
+## argv: grep -EF --help a
+## stdin-json: "a\nb\n"
+## stdout-json: ""
+## stderr-contains: conflicting matchers specified
+## status: 2
+
+#### and a --help BEFORE the conflict does not escape it either
+## argv: grep --help -EF a
+## stdin-json: "a\nb\n"
+## stdout-json: ""
+## stderr-contains: conflicting matchers specified
+## status: 2
+
+#### nor does a --version before it
+## argv: grep --version -EF a
+## stdin-json: "a\nb\n"
+## stdout-json: ""
+## stderr-contains: conflicting matchers specified
+## status: 2
+
+#### the short spelling conflicts with a long one that follows it
+## argv: grep -F --extended-regexp a
+## stdin-json: "a\nb\n"
+## stdout-json: ""
+## stderr-contains: conflicting matchers specified
+## status: 2
+
+#### a repeated LONG spelling is no more a conflict than a repeated short one
+## argv: grep --extended-regexp --extended-regexp -c 'a|b'
+## stdin-json: "a\nb\n"
+## stdout-json: "2\n"
+## stderr-json: ""
+## status: 0
+
+#### --help waits for the option scan to finish, so a bad -m still outranks it
+## argv: grep --help -m x a
+## stdin-json: "a\n"
+## stdout-json: ""
+## stderr-contains: invalid max count
+## status: 2
+
+#### and so does a -f file that is not there, being READ during that scan
+## argv: grep --help -f /nonexistent a
+## stdin-json: "a\n"
+## stdout-json: ""
+## stderr-contains: No such file or directory
+## status: 2
+
+#### -o drops a context line that has no matched text, but not the group separator
+# GNU prints the separator where the context RANGES break even though the
+# context LINE itself printed nothing -- the separator is about the ranges.
+## argv: grep -o -B1 a f
+## file f:
+a
+b
+A
+aa
+## END
+## stdout-json: "a\n--\na\na\n"
+## stderr-json: ""
+## status: 0
+
+#### and merges the ranges the same way, so -o -C1 has no separator at all
+## argv: grep -o -C1 a f
+## file f:
+a
+b
+A
+aa
+## END
+## stdout-json: "a\na\na\n"
+## stderr-json: ""
+## status: 0
+
+#### a context line under -o prints its matched PARTS, which -v is what shows
+# Under -v the SELECTED lines are the non-matching ones, so the context lines
+# are the matching ones -- and they print reduced to their spans, prefixed `-`
+# like any context line. Without -v a context line never matches, which is why
+# this reads as `-o drops context lines` on every other input.
+## argv: grep -o -B1 -n -v a m
+## file m:
+a
+aa
+b
+aaa
+## END
+## stdout-json: "2-a\n2-a\n"
+## stderr-json: ""
+## status: 0
+
+#### and after -A too, each span on its own line
+## argv: grep -o -A1 -n -v a m
+## file m:
+a
+aa
+b
+aaa
+## END
+## stdout-json: "4-a\n4-a\n4-a\n"
+## stderr-json: ""
+## status: 0
+
+#### -o past -m prints no span, the drain having run all the same
+# The context line is reached -- `-m` never shortens the drain -- and prints
+# nothing because a context line is not a matching one without -v. Without -o
+# the same line prints whole.
+## argv: grep -o -A1 -m1 -n a m
+## file m:
+a
+aa
+b
+aaa
+## END
+## stdout-json: "1:a\n"
+## stderr-json: ""
+## status: 0
+
+#### which without -o is the line itself
+## argv: grep -A1 -m1 -n a m
+## file m:
+a
+aa
+b
+aaa
+## END
+## stdout-json: "1:a\n2-aa\n"
+## stderr-json: ""
+## status: 0
+
+#### a ZERO context count still groups, so -B0 separates where no flag does not
+# -B0 asks for no context LINES and still asks for grouping, so the rule is
+# `was a context flag given`, not `is the count non-zero`.
+## argv: grep -B0 a h
+## file h:
+a
+b
+b
+b
+b
+a
+## END
+## stdout-json: "a\n--\na\n"
+## stderr-json: ""
+## status: 0
+
+#### -A0 the same
+## argv: grep -A0 -n a h
+## file h:
+a
+b
+b
+b
+b
+a
+## END
+## stdout-json: "1:a\n--\n6:a\n"
+## stderr-json: ""
+## status: 0
+
+#### -C0 the same
+## argv: grep -C0 -n a h
+## file h:
+a
+b
+b
+b
+b
+a
+## END
+## stdout-json: "1:a\n--\n6:a\n"
+## stderr-json: ""
+## status: 0
+
+#### -C does not override an explicit -A: it supplies what was not given
+# So -A2 -C0 keeps two lines after and takes zero before, and writing the two
+# the other way round is the same thing.
+## argv: grep -A2 -C0 -n a h
+## file h:
+a
+b
+b
+b
+b
+a
+## END
+## stdout-json: "1:a\n2-b\n3-b\n--\n6:a\n"
+## stderr-json: ""
+## status: 0
+
+#### and the other order is the same thing
+## argv: grep -C0 -A2 -n a h
+## file h:
+a
+b
+b
+b
+b
+a
+## END
+## stdout-json: "1:a\n2-b\n3-b\n--\n6:a\n"
+## stderr-json: ""
+## status: 0
+
+#### nor an explicit -B, from either side
+## argv: grep -C2 -B0 -n a h
+## file h:
+a
+b
+b
+b
+b
+a
+## END
+## stdout-json: "1:a\n2-b\n3-b\n--\n6:a\n"
+## stderr-json: ""
+## status: 0
+
+#### but a second -A replaces the first
+## argv: grep -A1 -A2 -n a h
+## file h:
+a
+b
+b
+b
+b
+a
+## END
+## stdout-json: "1:a\n2-b\n3-b\n--\n6:a\n"
+## stderr-json: ""
+## status: 0
+
+#### and a second -C replaces the first
+## argv: grep -C2 -C1 -n a h
+## file h:
+a
+b
+b
+b
+b
+a
+## END
+## stdout-json: "1:a\n2-b\n--\n5-b\n6:a\n"
+## stderr-json: ""
+## status: 0
+
+#### -C is ignored outright when both -A and -B were given
+## argv: grep -A2 -B1 -C3 -n a h
+## file h:
+a
+b
+b
+b
+b
+a
+## END
+## stdout-json: "1:a\n2-b\n3-b\n--\n5-b\n6:a\n"
+## stderr-json: ""
+## status: 0
+
+#### the separator crosses a file boundary under -o as it does without it
+## argv: grep -o -B1 a f g
+## file f:
+a
+b
+A
+aa
+## END
+## file g:
+xay
+zzz
+bab
+qqq
+cac
+## END
+## stdout-json: "f:a\n--\nf:a\nf:a\n--\ng:a\ng:a\ng:a\n"
+## stderr-json: ""
+## status: 0
+
+#### -m does not shorten the trailing context, not even under -o
+# The line past the limit is a CONTEXT line, and under -v a context line is a
+# matching one, so it prints its spans. Whether -o prints a line is decided by
+# the line being a matching one -- selected without -v, context with it -- and
+# never by whether the line happens to match, which past -m is not the same.
+## argv: grep -o -A1 -v -m1 a x
+## file x:
+b
+aa
+## END
+## stdout-json: "a\na\n"
+## stderr-json: ""
+## status: 0
+
+#### and with -C both sides of the limit print
+## argv: grep -o -v -C1 -m1 -n a y
+## file y:
+a
+b
+a
+## END
+## stdout-json: "1-a\n3-a\n"
+## stderr-json: ""
+## status: 0
+
+#### a SELECTED line prints nothing under -o -v, having no match by definition
+## argv: grep -o -v -n a y
+## file y:
+a
+b
+a
+## END
+## stdout-json: ""
+## stderr-json: ""
+## status: 0
+
+#### a BINARY file that matched arms the next file's separator
+# Its notice goes to stderr, so nothing of that file reaches stdout -- and GNU
+# still opens the NEXT file's group with `--`. The separator is about the
+# ranges a processed file covered, not about what was printed.
+## argv: grep -B0 a bin txt
+## file-json bin: "a\u0000b\naa\n"
+## file-json txt: "a\nb\na\n"
+## stdout-json: "--\ntxt:a\n--\ntxt:a\n"
+## stderr-contains: bin: binary file matches
+## status: 0
+
+#### and one that matched nothing does not arm it
+## argv: grep -B0 a nomatch txt
+## file nomatch:
+zz
+## END
+## file-json txt: "a\nb\na\n"
+## stdout-json: "txt:a\n--\ntxt:a\n"
+## stderr-json: ""
+## status: 0

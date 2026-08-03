@@ -26,9 +26,8 @@ xfail grep-cli.test.txt::-w over sliding greedy repeats on a long line
 xfail grep-cli.test.txt::-o -w prints a shrunk span only at the first search position
 xfail grep-cli.test.txt::-o -w skips two shrinkable spans in the middle of the line
 xfail grep-cli.test.txt::-o -w after a shrunk span at the line start
-xfail grep-cli.test.txt::a dollar before a bare pipe anchors in grep, where the pipe is a literal
-xfail grep-cli.test.txt::so the text it looks like it wants is what it does NOT select
-xfail grep-cli.test.txt::and the same at the start of a pattern
+xfail grep-cli.test.txt::and `-o` runs glibc for the same pattern, which disagrees with the dfa `-c` uses
+xfail grep-cli.test.txt::a BACKREFERENCE anywhere in the list hands the whole list to glibc, which reads the pipe rule differently
 xfail grep-cli.test.txt::a fuzz composite that diverges where each of its parts agrees
 xfail grep-cli.test.txt::and the dropped interval does not make its group participate
 xfail grep-cli.test.txt::a second fuzz composite in the same family
@@ -48,7 +47,9 @@ xfail sed-cli.test.txt::a --sandbox that FOLLOWS the w it would refuse comes too
 xfail sed-cli.test.txt::and a w naming the -f script truncates it before GNU reads it
 xfail sed-cli.test.txt::F names the file GNU's $ lookahead has already opened
 xfail sed-cli.test.txt::\c at the end of a text controls the text's own terminator
-xfail sed-cli.test.txt::a dollar before a bare pipe is not the literal it looks like
+xfail sed-cli.test.txt::where nothing before the dollar pins where a match may start, GNU's literal shows through
+xfail sed-cli.test.txt::a dot pins no byte either, so the same pattern past a branch start still does
+xfail sed-cli.test.txt::nor does a star that can take none of its atom
 xfail sed-cli.test.txt::but a MANDATORY single-byte matcher after the pair matches nothing at all
 xfail sed-cli.test.txt::which a bracket spells the same way
 xfail sed-cli.test.txt::a [ consumed as a closer test leaves the reader somewhere unmodelled

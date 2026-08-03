@@ -56,6 +56,48 @@ pub fn read_input(path: &[u8]) -> std::io::Result<Vec<u8>> {
     std::fs::read(path_from_bytes(path))
 }
 
+/// A read that failed, and whether the OPEN is what failed. GNU counts a file it
+/// opened and could not READ as one it processed and found nothing in -- a
+/// directory operand is the reachable case, so `grep -c a d` prints its `0` --
+/// while a name it could not open at all was never processed.
+pub struct ReadFail {
+    pub err: std::io::Error,
+    pub opened: bool,
+    /// What the read DID return before failing. A read can append bytes and then
+    /// fail, and those bytes were still read: discarding them would report a file
+    /// as empty that had matches in it.
+    pub partial: Vec<u8>,
+}
+
+/// `read_input` for the SEARCH: it reports where the failure fell, and a name the
+/// WALK produced is always a file. Only an operand spells stdin `-`, so `grep -r`
+/// in a directory holding a file called `-` searches it rather than reading
+/// stdin, as GNU does.
+pub fn read_search(path: &[u8], from_walk: bool) -> Result<Vec<u8>, ReadFail> {
+    if path == b"-" && !from_walk {
+        let mut buf = Vec::new();
+        return match std::io::stdin().lock().read_to_end(&mut buf) {
+            Ok(_) => Ok(buf),
+            Err(err) => Err(ReadFail { err, opened: true, partial: buf }),
+        };
+    }
+    let mut file = match std::fs::File::open(path_from_bytes(path)) {
+        Ok(f) => f,
+        Err(err) => return Err(ReadFail { err, opened: false, partial: Vec::new() }),
+    };
+    // Size the buffer from the metadata, as `fs::read` does -- but CLAMPED. That
+    // number comes from the filesystem and need not be a size anything can hold
+    // (a sparse file, `/proc/kcore`), and `with_capacity` ABORTS rather than
+    // failing, where the read below reports out of memory and grep carries on.
+    const HINT_CAP: usize = 8 << 20;
+    let size = file.metadata().map(|m| m.len() as usize).unwrap_or(0);
+    let mut buf = Vec::with_capacity(size.saturating_add(1).min(HINT_CAP));
+    match file.read_to_end(&mut buf) {
+        Ok(_) => Ok(buf),
+        Err(err) => Err(ReadFail { err, opened: true, partial: buf }),
+    }
+}
+
 /// Write one line to stdout, treating a CLOSED READER as "done" rather than as a
 /// panic — `println!` aborts the applet thread on EPIPE (`grep --help | head -1`),
 /// which every other write here already avoids by going through `Out`, so the
@@ -142,50 +184,134 @@ pub fn records(buf: &[u8], sep: u8) -> Vec<(&[u8], bool)> {
     out
 }
 
-/// Directory walk for `grep -r`, deepest-last, sorted for a deterministic
-/// listing. Symlinked directories are not descended (GNU's `-r` behavior);
-/// unreadable entries surface as errors to the caller.
-/// Every readable file under `root`, plus one error PER unreadable directory.
+/// Something the walk has to say about a path.
+pub enum Diag {
+    /// A directory that could not be read. An error: it sets the exit status.
+    Failed(std::io::Error),
+    /// A directory skipped for being its own ancestor. GNU WARNS and carries on,
+    /// so this one leaves the status to the search.
+    Loop,
+}
+
+/// What a walk produced.
+pub struct Walked {
+    /// Files to search, sorted.
+    pub files: Vec<PathBuf>,
+    /// In the order the walk MET them, both kinds in one list: GNU interleaves
+    /// its errors and its cycle warnings, and two lists could only be drained one
+    /// after the other.
+    pub diags: Vec<(PathBuf, Diag)>,
+    /// Whether the root was a directory; the caller names its output on it, and a
+    /// second copy of the test would drift the moment this one changes.
+    pub descended: bool,
+}
+
+/// Directory walk for `grep -r`/`-R`, deepest-last, sorted for a deterministic
+/// listing.
+///
+/// `logical` is `-R`. Without it the walk is PHYSICAL: the root is followed but
+/// nothing below it is, so a symlink named as an operand is descended and one
+/// found by the walk is skipped, and only REGULAR files are collected — a FIFO
+/// there would block the open forever, and GNU skips it. With it every symlink is
+/// followed and every non-directory is collected, devices included, which is GNU's
+/// `-R` and is why that flag CAN block where `-r` cannot. Following symlinks is the
+/// usual way a directory becomes reachable from inside itself, but not the only one
+/// -- a bind mount does it without any symlink -- so BOTH walks carry the ancestor
+/// chain and refuse to re-enter one, as GNU's does.
 ///
 /// Errors are collected rather than propagated: one 0700 subdirectory must not
 /// discard the whole walk, which is what `?` here used to do — `grep -r` then
 /// reported nothing at all and blamed the root. GNU searches what it can reach
 /// and reports each directory it cannot.
-pub fn walk(root: &Path, out: &mut Vec<PathBuf>, errs: &mut Vec<(PathBuf, std::io::Error)>) {
-    let meta = match std::fs::symlink_metadata(root) {
+pub fn walk(root: &Path, logical: bool) -> Walked {
+    let mut out = Walked { files: Vec::new(), diags: Vec::new(), descended: false };
+    out.descended = walk_from(root, true, logical, &mut Vec::new(), &mut out);
+    out
+}
+
+/// `follow` is true for the operand and false for what the walk finds, which is
+/// the asymmetry above; `logical` follows both. It is a parameter rather than a
+/// choice of stat per call site so that a directory entry swapped for a symlink
+/// between the two cannot be descended.
+fn walk_from(
+    root: &Path,
+    follow: bool,
+    logical: bool,
+    chain: &mut Vec<(u64, u64)>,
+    out: &mut Walked,
+) -> bool {
+    let meta = match stat(root, follow || logical) {
         Ok(m) => m,
         Err(e) => {
-            errs.push((root.to_path_buf(), e));
-            return;
+            // A name that EXISTS without RESOLVING — a dangling symlink, a loop —
+            // is passed on rather than reported here, because a search that never
+            // opens it must stay silent: `grep -rm0 a dangling` is GNU's exit 1
+            // with nothing said. The open reports it in every other case.
+            match std::fs::symlink_metadata(root).is_ok() {
+                true => out.files.push(root.to_path_buf()),
+                false => out.diags.push((root.to_path_buf(), Diag::Failed(e))),
+            }
+            return false;
         }
     };
     if !meta.is_dir() {
-        out.push(root.to_path_buf());
-        return;
+        out.files.push(root.to_path_buf());
+        return false;
     }
+    chain.push(ident(&meta));
     let reader = match std::fs::read_dir(root) {
         Ok(r) => r,
         Err(e) => {
-            errs.push((root.to_path_buf(), e));
-            return;
+            out.diags.push((root.to_path_buf(), Diag::Failed(e)));
+            chain.pop();
+            return true;
         }
     };
     let mut entries: Vec<PathBuf> = Vec::new();
     for entry in reader {
         match entry {
             Ok(e) => entries.push(e.path()),
-            Err(e) => errs.push((root.to_path_buf(), e)),
+            Err(e) => out.diags.push((root.to_path_buf(), Diag::Failed(e))),
         }
     }
     entries.sort();
     for path in entries {
-        match std::fs::symlink_metadata(&path) {
-            Ok(meta) if meta.is_dir() => walk(&path, out, errs),
-            Ok(meta) if !meta.file_type().is_symlink() => out.push(path),
+        match stat(&path, logical) {
+            Ok(meta) if meta.is_dir() => match chain.contains(&ident(&meta)) {
+                true => out.diags.push((path, Diag::Loop)),
+                false => {
+                    walk_from(&path, false, logical, chain, out);
+                }
+            },
+            // A symlink, FIFO, socket or device found by a PHYSICAL walk: GNU
+            // skips it. A logical walk reads them, having followed the link.
+            Ok(meta) if logical || meta.is_file() => out.files.push(path),
             Ok(_) => {}
-            Err(e) => errs.push((path, e)),
+            // Only a logical walk gets here, on a link that does not resolve. Passed
+            // on for the same reason the root is: the OPEN reports it, so a search
+            // that never opens stays silent as GNU's does.
+            Err(e) => match std::fs::symlink_metadata(&path).is_ok() {
+                true => out.files.push(path),
+                false => out.diags.push((path, Diag::Failed(e))),
+            },
         }
     }
+    chain.pop();
+    true
+}
+
+fn stat(path: &Path, follow: bool) -> std::io::Result<std::fs::Metadata> {
+    match follow {
+        true => std::fs::metadata(path),
+        false => std::fs::symlink_metadata(path),
+    }
+}
+
+/// The pair that says "the same directory": a logical walk re-entering one is a
+/// cycle, and no path comparison can tell, two names resolving to one inode.
+fn ident(meta: &std::fs::Metadata) -> (u64, u64) {
+    use std::os::unix::fs::MetadataExt;
+    (meta.dev(), meta.ino())
 }
 
 /// Bytes of a path, for output that must round-trip a non-UTF-8 name.
