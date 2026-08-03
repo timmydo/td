@@ -452,6 +452,11 @@ pub fn fork_shell(sh: &Shell) -> Shell {
         arg0: sh.arg0.clone(),
         status: sh.status,
         last_bg: sh.last_bg,
+        // CLEARED, not carried: ash does this in `forkchild` with the comment
+        // "or else $RANDOM repeats in child" (ash.c:5344), so a subshell reseeds
+        // from its own pid rather than replaying the parent's sequence. The
+        // DYNAMIC flag rides along in `vars`, which is cloned above.
+        random: None,
         opts: sh.opts,
         cwd: sh.cwd.clone(),
         logical_cwd: sh.logical_cwd.clone(),

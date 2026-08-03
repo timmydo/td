@@ -28,6 +28,7 @@ mod lexer;
 mod parser;
 mod pattern;
 mod process;
+mod random;
 
 use std::io::{IsTerminal, Read, Write};
 use std::process::ExitCode;

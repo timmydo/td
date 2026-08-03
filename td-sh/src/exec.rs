@@ -52,6 +52,12 @@ pub struct Var {
     /// (ash.c:10020), so an inner function's `unset` sees an outer function's
     /// declaration. The frame's own restore puts the flag back with the binding.
     pub localised: bool,
+    /// ash's `VDYNAMIC`, which only `$RANDOM` carries: a read runs a generator
+    /// instead of returning the stored text. It lives on the VARIABLE and not on
+    /// the shell because `unsetvar` clears it while a frame's restore puts it
+    /// back (ash.c's `mklocal`/`poplocalvars`), so `local RANDOM` suspends the
+    /// generator for the call and returns it afterwards.
+    pub dynamic: bool,
 }
 
 /// A binding displaced by `local`, kept so the function's return can put it back.
@@ -115,6 +121,9 @@ pub struct Shell {
     pub params: Vec<String>, // positional parameters $1..
     pub arg0: String,        // $0
     pub status: i32,         // $?
+    /// ash's `random_gen`, lazily seeded: `None` is "never seeded", which takes
+    /// the pid and the clock on first read as ash's `UNINITED_RANDOM_T` does.
+    pub random: Option<crate::random::Rand>,
     /// `$!`, which is UNSET until a background job runs -- ash errors on it
     /// under `set -u` and expands it to nothing otherwise, where a `0` default
     /// would silently name process zero.
@@ -296,6 +305,7 @@ impl Shell {
                     exported: true,
                     readonly: false,
                     localised: false,
+                    dynamic: false,
                 },
             );
         }
@@ -306,6 +316,7 @@ impl Shell {
             arg0: "td-sh".to_string(),
             status: 0,
             last_bg: None,
+            random: None,
             opts: Opts::default(),
             logical_cwd: cwd.clone(),
             cwd,
@@ -352,6 +363,29 @@ impl Shell {
         sh.export_var("PWD");
         // POSIX: OPTIND is 1 at shell start, overriding any imported value.
         let _ = sh.set_var("OPTIND", "1");
+        // ash's varinit carries RANDOM as a VDYNAMIC name that is UNSET until
+        // first read (ash.c:2169). The environment import runs through
+        // `setvareq`, which fires that func -- so an INHERITED RANDOM SEEDS the
+        // generator instead of sitting in the map as an ordinary string.
+        let inherited_random = sh.get_var("RANDOM");
+        match sh.vars.get_mut("RANDOM") {
+            Some(v) => v.dynamic = true,
+            None => {
+                sh.vars.insert(
+                    "RANDOM".to_string(),
+                    Var {
+                        value: None,
+                        exported: false,
+                        readonly: false,
+                        localised: false,
+                        dynamic: true,
+                    },
+                );
+            }
+        }
+        if let Some(text) = inherited_random {
+            sh.random = Some(crate::random::Rand::seeded(crate::random::seed_of(&text)));
+        }
         // The names ash seeds itself when the environment carries none. Each is
         // an ORDINARY variable a script may reassign -- only PWD and SHLVL are
         // exported -- but a shell that leaves them unset makes `set -u` fatal on
@@ -392,6 +426,9 @@ impl Shell {
             vars: HashMap::new(),
             funcs: HashMap::new(),
             params: Vec::new(),
+            // Seeded rather than left lazy, so a unit test that reads `$RANDOM`
+            // is deterministic instead of taking the pid and the clock.
+            random: Some(crate::random::Rand::seeded(1)),
             arg0: "td-sh".to_string(),
             status: 0,
             last_bg: None,
@@ -418,6 +455,16 @@ impl Shell {
             traps: BTreeMap::new(),
             trap_status: None,
         };
+        sh.vars.insert(
+            "RANDOM".to_string(),
+            Var {
+                value: None,
+                exported: false,
+                readonly: false,
+                localised: false,
+                dynamic: true,
+            },
+        );
         let _ = sh.set_var("IFS", " \t\n");
         let _ = sh.set_var("OPTIND", "1");
         let _ = sh.set_var("PS4", "+ ");
@@ -436,6 +483,10 @@ impl Shell {
     /// only (so " 2", "+1" and "-1" are all rejected) and coerces 0 up to 1; a
     /// rejected value parks -1, which `getopts` reports when it next runs.
     fn var_hook(&mut self, name: &str, value: &str) {
+        if self.vars.get(name).is_some_and(|v| v.dynamic) {
+            self.random = Some(crate::random::Rand::seeded(crate::random::seed_of(value)));
+            return;
+        }
         if name != "OPTIND" {
             return;
         }
@@ -451,6 +502,12 @@ impl Shell {
     /// parking the error an assignment parks. dash rejects `unset OPTIND`
     /// outright, so ash decides this one.
     fn unset_hook(&mut self, name: &str) {
+        // ash: "as soon as they're unset, they're no longer dynamic" (the
+        // comment on `lookupvar`). `local VAR` reaches this through the same
+        // `unsetvar`, which is why only the frame's RESTORE brings it back.
+        if let Some(v) = self.vars.get_mut(name) {
+            v.dynamic = false;
+        }
         if name == "OPTIND" {
             self.getopts_optind = 1;
             self.getopts_off = -1;
@@ -461,11 +518,16 @@ impl Shell {
         // Assigning OPTIND at all -- even the value it already holds -- restarts
         // `getopts` at a word boundary. `getopts` itself re-establishes the
         // offset after publishing OPTIND.
+        // A DYNAMIC variable is exempt from the readonly refusal: ash tests
+        // `(flags & (VREADONLY|VDYNAMIC)) == VREADONLY`, so `readonly RANDOM`
+        // still lists the name readonly while an assignment to it reseeds
+        // rather than failing.
+        let dynamic = !self.readonly_refuses(name);
         self.var_hook(name, value);
         match self.vars.get_mut(name) {
             // dash reports this through sh_error, which ends a non-interactive
             // shell with status 2 -- not a status a script can test.
-            Some(v) if v.readonly => {
+            Some(v) if v.readonly && !dynamic => {
                 return Err(self.fatal(&format!("{name}: is read only"), 2));
             }
             Some(v) => {
@@ -482,6 +544,7 @@ impl Shell {
                         exported: self.opts.allexport,
                         readonly: false,
                         localised: false,
+                        dynamic: false,
                     },
                 );
             }
@@ -500,6 +563,7 @@ impl Shell {
                     exported: true,
                     readonly: false,
                     localised: false,
+                    dynamic: false,
                 },
             );
         }
@@ -516,6 +580,7 @@ impl Shell {
                     exported: false,
                     readonly: true,
                     localised: false,
+                    dynamic: false,
                 },
             );
         }
@@ -530,17 +595,31 @@ impl Shell {
         }
     }
 
+    /// ash's one readonly test, `(flags & (VREADONLY|VDYNAMIC)) == VREADONLY`
+    /// (ash.c:2421): a DYNAMIC name is exempt, and `setvareq` is reached by
+    /// assignment AND by unset, so all three callers owe the same predicate.
+    fn readonly_refuses(&self, name: &str) -> bool {
+        self.vars.get(name).is_some_and(|v| v.readonly && !v.dynamic)
+    }
+
     pub fn unset_var(&mut self, name: &str) -> bool {
-        if self.vars.get(name).is_some_and(|v| v.readonly) {
+        if self.readonly_refuses(name) {
             return false;
+        }
+        // A readonly DYNAMIC name is the only one that gets past that gate with
+        // an attribute worth keeping: ash unsets through `setvareq`, so the
+        // struct survives and VREADONLY with it -- the NEXT assignment is still
+        // refused, which dropping the entry would lose.
+        if self.vars.get(name).is_some_and(|v| v.readonly) {
+            return self.unset_value(name);
         }
         // Under `set -a`, `setvareq` ORs `VEXPORT` into the flags an unset writes
         // (ash.c:2417), so the free test below it can never hold: the entry
         // survives -- created, if the name was new -- and only the value goes.
+        self.unset_hook(name);
         if self.opts.allexport {
             return self.unset_value(name);
         }
-        self.unset_hook(name);
         self.vars.remove(name);
         true
     }
@@ -567,6 +646,7 @@ impl Shell {
                         exported: false,
                         readonly: false,
                         localised: true,
+                        dynamic: false,
                     },
                 );
             }
@@ -578,7 +658,7 @@ impl Shell {
     /// still reaches a child. The `unset` builtin drops the attributes with the
     /// name; ash's `mklocal` keeps them, and this is that difference.
     pub fn unset_value(&mut self, name: &str) -> bool {
-        if self.vars.get(name).is_some_and(|v| v.readonly) {
+        if self.readonly_refuses(name) {
             return false;
         }
         // The `VEXPORT` that `set -a` ORs in is written to the entry too, so an
@@ -595,6 +675,7 @@ impl Shell {
                     exported: true,
                     readonly: false,
                     localised: false,
+                    dynamic: false,
                 },
             );
         }
@@ -1314,13 +1395,19 @@ fn undo_binding(sh: &mut Shell, entry: Local) {
             // Bypassing `set_var` still owes the hook, which dash runs on the
             // RESTORE too (`poplocalvars` calls the var's `func`): a frame that
             // displaced OPTIND has to put the hidden cursor back with it, or
-            // `getopts` resumes at the word the frame's value pointed at. An
-            // attributes-only entry restores as the unset it is.
-            match var.value.as_deref() {
+            // `getopts` resumes at the word the frame's value pointed at.
+            // The entry goes back BEFORE the hook runs, since the hook reads the
+            // restored flags. A DYNAMIC name is re-run with the saved TEXT rather
+            // than treated as an unset -- for a valueless entry that text is
+            // empty, which reseeds with `strtoul("")`, not the generator's death.
+            let restored = var.value.clone();
+            let dynamic = var.dynamic;
+            sh.vars.insert(name.clone(), var);
+            match restored.as_deref() {
                 Some(v) => sh.var_hook(&name, v),
+                None if dynamic => sh.var_hook(&name, ""),
                 None => sh.unset_hook(&name),
             }
-            sh.vars.insert(name, var);
         }
         Local::Var(name, None) => {
             sh.unset_hook(&name);

@@ -521,6 +521,155 @@ fn the_export_listing_is_eval_safe() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// `$RANDOM` is ash's one DYNAMIC variable. Every expected value here was
+/// measured on busybox 1.37.0 ash: a script that seeds asks for one SPECIFIC
+/// sequence, so "produces numbers in range" is not the same answer.
+#[test]
+fn random_is_ashs_seeded_generator() -> Result<(), Box<dyn std::error::Error>> {
+    let shell = PathBuf::from(env!("CARGO_BIN_EXE_td-sh"));
+    let run = |src: &str| -> Result<String, Box<dyn std::error::Error>> {
+        let out = std::process::Command::new(&shell)
+            .arg("-c")
+            .arg(src)
+            .env_clear()
+            .output()?;
+        assert_eq!(String::from_utf8_lossy(&out.stderr), "", "{src}");
+        assert!(out.status.success(), "{src} exited {:?}", out.status.code());
+        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    };
+    let six = "echo $RANDOM $RANDOM $RANDOM $RANDOM $RANDOM $RANDOM";
+    for (seed, want) in [
+        ("0", "3240 22231 2355 11491 7008 14858"),
+        ("1", "9882 31274 32415 17757 4881 16130"),
+        ("42", "20351 9206 20506 13396 18747 8898"),
+        ("4294967295", "29350 13153 5018 5161 8973 25390"),
+        // `strtoul`, so a numeric prefix counts and a non-number is 0...
+        ("5x", "3710 1948 21657 10135 29411 21828"),
+        ("5", "3710 1948 21657 10135 29411 21828"),
+        ("abc", "3240 22231 2355 11491 7008 14858"),
+        ("0x10", "3240 22231 2355 11491 7008 14858"),
+        // ...a negative seed is negated as UNSIGNED, so -1 is 4294967295...
+        ("-1", "29350 13153 5018 5161 8973 25390"),
+        // ...and an absurd one saturates at ULONG_MAX, whose low 32 bits are the
+        // same all-ones, which is why it matches -1 rather than 0.
+        ("18446744073709551616", "29350 13153 5018 5161 8973 25390"),
+    ] {
+        assert_eq!(run(&format!("RANDOM={seed}; {six}"))?, format!("{want}\n"), "seed {seed}");
+    }
+    // Re-seeding restarts the sequence rather than continuing it.
+    assert_eq!(run("RANDOM=1; echo $RANDOM; RANDOM=1; echo $RANDOM")?, "9882\n9882\n");
+    // ARITHMETIC draws too, and draws once per mention: reading the stored text
+    // instead would add the seed to itself.
+    assert_eq!(run("RANDOM=1; echo $((RANDOM+RANDOM))")?, "41156\n");
+    // A read REWRITES the stored text (ash's `VNOFUNC` write-back), so the value
+    // last drawn is what an exported RANDOM carries. Asserted through `export -p`
+    // because `echo $RANDOM` twice would pass with NO write-back at all -- the
+    // second read simply draws again.
+    let listing = run("RANDOM=1; export RANDOM; echo $RANDOM >/dev/null; export -p")?;
+    assert!(listing.contains("export RANDOM='9882'"), "{listing}");
+    // `set -a` reaches that write-back too: ash's `setvareq` ORs VEXPORT in, so a
+    // read under `-a` exports a name that was assigned before the option was set.
+    let listing = run("RANDOM=1; set -a; echo $RANDOM >/dev/null; export -p")?;
+    assert!(listing.contains("export RANDOM='9882'"), "{listing}");
+    // `unset` switches the generator off for good; the name is then ORDINARY,
+    // so an assignment reads back literally instead of seeding.
+    assert_eq!(run("unset RANDOM; echo \"[$RANDOM]\"")?, "[]\n");
+    assert_eq!(run("unset RANDOM; RANDOM=1; echo \"[$RANDOM]\"")?, "[1]\n");
+    // A DYNAMIC variable is exempt from the readonly refusal, which ash spells
+    // `(flags & (VREADONLY|VDYNAMIC)) == VREADONLY`.
+    assert_eq!(run("readonly RANDOM; RANDOM=1; echo $RANDOM")?, "9882\n");
+    // A subshell must NOT replay the parent's sequence -- ash clears the
+    // generator in the child on purpose -- and must not disturb it either.
+    let out = run("RANDOM=1; (echo $RANDOM >/dev/null); echo $RANDOM")?;
+    assert_eq!(out, "9882\n", "the subshell must not consume the parent's draw");
+    // ...and must not INHERIT it either: an inheriting child would draw the
+    // parent's un-consumed 9882, and five of them would draw it five times.
+    let kids = run("RANDOM=1; for i in 1 2 3 4 5; do (echo $RANDOM); done")?;
+    let kids: Vec<&str> = kids.split_whitespace().collect();
+    assert_eq!(kids.len(), 5, "{kids:?}");
+    assert!(kids.iter().any(|v| *v != "9882"), "children inherited the parent generator: {kids:?}");
+    for v in &kids {
+        assert!(v.parse::<u32>().is_ok_and(|n| n <= 32767), "out of range: {v}");
+    }
+
+    // An INHERITED `RANDOM` seeds too: ash imports the environment through
+    // `setvareq`, which fires the name's func. A shell that merely stored the
+    // string would draw an unrelated sequence here.
+    for (seed, want) in [("1", "9882 31274"), ("42", "20351 9206"), ("5x", "3710 1948")] {
+        let out = std::process::Command::new(&shell)
+            .arg("-c")
+            .arg("echo $RANDOM $RANDOM")
+            .env_clear()
+            .env("RANDOM", seed)
+            .output()?;
+        assert_eq!(String::from_utf8_lossy(&out.stdout), format!("{want}\n"), "env RANDOM={seed}");
+    }
+
+    // A PREFIX assignment is undone by restoring the saved text, not by unsetting
+    // the name: ash puts the valueless varinit text back, which reseeds with
+    // `strtoul("")` = 0. Treating the restore as an unset would retire the
+    // generator instead, and every later `$RANDOM` would be empty.
+    assert_eq!(run("RANDOM=1 true; echo $RANDOM $RANDOM")?, "3240 22231\n");
+    assert_eq!(run("RANDOM=5; RANDOM=1 true; echo $RANDOM")?, "3710\n");
+
+    // `local RANDOM` unsets the name for the call -- ash's `mklocal` reaches
+    // `unsetvar` -- so it reads empty and the generator is suspended, NOT
+    // retired: the frame's restore puts the flag back with the binding, and the
+    // sequence resumes where the seed left it.
+    assert_eq!(
+        run("f(){ local RANDOM; echo \"[$RANDOM]\"; }; RANDOM=1; f; echo $RANDOM $RANDOM")?,
+        "[]\n9882 31274\n"
+    );
+    // With a VALUE the local assignment seeds like any other, and the outer
+    // binding comes back on return.
+    assert_eq!(run("f(){ local RANDOM=7; echo $RANDOM; }; RANDOM=1; f; echo $RANDOM")?, "17008\n9882\n");
+
+    // `set -u` must not COST a draw. The nounset check and the expansion are two
+    // lookups of the same name, and a dynamic lookup has a side effect -- so a
+    // shell that checks by looking up skips every other number under `-u` alone.
+    assert_eq!(run("set -u; RANDOM=1; echo $RANDOM $RANDOM")?, "9882 31274\n");
+    assert_eq!(run("set -u; RANDOM=1; echo ${#RANDOM}; echo $RANDOM")?, "4\n31274\n");
+    assert_eq!(run("set -u; RANDOM=1; echo ${RANDOM#x}; echo $RANDOM")?, "9882\n31274\n");
+
+    // `strtoul`'s range error is ULONG_MAX and is NOT negated afterwards, so an
+    // absurd NEGATIVE seed is all-ones like an absurd positive one -- while a
+    // magnitude that still fits is negated as usual.
+    assert_eq!(run("RANDOM=-18446744073709551616; echo $RANDOM")?, "29350\n");
+    assert_eq!(run("RANDOM=-18446744073709551615; echo $RANDOM")?, "9882\n");
+
+    // `readonly` does not block the UNSET, because ash applies the same
+    // `(VREADONLY|VDYNAMIC)` exemption there -- but the attribute SURVIVES it, so
+    // the next assignment is refused even though the name is no longer dynamic.
+    assert_eq!(run("readonly RANDOM; unset RANDOM; echo \"[$RANDOM]\"")?, "[]\n");
+    let out = std::process::Command::new(&shell)
+        .arg("-c")
+        .arg("readonly RANDOM; unset RANDOM; RANDOM=1; echo reached")
+        .env_clear()
+        .output()?;
+    assert!(String::from_utf8_lossy(&out.stderr).contains("RANDOM: is read only"));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "");
+
+    // The untaken side of a `?:` is not evaluated AT ALL, so it must not draw --
+    // while the dead side of `&&`/`||` IS evaluated by ash and must still draw.
+    // One `live` flag cannot say both.
+    assert_eq!(run("RANDOM=1; echo $((1?0:RANDOM)); echo $RANDOM")?, "0\n9882\n");
+    assert_eq!(run("RANDOM=1; echo $((0?RANDOM:0)); echo $RANDOM")?, "0\n9882\n");
+    assert_eq!(run("RANDOM=1; echo $((0?RANDOM:RANDOM)); echo $RANDOM")?, "9882\n31274\n");
+    assert_eq!(run("RANDOM=1; echo $((0&&RANDOM)); echo $RANDOM")?, "0\n31274\n");
+    assert_eq!(run("RANDOM=1; echo $((1||RANDOM)); echo $RANDOM")?, "1\n31274\n");
+
+    // `unset` is the one thing that DOES retire it: the name is then genuinely
+    // unset, so `set -u` fires on it.
+    let out = std::process::Command::new(&shell)
+        .arg("-c")
+        .arg("unset RANDOM; set -u; echo $RANDOM; echo reached")
+        .env_clear()
+        .output()?;
+    assert!(String::from_utf8_lossy(&out.stderr).contains("RANDOM: parameter not set"));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "");
+    Ok(())
+}
+
 /// The names ash seeds when the environment carries none. They are ordinary
 /// variables a script can reassign; their ABSENCE is what made `set -u` fatal on
 /// idioms like `${HOSTNAME%%.*}` that work in every other shell. Spawned rather

@@ -466,8 +466,13 @@ fn push_chars(out: &mut Vec<QChar>, chars: &[QChar], quoted: bool) {
 /// name, which is how a script asks about one without tripping the option; `?`
 /// raises its own error for unset and so needs no help from here. All four
 /// therefore skip this check rather than suppressing a failure.
-fn nounset_check(sh: &Shell, name: &str) -> R<()> {
-    if sh.opts.nounset && !is_always_set(name) && lookup(sh, name).is_none() {
+fn nounset_check(sh: &mut Shell, name: &str) -> R<()> {
+    // A DYNAMIC name is never unset -- ash's `lookupvar` runs the func BEFORE the
+    // VUNSET test, so the value exists by the time anything asks. Reaching for
+    // `lookup` here would draw, and the expansion's own read would then be the
+    // SECOND draw: `set -u` alone would skip a number.
+    let dynamic = sh.vars.get(name).is_some_and(|v| v.dynamic);
+    if sh.opts.nounset && !is_always_set(name) && !dynamic && lookup(sh, name).is_none() {
         return Err(sh.fatal(&format!("{name}: parameter not set"), 2));
     }
     Ok(())
@@ -479,8 +484,49 @@ fn is_always_set(name: &str) -> bool {
     matches!(name, "?" | "#" | "$" | "-" | "0" | "@" | "*")
 }
 
+/// One draw from ash's `$RANDOM`, which also REWRITES the stored text (ash's
+/// `VNOFUNC` write-back) -- so the value last handed out is what an exported
+/// RANDOM carries into a child. That write is why the lookup path takes `&mut`.
+fn random_value(sh: &mut Shell) -> String {
+    let mut gen = sh.random.unwrap_or_else(|| {
+        // ash's uninitialised state is `INIT_RANDOM_T(rnd, getpid(),
+        // monotonic_us())` -- two DISTINCT inputs landing in different state
+        // words, not one value used twice. The clock stands in for the monotonic
+        // source; an unseeded sequence only has to differ per shell.
+        let clock = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.subsec_nanos());
+        crate::random::Rand::init(std::process::id().max(1), clock)
+    });
+    let value = gen.next().to_string();
+    sh.random = Some(gen);
+    // Written straight into the map: `set_var` would fire the seeding hook and
+    // reseed the generator from the value it just produced, which is what ash's
+    // `VNOFUNC` avoids. The entry is always there -- only a DYNAMIC one reaches
+    // here, and the flag lives on the entry.
+    let allexport = sh.opts.allexport;
+    if let Some(v) = sh.vars.get_mut("RANDOM") {
+        v.value = Some(value.clone());
+        // The write-back is a `setvareq`, which ORs in VEXPORT under `set -a`
+        // like any other assignment -- so a first read under `-a` exports.
+        v.exported |= allexport;
+    }
+    value
+}
+
+/// A plain variable's value, honouring the DYNAMIC names. Only `$RANDOM` is one,
+/// and both the expansion path and the arithmetic evaluator go through here
+/// because `$((RANDOM+RANDOM))` must draw TWICE -- reading the stored text
+/// instead gives the seed added to itself.
+pub fn var_value(sh: &mut Shell, name: &str) -> Option<String> {
+    if sh.vars.get(name).is_some_and(|v| v.dynamic) {
+        return Some(random_value(sh));
+    }
+    sh.get_var(name)
+}
+
 /// The value of a parameter, or `None` when it is unset.
-pub fn lookup(sh: &Shell, name: &str) -> Option<String> {
+pub fn lookup(sh: &mut Shell, name: &str) -> Option<String> {
     match name {
         "?" => Some(sh.status.to_string()),
         "#" => Some(sh.params.len().to_string()),
@@ -506,7 +552,7 @@ pub fn lookup(sh: &Shell, name: &str) -> Option<String> {
                 }
                 return sh.params.get(n - 1).cloned();
             }
-            sh.get_var(name)
+            var_value(sh, name)
         }
     }
 }
@@ -901,7 +947,7 @@ mod tests {
         // background job runs, so it errors like any other unset name -- and
         // expands to nothing without `-u`, where a `0` would name process zero.
         let mut sh = Shell::new_for_test();
-        assert_eq!(lookup(&sh, "!"), None);
+        assert_eq!(lookup(&mut sh, "!"), None);
         sh.opts.nounset = true;
         for src in ["${!}", "${#!}", "${!#x}", "${!/x/y}"] {
             assert!(try_expand(&mut sh, src).is_err(), "{src} should trip nounset");
@@ -914,14 +960,14 @@ mod tests {
         let mut sh = sh_with(&[]);
         sh.opts.nounset = true;
         assert!(try_expand(&mut sh, "${v/${w:=D}/z}").is_err());
-        assert_eq!(lookup(&sh, "w"), None, "the replacement must not have run");
+        assert_eq!(lookup(&mut sh, "w"), None, "the replacement must not have run");
         assert!(try_expand(&mut sh, "${v#${w:=D}}").is_err());
-        assert_eq!(lookup(&sh, "w"), None, "the pattern must not have run");
+        assert_eq!(lookup(&mut sh, "w"), None, "the pattern must not have run");
         // With the subject SET both run, which is what makes the above a
         // statement about ordering rather than about patsub being lazy.
         let _ = sh.set_var("v", "A");
         assert!(try_expand(&mut sh, "${v/${w:=D}/z}").is_ok());
-        assert_eq!(lookup(&sh, "w").as_deref(), Some("D"));
+        assert_eq!(lookup(&mut sh, "w").as_deref(), Some("D"));
         sh.last_bg = Some(4321);
         for src in ["${!}", "${#!}"] {
             assert!(try_expand(&mut sh, src).is_ok(), "{src} after a background job");

@@ -16,6 +16,7 @@ pub fn eval(sh: &mut Shell, text: &str) -> R<i64> {
         pos: 0,
         pdepth: 0,
         live: true,
+        ternary_dead: false,
     };
     let value = match p.expr_comma(sh) {
         Ok(v) => v,
@@ -148,6 +149,11 @@ struct Arith {
     /// tokens still have to be consumed, so the walk continues — it just must
     /// not assign, divide by zero or overflow on the way through.
     live: bool,
+    /// The untaken side of a `?:` specifically. ash does not evaluate that one
+    /// AT ALL, where it DOES evaluate the dead side of `&&`/`||` for effect --
+    /// so this is the only place a DYNAMIC read must be skipped, drawing being
+    /// the side effect in question.
+    ternary_dead: bool,
 }
 
 /// Bound on operator/parenthesis nesting inside `$(( … ))`. Enforced via enter()/
@@ -259,18 +265,23 @@ impl Arith {
             return Ok(cond);
         }
         let outer = self.live;
+        let outer_dead = self.ternary_dead;
         self.live = outer && cond != 0;
+        self.ternary_dead = outer_dead || cond == 0;
         let then = self.expr_assign(sh)?;
         self.live = outer;
+        self.ternary_dead = outer_dead;
         if !self.eat_op(":") {
             return Err("expected `:` in `?:`".into());
         }
         self.live = outer && cond == 0;
+        self.ternary_dead = outer_dead || cond != 0;
         self.enter()?;
         let other = self.expr_ternary(sh);
         self.leave();
         let other = other?;
         self.live = outer;
+        self.ternary_dead = outer_dead;
         Ok(if cond != 0 { then } else { other })
     }
 
@@ -469,7 +480,12 @@ impl Arith {
     /// A variable's value as a number. An unset or empty variable is 0; anything
     /// else must BE a number, not an expression that evaluates to one.
     fn name_value(&mut self, sh: &mut Shell, name: &str) -> A<i64> {
-        let Some(text) = sh.get_var(name) else {
+        // The value is unused here and READING is a side effect for a dynamic
+        // name, so the untaken `?:` branch must not reach the lookup at all.
+        if self.ternary_dead {
+            return Ok(0);
+        }
+        let Some(text) = crate::expand::var_value(sh, name) else {
             return Ok(0);
         };
         if let Some(n) = strtoimax(&text) {

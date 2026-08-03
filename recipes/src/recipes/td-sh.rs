@@ -52,7 +52,41 @@ const MODULES: &[(&str, &str)] = &[
     ("parser", include_str!("../../../td-sh/src/parser.rs")),
     ("pattern", include_str!("../../../td-sh/src/pattern.rs")),
     ("process", include_str!("../../../td-sh/src/process.rs")),
+    ("random", include_str!("../../../td-sh/src/random.rs")),
 ];
+
+#[cfg(test)]
+mod tests {
+    use super::{MAIN_RS, MODULES};
+
+    /// A module `main.rs` declares but MODULES omits is never written into
+    /// {src}, so `rustc src/main.rs` fails with E0583 -- inside the sandbox,
+    /// twenty minutes into a recipe check. The two lists are one fact written
+    /// twice. td-init and td-util already assert this; td-sh did not.
+    #[test]
+    fn modules_match_the_mod_lines_in_main_rs() {
+        let mut declared: Vec<&str> = MAIN_RS
+            .lines()
+            .map(str::trim)
+            .filter_map(|l| l.strip_prefix("mod ").and_then(|r| r.strip_suffix(';')))
+            .collect();
+        declared.sort_unstable();
+        // An inline `mod tests { ... }` is a brace form, so the `;` suffix above
+        // already excludes it; assert that rather than trusting it.
+        assert!(
+            !declared.contains(&"tests"),
+            "`mod tests` is inline, not a file, and must not be embedded"
+        );
+        let mut embedded: Vec<&str> = MODULES.iter().map(|(n, _)| *n).collect();
+        embedded.sort_unstable();
+        assert_eq!(
+            declared, embedded,
+            "MODULES and main.rs's `mod` lines disagree -- a name in one and not \
+             the other is an E0583 only the recipe check would catch"
+        );
+        assert!(!declared.is_empty(), "no `mod` lines parsed out of main.rs");
+    }
+}
 
 pub fn recipe() -> Recipe {
     // The self-hosted toolchains install under a nested stage/td/store/<pkg>
