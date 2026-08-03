@@ -4298,6 +4298,9 @@ mod tests {
                 }],
             )
             .unwrap();
+        // Motion owes a paint rather than taking one; the reader batch flushes.
+        assert_eq!(fs::read(&framebuffer_path).unwrap(), before_input);
+        runtime.lock().unwrap().flush_paint().unwrap();
         let compositor_pointer_frame = fs::read(&framebuffer_path).unwrap();
         assert_ne!(compositor_pointer_frame, before_input);
         connected

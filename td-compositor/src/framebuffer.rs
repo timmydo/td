@@ -6,14 +6,27 @@ use std::path::{Path, PathBuf};
 
 const MAX_FRAMEBUFFER_BYTES: usize = 64 * 1024 * 1024;
 
+/// One paint in every this many is a full write, so pixels the compositor did
+/// not put there -- fbcon still owns the VT -- cannot outlive the interval.
+const RESEND_INTERVAL: usize = 240;
+
 pub struct Framebuffer {
     file: File,
     pub width: usize,
     pub height: usize,
     pub stride: usize,
     frame: Vec<u8>,
+    // What the device is believed to hold. `resend_all` says that belief is
+    // unfounded, so the next paint writes the whole image rather than a band.
+    written: Vec<u8>,
+    resend_all: bool,
+    since_resend: usize,
+    #[cfg(test)]
+    writes: Vec<(u64, usize)>,
     #[cfg(test)]
     fail_next_paint: bool,
+    #[cfg(test)]
+    fail_next_write: bool,
 }
 
 fn parse_number(path: &Path) -> Result<usize, String> {
@@ -78,6 +91,26 @@ fn validate_geometry(width: usize, height: usize, stride: usize) -> Result<usize
     Ok(size)
 }
 
+/// First and last rows whose bytes differ, or `None` when the image is
+/// unchanged. Rows, not rectangles: a band is one contiguous write, where
+/// per-row column spans would be one `seek`+`write` pair each and the syscalls
+/// would cost more than the bytes they saved.
+fn damaged_rows(written: &[u8], frame: &[u8], stride: usize) -> Option<(usize, usize)> {
+    if stride == 0 {
+        return None;
+    }
+    let rows = frame.len() / stride;
+    if written.len() != frame.len() {
+        return rows.checked_sub(1).map(|last| (0, last));
+    }
+    let pairs = || frame.chunks_exact(stride).zip(written.chunks_exact(stride));
+    let first = pairs().position(|(current, previous)| current != previous)?;
+    let last = pairs()
+        .rposition(|(current, previous)| current != previous)
+        .unwrap_or(first);
+    Some((first, last))
+}
+
 impl Framebuffer {
     pub fn open(path: &Path) -> Result<Framebuffer, String> {
         let name = path
@@ -105,8 +138,15 @@ impl Framebuffer {
             height,
             stride,
             frame: vec![0; size],
+            written: vec![0; size],
+            resend_all: true,
+            since_resend: 0,
+            #[cfg(test)]
+            writes: Vec::new(),
             #[cfg(test)]
             fail_next_paint: false,
+            #[cfg(test)]
+            fail_next_write: false,
         })
     }
 
@@ -133,7 +173,12 @@ impl Framebuffer {
             height,
             stride,
             frame: vec![0; size],
+            written: vec![0; size],
+            resend_all: true,
+            since_resend: 0,
+            writes: Vec::new(),
             fail_next_paint: false,
+            fail_next_write: false,
         })
     }
 
@@ -142,21 +187,81 @@ impl Framebuffer {
         self.fail_next_paint = true;
     }
 
+    /// Fail the next write after the shadow copy has been marked untrustworthy.
+    #[cfg(test)]
+    pub fn fail_next_write(&mut self) {
+        self.fail_next_write = true;
+    }
+
+    /// Offset and length of every write this framebuffer has issued.
+    #[cfg(test)]
+    pub fn take_writes(&mut self) -> Vec<(u64, usize)> {
+        std::mem::take(&mut self.writes)
+    }
+
+    /// Distrust the shadow copy, so the next paint rewrites the whole image.
+    pub fn resend(&mut self) {
+        self.resend_all = true;
+    }
+
     pub fn paint(&mut self, scene: &Scene) -> Result<(), String> {
         #[cfg(test)]
         if std::mem::take(&mut self.fail_next_paint) {
             return Err("injected framebuffer paint failure".to_string());
         }
         scene.render(&mut self.frame, self.width, self.height, self.stride);
+        let rows = self.frame.len().checked_div(self.stride).unwrap_or(0);
+        let full = self.resend_all || self.since_resend.saturating_add(1) >= RESEND_INTERVAL;
+        let band = if full {
+            rows.checked_sub(1).map(|last| (0, last))
+        } else {
+            damaged_rows(&self.written, &self.frame, self.stride)
+        };
+        let Some((first, last)) = band else {
+            return Ok(());
+        };
+        let start = first
+            .checked_mul(self.stride)
+            .ok_or_else(|| "framebuffer damage offset overflow".to_string())?;
+        let end = last
+            .checked_add(1)
+            .and_then(|rows| rows.checked_mul(self.stride))
+            .ok_or_else(|| "framebuffer damage extent overflow".to_string())?;
+        let band = self
+            .frame
+            .get(start..end)
+            .ok_or_else(|| format!("framebuffer damage {start}..{end} is outside the frame"))?;
+        let at =
+            u64::try_from(start).map_err(|_| "framebuffer damage offset overflow".to_string())?;
+        // Pessimistic across the write: a partial or failed one leaves the
+        // device holding something no shadow copy describes.
+        self.resend_all = true;
+        #[cfg(test)]
+        if std::mem::take(&mut self.fail_next_write) {
+            return Err("injected framebuffer write failure".to_string());
+        }
         self.file
-            .seek(SeekFrom::Start(0))
+            .seek(SeekFrom::Start(at))
             .map_err(|e| format!("seek framebuffer: {e}"))?;
         self.file
-            .write_all(&self.frame)
+            .write_all(band)
             .map_err(|e| format!("write framebuffer: {e}"))?;
         self.file
             .flush()
-            .map_err(|e| format!("flush framebuffer: {e}"))
+            .map_err(|e| format!("flush framebuffer: {e}"))?;
+        self.written
+            .get_mut(start..end)
+            .ok_or_else(|| format!("framebuffer shadow {start}..{end} is outside the image"))?
+            .copy_from_slice(band);
+        self.resend_all = false;
+        self.since_resend = if full {
+            0
+        } else {
+            self.since_resend.saturating_add(1)
+        };
+        #[cfg(test)]
+        self.writes.push((at, band.len()));
+        Ok(())
     }
 }
 
@@ -178,6 +283,161 @@ mod tests {
         framebuffer.paint(&Scene::new()).unwrap();
         assert_eq!(fs::metadata(&path).unwrap().len(), 160);
         fs::remove_file(path).unwrap();
+    }
+
+    fn scratch(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "td-framebuffer-{name}-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ))
+    }
+
+    struct Cleanup(PathBuf);
+
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let _ = fs::remove_file(&self.0);
+        }
+    }
+
+    #[test]
+    fn damaged_rows_reports_the_band_that_changed() {
+        let unchanged = vec![7u8; 24];
+        assert_eq!(damaged_rows(&unchanged, &unchanged, 4), None);
+        let mut moved = unchanged.clone();
+        moved[9] = 0;
+        assert_eq!(damaged_rows(&unchanged, &moved, 4), Some((2, 2)));
+        moved[17] = 0;
+        assert_eq!(damaged_rows(&unchanged, &moved, 4), Some((2, 4)));
+        moved[0] = 0;
+        assert_eq!(damaged_rows(&unchanged, &moved, 4), Some((0, 4)));
+        // A shadow of the wrong size describes nothing, so everything is owed.
+        assert_eq!(damaged_rows(&[], &unchanged, 4), Some((0, 5)));
+        assert_eq!(damaged_rows(&[], &[], 4), None);
+        assert_eq!(damaged_rows(&unchanged, &unchanged, 0), None);
+    }
+
+    #[test]
+    fn an_unchanged_scene_writes_nothing_and_a_moved_pointer_writes_its_band() {
+        let cleanup = Cleanup(scratch("damage"));
+        let mut framebuffer = Framebuffer::test_file(&cleanup.0, 120, 80, 480).unwrap();
+        let mut scene = Scene::new();
+        scene.move_pointer(40, 40, 120, 80);
+        framebuffer.paint(&scene).unwrap();
+        assert_eq!(framebuffer.take_writes(), vec![(0, 480 * 80)]);
+
+        framebuffer.paint(&scene).unwrap();
+        assert_eq!(framebuffer.take_writes(), vec![]);
+
+        // The cursor is a 13-row cross, so one pixel sideways is 13 rows.
+        scene.move_pointer(1, 0, 120, 80);
+        framebuffer.paint(&scene).unwrap();
+        assert_eq!(framebuffer.take_writes(), vec![(34 * 480, 13 * 480)]);
+
+        // One pixel down extends the band by the row it left and the row it
+        // reached, and still costs a fraction of the image.
+        scene.move_pointer(0, 1, 120, 80);
+        framebuffer.paint(&scene).unwrap();
+        assert_eq!(framebuffer.take_writes(), vec![(34 * 480, 14 * 480)]);
+    }
+
+    #[test]
+    fn the_damaged_band_leaves_the_device_holding_the_whole_image() {
+        let cleanup = Cleanup(scratch("band-equals-full"));
+        let mut banded = Framebuffer::test_file(&cleanup.0, 40, 24, 160).unwrap();
+        let whole = Cleanup(scratch("band-equals-full-reference"));
+        let mut reference = Framebuffer::test_file(&whole.0, 40, 24, 160).unwrap();
+        let mut scene = Scene::new();
+        scene.move_pointer(20, 12, 40, 24);
+        banded.paint(&scene).unwrap();
+        for step in 0..7 {
+            scene.move_pointer(1, i32::from(step % 2 == 0), 40, 24);
+            banded.paint(&scene).unwrap();
+        }
+        // The reference has only ever seen the final scene, as one full write.
+        reference.paint(&scene).unwrap();
+        assert_eq!(reference.take_writes(), vec![(0, 160 * 24)]);
+        assert!(banded.take_writes().len() > 1);
+        assert_eq!(fs::read(&cleanup.0).unwrap(), fs::read(&whole.0).unwrap());
+    }
+
+    /// fbcon can draw on the same device, and the shadow copy cannot see it.
+    /// Before damage tracking every paint healed that; this bounds it instead.
+    #[test]
+    fn a_full_image_is_resent_at_least_every_interval() {
+        let cleanup = Cleanup(scratch("interval"));
+        let full = 480 * 80;
+        let mut framebuffer = Framebuffer::test_file(&cleanup.0, 120, 80, 480).unwrap();
+        let mut scene = Scene::new();
+        scene.move_pointer(10, 40, 120, 80);
+        framebuffer.paint(&scene).unwrap();
+        assert_eq!(framebuffer.take_writes(), vec![(0, full)]);
+
+        let mut banded = 0;
+        let mut resends = 0;
+        for step in 0..RESEND_INTERVAL {
+            // Bounce, so every paint has something to write. A screen nothing
+            // changes never writes at all, and so never spends the interval.
+            scene.move_pointer(if step % 2 == 0 { 1 } else { -1 }, 0, 120, 80);
+            framebuffer.paint(&scene).unwrap();
+            for (at, length) in framebuffer.take_writes() {
+                if (at, length) == (0, full) {
+                    resends += 1;
+                } else {
+                    banded += 1;
+                }
+            }
+        }
+        assert_eq!(resends, 1);
+        assert_eq!(banded, RESEND_INTERVAL - 1);
+    }
+
+    /// The complaint this exists for: at the first supported output size, a
+    /// pointer that moved one pixel used to cost a whole 8 MiB image.
+    #[test]
+    fn a_pointer_step_costs_a_fraction_of_a_full_size_output() {
+        let cleanup = Cleanup(scratch("full-size"));
+        let stride = 1920 * 4;
+        let full = stride * 1080;
+        let mut framebuffer = Framebuffer::test_file(&cleanup.0, 1920, 1080, stride).unwrap();
+        let mut scene = Scene::new();
+        scene.move_pointer(960, 540, 1920, 1080);
+        framebuffer.paint(&scene).unwrap();
+        assert_eq!(framebuffer.take_writes(), vec![(0, full)]);
+
+        scene.move_pointer(1, 1, 1920, 1080);
+        framebuffer.paint(&scene).unwrap();
+        let written: usize = framebuffer
+            .take_writes()
+            .iter()
+            .map(|(_, length)| *length)
+            .sum();
+        assert_eq!(written, 14 * stride);
+        assert!(
+            written * 50 < full,
+            "{written} bytes is not under 2% of {full}"
+        );
+    }
+
+    #[test]
+    fn a_failed_write_resends_the_whole_image_even_though_the_scene_is_the_same() {
+        let cleanup = Cleanup(scratch("resend"));
+        let mut framebuffer = Framebuffer::test_file(&cleanup.0, 120, 80, 480).unwrap();
+        let mut scene = Scene::new();
+        scene.move_pointer(40, 40, 120, 80);
+        framebuffer.paint(&scene).unwrap();
+        framebuffer.take_writes();
+
+        scene.move_pointer(1, 0, 120, 80);
+        framebuffer.fail_next_write();
+        assert!(framebuffer.paint(&scene).is_err());
+        assert_eq!(framebuffer.take_writes(), vec![]);
+
+        // Same scene: a shadow trusted after a failed write would write nothing
+        // here and leave the stale image on the device forever.
+        framebuffer.paint(&scene).unwrap();
+        assert_eq!(framebuffer.take_writes(), vec![(0, 480 * 80)]);
     }
 
     #[test]

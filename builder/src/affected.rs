@@ -1436,6 +1436,15 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
     assert_target!("td-compositor/src/server.rs", "recipe-checks");
     assert_target!("td-compositor/src/sys.rs", "recipe-checks");
     assert_preflight!("td-compositor/src/sys.rs", "cargo-test");
+    // td-term's keyboard and PTY adapters ship in the same multicall, so they
+    // route like every other compositor module; pty.rs is the only permitted
+    // caller of the confined terminal ioctls.
+    assert_target!("td-compositor/src/keys.rs", "recipe-checks");
+    assert_preflight!("td-compositor/src/keys.rs", "cargo-test");
+    assert_target!("td-compositor/src/pty.rs", "recipe-checks");
+    assert_preflight!("td-compositor/src/pty.rs", "cargo-test");
+    assert_target!("td-compositor/spec/term/input.term", "check");
+    assert_preflight!("td-compositor/spec/term/input.term", "cargo-test");
     assert_target!("td-compositor/tools/import-libvterm.rs", "check");
     assert_preflight!("td-compositor/tools/import-libvterm.rs", "cargo-test");
     assert_target!("td-compositor/tools/libvterm-0.3.3.sources", "check");

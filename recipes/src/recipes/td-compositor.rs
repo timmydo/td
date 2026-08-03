@@ -16,6 +16,7 @@ const MODULES: &[(&str, &str)] = &[
         "keyboard",
         include_str!("../../../td-compositor/src/keyboard.rs"),
     ),
+    ("keys", include_str!("../../../td-compositor/src/keys.rs")),
     (
         "launcher",
         include_str!("../../../td-compositor/src/launcher.rs"),
@@ -25,6 +26,7 @@ const MODULES: &[(&str, &str)] = &[
         "pointer",
         include_str!("../../../td-compositor/src/pointer.rs"),
     ),
+    ("pty", include_str!("../../../td-compositor/src/pty.rs")),
     (
         "runtime",
         include_str!("../../../td-compositor/src/runtime.rs"),
@@ -177,5 +179,29 @@ mod tests {
         assert!(client.contains(&format!(
             "println!(\"{TD_UI_CLIENT_RUNTIME_MARKER} surface={{}}x{{}}\""
         )));
+    }
+
+    /// td-term's child command is an absolute path into a DIFFERENT staged
+    /// package plus a flag that package must parse. Neither crate compiles
+    /// against the other, so nothing but this would notice `--stdin` being
+    /// renamed on one side: the terminal would build, ship, and fail at the
+    /// first spawn. Both recipes' sources are embedded here, so pin them
+    /// against each other where both are already in hand.
+    #[test]
+    fn the_terminals_session_wrapper_matches_the_staged_td_init() {
+        const CTTYHACK: &str = include_str!("../../../td-init/src/cttyhack.rs");
+        let pty = MODULES
+            .iter()
+            .find_map(|(name, source)| (*name == "pty").then_some(*source))
+            .expect("pty source");
+        assert!(pty.contains(r#"pub const CTTYHACK: &str = "/bin/cttyhack";"#));
+        assert!(pty.contains(r#"pub const CTTYHACK_STDIN: &str = "--stdin";"#));
+        assert!(CTTYHACK.contains(r#"const STDIN_FLAG: &str = "--stdin";"#));
+        // And that the applet still advertises it, so `cttyhack` alone tells an
+        // operator the mode exists.
+        assert!(CTTYHACK.contains("usage: cttyhack [--stdin] PROG [ARG...]"));
+        // `/bin/cttyhack` is td-init's own symlink name in the image roster.
+        const INIT_MAIN: &str = include_str!("../../../td-init/src/main.rs");
+        assert!(INIT_MAIN.contains(r#"("cttyhack", cttyhack::run)"#));
     }
 }

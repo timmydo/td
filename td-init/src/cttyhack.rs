@@ -11,6 +11,13 @@
 //!
 //! If the console cannot be claimed the program is exec'd anyway, on inherited
 //! stdio. cttyhack must never be the reason a rescue shell fails to start.
+//!
+//! `--stdin` is the exception, and it is td-term's: the caller has already put a
+//! PTY slave on descriptor zero and needs the child to LEAD a session on it.
+//! That mode always makes a new session — even when an outer terminal was
+//! inherited — and fails rather than degrading, because a terminal emulator
+//! whose child has no controlling terminal has no job control and no ^C, and
+//! nothing downstream would report why.
 
 use crate::sys;
 use std::fs::{File, OpenOptions};
@@ -31,8 +38,29 @@ const O_NOCTTY: i32 = 0o400;
 const DEV_TTY: &str = "/dev/tty";
 const SYS_CONSOLE_ACTIVE: &str = "/sys/class/tty/console/active";
 
+const STDIN_FLAG: &str = "--stdin";
+
 fn usage() -> String {
-    "usage: cttyhack PROG [ARG...]".to_string()
+    "usage: cttyhack [--stdin] PROG [ARG...]".to_string()
+}
+
+/// Split the leading `--stdin` off the argument list. It is a leading flag
+/// only: everything after the program name belongs to the program.
+fn split_mode(args: &[String]) -> (bool, &[String]) {
+    match args.first() {
+        Some(flag) if flag == STDIN_FLAG => (true, args.get(1..).unwrap_or(&[])),
+        _ => (false, args),
+    }
+}
+
+/// What `--stdin` requires before it touches the session. Kept separate from
+/// the syscalls so it is testable without detaching the test process.
+fn stdin_precondition(is_terminal: bool) -> Result<(), String> {
+    if is_terminal {
+        Ok(())
+    } else {
+        Err(format!("{STDIN_FLAG}: descriptor zero is not a terminal"))
+    }
 }
 
 /// `/dev/tty` opens only for a process that HAS a controlling terminal, so this
@@ -149,12 +177,26 @@ fn claim_console() -> Result<File, String> {
     Ok(console)
 }
 
+/// `--stdin`'s claim. `setsid(2)` unconditionally, so an inherited controlling
+/// terminal is dropped rather than kept alongside the new one, then the same
+/// non-stealing `TIOCSCTTY(0)` the rescue path uses. Every failure is fatal:
+/// the caller asked for a session on this terminal, and half of one is not it.
+fn claim_stdin_session() -> Result<(), String> {
+    stdin_precondition(std::io::stdin().is_terminal())?;
+    sys::setsid().map_err(|e| format!("{STDIN_FLAG}: setsid: {e}"))?;
+    sys::set_controlling_tty(std::io::stdin().as_raw_fd())
+        .map_err(|e| format!("{STDIN_FLAG}: TIOCSCTTY: {e}"))
+}
+
 pub fn run(args: &[String]) -> Result<u8, String> {
+    let (own_stdin, args) = split_mode(args);
     let prog = args.first().ok_or_else(usage)?;
     let mut cmd = Command::new(prog);
     cmd.args(args.get(1..).unwrap_or(&[]));
 
-    if !has_controlling_tty() {
+    if own_stdin {
+        claim_stdin_session()?;
+    } else if !has_controlling_tty() {
         // If stdin is ALREADY a terminal, that is the one to claim: init opened
         // the tty its inittab entry named and wired it onto 0/1/2, so opening
         // the global console here would move a `tty1:` job onto ttyS0. Claim
@@ -203,10 +245,37 @@ mod tests {
     }
 
     /// No program means nothing to exec — diagnosed before any session or
-    /// terminal state is touched.
+    /// terminal state is touched. That holds for `--stdin` too: the flag is
+    /// consumed first, so `cttyhack --stdin` alone is the same usage error.
     #[test]
     fn a_missing_program_is_a_usage_error() {
         assert!(run(&[]).unwrap_err().contains("usage: cttyhack"));
+        assert!(run(&[STDIN_FLAG.to_string()])
+            .unwrap_err()
+            .contains("usage: cttyhack"));
+        assert!(usage().contains("[--stdin]"));
+    }
+
+    /// The flag is leading-only. `cttyhack sh --stdin` runs `sh --stdin`,
+    /// because everything after the program name is the program's.
+    #[test]
+    fn the_stdin_flag_is_consumed_only_at_the_front() {
+        let stdin_first = vec![STDIN_FLAG.to_string(), "/bin/sh".to_string()];
+        assert_eq!(split_mode(&stdin_first), (true, &stdin_first[1..]));
+        let program_first = vec!["/bin/sh".to_string(), STDIN_FLAG.to_string()];
+        assert_eq!(split_mode(&program_first), (false, &program_first[..]));
+        assert_eq!(split_mode(&[]), (false, &[][..]));
+    }
+
+    /// `--stdin` fails closed. Rescue mode degrades to no controlling terminal
+    /// because a shell without job control beats no shell; a terminal emulator
+    /// has no such fallback, so a descriptor that is not a terminal is refused
+    /// before `setsid(2)` is issued at all.
+    #[test]
+    fn the_stdin_mode_refuses_a_descriptor_that_is_not_a_terminal() {
+        assert!(stdin_precondition(true).is_ok());
+        let error = stdin_precondition(false).unwrap_err();
+        assert!(error.contains("descriptor zero is not a terminal"), "{error}");
     }
 
     /// There is no outcome that takes a terminal from whoever holds it. EPERM

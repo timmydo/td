@@ -154,6 +154,7 @@ pub struct Runtime {
     keyboard: KeyboardState,
     pointer: PointerState,
     keyboard_subscribers: BTreeMap<u64, KeyboardSender>,
+    pending_paint: bool,
 }
 
 impl Runtime {
@@ -166,6 +167,7 @@ impl Runtime {
             keyboard: KeyboardState::default(),
             pointer: PointerState::default(),
             keyboard_subscribers: BTreeMap::new(),
+            pending_paint: false,
         }
     }
 
@@ -177,8 +179,36 @@ impl Runtime {
         self.framebuffer.height
     }
 
+    /// Pessimistic across the paint, as the framebuffer's shadow copy is across
+    /// its write: a paint that failed leaves the screen owed, not settled.
     pub fn repaint(&mut self) -> Result<(), String> {
-        self.framebuffer.paint(&self.scene)
+        self.pending_paint = true;
+        self.framebuffer.paint(&self.scene)?;
+        self.pending_paint = false;
+        Ok(())
+    }
+
+    /// Owe a paint instead of taking one. The scene is already current, so any
+    /// repaint before the flush settles the debt.
+    pub fn defer_repaint(&mut self) {
+        self.pending_paint = true;
+    }
+
+    pub fn flush_paint(&mut self) -> Result<(), String> {
+        if self.pending_paint {
+            return self.repaint();
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub fn paint_pending(&self) -> bool {
+        self.pending_paint
+    }
+
+    #[cfg(test)]
+    pub fn take_writes(&mut self) -> Vec<(u64, usize)> {
+        self.framebuffer.take_writes()
     }
 
     #[cfg(test)]
@@ -250,6 +280,10 @@ impl Runtime {
 
     pub fn command(&mut self, command: Command) -> Result<(), String> {
         self.scene.command(command);
+        // A tiling command is what a user reaches for when the screen looks
+        // wrong, so make it the immediate repair for pixels the compositor did
+        // not write and its shadow copy therefore cannot see.
+        self.framebuffer.resend();
         self.repaint()?;
         self.refresh_focus()?;
         if self.refresh_layout()? {
@@ -312,7 +346,9 @@ impl Runtime {
         let frames = self.pointer.frame(time, hover, grab, buttons)?;
         self.publish_pointer(frames);
         if dx != 0 || dy != 0 {
-            self.repaint()?;
+            // Coalesced by the caller: a reader batch that carries many reports
+            // owes one paint, not one per report.
+            self.defer_repaint();
         }
         Ok(())
     }
@@ -618,6 +654,130 @@ mod tests {
         runtime.command(Command::Focus(Direction::Left)).unwrap();
         let first_focused = fs::read(&cleanup.0).unwrap();
         assert_ne!(first_focused, second_focused);
+    }
+
+    #[test]
+    fn many_pointer_reports_owe_one_paint_and_the_flush_takes_it() {
+        let path = std::env::temp_dir().join(format!(
+            "td-runtime-deferred-paint-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let cleanup = Cleanup(path);
+        let framebuffer = Framebuffer::test_file(&cleanup.0, 120, 80, 120 * 4).unwrap();
+        let mut runtime = Runtime::new(framebuffer);
+        runtime.repaint().unwrap();
+        runtime.take_writes();
+        assert!(!runtime.paint_pending());
+
+        for step in 0..16 {
+            runtime.pointer_frame(step, 1, 0, &[]).unwrap();
+        }
+        assert!(runtime.paint_pending());
+        assert_eq!(runtime.take_writes(), vec![]);
+
+        runtime.flush_paint().unwrap();
+        assert!(!runtime.paint_pending());
+        assert_eq!(runtime.take_writes().len(), 1);
+
+        // A second flush owes nothing and must not touch the device.
+        runtime.flush_paint().unwrap();
+        assert_eq!(runtime.take_writes(), vec![]);
+    }
+
+    #[test]
+    fn a_tiling_command_rewrites_the_whole_image() {
+        let path = std::env::temp_dir().join(format!(
+            "td-runtime-command-resend-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let cleanup = Cleanup(path);
+        let framebuffer = Framebuffer::test_file(&cleanup.0, 120, 80, 120 * 4).unwrap();
+        let mut runtime = Runtime::new(framebuffer);
+        runtime.repaint().unwrap();
+        runtime.take_writes();
+
+        runtime.pointer_frame(1, 30, 30, &[]).unwrap();
+        runtime.flush_paint().unwrap();
+        let banded = runtime.take_writes();
+        assert_eq!(banded.len(), 1);
+        assert!(banded.iter().all(|(_, length)| *length < 120 * 4 * 80));
+
+        // The repair a user can reach for when foreign pixels are on screen.
+        runtime.command(Command::Focus(Direction::Left)).unwrap();
+        assert_eq!(runtime.take_writes(), vec![(0, 120 * 4 * 80)]);
+    }
+
+    #[test]
+    fn a_failed_flush_leaves_the_paint_owed_so_teardown_retries_it() {
+        let path = std::env::temp_dir().join(format!(
+            "td-runtime-failed-flush-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let cleanup = Cleanup(path);
+        let framebuffer = Framebuffer::test_file(&cleanup.0, 120, 80, 120 * 4).unwrap();
+        let mut runtime = Runtime::new(framebuffer);
+        runtime.repaint().unwrap();
+        runtime.take_writes();
+
+        runtime.pointer_frame(1, 5, 5, &[]).unwrap();
+        runtime.fail_next_repaint();
+        assert!(runtime.flush_paint().is_err());
+        // Settling on a failed paint would close the device showing the pointer
+        // where it no longer is, with nothing left to say so.
+        assert!(runtime.paint_pending());
+        assert_eq!(runtime.take_writes(), vec![]);
+
+        runtime.flush_paint().unwrap();
+        assert!(!runtime.paint_pending());
+        assert_eq!(runtime.take_writes().len(), 1);
+    }
+
+    #[test]
+    fn a_failed_repaint_owes_the_screen_even_when_no_pointer_moved() {
+        let path = std::env::temp_dir().join(format!(
+            "td-runtime-failed-repaint-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let cleanup = Cleanup(path);
+        let framebuffer = Framebuffer::test_file(&cleanup.0, 120, 80, 120 * 4).unwrap();
+        let mut runtime = Runtime::new(framebuffer);
+        runtime.fail_next_repaint();
+        assert!(runtime.repaint().is_err());
+        assert!(runtime.paint_pending());
+        runtime.flush_paint().unwrap();
+        assert!(!runtime.paint_pending());
+    }
+
+    #[test]
+    fn a_repaint_from_another_source_settles_the_deferred_pointer_paint() {
+        let path = std::env::temp_dir().join(format!(
+            "td-runtime-settled-paint-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let cleanup = Cleanup(path);
+        let framebuffer = Framebuffer::test_file(&cleanup.0, 120, 80, 120 * 4).unwrap();
+        let mut runtime = Runtime::new(framebuffer);
+        runtime.pointer_frame(1, 4, 4, &[]).unwrap();
+        assert!(runtime.paint_pending());
+        runtime
+            .commit(
+                SurfaceKey {
+                    client: 1,
+                    object: 1,
+                },
+                surface([1, 2, 3, 0]),
+            )
+            .unwrap();
+        // The commit painted the scene the motion had already updated.
+        assert!(!runtime.paint_pending());
+        runtime.take_writes();
+        runtime.flush_paint().unwrap();
+        assert_eq!(runtime.take_writes(), vec![]);
     }
 
     #[test]

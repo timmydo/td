@@ -459,6 +459,46 @@ mod confinement {
         walk().0
     }
 
+    /// `cttyhack --stdin` claims a session in a fixed ORDER, and nothing but
+    /// this says so: `TIOCSCTTY` before `setsid(2)` is EPERM, because a process
+    /// that does not lead a session cannot acquire one's terminal. Both calls
+    /// would still be "issued once" by every roster assertion in this file,
+    /// and the applet would fail every time with a plausible errno.
+    ///
+    /// The live claim needs a PTY slave on descriptor zero, which this crate
+    /// cannot create — it has no `TIOCGPTPEER` — so the positive path is proven
+    /// by the system integration test when td-term is packaged
+    /// (`td-compositor/DESIGN.md` §12). This is what holds until then.
+    #[test]
+    fn the_stdin_session_is_claimed_in_the_only_order_that_works() {
+        let cttyhack = sources()
+            .into_iter()
+            .filter(|(path, _)| path == "cttyhack.rs")
+            .map(|(_, text)| text)
+            .next()
+            .unwrap_or_default();
+        let claim = cttyhack
+            .split_once("fn claim_stdin_session()")
+            .map(|(_, tail)| tail.split_once("\n}").map_or(tail, |(body, _)| body))
+            .unwrap_or_default();
+        // `match_indices` rather than the shorter searcher whose name is a
+        // retired host tool: this file is embedded verbatim into the td-init
+        // recipe, and the ladder guard rejects that bare token in any
+        // WriteFile body.
+        let offset = |needle: &str| claim.match_indices(needle).next().map(|(at, _)| at);
+        let setsid = offset(concat!("sys::", "setsid"));
+        let ctty = offset(concat!("sys::", "set_controlling_tty"));
+        assert!(
+            setsid.is_some() && ctty.is_some(),
+            "--stdin must issue both calls itself"
+        );
+        assert!(setsid < ctty, "setsid(2) must precede TIOCSCTTY");
+        // And it must not degrade the way the rescue path deliberately does:
+        // every step of the claim propagates.
+        assert_eq!(claim.matches('?').count(), 2);
+        assert!(!claim.contains("emit_err"));
+    }
+
     /// Where a file's `mod x;` puts `x.rs`: beside `main.rs` for the crate root,
     /// and in a like-named subdirectory for every other module.
     fn submodule_dir(file: &str) -> String {

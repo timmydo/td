@@ -15,6 +15,11 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 
 const EVENT_SIZE: usize = 24;
+/// Records drained per read. A batch is what makes a full-speed pointer cost
+/// one paint instead of one per report; the ceiling only bounds the buffer,
+/// since a reader that falls further behind simply takes another batch.
+const READ_BATCH_RECORDS: usize = 64;
+const READ_BATCH_BYTES: usize = EVENT_SIZE * READ_BATCH_RECORDS;
 const EV_SYN: u16 = 0;
 const EV_KEY: u16 = 1;
 const EV_REL: u16 = 2;
@@ -470,6 +475,9 @@ trait InputTarget {
         dy: i32,
         buttons: &[PointerButtonInput],
     ) -> Result<(), String>;
+
+    /// Take any paint the delivered reports left owing.
+    fn flush(&mut self) -> Result<(), String>;
 }
 
 struct LiveInputTarget {
@@ -532,6 +540,13 @@ impl InputTarget for LiveInputTarget {
             .lock()
             .map_err(|_| "runtime lock poisoned".to_string())?
             .pointer_frame(time, dx, dy, buttons)
+    }
+
+    fn flush(&mut self) -> Result<(), String> {
+        self.runtime
+            .lock()
+            .map_err(|_| "runtime lock poisoned".to_string())?
+            .flush_paint()
     }
 }
 
@@ -923,41 +938,101 @@ fn apply_device_event<T: InputTarget>(
     Ok(())
 }
 
-fn read_device(
+/// Move the bytes after `consumed` to the front, returning how many were kept.
+/// Evdev hands out whole records, so this only ever carries a short tail. Both
+/// bounds are clamped so `copy_within` cannot be handed a range that panics.
+fn carry_remainder(buffer: &mut [u8], consumed: usize, filled: usize) -> usize {
+    let filled = filled.min(buffer.len());
+    let consumed = consumed.min(filled);
+    let kept = filled.saturating_sub(consumed);
+    if kept > 0 && consumed > 0 {
+        buffer.copy_within(consumed..filled, 0);
+    }
+    kept
+}
+
+fn flush_target<T: InputTarget>(target: &Mutex<T>) -> Result<(), String> {
+    target
+        .lock()
+        .map_err(|_| "runtime lock poisoned".to_string())?
+        .flush()
+}
+
+fn read_device<T: InputTarget>(
     path: &Path,
-    mut file: File,
+    file: &mut impl Read,
     device: usize,
-    target: Arc<Mutex<LiveInputTarget>>,
-    bindings: Arc<Mutex<KeyBindings>>,
+    target: &Mutex<T>,
+    bindings: &Mutex<KeyBindings>,
 ) -> Result<(), String> {
-    let mut bytes = [0u8; EVENT_SIZE];
+    let mut buffer = [0u8; READ_BATCH_BYTES];
+    let mut filled = 0usize;
     let mut pointer = PointerMotion::default();
     let mut dropped = false;
     let mut last_time = 0;
     let result = loop {
-        match file.read_exact(&mut bytes) {
-            Ok(()) => {
-                let event = match parse(&bytes) {
-                    Ok(event) => event,
-                    Err(error) => break Err(error),
-                };
-                last_time = event.time;
-                if let Err(error) = apply_device_event(
-                    target.as_ref(),
-                    event,
-                    device,
-                    bindings.as_ref(),
-                    &mut pointer,
-                    &mut dropped,
-                ) {
-                    break Err(error);
-                }
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => break Ok(()),
+        // An empty tail, not just an out-of-range one: `get_mut(len..)` yields
+        // `Some(&mut [])`, and reading into that returns `Ok(0)`, which the
+        // arm below cannot tell from the device closing. A reader that retired
+        // silently is exactly what this refuses to do.
+        let tail = match buffer.get_mut(filled..) {
+            Some(tail) if !tail.is_empty() => tail,
+            _ => break Err(format!("input {} overran its batch buffer", path.display())),
+        };
+        let read = match file.read(tail) {
+            Ok(0) => break Ok(()),
+            Ok(count) => count,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
             Err(error) => break Err(format!("read input {}: {error}", path.display())),
+        };
+        filled = filled.saturating_add(read);
+        let records = filled / EVENT_SIZE;
+        let mut failure = None;
+        for index in 0..records {
+            let at = index.saturating_mul(EVENT_SIZE);
+            let Some(record) = buffer.get(at..at.saturating_add(EVENT_SIZE)) else {
+                failure = Some(format!("input {} lost a record", path.display()));
+                break;
+            };
+            let event = match parse(record) {
+                Ok(event) => event,
+                Err(error) => {
+                    failure = Some(error);
+                    break;
+                }
+            };
+            last_time = event.time;
+            if let Err(error) =
+                apply_device_event(target, event, device, bindings, &mut pointer, &mut dropped)
+            {
+                failure = Some(error);
+                break;
+            }
+        }
+        filled = carry_remainder(&mut buffer, records.saturating_mul(EVENT_SIZE), filled);
+        if let Some(error) = failure {
+            break Err(error);
+        }
+        // One paint for the whole batch: while the compositor was painting, the
+        // kernel queued these reports, and only the last one is on screen now.
+        // A read too short to complete a record owes nothing, so it takes no
+        // lock.
+        if records > 0 {
+            if let Err(error) = flush_target(target) {
+                break Err(error);
+            }
         }
     };
-    let cleanup = release_device(target.as_ref(), device, bindings.as_ref(), last_time);
+    // Both run: a release that failed is the case where the screen is most
+    // likely stale, so it must not be the case that skips the final paint.
+    let cleanup = match (
+        release_device(target, device, bindings, last_time),
+        flush_target(target),
+    ) {
+        (Ok(()), flushed) => flushed,
+        (Err(error), Ok(())) => Err(error),
+        (Err(error), Err(flush_error)) => Err(format!("{error}; final paint: {flush_error}")),
+    };
     match (result, cleanup) {
         (Ok(()), Ok(())) => Ok(()),
         (Err(error), Ok(())) => Err(error),
@@ -978,7 +1053,8 @@ pub fn start(
     let bindings = Arc::new(Mutex::new(KeyBindings::default()));
     let target = Arc::new(Mutex::new(LiveInputTarget { runtime, launches }));
     for (device, path) in paths.iter().enumerate() {
-        let file = File::open(path).map_err(|e| format!("open input {}: {e}", path.display()))?;
+        let mut file =
+            File::open(path).map_err(|e| format!("open input {}: {e}", path.display()))?;
         let path = path.clone();
         let label = path.display().to_string();
         let target = Arc::clone(&target);
@@ -991,7 +1067,9 @@ pub fn start(
                     .unwrap_or("event")
             ))
             .spawn(move || {
-                if let Err(error) = read_device(&path, file, device, target, bindings) {
+                if let Err(error) =
+                    read_device(&path, &mut file, device, target.as_ref(), bindings.as_ref())
+                {
                     eprintln!("td-compositor: {error}");
                 }
             })
@@ -1051,6 +1129,8 @@ mod tests {
         keyboard_calls: Vec<KeyboardCall>,
         pointer_frames: Vec<(u32, i32, i32, Vec<PointerButtonInput>)>,
         pointer_error: Option<String>,
+        flushes: usize,
+        flush_error: Option<String>,
     }
 
     impl InputTarget for RecordingTarget {
@@ -1100,6 +1180,14 @@ mod tests {
                 None => Ok(()),
             }
         }
+
+        fn flush(&mut self) -> Result<(), String> {
+            self.flushes = self.flushes.saturating_add(1);
+            match self.flush_error.take() {
+                Some(error) => Err(error),
+                None => Ok(()),
+            }
+        }
     }
 
     struct LauncherModelTarget {
@@ -1144,6 +1232,170 @@ mod tests {
         ) -> Result<(), String> {
             self.recording.pointer_frame(time, dx, dy, buttons)
         }
+
+        fn flush(&mut self) -> Result<(), String> {
+            self.recording.flush()
+        }
+    }
+
+    fn encode(event: Event) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(EVENT_SIZE);
+        bytes.extend_from_slice(&i64::from(event.time / 1_000).to_ne_bytes());
+        bytes.extend_from_slice(&(i64::from(event.time % 1_000) * 1_000).to_ne_bytes());
+        bytes.extend_from_slice(&event.kind.to_ne_bytes());
+        bytes.extend_from_slice(&event.code.to_ne_bytes());
+        bytes.extend_from_slice(&event.value.to_ne_bytes());
+        bytes
+    }
+
+    fn motion(time: u32, dx: i32) -> Vec<u8> {
+        let mut bytes = encode(Event {
+            time,
+            kind: EV_REL,
+            code: REL_X,
+            value: dx,
+        });
+        bytes.extend_from_slice(&encode(Event {
+            time,
+            kind: EV_SYN,
+            code: SYN_REPORT,
+            value: 0,
+        }));
+        bytes
+    }
+
+    /// A reader that hands out a scripted sequence of short reads, the way a
+    /// character device may but a regular file never does.
+    struct ChunkedReader {
+        data: Vec<u8>,
+        chunks: Vec<std::io::Result<usize>>,
+        at: usize,
+    }
+
+    impl ChunkedReader {
+        fn new(data: Vec<u8>, chunks: Vec<std::io::Result<usize>>) -> Self {
+            Self {
+                data,
+                chunks,
+                at: 0,
+            }
+        }
+    }
+
+    impl Read for ChunkedReader {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            let want = if self.chunks.is_empty() {
+                self.data.len() - self.at
+            } else {
+                self.chunks.remove(0)?
+            };
+            let count = want.min(self.data.len() - self.at).min(buffer.len());
+            buffer[..count].copy_from_slice(&self.data[self.at..self.at + count]);
+            self.at += count;
+            Ok(count)
+        }
+    }
+
+    fn drain(
+        data: Vec<u8>,
+        chunks: Vec<std::io::Result<usize>>,
+    ) -> (RecordingTarget, Result<(), String>) {
+        let target = Mutex::new(RecordingTarget::default());
+        let bindings = Mutex::new(KeyBindings::default());
+        let mut reader = ChunkedReader::new(data, chunks);
+        let result = read_device(Path::new("event-test"), &mut reader, 0, &target, &bindings);
+        (
+            target
+                .into_inner()
+                .unwrap_or_else(|error| error.into_inner()),
+            result,
+        )
+    }
+
+    #[test]
+    fn carry_remainder_moves_only_the_tail() {
+        let mut buffer = [1u8, 2, 3, 4, 5, 6];
+        assert_eq!(carry_remainder(&mut buffer, 4, 6), 2);
+        assert_eq!(&buffer[..2], &[5, 6]);
+        assert_eq!(carry_remainder(&mut buffer, 2, 2), 0);
+        assert_eq!(carry_remainder(&mut buffer, 0, 3), 3);
+        assert_eq!(&buffer[..3], &[5, 6, 3]);
+        // `read_device` consumes a whole multiple of a record and so cannot ask
+        // for more than it filled; out of that domain the bounds are clamped
+        // rather than allowed to panic inside `copy_within`.
+        assert_eq!(carry_remainder(&mut buffer, 9, 3), 0);
+        assert_eq!(carry_remainder(&mut buffer, 1, 99), 5);
+    }
+
+    #[test]
+    fn a_batch_of_reports_costs_one_flush_not_one_per_report() {
+        let mut data = Vec::new();
+        for step in 0..32u32 {
+            data.extend_from_slice(&motion(step, 1));
+        }
+        let (target, result) = drain(data, Vec::new());
+        assert_eq!(result, Ok(()));
+        // Every report still reaches the seat -- clients see the motion path.
+        assert_eq!(target.pointer_frames.len(), 32);
+        // One paint for the batch, plus the teardown flush after EOF.
+        assert_eq!(target.flushes, 2);
+    }
+
+    #[test]
+    fn a_report_that_arrives_alone_is_painted_without_waiting() {
+        let (target, result) = drain(motion(1, 1), vec![Ok(EVENT_SIZE), Ok(EVENT_SIZE)]);
+        assert_eq!(result, Ok(()));
+        assert_eq!(target.pointer_frames.len(), 1);
+        // The bare motion read flushes nothing to paint; the report's own read
+        // flushes it, and EOF flushes again.
+        assert_eq!(target.flushes, 3);
+    }
+
+    #[test]
+    fn a_record_split_across_reads_is_carried_to_the_next() {
+        let data = motion(4, 3);
+        let (target, result) = drain(data, vec![Ok(EVENT_SIZE + 7), Ok(EVENT_SIZE - 7)]);
+        assert_eq!(result, Ok(()));
+        assert_eq!(target.pointer_frames, vec![(4, 3, 0, Vec::new())]);
+    }
+
+    #[test]
+    fn an_interrupted_read_resumes_the_batch() {
+        let interrupted = std::io::Error::new(std::io::ErrorKind::Interrupted, "signal");
+        let (target, result) = drain(motion(6, 5), vec![Err(interrupted)]);
+        assert_eq!(result, Ok(()));
+        assert_eq!(target.pointer_frames, vec![(6, 5, 0, Vec::new())]);
+    }
+
+    #[test]
+    fn a_flush_failure_closes_the_device_after_releasing_its_pressed_buttons() {
+        let target = Mutex::new(RecordingTarget::default());
+        target.lock().unwrap().flush_error = Some("paint refused".to_string());
+        let bindings = Mutex::new(KeyBindings::default());
+        let mut data = encode(Event {
+            time: 1,
+            kind: EV_KEY,
+            code: BTN_MOUSE,
+            value: KEY_PRESS,
+        });
+        data.extend_from_slice(&motion(1, 2));
+        let mut reader = ChunkedReader::new(data, Vec::new());
+        let result = read_device(Path::new("event-test"), &mut reader, 0, &target, &bindings);
+        assert_eq!(result, Err("paint refused".to_string()));
+        assert!(bindings.lock().unwrap().pointer_pressed.is_empty());
+        let target = target.into_inner().unwrap();
+        let released = target
+            .pointer_frames
+            .last()
+            .map(|(_, _, _, buttons)| buttons.clone())
+            .unwrap_or_default();
+        assert_eq!(
+            released
+                .iter()
+                .map(|button| (button.button, button.state))
+                .collect::<Vec<_>>(),
+            vec![(u32::from(BTN_MOUSE), PointerButtonState::Released)]
+        );
     }
 
     #[test]
@@ -2041,7 +2293,9 @@ mod tests {
         )
         .unwrap();
         runtime.lock().unwrap().fail_next_repaint();
-        assert!(apply(
+        // The report itself now only owes the paint, so the failure surfaces at
+        // the batch flush -- and must still leave the press for cleanup.
+        apply(
             &target,
             Event {
                 time: 4,
@@ -2053,7 +2307,8 @@ mod tests {
             &bindings,
             &mut pointer,
         )
-        .is_err());
+        .unwrap();
+        assert!(flush_target(&target).is_err());
         {
             let bindings = bindings.lock().unwrap();
             assert!(bindings.pointer_pressed.contains(&(0, BTN_MOUSE)));

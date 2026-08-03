@@ -410,13 +410,39 @@ td's Rust is defensive and minimal-surface.
   `close(2)` for the received descriptor after safe duplication through
   `/proc/self/fd/N`, and `sendmsg(2)` for the td-native demo client's wl_shm pool
   descriptor, the server's wl_keyboard keymap descriptor, and the transport
-  selftest. Stable Rust exposes no stable ancillary-data API. Deliberately NOT in
+  selftest. Stable Rust exposes no stable ancillary-data API. It also carries a
+  FOURTH, `ioctl(2)`, for td-term's PTY, with FOUR value-pinned requests reached
+  only from `pty.rs`: `TIOCSPTLCK` (0x40045431) to unlock the slave,
+  `TIOCGPTPEER` (0x5441) to obtain it as a descriptor rather than by
+  `/dev/pts/N` name, and `TIOCSWINSZ`/`TIOCGWINSZ` (0x5414/0x5413) to publish a
+  grid and read it back. The readback is the point, as it is for `losetup`'s
+  read-only flag: nothing observable distinguishes a `TIOCSWINSZ` the kernel
+  applied from one it clamped or ignored, and a child that lays out its screen
+  for a size the terminal does not have is a terminal that looks broken with
+  every test green. The request roster is enforced in code, not only in a test —
+  one `ioctl` entry point refuses anything outside the four before issuing the
+  syscall — and the winsize argument is an `[u16; 4]` rather than a
+  `#[repr(C)]` struct so its field ORDER is a tested function; a swapped
+  rows/columns pair is a well-formed resize to a different size. `TIOCGPTPEER`'s
+  returned number is adopted through the SAME `/proc/self/fd/N` reopen the
+  received-descriptor path uses, deliberately NOT `OwnedFd::from_raw_fd`: that
+  would be a second scoped allow of a different shape — a descriptor adoption
+  rather than the syscall-instruction layer — and the crate can reopen by
+  descriptor identity instead. Deliberately NOT in
   that surface: framebuffer and evdev I/O (ordinary files), Unix socket setup and
-  byte I/O (`std`), mmap (wl_shm pixels are copied with `FileExt`), or device
-  ownership (safe `td-seatd`). `td-compositor/DESIGN.md` is the normative UI-stack
+  byte I/O (`std`), mmap (wl_shm pixels are copied with `FileExt`), device
+  ownership (safe `td-seatd`), or anything else the PTY needs — no termios call
+  (the slave's kernel defaults ARE the canonical-input policy), no `setsid(2)`
+  or `TIOCSCTTY` (the child gets its session from the declared `td-init`
+  input's `cttyhack --stdin`), and no `fork`/`execve`/`dup2` (`Command` plus
+  `Stdio::from(File)` cover all three). `td-compositor/DESIGN.md` is the
+  normative UI-stack
   specification. Its confinement tests pin the allow count, assembly body, syscall
   numbers, callers, and absence of unsafe from every other module; adding another
-  syscall or scoped allow is an amendment there AND here.
+  syscall or scoped allow is an amendment there AND here. The two surfaces
+  behind the one body are pinned to disjoint modules — transport to
+  `client.rs`/`server.rs`, terminal control to `pty.rs`, and no other module
+  names `sys` at all.
   And (7) the `td-util` diagnostics multicall, whose one `syscall3` body in
   `td-util/src/sys.rs` carries EXACTLY ONE syscall — `ioctl(2)` — with THREE
   value-pinned requests, reached only from `term.rs`: `TCGETS`/`TCSETS`

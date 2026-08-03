@@ -91,14 +91,50 @@ treats symbol keys as repeatable by default. Clients combine that per-key
 property with `wl_keyboard.repeat_info`.
 
 The framebuffer is single-buffered from userspace's perspective. The renderer
-allocates its frame storage once, composes a full frame after scene changes,
-then writes one stride-complete image. There is no page flip, vblank,
+allocates its frame storage once and composes a full frame after scene changes.
+It then writes only the rows that changed, keeping a second allocation holding
+what the device is believed to contain. An unchanged scene writes nothing at
+all. Rows rather than rectangles: a band is one `seek`+`write` pair, where
+per-row column spans would be one pair each and the syscalls would cost more
+than the bytes they saved. The shadow copy is marked untrustworthy for the
+duration of every write and trusted again only once that write has returned, so
+a failed or partial write resends the whole image rather than leaving the device
+holding bytes no shadow describes.
+
+The compositor is not the only writer of that device. It deliberately does not
+take the VT, and the boot profile keeps fbcon there on purpose so a recovery
+console stays reachable; owning the `/dev/fb0` node through td-seatd does not
+stop a writer inside the kernel. Every paint used to rewrite the whole image and
+so healed foreign pixels for free, where a shadow copy that is never distrusted
+would keep them until a scene change happened to touch those exact rows. Two
+things bound that: one paint in every 240 is an unconditional full write, and
+a tiling command distrusts the shadow outright, so the repair is both automatic
+and reachable by a user who can see the artifact. That bound is counted in
+paints, not seconds, and the batching above is what lowers the paint rate --
+the two halves of this mechanism pull against each other, so the interval is a
+count of repairs deferred rather than a wall-clock age. A screen nothing changes
+writes nothing and so never spends the interval, which is the same reach the
+renderer had before damage tracking. There is still no page flip, vblank,
 acceleration, DMA-BUF, or tear-free claim.
 
-Pointer motion is a scene change: each evdev `SYN_REPORT` currently performs
-that full repaint while holding the runtime lock. This is bounded enough for
-the supported QEMU PS/2 profile but is not a high-rate input design. Damage
-tracking or a throttled render loop is required before adding such hardware.
+Pointer motion is a scene change, and a moving pointer is the highest-rate
+source of them. A reader drains up to 64 evdev records per read and takes one
+paint for the batch rather than one per `SYN_REPORT`: every record still crosses
+the seat in order, so clients see the whole motion path, but the framebuffer
+only ever shows the newest state. This is the throttle, and it is
+self-regulating — it costs a lone report nothing, because a read returns as soon
+as one record is available, and it coalesces exactly as hard as the compositor
+is behind. Motion therefore owes a paint instead of taking one, and any repaint
+before the flush settles that debt; the flush also runs after device teardown,
+so a batch that ended in an error still leaves the truth on screen. The debt is
+pessimistic across the paint exactly as the shadow copy is across its write —
+a paint that failed leaves the screen owed, never settled — so the owing flag
+means "the output may not match the scene" whatever raised it, and a failure
+cannot be swallowed by having already cleared it. Together
+with damage tracking, a one-pixel pointer step at 1920x1080 writes 14 rows
+instead of an 8 MiB image. Both were prerequisites for real GPU hardware, and
+neither is a substitute for it: acceleration would make a redundant full-screen
+frame cheaper without making it unnecessary.
 The shared logical-seat boundary spans a key decision through its runtime
 adapter delivery, so evdev inputs remain ordered behind that lock; partial
 pointer records return before acquiring either lock. Each adapter operation
@@ -427,19 +463,16 @@ handshake rejects any descriptor left over after all expected events. The
 descriptor queue and keymap read are bounded, and every overflow or abandoned
 connection closes all descriptors it owns.
 
-This section records the current compositor surface. Section 12 specifies a
-proposed PTY widening; its implementation landing must update this roster, the
-repository-wide inventory, and the confinement assertions atomically.
-
 `td-compositor/src/sys.rs` contains the sole scoped `unsafe` block. One raw
 `syscall3` body carries exactly:
 
 - sendmsg(2), to send the demo client's wl_shm descriptor, the server's XKB
   keymap descriptor, or a test request;
 - recvmsg(2), to receive wl_shm pool descriptors or the demo client's XKB
-  keymap descriptor; and
+  keymap descriptor;
 - close(2), to release a received descriptor after it has been safely
-  duplicated through `/proc/self/fd/N`.
+  duplicated through `/proc/self/fd/N`; and
+- ioctl(2), for the four pinned terminal-control requests in section 12.
 
 No framebuffer, input, socket, allocation, process, or filesystem operation
 passes through that surface. The crate denies unsafe globally; confinement
@@ -447,9 +480,14 @@ tests pin the allow count, assembly body, syscall numbers, callers, and the
 absence of unsafe from every other target source file. Each developer tool is
 a separate crate root that also denies unsafe. Adding a syscall or another
 scoped allow amends this document and the repository-wide unsafe inventory.
-This paragraph describes the implemented surface today. The PTY adapter in
-section 12 is a gated future amendment; its ioctl requests do not enter the
-crate until that adapter and its confinement tests land together.
+
+The two surfaces behind that one body are disjoint and are pinned to disjoint
+modules: descriptor transport is reachable only from `client.rs` and
+`server.rs`, terminal control only from `pty.rs`, and no other module names
+`sys` at all. `ioctl(2)` is the request-carrying one, so its roster is the
+confinement: a request outside the four is refused before the syscall, and a
+test pins each value, the single guard, the single entry point, and each
+wrapper's operand shape.
 
 ## 5. Boot and recovery
 
@@ -531,6 +569,21 @@ The landing must prove:
 - evdev tests prove relative motion and logical multi-device buttons flush
   only at `SYN_REPORT`, while EOF, `SYN_DROPPED`, and an oversized partial
   report cannot strand a delivered button;
+- a batch of 32 pointer reports delivers 32 frames and takes one paint, a lone
+  report is painted without waiting for a second, a record split across two
+  reads is carried rather than parsed short, an interrupted read resumes, and a
+  flush failure closes the device only after releasing its pressed buttons;
+- a failed flush and a failed repaint both leave the paint owed, so the next
+  flush retries it rather than closing the device on a stale screen;
+- a run of banded paints resends the whole image on the 240th paint and no
+  sooner,
+  and a tiling command resends it immediately, so foreign pixels fbcon left on
+  the device cannot outlive either bound;
+- framebuffer tests pin the damaged band exactly: an unchanged scene writes
+  nothing, a one-pixel pointer step writes the cursor's 13 rows, a diagonal step
+  writes 14, a full-size output writes under 2% of its image, a banded sequence
+  leaves the device byte-identical to one full write of the same scene, and a
+  failed write resends everything even though the scene did not change;
 - pointer wire tests cover checked fixed-point coordinates, event payloads,
   shared serials, version-gated frame and release, cursor roles, queue
   saturation, and leave/frame/delete ordering;
@@ -629,6 +682,21 @@ application registry. A terminal launcher entry follows after the native
 terminal client is packaged. Clipboard, pointer axes, client cursor rendering,
 hotplug, and real DRM/KMS profiles follow. The terminal stack has the separate
 contract below.
+
+Of that contract these are built: the parser and terminal model, the native
+corpus including its `key` operations, the keyboard adapter of section 11
+(translation, autorepeat, and the bounded input queue), and from section 12 the
+PTY open/unlock/peer/winsize operations, the account and environment policy,
+the child argv through `cttyhack --stdin`, and the PTY reader thread.
+
+Section 12's writer thread, child waiter, readiness socket, `TD-TERM-READY`
+marker, and `probe` subcommand are not, nor is section 11's renderer, which
+waits on the pinned PSF2 font asset and its provenance landing. The Wayland
+client, terminfo entry, packaging, and boot cutover of sections 12 and 14
+follow it. Until that client exists the PTY adapter has no production caller;
+its host tests drive every operation against a real PTY, and the packaged
+binary's selftest covers the policy layer, which is what runs where devpts is
+not mounted.
 General Wayland toolkit compatibility is not claimed until the missing core
 protocols have explicit tests. Hardware acceleration, niri, portals, PipeWire,
 Xwayland, and a C desktop stack remain optional consumers rather than
@@ -740,7 +808,16 @@ without limit.
 The child environment is cleared and reconstructed. A bounded parse of
 `/proc/self/status` selects the matching unique `/etc/passwd` entry and
 supplies `HOME`, `USER`, and `LOGNAME`; a missing, duplicate, malformed, or
-mismatched account closes the terminal before child creation. The remaining
+mismatched account closes the terminal before child creation. Malformed is
+whole-file, not per-entry: any line without seven fields or with a non-numeric
+uid closes it, wherever it sits. td owns this file, so a line it cannot account
+for is a system-integrity problem rather than an entry to skip past on the way
+to the one being looked up. That file is the
+whole account namespace: td resolves no Name Service Switch, so an account that
+exists only in LDAP, NIS, or a directory service does not exist for td-term.
+This is the same single-local-seat assumption `td-seatd` is built on, and
+lifting it is a separately reviewed design change, not a parser change. The
+remaining
 values are `TERM=td-term`, `COLORTERM=truecolor`, `PATH=/bin`,
 `SHELL=/bin/sh`, and `TERMINFO=/etc/terminfo`. The package carries its td-owned
 entry under its store `share/terminfo`, and the system closure exposes that
@@ -810,13 +887,65 @@ Home, End, PageUp, PageDown, Insert, Delete, and F1 through F12. It selects
 normal or application sequences from explicit terminal modes. Ctrl produces
 the specified ASCII C0 bytes, Alt prefixes the resulting sequence with ESC,
 and Shift selects the defined text or navigation variant; unlisted modifier
-combinations produce no bytes. Backspace emits DEL (`0x7f`) to match the
+combinations produce no bytes.
+
+Those three rules are exhaustive, and what they exclude is deliberate. Ctrl
+reaches printable keys only, and only where a C0 spelling is defined; the
+character it maps is the one Shift already selected, so `Ctrl+Shift+6` needs no
+second rule to reach `RS`. Alt prefixes ESC uniformly rather than folding a
+modifier into a CSI parameter, because this profile does not claim the
+modified-key encodings such a parameter implies, and a sequence it does not
+claim would be indistinguishable to the child from one it does. Shift on an
+arrow or a function key is therefore silent, and `Shift+PageUp` and
+`Shift+PageDown` belong to the scrollback viewport rather than to the child.
+Keys the pinned keymap publishes but this profile does not translate — Print,
+Pause, Menu, and the media keys — are silent for the same reason.
+
+Shift is not silent everywhere: on the fixed keys it passes through, because
+they have one spelling at both levels and real terminals send CR for
+`Shift+Enter` and DEL for `Shift+Backspace`. Tab is the one fixed key with a
+defined second spelling. It is the navigation and function keys, which have no
+shifted spelling in this profile, that Shift silences.
+
+A modifier the profile does not translate makes the whole chord unlisted rather
+than a bare key press. The compositor forwards Super chords it has no binding
+for, so without that rule `Super+q` would type `q` and `Super+Enter` would
+submit whatever the shell had half-typed. Shift, Caps Lock, Control, and Alt
+are the handled set; Num Lock is handled-and-inert, because this profile's
+keypad is digits-only; any other bit, including an undefined one, silences the
+chord.
+
+The key table is checked against the compositor's published keymap in both
+directions, and the keys it marks repeatable are exactly that keymap's
+`repeat=no` exclusions inverted, so a client using the published keymap and
+td-term cannot disagree about which keys autorepeat.
+
+Backspace emits DEL (`0x7f`) to match the
 slave's Linux-default canonical `VERASE`; Alt prefixes that byte with ESC. The
 compositor suppresses evdev repeat and publishes a repeat rate of 25 Hz with a
 600 millisecond delay, so td-term implements repeat from an injected clock.
 Release, focus loss, or any modifier snapshot change cancels the corresponding
 repeat; this also covers compositor chords whose command-key events are
-intercepted.
+intercepted. Releasing some other key leaves a held key repeating, and
+repetitions missed while the main loop was busy are dropped rather than
+delivered as a burst. A repetition is translated when it is emitted, not when
+the key went down: the child can change cursor-key mode while an arrow is held,
+and a stored sequence would keep sending the spelling that was correct at the
+press.
+
+Keyboard bytes reach the PTY writer through a bounded queue that admits a
+sequence whole or drops it whole: half a `CSI` arriving at the child would be
+worse than the key never having been pressed, so an overflowing queue rings the
+visual bell instead of truncating. The writer consumes only what the kernel
+accepted, so a partial write leaves the remainder queued; keystrokes have
+nowhere to come back from. Because the master is blocking, a child that stops
+reading blocks that writer once the line discipline fills — which is why the
+writer is its own thread and the main loop only enqueues.
+
+The scrollback viewport `Shift+PageUp` and `Shift+PageDown` select lands with
+the renderer, and so does §10's rule that an unmodified End key returns to the
+live bottom while viewing scrollback. Until then End is forwarded in the
+selected cursor-key mode, which is its behaviour at the live bottom.
 
 ## 12. PTY and process lifecycle
 
@@ -832,11 +961,9 @@ The image proof pins the startup mount command and checks the effective slave
 gid/mode plus `pts/ptmx` mode; it does not require `/proc/mounts` to echo the
 modern kernel's accepted no-op `newinstance` token.
 
-Stable Rust does not expose the required PTY operations. The PTY
-implementation landing must amend the repository unsafe inventory together
-with `td-compositor/src/sys.rs`; this design alone grants no new unsafe
-surface. The proposed widening adds x86-64 `SYS_IOCTL=16` to the existing raw
-body. Its safe wrapper accepts exactly four request values:
+Stable Rust does not expose the required PTY operations. The widening adds
+x86-64 `SYS_IOCTL=16` to the existing raw body. Its safe wrapper accepts
+exactly four request values:
 
 - `TIOCSPTLCK=0x40045431`, to unlock the slave;
 - `TIOCGPTPEER=0x5441`, to obtain the slave as a new owned descriptor;
@@ -844,19 +971,35 @@ body. Its safe wrapper accepts exactly four request values:
 - `TIOCGWINSZ=0x5413`, to verify every published size before it becomes
   visible to the child.
 
-The same landing updates the confinement tests that pin the `SYS_` constant
-count, raw-body call count, request values, and callers. This setter applies
-only to td-term's newly created PTY; it does not weaken the separate
-repository prohibition on resizing an operator's terminal.
+The confinement tests pin the `SYS_` constant count, raw-body call count,
+request values, and callers. This setter applies only to td-term's newly
+created PTY; it does not weaken the separate repository prohibition on
+resizing an operator's terminal. A request outside the four is refused by the
+one `ioctl` entry point before the syscall is issued, so a mistyped or newly
+invented number cannot reach the kernel without amending both the roster and
+the test that pins it.
 
 The wrappers use a four-byte native-endian `int` for `TIOCSPTLCK` and an
-eight-byte `#[repr(C)]` winsize of four native-endian `u16` fields for both
-winsize requests. The kernel never receives a pointer to a temporary or
-shorter object, and the existing assembly body remains memory-aware: it does
-not acquire `options(nomem)`. `TIOCGPTPEER` receives the open flags as an
-immediate value rather than a pointer; its nonnegative return is adopted into
-one `OwnedFd` exactly once. Confinement tests pin both operand shapes and the
-returned-descriptor conversion.
+eight-byte `[u16; 4]` of native-endian rows, columns, and the two pixel fields
+for both winsize requests. The array rather than a `#[repr(C)]` struct because
+the language guarantees that layout, which turns the field ORDER into an
+ordinary tested function: a swapped rows/columns pair is a well-formed resize
+to a different size, and an attribute nobody can observe would not catch it.
+The kernel never receives a pointer to a temporary or shorter object, and the
+existing assembly body remains memory-aware: it does not acquire
+`options(nomem)`. `TIOCGPTPEER` receives the open flags as an immediate value
+rather than a pointer, and the flags are pinned in `sys.rs` rather than chosen
+by a caller, so `O_NOCTTY` cannot be forgotten by the one call site that must
+not acquire the terminal.
+
+Its nonnegative return is adopted exactly once, through the same
+`/proc/self/fd/N` duplication the received-descriptor path already uses, and
+the raw number is closed. `OwnedFd::from_raw_fd` is `unsafe`, and a second
+scoped allow of a different SHAPE — a descriptor adoption rather than the
+syscall-instruction layer — is a wider amendment than this adapter needs when
+the crate can reopen the descriptor by identity instead. The reopen is by
+descriptor number, not by terminal name: no `/dev/pts/N` path is resolved, so
+it retains the property the peer request was chosen for.
 
 No termios construction, signal syscall, process creation, or descriptor
 duplication enters that unsafe surface. The slave's kernel defaults provide
@@ -879,10 +1022,25 @@ an outer controlling terminal. Unlike rescue mode, `--stdin` exits nonzero if
 line. The td-term recipe and system integration tests assert that the staged
 td-init advertises and exercises this exact flag, tying the absolute path to
 the declared runtime input. Ordinary rescue-console behavior remains
-unchanged. Immediately after a successful spawn, td-term drops the original
+unchanged. The child starts in the verified account home: setting `HOME` does
+not move a process, so without an explicit working directory the shell would
+start wherever td-svc left the graphical service and disagree with its own
+environment. A home the child cannot enter fails the spawn rather than silently
+landing in `/`. Immediately after a successful spawn, td-term drops the original
 slave and all three parent-side `Stdio` clones, retaining only the master.
 Closing that master produces the kernel's normal PTY hangup; child exit unmaps
 the surface and terminates the client.
+
+The PTY reader thread owns a master descriptor and parks in `read` whenever the
+child is idle, and safe `std` cannot interrupt that: there is no poll, no read
+timeout, and closing a descriptor another thread is reading is not something
+this crate may express. Its only retirement is the child's exit closing the last
+slave. That is sound because td-term is one process per terminal: closing the
+terminal IS exiting, process exit closes the descriptor, and the kernel then
+sends the child `SIGHUP` for its controlling terminal. The consequence is a
+contract rather than a mechanism — a teardown path must not join that thread —
+and interrupting the reader for any other reason requires a separately reviewed
+wakeup surface.
 
 The client first completes the required empty XDG commit and initial
 configure/ack. It maps a bounded blank placeholder and waits up to the same

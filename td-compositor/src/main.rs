@@ -5,9 +5,11 @@ mod configure;
 mod framebuffer;
 mod input;
 mod keyboard;
+mod keys;
 mod launcher;
 mod layout;
 mod pointer;
+mod pty;
 mod runtime;
 mod scene;
 mod server;
@@ -107,6 +109,8 @@ fn run_compositor(options: RunOptions) -> Result<(), String> {
 
 fn selftest() -> Result<(), String> {
     term::selftest()?;
+    keys::selftest()?;
+    pty::selftest()?;
 
     let mut payload = wire::Builder::new();
     payload.u32(7);
@@ -275,9 +279,11 @@ mod confinement {
         ("framebuffer.rs", include_str!("framebuffer.rs")),
         ("input.rs", include_str!("input.rs")),
         ("keyboard.rs", include_str!("keyboard.rs")),
+        ("keys.rs", include_str!("keys.rs")),
         ("launcher.rs", include_str!("launcher.rs")),
         ("layout.rs", include_str!("layout.rs")),
         ("pointer.rs", include_str!("pointer.rs")),
+        ("pty.rs", include_str!("pty.rs")),
         ("runtime.rs", include_str!("runtime.rs")),
         ("scene.rs", include_str!("scene.rs")),
         ("server.rs", include_str!("server.rs")),
@@ -324,7 +330,7 @@ mod confinement {
     }
 
     #[test]
-    fn one_scoped_unsafe_body_carries_only_wayland_fd_transport() {
+    fn one_scoped_unsafe_body_carries_only_the_reviewed_syscalls() {
         let syscall_body = r#"#[allow(unsafe_code)]
 fn syscall3(number: usize, a1: usize, a2: usize, a3: usize) -> isize {
     let result: isize;
@@ -349,12 +355,13 @@ fn syscall3(number: usize, a1: usize, a2: usize, a3: usize) -> isize {
         assert_eq!(occurrences(SYS, syscall_body), 1);
         for syscall in [
             "const SYS_CLOSE: usize = 3;",
+            "const SYS_IOCTL: usize = 16;",
             "const SYS_SENDMSG: usize = 46;",
             "const SYS_RECVMSG: usize = 47;",
         ] {
             assert!(SYS.contains(syscall), "{syscall}");
         }
-        assert_eq!(occurrences(SYS, "const SYS_"), 3);
+        assert_eq!(occurrences(SYS, "const SYS_"), 4);
         for (name, source) in OTHER.iter().chain(TEST_ONLY) {
             assert!(
                 !source.contains("unsafe"),
@@ -401,8 +408,74 @@ fn syscall3(number: usize, a1: usize, a2: usize, a3: usize) -> isize {
         assert_eq!(inventoried, actual);
     }
 
+    /// `ioctl(2)`'s request number chooses the operation, so the roster is the
+    /// confinement: these four values, one entry point, and four callers.
     #[test]
-    fn syscall_wrapper_is_called_only_by_the_three_reviewed_operations() {
+    fn the_ioctl_surface_is_four_pinned_requests_and_four_wrappers() {
+        for request in [
+            "const TIOCSPTLCK: usize = 0x4004_5431;",
+            "const TIOCGPTPEER: usize = 0x5441;",
+            "const TIOCSWINSZ: usize = 0x5414;",
+            "const TIOCGWINSZ: usize = 0x5413;",
+        ] {
+            assert!(SYS.contains(request), "{request}");
+        }
+        assert_eq!(occurrences(SYS, "const TIOC"), 4);
+        // The guard names each request once more; every other mention is a
+        // wrapper passing it to the one entry point.
+        let guard = r#"    if !matches!(
+        request,
+        TIOCSPTLCK | TIOCGPTPEER | TIOCSWINSZ | TIOCGWINSZ
+    ) {"#;
+        assert_eq!(occurrences(SYS, guard), 1);
+        let entry = r#"    errno_result(syscall3(SYS_IOCTL, fd as usize, request, argument), operation)"#;
+        assert_eq!(occurrences(SYS, entry), 1);
+        assert_eq!(occurrences(SYS, "fn ioctl("), 1);
+        // One definition plus exactly four call sites: a FIFTH wrapper reusing
+        // a pinned request would satisfy every other assertion here. Split at
+        // the test MODULE, since `sys.rs` puts `#[cfg(test)]` on individual
+        // constants too and the first one would truncate this to nothing.
+        let production_sys = SYS
+            .split_once("\n#[cfg(test)]\nmod tests {")
+            .map_or(SYS, |(source, _)| source);
+        let mentions = occurrences(production_sys, "ioctl(");
+        let prose = occurrences(production_sys, "ioctl(2)");
+        assert_eq!(mentions - prose, 5);
+        // The four wrappers, each reaching that entry point exactly once with
+        // its own request and its own operand.
+        for (wrapper, call) in [
+            (
+                "pub fn unlock_pty(",
+                "        master.as_raw_fd(),\n        TIOCSPTLCK,\n        (&unlocked as *const i32) as usize,\n        \"TIOCSPTLCK\",",
+            ),
+            (
+                "pub fn pty_peer(",
+                "        master.as_raw_fd(),\n        TIOCGPTPEER,\n        PTY_PEER_FLAGS,\n        \"TIOCGPTPEER\",",
+            ),
+            (
+                "pub fn set_window_size(",
+                "        terminal.as_raw_fd(),\n        TIOCSWINSZ,\n        (&words as *const [u16; 4]) as usize,\n        \"TIOCSWINSZ\",",
+            ),
+            (
+                "pub fn window_size(",
+                "        terminal.as_raw_fd(),\n        TIOCGWINSZ,\n        (&mut words as *mut [u16; 4]) as usize,\n        \"TIOCGWINSZ\",",
+            ),
+        ] {
+            assert!(SYS.contains(wrapper), "{wrapper}");
+            assert_eq!(occurrences(SYS, call), 1, "{wrapper}");
+        }
+        // The peer's open flags are pinned rather than chosen by a caller: the
+        // slave belongs to the child, so O_NOCTTY cannot be forgotten.
+        assert!(SYS.contains("const PTY_PEER_FLAGS: usize = 0o2 | 0o400 | 0o2_000_000;"));
+        // The eight bytes the kernel reads are an array whose layout the
+        // language guarantees, not an attribute nobody can observe.
+        assert!(SYS.contains("fn winsize_words(size: WindowSize) -> [u16; 4] {"));
+        assert_eq!(occurrences(SYS, "as *const [u16; 4]"), 1);
+        assert_eq!(occurrences(SYS, "as *mut [u16; 4]"), 1);
+    }
+
+    #[test]
+    fn syscall_wrapper_is_called_only_by_the_four_reviewed_operations() {
         let close = r#"errno_result(syscall3(SYS_CLOSE, fd as usize, 0, 0), "close")?"#;
         let receive = r#"syscall3(
             SYS_RECVMSG,
@@ -416,8 +489,9 @@ fn syscall3(number: usize, a1: usize, a2: usize, a3: usize) -> isize {
             (&message as *const MsgHdr) as usize,
             0,
         )"#;
-        assert_eq!(occurrences(SYS, "syscall3("), 4);
+        assert_eq!(occurrences(SYS, "syscall3("), 5);
         assert_eq!(occurrences(SYS, "SYS_CLOSE"), 2);
+        assert_eq!(occurrences(SYS, "SYS_IOCTL"), 2);
         assert_eq!(occurrences(SYS, "SYS_SENDMSG"), 2);
         assert_eq!(occurrences(SYS, "SYS_RECVMSG"), 2);
         assert_eq!(occurrences(SYS, close), 1);
@@ -432,35 +506,94 @@ fn syscall3(number: usize, a1: usize, a2: usize, a3: usize) -> isize {
         }
     }
 
+    /// Two disjoint reviewed surfaces live behind one syscall body, so each is
+    /// pinned to its own module: descriptor transport to the protocol
+    /// endpoints, terminal control to the PTY adapter. Nothing else names
+    /// `sys` at all — an alias elsewhere would give an audited call a name
+    /// neither of these scans looks for.
     #[test]
-    fn descriptor_transport_is_reachable_only_from_the_server_and_demo_client() {
-        let production_main = MAIN
-            .split_once("\n#[cfg(test)]")
-            .map_or(MAIN, |(source, _)| source);
-        for (name, source) in
-            std::iter::once(("main.rs", production_main)).chain(OTHER.iter().copied())
-        {
-            if matches!(name, "client.rs" | "server.rs") {
-                continue;
-            }
-            assert!(
-                !source.contains("sys::"),
-                "{name} reached the descriptor transport outside the protocol endpoints"
-            );
-        }
-        let client = include_str!("client.rs");
-        let server = include_str!("server.rs");
-        for operation in [
+    fn each_confined_operation_is_reachable_only_from_its_own_module() {
+        const TRANSPORT: &[&str] = &[
             "sys::send_with_fd(",
             "sys::recv_with_fds(",
             "sys::duplicate_received(",
             "sys::discard_received(",
-        ] {
+        ];
+        const TERMINAL: &[&str] = &[
+            "sys::unlock_pty(",
+            "sys::pty_peer(",
+            "sys::set_window_size(",
+            "sys::window_size(",
+        ];
+        let production_main = MAIN
+            .split_once("\n#[cfg(test)]")
+            .map_or(MAIN, |(source, _)| source);
+        for (name, source) in std::iter::once(("main.rs", production_main))
+            .chain(OTHER.iter().copied())
+            .chain(TEST_ONLY.iter().copied())
+        {
+            if matches!(name, "client.rs" | "server.rs" | "pty.rs") {
+                continue;
+            }
+            assert!(
+                !source.contains("sys::"),
+                "{name} reached a confined syscall outside its reviewed module"
+            );
+        }
+        // A NAMED or ALIASED import defeats the scan above the way a glob does:
+        // `use crate::sys as raw;` then `raw::set_window_size(...)` matches
+        // nothing it looks for, and terminal control would be reachable from a
+        // module that never resizes anything it verified. Every reach must be
+        // spelled `sys::<wrapper>` where the caller scan can see it — including
+        // inside the three permitted modules, so the module list stays the
+        // whole answer to "who can call this".
+        for (name, source) in std::iter::once(("main.rs", production_main))
+            .chain(OTHER.iter().copied())
+            .chain(TEST_ONLY.iter().copied())
+        {
+            let squeezed: String = source.chars().filter(|c| !c.is_whitespace()).collect();
+            for form in [
+                concat!("use", "crate::sys::"),
+                concat!("use", "super::sys::"),
+                concat!("use", "crate::sysas"),
+                concat!("use", "super::sysas"),
+                concat!("sys::", "*"),
+            ] {
+                assert_eq!(
+                    squeezed.matches(form).count(),
+                    0,
+                    "{name} imports out of the syscall module ('{form}')"
+                );
+            }
+        }
+        let client = include_str!("client.rs");
+        let server = include_str!("server.rs");
+        let pty = include_str!("pty.rs");
+        for operation in TRANSPORT {
             assert!(
                 client.contains(operation) || server.contains(operation),
                 "{operation}"
             );
+            assert!(!pty.contains(operation), "pty.rs reached {operation}");
         }
+        for operation in TERMINAL {
+            assert!(pty.contains(operation), "{operation}");
+            assert!(
+                !client.contains(operation) && !server.contains(operation),
+                "a protocol endpoint reached {operation}"
+            );
+        }
+        // `set_window_size` is generic over `AsRawFd`, so inside pty.rs it
+        // would type-check against any terminal — including an operator's.
+        // `Pty::resize` is the only caller, and it is the one that verifies
+        // what it published.
+        let production_pty = pty
+            .split_once("\n#[cfg(test)]")
+            .map_or(pty, |(source, _)| source);
+        assert_eq!(occurrences(production_pty, "sys::set_window_size("), 1);
+        assert_eq!(occurrences(production_pty, "sys::window_size("), 1);
+        assert!(production_pty.contains("sys::set_window_size(&self.master, requested)?;"));
+        assert!(production_pty.contains("let observed = sys::window_size(&self.master)?;"));
     }
 
     #[test]
