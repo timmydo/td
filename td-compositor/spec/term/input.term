@@ -206,3 +206,49 @@ key b
 expect input b"ab"
 expect reply b"\x1b[1;1R"
 end
+
+# Alt is a prefix applied after the level is chosen, so it composes with the
+# one Shift variant a fixed key defines rather than cancelling it.
+case input/alt-composes-with-the-shift-variant
+source td
+tags core input
+size 2 8
+key tab
+expect input b"\t"
+key shift+tab
+expect input b"\t\x1b[Z"
+key alt+shift+tab
+expect input b"\t\x1b[Z\x1b\x1b[Z"
+end
+
+# Ctrl reads the level Shift selected, but Caps Lock never changes which C0
+# byte comes out: Ctrl+A and Ctrl+Shift+A are both SOH.
+case input/caps-does-not-change-the-control-byte
+source td
+tags core input
+size 2 8
+key ctrl+a
+expect input b"\x01"
+key ctrl+caps+a
+expect input b"\x01\x01"
+key ctrl+shift+a
+expect input b"\x01\x01\x01"
+end
+
+# Ctrl over a key whose level has no C0 spelling is silent, not the bare
+# character: the profile claims the specified table and nothing besides.
+case input/control-without-a-c0-spelling-is-silent
+source td
+tags core input
+size 2 8
+key ctrl+1
+expect input b""
+key ctrl+comma
+expect input b""
+key ctrl+period
+expect input b""
+key ctrl+f1
+expect input b""
+key ctrl+a
+expect input b"\x01"
+end

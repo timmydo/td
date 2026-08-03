@@ -612,6 +612,7 @@ pub fn parse_chord(text: &str) -> Result<(u16, u32), String> {
 mod tests {
     use super::*;
     use crate::keyboard::{MOD_LOGO, XKB_KEYMAP};
+    use std::collections::BTreeSet;
 
     fn bytes(chord: &str, modes: Modes) -> Option<Vec<u8>> {
         let (code, modifiers) = parse_chord(chord).unwrap();
@@ -727,13 +728,9 @@ mod tests {
 
     /// The published keymap's two levels for a printable key, by keycode name.
     fn keymap_levels(name: &str) -> Option<(u8, u8)> {
-        let declaration = format!("key <{name}> {{");
-        let (_, tail) = XKB_KEYMAP.split_once(&declaration)?;
-        let (body, _) = tail.split_once("]")?;
-        let (_, levels) = body.split_once('[')?;
-        let mut symbols = levels.split(',').map(str::trim);
-        let base = keysym(symbols.next()?)?;
-        let shifted = symbols.next().map_or(Some(base), keysym)?;
+        let (base, shifted) = keymap_keysyms(name)?;
+        let base = keysym(base)?;
+        let shifted = shifted.map_or(Some(base), keysym)?;
         Some((base, shifted))
     }
 
@@ -768,6 +765,197 @@ mod tests {
         // purpose — its `KP_7`-style symbols are not ASCII names, and its
         // digits-only spelling is this profile's choice, not the keymap's.
         assert_eq!(checked, 49);
+    }
+
+    /// Caps Lock behaviour is the keymap's `type=`, not a guess from the shape
+    /// of the symbols: retyping a key to `TWO_LEVEL` changes what Caps does for
+    /// every xkbcommon client while its two symbols stay exactly as they were.
+    #[test]
+    fn letter_keys_are_the_ones_the_keymap_types_alphabetic() {
+        let mut checked = 0usize;
+        for (name, code) in keymap_codes() {
+            let Some(kind) = kind(code) else {
+                continue;
+            };
+            let Some(body) = keymap_body(&name) else {
+                continue;
+            };
+            assert_eq!(
+                matches!(kind, Kind::Letter { .. }),
+                body.contains("type=\"ALPHABETIC\""),
+                "{name} ({code}) disagrees with the keymap's declared type"
+            );
+            checked += 1;
+        }
+        assert_eq!(checked, KEYS.len());
+    }
+
+    /// A key's declaration body, up to its closing brace. The keymap pads some
+    /// names to align its columns, so match the name and not the spacing.
+    fn keymap_body(name: &str) -> Option<&'static str> {
+        let (_, tail) = XKB_KEYMAP.split_once(&format!("key <{name}>"))?;
+        tail.split_once('}').map(|(body, _)| body)
+    }
+
+    /// The keysyms a key declares, in level order.
+    fn keymap_keysyms(name: &str) -> Option<(&'static str, Option<&'static str>)> {
+        let (_, levels) = keymap_body(name)?.split_once('[')?;
+        let (levels, _) = levels.split_once(']')?;
+        let mut parts = levels.split(',').map(str::trim);
+        Some((parts.next()?, parts.next()))
+    }
+
+    /// The first keysym the keymap publishes for an XKB name.
+    fn keymap_symbol(name: &str) -> Option<&'static str> {
+        keymap_keysyms(name).map(|(first, _)| first)
+    }
+
+    /// Every roster name, and the keysym the keymap publishes for that key.
+    /// The roster is matched to the keymap by CODE elsewhere and printable keys
+    /// by their CHARACTERS, but neither reads a roster NAME: a code set is a
+    /// set, so swapping the codes of `up` and `down` leaves it identical, and
+    /// the character scan walks the keymap into `Kind` without ever looking at
+    /// the tuple's name, so swapping the names of `2` and `3` leaves it green
+    /// while `key 2` in the corpus resolves to the physical 3. This table is
+    /// the name pin, and it covers the roster exactly.
+    const KEYSYMS: &[(&str, &str)] = &[
+        ("escape", "Escape"),
+        ("1", "1"),
+        ("2", "2"),
+        ("3", "3"),
+        ("4", "4"),
+        ("5", "5"),
+        ("6", "6"),
+        ("7", "7"),
+        ("8", "8"),
+        ("9", "9"),
+        ("0", "0"),
+        ("minus", "minus"),
+        ("equal", "equal"),
+        ("backspace", "BackSpace"),
+        ("tab", "Tab"),
+        ("q", "q"),
+        ("w", "w"),
+        ("e", "e"),
+        ("r", "r"),
+        ("t", "t"),
+        ("y", "y"),
+        ("u", "u"),
+        ("i", "i"),
+        ("o", "o"),
+        ("p", "p"),
+        ("leftbracket", "bracketleft"),
+        ("rightbracket", "bracketright"),
+        ("enter", "Return"),
+        ("leftcontrol", "Control_L"),
+        ("a", "a"),
+        ("s", "s"),
+        ("d", "d"),
+        ("f", "f"),
+        ("g", "g"),
+        ("h", "h"),
+        ("j", "j"),
+        ("k", "k"),
+        ("l", "l"),
+        ("semicolon", "semicolon"),
+        ("apostrophe", "apostrophe"),
+        ("grave", "grave"),
+        ("leftshift", "Shift_L"),
+        ("backslash", "backslash"),
+        ("z", "z"),
+        ("x", "x"),
+        ("c", "c"),
+        ("v", "v"),
+        ("b", "b"),
+        ("n", "n"),
+        ("m", "m"),
+        ("comma", "comma"),
+        ("period", "period"),
+        ("slash", "slash"),
+        ("rightshift", "Shift_R"),
+        ("kpasterisk", "KP_Multiply"),
+        ("leftalt", "Alt_L"),
+        ("space", "space"),
+        ("capslock", "Caps_Lock"),
+        ("f1", "F1"),
+        ("f2", "F2"),
+        ("f3", "F3"),
+        ("f4", "F4"),
+        ("f5", "F5"),
+        ("f6", "F6"),
+        ("f7", "F7"),
+        ("f8", "F8"),
+        ("f9", "F9"),
+        ("f10", "F10"),
+        ("numlock", "Num_Lock"),
+        ("scrolllock", "Scroll_Lock"),
+        ("kp7", "KP_7"),
+        ("kp8", "KP_8"),
+        ("kp9", "KP_9"),
+        ("kpminus", "KP_Subtract"),
+        ("kp4", "KP_4"),
+        ("kp5", "KP_5"),
+        ("kp6", "KP_6"),
+        ("kpplus", "KP_Add"),
+        ("kp1", "KP_1"),
+        ("kp2", "KP_2"),
+        ("kp3", "KP_3"),
+        ("kp0", "KP_0"),
+        ("kpperiod", "KP_Decimal"),
+        ("less", "less"),
+        ("f11", "F11"),
+        ("f12", "F12"),
+        ("kpenter", "KP_Enter"),
+        ("rightcontrol", "Control_R"),
+        ("kpslash", "KP_Divide"),
+        ("print", "Print"),
+        ("rightalt", "Alt_R"),
+        ("home", "Home"),
+        ("up", "Up"),
+        ("pageup", "Prior"),
+        ("left", "Left"),
+        ("right", "Right"),
+        ("end", "End"),
+        ("down", "Down"),
+        ("pagedown", "Next"),
+        ("insert", "Insert"),
+        ("delete", "Delete"),
+        ("mute", "XF86AudioMute"),
+        ("volumedown", "XF86AudioLowerVolume"),
+        ("volumeup", "XF86AudioRaiseVolume"),
+        ("power", "XF86PowerOff"),
+        ("kpequal", "KP_Equal"),
+        ("pause", "Pause"),
+        ("leftmeta", "Super_L"),
+        ("rightmeta", "Super_R"),
+        ("menu", "Menu"),
+    ];
+
+    #[test]
+    fn every_name_is_pinned_to_the_key_the_keymap_publishes() {
+        let codes = keymap_codes();
+        for (ours, keysym) in KEYSYMS {
+            let published = codes
+                .iter()
+                .filter(|(name, _)| keymap_symbol(name) == Some(*keysym))
+                .map(|(_, code)| *code)
+                .collect::<Vec<_>>();
+            assert_eq!(published.len(), 1, "{keysym} is not one keymap key");
+            let table = KEYS
+                .iter()
+                .filter(|(name, _, _)| name == ours)
+                .map(|(_, code, _)| *code)
+                .collect::<Vec<_>>();
+            assert_eq!(table, published, "{ours} is not the keymap's {keysym}");
+        }
+
+        // The pin covers the roster exactly: every key has one, and it names no
+        // key the roster does not have. A key added later must appear here.
+        let pinned: BTreeSet<&str> = KEYSYMS.iter().map(|(ours, _)| *ours).collect();
+        let roster: BTreeSet<&str> = KEYS.iter().map(|(name, _, _)| *name).collect();
+        assert_eq!(pinned, roster, "the pin and the roster name different keys");
+        assert_eq!(KEYSYMS.len(), pinned.len(), "a name is pinned twice");
+        assert_eq!(KEYS.len(), roster.len(), "a roster name is used twice");
     }
 
     /// `with_alt` returns `None` on overflow, which reads exactly like a

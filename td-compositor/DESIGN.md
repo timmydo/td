@@ -920,6 +920,19 @@ directions, and the keys it marks repeatable are exactly that keymap's
 `repeat=no` exclusions inverted, so a client using the published keymap and
 td-term cannot disagree about which keys autorepeat.
 
+Those are checks on codes and characters, and neither reads a roster name. A
+code set is a set, so two entries that trade codes leave it identical; the
+character check walks the keymap into a spelling without consulting the name
+that selects it, so two entries that trade names leave it identical too — and
+then a corpus chord names one physical key and reaches another. Every roster
+name is therefore pinned to the keysym the keymap publishes for its key, and
+that pin covers the roster exactly in both directions, so a key added later
+cannot arrive unpinned. It is also the keypad's only per-key identity check,
+since the character check excludes `KP_7`-style symbols on purpose. Caps Lock behaviour is read
+from the keymap's declared `type="ALPHABETIC"` rather than inferred from a
+key's symbols looking like a letter pair, because retyping a key changes what
+Caps does for every xkbcommon client while its symbols stay as they were.
+
 Backspace emits DEL (`0x7f`) to match the
 slave's Linux-default canonical `VERASE`; Alt prefixes that byte with ESC. The
 compositor suppresses evdev repeat and publishes a repeat rate of 25 Hz with a
