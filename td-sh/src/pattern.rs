@@ -17,6 +17,10 @@ pub enum Unit {
         negated: bool,
         items: Vec<ClassItem>,
     },
+    /// A trailing unquoted `\`, which has nothing to escape. glibc's `fnmatch`
+    /// refuses such a pattern outright, so this matches no character and, by
+    /// never being consumed, leaves the whole pattern unmatchable.
+    Never,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -27,23 +31,82 @@ pub enum ClassItem {
     Named(String),
 }
 
+/// ash hands `fnmatch` a pattern in which QUOTING IS ITSELF a backslash escape
+/// (its `preglob`), then lets `fnmatch` read every backslash the same way. So a
+/// quoted `*` arrives as `\*` and an unquoted backslash before it escapes THAT
+/// backslash, leaving the `*` a wildcard. Flattening the same way is the only
+/// shape that gets this right: looking at one `QChar` at a time cannot tell
+/// `\` + quoted `*` (literal backslash, then wildcard) from an unquoted `\*`
+/// (literal asterisk), and ash distinguishes them.
+pub fn preglob(pat: &[QChar]) -> Vec<char> {
+    let mut out = Vec::with_capacity(pat.len() * 2);
+    for q in pat {
+        if q.quoted {
+            out.push('\\');
+        }
+        out.push(q.c);
+    }
+    out
+}
+
 /// True when the pattern can match something other than itself — the cheap test
-/// that decides whether a field needs pathname expansion at all.
+/// that decides whether a field needs pathname expansion at all. A backslash
+/// escapes what follows, so `a\*b` has NO metacharacter and is left alone rather
+/// than globbed; ash reaches the same answer the same way.
 pub fn has_meta(pat: &[QChar]) -> bool {
-    pat.iter()
-        .any(|q| !q.quoted && matches!(q.c, '*' | '?' | '['))
+    has_meta_chars(&preglob(pat))
+}
+
+/// `has_meta` on an already-flattened pattern, for callers that split the
+/// `preglob` stream themselves -- pathname expansion, whose components are cut
+/// out of it.
+pub fn has_meta_chars(chars: &[char]) -> bool {
+    let mut i = 0usize;
+    while let Some(&c) = chars.get(i) {
+        if c == '\\' {
+            i += 2;
+            continue;
+        }
+        if matches!(c, '*' | '?') {
+            return true;
+        }
+        // An UNCLOSED `[` is not a metacharacter -- ash's `hasmeta` asks
+        // `strchr(p + 1, ']')` and keeps scanning when there is none
+        // (ash.c:7760), so `my[file*` globs on the `*` alone and `[\/` is not a
+        // pattern at all. Answering yes here would glob a word ash leaves whole,
+        // which is only visible once globbing also spends the escapes.
+        if c == '[' && chars.get(i + 1..).is_some_and(|r| r.contains(&']')) {
+            return true;
+        }
+        i += 1;
+    }
+    false
 }
 
 pub fn compile(pat: &[QChar]) -> Vec<Unit> {
+    compile_chars(&preglob(pat))
+}
+
+/// `compile` on an already-flattened pattern. See `has_meta_chars`.
+pub fn compile_chars(chars: &[char]) -> Vec<Unit> {
     let mut units = Vec::new();
     let mut i = 0usize;
-    while let Some(q) = pat.get(i) {
-        if q.quoted {
-            units.push(Unit::Lit(q.c));
-            i += 1;
-            continue;
-        }
-        match q.c {
+    while let Some(&c) = chars.get(i) {
+        match c {
+            // ash's matcher is `fnmatch(pattern, string, 0)`, so a backslash
+            // escapes the next character: `\f` is the letter f, `\*` a literal
+            // asterisk. Quoted characters carry their own backslash from
+            // `preglob`, which is what keeps them literal here.
+            '\\' => match chars.get(i + 1) {
+                Some(&n) => {
+                    units.push(Unit::Lit(n));
+                    i += 2;
+                }
+                None => {
+                    units.push(Unit::Never);
+                    i += 1;
+                }
+            },
             '*' => {
                 // Collapse `**` so backtracking stays linear in the pattern.
                 if !matches!(units.last(), Some(Unit::Star)) {
@@ -55,7 +118,7 @@ pub fn compile(pat: &[QChar]) -> Vec<Unit> {
                 units.push(Unit::Any);
                 i += 1;
             }
-            '[' => match compile_class(pat, i) {
+            '[' => match compile_class(chars, i) {
                 Some((unit, next)) => {
                     units.push(unit);
                     i = next;
@@ -66,7 +129,7 @@ pub fn compile(pat: &[QChar]) -> Vec<Unit> {
                     i += 1;
                 }
             },
-            c => {
+            _ => {
                 units.push(Unit::Lit(c));
                 i += 1;
             }
@@ -75,59 +138,90 @@ pub fn compile(pat: &[QChar]) -> Vec<Unit> {
     units
 }
 
+/// A flattened pattern read as plain TEXT: every backslash escapes the next
+/// character and is dropped. ash's `expmeta` does this to the literal path
+/// components around the wildcard before `opendir`ing them (ash.c:7873), which
+/// is why `d\ir/*` lists `dir/`. A TRAILING backslash has nothing to escape and
+/// stays, as ash's `*p == '\\' && p[1]` guard leaves it.
+pub fn unescape(chars: &[char]) -> String {
+    let mut out = String::with_capacity(chars.len());
+    let mut i = 0usize;
+    while let Some(&c) = chars.get(i) {
+        match (c, chars.get(i + 1)) {
+            ('\\', Some(&n)) => {
+                out.push(n);
+                i += 2;
+            }
+            _ => {
+                out.push(c);
+                i += 1;
+            }
+        }
+    }
+    out
+}
+
 /// Parse a bracket expression starting at `start` (which holds `[`). Returns the
 /// unit and the index just past the closing `]`.
-fn compile_class(pat: &[QChar], start: usize) -> Option<(Unit, usize)> {
+fn compile_class(chars: &[char], start: usize) -> Option<(Unit, usize)> {
     let mut i = start + 1;
     let mut negated = false;
-    if matches!(pat.get(i), Some(q) if !q.quoted && (q.c == '!' || q.c == '^')) {
+    if matches!(chars.get(i), Some('!') | Some('^')) {
         negated = true;
         i += 1;
     }
     let mut items: Vec<ClassItem> = Vec::new();
     // A `]` in the first position is a literal member, not the terminator.
-    if matches!(pat.get(i), Some(q) if q.c == ']') {
+    if matches!(chars.get(i), Some(']')) {
         items.push(ClassItem::Ch(']'));
         i += 1;
     }
     loop {
-        let q = pat.get(i)?;
-        if !q.quoted && q.c == ']' {
+        let &c = chars.get(i)?;
+        if c == ']' {
             if items.is_empty() {
                 return None;
             }
             return Some((Unit::Class { negated, items }, i + 1));
         }
         // `[:alpha:]`
-        if !q.quoted && q.c == '[' && matches!(pat.get(i + 1), Some(n) if !n.quoted && n.c == ':') {
+        if c == '[' && matches!(chars.get(i + 1), Some(':')) {
             let mut name = String::new();
             let mut j = i + 2;
             loop {
-                let c = pat.get(j)?;
-                if c.c == ':' && matches!(pat.get(j + 1), Some(e) if e.c == ']') {
+                let &n = chars.get(j)?;
+                if n == ':' && matches!(chars.get(j + 1), Some(']')) {
                     break;
                 }
-                name.push(c.c);
+                name.push(n);
                 j += 1;
             }
             items.push(ClassItem::Named(name));
             i = j + 2;
             continue;
         }
-        let lo = q.c;
-        let dash = pat.get(i + 1);
-        let hi = pat.get(i + 2);
-        if matches!(dash, Some(d) if !d.quoted && d.c == '-')
-            && matches!(hi, Some(h) if !(h.c == ']' && !h.quoted))
-        {
-            if let Some(h) = hi {
-                items.push(ClassItem::Range(lo, h.c));
-                i += 3;
-                continue;
-            }
+        // A member may be escaped, and so may a range's endpoints -- BOTH of
+        // them: `[a-\z]` is the range a..z, not `a..\` with a stray `z` beside
+        // it. The high endpoint is the one that is easy to miss, because the
+        // low one goes through this same step.
+        let (lo, j) = escaped_at(chars, i)?;
+        if matches!(chars.get(j), Some('-')) && !matches!(chars.get(j + 1), Some(']') | None) {
+            let (hi, k) = escaped_at(chars, j + 1)?;
+            items.push(ClassItem::Range(lo, hi));
+            i = k;
+            continue;
         }
         items.push(ClassItem::Ch(lo));
-        i += 1;
+        i = j;
+    }
+}
+
+/// The character at `i`, honouring a backslash escape, and the index just past
+/// what it consumed. `None` when a trailing backslash leaves nothing to escape.
+fn escaped_at(chars: &[char], i: usize) -> Option<(char, usize)> {
+    match chars.get(i)? {
+        '\\' => Some((*chars.get(i + 1)?, i + 2)),
+        &c => Some((c, i + 1)),
     }
 }
 
@@ -155,6 +249,7 @@ fn unit_matches(unit: &Unit, c: char) -> bool {
         Unit::Any => true,
         // Handled by the caller; a `*` never consumes exactly one character.
         Unit::Star => false,
+        Unit::Never => false,
         Unit::Class { negated, items } => {
             let hit = items.iter().any(|item| match item {
                 ClassItem::Ch(x) => *x == c,
@@ -320,6 +415,126 @@ mod tests {
 
     fn pat(s: &str) -> Vec<Unit> {
         compile(&QChar::literal_str(s))
+    }
+
+    /// An UNCLOSED `[` is not a metacharacter. ash keeps scanning past it for a
+    /// real one, so `my[file*` globs on the `*` while `[\` is not a pattern at
+    /// all -- and a word that is not a pattern keeps its backslashes, which is
+    /// what makes the difference observable.
+    #[test]
+    fn an_unclosed_bracket_is_not_a_metacharacter() {
+        let m = |s: &str| has_meta_chars(&s.chars().collect::<Vec<_>>());
+        assert!(!m("[abc"));
+        assert!(!m("["));
+        assert!(!m("a[b"));
+        assert!(!m("[\\"));
+        // A `]` later in the SAME slice closes it, wherever it sits.
+        assert!(m("[abc]"));
+        assert!(m("a[b]c"));
+        assert!(m("[]"));
+        // ...and another metacharacter still counts even when the bracket does
+        // not, which is the half a plain "no `]`, no glob" rule gets wrong.
+        assert!(m("my[file*"));
+        assert!(m("[abc?"));
+        // An escaped `]` does not close it for this test -- ash asks a plain
+        // `strchr`, which cannot see the escape.
+        assert!(m("[a\\]"));
+    }
+
+    /// The literal path components around a wildcard are spent as TEXT, not
+    /// matched, so their escapes come off here.
+    #[test]
+    fn unescape_spends_the_escape_and_keeps_a_trailing_backslash() {
+        let u = |s: &str| unescape(&s.chars().collect::<Vec<_>>());
+        assert_eq!(u("d\\ir"), "dir");
+        assert_eq!(u("\\dir"), "dir");
+        // A doubled backslash is one literal backslash, which is how a directory
+        // actually NAMED `od\dd` is reached.
+        assert_eq!(u("od\\\\dd"), "od\\dd");
+        // Nothing to escape, so ash's `p[1]` guard leaves it in place.
+        assert_eq!(u("dir\\"), "dir\\");
+        assert_eq!(u("\\"), "\\");
+        assert_eq!(u(""), "");
+        // A metacharacter that reached here was escaped, so it is just text.
+        assert_eq!(u("f\\*"), "f*");
+    }
+
+    #[test]
+    fn an_unquoted_backslash_is_the_fnmatch_escape() {
+        // ash matches with `fnmatch(p, s, 0)`, so `\f` is the letter f -- it does
+        // NOT match a literal backslash-f, which is the whole point.
+        assert!(matches(&pat("\\f"), "f"));
+        assert!(!matches(&pat("\\f"), "\\f"));
+        assert!(matches(&pat("\\*"), "*"));
+        assert!(!matches(&pat("\\*"), "a"));
+        assert!(matches(&pat("a\\b"), "ab"));
+        // A TRAILING escape has nothing to escape, and glibc refuses the pattern
+        // rather than matching a backslash: neither `a\` nor `a` matches `a\`.
+        assert!(!matches(&pat("a\\"), "a\\"));
+        assert!(!matches(&pat("a\\"), "a"));
+        assert!(!matches(&pat("\\"), "\\"));
+        // The escape reaches inside a bracket, so the class holds the asterisk
+        // alone -- the backslash beside it is not a member.
+        assert!(matches(&pat("[\\*]"), "*"));
+        assert!(!matches(&pat("[\\*]"), "\\"));
+        // Quoting suppresses it: a quoted backslash is data, which is why the
+        // quoted forms of all of the above already agreed with ash.
+        let quoted: Vec<QChar> = "\\f".chars().map(|c| QChar { c, quoted: true, expanded: true }).collect();
+        assert!(matches(&compile(&quoted), "\\f"));
+        assert!(!matches(&compile(&quoted), "f"));
+    }
+
+    /// Build a pattern from `(char, quoted)` pairs, which is the only way to
+    /// reach the mixed-quoting boundary below.
+    fn mixed(spec: &[(char, bool)]) -> Vec<Unit> {
+        let qs: Vec<QChar> = spec
+            .iter()
+            .map(|&(c, quoted)| QChar { c, quoted, expanded: true })
+            .collect();
+        compile(&qs)
+    }
+
+    #[test]
+    fn an_unquoted_backslash_escapes_the_quoting_of_the_next_character() {
+        // Quoting is ITSELF a backslash in the pattern ash builds, so an
+        // unquoted `\` before a QUOTED `*` escapes that backslash and leaves the
+        // asterisk a WILDCARD -- literal backslash, then match anything.
+        let p = mixed(&[('\\', false), ('*', true)]);
+        assert!(matches(&p, "\\ab"));
+        assert!(matches(&p, "\\*"));
+        assert!(!matches(&p, "*"));
+        // Both unquoted is the other reading of the same two characters, and it
+        // means the opposite: a literal asterisk and nothing else.
+        assert!(!matches(&pat("\\*"), "\\ab"));
+        assert!(matches(&pat("\\*"), "*"));
+        // A quoted backslash inside a class is a member, not an escape.
+        let cls = mixed(&[('[', false), ('\\', true), (']', false)]);
+        assert!(matches(&cls, "\\"));
+    }
+
+    #[test]
+    fn a_bracket_range_escapes_both_of_its_endpoints() {
+        // The HIGH endpoint is the one easily missed: read raw, `[a-\z]` becomes
+        // the empty range a..\ plus a stray `z`, so `m` stops matching and -- the
+        // sharper failure -- `[!a-\z]` starts matching it.
+        assert!(matches(&pat("[a-\\z]"), "m"));
+        assert!(!matches(&pat("[!a-\\z]"), "m"));
+        assert!(matches(&pat("[\\a-\\c]"), "b"));
+        // `-` before the closing bracket is a member, not a range.
+        assert!(matches(&pat("[a\\-z]"), "-"));
+        assert!(!matches(&pat("[a\\-z]"), "b"));
+    }
+
+    #[test]
+    fn has_meta_honours_the_escape() {
+        // `a\*b` has no metacharacter, so the field is left alone instead of
+        // being globbed -- without this the pattern would match a file named
+        // `a*b` and the word would change under pathname expansion.
+        assert!(!has_meta(&QChar::literal_str("a\\*b")));
+        assert!(!has_meta(&QChar::literal_str("\\?")));
+        assert!(has_meta(&QChar::literal_str("a*b")));
+        assert!(has_meta(&QChar::literal_str("\\[a]*")));
+        assert!(!has_meta(&QChar::literal_str("plain")));
     }
 
     #[test]

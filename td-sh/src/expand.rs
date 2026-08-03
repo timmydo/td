@@ -349,8 +349,14 @@ fn expand_param(
 
     if matches!(p.op, Some(ParamOp::Length)) {
         let len = match p.name.as_str() {
-            "@" | "*" => sh.params.len(),
-            _ => lookup(sh, &p.name).unwrap_or_default().chars().count(),
+            // Not the COUNT: ash and dash both give the character length of the
+            // `$*` join, so `set -- a b c` makes `${#@}` 5 rather than 3, and
+            // `IFS=:` makes it 3. `$#` is the count.
+            "@" | "*" => lookup(sh, "*").unwrap_or_default().chars().count(),
+            _ => {
+                nounset_check(sh, &p.name)?;
+                lookup(sh, &p.name).unwrap_or_default().chars().count()
+            }
         };
         push_expanded(&mut cur.chars, &len.to_string(), quoted);
         return Ok(());
@@ -364,9 +370,7 @@ fn expand_param(
 
     let value: Option<String> = match &p.op {
         None => {
-            if raw.is_none() && sh.opts.nounset && !is_always_set(&p.name) {
-                return Err(sh.fatal(&format!("{}: parameter not set", p.name), 2));
-            }
+            nounset_check(sh, &p.name)?;
             raw
         }
         Some(ParamOp::Length) => raw,
@@ -412,16 +416,19 @@ fn expand_param(
             raw
         }
         Some(ParamOp::TrimPrefix { pat, longest }) => {
+            nounset_check(sh, &p.name)?;
             let subject = raw.unwrap_or_default();
             let units = pattern::compile(&expand_pattern(sh, pat)?);
             Some(pattern::strip_prefix(&units, &subject, *longest).unwrap_or(subject))
         }
         Some(ParamOp::TrimSuffix { pat, longest }) => {
+            nounset_check(sh, &p.name)?;
             let subject = raw.unwrap_or_default();
             let units = pattern::compile(&expand_pattern(sh, pat)?);
             Some(pattern::strip_suffix(&units, &subject, *longest).unwrap_or(subject))
         }
         Some(ParamOp::Replace { pat, repl, all }) => {
+            nounset_check(sh, &p.name)?;
             let subject = raw.unwrap_or_default();
             let units = pattern::compile(&expand_pattern(sh, pat)?);
             // The replacement is expanded even when the pattern turns out empty:
@@ -454,9 +461,22 @@ fn push_chars(out: &mut Vec<QChar>, chars: &[QChar], quoted: bool) {
     }
 }
 
+/// `set -u` for the operators that READ the value: a bare `${v}`, `${#v}`, both
+/// trims and patsub. The `-`, `+` and `=` forms SUPPLY a value for an unset
+/// name, which is how a script asks about one without tripping the option; `?`
+/// raises its own error for unset and so needs no help from here. All four
+/// therefore skip this check rather than suppressing a failure.
+fn nounset_check(sh: &Shell, name: &str) -> R<()> {
+    if sh.opts.nounset && !is_always_set(name) && lookup(sh, name).is_none() {
+        return Err(sh.fatal(&format!("{name}: parameter not set"), 2));
+    }
+    Ok(())
+}
+
 /// Parameters that are always set, so `set -u` never fires on them.
 fn is_always_set(name: &str) -> bool {
-    matches!(name, "?" | "#" | "$" | "!" | "-" | "0" | "@" | "*")
+    // `!` is deliberately ABSENT: it is unset until a background job runs.
+    matches!(name, "?" | "#" | "$" | "-" | "0" | "@" | "*")
 }
 
 /// The value of a parameter, or `None` when it is unset.
@@ -465,7 +485,7 @@ pub fn lookup(sh: &Shell, name: &str) -> Option<String> {
         "?" => Some(sh.status.to_string()),
         "#" => Some(sh.params.len().to_string()),
         "$" => Some(std::process::id().to_string()),
-        "!" => Some(sh.last_bg.to_string()),
+        "!" => sh.last_bg.map(|p| p.to_string()),
         "-" => Some(sh.opts.letters(sh.interactive)),
         "0" => Some(sh.arg0.clone()),
         "*" => {
@@ -583,35 +603,77 @@ fn glob_field(sh: &Shell, field: &[QChar]) -> Vec<String> {
     matched
 }
 
-fn glob_walk(sh: &Shell, field: &[QChar]) -> Vec<String> {
-    let absolute = field.first().is_some_and(|q| q.c == '/');
-    let trailing_slash = field.last().is_some_and(|q| q.c == '/');
-    let mut comps: Vec<Vec<QChar>> = Vec::new();
-    let mut cur: Vec<QChar> = Vec::new();
-    for q in field {
-        if q.c == '/' {
-            comps.push(std::mem::take(&mut cur));
-        } else {
-            cur.push(*q);
+/// Split a flattened pattern into path components. A `/` separates whether or
+/// not a backslash precedes it -- ash's `expmeta` scan reaches the slash through
+/// the escape and still treats it as the component boundary -- and that
+/// backslash is dropped, so `dir\/*` walks `dir/` rather than looking for a
+/// directory whose name ends in a backslash.
+fn glob_components(chars: &[char]) -> Vec<Vec<char>> {
+    let mut comps = Vec::new();
+    let mut cur = Vec::new();
+    let mut i = 0usize;
+    while let Some(&c) = chars.get(i) {
+        match (c, chars.get(i + 1)) {
+            ('\\', Some('/')) => {
+                comps.push(std::mem::take(&mut cur));
+                i += 2;
+            }
+            ('\\', Some(&n)) => {
+                cur.push('\\');
+                cur.push(n);
+                i += 2;
+            }
+            ('/', _) => {
+                comps.push(std::mem::take(&mut cur));
+                i += 1;
+            }
+            _ => {
+                cur.push(c);
+                i += 1;
+            }
         }
     }
     comps.push(cur);
+    comps
+}
 
-    let mut results: Vec<String> = vec![if absolute { "/".into() } else { String::new() }];
+fn glob_walk(sh: &Shell, field: &[QChar]) -> Vec<String> {
+    let comps = glob_components(&pattern::preglob(field));
+    // A trailing separator selects directories only. Belt-and-braces on Linux,
+    // where the trailing slash left ON the path below makes the kernel refuse to
+    // stat anything else -- this states the rule locally instead of resting on
+    // that, and on the slash surviving `resolve`.
+    let trailing_slash = comps.len() > 1 && comps.last().is_some_and(Vec::is_empty);
+
+    // The result is built out of the ORIGINAL text, separators included, as
+    // ash's `expmeta` builds `expdir`. Repeated slashes are therefore copied
+    // rather than normalised -- `dir//*` lists `dir//f1` -- and an EMPTY
+    // component is exactly what carries the extra one. A leading empty
+    // component is what roots the walk, so absoluteness needs no flag.
+    let mut results: Vec<String> = vec![String::new()];
     let mut globbed = false;
-    for comp in &comps {
-        if comp.is_empty() {
-            continue;
+    for (i, comp) in comps.iter().enumerate() {
+        if i > 0 {
+            for r in &mut results {
+                r.push('/');
+            }
         }
-        if !pattern::has_meta(comp) {
-            let lit = QChar::text(comp);
-            results = results.iter().map(|base| join_path(base, &lit)).collect();
+        if !pattern::has_meta_chars(comp) {
+            // The literal components are PATHS, not patterns, so their escapes
+            // are spent here rather than handed to the matcher.
+            let lit = pattern::unescape(comp);
+            for r in &mut results {
+                r.push_str(&lit);
+            }
             continue;
         }
         globbed = true;
-        let units = pattern::compile(comp);
-        // A leading `.` is only matched by an explicit literal `.`.
-        let literal_dot = matches!(comp.first(), Some(q) if q.c == '.');
+        let units = pattern::compile_chars(comp);
+        // A leading `.` is only matched by an explicit literal `.`, and ash
+        // steps over ONE leading backslash before asking (ash.c:7957), so `\.f*`
+        // reaches dotfiles exactly as `.f*` does.
+        let dot_at = usize::from(comp.first() == Some(&'\\'));
+        let literal_dot = comp.get(dot_at) == Some(&'.');
         let mut next = Vec::new();
         for base in &results {
             let dir = if base.is_empty() {
@@ -628,7 +690,7 @@ fn glob_walk(sh: &Shell, field: &[QChar]) -> Vec<String> {
                     continue;
                 }
                 if pattern::matches(&units, &name) {
-                    next.push(join_path(base, &name));
+                    next.push(format!("{base}{name}"));
                 }
             }
         }
@@ -637,33 +699,19 @@ fn glob_walk(sh: &Shell, field: &[QChar]) -> Vec<String> {
     if !globbed {
         return Vec::new();
     }
+    // The trailing separator is already on the path, the empty final component
+    // having carried it, so this only decides WHICH results survive.
     results
         .into_iter()
-        .filter_map(|p| {
-            let full = sh.resolve(&p);
+        .filter(|p| {
+            let full = sh.resolve(p);
             if trailing_slash {
-                if full.is_dir() {
-                    Some(format!("{p}/"))
-                } else {
-                    None
-                }
-            } else if full.symlink_metadata().is_ok() {
-                Some(p)
+                full.is_dir()
             } else {
-                None
+                full.symlink_metadata().is_ok()
             }
         })
         .collect()
-}
-
-fn join_path(base: &str, name: &str) -> String {
-    if base.is_empty() {
-        name.to_string()
-    } else if base.ends_with('/') {
-        format!("{base}{name}")
-    } else {
-        format!("{base}/{name}")
-    }
 }
 
 /// Assignment values take tilde expansion after `=` and after every unquoted
@@ -796,6 +844,90 @@ mod tests {
         assert_eq!(sh.get_var("w").as_deref(), Some("SIDE"));
     }
 
+    /// Expand one source word, KEEPING the error -- `fields` swallows it, and
+    /// whether an expansion fails is exactly what these assertions are about.
+    fn try_expand(sh: &mut Shell, src: &str) -> R<Vec<String>> {
+        let toks = crate::lexer::tokenize(src).map_err(|e| sh.fatal(&e, 2))?;
+        let mut out = Vec::new();
+        for t in toks.toks {
+            if let crate::lexer::Tok::Word(w) = t {
+                out.extend(expand_fields(sh, &w)?);
+            }
+        }
+        Ok(out)
+    }
+
+    #[test]
+    fn nounset_reaches_every_operator_that_reads_the_value() {
+        let mut sh = sh_with(&[("set", "x")]);
+        sh.opts.nounset = true;
+        // Reading an unset name is an error however the value is consumed --
+        // bare, its length, either trim, or patsub. Only `${#v}` and the three
+        // pattern operators were missing the check.
+        for src in ["${v}", "${#v}", "${v#x}", "${v%x}", "${v/x/y}", "${v//x/y}"] {
+            assert!(
+                try_expand(&mut sh, src).is_err(),
+                "{src} should be a nounset error"
+            );
+        }
+        // The forms that SUPPLY a value for an unset name suppress it, which is
+        // how a script asks about a name without tripping `set -u`.
+        for src in ["${v-d}", "${v:-d}", "${v+a}", "${v:+a}", "${v=d}"] {
+            assert!(
+                try_expand(&mut sh, src).is_ok(),
+                "{src} should not trip nounset"
+            );
+        }
+        // Set-but-empty is SET: only an unset name errors.
+        let mut sh = sh_with(&[("e", "")]);
+        sh.opts.nounset = true;
+        for src in ["${e}", "${#e}", "${e#x}", "${e/x/y}"] {
+            assert!(try_expand(&mut sh, src).is_ok(), "{src}");
+        }
+        // `$@`/`$*` are always set, even with no positionals.
+        for src in ["${@}", "${*}", "${#@}", "${#*}"] {
+            assert!(try_expand(&mut sh, src).is_ok(), "{src}");
+        }
+        // And their LENGTH is the length of the `$*` join, not the count -- so
+        // asserting only that they do not error would bless a wrong value.
+        let mut sh = sh_with(&[]);
+        sh.params = vec!["a".into(), "b".into(), "c".into()];
+        assert_eq!(fields(&mut sh, "${#@}"), vec!["5"]);
+        assert_eq!(fields(&mut sh, "${#*}"), vec!["5"]);
+        assert_eq!(fields(&mut sh, "$#"), vec!["3"]);
+        let _ = sh.set_var("IFS", ":");
+        assert_eq!(fields(&mut sh, "${#@}"), vec!["5"]);
+        // `$!` is the one special parameter that is genuinely UNSET until a
+        // background job runs, so it errors like any other unset name -- and
+        // expands to nothing without `-u`, where a `0` would name process zero.
+        let mut sh = Shell::new_for_test();
+        assert_eq!(lookup(&sh, "!"), None);
+        sh.opts.nounset = true;
+        for src in ["${!}", "${#!}", "${!#x}", "${!/x/y}"] {
+            assert!(try_expand(&mut sh, src).is_err(), "{src} should trip nounset");
+        }
+        assert!(try_expand(&mut sh, "${!-none}").is_ok());
+        // The check fires BEFORE the pattern and replacement are expanded, so a
+        // side effect in either never happens. The previous landing made patsub
+        // expand its replacement eagerly, which is exactly what would hoist that
+        // work above this check; nothing else in the tree would notice.
+        let mut sh = sh_with(&[]);
+        sh.opts.nounset = true;
+        assert!(try_expand(&mut sh, "${v/${w:=D}/z}").is_err());
+        assert_eq!(lookup(&sh, "w"), None, "the replacement must not have run");
+        assert!(try_expand(&mut sh, "${v#${w:=D}}").is_err());
+        assert_eq!(lookup(&sh, "w"), None, "the pattern must not have run");
+        // With the subject SET both run, which is what makes the above a
+        // statement about ordering rather than about patsub being lazy.
+        let _ = sh.set_var("v", "A");
+        assert!(try_expand(&mut sh, "${v/${w:=D}/z}").is_ok());
+        assert_eq!(lookup(&sh, "w").as_deref(), Some("D"));
+        sh.last_bg = Some(4321);
+        for src in ["${!}", "${#!}"] {
+            assert!(try_expand(&mut sh, src).is_ok(), "{src} after a background job");
+        }
+    }
+
     #[test]
     fn parameter_defaults_and_trims() {
         let mut sh = sh_with(&[("f", "archive.tar.gz"), ("e", "")]);
@@ -827,6 +959,30 @@ mod tests {
         sh.params.clear();
         assert!(fields(&mut sh, "\"$@\"").is_empty());
         assert_eq!(fields(&mut sh, "\"$*\""), vec![""]);
+    }
+
+    /// An escaped slash still SEPARATES -- ash's `expmeta` scan reaches it
+    /// through the escape -- and the backslash it carried is dropped.
+    #[test]
+    fn an_escaped_slash_is_still_a_component_separator() {
+        let split = |s: &str| {
+            super::glob_components(&s.chars().collect::<Vec<_>>())
+                .iter()
+                .map(|c| c.iter().collect::<String>())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(split("dir/*"), vec!["dir", "*"]);
+        assert_eq!(split("dir\\/*"), vec!["dir", "*"]);
+        // The escape is kept on anything that is NOT a slash, because the
+        // matcher still has to read it as an escape.
+        assert_eq!(split("d\\ir/*"), vec!["d\\ir", "*"]);
+        // A doubled backslash is a literal backslash, so the slash after it is
+        // an ordinary separator and the pair survives into the component.
+        assert_eq!(split("dir\\\\/*"), vec!["dir\\\\", "*"]);
+        assert_eq!(split("/a/b"), vec!["", "a", "b"]);
+        assert_eq!(split("a/"), vec!["a", ""]);
+        // A trailing backslash has nothing to pair with and is kept whole.
+        assert_eq!(split("a\\"), vec!["a\\"]);
     }
 
     #[test]

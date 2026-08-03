@@ -115,7 +115,10 @@ pub struct Shell {
     pub params: Vec<String>, // positional parameters $1..
     pub arg0: String,        // $0
     pub status: i32,         // $?
-    pub last_bg: u32,        // $!
+    /// `$!`, which is UNSET until a background job runs -- ash errors on it
+    /// under `set -u` and expands it to nothing otherwise, where a `0` default
+    /// would silently name process zero.
+    pub last_bg: Option<u32>,
     pub opts: Opts,
     /// The PHYSICAL working directory: what a child process is started in and
     /// what a relative path resolves against, so it is kept canonical.
@@ -193,6 +196,71 @@ pub struct Shell {
 /// would SIGABRT — there is no unsafe/stack-probe escape hatch here).
 const MAX_RUN_DEPTH: u32 = 256;
 
+/// A value the kernel publishes as an ordinary file: the whole contents less the
+/// terminating newline when `key` is `None`, else the remainder of the first line
+/// starting with it. This is how `$PPID` and `$HOSTNAME` are answered without
+/// `getppid(2)` or `gethostname(2)` -- a new syscall is an AGENTS.md amendment,
+/// and `/proc` makes one unnecessary.
+///
+/// Two rules the obvious `trim()` gets wrong, both because ash reads these from
+/// a syscall that returns the bytes verbatim. The newline is procfs's framing
+/// and nothing else is: a hostname of `" x "` keeps its spaces. And `None` means
+/// the field could not be READ, where an EMPTY value is a value -- `uname(2)`
+/// cannot fail, so an empty nodename is seeded set-and-empty, and collapsing the
+/// two would leave `HOSTNAME` unset and hand `set -u` back the abort this
+/// seeding exists to remove. The keyed form still trims, because there the
+/// separator is whitespace rather than data.
+fn proc_field(path: &str, key: Option<&str>) -> Option<String> {
+    let text = std::fs::read_to_string(path).ok()?;
+    match key {
+        None => Some(text.strip_suffix('\n').unwrap_or(&text).to_string()),
+        Some(k) => text
+            .lines()
+            .filter_map(|l| l.strip_prefix(k))
+            .map(|v| v.trim().to_string())
+            .next(),
+    }
+}
+
+/// The `SHLVL` an inherited value yields, as `utoa((int)strtol(p, NULL, 10) + 1)`
+/// (ash.c:14543). That is C `atoi`, so the three parts a whole-string parse gets
+/// wrong: a leading numeric PREFIX counts (`4x` is 4), the scan SATURATES rather
+/// than failing (a value past `LONG_MAX` truncates to -1, so the next shell is 0
+/// and not 1), and the sum is printed UNSIGNED (`-3` yields 4294967294).
+fn shlvl_next(inherited: &str) -> u32 {
+    let mut rest = inherited.trim_start_matches([' ', '\t', '\n', '\x0b', '\x0c', '\r']);
+    let neg = match rest.strip_prefix('-') {
+        Some(r) => {
+            rest = r;
+            true
+        }
+        None => {
+            rest = rest.strip_prefix('+').unwrap_or(rest);
+            false
+        }
+    };
+    let mut acc: i64 = 0;
+    for c in rest.chars() {
+        let Some(d) = c.to_digit(10).map(i64::from) else {
+            break;
+        };
+        let step = acc
+            .checked_mul(10)
+            .and_then(|a| if neg { a.checked_sub(d) } else { a.checked_add(d) });
+        acc = match step {
+            Some(v) => v,
+            // strtol clamps and keeps scanning; the remaining digits cannot
+            // move it back off the limit.
+            None if neg => i64::MIN,
+            None => i64::MAX,
+        };
+    }
+    // Truncation to `int` then the unsigned print, in one step: the low 32 bits.
+    u32::try_from(acc.rem_euclid(0x1_0000_0000))
+        .unwrap_or_default()
+        .wrapping_add(1)
+}
+
 /// Whether two paths name the same directory, by device and inode as dash's
 /// startup check does -- a string compare would accept a stale inherited `PWD`
 /// that merely looks plausible.
@@ -237,7 +305,7 @@ impl Shell {
             params: Vec::new(),
             arg0: "td-sh".to_string(),
             status: 0,
-            last_bg: 0,
+            last_bg: None,
             opts: Opts::default(),
             logical_cwd: cwd.clone(),
             cwd,
@@ -284,9 +352,36 @@ impl Shell {
         sh.export_var("PWD");
         // POSIX: OPTIND is 1 at shell start, overriding any imported value.
         let _ = sh.set_var("OPTIND", "1");
-        if sh.get_var("PPID").is_none() {
-            // Best-effort; std has no getppid, so leave it to the environment.
+        // The names ash seeds itself when the environment carries none. Each is
+        // an ORDINARY variable a script may reassign -- only PWD and SHLVL are
+        // exported -- but a shell that leaves them unset makes `set -u` fatal on
+        // idioms like `${HOSTNAME%%.*}` that work everywhere else.
+        if sh.get_var("PATH").is_none() {
+            let _ = sh.set_var("PATH", "/sbin:/usr/sbin:/bin:/usr/bin");
         }
+        if sh.get_var("PS1").is_none() {
+            let _ = sh.set_var("PS1", "\\w \\$ ");
+        }
+        if sh.get_var("PS2").is_none() {
+            let _ = sh.set_var("PS2", "> ");
+        }
+        if sh.get_var("HOSTNAME").is_none() {
+            if let Some(h) = proc_field("/proc/sys/kernel/hostname", None) {
+                let _ = sh.set_var("HOSTNAME", &h);
+            }
+        }
+        // PPID is the one name the environment does NOT get to supply: ash sets
+        // it unguarded (ash.c:14540), so a stale exported value from the parent
+        // is replaced rather than believed.
+        if let Some(v) = proc_field("/proc/self/status", Some("PPid:")) {
+            let _ = sh.set_var("PPID", &v);
+        }
+        // SHLVL counts nested shells. Exported, so the count reaches the child
+        // that increments it next; an absent value reads as ash's `atoi(NULL
+        // ? ...: 0)`, which is the same 0 an unparsable one gives.
+        let depth = shlvl_next(sh.get_var("SHLVL").as_deref().unwrap_or(""));
+        let _ = sh.set_var("SHLVL", &depth.to_string());
+        sh.export_var("SHLVL");
         sh
     }
 
@@ -299,7 +394,7 @@ impl Shell {
             params: Vec::new(),
             arg0: "td-sh".to_string(),
             status: 0,
-            last_bg: 0,
+            last_bg: None,
             opts: Opts::default(),
             logical_cwd: std::env::current_dir()
                 .unwrap_or_else(|_| PathBuf::from("/")),
@@ -632,7 +727,7 @@ pub fn run_list(sh: &mut Shell, list: &List) -> R<()> {
                 Err(_) => child.status,
             };
             let _ = run_exit_trap(&mut child, status);
-            sh.last_bg = std::process::id();
+            sh.last_bg = Some(std::process::id());
             sh.set_status(0);
         } else {
             run_and_or(sh, and_or)?;
@@ -1422,6 +1517,96 @@ pub fn write_stderr(sh: &Shell, msg: &str) -> std::io::Result<()> {
 mod tests {
     fn run(src: &str) -> (i32, String, String) {
         crate::process::run_capturing(src)
+    }
+
+    /// The two rules a `trim()` would break. An EMPTY field is a value, not a
+    /// failure to read one -- ash's `uname(2)` cannot fail, so a host with no
+    /// hostname gets `HOSTNAME` set-and-empty, and collapsing empty into `None`
+    /// would leave it UNSET and hand `set -u` back the abort this seeding
+    /// removes. And only the terminating newline is procfs framing, so a
+    /// hostname's own spaces survive. Driven through files rather than a UTS
+    /// namespace so both are pinned without depending on the host's hostname.
+    #[test]
+    fn a_proc_field_distinguishes_empty_from_unreadable() {
+        let dir = std::env::temp_dir().join(format!("td-sh-procfield-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let write = |name: &str, body: &str| {
+            let p = dir.join(name);
+            std::fs::write(&p, body).unwrap();
+            p.to_string_lossy().into_owned()
+        };
+        let field = |p: &str, k: Option<&str>| super::proc_field(p, k);
+
+        assert_eq!(field(&write("full", "t5700g\n"), None).as_deref(), Some("t5700g"));
+        assert_eq!(field(&write("empty", ""), None).as_deref(), Some(""));
+        assert_eq!(field(&write("blank", "\n"), None).as_deref(), Some(""));
+        // Only the terminating newline is framing. A hostname may hold spaces,
+        // and ash's `uname(2)` hands them over verbatim, so `trim()` would
+        // silently rename the host.
+        assert_eq!(field(&write("spaced", " x \n"), None).as_deref(), Some(" x "));
+        assert_eq!(field(&write("inner", "a b\n"), None).as_deref(), Some("a b"));
+        // Exactly one newline: a value that really ends in one keeps the rest.
+        assert_eq!(field(&write("two", "x\n\n"), None).as_deref(), Some("x\n"));
+        assert_eq!(field(&write("nonl", "x"), None).as_deref(), Some("x"));
+        assert_eq!(field(&dir.join("absent").to_string_lossy(), None), None);
+        // A directory is readable-but-not-a-file; it must not look like a value.
+        assert_eq!(field(&dir.to_string_lossy(), None), None);
+
+        let status = write("status", "Name:\tsh\nPid:\t9\nPPid:\t7\nTracerPid:\t0\n");
+        assert_eq!(field(&status, Some("PPid:")).as_deref(), Some("7"));
+        // `Pid:` and `TracerPid:` must not be mistaken for it in either
+        // direction -- the first is a prefix-of-a-prefix, the second contains it.
+        assert_eq!(field(&status, Some("Pid:")).as_deref(), Some("9"));
+        assert_eq!(field(&status, Some("Nope:")), None);
+        // Key present, remainder empty: still READ, so the caller seeds what the
+        // kernel published rather than second-guessing it.
+        assert_eq!(
+            field(&write("nopid", "PPid:\t\n"), Some("PPid:")).as_deref(),
+            Some("")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ash's counter is `atoi` into an `int` printed UNSIGNED, and each of those
+    /// three is a place a whole-string `parse()` silently disagrees. The
+    /// spawned test covers the same rules end to end; these pin the arithmetic
+    /// where a wrong answer is a number rather than a failure.
+    #[test]
+    fn shlvl_follows_atoi_into_an_unsigned_32_bit_counter() {
+        for (inherited, want) in [
+            ("", 1),
+            ("0", 1),
+            ("4", 5),
+            ("007", 8),
+            ("+7", 8),
+            ("zz", 1),
+            ("0x10", 1),
+            // A numeric prefix counts, and the scan stops at the first
+            // non-digit instead of rejecting the value.
+            ("4x", 5),
+            ("1e2", 2),
+            ("123abc456", 124),
+            // strtol's leading-blank set is the C locale's, which is NARROWER
+            // than Unicode's -- `trim_start()` would skip the NBSP and count
+            // the 4 that ash never reaches.
+            (" \t\n\x0b\x0c\r4", 5),
+            ("\u{a0}4", 1),
+            ("\u{2003}4", 1),
+            // Negative values wrap, because the sum is printed unsigned.
+            ("-1", 0),
+            ("-3", 4_294_967_294),
+            ("4294967295", 0),
+            ("4294967296", 1),
+            // Past LONG_MAX the scan saturates rather than failing, and the low
+            // 32 bits of LONG_MAX are -1 -- so this is 0, where a failed parse
+            // would give 1. LONG_MIN's low 32 bits are 0, so that one IS 1.
+            ("99999999999999999999", 0),
+            ("9223372036854775807", 0),
+            ("-99999999999999999999", 1),
+            ("-9223372036854775808", 1),
+        ] {
+            assert_eq!(super::shlvl_next(inherited), want, "SHLVL={inherited:?}");
+        }
     }
 
     #[test]

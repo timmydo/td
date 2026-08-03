@@ -498,6 +498,9 @@ fn the_export_listing_is_eval_safe() -> Result<(), Box<dyn std::error::Error>> {
             // whole entry is a bare `export`; a non-ASCII first byte is the same.
             "export ",
             "export PATH='/usr/bin'",
+            // Seeded by the shell itself, and exported -- so this listing is
+            // now byte-for-byte ash's, which it was not while SHLVL was absent.
+            "export SHLVL='1'",
             "export TD_SH_A='1'",
             // A quote closes the run and re-opens it around a `"`-quoted one.
             "export TD_SH_Q='it'\"'\"'s'",
@@ -515,6 +518,93 @@ fn the_export_listing_is_eval_safe() -> Result<(), Box<dyn std::error::Error>> {
     // point of `endofname` is that the text parses at all.
     let round_trip = run("eval \"$(export -p)\"; echo \"[$TD_SH_Q]\"")?;
     assert!(round_trip.ends_with("[it's]\n"), "{round_trip}");
+    Ok(())
+}
+
+/// The names ash seeds when the environment carries none. They are ordinary
+/// variables a script can reassign; their ABSENCE is what made `set -u` fatal on
+/// idioms like `${HOSTNAME%%.*}` that work in every other shell. Spawned rather
+/// than run in-process, because the seeding happens in `Shell::new` and the
+/// in-process harness deliberately builds a barer shell.
+#[test]
+fn the_shell_seeds_the_names_ash_seeds() -> Result<(), Box<dyn std::error::Error>> {
+    let shell = PathBuf::from(env!("CARGO_BIN_EXE_td-sh"));
+    let run = |src: &str, env: &[(&str, &str)]| -> Result<String, Box<dyn std::error::Error>> {
+        let mut cmd = std::process::Command::new(&shell);
+        cmd.arg("-c").arg(src).env_clear();
+        for (k, v) in env {
+            cmd.env(k, v);
+        }
+        let out = cmd.output()?;
+        // A spurious diagnostic or a non-zero exit would otherwise pass unseen.
+        assert_eq!(String::from_utf8_lossy(&out.stderr), "", "{src}");
+        assert_eq!(out.status.code(), Some(0), "{src}");
+        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    };
+    assert_eq!(
+        run("echo \"[$PATH][$PS1][$PS2][$PS4]\"", &[])?,
+        "[/sbin:/usr/sbin:/bin:/usr/bin][\\w \\$ ][> ][+ ]\n"
+    );
+    // `/proc` answers these two, so neither needs `getppid(2)` nor
+    // `gethostname(2)` -- a new syscall would be an AGENTS.md amendment. Pinned
+    // to the EXACT values: "some digits" would pass for any wrong pid, and
+    // "non-empty" for any wrong host.
+    assert_eq!(
+        run("echo $PPID", &[])?,
+        format!("{}\n", std::process::id()),
+        "PPID must name this test process"
+    );
+    // Compared against the kernel's bytes less its terminating newline, not a
+    // trim: the newline is procfs framing and any other space is the hostname.
+    let kernel = std::fs::read_to_string("/proc/sys/kernel/hostname")?;
+    let kernel = kernel.strip_suffix('\n').unwrap_or(&kernel);
+    assert_eq!(run("echo \"$HOSTNAME\"", &[])?, format!("{kernel}\n"));
+    // An inherited value wins over the default, so these are defaults and not
+    // constants the shell imposes.
+    assert_eq!(run("echo \"$PS2\"", &[("PS2", "%")])?, "%\n");
+    assert_eq!(run("echo \"$HOSTNAME\"", &[("HOSTNAME", "given")])?, "given\n");
+    assert_eq!(run("echo \"$PATH\"", &[("PATH", "/given")])?, "/given\n");
+    // PPID is the exception: ash sets it UNGUARDED (ash.c:14540), so a stale
+    // exported value from a parent is replaced rather than believed. Asserting
+    // "inherited wins" for the whole group would have blessed the opposite.
+    assert_eq!(
+        run("echo $PPID", &[("PPID", "999")])?,
+        format!("{}\n", std::process::id()),
+        "an inherited PPID must lose"
+    );
+    // ...and the import's export flag survives that overwrite, as ash's does.
+    assert!(run("export -p", &[("PPID", "999")])?
+        .lines()
+        .any(|l| l == format!("export PPID='{}'", std::process::id())));
+    // SHLVL counts nested shells in an UNSIGNED 32-BIT counter, which only shows
+    // at the edges: saturating, or staying signed, differs on the last two.
+    // `None` is "absent"; `Some("")` is set-and-empty. ash reaches 1 by two
+    // different routes (`p ? atoi(p) : 0` against `atoi("")`), so both are pinned.
+    for (env, want) in [
+        (None, "1"),
+        (Some(""), "1"),
+        (Some("4"), "5"),
+        (Some("zz"), "1"),
+        (Some(" 4"), "5"),
+        (Some("0"), "1"),
+        (Some("-1"), "0"),
+        (Some("-3"), "4294967294"),
+        (Some("4294967295"), "0"),
+        // A leading numeric PREFIX counts; the scan stops at the first
+        // non-digit rather than rejecting the whole value.
+        (Some("4x"), "5"),
+        (Some("1e2"), "2"),
+        // Past LONG_MAX the scan saturates, and the low 32 bits of that are
+        // -1 -- so an absurd value yields 0, not 1.
+        (Some("99999999999999999999"), "0"),
+        (Some("-99999999999999999999"), "1"),
+    ] {
+        let got = match env {
+            None => run("echo $SHLVL", &[])?,
+            Some(v) => run("echo $SHLVL", &[("SHLVL", v)])?,
+        };
+        assert_eq!(got, format!("{want}\n"), "SHLVL={env:?}");
+    }
     Ok(())
 }
 
@@ -582,36 +672,148 @@ fn a_non_utf8_environment_entry_does_not_abort_the_shell() -> Result<(), Box<dyn
     Ok(())
 }
 
-/// A throwaway directory holding a COPY of the shell under test, named
-/// `td_sh_probe`. A copy rather than a `#!/bin/sh` script, so no gate needs a host
-/// interpreter to exist at an absolute path.
-struct ProbeDir(PathBuf);
+/// A throwaway directory that removes itself. Exclusive create at 0700, not
+/// `create_dir_all`, and no pre-emptive remove: the name is predictable, so
+/// anything already there must RED the create rather than be adopted.
+struct ScratchDir(PathBuf);
 
-impl ProbeDir {
+impl ScratchDir {
     fn new(tag: &str) -> Result<Self, Box<dyn std::error::Error>> {
-        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
-        // Exclusive create at 0700, not `create_dir_all`, and no pre-emptive
-        // remove: the name is predictable, so anything already there must RED the
-        // create rather than be adopted -- this directory holds a program the gate
-        // then executes. Same argument as `CaseWorkdir` in lib.rs.
+        use std::os::unix::fs::DirBuilderExt as _;
         let base = std::env::temp_dir();
-        let mut dir = None;
         for seq in 0..64u32 {
             let candidate = base.join(format!("td-sh-{tag}-{}-{seq}", std::process::id()));
             match std::fs::DirBuilder::new().mode(0o700).create(&candidate) {
-                Ok(()) => {
-                    dir = Some(candidate);
-                    break;
-                }
+                Ok(()) => return Ok(Self(candidate)),
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
                 Err(e) => return Err(e.into()),
             }
         }
-        let dir = dir.ok_or("no free temp directory name")?;
+        Err("no free temp directory name".into())
+    }
+}
+
+impl Drop for ScratchDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// Pathname expansion spends the escapes in a LITERAL path component, because
+/// those components are paths rather than patterns -- ash's `expmeta` unescapes
+/// them before `opendir` (ash.c:7873). Driven against a real directory, since
+/// the whole question is what gets opened.
+#[test]
+fn globbing_spends_the_escapes_in_a_literal_component() -> Result<(), Box<dyn std::error::Error>> {
+    let scratch = ScratchDir::new("glob")?;
+    let root = &scratch.0;
+    std::fs::create_dir(root.join("dir"))?;
+    std::fs::create_dir(root.join("dir/sub"))?;
+    std::fs::write(root.join("dir/f1"), "")?;
+    std::fs::write(root.join("dir/.hid"), "")?;
+    std::fs::write(root.join("dir/sub/g1"), "")?;
+    // A directory whose name really does contain a backslash, reached only by
+    // DOUBLING it -- the case that separates "drop the escape" from "drop every
+    // backslash".
+    std::fs::create_dir(root.join("od\\dd"))?;
+    std::fs::write(root.join("od\\dd/z1"), "")?;
+    // Kept out of `dir/` so the rows above keep measuring what they name. A
+    // trailing separator asks whether the path RESOLVES to a directory, which a
+    // symlink to one does and a symlink to a file does not.
+    std::fs::create_dir(root.join("lnk"))?;
+    std::fs::create_dir(root.join("lnk/real"))?;
+    std::fs::write(root.join("lnk/plain"), "")?;
+    std::os::unix::fs::symlink("real", root.join("lnk/ldir"))?;
+    std::os::unix::fs::symlink("plain", root.join("lnk/lfile"))?;
+    std::os::unix::fs::symlink("nowhere", root.join("lnk/ldangle"))?;
+
+    let shell = PathBuf::from(env!("CARGO_BIN_EXE_td-sh"));
+    let run = |src: &str| -> Result<String, Box<dyn std::error::Error>> {
+        let out = std::process::Command::new(&shell)
+            .arg("-c")
+            .arg(src)
+            .current_dir(root)
+            .output()?;
+        assert_eq!(String::from_utf8_lossy(&out.stderr), "", "{src}");
+        assert_eq!(out.status.code(), Some(0), "{src}");
+        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    };
+    for (src, want) in [
+        // Before the wildcard...
+        (r#"x='d\ir/*'; echo $x"#, "dir/f1 dir/sub\n"),
+        (r#"x='\dir/*'; echo $x"#, "dir/f1 dir/sub\n"),
+        // ...and after it: `expmeta` recurses and unescapes there too.
+        (r#"x='*/\f1'; echo $x"#, "dir/f1\n"),
+        (r#"x='*/\sub/g1'; echo $x"#, "dir/sub/g1\n"),
+        (r#"x='d\ir/su\b/*'; echo $x"#, "dir/sub/g1\n"),
+        // A doubled backslash is one literal backslash in the path.
+        (r#"x='od\\dd/*'; echo $x"#, "od\\dd/z1\n"),
+        // An escaped slash still SEPARATES; the backslash it carried is dropped.
+        (r#"x='dir\/*'; echo $x"#, "dir/f1 dir/sub\n"),
+        // ash steps over ONE leading backslash before asking about the dot, so
+        // an escaped one still reaches dotfiles.
+        (r#"x='dir/\.h*'; echo $x"#, "dir/.hid\n"),
+        (r#"x='dir/.h*'; echo $x"#, "dir/.hid\n"),
+        // With NO metacharacter anywhere, nothing is globbed and nothing is
+        // unescaped -- the word is used as written. This is the pair that makes
+        // the rule "escapes are spent by globbing", not "escapes are removed".
+        (r#"x='d\ir/\f1'; echo $x"#, "d\\ir/\\f1\n"),
+        (r#"x='dir/f\*'; echo $x"#, "dir/f\\*\n"),
+        // No match, so the field stays exactly as written, escapes included.
+        (r#"x='no\such/*'; echo $x"#, "no\\such/*\n"),
+        // REPEATED separators are copied through, not normalised: the result is
+        // built out of the original text, so an empty component carries its own
+        // slash. Collapsing them would rewrite a path the script wrote.
+        ("echo dir//f*", "dir//f1\n"),
+        ("echo dir///f*", "dir///f1\n"),
+        ("echo dir//sub//*", "dir//sub//g1\n"),
+        ("echo .//dir/f*", ".//dir/f1\n"),
+        // ...but a MATCHED component contributes exactly one, so the slashes
+        // after it are the ones the field wrote and no more.
+        ("echo *//f1", "dir//f1\n"),
+        ("echo d*/f1", "dir/f1\n"),
+        // A trailing separator selects DIRECTORIES only, so the two plain files
+        // are not candidates and a pattern matching only files finds nothing.
+        ("echo dir/*/", "dir/sub/\n"),
+        ("echo dir/f*/", "dir/f*/\n"),
+        // A symlink to a directory RESOLVES to one and is selected; a symlink to
+        // a file, and a dangling one, are not. That is the pair separating "is a
+        // directory" from "is not a symlink".
+        ("echo lnk/*/", "lnk/ldir/ lnk/real/\n"),
+        ("echo lnk/l*/", "lnk/ldir/\n"),
+        ("echo dir//*/", "dir//sub/\n"),
+    ] {
+        assert_eq!(run(src)?, want, "{src}");
+    }
+    // An ESCAPED leading slash still roots the walk. The field's FIRST character
+    // is the backslash, so reading absoluteness off the raw word rather than off
+    // the split components looks below the cwd instead.
+    let abs = root.to_string_lossy();
+    assert_eq!(
+        run(&format!(r"x='\{abs}/dir/f*'; echo $x"))?,
+        format!("{abs}/dir/f1\n")
+    );
+    Ok(())
+}
+
+/// A throwaway directory holding a COPY of the shell under test, named
+/// `td_sh_probe`. A copy rather than a `#!/bin/sh` script, so no gate needs a host
+/// interpreter to exist at an absolute path.
+struct ProbeDir(ScratchDir);
+
+impl ProbeDir {
+    fn new(tag: &str) -> Result<Self, Box<dyn std::error::Error>> {
+        use std::os::unix::fs::PermissionsExt;
+        // The exclusive claim and the cleanup are `ScratchDir`'s; what is added
+        // here is a copy of the shell under test, which the gate then EXECUTES --
+        // so adopting a directory that already existed would be adopting whatever
+        // program was in it.
+        let scratch = ScratchDir::new(tag)?;
+        let dir = &scratch.0;
         let probe = dir.join("td_sh_probe");
         std::fs::copy(PathBuf::from(env!("CARGO_BIN_EXE_td-sh")), &probe)?;
         std::fs::set_permissions(&probe, std::fs::Permissions::from_mode(0o755))?;
-        Ok(Self(dir))
+        Ok(Self(scratch))
     }
 
     fn run(&self, src: &str) -> Result<(i32, String), Box<dyn std::error::Error>> {
@@ -626,12 +828,6 @@ impl ProbeDir {
     }
 }
 
-impl Drop for ProbeDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
-
 /// A prefix assignment is applied to the SHELL for the command's duration, not
 /// merely handed to the child, so `PATH=dir prog` locates `prog` in `dir`. Only a
 /// real child shows it: the builtin route already applied prefixes to shell state,
@@ -640,7 +836,7 @@ impl Drop for ProbeDir {
 fn a_prefix_assignment_reaches_the_external_lookup()
 -> Result<(), Box<dyn std::error::Error>> {
     let probe = ProbeDir::new("prefix")?;
-    let path = probe.0.display();
+    let path = probe.0 .0.display();
     let ran = (0, "RAN\n".to_string());
     assert_eq!(probe.run(&format!("PATH={path} td_sh_probe -c 'echo RAN'"))?, ran);
     // ... and the child sees it too, since it is EXPORTED for that run rather than
@@ -756,7 +952,7 @@ fn a_prefix_assignment_reaches_the_external_lookup()
 fn command_p_moves_the_execution_lookup() -> Result<(), Box<dyn std::error::Error>> {
     let probe = ProbeDir::new("cmd-p")?;
     let run = |src: &str| probe.run(src);
-    let path = probe.0.display();
+    let path = probe.0 .0.display();
     // Without `-p` the probe runs; with it the lookup no longer reads PATH, so it
     // is not there to run -- and the QUERY answers the same way, which is the
     // property that makes `command -pv` honest about `command -p`.

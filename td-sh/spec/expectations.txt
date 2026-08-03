@@ -1180,13 +1180,10 @@ xfail var-op-bash.test.sh::argv array and @P @Q @a
 xfail var-op-bash.test.sh::assoc array and @P @Q @a
 xfail var-op-bash.test.sh::undef and @P @Q @a
 xfail var-op-bash.test.sh::undef vs. empty string in var ops
-xfail var-op-len.test.sh::Length of undefined variable with nounset
 xfail var-op-len.test.sh::Length operator can't be followed by test operator
 xfail var-op-patsub.test.sh::${v//} is empty search and replacement
 xfail var-op-patsub.test.sh::${v/} is empty search and replacement
 xfail var-op-patsub.test.sh::Confusing unquoted slash matches bash (and ash)
-xfail var-op-patsub.test.sh::Pattern replacement on unset variable
-xfail var-op-patsub.test.sh::Replace backslash
 xfail var-op-patsub.test.sh::Substitute glob characters in pattern, quoted and unquoted
 xfail var-op-patsub.test.sh::Substitute one unicode character (UTF-8)
 xfail var-op-patsub.test.sh::Synthesized ${x///} bug (similar to above)
@@ -1248,7 +1245,6 @@ xfail vars-bash.test.sh::$SHELL is set to what is in /etc/passwd
 xfail vars-special.test.sh::$$ looks like a PID
 xfail vars-special.test.sh::$?
 xfail vars-special.test.sh::$HOME is NOT set
-xfail vars-special.test.sh::$HOSTNAME
 xfail vars-special.test.sh::$LINENO for assignment
 xfail vars-special.test.sh::$LINENO in "bare" redirect arg (bug regression)
 xfail vars-special.test.sh::$LINENO in case
