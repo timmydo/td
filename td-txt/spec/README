@@ -360,6 +360,38 @@ td-txt-authored case files
     positions therefore needed their CONSUMER fixed as well as the reader, and
     the shipped `l` case for the wrap (`18446744073709551636`, which is 20)
     could not see it: its value is under 2^32, so it agrees either way.
+    That sentinel selects between TWO things, and the FALLBACK WIDTH is the other
+    one -- refused here until `-l` landed, so "no width argument" could only ever
+    mean 70 and the case pinning it could not tell the rule from the constant.
+    `-l 10 l4294967295` folds at 10 and `-l 0 l4294967295` folds nowhere, which
+    is what makes it a fallback rather than a default. The option is read when
+    `l` RUNS, not when the script compiles, so `sed -e l -l 12` folds at 12
+    though the option came after the part; and `--posix` withdraws the script's
+    width argument without touching it.
+    That fallback has TWO inputs, not one, which a reviewer found by reading
+    GNU's `main` rather than its manual: `COLS` seeds it before any option is
+    scanned, so `-l` overrides `COLS` and `COLS=12 sed -n l4294967295` folds at
+    11. It is not `-l` under another name. GNU takes `COLS - 1` -- one column
+    kept back so a tty does not wrap the line itself -- and only when the value
+    exceeds 1, so `COLS=2` folds at 1 while `COLS=1`, `COLS=0` and `COLS=abc`
+    leave 70 standing. The comparison happens AFTER the `int` lands in the
+    unsigned counter both widths live in, which is the part no reading of the
+    manual gives: `COLS=-1` folds NOWHERE rather than leaving the default, and
+    `COLS=-4294967286` folds at 9, its truncation being a positive 10. The name
+    is `COLS` and not `COLUMNS`, which has its own case.
+    Both inputs are read by a THIRD reader, GNU's `atoi`, and it disagrees with
+    the script's numbers in both directions a number can be read wrong. It cannot
+    fail -- leading whitespace, an optional sign, decimal digits, and the rest
+    of the word ignored -- so `-l abc` is a silent width of 0, which is "never
+    fold"; and it SATURATES where `in_integer` wraps, so `-l 18446744073709551626`
+    never folds while `l18446744073709551626` folds at 10. Same digits, same
+    program, opposite overflow rules, and the pair ships as two cases side by
+    side. The truncation is shared: `-l 4294967306` folds at 10 like the command
+    does, and `-l -4294967286` folds at 10 as well -- a NEGATIVE argument whose
+    low 32 bits are positive, which is the case that would survive reading the
+    sign as "never fold". There is no -1 sentinel on this side, `-l` being what
+    the other one defers to: `-l 4294967295` never folds where `l4294967295`
+    falls back.
     The ARITHMETIC on a number wraps too, not just the parse. `addr,+N` resolves
     its end as `start + N` in that same counter, so `1,+(2^64-1)` ends at line 0.
     Two rules follow, and td-txt had neither. The addition wraps rather than
@@ -1178,14 +1210,6 @@ td-txt-authored case files
     reported as success), which makes it the more serious of the two; predates the
     branch. Surfaced by a reviewer probing `q`'s exit code.
 
-  - `-l N` / `--line-length=N`, GNU's command-line default for `l`'s width, is
-    REFUSED here (`invalid option -- 'l'` / `unrecognized option`, exit 1) where
-    GNU takes it. Fail-CLOSED, predates the branch, and recorded now because it
-    is the other input to the width the `l` rule above fixes: without it, the
-    "no width argument" sentinel can only ever fall back to 70 here, so half of
-    what that sentinel selects between is unreachable. Found by a reviewer
-    sweeping the numeric surface.
-
   - `-f` naming an ENDLESS stream (`/dev/zero`, `/dev/urandom`): GNU parses the
     script as it reads, so it fails on line 1 -- `unknown command: ` on a NUL
     byte -- and exits 1. td-txt reads the whole script into memory BEFORE
@@ -1574,11 +1598,18 @@ td-txt-authored case files
   oracle against a new case and confirm it does NOT match, comparing status,
   stdout AND stderr: for every refusal here the whole divergence is the
   diagnostic, so a check that reads only status and stdout reports agreement.
-  All 32 cases were verified this way when the `-NUM` decision landed -- 30
-  differ, and the other TWO are counts GNU never finishes, so they are not
-  comparable by construction and their divergence is the non-finishing itself.
+  32 cases, of which 30 differ; the other TWO are counts GNU never finishes, so
+  they are not comparable by construction and their divergence is the
+  non-finishing itself. That was also the count when the `-NUM` decision landed,
+  and it is a DIFFERENT 32: `sed -l N` was retired when the option was
+  implemented, which is the one way a case leaves this file -- td-txt stopped
+  diverging -- and the usage line after a missing option argument replaced it.
   Re-run it when adding one: the count in this sentence is part of what it
   asserts, and it was wrong once already between writing it and checking it.
+  What the `-l` landing re-ran was the EIGHT sed cases, against GNU sed 4.9; the
+  grep ones were not re-run, that host having no GNU grep any more (its `grep`
+  is ugrep), which is the same reason a grep golden cannot be captured there
+  today.
 
 
 Overlay

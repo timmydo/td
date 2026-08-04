@@ -8143,3 +8143,977 @@ abcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghij
 ## END
 ## stderr-json: ""
 ## status: 0
+
+# `-l N' / `--line-length=N' -- the WIDTH a bare `l' folds at, GNU's default
+# being 70 (`l wraps at the default width' above is that control). The option was
+# refused here until this landing, which made half of the `l' width rule just
+# above unreachable: a script width truncating to -1 means "no width argument"
+# and defers to THIS number, so without the option it could only defer to 70.
+#
+# The argument is read the way GNU reads it, with C `atoi': leading whitespace,
+# an optional sign, decimal digits, and whatever follows them IGNORED rather than
+# diagnosed. It cannot fail, so a word with no digits is 0 -- the width that
+# never folds -- and `-l abc' is silently "never fold" rather than an error. Two
+# rules the script's own numbers do NOT share, both cased below: the option
+# SATURATES where they wrap, and it has no -1 sentinel, `-l' being what the
+# sentinel defers TO.
+
+#### -l N is the width a bare l folds at
+## argv: sed -n -l 10 l
+## stdin:
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+## END
+## stdout:
+xxxxxxxxx\
+xxxxxxxxx\
+xxxxxxxxx\
+xxxxxxxxx\
+xxxxxxxxx\
+xxxxxxxxx\
+xxxxxxxxx\
+xxxxxxxxx\
+xxxxxxxxx\
+xxxxxxxxx\
+xxxxxxxxx\
+x$
+## END
+## stderr-json: ""
+## status: 0
+
+#### -l 0 never folds
+## argv: sed -n -l 0 l
+## stdin:
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+## END
+## stdout:
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx$
+## END
+## stderr-json: ""
+## status: 0
+
+#### -l 1 folds before every chunk
+## argv: sed -n -l 1 l
+## stdin:
+abcdefghijklmnopqrstuvwxyz
+## END
+## stdout:
+\
+a\
+b\
+c\
+d\
+e\
+f\
+g\
+h\
+i\
+j\
+k\
+l\
+m\
+n\
+o\
+p\
+q\
+r\
+s\
+t\
+u\
+v\
+w\
+x\
+y\
+z$
+## END
+## stderr-json: ""
+## status: 0
+
+#### the argument may be attached
+## argv: sed -n -l10 l
+## stdin:
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+## END
+## stdout:
+xxxxxxxxx\
+xxxxxxxxx\
+xxxxxxxxx\
+xxxxxxxxx\
+xxxxxxxxx\
+xxxxxxxxx\
+xxxxxxxxx\
+xxxxxxxxx\
+xxxxxxxxx\
+xxxxxxxxx\
+xxxxxxxxx\
+x$
+## END
+## stderr-json: ""
+## status: 0
+
+#### or attached to a cluster
+## argv: sed -nl10 l
+## stdin:
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+## END
+## stdout:
+xxxxxxxxx\
+xxxxxxxxx\
+xxxxxxxxx\
+xxxxxxxxx\
+xxxxxxxxx\
+xxxxxxxxx\
+xxxxxxxxx\
+xxxxxxxxx\
+xxxxxxxxx\
+xxxxxxxxx\
+xxxxxxxxx\
+x$
+## END
+## stderr-json: ""
+## status: 0
+
+#### --line-length is its long spelling
+## argv: sed -n --line-length=10 l
+## stdin:
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+## END
+## stdout:
+xxxxxxxxx\
+xxxxxxxxx\
+xxxxxxxxx\
+xxxxxxxxx\
+xxxxxxxxx\
+xxxxxxxxx\
+xxxxxxxxx\
+xxxxxxxxx\
+xxxxxxxxx\
+xxxxxxxxx\
+xxxxxxxxx\
+x$
+## END
+## stderr-json: ""
+## status: 0
+
+#### and takes a separate argument too
+## argv: sed -n --line-length 10 l
+## stdin:
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+## END
+## stdout:
+xxxxxxxxx\
+xxxxxxxxx\
+xxxxxxxxx\
+xxxxxxxxx\
+xxxxxxxxx\
+xxxxxxxxx\
+xxxxxxxxx\
+xxxxxxxxx\
+xxxxxxxxx\
+xxxxxxxxx\
+xxxxxxxxx\
+x$
+## END
+## stderr-json: ""
+## status: 0
+
+#### an unambiguous prefix of it resolves
+## argv: sed -n --line-len=10 l
+## stdin:
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+## END
+## stdout:
+xxxxxxxxx\
+xxxxxxxxx\
+xxxxxxxxx\
+xxxxxxxxx\
+xxxxxxxxx\
+xxxxxxxxx\
+xxxxxxxxx\
+xxxxxxxxx\
+xxxxxxxxx\
+xxxxxxxxx\
+xxxxxxxxx\
+x$
+## END
+## stderr-json: ""
+## status: 0
+
+#### the last -l wins
+## argv: sed -n -l 5 -l 10 l
+## stdin:
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+## END
+## stdout:
+xxxxxxxxx\
+xxxxxxxxx\
+xxxxxxxxx\
+xxxxxxxxx\
+xxxxxxxxx\
+xxxxxxxxx\
+xxxxxxxxx\
+xxxxxxxxx\
+xxxxxxxxx\
+xxxxxxxxx\
+xxxxxxxxx\
+x$
+## END
+## stderr-json: ""
+## status: 0
+
+#### a width the script wrote outranks it
+## argv: sed -n -l 10 'l 5'
+## stdin:
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+## END
+## stdout:
+xxxx\
+xxxx\
+xxxx\
+xxxx\
+xxxx\
+xxxx\
+xxxx\
+xxxx\
+xxxx\
+xxxx\
+xxxx\
+xxxx\
+xxxx\
+xxxx\
+xxxx\
+xxxx\
+xxxx\
+xxxx\
+xxxx\
+xxxx\
+xxxx\
+xxxx\
+xxxx\
+xxxx\
+xxxx$
+## END
+## stderr-json: ""
+## status: 0
+
+#### including a script width of 0
+## argv: sed -n -l 10 'l 0'
+## stdin:
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+## END
+## stdout:
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx$
+## END
+## stderr-json: ""
+## status: 0
+
+#### --posix does not withdraw the OPTION, only the script's width
+## argv: sed -n --posix -l 10 l
+## stdin:
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+## END
+## stdout:
+xxxxxxxxx\
+xxxxxxxxx\
+xxxxxxxxx\
+xxxxxxxxx\
+xxxxxxxxx\
+xxxxxxxxx\
+xxxxxxxxx\
+xxxxxxxxx\
+xxxxxxxxx\
+xxxxxxxxx\
+xxxxxxxxx\
+x$
+## END
+## stderr-json: ""
+## status: 0
+
+#### -l abc is 0, which never folds, and is not diagnosed
+## argv: sed -n -l abc l
+## stdin:
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+## END
+## stdout:
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx$
+## END
+## stderr-json: ""
+## status: 0
+
+#### digits stop at the first byte that is not one
+## argv: sed -n -l 10x l
+## stdin:
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+## END
+## stdout:
+xxxxxxxxx\
+xxxxxxxxx\
+xxxxxxxxx\
+xxxxxxxxx\
+xxxxxxxxx\
+xxxxxxxxx\
+xxxxxxxxx\
+xxxxxxxxx\
+xxxxxxxxx\
+xxxxxxxxx\
+xxxxxxxxx\
+x$
+## END
+## stderr-json: ""
+## status: 0
+
+#### a leading space is skipped
+## argv: sed -n -l ' 10' l
+## stdin:
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+## END
+## stdout:
+xxxxxxxxx\
+xxxxxxxxx\
+xxxxxxxxx\
+xxxxxxxxx\
+xxxxxxxxx\
+xxxxxxxxx\
+xxxxxxxxx\
+xxxxxxxxx\
+xxxxxxxxx\
+xxxxxxxxx\
+xxxxxxxxx\
+x$
+## END
+## stderr-json: ""
+## status: 0
+
+#### the argument is read base 10, so 0x10 is 0
+## argv: sed -n -l 0x10 l
+## stdin:
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+## END
+## stdout:
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx$
+## END
+## stderr-json: ""
+## status: 0
+
+#### and a leading zero is not an octal marker
+## argv: sed -n -l 010 l
+## stdin:
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+## END
+## stdout:
+xxxxxxxxx\
+xxxxxxxxx\
+xxxxxxxxx\
+xxxxxxxxx\
+xxxxxxxxx\
+xxxxxxxxx\
+xxxxxxxxx\
+xxxxxxxxx\
+xxxxxxxxx\
+xxxxxxxxx\
+xxxxxxxxx\
+x$
+## END
+## stderr-json: ""
+## status: 0
+
+#### an EMPTY argument is 0 as well
+## argv: sed -n -l '' l
+## stdin:
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+## END
+## stdout:
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx$
+## END
+## stderr-json: ""
+## status: 0
+
+#### a negative width never folds
+## argv: sed -n -l -5 l
+## stdin:
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+## END
+## stdout:
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx$
+## END
+## stderr-json: ""
+## status: 0
+
+#### the argument truncates to a C int
+## argv: sed -n -l 4294967306 l
+## stdin:
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+## END
+## stdout:
+xxxxxxxxx\
+xxxxxxxxx\
+xxxxxxxxx\
+xxxxxxxxx\
+xxxxxxxxx\
+xxxxxxxxx\
+xxxxxxxxx\
+xxxxxxxxx\
+xxxxxxxxx\
+xxxxxxxxx\
+xxxxxxxxx\
+x$
+## END
+## stderr-json: ""
+## status: 0
+
+#### a truncation that is negative never folds -- a CONTROL
+# This cannot go red for the reason its name gives: the alternative to
+# truncating is a width of about 2.1e9, which no line reaches, so both answers
+# fold nowhere. It reds only when `-l' is ignored outright. `-l 4294967306'
+# above is what holds the truncation to account.
+## argv: sed -n -l 2147483648 l
+## stdin:
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+## END
+## stdout:
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx$
+## END
+## stderr-json: ""
+## status: 0
+
+#### a negative that truncates POSITIVE folds at what it truncates to
+## argv: sed -n -l -4294967286 l
+## stdin:
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+## END
+## stdout:
+xxxxxxxxx\
+xxxxxxxxx\
+xxxxxxxxx\
+xxxxxxxxx\
+xxxxxxxxx\
+xxxxxxxxx\
+xxxxxxxxx\
+xxxxxxxxx\
+xxxxxxxxx\
+xxxxxxxxx\
+xxxxxxxxx\
+x$
+## END
+## stderr-json: ""
+## status: 0
+
+#### the option argument SATURATES where the script's own numbers wrap
+## argv: sed -n -l 18446744073709551626 l
+## stdin:
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+## END
+## stdout:
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx$
+## END
+## stderr-json: ""
+## status: 0
+
+#### -- the same digits, written as the command's width, fold at 10
+## argv: sed -n l18446744073709551626
+## stdin:
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+## END
+## stdout:
+xxxxxxxxx\
+xxxxxxxxx\
+xxxxxxxxx\
+xxxxxxxxx\
+xxxxxxxxx\
+xxxxxxxxx\
+xxxxxxxxx\
+xxxxxxxxx\
+xxxxxxxxx\
+xxxxxxxxx\
+xxxxxxxxx\
+x$
+## END
+## stderr-json: ""
+## status: 0
+
+#### a width truncating to -1 is no width, so it folds where -l says
+## argv: sed -n -l 10 l4294967295
+## stdin:
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+## END
+## stdout:
+xxxxxxxxx\
+xxxxxxxxx\
+xxxxxxxxx\
+xxxxxxxxx\
+xxxxxxxxx\
+xxxxxxxxx\
+xxxxxxxxx\
+xxxxxxxxx\
+xxxxxxxxx\
+xxxxxxxxx\
+xxxxxxxxx\
+x$
+## END
+## stderr-json: ""
+## status: 0
+
+#### and with -l 0 that same width folds nowhere
+## argv: sed -n -l 0 l4294967295
+## stdin:
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+## END
+## stdout:
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx$
+## END
+## stderr-json: ""
+## status: 0
+
+#### -l is read when l RUNS, so it reaches a script part before it
+## argv: sed -e l -n -l 10
+## stdin:
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+## END
+## stdout:
+xxxxxxxxx\
+xxxxxxxxx\
+xxxxxxxxx\
+xxxxxxxxx\
+xxxxxxxxx\
+xxxxxxxxx\
+xxxxxxxxx\
+xxxxxxxxx\
+xxxxxxxxx\
+xxxxxxxxx\
+xxxxxxxxx\
+x$
+## END
+## stderr-json: ""
+## status: 0
+
+#### a leading tab is skipped like a space
+## argv: sed -n -l "\t10" l
+## stdin:
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+## END
+## stdout:
+xxxxxxxxx\
+xxxxxxxxx\
+xxxxxxxxx\
+xxxxxxxxx\
+xxxxxxxxx\
+xxxxxxxxx\
+xxxxxxxxx\
+xxxxxxxxx\
+xxxxxxxxx\
+xxxxxxxxx\
+xxxxxxxxx\
+x$
+## END
+## stderr-json: ""
+## status: 0
+
+#### the fold ends with the record separator, so -z folds on a NUL
+## argv: sed -nz -l 4 l
+## stdin-json: "aaaaaaaaaa\u0000"
+## stdout-json: "aaa\\\u0000aaa\\\u0000aaa\\\u0000a$\u0000"
+## stderr-json: ""
+## status: 0
+
+#### -l with no argument is refused
+## argv: sed -l
+## stdin:
+a
+## END
+## stdout-json: ""
+## stderr-contains: sed: option requires an argument -- 'l'
+## status: 1
+
+#### -e with no argument is refused
+## argv: sed -e
+## stdin:
+a
+## END
+## stdout-json: ""
+## stderr-contains: sed: option requires an argument -- 'e'
+## status: 1
+
+#### -f with no argument is refused
+## argv: sed -f
+## stdin:
+a
+## END
+## stdout-json: ""
+## stderr-contains: sed: option requires an argument -- 'f'
+## status: 1
+
+#### --line-length with no argument is refused
+## argv: sed --line-length
+## stdin:
+a
+## END
+## stdout-json: ""
+## stderr-contains: sed: option '--line-length' requires an argument
+## status: 1
+
+#### --expression with no argument is refused
+## argv: sed --expression
+## stdin:
+a
+## END
+## stdout-json: ""
+## stderr-contains: sed: option '--expression' requires an argument
+## status: 1
+
+#### --file with no argument is refused
+## argv: sed --file
+## stdin:
+a
+## END
+## stdout-json: ""
+## stderr-contains: sed: option '--file' requires an argument
+## status: 1
+
+
+# `COLS' is the OTHER input to that fallback width, and it is not `-l' under a
+# different name. GNU takes COLS-1 -- one column kept back so a tty does not wrap
+# the line itself -- and only when the value exceeds 1, so the three ways of
+# writing something that is not greater than 1 all leave the default alone. The
+# comparison happens after the `int' has landed in an UNSIGNED counter, which is
+# why a negative passes it as a huge number and folds nowhere.
+#### COLS is the OTHER input to that width, minus one for the tty
+## argv: sed -n l
+## env COLS: 12
+## stdin:
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+## END
+## stdout:
+xxxxxxxxxx\
+xxxxxxxxxx\
+xxxxxxxxxx\
+xxxxxxxxxx\
+xxxxxxxxxx\
+xxxxxxxxxx\
+xxxxxxxxxx\
+xxxxxxxxxx\
+xxxxxxxxxx\
+xxxxxxxxxx$
+## END
+## stderr-json: ""
+## status: 0
+
+#### and its smallest useful value folds before every chunk
+## argv: sed -n l
+## env COLS: 2
+## stdin:
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+## END
+## stdout:
+\
+x\
+x\
+x\
+x\
+x\
+x\
+x\
+x\
+x\
+x\
+x\
+x\
+x\
+x\
+x\
+x\
+x\
+x\
+x\
+x\
+x\
+x\
+x\
+x\
+x\
+x\
+x\
+x\
+x\
+x\
+x\
+x\
+x\
+x\
+x\
+x\
+x\
+x\
+x\
+x\
+x\
+x\
+x\
+x\
+x\
+x\
+x\
+x\
+x\
+x\
+x\
+x\
+x\
+x\
+x\
+x\
+x\
+x\
+x\
+x\
+x\
+x\
+x\
+x\
+x\
+x\
+x\
+x\
+x\
+x\
+x\
+x\
+x\
+x\
+x\
+x\
+x\
+x\
+x\
+x\
+x\
+x\
+x\
+x\
+x\
+x\
+x\
+x\
+x\
+x\
+x\
+x\
+x\
+x\
+x\
+x\
+x\
+x\
+x\
+x$
+## END
+## stderr-json: ""
+## status: 0
+
+#### COLS 1 is not greater than 1, so the default stands
+## argv: sed -n l
+## env COLS: 1
+## stdin:
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+## END
+## stdout:
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx$
+## END
+## stderr-json: ""
+## status: 0
+
+#### nor is 0 -- a CONTROL beside it
+# COLS=1 above is the case that holds the `> 1' guard to account; this one is
+# its neighbour and reds under none of the rule mutations, only when COLS is
+# ignored or read from another name. It is here because 0 and a word with no
+# digits reach that guard by different routes and both must land on 70.
+## argv: sed -n l
+## env COLS: 0
+## stdin:
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+## END
+## stdout:
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx$
+## END
+## stderr-json: ""
+## status: 0
+
+#### nor a word with no digits in it
+## argv: sed -n l
+## env COLS: abc
+## stdin:
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+## END
+## stdout:
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx$
+## END
+## stderr-json: ""
+## status: 0
+
+#### a NEGATIVE passes that test as a huge count, so nothing folds
+## argv: sed -n l
+## env COLS: -1
+## stdin:
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+## END
+## stdout:
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx$
+## END
+## stderr-json: ""
+## status: 0
+
+#### COLS truncates to a C int like -l does
+## argv: sed -n l
+## env COLS: 4294967307
+## stdin:
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+## END
+## stdout:
+xxxxxxxxx\
+xxxxxxxxx\
+xxxxxxxxx\
+xxxxxxxxx\
+xxxxxxxxx\
+xxxxxxxxx\
+xxxxxxxxx\
+xxxxxxxxx\
+xxxxxxxxx\
+xxxxxxxxx\
+xxxxxxxxx\
+x$
+## END
+## stderr-json: ""
+## status: 0
+
+#### a COLS wider than the line folds it once
+## argv: sed -n l
+## env COLS: 101
+## stdin:
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+## END
+## stdout:
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\
+x$
+## END
+## stderr-json: ""
+## status: 0
+
+#### -l is read after COLS, so it overrides it
+## argv: sed -n -l 30 l
+## env COLS: 12
+## stdin:
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+## END
+## stdout:
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxx\
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxx\
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxx\
+xxxxxxxxxxxxx$
+## END
+## stderr-json: ""
+## status: 0
+
+#### including when what it overrides with never folds
+## argv: sed -n -l abc l
+## env COLS: 12
+## stdin:
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+## END
+## stdout:
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx$
+## END
+## stderr-json: ""
+## status: 0
+
+#### the -1 sentinel defers to the fallback, so it reaches COLS too
+## argv: sed -n l4294967295
+## env COLS: 12
+## stdin:
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+## END
+## stdout:
+xxxxxxxxxx\
+xxxxxxxxxx\
+xxxxxxxxxx\
+xxxxxxxxxx\
+xxxxxxxxxx\
+xxxxxxxxxx\
+xxxxxxxxxx\
+xxxxxxxxxx\
+xxxxxxxxxx\
+xxxxxxxxxx$
+## END
+## stderr-json: ""
+## status: 0
+
+#### a width the script wrote still outranks both
+## argv: sed -n 'l 5'
+## env COLS: 12
+## stdin:
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+## END
+## stdout:
+xxxx\
+xxxx\
+xxxx\
+xxxx\
+xxxx\
+xxxx\
+xxxx\
+xxxx\
+xxxx\
+xxxx\
+xxxx\
+xxxx\
+xxxx\
+xxxx\
+xxxx\
+xxxx\
+xxxx\
+xxxx\
+xxxx\
+xxxx\
+xxxx\
+xxxx\
+xxxx\
+xxxx\
+xxxx$
+## END
+## stderr-json: ""
+## status: 0
+
+#### --posix does not touch COLS either
+## argv: sed -n --posix l
+## env COLS: 12
+## stdin:
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+## END
+## stdout:
+xxxxxxxxxx\
+xxxxxxxxxx\
+xxxxxxxxxx\
+xxxxxxxxxx\
+xxxxxxxxxx\
+xxxxxxxxxx\
+xxxxxxxxxx\
+xxxxxxxxxx\
+xxxxxxxxxx\
+xxxxxxxxxx$
+## END
+## stderr-json: ""
+## status: 0
+
+#### COLUMNS is not the name GNU reads
+## argv: sed -n l
+## env COLUMNS: 12
+## stdin:
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+## END
+## stdout:
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx$
+## END
+## stderr-json: ""
+## status: 0
+

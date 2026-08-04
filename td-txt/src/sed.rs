@@ -20,6 +20,7 @@
 
 use std::collections::BTreeMap;
 use std::io::{Read, Seek, Write};
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
 use crate::regex::{Captures, Options, Regex};
@@ -27,7 +28,12 @@ use crate::util::{
     errmsg, number, posixly_correct, print_line, read_input, records, show, Out, VERSION,
 };
 
-const USAGE: &str = "usage: sed [-nrEsz] [-i[SUFFIX]] [-e SCRIPT] [-f FILE] [SCRIPT] [FILE]...";
+const USAGE: &str =
+    "usage: sed [-nrEsz] [-i[SUFFIX]] [-l N] [-e SCRIPT] [-f FILE] [SCRIPT] [FILE]...";
+
+/// What a bare `l` folds at when NEITHER input to the fallback width said
+/// otherwise — `COLS` seeds it and `-l` overrides it. GNU's own constant.
+const DEFAULT_LINE_WRAP: usize = 70;
 
 // ---- script model --------------------------------------------------------
 
@@ -118,7 +124,9 @@ enum Kind {
     Hold,
     HoldAppend,
     Exchange,
-    List(usize),
+    /// `None` is "no width argument", which defers to `-l`'s value at RUN time —
+    /// GNU reads that global when `l` executes, so `sed -e l -l 12` folds at 12.
+    List(Option<usize>),
     Next,
     NextAppend,
     Print,
@@ -1239,26 +1247,7 @@ fn parse_script(
                     true => None,
                     false => p.parse_number(),
                 };
-                // GNU keeps the width in the same `int` as `q`'s code, so it
-                // TRUNCATES to 32 bits and a result that is not POSITIVE means
-                // "never wrap": `l4294967306` folds at 10 there. `usize::try_from`
-                // never fails on 64-bit, so the whole `u64` used to arrive and
-                // nothing folded.
-                let width = match w.map(|v| u32::try_from(v & 0xffff_ffff).unwrap_or(0)) {
-                    // -1 is the SAME sentinel `q` has, and it means "no width
-                    // argument", not "never wrap": `l4294967295` folds where a
-                    // bare `l` folds. Reading it as non-positive got that wrong.
-                    None | Some(u32::MAX) => 70,
-                    Some(low32) => match i32::try_from(low32) {
-                        Ok(n) => usize::try_from(n).unwrap_or(0),
-                        // Any OTHER negative really is "never wrap". No case can
-                        // red this arm -- the alternative is a width of ~4.3e9,
-                        // which no line reaches -- but the line is being rewritten
-                        // for the truncation anyway and this is the rule.
-                        Err(_) => 0,
-                    },
-                };
-                Kind::List(width)
+                Kind::List(list_width(w))
             }
             b'n' => Kind::Next,
             b'N' => Kind::NextAppend,
@@ -1619,6 +1608,10 @@ struct Sed {
     suppress: bool,
     separator: u8,
     posix: bool,
+    /// The fallback width (`COLS`, then `-l`), read HERE rather than at compile
+    /// time because GNU reads it when `l` runs: `sed -e l -l 12` folds at 12
+    /// though the option came after.
+    line_wrap: usize,
     pattern: Vec<u8>,
     hold: Vec<u8>,
     /// GNU tracks `chomped` per BUFFER: after `g`/`G`/`x` the pattern space's
@@ -1870,6 +1863,94 @@ impl Sed {
 
 }
 
+/// `l`'s WIDTH ARGUMENT, from the number the script wrote. GNU keeps it in the
+/// same `int` as `q`'s exit code, so it TRUNCATES to 32 bits — `l4294967306`
+/// folds at 10 — and a result that is not POSITIVE never wraps.
+fn list_width(w: Option<u64>) -> Option<usize> {
+    match w.map(|v| u32::try_from(v & 0xffff_ffff).unwrap_or(0)) {
+        // -1 is the SAME sentinel `q` has, and it means "no width argument", not
+        // "never wrap": `l4294967295` folds where a bare `l` folds, which is at
+        // `-l`'s width and only therefore at 70. Reading it as non-positive got
+        // that wrong; reading it as 70 got the other half wrong.
+        None | Some(u32::MAX) => None,
+        Some(low32) => Some(match i32::try_from(low32) {
+            Ok(n) => usize::try_from(n).unwrap_or(0),
+            // Any OTHER negative really is "never wrap". No case can red this
+            // arm -- the alternative is a width of ~4.3e9, which no line reaches.
+            Err(_) => 0,
+        }),
+    }
+}
+
+/// C `atoi`: leading whitespace, an optional sign, decimal digits, and whatever
+/// follows them ignored rather than diagnosed. It cannot fail, so a word with no
+/// digits at all is 0. Both inputs to the fallback width are read with this —
+/// `-l`'s argument and `COLS` — and neither is the reader the SCRIPT's own
+/// numbers use, in two ways. Overflow SATURATES, because `strtol` clamps at
+/// `LONG_MAX` where `in_integer` wraps: same digits, so `-l 18446744073709551626`
+/// never folds while `l18446744073709551626` folds at 10. And the result is a C
+/// `int`, so it can be NEGATIVE — `-l -4294967286` is a positive 10.
+fn atoi(arg: &[u8]) -> i32 {
+    let mut i = 0usize;
+    // `strtol`'s leading run is C `isspace`, which is wider than `skip_blank`'s
+    // space-and-tab: `-l '\v12'` is a width of 12.
+    while matches!(arg.get(i), Some(b' ' | b'\t' | b'\n' | 0x0b | 0x0c | b'\r')) {
+        i += 1;
+    }
+    let negative = match arg.get(i) {
+        Some(b'-') => {
+            i += 1;
+            true
+        }
+        Some(b'+') => {
+            i += 1;
+            false
+        }
+        _ => false,
+    };
+    // The magnitude a `long` can hold: one more below zero than above it.
+    let limit = if negative { 1u64 << 63 } else { (1u64 << 63) - 1 };
+    let mut mag = 0u64;
+    while let Some(d) = arg.get(i).filter(|b| b.is_ascii_digit()) {
+        mag = mag
+            .saturating_mul(10)
+            .saturating_add(u64::from(*d - b'0'))
+            .min(limit);
+        i += 1;
+    }
+    // The low 32 bits of the two's-complement value, REINTERPRETED rather than
+    // converted: the sign is part of the answer here, not a failure.
+    let low32 = if negative {
+        0u64.wrapping_sub(mag) & 0xffff_ffff
+    } else {
+        mag & 0xffff_ffff
+    };
+    let bits = u32::try_from(low32).unwrap_or(0);
+    i32::from_ne_bytes(bits.to_ne_bytes())
+}
+
+/// `-l N`'s width. GNU keeps the width in an UNSIGNED counter, so a negative
+/// `int` becomes a number no line reaches and folds nowhere — which is what 0,
+/// the width `-l abc` gives, already means here.
+fn line_length_arg(arg: &[u8]) -> usize {
+    usize::try_from(atoi(arg)).unwrap_or(0)
+}
+
+/// `COLS`, the OTHER input to the fallback width, and it is not `-l` with a
+/// different name. GNU takes `COLS - 1` -- one column kept back so a tty does not
+/// wrap the line itself -- and only when the value exceeds 1, so `COLS=2` folds
+/// at 1 while `COLS=1`, `COLS=0` and `COLS=abc` leave the default alone. The
+/// comparison happens AFTER the `int` lands in that unsigned counter, so a
+/// negative passes it as a huge number: `COLS=-1` folds nowhere rather than
+/// leaving 70. `None` is "say nothing about the width".
+fn cols_line_wrap(cols: &[u8]) -> Option<usize> {
+    match atoi(cols) {
+        n if n >= 2 => Some(usize::try_from(n - 1).unwrap_or(0)),
+        n if n < 0 => Some(0),
+        _ => None,
+    }
+}
+
 fn escape_for_l(bytes: &[u8], width: usize, separator: u8, out: &mut Vec<u8>) {
     let mut col = 0usize;
     let push = |chunk: &[u8], col: &mut usize, out: &mut Vec<u8>| {
@@ -1996,6 +2077,9 @@ struct Conf {
     null_data: bool,
     in_place: Option<Vec<u8>>,
     posix: bool,
+    /// The width a bare `l` folds at: `COLS` seeds it, `-l N` overrides it, and
+    /// with neither it is 70.
+    line_wrap: usize,
 }
 
 pub fn main(args: &[Vec<u8>]) -> i32 {
@@ -2043,6 +2127,7 @@ const LONG_OPTIONS: &[&[u8]] = &[
     b"follow-symlinks",
     b"help",
     b"in-place",
+    b"line-length",
     b"null-data",
     b"posix",
     b"quiet",
@@ -2081,6 +2166,16 @@ fn resolve_long(name: &[u8]) -> Result<&'static [u8], String> {
     }
 }
 
+/// A missing option ARGUMENT, reported the way GNU reports one: bare, with the
+/// usage after it, at exit 1. Not through `Fatal`, whose status-1 path prefixes
+/// `-e expression #1:` — true of a script that failed to compile and false of an
+/// option that never got its value.
+fn missing_short_argument(opt: u8) -> i32 {
+    eprintln!("sed: option requires an argument -- '{}'", char::from(opt));
+    eprintln!("{USAGE}");
+    1
+}
+
 #[allow(clippy::too_many_lines)] // one option table; splitting it would only hide it
 fn run(args: &[Vec<u8>]) -> Result<i32, Fatal> {
     let mut conf = Conf {
@@ -2094,6 +2189,11 @@ fn run(args: &[Vec<u8>]) -> Result<i32, Fatal> {
         // different switches in GNU, and `conf.posix` is `--posix`'s. See the
         // POSIXLY_CORRECT gap in spec/README.
         posix: false,
+        // Read BEFORE the options, as GNU reads it, so `-l` overrides it and not
+        // the other way round.
+        line_wrap: std::env::var_os("COLS")
+            .and_then(|v| cols_line_wrap(v.as_bytes()))
+            .unwrap_or(DEFAULT_LINE_WRAP),
     };
     let mut script_parts: Vec<Vec<u8>> = Vec::new();
     // Only the FIRST script part can carry `#n`, and a `-f` one carries it only
@@ -2185,33 +2285,49 @@ fn run(args: &[Vec<u8>]) -> Result<i32, Fatal> {
                     conf.separate = true;
                     conf.in_place = Some(inline.unwrap_or_default());
                 }
-                b"expression" | b"file" => {
+                b"expression" | b"file" | b"line-length" => {
                     let value = match inline {
                         Some(v) => v,
                         None => {
                             let v = args.get(i).cloned();
                             i += 1;
-                            v.ok_or_else(|| {
-                                format!("option '--{}' requires an argument", show(name))
-                            })?
+                            match v {
+                                Some(v) => v,
+                                // A missing option ARGUMENT is reported bare, with
+                                // the usage after it: the failure is in argv, not in
+                                // expression #1, which is what the `Fatal` path would
+                                // have named.
+                                None => {
+                                    eprintln!(
+                                        "sed: option '--{}' requires an argument",
+                                        show(name)
+                                    );
+                                    eprintln!("{USAGE}");
+                                    return Ok(1);
+                                }
+                            }
                         }
                     };
-                    if name == b"file" {
-                        // Same failure as short `-f`, so the same status and the same
-                        // wording: the script did not fail to COMPILE, the file failed
-                        // to open.
-                        let (text, seekable) = read_script(&value).map_err(|e| Fatal {
-                            msg: format!("couldn't open file {}: {}", show(&value), errmsg(&e)),
-                            status: 4,
-                        })?;
-                        if script_parts.is_empty() {
-                            hash_n_carries = seekable;
-                        }
-                        script_parts.push(text);
+                    if name == b"line-length" {
+                        conf.line_wrap = line_length_arg(&value);
                     } else {
-                        script_parts.push(value);
+                        if name == b"file" {
+                            // Same failure as short `-f`, so the same status and the
+                            // same wording: the script did not fail to COMPILE, the
+                            // file failed to open.
+                            let (text, seekable) = read_script(&value).map_err(|e| Fatal {
+                                msg: format!("couldn't open file {}: {}", show(&value), errmsg(&e)),
+                                status: 4,
+                            })?;
+                            if script_parts.is_empty() {
+                                hash_n_carries = seekable;
+                            }
+                            script_parts.push(text);
+                        } else {
+                            script_parts.push(value);
+                        }
+                        script_given = true;
                     }
-                    script_given = true;
                 }
                 _ => {
                     eprintln!("sed: unrecognized option '{}'", show(arg));
@@ -2251,15 +2367,23 @@ fn run(args: &[Vec<u8>]) -> Result<i32, Fatal> {
                     conf.separate = true;
                     conf.in_place = Some(suffix);
                 }
+                b'l' => {
+                    let Some(v) = value_of(&mut j, &mut i) else {
+                        return Ok(missing_short_argument(b'l'));
+                    };
+                    conf.line_wrap = line_length_arg(&v);
+                }
                 b'e' => {
-                    let v = value_of(&mut j, &mut i)
-                        .ok_or_else(|| "option requires an argument -- 'e'".to_string())?;
+                    let Some(v) = value_of(&mut j, &mut i) else {
+                        return Ok(missing_short_argument(b'e'));
+                    };
                     script_parts.push(v);
                     script_given = true;
                 }
                 b'f' => {
-                    let v = value_of(&mut j, &mut i)
-                        .ok_or_else(|| "option requires an argument -- 'f'".to_string())?;
+                    let Some(v) = value_of(&mut j, &mut i) else {
+                        return Ok(missing_short_argument(b'f'));
+                    };
                     // An unreadable SCRIPT file is exit 4, like any other
                     // runtime failure — not 1, which means a bad script.
                     let (text, seekable) = read_script(&v).map_err(|e| Fatal {
@@ -2321,6 +2445,7 @@ fn run(args: &[Vec<u8>]) -> Result<i32, Fatal> {
         suppress: conf.suppress,
         separator,
         posix: conf.posix,
+        line_wrap: conf.line_wrap,
         pattern: Vec::new(),
         hold: Vec::new(),
         hold_terminated: true,
@@ -2946,7 +3071,7 @@ impl Sed {
                     std::mem::swap(&mut self.terminated, &mut self.hold_terminated);
                 }
                 Some(Kind::List(width)) => {
-                    let width = *width;
+                    let width = width.unwrap_or(self.line_wrap);
                     let mut buf = Vec::new();
                     escape_for_l(&self.pattern, width, self.separator, &mut buf);
                     sink.write(&buf)?;
@@ -3196,6 +3321,7 @@ mod tests {
             suppress: opts.contains(&"-n"),
             separator: sep,
             posix: false,
+            line_wrap: DEFAULT_LINE_WRAP,
             pattern: Vec::new(),
             hold: Vec::new(),
             hold_terminated: true,
@@ -3235,6 +3361,81 @@ mod tests {
         out.clear();
         escape_for_l(b"abcd", 3, 0, &mut out);
         assert_eq!(out, b"ab\\\0cd$\0");
+    }
+
+    /// The `atoi` grammar is pinned here rather than in the corpus because three
+    /// of the six bytes `strtol` skips (VT, FF, CR) can only reach a `## argv:`
+    /// line as raw bytes, invisible in a file people edit.
+    #[test]
+    fn atoi_reads_what_c_reads() {
+        for pre in [" ", "\t", "\n", "\x0b", "\x0c", "\r", " \t\n\x0b\x0c\r"] {
+            assert_eq!(atoi(format!("{pre}12").as_bytes()), 12, "{pre:?}");
+        }
+        assert_eq!(atoi(b"+12"), 12);
+        assert_eq!(atoi(b"-12"), -12);
+        assert_eq!(atoi(b"012"), 12);
+        // Base 10 only, and the rest of the word is ignored rather than diagnosed.
+        assert_eq!(atoi(b"12x"), 12);
+        assert_eq!(atoi(b"0x10"), 0);
+        // Nothing to read is 0.
+        assert_eq!(atoi(b""), 0);
+        assert_eq!(atoi(b"abc"), 0);
+        assert_eq!(atoi(b"-"), 0);
+        assert_eq!(atoi(b"+"), 0);
+        // The whitespace run comes FIRST: a sign it follows is not a sign.
+        assert_eq!(atoi(b"1 2"), 1);
+        assert_eq!(atoi(b"- 12"), 0);
+    }
+
+    /// The two rules this reader does NOT share with the script's own numbers: it
+    /// truncates to an `int`, and it saturates where they wrap.
+    #[test]
+    fn atoi_truncates_to_an_int_and_saturates_rather_than_wrapping() {
+        assert_eq!(atoi(b"4294967306"), 10);
+        assert_eq!(atoi(b"-4294967286"), 10);
+        assert_eq!(atoi(b"4294967295"), -1);
+        assert_eq!(atoi(b"2147483648"), i32::MIN);
+        // Past a `long` the value clamps, so the low 32 bits stop tracking the
+        // digits: wrapping would make this 10, as the command's width is.
+        assert_eq!(atoi(b"18446744073709551626"), -1);
+        assert_eq!(atoi(b"99999999999999999999999"), -1);
+        assert_eq!(atoi(b"-99999999999999999999999"), 0);
+    }
+
+    /// `-l`'s width and `COLS` read the same number and then do DIFFERENT things
+    /// with it: GNU keeps both in an unsigned counter, so every negative folds
+    /// nowhere, but `COLS` also subtracts one and only acts above 1.
+    #[test]
+    fn the_two_fallback_inputs_differ_in_what_they_do_with_the_number() {
+        assert_eq!(line_length_arg(b"10"), 10);
+        assert_eq!(line_length_arg(b"4294967306"), 10);
+        assert_eq!(line_length_arg(b"-4294967286"), 10);
+        assert_eq!(line_length_arg(b"-5"), 0);
+        assert_eq!(line_length_arg(b"abc"), 0);
+        assert_eq!(line_length_arg(b"18446744073709551626"), 0);
+
+        assert_eq!(cols_line_wrap(b"12"), Some(11));
+        assert_eq!(cols_line_wrap(b"2"), Some(1));
+        // Not greater than 1: the default stands, which is what `None` says.
+        assert_eq!(cols_line_wrap(b"1"), None);
+        assert_eq!(cols_line_wrap(b"0"), None);
+        assert_eq!(cols_line_wrap(b"abc"), None);
+        // The comparison is unsigned, so a negative is a huge count, not a small
+        // one -- it folds nowhere rather than leaving the default alone.
+        assert_eq!(cols_line_wrap(b"-1"), Some(0));
+        assert_eq!(cols_line_wrap(b"-4294967286"), Some(9));
+        assert_eq!(cols_line_wrap(b"4294967307"), Some(10));
+    }
+
+    /// -1 is the command width's "no width argument", and nothing else is.
+    #[test]
+    fn a_command_width_of_minus_one_defers_where_its_neighbours_do_not() {
+        assert_eq!(list_width(None), None);
+        assert_eq!(list_width(Some(4_294_967_295)), None);
+        assert_eq!(list_width(Some(4_294_967_294)), Some(0));
+        assert_eq!(list_width(Some(4_294_967_306)), Some(10));
+        assert_eq!(list_width(Some(0)), Some(0));
+        assert_eq!(list_width(Some(70)), Some(70));
     }
 
     /// `q` pays a separator the record left OWED; `Q` does not, and `Q` also throws
