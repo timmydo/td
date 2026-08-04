@@ -102,11 +102,11 @@ pub fn recipe() -> Recipe {
                 "-c",
                 &format!(
                     "l=$('{bin}' --list) || {{ echo 'td-init --list failed' >&2; exit 1; }}; \
-                     for a in cttyhack halt hostname init losetup mknod mount poweroff reboot switch_root sync umount; do \
+                     for a in cttyhack devpts halt hostname init losetup mknod mount poweroff reboot switch_root sync umount; do \
                          printf '%s\\n' \"$l\" | grep -q -x -F \"$a\" || {{ echo \"td-init does not serve applet '$a'\" >&2; exit 1; }}; \
                      done; \
                      n=$(printf '%s\\n' \"$l\" | wc -l); \
-                     [ \"$n\" -eq 12 ] || {{ echo \"td-init serves $n applets, expected exactly 12 — update this check deliberately when adding one\" >&2; exit 1; }}"
+                     [ \"$n\" -eq 13 ] || {{ echo \"td-init serves $n applets, expected exactly 13 — update this check deliberately when adding one\" >&2; exit 1; }}"
                 ),
             ],
         )
@@ -168,7 +168,10 @@ pub fn recipe() -> Recipe {
                      e=$('{bin}' mknod {{root}}/mknod-probe b 7 2>&1); \
                      [ $? -eq 1 ] || {{ echo 'mknod must refuse a short operand list with exit 1' >&2; exit 1; }}; \
                      e=$('{bin}' losetup -r dev/loop0 /img 2>&1); \
-                     [ $? -eq 1 ] || {{ echo 'losetup must refuse a relative path with exit 1' >&2; exit 1; }}"
+                     [ $? -eq 1 ] || {{ echo 'losetup must refuse a relative path with exit 1' >&2; exit 1; }}; \
+                     e=$('{bin}' devpts /dev/pts 2>&1); \
+                     [ $? -eq 1 ] || {{ echo 'devpts must reject an argument with exit 1 — it takes none, and reaching the mount here would put a second instance over the one serving this build' >&2; exit 1; }}; \
+                     printf '%s\n' \"$e\" | grep -q 'takes no arguments' || {{ echo \"devpts rejected the argument without saying so: '$e'\" >&2; exit 1; }}"
                 ),
             ],
         )
@@ -354,7 +357,7 @@ pub fn recipe() -> Recipe {
         .steps(steps)
         .checks(vec![RecipeCheck::new(
             r#"
-echo ">> recipe-check td-init-test: build-plan --auto builds td-init (td's static boot-glue multicall: init/reboot/poweroff/halt/switch_root/mount/umount/cttyhack/hostname/losetup/mknod/sync, statically linked by the /td/store target Rust + native GCC/binutils/glibc toolchain), asserts a self-contained static ELF64 x86-64 executable (ET_EXEC, no PT_INTERP, no dynamic NEEDED), and exercises the applet roster, both dispatch forms, the inittab validator, the mount-table listing, and the fail-early/reject paths of the irreversible applets"
+echo ">> recipe-check td-init-test: build-plan --auto builds td-init (td's static boot-glue multicall: init/reboot/poweroff/halt/switch_root/mount/umount/devpts/cttyhack/hostname/losetup/mknod/sync, statically linked by the /td/store target Rust + native GCC/binutils/glibc toolchain), asserts a self-contained static ELF64 x86-64 executable (ET_EXEC, no PT_INTERP, no dynamic NEEDED), and exercises the applet roster, both dispatch forms, the inittab validator, the mount-table listing, and the fail-early/reject paths of the irreversible applets"
 : "${TD_RECIPE_EVAL:=$PWD/target/release/td-recipe-eval}"
 exec "$TD_RECIPE_EVAL" check-run td-init-test 1
 "#,

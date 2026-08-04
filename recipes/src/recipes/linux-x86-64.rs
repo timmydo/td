@@ -429,6 +429,7 @@ pub fn recipe() -> Recipe {
                   /^#? *CONFIG_PROC_FS[ =]/d; \
                   /^#? *CONFIG_SYSFS[ =]/d; \
                   /^#? *CONFIG_DEVTMPFS[ =]/d; \
+                  /^#? *CONFIG_UNIX98_PTYS[ =]/d; \
                   /^#? *CONFIG_TMPFS[ =]/d; \
                   /^#? *CONFIG_BLOCK[ =]/d; \
                   /^#? *CONFIG_BLK_DEV[ =]/d; \
@@ -496,6 +497,7 @@ pub fn recipe() -> Recipe {
                    'CONFIG_PROC_FS=y' \
                    'CONFIG_SYSFS=y' \
                    'CONFIG_DEVTMPFS=y' \
+                   'CONFIG_UNIX98_PTYS=y' \
                    'CONFIG_TMPFS=y' \
                    'CONFIG_BLOCK=y' \
                    'CONFIG_BLK_DEV=y' \
@@ -578,6 +580,7 @@ pub fn recipe() -> Recipe {
                  if grep -q '^CONFIG_OVERLAY_FS=y' .config; then echo 'OVERLAY_FS on - /etc is immutable and writable state uses direct mounts; no overlay user remains' >&2; exit 1; fi; \
                  grep -q '^CONFIG_PRINTK=y' .config || { echo 'PRINTK off — no kernel console output' >&2; exit 1; }; \
                  grep -q '^CONFIG_TTY=y' .config || { echo 'TTY off — the serial console needs the tty layer' >&2; exit 1; }; \
+                 grep -q '^CONFIG_UNIX98_PTYS=y' .config || { echo 'UNIX98_PTYS off — /dev/ptmx would not exist, so td-term could not allocate a pty and the graphical session would come up with no terminal' >&2; exit 1; }; \
                  grep -q '^CONFIG_KEXEC_FILE=y' .config || { echo 'KEXEC_FILE off — the shim boots the selected deployment via kexec_file_load(2)' >&2; exit 1; }; \
                  grep -q '^CONFIG_RELOCATABLE=y' .config || { echo 'RELOCATABLE off — a non-relocatable bzImage is rejected by the x86 kexec_file_load loader (boots via -kernel, fails via kexec)' >&2; exit 1; }; \
                  grep -q '^CONFIG_BTRFS_FS=y' .config || { echo 'BTRFS_FS off — the persistent volume is one btrfs filesystem (@var plus the loop-mounted EROFS root blobs)' >&2; exit 1; }; \

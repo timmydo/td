@@ -693,6 +693,18 @@ mod tests {
     /// btrfs word — a `subvol` swallowed as a flag mounts the wrong subvolume.
     #[test]
     fn the_image_s_own_mount_lines_parse_into_the_calls_they_mean() {
+        // The `devpts` applet composes its own argv rather than writing a
+        // mount itself, so what it composes is checked against this grammar
+        // here: every word of it must be filesystem DATA, since a `newinstance`
+        // swallowed as a flag would be a second view of the kernel's initial
+        // pty namespace wearing the options nobody applied to it.
+        let pts = parse(&crate::devpts::mount_argv()).unwrap().unwrap();
+        assert_eq!(pts.fstype.as_deref(), Some("devpts"));
+        assert_eq!(pts.source, "devpts");
+        assert_eq!(pts.target, "/dev/pts");
+        assert_eq!(pts.flags, 0);
+        assert_eq!(pts.data, "newinstance,ptmxmode=0666,mode=0620,gid=5");
+
         let dev = mounted(&["-t", "devtmpfs", "devtmpfs", "/dev"]);
         assert_eq!(dev.fstype.as_deref(), Some("devtmpfs"));
         assert_eq!(dev.source, "devtmpfs");

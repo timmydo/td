@@ -704,8 +704,11 @@ the frame-callback coalescing, the persistent-buffer reuse-after-release, and
 the buffer replacement on resize that section 11 also specifies land with the
 Wayland client, which is where a frame's lifecycle exists at all.
 
-Section 12's writer thread, child waiter, readiness socket, `TD-TERM-READY`
-marker, and `probe` subcommand are not built. The Wayland client, packaging,
+Section 12's devpts instance is landed: the image mounts it at sysinit
+through a `td-init` applet, pins `CONFIG_UNIX98_PTYS=y`, and re-proves the
+mount options, the `/dev/ptmx` symlink and the instance `ptmx` on the booted
+machine. Section 12's writer thread, child waiter, readiness socket,
+`TD-TERM-READY` marker, and `probe` subcommand are not built. The Wayland client, packaging,
 and boot cutover of sections 12 and 14 follow them; the terminfo entry is
 landed. Until that client exists the PTY adapter has no production caller;
 its host tests drive every operation against a real PTY, and the packaged
@@ -1125,9 +1128,48 @@ image pins `CONFIG_UNIX98_PTYS=y` and its existing `tty` group owns gid 5.
 td-term opens `/dev/ptmx` with safe `std` file operations, unlocks it, and
 obtains the slave as an owned descriptor with `TIOCGPTPEER` and
 `O_RDWR | O_NOCTTY | O_CLOEXEC`. No `/dev/pts/N` path is reopened.
-The image proof pins the startup mount command and checks the effective slave
-gid/mode plus `pts/ptmx` mode; it does not require `/proc/mounts` to echo the
-modern kernel's accepted no-op `newinstance` token.
+The image proof pins the startup mount command and re-checks `mode`, `gid`
+and `ptmxmode` out of `/proc/mounts` on the booted machine, in the kernel's
+own `%03o` spelling rather than the mount's -- the `mode=0620` asked for
+comes back as `mode=620`, so a check written to match what was passed would
+red every correct boot, and rootcheck is a gate; it does not require
+`/proc/mounts` to echo the modern kernel's accepted no-op `newinstance`
+token. The effective SLAVE gid and mode are proven by opening one, which
+lands with the client that opens the first pty.
+
+That sequence is one `td-init` applet rather than four sysinit lines. Three
+of the four would otherwise be uutils `mkdir`, `rm` and `ln` reached at
+absolute paths, with nothing tying them to the boot that needs them. It
+composes the mount as the argv the `mount` applet parses rather than calling
+`mount(2)` itself, so flag composition stays in the one module td-init's
+confinement tests allow it in -- and this mount needs no `MS_*` bit at all,
+since every option it passes is filesystem data. It adds no syscall, so it
+is not an amendment to `UNSAFE.md`.
+
+It reads its own mount back out of `/proc/mounts` before relinking
+`/dev/ptmx`, which is why the sysinit line comes after `/proc` rather than
+beside the devtmpfs mount: an option devpts does not know makes the mount
+fail outright, so what a readback catches is a known option that took a
+DIFFERENT value than the one asked for, and nothing distinguishes that until
+a pty is opened. Each option is matched as a whole comma-separated token, so
+`mode=620` cannot be satisfied by `ptmxmode=620`, and the expected spellings
+are derived from the ones passed rather than restated beside them. The
+instance `ptmx` is checked too -- character device, mode 0666 -- since it is
+mode 0000 on a mount that dropped `ptmxmode`. Relinking requires a value only
+that verification returns, so the order is the compiler's to enforce, and it
+is a rename rather than an unlink and a create, so a failure cannot leave the
+machine with no `/dev/ptmx` at all. A second run is refused rather than
+served: devpts stacks, and an instance mounted over a live one hides every
+pty the first is serving while every check still reads healthy.
+
+The symlink is the setup the kernel's own devpts documentation describes.
+It is not that a `/dev/ptmx` device node would allocate from the initial
+instance -- modern kernels resolve a `pts` directory beside the node and use
+that mount -- but that the link makes this instance the answer explicitly
+rather than resting on a sibling-directory lookup nothing checks. `mode=0620`
+is likewise the tty convention rather than a relaxation: owner read/write and
+tty group WRITE, which is how anything reaches a terminal it does not own,
+where the devpts default would be 0600 owned by group root.
 
 Stable Rust does not expose the required PTY operations. The widening adds
 x86-64 `SYS_IOCTL=16` to the existing raw body. Its safe wrapper accepts

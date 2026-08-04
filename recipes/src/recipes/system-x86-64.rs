@@ -233,7 +233,7 @@ const BUSYBOX_APPLETS: &[&str] = &["sh", "ash", "getty"];
 /// and td-init (and unlike uutils) it is an ET_EXEC with an EMPTY runtime closure.
 ///
 /// These names are LOAD-BEARING, which is what separates this farm from td-util's: the real
-/// root's `/etc/rootcheck` decides whether the boot is healthy with five `grep -Eq` runs over
+/// root's `/etc/rootcheck` decides whether the boot is healthy with eight `grep -Eq` runs over
 /// `/proc/mounts` and `/etc/machine-id`, and `/etc/profile`, `/etc/netup`, `/etc/bootsuccess`
 /// and `/etc/bootfail` each read `/proc/cmdline` with one. So every boot runs this binary
 /// before it can report success, and a grep that answered wrongly would not fail loudly — it
@@ -307,6 +307,11 @@ const TD_INIT_FARM: &[(&str, Probe)] = &[
     // cttyhack, so a probe that mutates global terminal state to prove an exec nothing
     // performs is pure cost. The usage refusal still pins the packed name and its dispatch.
     ("cttyhack", Probe::Refuses("", "usage: cttyhack")),
+    // Probed by REFUSAL for `mount`'s reason, which is its own: with no arguments this
+    // MOUNTS, and the greeter is unprivileged so a real run would EPERM anyway. The
+    // refusal proves the packed name and that arguments are read before /dev is touched.
+    // Its boot use is the sysinit line below, which is where the real exercise happens.
+    ("devpts", Probe::Refuses("--not-an-option", "takes no arguments")),
     ("halt", Probe::Refuses("--not-an-option", "unrecognised argument")),
     ("hostname", Probe::ReadsBackHostname),
     // The shipped table, parsed by the binary that will be PID 1 next boot.
@@ -719,6 +724,7 @@ fn build_inittab() -> String {
         "::sysinit:/bin/mount -t devtmpfs devtmpfs /dev\n\
          ::sysinit:/bin/mount -t proc proc /proc\n\
          ::sysinit:/bin/mount -t sysfs sysfs /sys\n\
+         ::sysinit:/bin/devpts\n\
          ::respawn:/bin/td-svc run -f {TD_SVC_CONF}\n"
     )
 }
@@ -1179,6 +1185,32 @@ fn build_rootcheck(sys: &SystemDef) -> String {
         "[ \"$(/bin/td-util readlink /home)\" = var/home ] || ok=0\n\
          [ \"$(/bin/td-util readlink /root)\" = var/root ] || ok=0\n\
          [ \"$(/bin/td-util readlink /var/run)\" = /run ] || ok=0\n",
+    );
+    // The pty instance sysinit mounted. Each option is checked because the mount
+    // SUCCEEDS having ignored it: `mode=620,gid=5` is the tty convention (owner
+    // read/write, tty group write -- how anything reaches a terminal it does not
+    // own), and `ptmxmode=666` is the one whose absence stops td-term dead, an
+    // instance ptmx being mode 0000 by default. `/dev/ptmx` must be the relative
+    // symlink, which is the setup the kernel's devpts documentation describes;
+    // `-c` beside it proves the node's TYPE, not its mode -- the node exists at
+    // 0000 on a mount that dropped `ptmxmode`, which is the leg above's to catch.
+    // `newinstance` is deliberately NOT matched -- modern kernels accept it and
+    // echo nothing back. The SLAVE's own gid and mode are proven by opening one,
+    // which lands with the client that opens the first pty.
+    //
+    // The numbers here are the kernel's spelling, NOT the mount's: devpts prints
+    // its modes with `%03o`, so the `mode=0620` this image asks for comes back as
+    // `mode=620` and a check written to match what was passed would red every
+    // correct boot.
+    s.push_str(
+        "/bin/grep -Eq '^devpts /dev/pts devpts ([^ ]*,)?mode=620(,[^ ]*)?( |$)' \
+         /proc/mounts || ok=0\n\
+         /bin/grep -Eq '^devpts /dev/pts devpts ([^ ]*,)?gid=5(,[^ ]*)?( |$)' \
+         /proc/mounts || ok=0\n\
+         /bin/grep -Eq '^devpts /dev/pts devpts ([^ ]*,)?ptmxmode=666(,[^ ]*)?( |$)' \
+         /proc/mounts || ok=0\n\
+         [ \"$(/bin/td-util readlink /dev/ptmx)\" = pts/ptmx ] || ok=0\n\
+         [ -c /dev/pts/ptmx ] || ok=0\n",
     );
     s.push_str(&build_mutable_etc_check(sys));
     let mut probe_paths = "/var /run /tmp /home /root".to_string();
@@ -2716,11 +2748,13 @@ mod tests {
                 "::sysinit:/bin/mount -t devtmpfs devtmpfs /dev",
                 "::sysinit:/bin/mount -t proc proc /proc",
                 "::sysinit:/bin/mount -t sysfs sysfs /sys",
+                "::sysinit:/bin/devpts",
                 &format!("::respawn:/bin/td-svc run -f {TD_SVC_CONF}"),
             ],
             "PID 1's table is the pseudo-filesystem mounts plus td-svc, and nothing else \
              — a service that reappears here is one td-svc cannot order, restart, or stop"
         );
+
         let proc = lines
             .iter()
             .position(|l| l.contains("proc /proc"))
@@ -3270,6 +3304,91 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The `tty` group's gid is written into the mount options in td-init and
+    /// into this check here, and neither knows about `build_group`. Deriving
+    /// the expectation from the group table is what the repo already does for
+    /// `supplementary_gids`, and for the same reason: a `tty` that moved would
+    /// otherwise leave all three sites stale and green, serving slaves that
+    /// name a group nobody has -- or, if gid 5 were reassigned, one that the
+    /// mount's group-write bit then hands a terminal to.
+    #[test]
+    fn the_devpts_gid_is_the_image_s_own_tty_group() {
+        let group = build_group(&SYSTEM);
+        let tty = group
+            .lines()
+            .filter_map(|line| {
+                let mut fields = line.split(':');
+                match (fields.next(), fields.next(), fields.next()) {
+                    (Some("tty"), Some(_), Some(gid)) => Some(gid.to_string()),
+                    _ => None,
+                }
+            })
+            .next()
+            .unwrap_or_else(|| unreachable!("the image has no tty group"));
+        let applet = super::super::td_init::module_source("devpts")
+            .unwrap_or_else(|| unreachable!("td-init serves no devpts module"));
+        assert!(
+            applet.contains(&format!("gid={tty}")),
+            "td-init's devpts mount must ask for the image's own tty gid ({tty})"
+        );
+        assert!(
+            build_rootcheck(&SYSTEM).contains(&format!("gid={tty}(")),
+            "rootcheck must expect the image's own tty gid ({tty})"
+        );
+    }
+
+    /// Every option here can be ignored by a mount that still succeeds, and a
+    /// machine missing any of them boots and looks fine: without `ptmxmode`
+    /// the instance ptmx is 0000 and no unprivileged process can open it at
+    /// all, and without `mode`/`gid` the slaves miss the tty convention that
+    /// lets anything write to a terminal it does not own.
+    #[test]
+    fn rootcheck_proves_the_pty_instance_sysinit_mounted() {
+        let profile = build_rootcheck(&SYSTEM);
+        // A devpts line as the kernel actually writes it. Every literal the
+        // check greps for is matched against THIS rather than against itself,
+        // which is what stops a check written in the mount's spelling —
+        // `mode=0620`, which devpts renders `%03o` — from passing its own test
+        // while failing on every real machine.
+        let proc_mounts = "devpts /dev/pts devpts rw,nosuid,noexec,relatime,\
+                           gid=5,mode=620,ptmxmode=666 0 0";
+        for option in ["mode=620", "gid=5", "ptmxmode=666"] {
+            assert!(
+                profile.contains(&format!("([^ ]*,)?{option}(,[^ ]*)?( |$)")),
+                "rootcheck must check devpts was mounted with {option}"
+            );
+            assert!(
+                proc_mounts.contains(option),
+                "{option} is not how the kernel spells it in /proc/mounts"
+            );
+        }
+        assert!(
+            profile.contains("^devpts /dev/pts devpts "),
+            "the check must name the mount point, not merely find devpts anywhere"
+        );
+        assert!(
+            profile.contains("readlink /dev/ptmx)\" = pts/ptmx"),
+            "/dev/ptmx must be the RELATIVE symlink into the instance"
+        );
+        assert!(
+            profile.contains("[ -c /dev/pts/ptmx ]"),
+            "the instance's own ptmx is what the symlink resolves to"
+        );
+        // `newinstance` is deliberately absent: modern kernels accept the token
+        // and echo nothing back, so requiring it would red a correct boot.
+        assert!(
+            !profile.contains("newinstance"),
+            "rootcheck must not require /proc/mounts to echo newinstance"
+        );
+        // devpts prints its modes with `%03o`. Matching the `0620` the mount
+        // ASKS for would never match what the kernel writes back, so rootcheck
+        // would fail on a perfectly correct boot -- and rootcheck is a gate.
+        assert!(
+            !profile.contains("mode=0620"),
+            "rootcheck must match the kernel's %03o spelling, not the mount's"
+        );
     }
 
     /// The greeter is the only process that can see whether `login` handed it the

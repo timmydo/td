@@ -8,6 +8,10 @@
 //! (`setsid(2)` + `TIOCSCTTY`), `init` (`wait4(2)`), and `hostname`
 //! (`sethostname(2)` — the `-F` flag uutils lacks).
 //!
+//! `devpts` is the one applet here that needs no syscall of its own: it mounts
+//! through the `mount` applet's own argv, and lives here rather than in td-util
+//! because that is where the mount it composes lives.
+//!
 //! The sibling multicall `td-util` covers the applets that need NO syscall
 //! surface and is `#![forbid(unsafe_code)]` as a result. The split is deliberate:
 //! everything that can be safe lives there, and this crate's `unsafe` is confined
@@ -23,6 +27,7 @@
 //! covers the un-symlinked case.
 
 mod cttyhack;
+mod devpts;
 mod devt;
 mod halt;
 mod hostname;
@@ -44,6 +49,7 @@ type Applet = fn(&[String]) -> Result<u8, String>;
 /// `--list`, argv[0] dispatch, and the shipped /bin symlink farm all read it.
 const APPLETS: &[(&str, Applet)] = &[
     ("cttyhack", cttyhack::run),
+    ("devpts", devpts::run),
     ("halt", halt::halt),
     ("hostname", hostname::run),
     ("init", init::run),
@@ -377,11 +383,12 @@ mod tests {
     /// The roster is the shipped /bin symlink farm, so a rename is a visible
     /// change to the image, not an internal one.
     #[test]
-    fn the_roster_is_the_amended_twelve() {
+    fn the_roster_is_the_amended_thirteen() {
         assert_eq!(
             names(),
             vec![
                 "cttyhack",
+                "devpts",
                 "halt",
                 "hostname",
                 "init",
@@ -817,7 +824,7 @@ mod confinement {
                 declared.push(target);
             }
         }
-        assert_eq!(declared.len(), 11, "expected eleven modules beside the crate root");
+        assert_eq!(declared.len(), 12, "expected twelve modules beside the crate root");
         // ...and nothing scanned is orphaned: a file present but declared by no
         // `mod` line is either dead or reached a way this scan does not model,
         // and either way the counts above stop meaning what they say. Matching on
@@ -844,13 +851,14 @@ mod confinement {
     /// skipping them: `src/sys.inc` is invisible to a `.rs`-only scan and
     /// compiles perfectly well through the constructs refused below.
     #[test]
-    fn src_holds_exactly_the_twelve_scanned_modules() {
+    fn src_holds_exactly_the_thirteen_scanned_modules() {
         let (rs, other) = walk();
         let paths: Vec<&str> = rs.iter().map(|(p, _)| p.as_str()).collect();
         assert_eq!(
             paths,
             [
                 "cttyhack.rs",
+                "devpts.rs",
                 "devt.rs",
                 "halt.rs",
                 "hostname.rs",

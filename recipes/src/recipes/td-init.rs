@@ -11,7 +11,8 @@ use crate::types::{Recipe, Step};
 // SCOPE: the busybox applets that need a RAW SYSCALL — `init` (wait4), `reboot`/
 // `poweroff`/`halt` (reboot), `sync` (sync), `switch_root` (mount MS_MOVE +
 // chroot), `mount`/`umount` (mount + umount2), `cttyhack` (setsid + TIOCSCTTY),
-// `losetup` (ioctl LOOP_SET_FD), `mknod` (mknod), and `hostname` (sethostname,
+// `losetup` (ioctl LOOP_SET_FD), `mknod` (mknod), `devpts` (no syscall of its own
+// — it mounts through the `mount` applet), and `hostname` (sethostname,
 // the `-F` flag uutils lacks). That is the complement of td-util,
 // which covers the applets safe `std` already reaches and is
 // `#![forbid(unsafe_code)]` as a result. The crate confines its `unsafe` to one
@@ -59,6 +60,7 @@ const MAIN_RS: &str = include_str!("../../../td-init/src/main.rs");
 // (module basename, source text). rustc resolves `mod NAME;` to `{src}/NAME.rs`.
 const MODULES: &[(&str, &str)] = &[
     ("cttyhack", include_str!("../../../td-init/src/cttyhack.rs")),
+    ("devpts", include_str!("../../../td-init/src/devpts.rs")),
     ("devt", include_str!("../../../td-init/src/devt.rs")),
     ("halt", include_str!("../../../td-init/src/halt.rs")),
     ("hostname", include_str!("../../../td-init/src/hostname.rs")),
