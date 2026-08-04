@@ -131,6 +131,14 @@ struct History {
     cells: usize,
     max_cells: usize,
     max_lines: usize,
+    /// Lines ever appended, which eviction does not decrease. An open
+    /// viewport names the line it is looking at in this space, so output
+    /// arriving underneath it does not drag the view along.
+    pushed: u64,
+    /// Which numbering `pushed` is counting in. Clearing starts a new one,
+    /// so an anchor from the old one can be told apart from a line that
+    /// happens to have been given the same number since.
+    epoch: u64,
 }
 
 impl History {
@@ -163,6 +171,8 @@ impl History {
             cells: 0,
             max_cells,
             max_lines: if enabled { MAX_HISTORY_LINES } else { 0 },
+            pushed: 0,
+            epoch: 0,
         }
     }
 
@@ -209,6 +219,7 @@ impl History {
             length: columns,
             wrapped,
         });
+        self.pushed = self.pushed.saturating_add(1);
     }
 
     fn clear(&mut self) {
@@ -216,6 +227,12 @@ impl History {
         self.arena.clear();
         self.write = 0;
         self.cells = 0;
+        // The counter goes with the lines it counted, and the numbering it
+        // counted in is retired with it: zeroing `pushed` alone would let an
+        // old anchor come back into range as new lines arrived, reopening a
+        // view the clear had closed.
+        self.pushed = 0;
+        self.epoch = self.epoch.saturating_add(1);
     }
 
     #[cfg(test)]
@@ -1078,6 +1095,23 @@ impl Terminal {
     /// viewport show the shell a full-screen program is covering.
     pub(crate) fn history_lines(&self) -> usize {
         self.primary.history.lines.len()
+    }
+
+    /// Lines ever pushed to primary history. Eviction lowers
+    /// `history_lines()` but never this, which is what lets a viewport name
+    /// a line rather than a distance from a moving bottom.
+    ///
+    /// Awaiting the Wayland client that holds a viewport across frames.
+    #[allow(dead_code)]
+    pub(crate) fn history_pushed(&self) -> u64 {
+        self.primary.history.pushed
+    }
+
+    /// Which numbering `history_pushed` is counting in. A clear -- a reset,
+    /// or `CSI 3 J` -- retires the old one.
+    #[allow(dead_code)]
+    pub(crate) fn history_epoch(&self) -> u64 {
+        self.primary.history.epoch
     }
 
     /// Oldest line first: `history_lines() - 1` is the row that most

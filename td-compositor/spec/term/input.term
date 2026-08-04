@@ -264,3 +264,125 @@ expect input b""
 key ctrl+a
 expect input b"\x01"
 end
+
+# Shift+PageUp and Shift+PageDown move td-term's own viewport a screen less
+# one row at a time, so the line last read is still on screen to read on
+# from. Neither reaches the child, and both stop at the ends.
+case input/scrollback-shift-paging-moves-the-viewport
+source td
+tags core input scrollback
+size 2 8
+write b"1\r\n2\r\n3\r\n4"
+expect viewport 0
+key shift+pageup
+expect viewport 1
+key shift+pageup
+expect viewport 2
+key shift+pageup
+expect viewport 2
+key shift+pagedown
+expect viewport 1
+key shift+pagedown
+expect viewport 0
+key shift+pagedown
+expect viewport 0
+expect input b""
+end
+
+# End has two meanings and the state at the moment of the press picks one:
+# at the live bottom it is the child's, and while viewing scrollback it is
+# consumed to return there.
+case input/scrollback-end-returns-to-the-live-bottom
+source td
+tags core input scrollback
+size 2 8
+write b"1\r\n2\r\n3\r\n4"
+key end
+expect input b"\x1b[F"
+key shift+pageup
+expect viewport 1
+key end
+expect viewport 0
+expect input b"\x1b[F"
+key end
+expect input b"\x1b[F\x1b[F"
+end
+
+# Ordinary input returns to the live bottom: the child cannot answer a key
+# whose answer the reader would not be looking at.
+case input/scrollback-ordinary-input-returns-to-the-bottom
+source td
+tags core input scrollback
+size 2 8
+write b"1\r\n2\r\n3\r\n4"
+key shift+pageup
+expect viewport 1
+key a
+expect viewport 0
+expect input b"a"
+end
+
+# A key this profile does not translate leaves the viewport where it is: it
+# is neither input nor a scroll, so it must not close the view.
+case input/scrollback-a-silent-key-leaves-the-view
+source td
+tags core input scrollback
+size 2 8
+write b"1\r\n2\r\n3\r\n4"
+key shift+pageup
+expect viewport 1
+key print
+key super+q
+key ctrl+shift+pageup
+key alt+shift+pageup
+expect viewport 1
+expect input b""
+end
+
+# Output arriving under an open viewport must not drag the view along with
+# it. The line being read is named in a numbering eviction and scrolling do
+# not renumber, so its distance from the live bottom grows instead.
+case input/scrollback-output-does-not-drag-the-view
+source td
+tags core input scrollback
+size 2 8
+write b"1\r\n2\r\n3\r\n4"
+key shift+pageup
+expect viewport 1
+write b"\r\n5"
+expect viewport 2
+write b"\r\n6"
+expect viewport 3
+end
+
+# A reset clears the history a viewport was anchored in, so the view has
+# nowhere to be but the live bottom.
+case input/scrollback-a-reset-closes-the-view
+source td
+tags core input scrollback
+size 2 8
+write b"1\r\n2\r\n3\r\n4"
+key shift+pageup
+expect viewport 1
+write b"\x1bc"
+expect viewport 0
+end
+
+# A clear renumbers history from zero, so an anchor from before it names a
+# number a later line will also have. The view must not come back as those
+# numbers arrive: it was closed by the clear, and the lines it was reading
+# no longer exist.
+case input/scrollback-a-cleared-history-does-not-reopen-the-view
+source td
+tags core input scrollback
+size 2 8
+write b"1\r\n2\r\n3\r\n4"
+key shift+pageup
+expect viewport 1
+write b"\x1bc"
+expect viewport 0
+write b"5\r\n6\r\n7\r\n8"
+expect viewport 0
+key shift+pageup
+expect viewport 1
+end

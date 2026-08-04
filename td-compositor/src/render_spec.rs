@@ -1,4 +1,5 @@
 use super::*;
+use crate::keys;
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
@@ -11,6 +12,15 @@ fn face() -> &'static Font {
 fn palette() -> &'static Palette {
     static PALETTE: OnceLock<Palette> = OnceLock::new();
     PALETTE.get_or_init(Palette::pinned)
+}
+
+/// The three numbers a viewport reads, as the model reports them.
+fn scrollback(terminal: &Terminal) -> keys::Scrollback {
+    keys::Scrollback {
+        epoch: terminal.history_epoch(),
+        pushed: terminal.history_pushed(),
+        lines: terminal.history_lines(),
+    }
 }
 
 fn terminal(rows: usize, columns: usize, input: &[u8]) -> Terminal {
@@ -739,6 +749,39 @@ fn scrolled_back_clamps_to_the_available_history() {
             .viewport(),
         0
     );
+}
+
+/// The corpus can see the viewport's offset but not what it shows, and the
+/// offset is exactly the number the anchor changes. So the property that
+/// makes the anchor worth having is asserted here: the same lines stay on
+/// screen while the child writes underneath them.
+#[test]
+fn an_anchored_view_shows_the_same_lines_while_output_arrives() {
+    let mut terminal = scrolled(2, 3, 3);
+    let mut viewport = keys::Viewport::new();
+    let back = keys::Action::Scroll(keys::Scroll::Back);
+    let seen = |terminal: &Terminal, viewport: &keys::Viewport| {
+        let offset = viewport.offset(scrollback(terminal));
+        let snapshot = Snapshot::new(terminal, false, false).scrolled_back(offset);
+        (0..snapshot.rows())
+            .map(|row| snapshot.cell(row, 0).scalar)
+            .collect::<Vec<char>>()
+    };
+
+    viewport.apply(&back, terminal.rows(), scrollback(&terminal));
+    let before = seen(&terminal, &viewport);
+    assert_eq!(before, vec!['2', '3']);
+
+    for line in 5..9 {
+        let digit = char::from_digit(line % 10, 10).unwrap();
+        let mut bytes = vec![b'\r', b'\n'];
+        bytes.extend(std::iter::repeat_n(u8::try_from(u32::from(digit)).unwrap(), 3));
+        terminal.feed(&bytes);
+        assert_eq!(seen(&terminal, &viewport), before, "line {line} moved the view");
+    }
+    // It moved further from the bottom, which is the same thing said the
+    // other way: four more lines arrived under it.
+    assert_eq!(viewport.offset(scrollback(&terminal)), 5);
 }
 
 #[test]

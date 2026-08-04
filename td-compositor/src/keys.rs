@@ -78,6 +78,32 @@ impl Sequence {
     }
 }
 
+/// A move of td-term's own scrollback viewport. These never reach the child:
+/// the terminal is looking at what it already received.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Scroll {
+    Back,
+    Forward,
+    /// Awaiting the Wayland client that routes keys; `Back` and `Forward`
+    /// are named by the roster, so only this one has no non-test caller.
+    #[allow(dead_code)]
+    Bottom,
+}
+
+/// What one key press does. Exactly one of three things, which is why this
+/// is an enum rather than an `Option<Sequence>` plus a flag: a key that
+/// scrolls must not also be able to send bytes.
+///
+/// Awaiting the Wayland client that composes the adapter; until it exists
+/// the corpus is what drives this.
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Action {
+    Bytes(Sequence),
+    Scroll(Scroll),
+    Silent,
+}
+
 /// How one key spells itself. The variants exist because the modifier rules
 /// differ per class, not because the byte strings do.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -104,9 +130,14 @@ enum Kind {
     Tilde(&'static [u8]),
     /// A function key with one fixed sequence.
     Function(&'static [u8]),
-    /// Shift selects td-term's scrollback viewport, so the shifted form is
-    /// consumed rather than forwarded.
-    Paging(&'static [u8]),
+    /// Shift selects td-term's scrollback viewport, so the shifted form
+    /// scrolls the terminal's own view rather than reaching the child. The
+    /// direction sits in the roster the keymap tests already cover, so the
+    /// two keys cannot be told apart by their bytes alone.
+    Paging {
+        bytes: &'static [u8],
+        shifted: Scroll,
+    },
     /// A modifier or lock. It is never text and never repeats — this set is
     /// exactly the keymap's `repeat=no` exclusions.
     Modifier,
@@ -211,12 +242,12 @@ const KEYS: &[(&str, u16, Kind)] = &[
     ("rightalt", 100, Kind::Modifier),
     ("home", 102, Kind::Cursor { normal: b"\x1b[H", application: b"\x1bOH" }),
     ("up", 103, Kind::Cursor { normal: b"\x1b[A", application: b"\x1bOA" }),
-    ("pageup", 104, Kind::Paging(b"\x1b[5~")),
+    ("pageup", 104, Kind::Paging { bytes: b"\x1b[5~", shifted: Scroll::Back }),
     ("left", 105, Kind::Cursor { normal: b"\x1b[D", application: b"\x1bOD" }),
     ("right", 106, Kind::Cursor { normal: b"\x1b[C", application: b"\x1bOC" }),
     ("end", 107, Kind::Cursor { normal: b"\x1b[F", application: b"\x1bOF" }),
     ("down", 108, Kind::Cursor { normal: b"\x1b[B", application: b"\x1bOB" }),
-    ("pagedown", 109, Kind::Paging(b"\x1b[6~")),
+    ("pagedown", 109, Kind::Paging { bytes: b"\x1b[6~", shifted: Scroll::Forward }),
     ("insert", 110, Kind::Tilde(b"\x1b[2~")),
     ("delete", 111, Kind::Tilde(b"\x1b[3~")),
     ("mute", 113, Kind::Silent),
@@ -326,8 +357,8 @@ pub fn sequence(code: u16, modifiers: u32, modes: Modes) -> Option<Sequence> {
             Sequence::new(bytes)?
         }
         // Shift+PageUp and Shift+PageDown belong to the scrollback viewport,
-        // which lands with the renderer; they are consumed either way.
-        Kind::Paging(bytes) => {
+        // so they generate nothing here; `action` is what routes them.
+        Kind::Paging { bytes, .. } => {
             if shift {
                 return None;
             }
@@ -339,6 +370,143 @@ pub fn sequence(code: u16, modifiers: u32, modes: Modes) -> Option<Sequence> {
         plain.with_alt()
     } else {
         Some(plain)
+    }
+}
+
+/// The one key whose meaning depends on where the viewport is. Pinned to the
+/// roster by the test below rather than read out of it per press.
+#[allow(dead_code)]
+const END: u16 = 107;
+
+/// Route one key press: to the viewport, to the child, or nowhere.
+///
+/// `viewing` is the viewport's EFFECTIVE position rather than whether it was
+/// ever opened, because §10 gives End two meanings and the one it has must
+/// follow what is on screen: a viewport whose history evicted underneath it
+/// is at the live bottom, and End there belongs to the child.
+#[allow(dead_code)]
+pub fn action(code: u16, modifiers: u32, modes: Modes, viewing: bool) -> Action {
+    if modifiers & !(HANDLED | IGNORED) != 0 {
+        return Action::Silent;
+    }
+    let shift = modifiers & MOD_SHIFT != 0;
+    // Caps Lock is not consulted: it selects a letter's level, and neither of
+    // these keys has one. Ctrl or Alt makes the chord unlisted, as elsewhere.
+    let compound = modifiers & (MOD_CONTROL | MOD_ALT) != 0;
+    if let Some(Kind::Paging { shifted, .. }) = kind(code) {
+        if shift && !compound {
+            return Action::Scroll(shifted);
+        }
+    }
+    if code == END && viewing && !shift && !compound {
+        return Action::Scroll(Scroll::Bottom);
+    }
+    match sequence(code, modifiers, modes) {
+        Some(sequence) => Action::Bytes(sequence),
+        None => Action::Silent,
+    }
+}
+
+/// How far one `Shift+PageUp` moves: a screen less one row, so the line the
+/// reader was looking at is still there to read on from. Never zero, since a
+/// one-row grid would otherwise have no way to scroll at all.
+#[allow(dead_code)]
+fn page_lines(rows: usize) -> usize {
+    rows.saturating_sub(1).max(1)
+}
+
+/// What the model's primary history looks like right now. The three travel
+/// together because an offset means nothing without all of them: which
+/// numbering the lines are counted in, how many have been counted, and how
+/// many are still held.
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Scrollback {
+    pub epoch: u64,
+    pub pushed: u64,
+    pub lines: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct Anchor {
+    epoch: u64,
+    line: u64,
+}
+
+/// td-term's scrollback viewport.
+///
+/// It stores the line it is looking at, not a distance from the live bottom,
+/// because the bottom moves: with a stored distance a child writing
+/// underneath an open viewport would drag the view along with it, one line
+/// per line of output.
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct Viewport {
+    anchor: Option<Anchor>,
+}
+
+#[allow(dead_code)]
+impl Viewport {
+    pub fn new() -> Viewport {
+        Viewport { anchor: None }
+    }
+
+    /// How many lines back from the live bottom the view sits, given what
+    /// history holds now. Clamped on every ask rather than stored, since
+    /// eviction and resize both shorten the history an anchor lives in: an
+    /// anchor whose line has been evicted rides the top of what remains,
+    /// which is where the reader was heading, rather than being thrown back
+    /// to the live bottom on the next line of output.
+    pub fn offset(&self, history: Scrollback) -> usize {
+        let Some(anchor) = self.anchor else {
+            return 0;
+        };
+        // A clear renumbers from zero. Without this an old anchor would come
+        // back into range as new lines arrived and reopen a view the clear
+        // had closed, on lines that have nothing to do with it.
+        if anchor.epoch != history.epoch {
+            return 0;
+        }
+        let back = history.pushed.saturating_sub(anchor.line);
+        usize::try_from(back).unwrap_or(usize::MAX).min(history.lines)
+    }
+
+    /// Whether anything but the live screen is showing. This is the question
+    /// End asks, so it is the EFFECTIVE position rather than whether the
+    /// viewport was ever opened: a view with nothing left to show is at the
+    /// live bottom however it got there.
+    pub fn viewing(&self, history: Scrollback) -> bool {
+        self.offset(history) != 0
+    }
+
+    /// Apply what `action` decided. Bytes return to the live bottom: §10's
+    /// rule that ordinary input does, and the child cannot answer a key
+    /// whose result the reader would not be looking at.
+    pub fn apply(&mut self, action: &Action, rows: usize, history: Scrollback) {
+        let current = self.offset(history);
+        let next = match action {
+            // Leave the anchor alone rather than re-anchoring at `current`:
+            // a clamped anchor still names the line it was put on, and a
+            // silent key must not quietly move it to where it landed.
+            Action::Silent => return,
+            Action::Bytes(_) | Action::Scroll(Scroll::Bottom) => 0,
+            // Not clamped here: `offset` clamps to what history holds on
+            // every read, and an anchor past the top reads as the top from
+            // the next line of output onward. A second clamp would be a
+            // second place for the two to disagree.
+            Action::Scroll(Scroll::Back) => current.saturating_add(page_lines(rows)),
+            Action::Scroll(Scroll::Forward) => current.saturating_sub(page_lines(rows)),
+        };
+        self.anchor = if next == 0 {
+            None
+        } else {
+            Some(Anchor {
+                epoch: history.epoch,
+                line: history
+                    .pushed
+                    .saturating_sub(u64::try_from(next).unwrap_or(u64::MAX)),
+            })
+        };
     }
 }
 
@@ -380,10 +548,13 @@ impl Repeat {
         }
     }
 
-    /// Arm the repeat for a press. A key that repeats but sends nothing arms
-    /// nothing; the newest qualifying press replaces any earlier one.
-    pub fn press(&mut self, code: u16, modifiers: u32, modes: Modes, now: u64) {
-        if repeats(code) && sequence(code, modifiers, modes).is_some() {
+    /// Arm the repeat for a press. A key that repeats but does nothing arms
+    /// nothing; the newest qualifying press replaces any earlier one. A
+    /// scroll qualifies: holding `Shift+PageUp` is how a reader walks back
+    /// through scrollback, and the compositor sends no repeat events of its
+    /// own for this to fall back on.
+    pub fn press(&mut self, code: u16, modifiers: u32, modes: Modes, viewing: bool, now: u64) {
+        if repeats(code) && !matches!(action(code, modifiers, modes, viewing), Action::Silent) {
             self.active = Some(Active {
                 code,
                 modifiers,
@@ -408,13 +579,20 @@ impl Repeat {
         self.active = None;
     }
 
-    /// The next repetition, if one is due, translated against the modes the
-    /// terminal is in NOW. Ticks missed while the main loop was busy are
-    /// dropped rather than delivered as a burst.
-    pub fn due(&mut self, now: u64, modes: Modes) -> Option<Sequence> {
+    /// The next repetition, if one is due, routed against the modes and the
+    /// viewport the terminal is in NOW. Ticks missed while the main loop was
+    /// busy are dropped rather than delivered as a burst.
+    ///
+    /// Re-routing per repetition is what makes a held End coherent: the
+    /// first repetition closes the viewport, and the ones after it are the
+    /// child's, because by then the view is at the live bottom.
+    pub fn due(&mut self, now: u64, modes: Modes, viewing: bool) -> Option<Action> {
         let active = self.active.as_mut().filter(|active| now >= active.due)?;
         active.due = now.saturating_add(self.interval);
-        sequence(active.code, active.modifiers, modes)
+        match action(active.code, active.modifiers, modes, viewing) {
+            Action::Silent => None,
+            found => Some(found),
+        }
     }
 
     /// When the caller should next ask, so a main loop can wait rather than poll.
@@ -527,22 +705,29 @@ pub fn selftest() -> Result<(), String> {
     }
 
     let mut repeat = Repeat::with_timing(REPEAT_DELAY_MS, REPEAT_INTERVAL_MS);
-    repeat.press(103, 0, escape, 0);
+    repeat.press(103, 0, escape, false, 0);
     if repeat.deadline() != Some(REPEAT_DELAY_MS)
-        || repeat.due(REPEAT_DELAY_MS - 1, escape).is_some()
+        || repeat.due(REPEAT_DELAY_MS - 1, escape, false).is_some()
     {
         return Err("keyboard repeat selftest did not wait out its delay".into());
     }
-    // Translated at emission, so a mode the child changed mid-hold is honoured.
-    if repeat.due(REPEAT_DELAY_MS, application).map(|found| found.as_slice().to_vec())
-        != Some(b"\x1bOA".to_vec())
-        || !repeat.armed()
-    {
+    // Routed at emission, so a mode the child changed mid-hold is honoured.
+    let repetition = match repeat.due(REPEAT_DELAY_MS, application, false) {
+        Some(Action::Bytes(found)) => found.as_slice().to_vec(),
+        _ => Vec::new(),
+    };
+    if repetition != b"\x1bOA".to_vec() || !repeat.armed() {
         return Err("keyboard repeat selftest lost its first repetition".into());
+    }
+    // A held scroll chord repeats too, and as a scroll rather than as bytes.
+    let mut scrolling = Repeat::with_timing(REPEAT_DELAY_MS, REPEAT_INTERVAL_MS);
+    scrolling.press(104, MOD_SHIFT, escape, true, 0);
+    if scrolling.due(REPEAT_DELAY_MS, escape, true) != Some(Action::Scroll(Scroll::Back)) {
+        return Err("keyboard repeat selftest did not repeat a held scroll".into());
     }
     repeat.release(103);
     repeat.cancel();
-    if repeat.armed() || Repeat::new().due(u64::MAX, escape).is_some() {
+    if repeat.armed() || Repeat::new().due(u64::MAX, escape, false).is_some() {
         return Err("keyboard repeat selftest kept a released key armed".into());
     }
 
@@ -1168,16 +1353,13 @@ mod tests {
         let mut repeat = Repeat::with_timing(600, 40);
         let code = key_code("a").unwrap();
         let modes = Modes::default();
-        repeat.press(code, 0, modes, 1_000);
+        repeat.press(code, 0, modes, false, 1_000);
         assert_eq!(repeat.deadline(), Some(1_600));
-        assert_eq!(repeat.due(1_599, modes), None);
-        assert_eq!(
-            repeat.due(1_600, modes).map(|found| found.as_slice().to_vec()),
-            Some(b"a".to_vec())
-        );
+        assert_eq!(repetition(&mut repeat, 1_599, modes), None);
+        assert_eq!(repetition(&mut repeat, 1_600, modes), Some(b"a".to_vec()));
         assert_eq!(repeat.deadline(), Some(1_640));
-        assert_eq!(repeat.due(1_639, modes), None);
-        assert!(repeat.due(1_640, modes).is_some());
+        assert_eq!(repetition(&mut repeat, 1_639, modes), None);
+        assert!(repetition(&mut repeat, 1_640, modes).is_some());
     }
 
     /// The child can change DECCKM while a cursor key is held, so a repetition
@@ -1190,15 +1372,10 @@ mod tests {
             application_cursor: true,
         };
         let up = key_code("up").unwrap();
-        repeat.press(up, 0, normal, 0);
+        repeat.press(up, 0, normal, false, 0);
+        assert_eq!(repetition(&mut repeat, 600, normal), Some(b"\x1b[A".to_vec()));
         assert_eq!(
-            repeat.due(600, normal).map(|found| found.as_slice().to_vec()),
-            Some(b"\x1b[A".to_vec())
-        );
-        assert_eq!(
-            repeat
-                .due(640, application)
-                .map(|found| found.as_slice().to_vec()),
+            repetition(&mut repeat, 640, application),
             Some(b"\x1bOA".to_vec())
         );
     }
@@ -1208,10 +1385,10 @@ mod tests {
         let mut repeat = Repeat::with_timing(600, 40);
         let code = key_code("a").unwrap();
         let modes = Modes::default();
-        repeat.press(code, 0, modes, 0);
-        assert!(repeat.due(10_000, modes).is_some());
+        repeat.press(code, 0, modes, false, 0);
+        assert!(repetition(&mut repeat, 10_000, modes).is_some());
         assert_eq!(repeat.deadline(), Some(10_040));
-        assert_eq!(repeat.due(10_000, modes), None);
+        assert_eq!(repetition(&mut repeat, 10_000, modes), None);
     }
 
     #[test]
@@ -1220,7 +1397,7 @@ mod tests {
         let other = key_code("b").unwrap();
         let armed = |now: u64| {
             let mut repeat = Repeat::with_timing(600, 40);
-            repeat.press(code, 0, Modes::default(), now);
+            repeat.press(code, 0, Modes::default(), false, now);
             repeat
         };
         let mut repeat = armed(0);
@@ -1231,24 +1408,24 @@ mod tests {
         let mut repeat = armed(0);
         repeat.cancel();
         assert!(!repeat.armed());
-        assert_eq!(repeat.due(u64::MAX, Modes::default()), None);
+        assert_eq!(repeat.due(u64::MAX, Modes::default(), false), None);
     }
 
     #[test]
-    fn keys_without_bytes_never_arm_a_repeat() {
+    fn keys_that_do_nothing_never_arm_a_repeat() {
         let mut repeat = Repeat::with_timing(600, 40);
         let modes = Modes::default();
         let shift = key_code("leftshift").unwrap();
-        repeat.press(shift, 0, modes, 0);
+        repeat.press(shift, 0, modes, false, 0);
         assert!(!repeat.armed());
         // Nor does a key whose chord this profile does not translate.
-        repeat.press(key_code("a").unwrap(), MOD_LOGO, modes, 0);
+        repeat.press(key_code("a").unwrap(), MOD_LOGO, modes, false, 0);
         assert!(!repeat.armed());
         // A repeating key press replaces an armed one.
         let a = key_code("a").unwrap();
         let b = key_code("b").unwrap();
-        repeat.press(a, 0, modes, 0);
-        repeat.press(b, 0, modes, 100);
+        repeat.press(a, 0, modes, false, 0);
+        repeat.press(b, 0, modes, false, 100);
         assert_eq!(repeat.deadline(), Some(700));
         repeat.release(a);
         assert!(repeat.armed());
@@ -1283,5 +1460,204 @@ mod tests {
         assert!(!queue.push(b"\x1b[24~"));
         assert!(queue.is_empty());
         assert!(queue.take_dropped());
+    }
+
+    /// The bytes of a due repetition, so the repeat tests stay about timing
+    /// rather than about routing.
+    fn repetition(repeat: &mut Repeat, now: u64, modes: Modes) -> Option<Vec<u8>> {
+        match repeat.due(now, modes, false) {
+            Some(Action::Bytes(found)) => Some(found.as_slice().to_vec()),
+            _ => None,
+        }
+    }
+
+    fn act(chord: &str, viewing: bool) -> Action {
+        let (code, modifiers) = parse_chord(chord).unwrap();
+        action(code, modifiers, Modes::default(), viewing)
+    }
+
+    /// `action` reads one key by number rather than by name. Nothing else
+    /// ties that number to the roster entry whose meaning it is taking.
+    #[test]
+    fn the_end_constant_is_the_key_the_roster_spells() {
+        assert_eq!(key_code("end"), Some(END));
+    }
+
+    #[test]
+    fn shift_paging_scrolls_the_viewport_and_sends_nothing() {
+        assert_eq!(act("shift+pageup", false), Action::Scroll(Scroll::Back));
+        assert_eq!(
+            act("shift+pagedown", false),
+            Action::Scroll(Scroll::Forward)
+        );
+        // Unshifted they are the child's, whatever the viewport is doing.
+        for viewing in [false, true] {
+            assert!(matches!(act("pageup", viewing), Action::Bytes(_)));
+            assert!(matches!(act("pagedown", viewing), Action::Bytes(_)));
+        }
+        // A further modifier makes the chord unlisted rather than a scroll.
+        for chord in ["ctrl+shift+pageup", "alt+shift+pagedown", "super+shift+pageup"] {
+            assert_eq!(act(chord, true), Action::Silent, "{chord}");
+        }
+    }
+
+    #[test]
+    fn end_is_the_childs_at_the_bottom_and_the_viewports_above_it() {
+        assert!(matches!(act("end", false), Action::Bytes(_)));
+        assert_eq!(act("end", true), Action::Scroll(Scroll::Bottom));
+        // Caps Lock has no level to select on End, so it does not make the
+        // chord a different one; a real modifier does.
+        assert_eq!(act("caps+end", true), Action::Scroll(Scroll::Bottom));
+        assert_eq!(act("shift+end", true), Action::Silent);
+        assert_eq!(act("ctrl+end", true), Action::Silent);
+        assert!(matches!(act("alt+end", true), Action::Bytes(_)));
+    }
+
+    /// One row of overlap, so the line last read survives the page.
+    #[test]
+    fn a_page_is_a_screen_less_one_row_and_never_zero() {
+        assert_eq!(page_lines(24), 23);
+        assert_eq!(page_lines(2), 1);
+        assert_eq!(page_lines(1), 1);
+        assert_eq!(page_lines(0), 1);
+    }
+
+    /// One epoch's worth of history, as the model would report it.
+    fn history(pushed: u64, lines: usize) -> Scrollback {
+        Scrollback {
+            epoch: 0,
+            pushed,
+            lines,
+        }
+    }
+
+    #[test]
+    fn the_viewport_stops_at_both_ends_of_what_history_holds() {
+        let mut viewport = Viewport::new();
+        let back = Action::Scroll(Scroll::Back);
+        let forward = Action::Scroll(Scroll::Forward);
+        // Ten lines of history, four rows: three per page.
+        for _ in 0..4 {
+            viewport.apply(&back, 4, history(10, 10));
+        }
+        assert_eq!(viewport.offset(history(10, 10)), 10);
+        assert!(viewport.viewing(history(10, 10)));
+        for _ in 0..4 {
+            viewport.apply(&forward, 4, history(10, 10));
+        }
+        assert_eq!(viewport.offset(history(10, 10)), 0);
+        assert!(!viewport.viewing(history(10, 10)));
+    }
+
+    /// The anchor names a line, so output underneath an open viewport moves
+    /// the live bottom away from it rather than moving the view.
+    #[test]
+    fn output_under_an_open_viewport_does_not_move_it() {
+        let mut viewport = Viewport::new();
+        viewport.apply(&Action::Scroll(Scroll::Back), 2, history(10, 10));
+        assert_eq!(viewport.offset(history(10, 10)), 1);
+        assert_eq!(viewport.offset(history(11, 11)), 2);
+        assert_eq!(viewport.offset(history(40, 40)), 31);
+    }
+
+    /// Eviction is `pushed` growing while `lines` stays at the ceiling. The
+    /// anchored line eventually falls out of the retained window, and the
+    /// view then rides the top of what remains rather than being thrown to
+    /// the live bottom -- which is where the reader was heading, and is the
+    /// only choice that does not move on every further line of output.
+    #[test]
+    fn an_evicted_anchor_rides_the_top_of_what_history_still_holds() {
+        let mut viewport = Viewport::new();
+        viewport.apply(&Action::Scroll(Scroll::Back), 4, history(10, 10));
+        assert_eq!(viewport.offset(history(10, 10)), 3);
+        // Seven more lines: the window is full, so the anchored line is gone.
+        assert_eq!(viewport.offset(history(17, 10)), 10);
+        assert_eq!(viewport.offset(history(1_000, 10)), 10);
+        assert!(viewport.viewing(history(1_000, 10)));
+    }
+
+    /// A clear renumbers from zero, so an old anchor's line number becomes a
+    /// number some future line will also have. Without the epoch the view
+    /// would reopen as output pushed `pushed` back past it.
+    #[test]
+    fn a_cleared_history_does_not_let_an_old_anchor_reopen() {
+        let mut viewport = Viewport::new();
+        viewport.apply(&Action::Scroll(Scroll::Back), 4, history(10, 10));
+        assert_eq!(viewport.offset(history(10, 10)), 3);
+        let after = |pushed: u64, lines: usize| Scrollback {
+            epoch: 1,
+            pushed,
+            lines,
+        };
+        assert_eq!(viewport.offset(after(0, 0)), 0);
+        // The numbers the old anchor named come back around; the view does not.
+        for pushed in 1..20u64 {
+            let lines = usize::try_from(pushed).unwrap();
+            assert_eq!(viewport.offset(after(pushed, lines)), 0, "{pushed}");
+            assert!(!viewport.viewing(after(pushed, lines)), "{pushed}");
+        }
+        // Scrolling again anchors in the new numbering and works normally.
+        viewport.apply(&Action::Scroll(Scroll::Back), 4, after(19, 19));
+        assert_eq!(viewport.offset(after(19, 19)), 3);
+    }
+
+    /// A silent key is neither input nor a scroll, so it must leave the
+    /// anchor exactly as it found it -- including its epoch.
+    #[test]
+    fn a_silent_key_does_not_move_the_anchor() {
+        let mut viewport = Viewport::new();
+        viewport.apply(&Action::Scroll(Scroll::Back), 9, history(10, 10));
+        let anchored = viewport;
+        viewport.apply(&Action::Silent, 9, history(10, 10));
+        assert_eq!(viewport, anchored);
+        // Not even when a clamp is what the offset would have re-anchored at.
+        viewport.apply(&Action::Silent, 9, history(10, 3));
+        assert_eq!(viewport, anchored);
+    }
+
+    /// The compositor suppresses evdev repeat, so a held scroll chord that
+    /// did not repeat here would move exactly one page however long it was
+    /// held -- and walking back through scrollback is what holding it is for.
+    #[test]
+    fn a_held_scroll_chord_repeats_as_a_scroll() {
+        let modes = Modes::default();
+        let mut repeat = Repeat::with_timing(600, 40);
+        let (code, modifiers) = parse_chord("shift+pageup").unwrap();
+        repeat.press(code, modifiers, modes, true, 0);
+        assert!(repeat.armed());
+        assert_eq!(repeat.due(600, modes, true), Some(Action::Scroll(Scroll::Back)));
+        assert_eq!(repeat.due(640, modes, true), Some(Action::Scroll(Scroll::Back)));
+    }
+
+    /// A repetition is routed when it is emitted, so a held End closes the
+    /// view once and then types: the state it asks about changed under it.
+    #[test]
+    fn a_held_end_closes_the_view_and_then_becomes_the_childs() {
+        let modes = Modes::default();
+        let mut repeat = Repeat::with_timing(600, 40);
+        repeat.press(key_code("end").unwrap(), 0, modes, true, 0);
+        assert_eq!(
+            repeat.due(600, modes, true),
+            Some(Action::Scroll(Scroll::Bottom))
+        );
+        assert!(matches!(
+            repeat.due(640, modes, false),
+            Some(Action::Bytes(_))
+        ));
+    }
+
+    #[test]
+    fn bytes_and_the_bottom_key_both_close_the_view() {
+        for closing in [
+            Action::Bytes(Sequence::new(b"a").unwrap()),
+            Action::Scroll(Scroll::Bottom),
+        ] {
+            let mut viewport = Viewport::new();
+            viewport.apply(&Action::Scroll(Scroll::Back), 4, history(10, 10));
+            assert!(viewport.viewing(history(10, 10)));
+            viewport.apply(&closing, 4, history(10, 10));
+            assert_eq!(viewport.offset(history(10, 10)), 0);
+            assert!(!viewport.viewing(history(10, 10)));
+        }
     }
 }

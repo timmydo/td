@@ -21,6 +21,12 @@ terminal generates the other, and the PTY writer merges them only later. A key
 this profile deliberately does not translate contributes no bytes rather than
 being a corpus error.
 
+`expect viewport` names how many lines back the scrollback viewport sits,
+which no byte stream reports: a key routed to the viewport reaches neither
+the child nor the terminal, so its whole effect is that number. What the
+viewport SHOWS is the renderer's, and the render spec is where it is
+checked -- these cases pin which key moves it, and how far.
+
 libvterm-0.3.3.term is generated from the pinned MIT-licensed v0.3.3 archive.
 Its report accounts for every source case and assertion; LICENSE.libvterm
 retains the upstream license. The archive and legacy Perl/C harness are not

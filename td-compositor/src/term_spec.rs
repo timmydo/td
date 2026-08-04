@@ -36,6 +36,7 @@ const KNOWN_TAGS: &[&str] = &[
     "modes",
     "replies",
     "resize",
+    "scrollback",
     "utf8",
     "wrapping",
 ];
@@ -85,6 +86,9 @@ enum Expectation {
         enabled: bool,
     },
     Reply(Vec<u8>),
+    /// How many lines back the scrollback viewport sits, which no byte
+    /// stream reports: it is td-term's own state, not the child's.
+    Viewport(usize),
     Row {
         row: usize,
         text: String,
@@ -204,6 +208,7 @@ fn validate_expectation_bounds(
         | Expectation::Input(_)
         | Expectation::Mode { .. }
         | Expectation::Reply(_)
+        | Expectation::Viewport(_)
         | Expectation::Size { .. } => {}
     }
     Ok(())
@@ -560,6 +565,12 @@ fn parse_expectation(file: &str, line: usize, input: &str) -> Result<Expectation
             rest,
             "history cell count",
         )?)),
+        "viewport" => Ok(Expectation::Viewport(parse_usize(
+            file,
+            line,
+            rest,
+            "viewport line count",
+        )?)),
         "mode" => {
             let (name, enabled) =
                 word(rest).ok_or_else(|| at(file, line, "mode requires a name and state"))?;
@@ -789,10 +800,50 @@ fn feed_operation(
     }
 }
 
+/// A clear retires the numbering as well as the lines. Both halves matter:
+/// the count so a fresh anchor is relative to the new history, the epoch so
+/// an old one cannot come back into range as that count grows.
+#[test]
+fn clearing_history_restarts_the_count_in_a_new_numbering() {
+    let mut terminal = Terminal::new(2, 4).unwrap();
+    terminal.feed(b"1\r\n2\r\n3\r\n4");
+    let epoch = terminal.history_epoch();
+    assert!(terminal.history_pushed() > 0);
+    terminal.feed(b"\x1bc");
+    assert_eq!(terminal.history_pushed(), 0);
+    assert_eq!(terminal.history_epoch(), epoch + 1);
+    // `CSI 3 J` drops the saved lines without resetting the screen, and is
+    // the same retirement.
+    terminal.feed(b"5\r\n6\r\n7\r\n8");
+    assert!(terminal.history_pushed() > 0);
+    terminal.feed(b"\x1b[3J");
+    assert_eq!(terminal.history_pushed(), 0);
+    assert_eq!(terminal.history_epoch(), epoch + 2);
+}
+
+/// A push the ceilings refuse is not a line, so it is not counted either.
+#[test]
+fn a_refused_push_does_not_count_as_a_line() {
+    let mut history = History::new(false);
+    history.push_line(&[Cell::blank(Attributes::default()); 4], 0, 4, false);
+    assert_eq!(history.lines.len(), 0);
+    assert_eq!(history.pushed, 0);
+}
+
+/// The three numbers a viewport reads, as the model reports them.
+fn scrollback(terminal: &Terminal) -> keys::Scrollback {
+    keys::Scrollback {
+        epoch: terminal.history_epoch(),
+        pushed: terminal.history_pushed(),
+        lines: terminal.history_lines(),
+    }
+}
+
 fn check_expectation(
     case: &Case,
     terminal: &Terminal,
     input: &[u8],
+    viewport: &keys::Viewport,
     expected: &Expectation,
 ) -> Result<(), String> {
     let failure = |detail: String| format!("{}: {detail}", case.id);
@@ -841,6 +892,14 @@ fn check_expectation(
             if actual != *expected {
                 return Err(failure(format!(
                     "history: expected {expected} cells, got {actual}"
+                )));
+            }
+        }
+        Expectation::Viewport(expected) => {
+            let actual = viewport.offset(scrollback(terminal));
+            if actual != *expected {
+                return Err(failure(format!(
+                    "viewport: expected {expected} lines back, got {actual}"
                 )));
             }
         }
@@ -943,6 +1002,7 @@ fn run_case(case: &Case, chunking: Chunking) -> Result<CaseRun, String> {
     let mut seed = case_seed(case);
     let mut mismatches = Vec::new();
     let mut input = Vec::new();
+    let mut viewport = keys::Viewport::new();
     for step in &case.steps {
         match step {
             Step::Write(bytes) => {
@@ -955,18 +1015,23 @@ fn run_case(case: &Case, chunking: Chunking) -> Result<CaseRun, String> {
             }
             // The adapter reads the mode the terminal is in now, which is what
             // makes an application-cursor case observable from one stream.
+            // It reads the viewport for the same reason: End has two meanings
+            // and which one it has is the state at the moment of the press.
             Step::Key(code, modifiers) => {
                 let modes = keys::Modes {
                     application_cursor: terminal.mode("application-cursor") == Some(true),
                 };
-                if let Some(sequence) = keys::sequence(*code, *modifiers, modes) {
+                let history = scrollback(&terminal);
+                let action = keys::action(*code, *modifiers, modes, viewport.viewing(history));
+                if let keys::Action::Bytes(sequence) = action {
                     input.extend_from_slice(sequence.as_slice());
                 }
+                viewport.apply(&action, terminal.rows(), history);
                 operation += 1;
             }
             Step::Expect(expected) => {
                 expectation = expectation.saturating_add(1);
-                if let Err(error) = check_expectation(case, &terminal, &input, expected) {
+                if let Err(error) = check_expectation(case, &terminal, &input, &viewport, expected) {
                     mismatches.push(Mismatch {
                         gap: Gap {
                             case: case.id.clone(),
@@ -1368,6 +1433,43 @@ fn assert_terminal_invariants(terminal: &Terminal) {
         );
     }
     assert!(terminal.replies().len() <= MAX_REPLY_BYTES);
+}
+
+/// The push counter exists to differ from the retained-line count, and the
+/// two agree until history evicts -- so without driving a terminal past its
+/// ceiling, `history_pushed` could return `history_lines` and nothing would
+/// notice. This is what makes the counter's existence observable.
+#[test]
+fn the_push_counter_outruns_the_lines_history_still_holds() {
+    let width = 4_096;
+    let mut terminal = Terminal::new(1, width).unwrap();
+    let row = vec![b'x'; width];
+    for _ in 0..400 {
+        terminal.feed(&row);
+    }
+    let pushed = terminal.history_pushed();
+    let lines = terminal.history_lines();
+    assert!(lines > 0);
+    assert!(
+        pushed > u64::try_from(lines).unwrap(),
+        "{pushed} pushed, {lines} retained: nothing was evicted"
+    );
+
+    // An anchor from before the flood names an evicted line, so the view
+    // rides the top of what remains rather than following the live bottom.
+    let mut viewport = keys::Viewport::new();
+    viewport.apply(
+        &keys::Action::Scroll(keys::Scroll::Back),
+        terminal.rows(),
+        keys::Scrollback {
+            epoch: terminal.history_epoch(),
+            pushed: 1,
+            lines: 1,
+        },
+    );
+    assert_eq!(viewport.offset(scrollback(&terminal)), lines);
+    terminal.feed(&row);
+    assert_eq!(viewport.offset(scrollback(&terminal)), terminal.history_lines());
 }
 
 #[test]

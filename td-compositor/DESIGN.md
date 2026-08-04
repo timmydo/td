@@ -685,9 +685,10 @@ contract below.
 
 Of that contract these are built: the parser and terminal model, the native
 corpus including its `key` operations, the keyboard adapter of section 11
-(translation, autorepeat, and the bounded input queue), and from section 12 the
-PTY open/unlock/peer/winsize operations, the account and environment policy,
-the child argv through `cttyhack --stdin`, and the PTY reader thread.
+(translation, autorepeat, the bounded input queue, and the scrollback
+viewport it selects), and from section 12 the PTY open/unlock/peer/winsize
+operations, the account and environment policy, the child argv through
+`cttyhack --stdin`, and the PTY reader thread.
 
 Section 11's pinned font is landed: the committed Unifont face, its licenses
 and provenance record, the importer that derives it reproducibly, and the PSF2
@@ -696,7 +697,8 @@ the renderer can index a glyph.
 
 Section 11's renderer is landed as a pure function, with section 14's exact
 P6 goldens as its oracle: the palette, the six renditions, the cursor, the
-visual-bell ring, the clipping, and the scrollback viewport's rendering half.
+visual-bell ring, the clipping, and the scrollback viewport, whose selecting
+keys landed after it.
 What it still lacks is a caller. Nothing submits its output to a surface, so
 the frame-callback coalescing, the persistent-buffer reuse-after-release, and
 the buffer replacement on resize that section 11 also specifies land with the
@@ -1050,10 +1052,15 @@ Release, focus loss, or any modifier snapshot change cancels the corresponding
 repeat; this also covers compositor chords whose command-key events are
 intercepted. Releasing some other key leaves a held key repeating, and
 repetitions missed while the main loop was busy are dropped rather than
-delivered as a burst. A repetition is translated when it is emitted, not when
+delivered as a burst. A repetition is routed when it is emitted, not when
 the key went down: the child can change cursor-key mode while an arrow is held,
 and a stored sequence would keep sending the spelling that was correct at the
-press.
+press. A held chord that scrolls repeats as a scroll, since walking back
+through scrollback is what holding it is for and the compositor sends no
+repeat events of its own to fall back on. Routing per repetition is also
+what makes a held End coherent: the first repetition closes the viewport and
+the ones after it are the child's, because by then the view is at the live
+bottom.
 
 Keyboard bytes reach the PTY writer through a bounded queue that admits a
 sequence whole or drops it whole: half a `CSI` arriving at the child would be
@@ -1064,10 +1071,34 @@ nowhere to come back from. Because the master is blocking, a child that stops
 reading blocks that writer once the line discipline fills — which is why the
 writer is its own thread and the main loop only enqueues.
 
-The scrollback viewport `Shift+PageUp` and `Shift+PageDown` select lands with
-the renderer, and so does §10's rule that an unmodified End key returns to the
-live bottom while viewing scrollback. Until then End is forwarded in the
-selected cursor-key mode, which is its behaviour at the live bottom.
+`Shift+PageUp` and `Shift+PageDown` move the viewport a screen less one row
+at a time, so the line last read is still on screen to read on from, and a
+one-row grid still scrolls by one rather than not at all. Both stop at the
+ends: there is nothing above the oldest retained line and nothing below the
+live screen, so a chord at either end is inert rather than an error.
+
+The viewport stores the line it is looking at in a monotonic numbering of
+lines ever pushed to primary history, not a distance from the live bottom,
+because the bottom moves. A stored distance would let a child writing
+underneath an open viewport drag the view along with it, one line per line
+of output. Clearing that history — a reset, or `CSI 3 J` — retires the
+numbering along with the lines, so an anchor is tagged with which numbering
+it belongs to. Zeroing the count alone would not close the view: the old
+anchor's line number comes back around as new lines arrive, and the view
+would reopen on lines that have nothing to do with it.
+
+The distance the anchor implies is clamped on every read rather than stored,
+because eviction drops the oldest lines and a resize can shorten the history
+an anchor lives in. An anchor whose line has been evicted rides the top of
+what history still holds, rather than being thrown back to the live bottom:
+that is where the reader was heading, and on a full buffer the alternative
+moves the view on every further line of output. Riding the top is therefore
+the end of what scrolling back can reach, and a retired numbering is the
+only thing that returns a view to the live bottom without a key. A silent
+key does not re-anchor at where a clamp put the view — the anchor still
+names the line asked for. End's two meanings follow that position rather
+than whether the viewport was ever opened, since what it asks is whether
+anything but the live screen is showing.
 
 The renderer's half of that viewport is landed: a snapshot carries how many
 lines back it is scrolled, rows above the split come from the primary
@@ -1076,8 +1107,13 @@ stored history clamps rather than blanks. History is primary-screen only,
 so the viewport reads it even while the alternate screen is active -- which
 is what lets it show the shell a full-screen program is covering. A line is
 stored at the width it scrolled off with, so a widening resize leaves the
-tail of an old line blank rather than fabricating cells for it. The keys
-that select the viewport land with the input adapter.
+tail of an old line blank rather than fabricating cells for it.
+
+The keys that select it are landed too, so the viewport is complete as a
+pure pair: the adapter routes a press to the child, to the viewport, or
+nowhere, and the viewport turns those into the offset a snapshot takes.
+What is left for the client is calling them — nothing yet asks the adapter
+what a key means, and the corpus is what drives it instead.
 
 ## 12. PTY and process lifecycle
 
@@ -1279,9 +1315,9 @@ vocabulary:
 - `write`, `resize`, and `key` operations; and
 - `expect` statements for rows, imported text and glyph observations, cells,
   cursor, modes, cumulative terminal replies, cumulative keyboard input,
-  history, and an optional rendered PPM -- the last of these deferred, as
-  §13's tree records. Cursor expectations accept only the optional
-  `pending-wrap` flag.
+  history, the scrollback viewport, and an optional rendered PPM -- the last
+  of these deferred, as §13's tree records. Cursor expectations accept only
+  the optional `pending-wrap` flag.
 
 Every case has a source. td-authored cases use `source td`; derived cases name
 the pinned release, path, and original case. `size` is rows followed by
