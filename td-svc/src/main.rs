@@ -732,7 +732,7 @@ mod confinement {
     /// The scan above proves every `mod` line has a file and every file has a
     /// `mod` line, which is a closed loop that says nothing about WHICH files:
     /// a `mod` line and its file added together satisfy both halves. This pins
-    /// the set the AGENTS.md amendment was written against.
+    /// the set the UNSAFE.md amendment was written against.
     ///
     /// The second half is why the collector keeps non-`.rs` files rather than
     /// skipping them: `src/sys.inc` is invisible to a `.rs`-only scan and
@@ -863,7 +863,7 @@ mod confinement {
         count
     }
 
-    /// The syscall AGENTS.md records for this crate, with the x86_64 number it
+    /// The syscall UNSAFE.md records for this crate, with the x86_64 number it
     /// must carry. A SECOND is a reviewed amendment; this is what makes that
     /// more than an aspiration.
     ///

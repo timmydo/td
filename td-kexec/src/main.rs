@@ -7,7 +7,7 @@
 //! Payload-hash verification is td-boot's job, NOT this
 //! program's, so this stays a two-syscall surface. This is the ONLY `unsafe` in
 //! td outside `builder/src/sys.rs` — a recorded amendment to the confinement
-//! rule (AGENTS.md). Unlike builder's crate-level `#![allow(unsafe_code)]`, the
+//! rule (UNSAFE.md). Unlike builder's crate-level `#![allow(unsafe_code)]`, the
 //! confinement here is compiler-enforced: the crate `#![deny(unsafe_code)]`s and
 //! only `syscall5` carries a scoped `#[allow]`, so any other `unsafe` reds.
 //!

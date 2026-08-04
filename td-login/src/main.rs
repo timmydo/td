@@ -17,7 +17,7 @@
 //!
 //! The crate is `#![deny(unsafe_code)]` with ONE scoped exception: `sys.rs`'s
 //! `syscall2`, through which `setgroups`/`setgid`/`setuid` go. That is the
-//! FOURTH target-side unsafe surface AGENTS.md records, after td-kexec, td-netd
+//! FOURTH target-side unsafe surface UNSAFE.md records, after td-kexec, td-netd
 //! and td-init, and the narrowest of them. THREAT-MODEL.md section 2 says why it
 //! is not `CommandExt::uid()`: `groups` is unstable on the pinned stable rustc,
 //! and `std` applies credentials in a forked child where nothing can read back
@@ -413,7 +413,7 @@ mod tests {
 /// crate's own source.
 ///
 /// Adapted from `td-init/src/main.rs`'s `mod confinement`, which is the shape
-/// AGENTS.md's target-side unsafe exceptions are held to. The scanning machinery
+/// UNSAFE.md's target-side unsafe exceptions are held to. The scanning machinery
 /// is the same; the assertions are this crate's. Two of them are new here and
 /// are the reason this module exists at all: the three credential syscalls are
 /// issued exactly once each, IN ORDER, from one function — and the crate never
@@ -624,7 +624,7 @@ mod confinement {
         out
     }
 
-    /// The syscalls AGENTS.md records for this crate, with the x86_64 number
+    /// The syscalls UNSAFE.md records for this crate, with the x86_64 number
     /// each name must carry. A FOURTH is a reviewed amendment; this test is what
     /// makes that more than an aspiration.
     ///
@@ -807,7 +807,7 @@ mod confinement {
     /// The scan above proves every `mod` line has a file and every file has a
     /// `mod` line, which is a closed loop that says nothing about WHICH files:
     /// a `mod` line and its file added together satisfy both halves. This pins
-    /// the set the AGENTS.md amendment was written against.
+    /// the set the UNSAFE.md amendment was written against.
     ///
     /// The second half is why the collector keeps non-`.rs` files rather than
     /// skipping them: `src/sys.inc` is invisible to a `.rs`-only scan and

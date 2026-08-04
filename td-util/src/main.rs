@@ -27,7 +27,7 @@
 //! without waiting for Enter, or ask how many rows the screen has, is not a pager,
 //! and both are `ioctl(2)`. That surface is ONE syscall with THREE pinned requests,
 //! confined to `sys.rs` with `term.rs` its only caller; it is the SEVENTH
-//! target-side unsafe exception AGENTS.md records, and `mod confinement` below
+//! target-side unsafe exception UNSAFE.md records, and `mod confinement` below
 //! asserts every part of it against this crate's own source. The applets that would
 //! need a syscall beyond that roster (reboot/poweroff/halt, switch_root, cttyhack,
 //! init) are deliberately absent — adding one is a further reviewed amendment, not
@@ -218,7 +218,7 @@ mod tests {
 
 /// The crate's `unsafe` surface, asserted against its own source TEXT.
 ///
-/// td-util is the SEVENTH target-side unsafe exception AGENTS.md records, and
+/// td-util is the SEVENTH target-side unsafe exception UNSAFE.md records, and
 /// like the six before it the exception is worth what its confinement is worth.
 /// The compiler checks that `unsafe` appears only where a scoped `#[allow]`
 /// permits it; it cannot check that there is exactly ONE such allow, that the
@@ -540,7 +540,7 @@ mod confinement {
     /// file is one of the sources it reads.
     const DECL: &str = concat!("const", "SYS_");
 
-    /// The syscall AGENTS.md records for this crate, with the x86_64 number it
+    /// The syscall UNSAFE.md records for this crate, with the x86_64 number it
     /// must carry. A SECOND is a reviewed amendment; this is what makes that
     /// more than an aspiration.
     ///
@@ -628,7 +628,7 @@ mod confinement {
     /// The scan above proves every `mod` line has a file and every file has a
     /// `mod` line, which is a closed loop that says nothing about WHICH files:
     /// a `mod` line and its file added together satisfy both halves. This pins
-    /// the set the AGENTS.md amendment was written against.
+    /// the set the UNSAFE.md amendment was written against.
     ///
     /// The second half is why the collector keeps non-`.rs` files rather than
     /// skipping them: `src/sys.inc` is invisible to a `.rs`-only scan and

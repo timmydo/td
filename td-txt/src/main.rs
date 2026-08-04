@@ -8,7 +8,7 @@
 //! `td-txt <applet> [args]` form covers the un-symlinked case.
 //!
 //! Everything here is safe `std` (`#![forbid(unsafe_code)]`): a regex engine and
-//! line I/O need none of the target-side syscall exceptions AGENTS.md records for
+//! line I/O need none of the target-side syscall exceptions UNSAFE.md records for
 //! td-kexec/td-netd/td-init.
 //!
 //! Behavior is scored against the conformance corpus in `../spec` — the vendored

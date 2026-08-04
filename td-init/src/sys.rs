@@ -4,7 +4,7 @@
 //! scoped `#[allow]`: `syscall5`, the `syscall`-instruction body copied verbatim
 //! from `builder/src/sys.rs`/`td-kexec`. Everything else in the crate — and every
 //! other function in this module — is ordinary safe Rust. This is the THIRD
-//! target-side unsafe exception AGENTS.md records, after td-kexec (two syscalls)
+//! target-side unsafe exception UNSAFE.md records, after td-kexec (two syscalls)
 //! and td-netd (one ioctl).
 //!
 //! The crate-level `deny` catches an added `unsafe`, but it is not the whole

@@ -4,7 +4,7 @@
 //! scoped `#[allow]`: `syscall3`, the `syscall`-instruction body copied from
 //! `td-init/src/sys.rs`. Everything else in the crate — and every other function
 //! in this module — is ordinary safe Rust. This is the SEVENTH target-side unsafe
-//! exception AGENTS.md records.
+//! exception UNSAFE.md records.
 //!
 //! The surface is ONE syscall, `ioctl(2)`, with exactly THREE permitted requests,
 //! all of them about the shape and mode of a terminal this process already has

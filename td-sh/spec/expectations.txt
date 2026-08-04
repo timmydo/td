@@ -603,12 +603,10 @@ xfail builtin-type-bash.test.sh::type prints function source code
 xfail builtin-type.test.sh::more special builtins
 xfail builtin-type.test.sh::type -> not found
 xfail builtin-umask.test.sh::'umask -S' prints symbolic umask
-xfail builtin-umask.test.sh::'umask -p' prints a form that can be eval'd
 xfail builtin-umask.test.sh::'umask 0002' sets the umask
 xfail builtin-umask.test.sh::'umask' without args prints the umask
 xfail builtin-umask.test.sh::set umask with symbolic mode: g-w,o-w
 xfail builtin-umask.test.sh::set umask with symbolic mode: u-rw  ...  u=,g+,o-  ...
-xfail builtin-umask.test.sh::symbolic syntax error: b=rwx
 xfail builtin-umask.test.sh::symbolic syntax error: empty clause u-r,,u-r
 xfail builtin-umask.test.sh::symbolic syntax error: start with -
 xfail builtin-umask.test.sh::umask X perm
@@ -622,10 +620,7 @@ xfail builtin-umask.test.sh::umask s perm
 xfail builtin-umask.test.sh::umask sequential actions
 xfail builtin-umask.test.sh::umask t perm
 xfail builtin-umask.test.sh::umask with too many arguments (i.e. extra spaces)
-xfail builtin-umask.test.sh::usage: empty input, space input
-xfail builtin-umask.test.sh::usage: invalid octal digits
 xfail builtin-umask.test.sh::usage: large octal number
-xfail builtin-umask.test.sh::usage: too many args
 xfail builtin-vars.test.sh::Dependent export setting
 xfail builtin-vars.test.sh::Export a global variable and unset it
 xfail builtin-vars.test.sh::Export a local that shadows a global

@@ -22,7 +22,7 @@ use crate::types::{Recipe, Step};
 // `free`/`ps` read /proc and `dmesg` reads /dev/kmsg O_NONBLOCK, all ordinary file
 // I/O. `less` is the one that is not: taking a keystroke without waiting for Enter,
 // and asking how many rows a screen has, are `ioctl(2)`, and nothing in safe `std`
-// reaches them. That is the SEVENTH target-side unsafe exception AGENTS.md records —
+// reaches them. That is the SEVENTH target-side unsafe exception UNSAFE.md records —
 // ONE syscall, THREE pinned requests (TCGETS/TCSETS/TIOCGWINSZ), confined to
 // `sys.rs` with `term.rs` its only caller — so the crate root is `#![deny]` rather
 // than `#![forbid]` and `main.rs`'s `mod confinement` tests hold the surface at that.

@@ -521,6 +521,137 @@ fn the_export_listing_is_eval_safe() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// `umask` is td-sh's first builtin backed by a raw syscall, and its symbolic
+/// form is busybox's `bb_parse_mode`: clauses act on the PERMITTED bits, left to
+/// right, each seeing what the last one left. Every value here was measured on
+/// busybox 1.37.0 ash.
+#[test]
+fn umask_is_ashs_including_the_symbolic_form() -> Result<(), Box<dyn std::error::Error>> {
+    let shell = PathBuf::from(env!("CARGO_BIN_EXE_td-sh"));
+    let run = |src: &str| -> Result<(String, i32), Box<dyn std::error::Error>> {
+        let out = std::process::Command::new(&shell)
+            .arg("-c")
+            .arg(src)
+            .env_clear()
+            .output()?;
+        Ok((
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+            out.status.code().unwrap_or(-1),
+        ))
+    };
+    // Reading prints four octal digits; setting takes numeric or symbolic.
+    assert_eq!(run("umask 077; umask")?, ("0077\n".to_string(), 0));
+    assert_eq!(run("umask 22; umask")?, ("0022\n".to_string(), 0));
+    assert_eq!(run("umask 0777; umask")?, ("0777\n".to_string(), 0));
+    // `-S` reports what a new file WOULD get, not the mask.
+    assert_eq!(run("umask 022; umask -S")?, ("u=rwx,g=rx,o=rx\n".to_string(), 0));
+    assert_eq!(run("umask 777; umask -S")?, ("u=,g=,o=\n".to_string(), 0));
+    // Clauses are sequential and see the running value...
+    assert_eq!(run("umask 0; umask u=rwx,u-w; umask")?, ("0200\n".to_string(), 0));
+    assert_eq!(run("umask 0; umask u=rwx,g=rx,o=; umask")?, ("0027\n".to_string(), 0));
+    // ...a permcopy reads that running value too...
+    assert_eq!(run("umask 022; umask g=u; umask")?, ("0002\n".to_string(), 0));
+    // ...`X` is execute only where execute is already permitted...
+    assert_eq!(run("umask 0; umask u=X; umask")?, ("0600\n".to_string(), 0));
+    assert_eq!(run("umask 777; umask u=X; umask")?, ("0777\n".to_string(), 0));
+    // ...and a bare `who` means "all EXCEPT what the mask already covers", which
+    // is why the same clause does different things from different masks.
+    assert_eq!(run("umask 0; umask =r; umask")?, ("0333\n".to_string(), 0));
+    assert_eq!(run("umask 077; umask =r; umask")?, ("0377\n".to_string(), 0));
+    // `=` CLEARS BEFORE THE PERMS ARE READ, so `X` and a permcopy in the same
+    // clause see the cleared value. Reading them first is the plausible order
+    // and it is wrong in both directions: `a=X` would be 0666 and `u=u` 0022.
+    assert_eq!(run("umask 0; umask a=X; umask")?, ("0777\n".to_string(), 0));
+    assert_eq!(run("umask 022; umask u=u; umask")?, ("0722\n".to_string(), 0));
+    assert_eq!(run("umask 027; umask ugo=rX; umask")?, ("0333\n".to_string(), 0));
+    // A bare-`who` `=` clears all nine bits, NOT just the ones outside the
+    // mask. Only visible once an earlier clause has pushed the running value
+    // outside that set, which is why it needs a two-clause case.
+    assert_eq!(
+        run("umask 077; umask u=rwx,g+rwx,=r; umask")?,
+        ("0377\n".to_string(), 0)
+    );
+    // One clause holds a LIST of actions, each seeing what the last left.
+    assert_eq!(run("umask 0; umask u+r-w; umask")?, ("0200\n".to_string(), 0));
+    // `s` and `t` are ordinary perms that happen to name bits outside the nine.
+    // So neither is universally legal or universally inert: what decides is
+    // whether the RESULT outgrew 0777. `o=rwxs` keeps no setuid bit and is
+    // fine; `a+t` keeps sticky and so is an illegal mode.
+    assert_eq!(run("umask 0; umask u=t; umask")?, ("0700\n".to_string(), 0));
+    assert_eq!(run("umask 022; umask o=rwxs; umask")?, ("0020\n".to_string(), 0));
+    assert_eq!(run("umask 022; umask u-s,g-w; umask")?, ("0022\n".to_string(), 0));
+    // A permcopy consumes ONE character, so anything after it must be another
+    // action -- `u=gr` is an error, not a silently truncated `u=g`. Truncating
+    // is the dangerous shape: a typo would set a DIFFERENT mask, not fail.
+    assert_eq!(run("umask 022; umask u=gr; echo st=$?; umask")?,
+        ("st=2\n0022\n".to_string(), 0));
+    // Options bundle, `--` ends them, and a lone `-` is an operand. `-Sp` is
+    // the case that proves EVERY character is checked: `-SS` alone passes
+    // whether the loop reads one flag or all of them.
+    assert_eq!(run("umask 022; umask -SS")?, ("u=rwx,g=rx,o=rx\n".to_string(), 0));
+    assert_eq!(run("umask 022; umask -Sp; echo st=$?")?, ("st=2\n".to_string(), 0));
+    assert_eq!(run("umask 022; umask -SSp; echo st=$?")?, ("st=2\n".to_string(), 0));
+    assert_eq!(run("umask 022; umask --")?, ("0022\n".to_string(), 0));
+    assert_eq!(run("umask 022; umask -S -- 077; umask")?, ("0077\n".to_string(), 0));
+    assert_eq!(run("umask 022; umask -; umask")?, ("0022\n".to_string(), 0));
+    // Errors are status 2 and NOT fatal, so the script keeps going -- and the
+    // mask is UNCHANGED. Asserting only that nothing printed would not tell a
+    // rejected mode from one silently accepted, since neither prints.
+    for bad in [
+        "8", "abc", "b=rwx", "99999999999", "07777", "+077", "u=s", "g+s", " ", "a+t",
+        "=t", "u=gr", "ao-ux", "u", "0778", "0x22", "22x",
+    ] {
+        let (stdout, code) = run(&format!("umask \"{bad}\"; echo after"))?;
+        assert_eq!(code, 0, "`umask {bad}` must not end the script");
+        assert_eq!(stdout, "after\n", "`umask {bad}` must not print");
+        let (stdout, _) = run(&format!("umask 022; umask \"{bad}\"; umask"))?;
+        assert_eq!(stdout, "0022\n", "`umask {bad}` changed the mask");
+    }
+    // A permcopy reads the RUNNING value, so a clause before it is visible:
+    // entry-based copying would answer 0300 here, and 0227 below.
+    assert_eq!(run("umask 0; umask u=r,g=u; umask")?, ("0330\n".to_string(), 0));
+    assert_eq!(run("umask 077; umask u=rx,g=u; umask")?, ("0227\n".to_string(), 0));
+    // An empty operand and extra operands are both accepted silently.
+    assert_eq!(run("umask 077; umask \"\"; umask")?, ("0077\n".to_string(), 0));
+    assert_eq!(run("umask 077 077; umask")?, ("0077\n".to_string(), 0));
+    // An unknown option is an option error, not a mode error.
+    assert_eq!(run("umask -p; echo after")?.0, "after\n");
+
+    // A SUBSHELL's mask is its own. ash forks, so nothing a subshell does can
+    // reach the parent; td-sh's subshells are in-process clones sharing one
+    // kernel mask, so this is the one piece of subshell state that needs an
+    // explicit save/restore -- and it is invisible to every assertion above.
+    assert_eq!(run("umask 022; (umask 077); umask")?, ("0022\n".to_string(), 0));
+    assert_eq!(
+        run("umask 022; (umask 077; umask); umask")?,
+        ("0077\n0022\n".to_string(), 0)
+    );
+    // Command substitution, pipeline stages and an async list are subshells too
+    // -- one assertion per `fork_shell` call site, since a site that forgot the
+    // guard would leak and nothing else here would notice.
+    assert_eq!(
+        run("umask 022; x=$(umask 077; umask); echo $x; umask")?,
+        ("0077\n0022\n".to_string(), 0)
+    );
+    assert_eq!(run("umask 022; umask 077 | :; umask")?, ("0022\n".to_string(), 0));
+    assert_eq!(run("umask 022; : | umask 077; umask")?, ("0022\n".to_string(), 0));
+    // The async body prints nothing on purpose: td-sh runs it synchronously
+    // (no job control yet), so a body that printed would pin THAT rather than
+    // the mask.
+    assert_eq!(run("umask 022; (umask 077) & umask")?, ("0022\n".to_string(), 0));
+    // ...nesting restores to the right level, not to the outermost...
+    assert_eq!(
+        run("umask 022; (umask 077; (umask 002; umask); umask); umask")?,
+        ("0002\n0077\n0022\n".to_string(), 0)
+    );
+    // ...and an `exit` out of the subshell still restores, which is why the
+    // guard restores on Drop rather than at the end of the body.
+    assert_eq!(run("umask 022; (umask 077; exit 3); echo $?; umask")?, ("3\n0022\n".to_string(), 0));
+    // A brace group is NOT a subshell, so there the mask does persist.
+    assert_eq!(run("umask 022; { umask 077; }; umask")?, ("0077\n".to_string(), 0));
+    Ok(())
+}
+
 /// `$RANDOM` is ash's one DYNAMIC variable. Every expected value here was
 /// measured on busybox 1.37.0 ash: a script that seeds asks for one SPECIFIC
 /// sequence, so "produces numbers in range" is not the same answer.
@@ -695,7 +826,7 @@ fn the_shell_seeds_the_names_ash_seeds() -> Result<(), Box<dyn std::error::Error
         "[/sbin:/usr/sbin:/bin:/usr/bin][\\w \\$ ][> ][+ ]\n"
     );
     // `/proc` answers these two, so neither needs `getppid(2)` nor
-    // `gethostname(2)` -- a new syscall would be an AGENTS.md amendment. Pinned
+    // `gethostname(2)` -- a new syscall would be an UNSAFE.md amendment. Pinned
     // to the EXACT values: "some digits" would pass for any wrong pid, and
     // "non-empty" for any wrong host.
     assert_eq!(

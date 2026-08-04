@@ -21,7 +21,7 @@ use crate::types::{Recipe, Step};
 // syscalls — setgroups(116), setgid(106), setuid(105) — issued once each, in
 // that order, from one function, with the result read back out of
 // /proc/self/status before anything execs. That is the FOURTH target-side unsafe
-// exception recorded in AGENTS.md, after td-kexec, td-netd and td-init, and the
+// exception recorded in UNSAFE.md, after td-kexec, td-netd and td-init, and the
 // crate's `mod confinement` tests pin every part of it the compiler cannot.
 //
 // Why not `CommandExt::uid()/gid()/groups()`, which would need no unsafe at all:

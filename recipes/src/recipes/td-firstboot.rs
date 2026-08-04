@@ -12,7 +12,7 @@ use crate::types::{Recipe, Step};
 // SCOPE: the /var side only. It carries no crypto — `sshd keygen` mints the ed25519
 // key — so the crate is pure safe std needing no syscall surface (its entropy is
 // /dev/random read as an ordinary file), which keeps it `#![forbid(unsafe_code)]`
-// and adds NO target-side unsafe exception to AGENTS.md.
+// and adds NO target-side unsafe exception to UNSAFE.md.
 //
 // Why mesboot-style (rustc invoked directly) and static, as for td-util/td-sh: this
 // runs at sysinit on a machine whose identity does not exist yet, and a tool that

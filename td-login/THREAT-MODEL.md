@@ -118,7 +118,7 @@ can *verify* them; Layer 2 would be impossible. Three confined syscalls
 in our own process buy the fidelity and the proof.
 
 The cost is recorded: this is the fourth target-side `unsafe` exception
-in AGENTS.md, and it is exactly three syscalls through one `syscall2`
+in UNSAFE.md, and it is exactly three syscalls through one `syscall2`
 body.
 
 ### Single-threadedness

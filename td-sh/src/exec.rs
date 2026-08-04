@@ -208,7 +208,7 @@ const MAX_RUN_DEPTH: u32 = 256;
 /// A value the kernel publishes as an ordinary file: the whole contents less the
 /// terminating newline when `key` is `None`, else the remainder of the first line
 /// starting with it. This is how `$PPID` and `$HOSTNAME` are answered without
-/// `getppid(2)` or `gethostname(2)` -- a new syscall is an AGENTS.md amendment,
+/// `getppid(2)` or `gethostname(2)` -- a new syscall is an UNSAFE.md amendment,
 /// and `/proc` makes one unnecessary.
 ///
 /// Two rules the obvious `trim()` gets wrong, both because ash reads these from

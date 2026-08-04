@@ -16,7 +16,7 @@ use crate::types::{Recipe, Step};
 // which covers the applets safe `std` already reaches and is
 // `#![forbid(unsafe_code)]` as a result. The crate confines its `unsafe` to one
 // `syscall5` body under a scoped `#[allow]` beneath a crate-level `deny` — the
-// THIRD target-side unsafe exception recorded in AGENTS.md, after td-kexec and
+// THIRD target-side unsafe exception recorded in UNSAFE.md, after td-kexec and
 // td-netd.
 //
 // system-x86-64 SHIPS this: /init (PID 1), both initramfses' mount pair, the

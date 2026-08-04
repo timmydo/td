@@ -14,6 +14,7 @@ use crate::{ast, exec};
 pub enum Builtin {
     Colon,
     True,
+    Umask,
     False,
     Echo,
     Printf,
@@ -59,6 +60,7 @@ pub fn lookup(name: &str) -> Option<Builtin> {
         "unset" => Builtin::Unset,
         "export" => Builtin::Export,
         "readonly" => Builtin::Readonly,
+        "umask" => Builtin::Umask,
         "read" => Builtin::Read,
         "getopts" => Builtin::Getopts,
         "test" | "[" => Builtin::Test,
@@ -135,6 +137,7 @@ pub fn run(sh: &mut Shell, bi: Builtin, argv: &[String]) -> R<()> {
         Builtin::Unset => unset(sh, argv),
         Builtin::Export => export(sh, argv, false),
         Builtin::Readonly => export(sh, argv, true),
+        Builtin::Umask => umask_builtin(sh, argv),
         Builtin::Local => local(sh, argv),
         Builtin::Read => read(sh, argv),
         Builtin::Getopts => getopts(sh, argv),
@@ -2556,6 +2559,206 @@ fn cd(sh: &mut Shell, argv: &[String]) -> R<()> {
         return out(sh, &line);
     }
     ok(sh)
+}
+
+/// The bits `bb_parse_mode` works in: the nine rwx bits plus setuid, setgid and
+/// sticky. A umask carries only the nine, but the parser handles all twelve and
+/// the CALLER rejects a result that outgrew 0777 -- which is how `a+t` becomes
+/// an illegal mode while `o=rwxs` is a legal one that changes nothing.
+const S_ISUID: u32 = 0o4000;
+const S_ISGID: u32 = 0o2000;
+const S_ISVTX: u32 = 0o1000;
+const FILEMODEBITS: u32 = S_ISUID | S_ISGID | S_ISVTX | 0o777;
+
+const WHO_CHARS: &[u8] = b"augo";
+const WHO_MASK: [u32; 4] = [FILEMODEBITS, S_ISUID | 0o700, S_ISGID | 0o070, 0o007];
+const PERM_CHARS: &[u8] = b"rwxXst";
+const PERM_MASK: [u32; 6] = [0o444, 0o222, 0o111, 0o111, S_ISUID | S_ISGID, S_ISVTX];
+
+/// `umask`'s mode operand, ported from busybox `libbb/parse_mode.c`.
+///
+/// `current_mode` is what the clauses start from -- for a symbolic operand ash
+/// hands in the PERMITTED bits, so `-` really does subtract permission. A clause
+/// holds a LIST of actions (`u+r-w`), and each action sees what the last one
+/// left. `umask_now` is the process mask, which limits a clause that names no
+/// `who`. `None` is the mode ash calls illegal.
+fn parse_mode(text: &str, current_mode: u32, umask_now: u32) -> Option<u32> {
+    let b = text.as_bytes();
+    // Numeric only when the FIRST character is an octal digit; `8` falls through
+    // to the symbolic parser, which rejects it as a bad `who`.
+    if b.first().is_some_and(|c| (b'0'..=b'7').contains(c)) {
+        let mut v: u32 = 0;
+        for c in b {
+            if !(b'0'..=b'7').contains(c) {
+                // `strtoul`'s trailing-character check: `0778` is not 077.
+                return None;
+            }
+            v = v.checked_mul(8)?.checked_add(u32::from(c - b'0'))?;
+        }
+        return if v > FILEMODEBITS { None } else { Some(v) };
+    }
+
+    let mut new_mode = current_mode;
+    let mut i = 0usize;
+    while i < b.len() {
+        if b.get(i) == Some(&b',') {
+            // Empty clauses are allowed, and an empty mode changes nothing.
+            i += 1;
+            continue;
+        }
+        // A `who` list. Running off the end inside one is an error rather than
+        // an implicit empty action, so `umask u` is illegal.
+        let mut wholist = 0u32;
+        while let Some(k) = b.get(i).and_then(|c| WHO_CHARS.iter().position(|w| w == c)) {
+            wholist |= *WHO_MASK.get(k)?;
+            i += 1;
+            if i >= b.len() {
+                return None;
+            }
+        }
+        loop {
+            let op = *b.get(i)?;
+            if op != b'+' && op != b'-' {
+                if op != b'=' {
+                    return None;
+                }
+                // `=` clears BEFORE the perms are read, which is why `X` and a
+                // permcopy in the same clause see the cleared value: `umask 0;
+                // umask a=X` leaves execute off and so is 0777, not 0666.
+                new_mode &= if wholist != 0 { !wholist } else { !FILEMODEBITS };
+            }
+            i += 1;
+
+            // A permcopy (`u=g`) reads the running value, and only from u/g/o.
+            let copy = b.get(i).and_then(|c| b"ugo".iter().position(|w| w == c));
+            let mut permlist = match copy {
+                Some(k) => {
+                    let mut pl = *WHO_MASK.get(k + 1)? & 0o777 & new_mode;
+                    for m in [0o444u32, 0o222, 0o111] {
+                        if pl & m != 0 {
+                            pl |= m;
+                        }
+                    }
+                    i += 1;
+                    pl
+                }
+                None => {
+                    let mut pl = 0u32;
+                    while let Some(k) =
+                        b.get(i).and_then(|c| PERM_CHARS.iter().position(|p| p == c))
+                    {
+                        // `X` is execute only where execute already is.
+                        if PERM_CHARS.get(k) != Some(&b'X') || new_mode & 0o111 != 0 {
+                            pl |= *PERM_MASK.get(k)?;
+                        }
+                        i += 1;
+                    }
+                    pl
+                }
+            };
+            if permlist != 0 {
+                // A clause naming no `who` is limited by the CURRENT process
+                // mask -- POSIX's rule, and note it is the mask, not the value
+                // being built, so an earlier clause cannot widen it.
+                permlist &= if wholist != 0 { wholist } else { !umask_now };
+                if op == b'-' {
+                    new_mode &= !permlist;
+                } else {
+                    new_mode |= permlist;
+                }
+            }
+            // Anything left that is not a separator must be another action, so
+            // `u=gr` is an error rather than a silently truncated `u=g`.
+            match b.get(i) {
+                None | Some(&b',') => break,
+                _ => {}
+            }
+        }
+    }
+    Some(new_mode)
+}
+
+/// `umask -S`'s output: the bits a new file WOULD get, not the mask itself.
+fn symbolic_mode(mask: u32) -> String {
+    let permitted = 0o777 & !mask;
+    let mut out = String::new();
+    for (label, shift) in [('u', 6), ('g', 3), ('o', 0)] {
+        if !out.is_empty() {
+            out.push(',');
+        }
+        out.push(label);
+        out.push('=');
+        let t = (permitted >> shift) & 7;
+        for (bit, ch) in [(4, 'r'), (2, 'w'), (1, 'x')] {
+            if t & bit != 0 {
+                out.push(ch);
+            }
+        }
+    }
+    out
+}
+
+/// ash's `umask`. Reading the mask needs no argument and setting it takes one;
+/// extra operands are IGNORED (`umask 077 077` is a success), and an error is an
+/// ordinary status 2 rather than a fatal, so a script continues unless `set -e`.
+fn umask_builtin(sh: &mut Shell, argv: &[String]) -> R<()> {
+    // ash's `nextopt("S")`: flags BUNDLE (`-SS`), `--` ends them, and a lone `-`
+    // is an operand rather than an option.
+    let mut idx = 1;
+    let mut symbolic = false;
+    while let Some(arg) = argv.get(idx) {
+        let Some(flags) = arg.strip_prefix('-') else {
+            break;
+        };
+        if flags.is_empty() {
+            break;
+        }
+        idx += 1;
+        if flags == "-" {
+            break;
+        }
+        for c in flags.chars() {
+            if c != 'S' {
+                err_line(sh, &format!("umask: illegal option -{c}"));
+                return status(sh, 2);
+            }
+            symbolic = true;
+        }
+    }
+    let current = crate::sys::get();
+    let Some(text) = argv.get(idx) else {
+        let line = if symbolic {
+            format!("{}\n", symbolic_mode(current))
+        } else {
+            format!("{current:04o}\n")
+        };
+        return out(sh, line.as_bytes());
+    };
+    // ash inverts around the parse: a numeric operand IS the mask, but a
+    // symbolic one names permissions, so the clauses run on the complement and
+    // the result is complemented back. `isdigit` picks the branch, so `8` takes
+    // the numeric path's spelling and the symbolic path's parser -- and is
+    // rejected by it.
+    let numeric = text.as_bytes().first().is_some_and(|c| c.is_ascii_digit());
+    let entry = if numeric { current } else { current ^ 0o777 };
+    let illegal = |sh: &mut Shell| {
+        err_line(sh, &format!("umask: illegal mode: {text}"));
+        status(sh, 2)
+    };
+    let Some(parsed) = parse_mode(text, entry, current) else {
+        return illegal(sh);
+    };
+    // Whatever grew past the nine rwx bits -- setuid, setgid or sticky -- makes
+    // the whole mode illegal; a umask has no say over them.
+    if parsed > 0o777 {
+        return illegal(sh);
+    }
+    let mask = if numeric { parsed } else { parsed ^ 0o777 };
+    if let Err(e) = crate::sys::set(mask) {
+        err_line(sh, &e);
+        return status(sh, 2);
+    }
+    status(sh, 0)
 }
 
 fn pwd(sh: &mut Shell, argv: &[String]) -> R<()> {

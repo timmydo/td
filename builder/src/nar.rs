@@ -11,7 +11,7 @@
 //! the SHA-256 hasher so file contents are never buffered whole.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable, clippy::todo, clippy::unimplemented, clippy::indexing_slicing)] // grandfathered: pre-dates the rust-lint rules (AGENTS.md); remove when cleaned
-#![allow(unsafe_code)] // confined raw-syscall / low-level layer (AGENTS.md)
+#![allow(unsafe_code)] // confined raw-syscall / low-level layer (UNSAFE.md)
 
 use std::fs;
 use std::io::{self, Read, Write};

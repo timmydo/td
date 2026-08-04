@@ -11,8 +11,9 @@ use crate::types::{Recipe, Step};
 // STATUS: the interpreter passes the seed Oils conformance corpus (resolved to
 // the dash/ash goldens; see td-sh/tests/conformance.rs) — a lexer/parser, word
 // expansion (parameter/command/arithmetic substitution, field splitting,
-// pathname expansion), control flow, functions and the core builtins, all pure
-// safe `std` (`#![deny(unsafe_code)]`). td-sh is NOT yet referenced by
+// pathname expansion), control flow, functions and the core builtins. The crate
+// root `#![deny(unsafe_code)]`s and `sys.rs` holds the one scoped exception --
+// `umask(2)`, the syscall `std` exposes no API for. td-sh is NOT yet referenced by
 // system-x86-64: the shipped `/bin/sh` stays busybox until td-sh also clears the
 // busybox `ash_test` parity gate and the bulk Oils import. Only then is the image
 // symlink flipped.
@@ -53,6 +54,7 @@ const MODULES: &[(&str, &str)] = &[
     ("pattern", include_str!("../../../td-sh/src/pattern.rs")),
     ("process", include_str!("../../../td-sh/src/process.rs")),
     ("random", include_str!("../../../td-sh/src/random.rs")),
+    ("sys", include_str!("../../../td-sh/src/sys.rs")),
 ];
 
 #[cfg(test)]

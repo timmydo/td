@@ -12,7 +12,7 @@
 //! surface and is `#![forbid(unsafe_code)]` as a result. The split is deliberate:
 //! everything that can be safe lives there, and this crate's `unsafe` is confined
 //! to `sys.rs` — one `syscall5` body under a scoped `#[allow]`. That is the THIRD
-//! target-side unsafe exception AGENTS.md records, after td-kexec and td-netd.
+//! target-side unsafe exception UNSAFE.md records, after td-kexec and td-netd.
 //! The `deny` above is the first line of that, not the last: `mod confinement`
 //! below is what actually holds the surface to ten syscalls and one asm body,
 //! because a lint level can be demoted and the compiler cannot count syscalls.
@@ -402,7 +402,7 @@ mod tests {
 ///
 /// The crate-root deny plus ONE scoped allow is compiler-enforced, but a SECOND
 /// scoped allow would be equally compiler-legal — and widening this surface is an
-/// AGENTS.md amendment, not an edit. So the shape is asserted here too. Needles
+/// UNSAFE.md amendment, not an edit. So the shape is asserted here too. Needles
 /// are assembled with `concat!` so the literals never appear in the sources being
 /// scanned, where they would count themselves.
 #[cfg(test)]
@@ -648,7 +648,7 @@ mod confinement {
         out
     }
 
-    /// The syscalls AGENTS.md records for this crate, with the x86_64 number
+    /// The syscalls UNSAFE.md records for this crate, with the x86_64 number
     /// each name must carry. An ELEVENTH is a reviewed amendment; this test is
     /// what makes that more than an aspiration.
     ///
@@ -838,7 +838,7 @@ mod confinement {
     /// a `mod` line and its file added together satisfy both halves. A file
     /// list is a hole only when it is the sole authority — here the directory
     /// still supplies every byte the assertions read, and this pins the set the
-    /// AGENTS.md amendment was written against. A new module is an amendment.
+    /// UNSAFE.md amendment was written against. A new module is an amendment.
     ///
     /// The second half is why the collector keeps non-`.rs` files rather than
     /// skipping them: `src/sys.inc` is invisible to a `.rs`-only scan and

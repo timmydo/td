@@ -2,8 +2,9 @@
 //! pipelines, subshells and external-command spawning.
 //!
 //! The shell keeps its OWN file-descriptor table (`Fds`) rather than dup2'ing
-//! real kernel descriptors, because the interpreter forbids `unsafe` and `std`
-//! exposes no `dup2`/`fork`. Builtins and shell functions read and write through
+//! real kernel descriptors, because `std` exposes no `dup2`/`fork` and the
+//! crate's one `unsafe` surface is `sys.rs`'s `umask(2)`, nothing else.
+//! Builtins and shell functions read and write through
 //! this table; only when an *external* program runs is the table translated into
 //! `std::process::Command` stdio. Pipelines between builtins are run stage by
 //! stage with the previous stage's output buffered as the next stage's input —
@@ -176,8 +177,9 @@ pub fn read_byte(sh: &Shell, fd: u32) -> std::io::Result<Option<u8>> {
 /// ready, because a read on them returns (0, or an error) immediately. `None`
 /// means td-sh cannot tell, which is exactly the inherited descriptor -- it may
 /// be a pipe or a terminal with nothing in it, and only `poll(2)` distinguishes
-/// that from one holding data. td-sh has no syscall surface (AGENTS.md makes one
-/// an amendment), so the caller reports the limit rather than guessing.
+/// that from one holding data. td-sh's syscall surface is `umask(2)` and adding
+/// to it is an UNSAFE.md amendment, so the caller reports the limit rather than
+/// guessing.
 pub fn read_ready(sh: &Shell, fd: u32) -> Option<bool> {
     match sh.fds.get(fd) {
         // Everything td-sh's own table holds is ready; only what it inherited
@@ -437,6 +439,56 @@ pub fn run_subshell(sh: &mut Shell, body: &List, redirs: &[Redir]) -> R<()> {
     Ok(())
 }
 
+/// The file-creation mask, saved and put back on `Drop`.
+///
+/// It is the one piece of subshell state that is NOT in `Shell`: the mask lives
+/// in the kernel, one per process. ash forks, so a subshell's `umask` cannot
+/// reach the parent; td-sh's subshells are in-process clones, so the
+/// save/restore a fork gives for free has to be explicit. Restoring on `Drop`
+/// is what carries it across the `?`-shaped exits those bodies take.
+struct UmaskScope(u32);
+
+impl UmaskScope {
+    fn capture() -> Self {
+        Self(crate::sys::get())
+    }
+}
+
+impl Drop for UmaskScope {
+    fn drop(&mut self) {
+        // Nothing to report to: the mask was this process's a moment ago, so a
+        // refusal here would mean the kernel changed its mind about a value it
+        // already accepted.
+        let _ = crate::sys::set(self.0);
+    }
+}
+
+/// A cloned shell environment and the mask guard it cannot be separated from.
+///
+/// The guard is bundled here rather than left to each caller because there is
+/// no way to tell from a subshell's OUTPUT that the mask leaked -- it shows up
+/// later, in the permissions of a file some unrelated command creates. So
+/// `fork_shell` hands out no bare `Shell`: a subshell construct added later
+/// gets the save/restore whether or not its author knew to ask. Derefs to
+/// `Shell`, so callers use it as one.
+pub struct Subshell {
+    shell: Shell,
+    _mask: UmaskScope,
+}
+
+impl std::ops::Deref for Subshell {
+    type Target = Shell;
+    fn deref(&self) -> &Shell {
+        &self.shell
+    }
+}
+
+impl std::ops::DerefMut for Subshell {
+    fn deref_mut(&mut self) -> &mut Shell {
+        &mut self.shell
+    }
+}
+
 /// A child shell that shares the parent's open descriptors (so redirections and
 /// captured output flow through) but owns an independent copy of the mutable
 /// state a subshell must not leak back. Recursion/substitution counters and the
@@ -444,8 +496,10 @@ pub fn run_subshell(sh: &mut Shell, body: &List, redirs: &[Redir]) -> R<()> {
 /// spawned while evaluating an `if`/`while` condition (or a non-final `&&`/`||`
 /// operand) is still part of that suppressed context, so it must not exit on an
 /// inner failure either.
-pub fn fork_shell(sh: &Shell) -> Shell {
-    Shell {
+pub fn fork_shell(sh: &Shell) -> Subshell {
+    // Taken before the clone, so the guard's life spans the child's.
+    let _mask = UmaskScope::capture();
+    let shell = Shell {
         vars: sh.vars.clone(),
         funcs: sh.funcs.clone(),
         params: sh.params.clone(),
@@ -493,7 +547,8 @@ pub fn fork_shell(sh: &Shell) -> Shell {
             .filter(|(_, action)| action.is_empty())
             .map(|(signo, action)| (*signo, action.clone()))
             .collect(),
-    }
+    };
+    Subshell { shell, _mask }
 }
 
 /// `$(code)`: run `code` in a subshell with stdout captured to a buffer, and

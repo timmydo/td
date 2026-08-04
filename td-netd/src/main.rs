@@ -14,7 +14,7 @@
 //!   print the first address.
 //! * `td-netd reach HOST PORT` — resolve HOST (if a name) and TCP-connect it.
 //!
-//! UNSAFE CONFINEMENT (a recorded AGENTS.md amendment — the SECOND target-side
+//! UNSAFE CONFINEMENT (a recorded UNSAFE.md amendment — the SECOND target-side
 //! unsafe surface after td-kexec): the crate `#![deny(unsafe_code)]`s and only
 //! `syscall3` carries a scoped `#[allow]`. That single raw `ioctl(2)` wrapper is
 //! the whole unsafe surface; the interface-config ioctls (SIOCSIFFLAGS/ADDR/

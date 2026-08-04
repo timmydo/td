@@ -47,7 +47,7 @@ ordered teardown with no build-time complaint. It also cost a `fork`+`exec`
 per signal during shutdown, and made seven of this crate's stop-path tests
 skip on a host without `/bin/kill` — the code most needing coverage, least
 often run. One confined syscall is the smaller surface, and `main.rs`'s
-confinement tests hold it to one. A SECOND is an AGENTS.md amendment.
+confinement tests hold it to one. A SECOND is an UNSAFE.md amendment.
 
 **I2. No `pre_exec`, ever.** td-svc is multithreaded (log drains, waiters).
 A `pre_exec` closure runs between `fork` and `exec` in a multithreaded
@@ -1037,7 +1037,7 @@ for a press whose shutdown was refused; a press that lands begins a teardown
 and wants no new sentinel. It is scheduled on `backoff::delay` rather than run
 inline, and keyed to the sentinel's pid — §9 records the two loops those two
 choices close. td-svc is consequently the fifth target-side unsafe exception
-AGENTS.md lists, for exactly one syscall.
+UNSAFE.md lists, for exactly one syscall.
 
 Landing 6 is the supervisor-restart eviction contract §11
 describes: td-svc records what it started under `/run` and, on startup,

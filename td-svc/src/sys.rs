@@ -5,7 +5,7 @@
 //! `td-login/src/sys.rs` (itself copied from `td-init`, itself from
 //! `builder/src/sys.rs`). Everything else in the crate — and every other
 //! function in this module — is ordinary safe Rust. This is the FIFTH
-//! target-side unsafe exception AGENTS.md records, after td-kexec (two
+//! target-side unsafe exception UNSAFE.md records, after td-kexec (two
 //! syscalls), td-netd (one ioctl), td-init (nine), and td-login (three).
 //!
 //! The amended surface is exactly ONE syscall: `kill(2)`.

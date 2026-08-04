@@ -4,7 +4,7 @@
 //! scoped `#[allow]`: `syscall2`, the `syscall`-instruction body copied from
 //! `td-init/src/sys.rs` (itself copied from `builder/src/sys.rs`). Everything
 //! else in the crate — and every other function in this module — is ordinary
-//! safe Rust. This is the FOURTH target-side unsafe exception AGENTS.md records,
+//! safe Rust. This is the FOURTH target-side unsafe exception UNSAFE.md records,
 //! after td-kexec (two syscalls), td-netd (one ioctl), and td-init (eight).
 //!
 //! The amended surface is exactly the THREE credential-setting syscalls below.

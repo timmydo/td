@@ -262,8 +262,8 @@ const TD_TXT_APPLETS: &[&str] = &["grep", "sed"];
 /// pagers. Neither has a call site to break.
 const DROPPED_APPLETS: &[&str] = &["vi", "more", "awk"];
 /// The credential switch, served by the static td-login multicall — the two busybox applets
-/// that change WHO A PROCESS IS. They are their own binary, and their own AGENTS.md unsafe
-/// exception, because a credential-ordering bug in them is privilege escalation rather than
+/// that change WHO A PROCESS IS. They are their own binary, and their own entry in
+/// UNSAFE.md, because a credential-ordering bug in them is privilege escalation rather than
 /// a malfunction: `setuid(2)` before `setgroups(2)` drops the uid and silently keeps the
 /// previous holder's supplementary groups. td-login/THREAT-MODEL.md is the specification.
 ///
