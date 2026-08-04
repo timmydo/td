@@ -8,6 +8,9 @@ write b"\e[3;4H@\e[2A\e[2DZ"
 expect row 0 "  Z   "
 expect row 2 "   @  "
 expect cursor 0 3
+write b"\e[2B\e[1CY"
+expect row 2 "   @Y "
+expect cursor 2 5
 end
 
 case cursor/tabs-save-and-restore

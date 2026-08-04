@@ -1628,3 +1628,238 @@ fn expectations_overlay_rejects_xpass_and_stale_entries() {
         run_case(&mismatch[0], Chunking::Bytes).unwrap()
     );
 }
+
+/// §10 requires every capability in the shipped terminfo entry to name a
+/// blocking native case. The corpus lives here, so the check does too.
+#[test]
+fn every_terminfo_capability_names_a_case_that_passes() {
+    let entry = crate::terminfo::parse().unwrap();
+    let cases = corpus().unwrap();
+    let ids: BTreeSet<&str> = cases.iter().map(|case| case.id.as_str()).collect();
+    let xfails = parse_expectations(EXPECTATIONS).unwrap();
+    for capability in &entry.capabilities {
+        assert!(
+            ids.contains(capability.case),
+            "{} names {:?}, which is not a corpus case",
+            capability.name,
+            capability.case
+        );
+        assert!(
+            !xfails.iter().any(|gap| gap.case == capability.case),
+            "{} names {:?}, which is a known failure rather than a blocking case",
+            capability.name,
+            capability.case
+        );
+    }
+}
+
+/// Naming a case only pins the attribution if the case actually carries the
+/// operation. Key capabilities and replies are checked byte-for-byte, because
+/// those are emitted exactly as the entry spells them. Output capabilities are
+/// checked by escape sequence: same introducer, private flag and final byte,
+/// and — for the finals where a PARAMETER SELECTS THE OPERATION rather than
+/// counting or positioning — the same parameters too. `\e[J` and `\e[2J` are
+/// different erases and must not prove each other, while `\e[A` and `\e[3A`
+/// are the same motion by different distances and must. Parameterized
+/// capabilities are not skipped: their `%` expressions are stripped to the
+/// literal skeleton first, and a capability that branches (`%?`, such as
+/// `setaf`) must have every literal run of three or more bytes present, which
+/// is what ties `setaf`/`setab` to a case using the `38;5`/`48;5` form.
+#[test]
+fn literal_terminfo_capabilities_appear_in_the_case_they_name() {
+    const KEYS: &[&str] = &[
+        "kbs", "kcbt", "kcuu1", "kcud1", "kcuf1", "kcub1", "khome", "kend", "kpp", "knp", "kich1",
+        "kdch1", "kf1", "kf2", "kf3", "kf4", "kf5", "kf6", "kf7", "kf8", "kf9", "kf10", "kf11",
+        "kf12",
+    ];
+    const REPLIES: &[&str] = &["u6", "u8"];
+    /// Finals whose parameter names the operation. `m` is here too, but as a
+    /// subset rather than an equality: an SGR case legitimately sets several
+    /// attributes at once.
+    // `c` is here because a device-attributes reply IS its parameters.
+    const SELECTS: &[u8] = b"JKghlmc";
+
+    /// The literal bytes a capability always emits, with terminfo's `%`
+    /// expressions removed.
+    fn skeleton(bytes: &[u8]) -> Vec<u8> {
+        let mut output = Vec::with_capacity(bytes.len());
+        let mut index = 0;
+        while let Some(byte) = bytes.get(index) {
+            if *byte != b'%' {
+                output.push(*byte);
+                index += 1;
+                continue;
+            }
+            match bytes.get(index + 1) {
+                // `%{n}` and `%'c'` carry a delimited literal operand.
+                Some(b'{') => {
+                    index += 2;
+                    while matches!(bytes.get(index), Some(byte) if *byte != b'}') {
+                        index += 1;
+                    }
+                    index += 1;
+                }
+                Some(b'\'') => {
+                    index += 2;
+                    while matches!(bytes.get(index), Some(byte) if *byte != b'\'') {
+                        index += 1;
+                    }
+                    index += 1;
+                }
+                // `%%` is a literal percent; anything else is a one-byte op.
+                Some(b'%') => {
+                    output.push(b'%');
+                    index += 2;
+                }
+                // A branch operator separates literal runs that belong to
+                // DIFFERENT branches; without a break `setaf`'s `3` and `9`
+                // and `38;5;` would merge into one run no case can contain.
+                // `%pN`, `%PX` and `%gX` take a one-byte operand; without
+                // this the operand survives as a literal digit and joins the
+                // run beside it.
+                Some(b'p' | b'P' | b'g') => index += 3,
+                Some(b'?' | b't' | b'e' | b';') => {
+                    output.push(b' ');
+                    index += 2;
+                }
+                Some(_) => index += 2,
+                None => index += 1,
+            }
+        }
+        output
+    }
+
+    /// Every CSI in a byte stream, as (private, parameters, final byte). An
+    /// omitted parameter list reads as the default the finals below use.
+    fn csis(bytes: &[u8]) -> Vec<(bool, Vec<u16>, u8)> {
+        let mut found = Vec::new();
+        let mut index = 0;
+        while index < bytes.len() {
+            if bytes.get(index) != Some(&0x1b) || bytes.get(index + 1) != Some(&b'[') {
+                index += 1;
+                continue;
+            }
+            let mut at = index + 2;
+            let private = bytes.get(at) == Some(&b'?');
+            if private {
+                at += 1;
+            }
+            let start = at;
+            while matches!(bytes.get(at), Some(byte) if byte.is_ascii_digit() || *byte == b';') {
+                at += 1;
+            }
+            let text = bytes.get(start..at).unwrap_or_default();
+            let mut parameters: Vec<u16> = text
+                .split(|byte| *byte == b';')
+                .filter_map(|field| std::str::from_utf8(field).ok()?.parse::<u16>().ok())
+                .collect();
+            match bytes.get(at) {
+                Some(final_byte) if (0x40..=0x7e).contains(final_byte) => {
+                    if parameters.is_empty() && SELECTS.contains(final_byte) {
+                        parameters.push(0);
+                    }
+                    found.push((private, parameters, *final_byte));
+                    index = at + 1;
+                }
+                _ => index += 1,
+            }
+        }
+        found
+    }
+
+    let entry = crate::terminfo::parse().unwrap();
+    let cases = corpus().unwrap();
+    let mut checked = 0;
+    let mut missing = Vec::new();
+    for capability in &entry.capabilities {
+        let crate::terminfo::Value::Bytes(bytes) = &capability.value else {
+            continue;
+        };
+        // `acsc` is a translation table, not a stream any case carries.
+        if capability.name == "acsc" {
+            continue;
+        }
+        let case = cases
+            .iter()
+            .position(|case| case.id == capability.case)
+            .and_then(|index| cases.get(index))
+            .unwrap_or_else(|| panic!("{} names no case", capability.name));
+        let is_key = KEYS.contains(&capability.name);
+        let is_reply = REPLIES.contains(&capability.name);
+        let mut streams: Vec<&[u8]> = Vec::new();
+        for step in &case.steps {
+            match step {
+                Step::Write(written) if !is_key && !is_reply => streams.push(written),
+                Step::Expect(Expectation::Input(input)) if is_key => streams.push(input),
+                Step::Expect(Expectation::Reply(reply)) if is_reply => streams.push(reply),
+                _ => {}
+            }
+        }
+        let body = skeleton(bytes);
+        let contains = |needle: &[u8]| {
+            !needle.is_empty()
+                && streams
+                    .iter()
+                    .any(|stream| stream.windows(needle.len()).any(|window| window == needle))
+        };
+        let found = if is_key {
+            // A key is emitted exactly as the entry spells it, so nothing is
+            // relaxed: matching `\e[15~` by shape would accept `\e[2~`.
+            contains(bytes)
+        } else if bytes.windows(2).any(|pair| pair == b"%?") {
+            let runs = literal_runs(&body);
+            !runs.is_empty() && runs.iter().all(|run| contains(run))
+        } else {
+            let wanted = csis(&body);
+            if wanted.is_empty() {
+                contains(&body)
+            } else {
+                wanted.iter().all(|(private, parameters, final_byte)| {
+                    streams.iter().any(|stream| {
+                        csis(stream).iter().any(|(had_private, had, had_final)| {
+                            had_private == private
+                                && had_final == final_byte
+                                && match *final_byte {
+                                    b'm' => parameters.iter().all(|want| had.contains(want)),
+                                    byte if SELECTS.contains(&byte) => had == parameters,
+                                    // A count or a coordinate: same operation.
+                                    _ => true,
+                                }
+                        })
+                    })
+                })
+            }
+        };
+        if !found {
+            missing.push(format!(
+                "{} = {:?} does not appear in {}",
+                capability.name, bytes, capability.case
+            ));
+        }
+        checked += 1;
+    }
+    assert!(missing.is_empty(), "{}", missing.join("\n"));
+    // A classifier that silently matched nothing would pass every assertion.
+    assert!(checked >= 90, "only {checked} capabilities checked");
+}
+
+/// Literal runs of three or more bytes, the parts of a branching capability
+/// that are emitted whichever branch is taken often enough to identify it.
+fn literal_runs(body: &[u8]) -> Vec<Vec<u8>> {
+    let mut runs = Vec::new();
+    let mut current: Vec<u8> = Vec::new();
+    for byte in body {
+        if byte.is_ascii_digit() || *byte == b';' {
+            current.push(*byte);
+        } else {
+            if current.len() >= 3 {
+                runs.push(current.clone());
+            }
+            current.clear();
+        }
+    }
+    if current.len() >= 3 {
+        runs.push(current);
+    }
+    runs
+}

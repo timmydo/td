@@ -46,3 +46,40 @@ expect cell 0 1 "B" fg=default bg=default attrs=none
 expect cell 0 2 "C" fg=default bg=default attrs=none
 expect cell 0 3 "D" fg=default bg=default attrs=none
 end
+
+# The rendition attributes and their individual resets. Bold and italic and
+# underline were reachable only through cases asserting something else, and
+# faint, inverse, strike and the 22/23/24/27/29 resets were pinned nowhere at
+# all. td-term's terminfo entry names this case for every set/reset pair it
+# claims.
+case color/rendition-set-and-reset
+source td
+tags core color
+size 1 12
+write b"\e[1mA\e[22mB\e[2mC\e[22mD\e[3mE\e[23mF"
+write b"\e[4mG\e[24mH\e[7mI\e[27mJ\e[9mK\e[29mL"
+expect cell 0 0 "A" fg=default bg=default attrs=bold
+expect cell 0 1 "B" fg=default bg=default attrs=none
+expect cell 0 2 "C" fg=default bg=default attrs=faint
+expect cell 0 3 "D" fg=default bg=default attrs=none
+expect cell 0 4 "E" fg=default bg=default attrs=italic
+expect cell 0 5 "F" fg=default bg=default attrs=none
+expect cell 0 6 "G" fg=default bg=default attrs=underline
+expect cell 0 7 "H" fg=default bg=default attrs=none
+expect cell 0 8 "I" fg=default bg=default attrs=inverse
+expect cell 0 9 "J" fg=default bg=default attrs=none
+expect cell 0 10 "K" fg=default bg=default attrs=strike
+expect cell 0 11 "L" fg=default bg=default attrs=none
+end
+
+# The palette background form. `48;2` (RGB) was covered; `48;5` was not, so
+# nothing pinned indexed background selection. td-term's `setab` names it.
+case color/indexed-palette-background
+source td
+tags core color
+size 1 2
+write b"\e[38;5;33;48;5;99mX"
+expect cell 0 0 "X" fg=indexed:33 bg=indexed:99 attrs=none
+write b"\e[39;49mY"
+expect cell 0 1 "Y" fg=default bg=default attrs=none
+end

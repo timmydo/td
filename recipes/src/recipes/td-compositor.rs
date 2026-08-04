@@ -39,6 +39,10 @@ const MODULES: &[(&str, &str)] = &[
     ("socket", include_str!("../../../td-compositor/src/socket.rs")),
     ("sys", include_str!("../../../td-compositor/src/sys.rs")),
     ("term", include_str!("../../../td-compositor/src/term.rs")),
+    (
+        "terminfo",
+        include_str!("../../../td-compositor/src/terminfo.rs"),
+    ),
     ("ui", include_str!("../../../td-compositor/src/ui.rs")),
     ("wire", include_str!("../../../td-compositor/src/wire.rs")),
 ];
@@ -139,6 +143,26 @@ pub fn recipe() -> Recipe {
             ],
             exec: true,
         },
+        // The just-built binary writes its own terminfo entry: one encoder,
+        // and the bytes the image installs are the bytes its tests decode.
+        // `tic` and a host terminfo database are not inputs. This runs after
+        // the Require above, so a binary that failed to link is reported as
+        // that rather than as a mysteriously failing build step.
+        Step::MkDir {
+            path: "{out}/share/terminfo/t".into(),
+        },
+        Step::run(
+            "{out}",
+            &[
+                "{out}/bin/td-compositor",
+                "terminfo",
+                "{out}/share/terminfo/t/td-term",
+            ],
+        ),
+        Step::Require {
+            paths: vec!["{out}/share/terminfo/t/td-term".into()],
+            exec: false,
+        },
         Step::assert_static(&["{out}/bin/td-compositor", "{out}/bin/td-ui-demo"]),
     ]);
 
@@ -179,6 +203,36 @@ mod tests {
         assert!(client.contains(&format!(
             "println!(\"{TD_UI_CLIENT_RUNTIME_MARKER} surface={{}}x{{}}\""
         )));
+    }
+
+    /// The recipe writes the terminfo entry at a path the compositor's own
+    /// module also spells, and the two never compile against each other, so a
+    /// divergence would be caught by nothing without this. The binary refuses
+    /// a path not ending in its constant, which makes a wrong STORE path a
+    /// build failure.
+    ///
+    /// It does NOT make the entry reachable: the child is given
+    /// `TERMINFO=/etc/terminfo`, and nothing in the image exposes this store
+    /// directory there yet, so ncurses still cannot look `td-term` up at
+    /// runtime. That exposure needs an immutable-symlink category in the
+    /// image's read-only-/etc invariant and is a separate landing.
+    #[test]
+    fn the_terminfo_entry_is_installed_where_the_encoder_expects() {
+        let terminfo = MODULES
+            .iter()
+            .filter(|(name, _)| *name == "terminfo")
+            .map(|(_, source)| *source)
+            .next()
+            .expect("terminfo source");
+        assert!(terminfo
+            .contains(r#"pub(crate) const INSTALL_PATH: &str = "share/terminfo/t/td-term";"#));
+        let steps = recipe().steps.expect("steps");
+        let writes = steps.iter().any(|step| {
+            matches!(step, Step::Run { argv, .. }
+                if argv.iter().any(|word| word == "terminfo")
+                    && argv.iter().any(|word| word == "{out}/share/terminfo/t/td-term"))
+        });
+        assert!(writes, "no step installs the terminfo entry");
     }
 
     /// td-term's child command is an absolute path into a DIFFERENT staged

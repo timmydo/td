@@ -90,10 +90,18 @@ source td
 tags core input
 size 2 8
 key f1
+key f2
+key f3
 key f4
 key f5
+key f6
+key f7
+key f8
+key f9
+key f10
+key f11
 key f12
-expect input b"\x1bOP\x1bOS\x1b[15~\x1b[24~"
+expect input b"\x1bOP\x1bOQ\x1bOR\x1bOS\x1b[15~\x1b[17~\x1b[18~\x1b[19~\x1b[20~\x1b[21~\x1b[23~\x1b[24~"
 end
 
 # DECCKM selects the SS3 spelling for cursor and edge keys. The write below is
@@ -104,21 +112,25 @@ source td
 tags core input modes
 size 2 8
 key up
+key down
 key left
+key right
 key home
 key end
-expect input b"\x1b[A\x1b[D\x1b[H\x1b[F"
+expect input b"\x1b[A\x1b[B\x1b[D\x1b[C\x1b[H\x1b[F"
 expect mode application-cursor off
 write b"\x1b[?1h"
 expect mode application-cursor on
 key up
+key down
 key left
+key right
 key home
 key end
-expect input b"\x1b[A\x1b[D\x1b[H\x1b[F\x1bOA\x1bOD\x1bOH\x1bOF"
+expect input b"\x1b[A\x1b[B\x1b[D\x1b[C\x1b[H\x1b[F\x1bOA\x1bOB\x1bOD\x1bOC\x1bOH\x1bOF"
 write b"\x1b[?1l"
 key up
-expect input b"\x1b[A\x1b[D\x1b[H\x1b[F\x1bOA\x1bOD\x1bOH\x1bOF\x1b[A"
+expect input b"\x1b[A\x1b[B\x1b[D\x1b[C\x1b[H\x1b[F\x1bOA\x1bOB\x1bOD\x1bOC\x1bOH\x1bOF\x1b[A"
 end
 
 # Paging keys never change spelling, and their shifted forms belong to the

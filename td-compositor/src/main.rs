@@ -16,6 +16,7 @@ mod server;
 mod socket;
 mod sys;
 mod term;
+mod terminfo;
 mod ui;
 mod wire;
 
@@ -31,7 +32,8 @@ const MAX_UI_FRAME_BYTES: usize = 32 * 1024 * 1024;
 
 fn usage() -> String {
     "usage: td-compositor run --framebuffer PATH --input DIR --socket PATH \
-     --launcher-client PATH | td-compositor probe SOCKET | td-compositor selftest"
+     --launcher-client PATH | td-compositor probe SOCKET | td-compositor terminfo PATH | \
+     td-compositor selftest"
         .into()
 }
 
@@ -111,6 +113,7 @@ fn selftest() -> Result<(), String> {
     term::selftest()?;
     keys::selftest()?;
     pty::selftest()?;
+    terminfo::selftest()?;
 
     let mut payload = wire::Builder::new();
     payload.u32(7);
@@ -155,6 +158,25 @@ fn run(args: &[String]) -> Result<(), String> {
                 return Err(usage());
             }
             server::probe(Path::new(socket))
+        }
+        // The build step that installs the entry; the shipped binary is the
+        // only encoder, so nothing can compile a second, divergent copy.
+        "terminfo" => {
+            let path = args.get(1).ok_or_else(usage)?;
+            if args.get(2).is_some() {
+                return Err(usage());
+            }
+            // ncurses finds an entry only under its own first letter, and a
+            // path that spells it differently is a terminal with no
+            // description and nothing to say so.
+            if !path.ends_with(terminfo::INSTALL_PATH) {
+                return Err(format!(
+                    "{path} does not end with {}",
+                    terminfo::INSTALL_PATH
+                ));
+            }
+            let bytes = terminfo::entry()?;
+            std::fs::write(path, bytes).map_err(|error| format!("write {path}: {error}"))
         }
         "selftest" => {
             if args.get(1).is_some() {
@@ -289,6 +311,7 @@ mod confinement {
         ("server.rs", include_str!("server.rs")),
         ("socket.rs", include_str!("socket.rs")),
         ("term.rs", include_str!("term.rs")),
+        ("terminfo.rs", include_str!("terminfo.rs")),
         ("ui.rs", include_str!("ui.rs")),
         ("wire.rs", include_str!("wire.rs")),
     ];

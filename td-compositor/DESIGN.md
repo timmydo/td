@@ -830,6 +830,69 @@ number, output sequence, and input key in that entry names a blocking native
 case. A structural test decodes the installed entry and compares it
 field-for-field with the source capabilities.
 
+The encoder emits the legacy binary format rather than the 32-bit-number one,
+which exists to carry `pairs#65536`; this entry's largest number fits the
+signed 16-bit field, so the older format every reader understands is enough.
+The three capability arrays are declared only one past the highest index
+claimed, and a reader treats the rest as absent — which is also why the pinned
+`Caps` ordering stops after `setab` instead of continuing through printer and
+bit-image capabilities this profile will never claim.
+
+That ordering is the whole trust surface. Position in the name tables IS the
+wire index, so a capability written at the wrong one is a well-formed entry
+that means something else, and no round-trip through the module's own decoder
+can see it — the encoder and decoder would share the mistake. It is therefore
+pinned as ordered lists rather than per-capability integers, so what a reviewer
+checks is one list against `Caps`, with the counts and the order's
+non-alphabetical joints asserted separately: `kf10` between `kf1` and `kf2`,
+`lf10` between `lf1` and `lf2`, and `kf11` after `rfi` rather than after
+`kf10`.
+
+Attribution is checked, not merely declared. Key capabilities are compared
+byte-for-byte against the sequence the keyboard adapter generates for that key,
+because a key is emitted exactly as the entry spells it; the same comparison
+runs against the corpus case's own input expectation. Output capabilities are
+compared by escape-sequence shape — introducer, private flag and final byte,
+and, for the finals where a parameter SELECTS the operation rather than
+counting or positioning, the parameters too — because a capability spells the
+default-parameter form (`\E[A`) of a sequence a case naturally writes with
+parameters (`\E[3A`), and demanding the literal bytes would only push the
+corpus into writing degenerate sequences to satisfy a test.
+
+Attribution alone is not enough, and the gap is worth stating precisely. It
+asks whether the named case exercises an operation; it cannot ask whether that
+is the RIGHT operation for that capability. Where a family shares one case the
+distinction is the whole point: the cursor case writes all four of `CSI A/B/C/D`,
+so exchanging `cuu` and `cud` satisfies every attribution and ships an entry
+that moves the cursor the wrong way — as do exchanging `il1`/`dl1`, `ich`/`dch`,
+`indn`/`rin`, or any two of the nine renditions that share a case. Each such
+capability is therefore pinned twice more: its declared spelling must be the
+same operation as a concrete form written beside it, and feeding that concrete
+form to the model must produce the effect its name promises. A capability that
+shares a case with another and has no such check is refused, so the coverage
+cannot quietly lapse as the entry grows. The colour capabilities are pinned by
+expansion instead — every branch of `setaf`/`setab` is instantiated and driven
+through the model — because a redirected branch still emits a well-formed SGR,
+just for the wrong channel.
+
+The entry is not yet reachable at runtime. The child is given
+`TERMINFO=/etc/terminfo`, and the image does not expose the package's store
+`share/terminfo` there, so ncurses cannot look `td-term` up: every curses
+program still fails to start. Closing it requires an immutable-symlink category
+in the read-only-`/etc` invariant — today every `/etc` symlink must be a
+reviewed `MUTABLE_ETC` entry, and an immutable store path is not mutable state —
+which is a separate reviewed landing, not part of producing the entry.
+
+What the entry omits is as deliberate as what it claims. `cols`/`lines` are
+absent because td-term sets and verifies the PTY winsize before the child
+starts, so the pre-winsize fallback they exist to serve is unreachable by
+construction. `smir`/`rmir` are absent because this profile implements no ANSI
+insert mode, and `blink`/`invis` because it has no SGR for either — an entry
+that claimed them would be describing a terminal td-term is not. `bel` is
+absent for a different reason: BEL sets the model's coalesced visual-bell bit,
+which no corpus observation can see until the renderer that presents it lands,
+and a capability whose case would be a fiction is worse than a missing one.
+
 An outer `TERM=foot`, `TERM=linux`, or other value describes the parent
 terminal and is never an oracle or a capability claim for td-term. An optional
 developer check may ask a pinned host `infocmp` to decode the generated entry,
