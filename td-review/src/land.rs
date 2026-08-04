@@ -523,7 +523,7 @@ fn rebase(git: &Git, base: &str, branch: &str, pinned: Pinned) -> io::Result<Lan
 
     // The tree the review pane diffed, and what the replay has to add up to.
     let target = match git.merge_tree(&head_before, &branch_oid)? {
-        MergeResult::Clean(tree) => Some(tree),
+        MergeResult::Clean(tree) => tree,
         // The pane showed the BRANCH's own diff and said so, because there is
         // no landing tree to show. A squash cannot land that blind — the merge
         // conflicts too, and it stops — but a replay's successive merges can
@@ -539,8 +539,19 @@ fn rebase(git: &Git, base: &str, branch: &str, pinned: Pinned) -> io::Result<Lan
             ))
         }
         // Git could not compute one at all. The squash path lands blind here
-        // too, so this one proceeds — and says that it did.
-        MergeResult::Unavailable(_) => None,
+        // and its confirmation is the human check on that; `r` has no
+        // confirmation, so there is nobody in the loop to be blind for it.
+        // Nothing to hold the result to means nothing lands.
+        MergeResult::Unavailable(why) => {
+            return Ok(blocked(
+                log,
+                format!(
+                    "the merge result onto {base} could not be computed ({why}), so \
+                     there is no reviewed tree to hold a replay to — land it \
+                     squashed instead"
+                ),
+            ))
+        }
     };
     let base_tree = match git.rev_parse(&format!("{head_before}^{{tree}}")) {
         Ok(tree) => tree,
@@ -549,7 +560,7 @@ fn rebase(git: &Git, base: &str, branch: &str, pinned: Pinned) -> io::Result<Lan
     // The squash path learns this from an empty index after the merge; here it
     // has to be known BEFORE the sequencer starts, because a commit that
     // replays to nothing stops it rather than being dropped.
-    if target.as_deref() == Some(base_tree.as_str()) {
+    if target == base_tree {
         log.push(err_line(format!(
             "nothing to replay: {branch} changes nothing on top of {base} (already landed?)"
         )));
@@ -654,35 +665,26 @@ fn rebase(git: &Git, base: &str, branch: &str, pinned: Pinned) -> io::Result<Lan
         return Ok(left_standing(log, why, &head_before));
     }
 
-    match &target {
-        Some(target) => {
-            let tree = match git.rev_parse(&format!("{head_after}^{{tree}}")) {
-                Ok(tree) => tree,
-                Err(e) => return Ok(left_standing(log, e.to_string(), &head_before)),
-            };
-            // Every commit applied cleanly and the total is still not what the
-            // pane diffed: successive three-way merges resolved something the
-            // one-shot merge does not, or a hook rewrote content on the way
-            // through. Either way it is not what was approved.
-            if tree != *target {
-                return Ok(roll_back(
-                    git,
-                    log,
-                    format!(
-                        "the replayed tree {} is not the merge result {} that was reviewed",
-                        short(&tree),
-                        short(target)
-                    ),
-                    &head_before,
-                ));
-            }
-        }
-        // Unavailable, the one case that gets this far without a tree to check
-        // against. A landing nothing could check must not read like one that was.
-        None => log.push(Line::new(
-            "landed WITHOUT the tree check: git computed no merge result to compare against",
-            Style::fg(YELLOW),
-        )),
+    let tree = match git.rev_parse(&format!("{head_after}^{{tree}}")) {
+        Ok(tree) => tree,
+        Err(e) => return Ok(left_standing(log, e.to_string(), &head_before)),
+    };
+    // Every commit applied cleanly and the total is still not what the pane
+    // diffed: successive three-way merges resolved something the one-shot merge
+    // does not, or a hook rewrote content on the way through. Either way it is
+    // not what was approved. Unconditional now — every path that reaches here
+    // has a reviewed tree, because the ones that would not have refused above.
+    if tree != target {
+        return Ok(roll_back(
+            git,
+            log,
+            format!(
+                "the replayed tree {} is not the merge result {} that was reviewed",
+                short(&tree),
+                short(&target)
+            ),
+            &head_before,
+        ));
     }
 
     log.push(ok_line(format!(

@@ -23,8 +23,9 @@ enum Screen {
 
 /// A pending yes/no decision, shown as a bar across the bottom row.
 enum Prompt {
-    /// Land the reviewed branch the way the key that raised this asked for.
-    Land(Mode),
+    /// Squash the reviewed branch in. The only landing that still asks: `r`
+    /// runs on the keystroke, so it raises nothing.
+    Squash,
     Conflict,
     /// Delete a hand-picked branch (`D`), whose relation to anything landed is
     /// unknown. The targets are pinned when the prompt is raised, so confirming
@@ -87,7 +88,11 @@ pub struct App {
     log_scroll: usize,
     help_scroll: usize,
     prompt: Option<Prompt>,
-    just_prompted: bool,
+    /// Set when the screen changed under the operator — a confirmation went up,
+    /// or an unconfirmed `r` landed and swapped the pane for the log. Either
+    /// way the rest of that read was typed against a screen they had not seen,
+    /// so the batch stops and the pending input is dropped.
+    stale_typeahead: bool,
     /// Branches squash-landed this session. Landing no longer publishes, so
     /// their remote copies are only swept once a push has put the commit
     /// carrying that work on a remote.
@@ -119,7 +124,7 @@ impl App {
             log_scroll: 0,
             help_scroll: 0,
             prompt: None,
-            just_prompted: false,
+            stale_typeahead: false,
             landed: VecDeque::new(),
             status: String::new(),
             status_style: Style::PLAIN,
@@ -128,18 +133,19 @@ impl App {
         }
     }
 
-    /// True when the key just handled raised a confirmation. The event loop
-    /// drops the rest of the read batch so a paste or typeahead can never
-    /// answer a prompt the user has not seen yet.
-    pub fn just_prompted(&self) -> bool {
-        self.just_prompted
+    /// True when the key just handled changed the screen. The event loop drops
+    /// the rest of the read batch, so a paste or typeahead can never answer a
+    /// prompt the user has not seen — nor act on the pane an unconfirmed
+    /// landing just replaced.
+    pub fn stale_typeahead(&self) -> bool {
+        self.stale_typeahead
     }
 
     /// Raise a confirmation. The pending typeahead is dropped by `settle_prompt`
     /// once the prompt is actually on screen.
     fn ask(&mut self, prompt: Prompt) {
         self.prompt = Some(prompt);
-        self.just_prompted = true;
+        self.stale_typeahead = true;
     }
 
     /// Drop typeahead now that the prompt is on screen. A failure here is fatal
@@ -147,10 +153,10 @@ impl App {
     /// restore fails, and every later read would return empty — indistinguishable
     /// from a closed tty, so the loop would exit successfully mid-confirmation.
     pub fn settle_prompt(&mut self, term: &mut dyn Ui) -> io::Result<()> {
-        if !self.just_prompted {
+        if !self.stale_typeahead {
             return Ok(());
         }
-        self.just_prompted = false;
+        self.stale_typeahead = false;
         term.drain_input()
     }
 
@@ -205,15 +211,12 @@ impl App {
         }
         if let Some(prompt) = &self.prompt {
             let text = match prompt {
-                Prompt::Land(mode) => {
+                Prompt::Squash => {
                     let name = self.reviewing.as_ref().map_or("?", |r| r.refname.as_str());
-                    // Which of the two keys raised this has to be readable on
-                    // the bar: they land the same work as different history.
-                    let what = match mode {
-                        Mode::Squash => "squash into one commit",
-                        Mode::Rebase => "replay its own commits",
-                    };
-                    format!(" land {name} into {} ?  [y] {what}   [n] cancel", self.base)
+                    format!(
+                        " land {name} into {} ?  [y] squash into one commit   [n] cancel",
+                        self.base
+                    )
                 }
                 Prompt::Conflict => {
                     // Names both, because `d` on a stopped replay aborts the
@@ -350,7 +353,7 @@ impl App {
         }
         self.footer(
             f,
-            " j/k scroll · space/b page · g/G top/end · p pager · s squash · r rebase · q back",
+            " j/k scroll · space/b page · g/G top/end · p pager · s squash · r rebase now · q back",
         );
     }
 
@@ -379,7 +382,7 @@ impl App {
 
     pub fn handle(&mut self, key: Key, term: &mut dyn Ui) -> io::Result<Flow> {
         self.status.clear();
-        self.just_prompted = false;
+        self.stale_typeahead = false;
         if self.prompt.is_some() {
             return self.handle_prompt(key, term);
         }
@@ -650,8 +653,24 @@ impl App {
             Key::Ctrl('c') => return Ok(Flow::Quit),
             Key::Char('?') => self.screen = Screen::Help,
             Key::Char('p') => self.open_pager(term)?,
-            Key::Char('s') => self.ask_land(Mode::Squash),
-            Key::Char('r') => self.ask_land(Mode::Rebase),
+            Key::Char('s') => self.ask_squash(),
+            // No confirmation, as `p` and `P` have none: the keystroke is the
+            // decision. What `r` can do is bounded before it starts — it only
+            // ever adds the branch's own commits, it refuses unless the result
+            // is the tree this pane diffed, and it undoes itself on anything
+            // else — and it publishes nothing, so `p` remains the step that
+            // leaves this machine.
+            Key::Char('r') => {
+                if !self.refused_as_empty() {
+                    self.run_land(Mode::Rebase, term)?;
+                    // The pane those keys were aimed at is now the log, where
+                    // `q` goes to the list and `p` there publishes without
+                    // asking. `s` gets this from its confirmation; `r` has to
+                    // take it here, or removing the prompt would have made
+                    // `r q p` a way to publish nothing was ever confirmed.
+                    self.stale_typeahead = true;
+                }
+            }
             _ => {
                 let total = self.reviewing.as_ref().map_or(0, |r| r.lines.len());
                 self.scroll = scroll_by(self.scroll, key, total, rows);
@@ -660,16 +679,24 @@ impl App {
         Ok(Flow::Continue)
     }
 
-    /// Raise the landing confirmation, unless the pane has nothing to land —
-    /// which neither mode can do anything with.
-    fn ask_land(&mut self, mode: Mode) {
-        if self.reviewing.as_ref().is_some_and(|r| r.empty) {
+    /// True when the pane has nothing to land — which neither mode can do
+    /// anything with. Says so on the status bar, since the key would otherwise
+    /// look ignored.
+    fn refused_as_empty(&mut self) -> bool {
+        let empty = self.reviewing.as_ref().is_some_and(|r| r.empty);
+        if empty {
             self.note(
                 "nothing to land: this branch changes nothing on top of the base",
                 Style::fg(RED),
             );
-        } else {
-            self.ask(Prompt::Land(mode));
+        }
+        empty
+    }
+
+    /// Raise the squash landing's confirmation. `r` has none — see its arm.
+    fn ask_squash(&mut self) {
+        if !self.refused_as_empty() {
+            self.ask(Prompt::Squash);
         }
     }
 
@@ -680,7 +707,7 @@ impl App {
             if matches!(self.handle(key, term)?, Flow::Quit) {
                 return Ok(Flow::Quit);
             }
-            if self.just_prompted() {
+            if self.stale_typeahead() {
                 break;
             }
         }
@@ -689,10 +716,10 @@ impl App {
 
     fn handle_prompt(&mut self, key: Key, term: &mut dyn Ui) -> io::Result<Flow> {
         match self.prompt {
-            Some(Prompt::Land(mode)) => match key {
+            Some(Prompt::Squash) => match key {
                 Key::Char('y') | Key::Char('Y') => {
                     self.prompt = None;
-                    self.run_land(mode, term)?;
+                    self.run_land(Mode::Squash, term)?;
                 }
                 _ => {
                     self.prompt = None;
@@ -1114,8 +1141,9 @@ fn help_lines() -> Vec<Line> {
             ("j / k, space / b", "scroll"),
             ("g / G", "top / end"),
             ("p", "open the same diff in your own pager"),
-            ("s", "land it squashed: one commit on the base"),
+            ("s", "land it squashed: one commit on the base — asks first"),
             ("r", "land it rebased: its own commits, replayed"),
+            ("", "lands on the keystroke — no confirmation"),
             ("q", "back to the list"),
         ],
     );
@@ -1123,8 +1151,9 @@ fn help_lines() -> Vec<Line> {
         "landing",
         &[
             ("s then y", "squash + commit, message from the branch's commits"),
-            ("r then y", "replay each commit onto the base tip, message,"),
-            ("", "author and all — all of them or none"),
+            ("r", "replays each commit onto the base tip, message,"),
+            ("", "author and all — all of them or none, and with no"),
+            ("", "confirmation: it commits, it does not publish"),
             ("q, then p", "publish it: push the base (P = every remote)"),
             ("after the push", "the branches it published are deleted from the"),
             ("", "remotes it reached — no further confirmation"),
@@ -1132,7 +1161,7 @@ fn help_lines() -> Vec<Line> {
     );
     for prose in [
         "The branch is pinned to the commit you reviewed: if the ref moves",
-        "before you approve, the landing refuses rather than committing work",
+        "before it runs, the landing refuses rather than committing work",
         "you have not seen. Both modes hold what lands to the diff this pane",
         "showed, and say so on the log when they could not. Landing only",
         "commits — the push is a separate,",
@@ -1470,12 +1499,12 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
-    /// The two landing keys land the same work as different history, so the
-    /// confirmation bar has to say which one is being answered — and the key
-    /// they replaced must no longer land anything at all.
+    /// `s` is the only key that still raises a bar, so the bar must name what
+    /// it is confirming — and the key both landings replaced must no longer
+    /// land anything at all.
     #[test]
     #[ignore = "drives a real git repo; the sandbox gate has no git, the host preflight does"]
-    fn the_bar_says_which_landing_the_key_asked_for() {
+    fn the_bar_names_the_squash_it_confirms() {
         let (root, work) = repo("land-bar");
         let mut app = app_on(&work);
         let mut ui = FakeUi::new();
@@ -1487,14 +1516,96 @@ mod tests {
         assert!(frame.contains("squash into one commit"), "s must say so:\n{frame}");
 
         app.handle(Key::Char('n'), &mut ui).unwrap();
-        app.handle(Key::Char('r'), &mut ui).unwrap();
-        app.redraw(&mut ui).unwrap();
-        let frame = ui.last().to_string();
-        assert!(frame.contains("replay its own commits"), "r must say so:\n{frame}");
-
-        app.handle(Key::Char('n'), &mut ui).unwrap();
         app.handle(Key::Char('a'), &mut ui).unwrap();
         assert!(app.prompt.is_none(), "the retired approve key must not raise a landing");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// `r` lands on the keystroke, as `p` does: no bar to answer, and nothing
+    /// left pending for a later keystroke to answer by accident.
+    #[test]
+    #[ignore = "drives a real git repo; the sandbox gate has no git, the host preflight does"]
+    fn r_lands_without_asking_and_s_still_asks() {
+        let (root, work) = repo("r-no-confirm");
+        let before = git_in(&work, &["rev-parse", "main"]).trim().to_string();
+        let mut app = app_on(&work);
+        let mut ui = FakeUi::new();
+
+        app.handle(Key::Enter, &mut ui).unwrap();
+        app.handle(Key::Char('r'), &mut ui).unwrap();
+        assert!(app.prompt.is_none(), "r must not raise a confirmation");
+        assert!(app.stale_typeahead(), "the keys typed before the land must be dropped");
+        assert_ne!(
+            git_in(&work, &["rev-parse", "main"]).trim(),
+            before,
+            "r must land on the keystroke"
+        );
+
+        // The other key is unchanged: it still asks, and cancelling still cancels.
+        let (root2, work2) = repo("s-still-asks");
+        let before2 = git_in(&work2, &["rev-parse", "main"]).trim().to_string();
+        let mut app = app_on(&work2);
+        app.handle(Key::Enter, &mut ui).unwrap();
+        app.handle(Key::Char('s'), &mut ui).unwrap();
+        assert!(app.prompt.is_some(), "s must still confirm");
+        app.handle(Key::Char('n'), &mut ui).unwrap();
+        assert_eq!(git_in(&work2, &["rev-parse", "main"]).trim(), before2, "cancel must cancel");
+        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_dir_all(root2);
+    }
+
+    /// What the confirmation used to cover for free. `r` swaps the review pane
+    /// for the log, where `q` goes to the branch list and `p` THERE publishes
+    /// and sweeps without asking — so one read of `r q p` would publish work
+    /// nobody confirmed, with the last two keys typed against a pane that was
+    /// still on screen when they were pressed.
+    #[test]
+    #[ignore = "drives a real git repo; the sandbox gate has no git, the host preflight does"]
+    fn keys_typed_behind_an_unconfirmed_land_do_not_reach_the_push() {
+        let (root, work) = repo("r-typeahead");
+        let origin = root.join("origin.git");
+        let published = git_in(&origin, &["rev-parse", "main"]).trim().to_string();
+        let before = git_in(&work, &["rev-parse", "main"]).trim().to_string();
+        let mut app = app_on(&work);
+        let mut ui = FakeUi::new();
+
+        app.handle(Key::Enter, &mut ui).unwrap();
+        app.feed(vec![Key::Char('r'), Key::Char('q'), Key::Char('p')], &mut ui).unwrap();
+
+        assert_ne!(git_in(&work, &["rev-parse", "main"]).trim(), before, "r must still land");
+        assert_eq!(
+            git_in(&origin, &["rev-parse", "main"]).trim(),
+            published,
+            "the keys behind r reached the push"
+        );
+        assert!(app.stale_typeahead(), "the rest of that read must be dropped");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// An empty pane has nothing for either key, and `r` must not land on one
+    /// just because it no longer stops to ask.
+    #[test]
+    #[ignore = "drives a real git repo; the sandbox gate has no git, the host preflight does"]
+    fn r_still_refuses_a_branch_with_nothing_to_land() {
+        let (root, work) = repo("r-empty");
+        // Land it once, so the branch changes nothing on top of the base.
+        let mut app = app_on(&work);
+        let mut ui = FakeUi::new();
+        for key in [Key::Enter, Key::Char('r')] {
+            app.handle(key, &mut ui).unwrap();
+        }
+        let landed = git_in(&work, &["rev-parse", "main"]).trim().to_string();
+
+        let mut app = app_on(&work);
+        app.handle(Key::Enter, &mut ui).unwrap();
+        app.handle(Key::Char('r'), &mut ui).unwrap();
+        assert_eq!(
+            git_in(&work, &["rev-parse", "main"]).trim(),
+            landed,
+            "an empty pane must not land again"
+        );
+        app.redraw(&mut ui).unwrap();
+        assert!(ui.last().contains("nothing to land"), "and must say why:\n{}", ui.last());
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -1503,8 +1614,11 @@ mod tests {
     #[test]
     #[ignore = "drives a real git repo; the sandbox gate has no git, the host preflight does"]
     fn r_lands_the_branchs_own_commit_where_s_builds_a_new_one() {
-        for (tag, land, same) in [("land-r", Key::Char('r'), true), ("land-s", Key::Char('s'), false)]
-        {
+        // `s` is answered, `r` is not: it lands on the keystroke.
+        for (tag, keys, same) in [
+            ("land-r", vec![Key::Enter, Key::Char('r')], true),
+            ("land-s", vec![Key::Enter, Key::Char('s'), Key::Char('y')], false),
+        ] {
             let (root, work) = repo(tag);
             let tip = git_in(&work, &["rev-parse", "refs/remotes/origin/work-0001-feature"])
                 .trim()
@@ -1513,7 +1627,7 @@ mod tests {
             let mut app = app_on(&work);
             let mut ui = FakeUi::new();
 
-            for key in [Key::Enter, land, Key::Char('y')] {
+            for key in keys {
                 app.handle(key, &mut ui).unwrap();
             }
 
@@ -2082,7 +2196,7 @@ mod tests {
         let mut ui = FakeUi::new();
 
         app.handle(Key::Char('D'), &mut ui).unwrap();
-        assert!(app.just_prompted(), "D must raise a prompt the loop then stops on");
+        assert!(app.stale_typeahead(), "D must raise a prompt the loop then stops on");
         assert!(app.prompt.is_some());
 
         // And the prompt is only answerable after the typeahead was dropped.
