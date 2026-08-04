@@ -213,17 +213,19 @@ fn parse_table(table: &[u8], count: usize) -> Result<BTreeMap<char, usize>, Stri
             break;
         };
         if byte == SEPARATOR || byte == SEQUENCE_START {
+            let run = table
+                .get(start..at)
+                .ok_or_else(|| "psf2 table run is out of bounds".to_string())?;
+            if index >= count {
+                return Err(format!("psf2 table describes more than {count} glyphs"));
+            }
+            // Sequence runs are not mapped, but they are still validated: the
+            // claim is that every table byte was checked, not merely the bytes
+            // this profile happens to use.
+            let text = std::str::from_utf8(run)
+                .map_err(|_| format!("psf2 table entry {index} is not UTF-8"))?;
             if !in_sequence {
-                let run = table
-                    .get(start..at)
-                    .ok_or_else(|| "psf2 table run is out of bounds".to_string())?;
-                if index >= count {
-                    return Err(format!("psf2 table describes more than {count} glyphs"));
-                }
-                for scalar in std::str::from_utf8(run)
-                    .map_err(|_| format!("psf2 table entry {index} is not UTF-8"))?
-                    .chars()
-                {
+                for scalar in text.chars() {
                     map.entry(scalar).or_insert(index);
                 }
             }
@@ -240,6 +242,14 @@ fn parse_table(table: &[u8], count: usize) -> Result<BTreeMap<char, usize>, Stri
     if index != count {
         return Err(format!(
             "psf2 table describes {index} glyphs, header declares {count}"
+        ));
+    }
+    // Bytes after the last separator belong to no entry. Ignoring them would
+    // accept a face whose table is longer than the glyphs it describes.
+    if start != table.len() {
+        return Err(format!(
+            "psf2 table has {} bytes after its last entry",
+            table.len().saturating_sub(start)
         ));
     }
     if map.is_empty() {
@@ -344,14 +354,32 @@ mod tests {
     }
 
     #[test]
+    fn a_table_longer_than_its_entries_is_refused() {
+        let header = [32, HAS_UNICODE_TABLE, 1, 16, 16, 8];
+        let glyphs = [0u8; 16];
+        assert!(Font::parse(&face(&header, &glyphs, b" \xff")).is_ok());
+        assert!(Font::parse(&face(&header, &glyphs, b" \xffZ")).is_err());
+    }
+
+    #[test]
     fn a_multi_scalar_sequence_is_skipped_without_losing_the_entry() {
         let header = [32, HAS_UNICODE_TABLE, 2, 16, 16, 8];
         let glyphs = [0u8; 32];
         // Glyph 0 is ' ' plus a sequence; glyph 1 is 'B'.
-        let table = b" \xfeAB\xffB\xff";
+        // PSF2 puts standalone scalars FIRST, then each sequence introduced
+        // by 0xFE, through to 0xFF -- so everything after the first 0xFE in an
+        // entry is sequence text and must not be mapped as a standalone.
+        let table = b" \xfeAB\xfeCD\xffB\xff";
         let font = Font::parse(&face(&header, &glyphs, table)).unwrap();
         assert_eq!(font.glyph_count(), 2);
         assert_eq!(font.index(' '), 0);
         assert_eq!(font.index('B'), 1);
+        // 'A', 'C' and 'D' appear only inside sequences, so none is claimed.
+        assert!(!font.covers('A'));
+        assert!(!font.covers('C'));
+        assert!(!font.covers('D'));
+        // Skipped does not mean unchecked: invalid UTF-8 inside a sequence is
+        // still refused.
+        assert!(Font::parse(&face(&header, &glyphs, b" \xfe\xc3\xffB\xff")).is_err());
     }
 }

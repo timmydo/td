@@ -292,7 +292,10 @@ mod tests {
 
 #[cfg(test)]
 mod confinement {
-    const IMPORTER: &str = include_str!("../tools/import-libvterm.rs");
+    const IMPORTERS: &[(&str, &str)] = &[
+        ("import-libvterm.rs", include_str!("../tools/import-libvterm.rs")),
+        ("import-unifont.rs", include_str!("../tools/import-unifont.rs")),
+    ];
     const MAIN: &str = include_str!("main.rs");
     const SHARED_SHA256: &str = include_str!("../../engine/src/sha256.rs");
     const SYS: &str = include_str!("sys.rs");
@@ -346,10 +349,15 @@ mod confinement {
 
     #[test]
     fn importer_is_a_safe_standalone_crate_root() {
-        assert!(IMPORTER.starts_with("#![deny(unsafe_code)]"));
-        assert_eq!(occurrences(IMPORTER, "unsafe"), 1);
-        assert_eq!(occurrences(IMPORTER, "#[allow(unsafe_code)]"), 0);
-        assert_eq!(occurrences(IMPORTER, "core::arch::asm!"), 0);
+        for (name, importer) in IMPORTERS {
+            assert!(
+                importer.starts_with("#![deny(unsafe_code)]"),
+                "{name} does not deny unsafe"
+            );
+            assert_eq!(occurrences(importer, "unsafe"), 1, "{name}");
+            assert_eq!(occurrences(importer, "#[allow(unsafe_code)]"), 0, "{name}");
+            assert_eq!(occurrences(importer, "core::arch::asm!"), 0, "{name}");
+        }
         assert_eq!(occurrences(SHARED_SHA256, "unsafe"), 0);
         assert_eq!(occurrences(SHARED_SHA256, "core::arch::asm!"), 0);
     }

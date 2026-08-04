@@ -30,8 +30,10 @@ const ASSET_FILE: &str = "unifont-16.0.04-8x16.psf2";
 const GLYPH_WIDTH: usize = 8;
 const GLYPH_HEIGHT: usize = 16;
 const GLYPH_BYTES: usize = GLYPH_HEIGHT * GLYPH_WIDTH.div_ceil(8);
-/// Hex digits in a single-width `.hex` record's bitmap field.
+/// Hex digits in a single-width `.hex` record's bitmap field, and in the one
+/// other form upstream publishes.
 const SINGLE_WIDTH_DIGITS: usize = GLYPH_BYTES * 2;
+const DOUBLE_WIDTH_DIGITS: usize = SINGLE_WIDTH_DIGITS * 2;
 
 const PSF2_MAGIC: [u8; 4] = [0x72, 0xb5, 0x4a, 0x86];
 const PSF2_HEADER_BYTES: u32 = 32;
@@ -117,18 +119,20 @@ fn parse_hex(text: &str) -> Result<BTreeMap<u32, [u8; GLYPH_BYTES]>, String> {
     let mut glyphs = BTreeMap::new();
     for (offset, raw) in text.lines().enumerate() {
         let line = offset.saturating_add(1);
-        let record = raw.trim_end_matches(['\r', '\n']);
+        let record = raw;
         if record.is_empty() {
             continue;
         }
         let Some((codepoint, bitmap)) = record.split_once(':') else {
             return Err(format!("hex:{line}: expected CODEPOINT:BITMAP"));
         };
-        if bitmap.len() != SINGLE_WIDTH_DIGITS {
-            if bitmap.len() % 2 != 0 || bitmap.is_empty() {
-                return Err(format!("hex:{line}: bitmap has {} digits", bitmap.len()));
-            }
+        if bitmap.len() == DOUBLE_WIDTH_DIGITS {
             continue;
+        }
+        // Fail closed on any other length. Skipping whatever happened not to
+        // be single-width would silently drop glyphs on a future pin update.
+        if bitmap.len() != SINGLE_WIDTH_DIGITS {
+            return Err(format!("hex:{line}: bitmap has {} digits", bitmap.len()));
         }
         let codepoint = parse_codepoint(codepoint, line)?;
         let mut glyph = [0u8; GLYPH_BYTES];
