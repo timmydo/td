@@ -1481,6 +1481,11 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
     assert_preflight!("td-compositor/tools/import-unifont.rs", "cargo-test");
     assert_target!("td-compositor/src/pty.rs", "recipe-checks");
     assert_preflight!("td-compositor/src/pty.rs", "cargo-test");
+    assert_target!("td-compositor/src/render.rs", "recipe-checks");
+    assert_preflight!("td-compositor/src/render.rs", "cargo-test");
+    // Rendered goldens route like the terminal corpus beside them.
+    assert_target!("td-compositor/spec/render/renditions.ppm", "check");
+    assert_preflight!("td-compositor/spec/render/renditions.ppm", "cargo-test");
     assert_target!("td-compositor/spec/term/input.term", "check");
     assert_preflight!("td-compositor/spec/term/input.term", "cargo-test");
     assert_target!("td-compositor/tools/import-libvterm.rs", "check");

@@ -8,12 +8,10 @@ use std::collections::BTreeMap;
 /// than a binary beside the sources because the target recipe stages modules
 /// through `Step::WriteFile`, whose content is a `String`; an `include_bytes!`
 /// of an unstaged asset compiles on the host and fails in the target build.
-#[allow(dead_code)]
 pub fn pinned() -> Result<Font, String> {
     Font::parse(&decode_hex(crate::font_data::UNIFONT_HEX)?)
 }
 
-#[allow(dead_code)]
 fn decode_hex(hex: &str) -> Result<Vec<u8>, String> {
     let bytes = hex.as_bytes();
     if !bytes.len().is_multiple_of(2) {
@@ -27,34 +25,24 @@ fn decode_hex(hex: &str) -> Result<Vec<u8>, String> {
     Ok(out)
 }
 
-#[allow(dead_code)]
 const MAGIC: [u8; 4] = [0x72, 0xb5, 0x4a, 0x86];
-#[allow(dead_code)]
 const HEADER_BYTES: usize = 32;
-#[allow(dead_code)]
 const HAS_UNICODE_TABLE: u32 = 1;
-#[allow(dead_code)]
 const SEPARATOR: u8 = 0xff;
-#[allow(dead_code)]
 const SEQUENCE_START: u8 = 0xfe;
 
 /// A cell wider than this cannot be a terminal cell on the supported output.
 /// These bound `row_bytes * height`; `charsize` is then pinned equal to it.
-#[allow(dead_code)]
 const MAX_DIMENSION: usize = 64;
-#[allow(dead_code)]
 const MAX_GLYPHS: usize = 1 << 20;
 
 /// Drawn when the model holds a scalar the face has no glyph for. U+FFFD if
 /// the face carries it, else space: a terminal that silently drew nothing
 /// would misreport its own contents.
-#[allow(dead_code)]
 const REPLACEMENT: char = '\u{fffd}';
-#[allow(dead_code)]
 const BLANK: char = ' ';
 
 #[derive(Debug)]
-#[allow(dead_code)]
 pub struct Font {
     width: usize,
     height: usize,
@@ -70,7 +58,6 @@ pub struct Font {
     fallback: usize,
 }
 
-#[allow(dead_code)]
 fn word(bytes: &[u8], at: usize) -> Result<u32, String> {
     let end = at
         .checked_add(4)
@@ -83,13 +70,11 @@ fn word(bytes: &[u8], at: usize) -> Result<u32, String> {
     Ok(u32::from_le_bytes(raw))
 }
 
-#[allow(dead_code)]
 fn size(value: u32, what: &str) -> Result<usize, String> {
     usize::try_from(value).map_err(|_| format!("psf2 {what} {value} does not fit"))
 }
 
 impl Font {
-    #[allow(dead_code)]
     pub fn parse(bytes: &[u8]) -> Result<Font, String> {
         if bytes.get(..4) != Some(&MAGIC[..]) {
             return Err("not a PSF2 face".to_string());
@@ -161,16 +146,16 @@ impl Font {
         })
     }
 
-    #[allow(dead_code)]
     pub fn width(&self) -> usize {
         self.width
     }
 
-    #[allow(dead_code)]
     pub fn height(&self) -> usize {
         self.height
     }
 
+    /// Coverage questions the renderer never asks — it falls back instead —
+    /// but the pinned-face and missing-glyph cases do.
     #[allow(dead_code)]
     pub fn glyph_count(&self) -> usize {
         self.count
@@ -183,14 +168,12 @@ impl Font {
 
     /// Glyph index for a scalar, falling back rather than failing so the
     /// renderer has no error path in its cell loop.
-    #[allow(dead_code)]
     pub fn index(&self, scalar: char) -> usize {
         self.map.get(&scalar).copied().unwrap_or(self.fallback)
     }
 
     /// One row of a glyph's bitmap, already bounded. `row` beyond the cell
     /// yields nothing rather than the next glyph's pixels.
-    #[allow(dead_code)]
     pub fn row(&self, index: usize, row: usize) -> Option<&[u8]> {
         if row >= self.height || index >= self.count {
             return None;
@@ -203,7 +186,6 @@ impl Font {
 
     /// Whether the pixel at (`column`, `row`) of a glyph is set. Columns are
     /// most-significant-bit first, as PSF2 stores them.
-    #[allow(dead_code)]
     pub fn pixel(&self, index: usize, column: usize, row: usize) -> bool {
         if column >= self.width {
             return false;
@@ -223,7 +205,6 @@ impl Font {
 /// 0xFF. 0xFE introduces a multi-scalar sequence, which this profile does not
 /// claim: the sequence is skipped, so a face carrying one still loads and its
 /// single scalars still resolve.
-#[allow(dead_code)]
 fn parse_table(table: &[u8], count: usize) -> Result<BTreeMap<char, usize>, String> {
     let mut map = BTreeMap::new();
     let mut index = 0usize;

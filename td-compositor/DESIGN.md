@@ -694,11 +694,18 @@ and provenance record, the importer that derives it reproducibly, and the PSF2
 reader that validates every header field, table entry, and pixel offset before
 the renderer can index a glyph.
 
+Section 11's renderer is landed as a pure function, with section 14's exact
+P6 goldens as its oracle: the palette, the six renditions, the cursor, the
+visual-bell ring, the clipping, and the scrollback viewport's rendering half.
+What it still lacks is a caller. Nothing submits its output to a surface, so
+the frame-callback coalescing, the persistent-buffer reuse-after-release, and
+the buffer replacement on resize that section 11 also specifies land with the
+Wayland client, which is where a frame's lifecycle exists at all.
+
 Section 12's writer thread, child waiter, readiness socket, `TD-TERM-READY`
-marker, and `probe` subcommand are not built, nor is section 11's renderer,
-which now waits only on itself. The Wayland
-client, terminfo entry, packaging, and boot cutover of sections 12 and 14
-follow it. Until that client exists the PTY adapter has no production caller;
+marker, and `probe` subcommand are not built. The Wayland client, packaging,
+and boot cutover of sections 12 and 14 follow them; the terminfo entry is
+landed. Until that client exists the PTY adapter has no production caller;
 its host tests drive every operation against a real PTY, and the packaged
 binary's selftest covers the policy layer, which is what runs where devpts is
 not mounted.
@@ -933,6 +940,29 @@ Underline and strike draw fixed clipped cell rows, and inverse exchanges
 foreground and background. Blocking PPM cases prove that each claimed
 attribute differs from an otherwise identical normal cell.
 
+The fixed palette is xterm's: its sixteen base entries are a table, and the
+remaining 240 are computed from the arithmetic that defines them -- the
+six-level cube on 0, 95, 135, 175, 215, 255, then the grey ramp from 8 in
+steps of 10 -- so those entries cannot drift from their own definition.
+Default ink is entry 7 on entry 0 rather than a seventeenth colour, so
+`SGR 39` and `SGR 49` land back on a palette the child can also name.
+Faint follows inverse rather than preceding it: after the exchange the
+drawn foreground is the one to dim, and blending before it would brighten
+an inverse-and-faint cell instead.
+
+The cursor is a presentation of that same exchange. Focused, it is its cell
+drawn with inverse toggled, so a cursor over an already-inverse cell reads
+as the surrounding text. Unfocused, it is a hollow one-pixel box in the
+cell's foreground, leaving the glyph legible underneath: present, but not
+claiming the keyboard. That box is the same colour as the glyph it rings, so
+over a cell whose border pixels are all set -- `U+2588`, and some
+box-drawing -- an unfocused cursor is invisible. That follows from drawing it
+in the cell's own foreground and is accepted for the first profile, where an
+unfocused terminal has nothing to locate; a focused cursor is never affected,
+since exchanging the ink is visible against any glyph. A pending wrap does
+not move either, because the model already reports the column the cursor
+still occupies.
+
 The renderer consumes a complete terminal snapshot, a fixed palette, focus
 state, and cursor state. It performs no allocation in the cell loop. A full
 redraw is acceptable for the initial QEMU profile, but rendering is coalesced
@@ -1038,6 +1068,16 @@ The scrollback viewport `Shift+PageUp` and `Shift+PageDown` select lands with
 the renderer, and so does §10's rule that an unmodified End key returns to the
 live bottom while viewing scrollback. Until then End is forwarded in the
 selected cursor-key mode, which is its behaviour at the live bottom.
+
+The renderer's half of that viewport is landed: a snapshot carries how many
+lines back it is scrolled, rows above the split come from the primary
+history and the rest from the live screen, and a request deeper than the
+stored history clamps rather than blanks. History is primary-screen only,
+so the viewport reads it even while the alternate screen is active -- which
+is what lets it show the shell a full-screen program is covering. A line is
+stored at the width it scrolled off with, so a widening resize leaves the
+tail of an old line blank rather than fabricating cells for it. The keys
+that select the viewport land with the input adapter.
 
 ## 12. PTY and process lifecycle
 
@@ -1191,6 +1231,17 @@ td-compositor/spec/term/
   visual/*.ppm
 ```
 
+The visual oracle is two-tiered, and only the lower tier is built. Goldens
+that pin the renderer itself live beside it in `td-compositor/spec/render/`,
+driven by native Rust fixtures that name a snapshot, a surface size, focus,
+and a cursor directly; they are what the renderer's own landing proves.
+`spec/term/visual/` above is the upper tier -- a corpus case rendering its
+own final grid through an `expect ppm` statement -- and neither those images
+nor that statement exist yet. A corpus case cannot render until the parser
+below it also carries a surface size and a focus state, which is a corpus
+format change rather than a renderer one, so it lands with the Wayland
+client that gives a frame those properties in the first place.
+
 The model starts with a small td-authored seed corpus. The bulk migration then
 converts a source archive and SHA-256 pin of the MIT-licensed libvterm 0.3.3
 suite. A sibling license file retains the complete upstream copyright and
@@ -1228,8 +1279,9 @@ vocabulary:
 - `write`, `resize`, and `key` operations; and
 - `expect` statements for rows, imported text and glyph observations, cells,
   cursor, modes, cumulative terminal replies, cumulative keyboard input,
-  history, and an optional rendered PPM. Cursor expectations accept only the
-  optional `pending-wrap` flag.
+  history, and an optional rendered PPM -- the last of these deferred, as
+  §13's tree records. Cursor expectations accept only the optional
+  `pending-wrap` flag.
 
 Every case has a source. td-authored cases use `source td`; derived cases name
 the pinned release, path, and original case. `size` is rows followed by
@@ -1284,10 +1336,25 @@ not the normative state model.
 ## 14. Visual and end-to-end proof
 
 The pure renderer's blocking visual oracle is exact P6 PPM output. Selected
-native cases render with the pinned font, palette, surface size, focus, and
-cursor. A mismatch reports the first differing coordinate and writes an
-actual image plus a high-contrast PPM diff beneath the build's temporary
-output; no PNG encoder or image library is required.
+cases render with the pinned font, palette, surface size, focus, and cursor.
+Those five are parameters rather than defaults, so no case can be green
+against a face or a palette it did not name. A mismatch reports the first
+differing coordinate and writes an actual image plus a high-contrast PPM
+diff beneath the build's temporary output; no PNG encoder or image library
+is required. The cases are Rust fixtures today and native corpus cases once
+the corpus format carries a surface, per §13.
+
+Exactness is the contract in both directions: a golden whose bytes differ
+from what the encoder emits fails even when it decodes to identical pixels,
+because the only thing that could produce one is a hand-edit, and a hand-
+edited golden is no longer an oracle. Goldens are generated by the renderer,
+so what makes them evidence is not their provenance but the structural
+assertions beside them -- that each rendition differs from an otherwise
+identical normal cell, that bold only adds pixels and each added one is a
+step right of a set one, that italic's every top-half pixel is its normal
+neighbour shifted one column, that underline and strike are exactly one full
+row each. Those are what a wrong renderer fails; the goldens are what a
+CHANGED one fails.
 
 A smaller integration gallery runs td-term against a real td-compositor with
 a file-backed framebuffer. It compares the compositor's exact final XRGB8888

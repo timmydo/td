@@ -230,7 +230,6 @@ impl History {
             )
     }
 
-    #[cfg(test)]
     fn line_cell(&self, line: usize, column: usize) -> Option<Cell> {
         let line = self.lines.get(line)?;
         if column >= line.length || self.max_cells == 0 {
@@ -1072,6 +1071,29 @@ impl Terminal {
 
     pub(crate) fn history_cells(&self) -> usize {
         self.primary.history.cells
+    }
+
+    /// Scrollback is primary-screen only, so these read the primary history
+    /// even while the alternate screen is active — which is what lets the
+    /// viewport show the shell a full-screen program is covering.
+    pub(crate) fn history_lines(&self) -> usize {
+        self.primary.history.lines.len()
+    }
+
+    /// Oldest line first: `history_lines() - 1` is the row that most
+    /// recently scrolled off, the one immediately above the live screen.
+    /// `None` past a line's stored width, which a resize can leave shorter
+    /// than the current grid.
+    pub(crate) fn history_cell(&self, line: usize, column: usize) -> Option<Cell> {
+        self.primary.history.line_cell(line, column)
+    }
+
+    /// The primary screen's cell whichever screen is active. An open
+    /// scrollback viewport reads through this so it shows one coherent
+    /// primary scroll region; `cell` would put primary history above the
+    /// split and a full-screen program's alternate rows below it.
+    pub(crate) fn primary_cell(&self, row: usize, column: usize) -> Option<Cell> {
+        self.primary.cell(row, column)
     }
 
     pub(crate) fn feed(&mut self, bytes: &[u8]) {

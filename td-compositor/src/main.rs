@@ -12,6 +12,7 @@ mod launcher;
 mod layout;
 mod pointer;
 mod pty;
+mod render;
 mod runtime;
 mod scene;
 mod server;
@@ -115,6 +116,7 @@ fn selftest() -> Result<(), String> {
     term::selftest()?;
     keys::selftest()?;
     pty::selftest()?;
+    render::selftest()?;
     terminfo::selftest()?;
 
     let mut payload = wire::Builder::new();
@@ -313,6 +315,7 @@ mod confinement {
         ("layout.rs", include_str!("layout.rs")),
         ("pointer.rs", include_str!("pointer.rs")),
         ("pty.rs", include_str!("pty.rs")),
+        ("render.rs", include_str!("render.rs")),
         ("runtime.rs", include_str!("runtime.rs")),
         ("scene.rs", include_str!("scene.rs")),
         ("server.rs", include_str!("server.rs")),
@@ -322,7 +325,10 @@ mod confinement {
         ("ui.rs", include_str!("ui.rs")),
         ("wire.rs", include_str!("wire.rs")),
     ];
-    const TEST_ONLY: &[(&str, &str)] = &[("term_spec.rs", include_str!("term_spec.rs"))];
+    const TEST_ONLY: &[(&str, &str)] = &[
+        ("render_spec.rs", include_str!("render_spec.rs")),
+        ("term_spec.rs", include_str!("term_spec.rs")),
+    ];
 
     fn occurrences(source: &str, needle: &str) -> usize {
         source.match_indices(needle).count()

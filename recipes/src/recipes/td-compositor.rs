@@ -33,6 +33,10 @@ const MODULES: &[(&str, &str)] = &[
     ),
     ("pty", include_str!("../../../td-compositor/src/pty.rs")),
     (
+        "render",
+        include_str!("../../../td-compositor/src/render.rs"),
+    ),
+    (
         "runtime",
         include_str!("../../../td-compositor/src/runtime.rs"),
     ),
