@@ -1,0 +1,357 @@
+//! The pinned PSF2 face of section 11. Every header field, every table entry,
+//! and every pixel offset is checked once at parse time, so the renderer's
+//! inner loop can index a glyph without arithmetic that could fail.
+
+use std::collections::BTreeMap;
+
+/// The committed asset. Bytes, not a path: section 11 requires host tests and
+/// the target recipe to consume the same face, with no host font lookup.
+#[allow(dead_code)]
+pub const UNIFONT: &[u8] = include_bytes!("../assets/unifont-16.0.04-8x16.psf2");
+
+#[allow(dead_code)]
+const MAGIC: [u8; 4] = [0x72, 0xb5, 0x4a, 0x86];
+#[allow(dead_code)]
+const HEADER_BYTES: usize = 32;
+#[allow(dead_code)]
+const HAS_UNICODE_TABLE: u32 = 1;
+#[allow(dead_code)]
+const SEPARATOR: u8 = 0xff;
+#[allow(dead_code)]
+const SEQUENCE_START: u8 = 0xfe;
+
+/// A cell wider than this cannot be a terminal cell on the supported output,
+/// and the ceilings are what keep `charsize` arithmetic in range.
+#[allow(dead_code)]
+const MAX_DIMENSION: usize = 64;
+#[allow(dead_code)]
+const MAX_GLYPHS: usize = 1 << 20;
+
+/// Drawn when the model holds a scalar the face has no glyph for. U+FFFD if
+/// the face carries it, else space: a terminal that silently drew nothing
+/// would misreport its own contents.
+#[allow(dead_code)]
+const REPLACEMENT: char = '\u{fffd}';
+#[allow(dead_code)]
+const BLANK: char = ' ';
+
+#[derive(Debug)]
+#[allow(dead_code)]
+pub struct Font {
+    width: usize,
+    height: usize,
+    /// Bytes per glyph, as the header declares it. Never recomputed from
+    /// width and height: a face may pad its rows, and the header is what says
+    /// where the next glyph starts.
+    charsize: usize,
+    /// Bytes per row within a glyph.
+    row_bytes: usize,
+    glyphs: Vec<u8>,
+    count: usize,
+    map: BTreeMap<char, usize>,
+    fallback: usize,
+}
+
+#[allow(dead_code)]
+fn word(bytes: &[u8], at: usize) -> Result<u32, String> {
+    let end = at
+        .checked_add(4)
+        .ok_or_else(|| "psf2 header offset overflow".to_string())?;
+    let raw: [u8; 4] = bytes
+        .get(at..end)
+        .ok_or_else(|| format!("psf2 header is short at {at}"))?
+        .try_into()
+        .map_err(|_| format!("psf2 header is short at {at}"))?;
+    Ok(u32::from_le_bytes(raw))
+}
+
+#[allow(dead_code)]
+fn size(value: u32, what: &str) -> Result<usize, String> {
+    usize::try_from(value).map_err(|_| format!("psf2 {what} {value} does not fit"))
+}
+
+impl Font {
+    #[allow(dead_code)]
+    pub fn parse(bytes: &[u8]) -> Result<Font, String> {
+        if bytes.get(..4) != Some(&MAGIC[..]) {
+            return Err("not a PSF2 face".to_string());
+        }
+        if word(bytes, 4)? != 0 {
+            return Err("psf2 version is not 0".to_string());
+        }
+        let header = size(word(bytes, 8)?, "headersize")?;
+        if header != HEADER_BYTES {
+            return Err(format!("psf2 headersize is {header}, expected {HEADER_BYTES}"));
+        }
+        let flags = word(bytes, 12)?;
+        if flags & HAS_UNICODE_TABLE == 0 {
+            return Err("psf2 face carries no Unicode table".to_string());
+        }
+        let count = size(word(bytes, 16)?, "length")?;
+        let charsize = size(word(bytes, 20)?, "charsize")?;
+        let height = size(word(bytes, 24)?, "height")?;
+        let width = size(word(bytes, 28)?, "width")?;
+        if count == 0 || count > MAX_GLYPHS {
+            return Err(format!("psf2 declares {count} glyphs"));
+        }
+        if width == 0 || height == 0 || width > MAX_DIMENSION || height > MAX_DIMENSION {
+            return Err(format!("psf2 cell is {width}x{height}"));
+        }
+        let row_bytes = width.div_ceil(8);
+        let needed = row_bytes
+            .checked_mul(height)
+            .ok_or_else(|| "psf2 glyph size overflow".to_string())?;
+        // Not equality: a face may pad each glyph. Too SMALL is the error,
+        // because then a row read would run into the next glyph.
+        if charsize < needed {
+            return Err(format!(
+                "psf2 charsize {charsize} cannot hold a {width}x{height} cell"
+            ));
+        }
+        let bitmap_bytes = charsize
+            .checked_mul(count)
+            .ok_or_else(|| "psf2 bitmap size overflow".to_string())?;
+        let table_at = header
+            .checked_add(bitmap_bytes)
+            .ok_or_else(|| "psf2 table offset overflow".to_string())?;
+        let glyphs = bytes
+            .get(header..table_at)
+            .ok_or_else(|| format!("psf2 bitmaps need {bitmap_bytes} bytes"))?
+            .to_vec();
+        let table = bytes
+            .get(table_at..)
+            .ok_or_else(|| "psf2 has no Unicode table".to_string())?;
+        let map = parse_table(table, count)?;
+        let fallback = map
+            .get(&REPLACEMENT)
+            .or_else(|| map.get(&BLANK))
+            .copied()
+            .ok_or_else(|| "psf2 face has neither U+FFFD nor a space".to_string())?;
+        Ok(Font {
+            width,
+            height,
+            charsize,
+            row_bytes,
+            glyphs,
+            count,
+            map,
+            fallback,
+        })
+    }
+
+    #[allow(dead_code)]
+    pub fn width(&self) -> usize {
+        self.width
+    }
+
+    #[allow(dead_code)]
+    pub fn height(&self) -> usize {
+        self.height
+    }
+
+    #[allow(dead_code)]
+    pub fn glyph_count(&self) -> usize {
+        self.count
+    }
+
+    #[allow(dead_code)]
+    pub fn covers(&self, scalar: char) -> bool {
+        self.map.contains_key(&scalar)
+    }
+
+    /// Glyph index for a scalar, falling back rather than failing so the
+    /// renderer has no error path in its cell loop.
+    #[allow(dead_code)]
+    pub fn index(&self, scalar: char) -> usize {
+        self.map.get(&scalar).copied().unwrap_or(self.fallback)
+    }
+
+    /// One row of a glyph's bitmap, already bounded. `row` beyond the cell
+    /// yields nothing rather than the next glyph's pixels.
+    #[allow(dead_code)]
+    pub fn row(&self, index: usize, row: usize) -> Option<&[u8]> {
+        if row >= self.height || index >= self.count {
+            return None;
+        }
+        let at = index
+            .checked_mul(self.charsize)?
+            .checked_add(row.checked_mul(self.row_bytes)?)?;
+        self.glyphs.get(at..at.checked_add(self.row_bytes)?)
+    }
+
+    /// Whether the pixel at (`column`, `row`) of a glyph is set. Columns are
+    /// most-significant-bit first, as PSF2 stores them.
+    #[allow(dead_code)]
+    pub fn pixel(&self, index: usize, column: usize, row: usize) -> bool {
+        if column >= self.width {
+            return false;
+        }
+        let Some(bits) = self.row(index, row) else {
+            return false;
+        };
+        let Some(byte) = bits.get(column / 8) else {
+            return false;
+        };
+        let shift = 7 - (column % 8);
+        byte >> shift & 1 == 1
+    }
+}
+
+/// PSF2's table is one entry per glyph, each a run of UTF-8 scalars ended by
+/// 0xFF. 0xFE introduces a multi-scalar sequence, which this profile does not
+/// claim: the sequence is skipped, so a face carrying one still loads and its
+/// single scalars still resolve.
+#[allow(dead_code)]
+fn parse_table(table: &[u8], count: usize) -> Result<BTreeMap<char, usize>, String> {
+    let mut map = BTreeMap::new();
+    let mut index = 0usize;
+    let mut at = 0usize;
+    let mut start = 0usize;
+    let mut in_sequence = false;
+    while at < table.len() {
+        let Some(byte) = table.get(at).copied() else {
+            break;
+        };
+        if byte == SEPARATOR || byte == SEQUENCE_START {
+            if !in_sequence {
+                let run = table
+                    .get(start..at)
+                    .ok_or_else(|| "psf2 table run is out of bounds".to_string())?;
+                if index >= count {
+                    return Err(format!("psf2 table describes more than {count} glyphs"));
+                }
+                for scalar in std::str::from_utf8(run)
+                    .map_err(|_| format!("psf2 table entry {index} is not UTF-8"))?
+                    .chars()
+                {
+                    map.entry(scalar).or_insert(index);
+                }
+            }
+            if byte == SEPARATOR {
+                index = index.saturating_add(1);
+                in_sequence = false;
+            } else {
+                in_sequence = true;
+            }
+            start = at.saturating_add(1);
+        }
+        at = at.saturating_add(1);
+    }
+    if index != count {
+        return Err(format!(
+            "psf2 table describes {index} glyphs, header declares {count}"
+        ));
+    }
+    if map.is_empty() {
+        return Err("psf2 table maps no scalars".to_string());
+    }
+    Ok(map)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn unifont() -> Font {
+        Font::parse(UNIFONT).unwrap()
+    }
+
+    #[test]
+    fn the_committed_face_is_the_single_width_unifont_the_asset_record_names() {
+        let font = unifont();
+        assert_eq!((font.width(), font.height()), (8, 16));
+        assert_eq!(font.glyph_count(), 20673);
+        assert_eq!(UNIFONT.len(), 422_671);
+    }
+
+    #[test]
+    fn the_face_covers_what_the_first_profile_renders() {
+        let font = unifont();
+        for scalar in ' '..='~' {
+            assert!(font.covers(scalar), "missing U+{:04X}", scalar as u32);
+        }
+        // Line drawing and the replacement character the fallback needs.
+        for scalar in ['─', '│', '┌', '┐', '└', '┘', '├', '┤', '┬', '┴', '┼', '\u{fffd}'] {
+            assert!(font.covers(scalar), "missing U+{:04X}", scalar as u32);
+        }
+        // Double-width scalars are out of profile, so the face omits them and
+        // the fallback is what a model holding one would draw.
+        assert!(!font.covers('漢'));
+        assert_eq!(font.index('漢'), font.index('\u{fffd}'));
+    }
+
+    #[test]
+    fn glyph_pixels_are_bounded_on_every_axis() {
+        let font = unifont();
+        let index = font.index('A');
+        assert!(font.row(index, 0).is_some());
+        assert!(font.row(index, 15).is_some());
+        assert!(font.row(index, 16).is_none(), "past the last row");
+        assert!(font.row(font.glyph_count(), 0).is_none(), "past the last glyph");
+        assert!(!font.pixel(index, 8, 0), "past the last column");
+        assert!(!font.pixel(index, 0, 99), "past the last row");
+        // A blank cell is genuinely blank, and a letter is genuinely not.
+        let space = font.index(' ');
+        assert!((0..16).all(|row| (0..8).all(|col| !font.pixel(space, col, row))));
+        assert!((0..16).any(|row| (0..8).any(|col| font.pixel(index, col, row))));
+    }
+
+    fn face(header: &[u32; 6], glyphs: &[u8], table: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(&MAGIC);
+        out.extend_from_slice(&0u32.to_le_bytes());
+        for value in header {
+            out.extend_from_slice(&value.to_le_bytes());
+        }
+        out.extend_from_slice(glyphs);
+        out.extend_from_slice(table);
+        out
+    }
+
+    #[test]
+    fn every_header_field_is_checked_before_use() {
+        let good = [32, HAS_UNICODE_TABLE, 1, 16, 16, 8];
+        let glyphs = [0u8; 16];
+        let table = b" \xff";
+        assert!(Font::parse(&face(&good, &glyphs, table)).is_ok());
+
+        assert!(Font::parse(b"nope").is_err());
+        let mut wrong_magic = face(&good, &glyphs, table);
+        wrong_magic[0] = 0;
+        assert!(Font::parse(&wrong_magic).is_err());
+
+        let no_table = [32, 0, 1, 16, 16, 8];
+        assert!(Font::parse(&face(&no_table, &glyphs, table)).is_err());
+        let bad_header = [33, HAS_UNICODE_TABLE, 1, 16, 16, 8];
+        assert!(Font::parse(&face(&bad_header, &glyphs, table)).is_err());
+        let no_glyphs = [32, HAS_UNICODE_TABLE, 0, 16, 16, 8];
+        assert!(Font::parse(&face(&no_glyphs, &glyphs, table)).is_err());
+        let huge = [32, HAS_UNICODE_TABLE, 1, 16, 16, u32::MAX];
+        assert!(Font::parse(&face(&huge, &glyphs, table)).is_err());
+        // charsize too small for the declared cell would let a row read run
+        // into the next glyph.
+        let short = [32, HAS_UNICODE_TABLE, 1, 8, 16, 8];
+        assert!(Font::parse(&face(&short, &glyphs, table)).is_err());
+        // Bitmaps shorter than the header claims.
+        assert!(Font::parse(&face(&good, &[0u8; 4], table)).is_err());
+        // A table naming fewer or more glyphs than the header.
+        assert!(Font::parse(&face(&good, &glyphs, b"")).is_err());
+        assert!(Font::parse(&face(&good, &glyphs, b" \xffB\xff")).is_err());
+        // A face with no space and no replacement has no fallback to draw.
+        assert!(Font::parse(&face(&good, &glyphs, b"B\xff")).is_err());
+        // Invalid UTF-8 in the table.
+        assert!(Font::parse(&face(&good, &glyphs, b"\xc3\xff")).is_err());
+    }
+
+    #[test]
+    fn a_multi_scalar_sequence_is_skipped_without_losing_the_entry() {
+        let header = [32, HAS_UNICODE_TABLE, 2, 16, 16, 8];
+        let glyphs = [0u8; 32];
+        // Glyph 0 is ' ' plus a sequence; glyph 1 is 'B'.
+        let table = b" \xfeAB\xffB\xff";
+        let font = Font::parse(&face(&header, &glyphs, table)).unwrap();
+        assert_eq!(font.glyph_count(), 2);
+        assert_eq!(font.index(' '), 0);
+        assert_eq!(font.index('B'), 1);
+    }
+}

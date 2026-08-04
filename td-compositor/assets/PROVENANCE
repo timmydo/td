@@ -1,0 +1,40 @@
+GNU Unifont 16.0.04, single-width PSF2 face
+===========================================
+
+unifont-16.0.04-8x16.psf2 is not an upstream file. Upstream publishes no
+full-coverage PSF2 -- its only PSF is Unifont-APL8x16-16.0.04.psf.gz, which is
+PSF1 (magic 0x0436) and covers APL alone. This face is derived from the
+upstream .hex release by td-compositor/tools/import-unifont.rs, which pins the
+input by hash and is what makes the derivation reproducible.
+
+  upstream release   unifont-16.0.04
+  input              unifont_all-16.0.04.hex.gz
+  input URL          https://ftp.gnu.org/gnu/unifont/unifont-16.0.04/unifont_all-16.0.04.hex.gz
+  input sha256       20e8b505f602488697979eefc69857f7f6106bceab702f5ac559f4f84e0e7494
+  decompressed hex   730472c02a75c8c7dd6e6a089d8d10f32c32b99f465f43d9992d8b12c4af640b
+  derived asset      64019ab811067e03a8de5990d2e6f23dcec5418e5a90caa5e5666b0524156732
+  glyphs             20673 single-width, 8x16, with a PSF2 Unicode table
+
+  source tarball     https://ftp.gnu.org/gnu/unifont/unifont-16.0.04/unifont-16.0.04.tar.gz
+  tarball sha256     2bd4e4679757126f48e1bf2c1be40b09aa92162bfedda4683ce5fbc70a2a5972
+  unifont-COPYING    5a65797606332f2f63057fd81ea0ff35f74043583515bf900ee9b42efa8176a6
+  unifont-OFL-1.1.txt 869692af094c57fb7258c57fe26820c759319603321d0ffeb278de3651763ded
+
+Reproduce with:
+
+  curl -O https://ftp.gnu.org/gnu/unifont/unifont-16.0.04/unifont_all-16.0.04.hex.gz
+  gunzip unifont_all-16.0.04.hex.gz
+  cargo run --bin td-term-import-unifont -- unifont_all-16.0.04.hex assets
+
+License
+-------
+
+Unifont's font files are dual-licensed, per the upstream COPYING committed
+beside this file: SIL Open Font License version 1.1, and GNU GPL version 2 or
+later with the GNU font embedding exception. td takes the OFL 1.1 arm.
+
+COPYING carves out font/plane00/jiskan16-plane00.hex and
+font/plane02/jiskan16-plane02.hex, which are Public Domain rather than
+dual-licensed. Both are 16x16, so this single-width face excludes them by
+construction rather than by choice -- the importer skips every double-width
+record, and no glyph here comes from either file.

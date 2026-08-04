@@ -689,9 +689,14 @@ corpus including its `key` operations, the keyboard adapter of section 11
 PTY open/unlock/peer/winsize operations, the account and environment policy,
 the child argv through `cttyhack --stdin`, and the PTY reader thread.
 
+Section 11's pinned font is landed: the committed Unifont face, its licenses
+and provenance record, the importer that derives it reproducibly, and the PSF2
+reader that validates every header field, table entry, and pixel offset before
+the renderer can index a glyph.
+
 Section 12's writer thread, child waiter, readiness socket, `TD-TERM-READY`
-marker, and `probe` subcommand are not, nor is section 11's renderer, which
-waits on the pinned PSF2 font asset and its provenance landing. The Wayland
+marker, and `probe` subcommand are not built, nor is section 11's renderer,
+which now waits only on itself. The Wayland
 client, terminfo entry, packaging, and boot cutover of sections 12 and 14
 follow it. Until that client exists the PTY adapter has no production caller;
 its host tests drive every operation against a real PTY, and the packaged
@@ -902,8 +907,19 @@ check remains green when the optional host tool is absent.
 ## 11. Font, keyboard, and rendering
 
 The first implementation pins one licensed PSF2 bitmap font with a Unicode
-table. Its exact bytes and license are committed under `td-compositor`, while
-the archive hash and upstream provenance are recorded in the asset landing.
+table: GNU Unifont 16.0.04, single-width, 8x16, 20673 glyphs. Its exact bytes
+and license are committed under `td-compositor/assets`, while the archive hash
+and upstream provenance are recorded there in `PROVENANCE`.
+
+That face is derived rather than downloaded, which the provenance record and
+`tools/import-unifont.rs` exist to make reproducible: upstream publishes no
+full-coverage PSF2, only an APL-specific PSF1. The importer pins the upstream
+`.hex` by hash and takes only its single-width records, which is not a
+narrowing of Unifont so much as the only thing PSF2 can express -- one fixed
+cell for every glyph -- and matches section 13 making double-width cells a
+deliberate first-profile exclusion. It also excludes the two jiskan16 files
+COPYING carves out of the dual license, by construction rather than by choice,
+since both are 16x16.
 Host tests and the target recipe consume those same bytes; no host font lookup
 or fetched-only test input participates. The PSF2 reader checks headers,
 dimensions, glyph counts, table bounds, scalar validity, and all pixel

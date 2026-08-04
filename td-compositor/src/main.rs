@@ -2,6 +2,7 @@
 
 mod client;
 mod configure;
+mod font;
 mod framebuffer;
 mod input;
 mod keyboard;
@@ -298,6 +299,7 @@ mod confinement {
     const OTHER: &[(&str, &str)] = &[
         ("client.rs", include_str!("client.rs")),
         ("configure.rs", include_str!("configure.rs")),
+        ("font.rs", include_str!("font.rs")),
         ("framebuffer.rs", include_str!("framebuffer.rs")),
         ("input.rs", include_str!("input.rs")),
         ("keyboard.rs", include_str!("keyboard.rs")),
