@@ -1,0 +1,246 @@
+# tests/review-record.cases — the per-commit review record (AGENTS.md, "Code
+# review"), as cases.
+#
+# TWO implementations read this: `td-builder ready`, which gates on the record,
+# and td-review, which shows the integrator whether a branch carries it. Neither
+# crate may depend on the other (separate workspaces, separate locks), so this
+# fixture is the only thing that keeps their verdicts the same. Both crates fail
+# their tests if a case here disagrees with them.
+#
+# Format:  case <name> <ready|not-ready> [paths=<comma,list>]
+#          <message lines, until the next `case` line>
+# `paths` defaults to a single source file — i.e. "not a docs-only commit".
+
+case complete ready paths=builder/src/ready.rs
+td-sh: `local` is ash's, not bash's
+
+A body explaining why.
+
+Reviewed-by: subagent/opus-4.8
+Reviewed-by: codex/gpt-5.6-sol
+Reviewed-by: agy/gemini-3.1-pro
+Checks: affected-checks --committed-only (green)
+
+case subagent-alone not-ready paths=builder/src/ready.rs
+td-sh: something
+
+Reviewed-by: subagent/opus-4.8
+Checks: affected-checks --committed-only (green)
+
+case one-cross-model not-ready paths=builder/src/ready.rs
+td-sh: something
+
+Reviewed-by: subagent/opus-4.8
+Reviewed-by: codex/gpt-5.6-sol
+Checks: affected-checks --committed-only (green)
+
+case same-cli-twice not-ready paths=builder/src/ready.rs
+td-sh: something
+
+Reviewed-by: subagent/opus-4.8
+Reviewed-by: codex/gpt-5.6-sol
+Reviewed-by: codex/gpt-5.6-sol
+Checks: affected-checks --committed-only (green)
+
+case no-checks not-ready paths=builder/src/ready.rs
+td-sh: something
+
+Reviewed-by: subagent/opus-4.8
+Reviewed-by: codex/gpt-5.6-sol
+Reviewed-by: agy/gemini-3.1-pro
+
+case waiver-with-reason ready paths=builder/src/ready.rs
+td-sh: something
+
+Reviewed-by: subagent/opus-4.8
+Reviewed-by: codex/gpt-5.6-sol
+Review-waiver: agy — CLI unavailable, approved by tester
+Checks: affected-checks --committed-only (green)
+
+case waiver-without-reason not-ready paths=builder/src/ready.rs
+td-sh: something
+
+Reviewed-by: subagent/opus-4.8
+Reviewed-by: codex/gpt-5.6-sol
+Review-waiver: agy
+Checks: affected-checks --committed-only (green)
+
+case docs-only ready paths=AGENTS.md,README.md
+docs: say what the record is
+
+Review-waiver: docs-only
+Checks: affected-checks --committed-only (green)
+
+case docs-only-touching-code not-ready paths=AGENTS.md,builder/src/ready.rs
+docs: say what the record is
+
+Review-waiver: docs-only
+Checks: affected-checks --committed-only (green)
+
+case unknown-reviewer not-ready paths=builder/src/ready.rs
+td-sh: something
+
+Reviewed-by: subagent/opus-4.8
+Reviewed-by: codex/gpt-5.6-sol
+Reviewed-by: gemini/3.1-pro
+Checks: affected-checks --committed-only (green)
+
+case malformed-identity not-ready paths=builder/src/ready.rs
+td-sh: something
+
+Reviewed-by: subagent
+Reviewed-by: codex/gpt-5.6-sol
+Reviewed-by: agy/gemini-3.1-pro
+Checks: affected-checks --committed-only (green)
+
+case quoted-record not-ready paths=AGENTS.md
+docs: explain the record
+
+A commit that SHOWS the shape must not thereby claim it:
+
+    Reviewed-by: subagent/opus-4.8
+    Reviewed-by: codex/gpt-5.6-sol
+    Reviewed-by: agy/gemini-3.1-pro
+    Checks: affected-checks --committed-only (green)
+
+so the indented block above counts for nothing, and this commit — which
+is documentation — still has to carry a real record or waive it.
+
+case trailing-block-wins ready paths=builder/src/ready.rs
+td-sh: something
+
+Reviewed-by: subagent/an-earlier-round
+
+prose written after that round, which ends the block
+
+Reviewed-by: subagent/opus-4.8
+Reviewed-by: codex/gpt-5.6-sol
+Reviewed-by: agy/gemini-3.1-pro
+Checks: affected-checks --committed-only (green)
+
+case agy-missing not-ready paths=builder/src/ready.rs
+td-sh: something
+
+Reviewed-by: subagent/opus-4.8
+Reviewed-by: codex/gpt-5.6-sol
+Reviewed-by: claude/opus-4.8
+Checks: affected-checks --committed-only (green)
+
+case agy-alone not-ready paths=builder/src/ready.rs
+td-sh: something
+
+Reviewed-by: subagent/opus-4.8
+Reviewed-by: agy/gemini-3.1-pro
+Checks: affected-checks --committed-only (green)
+
+case miscased-keys ready paths=builder/src/ready.rs
+td-sh: something
+
+Reviewed-By: subagent/opus-4.8
+REVIEWED-BY: codex/gpt-5.6-sol
+reviewed-by: agy/gemini-3.1-pro
+checks: affected-checks --committed-only (green)
+
+case waiver-punctuation ready paths=builder/src/ready.rs
+td-sh: something
+
+Reviewed-by: subagent/opus-4.8
+Reviewed-by: codex/gpt-5.6-sol
+Review-waiver: agy: not installed on this host, approved by tester
+Checks: affected-checks --committed-only (green)
+
+case record-does-not-close-the-message not-ready paths=builder/src/ready.rs
+td-sh: something
+
+Reviewed-by: subagent/opus-4.8
+Reviewed-by: codex/gpt-5.6-sol
+Reviewed-by: agy/gemini-3.1-pro
+Checks: affected-checks --committed-only (green)
+
+Next: finish the parser, then wire the CLI
+
+case docs-only-with-no-paths not-ready paths=
+docs: a commit whose paths could not be read
+
+Review-waiver: docs-only
+Checks: affected-checks --committed-only (green)
+
+case cross-model-is-the-acting-model not-ready paths=builder/src/ready.rs
+td-sh: something
+
+Reviewed-by: subagent/opus-4.8
+Reviewed-by: claude/opus-4.8
+Reviewed-by: agy/gemini-3.1-pro
+Checks: affected-checks --committed-only (green)
+
+case cross-model-is-the-acting-model-codex not-ready paths=builder/src/ready.rs
+td-sh: something
+
+Reviewed-by: subagent/gpt-5.6-sol
+Reviewed-by: codex/gpt-5.6-sol
+Reviewed-by: agy/gemini-3.1-pro
+Checks: affected-checks --committed-only (green)
+
+case codex-actor-reviewed-by-claude ready paths=builder/src/ready.rs
+td-sh: something
+
+Reviewed-by: subagent/gpt-5.6-sol
+Reviewed-by: claude/opus-4.8
+Reviewed-by: agy/gemini-3.1-pro
+Checks: affected-checks --committed-only (green)
+
+case waiving-the-subagent not-ready paths=builder/src/ready.rs
+td-sh: something
+
+Reviewed-by: codex/gpt-5.6-sol
+Reviewed-by: agy/gemini-3.1-pro
+Review-waiver: subagent — skipped, approved by tester
+Checks: affected-checks --committed-only (green)
+
+case waiving-everything not-ready paths=builder/src/ready.rs
+td-sh: something
+
+Review-waiver: subagent — skipped
+Review-waiver: agy — skipped
+Review-waiver: codex — skipped
+Checks: affected-checks --committed-only (green)
+
+case two-reviewers-waived not-ready paths=builder/src/ready.rs
+td-sh: something
+
+Reviewed-by: subagent/opus-4.8
+Review-waiver: agy — CLI unavailable, approved by tester
+Review-waiver: codex — CLI unavailable, approved by tester
+Checks: affected-checks --committed-only (green)
+
+case waiver-names-no-approver not-ready paths=builder/src/ready.rs
+td-sh: something
+
+Reviewed-by: subagent/opus-4.8
+Reviewed-by: codex/gpt-5.6-sol
+Review-waiver: agy — the CLI is not installed on this host
+Checks: affected-checks --committed-only (green)
+
+case vendor-prefixed-same-model not-ready paths=builder/src/ready.rs
+td-sh: something
+
+Reviewed-by: subagent/claude-opus-4.8
+Reviewed-by: claude/opus-4.8
+Reviewed-by: agy/gemini-3.1-pro
+Checks: affected-checks --committed-only (green)
+
+case miscased-same-model not-ready paths=builder/src/ready.rs
+td-sh: something
+
+Reviewed-by: subagent/opus-4.8
+Reviewed-by: claude/Opus-4.8
+Reviewed-by: agy/gemini-3.1-pro
+Checks: affected-checks --committed-only (green)
+
+case unknown-model not-ready paths=builder/src/ready.rs
+td-sh: something
+
+Reviewed-by: subagent/opus-4.8
+Reviewed-by: codex/some-new-thing
+Reviewed-by: agy/gemini-3.1-pro
+Checks: affected-checks --committed-only (green)

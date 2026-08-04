@@ -832,6 +832,15 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
         return;
     }
 
+    // The review-record fixture two crates share: `td-builder ready` gates on it
+    // and td-review displays it, from separate implementations that cannot
+    // depend on each other. Editing a case must run BOTH suites, which the one
+    // cargo-test preflight does.
+    if p == "tests/review-record.cases" {
+        sel.add_preflight("cargo-test");
+        return;
+    }
+
     // td-review: the HOST-side integrator TUI. In neither bootstrap graph — no
     // recipe builds it and it never enters a closure — so unlike the crates
     // above there is no target artifact for recipe-checks to link.
@@ -1026,6 +1035,20 @@ fn format_output(header: &Header, changed: &[String], sel: &Selection, run: bool
         o.push_str("Dry run only. Re-run with --run to execute.\n");
     }
     o
+}
+
+/// Whether this path routes to any check at all — the question `ready` asks of
+/// an UNTRACKED file, which the committed-only checks do not see but a compile
+/// does. Asking the real mapping beats guessing by extension.
+pub(crate) fn selects_checks(root: &Path, path: &str) -> bool {
+    let mut sel = Selection::default();
+    map_path(root, path, &mut sel);
+    // The catch-all arm adds `check` to EVERY unmapped path, so "selected
+    // something" is true of any file at all — scratch notes included. The note
+    // it leaves behind is what tells a mapped path from an unmapped one, and
+    // only a mapped one has any business reddening a pre-push gate.
+    !sel.notes.iter().any(|n| n.starts_with("No mapping for"))
+        && (!sel.preflights.is_empty() || !sel.targets.is_empty())
 }
 
 fn compute_selection(root: &Path, changed: &[String]) -> Selection {
@@ -1502,6 +1525,10 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
     assert_no_target!("td-review/tests/land.rs", "check");
     assert_no_target!("td-review/Cargo.toml", "check");
     assert_no_target!("td-review/Cargo.lock", "check");
+    // The record fixture is read by the builder AND td-review suites; the one
+    // cargo-test preflight runs both, and it must not escalate to the full check.
+    assert_preflight!("tests/review-record.cases", "cargo-test");
+    assert_no_target!("tests/review-record.cases", "check");
     assert_target!("tests/td-toolchain.lock", "toolchain-input-addressed");
     assert_target!(
         "tests/td-toolchain.lock",
@@ -1595,7 +1622,7 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
 // CLI.
 // ---------------------------------------------------------------------------
 
-fn git_lines(root: &Path, args: &[&str]) -> Vec<String> {
+pub(crate) fn git_lines(root: &Path, args: &[&str]) -> Vec<String> {
     let out = Command::new("git").args(args).current_dir(root).output();
     match out {
         Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout)
@@ -1606,7 +1633,16 @@ fn git_lines(root: &Path, args: &[&str]) -> Vec<String> {
     }
 }
 
-fn git_ok(root: &Path, args: &[&str]) -> bool {
+/// git's lines, or `None` if the command failed — for the queries whose empty
+/// answer would otherwise be indistinguishable from success with no results.
+fn git_lines_checked(root: &Path, args: &[&str]) -> Option<Vec<String>> {
+    let out = Command::new("git").args(args).current_dir(root).output().ok()?;
+    out.status
+        .success()
+        .then(|| String::from_utf8_lossy(&out.stdout).lines().map(str::to_string).collect())
+}
+
+pub(crate) fn git_ok(root: &Path, args: &[&str]) -> bool {
     Command::new("git")
         .args(args)
         .current_dir(root)
@@ -1620,7 +1656,7 @@ fn git_ok(root: &Path, args: &[&str]) -> bool {
 /// The repo root, the way the shell roots itself (`cd "$(dirname "$0")/.."`):
 /// `git rev-parse --show-toplevel` when git is present, else CWD. Keeps the
 /// subcommand CWD-robust like the oracle; outside a git repo it falls back to CWD.
-fn resolve_root() -> PathBuf {
+pub(crate) fn resolve_root() -> PathBuf {
     if let Ok(o) = Command::new("git")
         .args(["rev-parse", "--show-toplevel"])
         .output()
@@ -1862,6 +1898,13 @@ fn run_preflight(root: &Path, name: &str) -> i32 {
 }
 
 pub fn main(args: &[String]) -> ExitCode {
+    ExitCode::from(run(args))
+}
+
+/// The dispatcher proper, returning the code rather than an opaque `ExitCode`:
+/// `td-builder ready` runs the same bounded selection in-process and has to know
+/// whether it passed.
+pub fn run(args: &[String]) -> u8 {
     let root = resolve_root();
 
     let mut base = "origin/main".to_string();
@@ -1880,7 +1923,7 @@ pub fn main(args: &[String]) -> ExitCode {
                 i += 1;
                 if i >= args.len() {
                     eprintln!("affected-checks: --base needs a ref");
-                    return ExitCode::from(2);
+                    return 2;
                 }
                 base = args[i].clone();
             }
@@ -1888,18 +1931,18 @@ pub fn main(args: &[String]) -> ExitCode {
                 i += 1;
                 if i >= args.len() {
                     eprintln!("affected-checks: --path needs a path");
-                    return ExitCode::from(2);
+                    return 2;
                 }
                 explicit_paths.push(args[i].clone());
             }
             "-h" | "--help" => {
                 print!("{HELP}");
-                return ExitCode::SUCCESS;
+                return 0;
             }
             other => {
                 eprintln!("affected-checks: unknown arg '{other}'");
                 eprint!("{HELP}");
-                return ExitCode::from(2);
+                return 2;
             }
         }
         i += 1;
@@ -1912,10 +1955,10 @@ pub fn main(args: &[String]) -> ExitCode {
         }
         if failures.is_empty() {
             println!("PASS: affected-checks self-test");
-            return ExitCode::SUCCESS;
+            return 0;
         }
         eprintln!("affected-checks self-test: {} failure(s)", failures.len());
-        return ExitCode::FAILURE;
+        return 1;
     }
 
     // --- assemble the changed-path set ---
@@ -1932,7 +1975,7 @@ pub fn main(args: &[String]) -> ExitCode {
                 base = "main".to_string();
             } else {
                 eprintln!("affected-checks: base ref '{base}' is not available");
-                return ExitCode::from(2);
+                return 2;
             }
         }
         // The shell's `merge_base=$(git merge-base …)` runs under `set -e`, so a
@@ -1952,14 +1995,21 @@ pub fn main(args: &[String]) -> ExitCode {
             }
             Ok(o) => {
                 eprint!("{}", String::from_utf8_lossy(&o.stderr));
-                return ExitCode::from(o.status.code().unwrap_or(1) as u8);
+                return o.status.code().unwrap_or(1) as u8;
             }
             Err(e) => {
                 eprintln!("affected-checks: git merge-base failed: {e}");
-                return ExitCode::from(1);
+                return 1;
             }
         }
-        let mut all = git_lines(&root, &["diff", "--name-only", &merge_base, "HEAD"]);
+        // Checked, not `git_lines`: an empty answer from a FAILED diff would
+        // be "no changed paths" a few lines below, which exits 0 having run
+        // nothing — the same fail-open `ready` refuses on its own queries.
+        let Some(mut all) = git_lines_checked(&root, &["diff", "--name-only", &merge_base, "HEAD"])
+        else {
+            eprintln!("affected-checks: git diff --name-only {merge_base} HEAD failed");
+            return 1;
+        };
         if !committed_only {
             all.extend(git_lines(&root, &["diff", "--name-only"]));
             all.extend(git_lines(&root, &["diff", "--cached", "--name-only"]));
@@ -1973,7 +2023,7 @@ pub fn main(args: &[String]) -> ExitCode {
 
     if changed.is_empty() {
         println!("affected-checks: no changed paths relative to {base}");
-        return ExitCode::SUCCESS;
+        return 0;
     }
 
     let sel = compute_selection(&root, &changed);
@@ -1985,14 +2035,14 @@ pub fn main(args: &[String]) -> ExitCode {
     print!("{}", format_output(&header, &changed, &sel, run));
 
     if !run {
-        return ExitCode::SUCCESS;
+        return 0;
     }
 
     // --- execute ---
     for pre in &sel.preflights {
         let code = run_preflight(&root, pre);
         if code != 0 {
-            return ExitCode::from(code as u8);
+            return code as u8;
         }
     }
 
@@ -2018,10 +2068,10 @@ pub fn main(args: &[String]) -> ExitCode {
                 sel.targets.join(" ")
             );
         }
-        return ExitCode::from(code as u8);
+        return code as u8;
     }
 
-    ExitCode::SUCCESS
+    0
 }
 
 // ---------------------------------------------------------------------------

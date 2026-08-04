@@ -5,6 +5,8 @@ use std::io;
 
 use crate::git::{self, now_unix, Branch, DefaultRemote, Git};
 use crate::land::{self, Mode, Outcome, Preview};
+use crate::record;
+use crate::worktrees;
 use crate::term::{
     self, Frame, Key, Line, Style, Ui, CYAN, GREEN, MAGENTA, RED, YELLOW,
 };
@@ -32,6 +34,10 @@ enum Prompt {
     /// cannot delete more than was shown. Branches landed in this session are
     /// swept by the push that publishes them and never come through here.
     Delete { short: String, targets: Vec<land::DeleteTarget> },
+    /// Remove the worktrees whose branches have fully landed. Pinned when the
+    /// prompt is raised, like a delete, so confirming cannot sweep more than
+    /// the pane listed.
+    Sweep { paths: Vec<String> },
 }
 
 /// Names of the remotes a push would actually reach.
@@ -75,6 +81,9 @@ pub struct App {
     git: Git,
     base: String,
     branches: Vec<Branch>,
+    /// Per-branch review-record status, aligned with `branches` — whether every
+    /// commit a landing would replay carries the record AGENTS.md requires.
+    readiness: Vec<record::Readiness>,
     view: Vec<usize>,
     sel: usize,
     top: usize,
@@ -111,6 +120,7 @@ impl App {
             git,
             base,
             branches: Vec::new(),
+            readiness: Vec::new(),
             view: Vec::new(),
             sel: 0,
             top: 0,
@@ -162,6 +172,30 @@ impl App {
 
     pub fn reload(&mut self) -> io::Result<()> {
         self.branches = self.git.branches(&self.base)?;
+        // One log per branch. A branch whose commits cannot be read stays
+        // Unknown rather than Ready: the column may never invent a record.
+        self.readiness = self
+            .branches
+            .iter()
+            // Fully qualified, like every other range here: a TAG named after the
+            // branch would otherwise resolve first, and the count cross-check
+            // below would then compare two different ranges.
+            .map(|b| match self.git.commit_records(&format!(
+                "refs/heads/{}..refs/remotes/{}",
+                self.base, b.refname
+            )) {
+                // Cross-checked against the count for-each-ref reported, which
+                // is free and comes from a different query: a batch that lost a
+                // commit to a separator in someone's message must not read as
+                // ready. Without counts (pre-2.41 git) there is nothing to
+                // compare, and the scan stands on its own parse.
+                Ok(commits) => match b.counts {
+                    Some((ahead, _)) => record::readiness_for(ahead as usize, &commits),
+                    None => record::readiness(&commits),
+                },
+                Err(_) => record::Readiness::Unknown,
+            })
+            .collect();
         self.base_stale = self.git.base_behind_upstream(&self.base).unwrap_or(None);
         self.now = now_unix();
         self.apply_filter();
@@ -239,6 +273,11 @@ impl App {
                         if mixed { " REMOTES DIFFER." } else { "" },
                     )
                 }
+                Prompt::Sweep { paths } => format!(
+                    " remove {} fully landed worktree{} ?  [y] remove  [n] keep",
+                    paths.len(),
+                    if paths.len() == 1 { "" } else { "s" }
+                ),
             };
             f.push_text(&text, Style::bar(YELLOW));
             return;
@@ -285,9 +324,10 @@ impl App {
 
         f.push_text(
             &format!(
-                "  {:>4}  {:<7}  {:<width$}  {}",
+                "  {:>4}  {:<7}  {:<6}  {:<width$}  {}",
                 "AGE",
                 "A/B",
+                "READY",
                 "BRANCH",
                 "SUBJECT",
                 width = name_width
@@ -308,10 +348,13 @@ impl App {
             // double-width name would shift the subject column right.
             let (name, cols) = clip_cols(&b.refname, name_width);
             let text = format!(
-                "{} {:>4}  {:<7}  {name}{:pad$}  {}",
+                "{} {:>4}  {:<7}  {:<6}  {name}{:pad$}  {}",
                 if selected { ">" } else { " " },
                 b.age(self.now),
                 b.counts_label(),
+                self.readiness
+                    .get(idx)
+                    .map_or_else(|| "?".to_string(), record::Readiness::label),
                 "",
                 b.subject,
                 pad = name_width.saturating_sub(cols)
@@ -327,7 +370,7 @@ impl App {
         }
         self.footer(
             f,
-            " enter review · f/F fetch · p/P push+clean up · / filter · D delete · ? help · q quit",
+            " enter review · f/F fetch · p/P push+clean up · / filter · D delete · w worktrees · ? help · q quit",
         );
     }
 
@@ -469,6 +512,10 @@ impl App {
                     self.log.clear();
                     self.offer_delete(&refname, term);
                 }
+            }
+            Key::Char('w') => {
+                self.log.clear();
+                self.offer_sweep(term);
             }
             Key::Enter | Key::Char('l') | Key::Right => self.open_review()?,
             _ => {}
@@ -749,6 +796,25 @@ impl App {
                     }
                 }
             }
+            // Same as a delete: the plan can outrun the screen, so scrolling it
+            // is not answering it.
+            Some(Prompt::Sweep { .. }) if is_scroll(key) => {
+                self.log_scroll = scroll_by(self.log_scroll, key, self.log.len(), term.size().0);
+            }
+            Some(Prompt::Sweep { .. }) => {
+                let Some(Prompt::Sweep { paths }) = self.prompt.take() else {
+                    return Ok(Flow::Continue);
+                };
+                match key {
+                    Key::Char('y') | Key::Char('Y') => self.run_sweep(&paths, term)?,
+                    _ => {
+                        self.log
+                            .push(Line::new("kept every worktree", Style::dim()));
+                        self.log_to_end(term);
+                        self.note("kept every worktree", Style::dim());
+                    }
+                }
+            }
             Some(Prompt::Conflict) => match key {
                 Key::Char('d') | Key::Char('D') => {
                     self.prompt = None;
@@ -862,17 +928,35 @@ impl App {
                 // this refname happens to be qualified by.
                 let names = self.git.remote_names().unwrap_or_default();
                 let (_, short) = git::split_remote(&refname, &names);
+                let rolling = git::is_rolling(short);
                 self.log.push(Line::new(
-                    format!(
-                        "q then p pushes {} to its remote (P: every remote) and deletes {short} \
-                         from the remotes it reaches",
-                        self.base
-                    ),
+                    if rolling {
+                        // Said HERE rather than at push time: this pane is what
+                        // the integrator reads before pressing p, and promising
+                        // a delete that the sweep will decline is worse than
+                        // saying now that a rolling branch is kept.
+                        format!(
+                            "q then p pushes {} to its remote (P: every remote); {short} is a \
+                             rolling branch and is kept",
+                            self.base
+                        )
+                    } else {
+                        format!(
+                            "q then p pushes {} to its remote (P: every remote) and deletes \
+                             {short} from the remotes it reaches",
+                            self.base
+                        )
+                    },
                     Style::fg(CYAN),
                 ));
                 // The branch's remote copies stay put until a push publishes
-                // the commit that now carries their work.
-                self.landed.push_back(Landed { refname, oid, sha: sha.clone() });
+                // the commit that now carries their work — and a rolling branch
+                // never joins the queue at all: it is never deleted, so an entry
+                // for it would be re-popped and re-checked by every later push
+                // in the session, for ever.
+                if !rolling {
+                    self.landed.push_back(Landed { refname, oid, sha: sha.clone() });
+                }
                 self.log_to_end(term);
                 // A listing hiccup must not tear down the TUI after a good land.
                 self.refresh_quietly();
@@ -994,6 +1078,18 @@ impl App {
                 return Ok(());
             }
         };
+        // Belt and braces: a rolling branch no longer enters the queue, so this
+        // is for any other caller. Deleting one would take the working branch
+        // out from under a workstream that is still going. `D` still deletes on
+        // request — an explicit ask is an explicit ask.
+        if git::is_rolling(&short) {
+            self.log.push(Line::new(
+                format!("{short} is a rolling branch — kept"),
+                Style::dim(),
+            ));
+            self.log_to_end(term);
+            return Ok(());
+        }
         // Before the early return, not after: a branch every reached remote has
         // moved off is left alone AND dropped from the queue, so this line is
         // the only thing that will ever say why — and nothing is confirmed now
@@ -1064,6 +1160,85 @@ impl App {
         self.ask(Prompt::Delete { short, targets })
     }
 
+    /// Raise the worktree sweep (`w`): list every worktree with the reason it is
+    /// kept or removed, and confirm. Removal deletes a directory somebody may be
+    /// working in, so the pane shows the whole plan and the prompt pins it.
+    fn offer_sweep(&mut self, term: &mut dyn Ui) {
+        let planned = match worktrees::plan(&self.git, &self.base) {
+            Ok(p) => p,
+            Err(e) => return self.note(format!("{e}"), Style::fg(RED)),
+        };
+        self.screen = Screen::Log;
+        self.log_title = "worktrees".to_string();
+        let mut paths = Vec::new();
+        for p in &planned {
+            match &p.verdict {
+                worktrees::Verdict::Remove => {
+                    paths.push(p.worktree.path.clone());
+                    self.log.push(Line::new(
+                        format!("remove  {}", p.worktree.path),
+                        Style::fg(YELLOW),
+                    ));
+                }
+                worktrees::Verdict::Keep(why) => self.log.push(Line::new(
+                    format!("keep    {}  ({why})", p.worktree.path),
+                    Style::dim(),
+                )),
+            }
+        }
+        self.log_to_end(term);
+        if paths.is_empty() {
+            return self.note("no worktree to sweep", Style::dim());
+        }
+        self.ask(Prompt::Sweep { paths })
+    }
+
+    fn run_sweep(&mut self, paths: &[String], term: &mut dyn Ui) -> io::Result<()> {
+        self.log_title = "removing worktrees".to_string();
+        self.screen = Screen::Log;
+        self.log_to_end(term);
+        self.redraw(term)?;
+
+        // Re-plan rather than remove `paths` directly: the pinned list is what
+        // bounds the sweep, and re-deciding is what keeps a worktree that got
+        // dirty between the prompt and the keystroke.
+        let planned: Vec<worktrees::Planned> = worktrees::plan(&self.git, &self.base)?
+            .into_iter()
+            .filter(|p| paths.contains(&p.worktree.path))
+            .collect();
+        let mut removed = 0usize;
+        let mut failed = 0usize;
+        for swept in worktrees::sweep(&self.git, &planned) {
+            match swept.error {
+                None => {
+                    removed += 1;
+                    self.log
+                        .push(Line::new(format!("removed {}", swept.path), Style::fg(GREEN)));
+                }
+                Some(e) => {
+                    failed += 1;
+                    self.log.push(Line::new(
+                        format!("FAILED  {}: {e}", swept.path),
+                        Style::fg(RED),
+                    ));
+                }
+            }
+        }
+        let kept = paths.len().saturating_sub(removed + failed);
+        if kept > 0 {
+            self.log.push(Line::new(
+                format!("{kept} worktree(s) changed since the plan and were kept"),
+                Style::dim(),
+            ));
+        }
+        self.log_to_end(term);
+        self.note(
+            format!("removed {removed} worktree(s)"),
+            if failed > 0 { Style::fg(RED) } else { Style::fg(GREEN) },
+        );
+        Ok(())
+    }
+
     fn run_delete(
         &mut self,
         short: &str,
@@ -1131,6 +1306,8 @@ fn help_lines() -> Vec<Line> {
             ("r", "re-read branches"),
             ("/", "filter by branch name (esc clears)"),
             ("D", "delete the selected branch from the remote its row names"),
+            ("w", "sweep worktrees whose branch has fully landed (clean,"),
+            ("", "unpushed, not -rolling); every other one says why it stays"),
             ("?", "this help"),
             ("q", "quit"),
         ],
@@ -1322,12 +1499,28 @@ fn preview_lines(branch: &Branch, p: &Preview, base: &str, now: i64) -> Vec<Line
     ));
     out.push(Line::blank());
 
-    out.push(heading(&format!("commits ({})", p.commits.len())));
+    out.push(heading(&format!(
+        "commits ({}) — review record: {}",
+        p.commits.len(),
+        record::readiness_for(p.commits.len(), &p.records).label()
+    )));
     if p.commits.is_empty() {
         out.push(Line::new("  (none)", Style::fg(RED)));
     }
-    for c in &p.commits {
+    for (i, c) in p.commits.iter().enumerate() {
         out.push(Line::plain(format!("  {c}")));
+        // Annotate from the record read for THIS commit: `--oneline` abbreviates
+        // the oid, so pair them by that prefix rather than trusting position.
+        let abbrev = c.split_whitespace().next().unwrap_or_default();
+        let rec = p
+            .records
+            .get(i)
+            .filter(|r| !abbrev.is_empty() && r.oid.starts_with(abbrev));
+        if let Some(r) = rec {
+            for problem in record::commit_problems(r) {
+                out.push(Line::new(format!("      ! {problem}"), Style::fg(YELLOW)));
+            }
+        }
     }
     out.push(Line::blank());
 
@@ -2324,6 +2517,7 @@ mod tests {
             base_oid: "2222222222222222222222222222222222222222".to_string(),
             merge_base: "3333333333333333333333333333333333333333".to_string(),
             commits: vec!["c1 first".to_string()],
+            records: Vec::new(),
             message: "subject\n\nbody line\n".to_string(),
             stat: " f | 1 +".to_string(),
             diff: "+added\n-removed\n".to_string(),

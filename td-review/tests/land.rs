@@ -201,7 +201,7 @@ fn lands_squash_commit_and_pushes_every_pushable_remote() -> Res<()> {
     let s = scenario("land")?;
     let (ok, output) = review(
         &s.work,
-        &["--land", "origin/work-0001-feature", "--yes", "--push"],
+        &["--land", "origin/work-0001-feature", "--squash", "--yes", "--push"],
     )?;
     assert!(ok, "landing should succeed:\n{output}");
 
@@ -239,7 +239,7 @@ fn lands_squash_commit_and_pushes_every_pushable_remote() -> Res<()> {
     Ok(())
 }
 
-/// `r` in the pane, `--rebase` here: the same work as the branch's own history
+/// `r` in the pane, the default here: the same work as the branch's own history
 /// rather than one commit. A branch already sitting on the base tip replays as
 /// a fast-forward, so what lands is the very commits that were reviewed —
 /// messages, authors and object ids alike.
@@ -251,7 +251,7 @@ fn a_replay_lands_the_branchs_own_commits_rather_than_one() -> Res<()> {
         .to_string();
     let (ok, output) = review(
         &s.work,
-        &["--land", "origin/work-0001-feature", "--rebase", "--yes", "--push"],
+        &["--land", "origin/work-0001-feature", "--yes", "--push"],
     )?;
     assert!(ok, "the replay should succeed:\n{output}");
 
@@ -298,7 +298,7 @@ fn a_replay_onto_a_moved_base_keeps_every_commit_and_the_reviewed_tree() -> Res<
     let reviewed =
         git(&s.work, &["merge-tree", "--write-tree", &base, &tip])?.trim().to_string();
 
-    let (ok, output) = review(&s.work, &["--land", "origin/work-0001-feature", "--rebase", "--yes"])?;
+    let (ok, output) = review(&s.work, &["--land", "origin/work-0001-feature", "--yes"])?;
     assert!(ok, "the replay should succeed:\n{output}");
 
     let gained = git(&s.work, &["rev-list", "--count", &format!("{base}..main")])?;
@@ -326,7 +326,7 @@ fn a_replay_skips_a_commit_the_base_already_carries() -> Res<()> {
     git(&s.work, &["cherry-pick", &first])?;
     let base = git(&s.work, &["rev-parse", "main"])?.trim().to_string();
 
-    let (ok, output) = review(&s.work, &["--land", "origin/work-0001-feature", "--rebase", "--yes"])?;
+    let (ok, output) = review(&s.work, &["--land", "origin/work-0001-feature", "--yes"])?;
     assert!(ok, "the rest of the branch must still land:\n{output}");
     let gained = git(&s.work, &["rev-list", "--count", &format!("{base}..main")])?;
     assert_eq!(gained.trim(), "1", "the already-landed commit must not land twice\n{output}");
@@ -360,7 +360,7 @@ fn a_replay_that_stops_partway_leaves_the_base_where_it_was() -> Res<()> {
     commit(&s.work, "README", "moved\n", "base: moves README too", "2024-01-08T00:00:00 +0000")?;
     let before = git(&s.work, &["rev-parse", "main"])?.trim().to_string();
 
-    let (ok, output) = review(&s.work, &["--land", "work-0002-mid", "--rebase", "--yes"])?;
+    let (ok, output) = review(&s.work, &["--land", "work-0002-mid", "--yes"])?;
     assert!(!ok, "a stopped replay must not report success:\n{output}");
     assert_eq!(
         git(&s.work, &["rev-parse", "main"])?.trim(),
@@ -413,7 +413,7 @@ fn a_replay_that_gained_a_commit_it_did_not_make_is_not_rolled_back() -> Res<()>
     std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
     fs::set_permissions(&hook, perms)?;
 
-    let (ok, output) = review(&s.work, &["--land", "origin/work-0001-feature", "--rebase", "--yes"])?;
+    let (ok, output) = review(&s.work, &["--land", "origin/work-0001-feature", "--yes"])?;
     assert!(!ok, "a base that gained a foreign commit must not report success:\n{output}");
     assert!(output.contains("left standing"), "output: {output}");
     assert!(output.contains("gained 3"), "the count must be named:\n{output}");
@@ -465,7 +465,7 @@ fn a_replay_whose_tree_is_not_the_reviewed_one_is_rolled_back() -> Res<()> {
     std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
     fs::set_permissions(&hook, perms)?;
 
-    let (ok, output) = review(&s.work, &["--land", "origin/work-0001-feature", "--rebase", "--yes"])?;
+    let (ok, output) = review(&s.work, &["--land", "origin/work-0001-feature", "--yes"])?;
     assert!(!ok, "a tree that is not the reviewed one must not land:\n{output}");
     assert!(output.contains("is not the merge result"), "output: {output}");
     assert_eq!(
@@ -503,7 +503,7 @@ fn a_replay_keeps_a_commit_that_was_empty_to_begin_with() -> Res<()> {
     commit(&s.work, "c.txt", "gamma\n", "base: unrelated work", "2024-01-08T00:00:00 +0000")?;
     let base = git(&s.work, &["rev-parse", "main"])?.trim().to_string();
 
-    let (ok, output) = review(&s.work, &["--land", "work-0004-empty", "--rebase", "--yes"])?;
+    let (ok, output) = review(&s.work, &["--land", "work-0004-empty", "--yes"])?;
     assert!(ok, "an empty commit must not stop the replay:\n{output}");
     let gained = git(&s.work, &["rev-list", "--count", &format!("{base}..main")])?;
     assert_eq!(gained.trim(), "3", "every commit must land, empty one included\n{output}");
@@ -551,8 +551,8 @@ fn a_landing_refuses_to_start_on_someone_elses_stopped_replay() -> Res<()> {
     );
 
     for args in [
-        vec!["--land", "origin/work-0001-feature", "--rebase", "--yes"],
         vec!["--land", "origin/work-0001-feature", "--yes"],
+        vec!["--land", "origin/work-0001-feature", "--squash", "--yes"],
     ] {
         let (ok, output) = review(&s.work, &args)?;
         assert!(!ok, "{args:?} must refuse on an inherited sequence:\n{output}");
@@ -577,14 +577,14 @@ fn a_replay_refuses_a_branch_that_does_not_merge_cleanly() -> Res<()> {
     commit(&s.work, "b.txt", "conflicting\n", "base: touches b.txt", "2024-01-04T00:00:00 +0000")?;
     let before = git(&s.work, &["rev-parse", "main"])?.trim().to_string();
 
-    let (ok, output) = review(&s.work, &["--land", "origin/work-0001-feature", "--rebase", "--yes"])?;
+    let (ok, output) = review(&s.work, &["--land", "origin/work-0001-feature", "--yes"])?;
     assert!(!ok, "an unmergeable branch must not replay:\n{output}");
     assert!(output.contains("no reviewed tree to hold a replay to"), "output: {output}");
     assert_eq!(git(&s.work, &["rev-parse", "main"])?.trim(), before);
     assert_eq!(git(&s.work, &["status", "--porcelain"])?.trim(), "");
 
     // The squash path reaches the conflict instead, as it always did.
-    let (ok, output) = review(&s.work, &["--land", "origin/work-0001-feature", "--yes"])?;
+    let (ok, output) = review(&s.work, &["--land", "origin/work-0001-feature", "--squash", "--yes"])?;
     assert!(!ok, "{output}");
     assert!(output.contains("conflicts"), "output: {output}");
     Ok(())
@@ -602,13 +602,13 @@ fn a_replay_refuses_a_branch_that_carries_a_merge() -> Res<()> {
     git(&s.work, &["checkout", "main"])?;
     let before = git(&s.work, &["rev-parse", "main"])?.trim().to_string();
 
-    let (ok, output) = review(&s.work, &["--land", "merged", "--rebase", "--yes"])?;
+    let (ok, output) = review(&s.work, &["--land", "merged", "--yes"])?;
     assert!(!ok, "a branch with a merge must not replay:\n{output}");
     assert!(output.contains("merge commit"), "output: {output}");
     assert!(output.contains("squash it instead"), "output: {output}");
     assert_eq!(git(&s.work, &["rev-parse", "main"])?.trim(), before);
     // And the same branch still lands the other way.
-    let (ok, output) = review(&s.work, &["--land", "merged", "--yes"])?;
+    let (ok, output) = review(&s.work, &["--land", "merged", "--squash", "--yes"])?;
     assert!(ok, "squashing a merged branch must still work:\n{output}");
     Ok(())
 }
@@ -619,11 +619,11 @@ fn a_replay_refuses_a_branch_that_carries_a_merge() -> Res<()> {
 #[test]
 fn a_replay_refuses_a_branch_that_changes_nothing() -> Res<()> {
     let s = scenario("replay-noop")?;
-    let (ok, output) = review(&s.work, &["--land", "origin/work-0001-feature", "--yes"])?;
+    let (ok, output) = review(&s.work, &["--land", "origin/work-0001-feature", "--squash", "--yes"])?;
     assert!(ok, "first landing should succeed:\n{output}");
     let before = git(&s.work, &["rev-parse", "main"])?.trim().to_string();
 
-    let (ok, output) = review(&s.work, &["--land", "origin/work-0001-feature", "--rebase", "--yes"])?;
+    let (ok, output) = review(&s.work, &["--land", "origin/work-0001-feature", "--yes"])?;
     assert!(!ok, "an already-landed branch must not replay:\n{output}");
     assert!(output.contains("nothing to replay"), "output: {output}");
     assert_eq!(git(&s.work, &["rev-parse", "main"])?.trim(), before);
@@ -643,7 +643,7 @@ fn a_replay_refuses_when_either_side_moved_since_the_review() -> Res<()> {
 
     let (ok, output) = review(
         &s.work,
-        &["--land", "origin/work-0001-feature", "--rebase", "--yes", "--expect", "deadbeef"],
+        &["--land", "origin/work-0001-feature", "--yes", "--expect", "deadbeef"],
     )?;
     assert!(!ok, "a branch that moved must not replay:\n{output}");
     assert!(output.contains("moved since it was reviewed"), "output: {output}");
@@ -653,7 +653,6 @@ fn a_replay_refuses_when_either_side_moved_since_the_review() -> Res<()> {
         &[
             "--land",
             "origin/work-0001-feature",
-            "--rebase",
             "--yes",
             "--expect",
             &tip,
@@ -672,7 +671,7 @@ fn refuses_to_land_with_a_dirty_work_tree() -> Res<()> {
     let s = scenario("dirty")?;
     fs::write(s.work.join("untracked.txt"), "scratch\n")?;
 
-    let (ok, output) = review(&s.work, &["--land", "origin/work-0001-feature", "--yes"])?;
+    let (ok, output) = review(&s.work, &["--land", "origin/work-0001-feature", "--squash", "--yes"])?;
     assert!(!ok, "a dirty work tree must block the landing:\n{output}");
     assert!(output.contains("working tree not clean"), "output: {output}");
     assert_eq!(git(&s.work, &["rev-list", "--count", "main"])?.trim(), "1");
@@ -684,7 +683,7 @@ fn refuses_to_land_onto_the_wrong_branch() -> Res<()> {
     let s = scenario("wrongbranch")?;
     git(&s.work, &["checkout", "-b", "scratch"])?;
 
-    let (ok, output) = review(&s.work, &["--land", "origin/work-0001-feature", "--yes"])?;
+    let (ok, output) = review(&s.work, &["--land", "origin/work-0001-feature", "--squash", "--yes"])?;
     assert!(!ok, "landing must require the base to be checked out:\n{output}");
     assert!(output.contains("HEAD is on 'scratch'"), "output: {output}");
     Ok(())
@@ -694,10 +693,10 @@ fn refuses_to_land_onto_the_wrong_branch() -> Res<()> {
 fn refuses_a_branch_that_changes_nothing() -> Res<()> {
     let s = scenario("noop")?;
     // Land it once, then try again: the second attempt has no staged change.
-    let (ok, output) = review(&s.work, &["--land", "origin/work-0001-feature", "--yes"])?;
+    let (ok, output) = review(&s.work, &["--land", "origin/work-0001-feature", "--squash", "--yes"])?;
     assert!(ok, "first landing should succeed:\n{output}");
 
-    let (ok, output) = review(&s.work, &["--land", "origin/work-0001-feature", "--yes"])?;
+    let (ok, output) = review(&s.work, &["--land", "origin/work-0001-feature", "--squash", "--yes"])?;
     assert!(!ok, "an already-landed branch must not land again:\n{output}");
     assert!(output.contains("nothing staged"), "output: {output}");
     // The refusal cleaned up after itself.
@@ -709,7 +708,7 @@ fn refuses_a_branch_that_changes_nothing() -> Res<()> {
 #[test]
 fn land_requires_explicit_confirmation() -> Res<()> {
     let s = scenario("confirm")?;
-    let (ok, output) = review(&s.work, &["--land", "origin/work-0001-feature"])?;
+    let (ok, output) = review(&s.work, &["--land", "origin/work-0001-feature", "--squash"])?;
     assert!(!ok, "--land without --yes must refuse:\n{output}");
     assert!(output.contains("--yes"), "output: {output}");
     assert_eq!(git(&s.work, &["rev-list", "--count", "main"])?.trim(), "1");
@@ -727,9 +726,10 @@ fn list_shows_remote_branches_newest_first() -> Res<()> {
 
     let (ok, output) = review(&s.work, &["--list"])?;
     assert!(ok, "--list should succeed:\n{output}");
+    // age, ahead/behind, review record, then the refname.
     let branches: Vec<&str> = output
         .lines()
-        .filter_map(|l| l.split_whitespace().nth(2))
+        .filter_map(|l| l.split_whitespace().nth(3))
         .collect();
     // `archive` mirrors origin's refs, so each branch appears once per remote;
     // the assertion is on the committer-date ordering.
@@ -758,7 +758,7 @@ fn landed_message_is_byte_identical_to_the_branch_messages() -> Res<()> {
         &["log", "--reverse", "--format=%B", &format!("{base}..origin/work-0001-feature")],
     )?;
 
-    let (ok, output) = review(&s.work, &["--land", "origin/work-0001-feature", "--yes"])?;
+    let (ok, output) = review(&s.work, &["--land", "origin/work-0001-feature", "--squash", "--yes"])?;
     assert!(ok, "{output}");
 
     // `git log %B` and `git commit --cleanup=whitespace` differ only in the
@@ -795,7 +795,7 @@ fn a_non_utf8_commit_message_lands_without_replacement_chars() -> Res<()> {
     git(&s.work, &["checkout", "-q", "main"])?;
     git(&s.work, &["branch", "-D", "work-0002-latin1"])?;
 
-    let (ok, output) = review(&s.work, &["--land", "origin/work-0002-latin1", "--yes"])?;
+    let (ok, output) = review(&s.work, &["--land", "origin/work-0002-latin1", "--squash", "--yes"])?;
     assert!(ok, "{output}");
 
     let landed = git_bytes(&s.work, &["log", "-1", "--format=%B", "main"])?;
@@ -833,7 +833,7 @@ fn a_conflict_leaves_the_branch_message_in_squash_msg() -> Res<()> {
     git(&s.work, &["add", "shared.txt"])?;
     git(&s.work, &["commit", "-m", "base: main writes shared.txt"])?;
 
-    let (ok, output) = review(&s.work, &["--land", "origin/work-0002-conflict", "--yes"])?;
+    let (ok, output) = review(&s.work, &["--land", "origin/work-0002-conflict", "--squash", "--yes"])?;
     assert!(!ok, "a conflicted squash must not report success:\n{output}");
     assert!(output.contains("conflicts"), "output: {output}");
 
@@ -858,7 +858,7 @@ fn a_non_conflict_merge_failure_is_not_reported_as_a_conflict() -> Res<()> {
     commit(&s.work, "unrelated.txt", "x\n", "base: an unrelated commit", "2024-01-04T00:00:00 +0000")?;
     git(&s.work, &["config", "merge.ff", "only"])?;
 
-    let (ok, output) = review(&s.work, &["--land", "origin/work-0001-feature", "--yes"])?;
+    let (ok, output) = review(&s.work, &["--land", "origin/work-0001-feature", "--squash", "--yes"])?;
     assert!(!ok, "{output}");
     assert!(
         output.contains("merge failed") && output.contains("the work tree was not modified"),
@@ -880,7 +880,7 @@ fn refuses_a_branch_that_moved_since_it_was_reviewed() -> Res<()> {
 
     let (ok, output) = review(
         &s.work,
-        &["--land", "origin/work-0001-feature", "--expect", &stale, "--yes"],
+        &["--land", "origin/work-0001-feature", "--squash", "--expect", &stale, "--yes"],
     )?;
     assert!(!ok, "a branch that moved since the review must be refused:\n{output}");
     assert!(output.contains("moved since it was reviewed"), "output: {output}");
@@ -890,7 +890,7 @@ fn refuses_a_branch_that_moved_since_it_was_reviewed() -> Res<()> {
     let tip = git(&s.work, &["rev-parse", "origin/work-0001-feature"])?.trim().to_string();
     let (ok, output) = review(
         &s.work,
-        &["--land", "origin/work-0001-feature", "--expect", &tip, "--yes"],
+        &["--land", "origin/work-0001-feature", "--squash", "--expect", &tip, "--yes"],
     )?;
     assert!(ok, "an up-to-date pin must land:\n{output}");
     Ok(())
@@ -900,7 +900,7 @@ fn refuses_a_branch_that_moved_since_it_was_reviewed() -> Res<()> {
 fn refuses_a_branch_with_no_commits_beyond_the_base() -> Res<()> {
     let s = scenario("nocommits")?;
     // main itself has nothing beyond main.
-    let (ok, output) = review(&s.work, &["--land", "main", "--yes"])?;
+    let (ok, output) = review(&s.work, &["--land", "main", "--squash", "--yes"])?;
     assert!(!ok, "{output}");
     assert!(output.contains("no commits beyond"), "output: {output}");
     assert_eq!(git(&s.work, &["rev-list", "--count", "main"])?.trim(), "1");
@@ -920,7 +920,7 @@ fn refuses_a_branch_whose_commits_carry_no_message() -> Res<()> {
     git(&s.work, &["checkout", "-q", "main"])?;
     git(&s.work, &["branch", "-D", "work-0003-silent"])?;
 
-    let (ok, output) = review(&s.work, &["--land", "origin/work-0003-silent", "--yes"])?;
+    let (ok, output) = review(&s.work, &["--land", "origin/work-0003-silent", "--squash", "--yes"])?;
     assert!(!ok, "a messageless branch must not land:\n{output}");
     assert!(output.contains("empty message"), "output: {output}");
     assert_eq!(git(&s.work, &["rev-list", "--count", "main"])?.trim(), "1");
@@ -935,7 +935,7 @@ fn refuses_when_head_is_detached() -> Res<()> {
     let head = git(&s.work, &["rev-parse", "HEAD"])?.trim().to_string();
     git(&s.work, &["checkout", "-q", &head])?;
 
-    let (ok, output) = review(&s.work, &["--land", "origin/work-0001-feature", "--yes"])?;
+    let (ok, output) = review(&s.work, &["--land", "origin/work-0001-feature", "--squash", "--yes"])?;
     assert!(!ok, "{output}");
     assert!(output.contains("detached"), "output: {output}");
     Ok(())
@@ -952,7 +952,7 @@ fn a_hook_rejection_leaves_the_squash_staged_and_says_so() -> Res<()> {
     std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
     fs::set_permissions(&hook, perms)?;
 
-    let (ok, output) = review(&s.work, &["--land", "origin/work-0001-feature", "--yes"])?;
+    let (ok, output) = review(&s.work, &["--land", "origin/work-0001-feature", "--squash", "--yes"])?;
     assert!(!ok, "a rejected commit must not report success:\n{output}");
     assert!(output.contains("still staged"), "output: {output}");
     // HEAD did not move, and the squash is recoverable by hand.
@@ -1018,7 +1018,7 @@ fn the_push_says_which_commits_it_publishes() -> Res<()> {
     )?;
 
     let (ok, output) =
-        review(&s.work, &["--land", "origin/work-0001-feature", "--yes", "--push"])?;
+        review(&s.work, &["--land", "origin/work-0001-feature", "--squash", "--yes", "--push"])?;
     assert!(ok, "{output}");
     assert!(output.contains("publishing 2 commits"), "output: {output}");
     assert!(output.contains("a hand-made local commit"), "output: {output}");
@@ -1044,7 +1044,7 @@ fn content_staged_during_the_commit_does_not_ride_along() -> Res<()> {
     let main_before = git(&s.work, &["rev-parse", "main"])?.trim().to_string();
     let origin_before = git(&s.origin, &["rev-parse", "main"])?.trim().to_string();
     let (ok, output) =
-        review(&s.work, &["--land", "origin/work-0001-feature", "--yes", "--push"])?;
+        review(&s.work, &["--land", "origin/work-0001-feature", "--squash", "--yes", "--push"])?;
     assert!(!ok, "unreviewed content must not land:\n{output}");
     assert!(output.contains("not the staged"), "output: {output}");
     assert_eq!(git(&s.work, &["rev-parse", "main"])?.trim(), main_before, "not rolled back");
@@ -1090,7 +1090,7 @@ fn a_base_that_moves_while_the_squash_is_staged_is_refused() -> Res<()> {
 
     let origin_before = git(&s.origin, &["rev-parse", "main"])?.trim().to_string();
     let (ok, output) =
-        review(&s.work, &["--land", "origin/work-0001-feature", "--yes", "--push"])?;
+        review(&s.work, &["--land", "origin/work-0001-feature", "--squash", "--yes", "--push"])?;
     assert!(!ok, "a raced landing must not report success:\n{output}");
     assert!(output.contains("while the squash was staged"), "output: {output}");
     // The remedy must not rewind past the commit the guard just protected.
@@ -1118,7 +1118,7 @@ fn a_no_push_sentinel_behind_a_real_pushurl_still_blocks_the_remote() -> Res<()>
     git(&s.work, &["remote", "set-url", "--add", "--push", "backup", "no_push"])?;
 
     let (ok, output) =
-        review(&s.work, &["--land", "origin/work-0001-feature", "--yes", "--push"])?;
+        review(&s.work, &["--land", "origin/work-0001-feature", "--squash", "--yes", "--push"])?;
     assert!(ok, "{output}");
     assert!(output.contains("backup (skipped: no_push)"), "output: {output}");
     assert_eq!(
@@ -1146,7 +1146,7 @@ fn a_partial_push_failure_is_reported_as_failure() -> Res<()> {
 
     let (ok, output) = review(
         &s.work,
-        &["--land", "origin/work-0001-feature", "--yes", "--push"],
+        &["--land", "origin/work-0001-feature", "--squash", "--yes", "--push"],
     )?;
     assert!(!ok, "a rejected push must fail the run:\n{output}");
     // git prints `! [rejected] … (fetch first)` above a generic
@@ -1167,7 +1167,7 @@ fn every_remote_marked_no_push_is_not_reported_as_published() -> Res<()> {
     }
     let (ok, output) = review(
         &s.work,
-        &["--land", "origin/work-0001-feature", "--yes", "--push"],
+        &["--land", "origin/work-0001-feature", "--squash", "--yes", "--push"],
     )?;
     assert!(!ok, "publishing nothing must not exit 0:\n{output}");
     assert!(output.contains("local only") || output.contains("no remote was eligible"),
@@ -1184,7 +1184,7 @@ fn lands_onto_a_base_other_than_main() -> Res<()> {
 
     let (ok, output) = review(
         &s.work,
-        &["--base", "release", "--land", "origin/work-0001-feature", "--yes"],
+        &["--base", "release", "--land", "origin/work-0001-feature", "--squash", "--yes"],
     )?;
     assert!(ok, "{output}");
     assert_eq!(git(&s.work, &["rev-list", "--count", "release"])?.trim(), "2");
@@ -1200,10 +1200,13 @@ fn flag_combinations_that_do_nothing_are_rejected() -> Res<()> {
     // combinations also fail for want of a tty, which would green the assertion
     // without the guard ever running.
     for (args, want) in [
-        (vec!["--list", "--land", "origin/work-0001-feature", "--yes"], "mutually exclusive"),
+        (vec!["--list", "--land", "origin/work-0001-feature", "--squash", "--yes"], "mutually exclusive"),
         (vec!["--push"], "--push is only meaningful with --land"),
-        (vec!["--rebase"], "--rebase is only meaningful with --land"),
-        (vec!["--yes"], "--yes is only meaningful with --land or --delete"),
+        (vec!["--squash"], "--squash is only meaningful with --land"),
+        (
+            vec!["--yes"],
+            "--yes is only meaningful with --land, --delete or --prune-worktrees",
+        ),
         (vec!["--expect", "deadbeef"], "--expect/--expect-base are only meaningful with --land"),
         (vec!["--list", "--delete", "origin/work-0001-feature", "--yes"], "mutually exclusive"),
         (
@@ -1211,14 +1214,14 @@ fn flag_combinations_that_do_nothing_are_rejected() -> Res<()> {
                 "--delete",
                 "origin/work-0001-feature",
                 "--land",
-                "origin/work-0001-feature",
+                "origin/work-0001-feature", "--squash",
                 "--yes",
             ],
             "mutually exclusive",
         ),
         // Deleting the branch is only safe once its work is published.
         (
-            vec!["--delete-landed", "--land", "origin/work-0001-feature", "--yes"],
+            vec!["--delete-landed", "--land", "origin/work-0001-feature", "--squash", "--yes"],
             "--delete-landed needs --land <branch> --push",
         ),
     ] {
@@ -1325,7 +1328,7 @@ fn the_preview_shows_the_merge_result_not_the_branches_own_diff() -> Res<()> {
     );
 
     // And the claim is exactly right: landing it stages DOCS, not README.
-    let (ok, land) = review(&s.work, &["--land", "origin/edits-readme", "--yes"])?;
+    let (ok, land) = review(&s.work, &["--land", "origin/edits-readme", "--squash", "--yes"])?;
     assert!(ok, "land should succeed:\n{land}");
     let staged = git(&s.work, &["show", "--stat", "--format=", "HEAD"])?;
     assert!(staged.contains("DOCS"), "the landing staged: {staged}\npreview said:\n{output}");
@@ -1342,7 +1345,7 @@ fn a_tag_named_like_the_branch_does_not_hijack_the_landing() -> Res<()> {
     // A tag with the ref's exact name, parked on the base (nothing to land).
     git(&s.work, &["tag", "origin/work-0001-feature", "main"])?;
 
-    let (ok, output) = review(&s.work, &["--land", "origin/work-0001-feature", "--yes"])?;
+    let (ok, output) = review(&s.work, &["--land", "origin/work-0001-feature", "--squash", "--yes"])?;
     assert!(ok, "the remote branch, not the tag, should land:\n{output}");
     let landed = git(&s.work, &["show", "--stat", "--format=%s", "HEAD"])?;
     assert!(landed.contains("b.txt"), "the branch's content must be what landed: {landed}");
@@ -1360,7 +1363,7 @@ fn a_tag_named_like_the_branch_does_not_derail_the_cleanup() -> Res<()> {
 
     let (ok, output) = review(
         &s.work,
-        &["--land", "origin/work-0001-feature", "--yes", "--push", "--delete-landed"],
+        &["--land", "origin/work-0001-feature", "--squash", "--yes", "--push", "--delete-landed"],
     )?;
     assert!(ok, "{output}");
     assert!(!remote_has_branch(&s.origin)?, "the landed branch was left on origin:\n{output}");
@@ -1708,7 +1711,7 @@ fn delete_landed_removes_the_branch_only_after_it_is_published() -> Res<()> {
 
     let (ok, output) = review(
         &s.work,
-        &["--land", "origin/work-0001-feature", "--yes", "--push", "--delete-landed"],
+        &["--land", "origin/work-0001-feature", "--squash", "--yes", "--push", "--delete-landed"],
     )?;
     assert!(ok, "land + push + delete should succeed:\n{output}");
 
@@ -1732,7 +1735,7 @@ fn delete_landed_is_not_a_failure_when_there_is_nothing_to_delete() -> Res<()> {
 
     let (ok, output) = review(
         &s.work,
-        &["--land", "archive/work-0001-feature", "--yes", "--push", "--delete-landed"],
+        &["--land", "archive/work-0001-feature", "--squash", "--yes", "--push", "--delete-landed"],
     )?;
     assert!(ok, "an empty cleanup is not a failed landing:\n{output}");
     assert!(output.contains("no pushable remote carries the landed"), "output: {output}");
@@ -1760,7 +1763,7 @@ fn a_failed_push_leaves_the_branch_alone() -> Res<()> {
 
     let (ok, output) = review(
         &s.work,
-        &["--land", "origin/work-0001-feature", "--yes", "--push", "--delete-landed"],
+        &["--land", "origin/work-0001-feature", "--squash", "--yes", "--push", "--delete-landed"],
     )?;
     assert!(!ok, "a half-published landing must not report success:\n{output}");
     assert!(remote_has_branch(&s.origin)?, "the branch must survive a failed push:\n{output}");
@@ -1828,7 +1831,7 @@ fn landing_refuses_when_the_base_moved_since_the_review() -> Res<()> {
 
     let (ok, output) = review(
         &s.work,
-        &["--land", "origin/work-0001-feature", "--expect-base", &reviewed, "--yes"],
+        &["--land", "origin/work-0001-feature", "--squash", "--expect-base", &reviewed, "--yes"],
     )?;
     assert!(!ok, "landing onto a moved base must be refused:\n{output}");
     assert!(output.contains("moved since the review"), "output: {output}");
@@ -1838,7 +1841,7 @@ fn landing_refuses_when_the_base_moved_since_the_review() -> Res<()> {
     let now = git(&s.work, &["rev-parse", "main"])?.trim().to_string();
     let (ok, output) = review(
         &s.work,
-        &["--land", "origin/work-0001-feature", "--expect-base", &now, "--yes"],
+        &["--land", "origin/work-0001-feature", "--squash", "--expect-base", &now, "--yes"],
     )?;
     assert!(ok, "an up-to-date base pin must land:\n{output}");
     Ok(())
@@ -1861,7 +1864,7 @@ fn delete_landed_spares_a_same_named_branch_on_another_remote() -> Res<()> {
 
     let (ok, output) = review(
         &s.work,
-        &["--land", "origin/work-0001-feature", "--yes", "--push", "--delete-landed"],
+        &["--land", "origin/work-0001-feature", "--squash", "--yes", "--push", "--delete-landed"],
     )?;
     assert!(ok, "land + push + delete should succeed:\n{output}");
 
@@ -1874,6 +1877,145 @@ fn delete_landed_spares_a_same_named_branch_on_another_remote() -> Res<()> {
     assert!(
         output.contains("not the landed commit"),
         "the skip must be reported, not silent:\n{output}"
+    );
+    Ok(())
+}
+
+/// The record column is what the integrator reads before opening a branch, so
+/// it has to come from the commits themselves — a branch whose commits carry
+/// the record reads `ok`, one whose commits do not says how many.
+#[test]
+fn list_shows_the_review_record_per_branch() -> Res<()> {
+    let s = scenario("record")?;
+    let record = "\n\nReviewed-by: subagent/opus-4.8\nReviewed-by: codex/gpt-5.6-sol\n\
+                  Reviewed-by: agy/gemini-3.1-pro\nChecks: affected-checks (green)";
+
+    git(&s.work, &["checkout", "-b", "reviewed-rolling"])?;
+    commit(
+        &s.work,
+        "r.txt",
+        "one\n",
+        &format!("reviewed: an increment{record}"),
+        "2024-02-01T00:00:00 +0000",
+    )?;
+    git(&s.work, &["push", "origin", "reviewed-rolling"])?;
+    git(&s.work, &["checkout", "main"])?;
+
+    let (ok, output) = review(&s.work, &["--list"])?;
+    assert!(ok, "--list should succeed:\n{output}");
+
+    let column = |branch: &str| -> Option<String> {
+        output
+            .lines()
+            .find(|l| l.contains(branch))
+            .and_then(|l| l.split_whitespace().nth(2))
+            .map(str::to_string)
+    };
+    assert_eq!(
+        column("origin/reviewed-rolling").as_deref(),
+        Some("ok"),
+        "a fully recorded branch reads ok:\n{output}"
+    );
+    // The scenario's own branch carries no record at all: both its commits.
+    assert_eq!(
+        column("origin/work-0001-feature").as_deref(),
+        Some("2/2!"),
+        "an unreviewed branch names how many commits are missing it:\n{output}"
+    );
+    Ok(())
+}
+
+/// The sweep removes the worktree of a branch whose every commit has landed,
+/// and keeps everything it cannot prove is finished with.
+#[test]
+fn prune_worktrees_removes_only_landed_clean_unpushed_worktrees() -> Res<()> {
+    let s = scenario("prune")?;
+    let trees = s.work.join("trees");
+
+    // 1. Landed, clean, never pushed — the one case that is swept.
+    git(&s.work, &["checkout", "-b", "landed-work"])?;
+    commit(&s.work, "l.txt", "l\n", "landed: a change", "2024-02-01T00:00:00 +0000")?;
+    git(&s.work, &["checkout", "main"])?;
+    // Land it by replaying the patch onto main, as a rebase landing does: the
+    // object id differs, so only patch equivalence can see that it landed.
+    git(&s.work, &["cherry-pick", "landed-work"])?;
+    let landed = trees.join("landed");
+    git(&s.work, &["worktree", "add", &landed.to_string_lossy(), "landed-work"])?;
+
+    // 2. A rolling branch, equally landed — kept, because that is its normal state.
+    git(&s.work, &["branch", "keep-rolling", "landed-work"])?;
+    let rolling = trees.join("rolling");
+    git(&s.work, &["worktree", "add", &rolling.to_string_lossy(), "keep-rolling"])?;
+
+    // 3. Unlanded work — kept.
+    git(&s.work, &["checkout", "-b", "unlanded-work"])?;
+    commit(&s.work, "u.txt", "u\n", "unlanded: a change", "2024-02-02T00:00:00 +0000")?;
+    git(&s.work, &["checkout", "main"])?;
+    let unlanded = trees.join("unlanded");
+    git(&s.work, &["worktree", "add", &unlanded.to_string_lossy(), "unlanded-work"])?;
+
+    // 4. Landed but dirty — kept.
+    git(&s.work, &["branch", "dirty-work", "landed-work"])?;
+    let dirty = trees.join("dirty");
+    git(&s.work, &["worktree", "add", &dirty.to_string_lossy(), "dirty-work"])?;
+    fs::write(dirty.join("l.txt"), "edited\n")?;
+
+    let (ok, plan) = review(&s.work, &["--prune-worktrees"])?;
+    assert!(ok, "the plan should succeed:\n{plan}");
+    assert!(plan.contains("remove  "), "something should be removable:\n{plan}");
+    for (path, why) in [
+        (&rolling, "rolling branch"),
+        (&unlanded, "not on the base"),
+        (&dirty, "uncommitted changes"),
+    ] {
+        let name = path.to_string_lossy().to_string();
+        let line = plan
+            .lines()
+            .find(|l| l.contains(&name))
+            .unwrap_or_else(|| panic!("no plan line for {name}:\n{plan}"));
+        assert!(line.starts_with("keep"), "{name} must be kept:\n{line}");
+        assert!(line.contains(why), "{name} must say why ({why}):\n{line}");
+    }
+    assert!(
+        plan.lines().any(|l| l.starts_with("remove") && l.contains(&landed.to_string_lossy().to_string())),
+        "the landed worktree should be swept:\n{plan}"
+    );
+    // A plan alone removes nothing.
+    assert!(landed.exists(), "the plan must not have removed anything");
+
+    let (ok, done) = review(&s.work, &["--prune-worktrees", "--yes"])?;
+    assert!(ok, "the sweep should succeed:\n{done}");
+    assert!(!landed.exists(), "the landed worktree should be gone:\n{done}");
+    assert!(rolling.exists(), "the rolling worktree must survive:\n{done}");
+    assert!(unlanded.exists(), "the unlanded worktree must survive:\n{done}");
+    assert!(dirty.exists(), "the dirty worktree must survive:\n{done}");
+    Ok(())
+}
+
+/// A rolling branch is landed over and over, so the automatic post-land sweep
+/// must not delete it — that would take the branch out from under the agent
+/// still working the workstream.
+#[test]
+fn the_landed_sweep_keeps_a_rolling_branch() -> Res<()> {
+    let s = scenario("rolling")?;
+    git(&s.work, &["checkout", "-b", "ui-rolling"])?;
+    commit(&s.work, "u.txt", "u\n", "ui: an increment", "2024-02-01T00:00:00 +0000")?;
+    git(&s.work, &["push", "origin", "ui-rolling"])?;
+    git(&s.work, &["checkout", "main"])?;
+    git(&s.work, &["branch", "-D", "ui-rolling"])?;
+
+    let (ok, output) = review(
+        &s.work,
+        &["--land", "origin/ui-rolling", "--yes", "--push", "--delete-landed"],
+    )?;
+    assert!(ok, "landing a rolling branch should succeed:\n{output}");
+    assert!(
+        output.contains("rolling branch — kept"),
+        "the sweep must say it kept it, not silently skip:\n{output}"
+    );
+    assert!(
+        git(&s.origin, &["rev-parse", "refs/heads/ui-rolling"]).is_ok(),
+        "origin must still carry the rolling branch after landing:\n{output}"
     );
     Ok(())
 }

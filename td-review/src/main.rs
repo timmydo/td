@@ -1,14 +1,17 @@
-//! td-review — the integrator's branch review and landing TUI. It is
-//! `git squash-in` then `git commit` (`s`), or the branch's own commits replayed
-//! onto the base (`r`), then a separate `p`/`P` push, driven with plumbing so
-//! each step's outcome is visible and testable. The non-interactive modes exist
-//! for scripting and for the integration test.
+//! td-review — the integrator's branch review and landing TUI. It replays the
+//! branch's own commits onto the base (`r`, and the default headless mode) or
+//! squashes them into one (`s`), then a separate `p`/`P` push, driven with
+//! plumbing so each step's outcome is visible and testable. A `w` sweep removes
+//! the worktrees of branches that have fully landed. The non-interactive modes
+//! exist for scripting and for the integration test.
 #![forbid(unsafe_code)]
 
 mod app;
 mod git;
 mod land;
+mod record;
 mod term;
+mod worktrees;
 
 use std::env;
 use std::io::{self, Write};
@@ -30,9 +33,9 @@ options:
   -b, --base <name>   branch to review against and land into (default: main)
       --list          print the branch table and exit (no TUI)
       --preview <br>  print what landing <br> would stage, and exit
-      --land <branch> land <branch> non-interactively, squashed; needs --yes
-      --rebase        with --land, replay the branch's own commits onto the
-                      base instead of squashing them into one
+      --land <branch> land <branch> non-interactively, replaying its own
+                      commits onto the base; needs --yes
+      --squash        with --land, collapse them into one commit instead
       --push          with --land, also push the base to every remote (`P`;
                       the TUI's `p` pushes to the base's remote alone)
       --expect <oid>  with --land, require the branch to still be at <oid>
@@ -40,11 +43,15 @@ options:
                       with --land, require the base to still be at <oid>
       --delete <br>   delete <br> from every pushable remote; needs --yes
       --delete-landed with --land --push, delete the branch once it is published
-      --yes           confirm a non-interactive --land or --delete
+      --prune-worktrees
+                      show the worktrees whose branch has fully landed (clean,
+                      unpushed, not -rolling); removes them with --yes
+      --yes           confirm a non-interactive --land, --delete or sweep
   -h, --help          this text
 
 keys (TUI):
-  j/k move   enter review   r reload   / filter   D delete   ? help   q quit
+  j/k move   enter review   r reload   / filter   D delete   w worktrees
+  ? help   q quit
   f fetch the base's remote   F fetch every remote
   p push the base to its remote   P push the base to every remote
   in review: j/k or space/b scroll, p pager, s squash + land, r rebase + land
@@ -58,12 +65,13 @@ struct Args {
     list: bool,
     preview: Option<String>,
     land: Option<String>,
-    rebase: bool,
+    squash: bool,
     push: bool,
     expect: Option<String>,
     expect_base: Option<String>,
     delete: Option<String>,
     delete_landed: bool,
+    prune_worktrees: bool,
     yes: bool,
 }
 
@@ -74,12 +82,13 @@ fn parse_args() -> Result<Option<Args>, String> {
         list: false,
         preview: None,
         land: None,
-        rebase: false,
+        squash: false,
         push: false,
         expect: None,
         expect_base: None,
         delete: None,
         delete_landed: false,
+        prune_worktrees: false,
         yes: false,
     };
     let mut it = env::args().skip(1);
@@ -109,9 +118,9 @@ fn parse_args() -> Result<Option<Args>, String> {
             }
             "--preview" => args.preview = Some(value("a branch name")?),
             "--land" => args.land = Some(value("a branch name")?),
-            "--rebase" => {
+            "--squash" => {
                 bare()?;
-                args.rebase = true
+                args.squash = true
             }
             "--push" => {
                 bare()?;
@@ -123,6 +132,10 @@ fn parse_args() -> Result<Option<Args>, String> {
             "--delete-landed" => {
                 bare()?;
                 args.delete_landed = true
+            }
+            "--prune-worktrees" => {
+                bare()?;
+                args.prune_worktrees = true
             }
             "--yes" => {
                 bare()?;
@@ -170,29 +183,35 @@ fn run(args: Args) -> io::Result<ExitCode> {
     let modes = u8::from(args.list)
         + u8::from(args.preview.is_some())
         + u8::from(args.land.is_some())
-        + u8::from(args.delete.is_some());
+        + u8::from(args.delete.is_some())
+        + u8::from(args.prune_worktrees);
     if modes > 1 {
         return Err(io::Error::other(
-            "--list, --preview, --land and --delete are mutually exclusive",
+            "--list, --preview, --land, --delete and --prune-worktrees are mutually exclusive",
         ));
     }
     if args.land.is_none() && args.push {
         return Err(io::Error::other("--push is only meaningful with --land"));
     }
-    if args.land.is_none() && args.rebase {
-        return Err(io::Error::other("--rebase is only meaningful with --land"));
+    if args.land.is_none() && args.squash {
+        return Err(io::Error::other("--squash is only meaningful with --land"));
     }
     if args.land.is_none() && (args.expect.is_some() || args.expect_base.is_some()) {
         return Err(io::Error::other("--expect/--expect-base are only meaningful with --land"));
     }
-    if args.land.is_none() && args.delete.is_none() && args.yes {
-        return Err(io::Error::other("--yes is only meaningful with --land or --delete"));
+    if args.land.is_none() && args.delete.is_none() && !args.prune_worktrees && args.yes {
+        return Err(io::Error::other(
+            "--yes is only meaningful with --land, --delete or --prune-worktrees",
+        ));
     }
     if args.delete_landed && !(args.land.is_some() && args.push) {
         return Err(io::Error::other("--delete-landed needs --land <branch> --push"));
     }
     if args.list {
         return list_branches(&git, &args.base).map(|()| ExitCode::SUCCESS);
+    }
+    if args.prune_worktrees {
+        return prune_worktrees(&git, &args.base, args.yes);
     }
     if let Some(branch) = args.preview.clone() {
         return show_preview(&git, &args.base, &branch).map(|()| ExitCode::SUCCESS);
@@ -214,18 +233,72 @@ fn list_branches(git: &Git, base: &str) -> io::Result<()> {
     let stdout = io::stdout();
     let mut out = stdout.lock();
     for b in &branches {
+        let ready = match git.commit_records(&format!(
+            "refs/heads/{base}..refs/remotes/{}",
+            b.refname
+        )) {
+            Ok(commits) => match b.counts {
+                Some((ahead, _)) => record::readiness_for(ahead as usize, &commits),
+                None => record::readiness(&commits),
+            },
+            Err(_) => record::Readiness::Unknown,
+        };
         // Refnames and subjects are untrusted; --list prints straight to a
         // terminal, so neutralise them here as the TUI's frame does.
         writeln!(
             out,
-            "{:>5}  {:>7}  {}\t{}",
+            "{:>5}  {:>7}  {:<5}  {}\t{}",
             b.age(now),
             b.counts_label(),
+            ready.label(),
             scrub(&b.refname),
             scrub(&b.subject)
         )?;
     }
     Ok(())
+}
+
+/// Show what the worktree sweep would remove, and with `--yes` remove it. The
+/// worktrees are agents' working directories, so the default is to say and do
+/// nothing; every kept one prints the reason it was kept.
+fn prune_worktrees(git: &Git, base: &str, yes: bool) -> io::Result<ExitCode> {
+    let planned = worktrees::plan(git, base)?;
+    let stdout = io::stdout();
+    let mut out = stdout.lock();
+    let mut removable = 0usize;
+    for p in &planned {
+        match &p.verdict {
+            worktrees::Verdict::Remove => {
+                removable += 1;
+                writeln!(out, "remove  {}", scrub(&p.worktree.path))?;
+            }
+            worktrees::Verdict::Keep(why) => {
+                writeln!(out, "keep    {}  ({})", scrub(&p.worktree.path), scrub(why))?;
+            }
+        }
+    }
+    if removable == 0 {
+        writeln!(out, "\nnothing to sweep")?;
+        return Ok(ExitCode::SUCCESS);
+    }
+    if !yes {
+        writeln!(out, "\n{removable} worktree(s) would be removed; re-run with --yes")?;
+        return Ok(ExitCode::SUCCESS);
+    }
+    let mut failed = 0usize;
+    for swept in worktrees::sweep(git, &planned) {
+        match swept.error {
+            None => writeln!(out, "removed {}", scrub(&swept.path))?,
+            Some(e) => {
+                failed += 1;
+                writeln!(out, "FAILED  {}: {}", scrub(&swept.path), scrub(&e))?;
+            }
+        }
+    }
+    if failed > 0 {
+        return Ok(ExitCode::FAILURE);
+    }
+    Ok(ExitCode::SUCCESS)
 }
 
 /// Print what landing `branch` would stage, without staging it — the same
@@ -299,7 +372,10 @@ fn land_headless(git: &Git, base: &str, branch: &str, args: &Args) -> io::Result
     // Captured before the landing: the delete filter compares remotes against
     // the branch tip that was landed, not the new commit on the base.
     let landed_oid = git.branch_oid(branch).ok();
-    let mode = if args.rebase { land::Mode::Rebase } else { land::Mode::Squash };
+    // Replay by default: the workflow AGENTS.md documents lands each commit
+    // verbatim, and a default that quietly squashes them would collapse the
+    // per-commit records and checkpoints that whole model rests on.
+    let mode = if args.squash { land::Mode::Squash } else { land::Mode::Rebase };
     let landing = land::land(
         git,
         base,
@@ -351,6 +427,14 @@ fn land_headless(git: &Git, base: &str, branch: &str, args: &Args) -> io::Result
         // Only ever after a verified publish: the branch is the sole copy of
         // that work until the base carrying it reaches the remotes.
         if args.delete_landed {
+            let remotes = git.remote_names()?;
+            let (_, short) = git::split_remote(branch, &remotes);
+            // A rolling branch survives its landings by definition; sweeping it
+            // would delete the branch the agent is still working on.
+            if git::is_rolling(short) {
+                println!("{} is a rolling branch — kept", scrub(short));
+                return Ok(ExitCode::SUCCESS);
+            }
             // A failed cleanup is not a failed landing: the work is published.
             // Report it distinctly rather than as "nothing landed".
             if delete_headless(git, base, branch, true, landed_oid.as_deref())?

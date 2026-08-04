@@ -38,6 +38,7 @@ mod lock;
 mod mes_boot;
 mod nar;
 mod oci;
+mod ready;
 mod sandbox;
 mod scan;
 mod stage0;
@@ -6726,6 +6727,10 @@ fn main() -> ExitCode {
         // map the branch diff to a right-sized check set + the waive/escalate
         // decision. Run from the repo root. See builder/src/affected.rs.
         Some("affected-checks") => affected::main(&args[2..]),
+        // ready — the gate an agent runs before pushing a rolling branch: the
+        // bounded checks over the committed diff plus the per-commit review
+        // record AGENTS.md requires. See builder/src/ready.rs.
+        Some("ready") => ready::main(args.get(2..).unwrap_or(&[])),
         // gate-run — td's OWN gate runner: the loop scheduler that replaced `make`
         // on the spine. The gates are compiled in (src/gate_defs/*.rs registry);
         // runs the requested tier/gates with cheap-serial + heavy-parallel

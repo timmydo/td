@@ -2,14 +2,16 @@
 # revert-suspect.sh — form the revert of the commit that broke main.
 #
 # The optimistic-merge heal primitive (DESIGN §7.2). Main is NON-strict, so two
-# independently-green branches can squash-land into a red main (green(A)+green(B)
-# != green(A∪B)). Healing is an AGENT DUTY, not an automated workflow: when an
-# agent sees a gate red on main, it runs this to revert the suspect — the squash
-# commit at main's HEAD — onto a heal/revert-<sha> branch, and the integrator
-# squash-ins that branch so main returns to green with no human rebase toil.
-# Squash (one commit per landing) is what makes the suspect unambiguous and the
-# revert atomic. GitHub is a backup remote only — this forms the revert branch
-# locally; landing is the integrator's `git squash-in` (AGENTS.md "Parallel work").
+# independently-green branches can land into a red main (green(A)+green(B) !=
+# green(A∪B)). Healing is an AGENT DUTY, not an automated workflow: when an
+# agent sees a gate red on main, it runs this to revert the suspect onto a
+# heal/revert-<sha> branch, which the integrator lands as usual.
+#
+# A landing REPLAYS a branch's commits (AGENTS.md "Parallel work"), so it can put
+# several on main and HEAD is not automatically the suspect: name it with --ref
+# once `git log` says which increment broke the gate. The default stays HEAD
+# because the last commit is the common case, not because a landing is one
+# commit. GitHub is a backup remote only — this forms the revert branch locally.
 #
 #   ci/revert-suspect.sh                 # revert HEAD on a new heal/revert-<sha> branch
 #   ci/revert-suspect.sh --ref <sha>     # revert a specific commit
@@ -42,8 +44,8 @@ case "$subject" in
     exit 3 ;;
 esac
 
-# Squash landings are single-parent (git revert needs no -m); guard a stray true
-# merge commit anyway.
+# Replayed commits are single-parent (git revert needs no -m); guard a stray
+# true merge commit anyway.
 parents=$(git rev-list --parents -n1 "$sha" | wc -w)
 mflag=()
 [ "$parents" -gt 2 ] && mflag=(-m 1)
@@ -52,4 +54,4 @@ branch="heal/revert-$short"
 git switch -c "$branch"
 git revert --no-edit "${mflag[@]}" "$sha"
 echo "prepared revert of $short (\"$subject\") on branch $branch"
-echo "land it: the integrator runs 'git squash-in $branch' on main, then pushes."
+echo "land it: the integrator reviews and lands $branch (td-review), then pushes."

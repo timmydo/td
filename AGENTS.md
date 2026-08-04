@@ -181,95 +181,176 @@ includes dirty, staged, and untracked files by default. Use
 branch diff only, or `--path FILE` to inspect the mapping for a
 specific file.
 
-# Parallel work (worktrees, land on green)
+Before pushing, run `td-builder ready` rather than these directly: it
+is `affected-checks --committed-only --run` plus the per-commit review
+record, and it is the gate the next section describes.
 
-Multiple agents work this repo concurrently so use work trees. There is
-no GitHub PR/Issues/Actions UI and no branch protection; GitHub and the
-sr.ht mirror are backup remotes. But the shared `origin` is NOT merely a
-backup: the integrator reviews and lands from a SEPARATE clone, so you
-push your ready `work-NNNN-slug` branch to `origin` for them to fetch.
-That pushed, ready branch IS the "PR" — the standing ask for the
-integrator to squash it into main. There is no other handoff and nothing
-else to notify.
+# Parallel work (rolling branches, land on green)
 
-Work in your own git worktree/branch named `work-NNNN-slug`.
+Multiple agents work this repo concurrently, so work in your own git
+worktree. There is no GitHub PR/Issues/Actions UI and no branch
+protection; GitHub and the sr.ht mirror are backup remotes. But the
+shared `origin` is NOT merely a backup: the integrator reviews and lands
+from a SEPARATE clone, so you push your branch to `origin` for them to
+fetch. That pushed branch IS the "PR" — the standing ask for the
+integrator to land it. There is no other handoff and nothing else to
+notify.
 
-**Ready.** A branch is ready to land when its bounded checks are green
-(`td-builder affected-checks --committed-only --run`) AND all three
-code reviews have run, their findings acted on, and the acting agent's
-summary of those findings and follow-ups is in the commit message.
-There is no draft/ready flag to flip and nothing on a webpage to ask
-the human to look at — readiness lives entirely in the branch. The
-SAME agent that finishes the work carries it to ready; don't hand a
-half-reviewed branch to the integrator. When it is ready, push it to
-`origin` (`git push -u origin work-NNNN-slug`): that push is what submits
-it for landing — the integrator fetches it into their review clone.
+**The branch is a workstream, not a task.** Name it for the work it
+carries, suffixed `-rolling`: `ui-rolling`, `td-sh-rolling`,
+`td-txt-rolling`. There is no number — a number is a name nobody can
+allocate without a registry, and the ones that existed collided. The
+suffix is load-bearing: it tells the integrator's sweep that this
+branch survives its own landings, so an agent keeps working on it
+across them instead of opening a new branch per increment.
 
-**Land.** A single integrator (the test user) lands ready branches into
-main from their own clone: `git fetch origin` (retrieves the pushed
-`work-NNNN-slug` branch), `git squash-in <branch>` on the fetched branch
-(squashes it, prefilling the message from its commits), review `git diff
---cached`, `git commit`, `git push origin main`. The squash lands a fresh
-commit rather than replaying yours, so your branch and its individual
-commits never appear on main; after landing, the `work-NNNN-slug` branch
-is removed from `origin` — its disappearance is the signal it landed.
+**One commit is one increment.** Each commit stands alone: reviewed on
+its own diff and carrying its own record. That is what makes it a
+checkpoint — the integrator can land the first three commits of a
+branch and stop. Leave each one green as you make it; `ready` runs the
+checks once, over the tip, so a red commit in the middle of a branch is
+yours to prevent, not something it will catch. Do not roll several
+increments into one commit to save review effort; the commit is the
+review unit.
+
+**Ready.** `td-builder ready` IS the gate. It runs the bounded checks
+(`affected-checks --committed-only --run`) and verifies that every
+commit on the branch not yet on the base carries its review record
+(below). It exits non-zero naming what is missing.
+
+```
+td-builder ready                # checks + the per-commit record
+td-builder ready --record-only  # the record scan alone, no builds
+```
+
+There is no draft/ready flag to flip and nothing on a webpage to ask a
+human to look at — readiness lives entirely in the branch. The SAME
+agent that finishes the work carries it to ready; don't hand a
+half-reviewed branch to the integrator. When `ready` passes — the full
+run, not `--record-only`, which says `RECORD OK … checks NOT run` for
+exactly this reason — push (`git push -u origin <workstream>-rolling`):
+that push is what submits it for landing.
+
+**Land.** A single integrator (the test user) lands from their own
+clone with `td-review`, interactively: it lists the branches with each
+one's review record in a READY column, `r` rebases the reviewed branch
+onto main, `p` pushes, and `w` sweeps the worktrees whose branch has
+fully landed. A rebase REPLAYS your commits onto the base, so they land
+verbatim — one commit each, with their subjects, bodies and records
+intact. Nothing is squashed, so no commit's subject is demoted into
+another's body and the branch needs no particular commit first. The
+post-push sweep that deletes a landed branch skips `-rolling` ones, and
+so does the worktree sweep: yours is still yours after it lands.
+
+**Resume after a landing.** A rolling branch is not deleted when it
+lands — that is the point of it. Pick up where you left off:
+
+```
+git fetch origin && git rebase origin/main
+```
+
+Commits that landed drop out of the rebase (their patches are already
+upstream); anything unfinished replays on top. A landing is therefore
+invisible to you except that the branch gets shorter, and nothing needs
+you to notice it.
+
+**Parking.** If you must stop mid-workstream, the resume point goes in
+the last commit message as a `Next:` block — in the body, ABOVE the
+review record, which has to close the message. Whoever picks the branch
+up reads it straight out of `git log`; an untracked plan file does not
+survive a fresh worktree and is invisible to everyone but you.
 
 Never `git stash` in this repo. The stash stack (`refs/stash`) is
   repo-*global*.
 
-## Code review — three independent reviews, recorded in the commit
+## Code review — three per commit, recorded in the commit
 
-Every landing gets THREE independent code reviews — a subagent review
-AND two cross-model reviews, each by a different model's CLI — waivable
-only for documentation changes, and only if the commit message says so.
-Spawn an independent code-review subagent over the full branch diff
-(`/code-review`), AND run two further reviews with *different* models
-driven from their CLIs so two distinct models each audit the same diff
-(catches blind spots one model shares with its own subagent). Which
-three reviewer identities apply depends on which model is the acting
-agent:
+Every commit that lands gets THREE independent code reviews over ITS
+OWN diff — a subagent review AND two cross-model reviews, each by a
+different model's CLI. Per commit rather than per branch is what lets
+the integrator land part of a branch: a commit nobody reviewed cannot
+be a checkpoint. Spawn an independent code-review subagent over the
+commit (`/code-review`), AND run two further reviews with *different*
+models driven from their CLIs so two distinct models each audit the
+same diff (catches blind spots one model shares with its own
+subagent). Which three reviewer identities apply depends on which model
+is the acting agent:
 
 - **Acting agent is Claude:** subagent review at Opus 4.8, plus a
   Codex CLI review and an Agy (Antigravity) CLI review.
 - **Acting agent is Codex:** subagent review at gpt-5.6-sol, plus a
   Claude CLI review and an Agy CLI review.
 
+You know which you are. Inside Claude Code the subagent review is your
+own Agent tool (`/code-review`), never the `claude` CLI — that row is
+Codex's. Your own model twice is a second run, not a second opinion,
+and `ready` compares the model in `<tool>/<model>` to refuse it.
+
+Commit the increment first, then review `git show HEAD` — that is the
+unit being judged, and it hands the reviewer the message along with the
+diff — then `git commit --amend` to add your summary and the record.
 Run every cross-model reviewer at a strong model + high reasoning
-effort, and feed it the branch diff on stdin — a bare `git diff` is
-empty once the branch is committed, so pipe `git diff
-origin/main...HEAD` so each reviewer audits the same full branch diff
-the subagent does. The reviewers do NOT write the record: the acting
-agent reads all three, acts on the findings — fixing each real one or
-dismissing it with a stated reason — then writes ITS OWN summary of the
-findings and how each was followed up into the commit message. Send raw
-reviewer output to a scratch file you do NOT commit; account for every
-finding (don't silently drop one), but the commit carries your summary,
-not the verbatim dumps. That summary is the durable record the
-integrator reads before `squash-in`.
+effort. The reviewers do NOT write the record: the acting agent reads
+all three, acts on the findings — fixing each real one or dismissing it
+with a stated reason — then writes ITS OWN summary of the findings and
+how each was followed up into that commit's message. Send raw reviewer
+output to a scratch file you do NOT commit; account for every finding
+(don't silently drop one), but the commit carries your summary, not the
+verbatim dumps. That summary is the durable record the integrator reads
+before landing.
 
 Claude runs Codex (gpt-5.6-sol, xhigh):
 
 ```
-git diff origin/main...HEAD | codex exec --model gpt-5.6-sol -c model_reasoning_effort="xhigh" -s read-only --ephemeral "Do a code review of the git diff on stdin. Do not edit files. Return prioritized findings with file/line references where possible." | tee /tmp/codex-review.md
+git show HEAD | codex exec --model gpt-5.6-sol -c model_reasoning_effort="xhigh" -s read-only --ephemeral "Do a code review of the git commit on stdin. Do not edit files. Return prioritized findings with file/line references where possible." | tee /tmp/codex-review.md
 ```
 
 Codex runs Claude (Opus 4.8, xhigh):
 ```
-git diff origin/main...HEAD | claude -p --model opus --effort xhigh "Do a code review of the git diff on stdin. Do not edit files. Return prioritized findings with file/line references where possible." | tee /tmp/claude-review.md
+git show HEAD | claude -p --model opus --effort xhigh "Do a code review of the git commit on stdin. Do not edit files. Return prioritized findings with file/line references where possible." | tee /tmp/claude-review.md
 ``` 
 
 Either acting agent also runs Antigravity (Gemini 3.1 Pro High) as the
 third, shared cross-model reviewer:
 
 ```
-git diff origin/main...HEAD | agy --model "Gemini 3.1 Pro (High)" --mode plan --print-timeout 10m --print "Do a code review of the git diff on stdin. Do not edit files. Return prioritized findings with file/line references where possible." | tee /tmp/agy-review.md
+git show HEAD | agy --model "Gemini 3.1 Pro (High)" --mode plan --print-timeout 10m --print "Do a code review of the git commit on stdin. Do not edit files. Return prioritized findings with file/line references where possible." | tee /tmp/agy-review.md
 ```
 
 Use `--model`/`--effort` for `claude` (effort level `xhigh`); `--model`
 + `-c model_reasoning_effort=…` for `codex`; and `--model`/`--mode
-plan` for `agy`. Summarize the three reviews' findings and your
-follow-ups into the landing commit message — your summary, not the raw
-reviewer output.
+plan` for `agy`.
+
+**The record.** Trailers closing the message, one per reviewer, plus
+what you ran green:
+
+```
+Reviewed-by: subagent/opus-4.8
+Reviewed-by: codex/gpt-5.6-sol
+Reviewed-by: agy/gemini-3.1-pro
+Checks: affected-checks --committed-only (green)
+```
+
+`td-builder ready` requires that shape on every unlanded commit: one
+`subagent/<model>`, an `agy` review (both rosters name it) plus the CLI
+of whichever model is not acting, and a non-empty `Checks:` — a
+docs-only commit included. The trailers are the machine-checkable half
+of the record; the prose summary above them is the half a human reads.
+
+The record must CLOSE the message — it is read as git reads trailers,
+from the last block — so nothing goes below it and no trailer is
+wrapped, though the body around it is still hard-wrapped at 72.
+
+**If a reviewer is unavailable, ASK.** Record the answer you were
+given, and never one you were not:
+
+```
+Review-waiver: agy — CLI unavailable, approved by <who>
+```
+
+A documentation-only commit may waive all three with `Review-waiver:
+docs-only`, as before. `ready` checks that claim against the commit's
+own paths and refuses it if anything but a `*.md` file was touched.
 
 
 # Rust code
@@ -346,22 +427,19 @@ td's Rust is defensive and minimal-surface.
 
 **Commits**
   
-- **Commit messages ARE the durable record.** main is built from squash landings
-  (`git squash-in` composes the squashed commit's body from your branch's commit
-  messages). So put the rationale, the design decisions, the review findings +
-  resolutions, and the verified-red evidence in your commit messages — that is what
-  lands in `git log` on main and what the integrator reads before landing. Nothing
-  else persists (there is no PR description, no webpage); if you want to keep it, it
-  goes in a commit message.
+- **Commit messages ARE the durable record.** main is built by replaying your
+  commits onto it, so the message you write is the message that lands. Put the
+  rationale, the design decisions, the review findings + resolutions, and the
+  verified-red evidence in it — that is what lands in `git log` on main and what
+  the integrator reads before landing. Nothing else persists (there is no PR
+  description, no webpage); if you want to keep it, it goes in a commit message.
 
-- **Put the headline commit FIRST on the branch.** `squash-in` concatenates your
-  commit messages in order, and the FIRST commit's subject becomes the subject
-  of the squashed commit that lands; every later commit's subject is demoted to
-  a line in the body. So a branch that leads with a small preparatory fix lands
-  under that fix's name, and `git log` on main describes the change by its least
-  interesting part — the body is complete, but nobody scanning subjects can
-  tell. Order the branch so the commit naming the whole change comes first, or
-  squash it yourself before pushing so there is only one subject to pick.
+- **Write every commit as the one that lands.** A rebase gives each commit its
+  own subject line on main, so none is demoted into another's body and none
+  inherits a neighbour's name. That cuts both ways: a commit whose subject says
+  "fix review nits" is a permanent row in `git log` on main saying nothing. Amend
+  the increment you are working on until it reads as one complete change, rather
+  than stacking a correction on top of it.
 
 - **Hard-wrap message bodies at 72 columns.** They are read through `git log`,
   which indents them four spaces and does not reflow, so an unwrapped paragraph

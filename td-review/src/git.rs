@@ -8,6 +8,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::record;
+
 /// Field separator for `for-each-ref` formats. Records are newline-separated and
 /// the free-text fields (author, subject) come last, so commit text cannot forge
 /// a row or shift a structural field.
@@ -16,6 +18,16 @@ const FS: char = '\x1f';
 /// A remote's push URL set to this literal means "never push here" — the
 /// convention `git pushall` already honours.
 pub const NO_PUSH: &str = "no_push";
+
+/// The suffix marking a workstream branch that outlives its own landings
+/// (AGENTS.md, "Parallel work"). Landing one does not finish it: the agent
+/// rebases onto the new base and keeps going, so the automatic post-push sweep
+/// must leave it alone even though its commits are provably published.
+pub const ROLLING: &str = "-rolling";
+
+pub fn is_rolling(short: &str) -> bool {
+    short.ends_with(ROLLING)
+}
 
 pub struct Git {
     repo: PathBuf,
@@ -279,6 +291,77 @@ impl Git {
             return Ok(run.stdout);
         }
         Err(io::Error::other(String::from_utf8_lossy(&run.stderr).trim().to_string()))
+    }
+
+    /// Every commit in `range`, with its message and the paths it touches, for
+    /// the review-record scan. Record-separated (`%x1e`) with a field separator
+    /// after the oid and after the body: a message is free text, and nothing
+    /// line-based can delimit it. The encoding is pinned for the same reason
+    /// `message_bytes` pins it — the record is read out of the committed bytes.
+    pub fn commit_records(&self, range: &str) -> io::Result<Vec<record::Commit>> {
+        let out = self.run_ok(&[
+            "-c",
+            "i18n.logOutputEncoding=UTF-8",
+            "log",
+            "--reverse",
+            "--format=%x1e%H%x1f%P%x1f%B%x1f",
+            "--name-only",
+            range,
+            "--",
+        ])?;
+        record::parse_commits(&out).ok_or_else(|| {
+            io::Error::other(format!("{range}: commit log did not parse as records"))
+        })
+    }
+
+    /// Any uncommitted change in another worktree, untracked files included: the
+    /// sweep is about to delete the directory, so "not worth committing" is not
+    /// its call to make.
+    pub fn worktree_dirty(&self, path: &str) -> io::Result<bool> {
+        // `--untracked-files=all` explicitly: `--porcelain` alone obeys
+        // `status.showUntrackedFiles`, and so does `git worktree remove`'s own
+        // dirty check — so under that config BOTH layers go blind at once and
+        // the sweep deletes a directory with somebody's untracked notes in it.
+        Ok(!self
+            .run_ok(&["-C", path, "status", "--porcelain", "--untracked-files=all"])?
+            .trim()
+            .is_empty())
+    }
+
+    /// Commits on `branch` with no equivalent on `base`. `git cherry` compares
+    /// by PATCH, not ancestry, which is what makes it right after a rebase
+    /// landing: the commits that landed have new object ids and would otherwise
+    /// all look unlanded.
+    pub fn unlanded_commits(&self, base: &str, branch: &str) -> io::Result<usize> {
+        // Fully qualified: a TAG sharing the branch's name would otherwise
+        // resolve here, and a worktree judged landed against the wrong object
+        // is a worktree removed with work in it.
+        let base = format!("refs/heads/{base}");
+        let branch = format!("refs/heads/{branch}");
+        let out = self.run_ok(&["cherry", &base, &branch])?;
+        Ok(out.lines().filter(|l| l.starts_with('+')).count())
+    }
+
+    /// Commits on `branch` at all, landed or not. A branch with none has not
+    /// finished — it has not STARTED, and `git cherry` cannot tell those apart:
+    /// both report zero unlanded commits.
+    pub fn commits_over(&self, base: &str, branch: &str) -> io::Result<usize> {
+        let range = format!("refs/heads/{base}..refs/heads/{branch}");
+        Ok(self.run_ok(&["rev-list", "--count", &range])?.trim().parse().unwrap_or(0))
+    }
+
+    /// Remotes that still carry `branch`, by the same split a delete uses — a
+    /// remote whose name contains `/` is not guessed at.
+    pub fn remotes_carrying(&self, branch: &str) -> io::Result<Vec<String>> {
+        let names = self.remote_names()?;
+        let out = self.run_ok(&["for-each-ref", "--format=%(refname:short)", "refs/remotes"])?;
+        Ok(out
+            .lines()
+            .filter_map(|r| {
+                let (remote, short) = split_remote(r.trim(), &names);
+                (short == branch).then(|| remote.map(str::to_string)).flatten()
+            })
+            .collect())
     }
 
     /// Run git, turning a non-zero exit into an `Err` carrying git's own message.

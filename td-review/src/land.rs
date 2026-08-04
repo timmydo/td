@@ -54,6 +54,10 @@ pub struct Preview {
     pub base_oid: String,
     pub merge_base: String,
     pub commits: Vec<String>,
+    /// The same commits with their messages and paths, for the review-record
+    /// scan the pane annotates them with. A replay lands each one, so the
+    /// record is per commit rather than per branch.
+    pub records: Vec<crate::record::Commit>,
     pub message: String,
     pub stat: String,
     pub diff: String,
@@ -108,6 +112,9 @@ pub fn preview(git: &Git, base: &str, branch: &str) -> io::Result<Preview> {
     // The same bytes the landing will commit, decoded only for display: a
     // separate query could show a message the commit does not carry.
     let message = String::from_utf8_lossy(&git.message_bytes(&range)?).into_owned();
+    // Not fatal to the review: an unreadable batch leaves the record UNKNOWN
+    // (the pane compares this against `commits`), rather than refusing the diff.
+    let records = git.commit_records(&range).unwrap_or_default();
 
     // The landing is a three-way squash onto the base, NOT the branch's own
     // diff: with a base-side rename the two name different paths.
@@ -137,7 +144,7 @@ pub fn preview(git: &Git, base: &str, branch: &str) -> io::Result<Preview> {
             )),
         ),
     };
-    Ok(Preview { branch_oid, base_oid, merge_base, commits, message, stat, diff, note })
+    Ok(Preview { branch_oid, base_oid, merge_base, commits, records, message, stat, diff, note })
 }
 
 /// True while the sequencer holds a stopped cherry-pick or revert.
