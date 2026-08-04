@@ -837,9 +837,11 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
     // above there is no target artifact for recipe-checks to link.
     //
     // The only arm that selects NO check target. `cargo-test` is the one gate
-    // whose body names td-review at all: it lints the crate --all-targets, runs
-    // its tests, and asserts its 1-package lock, and the preflight above runs
-    // exactly those legs directly. `check` would add the cheap+heavy pools and
+    // whose body names td-review at all — clippy --all-targets, its tests, and
+    // its 1-package lock — and the preflight above covers all three and then
+    // some: it runs the tests with --include-ignored where the gate runs
+    // --bins, and its lock guard also rejects a `source =` line. Superset, not
+    // equal, and in the safe direction. `check` would add the cheap+heavy pools and
     // build-recipes on top — the source-bootstrap ladder from the stage0 seed,
     // an hour of mes/tcc/gcc that cannot read a host-side crate. Bounded means
     // bounded by what the diff can break; a selection nothing in it inspects is
@@ -1681,24 +1683,24 @@ fn shell_quote(p: &Path) -> Option<String> {
 /// the AGENTS.md dependency-free rule. Both, because they catch different
 /// things: the count catches a new crate, the source line catches a registry
 /// one that a stale count would miss.
-fn assert_dependency_free(root: &Path, lock: &str) -> Result<(), String> {
+fn assert_dependency_free(root: &Path, lock: &str, packages: usize) -> Result<(), String> {
     // An unreadable lock is a failure, not a pass: a guard that answers OK when
     // it cannot see the file is a guard that has silently stopped guarding, and
     // gate 325's `count-line-exact` fails the same way on a missing one.
     let text = std::fs::read_to_string(root.join(lock))
         .map_err(|e| format!("{lock} could not be read: {e}"))?;
-    dependency_free(lock, &text)
+    dependency_free(lock, &text, packages)
 }
 
 /// The check itself, over the lock's TEXT — no filesystem, so its cases are
 /// literals in the test rather than a fixture tree.
-fn dependency_free(lock: &str, text: &str) -> Result<(), String> {
-    let packages = text.lines().filter(|l| l.trim() == "[[package]]").count();
-    if packages != 1 {
+fn dependency_free(lock: &str, text: &str, expected: usize) -> Result<(), String> {
+    let found = text.lines().filter(|l| l.trim() == "[[package]]").count();
+    if found != expected {
         return Err(format!(
-            "{lock} lists {packages} packages, expected exactly 1 (the crate itself) — it \
-             must carry ZERO external crates (AGENTS.md 'Rust code'); adding one is a \
-             reviewed decision"
+            "{lock} lists {found} packages, expected exactly {expected} (its own path \
+             members) — it must carry ZERO external crates (AGENTS.md 'Rust code'); \
+             adding one is a reviewed decision"
         ));
     }
     if text.lines().any(|l| l.trim_start().starts_with("source = \"")) {
@@ -1710,6 +1712,66 @@ fn dependency_free(lock: &str, text: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Every lock this preflight answers for, and the `[[package]]` count it must
+/// carry: the engine workspace's three path members, one apiece for the
+/// standalone crates.
+///
+/// Gate 325 asserts these too, but it degrades to a tolerated Unprovisioned
+/// SKIP on every host today (re #469) and names this preflight the authoritative
+/// enforcement — so in the only tier that executes, this is where the
+/// dependency-free claim is actually checked. `--frozen` does not stand in: it
+/// demands that the committed lock RESOLVE, not that it be empty.
+const DEPENDENCY_FREE_LOCKS: [(&str, usize); 14] = [
+    ("Cargo.lock", 3),
+    ("td-kexec/Cargo.lock", 1),
+    ("td-sh/Cargo.lock", 1),
+    ("td-txt/Cargo.lock", 1),
+    ("td-netd/Cargo.lock", 1),
+    ("td-boot/Cargo.lock", 1),
+    ("td-util/Cargo.lock", 1),
+    ("td-init/Cargo.lock", 1),
+    ("td-firstboot/Cargo.lock", 1),
+    ("td-login/Cargo.lock", 1),
+    ("td-svc/Cargo.lock", 1),
+    ("td-seatd/Cargo.lock", 1),
+    ("td-compositor/Cargo.lock", 1),
+    ("td-review/Cargo.lock", 1),
+];
+
+/// What the `cargo-test` preflight runs, in order. A const so the lock roster
+/// above can be checked against it: a crate tested here whose lock is not
+/// guarded there would be dependency-free by assertion only.
+const CARGO_TEST_CMDS: [&str; 28] = [
+    "cargo test --frozen --workspace",
+    "cargo test --frozen --manifest-path td-kexec/Cargo.toml",
+    "cargo test --frozen --manifest-path td-sh/Cargo.toml",
+    "cargo test --frozen --manifest-path td-txt/Cargo.toml",
+    "cargo test --frozen --manifest-path td-netd/Cargo.toml",
+    "cargo test --frozen --manifest-path td-boot/Cargo.toml",
+    "cargo test --frozen --manifest-path td-util/Cargo.toml",
+    "cargo test --frozen --manifest-path td-init/Cargo.toml",
+    "cargo test --frozen --manifest-path td-firstboot/Cargo.toml",
+    "cargo test --frozen --manifest-path td-login/Cargo.toml",
+    "cargo test --frozen --manifest-path td-svc/Cargo.toml",
+    "cargo test --frozen --manifest-path td-seatd/Cargo.toml",
+    "cargo test --frozen --manifest-path td-compositor/Cargo.toml",
+    "cargo test --frozen --manifest-path td-review/Cargo.toml -- --include-ignored",
+    "cargo clippy --frozen --workspace",
+    "cargo clippy --frozen --manifest-path td-kexec/Cargo.toml",
+    "cargo clippy --frozen --manifest-path td-sh/Cargo.toml",
+    "cargo clippy --frozen --manifest-path td-txt/Cargo.toml",
+    "cargo clippy --frozen --manifest-path td-netd/Cargo.toml",
+    "cargo clippy --frozen --manifest-path td-boot/Cargo.toml",
+    "cargo clippy --frozen --manifest-path td-util/Cargo.toml",
+    "cargo clippy --frozen --manifest-path td-init/Cargo.toml",
+    "cargo clippy --frozen --manifest-path td-firstboot/Cargo.toml --all-targets",
+    "cargo clippy --frozen --manifest-path td-login/Cargo.toml",
+    "cargo clippy --frozen --manifest-path td-svc/Cargo.toml --all-targets",
+    "cargo clippy --frozen --manifest-path td-seatd/Cargo.toml --all-targets",
+    "cargo clippy --frozen --manifest-path td-compositor/Cargo.toml --all-targets",
+    "cargo clippy --frozen --manifest-path td-review/Cargo.toml --all-targets",
+];
+
 fn run_preflight(root: &Path, name: &str) -> i32 {
     match name {
         "shell-syntax" => run_shell(root, "bash -n start tests/*.sh ci/*.sh tools/*.sh"),
@@ -1720,14 +1782,18 @@ fn run_preflight(root: &Path, name: &str) -> i32 {
         // host preflight is the per-PR enforcement in the meantime (review
         // finding: recipes tests + clippy ran in NO automated per-PR tier).
         "cargo-test" => {
-            // td-review is the one path that selects no check target, so gate
-            // 325's lock-shape assertion never runs for it. It runs here
-            // instead: `--frozen` only demands that the committed lock RESOLVE,
-            // so a dependency added to this crate would otherwise reach main
-            // unchallenged, and dependency-free is the whole claim.
-            if let Err(e) = assert_dependency_free(root, "td-review/Cargo.lock") {
-                eprintln!("affected-checks: {e}");
-                return 1;
+            // Before any cargo call, and for EVERY lock rather than only the
+            // crate whose path selected this: gate 325 asserts these, and gate
+            // 325 does not run (see DEPENDENCY_FREE_LOCKS). So a td-sh-only
+            // branch reds here on a td-review lock — deliberate. The claim is
+            // repo-wide, the roster is the same either way, and a guard that
+            // only looks where the diff already pointed is one that never
+            // catches the crate nobody was looking at.
+            for (lock, packages) in DEPENDENCY_FREE_LOCKS {
+                if let Err(e) = assert_dependency_free(root, lock, packages) {
+                    eprintln!("affected-checks: {e}");
+                    return 1;
+                }
             }
             // The target-built guest programs ride the SAME preflight: all are
             // dependency-free pure std, while their static TARGET links ride recipe-checks.
@@ -1743,36 +1809,7 @@ fn run_preflight(root: &Path, name: &str) -> i32 {
             // App-level tests drive a real git repo, are `#[ignore]`d so the
             // git-less sandbox gate stays honest, and run HERE via
             // --include-ignored — this preflight is their only tier.
-            for cmd in [
-                "cargo test --frozen --workspace",
-                "cargo test --frozen --manifest-path td-kexec/Cargo.toml",
-                "cargo test --frozen --manifest-path td-sh/Cargo.toml",
-                "cargo test --frozen --manifest-path td-txt/Cargo.toml",
-                "cargo test --frozen --manifest-path td-netd/Cargo.toml",
-                "cargo test --frozen --manifest-path td-boot/Cargo.toml",
-                "cargo test --frozen --manifest-path td-util/Cargo.toml",
-                "cargo test --frozen --manifest-path td-init/Cargo.toml",
-                "cargo test --frozen --manifest-path td-firstboot/Cargo.toml",
-                "cargo test --frozen --manifest-path td-login/Cargo.toml",
-                "cargo test --frozen --manifest-path td-svc/Cargo.toml",
-                "cargo test --frozen --manifest-path td-seatd/Cargo.toml",
-                "cargo test --frozen --manifest-path td-compositor/Cargo.toml",
-                "cargo test --frozen --manifest-path td-review/Cargo.toml -- --include-ignored",
-                "cargo clippy --frozen --workspace",
-                "cargo clippy --frozen --manifest-path td-kexec/Cargo.toml",
-                "cargo clippy --frozen --manifest-path td-sh/Cargo.toml",
-                "cargo clippy --frozen --manifest-path td-txt/Cargo.toml",
-                "cargo clippy --frozen --manifest-path td-netd/Cargo.toml",
-                "cargo clippy --frozen --manifest-path td-boot/Cargo.toml",
-                "cargo clippy --frozen --manifest-path td-util/Cargo.toml",
-                "cargo clippy --frozen --manifest-path td-init/Cargo.toml",
-                "cargo clippy --frozen --manifest-path td-firstboot/Cargo.toml --all-targets",
-                "cargo clippy --frozen --manifest-path td-login/Cargo.toml",
-                "cargo clippy --frozen --manifest-path td-svc/Cargo.toml --all-targets",
-                "cargo clippy --frozen --manifest-path td-seatd/Cargo.toml --all-targets",
-                "cargo clippy --frozen --manifest-path td-compositor/Cargo.toml --all-targets",
-                "cargo clippy --frozen --manifest-path td-review/Cargo.toml --all-targets",
-            ] {
+            for cmd in CARGO_TEST_CMDS {
                 let code = run_shell(root, cmd);
                 if code != 0 {
                     return code;
@@ -2041,40 +2078,73 @@ mod tests {
         assert!(failures.is_empty(), "self-test failures: {failures:#?}");
     }
 
-    /// td-review selects no check target, so gate 325's lock guard never runs
-    /// for it — this preflight check is the only thing standing between the
-    /// crate and a dependency. It has to red on both shapes.
+    /// Gate 325 asserts these lock shapes and does not run (re #469), so this
+    /// preflight check is what actually stands between the crates and a
+    /// dependency. It has to red on both shapes.
     #[test]
     fn the_dependency_free_guard_reds_on_a_crate_and_on_a_source_line() {
         let lock = "td-review/Cargo.lock";
-        assert!(dependency_free(lock, "[[package]]\nname = \"td-review\"\n").is_ok());
+        assert!(dependency_free(lock, "[[package]]\nname = \"td-review\"\n", 1).is_ok());
         let two = dependency_free(
             lock,
             "[[package]]\nname = \"td-review\"\n\n[[package]]\nname = \"ureq\"\n",
+            1,
         );
         assert!(two.is_err_and(|e| e.contains("lists 2 packages")), "a second crate must red");
         let sourced = dependency_free(
             lock,
             "[[package]]\nname = \"ureq\"\nsource = \"registry+https://example.invalid\"\n",
+            1,
         );
         assert!(
             sourced.is_err_and(|e| e.contains("external `source = `")),
             "a registry crate must red even when the count still reads 1"
         );
-        assert!(dependency_free(lock, "").is_err(), "an empty lock is not a pass");
+        assert!(dependency_free(lock, "", 1).is_err(), "an empty lock is not a pass");
+        // The workspace root carries three path members, and a fourth is the
+        // shape that must red there.
+        let three = "[[package]]\na\n[[package]]\nb\n[[package]]\nc\n";
+        assert!(dependency_free("Cargo.lock", three, 3).is_ok());
+        assert!(dependency_free("Cargo.lock", three, 1).is_err());
 
-        // The committed lock against the real guard, including the read — but
+        // Every roster entry against the real guard, including the read — but
         // only from the full checkout: the td-builder package build ships
-        // `builder/` alone and has no td-review/ to read.
+        // `builder/` alone and has no sibling crates to read.
         let root = repo_root();
         if repo_tree_present(&root) {
+            for (lock, packages) in DEPENDENCY_FREE_LOCKS {
+                assert!(
+                    assert_dependency_free(&root, lock, packages).is_ok(),
+                    "the committed {lock} must pass its own guard"
+                );
+            }
             assert!(
-                assert_dependency_free(&root, lock).is_ok(),
-                "the committed lock must pass its own guard"
-            );
-            assert!(
-                assert_dependency_free(&root, "td-review/nope.lock").is_err(),
+                assert_dependency_free(&root, "td-review/nope.lock", 1).is_err(),
                 "an unreadable lock reds rather than passing"
+            );
+        }
+    }
+
+    /// The roster and the command list are two hand-written copies of the same
+    /// crate set. A crate tested by the preflight whose lock is not guarded
+    /// would be dependency-free by assertion only — which is how gate 325's own
+    /// hand-written list would drift too.
+    #[test]
+    fn every_crate_the_preflight_tests_has_its_lock_guarded() {
+        for cmd in CARGO_TEST_CMDS {
+            let Some(rest) = cmd.split("--manifest-path ").nth(1) else {
+                // `--workspace`: the root lock, which the roster carries.
+                assert!(
+                    DEPENDENCY_FREE_LOCKS.iter().any(|(l, _)| *l == "Cargo.lock"),
+                    "the workspace lock must be guarded"
+                );
+                continue;
+            };
+            let Some(krate) = rest.split('/').next() else { continue };
+            let lock = format!("{krate}/Cargo.lock");
+            assert!(
+                DEPENDENCY_FREE_LOCKS.iter().any(|(l, _)| *l == lock),
+                "{cmd}: {lock} is not in DEPENDENCY_FREE_LOCKS"
             );
         }
     }
