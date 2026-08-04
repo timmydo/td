@@ -1452,8 +1452,8 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
     assert_preflight!("td-compositor/src/keys.rs", "cargo-test");
     assert_target!("td-compositor/src/font.rs", "recipe-checks");
     assert_preflight!("td-compositor/src/font.rs", "cargo-test");
-    assert_target!("td-compositor/assets/unifont-16.0.04-8x16.psf2", "recipe-checks");
-    assert_preflight!("td-compositor/assets/unifont-16.0.04-8x16.psf2", "cargo-test");
+    assert_target!("td-compositor/src/font_data.rs", "recipe-checks");
+    assert_preflight!("td-compositor/src/font_data.rs", "cargo-test");
     assert_target!("td-compositor/tools/import-unifont.rs", "recipe-checks");
     assert_preflight!("td-compositor/tools/import-unifont.rs", "cargo-test");
     assert_target!("td-compositor/src/pty.rs", "recipe-checks");

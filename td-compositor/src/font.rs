@@ -4,10 +4,28 @@
 
 use std::collections::BTreeMap;
 
-/// The committed asset. Bytes, not a path: section 11 requires host tests and
-/// the target recipe to consume the same face, with no host font lookup.
+/// The committed face, decoded from the generated hex module. Hex text rather
+/// than a binary beside the sources because the target recipe stages modules
+/// through `Step::WriteFile`, whose content is a `String`; an `include_bytes!`
+/// of an unstaged asset compiles on the host and fails in the target build.
 #[allow(dead_code)]
-pub const UNIFONT: &[u8] = include_bytes!("../assets/unifont-16.0.04-8x16.psf2");
+pub fn pinned() -> Result<Font, String> {
+    Font::parse(&decode_hex(crate::font_data::UNIFONT_HEX)?)
+}
+
+#[allow(dead_code)]
+fn decode_hex(hex: &str) -> Result<Vec<u8>, String> {
+    let bytes = hex.as_bytes();
+    if !bytes.len().is_multiple_of(2) {
+        return Err("font hex has an odd length".to_string());
+    }
+    let mut out = Vec::with_capacity(bytes.len() / 2);
+    for pair in bytes.chunks(2) {
+        let text = std::str::from_utf8(pair).map_err(|_| "font hex is not ASCII".to_string())?;
+        out.push(u8::from_str_radix(text, 16).map_err(|_| format!("font hex '{text}'"))?);
+    }
+    Ok(out)
+}
 
 #[allow(dead_code)]
 const MAGIC: [u8; 4] = [0x72, 0xb5, 0x4a, 0x86];
@@ -263,7 +281,7 @@ mod tests {
     use super::*;
 
     fn unifont() -> Font {
-        Font::parse(UNIFONT).unwrap()
+        pinned().unwrap()
     }
 
     #[test]
@@ -271,7 +289,10 @@ mod tests {
         let font = unifont();
         assert_eq!((font.width(), font.height()), (8, 16));
         assert_eq!(font.glyph_count(), 20673);
-        assert_eq!(UNIFONT.len(), 422_671);
+        let face = decode_hex(crate::font_data::UNIFONT_HEX).unwrap();
+        assert_eq!(face.len(), 422_671);
+        assert!(decode_hex("0").is_err());
+        assert!(decode_hex("zz").is_err());
     }
 
     #[test]

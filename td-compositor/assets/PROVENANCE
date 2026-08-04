@@ -1,7 +1,13 @@
 GNU Unifont 16.0.04, single-width PSF2 face
 ===========================================
 
-unifont-16.0.04-8x16.psf2 is not an upstream file. Upstream publishes no
+The face ships as src/font_data.rs, a generated module of hex text, not as a
+.psf2 file: the target recipe stages module sources through Step::WriteFile,
+whose content is a String, so a binary beside them has nothing to carry it and
+an include_bytes! of one fails in the target build while every host test still
+passes. The hex decodes to exactly the PSF2 whose digest is recorded below.
+
+That PSF2 is not an upstream file. Upstream publishes no
 full-coverage PSF2 -- its only PSF is Unifont-APL8x16-16.0.04.psf.gz, which is
 PSF1 (magic 0x0436) and covers APL alone. This face is derived from the
 upstream .hex release by td-compositor/tools/import-unifont.rs, which pins the
@@ -12,7 +18,9 @@ input by hash and is what makes the derivation reproducible.
   input URL          https://ftp.gnu.org/gnu/unifont/unifont-16.0.04/unifont_all-16.0.04.hex.gz
   input sha256       20e8b505f602488697979eefc69857f7f6106bceab702f5ac559f4f84e0e7494
   decompressed hex   730472c02a75c8c7dd6e6a089d8d10f32c32b99f465f43d9992d8b12c4af640b
-  derived asset      64019ab811067e03a8de5990d2e6f23dcec5418e5a90caa5e5666b0524156732
+  derived asset      unifont-16.0.04-8x16.psf2
+  asset sha256       64019ab811067e03a8de5990d2e6f23dcec5418e5a90caa5e5666b0524156732
+  committed as       ../src/font_data.rs (that PSF2, hex-encoded)
   glyphs             20673 single-width, 8x16, with a PSF2 Unicode table
 
   source tarball     https://ftp.gnu.org/gnu/unifont/unifont-16.0.04/unifont-16.0.04.tar.gz
@@ -25,7 +33,7 @@ Reproduce with:
   curl -O https://ftp.gnu.org/gnu/unifont/unifont-16.0.04/unifont_all-16.0.04.hex.gz
   gunzip unifont_all-16.0.04.hex.gz
   cargo run --manifest-path td-compositor/Cargo.toml \
-      --bin td-term-import-unifont -- unifont_all-16.0.04.hex td-compositor/assets
+      --bin td-term-import-unifont -- unifont_all-16.0.04.hex td-compositor/src
 
 License
 -------

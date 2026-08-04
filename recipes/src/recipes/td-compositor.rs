@@ -9,6 +9,10 @@ const MODULES: &[(&str, &str)] = &[
     ),
     ("font", include_str!("../../../td-compositor/src/font.rs")),
     (
+        "font_data",
+        include_str!("../../../td-compositor/src/font_data.rs"),
+    ),
+    (
         "framebuffer",
         include_str!("../../../td-compositor/src/framebuffer.rs"),
     ),

@@ -3,6 +3,7 @@
 mod client;
 mod configure;
 mod font;
+mod font_data;
 mod framebuffer;
 mod input;
 mod keyboard;
@@ -303,6 +304,7 @@ mod confinement {
         ("client.rs", include_str!("client.rs")),
         ("configure.rs", include_str!("configure.rs")),
         ("font.rs", include_str!("font.rs")),
+        ("font_data.rs", include_str!("font_data.rs")),
         ("framebuffer.rs", include_str!("framebuffer.rs")),
         ("input.rs", include_str!("input.rs")),
         ("keyboard.rs", include_str!("keyboard.rs")),
