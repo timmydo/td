@@ -33,9 +33,9 @@ const BOOT_FAIL_PARKED: &str = "td-boot-parked-v1";
 //   boot/{selector-initramfs.cpio,manifest}
 //   deployment/{bzImage,initramfs.cpio,root.erofs,manifest}
 //
-// The direct-boot selector initramfs carries static busybox, td-init (for the
-// mount pair), td-boot, and td-kexec; it has no branch that can enter a
-// deployment directly, because it links no `/bin/switch_root`. It verifies
+// The direct-boot selector initramfs carries td-sh (the shell), td-init (for
+// the mount pair), td-boot, td-util and td-kexec; it has no branch that can
+// enter a deployment directly, because it links no `/bin/switch_root`. It verifies
 // current/previous from the Btrfs volume and kexecs the selected deployment.
 // That deployment's distinct initramfs requires the td.deployment handoff,
 // re-verifies root.erofs, binds it to a read-only loop device, mounts @var from
@@ -43,9 +43,9 @@ const BOOT_FAIL_PARKED: &str = "td-boot-parked-v1";
 // reviewed symlink per mutable file out to writable state (the `MUTABLE_ETC` table
 // below) rather than an overlay — so the read-only-`/etc` assertion survives while
 // per-machine identity still persists; `/home` and `/root` are root-image symlinks
-// into `/var`. The real root is
-// the store-native real root (busybox, uutils, ripgrep, and fd at their /td/store
-// paths, a /bin symlink farm, and generated /etc). The typed PackErofs step invokes
+// into `/var`. The real root is store-native: busybox for getty, uutils, ripgrep,
+// and fd at their /td/store paths, a /bin symlink farm, and generated /etc. The
+// typed PackErofs step invokes
 // the dependency-free control-plane image writer directly; no recipe process can
 // execute td-builder through PATH or argv. Strict manifests separately hash the
 // selector and the three deployment payloads.
@@ -60,10 +60,11 @@ const BOOT_FAIL_PARKED: &str = "td-boot-parked-v1";
 //
 // Userland strategy (v0): the static Rust td-init multicall provides the boot
 // glue — PID 1, the pivot, and every mount/umount on the machine — the static
-// Rust td-login serves the credential switch (/bin/{login,su}) and td-util the
-// diagnostics, while static busybox provides the shell, the tty setup and the
-// text tools uutils lacks; source-built Rust uutils provides the interactive
-// core file/text userland with its declared glibc runtime closure.
+// Rust td-login serves the credential switch (/bin/{login,su}), td-util the
+// diagnostics, td-sh the shell (/bin/{sh,ash}) and td-txt the text tools uutils
+// lacks, while static busybox provides only the tty setup (`getty`);
+// source-built Rust uutils provides the interactive core file/text userland
+// with its declared glibc runtime closure.
 
 //
 // Layout: the image is STORE-NATIVE. The busybox binary is packed at its
@@ -187,8 +188,10 @@ const UI_UID: u32 = 1000;
 const UI_GID: u32 = 1000;
 // ────────────────────────────────────────────────────────────────────────────────
 
-/// The real-root `/bin` is a symlink farm split across SIX multicall binaries, each
-/// dispatching on argv[0]'s basename: the static **busybox** (the shell and the tty glue),
+/// The real-root `/bin` is a symlink farm split across SEVEN binaries, each
+/// dispatching on argv[0]'s basename except td-sh, which answers to both its names
+/// with one program: the static **busybox** (the tty glue, and only that since the
+/// td-sh flip), the static Rust **td-sh** (the shell — see `TD_SH_APPLETS`),
 /// the static Rust **td-init** (the boot glue — see `TD_INIT_FARM`), the static Rust
 /// **td-login** (the credential switch — see `TD_LOGIN_APPLETS`), the static Rust
 /// **td-txt** (grep/sed — see `TD_TXT_APPLETS`), the static Rust **td-util**
@@ -196,9 +199,10 @@ const UI_GID: u32 = 1000;
 /// (the core file/text userland — #547's cutover). A name goes in exactly one list;
 /// `shape_check` asserts the owning binary actually provides it.
 ///
-/// BUSYBOX now keeps only what no Rust multicall serves: the shell (`sh`/`ash`) and
-/// `getty` (the tty setup half of the login chain — `login`/`su` moved to td-login).
-/// Those are the last two, and only `sh` and `getty` have a call site at all.
+/// BUSYBOX now keeps ONE name: `getty`, the tty setup half of the login chain
+/// (`login`/`su` moved to td-login, `sh`/`ash` to td-sh). It is the last, and the
+/// only remaining reason the multicall is packed into the real root at all — it is
+/// in neither initramfs.
 ///
 /// `grep`/`sed` LEFT this list for td-txt (see `TD_TXT_APPLETS`) once the conformance corpus
 /// covered the shapes the image's own scripts use — which is also why those scripts stopped
@@ -225,7 +229,25 @@ const UI_GID: u32 = 1000;
 /// `losetup` with the `LOOP_SET_FD` one. Those three were the boot-path jobs needing a
 /// syscall no safe `std` reaches, which is what a 1 MiB C multicall was being carried for;
 /// what busybox still serves here is ordinary userland.
-const BUSYBOX_APPLETS: &[&str] = &["sh", "ash", "getty"];
+const BUSYBOX_APPLETS: &[&str] = &["getty"];
+
+/// The shell, served by the static td-sh binary — the `sh` and `ash` busybox used to
+/// own. NOT a multicall: td-sh is one program and both names run it, so unlike the
+/// three farms above there is no `--list` to probe. What `shape_check` probes instead
+/// is BEHAVIOUR, because a shell that dispatches is not the question — a shell that
+/// runs the image's own scripts is, and every one of them is interpreted by this
+/// binary from the first line of `/init` onward.
+///
+/// `ash` is here because it is the name busybox answered to and scripts may still
+/// spell; it runs the same binary, which is what makes the two indistinguishable
+/// rather than merely both present.
+///
+/// `sh` was the last THIRD-PARTY program either initramfs ran, and its leaving
+/// busybox is what empties `INITRAMFS_APPLETS`: the multicall goes with it, so
+/// nothing in either archive is a program td did not build. The real root is not
+/// that claim — `getty` is still busybox's — which is why this one is about the
+/// archives.
+const TD_SH_APPLETS: &[&str] = &["sh", "ash"];
 
 /// The text userland, served by the static td-txt multicall — the `grep` and `sed` busybox
 /// used to own, because uutils ships neither. Like every other farm here it dispatches on
@@ -504,13 +526,14 @@ fn td_init_probe(applet: &str, probe: &Probe, sys: &SystemDef) -> String {
     }
 }
 
-/// Applets still reached through the packed BusyBox multicall as `/bin/busybox <applet>`.
-/// They must EXIST in busybox, so `shape_check` probes them against `busybox --list` like
-/// the farm names; otherwise a config drift breaks sysinit with no build-time signal.
-/// Unlike the three /bin farms this is deliberately NOT disjoint from BUSYBOX_APPLETS.
-/// `script_applets_are_covered` derives it from the script text both ways, so neither an
-/// uncovered call nor a stale entry survives; td-boot's own invocations are justified by
-/// its protocol constant.
+/// Applets reached through the packed BusyBox multicall as `/bin/busybox <applet>`,
+/// which is now NONE of them — see the closing paragraph for what an empty list is
+/// claiming. While it had entries they had to EXIST in busybox, so `shape_check`
+/// swept them against `busybox --list` the way it sweeps the farm names; that sweep
+/// is emitted only while there is something to sweep, so it is no longer emitted at
+/// all. Unlike the /bin farms this was deliberately NOT disjoint from
+/// BUSYBOX_APPLETS, since a multiplexed call and a `/bin` symlink can name the same
+/// applet.
 ///
 /// The ten that LEFT — cat, chmod, chown, ln, mkdir, printf, readlink, rm, sleep, test —
 /// are td-util applets now, and `sync` is td-init's. All eleven were reached here rather
@@ -525,9 +548,18 @@ fn td_init_probe(applet: &str, probe: &Probe, sys: &SystemDef) -> String {
 ///
 /// `mknod` left with td-init's tenth syscall — the amendment that also gave the
 /// crate one `dev_t` packing instead of two, and a readback that unlinks a node
-/// the kernel disagrees about. What remains is `sh`: the /init and /etc script
-/// interpreter, until td-sh ships.
-const INITRAMFS_APPLETS: &[&str] = &["sh"];
+/// the kernel disagrees about.
+///
+/// `sh` was the last, and it left with td-sh: the four `/bin/busybox sh -c`
+/// call sites this list existed for were spelled that way because busybox had
+/// `umask` and td-sh did not, which stopped being true when `umask(2)` entered
+/// td-sh's confined surface. They are `/bin/sh -c` now, so the list is EMPTY —
+/// and an empty one is the claim it looks like: no generated script and no td
+/// program reaches the busybox multiplexer for anything. That is held by a BAN
+/// rather than by coverage now — `no_generated_script_invokes_the_busybox_multiplexer`
+/// refuses the token anywhere in a generated script, so a re-added call reds the
+/// build rather than quietly reviving the dependency.
+const INITRAMFS_APPLETS: &[&str] = &[];
 
 /// The diagnostics userland, served by the static td-util multicall — the busybox names
 /// uutils does not provide. Like busybox and uutils it dispatches on argv[0]'s basename, so
@@ -1028,7 +1060,7 @@ fn build_deployment_init(sys: &SystemDef) -> String {
         }
     }
     init.push_str(
-        "\n/bin/busybox sh -c 'umask 077; /bin/td-util mkdir -p /sysroot/var/root'\n\
+        "\n/bin/sh -c 'umask 077; /bin/td-util mkdir -p /sysroot/var/root'\n\
          /bin/td-util rm -rf /sysroot/var/run\n\
          /bin/td-util ln -s /run /sysroot/var/run\n\
          /bin/td-util chown 0:0 /sysroot/var /sysroot/var/log /sysroot/var/home /sysroot/var/root\n\
@@ -1129,10 +1161,10 @@ fn build_rootcheck(sys: &SystemDef) -> String {
             // and a mode-bits answer would read root's own bit on 0755 `/var` and
             // report success for a system that had failed. Each attempt runs in a
             // CHILD shell because ash exits a non-interactive shell when a special
-            // builtin's redirection fails (the /etc probe below documents the same
-            // constraint; it spells the shell `/bin/busybox sh` where this spells it
-            // `/bin/sh` — the same static binary today, and the spelling that follows
-            // `sh` wherever it goes next).
+            // builtin's redirection fails, and td-sh keeps that behaviour (the /etc
+            // probe below is the same constraint). Both spell it `/bin/sh` now: the
+            // multiplexed `busybox sh` spelling left with the flip, and there is no
+            // second shell left for the two to disagree about.
             //
             // Root clears the probe files on BOTH sides, and the pre-clear is
             // load-bearing: a stale root-owned `/var/.tdwr-su` makes the unprivileged
@@ -1162,7 +1194,7 @@ fn build_rootcheck(sys: &SystemDef) -> String {
     // child shell: ash exits a non-interactive shell when a special builtin redirection
     // fails, instead of returning control to the parent `if`.
     s.push_str(&format!(
-        "if /bin/busybox sh -c ': > /etc/.tdwr' 2>/dev/null; then /bin/td-util rm -f /etc/.tdwr; ok=0; else echo {SYSTEM_ETC_RO_MARKER}; fi\n"
+        "if /bin/sh -c ': > /etc/.tdwr' 2>/dev/null; then /bin/td-util rm -f /etc/.tdwr; ok=0; else echo {SYSTEM_ETC_RO_MARKER}; fi\n"
     ));
     // State is the persistent Btrfs @var subvolume; only run/tmp are volatile.
     // Homes remain stable paths through immutable symlinks into /var.
@@ -1222,7 +1254,7 @@ fn build_rootcheck(sys: &SystemDef) -> String {
     }
     s.push_str(&format!(
         "for d in {probe_paths}; do \
-         if /bin/busybox sh -c ': > \"$1/.tdwr\"' td-probe \"$d\" 2>/dev/null; then /bin/td-util rm -f \"$d/.tdwr\"; else ok=0; fi; \
+         if /bin/sh -c ': > \"$1/.tdwr\"' td-probe \"$d\" 2>/dev/null; then /bin/td-util rm -f \"$d/.tdwr\"; else ok=0; fi; \
          done\n"
     ));
     if let Some(user) = sys.users.iter().find(|user| user.name == sys.autologin) {
@@ -1588,7 +1620,7 @@ fn build_bootfail() -> String {
 }
 
 fn build_profile(sys: &SystemDef) -> String {
-    // The login shell (busybox ash, invoked as `-sh` by td-login) sources this. We print
+    // The login shell (td-sh, invoked as `-sh` by td-login) sources this. We print
     // the banner HERE via a literal here-doc rather than leaning on a `login` motd feature
     // — td-login has none, by design: printing files at a console is not the job of the
     // program that hands out credentials — and set a sane PATH/PS1.
@@ -1601,7 +1633,7 @@ fn build_profile(sys: &SystemDef) -> String {
     s.push_str("export PS1='\\u@\\h:\\w\\$ '\n");
     s.push_str(&format!(
         "if /bin/grep -q -F '{BOOT_FAIL_TARGET_CMDLINE_TOKEN}' /proc/cmdline; then \
-         exec /bin/busybox sh -c 'cd / \
+         exec /bin/sh -c 'cd / \
          || exit 1; \
          if ! /bin/td-util printf \"%s\\n\" {BOOT_FAIL_PARKED} > /run/td-boot-parked; then \
          echo \"td-boot: could not park greeter\" >&2; fi; \
@@ -1893,14 +1925,18 @@ fn build_initramfs_spec(init: &str, phase: Phase) -> String {
         s.push_str(&format!("dir {d} 0755 0 0\n"));
     }
     s.push_str("dir /volume 0700 0 0\n");
-    // The static busybox at its content-addressed /td/store path; the cpio's /bin/busybox
-    // and /bin/sh symlinks (all the stage-1 script needs) point straight at it.
-    s.push_str("dir {in:busybox-x86-64} 0755 0 0\n");
-    s.push_str("dir {in:busybox-x86-64}/bin 0755 0 0\n");
-    s.push_str("file {in:busybox-x86-64}/bin/busybox {in:busybox-x86-64}/bin/busybox 0755 0 0\n");
+    // The shell, at its content-addressed /td/store path, with the cpio's /bin/sh
+    // pointing straight at it. This is td-sh, and busybox is NOT HERE: it was packed
+    // into both initramfs images for this one symlink, so the flip does not merely
+    // repoint /bin/sh, it takes the third-party multicall out of the boot path
+    // altogether. td-sh is a static ET_EXEC with an empty runtime closure, which is
+    // what lets it run here — nothing has mounted the real root yet, so a
+    // dynamically-linked shell would be a kernel panic rather than a degraded boot.
+    s.push_str("dir {in:td-sh} 0755 0 0\n");
+    s.push_str("dir {in:td-sh}/bin 0755 0 0\n");
+    s.push_str("file {in:td-sh}/bin/td-sh {in:td-sh}/bin/td-sh 0755 0 0\n");
     s.push_str("dir /bin 0755 0 0\n");
-    s.push_str("slink /bin/busybox {in:busybox-x86-64}/bin/busybox 0777 0 0\n");
-    s.push_str("slink /bin/sh {in:busybox-x86-64}/bin/busybox 0777 0 0\n");
+    s.push_str("slink /bin/sh {in:td-sh}/bin/td-sh 0777 0 0\n");
     s.push_str("dir {in:td-boot} 0755 0 0\n");
     s.push_str("dir {in:td-boot}/bin 0755 0 0\n");
     s.push_str("file {in:td-boot}/bin/td-boot {in:td-boot}/bin/td-boot 0755 0 0\n");
@@ -1951,10 +1987,11 @@ fn build_initramfs_spec(init: &str, phase: Phase) -> String {
 }
 
 /// Stage the REAL ROOT tree under `{root}/real-root` build scratch. The typed
-/// PackErofs step later packs it into the deployment output. Uses typed steps (no shell): the busybox
-/// package is copied to its /td/store path, /bin is a symlink farm into it, /init is a
-/// symlink to busybox, /etc holds the generated config, and the pseudo-fs + writable
-/// mountpoint dirs are created empty (stage-1/init mount over them). `/home` and `/root`
+/// PackErofs step later packs it into the deployment output. Uses typed steps (no shell): each
+/// packaged multicall is copied to its /td/store path, /bin is a symlink farm into them
+/// (the shell resolving to td-sh), /init is a symlink to td-init, /etc holds the generated
+/// config, and the pseudo-fs + writable mountpoint dirs are created empty
+/// (stage-1/init mount over them). `/home` and `/root`
 /// are immutable symlinks into the writable `/var` mount; per-user ownership is fixed at
 /// boot by `/etc/rootcheck`.
 fn real_root_steps(sys: &SystemDef) -> Vec<Step> {
@@ -2018,6 +2055,10 @@ fn real_root_steps(sys: &SystemDef) -> Vec<Step> {
         from: "{in:td-txt}".into(),
         dest: "{root}/real-root{in:td-txt}".into(),
     });
+    steps.push(Step::CopyTree {
+        from: "{in:td-sh}".into(),
+        dest: "{root}/real-root{in:td-sh}".into(),
+    });
     // td-init likewise — and here the empty closure is load-bearing rather than merely
     // convenient: this same binary is /init (PID 1) and the initramfs pivot, both of which
     // run where no dynamic loader is reachable.
@@ -2079,6 +2120,15 @@ fn real_root_steps(sys: &SystemDef) -> Vec<Step> {
     for app in BUSYBOX_APPLETS {
         steps.push(Step::Symlink {
             target: "{in:busybox-x86-64}/bin/busybox".into(),
+            link: format!("{{root}}/real-root/bin/{app}"),
+        });
+    }
+    // The shell. Two names, ONE static binary — td-sh is not a multicall and does not
+    // dispatch on argv[0]; `ash` runs the same program `sh` does, which is what makes a
+    // script that spells either one get the same shell.
+    for app in TD_SH_APPLETS {
+        steps.push(Step::Symlink {
+            target: "{in:td-sh}/bin/td-sh".into(),
             link: format!("{{root}}/real-root/bin/{app}"),
         });
     }
@@ -2227,14 +2277,23 @@ fn real_root_steps(sys: &SystemDef) -> Vec<Step> {
     steps
 }
 
+/// The `INITRAMFS_APPLETS` coverage sweep, spliced into `shape_check` only when
+/// that list has something in it. It asks busybox whether it implements each
+/// applet a generated script invokes through the multiplexer; with the list
+/// empty there is no such script, and an emitted `for a in ; do ... done` would
+/// be a guard-shaped no-op sitting in the middle of the real ones.
+const INITRAMFS_APPLET_SWEEP: &str = "for a in @APPLETS@; do printf '%s\\n' \"$applets\" | grep -q -x -F \"$a\" || { echo \"busybox does not implement multiplexed applet '$a' (config drift) - a generated script or td-boot invokes it as 'busybox $a'\" >&2; exit 1; }; done; ";
+
 /// A producer-rung shape check on the deployment bundle and staged real-root
-/// scratch tree. For the cpio: real newc magic, a size floor (static busybox alone is ~1 MiB), a
-/// `busybox cpio -t` parse, the members that make it bootable (incl. the /init pivot
-/// script), and the busybox binary under /td/store. For the root tree: /init and /bin/sh
+/// scratch tree. For the cpio: real newc magic, a size floor (the static shell alone is
+/// larger), a `busybox cpio -t` parse (the HOST's, as a build tool), the members that make
+/// it bootable (incl. the /init pivot script), and each packed binary under /td/store —
+/// busybox is in neither archive since the td-sh flip. For the root tree: /init and /bin/sh
 /// are symlinks into /td/store, the key /etc files exist, and the busybox binary is
 /// packed under /td/store. AND that busybox actually implements EVERY BUSYBOX_APPLETS
-/// entry (incl. `switch_root`) — a config drift or tailoring typo that dropped/misnamed
-/// an applet would leave a dead /bin symlink the member checks alone can't catch. For the
+/// entry, which since the flip is `getty` alone — a config drift or tailoring typo that
+/// dropped/misnamed it would leave a dead /bin symlink the member checks alone can't
+/// catch, and a getty respawn loop with it. For the
 /// uutils farm: the `coreutils` multicall is staged and every UUTILS_APPLETS /bin symlink
 /// exists. Its transitive store closure is enforced and staged by `StageRuntimeClosure`.
 /// All strings are ASCII (td-builder's config reader is Latin-1).
@@ -2253,14 +2312,14 @@ fn shape_check() -> String {
     "selector='{out}/boot/selector-initramfs.cpio'; selector_manifest='{out}/boot/manifest'; init='{out}/deployment/initramfs.cpio'; root='{root}/real-root'; disk='{out}/deployment/root.erofs'; manifest='{out}/deployment/manifest'; bb='{in:busybox-x86-64}/bin/busybox'; \
      for archive in \"$selector\" \"$init\"; do \
          sz=$(wc -c < \"$archive\"); \
-         [ \"$sz\" -ge 65536 ] || { echo \"initramfs $archive: implausibly small ($sz bytes) - the static busybox alone is ~1 MiB\" >&2; exit 1; }; \
+         [ \"$sz\" -ge 65536 ] || { echo \"initramfs $archive: implausibly small ($sz bytes) - the static shell alone is larger\" >&2; exit 1; }; \
          set -- $(od -An -tx1 -N 6 \"$archive\"); \
          [ \"$1$2$3$4$5$6\" = 303730373031 ] || { echo \"initramfs $archive: missing the newc cpio magic 070701\" >&2; exit 1; }; \
          \"$bb\" cpio -t < \"$archive\" >/dev/null 2>&1 || { echo \"initramfs $archive: busybox cpio -t could not parse the archive\" >&2; exit 1; }; \
      done; \
      selector_list=$(\"$bb\" cpio -t < \"$selector\" 2>/dev/null); \
      init_list=$(\"$bb\" cpio -t < \"$init\" 2>/dev/null); \
-     for m in init bin/busybox bin/sh bin/td-boot bin/mount bin/umount bin/td-util dev/console proc run volume sysroot; do \
+     for m in init bin/sh bin/td-boot bin/mount bin/umount bin/td-util dev/console proc run volume sysroot; do \
          printf '%s\\n' \"$selector_list\" | grep -q -x -F \"$m\" || { echo \"selector initramfs: cpio member '$m' missing\" >&2; exit 1; }; \
          printf '%s\\n' \"$init_list\" | grep -q -x -F \"$m\" || { echo \"deployment initramfs: cpio member '$m' missing\" >&2; exit 1; }; \
      done; \
@@ -2280,8 +2339,8 @@ fn shape_check() -> String {
      [ \"$(wc -l < \"$selector_manifest\")\" -eq 2 ] || { echo 'selector manifest: expected header plus one payload entry' >&2; exit 1; }; \
      [ \"$(head -n 1 \"$selector_manifest\")\" = td-deployment-v1 ] || { echo 'selector manifest: unsupported header' >&2; exit 1; }; \
      grep -q -E '^[0-9a-f]{64}  selector-initramfs\\.cpio$' \"$selector_manifest\" || { echo 'selector manifest: missing strict SHA-256 entry' >&2; exit 1; }; \
-     printf '%s\\n' \"$selector_list\" | grep -qE '^td/store/[^/]+/bin/busybox$' || { echo 'selector initramfs: busybox store member missing' >&2; exit 1; }; \
-     printf '%s\\n' \"$init_list\" | grep -qE '^td/store/[^/]+/bin/busybox$' || { echo 'deployment initramfs: busybox store member missing' >&2; exit 1; }; \
+     printf '%s\\n' \"$selector_list\" | grep -qE '^td/store/[^/]+/bin/td-sh$' || { echo 'selector initramfs: the shell store member is missing - /bin/sh would dangle and the kernel could not run /init' >&2; exit 1; }; \
+     printf '%s\\n' \"$init_list\" | grep -qE '^td/store/[^/]+/bin/td-sh$' || { echo 'deployment initramfs: the shell store member is missing - /bin/sh would dangle and the kernel could not run /init' >&2; exit 1; }; \
      [ -f \"$root/init\" ] || [ -L \"$root/init\" ] || { echo 'root tree: /init missing' >&2; exit 1; }; \
      case $(readlink \"$root/init\") in /td/store/*) : ;; *) echo 'root tree: /init is not a symlink into /td/store' >&2; exit 1;; esac; \
      case $(readlink \"$root/bin/sh\") in /td/store/*) : ;; *) echo 'root tree: /bin/sh is not a symlink into /td/store - the store-native /bin farm regressed' >&2; exit 1;; esac; \
@@ -2341,6 +2400,16 @@ fn shape_check() -> String {
          [ \"$(readlink \"$root/bin/$a\" 2>/dev/null)\" = \"$tditgt\" ] || { echo \"root tree: /bin/$a is not a symlink to the staged td-init multicall ($tditgt) - the boot-glue /bin farm regressed\" >&2; exit 1; }; \
          printf '%s\\n' \"$tdilist\" | grep -q -x -F \"$a\" || { echo \"td-init does not serve applet '$a' - its packed /bin/$a symlink would dispatch to nothing (usage, exit 2)\" >&2; exit 1; }; \
      done; \
+     tsh=\"{root}/real-root{in:td-sh}/bin/td-sh\"; tshtgt=\"{in:td-sh}/bin/td-sh\"; { [ -f \"$tsh\" ] && [ -x \"$tsh\" ]; } || { echo 'root tree: the td-sh binary is not packed/executable at real-root{in:td-sh}/bin/td-sh - /bin/sh would dangle and NOTHING on the boot path would run, since every /init and /etc script is interpreted by it' >&2; exit 1; }; \
+     for a in @TD_SH_APPLETS@; do \
+         [ \"$(readlink \"$root/bin/$a\" 2>/dev/null)\" = \"$tshtgt\" ] || { echo \"root tree: /bin/$a is not a symlink to the staged shell ($tshtgt) - the td-sh /bin farm regressed\" >&2; exit 1; }; \
+     done; \
+     [ \"$(\"$tsh\" -c 'echo TD-SH-OK')\" = TD-SH-OK ] || { echo 'td-sh: the packed shell did not run the simplest possible command' >&2; exit 1; }; \
+     [ \"$(\"$tsh\" -c 'x=1; for i in a b c; do x=\"$x$i\"; done; echo \"$x\"')\" = 1abc ] || { echo 'td-sh: the packed shell miscomputed a loop with assignment and expansion - the shape every generated script is built out of' >&2; exit 1; }; \
+     [ \"$(\"$tsh\" -c 'if [ -d / ]; then echo yes; else echo no; fi')\" = yes ] || { echo 'td-sh: the packed shell got a test/if wrong' >&2; exit 1; }; \
+     [ \"$(\"$tsh\" -c 'umask 077; umask')\" = 0077 ] || { echo 'td-sh: the packed shell cannot set and report a umask - the /init line that used to spell this `busybox sh -c` depends on it' >&2; exit 1; }; \
+     [ \"$(\"$tsh\" -c 'echo \"${TD_UNSET:-fallback}\"')\" = fallback ] || { echo 'td-sh: the packed shell got parameter expansion with a default wrong' >&2; exit 1; }; \
+     shst=0; \"$tsh\" -c 'exit 3' || shst=$?; [ \"$shst\" = 3 ] || { echo 'td-sh: the packed shell did not report an exit status - /etc/rootcheck decides the boot is healthy from these' >&2; exit 1; }; \
      [ \"$(readlink \"$root/bin/td-login\" 2>/dev/null)\" = \"{in:td-login}/bin/td-login\" ] || { echo 'root tree: /bin/td-login is not a symlink to the staged credential multicall' >&2; exit 1; }; \
      tdl=\"{root}/real-root{in:td-login}/bin/td-login\"; tdltgt=\"{in:td-login}/bin/td-login\"; { [ -f \"$tdl\" ] && [ -x \"$tdl\" ]; } || { echo 'root tree: the td-login binary is not packed/executable at real-root{in:td-login}/bin/td-login - getty would exec a dangling /bin/login and no session could start' >&2; exit 1; }; \
      tdllist=$(\"$tdl\" --list 2>/dev/null) || { echo 'td-login --list failed - cannot verify the credential farm' >&2; exit 1; }; \
@@ -2387,10 +2456,7 @@ fn shape_check() -> String {
      for a in @BUSYBOX_APPLETS@; do \
          printf '%s\\n' \"$applets\" | grep -q -x -F \"$a\" || { echo \"busybox does not implement applet '$a' (config drift) - its packed /bin/$a symlink would be a dead link\" >&2; exit 1; }; \
      done; \
-     for a in @INITRAMFS_APPLETS@; do \
-         printf '%s\\n' \"$applets\" | grep -q -x -F \"$a\" || { echo \"busybox does not implement multiplexed applet '$a' (config drift) - a generated script or td-boot invokes it as 'busybox $a'\" >&2; exit 1; }; \
-     done; \
-     for a in @DROPPED_APPLETS@; do \
+@INITRAMFS_APPLET_SWEEP@     for a in @DROPPED_APPLETS@; do \
          if [ -e \"$root/bin/$a\" ] || [ -L \"$root/bin/$a\" ]; then echo \"root tree: /bin/$a is packed, but '$a' is in DROPPED_APPLETS - the busybox retirement dropped this name rather than reimplementing it\" >&2; exit 1; fi; \
          if printf '%s\\n' \"$selector_list\" | grep -q -x -F \"bin/$a\"; then echo \"selector initramfs: bin/$a is packed, but '$a' is in DROPPED_APPLETS\" >&2; exit 1; fi; \
          if printf '%s\\n' \"$init_list\" | grep -q -x -F \"bin/$a\"; then echo \"deployment initramfs: bin/$a is packed, but '$a' is in DROPPED_APPLETS\" >&2; exit 1; fi; \
@@ -2432,13 +2498,24 @@ fn shape_check() -> String {
         // inside the assembled root; compare symlink text without resolving it. The headless
         // boot oracle executes uutils after pivoting and remains the behavioral runtime check.
         .replace("@BUSYBOX_APPLETS@", &BUSYBOX_APPLETS.join(" "))
-        .replace("@INITRAMFS_APPLETS@", &INITRAMFS_APPLETS.join(" "))
+        // Emitted only when there is something to sweep: `INITRAMFS_APPLETS` is
+        // empty since the td-sh flip, and `for a in ; do ... done` is valid POSIX
+        // that checks nothing -- text that reads like a guard and is not one.
+        .replace(
+            "@INITRAMFS_APPLET_SWEEP@",
+            &if INITRAMFS_APPLETS.is_empty() {
+                String::new()
+            } else {
+                INITRAMFS_APPLET_SWEEP.replace("@APPLETS@", &INITRAMFS_APPLETS.join(" "))
+            },
+        )
         // The dropped-name sweep tests -e AND -L because a repacked /bin entry pointing at a
         // target the build tree does not hold is DANGLING, which -e alone reads as absent.
         .replace("@DROPPED_APPLETS@", &DROPPED_APPLETS.join(" "))
         .replace("@UUTILS_APPLETS@", &UUTILS_APPLETS.join(" "))
         .replace("@TD_UTIL_APPLETS@", &TD_UTIL_APPLETS.join(" "))
         .replace("@TD_TXT_APPLETS@", &TD_TXT_APPLETS.join(" "))
+        .replace("@TD_SH_APPLETS@", &TD_SH_APPLETS.join(" "))
         .replace("@TD_INIT_APPLETS@", &td_init_applets().join(" "))
         .replace("@TD_LOGIN_APPLETS@", &TD_LOGIN_APPLETS.join(" "))
         .replace("@TD_SVC_UNITS@", &TD_SVC_UNITS.join(" "))
@@ -2645,6 +2722,7 @@ pub fn recipe() -> Recipe {
             "td-kexec",
             "td-util",
             "td-txt",
+            "td-sh",
             "td-init",
             "td-firstboot",
             "td-login",
@@ -3284,8 +3362,11 @@ mod tests {
             // loops); reject it.
             let packed_applet = u.shell.strip_prefix("/bin/");
             assert!(
-                packed_applet
-                    .is_some_and(|a| BUSYBOX_APPLETS.contains(&a) || UUTILS_APPLETS.contains(&a)),
+                packed_applet.is_some_and(|a| {
+                    BUSYBOX_APPLETS.contains(&a)
+                        || TD_SH_APPLETS.contains(&a)
+                        || UUTILS_APPLETS.contains(&a)
+                }),
                 "user '{}' login shell '{}' must be \"/bin/<applet>\" packed by a /bin farm \
                  (td-login execs it by absolute path)",
                 u.name,
@@ -3431,18 +3512,31 @@ mod tests {
     /// pivot applet — without it the two-stage boot cannot enter the erofs root, and
     /// `mount`/`umount` are what bring every filesystem up and let it go again. These are
     /// all boot-critical and must stay on a STATIC multicall (no runtime closure) — busybox
-    /// for the login pair, td-init for the rest since the cutovers: belt-and-braces against
-    /// a farm edit that drops one or reroutes it to dynamically-linked uutils (the shape
-    /// check catches it at build time, this catches it at test time).
+    /// for `getty` alone now, td-login for the credential pair, td-sh for the shell and
+    /// td-init for the rest since the cutovers: belt-and-braces against a farm edit that
+    /// drops one or reroutes it to dynamically-linked uutils (the shape check catches it
+    /// at build time, this catches it at test time).
     #[test]
     fn greeter_and_pivot_applets_are_present() {
-        // Split across THREE static multicalls now, so each name is pinned to the ONE that
+        // Split across FOUR static multicalls now, so each name is pinned to the ONE that
         // serves it. Asserting only "some farm has it" would let a boot name drift between
         // binaries unnoticed — and for these names that drift IS the boot.
-        for a in ["sh", "getty"] {
+        assert!(
+            BUSYBOX_APPLETS.contains(&"getty"),
+            "boot-critical applet 'getty' missing from BUSYBOX_APPLETS"
+        );
+        // The shell is td-sh's since the flip, and is BOTH names busybox answered
+        // to: a script spelling `ash` must reach the same binary `sh` does, or the
+        // two are a difference nothing tests.
+        for a in ["sh", "ash"] {
             assert!(
-                BUSYBOX_APPLETS.contains(&a),
-                "boot-critical applet '{a}' missing from BUSYBOX_APPLETS"
+                TD_SH_APPLETS.contains(&a),
+                "shell name '{a}' missing from the td-sh farm"
+            );
+            assert!(
+                !BUSYBOX_APPLETS.contains(&a),
+                "'{a}' is still on busybox; the td-sh cutover replaces it, and a name in \
+                 both farms ships whichever Symlink step ran last"
             );
         }
         for a in ["login", "su"] {
@@ -3483,9 +3577,9 @@ mod tests {
     /// one of them runs somewhere no dynamic loader is reachable (the pre-pivot initramfs)
     /// or where a failure has nowhere to be reported (PID 1's own sysinit), so what matters
     /// is not which static binary serves them but that uutils never does.
-    /// Every /bin farm, name-tagged. ONE table: two tests consume it, and a seventh farm
-    /// added to only one of them would leave the other silently narrower.
-    fn bin_farms<'a>(td_init: &'a [&'static str]) -> [(&'static str, &'a [&'static str]); 6] {
+    /// Every /bin farm, name-tagged. ONE table: two tests consume it, and an eighth
+    /// farm added to only one of them would leave the other silently narrower.
+    fn bin_farms<'a>(td_init: &'a [&'static str]) -> [(&'static str, &'a [&'static str]); 7] {
         [
             ("busybox", BUSYBOX_APPLETS),
             ("uutils", UUTILS_APPLETS),
@@ -3493,6 +3587,7 @@ mod tests {
             ("td-txt", TD_TXT_APPLETS),
             ("td-init", td_init),
             ("td-login", TD_LOGIN_APPLETS),
+            ("td-sh", TD_SH_APPLETS),
         ]
     }
 
@@ -3518,10 +3613,11 @@ mod tests {
         ] {
             assert!(
                 BUSYBOX_APPLETS.contains(&a)
+                    || TD_SH_APPLETS.contains(&a)
                     || td_init.contains(&a)
                     || TD_LOGIN_APPLETS.contains(&a),
-                "boot-critical applet '{a}' must be served by a STATIC multicall (busybox, \
-                 td-init or td-login) - it runs where no dynamic loader is reachable"
+                "boot-critical applet '{a}' must be served by a STATIC binary (busybox, \
+                 td-sh, td-init or td-login) - it runs where no dynamic loader is reachable"
             );
             assert!(
                 !UUTILS_APPLETS.contains(&a),
@@ -3677,7 +3773,7 @@ mod tests {
             "env ",
             "TDVAR=1 ",              // an assignment prefix
             "sh -c '",               // the -c body this file writes five times
-            "/bin/busybox sh -c \"",
+            "/bin/sh -c \"",
             "cmd \\\n     ",          // a line continuation
         ] {
             assert!(
@@ -3914,88 +4010,91 @@ mod tests {
         }
     }
 
-    /// Every `busybox <applet>` the generated scripts invoke through the multiplexer must be
-    /// one `shape_check` verifies against `busybox --list` — a packed farm name or an
-    /// INITRAMFS_APPLETS entry. Derived from the script TEXT, so adding a `busybox
-    /// <applet>` call without covering it reds here rather than at sysinit. This is what
-    /// keeps applets like `chown`/`readlink` (served in /bin by uutils, but still invoked as
-    /// `busybox chown` by rootcheck) from losing their busybox-side guarantee.
-    ///
-    /// Only the absolute `/bin/busybox <applet>` spelling is scannable, so the bare token is
-    /// rejected outright rather than parsed for command position: deciding that from
-    /// surrounding shell text needs a shell grammar, and every approximation of one leaves a
-    /// form (`if`, a `case` arm, an assignment prefix) that reads as prose and escapes.
+    /// The applet sweep's non-empty branch is DORMANT -- `INITRAMFS_APPLETS` is
+    /// empty, so nothing emits it and `the_shape_check_ships_no_unreplaced_placeholders`
+    /// cannot see it either. A dormant branch is one an edit can break silently,
+    /// and the break would surface at build step 146 on the day somebody re-adds
+    /// an applet, which is the worst possible day for it.
     #[test]
-    fn script_applets_are_covered() {
-        const TOKEN: &str = "busybox";
-        let mut seen: Vec<String> = Vec::new();
-        let mut sources_with_calls = 0usize;
-        for (name, text, _) in script_sources() {
-            let before_count = seen.len();
-            for (idx, _) in text.match_indices(TOKEN) {
-                let before = text.get(..idx).unwrap_or("");
-                assert!(
-                    before.ends_with("/bin/"),
-                    "{name} spells the busybox multiplexer as a bare `{TOKEN}` token rather \
-                     than `/bin/{TOKEN} <applet>`. In command position that runs it through \
-                     $PATH, invisibly to this scan, so its applet would never be verified \
-                     against `busybox --list`; write the absolute form (even in prose)"
-                );
-                let Some(rest) = text.get(idx + TOKEN.len()..) else {
-                    continue;
-                };
-                // The charset spans every name busybox can expose: truncating `mkfs.ext2` to
-                // `mkfs` would red naming an applet that does not exist.
-                let rest = rest.trim_start();
-                let applet: String = rest
-                    .chars()
-                    .take_while(|c| {
-                        c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | '[')
-                    })
-                    .collect();
-                // Fail CLOSED on a form this cannot resolve (`/bin/busybox "$cmd"`): skipping
-                // it would let the one invocation that most needs review escape the check.
-                assert!(
-                    !applet.is_empty(),
-                    "{name} invokes the busybox multiplexer with a form this scan cannot \
-                     resolve statically ({:?}) - it would silently escape the coverage check; \
-                     invoke the applet under a literal name",
-                    rest.chars().take(24).collect::<String>()
-                );
-                assert!(
-                    BUSYBOX_APPLETS.contains(&applet.as_str())
-                        || INITRAMFS_APPLETS.contains(&applet.as_str()),
-                    "{name} invokes `busybox {applet}`, but neither the /bin farm nor \
-                     INITRAMFS_APPLETS covers it - shape_check would never verify \
-                     busybox implements it"
-                );
-                seen.push(applet);
-            }
-            if seen.len() > before_count {
-                sources_with_calls += 1;
-            }
-        }
-        // Guard the guard. A bare total would not bind: one `/init` alone contributes more
-        // than any plausible floor, so dropping the whole `/etc` half of the scan would keep
-        // a count green. Requiring several sources to contribute is what pins the inputs.
+    fn the_dormant_applet_sweep_still_renders_a_loop() {
+        let rendered = INITRAMFS_APPLET_SWEEP.replace("@APPLETS@", "losetup cttyhack");
         assert!(
-            sources_with_calls >= 3,
-            "only {sources_with_calls} generated script(s) matched a `/bin/busybox <applet>` \
-             call - the scan has gone stale or stopped being fed its sources, and this test \
-             is now vacuous"
+            !rendered.contains("@APPLETS@"),
+            "the sweep's placeholder is no longer @APPLETS@, so nothing fills it in"
         );
-        // ...and no dead entries: a multiplexed applet nothing invokes is a stale shape-check
-        // probe that outlived the call it was protecting, and would red the build for a
-        // legitimate busybox config trim. Script text is not the only source of the
-        // requirement — td-boot invokes its own set from Rust, where this scan cannot see it,
-        // so those are justified by the protocol constant instead.
-        for a in INITRAMFS_APPLETS {
+        assert!(
+            rendered.starts_with("for a in losetup cttyhack; do "),
+            "the sweep no longer opens a loop over the applet list: {rendered}"
+        );
+        // The trailing `; ` is what separates it from the check that follows,
+        // since the whole script is one line.
+        assert!(
+            rendered.ends_with("done; "),
+            "the sweep no longer closes its loop and separates itself: {rendered}"
+        );
+    }
+
+    /// NO generated script invokes the busybox multiplexer, and this is what keeps it
+    /// that way. The four `/bin/busybox sh -c '…'` call sites that used to live here
+    /// were spelled that way because busybox had `umask` and td-sh did not; once
+    /// `umask(2)` entered td-sh's confined surface they became `/bin/sh -c`, and with
+    /// them went the last reason any script reached the multiplexer.
+    ///
+    /// The assertion is the whole SUBSTRING, as `no_generated_script_invokes_awk` is
+    /// and for the same reason: deciding "is this token in command position" needs a
+    /// shell grammar, and every approximation of one leaves a spelling that reads as
+    /// prose and escapes — a bare `busybox` found through PATH most of all. No
+    /// generated script contains the word at all, so banning it outright costs nothing
+    /// and cannot be evaded. A script that some day needs the multiplexer reds here and
+    /// gets a deliberate decision, with `INITRAMFS_APPLETS` to fill in and a
+    /// `shape_check` probe to add, rather than quietly reviving the dependency.
+    #[test]
+    fn no_generated_script_invokes_the_busybox_multiplexer() {
+        const TOKEN: &str = "busybox";
+        // Guard the guard: a shrunken source list would make the ban vacuous
+        // while every assertion in it stayed green. By NAME rather than by
+        // count, because a count is satisfied by the WRONG eighteen -- one
+        // script dropped and one config file added leaves the total right and
+        // the ban blind to whatever left. The two `/init`s matter most, since
+        // they carried all four `/bin/busybox sh -c` call sites this replaced,
+        // but every /etc script is a boot path too.
+        let sources = script_sources();
+        for required in [
+            "/init (selector)",
+            "/init (deployment)",
+            "/etc/profile",
+            "/etc/autologin",
+            "/etc/tty-session",
+            "/etc/shutdown",
+            "/etc/rootcheck",
+            "/etc/netup",
+            "/etc/bootsuccess",
+            "/etc/bootfail",
+            "/etc/inittab",
+            "/etc/td-svc.conf",
+        ] {
             assert!(
-                seen.iter().any(|s| s == a),
-                "INITRAMFS_APPLETS lists '{a}', but no generated script invokes `busybox {a}` \
-                 - drop it, or move it to the /bin farm if it needs a symlink"
+                sources.iter().any(|(n, _, _)| n == required),
+                "{required} is not among the scanned sources - the ban no longer \
+                 covers it, and nothing else would say so"
             );
         }
+        for (name, text, _) in &sources {
+            assert!(
+                !text.contains(TOKEN),
+                "{name} names `{TOKEN}`. Nothing on the boot path runs the multiplexer \
+                 since the td-sh flip: `sh` was the last applet any script reached it \
+                 for, and INITRAMFS_APPLETS is empty because of it. Re-adding a call \
+                 means listing the applet there and giving `shape_check` a probe for it"
+            );
+        }
+        // ...and the list it emptied stays empty by the same argument: an entry with no
+        // caller is a shape-check probe protecting nothing.
+        assert!(
+            INITRAMFS_APPLETS.is_empty(),
+            "INITRAMFS_APPLETS is non-empty, but no generated script invokes the \
+             multiplexer - either the ban above is stale or the entry has no caller"
+        );
     }
 
     /// `awk` is DROPPED now, and this is what keeps it dropped: no generated script
@@ -4088,7 +4187,7 @@ mod tests {
         names
     }
 
-    /// The mirror of `script_applets_are_covered`, for the form this commit actually
+    /// The mirror of the busybox-multiplexer ban, for the form this commit actually
     /// re-points: a direct `/bin/<name>`. Every one must be a name its own image actually
     /// packs, or the script calls a dangling symlink — and `shape_check` only validates
     /// farm → symlink, never script → farm, so nothing else would catch it.
@@ -4108,6 +4207,8 @@ mod tests {
             .iter()
             .chain(UUTILS_APPLETS)
             .chain(TD_UTIL_APPLETS)
+            .chain(TD_TXT_APPLETS)
+            .chain(TD_SH_APPLETS)
             .chain(&td_init)
             .chain(&["busybox", "td-util", "td-init"])
         {
@@ -4129,9 +4230,13 @@ mod tests {
         for (name, text, cpio_bin) in script_sources() {
             // Same guard for the initramfs side: an empty derived /bin would accept nothing.
             if let Some(names) = &cpio_bin {
+                // `sh` is the anchor now that busybox is not in either cpio: every
+                // line of both /init scripts runs through it, so a derived /bin
+                // without it is a derivation that stopped working, not a boot that
+                // stopped needing the shell.
                 assert!(
-                    names.iter().any(|n| n == "busybox"),
-                    "{name} runs from a cpio whose derived /bin does not contain busybox - \
+                    names.iter().any(|n| n == "sh"),
+                    "{name} runs from a cpio whose derived /bin does not contain sh - \
                      initramfs_bin_names() has gone stale"
                 );
             }
@@ -5091,6 +5196,187 @@ mod tests {
         );
     }
 
+    /// Every cpio member `shape_check` demands is one the specs actually emit.
+    ///
+    /// This is the mismatch nothing else models: `shape_check` runs inside the
+    /// BUILD, so a member it requires and the spec no longer writes reds at step
+    /// 146 of 146 with every host test green — which is exactly what happened
+    /// when `sh` left busybox and three assertions kept asking for
+    /// `bin/busybox`. Checking the two texts against each other here turns that
+    /// into a cargo-test failure.
+    #[test]
+    fn shape_check_asks_the_initramfs_for_members_it_actually_packs() {
+        let check = shape_check();
+        let specs = [
+            ("selector", build_initramfs_spec("selector-init", Phase::Selector)),
+            ("deployment", build_initramfs_spec("deployment-init", Phase::Deployment)),
+        ];
+        // The `for m in … ; do` sweep: every name is a cpio member path, and both
+        // archives are swept with the same list.
+        let marker = "for m in ";
+        let start = check.find(marker).expect("shape_check sweeps the cpio members");
+        let rest = check.get(start + marker.len()..).unwrap_or_default();
+        let list = rest.split(';').next().unwrap_or_default();
+        // No filter: the top-level members (`init`, `proc`, `run`, `volume`,
+        // `sysroot`) have no slash in them and are exactly the ones a
+        // slash-requiring filter drops -- five of the eleven, silently.
+        let members: Vec<&str> = list.split_whitespace().collect();
+        // Bounded EXACTLY, not `>=`: the ban test's count guard was replaced two
+        // hunks up because slack keeps a check green while the thing it guards
+        // quietly shrinks, and a floor here would do the same for a member
+        // shape_check stopped demanding.
+        assert_eq!(members.len(), 11, "the member sweep parsed as {members:?}");
+        for (phase, spec) in &specs {
+            for m in &members {
+                // A member is whatever the spec declares it as -- dir, slink,
+                // file or nod -- written with a LEADING slash where the cpio
+                // lists it without.
+                let declared = ["dir", "slink", "file", "nod"]
+                    .iter()
+                    .any(|kind| spec.contains(&format!("{kind} /{m} ")));
+                assert!(
+                    declared,
+                    "shape_check requires cpio member '{m}', but the {phase} spec \
+                     declares no such path - the build would red at shape_check \
+                     with every test here green"
+                );
+            }
+        }
+        // ...and the store members it greps for by regex, which is how a dangling
+        // symlink is caught: the slink can be there while its target is not. The
+        // script is one continuous line, so these are found by the PATTERN rather
+        // than by scanning lines.
+        const PAT: &str = "^td/store/[^/]+/bin/";
+        let mut greps = 0usize;
+        for (at, _) in check.match_indices(PAT) {
+            let name: String = check
+                .get(at + PAT.len()..)
+                .unwrap_or_default()
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+                .collect();
+            greps += 1;
+            // WHICH archive is asked is part of the claim: td-kexec is
+            // selector-only and losetup deployment-only, so "some spec carries
+            // this file" would let a payload sit in the archive that does not
+            // need it while the one that does greps for nothing. The phase comes
+            // from the list variable the grep reads, which is the same text.
+            //
+            // The member sweep above does NOT cover this: it pins `bin/<name>`,
+            // the /bin SYMLINK, where these are `td/store/…/bin/<name>`, the
+            // payload it points at. Different paths, and the dangling case is
+            // exactly one present without the other.
+            let before = check.get(..at).unwrap_or_default();
+            // Bounded to THIS statement. The script is one continuous line, so
+            // searching the whole prefix answers about whatever ran earlier: past
+            // the `for l in …` sweep every later grep looks like it named both
+            // lists, whichever one it actually reads. A statement starts at its
+            // own `printf`, which is where the list variable is named.
+            let stmt_at = before.rfind("printf").unwrap_or_default();
+            let stmt = before.get(stmt_at..).unwrap_or_default();
+            // Both halves below read that window, so its premise is pinned rather
+            // than assumed: the `printf` found must be THIS statement's. A grep
+            // led by anything else (`if echo "$init_list" | grep …`) would inherit
+            // the previous statement's window, and for the SENSE that is not a
+            // safe direction -- a forbid would be read as a requirement.
+            assert!(
+                !stmt.contains("; "),
+                "the `bin/{name}` store grep is not led by a `printf` of the list it \
+                 reads - this scan takes both its archive and its sense from that \
+                 one statement"
+            );
+            let sel = stmt.contains(r#""$selector_list""#);
+            let dep = stmt.contains(r#""$init_list""#);
+            // Naming NEITHER means the grep is inside the sweep over both, which
+            // is required to be exactly that text rather than inferred: a shape
+            // this cannot read is the bug the bounding exists to catch, so it
+            // fails here instead of guessing at an archive.
+            let in_both = !sel
+                && !dep
+                && before
+                    .get(..stmt_at)
+                    .unwrap_or_default()
+                    .ends_with("for l in \"$selector_list\" \"$init_list\"; do ");
+            assert!(
+                sel || dep || in_both,
+                "the `bin/{name}` store grep names no list variable and is not the \
+                 two-list sweep - this scan cannot say which archive it asks about"
+            );
+            // Some of these greps assert ABSENCE -- `if … grep -q …; then error`
+            // is how td-kexec is kept selector-only -- so the sense matters as
+            // much as the phase. A negative read as a requirement demands the
+            // opposite of what the script says.
+            let positive = {
+                let stmt = before.rfind("printf");
+                let negated = before.rfind("if printf");
+                !matches!((stmt, negated), (Some(t), Some(n)) if n + 3 == t)
+            };
+            let want: &[&str] = if in_both || (sel && dep) {
+                &["selector", "deployment"]
+            } else if sel {
+                &["selector"]
+            } else {
+                &["deployment"]
+            };
+            // The `file` KIND is required, not merely the name: `slink /bin/X
+            // {in:X}/bin/X …` contains the target's path too, so a substring
+            // match is satisfied by the very symlink whose danglingness this is
+            // supposed to catch.
+            let payload = format!("/bin/{name}");
+            for phase in want {
+                let packed = specs.iter().any(|(p, spec)| {
+                    p == phase
+                        && spec.lines().any(|l| {
+                            l.strip_prefix("file ")
+                                .and_then(|r| r.split_whitespace().next())
+                                .is_some_and(|dest| dest.ends_with(&payload))
+                        })
+                });
+                assert_eq!(
+                    packed,
+                    positive,
+                    "shape_check {} the {phase} initramfs to carry a `bin/{name}` store \
+                     member and that spec {} - the build would red at shape_check with \
+                     every test here green",
+                    if positive { "requires" } else { "forbids" },
+                    if packed { "packs one" } else { "packs none" }
+                );
+            }
+        }
+        // Exact for the same reason: a floor stays green while shape_check quietly
+        // stops asking one archive for a payload the other still gets checked for.
+        assert_eq!(greps, 9, "{greps} store-member greps found - the scan has gone stale");
+    }
+
+    /// Neither initramfs packs the busybox multicall. This is the property the
+    /// flip is FOR, and nothing else asserts it: the ban test covers the CALL
+    /// SITES and the member sweep covers what is packed and required, but a
+    /// busybox reintroduced BESIDE td-sh trips neither -- every script would
+    /// still say `/bin/sh`, `/bin/sh` would still be td-sh, and the multicall
+    /// would simply be back in both archives with nothing red.
+    #[test]
+    fn neither_initramfs_packs_the_busybox_multicall() {
+        for (phase, spec) in [
+            ("selector", build_initramfs_spec("selector-init", Phase::Selector)),
+            ("deployment", build_initramfs_spec("deployment-init", Phase::Deployment)),
+        ] {
+            assert!(
+                !spec.contains("busybox"),
+                "the {phase} initramfs spec names busybox - the multicall is back in \
+                 the boot archives. Nothing else here would have said so"
+            );
+        }
+        // What remains of busybox is `getty` on the REAL ROOT, which is a
+        // different claim and deliberately still true; pinned here so the two do
+        // not get conflated by whoever reads the assertion above.
+        assert_eq!(
+            BUSYBOX_APPLETS,
+            ["getty"],
+            "the busybox farm changed - the initramfs claim above is about the \
+             ARCHIVES, and the real root still serves getty from the multicall"
+        );
+    }
+
     #[test]
     fn initramfs_packs_the_verified_boot_chain() {
         let selector = build_initramfs_spec("selector-init", Phase::Selector);
@@ -5098,6 +5384,12 @@ mod tests {
         for entry in [
             "file {in:td-boot}/bin/td-boot {in:td-boot}/bin/td-boot 0755 0 0",
             "slink /bin/td-boot {in:td-boot}/bin/td-boot 0777 0 0",
+            // The shell, in BOTH phases: every line of both /init scripts is
+            // interpreted by it, so the `file` entry is as load-bearing as the
+            // symlink -- a slink to a member the cpio does not carry is a
+            // dangling /bin/sh and a kernel that cannot run /init at all.
+            "file {in:td-sh}/bin/td-sh {in:td-sh}/bin/td-sh 0755 0 0",
+            "slink /bin/sh {in:td-sh}/bin/td-sh 0777 0 0",
             "dir /volume 0700 0 0",
             "dir /proc 0755 0 0",
             "dir /run 0755 0 0",
@@ -6099,6 +6391,52 @@ mod tests {
             etc_files(&SYSTEM).iter().any(|(n, _, _)| *n == name),
             "no etc_files entry generates {name}, so PID 1 would exec td-svc against a \
              path that does not exist"
+        );
+    }
+
+    /// td-sh must be PACKED into the real root, not merely symlinked and listed
+    /// as an input — the same rent td-svc pays below, for the same reason.
+    ///
+    /// This one is the shell, so the blast radius is everything: with the
+    /// `CopyTree` gone the real root's `/bin/sh` is a symlink to nothing, which
+    /// takes out getty -> login -> the operator's session, `/etc/rootcheck`,
+    /// `/etc/bootsuccess`, `/etc/autologin` and every td-svc job, since each is
+    /// a script this binary interprets. Confirmed by deleting the step: the
+    /// whole host suite stayed green, and only `shape_check` — the last of 146
+    /// steps, in the recipe-checks tier — would have said so. That is precisely
+    /// the failure class this commit closed for the cpio half, left open for
+    /// the real-root half of its own new binary.
+    #[test]
+    fn td_sh_is_packed_and_not_merely_symlinked() {
+        let steps = real_root_steps(&SYSTEM);
+        assert!(
+            steps.iter().any(|s| matches!(
+                s,
+                Step::CopyTree { from, dest }
+                    if from == "{in:td-sh}" && dest == "{root}/real-root{in:td-sh}"
+            )),
+            "td-sh must be CopyTree'd into the real root (static, empty closure) - a \
+             symlink alone dangles on the image and /bin/sh interprets every script \
+             the boot runs"
+        );
+        // Both names, because `ash` is not decoration: a script spelling it must
+        // reach the same binary `sh` does or the two are a difference nothing
+        // tests, and the farm is what makes them one.
+        for applet in TD_SH_APPLETS {
+            assert!(
+                steps.iter().any(|s| matches!(
+                    s,
+                    Step::Symlink { target, link }
+                        if target == "{in:td-sh}/bin/td-sh"
+                            && link == &format!("{{root}}/real-root/bin/{applet}")
+                )),
+                "/bin/{applet} must symlink into the store td-sh package"
+            );
+        }
+        let native_inputs = recipe().native_inputs.expect("system native inputs");
+        assert!(
+            native_inputs.iter().any(|i| i == "td-sh"),
+            "td-sh must be a declared native input, or {{in:td-sh}} does not resolve"
         );
     }
 

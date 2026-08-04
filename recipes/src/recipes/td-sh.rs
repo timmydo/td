@@ -15,9 +15,10 @@ use crate::types::{Recipe, Step};
 // root `#![deny(unsafe_code)]`s and `sys.rs` holds the one scoped exception --
 // `umask(2)`, a disposition-only `rt_sigaction(2)`, and an `ioctl(2)` restricted
 // to three value-pinned terminal requests: the calls `std` exposes no API for.
-// td-sh is NOT yet referenced by system-x86-64: the shipped `/bin/sh` stays
-// busybox until td-sh also clears the busybox `ash_test` parity gate and the
-// bulk Oils import. Only then is the image symlink flipped.
+// td-sh IS the shipped `/bin/sh` and `/bin/ash`: system-x86-64 packs this output
+// into the real root and into BOTH initramfs images, where it replaced the
+// busybox multicall outright rather than beside it. Every generated script --
+// both `/init`s and every `/etc` script -- is interpreted by this binary.
 //
 // Why mesboot-style (rustc invoked directly) rather than `Recipe::rust`, and why
 // static: identical to td-kexec. The busybox `sh` it replaces is boot-critical and

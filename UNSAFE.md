@@ -69,9 +69,11 @@ mounts devtmpfs on `/dev` first thing, so `/dev/loop0` normally comes from
 the kernel; this is the fallback for when the loop driver registered none,
 and it cannot come from a cpio `nod` line because the devtmpfs mount
 shadows whatever was there. Unlike `losetup` and `kill`, the busybox
-spelling here WAS build-time checked — `INITRAMFS_APPLETS` names are swept
-against `busybox --list` — so this is not that argument. What it buys is
-narrower and real, and it is all about the ARGUMENT rather than the call:
+spelling here WAS build-time checked — `INITRAMFS_APPLETS` names were
+swept against `busybox --list`, and that sweep is emitted only while the
+list has something in it, which since the td-sh flip it does not — so
+this is not that argument. What it buys is narrower and real, and it is
+all about the ARGUMENT rather than the call:
 `dev` is one integer with major and minor packed into disjoint bit ranges,
 and a wrong packing is a well-formed node pointing at a DIFFERENT driver,
 which `mknod(2)` creates and reports success for. So the crate now has
@@ -119,9 +121,11 @@ but `mount.rs` — plus `switch_root`'s two `MS_MOVE` moves — may name one
 or call the two wrappers. That amendment is what lets both initramfses and
 `/etc/inittab` mount without busybox, and the `LOOP_SET_FD` request above
 is what lets `td-boot` attach the verified root loop without it — so
-nothing td-boot runs is a third-party program any more. Busybox is still
-the `/init` interpreter and still serves the shell utilities those scripts
-call; what left is the privileged work. Deliberately NOT in that surface:
+nothing td-boot runs is a third-party program any more. Neither
+initramfs packs the multicall at all since `sh` left busybox for td-sh,
+which is a claim about the ARCHIVES rather than the whole boot: `getty`
+on the real root is still busybox's, respawned by the greeter unit every
+boot. Deliberately NOT in that surface:
 `pivot_root(2)` (it fails on the initramfs rootfs, so switch_root moves
 the mount as util-linux and busybox do), `fork`/`execve` (`Command` plus
 the safe `CommandExt::exec` cover both), `dup2` (`Stdio::from(File)` wires
@@ -309,9 +313,10 @@ fork would have kept for it and for the one that stops the shell listening
 to the terminal while a foreground child runs, and `term.rs` for the
 terminal mode and width the line editor needs. `std` exposes an API for
 none of them, and in the umask case that is not a gap that can be worked
-around: it is why the shipped `/init` still spells one line `busybox sh
--c 'umask 077; …'`, and why the shell that is supposed to replace busybox
-could not serve it.
+around: it is why the shipped `/init` spelled one line `busybox sh -c
+'umask 077; …'` until this surface existed, and why the shell that is
+supposed to replace busybox could not serve it. That line is `/bin/sh -c`
+now, and it was the last call the image made into the multiplexer.
 
 `umask(2)` cannot fail, so there is no `check()` on that path; what it
 does is RETURN THE PREVIOUS MASK, and both wrappers are built out of that.

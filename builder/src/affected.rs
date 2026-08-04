@@ -723,15 +723,25 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
         return;
     }
 
-    // td-sh: the target-built POSIX /bin/sh (busybox-`sh` replacement), a standalone
-    // std-only crate OUTSIDE the engine workspace, exactly like td-kexec — same
-    // routing. Its lib.rs conformance harness + unit tests lint/test on the host
-    // cargo-test cargo-test preflight. src/main.rs is `include_str!`'d into the td-sh
-    // RECIPE, so a stub-source edit changes the TARGET artifact and a static-link
-    // regression is invisible to host cargo — so also route to recipe-checks
-    // (recipe-checks statically links it via td-sh-test). Its RECIPE files under
-    // recipes/src/recipes/ are routed by the recipes arm above, not here. The
-    // spec/ corpus and tests/ carry no standalone shell scripts, so no shell-syntax.
+    // td-sh: the target-built POSIX shell, a standalone std-only crate OUTSIDE the
+    // engine workspace — same routing as td-txt below, and for the same reason. Its
+    // lib.rs conformance harness + unit tests lint/test on the host cargo-test
+    // preflight. src/main.rs is `include_str!`'d into the td-sh RECIPE, so a
+    // source edit changes the TARGET artifact and a static-link regression is
+    // invisible to host cargo — so also route to recipe-checks, which statically
+    // links it and runs `-c 'exit 0'` via td-sh-test.
+    //
+    // What recipe-checks does NOT cover: td-sh is packed into system-x86-64 and IS
+    // the boot path since the flip — both `/init`s and every generated /etc script
+    // are interpreted by it, and td-login execs it by absolute path — but
+    // `system-x86-64` owns no gated check (it is absent from `check-list`), so its
+    // `shape_check` probes of the packed shell and the boot oracle behind
+    // `qemu-boot-system` run only in a full image build, which no gate runs. The
+    // host-side recipe TESTS are what stand in, and they are cargo-test's.
+    //
+    // Its RECIPE files under recipes/src/recipes/ are routed by the recipes arm
+    // above, not here. The spec/ corpus and tests/ carry no standalone shell
+    // scripts, so no shell-syntax.
     if pattern_matches(
         "td-sh/*|td-sh/src/*|td-sh/tests/*|td-sh/spec/*|td-sh/Cargo.toml|td-sh/Cargo.lock",
         p,
