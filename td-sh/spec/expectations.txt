@@ -1107,7 +1107,6 @@ xfail sh-usage.test.sh::--rcfile in non-interactive shell prints warnings
 xfail sh-usage.test.sh::LC_CTYPE=invalid
 xfail sh-usage.test.sh::Other flag parsers are not affected by - rule
 xfail sh-usage.test.sh::Set LC_ALL LC_CTYPE LC_COLLATE LANG - affects glob ?
-xfail sh-usage.test.sh::accepts -l flag
 xfail sh-usage.test.sh::sh - and sh -- stop flag processing
 xfail sh-usage.test.sh::sh -c -- 'echo hi' does not run anything (#2637)
 xfail shell-bugs.test.sh::./configure idiom
@@ -1236,7 +1235,6 @@ xfail var-sub-quote.test.sh::comparison: :- operator with single quoted arg
 xfail var-sub-quote.test.sh::single quotes work inside character classes
 xfail var-sub.test.sh::Braced block inside ${}
 xfail var-sub.test.sh::Descriptor redirect to bad "$@"
-xfail vars-bash.test.sh::$SHELL is set to what is in /etc/passwd
 xfail vars-special.test.sh::$$ looks like a PID
 xfail vars-special.test.sh::$?
 xfail vars-special.test.sh::$HOME is NOT set

@@ -67,6 +67,11 @@ fn run(args: &[String]) -> Result<i32, String> {
     let mut sh = Shell::new();
     let mut i = 1usize;
     let mut minus_c = false;
+    // A LOGIN shell, by the convention every shell since the Bourne one has used:
+    // `argv[0]` beginning with `-`. That is not decoration — it is the whole
+    // channel `login` has for saying so, and td-login spells it (`login_arg0`),
+    // as getty and su do. `-l` asks for the same thing outright.
+    let mut login = args.first().is_some_and(|a| a.starts_with('-'));
 
     // Leading options, parsed as dash's `options(cmdline=1)` does.
     while let Some(arg) = args.get(i) {
@@ -112,6 +117,13 @@ fn run(args: &[String]) -> Result<i32, String> {
                     }
                 }
                 'i' => sh.interactive = on,
+                // Not in the `set` table: this one is only ever a startup
+                // question, and `set -l` mid-script would be asking to have
+                // already been a login shell. The SIGN carries no meaning --
+                // dash ORs it into `login` and busybox ash comments `-l or +l ==
+                // --login` outright -- so `+l` asks for a login shell too, and
+                // cannot cancel one `argv[0]` already declared.
+                'l' => login = true,
                 // Every other letter comes from the one table `set` reads, so the
                 // command line cannot drift from it.
                 other => {
@@ -124,9 +136,25 @@ fn run(args: &[String]) -> Result<i32, String> {
         i += 1 + consumed;
     }
 
-    // `-c COMMAND [name [arg...]]`: the command is the first operand, taken after
-    // the whole option list, and the word after it is $0.
-    if minus_c {
+    // What this shell was invoked to run. Decided -- and its operands bound --
+    // BEFORE the profiles, because a profile is sourced in the shell it is
+    // setting up rather than in a shell that precedes it: `$0`, `$@` and `$-`
+    // have to already be what the session will see, or a `set --` in one is
+    // overwritten a moment later and `case $- in *i*)`, the guard nearly every
+    // distributed `/etc/profile` opens with, answers for the wrong shell.
+    enum Start {
+        Command(String),
+        /// The OPEN file and the name it was opened by, for the read's message.
+        Script(std::fs::File, String),
+        Repl,
+        Stdin,
+    }
+    // A script operand is only an operand when `-s` did not claim stdin.
+    let script_operand = if sh.opts.stdin { None } else { args.get(i) };
+    let start = if minus_c {
+        // `-c COMMAND [name [arg...]]`: the command is the first operand, taken
+        // after the whole option list, and the word after it is $0. A MISSING one
+        // raises here, before the profiles: a usage error is not a login.
         let cmd = args
             .get(i)
             .ok_or_else(|| "-c requires an argument".to_string())?
@@ -135,37 +163,153 @@ fn run(args: &[String]) -> Result<i32, String> {
             sh.arg0 = name.clone();
             sh.params = args.iter().skip(i + 2).cloned().collect();
         }
-        return Ok(run_program(&mut sh, &cmd));
-    }
+        Start::Command(cmd)
+    } else if let Some(path) = script_operand {
+        // `td-sh script [arg...]`. OPENED here, before the profiles, because ash
+        // opens it in `procargs` ahead of its login-profile block: a login whose
+        // script does not exist fails with `can't open` and reads no profile at
+        // all. Checked against busybox ash rather than assumed.
+        //
+        // Opened, not READ: ash's `setinputfile` takes a descriptor and the
+        // reading happens after, so a script that is a fifo or `/dev/stdin`
+        // blocks where the writer is waiting rather than before `/etc/profile`
+        // has run.
+        let file = std::fs::File::open(path).map_err(|e| format!("{path}: {e}"))?;
+        sh.arg0 = path.clone();
+        sh.params = args.iter().skip(i + 1).cloned().collect();
+        Start::Script(file, path.clone())
+    } else {
+        // No script and no `-c`: interactive when stdin is a terminal, otherwise
+        // read and run the whole of stdin as a script.
+        sh.params = args.iter().skip(i).cloned().collect();
+        // dash sets sflag when no operand is left as well, which is what puts `s`
+        // in `$-`; an EXPLICIT `-s` is what suppresses the prompt.
+        let explicit_s = sh.opts.stdin;
+        sh.opts.stdin = true;
+        if !explicit_s && std::io::stdin().is_terminal() {
+            sh.interactive = true;
+            Start::Repl
+        } else {
+            Start::Stdin
+        }
+    };
 
-    // A script-file operand: `td-sh script [arg...]`.
-    if !sh.opts.stdin {
-        if let Some(path) = args.get(i) {
-            sh.arg0 = path.clone();
-            sh.params = args.iter().skip(i + 1).cloned().collect();
-            let src =
-                std::fs::read_to_string(path).map_err(|e| format!("{path}: {e}"))?;
-            return Ok(run_program(&mut sh, &src));
+    // The profiles come BEFORE anything the shell was invoked to do, `-c`
+    // included, because that is where a login shell's environment is set up and
+    // a command that runs without it runs in a different shell than the operator
+    // asked for. An `exit` in one ends the shell THERE, so nothing below runs.
+    if login {
+        if let Some(code) = read_profiles(&mut sh) {
+            return Ok(exec::run_exit_trap(&mut sh, code) & 0xff);
         }
     }
 
-    // No script and no `-c`: interactive when stdin is a terminal, otherwise read
-    // and run the whole of stdin as a script.
-    sh.params = args.iter().skip(i).cloned().collect();
-    // dash sets sflag when no operand is left as well, which is what puts `s` in
-    // `$-`; an EXPLICIT `-s` is what suppresses the prompt.
-    let explicit_s = sh.opts.stdin;
-    sh.opts.stdin = true;
-    if !explicit_s && std::io::stdin().is_terminal() {
-        sh.interactive = true;
-        let code = repl(&mut sh);
-        return Ok(exec::run_exit_trap(&mut sh, code));
+    match start {
+        Start::Command(cmd) => Ok(run_program(&mut sh, &cmd)),
+        Start::Script(mut file, path) => {
+            let mut src = String::new();
+            file.read_to_string(&mut src).map_err(|e| format!("{path}: {e}"))?;
+            Ok(run_program(&mut sh, &src))
+        }
+        Start::Repl => {
+            let code = repl(&mut sh);
+            Ok(exec::run_exit_trap(&mut sh, code) & 0xff)
+        }
+        Start::Stdin => {
+            let mut src = String::new();
+            if let Err(e) = std::io::stdin().read_to_string(&mut src) {
+                // Reported and exited HERE rather than through `?`, because this
+                // is where the shell environment ends and an EXIT trap a profile
+                // installed has to run before it does.
+                let _ = exec::write_stderr(&sh, &format!("td-sh: stdin: {e}"));
+                return Ok(exec::run_exit_trap(&mut sh, 2) & 0xff);
+            }
+            Ok(run_program(&mut sh, &src))
+        }
     }
-    let mut src = String::new();
-    std::io::stdin()
-        .read_to_string(&mut src)
-        .map_err(|e| format!("stdin: {e}"))?;
-    Ok(run_program(&mut sh, &src))
+}
+
+/// Run the login profiles in THIS shell, so what they export survives into the
+/// session: `/etc/profile` first, then the user's own. `Some(code)` means one of
+/// them ran an `exit` and the shell is over.
+///
+/// A missing or unreadable profile is not an error and not a diagnostic — an
+/// account with no `.profile` is the ordinary case, and a login that complained
+/// about it would put a message on every console every boot. A profile that
+/// FAILS mid-way is not fatal either, which is what keeps a typo in one from
+/// costing the operator their session -- though its `$?` does carry, as it does
+/// under both references.
+///
+/// `$HOME/.profile` is spelled out, as dash (`main.c`) and busybox ash both
+/// spell it -- the bare `.profile` that leans on the caller having chdir'd is
+/// original BSD ash, not either shell this one is graded against. td-login does
+/// chdir, but a login shell that reads whatever `.profile` happens to sit in the
+/// current directory is a different and worse thing when it has not.
+fn read_profiles(sh: &mut Shell) -> Option<i32> {
+    if let Some(code) = read_profile(sh, "/etc/profile") {
+        return Some(code);
+    }
+    // `HOME` is read only once the system profile has FINISHED, because it is a
+    // variable that profile may set and the file to read is whatever it says by
+    // then — the ordering every other shell gets for free by sourcing the second
+    // file with the first one's assignments already in the environment.
+    if let Some(home) = sh.get_var("HOME").filter(|h| !h.is_empty()) {
+        if let Some(code) = read_profile(sh, &format!("{}/.profile", home.trim_end_matches('/'))) {
+            return Some(code);
+        }
+    }
+    // `$?` is NOT reset on the way out. A profile's last command is the last
+    // command, and both references leave it that way (dash's `main.c` and
+    // busybox `ash.c` run the profiles and fall straight through to `minusc` or
+    // `cmdloop` without touching `exitstatus`). Tidying it would be a divergence
+    // for a cosmetic gain at one prompt.
+    None
+}
+
+/// One profile, SOURCED the way `.` sources a file rather than run as a program
+/// of its own. The difference is the whole of what a profile is for: `exit` in
+/// one ends the login shell and an EXIT trap it sets fires when the SESSION
+/// ends, where a program-shaped run would swallow the first and fire the second
+/// immediately.
+fn read_profile(sh: &mut Shell, path: &str) -> Option<i32> {
+    let src = std::fs::read_to_string(path).ok()?;
+    match exec::run_source(sh, &src, &format!("{path}: ")) {
+        Ok(()) => None,
+        // td's own `/etc/profile` ends its autotest branch with `exit 0`, which
+        // is what powers the VM off; a shell that swallowed it would sit at a
+        // prompt on ttyS0 until the harness timed the boot out.
+        Err(exec::Sig::Exit(code)) => Some(code),
+        // A FATAL error -- a syntax error, or `${x:?}` -- ends the login too,
+        // unless the shell is interactive. That is ash's rule rather than a
+        // choice of ours: its top-level handler exits when `iflag == 0`, so
+        // `sh -l -c cmd` over a broken profile never runs `cmd` while
+        // `sh -i -l -c cmd` recovers and does. td-login starts an interactive
+        // shell, so the case that matters on the image is the recovering one --
+        // a typo in `/etc/profile` does not cost the operator their session.
+        // Nothing is unwound on the way out: the EXIT trap is owed the dying
+        // frame's bindings, which is why `unwind_pending_to` is bounded.
+        Err(exec::Sig::Abort(code)) if !sh.interactive => Some(code),
+        Err(exec::Sig::Abort(code)) => {
+            // Recovering, not exiting, so the two halves a prompt does: the
+            // bindings `Sig::Abort` unwound PAST go away -- without this,
+            // `f() { local PATH=/bad; : ${x:?}; }; f` in a profile leaves the
+            // session holding that `PATH` -- and `$?` is the failure's.
+            exec::unwind_pending_to(sh, 0);
+            sh.set_status(code);
+            None
+        }
+        // A `return` outside a function is unspecified; ash takes the operand
+        // as `$?` and carries on, which is what `return 5` reports there.
+        Err(exec::Sig::Return(code)) => {
+            sh.set_status(code);
+            None
+        }
+        // A stray break/continue is not worth ending a login over.
+        Err(_) => {
+            exec::unwind_pending_to(sh, 0);
+            None
+        }
+    }
 }
 
 /// A minimal read-eval-print loop: read lines, accumulating while the parse is

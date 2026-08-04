@@ -1369,3 +1369,234 @@ fn file_writing_case_does_not_pollute_cwd() -> Result<(), Box<dyn std::error::Er
     assert!(!Path::new(&marker).exists(), "case leaked {marker} into the cwd — isolation broken");
     Ok(())
 }
+
+/// A LOGIN shell reads the profiles, and a non-login one does not.
+///
+/// This is the mechanism the image's greeter turns on: `td-login` execs the shell
+/// with `argv[0]` set to `-sh`, and `/etc/profile` is what prints the greeter
+/// marker, parks a boot-fail target and exports `PS1`/`XDG_RUNTIME_DIR`. A shell
+/// that ignores the convention starts a session with none of it, and nothing
+/// about that failure mentions profiles — the boot simply never says it reached
+/// the greeter.
+#[test]
+fn a_login_shell_reads_the_profiles() -> Result<(), Box<dyn std::error::Error>> {
+    let home = profile_home("profile")?;
+    let run = |arg0: &str, extra: &[&str]| login_run(&home, arg0, extra, "echo got=$FROM_PROFILE");
+
+    // Every one of these reads the HOST's `/etc/profile` too, and a test cannot
+    // mount over it, so what it contributes is MEASURED rather than assumed: the
+    // same login with no user profile is the control, and the assertion is what
+    // OUR file adds on top of it.
+    let control = login_run(&home, "-sh", &[], ":")?.0;
+    assert!(
+        !control.contains("PROFILE-RAN"),
+        "the host's /etc/profile prints this test's marker: {control:?}"
+    );
+    std::fs::write(home.join(".profile"), "export FROM_PROFILE=yes\necho PROFILE-RAN\n")?;
+
+    // The Bourne convention: a leading `-` on argv[0] IS the login flag, and it
+    // is the only channel `login` has for saying so.
+    let (out, _) = run("-sh", &[])?;
+    assert_eq!(
+        out,
+        format!("{control}PROFILE-RAN\ngot=yes\n"),
+        "a `-`-prefixed argv[0] did not read the profile (or the host's \
+         /etc/profile ended the login before ours was reached)"
+    );
+    // ...and asking outright does the same thing.
+    assert_eq!(run("td-sh", &["-l"])?.0, format!("{control}PROFILE-RAN\ngot=yes\n"));
+    // A plain shell does NOT read them -- neither ours nor the host's, which is
+    // why this one can still be exact: a profile run per subshell would re-export
+    // the operator's environment under every command a script starts.
+    assert_eq!(run("td-sh", &[])?.0, "got=\n");
+    let _ = std::fs::remove_dir_all(&home);
+    Ok(())
+}
+
+/// A profile is sourced INTO the session it is setting up, not into a shell that
+/// merely precedes it. Both halves of that are load-bearing and neither is
+/// visible from inside the profile's own output alone.
+///
+/// The invocation state first: `$0`, `$@` and `$-` are what the session will see
+/// by the time the profile runs, so `set --` in one is not overwritten a moment
+/// later and `case $- in *i*)` -- the guard nearly every distributed
+/// `/etc/profile` opens with -- answers for the right shell. The interactive `i`
+/// needs a terminal to observe and this crate can open none without `unsafe`, so
+/// the same ordering is pinned through `s`, which a stdin-script login sets on
+/// exactly the same line.
+///
+/// Then `exit`: it ends the LOGIN, with its status, and the EXIT trap runs when
+/// the session ends rather than when the profile does. td's own `/etc/profile`
+/// closes its autotest branch with `exit 0` to power the VM off; a shell that
+/// swallowed it would sit at a prompt on ttyS0 until the boot timed out.
+#[test]
+fn a_profile_is_sourced_into_the_session_it_sets_up() -> Result<(), Box<dyn std::error::Error>> {
+    let home = profile_home("sourced")?;
+
+    std::fs::write(home.join(".profile"), "echo state=[$0][$*][$-]\n")?;
+    let (out, _) = login_run(&home, "td-sh", &["-l"], "echo body")?;
+    assert!(
+        out.contains("state=[myname][a b][]"),
+        "the operands were not bound before the profile: {out:?}"
+    );
+    // The same ordering, one line further on: `-s` is set for a stdin script by
+    // the branch that also decides `interactive`, so `s` here IS the `i` above.
+    let mut cmd = std::process::Command::new(PathBuf::from(env!("CARGO_BIN_EXE_td-sh")));
+    cmd.args(["-l"])
+        .env_clear()
+        .env("HOME", &home)
+        .env("PATH", "/nonexistent")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped());
+    let mut child = cmd.spawn()?;
+    if let Some(mut w) = child.stdin.take() {
+        std::io::Write::write_all(&mut w, b"echo body\n")?;
+    }
+    let out = child.wait_with_output()?;
+    // Only the `$-` half is asserted here: `$0` for a shell with no name operand
+    // is `td-sh` where dash and ash report `argv[0]`, which is a pre-existing gap
+    // this commit neither creates nor closes, and pinning it would pin the gap.
+    // The `$-` above is dash's answer rather than busybox ash's, which also
+    // carries `c` for a `-c` shell; dash's `optletters` has no `c` at all.
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("][s]"),
+        "a stdin login did not have `s` in `$-` by profile time: {out:?}"
+    );
+
+    // `exit` ends the login there, with its own status, and nothing the shell was
+    // invoked to run happens after it.
+    std::fs::write(home.join(".profile"), "trap 'echo BYE' EXIT\nexit 7\necho NOT-REACHED\n")?;
+    let (out, code) = login_run(&home, "-sh", &[], "echo NOT-REACHED-EITHER")?;
+    assert_eq!(code, Some(7), "an `exit` in a profile did not end the login");
+    assert!(!out.contains("NOT-REACHED"), "the profile ran on past its exit: {out:?}");
+    assert!(out.ends_with("BYE\n"), "the EXIT trap did not run on the way out: {out:?}");
+
+    // A profile whose function ABORTS mid-way leaves nothing of itself behind.
+    // `Sig::Abort` unwinds without undoing the bindings it passed, so recovering
+    // means undoing them here as an interactive prompt does, or a `local` from a
+    // function that died is the session's from then on. `-i`, because that is the
+    // shell that RECOVERS -- a non-interactive one ends on the same error, which
+    // the sibling test pins -- and it is the shell td-login starts.
+    std::fs::write(
+        home.join(".profile"),
+        "f() { local FROM_PROFILE=leaked; : ${missing:?}; }\nf\n",
+    )?;
+    let (out, code) = login_run(&home, "-sh", &["-i"], "echo got=[$FROM_PROFILE] st=$?")?;
+    assert_eq!(code, Some(0), "the interactive login did not recover: {out:?}");
+    assert!(
+        out.ends_with("got=[] st=2\n"),
+        "an aborted profile function left its `local` or the wrong `$?`: {out:?}"
+    );
+
+    // ...and without one, the trap a profile installs waits for the SESSION to
+    // end, which is the difference between sourcing a profile and running it.
+    std::fs::write(home.join(".profile"), "trap 'echo BYE' EXIT\n")?;
+    let (out, code) = login_run(&home, "-sh", &[], "echo body")?;
+    assert_eq!(code, Some(0));
+    assert!(out.ends_with("body\nBYE\n"), "the EXIT trap fired early: {out:?}");
+    let _ = std::fs::remove_dir_all(&home);
+    Ok(())
+}
+
+/// A private `$HOME` for a profile test, empty and its own.
+fn profile_home(tag: &str) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    let home = std::env::temp_dir().join(format!("td-sh-{tag}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&home);
+    std::fs::create_dir_all(&home)?;
+    Ok(home)
+}
+
+/// One login shell over that `$HOME`, as `(stdout, exit status)`. `$0` and the
+/// positional parameters are always the same three words, so a profile can report
+/// what it was handed.
+fn login_run(
+    home: &std::path::Path,
+    arg0: &str,
+    extra: &[&str],
+    cmd: &str,
+) -> Result<(String, Option<i32>), Box<dyn std::error::Error>> {
+    use std::os::unix::process::CommandExt;
+    let mut c = std::process::Command::new(PathBuf::from(env!("CARGO_BIN_EXE_td-sh")));
+    c.arg0(arg0)
+        .args(extra)
+        .args(["-c", cmd, "myname", "a", "b"])
+        .env_clear()
+        .env("HOME", home)
+        .env("PATH", "/nonexistent");
+    let out = c.output()?;
+    Ok((String::from_utf8_lossy(&out.stdout).into_owned(), out.status.code()))
+}
+
+/// A profile that fails, or is absent, does not cost the operator the session.
+#[test]
+fn a_broken_profile_is_not_a_failed_login() -> Result<(), Box<dyn std::error::Error>> {
+    use std::os::unix::process::CommandExt;
+    let shell = PathBuf::from(env!("CARGO_BIN_EXE_td-sh"));
+    let home = profile_home("badprofile")?;
+    let run = |cmd: &str| -> Result<(String, String, bool), Box<dyn std::error::Error>> {
+        let out = std::process::Command::new(&shell)
+            .arg0("-sh")
+            .args(["-c", cmd])
+            .env_clear()
+            .env("HOME", &home)
+            .env("PATH", "/nonexistent")
+            .output()?;
+        Ok((
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+            out.status.success(),
+        ))
+    };
+    // The host's `/etc/profile` is read here too (see the sibling test), so both
+    // streams are measured with no user profile first and asserted as deltas.
+    // `:` so the control's own output is empty and what it holds is the host's.
+    let (host_out, host_err, _) = run(":")?;
+
+    // A command that is not there, then one that is: the profile keeps going, and
+    // neither its failure nor its status reaches the shell.
+    std::fs::write(home.join(".profile"), "no_such_command_at_all\nexport LATER=set\n")?;
+    let (out, _, ok) = run("echo later=$LATER status=$?")?;
+    assert!(ok, "a failing profile ended the login");
+    assert_eq!(out, format!("{host_out}later=set status=0\n"));
+
+    // ...and `$?` CARRIES: a profile's last command is the last command, which is
+    // what dash and busybox ash both do -- neither touches `exitstatus` between
+    // the profiles and what follows. Tidying it here would be a divergence.
+    std::fs::write(home.join(".profile"), "false\n")?;
+    let (out, _, ok) = run("echo status=$?")?;
+    assert!(ok, "a profile ending in a failure ended the login");
+    assert_eq!(out, format!("{host_out}status=1\n"));
+
+    // A FATAL error is a different thing from a failing command, and ash draws
+    // the line where td-sh now does: its top-level handler exits when
+    // `iflag == 0`, so a NON-interactive login over a broken profile never runs
+    // what it was invoked for. Measured against busybox ash, which answers rc 2
+    // and no stdout for both a `${x:?}` and a syntax error, exactly as this does.
+    // The image is unaffected -- td-login starts an INTERACTIVE shell, which
+    // recovers in both shells, so a typo in `/etc/profile` still does not cost
+    // the operator their session.
+    for fatal in ["if\necho NOT-REACHED\n", ": ${missing:?}\necho NOT-REACHED\n"] {
+        std::fs::write(home.join(".profile"), fatal)?;
+        let (out, err, ok) = run("echo NOT-REACHED-EITHER")?;
+        assert!(!ok, "a fatal profile error did not end a non-interactive login");
+        assert_eq!(out, host_out, "the login ran on past a fatal profile error: {out:?}");
+        // ...and it is reported against the file it is in -- `td-sh: <path>: ...`,
+        // the shape `.` gives a sourced file, because a diagnostic naming no file
+        // is one an operator cannot act on.
+        let added = err.strip_prefix(host_err.as_str()).unwrap_or(&err);
+        assert!(
+            added.starts_with(&format!("td-sh: {}/.profile: ", home.display()))
+                || added.starts_with("missing: "),
+            "the error did not name the profile: {added:?}"
+        );
+    }
+
+    // No profile at all is the ordinary case, and adds nothing to either stream:
+    // a complaint here would print on every console at every boot.
+    std::fs::remove_file(home.join(".profile"))?;
+    let (out, err, _) = run("echo ok")?;
+    assert_eq!(out, format!("{host_out}ok\n"));
+    assert_eq!(err, host_err);
+    let _ = std::fs::remove_dir_all(&home);
+    Ok(())
+}
