@@ -39,13 +39,9 @@ xfail grep-cli.test.txt::while GNU's own -o reads the dropped interval as text
 xfail grep-cli.test.txt::which it does with no group in the pattern at all
 xfail grep-cli.test.txt::a backreference in ANOTHER branch reads the whole pattern glibc's way
 xfail grep-cli.test.txt::where its -o, reading glibc, selects nothing in those same lines
-xfail sed-cli.test.txt::without -s a failure on the FIRST operand outranks the quit code too
-xfail sed-cli.test.txt::and q5 reports it rather than 5
-xfail sed-cli.test.txt::q stops before a later operand is opened, so it is never reported
 xfail sed-cli.test.txt::GNU's own r cannot see what its w has written, because the write is buffered
 xfail sed-cli.test.txt::a --sandbox that FOLLOWS the w it would refuse comes too late in GNU
 xfail sed-cli.test.txt::and a w naming the -f script truncates it before GNU reads it
-xfail sed-cli.test.txt::F names the file GNU's $ lookahead has already opened
 xfail sed-cli.test.txt::\c at the end of a text controls the text's own terminator
 xfail sed-cli.test.txt::where nothing before the dollar pins where a match may start, GNU's literal shows through
 xfail sed-cli.test.txt::a dot pins no byte either, so the same pattern past a branch start still does

@@ -1380,38 +1380,99 @@ struct Line {
     terminated: bool,
 }
 
+/// The input a run reads, opened ONE OPERAND AT A TIME. Without `-s` every
+/// operand is concatenated into one stream, but they are not read up front: GNU
+/// opens the next only when the current one runs out, so an operand a `q` never
+/// reaches is never opened and never reported. That ordering is the whole point
+/// of the type — it decides which read failures exist at all.
 struct Stream {
-    /// (index of that file's first line, name). Without `-s` every operand is
-    /// concatenated into ONE stream, and `F` must still name the right file.
-    names: Vec<(usize, Vec<u8>)>,
+    /// Operands not yet opened. Under `-s`/`-i` the caller opens one operand per
+    /// `Stream`, so this is empty. An iterator rather than a slice and a cursor:
+    /// nothing revisits an operand, so nothing needs to look back at one.
+    pending: std::vec::IntoIter<Vec<u8>>,
+    separator: u8,
+    /// The file currently OPEN: `F` names it. The `$` lookahead below can open
+    /// the NEXT one mid-cycle, which is exactly when `F` starts naming that.
+    name: Vec<u8>,
     lines: Vec<Line>,
     pos: usize,
+    /// A read failure already suffered. It outranks a quit code, and because
+    /// operands open lazily it can only describe a file the run actually reached.
+    bad: bool,
 }
 
-
 impl Stream {
-    /// The name of the file line `idx` came from.
-    fn name_at(&self, idx: usize) -> &[u8] {
-        let mut name: &[u8] = b"-";
-        for (start, n) in &self.names {
-            if *start > idx {
-                break;
-            }
-            name = n;
+    /// One operand's worth of already-read data, for the `-s`/`-i` path.
+    fn of(path: &[u8], data: &[u8], separator: u8) -> Self {
+        Self {
+            pending: Vec::new().into_iter(),
+            separator,
+            name: path.to_vec(),
+            lines: to_lines(data, separator),
+            pos: 0,
+            bad: false,
         }
-        name
+    }
+
+    /// Every operand, none of them read yet. Taken BY VALUE: nothing revisits an
+    /// operand, so nothing needs a copy of one.
+    fn of_operands(paths: Vec<Vec<u8>>, separator: u8) -> Self {
+        Self {
+            pending: paths.into_iter(),
+            separator,
+            name: b"-".to_vec(),
+            lines: Vec::new(),
+            pos: 0,
+            bad: false,
+        }
+    }
+
+    /// Open operands until one HAS A LINE, reporting each that cannot be read and
+    /// stepping over each that is empty — GNU's `last_file_with_data_p`, which is
+    /// also how its `$` test answers. `false` once nothing is left.
+    fn advance(&mut self) -> bool {
+        while self.pos >= self.lines.len() {
+            let Some(path) = self.pending.next() else {
+                return false;
+            };
+            // GNU sets the name before it tries to open, so a failed operand is
+            // what `F` would report until the next open replaces it.
+            self.name = path;
+            match read_input(&self.name) {
+                Ok(data) => {
+                    self.lines = to_lines(&data, self.separator);
+                    self.pos = 0;
+                }
+                Err(e) => {
+                    eprintln!("sed: can't read {}: {}", show(&self.name), errmsg(&e));
+                    self.bad = true;
+                }
+            }
+        }
+        true
+    }
+
+    /// The file `F` names: the one most recently OPENED, not the one the current
+    /// line came from. Those differ exactly when a `$` has looked ahead.
+    fn current_name(&self) -> &[u8] {
+        &self.name
     }
 
     fn next_line(&mut self) -> Option<Line> {
+        if !self.advance() {
+            return None;
+        }
         let line = self.lines.get(self.pos)?;
         let out = Line { text: line.text.clone(), terminated: line.terminated };
         self.pos += 1;
         Some(out)
     }
 
-    /// No further input line, so the line just read was `$`.
-    fn at_last(&self) -> bool {
-        self.pos >= self.lines.len()
+    /// No further input line, so the line just read was `$`. Takes `&mut` because
+    /// ANSWERING opens operands: that is observable, through `F` and through which
+    /// unreadable operand gets reported, so only a `$` may ask.
+    fn at_last(&mut self) -> bool {
+        !self.advance()
     }
 }
 
@@ -1634,7 +1695,6 @@ struct Sed {
     /// per command: two `R f` commands share one cursor in GNU, and advance it
     /// twice in a cycle.
     rfiles: BTreeMap<Vec<u8>, RFile>,
-    file_name: Vec<u8>,
 }
 
 /// Does a single address match the current line? Free of `Sed` so the caller can
@@ -1672,12 +1732,16 @@ fn kind_matches(
     last_regex: Option<usize>,
     pattern: &[u8],
     line_number: u64,
-    at_last: bool,
+    stream: &mut Stream,
 ) -> Result<(bool, Option<usize>), String> {
     match kind {
         AddrKind::Line(n) => Ok((line_number == *n, None)),
         AddrKind::Zero => Ok((false, None)),
-        AddrKind::Last => Ok((at_last, None)),
+        // Asked HERE and nowhere else, because asking OPENS the next operand:
+        // a `$` that is never evaluated -- the end of a range that has not
+        // started -- must not open one. GNU's `match_address_p` reaches its
+        // `test_eof` on the same terms.
+        AddrKind::Last => Ok((stream.at_last(), None)),
         // `step` is never 0 here: `first~0` is normalised to a plain line at
         // parse time, so this arm is only ever a real stride.
         AddrKind::Step { first, step } => {
@@ -1703,7 +1767,7 @@ impl Sed {
     /// missed — and only such a range is subject to the line-number end test on
     /// its own first line. A range started by a regex always selects at least
     /// that line.
-    fn addr_matches(&mut self, idx: usize, at_last: bool) -> Result<bool, String> {
+    fn addr_matches(&mut self, idx: usize, stream: &mut Stream) -> Result<bool, String> {
         // The script is only read through raw pieces here so each borrow ends
         // before the range state (or `last_regex`) is written.
         let Some(cmd) = self.script.cmds.get(idx) else {
@@ -1714,7 +1778,7 @@ impl Sed {
             return Ok(!negate);
         }
         if !cmd.addr.is_range() {
-            let hit = self.match_a1(idx, at_last)?;
+            let hit = self.match_a1(idx, stream)?;
             return Ok(hit != negate);
         }
         let a1_line = match cmd.addr.a1 {
@@ -1724,7 +1788,7 @@ impl Sed {
         let state = self.ranges.get(idx).copied().unwrap_or_default();
 
         let hit = if let RangeState::Active(start) = state {
-            let (ends, select) = self.range_step(idx, start, at_last)?;
+            let (ends, select) = self.range_step(idx, start, stream)?;
             if ends {
                 self.set_range(idx, RangeState::Closed);
             }
@@ -1735,13 +1799,13 @@ impl Sed {
                 Some(n) => state != RangeState::Closed && self.line_number >= n,
                 // `AddrKind::Zero` (`0,/re/`) never matches as a start: the
                 // range is seeded ACTIVE before the first cycle instead.
-                None => self.match_a1(idx, at_last)?,
+                None => self.match_a1(idx, stream)?,
             };
             if !starts {
                 false
             } else {
                 let start = self.line_number;
-                let (ends, select) = self.range_opens(idx, start, a1_line, at_last)?;
+                let (ends, select) = self.range_opens(idx, start, a1_line, stream)?;
                 self.set_range(
                     idx,
                     if ends { RangeState::Closed } else { RangeState::Active(start) },
@@ -1766,7 +1830,7 @@ impl Sed {
         idx: usize,
         start: u64,
         a1_line: Option<u64>,
-        at_last: bool,
+        stream: &mut Stream,
     ) -> Result<(bool, bool), String> {
         let line = self.line_number;
         match self.script.cmds.get(idx).map(|c| &c.addr.a2) {
@@ -1799,7 +1863,7 @@ impl Sed {
             Some(Some(
                 Addr2::Multiple(_) | Addr2::Kind(AddrKind::Last | AddrKind::Step { .. }),
             )) => {
-                let (ends, _) = self.range_step(idx, start, at_last)?;
+                let (ends, _) = self.range_step(idx, start, stream)?;
                 Ok((ends, true))
             }
             _ => Ok((false, true)),
@@ -1807,7 +1871,12 @@ impl Sed {
     }
 
     /// A line INSIDE a running range: does it end here, and is it selected?
-    fn range_step(&mut self, idx: usize, start: u64, at_last: bool) -> Result<(bool, bool), String> {
+    fn range_step(
+        &mut self,
+        idx: usize,
+        start: u64,
+        stream: &mut Stream,
+    ) -> Result<(bool, bool), String> {
         let line = self.line_number;
         let kind = match self.script.cmds.get(idx).map(|c| &c.addr.a2) {
             // `start + N` WRAPS, as GNU's counter does: `1,+(2^64-1)` ends at
@@ -1832,7 +1901,7 @@ impl Sed {
             self.last_regex,
             &self.pattern,
             line,
-            at_last,
+            stream,
         )?;
         if let Some(i) = used {
             self.last_regex = Some(i);
@@ -1840,7 +1909,7 @@ impl Sed {
         Ok((hit, true))
     }
 
-    fn match_a1(&mut self, idx: usize, at_last: bool) -> Result<bool, String> {
+    fn match_a1(&mut self, idx: usize, stream: &mut Stream) -> Result<bool, String> {
         let kind = match self.script.cmds.get(idx).map(|c| &c.addr.a1) {
             Some(Some(k)) => k,
             _ => return Ok(false),
@@ -1853,7 +1922,7 @@ impl Sed {
             self.last_regex,
             &self.pattern,
             self.line_number,
-            at_last,
+            stream,
         )?;
         if let Some(i) = used {
             self.last_regex = Some(i);
@@ -2458,7 +2527,6 @@ fn run(args: &[Vec<u8>]) -> Result<i32, Fatal> {
         last_regex: None,
         wfiles,
         rfiles: BTreeMap::new(),
-        file_name: b"-".to_vec(),
     };
 
     // `-i` rewrites its OPERANDS, so with none there is nothing to edit and
@@ -2527,10 +2595,9 @@ fn run(args: &[Vec<u8>]) -> Result<i32, Fatal> {
                 // A read failure that has ALREADY happened outranks the quit code,
                 // whatever it is: `sed -s -n Q7 /nosuch A` is 2 in GNU, not 7, while
                 // `sed -s -n Q7 A /nosuch` is 7 because the quit fires before the
-                // second operand is ever opened. Only this path may consult `status`,
-                // since it opens one operand at a time; the branch below reads every
-                // operand BEFORE the first cycle to resolve `$`, so its `status` can
-                // describe a file GNU would have quit before opening.
+                // second operand is ever opened. Sound on both paths now that each
+                // opens one operand at a time — a `status` set here can only
+                // describe a file the run actually reached.
                 return Ok(match status {
                     0 => code,
                     _ => status,
@@ -2538,27 +2605,24 @@ fn run(args: &[Vec<u8>]) -> Result<i32, Fatal> {
             }
         }
     } else {
-        // One logical stream: line numbers and `$` span every input.
-        let mut lines: Vec<Line> = Vec::new();
-        let mut names: Vec<(usize, Vec<u8>)> = Vec::new();
-        for path in &inputs {
-            match read_input(path) {
-                Ok(d) => {
-                    names.push((lines.len(), path.clone()));
-                    lines.extend(to_lines(&d, separator));
-                }
-                Err(e) => {
-                    eprintln!("sed: can't read {}: {}", show(path), errmsg(&e));
-                    status = 2;
-                }
-            }
-        }
-        let mut stream = Stream { names, lines, pos: 0 };
+        // One logical stream: line numbers and `$` span every input. The operands
+        // are opened one at a time, so a failure is only suffered where GNU
+        // suffers it — reading every one up front reported files a `q` had
+        // already quit before, and reported them as SUCCESS.
+        let mut stream = Stream::of_operands(inputs, separator);
         let mut sink = Sink::stdout(&mut out, separator);
         let quit = sed.run_stream(&mut stream, &mut sink).map_err(Fatal::runtime)?;
+        if stream.bad {
+            status = 2;
+        }
         if let Some(code) = quit {
             out.flush().map_err(|e| Fatal::runtime(format!("write error: {}", errmsg(&e))))?;
-            return Ok(code);
+            // Same rule the `-s` path has always applied, and now sound here too:
+            // a read failure ALREADY suffered outranks the quit code.
+            return Ok(match status {
+                0 => code,
+                _ => status,
+            });
         }
     }
     out.flush().map_err(|e| Fatal::runtime(format!("write error: {}", errmsg(&e))))?;
@@ -2702,7 +2766,7 @@ fn to_lines(data: &[u8], separator: u8) -> Vec<Line> {
 }
 
 fn to_stream(path: &[u8], data: &[u8], separator: u8) -> Stream {
-    Stream { names: vec![(0, path.to_vec())], lines: to_lines(data, separator), pos: 0 }
+    Stream::of(path, data, separator)
 }
 
 /// The backup name for `-i SUFFIX`: the suffix appended, or — GNU's other form —
@@ -2833,7 +2897,6 @@ impl Sed {
     /// to exit with that status.
     fn run_stream(&mut self, stream: &mut Stream, sink: &mut Sink) -> Result<Option<i32>, String> {
         loop {
-            self.file_name = stream.name_at(stream.pos).to_vec();
             let Some(line) = stream.next_line() else {
                 return Ok(self.quit);
             };
@@ -2961,8 +3024,7 @@ impl Sed {
     fn run_cycle(&mut self, stream: &mut Stream, sink: &mut Sink) -> Result<Flow, String> {
         let mut pc = 0usize;
         while pc < self.script.cmds.len() {
-            let at_last = stream.at_last();
-            if !self.addr_matches(pc, at_last)? {
+            if !self.addr_matches(pc, stream)? {
                 // A block whose address does not match is skipped whole.
                 if let Some(Cmd { kind: Kind::Block(end), .. }) = self.script.cmds.get(pc) {
                     pc = *end;
@@ -3183,7 +3245,10 @@ impl Sed {
                     sink.write(&buf)?;
                 }
                 Some(Kind::FileName) => {
-                    let mut buf = self.file_name.clone();
+                    // The name is read HERE, not snapshotted at the cycle's start:
+                    // GNU prints whatever operand is open, and a `$` earlier in the
+                    // same cycle has already opened the NEXT one.
+                    let mut buf = stream.current_name().to_vec();
                     buf.push(self.separator);
                     sink.write(&buf)?;
                 }
@@ -3334,8 +3399,7 @@ mod tests {
             last_regex: None,
             wfiles,
             rfiles: BTreeMap::new(),
-            file_name: b"-".to_vec(),
-        };
+            };
         let mut stream = to_stream(b"-", input.as_bytes(), sep);
         let mut sink = Sink::buffer(sep);
         sed.run_stream(&mut stream, &mut sink).unwrap();

@@ -1050,25 +1050,6 @@ td-txt-authored case files
     means reproducing stdio's buffer size, which is a worse thing to depend on than
     the divergence.
 
-  - GNU opens each operand only when it reaches it, so a `q` early in the script
-    means a later unreadable operand is never opened and never reported. td-txt's
-    non-`-s` path reads every operand up front to resolve `$`, so it cannot tell a
-    failure GNU would have seen from one it would have quit before reaching. Two
-    consequences, both pinned as cases: it prints a diagnostic GNU never does, and
-    where the failure comes FIRST the quit code wins there while GNU's failure wins.
-    The rule, which the `-s`/`-i` path does honour, is that a failure ALREADY SEEN
-    outranks the quit code whatever it is -- `sed -s -n Q7 /nosuch A` is 2, not 7 --
-    while a quit reached first keeps its own code. Making the eager path lazy means
-    teaching `$` to look ahead one operand.
-
-    A third consequence, and the cheapest probe for the whole gap: `F` names the
-    wrong file as soon as the script contains a `$`. GNU's lookahead has ALREADY
-    opened the next operand and `F` reports whatever is open, so `sed -n -e '$d' -e
-    F in0 in1 in2` prints `in1 in2` in GNU and `in0 in1` here; without the `$` both
-    print all three. It is one xfail case, and it is the shape to check first if
-    anyone makes the eager read lazy, because getting `F` right is the same question
-    as getting the lookahead right.
-
   - A `\c` with nothing to control eats an `a` text's own TERMINATOR: GNU
     accumulates the text WITH its trailing newline and decodes that whole buffer,
     so `a\<newline>\c` appends `J` -- the newline upper-cased and XORed with 0x40
@@ -1196,19 +1177,28 @@ td-txt-authored case files
     `-f`. Fail-CLOSED, predates the branch. Found by a reviewer as a byproduct of
     sweeping script HEADS for the `#n` rule -- the same sweep axis, one byte over.
 
-  - A quit code, or a bare `q`, after a failed operand WITHOUT `-s`: GNU reports
-    the failure and td-txt reports the quit. `sed -n q nosuch f` is 2 there and 0
-    here; `sed -n q5 nosuch f` is 2 there and 5 here. With `-s` both agree (2),
-    and in the other operand ORDER both agree (0) -- GNU quits before it ever
-    opens the second file. The rule GNU follows is that a read failure ALREADY
-    suffered outranks the quit code, which td-txt applies on the `-s`/in-place
-    path and cannot apply on the other: that path reads every operand up front to
-    resolve `$`, so by the first cycle its status may describe a file GNU would
-    have quit before opening. The comment at that return says as much. Closing it
-    means making the one-stream path lazy, which is the same shape of change as
-    the endless-stream entry below and belongs with it. Fail-open (a failure
-    reported as success), which makes it the more serious of the two; predates the
-    branch. Surfaced by a reviewer probing `q`'s exit code.
+  - A DIRECTORY as an OPERAND, and the one place lazy operand reading made a
+    divergence WORSE rather than better. GNU `fopen`s a directory successfully
+    and fails at the first READ, so it says `read error on DIR: Is a directory`
+    and exits 4 where td-txt says `can't read DIR: Is a directory` and exits 2
+    -- one message and one status apart, both fail-closed. The sharper half is
+    in the `$` lookahead, which reads a byte to see whether an operand has one:
+    GNU's read fails there and is SILENTLY treated as "no data", so
+    `sed -n '$F' A DIR` prints `DIR` at exit 0 with no diagnostic at all, while
+    td-txt reports the directory and exits 2.
+    The message and the plain-operand status predate the lazy reading. What it
+    MOVED is two things, and one of them is a regression stated plainly rather
+    than left in a bucket: `F` now prints GNU's `DIR` where it printed `A`,
+    which is better; and the status of a directory operand followed by a QUIT
+    went from AGREEING with GNU to disagreeing, because "a failure already
+    suffered outranks the quit code" now fires on a `bad` GNU never sets.
+    `sed -n -e '$p' -e q in0 DIR` is 0 in GNU and was 0 here, and is 2 now --
+    eight shapes of a 440-shape status-only sweep, every one a directory beside
+    a quit. It hid from the landing's own sweep because that sweep compares
+    stdout, stderr and status as ONE tuple, so a pre-existing stderr difference
+    masks a status that moved the wrong way. Closing all of it means
+    `read_input` separating the OPEN from the READ, which is the same change
+    the endless-input entry wants and belongs with it.
 
   - `-f` naming an ENDLESS stream (`/dev/zero`, `/dev/urandom`): GNU parses the
     script as it reads, so it fails on line 1 -- `unknown command: ` on a NUL

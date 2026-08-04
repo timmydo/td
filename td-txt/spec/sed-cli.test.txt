@@ -4708,10 +4708,9 @@ f$
 ## status: 0
 
 #### F names the file GNU's $ lookahead has already opened
-# Recorded gap, not a fix: GNU opens each operand only when it reaches it, but `$`
-# forces a lookahead that has ALREADY opened the next one, and `F` reports whatever
-# is open. td-txt reads every operand up front to resolve `$`, so it names the file
-# the line came from. Without a `$` in the script both agree.
+# `$` forces a lookahead that has ALREADY opened the next operand, and `F` reports
+# whatever is open rather than where the current line came from. Without a `$` in
+# the script both name the same file, which is the control beside this one.
 ## argv: sed -n -e '$d' -e F in0 in1 in2
 ## file-json in0: "a\n"
 ## file-json in1: "b\n"
@@ -9116,4 +9115,147 @@ xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx$
 ## END
 ## stderr-json: ""
 ## status: 0
+
+
+# WHEN an operand is opened, which is the rule the three cases above turn on.
+# GNU opens each only as it reaches it, so a `q' earlier in the script means a
+# later operand is never opened and its failure never exists. td-txt read every
+# operand up front to resolve `$', so it reported failures GNU never suffers --
+# and reported them as SUCCESS, a quit code winning over a status the run should
+# never have had. The opening is lazy now, one operand at a time.
+#
+# The `$' address is what complicates it: answering "is this the last line"
+# requires OPENING the next operand, stepping over empty ones, until one has a
+# line -- so a script containing a `$' opens operands a script without one does
+# not, and reports failures the other never sees. `F' is the cheapest probe,
+# naming whatever is open rather than where the current line came from.
+#### a q reached BEFORE the last line never opens the next operand
+# Same script as the case below, two lines in the first operand instead of one,
+# and the opposite answer: the `$' test is satisfied inside the file it is
+# already reading, so nothing crosses the boundary and the `q' quits before
+# anything could.
+## argv: sed -n -e '$d' -e q two nosuch
+## file-json two: "x\ny\n"
+## stdin-json: ""
+## stdout-json: ""
+## stderr-json: ""
+## status: 0
+
+#### but on the LAST line the $ test crosses, and the failure is reported
+# A CONTROL against the parent build, which read every operand up front and so
+# reported this too. What it holds is the other direction: a lazy reader with no
+# lookahead at all would never open `nosuch' here, and would be silent.
+## argv: sed -n -e '$d' -e q in0 nosuch
+## file-json in0: "a\n"
+## stdin-json: ""
+## stdout-json: ""
+## stderr-json: "sed: can't read nosuch: No such file or directory\n"
+## status: 2
+
+#### and with no $ in the script that same run says nothing
+## argv: sed -n q in0 nosuch
+## file-json in0: "a\n"
+## stdin-json: ""
+## stdout-json: ""
+## stderr-json: ""
+## status: 0
+
+#### the lookahead steps OVER an empty operand to find one with a line
+## argv: sed -n -e '$!F' in0 empty in2
+## file-json in0: "a\n"
+## file-json empty: ""
+## file-json in2: "c\n"
+## stdin-json: ""
+## stdout-json: "in2\n"
+## stderr-json: ""
+## status: 0
+
+#### F before the $ in the same cycle still names the old operand
+## argv: sed -n -e F -e '$d' in0 in1
+## file-json in0: "a\n"
+## file-json in1: "b\n"
+## stdin-json: ""
+## stdout-json: "in0\nin1\n"
+## stderr-json: ""
+## status: 0
+
+#### and after it, the one the lookahead opened
+## argv: sed -n -e '$d' -e F in0 in1
+## file-json in0: "a\n"
+## file-json in1: "b\n"
+## stdin-json: ""
+## stdout-json: "in1\n"
+## stderr-json: ""
+## status: 0
+
+#### -s gives $ no lookahead at all, so F names each file itself
+## argv: sed -s -n -e '$F' in0 in1
+## file-json in0: "a\n"
+## file-json in1: "b\n"
+## stdin-json: ""
+## stdout-json: "in0\nin1\n"
+## stderr-json: ""
+## status: 0
+
+#### a q on the last line of the FIRST operand stops before the second opens
+# `2q' on a ONE-line file never fires, so the reader walks on into `nosuch' and
+# the case cannot tell a lazy reader from an eager one. Two lines makes the quit
+# real, and then the second operand is never opened.
+## argv: sed -n 2q two nosuch
+## file-json two: "x\ny\n"
+## stdin-json: ""
+## stdout-json: ""
+## stderr-json: ""
+## status: 0
+
+#### an empty operand between two files is stepped over by the reader too
+# A CONTROL: an eager reader concatenates past an empty file just as a lazy one
+# steps over it, so only the LOOKAHEAD version above can red the step-over.
+## argv: sed -n F in0 empty in2
+## file-json in0: "a\n"
+## file-json empty: ""
+## file-json in2: "c\n"
+## stdin-json: ""
+## stdout-json: "in0\nin2\n"
+## stderr-json: ""
+## status: 0
+
+
+# WHICH `$` asks, and when. A `$` is only consulted where the address evaluator
+# REACHES it, so the end of a range that has not started is never asked and never
+# opens anything -- GNU's `match_address_p` looks at the second address only once
+# the first has matched. A gate on whether the command's address CONTAINS a `$`
+# is not the same rule and opens operands GNU leaves shut.
+
+#### a range whose END is $ does not ask while the range is DORMANT
+## argv: sed -n -e '2,$F' -e q in0 nosuch
+## file-json in0: "a\n"
+## stdin-json: ""
+## stdout-json: ""
+## stderr-json: ""
+## status: 0
+
+#### nor when a regex start has not matched
+## argv: sed -n -e '/z/,$F' -e q in0 nosuch
+## file-json in0: "a\n"
+## stdin-json: ""
+## stdout-json: ""
+## stderr-json: ""
+## status: 0
+
+#### but a range that has OPENED asks, and opens the operand
+## argv: sed -n -e '1,$F' -e q in0 nosuch
+## file-json in0: "a\n"
+## stdin-json: ""
+## stdout-json: "nosuch\n"
+## stderr-json: "sed: can't read nosuch: No such file or directory\n"
+## status: 2
+
+#### and so does a bare $ on the same line
+## argv: sed -n -e '$F' -e q in0 nosuch
+## file-json in0: "a\n"
+## stdin-json: ""
+## stdout-json: "nosuch\n"
+## stderr-json: "sed: can't read nosuch: No such file or directory\n"
+## status: 2
 
