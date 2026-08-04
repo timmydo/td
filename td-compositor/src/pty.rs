@@ -17,8 +17,9 @@ use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::thread::JoinHandle;
 
@@ -397,26 +398,272 @@ pub fn spawn_reader(
         .map_err(|e| format!("spawn PTY reader: {e}"))
 }
 
-/// Drain the keyboard queue into the child, consuming only what the kernel
-/// actually took. `write_all` would lose the remainder of a partial write, and
-/// those bytes are keystrokes with nowhere to come back from.
+/// One write, reporting what the kernel actually took. `write_all` would lose
+/// the remainder of a partial write, and those bytes are keystrokes with
+/// nowhere to come back from.
 ///
 /// The master is blocking, so a child that stops reading blocks this call once
-/// the line discipline fills. §12 puts the PTY writer on its own thread for
-/// exactly that reason; the main loop enqueues and never writes.
-#[allow(dead_code)]
-pub fn write_input(master: &File, queue: &mut crate::keys::InputQueue) -> Result<(), String> {
+/// the line discipline fills. §12 puts the writer on its own thread for exactly
+/// that reason.
+fn write_chunk(sink: &mut impl Write, bytes: &[u8]) -> Result<usize, String> {
     loop {
-        if queue.is_empty() {
-            return Ok(());
-        }
-        let mut borrowed = master;
-        match borrowed.write(queue.front(READ_CHUNK)) {
+        match sink.write(bytes) {
             Ok(0) => return Err("terminal accepted no input bytes".into()),
-            Ok(count) => queue.consume(count),
+            Ok(count) => return Ok(count),
             Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
             Err(error) => return Err(format!("write terminal input: {error}")),
         }
+    }
+}
+
+/// Drain a keyboard queue into the child, consuming only what was taken.
+#[allow(dead_code)]
+pub fn write_input(master: &File, queue: &mut crate::keys::InputQueue) -> Result<(), String> {
+    let mut sink = master;
+    while !queue.is_empty() {
+        let taken = write_chunk(&mut sink, queue.front(READ_CHUNK))?;
+        queue.consume(taken);
+    }
+    Ok(())
+}
+
+/// The keyboard queue the main loop fills and the writer thread drains.
+///
+/// ONE bounded queue rather than a queue plus a channel: §10 admits a key
+/// sequence whole or drops it whole, and a second buffer downstream would be a
+/// second place for half of one to sit. The lock is held to copy bytes out —
+/// which may contiguate the ring first — or to put a consumption back, NEVER
+/// across the write, because
+/// §12 requires the main loop to enqueue without blocking and the master is
+/// blocking — a child that stops reading parks the writer indefinitely once the
+/// line discipline fills.
+#[allow(dead_code)]
+pub struct Input {
+    pending: Mutex<Pending>,
+    ready: Condvar,
+}
+
+struct Pending {
+    queue: crate::keys::InputQueue,
+    closed: bool,
+    failed: Option<String>,
+}
+
+#[allow(dead_code)]
+impl Input {
+    pub fn new() -> Arc<Input> {
+        Arc::new(Input {
+            pending: Mutex::new(Pending {
+                queue: crate::keys::InputQueue::new(),
+                closed: false,
+                failed: None,
+            }),
+            ready: Condvar::new(),
+        })
+    }
+
+    /// Admit a sequence whole, or refuse it whole. `false` is the caller's cue
+    /// to ring the visual bell: half a `CSI` reaching the child would be worse
+    /// than the key never having been pressed.
+    ///
+    /// A writer that has DIED is an error rather than a refusal. The two look
+    /// identical from a full queue — bytes going nowhere either way — but they
+    /// are not the same news: §10 defines `false` as "that sequence did not
+    /// fit, ring the bell", and a terminal that beeps at every keystroke
+    /// because its writer is gone would be reporting the wrong one forever.
+    /// An explicit [`Input::close`] outranks both.
+    pub fn push(&self, bytes: &[u8]) -> Result<bool, String> {
+        let mut pending = self.pending.lock().map_err(|_| POISONED)?;
+        // An explicit close outranks a death: the caller that closed the queue
+        // is the one ending the session, so `false` is the answer it asked for
+        // and a writer dying afterwards is not news to it.
+        if pending.closed {
+            return Ok(false);
+        }
+        if let Some(failure) = &pending.failed {
+            return Err(format!("the terminal stopped accepting input: {failure}"));
+        }
+        let admitted = pending.queue.push(bytes);
+        if admitted {
+            self.ready.notify_one();
+        }
+        Ok(admitted)
+    }
+
+    /// Retire the writer once it has drained. Unlike the reader — parked in a
+    /// `read` nothing safe can interrupt — the writer parks in `Condvar::wait`,
+    /// which this wakes, so it HAS a retirement path.
+    ///
+    /// It is not an interruption, though. This sets the predicate the writer
+    /// checks BETWEEN writes; a writer already inside a blocking `write` stays
+    /// there, and nothing safe cancels one. A child that never reads does not
+    /// by itself cause that — in the kernel's default canonical mode the line
+    /// discipline accepts and discards rather than blocking, which is what the
+    /// tests cover — but a child in RAW mode that stops reading does, and that
+    /// is every shell and editor.
+    ///
+    /// Nor does the child's exit free such a writer. The last slave closing
+    /// hangs up the READER, which is its whole retirement; the writer stays
+    /// parked in `write` on the same terminal at the same instant. So the
+    /// handle is joinable only for a writer that is not inside a write, and
+    /// td-term's teardown is process exit rather than a join, exactly as it is
+    /// for the reader.
+    pub fn close(&self) -> Result<(), String> {
+        let mut pending = self.pending.lock().map_err(|_| POISONED)?;
+        pending.closed = true;
+        self.ready.notify_all();
+        Ok(())
+    }
+
+    /// Record that the writer died, so the next `push` says so. Best effort by
+    /// construction: this runs while already returning an error, and a
+    /// poisoned lock is not news it can improve on.
+    fn fail(&self, message: &str) {
+        if let Ok(mut pending) = self.pending.lock() {
+            pending.failed = Some(message.to_string());
+        }
+    }
+
+    #[cfg(test)]
+    fn queued(&self) -> Result<usize, String> {
+        Ok(self.pending.lock().map_err(|_| POISONED)?.queue.len())
+    }
+}
+
+const POISONED: &str = "the keyboard queue lock was poisoned by a panicking thread";
+const CHILD_POISONED: &str = "the child handover lock was poisoned by a panicking thread";
+
+/// Pump the keyboard queue into a sink until it is closed and drained.
+///
+/// Bytes are copied out under the lock and written WITHOUT it, so a `push` on
+/// the main loop never waits on a child that has stopped reading. That is the
+/// whole design constraint, and it is why this takes a sink rather than the
+/// master directly: against a real PTY the claim cannot fail visibly — in
+/// canonical mode the line discipline accepts and discards rather than
+/// blocking — so holding the lock across the write would cost a millisecond
+/// there and forever in raw mode, with every test still green.
+///
+/// Only this thread consumes, so a partial write's remainder stays at the
+/// front of the queue in order, whatever arrived meanwhile.
+fn pump(sink: &mut impl Write, input: &Input) -> Result<(), String> {
+    // Set up once: this is the loop a held key runs through, and the copy
+    // exists only to get the bytes out from under the lock.
+    let mut chunk = Vec::with_capacity(READ_CHUNK);
+    loop {
+        {
+            let mut pending = input.pending.lock().map_err(|_| POISONED)?;
+            while pending.queue.is_empty() && !pending.closed {
+                pending = input.ready.wait(pending).map_err(|_| POISONED)?;
+            }
+            if pending.queue.is_empty() {
+                return Ok(());
+            }
+            chunk.clear();
+            chunk.extend_from_slice(pending.queue.front(READ_CHUNK));
+        }
+        let taken = write_chunk(sink, &chunk)?;
+        input
+            .pending
+            .lock()
+            .map_err(|_| POISONED)?
+            .queue
+            .consume(taken);
+    }
+}
+
+/// Run [`pump`] on its own thread, recording a death where the main loop can
+/// see it.
+///
+/// The handle is joinable, but see [`Input::close`] for WHEN: closing wakes a
+/// writer waiting for bytes, not one already inside a blocking `write`.
+#[allow(dead_code)]
+pub fn spawn_writer(
+    master: File,
+    input: Arc<Input>,
+) -> Result<JoinHandle<Result<(), String>>, String> {
+    spawn_pump(master, input)
+}
+
+/// The one place a writer thread is created, so the tests that drive a sink
+/// exercise the same failure publication the master does rather than a
+/// re-implementation of it.
+fn spawn_pump<W: Write + Send + 'static>(
+    mut sink: W,
+    input: Arc<Input>,
+) -> Result<JoinHandle<Result<(), String>>, String> {
+    thread::Builder::new()
+        .name("td-term-pty-input".into())
+        .spawn(move || {
+            let outcome = pump(&mut sink, &input);
+            if let Err(failure) = &outcome {
+                input.fail(failure);
+            }
+            outcome
+        })
+        .map_err(|e| format!("spawn PTY writer: {e}"))
+}
+
+/// One exit, so the main loop can unmap and go. Capacity one: there is exactly
+/// one child and it exits exactly once.
+#[allow(dead_code)]
+pub fn exit_channel() -> (SyncSender<ExitStatus>, Receiver<ExitStatus>) {
+    sync_channel(1)
+}
+
+/// Wait for the child and report how it went.
+///
+/// A send failure is not an error: it means the main loop is already gone, and
+/// the child having exited is the only thing this thread had to say.
+///
+/// The child is handed over through a cell rather than moved into the closure,
+/// so a failed spawn can take it back and kill it: `Builder::spawn` drops the
+/// closure on failure, and dropping a `Child` neither signals nor reaps. Losing
+/// it that way would leave a live process holding the slave — no hangup for the
+/// reader, and a zombie once it exits.
+#[allow(dead_code)]
+pub fn spawn_waiter(
+    child: Child,
+    sender: SyncSender<ExitStatus>,
+) -> Result<JoinHandle<Result<(), String>>, String> {
+    let held = Arc::new(Mutex::new(Some(child)));
+    let carried = Arc::clone(&held);
+    let spawned = thread::Builder::new()
+        .name("td-term-child".into())
+        .spawn(move || {
+            let mut child = carried
+                .lock()
+                .map_err(|_| CHILD_POISONED)?
+                .take()
+                .ok_or("the child waiter was handed no child")?;
+            let status = child.wait().map_err(|e| format!("wait for child: {e}"))?;
+            // Deliberately ignored: a closed receiver means the main loop is
+            // already gone, which is not this thread's problem to report.
+            let _ = sender.send(status);
+            Ok(())
+        });
+    match spawned {
+        Ok(handle) => Ok(handle),
+        Err(e) => Err(reap_unwatched(&held, &format!("spawn child waiter: {e}"))),
+    }
+}
+
+/// Kill and reap a child no thread will wait for. Both failures are reported
+/// when the cleanup fails too, since either message alone would misdescribe
+/// what was left behind.
+fn reap_unwatched(held: &Mutex<Option<Child>>, cause: &str) -> String {
+    let taken = match held.lock() {
+        Ok(mut slot) => slot.take(),
+        Err(_) => return format!("{cause}; the child could not be reclaimed: {CHILD_POISONED}"),
+    };
+    let Some(mut child) = taken else {
+        return cause.to_string();
+    };
+    if let Err(e) = child.kill() {
+        return format!("{cause}; and the child could not be killed: {e}");
+    }
+    match child.wait() {
+        Ok(_) => cause.to_string(),
+        Err(e) => format!("{cause}; and the killed child could not be reaped: {e}"),
     }
 }
 
@@ -743,6 +990,7 @@ mod tests {
     }
 
     const FIXTURE: &str = "TD_TERM_PTY_FIXTURE";
+    const SILENT_FIXTURE: &str = "TD_TERM_PTY_SILENT_FIXTURE";
 
     /// The child half of the test above: it runs only when the parent asks for
     /// it, and reports what it sees on its own stdin.
@@ -762,6 +1010,444 @@ mod tests {
             size.columns,
             directory.display()
         );
+    }
+
+    /// A child that holds the terminal and never reads a byte of it, so a
+    /// writer can be parked in `write` against a live process.
+    #[test]
+    #[ignore = "run as a child of the parked-writer test"]
+    fn pty_silent_child_fixture() {
+        let Some(millis) = std::env::var_os(SILENT_FIXTURE) else {
+            return;
+        };
+        // The parent picks the lifetime: long enough to outlive a drain in one
+        // test, and long enough in another that reaping a child NOT killed
+        // would blow a deadline rather than quietly succeed.
+        let millis: u64 = millis.to_string_lossy().parse().unwrap();
+        thread::sleep(Duration::from_millis(millis));
+    }
+
+    /// Cross-thread waits here are bounded. `cargo test` has no per-test
+    /// timeout, so an unbounded one turns a regression into a hung gate
+    /// instead of a red test — the same policy the reader's tests follow.
+    fn within<T: Send + 'static>(work: impl FnOnce() -> T + Send + 'static) -> Option<T> {
+        let (sender, receiver) = sync_channel(1);
+        thread::spawn(move || {
+            let _ = sender.send(work());
+        });
+        receiver.recv_timeout(Duration::from_secs(30)).ok()
+    }
+
+    /// Read one helping from a terminal, without waiting forever for it.
+    fn read_within(file: &File) -> Option<Vec<u8>> {
+        let mut clone = file.try_clone().unwrap();
+        within(move || {
+            let mut seen = vec![0u8; 64];
+            let count = clone.read(&mut seen).unwrap();
+            seen.truncate(count);
+            seen
+        })
+    }
+
+    /// A sink that parks INSIDE `write` until released, which is the state no
+    /// real PTY can be held in from this crate.
+    struct GatedSink {
+        entered: SyncSender<()>,
+        release: Receiver<()>,
+        written: Arc<Mutex<Vec<u8>>>,
+        outcome: Option<String>,
+    }
+
+    impl Write for GatedSink {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            let _ = self.entered.send(());
+            let _ = self.release.recv();
+            if let Some(failure) = &self.outcome {
+                return Err(std::io::Error::other(failure.clone()));
+            }
+            if let Ok(mut written) = self.written.lock() {
+                written.extend_from_slice(bytes);
+            }
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// The case the retirement contract is really about: a child that holds
+    /// the terminal and never reads a byte. In the kernel's default canonical
+    /// mode that does NOT park the writer — the line discipline discards what
+    /// its buffer cannot hold — so the close still retires it, and the drain
+    /// here completes long before the child's own exit. Raw mode is the case
+    /// that can park a writer, and this crate cannot construct it: its ioctl
+    /// roster carries no termios request, by design.
+    #[test]
+    fn a_child_that_never_reads_does_not_trap_the_writer() {
+        let pty = open_pty();
+        pty.resize(24, 80).unwrap();
+        let slave = pty.peer().unwrap();
+        let command = ChildCommand {
+            program: std::env::current_exe().unwrap(),
+            arguments: vec![
+                "--exact".into(),
+                "pty::tests::pty_silent_child_fixture".into(),
+                "--ignored".into(),
+                "--nocapture".into(),
+            ],
+        };
+        let account = account(PASSWD, 1000).unwrap();
+        let mut environment = environment(&account);
+        environment.push((SILENT_FIXTURE.into(), "1500".into()));
+        // `spawn` consumes the slave and both clones into the child's stdio,
+        // so the child is the only holder and its exit is the last close.
+        let child = spawn(&command, &environment, &std::env::temp_dir(), slave).unwrap();
+        let input = Input::new();
+        let master = pty.into_master();
+        let writer = spawn_writer(master.try_clone().unwrap(), Arc::clone(&input)).unwrap();
+        // The child writes nothing deliberately, but its harness does, and the
+        // terminal echoes every byte pushed below back at the master. Both have
+        // to keep moving or the CHILD blocks in its own write — a deadlock of
+        // this test's making rather than anything about the writer.
+        let (chunks, output) = output_channel();
+        let reader = spawn_reader(master, chunks).unwrap();
+        let drain = thread::spawn(move || while output.recv().is_ok() {});
+
+        let sequence = vec![b'z'; 1024];
+        let mut pushed = 0;
+        while pushed < 1024 * 1024 && input.push(&sequence).unwrap() {
+            pushed += sequence.len();
+        }
+        input.close().unwrap();
+        // The close retires it: nothing here waits for the child, which is
+        // still asleep and has read none of this.
+        within(move || writer.join())
+            .expect("the writer never retired")
+            .unwrap()
+            .unwrap();
+
+        let (sender, receiver) = exit_channel();
+        spawn_waiter(child, sender).unwrap();
+        receiver
+            .recv_timeout(Duration::from_secs(30))
+            .expect("the silent child never exited");
+        // The child was the only slave holder, so its exit is the reader's EOF.
+        within(move || reader.join())
+            .expect("the reader never saw the hangup")
+            .unwrap()
+            .unwrap();
+        drain.join().unwrap();
+    }
+
+    /// The commit's central invariant, and the only place it can fail: a push
+    /// completes while the writer is INSIDE a write. Against a real PTY this
+    /// cannot be observed — canonical mode accepts and discards rather than
+    /// blocking — so moving `write_chunk` inside the lock scope leaves every
+    /// other test green while making the main loop wait on the child forever.
+    #[test]
+    fn the_queue_lock_is_not_held_across_a_write() {
+        let (entered, arrivals) = sync_channel(1);
+        let (release, held) = sync_channel(1);
+        let written = Arc::new(Mutex::new(Vec::new()));
+        let sink = GatedSink {
+            entered,
+            release: held,
+            written: Arc::clone(&written),
+            outcome: None,
+        };
+        let input = Input::new();
+        assert!(input.push(b"first").unwrap());
+
+        let writer = spawn_pump(sink, Arc::clone(&input)).unwrap();
+        arrivals
+            .recv_timeout(Duration::from_secs(30))
+            .expect("the writer never reached its write");
+
+        // The writer is now parked in `write` holding nothing. A push that
+        // waits on it never returns, so this is bounded rather than joined.
+        let pushing = Arc::clone(&input);
+        let admitted = within(move || pushing.push(b"second"))
+            .expect("a push waited on a writer that was inside a write");
+        assert!(admitted.unwrap());
+
+        let _ = release.send(());
+        let _ = release.send(());
+        input.close().unwrap();
+        drop(release);
+        within(move || writer.join())
+            .expect("the writer never retired")
+            .unwrap()
+            .unwrap();
+        assert_eq!(written.lock().unwrap().as_slice(), b"firstsecond");
+    }
+
+    /// A writer that died is not a full queue. Both look like bytes going
+    /// nowhere, but §10's `false` means "ring the bell", and a session whose
+    /// writer is gone would ring it at every keystroke forever.
+    #[test]
+    fn a_dead_writer_is_reported_to_the_next_push() {
+        let (entered, arrivals) = sync_channel(1);
+        let (release, held) = sync_channel(1);
+        let sink = GatedSink {
+            entered,
+            release: held,
+            written: Arc::new(Mutex::new(Vec::new())),
+            outcome: Some("the terminal hung up".into()),
+        };
+        let input = Input::new();
+        assert!(input.push(b"doomed").unwrap());
+        let writer = spawn_pump(sink, Arc::clone(&input)).unwrap();
+        arrivals
+            .recv_timeout(Duration::from_secs(30))
+            .expect("the writer never reached its write");
+        let _ = release.send(());
+        // The thread publishes the failure before it returns, so a join that
+        // has completed is proof the record was written the production way.
+        within(move || writer.join())
+            .expect("the writer never retired")
+            .unwrap()
+            .unwrap_err();
+
+        let failure = input.push(b"x").unwrap_err();
+        assert!(
+            failure.contains("hung up"),
+            "a dead writer read as a full queue: {failure}"
+        );
+    }
+
+    /// A close outranks a death that follows it. The main loop that closed
+    /// the queue is the one ending the session, so the answer stays the `false`
+    /// it asked for rather than becoming an error about a writer it retired.
+    #[test]
+    fn a_close_outranks_a_writer_that_dies_after_it() {
+        let (entered, arrivals) = sync_channel(1);
+        let (release, held) = sync_channel(1);
+        let sink = GatedSink {
+            entered,
+            release: held,
+            written: Arc::new(Mutex::new(Vec::new())),
+            outcome: Some("the terminal hung up".into()),
+        };
+        let input = Input::new();
+        assert!(input.push(b"doomed").unwrap());
+        let writer = spawn_pump(sink, Arc::clone(&input)).unwrap();
+        arrivals
+            .recv_timeout(Duration::from_secs(30))
+            .expect("the writer never reached its write");
+
+        input.close().unwrap();
+        let _ = release.send(());
+        within(move || writer.join())
+            .expect("the writer never retired")
+            .unwrap()
+            .unwrap_err();
+        assert!(!input.push(b"x").unwrap());
+    }
+
+    /// The wakeup discipline itself. Both notifications are load-bearing and
+    /// they mask each other: a push after the writer has parked needs `push`'s
+    /// own `notify_one`, and nothing here closes, so `close`'s `notify_all`
+    /// cannot stand in for it.
+    #[test]
+    fn a_push_wakes_a_writer_that_has_already_drained() {
+        let pty = open_pty();
+        let slave = pty.peer().unwrap();
+        let input = Input::new();
+        let master = pty.into_master();
+        let writer = spawn_writer(master.try_clone().unwrap(), Arc::clone(&input)).unwrap();
+
+        assert!(input.push(b"first\n").unwrap());
+        assert_eq!(read_within(&slave).expect("no first line"), b"first\n");
+        // The writer is parked in `wait` now, with an empty queue and no close
+        // coming. Only the push below can move it.
+        assert!(input.push(b"second\n").unwrap());
+        assert_eq!(read_within(&slave).expect("no second line"), b"second\n");
+
+        input.close().unwrap();
+        within(move || writer.join())
+            .expect("the writer never retired")
+            .unwrap()
+            .unwrap();
+    }
+
+    /// What the main loop enqueues is what the child reads, in order.
+    #[test]
+    fn the_writer_delivers_what_was_enqueued_and_retires_on_close() {
+        let pty = open_pty();
+        let mut slave = pty.peer().unwrap();
+        let input = Input::new();
+        // The writer takes a CLONE, as it will in the client: the reader owns
+        // one too, and a writer holding the only master would hang the
+        // terminal up the moment it retired.
+        let master = pty.into_master();
+        let writer = spawn_writer(master.try_clone().unwrap(), Arc::clone(&input)).unwrap();
+
+        assert!(input.push(b"hello ").unwrap());
+        assert!(input.push(b"world\n").unwrap());
+        // Canonical input, so the slave sees the line once its newline lands.
+        assert_eq!(read_within(&slave).expect("no line arrived"), b"hello world\n");
+
+        // Closing drains and retires, which is why this handle can be joined
+        // where the reader's cannot.
+        assert!(input.push(b"tail\n").unwrap());
+        input.close().unwrap();
+        within(move || writer.join())
+            .expect("the writer never retired")
+            .unwrap()
+            .unwrap();
+        assert_eq!(read_within(&slave).expect("the tail never drained"), b"tail\n");
+        // A push after the close is refused rather than queued for a writer
+        // that has gone.
+        assert!(!input.push(b"x").unwrap());
+    }
+
+    /// The queue is bounded, and a sequence that does not fit is refused whole
+    /// rather than truncated — the caller rings the bell. Pushing until it
+    /// refuses also shows that a push never waits on the writer: the child
+    /// here never reads, so the writer is parked in `write` throughout.
+    #[test]
+    fn a_full_queue_refuses_whole_sequences_without_blocking_the_pusher() {
+        let pty = open_pty();
+        let _slave = pty.peer().unwrap();
+        let input = Input::new();
+        let master = pty.into_master();
+        let writer = spawn_writer(master.try_clone().unwrap(), Arc::clone(&input)).unwrap();
+
+        // A megabyte at a child that never reads one byte of it. WHETHER the
+        // queue fills is up to the scheduler — in canonical mode the writer is
+        // never blocked draining, since the line discipline takes bytes and
+        // discards what it cannot hold — so nothing here asserts a refusal.
+        // What must hold either way is the ceiling. Where that ceiling FALLS
+        // is the next test's job, without a writer and without the kernel.
+        let sequence = vec![b'z'; 1024];
+        let mut pushed = 0;
+        while pushed < 1024 * 1024 {
+            pushed += sequence.len();
+            if !input.push(&sequence).unwrap() {
+                break;
+            }
+            assert!(input.queued().unwrap() <= crate::keys::MAX_INPUT_BYTES);
+        }
+        input.close().unwrap();
+        drop(_slave);
+        let _ = within(move || writer.join()).expect("the writer never retired");
+    }
+
+    #[test]
+    fn a_full_queue_refuses_a_sequence_whole_rather_than_admitting_part_of_it() {
+        // No writer: nothing drains, so the ceiling is the queue's own and the
+        // kernel has no say in where it falls.
+        let input = Input::new();
+        let sequence = vec![b'z'; 1000];
+        let mut admitted = 0;
+        loop {
+            let before = input.queued().unwrap();
+            if input.push(&sequence).unwrap() {
+                admitted += 1;
+                assert_eq!(input.queued().unwrap(), before + sequence.len());
+                continue;
+            }
+            assert_eq!(
+                input.queued().unwrap(),
+                before,
+                "a refused sequence left bytes behind"
+            );
+            break;
+        }
+        let queued = input.queued().unwrap();
+        assert_eq!(queued, admitted * sequence.len());
+        assert!(queued <= crate::keys::MAX_INPUT_BYTES);
+        // The refusal is the queue being unable to take a WHOLE sequence, not
+        // it being full: there is room left, just not this much.
+        assert!(queued + sequence.len() > crate::keys::MAX_INPUT_BYTES);
+    }
+
+    #[test]
+    fn the_waiter_reports_the_childs_own_exit() {
+        let pty = open_pty();
+        pty.resize(24, 80).unwrap();
+        let slave = pty.peer().unwrap();
+        let command = ChildCommand {
+            program: std::env::current_exe().unwrap(),
+            arguments: vec![
+                "--exact".into(),
+                "pty::tests::pty_child_fixture".into(),
+                "--ignored".into(),
+                "--nocapture".into(),
+            ],
+        };
+        let account = account(PASSWD, 1000).unwrap();
+        let mut environment = environment(&account);
+        environment.push((FIXTURE.into(), "1".into()));
+        let child = spawn(&command, &environment, &std::env::temp_dir(), slave).unwrap();
+
+        let (sender, receiver) = exit_channel();
+        let waiter = spawn_waiter(child, sender).unwrap();
+        // Drain the master so the fixture's own output cannot fill the buffer
+        // and stall the exit this is waiting for.
+        let master = pty.into_master();
+        let (chunks, output) = output_channel();
+        let reader = spawn_reader(master, chunks).unwrap();
+
+        let status = receiver
+            .recv_timeout(Duration::from_secs(30))
+            .expect("the child waiter reported no exit");
+        assert!(status.success(), "the fixture failed its own checks: {status}");
+        waiter.join().unwrap().unwrap();
+        // Only a DISCONNECT ends this: a timeout here means the reader is
+        // still parked, and joining it then would hang rather than fail.
+        loop {
+            match output.recv_timeout(Duration::from_secs(30)) {
+                Ok(_) => {}
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    panic!("the reader never saw the child's hangup")
+                }
+            }
+        }
+        reader.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn a_child_no_thread_will_wait_for_is_killed_and_reaped() {
+        let pty = open_pty();
+        pty.resize(24, 80).unwrap();
+        let slave = pty.peer().unwrap();
+        let command = ChildCommand {
+            program: std::env::current_exe().unwrap(),
+            arguments: vec![
+                "--exact".into(),
+                "pty::tests::pty_silent_child_fixture".into(),
+                "--ignored".into(),
+                "--nocapture".into(),
+            ],
+        };
+        let account = account(PASSWD, 1000).unwrap();
+        let mut environment = environment(&account);
+        // A child that outlives this test by a wide margin, because the kill
+        // is the half a self-exiting fixture cannot prove: reaping one that
+        // was never signalled would simply wait for it and still pass. In
+        // production the child is a shell, which does not exit on its own.
+        environment.push((SILENT_FIXTURE.into(), "600000".into()));
+        let child = spawn(&command, &environment, &std::env::temp_dir(), slave).unwrap();
+        let pid = child.id();
+
+        let held = Mutex::new(Some(child));
+        let cleaned = within(move || reap_unwatched(&held, "spawn child waiter: no"))
+            .expect("reaping waited on a child that was never killed");
+        assert_eq!(cleaned, "spawn child waiter: no");
+        // Both mutations show here: a dropped child is still blocked on the
+        // slave, and a killed but unreaped one is a zombie. /proc keeps a
+        // directory for either.
+        assert!(
+            !std::path::Path::new(&format!("/proc/{pid}")).exists(),
+            "the child was left behind"
+        );
+        // Nothing to reclaim twice, and that is not itself a failure. (The
+        // check above follows the reap, so a recycled pid would need a whole
+        // cycle inside that window.)
+        assert_eq!(reap_unwatched(&Mutex::new(None), "again"), "again");
     }
 
     #[test]

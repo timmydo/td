@@ -704,11 +704,13 @@ the frame-callback coalescing, the persistent-buffer reuse-after-release, and
 the buffer replacement on resize that section 11 also specifies land with the
 Wayland client, which is where a frame's lifecycle exists at all.
 
-Section 12's devpts instance is landed: the image mounts it at sysinit
+Section 12's PTY writer thread and child waiter are landed with the bounded
+keyboard queue they share with the main loop. Section 12's devpts instance is
+landed: the image mounts it at sysinit
 through a `td-init` applet, pins `CONFIG_UNIX98_PTYS=y`, and re-proves the
 mount options, the `/dev/ptmx` symlink and the instance `ptmx` on the booted
-machine. Section 12's writer thread, child waiter, readiness socket,
-`TD-TERM-READY` marker, and `probe` subcommand are not built. The Wayland client, packaging,
+machine. Section 12's readiness socket, `TD-TERM-READY` marker, and `probe`
+subcommand are not built. The Wayland client, packaging,
 and boot cutover of sections 12 and 14 follow them; the terminfo entry is
 landed. Until that client exists the PTY adapter has no production caller;
 its host tests drive every operation against a real PTY, and the packaged
@@ -1251,6 +1253,33 @@ sends the child `SIGHUP` for its controlling terminal. The consequence is a
 contract rather than a mechanism — a teardown path must not join that thread —
 and interrupting the reader for any other reason requires a separately reviewed
 wakeup surface.
+
+The writer differs, but less than it first appears: it parks in a
+condition-variable wait rather than in a syscall, so closing the keyboard queue
+retires it and its handle IS joinable — for a writer that is waiting for bytes.
+Closing sets the predicate the writer checks BETWEEN writes; it does not
+interrupt one, and nothing safe cancels a blocking write. A child that never
+reads does not by itself park the writer: in the kernel's default canonical mode
+the line discipline accepts and discards rather than blocking, and the tests
+cover that case against a live child that reads nothing. A child in RAW mode
+that stops reading is the case that parks it, and that is every shell and
+editor. The child's exit does not free such a writer either — the last slave
+closing hangs up the reader, which is the reader's whole retirement, while the
+writer stays parked in `write` on the same terminal at the same instant. So the
+teardown rule is the reader's rule: td-term ends a terminal by exiting the
+process, not by joining either thread, and joining the writer is for a writer
+known to be idle. Because the writer can therefore die unobserved, its failure
+is recorded where the main loop meets it: a `push` after the writer is gone is
+an error rather than the bell §10 rings for a full queue, since a terminal
+beeping at every keystroke would be reporting the wrong thing forever. One
+bounded queue serves both ends — the
+main loop admits a sequence whole or drops it whole and rings the bell, and the
+writer drains it —
+because a second buffer downstream would be a second place for half a sequence
+to sit. Bytes are copied out under the lock and written without it, so a child
+that has stopped reading parks the writer in `write` without ever delaying an
+enqueue. Only the writer consumes, so a partial write's remainder stays at the
+front in order however much arrived meanwhile.
 
 The client first completes the required empty XDG commit and initial
 configure/ack. It maps a bounded blank placeholder and waits up to the same
