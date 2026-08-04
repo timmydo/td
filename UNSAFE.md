@@ -35,7 +35,7 @@ one.
 | 5 | `td-svc` | `kill(2)` |
 | 6 | `td-compositor` | `recvmsg(2)`, `close(2)`, `sendmsg(2)` |
 | 7 | `td-util` | `ioctl(2)`, three pinned requests |
-| 8 | `td-sh` | `umask(2)`, `rt_sigaction(2)` (disposition-only) |
+| 8 | `td-sh` | `umask(2)`, `rt_sigaction(2)` (disposition-only), `ioctl(2)` (three pinned requests) |
 
 The control-plane exception (`builder/src/sys.rs`) is described under The
 rule above and is not part of this numbering: it is host-side, and no
@@ -301,14 +301,15 @@ ordinary file, which is what keeps that surface at one syscall.
 ## 8. `td-sh` — the shell
 
 The `td-sh` shell, whose one `syscall4` body in `td-sh/src/sys.rs` carries
-EXACTLY TWO syscalls — `umask(2)` and a DISPOSITION-ONLY `rt_sigaction(2)`
-— reached from exactly two modules: `builtin.rs` for the `umask` and
-`trap` builtins, and `process.rs` for the guards that hand a subshell back
-the process state a fork would have kept for it. `std` exposes an API for
-neither, and in the umask case that is not a gap that can be worked
-around: it is why the shipped `/init` still spells one line `busybox sh -c
-'umask 077; …'`, and why the shell that is supposed to replace busybox
-could not serve it.
+EXACTLY THREE syscalls — `umask(2)`, a DISPOSITION-ONLY `rt_sigaction(2)`,
+and `ioctl(2)` with three value-pinned requests — reached from exactly
+three modules: `builtin.rs` for the `umask` and `trap` builtins,
+`process.rs` for the guards that hand a subshell back the process state a
+fork would have kept for it, and `term.rs` for the terminal mode and width
+the line editor needs. `std` exposes an API for none of them, and in the
+umask case that is not a gap that can be worked around: it is why the
+shipped `/init` still spells one line `busybox sh -c 'umask 077; …'`, and
+why the shell that is supposed to replace busybox could not serve it.
 
 `umask(2)` cannot fail, so there is no `check()` on that path; what it
 does is RETURN THE PREVIOUS MASK, and both wrappers are built out of that.
@@ -391,33 +392,96 @@ the syscall); `chmod`/`fchmod` (`std::fs::set_permissions` covers them);
 `kill(2)`, `rt_sigprocmask(2)` and `sigaltstack(2)` — this shell sends no
 signals, blocks none, and runs on no alternate stack; a handler-bearing
 `rt_sigaction`, which is the `SA_RESTORER` question above and lands as its
-own amendment when `trap INT` is served for real; and the terminal
-`ioctl`s for line editing, APPROVED in principle for this crate but NOT
-YET PRESENT, which lands with its own caller, because a syscall with no
-caller is a surface nothing reviews.
+own amendment when `trap INT` is served for real.
 
-A THIRD syscall is an amendment here; `td-sh/src/main.rs`'s confinement
-tests assert the roster and its two value-pinned numbers, that the two
+A FOURTH syscall, or a fourth `ioctl` request, is an amendment here;
+`td-sh/src/main.rs`'s confinement tests assert the roster and its three
+value-pinned numbers, that the three ioctl REQUESTS are value-pinned too
+and named three times each — the declaration, the roster the gate checks
+against, and the one wrapper that issues them — with the five refused
+neighbours (`TCSETSW`, `TCSETSF`, `TIOCSWINSZ`, `TIOCSTI`, `TIOCSCTTY`)
+absent from `sys.rs` entirely, since `TCSETS` mistyped as `0x5404` is
+`TCSETSF` and the in-code roster cannot tell them apart, that the two
 handler words are pinned by value and named in `sys.rs` alone, that the
 installed action is `handler` followed by three zeros, the whole `asm!`
 block including which register each argument lands in and that
 `options(nomem)` stays absent, that the crate names the unsafe lint
-exactly twice outside comments, that those two modules are the wrappers'
-only callers, that no module aliases OR IMPORTS OUT OF the syscall module,
-that `syscall4` has exactly one call site per syscall and that each passes
-the NAMED number rather than a bare literal (the number reaches the kernel
-as an argument, so pinning the declarations alone does not pin what is
-issued), that `sys.rs` carries no block comment — which is what makes the
-line-based comment strip complete for the one file that may hold `unsafe`,
-since a `/* */` between two tokens changes nothing the compiler sees — and
-that the scan COVERS every module `main.rs` declares, whatever its
-visibility, since a module missing from that list is one no other
-assertion can see. `sys.rs`'s own tests then issue both syscalls and check
-the answer against `/proc/self/status` — `Umask:` for one, the `SigIgn:`
-mask for the other — because every assertion above is about source TEXT,
-and a wrapper that returned a plausible value without issuing anything
-would satisfy all of them.
+exactly twice outside comments, that those three modules are the
+wrappers' only callers, that no module aliases OR IMPORTS OUT OF the
+syscall module, that `syscall4` has exactly one call site per syscall
+and that each passes the NAMED number rather than a bare literal (the
+number reaches the kernel as an argument, so pinning the declarations
+alone does not pin what is issued), that `sys.rs` carries no block
+comment — which is what makes the line-based comment strip complete for
+the one file that may hold `unsafe`, since a `/* */` between two tokens
+changes nothing the compiler sees — and that the scan COVERS every
+module `main.rs` declares, whatever its visibility, since a module
+missing from that list is one no other assertion can see. `sys.rs`'s own
+tests then issue two of the three and check the answer against
+`/proc/self/status` — `Umask:` for one, the `SigIgn:` mask for the other
+— while `term.rs`'s issues the third against a descriptor that is not a
+terminal and requires `ENOTTY` back, since the gate has no terminal to
+ask. Every assertion above is about source TEXT, and a wrapper that
+returned a plausible value without issuing anything would satisfy all of
+them.
+
+`ioctl(2)` is the third, and it is td-util's surface arriving in the shell:
+the same `TCGETS`/`TCSETS`/`TIOCGWINSZ` roster, taken for the same reason
+that no stable `std` API exposes a terminal's mode or its width —
+`IsTerminal` answers only whether a descriptor IS one. Because `ioctl` is
+one syscall onto an unbounded space of operations, the number in `rax` is
+not the surface: the request in `rsi` is. All three are pinned by VALUE,
+and unlike td-util's per-wrapper form the roster is ENFORCED IN CODE — one
+`ioctl` entry point refuses anything outside the list before issuing, so a
+fourth request is a compile-time edit to a named array rather than a new
+call site somebody has to notice. Deliberately NOT in it: `TIOCSWINSZ`
+(the setter; nothing td ships has a reason to resize an operator's
+terminal), `TCSETSW`/`TCSETSF` (they drain or discard pending terminal I/O
+another process may own), and `TIOCSTI` (it injects input into a terminal,
+the classic escape from a restricted session).
+
+`term.rs` is the only module that knows what a `termios` byte means, and
+it is a copy of `td-util/src/term.rs` down to the argument for each check:
+a termios is never CONSTRUCTED — the kernel's own bytes are read, known
+offsets are patched, and the untouched original is what `Drop` writes back
+— and raw mode is read back and REFUSED unless the kernel agrees, because
+a terminal still in canonical mode is indistinguishable from one whose
+reader has not typed yet. Three things are compared on that readback: the
+flag bits cleared, `VMIN`/`VTIME` took, and NO OTHER BYTE moved, the last
+being what makes "never constructs a termios" a property rather than a
+claim, since a ZEROED buffer passes the first two while `c_cflag = 0` is
+B0, a hang-up on a serial console. The guard holds a `BorrowedFd`, not a
+bare `RawFd`: it issues a syscall from `Drop` on a descriptor it does not
+own, so the borrow checker is what stops the terminal being closed — or
+closed and RECYCLED — before the restore reaches it.
+
+Where td-sh DIFFERS from the pager is `ISIG`, and it is worth writing down
+because it looks like a relaxation and is the opposite. td-util keeps
+signal generation on so Ctrl-C can kill a pager stuck on a huge file. A
+shell wants the reverse for a reason particular to this one: td-sh
+installs no signal handler, so `SIG_DFL` for SIGINT would END THE SHELL at
+its own prompt — which is what it did before the editor existed. With
+`ISIG` cleared, Ctrl-C arrives as a byte the editor acts on and the line
+is abandoned instead. The trade is bounded by the guard's lifetime: raw
+mode is taken PER LINE and dropped before any command runs, so a child
+still gets all three of Ctrl-C, Ctrl-\ and Ctrl-Z. Ctrl-C while a command
+is running therefore still ends the shell; that needs a real handler or
+job control, and both remain deferred.
+
+Clearing `ISIG` also removes the operator's last in-band escape if the
+restore never runs, which is worth stating because `Drop` is not a
+guarantee: this crate builds with `panic = "abort"`, so a panic inside
+the editor would leave the terminal with no `ECHO`, no `ICANON` and —
+unlike the pager, which keeps `ISIG` for just this — no Ctrl-C either,
+so `stty sane` would have to be typed blind from elsewhere. What holds
+that shut is the crate's own no-panic rule rather than the guard: every
+path through the editor returns `Option`/`Result`, `pos` moves only
+through the two boundary walkers, and the escape parameter saturates
+rather than overflowing a debug build. It is tested the only way an arm
+that needs a terminal to type can be — the dispatch is driven headlessly
+over a generated keystroke stream, in `line.rs`'s
+`no_keystroke_sequence_panics_the_editor`.
 
 Every other primitive td-sh needs — pipes, process spawn, `exec`, the
 virtual fd table that stands in for `dup2` — is reachable through safe
-`std`, which is what keeps that surface at two.
+`std`, which is what keeps that surface at three.

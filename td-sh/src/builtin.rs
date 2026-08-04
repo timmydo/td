@@ -2257,7 +2257,7 @@ const SIGCHLD: u8 = 17;
 ///
 /// A kernel that refuses the question is cached as "no", so a signal td-sh
 /// cannot read is one it never writes.
-fn may_set_signal(sh: &mut Shell, signo: u8) -> bool {
+pub fn may_set_signal(sh: &mut Shell, signo: u8) -> bool {
     if let Some(known) = sh.sig_may_set.get(&signo) {
         return *known;
     }

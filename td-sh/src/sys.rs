@@ -6,11 +6,13 @@
 //! in this module — is ordinary safe Rust. This is the EIGHTH target-side unsafe
 //! exception UNSAFE.md records.
 //!
-//! The surface is TWO syscalls, reached from TWO modules and no others:
-//! `builtin.rs`, for the `umask` and `trap` builtins, and `process.rs`, for the
+//! The surface is THREE syscalls, reached from THREE modules and no others:
+//! `builtin.rs`, for the `umask` and `trap` builtins; `process.rs`, for the
 //! guards that hand a subshell back the process state a real fork would have
-//! kept for it. Neither is reachable through safe `std`, which exposes no umask
-//! API and no signal-disposition API at all.
+//! kept for it; and `term.rs`, for the terminal mode and width the line editor
+//! needs. None is reachable through safe `std`, which exposes no umask API, no
+//! signal-disposition API, and no terminal-mode API at all — `IsTerminal`
+//! answers whether a descriptor is a terminal, never how wide or in what mode.
 //!
 //! `umask(2)` is unusual and the wrappers below turn both quirks into
 //! properties. It CANNOT FAIL — there is no error return — and it RETURNS THE
@@ -41,12 +43,20 @@
 //! field. It is real and it is safe, but it answers only half the builtin (there
 //! is no way to SET through it), so it would buy a `/proc` dependency without
 //! removing the syscall. Nor `kill(2)`, `rt_sigprocmask(2)` or `sigaltstack(2)`:
-//! this shell sends no signals, blocks none, and runs on no alternate stack.
+//! this shell sends no signals, blocks none, and runs on no alternate stack. Nor
+//! `isatty`, which `std::io::IsTerminal` already answers safely.
+//!
+//! `ioctl(2)` is the one with a REQUEST roster rather than a single meaning, so
+//! the three it may issue are pinned by value and `ioctl` refuses anything else
+//! before the syscall — the roster is code, not just a test.
+
+use std::os::fd::RawFd;
 
 #[cfg(not(all(target_arch = "x86_64", target_os = "linux")))]
 compile_error!("td-sh's syscall layer is x86_64-linux only (raw syscall ABI)");
 
 const SYS_RT_SIGACTION: usize = 13;
+const SYS_IOCTL: usize = 16;
 const SYS_UMASK: usize = 95;
 
 /// Every bit `umask(2)` can hold: the nine rwx permission bits and NOT ONE MORE.
@@ -171,6 +181,68 @@ pub fn umask_set(mask: u32) -> Result<(), String> {
         return Err(format!("umask: kernel kept {took:04o}, not {mask:04o}"));
     }
     Ok(())
+}
+
+/// `struct termios` as the x86-64 kernel lays it out: four `u32` flag words, a
+/// `c_line` byte, then `NCCS` = 19 control characters. OPAQUE here — this module
+/// never decides what a field means, so the layout knowledge lives in exactly
+/// one place (`term.rs`), next to the readback that checks it.
+pub const TERMIOS_LEN: usize = 36;
+
+/// `struct winsize`: four `u16` — rows, columns, and two pixel fields td ignores.
+pub const WINSIZE_LEN: usize = 8;
+
+// Pinned in the SHIPPED build, not only in a test: `TCGETS` and `TIOCGWINSZ`
+// copy `sizeof(struct …)` through the pointer with no length negotiation, so a
+// short buffer is an out-of-bounds kernel write into a stack array — from code
+// the compiler reads as `deny(unsafe_code)` clean. The binary the image runs is
+// compiled by `recipes/src/recipes/td-sh.rs` calling rustc directly and never
+// runs a test, so a `#[test]` would pin these only in the gate. Same argument as
+// `SIGACTION_WORDS` above.
+const _: () = assert!(TERMIOS_LEN == 4 * 4 + 1 + 19);
+const _: () = assert!(WINSIZE_LEN == 4 * 2);
+
+/// `ioctl(2)` is ONE syscall onto an unbounded space of operations, so the number
+/// in `rax` is not the surface — the request in `rsi` is. All three are pinned by
+/// VALUE, and `ioctl` below refuses anything outside this list BEFORE issuing,
+/// so the roster is enforced in code rather than only in a test.
+///
+/// `TCGETS`/`TCSETS` read and set the line discipline, which is what lets the
+/// shell take a keystroke without waiting for Enter. `TIOCGWINSZ` asks how many
+/// columns there are, so a line longer than the terminal can be scrolled inside
+/// one row rather than wrapping into a redraw nothing can undo.
+const TCGETS: usize = 0x5401;
+const TCSETS: usize = 0x5402;
+const TIOCGWINSZ: usize = 0x5413;
+const IOCTL_REQUESTS: [usize; 3] = [TCGETS, TCSETS, TIOCGWINSZ];
+
+/// The ONE `ioctl` call site, and the gate on its request.
+///
+/// Deliberately NOT in that roster: `TIOCSWINSZ` (the setter; nothing td ships
+/// has a reason to resize an operator's terminal), `TCSETSW`/`TCSETSF` (they
+/// drain or discard pending terminal I/O another process may own), and `TIOCSTI`
+/// (it injects input into a terminal, the classic escape from a restricted
+/// session). A fourth request is an amendment to UNSAFE.md.
+fn ioctl(fd: RawFd, request: usize, arg: usize) -> Result<(), String> {
+    if !IOCTL_REQUESTS.contains(&request) {
+        return Err(format!("ioctl: request {request:#x} is not td-sh's to issue"));
+    }
+    check("ioctl", syscall4(SYS_IOCTL, fd as usize, request, arg, 0))
+}
+
+/// `ioctl(fd, TCGETS, &mut termios)` — read the current line discipline.
+pub fn termios_get(fd: RawFd, out: &mut [u8; TERMIOS_LEN]) -> Result<(), String> {
+    ioctl(fd, TCGETS, out.as_mut_ptr() as usize)
+}
+
+/// `ioctl(fd, TCSETS, &termios)` — set it, effective immediately.
+pub fn termios_set(fd: RawFd, termios: &[u8; TERMIOS_LEN]) -> Result<(), String> {
+    ioctl(fd, TCSETS, termios.as_ptr() as usize)
+}
+
+/// `ioctl(fd, TIOCGWINSZ, &mut winsize)` — the terminal's size.
+pub fn window_size(fd: RawFd, out: &mut [u8; WINSIZE_LEN]) -> Result<(), String> {
+    ioctl(fd, TIOCGWINSZ, out.as_mut_ptr() as usize)
 }
 
 /// The two dispositions td-sh installs, and a type that cannot spell a third.

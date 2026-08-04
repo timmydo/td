@@ -9,14 +9,15 @@
 //! crate's `lib.rs` and is host-side test tooling — it is NOT part of this
 //! binary and runs the built shell as a subprocess.
 //!
-//! The interpreter is safe `std` but for TWO confined syscalls: a virtual
+//! The interpreter is safe `std` but for THREE confined syscalls: a virtual
 //! file-descriptor table replaces `dup2`, `Stdio::piped`/`CommandExt::exec`
 //! cover the process primitives, and subshells clone shell state in-process. The
 //! crate `#![deny(unsafe_code)]`s and `sys.rs` carries the single scoped
-//! `#[allow]` — `umask(2)` and a DISPOSITION-ONLY `rt_sigaction(2)`, neither of
-//! which `std` exposes an API for at all. That is the EIGHTH target-side unsafe
-//! exception UNSAFE.md records; the confinement tests below assert its roster
-//! against this crate's own source.
+//! `#[allow]` — `umask(2)`, a DISPOSITION-ONLY `rt_sigaction(2)`, and an
+//! `ioctl(2)` restricted to three value-pinned requests, none of which `std`
+//! exposes an API for at all. That is the EIGHTH target-side unsafe exception
+//! UNSAFE.md records; the confinement tests below assert its roster against this
+//! crate's own source.
 //!
 //! Still deferred, and each a further reviewed amendment: job control, and
 //! CATCHING a signal — `trap 'action' SIG` needs a handler, and a handler on
@@ -35,11 +36,13 @@ mod builtin;
 mod exec;
 mod expand;
 mod lexer;
+mod line;
 mod parser;
 mod pattern;
 mod process;
 mod random;
 mod sys;
+mod term;
 
 use std::io::{IsTerminal, Read, Write};
 use std::process::ExitCode;
@@ -167,15 +170,21 @@ fn run(args: &[String]) -> Result<i32, String> {
 
 /// A minimal read-eval-print loop: read lines, accumulating while the parse is
 /// merely incomplete (an open quote, `if`, here-doc, …), then run the command.
+///
+/// The prompt is written by the EDITOR rather than here, because a line being
+/// edited is redrawn with its prompt on every keystroke — printing it once up
+/// front would put it on the screen twice.
 fn repl(sh: &mut Shell) -> i32 {
-    let stdin = std::io::stdin();
+    let mut editor = line::Editor::new();
     loop {
-        let ps1 = sh.get_var("PS1").unwrap_or_else(|| "$ ".to_string());
-        let _ = write!(std::io::stdout(), "{ps1}");
-        let _ = std::io::stdout().flush();
-
         let mut buffer = String::new();
-        let ended = matches!(read_complete(&stdin, sh, &mut buffer), ReadResult::Eof);
+        let outcome = read_complete(&mut editor, sh, &mut buffer);
+        // POSIX's 128 + signal number, the status a shell reports for a command
+        // its own SIGINT ended -- even though this one arrived as a keystroke.
+        if matches!(outcome, ReadResult::Interrupted) {
+            sh.set_status(130);
+        }
+        let ended = matches!(outcome, ReadResult::Eof);
         if !buffer.trim().is_empty() {
             match parser::parse_aliased(&buffer, &sh.aliases) {
                 Ok(list) => {
@@ -196,27 +205,60 @@ fn repl(sh: &mut Shell) -> i32 {
     sh.status
 }
 
+/// The one signal the editor stands in for, since the terminal cannot deliver it
+/// while a line is being edited.
+const SIGINT: u8 = 2;
+
 enum ReadResult {
     Ready,
     Eof,
+    /// Ctrl-C at the prompt. Distinct from `Ready` with an empty buffer because
+    /// it also sets `$?`, which an operator can see with `echo $?`.
+    Interrupted,
 }
 
 /// Read lines into `buffer` until it parses (or fails with a non-continuation
-/// error), or stdin ends.
-fn read_complete(stdin: &std::io::Stdin, sh: &Shell, buffer: &mut String) -> ReadResult {
+/// error), or input ends.
+fn read_complete(
+    editor: &mut line::Editor,
+    sh: &mut Shell,
+    buffer: &mut String,
+) -> ReadResult {
+    let mut prompt = sh.get_var("PS1").unwrap_or_else(|| "$ ".to_string());
     loop {
-        let mut line = String::new();
-        match stdin.read_line(&mut line) {
-            Ok(0) => return ReadResult::Eof,
-            Ok(_) => buffer.push_str(&line),
-            Err(_) => return ReadResult::Eof,
+        // `trap '' INT` makes SIGINT do nothing, and the Ctrl-C keystroke only
+        // stands in for SIGINT while the editor has signal generation off — so
+        // it must do nothing too. BOTH ignores count: the shell's own, and the
+        // one it may have been started under, which POSIX says it cannot reset
+        // and which is what makes `nohup sh` stay un-interruptible. With `ISIG`
+        // cleared the kernel no longer enforces the second, so this is the only
+        // thing that does.
+        // A NON-EMPTY `trap 'action' INT` is not consulted: the keystroke
+        // abandons the line and sets `$?`, and the action does not run. That
+        // follows from catching being deferred — the disposition surface can
+        // ask for `SIG_DFL` or `SIG_IGN` and nothing else — and it is where
+        // td-sh differs from dash, which runs the action.
+        let ignored_on_entry = !builtin::may_set_signal(sh, SIGINT);
+        let interruptible = !ignored_on_entry
+            && !sh.traps.get(&SIGINT).is_some_and(String::is_empty);
+        match editor.read(&prompt, interruptible) {
+            line::Input::Eof => return ReadResult::Eof,
+            // Ctrl-C throws away the WHOLE unit, not just the line it arrived
+            // on: half of an unfinished `if` is not something the operator
+            // wants to keep typing into, and dash abandons the same way.
+            line::Input::Interrupted => {
+                buffer.clear();
+                return ReadResult::Interrupted;
+            }
+            line::Input::Line(text) => {
+                buffer.push_str(&text);
+                buffer.push('\n');
+            }
         }
         match parser::parse_aliased(buffer, &sh.aliases) {
             Ok(_) => return ReadResult::Ready,
             Err(e) if e.starts_with(ast::INCOMPLETE) => {
-                let ps2 = sh.get_var("PS2").unwrap_or_else(|| "> ".to_string());
-                let _ = write!(std::io::stdout(), "{ps2}");
-                let _ = std::io::stdout().flush();
+                prompt = sh.get_var("PS2").unwrap_or_else(|| "> ".to_string());
             }
             // A real syntax error: hand the buffer back so the caller reports it.
             Err(_) => return ReadResult::Ready,
@@ -225,8 +267,9 @@ fn read_complete(stdin: &std::io::Stdin, sh: &Shell, buffer: &mut String) -> Rea
 }
 
 /// Assertions about this crate's own SOURCE, which the compiler cannot make:
-/// the unsafe surface is two syscalls, in one module, with one call site each,
-/// writing two handler words and no others, named by two modules and no others.
+/// the unsafe surface is three syscalls, in one module, with one call site each,
+/// writing two handler words and no others, issuing three ioctl requests and no
+/// others, and named by three modules and no others.
 /// Every needle is built with `concat!` so this module's own text does not
 /// count itself.
 #[cfg(test)]
@@ -240,11 +283,13 @@ mod confinement {
         ("exec.rs", include_str!("exec.rs")),
         ("expand.rs", include_str!("expand.rs")),
         ("lexer.rs", include_str!("lexer.rs")),
+        ("line.rs", include_str!("line.rs")),
         ("parser.rs", include_str!("parser.rs")),
         ("pattern.rs", include_str!("pattern.rs")),
         ("process.rs", include_str!("process.rs")),
         ("random.rs", include_str!("random.rs")),
         ("sys.rs", include_str!("sys.rs")),
+        ("term.rs", include_str!("term.rs")),
     ];
 
     fn source(name: &str) -> &'static str {
@@ -355,10 +400,74 @@ mod confinement {
         );
     }
 
-    /// The roster is TWO syscalls, pinned by VALUE — a name alone would let the
-    /// number change under it.
+    /// The roster is THREE syscalls, pinned by VALUE — a name alone would let
+    /// the number change under it.
     #[test]
-    fn the_syscall_roster_is_exactly_two_and_value_pinned() {
+    fn the_ioctl_requests_are_exactly_three_and_value_pinned() {
+        // `ioctl(2)` is ONE syscall onto an unbounded space of operations, so
+        // the number in `rax` is not the surface -- the request in `rsi` is.
+        // The in-code roster refuses anything outside `IOCTL_REQUESTS`, but a
+        // wrong VALUE inside it is still a member: `TCSETS` mistyped as 0x5404
+        // is `TCSETSF`, which UNSAFE.md excludes on the ground that it DISCARDS
+        // terminal input another process may own. Nothing observable at the
+        // call site tells those two apart.
+        const REQUESTS: &[(&str, &str)] = &[
+            ("TCGETS", "0x5401"),
+            ("TCSETS", "0x5402"),
+            ("TIOCGWINSZ", "0x5413"),
+        ];
+        // Neighbours deliberately outside the surface, each a digit away from
+        // something admitted: the two `TCSETS` variants that drain or discard
+        // pending I/O, the winsize SETTER, the input injector, and the
+        // controlling-terminal call that is td-init's.
+        const REFUSED: &[&str] =
+            &["TCSETSW", "TCSETSF", "TIOCSWINSZ", "TIOCSTI", "TIOCSCTTY"];
+        // The crate's own tests name these freely, so the scan stops where they
+        // begin -- and comments go too, or a `// TIOCSTI` would red it.
+        let shipped = source("sys.rs")
+            .split(concat!("#[cfg(", "test)]"))
+            .next()
+            .unwrap_or_default();
+        let sys = squeeze(&code_only(shipped));
+        for (name, value) in REQUESTS {
+            assert_eq!(
+                sys.matches(&format!("const{name}:usize={value};")).count(),
+                1,
+                "{name} must be declared exactly once in sys.rs as {value}"
+            );
+            // Three mentions and no more: the declaration, the roster the gate
+            // checks against, and the ONE wrapper that issues it. A fourth is a
+            // place the pinned value could be shadowed or recomputed.
+            assert_eq!(
+                sys.matches(name).count(),
+                3,
+                "{name} must be named exactly three times in sys.rs"
+            );
+        }
+        for refused in REFUSED {
+            assert_eq!(
+                sys.matches(refused).count(),
+                0,
+                "{refused} is deliberately outside this crate's ioctl surface"
+            );
+        }
+        // ...and no other module may declare a request at all: sys.rs is the
+        // only file whose text can reach the kernel.
+        for (file, text) in SOURCES {
+            if *file == "sys.rs" {
+                continue;
+            }
+            for (name, _) in REQUESTS {
+                assert!(
+                    !squeeze(&code_only(text)).contains(&format!("const{name}")),
+                    "{file} declares an ioctl request; they belong in sys.rs"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_syscall_roster_is_exactly_three_and_value_pinned() {
         let decl = concat!("const", "SYS", "_");
         let sys = squeeze(source("sys.rs"));
         let mut seen: Vec<String> = Vec::new();
@@ -376,6 +485,7 @@ mod confinement {
             seen,
             vec![
                 concat!("SYS", "_RT_SIGACTION:usize=13").to_string(),
+                concat!("SYS", "_IOCTL:usize=16").to_string(),
                 concat!("SYS", "_UMASK:usize=95").to_string(),
             ]
         );
@@ -450,9 +560,12 @@ mod confinement {
         assert_eq!(count(concat!("arch::", "asm", "!")), 1, "one asm site only");
     }
 
-    /// TWO modules reach the wrappers and no others: `builtin.rs` for the
-    /// builtin itself, and `process.rs` for the scope guard that gives a
-    /// subshell back the mask a fork would have kept for it. Nothing renames the
+    /// THREE modules reach the wrappers and no others: `builtin.rs` for the
+    /// `umask` and `trap` builtins, `process.rs` for the guards that give a
+    /// subshell back the process state a fork would have kept for it, and
+    /// `term.rs` for the terminal mode and width the line editor needs — and
+    /// `term.rs` is the ONLY module that knows what a `termios` byte means, so
+    /// the layout lives beside the readback that checks it. Nothing renames the
     /// module — an alias would give the audited calls a name no scan looks for.
     #[test]
     fn only_the_named_callers_reach_the_syscall_module() {
@@ -463,23 +576,48 @@ mod confinement {
         for (name, text) in SOURCES {
             let uses = code_only(text).matches(call).count();
             match *name {
-                "builtin.rs" | "process.rs" => assert!(uses > 0, "{name} stopped calling"),
+                "builtin.rs" | "process.rs" | "term.rs" => {
+                    assert!(uses > 0, "{name} stopped calling")
+                }
                 _ => assert_eq!(uses, 0, "{name} reaches the syscall module"),
             }
         }
-        // Both callers spell it out in full, so ANY import of the module is a
-        // way to reach it under a name the scan above does not look for --
-        // `use crate::sys::set;` leaves only a bare `set(…)` behind.
-        let import = concat!("use crate::", "sys");
+        // Importing an ITEM out of the module is a way to reach it under a name
+        // the scan above does not look for: `use crate::sys::set;` leaves only a
+        // bare `set(…)` behind. Importing the MODULE (`use crate::sys;`) hides
+        // nothing -- every call still reads `sys::…`, which is what is counted
+        // above -- so that one form is allowed, and it is the only one, which is
+        // the same rule td-util states for its own syscall module.
+        let item_import = concat!("use crate::", "sys", "::");
         let alias_a = concat!("sys", " as ");
         let alias_b = concat!(" as ", "sys");
         for (name, text) in SOURCES {
             let code = code_only(text);
-            assert!(!code.contains(import), "{name} imports out of the syscall module");
+            assert!(
+                !code.contains(item_import),
+                "{name} imports an item out of the syscall module"
+            );
             assert!(
                 !code.contains(alias_a) && !code.contains(alias_b),
                 "{name} aliases the syscall module"
             );
+            // ... and the only import that may name it is the module itself.
+            // Checked over WHOLE STATEMENTS rather than lines, because both
+            // `use crate::{sys::set};` and a `use` broken across two lines put
+            // the module's name in an import that no line-based scan matches.
+            let flat = code.split_whitespace().collect::<Vec<_>>().join(" ");
+            for stmt in flat.split(';') {
+                let head =
+                    stmt.trim_start_matches(|c: char| c.is_whitespace() || c == '{' || c == '}');
+                if !head.starts_with("use ") || !head.contains(concat!("s", "ys")) {
+                    continue;
+                }
+                assert_eq!(
+                    head.trim(),
+                    concat!("use crate::", "sys"),
+                    "{name}: unexpected import `{head}`"
+                );
+            }
         }
     }
 
@@ -493,8 +631,8 @@ mod confinement {
         let name = concat!("syscall", "4");
         assert_eq!(
             code.matches(name).count(),
-            3,
-            "`{name}` should appear three times in code: its definition and its two calls"
+            4,
+            "`{name}` should appear four times in code: its definition and its three calls"
         );
         assert_eq!(
             code.matches(concat!("fn ", "syscall", "4(")).count(),
@@ -505,7 +643,11 @@ mod confinement {
         // declarations is not enough on its own: `syscall4(90, x, 0, 0, 0)`
         // names no constant and would satisfy the roster test above.
         let squeezed = squeeze(&code);
-        for number in [concat!("SYS", "_UMASK,"), concat!("SYS", "_RT_SIGACTION,")] {
+        for number in [
+            concat!("SYS", "_UMASK,"),
+            concat!("SYS", "_RT_SIGACTION,"),
+            concat!("SYS", "_IOCTL,"),
+        ] {
             assert_eq!(
                 squeezed.matches(&format!("{}{number}", concat!("syscall", "4("))).count(),
                 1,

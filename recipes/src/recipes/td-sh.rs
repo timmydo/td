@@ -13,10 +13,11 @@ use crate::types::{Recipe, Step};
 // expansion (parameter/command/arithmetic substitution, field splitting,
 // pathname expansion), control flow, functions and the core builtins. The crate
 // root `#![deny(unsafe_code)]`s and `sys.rs` holds the one scoped exception --
-// `umask(2)`, the syscall `std` exposes no API for. td-sh is NOT yet referenced by
-// system-x86-64: the shipped `/bin/sh` stays busybox until td-sh also clears the
-// busybox `ash_test` parity gate and the bulk Oils import. Only then is the image
-// symlink flipped.
+// `umask(2)`, a disposition-only `rt_sigaction(2)`, and an `ioctl(2)` restricted
+// to three value-pinned terminal requests: the calls `std` exposes no API for.
+// td-sh is NOT yet referenced by system-x86-64: the shipped `/bin/sh` stays
+// busybox until td-sh also clears the busybox `ash_test` parity gate and the
+// bulk Oils import. Only then is the image symlink flipped.
 //
 // Why mesboot-style (rustc invoked directly) rather than `Recipe::rust`, and why
 // static: identical to td-kexec. The busybox `sh` it replaces is boot-critical and
@@ -50,11 +51,13 @@ const MODULES: &[(&str, &str)] = &[
     ("exec", include_str!("../../../td-sh/src/exec.rs")),
     ("expand", include_str!("../../../td-sh/src/expand.rs")),
     ("lexer", include_str!("../../../td-sh/src/lexer.rs")),
+    ("line", include_str!("../../../td-sh/src/line.rs")),
     ("parser", include_str!("../../../td-sh/src/parser.rs")),
     ("pattern", include_str!("../../../td-sh/src/pattern.rs")),
     ("process", include_str!("../../../td-sh/src/process.rs")),
     ("random", include_str!("../../../td-sh/src/random.rs")),
     ("sys", include_str!("../../../td-sh/src/sys.rs")),
+    ("term", include_str!("../../../td-sh/src/term.rs")),
 ];
 
 #[cfg(test)]
