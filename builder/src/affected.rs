@@ -834,14 +834,21 @@ fn map_path(root: &Path, p: &str, sel: &mut Selection) {
 
     // td-review: the HOST-side integrator TUI. In neither bootstrap graph — no
     // recipe builds it and it never enters a closure — so unlike the crates
-    // above there is no target artifact for recipe-checks to link, and it
-    // deliberately does NOT route to recipe-checks.
+    // above there is no target artifact for recipe-checks to link.
+    //
+    // The only arm that selects NO check target. `cargo-test` is the one gate
+    // whose body names td-review at all: it lints the crate --all-targets, runs
+    // its tests, and asserts its 1-package lock, and the preflight above runs
+    // exactly those legs directly. `check` would add the cheap+heavy pools and
+    // build-recipes on top — the source-bootstrap ladder from the stage0 seed,
+    // an hour of mes/tcc/gcc that cannot read a host-side crate. Bounded means
+    // bounded by what the diff can break; a selection nothing in it inspects is
+    // latency, and latency is what gets a pre-push check skipped.
     if pattern_matches(
         "td-review/*|td-review/src/*|td-review/tests/*|td-review/Cargo.toml|td-review/Cargo.lock",
         p,
     ) {
         sel.add_preflight("cargo-test");
-        sel.add_target("check");
         return;
     }
 
@@ -1469,10 +1476,10 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
     assert_target!("td-boot/src/main.rs", "recipe-checks");
     assert_target!("td-boot/Cargo.toml", "check");
     assert_target!("td-boot/Cargo.toml", "recipe-checks");
-    // NOT recorded against recipe-checks: nothing builds td-review as a target
-    // artifact, so no -test recipe links it. (`check` runs recipe-checks anyway —
-    // this asserts the RECORD, not that the gate never executes; and `check` alone
-    // proves nothing here since the catch-all arm adds it to every path.)
+    // Nothing builds td-review as a target artifact, so no -test recipe links
+    // it — and it selects no check target at all, so these assert what RUNS
+    // rather than only what is recorded: `cargo-test` is the whole selection,
+    // and it is the only gate whose body names the crate.
     assert_preflight!("td-review/src/main.rs", "cargo-test");
     assert_preflight!("td-review/src/land.rs", "cargo-test");
     assert_preflight!("td-review/tests/land.rs", "cargo-test");
@@ -1480,6 +1487,13 @@ pub fn run_self_test(root: &Path) -> Vec<String> {
     assert_preflight!("td-review/Cargo.lock", "cargo-test");
     assert_no_target!("td-review/src/main.rs", "recipe-checks");
     assert_no_target!("td-review/Cargo.toml", "recipe-checks");
+    // The bootstrap ladder cannot read a host-side crate: selecting it here
+    // bought nothing and cost the hour that makes a pre-push check get skipped.
+    assert_no_target!("td-review/src/main.rs", "check");
+    assert_no_target!("td-review/src/land.rs", "check");
+    assert_no_target!("td-review/tests/land.rs", "check");
+    assert_no_target!("td-review/Cargo.toml", "check");
+    assert_no_target!("td-review/Cargo.lock", "check");
     assert_target!("tests/td-toolchain.lock", "toolchain-input-addressed");
     assert_target!(
         "tests/td-toolchain.lock",
@@ -1663,6 +1677,39 @@ fn shell_quote(p: &Path) -> Option<String> {
     Some(format!("'{s}'"))
 }
 
+/// Exactly one `[[package]]` and no external `source = `, as gate 325 spells
+/// the AGENTS.md dependency-free rule. Both, because they catch different
+/// things: the count catches a new crate, the source line catches a registry
+/// one that a stale count would miss.
+fn assert_dependency_free(root: &Path, lock: &str) -> Result<(), String> {
+    // An unreadable lock is a failure, not a pass: a guard that answers OK when
+    // it cannot see the file is a guard that has silently stopped guarding, and
+    // gate 325's `count-line-exact` fails the same way on a missing one.
+    let text = std::fs::read_to_string(root.join(lock))
+        .map_err(|e| format!("{lock} could not be read: {e}"))?;
+    dependency_free(lock, &text)
+}
+
+/// The check itself, over the lock's TEXT — no filesystem, so its cases are
+/// literals in the test rather than a fixture tree.
+fn dependency_free(lock: &str, text: &str) -> Result<(), String> {
+    let packages = text.lines().filter(|l| l.trim() == "[[package]]").count();
+    if packages != 1 {
+        return Err(format!(
+            "{lock} lists {packages} packages, expected exactly 1 (the crate itself) — it \
+             must carry ZERO external crates (AGENTS.md 'Rust code'); adding one is a \
+             reviewed decision"
+        ));
+    }
+    if text.lines().any(|l| l.trim_start().starts_with("source = \"")) {
+        return Err(format!(
+            "{lock} carries an external `source = ` — it must carry ZERO external crates \
+             (AGENTS.md 'Rust code'); adding one is a reviewed decision"
+        ));
+    }
+    Ok(())
+}
+
 fn run_preflight(root: &Path, name: &str) -> i32 {
     match name {
         "shell-syntax" => run_shell(root, "bash -n start tests/*.sh ci/*.sh tools/*.sh"),
@@ -1673,6 +1720,15 @@ fn run_preflight(root: &Path, name: &str) -> i32 {
         // host preflight is the per-PR enforcement in the meantime (review
         // finding: recipes tests + clippy ran in NO automated per-PR tier).
         "cargo-test" => {
+            // td-review is the one path that selects no check target, so gate
+            // 325's lock-shape assertion never runs for it. It runs here
+            // instead: `--frozen` only demands that the committed lock RESOLVE,
+            // so a dependency added to this crate would otherwise reach main
+            // unchallenged, and dependency-free is the whole claim.
+            if let Err(e) = assert_dependency_free(root, "td-review/Cargo.lock") {
+                eprintln!("affected-checks: {e}");
+                return 1;
+            }
             // The target-built guest programs ride the SAME preflight: all are
             // dependency-free pure std, while their static TARGET links ride recipe-checks.
             // builder + recipes + the shared engine lib are one cargo workspace,
@@ -1985,6 +2041,44 @@ mod tests {
         assert!(failures.is_empty(), "self-test failures: {failures:#?}");
     }
 
+    /// td-review selects no check target, so gate 325's lock guard never runs
+    /// for it — this preflight check is the only thing standing between the
+    /// crate and a dependency. It has to red on both shapes.
+    #[test]
+    fn the_dependency_free_guard_reds_on_a_crate_and_on_a_source_line() {
+        let lock = "td-review/Cargo.lock";
+        assert!(dependency_free(lock, "[[package]]\nname = \"td-review\"\n").is_ok());
+        let two = dependency_free(
+            lock,
+            "[[package]]\nname = \"td-review\"\n\n[[package]]\nname = \"ureq\"\n",
+        );
+        assert!(two.is_err_and(|e| e.contains("lists 2 packages")), "a second crate must red");
+        let sourced = dependency_free(
+            lock,
+            "[[package]]\nname = \"ureq\"\nsource = \"registry+https://example.invalid\"\n",
+        );
+        assert!(
+            sourced.is_err_and(|e| e.contains("external `source = `")),
+            "a registry crate must red even when the count still reads 1"
+        );
+        assert!(dependency_free(lock, "").is_err(), "an empty lock is not a pass");
+
+        // The committed lock against the real guard, including the read — but
+        // only from the full checkout: the td-builder package build ships
+        // `builder/` alone and has no td-review/ to read.
+        let root = repo_root();
+        if repo_tree_present(&root) {
+            assert!(
+                assert_dependency_free(&root, lock).is_ok(),
+                "the committed lock must pass its own guard"
+            );
+            assert!(
+                assert_dependency_free(&root, "td-review/nope.lock").is_err(),
+                "an unreadable lock reds rather than passing"
+            );
+        }
+    }
+
     // DURABLE renderer guard (replaces the now-deleted shell differential — the
     // shell oracle was the removable migration leg, retired with the cutover,
     // directive 4). Asserts the FULL `--path` render byte-for-byte for paths whose
@@ -2042,6 +2136,29 @@ mod tests {
                 "",
                 "Notes:",
                 "  - check.sh touches the loop spine: validated by the full check (the runner runs itself over every gate).",
+                "",
+                "Dry run only. Re-run with --run to execute.",
+            ])
+        );
+
+        // td-review → the cargo-test preflight and NOTHING else: the only
+        // selection with no `td-builder check` line at all. Pinned as exact
+        // output because that absence is the whole point of the arm, and a
+        // stray target added later would restore an hour of bootstrap builds
+        // for a crate none of it reads.
+        assert_eq!(
+            path_output(&root, "td-review/src/land.rs"),
+            expect(&[
+                "affected-checks: explicit path mode",
+                "",
+                "Changed paths:",
+                "  td-review/src/land.rs",
+                "",
+                "Selected checks:",
+                "  cargo test + clippy --frozen --workspace (builder/recipes/engine) + --manifest-path td-kexec/Cargo.toml + --manifest-path td-sh/Cargo.toml + --manifest-path td-txt/Cargo.toml + --manifest-path td-netd/Cargo.toml + --manifest-path td-boot/Cargo.toml + --manifest-path td-util/Cargo.toml + --manifest-path td-init/Cargo.toml + --manifest-path td-firstboot/Cargo.toml + --manifest-path td-login/Cargo.toml + --manifest-path td-svc/Cargo.toml + --manifest-path td-seatd/Cargo.toml + --manifest-path td-compositor/Cargo.toml + --manifest-path td-review/Cargo.toml -- --include-ignored",
+                "",
+                "Waiver: inspection only (--path does not prove the branch diff)",
+                "Branch-mode policy for these paths: the full check would be waived",
                 "",
                 "Dry run only. Re-run with --run to execute.",
             ])
