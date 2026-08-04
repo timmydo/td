@@ -889,13 +889,163 @@ a
 ## END
 ## status: 0
 
-#### #n on the first line suppresses auto-print
+#### #n at the head of the script suppresses auto-print
 ## argv: sed "#n\np"
 ## stdin:
 a
 ## END
 ## stdout:
 a
+## END
+## status: 0
+
+#### and the rule is the first two BYTES, not the first line
+# GNU takes `#n' at the head of the script and stops looking; whatever else is
+# on that line is comment. td-txt required a newline or end of script right
+# after, so every `#nx' spelling auto-printed -- a WRONG ANSWER rather than a
+# refusal, which is the worse kind. (Not the LAST one, as this said at first:
+# the `--posix' bracket-suppression xfail is one too.)
+## argv: sed "#nx\np"
+## stdin:
+a
+b
+## END
+## stdout:
+a
+b
+## END
+## status: 0
+
+#### a comment body that looks like commands is still comment
+## argv: sed "#n;p"
+## stdin:
+a
+b
+## END
+## stdout:
+## END
+## status: 0
+
+#### more `n's after it change nothing
+## argv: sed "#nnn\np"
+## stdin:
+a
+b
+## END
+## stdout:
+a
+b
+## END
+## status: 0
+
+#### but the two bytes must be exactly `#n' -- `#xn' is an ordinary comment
+## argv: sed "#xn\np"
+## stdin:
+a
+b
+## END
+## stdout:
+a
+a
+b
+b
+## END
+## status: 0
+
+#### and they must be FIRST: a leading blank disarms it
+## argv: sed " #n\np"
+## stdin:
+a
+b
+## END
+## stdout:
+a
+a
+b
+b
+## END
+## status: 0
+
+#### a multi-part script still gets the rule, from its first `-e' part
+## argv: sed -e "#nx" -e "p"
+## stdin:
+a
+b
+## END
+## stdout:
+a
+b
+## END
+## status: 0
+
+#### but a script arriving through a PIPE never carries it
+# GNU decides `#n' with `ftell(prog.file) == 2', which is -1 on a pipe, so a
+# `-f -' script off one auto-prints however it starts. td-txt read the file into
+# memory and always honoured it -- a divergence that predates the branch for the
+# bare `#n' spelling and that the prefix fix above would have WIDENED to every
+# `#n...' spelling, so it is closed in the same landing. Found by a reviewer,
+# whose sweep used a fifo where mine had used a regular file and so could see it.
+## argv: sed -f - data
+## file-json data: "a\nb\n"
+## stdin:
+#nx
+p
+## END
+## stdout:
+a
+a
+b
+b
+## END
+## status: 0
+
+#### the bare `#n' spelling through a pipe either
+## argv: sed -f - data
+## file-json data: "a\nb\n"
+## stdin:
+#n
+p
+## END
+## stdout:
+a
+a
+b
+b
+## END
+## status: 0
+
+#### and only the FIRST part is asked -- a later pipe cannot revoke it
+# The seekability question is about the stream the first two bytes came from,
+# so a second `-f' off a pipe leaves the rule alone. Without this the guard
+# could be written to let any `-f' clear it and nothing would notice.
+## argv: sed -f s.sed -f - data
+## file-json data: "a\nb\n"
+## file-json s.sed: "#nx\np\n"
+## stdout:
+a
+b
+## END
+## status: 0
+
+#### while a SEEKABLE `-f' script does carry it -- the control
+## argv: sed -f s.sed data
+## file-json data: "a\nb\n"
+## file-json s.sed: "#nx\np\n"
+## stdout:
+a
+b
+## END
+## status: 0
+
+#### and --posix keeps it, this one being POSIX's own spelling
+## argv: sed --posix "#nx\np"
+## stdin:
+a
+b
+## END
+## stdout:
+a
+b
 ## END
 ## status: 0
 

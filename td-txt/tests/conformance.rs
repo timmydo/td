@@ -41,7 +41,7 @@ fn bin() -> PathBuf {
 /// missing vendored `.inp`/`.good`, or a typo'd annotation reds in-loop — without
 /// depending on the behavioral run below.
 /// Raise this with the corpus; it exists to catch a corpus that SHRANK.
-const CORPUS_FLOOR: usize = 1784;
+const CORPUS_FLOOR: usize = 1795;
 
 #[test]
 fn corpus_is_well_formed() -> Result<(), Box<dyn std::error::Error>> {
@@ -681,5 +681,92 @@ fn grep_counts_what_it_opened_and_could_not_read_but_not_what_it_could_not_open(
         String::from_utf8_lossy(&as_stdin.stderr),
         "grep: (standard input): Is a directory\n"
     );
+    Ok(())
+}
+
+/// GNU's `#n` test for a FILE script is `prog.file && !prog.base && 2 ==
+/// ftell(prog.file)` -- an absolute offset -- so a `-f -` script on a
+/// descriptor handed over ALREADY PART-READ does not carry the rule: the two bytes
+/// begin what td-txt reads but not what the file holds. Seekability alone would
+/// take it, and that half of the rule has no corpus case — the harness can hand a
+/// case a pipe or a file, but not a pre-positioned one.
+#[test]
+fn sed_hash_n_wants_a_script_stream_that_started_at_its_beginning()
+-> Result<(), Box<dyn std::error::Error>> {
+    use std::io::Seek;
+    let dir = TempDir::new("sed-hash-n-offset")?;
+    std::fs::write(dir.join("data"), b"A\nB\n")?;
+    std::fs::write(dir.join("s"), b"xyz#n\np\n")?;
+    std::fs::write(dir.join("s0"), b"#n\np\n")?;
+
+    let mut part_read = std::fs::File::open(dir.join("s"))?;
+    part_read.seek(std::io::SeekFrom::Start(3))?;
+    let out = std::process::Command::new(bin())
+        .arg("sed")
+        .args(["-f", "-", "data"])
+        .current_dir(&dir.0)
+        .stdin(std::process::Stdio::from(part_read))
+        .output()?;
+    assert!(out.status.success() && out.stderr.is_empty(), "{out:?}");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "A\nA\nB\nB\n", "{out:?}");
+
+    // The control: the same two bytes at the file's own start DO carry it.
+    let whole = std::fs::File::open(dir.join("s0"))?;
+    let out0 = std::process::Command::new(bin())
+        .arg("sed")
+        .args(["-f", "-", "data"])
+        .current_dir(&dir.0)
+        .stdin(std::process::Stdio::from(whole))
+        .output()?;
+    assert!(out0.status.success() && out0.stderr.is_empty(), "{out0:?}");
+    assert_eq!(String::from_utf8_lossy(&out0.stdout), "A\nB\n", "{out0:?}");
+    Ok(())
+}
+
+/// Whether a `-f -` script can carry `#n` must be decided by STAT, never by opening
+/// fd 0 again: a second open waits for a writer FOR EVER when stdin is a fifo,
+/// which is how the first version of this hung. The hang cannot be provoked from a
+/// test — std cannot make a fifo and the gate runs no third-party program — so the
+/// property is guarded against the source, as td's other confinement tests do for
+/// what no compiler checks. It is a TEXT guard and not a proof, and its blind spot
+/// is exactly one thing: it reads a LINE at a time, so a reopen split across two --
+/// a path bound to a variable, or a multi-line `OpenOptions::new()...open(...)` --
+/// is not something it can see. Everything ON one line it does see, however the
+/// path is spelled or built, which is the part a reviewer got a hanging reopen
+/// past when this matched whole literals instead of prefixes.
+#[test]
+fn sed_script_stdin_seekability_is_a_stat_not_a_reopen()
+-> Result<(), Box<dyn std::error::Error>> {
+    let src =
+        std::fs::read_to_string(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/sed.rs"))?;
+    let (_, after) = src.split_once("fn read_script(").ok_or("read_script is gone")?;
+    let (body, _) = after.split_once("\nfn ").ok_or("read_script has no end")?;
+    assert!(
+        body.contains("metadata(\"/proc/self/fd/0\")"),
+        "the stdin arm must ask stat, which does not join a fifo's open handshake"
+    );
+    // Nowhere in the file may a name for fd 0 reach something that OPENS it. Only
+    // code lines: a comment naming both is discussion, not a reopen. `fs::read(`
+    // carries its paren so `read_dir`/`read_link` are not swept up with it, and
+    // the opener list is by SUFFIX -- `::open(`, `.open(` -- so `File::options()`
+    // and any other builder ending in `.open(` are caught too, which naming the
+    // constructors was not. The paths are PREFIXES, not whole literals, so a name
+    // BUILT on the line (`format!("/proc/self/fd/{}", 0)`) is caught as surely as
+    // one written out; pinning the three exact strings did not, and a reviewer
+    // got a hanging reopen past this guard that way. `read_source` opens
+    // `/dev/stdin` by design, eight lines from where it names it; that is fine
+    // while the two stay on separate lines, and this guard is why they must.
+    for line in src.lines() {
+        if line.trim_start().starts_with("//") {
+            continue;
+        }
+        let names_fd0 = ["/dev/stdin", "/dev/fd/", "/proc/self/fd"]
+            .iter()
+            .any(|n| line.contains(n));
+        let opens = ["::open(", ".open(", "OpenOptions", "fs::read(", "read_to_string("]
+            .iter()
+            .any(|o| line.contains(o));
+        assert!(!(names_fd0 && opens), "fd 0 must not be reopened: {line}");
+    }
     Ok(())
 }

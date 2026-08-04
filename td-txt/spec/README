@@ -253,6 +253,64 @@ td-txt-authored case files
     /proc/self/fd/0` and `R /dev/fd/0`, naming the same file, do. That last pair
     cannot go in the corpus: which of the two answers is right depends on whether
     the harness hands the case a pipe or a file.
+
+    The same question decides `#n`, and GNU's form of it for a FILE script is
+    `prog.file && !prog.base && 2 == ftell(prog.file)` (the `prog.cur == 2 +
+    prog.base` spelling is the STRING-script branch): the script stream must SEEK
+    -- `ftell` is -1 on a pipe, so a `-f`
+    script arriving through one never carries the rule however it starts -- and it
+    must have STARTED at its own beginning, so a descriptor handed over already
+    part-read does not carry it either (`sed -f -` on stdin pre-positioned past
+    three bytes auto-prints in GNU). Only the FIRST script part is asked, a later
+    `-f` off a pipe cannot revoke it, and an `-e` or literal part always carries.
+    Half of this is caseable and half is not: the harness gives every case a piped
+    stdin, so `-f -` reaches the non-seekable side and a `## file` reaches the
+    other, but it can hand a case neither a fifo nor a pre-positioned descriptor.
+    The pre-positioned half is an integration test in tests/conformance.rs, which
+    CAN seek a `File` and pass it as stdin. The fifo half has NO behavioural test:
+    std cannot make a fifo and the gate runs no third-party program to make one.
+    What stands in its place is a source assertion in the same file, and it guards
+    the narrower property of never REOPENING fd 0 rather than the answer a fifo
+    gets -- the two are not the same claim, and only the first is tested. The
+    answer itself was measured by hand: writer gone, GNU and td-txt both
+    auto-print. td-txt asks `stat` rather than reopening: reopening fd 0
+    HANGS when it is a fifo whose writer has gone, a worse failure than the wrong
+    answer it was meant to fix. What `stat` buys is that it does not join that
+    OPEN handshake -- not that it can never block, since an attribute lookup on a
+    stalled network or FUSE mount can. `stat` is a PROXY for `ftell`, not an
+    equal. It holds wherever `st_size` equals what is readable from offset 0 and
+    the thing is a regular file, and parts company BOTH ways. It DECLINES what GNU
+    takes for a BLOCK device (seekable, so `ftell` answers), a virtual file sized
+    0 (procfs) or a fixed 4096 (sysfs) against a shorter read, and a file RESIZED
+    between the read and the stat -- grown, when the read missed the new bytes (a
+    read that caught them agrees again), or shrunk to any size but the one just
+    read. Those auto-print here, as an absent or unreadable /proc does. Every one
+    of them is the `-f -` arm ONLY: a NAMED `-f` asks the stream itself to seek,
+    which is the real question, so `-f /proc/PID/comm` on a `#n` comm AGREES with
+    GNU (both suppress) where `-f -` redirected from that same file diverges (GNU
+    suppresses, td-txt auto-prints). Measured both ways -- the proxy governs the
+    one arm that cannot ask. A
+    CHARACTER device is NOT among them, though an earlier draft of this entry said
+    it was: measured through GNU's own sequence -- `fopen`, `fread` of two bytes,
+    `ftell` -- not one readable here reaches 2. `/dev/ptmx` refuses to seek at all
+    (ESPIPE); `/dev/zero`, `/dev/urandom` and `/dev/full` answer -1, glibc having
+    gone negative subtracting the bytes it read ahead and did not hand over; and
+    `/dev/null` answers 0, having read nothing. So GNU declines them too --
+    agreement, not divergence. (A draft of this said they "report offset 0", which
+    is what raw `lseek` reports and not what `ftell` does. The conclusion held and
+    the mechanism was wrong, which is twice on this branch that measuring the
+    near-neighbour call has answered a question about a different one.) The
+    block-device half is reasoning and not measurement: nothing here can open one.
+    It can also wrongly ACCEPT, which the decline cases might suggest it cannot,
+    but in two narrow shapes and NEITHER of them a static configuration. `S_IFREG`
+    is not the same question as seekable, so a filesystem serving a regular file
+    that refuses `lseek` (FUSE can) is taken here and declined there. And a file
+    truncated to exactly the bytes just read, in the window BETWEEN the read and
+    the stat, looks like a whole file read from 0 -- a pre-positioned descriptor
+    cannot do it alone, because what is readable from offset k is `size - k`,
+    which equals `size` only at k = 0. So the accepting direction needs a
+    concurrent writer where the declining one does not. Exactness would need
+    `lseek` on fd 0, which safe `std` cannot reach.
   - `R` cursors are keyed by NAME, not per command: two `R f` commands share one
     cursor and advance it twice in a cycle, while an `r f` beside them is unrelated.
   - And `w /dev/stdout` still means the real standard output under `-i`, where the
@@ -1026,14 +1084,27 @@ td-txt-authored case files
     refuse all three, differing only in the missing `char N:` offset -- which is
     a reminder to normalise that before believing a stderr comparison.
 
-  - `#n` is a PREFIX rule in GNU, not a whole-line one. POSIX says the default
-    output is suppressed if the first two characters of the script are `#n`;
-    td-txt additionally requires a newline or end of script after them, so
-    `sed '#nx'` prints nothing in GNU and echoes its input here (`#xn`
-    suppresses in neither -- it must be the first two bytes). A WRONG ANSWER
-    rather than a refusal, which makes it the more serious of the gaps recorded
-    here; both modes, predates the branch. Found by a reviewer fuzzing around
-    `--posix`.
+  - `R /dev/stdin` HANGS here when stdin is a fifo whose writer has gone, where
+    GNU prints its line and carries on: GNU opens `R` sources at compile time and
+    aliases the literal `/dev/stdin` to its own stdin stream, while `read_source`
+    opens the NAME, and opening a fifo waits for a writer for ever. `r /dev/stdin`
+    hangs in both, so only `R` diverges. Predates the branch -- the branch-point
+    build hangs identically -- and it is the same failure the `#n` seekability fix
+    exists for, surviving one command letter away, which is why it is recorded
+    beside it rather than filed with the other diagnostics.
+
+  - A leading `\r` in a script: GNU skips it, td-txt refuses with
+    `unknown command: `\r''`. `printf '\rp' > s; sed -f s F` doubles every line
+    in GNU at exit 0 and errors here, in both modes and through `-e` as much as
+    `-f`. Fail-CLOSED, predates the branch. Found by a reviewer as a byproduct of
+    sweeping script HEADS for the `#n` rule -- the same sweep axis, one byte over.
+
+  - `-f` naming a DIRECTORY: GNU reads it as an empty script and auto-prints at
+    exit 0, where td-txt is `couldn't open file DIR: Is a directory` at exit 4.
+    Fail-CLOSED, predates the branch, both modes. Found by a reviewer sweeping
+    what a `-f` STREAM can be, which is this section's own axis -- the read fails
+    on the directory rather than at open, so it is the read's error that surfaces
+    and not the open's.
 
   - An address left dangling at the end of an `-e` part: `sed -e '2' -e 'p'` is
     `missing command` in GNU and `unknown command: `\n'` here. Both modes,

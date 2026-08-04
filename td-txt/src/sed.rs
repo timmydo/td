@@ -2046,6 +2046,9 @@ fn run(args: &[Vec<u8>]) -> Result<i32, Fatal> {
         posix: false,
     };
     let mut script_parts: Vec<Vec<u8>> = Vec::new();
+    // Only the FIRST script part can carry `#n`, and a `-f` one carries it only
+    // if its stream can seek. A literal or `-e` part always can.
+    let mut hash_n_carries = true;
     let mut script_given = false;
     let mut operands: Vec<Vec<u8>> = Vec::new();
     let mut no_more_options = false;
@@ -2147,10 +2150,14 @@ fn run(args: &[Vec<u8>]) -> Result<i32, Fatal> {
                         // Same failure as short `-f`, so the same status and the same
                         // wording: the script did not fail to COMPILE, the file failed
                         // to open.
-                        script_parts.push(read_input(&value).map_err(|e| Fatal {
+                        let (text, seekable) = read_script(&value).map_err(|e| Fatal {
                             msg: format!("couldn't open file {}: {}", show(&value), errmsg(&e)),
                             status: 4,
-                        })?);
+                        })?;
+                        if script_parts.is_empty() {
+                            hash_n_carries = seekable;
+                        }
+                        script_parts.push(text);
                     } else {
                         script_parts.push(value);
                     }
@@ -2205,10 +2212,13 @@ fn run(args: &[Vec<u8>]) -> Result<i32, Fatal> {
                         .ok_or_else(|| "option requires an argument -- 'f'".to_string())?;
                     // An unreadable SCRIPT file is exit 4, like any other
                     // runtime failure — not 1, which means a bad script.
-                    let text = read_input(&v).map_err(|e| Fatal {
+                    let (text, seekable) = read_script(&v).map_err(|e| Fatal {
                         msg: format!("couldn't open file {}: {}", show(&v), errmsg(&e)),
                         status: 4,
                     })?;
+                    if script_parts.is_empty() {
+                        hash_n_carries = seekable;
+                    }
                     script_parts.push(text);
                     script_given = true;
                 }
@@ -2242,8 +2252,11 @@ fn run(args: &[Vec<u8>]) -> Result<i32, Fatal> {
         }
         source.extend_from_slice(part);
     }
-    // `#n` on the very first line is POSIX's in-script spelling of -n.
-    if source.starts_with(b"#n") && matches!(source.get(2), None | Some(b'\n')) {
+    // `#n` is POSIX's in-script spelling of -n, and the rule is about the first
+    // two BYTES of the script, not the first line: `#nx` and `#n;p` suppress in
+    // GNU as surely as `#n` does, the rest of the line being comment either way.
+    // Requiring a newline after them made every such script print twice over.
+    if hash_n_carries && source.starts_with(b"#n") {
         conf.suppress = true;
     }
 
@@ -2385,6 +2398,51 @@ struct RFile {
     lines: Vec<Line>,
     pos: usize,
     rewindable: bool,
+}
+
+/// Read a `-f` script, and say whether `#n` may come from it. GNU's test for a file
+/// script is `prog.file && !prog.base && 2 == ftell(prog.file)` -- an ABSOLUTE
+/// offset, so the stream must both SEEK (`ftell` is -1 on a pipe, which is why
+/// `printf '#n\np' | sed -f -` auto-prints there) and have STARTED at its own
+/// beginning (a descriptor handed over already part-read does not carry the rule).
+/// A named file is opened here, so the second half holds by construction and only
+/// the seek is asked. Stdin can be neither seeked nor reopened, so it gets a PROXY
+/// -- see the comment below for where the proxy and GNU part company.
+fn read_script(path: &[u8]) -> std::io::Result<(Vec<u8>, bool)> {
+    let mut data = Vec::new();
+    if path == b"-" {
+        std::io::stdin().lock().read_to_end(&mut data)?;
+        // `Stdin` cannot seek and must NOT be reopened to ask: opening fd 0 again
+        // waits for a writer for ever when it is a fifo. `stat` does not take part
+        // in that handshake, and it answers both halves at once for the case that
+        // reaches here -- a regular file is the seekable one, and a size equal to
+        // what was just read means the descriptor began at offset 0.
+        //
+        // `is_file` is defence in depth rather than the deciding test: `st_size`
+        // is 0 for a pipe, fifo, socket, tty and block device alike, so the
+        // length comparison already declines every one of them.
+        //
+        // It is a PROXY, not `ftell`, and parts company both ways -- spec/README
+        // enumerates. It DECLINES what GNU takes for a block device, a virtual
+        // file sized 0 (procfs) or a fixed 4096 (sysfs) against a shorter read,
+        // and a file RESIZED between the read and the stat; those auto-print
+        // rather than swallow output, as an absent or unreadable /proc does. A
+        // CHARACTER device is not among them: they refuse to seek or report
+        // offset 0 whatever was read, so GNU's `ftell == 2` declines them too.
+        // It can wrongly ACCEPT only where `S_IFREG` is not in fact seekable
+        // (FUSE may serve such a file), or under a concurrent truncation to
+        // exactly the bytes read -- never from a pre-positioned descriptor
+        // alone, since what is readable from offset k is `size - k`, and that
+        // equals `size` only at k = 0. Being exact would need `lseek` on fd 0,
+        // which safe `std` cannot reach.
+        let seekable = std::fs::metadata("/proc/self/fd/0")
+            .map(|m| m.is_file() && m.len() == data.len() as u64)
+            .unwrap_or(false);
+        return Ok((data, seekable));
+    }
+    let mut file = std::fs::File::open(crate::util::path_from_bytes(path))?;
+    file.read_to_end(&mut data)?;
+    Ok((data, file.seek(std::io::SeekFrom::Start(0)).is_ok()))
 }
 
 /// Read a file named by `r`/`R`. Unlike an operand or `-f`, `-` is NOT stdin here:
