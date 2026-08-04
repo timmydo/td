@@ -25,7 +25,7 @@ use std::path::{Path, PathBuf};
 
 use crate::regex::{Captures, Options, Regex};
 use crate::util::{
-    errmsg, number, posixly_correct, print_line, read_input, records, show, Out, VERSION,
+    errmsg, number, posixly_correct, print_line, records, show, Input, Out, VERSION,
 };
 
 const USAGE: &str =
@@ -1399,6 +1399,22 @@ struct Stream {
     /// A read failure already suffered. It outranks a quit code, and because
     /// operands open lazily it can only describe a file the run actually reached.
     bad: bool,
+    /// An operand the READER opened and could not read, which ends the run at 4.
+    /// The diagnostic is printed where it happens, ahead of the buffered output,
+    /// so it lands beside the other operand diagnostics as GNU's does.
+    fatal: bool,
+}
+
+/// Who is opening the next operand. It decides only what a READ failure means:
+/// GNU's reader panics on one -- `read error on NAME`, exit 4, and nothing after
+/// it runs -- while the `$` lookahead peeks with `getc`, which reports the error
+/// as end-of-file, so that operand is stepped over without a word. `sed -n p A
+/// DIR` is the first and `sed -n '$F' A DIR` the second. An OPEN failure is the
+/// same warning to both.
+#[derive(Clone, Copy)]
+enum Opener {
+    Reader,
+    Lookahead,
 }
 
 impl Stream {
@@ -1411,6 +1427,7 @@ impl Stream {
             lines: to_lines(data, separator),
             pos: 0,
             bad: false,
+            fatal: false,
         }
     }
 
@@ -1424,13 +1441,15 @@ impl Stream {
             lines: Vec::new(),
             pos: 0,
             bad: false,
+            fatal: false,
         }
     }
 
-    /// Open operands until one HAS A LINE, reporting each that cannot be read and
+    /// Open operands until one HAS A LINE, reporting each that cannot be OPENED and
     /// stepping over each that is empty — GNU's `last_file_with_data_p`, which is
-    /// also how its `$` test answers. `false` once nothing is left.
-    fn advance(&mut self) -> bool {
+    /// also how its `$` test answers. `false` once nothing is left, and once a read
+    /// failed under the reader, which ends the run.
+    fn advance(&mut self, opener: Opener) -> bool {
         while self.pos >= self.lines.len() {
             let Some(path) = self.pending.next() else {
                 return false;
@@ -1438,11 +1457,25 @@ impl Stream {
             // GNU sets the name before it tries to open, so a failed operand is
             // what `F` would report until the next open replaces it.
             self.name = path;
-            match read_input(&self.name) {
-                Ok(data) => {
-                    self.lines = to_lines(&data, self.separator);
-                    self.pos = 0;
-                }
+            match Input::open(&self.name, true) {
+                Ok(mut input) => match input.read_all() {
+                    Ok(data) => {
+                        self.lines = to_lines(&data, self.separator);
+                        self.pos = 0;
+                    }
+                    // The bytes a failed read DID deliver are dropped: GNU panics
+                    // at the failure rather than processing them, and the reachable
+                    // case — a DIRECTORY — delivers none, failing at the first read.
+                    Err((e, _)) => match opener {
+                        Opener::Reader => {
+                            let name = input.error_name(&self.name);
+                            eprintln!("sed: read error on {name}: {}", errmsg(&e));
+                            self.fatal = true;
+                            return false;
+                        }
+                        Opener::Lookahead => {}
+                    },
+                },
                 Err(e) => {
                     eprintln!("sed: can't read {}: {}", show(&self.name), errmsg(&e));
                     self.bad = true;
@@ -1458,8 +1491,12 @@ impl Stream {
         &self.name
     }
 
-    fn next_line(&mut self) -> Option<Line> {
-        if !self.advance() {
+    /// The next line, or `None` at end of input. WHO is asking decides what an
+    /// unreadable operand means, which is why the caller says: the cycle reads,
+    /// and `n`/`N` reach input through GNU's `test_eof` first, so a read failure
+    /// there is the peek's silent end-of-file rather than the reader's panic.
+    fn next_line(&mut self, opener: Opener) -> Option<Line> {
+        if !self.advance(opener) {
             return None;
         }
         let line = self.lines.get(self.pos)?;
@@ -1470,9 +1507,10 @@ impl Stream {
 
     /// No further input line, so the line just read was `$`. Takes `&mut` because
     /// ANSWERING opens operands: that is observable, through `F` and through which
-    /// unreadable operand gets reported, so only a `$` may ask.
+    /// unreadable operand gets reported, so only where GNU asks may this — a `$`
+    /// the evaluator reaches, and the `test_eof` inside `n` and `N`.
     fn at_last(&mut self) -> bool {
-        !self.advance()
+        !self.advance(Opener::Lookahead)
     }
 }
 
@@ -2552,16 +2590,38 @@ fn run(args: &[Vec<u8>]) -> Result<i32, Fatal> {
             // Under `-i` an operand names the file to REWRITE, so `-` is an
             // ordinary name here rather than stdin — there is no rewriting a
             // pipe. GNU reports it as the missing file it is.
-            let read = match &conf.in_place {
-                Some(_) => std::fs::read(crate::util::path_from_bytes(path)),
-                None => read_input(path),
-            };
-            let data = match read {
-                Ok(d) => d,
+            let mut input = match Input::open(path, conf.in_place.is_none()) {
+                Ok(input) => input,
                 Err(e) => {
                     eprintln!("sed: can't read {}: {}", show(path), errmsg(&e));
                     status = 2;
                     continue;
+                }
+            };
+            // `-i` REWRITES what it reads, so an operand it cannot rewrite is
+            // refused BEFORE the read rather than by it — which is why the message
+            // is about editing rather than about reading, and why a TERMINAL is
+            // refused rather than read until someone types. GNU gives up on the
+            // whole run there, leaving every later operand unedited.
+            if conf.in_place.is_some() {
+                if let Some(why) = input.in_place_refusal() {
+                    eprintln!("sed: couldn't edit {}: {why}", show(path));
+                    sink.flush().map_err(Fatal::runtime)?;
+                    return Ok(4);
+                }
+            }
+            let data = match input.read_all() {
+                Ok(data) => data,
+                // A file that opened and would not read ends the run at 4, as it
+                // does on the other path. Its partial bytes are dropped for the
+                // reason `advance` drops them, and under `-i` keeping them would
+                // rewrite the operand TRUNCATED where GNU's own failure path
+                // unlinks its temp file and leaves the original alone.
+                Err((e, _)) => {
+                    let name = input.error_name(path);
+                    eprintln!("sed: read error on {name}: {}", errmsg(&e));
+                    sink.flush().map_err(Fatal::runtime)?;
+                    return Ok(4);
                 }
             };
             let mut stream = to_stream(path, &data, separator);
@@ -2612,6 +2672,14 @@ fn run(args: &[Vec<u8>]) -> Result<i32, Fatal> {
         let mut stream = Stream::of_operands(inputs, separator);
         let mut sink = Sink::stdout(&mut out, separator);
         let quit = sed.run_stream(&mut stream, &mut sink).map_err(Fatal::runtime)?;
+        // A read that failed outranks everything else, including a `bad` operand
+        // opened earlier: GNU's reader panics there, so nothing after it happened.
+        // The flush is for its ERROR — what was written survives either way, since
+        // dropping the `BufWriter` writes it, but silently.
+        if stream.fatal {
+            out.flush().map_err(|e| Fatal::runtime(format!("write error: {}", errmsg(&e))))?;
+            return Ok(4);
+        }
         if stream.bad {
             status = 2;
         }
@@ -2897,7 +2965,7 @@ impl Sed {
     /// to exit with that status.
     fn run_stream(&mut self, stream: &mut Stream, sink: &mut Sink) -> Result<Option<i32>, String> {
         loop {
-            let Some(line) = stream.next_line() else {
+            let Some(line) = stream.next_line(Opener::Reader) else {
                 return Ok(self.quit);
             };
             self.line_number += 1;
@@ -3143,7 +3211,7 @@ impl Sed {
                         self.emit_pattern(sink)?;
                     }
                     self.flush_appends(sink)?;
-                    let Some(line) = stream.next_line() else {
+                    let Some(line) = stream.next_line(Opener::Lookahead) else {
                         self.pattern.clear();
                         return Ok(Flow::Deleted);
                     };
@@ -3158,7 +3226,7 @@ impl Sed {
                     // writes the line before f's text. Both flows the early returns
                     // take already flush, in that order. (`--posix` drops the
                     // pattern space instead, and `n` never had the problem.)
-                    let Some(line) = stream.next_line() else {
+                    let Some(line) = stream.next_line(Opener::Lookahead) else {
                         if self.posix {
                             self.pattern.clear();
                             return Ok(Flow::Deleted);

@@ -2,7 +2,7 @@
 //! buffered stdout that treats a closed pipe as "stop", not as a hard error.
 
 use std::ffi::OsString;
-use std::io::{Read, Write};
+use std::io::{IsTerminal, Read, Write};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
 
@@ -53,16 +53,91 @@ pub fn errmsg(e: &std::io::Error) -> String {
     }
 }
 
-/// Read a whole file, or stdin for `-`. Applets read whole inputs: both grep and
-/// sed need arbitrary lookahead within a file, and the largest thing td's image
-/// greps is a source tree.
-pub fn read_input(path: &[u8]) -> std::io::Result<Vec<u8>> {
-    if path == b"-" {
-        let mut buf = Vec::new();
-        std::io::stdin().lock().read_to_end(&mut buf)?;
-        return Ok(buf);
+/// An input that is OPEN, so a caller can tell the two failures apart. GNU carries
+/// on from a name it could not open -- a warning, exit 2 -- and treats one it
+/// opened and could not READ as fatal to sed (`read error on NAME`, exit 4) and as
+/// an empty file to grep. A DIRECTORY operand is the reachable case of the second:
+/// `open(2)` on one succeeds and the first read fails.
+pub enum Input {
+    Stdin,
+    File(std::fs::File),
+}
+
+impl Input {
+    /// `dash_is_stdin` is false for a name grep's WALK produced -- those are always
+    /// files, so `grep -r` over a directory holding one called `-` searches it --
+    /// and for sed's `-i`, which rewrites a NAME and cannot rewrite a pipe.
+    pub fn open(path: &[u8], dash_is_stdin: bool) -> std::io::Result<Self> {
+        if dash_is_stdin && path == b"-" {
+            return Ok(Self::Stdin);
+        }
+        Ok(Self::File(std::fs::File::open(path_from_bytes(path))?))
     }
-    std::fs::read(path_from_bytes(path))
+
+    /// Why `-i` may not rewrite this, if it may not -- GNU's two refusals, in GNU's
+    /// ORDER, since a terminal is also not a regular file and the first test is what
+    /// names it. Asked of the OPEN descriptor rather than of the name, so the answer
+    /// cannot be about a different file than the one that will be read. Stdin cannot
+    /// arrive here (`-i` opens `-` as the ordinary name it is) and is refused as the
+    /// non-file it would be.
+    pub fn in_place_refusal(&self) -> Option<&'static str> {
+        let Self::File(file) = self else {
+            return Some("not a regular file");
+        };
+        if file.is_terminal() {
+            return Some("is a terminal");
+        }
+        if !file.metadata().map(|m| m.is_file()).unwrap_or(false) {
+            return Some("not a regular file");
+        }
+        None
+    }
+
+    /// How a READ failure names this input. GNU registers the standard input STREAM
+    /// under the name `stdin` and reports read errors against that, where the same
+    /// operand is `-` to `F` and to the `can't read` warning -- so
+    /// `sed p < a-directory` is `read error on stdin`. Answered from the OPEN input
+    /// rather than by re-deciding what `-` meant, which is a second place to get it
+    /// wrong.
+    pub fn error_name(&self, path: &[u8]) -> String {
+        match self {
+            Self::Stdin => "stdin".to_string(),
+            Self::File(_) => show(path),
+        }
+    }
+
+    /// Read to EOF. On failure the bytes that DID arrive come back with it: a read
+    /// can append and then fail, and reporting that file as empty would lose the
+    /// matches in what was read.
+    pub fn read_all(&mut self) -> Result<Vec<u8>, (std::io::Error, Vec<u8>)> {
+        let mut buf = Vec::new();
+        let read = match self {
+            Self::Stdin => std::io::stdin().lock().read_to_end(&mut buf),
+            Self::File(file) => {
+                // Size the buffer from the metadata, as `fs::read` does -- but
+                // CLAMPED. That number comes from the filesystem and need not be a
+                // size anything can hold (a sparse file, `/proc/kcore`), and
+                // `with_capacity` ABORTS rather than failing, where the read below
+                // reports out of memory and the applet carries on.
+                const HINT_CAP: usize = 8 << 20;
+                let size = file.metadata().map(|m| m.len() as usize).unwrap_or(0);
+                buf.reserve(size.saturating_add(1).min(HINT_CAP));
+                file.read_to_end(&mut buf)
+            }
+        };
+        match read {
+            Ok(_) => Ok(buf),
+            Err(err) => Err((err, buf)),
+        }
+    }
+}
+
+/// Read a whole input, or stdin for `-`, for a caller the two failures read alike
+/// to. Applets read whole inputs: both grep and sed need arbitrary lookahead
+/// within a file, and the largest thing td's image greps is a source tree.
+pub fn read_input(path: &[u8]) -> std::io::Result<Vec<u8>> {
+    let mut input = Input::open(path, true)?;
+    input.read_all().map_err(|(err, _)| err)
 }
 
 /// A read that failed, and whether the OPEN is what failed. GNU counts a file it
@@ -83,28 +158,11 @@ pub struct ReadFail {
 /// in a directory holding a file called `-` searches it rather than reading
 /// stdin, as GNU does.
 pub fn read_search(path: &[u8], from_walk: bool) -> Result<Vec<u8>, ReadFail> {
-    if path == b"-" && !from_walk {
-        let mut buf = Vec::new();
-        return match std::io::stdin().lock().read_to_end(&mut buf) {
-            Ok(_) => Ok(buf),
-            Err(err) => Err(ReadFail { err, opened: true, partial: buf }),
-        };
-    }
-    let mut file = match std::fs::File::open(path_from_bytes(path)) {
-        Ok(f) => f,
+    let mut input = match Input::open(path, !from_walk) {
+        Ok(input) => input,
         Err(err) => return Err(ReadFail { err, opened: false, partial: Vec::new() }),
     };
-    // Size the buffer from the metadata, as `fs::read` does -- but CLAMPED. That
-    // number comes from the filesystem and need not be a size anything can hold
-    // (a sparse file, `/proc/kcore`), and `with_capacity` ABORTS rather than
-    // failing, where the read below reports out of memory and grep carries on.
-    const HINT_CAP: usize = 8 << 20;
-    let size = file.metadata().map(|m| m.len() as usize).unwrap_or(0);
-    let mut buf = Vec::with_capacity(size.saturating_add(1).min(HINT_CAP));
-    match file.read_to_end(&mut buf) {
-        Ok(_) => Ok(buf),
-        Err(err) => Err(ReadFail { err, opened: true, partial: buf }),
-    }
+    input.read_all().map_err(|(err, partial)| ReadFail { err, opened: true, partial })
 }
 
 /// Write one line to stdout, treating a CLOSED READER as "done" rather than as a
@@ -346,6 +404,40 @@ pub fn number(n: u64) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The corpus harness always PIPES stdin, so no case can make a read on it
+    /// fail; the rule is pinned here instead and checked by hand against GNU.
+    #[test]
+    fn a_read_error_names_the_standard_input_stream_stdin() {
+        let stdin = Input::open(b"-", true).unwrap();
+        assert_eq!(stdin.error_name(b"-"), "stdin");
+        // The refusal `-i` would give it, though `-i` opens `-` as a name and so
+        // never routes the stream here.
+        assert_eq!(stdin.in_place_refusal(), Some("not a regular file"));
+    }
+
+    /// The whole open/read split rests on `open(2)` SUCCEEDING on a directory and
+    /// the first read failing, which is a property of the kernel and of `std`, not
+    /// of this crate -- so it is asserted rather than assumed.
+    #[test]
+    fn a_directory_opens_and_will_not_read() {
+        let dir = std::env::temp_dir().join(format!("td-txt-input-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let name = dir.as_os_str().as_bytes();
+        let mut opened = Input::open(name, true).expect("a directory opens");
+        assert_eq!(opened.in_place_refusal(), Some("not a regular file"));
+        assert_eq!(opened.error_name(name), show(name));
+        let err = opened.read_all().expect_err("and does not read").0;
+        assert_eq!(errmsg(&err), "Is a directory");
+
+        let file = dir.join("f");
+        std::fs::write(&file, b"x").unwrap();
+        let mut opened = Input::open(file.as_os_str().as_bytes(), true).unwrap();
+        assert_eq!(opened.in_place_refusal(), None);
+        assert_eq!(opened.read_all().unwrap(), b"x");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn records_keeps_a_final_unterminated_line() {

@@ -9259,3 +9259,193 @@ xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx$
 ## stderr-json: "sed: can't read nosuch: No such file or directory\n"
 ## status: 2
 
+# An operand that OPENS and cannot be READ is a different failure from one that
+# would not open: GNU warns about the second and carries on (exit 2) and PANICS on
+# the first (`read error on NAME`, exit 4, nothing behind it read). A DIRECTORY is
+# the reachable case -- `open(2)` succeeds and the first read fails. Inside the
+# lookahead, which is `getc` in GNU, that same failure IS end-of-file: silent, and
+# stepped over. `n` and `N` reach input through that lookahead (`test_eof`) before
+# they read, so a directory is silent to them and fatal to the cycle that follows.
+
+#### an operand that OPENS and will not READ is fatal, not a warning
+## argv: sed -n p d
+## file-json in0: "a\n"
+## file-json two: "a\nb\n"
+## file-json in2: "c\n"
+## file-json f: "x\n"
+## file-json d/keep: ""
+## stdin-json: ""
+## stdout-json: ""
+## stderr-json: "sed: read error on d: Is a directory\n"
+## status: 4
+
+#### and what was already written still stands
+## argv: sed -n p in0 d
+## file-json in0: "a\n"
+## file-json two: "a\nb\n"
+## file-json in2: "c\n"
+## file-json f: "x\n"
+## file-json d/keep: ""
+## stdin-json: ""
+## stdout-json: "a\n"
+## stderr-json: "sed: read error on d: Is a directory\n"
+## status: 4
+
+#### nothing after it is read: the operand behind it never runs
+## argv: sed -n p d in0
+## file-json in0: "a\n"
+## file-json two: "a\nb\n"
+## file-json in2: "c\n"
+## file-json f: "x\n"
+## file-json d/keep: ""
+## stdin-json: ""
+## stdout-json: ""
+## stderr-json: "sed: read error on d: Is a directory\n"
+## status: 4
+
+#### the $ lookahead sees that same failure as end of input and says nothing
+## argv: sed -n '$F' in0 d
+## file-json in0: "a\n"
+## file-json two: "a\nb\n"
+## file-json in2: "c\n"
+## file-json f: "x\n"
+## file-json d/keep: ""
+## stdin-json: ""
+## stdout-json: "d\n"
+## stderr-json: ""
+## status: 0
+
+#### so it steps over the unreadable operand to one that has a line
+## argv: sed -n '$p' in0 d in2
+## file-json in0: "a\n"
+## file-json two: "a\nb\n"
+## file-json in2: "c\n"
+## file-json f: "x\n"
+## file-json d/keep: ""
+## stdin-json: ""
+## stdout-json: "c\n"
+## stderr-json: ""
+## status: 0
+
+#### an OPEN that fails is still the warning it was, in the same run
+## argv: sed -n p in0 nosuch d
+## file-json in0: "a\n"
+## file-json two: "a\nb\n"
+## file-json in2: "c\n"
+## file-json f: "x\n"
+## file-json d/keep: ""
+## stdin-json: ""
+## stdout-json: "a\n"
+## stderr-json: "sed: can't read nosuch: No such file or directory\nsed: read error on d: Is a directory\n"
+## status: 4
+
+#### -s reads each operand for itself and stops at the same failure
+## argv: sed -n -s p in0 d
+## file-json in0: "a\n"
+## file-json two: "a\nb\n"
+## file-json in2: "c\n"
+## file-json f: "x\n"
+## file-json d/keep: ""
+## stdin-json: ""
+## stdout-json: "a\n"
+## stderr-json: "sed: read error on d: Is a directory\n"
+## status: 4
+
+#### a quit after the lookahead stepped over one exits with the quit's own code
+## argv: sed -n -e '$p' -e q in0 d
+## file-json in0: "a\n"
+## file-json two: "a\nb\n"
+## file-json in2: "c\n"
+## file-json f: "x\n"
+## file-json d/keep: ""
+## stdin-json: ""
+## stdout-json: "a\n"
+## stderr-json: ""
+## status: 0
+
+#### N reaches input through that same lookahead, so it is silent too
+## argv: sed -n 'N;P;D' in0 d in2
+## file-json in0: "a\n"
+## file-json two: "a\nb\n"
+## file-json in2: "c\n"
+## file-json f: "x\n"
+## file-json d/keep: ""
+## stdin-json: ""
+## stdout-json: "a\n"
+## stderr-json: ""
+## status: 0
+
+#### but the CYCLE's own read is not, given a line for N to take first
+## argv: sed -n N two d
+## file-json in0: "a\n"
+## file-json two: "a\nb\n"
+## file-json in2: "c\n"
+## file-json f: "x\n"
+## file-json d/keep: ""
+## stdin-json: ""
+## stdout-json: ""
+## stderr-json: "sed: read error on d: Is a directory\n"
+## status: 4
+
+#### n likewise, and the line it does not get ends the script
+## argv: sed -n -e n -e F in0 d
+## file-json in0: "a\n"
+## file-json two: "a\nb\n"
+## file-json in2: "c\n"
+## file-json f: "x\n"
+## file-json d/keep: ""
+## stdin-json: ""
+## stdout-json: ""
+## stderr-json: ""
+## status: 0
+
+#### F names the operand the peek moved to, though nothing was read from it
+## argv: sed -n '$!{N};F' in0 d
+## file-json in0: "a\n"
+## file-json two: "a\nb\n"
+## file-json in2: "c\n"
+## file-json f: "x\n"
+## file-json d/keep: ""
+## stdin-json: ""
+## stdout-json: "d\n"
+## stderr-json: ""
+## status: 0
+
+#### and the one it never left, when there was a line and no peek needed it
+## argv: sed -n '$!{N};F' two d
+## file-json in0: "a\n"
+## file-json two: "a\nb\n"
+## file-json in2: "c\n"
+## file-json f: "x\n"
+## file-json d/keep: ""
+## stdin-json: ""
+## stdout-json: "two\n"
+## stderr-json: "sed: read error on d: Is a directory\n"
+## status: 4
+
+#### -i refuses a non-regular operand before reading it, and gives up on the run
+## argv: sed -i s/x/y/ d f
+## file-json in0: "a\n"
+## file-json two: "a\nb\n"
+## file-json in2: "c\n"
+## file-json f: "x\n"
+## file-json d/keep: ""
+## stdin-json: ""
+## stdout-json: ""
+## stderr-json: "sed: couldn't edit d: not a regular file\n"
+## status: 4
+## file-after-json f: "x\n"
+
+#### having already rewritten the ones before it
+## argv: sed -i s/x/y/ f d
+## file-json in0: "a\n"
+## file-json two: "a\nb\n"
+## file-json in2: "c\n"
+## file-json f: "x\n"
+## file-json d/keep: ""
+## stdin-json: ""
+## stdout-json: ""
+## stderr-json: "sed: couldn't edit d: not a regular file\n"
+## status: 4
+## file-after-json f: "y\n"
+

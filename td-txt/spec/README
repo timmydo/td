@@ -1169,36 +1169,17 @@ td-txt-authored case files
     hangs in both, so only `R` diverges. Predates the branch -- the branch-point
     build hangs identically -- and it is the same failure the `#n` seekability fix
     exists for, surviving one command letter away, which is why it is recorded
-    beside it rather than filed with the other diagnostics.
+    beside it rather than filed with the other diagnostics. The aliasing has a
+    second face in the DIAGNOSTIC, found by a reviewer: because GNU is reading
+    its own stdin stream, `sed -n 'R /dev/stdin' F < a-directory` says
+    `read error on stdin` where td-txt names the file it really opened,
+    `/dev/stdin`. Both exit 4. An OPERAND spelled `-` does say `stdin` now.
 
   - A leading `\r` in a script: GNU skips it, td-txt refuses with
     `unknown command: `\r''`. `printf '\rp' > s; sed -f s F` doubles every line
     in GNU at exit 0 and errors here, in both modes and through `-e` as much as
     `-f`. Fail-CLOSED, predates the branch. Found by a reviewer as a byproduct of
     sweeping script HEADS for the `#n` rule -- the same sweep axis, one byte over.
-
-  - A DIRECTORY as an OPERAND, and the one place lazy operand reading made a
-    divergence WORSE rather than better. GNU `fopen`s a directory successfully
-    and fails at the first READ, so it says `read error on DIR: Is a directory`
-    and exits 4 where td-txt says `can't read DIR: Is a directory` and exits 2
-    -- one message and one status apart, both fail-closed. The sharper half is
-    in the `$` lookahead, which reads a byte to see whether an operand has one:
-    GNU's read fails there and is SILENTLY treated as "no data", so
-    `sed -n '$F' A DIR` prints `DIR` at exit 0 with no diagnostic at all, while
-    td-txt reports the directory and exits 2.
-    The message and the plain-operand status predate the lazy reading. What it
-    MOVED is two things, and one of them is a regression stated plainly rather
-    than left in a bucket: `F` now prints GNU's `DIR` where it printed `A`,
-    which is better; and the status of a directory operand followed by a QUIT
-    went from AGREEING with GNU to disagreeing, because "a failure already
-    suffered outranks the quit code" now fires on a `bad` GNU never sets.
-    `sed -n -e '$p' -e q in0 DIR` is 0 in GNU and was 0 here, and is 2 now --
-    eight shapes of a 440-shape status-only sweep, every one a directory beside
-    a quit. It hid from the landing's own sweep because that sweep compares
-    stdout, stderr and status as ONE tuple, so a pre-existing stderr difference
-    masks a status that moved the wrong way. Closing all of it means
-    `read_input` separating the OPEN from the READ, which is the same change
-    the endless-input entry wants and belongs with it.
 
   - `-f` naming an ENDLESS stream (`/dev/zero`, `/dev/urandom`): GNU parses the
     script as it reads, so it fails on line 1 -- `unknown command: ` on a NUL
@@ -1216,7 +1197,10 @@ td-txt-authored case files
     Fail-CLOSED, predates the branch, both modes. Found by a reviewer sweeping
     what a `-f` STREAM can be, which is this section's own axis -- the read fails
     on the directory rather than at open, so it is the read's error that surfaces
-    and not the open's.
+    and not the open's. `-f` is now the LAST place that conflates the two: an
+    OPERAND tells them apart, and matching GNU here would mean running a script
+    that could not be read rather than refusing, which is the wrong direction to
+    move a refusal.
 
   - An address left dangling at the end of an `-e` part: `sed -e '2' -e 'p'` is
     `missing command` in GNU and `unknown command: `\n'` here. Both modes,
