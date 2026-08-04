@@ -9,14 +9,12 @@
 //! prompt. Raw mode is taken PER LINE and dropped before the command runs, so a
 //! running child still gets the ordinary Ctrl-C.
 //!
-//! What that does NOT fix, and is not this module's to fix: Ctrl-C while a
-//! command is RUNNING still ends the shell, because the terminal signals the
-//! whole foreground group and td-sh's own SIGINT is `SIG_DFL`. The terminal is
-//! left in a sane mode when it happens — the guard is already dropped — but the
-//! session goes. Surviving it needs either a real handler or the child in its
-//! own process group, and both are deferred; the nearest cheap fix is to ignore
-//! SIGINT in the shell across the wait, which the disposition surface can
-//! already express and which belongs with the code that does the waiting.
+//! Ctrl-C while a command is RUNNING is a different problem and not this
+//! module's: the terminal signals the whole foreground group, so it reaches the
+//! shell beside the command. `process.rs`'s `InterruptibleChild` is what answers
+//! it — the shell stops listening for as long as the child is alive — and the
+//! terminal is in a sane mode throughout, because the guard here is dropped
+//! before any command runs.
 //!
 //! The line is kept inside ONE terminal row and scrolled horizontally, which is
 //! why the width is needed and the height is not: a redraw that never moves off

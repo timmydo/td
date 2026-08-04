@@ -9,9 +9,11 @@
 //! The surface is THREE syscalls, reached from THREE modules and no others:
 //! `builtin.rs`, for the `umask` and `trap` builtins; `process.rs`, for the
 //! guards that hand a subshell back the process state a real fork would have
-//! kept for it; and `term.rs`, for the terminal mode and width the line editor
-//! needs. None is reachable through safe `std`, which exposes no umask API, no
-//! signal-disposition API, and no terminal-mode API at all — `IsTerminal`
+//! kept for it AND for the one that stops the shell listening to the terminal
+//! while a foreground child runs; and `term.rs`, for the terminal mode and
+//! width the line editor needs. None is reachable through safe `std`, which
+//! exposes no umask API, no signal-disposition API, and no terminal-mode API
+//! at all — `IsTerminal`
 //! answers whether a descriptor is a terminal, never how wide or in what mode.
 //!
 //! `umask(2)` is unusual and the wrappers below turn both quirks into

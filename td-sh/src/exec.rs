@@ -34,6 +34,18 @@ pub enum Sig {
     /// shell) and "return Ok if interactive" (which resumes the very loop the
     /// failing command was meant to leave, and spins).
     Abort(i32),
+    /// The terminal interrupted the shell -- inferred from a foreground child
+    /// dying of SIGINT, since td-sh installs no handler to be told directly.
+    ///
+    /// Distinct from `Abort` because of where it must NOT stop. A subshell,
+    /// a pipeline stage and a command substitution are all in-process CLONES
+    /// here, and each confines an `exit` or a fatal error to itself -- correctly,
+    /// since a forked one would only have ended that process. An interrupt is the
+    /// opposite: the terminal signals the whole foreground process group, so a
+    /// forked shell at every level would have died of it too. Confining it would
+    /// leave `x=$(sleep 100); echo after` printing `after`, which is the loop
+    /// nothing can stop wearing a different hat.
+    Interrupt(i32),
 }
 
 pub type R<T> = Result<T, Sig>;
@@ -743,7 +755,7 @@ impl Default for Shell {
 pub fn run_program(sh: &mut Shell, src: &str) -> i32 {
     let status = match run_source(sh, src, "") {
         Ok(()) => sh.status,
-        Err(Sig::Exit(code) | Sig::Abort(code)) => code,
+        Err(Sig::Exit(code) | Sig::Abort(code) | Sig::Interrupt(code)) => code,
         // A stray break/continue/return at the top level is not an error worth
         // aborting the process over; POSIX leaves it unspecified.
         Err(_) => sh.status,
@@ -760,10 +772,11 @@ pub fn run_interactive_unit(sh: &mut Shell, list: &List) -> Option<i32> {
     match run_list(sh, list) {
         Ok(()) => None,
         Err(Sig::Exit(code)) => Some(code),
-        Err(Sig::Abort(code)) => {
+        Err(Sig::Abort(code) | Sig::Interrupt(code)) => {
             // The shell is recovering, not exiting, so whatever the unwind left
             // standing goes now rather than into the next prompt. Nothing outer
-            // survives a top-level recovery, so the mark is 0.
+            // survives a top-level recovery, so the mark is 0. An interrupt lands
+            // here too: Ctrl-C returns an interactive shell to its prompt.
             unwind_pending_to(sh, 0);
             sh.set_status(code);
             None
@@ -785,7 +798,7 @@ pub fn run_exit_trap(sh: &mut Shell, status: i32) -> i32 {
     let saved = sh.trap_status.replace(status);
     let code = match run_source(sh, &action, "") {
         Ok(()) => status,
-        Err(Sig::Exit(code) | Sig::Abort(code)) => code,
+        Err(Sig::Exit(code) | Sig::Abort(code) | Sig::Interrupt(code)) => code,
         Err(_) => status,
     };
     sh.trap_status = saved;
@@ -827,6 +840,20 @@ pub fn run_list(sh: &mut Shell, list: &List) -> R<()> {
             let status = match run_and_or(&mut child, and_or) {
                 Ok(()) => child.status,
                 Err(Sig::Exit(code) | Sig::Abort(code)) => code,
+                // ...but an interrupt comes out, exactly as it does from the
+                // other clone boundaries. A real shell would put a background
+                // job OUTSIDE the foreground group, where the terminal's Ctrl-C
+                // never reaches it -- but this `&` is synchronous, so the child
+                // IS in the foreground group and the signal DID reach it.
+                // Confining it on the strength of what `&` is supposed to mean
+                // left `while :; do sleep 1 & done` unkillable from the
+                // keyboard: the interrupt arrived, killed the child, and was
+                // discarded. That is the loop nothing can stop that
+                // `Sig::Interrupt` exists to prevent. It goes back to being
+                // confined when `&` is a process of its own.
+                Err(Sig::Interrupt(code)) => {
+                    return process::leave_clone(sh, child, code);
+                }
                 Err(_) => child.status,
             };
             let _ = run_exit_trap(&mut child, status);
@@ -1399,10 +1426,12 @@ fn swallows_abort(bi: builtin::Builtin) -> bool {
 }
 
 /// Whether this signal is on its way out of the shell rather than out of a
-/// construct. Only these two skip a frame's cleanup; `return` and `break` unwind
-/// normally and undo it.
+/// construct. Only these three skip a frame's cleanup; `return` and `break`
+/// unwind normally and undo it. An interrupt belongs with the other two rather
+/// than with those: the EXIT trap is owed the dying function's `local`s, and a
+/// trap that says `local` at all needs the frame still standing to say it in.
 pub fn terminating(sig: &Sig) -> bool {
-    matches!(sig, Sig::Exit(_) | Sig::Abort(_))
+    matches!(sig, Sig::Exit(_) | Sig::Abort(_) | Sig::Interrupt(_))
 }
 
 

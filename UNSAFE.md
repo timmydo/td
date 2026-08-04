@@ -305,11 +305,13 @@ EXACTLY THREE syscalls — `umask(2)`, a DISPOSITION-ONLY `rt_sigaction(2)`,
 and `ioctl(2)` with three value-pinned requests — reached from exactly
 three modules: `builtin.rs` for the `umask` and `trap` builtins,
 `process.rs` for the guards that hand a subshell back the process state a
-fork would have kept for it, and `term.rs` for the terminal mode and width
-the line editor needs. `std` exposes an API for none of them, and in the
-umask case that is not a gap that can be worked around: it is why the
-shipped `/init` still spells one line `busybox sh -c 'umask 077; …'`, and
-why the shell that is supposed to replace busybox could not serve it.
+fork would have kept for it and for the one that stops the shell listening
+to the terminal while a foreground child runs, and `term.rs` for the
+terminal mode and width the line editor needs. `std` exposes an API for
+none of them, and in the umask case that is not a gap that can be worked
+around: it is why the shipped `/init` still spells one line `busybox sh
+-c 'umask 077; …'`, and why the shell that is supposed to replace busybox
+could not serve it.
 
 `umask(2)` cannot fail, so there is no `check()` on that path; what it
 does is RETURN THE PREVIOUS MASK, and both wrappers are built out of that.
@@ -464,9 +466,47 @@ its own prompt — which is what it did before the editor existed. With
 `ISIG` cleared, Ctrl-C arrives as a byte the editor acts on and the line
 is abandoned instead. The trade is bounded by the guard's lifetime: raw
 mode is taken PER LINE and dropped before any command runs, so a child
-still gets all three of Ctrl-C, Ctrl-\ and Ctrl-Z. Ctrl-C while a command
-is running therefore still ends the shell; that needs a real handler or
-job control, and both remain deferred.
+still gets all three of Ctrl-C, Ctrl-\ and Ctrl-Z. Ctrl-Z is the one of
+the three nothing here answers: with no job control there is no `fg` and
+no parent to continue the process, so a stopped shell stays stopped —
+which is what dash does without job control too, and what job control is
+the fix for. Ctrl-C while a command is RUNNING is the other half, and
+`rt_sigaction` serves it too: the shell ignores SIGINT and SIGQUIT for
+exactly as long as it waits, so the driver's signal ends the command and
+leaves the shell. Both of them, because Ctrl-\ reaches the shell exactly
+as Ctrl-C does and a shell that survived one and died on the other would
+be a coin toss from the keyboard. The ignore is taken AFTER the child
+exists, which is what keeps the child interruptible — a disposition is
+copied when a process is created, so one installed later cannot reach
+it. The guard therefore covers the WAIT and nothing else: between
+commands — PATH resolution, expansion, parsing, the gap between `spawn`
+returning and the ignore, and any builtin that blocks (`read` most of
+all) — the shell is back at `SIG_DFL` and a signal there still ends it.
+That is not a narrow race but a real exposure, and what divides the
+covered case from the uncovered one is not how LONG a command runs but
+whether an EXTERNAL command runs at all. Measured against the built
+binary with a randomly-timed group SIGINT: `while :; do sleep 0.5; done`
+and `while :; do sleep 0.02; done` each left the shell alive 30 times out
+of 30, `sleep 0.002` 27 of 30, and `while :; do true; done` — `true` is a
+builtin, so no guard is ever taken — died every time. A signal that lands
+INSIDE the guard with nothing left to die of it is lost outright rather
+than deferred, for the same reason: with no handler there is nowhere to
+record that it arrived. That is not only a timing tail. `kill -INT $$` is
+DETERMINISTICALLY swallowed, and it is the POSIX idiom for a script to end
+itself as if by the terminal: this shell has no `kill` builtin — sending a
+signal would need `kill(2)`, which is not on this surface — so `kill` is
+an external command, always inside the guard, and the signal it sends to
+the shell arrives on an ignored disposition and is discarded. `sh -c 'kill
+-INT $$; echo alive'` prints `alive` here where dash and bash report 130.
+`kill -QUIT $$` matches them, since SIGQUIT infers nothing either way.
+Both are inherent to installing none, since a
+shell that ignored the signal while doing its own work would lose the
+keystroke instead of surviving it. Closing either needs somewhere to
+RECORD the signal — a handler — or the child in a process group of its
+own. Real job control, with the child in that group and the terminal
+handed to it, closes it properly and is the better answer, and is still
+deferred: it needs `setpgid(2)` and a `TIOCSPGRP` ioctl, which is an
+amendment here rather than a use of what the surface already has.
 
 Clearing `ISIG` also removes the operator's last in-band escape if the
 restore never runs, which is worth stating because `Drop` is not a

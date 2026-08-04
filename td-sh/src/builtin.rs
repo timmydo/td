@@ -5386,6 +5386,86 @@ mod tests {
         }
     }
 
+    /// The guard the shell holds while a foreground child runs really does ignore
+    /// BOTH the terminal's signals, and really does put both back.
+    ///
+    /// Held under the same lock as the other disposition tests, because this is
+    /// process-global state and `trap` tests name signal 2 too. What a child
+    /// running under the guard SEES is asserted end-to-end over the built binary
+    /// instead (conformance's
+    /// `the_shell_stops_listening_to_the_terminal_while_a_child_runs`, which
+    /// reads both processes' masks out of `/proc`); what this pins is the
+    /// mechanism that rests on.
+    #[test]
+    fn the_shell_stops_listening_to_the_terminal_while_a_child_runs() {
+        let _held = Dispositions::held(&[2, 3]);
+        let mut sh = crate::exec::Shell::new();
+        for sig in [2u8, 3u8] {
+            // Start from the default, which is the state `may_set_signal` admits.
+            let _ = crate::sys::signal_set(sig, crate::sys::Disposition::Default);
+            assert_eq!(
+                crate::sys::signal_get(sig).ok().flatten(),
+                Some(crate::sys::Disposition::Default),
+                "the shell did not start from a default signal {sig}"
+            );
+        }
+        {
+            let _guard = crate::process::InterruptibleChild::hold(&mut sh);
+            for sig in [2u8, 3u8] {
+                assert_eq!(
+                    crate::sys::signal_get(sig).ok().flatten(),
+                    Some(crate::sys::Disposition::Ignore),
+                    "signal {sig} was not ignored while a child was running - the \
+                     keystroke would kill the shell beside the command"
+                );
+            }
+        }
+        for sig in [2u8, 3u8] {
+            assert_eq!(
+                crate::sys::signal_get(sig).ok().flatten(),
+                Some(crate::sys::Disposition::Default),
+                "signal {sig} was left ignored after the child ended - the next \
+                 keystroke at the prompt would do nothing"
+            );
+        }
+    }
+
+    /// A signal the shell was HANDED ignored is not the guard's to move, and not
+    /// its to hand back either. POSIX says a shell cannot reset one -- it is what
+    /// makes `nohup` stick -- and a shell that already ignores SIGINT already
+    /// survives a foreground child dying of it. The `trap '' INT` skip is covered
+    /// end-to-end over the built binary; this is the other skip, which only a
+    /// process that STARTED that way can show.
+    #[test]
+    fn a_signal_ignored_on_entry_is_not_the_guard_s_to_move() {
+        let _held = Dispositions::held(&[2, 3]);
+        // Ignored BEFORE the shell exists, so `may_set_signal`'s one question --
+        // asked on first touch and cached, because after a change the process can
+        // no longer be asked what it started with -- answers no.
+        let _ = crate::sys::signal_set(2, crate::sys::Disposition::Ignore);
+        let mut sh = crate::exec::Shell::new();
+        assert!(
+            !super::may_set_signal(&mut sh, 2),
+            "an entry ignore was read as settable"
+        );
+        {
+            let _guard = crate::process::InterruptibleChild::hold(&mut sh);
+            assert_eq!(
+                crate::sys::signal_get(2).ok().flatten(),
+                Some(crate::sys::Disposition::Ignore),
+                "the guard moved a signal it was handed ignored"
+            );
+        }
+        // ...and put nothing back, which is the half that would break `nohup`:
+        // handing back the default here would leave the shell killable by a
+        // signal its parent had arranged for it to survive.
+        assert_eq!(
+            crate::sys::signal_get(2).ok().flatten(),
+            Some(crate::sys::Disposition::Ignore),
+            "the guard restored the default over an ignore it never installed"
+        );
+    }
+
     #[test]
     fn trap_prints_what_is_in_force() {
         let _held = Dispositions::held(&[2, 10, 15]);

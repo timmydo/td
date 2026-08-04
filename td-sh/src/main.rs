@@ -48,6 +48,7 @@ use std::io::{IsTerminal, Read, Write};
 use std::process::ExitCode;
 
 use exec::{run_program, Shell};
+use process::SIGINT;
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
@@ -288,8 +289,16 @@ fn read_profile(sh: &mut Shell, path: &str) -> Option<i32> {
         // a typo in `/etc/profile` does not cost the operator their session.
         // Nothing is unwound on the way out: the EXIT trap is owed the dying
         // frame's bindings, which is why `unwind_pending_to` is bounded.
-        Err(exec::Sig::Abort(code)) if !sh.interactive => Some(code),
-        Err(exec::Sig::Abort(code)) => {
+        //
+        // An INTERRUPT falls the same way, and deliberately rather than by
+        // landing in the catch-all below. The references disagree here: bash
+        // abandons the rest of the profile and runs the command anyway, busybox
+        // ash dies of the signal and never reaches it. This crate tracks ash,
+        // and ash's answer is this same top-level handler -- so a Ctrl-C during
+        // `sh -l -c cmd`'s profile ends the login at 130 rather than starting a
+        // session the operator interrupted, while `-i` recovers to its prompt.
+        Err(exec::Sig::Abort(code) | exec::Sig::Interrupt(code)) if !sh.interactive => Some(code),
+        Err(exec::Sig::Abort(code) | exec::Sig::Interrupt(code)) => {
             // Recovering, not exiting, so the two halves a prompt does: the
             // bindings `Sig::Abort` unwound PAST go away -- without this,
             // `f() { local PATH=/bad; : ${x:?}; }; f` in a profile leaves the
@@ -349,10 +358,7 @@ fn repl(sh: &mut Shell) -> i32 {
     sh.status
 }
 
-/// The one signal the editor stands in for, since the terminal cannot deliver it
-/// while a line is being edited.
-const SIGINT: u8 = 2;
-
+/// What one read at the prompt ended with.
 enum ReadResult {
     Ready,
     Eof,
@@ -706,7 +712,9 @@ mod confinement {
 
     /// THREE modules reach the wrappers and no others: `builtin.rs` for the
     /// `umask` and `trap` builtins, `process.rs` for the guards that give a
-    /// subshell back the process state a fork would have kept for it, and
+    /// subshell back the process state a fork would have kept for it and for
+    /// the one that stops the shell listening to the terminal while a
+    /// foreground child runs, and
     /// `term.rs` for the terminal mode and width the line editor needs — and
     /// `term.rs` is the ONLY module that knows what a `termios` byte means, so
     /// the layout lives beside the readback that checks it. Nothing renames the

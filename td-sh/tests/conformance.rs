@@ -1498,6 +1498,205 @@ fn a_profile_is_sourced_into_the_session_it_sets_up() -> Result<(), Box<dyn std:
     Ok(())
 }
 
+/// The shell stops listening to the terminal's interrupt and quit characters for
+/// exactly as long as a foreground command runs, and the command does not
+/// inherit that.
+///
+/// Every claim here is read out of `/proc` BY THE CHILD, which is the only
+/// vantage point that can see both processes at the moment it matters: its own
+/// ignore mask, and the mask of the shell that is at that instant blocked
+/// waiting for it. That is deliberate — a Ctrl-C would need a terminal, and this
+/// crate can open none without `unsafe`, so the dispositions the keystroke would
+/// meet are what is asserted instead. The probe is written with builtins alone
+/// (`read`, `case`, a redirection), so it needs nothing on `PATH`.
+#[test]
+fn the_shell_stops_listening_to_the_terminal_while_a_child_runs(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let shell = PathBuf::from(env!("CARGO_BIN_EXE_td-sh"));
+    let sh = shell.display().to_string();
+    let run = |program: &str| -> Result<Vec<u64>, Box<dyn std::error::Error>> {
+        let out = std::process::Command::new(&shell).args(["-c", program]).output()?;
+        let text = String::from_utf8_lossy(&out.stdout).into_owned();
+        let mut masks = Vec::new();
+        for line in text.lines() {
+            let hex = line.split('=').nth(1).ok_or_else(|| format!("probe said {text:?}"))?;
+            masks.push(u64::from_str_radix(hex.trim(), 16)?);
+        }
+        Ok(masks)
+    };
+    let read_mask = |who: &str, path: &str| {
+        format!("while read k v; do case $k in SigIgn:) echo {who}=$v;; esac; done < {path}")
+    };
+    // The probe reads a byte from stdin BEFORE looking at either mask, and that
+    // is a happens-before rather than a delay: the shell creates the thread that
+    // writes it only after `InterruptibleChild::hold` has returned, so a probe
+    // that got the byte cannot have read the parent's mask too early. Without it
+    // the child races the guard and the test flakes on a loaded machine.
+    let probe = format!(
+        "read _go; {}; {}",
+        read_mask("child", "/proc/self/status"),
+        read_mask("shell", "/proc/$PPID/status")
+    );
+    // A here-document is what makes the shell buffer stdin for the child at all.
+    let feed = "<<EOF\ngo\nEOF\n";
+    // SIGINT is bit 1 and SIGQUIT bit 2. What a td-sh already ignores before its
+    // own `main` (Rust's runtime does SIGPIPE) is the BASELINE, measured rather
+    // than assumed, and every assertion below is a delta on it.
+    let base = *run(&read_mask("idle", "/proc/self/status"))?
+        .first()
+        .ok_or("no idle mask")?;
+    assert_eq!(base & 0b110, 0, "a fresh shell already ignores an interrupt: {base:#x}");
+    let held = base | 0b110;
+
+    // An ordinary external command: the shell is deaf to both for as long as it
+    // waits, and the child is not -- which is the whole trick, since a child that
+    // inherited the ignore would be a command Ctrl-C could not end.
+    assert_eq!(run(&format!(r#""{sh}" -c '{probe}' {feed}"#))?, vec![base, held]);
+
+    // The same while the shell is draining a CAPTURED stderr rather than sitting
+    // in `wait`: for `x=$(cmd 2>&1)` that read is where the command is spent, so
+    // a guard taken beside the wait would arrive after it was already over.
+    assert_eq!(
+        run(&format!(r#"x=$("{sh}" -c '{probe}' 2>&1 {feed}); echo "$x""#))?,
+        vec![base, held]
+    );
+
+    // `trap '' INT` is the OPERATOR's and reaches the children, on the second
+    // external command as much as the first -- what a guard that restored
+    // `SIG_DFL` over it would have destroyed after the first.
+    assert_eq!(
+        run(&format!(
+            r#"trap '' INT; "{sh}" -c '{probe}' {feed}"{sh}" -c '{probe}' {feed}"#
+        ))?,
+        vec![base | 0b10, held, base | 0b10, held]
+    );
+
+    // ...and with no child running the shell is listening again: the guard is a
+    // loan, not a mode.
+    assert_eq!(run(&read_mask("idle", "/proc/self/status"))?, vec![base]);
+    Ok(())
+}
+
+/// An interrupt is not swallowed at an in-process clone boundary.
+///
+/// td-sh's subshells, pipeline stages and command substitutions are CLONES in
+/// one process, and each rightly confines an `exit` or a fatal error to itself:
+/// a forked one would only ever have ended that process. An interrupt is the
+/// opposite -- the terminal signals the whole foreground process group, so a
+/// forked shell at every level would have died of it -- and confining it left
+/// `x=$(sleep 100); echo after` printing `after`, which is the loop nothing can
+/// stop wearing a different hat.
+///
+/// Driven from a child that signals ITSELF, because the terminal's own Ctrl-C
+/// needs a terminal this crate cannot open without `unsafe`. That works because
+/// td-sh installs no SIGINT handler and so cannot be told directly that it was
+/// interrupted: it INFERS one from a foreground child dying of SIGINT, and the
+/// inference cannot tell a group signal from a child signalled alone. bash can,
+/// because it has a handler to be told with; the precise version of this arrives
+/// with the handler amendment or with job control, and until then this is the
+/// behaviour and this pins it.
+#[test]
+fn an_interrupt_is_not_confined_to_a_clone() -> Result<(), Box<dyn std::error::Error>> {
+    let shell = PathBuf::from(env!("CARGO_BIN_EXE_td-sh"));
+    // POSIX puts a shell at this path and `kill` is one of its builtins. If the
+    // host's cannot produce a signal-killed child there is nothing to observe,
+    // and a green test would be saying otherwise.
+    let probe = std::process::Command::new("/bin/sh").args(["-c", "kill -INT $$"]).output();
+    assert!(
+        matches!(&probe, Ok(o) if o.status.code().is_none()),
+        "/bin/sh -c 'kill -INT $$' did not die of a signal ({probe:?}) - this test needs \
+         a child it can have killed, and has none. On a td image that is expected rather \
+         than a broken host: `/bin/sh` is td-sh, whose interrupt guard swallows a SIGINT \
+         a child sends to the shell itself."
+    );
+    let dies = r#"/bin/sh -c 'kill -INT $$'"#;
+    for boundary in [
+        format!("{dies}; echo AFTER"),
+        format!("x=$({dies}); echo AFTER"),
+        format!("({dies}); echo AFTER"),
+        format!("{dies} | :; echo AFTER"),
+        format!("for i in 1 2; do {dies}; done; echo AFTER"),
+        // `&` too, though a real shell's background job would never have been
+        // signalled: this one is synchronous and in the foreground group, so
+        // the signal reaches it and confining it left `while :; do cmd & done`
+        // unkillable.
+        format!("{dies} & echo AFTER"),
+    ] {
+        let out = std::process::Command::new(&shell).args(["-c", &boundary]).output()?;
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            "",
+            "the interrupt was swallowed by `{boundary}`"
+        );
+        assert_eq!(
+            out.status.code(),
+            Some(130),
+            "`{boundary}` did not report POSIX's 128 + SIGINT"
+        );
+    }
+    // An interrupt is on its way OUT of the shell, so it leaves a dying
+    // function's frame standing for the EXIT trap rather than popping it --
+    // the same rule `exit` and a fatal error follow. Without that the trap
+    // reads the caller's `v`, and one that says `local` at all fails outright
+    // with "not in a function".
+    let out = std::process::Command::new(&shell)
+        .args([
+            "-c",
+            &format!("trap 'echo T=$v' EXIT; f() {{ local v=in; {dies}; }}; v=out; f"),
+        ])
+        .output()?;
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "T=in\n");
+    assert_eq!(out.status.code(), Some(130));
+
+    // ...but `trap '' INT` is the operator saying the shell is not to be
+    // interrupted, so nothing is inferred from a child that dies anyway.
+    let out = std::process::Command::new(&shell)
+        .args(["-c", &format!("trap '' INT; {dies}; echo AFTER")])
+        .output()?;
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "AFTER\n");
+    assert_eq!(out.status.code(), Some(0));
+
+    // A child that dies of SIGINT is only the shell's own interrupt if the shell
+    // would have DIED of one. Under `trap '' INT` it would not -- and the child
+    // has to RESET the signal to die of it at all, since it inherits the ignore,
+    // which is why the case above cannot reach this arm and this one can. Drop
+    // the disposition half of that test and the shell aborts here instead.
+    let out = std::process::Command::new(&shell)
+        .args(["-c", "trap '' INT; /bin/sh -c 'trap - INT; kill -INT $$'; echo AFTER"])
+        .output()?;
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "AFTER\n",
+        "a child's death by SIGINT ended a shell that had asked to be uninterruptible"
+    );
+    assert_eq!(out.status.code(), Some(0));
+
+    // And the ignore is the ENCLOSING shell's to hold, which a clone can move
+    // out from under: `trap - INT` inside one resets the disposition for the
+    // whole process, since these are in-process clones. A forked shell would
+    // have had the SUBSHELL die while the parent's ignore stood, so the
+    // question has to be re-asked once the clone's restore has run. Asking
+    // inside it ends a shell that asked to be uninterruptible; all three
+    // boundaries answered that way before this, and `bash --posix` prints
+    // AFTER for each.
+    for boundary in [
+        format!("(trap - INT; {dies}); echo AFTER"),
+        format!("x=$(trap - INT; {dies}); echo AFTER"),
+        format!("(trap - INT; {dies}) | :; echo AFTER"),
+    ] {
+        let out = std::process::Command::new(&shell)
+            .args(["-c", &format!("trap '' INT; {boundary}")])
+            .output()?;
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            "AFTER\n",
+            "`{boundary}` let a clone's own interrupt past the enclosing ignore"
+        );
+        assert_eq!(out.status.code(), Some(0), "`{boundary}` did not survive");
+    }
+    Ok(())
+}
+
 /// A private `$HOME` for a profile test, empty and its own.
 fn profile_home(tag: &str) -> Result<PathBuf, Box<dyn std::error::Error>> {
     let home = std::env::temp_dir().join(format!("td-sh-{tag}-{}", std::process::id()));
@@ -1525,6 +1724,40 @@ fn login_run(
         .env("PATH", "/nonexistent");
     let out = c.output()?;
     Ok((String::from_utf8_lossy(&out.stdout).into_owned(), out.status.code()))
+}
+
+/// A profile INTERRUPTED falls where a fatal error in one falls, and by the same
+/// rule: ash's top-level handler exits a non-interactive login and recovers an
+/// interactive one. bash is the other way — it abandons the rest of the profile
+/// and runs the command anyway — so this is a place the two references disagree
+/// and the choice has to be made rather than fallen into. It reached the
+/// stray-`break` catch-all before, which took bash's side without saying so and
+/// left `$?` untouched besides.
+#[test]
+fn an_interrupted_profile_ends_a_non_interactive_login() -> Result<(), Box<dyn std::error::Error>>
+{
+    let probe = std::process::Command::new("/bin/sh").args(["-c", "kill -INT $$"]).output();
+    assert!(
+        matches!(&probe, Ok(o) if o.status.code().is_none()),
+        "/bin/sh -c 'kill -INT $$' did not die of a signal - this test cannot run"
+    );
+    let home = profile_home("profile-interrupt")?;
+    std::fs::write(home.join(".profile"), "/bin/sh -c 'kill -INT $$'\necho REST_OF_PROFILE\n")?;
+
+    // Non-interactive: the login ends at 130 and the command never runs.
+    let (out, code) = login_run(&home, "-sh", &[], "echo RAN_COMMAND")?;
+    assert_eq!(out, "", "an interrupted profile still started the session");
+    assert_eq!(code, Some(130), "an interrupted login did not report 128 + SIGINT");
+
+    // Interactive: the prompt is what an operator gets back, so the rest of the
+    // profile is abandoned but the session — and the command — survive, with the
+    // interrupt's status standing.
+    let (out, code) = login_run(&home, "-sh", &["-i"], "echo status=$?")?;
+    assert_eq!(out, "status=130\n", "an interactive login did not recover the interrupt");
+    assert_eq!(code, Some(0));
+
+    let _ = std::fs::remove_dir_all(&home);
+    Ok(())
 }
 
 /// A profile that fails, or is absent, does not cost the operator the session.

@@ -363,6 +363,36 @@ fn open_file(sh: &mut Shell, r: &Redir, opts: &OpenOptions) -> R<Result<Fd, ()>>
     }
 }
 
+/// Whether the shell ASKING would itself have died of an interrupt. That is what
+/// decides both raising one from a dead child and letting one out of a clone:
+/// under `trap '' INT`, or a SIGINT ignored on entry, the signal would have done
+/// nothing to this process and there is no death to stand in for.
+fn dies_of_interrupt() -> bool {
+    matches!(
+        crate::sys::signal_get(SIGINT),
+        Ok(Some(crate::sys::Disposition::Default))
+    )
+}
+
+/// End an in-process clone an interrupt reached, and answer whether the interrupt
+/// comes out with it.
+///
+/// The clone is dropped FIRST, because that is what puts back any disposition it
+/// changed. A clone can hold one of its own -- `trap '' INT; (trap - INT; sleep
+/// 5); echo AFTER` resets SIGINT for the duration, and in a forked shell that
+/// would be the SUBSHELL dying while the parent's ignore stands -- so asking
+/// inside it answers for the wrong shell and ends one that had asked to be
+/// uninterruptible. Neither way runs an EXIT trap: a clone killed by a signal
+/// never reaches one.
+pub(crate) fn leave_clone(sh: &mut Shell, clone: Subshell, code: i32) -> R<()> {
+    drop(clone);
+    if dies_of_interrupt() {
+        return Err(Sig::Interrupt(code));
+    }
+    sh.set_status(code);
+    Ok(())
+}
+
 /// Run a pipeline of two or more stages. Each stage's stdout is captured and
 /// handed to the next stage as its stdin; the last stage keeps the shell's real
 /// stdout. The pipeline's status is the last stage's (POSIX).
@@ -403,6 +433,11 @@ pub fn run_pipeline(sh: &mut Shell, cmds: &[Cmd]) -> R<()> {
         last_status = match exec::run_command(&mut stage, cmd) {
             Ok(()) => stage.status,
             Err(Sig::Exit(code) | Sig::Abort(code)) => code,
+            // ...but not an interrupt: the terminal signalled the whole
+            // foreground group, so a FORKED stage would have died of it. It
+            // does not even reach the stage's EXIT trap, because a stage killed
+            // by a signal never reaches one.
+            Err(Sig::Interrupt(code)) => return leave_clone(sh, stage, code),
             Err(_) => stage.status,
         };
         last_status = exec::run_exit_trap(&mut stage, last_status);
@@ -425,6 +460,10 @@ pub fn run_subshell(sh: &mut Shell, body: &List, redirs: &[Redir]) -> R<()> {
         Ok(RedirOutcome::Applied(_saved)) => match exec::run_list(&mut child, body) {
             Ok(()) => child.status,
             Err(Sig::Exit(code) | Sig::Abort(code)) => code,
+            // An interrupt is NOT the subshell's to keep: the terminal signals
+            // the whole foreground group, so a forked one would have died with
+            // its parent rather than reporting a status to it.
+            Err(Sig::Interrupt(code)) => return leave_clone(sh, child, code),
             // break/continue/return that escape a subshell are confined to it.
             Err(_) => child.status,
         },
@@ -433,12 +472,126 @@ pub fn run_subshell(sh: &mut Shell, body: &List, redirs: &[Redir]) -> R<()> {
         // A fatal expansion error in a target word (`>${x:?}`) exits the SUBSHELL,
         // not the parent — confine it here rather than propagating.
         Err(Sig::Exit(code) | Sig::Abort(code)) => code,
+        Err(Sig::Interrupt(code)) => return leave_clone(sh, child, code),
         Err(_) => child.status,
     };
     let status = exec::run_exit_trap(&mut child, status);
     sh.set_status(status);
     Ok(())
 }
+
+/// The shell's own SIGINT and SIGQUIT, ignored while a foreground child runs and
+/// restored after it — which is what lets Ctrl-C end the COMMAND without ending
+/// the shell.
+///
+/// The child is unaffected, and that is the trick rather than an accident:
+/// dispositions are copied when the process is created, and this is taken AFTER
+/// `spawn` has returned, so the child already exists holding the `SIG_DFL` it was
+/// created with. Ctrl-C therefore still kills `sleep 100`, and no longer kills the
+/// shell waiting on it. The other order — ignoring first, spawning second — would
+/// hand the child the ignore and make the command uninterruptible, which is the
+/// failure this exists to avoid.
+///
+/// It covers the WAIT and nothing else. Between commands — expansion, PATH
+/// resolution, the gap after `spawn` returns, and any builtin that blocks, `read`
+/// most of all — the shell is back at `SIG_DFL` and a signal there still ends it.
+/// That is inherent to installing no handler: a shell that ignored the signal
+/// while doing its own work would lose the keystroke instead of surviving it. The
+/// dividing line is not how LONG a command runs but whether an EXTERNAL one runs
+/// at all — a loop of `sleep 0.02` survives a Ctrl-C as reliably as one of `sleep
+/// 0.5`, while `while :; do true; done` takes no guard and dies every time. A
+/// signal landing INSIDE the guard with nothing left to die of it is lost
+/// outright, for the same reason: there is nowhere to record that it arrived.
+///
+/// It is also safe only because nothing here runs two commands at once: pipeline
+/// stages are sequential with the producer buffered, and an async list is an
+/// in-process subshell run to completion. A disposition is PROCESS-global, so two
+/// live guards would restore over each other and hand a later child an inherited
+/// ignore. Concurrent pipelines would have to reference-count this.
+///
+/// A signal IGNORED ON ENTRY is left alone: POSIX says the shell cannot reset one,
+/// `may_set_signal` is what remembers that, and a shell that already ignores
+/// SIGINT already survives this.
+///
+/// Real job control — the child in its own process group with the terminal handed
+/// to it — is the answer to both, and is deferred: it needs `setpgid(2)` and a
+/// `TIOCSPGRP` ioctl, which is an amendment to `UNSAFE.md` rather than a use of
+/// what is already there.
+pub(crate) struct InterruptibleChild {
+    /// One flag per signal in `HELD`: whether THIS guard is what installed the
+    /// ignore, and so what has to take it back off. An array rather than a list
+    /// because the roster is fixed and this runs once per external command.
+    restore: [bool; HELD.len()],
+}
+
+impl InterruptibleChild {
+    pub(crate) fn hold(sh: &mut Shell) -> Self {
+        let mut restore = [false; HELD.len()];
+        for (slot, sig) in restore.iter_mut().zip(HELD) {
+            // Not the shell's to change if someone handed it an ignore -- and
+            // nothing to do in that case either, since an ignored signal cannot
+            // kill it.
+            if !crate::builtin::may_set_signal(sh, sig) {
+                continue;
+            }
+            // ...and not this guard's to take if the SCRIPT has ignored it since:
+            // `may_set_signal` answers about the disposition on ENTRY and is
+            // cached there, so `trap '' INT` moves the kernel out from under it.
+            // Restoring `SIG_DFL` over that would undo the operator's own trap on
+            // the first external command it runs.
+            //
+            // This re-query SUBSUMES the entry check above for every reachable
+            // state — a signal ignored on entry can never be moved to `Default`,
+            // since `apply_disposition` refuses and this guard never installed it
+            // — so deleting that check is invisible to any test. It stays because
+            // it is the POSIX rule stated where the decision is made, and because
+            // this one is about the kernel rather than about the shell's own
+            // record; deleting THIS one is what breaks `trap '' INT`.
+            if !matches!(
+                crate::sys::signal_get(sig),
+                Ok(Some(crate::sys::Disposition::Default))
+            ) {
+                continue;
+            }
+            // A kernel that refuses leaves the shell exactly as interruptible as
+            // it was, which is the behaviour this replaces rather than a new one.
+            *slot = crate::sys::signal_set(sig, crate::sys::Disposition::Ignore).is_ok();
+        }
+        Self { restore }
+    }
+}
+
+impl Drop for InterruptibleChild {
+    fn drop(&mut self) {
+        for (taken, sig) in self.restore.iter().zip(HELD) {
+            if *taken {
+                // Only a signal this guard found at `SIG_DFL` and changed itself
+                // is here, so `SIG_DFL` is what goes back. Asking for it outright
+                // rather than replaying whatever the kernel handed back means an
+                // answer this shell cannot express cannot leave a signal ignored
+                // after the command.
+                let _ = crate::sys::signal_set(sig, crate::sys::Disposition::Default);
+            }
+        }
+    }
+}
+
+/// The signals a terminal's control characters raise at the whole foreground
+/// process group, and so the ones that reach the shell beside the command the
+/// operator meant them for. Ctrl-\ arrives exactly as Ctrl-C does, and a shell
+/// that survived one and died on the other would be a coin toss from the
+/// keyboard; dash and bash both outlive both.
+const HELD: [u8; 2] = [SIGINT, SIGQUIT];
+
+/// The signal a terminal's interrupt character raises. The one definition in
+/// the crate: `main.rs` reads it to decide whether the editor may treat Ctrl-C
+/// as a keystroke, and a second copy would be a second thing to keep right.
+pub(crate) const SIGINT: u8 = 2;
+
+/// ...and its quit character. Held with SIGINT but NOT abort-worthy: a child
+/// killed by Ctrl-\ reports 131 and the enclosing script carries on, which is
+/// what both references do -- only SIGINT unwinds a loop.
+const SIGQUIT: u8 = 3;
 
 /// The file-creation mask, saved and put back on `Drop`.
 ///
@@ -600,11 +753,24 @@ pub fn capture_stdout(sh: &mut Shell, code: &str) -> R<String> {
     let status = match outcome {
         Ok(()) => child.status,
         Err(Sig::Exit(code) | Sig::Abort(code)) => code,
+        // `x=$(sleep 100)` interrupted is the enclosing script's interrupt too,
+        // for the same reason a subshell's is: one signal, one process group.
+        // When it does not come out, the substitution ends with whatever it had
+        // already written -- which is what a killed fork's pipe would hold.
+        Err(Sig::Interrupt(code)) => {
+            leave_clone(sh, child, code)?;
+            return read_capture(sh, &buf);
+        }
         Err(_) => child.status,
     };
     let status = exec::run_exit_trap(&mut child, status);
     // Command substitution updates $? of the enclosing shell.
     sh.set_status(status);
+    read_capture(sh, &buf)
+}
+
+/// The captured bytes of a command substitution, as text.
+fn read_capture(sh: &mut Shell, buf: &Arc<Mutex<Vec<u8>>>) -> R<String> {
     let bytes = buf
         .lock()
         .map(|v| v.clone())
@@ -755,6 +921,19 @@ pub fn exec_external(sh: &mut Shell, argv: &[String], path: Option<&str>) -> R<(
         }
     };
 
+    // The shell stops listening to Ctrl-C for exactly as long as the child is
+    // alive. Both are in the terminal's foreground process group, so the driver's
+    // SIGINT reaches BOTH -- and a shell whose SIGINT is `SIG_DFL` dies beside the
+    // command the operator meant to interrupt. As the image's login shell that
+    // costs the session, and getty respawning a fresh login is not an answer.
+    //
+    // Taken HERE rather than beside the wait, because the wait is not the only
+    // place this blocks on the child: the stderr drain below reads to EOF on this
+    // thread, so for `x=$(cmd 2>&1)` the child has already run and exited by the
+    // time the wait is reached. Held until the stdout joiner is done too, since a
+    // grandchild holding that pipe keeps the shell here just as long.
+    let interrupt_guard = InterruptibleChild::hold(sh);
+
     // Feed stdin and drain stdout concurrently so a child that writes while reading
     // cannot deadlock a single-threaded pump. `Builder::spawn` is used (not
     // `thread::spawn`) so an OS thread-creation failure drops the pump closure —
@@ -801,6 +980,7 @@ pub fn exec_external(sh: &mut Shell, argv: &[String], path: Option<&str>) -> R<(
     if let Some(j) = stdout_join {
         let _ = j.join();
     }
+    drop(interrupt_guard);
 
     match status {
         Ok(status) => {
@@ -809,6 +989,27 @@ pub fn exec_external(sh: &mut Shell, argv: &[String], path: Option<&str>) -> R<(
                 .code()
                 .unwrap_or_else(|| 128 + status.signal().unwrap_or(0));
             sh.set_status(code);
+            // A child the INTERRUPT killed abandons what the shell was doing, or
+            // Ctrl-C would end one `sleep` of `for i in 1 2 3; do sleep 10; done`
+            // and go straight on to the next -- a loop nothing can stop, which is
+            // a worse answer than the death this guard was added to prevent. This
+            // stands in for the SIGINT the shell itself was sent, and `Sig::Abort`
+            // is exactly that shape: it ends a script, and returns an interactive
+            // shell to its prompt.
+            //
+            // Standing in for it means asking whether the shell would have DIED of
+            // it. The guard is already dropped, so the disposition here is the
+            // shell's own: under `trap '' INT` -- or a SIGINT ignored on entry, the
+            // `nohup` case -- the signal would have done nothing to this process,
+            // and inferring an abort from the child's death would end a script the
+            // operator asked to be uninterruptible.
+            // Only a child the KERNEL killed is visible here. A nested td-sh
+            // that aborted reports 130 as an ordinary exit, so this cannot see
+            // it and `for i in 1 2 3; do sh -c '...'; done` runs on; dash and
+            // bash avoid that by dying OF the signal, which needs `kill(2)`.
+            if status.signal() == Some(i32::from(SIGINT)) && dies_of_interrupt() {
+                return Err(Sig::Interrupt(code));
+            }
             Ok(())
         }
         Err(e) => {
