@@ -259,7 +259,12 @@ impl ScriptParser<'_> {
             if !b.is_ascii_digit() {
                 break;
             }
-            n = n.saturating_mul(10).saturating_add(u64::from(b - b'0'));
+            // GNU's `in_integer` accumulates into a `countT` and lets it WRAP, so
+            // a number past 2^64 is its remainder and not a clamp: `2^64+1` is
+            // line 1 and `2^64` is line 0, which is then refused as an address.
+            // Saturating instead was a silent wrong ANSWER -- the script ran,
+            // matched nothing, and said nothing.
+            n = n.wrapping_mul(10).wrapping_add(u64::from(b - b'0'));
             self.pos += 1;
         }
         if self.pos == start {
@@ -1234,7 +1239,26 @@ fn parse_script(
                     true => None,
                     false => p.parse_number(),
                 };
-                Kind::List(usize::try_from(w.unwrap_or(70)).unwrap_or(70))
+                // GNU keeps the width in the same `int` as `q`'s code, so it
+                // TRUNCATES to 32 bits and a result that is not POSITIVE means
+                // "never wrap": `l4294967306` folds at 10 there. `usize::try_from`
+                // never fails on 64-bit, so the whole `u64` used to arrive and
+                // nothing folded.
+                let width = match w.map(|v| u32::try_from(v & 0xffff_ffff).unwrap_or(0)) {
+                    // -1 is the SAME sentinel `q` has, and it means "no width
+                    // argument", not "never wrap": `l4294967295` folds where a
+                    // bare `l` folds. Reading it as non-positive got that wrong.
+                    None | Some(u32::MAX) => 70,
+                    Some(low32) => match i32::try_from(low32) {
+                        Ok(n) => usize::try_from(n).unwrap_or(0),
+                        // Any OTHER negative really is "never wrap". No case can
+                        // red this arm -- the alternative is a width of ~4.3e9,
+                        // which no line reaches -- but the line is being rewritten
+                        // for the truncation anyway and this is the rule.
+                        Err(_) => 0,
+                    },
+                };
+                Kind::List(width)
             }
             b'n' => Kind::Next,
             b'N' => Kind::NextAppend,
@@ -1250,7 +1274,20 @@ fn parse_script(
                     true => None,
                     false => p.parse_number(),
                 };
-                Kind::Quit(i32::try_from(n.unwrap_or(0)).unwrap_or(0), c == b'q')
+                // Only the low 8 bits survive `exit`, so the code is MASKED, not
+                // narrowed: `i32::try_from` on one past `i32::MAX` fell back to 0,
+                // a different STATUS rather than a clamped one. But GNU holds it
+                // in an `int` whose -1 means "no code was given", so a code whose
+                // 32-bit truncation IS -1 cannot be told from a bare `q` and falls
+                // back to the normal status instead of exiting 255. Masking alone
+                // got that one wrong in the other direction.
+                let code = match n {
+                    Some(v) if u32::try_from(v & 0xffff_ffff).unwrap_or(0) != u32::MAX => {
+                        i32::try_from(v & 0xff).unwrap_or(0)
+                    }
+                    _ => 0,
+                };
+                Kind::Quit(code, c == b'q')
             }
             b'r' | b'R' => {
                 p.deny_in_sandbox()?;
@@ -1628,6 +1665,11 @@ fn multiple_end(start: u64, n: u64) -> u64 {
     if n == 0 {
         return start;
     }
+    // Saturating and wrapping cannot differ OBSERVABLY here, which is why `+N`'s
+    // end moved to wrapping and this did not. Overflow needs `n` past the start
+    // (or a start past 2^63, which no file reaches), and then `start % n` is
+    // `start`, so the end is `n` wrapping and `u64::MAX - start` saturating --
+    // both past any input. Changing it would be a rule no case could red.
     start.saturating_add(n).saturating_sub(start % n)
 }
 
@@ -1754,10 +1796,15 @@ impl Sed {
             // gets its "at least two lines" rule. Untested, `1,1~0d` emptied
             // the file -- the same shape as the address-0 bug, in the last
             // numeric spelling.
+            // `+N` counts FROM the start line, so on that line the range ends
+            // only when N is 0. `line >= start + N` says the same thing for every
+            // N that does not overflow, and something else for one that does: an
+            // end that WRAPPED to before the start must still give the range its
+            // second line, which is what GNU does -- `1,+(2^64-1)` ends at line 0
+            // and selects lines 1 and 2, not line 1 alone.
+            Some(Some(Addr2::Plus(n))) => Ok((*n == 0, true)),
             Some(Some(
-                Addr2::Plus(_)
-                | Addr2::Multiple(_)
-                | Addr2::Kind(AddrKind::Last | AddrKind::Step { .. }),
+                Addr2::Multiple(_) | Addr2::Kind(AddrKind::Last | AddrKind::Step { .. }),
             )) => {
                 let (ends, _) = self.range_step(idx, start, at_last)?;
                 Ok((ends, true))
@@ -1770,7 +1817,10 @@ impl Sed {
     fn range_step(&mut self, idx: usize, start: u64, at_last: bool) -> Result<(bool, bool), String> {
         let line = self.line_number;
         let kind = match self.script.cmds.get(idx).map(|c| &c.addr.a2) {
-            Some(Some(Addr2::Plus(n))) => return Ok((line >= start.saturating_add(*n), true)),
+            // `start + N` WRAPS, as GNU's counter does: `1,+(2^64-1)` ends at
+            // line 0, so the range closes on the line after it opened rather
+            // than running to the end of input. Saturating made it run forever.
+            Some(Some(Addr2::Plus(n))) => return Ok((line >= start.wrapping_add(*n), true)),
             Some(Some(Addr2::Multiple(n))) => return Ok((line >= multiple_end(start, *n), true)),
             // Past the end line the range closes WITHOUT selecting: reachable
             // when `b`/`t`/`N` jumped over the end.
@@ -2427,8 +2477,10 @@ fn read_script(path: &[u8]) -> std::io::Result<(Vec<u8>, bool)> {
         // file sized 0 (procfs) or a fixed 4096 (sysfs) against a shorter read,
         // and a file RESIZED between the read and the stat; those auto-print
         // rather than swallow output, as an absent or unreadable /proc does. A
-        // CHARACTER device is not among them: they refuse to seek or report
-        // offset 0 whatever was read, so GNU's `ftell == 2` declines them too.
+        // CHARACTER device is not among them: through GNU's own sequence
+        // (`fopen`, `fread` of two, `ftell`) none reaches 2, so it declines them
+        // too. See spec/README -- the mechanism is not "offset 0", which is what
+        // raw `lseek` reports rather than what `ftell` does.
         // It can wrongly ACCEPT only where `S_IFREG` is not in fact seekable
         // (FUSE may serve such a file), or under a concurrent truncation to
         // exactly the bytes read -- never from a pre-positioned descriptor

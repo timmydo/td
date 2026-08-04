@@ -292,10 +292,13 @@ td-txt-authored case files
     one arm that cannot ask. A
     CHARACTER device is NOT among them, though an earlier draft of this entry said
     it was: measured through GNU's own sequence -- `fopen`, `fread` of two bytes,
-    `ftell` -- not one readable here reaches 2. `/dev/ptmx` refuses to seek at all
-    (ESPIPE); `/dev/zero`, `/dev/urandom` and `/dev/full` answer -1, glibc having
-    gone negative subtracting the bytes it read ahead and did not hand over; and
-    `/dev/null` answers 0, having read nothing. So GNU declines them too --
+    `ftell` -- not one readable here reaches 2. `/dev/zero`, `/dev/urandom` and
+    `/dev/full` answer -1, glibc having gone negative subtracting the bytes it
+    read ahead and did not hand over; and `/dev/null` answers 0, having read
+    nothing. `/dev/ptmx` is the one that CANNOT take that sequence -- its `fread`
+    never returns -- so what is measured there is a raw `lseek`, which is ESPIPE;
+    an earlier draft listed it with the other four as though it had. So GNU
+    declines them too --
     agreement, not divergence. (A draft of this said they "report offset 0", which
     is what raw `lseek` reports and not what `ftell` does. The conclusion held and
     the mechanism was wrong, which is twice on this branch that measuring the
@@ -311,6 +314,68 @@ td-txt-authored case files
     which equals `size` only at k = 0. So the accepting direction needs a
     concurrent writer where the declining one does not. Exactness would need
     `lseek` on fd 0, which safe `std` cannot reach.
+  - Every number a COMMAND or ADDRESS takes is read by one rule and it WRAPS,
+    because GNU reads them all with `in_integer` accumulating into a counter it
+    lets overflow. (Not every number in a script: a regex interval bound like
+    `a\{N\}` belongs to the regex engine, does not wrap, and refuses identically
+    in both.) So a
+    number past 2^64 is its remainder, not a clamp: `2^64+1` is line 1, and
+    `2^64` is line 0 and takes whatever complaint a bare 0 takes there. It is one
+    rule over eight positions -- the line address, both halves of `first~step`,
+    the `+N` and `~N` of a second address, `q`'s exit code, `l`'s width and
+    `s///N`'s occurrence -- and all eight agree with the oracle, though two of
+    them needed a second fix apiece BELOW to get there, since how a number is
+    read and what it then MEANS are different questions. td-txt saturated
+    until this landing, which was a silent WRONG ANSWER: the script ran, matched
+    nothing and said nothing. The `l` width is the one that needs a fixture wider
+    than the wrap to see, since a saturated width and a wrapped one both print a
+    short line unfolded.
+    What a number then MEANS is a separate question from how it is read, and
+    `q`/`Q`'s exit code is where the two were confused: only the low 8 bits
+    survive `exit`, so the code must be MASKED, not narrowed. td-txt narrowed
+    with `i32::try_from(..).unwrap_or(0)`, so every code past `i32::MAX` became
+    0 -- a different STATUS rather than a clamped one, and the SUCCESS status
+    for a script asking to fail. `q2147483692` is 44 in GNU and was 0 here.
+    The boundary is `i32::MAX` and not the wrap, which is why the number work
+    above does not cover it, and why a probe has to use a remainder that is not
+    0: `q4294967296` agrees under both answers.
+    Masking alone is still wrong at ONE point, though, and it took a reviewer to
+    find it: GNU holds the code in an `int` whose -1 means "no code was given",
+    so a code whose 32-BIT truncation is -1 cannot be told from a bare `q` and
+    falls back to the normal exit status. `q4294967295`, `q8589934591` and
+    `q(2^64-1)` are all 0 in GNU, and a plain mask makes them 255 -- which also
+    swallows a real failure, since `sed -n q4294967295 nosuch f` is 2 there. The
+    first fix here masked and so broke those three, which had AGREED before it;
+    the rule is: truncate to 32 bits, and if that is -1 behave as a bare `q`,
+    else exit on the low 8. `q4294967294` is 254 and `q4294967039` is 255, so
+    the sentinel is exactly one value in each 2^32 and nothing near it.
+    `l`'s WIDTH lives in that same `int` and so truncates the same way, with two
+    more rules on top -- and the SENTINEL is one of them, which a first fix here
+    missed by reading every negative alike. A truncation of exactly -1 means "no
+    width argument", so `l4294967295` folds where a bare `l` folds (at `-l N`, or
+    70); any OTHER non-positive value means never wrap. So `l4294967306` folds at
+    10, `l4294967295` folds at 70, and `l2147483658` folds nowhere. td-txt
+    narrowed with `usize::try_from`, which never fails on 64-bit, so the whole
+    `u64` arrived and nothing folded. Two of the eight
+    positions therefore needed their CONSUMER fixed as well as the reader, and
+    the shipped `l` case for the wrap (`18446744073709551636`, which is 20)
+    could not see it: its value is under 2^32, so it agrees either way.
+    The ARITHMETIC on a number wraps too, not just the parse. `addr,+N` resolves
+    its end as `start + N` in that same counter, so `1,+(2^64-1)` ends at line 0.
+    Two rules follow, and td-txt had neither. The addition wraps rather than
+    saturating -- it saturated, so the end was `u64::MAX` and the range ran to
+    the end of input where GNU selects two lines. And on the START line the range
+    ends only when N is 0, NOT whenever `line >= start + N`: those agree for
+    every N that does not overflow and part company for one that does, where an
+    end behind the start must still give the range its second line
+    (`3,+(2^64-2)` is lines 3 and 4). The full rule, measured over every start
+    1-4 against every end 0-7: `end == start` selects the start line alone,
+    `end > start` runs `start..end`, and `end < start` selects exactly two.
+    `addr,~N` is deliberately NOT part of this: its end can only overflow when N
+    is past the start, and then `start % N` is `start`, so the end is `N` itself
+    -- unreachable by any input under saturating and wrapping alike. It is left
+    saturating because changing it would be a rule no case could red, which a
+    mutation run confirmed by reddening nothing.
   - `R` cursors are keyed by NAME, not per command: two `R f` commands share one
     cursor and advance it twice in a cycle, while an `r f` beside them is unrelated.
   - And `w /dev/stdout` still means the real standard output under `-i`, where the
@@ -1099,6 +1164,39 @@ td-txt-authored case files
     `-f`. Fail-CLOSED, predates the branch. Found by a reviewer as a byproduct of
     sweeping script HEADS for the `#n` rule -- the same sweep axis, one byte over.
 
+  - A quit code, or a bare `q`, after a failed operand WITHOUT `-s`: GNU reports
+    the failure and td-txt reports the quit. `sed -n q nosuch f` is 2 there and 0
+    here; `sed -n q5 nosuch f` is 2 there and 5 here. With `-s` both agree (2),
+    and in the other operand ORDER both agree (0) -- GNU quits before it ever
+    opens the second file. The rule GNU follows is that a read failure ALREADY
+    suffered outranks the quit code, which td-txt applies on the `-s`/in-place
+    path and cannot apply on the other: that path reads every operand up front to
+    resolve `$`, so by the first cycle its status may describe a file GNU would
+    have quit before opening. The comment at that return says as much. Closing it
+    means making the one-stream path lazy, which is the same shape of change as
+    the endless-stream entry below and belongs with it. Fail-open (a failure
+    reported as success), which makes it the more serious of the two; predates the
+    branch. Surfaced by a reviewer probing `q`'s exit code.
+
+  - `-l N` / `--line-length=N`, GNU's command-line default for `l`'s width, is
+    REFUSED here (`invalid option -- 'l'` / `unrecognized option`, exit 1) where
+    GNU takes it. Fail-CLOSED, predates the branch, and recorded now because it
+    is the other input to the width the `l` rule above fixes: without it, the
+    "no width argument" sentinel can only ever fall back to 70 here, so half of
+    what that sentinel selects between is unreachable. Found by a reviewer
+    sweeping the numeric surface.
+
+  - `-f` naming an ENDLESS stream (`/dev/zero`, `/dev/urandom`): GNU parses the
+    script as it reads, so it fails on line 1 -- `unknown command: ` on a NUL
+    byte -- and exits 1. td-txt reads the whole script into memory BEFORE
+    parsing, so it grows until the allocation fails and exits 4 with
+    `couldn't open file /dev/zero: out of memory`. Both refuse and neither
+    hangs, so this is fail-closed either way; what differs is that td-txt
+    spends memory to get there. Closing it means parsing incrementally rather
+    than reading first, which is a different program and its own landing, not
+    a corner of this one. Predates the branch -- `read_input` read to the end
+    the same way `read_script` does. Found by a reviewer.
+
   - `-f` naming a DIRECTORY: GNU reads it as an empty script and auto-prints at
     exit 0, where td-txt is `couldn't open file DIR: Is a directory` at exit 4.
     Fail-CLOSED, predates the branch, both modes. Found by a reviewer sweeping
@@ -1167,16 +1265,6 @@ td-txt-authored case files
     `unknown command` wording difference. All of it predates the branch and is
     identical on the branch point; the entry is corrected because a reviewer
     measured what the earlier wording had asserted.
-
-  - Address NUMBERS overflow differently. GNU's `in_integer` accumulates into a
-    signed counter that WRAPS; `parse_number` here saturates. So
-    `sed -n '1,+18446744073709551616p'` is `+0` in GNU (printing line 1 alone)
-    and a range that never ends here, and a line address of 2^64 wraps to 0 in
-    GNU -- `invalid usage of line address 0` -- where it saturates to a line
-    number no file reaches here, and the script is a silent no-op. Predates the
-    branch. It sits exactly where this landing's cited model -- GNU reads all
-    three number spellings with `in_integer(in_nonblank())` -- stops being
-    followed, which is why it is recorded beside it.
 
   - An unterminated `\{` after a QUANTIFIED atom picks the other complaint:
     `sed 's/a*\{b/Z/'` is `Invalid preceding regular expression` in GNU and

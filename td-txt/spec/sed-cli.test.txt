@@ -7783,3 +7783,363 @@ a
 ## stdout-json: "a\nfoo\nb\nc\nd\nabc\n"
 ## stderr-json: ""
 ## status: 0
+
+#### a number past 2^64 WRAPS, as GNU's in_integer does
+# GNU accumulates every script number into a counter it lets overflow, so a
+# number past 2^64 is its remainder rather than a clamp. td-txt saturated, which
+# made the script a silent no-op: it ran, matched nothing and said nothing.
+## argv: sed -n 18446744073709551617p
+## stdin:
+a
+b
+c
+## END
+## stdout:
+a
+## END
+## stderr-json: ""
+## status: 0
+
+#### and 2^64 itself wraps to 0, which is then refused as an address
+## argv: sed -n 18446744073709551616p
+## stdin:
+a
+b
+c
+## END
+## stdout-json: ""
+## stderr-contains: invalid usage of line address 0
+## status: 1
+
+#### the wrap reaches the FIRST half of a step address
+## argv: sed -n 18446744073709551618~1p
+## stdin:
+a
+b
+c
+## END
+## stdout:
+b
+c
+## END
+## stderr-json: ""
+## status: 0
+
+#### and its STEP half
+## argv: sed -n 1~18446744073709551618p
+## stdin:
+a
+b
+c
+## END
+## stdout:
+a
+c
+## END
+## stderr-json: ""
+## status: 0
+
+#### and a second address `+N'
+# The value is 2^64+3, not 2^64+1: with +1 the range END absorbs the difference
+# -- a saturating parse gives N=u64::MAX, whose end wraps to 0 and still selects
+# two lines -- so that spelling passed under BOTH answers, which a reviewer
+# caught. +3 ends at line 4 when the parse wraps and at line 2 when it saturates.
+## argv: sed -n 1,+18446744073709551619p
+## stdin:
+a
+b
+c
+d
+e
+## END
+## stdout:
+a
+b
+c
+d
+## END
+## stderr-json: ""
+## status: 0
+
+#### and a second address `~N'
+## argv: sed -n 1,~18446744073709551618p
+## stdin:
+a
+b
+c
+## END
+## stdout:
+a
+b
+## END
+## stderr-json: ""
+## status: 0
+
+#### and `s///N', the occurrence to replace
+## argv: sed -n s/./X/18446744073709551617p
+## stdin:
+abc
+## END
+## stdout:
+Xbc
+## END
+## stderr-json: ""
+## status: 0
+
+#### and `l''s width -- which needs a line wider than the wrap to see it
+# A saturated width and a wrapped one both print a short line unfolded, so this
+# case is the one that would pass against either answer if the fixture were
+# narrower.
+## argv: sed -n 1l18446744073709551636
+## stdin:
+abcdefghijklmnopqrstuvwxyz
+## END
+## stdout:
+abcdefghijklmnopqrs\
+tuvwxyz$
+## END
+## stderr-json: ""
+## status: 0
+
+#### and `q''s exit code
+## argv: sed -n 1{q18446744073709551617}
+## stdin:
+a
+b
+## END
+## stdout-json: ""
+## stderr-json: ""
+## status: 1
+
+#### while ordinary numbers are untouched -- the control
+## argv: sed -n 2p
+## stdin:
+a
+b
+c
+## END
+## stdout:
+b
+## END
+## stderr-json: ""
+## status: 0
+
+#### `q''s exit code is masked to 8 bits, not narrowed to i32
+# Only the low 8 bits survive `exit', so a code past i32::MAX must still land on
+# its remainder. td-txt narrowed with `i32::try_from(..).unwrap_or(0)' first,
+# which turned every such code into a DIFFERENT status rather than a clamped
+# one -- exit 0, the success status, for a script asking to fail.
+## argv: sed -n 1{q2147483692}
+## stdin:
+a
+b
+## END
+## stdout-json: ""
+## stderr-json: ""
+## status: 44
+
+#### and `Q''s likewise
+## argv: sed -n 1{Q2147483692}
+## stdin:
+a
+b
+## END
+## stdout-json: ""
+## stderr-json: ""
+## status: 44
+
+#### a code past i32::MAX whose remainder is 0 -- the case that agreed by luck
+# This one passed against the old narrowing too, both answers being 0, which is
+# why the boundary had to be probed with a remainder that is NOT 0.
+## argv: sed -n 1{q4294967296}
+## stdin:
+a
+b
+## END
+## stdout-json: ""
+## stderr-json: ""
+## status: 0
+
+#### and one under the boundary -- the control
+## argv: sed -n 1{q300}
+## stdin:
+a
+b
+## END
+## stdout-json: ""
+## stderr-json: ""
+## status: 44
+
+#### `addr,+N' computes its END in the wrapping counter too
+# The parse is only half of it: GNU adds N to the start line in the same counter
+# it parsed N into, so an end past 2^64 is its remainder. `1,+(2^64-1)' ends at
+# line 0. td-txt added with `saturating_add', so the end was u64::MAX and the
+# range ran to the end of input -- every line, where GNU selects two.
+## argv: sed -n 1,+18446744073709551615p
+## stdin:
+1
+2
+3
+4
+5
+## END
+## stdout:
+1
+2
+## END
+## stderr-json: ""
+## status: 0
+
+#### an end that wraps to BEFORE the start still gives the range two lines
+# GNU's `+N' end is tested from the line AFTER the one that opened the range, so
+# a wrapped end behind the start closes on the next line rather than at once.
+# Testing `line >= start + N' on the start line agrees for every N that does not
+# overflow and disagrees here: it would select line 3 alone.
+## argv: sed -n 3,+18446744073709551614p
+## stdin:
+1
+2
+3
+4
+5
+## END
+## stdout:
+3
+4
+## END
+## stderr-json: ""
+## status: 0
+
+#### while `+0' still ends ON the start line -- the boundary the rule turns on
+## argv: sed -n 3,+0p
+## stdin:
+1
+2
+3
+4
+5
+## END
+## stdout:
+3
+## END
+## stderr-json: ""
+## status: 0
+
+#### and an ordinary `+N' is unchanged -- the control
+## argv: sed -n 2,+2p
+## stdin:
+1
+2
+3
+4
+5
+## END
+## stdout:
+2
+3
+4
+## END
+## stderr-json: ""
+## status: 0
+
+#### a `q' code whose 32-bit truncation is -1 is a bare `q'
+# GNU holds the code in an `int' whose -1 means "no code was given", so this one
+# value in each 2^32 cannot be told from a bare `q' and falls back to the normal
+# exit status. Masking to 8 bits alone made it 255 -- and these AGREED before
+# that fix, so the fix broke them; the value has to truncate to -1, not merely
+# be large.
+## argv: sed -n q4294967295
+## stdin:
+a
+b
+## END
+## stdout-json: ""
+## stderr-json: ""
+## status: 0
+
+#### and so is one a whole 2^32 further up
+## argv: sed -n q8589934591
+## stdin:
+a
+b
+## END
+## stdout-json: ""
+## stderr-json: ""
+## status: 0
+
+#### while its NEIGHBOURS are ordinary codes -- the controls that pin the sentinel
+## argv: sed -n q4294967294
+## stdin:
+a
+b
+## END
+## stdout-json: ""
+## stderr-json: ""
+## status: 254
+
+#### and one below it in the same 2^32
+## argv: sed -n q4294967039
+## stdin:
+a
+b
+## END
+## stdout-json: ""
+## stderr-json: ""
+## status: 255
+
+#### `l''s width truncates to a C int, and a non-positive one never wraps
+# The width shares `q''s `int', so it truncates mod 2^32: 4294967306 is 10.
+# td-txt narrowed with `usize::try_from', which never fails on 64-bit, so the
+# whole u64 arrived and the line folded nowhere.
+## argv: sed -n 1l4294967306
+## stdin:
+abcdefghijklmnopqrstuvwxyz
+## END
+## stdout:
+abcdefghi\
+jklmnopqr\
+stuvwxyz$
+## END
+## stderr-json: ""
+## status: 0
+
+#### and a width that truncates NEGATIVE folds nowhere at all -- a CONTROL
+# This one cannot go red: dropping the not-positive rule leaves a width of about
+# 4.3e9, which no line reaches, so it folds nowhere under either answer. It is
+# here to record the rule GNU actually has, not to hold the code to it -- the
+# truncation case above is what does that.
+## argv: sed -n 1l2147483658
+## stdin:
+abcdefghijklmnopqrstuvwxyz
+## END
+## stdout:
+abcdefghijklmnopqrstuvwxyz$
+## END
+## stderr-json: ""
+## status: 0
+
+#### an `l' width whose truncation is -1 means "no width", not "never wrap"
+# -1 is the same sentinel `q' has, and GNU reads it as "no width argument": this
+# folds exactly where a bare `l' folds, at the default 70. Reading every negative
+# as "never wrap" got it wrong, and a reviewer caught that after the first fix.
+## argv: sed -n 1l4294967295
+## stdin:
+abcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghij
+## END
+## stdout:
+abcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghi\
+jabcdefghijabcdefghij$
+## END
+## stderr-json: ""
+## status: 0
+
+#### while its neighbour, negative but not -1, really does never wrap
+## argv: sed -n 1l4294967294
+## stdin:
+abcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghij
+## END
+## stdout:
+abcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghij$
+## END
+## stderr-json: ""
+## status: 0

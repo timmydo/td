@@ -41,7 +41,7 @@ fn bin() -> PathBuf {
 /// missing vendored `.inp`/`.good`, or a typo'd annotation reds in-loop — without
 /// depending on the behavioral run below.
 /// Raise this with the corpus; it exists to catch a corpus that SHRANK.
-const CORPUS_FLOOR: usize = 1795;
+const CORPUS_FLOOR: usize = 1821;
 
 #[test]
 fn corpus_is_well_formed() -> Result<(), Box<dyn std::error::Error>> {
@@ -728,12 +728,16 @@ fn sed_hash_n_wants_a_script_stream_that_started_at_its_beginning()
 /// which is how the first version of this hung. The hang cannot be provoked from a
 /// test — std cannot make a fifo and the gate runs no third-party program — so the
 /// property is guarded against the source, as td's other confinement tests do for
-/// what no compiler checks. It is a TEXT guard and not a proof, and its blind spot
-/// is exactly one thing: it reads a LINE at a time, so a reopen split across two --
-/// a path bound to a variable, or a multi-line `OpenOptions::new()...open(...)` --
-/// is not something it can see. Everything ON one line it does see, however the
-/// path is spelled or built, which is the part a reviewer got a hanging reopen
-/// past when this matched whole literals instead of prefixes.
+/// what no compiler checks. It is a TEXT guard and not a proof: it reads a LINE at
+/// a time, so a reopen split across two -- a path bound to a variable, or a
+/// multi-line `OpenOptions::new()...open(...)` -- is not something it can see, and
+/// on one line it still only knows the path spellings and openers listed below.
+/// Two reviewers in a row got a hanging reopen past it, one by BUILDING the path
+/// and one by naming a DIFFERENT magic link to fd 0; each time the answer was to
+/// widen what it matches rather than to claim the class was covered. Treat the
+/// list as the guard's real extent, not as a statement about reopens in general.
+/// It also reads `src/sed.rs` ALONE, so the same probe in another module is
+/// invisible to it -- which is fine only while `read_script` lives here.
 #[test]
 fn sed_script_stdin_seekability_is_a_stat_not_a_reopen()
 -> Result<(), Box<dyn std::error::Error>> {
@@ -750,22 +754,30 @@ fn sed_script_stdin_seekability_is_a_stat_not_a_reopen()
     // carries its paren so `read_dir`/`read_link` are not swept up with it, and
     // the opener list is by SUFFIX -- `::open(`, `.open(` -- so `File::options()`
     // and any other builder ending in `.open(` are caught too, which naming the
-    // constructors was not. The paths are PREFIXES, not whole literals, so a name
-    // BUILT on the line (`format!("/proc/self/fd/{}", 0)`) is caught as surely as
-    // one written out; pinning the three exact strings did not, and a reviewer
-    // got a hanging reopen past this guard that way. `read_source` opens
-    // `/dev/stdin` by design, eight lines from where it names it; that is fine
-    // while the two stay on separate lines, and this guard is why they must.
+    // constructors was not. The path list is `/fd/` rather than any spelling of
+    // the whole name: `/proc/self/fd/0` is only ONE of the magic links to fd 0,
+    // and `/proc/<pid>/fd/0`, `/proc/thread-self/fd/0` and `/dev/fd/0` are the
+    // same descriptor by other names. Two reviewers in a row got a HANGING reopen
+    // past this scan, the first by building the path with `format!` and the
+    // second by picking a different link, so what it matches is now the segment
+    // they all share. `read_source` opens `/dev/stdin` by design, eight lines
+    // from where it names it; that is fine while the two stay on separate lines,
+    // and this guard is why they must.
     for line in src.lines() {
         if line.trim_start().starts_with("//") {
             continue;
         }
-        let names_fd0 = ["/dev/stdin", "/dev/fd/", "/proc/self/fd"]
-            .iter()
-            .any(|n| line.contains(n));
-        let opens = ["::open(", ".open(", "OpenOptions", "fs::read(", "read_to_string("]
-            .iter()
-            .any(|o| line.contains(o));
+        let names_fd0 = ["/dev/stdin", "/fd/"].iter().any(|n| line.contains(n));
+        let opens = [
+            "::open(",
+            ".open(",
+            "OpenOptions",
+            "fs::read(",
+            "read_to_string(",
+            "fs::copy(",
+        ]
+        .iter()
+        .any(|o| line.contains(o));
         assert!(!(names_fd0 && opens), "fd 0 must not be reopened: {line}");
     }
     Ok(())
