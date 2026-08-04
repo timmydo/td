@@ -3,7 +3,8 @@
 //!
 //! The shell keeps its OWN file-descriptor table (`Fds`) rather than dup2'ing
 //! real kernel descriptors, because `std` exposes no `dup2`/`fork` and the
-//! crate's one `unsafe` surface is `sys.rs`'s `umask(2)`, nothing else.
+//! crate's one `unsafe` surface is `sys.rs`'s two syscalls -- `umask(2)` and a
+//! disposition-only `rt_sigaction(2)` -- and nothing else.
 //! Builtins and shell functions read and write through
 //! this table; only when an *external* program runs is the table translated into
 //! `std::process::Command` stdio. Pipelines between builtins are run stage by
@@ -177,9 +178,9 @@ pub fn read_byte(sh: &Shell, fd: u32) -> std::io::Result<Option<u8>> {
 /// ready, because a read on them returns (0, or an error) immediately. `None`
 /// means td-sh cannot tell, which is exactly the inherited descriptor -- it may
 /// be a pipe or a terminal with nothing in it, and only `poll(2)` distinguishes
-/// that from one holding data. td-sh's syscall surface is `umask(2)` and adding
-/// to it is an UNSAFE.md amendment, so the caller reports the limit rather than
-/// guessing.
+/// that from one holding data. `poll(2)` is not on td-sh's syscall surface and
+/// adding to it is an UNSAFE.md amendment, so the caller reports the limit
+/// rather than guessing.
 pub fn read_ready(sh: &Shell, fd: u32) -> Option<bool> {
     match sh.fds.get(fd) {
         // Everything td-sh's own table holds is ready; only what it inherited
@@ -450,7 +451,7 @@ struct UmaskScope(u32);
 
 impl UmaskScope {
     fn capture() -> Self {
-        Self(crate::sys::get())
+        Self(crate::sys::umask_get())
     }
 }
 
@@ -459,21 +460,47 @@ impl Drop for UmaskScope {
         // Nothing to report to: the mask was this process's a moment ago, so a
         // refusal here would mean the kernel changed its mind about a value it
         // already accepted.
-        let _ = crate::sys::set(self.0);
+        let _ = crate::sys::umask_set(self.0);
     }
 }
 
-/// A cloned shell environment and the mask guard it cannot be separated from.
+/// A cloned shell environment and the process-state guards it cannot be
+/// separated from.
 ///
-/// The guard is bundled here rather than left to each caller because there is
-/// no way to tell from a subshell's OUTPUT that the mask leaked -- it shows up
-/// later, in the permissions of a file some unrelated command creates. So
-/// `fork_shell` hands out no bare `Shell`: a subshell construct added later
-/// gets the save/restore whether or not its author knew to ask. Derefs to
-/// `Shell`, so callers use it as one.
+/// They are bundled here rather than left to each caller because there is no way
+/// to tell from a subshell's OUTPUT that either leaked -- a stray mask shows up
+/// later in the permissions of a file some unrelated command creates, and a
+/// stray `SIG_IGN` shows up as a child that will not die. So `fork_shell` hands
+/// out no bare `Shell`: a subshell construct added later gets the save/restore
+/// whether or not its author knew to ask. Derefs to `Shell`, so callers use it
+/// as one.
 pub struct Subshell {
     shell: Shell,
     _mask: UmaskScope,
+}
+
+/// Put back every signal disposition this subshell changed.
+///
+/// The same argument as `UmaskScope`, for the other piece of subshell state that
+/// lives in the kernel rather than in `Shell`: ash forks, so a subshell's `trap
+/// '' INT` cannot reach the parent; td-sh's subshells are in-process clones, so
+/// the restore a fork gives for free has to be explicit. Written on `Subshell`
+/// itself rather than as a third field because the record is IN the shell --
+/// `trap` runs against a `&mut Shell` and has no other place to leave it -- and
+/// because `drop` runs before the fields do, so `_mask` is still standing.
+impl Drop for Subshell {
+    fn drop(&mut self) {
+        // Nothing to report to, and nothing to decide: each entry holds what the
+        // kernel itself handed back when this shell took the disposition over.
+        while let Some((signo, ignored)) = self.shell.sig_undo.pop() {
+            let want = if ignored {
+                crate::sys::Disposition::Ignore
+            } else {
+                crate::sys::Disposition::Default
+            };
+            let _ = crate::sys::signal_set(signo, want);
+        }
+    }
 }
 
 impl std::ops::Deref for Subshell {
@@ -541,12 +568,20 @@ pub fn fork_shell(sh: &Shell) -> Subshell {
         // POSIX 2.12: a subshell resets the traps it inherited to their defaults,
         // so only one it sets ITSELF runs when its environment ends -- but one set
         // to IGNORE (dash's empty action) stays ignored, and keeps being reported.
+        // The kernel already holds SIG_IGN for those, so nothing is re-applied
+        // here; the ones dropped were never more than table entries.
         traps: sh
             .traps
             .iter()
             .filter(|(_, action)| action.is_empty())
             .map(|(signo, action)| (*signo, action.clone()))
             .collect(),
+        // Carried exactly as `fork(2)` copies dash's `sigmode`: the answer is
+        // about how the PROCESS started, so a clone that re-derived it would
+        // read back a disposition its own parent installed and mistake it for
+        // one inherited from outside.
+        sig_may_set: sh.sig_may_set.clone(),
+        sig_undo: Vec::new(),
     };
     Subshell { shell, _mask }
 }

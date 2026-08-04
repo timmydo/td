@@ -9,19 +9,24 @@
 //! crate's `lib.rs` and is host-side test tooling — it is NOT part of this
 //! binary and runs the built shell as a subprocess.
 //!
-//! The interpreter is safe `std` but for ONE confined syscall: a virtual
+//! The interpreter is safe `std` but for TWO confined syscalls: a virtual
 //! file-descriptor table replaces `dup2`, `Stdio::piped`/`CommandExt::exec`
 //! cover the process primitives, and subshells clone shell state in-process. The
 //! crate `#![deny(unsafe_code)]`s and `sys.rs` carries the single scoped
-//! `#[allow]` — `umask(2)`, which `std` exposes no API for at all. That is the
-//! EIGHTH target-side unsafe exception UNSAFE.md records; the confinement tests
-//! below assert its roster against this crate's own source.
+//! `#[allow]` — `umask(2)` and a DISPOSITION-ONLY `rt_sigaction(2)`, neither of
+//! which `std` exposes an API for at all. That is the EIGHTH target-side unsafe
+//! exception UNSAFE.md records; the confinement tests below assert its roster
+//! against this crate's own source.
 //!
-//! Still deferred, and each a further reviewed amendment: job control and signal
-//! traps beyond `EXIT`. Concurrent (streaming) pipelines are NOT among them —
-//! `std::io::pipe` is stable and needs no `unsafe`; today's stages are still run
-//! sequentially with the producer buffered, which is a refinement rather than a
-//! syscall question.
+//! Still deferred, and each a further reviewed amendment: job control, and
+//! CATCHING a signal — `trap 'action' SIG` needs a handler, and a handler on
+//! x86-64 needs a hand-laid `SA_RESTORER` trampoline to return through, where
+//! the two code-free dispositions run no handler at all and so need none.
+//! `trap '' SIG` is therefore already real, and reaches the children a script
+//! starts, as POSIX requires. Concurrent (streaming) pipelines are NOT among
+//! the deferrals — `std::io::pipe` is stable and needs no `unsafe`; today's
+//! stages are still run sequentially with the producer buffered, which is a
+//! refinement rather than a syscall question.
 #![deny(unsafe_code)]
 
 mod arith;
@@ -220,8 +225,8 @@ fn read_complete(stdin: &std::io::Stdin, sh: &Shell, buffer: &mut String) -> Rea
 }
 
 /// Assertions about this crate's own SOURCE, which the compiler cannot make:
-/// the unsafe surface is one syscall, in one module, with one call site, named
-/// by two modules and no others.
+/// the unsafe surface is two syscalls, in one module, with one call site each,
+/// writing two handler words and no others, named by two modules and no others.
 /// Every needle is built with `concat!` so this module's own text does not
 /// count itself.
 #[cfg(test)]
@@ -350,10 +355,10 @@ mod confinement {
         );
     }
 
-    /// The roster is ONE syscall, pinned by VALUE — a name alone would let the
+    /// The roster is TWO syscalls, pinned by VALUE — a name alone would let the
     /// number change under it.
     #[test]
-    fn the_syscall_roster_is_exactly_one_and_value_pinned() {
+    fn the_syscall_roster_is_exactly_two_and_value_pinned() {
         let decl = concat!("const", "SYS", "_");
         let sys = squeeze(source("sys.rs"));
         let mut seen: Vec<String> = Vec::new();
@@ -367,11 +372,64 @@ mod confinement {
             sys.matches(decl).count(),
             "a syscall-number declaration was not parsed"
         );
-        assert_eq!(seen, vec![concat!("SYS", "_UMASK:usize=95").to_string()]);
+        assert_eq!(
+            seen,
+            vec![
+                concat!("SYS", "_RT_SIGACTION:usize=13").to_string(),
+                concat!("SYS", "_UMASK:usize=95").to_string(),
+            ]
+        );
+    }
+
+    /// The `rt_sigaction` surface is DISPOSITION-ONLY, which is what makes it
+    /// small enough to take without an `SA_RESTORER` trampoline: the two handler
+    /// words are pinned by value, `sys.rs` is the only file that names either,
+    /// and each is written in exactly one place — `Disposition`'s two arms.
+    /// A THIRD handler word, or one built by arithmetic, is a handler, and a
+    /// handler is a different surface.
+    #[test]
+    fn only_the_two_code_free_handlers_are_ever_installed() {
+        // The crate's own tests name both words freely -- they assert what
+        // `decode` makes of each -- so the scan stops where they begin.
+        let shipped = source("sys.rs")
+            .split(concat!("#[cfg(", "test)]"))
+            .next()
+            .unwrap_or_default();
+        let sys = squeeze(&code_only(shipped));
+        for decl in [
+            concat!("constSIG", "_DFL:usize=0;"),
+            concat!("constSIG", "_IGN:usize=1;"),
+        ] {
+            assert_eq!(sys.matches(decl).count(), 1, "`{decl}` must be pinned by value");
+        }
+        // Both appear exactly three times in code: the declaration, the decode
+        // that reads one back, and the `Disposition` arm that asks for it.
+        for name in [concat!("SIG", "_DFL"), concat!("SIG", "_IGN")] {
+            assert_eq!(sys.matches(name).count(), 3, "{name} is named somewhere new");
+        }
+        for (name, text) in SOURCES {
+            if *name == "sys.rs" {
+                continue;
+            }
+            let code = code_only(text);
+            assert!(
+                !code.contains(concat!("SIG", "_DFL")) && !code.contains(concat!("SIG", "_IGN")),
+                "{name} names a raw handler word"
+            );
+        }
+        // The struct is four words and the handler is the FIRST, written out
+        // rather than indexed so the order is visible at the one write.
+        assert!(
+            sys.contains(concat!("letact:[usize;SIGACTION", "_WORDS]=[handler,0,0,0];")),
+            "the installed action is no longer `handler` followed by three zeros"
+        );
     }
 
     /// The assembly body is pinned WHOLE, including which register each argument
-    /// lands in and that `options(nomem)` stays absent.
+    /// lands in and that `options(nomem)` stays absent — which is no longer
+    /// merely a promise kept for a future pointer argument: `rt_sigaction` has
+    /// the kernel write the previous action through `a3` and read the new one
+    /// through `a2`, and both addresses escape only as integers.
     #[test]
     fn the_confined_block_is_pinned_whole() {
         let sys = squeeze(source("sys.rs"));
@@ -380,6 +438,9 @@ mod confinement {
             "    \"syscall\",\n",
             "    inlateout(\"rax\") n as isize => ret,\n",
             "    in(\"rdi\") a1,\n",
+            "    in(\"rsi\") a2,\n",
+            "    in(\"rdx\") a3,\n",
+            "    in(\"r10\") a4,\n",
             "    out(\"rcx\") _,\n",
             "    out(\"r11\") _,\n",
             "    options(nostack),\n",
@@ -422,30 +483,34 @@ mod confinement {
         }
     }
 
-    /// The raw entry point has ONE call site. Module privacy stops another
-    /// MODULE reaching `syscall1`, but not another wrapper inside `sys.rs`, and
-    /// a second wrapper is a second syscall however safe its signature looks.
+    /// The raw entry point has ONE call site PER SYSCALL. Module privacy stops
+    /// another MODULE reaching `syscall4`, but not another wrapper inside
+    /// `sys.rs`, and a second wrapper is a second syscall however safe its
+    /// signature looks.
     #[test]
-    fn the_raw_syscall_has_exactly_one_call_site() {
+    fn the_raw_syscall_has_one_call_site_per_syscall() {
         let code = code_only(source("sys.rs"));
-        let name = concat!("syscall", "1");
+        let name = concat!("syscall", "4");
         assert_eq!(
             code.matches(name).count(),
-            2,
-            "`{name}` should appear twice in code: its definition and its one call"
+            3,
+            "`{name}` should appear three times in code: its definition and its two calls"
         );
         assert_eq!(
-            code.matches(concat!("fn ", "syscall", "1(")).count(),
+            code.matches(concat!("fn ", "syscall", "4(")).count(),
             1,
             "more than one raw entry point"
         );
         // The number reaches the kernel as an ARGUMENT, so pinning the `SYS_*`
-        // declarations is not enough on its own: `syscall1(90, x)` names no
-        // constant and would satisfy the roster test above.
-        assert_eq!(
-            squeeze(&code).matches(concat!("syscall", "1(", "SYS", "_UMASK,")).count(),
-            1,
-            "the one call must pass the named syscall number"
-        );
+        // declarations is not enough on its own: `syscall4(90, x, 0, 0, 0)`
+        // names no constant and would satisfy the roster test above.
+        let squeezed = squeeze(&code);
+        for number in [concat!("SYS", "_UMASK,"), concat!("SYS", "_RT_SIGACTION,")] {
+            assert_eq!(
+                squeezed.matches(&format!("{}{number}", concat!("syscall", "4("))).count(),
+                1,
+                "each call must pass the named syscall number"
+            );
+        }
     }
 }

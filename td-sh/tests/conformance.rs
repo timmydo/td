@@ -371,6 +371,64 @@ fn a_functions_temp_binding_is_exported_to_a_child() -> Result<(), Box<dyn std::
     Ok(())
 }
 
+/// `trap '' SIG` is a KERNEL disposition, and the whole point of it being one is
+/// that `execve` carries it into the children a script starts. Nothing
+/// in-process can show that — a disposition is per-process, so only a real child
+/// can be asked — and the answer has to come out of the kernel rather than out
+/// of td-sh, which is what `/proc/self/status`'s `SigIgn:` mask is for. The
+/// child is the shell running ITSELF, the one external a target-side gate can
+/// count on, and it reports the mask with builtins alone.
+///
+/// SIGPIPE (bit 0x1000) is set in EVERY line below, whatever the parent asked
+/// for, and that is this guarantee's one documented exception: Rust's runtime
+/// ignores SIGPIPE before `main`, `std::process::Command` undoes that in each
+/// child it spawns, and neither is reachable from safe code — so `trap '' PIPE`
+/// cannot reach a child, and a td-sh child could not tell an inherited ignore
+/// from the one its own runtime just installed. Asserted here as a constant so
+/// the exception is pinned rather than discovered.
+#[test]
+fn an_ignore_trap_is_inherited_by_a_child() -> Result<(), Box<dyn std::error::Error>> {
+    let shell = PathBuf::from(env!("CARGO_BIN_EXE_td-sh"));
+    let child = "\"$TD_SH_BIN\" -c 'while read l; do case \"$l\" in SigIgn:*) echo \"$l\";; \
+                 esac; done < /proc/self/status'";
+    // SIGINT is bit 1 and SIGPIPE bit 12, both counted from signal 1.
+    let int = 1u64 << 1;
+    let pipe = 1u64 << 12;
+    for (body, want) in [
+        (format!("trap '' INT; {child}"), int | pipe),
+        (format!("{child}"), pipe),
+        // A subshell's ignore is handed back before the next command runs, so the
+        // child started AFTER it must not inherit one.
+        (format!("( trap '' INT ); {child}"), pipe),
+        // ... and one the subshell cleared is handed back the other way.
+        (format!("trap '' INT; ( trap - INT ); {child}"), int | pipe),
+        // A catcher cannot be installed, so it leaves the default behind.
+        (format!("trap 'echo x' INT; {child}"), pipe),
+        // The pair that pins `fork_shell` CARRYING `sig_may_set`, and the only
+        // pair that can: from outside, a subshell that cleared an inherited
+        // ignore is indistinguishable from one that declined to touch it —
+        // both leave the parent ignoring INT. The difference is visible only to
+        // the subshell's OWN children. Without the carried cache the subshell
+        // would re-query, find the ignore its parent installed, mistake it for
+        // one inherited from outside the process, and decline; then the first
+        // line below would report an ignore rather than none.
+        (format!("trap '' INT; ( trap - INT; {child} )"), pipe),
+        (format!("trap '' INT; ( trap - INT ); {child}"), int | pipe),
+    ] {
+        let out = std::process::Command::new(&shell)
+            .arg("-c")
+            .arg(&body)
+            .env("TD_SH_BIN", &shell)
+            .output()?;
+        let text = String::from_utf8_lossy(&out.stdout);
+        let hex = text.trim().trim_start_matches("SigIgn:").trim();
+        let seen = u64::from_str_radix(hex, 16)
+            .map_err(|e| format!("{body}: unreadable mask {text:?}: {e}"))?;
+        assert_eq!(seen, want, "{body}: child inherited {seen:#x}, wanted {want:#x}");
+    }
+    Ok(())
+}
+
 /// A bare `local x` clears the VALUE and keeps the entry, so the name is absent
 /// from a child's environment while localised but exports again the moment the
 /// function assigns it — the `local PATH; PATH=...; cmd` idiom. The `unset`

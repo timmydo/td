@@ -35,7 +35,7 @@ one.
 | 5 | `td-svc` | `kill(2)` |
 | 6 | `td-compositor` | `recvmsg(2)`, `close(2)`, `sendmsg(2)` |
 | 7 | `td-util` | `ioctl(2)`, three pinned requests |
-| 8 | `td-sh` | `umask(2)` |
+| 8 | `td-sh` | `umask(2)`, `rt_sigaction(2)` (disposition-only) |
 
 The control-plane exception (`builder/src/sys.rs`) is described under The
 rule above and is not part of this numbering: it is host-side, and no
@@ -300,57 +300,124 @@ ordinary file, which is what keeps that surface at one syscall.
 
 ## 8. `td-sh` — the shell
 
-The `td-sh` shell, whose one `syscall1` body in `td-sh/src/sys.rs` carries
-EXACTLY ONE syscall — `umask(2)` — reached from exactly two modules:
-`builtin.rs` for the builtin itself, and `process.rs` for the scope guard
-that hands a subshell back the mask a fork would have kept for it. `std`
-exposes no umask API at all, which is not a gap that can be worked around:
-it is why the shipped `/init` still spells one line `busybox sh -c 'umask
-077; …'`, and why the shell that is supposed to replace busybox could not
-serve it. This surface passes NO POINTERS — the one argument is an integer
-and the return is an integer — so unlike td-util's `ioctl` there is
-nothing the kernel can write through. `options(nomem)` is absent anyway,
-and not merely to keep the body identical to the one it was copied from:
-the option is a promise about the FUNCTION, not about today's one call, so
-leaving it off is what keeps the body sound if a pointer argument is ever
-added to it. `umask(2)` also cannot fail, so there is no `check()`; what
-it does is RETURN THE PREVIOUS MASK, and both wrappers are built out of
-that. Reading is a set-and-restore (`umask(0)` then put it back), because
-there is no reading syscall; and `set` proves its own effect by asking for
+The `td-sh` shell, whose one `syscall4` body in `td-sh/src/sys.rs` carries
+EXACTLY TWO syscalls — `umask(2)` and a DISPOSITION-ONLY `rt_sigaction(2)`
+— reached from exactly two modules: `builtin.rs` for the `umask` and
+`trap` builtins, and `process.rs` for the guards that hand a subshell back
+the process state a fork would have kept for it. `std` exposes an API for
+neither, and in the umask case that is not a gap that can be worked
+around: it is why the shipped `/init` still spells one line `busybox sh -c
+'umask 077; …'`, and why the shell that is supposed to replace busybox
+could not serve it.
+
+`umask(2)` cannot fail, so there is no `check()` on that path; what it
+does is RETURN THE PREVIOUS MASK, and both wrappers are built out of that.
+Reading is a set-and-restore (`umask(0)` then put it back), because there
+is no reading syscall; and `umask_set` proves its own effect by asking for
 the same mask a second time, which changes nothing and returns what the
 first call left. That readback is not ceremony: nothing observable
 distinguishes a mask that did not take, since the wrong bits surface later
 as a file created with permissions nobody asked for — the same argument
 that made `losetup` re-read its read-only flag out of sysfs. It earned its
 keep immediately, catching `MODE_BITS` declared as `0o7777` when Linux's
-`sys_umask` keeps only the nine rwx bits. Deliberately NOT in that
-surface: reading the mask out of `/proc/self/status`'s `Umask:` field
-(real and safe, but it answers only half the builtin, so it would buy a
-`/proc` dependency without removing the syscall); `chmod`/`fchmod`
-(`std::fs::set_permissions` covers them); `rt_sigaction` for `trap INT`
-and the terminal `ioctl`s for line editing — both APPROVED in principle
-for this crate but NOT YET PRESENT, and each lands as its own amendment
-here with its own caller, because a syscall with no caller is a surface
-nothing reviews. `sigaction` in particular is not the small step it looks:
-on x86-64 a raw one needs a hand-laid `struct kernel_sigaction` AND an
-`SA_RESTORER` trampoline, so the disposition-only form
-(`SIG_IGN`/`SIG_DFL`, which never runs a handler and so needs neither) is
-what a later amendment should ask for first. A SECOND syscall is an
-amendment here; `td-sh/src/main.rs`'s confinement tests assert the roster
-and its one value-pinned number, the whole `asm!` block including which
-register the argument lands in, that the crate names the unsafe lint
+`sys_umask` keeps only the nine rwx bits.
+
+`rt_sigaction(2)` is the amendment the paragraph above used to defer, and
+it is deliberately the SMALL half of it. A shell wants two things from
+`trap`: to ignore a signal and to catch one. Catching needs a handler, and
+a handler on x86-64 needs a hand-laid `SA_RESTORER` trampoline to return
+through — so only the ignore is taken here, and the type system is what
+holds the line: `Disposition` has exactly two arms, `SIG_DFL` and
+`SIG_IGN`, neither of which runs any code, and no other handler word is
+constructible outside `sys.rs`. What that buys is not shell bookkeeping.
+POSIX makes `trap '' SIG` a real kernel disposition, INHERITED ACROSS
+`execve`, so it is the half of `trap` that has to reach the children a
+script starts; recording it in a table would leave `trap '' INT; long_job`
+interruptible and every other shell's scripts wrong under this one. The
+catching half stays deferred, and `trap 'action' SIG` therefore asks for
+`SIG_DFL` — honest about the shell dying on the signal rather than
+pretending an action is waiting to run.
+
+Three things confine the new syscall beyond its two-armed argument.
+FIRST, it is disposition-only in the STRUCT as well as the type: `install`
+writes `[handler, 0, 0, 0]` — `sa_flags` 0 (so no `SA_RESTORER`, no
+`SA_SIGINFO`), `sa_restorer` 0, empty `sa_mask` — and the word count is
+pinned because `sys_rt_sigaction` copies `sizeof(struct sigaction)`
+through the pointer with no length negotiation, so a short buffer is an
+out-of-bounds kernel write from code the compiler reads as safe. The
+struct is a plain `[usize; 4]` rather than a `#[repr(C)]` type so its
+field ORDER is a tested function, as td-compositor's winsize is: a handler
+written at the wrong offset is a well-formed `sa_flags` and a disposition
+left alone. SECOND, `signal_set` re-queries and REFUSES unless the kernel
+agrees, the same argument as the mask above — a signal the kernel still
+defaults on kills the shell at the moment the script was written to
+survive it. THIRD, td-sh only ever changes a signal it found at `SIG_DFL`,
+asked ONCE per signal and cached (dash's `sigmode`, and for dash's reason:
+after the first change the process can no longer be asked what it started
+with). `execve` resets every caught signal to default, so a non-default
+answer on first touch was installed by someone else — a parent that
+ignored it, which is POSIX's rule that a signal ignored on entry cannot be
+trapped or reset and is what makes `nohup` stick, or Rust's own runtime,
+which ignores SIGPIPE and handles SEGV/BUS before `main`. The SIGPIPE case
+is not academic: un-ignoring it would turn every `yes | head` into a dead
+shell. SIGKILL and SIGSTOP are refused before the call rather than after
+it, so every refusal that does surface is the kernel disagreeing about
+something it could have done — and SIGCHLD is refused as well, though the
+kernel would take it, because `SIG_IGN` there is POSIX's request that
+children be AUTO-REAPED and would leave every external command reporting
+`ECHILD` instead of its status.
+
+Two limits of the ignore are worth writing down beside it. `trap ''`
+cannot carry SIGPIPE into a child, because `std::process::Command` undoes
+the runtime's ignore in every child it spawns and neither end of that is
+reachable from safe code; undoing it in the shell instead would make td-sh
+die on a closed stdout as dash does, which is a different failure mode for
+every write in the crate and so a separate landing. And a non-empty action
+asks for `SIG_DFL` rather than leaving an inherited ignore standing, so the
+table and the process never describe different shells.
+
+This surface now PASSES POINTERS, which the umask-only one did not, and
+that is what `options(nomem)`'s absence was being kept for: the option is
+a promise about the FUNCTION, not about today's calls, and the kernel both
+writes the previous action through one address and reads the new one
+through another — addresses that escape only as integers, so a `nomem`
+promise could let the compiler keep a stale buffer across the call or drop
+the one it is about to read.
+
+Deliberately NOT in that surface: reading the mask out of
+`/proc/self/status`'s `Umask:` field (real and safe, but it answers only
+half the builtin, so it would buy a `/proc` dependency without removing
+the syscall); `chmod`/`fchmod` (`std::fs::set_permissions` covers them);
+`kill(2)`, `rt_sigprocmask(2)` and `sigaltstack(2)` — this shell sends no
+signals, blocks none, and runs on no alternate stack; a handler-bearing
+`rt_sigaction`, which is the `SA_RESTORER` question above and lands as its
+own amendment when `trap INT` is served for real; and the terminal
+`ioctl`s for line editing, APPROVED in principle for this crate but NOT
+YET PRESENT, which lands with its own caller, because a syscall with no
+caller is a surface nothing reviews.
+
+A THIRD syscall is an amendment here; `td-sh/src/main.rs`'s confinement
+tests assert the roster and its two value-pinned numbers, that the two
+handler words are pinned by value and named in `sys.rs` alone, that the
+installed action is `handler` followed by three zeros, the whole `asm!`
+block including which register each argument lands in and that
+`options(nomem)` stays absent, that the crate names the unsafe lint
 exactly twice outside comments, that those two modules are the wrappers'
 only callers, that no module aliases OR IMPORTS OUT OF the syscall module,
-that `syscall1` has exactly one call site and that it passes the NAMED
-number rather than a bare literal (the number reaches the kernel as an
-argument, so pinning the declarations alone does not pin what is issued),
-that `sys.rs` carries no block comment — which is what makes the
+that `syscall4` has exactly one call site per syscall and that each passes
+the NAMED number rather than a bare literal (the number reaches the kernel
+as an argument, so pinning the declarations alone does not pin what is
+issued), that `sys.rs` carries no block comment — which is what makes the
 line-based comment strip complete for the one file that may hold `unsafe`,
 since a `/* */` between two tokens changes nothing the compiler sees — and
 that the scan COVERS every module `main.rs` declares, whatever its
 visibility, since a module missing from that list is one no other
-assertion can see.
+assertion can see. `sys.rs`'s own tests then issue both syscalls and check
+the answer against `/proc/self/status` — `Umask:` for one, the `SigIgn:`
+mask for the other — because every assertion above is about source TEXT,
+and a wrapper that returned a plausible value without issuing anything
+would satisfy all of them.
 
 Every other primitive td-sh needs — pipes, process spawn, `exec`, the
 virtual fd table that stands in for `dup2` — is reachable through safe
-`std`, which is what keeps that surface at one.
+`std`, which is what keeps that surface at two.

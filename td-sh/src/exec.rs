@@ -191,10 +191,28 @@ pub struct Shell {
     /// POSIX makes that the value a bare `exit` in the action reports.
     pub trap_status: Option<i32>,
     /// `trap` actions by signal number, 0 being EXIT. An empty action is POSIX's
-    /// "ignore". Only EXIT is ever RUN: delivering a real signal needs a handler
-    /// this shell cannot install (see the crate-root note), so the rest are kept
-    /// so that `trap` reports them faithfully.
+    /// "ignore", and that half of `trap` is REAL: it installs `SIG_IGN`, which
+    /// the kernel then hands to every child. Only EXIT is ever RUN, though —
+    /// CATCHING a signal needs a handler this shell cannot install (see the
+    /// crate-root note), so the rest are kept so that `trap` reports them
+    /// faithfully.
     pub traps: BTreeMap<u8, String>,
+    /// Whether td-sh may set each signal's disposition, answered once by asking
+    /// the kernel the first time `trap` names it and cached because after the
+    /// first change it can no longer be asked. `false` means the process
+    /// STARTED with something other than `SIG_DFL` installed, which is not
+    /// td-sh's to overwrite: POSIX says a signal ignored on entry cannot be
+    /// trapped or reset, and Rust's runtime ignores SIGPIPE and handles
+    /// SEGV/BUS before `main`. Cloned into a subshell exactly as `fork(2)`
+    /// copies dash's `sigmode`.
+    pub sig_may_set: BTreeMap<u8, bool>,
+    /// Dispositions this shell CHANGED, and whether each was IGNORED before it
+    /// did — the undo a real fork would not need. One bit says which to put
+    /// back because `SIG_IGN` and `SIG_DFL` are the only two td-sh installs.
+    /// Recorded only in a clone, and only on the FIRST change to each signal, so
+    /// every entry already holds the parent's value and the list is bounded by
+    /// the signal count.
+    pub sig_undo: Vec<(u8, bool)>,
 }
 
 /// Bound on nested command execution — enforced once, at the `run_command` choke
@@ -337,6 +355,8 @@ impl Shell {
             aliases: Aliases::new(),
             cloned: false,
             traps: BTreeMap::new(),
+            sig_may_set: BTreeMap::new(),
+            sig_undo: Vec::new(),
             trap_status: None,
         };
         // dash's varinit carries `PS4=+ `, so it is a real variable a script can
@@ -453,6 +473,8 @@ impl Shell {
             aliases: Aliases::new(),
             cloned: false,
             traps: BTreeMap::new(),
+            sig_may_set: BTreeMap::new(),
+            sig_undo: Vec::new(),
             trap_status: None,
         };
         sh.vars.insert(

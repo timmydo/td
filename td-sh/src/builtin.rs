@@ -2226,9 +2226,90 @@ fn signal_name(n: u8) -> String {
     n.to_string()
 }
 
-/// `trap [action] condition...`. Only EXIT ever fires: installing a real signal
-/// handler needs syscalls this shell cannot make, so the other conditions are
-/// recorded and reported but never delivered.
+/// SIGCHLD, the one signal the kernel WOULD take a disposition for that td-sh
+/// still will not give it. `SIG_IGN` there does not mean "discard this signal":
+/// it is POSIX's documented request that children be AUTO-REAPED, which takes
+/// every command's exit status away from the shell that started it. Verified
+/// before it was fixed here — `trap '' CHLD` left each external reporting "No
+/// child processes" instead of what it exited with, while still running. bash
+/// keeps SIGCHLD under its own control for the same reason. The trap is
+/// recorded and printed like any other; only the kernel is left out of it.
+const SIGCHLD: u8 = 17;
+
+/// Whether td-sh may set `signo`'s disposition, asked of the kernel ONCE and
+/// remembered — dash's `sigmode`, and for the same reason: after the first
+/// change the kernel can no longer be asked what the process started with.
+///
+/// A non-default answer on first touch was installed by something other than
+/// this shell. `execve` resets every caught signal to default, so it is either a
+/// parent that ignored the signal — POSIX: one ignored on entry cannot be
+/// trapped or reset, which is what makes `nohup` stick — or Rust's own runtime,
+/// which ignores SIGPIPE and handles SEGV/BUS before `main`. Neither is td-sh's
+/// to overwrite, and the SIGPIPE case is not academic: un-ignoring it would turn
+/// every `yes | head` into a dead shell.
+///
+/// SIGPIPE is therefore the one signal `trap ''` cannot carry into a child:
+/// `std::process::Command` undoes the runtime's ignore in every child it spawns,
+/// and neither end of that is reachable from safe code. Undoing it in the shell
+/// instead is a real fix and a separate one — it would make td-sh DIE on a
+/// closed stdout the way dash does, which is a different failure mode for every
+/// write in the crate.
+///
+/// A kernel that refuses the question is cached as "no", so a signal td-sh
+/// cannot read is one it never writes.
+fn may_set_signal(sh: &mut Shell, signo: u8) -> bool {
+    if let Some(known) = sh.sig_may_set.get(&signo) {
+        return *known;
+    }
+    let entry = crate::sys::signal_get(signo);
+    let free = matches!(entry, Ok(Some(crate::sys::Disposition::Default)));
+    sh.sig_may_set.insert(signo, free);
+    free
+}
+
+/// Move `signo`'s kernel disposition to where the trap table now says it is.
+///
+/// This is the half of `trap` that leaves the shell: an ignore is inherited
+/// across `execve`, so `trap '' INT` has to reach the CHILDREN a script starts,
+/// and shell-side bookkeeping alone cannot do that. The catching half cannot be
+/// served at all — a handler needs an `SA_RESTORER` trampoline this crate does
+/// not have — so a non-empty action asks for `SIG_DFL`, which is honest: the
+/// shell dies on the signal rather than pretending an action will run.
+///
+/// Returns whether it succeeded, so a kernel that disagrees is REPORTED rather
+/// than leaving the table and the process describing different shells.
+fn apply_disposition(sh: &mut Shell, signo: u8, want: crate::sys::Disposition) -> bool {
+    // EXIT is not a signal, SIGKILL/SIGSTOP are not anyone's to set, and SIGCHLD
+    // is not this shell's. dash is silent about all of them, and so is this: the
+    // trap is still RECORDED, which is what `trap` prints.
+    if signo == SIGCHLD || !crate::sys::changeable(signo) || !may_set_signal(sh, signo) {
+        return true;
+    }
+    let prev = match crate::sys::signal_set(signo, want) {
+        Ok(prev) => prev,
+        Err(e) => {
+            err_line(sh, &format!("td-sh: {e}"));
+            return false;
+        }
+    };
+    // Only a CLONE has anything to undo, and only its first change to a signal
+    // saw the value its parent left. `may_set_signal` has already established
+    // the entry disposition was `SIG_DFL`, so `prev` is never a handler.
+    if sh.cloned {
+        if let Some(prev) = prev {
+            if !sh.sig_undo.iter().any(|(n, _)| *n == signo) {
+                sh.sig_undo.push((signo, prev == crate::sys::Disposition::Ignore));
+            }
+        }
+    }
+    true
+}
+
+/// `trap [action] condition...`. Only EXIT ever fires an ACTION: catching a
+/// signal needs a handler this shell cannot install, so a non-empty action for
+/// any other condition is recorded and reported but never delivered. An EMPTY
+/// action is different — it is POSIX's "ignore", and `apply_disposition` gives
+/// it to the kernel, which is what makes it hold across `exec` and in children.
 fn trap(sh: &mut Shell, argv: &[String]) -> R<()> {
     let mut ops = argv.get(1..).unwrap_or_default();
     // dash's `nextopt(nullstr)`: `--` ends an empty option set, a bare `-` is the
@@ -2266,13 +2347,24 @@ fn trap(sh: &mut Shell, argv: &[String]) -> R<()> {
             code = 1;
             continue;
         };
-        match action {
+        let want = match action {
             None | Some("-") => {
                 sh.traps.remove(&signo);
+                crate::sys::Disposition::Default
             }
             Some(a) => {
                 sh.traps.insert(signo, a.to_string());
+                if a.is_empty() {
+                    crate::sys::Disposition::Ignore
+                } else {
+                    crate::sys::Disposition::Default
+                }
             }
+        };
+        // The table is written first, so `trap` reports what was asked for even
+        // when the kernel would not take it -- dash records unconditionally too.
+        if !apply_disposition(sh, signo, want) {
+            code = 1;
         }
     }
     status(sh, code)
@@ -2725,7 +2817,7 @@ fn umask_builtin(sh: &mut Shell, argv: &[String]) -> R<()> {
             symbolic = true;
         }
     }
-    let current = crate::sys::get();
+    let current = crate::sys::umask_get();
     let Some(text) = argv.get(idx) else {
         let line = if symbolic {
             format!("{}\n", symbolic_mode(current))
@@ -2754,7 +2846,7 @@ fn umask_builtin(sh: &mut Shell, argv: &[String]) -> R<()> {
         return illegal(sh);
     }
     let mask = if numeric { parsed } else { parsed ^ 0o777 };
-    if let Err(e) = crate::sys::set(mask) {
+    if let Err(e) = crate::sys::umask_set(mask) {
         err_line(sh, &e);
         return status(sh, 2);
     }
@@ -5261,8 +5353,42 @@ mod tests {
         }
     }
 
+    /// `trap ''` installs a REAL `SIG_IGN`, and a disposition is PROCESS-global.
+    /// A test that leaves one behind both races its neighbours on cargo's thread
+    /// pool and hands the rest of the run a test binary that ignores the signal
+    /// -- a `cargo test` no longer answering Ctrl-C, say. This serialises the
+    /// tests that touch one and puts back what it found. (`sys.rs`'s own tests
+    /// hold a different lock, which is why they reserve signals 63/64: nothing
+    /// here may name those.)
+    static DISPOSITIONS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    struct Dispositions {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        saved: Vec<(u8, crate::sys::Disposition)>,
+    }
+
+    impl Dispositions {
+        fn held(signals: &[u8]) -> Self {
+            let _lock = DISPOSITIONS.lock().unwrap_or_else(|e| e.into_inner());
+            let saved = signals
+                .iter()
+                .filter_map(|s| crate::sys::signal_get(*s).ok().flatten().map(|d| (*s, d)))
+                .collect();
+            Self { _lock, saved }
+        }
+    }
+
+    impl Drop for Dispositions {
+        fn drop(&mut self) {
+            for (signo, disp) in &self.saved {
+                let _ = crate::sys::signal_set(*signo, *disp);
+            }
+        }
+    }
+
     #[test]
     fn trap_prints_what_is_in_force() {
+        let _held = Dispositions::held(&[2, 10, 15]);
         // dash's format, in signal-number order, with the action single-quoted.
         assert_eq!(
             run_capturing("trap 'echo test' TERM 2 EXIT\ntrap").1,
@@ -5280,6 +5406,10 @@ mod tests {
 
     #[test]
     fn trap_conditions_follow_dashs_decoding() {
+        // HUP and INT: this one RESETS rather than ignores, but a reset is a
+        // write too, and the guard is what serialises it against the tests that
+        // assert a disposition. KILL/STOP below never reach the kernel.
+        let _held = Dispositions::held(&[1, 2]);
         // A `SIG` prefix is not accepted, the bare name is, and the comparison is
         // case-insensitive -- so `trap - int` clears INT.
         let (_, out, _) = run_capturing("trap - SIGINT\necho $?\ntrap - INT\necho $?");
@@ -5314,8 +5444,152 @@ mod tests {
         assert_eq!((status, out.as_str()), (0, "status=1\n"));
     }
 
+    /// `trap ''` is the half of `trap` that leaves the shell, so it has to reach
+    /// the kernel; `trap 'action'` is the half that cannot be served without a
+    /// handler, so it asks for the default rather than pretending.
+    ///
+    /// Each `run_capturing` is a fresh SHELL in this one PROCESS, where a real
+    /// script would be a process of its own — so INT is put back between them,
+    /// which is what a new process would have found.
+    /// `signal_get` without the `Result`/`Option` scaffolding, and without
+    /// naming the module's items anywhere but here: the confinement tests refuse
+    /// an import out of `sys`, and repeating the whole path at every assertion
+    /// would drown them.
+    fn disposition(signo: u8) -> Option<crate::sys::Disposition> {
+        crate::sys::signal_get(signo).ok().flatten()
+    }
+
+    fn ignored(signo: u8) -> bool {
+        disposition(signo) == Some(crate::sys::Disposition::Ignore)
+    }
+
+    fn defaulted(signo: u8) -> bool {
+        disposition(signo) == Some(crate::sys::Disposition::Default)
+    }
+
+    /// Put a signal back to the default, which is what a fresh PROCESS would
+    /// have found. Each `run_capturing` is a new shell but not a new process.
+    fn reset(signo: u8) {
+        let _ = crate::sys::signal_set(signo, crate::sys::Disposition::Default);
+    }
+
+    #[test]
+    fn an_ignore_trap_reaches_the_kernel_and_a_catcher_asks_for_the_default() {
+        let _held = Dispositions::held(&[2]);
+
+        reset(2);
+        assert_eq!(run_capturing("trap '' INT").0, 0);
+        assert!(
+            ignored(2),
+            "`trap '' INT` did not reach the kernel, so no child would inherit it"
+        );
+
+        // A catcher needs a handler this shell has no trampoline for, so the
+        // disposition it asks for is the honest one: the shell dies on the
+        // signal rather than looking like an action is waiting to run.
+        reset(2);
+        assert_eq!(run_capturing("trap 'echo x' INT").0, 0);
+        assert!(defaulted(2));
+
+        // Within ONE shell the ignore can be taken back, because that shell
+        // already knows the process started with INT defaulted.
+        reset(2);
+        assert_eq!(run_capturing("trap '' INT\ntrap - INT\ntrap").1, "");
+        assert!(defaulted(2));
+
+        // KILL and STOP are recorded and reported like any other condition, and
+        // no syscall is made for either -- dash is silent about both too. The
+        // kernel side is asserted rather than just the table, since a table
+        // entry looks the same whether or not anything was issued.
+        assert_eq!(
+            run_capturing("trap '' KILL\ntrap\necho $?").1,
+            "trap -- '' KILL\n0\n"
+        );
+        assert!(crate::sys::signal_get(9).is_err(), "SIGKILL is not readable or writable");
+    }
+
+    /// SIGCHLD is recorded like any other condition and NEVER handed to the
+    /// kernel: `SIG_IGN` there asks for children to be auto-reaped, which takes
+    /// every command's exit status away from the shell. Asserted against the
+    /// kernel rather than against the output, because the table looks identical
+    /// either way -- and this was verified red, with each external reporting
+    /// "No child processes" instead of what it exited with.
+    ///
+    /// The criterion, stated so the next signal is checked against it rather
+    /// than against this list: a signal belongs here when `SIG_IGN` asks the
+    /// kernel for something OTHER than "discard it". SIGCHLD is the only one.
+    /// URG/WINCH/CONT default to being discarded anyway, so ignoring them asks
+    /// for what already happens; KILL/STOP are refused before the call.
+    #[test]
+    fn sigchld_is_recorded_but_never_handed_to_the_kernel() {
+        // The number is pinned in two places -- the exclusion and the name table
+        // `trap` decodes with -- and they have to agree, or the exclusion guards
+        // a signal nobody can name.
+        assert_eq!(super::decode_signal("CHLD"), Some(super::SIGCHLD));
+        let _held = Dispositions::held(&[super::SIGCHLD]);
+        assert_eq!(run_capturing("trap '' CHLD\ntrap").1, "trap -- '' CHLD\n");
+        assert!(defaulted(super::SIGCHLD), "`trap '' CHLD` would auto-reap every child");
+        assert_eq!(run_capturing("trap - CHLD\necho $?").1, "0\n");
+        assert!(defaulted(super::SIGCHLD));
+    }
+
+    /// POSIX: a signal ignored on entry cannot be trapped or reset. That is what
+    /// makes `nohup` stick, and it is asked of the kernel ONCE per signal —
+    /// after the first change the process can no longer be asked what it started
+    /// with. The trap is still RECORDED, as dash records it.
+    #[test]
+    fn a_signal_ignored_on_entry_is_not_the_shells_to_reset() {
+        let _held = Dispositions::held(&[15]);
+        // Standing in for the parent that ignored it before handing over.
+        let prev = crate::sys::signal_set(15, crate::sys::Disposition::Ignore);
+        assert_eq!(prev, Ok(Some(crate::sys::Disposition::Default)));
+
+        assert_eq!(run_capturing("trap - TERM\ntrap").1, "");
+        assert!(ignored(15), "`trap -` un-ignored it");
+
+        assert_eq!(
+            run_capturing("trap 'echo x' TERM\ntrap").1,
+            "trap -- 'echo x' TERM\n"
+        );
+        assert!(ignored(15), "a catcher un-ignored it");
+    }
+
+    /// A subshell is a separate PROCESS in every other shell, so its dispositions
+    /// cannot reach the parent. td-sh's are in-process clones, so the restore a
+    /// fork gives for free is explicit — and invisible in the subshell's output,
+    /// which is why it is asserted against the kernel.
+    #[test]
+    fn a_subshell_hands_back_the_dispositions_it_changed() {
+        let _held = Dispositions::held(&[2]);
+
+        for src in [
+            "( trap '' INT )",
+            "echo $(trap '' INT)",
+            ": | trap '' INT",
+            "( ( trap '' INT ) )",
+        ] {
+            reset(2);
+            run_capturing(src);
+            assert!(defaulted(2), "{src} leaked an ignore");
+        }
+
+        // ... and the other direction: a subshell that CLEARS an inherited
+        // ignore must hand the ignore back, not the default it left behind.
+        reset(2);
+        run_capturing("trap '' INT\n( trap - INT )");
+        assert!(ignored(2));
+
+        // The emulated `exec` clears the trap TABLE the way a real `execve`
+        // drops the image, but the undo is not a table entry -- it is the
+        // parent's disposition, and it still has to come back.
+        reset(2);
+        run_capturing("( trap '' INT; exec no_such_cmd_xyz )");
+        assert!(defaulted(2));
+    }
+
     #[test]
     fn a_subshell_starts_with_no_inherited_traps() {
+        let _held = Dispositions::held(&[2]);
         // POSIX 2.12: the parent's EXIT trap must not fire when a subshell, command
         // substitution or pipeline stage ends -- only once, for the shell itself.
         assert_eq!(
