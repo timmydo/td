@@ -4,7 +4,7 @@ use std::collections::VecDeque;
 use std::io;
 
 use crate::git::{self, now_unix, Branch, DefaultRemote, Git};
-use crate::land::{self, Outcome, Preview};
+use crate::land::{self, Mode, Outcome, Preview};
 use crate::term::{
     self, Frame, Key, Line, Style, Ui, CYAN, GREEN, MAGENTA, RED, YELLOW,
 };
@@ -23,7 +23,8 @@ enum Screen {
 
 /// A pending yes/no decision, shown as a bar across the bottom row.
 enum Prompt {
-    Land,
+    /// Land the reviewed branch the way the key that raised this asked for.
+    Land(Mode),
     Conflict,
     /// Delete a hand-picked branch (`D`), whose relation to anything landed is
     /// unknown. The targets are pinned when the prompt is raised, so confirming
@@ -204,12 +205,21 @@ impl App {
         }
         if let Some(prompt) = &self.prompt {
             let text = match prompt {
-                Prompt::Land => {
+                Prompt::Land(mode) => {
                     let name = self.reviewing.as_ref().map_or("?", |r| r.refname.as_str());
-                    format!(" land {name} into {} ?  [y] squash + commit   [n] cancel", self.base)
+                    // Which of the two keys raised this has to be readable on
+                    // the bar: they land the same work as different history.
+                    let what = match mode {
+                        Mode::Squash => "squash into one commit",
+                        Mode::Rebase => "replay its own commits",
+                    };
+                    format!(" land {name} into {} ?  [y] {what}   [n] cancel", self.base)
                 }
                 Prompt::Conflict => {
-                    " unfinished squash:  [l]/Esc leave it and quit   [d] discard (reset --hard HEAD)"
+                    // Names both, because `d` on a stopped replay aborts the
+                    // sequence too — and that moves HEAD, which "reset --hard
+                    // HEAD" alone reads as though it would not.
+                    " unfinished landing:  [l]/Esc leave it and quit   [d] discard (abort + reset --hard)"
                         .to_string()
                 }
                 Prompt::Delete { short, targets } => {
@@ -340,7 +350,7 @@ impl App {
         }
         self.footer(
             f,
-            " j/k scroll · space/b page · g/G top/end · p pager · a approve+land · q back",
+            " j/k scroll · space/b page · g/G top/end · p pager · s squash · r rebase · q back",
         );
     }
 
@@ -640,23 +650,27 @@ impl App {
             Key::Ctrl('c') => return Ok(Flow::Quit),
             Key::Char('?') => self.screen = Screen::Help,
             Key::Char('p') => self.open_pager(term)?,
-            Key::Char('a') => {
-                let empty = self.reviewing.as_ref().is_some_and(|r| r.empty);
-                if empty {
-                    self.note(
-                        "nothing to land: this branch changes nothing on top of the base",
-                        Style::fg(RED),
-                    );
-                } else {
-                    self.ask(Prompt::Land);
-                }
-            }
+            Key::Char('s') => self.ask_land(Mode::Squash),
+            Key::Char('r') => self.ask_land(Mode::Rebase),
             _ => {
                 let total = self.reviewing.as_ref().map_or(0, |r| r.lines.len());
                 self.scroll = scroll_by(self.scroll, key, total, rows);
             }
         }
         Ok(Flow::Continue)
+    }
+
+    /// Raise the landing confirmation, unless the pane has nothing to land —
+    /// which neither mode can do anything with.
+    fn ask_land(&mut self, mode: Mode) {
+        if self.reviewing.as_ref().is_some_and(|r| r.empty) {
+            self.note(
+                "nothing to land: this branch changes nothing on top of the base",
+                Style::fg(RED),
+            );
+        } else {
+            self.ask(Prompt::Land(mode));
+        }
     }
 
     /// Run one read batch. A confirmation must be answered by a keystroke typed
@@ -675,10 +689,10 @@ impl App {
 
     fn handle_prompt(&mut self, key: Key, term: &mut dyn Ui) -> io::Result<Flow> {
         match self.prompt {
-            Some(Prompt::Land) => match key {
+            Some(Prompt::Land(mode)) => match key {
                 Key::Char('y') | Key::Char('Y') => {
                     self.prompt = None;
-                    self.run_land(term)?;
+                    self.run_land(mode, term)?;
                 }
                 _ => {
                     self.prompt = None;
@@ -783,7 +797,7 @@ impl App {
         Ok(())
     }
 
-    fn run_land(&mut self, term: &mut dyn Ui) -> io::Result<()> {
+    fn run_land(&mut self, mode: Mode, term: &mut dyn Ui) -> io::Result<()> {
         let Some((refname, oid, base_oid)) = self
             .reviewing
             .as_ref()
@@ -791,9 +805,13 @@ impl App {
         else {
             return Ok(());
         };
-        self.log_title = format!("landing {refname} into {}", self.base);
+        self.log_title = format!("landing {refname} into {} ({})", self.base, mode.verb());
+        let doing = match mode {
+            Mode::Squash => "squashing",
+            Mode::Rebase => "replaying",
+        };
         self.log = vec![Line::new(
-            format!("squashing {refname} into {}…", self.base),
+            format!("{doing} {refname} onto {}…", self.base),
             Style::fg(YELLOW),
         )];
         self.log_scroll = 0;
@@ -801,7 +819,7 @@ impl App {
         self.redraw(term)?;
 
         let landing =
-            land::squash_land(&self.git, &self.base, &refname, Some(&oid), Some(&base_oid))?;
+            land::land(&self.git, &self.base, &refname, mode, Some(&oid), Some(&base_oid))?;
         self.log = landing.log;
         self.log_to_end(term);
         match landing.outcome {
@@ -1096,14 +1114,17 @@ fn help_lines() -> Vec<Line> {
             ("j / k, space / b", "scroll"),
             ("g / G", "top / end"),
             ("p", "open the same diff in your own pager"),
-            ("a", "approve: squash into the base and commit"),
+            ("s", "land it squashed: one commit on the base"),
+            ("r", "land it rebased: its own commits, replayed"),
             ("q", "back to the list"),
         ],
     );
     section(
         "landing",
         &[
-            ("a then y", "squash + commit, message from the branch's commits"),
+            ("s then y", "squash + commit, message from the branch's commits"),
+            ("r then y", "replay each commit onto the base tip, message,"),
+            ("", "author and all — all of them or none"),
             ("q, then p", "publish it: push the base (P = every remote)"),
             ("after the push", "the branches it published are deleted from the"),
             ("", "remotes it reached — no further confirmation"),
@@ -1112,7 +1133,9 @@ fn help_lines() -> Vec<Line> {
     for prose in [
         "The branch is pinned to the commit you reviewed: if the ref moves",
         "before you approve, the landing refuses rather than committing work",
-        "you have not seen. Landing only commits — the push is a separate,",
+        "you have not seen. Both modes hold what lands to the diff this pane",
+        "showed, and say so on the log when they could not. Landing only",
+        "commits — the push is a separate,",
         "deliberate step, and it publishes every local commit on the base.",
         "p and P push straight away: the keystroke is the decision, and the",
         "branches this session landed onto what it published go with it. A",
@@ -1250,8 +1273,8 @@ pub fn diff_style(line: &str) -> Style {
     }
 }
 
-/// Assemble the scrollable review buffer: what will be squashed, the message it
-/// will be committed with, then the diff itself.
+/// Assemble the scrollable review buffer: the commits a landing takes, the
+/// message a squash would commit them with, then the diff itself.
 fn preview_lines(branch: &Branch, p: &Preview, base: &str, now: i64) -> Vec<Line> {
     let mut out = Vec::new();
     out.push(heading("branch"));
@@ -1270,7 +1293,7 @@ fn preview_lines(branch: &Branch, p: &Preview, base: &str, now: i64) -> Vec<Line
     ));
     out.push(Line::blank());
 
-    out.push(heading(&format!("commits to squash ({})", p.commits.len())));
+    out.push(heading(&format!("commits ({})", p.commits.len())));
     if p.commits.is_empty() {
         out.push(Line::new("  (none)", Style::fg(RED)));
     }
@@ -1279,12 +1302,13 @@ fn preview_lines(branch: &Branch, p: &Preview, base: &str, now: i64) -> Vec<Line
     }
     out.push(Line::blank());
 
-    out.push(heading("squash commit message"));
+    out.push(heading("squash commit message (s)"));
     if p.message.trim().is_empty() {
         out.push(Line::new("  (empty)", Style::fg(RED)));
     }
-    // Not de-emphasised: this is the message the landing commits with, the one
-    // thing in the pane that must be read word for word.
+    // Not de-emphasised: this is the message a squash landing commits with, the
+    // one thing in the pane that must be read word for word. A replay (r)
+    // carries each commit's own message instead, listed above.
     for l in p.message.lines() {
         out.push(Line::plain(format!("  {l}")));
     }
@@ -1446,8 +1470,71 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    /// The two landing keys land the same work as different history, so the
+    /// confirmation bar has to say which one is being answered — and the key
+    /// they replaced must no longer land anything at all.
+    #[test]
+    #[ignore = "drives a real git repo; the sandbox gate has no git, the host preflight does"]
+    fn the_bar_says_which_landing_the_key_asked_for() {
+        let (root, work) = repo("land-bar");
+        let mut app = app_on(&work);
+        let mut ui = FakeUi::new();
+
+        app.handle(Key::Enter, &mut ui).unwrap();
+        app.handle(Key::Char('s'), &mut ui).unwrap();
+        app.redraw(&mut ui).unwrap();
+        let frame = ui.last().to_string();
+        assert!(frame.contains("squash into one commit"), "s must say so:\n{frame}");
+
+        app.handle(Key::Char('n'), &mut ui).unwrap();
+        app.handle(Key::Char('r'), &mut ui).unwrap();
+        app.redraw(&mut ui).unwrap();
+        let frame = ui.last().to_string();
+        assert!(frame.contains("replay its own commits"), "r must say so:\n{frame}");
+
+        app.handle(Key::Char('n'), &mut ui).unwrap();
+        app.handle(Key::Char('a'), &mut ui).unwrap();
+        assert!(app.prompt.is_none(), "the retired approve key must not raise a landing");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// `r` replays the branch's own commits: one sitting on the base tip is a
+    /// fast-forward, so what lands is that very commit. `s` builds a new one.
+    #[test]
+    #[ignore = "drives a real git repo; the sandbox gate has no git, the host preflight does"]
+    fn r_lands_the_branchs_own_commit_where_s_builds_a_new_one() {
+        for (tag, land, same) in [("land-r", Key::Char('r'), true), ("land-s", Key::Char('s'), false)]
+        {
+            let (root, work) = repo(tag);
+            let tip = git_in(&work, &["rev-parse", "refs/remotes/origin/work-0001-feature"])
+                .trim()
+                .to_string();
+            let before = git_in(&work, &["rev-parse", "main"]).trim().to_string();
+            let mut app = app_on(&work);
+            let mut ui = FakeUi::new();
+
+            for key in [Key::Enter, land, Key::Char('y')] {
+                app.handle(key, &mut ui).unwrap();
+            }
+
+            let landed = git_in(&work, &["rev-parse", "main"]).trim().to_string();
+            assert_ne!(landed, before, "nothing landed");
+            if same {
+                assert_eq!(landed, tip, "r must land the branch's own commit");
+            } else {
+                assert_ne!(landed, tip, "s must build a commit of its own");
+                assert_eq!(
+                    git_in(&work, &["rev-list", "--count", "main"]).trim(),
+                    "2",
+                    "s must land exactly one commit on the base"
+                );
+            }
+            let _ = std::fs::remove_dir_all(root);
+        }
+    }
+
     /// Landing commits and stops. Publishing is `p`, a separate deliberate
-    /// step — so `a y` must leave every remote exactly where it was, and must
+    /// step — so `s y` must leave every remote exactly where it was, and must
     /// not delete a branch whose work is still only local.
     #[test]
     #[ignore = "drives a real git repo; the sandbox gate has no git, the host preflight does"]
@@ -1458,7 +1545,7 @@ mod tests {
         let mut app = app_on(&work);
         let mut ui = FakeUi::new();
 
-        for key in [Key::Enter, Key::Char('a'), Key::Char('y')] {
+        for key in [Key::Enter, Key::Char('s'), Key::Char('y')] {
             app.handle(key, &mut ui).unwrap();
         }
 
@@ -1489,7 +1576,7 @@ mod tests {
         let mut app = app_on(&work);
         let mut ui = FakeUi::new();
 
-        for key in [Key::Enter, Key::Char('a'), Key::Char('y'), Key::Char('q')] {
+        for key in [Key::Enter, Key::Char('s'), Key::Char('y'), Key::Char('q')] {
             app.handle(key, &mut ui).unwrap();
         }
         let landed = git_in(&work, &["rev-parse", "main"]).trim().to_string();
@@ -1518,7 +1605,7 @@ mod tests {
         let mut app = app_on(&work);
         let mut ui = FakeUi::new();
 
-        for key in [Key::Enter, Key::Char('a'), Key::Char('y'), Key::Char('q')] {
+        for key in [Key::Enter, Key::Char('s'), Key::Char('y'), Key::Char('q')] {
             app.handle(key, &mut ui).unwrap();
         }
         let landed = git_in(&work, &["rev-parse", "main"]).trim().to_string();
@@ -1547,7 +1634,7 @@ mod tests {
         let mut app = app_on(&work);
         let mut ui = FakeUi::new();
 
-        for key in [Key::Enter, Key::Char('a'), Key::Char('y'), Key::Char('q')] {
+        for key in [Key::Enter, Key::Char('s'), Key::Char('y'), Key::Char('q')] {
             app.handle(key, &mut ui).unwrap();
         }
         let landing = git_in(&work, &["rev-parse", "main"]).trim().to_string();
@@ -1599,7 +1686,7 @@ mod tests {
         let mut app = app_on(&work);
         let mut ui = FakeUi::new();
 
-        for key in [Key::Enter, Key::Char('a'), Key::Char('y'), Key::Char('q'), Key::Char('p')] {
+        for key in [Key::Enter, Key::Char('s'), Key::Char('y'), Key::Char('q'), Key::Char('p')] {
             app.handle(key, &mut ui).unwrap();
         }
 
@@ -1657,7 +1744,7 @@ mod tests {
         let mut app = app_on(&work);
         let mut ui = FakeUi::new();
 
-        for key in [Key::Enter, Key::Char('a'), Key::Char('y'), Key::Char('q')] {
+        for key in [Key::Enter, Key::Char('s'), Key::Char('y'), Key::Char('q')] {
             app.handle(key, &mut ui).unwrap();
         }
         // The branch moves on the remote behind our tracking ref: the delete's
@@ -1685,7 +1772,7 @@ mod tests {
         let mut app = app_on(&work);
         let mut ui = FakeUi::new();
 
-        for key in [Key::Enter, Key::Char('a'), Key::Char('y'), Key::Char('q'), Key::Char('P')] {
+        for key in [Key::Enter, Key::Char('s'), Key::Char('y'), Key::Char('q'), Key::Char('P')] {
             app.handle(key, &mut ui).unwrap();
         }
 
@@ -1756,7 +1843,7 @@ mod tests {
                 .iter()
                 .position(|&i| app.branches.get(i).is_some_and(|b| b.refname.ends_with(name)))
                 .unwrap();
-            for key in [Key::Enter, Key::Char('a'), Key::Char('y'), Key::Char('q')] {
+            for key in [Key::Enter, Key::Char('s'), Key::Char('y'), Key::Char('q')] {
                 app.handle(key, &mut ui).unwrap();
             }
         }
@@ -1801,7 +1888,7 @@ mod tests {
         let mut app = app_on(&work);
         let mut ui = FakeUi::new();
 
-        for key in [Key::Enter, Key::Char('a'), Key::Char('y'), Key::Char('q'), Key::Char('p')] {
+        for key in [Key::Enter, Key::Char('s'), Key::Char('y'), Key::Char('q'), Key::Char('p')] {
             app.handle(key, &mut ui).unwrap();
         }
 
@@ -1836,7 +1923,7 @@ mod tests {
         let mut app = app_on(&work);
         let mut ui = FakeUi::new();
 
-        for key in [Key::Enter, Key::Char('a'), Key::Char('y'), Key::Char('q')] {
+        for key in [Key::Enter, Key::Char('s'), Key::Char('y'), Key::Char('q')] {
             app.handle(key, &mut ui).unwrap();
         }
         // Someone pushes to the branch after it was reviewed, and we see it:

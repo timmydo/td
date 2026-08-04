@@ -239,6 +239,434 @@ fn lands_squash_commit_and_pushes_every_pushable_remote() -> Res<()> {
     Ok(())
 }
 
+/// `r` in the pane, `--rebase` here: the same work as the branch's own history
+/// rather than one commit. A branch already sitting on the base tip replays as
+/// a fast-forward, so what lands is the very commits that were reviewed —
+/// messages, authors and object ids alike.
+#[test]
+fn a_replay_lands_the_branchs_own_commits_rather_than_one() -> Res<()> {
+    let s = scenario("replay")?;
+    let tip = git(&s.work, &["rev-parse", "refs/remotes/origin/work-0001-feature"])?
+        .trim()
+        .to_string();
+    let (ok, output) = review(
+        &s.work,
+        &["--land", "origin/work-0001-feature", "--rebase", "--yes", "--push"],
+    )?;
+    assert!(ok, "the replay should succeed:\n{output}");
+
+    // Two commits on top of the base, not one squash carrying both.
+    let count = git(&s.work, &["rev-list", "--count", "main"])?.trim().to_string();
+    assert_eq!(count, "3", "expected the branch's two commits on the base\n{output}");
+    let head = git(&s.work, &["rev-parse", "main"])?.trim().to_string();
+    assert_eq!(head, tip, "a branch on the base tip must land unrewritten\n{output}");
+
+    // Each commit keeps its own subject, body and author date, oldest first.
+    let subjects = git(&s.work, &["log", "--reverse", "--format=%s", "-2", "main"])?;
+    assert_eq!(
+        subjects.lines().collect::<Vec<_>>(),
+        vec!["feature: first step", "feature: second step"],
+        "output: {output}"
+    );
+    let bodies = git(&s.work, &["log", "--format=%b", "-2", "main"])?;
+    assert!(bodies.contains("rationale one"), "bodies: {bodies}");
+    assert!(bodies.contains("rationale two"), "bodies: {bodies}");
+    let dates = git(&s.work, &["log", "--reverse", "--format=%ad", "--date=short", "-2", "main"])?;
+    assert_eq!(dates.lines().collect::<Vec<_>>(), vec!["2024-01-02", "2024-01-03"]);
+
+    assert!(s.work.join("a.txt").exists());
+    assert!(s.work.join("b.txt").exists());
+    for remote in [&s.origin, &s.backup] {
+        let there = git(remote, &["rev-parse", "main"])?.trim().to_string();
+        assert_eq!(there, head, "{} should carry the replayed commits", remote.display());
+    }
+    assert_eq!(git(&s.work, &["status", "--porcelain"])?.trim(), "");
+    Ok(())
+}
+
+/// A base that has moved on is a real replay rather than a fast-forward: every
+/// commit is rewritten onto the new tip, and what they add up to has to be the
+/// merge result the review pane diffed — the same tree the squash would stage.
+#[test]
+fn a_replay_onto_a_moved_base_keeps_every_commit_and_the_reviewed_tree() -> Res<()> {
+    let s = scenario("replay-moved")?;
+    commit(&s.work, "c.txt", "gamma\n", "base: unrelated work", "2024-01-04T00:00:00 +0000")?;
+    let base = git(&s.work, &["rev-parse", "main"])?.trim().to_string();
+    let tip = git(&s.work, &["rev-parse", "refs/remotes/origin/work-0001-feature"])?
+        .trim()
+        .to_string();
+    let reviewed =
+        git(&s.work, &["merge-tree", "--write-tree", &base, &tip])?.trim().to_string();
+
+    let (ok, output) = review(&s.work, &["--land", "origin/work-0001-feature", "--rebase", "--yes"])?;
+    assert!(ok, "the replay should succeed:\n{output}");
+
+    let gained = git(&s.work, &["rev-list", "--count", &format!("{base}..main")])?;
+    assert_eq!(gained.trim(), "2", "both commits must land\n{output}");
+    assert_eq!(
+        git(&s.work, &["rev-parse", "main^{tree}"])?.trim(),
+        reviewed,
+        "the replay must add up to the tree the pane diffed\n{output}"
+    );
+    // Rewritten onto the new tip, so not the branch's own commits any more.
+    assert_ne!(git(&s.work, &["rev-parse", "main"])?.trim(), tip);
+    assert_eq!(git(&s.work, &["status", "--porcelain"])?.trim(), "");
+    Ok(())
+}
+
+/// cherry-pick drops a commit whose patch the base already carries — right, but
+/// it means the replay lands fewer commits than the pane listed, which must be
+/// said out loud rather than read as a miscount (or reported as one).
+#[test]
+fn a_replay_skips_a_commit_the_base_already_carries() -> Res<()> {
+    let s = scenario("replay-skip")?;
+    let first = git(&s.work, &["rev-parse", "refs/remotes/origin/work-0001-feature~1"])?
+        .trim()
+        .to_string();
+    git(&s.work, &["cherry-pick", &first])?;
+    let base = git(&s.work, &["rev-parse", "main"])?.trim().to_string();
+
+    let (ok, output) = review(&s.work, &["--land", "origin/work-0001-feature", "--rebase", "--yes"])?;
+    assert!(ok, "the rest of the branch must still land:\n{output}");
+    let gained = git(&s.work, &["rev-list", "--count", &format!("{base}..main")])?;
+    assert_eq!(gained.trim(), "1", "the already-landed commit must not land twice\n{output}");
+    assert_eq!(
+        git(&s.work, &["log", "-1", "--format=%s", "main"])?.trim(),
+        "feature: second step"
+    );
+    assert!(output.contains("are already on main"), "the skip must be reported:\n{output}");
+    assert!(output.contains("replayed 1 commit"), "output: {output}");
+    Ok(())
+}
+
+/// The property that makes `r` safe to press: a replay that stops partway has
+/// already committed everything before the commit that stopped it, and unlike a
+/// staged squash those commits are one `p` from being published. So the base
+/// goes back to where it started, with no sequencer state left to finish.
+#[test]
+fn a_replay_that_stops_partway_leaves_the_base_where_it_was() -> Res<()> {
+    let s = scenario("replay-conflict")?;
+    let root = git(&s.work, &["rev-parse", "main"])?.trim().to_string();
+
+    // A branch whose first commit replays cleanly and whose second does not,
+    // while its two ends still merge cleanly onto the base — so the pane has a
+    // landing tree to show, and the stop can only be found partway through,
+    // with a commit already on the base by then.
+    git(&s.work, &["checkout", "-b", "work-0002-mid", &root])?;
+    commit(&s.work, "a.txt", "alpha\n", "mid: first step", "2024-01-05T00:00:00 +0000")?;
+    commit(&s.work, "README", "sideways\n", "mid: second step", "2024-01-06T00:00:00 +0000")?;
+    commit(&s.work, "README", "moved\n", "mid: third step", "2024-01-07T00:00:00 +0000")?;
+    git(&s.work, &["checkout", "main"])?;
+    commit(&s.work, "README", "moved\n", "base: moves README too", "2024-01-08T00:00:00 +0000")?;
+    let before = git(&s.work, &["rev-parse", "main"])?.trim().to_string();
+
+    let (ok, output) = review(&s.work, &["--land", "work-0002-mid", "--rebase", "--yes"])?;
+    assert!(!ok, "a stopped replay must not report success:\n{output}");
+    assert_eq!(
+        git(&s.work, &["rev-parse", "main"])?.trim(),
+        before,
+        "the commits applied before the stop were left on the base:\n{output}"
+    );
+    assert_eq!(
+        git(&s.work, &["status", "--porcelain"])?.trim(),
+        "",
+        "the stopped replay was left in the work tree:\n{output}"
+    );
+    let dir = git(&s.work, &["rev-parse", "--absolute-git-dir"])?.trim().to_string();
+    assert!(
+        !Path::new(&dir).join("sequencer").exists(),
+        "sequencer state was left to finish by hand:\n{output}"
+    );
+    assert!(output.contains("nothing was applied"), "output: {output}");
+    Ok(())
+}
+
+/// A commit that is NOT ours arriving on the base mid-replay. The count no
+/// longer matches what was picked, so `head_before..HEAD` is no longer ours
+/// alone — and a rollback would take that commit with it. The landing must
+/// leave everything standing, say so, and warn that `p` would publish it: the
+/// tree is clean, so no bail-out prompt will offer to undo anything.
+#[test]
+fn a_replay_that_gained_a_commit_it_did_not_make_is_not_rolled_back() -> Res<()> {
+    let s = scenario("replay-foreign")?;
+    // Moved, so the replay makes commits of its own: a fast-forward creates
+    // none, and post-commit would never fire.
+    commit(&s.work, "c.txt", "gamma\n", "base: unrelated work", "2024-01-04T00:00:00 +0000")?;
+    let dir = git(&s.work, &["rev-parse", "--absolute-git-dir"])?.trim().to_string();
+    let hooks = Path::new(&dir).join("hooks");
+    fs::create_dir_all(&hooks)?;
+    // cherry-pick runs post-commit for each commit it makes, so this fires
+    // inside the sequencer. Plumbing only: the index and work tree belong to
+    // the sequencer while it runs, and neither is needed to add a commit.
+    let hook = hooks.join("post-commit");
+    fs::write(
+        &hook,
+        "#!/bin/sh\n\
+         d=$(git rev-parse --git-dir)\n\
+         [ -e \"$d/intruded\" ] && exit 0\n\
+         : > \"$d/intruded\"\n\
+         t=$(git rev-parse 'HEAD^{tree}')\n\
+         c=$(git commit-tree \"$t\" -p HEAD -m 'other: landed mid-replay')\n\
+         git update-ref refs/heads/main \"$c\"\n",
+    )?;
+    let mut perms = fs::metadata(&hook)?.permissions();
+    std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
+    fs::set_permissions(&hook, perms)?;
+
+    let (ok, output) = review(&s.work, &["--land", "origin/work-0001-feature", "--rebase", "--yes"])?;
+    assert!(!ok, "a base that gained a foreign commit must not report success:\n{output}");
+    assert!(output.contains("left standing"), "output: {output}");
+    assert!(output.contains("gained 3"), "the count must be named:\n{output}");
+    // The whole point: the intruder is still there.
+    let log = git(&s.work, &["log", "--format=%s", "main"])?;
+    assert!(
+        log.contains("other: landed mid-replay"),
+        "the rollback destroyed a commit it did not make:\n{log}"
+    );
+    // And the operator is told that `p` would publish what was just refused.
+    assert!(output.contains("WILL PUBLISH"), "output: {output}");
+    Ok(())
+}
+
+/// The replay landed exactly the commits it picked, and their total is still
+/// not the merge result the pane diffed. Nothing else is on the base, so these
+/// commits ARE ours to remove — and unlike the case above, they must be.
+#[test]
+fn a_replay_whose_tree_is_not_the_reviewed_one_is_rolled_back() -> Res<()> {
+    let s = scenario("replay-divergent")?;
+    commit(&s.work, "c.txt", "gamma\n", "base: unrelated work", "2024-01-04T00:00:00 +0000")?;
+    let before = git(&s.work, &["rev-parse", "main"])?.trim().to_string();
+    let dir = git(&s.work, &["rev-parse", "--absolute-git-dir"])?.trim().to_string();
+    let hooks = Path::new(&dir).join("hooks");
+    fs::create_dir_all(&hooks)?;
+    // Rewrites the commit the sequencer just made into one carrying an extra
+    // file, keeping its parent — so the COUNT still matches what was picked and
+    // only the tree gives it away. A private index, because the sequencer owns
+    // the real one; no work-tree writes at all. On the LAST of the two picks:
+    // done earlier, the rewritten HEAD no longer matches the work tree and the
+    // next pick refuses instead.
+    let hook = hooks.join("post-commit");
+    fs::write(
+        &hook,
+        "#!/bin/sh\n\
+         d=$(git rev-parse --git-dir)\n\
+         n=$(cat \"$d/picks\" 2>/dev/null || echo 0)\n\
+         n=$((n+1)); echo \"$n\" > \"$d/picks\"\n\
+         [ \"$n\" -lt 2 ] && exit 0\n\
+         GIT_INDEX_FILE=\"$d/tmp-index\"; export GIT_INDEX_FILE\n\
+         git read-tree HEAD\n\
+         b=$(printf sneaked | git hash-object -w --stdin)\n\
+         git update-index --add --cacheinfo 100644,\"$b\",sneaky.txt\n\
+         t=$(git write-tree)\n\
+         c=$(git commit-tree \"$t\" -p HEAD^ -m \"$(git log -1 --format=%s)\")\n\
+         git update-ref refs/heads/main \"$c\"\n",
+    )?;
+    let mut perms = fs::metadata(&hook)?.permissions();
+    std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
+    fs::set_permissions(&hook, perms)?;
+
+    let (ok, output) = review(&s.work, &["--land", "origin/work-0001-feature", "--rebase", "--yes"])?;
+    assert!(!ok, "a tree that is not the reviewed one must not land:\n{output}");
+    assert!(output.contains("is not the merge result"), "output: {output}");
+    assert_eq!(
+        git(&s.work, &["rev-parse", "main"])?.trim(),
+        before,
+        "the unreviewed commits were left on the base:\n{output}"
+    );
+    assert!(output.contains("rolled back"), "output: {output}");
+    assert_eq!(git(&s.work, &["status", "--porcelain"])?.trim(), "");
+    Ok(())
+}
+
+/// `r` promises the branch's own commits, and a deliberately empty one is one
+/// of them — without `--allow-empty` the sequencer stops on it and the whole
+/// landing aborts. A commit that BECOMES empty against this base still stops,
+/// which is the case that must not be quietly dropped.
+#[test]
+fn a_replay_keeps_a_commit_that_was_empty_to_begin_with() -> Res<()> {
+    let s = scenario("replay-empty")?;
+    let root = git(&s.work, &["rev-parse", "main"])?.trim().to_string();
+
+    git(&s.work, &["checkout", "-b", "work-0004-empty", &root])?;
+    commit(&s.work, "a.txt", "alpha\n", "empty: first step", "2024-01-05T00:00:00 +0000")?;
+    git_env(
+        &s.work,
+        &["commit", "--allow-empty", "-m", "empty: a marker commit"],
+        &[
+            ("GIT_AUTHOR_DATE", "2024-01-06T00:00:00 +0000"),
+            ("GIT_COMMITTER_DATE", "2024-01-06T00:00:00 +0000"),
+        ],
+    )?;
+    commit(&s.work, "b2.txt", "beta\n", "empty: third step", "2024-01-07T00:00:00 +0000")?;
+    git(&s.work, &["checkout", "main"])?;
+    // Moved, so this is a real replay rather than a fast-forward.
+    commit(&s.work, "c.txt", "gamma\n", "base: unrelated work", "2024-01-08T00:00:00 +0000")?;
+    let base = git(&s.work, &["rev-parse", "main"])?.trim().to_string();
+
+    let (ok, output) = review(&s.work, &["--land", "work-0004-empty", "--rebase", "--yes"])?;
+    assert!(ok, "an empty commit must not stop the replay:\n{output}");
+    let gained = git(&s.work, &["rev-list", "--count", &format!("{base}..main")])?;
+    assert_eq!(gained.trim(), "3", "every commit must land, empty one included\n{output}");
+    let subjects = git(&s.work, &["log", "--reverse", "--format=%s", "-3", "main"])?;
+    assert_eq!(
+        subjects.lines().collect::<Vec<_>>(),
+        vec!["empty: first step", "empty: a marker commit", "empty: third step"]
+    );
+    Ok(())
+}
+
+/// A cherry-pick that stopped because a commit replayed to NOTHING leaves a
+/// clean work tree, so the dirty-tree guard does not see it — but whoever
+/// aborts that sequence rewinds the base to where IT began, past commits this
+/// run never made. So a landing refuses to start on one at all, in either mode:
+/// the alternative is a recovery step that destroys work and then reports the
+/// commits it removed as left standing.
+#[test]
+fn a_landing_refuses_to_start_on_someone_elses_stopped_replay() -> Res<()> {
+    let s = scenario("inherited-stop")?;
+    let root = git(&s.work, &["rev-parse", "main"])?.trim().to_string();
+
+    // A branch whose one commit is already on the base by patch: replaying it
+    // lands nothing, which stops the sequencer with the tree clean.
+    git(&s.work, &["checkout", "-b", "work-0003-dup", &root])?;
+    commit(&s.work, "c.txt", "gamma\n", "dup: a step", "2024-01-05T00:00:00 +0000")?;
+    let dup = git(&s.work, &["rev-parse", "HEAD"])?.trim().to_string();
+    git(&s.work, &["checkout", "main"])?;
+    git(&s.work, &["cherry-pick", &dup])?;
+    // A commit of the base's own, the one an inherited abort would destroy.
+    commit(&s.work, "d.txt", "delta\n", "base: later work", "2024-01-06T00:00:00 +0000")?;
+    let before = git(&s.work, &["rev-parse", "main"])?.trim().to_string();
+
+    // Someone leaves a stopped sequence behind by hand.
+    let stopped = Command::new("git")
+        .current_dir(&s.work)
+        .args(["cherry-pick", &dup])
+        .envs(CLEAN_ENV)
+        .output()?;
+    assert!(!stopped.status.success(), "the fixture must leave a stopped cherry-pick");
+    assert_eq!(
+        git(&s.work, &["status", "--porcelain"])?.trim(),
+        "",
+        "the fixture's stop must leave a CLEAN tree, or it proves nothing"
+    );
+
+    for args in [
+        vec!["--land", "origin/work-0001-feature", "--rebase", "--yes"],
+        vec!["--land", "origin/work-0001-feature", "--yes"],
+    ] {
+        let (ok, output) = review(&s.work, &args)?;
+        assert!(!ok, "{args:?} must refuse on an inherited sequence:\n{output}");
+        assert!(output.contains("already in progress"), "output: {output}");
+        assert_eq!(
+            git(&s.work, &["rev-parse", "main"])?.trim(),
+            before,
+            "{args:?} rewound the base past commits it never made:\n{output}"
+        );
+    }
+    Ok(())
+}
+
+/// A branch that does not merge cleanly has no landing tree for the pane to
+/// show, so it showed the BRANCH's own diff and said so. A squash cannot land
+/// blind from there — the merge conflicts too — but a replay's successive
+/// merges can resolve where the one-shot merge does not, and would commit work
+/// whose diff nobody has seen. So `r` refuses before the sequencer starts.
+#[test]
+fn a_replay_refuses_a_branch_that_does_not_merge_cleanly() -> Res<()> {
+    let s = scenario("replay-unmergeable")?;
+    commit(&s.work, "b.txt", "conflicting\n", "base: touches b.txt", "2024-01-04T00:00:00 +0000")?;
+    let before = git(&s.work, &["rev-parse", "main"])?.trim().to_string();
+
+    let (ok, output) = review(&s.work, &["--land", "origin/work-0001-feature", "--rebase", "--yes"])?;
+    assert!(!ok, "an unmergeable branch must not replay:\n{output}");
+    assert!(output.contains("no reviewed tree to hold a replay to"), "output: {output}");
+    assert_eq!(git(&s.work, &["rev-parse", "main"])?.trim(), before);
+    assert_eq!(git(&s.work, &["status", "--porcelain"])?.trim(), "");
+
+    // The squash path reaches the conflict instead, as it always did.
+    let (ok, output) = review(&s.work, &["--land", "origin/work-0001-feature", "--yes"])?;
+    assert!(!ok, "{output}");
+    assert!(output.contains("conflicts"), "output: {output}");
+    Ok(())
+}
+
+/// cherry-pick replays one parent's changes and a merge commit has two, with
+/// nothing in the range saying which. Refused rather than guessed at.
+#[test]
+fn a_replay_refuses_a_branch_that_carries_a_merge() -> Res<()> {
+    let s = scenario("replay-merge")?;
+    git(&s.work, &["checkout", "-b", "side", "main"])?;
+    commit(&s.work, "c.txt", "gamma\n", "side: a commit", "2024-01-04T00:00:00 +0000")?;
+    git(&s.work, &["checkout", "-B", "merged", "refs/remotes/origin/work-0001-feature"])?;
+    git(&s.work, &["merge", "--no-ff", "-m", "feature: merge side", "side"])?;
+    git(&s.work, &["checkout", "main"])?;
+    let before = git(&s.work, &["rev-parse", "main"])?.trim().to_string();
+
+    let (ok, output) = review(&s.work, &["--land", "merged", "--rebase", "--yes"])?;
+    assert!(!ok, "a branch with a merge must not replay:\n{output}");
+    assert!(output.contains("merge commit"), "output: {output}");
+    assert!(output.contains("squash it instead"), "output: {output}");
+    assert_eq!(git(&s.work, &["rev-parse", "main"])?.trim(), before);
+    // And the same branch still lands the other way.
+    let (ok, output) = review(&s.work, &["--land", "merged", "--yes"])?;
+    assert!(ok, "squashing a merged branch must still work:\n{output}");
+    Ok(())
+}
+
+/// The squash path learns this from an empty index after the merge. A replay
+/// has to know it before the sequencer starts: a commit that replays to nothing
+/// stops the sequence rather than being dropped from it.
+#[test]
+fn a_replay_refuses_a_branch_that_changes_nothing() -> Res<()> {
+    let s = scenario("replay-noop")?;
+    let (ok, output) = review(&s.work, &["--land", "origin/work-0001-feature", "--yes"])?;
+    assert!(ok, "first landing should succeed:\n{output}");
+    let before = git(&s.work, &["rev-parse", "main"])?.trim().to_string();
+
+    let (ok, output) = review(&s.work, &["--land", "origin/work-0001-feature", "--rebase", "--yes"])?;
+    assert!(!ok, "an already-landed branch must not replay:\n{output}");
+    assert!(output.contains("nothing to replay"), "output: {output}");
+    assert_eq!(git(&s.work, &["rev-parse", "main"])?.trim(), before);
+    assert_eq!(git(&s.work, &["status", "--porcelain"])?.trim(), "");
+    Ok(())
+}
+
+/// Both modes are pinned to the commit that was reviewed, and to the base it was
+/// reviewed against.
+#[test]
+fn a_replay_refuses_when_either_side_moved_since_the_review() -> Res<()> {
+    let s = scenario("replay-moved-pins")?;
+    let tip = git(&s.work, &["rev-parse", "refs/remotes/origin/work-0001-feature"])?
+        .trim()
+        .to_string();
+    let before = git(&s.work, &["rev-parse", "main"])?.trim().to_string();
+
+    let (ok, output) = review(
+        &s.work,
+        &["--land", "origin/work-0001-feature", "--rebase", "--yes", "--expect", "deadbeef"],
+    )?;
+    assert!(!ok, "a branch that moved must not replay:\n{output}");
+    assert!(output.contains("moved since it was reviewed"), "output: {output}");
+
+    let (ok, output) = review(
+        &s.work,
+        &[
+            "--land",
+            "origin/work-0001-feature",
+            "--rebase",
+            "--yes",
+            "--expect",
+            &tip,
+            "--expect-base",
+            "deadbeef",
+        ],
+    )?;
+    assert!(!ok, "a base that moved must not be replayed onto:\n{output}");
+    assert!(output.contains("the rebase would differ"), "output: {output}");
+    assert_eq!(git(&s.work, &["rev-parse", "main"])?.trim(), before);
+    Ok(())
+}
+
 #[test]
 fn refuses_to_land_with_a_dirty_work_tree() -> Res<()> {
     let s = scenario("dirty")?;
@@ -774,6 +1202,7 @@ fn flag_combinations_that_do_nothing_are_rejected() -> Res<()> {
     for (args, want) in [
         (vec!["--list", "--land", "origin/work-0001-feature", "--yes"], "mutually exclusive"),
         (vec!["--push"], "--push is only meaningful with --land"),
+        (vec!["--rebase"], "--rebase is only meaningful with --land"),
         (vec!["--yes"], "--yes is only meaningful with --land or --delete"),
         (vec!["--expect", "deadbeef"], "--expect/--expect-base are only meaningful with --land"),
         (vec!["--list", "--delete", "origin/work-0001-feature", "--yes"], "mutually exclusive"),

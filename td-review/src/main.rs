@@ -1,7 +1,8 @@
 //! td-review — the integrator's branch review and landing TUI. It is
-//! `git squash-in` then `git commit`, then a separate `p`/`P` push, driven with
-//! plumbing so each step's outcome is visible and testable. The non-interactive
-//! modes exist for scripting and for the integration test.
+//! `git squash-in` then `git commit` (`s`), or the branch's own commits replayed
+//! onto the base (`r`), then a separate `p`/`P` push, driven with plumbing so
+//! each step's outcome is visible and testable. The non-interactive modes exist
+//! for scripting and for the integration test.
 #![forbid(unsafe_code)]
 
 mod app;
@@ -29,7 +30,9 @@ options:
   -b, --base <name>   branch to review against and land into (default: main)
       --list          print the branch table and exit (no TUI)
       --preview <br>  print what landing <br> would stage, and exit
-      --land <branch> land <branch> non-interactively; needs --yes
+      --land <branch> land <branch> non-interactively, squashed; needs --yes
+      --rebase        with --land, replay the branch's own commits onto the
+                      base instead of squashing them into one
       --push          with --land, also push the base to every remote (`P`;
                       the TUI's `p` pushes to the base's remote alone)
       --expect <oid>  with --land, require the branch to still be at <oid>
@@ -44,7 +47,7 @@ keys (TUI):
   j/k move   enter review   r reload   / filter   D delete   ? help   q quit
   f fetch the base's remote   F fetch every remote
   p push the base to its remote   P push the base to every remote
-  in review: j/k or space/b scroll, p pager, a approve + land
+  in review: j/k or space/b scroll, p pager, s squash + land, r rebase + land
   landing commits only; p publishes it afterwards, unconfirmed, and
   deletes the branches it published from the remotes it reached
 ";
@@ -55,6 +58,7 @@ struct Args {
     list: bool,
     preview: Option<String>,
     land: Option<String>,
+    rebase: bool,
     push: bool,
     expect: Option<String>,
     expect_base: Option<String>,
@@ -70,6 +74,7 @@ fn parse_args() -> Result<Option<Args>, String> {
         list: false,
         preview: None,
         land: None,
+        rebase: false,
         push: false,
         expect: None,
         expect_base: None,
@@ -104,6 +109,10 @@ fn parse_args() -> Result<Option<Args>, String> {
             }
             "--preview" => args.preview = Some(value("a branch name")?),
             "--land" => args.land = Some(value("a branch name")?),
+            "--rebase" => {
+                bare()?;
+                args.rebase = true
+            }
             "--push" => {
                 bare()?;
                 args.push = true
@@ -169,6 +178,9 @@ fn run(args: Args) -> io::Result<ExitCode> {
     }
     if args.land.is_none() && args.push {
         return Err(io::Error::other("--push is only meaningful with --land"));
+    }
+    if args.land.is_none() && args.rebase {
+        return Err(io::Error::other("--rebase is only meaningful with --land"));
     }
     if args.land.is_none() && (args.expect.is_some() || args.expect_base.is_some()) {
         return Err(io::Error::other("--expect/--expect-base are only meaningful with --land"));
@@ -284,13 +296,15 @@ fn land_headless(git: &Git, base: &str, branch: &str, args: &Args) -> io::Result
             "--land rewrites the base branch; re-run with --yes to confirm",
         ));
     }
-    // Captured before the squash: the delete filter compares remotes against the
-    // branch tip that was landed, not the new commit on the base.
+    // Captured before the landing: the delete filter compares remotes against
+    // the branch tip that was landed, not the new commit on the base.
     let landed_oid = git.branch_oid(branch).ok();
-    let landing = land::squash_land(
+    let mode = if args.rebase { land::Mode::Rebase } else { land::Mode::Squash };
+    let landing = land::land(
         git,
         base,
         branch,
+        mode,
         args.expect.as_deref(),
         args.expect_base.as_deref(),
     )?;

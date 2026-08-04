@@ -1,11 +1,30 @@
-//! Preview a branch against the base, squash it in, commit it with the
-//! message its own commits carry, and push the result to every remote.
+//! Preview a branch against the base and take it onto the base — squashed into
+//! one commit carrying the messages its own commits do, or those commits
+//! replayed — then push the result to every remote.
 
 use std::fs;
 use std::io;
 
 use crate::git::{Git, HeadClaim, MergeResult, NO_PUSH};
 use crate::term::{Line, Style, CYAN, GREEN, RED, YELLOW};
+
+/// How a branch is taken onto the base.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Mode {
+    /// One commit carrying the whole branch, its messages concatenated.
+    Squash,
+    /// The branch's own commits, replayed onto the base tip.
+    Rebase,
+}
+
+impl Mode {
+    pub fn verb(self) -> &'static str {
+        match self {
+            Mode::Squash => "squash",
+            Mode::Rebase => "rebase",
+        }
+    }
+}
 
 /// What the landing did. Anything other than `Committed` left HEAD unmoved.
 #[derive(Debug, PartialEq, Eq)]
@@ -104,8 +123,9 @@ pub fn preview(git: &Git, base: &str, branch: &str) -> io::Result<Preview> {
             git.run_ok(&["diff", "--stat", &range, "--"])?,
             git.run_ok(&["diff", &range, "--"])?,
             Some(format!(
-                "{branch} does not merge cleanly onto {base} — landing will stop at the \
-                 conflict. Shown below is the BRANCH's own diff, not the landing."
+                "{branch} does not merge cleanly onto {base} — a squash (s) will stop at \
+                 the conflict and a replay (r) refuses, having no reviewed tree to hold \
+                 itself to. Shown below is the BRANCH's own diff, not the landing."
             )),
         ),
         MergeResult::Unavailable(why) => (
@@ -113,17 +133,42 @@ pub fn preview(git: &Git, base: &str, branch: &str) -> io::Result<Preview> {
             git.run_ok(&["diff", &range, "--"])?,
             Some(format!(
                 "the merge result could not be computed ({why}) — shown below is the \
-                 BRANCH's own diff, which can differ from what the squash stages"
+                 BRANCH's own diff, which can differ from what a landing takes"
             )),
         ),
     };
     Ok(Preview { branch_oid, base_oid, merge_base, commits, message, stat, diff, note })
 }
 
-/// Refuse to land unless the work tree is clean and the base branch is checked
-/// out — the two guards `git squash-in` opens with, plus the branch check the
-/// integrator otherwise makes by eye.
+/// True while the sequencer holds a stopped cherry-pick or revert.
+///
+/// A replay stopped by a CONFLICT leaves a dirty tree, which `preflight` already
+/// refuses on. One stopped by a commit that replayed to nothing does not: the
+/// tree is clean and only this says so. Both matter, because whoever aborts an
+/// inherited sequence rewinds the base to wherever that sequence began — past
+/// commits this run never made.
+fn replay_in_progress(git: &Git) -> bool {
+    if git.run(&["rev-parse", "--verify", "--quiet", "CHERRY_PICK_HEAD"]).is_ok_and(|r| r.ok) {
+        return true;
+    }
+    git.git_dir().is_ok_and(|dir| dir.join("sequencer").exists())
+}
+
+/// Refuse to land unless the work tree is clean, the base branch is checked out
+/// and no sequencer operation is already under way — the two guards `git
+/// squash-in` opens with, the branch check the integrator otherwise makes by
+/// eye, and the one a replay adds.
 pub fn preflight(git: &Git, base: &str) -> io::Result<Result<(), String>> {
+    // Before the tree check, because this is the state a clean tree hides. A
+    // landing that started here would abort a sequence it did not begin, and
+    // `--abort` rewinds to where that one started, not to where we found it.
+    if replay_in_progress(git) {
+        return Ok(Err(
+            "a cherry-pick or revert is already in progress — finish it, or \
+             `git cherry-pick --abort`, before landing"
+                .to_string(),
+        ));
+    }
     match git.head_branch()? {
         Some(head) if head == base => {}
         Some(head) => {
@@ -143,87 +188,134 @@ pub fn preflight(git: &Git, base: &str) -> io::Result<Result<(), String>> {
     Ok(Ok(()))
 }
 
-/// Squash `branch` into the checked-out base and commit it with the branch's
-/// own commit messages. Leaves HEAD untouched unless it reports `Committed`.
+/// Take `branch` onto the checked-out base, `mode` deciding whether that is one
+/// squash commit or the branch's own commits replayed. Leaves HEAD untouched
+/// unless it reports `Committed`.
 ///
 /// `expected_oid` is the tip the integrator actually reviewed; if the ref has
 /// moved since, the landing is refused rather than committing unreviewed work.
-pub fn squash_land(
+pub fn land(
     git: &Git,
     base: &str,
     branch: &str,
+    mode: Mode,
     expected_oid: Option<&str>,
     expected_base: Option<&str>,
 ) -> io::Result<Landing> {
+    let pinned = match pin(git, base, branch, mode, expected_oid, expected_base)? {
+        Ok(p) => p,
+        Err(landing) => return Ok(landing),
+    };
+    match mode {
+        Mode::Squash => squash(git, base, branch, pinned),
+        Mode::Rebase => rebase(git, base, branch, pinned),
+    }
+}
+
+/// What a landing acts on, pinned to object ids and checked against the commits
+/// the review pane was rendered from.
+struct Pinned {
+    log: Vec<Line>,
+    branch_oid: String,
+    /// The base tip the landing builds on, verified again once it is over.
+    head_before: String,
+    range: String,
+    commits: Vec<String>,
+}
+
+/// The guards both modes share: a clean work tree with the base checked out, a
+/// branch and a base still at the commits that were reviewed, and a range with
+/// commits in it. `Err` carries the refusal, already logged.
+fn pin(
+    git: &Git,
+    base: &str,
+    branch: &str,
+    mode: Mode,
+    expected_oid: Option<&str>,
+    expected_base: Option<&str>,
+) -> io::Result<Result<Pinned, Landing>> {
     let mut log = Vec::new();
 
     if let Err(why) = preflight(git, base)? {
         log.push(err_line(format!("refusing: {why}")));
-        return Ok(Landing { log, outcome: Outcome::Blocked(why) });
+        return Ok(Err(Landing { log, outcome: Outcome::Blocked(why) }));
     }
 
     let branch_oid = match git.branch_oid(branch) {
         Ok(oid) => oid,
-        Err(e) => return Ok(blocked(log, e.to_string())),
+        Err(e) => return Ok(Err(blocked(log, e.to_string()))),
     };
     if let Some(expected) = expected_oid {
         if expected != branch_oid {
-            return Ok(blocked(
+            return Ok(Err(blocked(
                 log,
                 format!(
                     "{branch} moved since it was reviewed ({} -> {}) — review it again",
                     short(expected),
                     short(&branch_oid)
                 ),
-            ));
+            )));
         }
     }
 
     if let Some(expected) = expected_base {
         let current = match git.rev_parse(&format!("refs/heads/{base}")) {
             Ok(oid) => oid,
-            Err(e) => return Ok(blocked(log, e.to_string())),
+            Err(e) => return Ok(Err(blocked(log, e.to_string()))),
         };
         if expected != current {
-            return Ok(blocked(
+            return Ok(Err(blocked(
                 log,
                 format!(
-                    "{base} moved since the review ({} -> {}) — the squash would differ",
+                    "{base} moved since the review ({} -> {}) — the {} would differ",
                     short(expected),
-                    short(&current)
+                    short(&current),
+                    mode.verb()
                 ),
-            ));
+            )));
         }
     }
 
-    // The parent the squash is built on, re-checked before the commit and
+    // The parent the landing is built on, re-checked before the commit and
     // verified after it: a base that advances mid-landing would otherwise get a
     // commit whose tree predates it, reverting what arrived in between.
     let head_before = match git.rev_parse("HEAD") {
         Ok(oid) => oid,
-        Err(e) => return Ok(blocked(log, e.to_string())),
+        Err(e) => return Ok(Err(blocked(log, e.to_string()))),
     };
 
     let merge_base = match git.merge_base("HEAD", &branch_oid) {
         Ok(mb) => mb,
-        Err(e) => return Ok(blocked(log, e.to_string())),
+        Err(e) => return Ok(Err(blocked(log, e.to_string()))),
     };
-    // Everything below names the pinned oid, so the content that gets merged
-    // and the message that gets committed come from the same commit.
+    // Everything below names the pinned oid, so the content that gets taken and
+    // the messages that get committed come from the same commit.
     let range = format!("{merge_base}..{branch_oid}");
     log.push(step_line(format!("merge-base {base}..{branch}")));
     log.push(note_line(format!("  {merge_base}")));
 
-    let commits = git.run_ok(&["log", "--reverse", "--oneline", "--no-decorate", &range, "--"])?;
-    let commit_lines: Vec<&str> = commits.lines().collect();
-    if commit_lines.is_empty() {
+    let out = git.run_ok(&["log", "--reverse", "--oneline", "--no-decorate", &range, "--"])?;
+    let commits: Vec<String> = out.lines().map(str::to_string).collect();
+    if commits.is_empty() {
         log.push(err_line(format!("refusing: {branch} has no commits beyond {base}")));
-        return Ok(Landing { log, outcome: Outcome::Nothing });
+        return Ok(Err(Landing { log, outcome: Outcome::Nothing }));
     }
-    log.push(step_line(format!("commits to squash ({})", commit_lines.len())));
-    for c in &commit_lines {
+    let noun = match mode {
+        Mode::Squash => "squash",
+        Mode::Rebase => "replay",
+    };
+    log.push(step_line(format!("commits to {noun} ({})", commits.len())));
+    for c in &commits {
         log.push(note_line(format!("  {c}")));
     }
+
+    Ok(Ok(Pinned { log, branch_oid, head_before, range, commits }))
+}
+
+/// Stage the whole branch as one commit and commit it with the branch's own
+/// commit messages.
+fn squash(git: &Git, base: &str, branch: &str, pinned: Pinned) -> io::Result<Landing> {
+    let Pinned { mut log, branch_oid, head_before, range, .. } = pinned;
 
     // Build the message before the merge, so a blank one refuses while the
     // work tree is still pristine. Bytes, not text: it is committed verbatim.
@@ -403,6 +495,293 @@ pub fn squash_land(
     Ok(Landing { log, outcome: Outcome::Committed { sha } })
 }
 
+/// Replay the branch's own commits onto the base with the sequencer, then check
+/// that what they add up to is the tree the review pane diffed.
+///
+/// All of them or none. A replay that stops has already committed the commits
+/// before the one that stopped it, which is a state the squash path cannot
+/// reach — a staged squash never moved HEAD — so it is undone here rather than
+/// left for the operator: half a branch on the base is work nobody approved as
+/// a set, and it is one `p` from being published.
+fn rebase(git: &Git, base: &str, branch: &str, pinned: Pinned) -> io::Result<Landing> {
+    let Pinned { mut log, branch_oid, head_before, range, commits } = pinned;
+
+    // cherry-pick replays one parent's changes; a merge commit has two and
+    // nothing in the range says which. Squashing takes the same tree without
+    // the ambiguity.
+    let merges = git.run_ok(&["rev-list", "--merges", &range, "--"])?;
+    let merges = merges.lines().count();
+    if merges > 0 {
+        return Ok(blocked(
+            log,
+            format!(
+                "{branch} carries {merges} merge commit(s) — replaying them is ambiguous; \
+                 squash it instead"
+            ),
+        ));
+    }
+
+    // The tree the review pane diffed, and what the replay has to add up to.
+    let target = match git.merge_tree(&head_before, &branch_oid)? {
+        MergeResult::Clean(tree) => Some(tree),
+        // The pane showed the BRANCH's own diff and said so, because there is
+        // no landing tree to show. A squash cannot land that blind — the merge
+        // conflicts too, and it stops — but a replay's successive merges can
+        // resolve where the one-shot one does not, and would then commit work
+        // whose diff nobody has seen. Refused, not risked.
+        MergeResult::Conflicted => {
+            return Ok(blocked(
+                log,
+                format!(
+                    "{branch} does not merge cleanly onto {base}, so there is no reviewed \
+                     tree to hold a replay to — rebase it onto {base} and review it again"
+                ),
+            ))
+        }
+        // Git could not compute one at all. The squash path lands blind here
+        // too, so this one proceeds — and says that it did.
+        MergeResult::Unavailable(_) => None,
+    };
+    let base_tree = match git.rev_parse(&format!("{head_before}^{{tree}}")) {
+        Ok(tree) => tree,
+        Err(e) => return Ok(blocked(log, e.to_string())),
+    };
+    // The squash path learns this from an empty index after the merge; here it
+    // has to be known BEFORE the sequencer starts, because a commit that
+    // replays to nothing stops it rather than being dropped.
+    if target.as_deref() == Some(base_tree.as_str()) {
+        log.push(err_line(format!(
+            "nothing to replay: {branch} changes nothing on top of {base} (already landed?)"
+        )));
+        return Ok(Landing { log, outcome: Outcome::Nothing });
+    }
+
+    // What `git rebase` replays: the branch's commits less the ones whose patch
+    // the base already carries, by the same `--cherry-pick --right-only`
+    // selection it makes. cherry-pick does no such filtering when handed a
+    // range — it replays such a commit to nothing and stops the whole landing —
+    // so the choice is made here, where it can be said out loud.
+    let selection = git.run_ok(&[
+        "rev-list",
+        "--reverse",
+        "--no-merges",
+        "--cherry-pick",
+        "--right-only",
+        &format!("{head_before}...{branch_oid}"),
+        "--",
+    ])?;
+    let picks: Vec<String> = selection.lines().map(str::to_string).collect();
+    if picks.len() < commits.len() {
+        log.push(note_line(format!(
+            "  {} of {} commit(s) are already on {base} by patch and are skipped",
+            commits.len().saturating_sub(picks.len()),
+            commits.len()
+        )));
+    }
+    if picks.is_empty() {
+        log.push(err_line(format!(
+            "nothing to replay: every commit on {branch} is already on {base} by patch"
+        )));
+        return Ok(Landing { log, outcome: Outcome::Nothing });
+    }
+
+    // --ff so a branch already sitting on the base tip lands the very commits
+    // that were reviewed, oids and all, rather than rewritten copies of them.
+    //
+    // --allow-empty because `r` promises the branch's OWN commits and a
+    // deliberately empty one is one of them; without it the sequencer stops on
+    // it and the whole landing aborts. It only covers commits that were empty
+    // to begin with: one that BECOMES empty against this base still stops,
+    // which is the case that must not be quietly dropped.
+    let mut argv: Vec<&str> = vec!["cherry-pick", "--ff", "--allow-empty"];
+    argv.extend(picks.iter().map(String::as_str));
+    log.push(step_line(format!(
+        "git cherry-pick --ff --allow-empty ({} commit(s))",
+        picks.len()
+    )));
+    let pick = git.run(&argv)?;
+    log_output(&mut log, &pick);
+    if !pick.ok {
+        return abort_replay(git, log, base, branch, &head_before, pick.failure());
+    }
+
+    let head_after = match git.rev_parse("HEAD") {
+        Ok(oid) => oid,
+        Err(e) => return Ok(left_standing(log, e.to_string(), &head_before)),
+    };
+    if head_after == head_before {
+        // The merge result differs from the base tree — checked above — so a
+        // clean replay had to produce something. NOT `blocked`: that reads as
+        // "nothing was touched", and what this actually says is that a step
+        // which reported success did not do what success means.
+        let why = format!("cherry-pick reported success but {base} did not move");
+        log.push(err_line(format!("failed: {why}")));
+        return Ok(Landing { log, outcome: Outcome::Failed(why) });
+    }
+    // Both structural checks come before any rollback: only once the base still
+    // descends from where it started, by exactly the commits that were picked,
+    // is `head_before..HEAD` known to be ours alone to remove. They report
+    // rather than propagate, as does everything below — the commits are on the
+    // base now, and an error out of here would tear the TUI down with them
+    // landed and nothing on screen saying so.
+    if !git.contains(&head_after, &head_before).unwrap_or(false) {
+        return Ok(left_standing(
+            log,
+            format!(
+                "{base} is now {}, which does not descend from the {} the replay started on",
+                short(&head_after),
+                short(&head_before)
+            ),
+            &head_before,
+        ));
+    }
+    // A picked commit that replays to nothing stops the sequence rather than
+    // being dropped from it, so every pick made exactly one commit. Anything
+    // else means something committed here that we did not — and a count that
+    // could not be read is a different state from one that came out wrong.
+    let why = match git.run(&["rev-list", "--count", &format!("{head_before}..{head_after}"), "--"])
+    {
+        Ok(run) if !run.ok => Some(format!("{base}'s new commits could not be counted: {}", run.failure())),
+        Err(e) => Some(format!("{base}'s new commits could not be counted: {e}")),
+        Ok(run) if run.line() != picks.len().to_string() => Some(format!(
+            "{} commit(s) were replayed but {base} gained {}",
+            picks.len(),
+            run.line()
+        )),
+        Ok(_) => None,
+    };
+    if let Some(why) = why {
+        return Ok(left_standing(log, why, &head_before));
+    }
+
+    match &target {
+        Some(target) => {
+            let tree = match git.rev_parse(&format!("{head_after}^{{tree}}")) {
+                Ok(tree) => tree,
+                Err(e) => return Ok(left_standing(log, e.to_string(), &head_before)),
+            };
+            // Every commit applied cleanly and the total is still not what the
+            // pane diffed: successive three-way merges resolved something the
+            // one-shot merge does not, or a hook rewrote content on the way
+            // through. Either way it is not what was approved.
+            if tree != *target {
+                return Ok(roll_back(
+                    git,
+                    log,
+                    format!(
+                        "the replayed tree {} is not the merge result {} that was reviewed",
+                        short(&tree),
+                        short(target)
+                    ),
+                    &head_before,
+                ));
+            }
+        }
+        // Unavailable, the one case that gets this far without a tree to check
+        // against. A landing nothing could check must not read like one that was.
+        None => log.push(Line::new(
+            "landed WITHOUT the tree check: git computed no merge result to compare against",
+            Style::fg(YELLOW),
+        )),
+    }
+
+    log.push(ok_line(format!(
+        "replayed {} commit{} onto {base} — now at {}",
+        picks.len(),
+        if picks.len() == 1 { "" } else { "s" },
+        short(&head_after)
+    )));
+    Ok(Landing { log, outcome: Outcome::Committed { sha: head_after } })
+}
+
+/// Put a stopped replay back: the sequencer's own abort restores both the base
+/// and the work tree, so the branch can be fixed and landed again rather than
+/// half-landed.
+fn abort_replay(
+    git: &Git,
+    mut log: Vec<Line>,
+    base: &str,
+    branch: &str,
+    head_before: &str,
+    why: String,
+) -> io::Result<Landing> {
+    log.push(err_line(format!("cherry-pick stopped: {why}")));
+    // Only when there is one to abort: a pick that failed before the sequencer
+    // started has nothing in progress, and `--abort` would answer that with a
+    // `fatal:` of its own — reading as though the recovery were what failed.
+    if replay_in_progress(git) {
+        log.push(step_line("git cherry-pick --abort"));
+        let abort = git.run(&["cherry-pick", "--abort"])?;
+        log_output(&mut log, &abort);
+    }
+    let restored = git.rev_parse("HEAD").map(|head| head == head_before).unwrap_or(false);
+    let clean = git.dirty_entries().map(|d| d.is_empty()).unwrap_or(false);
+    if !restored || !clean {
+        return Ok(left_standing(
+            log,
+            format!("the replay stopped ({why}) and the abort did not put {base} back"),
+            head_before,
+        ));
+    }
+    // Nothing was applied and nothing is left in the tree, so this reads like
+    // the refusals rather than like a conflict to clean up: rebase the branch
+    // onto the base, review it again, or land it squashed. The reason is
+    // already on the log a line up; only the outcome repeats it, for the
+    // headless caller that prints that alone.
+    log.push(note_line(format!(
+        "  {base} is back at {} — nothing was applied",
+        short(head_before)
+    )));
+    Ok(Landing { log, outcome: Outcome::Blocked(format!("{branch} does not replay onto {base}: {why}")) })
+}
+
+/// Remove the commits a replay put on the base. Only reached once both
+/// structural checks have passed, so `head_before..HEAD` is exactly what this
+/// run added and nothing else goes with it.
+fn roll_back(git: &Git, mut log: Vec<Line>, why: String, head_before: &str) -> Landing {
+    log.push(step_line(format!("git reset --hard {}", short(head_before))));
+    let reset = match git.run(&["reset", "--hard", head_before]) {
+        Ok(run) => run,
+        Err(e) => {
+            let why = format!(
+                "{why}. ROLLBACK FAILED ({e}) — reset --hard {} by hand",
+                short(head_before)
+            );
+            log.push(err_line(why.clone()));
+            return Landing { log, outcome: Outcome::Failed(why) };
+        }
+    };
+    log_output(&mut log, &reset);
+    let why = if reset.ok {
+        format!("{why}. NOT published; rolled back to {}", short(head_before))
+    } else {
+        format!(
+            "{why}. ROLLBACK FAILED ({}) — reset --hard {} by hand",
+            reset.failure(),
+            short(head_before)
+        )
+    };
+    log.push(err_line(format!("failed: {why}")));
+    Landing { log, outcome: Outcome::Failed(why) }
+}
+
+/// Report a replay whose commits are still on the base and must NOT be removed
+/// from here: either the base no longer descends from where the replay started,
+/// or what sits on it is not only ours.
+fn left_standing(mut log: Vec<Line>, why: String, head_before: &str) -> Landing {
+    log.push(err_line(format!("failed: {why}")));
+    log.push(err_line(format!(
+        "left standing, and NOT ours to remove — inspect `git log {}..HEAD` by hand",
+        short(head_before)
+    )));
+    // The tree is clean, so no bail-out prompt will offer to remove them, and
+    // `p` publishes every local commit on the base without asking.
+    log.push(err_line(
+        "and the next p WILL PUBLISH them — remove them by hand first".to_string(),
+    ));
+    Landing { log, outcome: Outcome::Failed(why) }
+}
+
 fn blocked(mut log: Vec<Line>, why: String) -> Landing {
     log.push(err_line(format!("refusing: {why}")));
     Landing { log, outcome: Outcome::Blocked(why) }
@@ -424,9 +803,26 @@ pub fn short(sha: &str) -> String {
     sha.chars().take(12).collect()
 }
 
-/// Throw away a conflicted or staged squash, as the alias's bail-out does.
+/// Throw away a conflicted or staged landing, as the alias's bail-out does.
+/// `reset --hard` alone would leave a stopped replay's sequencer state behind,
+/// and the commits it already applied with it, so the abort comes first.
 pub fn discard(git: &Git) -> io::Result<Vec<Line>> {
-    let mut log = vec![step_line("git reset --hard HEAD")];
+    let mut log = Vec::new();
+    if replay_in_progress(git) {
+        log.push(step_line("git cherry-pick --abort"));
+        let abort = git.run(&["cherry-pick", "--abort"])?;
+        log_output(&mut log, &abort);
+        // Not "discarded": the sequence and whatever it applied may both still
+        // be there, and `reset --hard HEAD` below cannot see either.
+        if !abort.ok {
+            log.push(err_line(format!(
+                "abort failed: {} — the stopped replay is still there, finish it by hand",
+                abort.failure()
+            )));
+            return Ok(log);
+        }
+    }
+    log.push(step_line("git reset --hard HEAD"));
     let reset = git.run(&["reset", "--hard", "HEAD"])?;
     log_output(&mut log, &reset);
     if !reset.ok {
