@@ -1076,23 +1076,25 @@ fn globbing_spends_the_escapes_in_a_literal_component() -> Result<(), Box<dyn st
     Ok(())
 }
 
-/// A throwaway directory holding a COPY of the shell under test, named
-/// `td_sh_probe`. A copy rather than a `#!/bin/sh` script, so no gate needs a host
-/// interpreter to exist at an absolute path.
+/// A throwaway directory holding the shell under test on PATH, named
+/// `td_sh_probe`. A real executable rather than a `#!/bin/sh` script, so no gate
+/// needs a host interpreter to exist at an absolute path.
 struct ProbeDir(ScratchDir);
 
 impl ProbeDir {
     fn new(tag: &str) -> Result<Self, Box<dyn std::error::Error>> {
-        use std::os::unix::fs::PermissionsExt;
         // The exclusive claim and the cleanup are `ScratchDir`'s; what is added
-        // here is a copy of the shell under test, which the gate then EXECUTES --
-        // so adopting a directory that already existed would be adopting whatever
-        // program was in it.
+        // here is a name on PATH for the shell under test, which the gate then
+        // EXECUTES -- so adopting a directory that already existed would be
+        // adopting whatever program was in it.
+        //
+        // A SYMLINK, not a copy: copying opens the probe for WRITING, and a
+        // sibling test's fork inherits that descriptor until its own exec, so
+        // exec'ing the probe in that window fails ETXTBSY (reported as 126).
+        // Linking writes nothing, so the window does not exist.
         let scratch = ScratchDir::new(tag)?;
-        let dir = &scratch.0;
-        let probe = dir.join("td_sh_probe");
-        std::fs::copy(PathBuf::from(env!("CARGO_BIN_EXE_td-sh")), &probe)?;
-        std::fs::set_permissions(&probe, std::fs::Permissions::from_mode(0o755))?;
+        let probe = scratch.0.join("td_sh_probe");
+        std::os::unix::fs::symlink(PathBuf::from(env!("CARGO_BIN_EXE_td-sh")), &probe)?;
         Ok(Self(scratch))
     }
 
@@ -1101,6 +1103,14 @@ impl ProbeDir {
             .arg("-c")
             .arg(src)
             .output()?;
+        // The assertions compare status and stdout, so a failure here otherwise
+        // reads as a bare `(126, "")` with the reason discarded -- which is what
+        // made the race this helper used to have expensive to identify. cargo
+        // shows a passing test's stderr to nobody and a failing one's to whoever
+        // is reading, which is the right audience either way.
+        if !out.stderr.is_empty() {
+            eprint!("{}", String::from_utf8_lossy(&out.stderr));
+        }
         Ok((
             out.status.code().unwrap_or(-1),
             String::from_utf8_lossy(&out.stdout).into_owned(),
