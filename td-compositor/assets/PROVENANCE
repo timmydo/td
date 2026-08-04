@@ -24,7 +24,8 @@ Reproduce with:
 
   curl -O https://ftp.gnu.org/gnu/unifont/unifont-16.0.04/unifont_all-16.0.04.hex.gz
   gunzip unifont_all-16.0.04.hex.gz
-  cargo run --bin td-term-import-unifont -- unifont_all-16.0.04.hex assets
+  cargo run --manifest-path td-compositor/Cargo.toml \
+      --bin td-term-import-unifont -- unifont_all-16.0.04.hex td-compositor/assets
 
 License
 -------

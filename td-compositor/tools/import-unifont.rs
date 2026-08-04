@@ -75,7 +75,7 @@ fn run() -> Result<(), String> {
     let out_dir = PathBuf::from(out_dir);
     let bytes = read_input(&hex_path)?;
     let digest = sha256::hex_digest(&bytes);
-    if !HEX_SHA256.is_empty() && digest != HEX_SHA256 {
+    if digest != HEX_SHA256 {
         return Err(format!(
             "{} is not the pinned {RELEASE} hex: expected {HEX_SHA256}, read {digest}",
             hex_path.display()
@@ -221,6 +221,30 @@ fn write_atomically(path: &Path, bytes: &[u8]) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const ASSET: &[u8] = include_bytes!("../assets/unifont-16.0.04-8x16.psf2");
+    const PROVENANCE: &str = include_str!("../assets/PROVENANCE");
+    const ASSET_SHA256: &str =
+        "64019ab811067e03a8de5990d2e6f23dcec5418e5a90caa5e5666b0524156732";
+
+    /// Length and dimensions are pinned in `font.rs`, but a byte swapped
+    /// inside a bitmap preserves both. Only the digest catches that, and only
+    /// this binds the digest to what PROVENANCE claims and to the constants
+    /// that say where the bytes came from.
+    #[test]
+    fn the_committed_asset_is_the_bytes_provenance_describes() {
+        assert_eq!(sha256::hex_digest(ASSET), ASSET_SHA256);
+        for claim in [
+            ASSET_SHA256,
+            ARCHIVE_SHA256,
+            HEX_SHA256,
+            ARCHIVE_URL,
+            RELEASE,
+            ASSET_FILE,
+        ] {
+            assert!(PROVENANCE.contains(claim), "PROVENANCE omits {claim}");
+        }
+    }
 
     const SAMPLE: &str = "0041:00183C7EFFFF7E3C1800000000000000\n";
 
