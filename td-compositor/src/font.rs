@@ -38,8 +38,8 @@ const SEPARATOR: u8 = 0xff;
 #[allow(dead_code)]
 const SEQUENCE_START: u8 = 0xfe;
 
-/// A cell wider than this cannot be a terminal cell on the supported output,
-/// and the ceilings are what keep `charsize` arithmetic in range.
+/// A cell wider than this cannot be a terminal cell on the supported output.
+/// These bound `row_bytes * height`; `charsize` is then pinned equal to it.
 #[allow(dead_code)]
 const MAX_DIMENSION: usize = 64;
 #[allow(dead_code)]
@@ -58,9 +58,9 @@ const BLANK: char = ' ';
 pub struct Font {
     width: usize,
     height: usize,
-    /// Bytes per glyph, as the header declares it. Never recomputed from
-    /// width and height: a face may pad its rows, and the header is what says
-    /// where the next glyph starts.
+    /// Bytes per glyph. Equal to `height * row_bytes` -- parse refuses any
+    /// other value -- and kept as its own field because it is what steps from
+    /// one glyph to the next.
     charsize: usize,
     /// Bytes per row within a glyph.
     row_bytes: usize,
@@ -119,11 +119,15 @@ impl Font {
         let needed = row_bytes
             .checked_mul(height)
             .ok_or_else(|| "psf2 glyph size overflow".to_string())?;
-        // Not equality: a face may pad each glyph. Too SMALL is the error,
-        // because then a row read would run into the next glyph.
-        if charsize < needed {
+        // Exactly, not merely enough: PSF2 defines charsize as
+        // height * ceil(width/8) with no padding, and `row()` finds a row at
+        // `index * charsize + row * row_bytes`, which only holds when any
+        // slack is trailing. Accepting a larger charsize would read
+        // row-padded faces at the wrong offsets and draw garbled glyphs from
+        // inside the right glyph -- memory-safe, and silent.
+        if charsize != needed {
             return Err(format!(
-                "psf2 charsize {charsize} cannot hold a {width}x{height} cell"
+                "psf2 charsize {charsize} is not the {needed} bytes a {width}x{height} cell needs"
             ));
         }
         let bitmap_bytes = charsize
@@ -359,10 +363,13 @@ mod tests {
         assert!(Font::parse(&face(&no_glyphs, &glyphs, table)).is_err());
         let huge = [32, HAS_UNICODE_TABLE, 1, 16, 16, u32::MAX];
         assert!(Font::parse(&face(&huge, &glyphs, table)).is_err());
-        // charsize too small for the declared cell would let a row read run
-        // into the next glyph.
+        // charsize must be exactly the cell: too small lets a row read run
+        // into the next glyph, and too large means the face padded rows that
+        // `row()`'s offset arithmetic would then skip past.
         let short = [32, HAS_UNICODE_TABLE, 1, 8, 16, 8];
         assert!(Font::parse(&face(&short, &glyphs, table)).is_err());
+        let padded = [32, HAS_UNICODE_TABLE, 1, 32, 16, 8];
+        assert!(Font::parse(&face(&padded, &[0u8; 32], table)).is_err());
         // Bitmaps shorter than the header claims.
         assert!(Font::parse(&face(&good, &[0u8; 4], table)).is_err());
         // A table naming fewer or more glyphs than the header.
