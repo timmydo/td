@@ -11554,3 +11554,132 @@ xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx$
 ## stdout-json: ""
 ## stderr-json: "sed: -e expression #1, char 5: unknown command: `X'\n"
 ## status: 1
+
+
+# --- Who pays the separator a last record left OWED. A record that arrived
+# --- without one is written back without one -- unless something follows it on
+# --- the same channel, and GNU settles that debt before it knows whether there
+# --- is anything to follow with: an `r' file that may not exist, an `a' that
+# --- may carry no text at all. `a\' below is the command with NO text; `a\\'
+# --- is the one-character text that appends an EMPTY LINE, and is the control
+# --- that tells the two apart -- its own newline pays the debt either way.
+
+#### an `a' with NO TEXT still pays the separator its record left owed
+## argv: sed 'a\' U
+## file-json U: "a\nb"
+## stdin-json: ""
+## stdout-json: "a\nb\n"
+## stderr-json: ""
+## status: 0
+
+#### ... where the same command with an empty TEXT pays it by writing the line
+## argv: sed 'a\\' U
+## file-json U: "a\nb"
+## stdin-json: ""
+## stdout-json: "a\n\nb\n\n"
+## stderr-json: ""
+## status: 0
+
+#### ... and a record that arrived WITH a separator never owed one
+## argv: sed 'a\' U
+## file-json U: "a\nb\n"
+## stdin-json: ""
+## stdout-json: "a\nb\n"
+## stderr-json: ""
+## status: 0
+
+#### only the LAST record can owe, so an early text-less `a' pays nothing
+## argv: sed '1a\' U
+## file-json U: "a\nb"
+## stdin-json: ""
+## stdout-json: "a\nb"
+## stderr-json: ""
+## status: 0
+
+#### the byte paid is the RECORD separator, so `-z' pays a NUL
+## argv: sed -z 'a\' U
+## file-json U: "a\nb"
+## stdin-json: ""
+## stdout-json: "a\nb\0"
+## stderr-json: ""
+## status: 0
+
+#### it is the QUEUE that pays and not the auto-print
+## argv: sed -n -e '$p' -e 'a\' U
+## file-json U: "a\nb"
+## stdin-json: ""
+## stdout-json: "b\n"
+## stderr-json: ""
+## status: 0
+
+#### ... so with nothing printed at all there is no debt to pay
+## argv: sed -n 'a\' U
+## file-json U: "a\nb"
+## stdin-json: ""
+## stdout-json: ""
+## stderr-json: ""
+## status: 0
+
+#### a TEXT-LESS `i' cannot pay, which is the opposite of the `a' above
+## argv: sed -n -e '$p' -e 'i\' U
+## file-json U: "a\nb"
+## stdin-json: ""
+## stdout-json: "b"
+## stderr-json: ""
+## status: 0
+
+#### ... nor a text-less `c'
+## argv: sed -n -e '$p' -e 'c\' U
+## file-json U: "a\nb"
+## stdin-json: ""
+## stdout-json: "b"
+## stderr-json: ""
+## status: 0
+
+#### ... where the SAME `a' pays, the queue's own entry being what does it
+## argv: sed -n -e '$p' -e 'a\' U
+## file-json U: "a\nb"
+## stdin-json: ""
+## stdout-json: "b\n"
+## stderr-json: ""
+## status: 0
+
+#### and an `i' WITH text pays like any other writer, so it is not positional
+## argv: sed -n -e p -e 'i\\' U
+## file-json U: "a\nb"
+## stdin-json: ""
+## stdout-json: "a\n\nb\n\n"
+## stderr-json: ""
+## status: 0
+
+#### ... as does a `c' with text
+## argv: sed -n -e p -e 'c\\' U
+## file-json U: "a\nb"
+## stdin-json: ""
+## stdout-json: "a\n\nb\n\n"
+## stderr-json: ""
+## status: 0
+
+#### the empty append pays the MAIN channel only, leaving a `w' file's own debt
+## argv: sed -n -e 'w /dev/stdout' -e 'a\' U
+## file-json U: "a\nb"
+## stdin-json: ""
+## stdout-json: "a\nb"
+## stderr-json: ""
+## status: 0
+
+#### a missing `r' file pays the same way, the debt settled before the read
+## argv: sed 'r /nonexistent' U
+## file-json U: "a\nb"
+## stdin-json: ""
+## stdout-json: "a\nb\n"
+## stderr-json: ""
+## status: 0
+
+#### and a text-less `a' behind one that HAS text pays nothing extra
+## argv: sed -e aX -e 'a\' U
+## file-json U: "a\nb"
+## stdin-json: ""
+## stdout-json: "a\nX\nb\nX\n"
+## stderr-json: ""
+## status: 0

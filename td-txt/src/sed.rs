@@ -1768,7 +1768,11 @@ impl Stream {
 }
 
 enum Append {
-    Text(Vec<u8>),
+    /// `a`'s text, `None` where the command carries none at all (`sed 'a\'` --
+    /// ONE backslash, where two are a one-character text that appends a line).
+    /// Queued even then, because the QUEUE is what pays the record's owed
+    /// separator; see `flush_appends`.
+    Text(Option<Vec<u8>>),
     /// `r`: the FILENAME, read when the queue is flushed.
     File(Vec<u8>),
     /// `R`: the bytes, already read — GNU takes its line when the command runs, so a
@@ -3406,7 +3410,17 @@ impl Sed {
         let appends = std::mem::take(&mut self.appends);
         for a in appends {
             match a {
-                Append::Text(text) => sink.write_text(&text)?,
+                // An `a` with NO TEXT still pays a separator the record left
+                // owed, which is the whole of what queueing it does: the dump
+                // terminates the pattern space without looking at whether
+                // there is anything to dump, so `printf 'a\nb' | sed 'a\'`
+                // ends with one where a plain unterminated last line does not.
+                // Same rule as the missing `r` file below, from the other
+                // direction. A text-less `i`/`c` is the OPPOSITE case and not
+                // a positional one: they pay when they have text, and GNU's
+                // `output_line` returns before paying when they have none.
+                Append::Text(Some(text)) => sink.write_text(&text)?,
+                Append::Text(None) => sink.write(&[])?,
                 // A missing file is not an error for `r`/`R`, as in GNU sed — but
                 // GNU pays the owed separator BEFORE it finds out, so `printf x |
                 // sed 'r /nonexistent'` still ends with one. Writing the empty
@@ -3499,11 +3513,7 @@ impl Sed {
                 Some(Kind::Branch(Target::Name(n)) | Kind::BranchIfSub(Target::Name(n)) | Kind::BranchIfNoSub(Target::Name(n))) => {
                     return Err(format!("unresolved branch to `{}'", show(n)))
                 }
-                Some(Kind::Append(text)) => {
-                    if let Some(text) = text.clone() {
-                        self.appends.push(Append::Text(text));
-                    }
-                }
+                Some(Kind::Append(text)) => self.appends.push(Append::Text(text.clone())),
                 Some(Kind::Insert(text)) => {
                     if let Some(text) = text.clone() {
                         sink.write_line(&text, true)?;

@@ -1063,17 +1063,6 @@ td-txt-authored case files
     neighbouring shapes are NOT gaps: a text ending in an unpaired backslash is
     emitted raw, and a continuation collapses only across an `-e` boundary.
 
-  - An `a` with NO TEXT AT ALL still pays a record's missing separator in GNU.
-    A last record that arrived without one is written back without one, by both
-    programs -- unless an append is queued behind it, and GNU terminates it
-    before writing the text whether or not there IS any text. So
-    `printf 'a\nb' | sed 'a\'` is `a<nl>b<nl>` in GNU and `a<nl>b` here, the
-    appended nothing being the only difference between them. The `-z` spelling
-    (`sed -z 'a\'` over an input with no trailing NUL) is the same divergence
-    and is how it was found, but the separator is not what it is about: a real
-    text agrees under both separators, because there the text's own writer
-    supplies the byte, and `i`/`c` agree for the reasons the entry above gives.
-
   - A backreference to a group under a repetition whose BODY can match empty,
     which POSIX leaves undefined and where GNU's answers do not follow a rule.
     Participation itself is modelled -- the body runs once so `^(x*)*\1$` and
