@@ -1199,7 +1199,10 @@ td-txt-authored case files
     bytes has to account for its residue: once the `ISSPACE` family is closed
     these are 129 of the 134 bytes still disagreeing, and the other five are
     `sed L`, the three label commands' wording, and `e` -- each recorded or cased
-    elsewhere.
+    elsewhere. A `-f` script's NAME in the locus below is the same family from a
+    third direction, `show` being `from_utf8_lossy`: `sed -f $'h\377i.sed'` says
+    `file h\377i.sed` in GNU and `file h\357\277\275i.sed` here, one replacement
+    character where the raw byte was.
 
   - A NUL inside an `r`/`R`/`w`/`W` filename, which only a `-f` script can carry:
     GNU builds a C string from it, so `printf '1r\0F\n' > s; sed -f s A` truncates
@@ -1231,14 +1234,6 @@ td-txt-authored case files
     that could not be read rather than refusing, which is the wrong direction to
     move a refusal.
 
-  - An address left dangling at the end of an `-e` part: `sed -e '2' -e 'p'` is
-    `missing command` in GNU and `unknown command: `\n'` here. Both modes,
-    predates the branch, exit 1 either way -- same family as the other
-    diagnostic-wording gaps above. Every address form reaches it, `+` and `~`
-    included since they became addresses; that spelling used to stop at
-    `unknown command: `+'` one step earlier, for a reason unrelated to the
-    dangle.
-
   - `s//\N/` -- the empty regex reusing the last one -- is unchecked here and
     only half-unchecked in GNU: `/\(a\)/s//\2/` and `/a/s//\1/` are refused
     there (at `char 0`, so it is the command's OWN address regex being
@@ -1248,29 +1243,50 @@ td-txt-authored case files
     expand it empty -- which was what my own probe showed, the probe having
     reused a group-LESS regex and so never reaching the case that matters.
 
-  - A diagnostic locates a `-f` script differently: GNU says `file s line 2:`
-    where td-txt says `-e expression #1:`, so a refusal inside a `-f` script
-    names neither the file nor the line. The expression NUMBER is the same gap
-    one part over: td-txt spells it `#1` always, so `sed -e p -e Z` is
-    `expression #2` in GNU and `#1` here, and a script assembled from several
-    `-e` fragments cannot be told which one refused. Same family as the missing
-    `char N:` offset, and the corpus cases for `--posix`'s text-continuation
-    rule assert by substring because of all three.
+  - A compile diagnostic's `-e` form is missing its `, char N` offset: GNU says
+    `-e expression #1, char 1: unknown command: `Z'` where td-txt says
+    `-e expression #1: unknown command: `Z'`. It is what is LEFT of that family
+    -- the expression number and the `file NAME line L` form both landed -- and
+    it is the half GNU's `-f` form does not carry, which is why an `-f` refusal
+    is now asserted exactly in the corpus and an `-e` one by substring. Closing
+    it is not one number: `char N` is the count of characters CONSUMED when the
+    error was raised, and the raise sites disagree about whether the offending
+    byte is one of them, so it has to be calibrated per site.
+
+    Part of that calibration is ALREADY VISIBLE, because it moves the LINE a
+    `-f` script's refusal is on. Everything GNU compiles as part of an `s`
+    command's REGEX — the pattern (`s/\(a/b/`), the RHS backreference
+    (`s/a/\1/`) and the empty-regex modifier check (`s//x/I`) — is compiled
+    after the FLAG loop has consumed the command's terminating newline
+    (`mark_subst_opts` returns on `\n` without putting it back; `s` is not one
+    of `read_end_of_cmd`'s four callers), so all three are reported one line
+    further on than td-txt reports them, while
+    an ADDRESS regex — compiled as it is read — agrees. Only the position
+    differs: the ORDER already matches, `s/\(a/b/q` being `unknown option to
+    `s'` in both and `s/\(a/b/;Z` the regex error rather than the unknown
+    command in both. `sed -f` on a script of `0<newline>p` is a fourth,
+    from a different site: GNU reads the command character before judging the
+    address, so `invalid usage of line address 0` is its line 2 and td-txt's
+    line 1. Found by the three-way sweeps behind the locus landing, which are
+    also what say it is these four shapes and not the others they swept.
 
   - `sed -e '1a\<newline>foo' -e 'bar'` is `can't find label for jump to `ar''
     in GNU and `can't operate on label `ar'` here -- the same refusal, worded
     differently. Both modes, predates the branch.
 
-  - Three divergences a sweep of every command letter x {bare, addressed,
-    ranged} x {flag, no flag} turned up, none of them about `--posix` and all
-    of them predating this branch, recorded here because that sweep is how the
-    one-address rule above was found and these came with it: a bare `\` is
-    `unterminated address regex` there and `unterminated address` here; the
-    usage line after a bad option is `Usage: sed [OPTION]...` there and
+  - Two divergences a sweep of every command letter x {bare, addressed,
+    ranged} x {flag, no flag} turned up, none of them about `--posix` and both
+    predating this branch, recorded here because that sweep is how the
+    one-address rule above was found and these came with it: the usage line
+    after a bad option is `Usage: sed [OPTION]...` there and
     `usage: sed [-nrEsz]...` here, differing in capital and in content; and
     `sed L` is `sed: INTERNAL ERROR:
     Bad cmd L` at exit 4 in GNU, an obsolete command left in its table, where
-    td-txt says `unknown command: `L''.
+    td-txt says `unknown command: `L''. The third was a bare `\`, worded
+    `unterminated address` here against GNU's `unterminated address regex`,
+    and it closed with the locus landing: the boundary case had to say
+    something, and two spellings for one failure would have been worse than
+    the gap.
 
   - An unterminated `\{` after a QUANTIFIED atom picks the other complaint:
     `sed 's/a*\{b/Z/'` is `Invalid preceding regular expression` in GNU and

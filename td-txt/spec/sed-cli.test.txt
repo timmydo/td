@@ -8380,23 +8380,24 @@ r R
 
 #### --posix refuses a text continued past the end of its part
 # Not just the command's own backslash: one after the TEXT crosses the same
-# boundary and is refused the same way. Through `-f' because the newline
-# this needs cannot live in a `## argv:' line. GNU locates it as `file s
-# line 2' where td-txt says `-e expression #1', a pre-existing gap, so the
-# message is asserted by substring.
+# boundary and is refused the same way. Through `-f' so the diagnostic
+# carries a file and a line, which is the whole of it here -- the `-e' form
+# would still be short a `, char N'.
 ## argv: sed --posix '-f' 's' h
 ## file-json s: "1a\\\nfoo\\"
 ## file-json h: "a\nb\nc\nd\nabc\n"
 ## stdout-json: ""
-## stderr-contains: incomplete command
+## stderr-json: "sed: file s line 2: incomplete command\n"
 ## status: 1
 
 #### and the same with another part following it
+# The refusal is raised having run off the end of `s' and consumed nothing
+# of what follows, so the place is still inside `s'.
 ## argv: sed --posix '-f' 's' '-e' 'bar' h
 ## file-json s: "1a\\\nfoo\\"
 ## file-json h: "a\nb\nc\nd\nabc\n"
 ## stdout-json: ""
-## stderr-contains: incomplete command
+## stderr-json: "sed: file s line 2: incomplete command\n"
 ## status: 1
 
 #### while the same text WITHOUT the trailing backslash is fine
@@ -10292,3 +10293,540 @@ xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx$
 ## stderr-contains: `}' doesn't want any addresses
 ## status: 1
 
+
+# ---- WHERE a compile error happened ---------------------------------------
+# --- GNU prefixes a compile diagnostic with the PART the script came from:
+# --- `-e expression #N', counting the `-e'/`--expression' parts and the bare
+# --- operand and nothing else, or `file NAME line L' for a `-f' one, L
+# --- counted within that file. A RUNTIME failure is about no place in the
+# --- script and is reported bare. The `-e' form also carries `, char N',
+# --- which td-txt does not emit yet (spec/README), so an `-e' refusal is
+# --- asserted by substring here and an `-f' one exactly.
+
+#### a second -e part is expression #2, not #1
+## argv: sed -n -e p -e Z A
+## file-json A: "a1\na2\n"
+## stdin-json: ""
+## stdout-json: ""
+## stderr-contains: sed: -e expression #2: unknown command: `Z'
+## status: 1
+
+#### and a third is #3
+## argv: sed -n -e p -e p -e Z A
+## file-json A: "a1\na2\n"
+## stdin-json: ""
+## stdout-json: ""
+## stderr-contains: sed: -e expression #3: unknown command: `Z'
+## status: 1
+
+#### --expression shares the counter with -e
+## argv: sed -n --expression=p --expression=Z A
+## file-json A: "a1\na2\n"
+## stdin-json: ""
+## stdout-json: ""
+## stderr-contains: sed: -e expression #2: unknown command: `Z'
+## status: 1
+
+#### a bare script operand is expression #1
+## argv: sed -n Z A
+## file-json A: "a1\na2\n"
+## stdin-json: ""
+## stdout-json: ""
+## stderr-contains: sed: -e expression #1: unknown command: `Z'
+## status: 1
+
+#### a newline INSIDE one part does not start another
+# The parts are joined by a newline, so a script that already contains one
+# would count as two if the number came from the joined text.
+## argv: sed -n -e "p\nZ" A
+## file-json A: "a1\na2\n"
+## stdin-json: ""
+## stdout-json: ""
+## stderr-contains: sed: -e expression #1: unknown command: `Z'
+## status: 1
+
+#### a -f part does NOT advance the counter
+## argv: sed -n -f one.sed -e Z A
+## file-json one.sed: "p\n"
+## file-json A: "a1\na2\n"
+## stdin-json: ""
+## stdout-json: ""
+## stderr-contains: sed: -e expression #1: unknown command: `Z'
+## status: 1
+
+#### wherever it sits
+# Also the boundary case below, with a FILE part next: the refusal is raised
+# having consumed all of expression #1 and nothing of the file.
+## argv: sed -n -e Z -f one.sed A
+## file-json one.sed: "p\n"
+## file-json A: "a1\na2\n"
+## stdin-json: ""
+## stdout-json: ""
+## stderr-contains: sed: -e expression #1: unknown command: `Z'
+## status: 1
+
+#### an error on a part's LAST byte belongs to THAT part
+# GNU compiles each part on its own, so it can never blame the part after.
+# Joining them into one script has to resolve the shared position the same
+# way: `Z' ends expression #1, and #2 has not been reached.
+## argv: sed -n -e Z -e p A
+## file-json A: "a1\na2\n"
+## stdin-json: ""
+## stdout-json: ""
+## stderr-contains: sed: -e expression #1: unknown command: `Z'
+## status: 1
+
+#### a -f script is named by FILE and LINE, and matches GNU exactly
+## argv: sed -n -f bad3.sed A
+## file-json bad3.sed: "p\np\nZ\n"
+## file-json A: "a1\na2\n"
+## stdin-json: ""
+## stdout-json: ""
+## stderr-json: "sed: file bad3.sed line 3: unknown command: `Z'\n"
+## status: 1
+
+#### the line is counted within that file, terminator or not
+## argv: sed -n -f noeol.sed A
+## file-json noeol.sed: "p\nZ"
+## file-json A: "a1\na2\n"
+## stdin-json: ""
+## stdout-json: ""
+## stderr-json: "sed: file noeol.sed line 2: unknown command: `Z'\n"
+## status: 1
+
+#### --file is the same locator
+## argv: sed -n --file=bad3.sed A
+## file-json bad3.sed: "p\np\nZ\n"
+## file-json A: "a1\na2\n"
+## stdin-json: ""
+## stdout-json: ""
+## stderr-json: "sed: file bad3.sed line 3: unknown command: `Z'\n"
+## status: 1
+
+#### and the line is counted within the FILE, not the joined script
+# Three lines of script precede this file's own first line; the count starts
+# again at its start, so this is line 3 and not line 4.
+## argv: sed -n -e p -f bad3.sed A
+## file-json bad3.sed: "p\np\nZ\n"
+## file-json A: "a1\na2\n"
+## stdin-json: ""
+## stdout-json: ""
+## stderr-json: "sed: file bad3.sed line 3: unknown command: `Z'\n"
+## status: 1
+
+#### an error in the SECOND file names the second
+## argv: sed -n -f one.sed -f bad3.sed A
+## file-json one.sed: "p\n"
+## file-json bad3.sed: "p\np\nZ\n"
+## file-json A: "a1\na2\n"
+## stdin-json: ""
+## stdout-json: ""
+## stderr-json: "sed: file bad3.sed line 3: unknown command: `Z'\n"
+## status: 1
+
+#### a file's last line is a boundary too, with -e parts before it
+## argv: sed -n -e p -e p -f noeol.sed A
+## file-json noeol.sed: "p\nZ"
+## file-json A: "a1\na2\n"
+## stdin-json: ""
+## stdout-json: ""
+## stderr-json: "sed: file noeol.sed line 2: unknown command: `Z'\n"
+## status: 1
+
+#### `-f -' names the script `-', the operand it was given
+# The name is the one WRITTEN, not the stream it opened: `-' is stdin here
+# and GNU still prints it literally.
+## argv: sed -n -f - A
+## file-json A: "a1\na2\n"
+## stdin-json: "p\nZ\n"
+## stdout-json: ""
+## stderr-json: "sed: file - line 2: unknown command: `Z'\n"
+## status: 1
+
+#### a RUNTIME failure names no place at all, as in GNU
+# Exit 4 rather than 1, and no prefix: the failure is not about a place in
+# the script, which is what the locus being OPTIONAL is for.
+## argv: sed -n -e 'w /nope/x' A
+## file-json A: "a1\na2\n"
+## stdin-json: ""
+## stdout-json: ""
+## stderr-json: "sed: couldn't open file /nope/x: No such file or directory\n"
+## status: 4
+
+#### and still none when it is a later part that fails
+# Which is the half a locus attached to every failure would get wrong: the
+# position is squarely inside expression #2 and GNU names neither.
+## argv: sed -n -e p -e 'w /nope/x' A
+## file-json A: "a1\na2\n"
+## stdin-json: ""
+## stdout-json: ""
+## stderr-json: "sed: couldn't open file /nope/x: No such file or directory\n"
+## status: 4
+
+# --- Two positions a diagnostic is NOT raised at. GNU's `match_slash' puts the
+# --- newline that ended an unterminated scan back (`savchar (ch); /* for
+# --- proper line number in error report */'), and its block stack SAVES where
+# --- each `{' was -- so neither is
+# --- located where the parser gave up. Both differences are invisible in a
+# --- one-line `-e' script and both cross an `-e' boundary, which is why they
+# --- belong with the locus and not with the commands they are about.
+
+#### an unmatched { is located at the BRACE, not at the end of the script
+## argv: sed -n -f z.sed A
+## file-json z.sed: "p\n{\np\np\n"
+## file-json A: "a1\na2\n"
+## stdin-json: ""
+## stdout-json: ""
+## stderr-json: "sed: file z.sed line 2: unmatched `{'\n"
+## status: 1
+
+#### and it is the INNERMOST one, which is what GNU's block stack hands back
+## argv: sed -n -f z.sed A
+## file-json z.sed: "{\n{\np\np\n"
+## file-json A: "a1\na2\n"
+## stdin-json: ""
+## stdout-json: ""
+## stderr-json: "sed: file z.sed line 2: unmatched `{'\n"
+## status: 1
+
+#### an inner block that CLOSED leaves the outer one to be named
+## argv: sed -n -f z.sed A
+## file-json z.sed: "{\np\n{\np\n}\n"
+## file-json A: "a1\na2\n"
+## stdin-json: ""
+## stdout-json: ""
+## stderr-json: "sed: file z.sed line 1: unmatched `{'\n"
+## status: 1
+
+#### an unterminated s is located where the scan STOPPED, not past the newline
+## argv: sed -n -f z.sed A
+## file-json z.sed: "s/a\np\np\n"
+## file-json A: "a1\na2\n"
+## stdin-json: ""
+## stdout-json: ""
+## stderr-json: "sed: file z.sed line 1: unterminated `s' command\n"
+## status: 1
+
+#### the same for an address regex
+## argv: sed -n -f z.sed A
+## file-json z.sed: "/a\np\np\n"
+## file-json A: "a1\na2\n"
+## stdin-json: ""
+## stdout-json: ""
+## stderr-json: "sed: file z.sed line 1: unterminated address regex\n"
+## status: 1
+
+#### and for y
+## argv: sed -n -f z.sed A
+## file-json z.sed: "y/ab\nc\nd\n"
+## file-json A: "a1\na2\n"
+## stdin-json: ""
+## stdout-json: ""
+## stderr-json: "sed: file z.sed line 1: unterminated `y' command\n"
+## status: 1
+
+#### an unterminated s does not spill into the NEXT -e part
+# The joined script has a newline between the parts, so a scan that consumed
+# it would name expression #2 -- which is a part GNU never even reads, having
+# compiled #1 on its own.
+## argv: sed -n -e 's/a' -e p A
+## file-json A: "a1\na2\n"
+## stdin-json: ""
+## stdout-json: ""
+## stderr-contains: sed: -e expression #1: unterminated `s' command
+## status: 1
+
+#### nor does an unterminated address regex
+## argv: sed -n -e '/a' -e p A
+## file-json A: "a1\na2\n"
+## stdin-json: ""
+## stdout-json: ""
+## stderr-contains: sed: -e expression #1: unterminated address regex
+## status: 1
+
+#### nor an s whose DELIMITER is the newline that joins the parts
+## argv: sed -n -e s -e p A
+## file-json A: "a1\na2\n"
+## stdin-json: ""
+## stdout-json: ""
+## stderr-contains: sed: -e expression #1: unterminated `s' command
+## status: 1
+
+#### an unmatched { names the part its BRACE is in, not the last part
+## argv: sed -n -e '{p' -e p A
+## file-json A: "a1\na2\n"
+## stdin-json: ""
+## stdout-json: ""
+## stderr-contains: sed: -e expression #1: unmatched `{'
+## status: 1
+
+#### and that is expression #2 when the brace is there
+## argv: sed -n -e p -e '{' A
+## file-json A: "a1\na2\n"
+## stdin-json: ""
+## stdout-json: ""
+## stderr-contains: sed: -e expression #2: unmatched `{'
+## status: 1
+
+#### an unterminated y in a later part is that part
+## argv: sed -n -e p -e 'y/ab' A
+## file-json A: "a1\na2\n"
+## stdin-json: ""
+## stdout-json: ""
+## stderr-contains: sed: -e expression #2: unterminated `y' command
+## status: 1
+
+#### and inside a bracket SUB-EXPRESSION, which reads its bytes of its own
+# `[[:alpha' never reaches the class reader's end, so the newline that stops it
+# is put back by a third scan -- the one place the rule could have been missed.
+## argv: sed -n -f z.sed A
+## file-json z.sed: "s/[[:alpha\np\np\n"
+## file-json A: "a1\na2\n"
+## stdin-json: ""
+## stdout-json: ""
+## stderr-json: "sed: file z.sed line 1: unterminated `s' command\n"
+## status: 1
+
+# --- A command whose DELIMITER would be a newline is where the joined script
+# --- and GNU's per-part compile disagree hardest, and the answer is not one
+# --- rule: a newline that ENDS a part is that part's end of input, so there is
+# --- no delimiter to take and the refusal belongs to the part that ran out,
+# --- while one INSIDE a script is a byte GNU really consumes as the delimiter,
+# --- leaving the scan to fail on the NEXT line. Both halves, all three
+# --- commands that take a delimiter.
+
+#### an s whose delimiter would be the part JOINER is expression #1
+## argv: sed -n -e s -e p A
+## file-json A: "a1\na2\n"
+## stdin-json: ""
+## stdout-json: ""
+## stderr-contains: sed: -e expression #1: unterminated `s' command
+## status: 1
+
+#### and the same for y
+## argv: sed -n -e y -e p A
+## file-json A: "a1\na2\n"
+## stdin-json: ""
+## stdout-json: ""
+## stderr-contains: sed: -e expression #1: unterminated `y' command
+## status: 1
+
+#### and for an address regex opened with a backslash
+## argv: sed -n -e '\' -e p A
+## file-json A: "a1\na2\n"
+## stdin-json: ""
+## stdout-json: ""
+## stderr-contains: sed: -e expression #1: unterminated address regex
+## status: 1
+
+#### but a newline INSIDE a script really is the delimiter, and s fails a line on
+## argv: sed -n -f z.sed A
+## file-json z.sed: "s\np\nq\n"
+## file-json A: "a1\na2\n"
+## stdin-json: ""
+## stdout-json: ""
+## stderr-json: "sed: file z.sed line 2: unterminated `s' command\n"
+## status: 1
+
+#### the same for y
+## argv: sed -n -f z.sed A
+## file-json z.sed: "y\np\nq\n"
+## file-json A: "a1\na2\n"
+## stdin-json: ""
+## stdout-json: ""
+## stderr-json: "sed: file z.sed line 2: unterminated `y' command\n"
+## status: 1
+
+#### and for the address regex
+## argv: sed -n -f z.sed A
+## file-json z.sed: "\\\np\nq\n"
+## file-json A: "a1\na2\n"
+## stdin-json: ""
+## stdout-json: ""
+## stderr-json: "sed: file z.sed line 2: unterminated address regex\n"
+## status: 1
+
+#### a script that is nothing but `s' and a newline is that same line 2
+# Nothing follows the delimiter at all, so this is the shape where "consumed
+# it" and "did not" differ by the whole diagnostic and by nothing else.
+## argv: sed -n -f z.sed A
+## file-json z.sed: "s\n"
+## file-json A: "a1\na2\n"
+## stdin-json: ""
+## stdout-json: ""
+## stderr-json: "sed: file z.sed line 2: unterminated `s' command\n"
+## status: 1
+
+#### while with no newline at all it is line 1, the delimiter being EOF
+## argv: sed -n -f z.sed A
+## file-json z.sed: "s"
+## file-json A: "a1\na2\n"
+## stdin-json: ""
+## stdout-json: ""
+## stderr-json: "sed: file z.sed line 1: unterminated `s' command\n"
+## status: 1
+
+# --- The same rule everywhere else it reaches: a part's closing newline is
+# --- that part's END OF INPUT, because GNU compiles each part alone. Seven
+# --- sites read it as an ordinary byte before this and so blamed the part
+# --- AFTER the one that ran out; a newline INSIDE a script is an ordinary byte
+# --- and stays one, which is the other half of every pair below.
+
+#### an empty filename at a part boundary is that part's
+## argv: sed -n -e w -e p A
+## file-json A: "a1\na2\n"
+## stdin-json: ""
+## stdout-json: ""
+## stderr-contains: sed: -e expression #1: missing filename in r/R/w/W commands
+## status: 1
+
+#### the s///w flag reaches the same reader
+## argv: sed -n -e 's/a/b/w' -e p A
+## file-json A: "a1\na2\n"
+## stdin-json: ""
+## stdout-json: ""
+## stderr-contains: sed: -e expression #1: missing filename in r/R/w/W commands
+## status: 1
+
+#### while a real newline after `w' is read, and the refusal is a line on
+# GNU's `read_filename' takes the newline through `in_nonblank' and does not
+# put it back, so this half is NOT the boundary rule -- which is why the two
+# are cased together.
+## argv: sed -n -f z.sed A
+## file-json z.sed: "w\np\n"
+## file-json A: "a1\na2\n"
+## stdin-json: ""
+## stdout-json: ""
+## stderr-json: "sed: file z.sed line 2: missing filename in r/R/w/W commands\n"
+## status: 1
+
+#### a range whose second address is the part boundary is that part's
+## argv: sed -n -e '1,' -e p A
+## file-json A: "a1\na2\n"
+## stdin-json: ""
+## stdout-json: ""
+## stderr-contains: sed: -e expression #1: unexpected `,'
+## status: 1
+
+#### and with a real newline there, GNU has READ it and says line 2
+## argv: sed -n -f z.sed A
+## file-json z.sed: "1,\np\n"
+## file-json A: "a1\na2\n"
+## stdin-json: ""
+## stdout-json: ""
+## stderr-json: "sed: file z.sed line 2: unexpected `,'\n"
+## status: 1
+
+#### an address left dangling at a part boundary is `missing command'
+# The message GNU gives at the true end of a script, because to GNU the part
+# IS one. Reading the newline instead made the NEWLINE the unknown command --
+# a wording gap this closes as a side effect of getting the part right.
+## argv: sed -n -e 1 -e p A
+## file-json A: "a1\na2\n"
+## stdin-json: ""
+## stdout-json: ""
+## stderr-contains: sed: -e expression #1: missing command
+## status: 1
+
+#### every address form reaches it, `$' included
+## argv: sed -n -e '$' -e p A
+## file-json A: "a1\na2\n"
+## stdin-json: ""
+## stdout-json: ""
+## stderr-contains: sed: -e expression #1: missing command
+## status: 1
+
+#### while a real newline after an address IS the unknown command
+## argv: sed -n -f z.sed A
+## file-json z.sed: "1\np\n"
+## file-json A: "a1\na2\n"
+## stdin-json: ""
+## stdout-json: ""
+## stderr-json: "sed: file z.sed line 2: unknown command: `\n'\n"
+## status: 1
+
+#### and at the true end of a script it is `missing command' in both
+## argv: sed -n -f z.sed A
+## file-json z.sed: "1"
+## file-json A: "a1\na2\n"
+## stdin-json: ""
+## stdout-json: ""
+## stderr-json: "sed: file z.sed line 1: missing command\n"
+## status: 1
+
+#### a backslash at a part boundary has no newline to escape
+# This one was FAIL-OPEN: the pair crossed the boundary, so `sed -e 's/a/x\'
+# -e 'y/'` ran a substitution GNU refuses to compile. `a`/`i`/`c` text is the
+# deliberate exception and still crosses; a pattern or replacement does not.
+## argv: sed -n -e 's/a/x\' -e 'y/' A
+## file-json A: "a1\na2\n"
+## stdin-json: ""
+## stdout-json: ""
+## stderr-contains: sed: -e expression #1: unterminated `s' command
+## status: 1
+
+#### the pattern half the same way
+## argv: sed -n -e 's/a\' -e '1/X/' A
+## file-json A: "a1\na2\n"
+## stdin-json: ""
+## stdout-json: ""
+## stderr-contains: sed: -e expression #1: unterminated `s' command
+## status: 1
+
+#### and y, which reads its halves through the replacement reader
+## argv: sed -n -e 'y/ab/x\' -e 'y/' A
+## file-json A: "a1\na2\n"
+## stdin-json: ""
+## stdout-json: ""
+## stderr-contains: sed: -e expression #1: unterminated `y' command
+## status: 1
+
+#### while inside ONE part that same backslash still inserts a newline
+# The control: identical bytes, one argument, and the escape does its job.
+## argv: sed -n "s/a/x\\\ny/p" A
+## file-json A: "a1\na2\n"
+## stdin-json: ""
+## stdout-json: "x\ny1\nx\ny2\n"
+## stderr-json: ""
+## status: 0
+
+# --- `no previous regular expression' is the one SCRIPT error that cannot be
+# --- seen until a line RUNS -- the empty regex is legal, it is having no
+# --- earlier one to reuse that is not -- so GNU reports it with the position
+# --- its compile left behind: the END of the whole script, not where the `//'
+# --- is. Both spellings of the empty regex reach it, and both halves of that
+# --- (which part, which line) are cased.
+
+#### the empty ADDRESS regex names the LAST part, not the one holding it
+## argv: sed -n -e '//p' -e p A
+## file-json A: "a1\na2\n"
+## stdin-json: ""
+## stdout-json: ""
+## stderr-contains: sed: -e expression #2: no previous regular expression
+## status: 1
+
+#### and the empty s/// regex the same, after the lines it did run
+## argv: sed -n -e p -e p -e 's//x/' A
+## file-json A: "a1\na2\n"
+## stdin-json: ""
+## stdout-json: "a1\na1\n"
+## stderr-contains: sed: -e expression #3: no previous regular expression
+## status: 1
+
+#### in a -f script it is the line PAST the last, which is where GNU stopped
+## argv: sed -n -f z.sed A
+## file-json z.sed: "p\n//p\np\np\n"
+## file-json A: "a1\na2\n"
+## stdin-json: ""
+## stdout-json: "a1\n"
+## stderr-json: "sed: file z.sed line 5: no previous regular expression\n"
+## status: 1
+
+#### while an empty regex WITH an earlier one to reuse is no error at all
+## argv: sed -f z.sed A
+## file-json z.sed: "s/a/X/\ns//Y/\n"
+## file-json A: "a1\na2\n"
+## stdin-json: ""
+## stdout-json: "X1\nX2\n"
+## stderr-json: ""
+## status: 0

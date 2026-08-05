@@ -195,12 +195,14 @@ struct ScriptParser<'a> {
     sandbox: bool,
     /// `-z`. Only the `M` flag reads it: see `Options::reg_newline`.
     null_data: bool,
-    /// Offsets of the newlines that JOIN `-e`/`-f` parts. GNU ends a script part
-    /// like it ends the script for one question only -- whether `a`/`i`/`c` was
-    /// given any text -- so `sed -e a -e p` is an error where the one-argument
-    /// `sed 'a<newline>p'` is not, while `sed -e 'a\' -e text` still spans the
-    /// boundary because the backslash asked to. See `parse_text`.
-    part_ends: Vec<usize>,
+    /// Every `-e`/`-f` fragment: where it ENDS in `src`, and what to call it in a
+    /// diagnostic. The end doubles as the boundary the parse must respect, since
+    /// GNU compiles each part alone: a part's closing newline is that part's end
+    /// of input rather than a byte of the script, so `sed -e a -e p` is an error
+    /// where the one-argument `sed 'a<newline>p'` is not. `a`/`i`/`c` text is the
+    /// one thing GNU carries ACROSS that boundary, and only when a backslash asks
+    /// it to (`sed -e 'a\' -e text`). See `parse_text` and `at_part_end`.
+    parts: Vec<Part>,
     regexes: Vec<Regex>,
     wfiles: BTreeMap<Vec<u8>, WFile>,
 }
@@ -226,15 +228,28 @@ impl ScriptParser<'_> {
         false
     }
 
-    /// Is the parser at a newline that ENDS an `-e`/`-f` part? See `part_ends`.
+    /// Is the parser at a newline that ENDS an `-e`/`-f` part? Every part but
+    /// the last is followed by one, and `Part::end` is where it sits. The last
+    /// part's end is the source's length, where there is no byte to peek at, so
+    /// it cannot answer yes here.
     fn at_part_end(&self) -> bool {
-        self.peek() == Some(b'\n') && self.part_ends.contains(&self.pos)
+        self.peek() == Some(b'\n') && self.parts.iter().any(|p| p.end == self.pos)
     }
 
     fn skip_blank(&mut self) {
         while matches!(self.peek(), Some(b' ' | b'\t')) {
             self.pos += 1;
         }
+    }
+
+    /// Put the newline just read BACK, which is what GNU's `match_slash` does
+    /// before it reports an unterminated half — `savchar (ch); /* for proper
+    /// line number in error report */`. The position is where the diagnostic's
+    /// LINE and `-e` part come from, and a newline is exactly where one part
+    /// ends and the next begins, so keeping it reports the error one line, or
+    /// one `-e` argument, past the command that failed.
+    fn savchar(&mut self) {
+        self.pos = self.pos.saturating_sub(1);
     }
 
     /// What GNU skips where a COMMAND is expected: `;` plus its whole `ISSPACE`
@@ -363,12 +378,22 @@ impl ScriptParser<'_> {
             };
             // Ahead of bracket state too, so `s/[<newline>]/X/` is refused.
             if b == b'\n' {
+                self.savchar();
                 return Err(unterminated.to_string());
             }
             if b == delim && !in_bracket {
                 return Ok(out);
             }
             if b == b'\\' && !in_bracket {
+                // A part's closing newline is that part's end of input, so this
+                // backslash has nothing to escape and the half is unterminated
+                // — GNU compiled the part alone and ran out here. INSIDE one
+                // script the pair is an escaped newline, which is how a pattern
+                // carries one. `a`/`i`/`c` text is the deliberate exception and
+                // does cross the boundary; see `parse_text`.
+                if self.at_part_end() {
+                    return Err(unterminated.to_string());
+                }
                 let Some(n) = self.bump() else {
                     return Err(unterminated.to_string());
                 };
@@ -432,6 +457,7 @@ impl ScriptParser<'_> {
             return Err(unterminated.to_string());
         };
         if c == b'\n' {
+            self.savchar();
             return Err(unterminated.to_string());
         }
         out.push(c);
@@ -468,7 +494,16 @@ impl ScriptParser<'_> {
             }
             Some(b'\\') => {
                 self.pos += 1;
-                let delim = self.bump().ok_or_else(|| "unterminated address".to_string())?;
+                // Same rule as `s` and `y`: a part's closing newline is that
+                // part's end of input, so the refusal belongs to it and not to
+                // the part whose first byte would otherwise be the pattern.
+                if self.at_part_end() {
+                    return Err("unterminated address regex".to_string());
+                }
+                // GNU's wording for BOTH ways of running out here, and the two
+                // have to agree: a `\` with nothing after it is the same failure
+                // whether the script ended or its part did.
+                let delim = self.bump().ok_or_else(|| "unterminated address regex".to_string())?;
                 Ok(Some(self.parse_regex_addr(delim)?))
             }
             // `+N`/`~N` is an address FORM in any position, not only after a
@@ -547,9 +582,18 @@ impl ScriptParser<'_> {
                     self.skip_blank();
                     addr.a2 = Some(Addr2::Multiple(self.parse_number().unwrap_or(0)));
                 } else {
-                    let k = self
-                        .parse_addr_kind()?
-                        .ok_or_else(|| "unexpected `,'".to_string())?;
+                    let Some(k) = self.parse_addr_kind()? else {
+                        // GNU READS the byte that turned out not to be an address
+                        // before complaining (`in_nonblank`), so a real newline
+                        // has already moved its line count on. A part's closing
+                        // newline is that part's end of input and is not read at
+                        // all — the same rule the delimiters and `parse_filename`
+                        // follow, and the only reason this consumes anything.
+                        if self.peek() == Some(b'\n') && !self.at_part_end() {
+                            self.pos += 1;
+                        }
+                        return Err("unexpected `,'".to_string());
+                    };
                     addr.a2 = Some(Addr2::Kind(k));
                 }
             }
@@ -683,6 +727,13 @@ impl ScriptParser<'_> {
     /// through is exactly the fail-open this crate refuses everywhere else.
     fn parse_filename(&mut self) -> Result<Vec<u8>, String> {
         self.skip_blank();
+        // A part's closing newline is that part's end of input, and
+        // `rest_of_line` would CONSUME it — blaming the part after the one that
+        // really ran out. A newline inside a script is an ordinary byte, which
+        // GNU's `read_filename` consumes too, so only the boundary is special.
+        if self.at_part_end() {
+            return Err("missing filename in r/R/w/W commands".to_string());
+        }
         let name = self.rest_of_line();
         if name.is_empty() {
             return Err("missing filename in r/R/w/W commands".to_string());
@@ -702,6 +753,7 @@ impl ScriptParser<'_> {
             return Err(Fatal {
                 msg: "e/r/w commands disabled in sandbox mode".to_string(),
                 status: 1,
+                locus: None,
             });
         }
         Ok(())
@@ -740,12 +792,16 @@ impl ScriptParser<'_> {
     /// GNU reaches that flag before it compiles the pattern, so an unopenable
     /// target beats a bad regex or a bad backreference in the same `s`.
     fn parse_subst(&mut self) -> Result<Subst, Fatal> {
-        let delim = self.bump().ok_or_else(|| "unterminated `s' command".to_string())?;
-        // A backslash CAN delimit (`s\a\b\` is `s/a/b/`); a newline cannot, and
-        // GNU says so before reading anything else.
-        if delim == b'\n' {
+        // A backslash CAN delimit (`s\a\b\` is `s/a/b/`). A newline cannot, and
+        // WHICH newline it is decides where the refusal is: one that ENDS a part
+        // is that part's end of input -- GNU compiles each part alone, so there
+        // is no delimiter to take -- while one inside a script is a byte GNU
+        // really consumes as the delimiter, leaving the scan to fail on the next
+        // line. So this returns without consuming, and the scan handles the rest.
+        if self.at_part_end() {
             return Err("unterminated `s' command".to_string().into());
         }
+        let delim = self.bump().ok_or_else(|| "unterminated `s' command".to_string())?;
         let pattern = self.read_delimited(delim, "unterminated `s' command")?;
         let raw_repl = self.read_replacement(delim, "unterminated `s' command")?;
         let mut global = false;
@@ -851,12 +907,18 @@ impl ScriptParser<'_> {
                 return Err(unterminated.to_string());
             };
             if b == b'\n' {
+                self.savchar();
                 return Err(unterminated.to_string());
             }
             if b == delim {
                 return Ok(out);
             }
             if b == b'\\' {
+                // As in `read_delimited`: a part's closing newline is that
+                // part's end of input, so there is nothing here to escape.
+                if self.at_part_end() {
+                    return Err(unterminated.to_string());
+                }
                 let Some(n) = self.bump() else {
                     return Err(unterminated.to_string());
                 };
@@ -880,6 +942,11 @@ impl ScriptParser<'_> {
 
     fn parse_transliterate(&mut self) -> Result<Box<[u8; 256]>, String> {
         const UNTERM_Y: &str = "unterminated `y' command";
+        // As in `parse_subst`: a part's closing newline is its end of input, not
+        // a delimiter to be taken from the part after it.
+        if self.at_part_end() {
+            return Err(UNTERM_Y.to_string());
+        }
         let delim = self.bump().ok_or_else(|| UNTERM_Y.to_string())?;
         let from = normalize_buffer(&self.read_replacement(delim, UNTERM_Y)?)?;
         let to = normalize_buffer(&self.read_replacement(delim, UNTERM_Y)?)?;
@@ -1197,7 +1264,7 @@ fn parse_script(
     src: &[u8],
     ere: bool,
     null_data: bool,
-    part_ends: Vec<usize>,
+    parts: Vec<Part>,
     posix: bool,
     sandbox: bool,
 ) -> Result<Script, Fatal> {
@@ -1208,19 +1275,48 @@ fn parse_script(
         posix,
         sandbox,
         null_data,
-        part_ends,
+        parts,
         regexes: Vec::new(),
         wfiles: BTreeMap::new(),
     };
+    // Parsed by a function of its own so the parser SURVIVES its own failure:
+    // `?` returns from THERE, leaving `p.pos` readable here. That position is the
+    // only thing that can name where a compile error happened, and every `?` in
+    // the body would otherwise discard it.
+    let parsed = parse_commands(&mut p);
+    // Only an exit-1 failure gets a locus: a `w` target that would not open, or a
+    // pattern GNU reports bare, is not about a place in the script even though
+    // the parser was standing in one when it happened.
+    parsed.map_err(|f| match f.status {
+        1 => Fatal { locus: locus_at(&p.parts, src, p.pos), ..f },
+        _ => f,
+    })
+}
+
+/// The command loop itself. Split from `parse_script` for the reason given
+/// there: its caller reads `p.pos` after it fails.
+fn parse_commands(p: &mut ScriptParser) -> Result<Script, Fatal> {
     let mut cmds: Vec<Cmd> = Vec::new();
     let mut labels: BTreeMap<Vec<u8>, usize> = BTreeMap::new();
-    let mut open_blocks: Vec<usize> = Vec::new();
+    // (command index, where the `{` is) — the position because an unmatched one
+    // is reported where the BRACE is, not where the script ran out.
+    let mut open_blocks: Vec<(usize, usize)> = Vec::new();
     loop {
         p.skip_separators();
         if p.peek().is_none() {
             break;
         }
         let mut addr = p.parse_addr()?;
+        // A part's closing newline is that part's end of input, so an address
+        // left dangling on it is GNU's `missing command` -- the same message
+        // this reports at the true end of a script, because to GNU, which
+        // compiled the part alone, it IS the end. Reading the newline instead
+        // made it the unknown command and blamed the part after the one that
+        // ran out. A newline INSIDE a script is an ordinary byte, and there GNU
+        // reads it and calls it unknown too.
+        if p.at_part_end() {
+            return Err("missing command".to_string().into());
+        }
         let Some(c) = p.bump() else {
             return Err("missing command".to_string().into());
         };
@@ -1232,11 +1328,11 @@ fn parse_script(
         }
         let kind = match c {
             b'{' => {
-                open_blocks.push(cmds.len());
+                open_blocks.push((cmds.len(), p.pos.saturating_sub(1)));
                 Kind::Block(0) // patched when the matching `}` is seen
             }
             b'}' => {
-                let Some(open) = open_blocks.pop() else {
+                let Some((open, _)) = open_blocks.pop() else {
                     return Err("unexpected `}'".to_string().into());
                 };
                 // After the unmatched test, not before it: `sed '1}'` is GNU's
@@ -1405,10 +1501,19 @@ fn parse_script(
         }
         cmds.push(Cmd { addr, kind });
     }
-    if !open_blocks.is_empty() {
+    // The INNERMOST unmatched brace, which is what GNU's block stack hands
+    // `check_final_program`, and its own position rather than the end of the
+    // script: `{` on line 2 of four is `line 2` there.
+    if let Some((_, brace)) = open_blocks.last() {
+        p.pos = *brace;
         return Err("unmatched `{'".to_string().into());
     }
-    Ok(Script { cmds, regexes: p.regexes, labels, wfiles: p.wfiles })
+    Ok(Script {
+        cmds,
+        regexes: std::mem::take(&mut p.regexes),
+        labels,
+        wfiles: std::mem::take(&mut p.wfiles),
+    })
 }
 
 /// Turn every branch's label name into a command index. Done after the whole
@@ -2203,6 +2308,56 @@ fn expand(repl: &[Repl], hay: &[u8], caps: &Captures, out: &mut Vec<u8>) {
     }
 }
 
+/// One `-e`/`-f` fragment of the script, and where in `source` it ends. GNU
+/// numbers `-e` parts and NAMES `-f` ones, and the counter does not advance for
+/// a file -- `sed -f s.sed -e Z` is `expression #1`.
+#[derive(Debug)]
+enum Origin {
+    /// `-e`, `--expression=`, or the bare script operand.
+    Expression(usize),
+    /// `-f`/`--file=`, carrying the name as it was written (`-` stays `-`).
+    File(Vec<u8>),
+}
+
+#[derive(Debug)]
+struct Part {
+    /// Offset in `source` one past this part's last byte.
+    end: usize,
+    origin: Origin,
+}
+
+/// How GNU names the place a script failed to compile. An `-e` part is named by
+/// NUMBER and an `-f` one by file and LINE, the line counted within that file --
+/// so the position has to be resolved against the part it falls in, not the
+/// whole joined script.
+///
+/// `pos <= end` rather than `<`: a position AT a part's end has consumed that
+/// whole part and nothing of the next, which is the ordinary shape of an error
+/// raised on a part's last byte. GNU compiles each part on its own, so it can
+/// never blame the one after. The last part's `end` is the whole source's
+/// length and the parser never steps past it, so the search finds a part for
+/// every position it is asked about; None here means an empty script.
+fn locus_at(parts: &[Part], src: &[u8], pos: usize) -> Option<String> {
+    // `position` rather than the iterator method whose NAME is also a retired
+    // host tool's: this file is embedded verbatim in td-txt's recipe, and the
+    // ladder guard scans that text for the bare token (recipes/src/ladder.rs).
+    let idx = parts.iter().position(|p| pos <= p.end)?;
+    let part = parts.get(idx)?;
+    let start = match idx.checked_sub(1) {
+        // +1 steps over the newline joining this part to the one before it.
+        Some(prev) => parts.get(prev).map_or(0, |p| p.end + 1),
+        None => 0,
+    };
+    match &part.origin {
+        Origin::Expression(n) => Some(format!("-e expression #{n}")),
+        Origin::File(name) => {
+            let within = src.get(start..pos).unwrap_or_default();
+            let line = 1 + within.iter().filter(|b| **b == b'\n').count();
+            Some(format!("file {} line {}", show(name), line))
+        }
+    }
+}
+
 #[derive(Debug)]
 /// A fatal error and the status GNU sed exits with for it: 1 for a bad script
 /// or usage, 2 for an unreadable input, 4 for a runtime failure — of which an
@@ -2210,6 +2365,10 @@ fn expand(repl: &[Repl], hay: &[u8], caps: &Captures, out: &mut Vec<u8>) {
 struct Fatal {
     msg: String,
     status: i32,
+    /// Where the script went wrong, already formatted: `-e expression #2` or
+    /// `file s.sed line 3`. Only a COMPILE failure has one; a runtime failure is
+    /// not about a place in the script and GNU reports it bare.
+    locus: Option<String>,
 }
 
 impl From<String> for Fatal {
@@ -2218,7 +2377,7 @@ impl From<String> for Fatal {
         // alone among pattern errors; classified here by text for the same reason
         // NO_PREVIOUS_REGEX is, so the raising site and this boundary cannot drift.
         let status = if msg == crate::regex::CLASS_SYNTAX { 4 } else { 1 };
-        Self { msg, status }
+        Self { msg, status, locus: None }
     }
 }
 
@@ -2239,7 +2398,7 @@ impl Fatal {
     /// here or it lands in the wrong bucket wearing the wrong prefix.
     fn runtime(msg: String) -> Self {
         let status = if msg == NO_PREVIOUS_REGEX { 1 } else { 4 };
-        Self { msg, status }
+        Self { msg, status, locus: None }
     }
 }
 
@@ -2260,15 +2419,13 @@ pub fn main(args: &[Vec<u8>]) -> i32 {
     match run(args) {
         Ok(code) => code,
         Err(f) => {
-            // The `-e expression #N' prefix belongs to a failure to COMPILE the
-            // script (exit 1). A runtime failure — an unopenable `-f' file, an
-            // unresolvable label (exit 4) — is not about an expression, and GNU
-            // reports it bare; naming an expression there points at the wrong
-            // thing.
-            if f.status == 1 {
-                eprintln!("sed: -e expression #1: {}", f.msg);
-            } else {
-                eprintln!("sed: {}", f.msg);
+            // A LOCUS is attached only where the script is what is wrong, so
+            // having one IS the condition: a runtime failure — an unopenable
+            // `-f' file, an unresolvable label (exit 4) — is not about a place
+            // in the script and GNU reports it bare.
+            match &f.locus {
+                Some(locus) => eprintln!("sed: {locus}: {}", f.msg),
+                None => eprintln!("sed: {}", f.msg),
             }
             f.status
         }
@@ -2282,12 +2439,13 @@ fn compile_script(
     ere: bool,
     sandbox: bool,
     null_data: bool,
-    part_ends: Vec<usize>,
+    parts: Vec<Part>,
     posix: bool,
 ) -> Result<Script, Fatal> {
-    let mut script = parse_script(src, ere, null_data, part_ends, posix, sandbox)?;
+    let mut script = parse_script(src, ere, null_data, parts, posix, sandbox)?;
     let labels = std::mem::take(&mut script.labels);
-    resolve_labels(&mut script.cmds, &labels).map_err(|msg| Fatal { msg, status: 4 })?;
+    resolve_labels(&mut script.cmds, &labels)
+        .map_err(|msg| Fatal { msg, status: 4, locus: None })?;
     Ok(script)
 }
 
@@ -2369,7 +2527,9 @@ fn run(args: &[Vec<u8>]) -> Result<i32, Fatal> {
             .and_then(|v| cols_line_wrap(v.as_bytes()))
             .unwrap_or(DEFAULT_LINE_WRAP),
     };
-    let mut script_parts: Vec<Vec<u8>> = Vec::new();
+    // Each fragment with where it came from, so a compile error can name the
+    // `-e` NUMBER or the `-f` FILE the way GNU does.
+    let mut script_parts: Vec<(Option<Vec<u8>>, Vec<u8>)> = Vec::new();
     // Only the FIRST script part can carry `#n`, and a `-f` one carries it only
     // if its stream can seek. A literal or `-e` part always can.
     let mut hash_n_carries = true;
@@ -2492,13 +2652,14 @@ fn run(args: &[Vec<u8>]) -> Result<i32, Fatal> {
                             let (text, seekable) = read_script(&value).map_err(|e| Fatal {
                                 msg: format!("couldn't open file {}: {}", show(&value), errmsg(&e)),
                                 status: 4,
+                                locus: None,
                             })?;
                             if script_parts.is_empty() {
                                 hash_n_carries = seekable;
                             }
-                            script_parts.push(text);
+                            script_parts.push((Some(value), text));
                         } else {
-                            script_parts.push(value);
+                            script_parts.push((None, value));
                         }
                         script_given = true;
                     }
@@ -2551,7 +2712,7 @@ fn run(args: &[Vec<u8>]) -> Result<i32, Fatal> {
                     let Some(v) = value_of(&mut j, &mut i) else {
                         return Ok(missing_short_argument(b'e'));
                     };
-                    script_parts.push(v);
+                    script_parts.push((None, v));
                     script_given = true;
                 }
                 b'f' => {
@@ -2563,11 +2724,12 @@ fn run(args: &[Vec<u8>]) -> Result<i32, Fatal> {
                     let (text, seekable) = read_script(&v).map_err(|e| Fatal {
                         msg: format!("couldn't open file {}: {}", show(&v), errmsg(&e)),
                         status: 4,
+                        locus: None,
                     })?;
                     if script_parts.is_empty() {
                         hash_n_carries = seekable;
                     }
-                    script_parts.push(text);
+                    script_parts.push((Some(v), text));
                     script_given = true;
                 }
                 _ => {
@@ -2582,7 +2744,7 @@ fn run(args: &[Vec<u8>]) -> Result<i32, Fatal> {
     let mut operands = operands.into_iter();
     if !script_given {
         match operands.next() {
-            Some(s) => script_parts.push(s),
+            Some(s) => script_parts.push((None, s)),
             None => {
                 eprintln!("{USAGE}");
                 return Ok(1);
@@ -2592,13 +2754,21 @@ fn run(args: &[Vec<u8>]) -> Result<i32, Fatal> {
     let files: Vec<Vec<u8>> = operands.collect();
 
     let mut source: Vec<u8> = Vec::new();
-    let mut part_ends: Vec<usize> = Vec::new();
-    for (n, part) in script_parts.iter().enumerate() {
+    let mut parts: Vec<Part> = Vec::new();
+    let mut expr_no = 0usize;
+    for (n, (name, body)) in script_parts.iter().enumerate() {
         if n > 0 {
-            part_ends.push(source.len());
             source.push(b'\n');
         }
-        source.extend_from_slice(part);
+        source.extend_from_slice(body);
+        let origin = match name {
+            Some(f) => Origin::File(f.clone()),
+            None => {
+                expr_no += 1;
+                Origin::Expression(expr_no)
+            }
+        };
+        parts.push(Part { end: source.len(), origin });
     }
     // `#n` is POSIX's in-script spelling of -n, and the rule is about the first
     // two BYTES of the script, not the first line: `#nx` and `#n;p` suppress in
@@ -2608,9 +2778,34 @@ fn run(args: &[Vec<u8>]) -> Result<i32, Fatal> {
         conf.suppress = true;
     }
 
-    let mut script =
-        compile_script(&source, conf.ere, conf.sandbox, conf.null_data, part_ends, conf.posix)?;
+    // GNU reports `no previous regular expression' -- the one SCRIPT error it
+    // cannot see until a line RUNS -- with the position its compile left behind,
+    // which is the END of the whole script and not where the `//' is: a four-line
+    // `-f' script says `line 5', and `-e '//p' -e p' says expression #2. So the
+    // locus is taken here, while the parts are still in hand, and attached below
+    // to whatever exit-1 failure comes back without one.
+    let script_end = locus_at(&parts, &source, source.len());
     let separator = separator_for(conf.null_data);
+    compile_and_run(conf, &source, parts, files, separator).map_err(|f| {
+        match (f.status, &f.locus) {
+            (1, None) => Fatal { locus: script_end, ..f },
+            _ => f,
+        }
+    })
+}
+
+/// The rest of a run once the script text is assembled: compile it, then read the
+/// operands through it. Split from `run` so the LOCUS a deferred script error
+/// needs (see the caller) outlives every `?` in here.
+fn compile_and_run(
+    conf: Conf,
+    source: &[u8],
+    parts: Vec<Part>,
+    files: Vec<Vec<u8>>,
+    separator: u8,
+) -> Result<i32, Fatal> {
+    let mut script =
+        compile_script(source, conf.ere, conf.sandbox, conf.null_data, parts, conf.posix)?;
     let seed = seed_ranges(&script.cmds);
     let wfiles = std::mem::take(&mut script.wfiles);
     let mut sed = Sed {
@@ -3940,7 +4135,15 @@ mod tests {
     /// that question only -- the same bytes as one argument are legal.
     #[test]
     fn a_text_command_needs_text_only_where_its_part_ends() {
-        let compile = |src: &[u8], parts: Vec<usize>| {
+        // Ends of the `-e` parts, as `run` builds them: each part's last byte + 1,
+        // the last part's end being the whole script.
+        let compile = |src: &[u8], ends: Vec<usize>| {
+            let mut parts: Vec<Part> = ends
+                .iter()
+                .enumerate()
+                .map(|(i, e)| Part { end: *e, origin: Origin::Expression(i + 1) })
+                .collect();
+            parts.push(Part { end: src.len(), origin: Origin::Expression(parts.len() + 1) });
             compile_script(src, false, false, false, parts, false).err().map(|f| f.status)
         };
         // `sed a` and `sed -e a -e p`: nothing after the command in its own part.
@@ -3950,6 +4153,36 @@ mod tests {
         assert_eq!(compile(b"a\np", Vec::new()), None);
         // A backslash asks for the next line, so it crosses the boundary.
         assert_eq!(compile(b"a\\\ntext", vec![2]), None);
+    }
+
+    /// EVERY position of a mixed script, not a few interesting ones: which part
+    /// owns a position is a partition, and a partition tested from one side only
+    /// is how an off-by-one at a boundary survives. Both boundaries here are the
+    /// case that matters — a position AT a part's end has consumed that part and
+    /// none of the next, so it is still the earlier part's.
+    #[test]
+    fn every_position_of_a_joined_script_names_the_part_it_fell_in() {
+        // `sed -e p -f s.sed -e d` with `s.sed` holding `q\nZ`.
+        let src = b"p\nq\nZ\nd";
+        let parts = vec![
+            Part { end: 1, origin: Origin::Expression(1) },
+            Part { end: 5, origin: Origin::File(b"s.sed".to_vec()) },
+            Part { end: 7, origin: Origin::Expression(2) },
+        ];
+        let want = [
+            "-e expression #1",  // 0: `p'
+            "-e expression #1",  // 1: consumed `p', nothing of the file
+            "file s.sed line 1", // 2: `q'
+            "file s.sed line 1", // 3: consumed `q'
+            "file s.sed line 2", // 4: `Z'
+            "file s.sed line 2", // 5: consumed `Z', nothing of the last part
+            "-e expression #2",  // 6: `d'
+            "-e expression #2",  // 7: consumed the whole script
+        ];
+        for (pos, w) in want.iter().enumerate() {
+            assert_eq!(locus_at(&parts, src, pos).as_deref(), Some(*w), "at {pos}");
+        }
+        assert_eq!(locus_at(&[], src, 0), None);
     }
 
     /// The vocabulary is decoded before any parser reads the text, and the byte it
