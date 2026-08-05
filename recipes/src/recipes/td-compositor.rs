@@ -267,11 +267,11 @@ mod tests {
     /// a path not ending in its constant, which makes a wrong STORE path a
     /// build failure.
     ///
-    /// It does NOT make the entry reachable: the child is given
-    /// `TERMINFO=/etc/terminfo`, and nothing in the image exposes this store
-    /// directory there yet, so ncurses still cannot look `td-term` up at
-    /// runtime. That exposure needs an immutable-symlink category in the
-    /// image's read-only-/etc invariant and is a separate landing.
+    /// Reaching it is the image's half: the child is given
+    /// `TERMINFO=/etc/terminfo`, and `IMMUTABLE_ETC` in the system recipe
+    /// points that name at this directory — the category that landing added
+    /// for exactly this, since every other `/etc` symlink there dangles by
+    /// design and this one must not.
     #[test]
     fn the_terminfo_entry_is_installed_where_the_encoder_expects() {
         let terminfo = MODULES

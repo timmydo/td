@@ -1733,6 +1733,32 @@ struct MutableEtc {
 #[cfg(test)]
 const STATE_DIR: &str = "/var/lib/td";
 
+/// A name under the read-only `/etc` that points INTO the store.
+///
+/// The opposite of `MUTABLE_ETC` in every respect that matters: the target is
+/// image content rather than per-machine state, so the symlink resolves at
+/// build time rather than dangling, and it must never be written to. It
+/// exists because some readers only know one path — ncurses looks a terminal
+/// up under `TERMINFO`, and the store path a package lands at is content
+/// addressed and so cannot be spelled in an environment variable.
+struct ImmutableEtc {
+    /// Path under `/etc` — the stable name the reader knows.
+    etc: &'static str,
+    /// Absolute symlink target inside the store.
+    target: &'static str,
+    /// Which reader only knows the `/etc` name, and why the store path cannot
+    /// be given to it directly.
+    why: &'static str,
+}
+
+const IMMUTABLE_ETC: &[ImmutableEtc] = &[ImmutableEtc {
+    etc: "terminfo",
+    target: "{in:td-compositor}/share/terminfo",
+    why: "ncurses resolves TERM through TERMINFO, and td-term hands its child \
+          TERMINFO=/etc/terminfo because a content-addressed store path is not \
+          a name any child could have been given",
+}];
+
 const MUTABLE_ETC: &[MutableEtc] = &[
     MutableEtc {
         etc: "resolv.conf",
@@ -2135,6 +2161,12 @@ fn real_root_steps(sys: &SystemDef) -> Vec<Step> {
         target: "{in:td-compositor}/bin/td-ui-demo".into(),
         link: "{root}/real-root/bin/td-ui-demo".into(),
     });
+    // The terminal. Packaged beside the demo rather than in place of it: the
+    // boot still starts the demo, and cutting that over is its own landing.
+    steps.push(Step::Symlink {
+        target: "{in:td-compositor}/bin/td-term".into(),
+        link: "{root}/real-root/bin/td-term".into(),
+    });
     // /bin/td-util is the multicall's own entry (`td-util <applet>`, and `--list`); the loop
     // below is the argv[0] farm the diagnostics names resolve through.
     steps.push(Step::Symlink {
@@ -2198,6 +2230,15 @@ fn real_root_steps(sys: &SystemDef) -> Vec<Step> {
         });
     }
     for entry in MUTABLE_ETC {
+        steps.push(Step::Symlink {
+            target: entry.target.into(),
+            link: format!("{{root}}/real-root/etc/{}", entry.etc),
+        });
+    }
+    // The immutable /etc: names that resolve INTO the store. Unlike the table
+    // above these are not dangling — the target is image content — and nothing
+    // ever writes through them.
+    for entry in IMMUTABLE_ETC {
         steps.push(Step::Symlink {
             target: entry.target.into(),
             link: format!("{{root}}/real-root/etc/{}", entry.etc),
@@ -2292,6 +2333,13 @@ fn shape_check() -> String {
          [ \"$(readlink \"$root/etc/$l\")\" = \"$t\" ] || { echo \"root tree: /etc/$l must be a symlink to $t - it is a reviewed MUTABLE_ETC entry, so its writes must land on the state it names and nowhere else\" >&2; exit 1; }; \
          grep -q -F \"$l  \" \"$root/etc/mutable-state\" || { echo \"root tree: /etc/mutable-state does not document /etc/$l - the shipped list of holes in the read-only /etc must name every one of them\" >&2; exit 1; }; \
      done; \
+     @IMMUTABLE_ETC_WHY@; \
+     for pair in @IMMUTABLE_ETC@; do \
+         l=${pair%%=*}; t=${pair#*=}; \
+         [ \"$(readlink \"$root/etc/$l\")\" = \"$t\" ] || { echo \"root tree: /etc/$l must be a symlink to $t - it is a reviewed IMMUTABLE_ETC entry, so it must name the store path its readers resolve through\" >&2; exit 1; }; \
+         [ -e \"{root}/real-root$t\" ] || { echo \"root tree: /etc/$l points at $t, which is not packed under real-root - unlike a MUTABLE_ETC hole, an IMMUTABLE_ETC target is image content and a dangle here is a fault the running system cannot repair\" >&2; exit 1; }; \
+         if grep -q -F \"$l  \" \"$root/etc/mutable-state\"; then echo \"root tree: /etc/mutable-state documents /etc/$l as per-machine state, but it is an IMMUTABLE_ETC entry pointing into the read-only store - one of the two tables is wrong\" >&2; exit 1; fi; \
+     done; \
      ( cd \"$root/etc\" || exit 1; \
        for p in * .*; do \
            { [ -d \"$p\" ] && [ ! -L \"$p\" ]; } || continue; \
@@ -2299,15 +2347,18 @@ fn shape_check() -> String {
            seen=0; for d in @MUTABLE_ETC_DIRS@; do if [ \"$d\" = \"$p\" ]; then seen=1; fi; done; \
            [ \"$seen\" = 1 ] || { echo \"root tree: /etc/$p is a directory no MUTABLE_ETC entry declares, so the symlink sweep below cannot look inside it - add the entry that needs it (or the sweep stops being a proof)\" >&2; exit 1; }; \
        done; \
-       n=0; \
+       m=0; i=0; \
        for p in @ETC_GLOBS@; do \
            [ -L \"$p\" ] || continue; \
            case $p in .|..) continue;; esac; \
-           n=$((n+1)); \
            seen=0; for a in @MUTABLE_ETC_NAMES@; do if [ \"$a\" = \"$p\" ]; then seen=1; fi; done; \
-           [ \"$seen\" = 1 ] || { echo \"root tree: /etc/$p is a symlink out of the immutable /etc but is not a reviewed MUTABLE_ETC entry - the read-only-/etc invariant is only as strong as the list of holes in it\" >&2; exit 1; }; \
+           if [ \"$seen\" = 1 ]; then m=$((m+1)); continue; fi; \
+           for a in @IMMUTABLE_ETC_NAMES@; do if [ \"$a\" = \"$p\" ]; then seen=2; fi; done; \
+           [ \"$seen\" = 2 ] || { echo \"root tree: /etc/$p is a symlink out of the immutable /etc but is in NEITHER the MUTABLE_ETC nor the IMMUTABLE_ETC table - the read-only-/etc invariant is only as strong as the list of holes in it\" >&2; exit 1; }; \
+           i=$((i+1)); \
        done; \
-       [ \"$n\" = @MUTABLE_ETC_COUNT@ ] || { echo \"root tree: found $n symlinks under /etc but MUTABLE_ETC declares @MUTABLE_ETC_COUNT@ - the counts must agree or a hole is unaccounted for in either direction\" >&2; exit 1; }; \
+       [ \"$m\" = @MUTABLE_ETC_COUNT@ ] || { echo \"root tree: found $m mutable symlinks under /etc but MUTABLE_ETC declares @MUTABLE_ETC_COUNT@ - the counts must agree or a hole is unaccounted for in either direction\" >&2; exit 1; }; \
+       [ \"$i\" = @IMMUTABLE_ETC_COUNT@ ] || { echo \"root tree: found $i store-pointing symlinks under /etc but IMMUTABLE_ETC declares @IMMUTABLE_ETC_COUNT@ - the counts must agree or a link into the store is unaccounted for in either direction\" >&2; exit 1; }; \
      ) || exit 1; \
      case $(readlink \"$root/bin/td-netd\") in /td/store/*/bin/td-netd) : ;; *) echo 'root tree: /bin/td-netd is not a symlink into /td/store - the network daemon /bin entry regressed' >&2; exit 1;; esac; \
      tnd=\"{root}/real-root{in:td-netd}/bin/td-netd\"; { [ -f \"$tnd\" ] && [ -x \"$tnd\" ]; } || { echo 'root tree: the td-netd binary is not packed/executable at real-root{in:td-netd}/bin/td-netd - the /bin/td-netd symlink would dangle' >&2; exit 1; }; \
@@ -2368,6 +2419,9 @@ fn shape_check() -> String {
      compositor=\"{root}/real-root{in:td-compositor}/bin/td-compositor\"; { [ -f \"$compositor\" ] && [ -x \"$compositor\" ]; } || { echo 'root tree: td-compositor is not packed and executable' >&2; exit 1; }; \
      [ \"$(readlink \"$root/bin/td-ui-demo\" 2>/dev/null)\" = \"{in:td-compositor}/bin/td-ui-demo\" ] || { echo 'root tree: /bin/td-ui-demo is not a symlink to the staged td-native Wayland client' >&2; exit 1; }; \
      uidemo=\"{root}/real-root{in:td-compositor}/bin/td-ui-demo\"; { [ -f \"$uidemo\" ] && [ -x \"$uidemo\" ]; } || { echo 'root tree: td-ui-demo is not packed and executable' >&2; exit 1; }; \
+     [ \"$(readlink \"$root/bin/td-term\" 2>/dev/null)\" = \"{in:td-compositor}/bin/td-term\" ] || { echo 'root tree: /bin/td-term is not a symlink to the staged terminal' >&2; exit 1; }; \
+     tdterm=\"{root}/real-root{in:td-compositor}/bin/td-term\"; { [ -f \"$tdterm\" ] && [ -x \"$tdterm\" ]; } || { echo 'root tree: td-term is not packed/executable at real-root{in:td-compositor}/bin/td-term - the /bin/td-term symlink would dangle' >&2; exit 1; }; \
+     [ -f \"{root}/real-root{in:td-compositor}/share/terminfo/t/td-term\" ] || { echo 'root tree: the td-term terminfo entry is not packed, so /etc/terminfo resolves to a tree without it' >&2; exit 1; }; \
      tdsplan=$(\"$tds\" check -f \"$root@TD_SVC_CONF@\" 2>&1) || { echo 'td-svc check REJECTED the unit table this image ships - the boot would run a table the supervisor only partly understood. Its diagnostics:' >&2; printf '%s\\n' \"$tdsplan\" >&2; exit 1; }; \
      for u in @TD_SVC_UNITS@; do \
          printf '%s\\n' \"$tdsplan\" | grep -q -E \"^[0-9]+\\. $u\\$\" || { echo \"td-svc check resolved a start order without '$u' - a unit the inittab used to run is missing from the plan\" >&2; exit 1; }; \
@@ -2458,6 +2512,34 @@ fn shape_check() -> String {
                 .join(" "),
         )
         .replace("@MUTABLE_ETC_NAMES@", &mutable_etc_names().join(" "))
+        .replace(
+            "@IMMUTABLE_ETC@",
+            &IMMUTABLE_ETC
+                .iter()
+                .map(|entry| format!("{}={}", entry.etc, entry.target))
+                .collect::<Vec<_>>()
+                .join(" "),
+        )
+        .replace(
+            "@IMMUTABLE_ETC_NAMES@",
+            &IMMUTABLE_ETC
+                .iter()
+                .map(|entry| entry.etc)
+                .collect::<Vec<_>>()
+                .join(" "),
+        )
+        .replace("@IMMUTABLE_ETC_COUNT@", &IMMUTABLE_ETC.len().to_string())
+        // Each reason rides into the generated script as a `:` no-op, the form
+        // this file already uses for in-script commentary. A hole in the
+        // read-only /etc should say why it is there where it is checked.
+        .replace(
+            "@IMMUTABLE_ETC_WHY@",
+            &IMMUTABLE_ETC
+                .iter()
+                .map(|entry| format!(": '/etc/{}: {}'", entry.etc, entry.why))
+                .collect::<Vec<_>>()
+                .join("; "),
+        )
         // One glob per directory the table uses, relative to /etc — a sweep for
         // symlinks the table does not name. Globs rather than a recursive walk
         // because the ladder guard bans the host directory-walk tools by name, and
@@ -4333,6 +4415,196 @@ mod tests {
                 "/etc/{generated} is both generated image config and a MUTABLE_ETC entry"
             );
         }
+    }
+
+    /// Every immutable-/etc name resolves INTO the store, is staged as a
+    /// symlink, and is never also written as a file. The distinction from the
+    /// mutable table is the point: those are deliberately dangling, and a
+    /// dangling `/etc/terminfo` is a terminal whose child cannot look up its
+    /// own TERM — which nothing on the boot path reports, because a program
+    /// that cannot resolve TERM just draws badly.
+    #[test]
+    fn every_immutable_etc_entry_points_into_the_store() {
+        let steps = real_root_steps(&SYSTEM);
+        for entry in IMMUTABLE_ETC {
+            let link = format!("{{root}}/real-root/etc/{}", entry.etc);
+            assert!(
+                entry.target.starts_with("{in:"),
+                "/etc/{} does not point into a staged package, so it is not immutable content",
+                entry.etc
+            );
+            assert!(
+                steps.iter().any(|step| matches!(
+                    step,
+                    Step::Symlink { target, link: at } if at == &link && target == entry.target
+                )),
+                "nothing stages /etc/{} as a symlink to {}",
+                entry.etc,
+                entry.target
+            );
+            // The target must name a package this image actually STAGES.
+            // Pointing INTO the store is only syntax:
+            // `{in:busybox-x86-64}/share/foo` satisfies it and would ship a
+            // dangling link, busybox being a BUILD tool the shape check
+            // separately refuses to find under real-root at all.
+            let input = entry
+                .target
+                .split_once('}')
+                .map(|(head, _)| format!("{head}}}"))
+                .unwrap_or_default();
+            let staged = steps.iter().any(|step| match step {
+                Step::CopyTree { from, dest } => {
+                    from == &input && dest == &format!("{{root}}/real-root{input}")
+                }
+                Step::StageRuntimeClosure { roots, dest } => {
+                    roots.contains(&input) && dest == "{root}/real-root"
+                }
+                _ => false,
+            });
+            assert!(
+                staged,
+                "/etc/{} points into {input}, which nothing stages under real-root",
+                entry.etc
+            );
+            // Exactly ONE step may touch the name, whatever its kind. A
+            // WriteFile, a MkDir, or a second Symlink with a different target
+            // would all be resolved by step ORDER rather than by this table.
+            let touching = steps
+                .iter()
+                .filter(|step| match step {
+                    Step::Symlink { link: at, .. } => at == &link,
+                    Step::WriteFile { path, .. } | Step::MkDir { path } => path == &link,
+                    _ => false,
+                })
+                .count();
+            assert_eq!(
+                touching, 1,
+                "/etc/{} is staged by {touching} steps, not one",
+                entry.etc
+            );
+            // The two tables must not name the same path: one dangles by
+            // design and the other must not, so whichever step ran last would
+            // decide which.
+            assert!(
+                !MUTABLE_ETC.iter().any(|mutable| mutable.etc == entry.etc),
+                "/etc/{} is in both the mutable and immutable tables",
+                entry.etc
+            );
+        }
+    }
+
+    /// The `/etc` symlink sweep must know about BOTH tables.
+    ///
+    /// It is not a check that merely skips what it does not recognise: it
+    /// counts every symlink under `/etc` and compares the total against a
+    /// declared one, so a table it has never heard of does not go unchecked —
+    /// it reports the link as unreviewed and fails every system build. That
+    /// failure is invisible to `cargo test`, because the sweep is shell that
+    /// runs inside the image build, which is why it is asserted here.
+    #[test]
+    fn the_etc_symlink_sweep_counts_both_tables() {
+        let check = shape_check();
+        let names = |table: &[&str]| format!("for a in {}; do", table.join(" "));
+        let immutable: Vec<&str> = IMMUTABLE_ETC.iter().map(|entry| entry.etc).collect();
+        let mutable = mutable_etc_names();
+        assert!(
+            check.contains(&names(&immutable)),
+            "the sweep's allowlist does not name every IMMUTABLE_ETC entry"
+        );
+        assert!(
+            check.contains(&names(&mutable)),
+            "the sweep's allowlist does not name every MUTABLE_ETC entry"
+        );
+        // Each table is counted against its OWN length rather than a merged
+        // total, so a link moving between the tables is still a mismatch.
+        assert!(
+            check.contains(&format!(r#"[ "$m" = {} ]"#, MUTABLE_ETC.len())),
+            "the sweep does not compare the mutable count against MUTABLE_ETC"
+        );
+        assert!(
+            check.contains(&format!(r#"[ "$i" = {} ]"#, IMMUTABLE_ETC.len())),
+            "the sweep does not compare the immutable count against IMMUTABLE_ETC"
+        );
+    }
+
+    /// An `IMMUTABLE_ETC` row reaches the shape check as an unquoted
+    /// `name=target` word, and its target as a `{in:…}` reference the engine
+    /// expands. Both halves must survive that unquoted.
+    #[test]
+    fn immutable_etc_paths_are_shell_safe_and_well_formed() {
+        assert!(!IMMUTABLE_ETC.is_empty());
+        let safe = |path: &str| {
+            path.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-' | b'/'))
+        };
+        for entry in IMMUTABLE_ETC {
+            let etc = entry.etc;
+            assert!(
+                !etc.is_empty() && !etc.starts_with('/') && !etc.ends_with('/'),
+                "/etc/{etc}: the table stores a path RELATIVE to /etc"
+            );
+            assert!(
+                !etc.starts_with('-') && !etc.contains("/-"),
+                "/etc/{etc}: a leading '-' in any component is read as an OPTION by the \
+                 `readlink`/`test` the generated shell runs on it"
+            );
+            // Flat names only. `real_root_steps` stages the link with no MkDir
+            // ahead of it, and `etc_globs` sweeps exactly the levels MUTABLE_ETC
+            // declares — so a nested entry would be staged into a directory
+            // nothing creates and swept by nothing.
+            assert!(
+                !etc.contains('/'),
+                "/etc/{etc} is nested, but nothing creates its parent directory and the \
+                 unreviewed-symlink sweep would not reach it"
+            );
+            assert!(safe(etc), "/etc/{etc} is not safe unquoted in the generated shell");
+            // The target is a store reference rather than a literal path: the
+            // hash a package lands under is not knowable here.
+            let rest = entry
+                .target
+                .strip_prefix("{in:")
+                .and_then(|rest| rest.split_once('}'))
+                .map(|(input, rest)| {
+                    assert!(safe(input), "{input:?} is not a safe input name");
+                    rest
+                });
+            let Some(rest) = rest else {
+                panic!("/etc/{etc} points at {:?}, which is not a {{in:…}} store reference \
+                        - an absolute path would name a store hash this file cannot know",
+                       entry.target);
+            };
+            assert!(
+                rest.starts_with('/') && safe(rest),
+                "/etc/{etc}: {rest:?} is not a safe absolute path under the input"
+            );
+            assert!(
+                entry.why.len() > 20,
+                "/etc/{etc}: a hole in the read-only /etc is recorded with WHY it exists"
+            );
+            // The reason is emitted inside a single-quoted `:` no-op, which has
+            // no escape for a quote of its own.
+            assert!(
+                !entry.why.contains('\'') && !entry.why.contains('\n'),
+                "/etc/{etc}: the reason would break out of the `:` no-op that carries it"
+            );
+        }
+    }
+
+    /// The terminal is packaged under its own name. Asserted on the steps
+    /// because the boot does not start it yet — nothing else would notice the
+    /// symlink going missing until the cutover landing tried to run it.
+    #[test]
+    fn the_terminal_is_packaged_as_bin_td_term() {
+        let steps = real_root_steps(&SYSTEM);
+        assert!(
+            steps.iter().any(|step| matches!(
+                step,
+                Step::Symlink { target, link }
+                    if target == "{in:td-compositor}/bin/td-term"
+                        && link == "{root}/real-root/bin/td-term"
+            )),
+            "/bin/td-term does not symlink into the staged td-compositor package"
+        );
     }
 
     /// The staged tree must carry one symlink per table entry, with the recorded
