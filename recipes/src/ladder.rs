@@ -732,11 +732,26 @@ mod tests {
     ];
     type RunStep<'a> = (&'a [String], &'a [(String, String)], &'a str);
 
-    /// True if `cmd` appears in `s` as a whole command word. Splitting on every
-    /// non-alphanumeric char means `/usr/bin/find`, `find`, and `find;` all
-    /// surface the word `find`, while `findutils`, `found`, and `x86-64` do not.
+    /// True if `cmd` appears in `s` as a whole command word. Every
+    /// non-alphanumeric character is a boundary EXCEPT `_`, so `/usr/bin/find`,
+    /// `find`, and `find;` all surface the word `find`, while `findutils`,
+    /// `found`, `x86-64` and `find_map` do not.
+    ///
+    /// `_` is the exception because no shell command is named `find_map`: a body
+    /// that says so is naming an identifier, not spawning findutils. That
+    /// matters because the scanned surface is not only scripts — eight td
+    /// recipes write their Rust MODULES out with `WriteFile` (and four more
+    /// embed a single source), so every identifier in a shipped source is read
+    /// by this, and without the exception `outcomes.iter().find_map(…)` is a
+    /// recipe invoking `find`.
+    ///
+    /// It frees the IDENTIFIER and nothing else. A bare `find` in a comment is
+    /// still an invocation, deliberately: the token is what a quoted
+    /// `Command::new("find")` leaves behind too, and this cannot tell the two
+    /// apart. So a shipped module may say `find_map` but still not the bare
+    /// English word.
     fn invokes(s: &str, cmd: &str) -> bool {
-        s.split(|c: char| !c.is_ascii_alphanumeric())
+        s.split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
             .any(|t| t == cmd)
     }
 
@@ -1289,6 +1304,50 @@ mod tests {
                 command_texts(step).iter().any(|t| invokes(t, cmd)),
                 "command_texts must scan this surface for `{cmd}'"
             );
+        }
+    }
+
+    /// An identifier that CONTAINS a tool's name is not a call to it.
+    ///
+    /// The scanned surface includes `WriteFile` bodies, and td's own Rust
+    /// modules are written out that way, so this is the difference between a
+    /// gate that reads shipped source and one that forbids `find_map` or
+    /// `xargs_len`. A real invocation is separated by shell metacharacters or
+    /// whitespace, which `_` is not.
+    ///
+    /// The positive half pins the boundaries this does NOT relax — a path, a
+    /// pipe, a separator — because `/` or `.` joining a word to `find` is the
+    /// same argument as `_` and must keep the opposite answer. Without them a
+    /// later relaxation could make `/usr/bin/find` invisible with every test
+    /// still green.
+    #[test]
+    fn an_identifier_is_not_an_invocation() {
+        for (text, cmd) in [
+            ("let x = outcomes.iter().find_map(|o| o.ok());", "find"),
+            ("// the word find_map appears here", "find"),
+            ("fn xargs_limit() -> usize { 0 }", "xargs"),
+            // Word-shaped neighbours, which the old rule already excluded and
+            // this must not start admitting.
+            ("findutils is retired from the tool tier", "find"),
+            ("nothing found here", "find"),
+            ("target x86-64 needs no xargsy tool", "xargs"),
+        ] {
+            assert!(!invokes(text, cmd), "`{text}' is not an invocation of `{cmd}'");
+        }
+        // ...and every spelling that IS one still is: a bare word, an absolute
+        // PATH, after a pipe, after a separator, as the head of a line, and in
+        // a substitution. The bare English word in a comment is one of them,
+        // which is the limit this fix deliberately keeps.
+        for (text, cmd) in [
+            ("find . -name '*.o' -delete", "find"),
+            ("/usr/bin/find . -type f", "find"),
+            ("ls | xargs rm -f", "xargs"),
+            ("cd x && find y", "find"),
+            ("\tfind . -type f\n", "find"),
+            ("$(find .)", "find"),
+            ("// we cannot use find here", "find"),
+        ] {
+            assert!(invokes(text, cmd), "`{text}' IS an invocation of `{cmd}'");
         }
     }
 
