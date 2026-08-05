@@ -487,7 +487,11 @@ and `server.rs`, terminal control only from `pty.rs`, and no other module
 names `sys` at all. The extracted connection is crate-visible, so a module
 holding one reaches the transport without spelling `sys`: who may NAME `conn`
 is therefore pinned by the same confinement test as who may call the
-wrappers. `ioctl(2)` is the request-carrying one, so its roster is the
+wrappers. That roster is `client.rs`, `conn.rs`, and `term_client.rs` — the
+two clients and the transport itself. A transport user is not thereby a
+syscall caller: `term_client.rs` names no `sys` and does not appear above.
+
+`ioctl(2)` is the request-carrying one, so its roster is the
 confinement: a request outside the four is refused before the syscall, and a
 test pins each value, the single guard, the single entry point, and each
 wrapper's operand shape.
@@ -1232,9 +1236,17 @@ now `conn.rs` as well as `client.rs`: the connection — its id allocation,
 message framing, and descriptor queue — was extracted so the terminal is a
 second user of one transport rather than a second copy of it, and the
 descriptor queue could not stay behind. Section 4 records the same boundary.
-Terminal parser, model, renderer, keyboard, and PTY policy modules do not
-call the descriptor-transport wrappers and may not name the transport; the
-client landing adds the terminal's own client module to that roster.
+`term_client.rs` is the terminal's own client and is on the transport-user
+roster; the terminal's parser, model, renderer, keyboard, and PTY policy
+modules are not, may not name the transport, and do not call the
+descriptor-transport wrappers.
+
+When the compositor declines to choose a size, the terminal falls back to a
+grid rather than to a rectangle: 80 columns by 24 rows, multiplied out by the
+pinned font's cell, since that is what a terminfo entry and anything drawing a
+box assume when they cannot ask. Each axis declines independently. Its fixed
+object ids run densely to one past the last it creates, which is lower than
+the demo's because it binds no seat.
 
 Safe `Command` cannot call `setsid(2)`, and `pre_exec` would introduce a second
 unsafe surface. The declared td-init input therefore extends `cttyhack` with

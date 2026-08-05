@@ -51,6 +51,10 @@ const MODULES: &[(&str, &str)] = &[
     ("sys", include_str!("../../../td-compositor/src/sys.rs")),
     ("term", include_str!("../../../td-compositor/src/term.rs")),
     (
+        "term_client",
+        include_str!("../../../td-compositor/src/term_client.rs"),
+    ),
+    (
         "terminfo",
         include_str!("../../../td-compositor/src/terminfo.rs"),
     ),

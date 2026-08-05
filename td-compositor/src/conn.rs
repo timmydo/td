@@ -29,7 +29,13 @@ pub const XDG_TOPLEVEL: u32 = 9;
 pub const SEAT: u32 = 10;
 pub const KEYBOARD: u32 = 11;
 pub const POINTER: u32 = 12;
-pub const FIRST_DYNAMIC_ID: u32 = 13;
+// Where a client's dynamic ids begin is a property of the CLIENT, not of the
+// transport: it is one past the last fixed id that client actually creates, so
+// a client binding fewer globals has a lower one. Wayland requires client ids
+// to be allocated DENSELY — libwayland's object map refuses an insert past the
+// end of its array — so a client that skipped the ids it never created could be
+// disconnected by a compliant compositor. td's own server checks only
+// uniqueness, which is why this cannot be left to the server to catch.
 
 pub const CONNECT_ATTEMPTS: usize = 300;
 pub const MAX_PENDING_FDS: usize = 8;
@@ -118,6 +124,7 @@ pub struct Connection {
     stream: UnixStream,
     buffered: Vec<u8>,
     deadline: Option<Instant>,
+    first_dynamic_id: u32,
     next_id: u32,
     free_ids: BTreeSet<u32>,
     pending_fds: VecDeque<RawFd>,
@@ -131,7 +138,11 @@ impl Drop for Connection {
 }
 
 impl Connection {
-    pub fn connect(path: &Path, deadline: Instant) -> Result<Connection, String> {
+    pub fn connect(
+        path: &Path,
+        deadline: Instant,
+        first_dynamic_id: u32,
+    ) -> Result<Connection, String> {
         let mut last = None;
         for attempt in 0..CONNECT_ATTEMPTS {
             let remaining = deadline
@@ -139,7 +150,9 @@ impl Connection {
                 .filter(|duration| !duration.is_zero())
                 .ok_or_else(|| "Wayland presentation handshake timed out".to_string())?;
             match UnixStream::connect(path) {
-                Ok(stream) => return Ok(Connection::over(stream, Some(deadline))),
+                Ok(stream) => {
+                    return Ok(Connection::over(stream, Some(deadline), first_dynamic_id))
+                }
                 Err(error)
                     if matches!(
                         error.kind(),
@@ -170,12 +183,17 @@ impl Connection {
     /// dials and hands the stream here, so a field added to `Connection` is
     /// initialised in one place rather than once per caller. `deadline` is
     /// what separates a handshake (bounded) from a running client (not).
-    pub fn over(stream: UnixStream, deadline: Option<Instant>) -> Connection {
+    pub fn over(
+        stream: UnixStream,
+        deadline: Option<Instant>,
+        first_dynamic_id: u32,
+    ) -> Connection {
         Connection {
             stream,
             buffered: Vec::with_capacity(16 * 1024),
             deadline,
-            next_id: FIRST_DYNAMIC_ID,
+            first_dynamic_id,
+            next_id: first_dynamic_id,
             free_ids: BTreeSet::new(),
             pending_fds: VecDeque::new(),
             incoming: [0; RECEIVE_BUFFER_BYTES],
@@ -310,7 +328,7 @@ impl Connection {
             let mut args = wire::Cursor::new(&message.payload);
             let id = args.u32()?;
             args.finish()?;
-            if id >= FIRST_DYNAMIC_ID {
+            if id >= self.first_dynamic_id {
                 if id >= self.next_id {
                     return Err(format!("compositor deleted unallocated object {id}"));
                 }
@@ -375,4 +393,78 @@ impl Connection {
             sys::discard_received(&[fd]);
         }
     }
+}
+
+/// Bind an advertised global to a fixed object id. Both clients assign the
+/// same ids to the same interfaces, so this is transport rather than policy.
+pub fn bind(
+    connection: &mut Connection,
+    name: u32,
+    interface: &str,
+    version: u32,
+    id: u32,
+) -> Result<(), String> {
+    let mut request = wire::Builder::new();
+    request.u32(name);
+    request.string(interface)?;
+    request.u32(version);
+    request.u32(id);
+    connection.send(REGISTRY, 0, request)
+}
+
+/// The registry round-trip every client makes: ask for the registry, ask for
+/// a sync behind it, and record what is advertised until the sync answers.
+/// The sync is what makes the list COMPLETE rather than merely long.
+pub fn discover_globals(connection: &mut Connection) -> Result<Globals, String> {
+    let mut registry = wire::Builder::new();
+    registry.u32(REGISTRY);
+    connection.send(DISPLAY, 1, registry)?;
+
+    let mut sync = wire::Builder::new();
+    sync.u32(SYNC_CALLBACK);
+    connection.send(DISPLAY, 0, sync)?;
+
+    let mut globals = Globals::default();
+    loop {
+        let message = connection.next()?;
+        if connection.handle_common(&message)? {
+            continue;
+        }
+        if message.object == REGISTRY && message.opcode == 0 {
+            let mut args = wire::Cursor::new(&message.payload);
+            let name = args.u32()?;
+            let interface = args.string()?;
+            let version = args.u32()?;
+            args.finish()?;
+            globals.record(name, &interface, version);
+        } else if message.object == SYNC_CALLBACK && message.opcode == 0 {
+            let mut args = wire::Cursor::new(&message.payload);
+            args.u32()?;
+            args.finish()?;
+            return Ok(globals);
+        }
+    }
+}
+
+/// Create the surface, its xdg role and its toplevel, name it, and commit
+/// with nothing attached — which is what asks for the first configure. Pure
+/// transport differing between clients only by the title, so both use it.
+pub fn create_surface(connection: &mut Connection, title: &str) -> Result<(), String> {
+    let mut surface = wire::Builder::new();
+    surface.u32(SURFACE);
+    connection.send(COMPOSITOR, 0, surface)?;
+
+    let mut xdg_surface = wire::Builder::new();
+    xdg_surface.u32(XDG_SURFACE);
+    xdg_surface.u32(SURFACE);
+    connection.send(XDG_WM_BASE, 2, xdg_surface)?;
+
+    let mut toplevel = wire::Builder::new();
+    toplevel.u32(XDG_TOPLEVEL);
+    connection.send(XDG_SURFACE, 1, toplevel)?;
+
+    let mut named = wire::Builder::new();
+    named.string(title)?;
+    connection.send(XDG_TOPLEVEL, 2, named)?;
+    connection.send(SURFACE, 6, wire::Builder::new())
 }

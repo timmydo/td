@@ -6,10 +6,13 @@
 //! That comparison is only meaningful if the two cannot drift, so there is one
 //! encoder: [`marker`] produces both.
 //!
-//! `publish` has no production caller yet — it belongs to the Wayland client
-//! that decides when the terminal IS ready, which is the next increment. Each
-//! such item carries its own `dead_code` allow rather than the module carrying
-//! one, so anything left over once that client lands is still visible.
+//! `publish` still has no production caller. The Wayland client exists now,
+//! but §12 has readiness follow the first frame's `wl_buffer.release` and
+//! frame callback, and an unmapped surface never gets past the compositor's
+//! initial zero configure — so the client's handshake half cannot honestly
+//! publish a grid. The frame landing is the caller. Each such item carries its
+//! own `dead_code` allow rather than the module carrying one, so anything left
+//! over once that lands is still visible.
 
 use crate::pty;
 use crate::socket;

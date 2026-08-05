@@ -4207,6 +4207,55 @@ mod tests {
         fs::remove_file(pool_path).unwrap();
     }
 
+    /// The terminal's handshake against the REAL server. Every other test of
+    /// `term_client` hands `dispatch` events it built itself, so this is the
+    /// only one that would catch a wrong opcode, a wrong object id, a
+    /// mis-ordered request, or an event arm that is missing.
+    ///
+    /// It also pins WHY readiness cannot be published by the handshake alone:
+    /// a client that attaches no buffer is never mapped, so the only configure
+    /// it is ever sent is the initial zero one, and the size it settles on is
+    /// its own default rather than the tile it would be given.
+    #[test]
+    fn td_term_completes_the_real_server_handshake_without_being_mapped() {
+        let stem = format!(
+            "td-term-integration-{}-{}",
+            std::process::id(),
+            TEST_SEQ.fetch_add(1, Ordering::Relaxed)
+        );
+        let framebuffer_path = std::env::temp_dir().join(format!("{stem}.fb"));
+        let framebuffer = Framebuffer::test_file(&framebuffer_path, 640, 400, 640 * 4).unwrap();
+        let runtime = Arc::new(Mutex::new(Runtime::new(framebuffer)));
+        runtime.lock().unwrap().repaint().unwrap();
+        let (server, client) = UnixStream::pair().unwrap();
+        let thread_runtime = Arc::clone(&runtime);
+        let keymap = test_keymap();
+        let worker = thread::spawn(move || serve_client(server, 78, thread_runtime, keymap));
+
+        let (connection, size, xrgb) = crate::term_client::handshake_for_test(client).unwrap();
+        assert!(xrgb, "the real server never advertised XRGB8888");
+        let font = crate::font::pinned().unwrap();
+        assert_eq!(
+            size,
+            crate::term_client::default_size(&font).unwrap(),
+            "an unmapped surface was configured to something other than the default"
+        );
+        assert_eq!(crate::term_client::grid(size, &font).unwrap(), (24, 80));
+        // The premise, checked rather than asserted about one key: NOTHING is
+        // mapped. `surface_size` answers `None` for any key at all, so it
+        // cannot tell an unmapped surface from a made-up one; an empty layout
+        // can. A mapped terminal would put a view in here, and that view is
+        // what a second configure would come from.
+        assert!(
+            runtime.lock().unwrap().layout_snapshot().is_empty(),
+            "a client that attached no buffer was mapped"
+        );
+
+        drop(connection);
+        worker.join().unwrap().unwrap();
+        fs::remove_file(&framebuffer_path).unwrap();
+    }
+
     #[test]
     fn td_ui_demo_completes_the_real_server_handshake_and_frame() {
         let stem = format!(

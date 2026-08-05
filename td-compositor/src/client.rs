@@ -1,8 +1,14 @@
 use crate::conn::{
-    Connection, Globals, COMPOSITOR, DISPLAY, KEYBOARD, POINTER, REGISTRY, SEAT, SHM, SURFACE,
-    SYNC_CALLBACK, XDG_SURFACE, XDG_TOPLEVEL, XDG_WM_BASE,
+    self, Connection, Globals, COMPOSITOR, KEYBOARD, POINTER, SEAT, SHM, SURFACE, XDG_SURFACE,
+    XDG_TOPLEVEL, XDG_WM_BASE,
 };
+
+/// One past the last fixed id the DEMO creates. It binds a seat and creates a
+/// keyboard and pointer, so its dynamic range starts higher than the
+/// terminal's; see `conn`'s note on why this is per-client and must be dense.
+const FIRST_DYNAMIC_ID: u32 = POINTER + 1;
 use crate::keyboard::XKB_KEYMAP;
+use crate::scene::SHM_XRGB8888;
 use crate::pointer::MAX_POINTER_FRAME_EVENTS;
 use crate::ui::{KeyboardUpdate, PointerUpdate, UiKeyState, UiModel, UiModifiers};
 use crate::{socket, sys, wire, MAX_UI_DIMENSION, MAX_UI_FRAME_BYTES};
@@ -18,58 +24,11 @@ use std::time::{Duration, Instant};
 const DEFAULT_WIDTH: usize = 512;
 const DEFAULT_HEIGHT: usize = 320;
 const BYTES_PER_PIXEL: usize = 4;
-const SHM_XRGB8888: u32 = 1;
 const PRESENT_TIMEOUT: Duration = Duration::from_secs(20);
 
 pub struct Options {
     pub socket: PathBuf,
     pub ready_socket: PathBuf,
-}
-
-fn bind(
-    connection: &mut Connection,
-    name: u32,
-    interface: &str,
-    version: u32,
-    id: u32,
-) -> Result<(), String> {
-    let mut request = wire::Builder::new();
-    request.u32(name);
-    request.string(interface)?;
-    request.u32(version);
-    request.u32(id);
-    connection.send(REGISTRY, 0, request)
-}
-
-fn discover_globals(connection: &mut Connection) -> Result<Globals, String> {
-    let mut registry = wire::Builder::new();
-    registry.u32(REGISTRY);
-    connection.send(DISPLAY, 1, registry)?;
-
-    let mut sync = wire::Builder::new();
-    sync.u32(SYNC_CALLBACK);
-    connection.send(DISPLAY, 0, sync)?;
-
-    let mut globals = Globals::default();
-    loop {
-        let message = connection.next()?;
-        if connection.handle_common(&message)? {
-            continue;
-        }
-        if message.object == REGISTRY && message.opcode == 0 {
-            let mut args = wire::Cursor::new(&message.payload);
-            let name = args.u32()?;
-            let interface = args.string()?;
-            let version = args.u32()?;
-            args.finish()?;
-            globals.record(name, &interface, version);
-        } else if message.object == SYNC_CALLBACK && message.opcode == 0 {
-            let mut args = wire::Cursor::new(&message.payload);
-            args.u32()?;
-            args.finish()?;
-            return Ok(globals);
-        }
-    }
 }
 
 fn build_pixels(width: usize, height: usize, ui: &UiModel) -> Result<Vec<u8>, String> {
@@ -174,26 +133,6 @@ fn backing_file(directory: &Path, pixels: &[u8]) -> Result<File, String> {
         "could not create a unique wl_shm file in {}",
         directory.display()
     ))
-}
-
-fn create_surface(connection: &mut Connection) -> Result<(), String> {
-    let mut surface = wire::Builder::new();
-    surface.u32(SURFACE);
-    connection.send(COMPOSITOR, 0, surface)?;
-
-    let mut xdg_surface = wire::Builder::new();
-    xdg_surface.u32(XDG_SURFACE);
-    xdg_surface.u32(SURFACE);
-    connection.send(XDG_WM_BASE, 2, xdg_surface)?;
-
-    let mut toplevel = wire::Builder::new();
-    toplevel.u32(XDG_TOPLEVEL);
-    connection.send(XDG_SURFACE, 1, toplevel)?;
-
-    let mut title = wire::Builder::new();
-    title.string("td software Wayland demo")?;
-    connection.send(XDG_TOPLEVEL, 2, title)?;
-    connection.send(SURFACE, 6, wire::Builder::new())
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -848,29 +787,29 @@ fn present(
     mut connection: Connection,
     runtime_directory: &Path,
 ) -> Result<(Connection, Demo), String> {
-    let globals = discover_globals(&mut connection)?;
+    let globals = conn::discover_globals(&mut connection)?;
     let (compositor_name, compositor_version) =
         Globals::require(globals.compositor(), "wl_compositor", 4, 4)?;
     let (shm_name, shm_version) = Globals::require(globals.shm(), "wl_shm", 1, 1)?;
     let (xdg_name, xdg_version) = Globals::require(globals.xdg_wm_base(), "xdg_wm_base", 1, 1)?;
     let (seat_name, seat_version) = Globals::require(globals.seat(), "wl_seat", 5, 7)?;
-    bind(
+    conn::bind(
         &mut connection,
         compositor_name,
         "wl_compositor",
         compositor_version,
         COMPOSITOR,
     )?;
-    bind(&mut connection, shm_name, "wl_shm", shm_version, SHM)?;
-    bind(
+    conn::bind(&mut connection, shm_name, "wl_shm", shm_version, SHM)?;
+    conn::bind(
         &mut connection,
         xdg_name,
         "xdg_wm_base",
         xdg_version,
         XDG_WM_BASE,
     )?;
-    bind(&mut connection, seat_name, "wl_seat", seat_version, SEAT)?;
-    create_surface(&mut connection)?;
+    conn::bind(&mut connection, seat_name, "wl_seat", seat_version, SEAT)?;
+    conn::create_surface(&mut connection, "td software Wayland demo")?;
 
     let mut demo = Demo::new();
     while !demo.ready() {
@@ -897,7 +836,7 @@ pub fn run(options: &Options) -> Result<(), String> {
     let deadline = Instant::now()
         .checked_add(PRESENT_TIMEOUT)
         .ok_or_else(|| "could not bound the Wayland presentation handshake".to_string())?;
-    let connection = Connection::connect(&options.socket, deadline)?;
+    let connection = Connection::connect(&options.socket, deadline, FIRST_DYNAMIC_ID)?;
     let (mut connection, mut demo) = present(connection, runtime_directory)?;
     let size = demo
         .current_size
@@ -1012,7 +951,11 @@ pub fn present_for_test(
     stream: UnixStream,
     runtime_directory: &Path,
 ) -> Result<TestPresentation, String> {
-    let connection = Connection::over(stream, Instant::now().checked_add(Duration::from_secs(5)));
+    let connection = Connection::over(
+        stream,
+        Instant::now().checked_add(Duration::from_secs(5)),
+        FIRST_DYNAMIC_ID,
+    );
     let (mut connection, demo) = present(connection, runtime_directory)?;
     connection.finish_handshake()?;
     connection.set_read_timeout(Some(Duration::from_secs(5)))?;
@@ -1072,11 +1015,11 @@ pub fn selftest() -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::conn::MAX_PENDING_FDS;
+    use crate::conn::{DISPLAY, MAX_PENDING_FDS};
     use std::os::fd::IntoRawFd;
 
     fn test_connection(stream: UnixStream) -> Connection {
-        Connection::over(stream, None)
+        Connection::over(stream, None, FIRST_DYNAMIC_ID)
     }
 
     fn event(object: u32, opcode: u16, builder: wire::Builder) -> wire::Message {
@@ -1112,7 +1055,7 @@ mod tests {
     #[test]
     fn dynamic_object_ids_are_reused_only_after_delete_id() {
         let (stream, _peer) = UnixStream::pair().unwrap();
-        let mut connection = Connection::over(stream, None);
+        let mut connection = Connection::over(stream, None, FIRST_DYNAMIC_ID);
         assert_eq!(connection.allocate_id().unwrap(), 13);
         assert_eq!(connection.allocate_id().unwrap(), 14);
 
@@ -1694,7 +1637,7 @@ mod tests {
     #[test]
     fn expired_presentation_deadline_does_not_block_on_a_stalled_peer() {
         let (stream, _peer) = UnixStream::pair().unwrap();
-        let mut connection = Connection::over(stream, Some(Instant::now()));
+        let mut connection = Connection::over(stream, Some(Instant::now()), FIRST_DYNAMIC_ID);
         assert_eq!(
             connection.next().unwrap_err(),
             "Wayland presentation handshake timed out"
@@ -1707,7 +1650,7 @@ mod tests {
         stream
             .set_read_timeout(Some(Duration::from_millis(1)))
             .unwrap();
-        let mut connection = Connection::over(stream, None);
+        let mut connection = Connection::over(stream, None, FIRST_DYNAMIC_ID);
         assert_eq!(
             connection.next().unwrap_err(),
             "Wayland event wait timed out"

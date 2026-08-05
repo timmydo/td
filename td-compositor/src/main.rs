@@ -21,6 +21,7 @@ mod server;
 mod socket;
 mod sys;
 mod term;
+mod term_client;
 mod terminfo;
 mod ui;
 mod wire;
@@ -80,20 +81,20 @@ impl Personality {
     }
 }
 
-/// The terminal's own entry point. `run` lands with the Wayland client that
-/// composes the PTY adapter and the renderer; until then this serves the two
-/// commands that need no surface — the readiness probe td-svc calls, and the
-/// packaged binary's self-check.
-/// The terminal's three self-checks and the marker that says all three ran.
+/// The terminal's four self-checks and the marker that says all four ran.
 /// Where it writes is a parameter so the marker is a tested string rather than
 /// one nobody reads.
 fn term_selftest(out: &mut impl std::io::Write) -> Result<(), String> {
     term::selftest()?;
     pty::selftest()?;
     ready::selftest()?;
+    term_client::selftest()?;
     writeln!(out, "TD-TERM-SELFTEST-OK").map_err(|e| format!("write selftest marker: {e}"))
 }
 
+/// The terminal's own entry point. `run` lands with the frame that earns
+/// readiness; until then this serves the two commands that need no surface —
+/// the readiness probe td-svc calls, and the packaged binary's self-check.
 fn run_term(args: &[String]) -> Result<(), String> {
     let command = args.first().ok_or_else(term_usage)?;
     match command.as_str() {
@@ -423,6 +424,7 @@ mod confinement {
         ("server.rs", include_str!("server.rs")),
         ("socket.rs", include_str!("socket.rs")),
         ("term.rs", include_str!("term.rs")),
+        ("term_client.rs", include_str!("term_client.rs")),
         ("terminfo.rs", include_str!("terminfo.rs")),
         ("ui.rs", include_str!("ui.rs")),
         ("wire.rs", include_str!("wire.rs")),
@@ -446,18 +448,23 @@ mod confinement {
             .collect()
     }
 
-    /// The terminal's selftest is a composition, and its marker says all three
-    /// ran. Nothing observable distinguishes two from three — each returns
+    /// The terminal's selftest is a composition, and its marker says all four
+    /// ran. Nothing observable distinguishes three from four — each returns
     /// `Ok(())` — so the composition is pinned against the source, the way
     /// this crate pins everything else the compiler cannot see.
     #[test]
-    fn the_terminals_selftest_covers_all_three_of_its_layers() {
+    fn the_terminals_selftest_covers_all_four_of_its_layers() {
         let body = MAIN
             .split("fn term_selftest")
             .nth(1)
             .and_then(|rest| rest.split("\nfn ").next())
             .expect("term_selftest body");
-        for layer in ["term::selftest()?", "pty::selftest()?", "ready::selftest()?"] {
+        for layer in [
+            "term::selftest()?",
+            "pty::selftest()?",
+            "ready::selftest()?",
+            "term_client::selftest()?",
+        ] {
             assert!(body.contains(layer), "the terminal selftest skips {layer}");
         }
     }
@@ -739,7 +746,7 @@ fn syscall3(number: usize, a1: usize, a2: usize, a3: usize) -> isize {
         // is all the scan above looks for. So who may NAME the transport is a
         // roster on the same footing as who may call the syscall, and the
         // terminal's client joins it by amendment rather than by importing.
-        const TRANSPORT_USERS: &[&str] = &["client.rs", "conn.rs"];
+        const TRANSPORT_USERS: &[&str] = &["client.rs", "conn.rs", "term_client.rs"];
         for (name, source) in std::iter::once(("main.rs", production_main))
             .chain(OTHER.iter().copied())
             .chain(TEST_ONLY.iter().copied())

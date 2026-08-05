@@ -304,7 +304,11 @@ one without ever spelling `sys::` — which is all the caller scan looks for.
 The transport's USERS are therefore pinned by that same test, which is what
 makes "the terminal modules — parser, model, renderer, keyboard, PTY policy
 — reach none of it" a checked property rather than a claim. A module joining
-that roster is an amendment here, as a new caller is.
+that roster is an amendment here, as a new caller is, and `term_client.rs`
+is the first: the terminal's own Wayland client is a transport USER by
+construction. It is NOT a new caller — it names no `sys::` at all, and the
+descriptors it will eventually receive arrive through `Connection` — so the
+syscall roster above is unchanged by it.
 
 ## 7. `td-util` — the diagnostics multicall
 
