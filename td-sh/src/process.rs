@@ -175,7 +175,10 @@ static STDIN_RAW: Mutex<Option<Arc<File>>> = Mutex::new(None);
 /// CLONE the `Arc` -- never across the read itself, which blocks: a sibling
 /// stage's `read -t 5` would otherwise wait on this mutex without ever reaching
 /// `poll(2)`, and miss the deadline it was given.
-fn stdin_raw() -> std::io::Result<Arc<File>> {
+///
+/// Shared with `line.rs`'s cooked reader rather than duplicated, so the script
+/// and the `read` builtin cannot disagree about where in stdin they are.
+pub fn stdin_raw() -> std::io::Result<Arc<File>> {
     let mut slot = STDIN_RAW
         .lock()
         .map_err(|_| std::io::Error::other("poisoned stdin"))?;

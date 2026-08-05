@@ -226,15 +226,8 @@ fn run(args: &[String]) -> Result<i32, String> {
             Ok(exec::run_exit_trap(&mut sh, code) & 0xff)
         }
         Start::Stdin => {
-            let mut src = String::new();
-            if let Err(e) = std::io::stdin().read_to_string(&mut src) {
-                // Reported and exited HERE rather than through `?`, because this
-                // is where the shell environment ends and an EXIT trap a profile
-                // installed has to run before it does.
-                let _ = exec::write_stderr(&sh, &format!("td-sh: stdin: {e}"));
-                return Ok(exec::run_exit_trap(&mut sh, 2) & 0xff);
-            }
-            Ok(run_program(&mut sh, &src))
+            let code = stdin_script(&mut sh);
+            Ok(exec::run_exit_trap(&mut sh, code) & 0xff)
         }
     }
 }
@@ -326,6 +319,73 @@ fn read_profile(sh: &mut Shell, path: &str) -> Option<i32> {
         Err(_) => {
             exec::unwind_pending_to(sh, 0);
             None
+        }
+    }
+}
+
+/// Where `stdin_script`'s parser gets its next line. A free function because
+/// `Units` holds a plain `fn` pointer rather than a closure.
+fn next_stdin_line() -> parser::More {
+    match line::read_script_line() {
+        // Verbatim, terminator included: whether the last line ended in a
+        // newline is what decides whether a trailing `\` continues it.
+        line::ScriptLine::Line(text) => parser::More::Line(text),
+        line::ScriptLine::Eof => parser::More::Eof,
+        line::ScriptLine::Failed(e) => parser::More::Failed(e),
+    }
+}
+
+/// Run a script arriving on stdin, reading only as far as it has run.
+///
+/// A shell shares its stdin with the commands in it, so how much of that
+/// descriptor the SCRIPT consumes is observable: `printf 'read v\nDATA\n' | sh`
+/// gives `read` the line after it. This used to slurp stdin whole, so `read`
+/// found end of input and `DATA` was then run as a command -- the opposite of
+/// bash, and of POSIX, which requires a shell not to consume more of a
+/// non-seekable input than the commands it has executed need.
+///
+/// The parser PULLS lines as the grammar needs them, so a unit spanning many
+/// of them is parsed once rather than re-parsed per line. No editor, no
+/// prompts, and no recovery: a syntax error or an abort ends a non-interactive
+/// shell where it would return an interactive one to `PS1`. Commands BEFORE
+/// the error have run by then, which is the other half of reading
+/// incrementally and is what bash does too.
+fn stdin_script(sh: &mut Shell) -> i32 {
+    // The parser PULLS lines as the grammar needs them, so a unit spanning many
+    // lines is lexed and parsed once rather than from the top per line, and the
+    // shell consumes no more of a shared stdin than the commands it has run.
+    let mut units = parser::Units::streaming(next_stdin_line);
+    loop {
+        let unit = units.next_unit(&sh.aliases);
+        // A script whose input FAILED did not end, it broke. Checked before the
+        // parse outcome because sealing the source on failure also makes the
+        // half-read unit a syntax error, and the read is the truer report.
+        if let Some(e) = units.source_error() {
+            let _ = exec::write_stderr(sh, &format!("td-sh: stdin: {e}"));
+            sh.set_status(2);
+            return 2;
+        }
+        let Some(outcome) = unit else { return sh.status };
+        match outcome {
+            Ok(list) => match exec::run_list(sh, &list) {
+                Ok(()) => {}
+                Err(exec::Sig::Exit(code) | exec::Sig::Abort(code) | exec::Sig::Interrupt(code)) => {
+                    return code
+                }
+                // Anything else -- a top-level `return`, which `run_source`
+                // propagated with `?` -- ends the script at `$?`, as the
+                // whole-of-stdin path did. `break`/`continue` never reach here;
+                // `run_list` catches those lower down.
+                Err(_) => return sh.status,
+            },
+            Err(e) => {
+                // Through the shell's own fd 2, as `run_source` reported a parse
+                // error before this, so a script that redirected it still sees
+                // the message where it sent everything else.
+                let _ = exec::write_stderr(sh, &format!("td-sh: {e}"));
+                sh.set_status(2);
+                return 2;
+            }
         }
     }
 }

@@ -585,6 +585,136 @@ fn read_dash_t_waits_on_a_pipe_that_can_block() -> Result<(), Box<dyn std::error
     Ok(())
 }
 
+/// A script on stdin is read only as far as it has RUN, so the commands in it
+/// share the descriptor with the script itself.
+///
+/// This used to slurp stdin whole before running anything, which is invisible
+/// until a command reads stdin too: `read` found end of input and the line it
+/// should have taken was then executed as a command. POSIX requires a shell not
+/// to consume more of a non-seekable input than the commands it has executed
+/// need, and bash does not.
+#[test]
+fn a_stdin_script_leaves_the_rest_of_itself_for_read()
+-> Result<(), Box<dyn std::error::Error>> {
+    use std::io::Write as _;
+    let shell = PathBuf::from(env!("CARGO_BIN_EXE_td-sh"));
+    for (script, want) in [
+        // The line after `read` is data, not a command.
+        ("read v\nDATA\necho \"got=[$v]\"\n", "got=[DATA]\n"),
+        // Two of them in a row, so the position advances rather than resetting.
+        (
+            "read a\nONE\nread b\nTWO\necho \"[$a][$b]\"\n",
+            "[ONE][TWO]\n",
+        ),
+        // A multi-line construct still reads as far as it needs and no further.
+        (
+            "for i in 1 2; do\n  read v\n  echo \"i=$i v=$v\"\ndone\nA\nB\n",
+            "i=1 v=A\ni=2 v=B\n",
+        ),
+        // A here-document is consumed by the parser, not by `read`.
+        ("cat <<EOF\nbody\nEOF\nread v\nAFTER\necho \"[$v]\"\n", "body\n[AFTER]\n"),
+    ] {
+        let mut child = std::process::Command::new(&shell)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()?;
+        match child.stdin.take() {
+            Some(mut w) => w.write_all(script.as_bytes())?,
+            None => return Err("no stdin pipe".into()),
+        }
+        let out = child.wait_with_output()?;
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            want,
+            "script {script:?}"
+        );
+    }
+    Ok(())
+}
+
+/// The shell-ending paths a stdin script has still end it once that script is
+/// read incrementally rather than whole.
+///
+/// None of this is new behaviour — the slurping version ran units one at a time
+/// out of the string it had read, so it reported a syntax error after the
+/// commands before it too, with the same status. That is exactly why it is
+/// pinned here: replacing the reader is the kind of change that would break
+/// `exit`, the EXIT trap or `set -e` without any of them being its subject.
+#[test]
+fn a_stdin_script_still_ends_where_it_should()
+-> Result<(), Box<dyn std::error::Error>> {
+    use std::io::Write as _;
+    let shell = PathBuf::from(env!("CARGO_BIN_EXE_td-sh"));
+    let mut child = std::process::Command::new(&shell)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()?;
+    match child.stdin.take() {
+        Some(mut w) => w.write_all(b"echo before\nif\n")?,
+        None => return Err("no stdin pipe".into()),
+    }
+    let out = child.wait_with_output()?;
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "before\n");
+    assert_eq!(out.status.code(), Some(2), "a syntax error ends the script");
+    // Unchanged from the slurping reader, which is the point of asserting it.
+    assert!(
+        !String::from_utf8_lossy(&out.stderr).is_empty(),
+        "the error is reported"
+    );
+
+    // ... and the shell-ending paths still end it: `exit` stops reading, an
+    // EXIT trap still runs, and `set -e` still reports the failing status.
+    //
+    // The last three are about the BYTES rather than the control flow, and each
+    // is a regression a line-at-a-time reader invites: the script's own text is
+    // not this reader's to normalise. A final line with no newline must stay
+    // unterminated, or a trailing `\` becomes a line continuation and the
+    // script is incomplete instead of complete; a carriage return is data in a
+    // script where it is noise on a console; and input that fails to READ is
+    // reported and exits 2, where end of input is a script that simply ended.
+    for (script, want_out, want_code) in [
+        ("echo a\nexit 7\necho never\n", "a\n", 7),
+        ("trap 'echo bye' EXIT\necho hi\n", "hi\nbye\n", 0),
+        ("set -e\nfalse\necho never\n", "", 1),
+        ("printf '<%s>' foo\\", "<foo\\>", 0),
+        ("echo one\r\necho two\r\n", "one\r\ntwo\r\n", 0),
+        ("v='a\rb'\nprintf '%s|' \"$v\"\n", "a\rb|", 0),
+    ] {
+        let mut child = std::process::Command::new(&shell)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()?;
+        match child.stdin.take() {
+            Some(mut w) => w.write_all(script.as_bytes())?,
+            None => return Err("no stdin pipe".into()),
+        }
+        let out = child.wait_with_output()?;
+        assert_eq!(String::from_utf8_lossy(&out.stdout), want_out, "{script:?}");
+        assert_eq!(out.status.code(), Some(want_code), "{script:?}");
+    }
+
+    // A script that is not UTF-8 is REPORTED, not silently taken for the end of
+    // one. Bytes, not `&str`, because the case is a byte no `&str` can hold.
+    let mut child = std::process::Command::new(&shell)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()?;
+    match child.stdin.take() {
+        Some(mut w) => w.write_all(b"\xff\n")?,
+        None => return Err("no stdin pipe".into()),
+    }
+    let out = child.wait_with_output()?;
+    assert_eq!(out.status.code(), Some(2), "a script that will not decode");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("stdin"),
+        "the failure names stdin: {:?}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    Ok(())
+}
+
 /// The `read` builtin takes ONE BYTE off stdin, leaving the rest for the next
 /// reader — `sh -c 'read a; cat'` on a pipe.
 ///

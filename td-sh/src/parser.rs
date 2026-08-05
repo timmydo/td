@@ -7,14 +7,13 @@
 //! reason -- only the grammar knows which positions can start a command word --
 //! and happens at the token fetch, as dash's does.
 
-use std::cell::Cell;
 use std::sync::Arc;
 
 use crate::ast::{
     is_name, AndOr, Assign, CaseItem, Cmd, Conn, IfArm, List, Pipeline, Redir, RedirKind, Seg, Sep,
     Syn, Word, INCOMPLETE,
 };
-use crate::lexer::{tokenize, tokenize_prefix, Op, Tok};
+use crate::lexer::{tokenize, Op, Scan, Tok};
 
 /// Alias name -> replacement text. Ordered so `alias` lists deterministically.
 pub type Aliases = std::collections::BTreeMap<String, String>;
@@ -99,12 +98,15 @@ struct Region {
 /// but not to the rest of its own, and it costs one lexing pass, not one per line.
 pub struct Units {
     toks: Vec<Tok>,
-    heredocs: Vec<Word>,
+    /// The scan this source's tokens come from, kept alive because it OWNS the
+    /// here-document bodies: an id is minted (and a placeholder pushed) when
+    /// `<<` is scanned, and the body is written into that slot later.
+    scan: Scan,
     /// What stopped the lexer, raised only once a parse needs the text there.
     pending: Option<String>,
     /// Set when a fetch ran off the end of the tokens, which is how `pending`
     /// becomes this unit's error rather than a bare "unexpected end of input".
-    hit_end: Cell<bool>,
+    hit_end: bool,
     pos: usize,
     depth: u32,
     budget: u32,
@@ -114,22 +116,151 @@ pub struct Units {
     active: Vec<Region>,
     /// Index of the token a blank-terminated replacement made a candidate.
     force_at: Option<usize>,
+    /// Where more input comes from, for a script arriving a line at a time.
+    /// `None` is a whole-string source, which is sealed from the start.
+    source: Option<fn() -> More>,
+    /// A source that FAILED rather than ended. Kept rather than raised, because
+    /// the units already parsed have run and the driver reports it after them.
+    source_error: Option<String>,
+    /// Set once the scan has yielded its `Eof` or its error. Without it a fetch
+    /// past the end would pull again and append a SECOND `Eof` every time.
+    spent: bool,
+}
+
+/// What a streaming source hands back. `Eof` and `Failed` are distinct because a
+/// script whose input broke did not end, and must not be run as though it had.
+pub enum More {
+    Line(String),
+    Eof,
+    Failed(String),
 }
 
 impl Units {
     pub fn new(src: &str) -> Units {
-        let lexed = tokenize_prefix(src);
+        let mut scan = Scan::new(src);
+        scan.seal();
+        Units::over(scan, None)
+    }
+
+    /// A source read a line at a time, parsed ONCE however many lines a unit
+    /// spans: running off the end of the tokens asks `source` for another line
+    /// and resumes, rather than re-lexing and re-parsing everything before it.
+    pub fn streaming(source: fn() -> More) -> Units {
+        Units::over(Scan::new(""), Some(source))
+    }
+
+    /// Nothing is pulled here. Every token this parse sees arrives through
+    /// `ensure`, so that the scan is asked exactly once for its end: a second
+    /// ask after an error returns a fresh `Eof` -- the scanner having consumed
+    /// the input the error was found in -- and that `Eof` would mask `hit_end`,
+    /// leaving the lexer's error unreported and its half-read command run.
+    fn over(scan: Scan, source: Option<fn() -> More>) -> Units {
         Units {
-            toks: lexed.toks,
-            heredocs: lexed.heredocs,
-            pending: lexed.error,
-            hit_end: Cell::new(false),
+            toks: Vec::new(),
+            scan,
+            pending: None,
+            hit_end: false,
             pos: 0,
             depth: 0,
             budget: 0,
             aliases: Aliases::new(),
             active: Vec::new(),
             force_at: None,
+            source,
+            source_error: None,
+            spent: false,
+        }
+    }
+
+    /// The input failure that ended the source, if it was a failure.
+    pub fn source_error(&mut self) -> Option<String> {
+        self.source_error.take()
+    }
+
+    /// Buffer tokens through index `upto`, reading more input while the scan
+    /// says the text so far stops inside a construct. The parser looks ahead at
+    /// most one token, so holding this through `pos + 1` is what lets every
+    /// `&self` peek keep handing out a borrow into `toks`.
+    fn ensure(&mut self, upto: usize) {
+        while !self.spent && self.toks.len() <= upto {
+            let chunk = self.scan.pull();
+            self.toks.extend(chunk.toks);
+            if let Some(e) = chunk.error {
+                self.pending = Some(e);
+                self.spent = true;
+                return;
+            }
+            if !chunk.incomplete {
+                self.spent = true;
+                return;
+            }
+            // The pull may already have answered the fetch; asking the source
+            // anyway would take a line THIS unit does not need, which on a
+            // shared stdin is a line the commands in it were owed.
+            if self.toks.len() > upto {
+                return;
+            }
+            let Some(source) = self.source else {
+                self.spent = true;
+                return;
+            };
+            match source() {
+                More::Line(text) => self.scan.feed(&text),
+                More::Eof => self.scan.seal(),
+                More::Failed(e) => {
+                    self.source_error = Some(e);
+                    self.scan.seal();
+                }
+            }
+        }
+    }
+
+    /// Read on until here-document `id` has its body. The parser copies the
+    /// body into the redirection as it parses, but the lexer only fills it at
+    /// the END of the operator's line -- which under a streaming source is a
+    /// later pull than the one that produced the `<<` token.
+    fn ensure_heredoc(&mut self, id: usize) {
+        while !self.spent && self.scan.heredoc_pending(id) {
+            let chunk = self.scan.pull();
+            self.toks.extend(chunk.toks);
+            if let Some(e) = chunk.error {
+                self.pending = Some(e);
+                self.spent = true;
+                return;
+            }
+            if !chunk.incomplete {
+                self.spent = true;
+                return;
+            }
+            if !self.scan.heredoc_pending(id) {
+                return;
+            }
+            let Some(source) = self.source else {
+                self.spent = true;
+                return;
+            };
+            match source() {
+                More::Line(text) => self.scan.feed(&text),
+                More::Eof => self.scan.seal(),
+                More::Failed(e) => {
+                    self.source_error = Some(e);
+                    self.scan.seal();
+                }
+            }
+        }
+    }
+
+    /// Buffer through the end of the input LINE starting at `from`, so
+    /// `line_end` finds the real newline rather than the end of what has been
+    /// read. Only an alias replacement that trails off in a comment needs it.
+    fn ensure_line(&mut self, from: usize) {
+        let mut i = from;
+        loop {
+            self.ensure(i);
+            match self.toks.get(i) {
+                None | Some(Tok::Newline) | Some(Tok::Eof) => return,
+                _ => i += 1,
+            }
         }
     }
 
@@ -141,7 +272,7 @@ impl Units {
         self.depth = 0;
         self.budget = MAX_ALIAS_EXPANSIONS;
         let parsed = self.parse_unit();
-        if self.hit_end.get() {
+        if self.hit_end {
             // The parse reached where lexing stopped, so what stopped it is the
             // real error -- and everything before here has already run.
             if let Some(e) = self.pending.take() {
@@ -218,10 +349,15 @@ impl Units {
     /// The alias the token at `pos` names, if this position may take one: where the
     /// grammar allows one, or on the token after a blank-terminated replacement --
     /// dash sets its check when popping one, wherever that lands.
-    fn alias_here(&self, chk: Chk) -> Option<(String, String)> {
+    fn alias_here(&mut self, chk: Chk) -> Option<(String, String)> {
         if chk == Chk::None && self.force_at != Some(self.pos) {
             return None;
         }
+        // Through the fetch, not `toks` directly: under a streaming source the
+        // candidate may not be buffered yet, and reading the vector would miss
+        // it. `A \<newline> B` is exactly that -- the fold ends the fed line, so
+        // B arrives only when asked for.
+        self.ensure(self.pos);
         // Only an unquoted literal word is a candidate: `'hi'` and `$cmd` are not.
         let Some(Tok::Word(w)) = self.toks.get(self.pos) else {
             return None;
@@ -245,8 +381,7 @@ impl Units {
         // Not incomplete input however it failed: no amount of further input can
         // complete a replacement, so the unit loop must stop rather than read on.
         let lexed = tokenize(value).map_err(|e| format!("alias `{name}': {e}"))?;
-        let base = self.heredocs.len();
-        self.heredocs.extend(lexed.heredocs);
+        let base = self.scan.push_heredocs(lexed.heredocs);
         let sub: Vec<Tok> = lexed
             .toks
             .into_iter()
@@ -263,6 +398,7 @@ impl Units {
         // the line it was written on: dash reads the replacement from the same
         // input stream, so the comment runs to the next newline of the INPUT.
         let over = if lexed.ended_in_comment {
+            self.ensure_line(self.pos + 1);
             self.line_end(self.pos + 1)
         } else {
             self.pos + 1
@@ -308,15 +444,19 @@ impl Units {
         }
     }
 
-    fn tok_at(&self, i: usize) -> Option<&Tok> {
+    fn tok_at(&mut self, i: usize) -> Option<&Tok> {
+        // The refill belongs HERE and not one fetch earlier: filling ahead of
+        // the fetch reads a line the current unit does not need, which for a
+        // shared stdin is a line the commands in it were owed.
+        self.ensure(i);
         let tok = self.toks.get(i);
         if tok.is_none() {
-            self.hit_end.set(true);
+            self.hit_end = true;
         }
         tok
     }
 
-    fn peek(&self) -> Option<&Tok> {
+    fn peek(&mut self) -> Option<&Tok> {
         self.tok_at(self.pos)
     }
 
@@ -327,11 +467,11 @@ impl Units {
         self.settle();
     }
 
-    fn at_eof(&self) -> bool {
+    fn at_eof(&mut self) -> bool {
         matches!(self.peek(), None | Some(Tok::Eof))
     }
 
-    fn peek_op(&self) -> Option<Op> {
+    fn peek_op(&mut self) -> Option<Op> {
         match self.peek() {
             Some(Tok::Op(op)) => Some(*op),
             _ => None,
@@ -340,14 +480,14 @@ impl Units {
 
     /// The next token's text when it is an unquoted literal word — the only
     /// shape that can be a reserved word.
-    fn peek_reserved(&self) -> Option<&str> {
+    fn peek_reserved(&mut self) -> Option<&str> {
         match self.peek() {
             Some(Tok::Word(w)) => w.plain(),
             _ => None,
         }
     }
 
-    fn describe(&self) -> String {
+    fn describe(&mut self) -> String {
         match self.peek() {
             None | Some(Tok::Eof) => "end of input".to_string(),
             Some(Tok::Newline) => "newline".to_string(),
@@ -412,7 +552,7 @@ impl Units {
 
     /// True where a list ends: at EOF, at `)`, at `;;`, or at one of the
     /// caller's closing reserved words.
-    fn at_list_end(&self, terms: &[&str]) -> bool {
+    fn at_list_end(&mut self, terms: &[&str]) -> bool {
         match self.peek() {
             None | Some(Tok::Eof) => true,
             Some(Tok::Op(Op::RParen)) | Some(Tok::Op(Op::DSemi)) => true,
@@ -529,7 +669,7 @@ impl Units {
         self.parse_simple()
     }
 
-    fn at_func_def(&self) -> bool {
+    fn at_func_def(&mut self) -> bool {
         let Some(Tok::Word(w)) = self.peek() else {
             return false;
         };
@@ -789,7 +929,8 @@ impl Units {
             // The delimiter word follows the operator; its body was collected
             // by the lexer at the end of the line.
             let _delim = self.take_word()?;
-            let body = self.heredocs.get(id).cloned().unwrap_or_default();
+            self.ensure_heredoc(id);
+            let body = self.scan.heredocs().get(id).cloned().unwrap_or_default();
             return Ok(Redir {
                 fd,
                 kind: RedirKind::Here(body),

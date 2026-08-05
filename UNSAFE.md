@@ -790,12 +790,11 @@ through `std::io::Stdin`, a `BufReader`, took up to 8 KiB off a shared
 descriptor and then reported a timeout for a line already in hand. So the
 `read` BUILTIN takes stdin ONE BYTE at a time through an unbuffered
 handle, as this shell already did for every other descriptor and as its
-line editor already did in raw mode. The editor's COOKED fallback still
-reads through the buffered handle, which is the one remaining reader that
-runs ahead; it cannot overlap the builtin's deadline (a canonical
-terminal returns at most one line per read, so it leaves nothing behind)
-and the case where it does lose input — an interactive shell fed a script
-down a pipe — loses it identically without any of this.
+line editor already did in raw mode. NOTHING in the shell reads ahead on
+stdin now: the editor's cooked fallback and the reader for a script
+arriving on stdin take the same handle a byte at a time, so the script
+and the commands in it cannot disagree about where in that descriptor
+they are.
 
 Nor may a descriptor be LOCKED across that read. The shell's table holds
 an open file behind a bare `Arc` rather than an `Arc<Mutex<…>>`, because

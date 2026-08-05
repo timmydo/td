@@ -98,6 +98,10 @@ struct Pending {
     delim: String,
     quoted: bool,
     strip_tabs: bool,
+    /// Body lines read so far. Kept HERE rather than in a local so that a scan
+    /// which runs out of input part way through a body resumes after the lines
+    /// it already consumed, instead of re-reading them on every refill.
+    body: String,
 }
 
 struct Scanner {
@@ -221,19 +225,158 @@ pub fn tokenize(src: &str) -> Syn<Lexed> {
 
 /// Lex as much of `src` as scans, reporting what stopped it in `Lexed::error`.
 pub fn tokenize_prefix(src: &str) -> Lexed {
-    let mut lx = Lexer {
-        sc: Scanner {
-            src: src.chars().collect(),
-            pos: 0,
-            continued: false,
-        },
-        ended_in_comment: false,
-        heredocs: Vec::new(),
-        pending: Vec::new(),
-        awaiting: None,
-        depth: 0,
-    };
-    lx.run()
+    let mut scan = Scan::new(src);
+    scan.seal();
+    let chunk = scan.pull();
+    Lexed {
+        toks: chunk.toks,
+        heredocs: scan.take_heredocs(),
+        ended_in_comment: scan.ended_in_comment(),
+        error: chunk.error,
+    }
+}
+
+/// What one `pull` produced. `incomplete` means the scan stopped because the
+/// input ran out INSIDE a construct and more of it could finish the job -- the
+/// scanner has been rewound to the last token boundary, so feeding more text and
+/// pulling again re-scans only the token that was open.
+pub struct Chunk {
+    pub toks: Vec<Tok>,
+    pub incomplete: bool,
+    pub error: Option<String>,
+}
+
+/// A lexer that can be fed more input and asked for more tokens, so a script
+/// arriving a line at a time is scanned ONCE rather than from the top per line.
+/// Sealing it says no more is coming, which is what turns an unfinished
+/// construct from "ask for another line" into the syntax error it turns out to
+/// be.
+pub struct Scan {
+    lx: Lexer,
+    sealed: bool,
+}
+
+impl Scan {
+    pub fn new(src: &str) -> Scan {
+        Scan {
+            lx: Lexer {
+                sc: Scanner {
+                    src: src.chars().collect(),
+                    pos: 0,
+                    continued: false,
+                },
+                ended_in_comment: false,
+                sealed: false,
+                owed_newline: false,
+                committed: false,
+                fatal: false,
+                heredocs: Vec::new(),
+                pending: Vec::new(),
+                awaiting: None,
+                depth: 0,
+            },
+            sealed: false,
+        }
+    }
+
+    /// Append more input. Only meaningful before `seal`.
+    pub fn feed(&mut self, text: &str) {
+        self.lx.sc.src.extend(text.chars());
+    }
+
+    pub fn seal(&mut self) {
+        self.sealed = true;
+        self.lx.sealed = true;
+    }
+
+    pub fn ended_in_comment(&self) -> bool {
+        self.lx.ended_in_comment
+    }
+
+    pub fn take_heredocs(&mut self) -> Vec<Word> {
+        std::mem::take(&mut self.lx.heredocs)
+    }
+
+    /// Here-document bodies collected so far, in `Op::DLess` id order.
+    pub fn heredocs(&self) -> &[Word] {
+        &self.lx.heredocs
+    }
+
+    /// Whether here-document `id` is still waiting for its body. A placeholder
+    /// is pushed when `<<` is scanned and filled in at the end of the line, so
+    /// an unfilled slot is indistinguishable from a legitimately EMPTY body --
+    /// the pending list is the only thing that can tell them apart.
+    pub fn heredoc_pending(&self, id: usize) -> bool {
+        self.lx.awaiting.is_some_and(|(a, _)| a == id)
+            || self.lx.pending.iter().any(|p| p.id == id)
+    }
+
+    /// Adopt bodies scanned elsewhere -- an alias replacement is lexed on its
+    /// own, and its here-documents have to live in the SAME table as this
+    /// source's or the two id spaces collide. Returns the base its ids move to.
+    pub fn push_heredocs(&mut self, more: Vec<Word>) -> usize {
+        let base = self.lx.heredocs.len();
+        self.lx.heredocs.extend(more);
+        base
+    }
+
+    /// Every token available from the input fed so far.
+    pub fn pull(&mut self) -> Chunk {
+        let mut toks = Vec::new();
+        loop {
+            // Taken BEFORE each attempt, because a `next_tok` that fails part way
+            // can already have consumed input, armed `awaiting`, or pushed a body.
+            let mark = self.lx.mark();
+            // Cleared per attempt: it means "this token banked input a rewind
+            // must not undo", and a stale one from an earlier token would skip
+            // the rewind for an unrelated unfinished construct.
+            self.lx.committed = false;
+            match self.lx.next_tok() {
+                Ok(Tok::Eof) if !self.sealed => {
+                    self.lx.restore(mark);
+                    return Chunk { toks, incomplete: true, error: None };
+                }
+                Ok(tok) => {
+                    let last = matches!(tok, Tok::Eof);
+                    toks.push(tok);
+                    if last {
+                        return Chunk { toks, incomplete: false, error: None };
+                    }
+                }
+                // Unsealed, an unfinished construct is a request for more input
+                // rather than an error: rewind so the open token is scanned once,
+                // whole, when the rest of it arrives.
+                Err(e) if !self.sealed && !self.lx.fatal && e.starts_with(INCOMPLETE) => {
+                    // A rewind would throw away here-document lines already
+                    // consumed, and re-reading them on every refill is what
+                    // makes a large body quadratic. Progress stays; the scan is
+                    // resumable from exactly where it stopped.
+                    if std::mem::take(&mut self.lx.committed) {
+                        return Chunk { toks, incomplete: true, error: None };
+                    }
+                    self.lx.restore(mark);
+                    return Chunk { toks, incomplete: true, error: None };
+                }
+                Err(e) => return Chunk { toks, incomplete: false, error: Some(e) },
+            }
+        }
+    }
+}
+
+/// A token boundary the scan can be wound back to. Both vectors are recorded as
+/// LENGTHS rather than copies: a rewind only ever has to undo pushes, because
+/// the two operations that shorten `pending` or extend a body -- consuming an
+/// entry and banking a line -- each set `committed`, and `pull` does not rewind
+/// once that is set. Cloning `pending` instead would copy the accumulated body
+/// at every token, which is quadratic in the length of a here-document.
+struct Mark {
+    pos: usize,
+    continued: bool,
+    ended_in_comment: bool,
+    awaiting: Option<(usize, bool)>,
+    owed_newline: bool,
+    pending: usize,
+    heredocs: usize,
 }
 
 /// Scan `text` as a single word: blanks and operator characters are ordinary
@@ -271,6 +414,10 @@ fn lexer_over(text: &str, depth: u32) -> Syn<Lexer> {
         return Err("expansion nested too deeply".into());
     }
     Ok(Lexer {
+        sealed: true,
+        owed_newline: false,
+        committed: false,
+        fatal: false,
         sc: Scanner {
             src: text.chars().collect(),
             pos: 0,
@@ -287,6 +434,18 @@ fn lexer_over(text: &str, depth: u32) -> Syn<Lexer> {
 struct Lexer {
     sc: Scanner,
     ended_in_comment: bool,
+    /// Set once no more input can arrive, which is what makes an unterminated
+    /// final line the last line rather than half of one still being typed.
+    sealed: bool,
+    /// A newline has been consumed but its here-document bodies are not all
+    /// read, so the `Tok::Newline` it owes has not been emitted yet.
+    owed_newline: bool,
+    /// Set when a body line was consumed and recorded. Progress that a rewind
+    /// must not undo -- see `Scan::pull`.
+    committed: bool,
+    /// Set when an error cannot be cured by more input, so `pull` reports it
+    /// even though it is spelled as an end-of-input one.
+    fatal: bool,
     heredocs: Vec<Word>,
     pending: Vec<Pending>,
     /// Set when a `<<` operator is waiting for its delimiter word.
@@ -296,35 +455,39 @@ struct Lexer {
 }
 
 impl Lexer {
-    fn run(&mut self) -> Lexed {
-        let mut toks = Vec::new();
-        let mut error = None;
-        loop {
-            match self.next_tok() {
-                Ok(tok) => {
-                    let last = matches!(tok, Tok::Eof);
-                    toks.push(tok);
-                    if last {
-                        break;
-                    }
-                }
-                Err(e) => {
-                    error = Some(e);
-                    break;
-                }
-            }
-        }
-        Lexed {
-            toks,
-            heredocs: std::mem::take(&mut self.heredocs),
+    fn mark(&self) -> Mark {
+        Mark {
+            pos: self.sc.pos,
+            continued: self.sc.continued,
             ended_in_comment: self.ended_in_comment,
-            error,
+            awaiting: self.awaiting,
+            owed_newline: self.owed_newline,
+            pending: self.pending.len(),
+            heredocs: self.heredocs.len(),
         }
+    }
+
+    fn restore(&mut self, m: Mark) {
+        self.sc.pos = m.pos;
+        self.sc.continued = m.continued;
+        self.ended_in_comment = m.ended_in_comment;
+        self.awaiting = m.awaiting;
+        self.owed_newline = m.owed_newline;
+        self.pending.truncate(m.pending);
+        self.heredocs.truncate(m.heredocs);
     }
 
     /// The next token, or `Tok::Eof` once the input is spent.
     fn next_tok(&mut self) -> Syn<Tok> {
         loop {
+            // A newline whose here-documents are not all read: finish them
+            // before anything else, so a scan resumed mid-body continues the
+            // body rather than lexing its lines as ordinary tokens.
+            if self.owed_newline {
+                self.read_heredoc_bodies()?;
+                self.owed_newline = false;
+                return Ok(Tok::Newline);
+            }
             self.skip_blanks();
             let Some(c) = self.sc.peek() else {
                 if self.sc.continued {
@@ -335,8 +498,8 @@ impl Lexer {
             };
             if c == '\n' {
                 self.sc.bump();
-                self.read_heredoc_bodies()?;
-                return Ok(Tok::Newline);
+                self.owed_newline = true;
+                continue;
             }
             if c == '#' {
                 while let Some(c) = self.sc.peek() {
@@ -361,6 +524,7 @@ impl Lexer {
                     delim,
                     quoted,
                     strip_tabs,
+                    body: String::new(),
                 });
                 return Ok(Tok::Word(word));
             }
@@ -456,6 +620,7 @@ impl Lexer {
 
     fn read_raw_line(&mut self) -> Option<String> {
         self.sc.peek()?; // at end of input there is no next line
+        let start = self.sc.pos;
         let mut line = String::new();
         while let Some(c) = self.sc.bump() {
             if c == '\n' {
@@ -463,38 +628,72 @@ impl Lexer {
             }
             line.push(c);
         }
-        Some(line)
+        // No terminator. Sealed, that IS the last line; unsealed, the rest of it
+        // is still coming, so give the characters back rather than treat half a
+        // line as whole -- it might be the delimiter with its tail unread.
+        if self.sealed {
+            Some(line)
+        } else {
+            self.sc.pos = start;
+            None
+        }
     }
 
     fn read_heredoc_bodies(&mut self) -> Syn<()> {
-        for p in std::mem::take(&mut self.pending) {
-            let mut body = String::new();
+        while !self.pending.is_empty() {
+            let Some((id, delim, quoted, strip_tabs)) = self
+                .pending
+                .first()
+                .map(|p| (p.id, p.delim.clone(), p.quoted, p.strip_tabs))
+            else {
+                break;
+            };
             loop {
                 let Some(raw) = self.read_raw_line() else {
-                    return Err(format!(
-                        "{INCOMPLETE}: here-document delimited by `{}`",
-                        p.delim
-                    ));
+                    return Err(format!("{INCOMPLETE}: here-document delimited by `{delim}`"));
                 };
-                let line = if p.strip_tabs {
+                let line = if strip_tabs {
                     raw.trim_start_matches('\t')
                 } else {
                     raw.as_str()
                 };
-                if line == p.delim {
+                if line == delim {
                     break;
                 }
-                body.push_str(line);
-                body.push('\n');
+                if let Some(p) = self.pending.first_mut() {
+                    p.body.push_str(line);
+                    p.body.push('\n');
+                }
+                self.committed = true;
             }
-            let word = if p.quoted {
+            let body = match self.pending.first_mut() {
+                Some(p) => std::mem::take(&mut p.body),
+                None => String::new(),
+            };
+            let word = if quoted {
                 Word(vec![Seg::Quoted(body)])
             } else {
-                heredoc_body_word(&body)?
+                // The body is bounded by its delimiter, so an unfinished
+                // construct inside it is a syntax error and NOT a request for
+                // another line -- `fatal` says so without changing the text,
+                // which is the same diagnostic the whole-of-input path gives.
+                match heredoc_body_word(&body) {
+                    Ok(w) => w,
+                    Err(e) => {
+                        self.fatal = true;
+                        return Err(e);
+                    }
+                }
             };
-            if let Some(slot) = self.heredocs.get_mut(p.id) {
+            if let Some(slot) = self.heredocs.get_mut(id) {
                 *slot = word;
             }
+            // Only now: the entry is what a resumed scan would need if storing
+            // the body had failed.
+            if !self.pending.is_empty() {
+                self.pending.remove(0);
+            }
+            self.committed = true;
         }
         Ok(())
     }
@@ -513,14 +712,23 @@ impl Lexer {
     /// it (normal tokenizing); without, the whole remaining input is the word.
     fn scan_word(&mut self, stop_at_delims: bool) -> Syn<Word> {
         let mut buf = WordBuf::default();
+        // Distinguishes a word ENDED by a delimiter from one that merely ran out
+        // of fed text, which unsealed means the rest is still coming.
+        let mut ran_out = true;
         while let Some(c) = self.sc.peek() {
             if stop_at_delims && is_word_end(c) {
+                ran_out = false;
                 break;
             }
             match c {
                 '\\' => {
                     self.sc.bump();
                     match self.sc.peek() {
+                        // Sealed, a trailing backslash is a literal one; unsealed
+                        // it is half of a fold whose newline has not arrived.
+                        None if !self.sealed => {
+                            return Err(format!("{INCOMPLETE}: line continuation"))
+                        }
                         None => buf.push_quoted('\\'),
                         Some('\n') => {
                             self.sc.bump();
@@ -564,6 +772,14 @@ impl Lexer {
                     buf.push_lit(other);
                 }
             }
+        }
+        // A word that ran to the end of the fed text is only finished if nothing
+        // more can arrive. Unsealed it is not: a `\<newline>` fold consumed this
+        // line's terminator, so the next line CONTINUES this word rather than
+        // starting a new one, and ending it here would split `foo\<nl>bar` into
+        // two words.
+        if ran_out && !self.sealed {
+            return Err(format!("{INCOMPLETE}: line continuation"));
         }
         Ok(buf.finish())
     }
@@ -888,6 +1104,10 @@ impl Lexer {
 /// is recorded as quoted.
 fn heredoc_body_word(body: &str) -> Syn<Word> {
     let mut lx = Lexer {
+        sealed: true,
+        owed_newline: false,
+        committed: false,
+        fatal: false,
         sc: Scanner {
             src: body.chars().collect(),
             pos: 0,

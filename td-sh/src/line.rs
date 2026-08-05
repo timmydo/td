@@ -701,18 +701,96 @@ fn pick_sink(candidates: [std::os::fd::BorrowedFd<'_>; 2]) -> Option<std::fs::Fi
 
 /// The kernel's own line discipline, for a stdin that is not an editable
 /// terminal — a pipe, a file, or a console that would not take `TCSETS`.
+///
+/// ONE BYTE AT A TIME, through the same unbuffered handle the `read` builtin
+/// takes, and for the same reason it takes one: `std::io::Stdin` is a
+/// `BufReader`, so reading a line through it pulls up to 8 KiB off a descriptor
+/// the SCRIPT shares with the commands in it. `printf 'read v\nDATA\n' | td-sh
+/// -i` left `read` at end of input with the line it wanted sitting in the
+/// shell's own buffer, where bash hands it over. Sharing the handle rather than
+/// taking a second one is what keeps the two from disagreeing about position.
+///
+/// The cost is a syscall per byte on a path that is per-LINE and interactive.
+/// A non-interactive stdin script never reaches here — it is read by
+/// `read_script_line` below, which `main`'s parser pulls from — so this is `-i`
+/// on a pipe, or a console that refused raw mode.
 fn read_cooked(prompt: &str) -> Input {
     let _ = write!(std::io::stdout(), "{prompt}");
     let _ = std::io::stdout().flush();
-    let mut line = String::new();
-    match std::io::stdin().read_line(&mut line) {
-        Ok(0) | Err(_) => Input::Eof,
-        Ok(_) => {
+    match read_script_line() {
+        // The terminator is not part of what the operator typed, and a console
+        // may end a line CRLF. Stripped HERE rather than in the reader, because
+        // in a SCRIPT those same bytes are the script's own: whether the last
+        // line ended in a newline decides whether a trailing `\` is a line
+        // continuation, and a carriage return inside a quoted value is data.
+        ScriptLine::Line(mut line) => {
             while line.ends_with('\n') || line.ends_with('\r') {
                 line.pop();
             }
             Input::Line(line)
         }
+        // A failed read ends the prompt loop, which is what `read_line` did.
+        ScriptLine::Eof | ScriptLine::Failed(_) => Input::Eof,
+    }
+}
+
+/// What one raw line off stdin turned out to be.
+pub enum ScriptLine {
+    /// The bytes up to and INCLUDING the newline — or without one, at the end
+    /// of input. Verbatim: a script's own bytes are not this reader's to
+    /// normalise.
+    Line(String),
+    Eof,
+    /// Reported rather than folded into `Eof`, because a script that stopped
+    /// because its input FAILED is not a script that ended.
+    Failed(String),
+}
+
+/// One line off stdin, unbuffered and byte at a time.
+///
+/// Through the same handle the `read` builtin takes, `process::stdin_raw`:
+/// `std::io::Stdin` is a `BufReader`, so reading a line through it pulls up to
+/// 8 KiB off a descriptor the script SHARES with the commands in it. Sharing
+/// the handle rather than opening a second one is the point — two dups would
+/// have one offset but two buffers, which is the bug this exists to avoid.
+///
+/// The cost is a syscall per byte. A script given as a FILE OPERAND is still
+/// read whole (`Start::Script`); everything else reaching stdin comes through
+/// here, `sh < script` included.
+pub fn read_script_line() -> ScriptLine {
+    let handle = match crate::process::stdin_raw() {
+        Ok(handle) => handle,
+        Err(e) => return ScriptLine::Failed(e.to_string()),
+    };
+    let mut src: &std::fs::File = &handle;
+    let mut bytes: Vec<u8> = Vec::new();
+    let mut one = [0u8; 1];
+    loop {
+        match src.read(&mut one) {
+            // `read_line`, which this replaces, retried an interrupted read;
+            // treating it as end of input would truncate a script that has
+            // more. Unreachable while td-sh installs no handler, and reachable
+            // the moment `trap 'action'` is served, which UNSAFE.md §8 defers.
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return ScriptLine::Failed(e.to_string()),
+            Ok(0) => break,
+            Ok(_) => {
+                let byte = one[0];
+                bytes.push(byte);
+                if byte == b'\n' {
+                    break;
+                }
+            }
+        }
+    }
+    if bytes.is_empty() {
+        return ScriptLine::Eof;
+    }
+    match String::from_utf8(bytes) {
+        Ok(line) => ScriptLine::Line(line),
+        // The message `read_to_string` gave for the same input, which is what
+        // this path reported before it read a line at a time.
+        Err(_) => ScriptLine::Failed("stream did not contain valid UTF-8".to_string()),
     }
 }
 
