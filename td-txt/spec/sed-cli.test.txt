@@ -11683,3 +11683,98 @@ xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx$
 ## stdout-json: "a\nX\nb\nX\n"
 ## stderr-json: ""
 ## status: 0
+
+# --- A diagnostic that QUOTES A BYTE quotes the byte ITSELF. GNU builds each
+# --- message with sprintf (`unknown command: `%c'') and prints it with %s, so
+# --- a script byte from 0x80 up goes out as one byte -- where rendering it
+# --- through `char::from' widens it to a Unicode scalar and sends two. The %s
+# --- is the other half: a NUL ENDS the message it lands in, closing quote and
+# --- all, and only a -f script can carry one, argv being NUL-terminated.
+
+#### a script byte sed cannot read is quoted RAW, not UTF-8 encoded
+## argv: sed -e "\x80p"
+## stdin-json: "a\n"
+## stdout-json: ""
+## stderr-json: "sed: -e expression #1, char 1: unknown command: `\x80'\n"
+## status: 1
+
+#### the quoted byte follows an address, and char counts it once
+## argv: sed -e "1\x80"
+## stdin-json: "a\n"
+## stdout-json: ""
+## stderr-json: "sed: -e expression #1, char 2: unknown command: `\x80'\n"
+## status: 1
+
+#### the quoted byte inside a block
+## argv: sed -e "{\x80}"
+## stdin-json: "a\n"
+## stdout-json: ""
+## stderr-json: "sed: -e expression #1, char 2: unknown command: `\x80'\n"
+## status: 1
+
+#### 0xff, the top byte, is quoted like any other
+## argv: sed -e "\xffp"
+## stdin-json: "a\n"
+## stdout-json: ""
+## stderr-json: "sed: -e expression #1, char 1: unknown command: `\xff'\n"
+## status: 1
+
+#### a byte below 0x80 was already itself and still is
+## argv: sed -e "\x01p"
+## stdin-json: "a\n"
+## stdout-json: ""
+## stderr-json: "sed: -e expression #1, char 1: unknown command: `\x01'\n"
+## status: 1
+
+#### a -f script's raw byte is quoted under the file locus
+## argv: sed -f S
+## file-json S: "\x80p\n"
+## stdin-json: "a\n"
+## stdout-json: ""
+## stderr-json: "sed: file S line 1: unknown command: `\x80'\n"
+## status: 1
+
+#### the file locus still counts lines around a raw byte
+## argv: sed -f S
+## file-json S: "p\np\n\xffp\n"
+## stdin-json: "a\n"
+## stdout-json: ""
+## stderr-json: "sed: file S line 3: unknown command: `\xff'\n"
+## status: 1
+
+#### a NUL ENDS the message, losing even its closing quote
+## argv: sed -f S
+## file-json S: "\x00p\n"
+## stdin-json: "a\n"
+## stdout-json: ""
+## stderr-json: "sed: file S line 1: unknown command: `\n"
+## status: 1
+
+#### a control that is not NUL keeps its closing quote
+## argv: sed -f S
+## file-json S: "\x01p\n"
+## stdin-json: "a\n"
+## stdout-json: ""
+## stderr-json: "sed: file S line 1: unknown command: `\x01'\n"
+## status: 1
+
+#### an unopenable -f script is NAMED raw
+## argv: sed -f "no\xffsuch"
+## stdin-json: "a\n"
+## stdout-json: ""
+## stderr-json: "sed: couldn't open file no\xffsuch: No such file or directory\n"
+## status: 4
+
+#### a bad option byte is quoted raw
+## argv: sed "-\x80"
+## stdin-json: "a\n"
+## stdout-json: ""
+## stderr-json: "sed: invalid option -- '\x80'\nusage: sed [-nrEsz] [-i[SUFFIX]] [-l N] [-e SCRIPT] [-f FILE] [SCRIPT] [FILE]...\n"
+## status: 1
+
+#### the LONG spelling of -f names an unopenable script raw as well
+## argv: sed "--file=no\xffsuch"
+## stdin-json: "a\n"
+## stdout-json: ""
+## stderr-json: "sed: couldn't open file no\xffsuch: No such file or directory\n"
+## status: 4

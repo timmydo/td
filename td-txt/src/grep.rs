@@ -11,8 +11,8 @@
 
 use crate::regex::{Filter, OnBudget, Options, Regex};
 use crate::util::{
-    errmsg, number, path_bytes, posixly_correct, print_line, read_input, read_search, records,
-    show, walk, Diag, Out, VERSION,
+    byte_in, errmsg, number, path_bytes, posixly_correct, print_line, read_input, read_search,
+    records, show, walk, Diag, Out, VERSION,
 };
 
 /// How many significant digits `-NUM` takes before refusing the run. GNU's own
@@ -366,7 +366,20 @@ fn better(cur: Option<(usize, usize)>, cand: (usize, usize)) -> (usize, usize) {
 }
 
 fn err(msg: &str) {
-    eprintln!("grep: {msg}");
+    errb(msg.as_bytes());
+}
+
+/// `err` for a message carrying a RAW byte, which a `&str` cannot hold as one:
+/// `char::from` widens it to a Unicode scalar and encodes it as UTF-8, so
+/// `grep -\x80` would name its bad option with two bytes where GNU names it
+/// with the one. No `cstr` here, unlike sed's: every name grep quotes comes from
+/// argv, which is NUL-terminated, so none can carry the byte that would truncate.
+fn errb(msg: &[u8]) {
+    use std::io::Write;
+    let mut out = b"grep: ".to_vec();
+    out.extend_from_slice(msg);
+    out.push(b'\n');
+    let _ = std::io::stderr().write_all(&out);
 }
 
 /// Applet entry point. `args[0]` is the invoked name.
@@ -591,7 +604,7 @@ pub fn main(args: &[Vec<u8>]) -> i32 {
                 },
                 b'm' => {
                     let Some(v) = value_of(&mut j, &mut i) else {
-                        err(&format!("option requires an argument -- '{}'", char::from(opt)));
+                        errb(&byte_in("option requires an argument -- '", opt, "'"));
                         return 2;
                     };
                     let Some(limit) = parse_max_count(&v) else {
@@ -603,7 +616,7 @@ pub fn main(args: &[Vec<u8>]) -> i32 {
                 }
                 b'A' | b'B' | b'C' => {
                     let Some(v) = value_of(&mut j, &mut i) else {
-                        err(&format!("option requires an argument -- '{}'", char::from(opt)));
+                        errb(&byte_in("option requires an argument -- '", opt, "'"));
                         return 2;
                     };
                     let Some(n) = parse_count(&v) else {
@@ -613,7 +626,7 @@ pub fn main(args: &[Vec<u8>]) -> i32 {
                     apply_count(&mut conf, opt, n);
                 }
                 _ => {
-                    err(&format!("invalid option -- '{}'", char::from(opt)));
+                    errb(&byte_in("invalid option -- '", opt, "'"));
                     eprintln!("{USAGE}");
                     return 2;
                 }

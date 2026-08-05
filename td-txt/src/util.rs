@@ -34,6 +34,27 @@ pub fn show(bytes: &[u8]) -> String {
     String::from_utf8_lossy(bytes).into_owned()
 }
 
+/// A diagnostic with one RAW byte spliced into it, which is what GNU's `sprintf`
+/// writes for `%c`. `format!` cannot: `char::from` widens the byte to a Unicode
+/// scalar and encodes it as UTF-8, so every byte from 0x80 up arrives as two.
+pub fn byte_in(before: &str, byte: u8, after: &str) -> Vec<u8> {
+    let mut out = Vec::with_capacity(before.len() + 1 + after.len());
+    out.extend_from_slice(before.as_bytes());
+    out.push(byte);
+    out.extend_from_slice(after.as_bytes());
+    out
+}
+
+/// The prefix a C `%s` prints: the bytes before the first NUL. GNU builds each
+/// diagnostic as a C string, so a NUL that reaches one ENDS it -- and only a
+/// `-f` script can carry a NUL into a message, argv being NUL-terminated.
+pub fn cstr(bytes: &[u8]) -> &[u8] {
+    match bytes.iter().position(|b| *b == 0) {
+        Some(n) => bytes.get(..n).unwrap_or_default(),
+        None => bytes,
+    }
+}
+
 /// What `--version` reports. A literal rather than `env!("CARGO_PKG_VERSION")`
 /// because the SHIPPED binary is compiled by a direct `rustc src/main.rs` with no
 /// cargo to set that variable; `version_matches_the_manifest` pins the two.
@@ -471,6 +492,23 @@ mod tests {
         // A non-errno error has no suffix to drop.
         let other = std::io::Error::other("boom");
         assert_eq!(errmsg(&other), "boom");
+    }
+
+    /// The FIRST NUL, not the last: a message holding two would otherwise keep
+    /// the text between them, which no C `%s` prints.
+    #[test]
+    fn cstr_stops_at_the_first_nul() {
+        assert_eq!(cstr(b"a\0b\0c"), b"a");
+        assert_eq!(cstr(b"abc"), b"abc");
+        assert_eq!(cstr(b"\0abc"), b"");
+        assert_eq!(cstr(b""), b"");
+    }
+
+    /// A byte goes in as ITSELF; `char::from` would send 0x80 as two.
+    #[test]
+    fn byte_in_splices_one_raw_byte() {
+        assert_eq!(byte_in("a`", 0x80, "'"), b"a`\x80'".to_vec());
+        assert_eq!(byte_in("", 0, ""), vec![0u8]);
     }
 
     #[test]

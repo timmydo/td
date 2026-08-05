@@ -41,7 +41,7 @@ fn bin() -> PathBuf {
 /// missing vendored `.inp`/`.good`, or a typo'd annotation reds in-loop — without
 /// depending on the behavioral run below.
 /// Raise this with the corpus; it exists to catch a corpus that SHRANK.
-const CORPUS_FLOOR: usize = 2145;
+const CORPUS_FLOOR: usize = 2158;
 
 #[test]
 fn corpus_is_well_formed() -> Result<(), Box<dyn std::error::Error>> {
@@ -780,5 +780,34 @@ fn sed_script_stdin_seekability_is_a_stat_not_a_reopen()
         .any(|o| line.contains(o));
         assert!(!(names_fd0 && opens), "fd 0 must not be reopened: {line}");
     }
+    Ok(())
+}
+
+/// The `-f` script's NAME reaches the diagnostic RAW, end to end. `locus_at`'s
+/// own test builds the `Origin::File` by hand, so it pins the formatting and not
+/// the plumbing that fills it: a review turned `Origin::File(f.clone())` into
+/// `Origin::File(show(f).into_bytes())` and the whole suite stayed green while
+/// diverging from GNU. The case files cannot say it -- an annotation names its
+/// file as text -- but a test can, `OsStr::from_bytes` naming one fine.
+#[test]
+fn a_f_script_named_in_non_utf8_is_reported_raw() -> Result<(), Box<dyn std::error::Error>> {
+    use std::os::unix::ffi::OsStrExt;
+
+    let dir = TempDir::new("rawname")?;
+    let name = std::ffi::OsStr::from_bytes(b"h\xffi.sed");
+    std::fs::write(dir.0.join(name), b"\x80p\n")?;
+
+    let out = std::process::Command::new(bin())
+        .arg("sed")
+        .arg("-f")
+        .arg(name)
+        .current_dir(&dir.0)
+        .output()?;
+    assert_eq!(
+        out.stderr,
+        b"sed: file h\xffi.sed line 1: unknown command: `\x80'\n".to_vec(),
+        "the -f name or the byte it quotes was not written raw"
+    );
+    assert_eq!(out.status.code(), Some(1));
     Ok(())
 }

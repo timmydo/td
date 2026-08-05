@@ -169,6 +169,18 @@ fn read_block(lines: &[&str], start: usize) -> Result<(Vec<u8>, usize), SpecErro
     }
 }
 
+/// The byte two hex digits spell, for the `\xHH` both escape tables use. BOTH
+/// digits are required and both must be HEX: `from_str_radix` alone accepts a
+/// leading `+`, so `\x+4` would silently mean 0x04 -- the same "spells something
+/// else" trap the letter escapes are refused for.
+fn hex_byte(hex: &[u8]) -> Option<u8> {
+    if hex.len() != 2 || !hex.iter().all(u8::is_ascii_hexdigit) {
+        return None;
+    }
+    let text = std::str::from_utf8(hex).ok()?;
+    u8::from_str_radix(text, 16).ok()
+}
+
 /// Decode a JSON string literal (the `-json` annotation forms). Hand-rolled: the
 /// crate carries no dependencies.
 fn json_decode(value: &str, line: usize) -> Result<Vec<u8>, SpecError> {
@@ -200,9 +212,9 @@ fn json_decode(value: &str, line: usize) -> Result<Vec<u8>, SpecError> {
             '\\' => out.push(b'\\'),
             'x' => {
                 let hex: String = chars.get(i..i + 2).unwrap_or_default().iter().collect();
-                let byte = u8::from_str_radix(&hex, 16)
-                    .map_err(|_| SpecError::new(line, "bad \\xHH escape in a -json value"))?;
                 i += 2;
+                let byte = hex_byte(hex.as_bytes())
+                    .ok_or_else(|| SpecError::new(line, "bad \\xHH escape in a -json value"))?;
                 out.push(byte);
             }
             // JSON's own byte escape. Restricted to \u00XX: this corpus holds
@@ -276,6 +288,17 @@ fn tokenize(text: &str, line: usize) -> Result<Vec<Vec<u8>>, SpecError> {
                             // `"\r"` is the letter, which a case asserting a CR
                             // would pass while testing something else.
                             b'r' => b'\r',
+                            // `\xHH`, spelled as the `-json` table spells it. An
+                            // argv byte above 0x7f has no other spelling here:
+                            // this line reaches the tokenizer as UTF-8 text, so a
+                            // raw one could not survive being read.
+                            b'x' => {
+                                let hex = bytes.get(i..i + 2).unwrap_or_default();
+                                i += 2;
+                                hex_byte(hex).ok_or_else(|| {
+                                    SpecError::new(line, "bad \\xHH escape in argv")
+                                })?
+                            }
                             // Punctuation escapes ITSELF here (`\\`, `\"`, `\$`),
                             // which is the shell rule this borrows. A LETTER or
                             // DIGIT does not: it is the shape every escape that
@@ -313,6 +336,15 @@ fn tokenize(text: &str, line: usize) -> Result<Vec<Vec<u8>>, SpecError> {
     }
     if argv.is_empty() {
         return Err(SpecError::new(line, "`## argv:' is empty"));
+    }
+    // argv cannot hold a NUL -- `execve` takes NUL-terminated strings -- and a
+    // case that asked for one would pass the well-formedness check and then fail
+    // at SPAWN, which aborts the whole run instead of failing that one case.
+    // Refused where it is written, which is also what makes "only a `-f` script
+    // can carry a NUL into a diagnostic" true of the corpus and not just of a
+    // shell.
+    if argv.iter().any(|a| a.contains(&0)) {
+        return Err(SpecError::new(line, "a NUL cannot go in argv"));
     }
     Ok(argv)
 }
@@ -1121,18 +1153,43 @@ b
 
     /// A LETTER escape the tokenizer does not know must be refused rather than
     /// spelled as the letter: `"\r"` meaning `r` is a case that passes while
-    /// asserting something else, and `\0`/`\x41` are the same trap unclosed.
+    /// asserting something else, and `\0` is the same trap unclosed.
     /// Punctuation still escapes itself, which is what `\\` and `\"` need.
     #[test]
     fn argv_tokenizer_refuses_an_unknown_letter_escape() {
         assert_eq!(tokenize(r#"sed "a\rb""#, 1).unwrap(), vec![b"sed".to_vec(), b"a\rb".to_vec()]);
-        for bad in [r#"sed "a\0b""#, r#"sed "a\x41""#, r#"sed "a\e""#] {
+        for bad in [r#"sed "a\0b""#, r#"sed "a\e""#] {
             assert!(tokenize(bad, 1).is_err(), "{bad} was accepted");
         }
         assert_eq!(
             tokenize(r#"sed "a\\b" "c\"d" "e\$f""#, 1).unwrap(),
             vec![b"sed".to_vec(), br"a\b".to_vec(), b"c\"d".to_vec(), b"e$f".to_vec()]
         );
+    }
+
+    /// The one escape that puts a byte no `&str` can carry into argv. A case
+    /// about a diagnostic QUOTING a byte cannot be written without it: the byte
+    /// has to reach the applet through argv, and this file is read as text.
+    #[test]
+    fn argv_tokenizer_takes_a_hex_escape() {
+        assert_eq!(
+            tokenize(r#"sed "-\x80" "\x41\x7f""#, 1).unwrap(),
+            vec![b"sed".to_vec(), b"-\x80".to_vec(), b"A\x7f".to_vec()]
+        );
+        // A short or non-hex run is refused rather than read as the letter.
+        // `\x+4` is the one that needs saying: `from_str_radix` takes a leading
+        // `+`, so without the digit check it would quietly be 0x04.
+        for bad in [r#"sed "a\x4""#, r#"sed "a\xzz""#, r#"sed "a\x""#, r#"sed "a\x+4""#] {
+            assert!(tokenize(bad, 1).is_err(), "{bad} was accepted");
+        }
+        // A NUL is spellable now and argv cannot hold one, so it is refused
+        // here rather than at `Command::spawn`, which would end the whole run.
+        assert!(tokenize(r#"sed "a\x00b""#, 1).is_err(), "a NUL in argv was accepted");
+        // The same escape in the `-json` table, which shares the reader.
+        assert_eq!(json_decode(r#""\x41\x80""#, 1).unwrap(), b"A\x80".to_vec());
+        for bad in [r#""\x+4""#, r#""\xzz""#, r#""\x4""#] {
+            assert!(json_decode(bad, 1).is_err(), "{bad} was accepted");
+        }
     }
 
     #[test]

@@ -800,7 +800,7 @@ impl ScriptParser<'_> {
     fn deny_in_sandbox(&self) -> Result<(), Fatal> {
         if self.sandbox {
             return Err(Fatal {
-                msg: "e/r/w commands disabled in sandbox mode".to_string(),
+                msg: b"e/r/w commands disabled in sandbox mode".to_vec(),
                 status: 1,
                 locus: None,
             });
@@ -1403,7 +1403,7 @@ fn parse_commands(p: &mut ScriptParser) -> Result<Script, Fatal> {
             return Err("missing command".to_string().into());
         };
         if p.posix_drops_command(c) {
-            return Err(format!("unknown command: `{}'", char::from(c)).into());
+            return Err(crate::util::byte_in("unknown command: `", c, "'").into());
         }
         if p.posix_limits_addresses(c) && addr.is_range() {
             return Err("command only uses one address".to_string().into());
@@ -1554,7 +1554,7 @@ fn parse_commands(p: &mut ScriptParser) -> Result<Script, Fatal> {
                 Kind::Comment
             }
             b'e' => return Err("the `e' command is not supported".to_string().into()),
-            other => return Err(format!("unknown command: `{}'", char::from(other)).into()),
+            other => return Err(crate::util::byte_in("unknown command: `", other, "'").into()),
         };
         // The commands NOT listed here have already consumed everything that could
         // need separating, each in its own way: a filename, `a`/`i`/`c` text and a
@@ -2436,7 +2436,7 @@ enum Spot {
 /// never blame the one after. The last part's `end` is the whole source's
 /// length and the parser never steps past it, so the search reaches a part for
 /// every position it is asked about; None here means an empty script.
-fn locus_at(parts: &[Part], src: &[u8], spot: Spot) -> Option<String> {
+fn locus_at(parts: &[Part], src: &[u8], spot: Spot) -> Option<Vec<u8>> {
     let (pos, saved) = match spot {
         Spot::Read(pos) => (pos, false),
         Spot::Saved(pos) => (pos, true),
@@ -2454,12 +2454,17 @@ fn locus_at(parts: &[Part], src: &[u8], spot: Spot) -> Option<String> {
     match &part.origin {
         Origin::Expression(n) => {
             let ch = if saved { 0 } else { pos.saturating_sub(start) };
-            Some(format!("-e expression #{n}, char {ch}"))
+            Some(format!("-e expression #{n}, char {ch}").into_bytes())
         }
         Origin::File(name) => {
             let within = src.get(start..pos).unwrap_or_default();
             let line = 1 + within.iter().filter(|b| **b == b'\n').count();
-            Some(format!("file {} line {}", show(name), line))
+            // The NAME goes out as GNU's `%s` writes it, raw: `show` would send a
+            // non-UTF-8 one through a replacement character.
+            let mut out = b"file ".to_vec();
+            out.extend_from_slice(name);
+            out.extend_from_slice(format!(" line {line}").as_bytes());
+            Some(out)
         }
     }
 }
@@ -2469,20 +2474,29 @@ fn locus_at(parts: &[Part], src: &[u8], spot: Spot) -> Option<String> {
 /// or usage, 2 for an unreadable input, 4 for a runtime failure — of which an
 /// unresolvable branch label is one, because GNU resolves labels while running.
 struct Fatal {
-    msg: String,
+    /// BYTES rather than a `String`, because GNU builds each diagnostic with
+    /// `sprintf` and prints it with `%s`: a script byte it quotes goes out as
+    /// itself, and a `-f` script's name does too.
+    msg: Vec<u8>,
     status: i32,
     /// Where the script went wrong, already formatted: `-e expression #2` or
     /// `file s.sed line 3`. Only a COMPILE failure has one; a runtime failure is
     /// not about a place in the script and GNU reports it bare.
-    locus: Option<String>,
+    locus: Option<Vec<u8>>,
 }
 
 impl From<String> for Fatal {
     fn from(msg: String) -> Self {
+        Self::from(msg.into_bytes())
+    }
+}
+
+impl From<Vec<u8>> for Fatal {
+    fn from(msg: Vec<u8>) -> Self {
         // GNU reports the `[:alpha:]`-for-`[[:alpha:]]` refusal bare and exits 4,
         // alone among pattern errors; classified here by text for the same reason
         // NO_PREVIOUS_REGEX is, so the raising site and this boundary cannot drift.
-        let status = if msg == crate::regex::CLASS_SYNTAX { 4 } else { 1 };
+        let status = if msg == crate::regex::CLASS_SYNTAX.as_bytes() { 4 } else { 1 };
         Self { msg, status, locus: None }
     }
 }
@@ -2504,7 +2518,7 @@ impl Fatal {
     /// here or it lands in the wrong bucket wearing the wrong prefix.
     fn runtime(msg: String) -> Self {
         let status = if msg == NO_PREVIOUS_REGEX { 1 } else { 4 };
-        Self { msg, status, locus: None }
+        Self { msg: msg.into_bytes(), status, locus: None }
     }
 }
 
@@ -2521,6 +2535,37 @@ struct Conf {
     line_wrap: usize,
 }
 
+/// `couldn't open file NAME: WHY` with the NAME raw, as GNU's `%s` writes it.
+/// Only a `-f` script reaches this; every other name a diagnostic carries is
+/// still `show`n -- see spec/README.
+fn cant_open(name: &[u8], e: &std::io::Error) -> Vec<u8> {
+    let mut msg = b"couldn't open file ".to_vec();
+    msg.extend_from_slice(name);
+    msg.extend_from_slice(format!(": {}", errmsg(e)).as_bytes());
+    msg
+}
+
+/// One diagnostic line, written as BYTES. `eprintln!` of a `String` cannot carry
+/// a script byte from 0x80 up -- it would arrive UTF-8 encoded as two -- and
+/// cannot stop at a NUL.
+fn diag(msg: &[u8]) {
+    diag_at(None, msg);
+}
+
+/// `diag` with the place in the script GNU names first. The MESSAGE is what a
+/// NUL truncates and the locus is not: GNU passes each as its own `%s`, and only
+/// the message can hold one, a locus naming a `-f` file that came from argv.
+fn diag_at(locus: Option<&[u8]>, msg: &[u8]) {
+    let mut out = b"sed: ".to_vec();
+    if let Some(locus) = locus {
+        out.extend_from_slice(locus);
+        out.extend_from_slice(b": ");
+    }
+    out.extend_from_slice(crate::util::cstr(msg));
+    out.push(b'\n');
+    let _ = std::io::stderr().write_all(&out);
+}
+
 pub fn main(args: &[Vec<u8>]) -> i32 {
     match run(args) {
         Ok(code) => code,
@@ -2529,10 +2574,7 @@ pub fn main(args: &[Vec<u8>]) -> i32 {
             // having one IS the condition: a runtime failure — an unopenable
             // `-f' file, an unresolvable label (exit 4) — is not about a place
             // in the script and GNU reports it bare.
-            match &f.locus {
-                Some(locus) => eprintln!("sed: {locus}: {}", f.msg),
-                None => eprintln!("sed: {}", f.msg),
-            }
+            diag_at(f.locus.as_deref(), &f.msg);
             f.status
         }
     }
@@ -2551,7 +2593,7 @@ fn compile_script(
     let mut script = parse_script(src, ere, null_data, parts, posix, sandbox)?;
     let labels = std::mem::take(&mut script.labels);
     resolve_labels(&mut script.cmds, &labels)
-        .map_err(|msg| Fatal { msg, status: 4, locus: None })?;
+        .map_err(|msg| Fatal { msg: msg.into_bytes(), status: 4, locus: None })?;
     Ok(script)
 }
 
@@ -2609,7 +2651,7 @@ fn resolve_long(name: &[u8]) -> Result<&'static [u8], String> {
 /// `-e expression #1:` — true of a script that failed to compile and false of an
 /// option that never got its value.
 fn missing_short_argument(opt: u8) -> i32 {
-    eprintln!("sed: option requires an argument -- '{}'", char::from(opt));
+    diag(&crate::util::byte_in("option requires an argument -- '", opt, "'"));
     eprintln!("{USAGE}");
     1
 }
@@ -2756,7 +2798,7 @@ fn run(args: &[Vec<u8>]) -> Result<i32, Fatal> {
                             // same wording: the script did not fail to COMPILE, the
                             // file failed to open.
                             let (text, seekable) = read_script(&value).map_err(|e| Fatal {
-                                msg: format!("couldn't open file {}: {}", show(&value), errmsg(&e)),
+                                msg: cant_open(&value, &e),
                                 status: 4,
                                 locus: None,
                             })?;
@@ -2828,7 +2870,7 @@ fn run(args: &[Vec<u8>]) -> Result<i32, Fatal> {
                     // An unreadable SCRIPT file is exit 4, like any other
                     // runtime failure — not 1, which means a bad script.
                     let (text, seekable) = read_script(&v).map_err(|e| Fatal {
-                        msg: format!("couldn't open file {}: {}", show(&v), errmsg(&e)),
+                        msg: cant_open(&v, &e),
                         status: 4,
                         locus: None,
                     })?;
@@ -2839,7 +2881,7 @@ fn run(args: &[Vec<u8>]) -> Result<i32, Fatal> {
                     script_given = true;
                 }
                 _ => {
-                    eprintln!("sed: invalid option -- '{}'", char::from(opt));
+                    diag(&crate::util::byte_in("invalid option -- '", opt, "'"));
                     eprintln!("{USAGE}");
                     return Ok(1);
                 }
@@ -4166,7 +4208,7 @@ mod tests {
             let err = compile_script(script, false, false, false, Vec::new(), false).err();
             assert_eq!(
                 err.map(|f| f.msg),
-                Some(msg.to_string()),
+                Some(msg.as_bytes().to_vec()),
                 "{:?} must be {msg}",
                 String::from_utf8_lossy(script)
             );
@@ -4194,13 +4236,13 @@ mod tests {
             compile_script(b"s/[[....]]/X/", false, false, false, Vec::new(), false)
                 .err()
                 .map(|f| f.msg),
-            Some("Invalid collation character".to_string())
+            Some(b"Invalid collation character".to_vec())
         );
         for script in [&b"s/[[...]]/X/"[..], b"s/[[.....]]/X/", b"s/[[:::]]/X/", b"s/[[===]]/X/"] {
             let err = compile_script(script, false, false, false, Vec::new(), false).err();
             assert_eq!(
                 err.map(|f| f.msg),
-                Some("unterminated `s' command".to_string()),
+                Some(b"unterminated `s' command".to_vec()),
                 "{:?}",
                 String::from_utf8_lossy(script)
             );
@@ -4211,7 +4253,7 @@ mod tests {
             let err = compile_script(script, false, false, false, Vec::new(), false).err();
             assert_eq!(
                 err.map(|f| f.msg),
-                Some("unterminated `s' command".to_string()),
+                Some(b"unterminated `s' command".to_vec()),
                 "{:?}",
                 String::from_utf8_lossy(script)
             );
@@ -4224,7 +4266,7 @@ mod tests {
     fn the_bare_class_syntax_refusal_is_exit_4_where_other_pattern_errors_are_1() {
         let f = compile_script(b"s@[:alpha:]@X@", false, false, false, Vec::new(), false).err();
         assert_eq!(f.as_ref().map(|f| f.status), Some(4));
-        assert_eq!(f.map(|f| f.msg), Some(crate::regex::CLASS_SYNTAX.to_string()));
+        assert_eq!(f.map(|f| f.msg), Some(crate::regex::CLASS_SYNTAX.as_bytes().to_vec()));
         let f = compile_script(b"s@[[:a:]]@X@", false, false, false, Vec::new(), false).err();
         assert_eq!(f.map(|f| f.status), Some(1));
     }
@@ -4292,20 +4334,31 @@ mod tests {
             "-e expression #2, char 1", // 7: consumed the whole script
         ];
         for (pos, w) in want.iter().enumerate() {
-            assert_eq!(locus_at(&parts, src, Spot::Read(pos)).as_deref(), Some(*w), "at {pos}");
+            assert_eq!(locus_at(&parts, src, Spot::Read(pos)).as_deref(), Some(w.as_bytes()), "at {pos}");
         }
         // A SAVED location picks its part the same way and always reads char 0,
         // which is what GNU prints for one -- so the two spots differ only where
         // an `-e` part carries a count at all.
         assert_eq!(
             locus_at(&parts, src, Spot::Saved(1)).as_deref(),
-            Some("-e expression #1, char 0")
+            Some(&b"-e expression #1, char 0"[..])
         );
         assert_eq!(
             locus_at(&parts, src, Spot::Saved(7)).as_deref(),
-            Some("-e expression #2, char 0")
+            Some(&b"-e expression #2, char 0"[..])
         );
-        assert_eq!(locus_at(&parts, src, Spot::Saved(4)).as_deref(), Some("file s.sed line 2"));
+        assert_eq!(
+            locus_at(&parts, src, Spot::Saved(4)).as_deref(),
+            Some(&b"file s.sed line 2"[..])
+        );
+        // The NAME goes out as GNU's `%s` writes it. No case can say so: a
+        // corpus file's name is read as text, so a non-UTF-8 one cannot be
+        // asked for -- and a name that IS UTF-8 renders alike either way.
+        let raw = vec![Part { end: 1, origin: Origin::File(b"h\xffi.sed".to_vec()) }];
+        assert_eq!(
+            locus_at(&raw, b"Z", Spot::Read(0)).as_deref(),
+            Some(&b"file h\xffi.sed line 1"[..])
+        );
         assert_eq!(locus_at(&[], src, Spot::Read(0)), None);
     }
 

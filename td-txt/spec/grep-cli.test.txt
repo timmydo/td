@@ -5932,3 +5932,14 @@ MATCH
 ## stdout-json: "L008\nL009\nL010\nL011\nL012\nL013\nL014\nL015\nL016\nL017\nL018\nL019\nL020\nL021\nL022\nL023\nL024\nL025\nL026\nL027\nL028\nL029\nL030\nL031\nL032\nL033\nL034\nL035\nL036\nL037\nL038\nL039\nL040\nL041\nL042\nL043\nL044\nL045\nL046\nL047\nL048\nL049\nL050\nL051\nL052\nL053\nL054\nL055\nL056\nL057\nL058\nL059\nL060\nL061\nL062\nL063\nL064\nL065\nL066\nL067\nL068\nL069\nL070\nL071\nL072\nL073\nL074\nL075\nL076\nL077\nL078\nL079\nL080\nL081\nL082\nL083\nL084\nL085\nL086\nL087\nL088\nL089\nL090\nL091\nL092\nL093\nL094\nL095\nL096\nL097\nL098\nL099\nL100\nL101\nL102\nL103\nL104\nL105\nL106\nL107\nL108\nL109\nL110\nL111\nL112\nL113\nL114\nL115\nL116\nL117\nL118\nL119\nL120\nL121\nL122\nL123\nL124\nL125\nL126\nL127\nL128\nL129\nL130\nMATCH\n"
 ## stderr-json: ""
 ## status: 0
+
+# --- grep quotes a bad OPTION byte the same way, and for the same reason: the
+# --- byte goes out as itself rather than UTF-8 encoded. Its usage line still
+# --- differs from GNU's in capital and content, which spec/README records.
+
+#### grep quotes a bad option byte raw too
+## argv: grep "-\x80" x
+## stdin-json: "a\n"
+## stdout-json: ""
+## stderr-json: "grep: invalid option -- '\x80'\nusage: grep [-aEFGHhicLlnoqRrsvwxyzZ] [-NUM] [-m NUM] [-A NUM] [-B NUM] [-C NUM] [-e PATTERN] [-f FILE] [PATTERN] [FILE]...\n"
+## status: 2
