@@ -6,15 +6,16 @@
 //! in this module — is ordinary safe Rust. This is the EIGHTH target-side unsafe
 //! exception UNSAFE.md records.
 //!
-//! The surface is THREE syscalls, reached from THREE modules and no others:
+//! The surface is FOUR syscalls, reached from THREE modules and no others:
 //! `builtin.rs`, for the `umask` and `trap` builtins; `process.rs`, for the
 //! guards that hand a subshell back the process state a real fork would have
-//! kept for it AND for the one that stops the shell listening to the terminal
-//! while a foreground child runs; and `term.rs`, for the terminal mode and
-//! width the line editor needs. None is reachable through safe `std`, which
-//! exposes no umask API, no signal-disposition API, and no terminal-mode API
-//! at all — `IsTerminal`
-//! answers whether a descriptor is a terminal, never how wide or in what mode.
+//! kept for it, for the one that stops the shell listening to the terminal
+//! while a foreground child runs, AND for the descriptor question `read -t`
+//! asks; and `term.rs`, for the terminal mode and width the line editor needs.
+//! None is reachable through safe `std`, which exposes no umask API, no
+//! signal-disposition API, no terminal-mode API and no readiness API at all —
+//! `IsTerminal` answers whether a descriptor is a terminal, never how wide, in
+//! what mode, or whether reading it would wait.
 //!
 //! `umask(2)` is unusual and the wrappers below turn both quirks into
 //! properties. It CANNOT FAIL — there is no error return — and it RETURNS THE
@@ -51,6 +52,13 @@
 //! `ioctl(2)` is the one with a REQUEST roster rather than a single meaning, so
 //! the three it may issue are pinned by value and `ioctl` refuses anything else
 //! before the syscall — the roster is code, not just a test.
+//!
+//! `poll(2)` is the narrowest of the four: it exists for ONE builtin, `read -t`,
+//! whose whole question is the one poll answers — would a read return without
+//! waiting. Nothing in `std` asks it. Its absence is the one the shell had to
+//! ANNOUNCE: readiness was answered from the descriptor table's own shape, which
+//! is right for a cursor over a here-document and a guess about a pipe, a FIFO,
+//! a socket or an idle terminal, so `-t` refused those rather than guess.
 
 use std::os::fd::RawFd;
 
@@ -59,6 +67,7 @@ compile_error!("td-sh's syscall layer is x86_64-linux only (raw syscall ABI)");
 
 use std::sync::Mutex;
 
+const SYS_POLL: usize = 7;
 const SYS_RT_SIGACTION: usize = 13;
 const SYS_IOCTL: usize = 16;
 const SYS_UMASK: usize = 95;
@@ -295,6 +304,113 @@ pub fn window_size(fd: RawFd, out: &mut [u8; WINSIZE_LEN]) -> Result<(), String>
     ioctl(fd, TIOCGWINSZ, out.as_mut_ptr() as usize)
 }
 
+/// `struct pollfd`: `int fd; short events; short revents;` — two words on
+/// x86-64, laid out as a plain `[u32; 2]` rather than a `#[repr(C)]` type so its
+/// field ORDER is a tested function, as td-compositor's winsize is. The two
+/// `short`s share the second word, little-endian: `events` low, `revents` high.
+/// A swapped pair is a well-formed request for a DIFFERENT event, which the
+/// kernel accepts and answers.
+const POLLFD_WORDS: usize = 2;
+
+/// Exactly ONE descriptor. Named rather than written as a bare `1` at the call
+/// site so the count the kernel is TOLD and the buffer it may write through are
+/// pinned together: `nfds = 2` over an eight-byte buffer is precisely the
+/// out-of-bounds kernel write `POLLFD_WORDS` exists to prevent, and a literal
+/// there is a number no test looks at.
+const POLLFD_COUNT: usize = 1;
+
+/// Pinned in the SHIPPED build, not only in a test, for the reason the termios
+/// and winsize lengths are: `poll(2)` reads `nfds * sizeof(struct pollfd)`
+/// through the pointer and writes `revents` back through it, with no length
+/// negotiation, so a short buffer is an out-of-bounds kernel write from code the
+/// compiler reads as `deny(unsafe_code)` clean.
+const _: () = assert!(
+    POLLFD_COUNT * POLLFD_WORDS * core::mem::size_of::<u32>() == 8
+);
+
+/// The event bits this shell asks about and the ones it accepts as an answer.
+///
+/// `POLLIN` is the only one REQUESTED. The other three are output-only — the
+/// kernel reports them whether or not they were asked for — and each means a
+/// `read` would return at once rather than block: end of file on a pipe whose
+/// writer is gone, an error condition, or a descriptor that is not open. That is
+/// the question `read -t` asks, so all four count as ready. It is also what
+/// `read -t 0 </dev/null` has always answered, and why ash answers 0 for a
+/// closed descriptor: not "there are bytes" but "a read would not wait".
+const POLLIN: u32 = 0x001;
+const POLLERR: u32 = 0x008;
+const POLLHUP: u32 = 0x010;
+const POLLNVAL: u32 = 0x020;
+const POLL_READY: u32 = POLLIN | POLLERR | POLLHUP | POLLNVAL;
+
+/// Whether a read on `fd` would return without waiting, blocking up to
+/// `timeout_ms` for that to become true (0 asks and returns at once; a negative
+/// value would wait forever and no caller passes one).
+///
+/// The ONE `poll` call site. Unlike `ioctl` there is no request roster to gate —
+/// `poll` has a single meaning — so what is pinned instead is the ARGUMENT: one
+/// descriptor, `POLLIN` and nothing else requested, and a buffer whose length
+/// the kernel is told matches what it may write.
+/// The request as the kernel reads it: `fd` in the first word, `events` in the
+/// LOW half of the second. Little-endian x86-64, and a function rather than an
+/// inline expression so the field order is something a test can state.
+fn pollfd(fd: u32, events: u32) -> [u32; POLLFD_WORDS] {
+    [fd, events]
+}
+
+/// `revents`, which the kernel writes into the HIGH half of that second word.
+///
+/// Reading the wrong half is not otherwise detectable: `events` is `POLLIN`,
+/// which is also a member of `POLL_READY`, so a wrapper that read the request
+/// back as though it were the answer would say "ready" whenever poll returned
+/// at all and agree with every other observation.
+fn revents(words: &[u32; POLLFD_WORDS]) -> u32 {
+    words.get(1).map_or(0, |w| w >> 16)
+}
+
+pub fn poll_readable(fd: RawFd, timeout_ms: i32) -> Result<bool, String> {
+    // Both guards refuse an ANSWER rather than a failure, which is why they are
+    // here and not left to the kernel. `poll` IGNORES a negative descriptor —
+    // revents 0, not counted — so `read -t 5` on one would wait the whole five
+    // seconds and report a timeout that never happened; and a negative timeout
+    // is poll's spelling of "wait forever", which is the one thing `read -t`
+    // exists to avoid. Neither is reachable from today's callers.
+    let Ok(fd_word) = u32::try_from(fd) else {
+        return Err(format!("poll: bad descriptor {fd}"));
+    };
+    if timeout_ms < 0 {
+        return Err(format!("poll: negative timeout {timeout_ms}"));
+    }
+    // `revents` is what the kernel writes back, so the second word starts as the
+    // request alone and is read for the answer afterwards.
+    let mut request = pollfd(fd_word, POLLIN);
+    let ret = syscall4(
+        SYS_POLL,
+        request.as_mut_ptr() as usize,
+        POLLFD_COUNT,
+        timeout_ms as usize,
+        0,
+    );
+    // EINTR is not retried because it cannot arrive: td-sh installs no signal
+    // handler, an IGNORED signal does not interrupt a syscall, and Linux
+    // restarts `poll` itself across a stop/continue. Serving `trap 'action'`
+    // for real would need a handler -- a separate amendment to UNSAFE.md --
+    // and this is one of the places that amendment has to revisit.
+    check("poll", ret)?;
+    // 0 means the timeout expired with nothing ready. Otherwise the answer is in
+    // the HIGH half of the second word, and a read is ready if any of the four
+    // bits above came back — an empty `revents` with a positive return would be
+    // the kernel contradicting itself, and is reported rather than guessed at.
+    if ret == 0 {
+        return Ok(false);
+    }
+    let answer = revents(&request);
+    if answer & POLL_READY == 0 {
+        return Err(format!("poll: returned {ret} with revents {answer:#x}"));
+    }
+    Ok(true)
+}
+
 /// The two dispositions td-sh installs, and a type that cannot spell a third.
 ///
 /// A HANDLER is deliberately not representable. Running one on x86-64 needs a
@@ -427,6 +543,86 @@ mod tests {
 
     fn serial() -> std::sync::MutexGuard<'static, ()> {
         SERIAL.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// `poll_readable` ISSUES the syscall and gets the kernel's answer.
+    ///
+    /// Every other assertion about this surface is over source TEXT, and a
+    /// wrapper that returned a plausible `bool` without issuing anything would
+    /// satisfy all of them. So: a pipe with nothing in it is NOT ready, the same
+    /// pipe is ready once a byte is in it, and it stays ready at EOF after the
+    /// writer is dropped — which is the distinction `read -t` turns on and the
+    /// one a "bytes remain" answer would get wrong.
+    #[test]
+    fn poll_answers_about_a_real_descriptor() {
+        use std::io::Write as _;
+        use std::os::fd::AsRawFd as _;
+
+        let (reader, mut writer) = std::io::pipe().unwrap();
+        let fd = reader.as_raw_fd();
+        // Nothing written yet: a read would wait. A zero timeout is the whole
+        // question, so this also pins that the wrapper does not block on it.
+        assert_eq!(poll_readable(fd, 0), Ok(false));
+        writer.write_all(b"x").unwrap();
+        assert_eq!(poll_readable(fd, 0), Ok(true));
+        // ... and with a NONZERO timeout on an already-ready descriptor, which
+        // no other assertion here reaches: a wrapper that answered `false` for
+        // every positive timeout would satisfy all of them, and that is the
+        // shape `read -t 5` spends its whole deadline in.
+        let start = std::time::Instant::now();
+        assert_eq!(poll_readable(fd, 5_000), Ok(true));
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(1),
+            "poll waited {:?} for a descriptor that was already ready",
+            start.elapsed()
+        );
+        // EOF is READY, not "no data": the writer is gone, so a read returns 0
+        // at once. This is the arm that makes `read -t` terminate at all.
+        drop(writer);
+        assert_eq!(poll_readable(fd, 0), Ok(true));
+
+        // A timeout is honoured rather than ignored: an empty pipe whose writer
+        // is still alive must take at least the time asked for.
+        let (empty, _keep) = std::io::pipe().unwrap();
+        let start = std::time::Instant::now();
+        assert_eq!(poll_readable(empty.as_raw_fd(), 60), Ok(false));
+        assert!(
+            start.elapsed() >= std::time::Duration::from_millis(50),
+            "poll returned early: {:?}",
+            start.elapsed()
+        );
+
+        // The two arguments the wrapper refuses rather than passes on. Both
+        // would be ANSWERED by poll — a negative descriptor is ignored and
+        // reported not-ready, a negative timeout waits forever — so neither
+        // failure would look like one at the call site.
+        assert!(poll_readable(-1, 0).is_err());
+        assert!(poll_readable(fd, -1).is_err());
+    }
+
+    /// `struct pollfd`'s field order, which no observation of the syscall can
+    /// check: `events` is `POLLIN`, itself a member of `POLL_READY`, so a
+    /// wrapper reading the request back as the answer says "ready" whenever
+    /// poll returns at all and agrees with every other test in this file.
+    #[test]
+    fn the_pollfd_words_put_each_field_where_the_kernel_reads_it() {
+        // fd in the first word; events in the LOW half of the second.
+        assert_eq!(pollfd(7, POLLIN), [7, 0x0001]);
+        assert_eq!(pollfd(0, 0), [0, 0]);
+        // revents comes out of the HIGH half, and nothing of `events` leaks in.
+        assert_eq!(revents(&[0, 0x0010_0001]), 0x0010);
+        assert_eq!(revents(&[0xffff_ffff, 0x0000_ffff]), 0);
+        // The four bits that count as ready, each restated by value here so a
+        // wrong one is caught independently of the declaration, and one that
+        // does not: 0x004 is POLLOUT, never requested and never an answer about
+        // reading.
+        assert_eq!((POLLIN, POLLERR, POLLHUP, POLLNVAL), (0x001, 0x008, 0x010, 0x020));
+        assert_eq!(POLL_READY, 0x001 | 0x008 | 0x010 | 0x020);
+        assert_eq!(POLL_READY & 0x004, 0);
+        // One descriptor, and the buffer the kernel is told about is the one it
+        // may write through.
+        assert_eq!(POLLFD_COUNT, 1);
+        assert_eq!(POLLFD_COUNT * POLLFD_WORDS * core::mem::size_of::<u32>(), 8);
     }
 
     /// Two threads setting a umask at once do not read back each other's.

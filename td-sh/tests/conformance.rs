@@ -429,6 +429,177 @@ fn an_ignore_trap_is_inherited_by_a_child() -> Result<(), Box<dyn std::error::Er
     Ok(())
 }
 
+/// Wait for `child`, killing it if it outlives `limit`. Returns whether it ended
+/// on its own.
+///
+/// A test about a TIMEOUT must not be able to hang the suite: a `read -t 1` that
+/// read its argument as seconds-times-a-thousand would otherwise sit for a
+/// quarter of an hour with nothing to say about why.
+fn wait_within(
+    child: &mut std::process::Child,
+    limit: std::time::Duration,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    let deadline = std::time::Instant::now() + limit;
+    loop {
+        if child.try_wait()?.is_some() {
+            return Ok(true);
+        }
+        if std::time::Instant::now() >= deadline {
+            // Ignored, not propagated: a child that exited between the
+            // `try_wait` above and here makes `kill` fail, and reporting THAT
+            // instead of the assertion below would hide the real result.
+            let _ = child.kill();
+            return Ok(false);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+/// `read -t` on a descriptor that can really block: it waits, and it stops.
+///
+/// Every in-crate test of this builtin reads something that cannot wait — a
+/// here-document cursor, `/dev/null`, a sibling pipeline stage that is about to
+/// finish — so all of them pass against a `read -t` that ignores its timeout
+/// entirely, which is what this shell did until poll(2) landed. The wait is only
+/// observable over a real pipe whose writer is a process that has not written,
+/// so the harness holds that writer itself and hands the child the read end as
+/// its stdin. That is the FIFO case without needing a FIFO: td-sh has no
+/// `mkfifo`, and `std` cannot make one without a dependency.
+///
+/// Timings are asserted as loose one-sided bounds. The point is not that the
+/// wait is accurate but that it happens at all and ends by itself; a 4-second
+/// ceiling on a 5-second timeout distinguishes "the write woke it" from "it sat
+/// out the timeout and reported one" without pinning the scheduler.
+#[test]
+fn read_dash_t_waits_on_a_pipe_that_can_block() -> Result<(), Box<dyn std::error::Error>> {
+    use std::io::Write as _;
+    let shell = PathBuf::from(env!("CARGO_BIN_EXE_td-sh"));
+
+    // Nothing is ever written and the write end stays open, so the timeout is
+    // the only thing that can end this read. Status 1 is ash's answer, which
+    // this shell's corpus already pins; bash reports 142.
+    let (reader, writer) = std::io::pipe()?;
+    let start = std::time::Instant::now();
+    let mut child = std::process::Command::new(&shell)
+        .arg("-c")
+        .arg("read -t 1 v; echo \"rc=$? [$v]\"")
+        .stdin(std::process::Stdio::from(reader))
+        .stdout(std::process::Stdio::piped())
+        .spawn()?;
+    let ended = wait_within(&mut child, std::time::Duration::from_secs(30))?;
+    let waited = start.elapsed();
+    let out = child.wait_with_output()?;
+    drop(writer);
+    assert!(ended, "read -t 1 never returned on a pipe with no writer activity");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "rc=1 []\n");
+    assert!(
+        waited >= std::time::Duration::from_millis(900),
+        "read -t 1 returned after {waited:?}, so it did not wait"
+    );
+
+    // ... and a write DURING the timeout is what ends it, well before the
+    // timeout would have.
+    let (reader, mut writer) = std::io::pipe()?;
+    let start = std::time::Instant::now();
+    let mut child = std::process::Command::new(&shell)
+        .arg("-c")
+        .arg("read -t 5 v; echo \"rc=$? [$v]\"")
+        .stdin(std::process::Stdio::from(reader))
+        .stdout(std::process::Stdio::piped())
+        .spawn()?;
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    writer.write_all(b"hi\n")?;
+    let ended = wait_within(&mut child, std::time::Duration::from_secs(30))?;
+    let waited = start.elapsed();
+    let out = child.wait_with_output()?;
+    assert!(ended, "read -t 5 never returned after its input arrived");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "rc=0 [hi]\n");
+    assert!(
+        waited < std::time::Duration::from_secs(4),
+        "read -t 5 took {waited:?}, so it sat out the timeout instead of waking"
+    );
+
+    // A PARTIAL line, which is what makes the deadline have to survive the
+    // first byte. The writer sends two bytes with no delimiter and keeps the
+    // pipe open, so poll reports ready, the read consumes both, and there is
+    // nothing more to come. A timeout checked once -- before the loop rather
+    // than before each byte -- blocks here forever.
+    let (reader, mut writer) = std::io::pipe()?;
+    let start = std::time::Instant::now();
+    let mut child = std::process::Command::new(&shell)
+        .arg("-c")
+        .arg("read -t 1 v; echo \"rc=$? [$v]\"")
+        .stdin(std::process::Stdio::from(reader))
+        .stdout(std::process::Stdio::piped())
+        .spawn()?;
+    writer.write_all(b"ab")?;
+    let ended = wait_within(&mut child, std::time::Duration::from_secs(30))?;
+    let waited = start.elapsed();
+    let out = child.wait_with_output()?;
+    drop(writer);
+    assert!(ended, "read -t 1 hung on a partial line");
+    // ash reports 1 and drops what followed the last field delimiter, where an
+    // EOF assigns it. bash differs on both halves (142, and `ab` assigned).
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "rc=1 []\n");
+    assert!(
+        waited >= std::time::Duration::from_millis(900),
+        "read -t 1 gave up after {waited:?} instead of waiting out its deadline"
+    );
+
+    // ... and with SEVERAL names, the fields the loop completed before the
+    // deadline stand, because `read` assigns each as it consumes the separator
+    // rather than at the end. Only the trailing partial is dropped. That makes
+    // "a timeout assigns nothing" wrong as a blanket statement, which is why it
+    // is pinned here rather than left to a comment.
+    let (reader, mut writer) = std::io::pipe()?;
+    let mut child = std::process::Command::new(&shell)
+        .arg("-c")
+        .arg("IFS=: read -t 1 a b; echo \"rc=$? a=[$a] b=[$b]\"")
+        .stdin(std::process::Stdio::from(reader))
+        .stdout(std::process::Stdio::piped())
+        .spawn()?;
+    writer.write_all(b"x:y")?;
+    let ended = wait_within(&mut child, std::time::Duration::from_secs(30))?;
+    let out = child.wait_with_output()?;
+    drop(writer);
+    assert!(ended, "read -t 1 hung with several names");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "rc=1 a=[x] b=[]\n");
+    Ok(())
+}
+
+/// The `read` builtin takes ONE BYTE off stdin, leaving the rest for the next
+/// reader — `sh -c 'read a; cat'` on a pipe.
+///
+/// It used to read through `std::io::Stdin`, a `BufReader`, so the first `read`
+/// took up to 8 KiB off a descriptor it shares and `cat` saw nothing. That was a
+/// divergence on its own, and `read -t` made it a wrong ANSWER too: bytes in the
+/// shell's buffer are invisible to `poll(2)`, which can only see what is still
+/// in the kernel, so a line already in hand read as a timeout.
+#[test]
+fn read_leaves_the_rest_of_stdin_for_the_next_reader()
+-> Result<(), Box<dyn std::error::Error>> {
+    use std::io::Write as _;
+    let shell = PathBuf::from(env!("CARGO_BIN_EXE_td-sh"));
+    // `cat` is an external command the harness cannot rely on, so the second
+    // reader is the shell's own `read` in a CHILD process: it shares the
+    // descriptor exactly as `cat` would, and it exists wherever the test does.
+    let body = "read a; echo \"a=$a\"; \"$TD_SH_BIN\" -c 'read b; echo \"b=$b\"'";
+    let mut child = std::process::Command::new(&shell)
+        .arg("-c")
+        .arg(body)
+        .env("TD_SH_BIN", &shell)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()?;
+    match child.stdin.take() {
+        Some(mut w) => w.write_all(b"one\ntwo\n")?,
+        None => return Err("no stdin pipe".into()),
+    }
+    let out = child.wait_with_output()?;
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "a=one\nb=two\n");
+    Ok(())
+}
+
 /// A bare `local x` clears the VALUE and keeps the entry, so the name is absent
 /// from a child's environment while localised but exports again the moment the
 /// function assigns it — the `local PATH; PATH=...; cmd` idiom. The `unset`

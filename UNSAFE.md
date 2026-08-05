@@ -33,9 +33,9 @@ one.
 | 3 | `td-init` | ten — see [§3](#3-td-init--the-boot-glue-multicall); `ioctl` has four pinned requests |
 | 4 | `td-login` | `setgroups(2)`, `setgid(2)`, `setuid(2)` |
 | 5 | `td-svc` | `kill(2)` |
-| 6 | `td-compositor` | `recvmsg(2)`, `close(2)`, `sendmsg(2)` |
+| 6 | `td-compositor` | `recvmsg(2)`, `close(2)`, `sendmsg(2)`, `ioctl(2)` |
 | 7 | `td-util` | `ioctl(2)`, three pinned requests |
-| 8 | `td-sh` | `umask(2)`, `rt_sigaction(2)` (disposition-only), `ioctl(2)` (three pinned requests) |
+| 8 | `td-sh` | `umask(2)`, `rt_sigaction(2)` (disposition-only), `ioctl(2)` (three pinned requests), `poll(2)` |
 
 The control-plane exception (`builder/src/sys.rs`) is described under The
 rule above and is not part of this numbering: it is host-side, and no
@@ -403,13 +403,14 @@ ordinary file, which is what keeps that surface at one syscall.
 ## 8. `td-sh` — the shell
 
 The `td-sh` shell, whose one `syscall4` body in `td-sh/src/sys.rs` carries
-EXACTLY THREE syscalls — `umask(2)`, a DISPOSITION-ONLY `rt_sigaction(2)`,
-and `ioctl(2)` with three value-pinned requests — reached from exactly
-three modules: `builtin.rs` for the `umask` and `trap` builtins,
+EXACTLY FOUR syscalls — `umask(2)`, a DISPOSITION-ONLY `rt_sigaction(2)`,
+`ioctl(2)` with three value-pinned requests, and `poll(2)` — reached from
+exactly three modules: `builtin.rs` for the `umask` and `trap` builtins,
 `process.rs` for the guards that hand a subshell back the process state a
-fork would have kept for it and for the one that stops the shell listening
-to the terminal while a foreground child runs, and `term.rs` for the
-terminal mode and width the line editor needs. `std` exposes an API for
+fork would have kept for it, for the one that stops the shell listening
+to the terminal while a foreground child runs, and for the one question
+`read -t` asks, and `term.rs` for the terminal mode and width the line
+editor needs. `std` exposes an API for
 none of them, and in the umask case that is not a gap that can be worked
 around: it is why the shipped `/init` spelled one line `busybox sh -c
 'umask 077; …'` until this surface existed, and why the shell that is
@@ -558,8 +559,8 @@ signals, blocks none, and runs on no alternate stack; a handler-bearing
 `rt_sigaction`, which is the `SA_RESTORER` question above and lands as its
 own amendment when `trap INT` is served for real.
 
-A FOURTH syscall, or a fourth `ioctl` request, is an amendment here;
-`td-sh/src/main.rs`'s confinement tests assert the roster and its three
+A FIFTH syscall, or a fourth `ioctl` request, is an amendment here;
+`td-sh/src/main.rs`'s confinement tests assert the roster and its four
 value-pinned numbers, that the three ioctl REQUESTS are value-pinned too
 and named three times each — the declaration, the roster the gate checks
 against, and the one wrapper that issues them — with the five refused
@@ -580,14 +581,17 @@ comment — which is what makes the line-based comment strip complete for
 the one file that may hold `unsafe`, since a `/* */` between two tokens
 changes nothing the compiler sees — and that the scan COVERS every
 module `main.rs` declares, whatever its visibility, since a module
-missing from that list is one no other assertion can see. `sys.rs`'s own
-tests then issue two of the three and check the answer against
-`/proc/self/status` — `Umask:` for one, the `SigIgn:` mask for the other
-— while `term.rs`'s issues the third against a descriptor that is not a
-terminal and requires `ENOTTY` back, since the gate has no terminal to
-ask. Every assertion above is about source TEXT, and a wrapper that
-returned a plausible value without issuing anything would satisfy all of
-them.
+missing from that list is one no other assertion can see, and that the
+pollfd length is pinned in the SHIPPED build for the reason the termios
+and winsize lengths are. `sys.rs`'s own tests then issue three of the
+four: two are checked against `/proc/self/status` — `Umask:` for one, the
+`SigIgn:` mask for the other — and `poll` is asked about a real pipe,
+whose readiness the test controls from both ends. `term.rs`'s test
+issues the fourth against a
+descriptor that is not a terminal and requires `ENOTTY` back, since the
+gate has no terminal to ask. Every assertion above is about source TEXT,
+and a wrapper that returned a plausible value without issuing anything
+would satisfy all of them.
 
 `ioctl(2)` is the third, and it is td-util's surface arriving in the shell:
 the same `TCGETS`/`TCSETS`/`TIOCGWINSZ` roster, taken for the same reason
@@ -706,6 +710,115 @@ that needs a terminal to type can be — the dispatch is driven headlessly
 over a generated keystroke stream, in `line.rs`'s
 `no_keystroke_sequence_panics_the_editor`.
 
+`poll(2)` is the fourth, and the narrowest: it exists for ONE builtin,
+`read -t`, whose whole question is the one poll answers — would a read
+return without waiting, and if not, does that become true within a
+deadline. `std` exposes no readiness primitive at all, and the two safe
+ways round it are each worse than a syscall. A blocking read is the thing
+the timeout exists to avoid. A read on a thread abandoned when the
+deadline passes has already CONSUMED what it read — for a shell that is a
+line of the script's input lost rather than returned late, on a
+descriptor a parent process usually shares.
+
+Before this, the table answered from its own SHAPE, and got it wrong in
+two different directions. An inherited descriptor or an internal pipe
+stage answered "cannot tell", and the builtin REFUSED — `cannot time this
+descriptor without poll(2)`, status 2. Everything else answered "ready",
+including the things that are a `File` to the table and not a regular
+file to the kernel: a FIFO, a socket, an opened terminal, where the read
+then BLOCKS with the deadline already spent. Measured on the parent
+commit, `exec 3<>fifo; read -t 1 x <&3` never returned. So the option
+served only the descriptors that never needed it, and on the rest it
+either refused or hung. A dead variant went with the refusal: `Fd::Pipe`
+existed to make the table say "cannot tell", and a pipe is a file in
+every other respect, so the question is answered by asking the kernel
+rather than by the shape of the table.
+
+`poll` has a single meaning, so unlike `ioctl` there is no request roster
+to gate; what is pinned instead is the ARGUMENT, and in three parts. The
+buffer LENGTH is asserted in the SHIPPED build rather than only in a
+test, for the reason the termios and winsize lengths are: `poll` reads
+`nfds * sizeof(struct pollfd)` through the pointer and writes `revents`
+back through it with no length negotiation, so a short buffer is an
+out-of-bounds kernel write from code the compiler reads as
+`deny(unsafe_code)` clean. `nfds` is pinned WITH it and by name, because
+a length alone is only half the bound — the kernel writes `nfds` structs
+whatever the buffer is, so a bare `2` at the call site reaches past an
+eight-byte one exactly as a short buffer would. And the EVENT is pinned:
+`POLLIN` by value and named three times and no more, the three
+output-only bits by value beside it, and `POLLOUT`/`POLLPRI` absent —
+each of those over the SHIPPED half of `sys.rs`, since the crate's own
+tests name what they assert about, as the `ioctl` roster's scan does.
+
+The struct is a plain `[u32; 2]` rather than a `#[repr(C)]` type so its
+field ORDER is a tested function, as td-compositor's winsize is: the two
+`short`s share the second word, and a swapped pair is a well-formed
+request for a DIFFERENT event, which the kernel accepts and answers.
+Composing and reading that word are two named functions for a reason no
+runtime observation covers — `events` is `POLLIN`, which is itself a
+member of the ready set, so a wrapper that read the REQUEST back as
+though it were the answer would report ready whenever poll returned at
+all and agree with every other test in the file.
+
+Two arguments are refused before the call rather than passed on, and both
+are about an ANSWER rather than a failure — `losetup`'s argument again.
+`poll` IGNORES a negative descriptor, reporting it neither ready nor in
+error, so `read -t 5` on one would wait the full five seconds and report
+a timeout that never happened; and a negative timeout is poll's spelling
+of "wait forever", which is the one thing this option exists to prevent.
+Neither is reachable from today's callers, which is why they are guards
+rather than error handling.
+
+Three output-only bits count as ready beside `POLLIN`: `POLLERR`,
+`POLLHUP` and `POLLNVAL`. The kernel reports them whether or not they
+were asked for, and each means a read returns AT ONCE rather than blocks
+— end of file on a pipe whose writer is gone, an error condition, or a
+descriptor that is not open. That is `read -t`'s question, and it is
+already what this shell answers for a here-document at EOF and for a
+closed descriptor, so the bits agree with the table rather than adding a
+rule to it.
+
+What poll can answer bounds how the shell may READ, which is the one way
+this syscall reaches past its own call site. `read -t` carries ONE
+ABSOLUTE DEADLINE and polls with what is left of it before EVERY byte, as
+ash does: a single poll before the loop bounds only the FIRST byte, so a
+writer that sends a partial line and keeps the pipe open would leave
+`read -t 1` blocked forever, past the deadline it was given. And the
+shell must not read AHEAD, because bytes in its own buffer are invisible
+to poll, which sees only what is still in the kernel — reading stdin
+through `std::io::Stdin`, a `BufReader`, took up to 8 KiB off a shared
+descriptor and then reported a timeout for a line already in hand. So the
+`read` BUILTIN takes stdin ONE BYTE at a time through an unbuffered
+handle, as this shell already did for every other descriptor and as its
+line editor already did in raw mode. The editor's COOKED fallback still
+reads through the buffered handle, which is the one remaining reader that
+runs ahead; it cannot overlap the builtin's deadline (a canonical
+terminal returns at most one line per read, so it leaves nothing behind)
+and the case where it does lose input — an interactive shell fed a script
+down a pipe — loses it identically without any of this.
+
+Nor may a descriptor be LOCKED across that read. The shell's table holds
+an open file behind a bare `Arc` rather than an `Arc<Mutex<…>>`, because
+a mutex held across a blocking one-byte read is a sibling stage's
+`read -t 5` waiting on a lock without ever reaching `poll` — the deadline
+missed by the very mechanism meant to keep it. `&File` is both `Read` and
+`Write`, so the kernel serialises two stages sharing a descriptor exactly
+as it does two processes. What remains is a RACE rather than a wait: a
+sibling can take the byte between the poll and the read, and that one is
+inherent to sharing a descriptor at all.
+
+Deliberately NOT in that surface: `select(2)`/`pselect6(2)`, `ppoll(2)`
+and the `epoll` family — the same question with a larger argument, a
+descriptor-indexed bitmask or a kernel object with a lifetime of its own,
+where poll's is eight bytes on the stack; `read(2)` itself, since every
+read this shell does goes through `std`; `fcntl(2)` with `O_NONBLOCK`,
+which would answer the same question by MUTATING a descriptor the shell
+usually does not own — an inherited stdin handed back to a parent
+nonblocking is a different failure for every program that shares it; and
+a deadline built from `alarm(2)` or `setitimer(2)`, which arrives as
+SIGALRM and so needs the handler this surface deliberately cannot
+install.
+
 Every other primitive td-sh needs — pipes, process spawn, `exec`, the
 virtual fd table that stands in for `dup2` — is reachable through safe
-`std`, which is what keeps that surface at three.
+`std`, which is what keeps that surface at four.

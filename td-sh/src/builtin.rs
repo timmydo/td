@@ -1952,35 +1952,31 @@ fn read(sh: &mut Shell, argv: &[String]) -> R<()> {
         None => 0,
     };
 
-    // `-t 0` asks whether a read would block and reads NOTHING, not even setting
-    // REPLY. A nonzero `-t` needs the same answer, just later: without it the read
-    // cannot be abandoned. So both are answered from the descriptor table, and
-    // where it cannot answer -- an inherited descriptor, which may be a pipe or an
-    // idle terminal -- both say so rather than guess. Guessing "ready" would pass
-    // the corpus case while misleading every caller, and for a nonzero timeout it
-    // would HANG where ash returns.
-    if let Some(ms) = timeout {
-        match process::read_ready(sh, fd) {
-            // A read that cannot block reaches the same answer with or without a
-            // deadline, so a nonzero timeout is simply never reached.
-            Some(true) if ms > 0 => {}
-            Some(true) => return ok(sh),
-            Some(false) => return status(sh, 1),
-            None => {
-                let what = if ms == 0 { "-t 0" } else { "-t" };
-                err_line(
-                    sh,
-                    &format!("read: {what}: cannot time this descriptor without poll(2)"),
-                );
-                return status(sh, 2);
-            }
-        }
+    // `-t 0` asks whether a read would block and reads NOTHING, so it answers
+    // FIRST and does nothing else on the way: no prompt for a line it will not
+    // read, and no refusal of `-s`/`-n`, which describe how a read behaves and
+    // so cannot be wrong about one that never happens. bash reports 1 for
+    // `read -t 0 -s v` on a terminal, and printing a prompt there would leave
+    // `P` on the screen with nothing reading after it. That case needs a
+    // terminal to see, which is why no test below reaches it -- the same gap
+    // the `-s`/`-n` refusal itself has.
+    if timeout == Some(0) {
+        return match read_ready_or_fail(sh, fd, 0) {
+            Err(code) => status(sh, code),
+            Ok(true) => ok(sh),
+            Ok(false) => status(sh, 1),
+        };
     }
 
     // The prompt goes to stderr, and ONLY when the source is a terminal. Noted
     // like every other fd-2 writer: `while :; do read -p 'P> ' v; done` with a
     // broken stderr is the same spin the rest of them had, and the terminal
     // gate is why no headless test can reach it.
+    //
+    // BEFORE the wait below, as ash orders it: a prompt printed after the poll
+    // is a `read -t 5 -p 'P> '` that shows nothing for five seconds and then
+    // either prompts for a line it has already read or -- on a timeout --
+    // never prompts at all.
     if let Some(p) = &opt_p {
         if sh.fds.is_terminal(fd) {
             let _ = exec::note_epipe(sh, write_fd(sh, 2, p.as_bytes()));
@@ -1992,11 +1988,41 @@ fn read(sh: &mut Shell, argv: &[String]) -> R<()> {
     // none and the byte semantics below are complete; ON one they cannot be
     // honoured, and failing loudly beats the two silent wrong answers -- echoing a
     // password, or waiting for the Enter the caller was told not to need.
+    // Refused before the wait for the same reason the prompt is printed before
+    // it: an option this shell will not honour should say so at once, not after
+    // the caller's timeout has run.
     if sh.fds.is_terminal(fd) && (silent || nchars > 0) {
         let what = if silent { "-s" } else { "-n" };
         err_line(sh, &format!("read: {what}: needs termios on a terminal"));
         return status(sh, 2);
     }
+
+    // A nonzero `-t` is `-t 0`'s question carried across the WHOLE read, and
+    // `poll(2)` answers both -- it is the reason that syscall is on this surface
+    // at all. Before it, neither could be served on the descriptors that can
+    // actually block and both were refused; a pipe, a FIFO, a socket and an idle
+    // terminal are exactly the cases `read -t` exists for.
+    //
+    // ONE ABSOLUTE DEADLINE, not one wait: ash computes `end_ms` once and polls
+    // with what is left of it before EVERY byte. A single poll before the loop
+    // would bound only the FIRST byte, so a writer that sends a partial line and
+    // stops -- `printf ab` down a pipe it keeps open -- would leave `read -t 1`
+    // blocked forever, having reported nothing and waited past the deadline it
+    // was given.
+    let deadline = match timeout {
+        // Answered above; the arm is here so the match stays exhaustive over
+        // what `timeout` can hold rather than resting on a `_`.
+        Some(0) => None,
+        // SATURATING, not a cast: `poll`'s timeout is an `int` and a NEGATIVE one
+        // means wait forever, so a `-t` big enough to wrap would turn the one
+        // thing this option exists to bound into an unbounded block. `i32::MAX`
+        // ms is about 24 days, which is past any real deadline.
+        Some(ms) => Some(
+            std::time::Instant::now()
+                + std::time::Duration::from_millis(ms.min(u64::from(i32::MAX.unsigned_abs()))),
+        ),
+        None => None,
+    };
     let ifs = sh.get_var("IFS").unwrap_or_else(|| " \t\n".to_string());
     let ifs_bytes: Vec<u8> = ifs.as_bytes().to_vec();
     let is_ifs = |c: u8| ifs_bytes.contains(&c);
@@ -2025,6 +2051,42 @@ fn read(sh: &mut Shell, argv: &[String]) -> R<()> {
         Stop,
     }
     loop {
+        // What is LEFT of the deadline, asked again for each byte. Zero means it
+        // has already passed, and the poll is SKIPPED rather than made with a
+        // zero timeout: poll spells that "ask and return at once", so a writer
+        // streaming faster than the reader would answer ready every time and the
+        // deadline would never bite -- `read -t 1` on an endless line with no
+        // delimiter never returns. The short-circuit is what makes the deadline
+        // a bound rather than a hint.
+        //
+        // ROUNDED UP, because the deadline is in nanoseconds and poll counts
+        // whole milliseconds: truncating turns the last fraction of a
+        // millisecond into "already passed", which made `read -t 0.001` report a
+        // timeout for a line that was already in the pipe.
+        if let Some(end) = deadline {
+            let left = end.saturating_duration_since(std::time::Instant::now());
+            let left_ms = i32::try_from(left.as_micros().div_ceil(1000)).unwrap_or(i32::MAX);
+            let ready = if left_ms == 0 {
+                Ok(false)
+            } else {
+                read_ready_or_fail(sh, fd, left_ms)
+            };
+            match ready {
+                // Named apart from the loop's own `code`, which is the status a
+                // completed read reports rather than a diagnostic's.
+                Err(usage) => return status(sh, usage),
+                // Timed out. ash reports 1 and returns from HERE, so whatever
+                // followed the last field delimiter is dropped -- unlike the EOF
+                // below, which assigns it. Fields the loop already completed
+                // were assigned as it went and stand: `IFS=: read -t 1 a b` on
+                // `x:y` leaves `a` set and `b` empty. bash differs on both
+                // halves, reporting 142 and assigning the whole partial line.
+                // The bytes taken off the descriptor are gone either way, which
+                // is inherent to reading one at a time.
+                Ok(false) => return status(sh, 1),
+                Ok(true) => {}
+            }
+        }
         let c = match process::read_byte(sh, fd) {
             Ok(Some(b)) => b,
             Ok(None) => {
@@ -2158,6 +2220,18 @@ fn bb_strtou(s: &str) -> Option<u32> {
 /// `-t`'s milliseconds keep the full unsigned range.
 fn bb_strtoi(s: &str) -> Option<i32> {
     bb_strtou(s).and_then(|v| i32::try_from(v).ok())
+}
+
+/// `read_ready` with the builtin's diagnostic attached: `Err(2)` is the usage
+/// status the caller returns after the message has been printed.
+fn read_ready_or_fail(sh: &mut Shell, fd: u32, timeout_ms: i32) -> Result<bool, i32> {
+    match process::read_ready(sh, fd, timeout_ms) {
+        Ok(ready) => Ok(ready),
+        Err(e) => {
+            err_line(sh, &format!("read: {e}"));
+            Err(2)
+        }
+    }
 }
 
 /// `-t`'s timeout in milliseconds. bash 4.3 takes `N.NNN`, and busybox reads at
@@ -5040,37 +5114,51 @@ mod tests {
         // for `/dev/zero`, for `/dev/null` and even for a closed descriptor.
         assert_eq!(run_capturing("read -t 0 </dev/null; echo $?").1, "0\n");
         assert_eq!(run_capturing("read -t 0.0 </dev/null; echo $?").1, "0\n");
-        // A PIPELINE stage is refused, which is the shell answering the same
-        // way about the same kind of descriptor: a pipe INTO the shell was
-        // always refused, since `Fd::Inherit` cannot be polled either. Only the
-        // internal one used to answer, and only because the producer had
-        // already run to completion into a buffer -- the same buffering that
-        // made `yes | head` hang. Its stdin is a real pipe now, whose writer is
-        // a sibling STAGE still running, so whether a read would block is a
-        // question about another thread's progress: poll's question exactly,
-        // and poll(2) is not on this shell's syscall surface.
+        // A PIPELINE stage is answered now rather than refused, which is the
+        // whole of this surface's point: its stdin is a real pipe whose writer
+        // is a sibling stage, so the question is about another thread's
+        // progress and only the kernel can settle it. Asserted on what the
+        // STAGE printed, since the program's status is the last stage's `echo`.
         //
-        // Asserted on what the STAGE printed rather than on the program's
-        // status, which is the last stage's `echo` either way.
-        for cmd in [
-            "echo foo | { read -t 0; echo $?; }",
-            ": | { read -t 0; echo $?; }",
-            "echo x | { read -t 5 v; echo \"[$v] $?\"; }",
+        // A NONZERO timeout, deliberately. `-t 0` on a live pipe is a race by
+        // definition -- it asks whether the sibling has written YET -- and bash
+        // loses it too, answering 1 about once in twelve runs of
+        // `echo foo | { read -t 0; echo $?; }`. Asserting it would be asserting
+        // the scheduler. With a timeout the answer is determinate: poll waits
+        // for the write or for the EOF that follows it.
+        for (cmd, want) in [
+            ("echo x | { read -t 5 v; echo \"[$v] $?\"; }", "[x] 0\n"),
+            // A producer that ends WITHOUT writing is ready too, because EOF is
+            // not "bytes remain": the read returns at once, empty, reporting 1.
+            (": | { read -t 5 v; echo \"[$v] $?\"; }", "[] 1\n"),
         ] {
             let (_, out, err) = run_capturing(cmd);
-            assert!(out.ends_with("2\n"), "{cmd} out: {out:?}");
-            assert!(err.contains("without poll(2)"), "{cmd} err: {err:?}");
-        }
-        // A nonzero timeout needs the same answer, only later, so it is refused
-        // on the same descriptors -- and refusing beats ash's behaviour going
-        // unmatched by HANGING, which is what ignoring the timeout would do.
-        for cmd in ["read -t 0 v", "read -t 1 v", "read -t 0.5 v"] {
-            let (status, _, err) = run_capturing(cmd);
-            assert_eq!(status, 2, "{cmd}");
-            assert!(err.contains("without poll(2)"), "{cmd} err: {err:?}");
+            assert_eq!(out, want, "{cmd} err: {err:?}");
         }
         // Where a read cannot block, a nonzero timeout is simply never reached.
         assert_eq!(run_capturing("read -t 5 x </dev/null; echo $?").1, "1\n");
+        // A SUB-MILLISECOND timeout still reads what is already there. poll
+        // counts whole milliseconds and the deadline is nanoseconds, so
+        // truncating the remainder rather than rounding it up made the FIRST
+        // poll of a 1ms deadline see zero and report a timeout at once.
+        //
+        // Read from a regular file, and exactly ONE byte of it. A file is
+        // always poll-ready, so nothing but the rounding decides the answer,
+        // and `-n 1` leaves the deadline to bound a single poll rather than a
+        // whole line. Asking a sibling pipeline STAGE for the byte instead
+        // would be asserting the scheduler -- the same objection the comment
+        // above makes about `-t 0`, and measured: that form failed 6 times in
+        // 20 with the machine loaded, where this one failed none.
+        assert_eq!(
+            run_capturing("read -t 0.001 -n 1 v < /proc/self/status; echo \"$?/$v\"").1,
+            "0/N\n"
+        );
+        // The shell's own in-memory entries are answered without a syscall: a
+        // here-document cursor cannot block whatever the kernel would say.
+        assert_eq!(
+            run_capturing("read -t 0 v <<EOF\nhi\nEOF\necho $?").1,
+            "0\n"
+        );
     }
 
     #[test]

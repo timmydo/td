@@ -3,8 +3,9 @@
 //!
 //! The shell keeps its OWN file-descriptor table (`Fds`) rather than dup2'ing
 //! real kernel descriptors, because `std` exposes no `dup2`/`fork` and the
-//! crate's one `unsafe` surface is `sys.rs`'s three syscalls -- `umask(2)`, a
-//! disposition-only `rt_sigaction(2)`, and `ioctl(2)` -- and nothing else.
+//! crate's one `unsafe` surface is `sys.rs`'s four syscalls -- `umask(2)`, a
+//! disposition-only `rt_sigaction(2)`, `ioctl(2)` and `poll(2)` -- and nothing
+//! else.
 //! Builtins and shell functions read and write through
 //! this table; only when an *external* program runs is the table translated into
 //! `std::process::Command` stdio. A pipeline's stages run CONCURRENTLY, on
@@ -23,7 +24,7 @@
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{Cursor, Read, Write};
-use std::os::fd::OwnedFd;
+use std::os::fd::{AsFd, OwnedFd};
 use std::os::unix::process::ExitStatusExt;
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
@@ -32,18 +33,21 @@ use crate::ast::{Cmd, List, Redir, RedirKind};
 use crate::exec::{self, Shell, Sig, R};
 
 /// One entry in the shell's descriptor table. Everything shareable is behind an
-/// `Arc<Mutex<…>>` so a subshell or pipeline stage inherits the same open file
-/// (and its offset), the way a real dup'd descriptor would.
+/// `Arc` so a subshell or pipeline stage inherits the same open file (and its
+/// offset), the way a real dup'd descriptor would.
+///
+/// An open FILE needs no `Mutex` with it: `&File` is both `Read` and `Write`,
+/// so the kernel serialises what two stages do to one descriptor, exactly as it
+/// does for two processes sharing one. A lock here would be held across a
+/// BLOCKING read, and a sibling's `read -t 5` would then wait on the mutex
+/// without ever reaching `poll(2)` -- missing the deadline that option exists
+/// to keep. The shell's own in-memory entries still take one, since nothing but
+/// this process can serialise a `Vec`.
 #[derive(Clone)]
 pub enum Fd {
     /// The process's real stdin/stdout/stderr (0/1/2).
     Inherit(u8),
-    File(Arc<Mutex<File>>),
-    /// A PIPE end, which is a `File` in every respect but one: a read on it can
-    /// BLOCK. That is the whole reason it is a variant of its own — `read_ready`
-    /// must answer "cannot tell" for it rather than "yes", or `read -t` reports
-    /// a timeout that has not happened and blocks past one that has.
-    Pipe(Arc<Mutex<File>>),
+    File(Arc<File>),
     ReadBuf(Arc<Mutex<Cursor<Vec<u8>>>>),
     WriteBuf(Arc<Mutex<Vec<u8>>>),
     Null,
@@ -78,7 +82,7 @@ impl Fds {
             Some(Fd::Inherit(1)) => std::io::stdout().is_terminal(),
             Some(Fd::Inherit(2)) => std::io::stderr().is_terminal(),
             // An opened `/dev/tty` is one too, which `read -p` turns on.
-            Some(Fd::File(f)) | Some(Fd::Pipe(f)) => f.lock().is_ok_and(|g| g.is_terminal()),
+            Some(Fd::File(f)) => f.is_terminal(),
             _ => false,
         }
     }
@@ -125,7 +129,7 @@ pub fn write_target(target: Option<&Fd>, bytes: &[u8]) -> std::io::Result<()> {
             lock.write_all(bytes)?;
             lock.flush()
         }
-        Some(Fd::File(f)) | Some(Fd::Pipe(f)) => lock_write(f, bytes),
+        Some(Fd::File(f)) => file_write(f, bytes),
         Some(Fd::WriteBuf(b)) => {
             if let Ok(mut v) = b.lock() {
                 v.extend_from_slice(bytes);
@@ -141,12 +145,47 @@ pub fn write_target(target: Option<&Fd>, bytes: &[u8]) -> std::io::Result<()> {
     }
 }
 
-fn lock_write(f: &Arc<Mutex<File>>, bytes: &[u8]) -> std::io::Result<()> {
-    let mut file = f
+/// `&File` is `Write`, so no lock is taken and none is HELD across the write.
+/// Two stages writing one entry interleave exactly as two processes sharing a
+/// descriptor do, which is what a forking shell gives them anyway.
+fn file_write(f: &File, bytes: &[u8]) -> std::io::Result<()> {
+    let mut sink: &File = f;
+    sink.write_all(bytes)?;
+    sink.flush()
+}
+
+/// ONE unbuffered handle on the real stdin, taken once and kept.
+///
+/// `std::io::Stdin` is a `BufReader`, so a builtin reading through it takes up
+/// to 8 KiB off a descriptor the shell usually SHARES -- `sh -c 'read a; cat'`
+/// on a pipe left `cat` with nothing -- and hides those bytes from `poll(2)`,
+/// which can only see what is still in the kernel. `read -t` turns on that
+/// answer, so a partial line read ahead into the shell's own buffer would time
+/// out with the bytes already in hand. One byte at a time is what this module
+/// already does for every OTHER descriptor and what `line.rs` already does in
+/// raw mode, for the same reason: it leaves the rest in the kernel where the
+/// next reader finds it.
+///
+/// Taken once rather than per byte because a dup is a syscall too. It stays
+/// valid for the shell's lifetime: `Fd::Inherit(0)` names the real descriptor 0,
+/// and a redirection replaces the shell's TABLE entry rather than that.
+static STDIN_RAW: Mutex<Option<Arc<File>>> = Mutex::new(None);
+
+/// The handle above, taken on first use. The lock is held only long enough to
+/// CLONE the `Arc` -- never across the read itself, which blocks: a sibling
+/// stage's `read -t 5` would otherwise wait on this mutex without ever reaching
+/// `poll(2)`, and miss the deadline it was given.
+fn stdin_raw() -> std::io::Result<Arc<File>> {
+    let mut slot = STDIN_RAW
         .lock()
-        .map_err(|_| std::io::Error::other("poisoned file"))?;
-    file.write_all(bytes)?;
-    file.flush()
+        .map_err(|_| std::io::Error::other("poisoned stdin"))?;
+    if let Some(f) = slot.as_ref() {
+        return Ok(Arc::clone(f));
+    }
+    let dup = std::io::stdin().as_fd().try_clone_to_owned()?;
+    let f = Arc::new(File::from(dup));
+    *slot = Some(Arc::clone(&f));
+    Ok(f)
 }
 
 /// Read the next byte from a shell descriptor, or `None` at end of input.
@@ -154,15 +193,13 @@ pub fn read_byte(sh: &Shell, fd: u32) -> std::io::Result<Option<u8>> {
     let mut one = [0u8; 1];
     let n = match sh.fds.get(fd) {
         Some(Fd::Inherit(0)) => {
-            let stdin = std::io::stdin();
-            let mut lock = stdin.lock();
-            lock.read(&mut one)?
+            let handle = stdin_raw()?;
+            let mut src: &File = &handle;
+            src.read(&mut one)?
         }
-        Some(Fd::File(f)) | Some(Fd::Pipe(f)) => {
-            let mut file = f
-                .lock()
-                .map_err(|_| std::io::Error::other("poisoned file"))?;
-            file.read(&mut one)?
+        Some(Fd::File(f)) => {
+            let mut src: &File = f;
+            src.read(&mut one)?
         }
         Some(Fd::ReadBuf(b)) => {
             let mut cur = b
@@ -180,33 +217,45 @@ pub fn read_byte(sh: &Shell, fd: u32) -> std::io::Result<Option<u8>> {
     Ok(if n == 0 { None } else { Some(one[0]) })
 }
 
-/// Whether a read on `fd` is READY -- meaning it would not block, which is what
-/// `poll(2)` answers and hence what `read -t 0` and `-t N` turn on. NOT "bytes
-/// remain": a file at EOF, an exhausted buffer and a closed descriptor are all
-/// ready, because a read on them returns (0, or an error) immediately. `None`
-/// means td-sh cannot tell, which is exactly the inherited descriptor -- it may
-/// be a pipe or a terminal with nothing in it, and only `poll(2)` distinguishes
-/// that from one holding data. `poll(2)` is not on td-sh's syscall surface and
-/// adding to it is an UNSAFE.md amendment, so the caller reports the limit
-/// rather than guessing.
-pub fn read_ready(sh: &Shell, fd: u32) -> Option<bool> {
-    match sh.fds.get(fd) {
-        // Everything td-sh's own table holds is ready; only what it inherited
-        // from the host can block. `Fd::File` overstates that for a file that is
-        // not a regular one -- a FIFO, a socket, an opened terminal -- where a
-        // read blocks exactly as a pipe's does and this still answers "ready":
-        // `exec 3<>fifo; read -t 1 x <&3` hangs where bash reports 142. Older
-        // than the streaming pipeline and not fixed by it, because the answer is
-        // the same `poll(2)` the variant below is waiting for.
-        Some(Fd::Null) | Some(Fd::File(_)) | Some(Fd::ReadBuf(_)) | Some(Fd::Closed)
-        | Some(Fd::WriteBuf(_)) | None => Some(true),
-        // A pipe is the inherited descriptor's case arriving inside the shell's
-        // own table: the writer is a SIBLING STAGE, so whether a read would block
-        // is a question about another thread's progress and only `poll(2)` — not
-        // on this surface — can answer it. Saying "ready" here made `read -t 0.1`
-        // wait two seconds for `{ sleep 2; echo x; } | …` and then report success.
-        Some(Fd::Inherit(_)) | Some(Fd::Pipe(_)) => None,
-    }
+/// Whether a read on `fd` would return without waiting, blocking up to
+/// `timeout_ms` for that to become true.
+///
+/// NOT "bytes remain": a file at EOF, an exhausted buffer and a closed
+/// descriptor are all ready, because a read on them returns (0, or an error)
+/// immediately. That is `poll(2)`'s question and hence exactly what `read -t`
+/// asks, which is why this is the one thing on td-sh's syscall surface that
+/// exists for a single builtin.
+///
+/// Only the entries backed by a REAL descriptor are asked. The rest are the
+/// shell's own memory -- a cursor over a here-document, a capture buffer, the
+/// two sinks -- where a read cannot block whatever the kernel would say about
+/// anything, so they answer at once and never spend a syscall.
+pub fn read_ready(sh: &Shell, fd: u32, timeout_ms: i32) -> Result<bool, String> {
+    // No lock is taken for any of this, which is what makes the deadline hold:
+    // the wait can be seconds long, and a stage blocked on a sibling's lock
+    // would never reach `poll` at all. What remains is a race rather than a
+    // wait -- a sibling can take the byte between the poll and the read, and
+    // then this read blocks past the deadline -- and that one is inherent to
+    // sharing a descriptor at all, since two PROCESSES race the same way.
+    let raw = match sh.fds.get(fd) {
+        // The real descriptor, not the dup `read_byte` reads through: a dup
+        // names the same open file description, so readiness is the same
+        // question asked of either.
+        Some(Fd::Inherit(0)) => 0,
+        // The shell can only READ the stdin it inherited; `read -u 1` fails at
+        // once whatever fd 1 holds. Answering "ready" is what makes that true
+        // rather than spending a deadline waiting for a descriptor this builtin
+        // would refuse anyway -- `read -u 1 -t 5` reports its error now instead
+        // of in five seconds.
+        Some(Fd::Inherit(_)) => return Ok(true),
+        Some(Fd::File(f)) => std::os::fd::AsRawFd::as_raw_fd(&**f),
+        // The shell's own memory, and the absent entry that reads as EOF: a
+        // read cannot block on any of them whatever the kernel would say.
+        Some(Fd::Null | Fd::ReadBuf(_) | Fd::WriteBuf(_) | Fd::Closed) | None => {
+            return Ok(true);
+        }
+    };
+    crate::sys::poll_readable(raw, timeout_ms)
 }
 
 /// A descriptor saved by `apply_redirs` so `restore_redirs` can put it back.
@@ -373,7 +422,7 @@ fn open_file(sh: &mut Shell, r: &Redir, opts: &OpenOptions) -> R<Result<Fd, ()>>
     }
     let path = sh.resolve(&name);
     match opts.open(&path) {
-        Ok(f) => Ok(Ok(Fd::File(Arc::new(Mutex::new(f))))),
+        Ok(f) => Ok(Ok(Fd::File(Arc::new(f)))),
         Err(e) => {
             let _ = exec::write_stderr(sh, &format!("{name}: {e}"));
             Ok(Err(()))
@@ -457,9 +506,9 @@ pub(crate) fn leave_clone(sh: &mut Shell, clone: Subshell, code: i32) -> R<()> {
 /// pipe directly with no copy through the shell at all. `PipeReader`/
 /// `PipeWriter` convert through `OwnedFd` with no `unsafe`, which is why the
 /// module header lists concurrent pipelines as a refinement rather than a
-/// syscall question. It is a VARIANT of its own (`Fd::Pipe`) for the single
-/// respect in which a pipe is not a file — a read on it can block — which is
-/// `read_ready`'s question and nothing else's.
+/// syscall question. It needs no variant of its own: the single respect in which
+/// a pipe is not a file — a read on it can block — is `read_ready`'s question,
+/// and that is answered by asking the kernel rather than by the table's shape.
 ///
 /// Threads rather than forks, since these stages are in-process clones: the
 /// scope is what lets a stage borrow the `Cmd` it runs, and the shell state is
@@ -498,10 +547,10 @@ pub fn run_pipeline(sh: &mut Shell, cmds: &[Cmd]) -> R<()> {
             Err(e) => return Err(sh.fatal(&format!("cannot create pipe: {e}"), 1)),
         };
         if let Some(stage) = stages.get_mut(i) {
-            stage.fds.set(1, Fd::Pipe(Arc::new(Mutex::new(File::from(OwnedFd::from(w))))));
+            stage.fds.set(1, Fd::File(Arc::new(File::from(OwnedFd::from(w)))));
         }
         if let Some(stage) = stages.get_mut(i + 1) {
-            stage.fds.set(0, Fd::Pipe(Arc::new(Mutex::new(File::from(OwnedFd::from(r))))));
+            stage.fds.set(0, Fd::File(Arc::new(File::from(OwnedFd::from(r)))));
         }
     }
 
@@ -1377,11 +1426,8 @@ fn stdio_for(sh: &Shell, fd: u32) -> R<Stdio> {
         Some(Fd::Inherit(n)) => Ok(inherit_stream(*n)),
         None => Ok(Stdio::inherit()),
         Some(Fd::Null) => Ok(Stdio::null()),
-        Some(Fd::File(f)) | Some(Fd::Pipe(f)) => match f.lock() {
-            Ok(file) => match file.try_clone() {
-                Ok(c) => Ok(Stdio::from(c)),
-                Err(_) => Ok(Stdio::inherit()),
-            },
+        Some(Fd::File(f)) => match f.try_clone() {
+            Ok(c) => Ok(Stdio::from(c)),
             Err(_) => Ok(Stdio::inherit()),
         },
         Some(Fd::Closed) => Ok(Stdio::null()),

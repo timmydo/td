@@ -9,15 +9,15 @@
 //! crate's `lib.rs` and is host-side test tooling — it is NOT part of this
 //! binary and runs the built shell as a subprocess.
 //!
-//! The interpreter is safe `std` but for THREE confined syscalls: a virtual
+//! The interpreter is safe `std` but for FOUR confined syscalls: a virtual
 //! file-descriptor table replaces `dup2`, `Stdio::piped`/`CommandExt::exec`
 //! cover the process primitives, and subshells clone shell state in-process. The
 //! crate `#![deny(unsafe_code)]`s and `sys.rs` carries the single scoped
-//! `#[allow]` — `umask(2)`, a DISPOSITION-ONLY `rt_sigaction(2)`, and an
-//! `ioctl(2)` restricted to three value-pinned requests, none of which `std`
-//! exposes an API for at all. That is the EIGHTH target-side unsafe exception
-//! UNSAFE.md records; the confinement tests below assert its roster against this
-//! crate's own source.
+//! `#[allow]` — `umask(2)`, a DISPOSITION-ONLY `rt_sigaction(2)`, an
+//! `ioctl(2)` restricted to three value-pinned requests, and `poll(2)` asking
+//! about ONE descriptor, none of which `std` exposes an API for at all. That
+//! is the EIGHTH target-side unsafe exception UNSAFE.md records; the
+//! confinement tests below assert its roster against this crate's own source.
 //!
 //! Still deferred, and each a further reviewed amendment: job control, and
 //! CATCHING a signal — `trap 'action' SIG` needs a handler, and a handler on
@@ -426,9 +426,10 @@ fn read_complete(
 }
 
 /// Assertions about this crate's own SOURCE, which the compiler cannot make:
-/// the unsafe surface is three syscalls, in one module, with one call site each,
+/// the unsafe surface is four syscalls, in one module, with one call site each,
 /// writing two handler words and no others, issuing three ioctl requests and no
-/// others, and named by three modules and no others.
+/// others, asking about one descriptor and one event, and named by three
+/// modules and no others.
 /// Every needle is built with `concat!` so this module's own text does not
 /// count itself.
 #[cfg(test)]
@@ -559,8 +560,9 @@ mod confinement {
         );
     }
 
-    /// The roster is THREE syscalls, pinned by VALUE — a name alone would let
-    /// the number change under it.
+    /// The `ioctl` roster is THREE REQUESTS — not syscalls, of which the crate
+    /// has four — pinned by VALUE, since a name alone would let the number
+    /// change under it.
     #[test]
     fn the_ioctl_requests_are_exactly_three_and_value_pinned() {
         // `ioctl(2)` is ONE syscall onto an unbounded space of operations, so
@@ -626,7 +628,7 @@ mod confinement {
     }
 
     #[test]
-    fn the_syscall_roster_is_exactly_three_and_value_pinned() {
+    fn the_syscall_roster_is_exactly_four_and_value_pinned() {
         let decl = concat!("const", "SYS", "_");
         let sys = squeeze(source("sys.rs"));
         let mut seen: Vec<String> = Vec::new();
@@ -643,11 +645,87 @@ mod confinement {
         assert_eq!(
             seen,
             vec![
+                concat!("SYS", "_POLL:usize=7").to_string(),
                 concat!("SYS", "_RT_SIGACTION:usize=13").to_string(),
                 concat!("SYS", "_IOCTL:usize=16").to_string(),
                 concat!("SYS", "_UMASK:usize=95").to_string(),
             ]
         );
+    }
+
+    /// `poll` has one meaning, so unlike `ioctl` there is no request roster to
+    /// gate — what has to be pinned is the ARGUMENT. The buffer LENGTH already
+    /// is, in the shipped build, but a length is only half of it: the kernel
+    /// writes `nfds * sizeof(struct pollfd)` through that pointer, so `nfds`
+    /// decides the same thing the length does. A bare `2` at the call site
+    /// would be an out-of-bounds kernel write past an eight-byte buffer, from
+    /// code the compiler reads as `deny(unsafe_code)` clean.
+    #[test]
+    fn the_poll_argument_is_one_descriptor_and_one_event() {
+        // The crate's own tests name all of these freely, so the scan stops
+        // where they begin -- and comments go too, as the ioctl scan does.
+        let shipped = source("sys.rs")
+            .split(concat!("#[cfg(", "test)]"))
+            .next()
+            .unwrap_or_default();
+        let sys = squeeze(&code_only(shipped));
+        for decl in [
+            concat!("constPOLL", "IN:u32=0x001;"),
+            concat!("constPOLL", "ERR:u32=0x008;"),
+            concat!("constPOLL", "HUP:u32=0x010;"),
+            concat!("constPOLL", "NVAL:u32=0x020;"),
+            concat!("constPOLL", "FD_COUNT:usize=1;"),
+            concat!("constPOLL", "FD_WORDS:usize=2;"),
+        ] {
+            assert_eq!(sys.matches(decl).count(), 1, "`{decl}` must be pinned by value");
+        }
+        // The length assertion is in the SHIPPED build, not a test, and it is
+        // the two constants MULTIPLIED -- a count and a width each right on
+        // their own still overrun if their product is not the buffer.
+        assert_eq!(
+            sys.matches(concat!(
+                "const_:()=assert!(POLL", "FD_COUNT*POLL", "FD_WORDS*core::mem::size_of::<u32>()==8);"
+            ))
+            .count(),
+            1,
+            "the pollfd length must stay asserted in the shipped build"
+        );
+        // `POLLIN` three times and no more: the declaration, the ready set it
+        // belongs to, and the ONE request that asks for it.
+        assert_eq!(sys.matches(concat!("POLL", "IN")).count(), 3);
+        // The count reaches the kernel as an ARGUMENT, so pinning the
+        // declaration is not enough on its own -- the call must pass the name.
+        assert_eq!(
+            sys.matches(&format!(
+                "{}{}",
+                concat!("syscall", "4(SYS", "_POLL,request.as_mut_ptr()asusize,"),
+                concat!("POLL", "FD_COUNT,")
+            ))
+            .count(),
+            1,
+            "the poll call must pass the named descriptor count"
+        );
+        // ... and exactly one request is ever built, asking for POLLIN alone.
+        assert_eq!(
+            sys.matches(concat!("poll", "fd(fd_word,POLL", "IN)")).count(),
+            1,
+            "one request, one event"
+        );
+        // Neighbours deliberately outside the surface: the other things poll
+        // can be asked about, and the two syscalls that ask the same question
+        // with a bigger argument.
+        for absent in [
+            concat!("POLL", "OUT"),
+            concat!("POLL", "PRI"),
+            concat!("pp", "oll"),
+            concat!("sel", "ect"),
+            concat!("epo", "ll"),
+        ] {
+            assert!(
+                !sys.contains(absent),
+                "{absent} must not appear in the SHIPPED half of sys.rs"
+            );
+        }
     }
 
     /// The `rt_sigaction` surface is DISPOSITION-ONLY, which is what makes it
@@ -721,9 +799,9 @@ mod confinement {
 
     /// THREE modules reach the wrappers and no others: `builtin.rs` for the
     /// `umask` and `trap` builtins, `process.rs` for the guards that give a
-    /// subshell back the process state a fork would have kept for it and for
-    /// the one that stops the shell listening to the terminal while a
-    /// foreground child runs, and
+    /// subshell back the process state a fork would have kept for it, for the
+    /// one that stops the shell listening to the terminal while a foreground
+    /// child runs, and for the readiness question `read -t` asks, and
     /// `term.rs` for the terminal mode and width the line editor needs — and
     /// `term.rs` is the ONLY module that knows what a `termios` byte means, so
     /// the layout lives beside the readback that checks it. Nothing renames the
@@ -792,8 +870,8 @@ mod confinement {
         let name = concat!("syscall", "4");
         assert_eq!(
             code.matches(name).count(),
-            4,
-            "`{name}` should appear four times in code: its definition and its three calls"
+            5,
+            "`{name}` should appear five times in code: its definition and its four calls"
         );
         assert_eq!(
             code.matches(concat!("fn ", "syscall", "4(")).count(),
@@ -808,6 +886,7 @@ mod confinement {
             concat!("SYS", "_UMASK,"),
             concat!("SYS", "_RT_SIGACTION,"),
             concat!("SYS", "_IOCTL,"),
+            concat!("SYS", "_POLL,"),
         ] {
             assert_eq!(
                 squeezed.matches(&format!("{}{number}", concat!("syscall", "4("))).count(),
