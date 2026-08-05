@@ -1027,6 +1027,208 @@ b
 ## END
 ## status: 0
 
+#### a leading carriage return is skipped where a command is expected
+# GNU skips its whole `ISSPACE' set where a COMMAND is expected (compile.c:997),
+# which in the C locale is six bytes, of which td-txt skipped three -- the
+# fourth byte it already crossed is `;', which GNU skips there too but which is
+# not in ISSPACE. Found one byte over
+# from the `#n' sweep above, and cased beside it for that reason. Scripts go
+# through `-f' because these bytes cannot live in a `## argv:' line, which moves
+# GNU's prefix to `file S line N:' and is why a refusal is asserted by substring.
+## argv: sed -n -f S A
+## file-json S: "\rp"
+## file-json A: "a1\na2\n"
+## stdin-json: ""
+## stdout-json: "a1\na2\n"
+## stderr-json: ""
+## status: 0
+
+#### and so is a vertical tab
+## argv: sed -n -f S A
+## file-json S: "\u000bp"
+## file-json A: "a1\na2\n"
+## stdin-json: ""
+## stdout-json: "a1\na2\n"
+## stderr-json: ""
+## status: 0
+
+#### and a form feed
+## argv: sed -n -f S A
+## file-json S: "\u000cp"
+## file-json A: "a1\na2\n"
+## stdin-json: ""
+## stdout-json: "a1\na2\n"
+## stderr-json: ""
+## status: 0
+
+#### a tab and a space were already skipped, and still are
+## argv: sed -n -f S A
+## file-json S: "\t p"
+## file-json A: "a1\na2\n"
+## stdin-json: ""
+## stdout-json: "a1\na2\n"
+## stderr-json: ""
+## status: 0
+
+#### they skip BETWEEN commands too, after the semicolon
+## argv: sed -n -f S A
+## file-json S: "p;\rp"
+## file-json A: "a1\na2\n"
+## stdin-json: ""
+## stdout-json: "a1\na1\na2\na2\n"
+## stderr-json: ""
+## status: 0
+
+#### and after a newline, which is a separator in its own right
+## argv: sed -n -f S A
+## file-json S: "p\n\u000bp"
+## file-json A: "a1\na2\n"
+## stdin-json: ""
+## stdout-json: "a1\na1\na2\na2\n"
+## stderr-json: ""
+## status: 0
+
+#### and they stack in any order
+## argv: sed -n -f S A
+## file-json S: "\r\u000b\u000c\t \r;\u000cp"
+## file-json A: "a1\na2\n"
+## stdin-json: ""
+## stdout-json: "a1\na2\n"
+## stderr-json: ""
+## status: 0
+
+#### a run of them alone is an empty script, not a refusal
+## argv: sed -n -f S A
+## file-json S: "\r\u000b\u000c\n"
+## file-json A: "a1\na2\n"
+## stdin-json: ""
+## stdout-json: ""
+## stderr-json: ""
+## status: 0
+
+#### but AFTER a command the same byte is junk, which is GNU's asymmetry
+## argv: sed -n -f S A
+## file-json S: "p\rp"
+## file-json A: "a1\na2\n"
+## stdin-json: ""
+## stdout-json: ""
+## stderr-contains: extra characters after command
+## status: 1
+
+#### a blank after a command does not separate one either, which is the control
+## argv: sed -n -f S A
+## file-json S: "p p"
+## file-json A: "a1\na2\n"
+## stdin-json: ""
+## stdout-json: ""
+## stderr-contains: extra characters after command
+## status: 1
+
+#### the asymmetry holds for the vertical tab as well
+## argv: sed -n -f S A
+## file-json S: "p\u000bp"
+## file-json A: "a1\na2\n"
+## stdin-json: ""
+## stdout-json: ""
+## stderr-contains: extra characters after command
+## status: 1
+
+#### and the form feed
+## argv: sed -n -f S A
+## file-json S: "p\u000cp"
+## file-json A: "a1\na2\n"
+## stdin-json: ""
+## stdout-json: ""
+## stderr-contains: extra characters after command
+## status: 1
+
+#### one before a closing brace is skipped like any other separator
+## argv: sed -n -f S A
+## file-json S: "1{p;\r}"
+## file-json A: "a1\na2\n"
+## stdin-json: ""
+## stdout-json: "a1\n"
+## stderr-json: ""
+## status: 0
+
+#### and before an opening one
+## argv: sed -n -f S A
+## file-json S: "\r1{p}"
+## file-json A: "a1\na2\n"
+## stdin-json: ""
+## stdout-json: "a1\n"
+## stderr-json: ""
+## status: 0
+
+#### a comment still runs to the end of its LINE, so \r stays inside it
+## argv: sed -n -f S A
+## file-json S: "#c\rp"
+## file-json A: "a1\na2\n"
+## stdin-json: ""
+## stdout-json: ""
+## stderr-json: ""
+## status: 0
+
+#### but a real newline ends it, so the next command runs
+## argv: sed -n -f S A
+## file-json S: "#c\np"
+## file-json A: "a1\na2\n"
+## stdin-json: ""
+## stdout-json: "a1\na2\n"
+## stderr-json: ""
+## status: 0
+
+# The first of these three closes a hole a reviewer found: every other case
+# here spells the byte BETWEEN two commands, where "crossed, so the second `p'
+# is junk" and "the byte itself is junk" give the same message for different
+# reasons. At the END of a script they finally differ -- crossing it would be
+# silent -- so a `skip_blank' widened to cross it survived the whole corpus
+# until this case.
+#### at the END of a script the byte is junk, where crossing it would be silent
+## argv: sed -n -f S A
+## file-json S: "p\r"
+## file-json A: "a1\na2\n"
+## stdin-json: ""
+## stdout-json: ""
+## stderr-contains: extra characters after command
+## status: 1
+
+#### a leading one disarms #n, as a leading blank does
+## argv: sed -f S A
+## file-json S: "\r#np"
+## file-json A: "a1\na2\n"
+## stdin-json: ""
+## stdout-json: "a1\na2\n"
+## stderr-json: ""
+## status: 0
+
+#### and none of this is posix-gated: GNU's loop is not, so neither is this
+## argv: sed --posix -n -f S A
+## file-json S: "\rp"
+## file-json A: "a1\na2\n"
+## stdin-json: ""
+## stdout-json: "a1\na2\n"
+## stderr-json: ""
+## status: 0
+
+#### a NUL is NOT whitespace, which is the other edge of that set
+## argv: sed -n -f S A
+## file-json S: "\u0000p"
+## file-json A: "a1\na2\n"
+## stdin-json: ""
+## stdout-json: ""
+## stderr-contains: unknown command: `
+## status: 1
+
+#### nor is a backspace, the byte below the tab
+## argv: sed -n -f S A
+## file-json S: "\u0008p"
+## file-json A: "a1\na2\n"
+## stdin-json: ""
+## stdout-json: ""
+## stderr-contains: unknown command: `
+## status: 1
+
 #### while a SEEKABLE `-f' script does carry it -- the control
 ## argv: sed -f s.sed data
 ## file-json data: "a\nb\n"

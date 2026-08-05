@@ -237,8 +237,16 @@ impl ScriptParser<'_> {
         }
     }
 
+    /// What GNU skips where a COMMAND is expected: `;` plus its whole `ISSPACE`
+    /// set, which is six bytes -- four more than the blanks `skip_blank`
+    /// crosses. The asymmetry with `end_of_cmd` is GNU's own: `read_end_of_cmd`
+    /// reads through `in_nonblank`, so a `\r` AFTER a command is `extra
+    /// characters after command` while one BEFORE it is nothing at all.
     fn skip_separators(&mut self) {
-        while matches!(self.peek(), Some(b' ' | b'\t' | b'\n' | b';')) {
+        while matches!(
+            self.peek(),
+            Some(b' ' | b'\t' | b'\n' | b'\x0b' | b'\x0c' | b'\r' | b';')
+        ) {
             self.pos += 1;
         }
     }

@@ -1176,14 +1176,30 @@ td-txt-authored case files
     `read error on stdin` where td-txt names the file it really opened,
     `/dev/stdin`. Both exit 4. An OPERAND spelled `-` does say `stdin` now.
 
-  - A leading `\r`, `\v` or `\f` in a script: GNU skips all three, td-txt
-    refuses with `unknown command:`. `printf '\rp' > s; sed -f s F` doubles every
-    line in GNU at exit 0 and errors here, in both modes and through `-e` as much
-    as `-f`. Fail-CLOSED, predates the branch. Found by a reviewer as a byproduct
-    of sweeping script HEADS for the `#n` rule -- the same sweep axis, one byte
-    over -- and it is a family of THREE rather than the one first recorded,
-    because GNU skips its whole `ISSPACE` set there and a later reviewer swept
-    all 256 bytes rather than the one that had been reported.
+  - Blanks before an address regex's `I`/`M` modifier: GNU reads it through
+    `in_nonblank` inside a loop (compile.c:909-912), so blanks are crossed
+    before AND between the modifiers, and `sed -n '/a/ Ip'` matches
+    case-insensitively there. td-txt peeks directly with no skip, so the same
+    script is `unknown command: `I''. Fail-CLOSED, both modes, identical on the
+    parent, so it predates the branch. It is the ONE site where the
+    whitespace-class audit behind the ISSPACE landing came back NO: every other
+    place GNU crosses ISBLANK -- labels, filenames, `a`/`i`/`c` text, `s`/`y`
+    flags, the numeric arguments, addresses, the step, the `,` and the `!` --
+    td-txt already crosses. Recorded rather than fixed there because it is a
+    different site and a different whitespace class from the one that landing
+    changed.
+
+  - A diagnostic that QUOTES A BYTE differs for 129 of the 256: GNU emits the
+    raw byte, td-txt renders it through `char::from`, so every byte from 0x80 up
+    is UTF-8 encoded and arrives as two -- `sed $'\200p'` is `unknown command:
+    `\200'` there and `` `\302\200' `` here. NUL is the 129th and goes the other
+    way: GNU builds the message as a C string, so it stops at the NUL and loses
+    even the closing quote, where td-txt prints the byte. Both modes, exit 1
+    either way, predates the branch. Recorded because a sweep of all 256 leading
+    bytes has to account for its residue: once the `ISSPACE` family is closed
+    these are 129 of the 134 bytes still disagreeing, and the other five are
+    `sed L`, the three label commands' wording, and `e` -- each recorded or cased
+    elsewhere.
 
   - A NUL inside an `r`/`R`/`w`/`W` filename, which only a `-f` script can carry:
     GNU builds a C string from it, so `printf '1r\0F\n' > s; sed -f s A` truncates
