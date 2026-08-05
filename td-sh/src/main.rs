@@ -443,7 +443,19 @@ fn read_complete(
     sh: &mut Shell,
     buffer: &mut String,
 ) -> ReadResult {
-    let mut prompt = sh.get_var("PS1").unwrap_or_else(|| "$ ".to_string());
+    // Expanded per call rather than once, because `\w` is a fact about where
+    // the shell is NOW and the command just run may have been a `cd`. The cwd
+    // is the shell's LOGICAL one -- what `$PWD` and `pwd` report, and what
+    // bash's `\w` follows -- and not the process's, which `cd` never moves.
+    let home = sh.get_var("HOME");
+    let user = sh.get_var("USER").or_else(|| sh.get_var("LOGNAME"));
+    let env = line::PromptEnv {
+        home: home.as_deref(),
+        user: user.as_deref(),
+        cwd: &sh.logical_cwd.clone(),
+    };
+    let mut prompt =
+        line::expand_prompt(&sh.get_var("PS1").unwrap_or_else(|| r"\$ ".to_string()), &env);
     loop {
         // `trap '' INT` makes SIGINT do nothing, and the Ctrl-C keystroke only
         // stands in for SIGINT while the editor has signal generation off — so
@@ -477,7 +489,8 @@ fn read_complete(
         match parser::parse_aliased(buffer, &sh.aliases) {
             Ok(_) => return ReadResult::Ready,
             Err(e) if e.starts_with(ast::INCOMPLETE) => {
-                prompt = sh.get_var("PS2").unwrap_or_else(|| "> ".to_string());
+                prompt =
+                    line::expand_prompt(&sh.get_var("PS2").unwrap_or_else(|| "> ".to_string()), &env);
             }
             // A real syntax error: hand the buffer back so the caller reports it.
             Err(_) => return ReadResult::Ready,

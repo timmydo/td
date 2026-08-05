@@ -637,6 +637,283 @@ fn columns(c: char) -> usize {
     }
 }
 
+/// What a prompt escape can ask about.
+///
+/// Separated from the expansion so the escape rules are a pure function of
+/// strings: `render` can then be tested exhaustively without a filesystem, a
+/// home directory or a uid, none of which a unit test can arrange.
+struct PromptFacts {
+    user: Option<String>,
+    host: Option<String>,
+    cwd: Option<String>,
+    home: Option<String>,
+    root: bool,
+}
+
+/// The effective uid, out of `/proc/self/status` rather than `getuid(2)`.
+///
+/// `\$` is the only escape that needs it, and reading it is what keeps this
+/// off td-sh's syscall surface — the roster in UNSAFE.md §8 stays at four.
+/// The EFFECTIVE uid is the second field, which is the one that decides
+/// whether the shell can write where root can.
+fn effective_uid() -> Option<u32> {
+    effective_uid_in(&std::fs::read_to_string("/proc/self/status").ok()?)
+}
+
+/// The parse, separated so it can be tested with the four ids DIFFERING.
+/// They are equal in every process the gate can run as, so a test against the
+/// real `/proc/self/status` would pass whichever of them this picked.
+fn effective_uid_in(status: &str) -> Option<u32> {
+    for line in status.lines() {
+        if let Some(ids) = line.strip_prefix("Uid:") {
+            // `real effective saved fs` — the second is the one that decides
+            // what the shell may write, so it is the one `\$` reports.
+            return ids.split_whitespace().nth(1)?.parse().ok();
+        }
+    }
+    None
+}
+
+/// The login name for `uid`, out of `/etc/passwd`.
+///
+/// By uid rather than by `$USER`, because `$USER` is inherited and survives an
+/// `su`: a prompt that still said the old name after switching user would be
+/// the one thing this escape exists to prevent. `$USER` is the fallback for an
+/// image with no passwd file, not the first answer.
+fn passwd_name(uid: u32) -> Option<String> {
+    let passwd = std::fs::read_to_string("/etc/passwd").ok()?;
+    for line in passwd.lines() {
+        let mut fields = line.split(':');
+        // `continue`, not `?`: a malformed line skips itself rather than
+        // abandoning the rest of the file.
+        let Some(name) = fields.next() else { continue };
+        let _password = fields.next();
+        if fields.next().and_then(|u| u.parse::<u32>().ok()) == Some(uid) {
+            return Some(name.to_string());
+        }
+    }
+    None
+}
+
+/// What the SHELL knows that a prompt escape may ask about.
+///
+/// Passed in rather than read here, because the two that matter are not facts
+/// about the process. `cd` moves the shell's own `logical_cwd` and never
+/// chdirs the process, so `std::env::current_dir()` answers where the shell
+/// STARTED for the rest of its life; and `$USER` may have been assigned in the
+/// shell without reaching the environment.
+pub struct PromptEnv<'a> {
+    pub home: Option<&'a str>,
+    pub user: Option<&'a str>,
+    pub cwd: &'a std::path::Path,
+}
+
+impl PromptFacts {
+    /// Gather only what `raw` actually asks about: a prompt is rendered once
+    /// per line, and the common `\w \$` has no business scanning `/etc/passwd`.
+    fn gather(raw: &str, env: &PromptEnv<'_>) -> PromptFacts {
+        let (mut user, mut host, mut cwd, mut root) = (false, false, false, false);
+        let mut chars = raw.chars();
+        while let Some(c) = chars.next() {
+            if c != '\\' {
+                continue;
+            }
+            match chars.next() {
+                Some('u') => user = true,
+                Some('h' | 'H') => host = true,
+                Some('w' | 'W') => cwd = true,
+                Some('$') => root = true,
+                _ => {}
+            }
+        }
+        let uid = if user || root { effective_uid() } else { None };
+        PromptFacts {
+            user: if user {
+                uid.and_then(passwd_name)
+                    .or_else(|| env.user.map(str::to_string))
+            } else {
+                None
+            },
+            // The kernel's own answer, so it follows `hostname` being set
+            // during boot rather than whatever `/etc/hostname` was written
+            // with. Reading it is why `gethostname(2)` is not needed.
+            host: if host {
+                std::fs::read_to_string("/proc/sys/kernel/hostname")
+                    .ok()
+                    .map(|h| h.trim_end().to_string())
+                    .filter(|h| !h.is_empty())
+                    .or_else(|| {
+                        std::fs::read_to_string("/etc/hostname")
+                            .ok()
+                            .map(|h| h.trim_end().to_string())
+                            .filter(|h| !h.is_empty())
+                    })
+            } else {
+                None
+            },
+            cwd: if cwd {
+                Some(env.cwd.display().to_string())
+            } else {
+                None
+            },
+            home: env.home.map(str::to_string),
+            // Only `\$` asks, and an unreadable uid is not root: the prompt
+            // that understates privilege is the safe way to be wrong.
+            root: root && uid == Some(0),
+        }
+    }
+
+    /// `\w`: the working directory with `$HOME` written `~`, as bash does.
+    ///
+    /// A `HOME` with a trailing slash abbreviates NOTHING, which is bash's
+    /// behaviour too rather than an oversight: the prefix it compares is the
+    /// variable as written.
+    fn tilde_cwd(&self) -> String {
+        let Some(cwd) = self.cwd.as_deref() else {
+            return "?".to_string();
+        };
+        // `HOME=/` abbreviates NOTHING, which is bash's rule (its
+        // `polite_directory_format` wants `strlen(HOME) > 1`) and not an
+        // accident: under it every path begins with `$HOME`, so `~` would
+        // swallow the leading slash of all of them. A root shell with `HOME=/`
+        // is an ordinary td configuration, so this is reachable.
+        let Some(home) = self.home.as_deref().filter(|h| h.len() > 1) else {
+            return cwd.to_string();
+        };
+        if cwd == home {
+            return "~".to_string();
+        }
+        match cwd.strip_prefix(home) {
+            Some(rest) if rest.starts_with('/') => format!("~{rest}"),
+            _ => cwd.to_string(),
+        }
+    }
+}
+
+/// Expand the backslash escapes in a `PS1`/`PS2` value.
+///
+/// Without this the shipped prompt prints as the literal `\u@\h:\w\$`, which is
+/// what it did: td-sh set a bash-shaped default (`\w \$ `) and the image's
+/// profile exports another, and NOTHING expanded either. Both are written the
+/// way bash and busybox ash write them, so bash's meanings are the ones
+/// implemented here.
+///
+/// Deliberately NOT implemented, and so left standing as the literal text they
+/// are: the time and date escapes (`\d`, `\t`, `\T`, `\@`, `\A`). Rendering one
+/// means turning a `SystemTime` into a civil date, which is a calendar — leap
+/// years, the local zone, a month table — and none of td's prompts asks for it.
+/// Leaving them alone is also the safer error: `\t` is bash's TIME, not a tab,
+/// so a guess would silently produce whitespace where the operator asked for a
+/// clock. `\!`, `\#`, `\j`, `\l`, `\s`, `\v` and `\V` are left for the same
+/// reason — nothing shipped uses them, and a wrong answer looks like a right
+/// one.
+///
+/// Two limits worth writing down rather than leaving to be discovered. `\u` is
+/// answered out of `/etc/passwd`, so a user that exists only in a network
+/// directory (LDAP, NIS) falls back to `$USER`; td ships no name service to
+/// ask. And `\n` reaches the terminal, but the editor keeps the line being
+/// edited inside ONE row and draws only the prompt's LAST row (see `visible`),
+/// so a two-line `PS1` shows its second line while editing.
+pub fn expand_prompt(raw: &str, env: &PromptEnv<'_>) -> String {
+    render_prompt(raw, &PromptFacts::gather(raw, env))
+}
+
+/// The escape rules themselves, over facts already gathered.
+fn render_prompt(raw: &str, facts: &PromptFacts) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut chars = raw.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        let Some(esc) = chars.next() else {
+            // A trailing backslash is itself, as it is in bash.
+            out.push('\\');
+            break;
+        };
+        match esc {
+            'u' => out.push_str(facts.user.as_deref().unwrap_or("?")),
+            // `\h` stops at the first dot, `\H` does not.
+            'h' => {
+                let host = facts.host.as_deref().unwrap_or("?");
+                out.push_str(host.split('.').next().unwrap_or(host));
+            }
+            'H' => out.push_str(facts.host.as_deref().unwrap_or("?")),
+            'w' => out.push_str(&facts.tilde_cwd()),
+            // Over the TILDE form, not the raw path: bash's `\W` in the home
+            // directory itself is `~`, not the basename of `$HOME`.
+            'W' => {
+                let cwd = facts.tilde_cwd();
+                // The root directory is its own basename; anything else is the
+                // text after the last separator.
+                let base = match cwd.rsplit_once('/') {
+                    Some((_, tail)) if !tail.is_empty() => tail,
+                    _ => cwd.as_str(),
+                };
+                out.push_str(if base.is_empty() { "/" } else { base });
+            }
+            '$' => out.push(if facts.root { '#' } else { '$' }),
+            'n' => out.push('\n'),
+            'r' => out.push('\r'),
+            'a' => out.push('\x07'),
+            'e' => out.push('\x1b'),
+            '\\' => out.push('\\'),
+            // bash's non-printing markers. They are DROPPED rather than
+            // honoured, because `display_cols` already skips the escape
+            // sequences they usually wrap; what matters is that they do not
+            // print as `\[`.
+            '[' | ']' => {}
+            // `\nnn`, up to three octal digits, read as bash's `read_octal`
+            // reads them -- which is neither "one to three" nor "exactly
+            // three". bash scans a THREE-BYTE window, so a short run counts
+            // only when nothing follows it: `\7` alone is a bell, `\7|` is the
+            // text `\7|`. The value is then a BYTE, so it WRAPS: `\555` is
+            // `m`, which the corpus names in a case of its own.
+            '0'..='7' => {
+                let mut digits = String::from(esc);
+                while digits.len() < 3 {
+                    match chars.peek().copied().filter(|c| c.is_digit(8)) {
+                        Some(d) => {
+                            digits.push(d);
+                            chars.next();
+                        }
+                        None => break,
+                    }
+                }
+                let short_run = digits.len() < 3 && chars.peek().is_some();
+                let byte = digits
+                    .chars()
+                    .fold(0u32, |acc, c| acc * 8 + c.to_digit(8).unwrap_or(0))
+                    % 0x100;
+                if short_run {
+                    out.push('\\');
+                    out.push_str(&digits);
+                } else if byte == 0 {
+                    // bash emits nothing for a NUL, and a NUL in a prompt is
+                    // a byte the terminal would count and not draw.
+                } else if byte < 0x80 {
+                    out.extend(char::from_u32(byte));
+                } else {
+                    // Above ASCII bash emits a RAW byte, which this `String`
+                    // cannot carry: `\377` is 0xff there and would become two
+                    // UTF-8 bytes here. Left as the text it was, rather than
+                    // silently drawn as a different character.
+                    out.push('\\');
+                    out.push_str(&digits);
+                }
+            }
+            // Anything else keeps its backslash, which is what bash does with
+            // an escape it does not know.
+            other => {
+                out.push('\\');
+                out.push(other);
+            }
+        }
+    }
+    out
+}
+
 /// How many columns `text` occupies, skipping escape sequences.
 ///
 /// A coloured `PS1` is ordinary here — `PS1='\033[32m$ \033[0m'` is a common
@@ -650,18 +927,40 @@ fn display_cols(text: &str) -> usize {
     let mut chars = text.chars();
     while let Some(c) = chars.next() {
         if c != '\x1b' {
-            cols += columns(c);
+            // A carriage return puts the cursor back at the left margin, so
+            // what precedes it occupies nothing: `PS1='xxx\ry'` is one column
+            // wide, not four. Every other control byte draws nothing and so
+            // counts nothing -- BEL above all, which `\a` now puts in reach.
+            match c {
+                '\r' => cols = 0,
+                c if (c as u32) < 0x20 || c == '\u{7f}' => {}
+                c => cols += columns(c),
+            }
             continue;
         }
         // CSI (`ESC [`) and SS3 (`ESC O`) run to a final byte in 0x40..=0x7e;
-        // anything else after ESC is a single character sequence already
-        // consumed by `chars.next()` above.
-        if matches!(chars.next(), Some('[') | Some('O')) {
-            for f in chars.by_ref() {
-                if ('\u{40}'..='\u{7e}').contains(&f) {
-                    break;
+        // OSC (`ESC ]`) is the one a prompt uses to set a window title, and
+        // runs to BEL or to ST (`ESC \`). Anything else after ESC is a single
+        // character sequence already consumed by `chars.next()` above.
+        match chars.next() {
+            Some('[' | 'O') => {
+                for f in chars.by_ref() {
+                    if ('\u{40}'..='\u{7e}').contains(&f) {
+                        break;
+                    }
                 }
             }
+            Some(']') => {
+                while let Some(f) = chars.next() {
+                    if f == '\x07' {
+                        break;
+                    }
+                    if f == '\x1b' && chars.next() == Some('\\') {
+                        break;
+                    }
+                }
+            }
+            _ => {}
         }
     }
     cols
@@ -892,6 +1191,151 @@ mod tests {
 
     fn hist(lines: &[&str]) -> Editor {
         Editor { history: lines.iter().map(|s| (*s).to_string()).collect() }
+    }
+
+    fn facts(cwd: &str, home: &str, root: bool) -> PromptFacts {
+        PromptFacts {
+            user: Some("ada".to_string()),
+            host: Some("box.example.com".to_string()),
+            cwd: Some(cwd.to_string()),
+            home: Some(home.to_string()),
+            root,
+        }
+    }
+
+    /// The prompt the image actually ships, and the default td-sh sets when
+    /// none is exported. Both were printed VERBATIM before this existed, which
+    /// is the bug: the shell wrote a prompt in a notation it could not render.
+    #[test]
+    fn the_shipped_prompts_expand() {
+        let f = facts("/home/ada/src", "/home/ada", false);
+        assert_eq!(render_prompt(r"\u@\h:\w\$ ", &f), "ada@box:~/src$ ");
+        assert_eq!(render_prompt(r"\w \$ ", &f), "~/src $ ");
+    }
+
+    /// `\$` is the privilege indicator, so it has to follow the uid rather than
+    /// the name -- and `\h` stops at the first dot where `\H` does not.
+    #[test]
+    fn prompt_root_and_host_forms() {
+        let user = facts("/", "/home/ada", false);
+        let root = facts("/", "/home/ada", true);
+        assert_eq!(render_prompt(r"\$", &user), "$");
+        assert_eq!(render_prompt(r"\$", &root), "#");
+        assert_eq!(render_prompt(r"\h", &user), "box");
+        assert_eq!(render_prompt(r"\H", &user), "box.example.com");
+    }
+
+    /// `\w` abbreviates `$HOME` and nothing else: a directory that merely
+    /// starts with the same TEXT is a different directory, and shortening it
+    /// would name a path that does not exist.
+    #[test]
+    fn prompt_tilde_is_a_path_prefix_not_a_string_prefix() {
+        let home = "/home/ada";
+        assert_eq!(render_prompt(r"\w", &facts(home, home, false)), "~");
+        assert_eq!(render_prompt(r"\w", &facts("/home/ada/x", home, false)), "~/x");
+        assert_eq!(
+            render_prompt(r"\w", &facts("/home/adamant", home, false)),
+            "/home/adamant"
+        );
+        assert_eq!(render_prompt(r"\W", &facts("/home/ada/x", home, false)), "x");
+        assert_eq!(render_prompt(r"\W", &facts("/", home, false)), "/");
+        // `\W` is the basename of the TILDE form, so the home directory itself
+        // is `~` and not the last component of `$HOME`.
+        assert_eq!(render_prompt(r"\W", &facts(home, home, false)), "~");
+    }
+
+    /// The character escapes, the dropped non-printing markers, and octal.
+    #[test]
+    fn prompt_character_escapes() {
+        let f = facts("/", "/home/ada", false);
+        assert_eq!(render_prompt(r"a\nb\rc\ad\ee\\f", &f), "a\nb\rc\x07d\x1be\\f");
+        assert_eq!(render_prompt(r"\[\e[32m\]x\[\e[0m\]", &f), "\x1b[32mx\x1b[0m");
+    }
+
+    /// `\nnn` is read the way bash's `read_octal` reads it, which is neither
+    /// "one to three digits" nor "exactly three". Every line here was measured
+    /// against bash rather than reasoned about: two plausible readings each
+    /// get some of them wrong.
+    #[test]
+    fn octal_prompt_escapes_follow_bashs_three_byte_window() {
+        let f = facts("/", "/home/ada", false);
+        // A short run counts only when nothing follows it.
+        assert_eq!(render_prompt(r"\7", &f), "\x07");
+        assert_eq!(render_prompt(r"\7|", &f), r"\7|");
+        assert_eq!(render_prompt(r"\101\10\7|", &f), r"A\10\7|");
+        // A fourth digit is ordinary text after a complete escape.
+        assert_eq!(render_prompt(r"\1234", &f), "S4");
+        // The value is a BYTE and wraps -- the corpus names this one.
+        assert_eq!(render_prompt(r"\555", &f), "m");
+        // A NUL emits nothing at all.
+        assert_eq!(render_prompt(r"\0", &f), "");
+        assert_eq!(render_prompt(r"\0x", &f), r"\0x");
+        // `8` and `9` are not octal, so the escape never starts.
+        assert_eq!(render_prompt(r"\8\9", &f), r"\8\9");
+        // Above ASCII bash emits a raw byte, which a `String` cannot carry;
+        // the escape is left as text rather than drawn as another character.
+        assert_eq!(render_prompt(r"\377\200", &f), r"\377\200");
+        assert_eq!(render_prompt(r"\177", &f), "\x7f");
+    }
+
+    /// `\$` reports the EFFECTIVE uid, which is the second of the four
+    /// `/proc/self/status` reports. Every process the gate can run as has all
+    /// four equal, so this is asserted against a sample where they differ --
+    /// against the real file, any of the four would pass.
+    #[test]
+    fn the_effective_uid_is_the_second_of_the_four() {
+        let status = "Name:\tsh\nUid:\t1000\t0\t1000\t1000\nGid:\t1000\t1000\t1000\t1000\n";
+        assert_eq!(effective_uid_in(status), Some(0));
+        // A real one, where they agree.
+        assert_eq!(effective_uid_in("Uid:\t1001\t1001\t1001\t1001\n"), Some(1001));
+        // No `Uid:` line at all, and a malformed one.
+        assert_eq!(effective_uid_in("Name:\tsh\n"), None);
+        assert_eq!(effective_uid_in("Uid:\t1000\n"), None);
+    }
+
+    /// `HOME=/` abbreviates nothing, as bash's `polite_directory_format` does
+    /// not: under it every path starts with `$HOME`, so `~` would eat the
+    /// leading slash of all of them. A root shell with `HOME=/` is ordinary.
+    #[test]
+    fn a_root_home_abbreviates_nothing() {
+        assert_eq!(render_prompt(r"\w", &facts("/", "/", false)), "/");
+        assert_eq!(render_prompt(r"\w", &facts("/etc", "/", false)), "/etc");
+        assert_eq!(render_prompt(r"\W", &facts("/etc", "/", false)), "etc");
+    }
+
+    /// An escape this shell does not implement keeps its backslash rather than
+    /// vanishing or guessing. `\t` is the one that matters: it is bash's TIME,
+    /// so emitting a tab would put whitespace where a clock was asked for.
+    #[test]
+    fn unimplemented_prompt_escapes_stay_literal() {
+        let f = facts("/", "/home/ada", false);
+        for esc in [r"\t", r"\d", r"\T", r"\@", r"\A", r"\!", r"\#", r"\j"] {
+            assert_eq!(render_prompt(esc, &f), esc, "{esc} should stay literal");
+        }
+        // A trailing backslash is itself.
+        assert_eq!(render_prompt(r"x\", &f), r"x\");
+    }
+
+    /// Whatever the escapes render to, the editor must not count colour bytes
+    /// as columns -- the prompt is measured after expansion, so this is where
+    /// the two meet.
+    ///
+    /// Expansion is what puts these in reach: before it, a `PS1` could not
+    /// contain a BEL or a bare ESC without the operator typing one. The
+    /// window-title form is the case that matters, since `\[\e]0;t\a\]` is a
+    /// commonplace prompt and OSC ends at BEL rather than at a CSI final byte.
+    #[test]
+    fn an_expanded_colour_prompt_measures_its_visible_width() {
+        let f = facts("/home/ada", "/home/ada", false);
+        let drawn = render_prompt(r"\[\e[32m\]\w\[\e[0m\]\$ ", &f);
+        assert_eq!(display_cols(&drawn), "~$ ".len());
+        // An OSC window title occupies no columns, however long it is.
+        assert_eq!(display_cols(&render_prompt(r"\[\e]0;a title\a\]\$ ", &f)), 2);
+        // ...and the ST-terminated spelling of the same thing.
+        assert_eq!(display_cols(&render_prompt("\\[\\e]0;a title\\e\\\\\\]\\$ ", &f)), 2);
+        // A carriage return returns to the margin, so what preceded it is not
+        // width; a bell draws nothing.
+        assert_eq!(display_cols(&render_prompt(r"xxx\ry\a", &f)), 1);
     }
 
     /// Cursor motion lands on CHARACTER boundaries, never inside a UTF-8
