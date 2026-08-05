@@ -1063,20 +1063,6 @@ td-txt-authored case files
     neighbouring shapes are NOT gaps: a text ending in an unpaired backslash is
     emitted raw, and a continuation collapses only across an `-e` boundary.
 
-  - A SECOND backslash after an `a\`/`i\`/`c\` is a one-character TEXT in GNU,
-    not a continuation. GNU's `read_text` takes it as the lead-in character and
-    adds it literally, so the newline after it ends the text there: `sed 'a\\'`
-    followed by a line `X` appends a single backslash and then meets `X` as a
-    COMMAND (`unknown command: `X''). td-txt reads the pair as an escaped
-    newline, swallows `X` into the text and exits 0 having appended it -- a
-    wrong ANSWER rather than a diagnostic, and the only one of these entries
-    that is. It crosses an `-e` boundary the same way (`sed -e 'a\\' -e X` is
-    GNU's `expression #2` refusal and td-txt's silent append). `sed 'a\\'` with
-    nothing after it agrees, both appending one empty line, which is why the
-    shape hides. Found while sweeping for the `char N` landing and out of its
-    scope; the entry above describes the SINGLE-backslash continuation, which
-    is a different rule and correct.
-
   - An `a` with NO TEXT AT ALL still pays a record's missing separator in GNU.
     A last record that arrived without one is written back without one, by both
     programs -- unless an append is queued behind it, and GNU terminates it

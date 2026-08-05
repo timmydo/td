@@ -11411,3 +11411,146 @@ xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx$
 ## stdout-json: "A1\na2\nA4\n"
 ## stderr-json: ""
 ## status: 0
+
+
+# --- GNU's `read_text' LEAD-IN: the byte after the command's own backslash is
+# --- added to the buffer literally, before any escape processing, and only the
+# --- bytes after it go through the decoder loop. A second backslash is
+# --- therefore a one-character text that the next newline ends -- not a
+# --- continuation, which is what one loop over the whole thing makes it.
+
+#### a SECOND backslash is a one-character text, so the newline after it ENDS the text
+## argv: sed "a\\\\\nX" A
+## file-json A: "a1\na2\n"
+## stdin-json: ""
+## stdout-json: ""
+## stderr-json: "sed: -e expression #1, char 5: unknown command: `X'\n"
+## status: 1
+
+#### ... which is why the line after is met as a COMMAND
+## argv: sed -e 'a\\' -e X A
+## file-json A: "a1\na2\n"
+## stdin-json: ""
+## stdout-json: ""
+## stderr-json: "sed: -e expression #2, char 1: unknown command: `X'\n"
+## status: 1
+
+#### `i' takes the lead-in the same way
+## argv: sed "i\\\\\nX" A
+## file-json A: "a1\na2\n"
+## stdin-json: ""
+## stdout-json: ""
+## stderr-json: "sed: -e expression #1, char 5: unknown command: `X'\n"
+## status: 1
+
+#### ... `c' too, whose text replaces rather than follows
+## argv: sed "c\\\\\nX" A
+## file-json A: "a1\na2\n"
+## stdin-json: ""
+## stdout-json: ""
+## stderr-json: "sed: -e expression #1, char 5: unknown command: `X'\n"
+## status: 1
+
+#### and an address does not change it
+## argv: sed "1a\\\\\nX" A
+## file-json A: "a1\na2\n"
+## stdin-json: ""
+## stdout-json: ""
+## stderr-json: "sed: -e expression #1, char 6: unknown command: `X'\n"
+## status: 1
+
+#### the text it leaves is EMPTY, the lone backslash decoding to nothing
+## argv: sed -n -e 'a\\' -e p A
+## file-json A: "a1\na2\n"
+## stdin-json: ""
+## stdout-json: "a1\n\na2\n\n"
+## stderr-json: ""
+## status: 0
+
+#### a lead-in that is an ordinary byte is kept literally
+## argv: sed 'a\X' A
+## file-json A: "a1\na2\n"
+## stdin-json: ""
+## stdout-json: "a1\nX\na2\nX\n"
+## stderr-json: ""
+## status: 0
+
+#### ... and decodes with the rest of the buffer, not before it
+## argv: sed 'a\\X' A
+## file-json A: "a1\na2\n"
+## stdin-json: ""
+## stdout-json: "a1\nX\na2\nX\n"
+## stderr-json: ""
+## status: 0
+
+#### two backslashes of TEXT are still one backslash out
+## argv: sed 'a\\\\' A
+## file-json A: "a1\na2\n"
+## stdin-json: ""
+## stdout-json: "a1\n\\\na2\n\\\n"
+## stderr-json: ""
+## status: 0
+
+#### the ordinary continuation is unchanged: a newline lead-in opens the text
+## argv: sed "a\\\nX" A
+## file-json A: "a1\na2\n"
+## stdin-json: ""
+## stdout-json: "a1\nX\na2\nX\n"
+## stderr-json: ""
+## status: 0
+
+#### ... and a trailing backslash still carries it to the next line
+## argv: sed "a\\\nX\\\nY" A
+## file-json A: "a1\na2\n"
+## stdin-json: ""
+## stdout-json: "a1\nX\nY\na2\nX\nY\n"
+## stderr-json: ""
+## status: 0
+
+#### ... and across an `-e' part, which is the one crossing GNU allows
+## argv: sed -e 'a\' -e text A
+## file-json A: "a1\na2\n"
+## stdin-json: ""
+## stdout-json: "a1\ntext\na2\ntext\n"
+## stderr-json: ""
+## status: 0
+
+#### the one-line form is untouched
+## argv: sed 'a text' A
+## file-json A: "a1\na2\n"
+## stdin-json: ""
+## stdout-json: "a1\ntext\na2\ntext\n"
+## stderr-json: ""
+## status: 0
+
+#### the ordinary continuation under `--posix' (a NEWLINE lead-in, not this rule)
+## argv: sed --posix "a\\\nX" A
+## file-json A: "a1\na2\n"
+## stdin-json: ""
+## stdout-json: "a1\nX\na2\nX\n"
+## stderr-json: ""
+## status: 0
+
+#### `--posix' takes the lead-in too, GNU's read_text never asking about it
+## argv: sed --posix 'a\X' A
+## file-json A: "a1\na2\n"
+## stdin-json: ""
+## stdout-json: "a1\nX\na2\nX\n"
+## stderr-json: ""
+## status: 0
+
+#### ... so a second backslash is that one-character text under the flag as well
+## argv: sed --posix 'a\\' A
+## file-json A: "a1\na2\n"
+## stdin-json: ""
+## stdout-json: "a1\n\na2\n\n"
+## stderr-json: ""
+## status: 0
+
+#### ... and the line after it is script, which `--posix' used to refuse outright
+## argv: sed --posix "a\\\\\nX" A
+## file-json A: "a1\na2\n"
+## stdin-json: ""
+## stdout-json: ""
+## stderr-json: "sed: -e expression #1, char 5: unknown command: `X'\n"
+## status: 1

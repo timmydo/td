@@ -691,8 +691,17 @@ impl ScriptParser<'_> {
             if self.posix && (self.at_part_end() || self.peek().is_none()) {
                 return Err("incomplete command".to_string());
             }
-            if !self.eat(b'\n') && self.peek().is_none() {
-                return Ok(None);
+            if !self.eat(b'\n') {
+                // GNU's `read_text` adds whatever follows the command's own
+                // backslash to the buffer as a LEAD-IN, before escape
+                // processing starts, and never asks about `--posix` first. A
+                // SECOND backslash is therefore a one-character text the next
+                // newline ENDS, where the loop below would read the pair as a
+                // continuation and swallow the line after it.
+                let Some(lead) = self.bump() else {
+                    return Ok(None);
+                };
+                out.push(lead);
             }
         } else if self.posix || self.peek().is_none() || self.at_part_end() {
             // The one-line `a text` form is GNU's; `--posix` leaves only `a\`.
@@ -744,9 +753,11 @@ impl ScriptParser<'_> {
         if undecoded {
             return Ok(Some(out));
         }
-        // No terminator here: the writer appends the RECORD separator, which
-        // under -z is NUL. Parsing cannot know it — the option is read first,
-        // but the text belongs to the script.
+        // No terminator here: the writer supplies one, and WHICH one is not the
+        // same for all three. `i`/`c` end their text with the record separator,
+        // so under -z it is a NUL; `a` ends its with a literal newline whatever
+        // the separator is. GNU's asymmetry, recorded in spec/README, and the
+        // reason parsing does not append either.
         Ok(Some(normalize_buffer(&out)?))
     }
 
