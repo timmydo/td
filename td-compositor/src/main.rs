@@ -50,7 +50,9 @@ fn client_usage() -> String {
 }
 
 fn term_usage() -> String {
-    "usage: td-term probe READY_SOCKET | td-term selftest".into()
+    "usage: td-term run --socket PATH --ready-socket PATH \
+| td-term probe READY_SOCKET | td-term selftest"
+        .into()
 }
 
 /// Which program this binary was invoked as. Three names, one artifact: the
@@ -92,12 +94,20 @@ fn term_selftest(out: &mut impl std::io::Write) -> Result<(), String> {
     writeln!(out, "TD-TERM-SELFTEST-OK").map_err(|e| format!("write selftest marker: {e}"))
 }
 
-/// The terminal's own entry point. `run` lands with the frame that earns
-/// readiness; until then this serves the two commands that need no surface —
-/// the readiness probe td-svc calls, and the packaged binary's self-check.
+/// The terminal's own entry point. `run` is the Wayland client; the other two
+/// need no surface — the readiness probe td-svc calls, and the packaged
+/// binary's self-check.
 fn run_term(args: &[String]) -> Result<(), String> {
     let command = args.first().ok_or_else(term_usage)?;
     match command.as_str() {
+        "run" => {
+            let args = args.get(1..).ok_or_else(term_usage)?;
+            let (socket, ready_socket) = parse_run_flags(args)?;
+            term_client::run(&term_client::Options {
+                socket,
+                ready_socket,
+            })
+        }
         "probe" => {
             let socket = args.get(1).ok_or_else(term_usage)?;
             if args.get(2).is_some() {
@@ -261,14 +271,17 @@ fn run(args: &[String]) -> Result<(), String> {
     }
 }
 
-fn parse_client_run(args: &[String]) -> Result<client::Options, String> {
+/// The two run flags both clients take. They are spelled the same way because
+/// the terminal is meant to replace the demo service, not to be started
+/// differently from it; what differs is only what each builds from them.
+fn parse_run_flags(args: &[String]) -> Result<(PathBuf, PathBuf), String> {
     let mut socket = None;
     let mut ready_socket = None;
     let mut index = 0;
     while index < args.len() {
         let flag = args
             .get(index)
-            .ok_or_else(|| "missing UI client flag".to_string())?;
+            .ok_or_else(|| "missing run flag".to_string())?;
         let value = args
             .get(index + 1)
             .ok_or_else(|| format!("{flag} requires a value"))?;
@@ -280,9 +293,17 @@ fn parse_client_run(args: &[String]) -> Result<client::Options, String> {
         }
         index += 2;
     }
+    Ok((
+        socket.ok_or_else(|| "--socket is required".to_string())?,
+        ready_socket.ok_or_else(|| "--ready-socket is required".to_string())?,
+    ))
+}
+
+fn parse_client_run(args: &[String]) -> Result<client::Options, String> {
+    let (socket, ready_socket) = parse_run_flags(args)?;
     Ok(client::Options {
-        socket: socket.ok_or_else(|| "--socket is required".to_string())?,
-        ready_socket: ready_socket.ok_or_else(|| "--ready-socket is required".to_string())?,
+        socket,
+        ready_socket,
     })
 }
 

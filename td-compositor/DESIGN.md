@@ -1329,7 +1329,17 @@ deadline bounds failure detection rather than ordering state transitions.
 
 td-term exposes a mode-0600 readiness socket and prints `TD-TERM-READY` with
 its rows and columns only after the exact tile-sized buffer receives both
-`wl_buffer.release` and its frame callback. One encoder produces both the
+`wl_buffer.release` and its frame callback. Reaching that buffer takes TWO
+frames, and that is the protocol rather than a retry: the compositor cannot
+tile a surface it has not mapped, so its first configure is zero in both axes,
+presenting at the client's own fallback is what maps the surface, and the tile
+arrives in the configure that follows. Readiness is therefore a frame drawn at
+a size the compositor CHOSE, and choosing is per axis — zero is a declined
+axis, and a configure choosing one axis has chosen. An `ack_configure` takes
+effect on the surface commit that follows it, so a configure needing no new
+frame is applied with a bare `wl_surface.commit` rather than left
+acknowledged and unapplied; a chosen tile equal to the client's fallback is
+exactly that case. One encoder produces both the
 diagnostic and the socket's answer, since the integration test compares them
 and two spellings could drift while each stayed plausible. A readiness line is
 parsed fail-closed and order-pinned, and its grid is held to the same

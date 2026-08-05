@@ -6,13 +6,10 @@
 //! That comparison is only meaningful if the two cannot drift, so there is one
 //! encoder: [`marker`] produces both.
 //!
-//! `publish` still has no production caller. The Wayland client exists now,
-//! but §12 has readiness follow the first frame's `wl_buffer.release` and
-//! frame callback, and an unmapped surface never gets past the compositor's
-//! initial zero configure — so the client's handshake half cannot honestly
-//! publish a grid. The frame landing is the caller. Each such item carries its
-//! own `dead_code` allow rather than the module carrying one, so anything left
-//! over once that lands is still visible.
+//! `publish`'s caller is `term_client::run`, which reaches it only once its
+//! first frame has come back with both `wl_buffer.release` and its frame
+//! callback — the point §12 defines readiness at, and the point at which the
+//! grid it announces is the one the compositor actually gave it.
 
 use crate::pty;
 use crate::socket;
@@ -90,7 +87,6 @@ fn field(value: Option<&str>, name: &str) -> Result<u16, String> {
 }
 
 /// Bind the readiness socket and answer every caller with this grid.
-#[allow(dead_code)]
 pub fn publish(path: &Path, rows: u16, columns: u16) -> Result<socket::Published, String> {
     let line = marker(rows, columns);
     // Refuse to publish a grid the probe would then reject, rather than

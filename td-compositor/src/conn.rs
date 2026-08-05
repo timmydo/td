@@ -7,10 +7,12 @@
 //! must answer identically — the display's protocol error, its `delete_id`,
 //! and the shell's ping.
 
+use crate::render::BYTES_PER_PIXEL;
 use crate::{sys, wire};
 use std::collections::{BTreeSet, VecDeque};
-use std::fs::File;
+use std::fs::{self, File, OpenOptions};
 use std::io::Write;
+use std::os::unix::fs::OpenOptionsExt;
 use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
@@ -467,4 +469,106 @@ pub fn create_surface(connection: &mut Connection, title: &str) -> Result<(), St
     named.string(title)?;
     connection.send(XDG_TOPLEVEL, 2, named)?;
     connection.send(SURFACE, 6, wire::Builder::new())
+}
+
+/// An anonymous wl_shm backing file holding `pixels`: created 0600 under
+/// `directory`, written, and UNLINKED before it is handed over, so the only
+/// reference left is the descriptor the compositor receives. `stem` names the
+/// transient path, which exists only long enough to be opened.
+pub fn backing_file(directory: &Path, stem: &str, pixels: &[u8]) -> Result<File, String> {
+    let pid = std::process::id();
+    for attempt in 0..64u32 {
+        let path = directory.join(format!("{stem}-{pid}-{attempt}.shm"));
+        let mut file = match OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)
+        {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(format!(
+                    "create wl_shm backing file {}: {error}",
+                    path.display()
+                ));
+            }
+        };
+        let write = file
+            .write_all(pixels)
+            .map_err(|e| format!("write wl_shm backing file {}: {e}", path.display()));
+        let remove = fs::remove_file(&path)
+            .map_err(|e| format!("unlink wl_shm file {}: {e}", path.display()));
+        // Unlink before propagating a write failure so every created path is
+        // cleaned up.
+        write?;
+        remove?;
+        return Ok(file);
+    }
+    Err(format!(
+        "could not create a unique wl_shm file in {}",
+        directory.display()
+    ))
+}
+
+/// Put one frame on the surface: a pool over `pixels`, a buffer covering it,
+/// attach, damage, a frame callback, commit. Returns the buffer and callback
+/// ids, which are what the caller waits on — the compositor owns the buffer
+/// until it releases it, and the frame is not on screen until the callback
+/// fires. The pool is destroyed immediately; the buffer keeps the mapping.
+pub fn attach_frame(
+    connection: &mut Connection,
+    directory: &Path,
+    stem: &str,
+    pixels: &[u8],
+    width: usize,
+    height: usize,
+) -> Result<(u32, u32), String> {
+    let file = backing_file(directory, stem, pixels)?;
+    let pool_id = connection.allocate_id()?;
+    let buffer_id = connection.allocate_id()?;
+    let callback_id = connection.allocate_id()?;
+    let bytes = i32::try_from(pixels.len()).map_err(|_| "wl_shm pool exceeds i32".to_string())?;
+    let pixel_width = i32::try_from(width).map_err(|_| "surface width exceeds i32".to_string())?;
+    let pixel_height =
+        i32::try_from(height).map_err(|_| "surface height exceeds i32".to_string())?;
+    let stride = width
+        .checked_mul(BYTES_PER_PIXEL)
+        .and_then(|value| i32::try_from(value).ok())
+        .ok_or_else(|| "surface stride exceeds i32".to_string())?;
+
+    let mut pool = wire::Builder::new();
+    pool.u32(pool_id);
+    pool.i32(bytes);
+    connection.send_with_fd(SHM, 0, pool, &file)?;
+
+    let mut buffer = wire::Builder::new();
+    buffer.u32(buffer_id);
+    buffer.i32(0);
+    buffer.i32(pixel_width);
+    buffer.i32(pixel_height);
+    buffer.i32(stride);
+    buffer.u32(crate::scene::SHM_XRGB8888);
+    connection.send(pool_id, 0, buffer)?;
+    connection.send(pool_id, 1, wire::Builder::new())?;
+
+    let mut attach = wire::Builder::new();
+    attach.u32(buffer_id);
+    attach.i32(0);
+    attach.i32(0);
+    connection.send(SURFACE, 1, attach)?;
+
+    let mut damage = wire::Builder::new();
+    damage.i32(0);
+    damage.i32(0);
+    damage.i32(pixel_width);
+    damage.i32(pixel_height);
+    connection.send(SURFACE, 9, damage)?;
+
+    let mut frame = wire::Builder::new();
+    frame.u32(callback_id);
+    connection.send(SURFACE, 3, frame)?;
+    connection.send(SURFACE, 6, wire::Builder::new())?;
+    Ok((buffer_id, callback_id))
 }

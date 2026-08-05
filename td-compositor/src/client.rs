@@ -8,22 +8,21 @@ use crate::conn::{
 /// terminal's; see `conn`'s note on why this is per-client and must be dense.
 const FIRST_DYNAMIC_ID: u32 = POINTER + 1;
 use crate::keyboard::XKB_KEYMAP;
+use crate::render::BYTES_PER_PIXEL;
 use crate::scene::SHM_XRGB8888;
 use crate::pointer::MAX_POINTER_FRAME_EVENTS;
 use crate::ui::{KeyboardUpdate, PointerUpdate, UiKeyState, UiModel, UiModifiers};
 use crate::{socket, sys, wire, MAX_UI_DIMENSION, MAX_UI_FRAME_BYTES};
 use std::collections::BTreeSet;
-use std::fs::{self, File, OpenOptions};
+use std::fs::File;
 use std::io::{Read, Write};
 use std::os::fd::AsRawFd;
-use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 const DEFAULT_WIDTH: usize = 512;
 const DEFAULT_HEIGHT: usize = 320;
-const BYTES_PER_PIXEL: usize = 4;
 const PRESENT_TIMEOUT: Duration = Duration::from_secs(20);
 
 pub struct Options {
@@ -97,42 +96,6 @@ fn build_pixels(width: usize, height: usize, ui: &UiModel) -> Result<Vec<u8>, St
     }
     ui.paint(&mut pixels, width, height)?;
     Ok(pixels)
-}
-
-fn backing_file(directory: &Path, pixels: &[u8]) -> Result<File, String> {
-    let pid = std::process::id();
-    for attempt in 0..64u32 {
-        let path = directory.join(format!("td-ui-demo-{pid}-{attempt}.shm"));
-        let mut file = match OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&path)
-        {
-            Ok(file) => file,
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(error) => {
-                return Err(format!(
-                    "create wl_shm backing file {}: {error}",
-                    path.display()
-                ));
-            }
-        };
-        let write = file
-            .write_all(pixels)
-            .map_err(|e| format!("write wl_shm backing file {}: {e}", path.display()));
-        let remove = fs::remove_file(&path)
-            .map_err(|e| format!("unlink wl_shm file {}: {e}", path.display()));
-        // Unlink before propagating a write failure so every created path is cleaned up.
-        write?;
-        remove?;
-        return Ok(file);
-    }
-    Err(format!(
-        "could not create a unique wl_shm file in {}",
-        directory.display()
-    ))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -336,53 +299,14 @@ impl Demo {
             return Err("compositor did not advertise wl_shm XRGB8888".into());
         }
         let pixels = build_pixels(size.width, size.height, &self.ui)?;
-        let file = backing_file(runtime_directory, &pixels)?;
-        let pool_id = connection.allocate_id()?;
-        let buffer_id = connection.allocate_id()?;
-        let callback_id = connection.allocate_id()?;
-        let bytes =
-            i32::try_from(pixels.len()).map_err(|_| "demo wl_shm pool exceeds i32".to_string())?;
-        let width = i32::try_from(size.width).map_err(|_| "demo width exceeds i32".to_string())?;
-        let height =
-            i32::try_from(size.height).map_err(|_| "demo height exceeds i32".to_string())?;
-        let stride = size
-            .width
-            .checked_mul(BYTES_PER_PIXEL)
-            .and_then(|value| i32::try_from(value).ok())
-            .ok_or_else(|| "demo stride exceeds i32".to_string())?;
-
-        let mut pool = wire::Builder::new();
-        pool.u32(pool_id);
-        pool.i32(bytes);
-        connection.send_with_fd(SHM, 0, pool, &file)?;
-
-        let mut buffer = wire::Builder::new();
-        buffer.u32(buffer_id);
-        buffer.i32(0);
-        buffer.i32(width);
-        buffer.i32(height);
-        buffer.i32(stride);
-        buffer.u32(SHM_XRGB8888);
-        connection.send(pool_id, 0, buffer)?;
-        connection.send(pool_id, 1, wire::Builder::new())?;
-
-        let mut attach = wire::Builder::new();
-        attach.u32(buffer_id);
-        attach.i32(0);
-        attach.i32(0);
-        connection.send(SURFACE, 1, attach)?;
-
-        let mut damage = wire::Builder::new();
-        damage.i32(0);
-        damage.i32(0);
-        damage.i32(width);
-        damage.i32(height);
-        connection.send(SURFACE, 9, damage)?;
-
-        let mut frame = wire::Builder::new();
-        frame.u32(callback_id);
-        connection.send(SURFACE, 3, frame)?;
-        connection.send(SURFACE, 6, wire::Builder::new())?;
+        let (buffer_id, callback_id) = conn::attach_frame(
+            connection,
+            runtime_directory,
+            "td-ui-demo",
+            &pixels,
+            size.width,
+            size.height,
+        )?;
 
         if !self.live_buffers.insert(buffer_id) {
             return Err(format!(
@@ -844,6 +768,10 @@ pub fn run(options: &Options) -> Result<(), String> {
     connection.finish_handshake()?;
 
     let _ready = socket::publish(&options.ready_socket, "ui-demo-ready", Vec::new())?;
+    // NOTE: `println!` panics on a write failure, the hazard the terminal's
+    // own marker avoids. It is left alone here because the recipe pins this
+    // exact spelling as the demo's boot oracle, so changing it is that
+    // oracle's landing rather than this one.
     println!("TD-UI-CLIENT-READY surface={}x{}", size.width, size.height);
     std::io::stdout()
         .flush()
@@ -986,7 +914,7 @@ pub fn selftest() -> Result<(), String> {
 
     let (sender, receiver) =
         UnixStream::pair().map_err(|e| format!("create descriptor test socket: {e}"))?;
-    let file = backing_file(&std::env::temp_dir(), first)?;
+    let file = conn::backing_file(&std::env::temp_dir(), "td-ui-demo", first)?;
     sys::send_with_fd(&sender, b"demo", file.as_raw_fd())
         .map_err(|e| format!("send descriptor self-test: {e}"))?;
     let mut bytes = [0u8; 16];
@@ -1284,7 +1212,7 @@ mod tests {
         };
         let (stream, peer) = UnixStream::pair().unwrap();
         let mut connection = test_connection(stream);
-        let file = backing_file(&std::env::temp_dir(), &expected).unwrap();
+        let file = conn::backing_file(&std::env::temp_dir(), "td-ui-demo-test", &expected).unwrap();
         let mut keymap = wire::Builder::new();
         keymap.u32(1);
         keymap.u32(u32::try_from(expected.len()).unwrap());
@@ -1300,7 +1228,7 @@ mod tests {
         let mut connection = test_connection(stream);
         let mut changed = expected.clone();
         changed[0] ^= 1;
-        let file = backing_file(&std::env::temp_dir(), &changed).unwrap();
+        let file = conn::backing_file(&std::env::temp_dir(), "td-ui-demo-test", &changed).unwrap();
         let mut keymap = wire::Builder::new();
         keymap.u32(1);
         keymap.u32(u32::try_from(changed.len()).unwrap());
@@ -1337,7 +1265,7 @@ mod tests {
         ] {
             let (stream, peer) = UnixStream::pair().unwrap();
             let mut connection = test_connection(stream);
-            let file = backing_file(&std::env::temp_dir(), &expected).unwrap();
+            let file = conn::backing_file(&std::env::temp_dir(), "td-ui-demo-test", &expected).unwrap();
             let mut keymap = wire::Builder::new();
             keymap.u32(format);
             keymap.u32(size);
@@ -1355,7 +1283,7 @@ mod tests {
     #[test]
     fn keymap_read_is_bounded_against_growth_after_metadata() {
         let bytes = vec![7u8; 18];
-        let file = backing_file(&std::env::temp_dir(), &bytes).unwrap();
+        let file = conn::backing_file(&std::env::temp_dir(), "td-ui-demo-test", &bytes).unwrap();
         let mut file = sys::duplicate_received(file.into_raw_fd()).unwrap();
         let error = read_keymap_bytes(&mut file, 16).unwrap_err();
         assert!(error.contains("read 17 bytes, expected 16"));
@@ -1373,7 +1301,7 @@ mod tests {
         peer.write_all(ordinary.get(3..).unwrap()).unwrap();
 
         let descriptor_bytes = b"descriptor-order";
-        let file = backing_file(&std::env::temp_dir(), descriptor_bytes).unwrap();
+        let file = conn::backing_file(&std::env::temp_dir(), "td-ui-demo-test", descriptor_bytes).unwrap();
         let mut descriptor_event = wire::Builder::new();
         descriptor_event.u32(1);
         descriptor_event.u32(u32::try_from(descriptor_bytes.len()).unwrap());
@@ -1427,7 +1355,7 @@ mod tests {
         let second = wire::Builder::new().message(KEYBOARD, 0).unwrap();
         let mut events = first;
         events.extend_from_slice(&second);
-        let source = backing_file(&std::env::temp_dir(), b"coalesced-fd").unwrap();
+        let source = conn::backing_file(&std::env::temp_dir(), "td-ui-demo-test", b"coalesced-fd").unwrap();
         sys::send_with_fd(&peer, &events, source.as_raw_fd()).unwrap();
         drop(source);
 

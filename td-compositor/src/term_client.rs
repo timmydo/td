@@ -1,27 +1,39 @@
-//! td-term's Wayland client: the handshake, and the grid the surface holds.
+//! td-term's Wayland client: the handshake, the frame, and the grid it earns.
 //!
-//! The half that reaches a configured surface. Readiness is deliberately NOT
-//! published here, and that is not a scoping choice: §12 has the terminal
-//! announce itself only once the tile-sized buffer has come back with both
-//! `wl_buffer.release` and its frame callback, and an unmapped surface never
-//! receives a second configure — td's compositor tracks a view only once a
-//! buffer is attached, so the only configure a bufferless client ever sees is
-//! the initial zero one. Publishing here would therefore publish the FALLBACK
-//! grid every time, which is exactly the number a readiness socket must not
-//! be carrying. The frame landing is what earns it.
+//! It presents, and readiness follows the frame as §12 requires — both the
+//! buffer release and the frame callback. TWO frames, because a compositor
+//! cannot tile a surface it has not mapped: the first configure is zero in
+//! both axes, presenting at the fallback is what maps the surface, and the
+//! tile arrives in the configure after that. No child yet, so the model
+//! rendered here is empty.
 
 use crate::conn::{
-    self, Connection, Globals, COMPOSITOR, REGISTRY, SHM, XDG_SURFACE, XDG_TOPLEVEL, XDG_WM_BASE,
+    self, Connection, Globals, COMPOSITOR, REGISTRY, SHM, SURFACE, XDG_SURFACE, XDG_TOPLEVEL,
+    XDG_WM_BASE,
 };
 use crate::font::Font;
 use crate::scene::SHM_XRGB8888;
-use crate::{font, pty, wire};
+use crate::term::Terminal;
+use crate::{font, pty, ready, render, wire, MAX_UI_DIMENSION, MAX_UI_FRAME_BYTES};
+use std::collections::BTreeSet;
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
+
+pub struct Options {
+    pub socket: PathBuf,
+    pub ready_socket: PathBuf,
+}
+
+/// Bound on reaching a presented frame. Past this the compositor is not
+/// coming, and a terminal that waits forever is one td-svc reports as down
+/// without ever saying why. §12 sets it below the supervisor's 30.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// One past the last fixed id the TERMINAL creates. It binds no seat and
 /// creates no keyboard or pointer, so its dynamic range starts three lower
 /// than the demo's — and starting where the demo does would SKIP those three,
 /// which Wayland forbids. See `conn`'s note.
-#[allow(dead_code)]
 const FIRST_DYNAMIC_ID: u32 = XDG_TOPLEVEL + 1;
 
 /// What an operator sees in a title bar. td's own compositor parses and
@@ -91,7 +103,6 @@ impl Bound {
 /// Bind the three globals a terminal needs. No `wl_seat`: there is no
 /// keyboard to route yet, and binding one would mean fielding capability
 /// events for a device nothing reads.
-#[allow(dead_code)]
 fn bind_globals(connection: &mut Connection) -> Result<Bound, String> {
     let globals = conn::discover_globals(connection)?;
     let (compositor_name, compositor_version) =
@@ -120,23 +131,66 @@ fn bind_globals(connection: &mut Connection) -> Result<Bound, String> {
     })
 }
 
+/// `XDG_TOPLEVEL_STATE_ACTIVATED`. Pinned by value, as every other protocol
+/// number here is: this one decides whether the cursor is drawn as holding
+/// the keyboard, so a wrong constant is a terminal whose cursor never claims
+/// focus — with nothing failing anywhere.
+const XDG_STATE_ACTIVATED: u32 = 4;
+
+/// The frame in flight. §12 has readiness follow BOTH answers, because they
+/// mean different things: the release says the compositor is done reading the
+/// buffer, and the callback says the frame reached the screen. A terminal that
+/// announced itself on either alone would be announcing something it cannot
+/// see.
+struct Frame {
+    buffer: u32,
+    callback: u32,
+    released: bool,
+    presented: bool,
+}
+
+impl Frame {
+    /// Named for the state rather than for one of its halves, so it does
+    /// not shadow the `presented` field it reads.
+    fn complete(&self) -> bool {
+        self.released && self.presented
+    }
+}
+
 /// What the client knows about its surface between configures.
 ///
 /// The toplevel configure carries the size and the SURFACE configure is where
 /// it takes effect, so a proposal is only ever adopted at the second — which
 /// is also the only one that is acknowledged. Two events, one transition.
-#[allow(dead_code)]
 struct Surface {
     bound: Bound,
     proposed: Option<Size>,
     current: Option<Size>,
     xrgb: bool,
+    activated: bool,
+    /// The activation state the pending configure carries. Double-buffered
+    /// with the size for the same reason: both arrive on the toplevel
+    /// configure and xdg-shell applies the whole configure at the surface one.
+    proposed_activated: Option<bool>,
+    /// Whether the pending proposal actually CHOSE a size. The compositor's
+    /// first configure is zero in both axes — it cannot know a tile for a
+    /// surface it has not mapped — so a terminal that stopped there would
+    /// announce its own fallback. Presenting is what maps it; this is how the
+    /// configure that follows is told from the one that preceded it.
+    proposed_selected: bool,
+    layout_configured: bool,
+    /// An acknowledged configure that has not been applied yet. xdg-shell
+    /// makes `ack_configure` take effect on the surface commit that FOLLOWS
+    /// it, so acknowledging is only half of answering one.
+    needs_commit: bool,
+    /// The size the frame in flight was drawn at, which is not always the size
+    /// now held: a configure can arrive while a frame is in the air.
+    drawn: Option<Size>,
+    live_buffers: BTreeSet<u32>,
+    live_callbacks: BTreeSet<u32>,
+    frame: Option<Frame>,
 }
 
-// The state machine is a unit the frame landing consumes whole, so the allow
-// is on the block rather than on each of the four: there is no half of this
-// that could be left over for a per-item allow to keep visible.
-#[allow(dead_code)]
 impl Surface {
     fn new(bound: Bound) -> Surface {
         Surface {
@@ -144,6 +198,15 @@ impl Surface {
             proposed: None,
             current: None,
             xrgb: false,
+            activated: false,
+            proposed_activated: None,
+            proposed_selected: false,
+            layout_configured: false,
+            needs_commit: false,
+            drawn: None,
+            live_buffers: BTreeSet::new(),
+            live_callbacks: BTreeSet::new(),
+            frame: None,
         }
     }
 
@@ -175,7 +238,9 @@ impl Surface {
             // terminal would stall at its first buffer with nothing to report.
             if message.opcode == 1 {
                 if let Some(interface) = self.bound.interface(name) {
-                    return Err(format!("compositor withdrew {interface} while it was in use"));
+                    return Err(format!(
+                        "compositor withdrew {interface} while it was in use"
+                    ));
                 }
             }
             return Ok(false);
@@ -189,7 +254,10 @@ impl Surface {
             return Ok(false);
         }
         if message.object == XDG_TOPLEVEL && message.opcode == 0 {
-            self.proposed = Some(self.toplevel_size(message, fallback)?);
+            let (proposed, activated, selected) = self.toplevel_size(message, fallback)?;
+            self.proposed = Some(proposed);
+            self.proposed_activated = Some(activated);
+            self.proposed_selected = selected;
             return Ok(false);
         }
         if message.object == XDG_TOPLEVEL && message.opcode == 1 {
@@ -206,12 +274,67 @@ impl Surface {
             // than falling back: the compositor is confirming what it already
             // proposed, not withdrawing it.
             self.current = Some(self.proposed.take().or(self.current).unwrap_or(fallback));
+            if let Some(activated) = self.proposed_activated.take() {
+                self.activated = activated;
+            }
+            if std::mem::take(&mut self.proposed_selected) {
+                self.layout_configured = true;
+            }
+            self.needs_commit = true;
             return Ok(true);
+        }
+        if self.live_buffers.contains(&message.object) && message.opcode == 0 {
+            wire::Cursor::new(&message.payload).finish()?;
+            self.live_buffers.remove(&message.object);
+            if let Some(frame) = self.frame.as_mut() {
+                if frame.buffer == message.object {
+                    frame.released = true;
+                }
+            }
+            // The buffer is ours again; the pool it came from is long gone, so
+            // destroying it is what frees the mapping.
+            connection.send(message.object, 0, wire::Builder::new())?;
+            return Ok(false);
+        }
+        if self.live_callbacks.contains(&message.object) && message.opcode == 0 {
+            let mut args = wire::Cursor::new(&message.payload);
+            args.u32()?;
+            args.finish()?;
+            self.live_callbacks.remove(&message.object);
+            if let Some(frame) = self.frame.as_mut() {
+                if frame.callback == message.object {
+                    frame.presented = true;
+                }
+            }
+            return Ok(false);
         }
         Err(format!(
             "unexpected Wayland event object={} opcode={}",
             message.object, message.opcode
         ))
+    }
+
+    /// Discharge what an acknowledgement owes. A configure asking for a size
+    /// already drawn produces no frame, and therefore no commit, so the
+    /// compositor would have its configure acknowledged and never applied —
+    /// which is exactly what a chosen tile equal to the fallback looks like.
+    /// A bare commit says the pixels already standing are the answer.
+    fn commit_configure(&mut self, connection: &mut Connection) -> Result<(), String> {
+        if !std::mem::take(&mut self.needs_commit) {
+            return Ok(());
+        }
+        connection.send(SURFACE, 6, wire::Builder::new())
+    }
+
+    /// Readiness, as §12 defines it: a frame the compositor has both released
+    /// and presented, DRAWN AT the size now held, which the compositor chose.
+    /// All three matter and the middle one is easy to lose — a configure can
+    /// arrive while a frame is in the air, and the frame that comes back is
+    /// then a picture of the wrong size.
+    fn ready(&self) -> bool {
+        self.layout_configured
+            && self.drawn == self.current
+            && self.frame.as_ref().is_some_and(Frame::complete)
     }
 
     /// One event, with the display's own three answered where they belong.
@@ -230,7 +353,11 @@ impl Surface {
     /// A configure of zero in either axis is the compositor declining to
     /// choose, not a zero-sized window; each axis declines independently, so
     /// the fallback fills in per axis rather than wholesale.
-    fn toplevel_size(&self, message: &wire::Message, fallback: Size) -> Result<Size, String> {
+    fn toplevel_size(
+        &self,
+        message: &wire::Message,
+        fallback: Size,
+    ) -> Result<(Size, bool, bool), String> {
         let mut args = wire::Cursor::new(&message.payload);
         let width = args.i32()?;
         let height = args.i32()?;
@@ -244,8 +371,11 @@ impl Surface {
         if !states.is_multiple_of(4) {
             return Err(format!("XDG state array has invalid length {states}"));
         }
+        let mut activated = false;
         for _ in 0..states / 4 {
-            args.u32()?;
+            if args.u32()? == XDG_STATE_ACTIVATED {
+                activated = true;
+            }
         }
         args.finish()?;
         let width = usize::try_from(width)
@@ -253,50 +383,239 @@ impl Surface {
         let height = usize::try_from(height)
             .map_err(|_| "configured terminal height escaped usize".to_string())?;
         let current = self.current.unwrap_or(fallback);
-        Ok(Size {
-            width: if width == 0 { current.width } else { width },
-            height: if height == 0 { current.height } else { height },
-        })
+        Ok((
+            Size {
+                width: if width == 0 { current.width } else { width },
+                height: if height == 0 { current.height } else { height },
+            },
+            activated,
+            width != 0 || height != 0,
+        ))
     }
 }
 
-/// The handshake itself, from a dialled connection to a configured surface.
-/// This is the PRODUCTION sequence — `run` will dial and then call it — and
-/// the test wrapper below is deliberately thin so what runs against the real
-/// server is what the binary will run, as the demo's `present_for_test` is.
-#[allow(dead_code)]
-fn handshake(connection: &mut Connection, fallback: Size) -> Result<(Size, bool), String> {
-    let bound = bind_globals(connection)?;
+/// What a compositor-supplied size must satisfy before ANYTHING is allocated
+/// for it — the demo's three bounds, and for its reason: a configure comes
+/// from outside, and an allocation too large to serve ABORTS rather than
+/// returning an error this crate could propagate. The server refuses an
+/// oversized pool, but only after the client has already tried to allocate.
+/// Called before the terminal model is built as well as before the pixels
+/// are, so the bound covers the first allocation rather than the last.
+fn frame_bytes(size: Size) -> Result<usize, String> {
+    if size.width == 0 || size.height == 0 {
+        return Err(format!(
+            "terminal surface {}x{} has no area",
+            size.width, size.height
+        ));
+    }
+    if size.width > MAX_UI_DIMENSION || size.height > MAX_UI_DIMENSION {
+        return Err(format!(
+            "terminal surface {}x{} exceeds {MAX_UI_DIMENSION}",
+            size.width, size.height
+        ));
+    }
+    let bytes = size
+        .width
+        .checked_mul(size.height)
+        .and_then(|count| count.checked_mul(render::BYTES_PER_PIXEL))
+        .ok_or_else(|| {
+            format!(
+                "terminal surface {}x{} overflows a byte count",
+                size.width, size.height
+            )
+        })?;
+    if bytes > MAX_UI_FRAME_BYTES {
+        return Err(format!(
+            "terminal surface needs {bytes} bytes, exceeding {MAX_UI_FRAME_BYTES}"
+        ));
+    }
+    Ok(bytes)
+}
+
+fn build_pixels(
+    size: Size,
+    terminal: &Terminal,
+    font: &Font,
+    palette: &render::Palette,
+    focused: bool,
+) -> Result<Vec<u8>, String> {
+    let bytes = frame_bytes(size)?;
+    let mut pixels = vec![0u8; bytes];
+    let snapshot = render::Snapshot::new(terminal, focused, false);
+    render::render(
+        &snapshot,
+        palette,
+        font,
+        &mut pixels,
+        size.width,
+        size.height,
+    )?;
+    Ok(pixels)
+}
+
+/// Render the terminal into a new buffer and put it on the surface. The ids
+/// are recorded so the two answers that follow can be told from an event
+/// about some other object.
+fn commit_frame(
+    connection: &mut Connection,
+    surface: &mut Surface,
+    directory: &Path,
+    size: Size,
+    terminal: &Terminal,
+    font: &Font,
+    palette: &render::Palette,
+) -> Result<(), String> {
+    if !surface.xrgb {
+        return Err("compositor did not advertise wl_shm XRGB8888".into());
+    }
+    let pixels = build_pixels(size, terminal, font, palette, surface.activated)?;
+    let (buffer, callback) = conn::attach_frame(
+        connection,
+        directory,
+        "td-term",
+        &pixels,
+        size.width,
+        size.height,
+    )?;
+    if !surface.live_buffers.insert(buffer) {
+        return Err(format!(
+            "terminal buffer object {buffer} was reused while live"
+        ));
+    }
+    if !surface.live_callbacks.insert(callback) {
+        return Err(format!(
+            "terminal callback object {callback} was reused while live"
+        ));
+    }
+    surface.frame = Some(Frame {
+        buffer,
+        callback,
+        released: false,
+        presented: false,
+    });
+    // `attach_frame` ends in a `wl_surface.commit`, which is the commit any
+    // outstanding acknowledgement was waiting for.
+    surface.needs_commit = false;
+    Ok(())
+}
+
+/// Everything `run` does before it may publish: bind, create the surface,
+/// take the first configure, render one frame into it, and wait for BOTH the
+/// buffer release and the frame callback. Production, so the test that drives
+/// it against the real server drives what the binary runs.
+fn present(
+    connection: &mut Connection,
+    directory: &Path,
+    font: &Font,
+    palette: &render::Palette,
+) -> Result<(Surface, Size, (u16, u16)), String> {
+    let fallback = default_size(font)?;
+    let mut surface = Surface::new(bind_globals(connection)?);
     conn::create_surface(connection, TITLE)?;
-    let mut surface = Surface::new(bound);
-    while !surface.dispatch_next(connection, fallback)? {}
+    // Two frames, not one, and that is the protocol rather than a retry. The
+    // compositor cannot tile a surface it has not mapped, so its first
+    // configure is zero in both axes; presenting at the fallback is what maps
+    // the surface, and the tile arrives in the configure that follows. §12
+    // puts readiness after a frame, and this is the frame it means: one drawn
+    // at a size the compositor CHOSE. Everything here runs under the
+    // connection's deadline, so a compositor that never gets there fails.
+    loop {
+        surface.dispatch_next(connection, fallback)?;
+        let Some(size) = surface.current else {
+            continue;
+        };
+        if surface.drawn != Some(size) {
+            // Before the model, not just before the pixels: a configure large
+            // enough to matter would otherwise have `Terminal::new` allocate
+            // for it first.
+            frame_bytes(size)?;
+            let (rows, columns) = grid(size, font)?;
+            let terminal = Terminal::new(usize::from(rows), usize::from(columns))?;
+            commit_frame(
+                connection,
+                &mut surface,
+                directory,
+                size,
+                &terminal,
+                font,
+                palette,
+            )?;
+            surface.drawn = Some(size);
+            continue;
+        }
+        surface.commit_configure(connection)?;
+        if surface.ready() {
+            break;
+        }
+    }
     let size = surface
         .current
-        .ok_or_else(|| "the terminal was configured without a size".to_string())?;
+        .ok_or_else(|| "the terminal presented without a size".to_string())?;
+    let (rows, columns) = grid(size, font)?;
+
     let unclaimed = connection.pending_fd_count();
     if unclaimed != 0 {
         return Err(format!(
-            "the terminal handshake retained {unclaimed} unexpected descriptors"
+            "the terminal presentation retained {unclaimed} unexpected descriptors"
         ));
     }
-    Ok((size, surface.xrgb))
+    Ok((surface, size, (rows, columns)))
 }
 
-/// The handshake over an already-open stream, which is the only way to drive
-/// it against the real server without a socket on disk.
+/// The same sequence over an already-open stream, which is the only way to
+/// drive it against the real server without a socket on disk.
 #[cfg(test)]
-pub fn handshake_for_test(
+pub fn present_for_test(
     stream: std::os::unix::net::UnixStream,
-) -> Result<(Connection, Size, bool), String> {
+    directory: &Path,
+) -> Result<(Connection, Size, (u16, u16)), String> {
     let font = font::pinned()?;
-    let fallback = default_size(&font)?;
-    let deadline = std::time::Instant::now()
-        .checked_add(std::time::Duration::from_secs(20))
+    let palette = render::Palette::pinned();
+    let deadline = Instant::now()
+        .checked_add(HANDSHAKE_TIMEOUT)
         .ok_or_else(|| "could not bound the terminal's Wayland handshake".to_string())?;
     let mut connection = Connection::over(stream, Some(deadline), FIRST_DYNAMIC_ID);
-    connection.set_read_timeout(Some(std::time::Duration::from_secs(20)))?;
-    let (size, xrgb) = handshake(&mut connection, fallback)?;
-    Ok((connection, size, xrgb))
+    connection.set_read_timeout(Some(HANDSHAKE_TIMEOUT))?;
+    let (_surface, size, cells) = present(&mut connection, directory, &font, &palette)?;
+    Ok((connection, size, cells))
+}
+
+pub fn run(options: &Options) -> Result<(), String> {
+    let runtime_directory = options
+        .socket
+        .parent()
+        .ok_or_else(|| format!("Wayland socket {} has no parent", options.socket.display()))?;
+    let font = font::pinned()?;
+    let palette = render::Palette::pinned();
+    let fallback = default_size(&font)?;
+    let deadline = Instant::now()
+        .checked_add(HANDSHAKE_TIMEOUT)
+        .ok_or_else(|| "could not bound the terminal's Wayland handshake".to_string())?;
+    let mut connection = Connection::connect(&options.socket, deadline, FIRST_DYNAMIC_ID)?;
+    let (mut surface, _size, (rows, columns)) =
+        present(&mut connection, runtime_directory, &font, &palette)?;
+    connection.finish_handshake()?;
+
+    let _ready = ready::publish(&options.ready_socket, rows, columns)?;
+    // `write_all` rather than `print!`, which PANICS on a write failure — and
+    // a panic here would abort past `Published::drop` and leave the socket
+    // behind. One encoder, so the diagnostic an operator reads and the line a
+    // probe parses cannot describe different grids.
+    let mut out = std::io::stdout();
+    out.write_all(ready::marker(rows, columns).as_bytes())
+        .map_err(|e| format!("write terminal ready marker: {e}"))?;
+    out.flush()
+        .map_err(|e| format!("flush terminal ready marker: {e}"))?;
+
+    // Nothing writes to the terminal yet, so the loop stays a well-behaved
+    // client: it answers pings, retires the buffers it is handed back, and
+    // applies each configure with the commit an acknowledgement owes.
+    // Redrawing on a new size is the resize landing, and on child output the
+    // one after — until then a configure is applied without new pixels.
+    loop {
+        surface.dispatch_next(&mut connection, fallback)?;
+        surface.commit_configure(&mut connection)?;
+    }
 }
 
 pub fn selftest() -> Result<(), String> {
@@ -358,11 +677,36 @@ mod tests {
     }
 
     fn toplevel_configure(width: i32, height: i32) -> wire::Message {
+        configure_with_states(width, height, &[])
+    }
+
+    /// The state array spelled out in NUMBERS rather than through the
+    /// constant it is read with, so the constant is pinned by this rather
+    /// than compared with itself.
+    fn configure_with_states(width: i32, height: i32, states: &[u32]) -> wire::Message {
         let mut payload = Vec::new();
         payload.extend_from_slice(&width.to_ne_bytes());
         payload.extend_from_slice(&height.to_ne_bytes());
-        payload.extend_from_slice(&0u32.to_ne_bytes());
+        let bytes = u32::try_from(states.len() * 4).unwrap();
+        payload.extend_from_slice(&bytes.to_ne_bytes());
+        for state in states {
+            payload.extend_from_slice(&state.to_ne_bytes());
+        }
         message(XDG_TOPLEVEL, 0, payload)
+    }
+
+    /// One request off the wire, as `(object, opcode, payload)`.
+    fn said(peer: &mut UnixStream) -> (u32, u16, Vec<u8>) {
+        peer.set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        let mut header = [0u8; 8];
+        std::io::Read::read_exact(peer, &mut header).unwrap();
+        let object = u32::from_ne_bytes([header[0], header[1], header[2], header[3]]);
+        let opcode = u16::from_ne_bytes([header[4], header[5]]);
+        let length = usize::from(u16::from_ne_bytes([header[6], header[7]]));
+        let mut payload = vec![0u8; length.saturating_sub(8)];
+        std::io::Read::read_exact(peer, &mut payload).unwrap();
+        (object, opcode, payload)
     }
 
     fn surface_configure(serial: u32) -> wire::Message {
@@ -462,11 +806,7 @@ mod tests {
             height: 768,
         };
         surface
-            .dispatch(
-                &mut connection,
-                &toplevel_configure(1024, 768),
-                fallback,
-            )
+            .dispatch(&mut connection, &toplevel_configure(1024, 768), fallback)
             .unwrap();
         surface
             .dispatch(&mut connection, &surface_configure(1), fallback)
@@ -513,7 +853,11 @@ mod tests {
         for (opcode, payload) in [(0u16, arrived), (1u16, departed)] {
             assert!(
                 !surface
-                    .dispatch(&mut connection, &message(REGISTRY, opcode, payload), fallback)
+                    .dispatch(
+                        &mut connection,
+                        &message(REGISTRY, opcode, payload),
+                        fallback
+                    )
                     .unwrap(),
                 "a registry event completed a configure"
             );
@@ -605,7 +949,8 @@ mod tests {
         surface
             .dispatch(&mut connection, &surface_configure(0x2a), fallback)
             .unwrap();
-        peer.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
         let mut said = [0u8; 12];
         std::io::Read::read_exact(&mut peer, &mut said).unwrap();
         let object = u32::from_ne_bytes([said[0], said[1], said[2], said[3]]);
@@ -649,7 +994,11 @@ mod tests {
         payload.extend_from_slice(&8i32.to_ne_bytes());
         payload.extend_from_slice(&3u32.to_ne_bytes());
         assert!(surface
-            .dispatch(&mut connection, &message(XDG_TOPLEVEL, 0, payload), fallback)
+            .dispatch(
+                &mut connection,
+                &message(XDG_TOPLEVEL, 0, payload),
+                fallback
+            )
             .is_err());
     }
 
@@ -666,7 +1015,11 @@ mod tests {
             height: 8,
         };
         assert!(surface
-            .dispatch(&mut connection, &message(XDG_TOPLEVEL, 1, Vec::new()), fallback)
+            .dispatch(
+                &mut connection,
+                &message(XDG_TOPLEVEL, 1, Vec::new()),
+                fallback
+            )
             .is_err());
         assert!(surface
             .dispatch(&mut connection, &message(4242, 0, Vec::new()), fallback)
@@ -706,6 +1059,284 @@ mod tests {
             )
             .unwrap();
         assert!(surface.xrgb);
+    }
+
+    fn frame(released: bool, presented: bool) -> Frame {
+        Frame {
+            buffer: 20,
+            callback: 21,
+            released,
+            presented,
+        }
+    }
+
+    /// The release says the compositor is done READING the buffer; the
+    /// callback says the frame reached the screen. Neither implies the other,
+    /// and readiness means both.
+    #[test]
+    fn a_frame_is_presented_only_when_both_answers_have_come_back() {
+        assert!(!frame(false, false).complete());
+        assert!(!frame(true, false).complete(), "a release alone presented");
+        assert!(!frame(false, true).complete(), "a callback alone presented");
+        assert!(frame(true, true).complete());
+    }
+
+    /// A frame is not enough: the FIRST frame is drawn at the terminal's own
+    /// fallback, because a compositor cannot tile a surface it has not mapped.
+    /// Announcing then would announce a grid the compositor never chose.
+    #[test]
+    fn readiness_needs_a_chosen_size_as_well_as_a_presented_frame() {
+        let (mut connection, _peer) = pair();
+        let mut surface = Surface::new(Bound {
+            compositor: 1,
+            shm: 2,
+            xdg_wm_base: 4,
+        });
+        let fallback = Size {
+            width: 640,
+            height: 384,
+        };
+
+        // The compositor's opening configure: zero in both axes.
+        surface
+            .dispatch(&mut connection, &toplevel_configure(0, 0), fallback)
+            .unwrap();
+        surface
+            .dispatch(&mut connection, &surface_configure(1), fallback)
+            .unwrap();
+        surface.drawn = surface.current;
+        surface.frame = Some(frame(true, true));
+        assert!(
+            !surface.ready(),
+            "a frame at the fallback size counted as readiness"
+        );
+
+        // The configure that follows the surface being mapped chooses one.
+        surface
+            .dispatch(&mut connection, &toplevel_configure(592, 352), fallback)
+            .unwrap();
+        surface
+            .dispatch(&mut connection, &surface_configure(2), fallback)
+            .unwrap();
+        assert!(
+            !surface.ready(),
+            "the frame drawn at the OLD size counted as readiness for the new one"
+        );
+
+        // Only a frame drawn at the size now held is readiness.
+        surface.drawn = surface.current;
+        surface.frame = Some(frame(true, true));
+        assert!(surface.ready());
+    }
+
+    /// The activation state decides whether the cursor is drawn as holding
+    /// the keyboard, and NOTHING else observes it — so a wrong constant is a
+    /// terminal that never looks focused, with every other test green. The
+    /// state array here is written as the number 4, not as the constant the
+    /// parser reads it with, or this would compare the constant with itself.
+    ///
+    /// It is also double-buffered with the size, because xdg-shell applies a
+    /// whole configure at the surface event: the toplevel event alone must
+    /// not move it.
+    #[test]
+    fn the_activation_state_is_read_by_value_and_applied_with_the_size() {
+        let (mut connection, _peer) = pair();
+        let mut surface = Surface::new(Bound {
+            compositor: 1,
+            shm: 2,
+            xdg_wm_base: 4,
+        });
+        let fallback = Size {
+            width: 640,
+            height: 384,
+        };
+
+        // MAXIMIZED, RESIZING and ACTIVATED — the state is found in a list
+        // rather than being the only entry.
+        surface
+            .dispatch(
+                &mut connection,
+                &configure_with_states(592, 352, &[1, 3, 4]),
+                fallback,
+            )
+            .unwrap();
+        assert!(
+            !surface.activated,
+            "the toplevel configure applied the activation state on its own"
+        );
+        surface
+            .dispatch(&mut connection, &surface_configure(1), fallback)
+            .unwrap();
+        assert!(
+            surface.activated,
+            "an ACTIVATED configure left the terminal unfocused"
+        );
+
+        // Every neighbouring state, and none of them is this one.
+        surface
+            .dispatch(
+                &mut connection,
+                &configure_with_states(592, 352, &[1, 2, 3, 5, 6]),
+                fallback,
+            )
+            .unwrap();
+        surface
+            .dispatch(&mut connection, &surface_configure(2), fallback)
+            .unwrap();
+        assert!(
+            !surface.activated,
+            "a configure without ACTIVATED left the terminal focused"
+        );
+    }
+
+    /// A compositor may choose one axis and decline the other, and that is
+    /// still a compositor that chose. Requiring both would leave the terminal
+    /// waiting for a configure it has already been sent, which presents as a
+    /// twenty-second hang rather than as anything about layout.
+    #[test]
+    fn one_chosen_axis_is_enough_to_have_chosen() {
+        let fallback = Size {
+            width: 640,
+            height: 384,
+        };
+        for (width, height) in [(592, 0), (0, 352), (592, 352)] {
+            let (mut connection, _peer) = pair();
+            let mut surface = Surface::new(Bound {
+                compositor: 1,
+                shm: 2,
+                xdg_wm_base: 4,
+            });
+            surface
+                .dispatch(
+                    &mut connection,
+                    &toplevel_configure(width, height),
+                    fallback,
+                )
+                .unwrap();
+            surface
+                .dispatch(&mut connection, &surface_configure(1), fallback)
+                .unwrap();
+            assert!(
+                surface.layout_configured,
+                "a configure of {width}x{height} was not treated as a choice"
+            );
+        }
+
+        // Zero in both axes is the compositor declining, which is what the
+        // very first configure always is.
+        let (mut connection, _peer) = pair();
+        let mut surface = Surface::new(Bound {
+            compositor: 1,
+            shm: 2,
+            xdg_wm_base: 4,
+        });
+        surface
+            .dispatch(&mut connection, &toplevel_configure(0, 0), fallback)
+            .unwrap();
+        surface
+            .dispatch(&mut connection, &surface_configure(1), fallback)
+            .unwrap();
+        assert!(
+            !surface.layout_configured,
+            "the opening zero configure was treated as a choice"
+        );
+    }
+
+    /// The pool a buffer came from is destroyed as soon as the buffer exists,
+    /// so the buffer is the last handle on that mapping: a terminal that kept
+    /// them would leak one mapping and one object id per frame, forever, with
+    /// nothing failing until the compositor ran out.
+    #[test]
+    fn a_released_buffer_is_destroyed() {
+        let (mut connection, mut peer) = pair();
+        let mut surface = Surface::new(Bound {
+            compositor: 1,
+            shm: 2,
+            xdg_wm_base: 4,
+        });
+        let fallback = Size {
+            width: 8,
+            height: 8,
+        };
+        surface.live_buffers.insert(31);
+        surface.frame = Some(Frame {
+            buffer: 31,
+            callback: 32,
+            released: false,
+            presented: false,
+        });
+        surface
+            .dispatch(&mut connection, &message(31, 0, Vec::new()), fallback)
+            .unwrap();
+        assert_eq!(said(&mut peer), (31, 0, Vec::new()));
+        assert!(!surface.live_buffers.contains(&31));
+    }
+
+    /// Acknowledging a configure is half of answering it: xdg-shell applies
+    /// one at the surface commit that follows. A configure whose size is
+    /// already drawn produces no frame and so no commit of its own — which is
+    /// what a compositor choosing exactly the fallback looks like — so the
+    /// bare commit is what stops that configure from being dropped.
+    #[test]
+    fn an_acknowledged_configure_is_applied_by_a_commit() {
+        let (mut connection, mut peer) = pair();
+        let mut surface = Surface::new(Bound {
+            compositor: 1,
+            shm: 2,
+            xdg_wm_base: 4,
+        });
+        let fallback = Size {
+            width: 8,
+            height: 8,
+        };
+        surface
+            .dispatch(&mut connection, &surface_configure(7), fallback)
+            .unwrap();
+        assert_eq!(
+            said(&mut peer),
+            (XDG_SURFACE, 4, 7u32.to_ne_bytes().to_vec())
+        );
+        surface.commit_configure(&mut connection).unwrap();
+        assert_eq!(said(&mut peer), (SURFACE, 6, Vec::new()));
+
+        // One commit per configure, not one per turn of the loop: an empty
+        // commit with nothing to apply is a frame the compositor may act on.
+        surface.commit_configure(&mut connection).unwrap();
+        surface
+            .dispatch(&mut connection, &surface_configure(8), fallback)
+            .unwrap();
+        assert_eq!(
+            said(&mut peer),
+            (XDG_SURFACE, 4, 8u32.to_ne_bytes().to_vec())
+        );
+    }
+
+    /// The bound is on the size a COMPOSITOR chose, so it has to hold before
+    /// anything is allocated for that size — the terminal model included.
+    /// An allocation too large to serve aborts, which no `Result` here could
+    /// carry.
+    #[test]
+    fn a_frame_is_bounded_before_anything_is_allocated_for_it() {
+        assert_eq!(
+            frame_bytes(Size {
+                width: 592,
+                height: 352
+            }),
+            Ok(592 * 352 * render::BYTES_PER_PIXEL)
+        );
+        for (width, height) in [
+            (0, 352),
+            (592, 0),
+            (MAX_UI_DIMENSION + 1, 352),
+            (592, MAX_UI_DIMENSION + 1),
+            (MAX_UI_DIMENSION, MAX_UI_DIMENSION),
+            (usize::MAX, usize::MAX),
+        ] {
+            assert!(
+                frame_bytes(Size { width, height }).is_err(),
+                "{width}x{height} was accepted"
+            );
+        }
     }
 
     #[test]

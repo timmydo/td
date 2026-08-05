@@ -4207,17 +4207,20 @@ mod tests {
         fs::remove_file(pool_path).unwrap();
     }
 
-    /// The terminal's handshake against the REAL server. Every other test of
+    /// The terminal presenting against the REAL server. Every other test of
     /// `term_client` hands `dispatch` events it built itself, so this is the
     /// only one that would catch a wrong opcode, a wrong object id, a
     /// mis-ordered request, or an event arm that is missing.
     ///
-    /// It also pins WHY readiness cannot be published by the handshake alone:
-    /// a client that attaches no buffer is never mapped, so the only configure
-    /// it is ever sent is the initial zero one, and the size it settles on is
-    /// its own default rather than the tile it would be given.
+    /// It is also the whole argument for the ORDER: a client that attached no
+    /// buffer would never be mapped, would receive only the initial zero
+    /// configure, and would announce its own 80x24 default. Having presented,
+    /// this one is mapped and holds the tile the compositor actually gave it —
+    /// so the grid asserted below is the compositor's and not the fallback,
+    /// and swapping the frame back behind readiness makes it the fallback
+    /// again.
     #[test]
-    fn td_term_completes_the_real_server_handshake_without_being_mapped() {
+    fn td_term_presents_a_frame_and_takes_the_grid_the_compositor_gave_it() {
         let stem = format!(
             "td-term-integration-{}-{}",
             std::process::id(),
@@ -4232,23 +4235,49 @@ mod tests {
         let keymap = test_keymap();
         let worker = thread::spawn(move || serve_client(server, 78, thread_runtime, keymap));
 
-        let (connection, size, xrgb) = crate::term_client::handshake_for_test(client).unwrap();
-        assert!(xrgb, "the real server never advertised XRGB8888");
+        let (connection, size, cells) =
+            crate::term_client::present_for_test(client, &std::env::temp_dir()).unwrap();
         let font = crate::font::pinned().unwrap();
+
+        // The tile this output gives one surface, not the client's own guess.
         assert_eq!(
             size,
-            crate::term_client::default_size(&font).unwrap(),
-            "an unmapped surface was configured to something other than the default"
+            crate::term_client::Size {
+                width: 592,
+                height: 352
+            }
         );
-        assert_eq!(crate::term_client::grid(size, &font).unwrap(), (24, 80));
-        // The premise, checked rather than asserted about one key: NOTHING is
-        // mapped. `surface_size` answers `None` for any key at all, so it
-        // cannot tell an unmapped surface from a made-up one; an empty layout
-        // can. A mapped terminal would put a view in here, and that view is
-        // what a second configure would come from.
+        assert_eq!(
+            runtime.lock().unwrap().surface_size(SurfaceKey {
+                client: 78,
+                object: 7,
+            }),
+            Some((592, 352))
+        );
+        assert_eq!(cells, crate::term_client::grid(size, &font).unwrap());
+        assert_eq!(cells, (22, 74));
+        assert_ne!(
+            cells,
+            crate::term_client::grid(crate::term_client::default_size(&font).unwrap(), &font)
+                .unwrap(),
+            "the terminal announced its fallback grid rather than the tile's"
+        );
+        // A frame that was released and presented is a frame that reached the
+        // framebuffer. Compared against the DESKTOP BACKGROUND, which is what
+        // every pixel held before the client connected — comparing against
+        // zero would pass on the bare desktop and prove nothing. These are
+        // MEMORY bytes, not an RGB literal: XRGB8888 is little-endian, so the
+        // blue channel comes first, as `scene`'s own desktop test spells it.
+        let painted = fs::read(&framebuffer_path).unwrap();
+        let foreign = painted
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .filter(|pixel| *pixel != &[0x30, 0x25, 0x20, 0])
+            .count();
         assert!(
-            runtime.lock().unwrap().layout_snapshot().is_empty(),
-            "a client that attached no buffer was mapped"
+            foreign >= 592 * 352,
+            "the presented frame covered {foreign} pixels, not the whole tile"
         );
 
         drop(connection);
