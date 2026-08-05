@@ -11778,3 +11778,193 @@ xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx$
 ## stdout-json: ""
 ## stderr-json: "sed: couldn't open file no\xffsuch: No such file or directory\n"
 ## status: 4
+
+# --- GNU's script READERS build C strings as its printer does, so a NUL ENDS
+# --- what they READ while the bytes after it are still CONSUMED. `read_label'
+# --- xstrdup's a NUL-terminated buffer (`:'/`b'/`t'/`T', and `v's version) and
+# --- `read_filename' takes strlen of one (`r'/`R'/`w'/`W' and the `s///w'
+# --- flag). Only a -f script can carry a NUL, argv being NUL-terminated.
+
+#### a NUL ENDS a label, so `b' jumps to the empty one -- the end of the script
+## argv: sed -f S
+## file-json S: "b\x00x\np\n"
+## stdin-json: "a\n"
+## stdout-json: "a\n"
+## stderr-json: ""
+## status: 0
+
+#### and `t' reads its label the same way
+## argv: sed -f S
+## file-json S: "t\x00x\np\n"
+## stdin-json: "a\n"
+## stdout-json: "a\na\n"
+## stderr-json: ""
+## status: 0
+
+#### `:' reading a NUL label has an EMPTY one, which it refuses
+## argv: sed -f S
+## file-json S: ":\x00x\n"
+## stdin-json: "a\n"
+## stdout-json: ""
+## stderr-json: "sed: file S line 1: \":\" lacks a label\n"
+## status: 1
+
+#### the definition and the branch agree on nothing, which is why this HUNG
+## argv: sed -f S
+## file-json S: ":\x00\nb\x00"
+## stdin-json: "a\nb\n"
+## stdout-json: ""
+## stderr-json: "sed: file S line 1: \":\" lacks a label\n"
+## status: 1
+
+#### a label both sides truncate the same way still RESOLVES
+## argv: sed -f S
+## file-json S: "ba\x00x\np\n:a\x00y\n"
+## stdin-json: "a\n"
+## stdout-json: "a\n"
+## stderr-json: ""
+## status: 0
+
+#### a label with no NUL is untouched
+## argv: sed -f S
+## file-json S: "bax\np\n:ax\n"
+## stdin-json: "a\n"
+## stdout-json: "a\n"
+## stderr-json: ""
+## status: 0
+
+#### `v' reads through the same reader, but its own compare stops at a NUL too
+## argv: sed -f S
+## file-json S: "v\x00x\np\n"
+## stdin-json: "a\n"
+## stdout-json: "a\na\n"
+## stderr-json: ""
+## status: 0
+
+#### a NUL ENDS a `w' filename, so the name is EMPTY and refused
+## argv: sed -f S
+## file-json S: "w \x00f\n"
+## stdin-json: "a\n"
+## stdout-json: ""
+## stderr-json: "sed: file S line 2: missing filename in r/R/w/W commands\n"
+## status: 1
+
+#### `r' names its file through the same reader
+## argv: sed -f S
+## file-json S: "r \x00f\n"
+## stdin-json: "a\n"
+## stdout-json: ""
+## stderr-json: "sed: file S line 2: missing filename in r/R/w/W commands\n"
+## status: 1
+
+#### `R' too
+## argv: sed -f S
+## file-json S: "R \x00f\n"
+## stdin-json: "a\n"
+## stdout-json: ""
+## stderr-json: "sed: file S line 2: missing filename in r/R/w/W commands\n"
+## status: 1
+
+#### and the `s///w' flag's filename
+## argv: sed -f S
+## file-json S: "s/a/X/w \x00f\n"
+## stdin-json: "a\n"
+## stdout-json: ""
+## stderr-json: "sed: file S line 2: missing filename in r/R/w/W commands\n"
+## status: 1
+
+#### a NUL after a name TRUNCATES it -- `w F\0G' writes to F
+## argv: sed -f S
+## file-json S: "w F\x00G\n"
+## stdin-json: "a\n"
+## stdout-json: "a\n"
+## stderr-json: ""
+## file-after-json F: "a\n"
+## status: 0
+
+#### a `w' name with no NUL is untouched
+## argv: sed -f S
+## file-json S: "w F\n"
+## stdin-json: "a\n"
+## stdout-json: "a\n"
+## stderr-json: ""
+## file-after-json F: "a\n"
+## status: 0
+
+#### `W' too, the last of the four filename commands
+## argv: sed -f S
+## file-json S: "W \x00f\n"
+## stdin-json: "a\n"
+## stdout-json: ""
+## stderr-json: "sed: file S line 2: missing filename in r/R/w/W commands\n"
+## status: 1
+
+#### a `W' name TRUNCATES at a NUL like the rest
+## argv: sed -f S
+## file-json S: "W F\x00G\n"
+## stdin-json: "a\n"
+## stdout-json: "a\n"
+## stderr-json: ""
+## file-after-json F: "a\n"
+## status: 0
+
+#### a label with TWO NULs ends at the FIRST, not at the last
+## argv: sed -f S
+## file-json S: "ba\x00b\x00c\np\n:a\x00z\n"
+## stdin-json: "a\n"
+## stdout-json: "a\n"
+## stderr-json: ""
+## status: 0
+
+#### and a filename with two NULs likewise
+## argv: sed -f S
+## file-json S: "w F\x00G\x00H\n"
+## stdin-json: "a\n"
+## stdout-json: "a\n"
+## stderr-json: ""
+## file-after-json F: "a\n"
+## status: 0
+
+#### `T' reads its label through that reader too
+## argv: sed -f S
+## file-json S: "T\x00x\np\n"
+## stdin-json: "a\n"
+## stdout-json: "a\n"
+## stderr-json: ""
+## status: 0
+
+#### a `T' label with TWO NULs ends at the first as well
+## argv: sed -f S
+## file-json S: "Ta\x00b\x00c\np\n:a\x00z\n"
+## stdin-json: "a\n"
+## stdout-json: "a\n"
+## stderr-json: ""
+## status: 0
+
+#### a NUL after an `r' name TRUNCATES it -- `r F\0G' reads F
+## argv: sed -f S
+## file-json S: "r F\x00G\n"
+## file-json F: "FILE\n"
+## stdin-json: "a\n"
+## stdout-json: "a\nFILE\n"
+## stderr-json: ""
+## status: 0
+
+#### `R' takes its one line from the truncated name too
+## argv: sed -f S
+## file-json S: "R F\x00G\n"
+## file-json F: "one\ntwo\n"
+## stdin-json: "a\nb\n"
+## stdout-json: "a\none\nb\ntwo\n"
+## stderr-json: ""
+## status: 0
+
+#### and the `s///w' flag writes to the truncated name
+## argv: sed -f S
+## file-json S: "s/a/X/w F\x00G\n"
+## file-json F: "OLD\n"
+## stdin-json: "a\n"
+## stdout-json: "X\n"
+## stderr-json: ""
+## file-after-json F: "X\n"
+## status: 0

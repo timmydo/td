@@ -771,7 +771,12 @@ impl ScriptParser<'_> {
         while !matches!(self.peek(), None | Some(b'\n' | b' ' | b'\t' | b';' | b'}' | b'#')) {
             self.pos += 1;
         }
-        self.src.get(start..self.pos).unwrap_or_default().to_vec()
+        // GNU's `read_label` NUL-terminates its buffer and `xstrdup`s it, so the
+        // label ENDS at a NUL the script put in it while the bytes after it are
+        // still CONSUMED: `b\0x` branches to the EMPTY label, which is the end of
+        // the script. Keeping the byte instead made `:\0` and `b\0` agree on a
+        // label neither GNU spelling has, and the script jump to itself for ever.
+        crate::util::cstr(self.src.get(start..self.pos).unwrap_or_default()).to_vec()
     }
 
     /// r/R/w/W and the `s///w` flag all take a file name to end of line. An
@@ -783,7 +788,10 @@ impl ScriptParser<'_> {
         // reads nothing and leaves that byte alone, so the empty-name refusal
         // below is already the right message at the right position. One that
         // could never fire would read as a handled case.
-        let name = self.rest_of_line();
+        // `read_filename` is a C string in GNU too, so a NUL ENDS the name --
+        // `w \0f` is the EMPTY one this refuses rather than a file nothing can
+        // open. Same rule as the label above and as the printer's `%s`.
+        let name = crate::util::cstr(&self.rest_of_line()).to_vec();
         if name.is_empty() {
             return Err("missing filename in r/R/w/W commands".to_string());
         }

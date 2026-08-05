@@ -1039,7 +1039,10 @@ td-txt-authored case files
     wrong answer, so it is recorded here even though no case can carry it -- the
     corpus would only see its 10s timeout. Pre-existing and a different axis (`r`/`R`
     open when they RUN, which is why the `w` work above does not touch it); a
-    reviewer's cross-product found it here.
+    reviewer's cross-product found it here. The NUL-truncation landing WIDENS what
+    reaches it without changing it: `R /dev/stdout\0X` used to be a name nothing
+    could open, so it passed through, and it now truncates to the name above and
+    hangs with it. Every spelling that truncates to one of these two is this entry.
 
   - An `r` of the file a `w` in the SAME run is writing. GNU's `w` output is
     stdio-buffered, so `sed -n -e 'w out' -e 'r out'` appends nothing while td-txt,
@@ -1203,34 +1206,6 @@ td-txt-authored case files
     carries bytes, a `%s` that stops at a NUL -- is in place, so closing the rest
     is a sweep of call sites and not a second mechanism. Predates the branch.
 
-  - A NUL inside an `r`/`R`/`w`/`W` filename, which only a `-f` script can carry:
-    GNU builds a C string from it, so `printf '1r\0F\n' > s; sed -f s A` truncates
-    the name to empty and refuses with `missing filename in r/R/w/W commands` at
-    exit 1. td-txt keeps the byte, so the open silently fails and the read is
-    silently empty at exit 0. Fail-OPEN and predates the branch (`1r` and `0r`
-    behave alike), but worth recording because the address-0 landing made the
-    `0r` spelling REACH it: before, `0r` was refused for its address and happened
-    to exit 1 like GNU, for an unrelated reason. The `w` half of it CHANGED
-    wording when the printer learned GNU's `%s`: it said `couldn't open file
-    \0f: file name contained an unexpected NUL byte` and now stops at the NUL,
-    `couldn't open file `. Neither is GNU's, both exit 4, and the message is
-    now the shape GNU's printer would give -- the divergence that remains is
-    the READER, which is what the entry below is about.
-
-  - GNU's script READERS build C strings too, so a NUL ends what they read --
-    a different mechanism from the printer's `%s`, and the one still open. Three
-    faces, all predating the branch. A LABEL stops at the NUL, so `b\0x` is a
-    branch to the empty label, which is the end of the script: GNU exits 0 in
-    silence where td-txt keeps the byte and refuses, `can't operate on label` at
-    exit 4 (`t\0` alike). A `:` reading an empty label is `":" lacks a label` at
-    exit 1, where td-txt takes `\0` as the label. And those two shapes MEET in
-    `printf ':\0\nb\0' > s; sed -f s`, which HANGS here on any non-empty input:
-    both the definition and the branch keep the byte, so they agree, and the
-    script jumps to itself for ever. A hang rather than a wrong answer, and the
-    only one on this list beside `R /dev/stdin`. The `r`/`R`/`w`/`W` filename
-    entry above is the fourth face of the same reader rule, which is why closing
-    this is one landing and not four.
-
   - `-V` is an option GNU sed still TAKES, with an argument, and td-txt refuses.
     GNU's getopt string carries it (the obsolete `--version` spelling) but its
     switch has no arm for it, so `sed -V x -n -e p` consumes the `x`, falls to
@@ -1273,7 +1248,12 @@ td-txt-authored case files
 
   - `sed -e '1a\<newline>foo' -e 'bar'` is `can't find label for jump to `ar''
     in GNU and `can't operate on label `ar'` here -- the same refusal, worded
-    differently. Both modes, predates the branch.
+    differently. Both modes, predates the branch. It is also a different
+    LABEL once a script leaves SEVERAL unresolved: GNU names the last and
+    td-txt the first, so `ba;bb;bc` is `c' there and `a' here, and reversing
+    the script reverses both answers. Recorded by a review of the
+    reader-truncation landing, whose sweeps kept surfacing this pair -- the
+    wording had been the only half written down.
 
   - Two divergences a sweep of every command letter x {bare, addressed,
     ranged} x {flag, no flag} turned up, none of them about `--posix` and both
