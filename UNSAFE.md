@@ -391,7 +391,39 @@ does is RETURN THE PREVIOUS MASK, and both wrappers are built out of that.
 Reading is a set-and-restore (`umask(0)` then put it back), because there
 is no reading syscall; and `umask_set` proves its own effect by asking for
 the same mask a second time, which changes nothing and returns what the
-first call left. That readback is not ceremony: nothing observable
+first call left. That dance now happens EXACTLY ONCE, from `main` before
+the shell runs anything, and every later READ answers from the shell's own
+record. The window it opens is the reason: for the two instructions
+between clearing the mask and putting it back the process has none at all,
+which was unobservable while the shell was the only thing running and
+stopped being so when pipeline stages began to stream concurrently — a
+sibling stage creating a file in that window gets it world-writable, and
+nothing about the file says why. `umask_set` holds that record across its
+own install-and-readback for the same reason, or two stages setting a mask
+interleave and each reads back the OTHER's.
+
+What that does NOT close, and must not be read as closing, is a stage that
+SETS a mask. `umask(2)` is per-PROCESS and a pipeline's stages are threads
+of one, so `{ umask 000; … } | { …; : > f; }` really does create that file
+world-writable — a window the length of a stage rather than of two
+instructions, in the same direction and with the same consequence. It is
+bounded to the pipeline (the mask is restored after) and it is a
+divergence from every forking shell, which gives each stage its own. Real
+isolation needs the mask applied per stage at each file creation, or
+stages in processes of their own; neither is here, and the record above
+is only sound for the read.
+
+A stage that sets NONE is a different matter and is closed. Every clone
+captured the mask and put it back when it ended, which is invisible while
+subshells run one at a time and is a stage reaching into a SIBLING's
+lifetime once they do not: `umask 022; { umask 077; sleep .2; : >a; } |
+sleep .1` created `a` as 0644, because the right-hand stage — which asked
+for nothing — restored 022 between the left one's `umask` and its file.
+So a clone now restores only a mask it actually CHANGED. The direction is
+why it is not merely untidy: the file comes out more permissive than the
+stage that created it asked for, and nothing about the file says so.
+
+That readback is not ceremony: nothing observable
 distinguishes a mask that did not take, since the wrong bits surface later
 as a file created with permissions nobody asked for — the same argument
 that made `losetup` re-read its read-only flag out of sysfs. It earned its
@@ -414,6 +446,27 @@ catching half stays deferred, and `trap 'action' SIG` therefore asks for
 `SIG_DFL` — honest about the shell dying on the signal rather than
 pretending an action is waiting to run.
 
+Inside a PIPELINE that install is deferred to the spawn rather than made
+when `trap` runs, because a disposition is one cell the concurrent stages
+share: a stage that installed its ignore would hand it to whatever a
+SIBLING spawned at that instant, and — since each stage restores what it
+SAW — two stages touching the same signal leave the parent holding one
+forever, outliving the pipeline that caused it. So a stage records the
+ignore and `spawn_uninherited` installs the SPAWNING stage's own intent
+for as long as it takes to create the child, which is the only moment a
+disposition is read. Nothing about `trap ''` reaching a script's children
+changes; what a stage gives up is protecting ITSELF from the signal,
+which a pipeline already gave up to the guard exemption below, for the
+same reason. The set installed is the stage's whole ignore roster and not
+just the two the guard moves, so `trap '' TERM` in a stage reaches its
+children as bash's does; it also covers every signal the shell has
+INSTALLED an ignore for, which the trap table alone cannot name — a stage
+that CLEARS its parent's `trap '' TERM` no longer mentions TERM, while
+the process is still holding it, and the child would inherit an ignore
+the stage asked to be rid of. SIGCHLD is refused there as it is
+everywhere, since ignoring it is POSIX's request to AUTO-REAP and would
+cost the very status the spawn is about to wait for.
+
 Three things confine the new syscall beyond its two-armed argument.
 FIRST, it is disposition-only in the STRUCT as well as the type: `install`
 writes `[handler, 0, 0, 0]` — `sa_flags` 0 (so no `SA_RESTORER`, no
@@ -430,7 +483,13 @@ defaults on kills the shell at the moment the script was written to
 survive it. THIRD, td-sh only ever changes a signal it found at `SIG_DFL`,
 asked ONCE per signal and cached (dash's `sigmode`, and for dash's reason:
 after the first change the process can no longer be asked what it started
-with). `execve` resets every caught signal to default, so a non-default
+with). Every signal is asked at STARTUP rather than on first use, because
+lazily is too late once stages run at once: a sibling's guard is an
+ignore, and so is the one a sibling's spawn installs for the length of a
+`fork`, and a stage resolving a signal inside either window would cache
+POSIX's never-touch-this for a signal that started at the default — and a
+cache is answered once and kept. `execve` resets every caught signal to
+default, so a non-default
 answer on first touch was installed by someone else — a parent that
 ignored it, which is POSIX's rule that a signal ignored on entry cannot be
 trapped or reset and is what makes `nohup` stick, or Rust's own runtime,
@@ -546,7 +605,25 @@ which is what dash does without job control too, and what job control is
 the fix for. Ctrl-C while a command is RUNNING is the other half, and
 `rt_sigaction` serves it too: the shell ignores SIGINT and SIGQUIT for
 exactly as long as it waits, so the driver's signal ends the command and
-leaves the shell. Both of them, because Ctrl-\ reaches the shell exactly
+leaves the shell. NOT inside a pipeline, though, and that exception is
+load-bearing: stages are threads of one process, so a guard taken by the
+stage waiting on `cat` covers the stage running `while :; do :; done` as
+well — and that one can only ever be stopped by a signal. The pipeline
+became unkillable with no in-band way out, which is strictly worse than
+the death the guard replaces. So a pipeline is not covered, which is also
+what `bash --posix` does with one — for a signal delivered to the process
+GROUP, which is what the terminal driver sends and what the Ctrl-C above
+means. For one aimed at the SHELL ALONE bash does not agree, and that
+half is a real cost of the exemption rather than a tie: `sleep 1 | cat;
+echo AFTER` under `kill -INT <shell>` prints `AFTER` under bash and
+exits 130 here, where td-sh survived it before stages streamed. Any
+supervisor that signals a shell by pid sees it, so it is not only the
+interactive case. Closing it needs the same thing the rest of this
+paragraph needs — somewhere to RECORD a signal, or stages in processes
+of their own — since what the exemption gives up is the shell's own
+protection for exactly as long as a pipeline runs.
+
+Both of them, because Ctrl-\ reaches the shell exactly
 as Ctrl-C does and a shell that survived one and died on the other would
 be a coin toss from the keyboard. The ignore is taken AFTER the child
 exists, which is what keeps the child interruptible — a disposition is
@@ -570,7 +647,11 @@ itself as if by the terminal: this shell has no `kill` builtin — sending a
 signal would need `kill(2)`, which is not on this surface — so `kill` is
 an external command, always inside the guard, and the signal it sends to
 the shell arrives on an ignored disposition and is discarded. `sh -c 'kill
--INT $$; echo alive'` prints `alive` here where dash and bash report 130.
+-INT $$; echo alive'` prints `alive` here where dash and bash report 130
+— OUTSIDE a pipeline, that is. Inside one no guard is held, so
+`{ kill -INT $$; echo alive; } | cat` is the opposite failure and the
+shell dies of the signal where bash prints `alive`. The two are the same
+missing handler seen from either side.
 `kill -QUIT $$` matches them, since SIGQUIT infers nothing either way.
 Both are inherent to installing none, since a
 shell that ignored the signal while doing its own work would lose the

@@ -3,14 +3,16 @@
 //!
 //! The shell keeps its OWN file-descriptor table (`Fds`) rather than dup2'ing
 //! real kernel descriptors, because `std` exposes no `dup2`/`fork` and the
-//! crate's one `unsafe` surface is `sys.rs`'s two syscalls -- `umask(2)` and a
-//! disposition-only `rt_sigaction(2)` -- and nothing else.
+//! crate's one `unsafe` surface is `sys.rs`'s three syscalls -- `umask(2)`, a
+//! disposition-only `rt_sigaction(2)`, and `ioctl(2)` -- and nothing else.
 //! Builtins and shell functions read and write through
 //! this table; only when an *external* program runs is the table translated into
-//! `std::process::Command` stdio. Pipelines between builtins are run stage by
-//! stage with the previous stage's output buffered as the next stage's input —
-//! correct for every finite producer, which is the whole seed corpus and the
-//! overwhelming majority of scripts. True concurrent pipes are a later refinement.
+//! `std::process::Command` stdio. A pipeline's stages run CONCURRENTLY, on
+//! threads joined by real `std::io::pipe` descriptors, so a consumer runs while
+//! its producer does and an infinite producer is bounded by the pipe rather than
+//! by memory. That is also what makes every piece of PROCESS-global state below
+//! -- the umask, signal dispositions, the interrupt guard -- something stages
+//! share rather than own.
 //!
 //! The virtual table is why `exec cmd` hands the child only descriptors 0/1/2:
 //! passing a higher one across an `execve` needs a `pre_exec` `dup2` (unsafe) or a
@@ -21,6 +23,7 @@
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{Cursor, Read, Write};
+use std::os::fd::OwnedFd;
 use std::os::unix::process::ExitStatusExt;
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
@@ -36,6 +39,11 @@ pub enum Fd {
     /// The process's real stdin/stdout/stderr (0/1/2).
     Inherit(u8),
     File(Arc<Mutex<File>>),
+    /// A PIPE end, which is a `File` in every respect but one: a read on it can
+    /// BLOCK. That is the whole reason it is a variant of its own — `read_ready`
+    /// must answer "cannot tell" for it rather than "yes", or `read -t` reports
+    /// a timeout that has not happened and blocks past one that has.
+    Pipe(Arc<Mutex<File>>),
     ReadBuf(Arc<Mutex<Cursor<Vec<u8>>>>),
     WriteBuf(Arc<Mutex<Vec<u8>>>),
     Null,
@@ -70,7 +78,7 @@ impl Fds {
             Some(Fd::Inherit(1)) => std::io::stdout().is_terminal(),
             Some(Fd::Inherit(2)) => std::io::stderr().is_terminal(),
             // An opened `/dev/tty` is one too, which `read -p` turns on.
-            Some(Fd::File(f)) => f.lock().is_ok_and(|g| g.is_terminal()),
+            Some(Fd::File(f)) | Some(Fd::Pipe(f)) => f.lock().is_ok_and(|g| g.is_terminal()),
             _ => false,
         }
     }
@@ -117,7 +125,7 @@ pub fn write_target(target: Option<&Fd>, bytes: &[u8]) -> std::io::Result<()> {
             lock.write_all(bytes)?;
             lock.flush()
         }
-        Some(Fd::File(f)) => lock_write(f, bytes),
+        Some(Fd::File(f)) | Some(Fd::Pipe(f)) => lock_write(f, bytes),
         Some(Fd::WriteBuf(b)) => {
             if let Ok(mut v) = b.lock() {
                 v.extend_from_slice(bytes);
@@ -150,7 +158,7 @@ pub fn read_byte(sh: &Shell, fd: u32) -> std::io::Result<Option<u8>> {
             let mut lock = stdin.lock();
             lock.read(&mut one)?
         }
-        Some(Fd::File(f)) => {
+        Some(Fd::File(f)) | Some(Fd::Pipe(f)) => {
             let mut file = f
                 .lock()
                 .map_err(|_| std::io::Error::other("poisoned file"))?;
@@ -184,10 +192,20 @@ pub fn read_byte(sh: &Shell, fd: u32) -> std::io::Result<Option<u8>> {
 pub fn read_ready(sh: &Shell, fd: u32) -> Option<bool> {
     match sh.fds.get(fd) {
         // Everything td-sh's own table holds is ready; only what it inherited
-        // from the host can block.
+        // from the host can block. `Fd::File` overstates that for a file that is
+        // not a regular one -- a FIFO, a socket, an opened terminal -- where a
+        // read blocks exactly as a pipe's does and this still answers "ready":
+        // `exec 3<>fifo; read -t 1 x <&3` hangs where bash reports 142. Older
+        // than the streaming pipeline and not fixed by it, because the answer is
+        // the same `poll(2)` the variant below is waiting for.
         Some(Fd::Null) | Some(Fd::File(_)) | Some(Fd::ReadBuf(_)) | Some(Fd::Closed)
         | Some(Fd::WriteBuf(_)) | None => Some(true),
-        Some(Fd::Inherit(_)) => None,
+        // A pipe is the inherited descriptor's case arriving inside the shell's
+        // own table: the writer is a SIBLING STAGE, so whether a read would block
+        // is a question about another thread's progress and only `poll(2)` — not
+        // on this surface — can answer it. Saying "ready" here made `read -t 0.1`
+        // wait two seconds for `{ sleep 2; echo x; } | …` and then report success.
+        Some(Fd::Inherit(_)) | Some(Fd::Pipe(_)) => None,
     }
 }
 
@@ -363,11 +381,34 @@ fn open_file(sh: &mut Shell, r: &Redir, opts: &OpenOptions) -> R<Result<Fd, ()>>
     }
 }
 
+/// Why a stage did not simply return a status.
+enum StageError {
+    /// The interrupt that ended it, carried back to be re-raised on the joining
+    /// thread where the enclosing shell's own disposition decides.
+    Interrupted(i32),
+    /// The OS refused a thread for it, so this stage never ran at all.
+    Unstarted(String),
+}
+
 /// Whether the shell ASKING would itself have died of an interrupt. That is what
 /// decides both raising one from a dead child and letting one out of a clone:
 /// under `trap '' INT`, or a SIGINT ignored on entry, the signal would have done
 /// nothing to this process and there is no death to stand in for.
 fn dies_of_interrupt() -> bool {
+    // A CONCURRENT stage may be holding the guard, and the guard's whole job is
+    // to make the answer `Ignore` -- so asking the kernel while one is standing
+    // reads this shell as uninterruptible when it is merely busy, and a Ctrl-C
+    // during a pipeline would abort nothing. What the guard SAVED is the honest
+    // answer: it only ever takes a signal it found at `Default`.
+    if let Ok(g) = GUARD.lock() {
+        if g.depth > 0 {
+            // By POSITION in `HELD`, not by index 0: SIGINT happens to be first
+            // today, and a signal prepended to that roster would otherwise
+            // silently answer this question with SIGQUIT's disposition.
+            let at = HELD.iter().position(|s| *s == SIGINT);
+            return at.and_then(|i| g.restore.get(i).copied()).unwrap_or(false);
+        }
+    }
     matches!(
         crate::sys::signal_get(SIGINT),
         Ok(Some(crate::sys::Disposition::Default))
@@ -400,49 +441,153 @@ pub(crate) fn leave_clone(sh: &mut Shell, clone: Subshell, code: i32) -> R<()> {
 /// Every stage runs in its OWN subshell environment (a `fork_shell` clone), so a
 /// stage's assignments, `cd`, `exit`, `break`/`continue`/`return`, and option
 /// changes affect neither the parent shell nor a sibling stage — matching POSIX,
-/// which specifies each pipeline command in a separate environment. Stages are
-/// still run sequentially with the producer's output fully buffered before the
-/// consumer starts (correct for every finite producer; true concurrent streaming
-/// is a later refinement — see the module header).
+/// which specifies each pipeline command in a separate environment.
+///
+/// Stages run CONCURRENTLY, joined by real `std::io::pipe` descriptors. The
+/// producer no longer runs to completion into a `Vec` first, which was correct
+/// for every FINITE producer and pathological for the two shapes an operator
+/// most often types: `cat /dev/zero | head -c 1` grew a buffer until the machine
+/// died, and `tail -f log | grep x` never reached `grep` at all. A pipe is a
+/// fixed kernel buffer, so the first is now bounded and ends when `head` closes
+/// its end, and the second streams.
+///
+/// A pipe end is a `File` in the table like any other, which is what makes this
+/// small: an external command already receives a `File` entry as a real
+/// descriptor (`stdio_for`), so a stage that IS one now reads and writes the
+/// pipe directly with no copy through the shell at all. `PipeReader`/
+/// `PipeWriter` convert through `OwnedFd` with no `unsafe`, which is why the
+/// module header lists concurrent pipelines as a refinement rather than a
+/// syscall question. It is a VARIANT of its own (`Fd::Pipe`) for the single
+/// respect in which a pipe is not a file — a read on it can block — which is
+/// `read_ready`'s question and nothing else's.
+///
+/// Threads rather than forks, since these stages are in-process clones: the
+/// scope is what lets a stage borrow the `Cmd` it runs, and the shell state is
+/// `Send` — asserted in `shell_state_can_cross_a_thread` rather than left to
+/// `scope` to infer, so a field that quietly stops being `Send` names itself
+/// here instead of somewhere downstream.
+///
+/// Everything PROCESS-GLOBAL is where threads-not-processes shows, and each is
+/// handled at its own site: the interrupt guard is not a stage's to take, a
+/// spawn installs the spawning stage's own signal intent, and a stage that sets
+/// a umask still sets the whole process's for as long as it runs.
+///
+/// What a stage's own copy of a pipe end costs: the descriptor stays open until
+/// the STAGE ends, not until the external command inside it exits. So
+/// `cat /dev/zero | { head -c 1; sleep 100; }` leaves `cat` blocked on a full
+/// pipe for the sleep, where a forking shell would have SIGPIPEd it at once.
+/// Bounded and idle rather than unbounded and growing, which is the trade this
+/// makes; closing it properly needs the stage to drop the ends it handed over,
+/// and that is a redirection-restore question rather than a pipeline one.
 pub fn run_pipeline(sh: &mut Shell, cmds: &[Cmd]) -> R<()> {
-    let mut input: Option<Vec<u8>> = None;
-    let last = cmds.len().saturating_sub(1);
-    let mut last_status = 0;
-    for (i, cmd) in cmds.iter().enumerate() {
-        let is_last = i == last;
-        let mut stage = fork_shell(sh);
-
-        // Feed the previous stage's output in as this stage's stdin.
-        if let Some(bytes) = input.take() {
+    let mut stages: Vec<Subshell> = cmds
+        .iter()
+        .map(|_| {
+            let mut stage = fork_shell(sh);
+            stage.in_pipeline = true;
             stage
-                .fds
-                .set(0, Fd::ReadBuf(Arc::new(Mutex::new(Cursor::new(bytes)))));
+        })
+        .collect();
+    // Wire junction i: stage i's stdout to the write end, stage i+1's stdin to
+    // the read end. The PARENT is deliberately given neither -- a copy there
+    // would hold the pipe open after the producing stage ended, and the reader
+    // would never see EOF.
+    for i in 0..stages.len().saturating_sub(1) {
+        let (r, w) = match std::io::pipe() {
+            Ok(ends) => ends,
+            Err(e) => return Err(sh.fatal(&format!("cannot create pipe: {e}"), 1)),
+        };
+        if let Some(stage) = stages.get_mut(i) {
+            stage.fds.set(1, Fd::Pipe(Arc::new(Mutex::new(File::from(OwnedFd::from(w))))));
         }
-        // Capture stdout unless this is the final stage, which keeps the parent's
-        // real destination (inherited by the clone).
-        let capture = if is_last {
-            None
-        } else {
-            let buf = Arc::new(Mutex::new(Vec::new()));
-            stage.fds.set(1, Fd::WriteBuf(buf.clone()));
-            Some(buf)
-        };
+        if let Some(stage) = stages.get_mut(i + 1) {
+            stage.fds.set(0, Fd::Pipe(Arc::new(Mutex::new(File::from(OwnedFd::from(r))))));
+        }
+    }
 
-        // A non-local transfer (`exit`, break/continue/return) is confined to the
-        // stage's subshell; only its exit status survives.
-        last_status = match exec::run_command(&mut stage, cmd) {
-            Ok(()) => stage.status,
-            Err(Sig::Exit(code) | Sig::Abort(code)) => code,
-            // ...but not an interrupt: the terminal signalled the whole
-            // foreground group, so a FORKED stage would have died of it. It
-            // does not even reach the stage's EXIT trap, because a stage killed
-            // by a signal never reaches one.
-            Err(Sig::Interrupt(code)) => return leave_clone(sh, stage, code),
-            Err(_) => stage.status,
-        };
-        last_status = exec::run_exit_trap(&mut stage, last_status);
+    // Each stage answers with its status, or with the interrupt that ended it.
+    let outcomes: Vec<Result<i32, StageError>> = std::thread::scope(|scope| {
+        let handles: Vec<_> = stages
+            .into_iter()
+            .zip(cmds)
+            .map(|(stage, cmd)| {
+                // `Builder`, not `Scope::spawn`, because that one PANICS when the
+                // OS cannot make a thread — and pipeline length is whatever the
+                // operator typed, so a low thread limit would abort the shell
+                // where a diagnostic belongs. This crate does not panic on an
+                // error path.
+                std::thread::Builder::new().spawn_scoped(scope, move || {
+                    let mut stage = stage;
+                    // A non-local transfer (`exit`, break/continue/return) is
+                    // confined to the stage's subshell; only its status
+                    // survives. An interrupt is not -- it is carried back and
+                    // re-raised on the joining thread, where the enclosing
+                    // shell's own disposition is what decides.
+                    let status = match exec::run_command(&mut stage, cmd) {
+                        Ok(()) => stage.status,
+                        Err(Sig::Exit(code) | Sig::Abort(code)) => code,
+                        // A stage killed by a signal never reaches an EXIT trap,
+                        // so this returns before `run_exit_trap` rather than
+                        // through it.
+                        Err(Sig::Interrupt(code)) => {
+                            return Err(StageError::Interrupted(code))
+                        }
+                        Err(_) => stage.status,
+                    };
+                    Ok(exec::run_exit_trap(&mut stage, status))
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| match h {
+                // A thread that could not START is the stage failing to run at
+                // all: 126, the status this shell already gives a command it
+                // could not execute. Reported, not just counted -- a middle
+                // stage that never ran leaves the consumer reading an immediate
+                // EOF, which is indistinguishable from a producer with nothing
+                // to say, so the pipeline would otherwise report SUCCESS for a
+                // command that never happened.
+                Err(e) => Err(StageError::Unstarted(e.to_string())),
+                Ok(handle) => handle.join().unwrap_or(Err(StageError::Interrupted(128))),
+            })
+            .collect()
+    });
 
-        input = capture.and_then(|buf| buf.lock().ok().map(|v| v.clone()));
+    // A stage that never started is the shell failing, not the pipeline
+    // reporting: say so, and let 126 stand as the status however the last stage
+    // ended.
+    let mut unstarted = false;
+    for outcome in &outcomes {
+        if let Err(StageError::Unstarted(e)) = outcome {
+            let _ = exec::write_stderr(sh, &format!("td-sh: pipeline stage did not start: {e}"));
+            unstarted = true;
+        }
+    }
+    // UNWINDS rather than returning a status, exactly as a pipe this could not
+    // create does. A status would be `!`'s to negate, and `! cmd | cmd` turning
+    // the shell's own inability to run the pipeline into SUCCESS is the one
+    // answer a caller must never get. Reported above, one line per stage.
+    if unstarted {
+        return Err(Sig::Abort(126));
+    }
+
+    // The pipeline's status is the LAST stage's (POSIX). An interrupt anywhere
+    // in it ends the pipeline, and is asked the same boundary question every
+    // other clone is -- once, out here, with every stage's clone already
+    // dropped and its dispositions back.
+    let interrupted = outcomes.iter().find_map(|o| match o {
+        Err(StageError::Interrupted(code)) => Some(*code),
+        _ => None,
+    });
+    let last_status = outcomes.last().map_or(0, |o| match o {
+        Ok(code) | Err(StageError::Interrupted(code)) => *code,
+        Err(StageError::Unstarted(_)) => 126,
+    });
+    if let Some(code) = interrupted {
+        if dies_of_interrupt() {
+            return Err(Sig::Interrupt(code));
+        }
     }
     sh.set_status(last_status);
     Ok(())
@@ -503,11 +648,21 @@ pub fn run_subshell(sh: &mut Shell, body: &List, redirs: &[Redir]) -> R<()> {
 /// signal landing INSIDE the guard with nothing left to die of it is lost
 /// outright, for the same reason: there is nowhere to record that it arrived.
 ///
-/// It is also safe only because nothing here runs two commands at once: pipeline
-/// stages are sequential with the producer buffered, and an async list is an
-/// in-process subshell run to completion. A disposition is PROCESS-global, so two
-/// live guards would restore over each other and hand a later child an inherited
-/// ignore. Concurrent pipelines would have to reference-count this.
+/// A disposition is PROCESS-global, so the guard is REFERENCE-COUNTED rather than
+/// per-command: the outermost holder takes it, the last one out puts it back,
+/// and `dies_of_interrupt` reads what was SAVED rather than the kernel, since a
+/// standing guard would have the kernel say this shell ignores SIGINT when it is
+/// only busy.
+///
+/// Today nothing reaches a second `hold`, and saying otherwise would be the
+/// second wrong claim about this mechanism. `hold` returns early for a pipeline
+/// stage BEFORE touching the count, `fork_shell` carries `in_pipeline` into
+/// every nested shell of one, and the sole non-test caller is `exec_external`,
+/// between whose `hold` and drop no shell code runs. So the depth is 0 or 1 and
+/// the saved-answer branch is unreachable outside tests. It is kept because the
+/// property it enforces is what a SECOND caller would need and cannot be seen to
+/// be missing from the call site that adds one — not because it fixes a live
+/// failure.
 ///
 /// A signal IGNORED ON ENTRY is left alone: POSIX says the shell cannot reset one,
 /// `may_set_signal` is what remembers that, and a shell that already ignores
@@ -518,14 +673,148 @@ pub fn run_subshell(sh: &mut Shell, body: &List, redirs: &[Redir]) -> R<()> {
 /// `TIOCSPGRP` ioctl, which is an amendment to `UNSAFE.md` rather than a use of
 /// what is already there.
 pub(crate) struct InterruptibleChild {
-    /// One flag per signal in `HELD`: whether THIS guard is what installed the
-    /// ignore, and so what has to take it back off. An array rather than a list
-    /// because the roster is fixed and this runs once per external command.
+    /// Whether this guard holds a REFERENCE, and so owes one back. What was
+    /// actually installed lives in `GUARD` rather than here: the dispositions
+    /// are process-global, so with concurrent stages the record of what to put
+    /// back has to be too.
+    held: bool,
+}
+
+/// Spawn a child that does NOT inherit the interrupt guard's ignore.
+///
+/// A disposition is copied when a process is CREATED, and with pipeline stages
+/// running at once one stage's guard is up while a SIBLING spawns. That child
+/// would be created holding `SIG_IGN` and no keystroke could reach it: measured
+/// as `/bin/sh -c 'echo go; sleep 10' | { read x; sleep 10; }` surviving a group
+/// SIGINT outright, where every other shell dies. It is the same
+/// uninterruptible-command failure the guard's ORDER was chosen to avoid,
+/// arriving by the one route ordering cannot close — the guard is not this
+/// stage's.
+///
+/// A sibling's `trap '' INT` is the same bug by another route: that one really
+/// does change the process, and stage two's child inherits an ignore stage two
+/// never asked for -- `{ trap '' INT; echo go; sleep .4; } | { read x; sleep
+/// 10; }` hung outright.
+///
+/// So rather than undoing the guard specifically, the spawn installs what THIS
+/// shell wants its child to have and puts the process state back after, under
+/// the guard's own lock so two stages cannot interleave here. That is POSIX's
+/// rule stated directly — a signal this shell ignores is inherited ignored, so
+/// `trap '' INT; cmd` still works, and everything else is default — and it
+/// covers the guard and a sibling's trap with one rule instead of two.
+///
+/// The signals considered are `HELD`, every one the trap table marks IGNORED,
+/// and every one this shell has actually INSTALLED an ignore for — which are the
+/// only three ways the process can be holding a disposition that is not this
+/// stage's intent. The third is not implied by the first two: a stage records a
+/// trap without installing it, so `trap '' TERM; { trap - TERM; cmd; } | …`
+/// leaves the process ignoring TERM while the stage's table no longer mentions
+/// it, and the child would inherit an ignore the stage asked to be rid of. Every
+/// other signal wants `SIG_DFL`, which is what an untouched one already is.
+///
+/// Over-approximating the set is safe and under-approximating is not, because
+/// every candidate is compared against the kernel before anything is issued: a
+/// signal already where this stage wants it costs one query and no change.
+///
+/// A signal that is not the shell's to move is skipped rather than asked for,
+/// which is what keeps `trap '' CHLD` from auto-reaping the child whose status
+/// this is about to wait for. `signal_get` answering `None` for a
+/// handler-bearing signal is the second half of that: Rust's own SEGV/BUS
+/// handlers cannot be replaced by this loop even briefly.
+///
+/// The shell is briefly exposed while this window is open, which is the same
+/// exposure the guard already documents between commands rather than a new one.
+fn spawn_uninherited(sh: &mut Shell, cmd: &mut Command) -> std::io::Result<std::process::Child> {
+    // What THIS shell wants its child to have, which is POSIX's rule: a signal
+    // it ignores is inherited ignored, and everything else is default -- a
+    // trapped signal included, since the handler is the shell's and the child
+    // has none.
+    let touched: Vec<u8> = sh
+        .traps
+        .iter()
+        .filter(|(_, action)| action.is_empty())
+        .map(|(sig, _)| *sig)
+        .chain(sh.sig_installed.iter().copied())
+        .filter(|sig| !HELD.contains(sig))
+        .collect();
+    let mut want: Vec<(u8, crate::sys::Disposition)> = Vec::with_capacity(HELD.len() + touched.len());
+    for sig in HELD.iter().copied().chain(touched) {
+        if want.iter().any(|(s, _)| *s == sig) || !crate::builtin::may_install(sh, sig) {
+            continue;
+        }
+        want.push(if sh.traps.get(&sig).is_some_and(String::is_empty) {
+            (sig, crate::sys::Disposition::Ignore)
+        } else {
+            (sig, crate::sys::Disposition::Default)
+        });
+    }
+
+    // Under the guard's lock, so two stages cannot interleave here and neither
+    // can race a guard being taken or given back.
+    let Ok(_guard) = GUARD.lock() else {
+        return cmd.spawn();
+    };
+    let mut saved = Vec::with_capacity(want.len());
+    for (sig, want) in &want {
+        match crate::sys::signal_get(*sig) {
+            Ok(Some(now)) if now != *want && crate::sys::signal_set(*sig, *want).is_ok() => {
+                saved.push((*sig, now));
+            }
+            _ => {}
+        }
+    }
+    let spawned = cmd.spawn();
+    for (sig, was) in saved {
+        let _ = crate::sys::signal_set(sig, was);
+    }
+    spawned
+}
+
+/// The guard's process-global state, because the dispositions it moves are.
+///
+/// Pipeline stages run concurrently now, so two of them can be waiting on an
+/// external command at once. Each taking and restoring the disposition
+/// independently would have the FIRST to finish hand `SIG_DFL` back while the
+/// second is still waiting — and the second's child, spawned after that, would
+/// inherit it. The outermost holder takes it and the last one out puts it back.
+struct GuardState {
+    depth: u32,
     restore: [bool; HELD.len()],
 }
 
+static GUARD: Mutex<GuardState> = Mutex::new(GuardState {
+    depth: 0,
+    restore: [false; HELD.len()],
+});
+
 impl InterruptibleChild {
     pub(crate) fn hold(sh: &mut Shell) -> Self {
+        // NOT inside a pipeline. A disposition is process-global and a pipeline's
+        // stages are threads of one process, so a guard taken by the stage
+        // running `cat` covers the stage running `while :; do :; done` as well —
+        // and that one can only ever be stopped by a signal. The result was a
+        // pipeline nothing could interrupt and no in-band way out of it, which is
+        // strictly worse than the death this guard replaces: `while :; do :;
+        // done | cat` needed a SIGKILL from another terminal.
+        //
+        // So a pipeline is simply not covered, which is what `bash --posix` does
+        // too — it dies of the signal on every one of those shapes, as this shell
+        // did before pipelines streamed. Covering it properly means either a
+        // handler to record the signal with (the `SA_RESTORER` amendment) or
+        // stages in processes of their own; neither is bought here, and pretending
+        // otherwise costs the operator their only escape.
+        if sh.in_pipeline {
+            return Self { held: false };
+        }
+        let Ok(mut guard) = GUARD.lock() else {
+            return Self { held: false };
+        };
+        if guard.depth > 0 {
+            // Already standing: the dispositions are what the outermost holder
+            // made them, and this stage adds only a reference.
+            guard.depth = guard.depth.saturating_add(1);
+            return Self { held: true };
+        }
         let mut restore = [false; HELD.len()];
         for (slot, sig) in restore.iter_mut().zip(HELD) {
             // Not the shell's to change if someone handed it an ignore -- and
@@ -557,15 +846,32 @@ impl InterruptibleChild {
             // it was, which is the behaviour this replaces rather than a new one.
             *slot = crate::sys::signal_set(sig, crate::sys::Disposition::Ignore).is_ok();
         }
-        Self { restore }
+        guard.restore = restore;
+        guard.depth = 1;
+        Self { held: true }
     }
 }
 
 impl Drop for InterruptibleChild {
     fn drop(&mut self) {
-        for (taken, sig) in self.restore.iter().zip(HELD) {
+        if !self.held {
+            return;
+        }
+        let Ok(mut guard) = GUARD.lock() else {
+            return;
+        };
+        guard.depth = guard.depth.saturating_sub(1);
+        // Not the LAST one out: another stage is still waiting on a child, and
+        // handing the disposition back now would leave that one exposed and its
+        // next child holding an inherited default.
+        if guard.depth > 0 {
+            return;
+        }
+        let restore = guard.restore;
+        guard.restore = [false; HELD.len()];
+        for (taken, sig) in restore.iter().zip(HELD) {
             if *taken {
-                // Only a signal this guard found at `SIG_DFL` and changed itself
+                // Only a signal the guard found at `SIG_DFL` and changed itself
                 // is here, so `SIG_DFL` is what goes back. Asking for it outright
                 // rather than replaying whatever the kernel handed back means an
                 // answer this shell cannot express cannot leave a signal ignored
@@ -600,11 +906,36 @@ const SIGQUIT: u8 = 3;
 /// reach the parent; td-sh's subshells are in-process clones, so the
 /// save/restore a fork gives for free has to be explicit. Restoring on `Drop`
 /// is what carries it across the `?`-shaped exits those bodies take.
-struct UmaskScope(u32);
+/// Read the real mask once, while this is still the only thread.
+///
+/// `sys::umask_get` answers from the shell's own record, which has to start out
+/// right: the record is seeded here rather than on first use, because "first
+/// use" is `fork_shell`, and by the time a pipeline is forking stages there is
+/// no safe moment to clear the mask even briefly. Called from `main` before the
+/// shell runs anything.
+pub(crate) fn prime_umask() {
+    crate::sys::umask_prime();
+}
+
+struct UmaskScope {
+    mask: u32,
+    armed: bool,
+}
 
 impl UmaskScope {
     fn capture() -> Self {
-        Self(crate::sys::umask_get())
+        Self { mask: crate::sys::umask_get(), armed: true }
+    }
+
+    /// Stand down, for a clone that never changed the mask. Sequentially that is
+    /// a restore of the value already installed and so invisible; with stages
+    /// running at once it is not, because the value installed may be a SIBLING's
+    /// and putting the captured one back UNDOES that sibling's `umask` while it
+    /// is still running. `umask 022; { umask 077; sleep .2; : >a; } | sleep .1`
+    /// created `a` as 0644 rather than 0600 — the wrong direction, and asked for
+    /// by neither stage.
+    fn disarm(&mut self) {
+        self.armed = false;
     }
 }
 
@@ -613,7 +944,9 @@ impl Drop for UmaskScope {
         // Nothing to report to: the mask was this process's a moment ago, so a
         // refusal here would mean the kernel changed its mind about a value it
         // already accepted.
-        let _ = crate::sys::umask_set(self.0);
+        if self.armed {
+            let _ = crate::sys::umask_set(self.mask);
+        }
     }
 }
 
@@ -629,7 +962,7 @@ impl Drop for UmaskScope {
 /// as one.
 pub struct Subshell {
     shell: Shell,
-    _mask: UmaskScope,
+    mask: UmaskScope,
 }
 
 /// Put back every signal disposition this subshell changed.
@@ -640,9 +973,15 @@ pub struct Subshell {
 /// the restore a fork gives for free has to be explicit. Written on `Subshell`
 /// itself rather than as a third field because the record is IN the shell --
 /// `trap` runs against a `&mut Shell` and has no other place to leave it -- and
-/// because `drop` runs before the fields do, so `_mask` is still standing.
+/// because `drop` runs before the fields do, so `mask` is still standing.
 impl Drop for Subshell {
     fn drop(&mut self) {
+        // A clone that never set a mask has none to put back, and putting one
+        // back anyway is how a stage came to undo a sibling's. `drop` runs
+        // before the fields do, so the scope is still standing to be told.
+        if !self.shell.umask_changed {
+            self.mask.disarm();
+        }
         // Nothing to report to, and nothing to decide: each entry holds what the
         // kernel itself handed back when this shell took the disposition over.
         while let Some((signo, ignored)) = self.shell.sig_undo.pop() {
@@ -678,7 +1017,7 @@ impl std::ops::DerefMut for Subshell {
 /// inner failure either.
 pub fn fork_shell(sh: &Shell) -> Subshell {
     // Taken before the clone, so the guard's life spans the child's.
-    let _mask = UmaskScope::capture();
+    let mask = UmaskScope::capture();
     let shell = Shell {
         vars: sh.vars.clone(),
         funcs: sh.funcs.clone(),
@@ -709,6 +1048,8 @@ pub fn fork_shell(sh: &Shell) -> Subshell {
         cmdsubst_count: sh.cmdsubst_count,
         errexit_suppressed: sh.errexit_suppressed,
         interactive: false,
+        // Carried, so a subshell inside a stage is still inside the pipeline.
+        in_pipeline: sh.in_pipeline,
         // Inherited: a `$(...)` inside $PS4 runs in one of these, and it must
         // still know it is inside PS4 or the guard buys nothing.
         in_ps4: sh.in_ps4,
@@ -734,9 +1075,11 @@ pub fn fork_shell(sh: &Shell) -> Subshell {
         // read back a disposition its own parent installed and mistake it for
         // one inherited from outside.
         sig_may_set: sh.sig_may_set.clone(),
+        sig_installed: sh.sig_installed.clone(),
+        umask_changed: false,
         sig_undo: Vec::new(),
     };
-    Subshell { shell, _mask }
+    Subshell { shell, mask }
 }
 
 /// `$(code)`: run `code` in a subshell with stdout captured to a buffer, and
@@ -912,7 +1255,7 @@ pub fn exec_external(sh: &mut Shell, argv: &[String], path: Option<&str>) -> R<(
         stdio_for(sh, 2)?
     });
 
-    let mut child = match cmd.spawn() {
+    let mut child = match spawn_uninherited(sh, &mut cmd) {
         Ok(c) => c,
         Err(e) => {
             let _ = exec::write_stderr(sh, &format!("td-sh: {program}: {e}"));
@@ -1033,7 +1376,7 @@ fn stdio_for(sh: &Shell, fd: u32) -> R<Stdio> {
         Some(Fd::Inherit(n)) => Ok(inherit_stream(*n)),
         None => Ok(Stdio::inherit()),
         Some(Fd::Null) => Ok(Stdio::null()),
-        Some(Fd::File(f)) => match f.lock() {
+        Some(Fd::File(f)) | Some(Fd::Pipe(f)) => match f.lock() {
             Ok(file) => match file.try_clone() {
                 Ok(c) => Ok(Stdio::from(c)),
                 Err(_) => Ok(Stdio::inherit()),
@@ -1170,3 +1513,18 @@ pub fn run_capturing_interactive_units(units: &[&str]) -> (i32, String, String) 
     (sh.status, text(&out), text(&err))
 }
 
+
+#[cfg(test)]
+mod thread_state {
+    /// Stage state crosses a thread boundary, which `run_pipeline` needs and
+    /// nothing else in the crate does. Spelled out so that adding a field which
+    /// is not `Send` fails HERE, naming the property, rather than inside the
+    /// pipeline's closure.
+    #[test]
+    fn shell_state_can_cross_a_thread() {
+        fn assert_send<T: Send>() {}
+        assert_send::<crate::exec::Shell>();
+        assert_send::<super::Subshell>();
+        assert_send::<super::Fds>();
+    }
+}

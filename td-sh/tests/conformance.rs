@@ -1577,6 +1577,155 @@ fn the_shell_stops_listening_to_the_terminal_while_a_child_runs(
     Ok(())
 }
 
+/// A stage that never set a umask does not undo a SIBLING's.
+///
+/// `umask(2)` is per-process and stages are threads of one, so a subshell's
+/// capture-and-restore -- invisible when subshells ran one at a time -- became a
+/// stage reaching into a sibling's lifetime the moment it happened to exit. The
+/// direction is what makes it worth a test: the file comes out MORE permissive
+/// than the stage that created it asked for, and nothing about the file says so.
+///
+/// What this does NOT claim is per-stage isolation. Two stages that both set a
+/// mask still share one, which is the divergence from a forking shell that
+/// UNSAFE.md records; this is only the case where a stage that asked for
+/// nothing overrode one that did.
+#[test]
+fn a_stage_that_set_no_umask_restores_none() -> Result<(), Box<dyn std::error::Error>> {
+    let shell = PathBuf::from(env!("CARGO_BIN_EXE_td-sh"));
+    let dir = ScratchDir::new("umask-stage")?;
+    let mode = |name: &str| -> Result<u32, Box<dyn std::error::Error>> {
+        use std::os::unix::fs::PermissionsExt as _;
+        Ok(std::fs::metadata(dir.0.join(name))?.permissions().mode() & 0o777)
+    };
+    let run = |program: &str| -> Result<(), Box<dyn std::error::Error>> {
+        let out = std::process::Command::new(&shell)
+            .args(["-c", program])
+            .current_dir(&dir.0)
+            .output()?;
+        assert!(out.status.success(), "{program}: {out:?}");
+        Ok(())
+    };
+    // The sibling exits while the setter is still running, which is the whole
+    // shape: its restore lands between the `umask` and the file it guards.
+    run("umask 022; { umask 077; sleep 0.3; : > a; } | sleep 0.05")?;
+    assert_eq!(mode("a")?, 0o600, "a sibling's exit undid the mask the stage set");
+    // The ordinary subshell restore is untouched by that, in both directions.
+    run("umask 022; ( umask 077; : > /dev/null ); : > b")?;
+    assert_eq!(mode("b")?, 0o644, "a subshell's mask escaped it");
+    run("umask 077; ( umask 022; : > /dev/null ); : > c")?;
+    assert_eq!(mode("c")?, 0o600, "a subshell's looser mask escaped it");
+    run("umask 022; ( : > /dev/null ); : > d")?;
+    assert_eq!(mode("d")?, 0o644);
+    Ok(())
+}
+
+/// A pipeline stage's `trap ''` reaches ITS children and no sibling's.
+///
+/// Stages are threads of one process, so the kernel disposition is a single cell
+/// they share. A stage that INSTALLED its ignore would hand it to whatever a
+/// sibling spawned at the same moment, and would leave the parent holding it
+/// after the pipeline ended -- so a stage records the ignore and the SPAWN
+/// installs the spawning stage's own intent for as long as it takes to create
+/// the child. Read from `/proc` by the child, as the test above is, because
+/// nothing else can see the disposition at the instant it is copied.
+#[test]
+fn a_stages_trap_reaches_its_own_children_only(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let shell = PathBuf::from(env!("CARGO_BIN_EXE_td-sh"));
+    let sh = shell.display().to_string();
+    let run = |program: &str| -> Result<Vec<u64>, Box<dyn std::error::Error>> {
+        let out = std::process::Command::new(&shell).args(["-c", program]).output()?;
+        let text = String::from_utf8_lossy(&out.stdout).into_owned();
+        let mut masks = Vec::new();
+        for line in text.lines() {
+            let hex = line.split('=').nth(1).ok_or_else(|| format!("probe said {text:?}"))?;
+            masks.push(u64::from_str_radix(hex.trim(), 16)?);
+        }
+        Ok(masks)
+    };
+    let probe = "while read k v; do case $k in SigIgn:) echo child=$v;; esac; done \
+                 < /proc/self/status";
+    // Everything below is a delta on what a fresh td-sh already ignores (Rust's
+    // runtime does SIGPIPE), measured rather than assumed.
+    let base = *run(&format!(r#""{sh}" -c '{probe}'"#))?.first().ok_or("no base mask")?;
+    // A consumer written with builtins alone, so the pipeline needs nothing on
+    // `PATH` beyond the shell under test.
+    let sink = "while read l; do echo \"$l\"; done";
+
+    // SIGTERM is bit 15, and is deliberately NOT one of the two the interrupt
+    // guard moves -- so it is the case that a fix bounded to those would miss.
+    let term = 1u64 << 14;
+    assert_eq!(
+        run(&format!(r#"{{ trap '' TERM; "{sh}" -c '{probe}'; }} | {sink}"#))?,
+        vec![base | term],
+        "a stage's own child did not inherit its ignore"
+    );
+    // The same stage's ignore must NOT reach a SIBLING's child. `echo go` is a
+    // happens-before and the `sleep` after it keeps stage one INSIDE the trap
+    // for the whole of the sibling's spawn -- without both, a stage that
+    // installed its ignore globally would have restored it again before the
+    // sibling got there, and the case would pass for the wrong reason.
+    assert_eq!(
+        run(&format!(
+            r#"{{ trap '' TERM; echo go; sleep 1; }} | {{ read _go; "{sh}" -c '{probe}'; }}"#
+        ))?,
+        vec![base],
+        "a sibling stage's child inherited an ignore nobody asked it for"
+    );
+    // ...and the parent is not left holding it after the pipeline ends. Two
+    // stages have to touch the SAME signal for that, which is the shape the
+    // corruption needs: each stage restores what it SAW when it changed one, so
+    // stage two captures stage one's ignore and puts it back after both are
+    // gone. SIGTERM rather than SIGINT because a spawn rewrites the two signals
+    // the guard moves, which would hide the leak from the probe that reads it.
+    assert_eq!(
+        run(&format!(
+            r#"{{ trap '' TERM; sleep 0.3; }} | {{ sleep 0.1; trap - TERM; sleep 0.4; }}; \
+               "{sh}" -c '{probe}'"#
+        ))?,
+        vec![base],
+        "the pipeline left its ignore installed in the parent"
+    );
+
+    // A stage that CLEARS an ignore its parent installed is the case the trap
+    // table alone cannot answer: the table no longer mentions the signal, but
+    // the process is still holding it, because clearing it in a stage does not
+    // reach the kernel. Both spellings of clearing it, since a non-empty action
+    // wants `SIG_DFL` in the child exactly as `trap -` does.
+    for stage in ["trap - TERM", "trap 'echo hi' TERM"] {
+        assert_eq!(
+            run(&format!(
+                r#"trap '' TERM; {{ {stage}; "{sh}" -c '{probe}'; }} | {sink}"#
+            ))?,
+            vec![base],
+            "a stage that cleared its parent's ignore still handed it to a child"
+        );
+    }
+    // ...and the parent's ignore is still inherited by a stage that leaves it
+    // alone, which is the half that must NOT change.
+    assert_eq!(
+        run(&format!(r#"trap '' TERM; {{ "{sh}" -c '{probe}'; }} | {sink}"#))?,
+        vec![base | term],
+        "a stage lost an ignore it never touched"
+    );
+
+    // SIGCHLD is the one the table may record and the spawn must NEVER install:
+    // ignoring it is POSIX's request that children be AUTO-REAPED, which costs
+    // the very status this is about to wait for. dash and bash both keep it.
+    let status = |program: &str| -> Result<String, Box<dyn std::error::Error>> {
+        let out = std::process::Command::new(&shell).args(["-c", program]).output()?;
+        Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+    };
+    assert_eq!(status(&format!(r#"trap '' CHLD; "{sh}" -c 'exit 3'; echo st=$?"#))?, "st=3");
+    assert_eq!(
+        status(&format!(
+            r#"{{ trap '' CHLD; "{sh}" -c 'exit 3'; echo st=$?; }} | {sink}"#
+        ))?,
+        "st=3"
+    );
+    Ok(())
+}
+
 /// An interrupt is not swallowed at an in-process clone boundary.
 ///
 /// td-sh's subshells, pipeline stages and command substitutions are CLONES in
@@ -1724,6 +1873,182 @@ fn login_run(
         .env("PATH", "/nonexistent");
     let out = c.output()?;
     Ok((String::from_utf8_lossy(&out.stdout).into_owned(), out.status.code()))
+}
+
+/// A stage the OS refuses a thread for is not something `!` can turn into
+/// success.
+///
+/// The status was `!`'s to negate, so `! cmd | cmd` reported 0 when the shell
+/// had in fact run none of it — the one answer a caller must never get from a
+/// pipeline that did not happen. It unwinds now, as a pipe this could not create
+/// already did.
+///
+/// Driven by `RLIMIT_NPROC` rather than a memory limit, deliberately: threads
+/// count against it, so the refusal is EAGAIN at the exact call being tested
+/// with nothing else starved. A limit generous enough to let the threads through
+/// leaves nothing to assert, so the test says so rather than passing quietly.
+#[test]
+fn an_unstarted_stage_is_not_negatable() -> Result<(), Box<dyn std::error::Error>> {
+    let shell = PathBuf::from(env!("CARGO_BIN_EXE_td-sh"));
+    let ten = ": | : | : | : | : | : | : | : | : | :";
+    let mut exercised = false;
+    for program in [ten.to_string(), format!("! {ten}")] {
+        let out = std::process::Command::new("/bin/sh")
+            .args([
+                "-c",
+                &format!(
+                    "ulimit -u 40 2>/dev/null; exec {} -c {}",
+                    shell.display(),
+                    shell_quote(&program)
+                ),
+            ])
+            .output()?;
+        let err = String::from_utf8_lossy(&out.stderr).into_owned();
+        if !err.contains("pipeline stage did not start") {
+            continue;
+        }
+        exercised = true;
+        assert_eq!(
+            out.status.code(),
+            Some(126),
+            "`{program}` answered {:?} for a pipeline that never ran: {err}",
+            out.status.code()
+        );
+    }
+    if !exercised {
+        eprintln!(
+            "an_unstarted_stage_is_not_negatable: RLIMIT_NPROC left every thread \
+             startable, so nothing was exercised"
+        );
+    }
+    Ok(())
+}
+
+/// A pipeline STREAMS: the consumer runs while the producer is still producing.
+///
+/// Both shapes here hung or died before, and neither is exotic — they are what
+/// an operator types. With the producer buffered whole, `head` never ran until
+/// `cat /dev/zero` had finished, which is never, so the shell grew a `Vec` until
+/// the machine gave out; and `yes | head` is the same thing with a cheaper
+/// producer. A pipe is a fixed kernel buffer, so the first is bounded and the
+/// second ends when `head` closes its end.
+///
+/// Bounded with `ulimit -v`, so a regression is a FAILURE rather than a machine
+/// that stops responding — the whole point is that unbounded growth is gone, and
+/// a test that proves it by exhausting memory would be the bug it is testing for.
+#[test]
+fn a_pipeline_streams_rather_than_buffering_its_producer() -> Result<(), Box<dyn std::error::Error>>
+{
+    let shell = PathBuf::from(env!("CARGO_BIN_EXE_td-sh"));
+    for (program, want) in [
+        // The unbounded producer: `head` closing its end is what ends `cat`.
+        ("cat /dev/zero | head -c 1 | wc -c", "1\n"),
+        // The endless one: nothing here ever reaches EOF on its own.
+        ("yes striped | head -n 2", "striped\nstriped\n"),
+        // A BUILTIN producer, which no pipe descriptor ends: the write returns
+        // EPIPE and that has to end the stage, or the loop spins forever.
+        ("while :; do echo x; done | head -n 1", "x\n"),
+    ] {
+        let out = std::process::Command::new("/bin/sh")
+            .args([
+                "-c",
+                // 256 MiB is far under what buffering `/dev/zero` needs and far
+                // over what streaming needs.
+                // `timeout` as well as `ulimit`: the memory shapes regress into
+                // an abort, but the EPIPE one regresses into a SPIN at constant
+                // memory, which no limit catches. Without this the test wedges
+                // the gate instead of failing it — the same "a regression is a
+                // failure, not a machine that stops responding" the limit is
+                // for.
+                &format!(
+                    "ulimit -v 262144; exec timeout 20 {} -c {}",
+                    shell.display(),
+                    shell_quote(program)
+                ),
+            ])
+            .output()?;
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            want,
+            "`{program}` did not stream"
+        );
+        // The STATUS too, or the timeout above reads as success: a producer that
+        // emits its first line and then spins on EPIPE gives `head` exactly the
+        // expected bytes, and only the exit status says the shell had to be
+        // killed to end it.
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "`{program}` produced the right bytes but did not end on its own"
+        );
+    }
+    Ok(())
+}
+
+/// A pipeline can still be stopped from the keyboard.
+///
+/// Stages are THREADS of one process, so a disposition one of them installs
+/// covers all of them. The interrupt guard taken by the stage running `cat`
+/// therefore covered the stage running `while :; do :; done` — and that one can
+/// only ever be stopped by a signal, so the pipeline became unkillable and the
+/// operator had no in-band way out of it. Strictly worse than the death the
+/// guard replaces, and on the image this is the login shell.
+///
+/// A pipeline is not covered by the guard for that reason, which is what
+/// `bash --posix` does on every one of these: it dies of the signal, as this
+/// shell did before pipelines streamed.
+#[test]
+fn a_pipeline_can_still_be_interrupted() -> Result<(), Box<dyn std::error::Error>> {
+    use std::os::unix::process::CommandExt;
+    let shell = PathBuf::from(env!("CARGO_BIN_EXE_td-sh"));
+    for program in [
+        // Nothing here ends on its own, and no pipe closing can stop the
+        // producer: only the signal can.
+        "while :; do :; done | cat",
+        "while :; do :; done | sleep 30",
+        "while :; do echo x > /dev/null; done | cat",
+    ] {
+        let mut child = std::process::Command::new(&shell)
+            .args(["-c", program])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            // Its own process group, so the signal below reaches the whole
+            // pipeline the way a terminal's would rather than one process of it.
+            .process_group(0)
+            .spawn()?;
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        // Through the shell's own `kill`, so this needs no external binary.
+        let _ = std::process::Command::new("/bin/sh")
+            .args(["-c", &format!("kill -INT -{}", child.id())])
+            .status();
+        let start = std::time::Instant::now();
+        loop {
+            match child.try_wait()? {
+                Some(status) => {
+                    assert!(
+                        status.code() != Some(0),
+                        "`{program}` reported success after being interrupted"
+                    );
+                    break;
+                }
+                None if start.elapsed() > std::time::Duration::from_secs(5) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!(
+                        "`{program}` ignored the interrupt entirely - the operator \
+                         has no way to stop it from the terminal"
+                    );
+                }
+                None => std::thread::sleep(std::time::Duration::from_millis(20)),
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Single-quote `s` for a POSIX shell.
+fn shell_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', r"'\''"))
 }
 
 /// A profile INTERRUPTED falls where a fatal error in one falls, and by the same

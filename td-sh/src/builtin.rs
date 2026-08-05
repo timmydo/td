@@ -166,16 +166,44 @@ fn status(sh: &mut Shell, code: i32) -> R<()> {
     Ok(())
 }
 
-/// Write to stdout, setting `$?`: 0 on success, 1 on a broken pipe / I/O error (so a
-/// write to a closed descriptor, `echo hi >&-`, fails visibly instead of silently
+/// Write to stdout, setting `$?`: 0 on success, 1 on an I/O error (so a write to a
+/// closed descriptor, `echo hi >&-`, fails visibly instead of silently
 /// succeeding). Callers must NOT overwrite the status afterward.
 fn out(sh: &mut Shell, bytes: &[u8]) -> R<()> {
     match write_fd(sh, 1, bytes) {
         Ok(()) => sh.set_status(0),
+        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => return Err(sigpipe()),
         Err(_) => sh.set_status(1),
     }
     Ok(())
 }
+
+/// A broken pipe ENDS the writer rather than setting `$?` and carrying on.
+///
+/// The reader is gone, so every later write fails the same way and a producer
+/// that only recorded it would spin forever: `while :; do echo x; done | head -1`
+/// is the shape, and it is not hypothetical -- it hung before streaming
+/// pipelines existed too, building an unbounded buffer instead of blocking on a
+/// full pipe. dash and bash end the producer by DYING of SIGPIPE. This shell
+/// installs no handler and cannot die of it — the Rust runtime ignores SIGPIPE
+/// before `main`, and un-ignoring it would change every write in the crate, so
+/// it is its own landing — but it can end the same way a CALLER observes:
+/// status 141, POSIX's 128 + SIGPIPE.
+///
+/// `Sig::Exit` rather than a variant of its own, so it is confined to the
+/// pipeline STAGE exactly as a forked producer's death would be: `head` still
+/// reports the pipeline's status and the enclosing shell carries on. The one
+/// visible difference from a real signal death is that an EXIT trap in the
+/// producer still runs, where a signalled shell would never reach one.
+fn sigpipe() -> Sig {
+    Sig::Exit(128 + i32::from(SIGPIPE))
+}
+
+/// The signal whose number this shell reports but never sends or installs: the
+/// Rust runtime ignores it before `main`, so td-sh cannot die of it and says so
+/// in a status instead. Named for the same reason `SIGCHLD` is — a bare 13 in an
+/// arithmetic expression is the one kind of wrong number nothing else catches.
+const SIGPIPE: u8 = 13;
 
 fn err_line(sh: &mut Shell, msg: &str) {
     let _ = exec::write_stderr(sh, msg);
@@ -272,6 +300,7 @@ fn printf(sh: &mut Shell, argv: &[String]) -> R<()> {
     }
     match write_fd(sh, 1, &out_buf) {
         Ok(()) => sh.set_status(if st.error { 1 } else { 0 }),
+        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => return Err(sigpipe()),
         Err(_) => sh.set_status(1),
     }
     Ok(())
@@ -2257,6 +2286,32 @@ const SIGCHLD: u8 = 17;
 ///
 /// A kernel that refuses the question is cached as "no", so a signal td-sh
 /// cannot read is one it never writes.
+/// Answer the question above for the signals the interrupt guard moves, while
+/// this is still the only thread.
+///
+/// It is derived from the disposition the process is holding RIGHT NOW, which is
+/// only "how the shell started" if nothing has changed it since. Sequentially
+/// that held. With pipeline stages running at once it does not: a sibling's
+/// guard is an ignore, and a stage asking for the first time during one would
+/// cache "ignored on entry" — POSIX's never-touch-this answer — for a signal
+/// that started at the default. The shell would then hand its own children that
+/// ignore and stop being interruptible at all.
+///
+/// So EVERY signal is settled once, before any stage exists, and every clone
+/// inherits the answers through `sig_may_set`. All of them rather than the two
+/// the guard moves, because the guard is not the only thing that installs behind
+/// a stage's back: a spawn briefly installs the spawning stage's own ignores,
+/// and a sibling resolving one of those for the first time inside that window
+/// would cache never-touch-this for a signal that started at the default — and a
+/// cache is answered once and kept. Sixty-odd queries at startup, none after.
+pub fn prime_signal_entries(sh: &mut Shell) {
+    for sig in 1..=crate::sys::SIG_MAX {
+        if crate::sys::changeable(sig) {
+            let _ = may_set_signal(sh, sig);
+        }
+    }
+}
+
 pub fn may_set_signal(sh: &mut Shell, signo: u8) -> bool {
     if let Some(known) = sh.sig_may_set.get(&signo) {
         return *known;
@@ -2265,6 +2320,19 @@ pub fn may_set_signal(sh: &mut Shell, signo: u8) -> bool {
     let free = matches!(entry, Ok(Some(crate::sys::Disposition::Default)));
     sh.sig_may_set.insert(signo, free);
     free
+}
+
+/// Whether `signo`'s kernel disposition is td-sh's to install AT ALL.
+///
+/// Shared by the `trap` builtin and by the spawn that hands a child this shell's
+/// intent, so the two cannot disagree about which signals the shell may move.
+/// EXIT is not a signal and SIGKILL/SIGSTOP are not anyone's; SIGCHLD ignored is
+/// POSIX's request that children be AUTO-REAPED, which would leave every
+/// external command reporting `ECHILD` instead of its status; and a signal that
+/// was not `SIG_DFL` on entry was installed by a parent or by Rust's own
+/// runtime, which POSIX says stays where it is.
+pub fn may_install(sh: &mut Shell, signo: u8) -> bool {
+    signo != SIGCHLD && crate::sys::changeable(signo) && may_set_signal(sh, signo)
 }
 
 /// Move `signo`'s kernel disposition to where the trap table now says it is.
@@ -2279,10 +2347,26 @@ pub fn may_set_signal(sh: &mut Shell, signo: u8) -> bool {
 /// Returns whether it succeeded, so a kernel that disagrees is REPORTED rather
 /// than leaving the table and the process describing different shells.
 fn apply_disposition(sh: &mut Shell, signo: u8, want: crate::sys::Disposition) -> bool {
-    // EXIT is not a signal, SIGKILL/SIGSTOP are not anyone's to set, and SIGCHLD
-    // is not this shell's. dash is silent about all of them, and so is this: the
-    // trap is still RECORDED, which is what `trap` prints.
-    if signo == SIGCHLD || !crate::sys::changeable(signo) || !may_set_signal(sh, signo) {
+    // dash is silent about the signals it may not move, and so is this: the trap
+    // is still RECORDED, which is what `trap` prints.
+    if !may_install(sh, signo) {
+        return true;
+    }
+    // A PIPELINE STAGE records and stops there. The kernel disposition is one
+    // cell shared by every stage, and each stage's `Subshell` restores what it
+    // saw when it changed one -- so with stages running at once a stage captures
+    // a SIBLING's disposition and puts it back after the pipeline ends, leaving
+    // the parent holding it forever. `{ trap "" INT; sleep .1; } | { sleep .05;
+    // trap - INT; sleep .2; }` left the shell ignoring SIGINT and needing a
+    // SIGKILL, and the corruption outlives the pipeline that caused it.
+    //
+    // Recording is enough, because the only thing the kernel disposition buys
+    // `trap ''` is reaching the CHILDREN a stage starts -- and `spawn_uninherited`
+    // installs this stage's own intent across every spawn, reading the same table
+    // this writes. What a stage gives up is protecting ITSELF from the signal,
+    // which is already the case: a pipeline is not covered by the interrupt guard
+    // either, for the same reason.
+    if sh.in_pipeline {
         return true;
     }
     let prev = match crate::sys::signal_set(signo, want) {
@@ -2292,6 +2376,13 @@ fn apply_disposition(sh: &mut Shell, signo: u8, want: crate::sys::Disposition) -
             return false;
         }
     };
+    // What the PROCESS now holds, which a spawn inside a pipeline needs and the
+    // trap table cannot tell it: a stage that clears this leaves the record
+    // standing, because clearing it in a stage does not reach the kernel.
+    sh.sig_installed.retain(|s| *s != signo);
+    if want == crate::sys::Disposition::Ignore {
+        sh.sig_installed.push(signo);
+    }
     // Only a CLONE has anything to undo, and only its first change to a signal
     // saw the value its parent left. `may_set_signal` has already established
     // the entry disposition was `SIG_DFL`, so `prev` is never a handler.
@@ -2409,9 +2500,14 @@ fn alias(sh: &mut Shell, argv: &[String]) -> R<()> {
             .collect();
         for line in listing {
             // A failed write is reported, as it is for every other builtin that
-            // prints (see `out`), rather than silently succeeding.
-            if write_fd(sh, 1, line.as_bytes()).is_err() {
-                ret = 1;
+            // prints (see `out`), rather than silently succeeding -- and a
+            // BROKEN one ends the shell there, for the reason `sigpipe` gives.
+            match write_fd(sh, 1, line.as_bytes()) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {
+                    return Err(sigpipe())
+                }
+                Err(_) => ret = 1,
             }
         }
         return status(sh, ret);
@@ -2432,8 +2528,15 @@ fn alias(sh: &mut Shell, argv: &[String]) -> R<()> {
             None => match sh.aliases.get(arg) {
                 Some(value) => {
                     let line = format!("{arg}={}\n", single_quote(value));
-                    if write_fd(sh, 1, line.as_bytes()).is_err() {
-                        ret = 1;
+                    // Same rule as `out` and the bare listing above: a BROKEN
+                    // pipe ends the writer, or `while :; do alias a; done |
+                    // head -1` spins forever on a reader that is gone.
+                    match write_fd(sh, 1, line.as_bytes()) {
+                        Ok(()) => {}
+                        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {
+                            return Err(sigpipe())
+                        }
+                        Err(_) => ret = 1,
                     }
                 }
                 None => {
@@ -2846,6 +2949,10 @@ fn umask_builtin(sh: &mut Shell, argv: &[String]) -> R<()> {
         return illegal(sh);
     }
     let mask = if numeric { parsed } else { parsed ^ 0o777 };
+    // Recorded BEFORE the readback is judged, because the mask is installed
+    // either way: `umask_set` asks the kernel first and only then reports a
+    // disagreement, so a clone that gave up here still has one to put back.
+    sh.umask_changed = true;
     if let Err(e) = crate::sys::umask_set(mask) {
         err_line(sh, &e);
         return status(sh, 2);
@@ -4926,12 +5033,31 @@ mod tests {
     fn read_dash_t_asks_whether_a_read_would_block() {
         // `-t 0` reads NOTHING -- not even $REPLY -- and reports whether a read
         // would block. That is poll's question, not "are bytes left": a file at
-        // EOF and an exhausted pipe are both READY, which is why ash answers 0
-        // for `/dev/zero`, for `: | read -t 0` and even for a closed descriptor.
-        assert_eq!(run_capturing("echo foo | { read -t 0; echo \"reply=$REPLY $?\"; }").1, "reply= 0\n");
+        // EOF and a closed descriptor are both READY, which is why ash answers 0
+        // for `/dev/zero`, for `/dev/null` and even for a closed descriptor.
         assert_eq!(run_capturing("read -t 0 </dev/null; echo $?").1, "0\n");
         assert_eq!(run_capturing("read -t 0.0 </dev/null; echo $?").1, "0\n");
-        assert_eq!(run_capturing(": | { read -t 0; echo $?; }").1, "0\n");
+        // A PIPELINE stage is refused, which is the shell answering the same
+        // way about the same kind of descriptor: a pipe INTO the shell was
+        // always refused, since `Fd::Inherit` cannot be polled either. Only the
+        // internal one used to answer, and only because the producer had
+        // already run to completion into a buffer -- the same buffering that
+        // made `yes | head` hang. Its stdin is a real pipe now, whose writer is
+        // a sibling STAGE still running, so whether a read would block is a
+        // question about another thread's progress: poll's question exactly,
+        // and poll(2) is not on this shell's syscall surface.
+        //
+        // Asserted on what the STAGE printed rather than on the program's
+        // status, which is the last stage's `echo` either way.
+        for cmd in [
+            "echo foo | { read -t 0; echo $?; }",
+            ": | { read -t 0; echo $?; }",
+            "echo x | { read -t 5 v; echo \"[$v] $?\"; }",
+        ] {
+            let (_, out, err) = run_capturing(cmd);
+            assert!(out.ends_with("2\n"), "{cmd} out: {out:?}");
+            assert!(err.contains("without poll(2)"), "{cmd} err: {err:?}");
+        }
         // A nonzero timeout needs the same answer, only later, so it is refused
         // on the same descriptors -- and refusing beats ash's behaviour going
         // unmatched by HANGING, which is what ignoring the timeout would do.
@@ -4942,7 +5068,6 @@ mod tests {
         }
         // Where a read cannot block, a nonzero timeout is simply never reached.
         assert_eq!(run_capturing("read -t 5 x </dev/null; echo $?").1, "1\n");
-        assert_eq!(run_capturing("echo x | { read -t 5 v; echo \"[$v] $?\"; }").1, "[x] 0\n");
     }
 
     #[test]
@@ -5383,6 +5508,51 @@ mod tests {
             for (signo, disp) in &self.saved {
                 let _ = crate::sys::signal_set(*signo, *disp);
             }
+        }
+    }
+
+    /// A nested guard does not hand the disposition back when the INNER one ends.
+    ///
+    /// This is a property of the reference count itself, not of a failure any
+    /// shape reaches today: a pipeline stage is exempt from the guard before the
+    /// count is touched, so no second holder exists to nest with. What it pins is
+    /// what a future second `hold` site would depend on and could not see missing
+    /// — an unconditional restore reds it — which is the whole reason the count
+    /// is kept rather than reduced to a bool.
+    #[test]
+    fn a_nested_guard_does_not_hand_the_terminal_back_early() {
+        let _held = Dispositions::held(&[2, 3]);
+        let mut sh = crate::exec::Shell::new();
+        for sig in [2u8, 3u8] {
+            let _ = crate::sys::signal_set(sig, crate::sys::Disposition::Default);
+        }
+        let outer = crate::process::InterruptibleChild::hold(&mut sh);
+        {
+            let _inner = crate::process::InterruptibleChild::hold(&mut sh);
+            for sig in [2u8, 3u8] {
+                assert_eq!(
+                    crate::sys::signal_get(sig).ok().flatten(),
+                    Some(crate::sys::Disposition::Ignore),
+                    "signal {sig} was not ignored with two guards standing"
+                );
+            }
+        }
+        // The inner one is gone and the outer is still waiting on its own child.
+        for sig in [2u8, 3u8] {
+            assert_eq!(
+                crate::sys::signal_get(sig).ok().flatten(),
+                Some(crate::sys::Disposition::Ignore),
+                "signal {sig} was handed back while another guard was still held - \
+                 that stage's next child would be created interruptible"
+            );
+        }
+        drop(outer);
+        for sig in [2u8, 3u8] {
+            assert_eq!(
+                crate::sys::signal_get(sig).ok().flatten(),
+                Some(crate::sys::Disposition::Default),
+                "signal {sig} was left ignored after the LAST guard went"
+            );
         }
     }
 

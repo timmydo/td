@@ -57,6 +57,8 @@ use std::os::fd::RawFd;
 #[cfg(not(all(target_arch = "x86_64", target_os = "linux")))]
 compile_error!("td-sh's syscall layer is x86_64-linux only (raw syscall ABI)");
 
+use std::sync::Mutex;
+
 const SYS_RT_SIGACTION: usize = 13;
 const SYS_IOCTL: usize = 16;
 const SYS_UMASK: usize = 95;
@@ -159,15 +161,47 @@ fn umask(mask: u32) -> u32 {
     (syscall4(SYS_UMASK, (mask & MODE_BITS) as usize, 0, 0, 0) as u32) & MODE_BITS
 }
 
-/// The current mask. There is no "read" syscall, so this SETS zero to learn the
-/// old value and immediately puts it back — the dance every shell does. Safe
-/// here because the window is two instructions inside a shell that runs its
-/// pipeline stages sequentially and installs no signal handlers; a threaded
-/// stage or a handler that creates files would make it observable.
-pub fn umask_get() -> u32 {
+/// The shell's own view of the mask, so reading one costs no syscall and opens
+/// no window.
+///
+/// There is no "read" syscall: learning the mask means SETTING zero and putting
+/// it back, and for the two instructions in between the process has NO mask at
+/// all. That was safe while pipeline stages ran one at a time — the shell was
+/// the only thing running — and it stopped being safe the moment they ran
+/// concurrently, because a sibling stage creating a file inside that window gets
+/// it with permissions nobody asked for. Silent, and exactly the failure the
+/// readback in `umask_set` exists to prevent at the other end.
+///
+/// So the dance happens ONCE, in `umask_prime`, before any stage can exist, and
+/// after that the shell answers from what it remembers. That is sound because
+/// nothing else can change this process's mask: `umask(2)` is reachable only
+/// through this module, `main.rs`'s confinement tests pin `builtin.rs` and
+/// `process.rs` as the only callers, and a child's own `umask` cannot reach back
+/// into its parent.
+static CURRENT: Mutex<u32> = Mutex::new(0o022);
+
+/// Read the mask the one way that needs the window, and remember it. Called from
+/// `main` before the shell runs anything, which is what keeps the window
+/// single-threaded; calling it twice is harmless but pointless.
+pub fn umask_prime() {
+    let mut cur = lock_current();
     let old = umask(0);
     let _ = umask(old);
-    old
+    *cur = old;
+}
+
+/// The current mask, from the shell's own record.
+pub fn umask_get() -> u32 {
+    *lock_current()
+}
+
+/// The record, whether or not a panicking thread poisoned it. Poisoning cannot
+/// actually happen — this crate is `panic = "abort"`, so nothing unwinds out of
+/// a held lock — but reading THROUGH it rather than around it means the two
+/// accessors cannot disagree about what a poisoned lock means, which is the kind
+/// of difference that only shows up once it matters.
+fn lock_current() -> std::sync::MutexGuard<'static, u32> {
+    CURRENT.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 /// Install `mask`, and REFUSE unless the kernel agrees it took.
@@ -175,10 +209,24 @@ pub fn umask_get() -> u32 {
 /// The second call is the readback, not a second write: it asks for the same
 /// mask again, so it changes nothing, and its return value is what the first
 /// call actually left in place.
+///
+/// The record is held for the WHOLE of that, which is what makes the readback
+/// mean anything now that pipeline stages run at once. Two stages each setting a
+/// mask would otherwise interleave their two calls, and each would read back the
+/// OTHER's mask and report `kernel kept …` about a kernel that had done exactly
+/// what it was told — measured at 6 spurious diagnostics in 100 runs of
+/// `umask 077 | umask 022` before this lock. Holding it also keeps the record and
+/// the kernel in step, since the update lands before any other stage can look.
 pub fn umask_set(mask: u32) -> Result<(), String> {
     let mask = mask & MODE_BITS;
+    let mut cur = lock_current();
     let _prev = umask(mask);
     let took = umask(mask);
+    // What the kernel KEPT, recorded before the disagreement is reported: the
+    // mask is installed either way, so a record left holding the old value would
+    // have the shell reporting one mask while creating files under another --
+    // compounding exactly the disagreement this readback exists to catch.
+    *cur = took;
     if took != mask {
         return Err(format!("umask: kernel kept {took:04o}, not {mask:04o}"));
     }
@@ -379,6 +427,47 @@ mod tests {
 
     fn serial() -> std::sync::MutexGuard<'static, ()> {
         SERIAL.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Two threads setting a umask at once do not read back each other's.
+    ///
+    /// `umask_set` installs and then asks what took, because there is no reading
+    /// syscall — two calls, and with pipeline stages running at once two of those
+    /// pairs interleave. Each thread then reads the OTHER's mask and reports
+    /// `kernel kept …` about a kernel that did exactly what it was told.
+    ///
+    /// In-process rather than over the built binary: the same race measured
+    /// through `td-sh -c 'umask 077 | umask 022'` fires about 4 times in 1000, so
+    /// a process-level test needs thousands of spawns to be reliable and still
+    /// caught its own mutant only about half the time. Here the window is all
+    /// there is between the two calls, and the mutant reds in well under a
+    /// second.
+    #[test]
+    fn concurrent_setters_do_not_read_back_each_other_s_mask() {
+        let _serial = serial();
+        let restore = umask_get();
+        let failures = std::sync::Mutex::new(Vec::<String>::new());
+        std::thread::scope(|scope| {
+            for mask in [0o077u32, 0o022] {
+                let failures = &failures;
+                scope.spawn(move || {
+                    for _ in 0..4000 {
+                        if let Err(e) = umask_set(mask) {
+                            if let Ok(mut f) = failures.lock() {
+                                f.push(e);
+                            }
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        let seen = failures.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let _ = umask_set(restore);
+        assert!(
+            seen.is_empty(),
+            "a setter read back the mask another thread had installed: {seen:?}"
+        );
     }
 
     /// The value of a `/proc/self/status` field, when that file is readable.

@@ -182,6 +182,10 @@ pub struct Shell {
     /// it propagates into compounds nested inside the condition.
     pub errexit_suppressed: u32,
     pub interactive: bool,
+    /// This shell IS a pipeline stage (or something inside one), which is what
+    /// decides that the interrupt guard is not available to it. Carried into
+    /// clones: a subshell inside a stage is still inside the pipeline.
+    pub in_pipeline: bool,
     /// dash's `inps4`: set while $PS4 is being expanded, so a command
     /// substitution inside it cannot trace itself into infinite regress.
     pub in_ps4: bool,
@@ -225,6 +229,19 @@ pub struct Shell {
     /// every entry already holds the parent's value and the list is bounded by
     /// the signal count.
     pub sig_undo: Vec<(u8, bool)>,
+    /// Signals this shell has INSTALLED an ignore for, which is what the process
+    /// is holding. Not the same as the trap table's ignore set: a pipeline stage
+    /// RECORDS a trap without installing one, so a stage that clears its parent's
+    /// `trap '' TERM` leaves the process still ignoring it, and the spawn has to
+    /// know to put `SIG_DFL` back for the child. Cloned like `sig_may_set`.
+    pub sig_installed: Vec<u8>,
+    /// Whether THIS shell has changed the process umask. A clone restores the
+    /// mask it captured only when this is set, because a clone that never
+    /// touched it has nothing to put back — and with pipeline stages running at
+    /// once, restoring anyway is a stage undoing a SIBLING's `umask` at the
+    /// moment it happens to exit. Not inherited: a clone starts having changed
+    /// nothing, whatever its parent did.
+    pub umask_changed: bool,
 }
 
 /// Bound on nested command execution — enforced once, at the `run_command` choke
@@ -361,6 +378,7 @@ impl Shell {
             cmdsubst_count: 0,
             errexit_suppressed: 0,
             interactive: false,
+            in_pipeline: false,
             in_ps4: false,
             getopts_optind: 1,
             getopts_off: -1,
@@ -368,6 +386,8 @@ impl Shell {
             cloned: false,
             traps: BTreeMap::new(),
             sig_may_set: BTreeMap::new(),
+            sig_installed: Vec::new(),
+            umask_changed: false,
             sig_undo: Vec::new(),
             trap_status: None,
         };
@@ -479,6 +499,7 @@ impl Shell {
             cmdsubst_count: 0,
             errexit_suppressed: 0,
             interactive: false,
+            in_pipeline: false,
             in_ps4: false,
             getopts_optind: 1,
             getopts_off: -1,
@@ -486,6 +507,8 @@ impl Shell {
             cloned: false,
             traps: BTreeMap::new(),
             sig_may_set: BTreeMap::new(),
+            sig_installed: Vec::new(),
+            umask_changed: false,
             sig_undo: Vec::new(),
             trap_status: None,
         };

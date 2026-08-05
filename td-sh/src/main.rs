@@ -24,10 +24,10 @@
 //! x86-64 needs a hand-laid `SA_RESTORER` trampoline to return through, where
 //! the two code-free dispositions run no handler at all and so need none.
 //! `trap '' SIG` is therefore already real, and reaches the children a script
-//! starts, as POSIX requires. Concurrent (streaming) pipelines are NOT among
-//! the deferrals — `std::io::pipe` is stable and needs no `unsafe`; today's
-//! stages are still run sequentially with the producer buffered, which is a
-//! refinement rather than a syscall question.
+//! starts, as POSIX requires. Pipeline stages now STREAM, on threads joined by
+//! `std::io::pipe` descriptors — no `unsafe`, which is why that was a
+//! refinement rather than a syscall question. Async lists (`&`) are still
+//! synchronous, which is the remaining one of that pair.
 #![deny(unsafe_code)]
 
 mod arith;
@@ -51,6 +51,10 @@ use exec::{run_program, Shell};
 use process::SIGINT;
 
 fn main() -> ExitCode {
+    // Before anything else, and before any pipeline stage can exist: reading the
+    // mask means briefly clearing it, so the one place that is safe to do is
+    // here, while this thread is the only one.
+    process::prime_umask();
     let args: Vec<String> = std::env::args().collect();
     let code = match run(&args) {
         Ok(code) => code,
@@ -66,6 +70,11 @@ fn main() -> ExitCode {
 /// Parse the command line and dispatch to the right execution mode.
 fn run(args: &[String]) -> Result<i32, String> {
     let mut sh = Shell::new();
+    // Settle "was this signal ignored when we started?" while this is still the
+    // only thread — a stage asking for the first time during a SIBLING's guard,
+    // or during the window a sibling's spawn opens, would read that ignore as
+    // the answer and keep it. Every clone inherits what this records.
+    builtin::prime_signal_entries(&mut sh);
     let mut i = 1usize;
     let mut minus_c = false;
     // A LOGIN shell, by the convention every shell since the Bourne one has used:
