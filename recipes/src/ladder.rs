@@ -289,6 +289,20 @@ pub const TD_WAYLAND_RUNTIME_MARKER: &str = "TD-WAYLAND-READY";
 /// DUPLICATED in td-compositor/src/client.rs and pinned by its recipe.
 pub const TD_UI_CLIENT_RUNTIME_MARKER: &str = "TD-UI-CLIENT-READY";
 
+/// Printed by the terminal once `present` has returned — a frame drawn at a size
+/// the compositor CHOSE, with both the wl_shm buffer release and the first frame
+/// callback arrived — and once the PTY the kernel agrees is that grid has a child
+/// on it — more than [`TD_UI_CLIENT_RUNTIME_MARKER`] proves, in every dimension
+/// but ONE. The demo required a seat advertising POINTER and KEYBOARD and asked
+/// for both; the terminal needs no pointer and requires only KEYBOARD, so a
+/// compositor whose `wl_seat.get_pointer` path broke used to fail the boot and
+/// now does not. That is a real loss of coverage, kept because a terminal
+/// demanding a device it never uses would be a client lying about its needs to
+/// hold a test property up.
+///
+/// DUPLICATED as `MARKER` in td-compositor/src/ready.rs and pinned by its recipe.
+pub const TD_TERM_RUNTIME_MARKER: &str = "TD-TERM-READY";
+
 /// Kernel-cmdline token the headless `qemu-boot-system` oracle appends so the greeter
 /// waits for the root-owned health/update transaction and then exits. `tty-session`
 /// turns that exit into a clean VM poweroff. Without it, the greeter is interactive.

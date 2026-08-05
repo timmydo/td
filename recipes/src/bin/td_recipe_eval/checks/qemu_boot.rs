@@ -101,8 +101,9 @@ const TD_INIT_RUNTIME_MARKER: &str = td_recipe::ladder::TD_INIT_RUNTIME_MARKER;
 const TD_LOGIN_RUNTIME_MARKER: &str = td_recipe::ladder::TD_LOGIN_RUNTIME_MARKER;
 /// Printed after the unprivileged software compositor paints and listens.
 const TD_WAYLAND_RUNTIME_MARKER: &str = td_recipe::ladder::TD_WAYLAND_RUNTIME_MARKER;
-/// Printed after the td-native client receives its first release and frame callback.
-const TD_UI_CLIENT_RUNTIME_MARKER: &str = td_recipe::ladder::TD_UI_CLIENT_RUNTIME_MARKER;
+/// Printed by the FIRST client the machine now starts: the terminal, after a frame
+/// at a compositor-chosen size and a PTY the kernel agrees is that grid.
+const TD_TERM_RUNTIME_MARKER: &str = td_recipe::ladder::TD_TERM_RUNTIME_MARKER;
 
 /// The line `/etc/rootcheck` prints once it has confirmed `/` is a READ-ONLY erofs
 /// mount (re #550). `qemu-boot-system` asserts it to prove the switched-into root is
@@ -234,7 +235,7 @@ struct ConsoleEvidence {
     td_init_runtime: bool,
     td_login_runtime: bool,
     td_wayland_runtime: bool,
-    td_ui_client_runtime: bool,
+    td_term_runtime: bool,
     persist_write: bool,
     persist_read: bool,
     boot_success: bool,
@@ -790,8 +791,8 @@ pub(crate) fn run_system(runner: &RecipeCheckRunner) -> Result<(), String> {
          td-login credential switch the switched process read back and confirmed \
          ({TD_LOGIN_RUNTIME_MARKER}), then assigned the single-user graphical seat and brought \
          the software Wayland socket up on virtio-gpu ({TD_WAYLAND_RUNTIME_MARKER}), \
-         presented the td-native wl_shm demo and received its first frame callback \
-         ({TD_UI_CLIENT_RUNTIME_MARKER}), \
+         presented the td-native wl_shm TERMINAL and received its first frame callback \
+         ({TD_TERM_RUNTIME_MARKER}), \
          and unmounted state \
          before exit ({SYSTEM_SHUTDOWN_MARKER})",
         td_boot_protocol::DEFAULT_BOOT_ATTEMPTS,
@@ -1178,12 +1179,15 @@ fn validate_system_boot(
             tail(&result.console, 80)
         ));
     }
-    if !result.evidence.td_ui_client_runtime {
+    if !result.evidence.td_term_runtime {
         return Err(format!(
-            "the compositor became ready, but the td-native graphical client marker \
-             ({TD_UI_CLIENT_RUNTIME_MARKER:?}) was absent — registry binding, the XDG \
-             configure/ack handshake, wl_shm descriptor transfer, buffer release, or the \
-             first frame callback failed. The serial greeter remains the recovery path. \
+            "the compositor became ready, but the TERMINAL marker \
+             ({TD_TERM_RUNTIME_MARKER:?}) was absent — registry binding, the XDG \
+             configure/ack handshake, wl_shm descriptor transfer, buffer release, the \
+             first frame callback, keymap verification, the devpts PTY, or the child \
+             shell failed. The machine \
+             booted to a compositor with nothing on it. The serial greeter remains the \
+             recovery path. \
              Last serial output:\n{}",
             tail(&result.console, 80)
         ));
@@ -2588,7 +2592,7 @@ fn evidence_marker_max_len(target: &[u8]) -> usize {
         TD_INIT_RUNTIME_MARKER.len(),
         TD_LOGIN_RUNTIME_MARKER.len(),
         TD_WAYLAND_RUNTIME_MARKER.len(),
-        TD_UI_CLIENT_RUNTIME_MARKER.len(),
+        TD_TERM_RUNTIME_MARKER.len(),
         SYSTEM_PERSIST_WRITE_MARKER.len(),
         SYSTEM_PERSIST_READ_MARKER.len(),
         SYSTEM_BOOT_SUCCESS_MARKER.len(),
@@ -2724,9 +2728,9 @@ fn latch_console_evidence(evidence: &mut ConsoleEvidence, buf: &[u8], target: &[
         TD_WAYLAND_RUNTIME_MARKER.as_bytes(),
     );
     latch_marker(
-        &mut evidence.td_ui_client_runtime,
+        &mut evidence.td_term_runtime,
         buf,
-        TD_UI_CLIENT_RUNTIME_MARKER.as_bytes(),
+        TD_TERM_RUNTIME_MARKER.as_bytes(),
     );
     latch_marker(
         &mut evidence.persist_write,
@@ -3167,6 +3171,26 @@ mod tests {
     /// this: its result is dominated by the id-bearing markers (marker + space + 64-char
     /// hex), so a "no marker exceeds the max" assertion cannot fail and would only look like
     /// a guard. The rescan window is covered behaviourally instead, by the split tests below.
+    /// The oracle's first-client evidence must be the TERMINAL's marker.
+    ///
+    /// Rebinding the alias to the demo's is a boot that runs to its timeout:
+    /// nothing has started the demo since the cutover, so its line never
+    /// appears and the failure names a marker rather than a cause. The
+    /// equality is not a tautology — the alias names one of several ladder
+    /// constants, and which one is exactly what can go wrong.
+    #[test]
+    fn the_first_client_evidence_is_the_terminals_marker() {
+        assert_eq!(
+            TD_TERM_RUNTIME_MARKER,
+            td_recipe::ladder::TD_TERM_RUNTIME_MARKER
+        );
+        assert_ne!(
+            TD_TERM_RUNTIME_MARKER,
+            td_recipe::ladder::TD_UI_CLIENT_RUNTIME_MARKER
+        );
+        assert!(all_console_markers().contains(&TD_TERM_RUNTIME_MARKER));
+    }
+
     fn all_console_markers() -> [&'static str; 33] {
         [
             MARKER,
@@ -3201,7 +3225,7 @@ mod tests {
             TD_INIT_RUNTIME_MARKER,
             TD_LOGIN_RUNTIME_MARKER,
             TD_WAYLAND_RUNTIME_MARKER,
-            TD_UI_CLIENT_RUNTIME_MARKER,
+            TD_TERM_RUNTIME_MARKER,
         ]
     }
 

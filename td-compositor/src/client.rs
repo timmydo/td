@@ -718,9 +718,10 @@ pub fn run(options: &Options) -> Result<(), String> {
 
     let _ready = socket::publish(&options.ready_socket, "ui-demo-ready", Vec::new())?;
     // NOTE: `println!` panics on a write failure, the hazard the terminal's
-    // own marker avoids. It is left alone here because the recipe pins this
-    // exact spelling as the demo's boot oracle, so changing it is that
-    // oracle's landing rather than this one.
+    // own marker avoids. No oracle reads this line since the terminal took
+    // over as the boot's first client; what still pins the spelling is the
+    // recipe, and the launcher still spawns this binary, so the hazard is
+    // real and unfixed rather than blocked.
     println!("TD-UI-CLIENT-READY surface={}x{}", size.width, size.height);
     std::io::stdout()
         .flush()

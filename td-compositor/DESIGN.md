@@ -176,7 +176,9 @@ required empty initial wl_surface commit and acknowledges the resulting
 xdg_surface configure serial. A buffer attached before that handshake is a
 client protocol failure.
 
-The boot profile starts one `td-ui-demo` toplevel. It discovers and binds
+The boot profile starts one `td-term` toplevel; a `td-ui-demo` toplevel is
+reached from the launcher instead, and the conformance below is its. It
+discovers and binds
 globals rather than depending on registry names, binds the version-5-or-newer
 seat, and completes the initial XDG configure/ack handshake. It accepts only a
 seat with both keyboard and pointer capabilities, requests those devices only
@@ -509,15 +511,17 @@ wrapper's operand shape.
 
 ## 5. Boot and recovery
 
-This section records the current demo-client boot profile. When the td-term
-cutover specified in sections 12 and 14 lands, it replaces the demo service,
-marker, and final-image symlink and adds the specified devpts setup to the
-early mount sequence. The compositor ordering, readiness, restart, and
-serial-recovery guarantees remain in force.
+This section records the boot profile. The td-term cutover of sections 12 and
+14 has landed: it replaced the demo SERVICE and the oracle's marker, and the
+devpts setup is in the early mount sequence. It did NOT remove the demo's
+final-image symlink, as this section used to say it would — the launcher
+spawns the demo by absolute path, so the name outlived the service. The
+compositor ordering, readiness, restart, and serial-recovery guarantees remain
+in force.
 
 PID 1 still mounts devtmpfs, procfs, sysfs, tmpfs, and the immutable root.
 `td-svc` starts `td-seatd` after root checking, then starts
-`td-compositor` and `td-ui-demo`, in that order, through td-login's credential
+`td-compositor` and `td-term`, in that order, through td-login's credential
 switch. Both long-running processes are restartable with backoff. Client
 readiness is probed through its private socket, so deployment health cannot
 race ahead of the first committed frame. Graphical failure never suppresses
@@ -530,13 +534,17 @@ broken UI cannot mark an update healthy or let QEMU power off before testing
 the new boot seam. The
 graphical service prints `TD-WAYLAND-READY` only after the framebuffer has
 been painted and the Wayland socket is listening. The QEMU system oracle
-requires that marker and the client's later `TD-UI-CLIENT-READY` marker.
+requires that marker and the first client's later `TD-TERM-READY` marker.
 
 ## 6. Required proof
 
-These are the current compositor and demo proofs. When the td-term proof in
-section 14 lands, it supersedes the demo-specific entry-point, image-roster,
-and `TD-UI-CLIENT-READY` requirements without waiving the remaining checks.
+These are the compositor and client proofs. The td-term proof of section 14
+has landed and superseded the demo-specific `TD-UI-CLIENT-READY` requirement;
+the entry-point and image-roster requirements stand, the demo being a launcher
+entry still. Where a bullet below says "the boot client" it now means td-term,
+except the pointer clause: the demo required a seat advertising POINTER and
+KEYBOARD, and the terminal requires only a keyboard, so that clause is the
+demo's alone and is proved from the launcher rather than at boot.
 
 The landing must prove:
 
@@ -696,8 +704,8 @@ input devices, sockets, clocks, the filesystem, or ambient environment.
 
 Focused keyboard and pointer delivery now connect the demo client to the
 existing evdev input path, and the Emacs-style launcher has a filterable
-application registry with a terminal entry. Making the terminal the first
-client the BOOT starts, in place of the demo, follows. Clipboard, pointer
+application registry with a terminal entry, and the terminal is the first
+client the BOOT starts, in place of the demo. Clipboard, pointer
 axes, client cursor rendering, hotplug, and real DRM/KMS profiles follow.
 The terminal stack has the separate contract below.
 
@@ -733,15 +741,21 @@ serves three programs, chosen by argv[0], and the store output carries the
 terminal as a symlink beside the compositor. The `/bin/td-term` name §12 spells
 and the `ready=` line that calls it are packaging, and are landed. The
 publisher has its caller: deciding a terminal IS ready belongs to the Wayland
-client, which publishes once everything that can still fail has — handshake
+client, which publishes after `present` has drawn a frame at a size the
+compositor CHOSE and taken both the buffer release and the first frame
+callback, and then once everything that can still fail has — handshake
 finished, reader detached, child started — and before its main loop, so a
-probe is never told something true for less than a second. That client is
-landed and is the PTY adapter's production caller; its host tests still drive
+probe is never told something true for less than a second. That is strictly
+more than the demo's marker proved, which is why the boot oracle could move
+to it. That client is landed and is the PTY adapter's production caller; its
+host tests still drive
 every operation against a real PTY, and the packaged binary's selftest covers
 the policy layer, which is what runs where devpts is not mounted. The terminfo
-entry and the `/bin/td-term` symlink are landed, and the launcher can open a
-terminal. What remains of sections 12 and 14 is the boot cutover — making the
-terminal the first client the machine starts, in place of the demo.
+entry and the `/bin/td-term` symlink are landed, the launcher can open a
+terminal, and the boot cutover is landed: the `[terminal]` unit replaced
+`[ui-demo]`, so the machine comes up on a shell prompt and the boot oracle's
+first-client marker is the terminal's. The demo stays packaged as a launcher
+entry rather than as a service.
 General Wayland toolkit compatibility is not claimed until the missing core
 protocols have explicit tests. Hardware acceleration, niri, portals, PipeWire,
 Xwayland, and a C desktop stack remain optional consumers rather than
@@ -762,8 +776,10 @@ implementation and the existing confined SCM_RIGHTS transport instead of
 creating a second target-side unsafe surface. The client and server run as the
 same graphical user, and the shared artifact is not a privilege boundary.
 `td-ui-demo` remains a source and target-recipe protocol fixture. The boot
-cutover removes its final-image symlink when td-term replaces it as the visible
-client.
+cutover KEPT its final-image symlink, superseding the earlier plan to remove
+it: the launcher registry spawns the demo by absolute path, so the name is
+reachable from the screen rather than only from a recipe. What the cutover
+removed is its SERVICE — nothing starts it at boot.
 
 All terminal code is dependency-free Rust built by td's source-built stage2
 toolchain. It has no toolkit, GPU API, dynamic font system, terminal daemon,
@@ -1417,10 +1433,10 @@ command uses the existing credential-switch pattern to invoke `/bin/td-term
 probe /run/user/1000/td-term-ready` as the graphical user. The probe
 requires a ready state and nonzero internally consistent rows and columns;
 its output and the matching `TD-TERM-READY` QEMU diagnostic are compared in
-integration tests. The boot profile atomically replaces the visible
-`td-ui-demo` service and removes its final-image symlink when this proof is
-complete. The compositor and serial recovery greeter remain independently
-restartable.
+integration tests. The boot profile has atomically replaced the visible
+`td-ui-demo` service with a `[terminal]` one; the demo's final-image symlink
+stays, because the launcher spawns it. The compositor and serial recovery
+greeter remain independently restartable.
 
 ## 13. Native terminal corpus
 

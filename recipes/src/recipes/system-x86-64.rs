@@ -315,9 +315,10 @@ const TD_INIT_FARM: &[(&str, Probe)] = &[
     // init's /dev/console on stdin, so a run-it probe claims the LIVE console once per boot.
     // That normally EPERMs (getty holds ttyS0 by then), but `::once:` jobs start before the
     // respawned tty session, so there is a window where the claim succeeds and the probe —
-    // exiting immediately as a session leader — vhangups it. No script on this image uses
-    // cttyhack, so a probe that mutates global terminal state to prove an exec nothing
-    // performs is pure cost. The usage refusal still pins the packed name and its dispatch.
+    // exiting immediately as a session leader — vhangups it. That cost stands whatever
+    // else uses the applet, and since the terminal became the boot's first client its
+    // success path IS on the boot path: td-term execs `cttyhack --stdin /bin/sh` for
+    // every session. The usage refusal still pins the packed name and its dispatch.
     ("cttyhack", Probe::Refuses("", "usage: cttyhack")),
     // Probed by REFUSAL for `mount`'s reason, which is its own: with no arguments this
     // MOUNTS, and the greeter is unprivileged so a real run would EPERM anyway. The
@@ -759,7 +760,7 @@ const TD_SVC_UNITS: [&str; 11] = [
     "seat",
     "netup",
     "wayland",
-    "ui-demo",
+    "terminal",
     "bootsuccess",
     "bootfail",
     "sshd",
@@ -886,22 +887,26 @@ fn build_td_svc_conf() -> String {
          ready-timeout=30\n\
          restart=always\n\
          \n\
-         # The first td-native client stays mapped. Its readiness probe is exposed\n\
-         # only after the configure/ack, wl_shm commit, release, and frame callback.\n\
-         [ui-demo]\n\
+         # The first td-native client stays mapped, and it is the TERMINAL: the\n\
+         # machine boots to a shell prompt rather than to a demo. Its readiness\n\
+         # probe is exposed only after a frame presented at a size the compositor\n\
+         # CHOSE, a PTY the kernel agrees is that grid, and a started child --\n\
+         # more than the demo's probe proved, except that the demo also required\n\
+         # a seat advertising a POINTER and this needs only a keyboard.\n\
+         [terminal]\n\
          type=daemon\n\
-         exec=/bin/su -s /bin/sh {ui_user} -c '/bin/td-ui-demo run --socket /run/user/{ui_uid}/wayland-0 --ready-socket /run/user/{ui_uid}/td-ui-demo-ready'\n\
+         exec=/bin/su -s /bin/sh {ui_user} -c '/bin/td-term run --socket /run/user/{ui_uid}/wayland-0 --ready-socket /run/user/{ui_uid}/td-term-ready'\n\
          after=wayland\n\
          requires=wayland\n\
-         ready=/bin/su -s /bin/sh {ui_user} -c '/bin/td-ui-demo probe /run/user/{ui_uid}/td-ui-demo-ready'\n\
+         ready=/bin/su -s /bin/sh {ui_user} -c '/bin/td-term probe /run/user/{ui_uid}/td-term-ready'\n\
          ready-timeout=30\n\
          restart=always\n\
          \n\
          [bootsuccess]\n\
          type=oneshot\n\
          exec=/etc/bootsuccess\n\
-         after={sysinit},wayland,ui-demo\n\
-         requires=ui-demo\n\
+         after={sysinit},wayland,terminal\n\
+         requires=terminal\n\
          timeout={bootsuccess}\n\
          \n\
          [bootfail]\n\
@@ -2161,8 +2166,8 @@ fn real_root_steps(sys: &SystemDef) -> Vec<Step> {
         target: "{in:td-compositor}/bin/td-ui-demo".into(),
         link: "{root}/real-root/bin/td-ui-demo".into(),
     });
-    // The terminal. Packaged beside the demo rather than in place of it: the
-    // boot still starts the demo, and cutting that over is its own landing.
+    // The terminal: what the boot starts, and what the launcher opens. The
+    // demo keeps its own /bin name below because the launcher spawns it.
     steps.push(Step::Symlink {
         target: "{in:td-compositor}/bin/td-term".into(),
         link: "{root}/real-root/bin/td-term".into(),
@@ -2431,14 +2436,14 @@ fn shape_check() -> String {
      : 'the plan identical. the_declared_edges_are_exactly_these pins the edge set on'; \
      : 'the host; this pins that td-svc itself still resolves them this way.'; \
      svcpos() { printf '%s\\n' \"$tdsplan\" | grep -n -E \"^[0-9]+\\. $1\\$\" | cut -d: -f1; }; \
-     hn=$(svcpos hostname); fb=$(svcpos td-firstboot); rc=$(svcpos rootcheck); st=$(svcpos seat); nu=$(svcpos netup); wl=$(svcpos wayland); ui=$(svcpos ui-demo); bs=$(svcpos bootsuccess); sd=$(svcpos sshd); gr=$(svcpos greeter); \
+     hn=$(svcpos hostname); fb=$(svcpos td-firstboot); rc=$(svcpos rootcheck); st=$(svcpos seat); nu=$(svcpos netup); wl=$(svcpos wayland); tm=$(svcpos terminal); bs=$(svcpos bootsuccess); sd=$(svcpos sshd); gr=$(svcpos greeter); \
      [ \"$hn\" -lt \"$fb\" ] || { echo 'td-svc would not serialize hostname before td-firstboot - init ran every sysinit line to completion before the next, and td-svc starts settled units in the same pass' >&2; exit 1; }; \
      [ \"$fb\" -lt \"$rc\" ] || { echo 'td-svc would start rootcheck before td-firstboot - rootcheck asserts the identity td-firstboot mints is readable' >&2; exit 1; }; \
      [ \"$rc\" -lt \"$nu\" ] || { echo 'td-svc would start netup before rootcheck - networking must follow the read-only-root self-check' >&2; exit 1; }; \
      [ \"$nu\" -lt \"$sd\" ] || { echo 'td-svc would start sshd before netup - sshd binds loopback, which netup brings up' >&2; exit 1; }; \
      [ \"$fb\" -lt \"$sd\" ] || { echo 'td-svc would start sshd before td-firstboot - sshd is fail-closed on the host key td-firstboot mints, so it would refuse to start on every boot' >&2; exit 1; }; \
      [ \"$nu\" -lt \"$gr\" ] || { echo 'td-svc would start the greeter before netup' >&2; exit 1; }; \
-     [ \"$rc\" -lt \"$st\" ] && [ \"$st\" -lt \"$wl\" ] && [ \"$wl\" -lt \"$ui\" ] && [ \"$ui\" -lt \"$bs\" ] || { echo 'td-svc would not serialize rootcheck -> seat -> wayland -> ui-demo -> bootsuccess' >&2; exit 1; }; \
+     [ \"$rc\" -lt \"$st\" ] && [ \"$st\" -lt \"$wl\" ] && [ \"$wl\" -lt \"$tm\" ] && [ \"$tm\" -lt \"$bs\" ] || { echo 'td-svc would not serialize rootcheck -> seat -> wayland -> terminal -> bootsuccess' >&2; exit 1; }; \
      mkdir -p '{root}/pivot-probe' && cp \"$tdi\" '{root}/pivot-probe/init' || { echo 'root tree: could not build the switch_root probe NEWROOT' >&2; exit 1; }; \
      tdipiv=$(\"$tdi\" switch_root '{root}/pivot-probe' /init 2>&1) && { echo 'td-init switch_root ACCEPTED a NEWROOT that is not a mount point - the last refusal standing between a bad pivot and a panicked kernel is gone' >&2; exit 1; }; \
      case \"$tdipiv\" in *'not a mount point'*) : ;; *) echo \"td-init switch_root refused a non-mount NEWROOT for the WRONG reason, so the mount-point guard is untested: $tdipiv\" >&2; exit 1;; esac; \
@@ -2871,7 +2876,7 @@ mod tests {
             "/bin/td-seatd assign",
             "/etc/netup",
             "/bin/td-compositor run",
-            "/bin/td-ui-demo run",
+            "/bin/td-term run",
             "/etc/bootsuccess",
             "/etc/bootfail",
             "/bin/sshd serve",
@@ -2892,6 +2897,63 @@ mod tests {
             "TD_SVC_UNITS is what shape_check greps `td-svc check`'s plan for; a unit \
              missing from it is a unit whose absence from the plan nothing would catch"
         );
+    }
+
+    /// The boot's first graphical client is the TERMINAL, and the marker the
+    /// QEMU oracle waits for is the one THAT client prints.
+    ///
+    /// The two live in different files — the unit table here, the oracle in
+    /// `td-recipe-eval` — and nothing but this ties them. Point the unit back
+    /// at the demo and the oracle waits for a line nothing prints: a boot that
+    /// runs to its timeout with no cause on the console.
+    #[test]
+    fn the_boot_starts_the_terminal_and_the_oracle_waits_for_its_marker() {
+        let exec = unit_key("terminal", "exec").unwrap_or_default();
+        assert!(exec.contains("/bin/td-term run "), "{exec}");
+        let ready = unit_key("terminal", "ready").unwrap_or_default();
+        assert!(ready.contains("/bin/td-term probe "), "{ready}");
+        // The SAME socket in both, which containing the right program does not
+        // give: a probe dialling a path the client never publishes burns the
+        // 30s ready-timeout, restarts forever, and never reaches bootsuccess.
+        let published = exec.split("--ready-socket ").nth(1).unwrap_or_default();
+        let published = published.split(['\'', ' ']).next().unwrap_or_default();
+        let dialled = ready.split("probe ").nth(1).unwrap_or_default();
+        let dialled = dialled.split(['\'', ' ']).next().unwrap_or_default();
+        assert!(!published.is_empty(), "the unit publishes no ready socket");
+        assert_eq!(
+            published, dialled,
+            "the terminal publishes {published} but its probe dials {dialled}"
+        );
+        assert_eq!(unit_key("terminal", "requires").as_deref(), Some("wayland"));
+        // bootsuccess turns on it, so a boot that reaches no terminal is not a
+        // success — which is what makes the oracle's wait a proof and not a
+        // hopeful grep.
+        assert_eq!(
+            unit_key("bootsuccess", "requires").as_deref(),
+            Some("terminal")
+        );
+        assert!(unit_after("bootsuccess").contains(&"terminal".to_string()));
+        // Which marker the ORACLE selects cannot be seen from this crate's
+        // lib — it is a `const` in the `td-recipe-eval` bin — so the pin for
+        // that lives beside it, in `qemu_boot.rs`'s own tests.
+        // And nothing STARTS the demo any more. Stated as the property rather
+        // than as one spelling of it: the demo's name may appear in a unit
+        // ONLY as the launcher client the compositor spawns on request, which
+        // is not a service. Anchoring on `-c '` instead would let a unit using
+        // double quotes, or no `su` wrapper, walk straight past.
+        for (unit, keys) in parse_td_svc_conf() {
+            for (key, value) in keys {
+                for occurrence in value.match_indices("/bin/td-ui-demo") {
+                    let (at, _) = occurrence;
+                    let before = value.get(..at).unwrap_or_default();
+                    assert!(
+                        before.ends_with("--launcher-client "),
+                        "unit [{unit}] {key}= names the demo somewhere other than \
+                         as the launcher client: {value}"
+                    );
+                }
+            }
+        }
     }
 
     /// Every client path the compositor is handed is a name the image STAGES.
@@ -3139,13 +3201,13 @@ mod tests {
             ("seat", vec!["rootcheck"]),
             ("netup", vec!["rootcheck"]),
             ("wayland", vec!["seat"]),
-            ("ui-demo", vec!["wayland"]),
+            ("terminal", vec!["wayland"]),
             (
                 "bootsuccess",
                 sysinit
                     .iter()
                     .copied()
-                    .chain(["wayland", "ui-demo"])
+                    .chain(["wayland", "terminal"])
                     .collect(),
             ),
             ("bootfail", sysinit.to_vec()),
@@ -3203,12 +3265,12 @@ mod tests {
             "bootsuccess must be ordered after the graphical readiness decision"
         );
         assert!(
-            unit_after("bootsuccess").contains(&"ui-demo".to_string()),
+            unit_after("bootsuccess").contains(&"terminal".to_string()),
             "bootsuccess must wait for the first client frame"
         );
         assert_eq!(
             unit_key("bootsuccess", "requires").as_deref(),
-            Some("ui-demo"),
+            Some("terminal"),
             "deployment health must be skipped when the graphical client failed; \
              after= alone settles on either success or failure"
         );
@@ -3250,12 +3312,12 @@ mod tests {
             "the graphical session is supervised and restartable"
         );
         assert_eq!(
-            unit_key("ui-demo", "requires").as_deref(),
+            unit_key("terminal", "requires").as_deref(),
             Some("wayland"),
-            "the demo client must not start without its compositor"
+            "the terminal must not start without its compositor"
         );
         assert_eq!(
-            unit_key("ui-demo", "restart").as_deref(),
+            unit_key("terminal", "restart").as_deref(),
             Some("always"),
             "the graphical client is supervised and restartable"
         );

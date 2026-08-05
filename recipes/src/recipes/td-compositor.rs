@@ -205,7 +205,9 @@ pub fn recipe() -> Recipe {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ladder::{TD_UI_CLIENT_RUNTIME_MARKER, TD_WAYLAND_RUNTIME_MARKER};
+    use crate::ladder::{
+        TD_TERM_RUNTIME_MARKER, TD_UI_CLIENT_RUNTIME_MARKER, TD_WAYLAND_RUNTIME_MARKER,
+    };
 
     #[test]
     fn recipe_writes_every_declared_module() {
@@ -228,6 +230,15 @@ mod tests {
             .expect("client source");
         assert!(client.contains(&format!(
             "println!(\"{TD_UI_CLIENT_RUNTIME_MARKER} surface={{}}x{{}}\""
+        )));
+        // The terminal's marker is the boot oracle's first-client proof since
+        // the cutover, so the literal is pinned here as the other two are.
+        let ready = MODULES
+            .iter()
+            .find_map(|(name, source)| (*name == "ready").then_some(*source))
+            .expect("ready source");
+        assert!(ready.contains(&format!(
+            "pub const MARKER: &str = \"{TD_TERM_RUNTIME_MARKER}\";"
         )));
     }
 
