@@ -221,15 +221,17 @@ mod tests {
             .iter()
             .find_map(|(name, source)| (*name == "server").then_some(*source))
             .expect("server source");
+        // The pin is on the EMIT, not on a string beside it: a helper that
+        // returns the right bytes proves nothing about what reaches stdout.
         assert!(server.contains(&format!(
-            "println!(\"{TD_WAYLAND_RUNTIME_MARKER} socket={{}}\""
+            "writeln!(out, \"{TD_WAYLAND_RUNTIME_MARKER} socket={{}}\", path.display())"
         )));
         let client = MODULES
             .iter()
             .find_map(|(name, source)| (*name == "client").then_some(*source))
             .expect("client source");
         assert!(client.contains(&format!(
-            "println!(\"{TD_UI_CLIENT_RUNTIME_MARKER} surface={{}}x{{}}\""
+            "writeln!(out, \"{TD_UI_CLIENT_RUNTIME_MARKER} surface={{}}x{{}}\", width, height)"
         )));
         // The terminal's marker is the boot oracle's first-client proof since
         // the cutover, so the literal is pinned here as the other two are.

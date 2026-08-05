@@ -29,6 +29,7 @@ mod wire;
 use framebuffer::Framebuffer;
 use runtime::Runtime;
 use std::env;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process;
 use std::sync::{Arc, Mutex};
@@ -243,7 +244,8 @@ fn selftest() -> Result<(), String> {
     if !frame.as_chunks::<4>().0.contains(&[1, 2, 3, 0]) {
         return Err("renderer selftest did not copy its surface".into());
     }
-    println!("TD-COMPOSITOR-SELFTEST-OK");
+    let mut out = std::io::stdout().lock();
+    writeln!(out, "TD-COMPOSITOR-SELFTEST-OK").map_err(|e| format!("write compositor selftest marker: {e}"))?;
     Ok(())
 }
 

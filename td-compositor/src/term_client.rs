@@ -1657,7 +1657,11 @@ pub fn run(options: &Options) -> Result<(), String> {
     // a panic here would abort past `Published::drop` and leave the socket
     // behind. One encoder, so the diagnostic an operator reads and the line a
     // probe parses cannot describe different grids.
-    let mut out = std::io::stdout();
+    // `lock()` because `println!` held one for the whole write and this must
+    // too: `write_all` on the unlocked handle re-takes it per `write` call, so
+    // a marker could interleave with another thread's line and reach the
+    // oracle as neither.
+    let mut out = std::io::stdout().lock();
     out.write_all(ready::marker(rows, columns).as_bytes())
         .map_err(|e| format!("write terminal ready marker: {e}"))?;
     out.flush()

@@ -2301,6 +2301,17 @@ fn keymap_directory(path: &Path) -> Result<&Path, String> {
     Ok(parent)
 }
 
+/// The readiness line the boot oracle greps. Where it WRITES is a parameter,
+/// the shape `term_selftest` and `probe_to` already use: a helper returning a
+/// String leaves the emit untested, so the bytes could be pinned here and a
+/// different line reach the console.
+fn announce(out: &mut impl Write, path: &Path) -> Result<(), String> {
+    writeln!(out, "TD-WAYLAND-READY socket={}", path.display())
+        .map_err(|e| format!("write Wayland ready marker: {e}"))?;
+    out.flush()
+        .map_err(|e| format!("flush Wayland ready marker: {e}"))
+}
+
 pub fn serve(path: &Path, runtime: Arc<Mutex<Runtime>>) -> Result<(), String> {
     let keymap_dir = keymap_directory(path)?.to_path_buf();
     let keymap = keymap_file(&keymap_dir)?;
@@ -2309,10 +2320,11 @@ pub fn serve(path: &Path, runtime: Arc<Mutex<Runtime>>) -> Result<(), String> {
         .map_err(|e| format!("bind Wayland socket {}: {e}", path.display()))?;
     fs::set_permissions(path, Permissions::from_mode(0o600))
         .map_err(|e| format!("chmod Wayland socket {}: {e}", path.display()))?;
-    println!("TD-WAYLAND-READY socket={}", path.display());
-    std::io::stdout()
-        .flush()
-        .map_err(|e| format!("flush Wayland ready marker: {e}"))?;
+    // `writeln!` rather than `println!`, which PANICS on a write failure; and
+    // `lock()` because `println!` held one for the whole write, so an unlocked
+    // handle could interleave this with another thread's line and reach the
+    // oracle as neither.
+    announce(&mut std::io::stdout().lock(), path)?;
     for connection in listener.incoming() {
         let stream = connection.map_err(|e| format!("accept Wayland client: {e}"))?;
         let permit = match ClientPermit::acquire() {
@@ -2346,6 +2358,15 @@ pub fn probe(path: &Path) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
+    /// The bytes the boot oracle greps, taken from the EMIT rather than from
+    /// a string beside it — including the newline `println!` added for free.
+    #[test]
+    fn the_ready_marker_is_one_line_with_its_socket() {
+        let mut out = Vec::new();
+        super::announce(&mut out, std::path::Path::new("/run/user/1000/wayland-0")).unwrap();
+        assert_eq!(out, b"TD-WAYLAND-READY socket=/run/user/1000/wayland-0\n");
+    }
+
     use super::*;
     use crate::framebuffer::Framebuffer;
     use crate::keyboard::{KeyInput, KeyState, ModifierState, RoutedKeyboardEvent, MOD_LOGO};

@@ -701,6 +701,15 @@ fn present(
     Ok((connection, demo))
 }
 
+/// The readiness line. Where it WRITES is a parameter for `announce`'s reason
+/// in `server.rs`: pinning a String beside the emit leaves the emit untested.
+fn announce(out: &mut impl Write, width: usize, height: usize) -> Result<(), String> {
+    writeln!(out, "TD-UI-CLIENT-READY surface={}x{}", width, height)
+        .map_err(|e| format!("write UI client ready marker: {e}"))?;
+    out.flush()
+        .map_err(|e| format!("flush UI client ready marker: {e}"))
+}
+
 pub fn run(options: &Options) -> Result<(), String> {
     let runtime_directory = options
         .socket
@@ -717,15 +726,11 @@ pub fn run(options: &Options) -> Result<(), String> {
     connection.finish_handshake()?;
 
     let _ready = socket::publish(&options.ready_socket, "ui-demo-ready", Vec::new())?;
-    // NOTE: `println!` panics on a write failure, the hazard the terminal's
-    // own marker avoids. No oracle reads this line since the terminal took
-    // over as the boot's first client; what still pins the spelling is the
-    // recipe, and the launcher still spawns this binary, so the hazard is
-    // real and unfixed rather than blocked.
-    println!("TD-UI-CLIENT-READY surface={}x{}", size.width, size.height);
-    std::io::stdout()
-        .flush()
-        .map_err(|e| format!("flush UI client ready marker: {e}"))?;
+    // `writeln!` rather than `println!`, which PANICS on a write failure -- the
+    // crate forbids that on any path, and the launcher spawns this binary with
+    // its stdout wherever the compositor's went. `lock()` for `announce`'s
+    // reason there.
+    announce(&mut std::io::stdout().lock(), size.width, size.height)?;
 
     loop {
         let message = connection.next()?;
@@ -886,12 +891,25 @@ pub fn selftest() -> Result<(), String> {
     if content != first {
         return Err("demo descriptor transport did not preserve pixels".into());
     }
-    println!("TD-UI-DEMO-SELFTEST-OK");
+    let mut out = std::io::stdout().lock();
+    writeln!(out, "TD-UI-DEMO-SELFTEST-OK").map_err(|e| format!("write demo selftest marker: {e}"))?;
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
+    /// The bytes the recipe pins, taken from the EMIT rather than from a
+    /// string beside it — including the newline `println!` added for free.
+    #[test]
+    fn the_ready_marker_is_one_line_with_its_dimensions() {
+        let mut out = Vec::new();
+        super::announce(&mut out, 640, 480).unwrap();
+        assert_eq!(out, b"TD-UI-CLIENT-READY surface=640x480\n");
+        let mut zero = Vec::new();
+        super::announce(&mut zero, 0, 0).unwrap();
+        assert_eq!(zero, b"TD-UI-CLIENT-READY surface=0x0\n");
+    }
+
     use super::*;
     use crate::conn::{DISPLAY, MAX_PENDING_FDS};
     use crate::keyboard::XKB_KEYMAP;
