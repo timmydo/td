@@ -3,11 +3,11 @@ use crate::pointer::MAX_POINTER_FRAME_EVENTS;
 use crate::ui::{KeyboardUpdate, PointerUpdate, UiKeyState, UiModel, UiModifiers};
 use crate::{socket, sys, wire, MAX_UI_DIMENSION, MAX_UI_FRAME_BYTES};
 use std::collections::{BTreeSet, VecDeque};
-use std::fs::{self, File, OpenOptions, Permissions};
+use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::os::fd::{AsRawFd, RawFd};
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-use std::os::unix::net::{UnixListener, UnixStream};
+use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -319,50 +319,6 @@ impl Connection {
             sys::discard_received(&[fd]);
         }
     }
-}
-
-struct ReadySocket {
-    path: PathBuf,
-}
-
-impl Drop for ReadySocket {
-    fn drop(&mut self) {
-        let _ = fs::remove_file(&self.path);
-    }
-}
-
-fn start_ready_socket(path: &Path) -> Result<ReadySocket, String> {
-    socket::remove_stale(path, "readiness")?;
-    let listener = UnixListener::bind(path)
-        .map_err(|e| format!("bind readiness socket {}: {e}", path.display()))?;
-    if let Err(error) = fs::set_permissions(path, Permissions::from_mode(0o600)) {
-        let cleanup = fs::remove_file(path);
-        return match cleanup {
-            Ok(()) => Err(format!(
-                "chmod readiness socket {}: {error}",
-                path.display()
-            )),
-            Err(cleanup) => Err(format!(
-                "chmod readiness socket {}: {error}; remove it: {cleanup}",
-                path.display()
-            )),
-        };
-    }
-    let owned_path = path.to_path_buf();
-    if let Err(error) = thread::Builder::new()
-        .name("ui-demo-ready".into())
-        .spawn(move || {
-            for connection in listener.incoming() {
-                if connection.is_err() {
-                    break;
-                }
-            }
-        })
-    {
-        let _ = fs::remove_file(path);
-        return Err(format!("start readiness listener: {error}"));
-    }
-    Ok(ReadySocket { path: owned_path })
 }
 
 fn bind(
@@ -1243,7 +1199,7 @@ pub fn run(options: &Options) -> Result<(), String> {
         .ok_or_else(|| "demo became ready without a configured size".to_string())?;
     connection.finish_handshake()?;
 
-    let _ready = start_ready_socket(&options.ready_socket)?;
+    let _ready = socket::publish(&options.ready_socket, "ui-demo-ready", Vec::new())?;
     println!("TD-UI-CLIENT-READY surface={}x{}", size.width, size.height);
     std::io::stdout()
         .flush()

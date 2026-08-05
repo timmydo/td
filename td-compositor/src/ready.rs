@@ -13,19 +13,12 @@
 
 use crate::pty;
 use crate::socket;
-use std::fs::{self, Permissions};
 use std::io::{Read, Write};
-use std::os::unix::fs::PermissionsExt;
-use std::os::unix::net::{UnixListener, UnixStream};
-use std::path::{Path, PathBuf};
-use std::thread;
+use std::os::unix::net::UnixStream;
+use std::path::Path;
 use std::time::{Duration, Instant};
 
 pub const MARKER: &str = "TD-TERM-READY";
-
-/// Private to the graphical user, as the demo's is.
-#[allow(dead_code)]
-const MODE: u32 = 0o600;
 
 /// Exactly the longest line [`marker`] can produce — both dimensions at their
 /// widest. A byte more is not a readiness line, and the bound is what keeps a
@@ -93,71 +86,14 @@ fn field(value: Option<&str>, name: &str) -> Result<u16, String> {
         .map_err(|_| format!("readiness {name} '{digits}' is not a grid dimension"))
 }
 
-/// A bound readiness socket. Dropping it unlinks the path, so a terminal that
-/// exits leaves nothing for the next one to refuse.
-///
-/// It does NOT retire the listener: that thread owns the descriptor and parks
-/// in `accept`, which safe `std` cannot interrupt any more than it can the PTY
-/// reader's `read`. Its only retirement is process exit — sound for the same
-/// reason, since td-term is one process per terminal and closing the terminal
-/// IS exiting. The consequence is the same contract: nothing may join it.
-#[allow(dead_code)]
-pub struct Ready {
-    path: PathBuf,
-}
-
-impl Drop for Ready {
-    fn drop(&mut self) {
-        let _ = fs::remove_file(&self.path);
-    }
-}
-
 /// Bind the readiness socket and answer every caller with this grid.
 #[allow(dead_code)]
-pub fn publish(path: &Path, rows: u16, columns: u16) -> Result<Ready, String> {
+pub fn publish(path: &Path, rows: u16, columns: u16) -> Result<socket::Published, String> {
     let line = marker(rows, columns);
     // Refuse to publish a grid the probe would then reject, rather than
     // serving a line no caller can accept.
     parse(&line)?;
-    socket::remove_stale(path, "readiness")?;
-    let listener = UnixListener::bind(path)
-        .map_err(|e| format!("bind readiness socket {}: {e}", path.display()))?;
-    if let Err(error) = fs::set_permissions(path, Permissions::from_mode(MODE)) {
-        return Err(cleanup(path, format!("chmod readiness socket: {error}")));
-    }
-    let owned = path.to_path_buf();
-    if let Err(error) = thread::Builder::new()
-        .name("td-term-ready".into())
-        .spawn(move || {
-            for connection in listener.incoming() {
-                let Ok(mut connection) = connection else {
-                    break;
-                };
-                // A caller that hung up mid-answer is the caller's business.
-                let _ = connection.write_all(line.as_bytes());
-            }
-        })
-    {
-        return Err(cleanup(path, format!("start readiness listener: {error}")));
-    }
-    Ok(Ready { path: owned })
-}
-
-/// Both failures, when removing the half-built socket fails too: either
-/// message alone would misdescribe what was left on disk.
-#[allow(dead_code)]
-fn cleanup(path: &Path, cause: String) -> String {
-    match fs::remove_file(path) {
-        // Nothing left to remove is not a second thing to report.
-        Ok(()) => format!("{cause} ({})", path.display()),
-        Err(removal) if removal.kind() == std::io::ErrorKind::NotFound => {
-            format!("{cause} ({})", path.display())
-        }
-        Err(removal) => format!(
-            "{cause} ({}); and removing it failed: {removal}",
-            path.display()
-        ),
-    }
+    socket::publish(path, "td-term-ready", line.into_bytes())
 }
 
 /// Ask a terminal whether it is up, and print what it answered.
@@ -264,7 +200,12 @@ pub fn selftest() -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::net::UnixListener;
+    use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::thread;
 
     static SEQ: AtomicU64 = AtomicU64::new(0);
 
@@ -403,23 +344,6 @@ mod tests {
         assert!(occupied.exists(), "a refused publication ate a real file");
         fs::remove_file(&occupied).unwrap();
         fs::remove_file(&path).unwrap();
-        fs::remove_dir(&directory).unwrap();
-    }
-
-    #[test]
-    fn a_half_built_socket_is_removed_and_reported() {
-        let directory = scratch("cleanup");
-        let path = directory.join("td-term-ready");
-        UnixListener::bind(&path).unwrap();
-        let reported = cleanup(&path, "chmod readiness socket: no".into());
-        assert!(reported.starts_with("chmod readiness socket: no"));
-        assert!(
-            !path.exists(),
-            "a failed publication left its own socket behind"
-        );
-        // Nothing to remove is not a second failure to report.
-        let reported = cleanup(&path, "cause".into());
-        assert!(!reported.contains("removing it failed"), "{reported}");
         fs::remove_dir(&directory).unwrap();
     }
 
