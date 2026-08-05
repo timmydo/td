@@ -11,7 +11,8 @@
 # on a pin bump or when passes change:
 #   cargo build --release --manifest-path td-sh/Cargo.toml
 #   cargo run --release --manifest-path td-sh/Cargo.toml --example gen_expectations \
-#     -- target/release/td-sh td-sh/spec > td-sh/spec/expectations.txt
+#     -- td-sh/target/release/td-sh td-sh/target/release/spec_argv td-sh/spec \
+#     > td-sh/spec/expectations.txt
 #
 # Format, one per line:   <xfail|skip> <spec-file>::<case description>
 #   xfail = td-sh runs it and gets the wrong answer today. It still RUNS every
@@ -19,15 +20,14 @@
 #           fails) reds the gate, and an unexpected PASS (XPASS) reds it so the
 #           entry is promoted. NOTE on honesty at this scale: many xfails are
 #           status-127 `command not found` failures, because the cleared-env `-c`
-#           harness exposes no external PATH and no `argv.py`. Those are real
-#           mismatches today, but they measure the harness's minimalism as much as
-#           td-sh; a PATH/externals + argv.py rig (deferred) would convert a large
-#           block of them into true builtin/parser pass-fail signal.
+#           harness exposes no external PATH beyond the shell itself and `argv.py`.
+#           Those are real mismatches today, but they measure the harness's
+#           minimalism as much as td-sh; serving more of the externals the corpus
+#           reaches for (deferred) would convert a further block of them into true
+#           builtin/parser pass-fail signal.
 #   skip  = not run at all, because it cannot be evaluated faithfully here:
-#           (a) it needs a facility the `-c` harness does not provide (the Oils
-#               `argv.py` helper), detected by the code mentioning `argv.py`;
-#           (b) td-sh hangs/loops on it, so it would time out (10s) every gate;
-#           (c) it depends on the Oils repo tree the isolated cwd does not stage
+#           (a) td-sh hangs/loops on it, so it would time out (10s) every gate;
+#           (b) it depends on the Oils repo tree the isolated cwd does not stage
 #               (a `spec/testdata/*` fixture, `$REPO_ROOT`, a pre-made `_tmp/`, or
 #               reading `spec/`), detected by `reads_repo_tree` (the code mentions
 #               `spec/`, `REPO_ROOT`, `testdata`, or `_tmp/`) — which fails for an
@@ -35,7 +35,7 @@
 #               spec/` empty on both sides of a comparison) that would mask real
 #               regressions. A PASSING tree-reading case is skipped for the same
 #               false-green reason.
-#           (d) it depends on SHARED `/tmp` state the isolated cwd neither owns nor
+#           (c) it depends on SHARED `/tmp` state the isolated cwd neither owns nor
 #               cleans, detected by `depends_on_shared_tmp` in the three shapes the
 #               corpus spells it: an absolute path under `/tmp` (the code mentions
 #               `/tmp/`), the same path reached through `HOME=/tmp`, and a test of
@@ -51,7 +51,7 @@
 #               same false-green reason, and `-k for sticky bit` IS one -- so its
 #               disagreement would red as a REGRESSION, not as the milder XPASS the
 #               rest would. Fifteen MOVE here; the sixteenth (`builtin-dirs::cd
-#               replaces the lowest entry`) was already skipped by (c), whose
+#               replaces the lowest entry`) was already skipped by (b), whose
 #               `spec/` token its `/tmp/oils-spec/` path contains.
 #               Bare `/tmp` is deliberately NOT a shape: ten cases need only that it
 #               EXIST, which is universal, and one names the relative `./tmp.sh`.
@@ -59,8 +59,8 @@
 #           with FULL-LINE comments stripped, so a token mentioned only in prose does
 #           not force a skip. KNOWN over-match (safe direction): a token inside an
 #           INLINE comment (`cmd  # ... spec/ ...`) still trips it, so a self-contained
-#           case can be over-skipped and lose gate coverage; a follow-up fixture/argv
-#           rig plus proper comment tokenizing would let most of (a) and (c) run.
+#           case can be over-skipped and lose gate coverage; a follow-up fixture rig
+#           plus proper comment tokenizing would let most of (b) run.
 #
 # The key is `<file>::<description>`, occurrence-qualified: a description repeated
 # within a file gets an ` ##N` suffix on its 2nd+ occurrence (see case_keys), so
@@ -69,6 +69,7 @@
 # (see duplicate_conflicts).
 
 # ---- xfail: td-sh runs, wrong answer (known gaps) ----
+xfail alias.test.sh::Alias and command sub (bug regression)
 xfail alias.test.sh::Alias that is && || ;
 xfail alias.test.sh::Alias that is pipeline
 xfail alias.test.sh::Two aliases in pipeline
@@ -79,17 +80,25 @@ xfail alias.test.sh::alias with word of multiple lines
 xfail alias.test.sh::alias without args lists all aliases
 xfail alias.test.sh::here doc inside alias
 xfail alias.test.sh::unalias -a
+xfail append.test.sh::Append array to array
 xfail append.test.sh::Append string to string
 xfail append.test.sh::Append string to undefined variable
+xfail append.test.sh::Append to array to undefined variable
 xfail append.test.sh::Strings have value semantics, not reference semantics
 xfail append.test.sh::Type mismatching of lhs+=rhs should not cause a crash
 xfail append.test.sh::assign builtin appending array: declare d+=(d e)
 xfail append.test.sh::error: append used like env prefix
+xfail append.test.sh::error: myarray+=s
+xfail append.test.sh::error: s+=(my array)
+xfail append.test.sh::error: typeset myarray+=s
 xfail append.test.sh::export readonly +=
 xfail append.test.sh::export+=array disallowed (strict_array)
 xfail append.test.sh::local +=
+xfail append.test.sh::myarray[-1]+=s - Append to last element
+xfail append.test.sh::myarray[1]+=s - Append to element
 xfail append.test.sh::typeset s${dyn}+=
 xfail append.test.sh::typeset s+=
+xfail append.test.sh::typeset s+=(my array)
 xfail arith-context.test.sh::$[ is a synonym for $((
 xfail arith-context.test.sh::$[$undefined] is a synonym for $(($undefined (#2566)
 xfail arith-context.test.sh::$[$var is a synonym for $(($var (#2426)
@@ -113,17 +122,25 @@ xfail array-assoc.test.sh::${A[@]/b/B}
 xfail array-assoc.test.sh::${assoc} is like ${assoc[0]}
 xfail array-assoc.test.sh::(( A[5] += 42 ))
 xfail array-assoc.test.sh::(( A[5] += 42 )) with empty cell
+xfail array-assoc.test.sh::Append to associative array value A['x']+='suffix'
+xfail array-assoc.test.sh::Array stored in associative array gets converted to string (without strict_array)
 xfail array-assoc.test.sh::Associative array expressions inside (( )) with keys that look like numbers
 xfail array-assoc.test.sh::BashAssoc ${a[@]@Q}
 xfail array-assoc.test.sh::BashAssoc a+=()
 xfail array-assoc.test.sh::Can initialize assoc array with the "(key value ...)" sequence
+xfail array-assoc.test.sh::Empty value (doesn't use EmptyWord?)
+xfail array-assoc.test.sh::Implicit increment of keys
 xfail array-assoc.test.sh::Indexed array as key of associative array coerces to string (without shopt -s strict_array)
 xfail array-assoc.test.sh::Literal syntax ([x]=y)
+xfail array-assoc.test.sh::Slice of associative array doesn't make sense in bash
 xfail array-assoc.test.sh::[[ -v assoc[key] ]]
 xfail array-assoc.test.sh::[[ -v assoc[key] ]] syntax errors
 xfail array-assoc.test.sh::associative array and brace expansion
 xfail array-assoc.test.sh::bash bug: "i+1" and i+1 are the same key
+xfail array-assoc.test.sh::bash bug: (( A["$key"] = 1 )) doesn't work
 xfail array-assoc.test.sh::bash variable can have an associative array part and a string part
+xfail array-assoc.test.sh::coerce to string with ${A[*]}, etc.
+xfail array-assoc.test.sh::create empty assoc array, put, then get
 xfail array-assoc.test.sh::declare -A A=() allowed
 xfail array-assoc.test.sh::length ${#a[@]}
 xfail array-assoc.test.sh::lookup by unquoted string doesn't work in OSH because it's a variable
@@ -141,36 +158,62 @@ xfail array-assoc.test.sh::setting key to itself (from bash-bug mailing list)
 xfail array-assoc.test.sh::test -v assoc[key]
 xfail array-assoc.test.sh::test -v with dynamic parsing
 xfail array-assoc.test.sh::unset -v and assoc array
+xfail array-basic.test.sh::"${a[@]}" and "${a[*]}"
+xfail array-basic.test.sh::${a[@]} and ${a[*]}
+xfail array-basic.test.sh::4 ways to interpolate empty array
+xfail array-basic.test.sh::Empty array with :-
+xfail array-basic.test.sh::empty array
 xfail array-compat.test.sh::++ on a whole array increments the first element (disallowed with strict_array)
+xfail array-compat.test.sh::Apply vectorized operations on ${a[*]}
 xfail array-compat.test.sh::Assign to array index without initialization
+xfail array-compat.test.sh::User arrays decay
 xfail array-compat.test.sh::a[40] grows array
 xfail array-compat.test.sh::array decays to string when comparing with [[ a = b ]]
 xfail array-compat.test.sh::strict_array: $array is not valid in OSH, is ${array[0]} in ksh/bash
 xfail array-compat.test.sh::strict_array: ${array} is not valid in OSH, is ${array[0]} in ksh/bash
+xfail array-compat.test.sh::value.BashArray internal representation - Assoc (ordering is a problem)
+xfail array-compat.test.sh::value.BashArray internal representation - Indexed
 xfail array-literal.test.sh::(strict_array) assoc=(key value ...) is not allowed
 xfail array-literal.test.sh::(strict_array) declare -A s+=()
 xfail array-literal.test.sh::(strict_array) s+=()
+xfail array-literal.test.sh::BashArray cannot be changed to BashAssoc and vice versa
+xfail array-literal.test.sh::Evaluation order (1)
+xfail array-literal.test.sh::Evaluation order (2)
+xfail array-literal.test.sh::Evaluation order (3)
 xfail array-literal.test.sh::Tilde expansions in RHS of [k]=v (BashArray)
 xfail array-literal.test.sh::Tilde expansions in RHS of [k]=v (BashAssoc)
 xfail array-literal.test.sh::[k1]=v1 (BashArray)
 xfail array-literal.test.sh::[k1]=v1 (BashAssoc)
 xfail array-literal.test.sh::[k1]=v1 looking like brace expansions (BashArray)
 xfail array-literal.test.sh::[k1]=v1 looking like brace expansions (BashAssoc)
+xfail array-literal.test.sh::[k]=$v and [k]="$@" (BashArray)
+xfail array-literal.test.sh::[k]=$v and [k]="$@" (BashAssoc)
+xfail array-literal.test.sh::append to element (BashArray)
+xfail array-literal.test.sh::append to element (BashAssoc)
+xfail array-literal.test.sh::index increments without [k]= (BashArray)
+xfail array-literal.test.sh::non-index forms of element (BashAssoc)
 xfail array-sparse.test.sh::"${a[*]}"
 xfail array-sparse.test.sh::${!a[0]}
+xfail array-sparse.test.sh::${!a[@]}
 xfail array-sparse.test.sh::${@:offset:length}
 xfail array-sparse.test.sh::${a-}
+xfail array-sparse.test.sh::${a[@]#...}
 xfail array-sparse.test.sh::${a[@]-unset}, ${a[@]:-empty}, etc.
+xfail array-sparse.test.sh::${a[@]/pat/rep}
 xfail array-sparse.test.sh::${a[@]:BigInt}
 xfail array-sparse.test.sh::${a[@]:offset:length}
+xfail array-sparse.test.sh::${a[@]@P}, ${a[@]@Q}, and ${a[@]@a}
+xfail array-sparse.test.sh::${a[@]}
 xfail array-sparse.test.sh::${sp[i]}
 xfail array-sparse.test.sh::${sp[i]} with negative invalid index
 xfail array-sparse.test.sh::((sp[i])) and ((sp[i]++))
 xfail array-sparse.test.sh::((sp[i])) and ((sp[i]++)) with invalid negative index
 xfail array-sparse.test.sh::(YSH) $[a1 === a2]
 xfail array-sparse.test.sh::(YSH) $[bool(a)]
+xfail array-sparse.test.sh::(YSH) @[sp] and @sp
 xfail array-sparse.test.sh::(YSH) append v1 v2... (a)
 xfail array-sparse.test.sh::+=
+xfail array-sparse.test.sh::Initializing indexed array with ([index]=value)
 xfail array-sparse.test.sh::Negative index with a[i]=v
 xfail array-sparse.test.sh::Negative out-of-bound index with a[i]=v (1/2)
 xfail array-sparse.test.sh::Negative out-of-bound index with a[i]=v (2/2)
@@ -180,6 +223,7 @@ xfail array-sparse.test.sh::[[ -v a[i] ]]
 xfail array-sparse.test.sh::[[ -v a[i] ]] with invalid negative index
 xfail array-sparse.test.sh::a[i]=v
 xfail array-sparse.test.sh::a[i]=v with BigInt
+xfail array-sparse.test.sh::compadjust
 xfail array-sparse.test.sh::compgen -F _set_COMPREPLY
 xfail array-sparse.test.sh::crash dump
 xfail array-sparse.test.sh::test "declare -p sp"
@@ -188,19 +232,34 @@ xfail array-sparse.test.sh::unset -v a[i]
 xfail array-sparse.test.sh::unset -v a[i] for max index
 xfail array-sparse.test.sh::unset -v a[i] with out-of-bound negative index
 xfail array-sparse.test.sh::xtrace a+=()
+xfail array.test.sh::"$*"
+xfail array.test.sh::$*
+xfail array.test.sh::${!a[1]} is named ref in bash
+xfail array.test.sh::${!a} on array
 xfail array.test.sh::${mystr[@]} and ${mystr[*]} are no-ops
 xfail array.test.sh::${mystr[@]} and ${mystr[*]} disallowed with strict_array
+xfail array.test.sh::All elements quoted
+xfail array.test.sh::All elements unquoted
+xfail array.test.sh::Append sparse arrays
 xfail array.test.sh::Array syntax in wrong place
 xfail array.test.sh::Brace Expansion within Array
+xfail array.test.sh::Command with with word splitting in array
+xfail array.test.sh::Create a "user" array out of the argv array
+xfail array.test.sh::Create sparse array
+xfail array.test.sh::Create sparse array implicitly
 xfail array.test.sh::Dynamic parsing of RHS ${a[$code]}
 xfail array.test.sh::Exporting array doesn't do anything, not even first element
+xfail array.test.sh::Interpolate array into array
 xfail array.test.sh::Is element set?  test -v a[i]
 xfail array.test.sh::Iteration
 xfail array.test.sh::Length after unset
 xfail array.test.sh::Length of an element
 xfail array.test.sh::More arith expressions in [[ -v array[expr]] ]]
+xfail array.test.sh::Negative index
 xfail array.test.sh::Negative index and sparse array
 xfail array.test.sh::Negative index and sparse array ##2
+xfail array.test.sh::Negative slice begin
+xfail array.test.sh::Negative slice length
 xfail array.test.sh::Number of elements
 xfail array.test.sh::Regression: ${a[@]@Q} crash with `a[0]=x a[2]=y`
 xfail array.test.sh::Regression: Array length after unset
@@ -210,16 +269,46 @@ xfail array.test.sh::Regression: Negative out-of-range index in [[ -v a[index] ]
 xfail array.test.sh::Regression: Out-of-bound negative offset for ${a[@]:offset}
 xfail array.test.sh::Regression: silent out-of-bound negative index in ${a[-2]} and $((a[-2]))
 xfail array.test.sh::Regression: unset a[-2]: out-of-bound negative index should cause error
+xfail array.test.sh::Retrieve array indices with ${!a}
+xfail array.test.sh::Retrieve index
+xfail array.test.sh::Retrieve index that is a command sub
+xfail array.test.sh::Retrieve index that is a variable
+xfail array.test.sh::Retrieve index that is a variable without $
+xfail array.test.sh::Retrieve out of bounds index
+xfail array.test.sh::Retrieve sparse array indices with ${!a}
+xfail array.test.sh::Set element
+xfail array.test.sh::Set element with array ref
+xfail array.test.sh::Set element with var ref
+xfail array.test.sh::Single array with :-
 xfail array.test.sh::Singleton Array Copy and Assign.  OSH can't index strings with ints
+xfail array.test.sh::Slice of array with [@]
+xfail array.test.sh::Slice of sparse array with [@]
+xfail array.test.sh::Slice with arithmetic
+xfail array.test.sh::Stripping a whole array quoted
+xfail array.test.sh::Stripping a whole array unquoted
 xfail array.test.sh::Tilde expansion within array
+xfail array.test.sh::Using an array itself as the index on LHS
 xfail array.test.sh::Using an array itself as the index on RHS
 xfail array.test.sh::[[ -v a[i] ]]
 xfail array.test.sh::a+=() modifies existing instance of BashArray
 xfail array.test.sh::a[$x$y] on LHS and RHS
+xfail array.test.sh::array default
+xfail array.test.sh::array over multiple lines
+xfail array.test.sh::array with empty string
+xfail array.test.sh::declare -a / local -a is empty array
+xfail array.test.sh::declare array and then append
+xfail array.test.sh::glob within array yields separate elements
+xfail array.test.sh::local array
+xfail array.test.sh::nounset / set -u with empty array (bug in bash 4.3, fixed in 4.4)
 xfail array.test.sh::strict_array prevents exporting array
 xfail array.test.sh::test -v a[i] with arith expressions
+xfail assign-deferred.test.sh::export a[7]=8
 xfail assign-deferred.test.sh::is 'builtin' prefix and array allowed?  OSH is smarter
 xfail assign-deferred.test.sh::is 'command' prefix and array allowed?  OSH is smarter
+xfail assign-deferred.test.sh::local a[3]=4
+xfail assign-deferred.test.sh::readonly a[7]=8
+xfail assign-deferred.test.sh::typeset -a a[1]=a a[3]=c
+xfail assign-deferred.test.sh::typeset a[3]=4
 xfail assign-dialects.test.sh::K and V are variables in (( array[K] = V ))
 xfail assign-dialects.test.sh::test -v with arrays
 xfail assign-dialects.test.sh::test -v with assoc arrays
@@ -229,7 +318,9 @@ xfail assign-extended.test.sh::Multiple assignments / array assignments on a lin
 xfail assign-extended.test.sh::ble.sh: eval -- "$(declare -p var arr)"
 xfail assign-extended.test.sh::declare
 xfail assign-extended.test.sh::declare -F prints function names
+xfail assign-extended.test.sh::declare -a
 xfail assign-extended.test.sh::declare -f exit code indicates function existence
+xfail assign-extended.test.sh::declare -g (bash-specific; bash-completion uses it)
 xfail assign-extended.test.sh::declare -p
 xfail assign-extended.test.sh::declare -p UNDEF (and typeset) -- prints something to stderr
 xfail assign-extended.test.sh::declare -p and value.Undef
@@ -243,9 +334,11 @@ xfail assign-extended.test.sh::declare -pg
 xfail assign-extended.test.sh::declare -pg var
 xfail assign-extended.test.sh::declare -pnrx
 xfail assign-extended.test.sh::declare -pnrx var
+xfail assign-extended.test.sh::dynamic array parsing is not allowed
 xfail assign-extended.test.sh::dynamic flag in array in assign builtin
 xfail assign-extended.test.sh::eval -- "$(declare -p arr)" (restore arrays w/ unset elements)
 xfail assign-extended.test.sh::invalid var name
+xfail assign-extended.test.sh::local -a
 xfail assign-extended.test.sh::myvar=typeset (another form of dynamic assignment)
 xfail assign-extended.test.sh::syntax error in array assignment
 xfail assign-extended.test.sh::typeset +r removes read-only attribute (TODO: documented in bash to do nothing)
@@ -266,9 +359,14 @@ xfail assign.test.sh::Env value with escaped <
 xfail assign.test.sh::Env value with two quotes
 xfail assign.test.sh::Escaped = in command name
 xfail assign.test.sh::Multiple temporary envs on the stack
+xfail assign.test.sh::aliased assignment doesn't split
+xfail assign.test.sh::assign and glob
+xfail assign.test.sh::assignment using dynamic keyword (splits in most shells, not in zsh/osh)
 xfail assign.test.sh::export a=1 no_value c=2
+xfail assign.test.sh::local a=loc $var c=loc
 xfail assign.test.sh::redirect after assignment builtin (eval redirects after evaluating arguments)
 xfail assign.test.sh::redirect after command sub (like case above but without assignment builtin)
+xfail assign.test.sh::static assignment doesn't split
 xfail background.test.sh::Background process and then a singleton pipeline
 xfail background.test.sh::No stderr spew when shell is not interactive
 xfail background.test.sh::Start background pipeline, wait $pid
@@ -316,6 +414,8 @@ xfail brace-expansion.test.sh::Char ranges with steps of the wrong sign
 xfail brace-expansion.test.sh::Descending char range expansion
 xfail brace-expansion.test.sh::Descending number range expansion with negative step
 xfail brace-expansion.test.sh::Descending number range expansion with positive step is invalid
+xfail brace-expansion.test.sh::Empty alternative
+xfail brace-expansion.test.sh::Empty alternative with empty string suffix
 xfail brace-expansion.test.sh::Empty expansion
 xfail brace-expansion.test.sh::Fixed width number range expansion
 xfail brace-expansion.test.sh::Inconsistent fixed width number range expansion
@@ -399,6 +499,8 @@ xfail builtin-completion.test.sh::Invalid syntax
 xfail builtin-completion.test.sh::Parse errors for compgen -W and complete -W
 xfail builtin-completion.test.sh::Runtime errors for compgen -F func
 xfail builtin-completion.test.sh::Runtime errors for compgen -W
+xfail builtin-completion.test.sh::compadjust with empty COMP_ARGV
+xfail builtin-completion.test.sh::compadjust with sparse COMP_ARGV
 xfail builtin-completion.test.sh::compgen -A builtin
 xfail builtin-completion.test.sh::compgen -A command completes builtins and keywords
 xfail builtin-completion.test.sh::compgen -A command completes external commands
@@ -436,6 +538,7 @@ xfail builtin-completion.test.sh::complete with no args and complete -p both pri
 xfail builtin-completion.test.sh::complete with nonexistent function
 xfail builtin-completion.test.sh::compopt fails when not in completion function
 xfail builtin-completion.test.sh::compopt with invalid syntax
+xfail builtin-completion.test.sh::how compgen calls completion functions
 xfail builtin-dirs.test.sh::dirs -c to clear the stack
 xfail builtin-dirs.test.sh::dirs -p to print one entry per line
 xfail builtin-dirs.test.sh::dirs -v to print numbered stack, one entry per line
@@ -514,6 +617,7 @@ xfail builtin-misc.test.sh::time pipeline
 xfail builtin-printf.test.sh::Invalid UTF-8
 xfail builtin-printf.test.sh::Too large
 xfail builtin-printf.test.sh::printf %b with truncated octal escapes
+xfail builtin-printf.test.sh::printf octal backslash escapes
 xfail builtin-printf.test.sh::unsigned / octal / hex big
 xfail builtin-process.test.sh::arg that would overflow 64 bits is detected
 xfail builtin-process.test.sh::exec builtin
@@ -528,6 +632,8 @@ xfail builtin-process.test.sh::ulimit of 2**32, 2**31 (int overflow)
 xfail builtin-process.test.sh::ulimit that is 64 bits
 xfail builtin-process.test.sh::ulimit with no flags is like -f
 xfail builtin-process.test.sh::write big file with ulimit
+xfail builtin-read.test.sh::IFS='x ' incomplete backslash
+xfail builtin-read.test.sh::read -n 4 with backslash + delim
 xfail builtin-read.test.sh::read -r -d '' for NUL strings, e.g. find -print0
 xfail builtin-read.test.sh::read multiple lines with IFS=:
 xfail builtin-set.test.sh::'set' and 'eval' round trip
@@ -644,6 +750,8 @@ xfail command-sub-ksh.test.sh::${ echo hi }  without semi-colon
 xfail command-sub-ksh.test.sh::${ echo hi;}
 xfail command-sub-ksh.test.sh::${|REPLY=hi}
 xfail command-sub-ksh.test.sh::for loop / case
+xfail command-sub.test.sh::Command Sub trailing newline removed
+xfail command-sub.test.sh::Command Sub trailing whitespace not removed
 xfail command-sub.test.sh::Command sub with here doc
 xfail command-sub.test.sh::Double Quotes in Command Sub in Double Quotes
 xfail command-sub.test.sh::Escaped quote in [[ ]]
@@ -757,9 +865,16 @@ xfail extglob-files.test.sh::*() matches 0 or more
 xfail extglob-files.test.sh::+() matches 1 or more
 xfail extglob-files.test.sh::?() matches 0 or 1
 xfail extglob-files.test.sh::@() matches exactly one of the patterns
+xfail extglob-files.test.sh::Escaping of pipe (glibc bug, see demo/glibc_fnmatch.c)
 xfail extglob-files.test.sh::Extended glob as argument to ${undef:-} (dynamic globbing)
 xfail extglob-files.test.sh::Extended glob in assignment builtin
+xfail extglob-files.test.sh::Extended glob in same word as array
+xfail extglob-files.test.sh::Extended glob patterns with spaces
+xfail extglob-files.test.sh::Extended glob with word splitting
+xfail extglob-files.test.sh::Filenames with spaces
+xfail extglob-files.test.sh::Glob other punctuation chars (lexer mode)
 xfail extglob-files.test.sh::In Array Literal and for loop
+xfail extglob-files.test.sh::More glob escaping
 xfail extglob-files.test.sh::Nested extended glob pattern
 xfail extglob-files.test.sh::No extended glob with simple_word_eval (YSH evaluation)
 xfail extglob-files.test.sh::Two adjacent alternations
@@ -767,6 +882,7 @@ xfail extglob-files.test.sh::failglob
 xfail extglob-files.test.sh::no match
 xfail extglob-files.test.sh::no_dash_glob
 xfail extglob-files.test.sh::noglob
+xfail extglob-files.test.sh::nullglob with extended glob
 xfail extglob-match.test.sh::! matches none
 xfail extglob-match.test.sh::* matches 0 or more
 xfail extglob-match.test.sh::+ matches 1 or more
@@ -810,6 +926,8 @@ xfail glob.test.sh::Glob of negated unescaped [[] and []]
 xfail glob.test.sh::Glob of unescaped [[] and []]
 xfail glob.test.sh::Glob ordering respects LC_COLLATE (zsh respects this too)
 xfail glob.test.sh::Glob unicode char
+xfail glob.test.sh::\ in unquoted substitutions does not match a backslash
+xfail glob.test.sh::\ in unquoted substitutions escapes globchars
 xfail glob.test.sh::pattern starting with . does not return . and ..
 xfail globignore.test.sh::. and .. always filtered when GLOBIGNORE is set
 xfail globignore.test.sh::Extended glob expansion combined with GLOBIGNORE
@@ -879,6 +997,11 @@ xfail interactive.test.sh::parse error in PROMPT_COMMAND
 xfail interactive.test.sh::runtime error in PROMPT_COMMAND
 xfail interactive.test.sh::shell doesn't load rcfile/rcdir if --norc is given
 xfail introspect.test.sh::$((BASH_LINENO)) (scalar form in arith)
+xfail introspect.test.sh::${BASH_LINENO[@]} is a stack of line numbers for function calls
+xfail introspect.test.sh::${FUNCNAME[@]} array
+xfail introspect.test.sh::${FUNCNAME} and "set -u" (OSH regression)
+xfail introspect.test.sh::${FUNCNAME} with prefix/suffix operators
+xfail introspect.test.sh::operators on FUNCNAME
 xfail known-differences.test.sh::`set` output format - ifupdown-ng
 xfail let.test.sh::let
 xfail let.test.sh::let with ()
@@ -895,7 +1018,9 @@ xfail nameref.test.sh::Chain of namerefs
 xfail nameref.test.sh::Dynamic scope with namerefs
 xfail nameref.test.sh::Mutually recursive namerefs detected on READ
 xfail nameref.test.sh::Mutually recursive namerefs detected on WRITE
+xfail nameref.test.sh::Unquoted assoc reference on RHS
 xfail nameref.test.sh::a[2] in nameref
+xfail nameref.test.sh::a[@] in nameref
 xfail nameref.test.sh::a[expr] in nameref
 xfail nameref.test.sh::assign to empty nameref and invalid nameref
 xfail nameref.test.sh::assign to invalid ref with strict_nameref
@@ -916,8 +1041,12 @@ xfail nameref.test.sh::pass local array by reference, relying on DYNAMIC SCOPING
 xfail nameref.test.sh::readonly nameref doesn't prevent assigning through it
 xfail nameref.test.sh::readonly var can't be assigned through nameref
 xfail nameref.test.sh::unset nameref
+xfail nix-idioms.test.sh::${!ref} to undefined array
+xfail nix-idioms.test.sh::${!ref} to undefined string var is fatal, INCONSISTENT with array
+xfail nix-idioms.test.sh::Similar to above with set -u
 xfail nix-idioms.test.sh::export with dynamic var name +=
 xfail nix-idioms.test.sh::let idiom can be written in POSIX shell - eval ": \$(( ))"
+xfail nix-idioms.test.sh::var ref to array 'preHooks[@]'
 xfail nocasematch-match.test.sh::[[ equality matching
 xfail nocasematch-match.test.sh::[[ regex matching
 xfail nocasematch-match.test.sh::case matching
@@ -926,6 +1055,7 @@ xfail nul-bytes.test.sh::Compare \x00 byte versus \x01 byte - read -n
 xfail nul-bytes.test.sh::Compare \x00 byte versus \x01 byte - read builtin
 xfail nul-bytes.test.sh::Issue 2269 - Do NUL bytes match ? in ${a#?}
 xfail nul-bytes.test.sh::Issue 2269 Reduction
+xfail nul-bytes.test.sh::NUL bytes and IFS splitting
 xfail nul-bytes.test.sh::NUL bytes with ${#s} (OSH and zsh agree)
 xfail nul-bytes.test.sh::NUL bytes with echo $'\0' (OSH and zsh agree)
 xfail nul-bytes.test.sh::NUL bytes with echo -e
@@ -1057,14 +1187,18 @@ xfail redirect.test.sh::can't mention big file descriptor
 xfail redirect.test.sh::echo foo >&100 (OSH regression: does not fail with invalid fd 100)
 xfail redirect.test.sh::echo foo >&N where N is first unused fd
 xfail redirect.test.sh::xtrace not affected by redirects
+xfail regex.test.sh::BASH_REMATCH
 xfail regex.test.sh::Bug: Nix idiom with closing ) next to pattern
 xfail regex.test.sh::Double quoting pat variable -- again bash doesn't like it.
+xfail regex.test.sh::Escaped {
+xfail regex.test.sh::Escaped { stored in variable first
 xfail regex.test.sh::Failed match
 xfail regex.test.sh::Fatal error inside [[ =~ ]]
 xfail regex.test.sh::Fix single quotes by storing in variable
 xfail regex.test.sh::Fix single quotes by storing in variable ##2
 xfail regex.test.sh::Match is unanchored at both ends
 xfail regex.test.sh::Mixing quoted and unquoted parts
+xfail regex.test.sh::Multiple adjacent () groups
 xfail regex.test.sh::Omitting ( )
 xfail regex.test.sh::Operator chars ; & but not |
 xfail regex.test.sh::Operators and space lose meaning inside ()
@@ -1151,6 +1285,8 @@ xfail type-compat.test.sh::declare -i -l -u errors can be silenced - ignore_flag
 xfail type-compat.test.sh::declare -i with +=
 xfail type-compat.test.sh::declare -i with arithmetic inside strings (Nix, issue 864)
 xfail type-compat.test.sh::declare -l -u
+xfail type-compat.test.sh::declare array vs. associative array
+xfail type-compat.test.sh::declare array vs. string: mixing -a +a and () ''
 xfail unicode.test.sh::$'' does NOT check that 0x110000 is too big at parse time
 xfail unicode.test.sh::$'' does not check for surrogate range at parse time
 xfail unicode.test.sh::OSH source code doesn't have to be valid Unicode (like other shells)
@@ -1160,6 +1296,7 @@ xfail var-num.test.sh::$0 with -c
 xfail var-num.test.sh::$0 with -i
 xfail var-num.test.sh::$0 with stdin
 xfail var-op-bash.test.sh::${!A@a} and ${!A[@]@a}
+xfail var-op-bash.test.sh::${!prefix@} ${!prefix*} yields sorted array of var names
 xfail var-op-bash.test.sh::${!prefix@} matches var name (regression)
 xfail var-op-bash.test.sh::${!r@a} with r='a[0]' (attribute for indirect expansion of an array element)
 xfail var-op-bash.test.sh::${a[0]@a} and ${a@a}
@@ -1169,6 +1306,9 @@ xfail var-op-bash.test.sh::${var@a} for attributes
 xfail var-op-bash.test.sh::${x@Q}
 xfail var-op-bash.test.sh::${x@u} U L - upper / lower case (bash 5.1 feature)
 xfail var-op-bash.test.sh::-o nounset with var ops
+xfail var-op-bash.test.sh::Array expansion with nullary var op @P
+xfail var-op-bash.test.sh::Array expansion with nullary var op @Q
+xfail var-op-bash.test.sh::Array expansion with nullary var op @a
 xfail var-op-bash.test.sh::Case folding - Unicode characters
 xfail var-op-bash.test.sh::Case folding - multi code point
 xfail var-op-bash.test.sh::Case folding that depends on locale (not enabled, requires Turkish locale)
@@ -1190,6 +1330,10 @@ xfail var-op-patsub.test.sh::Synthesized ${x///} bug (similar to above)
 xfail var-op-patsub.test.sh::When LC_ALL=C, pattern ? doesn't match multibyte character
 xfail var-op-patsub.test.sh::patsub with [^]]
 xfail var-op-slice.test.sh::${@:0:1}
+xfail var-op-slice.test.sh::${@:offset:length} and ${*:offset:length}
+xfail var-op-slice.test.sh::${@:offset} and ${*:offset}
+xfail var-op-slice.test.sh::${array[@]::} has implicit length of zero - for ble.sh
+xfail var-op-slice.test.sh::${array[@]:} vs ${array[@]: }  - bash and zsh inconsistent
 xfail var-op-slice.test.sh::Cannot take length of substring slice
 xfail var-op-slice.test.sh::Negative second arg is position, not length!
 xfail var-op-slice.test.sh::Negative start index
@@ -1197,6 +1341,8 @@ xfail var-op-slice.test.sh::Negative start index respects unicode
 xfail var-op-slice.test.sh::Negative start index respects unicode ##2
 xfail var-op-slice.test.sh::Out of range string slice: begin
 xfail var-op-slice.test.sh::Out of range string slice: length
+xfail var-op-slice.test.sh::Permutations of implicit begin and length
+xfail var-op-slice.test.sh::Simple ${@:offset}
 xfail var-op-slice.test.sh::Slice UTF-8 String
 xfail var-op-slice.test.sh::Slice string with invalid UTF-8 results in empty string and warning
 xfail var-op-slice.test.sh::Slice string with invalid UTF-8 with strict_word_eval
@@ -1205,14 +1351,20 @@ xfail var-op-slice.test.sh::Slice with an assoc array
 xfail var-op-slice.test.sh::Slice with an index that's an array -- silent a[0] decay
 xfail var-op-slice.test.sh::String slice
 xfail var-op-slice.test.sh::String slice with math
+xfail var-op-strip.test.sh::Nested % and # operators (bug reported by Crestwave)
 xfail var-op-strip.test.sh::Strip unicode prefix
 xfail var-op-strip.test.sh::strip all unicode
 xfail var-op-test.test.sh::"\e" as arg
 xfail var-op-test.test.sh::"\z" as arg
 xfail var-op-test.test.sh::$* ("" "") and - and + (IFS=)
 xfail var-ref.test.sh::${!OPTIND} (used by bash completion
+xfail var-ref.test.sh::${!a[@]-'default'} is legal but fails with more than one element
+xfail var-ref.test.sh::${!array_ref:-set} and ${!array_ref:=assign}
 xfail var-ref.test.sh::${!ref-default}
 xfail var-ref.test.sh::${!undef:-}
+xfail var-ref.test.sh::Array indirect expansion with @? conversion
+xfail var-ref.test.sh::Array indirect expansion with replacements
+xfail var-ref.test.sh::Array indirect expansion with suffix operators
 xfail var-ref.test.sh::Bad var ref
 xfail var-ref.test.sh::Bad var ref 2
 xfail var-ref.test.sh::Bizarre tilde expansion in array index
@@ -1223,9 +1375,11 @@ xfail var-ref.test.sh::Var ref, then assignment with ${ := }
 xfail var-ref.test.sh::Var ref, then error with ${ ? }
 xfail var-ref.test.sh::array ref
 xfail var-ref.test.sh::array ref with strict_array
+xfail var-ref.test.sh::comparison to ${!array[@]} keys (similar SYNTAX)
 xfail var-ref.test.sh::var ref ${!a}
 xfail var-ref.test.sh::var ref OF array var -- silent a[0] decay
 xfail var-ref.test.sh::var ref TO array var
+xfail var-ref.test.sh::var ref TO array var, with subscripts
 xfail var-ref.test.sh::var ref TO array with arbitrary subscripts
 xfail var-ref.test.sh::var ref TO assoc array a[key]
 xfail var-ref.test.sh::var ref doesn't need cycle detection
@@ -1233,8 +1387,13 @@ xfail var-ref.test.sh::var ref to $1 and $2 with 1 and 2
 xfail var-ref.test.sh::var ref to $? with '?'
 xfail var-ref.test.sh::var ref to $@ with @
 xfail var-ref.test.sh::var ref to special var BASH_SOURCE
+xfail var-ref.test.sh::var ref: 1, @, *
+xfail var-sub-quote.test.sh::"${undef-'c d'}" and "${foo%'c d'}" are parsed differently
 xfail var-sub-quote.test.sh::# operator with single quoted arg (dash/ash and bash/mksh disagree, reported by Crestwave)
 xfail var-sub-quote.test.sh::/ operator with single quoted arg (causes syntax error in regex in OSH, reported by Crestwave)
+xfail var-sub-quote.test.sh::Inner single quotes, outer double quotes
+xfail var-sub-quote.test.sh::Multiple words: outer double quotes, inner single quotes
+xfail var-sub-quote.test.sh::Multiple words: outer double quotes, inner single quotes ##2
 xfail var-sub-quote.test.sh::Right Brace as argument (similar to #702)
 xfail var-sub-quote.test.sh::Var substitution with \n in value
 xfail var-sub-quote.test.sh::comparison: :- operator with single quoted arg
@@ -1250,6 +1409,7 @@ xfail vars-special.test.sh::$LINENO in case
 xfail vars-special.test.sh::$LINENO in for loop
 xfail vars-special.test.sh::$LINENO in other for loops
 xfail vars-special.test.sh::$LINENO in redirect arg (bug regression)
+xfail vars-special.test.sh::$LINENO is the current line, not line of function call
 xfail vars-special.test.sh::$PATH is set if unset at startup
 xfail vars-special.test.sh::$PPID
 xfail vars-special.test.sh::$PWD is not only set, but exported
@@ -1259,9 +1419,24 @@ xfail vars-special.test.sh::$SECONDS
 xfail vars-special.test.sh::$UID and $EUID
 xfail vars-special.test.sh::Background PID $! looks like a PID
 xfail vars-special.test.sh::UID EUID PPID can't be changed
+xfail whitespace.test.sh::Default IFS does not include \r \v \f
+xfail whitespace.test.sh::Parsing shell words \r \v
+xfail whitespace.test.sh::\r at end of line is not special
+xfail whitespace.test.sh::\r in arith expression is allowed by some shells, but not most!
 xfail whitespace.test.sh::whitespace in string to integer conversion
+xfail word-eval.test.sh::Default values -- more cases
+xfail word-split.test.sh::""$A"" - empty string on both sides - derived from spec/toysh-posix #15
+xfail word-split.test.sh::$* with empty IFS
 xfail word-split.test.sh::4 x 3 table - with for loop
+xfail word-split.test.sh::4 x 3 table: (default IFS, IFS='', IFS=zx) x ( $* "$*" $@ "$@" )
+xfail word-split.test.sh::IFS and joining arrays by assignments
+xfail word-split.test.sh::IFS empty doesn't do splitting
+xfail word-split.test.sh::IFS unset behaves like $' \t\n'
+xfail word-split.test.sh::IFS='' with $@ and $* (bug #627)
 xfail word-split.test.sh::IFS='' with $@ and $* and printf (bug #627)
+xfail word-split.test.sh::IFS=x and '' and $@ (#2)
+xfail word-split.test.sh::IFS=x and '' and $@ (#3)
+xfail word-split.test.sh::IFS=x and '' and $@ - same bug as spec/toysh-posix case #12
 xfail word-split.test.sh::Unicode in IFS
 xfail xtrace.test.sh::PS4 with runtime error
 xfail xtrace.test.sh::PS4 with unterminated $(
@@ -1270,124 +1445,19 @@ xfail xtrace.test.sh::set -o verbose prints unevaluated code
 xfail xtrace.test.sh::xtrace with newlines
 xfail zsh-assoc.test.sh::TODO: SETUP should be shared
 xfail zsh-assoc.test.sh::get length
+xfail zsh-assoc.test.sh::index by integer does not work
 xfail zsh-assoc.test.sh::iterate over both keys and values
 xfail zsh-assoc.test.sh::iterate over keys
 xfail zsh-assoc.test.sh::retrieve key
+xfail zsh-assoc.test.sh::set key
 xfail zsh-idioms.test.sh::asdf snippet
 xfail zsh-idioms.test.sh::git-completion snippet
 xfail zsh-idioms.test.sh::zsh var sub is rejected at runtime
 
 # ---- skip: not evaluated here (see header) ----
-skip alias.test.sh::Alias and arithmetic
-skip alias.test.sh::Alias and command sub (bug regression)
-skip append.test.sh::Append array to array
-skip append.test.sh::Append to array to undefined variable
-skip append.test.sh::error: myarray+=s
-skip append.test.sh::error: s+=(my array)
-skip append.test.sh::error: typeset myarray+=s
-skip append.test.sh::myarray[-1]+=s - Append to last element
-skip append.test.sh::myarray[1]+=s - Append to element
-skip append.test.sh::typeset s+=(my array)
-skip array-assoc.test.sh::Append to associative array value A['x']+='suffix'
-skip array-assoc.test.sh::Array stored in associative array gets converted to string (without strict_array)
-skip array-assoc.test.sh::Empty value (doesn't use EmptyWord?)
-skip array-assoc.test.sh::Implicit increment of keys
-skip array-assoc.test.sh::Slice of associative array doesn't make sense in bash
-skip array-assoc.test.sh::bash bug: (( A["$key"] = 1 )) doesn't work
-skip array-assoc.test.sh::coerce to string with ${A[*]}, etc.
-skip array-assoc.test.sh::create empty assoc array, put, then get
-skip array-basic.test.sh::"${a[@]}" and "${a[*]}"
-skip array-basic.test.sh::${a[@]} and ${a[*]}
-skip array-basic.test.sh::4 ways to interpolate empty array
-skip array-basic.test.sh::Empty array with :-
-skip array-basic.test.sh::empty array
-skip array-compat.test.sh::Apply vectorized operations on ${a[*]}
-skip array-compat.test.sh::Array Decay with IFS
-skip array-compat.test.sh::Assignment Causes Array Decay
-skip array-compat.test.sh::User arrays decay
-skip array-compat.test.sh::value.BashArray internal representation - Assoc (ordering is a problem)
-skip array-compat.test.sh::value.BashArray internal representation - Indexed
-skip array-literal.test.sh::BashArray cannot be changed to BashAssoc and vice versa
-skip array-literal.test.sh::Evaluation order (1)
-skip array-literal.test.sh::Evaluation order (2)
-skip array-literal.test.sh::Evaluation order (3)
-skip array-literal.test.sh::[k]=$v and [k]="$@" (BashArray)
-skip array-literal.test.sh::[k]=$v and [k]="$@" (BashAssoc)
-skip array-literal.test.sh::append to element (BashArray)
-skip array-literal.test.sh::append to element (BashAssoc)
-skip array-literal.test.sh::index increments without [k]= (BashArray)
-skip array-literal.test.sh::non-index forms of element (BashAssoc)
-skip array-sparse.test.sh::${!a[@]}
-skip array-sparse.test.sh::${a[@]#...}
-skip array-sparse.test.sh::${a[@]/pat/rep}
-skip array-sparse.test.sh::${a[@]@P}, ${a[@]@Q}, and ${a[@]@a}
-skip array-sparse.test.sh::${a[@]}
-skip array-sparse.test.sh::(YSH) @[sp] and @sp
-skip array-sparse.test.sh::Initializing indexed array with ([index]=value)
-skip array-sparse.test.sh::compadjust
-skip array.test.sh::"$*"
-skip array.test.sh::$*
-skip array.test.sh::${!a[1]} is named ref in bash
-skip array.test.sh::${!a} on array
-skip array.test.sh::All elements quoted
-skip array.test.sh::All elements unquoted
-skip array.test.sh::Append sparse arrays
-skip array.test.sh::Command with with word splitting in array
-skip array.test.sh::Create a "user" array out of the argv array
-skip array.test.sh::Create sparse array
-skip array.test.sh::Create sparse array implicitly
-skip array.test.sh::Interpolate array into array
-skip array.test.sh::Negative index
-skip array.test.sh::Negative slice begin
-skip array.test.sh::Negative slice length
-skip array.test.sh::Retrieve array indices with ${!a}
-skip array.test.sh::Retrieve index
-skip array.test.sh::Retrieve index that is a command sub
-skip array.test.sh::Retrieve index that is a variable
-skip array.test.sh::Retrieve index that is a variable without $
-skip array.test.sh::Retrieve out of bounds index
-skip array.test.sh::Retrieve sparse array indices with ${!a}
-skip array.test.sh::Set element
-skip array.test.sh::Set element with array ref
-skip array.test.sh::Set element with var ref
-skip array.test.sh::Single array with :-
-skip array.test.sh::Slice of array with [@]
-skip array.test.sh::Slice of sparse array with [@]
-skip array.test.sh::Slice with arithmetic
-skip array.test.sh::Stripping a whole array quoted
-skip array.test.sh::Stripping a whole array unquoted
-skip array.test.sh::Using an array itself as the index on LHS
-skip array.test.sh::array default
-skip array.test.sh::array over multiple lines
-skip array.test.sh::array with empty string
-skip array.test.sh::declare -a / local -a is empty array
-skip array.test.sh::declare array and then append
-skip array.test.sh::glob within array yields separate elements
-skip array.test.sh::local array
-skip array.test.sh::nounset / set -u with empty array (bug in bash 4.3, fixed in 4.4)
-skip assign-deferred.test.sh::export a[7]=8
-skip assign-deferred.test.sh::local a[3]=4
-skip assign-deferred.test.sh::readonly a[7]=8
-skip assign-deferred.test.sh::typeset -a a[1]=a a[3]=c
-skip assign-deferred.test.sh::typeset a[3]=4
 skip assign-extended.test.sh::declare -F with shopt -s extdebug and main file
 skip assign-extended.test.sh::declare -F with shopt -s extdebug prints more info
-skip assign-extended.test.sh::declare -a
-skip assign-extended.test.sh::declare -g (bash-specific; bash-completion uses it)
-skip assign-extended.test.sh::dynamic array parsing is not allowed
-skip assign-extended.test.sh::local -a
 skip assign.test.sh::Assignment doesn't do glob expansion
-skip assign.test.sh::Assignment doesn't do word splitting
-skip assign.test.sh::aliased assignment doesn't split
-skip assign.test.sh::assign and glob
-skip assign.test.sh::assignment using dynamic keyword (splits in most shells, not in zsh/osh)
-skip assign.test.sh::assignment using dynamic var names doesn't split
-skip assign.test.sh::declare and glob
-skip assign.test.sh::local a=loc $var c=loc
-skip assign.test.sh::readonly x= gives empty string (regression)
-skip assign.test.sh::static assignment doesn't split
-skip brace-expansion.test.sh::Empty alternative
-skip brace-expansion.test.sh::Empty alternative with empty string suffix
 skip builtin-bracket.test.sh::-k for sticky bit
 skip builtin-bracket.test.sh::test -b -c -S (block, character, socket)
 skip builtin-bracket.test.sh::test -p named pipe
@@ -1399,13 +1469,10 @@ skip builtin-cd.test.sh::remove pwd dir
 skip builtin-cd.test.sh::setting $PWD doesn't affect the value of 'pwd' builtin
 skip builtin-cd.test.sh::unset PWD; then pwd
 skip builtin-completion.test.sh::-o plusdirs and -o dirnames with compgen
-skip builtin-completion.test.sh::compadjust with empty COMP_ARGV
-skip builtin-completion.test.sh::compadjust with sparse COMP_ARGV
 skip builtin-completion.test.sh::compgen -A directory
 skip builtin-completion.test.sh::compgen -A file
 skip builtin-completion.test.sh::compgen -W 'one two three'
 skip builtin-completion.test.sh::compgen -o default completes files and dirs
-skip builtin-completion.test.sh::how compgen calls completion functions
 skip builtin-dirs.test.sh::cd replaces the lowest entry on the directory stack!
 skip builtin-dirs.test.sh::dirs -l to print in long format, no tilde prefix
 skip builtin-dirs.test.sh::dirs don't convert to tilde when $HOME is substring
@@ -1420,32 +1487,7 @@ skip builtin-getopts.test.sh::getopts bug #1523
 skip builtin-history.test.sh::HISTFILE must point to a file
 skip builtin-meta.test.sh::command -v doesn't find executable dir
 skip builtin-meta.test.sh::command -v doesn't find non-executable file
-skip builtin-printf.test.sh::dynamic declare instead of %s
-skip builtin-printf.test.sh::printf -v %s
-skip builtin-printf.test.sh::printf backslash escapes
-skip builtin-printf.test.sh::printf octal backslash escapes
-skip builtin-printf.test.sh::printf unicode backslash escapes
 skip builtin-process.test.sh::exec builtin with here doc
-skip builtin-read.test.sh::"backslash + newline" should be swallowed regardless of "-d <delim>"
-skip builtin-read.test.sh::IFS= read -n (OSH regression: value saved in tempenv)
-skip builtin-read.test.sh::IFS='\ ' and backslash escaping
-skip builtin-read.test.sh::IFS='x ' incomplete backslash
-skip builtin-read.test.sh::IFS='x ' read a b: trailing spaces (with max_split)
-skip builtin-read.test.sh::IFS=x read a b <<< xxxxxx
-skip builtin-read.test.sh::max_split and backslash escaping
-skip builtin-read.test.sh::read -n (with $REPLY)
-skip builtin-read.test.sh::read -n 0
-skip builtin-read.test.sh::read -n 4 with backslash + delim
-skip builtin-read.test.sh::read -n 4 with incomplete backslash
-skip builtin-read.test.sh::read -n and backslash escape
-skip builtin-read.test.sh::read -r ignores backslashes
-skip builtin-read.test.sh::read -r with \n
-skip builtin-read.test.sh::read -r with other backslash escapes
-skip builtin-read.test.sh::read and "\ "
-skip builtin-read.test.sh::read bash bug
-skip builtin-read.test.sh::read from empty file
-skip builtin-read.test.sh::read multiple vars spanning many lines
-skip builtin-read.test.sh::read with line continuation reads multiple physical lines
 skip builtin-trap-bash.test.sh::trap RETURN
 skip builtin-trap.test.sh::trap EXIT, sleep, SIGINT: non-interactively
 skip builtin-trap.test.sh::trap INT, sleep, SIGINT: non-interactively
@@ -1466,21 +1508,8 @@ skip builtin-type.test.sh::type of relative path
 skip command-parsing.test.sh::Redirect on assignment (enabled 7/2019)
 skip command-parsing.test.sh::Redirect on control flow (ignored in OSH)
 skip command-parsing.test.sh::Redirect on control flow with ysh:all (no_parse_ignored)
-skip command-sub.test.sh::Command Sub trailing newline removed
-skip command-sub.test.sh::Command Sub trailing whitespace not removed
-skip command-sub.test.sh::Command Sub word split
 skip command_.test.sh::Executing command with same name as directory in PATH (#2429)
 skip divergence.test.sh::Changing PATH will invalidate PATH cache
-skip extglob-files.test.sh::Escaping of pipe (glibc bug, see demo/glibc_fnmatch.c)
-skip extglob-files.test.sh::Extended glob in same word as array
-skip extglob-files.test.sh::Extended glob patterns with spaces
-skip extglob-files.test.sh::Extended glob with word splitting
-skip extglob-files.test.sh::Filenames with spaces
-skip extglob-files.test.sh::Glob other punctuation chars (lexer mode)
-skip extglob-files.test.sh::More glob escaping
-skip extglob-files.test.sh::nullglob with extended glob
-skip glob-bash.test.sh::shopt -s failglob exits properly in command context with set -e
-skip glob-bash.test.sh::shopt -s failglob in command context
 skip glob-bash.test.sh::shopt -s nullglob
 skip glob.test.sh::1 char glob
 skip glob.test.sh::: escaped
@@ -1488,9 +1517,6 @@ skip glob.test.sh::Glob after part joining
 skip glob.test.sh::Glob after var manipulation
 skip glob.test.sh::Glob flags on file system
 skip glob.test.sh::Splitting/Globbing doesn't happen on local assignment
-skip glob.test.sh::\ in unquoted substitutions does not match a backslash
-skip glob.test.sh::\ in unquoted substitutions escapes globchars
-skip glob.test.sh::\ in unquoted substitutions is preserved without glob matching
 skip glob.test.sh::glob after "$@" expansion
 skip glob.test.sh::glob after $@ expansion
 skip glob.test.sh::glob after var expansion
@@ -1504,161 +1530,25 @@ skip glob.test.sh::quoted var expansion with glob meta characters
 skip glob.test.sh::set -o noglob
 skip glob.test.sh::store literal globs in array then expand
 skip globignore.test.sh::Don't glob flags on file system with GLOBIGNORE
-skip introspect.test.sh::${BASH_LINENO[@]} is a stack of line numbers for function calls
 skip introspect.test.sh::${BASH_SOURCE[@]} with line numbers
 skip introspect.test.sh::${BASH_SOURCE[@]} with source and function name
-skip introspect.test.sh::${FUNCNAME[@]} array
-skip introspect.test.sh::${FUNCNAME} and "set -u" (OSH regression)
-skip introspect.test.sh::${FUNCNAME} with prefix/suffix operators
 skip introspect.test.sh::BASH_SOURCE and BASH_LINENO scalar or array (e.g. for virtualenv)
 skip introspect.test.sh::FUNCNAME with source (scalar or array)
 skip introspect.test.sh::Locations when sourcing
 skip introspect.test.sh::Locations with temp frame
 skip introspect.test.sh::Sourcing inside function grows the debug stack
-skip introspect.test.sh::operators on FUNCNAME
 skip loop.test.sh::break/continue within source
 skip loop.test.sh::while in pipe
-skip nameref.test.sh::Unquoted assoc reference on RHS
-skip nameref.test.sh::a[@] in nameref
-skip nix-idioms.test.sh::${!ref} to undefined array
-skip nix-idioms.test.sh::${!ref} to undefined string var is fatal, INCONSISTENT with array
-skip nix-idioms.test.sh::Similar to above with set -u
-skip nix-idioms.test.sh::var ref to array 'preHooks[@]'
-skip nul-bytes.test.sh::NUL bytes and IFS splitting
 skip osh-bugs.test.sh::SHELLOPTS bug with ysh:ugprade
 skip posix.test.sh::Newlines in compound lists
-skip redirect-command.test.sh::$(< $file) yields the contents of the file
-skip regex.test.sh::BASH_REMATCH
-skip regex.test.sh::Escaped {
-skip regex.test.sh::Escaped { stored in variable first
-skip regex.test.sh::Multiple adjacent () groups
-skip sh-usage.test.sh::args are passed
-skip sh-usage.test.sh::args that look like flags are passed after -c
-skip sh-usage.test.sh::args that look like flags are passed after script
 skip strict-options.test.sh::Sourcing a script that returns at the top level
 skip strict-options.test.sh::errexit and top-level control flow
 skip strict-options.test.sh::top level control flow
 skip temp-binding.test.sh::More eval 'local v='
-skip toysh-posix.test.sh::IFS=x and '' and unquoted $@ - reduction of case above - copied into spec/word-split
-skip type-compat.test.sh::declare array vs. associative array
-skip type-compat.test.sh::declare array vs. string: mixing -a +a and () ''
-skip var-op-bash.test.sh::${!prefix@} ${!prefix*} yields sorted array of var names
-skip var-op-bash.test.sh::Array expansion with nullary var op @P
-skip var-op-bash.test.sh::Array expansion with nullary var op @Q
-skip var-op-bash.test.sh::Array expansion with nullary var op @a
 skip var-op-len.test.sh::String length with incomplete utf-8
 skip var-op-len.test.sh::String length with invalid utf-8 continuation bytes
 skip var-op-len.test.sh::Unicode string length (spec/testdata/utf8-chars.txt)
-skip var-op-slice.test.sh::${@:offset:length} and ${*:offset:length}
-skip var-op-slice.test.sh::${@:offset} and ${*:offset}
-skip var-op-slice.test.sh::${array[@]::} has implicit length of zero - for ble.sh
-skip var-op-slice.test.sh::${array[@]:} vs ${array[@]: }  - bash and zsh inconsistent
-skip var-op-slice.test.sh::Permutations of implicit begin and length
-skip var-op-slice.test.sh::Simple ${@:offset}
-skip var-op-strip.test.sh::Bug fix: Test that you can remove everything with glob
-skip var-op-strip.test.sh::Nested % and # operators (bug reported by Crestwave)
-skip var-op-strip.test.sh::Remove const suffix is vectorized on $@ array
-skip var-op-strip.test.sh::Test that you can remove everything with const
-skip var-op-strip.test.sh::strip * (bug regression)
-skip var-op-strip.test.sh::strip ?
-skip var-op-strip.test.sh::strip all
-skip var-op-strip.test.sh::strip none
-skip var-op-strip.test.sh::strip none unicode
-skip var-op-test.test.sh::"${x+foo}" quoted (regression)
-skip var-op-test.test.sh::Assign default with array
-skip var-op-test.test.sh::Quoted with array as default value
-skip var-op-test.test.sh::Unquoted with array as default value
-skip var-ref.test.sh::${!a[@]-'default'} is legal but fails with more than one element
-skip var-ref.test.sh::${!array_ref:-set} and ${!array_ref:=assign}
-skip var-ref.test.sh::Array indirect expansion with @? conversion
-skip var-ref.test.sh::Array indirect expansion with replacements
-skip var-ref.test.sh::Array indirect expansion with suffix operators
-skip var-ref.test.sh::comparison to ${!array[@]} keys (similar SYNTAX)
-skip var-ref.test.sh::var ref TO array var, with subscripts
-skip var-ref.test.sh::var ref: 1, @, *
-skip var-sub-quote.test.sh::"${empty:-}"
-skip var-sub-quote.test.sh::"${undef-'c d'}" and "${foo%'c d'}" are parsed differently
-skip var-sub-quote.test.sh::${empty:-}
-skip var-sub-quote.test.sh::-
-skip var-sub-quote.test.sh:::-
-skip var-sub-quote.test.sh::Inner double quotes
-skip var-sub-quote.test.sh::Inner double quotes, outer double quotes
-skip var-sub-quote.test.sh::Inner single quotes
-skip var-sub-quote.test.sh::Inner single quotes, outer double quotes
-skip var-sub-quote.test.sh::Mixed inner quotes
-skip var-sub-quote.test.sh::Mixed inner quotes with outer quotes
-skip var-sub-quote.test.sh::Multiple words: no outer quotes, inner double quotes
-skip var-sub-quote.test.sh::Multiple words: no outer quotes, inner double quotes ##2
-skip var-sub-quote.test.sh::Multiple words: no outer quotes, inner single quotes
-skip var-sub-quote.test.sh::Multiple words: no outer quotes, inner single quotes ##2
-skip var-sub-quote.test.sh::Multiple words: no quotes
-skip var-sub-quote.test.sh::Multiple words: outer double quotes, inner double quotes
-skip var-sub-quote.test.sh::Multiple words: outer double quotes, inner double quotes ##2
-skip var-sub-quote.test.sh::Multiple words: outer double quotes, inner single quotes
-skip var-sub-quote.test.sh::Multiple words: outer double quotes, inner single quotes ##2
-skip var-sub-quote.test.sh::Multiple words: outer double quotes, no inner quotes
-skip var-sub-quote.test.sh::Multiple words: outer double quotes, no inner quotes ##2
-skip var-sub-quote.test.sh::No outer quotes, Multiple internal quotes
-skip var-sub-quote.test.sh::Strip a string with single quotes, double quoted
-skip var-sub-quote.test.sh::Strip a string with single quotes, unquoted
-skip var-sub-quote.test.sh::The string to strip can be single quoted, outer is unquoted
-skip var-sub-quote.test.sh::The string to strip is space sensitive
-skip var-sub-quote.test.sh::Var with multiple words: no quotes
-skip var-sub-quote.test.sh::part_value tree on RHS
-skip var-sub-quote.test.sh::part_value tree with multiple words
-skip var-sub-quote.test.sh::substitution of IFS character, quoted and unquoted
 skip var-sub.test.sh::Filename redirect with "$@"
-skip vars-special.test.sh::$LINENO is the current line, not line of function call
 skip vars-special.test.sh::Some vars are set, even without startup file, or env: PATH, PWD
-skip whitespace.test.sh::Default IFS does not include \r \v \f
-skip whitespace.test.sh::Parsing shell words \r \v
-skip whitespace.test.sh::\r at end of line is not special
-skip whitespace.test.sh::\r in arith expression is allowed by some shells, but not most!
-skip word-eval.test.sh::Default values -- more cases
-skip word-eval.test.sh::Evaluation of constant parts
 skip word-eval.test.sh::Globbing after splitting
 skip word-eval.test.sh::Globbing escaping
-skip word-eval.test.sh::Word elision
-skip word-eval.test.sh::Word splitting
-skip word-split.test.sh::""$A"" - empty string on both sides - derived from spec/toysh-posix #15
-skip word-split.test.sh::"$*"
-skip word-split.test.sh::"$@"
-skip word-split.test.sh::$*
-skip word-split.test.sh::$* with empty IFS
-skip word-split.test.sh::$@
-skip word-split.test.sh::4 x 3 table: (default IFS, IFS='', IFS=zx) x ( $* "$*" $@ "$@" )
-skip word-split.test.sh::Bug #1664, \\ with noglob
-skip word-split.test.sh::Bug #628 split on : with : in literal word
-skip word-split.test.sh::IFS and joining arrays
-skip word-split.test.sh::IFS and joining arrays by assignments
-skip word-split.test.sh::IFS characters are glob metacharacters
-skip word-split.test.sh::IFS empty doesn't do splitting
-skip word-split.test.sh::IFS is scoped
-skip word-split.test.sh::IFS unset behaves like $' \t\n'
-skip word-split.test.sh::IFS with whitespace and non-whitepace.
-skip word-split.test.sh::IFS='' with $@ and $* (bug #627)
-skip word-split.test.sh::IFS='\ '
-skip word-split.test.sh::IFS='\'
-skip word-split.test.sh::IFS=x and '' and $@ (#2)
-skip word-split.test.sh::IFS=x and '' and $@ (#3)
-skip word-split.test.sh::IFS=x and '' and $@ - same bug as spec/toysh-posix case #12
-skip word-split.test.sh::Leading ' ' vs leading ' _ '
-skip word-split.test.sh::Leading/trailing word elision with non-whitespace IFS
-skip word-split.test.sh::Multiple non-whitespace IFS chars.
-skip word-split.test.sh::Tilde sub is not split, but var sub is
-skip word-split.test.sh::Trailing space
-skip word-split.test.sh::Word elision with non-whitespace IFS
-skip word-split.test.sh::Word elision with space
-skip word-split.test.sh::Word splitting
-skip word-split.test.sh::Word splitting 2
-skip word-split.test.sh::default value can yield multiple words
-skip word-split.test.sh::default value can yield multiple words with part joining
-skip word-split.test.sh::default value with unquoted IFS char
-skip word-split.test.sh::empty $@ and $* is elided
-skip word-split.test.sh::empty argv
-skip word-split.test.sh::empty literals are not elided
-skip word-split.test.sh::no splitting when IFS is empty
-skip word-split.test.sh::unquoted empty arg is elided
-skip word-split.test.sh::unquoted whitespace arg is elided
-skip zsh-assoc.test.sh::index by integer does not work
-skip zsh-assoc.test.sh::set key

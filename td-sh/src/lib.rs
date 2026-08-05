@@ -40,7 +40,7 @@
 //! asserted"; unspecified status defaults to 0 (Oils semantics). The qualifier
 //! kind (OK/N-I/BUG) does not change WHICH value applies to a shell, only records
 //! why the shells legitimately differ, so resolution keys on the shell list.
-#![deny(unsafe_code)]
+#![forbid(unsafe_code)]
 
 use std::collections::BTreeSet;
 use std::io::Read;
@@ -778,6 +778,7 @@ impl Drop for CaseWorkdir {
 /// `timed out` detail.
 pub fn run_case(
     shell: &Path,
+    argv_helper: &Path,
     case: &SpecCase,
     chain: &[&str],
 ) -> Result<CaseOutcome, Box<dyn std::error::Error>> {
@@ -828,6 +829,16 @@ pub fn run_case(
     // woke the same latent race in `ProbeDir`.
     let entry = bindir.join(identity);
     std::os::unix::fs::symlink(&shell, &entry)?;
+    // `argv.py` is the corpus's own way of asking what a word EXPANDED to: 333
+    // cases run it and compare against a CPython `repr` of its argv. Upstream
+    // ships it as a Python script and td does not vendor it, so `spec_argv`
+    // answers under that name -- staged here, beside the shell, because PATH is
+    // this directory and nothing else. Linked rather than copied for the reason
+    // the shell is. It is REQUIRED rather than optional: absent, those cases
+    // would fail with a 127 that looks exactly like a shell gap, and the
+    // generated overlay would record them as such.
+    let argv_helper = std::fs::canonicalize(argv_helper)?;
+    std::os::unix::fs::symlink(&argv_helper, bindir.join("argv.py"))?;
     // Spawn the ENTRY, not the canonicalized original, so the top-level shell and
     // a nested `$SH -c ..` are the same argv[0]. It matters for a multicall
     // binary: `canonicalize` resolves a busybox `ash` link back to `busybox`,
@@ -862,6 +873,7 @@ pub fn run_case(
 /// Parse and run every case in a spec file.
 pub fn run_file(
     shell: &Path,
+    argv_helper: &Path,
     path: &Path,
     chain: &[&str],
 ) -> Result<Vec<CaseOutcome>, Box<dyn std::error::Error>> {
@@ -869,7 +881,7 @@ pub fn run_file(
     let cases = parse_spec(&text)?;
     let mut outcomes = Vec::with_capacity(cases.len());
     for case in &cases {
-        outcomes.push(run_case(shell, case, chain)?);
+        outcomes.push(run_case(shell, argv_helper, case, chain)?);
     }
     Ok(outcomes)
 }
@@ -897,12 +909,13 @@ pub fn spec_paths(dir: &Path) -> std::io::Result<Vec<std::path::PathBuf>> {
 /// Run every `*.test.sh` file in `dir` (non-recursive, sorted by name).
 pub fn run_dir(
     shell: &Path,
+    argv_helper: &Path,
     dir: &Path,
     chain: &[&str],
 ) -> Result<Vec<CaseOutcome>, Box<dyn std::error::Error>> {
     let mut outcomes = Vec::new();
     for path in &spec_paths(dir)? {
-        outcomes.extend(run_file(shell, path, chain)?);
+        outcomes.extend(run_file(shell, argv_helper, path, chain)?);
     }
     Ok(outcomes)
 }
@@ -1094,6 +1107,7 @@ fn duplicate_conflicts(is_new: bool) -> bool {
 /// case); a caller enforcing land-on-green must red the gate when it is non-empty.
 pub fn run_dir_classified(
     shell: &Path,
+    argv_helper: &Path,
     dir: &Path,
     chain: &[&str],
     exp: &Expectations,
@@ -1119,7 +1133,7 @@ pub fn run_dir_classified(
                 out.push(ClassifiedOutcome { key, disposition: Disposition::Skip, detail: None });
                 continue;
             }
-            let outcome = run_case(shell, case, chain)?;
+            let outcome = run_case(shell, argv_helper, case, chain)?;
             out.push(classify(key, &outcome, exp));
         }
     }
@@ -1130,6 +1144,63 @@ pub fn run_dir_classified(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every crate root in td-sh must `#![deny(unsafe_code)]`. The compiler
+    /// cannot check this: a bin is a root of its own, so the attribute in
+    /// `main.rs` reaches neither `lib.rs` nor `src/bin/*`, and a new one is
+    /// simply exempt until somebody notices. UNSAFE.md's claim is about the
+    /// CRATE, so a quiet exemption would make it false. Asserted from here
+    /// rather than from `main.rs` because the recipe bakes `main.rs`'s source
+    /// and compiles it where the host-only roots do not exist -- an
+    /// `include_str!` of one there would fail the SANDBOX build, not this test.
+    ///
+    /// The roster is READ rather than listed, because cargo DISCOVERS a root in
+    /// each of three directories whether or not the manifest names it: a
+    /// literal list would exempt the next bin, example or test from the rule
+    /// and from its own check at the same moment, which is the failure this
+    /// test exists to prevent.
+    ///
+    /// `main.rs` DENIES, because `sys.rs` holds the crate's one scoped allow
+    /// and `forbid` would refuse it. Every other root FORBIDS: none of them has
+    /// any business containing `unsafe`, and `forbid` is the spelling a later
+    /// scoped `#[allow(unsafe_code)]` cannot override -- so for those the
+    /// property is enforced by the compiler rather than asserted here.
+    #[test]
+    fn every_crate_root_refuses_unsafe() {
+        let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let src = manifest.join("src");
+        let mut roots = vec![(src.join("main.rs"), "#![deny(unsafe_code)]")];
+        let mut discovered = vec![src.join("lib.rs")];
+        // Fail closed: an unreadable directory is where a root could hide.
+        for dir in [src.join("bin"), manifest.join("examples"), manifest.join("tests")] {
+            let entries = std::fs::read_dir(&dir).unwrap();
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().is_some_and(|e| e == "rs") {
+                    discovered.push(path);
+                }
+            }
+        }
+        // lib.rs + at least one each of bin/example/test.
+        assert!(
+            discovered.len() >= 4,
+            "discovered only {} non-main roots -- the scan found too little to be checking anything",
+            discovered.len()
+        );
+        roots.extend(
+            discovered
+                .into_iter()
+                .map(|p| (p, "#![forbid(unsafe_code)]")),
+        );
+        for (root, want) in roots {
+            let text = std::fs::read_to_string(&root).unwrap();
+            assert!(
+                text.lines().any(|l| l.trim() == want),
+                "{} is a crate root without `{want}`",
+                root.display()
+            );
+        }
+    }
 
     const SAMPLE: &str = "\
 ## compare_shells: bash dash mksh ash

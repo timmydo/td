@@ -8,10 +8,10 @@
 //!     failure is tolerated, but a REGRESSION (an unlisted case that fails) reds
 //!     the gate, and an unexpected PASS (`xpass`) reds it so the entry is promoted;
 //!   - a case that cannot be evaluated faithfully in this isolated `-c` harness is
-//!     listed `skip` and not run: it needs the `argv.py` helper, hangs/times out,
-//!     or depends on the Oils repo tree the sandbox cwd does not stage (which would
-//!     fail for an environment reason or degenerate into a false pass). The overlay
-//!     header enumerates these categories.
+//!     listed `skip` and not run: it hangs/times out, depends on the Oils repo
+//!     tree the sandbox cwd does not stage, or turns on shared `/tmp` state (each
+//!     of which would fail for an environment reason or degenerate into a false
+//!     pass). The overlay header enumerates these categories.
 //!
 //! The `xfail` COUNT is not a backlog, and a large share of it is not about
 //! this shell at all: a case dies the same way on an external program the
@@ -19,7 +19,8 @@
 //! builtin td-sh does not have -- both are `not found`. The overlay header
 //! carries the standing note and the deferred externals rig; measure before
 //! mining the list, because the two causes are indistinguishable from the
-//! failure alone, and an Oils `.py` helper is a third that looks like both.
+//! failure alone. `argv.py` WAS a third that looked like both, and is now
+//! served (`src/bin/spec_argv.rs`), which is why those cases grade.
 //!
 //! Two things that note does not say. The here-doc cases that die on `cat` are
 //! already byte-correct where `cat` exists -- `cat <<-EOF` with stripped tabs,
@@ -43,8 +44,13 @@
 //!
 //! Conformance green is one of two gates before td-sh becomes the image
 //! `/bin/sh`; the busybox `ash_test` parity gate is the other (system-x86-64,
-//! a later PR). Importing the remaining Oils files (and the `argv.py` helper rig
-//! the `skip` cases need) is follow-up work.
+//! a later PR). Importing the remaining Oils files, and serving more of the
+//! externals the corpus reaches for, is follow-up work.
+
+// A crate root of its own: `main.rs`'s lint reaches nothing here. `forbid`
+// rather than `deny` because no scoped allow belongs in this one, and
+// `forbid` is the spelling a later `#[allow(unsafe_code)]` cannot override.
+#![forbid(unsafe_code)]
 
 use std::path::{Path, PathBuf};
 
@@ -119,6 +125,78 @@ fn corpus_is_well_formed() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// The staged `argv.py` is a SYMLINK to this crate's build artifact, so a case
+/// that wrote through the PATH entry would truncate the real binary — outside
+/// its own throwaway workdir, and so for every later and every parallel case,
+/// which would then grade against a helper that prints nothing. The shell entry
+/// is not exposed the same way: it IS the executable the case is running, so the
+/// kernel answers a write to it with ETXTBSY, while the helper is only running
+/// for the instant it takes to print a line. Demonstrated, not assumed: through
+/// a symlink of the same shape, `: > $PATH/argv.py` takes the target to 0 bytes.
+///
+/// No case in the pinned corpus writes to it, and this is what keeps that a
+/// CHECKED property rather than a fact about today's import — a future corpus
+/// file that does reds here, at the import, instead of silently corrupting a
+/// regenerated overlay that the gate would then enforce. A guard, not a fix:
+/// what removes the exposure is staging a read-only copy, which costs the very
+/// per-case `fs::copy` whose write fd the shell-staging note above avoids.
+#[test]
+fn no_case_writes_to_the_staged_helper() -> Result<(), Box<dyn std::error::Error>> {
+    // The redirect target is the word after `>`; `>>` simply hits the second.
+    fn redirects_to(code: &str, name: &str) -> bool {
+        let mut rest = code;
+        while let Some(pos) = rest.find('>') {
+            let after = rest.get(pos + 1..).unwrap_or("").trim_start();
+            let end = after
+                .find(|c: char| c.is_whitespace() || matches!(c, ';' | '&' | '|' | ')'))
+                .unwrap_or(after.len());
+            if after.get(..end).is_some_and(|t| t.ends_with(name)) {
+                return true;
+            }
+            rest = rest.get(pos + 1..).unwrap_or("");
+        }
+        false
+    }
+
+    let spec_dir = spec_dir();
+    let mut checked = 0usize;
+    for path in td_sh::spec_paths(&spec_dir)? {
+        let text = std::fs::read_to_string(&path)?;
+        for case in parse_spec(&text).map_err(|e| format!("{}: {e}", path.display()))? {
+            let code = &case.code;
+            assert!(
+                !code.contains("$PATH/"),
+                "{} [case: {}]: writes into the staged PATH directory, which holds \
+                 a symlink to this crate's build artifact",
+                path.display(),
+                case.name,
+            );
+            assert!(
+                !redirects_to(code, "argv.py"),
+                "{} [case: {}]: redirects onto `argv.py`, which would truncate the \
+                 real `spec_argv` binary for every other case",
+                path.display(),
+                case.name,
+            );
+            for verb in ["rm ", "mv ", "cp ", "ln ", "chmod ", "truncate ", "tee "] {
+                let mutates = code
+                    .lines()
+                    .any(|l| l.contains(verb) && l.contains("argv.py"));
+                assert!(
+                    !mutates,
+                    "{} [case: {}]: `{verb}` names `argv.py`, which is a symlink to \
+                     this crate's build artifact",
+                    path.display(),
+                    case.name,
+                );
+            }
+            checked += 1;
+        }
+    }
+    assert!(checked > 0, "scanned no cases");
+    Ok(())
+}
+
 /// The runner's ENVIRONMENT contract, which 359 corpus guards turn on and which
 /// only a real child can demonstrate. Written as a spec so each expectation is
 /// the golden itself: `$SH` is the identity the case is GRADED as rather than a
@@ -152,7 +230,7 @@ no-externals
 ## END
 ";
     for case in parse_spec(spec)? {
-        let outcome = run_case(&shell, &case, ASH_DASH_CHAIN)?;
+        let outcome = run_case(&shell, &argv_helper(), &case, ASH_DASH_CHAIN)?;
         assert!(outcome.passed, "{}: {}", case.name, outcome.detail.unwrap_or_default());
     }
     // And it follows the chain rather than being a fixed `ash`.
@@ -164,7 +242,7 @@ DASH
 ## END
 ";
     for case in parse_spec(spec)? {
-        let outcome = run_case(&shell, &case, &["dash"])?;
+        let outcome = run_case(&shell, &argv_helper(), &case, &["dash"])?;
         assert!(outcome.passed, "{}: {}", case.name, outcome.detail.unwrap_or_default());
     }
 
@@ -200,7 +278,7 @@ ASH
 ## END
 ";
     for case in parse_spec(spec)? {
-        let outcome = run_case(&shell, &case, ASH_DASH_CHAIN)?;
+        let outcome = run_case(&shell, &argv_helper(), &case, ASH_DASH_CHAIN)?;
         assert!(outcome.passed, "{}: {}", case.name, outcome.detail.unwrap_or_default());
     }
     let spec = "\
@@ -213,7 +291,7 @@ ASH
 ## END
 ";
     for case in parse_spec(spec)? {
-        let outcome = run_case(&shell, &case, ASH_DASH_CHAIN)?;
+        let outcome = run_case(&shell, &argv_helper(), &case, ASH_DASH_CHAIN)?;
         assert!(outcome.passed, "{}: {}", case.name, outcome.detail.unwrap_or_default());
     }
     // And the identity a case is graded as is readable without running it, so an
@@ -264,7 +342,7 @@ ash
 ## N-I dash status: 2
 ";
     for case in parse_spec(spec)? {
-        let outcome = run_case(&shell, &case, ASH_DASH_CHAIN)?;
+        let outcome = run_case(&shell, &argv_helper(), &case, ASH_DASH_CHAIN)?;
         assert!(outcome.passed, "{}: {}", case.name, outcome.detail.unwrap_or_default());
     }
 
@@ -281,7 +359,7 @@ ash
 ## status: 1
 ";
     for case in parse_spec(spec)? {
-        let outcome = run_case(&shell, &case, ASH_DASH_CHAIN)?;
+        let outcome = run_case(&shell, &argv_helper(), &case, ASH_DASH_CHAIN)?;
         assert!(outcome.passed, "{}: {}", case.name, outcome.detail.unwrap_or_default());
     }
     assert_eq!(
@@ -296,7 +374,7 @@ ash
     let case = cases.first().ok_or("missing case")?;
     for bad in ["../escape", "/abs", "a/b", "", ".", ".."] {
         assert!(
-            run_case(&shell, case, &[bad]).is_err(),
+            run_case(&shell, &argv_helper(), case, &[bad]).is_err(),
             "identity {bad:?} was accepted as a path component"
         );
     }
@@ -314,7 +392,7 @@ fn corpus_conformance() -> Result<(), Box<dyn std::error::Error>> {
     let exp_text = std::fs::read_to_string(spec_dir.join("expectations.txt")).unwrap_or_default();
     let exp = Expectations::parse(&exp_text).map_err(|e| format!("expectations.txt: {e}"))?;
 
-    let (outcomes, stale) = run_dir_classified(&shell, &spec_dir, ASH_DASH_CHAIN, &exp)?;
+    let (outcomes, stale) = run_dir_classified(&shell, &argv_helper(), &spec_dir, ASH_DASH_CHAIN, &exp)?;
     let s = summarize(&outcomes);
     eprintln!(
         "td-sh conformance: {} pass, {} xfail, {} skip  |  {} regressions, {} to-promote, {} stale",
@@ -359,7 +437,7 @@ fn large_output_case_is_captured_without_deadlock() -> Result<(), Box<dyn std::e
     let cases = parse_spec(spec)?;
     let case = cases.first().ok_or("no case parsed")?;
     let start = std::time::Instant::now();
-    let outcome = run_case(&shell, case, ASH_DASH_CHAIN)?;
+    let outcome = run_case(&shell, &argv_helper(), case, ASH_DASH_CHAIN)?;
     assert!(outcome.passed, "large-output case failed: {:?}", outcome.detail);
     assert!(
         start.elapsed() < std::time::Duration::from_secs(5),
@@ -445,6 +523,12 @@ fn an_ignore_trap_is_inherited_by_a_child() -> Result<(), Box<dyn std::error::Er
         assert_eq!(seen, want, "{body}: child inherited {seen:#x}, wanted {want:#x}");
     }
     Ok(())
+}
+
+/// The `argv.py` stand-in the corpus expects on PATH, built by this crate as a
+/// second bin. `run_case` stages it under that name.
+fn argv_helper() -> PathBuf {
+    PathBuf::from(env!("CARGO_BIN_EXE_spec_argv"))
 }
 
 /// Wait for `child`, killing it if it outlives `limit`. Returns whether it ended
@@ -1801,7 +1885,7 @@ fn file_writing_case_does_not_pollute_cwd() -> Result<(), Box<dyn std::error::Er
     let spec = format!("#### writes a file\necho hi > {marker}\n## status: 0\n");
     let cases = parse_spec(&spec)?;
     let case = cases.first().ok_or("no case parsed")?;
-    let outcome = run_case(&shell, case, ASH_DASH_CHAIN)?;
+    let outcome = run_case(&shell, &argv_helper(), case, ASH_DASH_CHAIN)?;
     assert!(outcome.passed, "redirect case failed: {:?}", outcome.detail);
     assert!(!Path::new(&marker).exists(), "case leaked {marker} into the cwd — isolation broken");
     Ok(())
