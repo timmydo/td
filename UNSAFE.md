@@ -790,11 +790,49 @@ through `std::io::Stdin`, a `BufReader`, took up to 8 KiB off a shared
 descriptor and then reported a timeout for a line already in hand. So the
 `read` BUILTIN takes stdin ONE BYTE at a time through an unbuffered
 handle, as this shell already did for every other descriptor and as its
-line editor already did in raw mode. NOTHING in the shell reads ahead on
-stdin now: the editor's cooked fallback and the reader for a script
-arriving on stdin take the same handle a byte at a time, so the script
-and the commands in it cannot disagree about where in that descriptor
-they are.
+line editor already did in raw mode. Nothing in the shell is LEFT
+reading ahead on stdin: the editor's cooked fallback and the reader for
+a script arriving on stdin end every line with the descriptor exactly
+past it, so the script and the commands in it cannot disagree about
+where in that descriptor they are.
+
+HOW that position is reached depends on whether the descriptor can be
+given back to, and only the `read` builtin needs it a byte at a time —
+poll is the reason there, and a pipe has no way to return an over-read.
+A script on stdin that is a REGULAR FILE does not need either: `sh <
+script` reads a block and REWINDS to the byte after the newline, which
+is what bash does and what costs two syscalls a line rather than one a
+byte. How much that is worth depends on how long the lines are, since
+the old cost was per BYTE and the new one is per LINE: on a 60k-line
+script of ordinary length it is about a third of the time, and on one
+of two-byte lines it is barely anything. Regular rather than merely
+seekable, because a descriptor can answer a position query and still
+refuse the negative seek this ends with, and by then the block is read.
+That is not a silent loss — the failing seek becomes a
+`ScriptLine::Failed` and the shell stops — but a script that stops is
+still not a script that ran, so the narrower test is the one taken.
+
+The rewind is not tidiness but the whole of that path's correctness:
+without it the block takes lines the script's own `read` is owed, which
+`a_file_stdin_script_agrees_with_a_piped_one` pins by running both
+paths over one script and holding each to the same expected output
+rather than to the other. It is issued before `read_line_block`
+returns, so the descriptor is ahead only between that read and that
+seek. NOTHING td-sh itself starts can observe that window: `&` is
+synchronous here, and a pipeline's stages are threads joined before the
+list returns, so no command of this shell's runs while the parser is
+reading. What could is a process OUTSIDE it holding the same file
+description — a daemonising child, or a sibling of whoever set up the
+redirect. For one of those the cost is worse than seeing a transient
+offset: the rewind is RELATIVE, so a sharer that moves the position
+inside the window sends it to the wrong absolute place and the reader
+does not recover. That is inherent to reading more than a byte and
+giving the rest back, bash included.
+
+Deliberately NOT done: bash's further trick of deferring the rewind
+until it is about to run something that reads stdin. That buys the rest
+of the distance to bash and replaces an invariant that holds
+unconditionally with one every future command path has to remember.
 
 Nor may a descriptor be LOCKED across that read. The shell's table holds
 an open file behind a bare `Arc` rather than an `Arc<Mutex<…>>`, because

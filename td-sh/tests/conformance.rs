@@ -632,6 +632,124 @@ fn a_stdin_script_leaves_the_rest_of_itself_for_read()
     Ok(())
 }
 
+/// A stdin that is a REGULAR FILE takes the same script to the same place a
+/// pipe does.
+///
+/// The test above drives stdin through a pipe, which can only be read a byte at
+/// a time — there is no way to give an over-read back. A file is read a block at
+/// a time and rewound to the byte after the newline instead, and that rewind is
+/// the whole of the path's correctness: without it the block takes lines the
+/// script's own `read` is owed, and every case here prints the wrong thing while
+/// the piped ones stay green. So both paths are run over the same scripts and
+/// both are held to the same expected output, rather than to each other — two
+/// paths agreeing on the wrong answer is the failure this would otherwise miss.
+///
+/// Each child is BOUNDED, because the two ways a rewind can be wrong fail
+/// differently: rewinding too little loses bytes and shows up as a mismatch,
+/// while rewinding too far re-reads the newline forever, and an unbounded
+/// `output()` would hang the suite instead of reddening it.
+///
+/// Only builtins appear, so the assertion is about the descriptor rather than
+/// about what happens to be on PATH.
+#[test]
+fn a_file_stdin_script_agrees_with_a_piped_one()
+-> Result<(), Box<dyn std::error::Error>> {
+    use std::io::Write as _;
+    let shell = PathBuf::from(env!("CARGO_BIN_EXE_td-sh"));
+    let long = "x".repeat(700);
+    let cases = [
+        ("read v\nDATA\necho \"got=[$v]\"\n".to_string(), "got=[DATA]\n"),
+        (
+            "read a\nONE\nread b\nTWO\necho \"[$a][$b]\"\n".to_string(),
+            "[ONE][TWO]\n",
+        ),
+        (
+            "for i in 1 2; do\n  read v\n  echo \"i=$i v=$v\"\ndone\nA\nB\n".to_string(),
+            "i=1 v=A\ni=2 v=B\n",
+        ),
+        // A here-document is consumed by the PARSER rather than by `read`, so
+        // its lines go through the reader under test.
+        ("read v <<EOF\nbody\nEOF\necho \"[$v]\"\n".to_string(), "[body]\n"),
+        // A SCRIPT line longer than SCRIPT_BLOCK, so the seekable path has to
+        // accumulate across reads before it finds a newline to rewind to. The
+        // length has to be in a line the PARSER reads: as data after `read v`
+        // it would be consumed by the builtin a byte at a time instead, and
+        // the accumulation branch would never run. The `read` that follows is
+        // what checks the rewind ending a multi-block line, since it can only
+        // see `DATA` if the descriptor came back to the right place.
+        (
+            format!("v={long}\nread w\nDATA\necho \"[$w][${{#v}}]\"\n"),
+            "[DATA][700]\n",
+        ),
+        // A first line ending EXACTLY on the block boundary: `v=` + 253 + the
+        // newline is 256, so the read stops with nothing over-read and the
+        // rewind is skipped. That is the one path through the arithmetic that
+        // never issues a seek, and EOF is the only other way to reach it.
+        (
+            format!("v={}\nread w\nDATA\necho \"[$w][${{#v}}]\"\n", "x".repeat(253)),
+            "[DATA][253]\n",
+        ),
+        // No trailing newline, so the last line ends at end of input rather
+        // than at a byte the rewind can point past.
+        ("read v\nDATA\necho \"end=[$v]\"".to_string(), "end=[DATA]\n"),
+    ];
+    let dir = std::env::temp_dir().join(format!("td-sh-stdin-{}", std::process::id()));
+    // Fresh, so a leak from a previous failing run cannot feed this one.
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir)?;
+    for (i, (script, want)) in cases.iter().enumerate() {
+        let mut child = std::process::Command::new(&shell)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()?;
+        match child.stdin.take() {
+            Some(mut w) => w.write_all(script.as_bytes())?,
+            None => return Err("no stdin pipe".into()),
+        }
+        let ended = wait_within(&mut child, std::time::Duration::from_secs(30))?;
+        let piped = child.wait_with_output()?;
+        assert!(ended, "piped {script:?} did not finish");
+        // Status first, so a shell that died reports what it said rather than
+        // presenting as an empty-string mismatch.
+        assert!(
+            piped.status.success(),
+            "piped {script:?} failed: {}",
+            String::from_utf8_lossy(&piped.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&piped.stdout),
+            *want,
+            "piped: {script:?}"
+        );
+
+        let path = dir.join(format!("case{i}.sh"));
+        std::fs::write(&path, script)?;
+        let mut child = std::process::Command::new(&shell)
+            .stdin(std::process::Stdio::from(std::fs::File::open(&path)?))
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()?;
+        let ended = wait_within(&mut child, std::time::Duration::from_secs(30))?;
+        let seekable = child.wait_with_output()?;
+        // A rewind that goes one byte too far re-reads the newline forever, so
+        // this is the assertion that catches it.
+        assert!(ended, "file {script:?} did not finish");
+        assert!(
+            seekable.status.success(),
+            "file {script:?} failed: {}",
+            String::from_utf8_lossy(&seekable.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&seekable.stdout),
+            *want,
+            "file: {script:?}"
+        );
+    }
+    std::fs::remove_dir_all(&dir)?;
+    Ok(())
+}
+
 /// The shell-ending paths a stdin script has still end it once that script is
 /// read incrementally rather than whole.
 ///

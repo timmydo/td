@@ -34,7 +34,7 @@
 //! the safe error, since over-counting can only shorten the row, and correcting
 //! it needs full grapheme segmentation rather than a range table.
 
-use std::io::{IsTerminal, Read, Write};
+use std::io::{IsTerminal, Read, Seek, Write};
 use std::os::fd::AsFd;
 
 use crate::term;
@@ -702,18 +702,20 @@ fn pick_sink(candidates: [std::os::fd::BorrowedFd<'_>; 2]) -> Option<std::fs::Fi
 /// The kernel's own line discipline, for a stdin that is not an editable
 /// terminal — a pipe, a file, or a console that would not take `TCSETS`.
 ///
-/// ONE BYTE AT A TIME, through the same unbuffered handle the `read` builtin
-/// takes, and for the same reason it takes one: `std::io::Stdin` is a
-/// `BufReader`, so reading a line through it pulls up to 8 KiB off a descriptor
-/// the SCRIPT shares with the commands in it. `printf 'read v\nDATA\n' | td-sh
-/// -i` left `read` at end of input with the line it wanted sitting in the
-/// shell's own buffer, where bash hands it over. Sharing the handle rather than
-/// taking a second one is what keeps the two from disagreeing about position.
+/// Through the same unbuffered handle the `read` builtin takes, and never past
+/// the line: `std::io::Stdin` is a `BufReader`, so reading a line through it
+/// pulls up to 8 KiB off a descriptor the SCRIPT shares with the commands in
+/// it. `printf 'read v\nDATA\n' | td-sh -i` left `read` at end of input with
+/// the line it wanted sitting in the shell's own buffer, where bash hands it
+/// over. Sharing the handle rather than taking a second one is what keeps the
+/// two from disagreeing about position.
 ///
-/// The cost is a syscall per byte on a path that is per-LINE and interactive.
-/// A non-interactive stdin script never reaches here — it is read by
-/// `read_script_line` below, which `main`'s parser pulls from — so this is `-i`
-/// on a pipe, or a console that refused raw mode.
+/// This defers to `read_script_line`, so which of the two readers runs follows
+/// from the descriptor rather than from being interactive: `td-sh -i < file`
+/// takes the block-and-rewind path, and `-i` on a pipe or on a console that
+/// refused raw mode takes the byte-at-a-time one. A non-interactive stdin
+/// script never reaches here at all — `main`'s parser pulls from
+/// `read_script_line` directly.
 fn read_cooked(prompt: &str) -> Input {
     let _ = write!(std::io::stdout(), "{prompt}");
     let _ = std::io::stdout().flush();
@@ -746,7 +748,15 @@ pub enum ScriptLine {
     Failed(String),
 }
 
-/// One line off stdin, unbuffered and byte at a time.
+/// Bytes taken per read once stdin is known to be seekable. Big enough that an
+/// ordinary line costs one read, small enough that the rewind after it is short.
+const SCRIPT_BLOCK: usize = 256;
+
+/// Whether stdin can be rewound, asked once. The handle is a dup taken at first
+/// use, so nothing the script does to fd 0 afterwards changes the answer.
+static STDIN_REWINDABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+/// One line off stdin, never leaving the descriptor past the newline.
 ///
 /// Through the same handle the `read` builtin takes, `process::stdin_raw`:
 /// `std::io::Stdin` is a `BufReader`, so reading a line through it pulls up to
@@ -754,15 +764,55 @@ pub enum ScriptLine {
 /// the handle rather than opening a second one is the point — two dups would
 /// have one offset but two buffers, which is the bug this exists to avoid.
 ///
-/// The cost is a syscall per byte. A script given as a FILE OPERAND is still
-/// read whole (`Start::Script`); everything else reaching stdin comes through
-/// here, `sh < script` included.
+/// How the line is taken depends on whether that descriptor can be given back
+/// to. A SEEKABLE stdin is read a block at a time and rewound to the byte after
+/// the newline, which is what bash does; an UNSEEKABLE one — pipe, FIFO,
+/// terminal — has no way to return an over-read, so it goes a byte at a time.
+/// Either way the descriptor ends up exactly past the line, which is what makes
+/// `cat` in `sh < script` see the lines the parser did not take.
+///
+/// A script given as a FILE OPERAND is still read whole (`Start::Script`);
+/// everything else reaching stdin comes through here, `sh < script` included.
 pub fn read_script_line() -> ScriptLine {
     let handle = match crate::process::stdin_raw() {
         Ok(handle) => handle,
         Err(e) => return ScriptLine::Failed(e.to_string()),
     };
-    let mut src: &std::fs::File = &handle;
+    let seekable = *STDIN_REWINDABLE.get_or_init(|| {
+        // A REGULAR FILE, and one that answers a position query. Answering is
+        // not enough on its own: a descriptor can take `stream_position` and
+        // still refuse the negative seek this path ends with, and by then the
+        // block has been read and there is nothing to give back. A regular
+        // file is the kind whose rewind is guaranteed — and it is what
+        // `sh < script` is. Anything else takes the byte-at-a-time loop, which
+        // is correct for every descriptor and merely slower.
+        let mut probe: &std::fs::File = &handle;
+        handle.metadata().is_ok_and(|m| m.file_type().is_file()) && probe.stream_position().is_ok()
+    });
+    let read = if seekable {
+        read_line_block(&handle)
+    } else {
+        read_line_bytewise(&handle)
+    };
+    let bytes = match read {
+        Ok(bytes) => bytes,
+        Err(e) => return ScriptLine::Failed(e),
+    };
+    if bytes.is_empty() {
+        return ScriptLine::Eof;
+    }
+    match String::from_utf8(bytes) {
+        Ok(line) => ScriptLine::Line(line),
+        // The message `read_to_string` gave for the same input, which is what
+        // this path reported before it read a line at a time.
+        Err(_) => ScriptLine::Failed("stream did not contain valid UTF-8".to_string()),
+    }
+}
+
+/// A line at one syscall per byte: the only way to read a descriptor that cannot
+/// be rewound, since anything over-read is taken from the script's own commands.
+fn read_line_bytewise(handle: &std::fs::File) -> Result<Vec<u8>, String> {
+    let mut src: &std::fs::File = handle;
     let mut bytes: Vec<u8> = Vec::new();
     let mut one = [0u8; 1];
     loop {
@@ -772,25 +822,66 @@ pub fn read_script_line() -> ScriptLine {
             // more. Unreachable while td-sh installs no handler, and reachable
             // the moment `trap 'action'` is served, which UNSAFE.md §8 defers.
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(e) => return ScriptLine::Failed(e.to_string()),
-            Ok(0) => break,
+            Err(e) => return Err(e.to_string()),
+            Ok(0) => return Ok(bytes),
             Ok(_) => {
-                let byte = one[0];
+                // Unreachable from a conforming `Read`, and an ERROR rather
+                // than the bytes so far: a script line quietly cut short is a
+                // different script, where a failure stops it.
+                let Some(&byte) = one.first() else {
+                    return Err("stdin reported a byte that is not there".to_string());
+                };
                 bytes.push(byte);
                 if byte == b'\n' {
-                    break;
+                    return Ok(bytes);
                 }
             }
         }
     }
-    if bytes.is_empty() {
-        return ScriptLine::Eof;
-    }
-    match String::from_utf8(bytes) {
-        Ok(line) => ScriptLine::Line(line),
-        // The message `read_to_string` gave for the same input, which is what
-        // this path reported before it read a line at a time.
-        Err(_) => ScriptLine::Failed("stream did not contain valid UTF-8".to_string()),
+}
+
+/// A line in block reads, rewinding to the byte after the newline.
+///
+/// The rewind is the whole point rather than tidiness: the parser and the
+/// commands it starts share one descriptor, so bytes read past the line would
+/// be bytes `cat` in `sh < script` never sees. It is issued before this returns,
+/// so the descriptor is ahead only for as long as one read takes — the same
+/// window bash's reader has, and it is why this path needs stdin to be seekable
+/// rather than merely a regular file.
+fn read_line_block(handle: &std::fs::File) -> Result<Vec<u8>, String> {
+    let mut src: &std::fs::File = handle;
+    let mut bytes: Vec<u8> = Vec::new();
+    let mut buf = [0u8; SCRIPT_BLOCK];
+    loop {
+        let n = match src.read(&mut buf) {
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e.to_string()),
+            // End of input: nothing was over-read, so there is nothing to give
+            // back and the descriptor already sits where it should.
+            Ok(0) => return Ok(bytes),
+            Ok(n) => n,
+        };
+        // Both of these are unreachable from a conforming `Read` -- `n` is what
+        // it just reported reading, and `nl` is an index into that same slice.
+        // They fail rather than returning the bytes so far, because a script
+        // line quietly cut short is a different script, where an error stops it.
+        let Some(chunk) = buf.get(..n) else {
+            return Err("stdin reported more bytes than were asked for".to_string());
+        };
+        let Some(nl) = chunk.iter().position(|&b| b == b'\n') else {
+            bytes.extend_from_slice(chunk);
+            continue;
+        };
+        let Some(upto) = chunk.get(..=nl) else {
+            return Err("stdin line ended past the bytes it was found in".to_string());
+        };
+        bytes.extend_from_slice(upto);
+        let over = n.saturating_sub(nl.saturating_add(1));
+        if over > 0 {
+            let back = i64::try_from(over).map_err(|e| e.to_string())?;
+            src.seek(std::io::SeekFrom::Current(-back)).map_err(|e| e.to_string())?;
+        }
+        return Ok(bytes);
     }
 }
 
