@@ -158,6 +158,16 @@ impl Frame {
     }
 }
 
+/// What a frame was drawn FOR. The size is the obvious half; the activation
+/// state is the other, because it decides how the cursor is drawn — so a
+/// configure that only takes focus away still needs a new picture, and a
+/// redraw decision made on the size alone would never make one.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct Drawn {
+    size: Size,
+    activated: bool,
+}
+
 /// What the client knows about its surface between configures.
 ///
 /// The toplevel configure carries the size and the SURFACE configure is where
@@ -184,9 +194,13 @@ struct Surface {
     /// makes `ack_configure` take effect on the surface commit that FOLLOWS
     /// it, so acknowledging is only half of answering one.
     needs_commit: bool,
-    /// The size the frame in flight was drawn at, which is not always the size
-    /// now held: a configure can arrive while a frame is in the air.
-    drawn: Option<Size>,
+    /// What the frame in flight was drawn for, which is not always what the
+    /// surface now wants: a configure can arrive while a frame is in the air.
+    drawn: Option<Drawn>,
+    /// The grid the PTY was last set to, which is the grid the published
+    /// readiness line names. On the surface because `adopt_size` is what
+    /// establishes it and both loops go through there.
+    cells: Option<(u16, u16)>,
     live_buffers: BTreeSet<u32>,
     live_callbacks: BTreeSet<u32>,
     frame: Option<Frame>,
@@ -205,6 +219,7 @@ impl Surface {
             layout_configured: false,
             needs_commit: false,
             drawn: None,
+            cells: None,
             live_buffers: BTreeSet::new(),
             live_callbacks: BTreeSet::new(),
             frame: None,
@@ -327,14 +342,34 @@ impl Surface {
         connection.send(SURFACE, 6, wire::Builder::new())
     }
 
+    /// What the surface would have to be showing to be up to date: the size
+    /// it holds, drawn with the focus it holds. `None` before any configure,
+    /// which is also when there is nothing it could be showing.
+    fn wanted(&self) -> Option<Drawn> {
+        self.current.map(|size| Drawn {
+            size,
+            activated: self.activated,
+        })
+    }
+
+    /// Whether a frame is out that the compositor has not finished with.
+    /// Drawing another would stack a second wl_shm pool on it for a picture
+    /// it has not shown yet, which is what makes a burst of configures a
+    /// memory leak rather than a redraw.
+    fn frame_in_flight(&self) -> bool {
+        self.frame.as_ref().is_some_and(|frame| !frame.complete())
+    }
+
     /// Readiness, as §12 defines it: a frame the compositor has both released
-    /// and presented, DRAWN AT the size now held, which the compositor chose.
-    /// All three matter and the middle one is easy to lose — a configure can
-    /// arrive while a frame is in the air, and the frame that comes back is
-    /// then a picture of the wrong size.
+    /// and presented, drawn FOR what the surface now holds, at a size the
+    /// compositor chose. All three matter and the middle one is easy to lose
+    /// — a configure can arrive while a frame is in the air, and the frame
+    /// that comes back is then a picture of the wrong thing.
     fn ready(&self) -> bool {
+        // `layout_configured` means a configure chose a size, so `wanted` is
+        // `Some` here and the comparison cannot be two `None`s agreeing.
         self.layout_configured
-            && self.drawn == self.current
+            && self.drawn == self.wanted()
             && self.frame.as_ref().is_some_and(Frame::complete)
     }
 
@@ -500,6 +535,125 @@ fn commit_frame(
     Ok(())
 }
 
+/// Everything `run` holds once the terminal is up. A struct rather than a
+/// tuple because the tuple reached five on the landing that added the PTY,
+/// which is where a reviewer said it would stop reading.
+pub struct Prepared {
+    surface: Surface,
+    pub pty: Pty,
+    terminal: Terminal,
+    pub cells: (u16, u16),
+}
+
+impl Prepared {
+    /// The tile the surface settled on. Read off the surface rather than
+    /// carried beside it, so the two cannot disagree.
+    #[cfg(test)]
+    pub fn size(&self) -> Result<Size, String> {
+        self.surface
+            .current
+            .ok_or_else(|| "the terminal presented without a size".to_string())
+    }
+}
+
+/// The size changed. Bound it, work out the grid, tell the PTY and verify it
+/// took, reflow the model, and draw — in that order, which §12 fixes: the
+/// child learns the new grid BEFORE the pixels change, so a program redrawing
+/// on the size change never paints for a grid the surface no longer has.
+///
+/// The first frame runs this too. A terminal's opening size is just the first
+/// size it was given, so `model` is what says whether there is anything to
+/// reflow yet; everything after that is one path.
+fn adopt_size(
+    connection: &mut Connection,
+    surface: &mut Surface,
+    model: &mut Option<Terminal>,
+    session: &Session,
+    size: Size,
+) -> Result<(), String> {
+    // Before the model, not only before the pixels: `build_pixels` checks
+    // this again, but by then `Terminal::new` has already allocated for a
+    // size nothing bounded. Deleting this line reds nothing, because the
+    // model's own limits keep it to a bounded transient that returns `Err` —
+    // the position is a defence in depth, and the comment is what holds it.
+    frame_bytes(size)?;
+    let (rows, columns) = grid(size, session.font)?;
+    let window = session
+        .pty
+        .resize(usize::from(rows), usize::from(columns))?;
+    let (rows, columns) = (usize::from(window.rows), usize::from(window.columns));
+    let terminal = match model.as_mut() {
+        // Reflowed, NOT rebuilt: a `Terminal::new` here would leave the
+        // screen intact only because it is empty today, and would silently
+        // erase a session's scrollback the moment a child writes to one.
+        Some(terminal) => {
+            terminal.resize(rows, columns)?;
+            terminal
+        }
+        None => model.insert(Terminal::new(rows, columns)?),
+    };
+    commit_frame(
+        connection,
+        surface,
+        session.directory,
+        size,
+        terminal,
+        session.font,
+        session.palette,
+    )?;
+    surface.drawn = Some(Drawn {
+        size,
+        activated: surface.activated,
+    });
+    surface.cells = Some((window.rows, window.columns));
+    Ok(())
+}
+
+/// What a terminal session is, apart from what is on the screen: where its
+/// wl_shm files go, the terminal its child will be given, and what a frame is
+/// drawn with. None of the four changes once the terminal is up and adopting
+/// a size needs all four — three to draw with and the PTY to tell — so they
+/// travel as one rather than as four arguments that could be paired wrongly.
+struct Session<'a> {
+    directory: &'a Path,
+    pty: &'a Pty,
+    font: &'a Font,
+    palette: &'a render::Palette,
+}
+
+/// One turn of the terminal's steady state: take an event, and answer it.
+/// A new size is adopted exactly as the first one was — same function, so
+/// resize is not a second code path — and a configure that changes nothing
+/// still gets the commit its acknowledgement owes.
+///
+/// This is a function rather than the body of `run`'s loop because `run` does
+/// not return: a loop that dials a socket and never ends is a loop no test
+/// can enter, and this is where every event after readiness is served.
+fn serve_turn(
+    connection: &mut Connection,
+    surface: &mut Surface,
+    model: &mut Option<Terminal>,
+    session: &Session,
+    fallback: Size,
+) -> Result<(), String> {
+    surface.dispatch_next(connection, fallback)?;
+    let Some(wanted) = surface.wanted() else {
+        return Ok(());
+    };
+    // Throttled on the frame in flight, which is what stops a burst of
+    // configures becoming a burst of pools: only the LATEST is ever drawn,
+    // because the ones in between are superseded in `current` before anything
+    // allocates for them. The release and the callback are events too, so the
+    // frame completing is what brings the deferred redraw back here — there is
+    // nothing to wait on that is not already an event.
+    if surface.drawn != Some(wanted) && !surface.frame_in_flight() {
+        return adopt_size(connection, surface, model, session, wanted.size);
+    }
+    // The acknowledgement is still owed a commit even when the pixels cannot
+    // be replaced yet.
+    surface.commit_configure(connection)
+}
+
 /// Everything `run` does before it may publish: bind, create the surface,
 /// take the first configure, render one frame into it, and wait for BOTH the
 /// buffer release and the frame callback. Production, so the test that drives
@@ -509,7 +663,14 @@ fn present(
     directory: &Path,
     font: &Font,
     palette: &render::Palette,
-) -> Result<(Surface, Size, (u16, u16)), String> {
+    pty: &Pty,
+) -> Result<(Surface, Terminal, (u16, u16)), String> {
+    let session = Session {
+        directory,
+        pty,
+        font,
+        palette,
+    };
     let fallback = default_size(font)?;
     let mut surface = Surface::new(bind_globals(connection)?);
     conn::create_surface(connection, TITLE)?;
@@ -520,39 +681,17 @@ fn present(
     // puts readiness after a frame, and this is the frame it means: one drawn
     // at a size the compositor CHOSE. Everything here runs under the
     // connection's deadline, so a compositor that never gets there fails.
-    loop {
-        surface.dispatch_next(connection, fallback)?;
-        let Some(size) = surface.current else {
-            continue;
-        };
-        if surface.drawn != Some(size) {
-            // Before the model, not just before the pixels: a configure large
-            // enough to matter would otherwise have `Terminal::new` allocate
-            // for it first.
-            frame_bytes(size)?;
-            let (rows, columns) = grid(size, font)?;
-            let terminal = Terminal::new(usize::from(rows), usize::from(columns))?;
-            commit_frame(
-                connection,
-                &mut surface,
-                directory,
-                size,
-                &terminal,
-                font,
-                palette,
-            )?;
-            surface.drawn = Some(size);
-            continue;
-        }
-        surface.commit_configure(connection)?;
-        if surface.ready() {
-            break;
-        }
+    let mut model = None;
+    // The SAME turn the steady state runs, so startup cannot throttle or
+    // redraw differently from a resize — the only difference is that this
+    // loop has somewhere to stop.
+    while !surface.ready() {
+        serve_turn(connection, &mut surface, &mut model, &session, fallback)?;
     }
-    let size = surface
-        .current
-        .ok_or_else(|| "the terminal presented without a size".to_string())?;
-    let (rows, columns) = grid(size, font)?;
+    let terminal = model.ok_or_else(|| "the terminal presented without a model".to_string())?;
+    let cells = surface
+        .cells
+        .ok_or_else(|| "the terminal presented without a grid".to_string())?;
 
     let unclaimed = connection.pending_fd_count();
     if unclaimed != 0 {
@@ -560,7 +699,7 @@ fn present(
             "the terminal presentation retained {unclaimed} unexpected descriptors"
         ));
     }
-    Ok((surface, size, (rows, columns)))
+    Ok((surface, terminal, cells))
 }
 
 /// Everything that must hold before readiness may be published: a presented
@@ -575,14 +714,18 @@ fn prepare(
     font: &Font,
     palette: &render::Palette,
     ptmx: &Path,
-) -> Result<(Surface, Pty, Size, (u16, u16)), String> {
+) -> Result<Prepared, String> {
     // Before the first frame rather than after it: a machine whose devpts is
     // missing or misconfigured should fail without having drawn a window,
     // and nothing about the size is needed to open one.
     let pty = Pty::open(ptmx)?;
-    let (surface, size, (rows, columns)) = present(connection, directory, font, palette)?;
-    let window = pty.resize(usize::from(rows), usize::from(columns))?;
-    Ok((surface, pty, size, (window.rows, window.columns)))
+    let (surface, terminal, cells) = present(connection, directory, font, palette, &pty)?;
+    Ok(Prepared {
+        surface,
+        pty,
+        terminal,
+        cells,
+    })
 }
 
 /// The same sequence over an already-open stream, which is the only way to
@@ -592,7 +735,7 @@ pub fn prepare_for_test(
     stream: std::os::unix::net::UnixStream,
     directory: &Path,
     ptmx: &Path,
-) -> Result<(Connection, Pty, Size, (u16, u16)), String> {
+) -> Result<(Connection, Prepared), String> {
     let font = font::pinned()?;
     let palette = render::Palette::pinned();
     let deadline = Instant::now()
@@ -600,8 +743,8 @@ pub fn prepare_for_test(
         .ok_or_else(|| "could not bound the terminal's Wayland handshake".to_string())?;
     let mut connection = Connection::over(stream, Some(deadline), FIRST_DYNAMIC_ID);
     connection.set_read_timeout(Some(HANDSHAKE_TIMEOUT))?;
-    let (_surface, pty, size, cells) = prepare(&mut connection, directory, &font, &palette, ptmx)?;
-    Ok((connection, pty, size, cells))
+    let prepared = prepare(&mut connection, directory, &font, &palette, ptmx)?;
+    Ok((connection, prepared))
 }
 
 pub fn run(options: &Options) -> Result<(), String> {
@@ -616,17 +759,29 @@ pub fn run(options: &Options) -> Result<(), String> {
         .checked_add(HANDSHAKE_TIMEOUT)
         .ok_or_else(|| "could not bound the terminal's Wayland handshake".to_string())?;
     let mut connection = Connection::connect(&options.socket, deadline, FIRST_DYNAMIC_ID)?;
-    // `_pty` rather than `_`: an underscore-PREFIXED binding lives to the end
-    // of the scope, and this one has to. The slave the child will be given is
-    // allocated from this master, so dropping it would close the terminal the
-    // published grid describes.
-    let (mut surface, _pty, _size, (rows, columns)) = prepare(
+    let Prepared {
+        mut surface,
+        pty,
+        terminal,
+        cells: (rows, columns),
+    } = prepare(
         &mut connection,
         runtime_directory,
         &font,
         &palette,
         Path::new(pty::DEV_PTMX),
     )?;
+    // The PTY lives as long as the loop below: the slave the child will be
+    // given is allocated from this master, and every later configure resizes
+    // it. The model lives that long for the stronger reason — it is the
+    // screen, and rebuilding it on a resize would erase the session.
+    let mut model = Some(terminal);
+    let session = Session {
+        directory: runtime_directory,
+        pty: &pty,
+        font: &font,
+        palette: &palette,
+    };
     connection.finish_handshake()?;
 
     let _ready = ready::publish(&options.ready_socket, rows, columns)?;
@@ -640,14 +795,16 @@ pub fn run(options: &Options) -> Result<(), String> {
     out.flush()
         .map_err(|e| format!("flush terminal ready marker: {e}"))?;
 
-    // Nothing writes to the terminal yet, so the loop stays a well-behaved
-    // client: it answers pings, retires the buffers it is handed back, and
-    // applies each configure with the commit an acknowledgement owes.
-    // Redrawing on a new size is the resize landing, and on child output the
-    // one after — until then a configure is applied without new pixels.
+    // Nothing writes to the terminal yet, so every turn is a Wayland event.
+    // Redrawing on child output is the landing after this one.
     loop {
-        surface.dispatch_next(&mut connection, fallback)?;
-        surface.commit_configure(&mut connection)?;
+        serve_turn(
+            &mut connection,
+            &mut surface,
+            &mut model,
+            &session,
+            fallback,
+        )?;
     }
 }
 
@@ -748,7 +905,15 @@ mod tests {
 
     fn pair() -> (Connection, UnixStream) {
         let (ours, theirs) = UnixStream::pair().unwrap();
-        (Connection::over(ours, None, FIRST_DYNAMIC_ID), theirs)
+        let connection = Connection::over(ours, None, FIRST_DYNAMIC_ID);
+        // Every test here writes the events it expects to be read. A change
+        // that reads one more would otherwise block forever, and a gate has
+        // nothing to interrupt it with — so an over-read is a failure with a
+        // diagnostic rather than a hung run.
+        connection
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        (connection, theirs)
     }
 
     /// Wayland ids must be allocated DENSELY, and td's own server only checks
@@ -1137,7 +1302,7 @@ mod tests {
         surface
             .dispatch(&mut connection, &surface_configure(1), fallback)
             .unwrap();
-        surface.drawn = surface.current;
+        surface.drawn = surface.wanted();
         surface.frame = Some(frame(true, true));
         assert!(
             !surface.ready(),
@@ -1157,8 +1322,28 @@ mod tests {
         );
 
         // Only a frame drawn at the size now held is readiness.
-        surface.drawn = surface.current;
+        surface.drawn = surface.wanted();
         surface.frame = Some(frame(true, true));
+        assert!(surface.ready());
+
+        // The size is not the whole of what a frame answers. A configure that
+        // only takes focus leaves the picture on screen wrong in the one way
+        // a terminal shows focus at all, so it is not readiness either.
+        surface
+            .dispatch(
+                &mut connection,
+                &configure_with_states(592, 352, &[4]),
+                fallback,
+            )
+            .unwrap();
+        surface
+            .dispatch(&mut connection, &surface_configure(3), fallback)
+            .unwrap();
+        assert!(
+            !surface.ready(),
+            "a frame drawn unfocused counted as readiness once focus arrived"
+        );
+        surface.drawn = surface.wanted();
         assert!(surface.ready());
     }
 
@@ -1370,6 +1555,378 @@ mod tests {
                 "{width}x{height} was accepted"
             );
         }
+    }
+
+    /// A configure after the first is the SAME event as the first, and the
+    /// model is reflowed rather than replaced. Rebuilding it looks identical
+    /// today — the terminal renders an empty model, so an erased screen and a
+    /// preserved one are the same pixels — which is why this writes to the
+    /// model first. That is the only way to tell the two apart before a child
+    /// lands, and by then the difference is a session's scrollback.
+    ///
+    /// It also pins the ORDER §12 fixes: the PTY holds the new grid, so a
+    /// child told to redraw is told about the size the surface now has.
+    #[test]
+    fn a_later_size_reflows_the_model_and_the_pty_rather_than_replacing_them() {
+        let (mut connection, _peer) = pair();
+        let mut surface = Surface::new(Bound {
+            compositor: 1,
+            shm: 2,
+            xdg_wm_base: 4,
+        });
+        surface.xrgb = true;
+        let font = font();
+        let palette = render::Palette::pinned();
+        let pty = Pty::open(Path::new(pty::DEV_PTMX)).unwrap();
+        let directory = std::env::temp_dir();
+        let session = Session {
+            directory: &directory,
+            pty: &pty,
+            font: &font,
+            palette: &palette,
+        };
+        let mut model = None;
+
+        let first = default_size(&font).unwrap();
+        adopt_size(&mut connection, &mut surface, &mut model, &session, first).unwrap();
+        assert_eq!(surface.cells, Some((24, 80)));
+        let window = pty.window().unwrap();
+        assert_eq!((window.rows, window.columns), (24, 80));
+
+        model.as_mut().unwrap().feed(b"reflow me");
+        assert!(model
+            .as_ref()
+            .unwrap()
+            .row_text(0)
+            .unwrap()
+            .starts_with("reflow me"));
+
+        let second = Size {
+            width: 592,
+            height: 352,
+        };
+        adopt_size(&mut connection, &mut surface, &mut model, &session, second).unwrap();
+        assert_eq!(surface.cells, Some((22, 74)));
+        let window = pty.window().unwrap();
+        assert_eq!(
+            (window.rows, window.columns),
+            (22, 74),
+            "the PTY kept the size the surface no longer has"
+        );
+        let model = model.as_ref().unwrap();
+        assert_eq!((model.rows(), model.columns()), (22, 74));
+        assert!(
+            model.row_text(0).unwrap().starts_with("reflow me"),
+            "the resize replaced the terminal instead of reflowing it"
+        );
+        assert_eq!(
+            surface.drawn,
+            Some(Drawn {
+                size: second,
+                activated: false
+            })
+        );
+    }
+
+    /// A configure that asks for nothing new still has to be APPLIED, and
+    /// applying one is a commit. `Surface::commit_configure` has its own test;
+    /// what this pins is that the loop reaches it, which is the half DESIGN.md
+    /// §12 spells out and the half a `serve_turn` that only ever drew would
+    /// silently drop. The surface is primed by hand rather than by drawing, so
+    /// the only two requests on the wire are the ones being asserted.
+    #[test]
+    fn the_steady_state_loop_applies_a_configure_it_need_not_draw() {
+        let (mut connection, mut peer) = pair();
+        let mut surface = Surface::new(Bound {
+            compositor: 1,
+            shm: 2,
+            xdg_wm_base: 4,
+        });
+        let font = font();
+        let palette = render::Palette::pinned();
+        let pty = Pty::open(Path::new(pty::DEV_PTMX)).unwrap();
+        let directory = std::env::temp_dir();
+        let session = Session {
+            directory: &directory,
+            pty: &pty,
+            font: &font,
+            palette: &palette,
+        };
+        let fallback = default_size(&font).unwrap();
+        surface.current = Some(fallback);
+        surface.drawn = Some(Drawn {
+            size: fallback,
+            activated: false,
+        });
+        surface.frame = Some(frame(true, true));
+        let mut model = None;
+
+        write_event(&mut peer, &surface_configure(12));
+        serve_turn(
+            &mut connection,
+            &mut surface,
+            &mut model,
+            &session,
+            fallback,
+        )
+        .unwrap();
+
+        assert_eq!(
+            said(&mut peer),
+            (XDG_SURFACE, 4, 12u32.to_ne_bytes().to_vec())
+        );
+        assert_eq!(
+            said(&mut peer),
+            (SURFACE, 6, Vec::new()),
+            "the loop acknowledged a configure and never applied it"
+        );
+        assert!(!surface.needs_commit);
+    }
+
+    /// A configure the terminal cannot serve ends the session rather than
+    /// being ignored or clamped. The bound is shared with the server's own
+    /// per-client budget, so a tile refused here is one the server would
+    /// refuse too — showing the old size forever, or a size nobody asked
+    /// for, would both be lying about a window someone is looking at.
+    #[test]
+    fn a_configure_too_large_to_serve_ends_the_loop() {
+        let (mut connection, mut peer) = pair();
+        let mut surface = Surface::new(Bound {
+            compositor: 1,
+            shm: 2,
+            xdg_wm_base: 4,
+        });
+        surface.xrgb = true;
+        let font = font();
+        let palette = render::Palette::pinned();
+        let pty = Pty::open(Path::new(pty::DEV_PTMX)).unwrap();
+        let directory = std::env::temp_dir();
+        let session = Session {
+            directory: &directory,
+            pty: &pty,
+            font: &font,
+            palette: &palette,
+        };
+        let fallback = default_size(&font).unwrap();
+        let mut model = None;
+
+        write_event(&mut peer, &toplevel_configure(16_000, 16_000));
+        write_event(&mut peer, &surface_configure(13));
+        let mut refused = None;
+        for _ in 0..2 {
+            if let Err(error) = serve_turn(
+                &mut connection,
+                &mut surface,
+                &mut model,
+                &session,
+                fallback,
+            ) {
+                refused = Some(error);
+            }
+        }
+        let refused = refused.expect("an unservable configure was accepted");
+        assert!(
+            refused.contains(&MAX_UI_FRAME_BYTES.to_string()),
+            "{refused}"
+        );
+    }
+
+    /// The wire form of an event, so a test can hand the client one the way a
+    /// compositor would rather than calling `dispatch` behind the loop's back.
+    fn write_event(peer: &mut UnixStream, message: &wire::Message) {
+        let size = u32::try_from(message.payload.len() + 8).unwrap();
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&message.object.to_ne_bytes());
+        bytes.extend_from_slice(&((size << 16) | u32::from(message.opcode)).to_ne_bytes());
+        bytes.extend_from_slice(&message.payload);
+        std::io::Write::write_all(peer, &bytes).unwrap();
+    }
+
+    /// The steady-state loop serves a resize — and serves only the LAST one.
+    ///
+    /// Two things are pinned here and neither is `adopt_size`'s own business.
+    /// The first is that the loop `run` never leaves reaches a redraw at all:
+    /// a loop that only acknowledged configures would strand the terminal at
+    /// its startup grid, and nothing would look wrong, because a compositor
+    /// showing a stale buffer scales nothing and reports nothing.
+    ///
+    /// The second is the throttle. A configure arriving while a frame is out
+    /// must NOT draw: every draw is a fresh wl_shm pool, and a burst of legal
+    /// configures would stack them until the compositor's aggregate limit
+    /// disconnected the terminal. So the intermediate size here is superseded
+    /// before anything allocates for it, and the count of live buffers says
+    /// so — it stays at one across both configures, and the size that
+    /// eventually lands is the second one.
+    #[test]
+    fn the_steady_state_loop_adopts_the_last_size_and_only_once_the_frame_is_back() {
+        let (mut connection, mut peer) = pair();
+        let mut surface = Surface::new(Bound {
+            compositor: 1,
+            shm: 2,
+            xdg_wm_base: 4,
+        });
+        surface.xrgb = true;
+        let font = font();
+        let palette = render::Palette::pinned();
+        let pty = Pty::open(Path::new(pty::DEV_PTMX)).unwrap();
+        let directory = std::env::temp_dir();
+        let session = Session {
+            directory: &directory,
+            pty: &pty,
+            font: &font,
+            palette: &palette,
+        };
+        let fallback = default_size(&font).unwrap();
+        let mut model = None;
+        adopt_size(
+            &mut connection,
+            &mut surface,
+            &mut model,
+            &session,
+            fallback,
+        )
+        .unwrap();
+        let first = surface.frame.as_ref().unwrap();
+        let (buffer, callback) = (first.buffer, first.callback);
+
+        // Two configures, back to back, with the first frame still out.
+        write_event(&mut peer, &toplevel_configure(704, 400));
+        write_event(&mut peer, &surface_configure(9));
+        write_event(&mut peer, &toplevel_configure(592, 352));
+        write_event(&mut peer, &surface_configure(10));
+        for _ in 0..4 {
+            serve_turn(
+                &mut connection,
+                &mut surface,
+                &mut model,
+                &session,
+                fallback,
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            surface.drawn,
+            Some(Drawn {
+                size: fallback,
+                activated: false
+            }),
+            "a configure was drawn while a frame was still out"
+        );
+        assert_eq!(
+            surface.live_buffers.len(),
+            1,
+            "each deferred configure allocated a buffer of its own"
+        );
+
+        // The frame comes back, and the redraw it was holding up happens on
+        // that event rather than needing one of its own.
+        write_event(&mut peer, &message(buffer, 0, Vec::new()));
+        write_event(
+            &mut peer,
+            &message(callback, 0, 1u32.to_ne_bytes().to_vec()),
+        );
+        for _ in 0..2 {
+            serve_turn(
+                &mut connection,
+                &mut surface,
+                &mut model,
+                &session,
+                fallback,
+            )
+            .unwrap();
+        }
+
+        let second = Size {
+            width: 592,
+            height: 352,
+        };
+        assert_eq!(
+            surface.drawn,
+            Some(Drawn {
+                size: second,
+                activated: false
+            }),
+            "the size the terminal settled on was not the last one configured"
+        );
+        assert_eq!(surface.live_buffers.len(), 1);
+        let window = pty.window().unwrap();
+        assert_eq!((window.rows, window.columns), (22, 74));
+        let model = model.as_ref().unwrap();
+        assert_eq!((model.rows(), model.columns()), (22, 74));
+    }
+
+    /// A configure that changes only the focus still needs a new picture: the
+    /// cursor is drawn inverted when the terminal holds the keyboard and
+    /// hollow when it does not, and nothing else on screen says which. A
+    /// redraw decided on the size alone would leave a window looking focused
+    /// after it stopped being.
+    #[test]
+    fn losing_or_taking_focus_redraws_at_the_same_size() {
+        let (mut connection, mut peer) = pair();
+        let mut surface = Surface::new(Bound {
+            compositor: 1,
+            shm: 2,
+            xdg_wm_base: 4,
+        });
+        surface.xrgb = true;
+        let font = font();
+        let palette = render::Palette::pinned();
+        let pty = Pty::open(Path::new(pty::DEV_PTMX)).unwrap();
+        let directory = std::env::temp_dir();
+        let session = Session {
+            directory: &directory,
+            pty: &pty,
+            font: &font,
+            palette: &palette,
+        };
+        let fallback = default_size(&font).unwrap();
+        let mut model = None;
+        adopt_size(
+            &mut connection,
+            &mut surface,
+            &mut model,
+            &session,
+            fallback,
+        )
+        .unwrap();
+        let first = surface.frame.as_ref().unwrap();
+        let (buffer, callback) = (first.buffer, first.callback);
+        write_event(&mut peer, &message(buffer, 0, Vec::new()));
+        write_event(
+            &mut peer,
+            &message(callback, 0, 1u32.to_ne_bytes().to_vec()),
+        );
+
+        // Same size, ACTIVATED — the one thing that changed is the focus.
+        let (width, height) = (
+            i32::try_from(fallback.width).unwrap(),
+            i32::try_from(fallback.height).unwrap(),
+        );
+        write_event(&mut peer, &configure_with_states(width, height, &[4]));
+        write_event(&mut peer, &surface_configure(11));
+        for _ in 0..4 {
+            serve_turn(
+                &mut connection,
+                &mut surface,
+                &mut model,
+                &session,
+                fallback,
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            surface.drawn,
+            Some(Drawn {
+                size: fallback,
+                activated: true
+            }),
+            "taking focus at the same size did not redraw"
+        );
+        assert_ne!(
+            surface.frame.as_ref().unwrap().buffer,
+            buffer,
+            "the focus change reused the frame drawn without it"
+        );
     }
 
     /// The PTY is opened BEFORE the first frame, so a machine that cannot

@@ -4235,12 +4235,13 @@ mod tests {
         let keymap = test_keymap();
         let worker = thread::spawn(move || serve_client(server, 78, thread_runtime, keymap));
 
-        let (connection, pty, size, cells) = crate::term_client::prepare_for_test(
+        let (connection, prepared) = crate::term_client::prepare_for_test(
             client,
             &std::env::temp_dir(),
             std::path::Path::new(crate::pty::DEV_PTMX),
         )
         .unwrap();
+        let (pty, size, cells) = (&prepared.pty, prepared.size().unwrap(), prepared.cells);
         let font = crate::font::pinned().unwrap();
 
         // The tile this output gives one surface, not the client's own guess.
