@@ -7157,7 +7157,8 @@ a
 ## status: 0
 
 #### --posix withdraws line address 0 entirely
-# `0,/re/' is itself GNU's, so under the flag address 0 has no valid use.
+# Both its uses are GNU's own -- the `0,/re/' range and `0r' -- so under the
+# flag address 0 has none left.
 ## argv: sed --posix '0,/b/d' h
 ## file-json h: "a\nb\nc\nd\nabc\n"
 ## stdout-json: ""
@@ -7717,9 +7718,10 @@ a
 
 #### line address 0 needs a REGEX end, not just a range
 # Not a --posix rule: GNU refuses this WITHOUT the flag too, and td-txt
-# accepted it -- fail-open, a range starting a line early. Address 0 exists
-# only so a range's end regex may match on line 1, so an end that is not a
-# regex has nothing to justify it.
+# accepted it -- fail-open, a range starting a line early. As a RANGE START
+# address 0 exists only so the end regex may match on line 1, so an end that
+# is not a regex has nothing to justify it. That is one of its two uses; `r'
+# alone takes it as a LONE address, below.
 ## argv: sed '0,5d' h
 ## file-json h: "a\nb\nc\nd\nabc\n"
 ## stdout-json: ""
@@ -7751,6 +7753,232 @@ a
 ## argv: sed '0,\%b%d' h
 ## file-json h: "a\nb\nc\nd\nabc\n"
 ## stdout-json: "c\nd\nabc\n"
+## stderr-json: ""
+## status: 0
+
+#### line address 0 is legal with r ALONE, and PREPENDS the file
+# The one exemption, and GNU spells it as a REWRITE of the command rather
+# than a case in the executor: `0rFILE' becomes `1rFILE' in PREPEND mode, so
+# the address change is why an empty input prints nothing and the mode change
+# is why the file lands before line 1's own output instead of on the append
+# queue behind it. td-txt refused the whole form -- fail-CLOSED this time, but
+# a script GNU runs.
+## argv: sed -n '0r R' A
+## file-json A: "a1\na2\n"
+## file-json R: "r1\nr2\n"
+## stdin-json: ""
+## stdout-json: "r1\nr2\n"
+## stderr-json: ""
+## status: 0
+
+#### the blank between address and command does not change that
+## argv: sed -n '0 r R' A
+## file-json A: "a1\na2\n"
+## file-json R: "r1\nr2\n"
+## stdin-json: ""
+## stdout-json: "r1\nr2\n"
+## stderr-json: ""
+## status: 0
+
+#### nor does a blank after a RANGE, which is a different skip
+# The blank case above never reaches the skip this one needs: `parse_addr'
+# already eats blanks after a FIRST address, so only a second address leaves
+# one standing. Added because deleting that skip left the whole corpus green
+# -- the line was touched by this commit and pinned by nothing.
+## argv: sed -n '0,/a1/ r R' A
+## file-json A: "a1\na2\n"
+## file-json R: "r1\nr2\n"
+## stdin-json: ""
+## stdout-json: "r1\nr2\n"
+## stderr-json: ""
+## status: 0
+
+#### nor does a step of 0, which is a plain 0 address in GNU
+## argv: sed -n '0~0r R' A
+## file-json A: "a1\na2\n"
+## file-json R: "r1\nr2\n"
+## stdin-json: ""
+## stdout-json: "r1\nr2\n"
+## stderr-json: ""
+## status: 0
+
+#### a real step is a different address, so this is the ordinary append
+## argv: sed -n '0~2r R' A
+## file-json A: "a1\na2\n"
+## file-json R: "r1\nr2\n"
+## stdin-json: ""
+## stdout-json: "r1\nr2\n"
+## stderr-json: ""
+## status: 0
+
+#### the prepend is not autoprint, so -n does not withdraw it
+## argv: sed '0r R' A
+## file-json A: "a1\na2\n"
+## file-json R: "r1\nr2\n"
+## stdin-json: ""
+## stdout-json: "r1\nr2\na1\na2\n"
+## stderr-json: ""
+## status: 0
+
+#### an empty input never reaches line 1, so nothing is prepended
+## argv: sed -n '0r R' /dev/null
+## file-json R: "r1\nr2\n"
+## stdin-json: ""
+## stdout-json: ""
+## stderr-json: ""
+## status: 0
+
+#### a missing file is still silently empty, as it is on the queue
+## argv: sed -n '0r /nope' A
+## file-json A: "a1\na2\n"
+## stdin-json: ""
+## stdout-json: ""
+## stderr-json: ""
+## status: 0
+
+#### but a file that opens and will not read is fatal at exit 4
+## argv: sed -n '0r DIR' A
+## file-json A: "a1\na2\n"
+## file DIR/x: x
+## stdin-json: ""
+## stdout-json: ""
+## stderr-contains: sed: read error on DIR: Is a directory
+## status: 4
+
+#### and the exemption does not excuse a MISSING filename
+## argv: sed -n 0r A
+## file-json A: "a1\na2\n"
+## stdin-json: ""
+## stdout-json: ""
+## stderr-contains: missing filename in r/R/w/W commands
+## status: 1
+
+#### it is r's alone: R is a different command and still refuses
+## argv: sed -n '0R R' A
+## file-json A: "a1\na2\n"
+## file-json R: "r1\nr2\n"
+## stdin-json: ""
+## stdout-json: ""
+## stderr-contains: invalid usage of line address 0
+## status: 1
+
+#### a bang is not r either, so the address is judged before it
+## argv: sed -n '0!r R' A
+## file-json A: "a1\na2\n"
+## file-json R: "r1\nr2\n"
+## stdin-json: ""
+## stdout-json: ""
+## stderr-contains: invalid usage of line address 0
+## status: 1
+
+#### and a second address withdraws it, non-regex end or not
+## argv: sed -n '0,+0r R' A
+## file-json A: "a1\na2\n"
+## file-json R: "r1\nr2\n"
+## stdin-json: ""
+## stdout-json: ""
+## stderr-contains: invalid usage of line address 0
+## status: 1
+
+#### a REGEX end keeps the range meaning, which appends as ever
+## argv: sed -n '0,/a1/r R' A
+## file-json A: "a1\na2\n"
+## file-json R: "r1\nr2\n"
+## stdin-json: ""
+## stdout-json: "r1\nr2\n"
+## stderr-json: ""
+## status: 0
+
+#### --posix withdraws the exemption with the rest of address 0
+## argv: sed --posix -n '0r R' A
+## file-json A: "a1\na2\n"
+## file-json R: "r1\nr2\n"
+## stdin-json: ""
+## stdout-json: ""
+## stderr-contains: invalid usage of line address 0
+## status: 1
+
+#### 0 with any other command is refused as before
+## argv: sed -n 0p A
+## file-json A: "a1\na2\n"
+## stdin-json: ""
+## stdout-json: ""
+## stderr-contains: invalid usage of line address 0
+## status: 1
+
+#### line 1 is global without -s, so ONE prepend covers both files
+## argv: sed '0r R' A B
+## file-json A: "a1\na2\n"
+## file-json B: "b1\nb2\n"
+## file-json R: "r1\nr2\n"
+## stdin-json: ""
+## stdout-json: "r1\nr2\na1\na2\nb1\nb2\n"
+## stderr-json: ""
+## status: 0
+
+#### -s restarts the line count, so each file gets its own
+## argv: sed -s '0r R' A B
+## file-json A: "a1\na2\n"
+## file-json B: "b1\nb2\n"
+## file-json R: "r1\nr2\n"
+## stdin-json: ""
+## stdout-json: "r1\nr2\na1\na2\nr1\nr2\nb1\nb2\n"
+## stderr-json: ""
+## status: 0
+
+#### the immediate write does not pay an owed separator
+## argv: sed -s '0r R' NOEOL A
+## file-json A: "a1\na2\n"
+## file-json NOEOL: "a1"
+## file-json R: "r1\nr2\n"
+## stdin-json: ""
+## stdout-json: "r1\nr2\na1r1\nr2\n\na1\na2\n"
+## stderr-json: ""
+## status: 0
+
+#### prepend and append are both live, and land either side of line 1
+## argv: sed -e '0r R' -e '1r R' A
+## file-json A: "a1\na2\n"
+## file-json R: "r1\nr2\n"
+## stdin-json: ""
+## stdout-json: "r1\nr2\na1\nr1\nr2\na2\n"
+## stderr-json: ""
+## status: 0
+
+#### the peek crosses BLANKS and nothing else, so a newline refuses
+# GNU tests the character already read past the address, and `in_nonblank'
+# stops at a newline: `0' then a newline then `r' is the address complaint in
+# both. Through `-f' because that newline cannot live in a `## argv:' line --
+# which also moves GNU's prefix to `file S line 2:', so the body is what is
+# asserted.
+## argv: sed -n -f S A
+## file S:
+0
+r R
+## END
+## file-json A: "a1\na2\n"
+## file-json R: "r1\nr2\n"
+## stdin-json: ""
+## stdout-json: ""
+## stderr-contains: invalid usage of line address 0
+## status: 1
+
+#### and an -e part boundary ends it the same way
+## argv: sed -n -e 0 -e 'r R' A
+## file-json A: "a1\na2\n"
+## file-json R: "r1\nr2\n"
+## stdin-json: ""
+## stdout-json: ""
+## stderr-contains: invalid usage of line address 0
+## status: 1
+
+#### -i prepends into the file, ahead of its first line
+## argv: sed -i '0r R' Z
+## file-json Z: "a1\na2\n"
+## file-json R: "r1\nr2\n"
+## stdin-json: ""
+## stdout-json: ""
+## file-after-json Z: "r1\nr2\na1\na2\n"
 ## stderr-json: ""
 ## status: 0
 

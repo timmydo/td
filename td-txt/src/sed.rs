@@ -133,6 +133,8 @@ enum Kind {
     PrintFirstLine,
     Quit(i32, bool), // (exit status, auto-print first)
     ReadFile(Vec<u8>),
+    /// `0r` — the same read, written where the command RUNS rather than queued.
+    PrependFile(Vec<u8>),
     ReadLine(Vec<u8>),
     Subst(Subst),
     Transliterate(Box<[u8; 256]>),
@@ -531,18 +533,24 @@ impl ScriptParser<'_> {
         if matches!(addr.a2, Some(Addr2::Kind(AddrKind::Zero))) {
             addr.a2 = Some(Addr2::Kind(AddrKind::Line(0)));
         }
+        self.skip_blank();
         // Checked BEFORE the `!`: GNU judges the address first, so `0!!p` is
-        // `invalid usage of line address 0` and not `multiple `!'s`. Both a1 and
-        // a2 are parsed by now, so nothing here depends on what follows.
-        // Address 0 exists ONLY to let a range's end regex match on line 1, so it
-        // needs a REGEX end: `0,/b/` and `0,\%b%` are the whole of what GNU takes,
-        // and `0,5`, `0,$`, `0,+2`, `0,~2` are refused like a bare `0`. `0,/re/`
-        // is itself GNU's, so under `--posix` address 0 has no valid use at all.
+        // `invalid usage of line address 0` and not `multiple `!'s`. TWO uses
+        // survive. A range's end regex may match on line 1 if the range starts
+        // at 0 -- `0,/b/` and `0,\%b%` are the whole of that, while `0,5`,
+        // `0,$`, `0,+2` and `0,~2` are refused like a bare `0`. And `r` ALONE
+        // takes 0 as a lone address, to prepend a file before line 1. Which is
+        // why the command character has to be peeked at here rather than judged
+        // in its own arm: GNU tests the char it has already read past the
+        // address, so `!` is not `r` and `0!r` is this error, not a negated
+        // prepend. Under `--posix` neither use is available.
         let ends_in_regex = matches!(addr.a2, Some(Addr2::Kind(AddrKind::Rx(_))));
-        if matches!(addr.a1, Some(AddrKind::Zero)) && (self.posix || !ends_in_regex) {
+        let prepends = addr.a2.is_none() && self.peek() == Some(b'r');
+        if matches!(addr.a1, Some(AddrKind::Zero))
+            && (self.posix || !(ends_in_regex || prepends))
+        {
             return Err("invalid usage of line address 0".to_string());
         }
-        self.skip_blank();
         // One `!` and no more: GNU refuses a second rather than toggling back.
         if self.eat(b'!') {
             addr.negate = true;
@@ -1183,7 +1191,7 @@ fn parse_script(
         if p.peek().is_none() {
             break;
         }
-        let addr = p.parse_addr()?;
+        let mut addr = p.parse_addr()?;
         let Some(c) = p.bump() else {
             return Err("missing command".to_string().into());
         };
@@ -1296,6 +1304,19 @@ fn parse_script(
                 p.deny_in_sandbox()?;
                 let name = p.parse_filename()?;
                 match c {
+                    // GNU spells its address-0 exemption as a REWRITE of the
+                    // command, not as a case in the executor: `0rFILE` becomes
+                    // `1rFILE` in prepend mode. The address change is what makes
+                    // an empty input print nothing (line 1 never arrives), and
+                    // the mode change is what puts the file before line 1's own
+                    // output instead of on the queue behind it. This condition
+                    // must stay `parse_addr`'s `prepends`: a `Zero` that is
+                    // admitted and NOT rewritten reaches `kind_matches`, which
+                    // never matches it, so the drift is a silent no-op.
+                    b'r' if matches!(addr.a1, Some(AddrKind::Zero)) && addr.a2.is_none() => {
+                        addr.a1 = Some(AddrKind::Line(1));
+                        Kind::PrependFile(name)
+                    }
                     b'r' => Kind::ReadFile(name),
                     _ => Kind::ReadLine(name),
                 }
@@ -1345,6 +1366,7 @@ fn parse_script(
             | Kind::Insert(_)
             | Kind::Change(_)
             | Kind::ReadFile(_)
+            | Kind::PrependFile(_)
             | Kind::ReadLine(_)
             | Kind::Write(_)
             | Kind::WriteFirstLine(_)
@@ -3296,6 +3318,13 @@ impl Sed {
                 Some(Kind::ReadFile(path)) => {
                     let path = path.clone();
                     self.appends.push(Append::File(path));
+                }
+                Some(Kind::PrependFile(path)) => {
+                    // `put`, not `write`: GNU's immediate read goes straight at the
+                    // output and does NOT pay an owed separator, so an unterminated
+                    // previous line still owes one AFTER the prepended bytes.
+                    let (data, _) = read_source(path)?;
+                    sink.put(&data)?;
                 }
                 Some(Kind::ReadLine(path)) => {
                     let path = path.clone();

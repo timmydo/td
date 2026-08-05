@@ -1175,11 +1175,23 @@ td-txt-authored case files
     `read error on stdin` where td-txt names the file it really opened,
     `/dev/stdin`. Both exit 4. An OPERAND spelled `-` does say `stdin` now.
 
-  - A leading `\r` in a script: GNU skips it, td-txt refuses with
-    `unknown command: `\r''`. `printf '\rp' > s; sed -f s F` doubles every line
-    in GNU at exit 0 and errors here, in both modes and through `-e` as much as
-    `-f`. Fail-CLOSED, predates the branch. Found by a reviewer as a byproduct of
-    sweeping script HEADS for the `#n` rule -- the same sweep axis, one byte over.
+  - A leading `\r`, `\v` or `\f` in a script: GNU skips all three, td-txt
+    refuses with `unknown command:`. `printf '\rp' > s; sed -f s F` doubles every
+    line in GNU at exit 0 and errors here, in both modes and through `-e` as much
+    as `-f`. Fail-CLOSED, predates the branch. Found by a reviewer as a byproduct
+    of sweeping script HEADS for the `#n` rule -- the same sweep axis, one byte
+    over -- and it is a family of THREE rather than the one first recorded,
+    because GNU skips its whole `ISSPACE` set there and a later reviewer swept
+    all 256 bytes rather than the one that had been reported.
+
+  - A NUL inside an `r`/`R`/`w`/`W` filename, which only a `-f` script can carry:
+    GNU builds a C string from it, so `printf '1r\0F\n' > s; sed -f s A` truncates
+    the name to empty and refuses with `missing filename in r/R/w/W commands` at
+    exit 1. td-txt keeps the byte, so the open silently fails and the read is
+    silently empty at exit 0. Fail-OPEN and predates the branch (`1r` and `0r`
+    behave alike), but worth recording because the address-0 landing made the
+    `0r` spelling REACH it: before, `0r` was refused for its address and happened
+    to exit 1 like GNU, for an unrelated reason.
 
   - `-f` naming an ENDLESS stream (`/dev/zero`, `/dev/urandom`): GNU parses the
     script as it reads, so it fails on line 1 -- `unknown command: ` on a NUL
@@ -1206,18 +1218,6 @@ td-txt-authored case files
     `missing command` in GNU and `unknown command: `\n'` here. Both modes,
     predates the branch, exit 1 either way -- same family as the other
     diagnostic-wording gaps above.
-
-  - A bare address 0 is legal in GNU for exactly ONE command, `r`: `sed '0r F'`
-    prepends F, which is what the address is FOR outside a `0,/re/` range.
-    Every other command refuses it (`0R`, `0w`, `0p`, `0d`, `0=`, `0a` all say
-    `invalid usage of line address 0`), and `--posix '0r F'` refuses too. td-txt
-    refuses in both modes, so this is fail-CLOSED and predates the branch;
-    closing it means deferring the address-0 check until the command letter is
-    known, which is where GNU makes it. One knock-on this branch DID change:
-    `0~0r F` used to do nothing silently and now takes the refusal -- still not
-    GNU's answer, but no longer a silent no-op. Found by a reviewer, and it is
-    why the claim that GNU takes address 0 "only" with a regex range end is
-    wrong: it takes it with `r` as well.
 
   - `s//\N/` -- the empty regex reusing the last one -- is unchecked here and
     only half-unchecked in GNU: `/\(a\)/s//\2/` and `/a/s//\1/` are refused
