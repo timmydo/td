@@ -12,14 +12,15 @@ name = "td-sh"
 path = "src/main.rs"
 
 # HOST-SIDE conformance tooling, like the lib below and not like the shell: the
-# Oils corpus asks 333 cases what a word expanded to by running `argv.py`, whose
-# goldens are a CPython `repr` of its argv. This is that helper, staged into
-# `run_case`'s PATH under that name. It cannot reach the image: the recipe
-# compiles `src/main.rs` plus a NAMED module list with a direct `rustc`, so a
-# second `[[bin]]` is invisible to it.
+# Oils corpus asks what a word expanded to (`argv.py`) and what reached the
+# environment (`printenv.py`), and vendors neither here. This is a MULTICALL
+# serving both, chosen by argv[0] and staged into `run_case`'s PATH under each
+# name in `SPEC_HELPERS`. It cannot reach the image: the recipe compiles
+# `src/main.rs` plus a NAMED module list with a direct `rustc`, so a second
+# `[[bin]]` is invisible to it.
 [[bin]]
-name = "spec_argv"
-path = "src/bin/spec_argv.rs"
+name = "spec_helpers"
+path = "src/bin/spec_helpers.rs"
 
 # The `td_sh` lib is host-side CONFORMANCE TOOLING only: a zero-dependency reader
 # for the Oils (`oils-for-unix`) spec-test format plus a golden-resolver/runner.

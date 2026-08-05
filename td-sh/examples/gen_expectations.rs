@@ -7,7 +7,7 @@
 //!   cargo build --release --manifest-path td-sh/Cargo.toml
 //!   cargo run --release --manifest-path td-sh/Cargo.toml \
 //!     --example gen_expectations -- \
-//!     td-sh/target/release/td-sh td-sh/target/release/spec_argv td-sh/spec \
+//!     td-sh/target/release/td-sh td-sh/target/release/spec_helpers td-sh/spec \
 //!     > td-sh/spec/expectations.txt
 //!
 //! It runs every case in <spec-dir> through the built td-sh under the SAME isolated
@@ -59,7 +59,7 @@ const HEADER: &str = "\
 # on a pin bump or when passes change:
 #   cargo build --release --manifest-path td-sh/Cargo.toml
 #   cargo run --release --manifest-path td-sh/Cargo.toml --example gen_expectations \\
-#     -- td-sh/target/release/td-sh td-sh/target/release/spec_argv td-sh/spec \\
+#     -- td-sh/target/release/td-sh td-sh/target/release/spec_helpers td-sh/spec \\
 #     > td-sh/spec/expectations.txt
 #
 # Format, one per line:   <xfail|skip> <spec-file>::<case description>
@@ -68,11 +68,16 @@ const HEADER: &str = "\
 #           fails) reds the gate, and an unexpected PASS (XPASS) reds it so the
 #           entry is promoted. NOTE on honesty at this scale: many xfails are
 #           status-127 `command not found` failures, because the cleared-env `-c`
-#           harness exposes no external PATH beyond the shell itself and `argv.py`.
-#           Those are real mismatches today, but they measure the harness's
-#           minimalism as much as td-sh; serving more of the externals the corpus
-#           reaches for (deferred) would convert a further block of them into true
-#           builtin/parser pass-fail signal.
+#           harness exposes no external PATH beyond the shell itself and the two
+#           Oils helpers (`argv.py`, `printenv.py`). Those are real mismatches
+#           today, but MEASURE before mining the list, because `not found` is
+#           reported identically for two different things. Some of those names are
+#           BUILTINS td-sh does not have (`shopt`, `[[`, `typeset`, `declare`,
+#           `compgen`) and are true shell gaps; the rest are EXTERNALS the harness
+#           withholds (`cat`, `touch`, `mkdir`, `grep`, `sed`, `wc`) and say
+#           nothing about the shell. Both groups are large and neither dominates.
+#           No counts are given here on purpose: this file is regenerated wholesale,
+#           so a number in it would silently describe some earlier tree.
 #   skip  = not run at all, because it cannot be evaluated faithfully here:
 #           (a) td-sh hangs/loops on it, so it would time out (10s) every gate;
 #           (b) it depends on the Oils repo tree the isolated cwd does not stage
@@ -170,7 +175,7 @@ fn depends_on_shared_tmp(code: &str) -> bool {
 /// prove nothing, so that is checked too and reported as a generation error.
 fn probe_identities(
     shell: &std::path::Path,
-    argv_helper: &std::path::Path,
+    helpers: &std::path::Path,
     errors: &mut Vec<String>,
 ) -> Result<Vec<&'static str>, Box<dyn std::error::Error>> {
     let mut bad = Vec::new();
@@ -185,7 +190,7 @@ fn probe_identities(
             errors.push(format!("identity probe for `{id}` does not resolve to it"));
             continue;
         }
-        if !run_case(shell, argv_helper, case, ASH_DASH_CHAIN)?.passed {
+        if !run_case(shell, helpers, case, ASH_DASH_CHAIN)?.passed {
             bad.push(*id);
         }
     }
@@ -201,40 +206,100 @@ fn probe_identities(
 /// argument exists to prevent, and it comes out as a clean exit 0 over an
 /// overlay with 110 extra xfails in it. So the helper is asked a question whose
 /// answer it cannot fake, through the same `run_case` staging the corpus uses.
+/// EVERY applet is probed, not just the multicall as a whole: one binary serves
+/// both names off `argv[0]`, so a dispatch that fell through for the second name
+/// would leave the first answering perfectly.
 fn probe_helper(
     shell: &std::path::Path,
-    argv_helper: &std::path::Path,
-) -> Result<Option<String>, Box<dyn std::error::Error>> {
-    // Two arguments, one of them quoted-with-a-space, so a helper that merely
-    // echoed its input could not pass either.
-    let src = "## compare_shells: ash\n\n#### helper probe\nargv.py x 'y z'\n\
-               ## stdout: ['x', 'y z']\n";
-    let cases = parse_spec(src)?;
-    let Some(case) = cases.first() else {
-        return Ok(Some("helper probe parsed to no case".to_string()));
-    };
-    let outcome = run_case(shell, argv_helper, case, ASH_DASH_CHAIN)?;
-    if outcome.passed {
-        return Ok(None);
+    helpers: &std::path::Path,
+    errors: &mut Vec<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // Each probe asks something its applet cannot fake: two arguments, one
+    // quoted-with-a-space, so echoing the input is not enough; and a variable
+    // that is set beside one that is not, so a helper printing either a value or
+    // `None` unconditionally fails one of the two lines.
+    let probes: &[(&str, &str)] = &[
+        ("argv.py x 'y z'", "['x', 'y z']\n"),
+        // Dispatch alone, depending on NO shell feature: this one separates a
+        // helper that cannot answer from a shell that broke. The next probe
+        // needs env-prefix assignment to work, so on its own it would blame the
+        // helper for a regression in the shell -- which is the distinction the
+        // whole function exists to draw.
+        ("printenv.py NOT_SET_HERE", "None\n"),
+        ("FOO=bar printenv.py FOO NOT_SET_HERE", "bar\nNone\n"),
+    ];
+    // The probe list is written out rather than generated -- each applet needs
+    // a question only IT can answer -- so it can drift from the roster it is
+    // meant to cover. An applet staged but not probed is exactly the hole this
+    // function exists to close, so the drift is refused rather than trusted.
+    for applet in td_sh::SPEC_HELPERS {
+        if !probes.iter().any(|(code, _)| code.contains(applet)) {
+            errors.push(format!(
+                "`{applet}` is staged by SPEC_HELPERS but no probe exercises it: a \
+                 dispatch that never answers to that name would be recorded as \
+                 ordinary shell gaps"
+            ));
+        }
     }
-    Ok(Some(format!(
-        "{} does not answer as `argv.py`: the probe `argv.py x 'y z'` did not \
-         print `['x', 'y z']` ({}). Every case that asks what a word expanded \
-         to would be recorded as a shell gap.",
-        argv_helper.display(),
-        outcome.detail.unwrap_or_else(|| "no detail".to_string()),
-    )))
+
+    for (code, want) in probes {
+        let src = format!(
+            "## compare_shells: ash\n\n#### helper probe\n{code}\n\
+             ## stdout-json: {}\n",
+            json_string(want)
+        );
+        let cases = parse_spec(&src)?;
+        let Some(case) = cases.first() else {
+            errors.push(format!("helper probe `{code}` parsed to no case"));
+            continue;
+        };
+        let outcome = run_case(shell, helpers, case, ASH_DASH_CHAIN)?;
+        if outcome.passed {
+            continue;
+        }
+        errors.push(format!(
+            "{} does not answer `{code}` with {:?} ({}). Every case that uses \
+             that helper would be recorded as a shell gap.",
+            helpers.display(),
+            want,
+            outcome.detail.unwrap_or_else(|| "no detail".to_string()),
+        ));
+    }
+    Ok(())
+}
+
+/// The `stdout-json` spelling of a golden, so a probe can carry an exact
+/// trailing newline that `## stdout:` cannot express.
+fn json_string(s: &str) -> String {
+    let mut out = String::from("\"");
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            // Every other control character, so a probe that grows one emits
+            // valid JSON rather than a golden the parser reads as something
+            // else. Only reachable by editing the table above, which is why it
+            // is a rule here rather than a case for each.
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args().skip(1);
-    let shell = PathBuf::from(args.next().ok_or("usage: gen_expectations <shell-binary> <argv-helper> <spec-dir>")?);
+    let shell = PathBuf::from(args.next().ok_or("usage: gen_expectations <shell-binary> <spec-helpers-binary> <spec-dir>")?);
     // The `argv.py` stand-in, REQUIRED rather than derived from the shell's
     // directory: without it the 294 cases that ask what a word expanded to fail
     // with a 127 indistinguishable from a shell gap, and this tool would write
     // that into the committed overlay.
-    let argv_helper = PathBuf::from(args.next().ok_or("usage: gen_expectations <shell-binary> <argv-helper> <spec-dir>")?);
-    let dir = PathBuf::from(args.next().ok_or("usage: gen_expectations <shell-binary> <argv-helper> <spec-dir>")?);
+    let helpers = PathBuf::from(args.next().ok_or("usage: gen_expectations <shell-binary> <spec-helpers-binary> <spec-dir>")?);
+    let dir = PathBuf::from(args.next().ok_or("usage: gen_expectations <shell-binary> <spec-helpers-binary> <spec-dir>")?);
 
     let mut xfail: Vec<String> = Vec::new();
     let mut skip: Vec<String> = Vec::new();
@@ -251,7 +316,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // busybox makes every dash-graded case die with `applet not found`, and the
     // overlay that comes out looks like 500 wrong answers instead of one
     // unusable pairing. Probe each identity once with `:` and fail closed.
-    for id in probe_identities(&shell, &argv_helper, &mut errors)? {
+    for id in probe_identities(&shell, &helpers, &mut errors)? {
         errors.push(format!(
             "{} cannot run as `{id}`: a case graded as `{id}` is staged under that \
              name, and a multicall binary reads it from argv[0]. Grade this shell \
@@ -260,9 +325,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ));
     }
 
-    if let Some(bad) = probe_helper(&shell, &argv_helper)? {
-        errors.push(bad);
-    }
+    probe_helper(&shell, &helpers, &mut errors)?;
 
     for path in &spec_paths(&dir)? {
         let file =
@@ -282,7 +345,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 continue;
             }
             let exec = executable_code(&case.code);
-            match run_case(&shell, &argv_helper, case, ASH_DASH_CHAIN) {
+            match run_case(&shell, &helpers, case, ASH_DASH_CHAIN) {
                 Ok(outcome) if outcome.passed => {
                     // A pass that reads the tree, or that depended on a directory
                     // the host happened to have, is a probable false-green.

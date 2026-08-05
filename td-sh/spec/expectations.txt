@@ -11,7 +11,7 @@
 # on a pin bump or when passes change:
 #   cargo build --release --manifest-path td-sh/Cargo.toml
 #   cargo run --release --manifest-path td-sh/Cargo.toml --example gen_expectations \
-#     -- td-sh/target/release/td-sh td-sh/target/release/spec_argv td-sh/spec \
+#     -- td-sh/target/release/td-sh td-sh/target/release/spec_helpers td-sh/spec \
 #     > td-sh/spec/expectations.txt
 #
 # Format, one per line:   <xfail|skip> <spec-file>::<case description>
@@ -20,11 +20,16 @@
 #           fails) reds the gate, and an unexpected PASS (XPASS) reds it so the
 #           entry is promoted. NOTE on honesty at this scale: many xfails are
 #           status-127 `command not found` failures, because the cleared-env `-c`
-#           harness exposes no external PATH beyond the shell itself and `argv.py`.
-#           Those are real mismatches today, but they measure the harness's
-#           minimalism as much as td-sh; serving more of the externals the corpus
-#           reaches for (deferred) would convert a further block of them into true
-#           builtin/parser pass-fail signal.
+#           harness exposes no external PATH beyond the shell itself and the two
+#           Oils helpers (`argv.py`, `printenv.py`). Those are real mismatches
+#           today, but MEASURE before mining the list, because `not found` is
+#           reported identically for two different things. Some of those names are
+#           BUILTINS td-sh does not have (`shopt`, `[[`, `typeset`, `declare`,
+#           `compgen`) and are true shell gaps; the rest are EXTERNALS the harness
+#           withholds (`cat`, `touch`, `mkdir`, `grep`, `sed`, `wc`) and say
+#           nothing about the shell. Both groups are large and neither dominates.
+#           No counts are given here on purpose: this file is regenerated wholesale,
+#           so a number in it would silently describe some earlier tree.
 #   skip  = not run at all, because it cannot be evaluated faithfully here:
 #           (a) td-sh hangs/loops on it, so it would time out (10s) every gate;
 #           (b) it depends on the Oils repo tree the isolated cwd does not stage
@@ -74,7 +79,6 @@ xfail alias.test.sh::Alias that is && || ;
 xfail alias.test.sh::Alias that is pipeline
 xfail alias.test.sh::Two aliases in pipeline
 xfail alias.test.sh::alias used in here doc
-xfail alias.test.sh::alias with environment bindings works
 xfail alias.test.sh::alias with redirects works
 xfail alias.test.sh::alias with word of multiple lines
 xfail alias.test.sh::alias without args lists all aliases
@@ -349,20 +353,12 @@ xfail assign-extended.test.sh::typeset -p
 xfail assign-extended.test.sh::typeset -r makes a string readonly
 xfail assign-extended.test.sh::typeset -x makes it exported
 xfail assign-extended.test.sh::unset and shell funcs
-xfail assign.test.sh::Empty env binding
-xfail assign.test.sh::Env binding can use preceding bindings, but not subsequent ones
-xfail assign.test.sh::Env binding in readonly/declare is NOT exported!  (pitfall)
 xfail assign.test.sh::Env binding not allowed before compound command
-xfail assign.test.sh::Env value doesn't persist
-xfail assign.test.sh::Env value with equals
-xfail assign.test.sh::Env value with escaped <
-xfail assign.test.sh::Env value with two quotes
 xfail assign.test.sh::Escaped = in command name
 xfail assign.test.sh::Multiple temporary envs on the stack
 xfail assign.test.sh::aliased assignment doesn't split
 xfail assign.test.sh::assign and glob
 xfail assign.test.sh::assignment using dynamic keyword (splits in most shells, not in zsh/osh)
-xfail assign.test.sh::export a=1 no_value c=2
 xfail assign.test.sh::local a=loc $var c=loc
 xfail assign.test.sh::redirect after assignment builtin (eval redirects after evaluating arguments)
 xfail assign.test.sh::redirect after command sub (like case above but without assignment builtin)
@@ -638,14 +634,7 @@ xfail builtin-read.test.sh::read -r -d '' for NUL strings, e.g. find -print0
 xfail builtin-read.test.sh::read multiple lines with IFS=:
 xfail builtin-set.test.sh::'set' and 'eval' round trip
 xfail builtin-set.test.sh::can continue after unknown option
-xfail builtin-set.test.sh::set +a stops exporting
-xfail builtin-set.test.sh::set -a exports declare variables
-xfail builtin-set.test.sh::set -a exports local variables
-xfail builtin-set.test.sh::set -a exports variables
-xfail builtin-set.test.sh::set -o allexport (long form)
 xfail builtin-set.test.sh::set -o lists options
-xfail builtin-set.test.sh::variables set before set -a are not exported
-xfail builtin-special.test.sh::Prefix assignments persist after readonly, but NOT exported (set -o posix)
 xfail builtin-special.test.sh::Prefix binding for exec is a special case (versus e.g. readonly)
 xfail builtin-special.test.sh::Special builtins can't be redefined as shell functions (set -o posix)
 xfail builtin-special.test.sh::Which shells allow special builtins to be redefined?
@@ -733,17 +722,6 @@ xfail builtin-umask.test.sh::umask sequential actions
 xfail builtin-umask.test.sh::umask t perm
 xfail builtin-umask.test.sh::umask with too many arguments (i.e. extra spaces)
 xfail builtin-umask.test.sh::usage: large octal number
-xfail builtin-vars.test.sh::Dependent export setting
-xfail builtin-vars.test.sh::Export a global variable and unset it
-xfail builtin-vars.test.sh::Export a local that shadows a global
-xfail builtin-vars.test.sh::Export a variable before defining it
-xfail builtin-vars.test.sh::Export existing global variables
-xfail builtin-vars.test.sh::Export existing local variable
-xfail builtin-vars.test.sh::Export sets a global variable
-xfail builtin-vars.test.sh::Export sets a global variable that persists after export -n
-xfail builtin-vars.test.sh::Exporting a parent func variable (dynamic scope)
-xfail builtin-vars.test.sh::Unset exported variable, then define it again.  It's NOT still exported.
-xfail builtin-vars.test.sh::can't export associative array (strict_array)
 xfail case_.test.sh::Pattern ? matches 1 code point (many bytes), but not multiple code points
 xfail case_.test.sh::matching every byte against itself
 xfail command-sub-ksh.test.sh::${ echo hi }  without semi-colon

@@ -1,4 +1,8 @@
-//! `argv.py`'s answer, without Python: print the arguments as a Python list.
+//! The Oils spec corpus's Python helpers, without Python. A MULTICALL: it
+//! serves `argv.py` and `printenv.py`, chosen by `argv[0]`, because that is how
+//! the corpus invokes them -- bare, off the one-entry PATH `run_case` stages.
+//!
+//! ## `argv.py` -- print the arguments as a Python list
 //!
 //! The Oils spec corpus asks 333 of its cases what a word EXPANDED to, and the
 //! way it asks is `argv.py a b c`, whose goldens are a `repr` of the argument
@@ -37,6 +41,20 @@
 //! and no cursor: the loop below advances by exactly one byte per iteration
 //! and terminates structurally. An earlier text-oriented draft did not, and
 //! spun forever on a UTF-8 continuation byte.
+//!
+//! ## `printenv.py` -- what actually reached the ENVIRONMENT
+//!
+//! One line per NAME, its value or Python's `None` when unset. 42 cases use it,
+//! and what they are asking is a question the shell cannot answer about itself:
+//! `$FOO` reads a shell variable whether or not it was ever EXPORTED, so only a
+//! child can report which names crossed into the environment. That is why the
+//! env-binding, `export` and `set -a` cases reach for a helper at all.
+//!
+//! `None` rather than a blank line is the load-bearing part. The three states
+//! the goldens distinguish are a name never exported, one exported with a
+//! value, and one exported as the EMPTY STRING -- and the last two are what a
+//! shell can confuse. Printing nothing for an unset name would make the first
+//! and third identical and quietly pass cases that should fail.
 
 // A bin is its own CRATE ROOT, so `main.rs`'s attribute does not reach here and
 // nothing but this line keeps td-sh's "one scoped allow, in sys.rs" true of the
@@ -87,23 +105,136 @@ fn push_hex(out: &mut String, byte: u8) {
     }
 }
 
-fn main() {
-    let mut out = String::from("[");
-    for (i, arg) in std::env::args_os().skip(1).enumerate() {
+/// `argv.py`: the argument list as Python would print it. Pure ASCII by
+/// construction -- `repr` escapes every byte above `\x7e` -- but returned as
+/// BYTES like its sibling, so `main` has one output type and no applet can
+/// acquire a lossy conversion by being written differently from the other.
+fn argv(args: &[std::ffi::OsString]) -> Vec<u8> {
+    let mut text = String::from("[");
+    for (i, arg) in args.iter().enumerate() {
         if i > 0 {
-            out.push_str(", ");
+            text.push_str(", ");
         }
-        repr(arg.as_bytes(), &mut out);
+        repr(arg.as_bytes(), &mut text);
     }
-    out.push_str("]\n");
+    text.push_str("]\n");
+    text.into_bytes()
+}
+
+/// `printenv.py`: one line per NAME, its value or `None` when unset (see the
+/// module doc for why `None` and not a blank line). No names is no output; the
+/// corpus never invokes it bare, so that arm is this crate's choice rather than
+/// something a golden derives.
+fn printenv(args: &[std::ffi::OsString]) -> Vec<u8> {
+    printenv_with(args, |name| std::env::var_os(name))
+}
+
+/// The lookup is a parameter so the rule above is testable: mutating this
+/// process's environment from a test would race every other test in the binary,
+/// and the distinction being pinned -- unset versus set-to-empty -- is exactly
+/// the one a racing test would report at random.
+fn printenv_with(
+    args: &[std::ffi::OsString],
+    lookup: impl Fn(&std::ffi::OsStr) -> Option<std::ffi::OsString>,
+) -> Vec<u8> {
+    let mut out = Vec::new();
+    for name in args {
+        // BYTES, not a lossy string. An environment value is a byte string on
+        // Unix and `var_os` exists to preserve one; passing it through
+        // `from_utf8_lossy` would replace every invalid byte with U+FFFD, so a
+        // shell that carried the bytes correctly would be graded as though it
+        // had mangled them. td-sh handles non-UTF-8 entries deliberately --
+        // `a_non_utf8_environment_entry_does_not_abort_the_shell` -- so this
+        // helper is exactly where that would go unnoticed. Python's own
+        // `printenv.py` round-trips them through `surrogateescape`.
+        match lookup(name) {
+            Some(value) => out.extend_from_slice(value.as_bytes()),
+            None => out.extend_from_slice(b"None"),
+        }
+        out.push(b'\n');
+    }
+    out
+}
+
+fn main() {
+    let mut args = std::env::args_os();
+    // The applet is argv[0]'s basename: `run_case` stages one binary under both
+    // names, and exec'ing a symlink passes the name the CASE used.
+    let applet = args
+        .next()
+        .map(std::path::PathBuf::from)
+        .and_then(|p| p.file_name().map(|n| n.to_os_string()))
+        .unwrap_or_default();
+    let rest: Vec<std::ffi::OsString> = args.collect();
+    let out = match applet.as_bytes() {
+        b"argv.py" => argv(&rest),
+        b"printenv.py" => printenv(&rest),
+        other => {
+            // Named as something this does not serve: say so rather than print
+            // a plausible answer, which would grade as a shell result.
+            let name = String::from_utf8_lossy(other);
+            let _ = writeln!(std::io::stderr(), "spec_helpers: no applet `{name}`");
+            std::process::exit(2);
+        }
+    };
     // Ignored deliberately: this is a test helper, and a closed stdout is the
     // harness having stopped reading, which the case's own status reports.
-    let _ = std::io::stdout().write_all(out.as_bytes());
+    let _ = std::io::stdout().write_all(&out);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn os(s: &str) -> std::ffi::OsString {
+        std::ffi::OsString::from(s)
+    }
+
+    /// All three states the goldens distinguish, including the two a shell can
+    /// confuse: exported-empty prints a blank LINE where never-exported prints
+    /// `None`.
+    #[test]
+    fn printenv_reports_unset_as_none_and_empty_as_empty() {
+        let env = |name: &std::ffi::OsStr| match name.to_str() {
+            Some("SET") => Some(os("value")),
+            Some("EMPTY") => Some(os("")),
+            _ => None,
+        };
+        assert_eq!(printenv_with(&[os("SET")], env), b"value\n");
+        assert_eq!(printenv_with(&[os("EMPTY")], env), b"\n");
+        assert_eq!(printenv_with(&[os("MISSING")], env), b"None\n");
+        // One line each, in argument order.
+        assert_eq!(
+            printenv_with(&[os("SET"), os("MISSING"), os("EMPTY")], env),
+            b"value\nNone\n\n"
+        );
+        // No names is no output, not an empty line.
+        assert_eq!(printenv_with(&[], env), b"");
+    }
+
+    /// An environment value is a byte string, and `var_os` exists to preserve
+    /// one that is not UTF-8. Passing it out losslessly is what stops a shell
+    /// that carried those bytes correctly being graded as though it mangled
+    /// them -- the same text-versus-bytes error `repr` above is written around.
+    #[test]
+    fn printenv_passes_a_non_utf8_value_through_byte_for_byte() {
+        use std::os::unix::ffi::OsStringExt;
+        let raw = vec![0xffu8, 0xfe, b'a', 0x80];
+        let value = std::ffi::OsString::from_vec(raw.clone());
+        let env = |name: &std::ffi::OsStr| {
+            (name.to_str() == Some("RAW")).then(|| value.clone())
+        };
+        let mut want = raw.clone();
+        want.push(b'\n');
+        assert_eq!(printenv_with(&[os("RAW")], env), want);
+    }
+
+    /// `argv.py` with no arguments is `[]`, not a blank list line.
+    #[test]
+    fn argv_with_no_arguments_is_the_empty_list() {
+        assert_eq!(argv(&[]), b"[]\n");
+        assert_eq!(argv(&[os("a"), os("b c")]), b"['a', 'b c']\n");
+    }
 
     fn r(arg: &[u8]) -> String {
         let mut out = String::new();

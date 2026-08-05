@@ -19,8 +19,9 @@
 //! builtin td-sh does not have -- both are `not found`. The overlay header
 //! carries the standing note and the deferred externals rig; measure before
 //! mining the list, because the two causes are indistinguishable from the
-//! failure alone. `argv.py` WAS a third that looked like both, and is now
-//! served (`src/bin/spec_argv.rs`), which is why those cases grade.
+//! failure alone. The Oils `.py` helpers WERE a third that looked like both,
+//! and `argv.py`/`printenv.py` are now served by `src/bin/spec_helpers.rs`,
+//! which is why those cases grade.
 //!
 //! Two things that note does not say. The here-doc cases that die on `cat` are
 //! already byte-correct where `cat` exists -- `cat <<-EOF` with stripped tabs,
@@ -171,24 +172,28 @@ fn no_case_writes_to_the_staged_helper() -> Result<(), Box<dyn std::error::Error
                 path.display(),
                 case.name,
             );
-            assert!(
-                !redirects_to(code, "argv.py"),
-                "{} [case: {}]: redirects onto `argv.py`, which would truncate the \
-                 real `spec_argv` binary for every other case",
-                path.display(),
-                case.name,
-            );
-            for verb in ["rm ", "mv ", "cp ", "ln ", "chmod ", "truncate ", "tee "] {
-                let mutates = code
-                    .lines()
-                    .any(|l| l.contains(verb) && l.contains("argv.py"));
+            // Every staged applet, not just the first: they are links to ONE
+            // binary, so truncating any of them breaks all of them.
+            for applet in td_sh::SPEC_HELPERS {
                 assert!(
-                    !mutates,
-                    "{} [case: {}]: `{verb}` names `argv.py`, which is a symlink to \
-                     this crate's build artifact",
+                    !redirects_to(code, applet),
+                    "{} [case: {}]: redirects onto `{applet}`, which would truncate \
+                     the real `spec_helpers` binary for every other case",
                     path.display(),
                     case.name,
                 );
+                for verb in ["rm ", "mv ", "cp ", "ln ", "chmod ", "truncate ", "tee "] {
+                    let mutates = code
+                        .lines()
+                        .any(|l| l.contains(verb) && l.contains(applet));
+                    assert!(
+                        !mutates,
+                        "{} [case: {}]: `{verb}` names `{applet}`, which is a symlink \
+                         to this crate's build artifact",
+                        path.display(),
+                        case.name,
+                    );
+                }
             }
             checked += 1;
         }
@@ -230,7 +235,7 @@ no-externals
 ## END
 ";
     for case in parse_spec(spec)? {
-        let outcome = run_case(&shell, &argv_helper(), &case, ASH_DASH_CHAIN)?;
+        let outcome = run_case(&shell, &spec_helpers_bin(), &case, ASH_DASH_CHAIN)?;
         assert!(outcome.passed, "{}: {}", case.name, outcome.detail.unwrap_or_default());
     }
     // And it follows the chain rather than being a fixed `ash`.
@@ -242,7 +247,7 @@ DASH
 ## END
 ";
     for case in parse_spec(spec)? {
-        let outcome = run_case(&shell, &argv_helper(), &case, &["dash"])?;
+        let outcome = run_case(&shell, &spec_helpers_bin(), &case, &["dash"])?;
         assert!(outcome.passed, "{}: {}", case.name, outcome.detail.unwrap_or_default());
     }
 
@@ -278,7 +283,7 @@ ASH
 ## END
 ";
     for case in parse_spec(spec)? {
-        let outcome = run_case(&shell, &argv_helper(), &case, ASH_DASH_CHAIN)?;
+        let outcome = run_case(&shell, &spec_helpers_bin(), &case, ASH_DASH_CHAIN)?;
         assert!(outcome.passed, "{}: {}", case.name, outcome.detail.unwrap_or_default());
     }
     let spec = "\
@@ -291,7 +296,7 @@ ASH
 ## END
 ";
     for case in parse_spec(spec)? {
-        let outcome = run_case(&shell, &argv_helper(), &case, ASH_DASH_CHAIN)?;
+        let outcome = run_case(&shell, &spec_helpers_bin(), &case, ASH_DASH_CHAIN)?;
         assert!(outcome.passed, "{}: {}", case.name, outcome.detail.unwrap_or_default());
     }
     // And the identity a case is graded as is readable without running it, so an
@@ -342,7 +347,7 @@ ash
 ## N-I dash status: 2
 ";
     for case in parse_spec(spec)? {
-        let outcome = run_case(&shell, &argv_helper(), &case, ASH_DASH_CHAIN)?;
+        let outcome = run_case(&shell, &spec_helpers_bin(), &case, ASH_DASH_CHAIN)?;
         assert!(outcome.passed, "{}: {}", case.name, outcome.detail.unwrap_or_default());
     }
 
@@ -359,7 +364,7 @@ ash
 ## status: 1
 ";
     for case in parse_spec(spec)? {
-        let outcome = run_case(&shell, &argv_helper(), &case, ASH_DASH_CHAIN)?;
+        let outcome = run_case(&shell, &spec_helpers_bin(), &case, ASH_DASH_CHAIN)?;
         assert!(outcome.passed, "{}: {}", case.name, outcome.detail.unwrap_or_default());
     }
     assert_eq!(
@@ -374,7 +379,7 @@ ash
     let case = cases.first().ok_or("missing case")?;
     for bad in ["../escape", "/abs", "a/b", "", ".", ".."] {
         assert!(
-            run_case(&shell, &argv_helper(), case, &[bad]).is_err(),
+            run_case(&shell, &spec_helpers_bin(), case, &[bad]).is_err(),
             "identity {bad:?} was accepted as a path component"
         );
     }
@@ -392,7 +397,7 @@ fn corpus_conformance() -> Result<(), Box<dyn std::error::Error>> {
     let exp_text = std::fs::read_to_string(spec_dir.join("expectations.txt")).unwrap_or_default();
     let exp = Expectations::parse(&exp_text).map_err(|e| format!("expectations.txt: {e}"))?;
 
-    let (outcomes, stale) = run_dir_classified(&shell, &argv_helper(), &spec_dir, ASH_DASH_CHAIN, &exp)?;
+    let (outcomes, stale) = run_dir_classified(&shell, &spec_helpers_bin(), &spec_dir, ASH_DASH_CHAIN, &exp)?;
     let s = summarize(&outcomes);
     eprintln!(
         "td-sh conformance: {} pass, {} xfail, {} skip  |  {} regressions, {} to-promote, {} stale",
@@ -437,7 +442,7 @@ fn large_output_case_is_captured_without_deadlock() -> Result<(), Box<dyn std::e
     let cases = parse_spec(spec)?;
     let case = cases.first().ok_or("no case parsed")?;
     let start = std::time::Instant::now();
-    let outcome = run_case(&shell, &argv_helper(), case, ASH_DASH_CHAIN)?;
+    let outcome = run_case(&shell, &spec_helpers_bin(), case, ASH_DASH_CHAIN)?;
     assert!(outcome.passed, "large-output case failed: {:?}", outcome.detail);
     assert!(
         start.elapsed() < std::time::Duration::from_secs(5),
@@ -525,10 +530,10 @@ fn an_ignore_trap_is_inherited_by_a_child() -> Result<(), Box<dyn std::error::Er
     Ok(())
 }
 
-/// The `argv.py` stand-in the corpus expects on PATH, built by this crate as a
-/// second bin. `run_case` stages it under that name.
-fn argv_helper() -> PathBuf {
-    PathBuf::from(env!("CARGO_BIN_EXE_spec_argv"))
+/// The Oils helper stand-in the corpus expects on PATH, built by this crate as
+/// a second bin. `run_case` stages it under every name in `SPEC_HELPERS`.
+fn spec_helpers_bin() -> PathBuf {
+    PathBuf::from(env!("CARGO_BIN_EXE_spec_helpers"))
 }
 
 /// Wait for `child`, killing it if it outlives `limit`. Returns whether it ended
@@ -1885,7 +1890,7 @@ fn file_writing_case_does_not_pollute_cwd() -> Result<(), Box<dyn std::error::Er
     let spec = format!("#### writes a file\necho hi > {marker}\n## status: 0\n");
     let cases = parse_spec(&spec)?;
     let case = cases.first().ok_or("no case parsed")?;
-    let outcome = run_case(&shell, &argv_helper(), case, ASH_DASH_CHAIN)?;
+    let outcome = run_case(&shell, &spec_helpers_bin(), case, ASH_DASH_CHAIN)?;
     assert!(outcome.passed, "redirect case failed: {:?}", outcome.detail);
     assert!(!Path::new(&marker).exists(), "case leaked {marker} into the cwd — isolation broken");
     Ok(())

@@ -60,6 +60,12 @@ const CASE_TIMEOUT: Duration = Duration::from_secs(10);
 /// unqualified default block.
 pub const ASH_DASH_CHAIN: &[&str] = &["ash", "dash"];
 
+/// The Oils helper names `run_case` stages, all served by the one `spec_helpers`
+/// multicall through `argv[0]`. Public because `gen_expectations` probes each
+/// one: a helper that is staged but does not ANSWER records its cases as shell
+/// gaps, which is the failure staging it exists to prevent.
+pub const SPEC_HELPERS: &[&str] = &["argv.py", "printenv.py"];
+
 /// A parse error, anchored to a 1-based source line.
 #[derive(Debug)]
 pub struct SpecError {
@@ -778,7 +784,7 @@ impl Drop for CaseWorkdir {
 /// `timed out` detail.
 pub fn run_case(
     shell: &Path,
-    argv_helper: &Path,
+    helpers: &Path,
     case: &SpecCase,
     chain: &[&str],
 ) -> Result<CaseOutcome, Box<dyn std::error::Error>> {
@@ -829,16 +835,19 @@ pub fn run_case(
     // woke the same latent race in `ProbeDir`.
     let entry = bindir.join(identity);
     std::os::unix::fs::symlink(&shell, &entry)?;
-    // `argv.py` is the corpus's own way of asking what a word EXPANDED to: 333
-    // cases run it and compare against a CPython `repr` of its argv. Upstream
-    // ships it as a Python script and td does not vendor it, so `spec_argv`
-    // answers under that name -- staged here, beside the shell, because PATH is
-    // this directory and nothing else. Linked rather than copied for the reason
-    // the shell is. It is REQUIRED rather than optional: absent, those cases
-    // would fail with a 127 that looks exactly like a shell gap, and the
-    // generated overlay would record them as such.
-    let argv_helper = std::fs::canonicalize(argv_helper)?;
-    std::os::unix::fs::symlink(&argv_helper, bindir.join("argv.py"))?;
+    // The corpus's own way of asking what a word EXPANDED to (`argv.py`, 333
+    // cases) and what reached the ENVIRONMENT (`printenv.py`, 42). Upstream
+    // ships both as Python scripts and td vendors neither, so `spec_helpers`
+    // answers under both names -- staged here, beside the shell, because PATH
+    // is this directory and nothing else. ONE binary under two links: it picks
+    // its applet from argv[0], which is the name the case used. Linked rather
+    // than copied for the reason the shell is. REQUIRED rather than optional:
+    // absent, those cases fail with a 127 that looks exactly like a shell gap,
+    // and the generated overlay would record them as such.
+    let helpers = std::fs::canonicalize(helpers)?;
+    for applet in SPEC_HELPERS {
+        std::os::unix::fs::symlink(&helpers, bindir.join(applet))?;
+    }
     // Spawn the ENTRY, not the canonicalized original, so the top-level shell and
     // a nested `$SH -c ..` are the same argv[0]. It matters for a multicall
     // binary: `canonicalize` resolves a busybox `ash` link back to `busybox`,
@@ -873,7 +882,7 @@ pub fn run_case(
 /// Parse and run every case in a spec file.
 pub fn run_file(
     shell: &Path,
-    argv_helper: &Path,
+    helpers: &Path,
     path: &Path,
     chain: &[&str],
 ) -> Result<Vec<CaseOutcome>, Box<dyn std::error::Error>> {
@@ -881,7 +890,7 @@ pub fn run_file(
     let cases = parse_spec(&text)?;
     let mut outcomes = Vec::with_capacity(cases.len());
     for case in &cases {
-        outcomes.push(run_case(shell, argv_helper, case, chain)?);
+        outcomes.push(run_case(shell, helpers, case, chain)?);
     }
     Ok(outcomes)
 }
@@ -909,13 +918,13 @@ pub fn spec_paths(dir: &Path) -> std::io::Result<Vec<std::path::PathBuf>> {
 /// Run every `*.test.sh` file in `dir` (non-recursive, sorted by name).
 pub fn run_dir(
     shell: &Path,
-    argv_helper: &Path,
+    helpers: &Path,
     dir: &Path,
     chain: &[&str],
 ) -> Result<Vec<CaseOutcome>, Box<dyn std::error::Error>> {
     let mut outcomes = Vec::new();
     for path in &spec_paths(dir)? {
-        outcomes.extend(run_file(shell, argv_helper, path, chain)?);
+        outcomes.extend(run_file(shell, helpers, path, chain)?);
     }
     Ok(outcomes)
 }
@@ -1107,7 +1116,7 @@ fn duplicate_conflicts(is_new: bool) -> bool {
 /// case); a caller enforcing land-on-green must red the gate when it is non-empty.
 pub fn run_dir_classified(
     shell: &Path,
-    argv_helper: &Path,
+    helpers: &Path,
     dir: &Path,
     chain: &[&str],
     exp: &Expectations,
@@ -1133,7 +1142,7 @@ pub fn run_dir_classified(
                 out.push(ClassifiedOutcome { key, disposition: Disposition::Skip, detail: None });
                 continue;
             }
-            let outcome = run_case(shell, argv_helper, case, chain)?;
+            let outcome = run_case(shell, helpers, case, chain)?;
             out.push(classify(key, &outcome, exp));
         }
     }

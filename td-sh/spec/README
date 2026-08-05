@@ -47,12 +47,14 @@ Overlay
                        cargo run --release --manifest-path td-sh/Cargo.toml \
                          --example gen_expectations -- \
                          td-sh/target/release/td-sh \
-                         td-sh/target/release/spec_argv \
+                         td-sh/target/release/spec_helpers \
                          td-sh/spec > td-sh/spec/expectations.txt
 
-                     The generator takes the `argv.py` stand-in (`spec_argv`,
-                     built by this crate) as its second argument: without it
-                     the 294 cases that call the helper would fail with a 127
+                     The generator takes the Oils helper stand-in
+                     (`spec_helpers`, built by this crate) as its second
+                     argument: it is a multicall serving `argv.py` and
+                     `printenv.py`, staged under both names, and without it the
+                     cases that call either would fail with a 127
                      indistinguishable from a shell gap. Paths are the CRATE's
                      target dir -- td-sh is its own workspace root, and a
                      `target/release/` at the repo root is a different, often
