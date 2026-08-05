@@ -299,8 +299,9 @@ fn control(character: u8) -> Option<u8> {
 pub fn sequence(code: u16, modifiers: u32, modes: Modes) -> Option<Sequence> {
     // A modifier this profile does not translate makes the whole chord
     // unlisted, not a bare keypress. The compositor forwards Super chords it
-    // has no binding for, so without this `Super+q` would type `q` and
-    // `Super+Enter` would submit whatever the shell had half-typed.
+    // has no binding for, so without this `Super+q` would type `q`. The rule
+    // is the profile's, not that compositor's: it holds under any of them,
+    // whatever each keeps for itself.
     if modifiers & !(HANDLED | IGNORED) != 0 {
         return None;
     }
@@ -1337,8 +1338,9 @@ mod tests {
         // A code outside the published keymap is not invented.
         assert_eq!(sequence(240, 0, Modes::default()), None);
         // A modifier this profile does not translate makes the whole chord
-        // unlisted. The compositor forwards Super chords it has no binding
-        // for, so a bare `q` here would type into the shell.
+        // unlisted. td's compositor keeps `enter` and `up` for itself, so
+        // those two are about a DIFFERENT compositor reaching this profile;
+        // the rest it forwards, where a bare `q` would type into the shell.
         for chord in ["a", "enter", "up", "ctrl+c", "space"] {
             let (code, modifiers) = parse_chord(chord).unwrap();
             assert!(

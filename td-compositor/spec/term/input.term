@@ -150,8 +150,10 @@ end
 
 # The compositor forwards Super chords it has no binding for, so a modifier
 # this profile does not translate must make the whole chord unlisted rather
-# than a bare keypress. Otherwise Super+q types q, and Super+Enter submits
-# whatever the shell had half-typed.
+# than a bare keypress. Otherwise Super+q types q. td's own compositor keeps
+# super+enter and super+up, so those two cases are about any OTHER compositor
+# that forwards them: the rule is the profile's and does not shrink as one
+# compositor's table grows.
 case input/an-untranslated-modifier-silences-the-chord
 source td
 tags core input

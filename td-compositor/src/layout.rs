@@ -753,7 +753,7 @@ mod tests {
     }
 
     #[test]
-    fn directional_focus_covers_all_emacs_directions_and_edges() {
+    fn directional_focus_covers_all_four_directions_and_edges() {
         let mut layout = Layout::new();
         layout.map(key(1));
         layout.map(key(2));

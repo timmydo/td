@@ -60,35 +60,59 @@ from `/sys/class/graphics/fb0`; the compositor refuses any format other than
 that interpretation against a file-backed framebuffer.
 
 Input is QEMU's PS/2 keyboard and pointer through evdev. The compositor
-supports EV_KEY, EV_REL, and EV_SYN. It has a fixed US key map. The
-compositor bindings deliberately follow Emacs navigation:
+supports EV_KEY, EV_REL, and EV_SYN. It has a fixed US key map. Every
+binding is ONE chord on `Super`:
 
-- `Super+b`, `Super+f`, `Super+p`, and `Super+n` focus left, right, up, and
-  down;
+- the arrow keys focus left, right, up, and down;
 - adding Shift to a focus binding moves the focused tile in that direction;
 - `Super+1` through `Super+9` switch workspaces, and adding Shift moves the
   focused tile to that workspace;
-- `Super+x 2` selects a vertical split for the next toplevel, `Super+x 3`
-  selects a horizontal split, and `Super+x 1` toggles fullscreen;
-- `Super+x l` opens the launcher. `Control+n` and `Control+p`, or Down and Up,
-  move its selection; Enter activates it; Escape and `Control+g` close it.
-  ASCII letters, digits, space, and hyphen filter its registry, and Backspace
-  edits that filter.
+- `Super+v` selects a vertical split for the next toplevel, `Super+h` selects
+  a horizontal split, and `Super+f` toggles fullscreen;
+- `Super+t` starts a terminal, which is the one registry entry anybody opens
+  repeatedly;
+- `Super+Enter` — or `Super+KPEnter`, since the open overlay activates on
+  either — opens the launcher, from which everything else is reachable.
+  `Control+n` and `Control+p`, or Down and Up, move its selection; Enter
+  activates it; Escape and `Control+g` close it. ASCII letters, digits,
+  space, and hyphen filter its registry, and Backspace edits that filter.
 
-The `Super+x` prefix survives key and modifier release, as an Emacs prefix
-does, and is consumed by the next non-modifier key press. Left and right
-modifier keys are tracked independently. A compositor chord consumes both
-the press and release of its command key. Its modifier transitions still
-reach the focused client, as do ordinary keys and their releases.
-Arbitrary keymaps, touch, calibration, gestures, and real GPUs are later
-increments.
+Shift is read only where the list says so: `Super+Shift+f` is fullscreen and
+`Ctrl+Super+t` is a terminal, since the letter chords and the launcher one
+look at Super alone. That is deliberate — a chord the operator got a spare
+modifier onto should do what it says rather than nothing — and it matches
+how the workspace and arrow bindings already treated Control and Alt. The
+overlay outranks all of it: while the launcher is up it owns every
+non-modifier key, so `Super+t` behind it neither starts a second terminal
+nor types `t` into the query.
+
+Everything in that table is taken FROM the focused client, and this list
+takes more than the one it replaces: the four arrows, Enter, and `t`/`v`/`h`
+where `b/f/p/n`, `x` and the digits were taken before. Anything else under
+Super still reaches the client, which is what td-term's own
+untranslated-chord rule below turns on.
+
+A prefix buys keys at the cost of a press, and this table is nowhere near
+running out of them: the movement bindings were `Super+b/f/p/n` and the
+layout ones `Super+x` followed by `1`/`2`/`3`, both from Emacs, so the
+operations done most often cost two presses each. The arrows say the same
+thing as `b/f/p/n` without a mnemonic to learn, and `v`/`h`/`f` name their
+own axis. If the table ever does outgrow one modifier the answer is a
+second modifier rather than a prefix, since a chord is one motion and a
+prefix is a mode with a state nothing on screen reports.
+
+Left and right modifier keys are tracked independently. A compositor chord
+consumes both the press and release of its command key. Its modifier
+transitions still reach the focused client, as do ordinary keys and their
+releases. Arbitrary keymaps, touch, calibration, gestures, and real GPUs
+are later increments.
 
 Compositor commands act only on key presses. Evdev autorepeat records are
-ignored for both compositor and client delivery. A held `Super+x 2` therefore
-cannot fall through into repeated workspace switches after consuming the
-prefix. Ordinary keys omit XKB's `repeat=no` property and libxkbcommon 1.11
-treats symbol keys as repeatable by default. Clients combine that per-key
-property with `wl_keyboard.repeat_info`.
+ignored for both compositor and client delivery. A held `Super+v` therefore
+splits once rather than once per repeat interval. Ordinary keys omit XKB's
+`repeat=no` property and libxkbcommon 1.11 treats symbol keys as repeatable
+by default. Clients combine that per-key property with
+`wl_keyboard.repeat_info`.
 
 The framebuffer is single-buffered from userspace's perspective. The renderer
 allocates its frame storage once and composes a full frame after scene changes.
@@ -341,9 +365,8 @@ That synthetic release burst holds the same seat-ordering boundary as normal
 events, so another device cannot interleave halfway through it.
 For a modifier key, the forwarded key transition precedes the resulting
 modifier snapshot, matching the ordering established by wlroots.
-After `SYN_DROPPED`, the adapter releases that node's state, cancels a partial
-prefix, discards records through the next `SYN_REPORT`, and resumes without
-guessing the lost state.
+After `SYN_DROPPED`, the adapter releases that node's state, discards records
+through the next `SYN_REPORT`, and resumes without guessing the lost state.
 Before a surface id is released, its `wl_display.delete_id` is placed in the
 bounded seat queue after the focus update. The worker therefore writes
 the queued leave first without making request dispatch wait for socket
@@ -562,7 +585,7 @@ The landing must prove:
   descriptor, consumes focused keyboard and framed pointer input, redraws the
   resulting model, and remains mapped;
 - every tiling command, split geometry edge case, workspace transition, tree
-  collapse, fullscreen transition, and Emacs binding is a deterministic host
+  collapse, fullscreen transition, and Super chord is a deterministic host
   test;
 - parsed key chords and complete pointer frames cross the evdev adapter into
   a recording target, while the runtime integration test proves a layout
@@ -583,7 +606,7 @@ The landing must prove:
   ordinary-key omissions, symbol, and evdev-code invariants without adding
   libxkbcommon to the target graph;
 - focus changes and ordinary evdev keys cross the bounded seat worker in
-  order, while pre-registration events and intercepted Emacs chords do not;
+  order, while pre-registration events and intercepted Super chords do not;
 - keyboard model tests cover held-key snapshots, cross-client focus, modifier
   locks, key releases, registration cutoffs, and queue saturation;
 - pointer model tests cover enter, leave, motion, cross-client routing,
@@ -692,8 +715,8 @@ wl_shm replacement, release, and callback completion.
 The launcher follows the same boundary. Its pure model consumes typed actions,
 owns the query and matching indices, and returns an optional launch request;
 its renderer consumes an explicit frame slice, dimensions, and stride. Input
-tests route parsed Emacs chords and the complete accepted character set through
-a recording target, while runtime tests prove that overlay repaints do not
+tests route parsed launcher chords and the complete accepted character set
+through a recording target, while runtime tests prove overlay repaints do not
 mutate the tiling tree. Process policy turns a launch request and explicit
 paths into literal argv, with its active-child ceiling tested independently.
 Every overlay pixel is clipped to the computed card rectangle, including on
@@ -703,7 +726,7 @@ input devices, sockets, clocks, the filesystem, or ambient environment.
 ## 8. Deferred UI stack
 
 Focused keyboard and pointer delivery now connect the demo client to the
-existing evdev input path, and the Emacs-style launcher has a filterable
+existing evdev input path, and the launcher has a filterable
 application registry with a terminal entry, and the terminal is the first
 client the BOOT starts, in place of the demo. Clipboard, pointer
 axes, client cursor rendering, hotplug, and real DRM/KMS profiles follow.
@@ -1108,8 +1131,11 @@ shifted spelling in this profile, that Shift silences.
 
 A modifier the profile does not translate makes the whole chord unlisted rather
 than a bare key press. The compositor forwards Super chords it has no binding
-for, so without that rule `Super+q` would type `q` and `Super+Enter` would
-submit whatever the shell had half-typed. Shift, Caps Lock, Control, and Alt
+for, so without that rule `Super+q` would type `q`. The rule belongs to the
+PROFILE rather than to td's compositor, and so does not shrink as that
+compositor's table grows: it holds for `Super+Enter` and `Super+Up`, which td
+keeps for itself, under any other compositor that forwards them.
+Shift, Caps Lock, Control, and Alt
 are the handled set; Num Lock is handled-and-inert, because this profile's
 keypad is digits-only; any other bit, including an undefined one, silences the
 chord.

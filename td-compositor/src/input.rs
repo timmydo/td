@@ -1,7 +1,7 @@
 use crate::keyboard::{
     KeyInput, KeyState, ModifierState, MOD_ALT, MOD_CAPS, MOD_CONTROL, MOD_LOGO, MOD_NUM, MOD_SHIFT,
 };
-use crate::launcher::{LaunchOptions, LaunchProcesses, LauncherAction};
+use crate::launcher::{LaunchOptions, LaunchProcesses, LaunchRequest, LauncherAction};
 use crate::layout::{Axis, Command, Direction};
 use crate::pointer::{
     PointerButtonInput, PointerButtonState, MAX_POINTER_BUTTON_TRANSITIONS_PER_FRAME,
@@ -78,6 +78,8 @@ const KEY_KPENTER: u16 = 96;
 const KEY_RIGHTCTRL: u16 = 97;
 const KEY_RIGHTALT: u16 = 100;
 const KEY_UP: u16 = 103;
+const KEY_LEFT: u16 = 105;
+const KEY_RIGHT: u16 = 106;
 const KEY_DOWN: u16 = 108;
 const KEY_LEFTMETA: u16 = 125;
 const KEY_RIGHTMETA: u16 = 126;
@@ -102,7 +104,6 @@ struct KeyBindings {
     forwarded: BTreeSet<(usize, u16)>,
     caps_lock: bool,
     num_lock: bool,
-    prefix_device: Option<usize>,
     launcher_open: bool,
     consumed: BTreeSet<(usize, u16)>,
     pointer_pressed: BTreeSet<(usize, u16)>,
@@ -113,6 +114,7 @@ struct KeyBindings {
 struct KeyDecision {
     command: Option<Command>,
     launcher: Option<LauncherAction>,
+    launch: Option<LaunchRequest>,
     forward: Option<KeyInput>,
     modifiers: Option<ModifierState>,
 }
@@ -127,6 +129,7 @@ impl KeyBindings {
         let mut decision = KeyDecision {
             command: None,
             launcher: None,
+            launch: None,
             forward: None,
             modifiers: None,
         };
@@ -214,30 +217,38 @@ impl KeyBindings {
             return decision;
         }
         let meta = self.pressed(KEY_LEFTMETA) || self.pressed(KEY_RIGHTMETA);
-        if meta && event.code == KEY_X {
-            self.prefix_device = Some(device);
-            self.consumed.insert(physical);
-            return decision;
-        }
-        if self.prefix_device.is_some() {
-            self.prefix_device = None;
-            self.consumed.insert(physical);
-            match event.code {
-                KEY_1 => decision.command = Some(Command::ToggleFullscreen),
-                KEY_2 => decision.command = Some(Command::SetSplit(Axis::Vertical)),
-                KEY_3 => decision.command = Some(Command::SetSplit(Axis::Horizontal)),
-                KEY_L => {
-                    decision.launcher = Some(LauncherAction::Open);
-                }
-                _ => {}
-            }
-            return decision;
-        }
         if !meta {
             decision.forward = self.forward(physical, event);
             return decision;
         }
         let shift = self.pressed(KEY_LEFTSHIFT) || self.pressed(KEY_RIGHTSHIFT);
+        // One chord per operation: no prefix, so a chord is read entirely
+        // from what is held at this press.
+        let chord = match event.code {
+            KEY_F => Some(Command::ToggleFullscreen),
+            KEY_V => Some(Command::SetSplit(Axis::Vertical)),
+            KEY_H => Some(Command::SetSplit(Axis::Horizontal)),
+            _ => None,
+        };
+        if let Some(command) = chord {
+            self.consumed.insert(physical);
+            decision.command = Some(command);
+            return decision;
+        }
+        // Both Enters, because the OPEN overlay already activates on either
+        // and a keypad that opens nothing while it activates is a coin toss.
+        if event.code == KEY_ENTER || event.code == KEY_KPENTER {
+            self.consumed.insert(physical);
+            decision.launcher = Some(LauncherAction::Open);
+            return decision;
+        }
+        // The terminal without going through the launcher: it is the one entry
+        // anybody opens repeatedly, and the registry still carries it.
+        if event.code == KEY_T {
+            self.consumed.insert(physical);
+            decision.launch = Some(LaunchRequest::Terminal);
+            return decision;
+        }
         if let Some(direction) = direction(event.code) {
             self.consumed.insert(physical);
             decision.command = if shift {
@@ -466,6 +477,10 @@ struct PointerFrame {
 trait InputTarget {
     fn command(&mut self, command: Command) -> Result<(), String>;
     fn launcher(&mut self, action: LauncherAction) -> Result<bool, String>;
+    /// Spawn a registry entry WITHOUT opening the overlay — `Super+t`'s whole
+    /// point. Separate from `launcher` because that one is about the overlay's
+    /// model and returns its visibility, which this never changes.
+    fn launch(&mut self, request: LaunchRequest) -> Result<(), String>;
     fn key(&mut self, input: KeyInput) -> Result<(), String>;
     fn modifiers(&mut self, modifiers: ModifierState) -> Result<(), String>;
     fn pointer_frame(
@@ -485,12 +500,32 @@ struct LiveInputTarget {
     launches: LaunchProcesses,
 }
 
+impl LiveInputTarget {
+    /// A launch failure is REPORTED, never fatal: the evdev reader must keep
+    /// serving so the operator can close the overlay or try again.
+    fn spawn(&mut self, request: LaunchRequest) {
+        match self.launches.launch(request) {
+            Ok(failures) => {
+                for failure in failures {
+                    eprintln!("td-compositor: {failure}");
+                }
+            }
+            Err(error) => eprintln!("td-compositor: {error}"),
+        }
+    }
+}
+
 impl InputTarget for LiveInputTarget {
     fn command(&mut self, command: Command) -> Result<(), String> {
         self.runtime
             .lock()
             .map_err(|_| "runtime lock poisoned".to_string())?
             .command(command)
+    }
+
+    fn launch(&mut self, request: LaunchRequest) -> Result<(), String> {
+        self.spawn(request);
+        Ok(())
     }
 
     fn launcher(&mut self, action: LauncherAction) -> Result<bool, String> {
@@ -503,14 +538,7 @@ impl InputTarget for LiveInputTarget {
             (request, runtime.launcher_visible())
         };
         if let Some(request) = request {
-            match self.launches.launch(request) {
-                Ok(failures) => {
-                    for failure in failures {
-                        eprintln!("td-compositor: {failure}");
-                    }
-                }
-                Err(error) => eprintln!("td-compositor: {error}"),
-            }
+            self.spawn(request);
         }
         Ok(visible)
     }
@@ -595,10 +623,10 @@ impl PointerMotion {
 
 fn direction(code: u16) -> Option<Direction> {
     match code {
-        KEY_B => Some(Direction::Left),
-        KEY_F => Some(Direction::Right),
-        KEY_P => Some(Direction::Up),
-        KEY_N => Some(Direction::Down),
+        KEY_LEFT => Some(Direction::Left),
+        KEY_RIGHT => Some(Direction::Right),
+        KEY_UP => Some(Direction::Up),
+        KEY_DOWN => Some(Direction::Down),
         _ => None,
     }
 }
@@ -770,6 +798,7 @@ fn apply<T: InputTarget>(
     let decision = bindings.feed_device(device, event);
     if decision.command.is_none()
         && decision.launcher.is_none()
+        && decision.launch.is_none()
         && decision.forward.is_none()
         && decision.modifiers.is_none()
         && frame.is_none()
@@ -808,6 +837,9 @@ fn deliver_key_decision<T: InputTarget>(
     if let Some(action) = decision.launcher {
         let visible = runtime.launcher(action)?;
         bindings.settle_launcher(Some(visible));
+    }
+    if let Some(request) = decision.launch {
+        runtime.launch(request)?;
     }
     if let Some(input) = decision.forward {
         runtime.key(input)?;
@@ -854,9 +886,6 @@ fn release_device<T: InputTarget>(
     let mut bindings = bindings
         .lock()
         .map_err(|_| "input bindings lock poisoned".to_string())?;
-    if bindings.prefix_device == Some(device) {
-        bindings.prefix_device = None;
-    }
     let codes: Vec<u16> = bindings
         .pressed
         .iter()
@@ -1131,11 +1160,17 @@ mod tests {
         pointer_error: Option<String>,
         flushes: usize,
         flush_error: Option<String>,
+        launched: Vec<LaunchRequest>,
     }
 
     impl InputTarget for RecordingTarget {
         fn command(&mut self, command: Command) -> Result<(), String> {
             self.commands.push(command);
+            Ok(())
+        }
+
+        fn launch(&mut self, request: LaunchRequest) -> Result<(), String> {
+            self.launched.push(request);
             Ok(())
         }
 
@@ -1207,6 +1242,10 @@ mod tests {
     impl InputTarget for LauncherModelTarget {
         fn command(&mut self, command: Command) -> Result<(), String> {
             self.recording.command(command)
+        }
+
+        fn launch(&mut self, request: LaunchRequest) -> Result<(), String> {
+            self.recording.launch(request)
         }
 
         fn launcher(&mut self, action: LauncherAction) -> Result<bool, String> {
@@ -1416,7 +1455,7 @@ mod tests {
         bytes
             .get_mut(18..20)
             .unwrap()
-            .copy_from_slice(&KEY_F.to_ne_bytes());
+            .copy_from_slice(&KEY_RIGHT.to_ne_bytes());
         bytes
             .get_mut(20..24)
             .unwrap()
@@ -1426,7 +1465,7 @@ mod tests {
             Event {
                 time: 12_345,
                 kind: EV_KEY,
-                code: KEY_F,
+                code: KEY_RIGHT,
                 value: KEY_PRESS
             }
         );
@@ -1455,12 +1494,12 @@ mod tests {
     }
 
     #[test]
-    fn emacs_direction_keys_focus_and_shift_moves_in_every_direction() {
+    fn arrow_keys_focus_and_shift_moves_in_every_direction() {
         for (code, direction) in [
-            (KEY_B, Direction::Left),
-            (KEY_F, Direction::Right),
-            (KEY_P, Direction::Up),
-            (KEY_N, Direction::Down),
+            (KEY_LEFT, Direction::Left),
+            (KEY_RIGHT, Direction::Right),
+            (KEY_UP, Direction::Up),
+            (KEY_DOWN, Direction::Down),
         ] {
             let mut bindings = KeyBindings::default();
             assert_eq!(tap(&mut bindings, code), None);
@@ -1486,16 +1525,16 @@ mod tests {
         bindings.feed(key(KEY_LEFTMETA, KEY_RELEASE));
         bindings.feed(key(KEY_LEFTSHIFT, KEY_RELEASE));
         assert_eq!(
-            tap(&mut bindings, KEY_F),
+            tap(&mut bindings, KEY_RIGHT),
             Some(Command::Move(Direction::Right))
         );
         bindings.feed(key(KEY_RIGHTSHIFT, KEY_RELEASE));
         assert_eq!(
-            tap(&mut bindings, KEY_F),
+            tap(&mut bindings, KEY_RIGHT),
             Some(Command::Focus(Direction::Right))
         );
         bindings.feed(key(KEY_RIGHTMETA, KEY_RELEASE));
-        assert_eq!(tap(&mut bindings, KEY_F), None);
+        assert_eq!(tap(&mut bindings, KEY_RIGHT), None);
     }
 
     #[test]
@@ -1526,39 +1565,110 @@ mod tests {
     }
 
     #[test]
-    fn emacs_prefix_selects_fullscreen_and_both_split_axes() {
+    fn super_chords_select_fullscreen_and_both_split_axes() {
         for (code, expected) in [
-            (KEY_1, Command::ToggleFullscreen),
-            (KEY_2, Command::SetSplit(Axis::Vertical)),
-            (KEY_3, Command::SetSplit(Axis::Horizontal)),
+            (KEY_F, Command::ToggleFullscreen),
+            (KEY_V, Command::SetSplit(Axis::Vertical)),
+            (KEY_H, Command::SetSplit(Axis::Horizontal)),
         ] {
             let mut bindings = KeyBindings::default();
+            // Bare, the key is the client's text: only the modifier makes it
+            // a command.
+            let bare = bindings.feed(key(code, KEY_PRESS));
+            assert_eq!(bare.command, None);
+            assert!(bare.forward.is_some());
+            bindings.feed(key(code, KEY_RELEASE));
             press(&mut bindings, KEY_LEFTMETA);
-            assert_eq!(press(&mut bindings, KEY_X), None);
-            assert_eq!(bindings.feed(key(KEY_X, KEY_RELEASE)).command, None);
             assert_eq!(tap(&mut bindings, code), Some(expected));
         }
     }
 
     #[test]
-    fn emacs_launcher_prefix_navigation_activation_and_cancel_are_consumed() {
+    fn super_t_starts_a_terminal_without_raising_the_overlay() {
+        let mut bindings = KeyBindings::default();
+        // Bare, the key is the client's text, not a launch.
+        let bare = bindings.feed(key(KEY_T, KEY_PRESS));
+        assert!(bare.launch.is_none());
+        assert!(bare.forward.is_some());
+        bindings.feed(key(KEY_T, KEY_RELEASE));
+        press(&mut bindings, KEY_RIGHTMETA);
+        let chord = bindings.feed(key(KEY_T, KEY_PRESS));
+        assert_eq!(chord.launch, Some(LaunchRequest::Terminal));
+        assert!(chord.launcher.is_none());
+        assert!(chord.command.is_none());
+        assert!(chord.forward.is_none());
+        // Consumed, so the release does not reach the client either.
+        assert!(bindings.feed(key(KEY_T, KEY_RELEASE)).forward.is_none());
+    }
+
+    #[test]
+    fn an_open_overlay_swallows_every_super_chord() {
         let mut bindings = KeyBindings::default();
         press(&mut bindings, KEY_LEFTMETA);
-        press(&mut bindings, KEY_X);
-        let opened = bindings.feed(key(KEY_L, KEY_PRESS));
+        assert_eq!(
+            bindings.feed(key(KEY_ENTER, KEY_PRESS)).launcher,
+            Some(LauncherAction::Open)
+        );
+        bindings.settle_launcher(Some(true));
+        bindings.feed(key(KEY_ENTER, KEY_RELEASE));
+        // Super is still DOWN. The overlay owns every non-modifier key, so a
+        // chord neither runs behind it nor types into its query: `Super+t`
+        // must not start a second terminal, `Super+v` must not split.
+        for code in [KEY_T, KEY_V, KEY_H, KEY_F, KEY_2, KEY_RIGHT] {
+            let held = bindings.feed(key(code, KEY_PRESS));
+            assert!(held.launch.is_none(), "{code}");
+            assert!(held.command.is_none(), "{code}");
+            assert!(held.launcher.is_none(), "{code}");
+            assert!(held.forward.is_none(), "{code}");
+            bindings.feed(key(code, KEY_RELEASE));
+        }
+    }
+
+    #[test]
+    fn an_unbound_key_under_super_reaches_the_client() {
+        let mut bindings = KeyBindings::default();
+        press(&mut bindings, KEY_LEFTMETA);
+        // Only the bound chords are stolen; everything else is the client's,
+        // which is what the terminal's own untranslated-chord rule turns on.
+        let unbound = bindings.feed(key(KEY_Q, KEY_PRESS));
+        assert!(unbound.command.is_none());
+        assert!(unbound.launch.is_none());
+        assert!(unbound.launcher.is_none());
+        assert!(unbound.forward.is_some());
+        assert!(bindings.feed(key(KEY_Q, KEY_RELEASE)).forward.is_some());
+    }
+
+    #[test]
+    fn the_adapter_hands_a_terminal_chord_to_the_target_without_a_launcher_action() {
+        let target = Mutex::new(RecordingTarget::default());
+        let bindings = Mutex::new(KeyBindings::default());
+        let mut pointer = PointerMotion::default();
+        for event in [
+            key(KEY_LEFTMETA, KEY_PRESS),
+            key(KEY_T, KEY_PRESS),
+            key(KEY_T, KEY_RELEASE),
+        ] {
+            apply(&target, event, 0, &bindings, &mut pointer).unwrap();
+        }
+        let target = target.lock().unwrap();
+        assert_eq!(target.launched, [LaunchRequest::Terminal]);
+        assert_eq!(target.launcher_actions, []);
+        assert_eq!(target.commands, []);
+    }
+
+    #[test]
+    fn launcher_navigation_activation_and_cancel_are_consumed() {
+        let mut bindings = KeyBindings::default();
+        press(&mut bindings, KEY_LEFTMETA);
+        let opened = bindings.feed(key(KEY_ENTER, KEY_PRESS));
         assert_eq!(opened.launcher, Some(LauncherAction::Open));
         assert!(opened.forward.is_none());
         bindings.settle_launcher(Some(true));
-        assert!(bindings.feed(key(KEY_L, KEY_RELEASE)).forward.is_none());
+        assert!(bindings.feed(key(KEY_ENTER, KEY_RELEASE)).forward.is_none());
         bindings.feed(key(KEY_LEFTMETA, KEY_RELEASE));
 
-        press(&mut bindings, KEY_LEFTMETA);
-        let nested_prefix = bindings.feed(key(KEY_X, KEY_PRESS));
-        assert!(nested_prefix.command.is_none());
-        assert!(nested_prefix.launcher.is_none());
-        assert!(nested_prefix.forward.is_none());
-        bindings.feed(key(KEY_X, KEY_RELEASE));
-        bindings.feed(key(KEY_LEFTMETA, KEY_RELEASE));
+        // A key that WOULD be a workspace command becomes text while the
+        // overlay is up: the overlay owns every non-modifier key.
         let blocked_command = bindings.feed(key(KEY_2, KEY_PRESS));
         assert!(blocked_command.command.is_none());
         assert!(blocked_command.forward.is_none());
@@ -1588,16 +1698,22 @@ mod tests {
         let activated = keypad.feed(key(KEY_KPENTER, KEY_PRESS));
         assert_eq!(activated.launcher, Some(LauncherAction::Activate));
         assert!(activated.forward.is_none());
+        // Both Enters OPEN as well, or the keypad activates something it
+        // cannot raise.
+        let mut keypad = KeyBindings::default();
+        press(&mut keypad, KEY_LEFTMETA);
+        let opened = keypad.feed(key(KEY_KPENTER, KEY_PRESS));
+        assert_eq!(opened.launcher, Some(LauncherAction::Open));
+        assert!(opened.forward.is_none());
 
         let mut bindings = KeyBindings::default();
         press(&mut bindings, KEY_RIGHTMETA);
-        press(&mut bindings, KEY_X);
         assert_eq!(
-            bindings.feed(key(KEY_L, KEY_PRESS)).launcher,
+            bindings.feed(key(KEY_ENTER, KEY_PRESS)).launcher,
             Some(LauncherAction::Open)
         );
         bindings.settle_launcher(Some(true));
-        bindings.feed(key(KEY_L, KEY_RELEASE));
+        bindings.feed(key(KEY_ENTER, KEY_RELEASE));
         bindings.feed(key(KEY_RIGHTMETA, KEY_RELEASE));
         assert_eq!(
             bindings.feed(key(KEY_DOWN, KEY_PRESS)).launcher,
@@ -1616,10 +1732,9 @@ mod tests {
 
         let mut bindings = KeyBindings::default();
         press(&mut bindings, KEY_LEFTMETA);
-        press(&mut bindings, KEY_X);
-        bindings.feed(key(KEY_L, KEY_PRESS));
+        bindings.feed(key(KEY_ENTER, KEY_PRESS));
         bindings.settle_launcher(Some(true));
-        bindings.feed(key(KEY_L, KEY_RELEASE));
+        bindings.feed(key(KEY_ENTER, KEY_RELEASE));
         bindings.feed(key(KEY_LEFTMETA, KEY_RELEASE));
         press(&mut bindings, KEY_LEFTCTRL);
         assert_eq!(
@@ -1633,13 +1748,12 @@ mod tests {
     fn launcher_text_backspace_and_modified_keys_are_consumed() {
         let mut bindings = KeyBindings::default();
         press(&mut bindings, KEY_LEFTMETA);
-        press(&mut bindings, KEY_X);
         assert_eq!(
-            bindings.feed(key(KEY_L, KEY_PRESS)).launcher,
+            bindings.feed(key(KEY_ENTER, KEY_PRESS)).launcher,
             Some(LauncherAction::Open)
         );
         bindings.settle_launcher(Some(true));
-        bindings.feed(key(KEY_L, KEY_RELEASE));
+        bindings.feed(key(KEY_ENTER, KEY_RELEASE));
         bindings.feed(key(KEY_LEFTMETA, KEY_RELEASE));
 
         for (code, expected) in [
@@ -1696,34 +1810,35 @@ mod tests {
     }
 
     #[test]
-    fn prefix_survives_modifier_release_and_is_cancelled_by_an_unknown_key() {
+    fn a_chord_is_read_from_the_modifier_held_now_not_from_one_released_earlier() {
         let mut bindings = KeyBindings::default();
         press(&mut bindings, KEY_LEFTMETA);
-        press(&mut bindings, KEY_X);
-        bindings.feed(key(KEY_LEFTMETA, KEY_RELEASE));
-        press(&mut bindings, KEY_LEFTCTRL);
-        press(&mut bindings, KEY_RIGHTCTRL);
-        bindings.feed(key(KEY_LEFTCTRL, KEY_RELEASE));
-        bindings.feed(key(KEY_RIGHTCTRL, KEY_RELEASE));
         assert_eq!(
-            tap(&mut bindings, KEY_2),
+            tap(&mut bindings, KEY_V),
             Some(Command::SetSplit(Axis::Vertical))
         );
-        press(&mut bindings, KEY_LEFTMETA);
-        press(&mut bindings, KEY_X);
-        assert_eq!(tap(&mut bindings, 99), None);
+        bindings.feed(key(KEY_LEFTMETA, KEY_RELEASE));
+        // With Super up the same key is the client's to type: nothing
+        // outlives the modifier.
+        assert_eq!(tap(&mut bindings, KEY_V), None);
+        assert_eq!(tap(&mut bindings, KEY_2), None);
+        press(&mut bindings, KEY_RIGHTMETA);
         assert_eq!(tap(&mut bindings, KEY_2), Some(Command::SwitchWorkspace(2)));
     }
 
     #[test]
-    fn autorepeat_neither_runs_a_command_nor_consumes_a_prefix() {
+    fn autorepeat_never_runs_a_command() {
         let mut bindings = KeyBindings::default();
         press(&mut bindings, KEY_LEFTMETA);
-        assert_eq!(bindings.feed(key(KEY_F, KEY_REPEAT)).command, None);
-        press(&mut bindings, KEY_X);
-        assert_eq!(bindings.feed(key(KEY_2, KEY_REPEAT)).command, None);
+        // A held chord repeats at the driver, and a compositor acting on that
+        // would split the layout once per repeat interval.
+        assert_eq!(bindings.feed(key(KEY_RIGHT, KEY_REPEAT)).command, None);
+        assert_eq!(bindings.feed(key(KEY_V, KEY_REPEAT)).command, None);
+        assert_eq!(press(&mut bindings, KEY_V), Some(Command::SetSplit(Axis::Vertical)));
+        assert_eq!(bindings.feed(key(KEY_V, KEY_REPEAT)).command, None);
+        bindings.feed(key(KEY_V, KEY_RELEASE));
         assert_eq!(
-            tap(&mut bindings, KEY_2),
+            tap(&mut bindings, KEY_V),
             Some(Command::SetSplit(Axis::Vertical))
         );
     }
@@ -1926,8 +2041,8 @@ mod tests {
             apply(&target, event, 0, &bindings, pointer).unwrap();
         };
         apply_event(key(KEY_LEFTMETA, KEY_PRESS), &mut pointer);
-        apply_event(key(KEY_X, KEY_PRESS), &mut pointer);
-        apply_event(key(KEY_L, KEY_PRESS), &mut pointer);
+        apply_event(key(KEY_ENTER, KEY_PRESS), &mut pointer);
+        apply_event(key(KEY_ENTER, KEY_PRESS), &mut pointer);
         assert!(bindings.lock().unwrap().launcher_open);
 
         apply_event(key(BTN_MOUSE, KEY_PRESS), &mut pointer);
@@ -2089,7 +2204,7 @@ mod tests {
         let mut pointer = PointerMotion::default();
         for event in [
             key(KEY_LEFTMETA, KEY_PRESS),
-            key(KEY_B, KEY_PRESS),
+            key(KEY_LEFT, KEY_PRESS),
             Event {
                 time: 0,
                 kind: EV_REL,
@@ -2152,9 +2267,8 @@ mod tests {
         let mut pointer = PointerMotion::default();
         for event in [
             key(KEY_LEFTMETA, KEY_PRESS),
-            key(KEY_X, KEY_PRESS),
-            key(KEY_L, KEY_PRESS),
-            key(KEY_L, KEY_RELEASE),
+            key(KEY_ENTER, KEY_PRESS),
+            key(KEY_ENTER, KEY_RELEASE),
             key(KEY_LEFTMETA, KEY_RELEASE),
             key(KEY_DOWN, KEY_PRESS),
             key(KEY_DOWN, KEY_RELEASE),
@@ -2179,9 +2293,8 @@ mod tests {
         let mut pointer = PointerMotion::default();
         for event in [
             key(KEY_LEFTMETA, KEY_PRESS),
-            key(KEY_X, KEY_PRESS),
-            key(KEY_L, KEY_PRESS),
-            key(KEY_L, KEY_RELEASE),
+            key(KEY_ENTER, KEY_PRESS),
+            key(KEY_ENTER, KEY_RELEASE),
             key(KEY_LEFTMETA, KEY_RELEASE),
             key(KEY_Z, KEY_PRESS),
             key(KEY_Z, KEY_RELEASE),
@@ -2247,11 +2360,9 @@ mod tests {
         });
         let bindings = Mutex::new(KeyBindings::default());
         let mut pointer = PointerMotion::default();
-        for event in [key(KEY_LEFTMETA, KEY_PRESS), key(KEY_X, KEY_PRESS)] {
-            apply(&target, event, 0, &bindings, &mut pointer).unwrap();
-        }
+        apply(&target, key(KEY_LEFTMETA, KEY_PRESS), 0, &bindings, &mut pointer).unwrap();
         runtime.lock().unwrap().fail_next_repaint();
-        assert!(apply(&target, key(KEY_L, KEY_PRESS), 0, &bindings, &mut pointer).is_err());
+        assert!(apply(&target, key(KEY_ENTER, KEY_PRESS), 0, &bindings, &mut pointer).is_err());
         assert!(!runtime.lock().unwrap().launcher_visible());
         assert!(!bindings.lock().unwrap().launcher_open);
     }
@@ -2353,7 +2464,7 @@ mod tests {
             })
         );
         let shortcut = bindings.feed(key(KEY_F, KEY_PRESS));
-        assert_eq!(shortcut.command, Some(Command::Focus(Direction::Right)));
+        assert_eq!(shortcut.command, Some(Command::ToggleFullscreen));
         assert_eq!(shortcut.forward, None);
         assert_eq!(bindings.feed(key(KEY_F, KEY_RELEASE)).forward, None);
         let released = bindings.feed(key(KEY_LEFTMETA, KEY_RELEASE));
@@ -2406,11 +2517,19 @@ mod tests {
         for (name, code) in [
             ("AE01", KEY_1),
             ("AE09", KEY_9),
+            ("AD05", KEY_T),
             ("AD10", KEY_P),
             ("AC04", KEY_F),
+            ("AC06", KEY_H),
             ("AB02", KEY_X),
+            ("AB04", KEY_V),
             ("AB05", KEY_B),
             ("AB06", KEY_N),
+            ("RTRN", KEY_ENTER),
+            ("UP", KEY_UP),
+            ("LEFT", KEY_LEFT),
+            ("RGHT", KEY_RIGHT),
+            ("DOWN", KEY_DOWN),
             ("LCTL", KEY_LEFTCTRL),
             ("RCTL", KEY_RIGHTCTRL),
             ("LFSH", KEY_LEFTSHIFT),
@@ -2524,7 +2643,7 @@ mod tests {
         bindings.feed_device(1, key(KEY_LEFTMETA, KEY_PRESS));
         assert_eq!(
             bindings.feed_device(1, key(KEY_F, KEY_PRESS)).command,
-            Some(Command::Focus(Direction::Right))
+            Some(Command::ToggleFullscreen)
         );
         let duplicate = bindings.feed_device(2, key(KEY_F, KEY_PRESS));
         assert_eq!(duplicate.command, None);
@@ -2539,13 +2658,12 @@ mod tests {
         );
 
         bindings.feed_device(1, key(KEY_2, KEY_PRESS));
-        bindings.feed_device(1, key(KEY_X, KEY_PRESS));
         let duplicate = bindings.feed_device(2, key(KEY_2, KEY_PRESS));
         assert_eq!(duplicate.command, None);
         assert_eq!(duplicate.forward, None);
         assert_eq!(
             bindings.feed_device(2, key(KEY_3, KEY_PRESS)).command,
-            Some(Command::SetSplit(Axis::Horizontal))
+            Some(Command::SwitchWorkspace(3))
         );
     }
 
@@ -2679,23 +2797,23 @@ mod tests {
     }
 
     #[test]
-    fn unrelated_device_teardown_does_not_cancel_a_prefix() {
+    fn unrelated_device_teardown_does_not_release_a_held_modifier() {
         let target = Mutex::new(RecordingTarget::default());
         let bindings = Mutex::new(KeyBindings::default());
         let mut pointer = PointerMotion::default();
-        for event in [
+        apply(
+            &target,
             key(KEY_LEFTMETA, KEY_PRESS),
-            key(KEY_X, KEY_PRESS),
-            key(KEY_X, KEY_RELEASE),
-            key(KEY_LEFTMETA, KEY_RELEASE),
-        ] {
-            apply(&target, event, 1, &bindings, &mut pointer).unwrap();
-        }
+            1,
+            &bindings,
+            &mut pointer,
+        )
+        .unwrap();
         release_device(&target, 2, &bindings, 17).unwrap();
         apply(&target, key(KEY_2, KEY_PRESS), 1, &bindings, &mut pointer).unwrap();
         assert_eq!(
             target.lock().unwrap().commands,
-            [Command::SetSplit(Axis::Vertical)]
+            [Command::SwitchWorkspace(2)]
         );
     }
 
@@ -2707,7 +2825,7 @@ mod tests {
         let mut dropped = false;
         for event in [
             key(KEY_LEFTMETA, KEY_PRESS),
-            key(KEY_X, KEY_PRESS),
+            key(KEY_V, KEY_PRESS),
             Event {
                 time: 3,
                 kind: EV_REL,
@@ -2739,7 +2857,7 @@ mod tests {
         }
 
         let target = target.lock().unwrap();
-        assert_eq!(target.commands, []);
+        assert_eq!(target.commands, [Command::SetSplit(Axis::Vertical)]);
         assert_eq!(
             target.keys,
             [
