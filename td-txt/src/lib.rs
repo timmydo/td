@@ -272,6 +272,21 @@ fn tokenize(text: &str, line: usize) -> Result<Vec<Vec<u8>>, SpecError> {
                         cur.push(match esc {
                             b'n' => b'\n',
                             b't' => b'\t',
+                            // The `-json` table's third control byte. Without it
+                            // `"\r"` is the letter, which a case asserting a CR
+                            // would pass while testing something else.
+                            b'r' => b'\r',
+                            // Punctuation escapes ITSELF here (`\\`, `\"`, `\$`),
+                            // which is the shell rule this borrows. A LETTER or
+                            // DIGIT does not: it is the shape every escape that
+                            // means something has, so `\0` or `\x41` silently
+                            // spelling `0` or `x41` is the same trap `\r` was.
+                            c if c.is_ascii_alphanumeric() => {
+                                return Err(SpecError::new(
+                                    line,
+                                    format!("unknown escape \\{} in argv", char::from(c)),
+                                ))
+                            }
                             other => other,
                         });
                         continue;
@@ -1101,6 +1116,22 @@ b
                 b"c\td".to_vec(),
                 b"e f".to_vec(),
             ]
+        );
+    }
+
+    /// A LETTER escape the tokenizer does not know must be refused rather than
+    /// spelled as the letter: `"\r"` meaning `r` is a case that passes while
+    /// asserting something else, and `\0`/`\x41` are the same trap unclosed.
+    /// Punctuation still escapes itself, which is what `\\` and `\"` need.
+    #[test]
+    fn argv_tokenizer_refuses_an_unknown_letter_escape() {
+        assert_eq!(tokenize(r#"sed "a\rb""#, 1).unwrap(), vec![b"sed".to_vec(), b"a\rb".to_vec()]);
+        for bad in [r#"sed "a\0b""#, r#"sed "a\x41""#, r#"sed "a\e""#] {
+            assert!(tokenize(bad, 1).is_err(), "{bad} was accepted");
+        }
+        assert_eq!(
+            tokenize(r#"sed "a\\b" "c\"d" "e\$f""#, 1).unwrap(),
+            vec![b"sed".to_vec(), br"a\b".to_vec(), b"c\"d".to_vec(), b"e$f".to_vec()]
         );
     }
 

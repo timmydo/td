@@ -1063,6 +1063,31 @@ td-txt-authored case files
     neighbouring shapes are NOT gaps: a text ending in an unpaired backslash is
     emitted raw, and a continuation collapses only across an `-e` boundary.
 
+  - A SECOND backslash after an `a\`/`i\`/`c\` is a one-character TEXT in GNU,
+    not a continuation. GNU's `read_text` takes it as the lead-in character and
+    adds it literally, so the newline after it ends the text there: `sed 'a\\'`
+    followed by a line `X` appends a single backslash and then meets `X` as a
+    COMMAND (`unknown command: `X''). td-txt reads the pair as an escaped
+    newline, swallows `X` into the text and exits 0 having appended it -- a
+    wrong ANSWER rather than a diagnostic, and the only one of these entries
+    that is. It crosses an `-e` boundary the same way (`sed -e 'a\\' -e X` is
+    GNU's `expression #2` refusal and td-txt's silent append). `sed 'a\\'` with
+    nothing after it agrees, both appending one empty line, which is why the
+    shape hides. Found while sweeping for the `char N` landing and out of its
+    scope; the entry above describes the SINGLE-backslash continuation, which
+    is a different rule and correct.
+
+  - An `a` with NO TEXT AT ALL still pays a record's missing separator in GNU.
+    A last record that arrived without one is written back without one, by both
+    programs -- unless an append is queued behind it, and GNU terminates it
+    before writing the text whether or not there IS any text. So
+    `printf 'a\nb' | sed 'a\'` is `a<nl>b<nl>` in GNU and `a<nl>b` here, the
+    appended nothing being the only difference between them. The `-z` spelling
+    (`sed -z 'a\'` over an input with no trailing NUL) is the same divergence
+    and is how it was found, but the separator is not what it is about: a real
+    text agrees under both separators, because there the text's own writer
+    supplies the byte, and `i`/`c` agree for the reasons the entry above gives.
+
   - A backreference to a group under a repetition whose BODY can match empty,
     which POSIX leaves undefined and where GNU's answers do not follow a rule.
     Participation itself is modelled -- the body runs once so `^(x*)*\1$` and
@@ -1160,8 +1185,9 @@ td-txt-authored case files
     over, from two directions. Found by a reviewer, and the three neighbouring
     shapes flagged with
     it (`[[:]\x41]`, `[[.]\x41]`, `[[=]\x41]`) are NOT divergences: both tools
-    refuse all three, differing only in the missing `char N:` offset -- which is
-    a reminder to normalise that before believing a stderr comparison.
+    refuse all three identically, down to the `char N:` offset -- which they did
+    not when this was written, the offset being the last piece of the diagnostic
+    locus to land.
 
   - `R /dev/stdin` HANGS here when stdin is a fifo whose writer has gone, where
     GNU prints its line and carries on: GNU opens `R` sources at compile time and
@@ -1242,33 +1268,6 @@ td-txt-authored case files
     branch. Found because a review caught a comment claiming both tools always
     expand it empty -- which was what my own probe showed, the probe having
     reused a group-LESS regex and so never reaching the case that matters.
-
-  - A compile diagnostic's `-e` form is missing its `, char N` offset: GNU says
-    `-e expression #1, char 1: unknown command: `Z'` where td-txt says
-    `-e expression #1: unknown command: `Z'`. It is what is LEFT of that family
-    -- the expression number and the `file NAME line L` form both landed -- and
-    it is the half GNU's `-f` form does not carry, which is why an `-f` refusal
-    is now asserted exactly in the corpus and an `-e` one by substring. Closing
-    it is not one number: `char N` is the count of characters CONSUMED when the
-    error was raised, and the raise sites disagree about whether the offending
-    byte is one of them, so it has to be calibrated per site.
-
-    Part of that calibration is ALREADY VISIBLE, because it moves the LINE a
-    `-f` script's refusal is on. Everything GNU compiles as part of an `s`
-    command's REGEX — the pattern (`s/\(a/b/`), the RHS backreference
-    (`s/a/\1/`) and the empty-regex modifier check (`s//x/I`) — is compiled
-    after the FLAG loop has consumed the command's terminating newline
-    (`mark_subst_opts` returns on `\n` without putting it back; `s` is not one
-    of `read_end_of_cmd`'s four callers), so all three are reported one line
-    further on than td-txt reports them, while
-    an ADDRESS regex — compiled as it is read — agrees. Only the position
-    differs: the ORDER already matches, `s/\(a/b/q` being `unknown option to
-    `s'` in both and `s/\(a/b/;Z` the regex error rather than the unknown
-    command in both. `sed -f` on a script of `0<newline>p` is a fourth,
-    from a different site: GNU reads the command character before judging the
-    address, so `invalid usage of line address 0` is its line 2 and td-txt's
-    line 1. Found by the three-way sweeps behind the locus landing, which are
-    also what say it is these four shapes and not the others they swept.
 
   - `sed -e '1a\<newline>foo' -e 'bar'` is `can't find label for jump to `ar''
     in GNU and `can't operate on label `ar'` here -- the same refusal, worded

@@ -195,6 +195,10 @@ struct ScriptParser<'a> {
     sandbox: bool,
     /// `-z`. Only the `M` flag reads it: see `Options::reg_newline`.
     null_data: bool,
+    /// Set when a diagnostic points somewhere other than where the parse stopped:
+    /// GNU SAVES the location of a `{` and reports an unmatched one there. `None`
+    /// means "wherever the parser is", which is every other diagnostic.
+    saved: Option<usize>,
     /// Every `-e`/`-f` fragment: where it ENDS in `src`, and what to call it in a
     /// diagnostic. The end doubles as the boundary the parse must respect, since
     /// GNU compiles each part alone: a part's closing newline is that part's end
@@ -242,12 +246,20 @@ impl ScriptParser<'_> {
         }
     }
 
-    /// Put the newline just read BACK, which is what GNU's `match_slash` does
+    /// Where this parser's next diagnostic points.
+    fn spot(&self) -> Spot {
+        match self.saved {
+            Some(at) => Spot::Saved(at),
+            None => Spot::Read(self.pos),
+        }
+    }
+
+    /// Put the byte just read BACK, which is what GNU's `match_slash` does
     /// before it reports an unterminated half — `savchar (ch); /* for proper
     /// line number in error report */`. The position is where the diagnostic's
-    /// LINE and `-e` part come from, and a newline is exactly where one part
-    /// ends and the next begins, so keeping it reports the error one line, or
-    /// one `-e` argument, past the command that failed.
+    /// LINE, `char N` and `-e` part all come from, and a newline is exactly
+    /// where one part ends and the next begins, so keeping it reports the error
+    /// one line, or one `-e` argument, past the command that failed.
     fn savchar(&mut self) {
         self.pos = self.pos.saturating_sub(1);
     }
@@ -274,7 +286,14 @@ impl ScriptParser<'_> {
         self.skip_blank();
         match self.peek() {
             None | Some(b'\n' | b';' | b'}' | b'#') => Ok(()),
-            Some(_) => Err("extra characters after command".to_string()),
+            Some(_) => {
+                // GNU's `read_end_of_cmd` READS the offending byte through
+                // `in_nonblank` and only then complains, so `pZ` is `char 2`
+                // rather than 1. It needs no part-boundary guard: a newline is
+                // accepted above, so nothing that reaches here is the joiner.
+                let _ = self.bump();
+                Err("extra characters after command".to_string())
+            }
         }
     }
 
@@ -284,7 +303,14 @@ impl ScriptParser<'_> {
             self.pos += 1;
         }
         let text = self.src.get(start..self.pos).unwrap_or_default().to_vec();
-        self.eat(b'\n');
+        // A part's closing newline is that part's end of input, not this line's
+        // terminator: eating it leaves the parse standing in the NEXT part, so a
+        // failure the SAME command raises afterwards is blamed on that one --
+        // `sed -e 's/\(a/b/wg' -e p` is expression #1 in GNU. Only the `s///w`
+        // flag can show it, the other callers having nothing left to fail at.
+        if !self.at_part_end() {
+            self.eat(b'\n');
+        }
         text
     }
 
@@ -584,13 +610,13 @@ impl ScriptParser<'_> {
                 } else {
                     let Some(k) = self.parse_addr_kind()? else {
                         // GNU READS the byte that turned out not to be an address
-                        // before complaining (`in_nonblank`), so a real newline
-                        // has already moved its line count on. A part's closing
-                        // newline is that part's end of input and is not read at
-                        // all — the same rule the delimiters and `parse_filename`
-                        // follow, and the only reason this consumes anything.
-                        if self.peek() == Some(b'\n') && !self.at_part_end() {
-                            self.pos += 1;
+                        // before complaining (`in_nonblank`), whatever it is, so
+                        // `1,p` is `char 3` and a real newline has moved its line
+                        // count on. A part's closing newline is that part's end of
+                        // input and is not read at all — the same rule the
+                        // delimiters and `parse_filename` follow.
+                        if !self.at_part_end() {
+                            let _ = self.bump();
                         }
                         return Err("unexpected `,'".to_string());
                     };
@@ -622,13 +648,22 @@ impl ScriptParser<'_> {
         if matches!(addr.a1, Some(AddrKind::Zero))
             && (self.posix || !(ends_in_regex || prepends))
         {
+            // GNU has READ that command character before it judges the address,
+            // so the refusal is reported past it: `0p` is `char 2`, `0 p` is
+            // `char 3` with the blank crossed as well, and in a `-f` script a
+            // newline there puts it on the next line. Not at a part's end, where
+            // GNU's input has run out and it reads nothing.
+            if !self.at_part_end() {
+                let _ = self.bump();
+            }
             return Err("invalid usage of line address 0".to_string());
         }
-        // One `!` and no more: GNU refuses a second rather than toggling back.
+        // One `!` and no more: GNU refuses a second rather than toggling back,
+        // having READ it -- `1!!p` is `char 3`.
         if self.eat(b'!') {
             addr.negate = true;
             self.skip_blank();
-            if self.peek() == Some(b'!') {
+            if self.eat(b'!') {
                 return Err("multiple `!'s".to_string());
             }
         }
@@ -661,6 +696,12 @@ impl ScriptParser<'_> {
             }
         } else if self.posix || self.peek().is_none() || self.at_part_end() {
             // The one-line `a text` form is GNU's; `--posix` leaves only `a\`.
+            // GNU has READ the byte that was not a backslash, so `--posix 'a t'`
+            // is `char 3` -- but a part's closing newline is that part's end of
+            // input, so there is nothing to read there and the count stops.
+            if !self.at_part_end() {
+                let _ = self.bump();
+            }
             return Err("expected \\ after `a', `c' or `i'".to_string());
         }
         // A text whose last character is an unpaired backslash is not decoded at
@@ -727,13 +768,10 @@ impl ScriptParser<'_> {
     /// through is exactly the fail-open this crate refuses everywhere else.
     fn parse_filename(&mut self) -> Result<Vec<u8>, String> {
         self.skip_blank();
-        // A part's closing newline is that part's end of input, and
-        // `rest_of_line` would CONSUME it — blaming the part after the one that
-        // really ran out. A newline inside a script is an ordinary byte, which
-        // GNU's `read_filename` consumes too, so only the boundary is special.
-        if self.at_part_end() {
-            return Err("missing filename in r/R/w/W commands".to_string());
-        }
+        // No part-end guard here: at a part's closing newline `rest_of_line`
+        // reads nothing and leaves that byte alone, so the empty-name refusal
+        // below is already the right message at the right position. One that
+        // could never fire would read as a handled case.
         let name = self.rest_of_line();
         if name.is_empty() {
             return Err("missing filename in r/R/w/W commands".to_string());
@@ -804,6 +842,12 @@ impl ScriptParser<'_> {
         let delim = self.bump().ok_or_else(|| "unterminated `s' command".to_string())?;
         let pattern = self.read_delimited(delim, "unterminated `s' command")?;
         let raw_repl = self.read_replacement(delim, "unterminated `s' command")?;
+        // GNU decodes the replacement BEFORE it reads the flags
+        // (`setup_replacement` precedes `mark_subst_opts` in compile.c), so a bad
+        // escape there outranks both an unknown flag and a bad PATTERN, and is
+        // reported before the terminator the flag loop goes on to consume:
+        // `s/a/\c\q/x` is `char 9` and `s/\(a/\c\q/` names the replacement.
+        let replacement = compile_replacement(&raw_repl, self.posix)?;
         let mut global = false;
         let mut print = false;
         let mut icase = false;
@@ -811,64 +855,90 @@ impl ScriptParser<'_> {
         let mut occurrence: u64 = 0;
         let mut wfile = None;
         loop {
+            // A blank SEPARATES flags rather than ending them (`s/a/b/ g p` is
+            // both), and GNU reads through `in_nonblank`, so a crossed blank is
+            // in the character count.
+            self.skip_blank();
+            // The two number refusals are counted from DIFFERENT places, because
+            // GNU judges a repeat before reading the number and a zero after it.
+            // So `s/a/b/2p345` stops at the first digit of the second number
+            // (`char 9`) while `s/a/b/000` reads all three (`char 9` as well,
+            // for the other reason).
+            if matches!(self.peek(), Some(d) if d.is_ascii_digit()) {
+                if occurrence != 0 {
+                    let _ = self.bump();
+                    return Err("multiple number options to `s' command".to_string().into());
+                }
+                // `in_integer` puts back the byte that ended the number, so the
+                // zero refusal names the last digit and not what follows it.
+                let n = self.parse_number().unwrap_or(0);
+                if n == 0 {
+                    return Err("number option to `s' command may not be zero".to_string().into());
+                }
+                occurrence = n;
+                continue;
+            }
             match self.peek() {
+                // `}` and `#` START the next command, so GNU savechars them; a
+                // part's closing newline is that part's end of input and is not
+                // read either. Neither is in the count.
+                None | Some(b'}' | b'#') => break,
+                Some(b'\n') if self.at_part_end() => break,
+                _ => {}
+            }
+            // Everything else GNU has READ before it decides what it was, so the
+            // count includes it -- `s/a/b/pp` is `char 8`, not 7.
+            let Some(b) = self.bump() else { break };
+            match b {
+                // The terminator, which GNU consumes before compiling the
+                // pattern: `s/\(a/b/;p` is `char 9` where the bare `s/\(a/b/`
+                // is `char 8`, and in a `-f` script it is the NEXT line.
+                b'\n' | b';' => break,
+                // GNU's one concession to CRLF, and it belongs to this command
+                // alone: the byte after a `\r` is read whatever it is, and the
+                // pair ends the flags only if it is the newline. After any
+                // OTHER command a `\r` is still `extra characters after
+                // command`, so this does not make a CRLF SCRIPT work -- it
+                // makes `s/a/b/<cr><nl>` work, and refuses `s/a/b/<cr>Z` past
+                // the `Z` rather than at the `\r`.
+                b'\r' => {
+                    if !self.at_part_end() && self.bump() == Some(b'\n') {
+                        break;
+                    }
+                    return Err("unknown option to `s'".to_string().into());
+                }
                 // GNU rejects a REPEAT of the three flags that carry a value, and
                 // `i`/`I`/`m`/`M` are the ones it lets you say twice.
-                Some(b'g') => {
+                b'g' => {
                     if global {
                         return Err("multiple `g' options to `s' command".to_string().into());
                     }
                     global = true;
-                    self.pos += 1;
                 }
-                Some(b'p') => {
+                b'p' => {
                     if print {
                         return Err("multiple `p' options to `s' command".to_string().into());
                     }
                     print = true;
-                    self.pos += 1;
                 }
-                Some(b'i' | b'I') if !self.posix => {
-                    icase = true;
-                    self.pos += 1;
-                }
-                Some(b'm' | b'M') if !self.posix => {
-                    multiline = true;
-                    self.pos += 1;
-                }
-                // Under the flag these are not flags at all, so the catch-all
+                b'i' | b'I' if !self.posix => icase = true,
+                b'm' | b'M' if !self.posix => multiline = true,
+                // Under `--posix` these are not flags at all, so the catch-all
                 // below answers with GNU's `unknown option to `s''.
-                Some(b'e') if !self.posix => {
+                b'e' if !self.posix => {
                     return Err("the `e' flag is not supported".to_string().into())
                 }
-                Some(b'w') => {
-                    self.pos += 1;
+                b'w' => {
                     self.deny_in_sandbox()?;
                     let name = self.parse_filename()?;
                     self.open_wfile(&name)?;
                     wfile = Some(name);
                     break;
                 }
-                Some(b) if b.is_ascii_digit() => {
-                    if occurrence != 0 {
-                        return Err("multiple number options to `s' command".to_string().into());
-                    }
-                    occurrence = self.parse_number().unwrap_or(0);
-                    if occurrence == 0 {
-                        return Err("number option to `s' command may not be zero".to_string().into());
-                    }
-                }
-                // A blank SEPARATES flags rather than ending them (`s/a/b/ g p` is
-                // both), and anything that is not a flag or a command terminator is
-                // an error rather than the next command: `s/a/b/x` is `unknown option
-                // to `s'` in GNU, not a substitution followed by an exchange.
-                Some(b' ' | b'\t') => self.pos += 1,
-                None | Some(b'\n' | b';' | b'}' | b'#') => break,
-                Some(_) => return Err("unknown option to `s'".to_string().into()),
+                _ => return Err("unknown option to `s'".to_string().into()),
             }
         }
         let re = self.add_regex(&pattern, icase, multiline)?;
-        let replacement = compile_replacement(&raw_repl, self.posix)?;
         // A `\N` naming a group the pattern does not have is a script error, not
         // an empty expansion -- except under `--posix`, GNU's fourth rule for the
         // flag, where it is accepted and expands to nothing. Checked only when
@@ -1275,6 +1345,7 @@ fn parse_script(
         posix,
         sandbox,
         null_data,
+        saved: None,
         parts,
         regexes: Vec::new(),
         wfiles: BTreeMap::new(),
@@ -1288,7 +1359,7 @@ fn parse_script(
     // pattern GNU reports bare, is not about a place in the script even though
     // the parser was standing in one when it happened.
     parsed.map_err(|f| match f.status {
-        1 => Fatal { locus: locus_at(&p.parts, src, p.pos), ..f },
+        1 => Fatal { locus: locus_at(&p.parts, src, p.spot()), ..f },
         _ => f,
     })
 }
@@ -1505,7 +1576,7 @@ fn parse_commands(p: &mut ScriptParser) -> Result<Script, Fatal> {
     // `check_final_program`, and its own position rather than the end of the
     // script: `{` on line 2 of four is `line 2` there.
     if let Some((_, brace)) = open_blocks.last() {
-        p.pos = *brace;
+        p.saved = Some(*brace);
         return Err("unmatched `{'".to_string().into());
     }
     Ok(Script {
@@ -2326,18 +2397,35 @@ struct Part {
     origin: Origin,
 }
 
+/// Where a diagnostic points, which is not always a place the parse reached.
+#[derive(Clone, Copy)]
+enum Spot {
+    /// A position the parser stopped at. Its distance from the part's start is
+    /// GNU's `char N`.
+    Read(usize),
+    /// A location GNU SAVED and reported later: the `{` of an unmatched block,
+    /// and the end of a compiled script for the one error deferred to run time.
+    /// It picks the part the same way, but a saved location carries no character
+    /// count and GNU prints `char 0`.
+    Saved(usize),
+}
+
 /// How GNU names the place a script failed to compile. An `-e` part is named by
-/// NUMBER and an `-f` one by file and LINE, the line counted within that file --
-/// so the position has to be resolved against the part it falls in, not the
-/// whole joined script.
+/// NUMBER and a CHARACTER COUNT within that part; an `-f` one by file and LINE,
+/// the line counted within that file and no char at all -- so the position has
+/// to be resolved against the part it falls in, not the whole joined script.
 ///
 /// `pos <= end` rather than `<`: a position AT a part's end has consumed that
 /// whole part and nothing of the next, which is the ordinary shape of an error
 /// raised on a part's last byte. GNU compiles each part on its own, so it can
 /// never blame the one after. The last part's `end` is the whole source's
-/// length and the parser never steps past it, so the search finds a part for
+/// length and the parser never steps past it, so the search reaches a part for
 /// every position it is asked about; None here means an empty script.
-fn locus_at(parts: &[Part], src: &[u8], pos: usize) -> Option<String> {
+fn locus_at(parts: &[Part], src: &[u8], spot: Spot) -> Option<String> {
+    let (pos, saved) = match spot {
+        Spot::Read(pos) => (pos, false),
+        Spot::Saved(pos) => (pos, true),
+    };
     // `position` rather than the iterator method whose NAME is also a retired
     // host tool's: this file is embedded verbatim in td-txt's recipe, and the
     // ladder guard scans that text for the bare token (recipes/src/ladder.rs).
@@ -2349,7 +2437,10 @@ fn locus_at(parts: &[Part], src: &[u8], pos: usize) -> Option<String> {
         None => 0,
     };
     match &part.origin {
-        Origin::Expression(n) => Some(format!("-e expression #{n}")),
+        Origin::Expression(n) => {
+            let ch = if saved { 0 } else { pos.saturating_sub(start) };
+            Some(format!("-e expression #{n}, char {ch}"))
+        }
         Origin::File(name) => {
             let within = src.get(start..pos).unwrap_or_default();
             let line = 1 + within.iter().filter(|b| **b == b'\n').count();
@@ -2784,7 +2875,7 @@ fn run(args: &[Vec<u8>]) -> Result<i32, Fatal> {
     // `-f' script says `line 5', and `-e '//p' -e p' says expression #2. So the
     // locus is taken here, while the parts are still in hand, and attached below
     // to whatever exit-1 failure comes back without one.
-    let script_end = locus_at(&parts, &source, source.len());
+    let script_end = locus_at(&parts, &source, Spot::Saved(source.len()));
     let separator = separator_for(conf.null_data);
     compile_and_run(conf, &source, parts, files, separator).map_err(|f| {
         match (f.status, &f.locus) {
@@ -4170,19 +4261,31 @@ mod tests {
             Part { end: 7, origin: Origin::Expression(2) },
         ];
         let want = [
-            "-e expression #1",  // 0: `p'
-            "-e expression #1",  // 1: consumed `p', nothing of the file
-            "file s.sed line 1", // 2: `q'
-            "file s.sed line 1", // 3: consumed `q'
-            "file s.sed line 2", // 4: `Z'
-            "file s.sed line 2", // 5: consumed `Z', nothing of the last part
-            "-e expression #2",  // 6: `d'
-            "-e expression #2",  // 7: consumed the whole script
+            "-e expression #1, char 0", // 0: `p'
+            "-e expression #1, char 1", // 1: consumed `p', nothing of the file
+            "file s.sed line 1",        // 2: `q'
+            "file s.sed line 1",        // 3: consumed `q'
+            "file s.sed line 2",        // 4: `Z'
+            "file s.sed line 2",        // 5: consumed `Z', nothing of the last part
+            "-e expression #2, char 0", // 6: `d'
+            "-e expression #2, char 1", // 7: consumed the whole script
         ];
         for (pos, w) in want.iter().enumerate() {
-            assert_eq!(locus_at(&parts, src, pos).as_deref(), Some(*w), "at {pos}");
+            assert_eq!(locus_at(&parts, src, Spot::Read(pos)).as_deref(), Some(*w), "at {pos}");
         }
-        assert_eq!(locus_at(&[], src, 0), None);
+        // A SAVED location picks its part the same way and always reads char 0,
+        // which is what GNU prints for one -- so the two spots differ only where
+        // an `-e` part carries a count at all.
+        assert_eq!(
+            locus_at(&parts, src, Spot::Saved(1)).as_deref(),
+            Some("-e expression #1, char 0")
+        );
+        assert_eq!(
+            locus_at(&parts, src, Spot::Saved(7)).as_deref(),
+            Some("-e expression #2, char 0")
+        );
+        assert_eq!(locus_at(&parts, src, Spot::Saved(4)).as_deref(), Some("file s.sed line 2"));
+        assert_eq!(locus_at(&[], src, Spot::Read(0)), None);
     }
 
     /// The vocabulary is decoded before any parser reads the text, and the byte it
