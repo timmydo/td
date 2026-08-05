@@ -2,22 +2,20 @@ use crate::conn::{
     self, Connection, Globals, COMPOSITOR, KEYBOARD, POINTER, SEAT, SHM, SURFACE, XDG_SURFACE,
     XDG_TOPLEVEL, XDG_WM_BASE,
 };
+use crate::MAX_HELD_KEYS;
 
 /// One past the last fixed id the DEMO creates. It binds a seat and creates a
 /// keyboard and pointer, so its dynamic range starts higher than the
 /// terminal's; see `conn`'s note on why this is per-client and must be dense.
 const FIRST_DYNAMIC_ID: u32 = POINTER + 1;
-use crate::keyboard::XKB_KEYMAP;
 use crate::pointer::MAX_POINTER_FRAME_EVENTS;
 use crate::render::BYTES_PER_PIXEL;
 use crate::scene::SHM_XRGB8888;
 use crate::ui::{KeyboardUpdate, PointerUpdate, UiKeyState, UiModel, UiModifiers};
 use crate::{socket, sys, wire, MAX_UI_DIMENSION, MAX_UI_FRAME_BYTES};
 use std::collections::BTreeSet;
-use std::fs::File;
 use std::io::{Read, Write};
 use std::os::fd::AsRawFd;
-use std::os::unix::fs::FileExt;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -375,38 +373,7 @@ impl Demo {
                 let size = args.u32()?;
                 args.finish()?;
                 let file = connection.take_fd("wl_keyboard.keymap")?;
-                if format != 1 {
-                    return Err(format!("unsupported wl_keyboard keymap format {format}"));
-                }
-                let expected_size = XKB_KEYMAP
-                    .len()
-                    .checked_add(1)
-                    .ok_or_else(|| "expected XKB keymap size overflow".to_string())?;
-                let announced_size = usize::try_from(size)
-                    .map_err(|_| "wl_keyboard keymap size escaped usize".to_string())?;
-                if announced_size != expected_size {
-                    return Err(format!(
-                        "wl_keyboard keymap has size {announced_size}, expected {expected_size}"
-                    ));
-                }
-                let metadata_size = usize::try_from(
-                    file.metadata()
-                        .map_err(|e| format!("stat wl_keyboard keymap: {e}"))?
-                        .len(),
-                )
-                .map_err(|_| "wl_keyboard keymap file size escaped usize".to_string())?;
-                if metadata_size != expected_size {
-                    return Err(format!(
-                        "wl_keyboard keymap file has size {metadata_size}, expected {expected_size}"
-                    ));
-                }
-                let bytes = read_keymap_bytes(&file, expected_size)?;
-                let body = bytes
-                    .get(..XKB_KEYMAP.len())
-                    .ok_or_else(|| "wl_keyboard keymap is truncated".to_string())?;
-                if body != XKB_KEYMAP.as_bytes() || bytes.last().copied() != Some(0) {
-                    return Err("wl_keyboard keymap differs from td's pinned keymap".into());
-                }
+                conn::verify_keymap(&file, format, size)?;
                 self.keymap_verified = true;
                 Ok(())
             }
@@ -418,7 +385,7 @@ impl Demo {
                 }
                 let byte_count = usize::try_from(args.u32()?)
                     .map_err(|_| "wl_keyboard key array size escaped usize".to_string())?;
-                if !byte_count.is_multiple_of(4) || byte_count / 4 > 256 {
+                if !byte_count.is_multiple_of(4) || byte_count / 4 > MAX_HELD_KEYS {
                     return Err(format!(
                         "wl_keyboard key array has invalid length {byte_count}"
                     ));
@@ -689,64 +656,6 @@ fn pointer_axis(axis: u32) -> Result<(), String> {
     }
 }
 
-/// POSITIONED reads, which is §11's rule and not a style choice. The
-/// compositor sends every client a duplicate of ONE open file description, so
-/// on the wire the read offset is SHARED, and a sequential read would leave it
-/// at end-of-file for whoever binds a keyboard next.
-///
-/// That does not bite today, and the reason is worth naming so nobody removes
-/// this thinking it does nothing: `Connection::take_fd` REOPENS the received
-/// descriptor through `/proc/self/fd/N`, which is a new description with its
-/// own offset. But that reopen exists for descriptor safety — it is what keeps
-/// this crate's confined syscall surface to one scoped allow — so a change
-/// there would be reviewed for that and not for what it does to a file offset.
-/// This is the guard §11 names, and the two are independent.
-///
-/// The size is already pinned by the caller's metadata check, so this asks
-/// for exactly that many bytes and treats a short answer as the file being
-/// something other than what was announced.
-fn read_keymap_bytes(file: &File, expected_size: usize) -> Result<Vec<u8>, String> {
-    let mut bytes = vec![0u8; expected_size];
-    let mut filled = 0usize;
-    while filled < expected_size {
-        let offset =
-            u64::try_from(filled).map_err(|_| "keymap read offset escaped u64".to_string())?;
-        let rest = bytes
-            .get_mut(filled..)
-            .ok_or_else(|| "keymap read bound escaped its buffer".to_string())?;
-        match file.read_at(rest, offset) {
-            Ok(0) => {
-                return Err(format!(
-                    "wl_keyboard keymap read {filled} bytes, expected {expected_size}"
-                ))
-            }
-            Ok(count) => filled = filled.saturating_add(count),
-            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
-            Err(error) => return Err(format!("read wl_keyboard keymap: {error}")),
-        }
-    }
-    // A file that GREW between the caller's `stat` and here is not the file
-    // whose size was announced, and the announced size is what was validated.
-    // One byte past the end, positioned like the rest, is what says so.
-    let mut past = [0u8; 1];
-    let end =
-        u64::try_from(expected_size).map_err(|_| "keymap end offset escaped u64".to_string())?;
-    loop {
-        match file.read_at(&mut past, end) {
-            Ok(0) => break,
-            Ok(_) => {
-                return Err(format!(
-                    "wl_keyboard keymap read {} bytes, expected {expected_size}",
-                    expected_size.saturating_add(1)
-                ))
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
-            Err(error) => return Err(format!("read wl_keyboard keymap: {error}")),
-        }
-    }
-    Ok(bytes)
-}
-
 fn present(
     mut connection: Connection,
     runtime_directory: &Path,
@@ -984,7 +893,7 @@ pub fn selftest() -> Result<(), String> {
 mod tests {
     use super::*;
     use crate::conn::{DISPLAY, MAX_PENDING_FDS};
-    use std::io::{Seek, SeekFrom};
+    use crate::keyboard::XKB_KEYMAP;
     use std::os::fd::IntoRawFd;
 
     fn test_connection(stream: UnixStream) -> Connection {
@@ -1292,41 +1201,6 @@ mod tests {
             .is_err());
     }
 
-    /// The read leaves the offset exactly where it found it, which is §11's
-    /// rule stated as the property rather than as a mechanism. Reading twice
-    /// is not enough on its own: an implementation that SEEKS to zero and then
-    /// reads sequentially answers twice and still leaves the description at
-    /// end-of-file for whoever holds it next.
-    ///
-    /// Nothing in td depends on this today — `sys::duplicate_received` reopens
-    /// a received descriptor through `/proc/self/fd/N`, so every client gets a
-    /// private offset and a sequential read would work anyway. That reopen is
-    /// the guard that is load-bearing; this is the one §11 names.
-    #[test]
-    fn reading_the_keymap_leaves_the_offset_alone() {
-        let expected = {
-            let mut bytes = XKB_KEYMAP.as_bytes().to_vec();
-            bytes.push(0);
-            bytes
-        };
-        let file = conn::backing_file(&std::env::temp_dir(), "td-ui-demo-test", &expected).unwrap();
-        let file = sys::duplicate_received(file.into_raw_fd()).unwrap();
-        // Somewhere that is neither the start nor the end, so neither a
-        // rewind nor a read-to-end can leave it looking untouched.
-        let parked = 3;
-        (&file).seek(SeekFrom::Start(parked)).unwrap();
-        for read in 0..2 {
-            let bytes = read_keymap_bytes(&file, expected.len())
-                .unwrap_or_else(|error| panic!("read {read} failed: {error}"));
-            assert_eq!(bytes, expected);
-            assert_eq!(
-                (&file).stream_position().unwrap(),
-                parked,
-                "read {read} moved the description's offset"
-            );
-        }
-    }
-
     #[test]
     fn keymap_rejects_format_and_announced_size_after_consuming_fd() {
         let mut expected = XKB_KEYMAP.as_bytes().to_vec();
@@ -1355,28 +1229,6 @@ mod tests {
             assert!(error.contains(expected_error));
             assert_eq!(connection.pending_fd_count(), 0);
         }
-    }
-
-    /// A file that SHRANK between the caller's `stat` and the read. The
-    /// helper's contract is that a short answer is the file being something
-    /// other than what was announced, and without this the arm that says so
-    /// can be a `break` returning a zero-padded buffer.
-    #[test]
-    fn a_keymap_shorter_than_announced_is_refused() {
-        let bytes = vec![7u8; 8];
-        let file = conn::backing_file(&std::env::temp_dir(), "td-ui-demo-test", &bytes).unwrap();
-        let file = sys::duplicate_received(file.into_raw_fd()).unwrap();
-        let error = read_keymap_bytes(&file, 16).unwrap_err();
-        assert!(error.contains("read 8 bytes, expected 16"), "{error}");
-    }
-
-    #[test]
-    fn keymap_read_is_bounded_against_growth_after_metadata() {
-        let bytes = vec![7u8; 17];
-        let file = conn::backing_file(&std::env::temp_dir(), "td-ui-demo-test", &bytes).unwrap();
-        let file = sys::duplicate_received(file.into_raw_fd()).unwrap();
-        let error = read_keymap_bytes(&file, 16).unwrap_err();
-        assert!(error.contains("read 17 bytes, expected 16"));
     }
 
     #[test]

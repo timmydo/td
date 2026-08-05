@@ -1,10 +1,10 @@
+use crate::MAX_HELD_KEYS;
 use std::collections::BTreeSet;
 use std::fmt::Write;
 
 const GLYPH_WIDTH: usize = 5;
 pub(crate) const GLYPH_HEIGHT: usize = 7;
 const GLYPH_ADVANCE: usize = 6;
-const MAX_HELD_KEYS: usize = 256;
 const MAX_HELD_BUTTONS: usize = 32;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

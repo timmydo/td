@@ -307,8 +307,21 @@ makes "the terminal modules — parser, model, renderer, keyboard, PTY policy
 that roster is an amendment here, as a new caller is, and `term_client.rs`
 is the first: the terminal's own Wayland client is a transport USER by
 construction. It is NOT a new caller — it names no `sys::` at all, and the
-descriptors it will eventually receive arrive through `Connection` — so the
-syscall roster above is unchanged by it.
+descriptors it receives arrive through `Connection` — so the syscall
+roster above is unchanged by it.
+
+"Eventually" is now: the terminal binds a `wl_seat`, creates a
+`wl_keyboard`, and RECEIVES its keymap descriptor, which §12 keeps inside
+the same transport boundary wl_shm submission is in. That is one more user
+of
+`recvmsg(2)`'s product and no new caller of it — the fd is claimed with
+`Connection::take_fd` and validated by `conn::verify_keymap`, both in
+the module the roster already names. Its TEST needed the other
+direction, a peer sending a descriptor, and that is why
+`conn::send_event_with_fd` exists rather than the test spelling
+`sys::send_with_fd` in `term_client.rs`: a test that named it would be a
+roster change, and the confinement scan refuses one — which is how this
+was caught rather than decided.
 
 A connection's READING half detaches: `Connection::detach_reader` hands a
 `Reader` to a thread, so a client whose main loop has a second source to

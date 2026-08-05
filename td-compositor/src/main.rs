@@ -35,6 +35,12 @@ use std::sync::{Arc, Mutex};
 
 const MAX_UI_DIMENSION: usize = 16_384;
 const MAX_UI_FRAME_BYTES: usize = 32 * 1024 * 1024;
+/// The most keys a `wl_keyboard.enter` may report as already held. One
+/// spelling for every client, for the reason `verify_keymap` is one function:
+/// a bound copied is a bound that stays agreed until exactly one copy moves.
+/// td's own server cannot legitimately reach it — `input.rs` caps its pressed
+/// set at `MAX_XKB_EVDEV_KEY` — so it bounds what another compositor claims.
+const MAX_HELD_KEYS: usize = 256;
 
 fn usage() -> String {
     "usage: td-compositor run --framebuffer PATH --input DIR --socket PATH \

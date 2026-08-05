@@ -1002,13 +1002,18 @@ td-term binds the compositor's keyboard and validates that the received
 keymap descriptor contains exactly the shared `keyboard::XKB_KEYMAP` string
 followed by its NUL terminator, matching the server's advertised size. A
 mismatch closes the client before child creation; running under another
-Wayland compositor is outside the first profile. The terminal translates the
-fixed evdev key codes and standard XKB modifier masks itself; it does not
-import libxkbcommon. A pinned in-tree table marks text and navigation keys
-repeatable and modifiers non-repeating, mirroring the exact keymap's repeat
-exclusions. Validation uses positioned `FileExt::read_at` calls so reading one
-SCM_RIGHTS duplicate cannot advance the shared open-file-description offset
-seen by a restarted or second client.
+Wayland compositor is outside the first profile. It binds the seat at
+version 5 through 7, as the demo does, because repeat_info is a version-4
+event and the timings below are read out of it rather than restated; a lower
+bind would make this section unimplementable and a higher one arrives at a
+client whose dispatch treats an unknown keyboard opcode as fatal. The
+terminal translates the fixed evdev key codes and standard XKB modifier
+masks itself; it does not import libxkbcommon. A pinned in-tree table marks
+text and navigation keys repeatable and modifiers non-repeating, mirroring
+the exact keymap's repeat exclusions. Validation uses positioned
+`FileExt::read_at` calls so reading one SCM_RIGHTS duplicate cannot advance
+the shared open-file-description offset seen by a restarted or second
+client.
 
 The input adapter covers text keys, Enter, Tab, Backspace, Escape, arrows,
 Home, End, PageUp, PageDown, Insert, Delete, and F1 through F12. It selects
@@ -1245,8 +1250,8 @@ When the compositor declines to choose a size, the terminal falls back to a
 grid rather than to a rectangle: 80 columns by 24 rows, multiplied out by the
 pinned font's cell, since that is what a terminfo entry and anything drawing a
 box assume when they cannot ask. Each axis declines independently. Its fixed
-object ids run densely to one past the last it creates, which is lower than
-the demo's because it binds no seat.
+object ids run densely to one past the last it creates, which is one lower
+than the demo's: it binds a seat and creates a keyboard, but no pointer.
 
 Safe `Command` cannot call `setsid(2)`, and `pre_exec` would introduce a second
 unsafe surface. The declared td-init input therefore extends `cttyhack` with
@@ -1329,30 +1334,41 @@ deadline bounds failure detection rather than ordering state transitions.
 
 td-term exposes a mode-0600 readiness socket and prints `TD-TERM-READY` with
 its rows and columns only after the exact tile-sized buffer receives both
-`wl_buffer.release` and its frame callback. Reaching that buffer takes TWO
-frames, and that is the protocol rather than a retry: the compositor cannot
-tile a surface it has not mapped, so its first configure is zero in both axes,
-presenting at the client's own fallback is what maps the surface, and the tile
-arrives in the configure that follows. Readiness is therefore a frame drawn at
-a size the compositor CHOSE, and choosing is per axis — zero is a declined
-axis, and a configure choosing one axis has chosen. An `ack_configure` takes
-effect on the surface commit that follows it, so a configure needing no new
-frame is applied with a bare `wl_surface.commit` rather than left
-acknowledged and unapplied; a chosen tile equal to the client's fallback is
-exactly that case. One encoder produces both the
-diagnostic and the socket's answer, since the integration test compares them
-and two spellings could drift while each stayed plausible. A readiness line is
-parsed fail-closed and order-pinned, and its grid is held to the same
-definition the winsize ioctl is: a line describing a grid no terminal could
-have been set to is not readiness. The terminal refuses to publish a grid its
-own probe would reject. td-svc's `ready=` command uses the
-existing credential-switch pattern to invoke
-`/bin/td-term probe /run/user/1000/td-term-ready` as the graphical user. The
-probe requires a ready state and nonzero internally consistent rows and
-columns; its output and the matching `TD-TERM-READY` QEMU diagnostic are
-compared in integration tests. The boot profile atomically replaces the
-visible `td-ui-demo` service and removes its final-image symlink when this proof
-is complete. The compositor and serial recovery greeter remain independently
+`wl_buffer.release` and its frame callback AND its seat still offers a
+keyboard AND its keymap is verified. The keyboard half is a precondition
+rather than a parallel errand: a terminal that started its shell before
+knowing what a key MEANS would take its first keystrokes against no map at
+all, so the same wait that makes readiness a frame the compositor chose
+makes it a frame it can be typed at. The seat is asked for its LATEST
+capability rather than the one that prompted the keymap request, since a
+seat may withdraw what it announced; td's own server announces keyboard and
+pointer once at bind and withdraws neither, so this bounds another
+compositor rather than describing a state this one reaches. It is a startup
+gate only — a capability withdrawn after readiness is not noticed, and
+noticing it needs somewhere to put a terminal that has lost its keyboard.
+Reaching that buffer takes TWO frames, and that is the protocol rather than
+a retry: the compositor cannot tile a surface it has not mapped, so its
+first configure is zero in both axes, presenting at the client's own
+fallback is what maps the surface, and the tile arrives in the configure
+that follows. Readiness is therefore a frame drawn at a size the compositor
+CHOSE, and choosing is per axis — zero is a declined axis, and a configure
+choosing one axis has chosen. An `ack_configure` takes effect on the surface
+commit that follows it, so a configure needing no new frame is applied with
+a bare `wl_surface.commit` rather than left acknowledged and unapplied; a
+chosen tile equal to the client's fallback is exactly that case. One encoder
+produces both the diagnostic and the socket's answer, since the integration
+test compares them and two spellings could drift while each stayed
+plausible. A readiness line is parsed fail-closed and order-pinned, and its
+grid is held to the same definition the winsize ioctl is: a line describing
+a grid no terminal could have been set to is not readiness. The terminal
+refuses to publish a grid its own probe would reject. td-svc's `ready=`
+command uses the existing credential-switch pattern to invoke `/bin/td-term
+probe /run/user/1000/td-term-ready` as the graphical user. The probe
+requires a ready state and nonzero internally consistent rows and columns;
+its output and the matching `TD-TERM-READY` QEMU diagnostic are compared in
+integration tests. The boot profile atomically replaces the visible
+`td-ui-demo` service and removes its final-image symlink when this proof is
+complete. The compositor and serial recovery greeter remain independently
 restartable.
 
 ## 13. Native terminal corpus

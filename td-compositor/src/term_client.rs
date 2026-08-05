@@ -8,14 +8,16 @@
 //! rendered here is empty.
 
 use crate::conn::{
-    self, Connection, Globals, COMPOSITOR, REGISTRY, SHM, SURFACE, XDG_SURFACE, XDG_TOPLEVEL,
-    XDG_WM_BASE,
+    self, Connection, Globals, COMPOSITOR, KEYBOARD, REGISTRY, SEAT, SHM, SURFACE, XDG_SURFACE,
+    XDG_TOPLEVEL, XDG_WM_BASE,
 };
 use crate::font::Font;
 use crate::pty::Pty;
 use crate::scene::SHM_XRGB8888;
 use crate::term::Terminal;
-use crate::{font, pty, ready, render, socket, wire, MAX_UI_DIMENSION, MAX_UI_FRAME_BYTES};
+use crate::{
+    font, pty, ready, render, socket, wire, MAX_HELD_KEYS, MAX_UI_DIMENSION, MAX_UI_FRAME_BYTES,
+};
 use std::collections::BTreeSet;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -42,11 +44,12 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(20);
 const PROC_STATUS: &str = "/proc/self/status";
 const ETC_PASSWD: &str = "/etc/passwd";
 
-/// One past the last fixed id the TERMINAL creates. It binds no seat and
-/// creates no keyboard or pointer, so its dynamic range starts three lower
-/// than the demo's — and starting where the demo does would SKIP those three,
-/// which Wayland forbids. See `conn`'s note.
-const FIRST_DYNAMIC_ID: u32 = XDG_TOPLEVEL + 1;
+/// One past the last fixed id the TERMINAL creates. It binds a seat and
+/// creates a keyboard, but no POINTER — it reads no motion and no buttons —
+/// so its dynamic range starts one lower than the demo's. Starting where the
+/// demo does would SKIP the pointer's id, which Wayland forbids. See `conn`'s
+/// note.
+const FIRST_DYNAMIC_ID: u32 = KEYBOARD + 1;
 
 /// What an operator sees in a title bar. td's own compositor parses and
 /// discards it; it is set because a client that names itself is easier to
@@ -99,6 +102,7 @@ struct Bound {
     compositor: u32,
     shm: u32,
     xdg_wm_base: u32,
+    seat: u32,
 }
 
 impl Bound {
@@ -107,20 +111,21 @@ impl Bound {
             _ if name == self.compositor => Some("wl_compositor"),
             _ if name == self.shm => Some("wl_shm"),
             _ if name == self.xdg_wm_base => Some("xdg_wm_base"),
+            _ if name == self.seat => Some("wl_seat"),
             _ => None,
         }
     }
 }
 
-/// Bind the three globals a terminal needs. No `wl_seat`: there is no
-/// keyboard to route yet, and binding one would mean fielding capability
-/// events for a device nothing reads.
+/// Bind the four globals a terminal needs. The `wl_seat` is one of them now:
+/// a keymap arrives through a keyboard, and a keyboard is a seat's to give.
 fn bind_globals(connection: &mut Connection) -> Result<Bound, String> {
     let globals = conn::discover_globals(connection)?;
     let (compositor_name, compositor_version) =
         Globals::require(globals.compositor(), "wl_compositor", 4, 4)?;
     let (shm_name, shm_version) = Globals::require(globals.shm(), "wl_shm", 1, 1)?;
     let (xdg_name, xdg_version) = Globals::require(globals.xdg_wm_base(), "xdg_wm_base", 1, 1)?;
+    let (seat_name, seat_version) = Globals::require(globals.seat(), "wl_seat", 5, 7)?;
     conn::bind(
         connection,
         compositor_name,
@@ -136,10 +141,12 @@ fn bind_globals(connection: &mut Connection) -> Result<Bound, String> {
         xdg_version,
         XDG_WM_BASE,
     )?;
+    conn::bind(connection, seat_name, "wl_seat", seat_version, SEAT)?;
     Ok(Bound {
         compositor: compositor_name,
         shm: shm_name,
         xdg_wm_base: xdg_name,
+        seat: seat_name,
     })
 }
 
@@ -148,6 +155,18 @@ fn bind_globals(connection: &mut Connection) -> Result<Bound, String> {
 /// the keyboard, so a wrong constant is a terminal whose cursor never claims
 /// focus — with nothing failing anywhere.
 const XDG_STATE_ACTIVATED: u32 = 4;
+
+/// `WL_SEAT_CAPABILITY_KEYBOARD`, pinned by value like every other protocol
+/// number here: a wrong bit is a terminal that never asks for a keyboard, or
+/// one that asks the moment a pointer appears.
+const SEAT_KEYBOARD: u32 = 2;
+
+/// `WL_KEYBOARD_KEY_STATE_RELEASED` and `_PRESSED`, the only two a version-1
+/// wl_keyboard may send. Checked rather than merely consumed because the
+/// next landing turns this word into a keystroke or the absence of one, and
+/// a third value would decide which by falling through.
+const KEY_RELEASED: u32 = 0;
+const KEY_PRESSED: u32 = 1;
 
 /// The frame in flight. §12 has readiness follow BOTH answers, because they
 /// mean different things: the release says the compositor is done reading the
@@ -216,6 +235,19 @@ struct Surface {
     /// the frame for the right SIZE and focus"; nothing in it can answer "is
     /// it for the right CONTENTS", because the contents are not a size.
     stale: bool,
+    /// The last capability word the seat announced, retained rather than
+    /// consumed: a seat may announce a keyboard and later withdraw it, and a
+    /// terminal whose seat has no keyboard is one nobody can type into
+    /// however well its keymap verified. `None` until the seat speaks, which
+    /// is also what stops an unsolicited keymap from standing in for one.
+    seat_capabilities: Option<u32>,
+    /// Whether `get_keyboard` has been sent. A seat may re-announce its
+    /// capabilities, and a second one into the same object id is a protocol
+    /// error rather than a second keyboard.
+    keyboard_requested: bool,
+    /// Whether the compositor's keymap has been received and matched against
+    /// td's pinned one. §11 makes this a precondition of the child starting.
+    keymap_verified: bool,
     live_buffers: BTreeSet<u32>,
     live_callbacks: BTreeSet<u32>,
     frame: Option<Frame>,
@@ -236,6 +268,9 @@ impl Surface {
             drawn: None,
             cells: None,
             stale: false,
+            seat_capabilities: None,
+            keyboard_requested: false,
+            keymap_verified: false,
             live_buffers: BTreeSet::new(),
             live_callbacks: BTreeSet::new(),
             frame: None,
@@ -315,6 +350,118 @@ impl Surface {
             self.needs_commit = true;
             return Ok(true);
         }
+        if message.object == SEAT {
+            let mut args = wire::Cursor::new(&message.payload);
+            match message.opcode {
+                // Capabilities. The keyboard is bound the FIRST time one is
+                // announced and never again: a seat may re-announce, and a
+                // second `get_keyboard` into the same id is a protocol error.
+                0 => {
+                    let capabilities = args.u32()?;
+                    args.finish()?;
+                    self.seat_capabilities = Some(capabilities);
+                    if capabilities & SEAT_KEYBOARD != 0 && !self.keyboard_requested {
+                        let mut keyboard = wire::Builder::new();
+                        keyboard.u32(KEYBOARD);
+                        connection.send(SEAT, 1, keyboard)?;
+                        self.keyboard_requested = true;
+                    }
+                }
+                // The seat's name, which nothing here reads.
+                1 => {
+                    args.string()?;
+                    args.finish()?;
+                }
+                _ => {
+                    return Err(format!(
+                        "unexpected wl_seat event opcode={}",
+                        message.opcode
+                    ))
+                }
+            }
+            return Ok(false);
+        }
+        if message.object == KEYBOARD {
+            let mut args = wire::Cursor::new(&message.payload);
+            match message.opcode {
+                0 => {
+                    let format = args.u32()?;
+                    let size = args.u32()?;
+                    args.finish()?;
+                    let file = connection.take_fd("wl_keyboard.keymap")?;
+                    conn::verify_keymap(&file, format, size)?;
+                    self.keymap_verified = true;
+                }
+                // Focus in and out. Parsed and otherwise ignored: this landing
+                // gets the terminal a VERIFIED keymap before its child starts,
+                // which is what §11 asks of it, and acting on keys is the next
+                // one. Parsed rather than skipped because every other arm here
+                // validates what it consumes, and a wl_keyboard that entered a
+                // surface this client does not own is a compositor confusing
+                // it with another client.
+                1 => {
+                    args.u32()?;
+                    let surface = args.u32()?;
+                    if surface != SURFACE {
+                        return Err(format!("wl_keyboard entered unexpected surface {surface}"));
+                    }
+                    let byte_count = usize::try_from(args.u32()?)
+                        .map_err(|_| "wl_keyboard key array size escaped usize".to_string())?;
+                    if !byte_count.is_multiple_of(4) || byte_count / 4 > MAX_HELD_KEYS {
+                        return Err(format!(
+                            "wl_keyboard key array has invalid length {byte_count}"
+                        ));
+                    }
+                    for _ in 0..byte_count / 4 {
+                        args.u32()?;
+                    }
+                    args.finish()?;
+                }
+                2 => {
+                    args.u32()?;
+                    let surface = args.u32()?;
+                    if surface != SURFACE {
+                        return Err(format!("wl_keyboard left unexpected surface {surface}"));
+                    }
+                    args.finish()?;
+                }
+                // key: serial, time, key, state.
+                3 => {
+                    for _ in 0..3 {
+                        args.u32()?;
+                    }
+                    match args.u32()? {
+                        KEY_RELEASED | KEY_PRESSED => {}
+                        state => return Err(format!("wl_keyboard key has invalid state {state}")),
+                    }
+                    args.finish()?;
+                }
+                // modifiers: serial and the four mask words.
+                4 => {
+                    for _ in 0..5 {
+                        args.u32()?;
+                    }
+                    args.finish()?;
+                }
+                // repeat_info: rate and delay, the version-4 event §11's
+                // repeat design reads its timings out of. Parsed and dropped
+                // like the rest until the landing that repeats a key; it has
+                // an arm at all because the catch-all below is fatal, so a
+                // seat bound high enough to send this must expect it.
+                5 => {
+                    args.i32()?;
+                    args.i32()?;
+                    args.finish()?;
+                }
+                _ => {
+                    return Err(format!(
+                        "unexpected wl_keyboard event opcode={}",
+                        message.opcode
+                    ))
+                }
+            }
+            return Ok(false);
+        }
         if self.live_buffers.contains(&message.object) && message.opcode == 0 {
             wire::Cursor::new(&message.payload).finish()?;
             self.live_buffers.remove(&message.object);
@@ -376,11 +523,37 @@ impl Surface {
         self.frame.as_ref().is_some_and(|frame| !frame.complete())
     }
 
-    /// Readiness, as §12 defines it: a frame the compositor has both released
-    /// and presented, drawn FOR what the surface now holds, at a size the
-    /// compositor chose. All three matter and the middle one is easy to lose
-    /// — a configure can arrive while a frame is in the air, and the frame
-    /// that comes back is then a picture of the wrong thing.
+    /// Everything that must be true before the terminal is a terminal: a
+    /// frame the compositor chose the size of, a seat that still offers a
+    /// keyboard, and a keymap matched against td's own. §11 makes the keymap
+    /// a precondition of CHILD CREATION — "a mismatch closes the client
+    /// before child creation" — and everything past this leads to a shell,
+    /// so a shell whose keyboard was never verified is one nobody should be
+    /// able to type into.
+    ///
+    /// A function rather than the loop's condition for the reason `ready` is
+    /// one: a condition written inline is a condition no test can hold to
+    /// one of its parts. All three are bounded by the same handshake
+    /// deadline, so a compositor that announces a seat and never sends a
+    /// keymap fails rather than hangs.
+    fn presented(&self) -> bool {
+        self.ready() && self.has_keyboard() && self.keymap_verified
+    }
+
+    /// Whether the seat's LATEST word still claims a keyboard. Asked here
+    /// rather than remembered from the request, because the two can differ:
+    /// a seat that announces a keyboard, has one taken, and then announces
+    /// none leaves `keyboard_requested` true and a verified keymap behind it.
+    fn has_keyboard(&self) -> bool {
+        self.seat_capabilities
+            .is_some_and(|capabilities| capabilities & SEAT_KEYBOARD != 0)
+    }
+
+    /// A frame the compositor has both released and presented, drawn FOR
+    /// what the surface now holds, at a size the compositor chose. All three
+    /// matter and the middle one is easy to lose — a configure can arrive
+    /// while a frame is in the air, and the frame that comes back is then a
+    /// picture of the wrong thing.
     fn ready(&self) -> bool {
         // `layout_configured` means a configure chose a size, so `wanted` is
         // `Some` here and the comparison cannot be two `None`s agreeing.
@@ -757,11 +930,16 @@ fn spawn_wayland_reader(
         .spawn(move || loop {
             match reader.next() {
                 Ok(message) => {
-                    // The terminal binds no seat and asks for no keymap, so
-                    // any descriptor is an event it has misread. `present`
-                    // makes the same check of the handshake; this is the rest
-                    // of the session, where an unclaimed one would otherwise
-                    // be held open until the process ended.
+                    // The ONE descriptor the terminal expects — its keymap —
+                    // is sent by td's server from `send_keyboard_initial`,
+                    // once, as the keyboard is registered, and a second
+                    // registration of that id is refused there. So it arrives
+                    // and is claimed during `present`, before the reading
+                    // half detaches. A compositor that re-sent one later
+                    // would be closed here rather than verified: §11 puts
+                    // other compositors outside this profile, and an
+                    // unclaimed descriptor would otherwise be held open until
+                    // the process ended.
                     let unclaimed = reader.pending_fd_count();
                     if unclaimed != 0 {
                         let _ = events.send(Event::Closed(format!(
@@ -1030,7 +1208,7 @@ fn present(
     // redraw differently from a resize — the only difference is that this
     // loop has somewhere to stop.
     let mut child = Child::default();
-    while !surface.ready() {
+    while !surface.presented() {
         serve_turn(
             connection,
             &mut surface,
@@ -1306,8 +1484,8 @@ mod tests {
     /// Wayland ids must be allocated DENSELY, and td's own server only checks
     /// uniqueness — so nothing at runtime would report a gap. What the
     /// terminal uses has to be exactly 1..FIRST_DYNAMIC_ID with nothing
-    /// skipped, and the demo's higher start would skip the three it does not
-    /// create.
+    /// skipped, and the demo's higher start would skip the pointer's id,
+    /// the one fixed object this client does not create.
     #[test]
     fn the_terminal_leaves_no_gap_before_its_first_dynamic_id() {
         let mut used = vec![
@@ -1320,6 +1498,8 @@ mod tests {
             SURFACE,
             XDG_SURFACE,
             XDG_TOPLEVEL,
+            SEAT,
+            KEYBOARD,
         ];
         used.sort_unstable();
         used.dedup();
@@ -1328,11 +1508,10 @@ mod tests {
             (1..FIRST_DYNAMIC_ID).collect::<Vec<u32>>(),
             "the terminal's fixed ids are not dense up to its dynamic range"
         );
-        // The three it deliberately does not create are the gap the demo's
-        // start would leave.
-        for absent in [SEAT, KEYBOARD, POINTER] {
-            assert!(absent >= FIRST_DYNAMIC_ID);
-        }
+        // The one it deliberately does not create is the gap the demo's start
+        // would leave. A const block, since both sides are constants and a
+        // build that cannot satisfy it should not produce a test binary.
+        const { assert!(POINTER >= FIRST_DYNAMIC_ID) };
     }
 
     /// The size arrives on one event and takes effect on another. A toplevel
@@ -1347,6 +1526,7 @@ mod tests {
             compositor: 1,
             shm: 2,
             xdg_wm_base: 4,
+            seat: 5,
         });
         let fallback = Size {
             width: 640,
@@ -1381,6 +1561,7 @@ mod tests {
             compositor: 1,
             shm: 2,
             xdg_wm_base: 4,
+            seat: 5,
         });
         let fallback = Size {
             width: 640,
@@ -1419,6 +1600,7 @@ mod tests {
             compositor: 1,
             shm: 2,
             xdg_wm_base: 4,
+            seat: 5,
         });
         let fallback = Size {
             width: 8,
@@ -1483,6 +1665,7 @@ mod tests {
             compositor: 1,
             shm: 2,
             xdg_wm_base: 4,
+            seat: 5,
         });
         let fallback = Size {
             width: 640,
@@ -1526,6 +1709,7 @@ mod tests {
             compositor: 1,
             shm: 2,
             xdg_wm_base: 4,
+            seat: 5,
         });
         let fallback = Size {
             width: 8,
@@ -1551,6 +1735,7 @@ mod tests {
             compositor: 1,
             shm: 2,
             xdg_wm_base: 4,
+            seat: 5,
         });
         let fallback = Size {
             width: 8,
@@ -1594,6 +1779,7 @@ mod tests {
             compositor: 1,
             shm: 2,
             xdg_wm_base: 4,
+            seat: 5,
         });
         let fallback = Size {
             width: 8,
@@ -1622,6 +1808,7 @@ mod tests {
             compositor: 1,
             shm: 2,
             xdg_wm_base: 4,
+            seat: 5,
         });
         let fallback = Size {
             width: 8,
@@ -1676,6 +1863,7 @@ mod tests {
             compositor: 1,
             shm: 2,
             xdg_wm_base: 4,
+            seat: 5,
         });
         let fallback = Size {
             width: 640,
@@ -1750,6 +1938,7 @@ mod tests {
             compositor: 1,
             shm: 2,
             xdg_wm_base: 4,
+            seat: 5,
         });
         let fallback = Size {
             width: 640,
@@ -1810,6 +1999,7 @@ mod tests {
                 compositor: 1,
                 shm: 2,
                 xdg_wm_base: 4,
+                seat: 5,
             });
             surface
                 .dispatch(
@@ -1834,6 +2024,7 @@ mod tests {
             compositor: 1,
             shm: 2,
             xdg_wm_base: 4,
+            seat: 5,
         });
         surface
             .dispatch(&mut connection, &toplevel_configure(0, 0), fallback)
@@ -1858,6 +2049,7 @@ mod tests {
             compositor: 1,
             shm: 2,
             xdg_wm_base: 4,
+            seat: 5,
         });
         let fallback = Size {
             width: 8,
@@ -1889,6 +2081,7 @@ mod tests {
             compositor: 1,
             shm: 2,
             xdg_wm_base: 4,
+            seat: 5,
         });
         let fallback = Size {
             width: 8,
@@ -1960,6 +2153,7 @@ mod tests {
             compositor: 1,
             shm: 2,
             xdg_wm_base: 4,
+            seat: 5,
         });
         surface.xrgb = true;
         let font = font();
@@ -2030,6 +2224,7 @@ mod tests {
             compositor: 1,
             shm: 2,
             xdg_wm_base: 4,
+            seat: 5,
         });
         let font = font();
         let palette = render::Palette::pinned();
@@ -2085,6 +2280,7 @@ mod tests {
             compositor: 1,
             shm: 2,
             xdg_wm_base: 4,
+            seat: 5,
         });
         surface.xrgb = true;
         let font = font();
@@ -2174,6 +2370,7 @@ mod tests {
             compositor: 1,
             shm: 2,
             xdg_wm_base: 4,
+            seat: 5,
         });
         surface.xrgb = true;
         let font = font();
@@ -2273,6 +2470,7 @@ mod tests {
             compositor: 1,
             shm: 2,
             xdg_wm_base: 4,
+            seat: 5,
         });
         surface.xrgb = true;
         let font = font();
@@ -2391,6 +2589,7 @@ mod tests {
             compositor: 1,
             shm: 2,
             xdg_wm_base: 4,
+            seat: 5,
         });
         let font = font();
         let palette = render::Palette::pinned();
@@ -2428,6 +2627,7 @@ mod tests {
             compositor: 1,
             shm: 2,
             xdg_wm_base: 4,
+            seat: 5,
         });
         surface.xrgb = true;
         let font = font();
@@ -2487,6 +2687,7 @@ mod tests {
             compositor: 1,
             shm: 2,
             xdg_wm_base: 4,
+            seat: 5,
         });
         let font = font();
         let palette = render::Palette::pinned();
@@ -2567,6 +2768,7 @@ mod tests {
             compositor: 1,
             shm: 2,
             xdg_wm_base: 4,
+            seat: 5,
         });
         surface.xrgb = true;
         let font = font();
@@ -2618,6 +2820,7 @@ mod tests {
             compositor: 1,
             shm: 2,
             xdg_wm_base: 4,
+            seat: 5,
         });
         surface.xrgb = true;
         let font = font();
@@ -2705,6 +2908,7 @@ mod tests {
             compositor: 1,
             shm: 2,
             xdg_wm_base: 4,
+            seat: 5,
         });
         surface.xrgb = true;
         let font = font();
@@ -2763,6 +2967,7 @@ mod tests {
             compositor: 1,
             shm: 2,
             xdg_wm_base: 4,
+            seat: 5,
         });
         surface.xrgb = true;
         let font = font();
@@ -2825,6 +3030,7 @@ mod tests {
             compositor: 1,
             shm: 2,
             xdg_wm_base: 4,
+            seat: 5,
         });
         surface.xrgb = true;
         let font = font();
@@ -2887,6 +3093,7 @@ mod tests {
             compositor: 1,
             shm: 2,
             xdg_wm_base: 4,
+            seat: 5,
         });
         surface.xrgb = true;
         let font = font();
@@ -2952,6 +3159,7 @@ mod tests {
             compositor: 1,
             shm: 2,
             xdg_wm_base: 4,
+            seat: 5,
         });
         surface.xrgb = true;
         let font = font();
@@ -3067,6 +3275,258 @@ mod tests {
         ));
     }
 
+    /// The seat's capabilities are what make the terminal ask for a keyboard,
+    /// and it asks exactly once. A seat may re-announce — a device arriving
+    /// makes it — and a second `get_keyboard` into the same object id is a
+    /// protocol error the compositor answers by closing the client.
+    #[test]
+    fn a_keyboard_is_requested_once_however_often_the_seat_announces_one() {
+        let (mut connection, mut peer) = pair();
+        let mut surface = Surface::new(Bound {
+            compositor: 1,
+            shm: 2,
+            xdg_wm_base: 4,
+            seat: 5,
+        });
+        let fallback = Size {
+            width: 8,
+            height: 8,
+        };
+        for _ in 0..3 {
+            let mut payload = Vec::new();
+            payload.extend_from_slice(&(SEAT_KEYBOARD | 1).to_ne_bytes());
+            surface
+                .dispatch(&mut connection, &message(SEAT, 0, payload), fallback)
+                .unwrap();
+        }
+        assert!(surface.keyboard_requested);
+        // wl_seat.get_keyboard, carrying the id the keyboard's events will
+        // arrive on.
+        let (object, opcode, payload) = said(&mut peer);
+        assert_eq!((object, opcode), (SEAT, 1));
+        assert_eq!(payload, KEYBOARD.to_ne_bytes());
+        // And nothing after it. `pair` sets a read timeout precisely so a
+        // second request is a failure here rather than a hang.
+        peer.set_read_timeout(Some(Duration::from_millis(200)))
+            .unwrap();
+        let mut spare = [0u8; 1];
+        assert!(
+            std::io::Read::read_exact(&mut peer, &mut spare).is_err(),
+            "the terminal asked for a second keyboard"
+        );
+    }
+
+    /// A seat with no keyboard is not asked for one. The bit is pinned by
+    /// value like every other protocol number here: read as 1 it would be the
+    /// POINTER capability, and the terminal would ask a seat that has no
+    /// keyboard for one and never ask a seat that does.
+    #[test]
+    fn a_seat_without_a_keyboard_is_not_asked_for_one() {
+        let (mut connection, _peer) = pair();
+        let mut surface = Surface::new(Bound {
+            compositor: 1,
+            shm: 2,
+            xdg_wm_base: 4,
+            seat: 5,
+        });
+        let fallback = Size {
+            width: 8,
+            height: 8,
+        };
+        // Pointer only, which is capability 1.
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&1u32.to_ne_bytes());
+        surface
+            .dispatch(&mut connection, &message(SEAT, 0, payload), fallback)
+            .unwrap();
+        assert!(!surface.keyboard_requested);
+    }
+
+    /// A frame is not enough. The terminal is not presented until its keymap
+    /// has been matched, because what follows is a child on a terminal.
+    #[test]
+    fn a_frame_without_a_verified_keymap_is_not_presented() {
+        let mut surface = Surface::new(Bound {
+            compositor: 1,
+            shm: 2,
+            xdg_wm_base: 4,
+            seat: 5,
+        });
+        surface.layout_configured = true;
+        surface.current = Some(Size {
+            width: 8,
+            height: 8,
+        });
+        surface.drawn = surface.wanted();
+        surface.frame = Some(frame(true, true));
+        surface.seat_capabilities = Some(SEAT_KEYBOARD);
+        assert!(surface.ready(), "the fixture is not frame-ready");
+        assert!(
+            !surface.presented(),
+            "a terminal with no verified keymap presented"
+        );
+        surface.keymap_verified = true;
+        assert!(surface.presented());
+    }
+
+    /// The other half of that gate. A keymap verified against a seat that no
+    /// longer offers a keyboard is a terminal nobody can type into, and the
+    /// seat is entitled to withdraw the capability it announced.
+    #[test]
+    fn a_seat_that_withdraws_its_keyboard_is_not_presented() {
+        let mut surface = Surface::new(Bound {
+            compositor: 1,
+            shm: 2,
+            xdg_wm_base: 4,
+            seat: 5,
+        });
+        surface.layout_configured = true;
+        surface.current = Some(Size {
+            width: 8,
+            height: 8,
+        });
+        surface.drawn = surface.wanted();
+        surface.frame = Some(frame(true, true));
+        surface.keymap_verified = true;
+        assert!(
+            !surface.presented(),
+            "a terminal presented before its seat said anything"
+        );
+        surface.seat_capabilities = Some(SEAT_KEYBOARD);
+        assert!(surface.presented(), "the fixture never became presentable");
+        surface.seat_capabilities = Some(0);
+        assert!(
+            !surface.presented(),
+            "a terminal whose seat withdrew its keyboard presented"
+        );
+    }
+
+    /// Focus in and out. The arms drop what they read, so nothing downstream
+    /// would notice their checks going missing — which is the whole reason
+    /// they are checked here. A foreign surface id is a compositor confusing
+    /// this client with another, and the held-key array is the one field a
+    /// compositor states the length of, so both bounds are pinned from either
+    /// side rather than by the constant they are read with.
+    #[test]
+    fn keyboard_focus_events_validate_their_surface_and_key_array() {
+        let (mut connection, _peer) = pair();
+        let mut surface = Surface::new(Bound {
+            compositor: 1,
+            shm: 2,
+            xdg_wm_base: 4,
+            seat: 5,
+        });
+        let fallback = Size {
+            width: 8,
+            height: 8,
+        };
+        let enter = |target: u32, keys: usize, misaligned: bool| {
+            let mut payload = Vec::new();
+            payload.extend_from_slice(&1u32.to_ne_bytes());
+            payload.extend_from_slice(&target.to_ne_bytes());
+            let bytes = keys * 4 + usize::from(misaligned);
+            payload.extend_from_slice(&(bytes as u32).to_ne_bytes());
+            payload.resize(payload.len() + bytes.next_multiple_of(4), 0);
+            message(KEYBOARD, 1, payload)
+        };
+        let leave = |target: u32| {
+            let mut payload = Vec::new();
+            payload.extend_from_slice(&1u32.to_ne_bytes());
+            payload.extend_from_slice(&target.to_ne_bytes());
+            message(KEYBOARD, 2, payload)
+        };
+        // 256 keys is the bound, so it is accepted and 257 is not: spelled in
+        // numbers, or the assertion moves with the constant it is checking.
+        for (event, want, what) in [
+            (enter(SURFACE, 0, false), true, "an empty enter"),
+            (enter(SURFACE, 256, false), true, "an enter at the bound"),
+            (enter(SURFACE, 257, false), false, "an enter over the bound"),
+            (enter(SURFACE, 1, true), false, "a misaligned key array"),
+            (enter(SURFACE + 1, 0, false), false, "an enter elsewhere"),
+            (leave(SURFACE), true, "a leave"),
+            (leave(SURFACE + 1), false, "a leave elsewhere"),
+        ] {
+            let result = surface.dispatch(&mut connection, &event, fallback);
+            assert_eq!(result.is_ok(), want, "{what} was misjudged: {result:?}");
+        }
+    }
+
+    /// A version-1 wl_keyboard has exactly two key states. A third is a
+    /// compositor this client cannot read, and the next landing would have
+    /// to guess whether it meant a keystroke.
+    #[test]
+    fn a_key_event_with_an_impossible_state_is_refused() {
+        let (mut connection, _peer) = pair();
+        let mut surface = Surface::new(Bound {
+            compositor: 1,
+            shm: 2,
+            xdg_wm_base: 4,
+            seat: 5,
+        });
+        let fallback = Size {
+            width: 8,
+            height: 8,
+        };
+        // Spelled in NUMBERS rather than through the constants they are read
+        // with, or the test compares each constant with itself.
+        for (state, want) in [(0u32, true), (1, true), (2, false)] {
+            let mut payload = Vec::new();
+            for word in [1, 2, 30, state] {
+                payload.extend_from_slice(&word.to_ne_bytes());
+            }
+            let result =
+                surface.dispatch(&mut connection, &message(KEYBOARD, 3, payload), fallback);
+            assert_eq!(result.is_ok(), want, "key state {state} was misjudged");
+            if !want {
+                let error = result.err().unwrap_or_default();
+                assert!(error.contains("invalid state 2"), "{error}");
+            }
+        }
+    }
+
+    /// A keymap that is not td's is refused, and refused where §11 wants it
+    /// refused: before anything downstream of presentation happens. The
+    /// compositor and the terminal are built from one pinned keymap, so a
+    /// different one is a compositor this terminal cannot read keys from.
+    #[test]
+    fn a_keymap_that_is_not_tds_is_refused() {
+        let mut wrong = crate::keyboard::XKB_KEYMAP.as_bytes().to_vec();
+        wrong.push(0);
+        let first = wrong.first().copied().unwrap_or(0);
+        if let Some(byte) = wrong.first_mut() {
+            *byte = first ^ 1;
+        }
+        let (mut connection, peer) = pair();
+        let mut surface = Surface::new(Bound {
+            compositor: 1,
+            shm: 2,
+            xdg_wm_base: 4,
+            seat: 5,
+        });
+        let fallback = Size {
+            width: 8,
+            height: 8,
+        };
+        let file = conn::backing_file(&std::env::temp_dir(), "td-term-test", &wrong).unwrap();
+        let mut keymap = wire::Builder::new();
+        keymap.u32(1);
+        keymap.u32(u32::try_from(wrong.len()).unwrap());
+        let bytes = keymap.message(KEYBOARD, 0).unwrap();
+        conn::send_event_with_fd(&peer, &bytes, &file).unwrap();
+        let received = connection.next().unwrap();
+        let error = surface
+            .dispatch(&mut connection, &received, fallback)
+            .err()
+            .unwrap();
+        assert!(error.contains("differs from td's pinned keymap"), "{error}");
+        assert!(!surface.keymap_verified);
+        assert_eq!(
+            connection.pending_fd_count(),
+            0,
+            "a refused keymap left its descriptor unclaimed"
+        );
+    }
+
     /// A child that is this test binary, running the ignored fixture below.
     /// `current_exe` rather than `/bin/sh` for `pty.rs`'s reason: the gate's
     /// shell is not td's, and a test that depended on one would be testing the
@@ -3129,6 +3589,7 @@ mod tests {
             compositor: 1,
             shm: 2,
             xdg_wm_base: 4,
+            seat: 5,
         });
         surface.xrgb = true;
         let font = font();
@@ -3241,6 +3702,7 @@ mod tests {
             compositor: 1,
             shm: 2,
             xdg_wm_base: 4,
+            seat: 5,
         });
         let font = font();
         let palette = render::Palette::pinned();
