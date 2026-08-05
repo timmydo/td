@@ -4,12 +4,13 @@
 //! — is pure and tested without a device. Only `Pty` itself touches the kernel,
 //! and it does so through the four reviewed `ioctl(2)` requests in `sys.rs`.
 //!
-//! The device half has no production caller yet: the Wayland client that
-//! composes it needs the renderer, which waits on the pinned font asset. Host
-//! tests drive every item against a real PTY, and `selftest` covers the policy
-//! layer inside the packaged binary, where devpts may not be mounted. Each such
-//! item carries its own `dead_code` allow rather than the module carrying one,
-//! so anything left over after the client lands is still visible.
+//! `term_client::run` opens a `Pty` and sizes it to the grid the compositor
+//! chose, so the readiness line names a grid something was actually set to.
+//! The CHILD half — the slave, the reader, the writer, the waiter — has no
+//! production caller yet. Host tests drive every item against a real PTY, and
+//! `selftest` covers the policy layer inside the packaged binary, where devpts
+//! may not be mounted. Each item still unwired carries its own `dead_code`
+//! allow rather than the module carrying one, so what is left is visible.
 
 use crate::sys;
 use std::ffi::OsString;
@@ -30,8 +31,6 @@ const O_NOCTTY: i32 = 0o400;
 /// The kernel's hangup once the last slave descriptor is gone.
 const EIO: i32 = 5;
 
-/// Awaiting the Wayland client that composes this adapter.
-#[allow(dead_code)]
 pub const DEV_PTMX: &str = "/dev/ptmx";
 
 /// The declared td-init input that gives the child a session and a controlling
@@ -62,12 +61,10 @@ pub struct Account {
 }
 
 /// An open PTY master whose slave has been unlocked but not yet handed out.
-#[allow(dead_code)]
 pub struct Pty {
     master: File,
 }
 
-#[allow(dead_code)]
 impl Pty {
     pub fn open(ptmx: &Path) -> Result<Pty, String> {
         let master = OpenOptions::new()
@@ -80,17 +77,29 @@ impl Pty {
         Ok(Pty { master })
     }
 
+    #[allow(dead_code)]
     pub fn master(&self) -> &File {
         &self.master
     }
 
+    #[allow(dead_code)]
     pub fn into_master(self) -> File {
         self.master
     }
 
     /// The slave, obtained from the master rather than by name.
+    #[allow(dead_code)]
     pub fn peer(&self) -> Result<File, String> {
         sys::pty_peer(&self.master)
+    }
+
+    /// What the terminal currently IS, asked fresh. `resize` verifies its own
+    /// write, so nothing in production needs this yet; it exists so a caller
+    /// that was NOT the one to set the size can ask — which today is the
+    /// integration test, and with resize handling will be the client.
+    #[allow(dead_code)]
+    pub fn window(&self) -> Result<sys::WindowSize, String> {
+        sys::window_size(&self.master)
     }
 
     /// Publish a grid size and verify it before anything may observe it. An

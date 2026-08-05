@@ -803,16 +803,29 @@ fn syscall3(number: usize, a1: usize, a2: usize, a3: usize) -> isize {
                 "a protocol endpoint reached {operation}"
             );
         }
-        // `set_window_size` is generic over `AsRawFd`, so inside pty.rs it
-        // would type-check against any terminal — including an operator's.
-        // `Pty::resize` is the only caller, and it is the one that verifies
-        // what it published.
+        // Both wrappers are generic over `AsRawFd`, so inside pty.rs they
+        // would type-check against ANY terminal — including an operator's.
         let production_pty = pty
             .split_once("\n#[cfg(test)]")
             .map_or(pty, |(source, _)| source);
+        // The IDENTIFIER count is the load-bearing one, and it is what the
+        // spelling assertions below are not: a call written with a space, or
+        // taken as a function pointer and called through that, satisfies
+        // every `sys::window_size(&self.master)` match while reaching the
+        // kernel with a descriptor nobody checked. It bounds every reach
+        // because the glob-and-alias scan above already requires each to be
+        // spelled `sys::<wrapper>`. Three: one in `set_window_size`, two in
+        // `window_size` — the setter's caller is `Pty::resize`, which
+        // verifies what it published, and the getter's two are that same
+        // readback and the accessor for something that did NOT set the size.
+        assert_eq!(occurrences(production_pty, "window_size"), 3);
         assert_eq!(occurrences(production_pty, "sys::set_window_size("), 1);
-        assert_eq!(occurrences(production_pty, "sys::window_size("), 1);
         assert!(production_pty.contains("sys::set_window_size(&self.master, requested)?;"));
+        assert_eq!(occurrences(production_pty, "sys::window_size("), 2);
+        assert_eq!(
+            occurrences(production_pty, "sys::window_size(&self.master)"),
+            2
+        );
         assert!(production_pty.contains("let observed = sys::window_size(&self.master)?;"));
     }
 

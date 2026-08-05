@@ -12,6 +12,7 @@ use crate::conn::{
     XDG_WM_BASE,
 };
 use crate::font::Font;
+use crate::pty::Pty;
 use crate::scene::SHM_XRGB8888;
 use crate::term::Terminal;
 use crate::{font, pty, ready, render, wire, MAX_UI_DIMENSION, MAX_UI_FRAME_BYTES};
@@ -562,13 +563,36 @@ fn present(
     Ok((surface, size, (rows, columns)))
 }
 
+/// Everything that must hold before readiness may be published: a presented
+/// frame at a size the compositor chose, and a PTY the kernel agrees is that
+/// size. §12 is explicit that the readiness line names a grid the terminal
+/// was actually SET to — a line describing a grid no terminal could have
+/// taken is not readiness — so the grid returned here is the one read back
+/// out of the kernel and not the one computed from the tile.
+fn prepare(
+    connection: &mut Connection,
+    directory: &Path,
+    font: &Font,
+    palette: &render::Palette,
+    ptmx: &Path,
+) -> Result<(Surface, Pty, Size, (u16, u16)), String> {
+    // Before the first frame rather than after it: a machine whose devpts is
+    // missing or misconfigured should fail without having drawn a window,
+    // and nothing about the size is needed to open one.
+    let pty = Pty::open(ptmx)?;
+    let (surface, size, (rows, columns)) = present(connection, directory, font, palette)?;
+    let window = pty.resize(usize::from(rows), usize::from(columns))?;
+    Ok((surface, pty, size, (window.rows, window.columns)))
+}
+
 /// The same sequence over an already-open stream, which is the only way to
 /// drive it against the real server without a socket on disk.
 #[cfg(test)]
-pub fn present_for_test(
+pub fn prepare_for_test(
     stream: std::os::unix::net::UnixStream,
     directory: &Path,
-) -> Result<(Connection, Size, (u16, u16)), String> {
+    ptmx: &Path,
+) -> Result<(Connection, Pty, Size, (u16, u16)), String> {
     let font = font::pinned()?;
     let palette = render::Palette::pinned();
     let deadline = Instant::now()
@@ -576,8 +600,8 @@ pub fn present_for_test(
         .ok_or_else(|| "could not bound the terminal's Wayland handshake".to_string())?;
     let mut connection = Connection::over(stream, Some(deadline), FIRST_DYNAMIC_ID);
     connection.set_read_timeout(Some(HANDSHAKE_TIMEOUT))?;
-    let (_surface, size, cells) = present(&mut connection, directory, &font, &palette)?;
-    Ok((connection, size, cells))
+    let (_surface, pty, size, cells) = prepare(&mut connection, directory, &font, &palette, ptmx)?;
+    Ok((connection, pty, size, cells))
 }
 
 pub fn run(options: &Options) -> Result<(), String> {
@@ -592,8 +616,17 @@ pub fn run(options: &Options) -> Result<(), String> {
         .checked_add(HANDSHAKE_TIMEOUT)
         .ok_or_else(|| "could not bound the terminal's Wayland handshake".to_string())?;
     let mut connection = Connection::connect(&options.socket, deadline, FIRST_DYNAMIC_ID)?;
-    let (mut surface, _size, (rows, columns)) =
-        present(&mut connection, runtime_directory, &font, &palette)?;
+    // `_pty` rather than `_`: an underscore-PREFIXED binding lives to the end
+    // of the scope, and this one has to. The slave the child will be given is
+    // allocated from this master, so dropping it would close the terminal the
+    // published grid describes.
+    let (mut surface, _pty, _size, (rows, columns)) = prepare(
+        &mut connection,
+        runtime_directory,
+        &font,
+        &palette,
+        Path::new(pty::DEV_PTMX),
+    )?;
     connection.finish_handshake()?;
 
     let _ready = ready::publish(&options.ready_socket, rows, columns)?;
@@ -1337,6 +1370,33 @@ mod tests {
                 "{width}x{height} was accepted"
             );
         }
+    }
+
+    /// The PTY is opened BEFORE the first frame, so a machine that cannot
+    /// provide one fails without having drawn a window. The peer is dropped
+    /// here, so the Wayland side fails immediately too — which is what makes
+    /// the assertion about WHICH failure is reported a test of the order
+    /// rather than of a timeout.
+    #[test]
+    fn a_pty_that_cannot_be_opened_is_refused_before_the_first_frame() {
+        let (ours, theirs) = UnixStream::pair().unwrap();
+        drop(theirs);
+        let font = font();
+        let palette = render::Palette::pinned();
+        let mut connection = Connection::over(ours, None, FIRST_DYNAMIC_ID);
+        let refused = prepare(
+            &mut connection,
+            &std::env::temp_dir(),
+            &font,
+            &palette,
+            Path::new("/nonexistent/td-term-ptmx"),
+        )
+        .err()
+        .unwrap();
+        assert!(
+            refused.contains("/nonexistent/td-term-ptmx"),
+            "the terminal reached Wayland before it had a terminal: {refused}"
+        );
     }
 
     #[test]

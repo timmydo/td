@@ -4220,7 +4220,7 @@ mod tests {
     /// and swapping the frame back behind readiness makes it the fallback
     /// again.
     #[test]
-    fn td_term_presents_a_frame_and_takes_the_grid_the_compositor_gave_it() {
+    fn td_term_presents_a_frame_and_sizes_a_pty_to_the_grid_it_was_given() {
         let stem = format!(
             "td-term-integration-{}-{}",
             std::process::id(),
@@ -4235,8 +4235,12 @@ mod tests {
         let keymap = test_keymap();
         let worker = thread::spawn(move || serve_client(server, 78, thread_runtime, keymap));
 
-        let (connection, size, cells) =
-            crate::term_client::present_for_test(client, &std::env::temp_dir()).unwrap();
+        let (connection, pty, size, cells) = crate::term_client::prepare_for_test(
+            client,
+            &std::env::temp_dir(),
+            std::path::Path::new(crate::pty::DEV_PTMX),
+        )
+        .unwrap();
         let font = crate::font::pinned().unwrap();
 
         // The tile this output gives one surface, not the client's own guess.
@@ -4261,6 +4265,19 @@ mod tests {
             crate::term_client::grid(crate::term_client::default_size(&font).unwrap(), &font)
                 .unwrap(),
             "the terminal announced its fallback grid rather than the tile's"
+        );
+        // The whole chain in one assertion: the compositor's tile became a
+        // grid, that grid was published to a real terminal, and the kernel —
+        // asked again, independently of the readback `resize` already did —
+        // says the terminal IS that size. §12 requires the readiness line to
+        // name a grid something was actually set to; this is what makes that
+        // more than a claim about arithmetic.
+        let window = pty.window().unwrap();
+        assert_eq!((window.rows, window.columns), cells);
+        assert_eq!((window.rows, window.columns), (22, 74));
+        assert_eq!(
+            crate::ready::marker(window.rows, window.columns),
+            "TD-TERM-READY rows=22 columns=74\n"
         );
         // A frame that was released and presented is a frame that reached the
         // framebuffer. Compared against the DESKTOP BACKGROUND, which is what
