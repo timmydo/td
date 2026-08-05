@@ -201,6 +201,10 @@ impl Scene {
         self.layout.apply(command);
     }
 
+    pub fn focus_key(&mut self, key: SurfaceKey) -> bool {
+        self.layout.focus_key(key)
+    }
+
     pub fn launcher(&mut self, action: LauncherAction) -> Option<LaunchRequest> {
         self.launcher.apply(action)
     }

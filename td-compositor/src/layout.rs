@@ -247,6 +247,33 @@ impl Layout {
             .and_then(|workspace| workspace.focused)
     }
 
+    /// Point focus at a surface by IDENTITY rather than by direction, which
+    /// is what a click means. Answers whether focus moved, so a caller can
+    /// skip the repaint a click on the already-focused tile does not owe.
+    pub fn focus_key(&mut self, key: SurfaceKey) -> bool {
+        let Some(workspace) = self.workspaces.get_mut(&self.active) else {
+            return false;
+        };
+        if workspace.focused == Some(key) {
+            return false;
+        }
+        // Only a leaf of the ACTIVE workspace, and under fullscreen only the
+        // fullscreen leaf: focusing anything else would leave the pointer on
+        // one surface and the keyboard on another the operator cannot see.
+        if !workspace
+            .root
+            .as_ref()
+            .is_some_and(|root| root.contains(key))
+        {
+            return false;
+        }
+        if workspace.fullscreen.is_some_and(|full| full != key) {
+            return false;
+        }
+        workspace.focused = Some(key);
+        true
+    }
+
     pub fn contains(&self, key: SurfaceKey) -> bool {
         self.workspaces.values().any(|workspace| {
             workspace
@@ -749,6 +776,41 @@ mod tests {
                 }
             ]
         );
+        layout.check_invariants().unwrap();
+    }
+
+    #[test]
+    fn focus_key_takes_a_visible_leaf_and_refuses_everything_else() {
+        let mut layout = Layout::new();
+        layout.map(key(1));
+        layout.apply(Command::SetSplit(Axis::Vertical));
+        layout.map(key(2));
+        assert_eq!(layout.focused(), Some(key(2)));
+
+        assert!(layout.focus_key(key(1)));
+        assert_eq!(layout.focused(), Some(key(1)));
+        // Already focused: no move, so a caller owes no repaint.
+        assert!(!layout.focus_key(key(1)));
+        // Never mapped.
+        assert!(!layout.focus_key(key(99)));
+        assert_eq!(layout.focused(), Some(key(1)));
+
+        // A leaf of ANOTHER workspace is not focusable from this one: the
+        // keyboard would go somewhere the screen does not show.
+        layout.apply(Command::SwitchWorkspace(2));
+        layout.map(key(3));
+        assert!(!layout.focus_key(key(1)));
+        assert_eq!(layout.focused(), Some(key(3)));
+        layout.apply(Command::SwitchWorkspace(1));
+        assert!(!layout.focus_key(key(3)));
+
+        // Fullscreen hides its siblings, so only the fullscreen leaf takes.
+        layout.apply(Command::ToggleFullscreen);
+        assert!(!layout.focus_key(key(2)));
+        assert_eq!(layout.focused(), Some(key(1)));
+        layout.apply(Command::ToggleFullscreen);
+        assert!(layout.focus_key(key(2)));
+        assert_eq!(layout.focused(), Some(key(2)));
         layout.check_invariants().unwrap();
     }
 

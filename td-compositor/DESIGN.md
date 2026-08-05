@@ -406,13 +406,49 @@ reports from two devices cannot reorder a replacement press behind the last
 release. A press starts Wayland's implicit grab: motion and further buttons
 continue to the pressed surface until every button is released. If another
 press follows the last release in the same frame, focus first reconciles with
-the surface under the cursor and the new grab starts there. Removing or hiding
-the grabbed surface cancels the grab and reconciles focus without leaving a
-stale surface reference. Partial button or motion records are discarded on
-`SYN_DROPPED`; delivered button state is tracked separately so recovery
-releases only buttons the client had actually seen. A report retains at most
-64 button transitions; crossing that limit performs the same fail-closed
-release and resynchronization through the next `SYN_REPORT`. Hiding or
+the surface under the cursor and the new grab starts there.
+
+That same press is what moves KEYBOARD focus: this compositor is
+click-to-focus, not focus-follows-mouse. Hovering delivers motion and changes
+nothing else, which is what keeps a tile's focus from flickering as the
+pointer crosses it on the way somewhere. The surface focused is the one the
+press ESTABLISHED its grab on — the same surface the button event was routed
+to, so keyboard focus cannot disagree with delivery — and only a press that
+starts a grab counts, so a second button pressed mid-drag does not drag focus
+along with the pointer, and a held grab does not re-assert its focus against a
+`Super+arrow` issued while the button is down. A press over the gap between
+tiles focuses nothing rather than unfocusing: it is a click on the desktop.
+
+The pointer model REPORTS that surface from the one place it assigns a grab,
+rather than the runtime inferring it by comparing the grab before and after
+the frame. The two are not the same predicate, and the paragraph above says
+why: a frame carrying a release and then a press retargets the grab, so the
+comparison sees `Some` on both sides and misses a press that WAS delivered
+elsewhere; a press and its release together end with no grab at all, which the
+comparison cannot tell from a frame with no press in it. Both shapes are
+reachable — a mouse reports its whole button bitmap per poll, so rolling from
+one button to another arrives as one report — and the failure is silent: the
+button goes to the tile under the cursor and the keyboard stays behind. Within
+one report every establishing press names the same surface anyway, since a
+press establishes only while no grab is held and focus is the hovered surface
+whenever none is.
+
+`Layout::focus_key` then refuses any surface that is not a leaf of the ACTIVE
+workspace, and under fullscreen refuses everything but the fullscreen leaf, so
+no click can put the keyboard somewhere the screen does not show. A modal
+launcher filters presses out before any of this, so nothing is established and
+the overlay keeps focus while it is up. A focusing click repaints
+synchronously, which settles any paint the same report's motion deferred; and
+because it can fail as any other paint can, a click can now end the evdev
+reader where only keys and commands could before.
+
+Removing or hiding the grabbed surface cancels the grab and reconciles focus
+without leaving a stale surface reference. Partial button or motion records
+are discarded on `SYN_DROPPED`; delivered button state is tracked separately
+so recovery releases only buttons the client had actually seen. A report
+retains at most 64 button transitions; crossing that limit performs the same
+fail-closed release and resynchronization through the next `SYN_REPORT`.
+Hiding or
 destroying a grabbed surface instead cancels its delivered state and sends
 leave, because an unmapped surface is no longer a valid button target.
 
@@ -612,6 +648,13 @@ The landing must prove:
 - pointer model tests cover enter, leave, motion, cross-client routing,
   duplicate buttons, mid-frame re-grabs, implicit grabs, surface removal,
   workspace cancellation, snapshots, and revision exhaustion;
+- click-to-focus is proved end to end through the runtime — hovering does
+  not focus, a press does, a press over the gap does not, a mid-drag press
+  does not follow the pointer, a release-and-press in one report focuses
+  where the press landed, a press behind the modal launcher focuses nothing,
+  and a held grab does not undo a keyboard focus command — with the pointer
+  model's press report and `Layout::focus_key`'s refusals tested on their
+  own, each positive case carrying a control that the same click DOES focus;
 - scene tests prove pointer hit testing excludes gaps and clipped-away
   pixels while retaining local coordinates for an implicit grab, and server
   tests pin per-region and aggregate retained-operation ceilings;

@@ -343,12 +343,38 @@ impl Runtime {
         } else {
             buttons
         };
-        let frames = self.pointer.frame(time, hover, grab, buttons)?;
-        self.publish_pointer(frames);
+        let result = self.pointer.frame(time, hover, grab, buttons)?;
+        self.publish_pointer(result.frames);
         if dx != 0 || dy != 0 {
             // Coalesced by the caller: a reader batch that carries many reports
-            // owes one paint, not one per report.
+            // owes one paint, not one per report. Before the focus below, so a
+            // focusing repaint settles this debt instead of being followed by
+            // a second paint of the identical scene.
             self.defer_repaint();
+        }
+        // Click to focus. The pointer model reports the surface a press
+        // ESTABLISHED a grab on, which is by construction the one the button
+        // event was routed to, so focus cannot disagree with delivery; and a
+        // press made DURING a grab establishes nothing, so dragging off a tile
+        // does not take focus with it. A modal launcher filters presses out
+        // above, so nothing is established and the overlay keeps focus.
+        if let Some(clicked) = result.pressed_on {
+            self.focus_surface(clicked)?;
+        }
+        Ok(())
+    }
+
+    fn focus_surface(&mut self, key: SurfaceKey) -> Result<(), String> {
+        if !self.scene.focus_key(key) {
+            return Ok(());
+        }
+        // No `framebuffer.resend()` here, unlike a tiling command: that one is
+        // the repair gesture for pixels the compositor did not write, and a
+        // click is not reached for when the screen looks wrong.
+        self.repaint()?;
+        self.refresh_focus()?;
+        if self.refresh_layout()? {
+            self.publish_layout();
         }
         Ok(())
     }
@@ -1155,6 +1181,318 @@ mod tests {
         second_stop.stop();
         runtime.unsubscribe_keyboard(1);
         runtime.unsubscribe_keyboard(2);
+    }
+
+    #[test]
+    fn a_press_focuses_the_surface_under_the_pointer() {
+        let path = std::env::temp_dir().join(format!(
+            "td-runtime-click-focus-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let cleanup = Cleanup(path);
+        let framebuffer = Framebuffer::test_file(&cleanup.0, 240, 120, 240 * 4).unwrap();
+        let mut runtime = Runtime::new(framebuffer);
+        let first = SurfaceKey {
+            client: 1,
+            object: 10,
+        };
+        let second = SurfaceKey {
+            client: 2,
+            object: 20,
+        };
+        runtime.commit(first, surface([1, 2, 3, 0])).unwrap();
+        runtime.commit(second, surface([4, 5, 6, 0])).unwrap();
+        // Mapping focuses the newest, so the click has somewhere to move to.
+        assert_eq!(runtime.keyboard_snapshot().focus, Some(second));
+        let layout = runtime.layout_snapshot();
+        let rect = layout.get(&first).unwrap().rect;
+
+        // Fresh per frame: an input's `time` rides through to the client, so
+        // reusing one in a later frame would send a stale timestamp.
+        let press = |time| PointerButtonInput {
+            time,
+            button: 272,
+            state: PointerButtonState::Pressed,
+        };
+        let release = |time| PointerButtonInput {
+            time,
+            button: 272,
+            state: PointerButtonState::Released,
+        };
+        // Hovering alone is not focusing: this compositor is click-to-focus.
+        runtime
+            .pointer_frame(
+                1,
+                i32::try_from(rect.x.saturating_add(2)).unwrap(),
+                i32::try_from(rect.y.saturating_add(2)).unwrap(),
+                &[],
+            )
+            .unwrap();
+        assert_eq!(runtime.keyboard_snapshot().focus, Some(second));
+
+        runtime.pointer_frame(2, 0, 0, &[press(2)]).unwrap();
+        assert_eq!(runtime.keyboard_snapshot().focus, Some(first));
+
+        // A second press on the same tile changes nothing, and a press made
+        // while a grab is HELD does not follow the pointer off the tile.
+        runtime.pointer_frame(3, 0, 0, &[release(3)]).unwrap();
+        runtime.pointer_frame(4, 0, 0, &[press(4)]).unwrap();
+        assert_eq!(runtime.keyboard_snapshot().focus, Some(first));
+        let dx = i32::try_from(layout.get(&second).unwrap().rect.x)
+            .unwrap()
+            .saturating_sub(i32::try_from(rect.x.saturating_add(2)).unwrap())
+            .saturating_add(2);
+        runtime.pointer_frame(5, dx, 0, &[]).unwrap();
+        let second_press = PointerButtonInput {
+            time: 6,
+            button: 273,
+            state: PointerButtonState::Pressed,
+        };
+        runtime.pointer_frame(6, 0, 0, &[second_press]).unwrap();
+        assert_eq!(runtime.keyboard_snapshot().focus, Some(first));
+
+        // Grab over: now the pointer is on the other tile and a press takes.
+        runtime.pointer_frame(7, 0, 0, &[release(7)]).unwrap();
+        runtime
+            .pointer_frame(
+                8,
+                0,
+                0,
+                &[PointerButtonInput {
+                    time: 8,
+                    button: 273,
+                    state: PointerButtonState::Released,
+                }],
+            )
+            .unwrap();
+        runtime.pointer_frame(9, 0, 0, &[press(9)]).unwrap();
+        assert_eq!(runtime.keyboard_snapshot().focus, Some(second));
+
+        // A HELD grab must not keep re-asserting its focus, or the keyboard
+        // could never move it while a button is down: `Super+Left` here would
+        // be undone by the next twitch of the mouse.
+        runtime.command(Command::Focus(Direction::Left)).unwrap();
+        assert_eq!(runtime.keyboard_snapshot().focus, Some(first));
+        runtime.pointer_frame(10, 1, 0, &[]).unwrap();
+        assert_eq!(runtime.keyboard_snapshot().focus, Some(first));
+    }
+
+    #[test]
+    fn a_release_and_press_in_one_report_focuses_where_the_press_landed() {
+        let path = std::env::temp_dir().join(format!(
+            "td-runtime-click-focus-retarget-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let cleanup = Cleanup(path);
+        let framebuffer = Framebuffer::test_file(&cleanup.0, 240, 120, 240 * 4).unwrap();
+        let mut runtime = Runtime::new(framebuffer);
+        let first = SurfaceKey {
+            client: 1,
+            object: 10,
+        };
+        let second = SurfaceKey {
+            client: 2,
+            object: 20,
+        };
+        runtime.commit(first, surface([1, 2, 3, 0])).unwrap();
+        runtime.commit(second, surface([4, 5, 6, 0])).unwrap();
+        let layout = runtime.layout_snapshot();
+        let first_rect = layout.get(&first).unwrap().rect;
+        let second_rect = layout.get(&second).unwrap().rect;
+
+        // Press on the left tile, then drag onto the right one holding it.
+        runtime
+            .pointer_frame(
+                1,
+                i32::try_from(first_rect.x.saturating_add(2)).unwrap(),
+                i32::try_from(first_rect.y.saturating_add(2)).unwrap(),
+                &[],
+            )
+            .unwrap();
+        runtime
+            .pointer_frame(
+                2,
+                0,
+                0,
+                &[PointerButtonInput {
+                    time: 2,
+                    button: 272,
+                    state: PointerButtonState::Pressed,
+                }],
+            )
+            .unwrap();
+        assert_eq!(runtime.keyboard_snapshot().focus, Some(first));
+        let dx = i32::try_from(second_rect.x)
+            .unwrap()
+            .saturating_sub(i32::try_from(first_rect.x.saturating_add(2)).unwrap())
+            .saturating_add(2);
+        runtime.pointer_frame(3, dx, 0, &[]).unwrap();
+        assert_eq!(runtime.keyboard_snapshot().focus, Some(first));
+
+        // Rolling from one button to the other inside ONE report: the mouse
+        // reports its whole bitmap per poll, so both edges arrive before a
+        // SYN_REPORT. The grab moves to the right tile and so must focus.
+        runtime
+            .pointer_frame(
+                4,
+                0,
+                0,
+                &[
+                    PointerButtonInput {
+                        time: 4,
+                        button: 272,
+                        state: PointerButtonState::Released,
+                    },
+                    PointerButtonInput {
+                        time: 4,
+                        button: 273,
+                        state: PointerButtonState::Pressed,
+                    },
+                ],
+            )
+            .unwrap();
+        assert_eq!(runtime.keyboard_snapshot().focus, Some(second));
+    }
+
+    #[test]
+    fn a_press_while_the_launcher_is_modal_does_not_move_focus() {
+        let path = std::env::temp_dir().join(format!(
+            "td-runtime-click-focus-modal-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let cleanup = Cleanup(path);
+        let framebuffer = Framebuffer::test_file(&cleanup.0, 240, 120, 240 * 4).unwrap();
+        let mut runtime = Runtime::new(framebuffer);
+        let first = SurfaceKey {
+            client: 1,
+            object: 10,
+        };
+        let second = SurfaceKey {
+            client: 2,
+            object: 20,
+        };
+        runtime.commit(first, surface([1, 2, 3, 0])).unwrap();
+        runtime.commit(second, surface([4, 5, 6, 0])).unwrap();
+        assert_eq!(runtime.keyboard_snapshot().focus, Some(second));
+        let rect = runtime.layout_snapshot().get(&first).unwrap().rect;
+        runtime
+            .pointer_frame(
+                1,
+                i32::try_from(rect.x.saturating_add(2)).unwrap(),
+                i32::try_from(rect.y.saturating_add(2)).unwrap(),
+                &[],
+            )
+            .unwrap();
+
+        runtime.launcher(LauncherAction::Open).unwrap();
+        runtime
+            .pointer_frame(
+                2,
+                0,
+                0,
+                &[PointerButtonInput {
+                    time: 2,
+                    button: 272,
+                    state: PointerButtonState::Pressed,
+                }],
+            )
+            .unwrap();
+        assert_eq!(runtime.keyboard_snapshot().focus, Some(second));
+
+        // Close it and the same click takes, so the assertion above is about
+        // the overlay rather than about a click that could never focus.
+        runtime.launcher(LauncherAction::Close).unwrap();
+        runtime
+            .pointer_frame(
+                3,
+                0,
+                0,
+                &[PointerButtonInput {
+                    time: 3,
+                    button: 273,
+                    state: PointerButtonState::Pressed,
+                }],
+            )
+            .unwrap();
+        assert_eq!(runtime.keyboard_snapshot().focus, Some(first));
+    }
+
+    #[test]
+    fn a_press_over_no_surface_leaves_focus_alone() {
+        let path = std::env::temp_dir().join(format!(
+            "td-runtime-click-focus-empty-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let cleanup = Cleanup(path);
+        let framebuffer = Framebuffer::test_file(&cleanup.0, 240, 120, 240 * 4).unwrap();
+        let mut runtime = Runtime::new(framebuffer);
+        let first = SurfaceKey {
+            client: 1,
+            object: 10,
+        };
+        let second = SurfaceKey {
+            client: 2,
+            object: 20,
+        };
+        runtime.commit(first, surface([1, 2, 3, 0])).unwrap();
+        runtime.commit(second, surface([4, 5, 6, 0])).unwrap();
+        assert_eq!(runtime.keyboard_snapshot().focus, Some(second));
+        // The gap between tiles belongs to no surface. A click there is not a
+        // request to focus nothing — it is a click on the desktop.
+        runtime.pointer_frame(1, 0, 0, &[]).unwrap();
+        runtime
+            .pointer_frame(
+                2,
+                0,
+                0,
+                &[PointerButtonInput {
+                    time: 2,
+                    button: 272,
+                    state: PointerButtonState::Pressed,
+                }],
+            )
+            .unwrap();
+        assert_eq!(runtime.keyboard_snapshot().focus, Some(second));
+        // Same click one tile over DOES take, so the assertion above is about
+        // the gap rather than about a harness that focuses nothing.
+        runtime
+            .pointer_frame(
+                3,
+                0,
+                0,
+                &[PointerButtonInput {
+                    time: 3,
+                    button: 272,
+                    state: PointerButtonState::Released,
+                }],
+            )
+            .unwrap();
+        let rect = runtime.layout_snapshot().get(&first).unwrap().rect;
+        runtime
+            .pointer_frame(
+                3,
+                i32::try_from(rect.x.saturating_add(2)).unwrap(),
+                i32::try_from(rect.y.saturating_add(2)).unwrap(),
+                &[],
+            )
+            .unwrap();
+        runtime
+            .pointer_frame(
+                4,
+                0,
+                0,
+                &[PointerButtonInput {
+                    time: 4,
+                    button: 272,
+                    state: PointerButtonState::Pressed,
+                }],
+            )
+            .unwrap();
+        assert_eq!(runtime.keyboard_snapshot().focus, Some(first));
     }
 
     #[test]
