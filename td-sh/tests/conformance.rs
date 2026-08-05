@@ -1875,6 +1875,154 @@ fn login_run(
     Ok((String::from_utf8_lossy(&out.stdout).into_owned(), out.status.code()))
 }
 
+/// A DIAGNOSTIC writer ends on a broken pipe, as the stdout writer already did.
+///
+/// The stdout rule landed with concurrent pipelines; these two are the half it
+/// did not reach, because `set -x` and the shell's own error lines discard the
+/// write result. With `head` gone every write fails and nothing looked, so both
+/// spun forever at constant memory — which no `ulimit` catches, hence `timeout`
+/// and an asserted STATUS: a shape that regresses here produces the right first
+/// line and then never exits, and only the status says so.
+///
+/// The first line is what a caller sees either way, so it is compared to bash's
+/// on the shape whose text both shells share.
+#[test]
+fn a_broken_pipe_ends_a_diagnostic_writer() -> Result<(), Box<dyn std::error::Error>> {
+    let shell = PathBuf::from(env!("CARGO_BIN_EXE_td-sh"));
+    for (program, want) in [
+        // xtrace: nothing here writes to stdout at all, so the pipe is fed by
+        // the trace alone.
+        ("set -x; while :; do :; done 2>&1 | head -1", Some("+ :\n")),
+        // ...and the shell's own error path, whose text is its own.
+        ("while :; do cd /nope; done 2>&1 | head -1", None),
+    ] {
+        let out = std::process::Command::new("/bin/sh")
+            .args([
+                "-c",
+                &format!("exec timeout 20 {} -c {}", shell.display(), shell_quote(program)),
+            ])
+            .output()?;
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "`{program}` did not end on the broken pipe (124 is the timeout killing a spin)"
+        );
+        if let Some(want) = want {
+            assert_eq!(String::from_utf8_lossy(&out.stdout), want, "`{program}`");
+        } else {
+            assert_eq!(String::from_utf8_lossy(&out.stdout).lines().count(), 1);
+        }
+    }
+    // `set -n` must not be able to strand a pending broken pipe. It returns
+    // from `run_command` before anything runs, so a flag left pending when
+    // noexec came on could never be looked at again — and `set +n` cannot turn
+    // it off. Checking AFTER the command is what closes that: the flag is seen
+    // by the very command that set it. Found by review against a first cut that
+    // only checked on entry.
+    let out = std::process::Command::new("/bin/sh")
+        .args([
+            "-c",
+            &format!(
+                "exec timeout 20 {} -c {}",
+                shell.display(),
+                shell_quote("set -x; while sleep .2; do set -n; done 2>&1 | head -1")
+            ),
+        ])
+        .output()?;
+    assert_eq!(out.status.code(), Some(0), "`set -n` hid a pending broken pipe");
+
+    // ...and AFTER the command, or the LAST one's diagnostic is never noticed:
+    // the script ends and reports its own status where bash reports 141.
+    //
+    // The reader is closed HERE rather than by a `head` in a pipeline, so the
+    // status read back is the SHELL's own and not the last stage's. The `sleep`
+    // puts the write after the close either way.
+    for program in ["set -x; sleep 0.3; :", "echo one >&2; sleep 0.3; cd /nope"] {
+        use std::io::Read as _;
+        let mut child = std::process::Command::new(&shell)
+            .args(["-c", program])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .spawn()?;
+        let mut err = child.stderr.take().ok_or("no stderr pipe")?;
+        // ONE line first, then close — `head -1` exactly. Closing straight away
+        // would break the FIRST write instead, which an entry-only check
+        // already catches on the next command; it is the LAST write that has
+        // nothing after it to notice.
+        let mut byte = [0u8; 1];
+        while let Ok(1) = err.read(&mut byte) {
+            if byte[0] == b'\n' {
+                break;
+            }
+        }
+        drop(err);
+        assert_eq!(
+            child.wait()?.code(),
+            Some(141),
+            "`{program}` did not report 128+SIGPIPE for its last command"
+        );
+    }
+
+    // An EXIT trap still RUNS, which is the whole difference between this and a
+    // signal death and what the stdout rule beside it already gave. The first
+    // cut let the trap's own first command meet the pending flag and return
+    // having done nothing, losing every cleanup trap on this path.
+    let dir = ScratchDir::new("epipe-trap")?;
+    for (program, tag) in [
+        ("while :; do cd /nope; done", "diag"),
+        ("while :; do echo x; done", "stdout"),
+    ] {
+        // TWO commands, because the action must run to COMPLETION. With the
+        // check placed after each command a one-command trap finishes before
+        // the pending flag is ever looked at, so only the second marker tells
+        // whether the trap was cut short.
+        let first = dir.0.join(format!("{tag}-1"));
+        let second = dir.0.join(format!("{tag}-2"));
+        let out = std::process::Command::new("/bin/sh")
+            .args([
+                "-c",
+                &format!(
+                    "exec timeout 20 {} -c {} 2>&1 | head -1 >/dev/null",
+                    shell.display(),
+                    shell_quote(&format!(
+                        "trap 'echo T > {}; echo T > {}' EXIT; {program}",
+                        first.display(),
+                        second.display()
+                    ))
+                ),
+            ])
+            .output()?;
+        assert!(out.status.success(), "`{program}` wedged: {out:?}");
+        assert!(
+            first.exists(),
+            "the EXIT trap did not run at all on the {tag} broken-pipe path"
+        );
+        assert!(
+            second.exists(),
+            "the EXIT trap was cut short on the {tag} broken-pipe path"
+        );
+    }
+
+    // A diagnostic write that FAILS for any other reason still just reports.
+    // `2>&-` is the case that matters and the one a broader rule would break:
+    // the write itself fails with EBADF, not EPIPE, and both shells carry on.
+    // Without this the difference between "ends on a broken pipe" and "ends on
+    // any failed diagnostic" is untested, since an ordinary `cd /nope` writes
+    // to a stderr that works.
+    for program in [
+        "cd /nope 2>&-; echo alive",
+        "set -x; cd /nope 2>&-; echo alive",
+        "echo hi >&-; echo rc=$?; cd /nope; echo alive",
+    ] {
+        let out = std::process::Command::new(&shell).args(["-c", program]).output()?;
+        assert!(
+            String::from_utf8_lossy(&out.stdout).contains("alive"),
+            "`{program}` ended the shell on a diagnostic that was not a broken pipe: {out:?}"
+        );
+    }
+    Ok(())
+}
+
 /// A stage the OS refuses a thread for is not something `!` can turn into
 /// success.
 ///

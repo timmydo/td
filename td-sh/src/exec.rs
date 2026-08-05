@@ -10,6 +10,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use crate::ast::{AndOr, Cmd, Conn, List, Pipeline, Redir, Sep, Word};
@@ -235,6 +236,15 @@ pub struct Shell {
     /// `trap '' TERM` leaves the process still ignoring it, and the spawn has to
     /// know to put `SIG_DFL` back for the child. Cloned like `sig_may_set`.
     pub sig_installed: Vec<u8>,
+    /// Set when a DIAGNOSTIC write to fd 2 met a broken pipe, and read back at
+    /// the `run_command` choke point so the shell ends there.
+    ///
+    /// A pending flag rather than a return value, because the alternative is
+    /// threading one through `err_line`'s thirty-odd callers and every `trace`;
+    /// and because this is what a real SIGPIPE would be — asynchronous, noticed
+    /// at the next command rather than at the write. `AtomicBool` so the writers
+    /// can keep taking `&Shell`, which most of them only ever had.
+    pub stderr_epipe: AtomicBool,
     /// Whether THIS shell has changed the process umask. A clone restores the
     /// mask it captured only when this is set, because a clone that never
     /// touched it has nothing to put back — and with pipeline stages running at
@@ -387,6 +397,7 @@ impl Shell {
             traps: BTreeMap::new(),
             sig_may_set: BTreeMap::new(),
             sig_installed: Vec::new(),
+            stderr_epipe: AtomicBool::new(false),
             umask_changed: false,
             sig_undo: Vec::new(),
             trap_status: None,
@@ -508,6 +519,7 @@ impl Shell {
             traps: BTreeMap::new(),
             sig_may_set: BTreeMap::new(),
             sig_installed: Vec::new(),
+            stderr_epipe: AtomicBool::new(false),
             umask_changed: false,
             sig_undo: Vec::new(),
             trap_status: None,
@@ -818,6 +830,13 @@ pub fn run_exit_trap(sh: &mut Shell, status: i32) -> i32 {
         return status;
     };
     sh.set_status(status);
+    // The trap RUNS, which is the whole difference between this and a signal
+    // death and is what the stdout rule beside it already gives. Its own first
+    // command would otherwise meet the pending flag and return 141 having done
+    // nothing, silently losing every cleanup trap on this path. If the action
+    // writes to the same broken pipe it sets the flag again and stops there,
+    // which is bounded and is what a second SIGPIPE would do.
+    sh.stderr_epipe.store(false, Ordering::Relaxed);
     let saved = sh.trap_status.replace(status);
     let code = match run_source(sh, &action, "") {
         Ok(()) => status,
@@ -979,7 +998,32 @@ pub fn run_command(sh: &mut Shell, cmd: &Cmd) -> R<()> {
     sh.run_depth += 1;
     let result = run_command_inner(sh, cmd);
     sh.run_depth -= 1;
-    result
+    // AFTER the command rather than before the next one, which is not the same
+    // thing at the two ends of a script: the LAST command's own diagnostic
+    // would otherwise never be looked at, and `set -x; sleep .3; :` with a
+    // broken stderr would report 0 where bash reports 141. It is also what
+    // makes `set -n` safe to leave above — the flag is seen by the post-check
+    // of the very command that set it, so it can never be left pending for a
+    // `noexec` early return to step over forever. The command's own error wins,
+    // being the more specific answer.
+    result?;
+    epipe_pending(sh)
+}
+
+/// End the shell if a diagnostic write has met a broken pipe since it was last
+/// asked. Sampled at the `run_command` choke point every compound body,
+/// function call and loop iteration descends through, which is the only place
+/// that sees it without every diagnostic returning one.
+///
+/// dash and bash end these shapes by DYING of SIGPIPE; this shell cannot, since
+/// the Rust runtime ignores SIGPIPE before `main`, so it ends the way a caller
+/// observes: 128 + SIGPIPE, as `Sig::Exit` so a pipeline stage is confined
+/// exactly as a forked producer's death would be.
+fn epipe_pending(sh: &Shell) -> R<()> {
+    if sh.stderr_epipe.load(Ordering::Relaxed) {
+        return Err(Sig::Exit(141));
+    }
+    Ok(())
 }
 
 fn run_command_inner(sh: &mut Shell, cmd: &Cmd) -> R<()> {
@@ -1172,10 +1216,13 @@ fn trace(sh: &mut Shell, parts: &[String], errout: Option<Option<&process::Fd>>)
     // the trace goes out with the raw value.
     let prefix = expanded.unwrap_or(ps4);
     let line = format!("{prefix}{}\n", parts.join(" "));
-    let _ = match errout {
-        Some(target) => process::write_target(target, line.as_bytes()),
-        None => process::write_fd(sh, 2, line.as_bytes()),
-    };
+    let _ = note_epipe(
+        sh,
+        match errout {
+            Some(target) => process::write_target(target, line.as_bytes()),
+            None => process::write_fd(sh, 2, line.as_bytes()),
+        },
+    );
 }
 
 fn run_simple(
@@ -1671,7 +1718,24 @@ pub fn redir_target(sh: &mut Shell, r: &Redir) -> R<String> {
 
 /// Write `msg` plus a newline to the shell's current stderr.
 pub fn write_stderr(sh: &Shell, msg: &str) -> std::io::Result<()> {
-    process::write_fd(sh, 2, format!("{msg}\n").as_bytes())
+    note_epipe(sh, process::write_fd(sh, 2, format!("{msg}\n").as_bytes()))
+}
+
+/// Record a broken pipe on the shell's diagnostic descriptor, passing the result
+/// through untouched.
+///
+/// `BrokenPipe` and nothing else — not "any failed write". A closed descriptor
+/// (`cd /nope 2>&-`) fails too, and the operator closed it on purpose; bash
+/// carries on and so does this. That one is not the kernel's EBADF either:
+/// `write_target` answers `Fd::Closed` itself, so nothing reaches a syscall,
+/// and the same `Other` covers a read-only target and a poisoned mutex. Which
+/// is the argument for naming the kind that ENDS the shell rather than
+/// enumerating the kinds that do not.
+pub fn note_epipe(sh: &Shell, r: std::io::Result<()>) -> std::io::Result<()> {
+    if r.as_ref().is_err_and(|e| e.kind() == std::io::ErrorKind::BrokenPipe) {
+        sh.stderr_epipe.store(true, Ordering::Relaxed);
+    }
+    r
 }
 
 #[cfg(test)]

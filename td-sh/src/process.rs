@@ -1076,6 +1076,7 @@ pub fn fork_shell(sh: &Shell) -> Subshell {
         // one inherited from outside.
         sig_may_set: sh.sig_may_set.clone(),
         sig_installed: sh.sig_installed.clone(),
+        stderr_epipe: std::sync::atomic::AtomicBool::new(false),
         umask_changed: false,
         sig_undo: Vec::new(),
     };

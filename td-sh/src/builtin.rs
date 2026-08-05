@@ -1977,10 +1977,13 @@ fn read(sh: &mut Shell, argv: &[String]) -> R<()> {
         }
     }
 
-    // The prompt goes to stderr, and ONLY when the source is a terminal.
+    // The prompt goes to stderr, and ONLY when the source is a terminal. Noted
+    // like every other fd-2 writer: `while :; do read -p 'P> ' v; done` with a
+    // broken stderr is the same spin the rest of them had, and the terminal
+    // gate is why no headless test can reach it.
     if let Some(p) = &opt_p {
         if sh.fds.is_terminal(fd) {
-            let _ = write_fd(sh, 2, p.as_bytes());
+            let _ = exec::note_epipe(sh, write_fd(sh, 2, p.as_bytes()));
         }
     }
 
