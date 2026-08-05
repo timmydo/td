@@ -403,7 +403,6 @@ pub fn action(code: u16, modifiers: u32, modes: Modes, viewing: bool) -> Action 
 /// How far one `Shift+PageUp` moves: a screen less one row, so the line the
 /// reader was looking at is still there to read on from. Never zero, since a
 /// one-row grid would otherwise have no way to scroll at all.
-#[allow(dead_code)]
 fn page_lines(rows: usize) -> usize {
     rows.saturating_sub(1).max(1)
 }
@@ -412,8 +411,7 @@ fn page_lines(rows: usize) -> usize {
 /// together because an offset means nothing without all of them: which
 /// numbering the lines are counted in, how many have been counted, and how
 /// many are still held.
-#[allow(dead_code)]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Default, Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Scrollback {
     pub epoch: u64,
     pub pushed: u64,
@@ -432,13 +430,11 @@ struct Anchor {
 /// because the bottom moves: with a stored distance a child writing
 /// underneath an open viewport would drag the view along with it, one line
 /// per line of output.
-#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct Viewport {
     anchor: Option<Anchor>,
 }
 
-#[allow(dead_code)]
 impl Viewport {
     pub fn new() -> Viewport {
         Viewport { anchor: None }
@@ -483,11 +479,15 @@ impl Viewport {
             // silent key must not quietly move it to where it landed.
             Action::Silent => return,
             Action::Bytes(_) | Action::Scroll(Scroll::Bottom) => 0,
-            // Not clamped here: `offset` clamps to what history holds on
-            // every read, and an anchor past the top reads as the top from
-            // the next line of output onward. A second clamp would be a
-            // second place for the two to disagree.
-            Action::Scroll(Scroll::Back) => current.saturating_add(page_lines(rows)),
+            // Clamped to what history HOLDS, unlike the read side. `offset`
+            // clamping is what lets an anchor already inside history ride the
+            // top as eviction shortens it; writing one BEYOND history is a
+            // different thing, and on an empty history it is a delayed jump —
+            // the chord looks inert, then the first line of output brings the
+            // anchor into range and pins the view at the oldest line.
+            Action::Scroll(Scroll::Back) => current
+                .saturating_add(page_lines(rows))
+                .min(history.lines),
             Action::Scroll(Scroll::Forward) => current.saturating_sub(page_lines(rows)),
         };
         self.anchor = if next == 0 {

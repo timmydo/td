@@ -1042,8 +1042,21 @@ key, because the sequence armed under the old state is no longer the one it
 would send — and a key pressed while the group is not td's arms nothing at
 all, for the reason a single such press sends nothing. A later `repeat_info`
 with a different nonzero rate is not a retirement: it retimes the held key
-rather than dropping it. The scrollback VIEWPORT is still not wired: a key
-that would scroll does nothing until there is something to scroll.
+rather than dropping it. The scrollback VIEWPORT is wired too.
+`Shift+PageUp` and `Shift+PageDown` move the view rather than reaching the
+child, and a key that scrolls never also sends bytes. The view names the
+LINE it is looking at rather than a distance from the live bottom, so a
+child writing underneath an open viewport does not drag it along; the anchor
+is clamped against what history holds on every read, so eviction and resize
+leave it riding the top of what remains rather than snapping back. A clear
+retires the numbering, which is what stops an old anchor reopening a closed
+view on unrelated lines. End has two meanings and the effective position
+decides which: with the view open it returns to the live bottom, and at the
+bottom it is the child's key. A held scroll repeats, since walking back
+through history is what holding it is for. While the view is open the
+cursor is drawn where the shift puts it, and stops being drawn once that pushes it
+past the bottom: the renderer shifts the live screen and the cursor by
+the same offset, so neither needs a special case.
 
 Those three rules are exhaustive, and what they exclude is deliberate. Ctrl
 reaches printable keys only, and only where a C0 spelling is defined; the
@@ -1157,8 +1170,9 @@ tail of an old line blank rather than fabricating cells for it.
 The keys that select it are landed too, so the viewport is complete as a
 pure pair: the adapter routes a press to the child, to the viewport, or
 nowhere, and the viewport turns those into the offset a snapshot takes.
-What is left for the client is calling them — nothing yet asks the adapter
-what a key means, and the corpus is what drives it instead.
+The client calls them: td-term routes every press through the adapter and
+holds the viewport across frames, so the corpus is no longer the only thing
+driving either.
 
 ## 12. PTY and process lifecycle
 

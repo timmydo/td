@@ -273,6 +273,12 @@ struct Surface {
     /// caller that has a CLOCK. `dispatch` has none and should not: it is
     /// driven by tests that inject events, not time.
     pending_key: Option<(u16, bool)>,
+    /// td-term's scrollback viewport: which line is being looked at, not a
+    /// distance from a bottom that moves.
+    viewport: keys::Viewport,
+    /// The history the viewport is read against, refreshed from the model
+    /// beside `modes` because `dispatch` cannot reach it either.
+    history: keys::Scrollback,
     /// The auto-repeat state machine. Its timings come from the compositor's
     /// `repeat_info` rather than from td's own constants, because §11 has the
     /// server publish them and a client that guessed would drift from it.
@@ -306,6 +312,8 @@ impl Surface {
             modes: keys::Modes::default(),
             pending_input: None,
             pending_key: None,
+            viewport: keys::Viewport::new(),
+            history: keys::Scrollback::default(),
             repeat: keys::Repeat::new(),
             live_buffers: BTreeSet::new(),
             live_callbacks: BTreeSet::new(),
@@ -621,12 +629,11 @@ impl Surface {
     /// to translate at all: a group this keymap does not have would otherwise
     /// be read against group 0's table and send bytes for a different key.
     ///
-    /// A scroll action is dropped rather than served, because td-term has no
-    /// scrollback VIEWPORT yet. `Shift+PageUp` and `Shift+PageDown` are
-    /// therefore SILENT — `keys` answers `Scroll` for them whatever `viewing`
-    /// says, and dropping it is the honest half of the answer rather than a
-    /// wrong one. `viewing` is false because there is nothing to view; it
-    /// gates only the End key, which reaches the child while it stays false.
+    /// A scroll action moves the VIEW and sends nothing; a byte action sends
+    /// and also returns the view to the live bottom, which is §10's rule and
+    /// what stops typing echoing where nobody can see it. `viewing` is read
+    /// rather than assumed because End means one thing with the view open and
+    /// another at the bottom.
     fn translate(&mut self, code: u32) -> Result<(), String> {
         // Silent rather than fatal, for the reason `keys` answers `Silent` to
         // any code its table lacks: no evdev code reaches u16, so this is a
@@ -648,11 +655,33 @@ impl Surface {
             }
             return Ok(());
         }
-        if let keys::Action::Bytes(sequence) = keys::action(code, self.modifiers, self.modes, false)
-        {
-            self.pending_input = Some(sequence);
+        let viewing = self.viewport.viewing(self.history);
+        let action = keys::action(code, self.modifiers, self.modes, viewing);
+        match action {
+            keys::Action::Bytes(sequence) => {
+                self.pending_input = Some(sequence);
+                // §10: ordinary input returns to the live bottom. Typing at a
+                // scrolled-back screen otherwise echoes where nobody can see
+                // it, and the reply lands there too.
+                self.scroll(&action);
+            }
+            keys::Action::Scroll(_) => {
+                self.scroll(&action);
+            }
+            keys::Action::Silent => {}
         }
         Ok(())
+    }
+
+    /// Move the view as `action` says, and ask for a frame only if it
+    /// actually moved: PageUp at the top of history clamps to where it
+    /// already was, and repainting the same lines is work the compositor
+    /// does for nothing.
+    fn scroll(&mut self, action: &keys::Action) {
+        let rows = self.cells.map_or(0, |(rows, _)| usize::from(rows));
+        let before = self.viewport.offset(self.history);
+        self.viewport.apply(action, rows, self.history);
+        self.stale |= self.viewport.offset(self.history) != before;
     }
 
     /// Whether the seat's LATEST word still claims a keyboard. Asked here
@@ -759,16 +788,29 @@ fn frame_bytes(size: Size) -> Result<usize, String> {
     Ok(bytes)
 }
 
+/// How far back the next frame is drawn, read against the terminal being
+/// DRAWN rather than the client's cached history: this is the moment the
+/// picture is decided, and an offset from a stale reading would draw a line
+/// the model no longer has there. A function so the composition is testable —
+/// inline it is a line that can be replaced by zero with every test green.
+fn draw_offset(surface: &Surface, terminal: &Terminal) -> usize {
+    surface.viewport.offset(terminal.scrollback())
+}
+
 fn build_pixels(
     size: Size,
     terminal: &Terminal,
     font: &Font,
     palette: &render::Palette,
     focused: bool,
+    viewport: usize,
 ) -> Result<Vec<u8>, String> {
     let bytes = frame_bytes(size)?;
     let mut pixels = vec![0u8; bytes];
-    let snapshot = render::Snapshot::new(terminal, focused, false);
+    // No cursor override: `render.rs` shifts the cursor down by the viewport
+    // and drops it once it falls off the bottom, so a scrolled-back view
+    // already draws it on the right cell or not at all.
+    let snapshot = render::Snapshot::new(terminal, focused, false).scrolled_back(viewport);
     render::render(
         &snapshot,
         palette,
@@ -795,7 +837,8 @@ fn commit_frame(
     if !surface.xrgb {
         return Err("compositor did not advertise wl_shm XRGB8888".into());
     }
-    let pixels = build_pixels(size, terminal, font, palette, surface.activated)?;
+    let viewport = draw_offset(surface, terminal);
+    let pixels = build_pixels(size, terminal, font, palette, surface.activated, viewport)?;
     let (buffer, callback) = conn::attach_frame(
         connection,
         directory,
@@ -1123,12 +1166,13 @@ fn arm_repeat(surface: &mut Surface, now: u64) {
         return;
     }
     let (modifiers, modes) = (surface.modifiers, surface.modes);
-    // `viewing` is false for the reason a fresh press passes false: there is
-    // no scrollback viewport yet. It reaches `keys` from both places, so
-    // wiring one and not the other would give a held End a different meaning
-    // from a tapped one.
+    // The same `viewing` the other two call sites compute. `press` reads it
+    // only to decide whether the key does anything at all, so today both
+    // answers arm End alike — but a key that became silent on one side of it
+    // would otherwise arm from a value no other site agrees with.
+    let viewing = surface.viewport.viewing(surface.history);
     if pressed {
-        surface.repeat.press(code, modifiers, modes, false, now);
+        surface.repeat.press(code, modifiers, modes, viewing, now);
     } else {
         surface.repeat.release(code);
     }
@@ -1153,8 +1197,26 @@ fn serve_repeat(
             .and_then(|terminal| terminal.mode("application-cursor"))
             .unwrap_or(false),
     };
-    let Some(keys::Action::Bytes(sequence)) = surface.repeat.due(now, modes, false) else {
-        return Ok(());
+    surface.history = model.as_ref().map(Terminal::scrollback).unwrap_or_default();
+    let viewing = surface.viewport.viewing(surface.history);
+    let action = match surface.repeat.due(now, modes, viewing) {
+        Some(action) => action,
+        None => return Ok(()),
+    };
+    let sequence = match action {
+        keys::Action::Bytes(sequence) => sequence,
+        // Holding Shift+PageUp is how a reader walks back through history,
+        // so a repeated scroll moves the view exactly as the first one did.
+        action @ keys::Action::Scroll(_) => {
+            let rows = surface.cells.map_or(0, |(rows, _)| usize::from(rows));
+            let before = surface.viewport.offset(surface.history);
+            surface.viewport.apply(&action, rows, surface.history);
+            // As above: a held PageUp at the top of history must not redraw
+            // once per repetition.
+            surface.stale |= surface.viewport.offset(surface.history) != before;
+            return Ok(());
+        }
+        keys::Action::Silent => return Ok(()),
     };
     if !child.input.push(sequence.as_slice())? {
         if let Some(terminal) = model.as_mut() {
@@ -1200,6 +1262,10 @@ fn serve_event(
                         .and_then(|terminal| terminal.mode("application-cursor"))
                         .unwrap_or(false),
                 };
+                // The viewport clamps against this on every read, so it has
+                // to be what history holds NOW rather than when the view was
+                // opened: output and eviction both move it underneath.
+                surface.history = model.as_ref().map(Terminal::scrollback).unwrap_or_default();
             }
             if !connection.handle_common(&message)? {
                 surface.dispatch(connection, &message, fallback)?;
@@ -1249,6 +1315,21 @@ fn serve_event(
     if let (true, Some(status)) = (child.drained, child.status) {
         return Err(ended(status));
     }
+    settle(connection, surface, model, session)
+}
+
+/// Put on screen whatever the turn just changed. Extracted because a
+/// REPETITION changes the same things an event does — a held scroll moves the
+/// view — and the loop's timeout branch has no event to carry it here. The
+/// compositor suppresses evdev repeat, so a held key produces no Wayland
+/// message at all: without this the view moved and the picture did not, until
+/// the key was released.
+fn settle(
+    connection: &mut Connection,
+    surface: &mut Surface,
+    model: &mut Option<Terminal>,
+    session: &Session,
+) -> Result<(), String> {
     let Some(wanted) = surface.wanted() else {
         return Ok(());
     };
@@ -1643,9 +1724,13 @@ pub fn run(options: &Options) -> Result<(), String> {
                 // the expiry, so a child writing steadily would otherwise
                 // starve the held key indefinitely.
                 serve_repeat(&mut surface, &mut model, &mut child, now)?;
+                settle(&mut connection, &mut surface, &mut model, &session)?;
             }
             // The wait expired, so a repetition is due rather than a message.
-            None => serve_repeat(&mut surface, &mut model, &mut child, now_ms(started))?,
+            None => {
+                serve_repeat(&mut surface, &mut model, &mut child, now_ms(started))?;
+                settle(&mut connection, &mut surface, &mut model, &session)?;
+            }
         }
     }
 }
@@ -3980,10 +4065,9 @@ mod tests {
             "a key pressed in a foreign group armed a repeat"
         );
 
-        // End is the key the two `viewing` literals decide the meaning of —
-        // one where it is armed, one where it repeats. Read as true it routes
-        // to the viewport instead, and a held End would silently stop
-        // reaching the child, so both are pinned by this.
+        // End with the view CLOSED is the child's key. Read as `viewing`
+        // when nothing is being viewed, it would route to the viewport
+        // instead and a held End would stop reaching the child.
         surface
             .dispatch(&mut connection, &modifiers(0, 0), fallback)
             .unwrap();
@@ -4092,6 +4176,307 @@ mod tests {
             delayed.deadline(),
             Some(50),
             "a retimed delay did not reach the next press"
+        );
+    }
+
+    /// The offset has to reach the RENDERER, not just the viewport: every
+    /// assertion about where the view sits is about a number, and a picture
+    /// drawn from the live bottom regardless would satisfy all of them.
+    #[test]
+    fn a_scrolled_view_draws_a_different_picture() {
+        let font = font();
+        let palette = render::Palette::pinned();
+        let size = Size {
+            width: 8 * 8,
+            height: 16 * 4,
+        };
+        let mut terminal = Terminal::new(4, 8).unwrap();
+        // Cursor hidden in the MODEL, so the override a scrolled view applies
+        // changes nothing and the offset is the only difference between the
+        // two frames. Without this the pictures differ either way and the
+        // assertion passes with the renderer ignoring the offset entirely.
+        terminal.feed(b"\x1b[?25l");
+        for line in 0..20u32 {
+            terminal.feed(format!("L{line}\r\n").as_bytes());
+        }
+        let live = build_pixels(size, &terminal, &font, &palette, true, 0).unwrap();
+        let back = build_pixels(size, &terminal, &font, &palette, true, 4).unwrap();
+        assert_ne!(
+            live, back,
+            "a scrolled viewport drew the live screen anyway"
+        );
+    }
+
+    /// The frame's offset comes from the viewport AND the terminal being
+    /// drawn. Inline in `commit_frame` this composition could be replaced by
+    /// zero with the whole suite green, which is the weaker version of the
+    /// defect the renderer test was written for.
+    #[test]
+    fn the_drawn_offset_is_the_viewport_read_against_the_model() {
+        let (mut connection, _peer) = pair();
+        let mut surface = Surface::new(Bound {
+            compositor: 1,
+            shm: 2,
+            xdg_wm_base: 4,
+            seat: 5,
+        });
+        let fallback = Size {
+            width: 8,
+            height: 8,
+        };
+        surface.cells = Some((4, 8));
+        let mut terminal = Terminal::new(4, 8).unwrap();
+        for line in 0..20u32 {
+            terminal.feed(format!("L{line}\r\n").as_bytes());
+        }
+        surface.history = terminal.scrollback();
+        assert_eq!(
+            draw_offset(&surface, &terminal),
+            0,
+            "a closed view drew somewhere other than the live bottom"
+        );
+        let mut payload = Vec::new();
+        for word in [1u32, crate::keyboard::MOD_SHIFT, 0, 0, 0] {
+            payload.extend_from_slice(&word.to_ne_bytes());
+        }
+        surface
+            .dispatch(&mut connection, &message(KEYBOARD, 4, payload), fallback)
+            .unwrap();
+        let mut payload = Vec::new();
+        for word in [1u32, 0, 104, 1] {
+            payload.extend_from_slice(&word.to_ne_bytes());
+        }
+        surface
+            .dispatch(&mut connection, &message(KEYBOARD, 3, payload), fallback)
+            .unwrap();
+        assert_eq!(
+            draw_offset(&surface, &terminal),
+            surface.viewport.offset(terminal.scrollback()),
+            "the drawn offset stopped agreeing with the viewport"
+        );
+        assert!(
+            draw_offset(&surface, &terminal) > 0,
+            "an open view still drew the live bottom"
+        );
+    }
+
+    /// A chord at the oldest end is INERT, and on an empty history that is
+    /// not the same as producing no offset today: an anchor written past what
+    /// history holds looks inert now and becomes a jump to the oldest line as
+    /// soon as the child writes enough to fill it.
+    #[test]
+    fn a_scroll_against_empty_history_does_not_arm_a_later_jump() {
+        let (mut connection, _peer) = pair();
+        let mut surface = Surface::new(Bound {
+            compositor: 1,
+            shm: 2,
+            xdg_wm_base: 4,
+            seat: 5,
+        });
+        let fallback = Size {
+            width: 8,
+            height: 8,
+        };
+        surface.cells = Some((4, 8));
+        let mut terminal = Terminal::new(4, 8).unwrap();
+        surface.history = terminal.scrollback();
+        assert_eq!(surface.history.lines, 0, "the fixture began with history");
+
+        let mut payload = Vec::new();
+        for word in [1u32, crate::keyboard::MOD_SHIFT, 0, 0, 0] {
+            payload.extend_from_slice(&word.to_ne_bytes());
+        }
+        surface
+            .dispatch(&mut connection, &message(KEYBOARD, 4, payload), fallback)
+            .unwrap();
+        let mut payload = Vec::new();
+        for word in [1u32, 0, 104, 1] {
+            payload.extend_from_slice(&word.to_ne_bytes());
+        }
+        surface
+            .dispatch(&mut connection, &message(KEYBOARD, 3, payload), fallback)
+            .unwrap();
+        assert!(
+            !surface.viewport.viewing(surface.history),
+            "a scroll with no history opened a view"
+        );
+
+        // The child now writes enough to fill the history that chord was
+        // aimed past. A dormant anchor comes into range HERE.
+        for line in 0..20u32 {
+            terminal.feed(format!("L{line}\r\n").as_bytes());
+        }
+        surface.history = terminal.scrollback();
+        assert!(
+            !surface.viewport.viewing(surface.history),
+            "output brought a dormant anchor into range and opened the view"
+        );
+    }
+
+    /// §10: ordinary text input returns to the live bottom. Typing at a
+    /// scrolled-back screen otherwise echoes somewhere nobody can see, and
+    /// the child's reply lands there too.
+    #[test]
+    fn ordinary_input_returns_the_view_to_the_live_bottom() {
+        let (mut connection, _peer) = pair();
+        let mut surface = Surface::new(Bound {
+            compositor: 1,
+            shm: 2,
+            xdg_wm_base: 4,
+            seat: 5,
+        });
+        let fallback = Size {
+            width: 8,
+            height: 8,
+        };
+        surface.cells = Some((4, 8));
+        let mut terminal = Terminal::new(4, 8).unwrap();
+        for line in 0..20u32 {
+            terminal.feed(format!("L{line}\r\n").as_bytes());
+        }
+        surface.history = terminal.scrollback();
+        let modifiers = |mask: u32| {
+            let mut payload = Vec::new();
+            for word in [1, mask, 0, 0, 0] {
+                payload.extend_from_slice(&word.to_ne_bytes());
+            }
+            message(KEYBOARD, 4, payload)
+        };
+        let key = |code: u32| {
+            let mut payload = Vec::new();
+            for word in [1u32, 0, code, 1] {
+                payload.extend_from_slice(&word.to_ne_bytes());
+            }
+            message(KEYBOARD, 3, payload)
+        };
+        surface
+            .dispatch(
+                &mut connection,
+                &modifiers(crate::keyboard::MOD_SHIFT),
+                fallback,
+            )
+            .unwrap();
+        surface
+            .dispatch(&mut connection, &key(104), fallback)
+            .unwrap();
+        assert!(
+            surface.viewport.viewing(surface.history),
+            "the fixture never opened a view"
+        );
+        surface
+            .dispatch(&mut connection, &modifiers(0), fallback)
+            .unwrap();
+        surface
+            .dispatch(&mut connection, &key(30), fallback)
+            .unwrap();
+        assert_eq!(
+            surface.pending_input.take().map(|s| s.as_slice().to_vec()),
+            Some(b"a".to_vec()),
+            "the letter did not reach the child"
+        );
+        assert!(
+            !surface.viewport.viewing(surface.history),
+            "ordinary text input did not return the view to the live bottom"
+        );
+    }
+
+    /// Shift+PageUp moves the VIEW rather than reaching the child, and a key
+    /// that scrolls must not also send bytes — which is why `keys` answers an
+    /// enum rather than an optional sequence. The wiring under test is that
+    /// the action reaches the viewport at all, and that the frame showing it
+    /// gets asked for.
+    #[test]
+    fn shift_pageup_moves_the_view_instead_of_reaching_the_child() {
+        let (mut connection, _peer) = pair();
+        let mut surface = Surface::new(Bound {
+            compositor: 1,
+            shm: 2,
+            xdg_wm_base: 4,
+            seat: 5,
+        });
+        let fallback = Size {
+            width: 8,
+            height: 8,
+        };
+        surface.cells = Some((4, 8));
+        // Twenty lines of history to walk back through, and the numbers the
+        // viewport clamps against read from the same model.
+        let mut terminal = Terminal::new(4, 8).unwrap();
+        for line in 0..20u32 {
+            terminal.feed(format!("L{line}\r\n").as_bytes());
+        }
+        surface.history = terminal.scrollback();
+        assert!(
+            surface.history.lines > 0,
+            "the fixture produced no scrollback"
+        );
+
+        let mut payload = Vec::new();
+        for word in [1u32, crate::keyboard::MOD_SHIFT, 0, 0, 0] {
+            payload.extend_from_slice(&word.to_ne_bytes());
+        }
+        surface
+            .dispatch(&mut connection, &message(KEYBOARD, 4, payload), fallback)
+            .unwrap();
+        let mut payload = Vec::new();
+        // evdev 104 is PageUp.
+        for word in [1u32, 0, 104, 1] {
+            payload.extend_from_slice(&word.to_ne_bytes());
+        }
+        surface.stale = false;
+        surface
+            .dispatch(&mut connection, &message(KEYBOARD, 3, payload), fallback)
+            .unwrap();
+        assert_eq!(
+            surface.pending_input, None,
+            "a key that scrolls also sent bytes to the child"
+        );
+        assert!(
+            surface.viewport.offset(surface.history) > 0,
+            "Shift+PageUp did not move the view"
+        );
+        assert!(surface.stale, "a moved view asked for no frame");
+        assert!(
+            surface.viewport.viewing(surface.history),
+            "the view moved but does not report itself as open"
+        );
+
+        // With the view open, End means "back to the bottom" rather than the
+        // sequence it sends at the live screen — which is the `viewing`
+        // argument doing its job, and the reason it is read rather than
+        // assumed.
+        let end = {
+            let mut payload = Vec::new();
+            for word in [1u32, 0, 107, 1] {
+                payload.extend_from_slice(&word.to_ne_bytes());
+            }
+            message(KEYBOARD, 3, payload)
+        };
+        // Shift is still held from the PageUp above, and Shift on a
+        // navigation key is silent — so it is released first, or this would
+        // pin nothing.
+        let mut released = Vec::new();
+        for word in [1u32, 0, 0, 0, 0] {
+            released.extend_from_slice(&word.to_ne_bytes());
+        }
+        surface
+            .dispatch(&mut connection, &message(KEYBOARD, 4, released), fallback)
+            .unwrap();
+        surface.dispatch(&mut connection, &end, fallback).unwrap();
+        assert_eq!(
+            surface.pending_input, None,
+            "End reached the child while the view was scrolled back"
+        );
+        assert!(
+            !surface.viewport.viewing(surface.history),
+            "End did not return the view to the live bottom"
+        );
+        // And at the bottom it is the child's again.
+        surface.dispatch(&mut connection, &end, fallback).unwrap();
+        assert_eq!(
+            surface.pending_input.take().map(|s| s.as_slice().to_vec()),
+            Some(b"\x1b[F".to_vec()),
+            "End stopped reaching the child once the view was closed"
         );
     }
 

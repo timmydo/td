@@ -1127,17 +1127,24 @@ impl Terminal {
     /// `history_lines()` but never this, which is what lets a viewport name
     /// a line rather than a distance from a moving bottom.
     ///
-    /// Awaiting the Wayland client that holds a viewport across frames.
-    #[allow(dead_code)]
     pub(crate) fn history_pushed(&self) -> u64 {
         self.primary.history.pushed
     }
 
     /// Which numbering `history_pushed` is counting in. A clear -- a reset,
     /// or `CSI 3 J` -- retires the old one.
-    #[allow(dead_code)]
     pub(crate) fn history_epoch(&self) -> u64 {
         self.primary.history.epoch
+    }
+
+    /// The three numbers a viewport needs, read together so they cannot
+    /// describe different moments.
+    pub(crate) fn scrollback(&self) -> crate::keys::Scrollback {
+        crate::keys::Scrollback {
+            epoch: self.history_epoch(),
+            pushed: self.history_pushed(),
+            lines: self.history_lines(),
+        }
     }
 
     /// Oldest line first: `history_lines() - 1` is the row that most

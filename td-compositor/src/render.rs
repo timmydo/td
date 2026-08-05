@@ -94,7 +94,10 @@ impl Palette {
             .get(DEFAULT_FOREGROUND)
             .copied()
             .unwrap_or([0xff, 0xff, 0xff]);
-        let background = entries.get(DEFAULT_BACKGROUND).copied().unwrap_or([0, 0, 0]);
+        let background = entries
+            .get(DEFAULT_BACKGROUND)
+            .copied()
+            .unwrap_or([0, 0, 0]);
         Self {
             entries,
             foreground,
@@ -127,7 +130,10 @@ impl Palette {
 }
 
 fn cube_level(axis: usize) -> u8 {
-    CUBE_LEVELS.get(axis % CUBE_LEVELS.len()).copied().unwrap_or(0)
+    CUBE_LEVELS
+        .get(axis % CUBE_LEVELS.len())
+        .copied()
+        .unwrap_or(0)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -167,8 +173,9 @@ impl<'a> Snapshot<'a> {
         }
     }
 
-    /// The main loop overrides the model's cursor while the scrollback
-    /// viewport is open; until that loop lands, only the spec calls this.
+    /// Overrides the model's cursor. Nothing in production does: the
+    /// viewport shifts the cursor rather than hiding it, so only the spec
+    /// calls this.
     #[allow(dead_code)]
     pub fn with_cursor(mut self, cursor: Cursor) -> Self {
         self.cursor = cursor;
@@ -178,7 +185,6 @@ impl<'a> Snapshot<'a> {
     /// Scroll the viewport back by `lines` of primary-screen history. Rows
     /// above the split come from history and the rest from the live screen,
     /// so a partially scrolled viewport shows both at once.
-    #[allow(dead_code)]
     pub fn scrolled_back(mut self, lines: usize) -> Self {
         self.viewport = lines.min(self.terminal.history_lines());
         self
