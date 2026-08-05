@@ -455,6 +455,22 @@ mod confinement {
         ("term_spec.rs", include_str!("term_spec.rs")),
     ];
 
+    /// A module's source with its test module removed. Anchored on the test
+    /// MODULE and not on `#[cfg(test)]` alone, since a crate gates individual
+    /// constants, imports and helpers that way too and the first of those
+    /// would truncate a scan to nothing.
+    ///
+    /// A missing anchor PANICS rather than falling back to the whole file:
+    /// every caller below counts something its own test module also spells,
+    /// so a silent fallback would not loosen these scans — it would invert
+    /// them, and they would pass by seeing the test that proves the opposite.
+    fn production(source: &str) -> &str {
+        let Some((production, _)) = source.split_once("\n#[cfg(test)]\nmod tests {") else {
+            panic!("a scanned module has no test module to cut at")
+        };
+        production
+    }
+
     fn occurrences(source: &str, needle: &str) -> usize {
         source.match_indices(needle).count()
     }
@@ -629,12 +645,8 @@ fn syscall3(number: usize, a1: usize, a2: usize, a3: usize) -> isize {
         assert_eq!(occurrences(SYS, entry), 1);
         assert_eq!(occurrences(SYS, "fn ioctl("), 1);
         // One definition plus exactly four call sites: a FIFTH wrapper reusing
-        // a pinned request would satisfy every other assertion here. Split at
-        // the test MODULE, since `sys.rs` puts `#[cfg(test)]` on individual
-        // constants too and the first one would truncate this to nothing.
-        let production_sys = SYS
-            .split_once("\n#[cfg(test)]\nmod tests {")
-            .map_or(SYS, |(source, _)| source);
+        // a pinned request would satisfy every other assertion here.
+        let production_sys = production(SYS);
         let mentions = occurrences(production_sys, "ioctl(");
         let prose = occurrences(production_sys, "ioctl(2)");
         assert_eq!(mentions - prose, 5);
@@ -722,9 +734,7 @@ fn syscall3(number: usize, a1: usize, a2: usize, a3: usize) -> isize {
             "sys::set_window_size(",
             "sys::window_size(",
         ];
-        let production_main = MAIN
-            .split_once("\n#[cfg(test)]")
-            .map_or(MAIN, |(source, _)| source);
+        let production_main = production(MAIN);
         for (name, source) in std::iter::once(("main.rs", production_main))
             .chain(OTHER.iter().copied())
             .chain(TEST_ONLY.iter().copied())
@@ -805,9 +815,7 @@ fn syscall3(number: usize, a1: usize, a2: usize, a3: usize) -> isize {
         }
         // Both wrappers are generic over `AsRawFd`, so inside pty.rs they
         // would type-check against ANY terminal — including an operator's.
-        let production_pty = pty
-            .split_once("\n#[cfg(test)]")
-            .map_or(pty, |(source, _)| source);
+        let production_pty = production(pty);
         // The IDENTIFIER count is the load-bearing one, and it is what the
         // spelling assertions below are not: a call written with a space, or
         // taken as a function pointer and called through that, satisfies

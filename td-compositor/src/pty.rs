@@ -4,13 +4,15 @@
 //! — is pure and tested without a device. Only `Pty` itself touches the kernel,
 //! and it does so through the four reviewed `ioctl(2)` requests in `sys.rs`.
 //!
-//! `term_client::run` opens a `Pty` and sizes it to the grid the compositor
-//! chose, so the readiness line names a grid something was actually set to.
-//! The CHILD half — the slave, the reader, the writer, the waiter — has no
-//! production caller yet. Host tests drive every item against a real PTY, and
-//! `selftest` covers the policy layer inside the packaged binary, where devpts
-//! may not be mounted. Each item still unwired carries its own `dead_code`
-//! allow rather than the module carrying one, so what is left is visible.
+//! `term_client::run` opens a `Pty`, sizes it to the grid the compositor
+//! chose — so the readiness line names a grid something was actually set to —
+//! and then starts the child on it: the slave, the reader thread and the
+//! waiter thread all have production callers. What is left unwired is the
+//! WRITER half, which is keyboard input and its own landing. Host tests drive
+//! every item against a real PTY, and `selftest` covers the policy layer
+//! inside the packaged binary, where devpts may not be mounted. Each item
+//! still unwired carries its own `dead_code` allow rather than the module
+//! carrying one, so what is left is visible.
 
 use crate::sys;
 use std::ffi::OsString;
@@ -19,7 +21,9 @@ use std::io::{Read, Write};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
-use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
+use std::sync::mpsc::SyncSender;
+#[cfg(test)]
+use std::sync::mpsc::{sync_channel, Receiver};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::thread::JoinHandle;
@@ -39,13 +43,30 @@ pub const CTTYHACK: &str = "/bin/cttyhack";
 pub const CTTYHACK_STDIN: &str = "--stdin";
 pub const DEFAULT_SHELL: &str = "/bin/sh";
 
+/// What a PTY reader puts on its channel: output, and then exactly one
+/// ending. The ending is a MESSAGE rather than only the thread's return value
+/// because nothing joins these threads — §12 forbids it, the read cannot be
+/// interrupted — so a terminal that learned of a fault only from a join handle
+/// would never learn of it at all.
+#[derive(Debug)]
+pub enum Output {
+    Bytes(Vec<u8>),
+    /// The child's last slave closed, which is the ordinary hangup — or the
+    /// read failed, which is the same end with a reason.
+    Ended(Result<(), String>),
+}
+
+/// What a child waiter puts on its channel, exactly once, for the same reason.
+#[derive(Debug)]
+pub enum Waited {
+    Exited(ExitStatus),
+    Failed(String),
+}
+
 /// §10's PTY-output ceiling, as whole read chunks. A full channel blocks the
 /// reader thread, which is how the kernel's PTY buffer backpressures the child.
-#[allow(dead_code)]
 pub const READ_CHUNK: usize = 8 * 1024;
-#[allow(dead_code)]
 pub const MAX_OUTPUT_BYTES: usize = 1024 * 1024;
-#[allow(dead_code)]
 pub const MAX_OUTPUT_CHUNKS: usize = MAX_OUTPUT_BYTES / READ_CHUNK;
 
 /// Bounded reads of the two small files the child environment is derived from.
@@ -77,7 +98,6 @@ impl Pty {
         Ok(Pty { master })
     }
 
-    #[allow(dead_code)]
     pub fn master(&self) -> &File {
         &self.master
     }
@@ -88,7 +108,6 @@ impl Pty {
     }
 
     /// The slave, obtained from the master rather than by name.
-    #[allow(dead_code)]
     pub fn peer(&self) -> Result<File, String> {
         sys::pty_peer(&self.master)
     }
@@ -252,7 +271,6 @@ pub fn account(passwd: &str, uid: u32) -> Result<Account, String> {
 }
 
 /// The account td-term runs as, read from the live process and account files.
-#[allow(dead_code)]
 pub fn current_account(status: &Path, passwd: &Path) -> Result<Account, String> {
     let uid = effective_uid(&read_bounded(status, MAX_STATUS_BYTES)?)?;
     account(&read_bounded(passwd, MAX_PASSWD_BYTES)?, uid)
@@ -318,7 +336,6 @@ pub fn child_command(wrapper: &Path, command: &[String]) -> Result<ChildCommand,
 /// child, so without this the shell would start in whatever directory td-svc
 /// left the graphical service in and disagree with its own environment. A home
 /// the child cannot enter fails the spawn rather than silently landing in `/`.
-#[allow(dead_code)]
 pub fn spawn(
     command: &ChildCommand,
     environment: &[(String, String)],
@@ -351,9 +368,11 @@ pub fn spawn(
     })
 }
 
-/// The bounded PTY-output channel between the reader thread and the main loop.
-#[allow(dead_code)]
-pub fn output_channel() -> (SyncSender<Vec<u8>>, Receiver<Vec<u8>>) {
+/// A channel of §10's output length, for tests that drive a reader on its
+/// own. The terminal's own channel is `term_client`'s, because it carries
+/// Wayland events too and one queue can only have one bound.
+#[cfg(test)]
+pub fn output_channel<T>() -> (SyncSender<T>, Receiver<T>) {
     sync_channel(MAX_OUTPUT_CHUNKS)
 }
 
@@ -375,23 +394,25 @@ pub fn output_channel() -> (SyncSender<Vec<u8>>, Receiver<Vec<u8>>) {
 /// thread cannot delay process exit, but a join would wait for a read that
 /// never returns. Interrupting the reader for any other reason needs a
 /// separately reviewed wakeup surface.
-#[allow(dead_code)]
-pub fn spawn_reader(
+pub fn spawn_reader<T: Send + 'static>(
     mut master: File,
-    sender: SyncSender<Vec<u8>>,
+    sender: SyncSender<T>,
+    wrap: fn(Output) -> T,
 ) -> Result<JoinHandle<Result<(), String>>, String> {
     thread::Builder::new()
         .name("td-term-pty".into())
         .spawn(move || {
             let mut buffer = vec![0u8; READ_CHUNK];
-            loop {
+            let ended = loop {
                 match master.read(&mut buffer) {
-                    Ok(0) => return Ok(()),
+                    Ok(0) => break Ok(()),
                     Ok(count) => {
                         let Some(bytes) = buffer.get(..count) else {
-                            return Err(format!("PTY read reported {count} bytes of a short buffer"));
+                            break Err(format!(
+                                "PTY read reported {count} bytes of a short buffer"
+                            ));
                         };
-                        if sender.send(bytes.to_vec()).is_err() {
+                        if sender.send(wrap(Output::Bytes(bytes.to_vec()))).is_err() {
                             return Ok(());
                         }
                     }
@@ -399,10 +420,16 @@ pub fn spawn_reader(
                     // EIO is the hangup this thread retires on. Every other
                     // errno is a real fault, and reporting it as a clean child
                     // exit would make a broken terminal look like a closed one.
-                    Err(error) if error.raw_os_error() == Some(EIO) => return Ok(()),
-                    Err(error) => return Err(format!("read terminal: {error}")),
+                    Err(error) if error.raw_os_error() == Some(EIO) => break Ok(()),
+                    Err(error) => break Err(format!("read terminal: {error}")),
                 }
-            }
+            };
+            // The ending goes on the CHANNEL and not only through the join
+            // handle. Nobody joins this thread — §12 forbids it, since the
+            // read it may be parked in cannot be interrupted — so a handle is
+            // somewhere an error goes to be lost.
+            let _ = sender.send(wrap(Output::Ended(ended.clone())));
+            ended
         })
         .map_err(|e| format!("spawn PTY reader: {e}"))
 }
@@ -612,10 +639,10 @@ fn spawn_pump<W: Write + Send + 'static>(
         .map_err(|e| format!("spawn PTY writer: {e}"))
 }
 
-/// One exit, so the main loop can unmap and go. Capacity one: there is exactly
-/// one child and it exits exactly once.
-#[allow(dead_code)]
-pub fn exit_channel() -> (SyncSender<ExitStatus>, Receiver<ExitStatus>) {
+/// One exit, for tests that drive a waiter on its own: there is exactly one
+/// child and it reports exactly once.
+#[cfg(test)]
+pub fn exit_channel<T>() -> (SyncSender<T>, Receiver<T>) {
     sync_channel(1)
 }
 
@@ -629,26 +656,35 @@ pub fn exit_channel() -> (SyncSender<ExitStatus>, Receiver<ExitStatus>) {
 /// closure on failure, and dropping a `Child` neither signals nor reaps. Losing
 /// it that way would leave a live process holding the slave — no hangup for the
 /// reader, and a zombie once it exits.
-#[allow(dead_code)]
-pub fn spawn_waiter(
+pub fn spawn_waiter<T: Send + 'static>(
     child: Child,
-    sender: SyncSender<ExitStatus>,
+    sender: SyncSender<T>,
+    wrap: fn(Waited) -> T,
 ) -> Result<JoinHandle<Result<(), String>>, String> {
     let held = Arc::new(Mutex::new(Some(child)));
     let carried = Arc::clone(&held);
     let spawned = thread::Builder::new()
         .name("td-term-child".into())
         .spawn(move || {
-            let mut child = carried
+            let waited = carried
                 .lock()
-                .map_err(|_| CHILD_POISONED)?
-                .take()
-                .ok_or("the child waiter was handed no child")?;
-            let status = child.wait().map_err(|e| format!("wait for child: {e}"))?;
+                .map_err(|_| CHILD_POISONED.to_string())
+                .and_then(|mut held| {
+                    held.take()
+                        .ok_or_else(|| "the child waiter was handed no child".to_string())
+                })
+                .and_then(|mut child| child.wait().map_err(|e| format!("wait for child: {e}")));
+            // Reported on the channel for the reader's reason: this thread is
+            // never joined either, so a failure returned alone is one the
+            // terminal cannot act on.
+            let message = match &waited {
+                Ok(status) => Waited::Exited(*status),
+                Err(error) => Waited::Failed(error.clone()),
+            };
             // Deliberately ignored: a closed receiver means the main loop is
             // already gone, which is not this thread's problem to report.
-            let _ = sender.send(status);
-            Ok(())
+            let _ = sender.send(wrap(message));
+            waited.map(|_| ())
         });
     match spawned {
         Ok(handle) => Ok(handle),
@@ -680,7 +716,10 @@ fn reap_unwatched(held: &Mutex<Option<Child>>, cause: &str) -> String {
 /// the live ioctl round trip is a host test, because the target selftest runs
 /// wherever the artifact does, including where devpts is not mounted.
 pub fn selftest() -> Result<(), String> {
-    let account = account("root:x:0:0:root:/root:/bin/sh\ntd:x:1000:1000::/var/home/td:/bin/sh\n", 1000)?;
+    let account = account(
+        "root:x:0:0:root:/root:/bin/sh\ntd:x:1000:1000::/var/home/td:/bin/sh\n",
+        1000,
+    )?;
     if account.name != "td" || account.home != "/var/home/td" {
         return Err("PTY selftest selected the wrong account".into());
     }
@@ -706,7 +745,11 @@ pub fn selftest() -> Result<(), String> {
     }
     let command = child_command(Path::new(CTTYHACK), &[])?;
     if command.program != Path::new(CTTYHACK)
-        || command.arguments != vec![OsString::from(CTTYHACK_STDIN), OsString::from(DEFAULT_SHELL)]
+        || command.arguments
+            != vec![
+                OsString::from(CTTYHACK_STDIN),
+                OsString::from(DEFAULT_SHELL),
+            ]
     {
         return Err("PTY selftest composed the wrong child command".into());
     }
@@ -785,7 +828,9 @@ mod tests {
         let duplicate = format!("{PASSWD}other:x:1000:1000::/var/home/other:/bin/sh\n");
         assert!(account_error(&duplicate, 1000).contains("more than one entry"));
         assert!(account_error("td:x:1000:1000::/var/home/td\n", 1000).contains("6 fields"));
-        assert!(account_error(":x:1000:1000::/var/home/td:/bin/sh\n", 1000).contains("no user name"));
+        assert!(
+            account_error(":x:1000:1000::/var/home/td:/bin/sh\n", 1000).contains("no user name")
+        );
         assert!(
             account_error("td:x:1000:1000::var/home/td:/bin/sh\n", 1000).contains("relative home")
         );
@@ -848,17 +893,25 @@ mod tests {
         assert_eq!(default.arguments, vec!["--stdin", "/bin/sh"]);
         let explicit = child_command(
             Path::new(CTTYHACK),
-            &["/bin/sh".to_string(), "-c".to_string(), "echo hi".to_string()],
+            &[
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                "echo hi".to_string(),
+            ],
         )
         .unwrap();
-        assert_eq!(explicit.arguments, vec!["--stdin", "/bin/sh", "-c", "echo hi"]);
+        assert_eq!(
+            explicit.arguments,
+            vec!["--stdin", "/bin/sh", "-c", "echo hi"]
+        );
         assert!(child_command(Path::new("cttyhack"), &[]).is_err());
         assert!(child_command(Path::new(CTTYHACK), &["sh".to_string()]).is_err());
     }
 
     #[test]
     fn current_account_reads_the_live_process_and_account_files() {
-        let directory = std::env::temp_dir().join(format!("td-term-account-{}", std::process::id()));
+        let directory =
+            std::env::temp_dir().join(format!("td-term-account-{}", std::process::id()));
         std::fs::create_dir_all(&directory).unwrap();
         let passwd = directory.join("passwd");
         std::fs::write(&passwd, PASSWD).unwrap();
@@ -896,7 +949,7 @@ mod tests {
         let mut slave = pty.peer().unwrap();
         let master = pty.master().try_clone().unwrap();
         let (sender, receiver) = output_channel();
-        let reader = spawn_reader(master, sender).unwrap();
+        let reader = spawn_reader(master, sender, std::convert::identity).unwrap();
 
         // Through the bounded queue, as the writer thread will: the queue is
         // what makes a partial write recoverable.
@@ -915,10 +968,13 @@ mod tests {
         slave.write_all(b"output\n").unwrap();
         let mut delivered = Vec::new();
         while !delivered.windows(6).any(|window| window == b"output") {
-            let chunk = receiver
+            match receiver
                 .recv_timeout(Duration::from_secs(10))
-                .expect("the reader thread stopped before delivering output");
-            delivered.extend_from_slice(&chunk);
+                .expect("the reader thread stopped before delivering output")
+            {
+                Output::Bytes(chunk) => delivered.extend_from_slice(&chunk),
+                ended => panic!("the reader ended before its output: {ended:?}"),
+            }
         }
 
         // Dropping every slave descriptor is the kernel's hangup, and the
@@ -927,6 +983,19 @@ mod tests {
         // parked in `read` forever, and joining first would hang the gate
         // instead of failing it — `cargo test` has no per-test timeout.
         drop(slave);
+        // The hangup is REPORTED and not only survived. Nothing joins this
+        // thread in production, so the message is the terminal's only way to
+        // learn its child's output has ended — and the disconnect that
+        // follows is what says it said so exactly once.
+        loop {
+            match receiver.recv_timeout(Duration::from_secs(30)) {
+                // Whatever the line discipline still owed, which is not this
+                // assertion's business.
+                Ok(Output::Bytes(_)) => {}
+                Ok(Output::Ended(Ok(()))) => break,
+                other => panic!("the reader did not report the hangup: {other:?}"),
+            }
+        }
         assert!(
             matches!(
                 receiver.recv_timeout(Duration::from_secs(30)),
@@ -961,11 +1030,11 @@ mod tests {
 
         let master = pty.into_master();
         let (sender, receiver) = output_channel();
-        let reader = spawn_reader(master, sender).unwrap();
+        let reader = spawn_reader(master, sender, std::convert::identity).unwrap();
         let mut seen = String::new();
         let marker = loop {
             match receiver.recv_timeout(Duration::from_secs(30)) {
-                Ok(chunk) => {
+                Ok(Output::Bytes(chunk)) => {
                     seen.push_str(&String::from_utf8_lossy(&chunk));
                     // Complete lines only. `str::lines` yields an
                     // unterminated tail as a line, so a chunk boundary inside
@@ -981,6 +1050,7 @@ mod tests {
                         break marker;
                     }
                 }
+                Ok(ended) => panic!("the reader ended before the marker: {ended:?}"),
                 Err(error) => panic!("no fixture marker in {seen:?}: {error}"),
             }
         };
@@ -991,7 +1061,10 @@ mod tests {
         let home = home.canonicalize().unwrap();
         assert_eq!(marker, format!("31 97 td-term 11 {}", home.display()));
         let status = child.wait().unwrap();
-        assert!(status.success(), "the fixture failed its own checks: {status}");
+        assert!(
+            status.success(),
+            "the fixture failed its own checks: {status}"
+        );
         // Same ordering as above: the child's exit closed the last slave, so
         // the channel must disconnect before the join can be safe.
         while receiver.recv_timeout(Duration::from_secs(30)).is_ok() {}
@@ -1120,7 +1193,7 @@ mod tests {
         // to keep moving or the CHILD blocks in its own write — a deadlock of
         // this test's making rather than anything about the writer.
         let (chunks, output) = output_channel();
-        let reader = spawn_reader(master, chunks).unwrap();
+        let reader = spawn_reader(master, chunks, std::convert::identity).unwrap();
         let drain = thread::spawn(move || while output.recv().is_ok() {});
 
         let sequence = vec![b'z'; 1024];
@@ -1137,10 +1210,11 @@ mod tests {
             .unwrap();
 
         let (sender, receiver) = exit_channel();
-        spawn_waiter(child, sender).unwrap();
-        receiver
-            .recv_timeout(Duration::from_secs(30))
-            .expect("the silent child never exited");
+        spawn_waiter(child, sender, std::convert::identity).unwrap();
+        assert!(matches!(
+            receiver.recv_timeout(Duration::from_secs(30)),
+            Ok(Waited::Exited(_))
+        ));
         // The child was the only slave holder, so its exit is the reader's EOF.
         within(move || reader.join())
             .expect("the reader never saw the hangup")
@@ -1295,7 +1369,10 @@ mod tests {
         assert!(input.push(b"hello ").unwrap());
         assert!(input.push(b"world\n").unwrap());
         // Canonical input, so the slave sees the line once its newline lands.
-        assert_eq!(read_within(&slave).expect("no line arrived"), b"hello world\n");
+        assert_eq!(
+            read_within(&slave).expect("no line arrived"),
+            b"hello world\n"
+        );
 
         // Closing drains and retires, which is why this handle can be joined
         // where the reader's cannot.
@@ -1305,7 +1382,10 @@ mod tests {
             .expect("the writer never retired")
             .unwrap()
             .unwrap();
-        assert_eq!(read_within(&slave).expect("the tail never drained"), b"tail\n");
+        assert_eq!(
+            read_within(&slave).expect("the tail never drained"),
+            b"tail\n"
+        );
         // A push after the close is refused rather than queued for a writer
         // that has gone.
         assert!(!input.push(b"x").unwrap());
@@ -1392,17 +1472,23 @@ mod tests {
         let child = spawn(&command, &environment, &std::env::temp_dir(), slave).unwrap();
 
         let (sender, receiver) = exit_channel();
-        let waiter = spawn_waiter(child, sender).unwrap();
+        let waiter = spawn_waiter(child, sender, std::convert::identity).unwrap();
         // Drain the master so the fixture's own output cannot fill the buffer
         // and stall the exit this is waiting for.
         let master = pty.into_master();
         let (chunks, output) = output_channel();
-        let reader = spawn_reader(master, chunks).unwrap();
+        let reader = spawn_reader(master, chunks, std::convert::identity).unwrap();
 
-        let status = receiver
+        let Waited::Exited(status) = receiver
             .recv_timeout(Duration::from_secs(30))
-            .expect("the child waiter reported no exit");
-        assert!(status.success(), "the fixture failed its own checks: {status}");
+            .expect("the child waiter reported no exit")
+        else {
+            panic!("the waiter reported a failure rather than an exit")
+        };
+        assert!(
+            status.success(),
+            "the fixture failed its own checks: {status}"
+        );
         waiter.join().unwrap().unwrap();
         // Only a DISCONNECT ends this: a timeout here means the reader is
         // still parked, and joining it then would hang rather than fail.

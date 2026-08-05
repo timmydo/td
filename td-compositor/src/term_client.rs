@@ -15,10 +15,11 @@ use crate::font::Font;
 use crate::pty::Pty;
 use crate::scene::SHM_XRGB8888;
 use crate::term::Terminal;
-use crate::{font, pty, ready, render, wire, MAX_UI_DIMENSION, MAX_UI_FRAME_BYTES};
+use crate::{font, pty, ready, render, socket, wire, MAX_UI_DIMENSION, MAX_UI_FRAME_BYTES};
 use std::collections::BTreeSet;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::process::ExitStatus;
 use std::sync::mpsc::{sync_channel, SyncSender};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -32,6 +33,13 @@ pub struct Options {
 /// coming, and a terminal that waits forever is one td-svc reports as down
 /// without ever saying why. §12 sets it below the supervisor's 30.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// Where the session's own identity is read from. Named here rather than
+/// inline so the two files the account is derived from are visible together:
+/// the uid comes from the first and everything else from the second, and a
+/// disagreement between them is what `current_account` refuses on.
+const PROC_STATUS: &str = "/proc/self/status";
+const ETC_PASSWD: &str = "/etc/passwd";
 
 /// One past the last fixed id the TERMINAL creates. It binds no seat and
 /// creates no keyboard or pointer, so its dynamic range starts three lower
@@ -203,6 +211,10 @@ struct Surface {
     /// readiness line names. On the surface because `adopt_size` is what
     /// establishes it and both loops go through there.
     cells: Option<(u16, u16)>,
+    /// The model changed under a picture that did not. `drawn` answers "is
+    /// the frame for the right SIZE and focus"; nothing in it can answer "is
+    /// it for the right CONTENTS", because the contents are not a size.
+    stale: bool,
     live_buffers: BTreeSet<u32>,
     live_callbacks: BTreeSet<u32>,
     frame: Option<Frame>,
@@ -222,6 +234,7 @@ impl Surface {
             needs_commit: false,
             drawn: None,
             cells: None,
+            stale: false,
             live_buffers: BTreeSet::new(),
             live_callbacks: BTreeSet::new(),
             frame: None,
@@ -558,8 +571,13 @@ fn adopt_size(
     surface: &mut Surface,
     model: &mut Option<Terminal>,
     session: &Session,
-    size: Size,
 ) -> Result<(), String> {
+    // The size comes off the surface, not from the caller: `redraw` reads it
+    // there too, and a size passed in beside one read out is two answers to
+    // one question.
+    let Some(size) = surface.current else {
+        return Ok(());
+    };
     // Before the model, not only before the pixels: `build_pixels` checks
     // this again, but by then `Terminal::new` has already allocated for a
     // size nothing bounded. Deleting this line reds nothing, because the
@@ -571,30 +589,46 @@ fn adopt_size(
         .pty
         .resize(usize::from(rows), usize::from(columns))?;
     let (rows, columns) = (usize::from(window.rows), usize::from(window.columns));
-    let terminal = match model.as_mut() {
+    match model.as_mut() {
         // Reflowed, NOT rebuilt: a `Terminal::new` here would leave the
         // screen intact only because it is empty today, and would silently
         // erase a session's scrollback the moment a child writes to one.
-        Some(terminal) => {
-            terminal.resize(rows, columns)?;
-            terminal
+        Some(terminal) => terminal.resize(rows, columns)?,
+        None => {
+            *model = Some(Terminal::new(rows, columns)?);
         }
-        None => model.insert(Terminal::new(rows, columns)?),
+    }
+    surface.cells = Some((window.rows, window.columns));
+    redraw(connection, surface, model, session)
+}
+
+/// Put what the model says on the screen, at whatever size the surface holds.
+/// This is the path OUTPUT takes: nothing about the geometry changed and only
+/// the contents did, so there is nothing to tell the PTY and nothing to
+/// reflow.
+fn redraw(
+    connection: &mut Connection,
+    surface: &mut Surface,
+    model: &Option<Terminal>,
+    session: &Session,
+) -> Result<(), String> {
+    let Some(wanted) = surface.wanted() else {
+        return Ok(());
     };
+    let terminal = model
+        .as_ref()
+        .ok_or_else(|| "the terminal has no model to draw".to_string())?;
     commit_frame(
         connection,
         surface,
         session.directory,
-        size,
+        wanted.size,
         terminal,
         session.font,
         session.palette,
     )?;
-    surface.drawn = Some(Drawn {
-        size,
-        activated: surface.activated,
-    });
-    surface.cells = Some((window.rows, window.columns));
+    surface.drawn = Some(wanted);
+    surface.stale = false;
     Ok(())
 }
 
@@ -617,16 +651,81 @@ struct Session<'a> {
 /// the ones the next landing adds.
 enum Event {
     Wayland(wire::Message),
-    /// The reading thread stopping, and why. It cannot return an error to
-    /// anyone, so it reports one and ends; the loop is where that becomes a
-    /// failure the process exits on.
+    /// Bytes the child wrote. Whole reads, not lines: the parser is a state
+    /// machine and an escape sequence split across two reads is ordinary.
+    Output(Vec<u8>),
+    /// The child is gone, which ends the session — a terminal outliving its
+    /// shell is a window nobody can type into.
+    Exit(ExitStatus),
+    /// The child's output ending: its last slave is closed and nothing more
+    /// will ever arrive on it.
+    Drained,
+    /// A producer stopping, and why. None of the three can return an error to
+    /// anyone — nothing joins them — so each reports one and ends; the loop is
+    /// where that becomes a failure the process exits on.
     Closed(String),
 }
 
 /// How many events may be in flight before a producer blocks. A blocked
 /// producer is the point: the alternative to waiting is dropping events, and
-/// a dropped configure is a window stuck at the wrong size.
-const MAX_PENDING_EVENTS: usize = 64;
+/// a dropped configure is a window stuck at the wrong size — while a blocked
+/// PTY reader is how §12 has the kernel's own buffer backpressure the child.
+///
+/// §10 bounds the output this process will hold for a child, and one channel
+/// now carries that output along with everything else, so the QUEUE is what
+/// has to honour the bound: its whole length in read chunks is the ceiling.
+/// Wayland events share those slots rather than being given more, which costs
+/// nothing that matters — they are small, and the loop drains them — while a
+/// longer queue would let output alone exceed the bound.
+const MAX_PENDING_EVENTS: usize = pty::MAX_OUTPUT_CHUNKS;
+
+/// Checked where a test cannot be defeated by a filter, since all three sides
+/// are constants: a queue that could hold more than §10's ceiling is a build
+/// that does not happen. It would pass every test here otherwise — a queue
+/// bounds memory, and nothing observes how much — while holding half again
+/// as much of a child's output as the design says it may.
+const _: () = assert!(MAX_PENDING_EVENTS * pty::READ_CHUNK <= pty::MAX_OUTPUT_BYTES);
+
+/// The PTY reader's vocabulary in the loop's. Its ending is an event like any
+/// other: output that stopped for a reason is a terminal that failed, and
+/// output that simply ran out is a child whose last slave closed.
+fn from_output(output: pty::Output) -> Event {
+    match output {
+        pty::Output::Bytes(bytes) => Event::Output(bytes),
+        pty::Output::Ended(Ok(())) => Event::Drained,
+        pty::Output::Ended(Err(error)) => Event::Closed(error),
+    }
+}
+
+/// The child waiter's, the same way. A wait that failed leaves the terminal
+/// unable to say how its child ended, which is a fault rather than an ending.
+fn from_waited(waited: pty::Waited) -> Event {
+    match waited {
+        pty::Waited::Exited(status) => Event::Exit(status),
+        pty::Waited::Failed(error) => Event::Closed(error),
+    }
+}
+
+/// What the terminal has learned about its child's ending. BOTH halves are
+/// needed and they race: the kernel hangs the reader up and the waiter's
+/// `wait` returns at the same instant, in either order.
+///
+/// Ending on the exit alone would drop whatever the child wrote last — the
+/// bytes are still in the kernel, and `Event::Exit` can overtake them — and a
+/// shell's parting line is exactly the case. Ending on the drain alone would
+/// name no status, since the wait may not have returned yet. So the terminal
+/// ends when its output has run out AND its child has been waited for, which
+/// is deterministic in a way neither half is.
+///
+/// A child that closes its descriptors and keeps running therefore keeps the
+/// terminal, and so does a grandchild still holding the slave after the child
+/// is gone: in both cases one half has not happened, and in both cases there
+/// is still something the terminal is for.
+#[derive(Default)]
+struct Ending {
+    drained: bool,
+    status: Option<ExitStatus>,
+}
 
 /// Read Wayland events until the connection ends, and hand each to the loop.
 /// This thread never writes: every request goes out from the main loop, so
@@ -683,31 +782,138 @@ fn serve_event(
     model: &mut Option<Terminal>,
     session: &Session,
     fallback: Size,
+    ending: &mut Ending,
     event: Event,
 ) -> Result<(), String> {
     match event {
         Event::Closed(error) => return Err(error),
+        Event::Exit(status) => ending.status = Some(status),
+        Event::Drained => ending.drained = true,
         Event::Wayland(message) => {
             if !connection.handle_common(&message)? {
                 surface.dispatch(connection, &message, fallback)?;
             }
         }
+        Event::Output(bytes) => {
+            let terminal = model
+                .as_mut()
+                .ok_or_else(|| "the child wrote before the terminal had a model".to_string())?;
+            terminal.feed(&bytes);
+            // Drained and DISCARDED. A reply is an answer the child asked
+            // for, and answering needs the writer thread §12 puts beside this
+            // one, which lands with the keyboard; leaving them here instead
+            // would grow a buffer for every query a program makes.
+            terminal.take_replies();
+            surface.stale = true;
+        }
+    }
+    // Both halves, in either order.
+    if let (true, Some(status)) = (ending.drained, ending.status) {
+        return Err(ended(status));
     }
     let Some(wanted) = surface.wanted() else {
         return Ok(());
     };
     // Throttled on the frame in flight, which is what stops a burst of
-    // configures becoming a burst of pools: only the LATEST is ever drawn,
-    // because the ones in between are superseded in `current` before anything
-    // allocates for them. The release and the callback are events too, so the
-    // frame completing is what brings the deferred redraw back here — there is
-    // nothing to wait on that is not already an event.
-    if surface.drawn != Some(wanted) && !surface.frame_in_flight() {
-        return adopt_size(connection, surface, model, session, wanted.size);
+    // configures — or of output — becoming a burst of pools: only the LATEST
+    // state is ever drawn, because what comes in between is superseded in the
+    // surface and the model before anything allocates for it. The release and
+    // the callback are events too, so the frame completing is what brings the
+    // deferred redraw back here — there is nothing to wait on that is not
+    // already an event.
+    if !surface.frame_in_flight() {
+        if surface.drawn != Some(wanted) {
+            return adopt_size(connection, surface, model, session);
+        }
+        if surface.stale {
+            return redraw(connection, surface, model, session);
+        }
     }
     // The acknowledgement is still owed a commit even when the pixels cannot
     // be replaced yet.
     surface.commit_configure(connection)
+}
+
+/// Start the session's child on the PTY and put its output and its exit on
+/// the loop's channel.
+///
+/// §12 orders this after the winsize is set and verified, which `present` has
+/// already done: a shell that asks its terminal how big it is at startup — as
+/// anything drawing a prompt does — must not be told a size the surface does
+/// not have. The slave is consumed by the spawn and every parent-side clone
+/// of it is dropped there, so the master is the only handle left and closing
+/// it is the kernel's ordinary hangup.
+fn start_child(
+    pty: &Pty,
+    events: &SyncSender<Event>,
+    command: &pty::ChildCommand,
+    account: &pty::Account,
+) -> Result<Vec<JoinHandle<Result<(), String>>>, String> {
+    let output = pty
+        .master()
+        .try_clone()
+        .map_err(|e| format!("duplicate the terminal device for its reader: {e}"))?;
+    let slave = pty.peer()?;
+    let child = pty::spawn(
+        command,
+        &pty::environment(account),
+        Path::new(&account.home),
+        slave,
+    )?;
+
+    // Two producers, both feeding the one channel the loop serves. The reader
+    // blocking on a full channel is how §12 has the kernel's PTY buffer
+    // backpressure the child rather than this process buffering for it.
+    //
+    // The WAITER goes first, and that order is the child's safety rather than
+    // a preference: from here the only fallible step left is a thread spawn,
+    // and `spawn_waiter` takes the child back and reaps it when its own
+    // fails. Spawning the reader first would drop a live `Child` on that
+    // failure — no signal, no reap — leaving a process holding the slave, so
+    // no hangup for anyone and a zombie once it does exit.
+    let waiter = pty::spawn_waiter(child, events.clone(), from_waited)?;
+    let reader = pty::spawn_reader(output, events.clone(), from_output)?;
+    Ok(vec![waiter, reader])
+}
+
+/// What a started terminal leaves behind it: the child's two threads, and
+/// the readiness socket for as long as the process is up.
+type Running = (Vec<JoinHandle<Result<(), String>>>, socket::Published);
+
+/// Start the child, and only then advertise the terminal.
+///
+/// The ORDER is the contract: resolving the account, spawning the shell and
+/// spawning its two threads can each fail, and a probe told the terminal is up
+/// on a terminal whose shell never started has been told something that was
+/// never true. It is a function rather than two lines of `run` because `run`
+/// dials a socket and never returns, so an ordering asserted only there is one
+/// no test can watch.
+fn start(
+    pty: &Pty,
+    events: &SyncSender<Event>,
+    status: &Path,
+    passwd: &Path,
+    ready_socket: &Path,
+    cells: (u16, u16),
+) -> Result<Running, String> {
+    let account = pty::current_account(status, passwd)?;
+    let command = pty::child_command(Path::new(pty::CTTYHACK), &[])?;
+    let children = start_child(pty, events, &command, &account)?;
+    let (rows, columns) = cells;
+    let published = ready::publish(ready_socket, rows, columns)?;
+    Ok((children, published))
+}
+
+/// A child ending ends the session: a terminal outliving its shell is a
+/// window nobody can type into, and td-svc restarting the service is what
+/// puts a fresh one there. Reported rather than swallowed, because "the
+/// shell exited" and "the compositor went away" are different things for
+/// whoever reads the log.
+fn ended(status: ExitStatus) -> String {
+    match status.code() {
+        Some(code) => format!("the terminal's child exited with status {code}"),
+        None => format!("the terminal's child was killed by a signal ({status})"),
+    }
 }
 
 /// The same turn, reading the event here. Startup has nothing else to serve,
@@ -721,12 +927,15 @@ fn serve_turn(
     fallback: Size,
 ) -> Result<(), String> {
     let message = connection.next()?;
+    // Startup has no child, so nothing here can reach an ending: the two
+    // events that make one are produced by threads `start` has not spawned.
     serve_event(
         connection,
         surface,
         model,
         session,
         fallback,
+        &mut Ending::default(),
         Event::Wayland(message),
     )
 }
@@ -867,9 +1076,15 @@ pub fn run(options: &Options) -> Result<(), String> {
     // been told something true for less than a second.
     let reader = connection.detach_reader()?;
     let (sender, events) = sync_channel(MAX_PENDING_EVENTS);
-    let _wayland = spawn_wayland_reader(reader, sender)?;
-
-    let _ready = ready::publish(&options.ready_socket, rows, columns)?;
+    let _wayland = spawn_wayland_reader(reader, sender.clone())?;
+    let (_children, _ready) = start(
+        &pty,
+        &sender,
+        Path::new(PROC_STATUS),
+        Path::new(ETC_PASSWD),
+        &options.ready_socket,
+        (rows, columns),
+    )?;
     // `write_all` rather than `print!`, which PANICS on a write failure — and
     // a panic here would abort past `Published::drop` and leave the socket
     // behind. One encoder, so the diagnostic an operator reads and the line a
@@ -880,21 +1095,30 @@ pub fn run(options: &Options) -> Result<(), String> {
     out.flush()
         .map_err(|e| format!("flush terminal ready marker: {e}"))?;
 
-    // Reading moved off the main thread above, and not before: startup has
-    // one source and can afford to block in it, while a terminal with a child
-    // cannot. Nothing else produces events yet — the child's output and its
-    // exit are the next landing — so today this loop has one producer and the
-    // shape it will need for three.
+    // Three producers now — the Wayland reader, the PTY reader and the child
+    // waiter — and one loop serving all of them, which is what §12 means by
+    // "bounded messages to one main loop". Reading moved off the main thread
+    // above, and not before: startup has one source and can afford to block
+    // in it, while a terminal with a child cannot.
+    //
+    // The loop's own handle goes first, or `recv` can never fail: a channel
+    // with a live sender in this thread stays open however few producers are
+    // left, and a terminal every producer had abandoned would park here
+    // forever holding a mapped surface. Each producer reports before it ends,
+    // so this is the case where one did not.
+    drop(sender);
+    let mut ending = Ending::default();
     loop {
         let event = events
             .recv()
-            .map_err(|_| "the Wayland reader thread stopped without reporting".to_string())?;
+            .map_err(|_| "every terminal producer stopped without reporting".to_string())?;
         serve_event(
             &mut connection,
             &mut surface,
             &mut model,
             &session,
             fallback,
+            &mut ending,
             event,
         )?;
     }
@@ -921,7 +1145,12 @@ mod tests {
     use super::*;
     use crate::conn::{DISPLAY, KEYBOARD, POINTER, SEAT, SURFACE, SYNC_CALLBACK};
     use std::os::unix::net::UnixStream;
+    use std::sync::atomic::{AtomicU32, Ordering};
     use std::time::Duration;
+
+    /// Distinct paths for tests that create one, since the suite runs them on
+    /// threads of one process in a shared directory.
+    static SEQ: AtomicU32 = AtomicU32::new(0);
 
     fn font() -> Font {
         font::pinned().unwrap()
@@ -1680,7 +1909,8 @@ mod tests {
         let mut model = None;
 
         let first = default_size(&font).unwrap();
-        adopt_size(&mut connection, &mut surface, &mut model, &session, first).unwrap();
+        surface.current = Some(first);
+        adopt_size(&mut connection, &mut surface, &mut model, &session).unwrap();
         assert_eq!(surface.cells, Some((24, 80)));
         let window = pty.window().unwrap();
         assert_eq!((window.rows, window.columns), (24, 80));
@@ -1697,7 +1927,8 @@ mod tests {
             width: 592,
             height: 352,
         };
-        adopt_size(&mut connection, &mut surface, &mut model, &session, second).unwrap();
+        surface.current = Some(second);
+        adopt_size(&mut connection, &mut surface, &mut model, &session).unwrap();
         assert_eq!(surface.cells, Some((22, 74)));
         let window = pty.window().unwrap();
         assert_eq!(
@@ -1823,6 +2054,25 @@ mod tests {
         );
     }
 
+    /// What an event IS, for a panic message that has to name the one it did
+    /// not want without matching every arm at each call site.
+    fn screen(terminal: &Terminal) -> String {
+        (0..terminal.rows())
+            .map(|row| terminal.row_text(row).unwrap_or_default())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn named(event: &Event) -> &'static str {
+        match event {
+            Event::Wayland(_) => "a Wayland event",
+            Event::Output(_) => "child output",
+            Event::Exit(_) => "a child exit",
+            Event::Drained => "the end of the child's output",
+            Event::Closed(_) => "a closed connection",
+        }
+    }
+
     /// The wire form of an event, so a test can hand the client one the way a
     /// compositor would rather than calling `dispatch` behind the loop's back.
     fn write_event(peer: &mut UnixStream, message: &wire::Message) {
@@ -1870,14 +2120,8 @@ mod tests {
         };
         let fallback = default_size(&font).unwrap();
         let mut model = None;
-        adopt_size(
-            &mut connection,
-            &mut surface,
-            &mut model,
-            &session,
-            fallback,
-        )
-        .unwrap();
+        surface.current = Some(fallback);
+        adopt_size(&mut connection, &mut surface, &mut model, &session).unwrap();
         let first = surface.frame.as_ref().unwrap();
         let (buffer, callback) = (first.buffer, first.callback);
 
@@ -1973,14 +2217,8 @@ mod tests {
         };
         let fallback = default_size(&font).unwrap();
         let mut model = None;
-        adopt_size(
-            &mut connection,
-            &mut surface,
-            &mut model,
-            &session,
-            fallback,
-        )
-        .unwrap();
+        surface.current = Some(fallback);
+        adopt_size(&mut connection, &mut surface, &mut model, &session).unwrap();
         let first = surface.frame.as_ref().unwrap();
         let (buffer, callback) = (first.buffer, first.callback);
         write_event(&mut peer, &message(buffer, 0, Vec::new()));
@@ -2039,7 +2277,7 @@ mod tests {
 
         match events.recv_timeout(Duration::from_secs(10)).unwrap() {
             Event::Closed(error) => assert!(error.contains("unexpected descriptor"), "{error}"),
-            Event::Wayland(_) => panic!("an unclaimed descriptor was served as an ordinary event"),
+            other => panic!("an unclaimed descriptor was served as {}", named(&other)),
         }
         thread.join().unwrap();
     }
@@ -2062,12 +2300,12 @@ mod tests {
             Event::Wayland(message) => {
                 assert_eq!((message.object, message.opcode), (XDG_SURFACE, 0));
             }
-            Event::Closed(error) => panic!("the reader reported {error} instead of an event"),
+            other => panic!("the reader produced {} instead of an event", named(&other)),
         }
         drop(theirs);
         match events.recv_timeout(Duration::from_secs(10)).unwrap() {
             Event::Closed(error) => assert!(error.contains("closed the connection"), "{error}"),
-            Event::Wayland(_) => panic!("a closed connection produced an event"),
+            other => panic!("a closed connection produced {}", named(&other)),
         }
         thread.join().unwrap();
     }
@@ -2101,11 +2339,455 @@ mod tests {
             &mut model,
             &session,
             fallback,
+            &mut Ending::default(),
             Event::Closed("compositor went away".into()),
         )
         .err()
         .unwrap();
         assert_eq!(refused, "compositor went away");
+    }
+
+    /// Output feeds the model even when the picture cannot be replaced yet,
+    /// and the redraw it asks for waits for the frame in flight. Dropping the
+    /// bytes instead would lose whatever a child wrote between two frames.
+    #[test]
+    fn output_while_a_frame_is_in_flight_feeds_the_model_and_waits() {
+        let (mut connection, _peer) = pair();
+        let mut surface = Surface::new(Bound {
+            compositor: 1,
+            shm: 2,
+            xdg_wm_base: 4,
+        });
+        surface.xrgb = true;
+        let font = font();
+        let palette = render::Palette::pinned();
+        let pty = Pty::open(Path::new(pty::DEV_PTMX)).unwrap();
+        let directory = std::env::temp_dir();
+        let session = Session {
+            directory: &directory,
+            pty: &pty,
+            font: &font,
+            palette: &palette,
+        };
+        let fallback = default_size(&font).unwrap();
+        surface.current = Some(fallback);
+        let mut model = None;
+        adopt_size(&mut connection, &mut surface, &mut model, &session).unwrap();
+        let drawn = surface.drawn;
+        surface.frame = Some(frame(false, false));
+
+        serve_event(
+            &mut connection,
+            &mut surface,
+            &mut model,
+            &session,
+            fallback,
+            &mut Ending::default(),
+            Event::Output(b"held".to_vec()),
+        )
+        .unwrap();
+        assert!(screen(model.as_ref().unwrap()).contains("held"));
+        assert!(surface.stale, "the deferred redraw was forgotten");
+        assert_eq!(surface.drawn, drawn, "a frame was drawn over one in flight");
+
+        // The frame comes back, and the next turn is what spends the debt.
+        surface.frame = Some(frame(true, true));
+        serve_event(
+            &mut connection,
+            &mut surface,
+            &mut model,
+            &session,
+            fallback,
+            &mut Ending::default(),
+            Event::Output(b"more".to_vec()),
+        )
+        .unwrap();
+        assert!(!surface.stale);
+        assert!(surface.frame_in_flight(), "the redraw produced no frame");
+    }
+
+    /// Output before the first configure has nothing to feed. It cannot happen
+    /// — the child is started after the terminal is up — so it is a fault
+    /// rather than something to swallow.
+    #[test]
+    fn output_before_a_model_exists_is_a_failure() {
+        let (mut connection, _peer) = pair();
+        let mut surface = Surface::new(Bound {
+            compositor: 1,
+            shm: 2,
+            xdg_wm_base: 4,
+        });
+        let font = font();
+        let palette = render::Palette::pinned();
+        let pty = Pty::open(Path::new(pty::DEV_PTMX)).unwrap();
+        let directory = std::env::temp_dir();
+        let session = Session {
+            directory: &directory,
+            pty: &pty,
+            font: &font,
+            palette: &palette,
+        };
+        let fallback = default_size(&font).unwrap();
+        let mut model = None;
+        let error = serve_event(
+            &mut connection,
+            &mut surface,
+            &mut model,
+            &session,
+            fallback,
+            &mut Ending::default(),
+            Event::Output(b"early".to_vec()),
+        )
+        .err()
+        .unwrap();
+        assert!(error.contains("before the terminal had a model"), "{error}");
+    }
+
+    /// A terminal that could not start its shell is not a terminal, and a
+    /// probe must not be able to accept one. The account file is the failure
+    /// injected because it is the first thing `start_child` reads; what is
+    /// asserted is not the error but the SOCKET, which is what a probe sees.
+    ///
+    /// This holds under BOTH orderings — publishing first and failing after
+    /// leaves nothing behind either, because `socket::Published` unlinks on
+    /// drop — so it is the outcome that is pinned here and not the order.
+    /// What the order buys beyond it is the WINDOW: published first, the
+    /// socket is real for as long as the spawn takes, and a probe that
+    /// connected inside it would be answered.
+    #[test]
+    fn a_terminal_that_cannot_start_its_child_is_never_advertised() {
+        let pty = Pty::open(Path::new(pty::DEV_PTMX)).unwrap();
+        let (sender, _events) = sync_channel(MAX_PENDING_EVENTS);
+        let directory = std::env::temp_dir();
+        let ready_socket = directory.join(format!(
+            "td-term-unstarted-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let missing = directory.join("td-term-no-such-passwd");
+        assert!(!missing.exists(), "the fixture path exists on this host");
+
+        let error = start(
+            &pty,
+            &sender,
+            Path::new(PROC_STATUS),
+            &missing,
+            &ready_socket,
+            (22, 74),
+        )
+        .err()
+        .unwrap();
+        assert!(error.contains("td-term-no-such-passwd"), "{error}");
+        assert!(
+            !ready_socket.exists(),
+            "readiness was published for a terminal with no child"
+        );
+    }
+
+    /// What the loop does with the two things a child can ask for that are not
+    /// pixels. A reply is DROPPED, because answering needs the writer thread
+    /// that lands with the keyboard and an answer sent minutes late is worse
+    /// than none. The BELL is deliberately kept: §10 says the next submitted
+    /// frame inverts a one-pixel ring and clears the bit after release, and
+    /// taking it here would destroy the only record that a notification ever
+    /// happened.
+    #[test]
+    fn a_query_is_answered_by_nobody_and_a_bell_waits_to_be_drawn() {
+        let (mut connection, _peer) = pair();
+        let mut surface = Surface::new(Bound {
+            compositor: 1,
+            shm: 2,
+            xdg_wm_base: 4,
+        });
+        surface.xrgb = true;
+        let font = font();
+        let palette = render::Palette::pinned();
+        let pty = Pty::open(Path::new(pty::DEV_PTMX)).unwrap();
+        let directory = std::env::temp_dir();
+        let session = Session {
+            directory: &directory,
+            pty: &pty,
+            font: &font,
+            palette: &palette,
+        };
+        let fallback = default_size(&font).unwrap();
+        surface.current = Some(fallback);
+        let mut model = None;
+        adopt_size(&mut connection, &mut surface, &mut model, &session).unwrap();
+        surface.frame = Some(frame(true, true));
+
+        // A cursor-position report and a BEL, which is what a shell prompt
+        // and a mistyped completion produce between them.
+        serve_event(
+            &mut connection,
+            &mut surface,
+            &mut model,
+            &session,
+            fallback,
+            &mut Ending::default(),
+            Event::Output(b"\x1b[6n\x07".to_vec()),
+        )
+        .unwrap();
+        let terminal = model.as_mut().unwrap();
+        assert!(
+            terminal.take_replies().is_empty(),
+            "a reply was left queued for a writer that does not exist yet"
+        );
+        assert!(
+            terminal.take_bell(),
+            "the bell was consumed before anything could present it"
+        );
+    }
+
+    /// A child killed by a signal is not a child that exited, and the
+    /// diagnostic is the only place that distinction survives: `ExitStatus`
+    /// gives `None` for the code, and a terminal that printed "status 0" for
+    /// a segfaulting shell would be reporting the opposite of what happened.
+    #[test]
+    fn a_child_killed_by_a_signal_is_not_reported_as_an_exit() {
+        let pty = Pty::open(Path::new(pty::DEV_PTMX)).unwrap();
+        let directory = std::env::temp_dir();
+        let (sender, events) = sync_channel(MAX_PENDING_EVENTS);
+        let account = pty::Account {
+            uid: 0,
+            name: "td-term-test".into(),
+            home: directory.display().to_string(),
+        };
+        let mut command = fixture_command();
+        command.arguments = vec![
+            "--exact".into(),
+            "term_client::tests::term_client_abort_fixture".into(),
+            "--ignored".into(),
+        ];
+        start_child(&pty, &sender, &command, &account).unwrap();
+
+        let status = loop {
+            match events.recv_timeout(Duration::from_secs(30)).unwrap() {
+                Event::Exit(status) => break status,
+                Event::Output(_) | Event::Drained => {}
+                other => panic!("the child produced {}", named(&other)),
+            }
+        };
+        assert_eq!(status.code(), None, "the fixture exited rather than dying");
+        let ended = ended(status);
+        assert!(ended.contains("killed by a signal"), "{ended}");
+    }
+
+    /// The child half of the test above: the smallest death that is not an
+    /// exit. `abort` rather than a signal sent by hand, since sending one
+    /// needs `kill(2)` and this crate has no such surface.
+    #[test]
+    #[ignore = "spawned as the child of a_child_killed_by_a_signal_is_not_reported_as_an_exit"]
+    fn term_client_abort_fixture() {
+        std::process::abort();
+    }
+
+    /// Both translations, including the two arms a real failure would take.
+    /// The failing arms are otherwise unreachable from a test — inducing a
+    /// read errno other than EIO, or a `wait` that fails, needs a kernel
+    /// state this suite cannot arrange — so the mapping is what is pinned:
+    /// a fault must become a `Closed`, which ends the terminal with a
+    /// diagnostic, and not an ending that looks ordinary.
+    #[test]
+    fn a_producers_fault_becomes_a_closed_session_rather_than_a_quiet_end() {
+        assert!(matches!(
+            from_output(pty::Output::Bytes(b"hi".to_vec())),
+            Event::Output(bytes) if bytes == b"hi"
+        ));
+        assert!(matches!(
+            from_output(pty::Output::Ended(Ok(()))),
+            Event::Drained
+        ));
+        assert!(matches!(
+            from_output(pty::Output::Ended(Err("read terminal: EBADF".into()))),
+            Event::Closed(error) if error == "read terminal: EBADF"
+        ));
+        assert!(matches!(
+            from_waited(pty::Waited::Failed("wait for child: ECHILD".into())),
+            Event::Closed(error) if error == "wait for child: ECHILD"
+        ));
+    }
+
+    /// A child that is this test binary, running the ignored fixture below.
+    /// `current_exe` rather than `/bin/sh` for `pty.rs`'s reason: the gate's
+    /// shell is not td's, and a test that depended on one would be testing the
+    /// host.
+    fn fixture_command() -> pty::ChildCommand {
+        pty::ChildCommand {
+            program: std::env::current_exe().unwrap_or_default(),
+            arguments: vec![
+                "--exact".into(),
+                "term_client::tests::term_client_child_fixture".into(),
+                "--ignored".into(),
+                "--nocapture".into(),
+            ],
+        }
+    }
+
+    const CHILD_MARKER: &str = "TD-TERM-CHILD-SPOKE";
+
+    /// The child half of the tests below. `#[ignore]` is what keeps it out of
+    /// an ordinary run: only a parent naming it exactly, with `--ignored`,
+    /// ever reaches it. It cannot be gated on the environment as `pty.rs`'s
+    /// fixture is, because the environment its parent gives it is the one
+    /// `start_child` constructs — which is the production one, and the point.
+    #[test]
+    #[ignore = "spawned as the child of a_child_puts_its_own_output_on_the_screen"]
+    fn term_client_child_fixture() {
+        print!("{CHILD_MARKER}");
+        std::io::stdout().flush().unwrap();
+    }
+
+    /// The whole pipeline, with a real child on a real PTY: the child writes,
+    /// the kernel carries it, the reader thread puts it on the loop's
+    /// channel, the loop feeds the model, and the model holds the text.
+    ///
+    /// Every earlier test of this client drew an EMPTY terminal, so a frame
+    /// proved the plumbing and nothing about the contents. This is the one
+    /// that would notice a loop which served output by throwing it away.
+    #[test]
+    fn a_child_puts_its_own_output_on_the_screen() {
+        let (mut connection, _peer) = pair();
+        let mut surface = Surface::new(Bound {
+            compositor: 1,
+            shm: 2,
+            xdg_wm_base: 4,
+        });
+        surface.xrgb = true;
+        let font = font();
+        let palette = render::Palette::pinned();
+        let pty = Pty::open(Path::new(pty::DEV_PTMX)).unwrap();
+        let directory = std::env::temp_dir();
+        let session = Session {
+            directory: &directory,
+            pty: &pty,
+            font: &font,
+            palette: &palette,
+        };
+        let fallback = default_size(&font).unwrap();
+        surface.current = Some(fallback);
+        let mut model = None;
+        adopt_size(&mut connection, &mut surface, &mut model, &session).unwrap();
+        // The frame the first draw put out comes back, or the redraw output
+        // asks for would be throttled behind it forever — there is no
+        // compositor here to release anything.
+        surface.frame = Some(frame(true, true));
+
+        // Through `start_child` itself, not through its parts: the wiring is
+        // what this proves, and an open-coded spawn here would leave a
+        // production function nothing in the suite ever calls.
+        let (sender, events) = sync_channel(MAX_PENDING_EVENTS);
+        let account = pty::Account {
+            uid: 0,
+            name: "td-term-test".into(),
+            home: directory.display().to_string(),
+        };
+        start_child(&pty, &sender, &fixture_command(), &account).unwrap();
+        drop(sender);
+
+        let mut ending = Ending::default();
+        let mut ended = None;
+        while ended.is_none() {
+            let event = events
+                .recv_timeout(Duration::from_secs(30))
+                .expect("the terminal never ended with its child");
+            // A compositor keeping up, so the redraw each turn asks for is not
+            // throttled behind a frame that never comes back. (Serving
+            // continues after the marker is on screen, because the ending is
+            // what this waits for.)
+            surface.frame = Some(frame(true, true));
+            let served = serve_event(
+                &mut connection,
+                &mut surface,
+                &mut model,
+                &session,
+                fallback,
+                &mut ending,
+                event,
+            );
+            if let Err(error) = served {
+                ended = Some(error);
+            }
+        }
+        let text = model.as_ref().map(screen).unwrap_or_default();
+        assert!(
+            text.contains(CHILD_MARKER),
+            "the child's output never reached the model: {text:?} (ended: {ended:?})"
+        );
+        // The output made the picture stale and the same turn replaced it.
+        assert!(!surface.stale, "the screen was left stale after output");
+        assert_eq!(surface.drawn, surface.wanted());
+        // And the session ends of its own accord, which takes BOTH threads:
+        // the waiter for the status and the reader for the drain. Without one
+        // of them this loop runs until the channel disconnects and `ended`
+        // stays `None`.
+        let ended = ended.expect("the terminal never ended with its child");
+        assert!(ended.contains("child exited with status 0"), "{ended}");
+    }
+
+    /// A child ending ends the session, and says which way it ended. A
+    /// terminal that outlived its shell would be a window nobody can type
+    /// into, and one that reported nothing would look like a compositor
+    /// failure in the log.
+    #[test]
+    fn a_child_exiting_ends_the_loop_and_names_the_status() {
+        let (mut connection, _peer) = pair();
+        let mut surface = Surface::new(Bound {
+            compositor: 1,
+            shm: 2,
+            xdg_wm_base: 4,
+        });
+        let font = font();
+        let palette = render::Palette::pinned();
+        let pty = Pty::open(Path::new(pty::DEV_PTMX)).unwrap();
+        let directory = std::env::temp_dir();
+        let session = Session {
+            directory: &directory,
+            pty: &pty,
+            font: &font,
+            palette: &palette,
+        };
+        let fallback = default_size(&font).unwrap();
+        let mut model = None;
+        let (sender, events) = sync_channel(MAX_PENDING_EVENTS);
+        let account = pty::Account {
+            uid: 0,
+            name: "td-term-test".into(),
+            home: directory.display().to_string(),
+        };
+        start_child(&pty, &sender, &fixture_command(), &account).unwrap();
+        let status = loop {
+            match events.recv_timeout(Duration::from_secs(30)).unwrap() {
+                Event::Exit(status) => break status,
+                Event::Output(_) | Event::Drained => {}
+                other => panic!("the child produced {}", named(&other)),
+            }
+        };
+        let mut ending = Ending::default();
+        // The exit ALONE does not end the terminal: the child's last bytes may
+        // still be in the kernel, and `Event::Exit` can overtake them.
+        serve_event(
+            &mut connection,
+            &mut surface,
+            &mut model,
+            &session,
+            fallback,
+            &mut ending,
+            Event::Exit(status),
+        )
+        .unwrap();
+        let ended = serve_event(
+            &mut connection,
+            &mut surface,
+            &mut model,
+            &session,
+            fallback,
+            &mut ending,
+            Event::Drained,
+        )
+        .err()
+        .unwrap();
+        assert!(ended.contains("child exited with status 0"), "{ended}");
     }
 
     /// The PTY is opened BEFORE the first frame, so a machine that cannot
