@@ -12,8 +12,8 @@ use crate::{sys, wire};
 use std::collections::{BTreeSet, VecDeque};
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
-use std::os::unix::fs::OpenOptionsExt;
 use std::os::fd::{AsRawFd, RawFd};
+use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::thread;
@@ -131,6 +131,123 @@ pub struct Connection {
     free_ids: BTreeSet<u32>,
     pending_fds: VecDeque<RawFd>,
     incoming: [u8; RECEIVE_BUFFER_BYTES],
+    /// Whether the reading half has moved to a thread. Reading from both
+    /// would split a message between them.
+    reader_detached: bool,
+}
+
+/// The reading half of a connection, once it has been detached. Owns a second
+/// handle on the same socket, the bytes already read past the last message,
+/// and any descriptors that arrived unclaimed — so nothing a `Connection` had
+/// buffered is lost by moving reads to a thread.
+pub struct Reader {
+    stream: UnixStream,
+    buffered: Vec<u8>,
+    pending_fds: VecDeque<RawFd>,
+    incoming: [u8; RECEIVE_BUFFER_BYTES],
+}
+
+impl Drop for Reader {
+    fn drop(&mut self) {
+        discard_fds(&mut self.pending_fds);
+    }
+}
+
+impl Reader {
+    pub fn next(&mut self) -> Result<wire::Message, String> {
+        // No deadline, and that is not an omission: detaching requires the
+        // handshake to have finished, which is the only thing a deadline
+        // bounds. A running client waits as long as the compositor is quiet.
+        read_next(
+            &self.stream,
+            &mut self.buffered,
+            &mut self.pending_fds,
+            &mut self.incoming,
+            None,
+        )
+    }
+
+    /// How many descriptors arrived that nobody claimed. The terminal binds
+    /// no seat and so should never receive one.
+    pub fn pending_fd_count(&self) -> usize {
+        self.pending_fds.len()
+    }
+}
+
+fn discard_fds(fds: &mut VecDeque<RawFd>) {
+    while let Some(fd) = fds.pop_front() {
+        sys::discard_received(&[fd]);
+    }
+}
+
+/// One event, from whichever half is doing the reading. A free function over
+/// the pieces rather than a method, so `Connection` and `Reader` cannot drift
+/// into two dialects of the same parser.
+fn read_next(
+    stream: &UnixStream,
+    buffered: &mut Vec<u8>,
+    pending_fds: &mut VecDeque<RawFd>,
+    incoming: &mut [u8],
+    deadline: Option<Instant>,
+) -> Result<wire::Message, String> {
+    loop {
+        let remaining = deadline
+            .map(|deadline| {
+                deadline
+                    .checked_duration_since(Instant::now())
+                    .filter(|duration| !duration.is_zero())
+                    .ok_or_else(|| "Wayland presentation handshake timed out".to_string())
+            })
+            .transpose()?;
+        if let Some(message) = wire::take(buffered)? {
+            return Ok(message);
+        }
+        let wanted = match wire::header(buffered)? {
+            Some((_, _, size)) => size.saturating_sub(buffered.len()),
+            None => wire::HEADER_SIZE.saturating_sub(buffered.len()),
+        };
+        if wanted == 0 {
+            return Err("Wayland event parser made no progress".into());
+        }
+        let capacity = wanted.min(incoming.len());
+        let input = incoming
+            .get_mut(..capacity)
+            .ok_or_else(|| "Wayland receive bound escaped input buffer".to_string())?;
+        if let Some(remaining) = remaining {
+            stream
+                .set_read_timeout(Some(remaining))
+                .map_err(|e| format!("set Wayland handshake timeout: {e}"))?;
+        }
+        let received = match sys::recv_with_fds(stream, input) {
+            Ok(received) => received,
+            Err(sys::ReceiveError::Disconnected) => {
+                return Err("Wayland compositor closed the connection".into())
+            }
+            Err(sys::ReceiveError::TimedOut) if deadline.is_some() => {
+                return Err("Wayland presentation handshake timed out".into())
+            }
+            Err(sys::ReceiveError::TimedOut) => return Err("Wayland event wait timed out".into()),
+            Err(sys::ReceiveError::Failure(error)) => {
+                return Err(format!("receive Wayland event: {error}"))
+            }
+        };
+        if received.count == 0 {
+            sys::discard_received(&received.fds);
+            return Err("Wayland compositor closed the connection".into());
+        }
+        if pending_fds.len().saturating_add(received.fds.len()) > MAX_PENDING_FDS {
+            sys::discard_received(&received.fds);
+            discard_fds(pending_fds);
+            return Err(format!(
+                "Wayland client queued more than {MAX_PENDING_FDS} descriptors"
+            ));
+        }
+        let bytes = input
+            .get(..received.count)
+            .ok_or_else(|| "Wayland read count escaped input buffer".to_string())?;
+        buffered.extend_from_slice(bytes);
+        pending_fds.extend(received.fds);
+    }
 }
 
 impl Drop for Connection {
@@ -199,18 +316,8 @@ impl Connection {
             free_ids: BTreeSet::new(),
             pending_fds: VecDeque::new(),
             incoming: [0; RECEIVE_BUFFER_BYTES],
+            reader_detached: false,
         }
-    }
-
-    pub fn remaining(&self) -> Result<Option<Duration>, String> {
-        self.deadline
-            .map(|deadline| {
-                deadline
-                    .checked_duration_since(Instant::now())
-                    .filter(|duration| !duration.is_zero())
-                    .ok_or_else(|| "Wayland presentation handshake timed out".to_string())
-            })
-            .transpose()
     }
 
     /// Bound how long an event wait may block. The handshake sets this from
@@ -250,60 +357,57 @@ impl Connection {
     }
 
     pub fn next(&mut self) -> Result<wire::Message, String> {
-        loop {
-            let remaining = self.remaining()?;
-            if let Some(message) = wire::take(&mut self.buffered)? {
-                return Ok(message);
-            }
-            let wanted = match wire::header(&self.buffered)? {
-                Some((_, _, size)) => size.saturating_sub(self.buffered.len()),
-                None => wire::HEADER_SIZE.saturating_sub(self.buffered.len()),
-            };
-            if wanted == 0 {
-                return Err("Wayland event parser made no progress".into());
-            }
-            let capacity = wanted.min(self.incoming.len());
-            let input = self
-                .incoming
-                .get_mut(..capacity)
-                .ok_or_else(|| "Wayland receive bound escaped input buffer".to_string())?;
-            if let Some(remaining) = remaining {
-                self.stream
-                    .set_read_timeout(Some(remaining))
-                    .map_err(|e| format!("set Wayland handshake timeout: {e}"))?;
-            }
-            let received = match sys::recv_with_fds(&self.stream, input) {
-                Ok(received) => received,
-                Err(sys::ReceiveError::Disconnected) => {
-                    return Err("Wayland compositor closed the connection".into())
-                }
-                Err(sys::ReceiveError::TimedOut) if self.deadline.is_some() => {
-                    return Err("Wayland presentation handshake timed out".into())
-                }
-                Err(sys::ReceiveError::TimedOut) => {
-                    return Err("Wayland event wait timed out".into())
-                }
-                Err(sys::ReceiveError::Failure(error)) => {
-                    return Err(format!("receive Wayland event: {error}"))
-                }
-            };
-            if received.count == 0 {
-                sys::discard_received(&received.fds);
-                return Err("Wayland compositor closed the connection".into());
-            }
-            if self.pending_fds.len().saturating_add(received.fds.len()) > MAX_PENDING_FDS {
-                sys::discard_received(&received.fds);
-                self.discard_pending_fds();
-                return Err(format!(
-                    "Wayland client queued more than {MAX_PENDING_FDS} descriptors"
-                ));
-            }
-            let bytes = input
-                .get(..received.count)
-                .ok_or_else(|| "Wayland read count escaped input buffer".to_string())?;
-            self.buffered.extend_from_slice(bytes);
-            self.pending_fds.extend(received.fds);
+        if self.reader_detached {
+            return Err("Wayland events are being read on another thread".into());
         }
+        read_next(
+            &self.stream,
+            &mut self.buffered,
+            &mut self.pending_fds,
+            &mut self.incoming,
+            self.deadline,
+        )
+    }
+
+    /// Hand the reading half to another thread, and stop reading here.
+    ///
+    /// Wayland reads BLOCK, and a client whose main loop has a second source
+    /// to serve — a terminal with a child on a PTY — cannot afford to block
+    /// in one of them. Every WRITE stays with the connection, so request
+    /// order remains the property of one thread rather than something two
+    /// have to agree about; what moves is the socket handle for reading, the
+    /// bytes already buffered, and any descriptors already received.
+    ///
+    /// Detaching is one-way, which is what makes "who reads" answerable by
+    /// looking rather than by reasoning: this connection refuses to read
+    /// afterwards, so a second reader cannot appear by accident and take
+    /// half of a message the first is waiting for.
+    pub fn detach_reader(&mut self) -> Result<Reader, String> {
+        if self.reader_detached {
+            return Err("the Wayland reading half was already detached".into());
+        }
+        // Only after the handshake, and that is a real constraint rather than
+        // a convention. `read_next` SETS the socket's read timeout from a
+        // live deadline and never clears it, so a connection whose deadline
+        // went away while a timeout stayed behind would give the reader a
+        // thread that wakes with `TimedOut` on a compositor that is merely
+        // quiet. `finish_handshake` clears both together and is the only way
+        // to clear either, so requiring it here is what makes that pairing a
+        // property instead of an ordering somebody has to remember.
+        if self.deadline.is_some() {
+            return Err("the Wayland reading half detached before the handshake finished".into());
+        }
+        let stream = self
+            .stream
+            .try_clone()
+            .map_err(|e| format!("clone the Wayland connection for reading: {e}"))?;
+        self.reader_detached = true;
+        Ok(Reader {
+            stream,
+            buffered: std::mem::take(&mut self.buffered),
+            pending_fds: std::mem::take(&mut self.pending_fds),
+            incoming: [0; RECEIVE_BUFFER_BYTES],
+        })
     }
 
     pub fn handle_common(&mut self, message: &wire::Message) -> Result<bool, String> {
@@ -391,9 +495,7 @@ impl Connection {
     }
 
     pub fn discard_pending_fds(&mut self) {
-        while let Some(fd) = self.pending_fds.pop_front() {
-            sys::discard_received(&[fd]);
-        }
+        discard_fds(&mut self.pending_fds);
     }
 }
 
@@ -571,4 +673,155 @@ pub fn attach_frame(
     connection.send(SURFACE, 3, frame)?;
     connection.send(SURFACE, 6, wire::Builder::new())?;
     Ok((buffer_id, callback_id))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Read;
+    use std::os::fd::IntoRawFd;
+    use std::time::Duration;
+
+    fn event(object: u32, opcode: u16, payload: &[u8]) -> Vec<u8> {
+        let mut builder = wire::Builder::new();
+        for word in payload.chunks(4) {
+            let mut bytes = [0u8; 4];
+            for (target, source) in bytes.iter_mut().zip(word) {
+                *target = *source;
+            }
+            builder.u32(u32::from_ne_bytes(bytes));
+        }
+        builder.message(object, opcode).unwrap()
+    }
+
+    fn pair() -> (Connection, UnixStream) {
+        let (ours, theirs) = UnixStream::pair().unwrap();
+        ours.set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        (Connection::over(ours, None, 10), theirs)
+    }
+
+    /// Detaching moves the bytes already READ but not yet parsed, and what
+    /// puts bytes there is a SHORT read: `read_next` asks for exactly what
+    /// the message in hand still needs, so it never over-reads past one, but
+    /// a receive that returns less leaves a fragment behind. A detach that
+    /// handed over a bare descriptor would drop that fragment, and the
+    /// message it belongs to would then be parsed from its own middle.
+    ///
+    /// A first version of this test wrote two whole events and read one,
+    /// believing the second would be buffered. It is not — it stays in the
+    /// socket, which the reader inherits anyway — so that test passed
+    /// whether the buffer moved or not.
+    #[test]
+    fn detaching_carries_the_bytes_already_buffered() {
+        let (mut connection, mut peer) = pair();
+        let whole = event(7, 0, &9u32.to_ne_bytes());
+        let (head, tail) = whole.split_at(5);
+        peer.write_all(head).unwrap();
+
+        // Part of a message and no more: this read banks the fragment and
+        // then times out waiting for the rest of it.
+        connection
+            .set_read_timeout(Some(Duration::from_millis(250)))
+            .unwrap();
+        assert!(connection.next().is_err());
+
+        let mut reader = connection.detach_reader().unwrap();
+        peer.write_all(tail).unwrap();
+        let message = reader.next().unwrap();
+        assert_eq!(
+            (message.object, message.opcode),
+            (7, 0),
+            "the fragment did not survive the detach"
+        );
+        assert_eq!(message.payload, 9u32.to_ne_bytes().to_vec());
+    }
+
+    /// Two readers on one socket would split a message between them, and the
+    /// half each got would be unparseable in a different way. Detaching is
+    /// therefore one-way and stated in the errors rather than by convention.
+    #[test]
+    fn only_one_half_may_read() {
+        let (mut connection, mut peer) = pair();
+        peer.write_all(&event(7, 0, &3u32.to_ne_bytes())).unwrap();
+        let _reader = connection.detach_reader().unwrap();
+
+        let refused = connection.next().err().unwrap();
+        assert!(refused.contains("another thread"), "{refused}");
+        let refused = connection.detach_reader().err().unwrap();
+        assert!(refused.contains("already detached"), "{refused}");
+    }
+
+    /// Detaching before the handshake is over is refused, because
+    /// `read_next` sets the socket's read timeout from a deadline and never
+    /// clears it: a reader that inherited the socket after the deadline was
+    /// dropped but before the timeout was would wake with `TimedOut` on a
+    /// compositor that had simply said nothing.
+    #[test]
+    fn the_reading_half_detaches_only_after_the_handshake() {
+        let (ours, _peer) = UnixStream::pair().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let mut connection = Connection::over(ours, Some(deadline), 10);
+        let refused = connection.detach_reader().err().unwrap();
+        assert!(
+            refused.contains("before the handshake finished"),
+            "{refused}"
+        );
+
+        connection.finish_handshake().unwrap();
+        connection.detach_reader().unwrap();
+    }
+
+    /// Descriptors move with the reader, and the reader closes what it still
+    /// holds. Both halves matter and neither is visible from the protocol: a
+    /// queue left behind is a descriptor held open until the process ends,
+    /// and one carried but never closed is the same leak in a new place.
+    ///
+    /// The socket pair is the oracle — a peer reads end-of-file only once
+    /// EVERY handle on the other end is gone, so the read returning zero is
+    /// the reader's `Drop` having closed the one it carried.
+    #[test]
+    fn descriptors_move_with_the_reader_and_are_closed_by_it() {
+        let (mut connection, _peer) = pair();
+        let (held, mut watcher) = UnixStream::pair().unwrap();
+        connection.queue_fd_for_test(held.into_raw_fd());
+        assert_eq!(connection.pending_fd_count(), 1);
+
+        let reader = connection.detach_reader().unwrap();
+        assert_eq!(
+            connection.pending_fd_count(),
+            0,
+            "the connection kept a descriptor it had handed over"
+        );
+        assert_eq!(reader.pending_fd_count(), 1);
+
+        drop(reader);
+        watcher
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        let mut byte = [0u8; 1];
+        assert_eq!(
+            watcher.read(&mut byte).unwrap(),
+            0,
+            "the reader did not close the descriptor it carried"
+        );
+    }
+
+    /// Writing is what stays behind. The whole point of detaching is that the
+    /// main loop keeps issuing requests while a thread blocks in a read, so a
+    /// connection that could no longer write would have gained nothing.
+    #[test]
+    fn a_detached_connection_still_writes() {
+        let (mut connection, mut peer) = pair();
+        let _reader = connection.detach_reader().unwrap();
+        connection.send(SURFACE, 6, wire::Builder::new()).unwrap();
+
+        peer.set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        let mut said = [0u8; 8];
+        peer.read_exact(&mut said).unwrap();
+        let object = u32::from_ne_bytes([said[0], said[1], said[2], said[3]]);
+        let opcode = u16::from_ne_bytes([said[4], said[5]]);
+        assert_eq!((object, opcode), (SURFACE, 6));
+    }
 }

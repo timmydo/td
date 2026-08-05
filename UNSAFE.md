@@ -310,6 +310,19 @@ construction. It is NOT a new caller — it names no `sys::` at all, and the
 descriptors it will eventually receive arrive through `Connection` — so the
 syscall roster above is unchanged by it.
 
+A connection's READING half detaches: `Connection::detach_reader` hands a
+`Reader` to a thread, so a client whose main loop has a second source to
+serve is not blocked in a socket read. `recvmsg(2)`, and the `close(2)` that
+retires a descriptor nobody claimed, therefore issue from that thread rather
+than from the main one. That is not an amendment to the roster above — same
+wrappers, same one calling module, and `term_client.rs` still names no
+`sys::` — but it is a change to what "intrinsic to that connection" means
+above, so it is recorded rather than left to be inferred. The one-reader
+rule is the TYPE's: a `Reader` is not clonable, exposes no descriptor, and a
+`Connection` refuses both to read and to detach again once it has given one
+up. Detaching also requires the handshake to be over, because the socket
+read timeout a deadline sets outlives the deadline itself.
+
 ## 7. `td-util` — the diagnostics multicall
 
 The `td-util` diagnostics multicall, whose one `syscall3` body in

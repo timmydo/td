@@ -19,6 +19,8 @@ use crate::{font, pty, ready, render, wire, MAX_UI_DIMENSION, MAX_UI_FRAME_BYTES
 use std::collections::BTreeSet;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::{sync_channel, SyncSender};
+use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 pub struct Options {
@@ -373,19 +375,6 @@ impl Surface {
             && self.frame.as_ref().is_some_and(Frame::complete)
     }
 
-    /// One event, with the display's own three answered where they belong.
-    fn dispatch_next(
-        &mut self,
-        connection: &mut Connection,
-        fallback: Size,
-    ) -> Result<bool, String> {
-        let message = connection.next()?;
-        if connection.handle_common(&message)? {
-            return Ok(false);
-        }
-        self.dispatch(connection, &message, fallback)
-    }
-
     /// A configure of zero in either axis is the compositor declining to
     /// choose, not a zero-sized window; each axis declines independently, so
     /// the fallback fills in per axis rather than wholesale.
@@ -621,22 +610,89 @@ struct Session<'a> {
     palette: &'a render::Palette,
 }
 
-/// One turn of the terminal's steady state: take an event, and answer it.
+/// What the terminal's main loop serves. One channel, because a loop cannot
+/// block in two places and every producer is a thread that blocks in one —
+/// which is what §12 means by "bounded messages to one main loop". The
+/// Wayland reader is the first producer; the child's output and its exit are
+/// the ones the next landing adds.
+enum Event {
+    Wayland(wire::Message),
+    /// The reading thread stopping, and why. It cannot return an error to
+    /// anyone, so it reports one and ends; the loop is where that becomes a
+    /// failure the process exits on.
+    Closed(String),
+}
+
+/// How many events may be in flight before a producer blocks. A blocked
+/// producer is the point: the alternative to waiting is dropping events, and
+/// a dropped configure is a window stuck at the wrong size.
+const MAX_PENDING_EVENTS: usize = 64;
+
+/// Read Wayland events until the connection ends, and hand each to the loop.
+/// This thread never writes: every request goes out from the main loop, so
+/// request order is one thread's property rather than something two have to
+/// agree about.
+fn spawn_wayland_reader(
+    mut reader: conn::Reader,
+    events: SyncSender<Event>,
+) -> Result<JoinHandle<()>, String> {
+    thread::Builder::new()
+        .name("td-term-wayland".into())
+        .spawn(move || loop {
+            match reader.next() {
+                Ok(message) => {
+                    // The terminal binds no seat and asks for no keymap, so
+                    // any descriptor is an event it has misread. `present`
+                    // makes the same check of the handshake; this is the rest
+                    // of the session, where an unclaimed one would otherwise
+                    // be held open until the process ended.
+                    let unclaimed = reader.pending_fd_count();
+                    if unclaimed != 0 {
+                        let _ = events.send(Event::Closed(format!(
+                            "the terminal received {unclaimed} unexpected descriptor(s)"
+                        )));
+                        return;
+                    }
+                    if events.send(Event::Wayland(message)).is_err() {
+                        return;
+                    }
+                }
+                Err(error) => {
+                    // Deliberately ignored: a closed receiver means the loop
+                    // has already gone, which is the only reader of this.
+                    let _ = events.send(Event::Closed(error));
+                    return;
+                }
+            }
+        })
+        .map_err(|e| format!("spawn the Wayland reader thread: {e}"))
+}
+
+/// One turn of the terminal's steady state: answer an event.
 /// A new size is adopted exactly as the first one was — same function, so
 /// resize is not a second code path — and a configure that changes nothing
 /// still gets the commit its acknowledgement owes.
 ///
-/// This is a function rather than the body of `run`'s loop because `run` does
-/// not return: a loop that dials a socket and never ends is a loop no test
-/// can enter, and this is where every event after readiness is served.
-fn serve_turn(
+/// It takes an event rather than reading one because after readiness the
+/// reading happens on another thread; and it is a function rather than the
+/// body of `run`'s loop because `run` does not return, so that loop is one no
+/// test can enter.
+fn serve_event(
     connection: &mut Connection,
     surface: &mut Surface,
     model: &mut Option<Terminal>,
     session: &Session,
     fallback: Size,
+    event: Event,
 ) -> Result<(), String> {
-    surface.dispatch_next(connection, fallback)?;
+    match event {
+        Event::Closed(error) => return Err(error),
+        Event::Wayland(message) => {
+            if !connection.handle_common(&message)? {
+                surface.dispatch(connection, &message, fallback)?;
+            }
+        }
+    }
     let Some(wanted) = surface.wanted() else {
         return Ok(());
     };
@@ -652,6 +708,27 @@ fn serve_turn(
     // The acknowledgement is still owed a commit even when the pixels cannot
     // be replaced yet.
     surface.commit_configure(connection)
+}
+
+/// The same turn, reading the event here. Startup has nothing else to serve,
+/// so it reads on the main thread and the reader is not detached until the
+/// terminal is up.
+fn serve_turn(
+    connection: &mut Connection,
+    surface: &mut Surface,
+    model: &mut Option<Terminal>,
+    session: &Session,
+    fallback: Size,
+) -> Result<(), String> {
+    let message = connection.next()?;
+    serve_event(
+        connection,
+        surface,
+        model,
+        session,
+        fallback,
+        Event::Wayland(message),
+    )
 }
 
 /// Everything `run` does before it may publish: bind, create the surface,
@@ -784,6 +861,14 @@ pub fn run(options: &Options) -> Result<(), String> {
     };
     connection.finish_handshake()?;
 
+    // Everything that can still fail happens BEFORE readiness is advertised.
+    // Both of these can — a descriptor limit, a thread limit — and a probe
+    // that accepted the socket only to watch the terminal exit would have
+    // been told something true for less than a second.
+    let reader = connection.detach_reader()?;
+    let (sender, events) = sync_channel(MAX_PENDING_EVENTS);
+    let _wayland = spawn_wayland_reader(reader, sender)?;
+
     let _ready = ready::publish(&options.ready_socket, rows, columns)?;
     // `write_all` rather than `print!`, which PANICS on a write failure — and
     // a panic here would abort past `Published::drop` and leave the socket
@@ -795,15 +880,22 @@ pub fn run(options: &Options) -> Result<(), String> {
     out.flush()
         .map_err(|e| format!("flush terminal ready marker: {e}"))?;
 
-    // Nothing writes to the terminal yet, so every turn is a Wayland event.
-    // Redrawing on child output is the landing after this one.
+    // Reading moved off the main thread above, and not before: startup has
+    // one source and can afford to block in it, while a terminal with a child
+    // cannot. Nothing else produces events yet — the child's output and its
+    // exit are the next landing — so today this loop has one producer and the
+    // shape it will need for three.
     loop {
-        serve_turn(
+        let event = events
+            .recv()
+            .map_err(|_| "the Wayland reader thread stopped without reporting".to_string())?;
+        serve_event(
             &mut connection,
             &mut surface,
             &mut model,
             &session,
             fallback,
+            event,
         )?;
     }
 }
@@ -1927,6 +2019,93 @@ mod tests {
             buffer,
             "the focus change reused the frame drawn without it"
         );
+    }
+
+    /// The terminal asks for no descriptors, so one arriving is an event it
+    /// has misread — and an unclaimed descriptor is held open for as long as
+    /// the session runs. `present` makes this check of the handshake; the
+    /// reader thread makes it of everything after, which is the part nothing
+    /// else looks at.
+    #[test]
+    fn the_reader_thread_refuses_a_descriptor_it_never_asked_for() {
+        let (ours, mut theirs) = UnixStream::pair().unwrap();
+        let mut connection = Connection::over(ours, None, FIRST_DYNAMIC_ID);
+        let (held, _watcher) = UnixStream::pair().unwrap();
+        connection.queue_fd_for_test(std::os::fd::IntoRawFd::into_raw_fd(held));
+        write_event(&mut theirs, &surface_configure(5));
+        let reader = connection.detach_reader().unwrap();
+        let (sender, events) = sync_channel(MAX_PENDING_EVENTS);
+        let thread = spawn_wayland_reader(reader, sender).unwrap();
+
+        match events.recv_timeout(Duration::from_secs(10)).unwrap() {
+            Event::Closed(error) => assert!(error.contains("unexpected descriptor"), "{error}"),
+            Event::Wayland(_) => panic!("an unclaimed descriptor was served as an ordinary event"),
+        }
+        thread.join().unwrap();
+    }
+
+    /// The reader thread is where every event comes from once the terminal is
+    /// up, so what it does at the END of the connection is the whole of how
+    /// the loop learns anything is wrong: it cannot return an error to
+    /// anybody, and a loop still waiting on a channel nobody will send to is
+    /// a terminal that hangs instead of exiting.
+    #[test]
+    fn the_reader_thread_reports_the_connection_ending() {
+        let (ours, mut theirs) = UnixStream::pair().unwrap();
+        let mut connection = Connection::over(ours, None, FIRST_DYNAMIC_ID);
+        write_event(&mut theirs, &surface_configure(4));
+        let reader = connection.detach_reader().unwrap();
+        let (sender, events) = sync_channel(MAX_PENDING_EVENTS);
+        let thread = spawn_wayland_reader(reader, sender).unwrap();
+
+        match events.recv_timeout(Duration::from_secs(10)).unwrap() {
+            Event::Wayland(message) => {
+                assert_eq!((message.object, message.opcode), (XDG_SURFACE, 0));
+            }
+            Event::Closed(error) => panic!("the reader reported {error} instead of an event"),
+        }
+        drop(theirs);
+        match events.recv_timeout(Duration::from_secs(10)).unwrap() {
+            Event::Closed(error) => assert!(error.contains("closed the connection"), "{error}"),
+            Event::Wayland(_) => panic!("a closed connection produced an event"),
+        }
+        thread.join().unwrap();
+    }
+
+    /// The loop treats the reader stopping as its own failure. `run` never
+    /// returns otherwise, so this is the path by which a compositor going
+    /// away ends the terminal rather than parking it forever.
+    #[test]
+    fn a_closed_connection_ends_the_loop() {
+        let (mut connection, _peer) = pair();
+        let mut surface = Surface::new(Bound {
+            compositor: 1,
+            shm: 2,
+            xdg_wm_base: 4,
+        });
+        let font = font();
+        let palette = render::Palette::pinned();
+        let pty = Pty::open(Path::new(pty::DEV_PTMX)).unwrap();
+        let directory = std::env::temp_dir();
+        let session = Session {
+            directory: &directory,
+            pty: &pty,
+            font: &font,
+            palette: &palette,
+        };
+        let fallback = default_size(&font).unwrap();
+        let mut model = None;
+        let refused = serve_event(
+            &mut connection,
+            &mut surface,
+            &mut model,
+            &session,
+            fallback,
+            Event::Closed("compositor went away".into()),
+        )
+        .err()
+        .unwrap();
+        assert_eq!(refused, "compositor went away");
     }
 
     /// The PTY is opened BEFORE the first frame, so a machine that cannot
