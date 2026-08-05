@@ -12,10 +12,13 @@
 //! It runs every case in <spec-dir> through the built td-sh under the SAME isolated
 //! `-c` harness the gate uses (`td_sh::run_case`), and buckets each case:
 //!   pass  -> unlisted, UNLESS its comment-stripped code reads the repo tree (see
-//!            `reads_repo_tree`): a pass there is a probable false-green because the
-//!            isolated cwd stages no tree, so those are emitted as `skip`.
+//!            `reads_repo_tree`) or depends on shared `/tmp` state (see
+//!            `depends_on_shared_tmp`): a pass there is a probable false-green,
+//!            because the isolated cwd stages neither, so those are emitted as
+//!            `skip`.
 //!   skip  -> cannot be evaluated faithfully here (needs the `argv.py` helper, timed
-//!            out per the typed `CaseOutcome::timed_out`, or is repo-tree/fixture bound).
+//!            out per the typed `CaseOutcome::timed_out`, or is repo-tree/fixture
+//!            bound, or turns on shared `/tmp` state the harness does not control).
 //!   xfail -> any other genuine wrong-answer failure (includes status-127
 //!            missing-external failures under the cleared-env harness).
 //! Keys are occurrence-qualified via `td_sh::case_keys`, so a description repeated
@@ -74,6 +77,26 @@ const HEADER: &str = "\
 #               spec/` empty on both sides of a comparison) that would mask real
 #               regressions. A PASSING tree-reading case is skipped for the same
 #               false-green reason.
+#           (d) it depends on SHARED `/tmp` state the isolated cwd neither owns nor
+#               cleans, detected by `depends_on_shared_tmp` in the three shapes the
+#               corpus spells it: an absolute path under `/tmp` (the code mentions
+#               `/tmp/`), the same path reached through `HOME=/tmp`, and a test of
+#               `/tmp`'s own MODE (`-k /tmp`). Sixteen cases `mkdir -p` or `touch`
+#               such a path and then depend on it -- `cd` there and print `pwd`, put
+#               it on `PATH`, make it `$HOME` -- or ask whether `/tmp` is sticky. The
+#               staging command is not on the harness PATH, so whether the path
+#               exists is a fact about the HOST, and so is the mode: five flip
+#               verdict once an earlier run under a real shell has left the
+#               directories behind, and `-k for sticky bit` flips on any host whose
+#               `/tmp` is not sticky. Listing them either way would red the gate on
+#               whichever machine disagrees. A PASSING such case is skipped for the
+#               same false-green reason, and `-k for sticky bit` IS one -- so its
+#               disagreement would red as a REGRESSION, not as the milder XPASS the
+#               rest would. Fifteen MOVE here; the sixteenth (`builtin-dirs::cd
+#               replaces the lowest entry`) was already skipped by (c), whose
+#               `spec/` token its `/tmp/oils-spec/` path contains.
+#               Bare `/tmp` is deliberately NOT a shape: ten cases need only that it
+#               EXIST, which is universal, and one names the relative `./tmp.sh`.
 #           These heuristics are conservative substring matches over the case code
 #           with FULL-LINE comments stripped, so a token mentioned only in prose does
 #           not force a skip. KNOWN over-match (safe direction): a token inside an
@@ -119,6 +142,24 @@ fn reads_repo_tree(code: &str) -> bool {
         || code.contains("REPO_ROOT")
         || code.contains("testdata")
         || code.contains("_tmp/")
+}
+
+// Depends on shared `/tmp` state the isolated cwd neither owns nor cleans, in the
+// three shapes the corpus spells it: an absolute path under it, the same path
+// reached through `HOME=/tmp`, and a test of `/tmp`'s own MODE. The staging
+// command (`mkdir`, `touch`) is withheld from the harness PATH, so the path exists
+// only when an EARLIER run under a real shell left it behind -- and one case
+// `rmdir`s it again. The verdict is then a fact about the host: the same commit is
+// green on a machine that has run the corpus with a real PATH and red on a fresh
+// one, in whichever direction the leftovers point. Matched on the dependency
+// rather than on today's verdict, as `reads_repo_tree` is: a case masked by a
+// SECOND withheld external is stable only until that one is served, and a category
+// defined by what a case DEPENDS ON is one the next reader can check by eye.
+//
+// Bare `/tmp` is deliberately not a shape of its own: ten cases need only that it
+// EXIST, which is universal, and one names the relative `./tmp.sh`.
+fn depends_on_shared_tmp(code: &str) -> bool {
+    code.contains("/tmp/") || code.contains("HOME=/tmp") || code.contains("-k /tmp")
 }
 
 /// Identities this shell CANNOT be staged as. Each probe is a real case run
@@ -201,13 +242,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let exec = executable_code(&case.code);
             match run_case(&shell, case, ASH_DASH_CHAIN) {
                 Ok(outcome) if outcome.passed => {
-                    // A tree-reading pass is a probable false-green: skip it.
-                    if reads_repo_tree(&exec) {
+                    // A pass that reads the tree, or that depended on a directory
+                    // the host happened to have, is a probable false-green.
+                    if reads_repo_tree(&exec) || depends_on_shared_tmp(&exec) {
                         skip.push(key);
                     }
                 }
                 Ok(outcome) => {
-                    if needs_missing_helper(&exec) || outcome.timed_out || reads_repo_tree(&exec) {
+                    if needs_missing_helper(&exec)
+                        || outcome.timed_out
+                        || reads_repo_tree(&exec)
+                        || depends_on_shared_tmp(&exec)
+                    {
                         skip.push(key);
                     } else {
                         xfail.push(key);

@@ -5180,9 +5180,18 @@ mod tests {
         assert_eq!(run_capturing("test -c /dev/zero; echo $?").1, "0\n");
         assert_eq!(run_capturing("test -S /dev/zero; echo $?").1, "1\n");
         assert_eq!(run_capturing("test -b /dev/zero; echo $?").1, "1\n");
-        // /tmp carries the sticky bit but not setuid/setgid.
-        assert_eq!(run_capturing("test -k /tmp; echo $?").1, "0\n");
-        assert_eq!(run_capturing("test -u /tmp; echo $?").1, "1\n");
+        // Sticky but not setuid, on a directory this test OWNS. Asking `/tmp`
+        // instead reds the gate on any host whose `/tmp` is a tmpfs mounted 0777
+        // without S_ISVTX -- the corpus skips its own sticky-bit case for exactly
+        // that reason, and a unit test may not reintroduce the assumption.
+        use std::os::unix::fs::PermissionsExt;
+        let sticky = std::env::temp_dir().join(format!("td-sh-sticky-{}", std::process::id()));
+        std::fs::create_dir_all(&sticky).unwrap();
+        std::fs::set_permissions(&sticky, std::fs::Permissions::from_mode(0o1777)).unwrap();
+        let dir = sticky.display();
+        assert_eq!(run_capturing(&format!("test -k {dir}; echo $?")).1, "0\n");
+        assert_eq!(run_capturing(&format!("test -u {dir}; echo $?")).1, "1\n");
+        std::fs::remove_dir_all(&sticky).unwrap();
         // `-ef` is identity, so a path is always the same file as itself.
         assert_eq!(run_capturing("test /dev/zero -ef /dev/zero; echo $?").1, "0\n");
         assert_eq!(run_capturing("test /dev/zero -ef /dev/null; echo $?").1, "1\n");

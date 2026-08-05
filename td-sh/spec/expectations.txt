@@ -35,6 +35,26 @@
 #               spec/` empty on both sides of a comparison) that would mask real
 #               regressions. A PASSING tree-reading case is skipped for the same
 #               false-green reason.
+#           (d) it depends on SHARED `/tmp` state the isolated cwd neither owns nor
+#               cleans, detected by `depends_on_shared_tmp` in the three shapes the
+#               corpus spells it: an absolute path under `/tmp` (the code mentions
+#               `/tmp/`), the same path reached through `HOME=/tmp`, and a test of
+#               `/tmp`'s own MODE (`-k /tmp`). Sixteen cases `mkdir -p` or `touch`
+#               such a path and then depend on it -- `cd` there and print `pwd`, put
+#               it on `PATH`, make it `$HOME` -- or ask whether `/tmp` is sticky. The
+#               staging command is not on the harness PATH, so whether the path
+#               exists is a fact about the HOST, and so is the mode: five flip
+#               verdict once an earlier run under a real shell has left the
+#               directories behind, and `-k for sticky bit` flips on any host whose
+#               `/tmp` is not sticky. Listing them either way would red the gate on
+#               whichever machine disagrees. A PASSING such case is skipped for the
+#               same false-green reason, and `-k for sticky bit` IS one -- so its
+#               disagreement would red as a REGRESSION, not as the milder XPASS the
+#               rest would. Fifteen MOVE here; the sixteenth (`builtin-dirs::cd
+#               replaces the lowest entry`) was already skipped by (c), whose
+#               `spec/` token its `/tmp/oils-spec/` path contains.
+#               Bare `/tmp` is deliberately NOT a shape: ten cases need only that it
+#               EXIST, which is universal, and one names the relative `./tmp.sh`.
 #           These heuristics are conservative substring matches over the case code
 #           with FULL-LINE comments stripped, so a token mentioned only in prose does
 #           not force a skip. KNOWN over-match (safe direction): a token inside an
@@ -360,12 +380,9 @@ xfail builtin-bracket.test.sh::-w
 xfail builtin-bracket.test.sh::-x
 xfail builtin-bracket.test.sh::operator/operand ambiguity with -a
 xfail builtin-cd.test.sh::$OLDPWD
-xfail builtin-cd.test.sh::'unset PWD; pwd' before any cd (tickles a rare corner case)
-xfail builtin-cd.test.sh::CDPATH is respected
 xfail builtin-cd.test.sh::Change directory in non-shell parent process (make or Python)
 xfail builtin-cd.test.sh::Survey of getcwd() syscall
 xfail builtin-cd.test.sh::Test the current directory after 'cd ..' involving symlinks
-xfail builtin-cd.test.sh::What happens when inherited $PWD and current dir disagree?
 xfail builtin-cd.test.sh::cd away from dir that was deleted
 xfail builtin-cd.test.sh::cd to relative path with -L and -P
 xfail builtin-cd.test.sh::cd to symlink with -L and -P
@@ -373,13 +390,9 @@ xfail builtin-cd.test.sh::cd with 2 or more args - with strict_arg_parse
 xfail builtin-cd.test.sh::cd with 2 or more args is allowed (strict_arg_parse disabled)
 xfail builtin-cd.test.sh::cd with no arguments
 xfail builtin-cd.test.sh::chdir is a synonym for cd - busybox ash
-xfail builtin-cd.test.sh::lie about PWD; pwd before any cd
 xfail builtin-cd.test.sh::pwd after cd ..
 xfail builtin-cd.test.sh::pwd in symlinked dir on shell initialization
 xfail builtin-cd.test.sh::pwd with symlink and -P
-xfail builtin-cd.test.sh::remove pwd dir
-xfail builtin-cd.test.sh::setting $PWD doesn't affect the value of 'pwd' builtin
-xfail builtin-cd.test.sh::unset PWD; then pwd
 xfail builtin-completion.test.sh::-A function prints functions
 xfail builtin-completion.test.sh::-o filenames and -o nospace have no effect with compgen
 xfail builtin-completion.test.sh::Invalid syntax
@@ -424,16 +437,11 @@ xfail builtin-completion.test.sh::complete with nonexistent function
 xfail builtin-completion.test.sh::compopt fails when not in completion function
 xfail builtin-completion.test.sh::compopt with invalid syntax
 xfail builtin-dirs.test.sh::dirs -c to clear the stack
-xfail builtin-dirs.test.sh::dirs -l to print in long format, no tilde prefix
 xfail builtin-dirs.test.sh::dirs -p to print one entry per line
 xfail builtin-dirs.test.sh::dirs -v to print numbered stack, one entry per line
 xfail builtin-dirs.test.sh::dirs builtin
-xfail builtin-dirs.test.sh::dirs don't convert to tilde when $HOME is substring
-xfail builtin-dirs.test.sh::dirs test converting true home directory to tilde
 xfail builtin-dirs.test.sh::dirs test of path alias `..`
 xfail builtin-dirs.test.sh::dirs test of path alias `.`
-xfail builtin-dirs.test.sh::dirs tilde test when $HOME is exactly $PWD
-xfail builtin-dirs.test.sh::dirs to print using tilde-prefix format
 xfail builtin-dirs.test.sh::popd returns error on empty directory stack
 xfail builtin-dirs.test.sh::popd usage error
 xfail builtin-dirs.test.sh::pushd usage
@@ -586,9 +594,7 @@ xfail builtin-type-bash.test.sh::type -a -> keyword
 xfail builtin-type-bash.test.sh::type -ap -> alias
 xfail builtin-type-bash.test.sh::type -ap -> builtin
 xfail builtin-type-bash.test.sh::type -ap -> function
-xfail builtin-type-bash.test.sh::type -f builtin -> function and file exists
 xfail builtin-type-bash.test.sh::type -f builtin -> not found
-xfail builtin-type-bash.test.sh::type -p and -P builtin -> file
 xfail builtin-type-bash.test.sh::type -p builtin -> not a file
 xfail builtin-type-bash.test.sh::type -p builtin -> not found
 xfail builtin-type-bash.test.sh::type -t -> alias
@@ -1382,8 +1388,16 @@ skip assign.test.sh::readonly x= gives empty string (regression)
 skip assign.test.sh::static assignment doesn't split
 skip brace-expansion.test.sh::Empty alternative
 skip brace-expansion.test.sh::Empty alternative with empty string suffix
+skip builtin-bracket.test.sh::-k for sticky bit
 skip builtin-bracket.test.sh::test -b -c -S (block, character, socket)
 skip builtin-bracket.test.sh::test -p named pipe
+skip builtin-cd.test.sh::'unset PWD; pwd' before any cd (tickles a rare corner case)
+skip builtin-cd.test.sh::CDPATH is respected
+skip builtin-cd.test.sh::What happens when inherited $PWD and current dir disagree?
+skip builtin-cd.test.sh::lie about PWD; pwd before any cd
+skip builtin-cd.test.sh::remove pwd dir
+skip builtin-cd.test.sh::setting $PWD doesn't affect the value of 'pwd' builtin
+skip builtin-cd.test.sh::unset PWD; then pwd
 skip builtin-completion.test.sh::-o plusdirs and -o dirnames with compgen
 skip builtin-completion.test.sh::compadjust with empty COMP_ARGV
 skip builtin-completion.test.sh::compadjust with sparse COMP_ARGV
@@ -1393,6 +1407,11 @@ skip builtin-completion.test.sh::compgen -W 'one two three'
 skip builtin-completion.test.sh::compgen -o default completes files and dirs
 skip builtin-completion.test.sh::how compgen calls completion functions
 skip builtin-dirs.test.sh::cd replaces the lowest entry on the directory stack!
+skip builtin-dirs.test.sh::dirs -l to print in long format, no tilde prefix
+skip builtin-dirs.test.sh::dirs don't convert to tilde when $HOME is substring
+skip builtin-dirs.test.sh::dirs test converting true home directory to tilde
+skip builtin-dirs.test.sh::dirs tilde test when $HOME is exactly $PWD
+skip builtin-dirs.test.sh::dirs to print using tilde-prefix format
 skip builtin-eval-source.test.sh::Source from a function, mutating argv and defining a local var
 skip builtin-eval-source.test.sh::Source with arguments
 skip builtin-eval-source.test.sh::sourcing along PATH should ignore directories
@@ -1440,6 +1459,8 @@ skip builtin-type-bash.test.sh::type -a -> file
 skip builtin-type-bash.test.sh::type -a -P gives multiple files
 skip builtin-type-bash.test.sh::type -ap -> builtin and file; doesn't print builtin or function
 skip builtin-type-bash.test.sh::type -ap -> file; abbreviated
+skip builtin-type-bash.test.sh::type -f builtin -> function and file exists
+skip builtin-type-bash.test.sh::type -p and -P builtin -> file
 skip builtin-type.test.sh::type -> alias external
 skip builtin-type.test.sh::type of relative path
 skip command-parsing.test.sh::Redirect on assignment (enabled 7/2019)
