@@ -211,10 +211,16 @@ shorter than the supervisor's 30-second readiness deadline, so a stalled
 compositor makes the client exit and permits `restart=always` to retry.
 
 The launcher is a compositor-owned overlay, so opening it never depends on an
-already-running client. Its registry currently has an input-monitor entry
-that starts another `td-ui-demo` and an explicit close entry. Each entry owns
-a label, lowercase search terms, and a typed launch request. The pure launcher
-model stores a bounded 64-byte ASCII filter, requires every whitespace-
+already-running client. Its registry has a terminal entry that starts a
+`td-term`, an input-monitor entry that starts another `td-ui-demo`, and an
+explicit close entry. The terminal is FIRST, so it is what an unfiltered
+Enter opens: it is the entry a person came for, where the monitor is a
+diagnostic that happened to be the only client there was. Three entries is
+what the card currently holds: a fourth overflows `CARD_HEIGHT`, which
+`registry_entries_are_searchable_and_fit_the_card` reds rather than clipping
+silently, so adding one means growing the card in the same landing. Each entry
+owns a label, lowercase search terms, and a typed launch request. The pure
+launcher model stores a bounded 64-byte ASCII filter, requires every whitespace-
 separated term to occur in an entry's search text, and resets selection to the
 first match after an edit. An empty result is explicit and Enter leaves it
 open; Backspace can recover it. Opening clears the previous filter. While the
@@ -227,10 +233,15 @@ guessing which action opened or closed it. It never enables capture before a
 successful open. An overlay action is transactional with its framebuffer
 paint: a failed paint restores the complete prior launcher model, so another
 input device cannot observe model state with stale capture.
-The compositor receives the client executable as an explicit
-`--launcher-client` argument, requires both it and the Wayland socket to be
-absolute, derives a unique readiness-socket name beside the socket, and passes
-both paths as literal argv values without a shell. It reaps exited children
+The compositor receives each client executable as an explicit argument —
+`--launcher-client` and `--terminal-client` — and requires both, along with
+the Wayland socket, to be absolute. Neither is defaulted: the store path a
+package lands at is content addressed, so the compositor cannot derive one,
+and a registry entry that spawns nothing is worse than one that never
+appeared. The launch request selects the PROGRAM and nothing else, both
+personalities of the multicall taking the same two run flags. The compositor
+derives a unique readiness-socket name beside the socket and passes both
+paths as literal argv values without a shell. It reaps exited children
 before each launch and retains at most 16 live launched clients. A launch or
 reap failure is reported without terminating the evdev reader, so the user
 can close or retry the launcher. Reaping also removes a dead child's private
@@ -685,10 +696,10 @@ input devices, sockets, clocks, the filesystem, or ambient environment.
 
 Focused keyboard and pointer delivery now connect the demo client to the
 existing evdev input path, and the Emacs-style launcher has a filterable
-application registry. A terminal launcher entry follows after the native
-terminal client is packaged. Clipboard, pointer axes, client cursor rendering,
-hotplug, and real DRM/KMS profiles follow. The terminal stack has the separate
-contract below.
+application registry with a terminal entry. Making the terminal the first
+client the BOOT starts, in place of the demo, follows. Clipboard, pointer
+axes, client cursor rendering, hotplug, and real DRM/KMS profiles follow.
+The terminal stack has the separate contract below.
 
 Of that contract these are built: the parser and terminal model, the native
 corpus including its `key` operations, the keyboard adapter of section 11
@@ -706,10 +717,10 @@ Section 11's renderer is landed as a pure function, with section 14's exact
 P6 goldens as its oracle: the palette, the six renditions, the cursor, the
 visual-bell ring, the clipping, and the scrollback viewport, whose selecting
 keys landed after it.
-What it still lacks is a caller. Nothing submits its output to a surface, so
-the frame-callback coalescing, the persistent-buffer reuse-after-release, and
-the buffer replacement on resize that section 11 also specifies land with the
-Wayland client, which is where a frame's lifecycle exists at all.
+Its caller is the Wayland client of section 12, which submits each rendered
+frame to its surface, so the frame-callback coalescing, the persistent-buffer
+reuse-after-release, and the buffer replacement on resize that section 11 also
+specifies are landed with it.
 
 Section 12's PTY writer thread and child waiter are landed with the bounded
 keyboard queue they share with the main loop. Section 12's devpts instance is
@@ -720,14 +731,17 @@ machine. Section 12's readiness socket, `TD-TERM-READY` marker, and `probe`
 subcommand are landed, along with the `td-term` name itself: one artifact
 serves three programs, chosen by argv[0], and the store output carries the
 terminal as a symlink beside the compositor. The `/bin/td-term` name §12 spells
-and the `ready=` line that calls it are packaging, and land with it. What has
-no caller yet is the publisher —
-deciding a terminal IS ready belongs to the Wayland client. The Wayland client,
-packaging, and boot cutover of sections 12 and 14 follow; the terminfo entry is
-landed. Until that client exists the PTY adapter has no production caller;
-its host tests drive every operation against a real PTY, and the packaged
-binary's selftest covers the policy layer, which is what runs where devpts is
-not mounted.
+and the `ready=` line that calls it are packaging, and are landed. The
+publisher has its caller: deciding a terminal IS ready belongs to the Wayland
+client, which publishes once everything that can still fail has — handshake
+finished, reader detached, child started — and before its main loop, so a
+probe is never told something true for less than a second. That client is
+landed and is the PTY adapter's production caller; its host tests still drive
+every operation against a real PTY, and the packaged binary's selftest covers
+the policy layer, which is what runs where devpts is not mounted. The terminfo
+entry and the `/bin/td-term` symlink are landed, and the launcher can open a
+terminal. What remains of sections 12 and 14 is the boot cutover — making the
+terminal the first client the machine starts, in place of the demo.
 General Wayland toolkit compatibility is not claimed until the missing core
 protocols have explicit tests. Hardware acceleration, niri, portals, PipeWire,
 Xwayland, and a C desktop stack remain optional consumers rather than

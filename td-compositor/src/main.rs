@@ -44,7 +44,7 @@ const MAX_HELD_KEYS: usize = 256;
 
 fn usage() -> String {
     "usage: td-compositor run --framebuffer PATH --input DIR --socket PATH \
-     --launcher-client PATH | td-compositor probe SOCKET | td-compositor terminfo PATH | \
+     --launcher-client PATH --terminal-client PATH | td-compositor probe SOCKET | td-compositor terminfo PATH | \
      td-compositor selftest"
         .into()
 }
@@ -136,6 +136,7 @@ struct RunOptions {
     input: PathBuf,
     socket: PathBuf,
     launcher_client: PathBuf,
+    terminal_client: PathBuf,
 }
 
 fn parse_run(args: &[String]) -> Result<RunOptions, String> {
@@ -143,6 +144,7 @@ fn parse_run(args: &[String]) -> Result<RunOptions, String> {
     let mut input = None;
     let mut socket = None;
     let mut launcher_client = None;
+    let mut terminal_client = None;
     let mut index = 0;
     while index < args.len() {
         let flag = args
@@ -158,9 +160,11 @@ fn parse_run(args: &[String]) -> Result<RunOptions, String> {
             "--launcher-client" if launcher_client.is_none() => {
                 launcher_client = Some(PathBuf::from(value))
             }
-            "--framebuffer" | "--input" | "--socket" | "--launcher-client" => {
-                return Err(format!("duplicate flag '{flag}'"))
+            "--terminal-client" if terminal_client.is_none() => {
+                terminal_client = Some(PathBuf::from(value))
             }
+            "--framebuffer" | "--input" | "--socket" | "--launcher-client"
+            | "--terminal-client" => return Err(format!("duplicate flag '{flag}'")),
             _ => return Err(format!("unrecognised argument '{flag}'")),
         }
         index += 2;
@@ -171,6 +175,11 @@ fn parse_run(args: &[String]) -> Result<RunOptions, String> {
         socket: socket.ok_or_else(|| "--socket is required".to_string())?,
         launcher_client: launcher_client
             .ok_or_else(|| "--launcher-client is required".to_string())?,
+        // Required rather than defaulted: the compositor cannot know the store
+        // path the terminal landed at, and a launcher entry that spawns nothing
+        // is worse than one that never appeared.
+        terminal_client: terminal_client
+            .ok_or_else(|| "--terminal-client is required".to_string())?,
     })
 }
 
@@ -188,6 +197,7 @@ fn run_compositor(options: RunOptions) -> Result<(), String> {
         launcher::LaunchOptions {
             socket: options.socket.clone(),
             client: options.launcher_client,
+            terminal: options.terminal_client,
         },
     )?;
     eprintln!(
@@ -399,6 +409,7 @@ mod tests {
         let launch = launcher::LaunchOptions {
             socket: PathBuf::from("/run/user/1000/wayland-0"),
             client: PathBuf::from("/bin/td-ui-demo"),
+            terminal: PathBuf::from("/bin/td-term"),
         };
         let (program, arguments, ready_socket) =
             launcher::launch_command(&launch, launcher::LaunchRequest::UiDemo, 7).unwrap();
@@ -418,6 +429,28 @@ mod tests {
         let ready_name = parsed.ready_socket.file_name().unwrap().to_string_lossy();
         assert!(ready_name.starts_with("td-launcher-"));
         assert!(ready_name.ends_with("-7.ready"));
+
+        // The terminal rides the same `parse_run_flags`, reached here through
+        // the demo's wrapper — the shared parser is what makes one set of run
+        // flags a property rather than a coincidence.
+        let (program, arguments, ready_socket) =
+            launcher::launch_command(&launch, launcher::LaunchRequest::Terminal, 8).unwrap();
+        assert_eq!(program, launch.terminal);
+        let arguments: Vec<String> = arguments
+            .into_iter()
+            .map(|argument| argument.into_string().unwrap())
+            .collect();
+        assert_eq!(arguments.first().map(String::as_str), Some("run"));
+        let parsed = parse_client_run(arguments.get(1..).unwrap()).unwrap();
+        assert_eq!(parsed.socket, launch.socket);
+        assert_eq!(parsed.ready_socket, ready_socket);
+        // The two usage strings are hand-written and the parser is not, so the
+        // thing that can drift is what each TELLS an operator. Both must spell
+        // the shared flags identically, or one personality documents a
+        // spelling `parse_run_flags` would refuse.
+        let flags = "run --socket PATH --ready-socket PATH";
+        assert!(client_usage().contains(flags), "{}", client_usage());
+        assert!(term_usage().contains(flags), "{}", term_usage());
     }
 }
 
@@ -854,6 +887,8 @@ fn syscall3(number: usize, a1: usize, a2: usize, a3: usize) -> isize {
             "/run/user/1000/wayland-0".into(),
             "--launcher-client".into(),
             "/bin/td-ui-demo".into(),
+            "--terminal-client".into(),
+            "/bin/td-term".into(),
         ])
         .unwrap();
         assert_eq!(options.framebuffer, std::path::PathBuf::from("/dev/fb0"));
@@ -861,6 +896,51 @@ fn syscall3(number: usize, a1: usize, a2: usize, a3: usize) -> isize {
             options.launcher_client,
             std::path::PathBuf::from("/bin/td-ui-demo")
         );
+        assert_eq!(
+            options.terminal_client,
+            std::path::PathBuf::from("/bin/td-term")
+        );
+        // Each boundary is required on its own, so dropping any ONE is refused
+        // rather than defaulted — a launcher entry that spawns nothing is
+        // worse than one that never appeared.
+        assert!(super::parse_run(&[
+            "--framebuffer".into(),
+            "/dev/fb0".into(),
+            "--input".into(),
+            "/dev/input".into(),
+            "--socket".into(),
+            "/run/user/1000/wayland-0".into(),
+            "--launcher-client".into(),
+            "/bin/td-ui-demo".into(),
+        ])
+        .is_err());
+        assert!(super::parse_run(&[
+            "--framebuffer".into(),
+            "/dev/fb0".into(),
+            "--input".into(),
+            "/dev/input".into(),
+            "--socket".into(),
+            "/run/user/1000/wayland-0".into(),
+            "--terminal-client".into(),
+            "/bin/td-term".into(),
+        ])
+        .is_err());
+        // A repeated flag is refused rather than last-one-wins.
+        assert!(super::parse_run(&[
+            "--framebuffer".into(),
+            "/dev/fb0".into(),
+            "--input".into(),
+            "/dev/input".into(),
+            "--socket".into(),
+            "/run/user/1000/wayland-0".into(),
+            "--launcher-client".into(),
+            "/bin/td-ui-demo".into(),
+            "--terminal-client".into(),
+            "/bin/td-term".into(),
+            "--terminal-client".into(),
+            "/bin/elsewhere".into(),
+        ])
+        .is_err());
         assert!(super::parse_run(&[
             "--framebuffer".into(),
             "/dev/fb0".into(),

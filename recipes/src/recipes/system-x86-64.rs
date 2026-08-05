@@ -879,7 +879,7 @@ fn build_td_svc_conf() -> String {
          # credentials, and the compositor opens only those fixed paths.\n\
          [wayland]\n\
          type=daemon\n\
-         exec=/bin/su -s /bin/sh {ui_user} -c '/bin/td-compositor run --framebuffer /dev/fb0 --input /dev/input --socket /run/user/{ui_uid}/wayland-0 --launcher-client /bin/td-ui-demo'\n\
+         exec=/bin/su -s /bin/sh {ui_user} -c '/bin/td-compositor run --framebuffer /dev/fb0 --input /dev/input --socket /run/user/{ui_uid}/wayland-0 --launcher-client /bin/td-ui-demo --terminal-client /bin/td-term'\n\
          after=seat\n\
          requires=seat\n\
          ready=/bin/su -s /bin/sh {ui_user} -c '/bin/td-compositor probe /run/user/{ui_uid}/wayland-0'\n\
@@ -2894,15 +2894,94 @@ mod tests {
         );
     }
 
+    /// Every client path the compositor is handed is a name the image STAGES.
+    ///
+    /// The compositor cannot resolve any of them: each is an absolute `/bin`
+    /// name, and the launcher refuses a relative program rather than
+    /// searching. A flag naming a binary this recipe does not symlink is a
+    /// launcher entry that spawns nothing — and nothing on the boot path would
+    /// say so, because the failure is a `Command::new` inside a running
+    /// compositor, reported through the launcher's own failure path.
+    ///
+    /// What this test uniquely holds is the MAPPING. That each path is staged
+    /// is already covered by `direct_bin_calls_resolve_to_a_packed_name`,
+    /// which sweeps every `/bin/NAME` in the table; what nothing else sees is
+    /// WHICH flag carries WHICH program. Swap the two and the image is a
+    /// machine whose NEW TERMINAL entry opens the input monitor and whose NEW
+    /// INPUT MONITOR opens a terminal — both binaries staged, every other
+    /// test green, and nothing short of looking at the screen to say so.
+    ///
+    /// The flags are enumerated out of the unit rather than only listed, so a
+    /// renamed or vanished flag reds the count instead of quietly leaving the
+    /// mapping unchecked.
     #[test]
-    fn wayland_service_supplies_the_explicit_launcher_client() {
+    fn the_launcher_client_flags_name_binaries_the_image_stages() {
+        let exec = unit_key("wayland", "exec").unwrap_or_default();
+        let steps = real_root_steps(&SYSTEM);
+        let words: Vec<&str> = exec.split_ascii_whitespace().collect();
+        let flags: Vec<(&str, &str)> = words
+            .iter()
+            .enumerate()
+            .filter(|(_, word)| word.starts_with("--") && word.ends_with("-client"))
+            .map(|(index, word)| {
+                // The unit's exec is a `su -c '…'` word, so the LAST flag's
+                // value carries the closing quote — strip it as the shell does.
+                let value = words
+                    .get(index.saturating_add(1))
+                    .copied()
+                    .unwrap_or_default()
+                    .trim_end_matches('\'');
+                (*word, value)
+            })
+            .collect();
+        // The enumeration is only a proof if it FOUND them, and the count is
+        // what says so: a renamed flag would silently yield a shorter list.
+        assert_eq!(
+            flags.len(),
+            2,
+            "expected two --*-client flags in the wayland unit, found {flags:?}"
+        );
+        for (flag, path) in &flags {
+            let program = path.strip_prefix("/bin/").unwrap_or_default();
+            assert!(
+                !program.is_empty() && !program.contains('/'),
+                "{flag} passes {path}, which is not a /bin name"
+            );
+            let link = format!("{{root}}/real-root{path}");
+            assert!(
+                steps.iter().any(|step| matches!(
+                    step,
+                    Step::Symlink { link: at, target } if at == &link
+                        && target == &format!("{{in:td-compositor}}/bin/{program}")
+                )),
+                "{flag} passes {path}, but nothing stages it"
+            );
+        }
+        // Order-independent, because two flags on one command line have none:
+        // what is pinned is which program each NAMES.
+        for expected in [
+            ("--launcher-client", "/bin/td-ui-demo"),
+            ("--terminal-client", "/bin/td-term"),
+        ] {
+            assert!(
+                flags.contains(&expected),
+                "the wayland unit does not pass {} {} — found {flags:?}",
+                expected.0,
+                expected.1
+            );
+        }
+    }
+
+    #[test]
+    fn wayland_service_supplies_both_explicit_client_paths() {
         assert_eq!(
             unit_key("wayland", "exec").as_deref(),
             Some(
                 "/bin/su -s /bin/sh tester -c '/bin/td-compositor run \
                  --framebuffer /dev/fb0 --input /dev/input \
                  --socket /run/user/1000/wayland-0 \
-                 --launcher-client /bin/td-ui-demo'"
+                 --launcher-client /bin/td-ui-demo \
+                 --terminal-client /bin/td-term'"
             )
         );
     }

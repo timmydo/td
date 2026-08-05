@@ -2238,6 +2238,7 @@ mod tests {
         let launches = LaunchProcesses::new(LaunchOptions {
             socket: PathBuf::from("/run/user/1000/wayland-0"),
             client: PathBuf::from("/bin/td-ui-demo"),
+            terminal: PathBuf::from("/bin/td-term"),
         })
         .unwrap();
         let target = Mutex::new(LiveInputTarget {
@@ -2270,6 +2271,7 @@ mod tests {
         let launches = LaunchProcesses::new(LaunchOptions {
             socket: PathBuf::from("/run/user/1000/wayland-0"),
             client: PathBuf::from("/bin/td-ui-demo"),
+            terminal: PathBuf::from("/bin/td-term"),
         })
         .unwrap();
         let target = Mutex::new(LiveInputTarget {

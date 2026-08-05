@@ -799,7 +799,7 @@ mod tests {
         assert_ne!(first, hidden);
         assert!(Arc::ptr_eq(&layout, &runtime.layout_snapshot()));
 
-        assert_eq!(runtime.launcher(LauncherAction::Next).unwrap(), None);
+        assert_eq!(runtime.launcher(LauncherAction::Previous).unwrap(), None);
         let second = fs::read(&cleanup.0).unwrap();
         assert_ne!(second, first);
         assert_eq!(runtime.launcher(LauncherAction::Activate).unwrap(), None);
@@ -808,7 +808,7 @@ mod tests {
         runtime.launcher(LauncherAction::Open).unwrap();
         assert_eq!(
             runtime.launcher(LauncherAction::Activate).unwrap(),
-            Some(LaunchRequest::UiDemo)
+            Some(LaunchRequest::Terminal)
         );
         assert_eq!(fs::read(&cleanup.0).unwrap(), hidden);
     }
@@ -832,7 +832,7 @@ mod tests {
         assert!(runtime.launcher_visible());
         assert_eq!(
             runtime.launcher(LauncherAction::Activate).unwrap(),
-            Some(LaunchRequest::UiDemo)
+            Some(LaunchRequest::Terminal)
         );
         assert!(!runtime.launcher_visible());
     }

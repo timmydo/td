@@ -23,6 +23,7 @@ pub enum LauncherAction {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LaunchRequest {
     UiDemo,
+    Terminal,
 }
 
 #[derive(Clone, Copy)]
@@ -33,6 +34,13 @@ struct Entry {
 }
 
 const ENTRIES: &[Entry] = &[
+    // First because it is the one a person came here for; the monitor below it
+    // is a diagnostic that happened to be the only client there was.
+    Entry {
+        label: "NEW TERMINAL",
+        search: "new terminal shell console prompt",
+        request: Some(LaunchRequest::Terminal),
+    },
     Entry {
         label: "NEW INPUT MONITOR",
         search: "new input monitor demo wayland",
@@ -56,6 +64,7 @@ pub struct Launcher {
 pub struct LaunchOptions {
     pub socket: PathBuf,
     pub client: PathBuf,
+    pub terminal: PathBuf,
 }
 
 pub(crate) trait ChildProcess {
@@ -104,6 +113,12 @@ impl LaunchOptions {
             return Err(format!(
                 "launcher client {} is not absolute",
                 self.client.display()
+            ));
+        }
+        if !self.terminal.is_absolute() {
+            return Err(format!(
+                "launcher terminal {} is not absolute",
+                self.terminal.display()
             ));
         }
         Ok(())
@@ -462,18 +477,21 @@ pub(crate) fn launch_command(
         "td-launcher-{}-{sequence}.ready",
         std::process::id()
     ));
-    match request {
-        LaunchRequest::UiDemo => {
-            let arguments = vec![
-                OsString::from("run"),
-                OsString::from("--socket"),
-                options.socket.as_os_str().to_os_string(),
-                OsString::from("--ready-socket"),
-                ready.as_os_str().to_os_string(),
-            ];
-            Ok((options.client.clone(), arguments, ready))
-        }
-    }
+    // The request picks the PROGRAM and nothing else: both personalities of the
+    // multicall take the same two run flags, which is what `client_usage` and
+    // `term_usage` spell identically.
+    let program = match request {
+        LaunchRequest::UiDemo => options.client.clone(),
+        LaunchRequest::Terminal => options.terminal.clone(),
+    };
+    let arguments = vec![
+        OsString::from("run"),
+        OsString::from("--socket"),
+        options.socket.as_os_str().to_os_string(),
+        OsString::from("--ready-socket"),
+        ready.as_os_str().to_os_string(),
+    ];
+    Ok((program, arguments, ready))
 }
 
 fn intersect(
@@ -616,6 +634,7 @@ mod tests {
                 .join(format!("td-launcher-fake-{}-missing", std::process::id()))
                 .join("wayland-0"),
             client: PathBuf::from("/bin/td-ui-demo"),
+            terminal: PathBuf::from("/bin/td-term"),
         }
     }
 
@@ -628,14 +647,14 @@ mod tests {
         assert!(launcher.visible());
         assert_eq!(launcher.selected(), 0);
         assert_eq!(launcher.apply(LauncherAction::Previous), None);
-        assert_eq!(launcher.selected(), 1);
+        assert_eq!(launcher.selected(), 2);
         assert_eq!(launcher.apply(LauncherAction::Activate), None);
         assert!(!launcher.visible());
 
         launcher.apply(LauncherAction::Open);
         assert_eq!(
             launcher.apply(LauncherAction::Activate),
-            Some(LaunchRequest::UiDemo)
+            Some(LaunchRequest::Terminal)
         );
         assert!(!launcher.visible());
     }
@@ -655,7 +674,7 @@ mod tests {
         assert_eq!(launcher.query(), "");
         assert_eq!(
             launcher.matched_labels(),
-            ["NEW INPUT MONITOR", "CLOSE LAUNCHER"]
+            ["NEW TERMINAL", "NEW INPUT MONITOR", "CLOSE LAUNCHER"]
         );
     }
 
@@ -701,7 +720,7 @@ mod tests {
         launcher.apply(LauncherAction::Backspace);
         assert_eq!(
             launcher.matched_labels(),
-            ["NEW INPUT MONITOR", "CLOSE LAUNCHER"]
+            ["NEW TERMINAL", "NEW INPUT MONITOR", "CLOSE LAUNCHER"]
         );
         launcher.apply(LauncherAction::Backspace);
         assert_eq!(launcher.query(), "");
@@ -784,11 +803,17 @@ mod tests {
         let options = LaunchOptions {
             socket: PathBuf::from("/run/user/1000/wayland-0"),
             client: PathBuf::from("/bin/td-ui-demo"),
+            terminal: PathBuf::from("/bin/td-term"),
         };
         let (program, first, first_ready) =
             launch_command(&options, LaunchRequest::UiDemo, 7).unwrap();
         let (_, second, second_ready) = launch_command(&options, LaunchRequest::UiDemo, 8).unwrap();
         assert_eq!(program, PathBuf::from("/bin/td-ui-demo"));
+        let (terminal, terminal_arguments, _) =
+            launch_command(&options, LaunchRequest::Terminal, 9).unwrap();
+        assert_eq!(terminal, PathBuf::from("/bin/td-term"));
+        // Same flags, different program — the request selects only the latter.
+        assert_eq!(terminal_arguments.get(..4), first.get(..4));
         assert_eq!(
             first,
             [
@@ -815,12 +840,24 @@ mod tests {
         let relative = LaunchOptions {
             socket: PathBuf::from("wayland-0"),
             client: PathBuf::from("/bin/td-ui-demo"),
+            terminal: PathBuf::from("/bin/td-term"),
         };
         assert!(launch_command(&relative, LaunchRequest::UiDemo, 0).is_err());
         let relative = LaunchOptions {
             socket: PathBuf::from("/run/user/1000/wayland-0"),
             client: PathBuf::from("td-ui-demo"),
+            terminal: PathBuf::from("/bin/td-term"),
         };
+        assert!(launch_command(&relative, LaunchRequest::UiDemo, 0).is_err());
+        assert!(LaunchProcesses::new(relative).is_err());
+        // Both paths are refused, whichever request asks: the terminal is
+        // spawned by the same `Command::new` the demo is.
+        let relative = LaunchOptions {
+            socket: PathBuf::from("/run/user/1000/wayland-0"),
+            client: PathBuf::from("/bin/td-ui-demo"),
+            terminal: PathBuf::from("td-term"),
+        };
+        assert!(launch_command(&relative, LaunchRequest::Terminal, 0).is_err());
         assert!(launch_command(&relative, LaunchRequest::UiDemo, 0).is_err());
         assert!(LaunchProcesses::new(relative).is_err());
     }
@@ -925,6 +962,7 @@ mod tests {
         let options = LaunchOptions {
             socket: directory.join("wayland-0"),
             client: PathBuf::from("/bin/td-ui-demo"),
+            terminal: PathBuf::from("/bin/td-term"),
         };
         let mut states = VecDeque::new();
         states.push_back(Ok(ChildState::Failed("signal: 9".to_string())));
@@ -954,6 +992,7 @@ mod tests {
         let options = LaunchOptions {
             socket: directory.join("wayland-0"),
             client: PathBuf::from("/bin/td-ui-demo"),
+            terminal: PathBuf::from("/bin/td-term"),
         };
         let mut states = VecDeque::new();
         states.push_back(Ok(ChildState::Exited));
