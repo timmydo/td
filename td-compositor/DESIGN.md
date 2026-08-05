@@ -1020,7 +1020,17 @@ Home, End, PageUp, PageDown, Insert, Delete, and F1 through F12. It selects
 normal or application sequences from explicit terminal modes. Ctrl produces
 the specified ASCII C0 bytes, Alt prefixes the resulting sequence with ESC,
 and Shift selects the defined text or navigation variant; unlisted modifier
-combinations produce no bytes.
+combinations produce no bytes. td-term routes that adapter: the keyboard's
+modifiers event folds depressed, latched and locked into the one mask the
+adapter reads, and a pressed key becomes bytes in the queue the PTY writer
+drains. Releases send nothing, and a non-zero keymap group sends nothing
+either — the pinned map has one group, so reading another against group 0's
+table would send a different key's bytes rather than none. The terminal mode
+that picks between two spellings is refreshed from the model before each
+event, because a child's reply to one key can change how the next is
+spelled. Key REPEAT and the scrollback VIEWPORT are not wired yet: a key
+that would scroll does nothing until there is something to scroll, and
+repeat needs a clock in a loop that currently blocks on its channel.
 
 Those three rules are exhaustive, and what they exclude is deliberate. Ctrl
 reaches printable keys only, and only where a C0 spelling is defined; the

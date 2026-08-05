@@ -84,19 +84,14 @@ impl Sequence {
 pub enum Scroll {
     Back,
     Forward,
-    /// Awaiting the Wayland client that routes keys; `Back` and `Forward`
-    /// are named by the roster, so only this one has no non-test caller.
-    #[allow(dead_code)]
+    /// Produced for the End key while the viewport is scrolled back. The
+    /// client drops every scroll until there is a viewport to move.
     Bottom,
 }
 
 /// What one key press does. Exactly one of three things, which is why this
 /// is an enum rather than an `Option<Sequence>` plus a flag: a key that
 /// scrolls must not also be able to send bytes.
-///
-/// Awaiting the Wayland client that composes the adapter; until it exists
-/// the corpus is what drives this.
-#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Action {
     Bytes(Sequence),
@@ -375,7 +370,6 @@ pub fn sequence(code: u16, modifiers: u32, modes: Modes) -> Option<Sequence> {
 
 /// The one key whose meaning depends on where the viewport is. Pinned to the
 /// roster by the test below rather than read out of it per press.
-#[allow(dead_code)]
 const END: u16 = 107;
 
 /// Route one key press: to the viewport, to the child, or nowhere.
@@ -384,7 +378,6 @@ const END: u16 = 107;
 /// ever opened, because §10 gives End two meanings and the one it has must
 /// follow what is on screen: a viewport whose history evicted underneath it
 /// is at the live bottom, and End there belongs to the child.
-#[allow(dead_code)]
 pub fn action(code: u16, modifiers: u32, modes: Modes, viewing: bool) -> Action {
     if modifiers & !(HANDLED | IGNORED) != 0 {
         return Action::Silent;

@@ -16,7 +16,8 @@ use crate::pty::Pty;
 use crate::scene::SHM_XRGB8888;
 use crate::term::Terminal;
 use crate::{
-    font, pty, ready, render, socket, wire, MAX_HELD_KEYS, MAX_UI_DIMENSION, MAX_UI_FRAME_BYTES,
+    font, keys, pty, ready, render, socket, wire, MAX_HELD_KEYS, MAX_UI_DIMENSION,
+    MAX_UI_FRAME_BYTES,
 };
 use std::collections::BTreeSet;
 use std::io::Write;
@@ -248,6 +249,26 @@ struct Surface {
     /// Whether the compositor's keymap has been received and matched against
     /// td's pinned one. §11 makes this a precondition of the child starting.
     keymap_verified: bool,
+    /// The effective XKB modifier mask — depressed, latched and locked folded
+    /// together, which is what `keys` reads. Held rather than recomputed
+    /// because a key event carries no modifiers of its own.
+    modifiers: u32,
+    /// Whether the current non-zero group has been reported. Cleared when
+    /// the group changes, so returning to td's own map and leaving it again
+    /// reports the second departure too.
+    group_reported: bool,
+    /// The keymap group the last modifiers event selected. td's pinned map
+    /// has exactly one, so a non-zero group is a layout whose key meanings
+    /// this table does not describe — and translating it against group 0
+    /// would send the wrong bytes rather than none.
+    group: u32,
+    /// The terminal modes that pick between two spellings of the same key,
+    /// refreshed from the model before each dispatch: `dispatch` translates,
+    /// and the model that knows the mode is not its to reach.
+    modes: keys::Modes,
+    /// One translated key press, waiting for `serve_event` to route it to the
+    /// child. A dispatch handles one message and so yields at most one.
+    pending_input: Option<keys::Sequence>,
     live_buffers: BTreeSet<u32>,
     live_callbacks: BTreeSet<u32>,
     frame: Option<Frame>,
@@ -271,6 +292,11 @@ impl Surface {
             seat_capabilities: None,
             keyboard_requested: false,
             keymap_verified: false,
+            modifiers: 0,
+            group: 0,
+            group_reported: false,
+            modes: keys::Modes::default(),
+            pending_input: None,
             live_buffers: BTreeSet::new(),
             live_callbacks: BTreeSet::new(),
             frame: None,
@@ -392,13 +418,14 @@ impl Surface {
                     conn::verify_keymap(&file, format, size)?;
                     self.keymap_verified = true;
                 }
-                // Focus in and out. Parsed and otherwise ignored: this landing
-                // gets the terminal a VERIFIED keymap before its child starts,
-                // which is what §11 asks of it, and acting on keys is the next
-                // one. Parsed rather than skipped because every other arm here
-                // validates what it consumes, and a wl_keyboard that entered a
-                // surface this client does not own is a compositor confusing
-                // it with another client.
+                // Focus in and out. The renderer's notion of focus comes from
+                // `xdg_toplevel`'s activated state rather than from here, so
+                // what these arms owe is the modifier reset below. Parsed
+                // rather than
+                // skipped because every other arm here validates what it
+                // consumes, and a wl_keyboard that entered a surface this
+                // client does not own is a compositor confusing it with
+                // another client.
                 1 => {
                     args.u32()?;
                     let surface = args.u32()?;
@@ -424,24 +451,46 @@ impl Surface {
                         return Err(format!("wl_keyboard left unexpected surface {surface}"));
                     }
                     args.finish()?;
+                    // Leaving lifts every key, modifiers among them, which the
+                    // protocol obliges a client to assume. td's server re-sends
+                    // modifiers right after each enter and cannot interleave a
+                    // key between the two, so nothing here could read a stale
+                    // Ctrl — but a client that kept one would be wrong, and the
+                    // cost of not keeping it is a word.
+                    self.modifiers = 0;
                 }
                 // key: serial, time, key, state.
                 3 => {
-                    for _ in 0..3 {
-                        args.u32()?;
-                    }
-                    match args.u32()? {
-                        KEY_RELEASED | KEY_PRESSED => {}
+                    args.u32()?;
+                    args.u32()?;
+                    let code = args.u32()?;
+                    let pressed = match args.u32()? {
+                        KEY_RELEASED => false,
+                        KEY_PRESSED => true,
                         state => return Err(format!("wl_keyboard key has invalid state {state}")),
-                    }
+                    };
                     args.finish()?;
+                    if pressed {
+                        self.translate(code)?;
+                    }
                 }
-                // modifiers: serial and the four mask words.
+                // modifiers: serial, then depressed, latched, locked and the
+                // group. The three masks fold into the one `keys` reads;
+                // nothing here distinguishes a held Shift from a latched one.
                 4 => {
-                    for _ in 0..5 {
-                        args.u32()?;
-                    }
+                    args.u32()?;
+                    let depressed = args.u32()?;
+                    let latched = args.u32()?;
+                    let locked = args.u32()?;
+                    let group = args.u32()?;
                     args.finish()?;
+                    // Staged like the three masks above: nothing is recorded
+                    // until the whole message has been read.
+                    if group != self.group {
+                        self.group = group;
+                        self.group_reported = false;
+                    }
+                    self.modifiers = depressed | latched | locked;
                 }
                 // repeat_info: rate and delay, the version-4 event §11's
                 // repeat design reads its timings out of. Parsed and dropped
@@ -538,6 +587,45 @@ impl Surface {
     /// keymap fails rather than hangs.
     fn presented(&self) -> bool {
         self.ready() && self.has_keyboard() && self.keymap_verified
+    }
+
+    /// Turn one pressed evdev code into the bytes a child expects, or into
+    /// nothing. `keys` owns every rule; what lives here is the decision NOT
+    /// to translate at all: a group this keymap does not have would otherwise
+    /// be read against group 0's table and send bytes for a different key.
+    ///
+    /// A scroll action is dropped rather than served, because td-term has no
+    /// scrollback VIEWPORT yet. `Shift+PageUp` and `Shift+PageDown` are
+    /// therefore SILENT — `keys` answers `Scroll` for them whatever `viewing`
+    /// says, and dropping it is the honest half of the answer rather than a
+    /// wrong one. `viewing` is false because there is nothing to view; it
+    /// gates only the End key, which reaches the child while it stays false.
+    fn translate(&mut self, code: u32) -> Result<(), String> {
+        // Silent rather than fatal, for the reason `keys` answers `Silent` to
+        // any code its table lacks: no evdev code reaches u16, so this is a
+        // broken compositor, and taking the operator's shell down over one
+        // key is a worse answer than ignoring it.
+        let Ok(code) = u16::try_from(code) else {
+            return Ok(());
+        };
+        if self.group != 0 {
+            // Said once per group, not once per key: a silent refusal is
+            // indistinguishable from a terminal that has stopped responding,
+            // and a line per keystroke would be its own kind of unusable.
+            if !self.group_reported {
+                self.group_reported = true;
+                eprintln!(
+                    "td-term: keymap group {} is not td's; keys in it send nothing",
+                    self.group
+                );
+            }
+            return Ok(());
+        }
+        if let keys::Action::Bytes(sequence) = keys::action(code, self.modifiers, self.modes, false)
+        {
+            self.pending_input = Some(sequence);
+        }
+        Ok(())
     }
 
     /// Whether the seat's LATEST word still claims a keyboard. Asked here
@@ -719,6 +807,10 @@ pub struct Prepared {
     pub pty: Pty,
     terminal: Terminal,
     pub cells: (u16, u16),
+    /// Carried out of startup rather than created with the writer: it may
+    /// already hold keys struck between the surface mapping and the child
+    /// existing.
+    input: Arc<pty::Input>,
 }
 
 impl Prepared {
@@ -905,9 +997,10 @@ struct Child {
 }
 
 impl Default for Child {
-    /// A child that is not there yet — startup, before `start` — whose queue
-    /// nothing drains. Pushing to it is not an error, because nothing pushes
-    /// until there is something to read it.
+    /// A child that is not there yet — startup, before `start`. Keys struck
+    /// during presentation ARE pushed into this queue, and it is the queue
+    /// `present` hands on rather than one that is dropped, so type-ahead
+    /// survives into the writer that eventually drains it.
     fn default() -> Self {
         Child {
             input: pty::Input::new(),
@@ -985,8 +1078,35 @@ fn serve_event(
         Event::Exit(status) => child.status = Some(status),
         Event::Drained => child.drained = true,
         Event::Wayland(message) => {
+            // Refreshed before rather than after: the mode in force when the
+            // key was pressed is the one that spells it, and a child's reply
+            // to an earlier key can change it. Only for the keyboard, though
+            // — every frame callback and configure is a Wayland message too,
+            // and none of them can consume a mode.
+            if message.object == KEYBOARD {
+                surface.modes = keys::Modes {
+                    application_cursor: model
+                        .as_ref()
+                        .and_then(|terminal| terminal.mode("application-cursor"))
+                        .unwrap_or(false),
+                };
+            }
             if !connection.handle_common(&message)? {
                 surface.dispatch(connection, &message, fallback)?;
+            }
+            if let Some(sequence) = surface.pending_input.take() {
+                // Refused means the child is not draining, which §10 answers
+                // with the bell rather than by growing the queue or dropping
+                // the terminal. A key typed before the model exists cannot be
+                // refused into anything, so there is nothing to ring.
+                if !child.input.push(sequence.as_slice())? {
+                    if let Some(terminal) = model.as_mut() {
+                        terminal.ring();
+                        // The ring is model state; without this nothing asks
+                        // for the frame that would show it.
+                        surface.stale = true;
+                    }
+                }
             }
         }
         Event::Output(bytes) => {
@@ -1056,6 +1176,7 @@ fn start_child(
     events: &SyncSender<Event>,
     command: &pty::ChildCommand,
     account: &pty::Account,
+    input: Arc<pty::Input>,
 ) -> Result<Started, String> {
     let output = pty
         .master()
@@ -1089,7 +1210,6 @@ fn start_child(
     // consumes what the loop pushes. §12 puts it on its own thread because a
     // child in raw mode that stops reading blocks a write, and blocking the
     // loop in one would stop the terminal answering the compositor.
-    let input = pty::Input::new();
     let writer = pty::spawn_writer(sink, Arc::clone(&input))?;
     Ok((
         vec![waiter, reader, writer],
@@ -1106,6 +1226,10 @@ fn start_child(
 /// loop pushes to have to be the same object, and returning the pieces
 /// separately is an invitation to wire up two.
 type Started = (Vec<JoinHandle<Result<(), String>>>, Child);
+
+/// What startup hands the steady state: the surface, the model, the grid the
+/// kernel agreed to, and the input queue that may already hold type-ahead.
+type Presented = (Surface, Terminal, (u16, u16), Arc<pty::Input>);
 
 /// Those, plus the readiness socket for as long as the process is up.
 type Running = (
@@ -1129,10 +1253,11 @@ fn start(
     passwd: &Path,
     ready_socket: &Path,
     cells: (u16, u16),
+    input: Arc<pty::Input>,
 ) -> Result<Running, String> {
     let account = pty::current_account(status, passwd)?;
     let command = pty::child_command(Path::new(pty::CTTYHACK), &[])?;
-    let (children, child) = start_child(pty, events, &command, &account)?;
+    let (children, child) = start_child(pty, events, &command, &account, input)?;
     let (rows, columns) = cells;
     let published = ready::publish(ready_socket, rows, columns)?;
     Ok((children, child, published))
@@ -1186,7 +1311,7 @@ fn present(
     font: &Font,
     palette: &render::Palette,
     pty: &Pty,
-) -> Result<(Surface, Terminal, (u16, u16)), String> {
+) -> Result<Presented, String> {
     let session = Session {
         directory,
         pty,
@@ -1229,7 +1354,12 @@ fn present(
             "the terminal presentation retained {unclaimed} unexpected descriptors"
         ));
     }
-    Ok((surface, terminal, cells))
+    // The queue goes on rather than being dropped. A surface is focusable the
+    // moment it maps, which is a frame BEFORE this loop ends, so a key struck
+    // during startup is already translated and queued — and minting a second
+    // queue for the writer would discard exactly the type-ahead a person
+    // expects a terminal to have kept.
+    Ok((surface, terminal, cells, child.input))
 }
 
 /// Everything that must hold before readiness may be published: a presented
@@ -1249,12 +1379,13 @@ fn prepare(
     // missing or misconfigured should fail without having drawn a window,
     // and nothing about the size is needed to open one.
     let pty = Pty::open(ptmx)?;
-    let (surface, terminal, cells) = present(connection, directory, font, palette, &pty)?;
+    let (surface, terminal, cells, input) = present(connection, directory, font, palette, &pty)?;
     Ok(Prepared {
         surface,
         pty,
         terminal,
         cells,
+        input,
     })
 }
 
@@ -1294,6 +1425,7 @@ pub fn run(options: &Options) -> Result<(), String> {
         pty,
         terminal,
         cells: (rows, columns),
+        input,
     } = prepare(
         &mut connection,
         runtime_directory,
@@ -1328,6 +1460,7 @@ pub fn run(options: &Options) -> Result<(), String> {
         Path::new(ETC_PASSWD),
         &options.ready_socket,
         (rows, columns),
+        input,
     )?;
     // `write_all` rather than `print!`, which PANICS on a write failure — and
     // a panic here would abort past `Published::drop` and leave the socket
@@ -2746,6 +2879,7 @@ mod tests {
             &missing,
             &ready_socket,
             (22, 74),
+            pty::Input::new(),
         )
         .err()
         .unwrap();
@@ -3225,6 +3359,7 @@ mod tests {
             &sender,
             &fixture_command("term_client_abort_fixture"),
             &account,
+            pty::Input::new(),
         )
         .unwrap();
 
@@ -3398,6 +3533,266 @@ mod tests {
         assert!(
             !surface.presented(),
             "a terminal whose seat withdrew its keyboard presented"
+        );
+    }
+
+    /// The wiring end to end: a key event arriving as a Wayland message
+    /// leaves bytes in the queue the WRITER drains. Tested through
+    /// `serve_event` rather than `dispatch` because the routing — taking what
+    /// dispatch translated and pushing it at the child — is production code
+    /// no `dispatch` test reaches.
+    #[test]
+    fn a_key_event_reaches_the_child_through_serve_event() {
+        let (mut connection, _peer) = pair();
+        let mut surface = Surface::new(Bound {
+            compositor: 1,
+            shm: 2,
+            xdg_wm_base: 4,
+            seat: 5,
+        });
+        let font = font();
+        let palette = render::Palette::pinned();
+        let pty = Pty::open(Path::new(pty::DEV_PTMX)).unwrap();
+        let directory = std::env::temp_dir();
+        let session = Session {
+            directory: &directory,
+            pty: &pty,
+            font: &font,
+            palette: &palette,
+        };
+        let fallback = default_size(&font).unwrap();
+        let mut model = None;
+        let mut child = Child::default();
+        let mut payload = Vec::new();
+        for word in [1u32, 0, 30, 1] {
+            payload.extend_from_slice(&word.to_ne_bytes());
+        }
+        serve_event(
+            &mut connection,
+            &mut surface,
+            &mut model,
+            &session,
+            fallback,
+            &mut child,
+            Event::Wayland(message(KEYBOARD, 3, payload)),
+        )
+        .unwrap();
+        assert_eq!(
+            child.input.take_for_test(),
+            b"a".to_vec(),
+            "a pressed key did not reach the writer's queue"
+        );
+        assert_eq!(surface.pending_input, None, "the key was routed twice");
+
+        // The mode the CHILD set has to reach the next key, and only
+        // `serve_event` can carry it there — `dispatch` cannot reach the
+        // model. Driven through the model rather than by setting the field,
+        // or the refresh itself is what goes untested.
+        let mut terminal = Terminal::new(4, 8).unwrap();
+        terminal.feed(b"\x1b[?1h");
+        assert_eq!(terminal.mode("application-cursor"), Some(true));
+        let mut model = Some(terminal);
+        let mut payload = Vec::new();
+        for word in [1u32, 0, 103, 1] {
+            payload.extend_from_slice(&word.to_ne_bytes());
+        }
+        serve_event(
+            &mut connection,
+            &mut surface,
+            &mut model,
+            &session,
+            fallback,
+            &mut child,
+            Event::Wayland(message(KEYBOARD, 3, payload)),
+        )
+        .unwrap();
+        assert_eq!(
+            child.input.take_for_test(),
+            b"\x1bOA".to_vec(),
+            "the model's mode did not reach the key that followed it"
+        );
+
+        // A key the queue will not take rings the bell AND asks for the frame
+        // that would show it. §10 answers a full queue with the bell rather
+        // than by growing it, and a bell nothing redraws is not an answer.
+        // Closing the queue is the deterministic refusal; a full one is the
+        // same `Ok(false)` after 64KB of keys.
+        child.input.close().unwrap();
+        surface.stale = false;
+        let mut payload = Vec::new();
+        for word in [1u32, 0, 30, 1] {
+            payload.extend_from_slice(&word.to_ne_bytes());
+        }
+        serve_event(
+            &mut connection,
+            &mut surface,
+            &mut model,
+            &session,
+            fallback,
+            &mut child,
+            Event::Wayland(message(KEYBOARD, 3, payload)),
+        )
+        .unwrap();
+        assert!(
+            model.as_mut().is_some_and(Terminal::take_bell),
+            "a refused key did not ring the bell"
+        );
+        assert!(surface.stale, "a refused key scheduled no redraw");
+    }
+
+    /// The whole point of the seat: a pressed key becomes the bytes a child
+    /// reads. `keys` owns the table, so this holds the WIRING to it — that
+    /// the code, the folded modifier mask and the terminal's mode all reach
+    /// `keys::action`, and that what comes back is what the child is offered.
+    #[test]
+    fn a_pressed_key_becomes_the_bytes_the_child_reads() {
+        let (mut connection, _peer) = pair();
+        let mut surface = Surface::new(Bound {
+            compositor: 1,
+            shm: 2,
+            xdg_wm_base: 4,
+            seat: 5,
+        });
+        let fallback = Size {
+            width: 8,
+            height: 8,
+        };
+        let modifiers = |depressed: u32, latched: u32, locked: u32, group: u32| {
+            let mut payload = Vec::new();
+            for word in [1, depressed, latched, locked, group] {
+                payload.extend_from_slice(&word.to_ne_bytes());
+            }
+            message(KEYBOARD, 4, payload)
+        };
+        let key = |code: u32, state: u32| {
+            let mut payload = Vec::new();
+            for word in [1, 0, code, state] {
+                payload.extend_from_slice(&word.to_ne_bytes());
+            }
+            message(KEYBOARD, 3, payload)
+        };
+        // evdev 30 is `a`; MOD_CONTROL is what makes it Ctrl-A. Spelled as
+        // numbers so the test pins the wiring rather than restating it.
+        let press = |surface: &mut Surface, connection: &mut Connection, code: u32| {
+            surface
+                .dispatch(connection, &key(code, 1), fallback)
+                .unwrap();
+            surface.pending_input.take().map(|s| s.as_slice().to_vec())
+        };
+        assert_eq!(
+            press(&mut surface, &mut connection, 30),
+            Some(b"a".to_vec()),
+            "an unmodified letter did not reach the child"
+        );
+        // A release sends nothing, or every key would arrive twice.
+        surface
+            .dispatch(&mut connection, &key(30, 0), fallback)
+            .unwrap();
+        assert_eq!(surface.pending_input, None, "a key release sent bytes");
+        // Each of the three masks alone must reach the translation: Wayland
+        // reports a held, a latched and a locked modifier in separate words,
+        // and folding them is this client's job, so a fold that dropped one
+        // would leave Ctrl working only while it was physically held down.
+        for (depressed, latched, locked, which) in [
+            (crate::keyboard::MOD_CONTROL, 0, 0, "depressed"),
+            (0, crate::keyboard::MOD_CONTROL, 0, "latched"),
+            (0, 0, crate::keyboard::MOD_CONTROL, "locked"),
+        ] {
+            surface
+                .dispatch(
+                    &mut connection,
+                    &modifiers(depressed, latched, locked, 0),
+                    fallback,
+                )
+                .unwrap();
+            assert_eq!(
+                press(&mut surface, &mut connection, 30),
+                Some(vec![0x01]),
+                "a {which} modifier did not reach the translation"
+            );
+        }
+        // A group this keymap does not have is refused rather than read
+        // against group 0's table, which would send a different key's bytes.
+        surface
+            .dispatch(
+                &mut connection,
+                &modifiers(crate::keyboard::MOD_CONTROL, 0, 0, 1),
+                fallback,
+            )
+            .unwrap();
+        assert_eq!(
+            press(&mut surface, &mut connection, 30),
+            None,
+            "a key in an unknown group was translated anyway"
+        );
+        // Reported once for that group, and re-armed when the group CHANGES,
+        // so leaving td's map a second time is reported a second time rather
+        // than silently. Asserted on the flag because the report itself goes
+        // to stderr, which a unit test has no handle on.
+        assert!(surface.group_reported, "a foreign group went unreported");
+        surface
+            .dispatch(&mut connection, &modifiers(0, 0, 0, 1), fallback)
+            .unwrap();
+        assert!(surface.group_reported, "the same group re-armed its report");
+        surface
+            .dispatch(&mut connection, &modifiers(0, 0, 0, 0), fallback)
+            .unwrap();
+        assert!(
+            !surface.group_reported,
+            "returning to td's map kept the report armed"
+        );
+        assert_eq!(
+            press(&mut surface, &mut connection, 30),
+            Some(b"a".to_vec()),
+            "returning to group 0 did not resume translation"
+        );
+        // End is the one key whose meaning depends on where the viewport is,
+        // and this client passes `viewing: false` because it has no viewport.
+        // Asserted because that literal is otherwise pinned by nothing: read
+        // as true, End becomes a scroll and stops reaching the shell.
+        assert_eq!(
+            press(&mut surface, &mut connection, 107),
+            Some(b"\x1b[F".to_vec()),
+            "End did not reach the child with no viewport to move"
+        );
+    }
+
+    /// The terminal's mode picks between two spellings of the same key, and
+    /// the model that holds it is not `dispatch`'s to reach — so the wiring
+    /// that carries it across is what this pins.
+    #[test]
+    fn application_cursor_mode_reaches_the_translation() {
+        let (mut connection, _peer) = pair();
+        let mut surface = Surface::new(Bound {
+            compositor: 1,
+            shm: 2,
+            xdg_wm_base: 4,
+            seat: 5,
+        });
+        let fallback = Size {
+            width: 8,
+            height: 8,
+        };
+        let mut payload = Vec::new();
+        // evdev 103 is Up.
+        for word in [1u32, 0, 103, 1] {
+            payload.extend_from_slice(&word.to_ne_bytes());
+        }
+        let up = message(KEYBOARD, 3, payload);
+        surface.dispatch(&mut connection, &up, fallback).unwrap();
+        assert_eq!(
+            surface.pending_input.take().map(|s| s.as_slice().to_vec()),
+            Some(b"\x1b[A".to_vec()),
+            "normal cursor mode did not spell Up"
+        );
+        surface.modes = keys::Modes {
+            application_cursor: true,
+        };
+        surface.dispatch(&mut connection, &up, fallback).unwrap();
+        assert_eq!(
+            surface.pending_input.take().map(|s| s.as_slice().to_vec()),
+            Some(b"\x1bOA".to_vec()),
+            "application cursor mode did not reach the translation"
         );
     }
 
@@ -3620,13 +4015,22 @@ mod tests {
             name: "td-term-test".into(),
             home: directory.display().to_string(),
         };
+        // The queue is passed IN, not minted here: startup may already have
+        // put type-ahead in it, and a writer given a fresh one would drop
+        // exactly the keys a person struck while the window was appearing.
+        let queued = pty::Input::new();
         let (_threads, mut child) = start_child(
             &pty,
             &sender,
             &fixture_command("term_client_echo_fixture"),
             &account,
+            Arc::clone(&queued),
         )
         .unwrap();
+        assert!(
+            Arc::ptr_eq(&child.input, &queued),
+            "the child minted its own queue and abandoned startup's"
+        );
         drop(sender);
 
         let mut typed = false;
@@ -3727,6 +4131,7 @@ mod tests {
             &sender,
             &fixture_command("term_client_child_fixture"),
             &account,
+            pty::Input::new(),
         )
         .unwrap();
         let status = loop {

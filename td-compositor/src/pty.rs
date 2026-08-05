@@ -525,6 +525,19 @@ impl Input {
         Ok(admitted)
     }
 
+    /// What the writer would send next, for tests that have no writer. The
+    /// production drain is the writer thread's, and it is the queue rather
+    /// than the descriptor that the main loop's half of this is about.
+    #[cfg(test)]
+    pub fn take_for_test(&self) -> Vec<u8> {
+        let Ok(mut pending) = self.pending.lock() else {
+            return Vec::new();
+        };
+        let bytes = pending.queue.front(usize::MAX).to_vec();
+        pending.queue.consume(bytes.len());
+        bytes
+    }
+
     /// Retire the writer once it has drained. Unlike the reader — parked in a
     /// `read` nothing safe can interrupt — the writer parks in `Condvar::wait`,
     /// which this wakes, so it HAS a retirement path.
