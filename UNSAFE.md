@@ -293,8 +293,18 @@ specification. Its confinement tests pin the allow count, assembly body,
 syscall numbers, callers, and absence of unsafe from every other module;
 adding another syscall or scoped allow is an amendment there AND here. The
 two surfaces behind the one body are pinned to disjoint modules —
-transport to `client.rs`/`server.rs`, terminal control to `pty.rs`, and no
-other module names `sys` at all.
+transport to `client.rs`/`conn.rs`/`server.rs`, terminal control to
+`pty.rs`, and no other module names `sys` at all. `conn.rs` is the client
+transport itself, extracted from `client.rs` so the terminal is a second
+USER of one connection rather than a second copy of it; the descriptor
+queue is intrinsic to that connection, so it moved with it. That widens the
+transport's caller list by one module and narrows nothing. A `Connection` is
+crate-visible, though, so a module could reach `sendmsg`/`recvmsg` through
+one without ever spelling `sys::` — which is all the caller scan looks for.
+The transport's USERS are therefore pinned by that same test, which is what
+makes "the terminal modules — parser, model, renderer, keyboard, PTY policy
+— reach none of it" a checked property rather than a claim. A module joining
+that roster is an amendment here, as a new caller is.
 
 ## 7. `td-util` — the diagnostics multicall
 

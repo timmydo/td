@@ -1,324 +1,29 @@
+use crate::conn::{
+    Connection, Globals, COMPOSITOR, DISPLAY, KEYBOARD, POINTER, REGISTRY, SEAT, SHM, SURFACE,
+    SYNC_CALLBACK, XDG_SURFACE, XDG_TOPLEVEL, XDG_WM_BASE,
+};
 use crate::keyboard::XKB_KEYMAP;
 use crate::pointer::MAX_POINTER_FRAME_EVENTS;
 use crate::ui::{KeyboardUpdate, PointerUpdate, UiKeyState, UiModel, UiModifiers};
 use crate::{socket, sys, wire, MAX_UI_DIMENSION, MAX_UI_FRAME_BYTES};
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::BTreeSet;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
-use std::os::fd::{AsRawFd, RawFd};
+use std::os::fd::AsRawFd;
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::thread;
 use std::time::{Duration, Instant};
-
-const DISPLAY: u32 = 1;
-const REGISTRY: u32 = 2;
-const SYNC_CALLBACK: u32 = 3;
-const COMPOSITOR: u32 = 4;
-const SHM: u32 = 5;
-const XDG_WM_BASE: u32 = 6;
-const SURFACE: u32 = 7;
-const XDG_SURFACE: u32 = 8;
-const XDG_TOPLEVEL: u32 = 9;
-const SEAT: u32 = 10;
-const KEYBOARD: u32 = 11;
-const POINTER: u32 = 12;
-const FIRST_DYNAMIC_ID: u32 = 13;
 
 const DEFAULT_WIDTH: usize = 512;
 const DEFAULT_HEIGHT: usize = 320;
 const BYTES_PER_PIXEL: usize = 4;
 const SHM_XRGB8888: u32 = 1;
-const CONNECT_ATTEMPTS: usize = 300;
-const MAX_PENDING_FDS: usize = 8;
-const RECEIVE_BUFFER_BYTES: usize = 16 * 1024;
 const PRESENT_TIMEOUT: Duration = Duration::from_secs(20);
 
 pub struct Options {
     pub socket: PathBuf,
     pub ready_socket: PathBuf,
-}
-
-#[derive(Clone, Copy)]
-struct Global {
-    name: u32,
-    version: u32,
-}
-
-#[derive(Default)]
-struct Globals {
-    compositor: Option<Global>,
-    shm: Option<Global>,
-    xdg_wm_base: Option<Global>,
-    seat: Option<Global>,
-}
-
-impl Globals {
-    fn record(&mut self, name: u32, interface: &str, version: u32) {
-        let global = Global { name, version };
-        match interface {
-            "wl_compositor"
-                if self
-                    .compositor
-                    .is_none_or(|current| version > current.version) =>
-            {
-                self.compositor = Some(global)
-            }
-            "wl_shm" if self.shm.is_none_or(|current| version > current.version) => {
-                self.shm = Some(global)
-            }
-            "xdg_wm_base"
-                if self
-                    .xdg_wm_base
-                    .is_none_or(|current| version > current.version) =>
-            {
-                self.xdg_wm_base = Some(global)
-            }
-            "wl_seat" if self.seat.is_none_or(|current| version > current.version) => {
-                self.seat = Some(global)
-            }
-            _ => {}
-        }
-    }
-
-    fn require(
-        global: Option<Global>,
-        interface: &str,
-        minimum: u32,
-        maximum: u32,
-    ) -> Result<(u32, u32), String> {
-        let global = global.ok_or_else(|| format!("compositor did not advertise {interface}"))?;
-        if global.version < minimum {
-            return Err(format!(
-                "{interface} version {} is below required version {minimum}",
-                global.version
-            ));
-        }
-        Ok((global.name, global.version.min(maximum)))
-    }
-}
-
-struct Connection {
-    stream: UnixStream,
-    buffered: Vec<u8>,
-    deadline: Option<Instant>,
-    next_id: u32,
-    free_ids: BTreeSet<u32>,
-    pending_fds: VecDeque<RawFd>,
-    incoming: [u8; RECEIVE_BUFFER_BYTES],
-}
-
-impl Drop for Connection {
-    fn drop(&mut self) {
-        self.discard_pending_fds();
-    }
-}
-
-impl Connection {
-    fn connect(path: &Path, deadline: Instant) -> Result<Connection, String> {
-        let mut last = None;
-        for attempt in 0..CONNECT_ATTEMPTS {
-            let remaining = deadline
-                .checked_duration_since(Instant::now())
-                .filter(|duration| !duration.is_zero())
-                .ok_or_else(|| "Wayland presentation handshake timed out".to_string())?;
-            match UnixStream::connect(path) {
-                Ok(stream) => {
-                    return Ok(Connection {
-                        stream,
-                        buffered: Vec::with_capacity(16 * 1024),
-                        deadline: Some(deadline),
-                        next_id: FIRST_DYNAMIC_ID,
-                        free_ids: BTreeSet::new(),
-                        pending_fds: VecDeque::new(),
-                        incoming: [0; RECEIVE_BUFFER_BYTES],
-                    });
-                }
-                Err(error)
-                    if matches!(
-                        error.kind(),
-                        std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
-                    ) =>
-                {
-                    last = Some(error);
-                    if attempt + 1 < CONNECT_ATTEMPTS {
-                        thread::sleep(remaining.min(Duration::from_millis(100)));
-                    }
-                }
-                Err(error) => {
-                    return Err(format!(
-                        "connect Wayland socket {}: {error}",
-                        path.display()
-                    ));
-                }
-            }
-        }
-        Err(format!(
-            "connect Wayland socket {} after {CONNECT_ATTEMPTS} attempts: {}",
-            path.display(),
-            last.map_or_else(|| "unknown error".to_string(), |error| error.to_string())
-        ))
-    }
-
-    fn remaining(&self) -> Result<Option<Duration>, String> {
-        self.deadline
-            .map(|deadline| {
-                deadline
-                    .checked_duration_since(Instant::now())
-                    .filter(|duration| !duration.is_zero())
-                    .ok_or_else(|| "Wayland presentation handshake timed out".to_string())
-            })
-            .transpose()
-    }
-
-    fn finish_handshake(&mut self) -> Result<(), String> {
-        self.stream
-            .set_read_timeout(None)
-            .map_err(|e| format!("clear Wayland handshake timeout: {e}"))?;
-        self.deadline = None;
-        Ok(())
-    }
-
-    fn send(&mut self, object: u32, opcode: u16, builder: wire::Builder) -> Result<(), String> {
-        let bytes = builder.message(object, opcode)?;
-        self.stream
-            .write_all(&bytes)
-            .map_err(|e| format!("write Wayland request object={object} opcode={opcode}: {e}"))
-    }
-
-    fn send_with_fd(
-        &mut self,
-        object: u32,
-        opcode: u16,
-        builder: wire::Builder,
-        file: &File,
-    ) -> Result<(), String> {
-        let bytes = builder.message(object, opcode)?;
-        sys::send_with_fd(&self.stream, &bytes, file.as_raw_fd())
-            .map_err(|e| format!("send Wayland request descriptor: {e}"))
-    }
-
-    fn next(&mut self) -> Result<wire::Message, String> {
-        loop {
-            let remaining = self.remaining()?;
-            if let Some(message) = wire::take(&mut self.buffered)? {
-                return Ok(message);
-            }
-            let wanted = match wire::header(&self.buffered)? {
-                Some((_, _, size)) => size.saturating_sub(self.buffered.len()),
-                None => wire::HEADER_SIZE.saturating_sub(self.buffered.len()),
-            };
-            if wanted == 0 {
-                return Err("Wayland event parser made no progress".into());
-            }
-            let capacity = wanted.min(self.incoming.len());
-            let input = self
-                .incoming
-                .get_mut(..capacity)
-                .ok_or_else(|| "Wayland receive bound escaped input buffer".to_string())?;
-            if let Some(remaining) = remaining {
-                self.stream
-                    .set_read_timeout(Some(remaining))
-                    .map_err(|e| format!("set Wayland handshake timeout: {e}"))?;
-            }
-            let received = match sys::recv_with_fds(&self.stream, input) {
-                Ok(received) => received,
-                Err(sys::ReceiveError::Disconnected) => {
-                    return Err("Wayland compositor closed the connection".into())
-                }
-                Err(sys::ReceiveError::TimedOut) if self.deadline.is_some() => {
-                    return Err("Wayland presentation handshake timed out".into())
-                }
-                Err(sys::ReceiveError::TimedOut) => {
-                    return Err("Wayland event wait timed out".into())
-                }
-                Err(sys::ReceiveError::Failure(error)) => {
-                    return Err(format!("receive Wayland event: {error}"))
-                }
-            };
-            if received.count == 0 {
-                sys::discard_received(&received.fds);
-                return Err("Wayland compositor closed the connection".into());
-            }
-            if self.pending_fds.len().saturating_add(received.fds.len()) > MAX_PENDING_FDS {
-                sys::discard_received(&received.fds);
-                self.discard_pending_fds();
-                return Err(format!(
-                    "Wayland client queued more than {MAX_PENDING_FDS} descriptors"
-                ));
-            }
-            let bytes = input
-                .get(..received.count)
-                .ok_or_else(|| "Wayland read count escaped input buffer".to_string())?;
-            self.buffered.extend_from_slice(bytes);
-            self.pending_fds.extend(received.fds);
-        }
-    }
-
-    fn handle_common(&mut self, message: &wire::Message) -> Result<bool, String> {
-        if message.object == DISPLAY && message.opcode == 0 {
-            let mut args = wire::Cursor::new(&message.payload);
-            let object = args.u32()?;
-            let code = args.u32()?;
-            let text = args.string()?;
-            args.finish()?;
-            return Err(format!(
-                "Wayland protocol error on object {object}, code {code}: {text}"
-            ));
-        }
-        if message.object == XDG_WM_BASE && message.opcode == 0 {
-            let mut args = wire::Cursor::new(&message.payload);
-            let serial = args.u32()?;
-            args.finish()?;
-            let mut pong = wire::Builder::new();
-            pong.u32(serial);
-            self.send(XDG_WM_BASE, 3, pong)?;
-            return Ok(true);
-        }
-        if message.object == DISPLAY && message.opcode == 1 {
-            let mut args = wire::Cursor::new(&message.payload);
-            let id = args.u32()?;
-            args.finish()?;
-            if id >= FIRST_DYNAMIC_ID {
-                if id >= self.next_id {
-                    return Err(format!("compositor deleted unallocated object {id}"));
-                }
-                if !self.free_ids.insert(id) {
-                    return Err(format!("compositor deleted object {id} twice"));
-                }
-            }
-            return Ok(true);
-        }
-        Ok(false)
-    }
-
-    fn allocate_id(&mut self) -> Result<u32, String> {
-        if let Some(id) = self.free_ids.pop_first() {
-            return Ok(id);
-        }
-        let id = self.next_id;
-        self.next_id = self
-            .next_id
-            .checked_add(1)
-            .filter(|next| *next != 0)
-            .ok_or_else(|| "Wayland object id space exhausted".to_string())?;
-        Ok(id)
-    }
-
-    fn take_fd(&mut self, purpose: &str) -> Result<File, String> {
-        let fd = self
-            .pending_fds
-            .pop_front()
-            .ok_or_else(|| format!("{purpose} event arrived without a descriptor"))?;
-        sys::duplicate_received(fd)
-    }
-
-    fn discard_pending_fds(&mut self) {
-        while let Some(fd) = self.pending_fds.pop_front() {
-            sys::discard_received(&[fd]);
-        }
-    }
 }
 
 fn bind(
@@ -1145,10 +850,10 @@ fn present(
 ) -> Result<(Connection, Demo), String> {
     let globals = discover_globals(&mut connection)?;
     let (compositor_name, compositor_version) =
-        Globals::require(globals.compositor, "wl_compositor", 4, 4)?;
-    let (shm_name, shm_version) = Globals::require(globals.shm, "wl_shm", 1, 1)?;
-    let (xdg_name, xdg_version) = Globals::require(globals.xdg_wm_base, "xdg_wm_base", 1, 1)?;
-    let (seat_name, seat_version) = Globals::require(globals.seat, "wl_seat", 5, 7)?;
+        Globals::require(globals.compositor(), "wl_compositor", 4, 4)?;
+    let (shm_name, shm_version) = Globals::require(globals.shm(), "wl_shm", 1, 1)?;
+    let (xdg_name, xdg_version) = Globals::require(globals.xdg_wm_base(), "xdg_wm_base", 1, 1)?;
+    let (seat_name, seat_version) = Globals::require(globals.seat(), "wl_seat", 5, 7)?;
     bind(
         &mut connection,
         compositor_name,
@@ -1175,10 +880,10 @@ fn present(
         }
         demo.dispatch_and_render(&mut connection, &message, runtime_directory)?;
     }
-    if !connection.pending_fds.is_empty() {
+    let unclaimed = connection.pending_fd_count();
+    if unclaimed != 0 {
         return Err(format!(
-            "Wayland presentation retained {} unexpected descriptors",
-            connection.pending_fds.len()
+            "Wayland presentation retained {unclaimed} unexpected descriptors"
         ));
     }
     Ok((connection, demo))
@@ -1307,21 +1012,10 @@ pub fn present_for_test(
     stream: UnixStream,
     runtime_directory: &Path,
 ) -> Result<TestPresentation, String> {
-    let connection = Connection {
-        stream,
-        buffered: Vec::with_capacity(16 * 1024),
-        deadline: Instant::now().checked_add(Duration::from_secs(5)),
-        next_id: FIRST_DYNAMIC_ID,
-        free_ids: BTreeSet::new(),
-        pending_fds: VecDeque::new(),
-        incoming: [0; RECEIVE_BUFFER_BYTES],
-    };
+    let connection = Connection::over(stream, Instant::now().checked_add(Duration::from_secs(5)));
     let (mut connection, demo) = present(connection, runtime_directory)?;
     connection.finish_handshake()?;
-    connection
-        .stream
-        .set_read_timeout(Some(Duration::from_secs(5)))
-        .map_err(|e| format!("set Wayland test event timeout: {e}"))?;
+    connection.set_read_timeout(Some(Duration::from_secs(5)))?;
     Ok(TestPresentation {
         connection,
         demo,
@@ -1378,18 +1072,11 @@ pub fn selftest() -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::conn::MAX_PENDING_FDS;
     use std::os::fd::IntoRawFd;
 
     fn test_connection(stream: UnixStream) -> Connection {
-        Connection {
-            stream,
-            buffered: Vec::new(),
-            deadline: None,
-            next_id: FIRST_DYNAMIC_ID,
-            free_ids: BTreeSet::new(),
-            pending_fds: VecDeque::new(),
-            incoming: [0; RECEIVE_BUFFER_BYTES],
-        }
+        Connection::over(stream, None)
     }
 
     fn event(object: u32, opcode: u16, builder: wire::Builder) -> wire::Message {
@@ -1425,15 +1112,7 @@ mod tests {
     #[test]
     fn dynamic_object_ids_are_reused_only_after_delete_id() {
         let (stream, _peer) = UnixStream::pair().unwrap();
-        let mut connection = Connection {
-            stream,
-            buffered: Vec::new(),
-            deadline: None,
-            next_id: FIRST_DYNAMIC_ID,
-            free_ids: BTreeSet::new(),
-            pending_fds: VecDeque::new(),
-            incoming: [0; RECEIVE_BUFFER_BYTES],
-        };
+        let mut connection = Connection::over(stream, None);
         assert_eq!(connection.allocate_id().unwrap(), 13);
         assert_eq!(connection.allocate_id().unwrap(), 14);
 
@@ -1541,23 +1220,23 @@ mod tests {
         globals.record(8, "wl_compositor", 3);
         globals.record(9, "wl_compositor", 4);
         assert_eq!(
-            Globals::require(globals.compositor, "wl_compositor", 4, 4).unwrap(),
+            Globals::require(globals.compositor(), "wl_compositor", 4, 4).unwrap(),
             (9, 4)
         );
 
         let mut globals = Globals::default();
         globals.record(9, "wl_compositor", 7);
         assert_eq!(
-            Globals::require(globals.compositor, "wl_compositor", 4, 4).unwrap(),
+            Globals::require(globals.compositor(), "wl_compositor", 4, 4).unwrap(),
             (9, 4)
         );
 
         let mut globals = Globals::default();
         globals.record(10, "wl_seat", 4);
-        assert!(Globals::require(globals.seat, "wl_seat", 5, 7).is_err());
+        assert!(Globals::require(globals.seat(), "wl_seat", 5, 7).is_err());
         globals.record(11, "wl_seat", 9);
         assert_eq!(
-            Globals::require(globals.seat, "wl_seat", 5, 7).unwrap(),
+            Globals::require(globals.seat(), "wl_seat", 5, 7).unwrap(),
             (11, 7)
         );
     }
@@ -1672,7 +1351,7 @@ mod tests {
         let mut demo = Demo::new();
         demo.keyboard_event(&mut connection, &message).unwrap();
         assert!(demo.keymap_verified);
-        assert!(connection.pending_fds.is_empty());
+        assert_eq!(connection.pending_fd_count(), 0);
 
         let (stream, peer) = UnixStream::pair().unwrap();
         let mut connection = test_connection(stream);
@@ -1688,7 +1367,7 @@ mod tests {
         assert!(Demo::new()
             .keyboard_event(&mut connection, &message)
             .is_err());
-        assert!(connection.pending_fds.is_empty());
+        assert_eq!(connection.pending_fd_count(), 0);
 
         let (stream, _peer) = UnixStream::pair().unwrap();
         let mut connection = test_connection(stream);
@@ -1726,7 +1405,7 @@ mod tests {
                 .keyboard_event(&mut connection, &message)
                 .unwrap_err();
             assert!(error.contains(expected_error));
-            assert!(connection.pending_fds.is_empty());
+            assert_eq!(connection.pending_fd_count(), 0);
         }
     }
 
@@ -1761,7 +1440,7 @@ mod tests {
         for _ in 0..2 {
             let message = connection.next().unwrap();
             assert_eq!((message.object, message.opcode), (SEAT, 1));
-            assert!(connection.pending_fds.is_empty());
+            assert_eq!(connection.pending_fd_count(), 0);
         }
         let message = connection.next().unwrap();
         assert_eq!((message.object, message.opcode), (KEYBOARD, 0));
@@ -1769,7 +1448,7 @@ mod tests {
         let mut bytes = Vec::new();
         received.read_to_end(&mut bytes).unwrap();
         assert_eq!(bytes, descriptor_bytes);
-        assert!(connection.pending_fds.is_empty());
+        assert_eq!(connection.pending_fd_count(), 0);
     }
 
     #[test]
@@ -1791,7 +1470,7 @@ mod tests {
 
         let error = connection.next().unwrap_err();
         assert!(error.contains("queued more than"));
-        assert!(connection.pending_fds.is_empty());
+        assert_eq!(connection.pending_fd_count(), 0);
         for observer in observers {
             assert_socket_eof(observer);
         }
@@ -1811,15 +1490,15 @@ mod tests {
 
         let message = connection.next().unwrap();
         assert_eq!((message.object, message.opcode), (SEAT, 1));
-        assert_eq!(connection.pending_fds.len(), 1);
+        assert_eq!(connection.pending_fd_count(), 1);
         let message = connection.next().unwrap();
         assert_eq!((message.object, message.opcode), (KEYBOARD, 0));
-        assert_eq!(connection.pending_fds.len(), 1);
+        assert_eq!(connection.pending_fd_count(), 1);
         let mut received = connection.take_fd("coalesced test").unwrap();
         let mut contents = Vec::new();
         received.read_to_end(&mut contents).unwrap();
         assert_eq!(contents, b"coalesced-fd");
-        assert!(connection.pending_fds.is_empty());
+        assert_eq!(connection.pending_fd_count(), 0);
     }
 
     #[test]
@@ -1827,7 +1506,7 @@ mod tests {
         let (stream, _peer) = UnixStream::pair().unwrap();
         let mut connection = test_connection(stream);
         let (owned, observer) = UnixStream::pair().unwrap();
-        connection.pending_fds.push_back(owned.into_raw_fd());
+        connection.queue_fd_for_test(owned.into_raw_fd());
         drop(connection);
         assert_socket_eof(observer);
     }
@@ -1963,7 +1642,7 @@ mod tests {
     fn input_rendering_coalesces_while_a_frame_is_in_flight() {
         let (stream, _peer) = UnixStream::pair().unwrap();
         let mut connection = test_connection(stream);
-        connection.next_id = 20;
+        connection.set_next_id_for_test(20);
         let mut demo = Demo::new();
         demo.xrgb_advertised = true;
         demo.current_size = Some(Size {
@@ -1983,7 +1662,7 @@ mod tests {
             .unwrap();
         demo.maybe_commit_input(&mut connection, &std::env::temp_dir())
             .unwrap();
-        assert_eq!(connection.next_id, 20);
+        assert_eq!(connection.next_id_for_test(), 20);
         assert_eq!(demo.rendered_revision, 0);
 
         let target = demo.target.as_mut().unwrap();
@@ -1991,7 +1670,7 @@ mod tests {
         target.presented = true;
         demo.maybe_commit_input(&mut connection, &std::env::temp_dir())
             .unwrap();
-        assert_eq!(connection.next_id, 23);
+        assert_eq!(connection.next_id_for_test(), 23);
         assert_eq!(demo.rendered_revision, demo.ui.revision());
 
         demo.ui
@@ -2008,22 +1687,14 @@ mod tests {
             .unwrap();
         demo.maybe_commit_input(&mut connection, &std::env::temp_dir())
             .unwrap();
-        assert_eq!(connection.next_id, 23);
+        assert_eq!(connection.next_id_for_test(), 23);
         assert!(demo.input_pending());
     }
 
     #[test]
     fn expired_presentation_deadline_does_not_block_on_a_stalled_peer() {
         let (stream, _peer) = UnixStream::pair().unwrap();
-        let mut connection = Connection {
-            stream,
-            buffered: Vec::new(),
-            deadline: Some(Instant::now()),
-            next_id: FIRST_DYNAMIC_ID,
-            free_ids: BTreeSet::new(),
-            pending_fds: VecDeque::new(),
-            incoming: [0; RECEIVE_BUFFER_BYTES],
-        };
+        let mut connection = Connection::over(stream, Some(Instant::now()));
         assert_eq!(
             connection.next().unwrap_err(),
             "Wayland presentation handshake timed out"
@@ -2036,15 +1707,7 @@ mod tests {
         stream
             .set_read_timeout(Some(Duration::from_millis(1)))
             .unwrap();
-        let mut connection = Connection {
-            stream,
-            buffered: Vec::new(),
-            deadline: None,
-            next_id: FIRST_DYNAMIC_ID,
-            free_ids: BTreeSet::new(),
-            pending_fds: VecDeque::new(),
-            incoming: [0; RECEIVE_BUFFER_BYTES],
-        };
+        let mut connection = Connection::over(stream, None);
         assert_eq!(
             connection.next().unwrap_err(),
             "Wayland event wait timed out"

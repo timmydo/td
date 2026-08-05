@@ -482,9 +482,12 @@ a separate crate root that also denies unsafe. Adding a syscall or another
 scoped allow amends this document and the repository-wide unsafe inventory.
 
 The two surfaces behind that one body are disjoint and are pinned to disjoint
-modules: descriptor transport is reachable only from `client.rs` and
-`server.rs`, terminal control only from `pty.rs`, and no other module names
-`sys` at all. `ioctl(2)` is the request-carrying one, so its roster is the
+modules: descriptor transport is reachable only from `client.rs`, `conn.rs`,
+and `server.rs`, terminal control only from `pty.rs`, and no other module
+names `sys` at all. The extracted connection is crate-visible, so a module
+holding one reaches the transport without spelling `sys`: who may NAME `conn`
+is therefore pinned by the same confinement test as who may call the
+wrappers. `ioctl(2)` is the request-carrying one, so its roster is the
 confinement: a request outside the four is refused before the syscall, and a
 test pins each value, the single guard, the single entry point, and each
 wrapper's operand shape.
@@ -1223,11 +1226,15 @@ duplication enters that unsafe surface. The slave's kernel defaults provide
 canonical input and echo. Safe `Command` and `Stdio` operations wire three
 slave clones to the child.
 
-All SCM_RIGHTS operations for td-term remain in the existing `client.rs`
-transport boundary, including keymap receipt and wl_shm submission. The
-client landing updates that caller inventory and §4's recvmsg and sendmsg
-descriptions; terminal parser, model, renderer, keyboard, and PTY policy
-modules do not call the descriptor-transport wrappers.
+All SCM_RIGHTS operations for td-term remain inside the client transport
+boundary, including keymap receipt and wl_shm submission. That boundary is
+now `conn.rs` as well as `client.rs`: the connection — its id allocation,
+message framing, and descriptor queue — was extracted so the terminal is a
+second user of one transport rather than a second copy of it, and the
+descriptor queue could not stay behind. Section 4 records the same boundary.
+Terminal parser, model, renderer, keyboard, and PTY policy modules do not
+call the descriptor-transport wrappers and may not name the transport; the
+client landing adds the terminal's own client module to that roster.
 
 Safe `Command` cannot call `setsid(2)`, and `pre_exec` would introduce a second
 unsafe surface. The declared td-init input therefore extends `cttyhack` with

@@ -2,6 +2,7 @@
 
 mod client;
 mod configure;
+mod conn;
 mod font;
 mod font_data;
 mod framebuffer;
@@ -404,6 +405,7 @@ mod confinement {
     const OTHER: &[(&str, &str)] = &[
         ("client.rs", include_str!("client.rs")),
         ("configure.rs", include_str!("configure.rs")),
+        ("conn.rs", include_str!("conn.rs")),
         ("font.rs", include_str!("font.rs")),
         ("font_data.rs", include_str!("font_data.rs")),
         ("framebuffer.rs", include_str!("framebuffer.rs")),
@@ -432,6 +434,16 @@ mod confinement {
 
     fn occurrences(source: &str, needle: &str) -> usize {
         source.match_indices(needle).count()
+    }
+
+    /// Braces and commas go with the whitespace, because `use crate::{sys as
+    /// raw};` squeezes to something no ungrouped form matches — and the alias
+    /// it introduces is then invisible to the caller scan as well.
+    fn squeezed(source: &str) -> String {
+        source
+            .chars()
+            .filter(|c| !c.is_whitespace() && !matches!(c, '{' | '}' | ','))
+            .collect()
     }
 
     /// The terminal's selftest is a composition, and its marker says all three
@@ -689,7 +701,7 @@ fn syscall3(number: usize, a1: usize, a2: usize, a3: usize) -> isize {
             .chain(OTHER.iter().copied())
             .chain(TEST_ONLY.iter().copied())
         {
-            if matches!(name, "client.rs" | "server.rs" | "pty.rs") {
+            if matches!(name, "client.rs" | "conn.rs" | "server.rs" | "pty.rs") {
                 continue;
             }
             assert!(
@@ -708,27 +720,48 @@ fn syscall3(number: usize, a1: usize, a2: usize, a3: usize) -> isize {
             .chain(OTHER.iter().copied())
             .chain(TEST_ONLY.iter().copied())
         {
-            let squeezed: String = source.chars().filter(|c| !c.is_whitespace()).collect();
             for form in [
                 concat!("use", "crate::sys::"),
                 concat!("use", "super::sys::"),
-                concat!("use", "crate::sysas"),
-                concat!("use", "super::sysas"),
+                concat!("sys", "as"),
                 concat!("sys::", "*"),
             ] {
                 assert_eq!(
-                    squeezed.matches(form).count(),
+                    squeezed(source).matches(form).count(),
                     0,
                     "{name} imports out of the syscall module ('{form}')"
                 );
             }
         }
+        // Extracting the connection made the transport CRATE-VISIBLE: a module
+        // that holds a `Connection` reaches `sendmsg`/`recvmsg` through
+        // `send_with_fd`/`next`/`take_fd` without ever spelling `sys::`, which
+        // is all the scan above looks for. So who may NAME the transport is a
+        // roster on the same footing as who may call the syscall, and the
+        // terminal's client joins it by amendment rather than by importing.
+        const TRANSPORT_USERS: &[&str] = &["client.rs", "conn.rs"];
+        for (name, source) in std::iter::once(("main.rs", production_main))
+            .chain(OTHER.iter().copied())
+            .chain(TEST_ONLY.iter().copied())
+        {
+            if TRANSPORT_USERS.contains(&name) {
+                continue;
+            }
+            for form in [concat!("conn", "::"), concat!("conn", "as")] {
+                assert_eq!(
+                    squeezed(source).matches(form).count(),
+                    0,
+                    "{name} reached the Wayland transport ('{form}')"
+                );
+            }
+        }
         let client = include_str!("client.rs");
+        let conn = include_str!("conn.rs");
         let server = include_str!("server.rs");
         let pty = include_str!("pty.rs");
         for operation in TRANSPORT {
             assert!(
-                client.contains(operation) || server.contains(operation),
+                client.contains(operation) || conn.contains(operation) || server.contains(operation),
                 "{operation}"
             );
             assert!(!pty.contains(operation), "pty.rs reached {operation}");
@@ -736,7 +769,9 @@ fn syscall3(number: usize, a1: usize, a2: usize, a3: usize) -> isize {
         for operation in TERMINAL {
             assert!(pty.contains(operation), "{operation}");
             assert!(
-                !client.contains(operation) && !server.contains(operation),
+                !client.contains(operation)
+                    && !conn.contains(operation)
+                    && !server.contains(operation),
                 "a protocol endpoint reached {operation}"
             );
         }
