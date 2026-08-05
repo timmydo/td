@@ -1202,6 +1202,11 @@ fn parse_script(
                 let Some(open) = open_blocks.pop() else {
                     return Err("unexpected `}'".to_string().into());
                 };
+                // After the unmatched test, not before it: `sed '1}'` is GNU's
+                // `unexpected `}'`, so the brace has to match its `{` first.
+                if addr.a1.is_some() {
+                    return Err("`}' doesn't want any addresses".to_string().into());
+                }
                 let after = cmds.len() + 1;
                 if let Some(cmd) = cmds.get_mut(open) {
                     cmd.kind = Kind::Block(after);
@@ -1209,6 +1214,11 @@ fn parse_script(
                 Kind::BlockEnd
             }
             b'#' => {
+                // GNU REFUSES an addressed comment rather than ignoring the
+                // address. The `!` is not one, so `!#` is still a comment.
+                if addr.a1.is_some() {
+                    return Err("comments don't accept any addresses".to_string().into());
+                }
                 p.rest_of_line();
                 Kind::Comment
             }
@@ -1220,8 +1230,12 @@ fn parse_script(
             b't' => Kind::BranchIfSub(Target::Name(p.parse_label())),
             b'T' => Kind::BranchIfNoSub(Target::Name(p.parse_label())),
             b':' => {
-                // The only two address restrictions GNU enforces at compile
-                // time: `:` takes none, `q`/`Q` take one.
+                // One of the FOUR rules GNU enforces at compile time for HOW
+                // MANY addresses a command takes: `#`, `}` and `:` take none,
+                // `q`/`Q` take one; a fifth holds under `--posix`, above. That
+                // count is exhaustive over THIS family only -- address 0 (legal
+                // with `r` alone) and `+N`/`~N` as a first address are
+                // compile-time address rules too, and both are still open.
                 if addr.a1.is_some() {
                     return Err(": doesn't want any addresses".to_string().into());
                 }

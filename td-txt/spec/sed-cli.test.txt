@@ -9449,3 +9449,219 @@ xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx$
 ## status: 4
 ## file-after-json f: "y\n"
 
+# GNU REFUSES an addressed comment rather than ignoring the address. It is one
+# of FOUR rules GNU enforces at compile time for HOW MANY addresses a command
+# takes -- `#`, `}` and `:` take none, `q`/`Q` take one -- plus a fifth that
+# holds only under `--posix`, where `=`, `a`, `i`, `l` and `r` take one. That
+# count is exhaustive over THAT family and no wider: address 0 (legal with `r`
+# alone) and `+N`/`~N` as a first address are compile-time address rules too,
+# both still open and recorded in spec/README. The `!` is not an address, so
+# `!#` is still a comment, and an UNaddressed `#` inside a block still swallows
+# the closing brace with the rest of its line.
+
+#### a comment REFUSES an address rather than ignoring it
+## argv: sed -n 1# A
+## file-json A: "a1\na2\n"
+## stdin-json: ""
+## stdout-json: ""
+## stderr-contains: comments don't accept any addresses
+## status: 1
+
+#### a bare comment is still a comment
+## argv: sed -n # A
+## file-json A: "a1\na2\n"
+## stdin-json: ""
+## stdout-json: ""
+## stderr-json: ""
+## status: 0
+
+#### and so is one behind a bang, which is not an address
+## argv: sed -n '!#' A
+## file-json A: "a1\na2\n"
+## stdin-json: ""
+## stdout-json: ""
+## stderr-json: ""
+## status: 0
+
+#### the last line is an address too
+## argv: sed -n '$#' A
+## file-json A: "a1\na2\n"
+## stdin-json: ""
+## stdout-json: ""
+## stderr-contains: comments don't accept any addresses
+## status: 1
+
+#### so is a regex
+## argv: sed -n /a1/# A
+## file-json A: "a1\na2\n"
+## stdin-json: ""
+## stdout-json: ""
+## stderr-contains: comments don't accept any addresses
+## status: 1
+
+#### so is a range
+## argv: sed -n 1,2# A
+## file-json A: "a1\na2\n"
+## stdin-json: ""
+## stdout-json: ""
+## stderr-contains: comments don't accept any addresses
+## status: 1
+
+#### so is a step
+## argv: sed -n 1~2# A
+## file-json A: "a1\na2\n"
+## stdin-json: ""
+## stdout-json: ""
+## stderr-contains: comments don't accept any addresses
+## status: 1
+
+#### so is the zero a range may open with
+## argv: sed -n 0,/a1/# A
+## file-json A: "a1\na2\n"
+## stdin-json: ""
+## stdout-json: ""
+## stderr-contains: comments don't accept any addresses
+## status: 1
+
+#### a bang does not excuse the address in front of it
+## argv: sed -n '1!#' A
+## file-json A: "a1\na2\n"
+## stdin-json: ""
+## stdout-json: ""
+## stderr-contains: comments don't accept any addresses
+## status: 1
+
+#### whitespace between the two does not either
+## argv: sed -n '1 #' A
+## file-json A: "a1\na2\n"
+## stdin-json: ""
+## stdout-json: ""
+## stderr-contains: comments don't accept any addresses
+## status: 1
+
+#### nor does the comment looking like the #n directive
+## argv: sed 1#n A
+## file-json A: "a1\na2\n"
+## stdin-json: ""
+## stdout-json: ""
+## stderr-contains: comments don't accept any addresses
+## status: 1
+
+#### a comment later in the script is refused where it stands
+## argv: sed -n 'p;1#' A
+## file-json A: "a1\na2\n"
+## stdin-json: ""
+## stdout-json: ""
+## stderr-contains: comments don't accept any addresses
+## status: 1
+
+#### and inside a block, before the block can be found unmatched
+## argv: sed -n '{1#}' A
+## file-json A: "a1\na2\n"
+## stdin-json: ""
+## stdout-json: ""
+## stderr-contains: comments don't accept any addresses
+## status: 1
+
+#### where an UNaddressed one there still swallows the brace
+## argv: sed -n '1{#}' A
+## file-json A: "a1\na2\n"
+## stdin-json: ""
+## stdout-json: ""
+## stderr-contains: unmatched `{'
+## status: 1
+
+#### --posix refuses it too
+## argv: sed --posix -n 1# A
+## file-json A: "a1\na2\n"
+## stdin-json: ""
+## stdout-json: ""
+## stderr-contains: comments don't accept any addresses
+## status: 1
+
+
+# The CLOSING BRACE is the same rule, and was the member of that four the count
+# above was written to find: `sed -n '{p;1}'` refuses with "`}' doesn't want any
+# addresses" at exit 1 in GNU and ran here. Its address test comes AFTER the
+# unmatched one, so a brace that never opened is still `unexpected' first.
+
+#### a closing brace refuses an address, as a comment does
+## argv: sed -n '{p;1}' A
+## file-json A: "a1\na2\n"
+## stdin-json: ""
+## stdout-json: ""
+## stderr-contains: `}' doesn't want any addresses
+## status: 1
+
+#### even when it is all the block holds
+## argv: sed -n '{1}' A
+## file-json A: "a1\na2\n"
+## stdin-json: ""
+## stdout-json: ""
+## stderr-contains: `}' doesn't want any addresses
+## status: 1
+
+#### the last line is an address there too
+## argv: sed -n '{p;$}' A
+## file-json A: "a1\na2\n"
+## stdin-json: ""
+## stdout-json: ""
+## stderr-contains: `}' doesn't want any addresses
+## status: 1
+
+#### so is a range there too
+## argv: sed -n '{p;1,2}' A
+## file-json A: "a1\na2\n"
+## stdin-json: ""
+## stdout-json: ""
+## stderr-contains: `}' doesn't want any addresses
+## status: 1
+
+#### a bang does not excuse it either
+## argv: sed -n '{p;1!}' A
+## file-json A: "a1\na2\n"
+## stdin-json: ""
+## stdout-json: ""
+## stderr-contains: `}' doesn't want any addresses
+## status: 1
+
+#### but a bang alone is not an address, so this block closes
+## argv: sed -n '{!}' A
+## file-json A: "a1\na2\n"
+## stdin-json: ""
+## stdout-json: ""
+## stderr-json: ""
+## status: 0
+
+#### as does a plain one
+## argv: sed -n '{p}' A
+## file-json A: "a1\na2\n"
+## stdin-json: ""
+## stdout-json: "a1\na2\n"
+## stderr-json: ""
+## status: 0
+
+#### an address on the OPENING brace is the block's, not the closing one's
+## argv: sed -n '1{p}' A
+## file-json A: "a1\na2\n"
+## stdin-json: ""
+## stdout-json: "a1\n"
+## stderr-json: ""
+## status: 0
+
+#### a brace that never opened is unexpected before it is addressed
+## argv: sed -n '1}' A
+## file-json A: "a1\na2\n"
+## stdin-json: ""
+## stdout-json: ""
+## stderr-contains: unexpected `}'
+## status: 1
+
+#### and the rule reaches an inner block
+## argv: sed -n '{{p;1}}' A
+## file-json A: "a1\na2\n"
+## stdin-json: ""
+## stdout-json: ""
+## stderr-contains: `}' doesn't want any addresses
+## status: 1
+

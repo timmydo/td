@@ -1230,27 +1230,28 @@ td-txt-authored case files
 
   - A diagnostic locates a `-f` script differently: GNU says `file s line 2:`
     where td-txt says `-e expression #1:`, so a refusal inside a `-f` script
-    names neither the file nor the line. Same family as the missing `char N:`
-    offset, and the corpus cases for `--posix`'s text-continuation rule assert
-    by substring because of it.
+    names neither the file nor the line. The expression NUMBER is the same gap
+    one part over: td-txt spells it `#1` always, so `sed -e p -e Z` is
+    `expression #2` in GNU and `#1` here, and a script assembled from several
+    `-e` fragments cannot be told which one refused. Same family as the missing
+    `char N:` offset, and the corpus cases for `--posix`'s text-continuation
+    rule assert by substring because of all three.
 
   - `sed -e '1a\<newline>foo' -e 'bar'` is `can't find label for jump to `ar''
     in GNU and `can't operate on label `ar'` here -- the same refusal, worded
     differently. Both modes, predates the branch.
 
-  - Five divergences a sweep of every command letter x {bare, addressed,
+  - Four divergences a sweep of every command letter x {bare, addressed,
     ranged} x {flag, no flag} turned up, none of them about `--posix` and all
     of them predating this branch, recorded here because that sweep is how the
-    one-address rule above was found and these came with it:
-    an ADDRESSED comment (`sed '1#'`) is `comments don't accept any addresses`
-    in GNU and accepted here, which is fail-open; a leading `+` or `~` is
-    its own family, understated in an earlier draft of this entry and set out
-    separately below; a bare `\` is
-    `unterminated address regex` there and `unterminated address` here; the
-    usage line after a bad option is `Usage: sed [OPTION]...` there and
-    `usage: sed [-nrEsz]...` here, differing in capital and in content; and
-    `sed L` is `sed: INTERNAL ERROR: Bad cmd L` at exit 4 in GNU, an obsolete
-    command left in its table, where td-txt says `unknown command: `L''.
+    one-address rule above was found and these came with it: a leading `+`
+    or `~` is its own family, understated in an earlier draft of this entry
+    and set out separately below; a bare `\` is `unterminated address regex`
+    there and `unterminated address` here; the usage line after a bad option
+    is `Usage: sed [OPTION]...` there and `usage: sed [-nrEsz]...` here,
+    differing in capital and in content; and `sed L` is `sed: INTERNAL ERROR:
+    Bad cmd L` at exit 4 in GNU, an obsolete command left in its table, where
+    td-txt says `unknown command: `L''.
 
   - A leading `+` or `~` is THREE answers in GNU, not one, and only the first
     is the diagnostic-wording gap an earlier draft above called it. GNU's
