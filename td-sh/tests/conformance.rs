@@ -12,6 +12,24 @@
 //!     or depends on the Oils repo tree the sandbox cwd does not stage (which would
 //!     fail for an environment reason or degenerate into a false pass). The overlay
 //!     header enumerates these categories.
+//!
+//! The `xfail` COUNT is not a backlog, and a large share of it is not about
+//! this shell at all: a case dies the same way on an external program the
+//! harness withholds (PATH holds only a link to the shell under test) as on a
+//! builtin td-sh does not have -- both are `not found`. The overlay header
+//! carries the standing note and the deferred externals rig; measure before
+//! mining the list, because the two causes are indistinguishable from the
+//! failure alone, and an Oils `.py` helper is a third that looks like both.
+//!
+//! Two things that note does not say. The here-doc cases that die on `cat` are
+//! already byte-correct where `cat` exists -- `cat <<-EOF` with stripped tabs,
+//! `<<` mixed with `<<-`, a here-doc piped on its first line all match bash --
+//! so they wait on the rig, not on the shell. And `[[` is NOT out-of-model:
+//! busybox ash provides it under `ASH_BASH_COMPAT`, which td's `defconfig`
+//! build enables, so those are real parity gaps rather than a bash-only feature
+//! to write off. Promote an entry when a gap actually closes -- `to-promote`
+//! reds the gate to make sure it is.
+//!
 //! A stale overlay entry (matching no case) also reds the gate, so the manifest
 //! cannot rot. This is the shared `cargo-test` gate every agent's `affected-checks`
 //! preflight runs, so it stays green and blocking.

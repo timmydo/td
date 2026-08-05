@@ -1860,9 +1860,11 @@ fn run_preflight(root: &Path, name: &str) -> i32 {
             // td-init, td-firstboot, td-login, td-svc, td-seatd, and
             // td-compositor) are
             // standalone crates and ride the preflight explicitly, as does the
-            // host-side td-review integrator tool. td-sh's conformance corpus run is
-            // `#[ignore]`d, so this plain `cargo test` runs only its (green)
-            // parser/harness unit tests. td-review goes the other way: its
+            // host-side td-review integrator tool. td-sh's conformance corpus run
+            // is NOT `#[ignore]`d: this plain `cargo test` runs the whole corpus,
+            // so a regression, an unexpected pass or a stale overlay entry reds
+            // the preflight rather than waiting for a tier nothing runs.
+            // td-review goes the other way: its
             // App-level tests drive a real git repo, are `#[ignore]`d so the
             // git-less sandbox gate stays honest, and run HERE via
             // --include-ignored — this preflight is their only tier.
