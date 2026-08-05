@@ -516,6 +516,9 @@ pub struct Repeat {
     delay: u64,
     interval: u64,
     active: Option<Active>,
+    /// Whether the compositor publishes repeat at all. A rate of zero is the
+    /// protocol's "no repeat", which is not the same as a long delay.
+    enabled: bool,
 }
 
 /// The key itself, not its translation: the child can change DECCKM while a
@@ -533,11 +536,37 @@ impl Repeat {
         Repeat::with_timing(REPEAT_DELAY_MS, REPEAT_INTERVAL_MS)
     }
 
+    /// A machine that never arms, for a compositor that publishes a rate of
+    /// zero — the protocol's way of saying keys do not repeat. Distinct from
+    /// a very long delay: nothing here should ever come due.
+    pub fn disabled() -> Repeat {
+        Repeat {
+            delay: 0,
+            interval: 1,
+            active: None,
+            enabled: false,
+        }
+    }
+
+    /// Adopt another machine's TIMINGS without disturbing the held key.
+    /// Wayland permits `repeat_info` at any time, and a rate change is not a
+    /// reason to stop repeating the key someone is holding — but a rate of
+    /// zero is, since it says this seat does not repeat at all.
+    pub fn retime(&mut self, source: &Repeat) {
+        self.delay = source.delay;
+        self.interval = source.interval;
+        self.enabled = source.enabled;
+        if !self.enabled {
+            self.active = None;
+        }
+    }
+
     pub fn with_timing(delay: u64, interval: u64) -> Repeat {
         Repeat {
             delay,
             interval: interval.max(1),
             active: None,
+            enabled: true,
         }
     }
 
@@ -547,7 +576,10 @@ impl Repeat {
     /// through scrollback, and the compositor sends no repeat events of its
     /// own for this to fall back on.
     pub fn press(&mut self, code: u16, modifiers: u32, modes: Modes, viewing: bool, now: u64) {
-        if repeats(code) && !matches!(action(code, modifiers, modes, viewing), Action::Silent) {
+        if self.enabled
+            && repeats(code)
+            && !matches!(action(code, modifiers, modes, viewing), Action::Silent)
+        {
             self.active = Some(Active {
                 code,
                 modifiers,

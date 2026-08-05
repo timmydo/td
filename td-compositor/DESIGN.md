@@ -1028,9 +1028,22 @@ either — the pinned map has one group, so reading another against group 0's
 table would send a different key's bytes rather than none. The terminal mode
 that picks between two spellings is refreshed from the model before each
 event, because a child's reply to one key can change how the next is
-spelled. Key REPEAT and the scrollback VIEWPORT are not wired yet: a key
-that would scroll does nothing until there is something to scroll, and
-repeat needs a clock in a loop that currently blocks on its channel.
+spelled. Key REPEAT is wired, and its timings are the compositor's rather
+than the client's: `repeat_info` publishes a rate in keys per second and a
+delay in milliseconds, and a rate of zero is the protocol's "do not repeat"
+rather than an infinite interval. A held key is the only thing that makes
+the main loop time-sensitive, so with none armed it blocks on its channel
+exactly as before, and with one armed it waits no longer than that key's
+next repetition rather than polling. A repetition is re-routed per tick
+rather than replayed, so a child that changes DECCKM under a held cursor key
+gets the new spelling; a release, any modifier change, a keymap group
+change, losing focus, and a republished rate of zero each retire the held
+key, because the sequence armed under the old state is no longer the one it
+would send — and a key pressed while the group is not td's arms nothing at
+all, for the reason a single such press sends nothing. A later `repeat_info`
+with a different nonzero rate is not a retirement: it retimes the held key
+rather than dropping it. The scrollback VIEWPORT is still not wired: a key
+that would scroll does nothing until there is something to scroll.
 
 Those three rules are exhaustive, and what they exclude is deliberate. Ctrl
 reaches printable keys only, and only where a C0 spelling is defined; the

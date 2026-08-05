@@ -23,7 +23,7 @@ use std::collections::BTreeSet;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::ExitStatus;
-use std::sync::mpsc::{sync_channel, SyncSender};
+use std::sync::mpsc::{sync_channel, RecvTimeoutError, SyncSender};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -269,6 +269,14 @@ struct Surface {
     /// One translated key press, waiting for `serve_event` to route it to the
     /// child. A dispatch handles one message and so yields at most one.
     pending_input: Option<keys::Sequence>,
+    /// The key event `dispatch` last read, as (code, pressed), waiting for a
+    /// caller that has a CLOCK. `dispatch` has none and should not: it is
+    /// driven by tests that inject events, not time.
+    pending_key: Option<(u16, bool)>,
+    /// The auto-repeat state machine. Its timings come from the compositor's
+    /// `repeat_info` rather than from td's own constants, because §11 has the
+    /// server publish them and a client that guessed would drift from it.
+    repeat: keys::Repeat,
     live_buffers: BTreeSet<u32>,
     live_callbacks: BTreeSet<u32>,
     frame: Option<Frame>,
@@ -297,6 +305,8 @@ impl Surface {
             group_reported: false,
             modes: keys::Modes::default(),
             pending_input: None,
+            pending_key: None,
+            repeat: keys::Repeat::new(),
             live_buffers: BTreeSet::new(),
             live_callbacks: BTreeSet::new(),
             frame: None,
@@ -458,6 +468,7 @@ impl Surface {
                     // Ctrl — but a client that kept one would be wrong, and the
                     // cost of not keeping it is a word.
                     self.modifiers = 0;
+                    self.repeat.cancel();
                 }
                 // key: serial, time, key, state.
                 3 => {
@@ -470,6 +481,9 @@ impl Surface {
                         state => return Err(format!("wl_keyboard key has invalid state {state}")),
                     };
                     args.finish()?;
+                    if let Ok(code) = u16::try_from(code) {
+                        self.pending_key = Some((code, pressed));
+                    }
                     if pressed {
                         self.translate(code)?;
                     }
@@ -489,8 +503,20 @@ impl Surface {
                     if group != self.group {
                         self.group = group;
                         self.group_reported = false;
+                        // Same argument as the modifier change below, and
+                        // sharper: a key armed under td's map would go on
+                        // sending ITS bytes after a switch, which is the
+                        // wrong-key outcome a fresh press in a foreign group
+                        // is refused to avoid.
+                        self.repeat.cancel();
                     }
-                    self.modifiers = depressed | latched | locked;
+                    let folded = depressed | latched | locked;
+                    if folded != self.modifiers {
+                        // The sequence armed under the old modifiers is not
+                        // the one the key would send now.
+                        self.repeat.cancel();
+                    }
+                    self.modifiers = folded;
                 }
                 // repeat_info: rate and delay, the version-4 event §11's
                 // repeat design reads its timings out of. Parsed and dropped
@@ -498,9 +524,10 @@ impl Surface {
                 // an arm at all because the catch-all below is fatal, so a
                 // seat bound high enough to send this must expect it.
                 5 => {
-                    args.i32()?;
-                    args.i32()?;
+                    let rate = args.i32()?;
+                    let delay = args.i32()?;
                     args.finish()?;
+                    self.repeat.retime(&repeat_from(rate, delay));
                 }
                 _ => {
                     return Err(format!(
@@ -1055,6 +1082,89 @@ fn spawn_wayland_reader(
         .map_err(|e| format!("spawn the Wayland reader thread: {e}"))
 }
 
+/// The compositor's published repeat timings, as a machine. `rate` is keys
+/// per second and zero means "do not repeat at all", which the protocol
+/// defines and which a division would otherwise turn into an interval of
+/// infinity. A negative rate or delay is a compositor talking nonsense: both
+/// are `int` on the wire and neither has a meaning below zero, so the pinned
+/// default stands in rather than a saturating guess.
+fn repeat_from(rate: i32, delay: i32) -> keys::Repeat {
+    let (Ok(rate), Ok(delay)) = (u64::try_from(rate), u64::try_from(delay)) else {
+        return keys::Repeat::new();
+    };
+    if rate == 0 {
+        return keys::Repeat::disabled();
+    }
+    // Clamped as the interval is, and for a sharper reason: a delay of zero
+    // arms a repeat that is due the instant it is pressed, and the loop dates
+    // the arming and the serving from ONE `now` — so a single tap would send
+    // its byte twice. Nothing td publishes trips it; a compositor that
+    // published 0 is exactly what this conversion is defensive about.
+    keys::Repeat::with_timing(delay.max(1), 1000 / rate)
+}
+
+/// Milliseconds since the terminal started. The repeat machine takes an
+/// injected clock so its tests never sleep; this is the only place a real one
+/// enters, and it is monotonic because `Instant` is.
+fn now_ms(started: Instant) -> u64 {
+    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
+/// Hand the repeat machine the key `dispatch` read, now that there is a clock
+/// to date it by. Separate from `serve_event` because a press is meaningless
+/// without a time and `dispatch` deliberately has none.
+fn arm_repeat(surface: &mut Surface, now: u64) {
+    let Some((code, pressed)) = surface.pending_key.take() else {
+        return;
+    };
+    if surface.group != 0 {
+        // Arming here would repeat bytes `translate` refuses to send once.
+        surface.repeat.cancel();
+        return;
+    }
+    let (modifiers, modes) = (surface.modifiers, surface.modes);
+    // `viewing` is false for the reason a fresh press passes false: there is
+    // no scrollback viewport yet. It reaches `keys` from both places, so
+    // wiring one and not the other would give a held End a different meaning
+    // from a tapped one.
+    if pressed {
+        surface.repeat.press(code, modifiers, modes, false, now);
+    } else {
+        surface.repeat.release(code);
+    }
+}
+
+/// One repetition, if one is due. Routed exactly as a fresh press is —
+/// through the same queue, ringing the same bell on refusal — because a
+/// repeat the child cannot take is a repeat that should stop being sent
+/// rather than one that silently vanishes.
+fn serve_repeat(
+    surface: &mut Surface,
+    model: &mut Option<Terminal>,
+    child: &mut Child,
+    now: u64,
+) -> Result<(), String> {
+    // Read here rather than reused from the last keyboard event: a held
+    // cursor key outlives the child's DECCKM changes, and rerouting per tick
+    // is the whole reason `Repeat` stores a CODE rather than a sequence.
+    let modes = keys::Modes {
+        application_cursor: model
+            .as_ref()
+            .and_then(|terminal| terminal.mode("application-cursor"))
+            .unwrap_or(false),
+    };
+    let Some(keys::Action::Bytes(sequence)) = surface.repeat.due(now, modes, false) else {
+        return Ok(());
+    };
+    if !child.input.push(sequence.as_slice())? {
+        if let Some(terminal) = model.as_mut() {
+            terminal.ring();
+            surface.stale = true;
+        }
+    }
+    Ok(())
+}
+
 /// One turn of the terminal's steady state: answer an event.
 /// A new size is adopted exactly as the first one was — same function, so
 /// resize is not a second code path — and a configure that changes nothing
@@ -1484,19 +1594,59 @@ pub fn run(options: &Options) -> Result<(), String> {
     // forever holding a mapped surface. Each producer reports before it ends,
     // so this is the case where one did not.
     drop(sender);
+    // The clock the repeat machine is dated by. Started here rather than at
+    // process start so a slow handshake cannot make the first repetition
+    // arrive early.
+    let started = Instant::now();
+    // Whatever presentation left unapplied. `present` serves events through
+    // the same `dispatch`, so a key held across startup is recorded there and
+    // has had no clock to be dated by until now; without this it would arm
+    // only when some LATER message happened to arrive, or never.
+    arm_repeat(&mut surface, now_ms(started));
     loop {
-        let event = events
-            .recv()
-            .map_err(|_| "every terminal producer stopped without reporting".to_string())?;
-        serve_event(
-            &mut connection,
-            &mut surface,
-            &mut model,
-            &session,
-            fallback,
-            &mut child,
-            event,
-        )?;
+        // A held key is the only thing that makes this loop time-sensitive:
+        // with none armed it blocks as it always did, and with one armed it
+        // waits no longer than that key's next repetition. Waiting rather
+        // than polling is what `Repeat::deadline` exists for.
+        let event = match surface.repeat.deadline() {
+            None => Some(
+                events
+                    .recv()
+                    .map_err(|_| "every terminal producer stopped without reporting".to_string())?,
+            ),
+            Some(due) => {
+                let wait = Duration::from_millis(due.saturating_sub(now_ms(started)));
+                match events.recv_timeout(wait) {
+                    Ok(event) => Some(event),
+                    Err(RecvTimeoutError::Timeout) => None,
+                    Err(RecvTimeoutError::Disconnected) => {
+                        return Err("every terminal producer stopped without reporting".to_string())
+                    }
+                }
+            }
+        };
+        match event {
+            Some(event) => {
+                serve_event(
+                    &mut connection,
+                    &mut surface,
+                    &mut model,
+                    &session,
+                    fallback,
+                    &mut child,
+                    event,
+                )?;
+                let now = now_ms(started);
+                arm_repeat(&mut surface, now);
+                // A due repetition is served even though a message arrived:
+                // `recv_timeout` hands back a QUEUED event before it reports
+                // the expiry, so a child writing steadily would otherwise
+                // starve the held key indefinitely.
+                serve_repeat(&mut surface, &mut model, &mut child, now)?;
+            }
+            // The wait expired, so a repetition is due rather than a message.
+            None => serve_repeat(&mut surface, &mut model, &mut child, now_ms(started))?,
+        }
     }
 }
 
@@ -3638,6 +3788,311 @@ mod tests {
             "a refused key did not ring the bell"
         );
         assert!(surface.stale, "a refused key scheduled no redraw");
+    }
+
+    /// §11 has the compositor PUBLISH its repeat timings and td-term read
+    /// them, so a client that guessed would drift from the server. Rate is
+    /// keys per second, and its two edge values both have protocol meanings
+    /// that a plain division would get wrong.
+    #[test]
+    fn repeat_timings_come_from_the_compositors_own_numbers() {
+        // The published pair, spelled as numbers: 25 keys per second is a
+        // 40ms interval, and pinning it here is what would catch a rate read
+        // as an interval.
+        let mut published = repeat_from(25, 600);
+        published.press(30, 0, keys::Modes::default(), false, 1_000);
+        assert_eq!(published.deadline(), Some(1_600), "the delay is not 600ms");
+        assert!(
+            published
+                .due(1_599, keys::Modes::default(), false)
+                .is_none(),
+            "a repetition came due before its delay"
+        );
+        assert!(published
+            .due(1_600, keys::Modes::default(), false)
+            .is_some());
+        assert_eq!(
+            published.deadline(),
+            Some(1_640),
+            "25 keys per second is not a 40ms interval"
+        );
+
+        // A published DELAY of zero would arm a repeat already due, and the
+        // loop dates arming and serving from one `now` — so a single tap
+        // would send its byte twice.
+        let mut instant = repeat_from(25, 0);
+        instant.press(30, 0, keys::Modes::default(), false, 0);
+        assert!(
+            instant.due(0, keys::Modes::default(), false).is_none(),
+            "a tap repeated in the instant it was pressed"
+        );
+
+        // Rate zero is the protocol's "do not repeat", not an infinite one.
+        let mut none = repeat_from(0, 600);
+        none.press(30, 0, keys::Modes::default(), false, 0);
+        assert!(!none.armed(), "a zero rate armed a repeat");
+
+        // Neither field has a meaning below zero, so nonsense falls back to
+        // the pinned default rather than to a saturated guess.
+        // A delay DIFFERENT from the pinned default, or the assertion cannot
+        // tell "fell back" from "kept what was published"; and the interval
+        // is checked too, since the rate is the half that decides it.
+        let mut negative = repeat_from(-1, 111);
+        negative.press(30, 0, keys::Modes::default(), false, 0);
+        assert_eq!(negative.deadline(), Some(keys::REPEAT_DELAY_MS));
+        assert!(negative
+            .due(keys::REPEAT_DELAY_MS, keys::Modes::default(), false)
+            .is_some());
+        assert_eq!(
+            negative.deadline(),
+            Some(keys::REPEAT_DELAY_MS + keys::REPEAT_INTERVAL_MS),
+            "a negative rate did not fall back to the pinned interval"
+        );
+    }
+
+    /// The repeat wiring: `dispatch` reads the key, the clocked caller dates
+    /// it, and a repetition reaches the child through the same queue a fresh
+    /// press does. Driven with an injected clock, so this never sleeps.
+    #[test]
+    fn a_held_key_repeats_into_the_child() {
+        let (mut connection, _peer) = pair();
+        let mut surface = Surface::new(Bound {
+            compositor: 1,
+            shm: 2,
+            xdg_wm_base: 4,
+            seat: 5,
+        });
+        let fallback = Size {
+            width: 8,
+            height: 8,
+        };
+        let mut child = Child::default();
+        let mut model = None;
+        let key = |code: u32, state: u32| {
+            let mut payload = Vec::new();
+            for word in [1, 0, code, state] {
+                payload.extend_from_slice(&word.to_ne_bytes());
+            }
+            message(KEYBOARD, 3, payload)
+        };
+        surface.repeat = repeat_from(25, 600);
+
+        surface
+            .dispatch(&mut connection, &key(30, 1), fallback)
+            .unwrap();
+        arm_repeat(&mut surface, 1_000);
+        assert_eq!(
+            surface.repeat.deadline(),
+            Some(1_600),
+            "a press did not arm the repeat"
+        );
+        // Nothing before the delay, and the first byte only after it.
+        serve_repeat(&mut surface, &mut model, &mut child, 1_599).unwrap();
+        assert!(
+            child.input.take_for_test().is_empty(),
+            "a repetition arrived before its delay"
+        );
+        serve_repeat(&mut surface, &mut model, &mut child, 1_600).unwrap();
+        assert_eq!(child.input.take_for_test(), b"a".to_vec());
+
+        // A release retires it; the loop then has no deadline to wait on.
+        surface
+            .dispatch(&mut connection, &key(30, 0), fallback)
+            .unwrap();
+        arm_repeat(&mut surface, 1_700);
+        assert_eq!(
+            surface.repeat.deadline(),
+            None,
+            "releasing the held key left it repeating"
+        );
+        serve_repeat(&mut surface, &mut model, &mut child, 9_999).unwrap();
+        assert!(
+            child.input.take_for_test().is_empty(),
+            "a released key repeated anyway"
+        );
+
+        // Two things retire a held key besides releasing it, and both are
+        // about the sequence armed no longer being the one the key sends: a
+        // MODIFIER change, and losing focus, which obliges a client to treat
+        // every key as lifted.
+        let modifiers = |mask: u32, group: u32| {
+            let mut payload = Vec::new();
+            for word in [1, mask, 0, 0, group] {
+                payload.extend_from_slice(&word.to_ne_bytes());
+            }
+            message(KEYBOARD, 4, payload)
+        };
+        let leave = {
+            let mut payload = Vec::new();
+            for word in [1u32, SURFACE] {
+                payload.extend_from_slice(&word.to_ne_bytes());
+            }
+            message(KEYBOARD, 2, payload)
+        };
+        for (retire, what) in [
+            (
+                modifiers(crate::keyboard::MOD_CONTROL, 0),
+                "a modifier change",
+            ),
+            (leave, "losing focus"),
+        ] {
+            surface
+                .dispatch(&mut connection, &key(30, 1), fallback)
+                .unwrap();
+            arm_repeat(&mut surface, 2_000);
+            assert!(surface.repeat.armed(), "the fixture never armed");
+            surface
+                .dispatch(&mut connection, &retire, fallback)
+                .unwrap();
+            assert!(
+                !surface.repeat.armed(),
+                "{what} left the key repeating under the wrong spelling"
+            );
+        }
+
+        // A layout change, with the modifier mask held CONSTANT so the
+        // modifier cancel above cannot be what fires. Reached separately for
+        // that reason: driving it in the loop changed both at once, and the
+        // group half passed on the other's work.
+        surface
+            .dispatch(&mut connection, &modifiers(0, 0), fallback)
+            .unwrap();
+        surface
+            .dispatch(&mut connection, &key(30, 1), fallback)
+            .unwrap();
+        arm_repeat(&mut surface, 3_000);
+        assert!(surface.repeat.armed(), "the layout fixture never armed");
+        surface
+            .dispatch(&mut connection, &modifiers(0, 1), fallback)
+            .unwrap();
+        assert!(
+            !surface.repeat.armed(),
+            "a layout change left the key repeating under td's own map"
+        );
+        // And a press made WHILE in that group arms nothing, or the repeat
+        // would send bytes the single press was refused for.
+        surface
+            .dispatch(&mut connection, &key(30, 1), fallback)
+            .unwrap();
+        arm_repeat(&mut surface, 4_000);
+        assert!(
+            !surface.repeat.armed(),
+            "a key pressed in a foreign group armed a repeat"
+        );
+
+        // End is the key the two `viewing` literals decide the meaning of —
+        // one where it is armed, one where it repeats. Read as true it routes
+        // to the viewport instead, and a held End would silently stop
+        // reaching the child, so both are pinned by this.
+        surface
+            .dispatch(&mut connection, &modifiers(0, 0), fallback)
+            .unwrap();
+        surface
+            .dispatch(&mut connection, &key(107, 1), fallback)
+            .unwrap();
+        arm_repeat(&mut surface, 5_000);
+        assert!(surface.repeat.armed(), "a held End armed nothing");
+        let _ = child.input.take_for_test();
+        serve_repeat(&mut surface, &mut model, &mut child, 5_600).unwrap();
+        assert_eq!(
+            child.input.take_for_test(),
+            b"\x1b[F".to_vec(),
+            "a held End did not keep reaching the child"
+        );
+
+        // The guard's other side: an IDENTICAL modifiers message changes
+        // nothing and must leave the held key alone. td's server dedupes,
+        // but one that re-sent modifiers with every key would otherwise kill
+        // autorepeat outright.
+        surface
+            .dispatch(&mut connection, &modifiers(0, 0), fallback)
+            .unwrap();
+        surface
+            .dispatch(&mut connection, &key(30, 1), fallback)
+            .unwrap();
+        arm_repeat(&mut surface, 4_500);
+        assert!(surface.repeat.armed(), "the repeat fixture never armed");
+        surface
+            .dispatch(&mut connection, &modifiers(0, 0), fallback)
+            .unwrap();
+        assert!(
+            surface.repeat.armed(),
+            "an unchanged modifiers message retired a held key"
+        );
+    }
+
+    /// A held key outlives the child's mode changes, which is why `Repeat`
+    /// stores a code rather than a sequence — and why a repetition reads the
+    /// mode in force NOW rather than the one cached when the key went down.
+    #[test]
+    fn a_held_cursor_key_follows_the_childs_mode_changes() {
+        let (mut connection, _peer) = pair();
+        let mut surface = Surface::new(Bound {
+            compositor: 1,
+            shm: 2,
+            xdg_wm_base: 4,
+            seat: 5,
+        });
+        let fallback = Size {
+            width: 8,
+            height: 8,
+        };
+        let mut child = Child::default();
+        let mut model = Some(Terminal::new(4, 8).unwrap());
+        surface.repeat = repeat_from(25, 600);
+        let mut payload = Vec::new();
+        // evdev 103 is Up, which spells differently under DECCKM.
+        for word in [1u32, 0, 103, 1] {
+            payload.extend_from_slice(&word.to_ne_bytes());
+        }
+        surface
+            .dispatch(&mut connection, &message(KEYBOARD, 3, payload), fallback)
+            .unwrap();
+        arm_repeat(&mut surface, 0);
+        serve_repeat(&mut surface, &mut model, &mut child, 600).unwrap();
+        assert_eq!(child.input.take_for_test(), b"\x1b[A".to_vec());
+        // The child turns DECCKM on with no key touched in between.
+        if let Some(terminal) = model.as_mut() {
+            terminal.feed(b"\x1b[?1h");
+        }
+        serve_repeat(&mut surface, &mut model, &mut child, 640).unwrap();
+        assert_eq!(
+            child.input.take_for_test(),
+            b"\x1bOA".to_vec(),
+            "a held key kept the spelling it was pressed under"
+        );
+    }
+
+    /// `repeat_info` may arrive at any time, and a rate change is not a reason
+    /// to stop repeating the key someone is holding. A rate of ZERO is.
+    #[test]
+    fn retiming_keeps_the_held_key_but_a_zero_rate_retires_it() {
+        let mut repeat = repeat_from(25, 600);
+        repeat.press(30, 0, keys::Modes::default(), false, 0);
+        assert_eq!(repeat.deadline(), Some(600));
+        repeat.retime(&repeat_from(50, 200));
+        assert!(
+            repeat.armed(),
+            "a new rate dropped the key that was being held"
+        );
+        assert!(repeat.due(600, keys::Modes::default(), false).is_some());
+        assert_eq!(
+            repeat.deadline(),
+            Some(620),
+            "the new interval did not take"
+        );
+        repeat.retime(&repeat_from(0, 600));
+        assert!(!repeat.armed(), "a zero rate left a key repeating");
+        // The DELAY half of a retime, which only a press made after it can
+        // see: the case above presses first, so it pins the interval alone.
+        let mut delayed = repeat_from(25, 600);
+        delayed.retime(&repeat_from(25, 50));
+        delayed.press(30, 0, keys::Modes::default(), false, 0);
+        assert_eq!(
+            delayed.deadline(),
+            Some(50),
+            "a retimed delay did not reach the next press"
+        );
     }
 
     /// The whole point of the seat: a pressed key becomes the bytes a child
