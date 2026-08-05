@@ -89,9 +89,7 @@ impl SavedCursor {
             let column = self.column.min(columns.saturating_sub(1));
             (
                 column,
-                self.pending_wrap
-                    && columns == old_columns
-                    && column.saturating_add(1) == columns,
+                self.pending_wrap && columns == old_columns && column.saturating_add(1) == columns,
             )
         };
         Self {
@@ -920,6 +918,10 @@ impl Utf8Decoder {
     }
 }
 
+/// What one boundary in `reply_ends` costs, charged against §10's reply
+/// ceiling beside the bytes it delimits.
+const REPLY_OVERHEAD: usize = std::mem::size_of::<usize>();
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct Terminal {
     primary: Screen,
@@ -939,6 +941,10 @@ pub(crate) struct Terminal {
     dec_alternate: Option<SavedState>,
     last_printed: Option<char>,
     replies: Vec<u8>,
+    /// Where each reply ends in `replies`. §10's atomicity unit is ONE reply,
+    /// so the loop has to be able to admit one and refuse the next; a flat
+    /// buffer alone makes a batch look like a single sequence.
+    reply_ends: Vec<usize>,
     bell_pending: bool,
 }
 
@@ -963,6 +969,7 @@ impl Terminal {
             dec_alternate: None,
             last_printed: None,
             replies: Vec::new(),
+            reply_ends: Vec::new(),
             bell_pending: false,
         })
     }
@@ -1078,8 +1085,27 @@ impl Terminal {
         &self.replies
     }
 
-    pub(crate) fn take_replies(&mut self) -> Vec<u8> {
-        std::mem::take(&mut self.replies)
+    /// The pending replies, each on its own, in the order the child asked.
+    pub(crate) fn take_replies(&mut self) -> Vec<Vec<u8>> {
+        let replies = std::mem::take(&mut self.replies);
+        let ends = std::mem::take(&mut self.reply_ends);
+        let mut sequences = Vec::with_capacity(ends.len());
+        let mut start = 0;
+        for end in ends {
+            if let Some(reply) = replies.get(start..end) {
+                sequences.push(reply.to_vec());
+            }
+            start = end;
+        }
+        sequences
+    }
+
+    /// §10's third source of the visual bell, beside C0 BEL and a reply the
+    /// model itself could not hold: a sequence the main loop could not admit
+    /// to the child WHOLE. The model owns the bit because the renderer reads
+    /// it from a snapshot, so the loop has nowhere else to put one.
+    pub(crate) fn ring(&mut self) {
+        self.bell_pending = true;
     }
 
     pub(crate) fn take_bell(&mut self) -> bool {
@@ -1797,12 +1823,28 @@ impl Terminal {
     }
 
     fn append_reply(&mut self, bytes: &[u8]) {
-        let Some(next) = self.replies.len().checked_add(bytes.len()) else {
-            self.bell_pending = true;
+        // An empty reply is not one, and admitting it would add a boundary
+        // without adding a byte — the one way this storage could grow while
+        // the ceiling below saw nothing. No caller sends one; this is what
+        // keeps that a property rather than a habit.
+        if bytes.is_empty() {
             return;
-        };
-        if next <= MAX_REPLY_BYTES {
+        }
+        // The boundary is charged too. §10 caps the reply storage, and an
+        // index of one `usize` per reply is storage: uncharged, a child
+        // spamming the four-byte status report would hold the ceiling in
+        // bytes and twice it again in offsets.
+        let stored = self
+            .reply_ends
+            .len()
+            .checked_mul(REPLY_OVERHEAD)
+            .and_then(|index| index.checked_add(self.replies.len()));
+        let next = stored
+            .and_then(|stored| stored.checked_add(bytes.len()))
+            .and_then(|next| next.checked_add(REPLY_OVERHEAD));
+        if next.is_some_and(|next| next <= MAX_REPLY_BYTES) {
             self.replies.extend_from_slice(bytes);
+            self.reply_ends.push(self.replies.len());
         } else {
             self.bell_pending = true;
         }
@@ -1858,7 +1900,7 @@ pub(crate) fn selftest() -> Result<(), String> {
         || terminal.row_text(0)? != "td! "
         || terminal.cursor() != (0, 3, false)
         || terminal.mode("autowrap") != Some(true)
-        || replies != b"\x1b[1;4R"
+        || replies.concat() != b"\x1b[1;4R"
         || !bell
         || terminal.history_cells() != 0
         || terminal.cell(0, 2).map(|cell| cell.attributes.foreground) != Some(Color::Indexed(1))

@@ -21,6 +21,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::ExitStatus;
 use std::sync::mpsc::{sync_channel, SyncSender};
+use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -706,7 +707,10 @@ fn from_waited(waited: pty::Waited) -> Event {
     }
 }
 
-/// What the terminal has learned about its child's ending. BOTH halves are
+/// The child, from the loop's side: the queue everything typed or answered
+/// goes into, and what the loop has learned about how it ended.
+///
+/// BOTH halves of the ending are
 /// needed and they race: the kernel hangs the reader up and the waiter's
 /// `wait` returns at the same instant, in either order.
 ///
@@ -721,10 +725,23 @@ fn from_waited(waited: pty::Waited) -> Event {
 /// terminal, and so does a grandchild still holding the slave after the child
 /// is gone: in both cases one half has not happened, and in both cases there
 /// is still something the terminal is for.
-#[derive(Default)]
-struct Ending {
+struct Child {
+    input: Arc<pty::Input>,
     drained: bool,
     status: Option<ExitStatus>,
+}
+
+impl Default for Child {
+    /// A child that is not there yet — startup, before `start` — whose queue
+    /// nothing drains. Pushing to it is not an error, because nothing pushes
+    /// until there is something to read it.
+    fn default() -> Self {
+        Child {
+            input: pty::Input::new(),
+            drained: false,
+            status: None,
+        }
+    }
 }
 
 /// Read Wayland events until the connection ends, and hand each to the loop.
@@ -782,13 +799,13 @@ fn serve_event(
     model: &mut Option<Terminal>,
     session: &Session,
     fallback: Size,
-    ending: &mut Ending,
+    child: &mut Child,
     event: Event,
 ) -> Result<(), String> {
     match event {
         Event::Closed(error) => return Err(error),
-        Event::Exit(status) => ending.status = Some(status),
-        Event::Drained => ending.drained = true,
+        Event::Exit(status) => child.status = Some(status),
+        Event::Drained => child.drained = true,
         Event::Wayland(message) => {
             if !connection.handle_common(&message)? {
                 surface.dispatch(connection, &message, fallback)?;
@@ -799,16 +816,29 @@ fn serve_event(
                 .as_mut()
                 .ok_or_else(|| "the child wrote before the terminal had a model".to_string())?;
             terminal.feed(&bytes);
-            // Drained and DISCARDED. A reply is an answer the child asked
-            // for, and answering needs the writer thread §12 puts beside this
-            // one, which lands with the keyboard; leaving them here instead
-            // would grow a buffer for every query a program makes.
-            terminal.take_replies();
+            // Answered, now that there is a writer to answer through. ONE AT
+            // A TIME, because §10's atomicity unit is a reply: pushing a
+            // whole read's worth as one sequence would drop an answer that
+            // fits because a later one did not.
+            //
+            // A refusal is the queue being full, which §10 defines as "that
+            // sequence did not fit, ring the bell" — dropped WHOLE, since half
+            // a `CSI` reaching the child is worse than no answer at all. A
+            // writer that has DIED is the other outcome and is an error, not a
+            // bell: a terminal beeping at every reply because its writer is
+            // gone would be reporting the wrong news forever.
+            let mut refused = false;
+            for reply in terminal.take_replies() {
+                refused |= !child.input.push(&reply)?;
+            }
+            if refused {
+                terminal.ring();
+            }
             surface.stale = true;
         }
     }
     // Both halves, in either order.
-    if let (true, Some(status)) = (ending.drained, ending.status) {
+    if let (true, Some(status)) = (child.drained, child.status) {
         return Err(ended(status));
     }
     let Some(wanted) = surface.wanted() else {
@@ -848,11 +878,15 @@ fn start_child(
     events: &SyncSender<Event>,
     command: &pty::ChildCommand,
     account: &pty::Account,
-) -> Result<Vec<JoinHandle<Result<(), String>>>, String> {
+) -> Result<Started, String> {
     let output = pty
         .master()
         .try_clone()
         .map_err(|e| format!("duplicate the terminal device for its reader: {e}"))?;
+    let sink = pty
+        .master()
+        .try_clone()
+        .map_err(|e| format!("duplicate the terminal device for its writer: {e}"))?;
     let slave = pty.peer()?;
     let child = pty::spawn(
         command,
@@ -873,19 +907,41 @@ fn start_child(
     // no hangup for anyone and a zombie once it does exit.
     let waiter = pty::spawn_waiter(child, events.clone(), from_waited)?;
     let reader = pty::spawn_reader(output, events.clone(), from_output)?;
-    Ok(vec![waiter, reader])
+    // The third thread, and the only one that does not produce events: it
+    // consumes what the loop pushes. §12 puts it on its own thread because a
+    // child in raw mode that stops reading blocks a write, and blocking the
+    // loop in one would stop the terminal answering the compositor.
+    let input = pty::Input::new();
+    let writer = pty::spawn_writer(sink, Arc::clone(&input))?;
+    Ok((
+        vec![waiter, reader, writer],
+        Child {
+            input,
+            drained: false,
+            status: None,
+        },
+    ))
 }
 
-/// What a started terminal leaves behind it: the child's two threads, and
-/// the readiness socket for as long as the process is up.
-type Running = (Vec<JoinHandle<Result<(), String>>>, socket::Published);
+/// The three threads a child is served by, and the loop's handle on it.
+/// One value from one place: the queue the writer drains and the queue the
+/// loop pushes to have to be the same object, and returning the pieces
+/// separately is an invitation to wire up two.
+type Started = (Vec<JoinHandle<Result<(), String>>>, Child);
+
+/// Those, plus the readiness socket for as long as the process is up.
+type Running = (
+    Vec<JoinHandle<Result<(), String>>>,
+    Child,
+    socket::Published,
+);
 
 /// Start the child, and only then advertise the terminal.
 ///
 /// The ORDER is the contract: resolving the account, spawning the shell and
-/// spawning its two threads can each fail, and a probe told the terminal is up
-/// on a terminal whose shell never started has been told something that was
-/// never true. It is a function rather than two lines of `run` because `run`
+/// spawning its three threads can each fail, and a probe told the terminal is
+/// up on a terminal whose shell never started has been told something that
+/// was never true. It is a function rather than two lines of `run` because `run`
 /// dials a socket and never returns, so an ordering asserted only there is one
 /// no test can watch.
 fn start(
@@ -898,10 +954,10 @@ fn start(
 ) -> Result<Running, String> {
     let account = pty::current_account(status, passwd)?;
     let command = pty::child_command(Path::new(pty::CTTYHACK), &[])?;
-    let children = start_child(pty, events, &command, &account)?;
+    let (children, child) = start_child(pty, events, &command, &account)?;
     let (rows, columns) = cells;
     let published = ready::publish(ready_socket, rows, columns)?;
-    Ok((children, published))
+    Ok((children, child, published))
 }
 
 /// A child ending ends the session: a terminal outliving its shell is a
@@ -925,17 +981,19 @@ fn serve_turn(
     model: &mut Option<Terminal>,
     session: &Session,
     fallback: Size,
+    child: &mut Child,
 ) -> Result<(), String> {
     let message = connection.next()?;
-    // Startup has no child, so nothing here can reach an ending: the two
-    // events that make one are produced by threads `start` has not spawned.
+    // Startup has no child at all: the events that make an ending, and the
+    // queue an answer would go into, both belong to threads `start` has not
+    // spawned yet.
     serve_event(
         connection,
         surface,
         model,
         session,
         fallback,
-        &mut Ending::default(),
+        child,
         Event::Wayland(message),
     )
 }
@@ -971,8 +1029,16 @@ fn present(
     // The SAME turn the steady state runs, so startup cannot throttle or
     // redraw differently from a resize — the only difference is that this
     // loop has somewhere to stop.
+    let mut child = Child::default();
     while !surface.ready() {
-        serve_turn(connection, &mut surface, &mut model, &session, fallback)?;
+        serve_turn(
+            connection,
+            &mut surface,
+            &mut model,
+            &session,
+            fallback,
+            &mut child,
+        )?;
     }
     let terminal = model.ok_or_else(|| "the terminal presented without a model".to_string())?;
     let cells = surface
@@ -1077,7 +1143,7 @@ pub fn run(options: &Options) -> Result<(), String> {
     let reader = connection.detach_reader()?;
     let (sender, events) = sync_channel(MAX_PENDING_EVENTS);
     let _wayland = spawn_wayland_reader(reader, sender.clone())?;
-    let (_children, _ready) = start(
+    let (_children, mut child, _ready) = start(
         &pty,
         &sender,
         Path::new(PROC_STATUS),
@@ -1107,7 +1173,6 @@ pub fn run(options: &Options) -> Result<(), String> {
     // forever holding a mapped surface. Each producer reports before it ends,
     // so this is the case where one did not.
     drop(sender);
-    let mut ending = Ending::default();
     loop {
         let event = events
             .recv()
@@ -1118,7 +1183,7 @@ pub fn run(options: &Options) -> Result<(), String> {
             &mut model,
             &session,
             fallback,
-            &mut ending,
+            &mut child,
             event,
         )?;
     }
@@ -1144,6 +1209,7 @@ pub fn selftest() -> Result<(), String> {
 mod tests {
     use super::*;
     use crate::conn::{DISPLAY, KEYBOARD, POINTER, SEAT, SURFACE, SYNC_CALLBACK};
+    use std::io::Read;
     use std::os::unix::net::UnixStream;
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::time::Duration;
@@ -1991,6 +2057,7 @@ mod tests {
             &mut model,
             &session,
             fallback,
+            &mut Child::default(),
         )
         .unwrap();
 
@@ -2043,6 +2110,7 @@ mod tests {
                 &mut model,
                 &session,
                 fallback,
+                &mut Child::default(),
             ) {
                 refused = Some(error);
             }
@@ -2137,6 +2205,7 @@ mod tests {
                 &mut model,
                 &session,
                 fallback,
+                &mut Child::default(),
             )
             .unwrap();
         }
@@ -2168,6 +2237,7 @@ mod tests {
                 &mut model,
                 &session,
                 fallback,
+                &mut Child::default(),
             )
             .unwrap();
         }
@@ -2241,6 +2311,7 @@ mod tests {
                 &mut model,
                 &session,
                 fallback,
+                &mut Child::default(),
             )
             .unwrap();
         }
@@ -2339,7 +2410,7 @@ mod tests {
             &mut model,
             &session,
             fallback,
-            &mut Ending::default(),
+            &mut Child::default(),
             Event::Closed("compositor went away".into()),
         )
         .err()
@@ -2382,7 +2453,7 @@ mod tests {
             &mut model,
             &session,
             fallback,
-            &mut Ending::default(),
+            &mut Child::default(),
             Event::Output(b"held".to_vec()),
         )
         .unwrap();
@@ -2398,7 +2469,7 @@ mod tests {
             &mut model,
             &session,
             fallback,
-            &mut Ending::default(),
+            &mut Child::default(),
             Event::Output(b"more".to_vec()),
         )
         .unwrap();
@@ -2435,7 +2506,7 @@ mod tests {
             &mut model,
             &session,
             fallback,
-            &mut Ending::default(),
+            &mut Child::default(),
             Event::Output(b"early".to_vec()),
         )
         .err()
@@ -2484,15 +2555,13 @@ mod tests {
         );
     }
 
-    /// What the loop does with the two things a child can ask for that are not
-    /// pixels. A reply is DROPPED, because answering needs the writer thread
-    /// that lands with the keyboard and an answer sent minutes late is worse
-    /// than none. The BELL is deliberately kept: §10 says the next submitted
-    /// frame inverts a one-pixel ring and clears the bit after release, and
-    /// taking it here would destroy the only record that a notification ever
-    /// happened.
+    /// The BELL is deliberately kept where a reply is consumed: §10 says the
+    /// next submitted frame inverts a one-pixel ring and clears the bit after
+    /// release, and taking it here would destroy the only record that a
+    /// notification ever happened. The renderer that presents it is a later
+    /// landing; the bit has to survive until then.
     #[test]
-    fn a_query_is_answered_by_nobody_and_a_bell_waits_to_be_drawn() {
+    fn a_bell_waits_to_be_drawn_rather_than_being_taken_here() {
         let (mut connection, _peer) = pair();
         let mut surface = Surface::new(Bound {
             compositor: 1,
@@ -2516,26 +2585,416 @@ mod tests {
         adopt_size(&mut connection, &mut surface, &mut model, &session).unwrap();
         surface.frame = Some(frame(true, true));
 
-        // A cursor-position report and a BEL, which is what a shell prompt
-        // and a mistyped completion produce between them.
         serve_event(
             &mut connection,
             &mut surface,
             &mut model,
             &session,
             fallback,
-            &mut Ending::default(),
-            Event::Output(b"\x1b[6n\x07".to_vec()),
+            &mut Child::default(),
+            Event::Output(b"\x07".to_vec()),
         )
         .unwrap();
-        let terminal = model.as_mut().unwrap();
         assert!(
-            terminal.take_replies().is_empty(),
-            "a reply was left queued for a writer that does not exist yet"
+            model.as_mut().unwrap().take_bell(),
+            "the bell was consumed before anything could present it"
+        );
+    }
+
+    /// The answer to a query the child asked reaches the child. This is the
+    /// whole return path in one test: the model composes a reply, the loop
+    /// hands it to the input queue, the writer thread takes it off, and the
+    /// kernel puts it on the other side of the terminal.
+    ///
+    /// The trailing newline is the TEST's own, standing in for the keystroke
+    /// that has not landed yet: the slave is in the kernel's canonical mode,
+    /// where a read returns nothing until a line is complete, and a cursor
+    /// report carries no newline of its own. A real child asking this question
+    /// has put its terminal in raw mode first.
+    #[test]
+    fn a_query_the_child_asked_is_answered_through_the_writer() {
+        let (mut connection, _peer) = pair();
+        let mut surface = Surface::new(Bound {
+            compositor: 1,
+            shm: 2,
+            xdg_wm_base: 4,
+        });
+        surface.xrgb = true;
+        let font = font();
+        let palette = render::Palette::pinned();
+        let pty = Pty::open(Path::new(pty::DEV_PTMX)).unwrap();
+        let mut slave = pty.peer().unwrap();
+        let directory = std::env::temp_dir();
+        let session = Session {
+            directory: &directory,
+            pty: &pty,
+            font: &font,
+            palette: &palette,
+        };
+        let fallback = default_size(&font).unwrap();
+        surface.current = Some(fallback);
+        let mut model = None;
+        adopt_size(&mut connection, &mut surface, &mut model, &session).unwrap();
+        surface.frame = Some(frame(true, true));
+
+        let input = pty::Input::new();
+        let writer = pty::spawn_writer(pty.master().try_clone().unwrap(), Arc::clone(&input))
+            .expect("the writer thread never started");
+        let mut child = Child {
+            input: Arc::clone(&input),
+            drained: false,
+            status: None,
+        };
+        serve_event(
+            &mut connection,
+            &mut surface,
+            &mut model,
+            &session,
+            fallback,
+            &mut child,
+            Event::Output(b"\x1b[6n".to_vec()),
+        )
+        .unwrap();
+        assert!(input.push(b"\n").unwrap(), "the queue refused the newline");
+
+        // Read on a thread, and wait with a deadline: `cargo test` has no
+        // per-test timeout, so a writer that never wrote would hang the whole
+        // binary with no diagnostic rather than failing here.
+        let (chunks, arrived) = sync_channel(16);
+        std::thread::spawn(move || loop {
+            let mut chunk = [0u8; 64];
+            let Ok(count) = slave.read(&mut chunk) else {
+                return;
+            };
+            if count == 0
+                || chunks
+                    .send(chunk.get(..count).unwrap_or_default().to_vec())
+                    .is_err()
+            {
+                return;
+            }
+        });
+        let mut seen = Vec::new();
+        while !seen.contains(&b'\n') {
+            let chunk = arrived
+                .recv_timeout(Duration::from_secs(30))
+                .expect("the terminal never answered");
+            seen.extend_from_slice(&chunk);
+        }
+        assert_eq!(
+            seen, b"\x1b[1;1R\n",
+            "the child was told something other than where the cursor is, exactly once"
         );
         assert!(
-            terminal.take_bell(),
-            "the bell was consumed before anything could present it"
+            !model.as_mut().unwrap().take_bell(),
+            "an answer that was delivered rang the bell anyway"
+        );
+        input.close().unwrap();
+        writer.join().unwrap().unwrap();
+    }
+
+    /// One reply fitting and the next not is the case a batched push gets
+    /// wrong: §10's atomicity unit is a REPLY, so an answer that fits must go
+    /// even when a later one cannot. Pushing a whole read's worth as one
+    /// sequence drops both, and the child that asked the first question waits
+    /// for an answer the terminal had room to send.
+    #[test]
+    fn a_reply_that_fits_goes_even_when_the_next_one_does_not() {
+        let (mut connection, _peer) = pair();
+        let mut surface = Surface::new(Bound {
+            compositor: 1,
+            shm: 2,
+            xdg_wm_base: 4,
+        });
+        surface.xrgb = true;
+        let font = font();
+        let palette = render::Palette::pinned();
+        let pty = Pty::open(Path::new(pty::DEV_PTMX)).unwrap();
+        let directory = std::env::temp_dir();
+        let session = Session {
+            directory: &directory,
+            pty: &pty,
+            font: &font,
+            palette: &palette,
+        };
+        let fallback = default_size(&font).unwrap();
+        surface.current = Some(fallback);
+        let mut model = None;
+        adopt_size(&mut connection, &mut surface, &mut model, &session).unwrap();
+        surface.frame = Some(frame(true, true));
+
+        // Room for exactly one cursor report and not two. Nothing drains this
+        // queue, which is the state a child that stopped reading leaves it in.
+        let mut child = Child::default();
+        let report = b"\x1b[1;1R".len();
+        let filler = crate::keys::MAX_INPUT_BYTES - report;
+        assert!(child.input.push(&vec![b'x'; filler]).unwrap());
+
+        serve_event(
+            &mut connection,
+            &mut surface,
+            &mut model,
+            &session,
+            fallback,
+            &mut child,
+            Event::Output(b"\x1b[6n\x1b[6n".to_vec()),
+        )
+        .unwrap();
+        // The second was refused, so the bell rings — and the first is IN, so
+        // the queue has no room left at all.
+        assert!(
+            model.as_mut().unwrap().take_bell(),
+            "the refused reply rang no bell"
+        );
+        assert!(
+            !child.input.push(b"z").unwrap(),
+            "the reply that fitted was dropped with the one that did not"
+        );
+    }
+
+    /// PARTIAL room is what "dropped whole" is about, and it is the case a
+    /// full queue cannot show: with no room at all, a byte-at-a-time push
+    /// admits nothing either. Here there is room for SOME of the reply, and
+    /// what must not happen is the child finding half a `CSI` in its input.
+    #[test]
+    fn a_reply_with_room_for_only_part_of_it_leaves_none_of_it() {
+        let (mut connection, _peer) = pair();
+        let mut surface = Surface::new(Bound {
+            compositor: 1,
+            shm: 2,
+            xdg_wm_base: 4,
+        });
+        surface.xrgb = true;
+        let font = font();
+        let palette = render::Palette::pinned();
+        let pty = Pty::open(Path::new(pty::DEV_PTMX)).unwrap();
+        let directory = std::env::temp_dir();
+        let session = Session {
+            directory: &directory,
+            pty: &pty,
+            font: &font,
+            palette: &palette,
+        };
+        let fallback = default_size(&font).unwrap();
+        surface.current = Some(fallback);
+        let mut model = None;
+        adopt_size(&mut connection, &mut surface, &mut model, &session).unwrap();
+        surface.frame = Some(frame(true, true));
+
+        // Three bytes free against a six-byte cursor report.
+        let spare = 3;
+        let mut child = Child::default();
+        assert!(child
+            .input
+            .push(&vec![b'x'; crate::keys::MAX_INPUT_BYTES - spare])
+            .unwrap());
+
+        serve_event(
+            &mut connection,
+            &mut surface,
+            &mut model,
+            &session,
+            fallback,
+            &mut child,
+            Event::Output(b"\x1b[6n".to_vec()),
+        )
+        .unwrap();
+        assert!(
+            model.as_mut().unwrap().take_bell(),
+            "the dropped reply rang no bell"
+        );
+        // The room is still there, byte for byte: anything admitted would
+        // have eaten into it, and a prefix of a `CSI` is what the child would
+        // then read.
+        assert!(
+            child.input.push(&vec![b'y'; spare]).unwrap(),
+            "part of the refused reply was admitted"
+        );
+        assert!(!child.input.push(b"z").unwrap(), "the queue was not full");
+    }
+
+    /// The refusal that a `refused = ` rather than a `refused |= ` loses: the
+    /// FIRST reply of a batch dropped and a later one admitted. Replies differ
+    /// in length, so this is reachable rather than theoretical — and a bell
+    /// that only reports the last reply of a read is one §10 does not
+    /// describe.
+    #[test]
+    fn a_refusal_rings_the_bell_even_when_a_later_reply_fits() {
+        let (mut connection, _peer) = pair();
+        let mut surface = Surface::new(Bound {
+            compositor: 1,
+            shm: 2,
+            xdg_wm_base: 4,
+        });
+        surface.xrgb = true;
+        let font = font();
+        let palette = render::Palette::pinned();
+        let pty = Pty::open(Path::new(pty::DEV_PTMX)).unwrap();
+        let directory = std::env::temp_dir();
+        let session = Session {
+            directory: &directory,
+            pty: &pty,
+            font: &font,
+            palette: &palette,
+        };
+        let fallback = default_size(&font).unwrap();
+        surface.current = Some(fallback);
+        let mut model = None;
+        adopt_size(&mut connection, &mut surface, &mut model, &session).unwrap();
+        surface.frame = Some(frame(true, true));
+
+        // Room for the SHORTER second reply and not the longer first: the
+        // device attributes answer is seven bytes and the status report four.
+        let mut child = Child::default();
+        let attributes = b"\x1b[?1;0c".len();
+        let status = b"\x1b[0n".len();
+        assert!(
+            attributes > status,
+            "the fixture no longer distinguishes them"
+        );
+        let filler = crate::keys::MAX_INPUT_BYTES - status;
+        assert!(child.input.push(&vec![b'x'; filler]).unwrap());
+
+        serve_event(
+            &mut connection,
+            &mut surface,
+            &mut model,
+            &session,
+            fallback,
+            &mut child,
+            Event::Output(b"\x1b[c\x1b[5n".to_vec()),
+        )
+        .unwrap();
+        assert!(
+            model.as_mut().unwrap().take_bell(),
+            "the reply that was dropped rang no bell"
+        );
+        // The short one went, so nothing is left.
+        assert!(
+            !child.input.push(b"z").unwrap(),
+            "the reply that fitted was dropped with the one that did not"
+        );
+    }
+
+    /// A writer that has DIED is an error and ends the session; it is NOT the
+    /// bell a full queue rings. §12 turns on that distinction and nothing at
+    /// the loop pinned it — `Input`'s own tests cover the queue reporting a
+    /// death, and this covers the loop acting on it.
+    #[test]
+    fn a_dead_writer_ends_the_session_rather_than_ringing() {
+        let (mut connection, _peer) = pair();
+        let mut surface = Surface::new(Bound {
+            compositor: 1,
+            shm: 2,
+            xdg_wm_base: 4,
+        });
+        surface.xrgb = true;
+        let font = font();
+        let palette = render::Palette::pinned();
+        let pty = Pty::open(Path::new(pty::DEV_PTMX)).unwrap();
+        let directory = std::env::temp_dir();
+        let session = Session {
+            directory: &directory,
+            pty: &pty,
+            font: &font,
+            palette: &palette,
+        };
+        let fallback = default_size(&font).unwrap();
+        surface.current = Some(fallback);
+        let mut model = None;
+        adopt_size(&mut connection, &mut surface, &mut model, &session).unwrap();
+        surface.frame = Some(frame(true, true));
+
+        // A sink whose every write fails, so the writer dies on its first and
+        // the death is not a race. Deliberately NOT the PTY master: writing
+        // to one whose slave is unopened, or opened and closed, does not
+        // reliably fail here — the writer parks in `Condvar::wait` and the
+        // join below hangs rather than failing, which is a test that never
+        // reports. `/dev/full` is the kernel's own always-fails device, as
+        // `/dev/ptmx` beside it is its terminal multiplexer.
+        let mut child = Child::default();
+        let sink = std::fs::OpenOptions::new()
+            .write(true)
+            .open("/dev/full")
+            .expect("the gate has no /dev/full to fail a write against");
+        let writer = pty::spawn_writer(sink, Arc::clone(&child.input)).unwrap();
+        assert!(child.input.push(b"doomed").unwrap());
+        writer.join().unwrap().unwrap_err();
+
+        let failed = serve_event(
+            &mut connection,
+            &mut surface,
+            &mut model,
+            &session,
+            fallback,
+            &mut child,
+            Event::Output(b"\x1b[6n".to_vec()),
+        )
+        .err()
+        .unwrap();
+        assert!(
+            failed.contains("stopped accepting input"),
+            "a dead writer read as a full queue: {failed}"
+        );
+        assert!(
+            !model.as_mut().unwrap().take_bell(),
+            "a dead writer rang the bell instead of ending the session"
+        );
+    }
+
+    /// A queue with NO room rings the bell. The "dropped whole" half of §10 is
+    /// not what this shows — with nothing free, admitting byte by byte admits
+    /// nothing either — and the test above is where that lives.
+    #[test]
+    fn a_reply_with_no_room_at_all_rings_the_bell() {
+        let (mut connection, _peer) = pair();
+        let mut surface = Surface::new(Bound {
+            compositor: 1,
+            shm: 2,
+            xdg_wm_base: 4,
+        });
+        surface.xrgb = true;
+        let font = font();
+        let palette = render::Palette::pinned();
+        let pty = Pty::open(Path::new(pty::DEV_PTMX)).unwrap();
+        let directory = std::env::temp_dir();
+        let session = Session {
+            directory: &directory,
+            pty: &pty,
+            font: &font,
+            palette: &palette,
+        };
+        let fallback = default_size(&font).unwrap();
+        surface.current = Some(fallback);
+        let mut model = None;
+        adopt_size(&mut connection, &mut surface, &mut model, &session).unwrap();
+        surface.frame = Some(frame(true, true));
+
+        // Nothing drains this queue: there is no writer, which is the state a
+        // child that has stopped reading puts a live one in.
+        let mut child = Child::default();
+        assert!(child
+            .input
+            .push(&vec![b'x'; crate::keys::MAX_INPUT_BYTES])
+            .unwrap());
+        assert!(
+            !child.input.push(b"y").unwrap(),
+            "the queue admitted more than its own bound"
+        );
+
+        serve_event(
+            &mut connection,
+            &mut surface,
+            &mut model,
+            &session,
+            fallback,
+            &mut child,
+            Event::Output(b"\x1b[6n".to_vec()),
+        )
+        .unwrap();
+        assert!(
+            model.as_mut().unwrap().take_bell(),
+            "a dropped reply rang no bell"
         );
     }
 
@@ -2553,13 +3012,13 @@ mod tests {
             name: "td-term-test".into(),
             home: directory.display().to_string(),
         };
-        let mut command = fixture_command();
-        command.arguments = vec![
-            "--exact".into(),
-            "term_client::tests::term_client_abort_fixture".into(),
-            "--ignored".into(),
-        ];
-        start_child(&pty, &sender, &command, &account).unwrap();
+        let (_threads, _child) = start_child(
+            &pty,
+            &sender,
+            &fixture_command("term_client_abort_fixture"),
+            &account,
+        )
+        .unwrap();
 
         let status = loop {
             match events.recv_timeout(Duration::from_secs(30)).unwrap() {
@@ -2612,12 +3071,12 @@ mod tests {
     /// `current_exe` rather than `/bin/sh` for `pty.rs`'s reason: the gate's
     /// shell is not td's, and a test that depended on one would be testing the
     /// host.
-    fn fixture_command() -> pty::ChildCommand {
+    fn fixture_command(name: &str) -> pty::ChildCommand {
         pty::ChildCommand {
             program: std::env::current_exe().unwrap_or_default(),
             arguments: vec![
                 "--exact".into(),
-                "term_client::tests::term_client_child_fixture".into(),
+                format!("term_client::tests::{name}").into(),
                 "--ignored".into(),
                 "--nocapture".into(),
             ],
@@ -2625,6 +3084,8 @@ mod tests {
     }
 
     const CHILD_MARKER: &str = "TD-TERM-CHILD-SPOKE";
+    const CHILD_ECHO: &str = "TD-TERM-CHILD-HEARD:";
+    const CHILD_TYPED: &str = "ping";
 
     /// The child half of the tests below. `#[ignore]` is what keeps it out of
     /// an ordinary run: only a parent naming it exactly, with `--ignored`,
@@ -2632,9 +3093,25 @@ mod tests {
     /// fixture is, because the environment its parent gives it is the one
     /// `start_child` constructs — which is the production one, and the point.
     #[test]
-    #[ignore = "spawned as the child of a_child_puts_its_own_output_on_the_screen"]
+    #[ignore = "spawned as the child of a_child_exiting_ends_the_loop_and_names_the_status"]
     fn term_client_child_fixture() {
         print!("{CHILD_MARKER}");
+        std::io::stdout().flush().unwrap();
+    }
+
+    /// The same, and then a LINE READ: it says what it was told, which is what
+    /// makes the writer's absence visible from the parent. A whole line,
+    /// because the slave is in the kernel's canonical mode and a read there
+    /// returns nothing until one is complete.
+    #[test]
+    #[ignore = "spawned as the child of a_child_puts_its_own_output_on_the_screen"]
+    fn term_client_echo_fixture() {
+        print!("{CHILD_MARKER}");
+        std::io::stdout().flush().unwrap();
+        let mut line = String::new();
+        let read = std::io::stdin().read_line(&mut line).unwrap();
+        assert_ne!(read, 0, "the fixture read end-of-file rather than a line");
+        print!("{CHILD_ECHO}{}", line.trim_end());
         std::io::stdout().flush().unwrap();
     }
 
@@ -2682,10 +3159,16 @@ mod tests {
             name: "td-term-test".into(),
             home: directory.display().to_string(),
         };
-        start_child(&pty, &sender, &fixture_command(), &account).unwrap();
+        let (_threads, mut child) = start_child(
+            &pty,
+            &sender,
+            &fixture_command("term_client_echo_fixture"),
+            &account,
+        )
+        .unwrap();
         drop(sender);
 
-        let mut ending = Ending::default();
+        let mut typed = false;
         let mut ended = None;
         while ended.is_none() {
             let event = events
@@ -2702,17 +3185,39 @@ mod tests {
                 &mut model,
                 &session,
                 fallback,
-                &mut ending,
+                &mut child,
                 event,
             );
             if let Err(error) = served {
                 ended = Some(error);
+            }
+            // Answer the child once it has spoken, which is the return path:
+            // this goes into the queue the writer thread drains, and the child
+            // reads it back off its own terminal.
+            let spoke = model
+                .as_ref()
+                .is_some_and(|terminal| screen(terminal).contains(CHILD_MARKER));
+            if spoke && !typed {
+                typed = true;
+                assert!(
+                    child
+                        .input
+                        .push(format!("{CHILD_TYPED}\n").as_bytes())
+                        .unwrap(),
+                    "the queue refused the line to type"
+                );
             }
         }
         let text = model.as_ref().map(screen).unwrap_or_default();
         assert!(
             text.contains(CHILD_MARKER),
             "the child's output never reached the model: {text:?} (ended: {ended:?})"
+        );
+        // And the other direction, which takes the writer thread: what the
+        // parent put on the queue reached the child, and the child said so.
+        assert!(
+            text.contains(&format!("{CHILD_ECHO}{CHILD_TYPED}")),
+            "the child never heard what was typed at it: {text:?}"
         );
         // The output made the picture stale and the same turn replaced it.
         assert!(!surface.stale, "the screen was left stale after output");
@@ -2755,7 +3260,13 @@ mod tests {
             name: "td-term-test".into(),
             home: directory.display().to_string(),
         };
-        start_child(&pty, &sender, &fixture_command(), &account).unwrap();
+        let (_threads, mut child) = start_child(
+            &pty,
+            &sender,
+            &fixture_command("term_client_child_fixture"),
+            &account,
+        )
+        .unwrap();
         let status = loop {
             match events.recv_timeout(Duration::from_secs(30)).unwrap() {
                 Event::Exit(status) => break status,
@@ -2763,7 +3274,6 @@ mod tests {
                 other => panic!("the child produced {}", named(&other)),
             }
         };
-        let mut ending = Ending::default();
         // The exit ALONE does not end the terminal: the child's last bytes may
         // still be in the kernel, and `Event::Exit` can overtake them.
         serve_event(
@@ -2772,7 +3282,7 @@ mod tests {
             &mut model,
             &session,
             fallback,
-            &mut ending,
+            &mut child,
             Event::Exit(status),
         )
         .unwrap();
@@ -2782,7 +3292,7 @@ mod tests {
             &mut model,
             &session,
             fallback,
-            &mut ending,
+            &mut child,
             Event::Drained,
         )
         .err()

@@ -1377,14 +1377,39 @@ fn replies_are_bounded_drainable_and_reusable() {
     for _ in 0..20_000 {
         terminal.feed(b"\x1b[6n");
     }
+    // The drained sequences ARE the buffer, split — nothing added, nothing
+    // lost. Held to the flat accessor rather than to a shape, because the
+    // boundaries are recorded beside the bytes and an index out of step with
+    // them drops replies SILENTLY: a bad end makes the split skip that reply
+    // and every one after it, which every other assertion here survives.
+    let flat = terminal.replies().to_vec();
     let replies = terminal.take_replies();
     assert!(!replies.is_empty());
-    assert!(replies.len() <= MAX_REPLY_BYTES);
+    assert_eq!(replies.concat(), flat);
+    // Each reply arrives on its own — §10's atomicity unit — so the COUNT is
+    // what the ceiling admitted, not one batch and not one short. The ceiling
+    // charges each reply its bytes AND its boundary, so what fits is fewer
+    // than the bytes alone would suggest.
+    assert!(replies.iter().all(|reply| reply == b"\x1b[1;1R"));
+    assert_eq!(
+        replies.len(),
+        MAX_REPLY_BYTES / (b"\x1b[1;1R".len() + std::mem::size_of::<usize>())
+    );
+    assert!(flat.len() <= MAX_REPLY_BYTES);
     assert!(terminal.take_bell());
     assert!(terminal.replies().is_empty());
     terminal.feed(b"\x1b[5n");
-    assert_eq!(terminal.take_replies(), b"\x1b[0n");
+    assert_eq!(terminal.take_replies(), vec![b"\x1b[0n".to_vec()]);
     assert!(terminal.replies().is_empty());
+
+    // ORDER, which needs two replies that differ: identical ones cannot tell
+    // the queue apart from its reverse, and a program matching answers to the
+    // questions it asked reads them positionally.
+    terminal.feed(b"\x1b[c\x1b[5n");
+    assert_eq!(
+        terminal.take_replies(),
+        vec![b"\x1b[?1;0c".to_vec(), b"\x1b[0n".to_vec()]
+    );
 }
 
 #[test]

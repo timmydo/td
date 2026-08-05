@@ -6,10 +6,11 @@
 //!
 //! `term_client::run` opens a `Pty`, sizes it to the grid the compositor
 //! chose — so the readiness line names a grid something was actually set to —
-//! and then starts the child on it: the slave, the reader thread and the
-//! waiter thread all have production callers. What is left unwired is the
-//! WRITER half, which is keyboard input and its own landing. Host tests drive
-//! every item against a real PTY, and `selftest` covers the policy layer
+//! and then starts the child on it: the slave and all three threads — reader,
+//! waiter and writer — have production callers. What is left unwired is the
+//! keyboard, which is a Wayland seat rather than anything here; the queue the
+//! writer drains already carries the answers the model composes. Host tests
+//! drive every item against a real PTY, and `selftest` covers the policy layer
 //! inside the packaged binary, where devpts may not be mounted. Each item
 //! still unwired carries its own `dead_code` allow rather than the module
 //! carrying one, so what is left is visible.
@@ -473,7 +474,6 @@ pub fn write_input(master: &File, queue: &mut crate::keys::InputQueue) -> Result
 /// §12 requires the main loop to enqueue without blocking and the master is
 /// blocking — a child that stops reading parks the writer indefinitely once the
 /// line discipline fills.
-#[allow(dead_code)]
 pub struct Input {
     pending: Mutex<Pending>,
     ready: Condvar,
@@ -485,7 +485,6 @@ struct Pending {
     failed: Option<String>,
 }
 
-#[allow(dead_code)]
 impl Input {
     pub fn new() -> Arc<Input> {
         Arc::new(Input {
@@ -544,6 +543,10 @@ impl Input {
     /// handle is joinable only for a writer that is not inside a write, and
     /// td-term's teardown is process exit rather than a join, exactly as it is
     /// for the reader.
+    // Not on td-term's own teardown path, which is process exit rather than a
+    // close (§12), so this is exercised by tests and by whatever ends a
+    // terminal without ending the process.
+    #[allow(dead_code)]
     pub fn close(&self) -> Result<(), String> {
         let mut pending = self.pending.lock().map_err(|_| POISONED)?;
         pending.closed = true;
@@ -612,7 +615,6 @@ fn pump(sink: &mut impl Write, input: &Input) -> Result<(), String> {
 ///
 /// The handle is joinable, but see [`Input::close`] for WHEN: closing wakes a
 /// writer waiting for bytes, not one already inside a blocking `write`.
-#[allow(dead_code)]
 pub fn spawn_writer(
     master: File,
     input: Arc<Input>,
