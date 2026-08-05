@@ -363,28 +363,28 @@ impl ScriptParser<'_> {
         Ok(Some(self.regexes.len() - 1))
     }
 
-    /// A `/re/` or `\cREc` address, consuming the `I`/`M` modifiers that follow --
-    /// except under `--posix`, which withdraws them; see the body.
+    /// A `/re/` or `\cREc` address, consuming the blanks before an `I`/`M`
+    /// modifier and the modifiers themselves -- except under `--posix`, which
+    /// withdraws the modifiers but still crosses the blanks; see the body.
     fn parse_regex_addr(&mut self, delim: u8) -> Result<AddrKind, String> {
         let raw = self.read_delimited(delim, "unterminated address regex")?;
         let mut icase = false;
         let mut multiline = false;
-        // `I` and `M` after an address regex are GNU's, so `--posix` leaves them
-        // unread and each is met as a command: `--posix -n '/A/Ip'` is
-        // `unknown command: `I''. The s/// flags of the same names go too, but
-        // through the `s` parser's own catch-all rather than here.
-        while !self.posix {
+        // GNU reads each modifier through `in_nonblank` and asks about
+        // posixicity only afterwards, so a blank is crossed ahead of one and
+        // BETWEEN two (`/a/ I M p` is one address with both) -- and under
+        // `--posix`, where the letter is then met as a command instead.
+        loop {
+            self.skip_blank();
+            if self.posix {
+                break;
+            }
             match self.peek() {
-                Some(b'I') => {
-                    icase = true;
-                    self.pos += 1;
-                }
-                Some(b'M') => {
-                    multiline = true;
-                    self.pos += 1;
-                }
+                Some(b'I') => icase = true,
+                Some(b'M') => multiline = true,
                 _ => break,
             }
+            self.pos += 1;
         }
         Ok(AddrKind::Rx(self.add_regex(&raw, icase, multiline)?))
     }

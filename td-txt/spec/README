@@ -1189,6 +1189,19 @@ td-txt-authored case files
     not when this was written, the offset being the last piece of the diagnostic
     locus to land.
 
+  - `v` DISCARDS its own address in GNU, which only the empty regex can show.
+    GNU's `case 'v'` ends in `continue` rather than `break` (compile.c:1081),
+    so the command slot is never committed and the address goes with it --
+    `sed -n '//v'` exits 0 in silence, the `//` never reaching a line. td-txt
+    keeps the command, so the empty regex is evaluated and there is no earlier
+    one: `no previous regular expression`, exit 1. Every non-empty spelling
+    agrees (`/a/v`, `1v`), the address being compiled and then merely unused,
+    which is why the shape hides. `v`'s other half of that `continue` --
+    setting posixicity back to EXTENDED, so a `v` would turn `--posix` off for
+    the rest of a script -- is unreachable in both programs, `--posix`
+    withdrawing `v` itself. Found while sweeping for the address-modifier
+    landing and outside it.
+
   - `R /dev/stdin` HANGS here when stdin is a fifo whose writer has gone, where
     GNU prints its line and carries on: GNU opens `R` sources at compile time and
     aliases the literal `/dev/stdin` to its own stdin stream, while `read_source`
@@ -1201,19 +1214,6 @@ td-txt-authored case files
     its own stdin stream, `sed -n 'R /dev/stdin' F < a-directory` says
     `read error on stdin` where td-txt names the file it really opened,
     `/dev/stdin`. Both exit 4. An OPERAND spelled `-` does say `stdin` now.
-
-  - Blanks before an address regex's `I`/`M` modifier: GNU reads it through
-    `in_nonblank` inside a loop (compile.c:909-912), so blanks are crossed
-    before AND between the modifiers, and `sed -n '/a/ Ip'` matches
-    case-insensitively there. td-txt peeks directly with no skip, so the same
-    script is `unknown command: `I''. Fail-CLOSED, both modes, identical on the
-    parent, so it predates the branch. It is the ONE site where the
-    whitespace-class audit behind the ISSPACE landing came back NO: every other
-    place GNU crosses ISBLANK -- labels, filenames, `a`/`i`/`c` text, `s`/`y`
-    flags, the numeric arguments, addresses, the step, the `,` and the `!` --
-    td-txt already crosses. Recorded rather than fixed there because it is a
-    different site and a different whitespace class from the one that landing
-    changed.
 
   - A diagnostic that QUOTES A BYTE differs for 129 of the 256: GNU emits the
     raw byte, td-txt renders it through `char::from`, so every byte from 0x80 up

@@ -11215,3 +11215,199 @@ xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx$
 ## stdout-json: ""
 ## stderr-json: "sed: file at.sed line 2: expected \\ after `a', `c' or `i'\n"
 ## status: 1
+
+
+# --- The blanks GNU crosses to reach an address regex's `I'/`M' modifier. Its
+# --- loop reads each through `in_nonblank' and asks about posixicity only
+# --- after, so a blank falls before a modifier and BETWEEN two -- and under
+# --- `--posix' the blanks are crossed as well, the byte then being put back to
+# --- be met as a command.
+
+#### a blank before an address regex's `I' is crossed, as GNU's in_nonblank does
+## argv: sed -n '/a/ Ip' B
+## file-json B: "A1\na2\nB3\n"
+## stdin-json: ""
+## stdout-json: "A1\na2\n"
+## stderr-json: ""
+## status: 0
+
+#### several, and a tab is one too
+## argv: sed -n "/a/\t \tIp" B
+## file-json B: "A1\na2\nB3\n"
+## stdin-json: ""
+## stdout-json: "A1\na2\n"
+## stderr-json: ""
+## status: 0
+
+#### `M' is the other modifier and reads the same way
+## argv: sed -n '/a/ Mp' B
+## file-json B: "A1\na2\nB3\n"
+## stdin-json: ""
+## stdout-json: "a2\n"
+## stderr-json: ""
+## status: 0
+
+#### and the loop crosses them BETWEEN modifiers, not just before the first
+## argv: sed -n '/a/ I Mp' B
+## file-json B: "A1\na2\nB3\n"
+## stdin-json: ""
+## stdout-json: "A1\na2\n"
+## stderr-json: ""
+## status: 0
+
+#### ... in either order
+## argv: sed -n '/a/ M I p' B
+## file-json B: "A1\na2\nB3\n"
+## stdin-json: ""
+## stdout-json: "A1\na2\n"
+## stderr-json: ""
+## status: 0
+
+#### the unspaced spelling is unchanged
+## argv: sed -n /a/IMp B
+## file-json B: "A1\na2\nB3\n"
+## stdin-json: ""
+## stdout-json: "A1\na2\n"
+## stderr-json: ""
+## status: 0
+
+#### a `\%re%' address takes them the same way
+## argv: sed -n '\%a% Ip' B
+## file-json B: "A1\na2\nB3\n"
+## stdin-json: ""
+## stdout-json: "A1\na2\n"
+## stderr-json: ""
+## status: 0
+
+#### ... and so does a range's SECOND address
+## argv: sed -n '1,/a/ Ip' B
+## file-json B: "A1\na2\nB3\n"
+## stdin-json: ""
+## stdout-json: "A1\na2\n"
+## stderr-json: ""
+## status: 0
+
+#### a modifier with no command after it is `missing command', not an unknown one
+## argv: sed -n '/a/ I' B
+## file-json B: "A1\na2\nB3\n"
+## stdin-json: ""
+## stdout-json: ""
+## stderr-json: "sed: -e expression #1, char 5: missing command\n"
+## status: 1
+
+#### ... at the same place a bare blank leaves it
+## argv: sed -n '/a/ ' B
+## file-json B: "A1\na2\nB3\n"
+## stdin-json: ""
+## stdout-json: ""
+## stderr-json: "sed: -e expression #1, char 4: missing command\n"
+## status: 1
+
+#### a byte that is not a modifier is still met as a command
+## argv: sed -n '/a/ Z' B
+## file-json B: "A1\na2\nB3\n"
+## stdin-json: ""
+## stdout-json: ""
+## stderr-json: "sed: -e expression #1, char 5: unknown command: `Z'\n"
+## status: 1
+
+#### `--posix' withdraws the modifiers, so the blank leads to the letter as a command
+## argv: sed -n --posix '/a/ Ip' B
+## file-json B: "A1\na2\nB3\n"
+## stdin-json: ""
+## stdout-json: ""
+## stderr-json: "sed: -e expression #1, char 5: unknown command: `I'\n"
+## status: 1
+
+#### ... which is what it does unspaced too
+## argv: sed -n --posix /a/Ip B
+## file-json B: "A1\na2\nB3\n"
+## stdin-json: ""
+## stdout-json: ""
+## stderr-json: "sed: -e expression #1, char 4: unknown command: `I'\n"
+## status: 1
+
+#### the `s' flags already read this way and still do
+## argv: sed -n 's/a/b/ I p' B
+## file-json B: "A1\na2\nB3\n"
+## stdin-json: ""
+## stdout-json: "b1\nb2\n"
+## stderr-json: ""
+## status: 0
+
+
+# --- The two forms at the edges of that loop: the EMPTY regex, whose own
+# --- refusal is positioned after it, and `$', which takes no modifier at all
+# --- so a blank in front of one must start no loop.
+
+#### the EMPTY regex takes a modifier too, and refuses it past the blanks crossed
+## argv: sed -n '// I  p' B
+## file-json B: "A1\na2\nB3\nA4\n"
+## stdin-json: ""
+## stdout-json: ""
+## stderr-json: "sed: -e expression #1, char 6: cannot specify modifiers on empty regexp\n"
+## status: 1
+
+#### ... which is where an unspaced one already stopped
+## argv: sed -n //Ip B
+## file-json B: "A1\na2\nB3\nA4\n"
+## stdin-json: ""
+## stdout-json: ""
+## stderr-json: "sed: -e expression #1, char 3: cannot specify modifiers on empty regexp\n"
+## status: 1
+
+#### ... and the count follows the blanks, not the modifier
+## argv: sed -n '//I ' B
+## file-json B: "A1\na2\nB3\nA4\n"
+## stdin-json: ""
+## stdout-json: ""
+## stderr-json: "sed: -e expression #1, char 4: cannot specify modifiers on empty regexp\n"
+## status: 1
+
+#### `\%%' is the same empty regex and answers the same way
+## argv: sed -n '\%%  I  p' B
+## file-json B: "A1\na2\nB3\nA4\n"
+## stdin-json: ""
+## stdout-json: ""
+## stderr-json: "sed: -e expression #1, char 8: cannot specify modifiers on empty regexp\n"
+## status: 1
+
+#### `$' takes NO modifier, so a blank before one starts no loop
+## argv: sed -n '$ Ip' B
+## file-json B: "A1\na2\nB3\nA4\n"
+## stdin-json: ""
+## stdout-json: ""
+## stderr-json: "sed: -e expression #1, char 3: unknown command: `I'\n"
+## status: 1
+
+#### ... as the unspaced spelling already showed
+## argv: sed -n '$Ip' B
+## file-json B: "A1\na2\nB3\nA4\n"
+## stdin-json: ""
+## stdout-json: ""
+## stderr-json: "sed: -e expression #1, char 2: unknown command: `I'\n"
+## status: 1
+
+#### nor does a range whose second address is `$'
+## argv: sed -n '/a/,$ Ip' B
+## file-json B: "A1\na2\nB3\nA4\n"
+## stdin-json: ""
+## stdout-json: ""
+## stderr-json: "sed: -e expression #1, char 7: unknown command: `I'\n"
+## status: 1
+
+#### every modifier sequence reads the same, spaced or not
+## argv: sed -n '/a/ M I M p' B
+## file-json B: "A1\na2\nB3\nA4\n"
+## stdin-json: ""
+## stdout-json: "A1\na2\nA4\n"
+## stderr-json: ""
+## status: 0
+
+#### ... including the repeats GNU allows
+## argv: sed -n '/a/ I I M M p' B
+## file-json B: "A1\na2\nB3\nA4\n"
+## stdin-json: ""
+## stdout-json: "A1\na2\nA4\n"
+## stderr-json: ""
+## status: 0
