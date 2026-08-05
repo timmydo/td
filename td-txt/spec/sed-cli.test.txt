@@ -7982,6 +7982,200 @@ r R
 ## stderr-json: ""
 ## status: 0
 
+#### a +N first address is refused: it has nothing to count from
+# The last compile-time address rule GNU has, and the one the addressed-comment
+# block's count points forward to. GNU reads `+N'/`~N' through one `compile_address' in
+# either position, then refuses a stride as a FIRST address, where there is
+# no start line to count from. td-txt had no spelling of the message at all:
+# `+' was read as a command and the whole family said `unknown command'.
+## argv: sed -n +2p A
+## file-json A: "a1\na2\na3\na4\n"
+## stdin-json: ""
+## stdout-json: ""
+## stderr-contains: invalid usage of +N or ~N as first address
+## status: 1
+
+#### and so is ~N, which is the same address form
+## argv: sed -n ~2p A
+## file-json A: "a1\na2\na3\na4\n"
+## stdin-json: ""
+## stdout-json: ""
+## stderr-contains: invalid usage of +N or ~N as first address
+## status: 1
+
+#### the refusal beats the range, so the comma is never read
+## argv: sed -n +2,3p A
+## file-json A: "a1\na2\na3\na4\n"
+## stdin-json: ""
+## stdout-json: ""
+## stderr-contains: invalid usage of +N or ~N as first address
+## status: 1
+
+#### and beats the bang too
+## argv: sed -n '+2!p' A
+## file-json A: "a1\na2\na3\na4\n"
+## stdin-json: ""
+## stdout-json: ""
+## stderr-contains: invalid usage of +N or ~N as first address
+## status: 1
+
+#### a blank before the step does not hide it
+## argv: sed -n '+ 2p' A
+## file-json A: "a1\na2\na3\na4\n"
+## stdin-json: ""
+## stdout-json: ""
+## stderr-contains: invalid usage of +N or ~N as first address
+## status: 1
+
+#### but a step of 0 is not a stride at all -- it matches EVERY line
+## argv: sed -n +0p A
+## file-json A: "a1\na2\na3\na4\n"
+## stdin-json: ""
+## stdout-json: "a1\na2\na3\na4\n"
+## stderr-json: ""
+## status: 0
+
+#### which is what a bare + is, the digits being absent rather than 0
+## argv: sed -n +p A
+## file-json A: "a1\na2\na3\na4\n"
+## stdin-json: ""
+## stdout-json: "a1\na2\na3\na4\n"
+## stderr-json: ""
+## status: 0
+
+#### ~ reads the same, since one routine reads both
+## argv: sed -n ~p A
+## file-json A: "a1\na2\na3\na4\n"
+## stdin-json: ""
+## stdout-json: "a1\na2\na3\na4\n"
+## stderr-json: ""
+## status: 0
+
+#### and so does a blank where the digits would be
+## argv: sed -n '+ p' A
+## file-json A: "a1\na2\na3\na4\n"
+## stdin-json: ""
+## stdout-json: "a1\na2\na3\na4\n"
+## stderr-json: ""
+## status: 0
+
+#### leading zeros are still zero
+## argv: sed -n +00p A
+## file-json A: "a1\na2\na3\na4\n"
+## stdin-json: ""
+## stdout-json: "a1\na2\na3\na4\n"
+## stderr-json: ""
+## status: 0
+
+#### the always-match is a real address, so a bang negates it
+## argv: sed -n '+0!p' A
+## file-json A: "a1\na2\na3\na4\n"
+## stdin-json: ""
+## stdout-json: ""
+## stderr-json: ""
+## status: 0
+
+#### and a doubled bang is still the bang complaint
+## argv: sed -n '+0!!p' A
+## file-json A: "a1\na2\na3\na4\n"
+## stdin-json: ""
+## stdout-json: ""
+## stderr-contains: multiple `!'s
+## status: 1
+
+#### it opens a range, which RE-ARMS after closing as a regex start does
+## argv: sed -n +0,3p A
+## file-json A: "a1\na2\na3\na4\n"
+## stdin-json: ""
+## stdout-json: "a1\na2\na3\na4\n"
+## stderr-json: ""
+## status: 0
+
+#### even against an end that matches, since the start always does
+## argv: sed -n +0,/a2/p A
+## file-json A: "a1\na2\na3\na4\n"
+## stdin-json: ""
+## stdout-json: "a1\na2\na3\na4\n"
+## stderr-json: ""
+## status: 0
+
+# Three cases a reviewer's surviving mutations asked for: the two above pin
+# that the range RE-ARMS, but with no line-number start every line is selected
+# on its opening line, so nothing distinguished "start of a range" from "always
+# true". An end BEHIND the start, an end OVERSHOT by `N', and `c' -- which
+# prints once per range rather than once per line -- each do.
+#### an end BEHIND every start closes at once, since the start is not line 0
+## argv: sed -n +0,0p A
+## file-json A: "a1\na2\na3\na4\n"
+## stdin-json: ""
+## stdout-json: "a1\na2\na3\na4\n"
+## stderr-json: ""
+## status: 0
+
+#### and an end OVERSHOT by N shows the range selecting, not the start
+## argv: sed -n -e N -e +0,3p A
+## file-json A: "a1\na2\na3\na4\n"
+## stdin-json: ""
+## stdout-json: "a1\na2\n"
+## stderr-json: ""
+## status: 0
+
+#### c prints once per RANGE, which is the other half a start-only test misses
+## argv: sed -n '+0,2c\X' A
+## file-json A: "a1\na2\na3\na4\n"
+## stdin-json: ""
+## stdout-json: "X\nX\nX\n"
+## stderr-json: ""
+## status: 0
+
+#### with no address at all the command runs everywhere, as ever
+## argv: sed -n p A
+## file-json A: "a1\na2\na3\na4\n"
+## stdin-json: ""
+## stdout-json: "a1\na2\na3\na4\n"
+## stderr-json: ""
+## status: 0
+
+#### a real step is still a range END, which is where it counts from
+## argv: sed -n 1,+2p A
+## file-json A: "a1\na2\na3\na4\n"
+## stdin-json: ""
+## stdout-json: "a1\na2\na3\n"
+## stderr-json: ""
+## status: 0
+
+#### and ~N there is the multiple, not the stride
+## argv: sed -n 1,~2p A
+## file-json A: "a1\na2\na3\na4\n"
+## stdin-json: ""
+## stdout-json: "a1\na2\n"
+## stderr-json: ""
+## status: 0
+
+#### --posix has no +N address, so the + is read as a command
+## argv: sed --posix -n +p A
+## file-json A: "a1\na2\na3\na4\n"
+## stdin-json: ""
+## stdout-json: ""
+## stderr-contains: unknown command: `+'
+## status: 1
+
+#### and the refusal is withdrawn with it
+## argv: sed --posix -n +2p A
+## file-json A: "a1\na2\na3\na4\n"
+## stdin-json: ""
+## stdout-json: ""
+## stderr-contains: unknown command: `+'
+## status: 1
+
+#### a lone + is an address with no command after it
+## argv: sed -n + A
+## file-json A: "a1\na2\na3\na4\n"
+## stdin-json: ""
+## stdout-json: ""
+## stderr-contains: missing command
+## status: 1
+
 #### --posix refuses a text continued past the end of its part
 # Not just the command's own backslash: one after the TEXT crosses the same
 # boundary and is refused the same way. Through `-f' because the newline
@@ -9681,9 +9875,12 @@ xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx$
 # of FOUR rules GNU enforces at compile time for HOW MANY addresses a command
 # takes -- `#`, `}` and `:` take none, `q`/`Q` take one -- plus a fifth that
 # holds only under `--posix`, where `=`, `a`, `i`, `l` and `r` take one. That
-# count is exhaustive over THAT family and no wider: address 0 (legal with `r`
-# alone) and `+N`/`~N` as a first address are compile-time address rules too,
-# both still open and recorded in spec/README. The `!` is not an address, so
+# family is a subset of a larger one, now closed: every compile-time check GNU
+# makes against a parsed ADDRESS -- these five, `unexpected `,'', `multiple
+# `!'s', address 0 and a leading `+N'/`~N' -- has a case here. The other two
+# arrived after this block and are cased where they landed, which is why this
+# note points forward rather than at spec/README, where they used to be
+# recorded as open. The `!` is not an address, so
 # `!#` is still a comment, and an UNaddressed `#` inside a block still swallows
 # the closing brace with the rest of its line.
 

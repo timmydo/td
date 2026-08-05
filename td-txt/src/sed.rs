@@ -46,6 +46,9 @@ enum AddrKind {
     Step { first: u64, step: u64 },
     /// `0` as the start of a range, so the end regex may match on line 1.
     Zero,
+    /// What a `+`/`~` with a step of 0 leaves behind: an address that matches
+    /// every line, which is how `sed -n '+p'` prints all of them.
+    Always,
 }
 
 #[derive(Debug)]
@@ -459,6 +462,24 @@ impl ScriptParser<'_> {
                 self.pos += 1;
                 let delim = self.bump().ok_or_else(|| "unterminated address".to_string())?;
                 Ok(Some(self.parse_regex_addr(delim)?))
+            }
+            // `+N`/`~N` is an address FORM in any position, not only after a
+            // comma -- GNU reads both through one `compile_address` -- but a
+            // stride with nothing to count FROM is refused as a first address.
+            // Step 0 is not a stride: it leaves the address with no type at all,
+            // and an untyped address matches every line, so `+p` and `~p` run
+            // and print all of them. Absent digits ARE 0, as everywhere else
+            // GNU reads a step, so a bare `+` is that same always-match; a
+            // number past 2^64 WRAPS like GNU's, so `+2^64` is `+0`. The
+            // message names the first address because only a first address
+            // reaches here -- `parse_addr` takes `+`/`~` after a comma itself.
+            Some(b'+' | b'~') if !self.posix => {
+                self.pos += 1;
+                self.skip_blank();
+                match self.parse_number().unwrap_or(0) {
+                    0 => Ok(Some(AddrKind::Always)),
+                    _ => Err("invalid usage of +N or ~N as first address".to_string()),
+                }
             }
             Some(b) if b.is_ascii_digit() => {
                 let n = self.parse_number().unwrap_or(0);
@@ -1241,9 +1262,10 @@ fn parse_script(
                 // One of the FOUR rules GNU enforces at compile time for HOW
                 // MANY addresses a command takes: `#`, `}` and `:` take none,
                 // `q`/`Q` take one; a fifth holds under `--posix`, above. That
-                // count is exhaustive over THIS family only -- address 0 (legal
-                // with `r` alone) and `+N`/`~N` as a first address are
-                // compile-time address rules too, and both are still open.
+                // family is a subset of a larger one now closed: every
+                // compile-time check GNU makes against a parsed ADDRESS --
+                // these five, `unexpected `,'`, `multiple `!'s`, address 0 and
+                // a leading `+N`/`~N` -- is implemented here.
                 if addr.a1.is_some() {
                     return Err(": doesn't want any addresses".to_string().into());
                 }
@@ -1811,6 +1833,7 @@ fn kind_matches(
     match kind {
         AddrKind::Line(n) => Ok((line_number == *n, None)),
         AddrKind::Zero => Ok((false, None)),
+        AddrKind::Always => Ok((true, None)),
         // Asked HERE and nowhere else, because asking OPENS the next operand:
         // a `$` that is never evaluated -- the end of a range that has not
         // started -- must not open one. GNU's `match_address_p` reaches its

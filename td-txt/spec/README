@@ -154,8 +154,9 @@ td-txt-authored case files
   The same campaign against SED, whose corpus had had none, found six — and its
   noise bucket was one flag rather than a regex corner. `--posix` dominated every
   early run, because GNU's `--posix` disables GNU's own extensions and refuses
-  twelve constructs td-txt accepts (`first~step`, `addr,+N`, `addr,~N`, `0,/re/`,
-  `s///I`, `s///M`, `Q`, `T`, `z`, `F`, one-liner `a text`, `q5`) while turning
+  thirteen constructs td-txt accepts (`first~step`, a leading `+N`/`~N`,
+  `addr,+N`, `addr,~N`, `0,/re/`, `s///I`, `s///M`, `Q`, `T`, `z`, `F`,
+  one-liner `a text`, `q5`) while turning
   `\U\L\u\l\E` and BRE `\+ \? \| \w` into literals. When this campaign ran,
   td-txt implemented `--posix` for exactly ONE of those (`N` at end of input) and
   silently ignored the rest, so every script that mixed the flag with an extension
@@ -1217,7 +1218,10 @@ td-txt-authored case files
   - An address left dangling at the end of an `-e` part: `sed -e '2' -e 'p'` is
     `missing command` in GNU and `unknown command: `\n'` here. Both modes,
     predates the branch, exit 1 either way -- same family as the other
-    diagnostic-wording gaps above.
+    diagnostic-wording gaps above. Every address form reaches it, `+` and `~`
+    included since they became addresses; that spelling used to stop at
+    `unknown command: `+'` one step earlier, for a reason unrelated to the
+    dangle.
 
   - `s//\N/` -- the empty regex reusing the last one -- is unchecked here and
     only half-unchecked in GNU: `/\(a\)/s//\2/` and `/a/s//\1/` are refused
@@ -1241,29 +1245,16 @@ td-txt-authored case files
     in GNU and `can't operate on label `ar'` here -- the same refusal, worded
     differently. Both modes, predates the branch.
 
-  - Four divergences a sweep of every command letter x {bare, addressed,
+  - Three divergences a sweep of every command letter x {bare, addressed,
     ranged} x {flag, no flag} turned up, none of them about `--posix` and all
     of them predating this branch, recorded here because that sweep is how the
-    one-address rule above was found and these came with it: a leading `+`
-    or `~` is its own family, understated in an earlier draft of this entry
-    and set out separately below; a bare `\` is `unterminated address regex`
-    there and `unterminated address` here; the usage line after a bad option
-    is `Usage: sed [OPTION]...` there and `usage: sed [-nrEsz]...` here,
-    differing in capital and in content; and `sed L` is `sed: INTERNAL ERROR:
+    one-address rule above was found and these came with it: a bare `\` is
+    `unterminated address regex` there and `unterminated address` here; the
+    usage line after a bad option is `Usage: sed [OPTION]...` there and
+    `usage: sed [-nrEsz]...` here, differing in capital and in content; and
+    `sed L` is `sed: INTERNAL ERROR:
     Bad cmd L` at exit 4 in GNU, an obsolete command left in its table, where
     td-txt says `unknown command: `L''.
-
-  - A leading `+` or `~` is THREE answers in GNU, not one, and only the first
-    is the diagnostic-wording gap an earlier draft above called it. GNU's
-    `compile_address` absorbs a `+`/`~` whose number is ABSENT and reports
-    "not an address", so the rest of the script runs: `sed '+p'` and `sed '~p'`
-    exit 0 having printed every line twice, where td-txt refuses -- a
-    behavioural divergence, not wording. With a number it is a third message
-    td-txt has no spelling of at all: `sed '+2p'` is `invalid usage of +N or
-    ~N as first address`. Only the bare `sed '+'` is the `missing command` vs
-    `unknown command` wording difference. All of it predates the branch and is
-    identical on the branch point; the entry is corrected because a reviewer
-    measured what the earlier wording had asserted.
 
   - An unterminated `\{` after a QUANTIFIED atom picks the other complaint:
     `sed 's/a*\{b/Z/'` is `Invalid preceding regular expression` in GNU and
