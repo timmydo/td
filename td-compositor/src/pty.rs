@@ -1275,7 +1275,7 @@ mod tests {
     #[test]
     fn the_writer_delivers_what_was_enqueued_and_retires_on_close() {
         let pty = open_pty();
-        let mut slave = pty.peer().unwrap();
+        let slave = pty.peer().unwrap();
         let input = Input::new();
         // The writer takes a CLONE, as it will in the client: the reader owns
         // one too, and a writer holding the only master would hang the

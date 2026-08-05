@@ -710,8 +710,13 @@ landed: the image mounts it at sysinit
 through a `td-init` applet, pins `CONFIG_UNIX98_PTYS=y`, and re-proves the
 mount options, the `/dev/ptmx` symlink and the instance `ptmx` on the booted
 machine. Section 12's readiness socket, `TD-TERM-READY` marker, and `probe`
-subcommand are not built. The Wayland client, packaging,
-and boot cutover of sections 12 and 14 follow them; the terminfo entry is
+subcommand are landed, along with the `td-term` name itself: one artifact
+serves three programs, chosen by argv[0], and the store output carries the
+terminal as a symlink beside the compositor. The `/bin/td-term` name §12 spells
+and the `ready=` line that calls it are packaging, and land with it. What has
+no caller yet is the publisher —
+deciding a terminal IS ready belongs to the Wayland client. The Wayland client,
+packaging, and boot cutover of sections 12 and 14 follow; the terminfo entry is
 landed. Until that client exists the PTY adapter has no production caller;
 its host tests drive every operation against a real PTY, and the packaged
 binary's selftest covers the policy layer, which is what runs where devpts is
@@ -1305,7 +1310,13 @@ deadline bounds failure detection rather than ordering state transitions.
 
 td-term exposes a mode-0600 readiness socket and prints `TD-TERM-READY` with
 its rows and columns only after the exact tile-sized buffer receives both
-`wl_buffer.release` and its frame callback. td-svc's `ready=` command uses the
+`wl_buffer.release` and its frame callback. One encoder produces both the
+diagnostic and the socket's answer, since the integration test compares them
+and two spellings could drift while each stayed plausible. A readiness line is
+parsed fail-closed and order-pinned, and its grid is held to the same
+definition the winsize ioctl is: a line describing a grid no terminal could
+have been set to is not readiness. The terminal refuses to publish a grid its
+own probe would reject. td-svc's `ready=` command uses the
 existing credential-switch pattern to invoke
 `/bin/td-term probe /run/user/1000/td-term-ready` as the graphical user. The
 probe requires a ready state and nonzero internally consistent rows and

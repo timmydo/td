@@ -12,6 +12,7 @@ mod launcher;
 mod layout;
 mod pointer;
 mod pty;
+mod ready;
 mod render;
 mod runtime;
 mod scene;
@@ -44,6 +45,72 @@ fn client_usage() -> String {
     "usage: td-ui-demo run --socket PATH --ready-socket PATH | \
      td-ui-demo probe READY_SOCKET | td-ui-demo selftest"
         .into()
+}
+
+fn term_usage() -> String {
+    "usage: td-term probe READY_SOCKET | td-term selftest".into()
+}
+
+/// Which program this binary was invoked as. Three names, one artifact: the
+/// terminal ships as a symlink beside the compositor rather than as a second
+/// build of the same modules.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Personality {
+    Compositor,
+    Demo,
+    Term,
+}
+
+impl Personality {
+    fn of(executable: &str) -> Personality {
+        match Path::new(executable).file_name().and_then(|name| name.to_str()) {
+            Some("td-ui-demo") => Personality::Demo,
+            Some("td-term") => Personality::Term,
+            _ => Personality::Compositor,
+        }
+    }
+
+    fn program(self) -> &'static str {
+        match self {
+            Personality::Compositor => "td-compositor",
+            Personality::Demo => "td-ui-demo",
+            Personality::Term => "td-term",
+        }
+    }
+}
+
+/// The terminal's own entry point. `run` lands with the Wayland client that
+/// composes the PTY adapter and the renderer; until then this serves the two
+/// commands that need no surface — the readiness probe td-svc calls, and the
+/// packaged binary's self-check.
+/// The terminal's three self-checks and the marker that says all three ran.
+/// Where it writes is a parameter so the marker is a tested string rather than
+/// one nobody reads.
+fn term_selftest(out: &mut impl std::io::Write) -> Result<(), String> {
+    term::selftest()?;
+    pty::selftest()?;
+    ready::selftest()?;
+    writeln!(out, "TD-TERM-SELFTEST-OK").map_err(|e| format!("write selftest marker: {e}"))
+}
+
+fn run_term(args: &[String]) -> Result<(), String> {
+    let command = args.first().ok_or_else(term_usage)?;
+    match command.as_str() {
+        "probe" => {
+            let socket = args.get(1).ok_or_else(term_usage)?;
+            if args.get(2).is_some() {
+                return Err(term_usage());
+            }
+            ready::probe(Path::new(socket))
+        }
+        "selftest" => {
+            if args.get(1).is_some() {
+                return Err(term_usage());
+            }
+            term_selftest(&mut std::io::stdout())
+        }
+        _ => Err(term_usage()),
+    }
 }
 
 struct RunOptions {
@@ -242,22 +309,14 @@ fn main() {
     let mut argv = env::args();
     let executable = argv.next().unwrap_or_default();
     let args: Vec<String> = argv.collect();
-    let is_client = Path::new(&executable)
-        .file_name()
-        .and_then(|name| name.to_str())
-        == Some("td-ui-demo");
-    let result = if is_client {
-        run_client(&args)
-    } else {
-        run(&args)
+    let personality = Personality::of(&executable);
+    let result = match personality {
+        Personality::Compositor => run(&args),
+        Personality::Demo => run_client(&args),
+        Personality::Term => run_term(&args),
     };
     if let Err(error) = result {
-        let program = if is_client {
-            "td-ui-demo"
-        } else {
-            "td-compositor"
-        };
-        eprintln!("{program}: {error}");
+        eprintln!("{}: {error}", personality.program());
         process::exit(1);
     }
 }
@@ -265,6 +324,46 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_three_names_pick_the_three_programs() {
+        // Whatever path the symlink is reached by, only the file name decides.
+        assert!(Personality::of("/bin/td-term") == Personality::Term);
+        assert!(Personality::of("td-term") == Personality::Term);
+        assert!(Personality::of("/td/store/x-td-compositor/bin/td-term") == Personality::Term);
+        assert!(Personality::of("/bin/td-ui-demo") == Personality::Demo);
+        assert!(Personality::of("/bin/td-compositor") == Personality::Compositor);
+        // An unknown name is the compositor, as it was before td-term existed.
+        assert!(Personality::of("/bin/something-else") == Personality::Compositor);
+        assert!(Personality::of("") == Personality::Compositor);
+        // A name that merely CONTAINS one is not that one.
+        assert!(Personality::of("/bin/td-terminal") == Personality::Compositor);
+        assert!(Personality::of("/bin/td-term/") == Personality::Term);
+        for personality in [
+            Personality::Compositor,
+            Personality::Demo,
+            Personality::Term,
+        ] {
+            assert_eq!(Personality::of(personality.program()), personality);
+        }
+    }
+
+    #[test]
+    fn the_terminal_serves_only_what_it_can_serve_yet() {
+        // `run` lands with the Wayland client; until then it is not a command,
+        // and neither is anything else that is not spelled out.
+        assert!(run_term(&[]).is_err());
+        assert!(run_term(&["run".into()]).is_err());
+        assert!(run_term(&["probe".into()]).is_err());
+        assert!(run_term(&["probe".into(), "/nonexistent".into()]).is_err());
+        assert!(run_term(&["probe".into(), "/a".into(), "/b".into()]).is_err());
+        assert!(run_term(&["selftest".into(), "extra".into()]).is_err());
+        run_term(&["selftest".into()]).unwrap();
+        // The marker is the terminal's own, not the compositor's.
+        let mut printed = Vec::new();
+        term_selftest(&mut printed).unwrap();
+        assert_eq!(printed, b"TD-TERM-SELFTEST-OK\n");
+    }
 
     #[test]
     fn launcher_command_round_trips_through_the_client_parser() {
@@ -315,6 +414,7 @@ mod confinement {
         ("layout.rs", include_str!("layout.rs")),
         ("pointer.rs", include_str!("pointer.rs")),
         ("pty.rs", include_str!("pty.rs")),
+        ("ready.rs", include_str!("ready.rs")),
         ("render.rs", include_str!("render.rs")),
         ("runtime.rs", include_str!("runtime.rs")),
         ("scene.rs", include_str!("scene.rs")),
@@ -332,6 +432,22 @@ mod confinement {
 
     fn occurrences(source: &str, needle: &str) -> usize {
         source.match_indices(needle).count()
+    }
+
+    /// The terminal's selftest is a composition, and its marker says all three
+    /// ran. Nothing observable distinguishes two from three — each returns
+    /// `Ok(())` — so the composition is pinned against the source, the way
+    /// this crate pins everything else the compiler cannot see.
+    #[test]
+    fn the_terminals_selftest_covers_all_three_of_its_layers() {
+        let body = MAIN
+            .split("fn term_selftest")
+            .nth(1)
+            .and_then(|rest| rest.split("\nfn ").next())
+            .expect("term_selftest body");
+        for layer in ["term::selftest()?", "pty::selftest()?", "ready::selftest()?"] {
+            assert!(body.contains(layer), "the terminal selftest skips {layer}");
+        }
     }
 
     #[test]

@@ -32,6 +32,7 @@ const MODULES: &[(&str, &str)] = &[
         include_str!("../../../td-compositor/src/pointer.rs"),
     ),
     ("pty", include_str!("../../../td-compositor/src/pty.rs")),
+    ("ready", include_str!("../../../td-compositor/src/ready.rs")),
     (
         "render",
         include_str!("../../../td-compositor/src/render.rs"),
@@ -145,10 +146,17 @@ pub fn recipe() -> Recipe {
             target: "td-compositor".into(),
             link: "{out}/bin/td-ui-demo".into(),
         },
+        // The terminal is the same artifact under a third name, not a second
+        // build of the same modules: argv[0] is what picks the program.
+        Step::Symlink {
+            target: "td-compositor".into(),
+            link: "{out}/bin/td-term".into(),
+        },
         Step::Require {
             paths: vec![
                 "{out}/bin/td-compositor".into(),
                 "{out}/bin/td-ui-demo".into(),
+                "{out}/bin/td-term".into(),
             ],
             exec: true,
         },
@@ -172,7 +180,11 @@ pub fn recipe() -> Recipe {
             paths: vec!["{out}/share/terminfo/t/td-term".into()],
             exec: false,
         },
-        Step::assert_static(&["{out}/bin/td-compositor", "{out}/bin/td-ui-demo"]),
+        Step::assert_static(&[
+            "{out}/bin/td-compositor",
+            "{out}/bin/td-ui-demo",
+            "{out}/bin/td-term",
+        ]),
     ]);
 
     Recipe::mesboot("td-compositor", "0.1")
@@ -212,6 +224,36 @@ mod tests {
         assert!(client.contains(&format!(
             "println!(\"{TD_UI_CLIENT_RUNTIME_MARKER} surface={{}}x{{}}\""
         )));
+    }
+
+    /// One artifact, three names. The symlink is what makes the terminal
+    /// reachable at all: `main` picks its program from argv[0], so a missing
+    /// link is not a build error anywhere — it is an image with no terminal
+    /// and nothing to say so.
+    #[test]
+    fn the_terminal_ships_as_a_name_on_the_compositor() {
+        let steps = recipe().steps.expect("steps");
+        let linked = steps.iter().any(|step| {
+            matches!(step, Step::Symlink { target, link }
+                if target == "td-compositor" && link == "{out}/bin/td-term")
+        });
+        assert!(linked, "nothing installs the td-term name");
+        // A name nothing requires is one a failed link leaves missing with the
+        // build still green, and one nothing asserts static is a name the
+        // image could ship dynamically linked.
+        let required = steps.iter().any(|step| {
+            matches!(step, Step::Require { paths, exec }
+                if *exec && paths.iter().any(|path| path == "{out}/bin/td-term"))
+        });
+        assert!(required, "nothing requires td-term to exist and execute");
+        let asserted = steps.iter().any(|step| {
+            matches!(step, Step::AssertStatic { paths }
+                if paths.iter().any(|path| path == "{out}/bin/td-term"))
+        });
+        assert!(asserted, "nothing asserts td-term is static");
+        // And the binary answers to it. Both halves are needed: a link to a
+        // binary that does not know the name would dispatch to the compositor.
+        assert!(MAIN_RS.contains(r#"Some("td-term") => Personality::Term,"#));
     }
 
     /// The recipe writes the terminfo entry at a path the compositor's own
