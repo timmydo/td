@@ -375,7 +375,7 @@ td's Rust is defensive and minimal-surface.
   |---|-------|----------|
   | 1 | `td-kexec` | `kexec_file_load(2)`, `reboot(2)` |
   | 2 | `td-netd` | `ioctl(2)` |
-  | 3 | `td-init` | ten, one per applet safe `std` cannot reach |
+  | 3 | `td-init` | ten, one per applet safe `std` cannot reach (`ioctl`: four pinned requests) |
   | 4 | `td-login` | `setgroups(2)`, `setgid(2)`, `setuid(2)` |
   | 5 | `td-svc` | `kill(2)` |
   | 6 | `td-compositor` | `recvmsg(2)`, `close(2)`, `sendmsg(2)`, `ioctl(2)` |

@@ -48,8 +48,8 @@ pub enum Containment {
     ///
     /// The only containment that reaches a login tree, and it takes both halves.
     /// `/etc/tty-session` runs `getty` as a child, and getty opens with
-    /// `setsid(2)` — busybox `loginutils/getty.c`, "Create new session and
-    /// pgrp, lose controlling tty" — so `login` and the user's shell are in a
+    /// `setsid(2)` — td-init's applet, as busybox's did: "create new session
+    /// and pgrp, lose controlling tty" — so `login` and the user's shell are in a
     /// session td-svc never created and cannot name from the pid it spawned.
     /// Group and session both stop at the wrapper.
     ///

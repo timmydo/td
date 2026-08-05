@@ -102,11 +102,11 @@ pub fn recipe() -> Recipe {
                 "-c",
                 &format!(
                     "l=$('{bin}' --list) || {{ echo 'td-init --list failed' >&2; exit 1; }}; \
-                     for a in cttyhack devpts halt hostname init losetup mknod mount poweroff reboot switch_root sync umount; do \
+                     for a in cttyhack devpts getty halt hostname init losetup mknod mount poweroff reboot switch_root sync umount; do \
                          printf '%s\\n' \"$l\" | grep -q -x -F \"$a\" || {{ echo \"td-init does not serve applet '$a'\" >&2; exit 1; }}; \
                      done; \
                      n=$(printf '%s\\n' \"$l\" | wc -l); \
-                     [ \"$n\" -eq 13 ] || {{ echo \"td-init serves $n applets, expected exactly 13 — update this check deliberately when adding one\" >&2; exit 1; }}"
+                     [ \"$n\" -eq 14 ] || {{ echo \"td-init serves $n applets, expected exactly 14 — update this check deliberately when adding one\" >&2; exit 1; }}"
                 ),
             ],
         )
@@ -146,6 +146,11 @@ pub fn recipe() -> Recipe {
                      [ $? -eq 2 ] || {{ echo 'td-init must exit 2 on an unknown applet (usage error)' >&2; exit 1; }}; \
                      '{bin}' cttyhack >/dev/null 2>&1; \
                      [ $? -eq 1 ] || {{ echo 'cttyhack with no PROG must exit 1' >&2; exit 1; }}; \
+                     e=$('{bin}' getty 2>&1); \
+                     [ $? -eq 1 ] || {{ echo 'getty with no operands must exit 1 — it opens a terminal and execs a login program, so the parse is the only part a build can drive' >&2; exit 1; }}; \
+                     printf '%s\\n' \"$e\" | grep -q 'usage: getty' || {{ echo \"getty refused without saying so: '$e'\" >&2; exit 1; }}; \
+                     e=$('{bin}' getty -n -l /bin/true 9600 115200 2>&1); \
+                     [ $? -eq 1 ] || {{ echo 'getty must refuse two operands that both name a line speed rather than opening a device called 115200' >&2; exit 1; }}; \
                      e=$('{bin}' reboot --not-an-option 2>&1); \
                      [ $? -eq 1 ] || {{ echo 'reboot must reject an unknown option with exit 1 — falling through to reboot(2) would power the machine down on a typo' >&2; exit 1; }}; \
                      printf '%s\\n' \"$e\" | grep -q 'unrecognised argument' || {{ echo \"reboot rejected the option without saying so: '$e'\" >&2; exit 1; }}; \
@@ -344,7 +349,7 @@ pub fn recipe() -> Recipe {
     });
     steps.push(Step::WriteFile {
         path: "{out}/result".into(),
-        content: "PASS: td-init is a statically-linked ELF64 x86-64 executable (ET_EXEC) with no PT_INTERP and no dynamic NEEDED entry; it serves exactly the twelve applets cttyhack/halt/hostname/init/losetup/mknod/mount/poweroff/reboot/switch_root/sync/umount, dispatches through both the argv[0] and `td-init <applet>` forms, rejects an unknown reboot option before reaching reboot(2), validates an inittab through `init --dry-run` (exit 1 on a rejected line), refuses a switch_root into a new root with no executable init, refuses a non-block or unencodable mknod before reaching mknod(2), refuses an unknown mount/umount argument before reaching mount(2)/umount2(2) and a lone mount operand td has no fstab to resolve, and prints the mount table and the hostname where /proc is mounted\n".into(),
+        content: "PASS: td-init is a statically-linked ELF64 x86-64 executable (ET_EXEC) with no PT_INTERP and no dynamic NEEDED entry; it serves exactly the fourteen applets cttyhack/devpts/getty/halt/hostname/init/losetup/mknod/mount/poweroff/reboot/switch_root/sync/umount, dispatches through both the argv[0] and `td-init <applet>` forms, rejects an unknown reboot option before reaching reboot(2), validates an inittab through `init --dry-run` (exit 1 on a rejected line), refuses a switch_root into a new root with no executable init, refuses a non-block or unencodable mknod before reaching mknod(2), refuses an unknown mount/umount argument before reaching mount(2)/umount2(2) and a lone mount operand td has no fstab to resolve, and prints the mount table and the hostname where /proc is mounted\n".into(),
         exec: false,
     });
     steps.push(Step::Require {
@@ -357,7 +362,7 @@ pub fn recipe() -> Recipe {
         .steps(steps)
         .checks(vec![RecipeCheck::new(
             r#"
-echo ">> recipe-check td-init-test: build-plan --auto builds td-init (td's static boot-glue multicall: init/reboot/poweroff/halt/switch_root/mount/umount/devpts/cttyhack/hostname/losetup/mknod/sync, statically linked by the /td/store target Rust + native GCC/binutils/glibc toolchain), asserts a self-contained static ELF64 x86-64 executable (ET_EXEC, no PT_INTERP, no dynamic NEEDED), and exercises the applet roster, both dispatch forms, the inittab validator, the mount-table listing, and the fail-early/reject paths of the irreversible applets"
+echo ">> recipe-check td-init-test: build-plan --auto builds td-init (td's static boot-glue multicall: init/reboot/poweroff/halt/switch_root/mount/umount/devpts/cttyhack/getty/hostname/losetup/mknod/sync, statically linked by the /td/store target Rust + native GCC/binutils/glibc toolchain), asserts a self-contained static ELF64 x86-64 executable (ET_EXEC, no PT_INTERP, no dynamic NEEDED), and exercises the applet roster, both dispatch forms, the inittab validator, the mount-table listing, and the fail-early/reject paths of the irreversible applets"
 : "${TD_RECIPE_EVAL:=$PWD/target/release/td-recipe-eval}"
 exec "$TD_RECIPE_EVAL" check-run td-init-test 1
 "#,

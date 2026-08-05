@@ -16,9 +16,11 @@
 //! The amended surface is exactly the ten syscalls below, one per boot-glue
 //! applet requirement that safe `std` does not expose. An ELEVENTH is a reviewed
 //! amendment, not an edit; `main.rs`'s confinement test asserts the roster.
-//! `ioctl(2)` is the one with TWO permitted requests — `TIOCSCTTY` for
-//! cttyhack and `LOOP_SET_FD` for losetup — and both are pinned by value, so
-//! widening the roster is as reviewable as adding a syscall to it.
+//! `ioctl(2)` is the one with FOUR permitted requests — `TIOCSCTTY` for
+//! cttyhack and getty, `LOOP_SET_FD` for losetup, and `TCGETS`/`TCSETS` for the
+//! line settings getty applies — each pinned by value and checked against the
+//! roster by the one `ioctl` entry point below, so widening it is as reviewable
+//! as adding a syscall.
 //! Notably absent: `pivot_root(2)` (it fails on the initramfs rootfs, so
 //! switch_root moves the mount instead, as util-linux and busybox do),
 //! `fork`/`execve` (`Command` plus the SAFE `CommandExt::exec` cover both), and
@@ -226,17 +228,46 @@ pub fn setsid() -> io::Result<i32> {
     check(syscall5(SYS_SETSID, 0, 0, 0, 0, 0)).map(|pid| pid as i32)
 }
 
-/// `ioctl(fd, TIOCSCTTY, 0)` — claim `fd`'s terminal as the controlling one.
-/// The request number is pinned here, so no other ioctl is reachable.
+// ── the ioctl roster ────────────────────────────────────────────────────────
+
+/// The FOUR requests this crate's `ioctl` may issue, pinned by value.
 ///
-/// The argument is pinned to 0 as well, which is the whole "do not steal" rule
+/// `ioctl(2)` is one syscall onto an unbounded space of operations, so the
+/// number in `rax` is not the surface — the request in `rsi` is. The roster is
+/// enforced HERE rather than per wrapper (td-sh's form, not td-util's): one
+/// entry point refuses anything outside the list before issuing, so a fifth
+/// request is an edit to this array rather than a new call site somebody has to
+/// notice.
+const TIOCSCTTY: usize = 0x540e;
+const LOOP_SET_FD: usize = 0x4c00;
+const TCGETS: usize = 0x5401;
+const TCSETS: usize = 0x5402;
+const IOCTL_REQUESTS: [usize; 4] = [TIOCSCTTY, LOOP_SET_FD, TCGETS, TCSETS];
+
+/// The only path to `ioctl(2)` in this crate. `request` is checked against the
+/// roster before the syscall, so an unlisted number cannot reach the kernel even
+/// from inside this module.
+fn ioctl(fd: RawFd, request: usize, arg: usize) -> io::Result<()> {
+    if !IOCTL_REQUESTS.contains(&request) {
+        return Err(io::Error::from_raw_os_error(EINVAL));
+    }
+    check(syscall5(SYS_IOCTL, fd as usize, request, arg, 0, 0)).map(|_| ())
+}
+
+/// `EINVAL` — what an off-roster request is refused with, chosen because it is
+/// what the kernel itself answers an operation a device does not implement.
+const EINVAL: i32 = 22;
+
+/// `ioctl(fd, TIOCSCTTY, 0)` — claim `fd`'s terminal as the controlling one.
+///
+/// The argument is pinned to 0, which is the whole "do not steal" rule
 /// expressed where it cannot be got wrong: 1 would make a `CAP_SYS_ADMIN` caller
 /// take the terminal from the session that holds it, and a terminal still held
 /// is one whose session is alive (the kernel releases it when the leader exits).
-/// With 0 that case is EPERM, and the caller carries on without a terminal.
+/// With 0 that case is EPERM, and the caller decides what that means — cttyhack
+/// carries on without a terminal, getty refuses to start a session.
 pub fn set_controlling_tty(fd: RawFd) -> io::Result<()> {
-    const TIOCSCTTY: usize = 0x540e;
-    check(syscall5(SYS_IOCTL, fd as usize, TIOCSCTTY, NO_STEAL, 0, 0)).map(|_| ())
+    ioctl(fd, TIOCSCTTY, NO_STEAL)
 }
 
 /// `TIOCSCTTY`'s argument, and the only value of it this crate may pass. Named
@@ -264,16 +295,37 @@ const NO_STEAL: usize = 0;
 /// descriptor td-boot verified and handed over. `losetup.rs` reads it back out
 /// of sysfs and refuses rather than trusting that.
 pub fn attach_loop(loop_fd: RawFd, backing_fd: RawFd) -> io::Result<()> {
-    const LOOP_SET_FD: usize = 0x4c00;
-    check(syscall5(
-        SYS_IOCTL,
-        loop_fd as usize,
-        LOOP_SET_FD,
-        backing_fd as usize,
-        0,
-        0,
-    ))
-    .map(|_| ())
+    ioctl(loop_fd, LOOP_SET_FD, backing_fd as usize)
+}
+
+// ── getty's two requests ────────────────────────────────────────────────────
+
+/// The KERNEL's `struct termios` — `asm-generic/termbits.h`, four 32-bit flag
+/// words, `c_line`, then `c_cc[NCCS]` with NCCS 19. Not glibc's, which carries
+/// 32 control slots and two speed fields: `TCGETS` copies the kernel's layout
+/// through the pointer with no length negotiation, so a buffer sized from the
+/// wrong header is either short — an out-of-bounds kernel write from code the
+/// compiler reads as safe — or long, with `term.rs` patching bytes past the end
+/// of what the kernel reads back.
+pub const TERMIOS_LEN: usize = 36;
+const _: () = assert!(TERMIOS_LEN == 4 * 4 + 1 + 19);
+
+/// `ioctl(fd, TCGETS, &mut termios)` — read the line's current settings.
+///
+/// The buffer is OPAQUE BYTES here; `term.rs` is the only module that knows what
+/// a field means. That split is what keeps this file free of the layout: a
+/// wrong offset is `term.rs`'s tested arithmetic rather than a syscall argument.
+pub fn termios_get(fd: RawFd, out: &mut [u8; TERMIOS_LEN]) -> io::Result<()> {
+    ioctl(fd, TCGETS, out.as_mut_ptr() as usize)
+}
+
+/// `ioctl(fd, TCSETS, &termios)` — apply line settings, immediately.
+///
+/// `TCSETS` rather than `TCSETSW`/`TCSETSF`, which drain or discard pending
+/// terminal I/O: a getty that flushed the line would throw away whatever the
+/// kernel or a previous session had already written to the operator's console.
+pub fn termios_set(fd: RawFd, termios: &[u8; TERMIOS_LEN]) -> io::Result<()> {
+    ioctl(fd, TCSETS, termios.as_ptr() as usize)
 }
 
 // ── init's reaper ───────────────────────────────────────────────────────────
@@ -375,6 +427,57 @@ pub fn status_text(status: i32) -> String {
 mod tests {
     #![allow(clippy::unwrap_used, clippy::indexing_slicing)]
     use super::*;
+
+    /// Every confinement assertion in `main.rs` reads source TEXT, and a
+    /// wrapper that returned a plausible value without issuing anything would
+    /// satisfy all of them. So the termios pair is ISSUED here, against a
+    /// descriptor that is deliberately not a terminal — the gate has none to
+    /// ask — and the kernel's `ENOTTY` is the proof it reached the kernel.
+    #[test]
+    fn the_termios_wrappers_reach_the_kernel() {
+        const ENOTTY: i32 = 25;
+        let file = std::fs::File::open("/proc/self/status").unwrap();
+        let fd = std::os::fd::AsRawFd::as_raw_fd(&file);
+        let mut buf = [0u8; TERMIOS_LEN];
+        let got = termios_get(fd, &mut buf).unwrap_err();
+        assert_eq!(got.raw_os_error(), Some(ENOTTY), "the read did not reach the kernel");
+        assert_eq!(buf, [0u8; TERMIOS_LEN], "a failed read must not have written");
+        let set = termios_set(fd, &buf).unwrap_err();
+        assert_eq!(set.raw_os_error(), Some(ENOTTY), "the write did not reach the kernel");
+    }
+
+    /// The roster is enforced in CODE, so an off-roster request is refused
+    /// before the syscall rather than issued and left to the device. Asserted at
+    /// runtime because the source pins say the check is written, not that it
+    /// runs, and input injection into another session's terminal is the one
+    /// worth proving cannot leave this module.
+    ///
+    /// Note what this is and is not. It proves ONE value of the roster's
+    /// complement is refused and that all four on it get through — not that the
+    /// roster is the right four, which is `main.rs`'s job. A fifth entry added
+    /// beside the four would satisfy every line here.
+    #[test]
+    fn an_off_roster_request_never_reaches_the_kernel() {
+        // 0x5412 is the terminal input-injection request, deliberately off the
+        // roster. Named by VALUE only: the roster test asserts the refused
+        // neighbours appear nowhere in this file, and an identifier counts.
+        const OFF_ROSTER: usize = 0x5412;
+        const EINVAL_ERRNO: i32 = 22;
+        let file = std::fs::File::open("/proc/self/status").unwrap();
+        let fd = std::os::fd::AsRawFd::as_raw_fd(&file);
+        let refused = ioctl(fd, OFF_ROSTER, 0).unwrap_err();
+        assert_eq!(refused.raw_os_error(), Some(EINVAL_ERRNO));
+        // ...and the four on the roster get past the check, reaching a kernel
+        // that answers for the device rather than the request.
+        for request in IOCTL_REQUESTS {
+            let err = ioctl(fd, request, 0).unwrap_err();
+            assert_ne!(
+                err.raw_os_error(),
+                Some(EINVAL_ERRNO),
+                "request {request:#x} is on the roster but was refused by the check"
+            );
+        }
+    }
 
     /// The raw encodings the kernel actually hands back: `status >> 8` for a
     /// normal exit, the low seven bits for a fatal signal.

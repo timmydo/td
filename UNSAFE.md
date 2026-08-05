@@ -30,7 +30,7 @@ one.
 |---|-------|----------|
 | 1 | `td-kexec` | `kexec_file_load(2)`, `reboot(2)` |
 | 2 | `td-netd` | `ioctl(2)` |
-| 3 | `td-init` | ten — see [§3](#3-td-init--the-boot-glue-multicall) |
+| 3 | `td-init` | ten — see [§3](#3-td-init--the-boot-glue-multicall); `ioctl` has four pinned requests |
 | 4 | `td-login` | `setgroups(2)`, `setgid(2)`, `setuid(2)` |
 | 5 | `td-svc` | `kill(2)` |
 | 6 | `td-compositor` | `recvmsg(2)`, `close(2)`, `sendmsg(2)` |
@@ -88,12 +88,67 @@ asserted like `mount`'s and `attach_loop`'s, because `mode`'s top bits are
 the node type and so choose the driver class. Only BLOCK nodes are served;
 `c`/`u`/`p` are refused, since nothing on td's boot path creates one and
 the type is the part of `mode` that picks the driver. An ELEVENTH syscall
-is an amendment here. `ioctl(2)` is the one with TWO permitted requests —
-`TIOCSCTTY` for cttyhack and `LOOP_SET_FD` for the `losetup` applet — both
-pinned by value, so widening that roster is as reviewable as adding a
-syscall to it. `losetup` is why `td-boot` no longer runs any third-party
-program: attaching the verified root loop had rested on busybox existing
-at an absolute path and parsing `-r <device> <file>` as expected, with
+is an amendment here. `ioctl(2)` is the one with FOUR permitted requests —
+`TIOCSCTTY` for cttyhack and getty, `LOOP_SET_FD` for the `losetup` applet,
+and `TCGETS`/`TCSETS` for the line settings getty applies — each pinned by
+value, so widening that roster is as reviewable as adding a syscall to it.
+Unlike the two-request form this replaced, the roster is now ENFORCED IN
+CODE (td-sh's shape, not td-util's per-wrapper one): a single `ioctl` entry
+point in `sys.rs` refuses anything outside `IOCTL_REQUESTS` before issuing,
+so a fifth request is an edit to a named array rather than a new call site
+somebody has to notice. The four wrappers are pinned whole in turn, because
+with one entry point the syscall-argument pin no longer sees a request
+number: `TIOCSCTTY` reads its third register as the steal flag,
+`LOOP_SET_FD` as a descriptor, and the two termios calls as a pointer the
+kernel copies 36 bytes through. That length is the kernel's `struct
+termios` (four flag words, `c_line`, NCCS=19 slots) and NOT glibc's 60-byte
+one, pinned for td-compositor's `WINSIZE_LEN` reason: the copy has no length
+negotiation, so a buffer sized from the wrong header is an out-of-bounds
+kernel write from code the compiler reads as safe.
+
+`TCGETS`/`TCSETS` arrived with the `getty` applet, which is what took the
+LAST busybox name off the image — the tty setup half of the login chain,
+where `login` and `su` had already moved to td-login and `sh` to td-sh. What
+that applet needs beyond a session is a line a person can type on, and
+`term.rs` is the only module that knows what a `termios` byte means: it
+never CONSTRUCTS one, patches named bits into the kernel's own bytes, and
+compares the whole 36-byte readback against exactly what it computed, so a
+byte the patch never named moving is a failure too. The bits are the ones
+whose absence makes a line unusable rather than a full `sane`: canonical
+input, echo, signal generation and visible erase; `OPOST`/`ONLCR` (without
+which every line staircases); `ICRNL` with `IGNCR` clear (without which
+Enter never terminates a line); 8N1 with `CREAD`; `CLOCAL` for `-L`; and the
+control bytes a canonical line needs, `VMIN`/`VTIME` among them because a
+leftover raw configuration carries `VMIN = 0`, under which `login` reads
+end-of-file at once. The failure this exists for is a shell that took raw
+mode and died before its restore ran: the next session on that terminal
+echoes nothing and submits no line, and nothing in the boot reports it.
+
+The line SPEED is the one field a refusal would be wrong about, and it gets
+a three-way answer rather than a check. A serial line programs its divisor
+from `CBAUD`; a virtual console has no speed and ignores the field. Refusing
+the second case would make the applet unusable on `tty1`, which a graphical
+image wants, and accepting it silently would hide a serial console left at
+the wrong speed — a console that prints garbage. So the readback tells "took
+it" from "left it exactly as found" and reports the latter on stderr, while
+a THIRD speed, neither asked for nor kept, is an error naming the field.
+
+`TIOCSCTTY` is where getty deliberately DIVERGES from the applet it
+replaces. busybox getty re-acquires the terminal with `TIOCSCTTY(1)`, a
+steal; td-init passes the same pinned `NO_STEAL` 0 cttyhack does, so a
+terminal a LIVE session still holds is EPERM. Where the two applets then
+differ is what that means: cttyhack degrades and execs anyway, because a
+rescue shell without job control beats no shell, and getty REFUSES —
+the caller asked for a login session on this terminal, and one with no
+controlling terminal is a session where Ctrl-C reaches nothing and
+`login`'s child cannot be signalled. Refusing is also what the shipped
+`/etc/tty-session` is written around: its `getty … && td-svc reboot`
+short-circuits, so the supervisor restarts the greeter rather than powering
+the machine off as though the operator had logged out.
+
+`losetup` is why `td-boot` no longer runs any third-party program:
+attaching the verified root loop had rested on busybox existing at an
+absolute path and parsing `-r <device> <file>` as expected, with
 nothing tying the two together, so dropping that applet would have stopped
 every boot with no build-time complaint — the same argument that moved
 `kill(2)` into td-svc. `LOOP_SET_FD` rather than `LOOP_CONFIGURE`
@@ -122,10 +177,13 @@ or call the two wrappers. That amendment is what lets both initramfses and
 `/etc/inittab` mount without busybox, and the `LOOP_SET_FD` request above
 is what lets `td-boot` attach the verified root loop without it — so
 nothing td-boot runs is a third-party program any more. Neither
-initramfs packs the multicall at all since `sh` left busybox for td-sh,
-which is a claim about the ARCHIVES rather than the whole boot: `getty`
-on the real root is still busybox's, respawned by the greeter unit every
-boot. Deliberately NOT in that surface:
+initramfs packs the multicall, and since `getty` became an applet here
+neither does the real root: that used to be a claim about the ARCHIVES
+alone, because the greeter unit respawned busybox's `getty` every boot,
+and it now holds for the whole image. Nothing td runs is a third-party
+program bar the Rust userland it builds from source.
+
+Deliberately NOT in that surface:
 `pivot_root(2)` (it fails on the initramfs rootfs, so switch_root moves
 the mount as util-linux and busybox do), `fork`/`execve` (`Command` plus
 the safe `CommandExt::exec` cover both), `dup2` (`Stdio::from(File)` wires

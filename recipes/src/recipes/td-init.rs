@@ -11,6 +11,7 @@ use crate::types::{Recipe, Step};
 // SCOPE: the busybox applets that need a RAW SYSCALL — `init` (wait4), `reboot`/
 // `poweroff`/`halt` (reboot), `sync` (sync), `switch_root` (mount MS_MOVE +
 // chroot), `mount`/`umount` (mount + umount2), `cttyhack` (setsid + TIOCSCTTY),
+// `getty` (both of those plus TCGETS/TCSETS — the last busybox name on the image),
 // `losetup` (ioctl LOOP_SET_FD), `mknod` (mknod), `devpts` (no syscall of its own
 // — it mounts through the `mount` applet), and `hostname` (sethostname,
 // the `-F` flag uutils lacks). That is the complement of td-util,
@@ -62,6 +63,7 @@ const MODULES: &[(&str, &str)] = &[
     ("cttyhack", include_str!("../../../td-init/src/cttyhack.rs")),
     ("devpts", include_str!("../../../td-init/src/devpts.rs")),
     ("devt", include_str!("../../../td-init/src/devt.rs")),
+    ("getty", include_str!("../../../td-init/src/getty.rs")),
     ("halt", include_str!("../../../td-init/src/halt.rs")),
     ("hostname", include_str!("../../../td-init/src/hostname.rs")),
     ("init", include_str!("../../../td-init/src/init.rs")),
@@ -71,6 +73,7 @@ const MODULES: &[(&str, &str)] = &[
     ("switchroot", include_str!("../../../td-init/src/switchroot.rs")),
     ("syncfs", include_str!("../../../td-init/src/syncfs.rs")),
     ("sys", include_str!("../../../td-init/src/sys.rs")),
+    ("term", include_str!("../../../td-init/src/term.rs")),
 ];
 
 /// The embedded source of one applet module. Lets a consumer that hard-codes a diagnostic

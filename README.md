@@ -19,8 +19,10 @@ nothing in the root is mutable.
   Host `/bin`, `/usr`, and ambient `PATH` never enter a build. (The one
   downloaded trust root — the pinned Rust bootstrap snapshot — is rebuilt
   from source and never reaches the final image.)
-- **Rust-first userland** — the core file and text tools are Rust uutils;
-  the boot/login/shell path is a static busybox.
+- **Rust-first userland** — the core file and text tools are Rust uutils, and
+  the boot/login/shell path is td's own static Rust multicalls. No
+  third-party multicall is shipped: the image packs nothing td did not
+  build from source.
 - **Content-addressed** — store paths, offline builds, and fixed-output
   sources verified by SHA-256. Deployment updates are verified into a hidden
   directory, flushed, atomically published by manifest hash, and activated
@@ -76,7 +78,7 @@ fixture proves corrupted-current fallback.
 
 ```
 /td/store/<hash>-<name>/   every package, content-addressed and read-only
-/bin                       symlink farm → /td/store (busybox + uutils applets)
+/bin                       symlink farm → /td/store (td multicalls + uutils)
 /etc                       generated, deployment-owned, immutable
 /var                       persistent writable Btrfs @var subvolume
 /run /tmp                  volatile writable tmpfs
@@ -86,7 +88,7 @@ fixture proves corrupted-current fallback.
 ## Defining the system
 
 A whole distribution is one Rust recipe. `recipes/src/recipes/system-x86-64.rs`
-composes the kernel, busybox, and uutils into a boot selector plus a deployment
+composes the kernel, td's own multicalls, and uutils into a boot selector plus a deployment
 bundle containing `{bzImage, initramfs.cpio, root.erofs, manifest}`. Edit its
 `SYSTEM` constant to tailor the hostname, users, auto-login, login shell, and
 applet set, then `td-recipe-eval run` again.

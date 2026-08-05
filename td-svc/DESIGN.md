@@ -294,8 +294,8 @@ own parent — a stop request for one unit tearing down the machine. So:
 **The terminal is what solved the shipped greeter, and the obvious answers
 did not.** `/etc/tty-session` is a `#!/bin/sh` wrapper that runs `getty`;
 the *shell* never `setsid`s or `setpgid`s — `getty` does, one level down,
-and unconditionally (`loginutils/getty.c`: "Create new session and pgrp,
-lose controlling tty"). So the direct child td-svc holds leads neither a
+and unconditionally (`td-init/src/getty.rs`; busybox's `loginutils/getty.c`
+did the same, and this reasoning predates the applet moving to td-init). So the direct child td-svc holds leads neither a
 session nor a group, and `login` and the user's shell are in a session
 td-svc never created and cannot name from the pid it spawned. Every
 containment keyed on that pid — `Process`, `Group`, `Session` alike —
@@ -309,9 +309,15 @@ a moment later, so it buys a `Session` holding exactly the one process
 the one boot path whose only verification is the daily oracle.
 
 What getty does not escape is the terminal. `setsid()` drops the
-controlling terminal, and getty immediately re-acquires the SAME one with
-`TIOCSCTTY(1)`, so getty and everything it goes on to exec carry that
-device in `/proc/<pid>/stat` field 7.
+controlling terminal, and getty immediately re-acquires the SAME one, so
+getty and everything it goes on to exec carry that device in
+`/proc/<pid>/stat` field 7. td-init's getty claims it with `TIOCSCTTY(0)`
+where busybox used `(1)` — it does not steal from a live session — which
+changes nothing here: td-svc opened the device `O_NOCTTY`, and the kernel
+clears the association when a session leader exits, so the terminal a
+restarting greeter claims is free. What the non-stealing form buys is that
+a terminal somebody else genuinely holds produces a refusal the supervisor
+restarts, rather than a session yanked out from under its owner.
 
 **But the leader does not, and that is the trap.** td-svc opens the tty
 `O_NOCTTY` — deliberately, so the supervisor can never acquire a console
@@ -1099,9 +1105,9 @@ The shipped greeter's containment reaching only its wrapper process is
 RESOLVED, and not the way this document previously said.
 The recorded fix was to spawn the wrapper through `td-init`'s `cttyhack`
 so it would lead a session. That does not work, and the reason is worth
-keeping: `/etc/tty-session` runs `getty` as a CHILD, and busybox getty
-opens with an unconditional `setsid(2)` — `loginutils/getty.c`, "Create
-new session and pgrp, lose controlling tty". So `login` and the user's
+keeping: `/etc/tty-session` runs `getty` as a CHILD, and getty opens with
+an unconditional `setsid(2)` — td-init's applet and busybox's before it
+both "create new session and pgrp, lose controlling tty". So `login` and the user's
 shell end up in a session getty made, not the wrapper's. `cttyhack`
 would have moved `setsid`/`TIOCSCTTY` onto the boot path to buy a
 `Session` containing exactly the one process `Process` already contained.
