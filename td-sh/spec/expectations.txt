@@ -106,7 +106,6 @@ xfail append.test.sh::typeset s+=(my array)
 xfail arith-context.test.sh::$[ is a synonym for $((
 xfail arith-context.test.sh::$[$undefined] is a synonym for $(($undefined (#2566)
 xfail arith-context.test.sh::$[$var is a synonym for $(($var (#2426)
-xfail arith-context.test.sh::Ambiguous colon in slice
 xfail arith-context.test.sh::Array index on LHS of assignment
 xfail arith-context.test.sh::Array index on LHS with indices
 xfail arith-context.test.sh::Empty expression (( ))  $(( ))
@@ -114,9 +113,6 @@ xfail arith-context.test.sh::Empty expression for (( ))
 xfail arith-context.test.sh::Empty expression in ${a[@]: : }
 xfail arith-context.test.sh::Multiple right brackets inside expression
 xfail arith-context.test.sh::Quadruple parens should be disambiguated
-xfail arith-context.test.sh::Slicing of string with constants
-xfail arith-context.test.sh::Slicing of string with expressions
-xfail arith-context.test.sh::Slicing of string with variables
 xfail arith-context.test.sh::Triple parens should be disambiguated
 xfail arith.test.sh::Comma operator (borrowed from C)
 xfail arith.test.sh::Negative numbers with bit shift
@@ -1184,7 +1180,6 @@ xfail toysh.test.sh::char class / extglob
 xfail toysh.test.sh::extglob $IFS 1
 xfail toysh.test.sh::extglob $IFS 2
 xfail toysh.test.sh::patsub of $* - http://landley.net/notes.html#23-04-2020
-xfail toysh.test.sh::slice of @ and @ - http://landley.net/notes.html#23-04-2020
 xfail toysh.test.sh::{abc}<<< - http://landley.net/notes-2019.html#09-12-2019
 xfail type-compat.test.sh::append in arith context
 xfail type-compat.test.sh::declare -i -l -u errors can be silenced - ignore_flags_not_impl
@@ -1236,28 +1231,17 @@ xfail var-op-patsub.test.sh::Substitute one unicode character (UTF-8)
 xfail var-op-patsub.test.sh::Synthesized ${x///} bug (similar to above)
 xfail var-op-patsub.test.sh::When LC_ALL=C, pattern ? doesn't match multibyte character
 xfail var-op-patsub.test.sh::patsub with [^]]
-xfail var-op-slice.test.sh::${@:0:1}
 xfail var-op-slice.test.sh::${@:offset:length} and ${*:offset:length}
 xfail var-op-slice.test.sh::${@:offset} and ${*:offset}
 xfail var-op-slice.test.sh::${array[@]::} has implicit length of zero - for ble.sh
 xfail var-op-slice.test.sh::${array[@]:} vs ${array[@]: }  - bash and zsh inconsistent
 xfail var-op-slice.test.sh::Cannot take length of substring slice
-xfail var-op-slice.test.sh::Negative second arg is position, not length!
-xfail var-op-slice.test.sh::Negative start index
-xfail var-op-slice.test.sh::Negative start index respects unicode
-xfail var-op-slice.test.sh::Negative start index respects unicode ##2
-xfail var-op-slice.test.sh::Out of range string slice: begin
-xfail var-op-slice.test.sh::Out of range string slice: length
 xfail var-op-slice.test.sh::Permutations of implicit begin and length
-xfail var-op-slice.test.sh::Simple ${@:offset}
-xfail var-op-slice.test.sh::Slice UTF-8 String
 xfail var-op-slice.test.sh::Slice string with invalid UTF-8 results in empty string and warning
 xfail var-op-slice.test.sh::Slice string with invalid UTF-8 with strict_word_eval
 xfail var-op-slice.test.sh::Slice undefined
 xfail var-op-slice.test.sh::Slice with an assoc array
 xfail var-op-slice.test.sh::Slice with an index that's an array -- silent a[0] decay
-xfail var-op-slice.test.sh::String slice
-xfail var-op-slice.test.sh::String slice with math
 xfail var-op-strip.test.sh::Strip unicode prefix
 xfail var-op-strip.test.sh::strip all unicode
 xfail var-op-test.test.sh::"\e" as arg

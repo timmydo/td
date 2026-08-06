@@ -1648,6 +1648,26 @@ fn parse_param(inner: &str, quoted: bool, depth: u32) -> Syn<Param> {
         return Err(format!("bad substitution: `${{{inner}}}`"));
     };
     i += 1;
+    // `${v:off}` and `${v:off:len}`. A colon followed by anything that is not
+    // one of the four word operators starts an arithmetic offset, which is what
+    // separates `${v:-1}` (the default operator, so `abcdef`) from `${v: -1}`
+    // and `${v:(-1)}` (the last character). `opc` is part of the expression, so
+    // this reads from BEFORE it.
+    if colon && !matches!(opc, '-' | '=' | '?' | '+') {
+        let rest = chars.get(i - 1..).unwrap_or_default();
+        let (offset, length) = split_slice(rest);
+        return Ok(Param {
+            name,
+            op: Some(ParamOp::Substring {
+                offset: arith_from_str_at(&offset, depth + 1)?,
+                length: match length {
+                    Some(l) => Some(arith_from_str_at(&l, depth + 1)?),
+                    None => None,
+                },
+            }),
+            quoted,
+        });
+    }
     let doubled = chars.get(i) == Some(&opc) && matches!(opc, '%' | '#' | '/');
     if doubled {
         i += 1;
@@ -1689,6 +1709,66 @@ fn parse_param(inner: &str, quoted: bool, depth: u32) -> Syn<Param> {
         op: Some(op),
         quoted,
     })
+}
+
+/// Split a slice operand into offset and optional length at the colon between
+/// them. The colon has to be found at the TOP level: `${v:$(f:x):2}` carries one
+/// inside a substitution, and `${v:a?1:2}` carries one inside a conditional,
+/// where the bracket depth is what tells them apart. bash reads the length as
+/// starting after the LAST such colon in the ternary case, which is why the
+/// scan tracks `?` depth rather than stopping at the first colon it sees.
+fn split_slice(operand: &[char]) -> (String, Option<String>) {
+    let text = |r: Option<&[char]>| -> String { r.unwrap_or_default().iter().collect() };
+    let mut i = 0usize;
+    let mut depth = 0u32;
+    let mut ternary = 0u32;
+    while let Some(&c) = operand.get(i) {
+        match c {
+            '\\' => i += 1,
+            '(' | '[' => depth += 1,
+            ')' | ']' => depth = depth.saturating_sub(1),
+            '?' if depth == 0 => ternary += 1,
+            '\'' | '"' => {
+                let q = c;
+                i += 1;
+                while let Some(&n) = operand.get(i) {
+                    // A backslash escapes inside double quotes but not inside
+                    // single ones, so `"\""` is data and does not end the run.
+                    if n == '\\' && q == '"' {
+                        i += 2;
+                        continue;
+                    }
+                    i += 1;
+                    if n == q {
+                        break;
+                    }
+                }
+                continue;
+            }
+            '$' => i += skip_substitution(operand, i).saturating_sub(1),
+            '`' => {
+                i += 1;
+                while let Some(&n) = operand.get(i) {
+                    if n == '\\' {
+                        i += 2;
+                        continue;
+                    }
+                    i += 1;
+                    if n == '`' {
+                        break;
+                    }
+                }
+                continue;
+            }
+            ':' if depth == 0 && ternary == 0 => {
+                return (text(operand.get(..i)), Some(text(operand.get(i + 1..))));
+            }
+            ':' if depth == 0 => ternary -= 1,
+            _ => {}
+        }
+        i += 1;
+    }
+    (text(Some(operand)), None)
 }
 
 /// Split a patsub operand into pattern and replacement at the first delimiting
@@ -1796,6 +1876,33 @@ mod tests {
                 _ => None,
             })
             .collect())
+    }
+
+    /// The colon between a slice's offset and its length is the one at the TOP
+    /// level, so one inside brackets, a ternary, a substitution or a quoted run
+    /// is not it -- and a backslash inside a double-quoted run or backticks
+    /// escapes, so a quote it protects does not end that run early.
+    #[test]
+    fn a_slice_operand_splits_at_its_own_colon() {
+        let split = |s: &str| {
+            let cs: Vec<char> = s.chars().collect();
+            split_slice(&cs)
+        };
+        assert_eq!(split("2"), ("2".into(), None));
+        assert_eq!(split("1:2"), ("1".into(), Some("2".into())));
+        assert_eq!(split(""), (String::new(), None));
+        assert_eq!(split(":"), (String::new(), Some(String::new())));
+        // A ternary's colon belongs to the ternary.
+        assert_eq!(split("1>0?1:2"), ("1>0?1:2".into(), None));
+        assert_eq!(split("1>0?1:2:3"), ("1>0?1:2".into(), Some("3".into())));
+        // Brackets and substitutions carry their own.
+        assert_eq!(split("(1:2)"), ("(1:2)".into(), None));
+        assert_eq!(split("$(f:x):2"), ("$(f:x)".into(), Some("2".into())));
+        assert_eq!(split("${a:-x}:2"), ("${a:-x}".into(), Some("2".into())));
+        // Quoted runs do too, and an ESCAPED quote does not end one early.
+        assert_eq!(split("'a:b':2"), ("'a:b'".into(), Some("2".into())));
+        assert_eq!(split("\"a\\\":b\":2"), ("\"a\\\":b\"".into(), Some("2".into())));
+        assert_eq!(split("`a\\`:b`:2"), ("`a\\`:b`".into(), Some("2".into())));
     }
 
     #[test]

@@ -91,6 +91,9 @@ pub enum ParamOp {
     /// `${name/pat/repl}` / `${name//pat/repl}`. ash has no bash `#`/`%`
     /// anchors, so a leading `#` or `%` is an ordinary pattern character.
     Replace { pat: Word, repl: Word, all: bool },
+    /// `${name:off}` / `${name:off:len}`. Both operands are ARITHMETIC, not
+    /// words, so `${v:n+1}` reads `n` as a variable the way `$((n+1))` does.
+    Substring { offset: Word, length: Option<Word> },
 }
 
 #[derive(Clone, Debug)]

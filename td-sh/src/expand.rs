@@ -306,6 +306,81 @@ fn push_expanded(out: &mut Vec<QChar>, text: &str, quoted: bool) {
     }
 }
 
+/// A slice operand: expanded, then evaluated as arithmetic. An EMPTY one is 0,
+/// which is what makes `${v: :2}` and `${v::2}` the first two characters --
+/// `arith::eval` would call the empty expression an error.
+fn slice_arith(sh: &mut Shell, w: &Word) -> R<i64> {
+    let text = QChar::text(&expand_chars(sh, w, false)?);
+    if text.trim().is_empty() {
+        return Ok(0);
+    }
+    arith::eval(sh, &text)
+}
+
+/// Resolve `offset`/`length` against a sequence of `total` elements, returning
+/// the half-open range to take. A NEGATIVE offset counts back from the end; a
+/// negative LENGTH is not a count but an end index measured from the end, so
+/// `${v:1:-1}` drops the last character. A length that puts the end before the
+/// start is fatal, as it is in bash -- the alternative is silently returning
+/// nothing for what is almost always an arithmetic mistake.
+fn slice_range(
+    sh: &mut Shell,
+    total: usize,
+    offset: i64,
+    length: Option<i64>,
+    end_relative: bool,
+) -> R<(usize, usize)> {
+    let total_i = i64::try_from(total).unwrap_or(i64::MAX);
+    let start = if offset < 0 {
+        let s = total_i.saturating_add(offset);
+        // Further back than the whole string reaches: bash yields NOTHING
+        // rather than clamping to the front, and raises no error doing it --
+        // not even with a length, which the in-range case below would refuse.
+        if s < 0 {
+            return Ok((0, 0));
+        }
+        s
+    } else if offset > total_i {
+        // Past the end is empty, and short-circuits BEFORE the length is
+        // looked at: `${v:7:-9}` on six characters is empty where `${v:6:-9}`
+        // is the error below. Clamping instead of returning would turn the
+        // first into the second.
+        return Ok((0, 0));
+    } else {
+        offset
+    };
+    let end = match length {
+        None => total_i,
+        // For a STRING a negative length is an end index measured from the
+        // end. For the POSITIONALS bash has no such form and refuses it
+        // outright -- but only once the offset is in range, since both
+        // out-of-range offsets above answer empty without looking at all.
+        Some(l) if l < 0 && end_relative => total_i.saturating_add(l),
+        Some(l) if l < 0 => return Err(sh.fatal(&format!("{l}: substring expression < 0"), 1)),
+        Some(l) => start.saturating_add(l).min(total_i),
+    };
+    if end < start {
+        let n = length.unwrap_or(0);
+        return Err(sh.fatal(&format!("{n}: substring expression < 0"), 1));
+    }
+    let clamp = |v: i64| usize::try_from(v.clamp(0, total_i)).unwrap_or(0);
+    Ok((clamp(start), clamp(end)))
+}
+
+fn slice_chars(sh: &mut Shell, chars: &[char], offset: i64, length: Option<i64>) -> R<String> {
+    let (a, b) = slice_range(sh, chars.len(), offset, length, true)?;
+    Ok(chars.get(a..b).unwrap_or_default().iter().collect())
+}
+
+/// `$@`/`$*` slice. The list carries `$0` at its head, so `${@:0}` reaches it --
+/// and a NEGATIVE offset counts back over that same list rather than over the
+/// positionals alone, which is why `${@: -4}` with three of them yields `$0`
+/// and all three. One step further back is empty, as it is for a string.
+fn slice_items(sh: &mut Shell, items: &[String], offset: i64, length: Option<i64>) -> R<Vec<String>> {
+    let (a, b) = slice_range(sh, items.len(), offset, length, false)?;
+    Ok(items.get(a..b).unwrap_or_default().to_vec())
+}
+
 fn expand_param(
     sh: &mut Shell,
     p: &Param,
@@ -343,6 +418,75 @@ fn expand_param(
         return Ok(());
     }
 
+    // `${v:off:len}`. Both operands are arithmetic, and for `$@`/`$*` the slice
+    // is over the POSITIONALS rather than over their join -- so it can yield
+    // several fields and is handled before the scalar path.
+    if let Some(ParamOp::Substring { offset, length }) = &p.op {
+        let off = slice_arith(sh, offset)?;
+        let len = match length {
+            Some(l) => Some(slice_arith(sh, l)?),
+            None => None,
+        };
+        if p.name == "@" || p.name == "*" {
+            // `${@:0}` is `$0` followed by the positionals, which is the one
+            // place `$0` is reachable by index.
+            let mut items = vec![sh.arg0.clone()];
+            items.extend(sh.params.iter().cloned());
+            let picked = slice_items(sh, &items, off, len)?;
+            if p.name == "*" {
+                // A quoted `$*` is ONE field however few elements it joins, so
+                // this marks the field unconditionally where `$@` below does
+                // not: `set -- "${*:9}"` passes one empty argument and
+                // `set -- "${@:9}"` passes none.
+                if quoted {
+                    cur.had_quotes = true;
+                }
+                // Joined on IFS's first character, as a plain `$*` is.
+                let sep = sh
+                    .get_var("IFS")
+                    .unwrap_or_else(|| " \t\n".to_string())
+                    .chars()
+                    .next()
+                    .map(String::from)
+                    .unwrap_or_default();
+                push_expanded(&mut cur.chars, &picked.join(&sep), quoted);
+                return Ok(());
+            }
+            // As for a plain `"$@"`: an EMPTY slice must not mark the field
+            // quoted, or `set -- "${@:9}"` would pass one empty argument where
+            // it should pass none.
+            if quoted && !picked.is_empty() {
+                cur.had_quotes = true;
+            }
+            for (i, v) in picked.iter().enumerate() {
+                if i > 0 {
+                    done.push(std::mem::replace(
+                        cur,
+                        Field {
+                            chars: Vec::new(),
+                            had_quotes: quoted,
+                        },
+                    ));
+                }
+                push_expanded(&mut cur.chars, v, quoted);
+            }
+            return Ok(());
+        }
+        // A SCALAR slice is an ordinary quoted expansion, so an empty result is
+        // still one empty field -- unlike the positional case above, where an
+        // empty slice yields none. `"${v:2:0}"` is one argument and `"${@:9}"`
+        // is zero, both measured.
+        if quoted {
+            cur.had_quotes = true;
+        }
+        nounset_check(sh, &p.name)?;
+        let value = lookup(sh, &p.name).unwrap_or_default();
+        let chars: Vec<char> = value.chars().collect();
+        let picked = slice_chars(sh, &chars, off, len)?;
+        push_expanded(&mut cur.chars, &picked, quoted);
+        return Ok(());
+    }
+
     if quoted {
         cur.had_quotes = true;
     }
@@ -373,7 +517,8 @@ fn expand_param(
             nounset_check(sh, &p.name)?;
             raw
         }
-        Some(ParamOp::Length) => raw,
+        // Both are answered above, before this match runs.
+        Some(ParamOp::Length | ParamOp::Substring { .. }) => raw,
         Some(ParamOp::Default { word, colon }) => {
             if raw.is_none() || (*colon && empty) {
                 let chars = expand_chars(sh, word, quoted)?;
@@ -815,6 +960,20 @@ mod tests {
         sh
     }
 
+    /// The single word `src` lexes to, for the cases that assert an ERROR --
+    /// `fields` swallows one to keep the passing assertions readable.
+    fn word(src: &str) -> Word {
+        crate::lexer::tokenize(src)
+            .ok()
+            .and_then(|l| {
+                l.toks.into_iter().find_map(|t| match t {
+                    crate::lexer::Tok::Word(w) => Some(w),
+                    _ => None,
+                })
+            })
+            .unwrap_or_else(|| Word(Vec::new()))
+    }
+
     fn fields(sh: &mut Shell, src: &str) -> Vec<String> {
         let words = crate::lexer::tokenize(src)
             .ok()
@@ -1040,5 +1199,128 @@ mod tests {
             vec!["*.nonexistent-td-sh"]
         );
         assert_eq!(fields(&mut sh, "'*'"), vec!["*"]);
+    }
+
+    /// Every expectation below was measured against bash 5.2.
+    #[test]
+    fn a_substring_counts_from_either_end() {
+        let mut sh = sh_with(&[("v", "abcdef")]);
+        assert_eq!(fields(&mut sh, "${v:0}"), vec!["abcdef"]);
+        assert_eq!(fields(&mut sh, "${v:2}"), vec!["cdef"]);
+        assert_eq!(fields(&mut sh, "${v:2:3}"), vec!["cde"]);
+        // A zero length is an empty field, not the rest of the string.
+        assert_eq!(fields(&mut sh, "\"${v:2:0}\""), vec![""]);
+        // An offset past the end clamps rather than failing.
+        assert_eq!(fields(&mut sh, "\"${v:7}\""), vec![""]);
+        // A negative offset counts back from the end -- and needs the space or
+        // the parens, since `${v:-1}` is the DEFAULT operator.
+        assert_eq!(fields(&mut sh, "${v: -2}"), vec!["ef"]);
+        assert_eq!(fields(&mut sh, "${v:(-2)}"), vec!["ef"]);
+        assert_eq!(fields(&mut sh, "${v:-1}"), vec!["abcdef"]);
+        // A negative LENGTH is an end index measured from the end, not a count.
+        assert_eq!(fields(&mut sh, "${v:1:-1}"), vec!["bcde"]);
+        assert_eq!(fields(&mut sh, "\"${v:0:-6}\""), vec![""]);
+        // Characters, not bytes.
+        let mut u = sh_with(&[("v", "--\u{3bc}--")]);
+        assert_eq!(fields(&mut u, "${v:1:3}"), vec!["-\u{3bc}-"]);
+    }
+
+    /// Both operands are ARITHMETIC, so they read variables and operators the
+    /// way `$(( ))` does. An EMPTY one is zero, which `arith::eval` alone would
+    /// call an error.
+    #[test]
+    fn substring_operands_are_arithmetic() {
+        let mut sh = sh_with(&[("v", "abcdef"), ("n", "2")]);
+        assert_eq!(fields(&mut sh, "${v:1+1}"), vec!["cdef"]);
+        assert_eq!(fields(&mut sh, "${v:1+1:2*1}"), vec!["cd"]);
+        assert_eq!(fields(&mut sh, "${v:n}"), vec!["cdef"]);
+        assert_eq!(fields(&mut sh, "${v:n:n}"), vec!["cd"]);
+        assert_eq!(fields(&mut sh, "${v:0x2:010}"), vec!["cdef"]);
+        assert_eq!(fields(&mut sh, "${v:${#v}-2}"), vec!["ef"]);
+        let mut e = sh_with(&[("v", "123")]);
+        assert_eq!(fields(&mut e, "${v:0}"), vec!["123"]);
+        assert_eq!(fields(&mut e, "\"${v::}\""), vec![""]);
+        assert_eq!(fields(&mut e, "${v: }"), vec!["123"]);
+    }
+
+    /// The colon between offset and length is found at the TOP level, so one
+    /// inside a substitution or a ternary is not it.
+    #[test]
+    fn the_slice_colon_is_found_at_the_top_level() {
+        let mut sh = sh_with(&[("v", "abcdef")]);
+        // `1>0?1:2` is one expression whose colon belongs to the ternary.
+        assert_eq!(fields(&mut sh, "${v:1>0?1:2}"), vec!["bcdef"]);
+        assert_eq!(fields(&mut sh, "${v:$(echo 1):$(echo 2)}"), vec!["bc"]);
+    }
+
+    /// `$@`/`$*` slice the POSITIONALS rather than their join, so a slice of
+    /// `$@` is several fields. `${@:0}` is the one place `$0` has an index.
+    #[test]
+    fn a_positional_slice_yields_fields() {
+        let mut sh = Shell::new_for_test();
+        sh.params = vec!["a".into(), "b".into(), "c".into()];
+        assert_eq!(fields(&mut sh, "${@:1:2}"), vec!["a", "b"]);
+        assert_eq!(fields(&mut sh, "${@:2}"), vec!["b", "c"]);
+        // A negative offset counts from the last POSITIONAL, not from `$0`.
+        assert_eq!(fields(&mut sh, "${@: -2}"), vec!["b", "c"]);
+        assert_eq!(fields(&mut sh, "\"${@:9}\""), Vec::<String>::new());
+        // `$*` joins on IFS's first character instead.
+        assert_eq!(fields(&mut sh, "\"${*:1:2}\""), vec!["a b"]);
+        let _ = sh.set_var("IFS", "-");
+        assert_eq!(fields(&mut sh, "\"${*:1:2}\""), vec!["a-b"]);
+        // Quoting keeps each element one field even when it contains a blank.
+        let mut q = Shell::new_for_test();
+        q.params = vec!["x y".into(), "z".into()];
+        assert_eq!(fields(&mut q, "\"${@:1:1}\""), vec!["x y"]);
+        assert_eq!(fields(&mut q, "${@:1:1}"), vec!["x", "y"]);
+    }
+
+    /// An offset that reaches outside the sequence answers EMPTY and raises no
+    /// error -- not even with a length, which an in-range offset would refuse.
+    /// Clamping it to the front instead would return a prefix nobody asked for.
+    #[test]
+    fn an_out_of_range_offset_is_empty_rather_than_clamped() {
+        let mut sh = sh_with(&[("v", "abcdef")]);
+        assert_eq!(fields(&mut sh, "\"${v: -6}\""), vec!["abcdef"]);
+        assert_eq!(fields(&mut sh, "\"${v: -7}\""), vec![""]);
+        assert_eq!(fields(&mut sh, "\"${v: -7:3}\""), vec![""]);
+        assert_eq!(fields(&mut sh, "\"${v: -7:-1}\""), vec![""]);
+        // Past the END short-circuits BEFORE the length is looked at, which is
+        // what separates these two: one is empty, the other an error.
+        assert_eq!(fields(&mut sh, "\"${v:7:-9}\""), vec![""]);
+        assert!(expand_fields(&mut sh, &word("${v:6:-9}")).is_err());
+        assert!(expand_fields(&mut sh, &word("${v:2:-9}")).is_err());
+    }
+
+    /// A negative offset over the positionals counts back over the list that
+    /// carries `$0`, so `${@: -4}` with three of them reaches `$0` itself. And
+    /// a negative LENGTH, which is an end index for a string, is simply refused
+    /// here -- bash has no end-relative form for the positionals.
+    #[test]
+    fn a_positional_slice_counts_over_arg0_and_refuses_a_negative_length() {
+        let mut sh = Shell::new_for_test();
+        sh.arg0 = "SH".into();
+        sh.params = vec!["a".into(), "b".into(), "c".into()];
+        assert_eq!(fields(&mut sh, "${@: -3}"), vec!["a", "b", "c"]);
+        assert_eq!(fields(&mut sh, "${@: -4}"), vec!["SH", "a", "b", "c"]);
+        assert_eq!(fields(&mut sh, "\"${@: -5}\""), Vec::<String>::new());
+        assert!(expand_fields(&mut sh, &word("${@:1:-1}")).is_err());
+        assert!(expand_fields(&mut sh, &word("${*:1:-1}")).is_err());
+        // But an out-of-range offset still answers empty without looking at it.
+        assert_eq!(fields(&mut sh, "\"${@:99:-1}\""), Vec::<String>::new());
+    }
+
+    /// A quoted `$*` is ONE field however few elements it joins, where a quoted
+    /// `$@` selecting nothing is no field at all. Only `$#` shows the
+    /// difference, which is why it needs its own test.
+    #[test]
+    fn a_quoted_star_slice_is_always_one_field() {
+        let mut sh = Shell::new_for_test();
+        sh.params = vec!["a".into(), "b".into(), "c".into()];
+        assert_eq!(fields(&mut sh, "\"${*:9}\""), vec![""]);
+        assert_eq!(fields(&mut sh, "\"${*:1:0}\""), vec![""]);
+        assert_eq!(fields(&mut sh, "\"${@:9}\""), Vec::<String>::new());
+        // Unquoted, an empty join is no field at all.
+        assert_eq!(fields(&mut sh, "${*:9}"), Vec::<String>::new());
     }
 }
