@@ -459,11 +459,26 @@ td-txt-authored case files
   is not, `v 4a` is refused because `a` sorts above `.` while `v 4-9` is accepted
   because `-` sorts below it, and an empty argument compares as 4.0. td-txt compares
   against the GNU LEVEL it implements rather than its own version number, since
-  comparing against 0.1.0 would refuse the `v 4.2` real scripts carry. And `s`'s
-  FLAGS end only at a command terminator: a blank separates flags rather than ending
-  them (`s/a/b/ g p` is both), an unknown letter is `unknown option to `s'` rather
-  than the next command, and `g`, `p` and the occurrence number may not repeat while
-  `i`/`I`/`m`/`M` may.
+  comparing against 0.1.0 would refuse the `v 4.2` real scripts carry.
+
+  `v` also DISCARDS any ADDRESS it was given, which is that same `continue` seen
+  from the other side: GNU counts a command's slot only after the switch, so the
+  slot `v` leaves through is abandoned with the address already copied into it and
+  the next command overwrites it. `//v;p` therefore runs the `p`, where a committed
+  `v` would fail for want of a previous regex to reuse. What can TELL is an address
+  whose application leaves something behind, and two kinds do. A regex is what a
+  later `//` reuses, so `/a/v;//p` prints `a` if the `v` applied it and is `no
+  previous regular expression` if it did not -- either half of a range, empty or
+  not, whatever the delimiter. And `$` forces the LOOKAHEAD that decides whether
+  more input follows, which over several operands opens the next one: `sed -n
+  '$v;F' f1 f2` names `f1 f1 f2` where a committed `$` names `f1 f2 f2`, and `$!`
+  asks the same question so negating it does not spare it. A line number and a
+  step are genuinely invisible.
+
+  `s`'s FLAGS end only at a command terminator: a blank separates flags rather
+  than ending them (`s/a/b/ g p` is both), an unknown letter is `unknown option to
+  `s'` rather than the next command, and `g`, `p` and the occurrence number may not
+  repeat while `i`/`I`/`m`/`M` may.
 
   One acceptance rule the command-form axis turned up on its own: GNU requires a
   command SEPARATOR after every command that does not consume the rest of the line,

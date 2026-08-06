@@ -1563,7 +1563,12 @@ fn parse_commands(p: &mut ScriptParser) -> Result<Script, Fatal> {
                 if version_is_newer(&p.parse_label()) {
                     return Err("expected newer version of sed".to_string().into());
                 }
-                Kind::Comment
+                // Never COMMITTED, which discards the ADDRESS with it: GNU counts a
+                // slot only after the switch its `continue` leaves through
+                // (compile.c:1081), so `sed --debug '//v;p'` shows a program of just
+                // `p`. Observable through a regex a later `//` would reuse, and
+                // through `$`, whose lookahead moves what `F` names.
+                continue;
             }
             b'e' => return Err("the `e' command is not supported".to_string().into()),
             other => return Err(crate::util::byte_in("unknown command: `", other, "'").into()),

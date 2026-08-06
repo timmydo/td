@@ -4956,6 +4956,128 @@ f$
 ## status: 1
 ## stderr-contains: expected newer version of sed
 
+# --- `v' is the one command that ENTERS NO SLOT: GNU prepares one before the
+# --- switch and counts it only after, so `v''s `continue' abandons the slot
+# --- with the address already copied into it. What SHOWS that is an address
+# --- whose APPLICATION leaves something behind, since one merely tested and
+# --- then dropped cannot be told from one never tested. Two kinds do: a REGEX
+# --- -- in either half of a range, empty or not, whatever the delimiter -- is
+# --- what a later `//' reuses, and `$' forces the LOOKAHEAD that decides
+# --- whether more input follows, which over several operands opens the next
+# --- one and so changes what `F' names. A line number and a step really are
+# --- invisible: `1v;F' and `1~2v;F' answer the same either way.
+# ---
+# --- The last three hold the SURROUNDINGS rather than the dropped command and
+# --- are GNU pins rather than drift of it: each answers the same whether the
+# --- slot is abandoned or taken and left empty, since a block's end index
+# --- shifts UNIFORMLY with the count and a later `//' reuses whatever regex
+# --- last APPLIED either way.
+
+#### v takes an address and then discards it along with itself
+## argv: sed -n '//v;p'
+## stdin-json: "a\nb\n"
+## stdout-json: "a\nb\n"
+## stderr-json: ""
+## status: 0
+
+#### a range's second half goes with its first
+## argv: sed -n '1,//v;p'
+## stdin-json: "a\nb\n"
+## stdout-json: "a\nb\n"
+## stderr-json: ""
+## status: 0
+
+#### and so does a negation
+## argv: sed -n '//!v;p'
+## stdin-json: "a\nb\n"
+## stdout-json: "a\nb\n"
+## stderr-json: ""
+## status: 0
+
+#### the version argument does not change which arm this is
+## argv: sed -n '//v 4.2;p'
+## stdin-json: "a\nb\n"
+## stdout-json: "a\nb\n"
+## stderr-json: ""
+## status: 0
+
+#### a NON-empty regex goes unapplied too, so it is not there to be reused
+## argv: sed -n '/a/v;//p'
+## stdin-json: "a\nb\nc\n"
+## stdout-json: ""
+## stderr-json: "sed: -e expression #1, char 0: no previous regular expression\n"
+## status: 1
+
+#### including one in a range's second half, which applies a line later
+## argv: sed -n '1,/b/v;3{//p}'
+## stdin-json: "a\nb\nc\n"
+## stdout-json: ""
+## stderr-json: "sed: -e expression #1, char 0: no previous regular expression\n"
+## status: 1
+
+#### and `$' goes unapplied, so nothing looks ahead into the next operand
+## argv: sed -n '$v;F' f1 f2
+## file f1:
+1
+2
+## END
+## file f2:
+3
+## END
+## stdout:
+f1
+f1
+f2
+## END
+## stderr-json: ""
+## status: 0
+
+#### negating it does not spare it, since `$!' asks the same question
+## argv: sed -n '$!v;F' f1 f2
+## file f1:
+1
+2
+## END
+## file f2:
+3
+## END
+## stdout:
+f1
+f1
+f2
+## END
+## stderr-json: ""
+## status: 0
+
+#### a branch over the dropped command lands where it would have anyway
+# `bend' clears the `p', so nothing prints at all.
+## argv: sed -n '//v;bend;p;:end'
+## stdin-json: "a\nb\n"
+## stdout-json: ""
+## stderr-json: ""
+## status: 0
+
+#### an empty regex after it still has no earlier one to reuse
+## argv: sed -n '//v;//p'
+## stdin-json: "a\nb\n"
+## stdout-json: ""
+## stderr-json: "sed: -e expression #1, char 0: no previous regular expression\n"
+## status: 1
+
+#### while a regex that DID apply is there for a later empty one
+## argv: sed -n '/a/p;//v;//p'
+## stdin-json: "a\nb\n"
+## stdout-json: "a\na\n"
+## stderr-json: ""
+## status: 0
+
+#### and a block END past it closes the block it opened
+## argv: sed -n '/a/{//v;p};/b/p'
+## stdin-json: "a\nb\n"
+## stdout-json: "a\nb\n"
+## stderr-json: ""
+## status: 0
+
 # --- An `r`/`R` source that OPENS but cannot be READ is exit 4, where a source
 # --- that does not open at all is silent. A directory is how you get one, and
 # --- `.` is one in every case's own temp directory.
