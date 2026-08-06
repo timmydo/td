@@ -72,7 +72,7 @@ const HEADER: &str = "\
 #           Oils helpers (`argv.py`, `printenv.py`). Those are real mismatches
 #           today, but MEASURE before mining the list, because `not found` is
 #           reported identically for two different things. Some of those names are
-#           BUILTINS td-sh does not have (`shopt`, `[[`, `typeset`, `declare`,
+#           BUILTINS td-sh does not have (`shopt`, `typeset`, `declare`,
 #           `compgen`) and are true shell gaps; the rest are EXTERNALS the harness
 #           withholds (`cat`, `touch`, `mkdir`, `grep`, `sed`, `wc`) and say
 #           nothing about the shell. Both groups are large and neither dominates.

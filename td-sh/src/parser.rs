@@ -10,8 +10,8 @@
 use std::sync::Arc;
 
 use crate::ast::{
-    is_name, AndOr, Assign, CaseItem, Cmd, Conn, IfArm, List, Pipeline, Redir, RedirKind, Seg, Sep,
-    Syn, Word, INCOMPLETE,
+    is_name, AndOr, ArithCmp, Assign, CaseItem, Cmd, CondExpr, CondOp, Conn, IfArm, List, Pipeline, Redir,
+    RedirKind, Seg, Sep, Syn, Word, INCOMPLETE,
 };
 use crate::lexer::{tokenize, Op, Scan, Tok};
 
@@ -47,6 +47,17 @@ const MAX_PARSE_DEPTH: u32 = 256;
 /// however long. The in-use guard already stops an alias re-entering itself, but a
 /// chain of aliases that each name several others still expands exponentially.
 const MAX_ALIAS_EXPANSIONS: u32 = 4096;
+
+/// The `-X` operators `[[ ]]` takes one operand for: `test`'s roster, plus the
+/// three it does not serve. `v` (is this NAME set) has no `test` spelling; `o`
+/// (is this shell option on) reads what `set -o` writes; and `a` is file-exists
+/// here where in `test` it is the binary AND operator -- inside `[[ ]]` the
+/// connective is `&&`, so the letter is free and bash gives it `-e`'s meaning.
+/// `G`/`N`/`O` are deliberately absent: they are missing from this shell's
+/// `test` too, and adding them belongs there, where both constructs get them.
+fn is_cond_unary(w: &str) -> bool {
+    matches!(w.strip_prefix('-'), Some(u) if u.len() == 1 && "znefdrwxshLtbcpSugkvoa".contains(u))
+}
 
 /// Reserved words. dash resolves these BEFORE aliases, so `alias if=…` never fires
 /// where a keyword is recognized.
@@ -627,8 +638,10 @@ impl Units {
         Ok(Pipeline { bang, cmds })
     }
 
-    /// Depth-guarded entry to command parsing. Every recursive descent bottoms out
-    /// here, so the counter here bounds the whole parse's stack use.
+    /// Depth-guarded entry to command parsing. Every recursive descent through
+    /// the COMMAND grammar bottoms out here, so this counter bounds its stack
+    /// use. `cond_term` shares the same counter for the same reason: its
+    /// parentheses recurse without passing through here.
     fn parse_command(&mut self) -> Syn<Cmd> {
         self.depth += 1;
         if self.depth > MAX_PARSE_DEPTH {
@@ -663,10 +676,186 @@ impl Units {
             }
             _ => {}
         }
+        // `[[` is dispatched here rather than through `is_reserved`, which would
+        // also stop it being a command NAME -- and `[[` reaching a PATH lookup
+        // is what any shell without this does, so the word keeps that meaning
+        // everywhere except the one position the grammar claims it.
+        if self.peek_reserved() == Some("[[") {
+            return self.parse_cond();
+        }
         if self.at_func_def() {
             return self.parse_func_def();
         }
         self.parse_simple()
+    }
+
+    /// `[[ expr ]]`.
+    ///
+    /// Parsed off the ORDINARY token stream rather than through a second lexer
+    /// mode: `[[` and `]]` arrive as plain words, and the operators the shell
+    /// spells with punctuation (`<`, `>`, `&&`, `||`, `(`, `)`) arrive as the
+    /// same `Op`s a command line uses. Reading them back as comparisons here is
+    /// what makes `[[ a < b ]]` a string test where `a < b` is a redirection,
+    /// with no change to how anything outside the brackets lexes.
+    fn parse_cond(&mut self) -> Syn<Cmd> {
+        self.expect_reserved("[[")?;
+        let expr = self.cond_or()?;
+        // A newline is skipped where a TERM is expected (see `cond_term_inner`)
+        // and refused everywhere else, which is bash's rule. Here the
+        // expression is COMPLETE, so what may follow is `]]`; bash calls a
+        // newline in this position an error too, and saying which beats
+        // "expected `]]`, found newline".
+        if matches!(self.peek(), Some(Tok::Newline)) {
+            return Err("syntax error: `[[` expression ended before `]]`".into());
+        }
+        self.expect_reserved("]]")?;
+        let redirs = self.parse_redirs()?;
+        Ok(Cmd::Cond { expr, redirs })
+    }
+
+    /// The chains are bounded as well as the nesting, and by the same constant.
+    /// Parsing `a && b && c` iterates rather than recursing, but the TREE it
+    /// builds is left-deep -- one level per term -- and both the evaluator and
+    /// the tree's own `Drop` walk that spine recursively. A 100k-term chain
+    /// therefore aborted the shell exactly as nested parentheses did, with
+    /// nothing in the parser's stack to show for it. Bounding the tree at parse
+    /// time is what makes the depth `eval_cond` and `Drop` see finite.
+    fn cond_or(&mut self) -> Syn<CondExpr> {
+        let mut left = self.cond_and()?;
+        let mut chain = 0u32;
+        while self.peek_op() == Some(Op::OrIf) {
+            chain += 1;
+            if chain > MAX_PARSE_DEPTH {
+                return Err("syntax error: `[[` expression too long".to_string());
+            }
+            self.bump();
+            let right = self.cond_and()?;
+            left = CondExpr::Or(Box::new(left), Box::new(right));
+        }
+        Ok(left)
+    }
+
+    fn cond_and(&mut self) -> Syn<CondExpr> {
+        let mut left = self.cond_term()?;
+        let mut chain = 0u32;
+        while self.peek_op() == Some(Op::AndIf) {
+            chain += 1;
+            if chain > MAX_PARSE_DEPTH {
+                return Err("syntax error: `[[` expression too long".to_string());
+            }
+            self.bump();
+            let right = self.cond_term()?;
+            left = CondExpr::And(Box::new(left), Box::new(right));
+        }
+        Ok(left)
+    }
+
+    /// Depth-guarded, sharing `parse_command`'s counter. `( … )` and `!` recurse
+    /// here WITHOUT going through `parse_command`, so without this the bound
+    /// that stops `((((…))))` overflowing the stack would not cover the same
+    /// shape inside `[[ ]]` -- and this crate builds with `panic = "abort"`, so
+    /// an overflow is the shell dying rather than a diagnostic. Verified: 100k
+    /// nested parens abort without it and are a syntax error with it.
+    fn cond_term(&mut self) -> Syn<CondExpr> {
+        self.depth += 1;
+        if self.depth > MAX_PARSE_DEPTH {
+            self.depth -= 1;
+            return Err("syntax error: `[[` nesting too deep".to_string());
+        }
+        let result = self.cond_term_inner();
+        self.depth -= 1;
+        result
+    }
+
+    fn cond_term_inner(&mut self) -> Syn<CondExpr> {
+        // A newline is skipped exactly where a TERM is expected, which is what
+        // reaching this function means: after `[[`, after `&&`, after `||`,
+        // after `(` and after `!`. It is NOT skipped where an OPERAND or the
+        // closer is expected -- after a binary or unary operator, before `)`,
+        // before `]]` -- and those are in `cond_operand` and the callers.
+        // Measured against bash 5.2 in all ten positions rather than assumed:
+        // it accepts the first five and refuses the rest.
+        while matches!(self.peek(), Some(Tok::Newline)) {
+            self.bump();
+        }
+        if self.peek_reserved() == Some("!") {
+            self.bump();
+            return Ok(CondExpr::Not(Box::new(self.cond_term()?)));
+        }
+        if self.peek_op() == Some(Op::LParen) {
+            self.bump();
+            let inner = self.cond_or()?;
+            self.expect_op(Op::RParen)?;
+            return Ok(inner);
+        }
+        // A unary operator claims the word after it. Checked before the binary
+        // shape because `-n` and `-z` take one operand where `-eq` takes two,
+        // and both start with `-`.
+        if let Some(op) = self.peek_reserved().filter(|w| is_cond_unary(w)) {
+            let op = op.to_string();
+            self.bump();
+            let arg = self.cond_operand()?;
+            return Ok(CondExpr::Unary { op, arg });
+        }
+        let lhs = self.cond_operand()?;
+        let Some(op) = self.peek_cond_op() else {
+            return Ok(CondExpr::Word(lhs));
+        };
+        self.bump();
+        let rhs = self.cond_operand()?;
+        Ok(CondExpr::Binary { op, lhs, rhs })
+    }
+
+    /// The binary operator at the cursor, whether it arrived as a word (`==`,
+    /// `-eq`) or as punctuation the lexer already claimed (`<`, `>`).
+    fn peek_cond_op(&mut self) -> Option<CondOp> {
+        match self.peek_op() {
+            Some(Op::Less) => return Some(CondOp::Before),
+            Some(Op::Great) => return Some(CondOp::After),
+            _ => {}
+        }
+        let w = self.peek_reserved()?;
+        Some(match w {
+            "==" | "=" => CondOp::Match,
+            "!=" => CondOp::NoMatch,
+            "-eq" => CondOp::Arith(ArithCmp::Eq),
+            "-ne" => CondOp::Arith(ArithCmp::Ne),
+            "-lt" => CondOp::Arith(ArithCmp::Lt),
+            "-le" => CondOp::Arith(ArithCmp::Le),
+            "-gt" => CondOp::Arith(ArithCmp::Gt),
+            "-ge" => CondOp::Arith(ArithCmp::Ge),
+            "-ef" => CondOp::File("-ef"),
+            "-nt" => CondOp::File("-nt"),
+            "-ot" => CondOp::File("-ot"),
+            _ => return None,
+        })
+    }
+
+    /// One operand word. `]]` is refused here so a missing operand is reported
+    /// against the operator that wanted it rather than swallowing the closer and
+    /// failing at end of input.
+    fn cond_operand(&mut self) -> Syn<Word> {
+        match self.peek() {
+            Some(Tok::Word(w)) if w.plain() != Some("]]") => {
+                let w = w.clone();
+                self.bump();
+                Ok(w)
+            }
+            // An `IoNumber` is digits written HARD AGAINST a redirection
+            // operator, so inside `[[ ]]` it can only come from `2>1` -- and
+            // bash calls that a conditional syntax error rather than a
+            // comparison of "2" with "1". Turning it back into a word would
+            // silently answer a question the user did not ask. (`[[ 2 -gt 1 ]]`
+            // never reaches here: the space makes `2` an ordinary word.)
+            Some(Tok::IoNumber(_)) => Err(
+                "syntax error: unexpected redirection inside `[[`".to_string()
+            ),
+            None | Some(Tok::Eof) => Err(format!("{INCOMPLETE}: expected `]]`")),
+            _ => Err(format!(
+                "syntax error: expected an operand inside `[[`, found {}",
+                self.describe()
+            )),
+        }
     }
 
     fn at_func_def(&mut self) -> bool {

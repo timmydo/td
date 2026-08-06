@@ -177,9 +177,64 @@ pub enum Cmd {
         items: Vec<CaseItem>,
         redirs: Vec<Redir>,
     },
+    /// `[[ expr ]]` — the conditional command. Not a builtin: its operands are
+    /// neither field-split nor pathname-expanded, and `<`/`>`/`&&` inside it are
+    /// comparisons rather than redirections and list operators, so it has to be
+    /// syntax. busybox ash provides it under `ASH_BASH_COMPAT`, which td's
+    /// defconfig enables, so it is in this shell's model.
+    Cond { expr: CondExpr, redirs: Vec<Redir> },
     /// `name() compound` — `Arc` so a call site can hold the body while the
     /// definition is redefined out from under it.
     FuncDef { name: String, body: Arc<Cmd> },
+}
+
+/// The expression inside `[[ ]]`. A tree rather than an argument vector — which
+/// is what `test` gets — because the operators bind: `!` tighter than `&&`,
+/// `&&` tighter than `||`, and parentheses group. `test` recovers that from a
+/// flat argv at run time and has to guess at ambiguities; here the parser knows.
+#[derive(Clone, Debug)]
+pub enum CondExpr {
+    /// A bare word: true when it expands to a non-empty string.
+    Word(Word),
+    /// `-X word`, the unary operators `test` already serves, plus `-v`.
+    Unary { op: String, arg: Word },
+    /// `lhs OP rhs`. The RHS of `==`/`!=`/`=` is a PATTERN, which is why it
+    /// stays a `Word` here: its quoting decides, per character, whether a `*`
+    /// matches anything or itself.
+    Binary { op: CondOp, lhs: Word, rhs: Word },
+    Not(Box<CondExpr>),
+    And(Box<CondExpr>, Box<CondExpr>),
+    Or(Box<CondExpr>, Box<CondExpr>),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ArithCmp {
+    Eq,
+    Ne,
+    Lt,
+    Le,
+    Gt,
+    Ge,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CondOp {
+    /// `==` and `=`: the right side is a pattern.
+    Match,
+    /// `!=`: the right side is a pattern.
+    NoMatch,
+    /// `<` / `>`: string order. NOT numeric -- `[[ 10 < 9 ]]` is true, and the
+    /// numeric spellings are the `-lt` family.
+    Before,
+    After,
+    /// `-eq`, `-ne`, `-lt`, `-le`, `-gt`, `-ge`. Both operands are ARITHMETIC
+    /// EXPRESSIONS, not integers -- `[[ 1+1 -eq 2 ]]` and, with `x=5`,
+    /// `[[ x -eq 5 ]]` are both true, where `test x -eq 5` is an error. That is
+    /// why these do not defer to `test` the way the file operators below do.
+    Arith(ArithCmp),
+    /// `-ef`, `-nt`, `-ot`: file comparisons, which ARE `test`'s, spelled here
+    /// rather than duplicated.
+    File(&'static str),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

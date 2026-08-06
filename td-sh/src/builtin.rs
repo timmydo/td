@@ -1447,6 +1447,27 @@ pub fn apply_named_option(sh: &mut Shell, name: &str, on: bool) -> bool {
     true
 }
 
+/// Is the named `-o` option ON? The reader for `[[ -o name ]]`, which is why it
+/// lives beside the writer: the two must agree about the names, and a name the
+/// setter accepts as a no-op is one this has to answer for rather than call
+/// unknown. An unrecognised name is FALSE, not an error, as bash's is.
+pub fn named_option_is_set(sh: &Shell, name: &str) -> bool {
+    match name {
+        "errexit" => sh.opts.errexit,
+        "nounset" => sh.opts.nounset,
+        "xtrace" => sh.opts.xtrace,
+        "noglob" => sh.opts.noglob,
+        "verbose" => sh.opts.verbose,
+        "noclobber" => sh.opts.noclobber,
+        "noexec" => sh.opts.noexec,
+        "allexport" => sh.opts.allexport,
+        "stdin" => sh.opts.stdin,
+        // The names the setter takes and ignores: off, because this shell has
+        // no such behaviour to report as on.
+        _ => false,
+    }
+}
+
 /// A usage error in a SPECIAL builtin, and the ONE route for them: POSIX 2.8.1
 /// ends a non-interactive shell on one, while dash's sh_error returns an
 /// interactive one to its prompt. Reaching for `Shell::fatal` here instead would
@@ -3426,7 +3447,7 @@ fn is_binary(op: &str) -> bool {
     )
 }
 
-fn binary_op(sh: &Shell, a: &str, op: &str, b: &str) -> Result<bool, String> {
+pub fn binary_op(sh: &Shell, a: &str, op: &str, b: &str) -> Result<bool, String> {
     match op {
         "=" => Ok(a == b),
         "!=" => Ok(a != b),
@@ -3455,7 +3476,7 @@ fn int_arg(s: &str) -> Result<i64, String> {
         .map_err(|_| format!("integer expression expected: `{s}`"))
 }
 
-fn unary_op(sh: &Shell, op: &str, arg: &str) -> Result<bool, String> {
+pub fn unary_op(sh: &Shell, op: &str, arg: &str) -> Result<bool, String> {
     use std::os::unix::fs::FileTypeExt;
     let path = || sh.resolve(arg);
     Ok(match op {

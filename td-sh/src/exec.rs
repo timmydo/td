@@ -13,7 +13,8 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use crate::ast::{AndOr, Cmd, Conn, List, Pipeline, Redir, Sep, Word};
+use crate::arith;
+use crate::ast::{AndOr, ArithCmp, Cmd, CondExpr, CondOp, Conn, List, Pipeline, Redir, Sep, Word};
 use crate::builtin;
 use crate::expand;
 use crate::parser::{self, Aliases};
@@ -1039,6 +1040,7 @@ fn run_command_inner(sh: &mut Shell, cmd: &Cmd) -> R<()> {
             process::run_subshell(sh, &list, &redirs)
         }
         Cmd::Group { body, redirs } => with_redirs(sh, redirs, |sh| run_list(sh, body)),
+        Cmd::Cond { expr, redirs } => with_redirs(sh, redirs, |sh| run_cond(sh, expr)),
         Cmd::If {
             arms,
             otherwise,
@@ -1162,6 +1164,161 @@ fn break_out(sh: &mut Shell, n: u32) -> R<()> {
     } else {
         Ok(())
     }
+}
+
+/// `[[ expr ]]`. Status 0 for true, 1 for false, 2 for a bad expression -- the
+/// statuses `test` uses, so a script cannot tell the two constructs apart by
+/// them.
+fn run_cond(sh: &mut Shell, expr: &CondExpr) -> R<()> {
+    match eval_cond(sh, expr)? {
+        Ok(true) => sh.set_status(0),
+        Ok(false) => sh.set_status(1),
+        Err(CondError { msg, status }) => {
+            // `write_stderr` supplies the newline.
+            let _ = write_stderr(sh, &format!("td-sh: [[: {msg}"));
+            sh.set_status(status);
+        }
+    }
+    Ok(())
+}
+
+/// A reported expression failure: what to say, and what status to leave. The
+/// STATUS varies because bash's does -- a malformed ARITHMETIC operand is
+/// diagnosed and then treated as FALSE (1), where a malformed expression is 2,
+/// the status `test` uses for one.
+struct CondError {
+    msg: String,
+    status: i32,
+}
+
+impl CondError {
+    /// A malformed EXPRESSION: status 2, the one `test` reports for one.
+    fn bad(msg: String) -> CondError {
+        CondError { msg, status: 2 }
+    }
+}
+
+/// Two error channels, and they are not interchangeable. The OUTER `R` carries
+/// a `Sig` -- expansion runs inside `[[ ]]`, so `set -u` on an unset operand or
+/// an `exit` from a command substitution has to leave the whole construct, not
+/// become a false result. The INNER `Result` is the expression being malformed,
+/// which is status 2 and a diagnostic.
+///
+/// `&&` and `||` SHORT-CIRCUIT, which is not merely an optimisation: the right
+/// side of `[[ -n $f && -r $f ]]` is written on the assumption the left one
+/// held, and evaluating it anyway can error where bash reports false.
+fn eval_cond(sh: &mut Shell, expr: &CondExpr) -> R<Result<bool, CondError>> {
+    Ok(match expr {
+        CondExpr::Word(w) => Ok(!expand::expand_single(sh, w)?.is_empty()),
+        CondExpr::Not(inner) => match eval_cond(sh, inner)? {
+            Ok(v) => Ok(!v),
+            e => e,
+        },
+        CondExpr::And(l, r) => match eval_cond(sh, l)? {
+            Ok(true) => eval_cond(sh, r)?,
+            other => other,
+        },
+        CondExpr::Or(l, r) => match eval_cond(sh, l)? {
+            Ok(false) => eval_cond(sh, r)?,
+            other => other,
+        },
+        CondExpr::Unary { op, arg } => {
+            let arg = expand::expand_single(sh, arg)?;
+            // Three operators `test` does not serve, for three different
+            // reasons. `-v` (is this NAME set) has no `test` spelling at all.
+            // `-o` (is this shell option on) is the reader for what `set -o`
+            // writes. And `-a` is file-exists HERE while in `test` it is the
+            // binary AND operator -- inside `[[ ]]` the connective is `&&`, so
+            // the letter is free and bash gives it to `-e`'s meaning.
+            match op.as_str() {
+                "-v" => Ok(cond_is_set(sh, &arg)),
+                "-o" => Ok(builtin::named_option_is_set(sh, &arg)),
+                "-a" => builtin::unary_op(sh, "e", &arg).map_err(CondError::bad),
+                _ => builtin::unary_op(sh, op.strip_prefix('-').unwrap_or(op), &arg)
+                    .map_err(CondError::bad),
+            }
+        }
+        CondExpr::Binary { op, lhs, rhs } => {
+            let left = expand::expand_single(sh, lhs)?;
+            match op {
+                // The right side is a PATTERN, matched exactly as `case` does:
+                // an unquoted `*` matches anything, a quoted one matches itself.
+                // That per-character distinction is why the RHS is still a Word
+                // here rather than a string -- flattening it would lose it.
+                CondOp::Match | CondOp::NoMatch => {
+                    let chars = expand::expand_pattern(sh, rhs)?;
+                    let units = pattern::compile(&chars);
+                    let hit = pattern::matches(&units, &left);
+                    Ok(if matches!(op, CondOp::Match) { hit } else { !hit })
+                }
+                CondOp::Before => Ok(left < expand::expand_single(sh, rhs)?),
+                CondOp::After => Ok(left > expand::expand_single(sh, rhs)?),
+                // ARITHMETIC on both sides, not integer parsing: `[[ 1+1 -eq 2 ]]`
+                // holds, and a bare name is its value (`x=5; [[ x -eq 5 ]]`),
+                // where `test x -eq 5` is an error. Measured against bash rather
+                // than assumed -- reusing `test`'s comparison here was wrong for
+                // every one of those.
+                CondOp::Arith(cmp) => {
+                    let right = expand::expand_single(sh, rhs)?;
+                    let (a, b) = match (cond_arith(sh, &left), cond_arith(sh, &right)) {
+                        (Ok(a), Ok(b)) => (a, b),
+                        // Diagnosed, then FALSE -- bash's answer, and the reason
+                        // `CondError` carries a status rather than assuming 2.
+                        (Err(msg), _) | (_, Err(msg)) => {
+                            return Ok(Err(CondError { msg, status: 1 }))
+                        }
+                    };
+                    Ok(match cmp {
+                        ArithCmp::Eq => a == b,
+                        ArithCmp::Ne => a != b,
+                        ArithCmp::Lt => a < b,
+                        ArithCmp::Le => a <= b,
+                        ArithCmp::Gt => a > b,
+                        ArithCmp::Ge => a >= b,
+                    })
+                }
+                CondOp::File(spelling) => {
+                    let right = expand::expand_single(sh, rhs)?;
+                    builtin::binary_op(sh, &left, spelling, &right).map_err(CondError::bad)
+                }
+            }
+        }
+    })
+}
+
+/// `-v NAME`. A positional is set when the list is long enough, which
+/// `get_var` cannot answer: positionals live in `params`, not in the variable
+/// table, so `set -- a; [[ -v 1 ]]` reported UNSET while `$1` expanded to `a`.
+/// A digit is the only special parameter bash's `-v` accepts.
+fn cond_is_set(sh: &Shell, name: &str) -> bool {
+    if !name.is_empty() && name.bytes().all(|b| b.is_ascii_digit()) {
+        return match name.parse::<usize>() {
+            // `$0` is the shell's own name and is always set.
+            Ok(0) => true,
+            Ok(n) => sh.params.len() >= n,
+            Err(_) => false,
+        };
+    }
+    sh.get_var(name).is_some()
+}
+
+/// One side of an `-eq`-family comparison. A BLANK operand is zero, which is
+/// bash's answer for `[[ "" -eq 0 ]]` and the reason this is not a bare
+/// `arith::eval`: an unset variable is the commonest way to reach here, and
+/// erroring would turn a false comparison into a diagnostic. Deliberately NOT
+/// pushed down into `arith` itself -- td-sh's `$(( ))` reports an empty
+/// expression as an error today, and changing that is a separate decision about
+/// a different construct.
+/// Reported rather than FATAL, which is the difference between this and
+/// `$(( ))`: bash answers `[[ 1+ -eq 2 ]]` with a diagnostic and a false result
+/// and carries on, where `arith::eval` would end a non-interactive shell at the
+/// first bad expression -- and an operand here is usually a variable somebody
+/// else set.
+fn cond_arith(sh: &mut Shell, text: &str) -> Result<i64, String> {
+    if text.trim().is_empty() {
+        return Ok(0);
+    }
+    arith::try_eval(sh, text)
 }
 
 fn run_case(sh: &mut Shell, word: &Word, items: &[crate::ast::CaseItem]) -> R<()> {
@@ -1953,6 +2110,198 @@ mod tests {
     fn while_loop_counts() {
         let (_, out, _) = run("i=0; while [ $i -lt 3 ]; do echo $i; i=$((i + 1)); done");
         assert_eq!(out, "0\n1\n2\n");
+    }
+
+    /// `[[ ]]`'s operands are neither field-split nor pathname-expanded, which
+    /// is the whole reason it is syntax rather than a builtin: `[ -n $f ]` on a
+    /// name with a space in it is a syntax error, and this is not.
+    #[test]
+    fn a_conditional_does_not_split_or_glob_its_operands() {
+        let (st, _, _) = run("f='a b'; [[ -n $f ]]");
+        assert_eq!(st, 0);
+        // Two words to `test`, one to `[[ ]]`.
+        let (st, _, _) = run("f='a b'; [[ $f == 'a b' ]]");
+        assert_eq!(st, 0);
+    }
+
+    /// The right side of `==` is a PATTERN, and its QUOTING decides per
+    /// character -- exactly `case`'s rule. Getting this backwards would make
+    /// every `[[ $x == *.c ]]` a literal comparison.
+    #[test]
+    fn a_conditional_match_takes_its_right_side_as_a_pattern() {
+        assert_eq!(run("[[ abc == a* ]]").0, 0);
+        assert_eq!(run("[[ abc == \"a*\" ]]").0, 1);
+        assert_eq!(run("[[ 'a*' == \"a*\" ]]").0, 0);
+        assert_eq!(run("[[ abc == ?b? ]]").0, 0);
+        assert_eq!(run("[[ abc != a* ]]").0, 1);
+    }
+
+    /// `<`/`>` are STRING order inside `[[ ]]`, where outside they are
+    /// redirections -- `[[ 10 < 9 ]]` is true because "1" sorts before "9",
+    /// and the numeric spellings are the `-lt` family. Both directions are
+    /// pinned because a `<` read as a redirection would silently create a file
+    /// and report success.
+    #[test]
+    fn a_conditional_compares_strings_with_angle_brackets() {
+        assert_eq!(run("[[ a < b ]]").0, 0);
+        assert_eq!(run("[[ b < a ]]").0, 1);
+        assert_eq!(run("[[ 10 < 9 ]]").0, 0);
+        assert_eq!(run("[[ 10 -lt 9 ]]").0, 1);
+    }
+
+    /// The `-eq` family evaluates both sides as ARITHMETIC, not as integers:
+    /// `[[ 1+1 -eq 2 ]]` holds and a bare name is its value, where
+    /// `test x -eq 5` is an error. Measured against bash rather than assumed --
+    /// deferring these to `test`'s comparison was wrong for every line here.
+    #[test]
+    fn a_conditional_compares_numbers_arithmetically() {
+        assert_eq!(run("x=5; [[ x -eq 5 ]]").0, 0);
+        assert_eq!(run("[[ 1+1 -eq 2 ]]").0, 0);
+        // An unset name is zero in arithmetic, so this is false, not an error.
+        assert_eq!(run("[[ nosuch -eq 1 ]]").0, 1);
+        assert_eq!(run("[[ nosuch -eq 0 ]]").0, 0);
+        // ...and so is an operand that expanded to nothing at all.
+        assert_eq!(run("[[ \"\" -eq 0 ]]").0, 0);
+        assert_eq!(run("[[ 3 -ne 4 && 2 -le 2 ]]").0, 0);
+    }
+
+    /// `!`, `&&`, `||` and parentheses bind as the parser says rather than as a
+    /// flat argv has to guess, and `&&`/`||` SHORT-CIRCUIT.
+    #[test]
+    fn a_conditional_binds_and_short_circuits() {
+        assert_eq!(run("[[ ! a == b ]]").0, 0);
+        assert_eq!(run("[[ ! ! a == a ]]").0, 0);
+        assert_eq!(run("[[ a == a || b == c ]]").0, 0);
+        assert_eq!(run("[[ ( a == b ) || ( c == c ) ]]").0, 0);
+        assert_eq!(run("[[ a == a && b == b && c == c ]]").0, 0);
+        // The right side of a failed `&&` is never evaluated: a command
+        // substitution there would otherwise run.
+        let (st, out, _) = run("[[ a == b && $(echo ran) == ran ]]; echo $?");
+        assert_eq!((st, out.as_str()), (0, "1\n"));
+    }
+
+    /// `( … )` and `!` inside `[[ ]]` recurse WITHOUT passing through
+    /// `parse_command`, so they need its depth cap explicitly. This crate builds
+    /// with `panic = "abort"`, which makes an overflow the shell DYING rather
+    /// than a diagnostic -- and it did, with SIGABRT, until `cond_term` was
+    /// guarded. Both shapes are pinned: the parenthesis nesting that found it,
+    /// and the `!` chain that reaches the same recursion without any bracket.
+    #[test]
+    fn a_deeply_nested_conditional_errors_instead_of_overflowing() {
+        // The shell's own status, not `echo $?`: this is a PARSE error, so it
+        // ends the whole input and nothing after it runs.
+        let src = format!("[[ {} a {} ]]", "(".repeat(5000), ")".repeat(5000));
+        assert_eq!(run(&src).0, 2);
+        let src = format!("[[ {} a ]]", "! ".repeat(5000));
+        assert_eq!(run(&src).0, 2);
+        // A FLAT chain is the same hazard by a different route: parsing it
+        // iterates, but the tree is left-deep and both `eval_cond` and its own
+        // `Drop` walk that spine, so a long chain aborted with nothing deep in
+        // the parser's stack to show for it.
+        let src = format!("[[ t{} ]]", " && t".repeat(100_000));
+        assert_eq!(run(&src).0, 2);
+        let src = format!("[[ t{} ]]", " || t".repeat(100_000));
+        assert_eq!(run(&src).0, 2);
+        // ...and a chain of ordinary length still runs.
+        let src = format!("[[ a == a{} ]]; echo $?", " && a == a".repeat(200));
+        assert_eq!(run(&src).1, "0\n");
+        // ...and an ordinary depth still parses and runs.
+        assert_eq!(run("[[ ((((a)))) ]]; echo $?").1, "0\n");
+    }
+
+    /// The three unary operators `test` does not serve. `-a` is the interesting
+    /// one: in `test` that spelling is the binary AND operator, so `test`'s
+    /// roster cannot have it, while inside `[[ ]]` the connective is `&&` and
+    /// bash gives the letter `-e`'s meaning.
+    #[test]
+    fn a_conditional_serves_three_operators_test_cannot() {
+        assert_eq!(run("v=1; [[ -v v ]]").0, 0);
+        assert_eq!(run("v=''; [[ -v v ]]").0, 0);
+        assert_eq!(run("unset u; [[ -v u ]]").0, 1);
+        // A POSITIONAL is set when the list reaches it. These live in `params`
+        // rather than in the variable table, so asking `get_var` reported every
+        // one of them unset while `$1` expanded to its value.
+        assert_eq!(run("set -- a; [[ -v 1 ]]").0, 0);
+        assert_eq!(run("set -- a; [[ -v 2 ]]").0, 1);
+        assert_eq!(run("set -- a b; [[ -v 2 ]]").0, 0);
+        assert_eq!(run("[[ -v 0 ]]").0, 0);
+        assert_eq!(run("[[ -a / ]]").0, 0);
+        assert_eq!(run("[[ -a /nonexistent-4b8a ]]").0, 1);
+        assert_eq!(run("set -e; [[ -o errexit ]]").0, 0);
+        assert_eq!(run("[[ -o errexit ]]").0, 1);
+        // An unknown option name is FALSE, not an error, as bash's is.
+        assert_eq!(run("[[ -o nosuchoption ]]").0, 1);
+    }
+
+    /// A bad ARITHMETIC operand is diagnosed and then FALSE, and above all does
+    /// not end the shell. Routing it through `arith::eval` did: that reports a
+    /// malformed expression the way `$(( ))` needs, which is fatally, so
+    /// `[[ 1+ -eq 2 ]]` killed a non-interactive shell before the next command.
+    /// bash prints the diagnostic, answers 1, and carries on.
+    #[test]
+    fn a_bad_arithmetic_operand_is_false_and_does_not_end_the_shell() {
+        let (st, out, err) = run("[[ 1+ -eq 2 ]]; echo after");
+        assert_eq!(out, "after\n", "the shell did not survive the expression");
+        assert_eq!(st, 0);
+        assert!(err.contains("arithmetic"), "no diagnostic: {err:?}");
+        // The conditional's own status is bash's 1, not the 2 a malformed
+        // EXPRESSION gets.
+        assert_eq!(run("[[ 1+ -eq 2 ]]").0, 1);
+    }
+
+    /// A newline continues the expression exactly where a TERM is expected and
+    /// ends it everywhere else. All ten positions were measured against bash
+    /// 5.2 rather than assumed: it accepts the first five here and refuses the
+    /// last five, which is the split this pins.
+    #[test]
+    fn a_newline_continues_a_conditional_only_where_a_term_is_expected() {
+        for src in [
+            "[[\na ]]",
+            "[[ a &&\nb ]]",
+            "[[ a ||\nb ]]",
+            "[[ (\na ) ]]",
+            "[[ a &&\n\n\nb ]]",
+        ] {
+            assert_eq!(run(src).0, 0, "should have continued: {src:?}");
+        }
+        // `[[ !\na ]]` continues too, and negating a non-empty word is 1.
+        assert_eq!(run("[[ !\na ]]").0, 1);
+        for src in [
+            "[[ a\n&& b ]]",
+            "[[ ( a\n) ]]",
+            "[[ a\n]]",
+            "[[ a ==\na ]]",
+            "[[ -z\na ]]",
+        ] {
+            assert_eq!(run(src).0, 2, "should have been a syntax error: {src:?}");
+        }
+    }
+
+    /// Digits hard against a redirection operator lex as an `IoNumber`, which
+    /// inside `[[ ]]` can only come from `2>1`. bash calls that a conditional
+    /// syntax error; reading it back as a word would silently compare "2" with
+    /// "1" and answer a question nobody asked.
+    #[test]
+    fn a_redirection_inside_a_conditional_is_a_syntax_error() {
+        assert_eq!(run("[[ 2>1 ]]").0, 2);
+        // The spaced form is an ordinary comparison and still works.
+        assert_eq!(run("[[ 2 -gt 1 ]]").0, 0);
+    }
+
+    /// A malformed expression is status 2 with a diagnostic, as `test`'s is --
+    /// so a script cannot tell the two constructs apart by their statuses --
+    /// and `[[` keeps its ordinary meaning everywhere the grammar does not
+    /// claim it.
+    #[test]
+    fn a_malformed_conditional_is_status_two_and_the_word_still_works() {
+        let (st, _, err) = run("[[ || true ]]");
+        assert_eq!(st, 2);
+        assert!(!err.is_empty(), "a syntax error said nothing");
+        let (st, _, _) = run("[[ a == ]]");
+        assert_eq!(st, 2);
+        // Not in command position, `[[` is just a word.
+        let (_, out, _) = run("echo [[ ]]");
+        assert_eq!(out, "[[ ]]\n");
     }
 
     #[test]

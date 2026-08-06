@@ -7,26 +7,30 @@
 
 use crate::exec::{Shell, R};
 
+/// `$(( ))`'s entry point: a malformed expression is FATAL, which is what dash
+/// does and what every caller here wants.
 pub fn eval(sh: &mut Shell, text: &str) -> R<i64> {
+    match try_eval(sh, text) {
+        Ok(v) => Ok(v),
+        Err(msg) => Err(sh.fatal(&msg, 2)),
+    }
+}
+
+/// The same evaluation, reporting a malformed expression as a MESSAGE instead
+/// of ending the shell. `[[ ]]` needs this: bash answers `[[ 1+ -eq 2 ]]` with
+/// a diagnostic and a false result and carries on, where routing it through
+/// `eval` above kills a non-interactive shell at the first bad expression.
+pub fn try_eval(sh: &mut Shell, text: &str) -> Result<i64, String> {
     let mut p = Arith {
-        toks: match lex(text) {
-            Ok(t) => t,
-            Err(e) => return Err(sh.fatal(&format!("arithmetic: {e}"), 2)),
-        },
+        toks: lex(text).map_err(|e| format!("arithmetic: {e}"))?,
         pos: 0,
         pdepth: 0,
         live: true,
         ternary_dead: false,
     };
-    let value = match p.expr_comma(sh) {
-        Ok(v) => v,
-        Err(e) => return Err(sh.fatal(&format!("arithmetic: {e}"), 2)),
-    };
+    let value = p.expr_comma(sh).map_err(|e| format!("arithmetic: {e}"))?;
     if p.peek().is_some() {
-        return Err(sh.fatal(
-            &format!("arithmetic: unexpected trailing input in {text:?}"),
-            2,
-        ));
+        return Err(format!("arithmetic: unexpected trailing input in {text:?}"));
     }
     Ok(value)
 }

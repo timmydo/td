@@ -24,7 +24,7 @@
 #           Oils helpers (`argv.py`, `printenv.py`). Those are real mismatches
 #           today, but MEASURE before mining the list, because `not found` is
 #           reported identically for two different things. Some of those names are
-#           BUILTINS td-sh does not have (`shopt`, `[[`, `typeset`, `declare`,
+#           BUILTINS td-sh does not have (`shopt`, `typeset`, `declare`,
 #           `compgen`) and are true shell gaps; the rest are EXTERNALS the harness
 #           withholds (`cat`, `touch`, `mkdir`, `grep`, `sed`, `wc`) and say
 #           nothing about the shell. Both groups are large and neither dominates.
@@ -398,8 +398,6 @@ xfail blog2.test.sh::-a -a
 xfail blog2.test.sh::-a -a -a -a
 xfail blog2.test.sh::-a -a -a -a -a -a
 xfail blog2.test.sh::-a -a -a -a -a -a -a -a
-xfail bool-parse.test.sh::Allowed: [[ = ]] and [[ == ]]
-xfail bool-parse.test.sh::[[ -f -f ]] and [[ -f == ]]
 xfail bool-parse.test.sh::test builtin - Unexpected trailing word '--' (#2409)
 xfail bool-parse.test.sh::test builtin: ( == ) is confusing: equality test or non-empty string test
 xfail brace-expansion.test.sh::Adjacent comma and range works
@@ -554,6 +552,7 @@ xfail builtin-echo.test.sh::echo to redirected directory is an error
 xfail builtin-echo.test.sh::incomplete hex escape
 xfail builtin-echo.test.sh::incomplete octal escape
 xfail builtin-echo.test.sh::incomplete unicode escape
+xfail builtin-eval-source.test.sh::Eval in does tilde expansion
 xfail builtin-eval-source.test.sh::source doesn't crash when targeting a directory
 xfail builtin-eval-source.test.sh::source finds files in PATH before current dir
 xfail builtin-eval-source.test.sh::source looks in PATH for files
@@ -752,49 +751,14 @@ xfail command_.test.sh::filling $PATH cache, then insert the same command earlie
 xfail command_.test.sh::hash -r doesn't allow additional args
 xfail command_.test.sh::hash with args
 xfail command_.test.sh::hash without args prints the cache
-xfail dbracket.test.sh::!= on strings
 xfail dbracket.test.sh::(( array1 == array2 )) doesn't work
-xfail dbracket.test.sh::-eq coercion produces weird results
-xfail dbracket.test.sh::-eq does dynamic arithmetic parsing (not supported in OSH)
-xfail dbracket.test.sh::-eq on strings
-xfail dbracket.test.sh::> on strings
-xfail dbracket.test.sh::Argument that looks like a real operator
 xfail dbracket.test.sh::Array coerces to string (shopt -s strict_array to disallow)
-xfail dbracket.test.sh::Hex literals with -eq
-xfail dbracket.test.sh::Octal literals with -eq
-xfail dbracket.test.sh::Quotes don't matter in comparison
 xfail dbracket.test.sh::User array compared to "$@" (broken unless shopt -s strict_array)
-xfail dbracket.test.sh::[[ && ]] is syntax error
-xfail dbracket.test.sh::[[ '(' ]] is treated as literal
-xfail dbracket.test.sh::[[ '(' foo ]] is syntax error
-xfail dbracket.test.sh::[[ -z '>' a ]] is syntax error
-xfail dbracket.test.sh::[[ -z ]] is syntax error
-xfail dbracket.test.sh::[[ ]] is syntax error
 xfail dbracket.test.sh::[[ ]] with redirect
-xfail dbracket.test.sh::[[ a 3< b ]] doesn't work (bug regression)
-xfail dbracket.test.sh::[[ compare with literal -f (compare with test-builtin.test.sh)
-xfail dbracket.test.sh::[[ compound expressions
-xfail dbracket.test.sh::[[ empty string is false
-xfail dbracket.test.sh::[[ glob matching with escapes
-xfail dbracket.test.sh::[[ glob matching with unquoted var
-xfail dbracket.test.sh::[[ glob matching, [[ has no glob expansion
-xfail dbracket.test.sh::[[ has no word splitting
-xfail dbracket.test.sh::[[ has quote joining
 xfail dbracket.test.sh::[[ over multiple lines is OK
 xfail dbracket.test.sh::[[ regex matching
-xfail dbracket.test.sh::[[ regex syntax error
-xfail dbracket.test.sh::[[ with op variable (compare with test-builtin.test.sh)
-xfail dbracket.test.sh::[[ with unquoted empty var (compare with test-builtin.test.sh)
-xfail dbracket.test.sh::\(\) in pattern (regression)
-xfail dbracket.test.sh::empty ! is treated as literal
-xfail dbracket.test.sh::equality
-xfail dbracket.test.sh::more tilde expansion
 xfail dbracket.test.sh::negative numbers - zero, decimal, octal, hex, base N
-xfail dbracket.test.sh::precedence of && and || inside [[
-xfail dbracket.test.sh::special chars
-xfail dbracket.test.sh::tilde expansion in [[
 xfail dbracket.test.sh::tilde expansion with =~ (confusing)
-xfail dbracket.test.sh::|| chain
 xfail divergence.test.sh::builtin cat crashes a subshell (#2530)
 xfail dparen.test.sh::(( ))
 xfail dparen.test.sh::(( )) in if statement
@@ -886,7 +850,6 @@ xfail extglob-match.test.sh::match is anchored
 xfail extglob-match.test.sh::nested @()
 xfail extglob-match.test.sh::nested @() with quotes and vars
 xfail extglob-match.test.sh::nested extglob
-xfail extglob-match.test.sh::regular glob of single unicode char
 xfail extglob-match.test.sh::repeated match is anchored
 xfail extglob-match.test.sh::repetition with glob
 xfail extglob-match.test.sh::simple repetition with *(foo) and +(Foo)
@@ -946,6 +909,7 @@ xfail here-doc.test.sh::Here doc with pipe continued on last line
 xfail here-doc.test.sh::Here doc with pipe on first line
 xfail here-doc.test.sh::Here doc with quote expansion in terminator
 xfail here-doc.test.sh::Here doc with var sub, command sub, arith sub
+xfail here-doc.test.sh::Here doc within subshell with boolean
 xfail here-doc.test.sh::Here redirect with explicit descriptor
 xfail here-doc.test.sh::Mixing << and <<-
 xfail here-doc.test.sh::Multiple here docs in pipeline
@@ -1050,6 +1014,7 @@ xfail parse-errors.test.sh::Bad var sub caught at parse time
 xfail parse-errors.test.sh::Long Token - 65535 bytes
 xfail parse-errors.test.sh::Token that's too long for Oils - 65536 bytes
 xfail parse-errors.test.sh::do unexpected
+xfail parse-errors.test.sh::empty clause in [[
 xfail parse-errors.test.sh::{ is its own word, needs a space
 xfail parse-errors.test.sh::} is a parse error
 xfail pipeline.test.sh::Brace group in pipeline
@@ -1177,10 +1142,8 @@ xfail regex.test.sh::Fix single quotes by storing in variable ##2
 xfail regex.test.sh::Match is unanchored at both ends
 xfail regex.test.sh::Mixing quoted and unquoted parts
 xfail regex.test.sh::Multiple adjacent () groups
-xfail regex.test.sh::Omitting ( )
 xfail regex.test.sh::Operator chars ; & but not |
 xfail regex.test.sh::Operators and space lose meaning inside ()
-xfail regex.test.sh::Parse error with 2 words
 xfail regex.test.sh::Quoted { and +
 xfail regex.test.sh::Quotes '' "" $'' $"" in pattern
 xfail regex.test.sh::Regex quoted with \ -- preferred in bash
@@ -1190,7 +1153,6 @@ xfail regex.test.sh::Regex to match literal brackets []
 xfail regex.test.sh::Regex to match literals . ^ $ etc.
 xfail regex.test.sh::Regex with |
 xfail regex.test.sh::Unicode in pattern
-xfail regex.test.sh::Unquoted { is a regex parse error
 xfail regex.test.sh::c|a unquoted
 xfail regex.test.sh::make a lisp example
 xfail regex.test.sh::pattern $f(x)  -- regression
@@ -1211,6 +1173,7 @@ xfail sh-options-bash.test.sh::SHELLOPTS reflects flags like sh -x
 xfail sh-options-bash.test.sh::export SHELLOPTS does cross-process tracing
 xfail sh-options-bash.test.sh::export SHELLOPTS does cross-process tracing with bash
 xfail sh-options-bash.test.sh::shopt -s progcomp hostcomplete are stubs (bash-completion)
+xfail sh-options.test.sh::$- and more options
 xfail sh-options.test.sh::$- with interactive shell
 xfail sh-options.test.sh::$- with pipefail
 xfail sh-options.test.sh::noclobber off
@@ -1383,6 +1346,7 @@ xfail vars-special.test.sh::$?
 xfail vars-special.test.sh::$HOME is NOT set
 xfail vars-special.test.sh::$LINENO for assignment
 xfail vars-special.test.sh::$LINENO in "bare" redirect arg (bug regression)
+xfail vars-special.test.sh::$LINENO in [[
 xfail vars-special.test.sh::$LINENO in case
 xfail vars-special.test.sh::$LINENO in for loop
 xfail vars-special.test.sh::$LINENO in other for loops
