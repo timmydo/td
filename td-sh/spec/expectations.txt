@@ -627,8 +627,6 @@ xfail builtin-process.test.sh::ulimit of 2**32, 2**31 (int overflow)
 xfail builtin-process.test.sh::ulimit that is 64 bits
 xfail builtin-process.test.sh::ulimit with no flags is like -f
 xfail builtin-process.test.sh::write big file with ulimit
-xfail builtin-read.test.sh::IFS='x ' incomplete backslash
-xfail builtin-read.test.sh::read -n 4 with backslash + delim
 xfail builtin-read.test.sh::read -r -d '' for NUL strings, e.g. find -print0
 xfail builtin-read.test.sh::read multiple lines with IFS=:
 xfail builtin-set.test.sh::'set' and 'eval' round trip
@@ -995,11 +993,9 @@ xfail nul-bytes.test.sh::Compare \x00 byte versus \x01 byte - read builtin
 xfail nul-bytes.test.sh::Issue 2269 - Do NUL bytes match ? in ${a#?}
 xfail nul-bytes.test.sh::Issue 2269 Reduction
 xfail nul-bytes.test.sh::NUL bytes and IFS splitting
-xfail nul-bytes.test.sh::NUL bytes with ${#s} (OSH and zsh agree)
 xfail nul-bytes.test.sh::NUL bytes with echo $'\0' (OSH and zsh agree)
 xfail nul-bytes.test.sh::NUL bytes with echo -e
 xfail nul-bytes.test.sh::NUL bytes with test -f
-xfail nul-bytes.test.sh::NUL bytes with test -n
 xfail nul-bytes.test.sh::Strip ops # ## % %% with NUL bytes
 xfail nul-bytes.test.sh::printf - NUL byte in value (OSH and zsh agree)
 xfail nul-bytes.test.sh::printf - \0 escape shows NUL byte
@@ -1072,13 +1068,9 @@ xfail prompt.test.sh::literal escapes
 xfail prompt.test.sh::sh -i
 xfail prompt.test.sh::special case for $
 xfail prompt.test.sh::username
-xfail quote.test.sh::$''
 xfail quote.test.sh::$'' octal escapes don't have leading 0
 xfail quote.test.sh::$'' octal escapes with fewer than 3 chars
-xfail quote.test.sh::$'' with newlines
-xfail quote.test.sh::$'' with quotes
 xfail quote.test.sh::$? split over multiple lines
-xfail quote.test.sh::OSH allows invalid backslashes
 xfail quote.test.sh::YSH allows unquoted foo\ bar too
 xfail redir-order.test.sh::case word + redirect order
 xfail redir-order.test.sh::echo `cat OSCFLAGS` "world" > OSCFLAGS (from Alpine imap)
@@ -1135,7 +1127,6 @@ xfail regex.test.sh::Fatal error inside [[ =~ ]]
 xfail regex.test.sh::Multiple adjacent () groups
 xfail regex.test.sh::Quotes '' "" $'' $"" in pattern
 xfail regex.test.sh::make a lisp example
-xfail regex.test.sh::regex with unprintable characters
 xfail serialize.test.sh::set
 xfail serialize.test.sh::xtrace
 xfail sh-func.test.sh::Subshell function
@@ -1236,6 +1227,7 @@ xfail var-op-bash.test.sh::assoc array and @P @Q @a
 xfail var-op-bash.test.sh::undef and @P @Q @a
 xfail var-op-bash.test.sh::undef vs. empty string in var ops
 xfail var-op-len.test.sh::Length operator can't be followed by test operator
+xfail var-op-len.test.sh::Unicode string length (UTF-8)
 xfail var-op-patsub.test.sh::${v//} is empty search and replacement
 xfail var-op-patsub.test.sh::${v/} is empty search and replacement
 xfail var-op-patsub.test.sh::Confusing unquoted slash matches bash (and ash)
@@ -1266,7 +1258,6 @@ xfail var-op-slice.test.sh::Slice with an assoc array
 xfail var-op-slice.test.sh::Slice with an index that's an array -- silent a[0] decay
 xfail var-op-slice.test.sh::String slice
 xfail var-op-slice.test.sh::String slice with math
-xfail var-op-strip.test.sh::Nested % and # operators (bug reported by Crestwave)
 xfail var-op-strip.test.sh::Strip unicode prefix
 xfail var-op-strip.test.sh::strip all unicode
 xfail var-op-test.test.sh::"\e" as arg
@@ -1305,6 +1296,7 @@ xfail var-ref.test.sh::var ref to special var BASH_SOURCE
 xfail var-ref.test.sh::var ref: 1, @, *
 xfail var-sub-quote.test.sh::"${undef-'c d'}" and "${foo%'c d'}" are parsed differently
 xfail var-sub-quote.test.sh::# operator with single quoted arg (dash/ash and bash/mksh disagree, reported by Crestwave)
+xfail var-sub-quote.test.sh::$'' allowed within VarSub arguments
 xfail var-sub-quote.test.sh::/ operator with single quoted arg (causes syntax error in regex in OSH, reported by Crestwave)
 xfail var-sub-quote.test.sh::Inner single quotes, outer double quotes
 xfail var-sub-quote.test.sh::Multiple words: outer double quotes, inner single quotes

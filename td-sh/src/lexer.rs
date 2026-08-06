@@ -158,6 +158,191 @@ fn is_special_param(c: char) -> bool {
     matches!(c, '@' | '*' | '#' | '?' | '-' | '$' | '!')
 }
 
+/// What a numeric `$'...'` escape named. The distinction is the whole reason
+/// that scan accumulates bytes: `\xNN` and `\NNN` name a BYTE, so a pair of
+/// them can spell one character, while `\uNNNN` names a code point outright.
+enum Esc {
+    Byte(u32),
+    Point(u32),
+}
+
+fn push_utf8(bytes: &mut Vec<u8>, c: char) {
+    bytes.extend_from_slice(c.encode_utf8(&mut [0u8; 4]).as_bytes());
+}
+
+/// Evaluate the body of a `$'...'`, whose extent the lexer has already found.
+/// Bytes rather than characters, because `\xNN` and `\NNN` name a byte: two of
+/// them can spell one character, and decoding each in isolation would turn
+/// `$'\xc3\xa9'` into `Ã©`.
+fn decode_ansi_c(body: &[char]) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(body.len());
+    // A NUL ends the STRING, not the walk: the rest is still consumed so the
+    // escapes in it cannot be mistaken for anything else.
+    let mut done = false;
+    let mut i = 0;
+    while let Some(&c) = body.get(i) {
+        i += 1;
+        if c != '\\' {
+            if !done {
+                push_utf8(&mut bytes, c);
+            }
+            continue;
+        }
+        // A trailing backslash cannot occur -- the scan pairs it with the
+        // character it escapes -- but it is a literal if it ever does.
+        let Some(&esc) = body.get(i) else {
+            if !done {
+                push_utf8(&mut bytes, c);
+            }
+            break;
+        };
+        i += 1;
+        let simple = match esc {
+            'a' => Some('\u{7}'),
+            'b' => Some('\u{8}'),
+            'e' | 'E' => Some('\u{1b}'),
+            'f' => Some('\u{c}'),
+            'n' => Some('\n'),
+            'r' => Some('\r'),
+            't' => Some('\t'),
+            'v' => Some('\u{b}'),
+            '\\' => Some('\\'),
+            '\'' => Some('\''),
+            '"' => Some('"'),
+            '?' => Some('?'),
+            _ => None,
+        };
+        if let Some(ch) = simple {
+            if !done {
+                push_utf8(&mut bytes, ch);
+            }
+            continue;
+        }
+        // `\cX` is a control character: the operand masked to five bits, which
+        // makes `$'\cA'` a 0x01 and folds case for free. NOT `^ 0x40`, which
+        // agrees on letters and parts company on everything else -- `$'\c0'` is
+        // 0x10, not 0x70. Handled apart from the numeric escapes because it can
+        // yield more than one byte.
+        if esc == 'c' {
+            let Some(&ch) = body.get(i) else {
+                // No operand at all: bash leaves `\c` as those two characters.
+                if !done {
+                    push_utf8(&mut bytes, '\\');
+                    push_utf8(&mut bytes, 'c');
+                }
+                continue;
+            };
+            i += 1;
+            // The operand is taken RAW -- `$'\c\a'` is Ctrl-\ then a literal
+            // `a`, not Ctrl-\a. The one exception is a backslash operand, which
+            // is written doubled, so a second one belongs to it.
+            if ch == '\\' && body.get(i) == Some(&'\\') {
+                i += 1;
+            }
+            // bash masks the operand's FIRST BYTE and leaves any others alone,
+            // so a multi-byte operand keeps its tail: `$'\cé'` is 0x03 then a
+            // stray 0xa9.
+            if let Some((&first, rest)) = ch.encode_utf8(&mut [0u8; 4]).as_bytes().split_first() {
+                // Ctrl-? is DEL by convention rather than the mask's 0x1f.
+                let ctl = if ch == '?' { 0x7f } else { first & 0x1f };
+                if ctl == 0 {
+                    done = true;
+                } else if !done {
+                    bytes.push(ctl);
+                    bytes.extend_from_slice(rest);
+                }
+            }
+            continue;
+        }
+        // The numeric forms. Each stops at its own digit count, so `$'\x41B'`
+        // is "AB" rather than a three-digit hex read.
+        let decoded = match esc {
+            // `\x{...}` is bash's ksh93-compatible brace form and takes any
+            // number of digits, closing brace optional. It is a BYTE like the
+            // bare form -- `\x{263a}` is masked to 0x3a, not a code point -- and
+            // `\x{}` names zero, which truncates. There is no such form for
+            // `\u`/`\U`, where `$'\u{41}'` stays literal.
+            'x' if body.get(i) == Some(&'{') => {
+                i += 1;
+                let mut n: u32 = 0;
+                while let Some(d) = body.get(i).and_then(|c| c.to_digit(16)) {
+                    i += 1;
+                    n = n.saturating_mul(16).saturating_add(d);
+                }
+                if body.get(i) == Some(&'}') {
+                    i += 1;
+                }
+                Some(Esc::Byte(n))
+            }
+            'x' => take_digits(body, &mut i, 16, 2).map(Esc::Byte),
+            'u' => take_digits(body, &mut i, 16, 4).map(Esc::Point),
+            'U' => take_digits(body, &mut i, 16, 8).map(Esc::Point),
+            '0'..='7' => {
+                // The first digit was already taken; bash reads three in all.
+                let mut n = esc.to_digit(8).unwrap_or(0);
+                for _ in 0..2 {
+                    let Some(d) = body.get(i).and_then(|c| c.to_digit(8)) else {
+                        break;
+                    };
+                    i += 1;
+                    n = n.saturating_mul(8).saturating_add(d);
+                }
+                Some(Esc::Byte(n))
+            }
+            _ => None,
+        };
+        match decoded {
+            Some(Esc::Byte(n)) => {
+                // Three octal digits can name 0x1ff, which is not a byte; bash
+                // keeps the low eight bits, so `$'\400'` is a NUL and
+                // truncates. Mask BEFORE that test, or it does not.
+                let b = (n & 0xff) as u8;
+                if b == 0 {
+                    done = true;
+                } else if !done {
+                    bytes.push(b);
+                }
+            }
+            // A `\u` names a code point. One that is not a scalar value -- a
+            // surrogate, or past U+10FFFF -- has no representation here and
+            // takes the same replacement an undecodable byte does.
+            Some(Esc::Point(0)) => done = true,
+            // Above 0x7fffffff bash emits NOTHING rather than any encoding of
+            // it, so a replacement character here would be a character bash
+            // does not produce at all.
+            Some(Esc::Point(n)) if n > 0x7fff_ffff => {}
+            Some(Esc::Point(n)) => {
+                if !done {
+                    push_utf8(&mut bytes, char::from_u32(n).unwrap_or(char::REPLACEMENT_CHARACTER));
+                }
+            }
+            None => {
+                // An unclaimed escape keeps BOTH characters.
+                if !done {
+                    push_utf8(&mut bytes, '\\');
+                    push_utf8(&mut bytes, esc);
+                }
+            }
+        }
+    }
+    bytes
+}
+
+/// Up to `max` digits in `radix` from `*i`, advancing it past them. `None` when
+/// there is not even one, which is what leaves `$'\x'` a literal `\x`.
+fn take_digits(body: &[char], i: &mut usize, radix: u32, max: usize) -> Option<u32> {
+    let mut value: Option<u32> = None;
+    for _ in 0..max {
+        let Some(d) = body.get(*i).and_then(|c| c.to_digit(radix)) else {
+            break;
+        };
+        *i += 1;
+        value = Some(value.unwrap_or(0).saturating_mul(radix).saturating_add(d));
+    }
+    value
+}
+
+
 /// Accumulates a word, merging runs of like segments so `abc` is one `Lit`.
 #[derive(Default)]
 struct WordBuf {
@@ -1013,6 +1198,51 @@ impl Lexer {
         }
     }
 
+    /// The body of a `$'...'`, decoded. Escapes are accumulated as BYTES and
+    /// the whole body is decoded once at the end, because `\xNN` and `\NNN`
+    /// name a byte rather than a character: `$'\xc3\xa9'` is the two bytes
+    /// that spell `é`, and decoding each in isolation would give `Ã©`. A
+    /// sequence that is not valid UTF-8 becomes U+FFFD, which is already what
+    /// this shell does with one out of a command substitution -- its words are
+    /// Unicode scalar values and there is no byte string to put a raw `\xff`
+    /// in.
+    ///
+    /// Every character is pushed QUOTED, because the result of the construct
+    /// is a quoted string: `set -- $'a b'` is ONE argument and `echo $'*'`
+    /// prints an asterisk, both measured. An escape the roster does not claim
+    /// keeps its backslash, as bash's does -- `$'\q'` is two characters.
+    fn scan_ansi_c(&mut self, buf: &mut WordBuf) -> Syn<()> {
+        // Phase one finds the BODY. bash locates the closing quote before
+        // evaluating anything in it, honouring only a backslash-escape, so
+        // `$'\c'` is a literal `\c` rather than a `\c` that takes the quote as
+        // its operand and runs on to the next one.
+        let mut body: Vec<char> = Vec::new();
+        loop {
+            let Some(c) = self.sc.bump() else {
+                return Err(format!("{INCOMPLETE}: unmatched `$'`"));
+            };
+            if c == '\'' {
+                break;
+            }
+            body.push(c);
+            if c == '\\' {
+                let Some(esc) = self.sc.bump() else {
+                    return Err(format!("{INCOMPLETE}: unmatched `$'`"));
+                };
+                body.push(esc);
+            }
+        }
+        // Even an empty body is a real (empty) field, exactly as `''` is: `set
+        // -- a $'' b` passes THREE arguments, and a `$'\0'` that truncated to
+        // nothing is the same case.
+        buf.open_quoted();
+        for ch in String::from_utf8_lossy(&decode_ansi_c(&body)).chars() {
+            buf.push_quoted(ch);
+        }
+        Ok(())
+    }
+
+
     /// A `$`-expansion. `in_dq` marks it as appearing inside double quotes, so
     /// its result is neither field-split nor globbed.
     fn scan_dollar(&mut self, buf: &mut WordBuf, in_dq: bool) -> Syn<()> {
@@ -1029,6 +1259,13 @@ impl Lexer {
             return Ok(());
         };
         match c {
+            // `$'...'` -- ANSI-C quoting. NOT a construct inside double quotes,
+            // where bash leaves `$'x'` as those four characters, so the `$` has
+            // already been pushed by then and this arm is unquoted-only.
+            '\'' if !in_dq => {
+                self.sc.bump();
+                self.scan_ansi_c(buf)?;
+            }
             '{' => {
                 self.sc.bump();
                 let inner = self.scan_braced()?;
@@ -1113,6 +1350,30 @@ impl Lexer {
                     }
                     continue;
                 }
+                // As in `scan_paren_body`: only a `$'...'` escapes its own
+                // closing quote, so `${v#$'a\''}` ends at the wrong one under a
+                // plain single quote's rule and the brace never closes.
+                '$' if self.sc.peek() == Some('\'') => {
+                    out.push('$');
+                    out.push('\'');
+                    self.sc.bump();
+                    loop {
+                        let Some(q) = self.sc.bump() else {
+                            return Err(format!("{INCOMPLETE}: unmatched `$'`"));
+                        };
+                        out.push(q);
+                        if q == '\\' {
+                            if let Some(n) = self.sc.bump() {
+                                out.push(n);
+                            }
+                            continue;
+                        }
+                        if q == '\'' {
+                            break;
+                        }
+                    }
+                    continue;
+                }
                 '\'' | '"' => {
                     out.push(c);
                     // Copy the quoted run verbatim so a `}` inside it is not
@@ -1160,6 +1421,31 @@ impl Lexer {
                     out.push('\\');
                     if let Some(n) = self.sc.bump() {
                         out.push(n);
+                    }
+                    continue;
+                }
+                // A `$'...'` escapes its own closing quote, where a plain
+                // `'...'` has no escapes at all -- so this scan has to tell
+                // them apart or `$(printf %s $'a\'b')` ends at the WRONG quote
+                // and the substitution never closes.
+                '$' if self.sc.peek() == Some('\'') => {
+                    out.push('$');
+                    out.push('\'');
+                    self.sc.bump();
+                    loop {
+                        let Some(q) = self.sc.bump() else {
+                            return Err(format!("{INCOMPLETE}: unmatched `$'`"));
+                        };
+                        out.push(q);
+                        if q == '\\' {
+                            if let Some(n) = self.sc.bump() {
+                                out.push(n);
+                            }
+                            continue;
+                        }
+                        if q == '\'' {
+                            break;
+                        }
                     }
                     continue;
                 }
@@ -1769,5 +2055,283 @@ mod tests {
             }
             Ok(_) => Err("an unterminated quote must not tokenize".into()),
         }
+    }
+
+    /// The text of the single word `$'...'` produces. Every escape below was
+    /// measured against bash 5.2 rather than read off the manual.
+    fn ansi_c(body: &str) -> Syn<String> {
+        let ws = words(&format!("x $'{body}'"))?;
+        let w = nth(&ws, 1)?;
+        // The construct is QUOTED throughout: one `Seg`, and a `Quoted` one,
+        // so `$'a b'` cannot field-split and `$'*'` cannot glob.
+        // Exactly ONE quoted segment, never zero: a segment-less word is not an
+        // empty field but no field at all, and accepting one here is what let
+        // `set -- a $'' b` pass two arguments unnoticed.
+        match w.0.as_slice() {
+            [Seg::Quoted(s)] => Ok(s.clone()),
+            other => Err(format!("expected one quoted segment, got {other:?}")),
+        }
+    }
+
+    #[test]
+    fn ansi_c_quoting_decodes_the_named_escapes() -> Syn<()> {
+        assert_eq!(ansi_c(r"\a\b\e\E\f\n\r\t\v")?, "\u{7}\u{8}\u{1b}\u{1b}\u{c}\n\r\t\u{b}");
+        assert_eq!(ansi_c(r"\\")?, "\\");
+        assert_eq!(ansi_c(r"\'")?, "'");
+        assert_eq!(ansi_c(r#"\""#)?, "\"");
+        assert_eq!(ansi_c(r"\?")?, "?");
+        // An escape the roster does not claim keeps BOTH characters.
+        assert_eq!(ansi_c(r"\q")?, "\\q");
+        assert_eq!(ansi_c(r"\uZ")?, "\\uZ");
+        // bash has no `\u{...}` brace form, so that is the same case.
+        assert_eq!(ansi_c(r"\u{03bc}")?, "\\u{03bc}");
+        assert_eq!(ansi_c("plain")?, "plain");
+        Ok(())
+    }
+
+    #[test]
+    fn ansi_c_numeric_escapes_stop_at_their_own_digit_count() -> Syn<()> {
+        // Two hex digits, so the `B` is a literal rather than a third digit.
+        assert_eq!(ansi_c(r"\x41B")?, "AB");
+        assert_eq!(ansi_c(r"\x41")?, "A");
+        // Three octal, so `\0101` is a NUL-free `\010` then `1`.
+        assert_eq!(ansi_c(r"\111")?, "I");
+        assert_eq!(ansi_c(r"\1ff")?, "\u{1}ff");
+        assert_eq!(ansi_c(r"A")?, "A");
+        assert_eq!(ansi_c(r"\U0001F600")?, "\u{1F600}");
+        // Not even one digit: the escape is unclaimed and keeps its backslash.
+        assert_eq!(ansi_c(r"\x")?, "\\x");
+        Ok(())
+    }
+
+    /// `\x{...}` is bash's ksh93-compatible brace form: any number of digits,
+    /// closing brace optional, and a BYTE rather than a code point -- so it is
+    /// masked, unlike `\u`. There is no such form for `\u`/`\U`, which is why
+    /// generalising from one to the other would be wrong.
+    #[test]
+    fn a_braced_hex_escape_is_a_byte_and_the_brace_is_optional() -> Syn<()> {
+        assert_eq!(ansi_c(r"\x{41}")?, "A");
+        assert_eq!(ansi_c(r"\x{7}")?, "\u{7}");
+        // Unterminated still takes the digits it read.
+        assert_eq!(ansi_c(r"\x{41")?, "A");
+        // Masked to a byte: 0x263a becomes 0x3a, NOT the code point.
+        assert_eq!(ansi_c(r"\x{263a}")?, ":");
+        assert_eq!(ansi_c(r"\x{1ff}")?, "\u{fffd}");
+        // No digits names zero, which truncates as any other NUL does.
+        assert_eq!(ansi_c(r"\x{}")?, "");
+        assert_eq!(ansi_c(r"\x{0}b")?, "");
+        // `\u`/`\U` have NO brace form -- both stay literal in bash.
+        assert_eq!(ansi_c(r"\u{41}")?, "\\u{41}");
+        assert_eq!(ansi_c(r"\U{41}")?, "\\U{41}");
+        Ok(())
+    }
+
+    /// Above 0x7fffffff bash emits NOTHING rather than any encoding, so a
+    /// replacement character would be a character bash never produces. Between
+    /// U+10FFFF and there it emits an extended UTF-8 form this shell cannot
+    /// represent, which is the documented divergence instead.
+    #[test]
+    fn a_code_point_past_the_encodable_range_emits_nothing() -> Syn<()> {
+        assert_eq!(ansi_c(r"a\U80000000!b")?, "a!b");
+        assert_eq!(ansi_c(r"\Uffffffff")?, "");
+        assert_eq!(ansi_c(r"a\U7fffffffb")?, "a\u{fffd}b");
+        assert_eq!(ansi_c(r"a\U00110000b")?, "a\u{fffd}b");
+        Ok(())
+    }
+
+    /// `\xNN` and `\NNN` name a BYTE, so two of them can spell one character.
+    /// Decoding each in isolation would give `Ã©` for the first of these.
+    #[test]
+    fn ansi_c_byte_escapes_compose_into_one_character() -> Syn<()> {
+        assert_eq!(ansi_c(r"\xc3\xa9")?, "é");
+        assert_eq!(ansi_c(r"\xe6\x97\xa5")?, "日");
+        assert_eq!(ansi_c(r"\303\251")?, "é");
+        // A lone high byte is not valid UTF-8 and has no representation in a
+        // shell whose words are Unicode scalar values, so it takes the same
+        // replacement a command substitution's would. bash emits the raw byte.
+        assert_eq!(ansi_c(r"\xff")?, "\u{fffd}");
+        // As does a code point that is not a scalar value: a surrogate, or one
+        // past the Unicode maximum. bash emits WTF-8 for both.
+        assert_eq!(ansi_c(r"\uD800")?, "\u{fffd}");
+        assert_eq!(ansi_c(r"\U00110000")?, "\u{fffd}");
+        Ok(())
+    }
+
+    /// Ctrl-X is its letter masked to five bits, NOT xor 0x40: the two agree on
+    /// letters and part company on everything else.
+    #[test]
+    fn ansi_c_control_escapes_mask_to_five_bits() -> Syn<()> {
+        assert_eq!(ansi_c(r"\cA")?, "\u{1}");
+        assert_eq!(ansi_c(r"\ca")?, "\u{1}");
+        assert_eq!(ansi_c(r"\cz")?, "\u{1a}");
+        // The arms that `^ 0x40` would get wrong.
+        assert_eq!(ansi_c(r"\c0")?, "\u{10}");
+        assert_eq!(ansi_c(r"\c9")?, "\u{19}");
+        assert_eq!(ansi_c(r"\c-")?, "\r");
+        assert_eq!(ansi_c(r"\c+")?, "\u{b}");
+        assert_eq!(ansi_c(r#"\c""#)?, "\u{2}");
+        // The operand is taken RAW -- Ctrl-\ then a literal `a`, not Ctrl-\a --
+        // except that a backslash operand is written doubled.
+        assert_eq!(ansi_c(r"\c\a")?, "\u{1c}a");
+        assert_eq!(ansi_c(r"\c\\")?, "\u{1c}");
+        assert_eq!(ansi_c(r"\c\\x")?, "\u{1c}x");
+        // Ctrl-? is DEL by convention rather than the mask's 0x1f.
+        assert_eq!(ansi_c(r"\c?")?, "\u{7f}");
+        // An operand that masks to NUL truncates like any other NUL.
+        assert_eq!(ansi_c(r"\c@x")?, "");
+        assert_eq!(ansi_c(r"a\c@b")?, "a");
+        assert_eq!(ansi_c(r"\c x")?, "");
+        // Only the FIRST byte is masked, so a multi-byte operand keeps its
+        // tail: bash gives 0x03 then a stray 0xa9, which is not valid UTF-8 and
+        // so takes the replacement the byte escapes above do.
+        assert_eq!(ansi_c(r"\cé!")?, "\u{3}\u{fffd}!");
+        Ok(())
+    }
+
+    /// A NUL cannot travel in an argument and bash TRUNCATES there. The rest of
+    /// the body is still LEXED, or a later `\'` would be read as the closing
+    /// quote and the construct would end in the wrong place.
+    #[test]
+    fn ansi_c_truncates_at_a_nul_but_keeps_lexing() -> Syn<()> {
+        assert_eq!(ansi_c(r"a\0b")?, "a");
+        assert_eq!(ansi_c(r"\0")?, "");
+        assert_eq!(ansi_c(r"\x00b")?, "");
+        // `\400` masks to 0x00, so the mask has to come BEFORE the NUL test.
+        assert_eq!(ansi_c(r"\400x")?, "");
+        // The escaped quote is an escape, not the closer: one word, and the
+        // `c` after it belongs to this construct rather than to the next word.
+        assert_eq!(ansi_c(r"a\0b\'c")?, "a");
+        assert_eq!(words(r"echo $'a\0b\'c' second")?.len(), 3);
+        Ok(())
+    }
+
+    /// The closing quote is found BEFORE anything is evaluated, so an escape
+    /// cannot reach past it. `\c` is the one that could: it consumes an
+    /// operand, and consuming the quote would run the construct on to the next
+    /// one -- turning a program bash rejects into a BEL, and `$'\c'` into an
+    /// error where bash has two literal characters.
+    #[test]
+    fn the_closing_quote_is_found_before_escapes_are_evaluated() -> Syn<()> {
+        assert_eq!(ansi_c(r"\c")?, "\\c");
+        assert_eq!(ansi_c(r"a\cb")?, "a\u{2}");
+        // `\c` takes the backslash and the quote is left a literal, so this is
+        // Ctrl-\ followed by `'` -- not a closed string followed by junk.
+        assert_eq!(ansi_c(r"\c\'")?, "\u{1c}'");
+        // An escaped quote is body, not the closer.
+        assert_eq!(ansi_c(r"a\'b")?, "a'b");
+        assert_eq!(ansi_c(r"a\\")?, "a\\");
+        // And a body that never closes is incomplete rather than silently
+        // ending at whatever `\c` swallowed.
+        for src in [r"echo $'\c", r"echo $'\c\", r"echo $'a\'"] {
+            match tokenize(src) {
+                Err(e) => assert!(e.starts_with(INCOMPLETE), "{src}: {e}"),
+                Ok(_) => return Err(format!("`{src}` must not tokenize").into()),
+            }
+        }
+        Ok(())
+    }
+
+    /// The body of a `$'...'` is text the SCRIPT supplies, and every escape in
+    /// it walks an index over a slice. A linear congruential generator rather
+    /// than a dependency, seeded fixed so a failure reproduces.
+    #[test]
+    fn no_ansi_c_body_panics_the_decoder() {
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut rand = move || {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (seed >> 33) as u32
+        };
+        // Oversample what the walk turns on: backslashes, the escapes that
+        // consume a following operand, and digits in both radices.
+        let pick = |r: u32| -> char {
+            match r % 10 {
+                0..=2 => '\\',
+                3 => "cxuU01234567".chars().nth((r >> 8) as usize % 12).unwrap_or('c'),
+                4 => "89abcdefABCDEF".chars().nth((r >> 8) as usize % 14).unwrap_or('a'),
+                5 => '\'',
+                6 => ['é', '日', '\u{ff}', '\u{10fffd}'][(r >> 8) as usize % 4],
+                _ => char::from_u32(0x20 + (r >> 8) % 0x60).unwrap_or('a'),
+            }
+        };
+        for _ in 0..20_000 {
+            let n = rand() % 24;
+            let body: Vec<char> = (0..n).map(|_| pick(rand())).collect();
+            // The property is only that it returns: no panic, no overflow in a
+            // debug build, and no walk that fails to advance.
+            let out = decode_ansi_c(&body);
+            // A NUL never reaches the result -- it truncates instead.
+            assert!(!out.contains(&0), "NUL in output for {body:?}");
+            // And the same text through the WHOLE lexer, which is where the
+            // body-finding phase meets the escapes: a syntax error is a fine
+            // answer, hanging or panicking is not.
+            let src: String = body.iter().collect();
+            let _ = tokenize(&format!("echo $'{src}'"));
+            let _ = tokenize(&format!("echo $({src})"));
+        }
+    }
+
+    /// `$( )`'s body is scanned as RAW SOURCE to locate its closing paren, and
+    /// that scan has to tell `$'...'` from `'...'`: only the first escapes its
+    /// own closing quote, so reading `$'a\'b'` by the second's rule ends the
+    /// string at the wrong quote and the substitution never closes.
+    #[test]
+    fn a_substitution_body_knows_an_ansi_c_quote_from_a_plain_one() -> Syn<()> {
+        let body = |src: &str| -> Syn<String> {
+            let ws = words(src)?;
+            match nth(&ws, 1)?.0.as_slice() {
+                [Seg::Cmd { code, .. }] => Ok(code.clone()),
+                other => Err(format!("expected one command segment, got {other:?}")),
+            }
+        };
+        assert_eq!(body(r"echo $(f $'a\'b')")?, r"f $'a\'b'");
+        assert_eq!(body(r"echo $(f $'a\\')")?, r"f $'a\\'");
+        // A PLAIN single-quoted region still has no escapes, so the backslash
+        // before the quote is data and the region ends at that quote.
+        assert_eq!(body(r"echo $(f 'a\' b)")?, r"f 'a\' b");
+        // `${ }` scans its operand the same way, and for the same reason: the
+        // brace must not be found inside the string.
+        let param = |src: &str| -> Syn<String> {
+            let ws = words(src)?;
+            match nth(&ws, 1)?.0.as_slice() {
+                [Seg::Param(p)] => Ok(format!("{:?}", p.op)),
+                other => Err(format!("expected one param segment, got {other:?}")),
+            }
+        };
+        assert!(param(r"echo ${v#$'a\''}")?.contains("Trim"));
+        assert!(param(r"echo ${v#'a}b'}")?.contains("Trim"));
+        Ok(())
+    }
+
+    /// An empty result is an empty FIELD, not the absence of one -- `''`'s
+    /// rule. Without it `set -- a $'' b` passes two arguments and `test -n $''`
+    /// answers about the string `-n`.
+    #[test]
+    fn an_empty_ansi_c_quote_is_still_a_field() -> Syn<()> {
+        assert_eq!(ansi_c("")?, "");
+        assert_eq!(ansi_c(r"\0")?, "");
+        // Three words after `echo`, the middle one empty.
+        let ws = words(r"echo a $'' b")?;
+        assert_eq!(ws.len(), 4);
+        assert!(matches!(nth(&ws, 2)?.0.as_slice(), [Seg::Quoted(s)] if s.is_empty()));
+        Ok(())
+    }
+
+    #[test]
+    fn ansi_c_quoting_is_not_a_construct_inside_double_quotes() -> Syn<()> {
+        // bash leaves `$'x'` as those four characters there, measured.
+        let ws = words("echo \"$'a\\tb'\"")?;
+        assert_eq!(nth(&ws, 1)?.delimiter().map(|(t, _)| t), Some("$'a\\tb'".into()));
+        Ok(())
+    }
+
+    #[test]
+    fn an_unterminated_ansi_c_quote_reports_incomplete_input() -> Syn<()> {
+        for src in ["echo $'abc", "echo $'a\\", "echo $'a\\c"] {
+            match tokenize(src) {
+                Err(e) => assert!(e.starts_with(INCOMPLETE), "{src}: {e}"),
+                Ok(_) => return Err(format!("`{src}` must not tokenize").into()),
+            }
+        }
+        Ok(())
     }
 }
