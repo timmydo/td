@@ -37,6 +37,7 @@
 use std::io::{IsTerminal, Read, Seek, Write};
 use std::os::fd::AsFd;
 
+use crate::complete;
 use crate::term;
 
 /// What a read ended with.
@@ -90,7 +91,14 @@ impl Editor {
     /// too. Passed in rather than read from the kernel because the trap table is
     /// the shell's own record of what the operator asked for, and reading it
     /// here would make this a fourth caller of the syscall module.
-    pub fn read(&mut self, prompt: &str, interruptible: bool) -> Input {
+    /// `comp` is what Tab may offer, passed in for the same reason `Keys` is:
+    /// a test must be able to state the whole world.
+    pub fn read(
+        &mut self,
+        prompt: &str,
+        interruptible: bool,
+        comp: &complete::Source<'_>,
+    ) -> Input {
         let stdin = std::io::stdin();
         // An UNBUFFERED handle on the same file description, taken before raw
         // mode so a failure here needs no unwind. `std::io::Stdin` is a
@@ -129,7 +137,7 @@ impl Editor {
             intr: raw.intr(),
             eof: raw.eof(),
         };
-        let outcome = self.edit(prompt, &mut keys, &mut out, interruptible);
+        let outcome = self.edit(prompt, &mut keys, &mut out, interruptible, comp);
         // Put the terminal back BEFORE the newline that ends the line, so what
         // follows — a command's output, or the next prompt — starts on a
         // terminal in its own mode rather than in the editor's.
@@ -159,6 +167,7 @@ impl Editor {
         keys: &mut Keys<'_>,
         out: &mut W,
         interruptible: bool,
+        src: &complete::Source<'_>,
     ) -> Input {
         let mut buf = String::new();
         // The cursor as a BYTE index, always on a character boundary.
@@ -171,6 +180,9 @@ impl Editor {
         // A byte an escape sequence turned out not to want, re-dispatched on the
         // next turn: ESC followed by Enter must submit the line, not eat it.
         let mut pending: Option<u8> = None;
+        // Whether the LAST keystroke was a Tab, which is what makes the second
+        // one a listing. Cleared by every other key, as ash's `lastWasTab` is.
+        let mut last_tab = false;
 
         // Re-read on every keystroke rather than once: td-sh installs no
         // SIGWINCH handler, and `TIOCGWINSZ` is cheap next to a key press, so
@@ -182,6 +194,7 @@ impl Editor {
                 // A closed stdin mid-line is end of input, not an empty line.
                 return Input::Eof;
             };
+            let was_tab = std::mem::replace(&mut last_tab, false);
             // The two bytes the DRIVER owns come from the terminal's own
             // settings, so `stty intr '^X'` moves them; the editing keys below
             // are the conventional readline bindings rather than the driver's.
@@ -267,15 +280,42 @@ impl Editor {
                     Escape::Literal(b) => pending = Some(b),
                     Escape::Unknown => {}
                 },
-                // Tab is TYPED, not dropped and not completion: `<<-EOF` is a
-                // here-doc form whose whole point is the leading tab, so a
+                // Tab completes the word under the cursor, and a SECOND Tab
+                // lists what it could not choose between -- ash's `lastWasTab`.
+                // With nothing to complete the byte is TYPED instead: `<<-EOF`
+                // is a here-doc form whose whole point is the leading tab, so a
                 // prompt that cannot enter one cannot enter that script. It is
                 // DRAWN as a space (see `visible`) so one buffer character stays
                 // one column.
-                b'\t' => {
-                    buf.insert(pos, '\t');
-                    pos += 1;
-                }
+                b'\t' => match complete::complete(&buf, pos, src) {
+                    None => {
+                        buf.insert(pos, '\t');
+                        pos += 1;
+                    }
+                    Some(c) => {
+                        // A UNIQUE match finished the word, so the next Tab is
+                        // not a double-tab -- busybox clears `lastWasTab` in
+                        // exactly that branch (lineedit.c:1329). Without this,
+                        // a Tab after `pw<Tab>` sees an empty word past a
+                        // command and dumps the whole directory.
+                        last_tab = c.matches.len() > 1;
+                        // Boundary-safe: `start` comes from `char_indices` and
+                        // `end` is `pos`, which the invariant above keeps on a
+                        // boundary.
+                        if Some(c.insert.as_str()) != buf.get(c.start..c.end) {
+                            buf.replace_range(c.start..c.end, &c.insert);
+                            pos = c.start.saturating_add(c.insert.len());
+                        } else if was_tab {
+                            let _ = writeln!(out);
+                            let _ = write!(out, "{}", complete::listing(&c.matches, width));
+                            // The listing is on the screen, so the Tab AFTER
+                            // it does nothing and the one after that lists
+                            // again -- busybox's same alternation, which beeps
+                            // where this is silent.
+                            last_tab = false;
+                        }
+                    }
+                },
                 // Any other control byte is ignored rather than inserted: a
                 // literal 0x00 or 0x1a in the line would reach the parser as
                 // something no script can contain.
@@ -922,7 +962,7 @@ fn render_prompt(raw: &str, facts: &PromptFacts) -> String {
 /// COUNT skips them; the prompt is still drawn verbatim, so the terminal sees
 /// the colours. The line being edited needs no such treatment: control bytes
 /// are dropped on input, so a `\x1b` cannot get into the buffer.
-fn display_cols(text: &str) -> usize {
+pub fn display_cols(text: &str) -> usize {
     let mut cols = 0usize;
     let mut chars = text.chars();
     while let Some(c) = chars.next() {
@@ -1628,13 +1668,29 @@ mod tests {
 
     /// Drive the whole editor with a keystroke script and no terminal at all.
     fn typed(ed: &mut Editor, keys: &[u8], width: u16, interruptible: bool) -> (Input, String) {
+        // A world with nothing in it, so Tab is a literal tab -- what the
+        // editor did before completion existed, and what every test here but
+        // the completion ones is about.
+        let c = |_: &str| Vec::new();
+        let e = |_: &str, _: &str| Vec::new();
+        let comp = complete::Source { commands: &c, entries: &e };
+        typed_in(ed, keys, width, interruptible, &comp)
+    }
+
+    fn typed_in(
+        ed: &mut Editor,
+        keys: &[u8],
+        width: u16,
+        interruptible: bool,
+        comp: &complete::Source<'_>,
+    ) -> (Input, String) {
         let mut src = keys.iter().copied();
         let mut next = || src.next();
         let mut w = || Some(width);
         let mut k =
             Keys { next: &mut next, width: &mut w, intr: Some(0x03), eof: Some(0x04) };
         let mut out: Vec<u8> = Vec::new();
-        let got = ed.edit("$ ", &mut k, &mut out, interruptible);
+        let got = ed.edit("$ ", &mut k, &mut out, interruptible, comp);
         (got, String::from_utf8_lossy(&out).into_owned())
     }
 
@@ -1644,6 +1700,53 @@ mod tests {
             Input::Eof => "<eof>".to_string(),
             Input::Interrupted => "<int>".to_string(),
         }
+    }
+
+    /// Tab completes the word under the cursor, a SECOND Tab lists what it
+    /// could not choose between, and with nothing to complete the byte is
+    /// still TYPED -- which is what `<<-EOF` depends on.
+    #[test]
+    fn tab_completes_and_a_second_tab_lists() {
+        let mut ed = Editor::new();
+        let cmds: Vec<String> = ["echo", "echoes"].iter().map(|s| (*s).to_string()).collect();
+        let c = |p: &str| cmds.iter().filter(|s| s.starts_with(p)).cloned().collect();
+        // TWO entries, so a Tab on an empty word would LIST -- which is what
+        // the unique-match case below has to not do.
+        let e = |_: &str, p: &str| {
+            [("elm".to_string(), true), ("zed".to_string(), false)]
+                .into_iter()
+                .filter(|(n, _)| n.starts_with(p))
+                .collect()
+        };
+        let comp = complete::Source { commands: &c, entries: &e };
+        // One Tab puts the shared prefix in and lists nothing.
+        let (got, drawn) = typed_in(&mut ed, b"ec\t\r", 80, true, &comp);
+        assert!(matches!(got, Input::Line(ref t) if t == "echo"), "{got:?}");
+        assert!(!drawn.contains("echoes"), "one Tab listed: {drawn:?}");
+        // A second one adds nothing, so it lists both instead.
+        let (got, drawn) = typed_in(&mut ed, b"ec\t\t\r", 80, true, &comp);
+        assert!(matches!(got, Input::Line(ref t) if t == "echo"), "{got:?}");
+        assert!(drawn.contains("echo    echoes\n"), "no listing: {drawn:?}");
+        // A key between the two Tabs clears it, as ash's `lastWasTab` is.
+        let (_, drawn) = typed_in(&mut ed, b"ec\t\x06\t\r", 80, true, &comp);
+        assert!(!drawn.contains("echo    echoes\n"), "listed anyway: {drawn:?}");
+        // A unique match finishes the word with a space, a directory with `/`.
+        let (got, _) = typed_in(&mut ed, b"echoe\t\r", 80, true, &comp);
+        assert!(matches!(got, Input::Line(ref t) if t == "echoes "), "{got:?}");
+        let (got, _) = typed_in(&mut ed, b"cat e\t\r", 80, true, &comp);
+        assert!(matches!(got, Input::Line(ref t) if t == "cat elm/"), "{got:?}");
+        // Nothing matches: the tab is typed.
+        let (got, _) = typed_in(&mut ed, b"zz\t\r", 80, true, &comp);
+        assert!(matches!(got, Input::Line(ref t) if t == "zz\t"), "{got:?}");
+        // A UNIQUE match finished the word, so the Tab after it is not a
+        // double-tab: without that, `echoe<Tab><Tab>` sees an empty word past
+        // a command and dumps the whole directory.
+        let (_, drawn) = typed_in(&mut ed, b"echoe\t\t\r", 80, true, &comp);
+        assert!(!drawn.contains("elm"), "the second Tab listed a directory: {drawn:?}");
+        // ...and the Tab after a LISTING does nothing, with the one after that
+        // listing again -- so four Tabs print two listings, not three.
+        let (_, drawn) = typed_in(&mut ed, b"ec\t\t\t\t\r", 80, true, &comp);
+        assert_eq!(drawn.matches("echo    echoes\n").count(), 2, "{drawn:?}");
     }
 
     #[test]
@@ -1723,7 +1826,12 @@ mod tests {
         let mut w = || Some(80u16);
         let mut k = Keys { next: &mut next, width: &mut w, intr: None, eof: None };
         let mut out: Vec<u8> = Vec::new();
-        let got = ed.edit("$ ", &mut k, &mut out, true);
+        let c = |_: &str| Vec::new();
+        let e = |_: &str, _: &str| Vec::new();
+        let got = ed.edit("$ ", &mut k, &mut out, true, &complete::Source {
+            commands: &c,
+            entries: &e,
+        });
         assert!(matches!(got, Input::Line(ref t) if t == "ab"), "{got:?}");
     }
 

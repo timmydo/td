@@ -33,6 +33,7 @@
 mod arith;
 mod ast;
 mod builtin;
+mod complete;
 mod exec;
 mod expand;
 mod lexer;
@@ -482,7 +483,12 @@ fn read_complete(
         let ignored_on_entry = !builtin::may_set_signal(sh, SIGINT);
         let interruptible = !ignored_on_entry
             && !sh.traps.get(&SIGINT).is_some_and(String::is_empty);
-        match editor.read(&prompt, interruptible) {
+        // Built per line rather than once: `commands` reads `PATH` and the
+        // filesystem, and the command just run may have changed either.
+        let cmds = |p: &str| complete::commands(sh, p);
+        let ents = |d: &str, p: &str| complete::entries(sh, d, p);
+        let src = complete::Source { commands: &cmds, entries: &ents };
+        match editor.read(&prompt, interruptible, &src) {
             line::Input::Eof => return ReadResult::Eof,
             // Ctrl-C throws away the WHOLE unit, not just the line it arrived
             // on: half of an unfinished `if` is not something the operator
@@ -523,6 +529,7 @@ mod confinement {
         ("arith.rs", include_str!("arith.rs")),
         ("ast.rs", include_str!("ast.rs")),
         ("builtin.rs", include_str!("builtin.rs")),
+        ("complete.rs", include_str!("complete.rs")),
         ("exec.rs", include_str!("exec.rs")),
         ("expand.rs", include_str!("expand.rs")),
         ("lexer.rs", include_str!("lexer.rs")),

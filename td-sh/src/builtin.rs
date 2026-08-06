@@ -44,6 +44,15 @@ pub enum Builtin {
     Type,
 }
 
+/// Every name `lookup` answers to, for the completion candidate list. A `match`
+/// arm and a list entry are one fact written twice, so a source-text test below
+/// holds them together -- the compiler cannot.
+pub const NAMES: &[&str] = &[
+    ":", "[", ".", "alias", "break", "cd", "command", "continue", "echo", "eval", "exec", "exit",
+    "export", "false", "getopts", "local", "printf", "pwd", "read", "readonly", "return", "set",
+    "shift", "test", "trap", "true", "type", "umask", "unalias", "unset", "wait",
+];
+
 pub fn lookup(name: &str) -> Option<Builtin> {
     Some(match name {
         ":" => Builtin::Colon,
@@ -3641,6 +3650,31 @@ impl TestParser<'_> {
 #[cfg(test)]
 mod tests {
     use crate::process::{run_capturing, run_capturing_bytes};
+
+    /// A name `lookup` answers to but `NAMES` omits is a builtin Tab never
+    /// offers, and one in `NAMES` alone is a candidate that does not run.
+    /// Neither is a compile error, so the two lists are compared as text.
+    #[test]
+    fn the_completion_names_are_the_names_lookup_answers_to() {
+        const SRC: &str = include_str!("builtin.rs");
+        let body = SRC
+            .split_once("pub fn lookup(")
+            .and_then(|(_, r)| r.split_once("_ => return None"))
+            .map(|(b, _)| b)
+            .unwrap();
+        let mut arms: Vec<&str> = Vec::new();
+        let mut rest = body;
+        while let Some((_, after)) = rest.split_once('"') {
+            let (lit, tail) = after.split_once('"').unwrap();
+            arms.push(lit);
+            rest = tail;
+        }
+        assert!(arms.len() > 20, "the match arms did not parse out of the source");
+        arms.sort_unstable();
+        let mut names = super::NAMES.to_vec();
+        names.sort_unstable();
+        assert_eq!(arms, names, "`lookup`'s arms and `NAMES` disagree");
+    }
 
     #[test]
     fn echo_joins_with_spaces_and_newline() {
