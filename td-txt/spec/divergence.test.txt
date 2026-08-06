@@ -103,7 +103,7 @@ sed (td-txt) 0.1.0
 # include/exclude globs this applet refuses two cases below.
 ## argv: grep --help
 ## stdout:
-usage: grep [-aEFGHhicLlnoqRrsvwxyzZ] [-NUM] [-m NUM] [-A NUM] [-B NUM] [-C NUM] [-e PATTERN] [-f FILE] [PATTERN] [FILE]...
+usage: grep [-aEFGHhicLlnoqRrsvwxyzZ] [-NUM] [-d ACTION] [-m NUM] [-A NUM] [-B NUM] [-C NUM] [-e PATTERN] [-f FILE] [PATTERN] [FILE]...
 ## END
 ## stderr-json: ""
 ## status: 0
@@ -129,7 +129,7 @@ grep (td-txt) 0.1.0
 #### --help outranks what comes after the scan, a bad pattern included
 ## argv: grep --help -e [
 ## stdout:
-usage: grep [-aEFGHhicLlnoqRrsvwxyzZ] [-NUM] [-m NUM] [-A NUM] [-B NUM] [-C NUM] [-e PATTERN] [-f FILE] [PATTERN] [FILE]...
+usage: grep [-aEFGHhicLlnoqRrsvwxyzZ] [-NUM] [-d ACTION] [-m NUM] [-A NUM] [-B NUM] [-C NUM] [-e PATTERN] [-f FILE] [PATTERN] [FILE]...
 ## END
 ## stderr-json: ""
 ## status: 0
@@ -155,28 +155,6 @@ a
 ## stdout-json: ""
 ## status: 2
 ## stderr-contains: invalid option -- 'b'
-
-#### grep refuses -d rather than guessing which of its three actions was meant
-# GNU's -d ACTION is read/skip/recurse for a DIRECTORY operand, and `-d recurse'
-# is a second spelling of -r. Accepting only that spelling would fail open on the
-# other two, and `-d skip' in particular asks for silence about a directory this
-# applet reports; -r and -R are the spellings td's own scripts use.
-## argv: grep -d recurse a
-## stdin:
-a
-## END
-## stdout-json: ""
-## status: 2
-## stderr-contains: invalid option -- 'd'
-
-#### and --directories, its long spelling
-## argv: grep --directories=skip a
-## stdin:
-a
-## END
-## stdout-json: ""
-## status: 2
-## stderr-contains: unrecognized option
 
 #### grep refuses -D rather than guessing which of its two actions was meant
 # GNU's -D ACTION is read/skip for a device, FIFO or socket operand, and it is

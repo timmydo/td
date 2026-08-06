@@ -19,8 +19,22 @@ use crate::util::{
 /// scanner stops there; the `-A`/`-B`/`-C` argument has no such limit.
 const NUM_DIGIT_CAP: usize = 21;
 
-const USAGE: &str = "usage: grep [-aEFGHhicLlnoqRrsvwxyzZ] [-NUM] [-m NUM] [-A NUM] [-B NUM] [-C NUM] \
-                     [-e PATTERN] [-f FILE] [PATTERN] [FILE]...";
+const USAGE: &str = "usage: grep [-aEFGHhicLlnoqRrsvwxyzZ] [-NUM] [-d ACTION] [-m NUM] [-A NUM] \
+                     [-B NUM] [-C NUM] [-e PATTERN] [-f FILE] [PATTERN] [FILE]...";
+
+/// `-d`/`--directories`, which is also where `-r` and `-R` land: GNU spells the
+/// same setting three ways and the LAST one wins, so `grep -r -d skip a .` skips.
+/// The `-R` deref is NOT part of it and is sticky -- `-R -d recurse` still
+/// follows symlinks -- which is why `logical` stays a field of its own.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Dirs {
+    /// Read a directory as a file, so the read fails with `Is a directory`.
+    Read,
+    /// Pass over it without a word.
+    Skip,
+    /// Descend into it, which is what `-r` and `-R` also ask for.
+    Recurse,
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Syntax {
@@ -50,8 +64,9 @@ struct Conf {
     line_number: bool,
     /// `None` until `-H`/`-h` or the file count decides it.
     with_filename: Option<bool>,
-    recursive: bool,
-    /// `-R`: follow every symlink the walk finds, not only the operand.
+    dirs: Dirs,
+    /// `-R`: follow every symlink the walk finds, not only the operand. Sticky
+    /// rather than part of `dirs`, since `-R -d recurse` still follows them.
     logical: bool,
     max_count: Option<u64>,
     /// `-A`/`-B` as GIVEN, and `-C` separately: `-C` does not override an
@@ -83,7 +98,7 @@ impl Default for Conf {
             no_messages: false,
             line_number: false,
             with_filename: None,
-            recursive: false,
+            dirs: Dirs::Read,
             logical: false,
             max_count: None,
             after: None,
@@ -481,6 +496,7 @@ pub fn main(args: &[Vec<u8>]) -> i32 {
                     return 2;
                 }
                 Err(LongErr::Handled) => return 2,
+                Err(LongErr::HandledWith(code)) => return code,
             }
         }
         // A short-option cluster; an option that takes a value consumes the rest
@@ -567,9 +583,18 @@ pub fn main(args: &[Vec<u8>]) -> i32 {
                 b'n' => conf.line_number = true,
                 b'h' => conf.with_filename = Some(false),
                 b'H' => conf.with_filename = Some(true),
-                b'r' => conf.recursive = true,
+                b'd' => {
+                    let Some(v) = value_of(&mut j, &mut i) else {
+                        errb(&byte_in("option requires an argument -- '", opt, "'"));
+                        eprintln!("{USAGE}");
+                        return 2;
+                    };
+                    let Some(action) = dirs_arg(&v) else { return 1 };
+                    conf.dirs = action;
+                }
+                b'r' => conf.dirs = Dirs::Recurse,
                 b'R' => {
-                    conf.recursive = true;
+                    conf.dirs = Dirs::Recurse;
                     conf.logical = true;
                 }
                 b'z' => conf.null_data = true,
@@ -684,7 +709,7 @@ pub fn main(args: &[Vec<u8>]) -> i32 {
     // Whether `-r` descended into a directory; with the operand count it decides
     // the NAME below. `walk` reports it rather than grep re-testing the operand.
     let mut descended = false;
-    if conf.recursive {
+    if conf.dirs == Dirs::Recurse {
         // A bare `grep -r PAT` walks the working tree but names its hits
         // `d/x`, not `./d/x` — the synthesized operand must not reach the
         // output, or a consumer of `grep -rl` sees paths GNU never prints.
@@ -754,8 +779,14 @@ pub fn main(args: &[Vec<u8>]) -> i32 {
         let data = if settled {
             Vec::new()
         } else {
-            match read_search(path, *from_walk) {
-                Ok(d) => d,
+            match read_search(path, *from_walk, grep.conf.dirs == Dirs::Skip) {
+                Ok(Some(d)) => d,
+                // `-d skip` passes over a directory WITHOUT A WORD: no
+                // diagnostic and no effect on the status, which is what
+                // distinguishes it from the `read` default whose message is a
+                // read failure. The OPEN still happened, so one that failed was
+                // reported above rather than swallowed.
+                Ok(None) => continue,
                 Err(f) => {
                     if !grep.conf.no_messages {
                         errb(&name_in("", display, &format!(": {}", errmsg(&f.err))));
@@ -807,6 +838,9 @@ enum LongErr {
     Message(Vec<u8>),
     /// Already reported by the handler; the caller only supplies the status.
     Handled,
+    /// Already reported, AND carrying its own status: GNU's argmatch failures
+    /// exit 1 where every other usage error here exits 2.
+    HandledWith(i32),
 }
 
 fn split_long(arg: &[u8]) -> (Vec<u8>, Option<Vec<u8>>) {
@@ -838,6 +872,7 @@ const LONG_OPTIONS: &[(&[u8], Arg)] = &[
     (b"context", Arg::Required),
     (b"count", Arg::None),
     (b"dereference-recursive", Arg::None),
+    (b"directories", Arg::Required),
     (b"extended-regexp", Arg::None),
     (b"file", Arg::Required),
     (b"files-with-matches", Arg::None),
@@ -893,6 +928,70 @@ fn resolve_long(name: &[u8], arg: &[u8]) -> Result<(&'static [u8], Arg), Vec<u8>
     }
 }
 
+/// Why gnulib's `argmatch` declined, which is not the same message.
+enum NoMatch {
+    Invalid,
+    /// The value prefixed more than one name and matched none exactly.
+    Ambiguous,
+}
+
+/// GNU's `argmatch`: an exact name, or an unambiguous PREFIX of one. Note that
+/// an ambiguity does NOT end the scan -- an exact match found LATER still wins,
+/// which is gnulib's own order and matters as soon as one name prefixes another
+/// (`skip` under a list that also held `skip-all`). Unreachable with the three
+/// names below, and written this way so the next argmatch option inherits it
+/// rather than the bug.
+///
+/// No empty-string guard: `""` prefixes everything, so GNU calls it AMBIGUOUS
+/// rather than invalid, and `-d ''` says so. The obvious defensive line is the
+/// divergence.
+fn argmatch<T: Copy>(value: &[u8], names: &[(&[u8], T)]) -> Result<T, NoMatch> {
+    let mut hit = None;
+    let mut ambiguous = false;
+    for (name, payload) in names {
+        if *name == value {
+            return Ok(*payload);
+        }
+        if name.starts_with(value) {
+            ambiguous |= hit.is_some();
+            hit = Some(*payload);
+        }
+    }
+    match hit {
+        Some(payload) if !ambiguous => Ok(payload),
+        Some(_) => Err(NoMatch::Ambiguous),
+        None => Err(NoMatch::Invalid),
+    }
+}
+
+/// `-d`/`--directories`'s argument. A failure is reported here rather than
+/// returned, because the two callers spell their exits differently and the
+/// message is the same either way -- and it exits 1, not the 2 every other usage
+/// error uses.
+fn dirs_arg(value: &[u8]) -> Option<Dirs> {
+    const NAMES: [(&[u8], Dirs); 3] =
+        [(b"read", Dirs::Read), (b"recurse", Dirs::Recurse), (b"skip", Dirs::Skip)];
+    match argmatch(value, &NAMES) {
+        Ok(action) => Some(action),
+        Err(no) => complain_dirs(value, matches!(no, NoMatch::Ambiguous)),
+    }
+}
+
+/// Always `None`; the return type is what lets `dirs_arg` end in one expression.
+fn complain_dirs(value: &[u8], ambiguous: bool) -> Option<Dirs> {
+    let what = if ambiguous { "ambiguous" } else { "invalid" };
+    let mut msg = format!("{what} argument ").into_bytes();
+    crate::util::quote_arg(value, &mut msg);
+    msg.extend_from_slice(b" for '--directories'");
+    errb(&msg);
+    eprintln!("Valid arguments are:");
+    for name in ["read", "recurse", "skip"] {
+        eprintln!("  - '{name}'");
+    }
+    eprintln!("{USAGE}");
+    None
+}
+
 fn parse_long(
     conf: &mut Conf,
     name: &[u8],
@@ -940,9 +1039,13 @@ fn parse_long(
         b"line-number" => conf.line_number = true,
         b"with-filename" => conf.with_filename = Some(true),
         b"no-filename" => conf.with_filename = Some(false),
-        b"recursive" => conf.recursive = true,
+        b"directories" => {
+            let v = need(value)?;
+            conf.dirs = dirs_arg(&v).ok_or(LongErr::HandledWith(1))?;
+        }
+        b"recursive" => conf.dirs = Dirs::Recurse,
         b"dereference-recursive" => {
-            conf.recursive = true;
+            conf.dirs = Dirs::Recurse;
             conf.logical = true;
         }
         b"null-data" => conf.null_data = true,
@@ -1519,5 +1622,20 @@ mod tests {
         }
         // Leading zeros are decimal, not octal.
         assert_eq!(parse_count(b"010"), Some(10));
+    }
+
+    /// The one property of `argmatch` that today's three names cannot exercise,
+    /// since none of them prefixes another: an exact match found AFTER an
+    /// ambiguity still wins. A scan that returned at the ambiguity would refuse
+    /// `skip` here, which is what gnulib does not do.
+    #[test]
+    fn an_exact_argmatch_outranks_an_earlier_ambiguity() {
+        let names: [(&[u8], u8); 3] = [(b"skip-all", 1), (b"skip-any", 2), (b"skip", 3)];
+        assert_eq!(argmatch(b"skip", &names).ok(), Some(3));
+        // Still ambiguous when nothing matches exactly, and order-independent.
+        assert!(matches!(argmatch(b"skip-a", &names), Err(NoMatch::Ambiguous)));
+        assert!(matches!(argmatch(b"", &names), Err(NoMatch::Ambiguous)));
+        assert_eq!(argmatch(b"skip-al", &names).ok(), Some(1));
+        assert!(matches!(argmatch(b"nope", &names), Err(NoMatch::Invalid)));
     }
 }

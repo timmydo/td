@@ -1267,6 +1267,142 @@ a
 ## status: 0
 ## stderr-json: ""
 
+# ---- -d / --directories ---------------------------------------------------
+# GNU spells ONE setting three ways -- `-r`, `-R` and `-d ACTION` -- and the last
+# one given wins. The `-R` deref is NOT part of that setting and is sticky, which
+# is why `-R -d recurse` still follows symlinks.
+
+#### -d skip passes over a directory operand without a word
+## argv: grep -d skip a f1 d
+## file f1:
+a
+## END
+## file d/f2:
+a
+## END
+## stdout:
+f1:a
+## END
+## status: 0
+## stderr-json: ""
+
+#### -d read is the default, so the read fails as it always did
+## argv: grep -d read a f1 d
+## file f1:
+a
+## END
+## file d/f2:
+a
+## END
+## stdout:
+f1:a
+## END
+## status: 2
+## stderr-contains: Is a directory
+
+#### -d recurse is a second spelling of -r
+## argv: grep -d recurse a d
+## file d/f2:
+a
+## END
+## stdout:
+d/f2:a
+## END
+## status: 0
+## stderr-json: ""
+
+#### --directories takes the same argument
+## argv: grep --directories=skip a f1 d
+## file f1:
+a
+## END
+## file d/f2:
+a
+## END
+## stdout:
+f1:a
+## END
+## status: 0
+## stderr-json: ""
+
+#### an unambiguous PREFIX of the action is accepted, as GNU's argmatch does
+## argv: grep --directories=rec a d
+## file d/f2:
+a
+## END
+## stdout:
+d/f2:a
+## END
+## status: 0
+## stderr-json: ""
+
+#### the LAST of -r and -d wins, so -r -d skip skips
+## argv: grep -r -d skip a d
+## file d/f2:
+a
+## END
+## stdout-json: ""
+## status: 1
+## stderr-json: ""
+
+#### and -d skip -r recurses
+## argv: grep -d skip -r a d
+## file d/f2:
+a
+## END
+## stdout:
+d/f2:a
+## END
+## status: 0
+## stderr-json: ""
+
+#### an unknown action is refused at status 1, not the 2 a bad OPTION gets
+# GNU's argmatch exits 1 here where an unrecognized option exits 2, and lists
+# every valid argument. The quotes are ASCII: the goldens are C-locale, where
+# gnulib's quote() picks ' over the U+2018/U+2019 a UTF-8 locale would.
+## argv: grep -d bogus a f1
+## file f1:
+a
+## END
+## stdout-json: ""
+## status: 1
+## stderr-contains: invalid argument 'bogus' for '--directories'
+
+#### and an AMBIGUOUS one names itself as such
+## argv: grep --directories=r a f1
+## file f1:
+a
+## END
+## stdout-json: ""
+## status: 1
+## stderr-contains: ambiguous argument 'r' for '--directories'
+
+#### an EMPTY action prefixes all three, so it is ambiguous rather than invalid
+## argv: grep --directories= a f1
+## file f1:
+a
+## END
+## stdout-json: ""
+## status: 1
+## stderr-contains: ambiguous argument '' for '--directories'
+
+#### -d skip does not skip STDIN, even with a directory named `-` alongside
+# `-` names stdin, not a path, so the skip decision must not stat it: with a
+# directory of that name in the working directory, statting the operand skips a
+# pipe GNU still reads. (A `-` the WALK produced is a real file and is not this.)
+## argv: grep -d skip a -
+## file -/inner:
+a
+## END
+## stdin:
+a
+## END
+## stdout:
+a
+## END
+## status: 0
+## stderr-json: ""
+
 #### an ambiguous long-option prefix is refused
 ## argv: grep --f a f1
 ## file f1:
@@ -5955,5 +6091,5 @@ MATCH
 ## argv: grep "-\x80" x
 ## stdin-json: "a\n"
 ## stdout-json: ""
-## stderr-json: "grep: invalid option -- '\x80'\nusage: grep [-aEFGHhicLlnoqRrsvwxyzZ] [-NUM] [-m NUM] [-A NUM] [-B NUM] [-C NUM] [-e PATTERN] [-f FILE] [PATTERN] [FILE]...\n"
+## stderr-json: "grep: invalid option -- '\x80'\nusage: grep [-aEFGHhicLlnoqRrsvwxyzZ] [-NUM] [-d ACTION] [-m NUM] [-A NUM] [-B NUM] [-C NUM] [-e PATTERN] [-f FILE] [PATTERN] [FILE]...\n"
 ## status: 2

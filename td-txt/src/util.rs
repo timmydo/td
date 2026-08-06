@@ -48,6 +48,43 @@ pub fn byte_in(before: &str, byte: u8, after: &str) -> Vec<u8> {
     name_in(before, &[byte], after)
 }
 
+/// GNU's `quote()` -- gnulib `quotearg` at `locale_quoting_style` -- as the C
+/// locale resolves it: ASCII `'` rather than the U+2018/U+2019 a UTF-8 locale
+/// picks. C is the only locale td's image sets and the one every golden here was
+/// derived under, so the curly pair would pin a message td's own userland never
+/// prints.
+///
+/// The ESCAPING is the half that is not cosmetic. An argument reaches this from
+/// argv, so a raw newline in one would split a single diagnostic across two lines
+/// a consumer reads as two, and a raw high byte would leave the message no longer
+/// valid in the encoding it is read as.
+pub fn quote_arg(value: &[u8], out: &mut Vec<u8>) {
+    out.push(b'\'');
+    for &b in value {
+        match b {
+            b'\\' => out.extend_from_slice(b"\\\\"),
+            b'\'' => out.extend_from_slice(b"\\'"),
+            0x07 => out.extend_from_slice(b"\\a"),
+            0x08 => out.extend_from_slice(b"\\b"),
+            b'\t' => out.extend_from_slice(b"\\t"),
+            b'\n' => out.extend_from_slice(b"\\n"),
+            0x0b => out.extend_from_slice(b"\\v"),
+            0x0c => out.extend_from_slice(b"\\f"),
+            b'\r' => out.extend_from_slice(b"\\r"),
+            // Always THREE octal digits, even where two would do: `\200` before a
+            // literal `1` must not read back as `\2001`.
+            0x00..=0x1f | 0x7f..=0xff => {
+                out.push(b'\\');
+                out.push(b'0' + (b >> 6));
+                out.push(b'0' + ((b >> 3) & 7));
+                out.push(b'0' + (b & 7));
+            }
+            _ => out.push(b),
+        }
+    }
+    out.push(b'\'');
+}
+
 /// The prefix a C `%s` prints: the bytes before the first NUL. GNU builds each
 /// diagnostic as a C string, so a NUL that reaches one ENDS it -- and only a
 /// `-f` script can carry a NUL into a message, argv being NUL-terminated.
@@ -104,6 +141,18 @@ impl Input {
     /// cannot be about a different file than the one that will be read. Stdin cannot
     /// arrive here (`-i` opens `-` as the ordinary name it is) and is refused as the
     /// non-file it would be.
+    /// Whether the OPEN descriptor is a directory. Stdin is never one for this
+    /// purpose even when it genuinely is: GNU exempts it by DESCRIPTOR, so
+    /// `grep -d skip x - < somedir` reports `(standard input): Is a directory`
+    /// rather than skipping -- and so a directory merely NAMED `-` cannot make
+    /// `-d skip` pass over a pipe.
+    pub fn is_dir(&self) -> bool {
+        match self {
+            Self::Stdin => false,
+            Self::File(file) => file.metadata().is_ok_and(|m| m.is_dir()),
+        }
+    }
+
     pub fn in_place_refusal(&self) -> Option<&'static str> {
         let Self::File(file) = self else {
             return Some("not a regular file");
@@ -229,12 +278,25 @@ pub struct ReadFail {
 /// WALK produced is always a file. Only an operand spells stdin `-`, so `grep -r`
 /// in a directory holding a file called `-` searches it rather than reading
 /// stdin, as GNU does.
-pub fn read_search(path: &[u8], from_walk: bool) -> Result<Vec<u8>, ReadFail> {
+///
+/// `skip_dirs` is grep's `-d skip`, and it is answered AFTER the open because
+/// that is where GNU answers it -- an `fstat` in `grepdesc`, not a `stat` on the
+/// name. A directory the process may not open is therefore still reported, and
+/// still exit 2; deciding from the name instead swallows that error silently.
+/// `Ok(None)` is the skip.
+pub fn read_search(
+    path: &[u8],
+    from_walk: bool,
+    skip_dirs: bool,
+) -> Result<Option<Vec<u8>>, ReadFail> {
     let mut input = match Input::open(path, !from_walk) {
         Ok(input) => input,
         Err(err) => return Err(ReadFail { err, opened: false, partial: Vec::new() }),
     };
-    input.read_all().map_err(|(err, partial)| ReadFail { err, opened: true, partial })
+    if skip_dirs && input.is_dir() {
+        return Ok(None);
+    }
+    input.read_all().map(Some).map_err(|(err, partial)| ReadFail { err, opened: true, partial })
 }
 
 /// Write one line to stdout, treating a CLOSED READER as "done" rather than as a

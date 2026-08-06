@@ -41,7 +41,7 @@ fn bin() -> PathBuf {
 /// missing vendored `.inp`/`.good`, or a typo'd annotation reds in-loop — without
 /// depending on the behavioral run below.
 /// Raise this with the corpus; it exists to catch a corpus that SHRANK.
-const CORPUS_FLOOR: usize = 2262;
+const CORPUS_FLOOR: usize = 2271;
 
 #[test]
 fn corpus_is_well_formed() -> Result<(), Box<dyn std::error::Error>> {
@@ -1148,6 +1148,131 @@ fn a_diverging_diagnostic_still_names_in_raw_bytes() -> Result<(), Box<dyn std::
         String::from_utf8_lossy(&tmp.stderr)
     );
     assert_eq!(tmp.status.code(), Some(4));
+    Ok(())
+}
+
+/// `-d skip` is decided from the OPENED descriptor, not from the name: a
+/// directory this process may not open is reported like any other unopenable
+/// operand, at exit 2. A corpus case cannot ask for it — nothing in the format
+/// sets a mode — and getting it wrong is silent, which is the whole point.
+///
+/// The `-R` dereference is checked here for the same reason: the format makes no
+/// symlinks, so the claim that `logical` survives a later `-d recurse` has
+/// nowhere else to live.
+#[test]
+fn directory_actions_answer_from_the_descriptor_and_leave_r_sticky()
+-> Result<(), Box<dyn std::error::Error>> {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = TempDir::new("dirs-desc")?;
+    std::fs::write(dir.0.join("f1"), b"a\n")?;
+    let shut = dir.0.join("noperm");
+    std::fs::create_dir_all(&shut)?;
+    std::fs::set_permissions(&shut, std::fs::Permissions::from_mode(0o000))?;
+
+    let run = |args: &[&str]| -> Result<(i32, Vec<u8>, Vec<u8>), Box<dyn std::error::Error>> {
+        let out = std::process::Command::new(bin())
+            .arg("grep")
+            .args(args)
+            .current_dir(&dir.0)
+            .output()?;
+        Ok((out.status.code().unwrap_or(-1), out.stdout, out.stderr))
+    };
+
+    // Silent + exit 1 is what a name-based stat gives; GNU gives both of these.
+    for args in [&["-d", "skip", "a", "noperm"][..], &["-c", "-d", "skip", "a", "noperm"]] {
+        let (code, _, stderr) = run(args)?;
+        assert_eq!(code, 2, "{args:?} did not report the unopenable directory");
+        assert_eq!(stderr, b"grep: noperm: Permission denied\n".to_vec(), "{args:?}");
+    }
+    // `-s` suppresses the message and KEEPS the status, as it does elsewhere.
+    let (code, _, stderr) = run(&["-s", "-d", "skip", "a", "noperm"])?;
+    assert_eq!((code, stderr), (2, Vec::new()));
+    // A directory it CAN open is still passed over without a word, and a good
+    // operand beside it still succeeds — the skip must not touch the status.
+    std::fs::set_permissions(&shut, std::fs::Permissions::from_mode(0o755))?;
+    let (code, stdout, stderr) = run(&["-d", "skip", "a", "f1", "noperm"])?;
+    assert_eq!((code, stdout, stderr), (0, b"f1:a\n".to_vec(), Vec::new()));
+
+    // `-R`'s dereference is sticky: a LATER `-d recurse` re-asks for the descent
+    // and says nothing about symlinks, so the walk still follows one it finds.
+    // `-r` alone does not, which is what makes this an assertion about `-R`.
+    let tree = TempDir::new("dirs-sticky")?;
+    std::fs::create_dir_all(tree.0.join("t/real"))?;
+    std::fs::write(tree.0.join("t/real/hit"), b"a\n")?;
+    std::os::unix::fs::symlink("real", tree.0.join("t/link"))?;
+    let walked = |args: &[&str]| -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+        let out = std::process::Command::new(bin())
+            .arg("grep")
+            .args(args)
+            .current_dir(&tree.0)
+            .output()?;
+        let mut lines: Vec<Vec<u8>> =
+            out.stdout.split(|b| *b == b'\n').filter(|l| !l.is_empty()).map(<[u8]>::to_vec).collect();
+        lines.sort();
+        Ok(lines.join(&b'\n'))
+    };
+    let follows = b"t/link/hit:a\nt/real/hit:a".to_vec();
+    let does_not = b"t/real/hit:a".to_vec();
+    assert_eq!(walked(&["-R", "-d", "recurse", "a", "t"])?, follows, "-R lost its deref to -d");
+    assert_eq!(walked(&["-d", "recurse", "-R", "a", "t"])?, follows);
+    assert_eq!(walked(&["-R", "a", "t"])?, follows);
+    assert_eq!(walked(&["-d", "recurse", "a", "t"])?, does_not, "-d recurse followed a symlink");
+    assert_eq!(walked(&["-r", "a", "t"])?, does_not);
+    Ok(())
+}
+
+/// `-d`'s bad-argument diagnostic ESCAPES what it quotes, which is the half of
+/// GNU's `quote()` a corpus case cannot ask for: `## argv:` splits on
+/// whitespace, so no case can put a newline — the byte the escape exists for —
+/// into an option's value.
+///
+/// Measured against GNU grep 3.11 under `LC_ALL=C`, the locale every golden here
+/// was derived under and the only one td's image sets. A UTF-8 locale would pick
+/// U+2018/U+2019 for the quotes; the escaping is the same either way.
+#[test]
+fn a_bad_directories_argument_is_quoted_the_way_gnu_quotes_it()
+-> Result<(), Box<dyn std::error::Error>> {
+    use std::os::unix::ffi::OsStrExt;
+    let dir = TempDir::new("dirs-quote")?;
+    std::fs::write(dir.0.join("IN"), b"a\n")?;
+
+    // A newline is the one that MATTERS: unescaped it ends the diagnostic early
+    // and the rest reads as a second one. A backslash, a quote and a high byte
+    // cover the three other arms; `\2001` pins the octal at three digits, since
+    // two would read back as a different byte followed by nothing.
+    let cases: [(&[u8], &[u8]); 5] = [
+        (b"b\no", br"'b\no'"),
+        (b"b\\o", br"'b\\o'"),
+        (b"b'o", br"'b\'o'"),
+        (b"b\xffo", br"'b\377o'"),
+        (b"\x801", br"'\2001'"),
+    ];
+    for (value, quoted) in cases {
+        let out = std::process::Command::new(bin())
+            .arg("grep")
+            .arg("-d")
+            .arg(std::ffi::OsStr::from_bytes(value))
+            .args(["a", "IN"])
+            .current_dir(&dir.0)
+            .output()?;
+        let mut want = b"grep: invalid argument ".to_vec();
+        want.extend_from_slice(quoted);
+        want.extend_from_slice(b" for '--directories'\n");
+        want.extend_from_slice(b"Valid arguments are:\n  - 'read'\n  - 'recurse'\n  - 'skip'\n");
+        assert!(
+            out.stderr.starts_with(&want),
+            "argument {value:?} was not quoted as GNU quotes it: {:?}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        // The message is ONE line: an unescaped byte would make it two.
+        assert_eq!(
+            out.stderr.iter().filter(|b| **b == b'\n').count(),
+            // The quoted line, `Valid arguments are:`, three names, the usage.
+            6,
+            "the diagnostic gained or lost a line for {value:?}"
+        );
+        assert_eq!(out.status.code(), Some(1));
+    }
     Ok(())
 }
 

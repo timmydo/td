@@ -642,8 +642,9 @@ td-txt-authored case files
   line, with `-Z` replacing the byte after the NAME only. `-H` and `-h` decide
   whether there is a name at all, and absent either it follows from the OPERANDS
   rather than from how many files were searched: more than one operand, or one
-  that was a DIRECTORY descended into under `-r` (GNU descends under `-d recurse`
-  too, which td-txt does not have -- see the walk gap below). So `grep -rn a sd` names the
+  that was a DIRECTORY descended into under `-r` (or `-R`, or `-d recurse`, which
+  is the same setting spelled a third way and names the same way).
+  So `grep -rn a sd` names the
   single file it finds under `sd` while `grep -rn a sd/only` does not, and a bare
   `grep -r a` names too, the `.` it walks being a descended directory.
 
@@ -1589,11 +1590,6 @@ td-txt-authored case files
     on where the buffer boundaries fall, so a reader that streams but classifies
     at the wrong moment reproduces none of it. It wants its own cases, over an
     operand large enough to have a second buffer at all.
-
-  - `-d`/`--directories` is an `invalid option` here, so GNU's other spelling of
-    a descent (`grep -d recurse a .`) is unavailable, as is `-d skip`. No xfail
-    case: it is a diagnosed refusal, pinned in divergence.test.txt like the other
-    unimplemented options.
 
   - The `-v` short cut above under `-r`, which GNU takes before it expands
     operands and td-txt takes after: `grep -rcv -e '' /nosuchdir` is exit 1 and
