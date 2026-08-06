@@ -205,7 +205,8 @@ binding is ONE chord on `Super`:
 - `Super+1` through `Super+9` switch workspaces, and adding Shift moves the
   focused tile to that workspace;
 - `Super+v` selects a vertical split for the next toplevel, `Super+h` selects
-  a horizontal split, and `Super+f` toggles fullscreen;
+  a horizontal split, `Super+f` toggles fullscreen, and `Super+s` toggles
+  stacking on the container the focused window sits in;
 - `Super+t` starts a terminal, which is the one registry entry anybody opens
   repeatedly;
 - `Super+?` shows this table on screen. `?` is Shift+`/` here and Shift is
@@ -539,7 +540,12 @@ and the client PARTITION the tile — the band is taken first, clipped to a tile
 too short to hold one, and the client is what is left — so a short tile is all
 band and no client rather than the two overlapping. The BORDER wraps the two
 together, since one around the client area alone would leave a window's own
-title bar outside its own frame.
+title bar outside its own frame. A STACKED leaf is the exception and the
+placement SAYS which it is rather than being measured: the run's last band
+abuts the content exactly as an ordinary band does, so adjacency cannot tell
+the two apart, and joining it would draw that leaf's border four pixels above
+its own band — over the band before it — and only when the last of a stack is
+shown. A stack's frame is therefore the client area alone.
 
 The band takes the focused or unfocused colour with the border, in its own
 pair rather than the border's, and its text is clipped to itself so an
@@ -556,6 +562,72 @@ happens for a fullscreen leaf on ANY workspace, and deliberately not from the
 fullscreen STATE published beside it, which is set only for the visible one: a
 client on a hidden workspace would otherwise be sized for the whole output and
 carved for a band it does not have.
+
+STACKING is the second arrangement a container can take, toggled by
+`Super+s`. Its leaves' bands run down its top, one after another, and ONE of
+them gets everything below the run; the rest are a band alone. The run is
+clipped to the container, so one too short to hold every band is all band and
+no content rather than the two overlapping — the short-tile rule again, one
+level up. A lone window is in no container of its own, so there is nothing to
+stack and the binding does nothing rather than stacking the whole workspace.
+
+Which leaf is shown is the container's own most recently focused, which is
+the focused one whenever focus is in the stack at all. Focus alone cannot
+answer it: it names one leaf per workspace, so every stack the operator is
+not in would fall back to its first and snap there the moment focus left.
+The workspace therefore keeps an MRU record of its leaves, and a stack reads
+the first of its own that appears in it. A workspace never yet visited has no
+record and shows its first leaf, which is what makes a hidden stack publish
+the sizes it will have when it is shown.
+
+`Super+s` STACKS the focused leaf's own parent, and UNSTACKS the outermost
+stacked ancestor. The asymmetry is not one: a stack runs every leaf beneath
+it, so it hides what the containers under it are doing, and that ancestor is
+what the leaf is displayed in whatever they say. Descending past it would
+toggle a container nothing can see — and a stack whose direct children have
+all since become splits could then never be undone from the keyboard, since
+no leaf in it is a child of it any more.
+
+Bands in a run are NOT separated by a border, and adjacent unfocused ones
+therefore read as one block distinguished only by their titles. That is a
+limitation rather than a decision deferred: the border is 4 pixels against a
+20-pixel band whose text already occupies rows 3 to 16, so a border per band
+would draw over the name it was meant to delimit.
+
+Where this diverges from i3 is WHAT is stacked: i3 stacks a container's
+CHILDREN, so a nested split shows as one title, and td stacks its LEAVES, so
+every window in the container has a band of its own. A stack is a way to see
+what is in a column without giving each window a share of it, and a title
+naming a container rather than a window answers a question nobody asked.
+
+A stacked-away leaf keeps the SIZE of the content area rather than being
+zeroed, so a client does not resize its buffer down and back across a
+toggle. That is why "shown" cannot be read off the rectangle — a hidden
+leaf's rectangle is exactly the shown one's — and a placement carries an
+explicit flag instead. Five sites read it: the border pass, the blit, the
+pointer hit test, the GRAB — which answers nothing for a leaf that is not
+shown, the way it already answers nothing for one on another workspace — and
+`views`, which is what the CLIENT is told, a stacked-away toplevel being
+published NOT visible at the size it would have so it holds a buffer ready
+for the moment it is shown. The band pass is the one that deliberately does
+not ask: a band is drawn whether or not its client is.
+
+Bands are drawn in a pass of their own, before any border rather than beside
+each one. The two are separate rectangles that OVERLAP in a stack — the shown
+leaf's border rides four pixels up into the run's last band — so interleaving
+them lets a band belonging to a later placement erase a border already drawn,
+and only when the shown leaf is not the last of its run. That is the same
+argument one level down from decoration preceding client pixels.
+
+`Super+s` is refused under fullscreen, as directional focus and move already
+are: nothing on screen would report the change, and leaving fullscreen would
+land the operator in an arrangement they never asked for.
+
+Directional focus and movement do NOT honour stacking. They ask for the
+arrangement the container would have unstacked, because in a stack every
+leaf shares the one content rectangle and `Super+Up` would have no geometry
+to decide on. Stacking is about what is DRAWN, and the tree a chord walks is
+the same either way.
 
 Client-side decoration negotiation, clipboard, drag-and-drop, subsurfaces,
 popups, output reconfiguration, fractional scale, screen capture, data
@@ -939,7 +1011,8 @@ The landing must prove:
 
 The keyboard-driven tiling shell is a pure policy layer. Workspaces own
 split-container trees, and leaf containers own mapped XDG toplevels. Layout,
-focus, move, split, fullscreen, and workspace operations are deterministic
+focus, move, split, fullscreen, stacking, and workspace operations are all
+deterministic
 state transitions over ordinary Rust data. They do not read devices, sockets,
 clocks, or global process state. Geometry calculation consumes explicit
 output dimensions and returns placements that tests inspect without a

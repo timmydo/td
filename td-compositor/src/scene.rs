@@ -120,17 +120,22 @@ const TITLE_TEXT: [u8; 4] = [0xf0, 0xe8, 0xf8, 0];
 /// window's own title bar outside its own frame, which is why `Placement` keeps
 /// the two rects and this composes them rather than the other way round.
 ///
-/// It assumes the two TOUCH and share a left edge and a width, which every
-/// arrangement here produces and
-/// `a_title_band_tops_every_tile_partitions_it_and_swallows_its_own_clicks`
-/// asserts against the tile the split actually produced. A stacked container
-/// breaks BOTH halves — its focused child's band sits up in the run of bands
-/// while the content is below all of them, and the run spans the container
-/// rather than the child — so the branch for it lands with the arrangement
-/// that needs it rather than as an untaken arm nothing can reach today. That
-/// test only walks the arrangements it BUILDS, so it fails loudly on a
-/// stacked one only once it builds one.
+/// The two abut by construction — the band is carved off the top of the tile
+/// — so the frame runs from the band's top to the client's bottom.
+///
+/// A STACKED leaf is the exception, and the placement is ASKED rather than
+/// measured. Every band there sits in the run at the container's top while the
+/// content is below all of them, so the run's LAST band abuts the content
+/// exactly as an ordinary band does and adjacency cannot tell the two apart.
+/// Joining it would put that leaf's border four pixels ABOVE its own band —
+/// over the band of the leaf before it — and only when the last of a stack is
+/// shown, so a stack's frame is the client area alone whichever leaf that is.
+/// The band is then its own strip, which is how a stack reads: one title per
+/// window, with the shown one framed beneath them all.
 fn frame_rect(placement: &Placement) -> Rect {
+    if placement.stacked {
+        return placement.rect;
+    }
     Rect {
         x: placement.rect.x,
         y: placement.band.y,
@@ -427,6 +432,9 @@ impl Scene {
         let x = usize::try_from(self.pointer_x).ok()?;
         let y = usize::try_from(self.pointer_y).ok()?;
         for placement in placements {
+            if !placement.visible {
+                continue;
+            }
             let Some(surface) = self.surfaces.get(&placement.key) else {
                 continue;
             };
@@ -478,7 +486,7 @@ impl Scene {
     ) -> Option<SurfacePoint> {
         placements
             .iter()
-            .filter(|placement| placement.key == key)
+            .filter(|placement| placement.key == key && placement.visible)
             .map(|placement| placement.rect)
             .next()
             .and_then(|rect| {
@@ -567,15 +575,29 @@ impl Scene {
         }
 
         let placements = self.tiled_placements(width, height);
+        // EVERY band before ANY border, rather than the two per placement.
+        // They are separate rectangles that overlap in a stack — the shown
+        // leaf's border rides four pixels up into the run's last band — so
+        // interleaving them lets a band drawn later erase a border drawn
+        // earlier, and only when the shown leaf is not the last of its run.
+        // Same argument one pass down as decoration before client pixels.
         for placement in &placements {
+            if !self.surfaces.contains_key(&placement.key) {
+                continue;
+            }
+            // Whether or not the client is shown: a leaf stacked away behind a
+            // sibling draws nothing else, and its band says it is there.
+            self.draw_title(frame, width, height, stride, placement);
+        }
+        for placement in &placements {
+            if !self.surfaces.contains_key(&placement.key) || !placement.visible {
+                continue;
+            }
             // The FRAME, not the client area: a tile too short to hold both is
             // all band and no client, and guarding on the client alone would
             // drop the one thing left to draw for it.
             let outline = frame_rect(placement);
             if outline.width == 0 || outline.height == 0 {
-                continue;
-            }
-            if !self.surfaces.contains_key(&placement.key) {
                 continue;
             }
             let x = i64::try_from(outline.x).unwrap_or(i64::MAX);
@@ -591,13 +613,12 @@ impl Scene {
                 outline.height,
                 placement.focused,
             );
-            self.draw_title(frame, width, height, stride, placement);
         }
         for placement in placements {
             // The CLIENT area here, where the border pass above wants the
             // frame: a tile too short to hold a band has no client pixels to
             // draw, and `draw_surface` was already a no-op for one.
-            if placement.rect.width == 0 || placement.rect.height == 0 {
+            if !placement.visible || placement.rect.width == 0 || placement.rect.height == 0 {
                 continue;
             }
             let Some(surface) = self.surfaces.get(&placement.key) else {
@@ -1263,6 +1284,135 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    #[test]
+    fn a_stacked_column_draws_every_band_but_only_the_focused_client() {
+        let mut scene = Scene::new();
+        scene.command(Command::SetSplit(crate::layout::Axis::Vertical));
+        let colors = [[1, 2, 3, 0], [4, 5, 6, 0], [7, 8, 9, 0]];
+        for (index, color) in colors.iter().enumerate() {
+            let object = u32::try_from(index).unwrap().saturating_add(1);
+            scene
+                .commit(SurfaceKey { client: 1, object }, surface(*color, 400, 400))
+                .unwrap();
+        }
+        let (width, height) = (320, least_output_height(200));
+        let stride = width * 4;
+        let mut frame = vec![0u8; stride * height];
+        scene.pointer_x = 0;
+        scene.pointer_y = i32::try_from(height - 1).unwrap();
+
+        scene.command(Command::ToggleStacked);
+
+        // EVERY position in the stack, not just the one that happens to be
+        // focused. All three leaves share the one content rectangle, so with
+        // the last one shown a renderer that ignored visibility would paint
+        // the other two and then overpaint them — green for the wrong reason,
+        // which is what the first draft of this test did.
+        for (index, shown) in colors.iter().enumerate() {
+            let object = u32::try_from(index).unwrap().saturating_add(1);
+            assert!(scene.focus_key(SurfaceKey { client: 1, object }));
+            scene.render(&mut frame, width, height, stride);
+
+            let placements = scene.tiled_placements(width, height);
+            assert_eq!(placements.len(), 3);
+            // Every band is painted, whether or not its client is shown: the
+            // band is what says a stacked-away window is there.
+            for placement in &placements {
+                assert_eq!(
+                    pixel(&frame, stride, placement.band.x + 1, placement.band.y + 1),
+                    if placement.focused {
+                        TITLE_FOCUSED
+                    } else {
+                        TITLE_UNFOCUSED
+                    },
+                    "a band went unpainted at {:?}",
+                    placement.band
+                );
+            }
+            // The frame a BORDER wraps is the client area ALONE in a stack.
+            // The run's last band abuts the content exactly as an ordinary
+            // band does, so joining it — which adjacency alone cannot refuse
+            // — would draw that leaf's border four pixels above its own band,
+            // inside the band before it, and only when the last of the stack
+            // is shown.
+            let content = placements.first().unwrap().rect;
+            let run_top = placements.first().unwrap().band.y;
+            let last_band = placements.last().unwrap().band;
+            let above = Rect {
+                x: last_band.x.saturating_sub(BORDER),
+                y: run_top.saturating_sub(BORDER),
+                width: last_band.width.saturating_add(BORDER * 2),
+                height: last_band.y.saturating_sub(run_top.saturating_sub(BORDER)),
+            };
+            assert_eq!(
+                count_color(&frame, stride, above, [0xc0, 0x70, 0xf0, 0]),
+                0,
+                "a border reached above the run's last band"
+            );
+            // The shown leaf's own top border SURVIVES the run. It rides four
+            // pixels up into the last band, so a pass that drew each band
+            // beside its border would erase it with a band belonging to a
+            // later placement — every time the shown leaf is not the last.
+            assert_eq!(
+                pixel(&frame, stride, content.x + 10, content.y - 1),
+                [0xc0, 0x70, 0xf0, 0],
+                "the shown leaf's top border was painted over"
+            );
+            // Only the focused leaf's pixels reach the screen. The other two
+            // are SIZED for the content area — so they keep their buffers
+            // across a toggle — which is exactly why "not drawn" cannot be
+            // inferred from the rectangle and has to be asserted here.
+            assert!(
+                frame.as_chunks::<4>().0.contains(shown),
+                "the shown client {shown:?} never reached the screen"
+            );
+            for (other, hidden) in colors.iter().enumerate() {
+                if other == index {
+                    continue;
+                }
+                assert!(
+                    !frame.as_chunks::<4>().0.contains(hidden),
+                    "a stacked-away client painted {hidden:?}"
+                );
+            }
+
+            // And a click anywhere in the content area reaches the shown leaf
+            // only — never one of the two stacked behind it, whose rectangle
+            // covers the very same pixels.
+            for (dx, dy) in [(1, 1), (10, 20), (50, 100)] {
+                scene.pointer_x = i32::try_from(content.x + dx).unwrap();
+                scene.pointer_y = i32::try_from(content.y + dy).unwrap();
+                assert_eq!(
+                    scene
+                        .pointer_targets(None, width, height)
+                        .0
+                        .map(|point| point.key),
+                    Some(SurfaceKey { client: 1, object }),
+                    "the hit test reached a stacked-away client at {dx},{dy}"
+                );
+            }
+            // A grab is resolved the way a workspace switch resolves one: a
+            // leaf that is not SHOWN is not somewhere the pointer can be, so
+            // a grab held on it answers nothing rather than coordinates in a
+            // window nobody can see.
+            for other in 0..colors.len() {
+                let held = SurfaceKey {
+                    client: 1,
+                    object: u32::try_from(other).unwrap().saturating_add(1),
+                };
+                assert_eq!(
+                    scene.pointer_targets(Some(held), width, height).1.is_some(),
+                    other == index,
+                    "a grab on {held:?} resolved wrongly while {object} was shown"
+                );
+            }
+            // Back to a corner, so the cursor never paints over the content
+            // the next iteration is about to inspect.
+            scene.pointer_x = 0;
+            scene.pointer_y = i32::try_from(height - 1).unwrap();
         }
     }
 

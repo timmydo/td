@@ -49,6 +49,10 @@ pub const ROWS: &[Row] = &[
         action: "TOGGLE FULLSCREEN",
     },
     Row {
+        keys: "SUPER+S",
+        action: "STACK A COLUMN",
+    },
+    Row {
         keys: "SUPER+T",
         action: "NEW TERMINAL",
     },

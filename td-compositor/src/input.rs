@@ -242,6 +242,7 @@ impl KeyBindings {
         // from what is held at this press.
         let chord = match event.code {
             KEY_F => Some(Command::ToggleFullscreen),
+            KEY_S => Some(Command::ToggleStacked),
             KEY_V => Some(Command::SetSplit(Axis::Vertical)),
             KEY_H => Some(Command::SetSplit(Axis::Horizontal)),
             _ => None,
@@ -1669,6 +1670,7 @@ mod tests {
                 Bound::Command(Command::SetSplit(Axis::Vertical)) => "SPLIT VERTICAL",
                 Bound::Command(Command::SetSplit(Axis::Horizontal)) => "SPLIT HORIZONTAL",
                 Bound::Command(Command::ToggleFullscreen) => "TOGGLE FULLSCREEN",
+                Bound::Command(Command::ToggleStacked) => "STACK A COLUMN",
                 Bound::Launch(LaunchRequest::Terminal) => "NEW TERMINAL",
                 Bound::Launch(LaunchRequest::UiDemo) => "NEW INPUT MONITOR",
                 Bound::Launcher(_) => "OPEN LAUNCHER",
@@ -1688,6 +1690,7 @@ mod tests {
             KEY_V => "V",
             KEY_H => "H",
             KEY_F => "F",
+            KEY_S => "S",
             KEY_T => "T",
             KEY_ENTER => "ENTER",
             // `?` IS the shifted `/`, so the glyph absorbs the modifier
@@ -1742,6 +1745,11 @@ mod tests {
                 &[KEY_LEFTMETA],
                 KEY_F,
                 Bound::Command(Command::ToggleFullscreen),
+            ),
+            (
+                &[KEY_LEFTMETA],
+                KEY_S,
+                Bound::Command(Command::ToggleStacked),
             ),
             (
                 &[KEY_LEFTMETA],
