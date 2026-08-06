@@ -1180,18 +1180,67 @@ td-txt-authored case files
     withdrawing `v` itself. Found while sweeping for the address-modifier
     landing and outside it.
 
-  - `R /dev/stdin` HANGS here when stdin is a fifo whose writer has gone, where
-    GNU prints its line and carries on: GNU opens `R` sources at compile time and
-    aliases the literal `/dev/stdin` to its own stdin stream, while `read_source`
-    opens the NAME, and opening a fifo waits for a writer for ever. `r /dev/stdin`
-    hangs in both, so only `R` diverges. Predates the branch -- the branch-point
-    build hangs identically -- and it is the same failure the `#n` seekability fix
-    exists for, surviving one command letter away, which is why it is recorded
-    beside it rather than filed with the other diagnostics. The aliasing has a
-    second face in the DIAGNOSTIC, found by a reviewer: because GNU is reading
-    its own stdin stream, `sed -n 'R /dev/stdin' F < a-directory` says
-    `read error on stdin` where td-txt names the file it really opened,
-    `/dev/stdin`. Both exit 4. An OPERAND spelled `-` does say `stdin` now.
+  - An `R` SOURCE read whole. `read_source` reads a source to EOF at its first
+    use and serves lines from that, where GNU holds the stream open and takes one
+    line per invocation. Wherever a source simply ENDS the bytes agree and only
+    the timing differs: over a fifo whose writer is still open, `sed -n -e 'R F'
+    -e p IN` prints the same output in both and waits here for as long as the
+    writer holds it (measured at the hold, against GNU's nothing), and a writer
+    that never closes never returns at all.
+    Where the source is the INPUT's own stream the bytes differ too, because
+    GNU's `R` and its input reader then share one cursor and take alternate
+    lines: `printf 'A\nB\nC\n' | sed -n -e 'R /dev/stdin' -e s/^/P/ -e p` is
+    `PA B PC` in GNU and `PA PB PC` here, the `R` finding the stream already
+    drained. That half IS caseable and is pinned as an xfail with GNU's golden;
+    the timing half is not.
+    "Read whole" undersells the third face, which is a COST this landing paid
+    rather than one it found: `R /dev/stdin` now CONSUMES the operator's
+    standard input to end of file, where GNU leaves it one line on. With a
+    regular file on fd 0, `( sed -n -e 'R /dev/stdin' -e p A; cat ) < EIGHT`
+    leaves `cat` nothing here and lines 3-8 in GNU -- and the build BEFORE the
+    special-file table left all eight, because reopening the name gave it an
+    offset of its own. So the table made this cell worse while making the fifo
+    cell work at all, and consuming SOMETHING is right in kind where consuming
+    nothing was an artifact. It is a descriptor another program owns, which is
+    the shape of harm `w /dev/stdin` truncating it was. Reading one line
+    instead needs an UNBUFFERED read of fd 0, and there is none in safe Rust:
+    `std::io::Stdin` is a `BufReader`, so a line-at-a-time reader would still
+    take up to 8 KiB off the shared descriptor, and going under it wants a
+    descriptor adoption this crate has no `unsafe` for.
+    Pre-existing in both halves, and what is LEFT of the class the special-file
+    table closed (its cases are in sed-cli.test.txt): that table stopped `R
+    /dev/stdin` reopening a NAME, which was a permanent hang on a fifo whose
+    writer had already gone, and this is the same hang from the other end --
+    reading to an EOF that never comes rather than opening something that never
+    opens. Fixing it is a streaming reader, as the `grep` entry below says of its
+    own, plus somewhere to keep the handle across cycles and a `rewind` for `-s`.
+
+  - `--posix` AFTER the `-e` it would govern reaches it here and does not in
+    GNU, which compiles each `-e` inside its own getopt loop: `sed -n -e '1~2p'
+    --posix h` prints `a c` in GNU and is `unknown command: '~'` here, while the
+    same flag FIRST refuses in both. td-txt settles every option before it
+    compiles anything, so the flag is retroactive. Pre-existing and not specific
+    to any one rule -- it reaches every behaviour `--posix` changes, the
+    special-file table above included (`… -e 'w /dev/stdout' --posix` groups
+    here and interleaves in GNU). Recorded when a review found the table's cell
+    of it; closing it wants the compile split across the option scan, which is a
+    landing of its own and not a rule to add.
+
+  - `-u` is accepted and IGNORED, which is content-neutral for one stream and
+    stopped being so once two of them share a descriptor. GNU's `-u` flushes
+    every output after every line (`flush_output`, execute.c:415), so it ORDERS
+    a `--posix` `w /dev/stdout` against auto-print: `sed --posix -u -n -e p -e
+    s/^/W/ -e 'w /dev/stdout' h` interleaves in GNU and comes out in two groups
+    here, and the same holds when standard output is a terminal. Without `-u`
+    GNU's stdout is block-buffered and the two GROUP, which is the cell td-txt
+    now gets right -- the `w` target being an unbuffered `File` and the sink
+    buffered whatever the flag says. So this is a cell the special-file table's
+    posixicity gate TRADED rather than one it broke: before it, `--posix` was
+    aliased here and matched GNU under `-u` and on a terminal while missing the
+    default, and now it is the other way round. The default is the common case,
+    which is why the trade was taken; the two it costs are pinned as an xfail
+    with GNU's golden. Closing it wants a real `-u`, which is a flush policy for
+    every output rather than anything about this table.
 
   - An AMBIGUOUS long-option abbreviation lists its possibilities in a different
     order, and for grep a different SET. `sed --s` is `'--silent' '--sandbox'

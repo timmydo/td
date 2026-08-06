@@ -41,7 +41,7 @@ fn bin() -> PathBuf {
 /// missing vendored `.inp`/`.good`, or a typo'd annotation reds in-loop — without
 /// depending on the behavioral run below.
 /// Raise this with the corpus; it exists to catch a corpus that SHRANK.
-const CORPUS_FLOOR: usize = 2185;
+const CORPUS_FLOOR: usize = 2207;
 
 #[test]
 fn corpus_is_well_formed() -> Result<(), Box<dyn std::error::Error>> {
@@ -760,9 +760,11 @@ fn sed_script_stdin_seekability_is_a_stat_not_a_reopen()
     // same descriptor by other names. Two reviewers in a row got a HANGING reopen
     // past this scan, the first by building the path with `format!` and the
     // second by picking a different link, so what it matches is now the segment
-    // they all share. `read_source` opens `/dev/stdin` by design, eight lines
-    // from where it names it; that is fine while the two stay on separate lines,
-    // and this guard is why they must.
+    // they all share. There is no longer an exception to carve out: `R`'s source
+    // reaches fd 0 through the special-file table, so no line NAMES fd 0 and
+    // opens something. `read_source` still opens whatever name it is handed, and
+    // outside POSIXLY_EXTENDED that name can be `/dev/stdin` again — which is
+    // what GNU does there too, hang and all.
     for line in src.lines() {
         if line.trim_start().starts_with("//") {
             continue;
@@ -1157,5 +1159,146 @@ fn a_dash_f_script_read_from_a_directory_is_refused(
     );
     assert_eq!(out.stdout, b"".to_vec());
     assert_eq!(out.status.code(), Some(4));
+    Ok(())
+}
+
+/// `R /dev/stdin` reads the descriptor it was GIVEN and not the name reopened,
+/// which is the whole point of the aliasing — and a corpus case cannot show it.
+/// The harness hands the child a PIPE, and `/proc/self/fd/0` on a pipe reopens
+/// the same pipe, so the two are indistinguishable there however the read is
+/// done. A regular file positioned PAST its start tells them apart with nothing
+/// but `std`: the descriptor continues from where it was left, while reopening
+/// starts over and hands back the head as well.
+///
+/// The failure this stands in for needs a fifo, which no safe API here can make:
+/// where standard input is one whose writer has gone, fd 0 is at end of file
+/// while opening the name waits for a writer that never comes, and the shell
+/// hangs outright.
+#[test]
+fn an_r_source_of_dev_stdin_continues_the_descriptor(
+) -> Result<(), Box<dyn std::error::Error>> {
+    use std::io::Seek as _;
+
+    let dir = TempDir::new("r-stdin-offset")?;
+    std::fs::write(dir.0.join("IN"), b"A\nB\n")?;
+    std::fs::write(dir.0.join("S"), b"HEAD\nTAIL1\nTAIL2\n")?;
+    let mut handed = std::fs::File::open(dir.0.join("S"))?;
+    handed.seek(std::io::SeekFrom::Start(5))?;
+
+    let out = std::process::Command::new(bin())
+        .args(["sed", "-n", "-e", "R /dev/stdin", "-e", "p", "IN"])
+        .stdin(std::process::Stdio::from(handed))
+        .current_dir(&dir.0)
+        .output()?;
+    assert_eq!(
+        out.stdout,
+        b"A\nTAIL1\nB\nTAIL2\n".to_vec(),
+        "the name was reopened: the head came back with the tail"
+    );
+    assert_eq!(out.stderr, b"".to_vec());
+    assert_eq!(out.status.code(), Some(0));
+
+    // The same argv OUTSIDE POSIXLY_EXTENDED, where GNU consults no table and
+    // `R` opens the name: the reopen starts at zero, so the head it skipped
+    // above comes back. `--posix` cannot show this — it withdraws `R` — so
+    // `POSIXLY_CORRECT` is the only reachable spelling of the gate's other side,
+    // and without this the gate could be dropped from the READ path with every
+    // case and test still green.
+    let mut handed = std::fs::File::open(dir.0.join("S"))?;
+    handed.seek(std::io::SeekFrom::Start(5))?;
+    let unaliased = std::process::Command::new(bin())
+        .args(["sed", "-n", "-e", "R /dev/stdin", "-e", "p", "IN"])
+        .stdin(std::process::Stdio::from(handed))
+        .env("POSIXLY_CORRECT", "1")
+        .current_dir(&dir.0)
+        .output()?;
+    assert_eq!(
+        unaliased.stdout,
+        b"A\nHEAD\nB\nTAIL1\n".to_vec(),
+        "the table was still consulted outside POSIXLY_EXTENDED"
+    );
+    assert_eq!(unaliased.status.code(), Some(0));
+    Ok(())
+}
+
+/// A read error on the aliased standard input names the STREAM and not the name
+/// the script spelled, which is GNU answering from the stream it registered
+/// rather than from the path. Uncaseable for the same reason as the test above:
+/// a case supplies stdin as BYTES, and a directory is the reachable way to make
+/// that read fail.
+#[test]
+fn an_r_read_error_on_standard_input_names_the_stream(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let dir = TempDir::new("r-stdin-dir")?;
+    let sub = dir.0.join("D");
+    std::fs::create_dir_all(&sub)?;
+    std::fs::write(dir.0.join("IN"), b"a\n")?;
+
+    let out = std::process::Command::new(bin())
+        .args(["sed", "-n", "-e", "R /dev/stdin", "-e", "p", "IN"])
+        .stdin(std::process::Stdio::from(std::fs::File::open(&sub)?))
+        .current_dir(&dir.0)
+        .output()?;
+    assert_eq!(
+        out.stderr,
+        b"sed: read error on stdin: Is a directory\n".to_vec(),
+        "the failed read named the path rather than the stream"
+    );
+    assert_eq!(out.stdout, b"".to_vec());
+    assert_eq!(out.status.code(), Some(4));
+    Ok(())
+}
+
+/// Each special name's direction belongs to the STREAM and not to the descriptor
+/// behind it: GNU decides both refusals in the C library, with no syscall made,
+/// so opening standard output for reading as well does not make `R /dev/stdout`
+/// readable and opening standard input for writing does not make `w /dev/stdin`
+/// writable. A case cannot say it — the harness hands the child pipes, and this
+/// needs a descriptor whose access mode contradicts its stream's.
+///
+/// The second half is also what guards the file behind standard input. Resolving
+/// `/dev/stdin` as a PATH to create would TRUNCATE it, so the assertion on the
+/// bytes afterwards is the one that would catch that coming back.
+#[test]
+fn a_special_stream_refuses_by_direction_not_by_descriptor(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let dir = TempDir::new("special-direction")?;
+    std::fs::write(dir.0.join("IN"), b"LINE\n")?;
+    let both_ways = |name: &str| -> std::io::Result<std::fs::File> {
+        std::fs::OpenOptions::new().read(true).write(true).open(dir.0.join(name))
+    };
+
+    std::fs::write(dir.0.join("OUT"), b"KEPT\n")?;
+    let read_out = std::process::Command::new(bin())
+        .args(["sed", "-n", "-e", "R /dev/stdout", "-e", "p", "IN"])
+        .stdout(std::process::Stdio::from(both_ways("OUT")?))
+        .current_dir(&dir.0)
+        .output()?;
+    assert_eq!(
+        read_out.stderr,
+        b"sed: read error on stdout: Bad file descriptor\n".to_vec(),
+        "a readable descriptor made the write-only STREAM readable"
+    );
+    assert_eq!(read_out.status.code(), Some(4));
+    assert_eq!(std::fs::read(dir.0.join("OUT"))?, b"KEPT\n".to_vec());
+
+    std::fs::write(dir.0.join("DATA"), b"PRECIOUS\n")?;
+    let write_in = std::process::Command::new(bin())
+        .args(["sed", "-n", "-e", "w /dev/stdin", "-e", "p", "IN"])
+        .stdin(std::process::Stdio::from(both_ways("DATA")?))
+        .current_dir(&dir.0)
+        .output()?;
+    assert_eq!(
+        write_in.stderr,
+        b"sed: couldn't write 4 items to stdin: Bad file descriptor\n".to_vec(),
+        "a writable descriptor made the read-only STREAM writable"
+    );
+    assert_eq!(write_in.stdout, b"".to_vec());
+    assert_eq!(write_in.status.code(), Some(4));
+    assert_eq!(
+        std::fs::read(dir.0.join("DATA"))?,
+        b"PRECIOUS\n".to_vec(),
+        "the file behind standard input was opened as a path and truncated"
+    );
     Ok(())
 }

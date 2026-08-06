@@ -3399,6 +3399,144 @@ sed: couldn't open file /nosuchdir/out: No such file or directory
 ## stderr-json: ""
 ## status: 0
 
+
+# Those three device names are ONE table, and GNU consults it from both
+# directions: `R' on the read side and `w'/`W'/`s///w' on the write side both
+# reach it through `get_openfile'. A name in it resolves to a stream the process
+# ALREADY HOLDS rather than to a path to open, which is what makes `R /dev/stdin'
+# work where standard input is a fifo whose writer has gone -- fd 0 is at end of
+# file while a fresh open of the name waits for a writer that never comes.
+#
+# Because it is one table serving two directions, each name carries a DIRECTION
+# with it. The C library's `stdin' is a read-only stream and its `stdout' and
+# `stderr' are write-only, so the wrong way round is EBADF decided in the library
+# with no syscall attempted at all -- which is why the refusals below do not
+# depend on what the descriptor would have allowed.
+
+#### R /dev/stdin reads the standard input the process was GIVEN
+## argv: sed -n -e 'R /dev/stdin' -e p IN
+## file-json IN: "A\nB\n"
+## stdin-json: "P1\nP2\n"
+## stdout-json: "A\nP1\nB\nP2\n"
+## stderr-json: ""
+## status: 0
+
+#### r is NOT in that table, so it opens the name it was given
+# GNU compiles `R' with `get_openfile' and `r' with a bare `read_filename', so
+# the aliasing reaches only one of the two.
+## argv: sed -n -e 'r /dev/stdin' -e p IN
+## file-json IN: "A\n"
+## stdin-json: "P1\nP2\n"
+## stdout-json: "A\nP1\nP2\n"
+## stderr-json: ""
+## status: 0
+
+#### R /dev/stdout is refused: nothing may be READ from that stream
+## argv: sed -n -e 'R /dev/stdout' -e p IN
+## file-json IN: "LINE\n"
+## stdin-json: ""
+## stdout-json: ""
+## stderr-json: "sed: read error on stdout: Bad file descriptor\n"
+## status: 4
+
+#### and /dev/stderr the same way
+## argv: sed -n -e 'R /dev/stderr' -e p IN
+## file-json IN: "LINE\n"
+## stdin-json: ""
+## stdout-json: ""
+## stderr-json: "sed: read error on stderr: Bad file descriptor\n"
+## status: 4
+
+#### an R that never runs never reads, so nothing is refused
+# The read happens when the command RUNS, not when the script is compiled.
+## argv: sed -n -e '5R /dev/stdout' -e p IN
+## file-json IN: "LINE\n"
+## stdin-json: ""
+## stdout-json: "LINE\n"
+## stderr-json: ""
+## status: 0
+
+#### w /dev/stdin is refused: nothing may be WRITTEN to that stream
+# And the target is not CREATED either, which is the half that matters: opening
+# the NAME would truncate whatever the operator's standard input is.
+## argv: sed -n -e 'w /dev/stdin' -e p IN
+## file-json IN: "LINE\n"
+## stdin-json: ""
+## stdout-json: ""
+## stderr-json: "sed: couldn't write 4 items to stdin: Bad file descriptor\n"
+## status: 4
+
+#### the count is BYTES, so a one-byte pattern space is one item
+## argv: sed -n 'w /dev/stdin' IN
+## file-json IN: "X\n"
+## stdin-json: ""
+## stdout-json: ""
+## stderr-json: "sed: couldn't write 1 item to stdin: Bad file descriptor\n"
+## status: 4
+
+#### an EMPTY pattern space is refused by the separator after it
+# A zero-length write is let through, so what fails is the newline behind it --
+# still one item, from a different call.
+## argv: sed -n 'w /dev/stdin' IN
+## file-json IN: "\n"
+## stdin-json: ""
+## stdout-json: ""
+## stderr-json: "sed: couldn't write 1 item to stdin: Bad file descriptor\n"
+## status: 4
+
+#### W reaches the same table, with the FIRST line's length
+## argv: sed -n 'W /dev/stdin' IN
+## file-json IN: "AB\nCDE\n"
+## stdin-json: ""
+## stdout-json: ""
+## stderr-json: "sed: couldn't write 2 items to stdin: Bad file descriptor\n"
+## status: 4
+
+#### and so does the s///w flag, with the SUBSTITUTED pattern space
+## argv: sed -n 's/A/Z/w /dev/stdin' IN
+## file-json IN: "ABC\n"
+## stdin-json: ""
+## stdout-json: ""
+## stderr-json: "sed: couldn't write 3 items to stdin: Bad file descriptor\n"
+## status: 4
+
+#### a w that never runs never writes, so nothing is refused
+## argv: sed -n -e '5w /dev/stdin' -e p IN
+## file-json IN: "LINE\n"
+## stdin-json: ""
+## stdout-json: "LINE\n"
+## stderr-json: ""
+## status: 0
+
+#### the name is EXACT: another spelling of the same file is a path
+## argv: sed -n -e 'R //dev/stdin' -e p IN
+## file-json IN: "A\n"
+## stdin-json: "P1\n"
+## stdout-json: "A\nP1\n"
+## stderr-json: ""
+## status: 0
+
+#### and so is the descriptor's own link
+## argv: sed -n -e 'R /proc/self/fd/0' -e p IN
+## file-json IN: "A\n"
+## stdin-json: "P1\n"
+## stdout-json: "A\nP1\n"
+## stderr-json: ""
+## status: 0
+
+#### R /dev/stdin when standard input is ALSO the input shares its cursor
+# GNU takes ONE line per `R', off the very stream its input reader is walking, so
+# the two share a position and alternate lines go to the append queue. td-txt
+# reads each input whole before the first cycle, so the `R' finds nothing left.
+# That is the read-whole gap spec/README records, and this is the one shape of it
+# that changes BYTES rather than only when they arrive -- which is why it is a
+# case with GNU's golden and not a paragraph. xfail.
+## argv: sed -n -e 'R /dev/stdin' -e s/^/P/ -e p
+## stdin-json: "A\nB\nC\n"
+## stdout-json: "PA\nB\nPC\n"
+## stderr-json: ""
+## status: 0
+
 # What restarts per operand under `-s`/`-i`, and what does not. Line numbers, range
 # state, the hold space and every `R` read position restart; the output streams and
 # their owed separators do not. GNU clears the hold's TEXT but keeps its terminator
@@ -7347,14 +7485,97 @@ a
 ## status: 1
 
 #### --posix stops `/dev/stdout' aliasing the program's own stdout
-# GNU opens it as an ordinary, separately buffered file under the flag, so the
-# `w' output arrives in one group after the `p' output; here the two interleave.
-# xfail with GNU's golden. This was recorded as UNCASEABLE on the grounds that
-# the harness captures stdout -- it captures it through a pipe, which is the
-# very condition the divergence needs.
+# GNU consults the special-file table only under POSIXLY_EXTENDED, so under the
+# flag all three names are the paths they are: an ordinary, separately buffered
+# file, whose output arrives in one group rather than interleaved with `p'. This
+# case cannot tell the two groups apart, both being the same bytes -- the pair
+# below is what pins the ORDER.
 ## argv: sed '--posix' '-n' 'p;w /dev/stdout' h
 ## file-json h: "1\n2\n3\n"
 ## stdout-json: "1\n2\n3\n1\n2\n3\n"
+## stderr-json: ""
+## status: 0
+
+#### --posix separates the w group from the p group
+## argv: sed --posix -n -e p -e s/^/W/ -e 'w /dev/stdout' h
+## file-json h: "1\n2\n3\n"
+## stdin-json: ""
+## stdout-json: "W1\nW2\nW3\n1\n2\n3\n"
+## stderr-json: ""
+## status: 0
+
+#### and without it the two share one stream and interleave
+## argv: sed -n -e p -e s/^/W/ -e 'w /dev/stdout' h
+## file-json h: "1\n2\n3\n"
+## stdin-json: ""
+## stdout-json: "1\nW1\n2\nW2\n3\nW3\n"
+## stderr-json: ""
+## status: 0
+
+#### but that GROUPING is buffering, and -u takes it away in GNU
+# The two streams are separate under the flag either way; what orders them is
+# that GNU block-buffers its stdout while the `w' file flushes first. `-u' makes
+# GNU flush every output after every line (execute.c:415) and the two interleave
+# again. td-txt accepts `-u' and ignores it -- its `w' target is an unbuffered
+# `File' and its auto-print sink is buffered whatever the flag says -- so it
+# groups here regardless. The same holds when stdout is a terminal. xfail with
+# GNU's golden; see spec/README's `-u' gap.
+## argv: sed --posix -u -n -e p -e s/^/W/ -e 'w /dev/stdout' h
+## file-json h: "1\n2\n3\n"
+## stdin-json: ""
+## stdout-json: "1\nW1\n2\nW2\n3\nW3\n"
+## stderr-json: ""
+## status: 0
+
+#### --posix takes /dev/stdin out of the table too, so the write is NOT refused
+# The path is opened instead, which for a pipe is its other end -- so nothing
+# is written anywhere anyone can see, and the point of the case is the ABSENCE
+# of the refusal the default mode gives.
+## argv: sed --posix -n -e 'w /dev/stdin' -e p IN
+## file-json IN: "LINE\n"
+## stdin-json: ""
+## stdout-json: "LINE\n"
+## stderr-json: ""
+## status: 0
+
+#### the read side's gate cannot be reached: --posix withdraws R itself
+## argv: sed --posix -n -e 'R /dev/stdin' -e p IN
+## file-json IN: "LINE\n"
+## stdin-json: ""
+## stdout-json: ""
+## stderr-contains: unknown command: `R'
+## status: 1
+
+# The gate is GNU's THIRD posixicity level and not the negation of `--posix':
+# `POSIXLY_CORRECT' selects a different mode that is equally not EXTENDED, so it
+# takes the table away too. That is why these cases exist under a variable td-txt
+# deliberately does NOT wire to `--posix' (see spec/README's gap entry) -- what is
+# shared here is the level, not the switch.
+
+#### POSIXLY_CORRECT takes the table away as well, being GNU's OTHER non-extended mode
+## argv: sed -n -e p -e s/^/W/ -e 'w /dev/stdout' h
+## file-json h: "1\n2\n3\n"
+## env POSIXLY_CORRECT: 1
+## stdin-json: ""
+## stdout-json: "W1\nW2\nW3\n1\n2\n3\n"
+## stderr-json: ""
+## status: 0
+
+#### and any value counts, `0' included
+## argv: sed -n -e p -e s/^/W/ -e 'w /dev/stdout' h
+## file-json h: "1\n2\n3\n"
+## env POSIXLY_CORRECT: 0
+## stdin-json: ""
+## stdout-json: "W1\nW2\nW3\n1\n2\n3\n"
+## stderr-json: ""
+## status: 0
+
+#### so w /dev/stdin under it opens the PATH and is not refused
+## argv: sed -n -e 'w /dev/stdin' -e p IN
+## file-json IN: "LINE\n"
+## env POSIXLY_CORRECT: 1
+## stdin-json: ""
+## stdout-json: "LINE\n"
 ## stderr-json: ""
 ## status: 0
 

@@ -189,6 +189,11 @@ struct ScriptParser<'a> {
     /// it (see `Options::posix`), and `normalize_regex`, which stops decoding the
     /// escape vocabulary inside a bracket expression.
     posix: bool,
+    /// GNU's POSIXLY_EXTENDED, which is NOT the negation of `posix`: `--posix`
+    /// and `POSIXLY_CORRECT` are different switches here (see spec/README's gap
+    /// entry) and GNU's third level is what each of them leaves. Only the
+    /// special-file table reads it.
+    extended: bool,
     /// `--sandbox`. Read at the `r`/`R`/`w`/`W` commands and the `s///w` flag, and
     /// checked BEFORE the target is opened, because refusing the command is GNU's
     /// answer whether or not the file could have been opened.
@@ -822,16 +827,19 @@ impl ScriptParser<'_> {
     /// the script is therefore what orders this failure against a script error:
     /// everything parsed before it has already had its say.
     ///
-    /// The two device names are not files and GNU creates nothing for them; they
+    /// The three device names are not files and GNU creates nothing for them; they
     /// are registered here anyway so the write path never has to open anything.
     fn open_wfile(&mut self, path: &[u8]) -> Result<(), Fatal> {
         if self.wfiles.contains_key(path) {
             return Ok(());
         }
-        let dest = match path {
-            b"/dev/stdout" => WDest::Stdout,
-            b"/dev/stderr" => WDest::Stderr,
-            _ => WDest::File(
+        let dest = match special(path, self.extended) {
+            Some(Special::Out) => WDest::Stdout,
+            Some(Special::Err) => WDest::Stderr,
+            // Opened as a stream nobody may write to, and not as a PATH: creating
+            // `/dev/stdin` truncates whatever the operator's standard input is.
+            Some(Special::In) => WDest::Stdin,
+            None => WDest::File(
                 std::fs::File::create(crate::util::path_from_bytes(path))
                     .map_err(|e| Fatal::runtime_msg(cant_open(path, &e)))?,
             ),
@@ -1349,14 +1357,15 @@ fn parse_script(
     ere: bool,
     null_data: bool,
     parts: Vec<Part>,
-    posix: bool,
+    mode: Posixicity,
     sandbox: bool,
 ) -> Result<Script, Fatal> {
     let mut p = ScriptParser {
         src,
         pos: 0,
         ere,
-        posix,
+        posix: mode.posix,
+        extended: mode.extended,
         sandbox,
         null_data,
         saved: None,
@@ -1931,6 +1940,8 @@ enum WDest {
     Stderr,
     /// `/dev/stdout` under `-i` only; otherwise it rides the auto-print sink.
     Stdout,
+    /// `/dev/stdin`, which every write refuses.
+    Stdin,
 }
 
 impl WFile {
@@ -1940,6 +1951,7 @@ impl WFile {
             WDest::File(f) => f.write_all(bytes),
             WDest::Stderr => std::io::stderr().write_all(bytes),
             WDest::Stdout => std::io::stdout().write_all(bytes),
+            WDest::Stdin => return refuse_write(bytes.len()),
         };
         wrote.map_err(|e| format!("write error: {}", errmsg(&e)).into_bytes())
     }
@@ -1975,6 +1987,9 @@ struct Sed {
     suppress: bool,
     separator: u8,
     posix: bool,
+    /// GNU's POSIXLY_EXTENDED — see `Conf::extended`. Only the special-file
+    /// table reads it.
+    extended: bool,
     /// The fallback width (`COLS`, then `-l`), read HERE rather than at compile
     /// time because GNU reads it when `l` runs: `sed -e l -l 12` folds at 12
     /// though the option came after.
@@ -2604,9 +2619,9 @@ fn compile_script(
     sandbox: bool,
     null_data: bool,
     parts: Vec<Part>,
-    posix: bool,
+    mode: Posixicity,
 ) -> Result<Script, Fatal> {
-    let mut script = parse_script(src, ere, null_data, parts, posix, sandbox)?;
+    let mut script = parse_script(src, ere, null_data, parts, mode, sandbox)?;
     let labels = std::mem::take(&mut script.labels);
     resolve_labels(&mut script.cmds, &labels)
         .map_err(|msg| Fatal { msg, status: 4, locus: None })?;
@@ -2780,7 +2795,12 @@ fn run(args: &[Vec<u8>]) -> Result<i32, Fatal> {
                 b"null-data" | b"zero-terminated" => conf.null_data = true,
                 b"posix" => conf.posix = true,
                 b"sandbox" => conf.sandbox = true,
-                b"unbuffered" => {} // output content does not depend on buffering
+                // Accepted and ignored. That is content-neutral for ONE stream,
+                // and stopped being so where two share a descriptor: GNU's `-u`
+                // flushes every output after every line (execute.c:415), which
+                // ORDERS a `--posix` `w /dev/stdout` against auto-print. See
+                // spec/README's `-u` gap.
+                b"unbuffered" => {}
                 // Accepting these silently would fail OPEN: --debug must print an
                 // annotated program, and --follow-symlinks changes which file -i
                 // rewrites. Refusing is the honest answer until they are built.
@@ -2960,8 +2980,12 @@ fn run(args: &[Vec<u8>]) -> Result<i32, Fatal> {
     // locus is taken here, while the parts are still in hand, and attached below
     // to whatever exit-1 failure comes back without one.
     let script_end = locus_at(&parts, &source, Spot::Saved(source.len()));
+    // Built now that every option has been seen. GNU's third posixicity level is
+    // the one BOTH other switches leave, and it is deliberately not `!posix`:
+    // the variable and the flag differ elsewhere on purpose.
+    let mode = Posixicity { posix: conf.posix, extended: !conf.posix && !posixly };
     let separator = separator_for(conf.null_data);
-    compile_and_run(conf, &source, parts, files, separator).map_err(|f| {
+    compile_and_run(conf, mode, &source, parts, files, separator).map_err(|f| {
         match (f.status, &f.locus) {
             (1, None) => Fatal { locus: script_end, ..f },
             _ => f,
@@ -2974,13 +2998,14 @@ fn run(args: &[Vec<u8>]) -> Result<i32, Fatal> {
 /// needs (see the caller) outlives every `?` in here.
 fn compile_and_run(
     conf: Conf,
+    mode: Posixicity,
     source: &[u8],
     parts: Vec<Part>,
     files: Vec<Vec<u8>>,
     separator: u8,
 ) -> Result<i32, Fatal> {
     let mut script =
-        compile_script(source, conf.ere, conf.sandbox, conf.null_data, parts, conf.posix)?;
+        compile_script(source, conf.ere, conf.sandbox, conf.null_data, parts, mode)?;
     let seed = seed_ranges(&script.cmds);
     let wfiles = std::mem::take(&mut script.wfiles);
     let mut sed = Sed {
@@ -2988,7 +3013,8 @@ fn compile_and_run(
         ranges: seed,
         suppress: conf.suppress,
         separator,
-        posix: conf.posix,
+        posix: mode.posix,
+        extended: mode.extended,
         line_wrap: conf.line_wrap,
         pattern: Vec::new(),
         hold: Vec::new(),
@@ -3199,6 +3225,110 @@ fn read_script(path: &[u8]) -> std::io::Result<(Vec<u8>, bool)> {
     Ok((data, file.seek(std::io::SeekFrom::Start(0)).is_ok()))
 }
 
+/// GNU's posixicity as td-txt needs it: TWO questions rather than one flag, and
+/// deliberately not each other's negation. `posix` is `--posix`, which withdraws
+/// extensions; `extended` is GNU's POSIXLY_EXTENDED, which `--posix` and
+/// `POSIXLY_CORRECT` each leave and only the special-file table reads. Threaded
+/// as one value because two adjacent `bool`s of the same shape transpose
+/// silently, and built in exactly one place so no later caller can default it.
+#[derive(Clone, Copy)]
+struct Posixicity {
+    posix: bool,
+    extended: bool,
+}
+
+/// One of the three names GNU's `get_openfile` resolves to a STREAM the process
+/// already holds instead of a path it opens (compile.c:81).
+#[derive(Clone, Copy)]
+enum Special {
+    In,
+    Out,
+    Err,
+}
+
+impl Special {
+    /// What a diagnostic calls it, which is the STREAM's registered name and not
+    /// the name the script spelled (GNU's `utils_fp_name`, utils.c:98).
+    fn name(self) -> &'static str {
+        match self {
+            Self::In => "stdin",
+            Self::Out => "stdout",
+            Self::Err => "stderr",
+        }
+    }
+}
+
+/// ONE table serves both directions -- `R` on the read side, `w`/`W`/`s///w` on
+/// the write side -- which is why each name carries a direction with it: the C
+/// library's `stdin` is a read-only stream and its `stdout`/`stderr` are
+/// write-only, so the wrong way round is EBADF decided in the library with no
+/// syscall attempted. That is why `1<>f` does not make `R /dev/stdout` readable.
+/// GNU consults the table only under POSIXLY_EXTENDED, so `--posix` opens all
+/// three as the paths they are.
+fn special(path: &[u8], extended: bool) -> Option<Special> {
+    if !extended {
+        return None;
+    }
+    match path {
+        b"/dev/stdin" => Some(Special::In),
+        b"/dev/stdout" => Some(Special::Out),
+        b"/dev/stderr" => Some(Special::Err),
+        _ => None,
+    }
+}
+
+/// `EBADF`, which the C library sets ITSELF for a stream used the wrong way round.
+/// Synthesised rather than obtained, because there is no operation to attempt: the
+/// refusal is above the kernel, and safe Rust exposes no reader for standard
+/// output to attempt it with.
+const EBADF: i32 = 9;
+
+fn ebadf() -> std::io::Error {
+    std::io::Error::from_raw_os_error(EBADF)
+}
+
+/// The refusal a `w` to `/dev/stdin` earns. GNU's `ck_fwrite` (utils.c:224) counts
+/// BYTES as items and pluralises. A zero-length write never reaches it: what
+/// skips one is `output_line`'s own `if (length)` (execute.c:426), the `size`
+/// argument being a literal 1 at every call — so an EMPTY pattern space is
+/// refused by the separator that follows it instead, one item.
+fn refuse_write(n: usize) -> Result<(), Vec<u8>> {
+    if n == 0 {
+        return Ok(());
+    }
+    let items = if n == 1 { "item" } else { "items" };
+    Err(format!("couldn't write {n} {items} to stdin: {}", errmsg(&ebadf())).into_bytes())
+}
+
+fn read_error(name: &str, e: &std::io::Error) -> Vec<u8> {
+    format!("read error on {}: {}", name, errmsg(e)).into_bytes()
+}
+
+/// `R`'s source, which unlike `r`'s is resolved through the table above: GNU
+/// compiles `R` with `get_openfile` and `r` with a bare `read_filename`, so only
+/// `R` gets the aliasing. The non-extended arm is reached through
+/// `POSIXLY_CORRECT` and not through `--posix`, which withdraws `R` itself — so
+/// under the variable this opens the NAME again, hang and all, exactly as GNU
+/// does there.
+fn read_r_source(path: &[u8], extended: bool) -> Result<(Vec<u8>, bool), Vec<u8>> {
+    let Some(s) = special(path, extended) else {
+        return read_source(path);
+    };
+    let Special::In = s else {
+        return Err(read_error(s.name(), &ebadf()));
+    };
+    // The descriptor we were GIVEN, rather than the name opened a second time.
+    // Where standard input is a fifo whose writer has gone, fd 0 is at end of file
+    // while a fresh open of the name waits for a writer that never comes.
+    let mut data = Vec::new();
+    match std::io::stdin().lock().read_to_end(&mut data) {
+        // Never rewindable: GNU does not `rewind` a special stream under `-s`,
+        // however seekable the descriptor behind it happens to be.
+        Ok(_) => Ok((data, false)),
+        Err(e) => Err(read_error(s.name(), &e)),
+    }
+}
+
 /// Read a file named by `r`/`R`. Unlike an operand or `-f`, `-` is NOT stdin here:
 /// GNU opens the name literally, so `R -` reads a file called `-` and reads nothing
 /// when there is none (`w -` already wrote one). The bool is whether the source can
@@ -3218,10 +3348,7 @@ fn read_source(path: &[u8]) -> Result<(Vec<u8>, bool), Vec<u8>> {
             &format!(": {}", errmsg(&e)),
         ));
     }
-    // GNU aliases the literal `/dev/stdin` to its own stdin stream, which is not
-    // among the streams it rewinds, however seekable that stream happens to be.
-    let rewindable = path != b"/dev/stdin" && file.seek(std::io::SeekFrom::Start(0)).is_ok();
-    Ok((data, rewindable))
+    Ok((data, file.seek(std::io::SeekFrom::Start(0)).is_ok()))
 }
 
 /// Is `want` newer than the GNU sed level td-txt implements? GNU's `v` runs glibc's
@@ -3465,7 +3592,7 @@ impl Sed {
             None => {
                 // A missing file is not an error for `R`: cache it as exhausted so it
                 // is opened at most once.
-                let (data, rewindable) = read_source(path)?;
+                let (data, rewindable) = read_r_source(path, self.extended)?;
                 let lines = to_lines(&data, separator);
                 self.rfiles.entry(path.to_vec()).or_insert(RFile { lines, pos: 0, rewindable })
             }
@@ -3533,7 +3660,7 @@ impl Sed {
         // in one script interleave wrongly. Under `-i` that sink is the replacement
         // buffer, and GNU still writes to the real standard output — so there it is
         // an ordinary target with a debt of its own, like every other one.
-        if path == b"/dev/stdout" && !self.in_place {
+        if matches!(special(path, self.extended), Some(Special::Out)) && !self.in_place {
             return sink.write_line_on(Chan::WFile, bytes, terminated);
         }
         let separator = self.separator;
@@ -3900,13 +4027,16 @@ impl Sed {
 mod tests {
     use super::*;
 
+    /// What every test here compiles under: no `--posix`, no `POSIXLY_CORRECT`.
+    const EXTENDED: Posixicity = Posixicity { posix: false, extended: true };
+
     /// Run a script over `input` and return what it wrote.
     fn sed(script: &str, input: &str, opts: &[&str]) -> Vec<u8> {
         let ere = opts.contains(&"-E") || opts.contains(&"-r");
         let null_data = opts.contains(&"-z");
         let sep = separator_for(null_data);
         let mut script =
-            compile_script(script.as_bytes(), ere, false, null_data, Vec::new(), false).unwrap();
+            compile_script(script.as_bytes(), ere, false, null_data, Vec::new(), EXTENDED).unwrap();
         let nranges = script.cmds.len();
         let seed = seed_ranges(&script.cmds);
         let wfiles = std::mem::take(&mut script.wfiles);
@@ -3916,6 +4046,7 @@ mod tests {
             suppress: opts.contains(&"-n"),
             separator: sep,
             posix: false,
+            extended: true,
             line_wrap: DEFAULT_LINE_WRAP,
             pattern: Vec::new(),
             hold: Vec::new(),
@@ -4244,7 +4375,7 @@ mod tests {
             (b"y/a\n/xy/", "unterminated `y' command"),
             (b"/a\nb/p", "unterminated address regex"),
         ] {
-            let err = compile_script(script, false, false, false, Vec::new(), false).err();
+            let err = compile_script(script, false, false, false, Vec::new(), EXTENDED).err();
             assert_eq!(
                 err.map(|f| f.msg),
                 Some(msg.as_bytes().to_vec()),
@@ -4272,13 +4403,13 @@ mod tests {
         // closer overlapping it is missed and the parity shows.
         // An even name-length CLOSES, and is then rejected for its name.
         assert_eq!(
-            compile_script(b"s/[[....]]/X/", false, false, false, Vec::new(), false)
+            compile_script(b"s/[[....]]/X/", false, false, false, Vec::new(), EXTENDED)
                 .err()
                 .map(|f| f.msg),
             Some(b"Invalid collation character".to_vec())
         );
         for script in [&b"s/[[...]]/X/"[..], b"s/[[.....]]/X/", b"s/[[:::]]/X/", b"s/[[===]]/X/"] {
-            let err = compile_script(script, false, false, false, Vec::new(), false).err();
+            let err = compile_script(script, false, false, false, Vec::new(), EXTENDED).err();
             assert_eq!(
                 err.map(|f| f.msg),
                 Some(b"unterminated `s' command".to_vec()),
@@ -4289,7 +4420,7 @@ mod tests {
         // The closer must be the character that opened it, so these run off the
         // end of the script rather than closing a set.
         for script in [&b"s/[[:alpha:]/X/"[..], b"s/[[:alpha.]]/X/", b"s/[[:]]/X/"] {
-            let err = compile_script(script, false, false, false, Vec::new(), false).err();
+            let err = compile_script(script, false, false, false, Vec::new(), EXTENDED).err();
             assert_eq!(
                 err.map(|f| f.msg),
                 Some(b"unterminated `s' command".to_vec()),
@@ -4303,10 +4434,10 @@ mod tests {
     /// exits 4, alone among pattern errors.
     #[test]
     fn the_bare_class_syntax_refusal_is_exit_4_where_other_pattern_errors_are_1() {
-        let f = compile_script(b"s@[:alpha:]@X@", false, false, false, Vec::new(), false).err();
+        let f = compile_script(b"s@[:alpha:]@X@", false, false, false, Vec::new(), EXTENDED).err();
         assert_eq!(f.as_ref().map(|f| f.status), Some(4));
         assert_eq!(f.map(|f| f.msg), Some(crate::regex::CLASS_SYNTAX.as_bytes().to_vec()));
-        let f = compile_script(b"s@[[:a:]]@X@", false, false, false, Vec::new(), false).err();
+        let f = compile_script(b"s@[[:a:]]@X@", false, false, false, Vec::new(), EXTENDED).err();
         assert_eq!(f.map(|f| f.status), Some(1));
     }
 
@@ -4315,11 +4446,11 @@ mod tests {
         // A bad script is status 1; an unresolvable branch is a RUNTIME error,
         // which GNU reports as 4.
         for bad in [&b"k"[..], b"s/a/b", b"{p"] {
-            let err = compile_script(bad, false, false, false, Vec::new(), false).err().map(|f| f.status);
+            let err = compile_script(bad, false, false, false, Vec::new(), EXTENDED).err().map(|f| f.status);
             assert_eq!(err, Some(1), "{:?} must be a status-1 script error", bad);
         }
         assert_eq!(
-            compile_script(b"bnowhere", false, false, false, Vec::new(), false).err().map(|f| f.status),
+            compile_script(b"bnowhere", false, false, false, Vec::new(), EXTENDED).err().map(|f| f.status),
             Some(4)
         );
     }
@@ -4337,7 +4468,7 @@ mod tests {
                 .map(|(i, e)| Part { end: *e, origin: Origin::Expression(i + 1) })
                 .collect();
             parts.push(Part { end: src.len(), origin: Origin::Expression(parts.len() + 1) });
-            compile_script(src, false, false, false, parts, false).err().map(|f| f.status)
+            compile_script(src, false, false, false, parts, EXTENDED).err().map(|f| f.status)
         };
         // `sed a` and `sed -e a -e p`: nothing after the command in its own part.
         assert_eq!(compile(b"a", Vec::new()), Some(1));
