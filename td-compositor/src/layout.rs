@@ -42,14 +42,17 @@ pub struct Rect {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Placement {
     pub key: SurfaceKey,
+    /// The CLIENT's own area — what the blit covers, what the hit test asks
+    /// about, and what the client is told it has.
     pub rect: Rect,
+    /// The title band. Its own rectangle rather than "the top of `rect`"
+    /// because the two need not touch: a stacked container puts every child's
+    /// band in a run at its top and gives the content below all of them, so a
+    /// derived band could not say where this one is. Zero height where the
+    /// arrangement carries no decoration, which is fullscreen: a window with a
+    /// band across the top of it is not fullscreen.
+    pub band: Rect,
     pub focused: bool,
-    /// Whether the tile carries a title band. False for the fullscreen
-    /// arrangement, which is the whole output or nothing: a window with a band
-    /// across the top of it is not fullscreen. The renderer needs the answer
-    /// per PLACEMENT rather than per workspace, since it is the rect it is
-    /// about to carve.
-    pub decorated: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -59,12 +62,6 @@ pub struct ViewLayout {
     pub visible: bool,
     pub activated: bool,
     pub fullscreen: bool,
-    /// As `Placement::decorated`, and deliberately NOT `!self.fullscreen`: the
-    /// rect is overridden for a fullscreen LEAF on any workspace, while the
-    /// field beside it is only set for the VISIBLE one. A client on a hidden
-    /// workspace would otherwise be sized for the whole output and carved for
-    /// a band it does not have.
-    pub decorated: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -362,25 +359,50 @@ impl Layout {
         }
     }
 
-    pub fn placements(&self, width: usize, height: usize, gap: usize) -> Vec<Placement> {
+    /// `band` is the height of one title band, passed in beside the gap rather
+    /// than known here: how tall a band is belongs to whatever draws one, and
+    /// where it goes is what this module decides.
+    pub fn placements(
+        &self,
+        width: usize,
+        height: usize,
+        gap: usize,
+        band: usize,
+    ) -> Vec<Placement> {
         let Some(workspace) = self.workspaces.get(&self.active) else {
             return Vec::new();
         };
-        visible_placements(workspace, width, height, gap)
+        visible_placements(workspace, width, height, gap, band)
     }
 
-    pub fn views(&self, width: usize, height: usize, gap: usize) -> Vec<ViewLayout> {
+    pub fn views(&self, width: usize, height: usize, gap: usize, band: usize) -> Vec<ViewLayout> {
         let mut views = Vec::new();
         for (number, workspace) in &self.workspaces {
             let workspace_visible = *number == self.active;
-            for mut placement in tiled_placements(workspace, width, height, gap) {
+            for mut placement in tiled_placements(workspace, width, height, gap, band) {
                 let fullscreen_leaf = workspace.fullscreen == Some(placement.key);
                 if fullscreen_leaf {
+                    // Undecorated on ANY workspace, not only the visible one:
+                    // the rect is overridden here regardless, and the
+                    // `fullscreen` field below is gated on visibility, so
+                    // deriving the carve from that field would size a hidden
+                    // client for the whole output and carve it for a band it
+                    // does not have.
                     placement.rect = Rect {
                         x: 0,
                         y: 0,
                         width,
                         height,
+                    };
+                    // The band goes with it. Nothing reads it here — a
+                    // `ViewLayout` drops it — but a `Placement` whose band
+                    // overlapped its own client area would contradict the
+                    // invariant every other constructor holds.
+                    placement.band = Rect {
+                        x: 0,
+                        y: 0,
+                        width,
+                        height: 0,
                     };
                 }
                 views.push(ViewLayout {
@@ -390,7 +412,6 @@ impl Layout {
                         && (workspace.fullscreen.is_none() || fullscreen_leaf),
                     activated: workspace_visible && placement.focused,
                     fullscreen: workspace_visible && fullscreen_leaf,
-                    decorated: !fullscreen_leaf,
                 });
             }
         }
@@ -447,7 +468,7 @@ impl Layout {
             }
         }
         let mut activated = self
-            .views(VIRTUAL_EXTENT, VIRTUAL_EXTENT, 0)
+            .views(VIRTUAL_EXTENT, VIRTUAL_EXTENT, 0, 0)
             .into_iter()
             .filter(|view| view.visible && view.activated)
             .map(|view| view.key);
@@ -472,7 +493,7 @@ impl Layout {
         {
             return;
         }
-        let placements = self.placements(VIRTUAL_EXTENT, VIRTUAL_EXTENT, 0);
+        let placements = self.placements(VIRTUAL_EXTENT, VIRTUAL_EXTENT, 0, 0);
         if let Some(target) = directional_target(&placements, focused, direction) {
             self.workspace_mut(self.active).focused = Some(target);
         }
@@ -489,7 +510,7 @@ impl Layout {
         {
             return;
         }
-        let placements = self.placements(VIRTUAL_EXTENT, VIRTUAL_EXTENT, 0);
+        let placements = self.placements(VIRTUAL_EXTENT, VIRTUAL_EXTENT, 0, 0);
         let Some(target) = directional_target(&placements, focused, direction) else {
             return;
         };
@@ -521,6 +542,7 @@ fn visible_placements(
     width: usize,
     height: usize,
     gap: usize,
+    band: usize,
 ) -> Vec<Placement> {
     if let Some(fullscreen) = workspace.fullscreen {
         return vec![Placement {
@@ -531,11 +553,16 @@ fn visible_placements(
                 width,
                 height,
             },
+            band: Rect {
+                x: 0,
+                y: 0,
+                width,
+                height: 0,
+            },
             focused: workspace.focused == Some(fullscreen),
-            decorated: false,
         }];
     }
-    tiled_placements(workspace, width, height, gap)
+    tiled_placements(workspace, width, height, gap, band)
 }
 
 fn tiled_placements(
@@ -543,6 +570,7 @@ fn tiled_placements(
     width: usize,
     height: usize,
     gap: usize,
+    band: usize,
 ) -> Vec<Placement> {
     let Some(root) = &workspace.root else {
         return Vec::new();
@@ -556,7 +584,7 @@ fn tiled_placements(
         height: height.saturating_sub(inset_y.saturating_mul(2)),
     };
     let mut placements = Vec::new();
-    place_node(root, rect, gap, workspace.focused, &mut placements);
+    place_node(root, rect, gap, band, workspace.focused, &mut placements);
     placements
 }
 
@@ -589,20 +617,38 @@ fn place_node(
     node: &Node,
     rect: Rect,
     gap: usize,
+    band: usize,
     focused: Option<SurfaceKey>,
     placements: &mut Vec<Placement>,
 ) {
     match node {
-        Node::Leaf(key) => placements.push(Placement {
-            key: *key,
-            rect,
-            focused: focused == Some(*key),
-            decorated: true,
-        }),
+        Node::Leaf(key) => {
+            // The band and the client PARTITION the tile: the band is taken
+            // first and clipped to a tile too short to hold one, and the
+            // client is what is left. Written once, so the two cannot be made
+            // to disagree by subtracting the same number twice.
+            let taken = band.min(rect.height);
+            placements.push(Placement {
+                key: *key,
+                rect: Rect {
+                    x: rect.x,
+                    y: rect.y.saturating_add(taken),
+                    width: rect.width,
+                    height: rect.height.saturating_sub(taken),
+                },
+                band: Rect {
+                    x: rect.x,
+                    y: rect.y,
+                    width: rect.width,
+                    height: taken,
+                },
+                focused: focused == Some(*key),
+            });
+        }
         Node::Split { axis, children } => {
             let rects = split_rects(rect, *axis, children.len(), gap);
             for (child, child_rect) in children.iter().zip(rects) {
-                place_node(child, child_rect, gap, focused, placements);
+                place_node(child, child_rect, gap, band, focused, placements);
             }
         }
     }
@@ -733,12 +779,24 @@ fn interval_gap(
 mod tests {
     use super::*;
 
+    /// Every placement literal below asks for band height 0, so a band is
+    /// the tile's top edge with no height. Spelled once rather than five
+    /// times, since none of these tests is about the band.
+    fn band_at(x: usize, y: usize, width: usize) -> Rect {
+        Rect {
+            x,
+            y,
+            width,
+            height: 0,
+        }
+    }
+
     fn key(object: u32) -> SurfaceKey {
         SurfaceKey { client: 1, object }
     }
 
     fn rect(layout: &Layout, object: u32) -> Rect {
-        let placements = layout.placements(100, 100, 0);
+        let placements = layout.placements(100, 100, 0, 0);
         let index = placements
             .iter()
             .position(|placement| placement.key == key(object))
@@ -750,6 +808,31 @@ mod tests {
     }
 
     #[test]
+    fn a_tile_too_short_for_a_band_is_all_band_and_no_client() {
+        let mut layout = Layout::new();
+        layout.map(key(1));
+
+        // Clipped to the tile rather than overhanging it. Asserted HERE
+        // rather than through the renderer's partition test, which derives
+        // the tile from the band plus the client and so cannot see this: an
+        // unclipped 20-row band on a 12-row tile leaves the client at zero
+        // height either way, and band-plus-client is then 20, which agrees
+        // with itself. Same self-satisfying shape that let a whole output
+        // size stop testing anything two commits ago.
+        let short = layout.placements(40, 12, 0, 20);
+        let placement = short.first().unwrap();
+        assert_eq!((placement.band.y, placement.band.height), (0, 12));
+        assert_eq!((placement.rect.y, placement.rect.height), (12, 0));
+
+        // And a tile with room keeps exactly the band it asked for.
+        let tall = layout.placements(40, 100, 0, 20);
+        let placement = tall.first().unwrap();
+        assert_eq!((placement.band.y, placement.band.height), (0, 20));
+        assert_eq!((placement.rect.y, placement.rect.height), (20, 80));
+        assert_eq!(placement.band.width, placement.rect.width);
+    }
+
+    #[test]
     fn maps_horizontal_then_nests_the_selected_vertical_split() {
         let mut layout = Layout::new();
         layout.map(key(1));
@@ -758,7 +841,7 @@ mod tests {
         layout.map(key(3));
 
         assert_eq!(
-            layout.placements(100, 100, 0),
+            layout.placements(100, 100, 0, 0),
             [
                 Placement {
                     key: key(1),
@@ -768,8 +851,8 @@ mod tests {
                         width: 50,
                         height: 100
                     },
-                    focused: false,
-                    decorated: true
+                    band: band_at(0, 0, 50),
+                    focused: false
                 },
                 Placement {
                     key: key(2),
@@ -779,8 +862,8 @@ mod tests {
                         width: 50,
                         height: 50
                     },
-                    focused: false,
-                    decorated: true
+                    band: band_at(50, 0, 50),
+                    focused: false
                 },
                 Placement {
                     key: key(3),
@@ -790,8 +873,8 @@ mod tests {
                         width: 50,
                         height: 50
                     },
-                    focused: true,
-                    decorated: true
+                    band: band_at(50, 50, 50),
+                    focused: true
                 }
             ]
         );
@@ -891,11 +974,11 @@ mod tests {
         layout.apply(Command::MoveToWorkspace(2));
         assert_eq!(layout.active_workspace(), 1);
         assert_eq!(layout.focused(), Some(key(1)));
-        assert_eq!(layout.placements(100, 100, 0).len(), 1);
+        assert_eq!(layout.placements(100, 100, 0, 0).len(), 1);
 
         layout.apply(Command::SwitchWorkspace(2));
         assert_eq!(layout.focused(), Some(key(2)));
-        assert_eq!(layout.placements(100, 100, 0).len(), 1);
+        assert_eq!(layout.placements(100, 100, 0, 0).len(), 1);
         layout.apply(Command::MoveToWorkspace(2));
         assert_eq!(layout.focused(), Some(key(2)));
         layout.apply(Command::SwitchWorkspace(3));
@@ -910,7 +993,7 @@ mod tests {
         layout.map(key(2));
         layout.apply(Command::MoveToWorkspace(2));
         assert_eq!(
-            layout.views(100, 80, 0),
+            layout.views(100, 80, 0, 0),
             [
                 ViewLayout {
                     key: key(1),
@@ -923,7 +1006,6 @@ mod tests {
                     visible: true,
                     activated: true,
                     fullscreen: false,
-                    decorated: true,
                 },
                 ViewLayout {
                     key: key(2),
@@ -936,14 +1018,13 @@ mod tests {
                     visible: false,
                     activated: false,
                     fullscreen: false,
-                    decorated: true,
                 },
             ]
         );
         layout.apply(Command::SwitchWorkspace(2));
         layout.apply(Command::ToggleFullscreen);
         assert_eq!(
-            layout.views(100, 80, 0),
+            layout.views(100, 80, 0, 0),
             [
                 ViewLayout {
                     key: key(1),
@@ -956,7 +1037,6 @@ mod tests {
                     visible: false,
                     activated: false,
                     fullscreen: false,
-                    decorated: true,
                 },
                 ViewLayout {
                     key: key(2),
@@ -969,7 +1049,6 @@ mod tests {
                     visible: true,
                     activated: true,
                     fullscreen: true,
-                    decorated: false,
                 },
             ]
         );
@@ -989,7 +1068,7 @@ mod tests {
         assert_eq!(layout.focused(), Some(key(2)));
         assert_eq!(
             layout
-                .placements(100, 100, 0)
+                .placements(100, 100, 0, 0)
                 .into_iter()
                 .map(|placement| placement.key)
                 .collect::<Vec<_>>(),
@@ -1005,7 +1084,7 @@ mod tests {
         layout.apply(Command::MoveToWorkspace(3));
         layout.unmap(key(1));
         layout.map(key(1));
-        assert!(layout.placements(100, 100, 0).is_empty());
+        assert!(layout.placements(100, 100, 0, 0).is_empty());
         layout.apply(Command::SwitchWorkspace(3));
         assert_eq!(layout.focused(), Some(key(1)));
 
@@ -1039,8 +1118,12 @@ mod tests {
         layout.map(key(1));
         layout.map(key(2));
         layout.apply(Command::ToggleFullscreen);
+        // Band 20, not 0: this is the ONE literal in the module that is about
+        // the band, so asking for none would make its zero height the
+        // argument's answer rather than the arrangement's — true of every arm
+        // and therefore about no arm.
         assert_eq!(
-            layout.placements(80, 60, 9),
+            layout.placements(80, 60, 9, 20),
             [Placement {
                 key: key(2),
                 rect: Rect {
@@ -1049,10 +1132,10 @@ mod tests {
                     width: 80,
                     height: 60
                 },
-                focused: true,
                 // The fullscreen arrangement carries no band: a window with
                 // one across the top of it is not fullscreen.
-                decorated: false
+                band: band_at(0, 0, 80),
+                focused: true
             }]
         );
         layout.apply(Command::Focus(Direction::Left));
@@ -1060,11 +1143,11 @@ mod tests {
         assert_eq!(layout.focused(), Some(key(2)));
         layout.apply(Command::SwitchWorkspace(2));
         layout.map(key(3));
-        assert_eq!(layout.placements(80, 60, 9).len(), 1);
+        assert_eq!(layout.placements(80, 60, 9, 0).len(), 1);
         layout.apply(Command::SwitchWorkspace(1));
-        assert_eq!(layout.placements(80, 60, 9).len(), 1);
+        assert_eq!(layout.placements(80, 60, 9, 0).len(), 1);
         layout.apply(Command::ToggleFullscreen);
-        assert_eq!(layout.placements(80, 60, 9).len(), 2);
+        assert_eq!(layout.placements(80, 60, 9, 0).len(), 2);
         layout.check_invariants().unwrap();
     }
 
@@ -1075,7 +1158,7 @@ mod tests {
         layout.apply(Command::ToggleFullscreen);
         layout.map(key(2));
         assert_eq!(layout.focused(), Some(key(2)));
-        assert_eq!(layout.placements(80, 60, 0).len(), 2);
+        assert_eq!(layout.placements(80, 60, 0, 0).len(), 2);
         layout.check_invariants().unwrap();
     }
 
@@ -1093,7 +1176,7 @@ mod tests {
         assert_eq!(layout.focused(), Some(key(1)));
         layout.unmap(key(1));
         assert_eq!(layout.focused(), None);
-        assert!(layout.placements(100, 100, 0).is_empty());
+        assert!(layout.placements(100, 100, 0, 0).is_empty());
         layout.check_invariants().unwrap();
     }
 
@@ -1110,7 +1193,7 @@ mod tests {
         layout.apply(Command::ToggleFullscreen);
         layout.unmap(key(2));
         assert_eq!(layout.focused(), Some(key(3)));
-        assert_eq!(layout.placements(100, 100, 0).len(), 1);
+        assert_eq!(layout.placements(100, 100, 0, 0).len(), 1);
         layout.check_invariants().unwrap();
     }
 
@@ -1230,7 +1313,7 @@ mod tests {
         layout.apply(Command::SetSplit(Axis::Vertical));
         layout.map(key(1));
         assert_eq!(
-            layout.placements(1, 1, 24),
+            layout.placements(1, 1, 24, 0),
             [Placement {
                 key: key(1),
                 rect: Rect {
@@ -1239,8 +1322,8 @@ mod tests {
                     width: 1,
                     height: 1
                 },
-                focused: true,
-                decorated: true
+                band: band_at(0, 0, 1),
+                focused: true
             }]
         );
         layout.map(key(2));

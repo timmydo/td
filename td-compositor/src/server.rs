@@ -2505,7 +2505,7 @@ mod tests {
         layout.map(key);
         layout.apply(Command::MoveToWorkspace(2));
         let snapshot = layout
-            .views(320, 200, 0)
+            .views(320, 200, 0, 0)
             .into_iter()
             .map(|view| (view.key, view))
             .collect();

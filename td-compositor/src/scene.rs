@@ -115,43 +115,27 @@ const TITLE_FOCUSED: [u8; 4] = [0x50, 0x28, 0x60, 0];
 const TITLE_UNFOCUSED: [u8; 4] = [0x38, 0x34, 0x3c, 0];
 const TITLE_TEXT: [u8; 4] = [0xf0, 0xe8, 0xf8, 0];
 
-/// A tile is a title band and the client's own area beneath it. EVERY
-/// consumer that means "where the client's pixels are" goes through
-/// `client_rect` — the blit, the pointer hit test, and the layout published to
-/// clients — for the reason the status bar's offset has one place: two of them
-/// disagreeing is a click landing somewhere other than where it looks.
+/// The rectangle a border wraps: the client's area and its band together. Only
+/// decoration reads this — a border around the client area alone would leave a
+/// window's own title bar outside its own frame, which is why `Placement` keeps
+/// the two rects and this composes them rather than the other way round.
 ///
-/// The BORDER deliberately uses the whole tile instead. A border around the
-/// client area alone would leave a window's own title bar outside its frame.
-///
-/// An UNDECORATED tile is all client. That is the fullscreen arrangement, and
-/// the flag rather than a `Rect` comparison is what says so: a tile that
-/// happens to fill the output is still a tile.
-///
-/// Derived FROM `title_rect` rather than subtracting `TITLE_HEIGHT` again, so
-/// the two partition the tile by construction: a tile shorter than the band is
-/// all band and no client, and the arithmetic that says so exists once.
-fn client_rect(rect: Rect, decorated: bool) -> Rect {
-    let band = title_rect(rect, decorated).height;
+/// It assumes the two TOUCH and share a left edge and a width, which every
+/// arrangement here produces and
+/// `a_title_band_tops_every_tile_partitions_it_and_swallows_its_own_clicks`
+/// asserts against the tile the split actually produced. A stacked container
+/// breaks BOTH halves — its focused child's band sits up in the run of bands
+/// while the content is below all of them, and the run spans the container
+/// rather than the child — so the branch for it lands with the arrangement
+/// that needs it rather than as an untaken arm nothing can reach today. That
+/// test only walks the arrangements it BUILDS, so it fails loudly on a
+/// stacked one only once it builds one.
+fn frame_rect(placement: &Placement) -> Rect {
     Rect {
-        x: rect.x,
-        y: rect.y.saturating_add(band),
-        width: rect.width,
-        height: rect.height.saturating_sub(band),
-    }
-}
-
-/// The band itself, clipped to a tile too short to hold one.
-fn title_rect(rect: Rect, decorated: bool) -> Rect {
-    Rect {
-        x: rect.x,
-        y: rect.y,
-        width: rect.width,
-        height: if decorated {
-            TITLE_HEIGHT.min(rect.height)
-        } else {
-            0
-        },
+        x: placement.rect.x,
+        y: placement.band.y,
+        width: placement.rect.width,
+        height: placement.band.height.saturating_add(placement.rect.height),
     }
 }
 
@@ -374,10 +358,11 @@ impl Scene {
     }
 
     pub fn views(&self, width: usize, height: usize) -> Vec<ViewLayout> {
-        let mut views = self.layout.views(width, self.tiled_height(height), GAP);
+        let mut views = self
+            .layout
+            .views(width, self.tiled_height(height), GAP, TITLE_HEIGHT);
         for view in &mut views {
             view.rect.y = view.rect.y.saturating_add(BAR_HEIGHT);
-            view.rect = client_rect(view.rect, view.decorated);
         }
         views
     }
@@ -392,9 +377,12 @@ impl Scene {
     }
 
     fn tiled_placements(&self, width: usize, height: usize) -> Vec<Placement> {
-        let mut placements = self.layout.placements(width, self.tiled_height(height), GAP);
+        let mut placements =
+            self.layout
+                .placements(width, self.tiled_height(height), GAP, TITLE_HEIGHT);
         for placement in &mut placements {
             placement.rect.y = placement.rect.y.saturating_add(BAR_HEIGHT);
+            placement.band.y = placement.band.y.saturating_add(BAR_HEIGHT);
         }
         placements
     }
@@ -442,7 +430,7 @@ impl Scene {
             let Some(surface) = self.surfaces.get(&placement.key) else {
                 continue;
             };
-            let rect = client_rect(placement.rect, placement.decorated);
+            let rect = placement.rect;
             let surface_width = surface.width.min(rect.width);
             let surface_height = surface.height.min(rect.height);
             let Some(end_x) = rect.x.checked_add(surface_width) else {
@@ -491,7 +479,7 @@ impl Scene {
         placements
             .iter()
             .filter(|placement| placement.key == key)
-            .map(|placement| client_rect(placement.rect, placement.decorated))
+            .map(|placement| placement.rect)
             .next()
             .and_then(|rect| {
                 self.surfaces.get(&key)?;
@@ -534,7 +522,7 @@ impl Scene {
         stride: usize,
         placement: &Placement,
     ) {
-        let band = title_rect(placement.rect, placement.decorated);
+        let band = placement.band;
         if band.width == 0 || band.height == 0 {
             return;
         }
@@ -580,14 +568,18 @@ impl Scene {
 
         let placements = self.tiled_placements(width, height);
         for placement in &placements {
-            if placement.rect.width == 0 || placement.rect.height == 0 {
+            // The FRAME, not the client area: a tile too short to hold both is
+            // all band and no client, and guarding on the client alone would
+            // drop the one thing left to draw for it.
+            let outline = frame_rect(placement);
+            if outline.width == 0 || outline.height == 0 {
                 continue;
             }
             if !self.surfaces.contains_key(&placement.key) {
                 continue;
             }
-            let x = i64::try_from(placement.rect.x).unwrap_or(i64::MAX);
-            let y = i64::try_from(placement.rect.y).unwrap_or(i64::MAX);
+            let x = i64::try_from(outline.x).unwrap_or(i64::MAX);
+            let y = i64::try_from(outline.y).unwrap_or(i64::MAX);
             draw_border(
                 frame,
                 width,
@@ -595,27 +587,23 @@ impl Scene {
                 stride,
                 x,
                 y,
-                placement.rect.width,
-                placement.rect.height,
+                outline.width,
+                outline.height,
                 placement.focused,
             );
             self.draw_title(frame, width, height, stride, placement);
         }
         for placement in placements {
+            // The CLIENT area here, where the border pass above wants the
+            // frame: a tile too short to hold a band has no client pixels to
+            // draw, and `draw_surface` was already a no-op for one.
             if placement.rect.width == 0 || placement.rect.height == 0 {
                 continue;
             }
             let Some(surface) = self.surfaces.get(&placement.key) else {
                 continue;
             };
-            draw_surface(
-                frame,
-                width,
-                height,
-                stride,
-                client_rect(placement.rect, placement.decorated),
-                surface,
-            );
+            draw_surface(frame, width, height, stride, placement.rect, surface);
         }
         bar::paint(frame, width, height, stride, &self.status);
         self.launcher.paint(frame, width, height, stride);
@@ -1219,24 +1207,44 @@ mod tests {
             (1920, 1080),
             (200, BAR_HEIGHT + 60),
         ] {
-            for placement in scene.tiled_placements(width, height) {
-                let band = title_rect(placement.rect, placement.decorated);
-                let client = client_rect(placement.rect, placement.decorated);
-                assert_eq!((band.x, band.y), (placement.rect.x, placement.rect.y));
-                assert_eq!(band.width, placement.rect.width);
+            // The tile the split ACTUALLY produced, asked for independently:
+            // band 0 leaves it uncarved. Deriving it from the band plus the
+            // client instead — which is what `frame_rect` does — would make
+            // the partition below agree with itself, and a client one row
+            // short of its tile would pass.
+            let tiles: Vec<Rect> = scene
+                .layout
+                .placements(width, scene.tiled_height(height), GAP, 0)
+                .into_iter()
+                .map(|placement| Rect {
+                    y: placement.rect.y.saturating_add(BAR_HEIGHT),
+                    ..placement.rect
+                })
+                .collect();
+            let placements = scene.tiled_placements(width, height);
+            assert_eq!(placements.len(), tiles.len());
+            for (index, placement) in placements.iter().enumerate() {
+                let band = placement.band;
+                let client = placement.rect;
+                let tile = *tiles.get(index).unwrap();
+                assert_eq!((band.x, band.y), (tile.x, tile.y));
+                assert_eq!(band.width, tile.width);
                 assert_eq!((client.x, client.width), (band.x, band.width));
                 // The band and the client PARTITION the tile: they meet at one
                 // row and together cover it exactly, so a client rect that
-                // grew back into the band fails here rather than by painting
-                // over it.
-                assert_eq!(band.height, TITLE_HEIGHT.min(placement.rect.height));
+                // grew back into the band — or fell one row short of it —
+                // fails here rather than by painting over something.
+                assert_eq!(band.height, TITLE_HEIGHT.min(tile.height));
                 assert_eq!(client.y, band.y.saturating_add(band.height));
                 assert_eq!(
                     client.y.saturating_add(client.height),
-                    placement.rect.y.saturating_add(placement.rect.height),
+                    tile.y.saturating_add(tile.height),
                     "{width}x{height}: the tile is not the band plus the client"
                 );
-                if placement.rect.width == 0 || band.height == 0 {
+                // And `frame_rect` recovers exactly that tile, which is what
+                // the border is drawn around.
+                assert_eq!(frame_rect(placement), tile);
+                if tile.width == 0 || band.height == 0 {
                     continue;
                 }
                 // And a click anywhere in the band reaches no client —
@@ -1288,7 +1296,7 @@ mod tests {
             .iter()
             .position(|placement| placement.key == named)
             .unwrap();
-        let band = title_rect(placements.get(index).unwrap().rect, true);
+        let band = placements.get(index).unwrap().band;
         let inside = count_color(&frame, stride, band, TITLE_TEXT);
         assert!(inside > 0, "the title never reached its band");
         // Every text pixel in the OUTPUT is one of those: the clip holds the
@@ -1457,7 +1465,7 @@ mod tests {
         scene.commit(key, surface([1, 2, 3, 0], 1, 1)).unwrap();
         scene.commit(key, surface([4, 5, 6, 0], 2, 2)).unwrap();
         assert_eq!(scene.surfaces.len(), 1);
-        assert_eq!(scene.layout.placements(100, 100, 0).len(), 1);
+        assert_eq!(scene.layout.placements(100, 100, 0, 0).len(), 1);
         assert_eq!(scene.surface_bytes, 16);
         assert!(scene.layout.check_invariants().is_ok());
     }
@@ -1614,11 +1622,11 @@ mod tests {
         assert!(scene.unmap(key));
         assert!(!scene.unmap(key));
         scene.commit(key, surface([1, 2, 3, 0], 1, 1)).unwrap();
-        assert!(scene.layout.placements(100, 100, 0).is_empty());
+        assert!(scene.layout.placements(100, 100, 0, 0).is_empty());
         assert!(scene.remove(key));
         assert!(!scene.remove(key));
         scene.commit(key, surface([1, 2, 3, 0], 1, 1)).unwrap();
-        assert_eq!(scene.layout.placements(100, 100, 0).len(), 1);
+        assert_eq!(scene.layout.placements(100, 100, 0, 0).len(), 1);
         assert!(scene.layout.check_invariants().is_ok());
     }
 
