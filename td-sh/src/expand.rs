@@ -1275,6 +1275,48 @@ mod tests {
         assert_eq!(fields(&mut q, "${@:1:1}"), vec!["x", "y"]);
     }
 
+    /// Every operator over `$@` acts on the JOIN rather than on each positional
+    /// as bash does -- every one but the SLICE, asserted beside them because
+    /// that contrast is the trap. Only the unquoted `${@%a}` has an ash golden
+    /// (`var-op-strip::Remove const suffix is vectorized on $@ array`,
+    /// `## N-I dash/ash`); the rest pin this shell, so the model cannot be
+    /// "fixed" one operator at a time.
+    #[test]
+    fn an_operator_over_at_acts_on_the_join_except_the_slice() {
+        let mut sh = Shell::new_for_test();
+        sh.params = vec!["1a".into(), "2a".into(), "3a".into()];
+        // The suffix comes off the JOIN, so only the LAST element loses it.
+        assert_eq!(fields(&mut sh, "${@%a}"), vec!["1a", "2a", "3"]);
+        assert_eq!(fields(&mut sh, "\"${@%a}\""), vec!["1a 2a 3"]);
+        // Unquoted, these agree with bash by accident: neither pattern touches
+        // a separator, so the re-split reproduces the same fields.
+        assert_eq!(fields(&mut sh, "${@#1}"), vec!["a", "2a", "3a"]);
+        assert_eq!(fields(&mut sh, "${@//a/X}"), vec!["1X", "2X", "3X"]);
+        // Quoted, the accident ends -- the default included, so what collapses
+        // is the join and not the patterns.
+        assert_eq!(fields(&mut sh, "\"${@#1}\""), vec!["a 2a 3a"]);
+        assert_eq!(fields(&mut sh, "\"${@//a/X}\""), vec!["1X 2X 3X"]);
+        assert_eq!(fields(&mut sh, "\"${@:-z}\""), vec!["1a 2a 3a"]);
+        // The slice acts on the LIST, so it keeps its fields and agrees with
+        // bash exactly where the others diverge.
+        assert_eq!(fields(&mut sh, "\"${@:1:2}\""), vec!["1a", "2a"]);
+        assert_eq!(fields(&mut sh, "\"${@:1}\""), vec!["1a", "2a", "3a"]);
+    }
+
+    /// `$@` with NO positionals is SET-and-empty here, not unset, so `-` does
+    /// not substitute and `+` does -- the opposite of bash, and what the corpus
+    /// records as `## BUG dash/zsh` in `var-op-test::$@ (empty) and - and +`.
+    #[test]
+    fn an_empty_at_is_set_rather_than_unset() {
+        let mut sh = Shell::new_for_test();
+        sh.params = Vec::new();
+        assert_eq!(fields(&mut sh, "${@-z}"), Vec::<&str>::new());
+        assert_eq!(fields(&mut sh, "${@+z}"), vec!["z"]);
+        // The colon forms test emptiness and agree with bash.
+        assert_eq!(fields(&mut sh, "${@:-z}"), vec!["z"]);
+        assert_eq!(fields(&mut sh, "${@:+z}"), Vec::<&str>::new());
+    }
+
     /// An offset that reaches outside the sequence answers EMPTY and raises no
     /// error -- not even with a length, which an in-range offset would refuse.
     /// Clamping it to the front instead would return a prefix nobody asked for.
