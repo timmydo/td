@@ -21,6 +21,34 @@ pub enum Direction {
     Down,
 }
 
+impl Direction {
+    fn axis(self) -> Axis {
+        match self {
+            Direction::Left | Direction::Right => Axis::Horizontal,
+            Direction::Up | Direction::Down => Axis::Vertical,
+        }
+    }
+
+    /// Whether this direction runs along its axis with the children's order
+    /// or against it, which is what makes a move a step right or a step left
+    /// once the axis has answered which container to step in.
+    fn forward(self) -> bool {
+        matches!(self, Direction::Right | Direction::Down)
+    }
+}
+
+/// How far a subtree got with a move it was asked to make.
+enum Moved {
+    /// Handled here; the tree is already changed.
+    Done,
+    /// The leaf is in this subtree but it cannot move it — the container does
+    /// not run along the asked-for axis, or the leaf is at its edge. The
+    /// caller tries, which is what pulls the leaf OUT of this container.
+    Escalate,
+    /// The leaf is not in this subtree at all.
+    Absent,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Command {
     Focus(Direction),
@@ -141,17 +169,87 @@ impl Node {
         }
     }
 
-    fn swap(&mut self, first: SurfaceKey, second: SurfaceKey) {
-        match self {
-            Node::Leaf(key) if *key == first => *key = second,
-            Node::Leaf(key) if *key == second => *key = first,
-            Node::Leaf(_) => {}
-            Node::Split { children, .. } => {
-                for child in children {
-                    child.swap(first, second);
-                }
+    /// Move a leaf one step along `axis`, i3's way: the nearest ancestor that
+    /// RUNS along that axis is the one that acts, and what it does depends on
+    /// what is beside the leaf there. A neighbouring window swaps places with
+    /// it; a neighbouring CONTAINER is entered at its near edge; and a leaf
+    /// with no neighbour that way leaves the container it is in and becomes a
+    /// sibling of it.
+    ///
+    /// Nothing mutates until an arm commits, so an `Escalate` walking back up
+    /// leaves the subtree exactly as it was — which is what lets the caller
+    /// treat the tree it gets back as untouched.
+    fn move_leaf(&mut self, key: SurfaceKey, axis: Axis, forward: bool) -> Moved {
+        let Node::Split {
+            axis: own,
+            children,
+            ..
+        } = self
+        else {
+            return match self {
+                Node::Leaf(candidate) if *candidate == key => Moved::Escalate,
+                _ => Moved::Absent,
+            };
+        };
+        let Some(index) = children.iter().position(|child| child.contains(key)) else {
+            return Moved::Absent;
+        };
+        let direct =
+            matches!(children.get(index), Some(Node::Leaf(candidate)) if *candidate == key);
+        if !direct {
+            match children
+                .get_mut(index)
+                .map(|child| child.move_leaf(key, axis, forward))
+            {
+                Some(Moved::Done) => return Moved::Done,
+                Some(Moved::Escalate) => {}
+                Some(Moved::Absent) | None => return Moved::Absent,
             }
         }
+        if *own != axis {
+            return Moved::Escalate;
+        }
+        if !direct {
+            // The leaf came UP out of `children[index]`; it becomes a sibling
+            // of the container it was in, on the side it was heading.
+            let child = children.remove(index);
+            let mut at = index;
+            if let Some(remainder) = remove_node(child, key) {
+                children.insert(index, remainder);
+                if forward {
+                    at = index.saturating_add(1);
+                }
+            }
+            children.insert(at, Node::Leaf(key));
+            return Moved::Done;
+        }
+        let target = if forward {
+            index.saturating_add(1)
+        } else {
+            match index.checked_sub(1) {
+                Some(target) => target,
+                None => return Moved::Escalate,
+            }
+        };
+        if target >= children.len() {
+            return Moved::Escalate;
+        }
+        if let Some(Node::Split {
+            children: inner, ..
+        }) = children.get_mut(target)
+        {
+            // Entering from the left lands FIRST, entering from the right
+            // lands last. Insert THEN remove, rather than the reverse: taking
+            // the leaf out first leaves an arm where it is out of the tree
+            // with nowhere to go, and a window that vanishes is worse than
+            // one briefly in two places. It also means no index shifts.
+            let position = if forward { 0 } else { inner.len() };
+            inner.insert(position, Node::Leaf(key));
+            children.remove(index);
+        } else {
+            children.swap(index, target);
+        }
+        Moved::Done
     }
 
     /// Toggle the presentation of the container a leaf is DISPLAYED in. The
@@ -637,16 +735,43 @@ impl Layout {
         {
             return;
         }
-        let Some(workspace) = self.workspaces.get(&self.active) else {
+        let Some(mut root) = self.workspace_mut(self.active).root.take() else {
             return;
         };
-        let placements = unstacked_placements(workspace, VIRTUAL_EXTENT, VIRTUAL_EXTENT, 0);
-        let Some(target) = directional_target(&placements, focused, direction) else {
-            return;
+        let axis = direction.axis();
+        // Whether the workspace ALREADY runs the way the move is going, which
+        // is what tells the two escalations apart. A leaf escalating out of a
+        // root that runs this way is at the workspace's EDGE — it went past
+        // the last sibling — and wrapping there would nest a container inside
+        // one of its own axis: `H[1, 2, 3]` moving 1 left would become
+        // `H[1, H[2, 3]]`, thirds turning into a half and two quarters, for a
+        // chord that should have done nothing.
+        let along_axis = matches!(&root, Node::Split { axis: own, .. } if *own == axis);
+        let root = match root.move_leaf(focused, axis, direction.forward()) {
+            // No ancestor runs along this axis at all — moving a window up out
+            // of a row of them. i3 wraps the workspace in a container that
+            // does, and so does this: the alternative is a chord that does
+            // nothing on the commonest arrangement there is, two side by side.
+            Moved::Escalate if !along_axis => match remove_node(root, focused) {
+                Some(rest) => Some(Node::Split {
+                    axis,
+                    children: if direction.forward() {
+                        vec![rest, Node::Leaf(focused)]
+                    } else {
+                        vec![Node::Leaf(focused), rest]
+                    },
+                    stacked: false,
+                }),
+                // The only window on the workspace: nothing to move it past.
+                None => Some(Node::Leaf(focused)),
+            },
+            // A container the leaf left may hold one child now, which the
+            // removing path collapses for itself and this one cannot. The
+            // untouched cases run it too, and harmlessly: it is a no-op on a
+            // tree that has no degenerate container to begin with.
+            Moved::Done | Moved::Absent | Moved::Escalate => collapsed(root),
         };
-        if let Some(root) = self.workspace_mut(self.active).root.as_mut() {
-            root.swap(focused, target);
-        }
+        self.workspace_mut(self.active).root = root;
     }
 
     fn move_to_workspace(&mut self, number: u8) {
@@ -783,22 +908,42 @@ fn remove_node(node: Node, key: SurfaceKey) -> Option<Node> {
             children,
             stacked,
         } => {
-            let mut retained: Vec<Node> = children
+            let retained: Vec<Node> = children
                 .into_iter()
                 .filter_map(|child| remove_node(child, key))
                 .collect();
-            match retained.len() {
-                0 => None,
-                // A container that collapses to one child is gone, and its
-                // presentation goes with it: the survivor is not a stack.
-                1 => retained.pop(),
-                _ => Some(Node::Split {
-                    axis,
-                    children: retained,
-                    stacked,
-                }),
-            }
+            rebuilt(axis, retained, stacked)
         }
+    }
+}
+
+/// Collapse any container left holding a single child, which a move that
+/// takes a leaf out of one can produce in place where a removal cannot.
+fn collapsed(node: Node) -> Option<Node> {
+    match node {
+        Node::Leaf(key) => Some(Node::Leaf(key)),
+        Node::Split {
+            axis,
+            children,
+            stacked,
+        } => {
+            let retained: Vec<Node> = children.into_iter().filter_map(collapsed).collect();
+            rebuilt(axis, retained, stacked)
+        }
+    }
+}
+
+fn rebuilt(axis: Axis, mut children: Vec<Node>, stacked: bool) -> Option<Node> {
+    match children.len() {
+        0 => None,
+        // A container that collapses to one child is gone, and its
+        // presentation goes with it: the survivor is not a stack.
+        1 => children.pop(),
+        _ => Some(Node::Split {
+            axis,
+            children,
+            stacked,
+        }),
     }
 }
 
@@ -1558,11 +1703,32 @@ mod tests {
 
     #[test]
     fn directional_move_covers_all_directions_and_keeps_focus_on_the_leaf() {
-        for (direction, prepare, target) in [
-            (Direction::Left, None, 1),
-            (Direction::Right, Some(Direction::Left), 2),
-            (Direction::Up, None, 2),
-            (Direction::Down, Some(Direction::Up), 3),
+        // One row holding a window and a column: `H[1, V[2, 3]]`. Each
+        // direction reaches a different arm, and what is asserted is the
+        // TREE's order rather than a rectangle, since a rectangle is what a
+        // swap and a move can agree on while the arrangement differs.
+        // The WIDTHS go with the order, because `Right`'s order is the one
+        // the tree already had: `H[1, V[2, 3]]` places `[1, 2, 3]` before the
+        // move as well as after, so order alone cannot tell "entered the
+        // column" from "did nothing". Entering makes it one column.
+        for (direction, prepare, order, widths) in [
+            // 3 leaves the column on its left: a sibling of it, before it.
+            (Direction::Left, None, [1, 3, 2], [34, 33, 33]),
+            // 1 enters the column beside it, at its top.
+            (
+                Direction::Right,
+                Some(Direction::Left),
+                [1, 2, 3],
+                [100, 100, 100],
+            ),
+            // 3 has a neighbour inside its own column, so the two trade.
+            (Direction::Up, None, [1, 3, 2], [50, 50, 50]),
+            (
+                Direction::Down,
+                Some(Direction::Up),
+                [1, 3, 2],
+                [50, 50, 50],
+            ),
         ] {
             let mut layout = Layout::new();
             layout.map(key(1));
@@ -1573,12 +1739,264 @@ mod tests {
                 layout.apply(Command::Focus(direction));
             }
             let focused = layout.focused().unwrap();
-            let target_rect = rect(&layout, target);
             layout.apply(Command::Move(direction));
             assert_eq!(layout.focused(), Some(focused), "{direction:?}");
-            assert_eq!(rect(&layout, focused.object), target_rect, "{direction:?}");
+            let placements = layout.placements(100, 100, 0, 0);
+            assert_eq!(
+                placements.iter().map(|p| p.key.object).collect::<Vec<_>>(),
+                order,
+                "{direction:?}"
+            );
+            assert_eq!(
+                placements.iter().map(|p| p.rect.width).collect::<Vec<_>>(),
+                widths,
+                "{direction:?}"
+            );
             layout.check_invariants().unwrap();
         }
+    }
+
+    #[test]
+    fn a_move_reparents_where_a_swap_could_only_have_traded_two_keys() {
+        // `H[1, V[2, 3]]`: 1 and 3 are in different containers, and moving 1
+        // right puts it INSIDE the column — an arrangement no exchange of two
+        // keys can reach, since a swap leaves the tree's shape untouched.
+        let mut layout = Layout::new();
+        layout.map(key(1));
+        layout.map(key(2));
+        layout.apply(Command::SetSplit(Axis::Vertical));
+        layout.map(key(3));
+        assert!(layout.focus_key(key(1)));
+
+        let before = layout.placements(100, 100, 0, 0);
+        assert_eq!(before.len(), 3);
+        // Two columns: one full-height window beside a stack of two.
+        assert_eq!(before.first().unwrap().rect.height, 100);
+
+        layout.apply(Command::Move(Direction::Right));
+        let after = layout.placements(100, 100, 0, 0);
+        // One column of three, each a third of the height and the full width.
+        assert_eq!(
+            after.iter().map(|p| p.key.object).collect::<Vec<_>>(),
+            [1, 2, 3]
+        );
+        assert!(after.iter().all(|p| p.rect.width == 100));
+        assert_eq!(
+            after.iter().map(|p| p.rect.height).collect::<Vec<_>>(),
+            [34, 33, 33]
+        );
+        layout.check_invariants().unwrap();
+    }
+
+    #[test]
+    fn a_leaf_entering_a_container_lands_at_the_end_it_came_in_by() {
+        // `H[V[1, 3], 2]` and 2 moves LEFT into the column. Entering from the
+        // right lands LAST — at the column's bottom — which is the half of
+        // that rule no other test reaches, since every entry elsewhere goes
+        // rightward and lands first.
+        let mut layout = Layout::new();
+        layout.map(key(1));
+        layout.map(key(2));
+        assert!(layout.focus_key(key(1)));
+        layout.apply(Command::SetSplit(Axis::Vertical));
+        layout.map(key(3));
+        assert!(layout.focus_key(key(2)));
+
+        layout.apply(Command::Move(Direction::Left));
+        let placements = layout.placements(100, 100, 0, 0);
+        assert_eq!(
+            placements.iter().map(|p| p.key.object).collect::<Vec<_>>(),
+            [1, 3, 2]
+        );
+        // One column: 2 came in at the bottom rather than the top.
+        assert!(placements.iter().all(|p| p.rect.width == 100));
+        layout.check_invariants().unwrap();
+    }
+
+    #[test]
+    fn a_move_into_and_out_of_a_stack_carries_the_presentation_correctly() {
+        // Entering a stacked column makes the arriving window one of its
+        // leaves, and the one SHOWN, because it is the focused one.
+        let mut layout = Layout::new();
+        layout.map(key(1));
+        layout.map(key(2));
+        assert!(layout.focus_key(key(1)));
+        layout.apply(Command::SetSplit(Axis::Vertical));
+        layout.map(key(3));
+        layout.map(key(4));
+        layout.apply(Command::ToggleStacked);
+        assert!(layout.focus_key(key(2)));
+
+        layout.apply(Command::Move(Direction::Left));
+        let entered = layout.placements(100, 300, 0, 20);
+        assert_eq!(
+            entered.iter().map(|p| p.key.object).collect::<Vec<_>>(),
+            [1, 3, 4, 2]
+        );
+        assert!(entered.iter().all(|p| p.stacked));
+        assert_eq!(
+            entered.iter().map(|p| p.visible).collect::<Vec<_>>(),
+            [false, false, false, true]
+        );
+
+        // And leaving one leaves the remainder stacked.
+        layout.apply(Command::Move(Direction::Right));
+        let left = layout.placements(100, 300, 0, 20);
+        assert_eq!(
+            left.iter().map(|p| p.key.object).collect::<Vec<_>>(),
+            [1, 3, 4, 2]
+        );
+        assert_eq!(
+            left.iter().map(|p| p.stacked).collect::<Vec<_>>(),
+            [true, true, true, false]
+        );
+        layout.check_invariants().unwrap();
+    }
+
+    #[test]
+    fn a_container_a_move_empties_to_one_child_loses_its_stacking_with_it() {
+        // `Hstacked[1, V[2, 3]]`: moving 1 into the column leaves the row
+        // holding a single child, so the row is gone and its presentation
+        // with it. `remove_node` has that rule tested; the move's own
+        // collapse is a second copy of it and needs its own.
+        let mut layout = Layout::new();
+        layout.map(key(1));
+        layout.map(key(2));
+        layout.apply(Command::SetSplit(Axis::Vertical));
+        layout.map(key(3));
+        assert!(layout.focus_key(key(1)));
+        layout.apply(Command::ToggleStacked);
+        assert!(layout.placements(100, 300, 0, 20).iter().all(|p| p.stacked));
+
+        layout.apply(Command::Move(Direction::Right));
+        let placements = layout.placements(100, 300, 0, 20);
+        assert_eq!(
+            placements.iter().map(|p| p.key.object).collect::<Vec<_>>(),
+            [1, 2, 3]
+        );
+        assert!(
+            placements.iter().all(|p| !p.stacked && p.visible),
+            "the collapsed row left its stacking behind"
+        );
+        layout.check_invariants().unwrap();
+    }
+
+    #[test]
+    fn a_leaf_leaving_its_container_lands_on_the_side_it_was_heading() {
+        // `H[V[1, 3], 2]`, and 1 leaves the column either way. Which SIDE of
+        // the column it lands on is the only thing the direction still
+        // decides once the leaf is out, since both are a sibling of it.
+        for (direction, order) in [(Direction::Right, [3, 1, 2]), (Direction::Left, [1, 3, 2])] {
+            let mut layout = Layout::new();
+            layout.map(key(1));
+            layout.map(key(2));
+            assert!(layout.focus_key(key(1)));
+            layout.apply(Command::SetSplit(Axis::Vertical));
+            layout.map(key(3));
+            assert!(layout.focus_key(key(1)));
+
+            layout.apply(Command::Move(direction));
+            assert_eq!(
+                layout
+                    .placements(100, 100, 0, 0)
+                    .iter()
+                    .map(|p| p.key.object)
+                    .collect::<Vec<_>>(),
+                order,
+                "{direction:?}"
+            );
+            layout.check_invariants().unwrap();
+        }
+    }
+
+    #[test]
+    fn a_move_across_the_grain_wraps_the_workspace_in_a_container_that_runs_that_way() {
+        // Two windows side by side is the commonest arrangement there is, and
+        // no ancestor of either runs vertically. i3 makes one rather than
+        // letting the chord do nothing; so does this.
+        //
+        // BOTH directions, each from a FRESH row, because the wrap changes
+        // the workspace's own axis: moving back down afterwards is a
+        // neighbour trade inside the column the first move built, not a
+        // second wrap, and proves nothing about which side a wrap picks.
+        for (direction, order) in [(Direction::Up, [2, 1]), (Direction::Down, [1, 2])] {
+            let mut layout = Layout::new();
+            layout.map(key(1));
+            layout.map(key(2));
+            assert_eq!(layout.focused(), Some(key(2)));
+
+            layout.apply(Command::Move(direction));
+            let wrapped = layout.placements(100, 100, 0, 0);
+            assert_eq!(
+                wrapped.iter().map(|p| p.key.object).collect::<Vec<_>>(),
+                order,
+                "{direction:?}"
+            );
+            // One above the other now, not side by side.
+            assert!(wrapped.iter().all(|p| p.rect.width == 100), "{direction:?}");
+            layout.check_invariants().unwrap();
+        }
+    }
+
+    #[test]
+    fn a_lone_window_and_an_edge_inside_a_row_have_nowhere_to_move() {
+        let mut layout = Layout::new();
+        layout.map(key(1));
+        let alone = layout.placements(100, 100, 0, 0);
+        for direction in [
+            Direction::Left,
+            Direction::Right,
+            Direction::Up,
+            Direction::Down,
+        ] {
+            layout.apply(Command::Move(direction));
+            assert_eq!(layout.placements(100, 100, 0, 0), alone, "{direction:?}");
+        }
+
+        // At the left edge of the only row there is. THREE windows, not two:
+        // with two, removing one and wrapping the survivor rebuilds the row
+        // it started as, so the wrong answer and the right one agree and the
+        // assertion is about nothing. With three, wrapping would nest a row
+        // inside a row — `H[1, H[2, 3]]` — and turn thirds into a half and
+        // two quarters.
+        layout.map(key(2));
+        layout.map(key(3));
+        assert!(layout.focus_key(key(1)));
+        let row = layout.placements(100, 100, 0, 0);
+        assert_eq!(
+            row.iter().map(|p| p.rect.width).collect::<Vec<_>>(),
+            [34, 33, 33]
+        );
+        layout.apply(Command::Move(Direction::Left));
+        assert_eq!(layout.placements(100, 100, 0, 0), row);
+        layout.check_invariants().unwrap();
+
+        // And the far edge the same way.
+        assert!(layout.focus_key(key(3)));
+        let row = layout.placements(100, 100, 0, 0);
+        layout.apply(Command::Move(Direction::Right));
+        assert_eq!(layout.placements(100, 100, 0, 0), row);
+        layout.check_invariants().unwrap();
+    }
+
+    #[test]
+    fn a_stacked_workspace_edge_keeps_its_presentation_when_a_move_has_nowhere_to_go() {
+        // The same edge, on a STACKED root. Wrapping would have rebuilt it as
+        // an unstacked container around a stacked one, so the run the operator
+        // is looking at would come apart under a chord that does nothing.
+        let mut layout = Layout::new();
+        layout.apply(Command::SetSplit(Axis::Vertical));
+        layout.map(key(1));
+        layout.map(key(2));
+        layout.map(key(3));
+        layout.apply(Command::ToggleStacked);
+        assert!(layout.focus_key(key(1)));
+
+        let stack = layout.placements(100, 300, 0, 20);
+        assert!(stack.iter().all(|p| p.stacked));
+        layout.apply(Command::Move(Direction::Up));
+        assert_eq!(layout.placements(100, 300, 0, 20), stack);
+        layout.check_invariants().unwrap();
     }
 
     #[test]

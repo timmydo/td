@@ -201,7 +201,8 @@ supports EV_KEY, EV_REL, and EV_SYN. It has a fixed US key map. Every
 binding is ONE chord on `Super`:
 
 - the arrow keys focus left, right, up, and down;
-- adding Shift to a focus binding moves the focused tile in that direction;
+- adding Shift to a focus binding MOVES the focused tile in that direction,
+  re-parenting it rather than trading places (see below);
 - `Super+1` through `Super+9` switch workspaces, and adding Shift moves the
   focused tile to that workspace;
 - `Super+v` selects a vertical split for the next toplevel, `Super+h` selects
@@ -562,6 +563,46 @@ happens for a fullscreen leaf on ANY workspace, and deliberately not from the
 fullscreen STATE published beside it, which is set only for the visible one: a
 client on a hidden workspace would otherwise be sized for the whole output and
 carved for a band it does not have.
+
+MOVING a window is i3's tree walk, not an exchange of two windows. The
+nearest ancestor that RUNS along the direction's axis is the one that acts,
+and what it does depends on what is beside the leaf there: a neighbouring
+WINDOW trades places with it, a neighbouring CONTAINER is entered at its near
+edge — entering from the left lands FIRST and entering from the right lands
+last, which is spatially exact along the axis and merely an end when the
+container runs across it — and a leaf with no neighbour that way LEAVES the
+container it is in and becomes a sibling of it. Where i3 inserts relative to
+the target container's own focused child, this inserts at the end, which is
+the simpler rule and the one that does not need the target to have a
+focus. Where NO ancestor runs that way at all — moving a
+window up out of a row of them, the commonest arrangement there is — the
+workspace is wrapped in a container that does, as i3 wraps it, rather than
+the chord doing nothing.
+
+Running out of ROOM is a different answer to the same walk, and telling the
+two apart is what the workspace's own axis is asked for. A leaf that walks
+off the end of a workspace already running that way is at its edge and stays
+put; wrapping there would nest a container inside one of its own axis and
+turn a row of three into a window beside a row of two — every width on
+screen changed by a chord that should have done nothing.
+
+Every arm is about the tree and none about the screen, which is what
+separates a move from the swap it replaces. A swap exchanges two keys, so the
+arrangement it leaves always has the shape it started with and a window can
+never enter or leave a column; the geometry it produces is reachable, but
+half of what an operator means by "move it there" is not. Directional FOCUS
+still asks the geometry, because "the window to the left" is a question about
+what is on screen, and a move is a question about where a window belongs.
+
+Nothing mutates until an arm commits, which is a property of the WALK and
+not of the whole command: a walk that reaches the root having found no
+ancestor to act hands back a tree it did not touch, and what happens next —
+the wrap, or nothing — is then decided on a pristine one. A container a leaf
+has left may hold a single child, which is collapsed as an unmap's is; and
+the lone-window case is a guard rather than something that falls out, since
+without it the wrap would build a container with one child in it. Focus does
+not follow the geometry afterwards — the window that moved stays focused,
+since it is the one the operator was acting on.
 
 STACKING is the second arrangement a container can take, toggled by
 `Super+s`. Its leaves' bands run down its top, one after another, and ONE of
