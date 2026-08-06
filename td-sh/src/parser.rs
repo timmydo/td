@@ -11,9 +11,9 @@ use std::sync::Arc;
 
 use crate::ast::{
     is_name, AndOr, ArithCmp, Assign, CaseItem, Cmd, CondExpr, CondOp, Conn, IfArm, List, Pipeline, Redir,
-    RedirKind, Seg, Sep, Syn, Word, INCOMPLETE,
+    RedirKind, Seg, Sep, Stage, Syn, Word, INCOMPLETE,
 };
-use crate::lexer::{tokenize, Op, Scan, Tok};
+use crate::lexer::{tokenize, Op, Placed, Scan, Tok};
 
 /// Alias name -> replacement text. Ordered so `alias` lists deterministically.
 pub type Aliases = std::collections::BTreeMap<String, String>;
@@ -28,7 +28,14 @@ fn parse(src: &str) -> Syn<List> {
 /// Parse all of `src` under one alias table, for the callers that run nothing
 /// while parsing: the interactive line and command substitution.
 pub fn parse_aliased(src: &str, aliases: &Aliases) -> Syn<List> {
-    let mut units = Units::new(src);
+    parse_aliased_at(src, aliases, 1)
+}
+
+/// The same, with the text's first line numbered `line` rather than 1. Only
+/// `$(...)` needs it, and only because dash reads that body from the outer
+/// input rather than re-scanning it as a string.
+pub fn parse_aliased_at(src: &str, aliases: &Aliases, line: u32) -> Syn<List> {
+    let mut units = Units::at(src, line);
     let mut items = Vec::new();
     while let Some(unit) = units.next_unit(aliases) {
         items.extend(unit?.items);
@@ -108,7 +115,7 @@ struct Region {
 /// unit before the next is parsed is what makes an `alias` visible to the next line
 /// but not to the rest of its own, and it costs one lexing pass, not one per line.
 pub struct Units {
-    toks: Vec<Tok>,
+    toks: Vec<Placed>,
     /// The scan this source's tokens come from, kept alive because it OWNS the
     /// here-document bodies: an id is minted (and a placeholder pushed) when
     /// `<<` is scanned, and the body is written into that slot later.
@@ -148,7 +155,12 @@ pub enum More {
 
 impl Units {
     pub fn new(src: &str) -> Units {
-        let mut scan = Scan::new(src);
+        Units::at(src, 1)
+    }
+
+    /// A whole-string source whose first line is numbered `line`.
+    pub fn at(src: &str, line: u32) -> Units {
+        let mut scan = Scan::new_at(src, line);
         scan.seal();
         Units::over(scan, None)
     }
@@ -268,7 +280,7 @@ impl Units {
         let mut i = from;
         loop {
             self.ensure(i);
-            match self.toks.get(i) {
+            match self.toks.get(i).map(|p| &p.tok) {
                 None | Some(Tok::Newline) | Some(Tok::Eof) => return,
                 _ => i += 1,
             }
@@ -370,7 +382,7 @@ impl Units {
         // B arrives only when asked for.
         self.ensure(self.pos);
         // Only an unquoted literal word is a candidate: `'hi'` and `$cmd` are not.
-        let Some(Tok::Word(w)) = self.toks.get(self.pos) else {
+        let Some(Tok::Word(w)) = self.toks.get(self.pos).map(|p| &p.tok) else {
             return None;
         };
         let name = w.plain()?;
@@ -389,19 +401,27 @@ impl Units {
             .budget
             .checked_sub(1)
             .ok_or_else(|| "alias expansion too deep".to_string())?;
+        // The replacement stands where the NAME stood, so it is LEXED from
+        // there: dash reads an alias body off the same input, so `$LINENO`
+        // inside one -- and inside a `$( )` inside one -- is the line the alias
+        // was invoked on, and a body with a newline in it reports the next.
+        // Where dash goes further and this shell does not is the REST of the
+        // script: dash shifts it by the body's newlines, so a two-line body
+        // makes the file's line 4 report 5.
+        let line = self.toks.get(self.pos).map_or(1, |p| p.line);
         // Not incomplete input however it failed: no amount of further input can
         // complete a replacement, so the unit loop must stop rather than read on.
-        let lexed = tokenize(value).map_err(|e| format!("alias `{name}': {e}"))?;
+        let lexed = tokenize(value, line).map_err(|e| format!("alias `{name}': {e}"))?;
         let base = self.scan.push_heredocs(lexed.heredocs);
-        let sub: Vec<Tok> = lexed
+        let sub: Vec<Placed> = lexed
             .toks
             .into_iter()
-            .filter(|t| !matches!(t, Tok::Eof))
+            .filter(|p| !matches!(p.tok, Tok::Eof))
             // Renumber onto the end of this source's table so a here-document
             // written inside an alias still resolves.
-            .map(|t| match t {
-                Tok::Op(Op::DLess(id)) => Tok::Op(Op::DLess(id + base)),
-                other => other,
+            .map(|p| match p.tok {
+                Tok::Op(Op::DLess(id)) => Placed { line: p.line, tok: Tok::Op(Op::DLess(id + base)) },
+                tok => Placed { line: p.line, tok },
             })
             .collect();
         let end = self.pos + sub.len();
@@ -425,7 +445,7 @@ impl Units {
 
     /// Replace `toks[at..over]` with `sub`, carrying the recorded replacement ends
     /// across the shift.
-    fn splice(&mut self, at: usize, over: usize, sub: Vec<Tok>) {
+    fn splice(&mut self, at: usize, over: usize, sub: Vec<Placed>) {
         let at = at.min(self.toks.len());
         let over = over.max(at).min(self.toks.len());
         let added = sub.len();
@@ -438,7 +458,10 @@ impl Units {
     /// The newline ending the line token `from` sits on, or the end of the stream.
     fn line_end(&self, from: usize) -> usize {
         let mut i = from;
-        while !matches!(self.toks.get(i), None | Some(Tok::Newline) | Some(Tok::Eof)) {
+        while !matches!(
+            self.toks.get(i).map(|p| &p.tok),
+            None | Some(Tok::Newline) | Some(Tok::Eof)
+        ) {
             i += 1;
         }
         i
@@ -455,12 +478,22 @@ impl Units {
         }
     }
 
+    /// The input line of the token at `pos`. Off the end it is the last token's,
+    /// so a line is never invented: the caller is about to fail the parse there.
+    fn line(&mut self) -> u32 {
+        self.ensure(self.pos);
+        self.toks
+            .get(self.pos)
+            .or_else(|| self.toks.last())
+            .map_or(1, |p| p.line)
+    }
+
     fn tok_at(&mut self, i: usize) -> Option<&Tok> {
         // The refill belongs HERE and not one fetch earlier: filling ahead of
         // the fetch reads a line the current unit does not need, which for a
         // shared stdin is a line the commands in it were owed.
         self.ensure(i);
-        let tok = self.toks.get(i);
+        let tok = self.toks.get(i).map(|p| &p.tok);
         if tok.is_none() {
             self.hit_end = true;
         }
@@ -629,13 +662,22 @@ impl Units {
             self.bump();
             bang = !bang;
         }
-        let mut cmds = vec![self.parse_command()?];
+        let mut cmds = vec![self.staged()?];
         while self.peek_op() == Some(Op::Pipe) {
             self.bump();
             self.open_command()?;
-            cmds.push(self.parse_command()?);
+            cmds.push(self.staged()?);
         }
         Ok(Pipeline { bang, cmds })
+    }
+
+    /// One command with the line it opens on, read BEFORE the command is
+    /// parsed -- afterwards the position is past it, and a command that spans
+    /// lines would be stamped with the line it ended on.
+    fn staged(&mut self) -> Syn<Stage> {
+        let line = self.line();
+        let cmd = self.parse_command()?;
+        Ok(Stage { line, cmd })
     }
 
     /// Depth-guarded entry to command parsing. Every recursive descent through
@@ -876,12 +918,18 @@ impl Units {
         };
         self.bump();
         self.expect_op(Op::LParen)?;
+        // The `)` TOKEN's line, which is where dash takes it (`ndefun.linno =
+        // plinno` at parser.c:569, with `)` just read). Not the NAME's, so a
+        // definition folded across a `\` counts from the parentheses; and not
+        // the BODY's, so `f()` with its `{` on the next line still counts from
+        // the `f()`. Both spellings measured.
+        let line = self.line();
         self.expect_op(Op::RParen)?;
         // The body is a command position like any other, so an alias may supply it:
         // `alias B='{ echo yes; }'` then `f()` / `B`.
         self.open_command()?;
-        let body = self.parse_command()?;
-        if matches!(body, Cmd::Simple { .. }) {
+        let body = self.staged()?;
+        if matches!(body.cmd, Cmd::Simple { .. }) {
             return Err(format!(
                 "syntax error: the body of function `{name}` must be a compound command"
             ));
@@ -889,6 +937,7 @@ impl Units {
         Ok(Cmd::FuncDef {
             name,
             body: Arc::new(body),
+            line,
         })
     }
 
@@ -1198,6 +1247,7 @@ mod tests {
             .cmds
             .into_iter()
             .next()
+            .map(|s| s.cmd)
             .ok_or_else(|| format!("{src}: pipeline has no command"))
     }
 

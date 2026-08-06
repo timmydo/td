@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use crate::arith;
-use crate::ast::{AndOr, ArithCmp, Cmd, CondExpr, CondOp, Conn, List, Pipeline, Redir, Sep, Word};
+use crate::ast::{AndOr, ArithCmp, Cmd, CondExpr, CondOp, Conn, List, Pipeline, Redir, Sep, Stage, Word};
 use crate::builtin;
 use crate::expand;
 use crate::parser::{self, Aliases};
@@ -66,12 +66,39 @@ pub struct Var {
     /// (ash.c:10020), so an inner function's `unset` sees an outer function's
     /// declaration. The frame's own restore puts the flag back with the binding.
     pub localised: bool,
-    /// ash's `VDYNAMIC`, which only `$RANDOM` carries: a read runs a generator
-    /// instead of returning the stored text. It lives on the VARIABLE and not on
-    /// the shell because `unsetvar` clears it while a frame's restore puts it
-    /// back (ash.c's `mklocal`/`poplocalvars`), so `local RANDOM` suspends the
-    /// generator for the call and returns it afterwards.
-    pub dynamic: bool,
+    /// ash's `VDYNAMIC`: a read runs code instead of returning the stored text.
+    /// It lives on the VARIABLE and not on the shell because `unsetvar` clears
+    /// it while a frame's restore puts it back (ash.c's `mklocal`/
+    /// `poplocalvars`), so `local RANDOM` suspends the generator for the call
+    /// and returns it afterwards.
+    pub dynamic: Option<Dyn>,
+}
+
+/// The two names whose value is COMPUTED at each read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Dyn {
+    /// `$RANDOM`: every read draws, and an assignment SEEDS the generator
+    /// rather than being stored -- so it survives one.
+    Random,
+    /// `$LINENO`: every read reports the line of the command being run, and
+    /// anything STORED in it ends that. dash tests `v->text == linenovar`
+    /// (var.c:316), which stops matching the moment an assignment -- or an
+    /// inherited `LINENO=50` -- puts another string there, so the two cases
+    /// need no separate rule.
+    Lineno,
+}
+
+/// A defined function: its body, and the line the DEFINITION opened on. The
+/// line is not the body's own -- it is what dash subtracts from every line
+/// inside the call (`funcline`, eval.c:996).
+#[derive(Clone, Debug)]
+pub struct Func {
+    pub line: u32,
+    /// `Arc` so a call site can hold the body while the definition is redefined
+    /// out from under it. It carries its own line: a compound's header --
+    /// a `for` word list, a `case` subject, a redirection target -- expands
+    /// under the BODY's line, not under the caller's.
+    pub body: Arc<Stage>,
 }
 
 /// A binding displaced by `local`, kept so the function's return can put it back.
@@ -131,9 +158,20 @@ impl Opts {
 
 pub struct Shell {
     pub vars: HashMap<String, Var>,
-    pub funcs: HashMap<String, Arc<Cmd>>,
+    pub funcs: HashMap<String, Func>,
     pub params: Vec<String>, // positional parameters $1..
     pub arg0: String,        // $0
+    /// What `$LINENO` reads: the input line of the command being run, already
+    /// relative to `funcline`. dash keeps the same pair (`lineno` in var.c,
+    /// `funcline` in eval.c) and computes the value at each command rather than
+    /// at each read. SIGNED because dash's is a plain `int` subtraction that
+    /// can go below zero -- see `set_lineno`.
+    pub lineno: i64,
+    /// The line the function whose body is running was DEFINED on, or 0 outside
+    /// one. dash reports `$LINENO` inside a function relative to its definition
+    /// (eval.c:752), where busybox ash and bash report the absolute line; the
+    /// corpus grades this shell on dash's answer.
+    pub funcline: u32,
     pub status: i32,         // $?
     /// ash's `random_gen`, lazily seeded: `None` is "never seeded", which takes
     /// the pid and the clock on first read as ash's `UNINITED_RANDOM_T` does.
@@ -363,7 +401,7 @@ impl Shell {
                     exported: true,
                     readonly: false,
                     localised: false,
-                    dynamic: false,
+                    dynamic: None,
                 },
             );
         }
@@ -372,6 +410,8 @@ impl Shell {
             funcs: HashMap::new(),
             params: Vec::new(),
             arg0: "td-sh".to_string(),
+            lineno: 1,
+            funcline: 0,
             status: 0,
             last_bg: None,
             random: None,
@@ -433,7 +473,7 @@ impl Shell {
         // generator instead of sitting in the map as an ordinary string.
         let inherited_random = sh.get_var("RANDOM");
         match sh.vars.get_mut("RANDOM") {
-            Some(v) => v.dynamic = true,
+            Some(v) => v.dynamic = Some(Dyn::Random),
             None => {
                 sh.vars.insert(
                     "RANDOM".to_string(),
@@ -442,7 +482,7 @@ impl Shell {
                         exported: false,
                         readonly: false,
                         localised: false,
-                        dynamic: true,
+                        dynamic: Some(Dyn::Random),
                     },
                 );
             }
@@ -450,6 +490,7 @@ impl Shell {
         if let Some(text) = inherited_random {
             sh.random = Some(crate::random::Rand::seeded(crate::random::seed_of(&text)));
         }
+        sh.start_lineno();
         // The names ash seeds itself when the environment carries none. Each is
         // an ORDINARY variable a script may reassign -- only PWD and SHLVL are
         // exported -- but a shell that leaves them unset makes `set -u` fatal on
@@ -494,6 +535,8 @@ impl Shell {
             // is deterministic instead of taking the pid and the clock.
             random: Some(crate::random::Rand::seeded(1)),
             arg0: "td-sh".to_string(),
+            lineno: 1,
+            funcline: 0,
             status: 0,
             last_bg: None,
             opts: Opts::default(),
@@ -532,13 +575,57 @@ impl Shell {
                 exported: false,
                 readonly: false,
                 localised: false,
-                dynamic: true,
+                dynamic: Some(Dyn::Random),
             },
         );
+        sh.start_lineno();
         let _ = sh.set_var("IFS", " \t\n");
         let _ = sh.set_var("OPTIND", "1");
         let _ = sh.set_var("PS4", "+ ");
         sh
+    }
+
+    /// Make `LINENO` answer with the line -- unless the environment already
+    /// carried one, which is a string STORED in it and so freezes it exactly as
+    /// an assignment does. Measured: `LINENO=50 dash -c 'echo $LINENO'` is 50,
+    /// where bash's is 1.
+    fn start_lineno(&mut self) {
+        if self.vars.contains_key("LINENO") {
+            return;
+        }
+        self.vars.insert(
+            "LINENO".to_string(),
+            Var {
+                // Set-and-EMPTY, not unset: dash's `linenovar` is a buffer that
+                // exists from the start and is only filled by a read, so before
+                // the first one `set` lists `LINENO=''` and an exported one
+                // reaches the child set and empty. The value is never what a
+                // `$LINENO` answers with -- the dynamic arm intercepts -- so
+                // this is only what the LISTINGS and the environment see.
+                value: Some(String::new()),
+                exported: false,
+                readonly: false,
+                localised: false,
+                dynamic: Some(Dyn::Lineno),
+            },
+        );
+    }
+
+    /// dash's `errlinno = lineno = n->…linno; if (funcline) lineno -= funcline
+    /// - 1`, run once per command node rather than at each `$LINENO` read.
+    ///
+    /// The subtraction is plain and signed, as dash's is, and really can go
+    /// NEGATIVE: a string reparsed inside a function starts again at line 1
+    /// while `funcline` is wherever the function was defined, so with `f`
+    /// defined on line 4, `eval 'echo $LINENO'` in its body is `-2` here and
+    /// in dash. Saturating at zero would be tidier and would be this shell
+    /// inventing an answer.
+    pub fn set_lineno(&mut self, line: u32) {
+        let line = i64::from(line);
+        self.lineno = match self.funcline {
+            0 => line,
+            f => line - i64::from(f) + 1,
+        };
     }
 
     pub fn get_var(&self, name: &str) -> Option<String> {
@@ -553,9 +640,15 @@ impl Shell {
     /// only (so " 2", "+1" and "-1" are all rejected) and coerces 0 up to 1; a
     /// rejected value parks -1, which `getopts` reports when it next runs.
     fn var_hook(&mut self, name: &str, value: &str) {
-        if self.vars.get(name).is_some_and(|v| v.dynamic) {
-            self.random = Some(crate::random::Rand::seeded(crate::random::seed_of(value)));
-            return;
+        match self.vars.get(name).and_then(|v| v.dynamic) {
+            Some(Dyn::Random) => {
+                self.random = Some(crate::random::Rand::seeded(crate::random::seed_of(value)));
+                return;
+            }
+            // The freeze belongs to `set_var`, which is the only path that
+            // STORES: this hook also runs on a local frame's restore, where
+            // clearing the flag would end the tracking a `local` only suspends.
+            Some(Dyn::Lineno) | None => {}
         }
         if name != "OPTIND" {
             return;
@@ -576,7 +669,7 @@ impl Shell {
         // comment on `lookupvar`). `local VAR` reaches this through the same
         // `unsetvar`, which is why only the frame's RESTORE brings it back.
         if let Some(v) = self.vars.get_mut(name) {
-            v.dynamic = false;
+            v.dynamic = None;
         }
         if name == "OPTIND" {
             self.getopts_optind = 1;
@@ -601,6 +694,12 @@ impl Shell {
                 return Err(self.fatal(&format!("{name}: is read only"), 2));
             }
             Some(v) => {
+                // dash's LINENO stops answering with the line the moment
+                // anything is stored in it, which is what `LINENO=99; echo
+                // $LINENO` printing 99 is.
+                if v.dynamic == Some(Dyn::Lineno) {
+                    v.dynamic = None;
+                }
                 v.value = Some(value.to_string());
                 v.exported |= self.opts.allexport;
             }
@@ -614,7 +713,7 @@ impl Shell {
                         exported: self.opts.allexport,
                         readonly: false,
                         localised: false,
-                        dynamic: false,
+                        dynamic: None,
                     },
                 );
             }
@@ -633,7 +732,7 @@ impl Shell {
                     exported: true,
                     readonly: false,
                     localised: false,
-                    dynamic: false,
+                    dynamic: None,
                 },
             );
         }
@@ -650,7 +749,7 @@ impl Shell {
                     exported: false,
                     readonly: true,
                     localised: false,
-                    dynamic: false,
+                    dynamic: None,
                 },
             );
         }
@@ -666,10 +765,16 @@ impl Shell {
     }
 
     /// ash's one readonly test, `(flags & (VREADONLY|VDYNAMIC)) == VREADONLY`
-    /// (ash.c:2421): a DYNAMIC name is exempt, and `setvareq` is reached by
-    /// assignment AND by unset, so all three callers owe the same predicate.
+    /// (ash.c:2421), scoped to the one dynamic name ash HAS: `readonly RANDOM`
+    /// still lists the name readonly while an assignment reseeds, where dash
+    /// refuses `readonly LINENO; LINENO=5` with `is read only`. `setvareq` is
+    /// reached by assignment AND by unset, so all three callers owe the same
+    /// predicate.
     fn readonly_refuses(&self, name: &str) -> bool {
-        self.vars.get(name).is_some_and(|v| v.readonly && !v.dynamic)
+        // Scoped to RANDOM rather than to DYNAMIC: ash exempts its one dynamic
+        // name, and dash -- whose LINENO this is -- refuses `readonly LINENO;
+        // LINENO=5` with `is read only`, measured.
+        self.vars.get(name).is_some_and(|v| v.readonly && v.dynamic != Some(Dyn::Random))
     }
 
     pub fn unset_var(&mut self, name: &str) -> bool {
@@ -716,7 +821,7 @@ impl Shell {
                         exported: false,
                         readonly: false,
                         localised: true,
-                        dynamic: false,
+                        dynamic: None,
                     },
                 );
             }
@@ -745,7 +850,7 @@ impl Shell {
                     exported: true,
                     readonly: false,
                     localised: false,
-                    dynamic: false,
+                    dynamic: None,
                 },
             );
         }
@@ -967,8 +1072,9 @@ fn maybe_errexit(sh: &mut Shell) -> R<()> {
 
 fn run_pipeline(sh: &mut Shell, pipe: &Pipeline) -> R<()> {
     if pipe.cmds.len() == 1 {
-        if let Some(cmd) = pipe.cmds.first() {
-            run_command(sh, cmd)?;
+        if let Some(stage) = pipe.cmds.first() {
+            sh.set_lineno(stage.line);
+            run_command(sh, &stage.cmd)?;
         }
     } else {
         process::run_pipeline(sh, &pipe.cmds)?;
@@ -1063,8 +1169,14 @@ fn run_command_inner(sh: &mut Shell, cmd: &Cmd) -> R<()> {
             items,
             redirs,
         } => with_redirs(sh, redirs, |sh| run_case(sh, word, items)),
-        Cmd::FuncDef { name, body } => {
-            sh.funcs.insert(name.clone(), body.clone());
+        Cmd::FuncDef { name, body, line } => {
+            sh.funcs.insert(
+                name.clone(),
+                Func {
+                    line: *line,
+                    body: body.clone(),
+                },
+            );
             sh.set_status(0);
             Ok(())
         }
@@ -1480,8 +1592,8 @@ fn dispatch_simple(
 ) -> R<()> {
     // A function call runs in the current shell with the assignments applied for
     // its duration and the words as its positional parameters.
-    if let Some(cmd) = argv.first().and_then(|name| sh.funcs.get(name)).cloned() {
-        return call_function(sh, &cmd, argv, assigns, redirs);
+    if let Some(func) = argv.first().and_then(|name| sh.funcs.get(name)).cloned() {
+        return call_function(sh, &func, argv, assigns, redirs);
     }
 
     if let Some(bi) = builtin::lookup(argv.first().map(String::as_str).unwrap_or("")) {
@@ -1694,7 +1806,7 @@ fn undo_binding(sh: &mut Shell, entry: Local) {
             // than treated as an unset -- for a valueless entry that text is
             // empty, which reseeds with `strtoul("")`, not the generator's death.
             let restored = var.value.clone();
-            let dynamic = var.dynamic;
+            let dynamic = var.dynamic.is_some();
             sh.vars.insert(name.clone(), var);
             match restored.as_deref() {
                 Some(v) => sh.var_hook(&name, v),
@@ -1759,7 +1871,7 @@ pub fn unwind_pending_to(sh: &mut Shell, mark: usize) {
 
 fn call_function(
     sh: &mut Shell,
-    body: &Arc<Cmd>,
+    func: &Func,
     argv: &[String],
     assigns: &[crate::ast::Assign],
     redirs: &[Redir],
@@ -1807,12 +1919,18 @@ fn call_function(
     sh.getopts_off = -1;
     let saved_loop_depth = sh.loop_depth;
     sh.loop_depth = 0;
+    // dash saves and restores `funcline` around the call (eval.c:986/1007) and
+    // NOT `lineno`, so a nested call reports relative to its OWN definition and
+    // the caller's next command sets the line again on its way past. The body's
+    // own line is published AFTER, so the subtraction is already in effect.
+    let saved_funcline = std::mem::replace(&mut sh.funcline, func.line);
+    sh.set_lineno(func.body.line);
     // Not `?`: a fatal error in a redirection WORD (`f 2>${u:?}`) must still unwind
     // the argument frame below, or the caller -- or an EXIT trap -- sees the
     // function's `$1`/`$#`.
     let result = match process::apply_redirs(sh, redirs) {
         Ok(process::RedirOutcome::Applied(saved)) => {
-            let r = run_command(sh, body);
+            let r = run_command(sh, &func.body.cmd);
             process::restore_redirs(sh, saved);
             r
         }
@@ -1825,6 +1943,7 @@ fn call_function(
     // unwind longjmps past dash's `poplocalvars`/`unwindlocalvars`, so the trap
     // still sees the `local` and the temp binding of the function it died in.
     (sh.getopts_optind, sh.getopts_off) = saved_getopts;
+    sh.funcline = saved_funcline;
     if result.as_ref().err().is_some_and(terminating) {
         defer_locals(sh);
     } else {
@@ -1865,12 +1984,12 @@ where
 /// `$(...)` / `` `...` ``: run the code with stdout captured, strip trailing
 /// newlines, and return the text. Runs in a subshell so its state changes do not
 /// leak, matching POSIX.
-pub fn command_subst(sh: &mut Shell, code: &str) -> R<String> {
+pub fn command_subst(sh: &mut Shell, code: &str, line: u32) -> R<String> {
     // Nesting is bounded centrally in `run_command` (the substituted body re-enters
     // there), so `$( $( … ) )` errors instead of overflowing the stack.
     // Counted so an assignment-only command can adopt the last substitution's $?.
     sh.cmdsubst_count = sh.cmdsubst_count.wrapping_add(1);
-    let mut out = process::capture_stdout(sh, code)?;
+    let mut out = process::capture_stdout(sh, code, line)?;
     while out.ends_with('\n') {
         out.pop();
     }
@@ -3149,5 +3268,197 @@ mod tests {
         // subshell (POSIX): the parent's `x` is untouched.
         let (_s, out, _e) = run("unset x; (:) >\"${x:=/dev/null}\"; echo \"${x-unset}\"");
         assert_eq!(out, "unset\n");
+    }
+
+    /// `$LINENO` is the line the COMMAND being run starts on -- dash's
+    /// `lineno`, set once per command node (eval.c:751) rather than read off
+    /// the scanner when the word is expanded. Every value asserted in these
+    /// five tests was measured against dash 0.5.12 first.
+    #[test]
+    fn lineno_is_the_line_of_the_command() {
+        assert_eq!(run("echo $LINENO\necho $LINENO\n\necho $LINENO").1, "1\n2\n4\n");
+        // Blank and comment lines are counted but do not carry a command, so
+        // the next one still reports its own.
+        assert_eq!(run("# c\n\n# c\necho $LINENO").1, "4\n");
+        // The word list of a `for` and the subject of a `case` belong to the
+        // compound's own node, which is why both report the keyword's line and
+        // the loop body reports its own on every iteration.
+        assert_eq!(run("set -- a b\nfor x; do\n  echo $LINENO\ndone").1, "3\n3\n");
+        assert_eq!(run("case $LINENO in\n  1) echo one ;;\n  *) echo no ;;\nesac").1, "one\n");
+        // Both assignments of one command see one line, and a word carried
+        // across a fold reports where its command OPENED, not where it sits.
+        assert_eq!(run("a=$LINENO b=$LINENO\necho $a $b").1, "1 1\n");
+        assert_eq!(run("echo one \\\n  $LINENO two").1, "one 1 two\n");
+        // A here-document body is input the next command is past.
+        assert_eq!(run("read x <<EOF\nbody\nEOF\necho $LINENO").1, "4\n");
+        // dash takes the line with the command's first token already READ
+        // (`savelinno` at the top of `simplecmd`, parser.c:524, after the
+        // pushback), so a first word that itself spans lines reports where it
+        // ENDS rather than where it opens. bash agrees; both measured at 2,
+        // and the fold above is what keeps the two rules distinguishable.
+        assert_eq!(run("x=\"a\nb\" y=$LINENO\necho $y").1, "2\n");
+    }
+
+    /// Per COMMAND and not per PIPELINE. dash sets the line at each NCMD and
+    /// has no NPIPE case at all, so a pipeline spanning lines gives each stage
+    /// its own -- measured at 2 under dash, where attaching the line to the
+    /// pipeline would give 1.
+    #[test]
+    fn a_pipeline_stage_reports_its_own_line() {
+        assert_eq!(run("true |\n  { read _; echo $LINENO; }").1, "2\n");
+        // The stages run as concurrent threads, so this also pins that the
+        // line is not one cell they share: each stage forks its own `Shell`.
+        assert_eq!(run("echo $LINENO |\n  { read a; echo $a $LINENO; }").1, "1 2\n");
+        // A stage that is a SIMPLE command is the only one that pins the
+        // publish: a `{ …; }` stage has an inner command whose own line
+        // overwrites it, so it passes even when nothing published the stage's.
+        // The leading `:` is what makes the inherited line differ from 2.
+        assert_eq!(run(":\necho $LINENO |\n  { read a; echo got=$a; }").1, "got=2\n");
+    }
+
+    /// dash reports a line inside a function RELATIVE to where the function
+    /// was DEFINED (`funcline`, eval.c:752). busybox ash keeps the same
+    /// variable but never subtracts it, so it and bash report the absolute
+    /// line; the corpus grades this shell on dash's answer, its
+    /// `$LINENO is the current line` case carrying a `BUG dash` block and no
+    /// ash one.
+    #[test]
+    fn lineno_in_a_function_is_relative_to_its_definition() {
+        assert_eq!(run("f() {\n  echo $LINENO\n}\nf").1, "2\n");
+        assert_eq!(run("g() { echo $LINENO; }\ng").1, "1\n");
+        // The subtraction is SAVED and restored rather than left standing: a
+        // nested call is relative to its own definition, the caller resumes
+        // relative to its, and the top level is absolute again afterwards.
+        let src = "g() {\n  echo $LINENO\n}\nf() {\n  echo $LINENO\n  g\n  echo $LINENO\n}\nf\necho $LINENO";
+        assert_eq!(run(src).1, "2\n2\n4\n10\n");
+        // A definition made INSIDE a call records its absolute parse line, not
+        // one already relative to the enclosing function.
+        assert_eq!(run("f() {\n  g() {\n    echo $LINENO\n  }\n  g\n}\nf").1, "2\n");
+        // The definition's line is the `)` TOKEN's, which is neither the name's
+        // nor the body's: a definition folded across a `\` counts from the
+        // parentheses, and a `{` on the next line does not move it. dash gives
+        // 1 and 3.
+        assert_eq!(run(":\n:\nfw \\\n() { echo $LINENO; }\nfw").1, "1\n");
+        assert_eq!(run("f()\n{\n  echo $LINENO\n}\nf").1, "3\n");
+        // The BODY is a command node too, so its own header expands under its
+        // own line and not the CALLER's: a body with no inner command to
+        // overwrite the line is the only place that shows.
+        assert_eq!(run("f() for x in \"$LINENO\"; do echo $x; done\necho top\nf").1, "top\n1\n");
+        assert_eq!(
+            run("g() case $LINENO in 1) echo ONE;; *) echo \"OTHER=$LINENO\";; esac\necho top\ng").1,
+            "top\nONE\n"
+        );
+        // And it really can go NEGATIVE, which is dash's plain signed
+        // subtraction rather than an accident: a reparsed string starts at 1
+        // while `funcline` is 4, measured at -2 in dash.
+        assert_eq!(run(":\n:\n:\nf() {\n  eval 'echo $LINENO'\n}\nf").1, "-2\n");
+    }
+
+    /// An alias replacement stands where the NAME stood, so it is LEXED from
+    /// there: dash reads one off the same input stream. Where dash goes
+    /// further and this shell does not is the REST of the script -- dash
+    /// shifts it by the newlines in the body, so a two-line body makes the
+    /// file's line 4 report 5, which is a line number no line has.
+    #[test]
+    fn an_alias_body_is_lexed_where_the_name_stood() {
+        assert_eq!(run("alias x='echo $LINENO'\necho top\nx\necho $LINENO").1, "top\n3\n4\n");
+        // Including a `$( )` inside the body, which a separately-lexed
+        // replacement would report as 1.
+        assert_eq!(run("alias x='echo $(echo $LINENO)'\necho top\nx").1, "top\n3\n");
+        // A body with a newline in it reports the line after for its second
+        // command, as dash does -- and the line AFTER the invocation is still
+        // its own, where dash shifts it to 5.
+        let two = "alias x='echo $LINENO\necho $LINENO'\nx\necho $LINENO";
+        assert_eq!(run(two).1, "3\n4\n4\n", "dash gives 3 4 5, shifting the rest of the file");
+    }
+
+    /// A substitution body is numbered the way it is PARSED. dash reads a
+    /// `$( )` body from the outer input, so it counts on from the outer line;
+    /// a backtick body is de-escaped and re-scanned as a string of its own, so
+    /// it starts again at 1. bash numbers both absolutely -- this shell
+    /// follows dash, and the two spellings are asserted against each other so
+    /// neither can quietly take the other's rule.
+    #[test]
+    fn a_substitution_body_is_numbered_the_way_it_is_parsed() {
+        assert_eq!(run("echo $(echo $LINENO)").1, "1\n");
+        assert_eq!(run("echo x\necho $(echo $LINENO)").1, "x\n2\n");
+        assert_eq!(run("echo \"$(\necho $LINENO\n)\"").1, "2\n");
+        // Same body, same lines, one line number apart: the backtick is 2
+        // because its body is re-scanned, the `$( )` 3 because it is not.
+        assert_eq!(run("echo a\necho \"`\necho $LINENO\n`\"").1, "a\n2\n");
+        assert_eq!(run("echo a\necho \"$(\necho $LINENO\n)\"").1, "a\n3\n");
+        // `eval` re-parses a string, so it starts at 1 as dash's does.
+        assert_eq!(run("echo x\neval 'echo $LINENO'").1, "x\n1\n");
+        // An operand is a SUBSTRING of the outer input, so a `$( )` inside a
+        // `${...}` word, an arithmetic body or a here-document body counts on
+        // from the script too -- all three re-lex the text, and starting that
+        // sub-lexer at 1 would report 1 where dash reports 3, 3 and 4.
+        assert_eq!(run("echo a\necho b\necho \"${u:-$(echo $LINENO)}\"").1, "a\nb\n3\n");
+        assert_eq!(run("echo a\necho b\necho $(( $(echo $LINENO) + 0 ))").1, "a\nb\n3\n");
+        assert_eq!(run("echo a\necho b\nread x <<EOF\n$(echo $LINENO)\nEOF\necho $x").1, "a\nb\n4\n");
+        // An operand's own offset inside the braces counts as well.
+        assert_eq!(run("echo a\necho $((1 +\n$(echo $LINENO) ))").1, "a\n4\n");
+        // A patsub REPLACEMENT is the one operand a newline can precede,
+        // because the pattern before it may span lines. dash has no patsub to
+        // measure this against; what it pins is self-consistency with the
+        // `${` two lines above it.
+        assert_eq!(run("v='a\nb'\necho \"${v/a\nb/$(echo $LINENO)}\"").1, "4\n");
+    }
+
+    /// dash formats the line into ONE static buffer on each read (var.c:317)
+    /// and exports that buffer verbatim, so what a child inherits is the value
+    /// the last read produced -- empty before the first, and NOT the line the
+    /// `exec` is on. It is the same write-back `$RANDOM` has, so LINENO uses
+    /// the same mechanism rather than a case in the environment builder.
+    #[test]
+    fn an_exported_lineno_carries_the_last_value_read() {
+        let seen = |src: &str| {
+            let mut sh = super::Shell::new_for_test();
+            super::run_program(&mut sh, src);
+            // A plain loop rather than the searching iterator adaptor: this
+            // file is written into the image by a `WriteFile`, which the
+            // ladder's host-findutils guard scans as a command surface, so
+            // that tool's name may not appear here at all -- not even in a
+            // comment. `recipes/src/recipes/td-sh.rs` states it.
+            let mut got = None;
+            for (k, v) in sh.exported_env() {
+                if k == "LINENO" {
+                    got = Some(v);
+                }
+            }
+            got
+        };
+        // Set-and-EMPTY before any read, which is what dash's child sees --
+        // not absent, and not the line the export is on.
+        assert_eq!(seen("export LINENO").as_deref(), Some(""));
+        assert_eq!(seen("export LINENO\n:\n:\n:").as_deref(), Some(""));
+        // ...then the value the LAST read produced, not the current line.
+        assert_eq!(seen("export LINENO\necho $LINENO >&-\n:\n:").as_deref(), Some("2"));
+        // A frozen LINENO exports what was stored, like any other variable.
+        assert_eq!(seen("export LINENO\nLINENO=42").as_deref(), Some("42"));
+    }
+
+    /// dash's LINENO auto-updates only while nothing has been STORED in it
+    /// (`v->text == linenovar`, var.c:316), which covers an assignment and an
+    /// inherited `LINENO=50` with one rule. bash instead ignores the
+    /// assignment and keeps reporting the line.
+    #[test]
+    fn storing_in_lineno_ends_it() {
+        assert_eq!(run("LINENO=99\necho $LINENO").1, "99\n");
+        assert_eq!(run("unset LINENO\necho [$LINENO]").1, "[]\n");
+        // A valueless `local` UNSETS, which is ash's rule (`mklocal` at
+        // ash.c:10028 says so in as many words) and the rule this shell already
+        // followed -- so it takes the tracking with it for the call, and the
+        // frame's restore brings it back. dash is the odd one out here, as it
+        // is for `local` generally: its `mklocal` keeps the text, so `local
+        // LINENO` there still reports the line (measured: `[1]`, and `got=1`
+        // rather than an abort under `set -u`).
+        assert_eq!(run("f() { local LINENO; echo \"[$LINENO]\"; }\nf\necho $LINENO").1, "[]\n3\n");
+        assert_eq!(run("f() { local LINENO; LINENO=7; echo $LINENO; }\nf\necho $LINENO").1, "7\n3\n");
+        // The readonly exemption is RANDOM's alone -- ash grants it to its one
+        // dynamic name, and dash refuses this with `is read only`, measured.
+        let (status, _out, err) = run("readonly LINENO\nLINENO=5\necho after");
+        assert_eq!(status, 2);
+        assert!(err.contains("read only"), "no diagnostic: {err:?}");
     }
 }

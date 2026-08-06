@@ -272,12 +272,12 @@ fn expand_raw(sh: &mut Shell, w: &Word, force_quoted: bool, splitting: bool) -> 
                     });
                 }
             }
-            Seg::Cmd { code, quoted } => {
+            Seg::Cmd { code, quoted, line } => {
                 let q = *quoted || force_quoted;
                 if q {
                     cur.had_quotes = true;
                 }
-                let out = command_subst(sh, code)?;
+                let out = command_subst(sh, code, *line)?;
                 push_expanded(&mut cur.chars, &out, q);
             }
             Seg::Arith { expr, quoted } => {
@@ -637,7 +637,7 @@ fn nounset_check(sh: &mut Shell, name: &str) -> R<()> {
     // VUNSET test, so the value exists by the time anything asks. Reaching for
     // `lookup` here would draw, and the expansion's own read would then be the
     // SECOND draw: `set -u` alone would skip a number.
-    let dynamic = sh.vars.get(name).is_some_and(|v| v.dynamic);
+    let dynamic = sh.vars.get(name).is_some_and(|v| v.dynamic.is_some());
     if sh.opts.nounset && !is_always_set(name) && !dynamic && lookup(sh, name).is_none() {
         return Err(sh.fatal(&format!("{name}: parameter not set"), 2));
     }
@@ -680,15 +680,32 @@ fn random_value(sh: &mut Shell) -> String {
     value
 }
 
-/// A plain variable's value, honouring the DYNAMIC names. Only `$RANDOM` is one,
-/// and both the expansion path and the arithmetic evaluator go through here
-/// because `$((RANDOM+RANDOM))` must draw TWICE -- reading the stored text
-/// instead gives the seed added to itself.
-pub fn var_value(sh: &mut Shell, name: &str) -> Option<String> {
-    if sh.vars.get(name).is_some_and(|v| v.dynamic) {
-        return Some(random_value(sh));
+/// The line, and the WRITE-BACK that makes an exported LINENO mean something.
+/// dash formats into the one static `linenovar` buffer on each read (var.c:317)
+/// and exports that buffer verbatim, so what a child inherits is the value the
+/// last read produced -- empty before the first, and NOT the line the `exec` is
+/// on. Same shape as `random_value`'s write-back, and for the same reason;
+/// unlike that one it does not OR in `allexport`, because dash's is a `fmtstr`
+/// into a buffer rather than ash's `setvareq`. The value is already relative to
+/// `funcline`: that subtraction is made once per command, not at each read.
+fn lineno_value(sh: &mut Shell) -> String {
+    let value = sh.lineno.to_string();
+    if let Some(v) = sh.vars.get_mut("LINENO") {
+        v.value = Some(value.clone());
     }
-    sh.get_var(name)
+    value
+}
+
+/// A plain variable's value, honouring the DYNAMIC names. Both the expansion
+/// path and the arithmetic evaluator go through here because
+/// `$((RANDOM+RANDOM))` must draw TWICE -- reading the stored text instead
+/// gives the seed added to itself.
+pub fn var_value(sh: &mut Shell, name: &str) -> Option<String> {
+    match sh.vars.get(name).and_then(|v| v.dynamic) {
+        Some(crate::exec::Dyn::Random) => Some(random_value(sh)),
+        Some(crate::exec::Dyn::Lineno) => Some(lineno_value(sh)),
+        None => sh.get_var(name),
+    }
 }
 
 /// The value of a parameter, or `None` when it is unset.
@@ -988,10 +1005,10 @@ mod tests {
     /// The single word `src` lexes to, for the cases that assert an ERROR --
     /// `fields` swallows one to keep the passing assertions readable.
     fn word(src: &str) -> Word {
-        crate::lexer::tokenize(src)
+        crate::lexer::tokenize(src, 1)
             .ok()
             .and_then(|l| {
-                l.toks.into_iter().find_map(|t| match t {
+                l.toks.into_iter().find_map(|p| match p.tok {
                     crate::lexer::Tok::Word(w) => Some(w),
                     _ => None,
                 })
@@ -1000,12 +1017,12 @@ mod tests {
     }
 
     fn fields(sh: &mut Shell, src: &str) -> Vec<String> {
-        let words = crate::lexer::tokenize(src)
+        let words = crate::lexer::tokenize(src, 1)
             .ok()
             .map(|l| {
                 l.toks
                     .into_iter()
-                    .filter_map(|t| match t {
+                    .filter_map(|p| match p.tok {
                         crate::lexer::Tok::Word(w) => Some(w),
                         _ => None,
                     })
@@ -1077,10 +1094,10 @@ mod tests {
     /// Expand one source word, KEEPING the error -- `fields` swallows it, and
     /// whether an expansion fails is exactly what these assertions are about.
     fn try_expand(sh: &mut Shell, src: &str) -> R<Vec<String>> {
-        let toks = crate::lexer::tokenize(src).map_err(|e| sh.fatal(&e, 2))?;
+        let toks = crate::lexer::tokenize(src, 1).map_err(|e| sh.fatal(&e, 2))?;
         let mut out = Vec::new();
-        for t in toks.toks {
-            if let crate::lexer::Tok::Word(w) = t {
+        for p in toks.toks {
+            if let crate::lexer::Tok::Word(w) = p.tok {
                 out.extend(expand_fields(sh, &w)?);
             }
         }

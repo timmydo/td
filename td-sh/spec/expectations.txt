@@ -1284,14 +1284,8 @@ xfail var-sub.test.sh::Descriptor redirect to bad "$@"
 xfail vars-special.test.sh::$$ looks like a PID
 xfail vars-special.test.sh::$?
 xfail vars-special.test.sh::$HOME is NOT set
-xfail vars-special.test.sh::$LINENO for assignment
-xfail vars-special.test.sh::$LINENO in "bare" redirect arg (bug regression)
 xfail vars-special.test.sh::$LINENO in [[
-xfail vars-special.test.sh::$LINENO in case
 xfail vars-special.test.sh::$LINENO in for loop
-xfail vars-special.test.sh::$LINENO in other for loops
-xfail vars-special.test.sh::$LINENO in redirect arg (bug regression)
-xfail vars-special.test.sh::$LINENO is the current line, not line of function call
 xfail vars-special.test.sh::$PATH is set if unset at startup
 xfail vars-special.test.sh::$PPID
 xfail vars-special.test.sh::$PWD is not only set, but exported

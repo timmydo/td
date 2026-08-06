@@ -78,7 +78,7 @@ pub enum Tok {
 }
 
 pub struct Lexed {
-    pub toks: Vec<Tok>,
+    pub toks: Vec<Placed>,
     /// Here-document bodies, indexed by the id carried in `Op::DLess`.
     pub heredocs: Vec<Word>,
     /// The input ended inside a `#` comment. Only alias substitution cares: a
@@ -102,11 +102,18 @@ struct Pending {
     /// which runs out of input part way through a body resumes after the lines
     /// it already consumed, instead of re-reading them on every refill.
     body: String,
+    /// The script line the body's FIRST line is on, 0 until one is read. A
+    /// `$( )` in the body counts on from it, as it does in dash.
+    body_line: u32,
 }
 
 struct Scanner {
     src: Vec<char>,
     pos: usize,
+    /// 1-based input line of `pos`, counted as characters are consumed rather
+    /// than by scanning back over `src`: a token's line is asked for once per
+    /// token, and counting from the top each time is quadratic in a long script.
+    line: u32,
     /// Set when the last thing consumed was a `\<newline>` fold, so the lexer can
     /// tell "input ended" from "input stopped mid-line and the rest is coming".
     continued: bool,
@@ -126,14 +133,17 @@ impl Scanner {
         if c.is_some() {
             self.pos += 1;
             self.continued = false;
+            self.line = self.line.saturating_add(u32::from(c == Some('\n')));
         }
         c
     }
 
+    /// Deliberately `bump` rather than a second `pos += 1`: it is the ONE place
+    /// input is consumed, so the line count cannot be bypassed by a caller that
+    /// happens to eat a newline through here.
     fn eat(&mut self, c: char) -> bool {
         if self.peek() == Some(c) {
-            self.pos += 1;
-            self.continued = false;
+            self.bump();
             true
         } else {
             false
@@ -392,6 +402,12 @@ impl WordBuf {
     }
 }
 
+/// A backtick body is DE-ESCAPED before it is parsed, so dash re-scans it as a
+/// string of its own and numbers it from 1 -- measured: a `` ` `` opening on
+/// line 6 with its command on line 7 reports 2, where the same body in `$( )`
+/// reports 7. bash numbers both absolutely; this shell follows dash.
+const BACKTICK_LINE: u32 = 1;
+
 /// Cap on nested expansion re-lexing (`${a:-${b:-${c:-…}}}`, `$(( ${x} ))`), which
 /// re-enters `word_from_str_at`/`arith_from_str_at` per level. Bounds the recursion so
 /// a pathological input errors instead of overflowing the stack. Well above any real
@@ -400,8 +416,12 @@ const MAX_EXPANSION_DEPTH: u32 = 100;
 
 /// Lex all of `src`, failing on the first error. For text that must be whole to
 /// mean anything at all -- an alias replacement, an expansion operand.
-pub fn tokenize(src: &str) -> Syn<Lexed> {
-    let lexed = tokenize_prefix(src);
+/// `line` numbers the text's first line. Alias substitution is why it is a
+/// parameter: dash reads a replacement from the input stream at the point the
+/// NAME stood, so a `$( )` inside one reports the invocation's line and a body
+/// with a newline in it reports the line after.
+pub fn tokenize(src: &str, line: u32) -> Syn<Lexed> {
+    let lexed = tokenize_prefix(src, line);
     match lexed.error {
         Some(e) => Err(e),
         None => Ok(lexed),
@@ -409,8 +429,8 @@ pub fn tokenize(src: &str) -> Syn<Lexed> {
 }
 
 /// Lex as much of `src` as scans, reporting what stopped it in `Lexed::error`.
-pub fn tokenize_prefix(src: &str) -> Lexed {
-    let mut scan = Scan::new(src);
+pub fn tokenize_prefix(src: &str, line: u32) -> Lexed {
+    let mut scan = Scan::new_at(src, line);
     scan.seal();
     let chunk = scan.pull();
     Lexed {
@@ -426,9 +446,18 @@ pub fn tokenize_prefix(src: &str) -> Lexed {
 /// scanner has been rewound to the last token boundary, so feeding more text and
 /// pulling again re-scans only the token that was open.
 pub struct Chunk {
-    pub toks: Vec<Tok>,
+    pub toks: Vec<Placed>,
     pub incomplete: bool,
     pub error: Option<String>,
+}
+
+/// A token and the input line it starts on. One value rather than two parallel
+/// vectors because the parser splices alias replacements INTO this stream, and a
+/// second vector to keep in step there is a divergence waiting to happen.
+#[derive(Clone, Debug)]
+pub struct Placed {
+    pub line: u32,
+    pub tok: Tok,
 }
 
 /// A lexer that can be fed more input and asked for more tokens, so a script
@@ -443,11 +472,19 @@ pub struct Scan {
 
 impl Scan {
     pub fn new(src: &str) -> Scan {
+        Scan::new_at(src, 1)
+    }
+
+    /// A scan whose first line is numbered `line`. `$(...)` needs it: dash
+    /// parses that body from the SAME input, so a `$LINENO` inside one is the
+    /// outer script's line, not an offset into text with no line of its own.
+    pub fn new_at(src: &str, line: u32) -> Scan {
         Scan {
             lx: Lexer {
                 sc: Scanner {
                     src: src.chars().collect(),
                     pos: 0,
+                    line,
                     continued: false,
                 },
                 ended_in_comment: false,
@@ -529,7 +566,13 @@ impl Scan {
                 }
                 Ok(tok) => {
                     let last = matches!(tok, Tok::Eof);
-                    toks.push(tok);
+                    // The line the scanner is on once the token has been
+                    // READ, which is dash's: `savelinno` is taken at the top of
+                    // `simplecmd` (parser.c:524) with the first token already
+                    // pushed back. It differs from the line the token opens on
+                    // only when the token itself spans lines, and there dash
+                    // reports the later one -- `x="a\nb" y=$LINENO` is 2.
+                    toks.push(Placed { line: self.lx.sc.line, tok });
                     if last {
                         return Chunk { toks, incomplete: false, error: None };
                     }
@@ -562,6 +605,7 @@ impl Scan {
 /// at every token, which is quadratic in the length of a here-document.
 struct Mark {
     pos: usize,
+    line: u32,
     continued: bool,
     ended_in_comment: bool,
     awaiting: Option<(usize, bool)>,
@@ -575,8 +619,8 @@ struct Mark {
 /// its brace, not by blanks. A nested `${…}` operand re-enters here one level
 /// deeper; the depth cap is checked before any scanning so the mutual recursion
 /// `scan_dollar -> parse_param -> word_from_str_at` is bounded.
-fn word_from_str_at(text: &str, depth: u32) -> Syn<Word> {
-    let mut lx = lexer_over(text, depth)?;
+fn word_from_str_at(text: &str, depth: u32, line: u32) -> Syn<Word> {
+    let mut lx = lexer_over(text, depth, line)?;
     lx.in_braces = true;
     lx.scan_word(false)
 }
@@ -591,7 +635,9 @@ fn word_from_str_at(text: &str, depth: u32) -> Syn<Word> {
 /// so `a\"b` traces with the backslash still on. `\$`, `` \` `` and `\\` lose
 /// theirs as they would inside real quotes.
 pub fn word_from_str(text: &str) -> Syn<Word> {
-    lexer_over(text, 0)?.scan_dq_run(false, false)
+    // Line 1: a runtime string (`$PS4`) is not part of the script and has no
+    // line of the script's to count from.
+    lexer_over(text, 0, 1)?.scan_dq_run(false, false)
 }
 
 /// The WORD of `${x-word}` when the whole expansion sits inside double quotes.
@@ -600,8 +646,8 @@ pub fn word_from_str(text: &str) -> Syn<Word> {
 /// `"${u-"c d"}"` loses them. The escape set is double-quote's plus `}`, which
 /// is special here and nowhere else. The PATTERN operators are not this --
 /// there a `'` quotes as usual, the asymmetry `var-sub-quote` grades.
-fn dq_word_from_str_at(text: &str, depth: u32) -> Syn<Word> {
-    let mut lx = lexer_over(text, depth)?;
+fn dq_word_from_str_at(text: &str, depth: u32, line: u32) -> Syn<Word> {
+    let mut lx = lexer_over(text, depth, line)?;
     lx.in_braces = true;
     lx.scan_dq_run(true, true)
 }
@@ -610,11 +656,15 @@ fn dq_word_from_str_at(text: &str, depth: u32) -> Syn<Word> {
 /// "except that a double-quote inside the expression is not treated specially",
 /// so NEITHER quote character quotes here: both reach the arithmetic lexer, which
 /// rejects them. That is why `$(( '1' + 2 ))` is an error and not 3.
-fn arith_from_str_at(text: &str, depth: u32) -> Syn<Word> {
-    lexer_over(text, depth)?.scan_dq_run(true, false)
+fn arith_from_str_at(text: &str, depth: u32, line: u32) -> Syn<Word> {
+    lexer_over(text, depth, line)?.scan_dq_run(true, false)
 }
 
-fn lexer_over(text: &str, depth: u32) -> Syn<Lexer> {
+/// `line` is where `text` begins in the SCRIPT, not in `text`: an operand is a
+/// substring of the outer input, and a `$( )` inside one reports the script's
+/// line as dash does -- which it only can if the sub-lexer starts counting
+/// where the substring starts.
+fn lexer_over(text: &str, depth: u32, line: u32) -> Syn<Lexer> {
     if depth > MAX_EXPANSION_DEPTH {
         return Err("expansion nested too deeply".into());
     }
@@ -626,6 +676,7 @@ fn lexer_over(text: &str, depth: u32) -> Syn<Lexer> {
         sc: Scanner {
             src: text.chars().collect(),
             pos: 0,
+            line,
             continued: false,
         },
         ended_in_comment: false,
@@ -694,6 +745,7 @@ impl Lexer {
     fn mark(&self) -> Mark {
         Mark {
             pos: self.sc.pos,
+            line: self.sc.line,
             continued: self.sc.continued,
             ended_in_comment: self.ended_in_comment,
             awaiting: self.awaiting,
@@ -705,6 +757,7 @@ impl Lexer {
 
     fn restore(&mut self, m: Mark) {
         self.sc.pos = m.pos;
+        self.sc.line = m.line;
         self.sc.continued = m.continued;
         self.ended_in_comment = m.ended_in_comment;
         self.awaiting = m.awaiting;
@@ -794,6 +847,7 @@ impl Lexer {
                     quoted,
                     strip_tabs,
                     body: String::new(),
+                    body_line: 0,
                 });
                 return Ok(Tok::Word(word));
             }
@@ -940,6 +994,7 @@ impl Lexer {
     fn read_raw_line(&mut self) -> Option<String> {
         self.sc.peek()?; // at end of input there is no next line
         let start = self.sc.pos;
+        let start_line = self.sc.line;
         let mut line = String::new();
         while let Some(c) = self.sc.bump() {
             if c == '\n' {
@@ -954,6 +1009,7 @@ impl Lexer {
             Some(line)
         } else {
             self.sc.pos = start;
+            self.sc.line = start_line;
             None
         }
     }
@@ -968,6 +1024,7 @@ impl Lexer {
                 break;
             };
             loop {
+                    let start = self.sc.line;
                 let Some(raw) = self.read_raw_line() else {
                     return Err(format!("{INCOMPLETE}: here-document delimited by `{delim}`"));
                 };
@@ -980,14 +1037,19 @@ impl Lexer {
                     break;
                 }
                 if let Some(p) = self.pending.first_mut() {
+                    if p.body_line == 0 {
+                        // `read_raw_line` consumed the newline, so the line it
+                        // read is the one before where the scanner now sits.
+                        p.body_line = start;
+                    }
                     p.body.push_str(line);
                     p.body.push('\n');
                 }
                 self.committed = true;
             }
-            let body = match self.pending.first_mut() {
-                Some(p) => std::mem::take(&mut p.body),
-                None => String::new(),
+            let (body, body_line) = match self.pending.first_mut() {
+                Some(p) => (std::mem::take(&mut p.body), p.body_line.max(1)),
+                None => (String::new(), 1),
             };
             let word = if quoted {
                 Word(vec![Seg::Quoted(body)])
@@ -996,7 +1058,7 @@ impl Lexer {
                 // construct inside it is a syntax error and NOT a request for
                 // another line -- `fatal` says so without changing the text,
                 // which is the same diagnostic the whole-of-input path gives.
-                match heredoc_body_word(&body) {
+                match heredoc_body_word(&body, body_line) {
                     Ok(w) => w,
                     Err(e) => {
                         self.fatal = true;
@@ -1115,6 +1177,7 @@ impl Lexer {
                     buf.push_seg(Seg::Cmd {
                         code,
                         quoted: false,
+                        line: BACKTICK_LINE,
                     });
                 }
                 '$' => self.scan_dollar(&mut buf, false)?,
@@ -1182,7 +1245,11 @@ impl Lexer {
                 '`' => {
                     self.sc.bump();
                     let code = self.scan_backtick()?;
-                    buf.push_seg(Seg::Cmd { code, quoted: true });
+                    buf.push_seg(Seg::Cmd {
+                        code,
+                        quoted: true,
+                        line: BACKTICK_LINE,
+                    });
                 }
                 '$' => self.scan_dollar(&mut buf, true)?,
                 other => {
@@ -1228,7 +1295,11 @@ impl Lexer {
                 '`' => {
                     self.sc.bump();
                     let code = self.scan_backtick()?;
-                    buf.push_seg(Seg::Cmd { code, quoted: true });
+                    buf.push_seg(Seg::Cmd {
+                        code,
+                        quoted: true,
+                        line: BACKTICK_LINE,
+                    });
                 }
                 '$' => self.scan_dollar(buf, true)?,
                 other => {
@@ -1309,25 +1380,31 @@ impl Lexer {
             }
             '{' => {
                 self.sc.bump();
+                // After the `{`, so this is where the braced text begins.
+                let line = self.sc.line;
                 let inner = self.scan_braced(in_dq)?;
-                let param = parse_param(&inner, in_dq, self.depth)?;
+                let param = parse_param(&inner, in_dq, self.depth, line)?;
                 buf.push_seg(Seg::Param(Box::new(param)));
             }
             '(' => {
                 if self.sc.peek_at(1) == Some('(') {
                     self.sc.bump();
                     self.sc.bump();
+                    let line = self.sc.line;
                     let text = self.scan_arith()?;
                     buf.push_seg(Seg::Arith {
-                        expr: arith_from_str_at(&text, self.depth + 1)?,
+                        expr: arith_from_str_at(&text, self.depth + 1, line)?,
                         quoted: in_dq,
                     });
                 } else {
                     self.sc.bump();
+                    // After the `(`, so this is the line the BODY opens on.
+                    let line = self.sc.line;
                     let code = self.scan_paren_body()?;
                     buf.push_seg(Seg::Cmd {
                         code,
                         quoted: in_dq,
+                        line,
                     });
                 }
             }
@@ -1677,7 +1754,7 @@ impl Lexer {
 /// Lex a here-document body: expansions are live, but `"` and `'` are ordinary
 /// characters and the result is never field-split, so every literal character
 /// is recorded as quoted.
-fn heredoc_body_word(body: &str) -> Syn<Word> {
+fn heredoc_body_word(body: &str, line: u32) -> Syn<Word> {
     let mut lx = Lexer {
         sealed: true,
         owed_newline: false,
@@ -1686,6 +1763,7 @@ fn heredoc_body_word(body: &str) -> Syn<Word> {
         sc: Scanner {
             src: body.chars().collect(),
             pos: 0,
+            line,
             continued: false,
         },
         ended_in_comment: false,
@@ -1720,7 +1798,11 @@ fn heredoc_body_word(body: &str) -> Syn<Word> {
             '`' => {
                 lx.sc.bump();
                 let code = lx.scan_backtick()?;
-                buf.push_seg(Seg::Cmd { code, quoted: true });
+                buf.push_seg(Seg::Cmd {
+                    code,
+                    quoted: true,
+                    line: BACKTICK_LINE,
+                });
             }
             '$' => lx.scan_dollar(&mut buf, true)?,
             other => {
@@ -1733,7 +1815,11 @@ fn heredoc_body_word(body: &str) -> Syn<Word> {
 }
 
 /// Split the inside of a `${...}` into name, operator and operand word.
-fn parse_param(inner: &str, quoted: bool, depth: u32) -> Syn<Param> {
+/// `line` is where `inner` begins in the script. Every operand but the patsub
+/// replacement begins on that same line: what precedes one is the NAME, an
+/// optional `:` and the operator, and a name cannot hold a newline. The
+/// replacement is the exception, since the PATTERN before it can.
+fn parse_param(inner: &str, quoted: bool, depth: u32, line: u32) -> Syn<Param> {
     let chars: Vec<char> = inner.chars().collect();
     if chars.is_empty() {
         return Err("bad substitution: `${}`".into());
@@ -1802,9 +1888,9 @@ fn parse_param(inner: &str, quoted: bool, depth: u32) -> Syn<Param> {
         return Ok(Param {
             name,
             op: Some(ParamOp::Substring {
-                offset: arith_from_str_at(&offset, depth + 1)?,
+                offset: arith_from_str_at(&offset, depth + 1, line)?,
                 length: match length {
-                    Some(l) => Some(arith_from_str_at(&l, depth + 1)?),
+                    Some(l) => Some(arith_from_str_at(&l, depth + 1, line)?),
                     None => None,
                 },
             }),
@@ -1823,8 +1909,12 @@ fn parse_param(inner: &str, quoted: bool, depth: u32) -> Syn<Param> {
         return Ok(Param {
             name,
             op: Some(ParamOp::Replace {
-                pat: word_from_str_at(&pat, depth + 1)?,
-                repl: word_from_str_at(&repl, depth + 1)?,
+                pat: word_from_str_at(&pat, depth + 1, line)?,
+                repl: word_from_str_at(
+                    &repl,
+                    depth + 1,
+                    line.saturating_add(u32::try_from(pat.matches('\n').count()).unwrap_or(u32::MAX)),
+                )?,
                 all: doubled,
             }),
             quoted,
@@ -1832,9 +1922,9 @@ fn parse_param(inner: &str, quoted: bool, depth: u32) -> Syn<Param> {
     }
     let operand: String = chars.iter().skip(i).collect();
     let word = if quoted && matches!(opc, '-' | '=' | '?' | '+') {
-        dq_word_from_str_at(&operand, depth + 1)?
+        dq_word_from_str_at(&operand, depth + 1, line)?
     } else {
-        word_from_str_at(&operand, depth + 1)?
+        word_from_str_at(&operand, depth + 1, line)?
     };
     let op = match opc {
         '-' => ParamOp::Default { word, colon },
@@ -2015,10 +2105,10 @@ mod tests {
     use super::*;
 
     fn words(src: &str) -> Syn<Vec<Word>> {
-        Ok(tokenize(src)?
+        Ok(tokenize(src, 1)?
             .toks
             .into_iter()
-            .filter_map(|t| match t {
+            .filter_map(|p| match p.tok {
                 Tok::Word(w) => Some(w),
                 _ => None,
             })
@@ -2100,7 +2190,7 @@ mod tests {
     }
 
     fn heredoc0(src: &str) -> Syn<Word> {
-        tokenize(src)?
+        tokenize(src, 1)?
             .heredocs
             .into_iter()
             .next()
@@ -2141,15 +2231,15 @@ mod tests {
 
     #[test]
     fn io_number_is_recognised_only_when_glued() -> Syn<()> {
-        assert!(matches!(tokenize("echo 2>x")?.toks.get(1), Some(Tok::IoNumber(2))));
-        assert!(matches!(tokenize("echo 2 >x")?.toks.get(1), Some(Tok::Word(_))));
+        assert!(matches!(tokenize("echo 2>x", 1)?.toks.get(1).map(|p| &p.tok), Some(Tok::IoNumber(2))));
+        assert!(matches!(tokenize("echo 2 >x", 1)?.toks.get(1).map(|p| &p.tok), Some(Tok::Word(_))));
         Ok(())
     }
 
     #[test]
     fn heredoc_body_is_collected_after_the_line() -> Syn<()> {
         assert!(matches!(
-            tokenize("cat <<EOF\nhi\nEOF\n")?.toks.get(1),
+            tokenize("cat <<EOF\nhi\nEOF\n", 1)?.toks.get(1).map(|p| &p.tok),
             Some(Tok::Op(Op::DLess(0)))
         ));
         assert!(matches!(heredoc0("cat <<EOF\nhi\nEOF\n")?.0.as_slice(),
@@ -2209,7 +2299,7 @@ mod tests {
         for _ in 0..500 {
             s.push('}');
         }
-        assert!(word_from_str_at(&s, 0).is_err());
+        assert!(word_from_str_at(&s, 0, 1).is_err());
         // patsub re-enters TWICE per level, once for the pattern and once for the
         // replacement, so it needs the same cap -- and it is charged separately
         // from the operator above, since nothing else reaches these two words.
@@ -2221,7 +2311,7 @@ mod tests {
         for _ in 0..500 {
             s.push('}');
         }
-        assert!(word_from_str_at(&s, 0).is_err());
+        assert!(word_from_str_at(&s, 0, 1).is_err());
         // The arith body shares the cap through the same constructor.
         let mut a = String::new();
         for _ in 0..500 {
@@ -2231,7 +2321,7 @@ mod tests {
         for _ in 0..500 {
             a.push_str("))");
         }
-        assert!(arith_from_str_at(&a, 0).is_err());
+        assert!(arith_from_str_at(&a, 0, 1).is_err());
     }
 
     #[test]
@@ -2241,7 +2331,7 @@ mod tests {
         // (literal before anything but `$`, backtick, `"`, `\`). Every one of these
         // reaches the arithmetic lexer, which rejects them — as dash does.
         for src in ["'1' + 2", "\"1\" + 2", "1 \\+ 2", "\\1"] {
-            let w = arith_from_str_at(src, 0)?;
+            let w = arith_from_str_at(src, 0, 1)?;
             let text: String = w
                 .0
                 .iter()
@@ -2253,7 +2343,7 @@ mod tests {
             assert_eq!(text, src);
         }
         // The expansions a double-quoted body still performs are unaffected.
-        let w = arith_from_str_at("$x + `echo 1`", 0)?;
+        let w = arith_from_str_at("$x + `echo 1`", 0, 1)?;
         assert!(w.0.iter().any(|s| matches!(s, Seg::Param(_))));
         assert!(w.0.iter().any(|s| matches!(s, Seg::Cmd { .. })));
         Ok(())
@@ -2302,7 +2392,7 @@ mod tests {
 
     #[test]
     fn unterminated_quote_reports_incomplete_input() -> Syn<()> {
-        match tokenize("echo 'abc") {
+        match tokenize("echo 'abc", 1) {
             Err(e) => {
                 assert!(e.starts_with(INCOMPLETE), "{e}");
                 Ok(())
@@ -2477,7 +2567,7 @@ mod tests {
         // And a body that never closes is incomplete rather than silently
         // ending at whatever `\c` swallowed.
         for src in [r"echo $'\c", r"echo $'\c\", r"echo $'a\'"] {
-            match tokenize(src) {
+            match tokenize(src, 1) {
                 Err(e) => assert!(e.starts_with(INCOMPLETE), "{src}: {e}"),
                 Ok(_) => return Err(format!("`{src}` must not tokenize").into()),
             }
@@ -2519,8 +2609,8 @@ mod tests {
             // body-finding phase meets the escapes: a syntax error is a fine
             // answer, hanging or panicking is not.
             let src: String = body.iter().collect();
-            let _ = tokenize(&format!("echo $'{src}'"));
-            let _ = tokenize(&format!("echo $({src})"));
+            let _ = tokenize(&format!("echo $'{src}'"), 1);
+            let _ = tokenize(&format!("echo $({src})"), 1);
         }
     }
 
@@ -2581,7 +2671,7 @@ mod tests {
     #[test]
     fn an_unterminated_ansi_c_quote_reports_incomplete_input() -> Syn<()> {
         for src in ["echo $'abc", "echo $'a\\", "echo $'a\\c"] {
-            match tokenize(src) {
+            match tokenize(src, 1) {
                 Err(e) => assert!(e.starts_with(INCOMPLETE), "{src}: {e}"),
                 Ok(_) => return Err(format!("`{src}` must not tokenize").into()),
             }

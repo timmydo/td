@@ -29,7 +29,7 @@ use std::os::unix::process::ExitStatusExt;
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 
-use crate::ast::{Cmd, List, Redir, RedirKind};
+use crate::ast::{List, Redir, RedirKind, Stage};
 use crate::exec::{self, Shell, Sig, R};
 
 /// One entry in the shell's descriptor table. Everything shareable is behind an
@@ -531,7 +531,7 @@ pub(crate) fn leave_clone(sh: &mut Shell, clone: Subshell, code: i32) -> R<()> {
 /// Bounded and idle rather than unbounded and growing, which is the trade this
 /// makes; closing it properly needs the stage to drop the ends it handed over,
 /// and that is a redirection-restore question rather than a pipeline one.
-pub fn run_pipeline(sh: &mut Shell, cmds: &[Cmd]) -> R<()> {
+pub fn run_pipeline(sh: &mut Shell, cmds: &[Stage]) -> R<()> {
     let mut stages: Vec<Subshell> = cmds
         .iter()
         .map(|_| {
@@ -562,7 +562,7 @@ pub fn run_pipeline(sh: &mut Shell, cmds: &[Cmd]) -> R<()> {
         let handles: Vec<_> = stages
             .into_iter()
             .zip(cmds)
-            .map(|(stage, cmd)| {
+            .map(|(stage, staged)| {
                 // `Builder`, not `Scope::spawn`, because that one PANICS when the
                 // OS cannot make a thread — and pipeline length is whatever the
                 // operator typed, so a low thread limit would abort the shell
@@ -570,12 +570,16 @@ pub fn run_pipeline(sh: &mut Shell, cmds: &[Cmd]) -> R<()> {
                 // error path.
                 std::thread::Builder::new().spawn_scoped(scope, move || {
                     let mut stage = stage;
+                    // Per STAGE, not per pipeline: `true |\n  echo $LINENO`
+                    // reports 2 in dash, and each stage is its own `Shell` here
+                    // so the cell is not shared between concurrent threads.
+                    stage.set_lineno(staged.line);
                     // A non-local transfer (`exit`, break/continue/return) is
                     // confined to the stage's subshell; only its status
                     // survives. An interrupt is not -- it is carried back and
                     // re-raised on the joining thread, where the enclosing
                     // shell's own disposition is what decides.
-                    let status = match exec::run_command(&mut stage, cmd) {
+                    let status = match exec::run_command(&mut stage, &staged.cmd) {
                         Ok(()) => stage.status,
                         Err(Sig::Exit(code) | Sig::Abort(code)) => code,
                         // A stage killed by a signal never reaches an EXIT trap,
@@ -1075,6 +1079,10 @@ pub fn fork_shell(sh: &Shell) -> Subshell {
         funcs: sh.funcs.clone(),
         params: sh.params.clone(),
         arg0: sh.arg0.clone(),
+        // Carried, not reset: a subshell is the same script at the same point,
+        // and `( echo $LINENO )` reports the line the subshell is written on.
+        lineno: sh.lineno,
+        funcline: sh.funcline,
         status: sh.status,
         last_bg: sh.last_bg,
         // CLEARED, not carried: ash does this in `forkchild` with the comment
@@ -1137,8 +1145,8 @@ pub fn fork_shell(sh: &Shell) -> Subshell {
 
 /// `$(code)`: run `code` in a subshell with stdout captured to a buffer, and
 /// return the captured bytes as text.
-pub fn capture_stdout(sh: &mut Shell, code: &str) -> R<String> {
-    let list = match crate::parser::parse_aliased(code, &sh.aliases) {
+pub fn capture_stdout(sh: &mut Shell, code: &str, line: u32) -> R<String> {
+    let list = match crate::parser::parse_aliased_at(code, &sh.aliases, line) {
         Ok(l) => l,
         Err(e) => return Err(sh.fatal(&e, 2)),
     };

@@ -58,7 +58,13 @@ pub enum Seg {
     Quoted(String),
     Param(Box<Param>),
     /// `$(...)` / backticks — the raw source, parsed when the word is expanded.
-    Cmd { code: String, quoted: bool },
+    /// `line` is where that source starts, which `$LINENO` inside it counts on
+    /// from; a backtick body is renumbered from 1, as dash renumbers it.
+    Cmd {
+        code: String,
+        quoted: bool,
+        line: u32,
+    },
     /// `$((...))` — the inner text is itself a word (it may contain `$x`), so it
     /// is expanded first and then evaluated as an arithmetic expression.
     Arith { expr: Word, quoted: bool },
@@ -187,8 +193,18 @@ pub enum Cmd {
     /// defconfig enables, so it is in this shell's model.
     Cond { expr: CondExpr, redirs: Vec<Redir> },
     /// `name() compound` — `Arc` so a call site can hold the body while the
-    /// definition is redefined out from under it.
-    FuncDef { name: String, body: Arc<Cmd> },
+    /// definition is redefined out from under it. `line` is the definition's
+    /// own, kept because it is not the body's: dash reports `$LINENO` inside a
+    /// function RELATIVE to it (`funcline`, eval.c:996).
+    FuncDef {
+        name: String,
+        /// A `Stage` and not a bare `Cmd` because the body is a command node
+        /// too, and a compound's OWN line is what its header expands under:
+        /// `f() for x in "$LINENO"; do …` is the definition's line in dash,
+        /// not the caller's.
+        body: Arc<Stage>,
+        line: u32,
+    },
 }
 
 /// The expression inside `[[ ]]`. A tree rather than an argument vector — which
@@ -251,10 +267,20 @@ pub enum Conn {
     Or,
 }
 
+/// One command of a pipeline, with the input line it starts on. Per COMMAND
+/// and not per pipeline because that is where dash keeps it (eval.c:751), and
+/// the difference shows the moment a pipeline spans lines: in `true |\n  echo
+/// $LINENO` the second stage reports its own line, not the first's.
+#[derive(Clone, Debug)]
+pub struct Stage {
+    pub line: u32,
+    pub cmd: Cmd,
+}
+
 #[derive(Clone, Debug)]
 pub struct Pipeline {
     pub bang: bool,
-    pub cmds: Vec<Cmd>,
+    pub cmds: Vec<Stage>,
 }
 
 #[derive(Clone, Debug)]

@@ -399,9 +399,17 @@ fn stdin_script(sh: &mut Shell) -> i32 {
 /// front would put it on the screen twice.
 fn repl(sh: &mut Shell) -> i32 {
     let mut editor = line::Editor::new();
+    // The session's line count. dash reads an interactive shell's input as one
+    // stream, so `$LINENO` runs for the life of the session rather than
+    // restarting at each prompt -- measured over a pty at 1, 2, 5, 7 for two
+    // one-line commands, a four-line `if`, and one more command.
+    let mut line_base: u32 = 1;
     loop {
         let mut buffer = String::new();
         let outcome = read_complete(&mut editor, sh, &mut buffer);
+        // Counted before the run, and outside the emptiness test below: a blank
+        // line at the prompt is a line the session read.
+        let typed = u32::try_from(buffer.matches('\n').count()).unwrap_or(0);
         // POSIX's 128 + signal number, the status a shell reports for a command
         // its own SIGINT ended -- even though this one arrived as a keystroke.
         if matches!(outcome, ReadResult::Interrupted) {
@@ -409,7 +417,7 @@ fn repl(sh: &mut Shell) -> i32 {
         }
         let ended = matches!(outcome, ReadResult::Eof);
         if !buffer.trim().is_empty() {
-            match parser::parse_aliased(&buffer, &sh.aliases) {
+            match parser::parse_aliased_at(&buffer, &sh.aliases, line_base) {
                 Ok(list) => {
                     if let Some(code) = exec::run_interactive_unit(sh, &list) {
                         return code;
@@ -421,6 +429,7 @@ fn repl(sh: &mut Shell) -> i32 {
                 }
             }
         }
+        line_base = line_base.saturating_add(typed);
         if ended {
             break;
         }
