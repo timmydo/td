@@ -188,6 +188,24 @@ mod tests {
     }
 
     #[test]
+    fn every_character_the_sheet_spells_is_in_the_font() {
+        // `SUPER+1..9` drew as `SUPER+1??9` until the font had a period: an
+        // unmapped byte fell to a glyph shaped like a question mark, so a
+        // gap in the font was unreadable as one.
+        for row in ROWS {
+            for byte in row.keys.bytes().chain(row.action.bytes()) {
+                assert!(
+                    ui::is_mapped(byte),
+                    "{:?} in {:?} has no glyph",
+                    byte as char,
+                    row.keys
+                );
+            }
+        }
+        assert!(ui::is_mapped(b'?'), "the sheet's own SUPER+? row needs one");
+    }
+
+    #[test]
     fn every_row_fits_its_column_and_the_card() {
         for row in ROWS {
             assert!(

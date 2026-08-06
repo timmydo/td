@@ -2368,6 +2368,7 @@ mod tests {
     }
 
     use super::*;
+    use crate::bar::BAR_HEIGHT;
     use crate::framebuffer::Framebuffer;
     use crate::keyboard::{KeyInput, KeyState, ModifierState, RoutedKeyboardEvent, MOD_LOGO};
     use crate::layout::{Command, Direction, Layout};
@@ -4248,7 +4249,8 @@ mod tests {
             TEST_SEQ.fetch_add(1, Ordering::Relaxed)
         );
         let framebuffer_path = std::env::temp_dir().join(format!("{stem}.fb"));
-        let framebuffer = Framebuffer::test_file(&framebuffer_path, 640, 400, 640 * 4).unwrap();
+        let framebuffer =
+            Framebuffer::test_file(&framebuffer_path, 640, 400 + BAR_HEIGHT, 640 * 4).unwrap();
         let runtime = Arc::new(Mutex::new(Runtime::new(framebuffer)));
         runtime.lock().unwrap().repaint().unwrap();
         let (server, client) = UnixStream::pair().unwrap();
@@ -4307,16 +4309,32 @@ mod tests {
         // zero would pass on the bare desktop and prove nothing. These are
         // MEMORY bytes, not an RGB literal: XRGB8888 is little-endian, so the
         // blue channel comes first, as `scene`'s own desktop test spells it.
+        // Counted INSIDE the tile only. Scanning the whole output would let
+        // the status bar's own 640x24 band — none of it the desktop colour —
+        // stand in for 15360 pixels the client never painted, which is about
+        // twenty-six terminal rows of slack in an assertion whose whole job
+        // is to prove the tile was covered.
         let painted = fs::read(&framebuffer_path).unwrap();
-        let foreign = painted
-            .as_chunks::<4>()
-            .0
-            .iter()
-            .filter(|pixel| *pixel != &[0x30, 0x25, 0x20, 0])
-            .count();
-        assert!(
-            foreign >= 592 * 352,
-            "the presented frame covered {foreign} pixels, not the whole tile"
+        // The tile's own rectangle, derived from the size asserted above: one
+        // surface is centred in the tiling area, which begins below the bar.
+        let (tile_width, tile_height) = (592usize, 352usize);
+        let (output_width, output_height) = (640usize, 400usize);
+        let left = (output_width - tile_width) / 2;
+        let top = BAR_HEIGHT + (output_height - tile_height) / 2;
+        let stride = output_width * 4;
+        let mut foreign = 0usize;
+        for y in top..top + tile_height {
+            for x in left..left + tile_width {
+                let offset = y * stride + x * 4;
+                if painted.get(offset..offset + 4) != Some(&[0x30, 0x25, 0x20, 0][..]) {
+                    foreign += 1;
+                }
+            }
+        }
+        assert_eq!(
+            foreign,
+            tile_width * tile_height,
+            "the presented frame left desktop showing inside its own tile"
         );
 
         drop(connection);
@@ -4332,7 +4350,8 @@ mod tests {
             TEST_SEQ.fetch_add(1, Ordering::Relaxed)
         );
         let framebuffer_path = std::env::temp_dir().join(format!("{stem}.fb"));
-        let framebuffer = Framebuffer::test_file(&framebuffer_path, 640, 400, 640 * 4).unwrap();
+        let framebuffer =
+            Framebuffer::test_file(&framebuffer_path, 640, 400 + BAR_HEIGHT, 640 * 4).unwrap();
         let runtime = Arc::new(Mutex::new(Runtime::new(framebuffer)));
         runtime.lock().unwrap().repaint().unwrap();
         let (server, client) = UnixStream::pair().unwrap();
@@ -4407,7 +4426,9 @@ mod tests {
             .pointer_frame(
                 100,
                 40,
-                40,
+                // Past the status bar, so the LOCAL coordinate the client is
+                // asserted to receive is still (40, 40).
+                40 + i32::try_from(BAR_HEIGHT).unwrap(),
                 &[PointerButtonInput {
                     time: 100,
                     button: 0x110,
@@ -4454,7 +4475,8 @@ mod tests {
             TEST_SEQ.fetch_add(1, Ordering::Relaxed)
         );
         let framebuffer_path = std::env::temp_dir().join(format!("{stem}.fb"));
-        let framebuffer = Framebuffer::test_file(&framebuffer_path, 120, 80, 120 * 4).unwrap();
+        let framebuffer =
+            Framebuffer::test_file(&framebuffer_path, 120, 80 + BAR_HEIGHT, 120 * 4).unwrap();
         let runtime = Arc::new(Mutex::new(Runtime::new(framebuffer)));
         let key = SurfaceKey {
             client: 88,
@@ -4716,7 +4738,8 @@ mod tests {
         let pool_path = std::env::temp_dir().join(format!("{stem}.pool"));
         let pixels = [0x21u8, 0x43, 0x65, 0];
         fs::write(&pool_path, pixels).unwrap();
-        let framebuffer = Framebuffer::test_file(&framebuffer_path, 8, 8, 32).unwrap();
+        let framebuffer =
+            Framebuffer::test_file(&framebuffer_path, 8, 8 + BAR_HEIGHT, 32).unwrap();
         let (server, _peer) = UnixStream::pair().unwrap();
         let runtime = Arc::new(Mutex::new(Runtime::new(framebuffer)));
         let mut client = Client::new(2, server, runtime, test_keymap()).unwrap();

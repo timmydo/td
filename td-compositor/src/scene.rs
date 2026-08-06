@@ -1,3 +1,4 @@
+use crate::bar::{self, BAR_HEIGHT};
 use crate::help::Help;
 use crate::launcher::{LaunchRequest, Launcher, LauncherAction};
 use crate::layout::{Command, Layout, Placement, Rect, ViewLayout};
@@ -106,6 +107,7 @@ pub struct Scene {
     surface_bytes: usize,
     launcher: Launcher,
     help: Help,
+    status: String,
 }
 
 impl Scene {
@@ -119,6 +121,7 @@ impl Scene {
             surface_bytes: 0,
             launcher: Launcher::new(),
             help: Help::default(),
+            status: String::new(),
         }
     }
 
@@ -244,7 +247,40 @@ impl Scene {
     }
 
     pub fn views(&self, width: usize, height: usize) -> Vec<ViewLayout> {
-        self.layout.views(width, height, GAP)
+        let mut views = self.layout.views(width, self.tiled_height(height), GAP);
+        for view in &mut views {
+            view.rect.y = view.rect.y.saturating_add(BAR_HEIGHT);
+        }
+        views
+    }
+
+    /// The output minus the status bar. EVERY consumer of tiling geometry
+    /// goes through this and `tiled_placements` — the renderer, the layout
+    /// published to clients, and the pointer hit test — because two of them
+    /// disagreeing is a click that lands on a different tile than the one
+    /// under the cursor, with nothing on screen to say so.
+    fn tiled_height(&self, height: usize) -> usize {
+        height.saturating_sub(BAR_HEIGHT)
+    }
+
+    fn tiled_placements(&self, width: usize, height: usize) -> Vec<Placement> {
+        let mut placements = self.layout.placements(width, self.tiled_height(height), GAP);
+        for placement in &mut placements {
+            placement.rect.y = placement.rect.y.saturating_add(BAR_HEIGHT);
+        }
+        placements
+    }
+
+    /// The line the bar paints. Owned here so the sampler thread hands over
+    /// text and nothing in the render path reads a clock or a file. Answers
+    /// the text it REPLACED when the line changed, so a caller whose paint
+    /// fails can put it back: otherwise the scene holds a line the screen
+    /// never showed, and the next identical sample repaints nothing.
+    pub fn set_status(&mut self, status: String) -> Option<String> {
+        if self.status == status {
+            return None;
+        }
+        Some(std::mem::replace(&mut self.status, status))
     }
 
     pub fn focused(&self) -> Option<SurfaceKey> {
@@ -267,7 +303,7 @@ impl Scene {
 
     #[cfg(test)]
     pub fn pointer_target(&self, width: usize, height: usize) -> Option<SurfacePoint> {
-        let placements = self.layout.placements(width, height, GAP);
+        let placements = self.tiled_placements(width, height);
         self.pointer_target_from(&placements)
     }
 
@@ -314,7 +350,7 @@ impl Scene {
         width: usize,
         height: usize,
     ) -> Option<SurfacePoint> {
-        let placements = self.layout.placements(width, height, GAP);
+        let placements = self.tiled_placements(width, height);
         self.pointer_target_for_from(key, &placements)
     }
 
@@ -346,7 +382,7 @@ impl Scene {
         width: usize,
         height: usize,
     ) -> (Option<SurfacePoint>, Option<SurfacePoint>) {
-        let placements = self.layout.placements(width, height, GAP);
+        let placements = self.tiled_placements(width, height);
         (
             self.pointer_target_from(&placements),
             grab.and_then(|key| self.pointer_target_for_from(key, &placements)),
@@ -354,7 +390,10 @@ impl Scene {
     }
 
     pub fn render(&self, frame: &mut [u8], width: usize, height: usize, stride: usize) {
-        for row in frame.chunks_mut(stride) {
+        // `take(height)`: every other painter here clips to the output, and
+        // the shadow buffer being exactly that tall is the framebuffer's
+        // arithmetic rather than this function's contract.
+        for row in frame.chunks_mut(stride).take(height) {
             let visible = width.saturating_mul(4).min(row.len());
             if let Some(pixels) = row.get_mut(..visible) {
                 for [blue, green, red, unused] in pixels.as_chunks_mut::<4>().0 {
@@ -366,7 +405,7 @@ impl Scene {
             }
         }
 
-        let placements = self.layout.placements(width, height, GAP);
+        let placements = self.tiled_placements(width, height);
         for placement in &placements {
             if placement.rect.width == 0 || placement.rect.height == 0 {
                 continue;
@@ -397,6 +436,7 @@ impl Scene {
             };
             draw_surface(frame, width, height, stride, placement.rect, surface);
         }
+        bar::paint(frame, width, height, stride, &self.status);
         self.launcher.paint(frame, width, height, stride);
         self.help.paint(frame, width, height, stride);
         draw_pointer(frame, width, height, stride, self.pointer_x, self.pointer_y);
@@ -693,6 +733,14 @@ mod tests {
         }
     }
 
+    /// A pixel of the TILING area, whose top is the status bar's bottom.
+    /// These tests are about tiling geometry, so they render into an output
+    /// the bar's height taller and address it from there — otherwise every
+    /// coordinate below would encode how tall the bar happens to be.
+    fn tiled(frame: &[u8], stride: usize, x: usize, y: usize) -> [u8; 4] {
+        pixel(frame, stride, x, y.saturating_add(BAR_HEIGHT))
+    }
+
     fn pixel(frame: &[u8], stride: usize, x: usize, y: usize) -> [u8; 4] {
         let offset = y
             .checked_mul(stride)
@@ -717,9 +765,20 @@ mod tests {
                 surface([1, 2, 3, 0], 100, 100),
             )
             .unwrap();
-        let mut frame = vec![0xaa; 20 * 12 * 4];
-        scene.render(&mut frame, 20, 12, 20 * 4);
-        assert_eq!(frame.len(), 20 * 12 * 4);
+        let height = 12 + BAR_HEIGHT;
+        // The "never grows" half of this test's name, made falsifiable: the
+        // buffer carries rows the output does not, and `0xaa` is what nothing
+        // may have touched. A `frame.len()` assertion could not fail — the
+        // slice's length is not something `render` can change.
+        let stride = 20 * 4;
+        let mut frame = vec![0xaa; stride * (height + 4)];
+        scene.render(&mut frame, 20, height, stride);
+        assert!(
+            frame
+                .get(stride * height..)
+                .is_some_and(|rows| rows.iter().all(|byte| *byte == 0xaa)),
+            "the clipped surface escaped the output"
+        );
         assert!(frame.as_chunks::<4>().0.contains(&[1, 2, 3, 0]));
     }
 
@@ -759,6 +818,166 @@ mod tests {
     }
 
     #[test]
+    fn every_consumer_of_tiling_geometry_agrees_and_none_of_it_is_under_the_bar() {
+        let mut scene = Scene::new();
+        for object in 1..=3 {
+            scene
+                .commit(SurfaceKey { client: 1, object }, surface([1, 2, 3, 0], 8, 8))
+                .unwrap();
+        }
+        scene.command(Command::SetSplit(crate::layout::Axis::Horizontal));
+        scene
+            .commit(
+                SurfaceKey {
+                    client: 1,
+                    object: 4,
+                },
+                surface([4, 5, 6, 0], 8, 8),
+            )
+            .unwrap();
+        for (width, height) in [(320, 200), (640, 400), (1920, 1080), (200, BAR_HEIGHT + 60)] {
+            for view in scene.views(width, height) {
+                // Nothing tiled may occupy a row the bar owns.
+                assert!(
+                    view.rect.y >= BAR_HEIGHT,
+                    "{width}x{height}: view at y={}",
+                    view.rect.y
+                );
+                assert!(
+                    view.rect.y.saturating_add(view.rect.height) <= height,
+                    "{width}x{height}: view runs past the output"
+                );
+                if view.rect.width == 0 || view.rect.height == 0 {
+                    continue;
+                }
+                // The published layout and the hit test must name the same
+                // surface at the same point, or a click lands on a tile other
+                // than the one under the cursor with nothing to say so. Near
+                // the ORIGIN, since hit testing is over the surface's own
+                // pixels and these are smaller than the tiles they sit in.
+                let x = view.rect.x.saturating_add(1);
+                let y = view.rect.y.saturating_add(1);
+                scene.pointer_x = i32::try_from(x).unwrap();
+                scene.pointer_y = i32::try_from(y).unwrap();
+                // Through `pointer_targets` — the PRODUCTION entry point.
+                // Asking the `#[cfg(test)]` wrapper instead would let this
+                // test pass while the compositor's own hit test drifted,
+                // which is the exact defect the reservation is here to
+                // prevent and the one that half-happened while it landed.
+                assert_eq!(
+                    scene
+                        .pointer_targets(None, width, height)
+                        .0
+                        .map(|point| point.key),
+                    Some(view.key),
+                    "{width}x{height}: hit test disagrees with the layout at {x},{y}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_fullscreen_tile_stops_at_the_bar_rather_than_covering_them() {
+        // This is where the reservation is load-bearing and the tiled case is
+        // not: a tiled placement is already inset by GAP, which happens to
+        // equal BAR_HEIGHT, so removing the offset leaves it looking right.
+        // Fullscreen has no gap at all — it is the full area or nothing — so
+        // it is the only arrangement whose pixels reach row 0 without it.
+        let mut scene = Scene::new();
+        let key = SurfaceKey {
+            client: 1,
+            object: 1,
+        };
+        scene.commit(key, surface([9, 8, 7, 0], 400, 400)).unwrap();
+        scene.command(Command::ToggleFullscreen);
+        for (width, height) in [(320, 200), (640, 400)] {
+            // `position`, not the iterator method whose name is also a shell
+            // command: this file is `include_str!`'d into the td-compositor
+            // recipe, so its text is scanned as a bootstrap step's.
+            let views = scene.views(width, height);
+            let index = views.iter().position(|view| view.key == key).unwrap();
+            let view = *views.get(index).unwrap();
+            assert_eq!(view.rect.y, BAR_HEIGHT, "{width}x{height}");
+            assert_eq!(view.rect.x, 0, "{width}x{height}");
+            assert_eq!(view.rect.height, height - BAR_HEIGHT, "{width}x{height}");
+            assert_eq!(view.rect.width, width, "{width}x{height}");
+
+            // And the pixels agree: the bar's rows keep their own colour and
+            // the client's start immediately below them. The pointer sprite
+            // is parked below the bar first — it paints last and would
+            // otherwise be the thing found in row 0.
+            let stride = width * 4;
+            let mut frame = vec![0u8; stride * height];
+            scene.pointer_x = i32::try_from(width / 4).unwrap();
+            scene.pointer_y = i32::try_from(height - 1).unwrap();
+            scene.render(&mut frame, width, height, stride);
+            for y in 0..BAR_HEIGHT {
+                for x in [0, width / 2, width - 1] {
+                    assert_eq!(
+                        pixel(&frame, stride, x, y),
+                        [0x18, 0x14, 0x20, 0],
+                        "{width}x{height}: fullscreen reached the bar at {x},{y}"
+                    );
+                }
+            }
+            assert_eq!(pixel(&frame, stride, 0, BAR_HEIGHT), [9, 8, 7, 0]);
+
+            // A click in ANY of the bar's rows and columns reaches no tile,
+            // even though a fullscreen surface covers every column below.
+            for y in 0..BAR_HEIGHT {
+                for x in [0, width / 2, width - 1] {
+                    scene.pointer_x = i32::try_from(x).unwrap();
+                    scene.pointer_y = i32::try_from(y).unwrap();
+                    assert_eq!(
+                        scene.pointer_target(width, height),
+                        None,
+                        "{width}x{height}: the bar is clickable at {x},{y}"
+                    );
+                }
+            }
+            scene.pointer_x = 0;
+            scene.pointer_y = i32::try_from(BAR_HEIGHT).unwrap();
+            assert_eq!(
+                scene.pointer_target(width, height).map(|point| point.key),
+                Some(key)
+            );
+        }
+    }
+
+    #[test]
+    fn an_output_no_taller_than_the_bar_tiles_nothing_and_paints_no_further() {
+        let mut scene = Scene::new();
+        scene
+            .commit(
+                SurfaceKey {
+                    client: 1,
+                    object: 1,
+                },
+                surface([1, 2, 3, 0], 8, 8),
+            )
+            .unwrap();
+        for height in [0, 1, BAR_HEIGHT] {
+            let width = 64usize;
+            let stride = width * 4;
+            // Rows past the output, so "paints no further" is a readable
+            // property rather than a buffer length that cannot change.
+            let guard = 4usize;
+            let mut frame = vec![0u8; stride * (height + guard)];
+            scene.render(&mut frame, width, height, stride);
+            assert!(
+                frame
+                    .get(stride * height..)
+                    .is_some_and(|rows| rows.iter().all(|byte| *byte == 0)),
+                "{height}: painted past the output"
+            );
+            assert!(scene
+                .views(width, height)
+                .iter()
+                .all(|view| view.rect.height == 0 || view.rect.width == 0));
+        }
+    }
+
+    #[test]
     fn renderer_uses_tiling_geometry_gaps_and_focus_borders() {
         let mut scene = Scene::new();
         for (object, color) in [(1, [1, 2, 3, 0]), (2, [4, 5, 6, 0])] {
@@ -767,21 +986,27 @@ mod tests {
                 .unwrap();
         }
         let width = 120usize;
-        let height = 80usize;
+        let height = 80 + BAR_HEIGHT;
         let stride = width * 4;
         let mut frame = vec![0; stride * height];
         scene.render(&mut frame, width, height, stride);
 
-        assert_eq!(pixel(&frame, stride, 24, 24), [1, 2, 3, 0]);
-        assert_eq!(pixel(&frame, stride, 72, 24), [4, 5, 6, 0]);
-        assert_eq!(pixel(&frame, stride, 60, 30), [0x30, 0x25, 0x20, 0]);
-        assert_eq!(pixel(&frame, stride, 68, 30), [0xc0, 0x70, 0xf0, 0]);
-        assert_eq!(pixel(&frame, stride, 20, 30), [0x70, 0x70, 0x70, 0]);
+        assert_eq!(tiled(&frame, stride, 24, 24), [1, 2, 3, 0]);
+        assert_eq!(tiled(&frame, stride, 72, 24), [4, 5, 6, 0]);
+        assert_eq!(tiled(&frame, stride, 60, 30), [0x30, 0x25, 0x20, 0]);
+        assert_eq!(tiled(&frame, stride, 68, 30), [0xc0, 0x70, 0xf0, 0]);
+        assert_eq!(tiled(&frame, stride, 20, 30), [0x70, 0x70, 0x70, 0]);
+        // The bar owns its own rows and the tiles start below them.
+        assert_eq!(pixel(&frame, stride, 24, 0), [0x18, 0x14, 0x20, 0]);
+        assert_eq!(
+            pixel(&frame, stride, 24, BAR_HEIGHT - 1),
+            [0x18, 0x14, 0x20, 0]
+        );
 
         scene.command(Command::Focus(crate::layout::Direction::Left));
         scene.render(&mut frame, width, height, stride);
-        assert_eq!(pixel(&frame, stride, 20, 30), [0xc0, 0x70, 0xf0, 0]);
-        assert_eq!(pixel(&frame, stride, 68, 30), [0x70, 0x70, 0x70, 0]);
+        assert_eq!(tiled(&frame, stride, 20, 30), [0xc0, 0x70, 0xf0, 0]);
+        assert_eq!(tiled(&frame, stride, 68, 30), [0x70, 0x70, 0x70, 0]);
     }
 
     #[test]
@@ -931,10 +1156,11 @@ mod tests {
                 .commit(SurfaceKey { client: 1, object }, surface(color, 2, 2))
                 .unwrap();
         }
-        let mut frame = vec![0; 2 * 20 * 4];
-        scene.render(&mut frame, 2, 20, 2 * 4);
-        assert_eq!(pixel(&frame, 2 * 4, 0, 9), [1, 2, 3, 0]);
-        assert_eq!(pixel(&frame, 2 * 4, 1, 9), [4, 5, 6, 0]);
+        let height = 20 + BAR_HEIGHT;
+        let mut frame = vec![0; 2 * height * 4];
+        scene.render(&mut frame, 2, height, 2 * 4);
+        assert_eq!(tiled(&frame, 2 * 4, 0, 9), [1, 2, 3, 0]);
+        assert_eq!(tiled(&frame, 2 * 4, 1, 9), [4, 5, 6, 0]);
         assert!(!frame.as_chunks::<4>().0.contains(&[7, 8, 9, 0]));
     }
 

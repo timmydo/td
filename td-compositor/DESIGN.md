@@ -59,6 +59,92 @@ from `/sys/class/graphics/fb0`; the compositor refuses any format other than
 32 bits per pixel and treats it as little-endian XRGB8888. Renderer tests pin
 that interpretation against a file-backed framebuffer.
 
+A status bar owns the top 24 rows. It is BUILT IN rather than a client,
+because a client would need a way to be placed and to reserve space —
+layer-shell, or a private protocol standing in for it — and none of that is
+here. The tiling area is therefore the output minus those rows, and every
+consumer of tiling geometry goes through one pair of helpers in `scene.rs`:
+the renderer, the layout published to clients, and the pointer hit test.
+That is not tidiness. Two of them disagreeing is a click landing on a tile
+other than the one under the cursor, with nothing on screen to say so. It
+half-happened while this landed: the two entry points left reaching
+`layout.placements` directly were the `#[cfg(test)]` hit-test wrappers, not
+the production one, so what it would have shipped is not a mis-aimed click
+but tests measuring a geometry the compositor no longer used — the same
+defect one step further back, since those tests are what certify the click.
+A click anywhere in the bar's own rows reaches no tile at all. FULLSCREEN
+fills the tiling area rather than covering the bar, which is deliberately
+unlike i3 — a user-visible divergence from the window manager this is modelled
+on, and the reason the reservation has a test of its own: fullscreen is the
+one arrangement with no gap, so it is the only one whose pixels would reach
+row 0 if the reservation were dropped.
+
+It shows load, memory, uptime and a UTC clock, all read from `/proc` as
+ordinary files, so the bar adds no syscall and needs no `UNSAFE.md`
+amendment. Memory is total minus MemAvailable rather than minus MemFree,
+which counts neither cache nor reclaimable slab and reads alarmingly low on
+an idle machine. A reading that could not be taken shows its label with `?`
+rather than vanishing, so a broken source looks broken instead of looking
+like a machine with less to report; each field fails on its own, so a
+garbled `loadavg` does not take the clock down with it. The `?` is why the
+font grew a period: an unmapped byte used to draw a glyph shaped like a
+question mark, so `LOAD 0.42` rendered as `LOAD 0?42` and a healthy reading
+was indistinguishable from a failed one. The fallback is a box now, `.` and
+`?` are glyphs of their own, and both the bar's line and the help sheet's
+rows are held to a font that has every character they spell.
+
+The fields are ordered as the i3status config they are modelled on has them,
+which puts the clock last. The line is left-aligned from x=8 and about 752
+pixels wide at full width, so on an output narrower than that the CLOCK is
+what clips first — the field the bar most exists for. That is a real cost of
+following the model rather than an oversight; the fix, if a narrow output ever
+matters, is dropping whole fields rather than clipping a glyph, and no output
+td targets is that narrow today.
+
+The clock is UTC and SAYS so. There is no TZif parser here, and a
+local-looking time that is silently UTC is worse than a UTC one that admits
+it. The civil date comes from days-since-epoch by the shift-the-era method,
+which is integer-only and needs no month table; its test pins 1972, 2000 and
+2100 — 1900 is the other side of the century rule and cannot be asked here,
+since these are UNSIGNED days since 1970. It also walks every day of a leap
+year and the year after, requiring each step to ADVANCE the calendar by one
+day against month lengths written out longhand. The round trip alone would
+not: it closes over the test's own inverse, so a matched pair of wrong
+functions satisfies it, which is what the walk is there to refuse.
+
+Nothing else in the compositor wakes without input, so the bar is the one
+thing in the process with a timer: a thread samples every second and hands
+the runtime a line. The runtime repaints only when the TEXT changed — which
+for the shipped line is EVERY tick, since the clock shows seconds. What that
+tick costs is worth stating rather than waving at: a repaint re-renders the
+whole shadow frame and compares it against what the device holds, so it is
+about two passes over the framebuffer a second (~16 MB at 1080p), and only
+the DEVICE write is confined to the bar's own band. `RESEND_INTERVAL` counts
+paints, so one tick in 240 writes the whole frame — every four minutes here,
+where before the bar it was however long the session went without input. The
+lever, if that idle cost ever matters, is the clock's resolution rather than
+the tick: at minute resolution the equality check starts refusing 59 of every
+60 repaints. Nothing exempts a blanked VT or a closed lid — the sampler knows
+nothing about either and loops regardless — so this is paid whenever the
+process runs.
+
+A failed paint puts the previous line back, or the scene would hold text the
+screen never showed and the next identical sample would decide nothing had
+changed. That restore is also what makes the retry unconditional, so a
+failure is reported ONCE and again only when a DIFFERENT one arrives or one
+returns after a good paint — an output broken for good would otherwise write
+a line a second forever, burying whatever else the session had to say. A
+paint failure there is reported and not fatal: the bar is the least
+important thing on the screen and must not take the session down with it.
+Reporting is bounded twice over — deduplicated, and capped at four named
+failures between good paints — because a fault that ALTERNATES defeats
+deduplication on its own and is a line a second again.
+
+Deliberately not here: disk free, which needs `statfs(2)` and so an
+`UNSAFE.md` amendment; a local timezone, which needs a TZif parser; and the
+wireless, ethernet and temperature fields of the i3status config this is
+modelled on. All three are additions rather than changes to what is above.
+
 Input is QEMU's PS/2 keyboard and pointer through evdev. The compositor
 supports EV_KEY, EV_REL, and EV_SYN. It has a fixed US key map. Every
 binding is ONE chord on `Super`:
@@ -167,12 +253,17 @@ would keep them until a scene change happened to touch those exact rows. Two
 things bound that: one paint in every 240 is an unconditional full write, and
 a tiling command distrusts the shadow outright, so the repair is both automatic
 and reachable by a user who can see the artifact. That bound is counted in
-paints, not seconds, and the batching above is what lowers the paint rate --
-the two halves of this mechanism pull against each other, so the interval is a
-count of repairs deferred rather than a wall-clock age. A screen nothing changes
-writes nothing and so never spends the interval, which is the same reach the
-renderer had before damage tracking. There is still no page flip, vblank,
-acceleration, DMA-BUF, or tear-free claim.
+paints, not seconds -- but since the status bar, its interval is effectively
+BOTH, and the difference matters to what is written above. The clock changes
+the line every second, so paints now have an unconditional 1 Hz floor that no
+batching lowers: the bar's own rows are overwritten within one second and the
+whole screen within four minutes, on an idle machine nobody is touching. What
+that costs is a recovery console's output. Before the bar, an idle compositor
+wrote nothing and a message fbcon had printed persisted indefinitely; now the
+rows the bar owns are gone at once and the rest within the interval. That is
+the price of a clock on a device with a second writer, and it is stated here
+rather than left to be discovered on the console it affects. There is still no
+page flip, vblank, acceleration, DMA-BUF, or tear-free claim.
 
 Pointer motion is a scene change, and a moving pointer is the highest-rate
 source of them. A reader drains up to 64 evdev records per read and takes one
@@ -686,6 +777,13 @@ The landing must prove:
   cover toggling, column and card fit, and clipping on an undersized output,
   and runtime tests cover its modal pointer — hover withdrawal and the
   button filter separately, since either alone hides the other;
+- the status bar's `/proc` parsing is driven from fixture roots rather than
+  the host's own `/proc`, its calendar is walked day by day across a leap
+  year, its strip is proved to paint only its own rows and to clip on an
+  output shorter than itself, the layout/render/hit-test agreement is
+  checked at several output sizes with the bar's rows proved unclickable,
+  and the runtime is held to repainting only on a changed line and to
+  restoring the previous one when that paint fails;
 - click-to-focus is proved end to end through the runtime — hovering does
   not focus, a press does, a press over the gap does not, a mid-drag press
   does not follow the pointer, a release-and-press in one report focuses

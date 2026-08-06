@@ -312,6 +312,20 @@ impl Runtime {
         Ok(request)
     }
 
+    /// Take a new status line. Repaints only when the TEXT changed, so a
+    /// sampler that ticks faster than the line does costs nothing — and the
+    /// clock's seconds are what make it change at all.
+    pub fn set_status(&mut self, status: String) -> Result<(), String> {
+        let Some(previous) = self.scene.set_status(status) else {
+            return Ok(());
+        };
+        if let Err(error) = self.repaint() {
+            self.scene.set_status(previous);
+            return Err(error);
+        }
+        Ok(())
+    }
+
     pub fn launcher_visible(&self) -> bool {
         self.scene.launcher_visible()
     }
@@ -356,6 +370,11 @@ impl Runtime {
     #[cfg(test)]
     pub fn fail_next_repaint(&mut self) {
         self.framebuffer.fail_next_paint();
+    }
+
+    #[cfg(test)]
+    pub fn clear_repaint_failure(&mut self) {
+        self.framebuffer.clear_paint_failure();
     }
 
     pub fn pointer_frame(
@@ -1524,6 +1543,42 @@ mod tests {
     }
 
     #[test]
+    fn a_status_line_repaints_only_when_its_text_changes() {
+        let path = std::env::temp_dir().join(format!(
+            "td-runtime-status-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let cleanup = Cleanup(path);
+        let framebuffer = Framebuffer::test_file(&cleanup.0, 320, 200, 320 * 4).unwrap();
+        let mut runtime = Runtime::new(framebuffer);
+        runtime.repaint().unwrap();
+        let blank = fs::read(&cleanup.0).unwrap();
+
+        runtime.set_status("LOAD 0.42".to_string()).unwrap();
+        let painted = fs::read(&cleanup.0).unwrap();
+        assert_ne!(painted, blank, "the line was never painted");
+
+        // Same text: the sampler ticks every second and the line only moves
+        // when the clock's seconds do, so an unchanged line owes no paint.
+        // Armed to fail, and it does not, because it never paints.
+        runtime.fail_next_repaint();
+        runtime.set_status("LOAD 0.42".to_string()).unwrap();
+        assert_eq!(fs::read(&cleanup.0).unwrap(), painted);
+        runtime.clear_repaint_failure();
+
+        // Changed text repaints, and a failure surfaces rather than being
+        // swallowed — leaving the scene holding the line it DID show, so the
+        // very next sample of the same text paints it rather than deciding
+        // nothing changed.
+        runtime.fail_next_repaint();
+        assert!(runtime.set_status("LOAD 9.99".to_string()).is_err());
+        assert_eq!(fs::read(&cleanup.0).unwrap(), painted);
+        runtime.set_status("LOAD 9.99".to_string()).unwrap();
+        assert_ne!(fs::read(&cleanup.0).unwrap(), painted);
+    }
+
+    #[test]
     fn the_sheet_cannot_be_raised_behind_the_launcher() {
         let path = std::env::temp_dir().join(format!(
             "td-runtime-help-exclusive-{}-{}",
@@ -2065,13 +2120,18 @@ mod tests {
             let dx = if time % 2 == 0 { 1 } else { -1 };
             runtime.pointer_frame(time, dx, 0, &[]).unwrap();
         }
-        let retained: Vec<RoutedPointerFrame> = events
-            .iter()
-            .filter_map(|delivery| match delivery {
-                KeyboardDelivery::Pointer(frame) => Some(frame),
-                KeyboardDelivery::Event(_) | KeyboardDelivery::DeleteId(_) => None,
-            })
-            .collect();
+        // Bounded rather than `events.iter()`, which blocks until the channel
+        // DISCONNECTS — and the only thing that disconnects it here is the
+        // very overflow being asserted. A regression that stopped the pointer
+        // landing on a surface queued nothing, overflowed nothing, and so
+        // WEDGED `cargo test` instead of failing it. Now the tiling geometry
+        // is composed in two places, that is a failure mode worth bounding.
+        let mut retained: Vec<RoutedPointerFrame> = Vec::new();
+        while let Ok(delivery) = events.recv_timeout(std::time::Duration::from_secs(10)) {
+            if let KeyboardDelivery::Pointer(frame) = delivery {
+                retained.push(frame);
+            }
+        }
         assert_eq!(retained.len(), MAX_PENDING_KEYBOARD_DELIVERIES);
         assert!(runtime.queue_keyboard_delete(5, 9).is_err());
         stop.stop();

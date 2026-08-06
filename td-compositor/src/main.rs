@@ -1,5 +1,6 @@
 #![deny(unsafe_code)]
 
+mod bar;
 mod client;
 mod configure;
 mod conn;
@@ -202,6 +203,11 @@ fn run_compositor(options: RunOptions) -> Result<(), String> {
             terminal: options.terminal_client,
         },
     )?;
+    // Reported, never fatal: a compositor without a clock is worth more
+    // than no compositor.
+    if let Err(error) = bar::start(Arc::clone(&runtime), PathBuf::from("/proc")) {
+        eprintln!("td-compositor: {error}");
+    }
     eprintln!(
         "td-compositor: software output {}x{} stride={} inputs={inputs}",
         geometry.0, geometry.1, geometry.2
@@ -240,8 +246,11 @@ fn selftest() -> Result<(), String> {
             format: scene::SHM_XRGB8888,
         },
     )?;
-    let mut frame = vec![0; 4 * 4 * 4];
-    scene.render(&mut frame, 4, 4, 4 * 4);
+    // Tall enough to have a tiling area beneath the status bar: the bar owns
+    // the top rows, so a frame the size of one is all bar and no tile.
+    let height = 4 + bar::BAR_HEIGHT;
+    let mut frame = vec![0; 4 * height * 4];
+    scene.render(&mut frame, 4, height, 4 * 4);
     if !frame.as_chunks::<4>().0.contains(&[1, 2, 3, 0]) {
         return Err("renderer selftest did not copy its surface".into());
     }
@@ -467,6 +476,7 @@ mod confinement {
     const SHARED_SHA256: &str = include_str!("../../engine/src/sha256.rs");
     const SYS: &str = include_str!("sys.rs");
     const OTHER: &[(&str, &str)] = &[
+        ("bar.rs", include_str!("bar.rs")),
         ("client.rs", include_str!("client.rs")),
         ("configure.rs", include_str!("configure.rs")),
         ("conn.rs", include_str!("conn.rs")),
@@ -878,6 +888,15 @@ fn syscall3(number: usize, a1: usize, a2: usize, a3: usize) -> isize {
             2
         );
         assert!(production_pty.contains("let observed = sys::window_size(&self.master)?;"));
+    }
+
+    /// The binary's own `selftest` subcommand, which is what the td-ui-test
+    /// RECIPE runs — and which nothing in `cargo test` reached before. A
+    /// geometry change that made it fail was invisible here until the recipe
+    /// gate said so, twenty minutes later.
+    #[test]
+    fn the_selftest_subcommand_passes() {
+        super::selftest().unwrap();
     }
 
     #[test]

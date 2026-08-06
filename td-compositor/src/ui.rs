@@ -574,9 +574,26 @@ fn glyph(byte: u8) -> [u8; GLYPH_HEIGHT] {
         b'+' => [0, 4, 4, 31, 4, 4, 0],
         b'/' => [1, 2, 2, 4, 8, 8, 16],
         b'_' => [0, 0, 0, 0, 0, 0, 31],
+        b'.' => [0, 0, 0, 0, 0, 0, 4],
+        b'?' => [14, 17, 1, 2, 4, 0, 4],
         b' ' => [0, 0, 0, 0, 0, 0, 0],
-        _ => [14, 17, 1, 2, 4, 0, 4],
+        _ => MISSING,
     }
+}
+
+/// What an unmapped byte draws. A BOX rather than the question mark this used
+/// to be, because `?` is a character td's own UI spells on purpose — it is how
+/// the status bar says a reading could not be taken — and a font gap that drew
+/// the same thing made a healthy `LOAD 0.42` render as `LOAD 0?42`, which is
+/// indistinguishable from a failure.
+const MISSING: [u8; GLYPH_HEIGHT] = [31, 17, 17, 17, 17, 17, 31];
+
+/// Whether the font has a glyph of its own for this byte. Callers with a fixed
+/// vocabulary — the status bar's line, the help sheet's rows — assert over it,
+/// since nothing the compiler sees connects a string literal to the font.
+#[cfg(test)]
+pub(crate) fn is_mapped(byte: u8) -> bool {
+    glyph(byte) != MISSING
 }
 
 #[cfg(test)]
@@ -776,10 +793,17 @@ mod tests {
 
     #[test]
     fn font_covers_the_ui_vocabulary_and_unknown_falls_back() {
-        for byte in b"ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 :-+/_?" {
-            assert_eq!(glyph(*byte).len(), GLYPH_HEIGHT);
+        // `is_mapped`, not a length. `glyph` returns `[u8; GLYPH_HEIGHT]`, so
+        // asserting its `len()` was a tautology wearing this test's name —
+        // which is how the missing period got past it.
+        for byte in b"ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 :-+/_?." {
+            assert!(is_mapped(*byte), "{:?} has no glyph", *byte as char);
         }
-        assert_eq!(glyph(b'?'), glyph(b'@'));
+        // The fallback is its own shape and `?` is NOT it. This line used to
+        // assert the opposite — pinning the collision that made a healthy
+        // `LOAD 0.42` draw as `LOAD 0?42`, indistinguishable from `LOAD ?`.
+        assert!(!is_mapped(b'@'));
+        assert_ne!(glyph(b'?'), MISSING);
         assert_eq!(key_label(30), Some("A"));
         assert_eq!(key_label(108), Some("DOWN"));
         assert_eq!(key_label(999), None);

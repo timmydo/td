@@ -187,6 +187,13 @@ impl Framebuffer {
         self.fail_next_paint = true;
     }
 
+    /// Disarm one that was never consumed, so a test can prove a path took
+    /// NO paint rather than only that it survived one.
+    #[cfg(test)]
+    pub fn clear_paint_failure(&mut self) {
+        self.fail_next_paint = false;
+    }
+
     /// Fail the next write after the shadow copy has been marked untrustworthy.
     #[cfg(test)]
     pub fn fail_next_write(&mut self) {
