@@ -225,6 +225,29 @@ fn escaped_at(chars: &[char], i: usize) -> Option<(char, usize)> {
     }
 }
 
+/// The POSIX character-class names `named_matches` serves. Exposed because the
+/// regex engine must REFUSE an unknown one at compile time where a glob merely
+/// never matches it: glibc reports `[[:bogus:]]` as a bad pattern, and a
+/// silently-empty class is worse than a diagnostic in the NEGATED case, where
+/// it matches everything instead of nothing.
+pub fn is_class_name(name: &str) -> bool {
+    matches!(
+        name,
+        "alpha"
+            | "digit"
+            | "alnum"
+            | "upper"
+            | "lower"
+            | "space"
+            | "blank"
+            | "punct"
+            | "print"
+            | "graph"
+            | "cntrl"
+            | "xdigit"
+    )
+}
+
 fn named_matches(name: &str, c: char) -> bool {
     match name {
         "alpha" => c.is_alphabetic(),
@@ -243,6 +266,18 @@ fn named_matches(name: &str, c: char) -> bool {
     }
 }
 
+/// Membership in a bracket expression. Shared with the regex engine so
+/// `[[:alpha:]]`, ranges and negation mean ONE thing across the shell rather
+/// than two implementations that drift.
+pub fn class_matches(negated: bool, items: &[ClassItem], c: char) -> bool {
+    let hit = items.iter().any(|item| match item {
+        ClassItem::Ch(x) => *x == c,
+        ClassItem::Range(lo, hi) => *lo <= c && c <= *hi,
+        ClassItem::Named(n) => named_matches(n, c),
+    });
+    hit != negated
+}
+
 fn unit_matches(unit: &Unit, c: char) -> bool {
     match unit {
         Unit::Lit(l) => *l == c,
@@ -250,14 +285,7 @@ fn unit_matches(unit: &Unit, c: char) -> bool {
         // Handled by the caller; a `*` never consumes exactly one character.
         Unit::Star => false,
         Unit::Never => false,
-        Unit::Class { negated, items } => {
-            let hit = items.iter().any(|item| match item {
-                ClassItem::Ch(x) => *x == c,
-                ClassItem::Range(lo, hi) => *lo <= c && c <= *hi,
-                ClassItem::Named(n) => named_matches(n, c),
-            });
-            hit != *negated
-        }
+        Unit::Class { negated, items } => class_matches(*negated, items, c),
     }
 }
 

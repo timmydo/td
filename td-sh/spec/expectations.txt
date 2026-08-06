@@ -756,9 +756,7 @@ xfail dbracket.test.sh::Array coerces to string (shopt -s strict_array to disall
 xfail dbracket.test.sh::User array compared to "$@" (broken unless shopt -s strict_array)
 xfail dbracket.test.sh::[[ ]] with redirect
 xfail dbracket.test.sh::[[ over multiple lines is OK
-xfail dbracket.test.sh::[[ regex matching
 xfail dbracket.test.sh::negative numbers - zero, decimal, octal, hex, base N
-xfail dbracket.test.sh::tilde expansion with =~ (confusing)
 xfail divergence.test.sh::builtin cat crashes a subshell (#2530)
 xfail dparen.test.sh::(( ))
 xfail dparen.test.sh::(( )) in if statement
@@ -845,7 +843,6 @@ xfail extglob-match.test.sh::extglob empty pattern
 xfail extglob-match.test.sh::extglob empty string
 xfail extglob-match.test.sh::extglob in variable
 xfail extglob-match.test.sh::extglob inside arg word
-xfail extglob-match.test.sh::extglob is not detected in regex!
 xfail extglob-match.test.sh::match is anchored
 xfail extglob-match.test.sh::nested @()
 xfail extglob-match.test.sh::nested @() with quotes and vars
@@ -1132,36 +1129,13 @@ xfail redirect.test.sh::echo foo >&N where N is first unused fd
 xfail redirect.test.sh::xtrace not affected by redirects
 xfail regex.test.sh::BASH_REMATCH
 xfail regex.test.sh::Bug: Nix idiom with closing ) next to pattern
-xfail regex.test.sh::Double quoting pat variable -- again bash doesn't like it.
 xfail regex.test.sh::Escaped {
 xfail regex.test.sh::Escaped { stored in variable first
-xfail regex.test.sh::Failed match
 xfail regex.test.sh::Fatal error inside [[ =~ ]]
-xfail regex.test.sh::Fix single quotes by storing in variable
-xfail regex.test.sh::Fix single quotes by storing in variable ##2
-xfail regex.test.sh::Match is unanchored at both ends
-xfail regex.test.sh::Mixing quoted and unquoted parts
 xfail regex.test.sh::Multiple adjacent () groups
-xfail regex.test.sh::Operator chars ; & but not |
-xfail regex.test.sh::Operators and space lose meaning inside ()
-xfail regex.test.sh::Quoted { and +
 xfail regex.test.sh::Quotes '' "" $'' $"" in pattern
-xfail regex.test.sh::Regex quoted with \ -- preferred in bash
-xfail regex.test.sh::Regex quoted with double quotes
-xfail regex.test.sh::Regex quoted with single quotes
-xfail regex.test.sh::Regex to match literal brackets []
-xfail regex.test.sh::Regex to match literals . ^ $ etc.
-xfail regex.test.sh::Regex with |
-xfail regex.test.sh::Unicode in pattern
-xfail regex.test.sh::c|a unquoted
 xfail regex.test.sh::make a lisp example
-xfail regex.test.sh::pattern $f(x)  -- regression
-xfail regex.test.sh::pattern @f(x)
-xfail regex.test.sh::pattern a=(1)
-xfail regex.test.sh::regex with ?
 xfail regex.test.sh::regex with unprintable characters
-xfail regex.test.sh::unquoted (a  b) as pattern, (a  b|c)
-xfail regex.test.sh::unquoted [a  b] as pattern, [a  b|c]
 xfail serialize.test.sh::set
 xfail serialize.test.sh::xtrace
 xfail sh-func.test.sh::Subshell function

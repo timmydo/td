@@ -1251,6 +1251,21 @@ fn eval_cond(sh: &mut Shell, expr: &CondExpr) -> R<Result<bool, CondError>> {
                     let hit = pattern::matches(&units, &left);
                     Ok(if matches!(op, CondOp::Match) { hit } else { !hit })
                 }
+                // A SEARCH, not a whole-string match, so `[[ abc =~ b ]]` holds.
+                // A regex that does not compile is FATAL rather than false:
+                // that is the corpus's graded answer (bash's carry-on is
+                // recorded there as the BUG), and it is the right one -- a
+                // malformed regex is a mistake in the script, like a syntax
+                // error, not a condition to branch on. The distinction matters
+                // because the alternative silently answers "no match" for
+                // every subject, which is indistinguishable from a real miss.
+                CondOp::Regex => {
+                    let chars = expand::expand_pattern(sh, rhs)?;
+                    match crate::regex::compile(&chars) {
+                        Ok(re) => Ok(re.is_match(&left)),
+                        Err(msg) => return Err(sh.fatal(&format!("[[: {msg}"), 2)),
+                    }
+                }
                 CondOp::Before => Ok(left < expand::expand_single(sh, rhs)?),
                 CondOp::After => Ok(left > expand::expand_single(sh, rhs)?),
                 // ARITHMETIC on both sides, not integer parsing: `[[ 1+1 -eq 2 ]]`
@@ -2247,6 +2262,98 @@ mod tests {
         // The conditional's own status is bash's 1, not the 2 a malformed
         // EXPRESSION gets.
         assert_eq!(run("[[ 1+ -eq 2 ]]").0, 1);
+    }
+
+    /// `=~` searches rather than matching whole, its right-hand side is a
+    /// regex where `==`'s is a glob, and quoting still decides per character.
+    #[test]
+    fn a_conditional_searches_with_a_regular_expression() {
+        assert_eq!(run("[[ abc =~ b ]]").0, 0, "a search, not a whole-string match");
+        assert_eq!(run("[[ abc =~ ^b ]]").0, 1);
+        assert_eq!(run("[[ abc =~ ^a ]]").0, 0);
+        assert_eq!(run("[[ abc =~ c$ ]]").0, 0);
+        // A quoted metacharacter is a literal, as it is for `==`.
+        assert_eq!(run("[[ abc =~ \"a.c\" ]]").0, 1);
+        assert_eq!(run("[[ a.c =~ \"a.c\" ]]").0, 0);
+        // ...and an UNQUOTED expansion is a regex, which is the documented idiom.
+        assert_eq!(run("r='a.c'; [[ abc =~ $r ]]").0, 0);
+        assert_eq!(run("r='a.c'; [[ abc =~ \"$r\" ]]").0, 1);
+        // The `==` operator is unaffected: its RHS is still a GLOB, and the
+        // two readings of `a*` have to be told apart by a case where they
+        // DISAGREE -- a glob `a*` anchors at the start and must match the whole
+        // subject, where the regex one matches an empty run anywhere.
+        assert_eq!(run("[[ xbc == a* ]]").0, 1, "glob: no match");
+        assert_eq!(run("[[ xbc =~ a* ]]").0, 0, "regex: empty run matches");
+        assert_eq!(run("[[ ab == a* ]]").0, 0);
+        assert_eq!(run("[[ zab =~ ^a* ]]").0, 0, "`a*` matches the empty prefix");
+    }
+
+    /// A regex that does not COMPILE ends the shell, where a false comparison
+    /// does not. That is the corpus's graded answer and bash's recorded BUG:
+    /// carrying on would answer "no match" for every subject, which is
+    /// indistinguishable from a real miss.
+    #[test]
+    fn an_uncompilable_regex_is_fatal() {
+        let (st, out, err) = run("[[ abc =~ a[ ]]; echo after");
+        assert_eq!(out, "", "the shell kept going after a bad regex");
+        assert_eq!(st, 2);
+        assert!(err.contains("[["), "no diagnostic: {err:?}");
+        assert_eq!(run("[[ { =~ { ]]; echo after").1, "");
+    }
+
+    /// The one place the shell's punctuation and a regex's overlap. Inside a
+    /// `=~` right-hand side `|` is alternation and a balanced `( )` group is
+    /// part of the expression, blanks and all -- and NOWHERE else does that
+    /// hold, which is the half worth testing.
+    #[test]
+    fn the_regex_operand_lexes_as_one_word() {
+        assert_eq!(run("[[ abc =~ a|z ]]").0, 0);
+        assert_eq!(run("[[ abc =~ (a|b) ]]").0, 0);
+        assert_eq!(run("[[ ab =~ (a)(b) ]]").0, 0);
+        assert_eq!(run("[[ 'a b' =~ (a b) ]]").0, 0, "a group absorbs a blank");
+        assert_eq!(run("[[ abc =~ (a|(b|c)) ]]").0, 0);
+        // An unbalanced group is an error, not a swallowed rest-of-script.
+        assert_eq!(run("[[ abc =~ a(b ]]").0, 2);
+        // `&&` is still the connective, so the left side really is tested.
+        assert_eq!(run("[[ zzz =~ a&&b ]]").0, 1);
+        assert_eq!(run("[[ abc =~ a&&b ]]").0, 0);
+        // Outside the brackets nothing changed: `=~` is an ordinary word and
+        // `|` is still a pipe.
+        assert_eq!(run("echo =~").1, "=~\n");
+        assert_eq!(run("echo ab | { read x; echo [$x]; }").1, "[ab]\n");
+    }
+
+    /// The regex lexer mode must not survive the command it was armed in. The
+    /// lexer cannot tell `[[` in COMMAND POSITION from `[[` as an argument --
+    /// that is the parser's job -- so `echo [[` raises a bracket count nothing
+    /// will ever close, and before this was bounded a later `=~` lexed its
+    /// operand as a regex and SWALLOWED A PIPE: `echo [[; echo a =~ b|tr a-z
+    /// A-Z` printed the pipeline as text.
+    #[test]
+    fn the_regex_lexer_mode_does_not_outlive_its_command() {
+        // `;`, `|` and a newline each end it. The sink is a builtin group so
+        // the pipeline needs no external command: what it prints is what
+        // reached the pipe, which is the whole question.
+        let sink = "{ read l; echo \"got:$l\"; }";
+        assert_eq!(run(&format!("echo [[; echo a =~ b|{sink}")).1, "[[\ngot:a =~ b\n");
+        assert_eq!(run(&format!("echo [[ |{sink}; echo a =~ b|{sink}")).1, "got:[[\ngot:a =~ b\n");
+        assert_eq!(run(&format!("echo [[\necho a =~ b|{sink}")).1, "[[\ngot:a =~ b\n");
+        // ...and the connectives do NOT, since a conditional continues past
+        // them: a regex after one still lexes as a regex.
+        assert_eq!(run("[[ abc =~ a|z &&\nabc =~ b|y ]]").0, 0);
+        // A `[[` that is an ARGUMENT arms nothing, even in the same command --
+        // there is no `;` here to end anything, so only its position saves it.
+        let sink = "{ read l; echo \"got:$l\"; }";
+        assert_eq!(run(&format!("echo [[ =~ a|{sink}")).1, "got:[[ =~ a\n");
+        // ...and the word `=~` as a literal OPERAND does not arm it either,
+        // which needs an operand to actually be there to scan.
+        assert_eq!(run("[[ =~ && x ]]").0, 0);
+        // Every position a conditional can legitimately start in still works.
+        assert_eq!(run("if [[ abc =~ a|z ]]; then echo y; fi").1, "y\n");
+        assert_eq!(run("while [[ abc =~ a|z ]]; do echo y; break; done").1, "y\n");
+        assert_eq!(run("until [[ abc =~ q|z ]]; do echo y; break; done").1, "y\n");
+        assert_eq!(run("! [[ abc =~ q|z ]]").0, 0);
+        assert_eq!(run("{ [[ abc =~ a|z ]]; }").0, 0);
     }
 
     /// A newline continues the expression exactly where a TERM is expected and

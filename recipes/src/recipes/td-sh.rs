@@ -57,6 +57,7 @@ const MODULES: &[(&str, &str)] = &[
     ("pattern", include_str!("../../../td-sh/src/pattern.rs")),
     ("process", include_str!("../../../td-sh/src/process.rs")),
     ("random", include_str!("../../../td-sh/src/random.rs")),
+    ("regex", include_str!("../../../td-sh/src/regex.rs")),
     ("sys", include_str!("../../../td-sh/src/sys.rs")),
     ("term", include_str!("../../../td-sh/src/term.rs")),
 ];

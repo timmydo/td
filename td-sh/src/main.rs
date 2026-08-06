@@ -41,6 +41,7 @@ mod parser;
 mod pattern;
 mod process;
 mod random;
+mod regex;
 mod sys;
 mod term;
 
@@ -521,6 +522,7 @@ mod confinement {
         ("pattern.rs", include_str!("pattern.rs")),
         ("process.rs", include_str!("process.rs")),
         ("random.rs", include_str!("random.rs")),
+        ("regex.rs", include_str!("regex.rs")),
         ("sys.rs", include_str!("sys.rs")),
         ("term.rs", include_str!("term.rs")),
     ];

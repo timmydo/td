@@ -818,6 +818,7 @@ impl Units {
         Some(match w {
             "==" | "=" => CondOp::Match,
             "!=" => CondOp::NoMatch,
+            "=~" => CondOp::Regex,
             "-eq" => CondOp::Arith(ArithCmp::Eq),
             "-ne" => CondOp::Arith(ArithCmp::Ne),
             "-lt" => CondOp::Arith(ArithCmp::Lt),

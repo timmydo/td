@@ -274,6 +274,11 @@ impl Scan {
                 pending: Vec::new(),
                 awaiting: None,
                 depth: 0,
+                cond_depth: 0,
+                regex_next: false,
+                cond_continues: false,
+                cmd_position: true,
+                regex_word: false,
             },
             sealed: false,
         }
@@ -428,6 +433,11 @@ fn lexer_over(text: &str, depth: u32) -> Syn<Lexer> {
         pending: Vec::new(),
         awaiting: None,
         depth,
+        cond_depth: 0,
+        regex_next: false,
+        cond_continues: false,
+        cmd_position: true,
+        regex_word: false,
     })
 }
 
@@ -452,6 +462,28 @@ struct Lexer {
     awaiting: Option<(usize, bool)>,
     /// Expansion-nesting depth of this (re-)lexing pass; see `MAX_EXPANSION_DEPTH`.
     depth: u32,
+    /// Open `[[` brackets. The lexer otherwise knows nothing about the
+    /// conditional command -- `[[` and `]]` are plain words to it -- and it is
+    /// tracked ONLY so that `=~` is recognised where it is an operator and
+    /// nowhere else: `echo =~ a|b` must keep its pipe.
+    cond_depth: u32,
+    /// The previous token was a `=~` inside `[[ ]]`, so the NEXT word is a
+    /// regular expression and lexes by `regex_word`'s rule.
+    regex_next: bool,
+    /// The last token was one a `[[ ]]` may be CONTINUED past a newline by, so
+    /// a newline here does not end the command. Exactly the five positions
+    /// `cond_term` accepts one in.
+    cond_continues: bool,
+    /// A command word could start at the cursor. The lexer does not otherwise
+    /// resolve reserved words -- they are positional, which is the parser's
+    /// business -- and this is the crudest form of that question, kept only so
+    /// that `[[` is counted where it can be the conditional and not where it
+    /// is an argument. `echo [[ =~ a|cat` is the case that needs it.
+    cmd_position: bool,
+    /// Set for exactly the one `scan_word` call that reads a `=~` right-hand
+    /// side. bash needs a mode here too, and the corpus says so in as many
+    /// words (`regex.test.sh`: "different lexer mode required").
+    regex_word: bool,
 }
 
 impl Lexer {
@@ -486,6 +518,12 @@ impl Lexer {
             if self.owed_newline {
                 self.read_heredoc_bodies()?;
                 self.owed_newline = false;
+                // A newline ends the command unless the conditional was left
+                // open at one of the five positions bash continues past.
+                if !self.cond_continues {
+                    self.end_cond_command();
+                }
+                self.cmd_position = true;
                 return Ok(Tok::Newline);
             }
             self.skip_blanks();
@@ -511,8 +549,35 @@ impl Lexer {
                 self.ended_in_comment = self.sc.peek().is_none();
                 continue;
             }
+            // The `=~` right-hand side is read as ONE word before `|` and `(`
+            // can become operators, which is the only place the shell's own
+            // punctuation and a regex's overlap. Everything else in `[[ ]]`
+            // still lexes exactly as a command line does.
+            // ...but only where an operand can actually begin. `[[ =~ && x ]]`
+            // is a conditional whose first operand is the literal word `=~`,
+            // and arming the mode there scanned an EMPTY word and failed the
+            // parse where bash answers 0.
+            if self.regex_next && !matches!(c, '&' | ';' | '<' | '>' | ')') {
+                self.regex_next = false;
+                self.regex_word = true;
+                let word = self.scan_word(true);
+                self.regex_word = false;
+                return Ok(Tok::Word(word?));
+            }
+            self.regex_next = false;
             if matches!(c, '|' | '&' | ';' | '<' | '>' | '(' | ')') {
-                return Ok(Tok::Op(self.scan_op()?));
+                let op = self.scan_op()?;
+                match op {
+                    // `&&`, `||` and `(` are the conditional's own connectives
+                    // and grouping, so they continue it rather than ending it.
+                    Op::AndIf | Op::OrIf | Op::LParen => self.cond_continues = true,
+                    Op::Semi | Op::Amp | Op::Pipe => self.end_cond_command(),
+                    _ => self.cond_continues = false,
+                }
+                // A redirection is followed by its target, which is not a
+                // command; everything else here separates or groups commands.
+                self.cmd_position = !op.is_redirect();
+                return Ok(Tok::Op(op));
             }
             let word = self.scan_word(true)?;
             if let Some((id, strip_tabs)) = self.awaiting.take() {
@@ -539,8 +604,58 @@ impl Lexer {
                     }
                 }
             }
+            self.track_cond(&word);
             return Ok(Tok::Word(word));
         }
+    }
+
+    /// The only conditional-command state the lexer keeps, and the whole of it:
+    /// where the brackets are open, so that `=~` arms `regex_next` there and a
+    /// bare `=~` on a command line does not.
+    fn track_cond(&mut self, word: &Word) {
+        match word.plain() {
+            // Deliberately NOT `cond_continues`: `[[` is the one word that
+            // RAISES the count, so letting it also protect that count across a
+            // newline is what keeps a stray `echo [[` alive into the next line.
+            // The cost is a newline written directly after `[[`, which stops
+            // arming the regex mode -- and that costs a glued `|` in a regex in
+            // that one shape, where the alternative silently ate a pipe.
+            Some("[[") if self.cmd_position => {
+                self.cond_depth = self.cond_depth.saturating_add(1)
+            }
+            Some("]]") => {
+                self.cond_depth = self.cond_depth.saturating_sub(1);
+                self.cond_continues = false;
+            }
+            Some("=~") if self.cond_depth > 0 => {
+                self.regex_next = true;
+                self.cond_continues = false;
+            }
+            Some("!") => self.cond_continues = true,
+            _ => self.cond_continues = false,
+        }
+        // Only the words a command can FOLLOW keep the position open. The list
+        // is the reserved words that introduce one; anything else is a command
+        // name or an argument, and what comes after it is an argument.
+        self.cmd_position = matches!(
+            word.plain(),
+            Some("if" | "then" | "else" | "elif" | "do" | "while" | "until" | "{" | "!")
+        );
+    }
+
+    /// Forget any open bracket, because the command it would have belonged to
+    /// has ended. The lexer cannot tell `[[` in COMMAND POSITION from `[[` as
+    /// an argument -- that is the parser's job -- so `echo [[` counts one that
+    /// no `]]` will ever close, and a later `=~` would then lex its operand as
+    /// a regex and swallow a pipe. Bounding the count to a single command is
+    /// what makes that a non-event: measured, `echo [[; echo a =~ b|tr a-z A-Z`
+    /// piped correctly again. The tokens below cannot occur inside `[[ ]]` at
+    /// all; `<` and `>` deliberately are NOT among them, being its string
+    /// comparisons.
+    fn end_cond_command(&mut self) {
+        self.cond_depth = 0;
+        self.regex_next = false;
+        self.cond_continues = false;
     }
 
     fn skip_blanks(&mut self) {
@@ -715,7 +830,39 @@ impl Lexer {
         // Distinguishes a word ENDED by a delimiter from one that merely ran out
         // of fed text, which unsealed means the rest is still coming.
         let mut ran_out = true;
+        // Open `(` groups, in a `=~` right-hand side only. bash absorbs a
+        // BALANCED group whole -- `[[ "a b" =~ (a b) ]]` holds, space and all --
+        // and refuses an unbalanced one, both measured.
+        let mut group = 0u32;
         while let Some(c) = self.sc.peek() {
+            if self.regex_word {
+                // `|` is alternation here, never a pipe. `(`/`)` nest, and
+                // inside them a blank is part of the expression rather than the
+                // end of the word.
+                if c == '|' || c == '(' || (c == ')' && group > 0) {
+                    if c == '(' {
+                        group = group.saturating_add(1);
+                    } else if c == ')' {
+                        group -= 1;
+                    }
+                    self.sc.bump();
+                    buf.push_lit(c);
+                    continue;
+                }
+                // INSIDE a group every shell operator loses its meaning, which
+                // is what the corpus case of that name asks for: bash reads
+                // `[[ '< >' =~ (< >) ]]` as one regex. Only the characters that
+                // would otherwise END the word are listed -- quoting and
+                // expansion still go through the ordinary path below, so
+                // `( $v )` expands.
+                if group > 0 && matches!(c, ' ' | '\t' | ';' | '&' | '<' | '>') {
+                    self.sc.bump();
+                    buf.push_lit(c);
+                    continue;
+                }
+                // A newline ends the word even mid-group, so an unbalanced `(`
+                // reports an unmatched paren rather than swallowing the script.
+            }
             if stop_at_delims && is_word_end(c) {
                 ran_out = false;
                 break;
@@ -1118,6 +1265,11 @@ fn heredoc_body_word(body: &str) -> Syn<Word> {
         pending: Vec::new(),
         awaiting: None,
         depth: 0,
+        cond_depth: 0,
+        regex_next: false,
+        cond_continues: false,
+        cmd_position: true,
+        regex_word: false,
     };
     let mut buf = WordBuf::default();
     buf.open_quoted();

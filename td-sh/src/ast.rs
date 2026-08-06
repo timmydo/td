@@ -232,6 +232,11 @@ pub enum CondOp {
     /// `[[ x -eq 5 ]]` are both true, where `test x -eq 5` is an error. That is
     /// why these do not defer to `test` the way the file operators below do.
     Arith(ArithCmp),
+    /// `=~`: the right side is a POSIX extended regular expression, SEARCHED
+    /// for rather than matched whole, and quoting makes a part of it literal
+    /// exactly as it does for `Match` above -- which is why this too keeps a
+    /// `Word` rather than a string.
+    Regex,
     /// `-ef`, `-nt`, `-ot`: file comparisons, which ARE `test`'s, spelled here
     /// rather than duplicated.
     File(&'static str),
