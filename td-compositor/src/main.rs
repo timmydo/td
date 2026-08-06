@@ -205,7 +205,11 @@ fn run_compositor(options: RunOptions) -> Result<(), String> {
     )?;
     // Reported, never fatal: a compositor without a clock is worth more
     // than no compositor.
-    if let Err(error) = bar::start(Arc::clone(&runtime), PathBuf::from("/proc")) {
+    if let Err(error) = bar::start(
+        Arc::clone(&runtime),
+        PathBuf::from("/proc"),
+        PathBuf::from("/sys"),
+    ) {
         eprintln!("td-compositor: {error}");
     }
     eprintln!(

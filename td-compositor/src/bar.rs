@@ -16,22 +16,50 @@ const SEPARATOR: &str = "  ";
 /// rows rather than the screen.
 const TICK: Duration = Duration::from_secs(1);
 
+/// The network interface and what is known about it. Not `Copy`, which is why
+/// `Readings` no longer is: the interface's NAME is read from a directory and
+/// so is owned rather than borrowed.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct Link {
+    pub name: Option<String>,
+    pub up: Option<bool>,
+    pub address: Address,
+}
+
+/// What is known about the interface's address, which is three states and not
+/// two. `/proc/net/fib_trie` does not say which INTERFACE a local address
+/// belongs to, so "there is no address" and "there is one but it may not be
+/// this interface's" are different claims — and printing the second as the
+/// first tells an operator their link has no lease while the machine is
+/// reachable.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub enum Address {
+    /// One local address, and one interface it could belong to.
+    Known(String),
+    /// The routing table has no non-loopback local address at all.
+    Absent,
+    /// There is an address, but nothing readable here attributes it.
+    #[default]
+    Unattributable,
+}
+
 /// Everything the bar shows, sampled together so one line cannot mix two
 /// moments. Missing readings stay `None` rather than defaulting to zero: a
 /// load of 0.00 and a load nobody could read are different claims.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct Readings {
     pub load_centi: Option<u64>,
     pub used_kb: Option<u64>,
     pub total_kb: Option<u64>,
     pub uptime_secs: Option<u64>,
     pub epoch_secs: Option<u64>,
+    pub link: Link,
 }
 
 impl Readings {
-    /// Read from a `/proc` root — a parameter so the tests can hand it a
-    /// fixture, since the host's own `/proc` is neither fixed nor reproducible.
-    pub fn sample(proc_root: &Path, epoch_secs: Option<u64>) -> Self {
+    /// Read from a `/proc` and a `/sys` root — parameters so the tests can hand
+    /// them fixtures, since the host's own are neither fixed nor reproducible.
+    pub fn sample(proc_root: &Path, sys_root: &Path, epoch_secs: Option<u64>) -> Self {
         let loadavg = std::fs::read_to_string(proc_root.join("loadavg")).ok();
         let meminfo = std::fs::read_to_string(proc_root.join("meminfo")).ok();
         let uptime = std::fs::read_to_string(proc_root.join("uptime")).ok();
@@ -51,7 +79,127 @@ impl Readings {
             total_kb,
             uptime_secs: uptime.as_deref().and_then(parse_uptime_secs),
             epoch_secs,
+            link: sample_link(proc_root, sys_root),
         }
+    }
+}
+
+/// The interface, whether it is up, and its address. Each is answered on its
+/// own: a name with no operstate is still worth showing, and an address with
+/// no name is not a thing this can produce.
+fn sample_link(proc_root: &Path, sys_root: &Path) -> Link {
+    let names = interface_names(sys_root);
+    let name = choose_interface(&names);
+    let up = name.as_deref().and_then(|name| {
+        // `operstate` over `carrier`: reading `carrier` on a down interface is
+        // an EINVAL rather than a `0`, so the two failure modes would be the
+        // same answer here.
+        let text = std::fs::read_to_string(sys_root.join("class/net").join(name).join("operstate"))
+            .ok()?;
+        operational(&text)
+    });
+    // Only ONE interface makes the address attributable. The dump says which
+    // addresses exist and not whose they are, so with a second interface
+    // present `NET eth0 <eth1's address>` is a well-formed line that is simply
+    // wrong — and a lease on the interface that is NOT named is exactly the
+    // case a two-NIC machine hits. Not read at all when nothing was named,
+    // since the kernel walks the trie under RCU on every read of that file.
+    let address = match name {
+        Some(_) if names.len() == 1 => std::fs::read_to_string(proc_root.join("net/fib_trie"))
+            .ok()
+            .as_deref()
+            .map_or(Address::Unattributable, local_ipv4),
+        Some(_) => Address::Unattributable,
+        None => Address::Unattributable,
+    };
+    Link { name, up, address }
+}
+
+/// `operstate`'s value, and only the two of them that MEAN something. A driver
+/// with no carrier reporting writes `unknown`, which is not evidence of a down
+/// link — reading it as one would put DOWN beside a working interface, and
+/// suppress the address with it. `dormant`, `testing` and `notpresent` are
+/// equally not an answer to the question the bar is asking.
+fn operational(text: &str) -> Option<bool> {
+    match text.trim() {
+        "up" => Some(true),
+        "down" | "lowerlayerdown" => Some(false),
+        _ => None,
+    }
+}
+
+/// Every interface but loopback, sorted. Non-UTF-8 names are kept LOSSILY
+/// rather than dropped, which is what `td-netd` does — dropping one here would
+/// be the two crates sorting different lists and naming different interfaces.
+fn interface_names(sys_root: &Path) -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir(sys_root.join("class/net")) else {
+        return Vec::new();
+    };
+    let mut names: Vec<String> = entries
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| name != "lo")
+        .collect();
+    names.sort();
+    names
+}
+
+/// The interface to report on, by the SAME rule `td-netd` configures one with:
+/// prefer a name beginning with `e`, else the first. A second copy of a
+/// convention rather than a shared one — the two crates share no library — so
+/// a change there is a bar naming an interface nothing configured.
+fn choose_interface(names: &[String]) -> Option<String> {
+    let ethernet = names.iter().position(|name| name.starts_with('e'));
+    match ethernet {
+        Some(index) => names.get(index).cloned(),
+        None => names.first().cloned(),
+    }
+}
+
+/// This machine's own IPv4, out of `/proc/net/fib_trie`. Nothing td writes
+/// records it — `td-netd` prints the lease and drops it, and `/etc/hosts` gets
+/// loopback only — so the kernel's own routing dump is the one file that has
+/// it without a `SIOCGIFADDR` ioctl, which would be a new syscall on a surface
+/// that has none.
+///
+/// A local address is a `/32 host LOCAL` leaf, whose value is on the `|--` line
+/// above it. Loopback is skipped, and an ambiguous answer — more than one
+/// non-loopback local address — is refused rather than guessed at, since the
+/// table does not say which interface a leaf belongs to.
+fn local_ipv4(text: &str) -> Address {
+    let mut previous: Option<&str> = None;
+    let mut found: Option<&str> = None;
+    for line in text.lines() {
+        let trimmed = line.trim();
+        // Taken at the TOP of every iteration, so an address is only ever
+        // claimed by the line DIRECTLY below it. Carrying it further makes a
+        // `/24 link UNICAST` in between invisible, and the leaf below that
+        // inherits an address which is not its own.
+        let above = previous.take();
+        if let Some(address) = trimmed.strip_prefix("|-- ") {
+            previous = Some(address.trim());
+            continue;
+        }
+        if !trimmed.starts_with("/32 host LOCAL") {
+            continue;
+        }
+        let Some(address) = above else {
+            continue;
+        };
+        if address.starts_with("127.") {
+            continue;
+        }
+        match found {
+            // The same address appears in both the `Main` and `Local` tables,
+            // which is agreement rather than ambiguity.
+            Some(seen) if seen == address => {}
+            Some(_) => return Address::Unattributable,
+            None => found = Some(address),
+        }
+    }
+    match found {
+        Some(address) => Address::Known(address.to_string()),
+        None => Address::Absent,
     }
 }
 
@@ -188,7 +336,30 @@ pub fn line(readings: &Readings) -> String {
     let clock = readings
         .epoch_secs
         .map_or_else(|| "CLOCK ?".to_string(), utc_stamp);
-    [load, memory, uptime, clock].join(SEPARATOR)
+    // Leftmost, as the ethernet stanza is in the config this follows, and
+    // for the same reason the clock is rightmost.
+    let net = match (&readings.link.name, readings.link.up, &readings.link.address) {
+        (None, _, _) => "NET ?".to_string(),
+        // DOWN outranks any address still configured on the interface: a
+        // stale address on a link with no carrier is not somewhere to reach
+        // this machine.
+        (Some(name), Some(false), _) => format!("NET {name} DOWN"),
+        (Some(name), up, address) => {
+            // `?` keeps its meaning throughout the bar — could not be
+            // determined — so it is the UNATTRIBUTABLE case and not the empty
+            // one. A link that is genuinely up with no address is a positive
+            // fact and reads as bare `UP`.
+            let state = match (address, up) {
+                (Address::Known(address), _) => address.clone(),
+                (Address::Absent, Some(true)) => "UP".to_string(),
+                (Address::Absent, _) => "?".to_string(),
+                (Address::Unattributable, Some(true)) => "UP ?".to_string(),
+                (Address::Unattributable, _) => "?".to_string(),
+            };
+            format!("NET {name} {state}")
+        }
+    };
+    [net, load, memory, uptime, clock].join(SEPARATOR)
 }
 
 /// Paint the strip across the top. The caller owns the text, so this never
@@ -271,10 +442,11 @@ enum Tick {
 fn tick(
     runtime: &Mutex<crate::runtime::Runtime>,
     proc_root: &Path,
+    sys_root: &Path,
     epoch_secs: Option<u64>,
     reported: &mut Reported,
 ) -> Tick {
-    let readings = Readings::sample(proc_root, epoch_secs);
+    let readings = Readings::sample(proc_root, sys_root, epoch_secs);
     let line = line(&readings);
     // The guard is released BEFORE anything is printed. `eprintln!` takes
     // stderr's own lock and blocks on a slow console, and holding the runtime
@@ -293,6 +465,7 @@ fn tick(
 pub fn start(
     runtime: Arc<Mutex<crate::runtime::Runtime>>,
     proc_root: PathBuf,
+    sys_root: PathBuf,
 ) -> Result<(), String> {
     // `thread::Builder`, not `thread::spawn`: the latter PANICS when the OS
     // refuses a thread, which would take the session down over the least
@@ -305,7 +478,7 @@ pub fn start(
                 // A paint failure is REPORTED, never fatal: the bar is the
                 // least important thing on the screen and must not take the
                 // session down with it.
-                match tick(&runtime, &proc_root, unix_epoch_secs(), &mut reported) {
+                match tick(&runtime, &proc_root, &sys_root, unix_epoch_secs(), &mut reported) {
                     Tick::Continue(report) => {
                         if let Some(report) = report {
                             eprintln!("td-compositor: status bar: {report}");
@@ -339,28 +512,78 @@ mod tests {
 
     static SEQ: AtomicU64 = AtomicU64::new(0);
 
-    struct Fixture(std::path::PathBuf);
+    struct Fixture {
+        proc_root: std::path::PathBuf,
+        sys_root: std::path::PathBuf,
+    }
 
     impl Fixture {
+        /// No interfaces and no routing table, so the network field reads as
+        /// unanswerable — which is what every test that predates it expects.
         fn new(loadavg: &str, meminfo: &str, uptime: &str) -> Self {
-            let root = std::env::temp_dir().join(format!(
-                "td-bar-proc-{}-{}",
+            Self::with_net(loadavg, meminfo, uptime, &[], "")
+        }
+
+        fn with_net(
+            loadavg: &str,
+            meminfo: &str,
+            uptime: &str,
+            interfaces: &[(&str, &str)],
+            fib_trie: &str,
+        ) -> Self {
+            let stem = format!(
+                "td-bar-{}-{}",
                 std::process::id(),
                 SEQ.fetch_add(1, Ordering::Relaxed)
-            ));
-            std::fs::create_dir_all(&root).unwrap();
-            std::fs::write(root.join("loadavg"), loadavg).unwrap();
-            std::fs::write(root.join("meminfo"), meminfo).unwrap();
-            std::fs::write(root.join("uptime"), uptime).unwrap();
-            Self(root)
+            );
+            let proc_root = std::env::temp_dir().join(format!("{stem}-proc"));
+            let sys_root = std::env::temp_dir().join(format!("{stem}-sys"));
+            std::fs::create_dir_all(&proc_root).unwrap();
+            std::fs::write(proc_root.join("loadavg"), loadavg).unwrap();
+            std::fs::write(proc_root.join("meminfo"), meminfo).unwrap();
+            std::fs::write(proc_root.join("uptime"), uptime).unwrap();
+            if !fib_trie.is_empty() {
+                std::fs::create_dir_all(proc_root.join("net")).unwrap();
+                std::fs::write(proc_root.join("net").join("fib_trie"), fib_trie).unwrap();
+            }
+            for (name, operstate) in interfaces {
+                let dir = sys_root.join("class").join("net").join(name);
+                std::fs::create_dir_all(&dir).unwrap();
+                std::fs::write(dir.join("operstate"), operstate).unwrap();
+            }
+            Self {
+                proc_root,
+                sys_root,
+            }
         }
     }
 
     impl Drop for Fixture {
         fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
+            let _ = std::fs::remove_dir_all(&self.proc_root);
+            let _ = std::fs::remove_dir_all(&self.sys_root);
         }
     }
+
+    /// The shape the kernel writes: every local address is a `/32 host LOCAL`
+    /// leaf under the `|--` line carrying it, and the `Main` and `Local`
+    /// tables both list it.
+    const FIB_TRIE: &str = "\
+Main:
+  +-- 0.0.0.0/0 3 0 5
+     |-- 10.0.2.0
+        /24 link UNICAST
+     |-- 10.0.2.15
+        /32 host LOCAL
+     |-- 127.0.0.0
+        /8 host LOCAL
+Local:
+  +-- 0.0.0.0/0 3 0 5
+     |-- 10.0.2.15
+        /32 host LOCAL
+     |-- 127.0.0.1
+        /32 host LOCAL
+";
 
     const MEMINFO: &str = "MemTotal:        8039384 kB\n\
                            MemFree:          204512 kB\n\
@@ -370,7 +593,7 @@ mod tests {
     #[test]
     fn a_sample_reads_every_field_from_its_proc_root() {
         let fixture = Fixture::new("0.42 0.31 0.28 2/517 9182\n", MEMINFO, "187245.31 91.2\n");
-        let readings = Readings::sample(&fixture.0, Some(1_770_000_000));
+        let readings = Readings::sample(&fixture.proc_root, &fixture.sys_root, Some(1_770_000_000));
         assert_eq!(readings.load_centi, Some(42));
         assert_eq!(readings.total_kb, Some(8_039_384));
         // Used is total minus AVAILABLE, not minus free.
@@ -378,8 +601,210 @@ mod tests {
         assert_eq!(readings.uptime_secs, Some(187_245));
         assert_eq!(
             line(&readings),
-            "LOAD 0.42  MEM 2.6G/7.6G  UP 2D 04:00  2026-02-02 02:40:00 UTC"
+            "NET ?  LOAD 0.42  MEM 2.6G/7.6G  UP 2D 04:00  2026-02-02 02:40:00 UTC"
         );
+    }
+
+    #[test]
+    fn the_network_field_names_the_interface_and_its_address() {
+        let fixture = Fixture::with_net(
+            "0.42 0.31 0.28 2/517 9182\n",
+            MEMINFO,
+            "187245.31 91.2\n",
+            &[("eth0", "up\n"), ("lo", "unknown\n")],
+            FIB_TRIE,
+        );
+        let readings = Readings::sample(&fixture.proc_root, &fixture.sys_root, Some(0));
+        assert_eq!(readings.link.name.as_deref(), Some("eth0"));
+        assert_eq!(readings.link.up, Some(true));
+        assert_eq!(readings.link.address, Address::Known("10.0.2.15".to_string()));
+        assert!(line(&readings).starts_with("NET eth0 10.0.2.15  LOAD"));
+    }
+
+    #[test]
+    fn a_down_interface_says_so_and_an_up_one_with_no_lease_says_that() {
+        let down = Fixture::with_net("0 0 0\n", MEMINFO, "0\n", &[("eth0", "down\n")], "");
+        let readings = Readings::sample(&down.proc_root, &down.sys_root, Some(0));
+        assert_eq!(readings.link.up, Some(false));
+        assert!(line(&readings).starts_with("NET eth0 DOWN"));
+
+        // Up with no address is a REAL state — a link with no lease — and it
+        // is not the same claim as an interface nobody could name. The table
+        // is PRESENT and holds only loopback, which is what makes this
+        // "there is none" rather than "could not tell".
+        let leaseless = Fixture::with_net(
+            "0 0 0\n",
+            MEMINFO,
+            "0\n",
+            &[("eth0", "up\n")],
+            "  |-- 127.0.0.1\n     /32 host LOCAL\n",
+        );
+        let readings = Readings::sample(&leaseless.proc_root, &leaseless.sys_root, Some(0));
+        assert_eq!(readings.link.address, Address::Absent);
+        assert!(line(&readings).starts_with("NET eth0 UP  LOAD"));
+
+        // No routing table at all is neither of those: it is the question
+        // going unanswered, and `?` is what the rest of this bar spells that
+        // with.
+        let blind = Fixture::with_net("0 0 0\n", MEMINFO, "0\n", &[("eth0", "up\n")], "");
+        let readings = Readings::sample(&blind.proc_root, &blind.sys_root, Some(0));
+        assert_eq!(readings.link.address, Address::Unattributable);
+        assert!(line(&readings).starts_with("NET eth0 UP ?  LOAD"));
+    }
+
+    #[test]
+    fn a_second_interface_makes_the_address_unattributable() {
+        // The dump says an address EXISTS, never whose it is. With two
+        // interfaces the named one may not be the one holding the lease, and
+        // `NET eth0 <eth1's address>` is a well-formed line that is wrong —
+        // which for a status bar is worse than showing less.
+        let two = Fixture::with_net(
+            "0 0 0\n",
+            MEMINFO,
+            "0\n",
+            &[("eth0", "up\n"), ("eth1", "up\n"), ("lo", "unknown\n")],
+            FIB_TRIE,
+        );
+        let readings = Readings::sample(&two.proc_root, &two.sys_root, Some(0));
+        assert_eq!(readings.link.name.as_deref(), Some("eth0"));
+        assert_eq!(readings.link.address, Address::Unattributable);
+        assert!(line(&readings).starts_with("NET eth0 UP ?  LOAD"));
+
+        // The very same routing table IS attributable once there is only one
+        // interface it could belong to.
+        let one = Fixture::with_net(
+            "0 0 0\n",
+            MEMINFO,
+            "0\n",
+            &[("eth0", "up\n"), ("lo", "unknown\n")],
+            FIB_TRIE,
+        );
+        let readings = Readings::sample(&one.proc_root, &one.sys_root, Some(0));
+        assert_eq!(
+            readings.link.address,
+            Address::Known("10.0.2.15".to_string())
+        );
+    }
+
+    #[test]
+    fn an_operstate_that_is_not_an_answer_is_not_read_as_down() {
+        // `unknown` is what a driver with no carrier reporting writes. Reading
+        // it as DOWN would put that beside a working interface and hide its
+        // address with it.
+        for state in ["unknown", "dormant", "testing", "notpresent", "nonsense"] {
+            assert_eq!(operational(state), None, "{state}");
+        }
+        assert_eq!(operational("up\n"), Some(true));
+        assert_eq!(operational("down\n"), Some(false));
+        assert_eq!(operational("lowerlayerdown\n"), Some(false));
+
+        let unknown =
+            Fixture::with_net("0 0 0\n", MEMINFO, "0\n", &[("eth0", "unknown\n")], FIB_TRIE);
+        let readings = Readings::sample(&unknown.proc_root, &unknown.sys_root, Some(0));
+        assert_eq!(readings.link.up, None);
+        // The address still shows: an unknown link state is no reason to
+        // withhold an address the routing table has.
+        assert!(line(&readings).starts_with("NET eth0 10.0.2.15  LOAD"));
+
+        // Named, but with no readable state and no address at all: `?`.
+        let stateless = Fixture::with_net("0 0 0\n", MEMINFO, "0\n", &[], "");
+        std::fs::create_dir_all(stateless.sys_root.join("class").join("net").join("eth0")).unwrap();
+        let readings = Readings::sample(&stateless.proc_root, &stateless.sys_root, Some(0));
+        assert_eq!(readings.link.name.as_deref(), Some("eth0"));
+        assert_eq!(readings.link.up, None);
+        assert!(line(&readings).starts_with("NET eth0 ?  LOAD"));
+    }
+
+    #[test]
+    fn a_down_link_reports_down_rather_than_the_address_it_still_holds() {
+        // A stale address on a link with no carrier is not somewhere to reach
+        // this machine, so DOWN outranks it. Deliberate, and it would not be
+        // held by any other test here.
+        let down = Fixture::with_net("0 0 0\n", MEMINFO, "0\n", &[("eth0", "down\n")], FIB_TRIE);
+        let readings = Readings::sample(&down.proc_root, &down.sys_root, Some(0));
+        assert_eq!(
+            readings.link.address,
+            Address::Known("10.0.2.15".to_string())
+        );
+        assert!(line(&readings).starts_with("NET eth0 DOWN  LOAD"));
+    }
+
+    #[test]
+    fn the_interface_is_chosen_as_td_netd_chooses_one() {
+        // Loopback is never it, a name beginning with `e` wins over one that
+        // does not whatever the sort order, and the sort is what decides
+        // between two of the same kind.
+        let fixture = Fixture::with_net(
+            "0 0 0\n",
+            MEMINFO,
+            "0\n",
+            // `ap0` sorts BEFORE `eth0`, so picking the first name would
+            // answer `ap0` — which is what makes this about the `e` rule
+            // rather than about the sort.
+            &[
+                ("lo", "unknown\n"),
+                ("wlan0", "up\n"),
+                ("eth1", "up\n"),
+                ("ap0", "up\n"),
+                ("eth0", "up\n"),
+            ],
+            "",
+        );
+        assert_eq!(
+            choose_interface(&interface_names(&fixture.sys_root)).as_deref(),
+            Some("eth0")
+        );
+
+        let no_ethernet = Fixture::with_net(
+            "0 0 0\n",
+            MEMINFO,
+            "0\n",
+            &[("lo", "unknown\n"), ("wlan0", "up\n")],
+            "",
+        );
+        assert_eq!(
+            choose_interface(&interface_names(&no_ethernet.sys_root)).as_deref(),
+            Some("wlan0")
+        );
+
+        let only_loopback =
+            Fixture::with_net("0 0 0\n", MEMINFO, "0\n", &[("lo", "unknown\n")], "");
+        assert_eq!(choose_interface(&interface_names(&only_loopback.sys_root)), None);
+    }
+
+    #[test]
+    fn the_routing_table_gives_one_local_address_or_none() {
+        assert_eq!(local_ipv4(FIB_TRIE), Address::Known("10.0.2.15".to_string()));
+        // Loopback is not this machine's address in any useful sense, and it
+        // is present in every routing table, so it must not be the answer.
+        assert_eq!(
+            local_ipv4("  |-- 127.0.0.1\n     /32 host LOCAL\n"),
+            Address::Absent
+        );
+        // Two different non-loopback locals: the table does not say which
+        // interface owns which, so guessing would be showing the wrong one.
+        let two = "  |-- 10.0.2.15\n     /32 host LOCAL\n  |-- 192.168.1.4\n     /32 host LOCAL\n";
+        assert_eq!(local_ipv4(two), Address::Unattributable);
+        // A LOCAL leaf must not inherit the address of a line it is not
+        // directly below. Here the `/24` in between is what a real dump has,
+        // and without clearing the carry the malformed leaf below it would be
+        // reported as 10.0.2.0 — a network address printed as this machine's.
+        let stale = "  |-- 10.0.2.0\n     /24 link UNICAST\n     /32 host LOCAL\n";
+        assert_eq!(local_ipv4(stale), Address::Absent);
+        // The prefix LENGTH is part of the pattern, not decoration: a
+        // non-loopback `/8 host LOCAL` is not a host address.
+        assert_eq!(
+            local_ipv4("  |-- 10.0.0.0\n     /8 host LOCAL\n"),
+            Address::Absent
+        );
+        // A `/32` that is not LOCAL is a route, not an address; and a LOCAL
+        // leaf with no address line above it is a malformed dump, not a hit.
+        assert_eq!(
+            local_ipv4("  |-- 10.0.2.15\n     /32 host UNICAST\n"),
+            Address::Absent
+        );
+        assert_eq!(local_ipv4("     /32 host LOCAL\n"), Address::Absent);
+        assert_eq!(local_ipv4(""), Address::Absent);
     }
 
     #[test]
@@ -389,21 +814,21 @@ mod tests {
             std::process::id(),
             SEQ.fetch_add(1, Ordering::Relaxed)
         ));
-        let readings = Readings::sample(&empty, None);
+        let readings = Readings::sample(&empty, &empty, None);
         assert_eq!(readings, Readings::default());
-        assert_eq!(line(&readings), "LOAD ?  MEM ?  UP ?  CLOCK ?");
+        assert_eq!(line(&readings), "NET ?  LOAD ?  MEM ?  UP ?  CLOCK ?");
 
         // Present but unparseable is the same answer, and each field fails on
         // its own: a garbled loadavg must not take the clock down with it.
         let fixture = Fixture::new("not-a-number\n", "MemTotal: elephants\n", "\n");
-        let readings = Readings::sample(&fixture.0, Some(0));
+        let readings = Readings::sample(&fixture.proc_root, &fixture.sys_root, Some(0));
         assert_eq!(readings.load_centi, None);
         assert_eq!(readings.total_kb, None);
         assert_eq!(readings.used_kb, None);
         assert_eq!(readings.uptime_secs, None);
         assert_eq!(
             line(&readings),
-            "LOAD ?  MEM ?  UP ?  1970-01-01 00:00:00 UTC"
+            "NET ?  LOAD ?  MEM ?  UP ?  1970-01-01 00:00:00 UTC"
         );
     }
 
@@ -412,7 +837,7 @@ mod tests {
         // MemAvailable absent: "used" is unanswerable, so the whole segment
         // is, rather than reporting a total beside a made-up used.
         let fixture = Fixture::new("0.00 0 0 1/1 1\n", "MemTotal:        1048576 kB\n", "0\n");
-        let readings = Readings::sample(&fixture.0, Some(0));
+        let readings = Readings::sample(&fixture.proc_root, &fixture.sys_root, Some(0));
         assert_eq!(readings.total_kb, Some(1_048_576));
         assert_eq!(readings.used_kb, None);
         assert!(line(&readings).contains("MEM ?"));
@@ -576,7 +1001,7 @@ mod tests {
         let mut at = 1_770_000_000u64;
         let mut next = |reported: &mut Reported| {
             at = at.saturating_add(1);
-            tick(&runtime, &fixture.0, Some(at), reported)
+            tick(&runtime, &fixture.proc_root, &fixture.sys_root, Some(at), reported)
         };
 
         assert_eq!(next(&mut reported), Tick::Continue(None), "a good paint says nothing");
@@ -624,14 +1049,32 @@ mod tests {
             total_kb: Some(8_039_384),
             uptime_secs: Some(187_245),
             epoch_secs: Some(1_770_000_000),
+            link: Link {
+                name: Some("eth0".to_string()),
+                up: Some(true),
+                address: Address::Known("10.0.2.15".to_string()),
+            },
         });
         let failed = line(&Readings::default());
-        for text in [full.as_str(), failed.as_str()] {
+        // `DOWN` spells a `W` that neither of the others does, and the
+        // interface NAME is a kernel-supplied string flowing into a 43-glyph
+        // font — `dev_valid_name` forbids only `/`, `:` and whitespace, so a
+        // name is not guaranteed to be spellable and this is what would say
+        // so.
+        let down = line(&Readings {
+            link: Link {
+                name: Some("br-1a2b3c".to_string()),
+                up: Some(false),
+                address: Address::Absent,
+            },
+            ..Readings::default()
+        });
+        for text in [full.as_str(), failed.as_str(), down.as_str()] {
             for byte in text.bytes() {
                 assert!(ui::is_mapped(byte), "{:?} in {text:?} has no glyph", byte as char);
             }
         }
-        assert!(full.contains('.') && failed.contains('?'));
+        assert!(full.contains('.') && failed.contains('?') && down.contains("DOWN"));
     }
 
     #[test]

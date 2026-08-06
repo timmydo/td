@@ -93,13 +93,64 @@ was indistinguishable from a failed one. The fallback is a box now, `.` and
 `?` are glyphs of their own, and both the bar's line and the help sheet's
 rows are held to a font that has every character they spell.
 
-The fields are ordered as the i3status config they are modelled on has them,
-which puts the clock last. The line is left-aligned from x=8 and about 752
-pixels wide at full width, so on an output narrower than that the CLOCK is
-what clips first — the field the bar most exists for. That is a real cost of
-following the model rather than an oversight; the fix, if a narrow output ever
-matters, is dropping whole fields rather than clipping a glyph, and no output
-td targets is that narrow today.
+The NETWORK field is leftmost, as the ethernet stanza is in the config this
+follows. It names the interface, whether it is up, and the address — and the
+address is the part with a story. Nothing td writes down records it: td-netd
+prints the acquired lease to stdout and drops it, `/run/resolv.conf` gets
+nameservers only, and the generated `/etc/hosts` is loopback. So the address
+comes from `/proc/net/fib_trie`, the kernel's own routing dump, where a local
+address is a `/32 host LOCAL` leaf. That file is the only one that has it
+without a `SIOCGIFADDR` ioctl, which would be a new syscall on a surface that
+has none and so an `UNSAFE.md` amendment for a status field.
+
+The dump says which addresses EXIST and never whose they are, and that governs
+the whole field. An address is attributable only when there is exactly one
+non-loopback interface it could belong to; with a second one present the named
+interface may not be the one holding the lease, and `NET eth0 <eth1's address>`
+is a well-formed line that is wrong. Wrong is worse than absent on a status
+bar. More than one non-loopback local address is refused for the same reason,
+and loopback — present in every routing table — is never the answer. The one
+residual is an address aliased onto `lo` itself, which the `127.` filter does
+not catch and nothing here can attribute.
+
+So the address is THREE states rather than two, and they read differently:
+`NET eth0 10.0.2.15` when it is known, bare `NET eth0 UP` when the table says
+there is genuinely none, and `NET eth0 UP ?` when there is one but nothing
+attributes it — `?` keeping the meaning it has everywhere else on this bar,
+could not be determined. Collapsing the last two would tell an operator their
+link has no lease while the machine is reachable. `DOWN` outranks any address
+still configured, since a stale address on a link with no carrier is not
+somewhere to reach this machine.
+
+Link state comes from `operstate`, and only `up`, `down` and `lowerlayerdown`
+are answers. A driver with no carrier reporting writes `unknown`; reading that
+as down would put `DOWN` beside a working interface and suppress its address
+with it, so `unknown`, `dormant`, `testing` and `notpresent` leave the state
+unknown instead.
+
+The interface is chosen by td-netd's own rule (skip `lo`, sort, prefer a name
+beginning with `e`), which is a SECOND COPY of that convention rather than a
+shared one, since the two crates share no library: a change there is a bar
+naming an interface nothing configured. Non-UTF-8 names are kept lossily for
+that reason too — dropping one would be the two crates sorting different
+lists.
+
+There is no WIRELESS field. td's kernel forces `CONFIG_VIRTIO_NET` and
+`CONFIG_E1000` on and no wireless driver at all, so the field could never be
+anything but `?` — a permanent question mark is worse than an absent stanza.
+Temperature is out for the same reason until a target has a thermal zone.
+
+The fields are otherwise ordered as the i3status config they are modelled on
+has them, which puts the clock last. The line is left-aligned from x=8, and
+the CLOCK is therefore what clips first on a narrow output — the field the bar
+most exists for. The network field made that a live concern rather than a
+theoretical one: without it the line is 752 pixels, with `NET eth0 10.0.2.15`
+it is 992, and a longer name and address (`NET enp0s3 192.168.100.42`) reaches
+1076. 1024x768 is an ordinary virtio-gpu mode, so this now clips on a target
+td plausibly runs on, where the previous claim that no such output exists was
+true and is not any more. It is a real cost of following the model rather than
+an oversight, and nothing is lost but pixels — `draw_text_clipped` clips. The
+fix, when it matters, is dropping whole FIELDS rather than clipping a glyph.
 
 The clock is UTC and SAYS so. There is no TZif parser here, and a
 local-looking time that is silently UTC is worse than a UTC one that admits
