@@ -11,6 +11,11 @@ const GAP: usize = 24;
 const BORDER: usize = 4;
 const MAX_SCENE_BYTES: usize = 128 * 1024 * 1024;
 pub const MAX_INPUT_REGION_OPERATIONS: usize = 256;
+/// Longer than any title bar can show at any plausible width, and short
+/// enough that a client cannot spend the compositor's memory on one. Counted
+/// in CHARACTERS rather than bytes so the truncation cannot split a UTF-8
+/// sequence and leave a string the renderer walks off the end of.
+pub const MAX_TITLE_CHARS: usize = 256;
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct SurfaceKey {
@@ -101,6 +106,7 @@ impl InputRegion {
 pub struct Scene {
     surfaces: BTreeMap<SurfaceKey, Surface>,
     input_regions: BTreeMap<SurfaceKey, SharedInputRegion>,
+    titles: BTreeMap<SurfaceKey, String>,
     layout: Layout,
     pointer_x: i32,
     pointer_y: i32,
@@ -115,6 +121,7 @@ impl Scene {
         Scene {
             surfaces: BTreeMap::new(),
             input_regions: BTreeMap::new(),
+            titles: BTreeMap::new(),
             layout: Layout::new(),
             pointer_x: 0,
             pointer_y: 0,
@@ -164,6 +171,53 @@ impl Scene {
         true
     }
 
+    /// The toplevel's title, as `xdg_toplevel.set_title` gave it. Accepted for
+    /// a surface that has NOT committed yet, unlike an input region: a client
+    /// sets its title before its first buffer and need never send it again, so
+    /// refusing it there would lose most titles there are. Answers whether the
+    /// stored text changed, since a repaint is only owed when it did.
+    ///
+    /// Its lifetime is the xdg_toplevel OBJECT's, not the mapped pixels': it
+    /// survives every unmap and is dropped by `remove`, `forget_title` and
+    /// client teardown. An input region can ride `discard_pixels` because the
+    /// client re-supplies one on every commit; nothing re-supplies a title.
+    pub fn set_title(&mut self, key: SurfaceKey, title: String) -> bool {
+        // The string is a client's, so it is bounded here rather than trusted.
+        // It outlives the request in a map that lives as long as the client,
+        // and nothing downstream would ever shorten it.
+        let title = match title.char_indices().nth(MAX_TITLE_CHARS) {
+            Some((offset, _)) => title.get(..offset).unwrap_or_default().to_string(),
+            None => title,
+        };
+        // An EMPTY title is no title rather than a title that is blank, so
+        // whatever draws one has a single absent case to answer rather than
+        // two that look the same on screen.
+        if title.is_empty() {
+            return self.titles.remove(&key).is_some();
+        }
+        if self.titles.get(&key) == Some(&title) {
+            return false;
+        }
+        self.titles.insert(key, title);
+        true
+    }
+
+    /// Drop a title because its ROLE OBJECT went, which is the one teardown
+    /// `remove` does not cover: destroying an xdg_toplevel leaves its
+    /// wl_surface alive, and a toplevel created on that surface next would
+    /// otherwise inherit the dead one's name until it set its own.
+    pub fn forget_title(&mut self, key: SurfaceKey) -> bool {
+        self.titles.remove(&key).is_some()
+    }
+
+    /// `#[cfg(test)]` only while nothing DRAWS a title. The renderer is the
+    /// production reader and lands next; until it does, a non-test accessor
+    /// would be dead code the lint is right about.
+    #[cfg(test)]
+    pub fn title(&self, key: SurfaceKey) -> Option<&str> {
+        self.titles.get(&key).map(String::as_str)
+    }
+
     fn discard_pixels(&mut self, key: SurfaceKey) -> bool {
         self.input_regions.remove(&key);
         if let Some(surface) = self.surfaces.remove(&key) {
@@ -183,6 +237,7 @@ impl Scene {
     pub fn remove(&mut self, key: SurfaceKey) -> bool {
         let layout_changed = self.layout.contains(key);
         self.discard_pixels(key);
+        self.titles.remove(&key);
         self.layout.forget(key);
         layout_changed
     }
@@ -198,6 +253,7 @@ impl Scene {
             });
         self.surfaces.retain(|key, _| key.client != client);
         self.input_regions.retain(|key, _| key.client != client);
+        self.titles.retain(|key, _| key.client != client);
         self.surface_bytes = self.surface_bytes.saturating_sub(removed);
         self.layout.unmap_client(client);
         layout_changed
@@ -780,6 +836,112 @@ mod tests {
             "the clipped surface escaped the output"
         );
         assert!(frame.as_chunks::<4>().0.contains(&[1, 2, 3, 0]));
+    }
+
+    #[test]
+    fn a_title_outlives_the_request_and_dies_with_its_surface() {
+        let mut scene = Scene::new();
+        let key = SurfaceKey {
+            client: 1,
+            object: 1,
+        };
+        // Accepted BEFORE any commit. A client sets its title once, before its
+        // first buffer, and never sends it again — refusing it here the way an
+        // input region is refused would lose every title there is.
+        assert!(scene.set_title(key, "FIREFOX".to_string()));
+        assert_eq!(scene.title(key), Some("FIREFOX"));
+        // Answers whether the text CHANGED, since a repaint is only owed then.
+        assert!(!scene.set_title(key, "FIREFOX".to_string()));
+        assert!(scene.set_title(key, "FIREFOX - A PAGE".to_string()));
+
+        scene.commit(key, surface([1, 2, 3, 0], 8, 8)).unwrap();
+        assert_eq!(scene.title(key), Some("FIREFOX - A PAGE"));
+
+        // Survives an UNMAP, which an input region does not: the client
+        // re-supplies a region on every commit and nothing re-supplies a
+        // title. A null-buffer attach is both the transient unmap and the
+        // opening of the initial handshake, so dropping it here would lose
+        // the name of a window that is about to come straight back.
+        scene.unmap(key);
+        assert_eq!(scene.title(key), Some("FIREFOX - A PAGE"));
+        scene.commit(key, surface([1, 2, 3, 0], 8, 8)).unwrap();
+        assert_eq!(scene.title(key), Some("FIREFOX - A PAGE"), "remapped nameless");
+
+        // Gone with the surface, or a re-used key inherits a stale name.
+        scene.remove(key);
+        assert_eq!(scene.title(key), None);
+    }
+
+    #[test]
+    fn an_empty_title_is_no_title_rather_than_a_blank_one() {
+        let mut scene = Scene::new();
+        let key = SurfaceKey {
+            client: 1,
+            object: 1,
+        };
+        // The wire accepts a one-byte string that is just its NUL, so this is
+        // reachable. Whatever draws a title should have ONE absent case.
+        assert!(!scene.set_title(key, String::new()));
+        assert_eq!(scene.title(key), None);
+
+        assert!(scene.set_title(key, "NAMED".to_string()));
+        assert!(scene.set_title(key, String::new()), "clearing is a change");
+        assert_eq!(scene.title(key), None);
+    }
+
+    #[test]
+    fn a_destroyed_toplevel_takes_its_name_with_it() {
+        // The one teardown `remove` does not cover: the role object goes and
+        // its wl_surface lives on.
+        let mut scene = Scene::new();
+        let key = SurfaceKey {
+            client: 1,
+            object: 1,
+        };
+        scene.commit(key, surface([1, 2, 3, 0], 8, 8)).unwrap();
+        scene.set_title(key, "OLD TOPLEVEL".to_string());
+        assert!(scene.forget_title(key));
+        assert_eq!(scene.title(key), None);
+        assert!(!scene.forget_title(key), "already gone");
+    }
+
+    #[test]
+    fn a_client_cannot_spend_the_compositors_memory_on_a_title() {
+        let mut scene = Scene::new();
+        let key = SurfaceKey {
+            client: 1,
+            object: 1,
+        };
+        // Truncated by CHARACTERS, not bytes: cutting a multi-byte sequence in
+        // half would leave a string that is not UTF-8 at all.
+        let long = "é".repeat(MAX_TITLE_CHARS * 4);
+        assert!(scene.set_title(key, long));
+        let stored = scene.title(key).unwrap();
+        assert_eq!(stored.chars().count(), MAX_TITLE_CHARS);
+        assert_eq!(stored.len(), MAX_TITLE_CHARS * 2, "é is two bytes");
+
+        // A title exactly at the bound is kept whole.
+        let exact = "A".repeat(MAX_TITLE_CHARS);
+        assert!(scene.set_title(key, exact.clone()));
+        assert_eq!(scene.title(key), Some(exact.as_str()));
+    }
+
+    #[test]
+    fn client_removal_takes_its_titles_with_it() {
+        let mut scene = Scene::new();
+        let mine = SurfaceKey {
+            client: 1,
+            object: 1,
+        };
+        let theirs = SurfaceKey {
+            client: 2,
+            object: 1,
+        };
+        scene.set_title(mine, "MINE".to_string());
+        scene.set_title(theirs, "THEIRS".to_string());
+        scene.remove_client(1);
+        assert_eq!(scene.title(mine), None);
+        assert_eq!(scene.title(theirs), Some("THEIRS"));
     }
 
     #[test]

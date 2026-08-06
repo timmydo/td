@@ -497,6 +497,27 @@ null attach on an already-unmapped surface is itself a valid initial commit.
 Configures still in flight at the mapped-to-unmapped transition remain
 acknowledgeable until the new initial serial is acknowledged; they cannot
 authorize a buffer in the new mapping generation.
+`xdg_toplevel.set_title` is RETAINED, keyed by surface: it is what names a
+window, and a client MAY send it once, before its first buffer, and never
+again — some resend on every tab or directory change, but a compositor cannot
+ask, so one that drops a title may never see another. It is bounded at 256
+CHARACTERS — a client's string in a map that outlives the request, and counted
+in characters rather than bytes so truncation cannot split a UTF-8 sequence.
+An empty title is stored as NO title, so what draws one has a single absent
+case rather than two that look identical on screen. `set_app_id` is still read
+for wire validity and dropped; it is not what names a window, and storing both
+would make them indistinguishable downstream. Nothing draws a title yet, so
+nothing repaints on one — a client that puts its progress in its title would
+otherwise repaint the screen per keystroke.
+
+A title's lifetime is its xdg_toplevel OBJECT's, not its mapped pixels'. It
+survives every unmap, because a null-buffer attach is both the transient unmap
+AND the opening of the initial handshake, so dropping it there would lose the
+name of a window before its first buffer ever arrived. It is dropped when the
+toplevel is destroyed, when the wl_surface is, and with the client. An input
+region can be dropped with the pixels only because the client re-supplies one
+on every commit; nothing re-supplies a title.
+
 Decoration, clipboard, drag-and-drop, subsurfaces, popups, output
 reconfiguration, fractional scale, screen capture, data devices, pointer
 axes, and touch are not yet advertised. Unknown objects, malformed sizes,

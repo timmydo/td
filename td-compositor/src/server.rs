@@ -2049,6 +2049,16 @@ impl Client {
                     self.unregister_surface(surface)?;
                     self.remove_object(message.object)?;
                     self.unmap_surface(surface)?;
+                    // The title is this TOPLEVEL's, and unmapping the surface
+                    // no longer drops one — a toplevel created on the same
+                    // wl_surface next would inherit the name of the dead one.
+                    self.runtime
+                        .lock()
+                        .map_err(|_| "runtime lock poisoned".to_string())?
+                        .forget_title(SurfaceKey {
+                            client: self.id,
+                            object: surface,
+                        })?;
                     self.objects.insert(
                         xdg_surface,
                         Object::XdgSurface {
@@ -2063,7 +2073,32 @@ impl Client {
                     args.u32()?;
                     args.finish()
                 }
-                2 | 3 => {
+                // set_title. Kept, where set_app_id below is still read for
+                // wire validity and dropped: the title is what a title bar
+                // shows, and an app id is not.
+                2 => {
+                    let title = args.string()?;
+                    args.finish()?;
+                    let Some(Object::XdgSurface { surface, .. }) =
+                        self.objects.get(&xdg_surface).cloned()
+                    else {
+                        return Err(format!(
+                            "xdg_toplevel {} lost xdg_surface {xdg_surface}",
+                            message.object
+                        ));
+                    };
+                    self.runtime
+                        .lock()
+                        .map_err(|_| "runtime lock poisoned".to_string())?
+                        .set_title(
+                            SurfaceKey {
+                                client: self.id,
+                                object: surface,
+                            },
+                            title,
+                        )
+                }
+                3 => {
                     args.string()?;
                     args.finish()
                 }
@@ -4465,6 +4500,85 @@ mod tests {
         drop(connected);
         worker.join().unwrap().unwrap();
         fs::remove_file(framebuffer_path).unwrap();
+    }
+
+    /// `set_title` was read for wire validity and dropped, so nothing the
+    /// compositor held could name a window. This drives the real request
+    /// through `dispatch` rather than calling `Scene::set_title`, because what
+    /// broke before was the ARM and not the storage.
+    #[test]
+    fn set_title_reaches_the_scene_and_set_app_id_still_does_not() {
+        let stem = format!(
+            "td-wayland-set-title-{}-{}",
+            std::process::id(),
+            TEST_SEQ.fetch_add(1, Ordering::Relaxed)
+        );
+        let framebuffer_path = std::env::temp_dir().join(format!("{stem}.fb"));
+        let framebuffer =
+            Framebuffer::test_file(&framebuffer_path, 120, 80 + BAR_HEIGHT, 120 * 4).unwrap();
+        let runtime = Arc::new(Mutex::new(Runtime::new(framebuffer)));
+        let key = SurfaceKey {
+            client: 88,
+            object: 5,
+        };
+        let (server, _peer) = UnixStream::pair().unwrap();
+        let mut client = Client::new(88, server, Arc::clone(&runtime), test_keymap()).unwrap();
+        client
+            .insert(
+                9,
+                Object::XdgSurface {
+                    surface: 5,
+                    toplevel: Some(10),
+                    configure: Arc::new(Mutex::new(ConfigureTracker::new())),
+                },
+            )
+            .unwrap();
+        client
+            .insert(10, Object::XdgToplevel { xdg_surface: 9 })
+            .unwrap();
+
+        let mut title = wire::Builder::new();
+        title.string("TD-TERM").unwrap();
+        client
+            .dispatch(request(10, 2, title).unwrap(), &mut VecDeque::new())
+            .unwrap();
+        assert_eq!(runtime.lock().unwrap().title(key), Some("TD-TERM".to_string()));
+
+        // The title follows the toplevel, so a second one replaces it.
+        let mut renamed = wire::Builder::new();
+        renamed.string("TD-TERM - BUILD").unwrap();
+        client
+            .dispatch(request(10, 2, renamed).unwrap(), &mut VecDeque::new())
+            .unwrap();
+        assert_eq!(
+            runtime.lock().unwrap().title(key),
+            Some("TD-TERM - BUILD".to_string())
+        );
+
+        // set_app_id is still read and dropped: it is not what a title bar
+        // shows, and accepting it here would make the two indistinguishable.
+        let mut app_id = wire::Builder::new();
+        app_id.string("org.td.terminal").unwrap();
+        client
+            .dispatch(request(10, 3, app_id).unwrap(), &mut VecDeque::new())
+            .unwrap();
+        assert_eq!(
+            runtime.lock().unwrap().title(key),
+            Some("TD-TERM - BUILD".to_string())
+        );
+
+        // Destroying the TOPLEVEL takes the name, where unmapping its surface
+        // does not. The wl_surface outlives the role object, so a toplevel
+        // created on it next must not inherit this one's name.
+        client
+            .dispatch(
+                request(10, 0, wire::Builder::new()).unwrap(),
+                &mut VecDeque::new(),
+            )
+            .unwrap();
+        assert_eq!(runtime.lock().unwrap().title(key), None);
+
+        let _ = fs::remove_file(&framebuffer_path);
     }
 
     #[test]

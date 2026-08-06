@@ -52,9 +52,8 @@ const ETC_PASSWD: &str = "/etc/passwd";
 /// note.
 const FIRST_DYNAMIC_ID: u32 = KEYBOARD + 1;
 
-/// What an operator sees in a title bar. td's own compositor parses and
-/// discards it; it is set because a client that names itself is easier to
-/// identify in a trace than one that does not.
+/// What an operator sees in a title bar. td's own compositor now KEEPS this
+/// rather than discarding it, so it is the name this window will carry.
 const TITLE: &str = "td terminal";
 
 /// The grid a terminal falls back to when the compositor proposes no size.

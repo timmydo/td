@@ -249,6 +249,25 @@ impl Runtime {
         Ok(())
     }
 
+    /// Take a toplevel's title. No repaint yet — nothing draws a title until
+    /// the decoration lands, and a repaint per `set_title` would be one per
+    /// keystroke from any client that puts its progress in the title.
+    pub fn set_title(&mut self, key: SurfaceKey, title: String) -> Result<(), String> {
+        self.scene.set_title(key, title);
+        Ok(())
+    }
+
+    /// The xdg_toplevel went. Its wl_surface may not have.
+    pub fn forget_title(&mut self, key: SurfaceKey) -> Result<(), String> {
+        self.scene.forget_title(key);
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub fn title(&self, key: SurfaceKey) -> Option<String> {
+        self.scene.title(key).map(str::to_string)
+    }
+
     pub fn remove(&mut self, key: SurfaceKey) -> Result<(), String> {
         let layout_changed = self.scene.remove(key);
         self.repaint()?;
