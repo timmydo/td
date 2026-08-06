@@ -41,7 +41,7 @@ fn bin() -> PathBuf {
 /// missing vendored `.inp`/`.good`, or a typo'd annotation reds in-loop — without
 /// depending on the behavioral run below.
 /// Raise this with the corpus; it exists to catch a corpus that SHRANK.
-const CORPUS_FLOOR: usize = 2180;
+const CORPUS_FLOOR: usize = 2185;
 
 #[test]
 fn corpus_is_well_formed() -> Result<(), Box<dyn std::error::Error>> {
@@ -1130,5 +1130,32 @@ fn a_diverging_diagnostic_still_names_in_raw_bytes() -> Result<(), Box<dyn std::
         String::from_utf8_lossy(&tmp.stderr)
     );
     assert_eq!(tmp.status.code(), Some(4));
+    Ok(())
+}
+
+/// `-f -` reading a DIRECTORY is the same deliberate refusal the four
+/// `spec/divergence.test.txt` cases pin for the named spelling, and the corpus
+/// cannot say it: a case supplies stdin as BYTES, so there is no way to
+/// annotate "stdin is a directory". GNU auto-prints at exit 0 here.
+#[test]
+fn a_dash_f_script_read_from_a_directory_is_refused(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let dir = TempDir::new("fdash-dir")?;
+    let sub = dir.0.join("D");
+    std::fs::create_dir_all(&sub)?;
+    std::fs::write(dir.0.join("IN"), b"a\nb\n")?;
+
+    let out = std::process::Command::new(bin())
+        .args(["sed", "-f", "-", "IN"])
+        .stdin(std::process::Stdio::from(std::fs::File::open(&sub)?))
+        .current_dir(&dir.0)
+        .output()?;
+    assert_eq!(
+        out.stderr,
+        b"sed: couldn't open file -: Is a directory\n".to_vec(),
+        "a directory on stdin was not refused the way a named one is"
+    );
+    assert_eq!(out.stdout, b"".to_vec());
+    assert_eq!(out.status.code(), Some(4));
     Ok(())
 }

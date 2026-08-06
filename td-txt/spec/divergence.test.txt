@@ -1195,3 +1195,57 @@ a
 ## stdout-json: ""
 ## status: 1
 ## stderr-contains: usage: sed
+
+#### sed refuses a `-f' script that is a DIRECTORY
+# GNU opens it, reads nothing, and runs the EMPTY program that results --
+# auto-printing at exit 0. The mechanism is that `inchar' guards on `feof' and
+# never asks `ferror' (compile.c:244), so a `getc' that FAILS simply ends the
+# script. Matching that would mean `sed -f "$conf" f' with $conf a directory
+# silently applies no edits, passes its input through and exits 0, which no
+# caller can tell from success -- a read that FAILED is not the same thing as a
+# script that was empty, and the shape that really is empty is pinned below and
+# agrees with GNU. The message is imprecise in one way worth knowing: the OPEN
+# succeeded and the READ is what failed, so `couldn't open file' names the wrong
+# call -- GNU's own string for that failure is `read error on %s' (utils.c:240)
+# and td-txt already prints it for an OPERAND and for `r'/`R'. It is kept here
+# for consistency with `-f''s open-failure path, and changing it is its own
+# landing rather than a corner of this one. A DIRECTORY is only the reachable
+# member of the class: any read that fails on an opened script does this, and
+# `sed -f /proc/self/mem' is the same divergence with EIO.
+## argv: sed -f D
+## file-json D/keep: ""
+## stdin-json: "a\nb\n"
+## stdout-json: ""
+## stderr-json: "sed: couldn't open file D: Is a directory\n"
+## status: 4
+
+#### and that refusal outranks an -e that parsed fine
+# GNU prints each line twice here (the `-e p' plus the auto-print).
+## argv: sed -e p -f D
+## file-json D/keep: ""
+## stdin-json: "a\n"
+## stdout-json: ""
+## stderr-json: "sed: couldn't open file D: Is a directory\n"
+## status: 4
+
+#### and a second -f that is a real script
+## argv: sed -f D -f S
+## file-json D/keep: ""
+## file-json S: "p\n"
+## stdin-json: "a\n"
+## stdout-json: ""
+## stderr-json: "sed: couldn't open file D: Is a directory\n"
+## status: 4
+
+#### and --file, its long spelling, which is a SECOND call site
+# `-f' and `--file' read their script through one function but wrap its failure
+# at two call sites, and the corpus pairs them elsewhere for exactly that reason
+# (sed-cli.test.txt, `an unreadable --file script is the same runtime failure as
+# -f'). A review drifted the long arm ALONE and the whole gate stayed green
+# while the two spellings of one option disagreed.
+## argv: sed --file=D
+## file-json D/keep: ""
+## stdin-json: "a\nb\n"
+## stdout-json: ""
+## stderr-json: "sed: couldn't open file D: Is a directory\n"
+## status: 4

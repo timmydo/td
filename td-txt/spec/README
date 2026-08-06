@@ -1193,14 +1193,6 @@ td-txt-authored case files
     `read error on stdin` where td-txt names the file it really opened,
     `/dev/stdin`. Both exit 4. An OPERAND spelled `-` does say `stdin` now.
 
-  - `grep` does not implement `-d ACTION` / `--directories=ACTION` at all, where
-    GNU takes `read`, `skip` and `recurse`. `grep -d skip x DIR` is exit 1 and
-    silent there and `invalid option -- 'd'` at exit 2 here, and
-    `--directories=recurse` is the spelling `-r` has. Refused rather than
-    silently ignored, which is this applet's rule for an option it does not
-    serve, so it is a missing FEATURE and not a wrong answer. Found by the
-    raw-name sweep, which passed a directory operand to every shape it had.
-
   - An AMBIGUOUS long-option abbreviation lists its possibilities in a different
     order, and for grep a different SET. `sed --s` is `'--silent' '--sandbox'
     '--separate'` in GNU -- its `long_options[]` declaration order -- and
@@ -1234,16 +1226,6 @@ td-txt-authored case files
     than reading first, which is a different program and its own landing, not
     a corner of this one. Predates the branch -- `read_input` read to the end
     the same way `read_script` does. Found by a reviewer.
-
-  - `-f` naming a DIRECTORY: GNU reads it as an empty script and auto-prints at
-    exit 0, where td-txt is `couldn't open file DIR: Is a directory` at exit 4.
-    Fail-CLOSED, predates the branch, both modes. Found by a reviewer sweeping
-    what a `-f` STREAM can be, which is this section's own axis -- the read fails
-    on the directory rather than at open, so it is the read's error that surfaces
-    and not the open's. `-f` is now the LAST place that conflates the two: an
-    OPERAND tells them apart, and matching GNU here would mean running a script
-    that could not be read rather than refusing, which is the wrong direction to
-    move a refusal.
 
   - `s//\N/` -- the empty regex reusing the last one -- is unchecked here and
     only half-unchecked in GNU: `/\(a\)/s//\2/` and `/a/s//\1/` are refused
@@ -1585,10 +1567,12 @@ td-txt-authored case files
   oracle against a new case and confirm it does NOT match, comparing status,
   stdout AND stderr: for every refusal here the whole divergence is the
   diagnostic, so a check that reads only status and stdout reports agreement.
-  32 cases, of which 30 differ; the other TWO are counts GNU never finishes, so
+  36 cases, of which 34 differ; the other TWO are counts GNU never finishes, so
   they are not comparable by construction and their divergence is the
-  non-finishing itself. That was also the count when the `-NUM` decision landed,
-  and it is a DIFFERENT 32: `sed -l N` was retired when the option was
+  non-finishing itself. It was 32 until the `-f DIR` decision arrived from the
+  gap list above with FOUR, each confirmed against GNU sed 4.9 as this paragraph
+  requires. 32 was also the count when the `-NUM` decision landed, and that was
+  a DIFFERENT 32: `sed -l N` was retired when the option was
   implemented, which is the one way a case leaves this file -- td-txt stopped
   diverging -- and the usage line after a missing option argument replaced it.
   Re-run it when adding one: the count in this sentence is part of what it

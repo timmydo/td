@@ -11968,3 +11968,15 @@ xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx$
 ## stderr-json: ""
 ## file-after-json F: "X\n"
 ## status: 0
+
+#### an EMPTY REGULAR `-f' file IS an empty script, and auto-prints
+# The control for the `-f DIR' refusals in divergence.test.txt: what those
+# object to is the failed READ, not the empty program a directory would leave
+# behind, and this is the shape that really is an empty program. It agrees with
+# GNU, which is why it lives here and not beside them.
+## argv: sed -f E
+## file-json E: ""
+## stdin-json: "a\nb\n"
+## stdout-json: "a\nb\n"
+## stderr-json: ""
+## status: 0
