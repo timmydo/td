@@ -1159,7 +1159,6 @@ xfail shell-grammar.test.sh::case item without ;; is not allowed
 xfail shell-grammar.test.sh::case: Using ; instead of ;;
 xfail spec-harness-bug.test.sh::osh-native duplicates stdin - is this a test harness issue?
 xfail subshell.test.sh::Subshell with redirects
-xfail tilde.test.sh::${undef:-~}
 xfail tilde.test.sh::${x//~/~root}
 xfail tilde.test.sh::temp assignment x=~ env
 xfail tilde.test.sh::tilde expansion an assignment keyword
@@ -1244,8 +1243,6 @@ xfail var-op-slice.test.sh::Slice with an assoc array
 xfail var-op-slice.test.sh::Slice with an index that's an array -- silent a[0] decay
 xfail var-op-strip.test.sh::Strip unicode prefix
 xfail var-op-strip.test.sh::strip all unicode
-xfail var-op-test.test.sh::"\e" as arg
-xfail var-op-test.test.sh::"\z" as arg
 xfail var-ref.test.sh::${!OPTIND} (used by bash completion
 xfail var-ref.test.sh::${!a[@]-'default'} is legal but fails with more than one element
 xfail var-ref.test.sh::${!array_ref:-set} and ${!array_ref:=assign}
@@ -1277,16 +1274,11 @@ xfail var-ref.test.sh::var ref to $? with '?'
 xfail var-ref.test.sh::var ref to $@ with @
 xfail var-ref.test.sh::var ref to special var BASH_SOURCE
 xfail var-ref.test.sh::var ref: 1, @, *
-xfail var-sub-quote.test.sh::"${undef-'c d'}" and "${foo%'c d'}" are parsed differently
 xfail var-sub-quote.test.sh::# operator with single quoted arg (dash/ash and bash/mksh disagree, reported by Crestwave)
 xfail var-sub-quote.test.sh::$'' allowed within VarSub arguments
 xfail var-sub-quote.test.sh::/ operator with single quoted arg (causes syntax error in regex in OSH, reported by Crestwave)
-xfail var-sub-quote.test.sh::Inner single quotes, outer double quotes
-xfail var-sub-quote.test.sh::Multiple words: outer double quotes, inner single quotes
-xfail var-sub-quote.test.sh::Multiple words: outer double quotes, inner single quotes ##2
 xfail var-sub-quote.test.sh::Right Brace as argument (similar to #702)
 xfail var-sub-quote.test.sh::Var substitution with \n in value
-xfail var-sub-quote.test.sh::comparison: :- operator with single quoted arg
 xfail var-sub-quote.test.sh::single quotes work inside character classes
 xfail var-sub.test.sh::Braced block inside ${}
 xfail var-sub.test.sh::Descriptor redirect to bad "$@"
@@ -1315,7 +1307,6 @@ xfail whitespace.test.sh::Parsing shell words \r \v
 xfail whitespace.test.sh::\r at end of line is not special
 xfail whitespace.test.sh::\r in arith expression is allowed by some shells, but not most!
 xfail whitespace.test.sh::whitespace in string to integer conversion
-xfail word-eval.test.sh::Default values -- more cases
 xfail word-split.test.sh::""$A"" - empty string on both sides - derived from spec/toysh-posix #15
 xfail word-split.test.sh::IFS and joining arrays by assignments
 xfail word-split.test.sh::IFS empty doesn't do splitting

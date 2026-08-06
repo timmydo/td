@@ -1347,6 +1347,38 @@ mod tests {
         assert_eq!(fields(&mut sh, "\"${*:-SUB}\""), vec!["SUB"]);
     }
 
+    /// Inside a double-quoted `${...}`, the WORD of a substitution operator is
+    /// itself a double-quoted body: a `'` is an ordinary character while a `"`
+    /// still opens a quoted run. The PATTERN operators are the other way round,
+    /// which is the asymmetry `var-sub-quote::"${undef-'c d'}" and
+    /// "${foo%'c d'}" are parsed differently` grades.
+    #[test]
+    fn a_quoted_substitution_word_keeps_its_single_quotes() {
+        let mut sh = Shell::new_for_test();
+        assert_eq!(fields(&mut sh, "\"${u-'c d'}\""), vec!["'c d'"]);
+        assert_eq!(fields(&mut sh, "\"${u-\"c d\"}\""), vec!["c d"]);
+        // The backslash follows double-quote rules: KEPT before a `'`, which it
+        // does not escape there, and consumed before a `"`, which it does.
+        assert_eq!(fields(&mut sh, "\"${u-a\\'b}\""), vec!["a\\'b"]);
+        assert_eq!(fields(&mut sh, "\"${u-a\\\"b}\""), vec!["a\"b"]);
+        // `}` is special HERE and nowhere else, so the backslash protecting one
+        // is consumed where a plain `"a\}b"` keeps it.
+        assert_eq!(fields(&mut sh, "\"${u-a\\}b}\""), vec!["a}b"]);
+        assert_eq!(fields(&mut sh, "\"a\\}b\""), vec!["a\\}b"]);
+        // Every operator on the roster, not just `-`: narrowing it is a change
+        // the corpus cannot see.
+        assert_eq!(fields(&mut sh, "\"${a='c d'}\""), vec!["'c d'"]);
+        assert_eq!(fields(&mut sh, "\"${b+'c d'}\""), vec![""]);
+        let _ = sh.set_var("s", "x");
+        assert_eq!(fields(&mut sh, "\"${s+'c d'}\""), vec!["'c d'"]);
+        assert_eq!(fields(&mut sh, "\"${s?'c d'}\""), vec!["x"]);
+        // Unquoted, the `'` quotes as it always did.
+        assert_eq!(fields(&mut sh, "${u-'c d'}"), vec!["c d"]);
+        // And a pattern's quotes are real even inside the same outer quotes.
+        let _ = sh.set_var("foo", "a b c d");
+        assert_eq!(fields(&mut sh, "\"${foo%'c d'}\""), vec!["a b "]);
+    }
+
     /// The `:-`/`:+` WORD inherits the outer splitting flag, as dash's
     /// `VSMINUS`/`VSPLUS` inherit `EXP_FULL` while `:=`/`:?` strip it. Without
     /// that, a nested `${undef:-${*:-SUB}}` answers the inner one as a

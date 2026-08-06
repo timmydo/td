@@ -588,7 +588,17 @@ fn word_from_str_at(text: &str, depth: u32) -> Syn<Word> {
 /// so `a\"b` traces with the backslash still on. `\$`, `` \` `` and `\\` lose
 /// theirs as they would inside real quotes.
 pub fn word_from_str(text: &str) -> Syn<Word> {
-    lexer_over(text, 0)?.scan_dq_run(false)
+    lexer_over(text, 0)?.scan_dq_run(false, false)
+}
+
+/// The WORD of `${x-word}` when the whole expansion sits inside double quotes.
+/// dash scans it as a double-quoted body, so a `'` is an ordinary character
+/// while a `"` still opens a quoted run: `"${u-'c d'}"` keeps its quotes and
+/// `"${u-"c d"}"` loses them. The escape set is double-quote's plus `}`, which
+/// is special here and nowhere else. The PATTERN operators are not this --
+/// there a `'` quotes as usual, the asymmetry `var-sub-quote` grades.
+fn dq_word_from_str_at(text: &str, depth: u32) -> Syn<Word> {
+    lexer_over(text, depth)?.scan_dq_run(true, true)
 }
 
 /// Scan the body of `$((...))`. POSIX expands it as if it were double-quoted,
@@ -596,7 +606,7 @@ pub fn word_from_str(text: &str) -> Syn<Word> {
 /// so NEITHER quote character quotes here: both reach the arithmetic lexer, which
 /// rejects them. That is why `$(( '1' + 2 ))` is an error and not 3.
 fn arith_from_str_at(text: &str, depth: u32) -> Syn<Word> {
-    lexer_over(text, depth)?.scan_dq_run(true)
+    lexer_over(text, depth)?.scan_dq_run(true, false)
 }
 
 fn lexer_over(text: &str, depth: u32) -> Syn<Lexer> {
@@ -1117,22 +1127,38 @@ impl Lexer {
     }
 
     /// A run of text under double-quote rules with no closing quote to look for:
-    /// `$`, backtick and backslash keep their meaning, every other character --
-    /// quote marks included -- is literal, and the whole run stays quoted, so it
-    /// is neither field-split nor globbed. Serves both `$((...))` bodies and the
-    /// runtime strings expanded as if double-quoted (`$PS4`).
-    ///
-    /// `escapes_dquote` is the one place the two part company; see `word_from_str`.
-    fn scan_dq_run(&mut self, escapes_dquote: bool) -> Syn<Word> {
+    /// `$`, backtick and backslash keep their meaning, the whole run stays
+    /// quoted, so it is neither field-split nor globbed. Serves THREE callers,
+    /// and the two flags are where they part company. `$((...))` bodies and the
+    /// runtime strings expanded as if double-quoted (`$PS4`) take neither, so
+    /// for them a quote mark is literal too; `escapes_dquote` decides whether
+    /// `\"` keeps its backslash there (see `word_from_str`). `subst_word` is the
+    /// word of a `${x-word}` inside real double quotes: a `"` opens a nested
+    /// quoted run rather than being literal, and `}` joins the escape set,
+    /// because it is what ENDS the expansion.
+    fn scan_dq_run(&mut self, escapes_dquote: bool, subst_word: bool) -> Syn<Word> {
         let mut buf = WordBuf::default();
         while let Some(c) = self.sc.peek() {
             match c {
+                '"' if subst_word => {
+                    self.sc.bump();
+                    let before = buf.segs.len();
+                    self.scan_double(&mut buf)?;
+                    buf.mark_empty_quote(before);
+                }
                 '\\' => {
                     self.sc.bump();
                     match self.sc.peek() {
                         Some(esc @ ('$' | '`' | '\\')) => {
                             self.sc.bump();
                             buf.push_quoted(esc);
+                        }
+                        // `}` ends the expansion, so the backslash protecting
+                        // one is consumed -- unlike in a plain `"..."`, where
+                        // `"a\}b"` keeps it.
+                        Some('}') if subst_word => {
+                            self.sc.bump();
+                            buf.push_quoted('}');
                         }
                         Some('"') if escapes_dquote => {
                             self.sc.bump();
@@ -1688,7 +1714,11 @@ fn parse_param(inner: &str, quoted: bool, depth: u32) -> Syn<Param> {
         });
     }
     let operand: String = chars.iter().skip(i).collect();
-    let word = word_from_str_at(&operand, depth + 1)?;
+    let word = if quoted && matches!(opc, '-' | '=' | '?' | '+') {
+        dq_word_from_str_at(&operand, depth + 1)?
+    } else {
+        word_from_str_at(&operand, depth + 1)?
+    };
     let op = match opc {
         '-' => ParamOp::Default { word, colon },
         '=' => ParamOp::Assign { word, colon },
