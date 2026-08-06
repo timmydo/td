@@ -205,19 +205,19 @@ pub fn expand_command_words(sh: &mut Shell, words: &[Word]) -> R<Vec<String>> {
 /// Expansion in a context that takes exactly one word: a redirection target, a
 /// `case` subject, an assignment value. No splitting, no pathname expansion.
 pub fn expand_single(sh: &mut Shell, w: &Word) -> R<String> {
-    Ok(QChar::text(&expand_chars(sh, w, false)?))
+    Ok(QChar::text(&expand_chars(sh, w, false, false)?))
 }
 
 /// Like `expand_single` but keeping the quoting bits, so the result can be used
 /// as a pattern.
 pub fn expand_pattern(sh: &mut Shell, w: &Word) -> R<Vec<QChar>> {
-    expand_chars(sh, w, false)
+    expand_chars(sh, w, false, false)
 }
 
 /// Expand and flatten to a single run of characters, joining the fields that a
 /// `$@` may have produced with a space.
-fn expand_chars(sh: &mut Shell, w: &Word, force_quoted: bool) -> R<Vec<QChar>> {
-    let fields = expand_raw(sh, w, force_quoted, false)?;
+fn expand_chars(sh: &mut Shell, w: &Word, force_quoted: bool, splitting: bool) -> R<Vec<QChar>> {
+    let fields = expand_raw(sh, w, force_quoted, splitting)?;
     let mut out: Vec<QChar> = Vec::new();
     for (i, f) in fields.iter().enumerate() {
         if i > 0 {
@@ -285,7 +285,7 @@ fn expand_raw(sh: &mut Shell, w: &Word, force_quoted: bool, splitting: bool) -> 
                 if q {
                     cur.had_quotes = true;
                 }
-                let text = QChar::text(&expand_chars(sh, expr, false)?);
+                let text = QChar::text(&expand_chars(sh, expr, false, false)?);
                 let value = arith::eval(sh, &text)?;
                 push_expanded(&mut cur.chars, &value.to_string(), q);
             }
@@ -310,7 +310,7 @@ fn push_expanded(out: &mut Vec<QChar>, text: &str, quoted: bool) {
 /// which is what makes `${v: :2}` and `${v::2}` the first two characters --
 /// `arith::eval` would call the empty expression an error.
 fn slice_arith(sh: &mut Shell, w: &Word) -> R<i64> {
-    let text = QChar::text(&expand_chars(sh, w, false)?);
+    let text = QChar::text(&expand_chars(sh, w, false, false)?);
     if text.trim().is_empty() {
         return Ok(0);
     }
@@ -517,9 +517,20 @@ fn expand_param(
     }
 
     let raw = lookup(sh, &p.name);
-    let empty = match &raw {
-        None => true,
-        Some(v) => v.is_empty(),
+    // UNQUOTED, `$@`/`$*` are null by their PARAMETERS -- none, or one that is
+    // empty -- so two empty ones are not null even though their join is, which
+    // only shows when IFS is empty. QUOTED, the expansion IS that join, so
+    // `"${*:-x}"` substitutes where `${*:-x}` does not.
+    let empty = match p.name.as_str() {
+        "@" | "*" if !quoted && splitting => match sh.params.as_slice() {
+            [] => true,
+            [only] => only.is_empty(),
+            _ => false,
+        },
+        _ => match &raw {
+            None => true,
+            Some(v) => v.is_empty(),
+        },
     };
 
     let value: Option<String> = match &p.op {
@@ -531,7 +542,7 @@ fn expand_param(
         Some(ParamOp::Length | ParamOp::Substring { .. }) => raw,
         Some(ParamOp::Default { word, colon }) => {
             if raw.is_none() || (*colon && empty) {
-                let chars = expand_chars(sh, word, quoted)?;
+                let chars = expand_chars(sh, word, quoted, splitting)?;
                 push_chars(&mut cur.chars, &chars, quoted);
                 return Ok(());
             }
@@ -541,14 +552,14 @@ fn expand_param(
             if raw.is_none() || (*colon && empty) {
                 Some(String::new())
             } else {
-                let chars = expand_chars(sh, word, quoted)?;
+                let chars = expand_chars(sh, word, quoted, splitting)?;
                 push_chars(&mut cur.chars, &chars, quoted);
                 return Ok(());
             }
         }
         Some(ParamOp::Assign { word, colon }) => {
             if raw.is_none() || (*colon && empty) {
-                let text = QChar::text(&expand_chars(sh, word, quoted)?);
+                let text = QChar::text(&expand_chars(sh, word, quoted, false)?);
                 if !crate::ast::is_name(&p.name) {
                     return Err(sh.fatal(&format!("cannot assign to ${}", p.name), 2));
                 }
@@ -560,7 +571,7 @@ fn expand_param(
         }
         Some(ParamOp::Error { word, colon }) => {
             if raw.is_none() || (*colon && empty) {
-                let msg = QChar::text(&expand_chars(sh, word, quoted)?);
+                let msg = QChar::text(&expand_chars(sh, word, quoted, false)?);
                 let msg = if msg.is_empty() {
                     "parameter not set".to_string()
                 } else {
@@ -589,7 +600,7 @@ fn expand_param(
             // The replacement is expanded even when the pattern turns out empty:
             // ash expands both before deciding, so `${v/$unset/${x:=y}}` still
             // assigns and a command substitution in it still runs.
-            let rep = QChar::text(&expand_chars(sh, repl, quoted)?);
+            let rep = QChar::text(&expand_chars(sh, repl, quoted, false)?);
             if units.is_empty() {
                 // No pattern: ash returns the value untouched rather than
                 // matching the empty string everywhere.
@@ -1304,6 +1315,49 @@ mod tests {
         // Quoted it still joins, with nothing between: `"$*"` is one field
         // however empty the separator is.
         assert_eq!(fields(&mut sh, "\"$*\""), vec!["1 23  4"]);
+    }
+
+    /// Unquoted, `$*` is null by its PARAMETERS -- none, or one empty one --
+    /// so two empty ones are not null; quoted it is their join, which under an
+    /// empty IFS is. The corpus grades the two spellings as separate cases with
+    /// opposite answers (`var-op-test::$* ("" "") and - and + (IFS=)` against
+    /// `::"$*" ("" "") and - and + (IFS=)`).
+    #[test]
+    fn whether_star_is_null_depends_on_whether_it_is_quoted() {
+        let mut sh = Shell::new_for_test();
+        sh.params = vec!["".into(), "".into()];
+        let _ = sh.set_var("IFS", "");
+        assert_eq!(fields(&mut sh, "${*:-SUB}"), Vec::<&str>::new());
+        assert_eq!(fields(&mut sh, "\"${*:-SUB}\""), vec!["SUB"]);
+        // `:+` is the same question answered the other way round -- and the one
+        // place this follows the corpus AGAINST dash 0.5.12, which strips its
+        // splitting flag for `:+` and so leaves the word unsubstituted.
+        assert_eq!(fields(&mut sh, "${*:+SUB}"), vec!["SUB"]);
+        // A SINGLE-WORD context asks the join even unquoted, because there is
+        // no splitting to count boundaries with: dash keys this on the same
+        // flag, not on quoting. `v=${*:-SUB}` is `SUB` where `c ${*:-SUB}` is
+        // no field at all.
+        assert_eq!(
+            expand_single(&mut sh, &word("${*:-SUB}")).ok(),
+            Some("SUB".into())
+        );
+        // One empty parameter is null either way: the SECOND is what turns it.
+        sh.params = vec!["".into()];
+        assert_eq!(fields(&mut sh, "${*:-SUB}"), vec!["SUB"]);
+        assert_eq!(fields(&mut sh, "\"${*:-SUB}\""), vec!["SUB"]);
+    }
+
+    /// The `:-`/`:+` WORD inherits the outer splitting flag, as dash's
+    /// `VSMINUS`/`VSPLUS` inherit `EXP_FULL` while `:=`/`:?` strip it. Without
+    /// that, a nested `${undef:-${*:-SUB}}` answers the inner one as a
+    /// single-word context and substitutes where dash and bash yield nothing.
+    #[test]
+    fn the_default_word_inherits_the_outer_splitting_flag() {
+        let mut sh = Shell::new_for_test();
+        sh.params = vec!["".into(), "".into()];
+        let _ = sh.set_var("IFS", "");
+        assert_eq!(fields(&mut sh, "${undef:-${*:-SUB}}"), Vec::<&str>::new());
+        assert_eq!(fields(&mut sh, "\"${undef:-${*:-SUB}}\""), vec!["SUB"]);
     }
 
     /// Skipping the join is bounded to contexts that SPLIT. A single-word

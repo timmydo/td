@@ -1246,7 +1246,6 @@ xfail var-op-strip.test.sh::Strip unicode prefix
 xfail var-op-strip.test.sh::strip all unicode
 xfail var-op-test.test.sh::"\e" as arg
 xfail var-op-test.test.sh::"\z" as arg
-xfail var-op-test.test.sh::$* ("" "") and - and + (IFS=)
 xfail var-ref.test.sh::${!OPTIND} (used by bash completion
 xfail var-ref.test.sh::${!a[@]-'default'} is legal but fails with more than one element
 xfail var-ref.test.sh::${!array_ref:-set} and ${!array_ref:=assign}
