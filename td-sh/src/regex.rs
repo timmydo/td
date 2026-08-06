@@ -30,6 +30,30 @@ const MAX_DEPTH: u32 = 256;
 /// measured before the fix, `[[ x =~ (){4000000000} ]]` did not return.
 const MAX_EMIT: usize = 100_000;
 
+/// The zero-width assertions glibc adds to ERE and bash inherits. Each is a
+/// question about the two characters STRADDLING a position, which is why they
+/// cannot be classes: `\b` matches where a word begins or ends and consumes
+/// nothing.
+#[derive(Clone, Copy, Debug)]
+enum Boundary {
+    /// `\b`
+    Word,
+    /// `\B`
+    NotWord,
+    /// `\<`
+    WordStart,
+    /// `\>`
+    WordEnd,
+}
+
+/// A word character for the boundary assertions. Derived from `\w`'s OWN
+/// members rather than spelled out again: the two agreed only because both
+/// said `is_alphanumeric()`, so changing what `[[:alnum:]]` covers would have
+/// moved `\w` and left `\b` behind, silently and with no test to catch it.
+fn is_word_char(c: char) -> bool {
+    crate::pattern::class_matches(false, &word_class(), c)
+}
+
 #[derive(Clone, Debug)]
 enum Node {
     Empty,
@@ -53,6 +77,8 @@ enum Node {
     Start,
     /// `$`
     End,
+    /// `\b`, `\B`, `\<`, `\>`.
+    Assert(Boundary),
     /// `( … )`. Kept in the tree rather than flattened away because a group is
     /// not its content for one purpose: `^*` has no preceding expression to
     /// repeat and is refused, while `(^)*` repeats a GROUP and bash accepts it.
@@ -76,6 +102,7 @@ enum Inst {
     Jmp(usize),
     AssertStart,
     AssertEnd,
+    AssertBoundary(Boundary),
     Match,
 }
 
@@ -117,7 +144,21 @@ struct Parser<'a> {
     classes: Vec<(bool, Vec<ClassItem>)>,
 }
 
+/// `\w`'s members: `[[:alnum:]_]`.
+fn word_class() -> Vec<ClassItem> {
+    vec![ClassItem::Named("alnum".into()), ClassItem::Ch('_')]
+}
+
 impl Parser<'_> {
+    /// Record a bracket expression and return the node that indexes it. The
+    /// `\w`-family escapes are classes with no brackets written round them, so
+    /// they arrive here rather than through `bracket`.
+    fn intern_class(&mut self, negated: bool, items: Vec<ClassItem>) -> Node {
+        let at = self.classes.len();
+        self.classes.push((negated, items));
+        Node::Class(at)
+    }
+
     /// The character at the cursor when it is an unquoted `c` -- i.e. when it is
     /// acting as a metacharacter. A quoted one is a literal and answers `false`.
     fn at_meta(&self, c: char) -> bool {
@@ -172,7 +213,7 @@ impl Parser<'_> {
             // glibc refuses a repeated ANCHOR (`^*`): there is no preceding
             // expression to repeat. Measured -- bash answers 2 where this
             // compiled and matched the empty prefix.
-            if matches!(node, Node::Start | Node::End)
+            if matches!(node, Node::Start | Node::End | Node::Assert(_))
                 && (self.at_meta('*') || self.at_meta('+') || self.at_meta('?') || self.at_meta('{'))
             {
                 return Err("nothing to repeat before a repetition".to_string());
@@ -282,12 +323,40 @@ impl Parser<'_> {
             }
             '\\' => {
                 self.i += 1;
-                match self.pat.get(self.i) {
-                    Some(next) => {
-                        self.i += 1;
-                        Ok(Node::Lit(next.c))
-                    }
-                    None => Err("trailing backslash".to_string()),
+                let Some(next) = self.pat.get(self.i) else {
+                    return Err("trailing backslash".to_string());
+                };
+                self.i += 1;
+                match next.c {
+                    // glibc's ERE extensions, which bash inherits. Serving them
+                    // as literals -- which is what an escape otherwise means --
+                    // silently answered the wrong question: `\bfoo\b` matched
+                    // the text "bfoob".
+                    'w' => Ok(self.intern_class(false, word_class())),
+                    'W' => Ok(self.intern_class(true, word_class())),
+                    's' => Ok(self.intern_class(false, vec![ClassItem::Named("space".into())])),
+                    'S' => Ok(self.intern_class(true, vec![ClassItem::Named("space".into())])),
+                    // `\\`` and `\\'` are the buffer anchors. bash does not set
+                    // `REG_NEWLINE`, so they are exactly `^` and `$` -- which
+                    // also gets their repetition refused for free, since
+                    // `\\`*` has no more of a preceding expression than `^*`.
+                    '`' => Ok(Node::Start),
+                    '\'' => Ok(Node::End),
+                    'b' => Ok(Node::Assert(Boundary::Word)),
+                    'B' => Ok(Node::Assert(Boundary::NotWord)),
+                    '<' => Ok(Node::Assert(Boundary::WordStart)),
+                    '>' => Ok(Node::Assert(Boundary::WordEnd)),
+                    // A BACKREFERENCE cannot be served by a state machine: it
+                    // asks what an earlier group captured, which is why every
+                    // engine that has them backtracks -- and backtracking is
+                    // the exponential behaviour this one exists to avoid.
+                    // Refused rather than read as a literal digit, because a
+                    // silent wrong answer is what this whole arm is fixing.
+                    '1'..='9' => Err(format!(
+                        "backreference `\\{}` needs a backtracking matcher",
+                        next.c
+                    )),
+                    other => Ok(Node::Lit(other)),
                 }
             }
             '*' | '+' | '?' => Err(format!("nothing to repeat before `{}`", q.c)),
@@ -324,9 +393,7 @@ impl Parser<'_> {
             };
             if q.c == ']' && !first {
                 self.i += 1;
-                let at = self.classes.len();
-                self.classes.push((negated, items));
-                return Ok(Node::Class(at));
+                return Ok(self.intern_class(negated, items));
             }
             first = false;
             if q.c == '[' && matches!(self.pat.get(self.i + 1), Some(n) if n.c == ':') {
@@ -409,6 +476,10 @@ fn emit(node: &Node, prog: &mut Vec<Inst>, fuel: &mut usize) -> Result<(), Strin
         }
         Node::End => {
             prog.push(Inst::AssertEnd);
+            Ok(())
+        }
+        Node::Assert(b) => {
+            prog.push(Inst::AssertBoundary(*b));
             Ok(())
         }
         Node::Group(inner) => emit(inner, prog, fuel),
@@ -514,7 +585,7 @@ impl Regex {
             // The search start is injected at every position, which is what
             // makes this unanchored without a `.*` prefix that `^` would then
             // have to see through.
-            self.add(&mut current, &mut on_current, &mut stack, 0, pos, len);
+            self.add(&mut current, &mut on_current, &mut stack, 0, pos, &chars);
             for pc in &current {
                 if matches!(self.prog.get(*pc), Some(Inst::Match)) {
                     return true;
@@ -538,7 +609,7 @@ impl Regex {
                     _ => false,
                 };
                 if consumes {
-                    self.add(&mut next, &mut on_next, &mut stack, pc + 1, pos + 1, len);
+                    self.add(&mut next, &mut on_next, &mut stack, pc + 1, pos + 1, &chars);
                 }
             }
             std::mem::swap(&mut current, &mut next);
@@ -558,8 +629,9 @@ impl Regex {
         stack: &mut Vec<usize>,
         pc: usize,
         pos: usize,
-        len: usize,
+        chars: &[char],
     ) {
+        let len = chars.len();
         stack.clear();
         stack.push(pc);
         while let Some(pc) = stack.pop() {
@@ -583,6 +655,24 @@ impl Regex {
                 }
                 Some(Inst::AssertEnd) => {
                     if pos == len {
+                        stack.push(pc + 1);
+                    }
+                }
+                Some(Inst::AssertBoundary(kind)) => {
+                    // Both sides, because every one of these is a question
+                    // about the PAIR: off either end counts as a non-word.
+                    let before = pos
+                        .checked_sub(1)
+                        .and_then(|i| chars.get(i))
+                        .is_some_and(|c| is_word_char(*c));
+                    let after = chars.get(pos).is_some_and(|c| is_word_char(*c));
+                    let ok = match kind {
+                        Boundary::Word => before != after,
+                        Boundary::NotWord => before == after,
+                        Boundary::WordStart => !before && after,
+                        Boundary::WordEnd => before && !after,
+                    };
+                    if ok {
                         stack.push(pc + 1);
                     }
                 }
@@ -786,6 +876,106 @@ mod tests {
         let re = compile(&q(&format!("[{big}]{{10000}}"))).unwrap();
         assert!(!re.is_match("x"));
         assert!(compile(&q(&format!("[{big}]{{100000}}"))).is_err(), "budget still bounds it");
+    }
+
+    /// glibc's ERE extensions, which bash inherits. Served as ordinary escaped
+    /// literals before, which is a SILENT wrong answer: `\bfoo\b` asked
+    /// whether the text contained "bfoob".
+    #[test]
+    fn the_gnu_class_escapes_are_classes() {
+        assert!(m(r"^\w+$", "abc"));
+        assert!(m(r"^\w+$", "a_1"));
+        assert!(!m(r"^\w+$", "a b"));
+        assert!(m(r"^\W$", " "));
+        assert!(!m(r"^\W$", "_"), "underscore is a word character");
+        assert!(m(r"a\sb", "a b"));
+        assert!(m(r"a\sb", "a\tb"));
+        assert!(!m(r"a\sb", "ab"));
+        assert!(m(r"^\S$", "x"));
+        assert!(!m(r"^\S$", " "));
+        // Non-ASCII is a word character, as `[[:alnum:]]` already had it.
+        assert!(m(r"^\w$", "é"));
+    }
+
+    /// The boundary assertions are questions about the PAIR of characters
+    /// straddling a position, and consume nothing. Off either end counts as a
+    /// non-word, which is what makes `\bfoo\b` match a word at the very start.
+    #[test]
+    fn the_boundary_assertions_straddle_a_position() {
+        assert!(m(r"\bfoo\b", "a foo b"));
+        assert!(m(r"\bfoo\b", "foo"), "both ends of the subject are boundaries");
+        assert!(!m(r"\bfoo\b", "afoob"));
+        assert!(m(r"\Bbc", "abc"));
+        assert!(!m(r"\Bbc", "a bc"));
+        assert!(m(r"\<abc\>", "x abc y"));
+        assert!(!m(r"\<abc\>", "xabcy"));
+        assert!(!m(r"\<abc", "xabc"));
+        assert!(m(r"\<abc", "abc"), "the start of the subject begins a word");
+        assert!(m(r"abc\>", "xabc"));
+        assert!(!m(r"abc\>", "abcd"), "`\\>` needs a NON-word after it");
+        // `\B` holds where NEITHER side is a word character as well as where
+        // both are. Without this, reading it as "both" passes every other
+        // assertion here.
+        assert!(m(r"\B", "  "));
+        assert!(m(r"\B", "ab"));
+        // Repeating one is refused exactly as repeating an anchor is, and
+        // parenthesising it is allowed exactly as `(^)*` is.
+        assert!(compile(&q(r"\b*")).is_err());
+        assert!(compile(&q(r"(\b)*")).is_ok());
+    }
+
+    /// The other two GNU operators, and the reason they are not assertions of
+    /// their own: bash does not set `REG_NEWLINE`, so `\`` and `\'` are the
+    /// buffer anchors and mean exactly what `^` and `$` mean. Served as
+    /// literals they were the same silent wrong answer as the rest -- `\`abc`
+    /// asked whether the subject contained a backtick.
+    #[test]
+    fn the_buffer_anchors_are_start_and_end() {
+        assert!(m(r"\`abc", "abc"));
+        assert!(!m(r"\`bc", "abc"));
+        assert!(m(r"abc\'", "abc"));
+        assert!(!m(r"ab\'", "abc"));
+        assert!(m(r"\`a\'", "a"));
+        assert!(!m(r"\`a\'", "ab"));
+        // ...which also gets their repetition refused, since they are the same
+        // node `^*` is refused for.
+        assert!(compile(&q(r"\`*a")).is_err());
+        assert!(compile(&q(r"\'*")).is_err());
+        assert!(compile(&q(r"(\`)*a")).is_ok());
+    }
+
+    /// `\b`'s notion of a word character IS `\w`'s, rather than a second
+    /// spelling of it that happens to agree. Pinned because the two would
+    /// otherwise part company the moment `[[:alnum:]]` changed, and nothing
+    /// else here would notice.
+    #[test]
+    fn the_boundary_and_the_class_share_one_word_character() {
+        for c in ['a', 'Z', '0', '_', ' ', '-', '.', 'é', '²'] {
+            let subject = format!("{c}");
+            assert_eq!(
+                is_word_char(c),
+                compile(&q(r"^\w$")).unwrap().is_match(&subject),
+                "`\\b` and `\\w` disagree about {c:?}"
+            );
+        }
+    }
+
+    /// A backreference asks what an earlier group CAPTURED, which no state
+    /// machine can answer -- every engine that serves them backtracks, and
+    /// backtracking is the exponential behaviour this one exists to avoid. So
+    /// it is refused rather than read as a literal digit: bash matches
+    /// `(a)\1` against "aa" and this cannot, and saying so beats answering a
+    /// different question.
+    #[test]
+    fn a_backreference_is_refused_rather_than_misread() {
+        for bad in [r"(a)\1", r"\1", r"(a)(b)\2"] {
+            assert!(compile(&q(bad)).is_err(), "should have been refused: {bad:?}");
+        }
+        // `\0` is not a backreference and stays a literal, as does any other
+        // escaped character the roster does not claim.
+        assert!(m(r"\0", "0"));
+        assert!(m(r"a\.c", "a.c"));
+        assert!(!m(r"a\.c", "abc"));
     }
 
     /// A repetition whose BODY emits nothing appends no instruction however
