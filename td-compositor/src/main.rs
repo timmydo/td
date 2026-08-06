@@ -6,6 +6,7 @@ mod conn;
 mod font;
 mod font_data;
 mod framebuffer;
+mod help;
 mod input;
 mod keyboard;
 mod keys;
@@ -472,6 +473,7 @@ mod confinement {
         ("font.rs", include_str!("font.rs")),
         ("font_data.rs", include_str!("font_data.rs")),
         ("framebuffer.rs", include_str!("framebuffer.rs")),
+        ("help.rs", include_str!("help.rs")),
         ("input.rs", include_str!("input.rs")),
         ("keyboard.rs", include_str!("keyboard.rs")),
         ("keys.rs", include_str!("keys.rs")),

@@ -4,7 +4,7 @@ use std::fmt::Write;
 
 const GLYPH_WIDTH: usize = 5;
 pub(crate) const GLYPH_HEIGHT: usize = 7;
-const GLYPH_ADVANCE: usize = 6;
+pub(crate) const GLYPH_ADVANCE: usize = 6;
 const MAX_HELD_BUTTONS: usize = 32;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -435,6 +435,72 @@ pub(crate) fn draw_text_clipped(
                 }
             }
         }
+    }
+}
+
+pub(crate) fn intersect(
+    rect: (usize, usize, usize, usize),
+    clip: (usize, usize, usize, usize),
+) -> (usize, usize, usize, usize) {
+    let (left, top, width, height) = rect;
+    let (clip_left, clip_top, clip_width, clip_height) = clip;
+    let right = left.saturating_add(width);
+    let bottom = top.saturating_add(height);
+    let clip_right = clip_left.saturating_add(clip_width);
+    let clip_bottom = clip_top.saturating_add(clip_height);
+    let clipped_left = left.max(clip_left);
+    let clipped_top = top.max(clip_top);
+    let clipped_right = right.min(clip_right);
+    let clipped_bottom = bottom.min(clip_bottom);
+    (
+        clipped_left,
+        clipped_top,
+        clipped_right.saturating_sub(clipped_left),
+        clipped_bottom.saturating_sub(clipped_top),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn fill(
+    frame: &mut [u8],
+    width: usize,
+    height: usize,
+    stride: usize,
+    rect: (usize, usize, usize, usize),
+    color: [u8; 4],
+) {
+    let (left, top, rect_width, rect_height) = rect;
+    let right = left.saturating_add(rect_width).min(width);
+    let bottom = top.saturating_add(rect_height).min(height);
+    for y in top..bottom {
+        for x in left..right {
+            put_pixel(frame, width, height, stride, x, y, color);
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn border(
+    frame: &mut [u8],
+    width: usize,
+    height: usize,
+    stride: usize,
+    rect: (usize, usize, usize, usize),
+    color: [u8; 4],
+) {
+    let (left, top, rect_width, rect_height) = rect;
+    if rect_width == 0 || rect_height == 0 {
+        return;
+    }
+    let right = left.saturating_add(rect_width).saturating_sub(1);
+    let bottom = top.saturating_add(rect_height).saturating_sub(1);
+    for x in left..=right.min(width.saturating_sub(1)) {
+        put_pixel(frame, width, height, stride, x, top, color);
+        put_pixel(frame, width, height, stride, x, bottom, color);
+    }
+    for y in top..=bottom.min(height.saturating_sub(1)) {
+        put_pixel(frame, width, height, stride, left, y, color);
+        put_pixel(frame, width, height, stride, right, y, color);
     }
 }
 

@@ -103,6 +103,14 @@ impl PointerState {
         }
     }
 
+    /// Drive the counter to its last value so the next frame that produces
+    /// any event fails. `refresh_focus` has no other injectable failure, and
+    /// the restore paths that turn on one are otherwise untestable.
+    #[cfg(test)]
+    pub fn exhaust_revision(&mut self) {
+        self.revision = u64::MAX;
+    }
+
     pub fn grab_surface(&self) -> Option<SurfaceKey> {
         self.grab
     }

@@ -1,3 +1,4 @@
+use crate::help::Help;
 use crate::launcher::{LaunchRequest, Launcher, LauncherAction};
 use crate::layout::{Command, Layout, Placement, Rect, ViewLayout};
 use std::collections::BTreeMap;
@@ -104,6 +105,7 @@ pub struct Scene {
     pointer_y: i32,
     surface_bytes: usize,
     launcher: Launcher,
+    help: Help,
 }
 
 impl Scene {
@@ -116,6 +118,7 @@ impl Scene {
             pointer_y: 0,
             surface_bytes: 0,
             launcher: Launcher::new(),
+            help: Help::default(),
         }
     }
 
@@ -211,6 +214,25 @@ impl Scene {
 
     pub fn launcher_visible(&self) -> bool {
         self.launcher.visible()
+    }
+
+    /// Set the sheet's one bit outright rather than by an action, so a
+    /// restore cannot be about a DIRECTION. Refuses to raise it behind the
+    /// launcher, which is where "the two are never both up" now lives —
+    /// before, that held only because nothing happened to call it.
+    pub fn set_help(&mut self, visible: bool) -> bool {
+        self.help.set(visible && !self.launcher.visible());
+        self.help.visible()
+    }
+
+    pub fn help_visible(&self) -> bool {
+        self.help.visible()
+    }
+
+    /// Either overlay is modal: it owns the keyboard, withdraws pointer
+    /// hover, and must not be clicked through to the tiles it covers.
+    pub fn modal(&self) -> bool {
+        self.launcher.visible() || self.help.visible()
     }
 
     pub fn launcher_checkpoint(&self) -> Launcher {
@@ -376,6 +398,7 @@ impl Scene {
             draw_surface(frame, width, height, stride, placement.rect, surface);
         }
         self.launcher.paint(frame, width, height, stride);
+        self.help.paint(frame, width, height, stride);
         draw_pointer(frame, width, height, stride, self.pointer_x, self.pointer_y);
     }
 }

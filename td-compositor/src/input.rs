@@ -1,6 +1,7 @@
 use crate::keyboard::{
     KeyInput, KeyState, ModifierState, MOD_ALT, MOD_CAPS, MOD_CONTROL, MOD_LOGO, MOD_NUM, MOD_SHIFT,
 };
+use crate::help::HelpAction;
 use crate::launcher::{LaunchOptions, LaunchProcesses, LaunchRequest, LauncherAction};
 use crate::layout::{Axis, Command, Direction};
 use crate::pointer::{
@@ -69,6 +70,7 @@ const KEY_V: u16 = 47;
 const KEY_B: u16 = 48;
 const KEY_N: u16 = 49;
 const KEY_M: u16 = 50;
+const KEY_SLASH: u16 = 53;
 const KEY_RIGHTSHIFT: u16 = 54;
 const KEY_LEFTALT: u16 = 56;
 const KEY_SPACE: u16 = 57;
@@ -105,6 +107,7 @@ struct KeyBindings {
     caps_lock: bool,
     num_lock: bool,
     launcher_open: bool,
+    help_open: bool,
     consumed: BTreeSet<(usize, u16)>,
     pointer_pressed: BTreeSet<(usize, u16)>,
     pointer_forwarded: BTreeSet<u16>,
@@ -114,6 +117,7 @@ struct KeyBindings {
 struct KeyDecision {
     command: Option<Command>,
     launcher: Option<LauncherAction>,
+    help: Option<HelpAction>,
     launch: Option<LaunchRequest>,
     forward: Option<KeyInput>,
     modifiers: Option<ModifierState>,
@@ -129,6 +133,7 @@ impl KeyBindings {
         let mut decision = KeyDecision {
             command: None,
             launcher: None,
+            help: None,
             launch: None,
             forward: None,
             modifiers: None,
@@ -195,6 +200,17 @@ impl KeyBindings {
             decision.forward = self.forward(physical, event);
             return decision;
         }
+        // Any NON-MODIFIER key dismisses the sheet: there is nothing to type
+        // into it and nothing to select, so such a key can only mean "seen
+        // it". Modifiers returned above, which is what lets someone release
+        // Super to read and then press a whole chord that is swallowed whole.
+        // Checked before the chords so `Super+t` closes rather than launching,
+        // and before the launcher so a sheet is always dismissable.
+        if self.help_open {
+            self.consumed.insert(physical);
+            decision.help = Some(HelpAction::Close);
+            return decision;
+        }
         if self.launcher_open {
             self.consumed.insert(physical);
             let control = self.pressed(KEY_LEFTCTRL) || self.pressed(KEY_RIGHTCTRL);
@@ -240,6 +256,14 @@ impl KeyBindings {
         if event.code == KEY_ENTER || event.code == KEY_KPENTER {
             self.consumed.insert(physical);
             decision.launcher = Some(LauncherAction::Open);
+            return decision;
+        }
+        // `?` is Shift+/ on this keymap, and Shift is not required: the sheet
+        // is what someone reaches for when they do not know the bindings, so
+        // demanding an exact one to see them would be the wrong way round.
+        if event.code == KEY_SLASH {
+            self.consumed.insert(physical);
+            decision.help = Some(HelpAction::Toggle);
             return decision;
         }
         // The terminal without going through the launcher: it is the one entry
@@ -294,6 +318,12 @@ impl KeyBindings {
     fn settle_launcher(&mut self, visible: Option<bool>) {
         if let Some(visible) = visible {
             self.launcher_open = visible;
+        }
+    }
+
+    fn settle_help(&mut self, visible: Option<bool>) {
+        if let Some(visible) = visible {
+            self.help_open = visible;
         }
     }
 
@@ -477,6 +507,9 @@ struct PointerFrame {
 trait InputTarget {
     fn command(&mut self, command: Command) -> Result<(), String>;
     fn launcher(&mut self, action: LauncherAction) -> Result<bool, String>;
+    /// Answers whether the sheet is up afterwards, as `launcher` does: the
+    /// adapter must know to route the NEXT key to it.
+    fn help(&mut self, action: HelpAction) -> Result<bool, String>;
     /// Spawn a registry entry WITHOUT opening the overlay — `Super+t`'s whole
     /// point. Separate from `launcher` because that one is about the overlay's
     /// model and returns its visibility, which this never changes.
@@ -526,6 +559,13 @@ impl InputTarget for LiveInputTarget {
     fn launch(&mut self, request: LaunchRequest) -> Result<(), String> {
         self.spawn(request);
         Ok(())
+    }
+
+    fn help(&mut self, action: HelpAction) -> Result<bool, String> {
+        self.runtime
+            .lock()
+            .map_err(|_| "runtime lock poisoned".to_string())?
+            .help(action)
     }
 
     fn launcher(&mut self, action: LauncherAction) -> Result<bool, String> {
@@ -798,6 +838,7 @@ fn apply<T: InputTarget>(
     let decision = bindings.feed_device(device, event);
     if decision.command.is_none()
         && decision.launcher.is_none()
+        && decision.help.is_none()
         && decision.launch.is_none()
         && decision.forward.is_none()
         && decision.modifiers.is_none()
@@ -812,7 +853,7 @@ fn apply<T: InputTarget>(
     deliver_key_decision(&mut *runtime, &mut bindings, decision)?;
     if let Some(frame) = frame {
         let mut buttons = bindings.pointer_device_changes(device, &frame.buttons, frame.time);
-        if bindings.launcher_open {
+        if bindings.launcher_open || bindings.help_open {
             buttons.retain(|button| button.state == PointerButtonState::Released);
         }
         let delivery = if frame.dx != 0 || frame.dy != 0 || !buttons.is_empty() {
@@ -837,6 +878,10 @@ fn deliver_key_decision<T: InputTarget>(
     if let Some(action) = decision.launcher {
         let visible = runtime.launcher(action)?;
         bindings.settle_launcher(Some(visible));
+    }
+    if let Some(action) = decision.help {
+        let visible = runtime.help(action)?;
+        bindings.settle_help(Some(visible));
     }
     if let Some(request) = decision.launch {
         runtime.launch(request)?;
@@ -1161,6 +1206,8 @@ mod tests {
         flushes: usize,
         flush_error: Option<String>,
         launched: Vec<LaunchRequest>,
+        help_actions: Vec<HelpAction>,
+        help: crate::help::Help,
     }
 
     impl InputTarget for RecordingTarget {
@@ -1172,6 +1219,15 @@ mod tests {
         fn launch(&mut self, request: LaunchRequest) -> Result<(), String> {
             self.launched.push(request);
             Ok(())
+        }
+
+        fn help(&mut self, action: HelpAction) -> Result<bool, String> {
+            self.help_actions.push(action);
+            // The real model, not a second copy of its rule: a fake that
+            // drifted would let the adapter test agree with a sheet that no
+            // longer behaves this way.
+            self.help.set(action.target(self.help.visible()));
+            Ok(self.help.visible())
         }
 
         fn launcher(&mut self, action: LauncherAction) -> Result<bool, String> {
@@ -1246,6 +1302,10 @@ mod tests {
 
         fn launch(&mut self, request: LaunchRequest) -> Result<(), String> {
             self.recording.launch(request)
+        }
+
+        fn help(&mut self, action: HelpAction) -> Result<bool, String> {
+            self.recording.help(action)
         }
 
         fn launcher(&mut self, action: LauncherAction) -> Result<bool, String> {
@@ -1581,6 +1641,277 @@ mod tests {
             press(&mut bindings, KEY_LEFTMETA);
             assert_eq!(tap(&mut bindings, code), Some(expected));
         }
+    }
+
+    /// What a help row's chord actually produces. The sheet is PAINTED text,
+    /// so nothing but a test can stop it describing bindings that no longer
+    /// exist — the compiler sees two unrelated string literals.
+    #[derive(Debug, Eq, PartialEq)]
+    enum Bound {
+        Command(Command),
+        Launcher(LauncherAction),
+        Launch(LaunchRequest),
+        Help(HelpAction),
+        /// Documented but not a key, so this row is exercised elsewhere.
+        Pointer,
+    }
+
+    impl Bound {
+        /// The words the sheet must use for this effect. Checking the ACTION
+        /// column is the half that makes a row honest: without it a row can
+        /// name the right chord beside a description of something else.
+        fn action(&self) -> &'static str {
+            match self {
+                Bound::Command(Command::Focus(_)) | Bound::Pointer => "FOCUS A TILE",
+                Bound::Command(Command::Move(_)) => "MOVE A TILE",
+                Bound::Command(Command::SwitchWorkspace(_)) => "SWITCH WORKSPACE",
+                Bound::Command(Command::MoveToWorkspace(_)) => "MOVE TO WORKSPACE",
+                Bound::Command(Command::SetSplit(Axis::Vertical)) => "SPLIT VERTICAL",
+                Bound::Command(Command::SetSplit(Axis::Horizontal)) => "SPLIT HORIZONTAL",
+                Bound::Command(Command::ToggleFullscreen) => "TOGGLE FULLSCREEN",
+                Bound::Launch(LaunchRequest::Terminal) => "NEW TERMINAL",
+                Bound::Launch(LaunchRequest::UiDemo) => "NEW INPUT MONITOR",
+                Bound::Launcher(_) => "OPEN LAUNCHER",
+                Bound::Help(_) => "THIS HELP",
+            }
+        }
+    }
+
+    /// How a chord is SPELLED on the sheet, derived from the codes a probe
+    /// actually pressed. Key FAMILIES rather than one row each, because four
+    /// bindings are a range and printing every member would be a worse cheat
+    /// sheet than naming the range.
+    fn spelling(modifiers: &[u16], code: u16) -> String {
+        let label = match code {
+            KEY_LEFT | KEY_RIGHT | KEY_UP | KEY_DOWN => "ARROWS",
+            KEY_1..=KEY_9 => "1..9",
+            KEY_V => "V",
+            KEY_H => "H",
+            KEY_F => "F",
+            KEY_T => "T",
+            KEY_ENTER => "ENTER",
+            // `?` IS the shifted `/`, so the glyph absorbs the modifier
+            // rather than the sheet naming it twice.
+            KEY_SLASH => return "SUPER+?".to_string(),
+            other => panic!("no help spelling for evdev {other}"),
+        };
+        let shift = if modifiers.contains(&KEY_LEFTSHIFT) {
+            "SHIFT+"
+        } else {
+            ""
+        };
+        format!("SUPER+{shift}{label}")
+    }
+
+    #[test]
+    fn every_painted_help_row_is_the_binding_it_claims() {
+        // One entry per row, IN ORDER, so a row added without a probe fails
+        // the length check rather than going unchecked.
+        let probes: &[(&[u16], u16, Bound)] = &[
+            (
+                &[KEY_LEFTMETA],
+                KEY_LEFT,
+                Bound::Command(Command::Focus(Direction::Left)),
+            ),
+            (
+                &[KEY_LEFTMETA, KEY_LEFTSHIFT],
+                KEY_UP,
+                Bound::Command(Command::Move(Direction::Up)),
+            ),
+            (
+                &[KEY_LEFTMETA],
+                KEY_3,
+                Bound::Command(Command::SwitchWorkspace(3)),
+            ),
+            (
+                &[KEY_LEFTMETA, KEY_LEFTSHIFT],
+                KEY_9,
+                Bound::Command(Command::MoveToWorkspace(9)),
+            ),
+            (
+                &[KEY_LEFTMETA],
+                KEY_V,
+                Bound::Command(Command::SetSplit(Axis::Vertical)),
+            ),
+            (
+                &[KEY_LEFTMETA],
+                KEY_H,
+                Bound::Command(Command::SetSplit(Axis::Horizontal)),
+            ),
+            (
+                &[KEY_LEFTMETA],
+                KEY_F,
+                Bound::Command(Command::ToggleFullscreen),
+            ),
+            (
+                &[KEY_LEFTMETA],
+                KEY_T,
+                Bound::Launch(LaunchRequest::Terminal),
+            ),
+            (
+                &[KEY_LEFTMETA],
+                KEY_ENTER,
+                Bound::Launcher(LauncherAction::Open),
+            ),
+            (
+                &[KEY_LEFTMETA, KEY_LEFTSHIFT],
+                KEY_SLASH,
+                Bound::Help(HelpAction::Toggle),
+            ),
+            (&[], 0, Bound::Pointer),
+        ];
+        assert_eq!(
+            probes.len(),
+            crate::help::ROWS.len(),
+            "every help row needs a probe"
+        );
+        for (probe, row) in probes.iter().zip(crate::help::ROWS) {
+            let (modifiers, code, expected) = probe;
+            if *expected == Bound::Pointer {
+                assert_eq!(row.keys, "CLICK");
+                assert_eq!(row.action, expected.action());
+                continue;
+            }
+            let mut bindings = KeyBindings::default();
+            for modifier in *modifiers {
+                bindings.feed(key(*modifier, KEY_PRESS));
+            }
+            let decision = bindings.feed(key(*code, KEY_PRESS));
+            let actual = match (
+                decision.command,
+                decision.launcher,
+                decision.launch,
+                decision.help,
+            ) {
+                (Some(command), None, None, None) => Bound::Command(command),
+                (None, Some(action), None, None) => Bound::Launcher(action),
+                (None, None, Some(request), None) => Bound::Launch(request),
+                (None, None, None, Some(action)) => Bound::Help(action),
+                other => panic!("{} produced {other:?}", row.keys),
+            };
+            assert_eq!(&actual, expected, "{} / {}", row.keys, row.action);
+            // Both COLUMNS are derived from what the dispatch just did, so a
+            // row cannot drift in either direction: the keys from the chord
+            // that was pressed, the action from the effect it produced.
+            assert_eq!(row.keys, spelling(modifiers, *code));
+            assert_eq!(row.action, actual.action(), "{}", row.keys);
+            assert!(
+                decision.forward.is_none(),
+                "{} reached the client",
+                row.keys
+            );
+        }
+    }
+
+    #[test]
+    fn super_slash_toggles_the_sheet_with_or_without_shift() {
+        for modifiers in [&[KEY_LEFTMETA][..], &[KEY_LEFTMETA, KEY_LEFTSHIFT][..]] {
+            let mut bindings = KeyBindings::default();
+            // Bare, the key is the client's text.
+            let bare = bindings.feed(key(KEY_SLASH, KEY_PRESS));
+            assert!(bare.help.is_none());
+            assert!(bare.forward.is_some());
+            bindings.feed(key(KEY_SLASH, KEY_RELEASE));
+            for modifier in modifiers {
+                bindings.feed(key(*modifier, KEY_PRESS));
+            }
+            let opened = bindings.feed(key(KEY_SLASH, KEY_PRESS));
+            assert_eq!(opened.help, Some(HelpAction::Toggle));
+            assert!(opened.forward.is_none());
+            assert!(bindings.feed(key(KEY_SLASH, KEY_RELEASE)).forward.is_none());
+        }
+    }
+
+    #[test]
+    fn any_non_modifier_key_dismisses_the_sheet_and_runs_no_command() {
+        for code in [KEY_T, KEY_V, KEY_2, KEY_ESC, KEY_A, KEY_ENTER, KEY_SLASH] {
+            let mut bindings = KeyBindings::default();
+            press(&mut bindings, KEY_LEFTMETA);
+            bindings.feed(key(KEY_SLASH, KEY_PRESS));
+            bindings.settle_help(Some(true));
+            bindings.feed(key(KEY_SLASH, KEY_RELEASE));
+            // Super still held: a chord behind the sheet closes it and does
+            // NOT also run, or reading the bindings would launch a terminal.
+            let dismissed = bindings.feed(key(code, KEY_PRESS));
+            assert_eq!(dismissed.help, Some(HelpAction::Close), "{code}");
+            assert!(dismissed.command.is_none(), "{code}");
+            assert!(dismissed.launch.is_none(), "{code}");
+            assert!(dismissed.launcher.is_none(), "{code}");
+            assert!(dismissed.forward.is_none(), "{code}");
+            assert!(bindings.feed(key(code, KEY_RELEASE)).forward.is_none());
+        }
+    }
+
+    #[test]
+    fn a_modifier_does_not_dismiss_the_sheet() {
+        let mut bindings = KeyBindings::default();
+        press(&mut bindings, KEY_LEFTMETA);
+        bindings.feed(key(KEY_SLASH, KEY_PRESS));
+        bindings.settle_help(Some(true));
+        bindings.feed(key(KEY_SLASH, KEY_RELEASE));
+        bindings.feed(key(KEY_LEFTMETA, KEY_RELEASE));
+        // Reading the sheet means letting go of the keyboard, and pressing a
+        // modifier is how the next chord STARTS: dismissing on it would eat
+        // the modifier and leave the chord's key to act on its own.
+        for code in [
+            KEY_LEFTMETA,
+            KEY_RIGHTMETA,
+            KEY_LEFTSHIFT,
+            KEY_LEFTCTRL,
+            KEY_LEFTALT,
+        ] {
+            let held = bindings.feed(key(code, KEY_PRESS));
+            assert!(held.help.is_none(), "{code} dismissed the sheet");
+            assert!(bindings.help_open, "{code}");
+        }
+        // The chord's own key then closes it and does not run.
+        let dismissed = bindings.feed(key(KEY_T, KEY_PRESS));
+        assert_eq!(dismissed.help, Some(HelpAction::Close));
+        assert!(dismissed.launch.is_none());
+    }
+
+    #[test]
+    fn the_launcher_outranks_the_sheet_so_both_are_never_up() {
+        let mut bindings = KeyBindings::default();
+        press(&mut bindings, KEY_LEFTMETA);
+        bindings.feed(key(KEY_ENTER, KEY_PRESS));
+        bindings.settle_launcher(Some(true));
+        bindings.feed(key(KEY_ENTER, KEY_RELEASE));
+        // The launcher branch runs first, and `/` is not a character it
+        // accepts, so the chord neither opens the sheet nor types.
+        let slash = bindings.feed(key(KEY_SLASH, KEY_PRESS));
+        assert!(slash.help.is_none());
+        assert!(slash.launcher.is_none());
+        assert!(slash.forward.is_none());
+        assert!(!bindings.help_open);
+    }
+
+    #[test]
+    fn the_adapter_routes_the_sheet_and_settles_its_capture() {
+        let target = Mutex::new(RecordingTarget::default());
+        let bindings = Mutex::new(KeyBindings::default());
+        let mut pointer = PointerMotion::default();
+        for event in [
+            key(KEY_LEFTMETA, KEY_PRESS),
+            key(KEY_SLASH, KEY_PRESS),
+            key(KEY_SLASH, KEY_RELEASE),
+        ] {
+            apply(&target, event, 0, &bindings, &mut pointer).unwrap();
+        }
+        assert!(bindings.lock().unwrap().help_open);
+        assert_eq!(target.lock().unwrap().help_actions, [HelpAction::Toggle]);
+
+        for event in [key(KEY_T, KEY_PRESS), key(KEY_T, KEY_RELEASE)] {
+            apply(&target, event, 0, &bindings, &mut pointer).unwrap();
+        }
+        assert!(!bindings.lock().unwrap().help_open);
+        let target = target.lock().unwrap();
+        assert_eq!(
+            target.help_actions,
+            [HelpAction::Toggle, HelpAction::Close]
+        );
+        assert_eq!(target.launched, []);
+        assert_eq!(target.commands, []);
     }
 
     #[test]

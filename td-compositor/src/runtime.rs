@@ -2,6 +2,7 @@ use crate::framebuffer::Framebuffer;
 use crate::keyboard::{
     KeyInput, KeyboardSnapshot, KeyboardState, ModifierState, RoutedKeyboardEvent,
 };
+use crate::help::HelpAction;
 use crate::launcher::{LaunchRequest, LauncherAction};
 use crate::layout::{Command, ViewLayout};
 use crate::pointer::{
@@ -315,6 +316,43 @@ impl Runtime {
         self.scene.launcher_visible()
     }
 
+    /// The cheat sheet has no model to restore, unlike the launcher: it is one
+    /// bit. Both failures put that bit back and repaint what was there —
+    /// `refresh_focus` as well as the paint, since a scene showing a modal
+    /// sheet the input layer does not believe is up withdraws pointer hover
+    /// with nothing left able to dismiss it.
+    pub fn help(&mut self, action: HelpAction) -> Result<bool, String> {
+        let before = self.scene.help_visible();
+        if self.scene.set_help(action.target(before)) == before {
+            return Ok(before);
+        }
+        if let Err(error) = self.repaint() {
+            return Err(self.restore_help(before, error));
+        }
+        if let Err(error) = self.refresh_focus() {
+            return Err(self.restore_help(before, error));
+        }
+        Ok(self.scene.help_visible())
+    }
+
+    fn restore_help(&mut self, before: bool, error: String) -> String {
+        self.scene.set_help(before);
+        match self.repaint() {
+            Ok(()) => error,
+            Err(restore_error) => format!("{error}; restore help overlay: {restore_error}"),
+        }
+    }
+
+    #[cfg(test)]
+    pub fn help_visible(&self) -> bool {
+        self.scene.help_visible()
+    }
+
+    #[cfg(test)]
+    pub fn exhaust_pointer_revision(&mut self) {
+        self.pointer.exhaust_revision();
+    }
+
     #[cfg(test)]
     pub fn fail_next_repaint(&mut self) {
         self.framebuffer.fail_next_paint();
@@ -329,7 +367,7 @@ impl Runtime {
     ) -> Result<(), String> {
         self.scene
             .move_pointer(dx, dy, self.framebuffer.width, self.framebuffer.height);
-        let modal = self.scene.launcher_visible();
+        let modal = self.scene.modal();
         let (hover, grab) = self.routed_pointer_targets();
         let mut modal_buttons = Vec::new();
         let buttons = if modal {
@@ -553,7 +591,7 @@ impl Runtime {
     }
 
     fn routed_pointer_targets(&self) -> (Option<PointerTarget>, Option<PointerTarget>) {
-        if !self.scene.launcher_visible() {
+        if !self.scene.modal() {
             return self.pointer_targets();
         }
         let (_, grab) = self.pointer_targets();
@@ -636,8 +674,14 @@ mod tests {
         }
     }
 
+    /// Bounded, not a bare `recv`: a compositor that stops emitting an event
+    /// a test expects should FAIL it, not wedge the whole binary — which is
+    /// how a mutation of the modal pointer path presented before this.
     fn recv_pointer(receiver: &Receiver<KeyboardDelivery>) -> RoutedPointerFrame {
-        match receiver.recv().unwrap() {
+        match receiver
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("expected a pointer delivery")
+        {
             KeyboardDelivery::Pointer(frame) => frame,
             KeyboardDelivery::Event(event) => {
                 panic!("unexpected keyboard event revision {}", event.revision);
@@ -1354,6 +1398,220 @@ mod tests {
             )
             .unwrap();
         assert_eq!(runtime.keyboard_snapshot().focus, Some(second));
+    }
+
+    #[test]
+    fn the_help_sheet_toggles_is_modal_to_the_pointer_and_survives_a_failed_paint() {
+        let path = std::env::temp_dir().join(format!(
+            "td-runtime-help-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let cleanup = Cleanup(path);
+        let framebuffer = Framebuffer::test_file(&cleanup.0, 900, 600, 900 * 4).unwrap();
+        let mut runtime = Runtime::new(framebuffer);
+        let first = SurfaceKey {
+            client: 1,
+            object: 10,
+        };
+        let second = SurfaceKey {
+            client: 2,
+            object: 20,
+        };
+        runtime.commit(first, surface([1, 2, 3, 0])).unwrap();
+        runtime.commit(second, surface([4, 5, 6, 0])).unwrap();
+        assert!(!runtime.help_visible());
+
+        assert!(runtime.help(HelpAction::Toggle).unwrap());
+        assert!(runtime.help_visible());
+        // Modal to the pointer exactly as the launcher is: a click cannot
+        // reach the tile the sheet covers.
+        let rect = runtime.layout_snapshot().get(&first).unwrap().rect;
+        runtime
+            .pointer_frame(
+                1,
+                i32::try_from(rect.x.saturating_add(2)).unwrap(),
+                i32::try_from(rect.y.saturating_add(2)).unwrap(),
+                &[],
+            )
+            .unwrap();
+        runtime
+            .pointer_frame(
+                2,
+                0,
+                0,
+                &[PointerButtonInput {
+                    time: 2,
+                    button: 272,
+                    state: PointerButtonState::Pressed,
+                }],
+            )
+            .unwrap();
+        assert_eq!(runtime.keyboard_snapshot().focus, Some(second));
+
+        assert!(!runtime.help(HelpAction::Toggle).unwrap());
+        assert!(!runtime.help_visible());
+        // Closing it hands the pointer back, so the same click now takes.
+        runtime
+            .pointer_frame(
+                3,
+                0,
+                0,
+                &[PointerButtonInput {
+                    time: 3,
+                    button: 273,
+                    state: PointerButtonState::Pressed,
+                }],
+            )
+            .unwrap();
+        assert_eq!(runtime.keyboard_snapshot().focus, Some(first));
+
+        // The two halves of "modal" are independent, and the legs above are
+        // held up by either one alone. This is the other half on its own: a
+        // grab held from BEFORE the sheet opened keeps its pointer target, so
+        // only the button filter stops a new press reaching that client.
+        let subscription = runtime
+            .subscribe_input_with_activity(
+                1,
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(AtomicBool::new(true)),
+            )
+            .unwrap();
+        let (events, stop) = subscription.split();
+        runtime
+            .pointer_frame(
+                4,
+                0,
+                0,
+                &[PointerButtonInput {
+                    time: 4,
+                    button: 274,
+                    state: PointerButtonState::Pressed,
+                }],
+            )
+            .unwrap();
+        while events.try_recv().is_ok() {}
+        assert!(runtime.help(HelpAction::Toggle).unwrap());
+        while events.try_recv().is_ok() {}
+        runtime
+            .pointer_frame(
+                5,
+                0,
+                0,
+                &[PointerButtonInput {
+                    time: 5,
+                    button: 275,
+                    state: PointerButtonState::Pressed,
+                }],
+            )
+            .unwrap();
+        assert!(events.try_recv().is_err(), "a press reached a covered tile");
+        stop.stop();
+        runtime.unsubscribe_keyboard(1);
+        runtime.help(HelpAction::Close).unwrap();
+
+        // A paint that fails puts the bit back, or the compositor would think
+        // a sheet is up that the screen never showed — and every key after it
+        // would be swallowed as a dismissal.
+        runtime.fail_next_repaint();
+        assert!(runtime.help(HelpAction::Toggle).is_err());
+        assert!(!runtime.help_visible());
+        assert!(runtime.help(HelpAction::Toggle).unwrap());
+        runtime.fail_next_repaint();
+        assert!(runtime.help(HelpAction::Close).is_err());
+        assert!(runtime.help_visible());
+
+    }
+
+    #[test]
+    fn the_sheet_cannot_be_raised_behind_the_launcher() {
+        let path = std::env::temp_dir().join(format!(
+            "td-runtime-help-exclusive-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let cleanup = Cleanup(path);
+        let framebuffer = Framebuffer::test_file(&cleanup.0, 900, 600, 900 * 4).unwrap();
+        let mut runtime = Runtime::new(framebuffer);
+        runtime.launcher(LauncherAction::Open).unwrap();
+        assert!(runtime.launcher_visible());
+        // The dispatch cannot ask for this — the launcher branch swallows
+        // `/` — so the refusal is where "never both up" actually lives, not
+        // in an ordering nobody can see.
+        assert!(!runtime.help(HelpAction::Toggle).unwrap());
+        assert!(!runtime.help_visible());
+        assert!(runtime.launcher_visible());
+
+        runtime.launcher(LauncherAction::Close).unwrap();
+        assert!(runtime.help(HelpAction::Toggle).unwrap());
+        assert!(runtime.help_visible());
+    }
+
+    #[test]
+    fn the_sheet_withdraws_pointer_hover_from_the_tile_it_covers() {
+        let path = std::env::temp_dir().join(format!(
+            "td-runtime-help-hover-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let cleanup = Cleanup(path);
+        let framebuffer = Framebuffer::test_file(&cleanup.0, 900, 600, 900 * 4).unwrap();
+        let mut runtime = Runtime::new(framebuffer);
+        let subscription = runtime
+            .subscribe_input_with_activity(
+                7,
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(AtomicBool::new(true)),
+            )
+            .unwrap();
+        let (events, stop) = subscription.split();
+        let key = SurfaceKey {
+            client: 7,
+            object: 3,
+        };
+        runtime.commit(key, surface([1, 2, 3, 0])).unwrap();
+        let rect = runtime.layout_snapshot().get(&key).unwrap().rect;
+        runtime
+            .pointer_frame(
+                1,
+                i32::try_from(rect.x.saturating_add(4)).unwrap(),
+                i32::try_from(rect.y.saturating_add(4)).unwrap(),
+                &[],
+            )
+            .unwrap();
+        assert!(matches!(
+            recv_pointer(&events).events.as_slice(),
+            [PointerEvent::Enter { target }] if target.surface == key
+        ));
+
+        // No button is held, so the filter has nothing to drop: leaving is
+        // the hover withdrawal's own work. A client under the sheet must not
+        // keep tracking a pointer the operator cannot aim at it.
+        assert!(runtime.help(HelpAction::Toggle).unwrap());
+        assert_eq!(
+            recv_pointer(&events).events,
+            vec![PointerEvent::Leave { surface: key }]
+        );
+        runtime.pointer_frame(2, 3, 3, &[]).unwrap();
+        assert!(events.try_recv().is_err(), "motion crossed the sheet");
+
+        assert!(!runtime.help(HelpAction::Toggle).unwrap());
+        assert!(matches!(
+            recv_pointer(&events).events.as_slice(),
+            [PointerEvent::Enter { target }] if target.surface == key
+        ));
+
+        // Withdrawing that hover is what advances the pointer revision, so
+        // exhausting it is the only injectable `refresh_focus` failure — and
+        // that failure lands AFTER a successful paint, with the sheet already
+        // on the screen. Leaving the bit set there would withdraw hover for
+        // good, since `settle_help` is never reached on an error and nothing
+        // would be able to dismiss it.
+        runtime.exhaust_pointer_revision();
+        assert!(runtime.help(HelpAction::Toggle).is_err());
+        assert!(!runtime.help_visible());
+        stop.stop();
+        runtime.unsubscribe_keyboard(7);
     }
 
     #[test]

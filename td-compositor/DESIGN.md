@@ -71,6 +71,15 @@ binding is ONE chord on `Super`:
   a horizontal split, and `Super+f` toggles fullscreen;
 - `Super+t` starts a terminal, which is the one registry entry anybody opens
   repeatedly;
+- `Super+?` shows this table on screen. `?` is Shift+`/` here and Shift is
+  not required, since the sheet is what someone reaches for when they do NOT
+  know the bindings and demanding an exact chord to see them would be the
+  wrong way round. Any NON-MODIFIER key dismisses it: there is nothing to
+  type into and nothing to select, so such a key can only mean "seen it".
+  Modifiers are deliberately excluded, which is what lets someone let go of
+  the keyboard to read and then press a whole chord that is swallowed whole
+  — dismissing on the modifier would eat it and leave the chord's key to
+  act alone, so reading the table would start a terminal;
 - `Super+Enter` — or `Super+KPEnter`, since the open overlay activates on
   either — opens the launcher, from which everything else is reachable.
   `Control+n` and `Control+p`, or Down and Up, move its selection; Enter
@@ -81,10 +90,34 @@ Shift is read only where the list says so: `Super+Shift+f` is fullscreen and
 `Ctrl+Super+t` is a terminal, since the letter chords and the launcher one
 look at Super alone. That is deliberate — a chord the operator got a spare
 modifier onto should do what it says rather than nothing — and it matches
-how the workspace and arrow bindings already treated Control and Alt. The
-overlay outranks all of it: while the launcher is up it owns every
-non-modifier key, so `Super+t` behind it neither starts a second terminal
-nor types `t` into the query.
+how the workspace and arrow bindings already treated Control and Alt. An
+overlay outranks all of it: while one is up it owns every non-modifier key,
+so `Super+t` behind it neither starts a second terminal nor types `t` into
+the query. The launcher outranks the sheet in turn, so the two can never
+both be up: `Scene::set_help` REFUSES to raise the sheet while the launcher
+is visible. That refusal is the invariant, not the fact that `/` is no
+character the launcher accepts — the dispatch already cannot ask for it, so
+before the refusal existed the property held only because nothing happened
+to call it, and any new caller would have broken it silently. The sheet is
+checked FIRST on dismissal, though, so a sheet is always dismissable
+whatever else believes itself up.
+
+The sheet is PAINTED text beside bindings that live in the dispatch, and
+nothing the compiler sees connects the two: they are unrelated string
+literals. So a test drives every row's real chord through `KeyBindings` and
+derives BOTH columns from what came back — the keys from the codes it
+pressed, the action from the effect it produced — and it counts the rows, so
+one added without a probe fails rather than going unchecked. A binding that
+changes without this table changing is therefore a failing test rather than
+a screen that lies, which is the only guarantee available for painted text.
+`CLICK` is the one row no chord can drive; it is pinned by name and by its
+action text, and the pointer path proves the behaviour itself. The limit of
+that check is worth stating: it links the table to the DISPATCH, not to the
+keymap, so the glyph names (`?`, `V`, `T`) are literals — remapping a key in
+`keys.rs` would make the sheet lie with the suite green. The card is
+sized FROM the table too, so adding a row cannot push the last one past the
+bottom edge, and every pixel is clipped to it on an output too small to
+hold it.
 
 Everything in that table is taken FROM the focused client, and this list
 takes more than the one it replaces: the four arrows, Enter, and `t`/`v`/`h`
@@ -648,6 +681,11 @@ The landing must prove:
 - pointer model tests cover enter, leave, motion, cross-client routing,
   duplicate buttons, mid-frame re-grabs, implicit grabs, surface removal,
   workspace cancellation, snapshots, and revision exhaustion;
+- every painted help row is driven through the dispatch, both columns
+  derived from the result, with the row count pinned; the sheet's own tests
+  cover toggling, column and card fit, and clipping on an undersized output,
+  and runtime tests cover its modal pointer — hover withdrawal and the
+  button filter separately, since either alone hides the other;
 - click-to-focus is proved end to end through the runtime — hovering does
   not focus, a press does, a press over the gap does not, a mid-drag press
   does not follow the pointer, a release-and-press in one report focuses
