@@ -744,7 +744,15 @@ fn sed_script_stdin_seekability_is_a_stat_not_a_reopen()
     let src =
         std::fs::read_to_string(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/sed.rs"))?;
     let (_, after) = src.split_once("fn read_script(").ok_or("read_script is gone")?;
-    let (body, _) = after.split_once("\nfn ").ok_or("read_script has no end")?;
+    // The EARLIEST top-level item ends the body, not `fn` alone: the function is
+    // followed by its error type now, so stopping at the next `fn` would swallow
+    // that and quietly widen what the assertion below is allowed to match.
+    let end = ["\nfn ", "\nenum ", "\nstruct ", "\nimpl ", "\n#[derive"]
+        .iter()
+        .filter_map(|k| after.find(k))
+        .min()
+        .ok_or("read_script has no end")?;
+    let body = after.get(..end).ok_or("read_script has no end")?;
     assert!(
         body.contains("metadata(\"/proc/self/fd/0\")"),
         "the stdin arm must ask stat, which does not join a fifo's open handshake"
@@ -1139,6 +1147,10 @@ fn a_diverging_diagnostic_still_names_in_raw_bytes() -> Result<(), Box<dyn std::
 /// `spec/divergence.test.txt` cases pin for the named spelling, and the corpus
 /// cannot say it: a case supplies stdin as BYTES, so there is no way to
 /// annotate "stdin is a directory". GNU auto-prints at exit 0 here.
+///
+/// It names the STREAM rather than the `-` it was spelled as, which is GNU's own
+/// machinery and not a preference: `compile_file` binds the name `-` alone to
+/// `stdin`, and `utils_fp_name` reports that stream as `stdin`.
 #[test]
 fn a_dash_f_script_read_from_a_directory_is_refused(
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -1154,7 +1166,7 @@ fn a_dash_f_script_read_from_a_directory_is_refused(
         .output()?;
     assert_eq!(
         out.stderr,
-        b"sed: couldn't open file -: Is a directory\n".to_vec(),
+        b"sed: read error on stdin: Is a directory\n".to_vec(),
         "a directory on stdin was not refused the way a named one is"
     );
     assert_eq!(out.stdout, b"".to_vec());
@@ -1218,6 +1230,52 @@ fn an_r_source_of_dev_stdin_continues_the_descriptor(
         "the table was still consulted outside POSIXLY_EXTENDED"
     );
     assert_eq!(unaliased.status.code(), Some(0));
+    Ok(())
+}
+
+/// The `-f` wording follows WHICH CALL failed and not the errno it failed with.
+/// Every open failure the corpus pins is ENOENT and every read failure is
+/// EISDIR, so those two agree perfectly with the two arms and an implementation
+/// keyed on the errno passes all of them -- a review demonstrated exactly that.
+/// These are open failures with neither errno, and both agree with GNU byte for
+/// byte. The corpus cannot express either: its harness materializes readable
+/// regular files, so there is no way to annotate a mode or a symlink.
+#[test]
+fn a_dash_f_open_failure_is_named_by_the_call_not_the_errno(
+) -> Result<(), Box<dyn std::error::Error>> {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = TempDir::new("fdash-openfail")?;
+    std::fs::write(dir.join("IN"), b"a\n")?;
+
+    // ELOOP, which no privilege defeats.
+    std::os::unix::fs::symlink("loop2", dir.join("loop1"))?;
+    std::os::unix::fs::symlink("loop1", dir.join("loop2"))?;
+    let looped = std::process::Command::new(bin())
+        .args(["sed", "-f", "loop1", "IN"])
+        .current_dir(&dir.0)
+        .output()?;
+    assert_eq!(
+        looped.stderr,
+        b"sed: couldn't open file loop1: Too many levels of symbolic links\n".to_vec(),
+        "an open that failed was reported as a read"
+    );
+    assert_eq!(looped.status.code(), Some(4));
+
+    // EACCES, which root does defeat -- so the mode is checked rather than the uid.
+    std::fs::write(dir.join("shut.sed"), b"p\n")?;
+    std::fs::set_permissions(dir.join("shut.sed"), std::fs::Permissions::from_mode(0o000))?;
+    if std::fs::File::open(dir.join("shut.sed")).is_err() {
+        let shut = std::process::Command::new(bin())
+            .args(["sed", "-f", "shut.sed", "IN"])
+            .current_dir(&dir.0)
+            .output()?;
+        assert_eq!(
+            shut.stderr,
+            b"sed: couldn't open file shut.sed: Permission denied\n".to_vec(),
+            "an open that failed was reported as a read"
+        );
+        assert_eq!(shut.status.code(), Some(4));
+    }
     Ok(())
 }
 

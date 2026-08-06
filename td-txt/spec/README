@@ -1268,13 +1268,15 @@ td-txt-authored case files
   - `-f` naming an ENDLESS stream (`/dev/zero`, `/dev/urandom`): GNU parses the
     script as it reads, so it fails on line 1 -- `unknown command: ` on a NUL
     byte -- and exits 1. td-txt reads the whole script into memory BEFORE
-    parsing, so it grows until the allocation fails and exits 4 with
-    `couldn't open file /dev/zero: out of memory`. Both refuse and neither
-    hangs, so this is fail-closed either way; what differs is that td-txt
-    spends memory to get there. Closing it means parsing incrementally rather
-    than reading first, which is a different program and its own landing, not
-    a corner of this one. Predates the branch -- `read_input` read to the end
-    the same way `read_script` does. Found by a reviewer.
+    parsing, so it grows until the allocation fails and exits 4 with `read
+    error on /dev/zero: out of memory` -- measured under a `ulimit -v`, and it
+    said `couldn't open file` until the open and read failures were told apart.
+    Both refuse and neither hangs, so this is fail-closed either way; what
+    differs is that td-txt spends memory to get there. Closing it means parsing
+    incrementally rather than reading first, which is a different program and
+    its own landing, not a corner of this one. Predates the branch --
+    `read_input` read to the end the same way `read_script` does. Found by a
+    reviewer.
 
   - `s//\N/` -- the empty regex reusing the last one -- is unchecked here and
     only half-unchecked in GNU: `/\(a\)/s//\2/` and `/a/s//\1/` are refused

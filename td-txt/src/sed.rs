@@ -1733,12 +1733,7 @@ impl Stream {
                     // case — a DIRECTORY — delivers none, failing at the first read.
                     Err((e, _)) => match opener {
                         Opener::Reader => {
-                            let name = input.error_name(&self.name);
-                            diag(&crate::util::name_in(
-                                "read error on ",
-                                &name,
-                                &format!(": {}", errmsg(&e)),
-                            ));
+                            diag(&read_error(&input.error_name(&self.name), &e));
                             self.fatal = true;
                             return false;
                         }
@@ -2842,10 +2837,11 @@ fn run(args: &[Vec<u8>]) -> Result<i32, Fatal> {
                     } else {
                         if name == b"file" {
                             // Same failure as short `-f`, so the same status and the
-                            // same wording: the script did not fail to COMPILE, the
-                            // file failed to open.
+                            // same wording: the script did not fail to COMPILE, it
+                            // failed to arrive — at the open or at the read, which
+                            // `ScriptFailure` tells apart.
                             let (text, seekable) = read_script(&value).map_err(|e| Fatal {
-                                msg: cant_open(&value, &e),
+                                msg: e.msg(&value),
                                 status: 4,
                                 locus: None,
                             })?;
@@ -2917,7 +2913,7 @@ fn run(args: &[Vec<u8>]) -> Result<i32, Fatal> {
                     // An unreadable SCRIPT file is exit 4, like any other
                     // runtime failure — not 1, which means a bad script.
                     let (text, seekable) = read_script(&v).map_err(|e| Fatal {
-                        msg: cant_open(&v, &e),
+                        msg: e.msg(&v),
                         status: 4,
                         locus: None,
                     })?;
@@ -3085,12 +3081,7 @@ fn compile_and_run(
                 // rewrite the operand TRUNCATED where GNU's own failure path
                 // unlinks its temp file and leaves the original alone.
                 Err((e, _)) => {
-                    let name = input.error_name(path);
-                    diag(&crate::util::name_in(
-                        "read error on ",
-                        &name,
-                        &format!(": {}", errmsg(&e)),
-                    ));
+                    diag(&read_error(&input.error_name(path), &e));
                     sink.flush().map_err(Fatal::runtime_msg)?;
                     return Ok(4);
                 }
@@ -3186,10 +3177,10 @@ struct RFile {
 /// A named file is opened here, so the second half holds by construction and only
 /// the seek is asked. Stdin can be neither seeked nor reopened, so it gets a PROXY
 /// -- see the comment below for where the proxy and GNU part company.
-fn read_script(path: &[u8]) -> std::io::Result<(Vec<u8>, bool)> {
+fn read_script(path: &[u8]) -> Result<(Vec<u8>, bool), ScriptFailure> {
     let mut data = Vec::new();
     if path == b"-" {
-        std::io::stdin().lock().read_to_end(&mut data)?;
+        std::io::stdin().lock().read_to_end(&mut data).map_err(ScriptFailure::Stdin)?;
         // `Stdin` cannot seek and must NOT be reopened to ask: opening fd 0 again
         // waits for a writer for ever when it is a fifo. `stat` does not take part
         // in that handshake, and it answers both halves at once for the case that
@@ -3220,9 +3211,40 @@ fn read_script(path: &[u8]) -> std::io::Result<(Vec<u8>, bool)> {
             .unwrap_or(false);
         return Ok((data, seekable));
     }
-    let mut file = std::fs::File::open(crate::util::path_from_bytes(path))?;
-    file.read_to_end(&mut data)?;
+    let mut file = std::fs::File::open(crate::util::path_from_bytes(path))
+        .map_err(ScriptFailure::Open)?;
+    file.read_to_end(&mut data).map_err(ScriptFailure::Read)?;
     Ok((data, file.seek(std::io::SeekFrom::Start(0)).is_ok()))
+}
+
+/// Which call failed on a `-f` script. The two earn different wordings, and the
+/// distinction is not cosmetic: `couldn't open file` names the call that did NOT
+/// fail when a script opens and then cannot be read, which is exactly what a
+/// DIRECTORY does. `read error on` is the string this program already prints for
+/// an operand and for `r`/`R` on the very same errno.
+#[derive(Debug)]
+enum ScriptFailure {
+    Open(std::io::Error),
+    Read(std::io::Error),
+    /// A read that failed on the STDIN script. Its own arm rather than a second
+    /// `path == "-"` test beside the one `read_script` already made: the module
+    /// that knows which stream it read is the one that says so.
+    Stdin(std::io::Error),
+}
+
+impl ScriptFailure {
+    /// `name` is the `-f` argument as spelled -- except that a READ failure on the
+    /// stdin script names the STREAM. That is GNU's own machinery rather than a
+    /// preference: `compile_file` binds `stdin` (compile.c:1538) for the name `-`
+    /// alone, and `utils_fp_name` reports that stream as `stdin` -- so it is what
+    /// GNU would print here if it inspected the failure at all.
+    fn msg(&self, name: &[u8]) -> Vec<u8> {
+        match self {
+            Self::Open(e) => cant_open(name, e),
+            Self::Read(e) => read_error(name, e),
+            Self::Stdin(e) => read_error(b"stdin", e),
+        }
+    }
 }
 
 /// GNU's posixicity as td-txt needs it: TWO questions rather than one flag, and
@@ -3300,8 +3322,12 @@ fn refuse_write(n: usize) -> Result<(), Vec<u8>> {
     Err(format!("couldn't write {n} {items} to stdin: {}", errmsg(&ebadf())).into_bytes())
 }
 
-fn read_error(name: &str, e: &std::io::Error) -> Vec<u8> {
-    format!("read error on {}: {}", name, errmsg(e)).into_bytes()
+/// `read error on NAME: WHY`, GNU's wording for a read that failed on something
+/// already open (utils.c:240). The one builder for it: `-f` scripts, `r`/`R`
+/// sources and the special streams all print this, and three spellings of one
+/// string is three places to chase when it changes.
+fn read_error(name: &[u8], e: &std::io::Error) -> Vec<u8> {
+    crate::util::name_in("read error on ", name, &format!(": {}", errmsg(e)))
 }
 
 /// `R`'s source, which unlike `r`'s is resolved through the table above: GNU
@@ -3315,7 +3341,7 @@ fn read_r_source(path: &[u8], extended: bool) -> Result<(Vec<u8>, bool), Vec<u8>
         return read_source(path);
     };
     let Special::In = s else {
-        return Err(read_error(s.name(), &ebadf()));
+        return Err(read_error(s.name().as_bytes(), &ebadf()));
     };
     // The descriptor we were GIVEN, rather than the name opened a second time.
     // Where standard input is a fifo whose writer has gone, fd 0 is at end of file
@@ -3325,7 +3351,7 @@ fn read_r_source(path: &[u8], extended: bool) -> Result<(Vec<u8>, bool), Vec<u8>
         // Never rewindable: GNU does not `rewind` a special stream under `-s`,
         // however seekable the descriptor behind it happens to be.
         Ok(_) => Ok((data, false)),
-        Err(e) => Err(read_error(s.name(), &e)),
+        Err(e) => Err(read_error(s.name().as_bytes(), &e)),
     }
 }
 
@@ -3342,11 +3368,7 @@ fn read_source(path: &[u8]) -> Result<(Vec<u8>, bool), Vec<u8>> {
         return Ok((data, false));
     };
     if let Err(e) = file.read_to_end(&mut data) {
-        return Err(crate::util::name_in(
-            "read error on ",
-            path,
-            &format!(": {}", errmsg(&e)),
-        ));
+        return Err(read_error(path, &e));
     }
     Ok((data, file.seek(std::io::SeekFrom::Start(0)).is_ok()))
 }

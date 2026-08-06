@@ -1204,19 +1204,19 @@ a
 # silently applies no edits, passes its input through and exits 0, which no
 # caller can tell from success -- a read that FAILED is not the same thing as a
 # script that was empty, and the shape that really is empty is pinned below and
-# agrees with GNU. The message is imprecise in one way worth knowing: the OPEN
-# succeeded and the READ is what failed, so `couldn't open file' names the wrong
-# call -- GNU's own string for that failure is `read error on %s' (utils.c:240)
-# and td-txt already prints it for an OPERAND and for `r'/`R'. It is kept here
-# for consistency with `-f''s open-failure path, and changing it is its own
-# landing rather than a corner of this one. A DIRECTORY is only the reachable
-# member of the class: any read that fails on an opened script does this, and
-# `sed -f /proc/self/mem' is the same divergence with EIO.
+# agrees with GNU. The message names the call that FAILED: the open succeeded
+# here and the read did not, so this is `read error on %s' (utils.c:240), which
+# is what td-txt already prints for an OPERAND and for `r'/`R' on the very same
+# errno. `couldn't open file' is reserved for an open that really failed, and
+# `-f NOPE' still says it -- byte for byte with GNU, which is the half of this
+# path that does agree. A DIRECTORY is only the reachable member of the class:
+# any read that fails on an opened script does this, and `sed -f /proc/self/mem'
+# is the same divergence with EIO.
 ## argv: sed -f D
 ## file-json D/keep: ""
 ## stdin-json: "a\nb\n"
 ## stdout-json: ""
-## stderr-json: "sed: couldn't open file D: Is a directory\n"
+## stderr-json: "sed: read error on D: Is a directory\n"
 ## status: 4
 
 #### and that refusal outranks an -e that parsed fine
@@ -1225,7 +1225,7 @@ a
 ## file-json D/keep: ""
 ## stdin-json: "a\n"
 ## stdout-json: ""
-## stderr-json: "sed: couldn't open file D: Is a directory\n"
+## stderr-json: "sed: read error on D: Is a directory\n"
 ## status: 4
 
 #### and a second -f that is a real script
@@ -1234,7 +1234,7 @@ a
 ## file-json S: "p\n"
 ## stdin-json: "a\n"
 ## stdout-json: ""
-## stderr-json: "sed: couldn't open file D: Is a directory\n"
+## stderr-json: "sed: read error on D: Is a directory\n"
 ## status: 4
 
 #### and --file, its long spelling, which is a SECOND call site
@@ -1247,5 +1247,5 @@ a
 ## file-json D/keep: ""
 ## stdin-json: "a\nb\n"
 ## stdout-json: ""
-## stderr-json: "sed: couldn't open file D: Is a directory\n"
+## stderr-json: "sed: read error on D: Is a directory\n"
 ## status: 4
