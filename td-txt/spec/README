@@ -1536,10 +1536,59 @@ td-txt-authored case files
     and against `/dev/zero` it is not a hang but an OOM, the buffer growing until
     the allocation fails (`out of memory`, exit 2, under a `ulimit -v`) or the
     kernel kills it, where GNU searches at constant memory.
+
+    That last clause is right, and WHY it is right is worth having, because an
+    attempt to correct it as wrong got it backwards. `/dev/zero` holds no
+    newline at all -- 1 MB of it has zero non-NUL bytes -- so it is one
+    unbounded line, and the natural reading is that any line-based tool must
+    buffer it. GNU escapes that by classifying the stream BINARY: it never has
+    to emit a line from it, so it never has to hold one. Measured at `ulimit -v`
+    200000, 500000 and 2000000, default `grep -q x /dev/zero` sits at a flat
+    ~6.8 MB and runs until killed. Ask it for the text and it dies exactly as
+    the reasoning predicts: `-a` or `--binary-files=text` gives `memory
+    exhausted` and SIGABRT, status 134. So the two devices differ in the DEVICE
+    and not in the fix, and a streaming td-txt would match GNU on both -- on
+    `/dev/urandom` by returning at the first match, and on `/dev/zero` by
+    scanning at constant memory and never returning, which is a divergence
+    closed even though neither implementation terminates.
+
     Pre-existing for an operand -- the parent build hangs identically -- and `-R`
     widens the reach rather than causing it, since a logical walk collects the
     devices a physical one skips. Not a `-R` bug: the same command without `-R`
     hangs the same way. Fixing it is a streaming reader, not a walk rule.
+
+  - The BINARY test is decided AS GNU STREAMS and whole-file here, so td-txt
+    SUPPRESSES output GNU has already printed. GNU classifies each buffer as it
+    reads it: once one holds a NUL, matching lines from there on are replaced by
+    a single `binary file matches` notice -- but lines matched BEFORE that
+    buffer were already written and stay written. `search_file` instead asks
+    `data.contains(&0)` of the whole operand, so one NUL anywhere retracts
+    everything. Over `"m1 match\n"` + 120 KB of padding + `"\n\0\n"` + `"m2
+    match\n"` + `"m3 match\n"`, GNU prints `m1 match` AND THEN the notice, at
+    exit 0; td-txt prints the notice alone.
+
+    A NUL in a LATER buffer therefore counts, which is what makes this a
+    streaming rule rather than a window: padding + `"\n\0\n"` + a match, with
+    nothing matching before the NUL, is `binary file matches` in both. What the
+    boundary measures is only where GNU's FIRST read ends -- the offset at which
+    an early match stops sharing a buffer with the NUL -- so it is a property of
+    the DESCRIPTOR and not of the rule. Binary-searching the NUL's offset
+    against GNU grep 3.11: for a regular-file operand a NUL at offset 98303 is
+    binary and 98304 is text, so the first read is 96 KiB; through a real pipe
+    the same file flips at 65535/65536, a 64 KiB first read. No case had caught
+    any of this because seeing it needs an operand bigger than that.
+
+    `-c`/`-l`/`-L`/`-q` are unaffected in both, printing no line content: GNU
+    still counts all three matches above. Distinct from the `-x` NUL entry,
+    which is a one-line file and about the anchored test rather than about how
+    much was looked at.
+
+    Closing it is NOT free with a streaming reader, which an earlier draft of
+    this entry claimed. What GNU does depends on the ORDER of two things inside
+    the loop -- classifying a buffer against emitting the matches in it -- and
+    on where the buffer boundaries fall, so a reader that streams but classifies
+    at the wrong moment reproduces none of it. It wants its own cases, over an
+    operand large enough to have a second buffer at all.
 
   - `-d`/`--directories` is an `invalid option` here, so GNU's other spelling of
     a descent (`grep -d recurse a .`) is unavailable, as is `-d skip`. No xfail
