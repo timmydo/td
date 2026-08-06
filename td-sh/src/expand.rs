@@ -51,7 +51,7 @@ struct Field {
 /// Full expansion of one word in an argument position: splitting and pathname
 /// expansion included.
 pub fn expand_fields(sh: &mut Shell, w: &Word) -> R<Vec<String>> {
-    let fields = expand_raw(sh, w, false)?;
+    let fields = expand_raw(sh, w, false, true)?;
     let split = split_fields(sh, fields);
     let mut out = Vec::new();
     for field in split {
@@ -217,7 +217,7 @@ pub fn expand_pattern(sh: &mut Shell, w: &Word) -> R<Vec<QChar>> {
 /// Expand and flatten to a single run of characters, joining the fields that a
 /// `$@` may have produced with a space.
 fn expand_chars(sh: &mut Shell, w: &Word, force_quoted: bool) -> R<Vec<QChar>> {
-    let fields = expand_raw(sh, w, force_quoted)?;
+    let fields = expand_raw(sh, w, force_quoted, false)?;
     let mut out: Vec<QChar> = Vec::new();
     for (i, f) in fields.iter().enumerate() {
         if i > 0 {
@@ -234,7 +234,7 @@ fn expand_chars(sh: &mut Shell, w: &Word, force_quoted: bool) -> R<Vec<QChar>> {
 
 /// Expand a word to its fields-before-splitting. More than one field can come
 /// out already: `"$@"` produces one per positional parameter.
-fn expand_raw(sh: &mut Shell, w: &Word, force_quoted: bool) -> R<Vec<Field>> {
+fn expand_raw(sh: &mut Shell, w: &Word, force_quoted: bool, splitting: bool) -> R<Vec<Field>> {
     let mut done: Vec<Field> = Vec::new();
     let mut cur = Field::default();
     for (i, seg) in w.0.iter().enumerate() {
@@ -289,7 +289,7 @@ fn expand_raw(sh: &mut Shell, w: &Word, force_quoted: bool) -> R<Vec<Field>> {
                 let value = arith::eval(sh, &text)?;
                 push_expanded(&mut cur.chars, &value.to_string(), q);
             }
-            Seg::Param(p) => expand_param(sh, p, force_quoted, &mut done, &mut cur)?,
+            Seg::Param(p) => expand_param(sh, p, force_quoted, splitting, &mut done, &mut cur)?,
         }
     }
     done.push(cur);
@@ -385,6 +385,7 @@ fn expand_param(
     sh: &mut Shell,
     p: &Param,
     force_quoted: bool,
+    splitting: bool,
     done: &mut Vec<Field>,
     cur: &mut Field,
 ) -> R<()> {
@@ -394,7 +395,16 @@ fn expand_param(
     // there are no positional parameters it contributes nothing at all — and
     // deliberately does not mark the field as quoted, so a lone `"$@"` expands
     // to zero arguments rather than one empty one.
-    if p.op.is_none() && p.name == "@" {
+    //
+    // An UNQUOTED `$*` joins the parameters and lets splitting take them apart
+    // again, which is indistinguishable from this path until IFS is EMPTY:
+    // then nothing splits the join back up, and `set -- "1 2" "3  4"; IFS=`
+    // has to pass two arguments rather than one. Quoted, `"$*"` still joins --
+    // and so does a `$*` in a context that takes ONE word (`v=$*`, `case $*`,
+    // a redirect target), where there is no splitting to undo the join and
+    // several fields would be rejoined on a space that is not the separator.
+    let star_unsplit = p.name == "*" && !quoted && splitting && ifs_value(sh).is_empty();
+    if p.op.is_none() && (p.name == "@" || star_unsplit) {
         let params = sh.params.clone();
         // Each positional becomes its own field; when quoted, every one is a
         // field even if empty (so `"$@"` over ("", "b") yields two args). But a
@@ -441,10 +451,10 @@ fn expand_param(
                 if quoted {
                     cur.had_quotes = true;
                 }
-                // Joined on IFS's first character, as a plain `$*` is.
-                let sep = sh
-                    .get_var("IFS")
-                    .unwrap_or_else(|| " \t\n".to_string())
+                // Joined on IFS's first character. A plain unquoted `$*`
+                // stops joining when IFS is empty; a slice does not, because
+                // it is the QUOTED form that reaches here as one field.
+                let sep = ifs_value(sh)
                     .chars()
                     .next()
                     .map(String::from)
@@ -680,9 +690,7 @@ pub fn lookup(sh: &mut Shell, name: &str) -> Option<String> {
         "-" => Some(sh.opts.letters(sh.interactive)),
         "0" => Some(sh.arg0.clone()),
         "*" => {
-            let sep = sh
-                .get_var("IFS")
-                .unwrap_or_else(|| " \t\n".to_string())
+            let sep = ifs_value(sh)
                 .chars()
                 .next()
                 .map(String::from)
@@ -727,10 +735,16 @@ fn is_ifs_ws(c: char) -> bool {
     c == ' ' || c == '\t' || c == '\n'
 }
 
+/// IFS as every reader of it must see it: UNSET is the default set, while
+/// SET-and-empty is the request that nothing be split or separated.
+pub fn ifs_value(sh: &Shell) -> String {
+    sh.get_var("IFS").unwrap_or_else(|| " \t\n".to_string())
+}
+
 /// IFS field splitting, applied only to characters that came out of an
 /// expansion unquoted.
 fn split_fields(sh: &Shell, fields: Vec<Field>) -> Vec<Vec<QChar>> {
-    let ifs = sh.get_var("IFS").unwrap_or_else(|| " \t\n".to_string());
+    let ifs = ifs_value(sh);
     let mut out: Vec<Vec<QChar>> = Vec::new();
     for field in fields {
         if ifs.is_empty() {
@@ -1273,6 +1287,53 @@ mod tests {
         q.params = vec!["x y".into(), "z".into()];
         assert_eq!(fields(&mut q, "\"${@:1:1}\""), vec!["x y"]);
         assert_eq!(fields(&mut q, "${@:1:1}"), vec!["x", "y"]);
+    }
+
+    /// An unquoted `$*` joins on IFS and lets splitting take the join apart,
+    /// which is indistinguishable from one-field-per-parameter until IFS is
+    /// EMPTY: then nothing splits it back up. `word-split::$* with empty IFS`
+    /// grades it, and `$@` -- which never joined -- is the shape to match.
+    #[test]
+    fn an_unquoted_star_does_not_join_when_ifs_is_empty() {
+        let mut sh = Shell::new_for_test();
+        sh.params = vec!["1 2".into(), "3  4".into()];
+        let _ = sh.set_var("IFS", "");
+        assert_eq!(fields(&mut sh, "$*"), vec!["1 2", "3  4"]);
+        assert_eq!(fields(&mut sh, "${*}"), vec!["1 2", "3  4"]);
+        assert_eq!(fields(&mut sh, "$@"), vec!["1 2", "3  4"]);
+        // Quoted it still joins, with nothing between: `"$*"` is one field
+        // however empty the separator is.
+        assert_eq!(fields(&mut sh, "\"$*\""), vec!["1 23  4"]);
+    }
+
+    /// Skipping the join is bounded to contexts that SPLIT. A single-word
+    /// context has nothing to undo the join with, so several fields would be
+    /// rejoined on a space that is not the separator: `IFS=; v=$*` is `ab`,
+    /// never `a b`. Nothing in the corpus covers this -- its only `$*`
+    /// assignment case runs at `IFS=:` -- so the guard lives here.
+    #[test]
+    fn a_single_word_context_still_joins_the_star() {
+        let mut sh = Shell::new_for_test();
+        sh.params = vec!["a".into(), "b".into()];
+        let _ = sh.set_var("IFS", "");
+        assert_eq!(expand_single(&mut sh, &word("$*")).ok(), Some("ab".into()));
+        assert_eq!(expand_single(&mut sh, &word("-$*-")).ok(), Some("-ab-".into()));
+        // `$@` has always been rejoined on a space here, and still is.
+        assert_eq!(expand_single(&mut sh, &word("$@")).ok(), Some("a b".into()));
+    }
+
+    /// The only thing that can tell join-then-split from one field per
+    /// parameter under a NON-empty IFS is an empty parameter -- and there this
+    /// shell answers as bash does while the ash golden drops it
+    /// (`word-split::IFS=x and '' and $@`, still an xfail). Recorded rather
+    /// than endorsed: it is pre-existing, untouched here, and asserted so that
+    /// changing it has to be deliberate.
+    #[test]
+    fn an_empty_parameter_under_a_non_empty_ifs_is_a_known_divergence() {
+        let mut sh = Shell::new_for_test();
+        sh.params = vec!["".into(), "a".into()];
+        let _ = sh.set_var("IFS", ":");
+        assert_eq!(fields(&mut sh, "$*"), vec!["", "a"]);
     }
 
     /// Every operator over `$@` acts on the JOIN rather than on each positional

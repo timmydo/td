@@ -1318,14 +1318,9 @@ xfail whitespace.test.sh::\r in arith expression is allowed by some shells, but 
 xfail whitespace.test.sh::whitespace in string to integer conversion
 xfail word-eval.test.sh::Default values -- more cases
 xfail word-split.test.sh::""$A"" - empty string on both sides - derived from spec/toysh-posix #15
-xfail word-split.test.sh::$* with empty IFS
-xfail word-split.test.sh::4 x 3 table - with for loop
-xfail word-split.test.sh::4 x 3 table: (default IFS, IFS='', IFS=zx) x ( $* "$*" $@ "$@" )
 xfail word-split.test.sh::IFS and joining arrays by assignments
 xfail word-split.test.sh::IFS empty doesn't do splitting
 xfail word-split.test.sh::IFS unset behaves like $' \t\n'
-xfail word-split.test.sh::IFS='' with $@ and $* (bug #627)
-xfail word-split.test.sh::IFS='' with $@ and $* and printf (bug #627)
 xfail word-split.test.sh::IFS=x and '' and $@ (#2)
 xfail word-split.test.sh::IFS=x and '' and $@ (#3)
 xfail word-split.test.sh::IFS=x and '' and $@ - same bug as spec/toysh-posix case #12

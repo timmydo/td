@@ -2044,7 +2044,7 @@ fn read(sh: &mut Shell, argv: &[String]) -> R<()> {
         ),
         None => None,
     };
-    let ifs = sh.get_var("IFS").unwrap_or_else(|| " \t\n".to_string());
+    let ifs = crate::expand::ifs_value(sh);
     let ifs_bytes: Vec<u8> = ifs.as_bytes().to_vec();
     let is_ifs = |c: u8| ifs_bytes.contains(&c);
     // C's `isspace` in the C locale, which is what `shell_builtin_read` uses to
