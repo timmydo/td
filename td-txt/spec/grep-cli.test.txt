@@ -1281,6 +1281,20 @@ c
 ## status: 2
 ## stderr-contains: ambiguous
 
+#### the ambiguity names the argv ELEMENT, value and all
+# `--f` and `--f=1` are the same ambiguity -- the `=` never gets as far as
+# mattering -- and glibc reports each as it was GIVEN. Only the NAME is pinned:
+# the possibilities that follow it are a set td-txt diverges on, since the
+# options it does not implement cannot be ambiguous WITH (see spec/README).
+## argv: grep --f=1 a f1
+## file f1:
+a
+b
+## END
+## stdout-json: ""
+## status: 2
+## stderr-contains: option '--f=1' is ambiguous;
+
 #### --max-c=N takes an inline argument
 ## argv: grep --max-c=1 a f1
 ## file f1:

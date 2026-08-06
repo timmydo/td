@@ -415,7 +415,7 @@ pub fn main(args: &[Vec<u8>]) -> i32 {
         }
         if arg.starts_with(b"--") {
             let (name, inline) = split_long(arg);
-            let (name, arity) = match resolve_long(&name) {
+            let (name, arity) = match resolve_long(&name, arg) {
                 Ok(pair) => pair,
                 Err(msg) if msg.is_empty() => {
                     errb(&name_in("unrecognized option '", arg, "'"));
@@ -864,7 +864,11 @@ const LONG_OPTIONS: &[(&[u8], Arg)] = &[
     (b"word-regexp", Arg::None),
 ];
 
-fn resolve_long(name: &[u8]) -> Result<(&'static [u8], Arg), Vec<u8>> {
+/// `arg` is the whole argv element and `name` the part of it between the `--`
+/// and any `=`. glibc names the ELEMENT in both diagnostics -- `--i` and `--i=1`
+/// are the same ambiguity and it reports each as given -- so resolving on one
+/// and reporting the other is the point of the two arguments.
+fn resolve_long(name: &[u8], arg: &[u8]) -> Result<(&'static [u8], Arg), Vec<u8>> {
     let mut hits: Vec<(&'static [u8], Arg)> = Vec::new();
     for (cand, arity) in LONG_OPTIONS {
         if *cand == name {
@@ -878,7 +882,7 @@ fn resolve_long(name: &[u8]) -> Result<(&'static [u8], Arg), Vec<u8>> {
         [one] => Ok(*one),
         [] => Err(Vec::new()),
         many => {
-            let mut msg = name_in("option '--", name, "' is ambiguous; possibilities:");
+            let mut msg = name_in("option '", arg, "' is ambiguous; possibilities:");
             for (n, _) in many {
                 msg.extend_from_slice(b" '--");
                 msg.extend_from_slice(n);

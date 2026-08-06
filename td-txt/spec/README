@@ -1349,18 +1349,31 @@ td-txt-authored case files
     with GNU's golden. Closing it wants a real `-u`, which is a flush policy for
     every output rather than anything about this table.
 
-  - An AMBIGUOUS long-option abbreviation lists its possibilities in a different
-    order, and for grep a different SET. `sed --s` is `'--silent' '--sandbox'
-    '--separate'` in GNU -- its `long_options[]` declaration order -- and
-    `'--sandbox' '--separate' '--silent'` here, which is td-txt's table order.
-    `grep --c` is `'--context' '--color' '--colour' '--count'` there against
-    `'--context' '--count'` here, because `--color`/`--colour` are among the
-    options td-txt does not implement, so they are not candidates to be
-    ambiguous WITH. Same wording, same status, and the count of possibilities is
-    what differs. Predates the branch; recorded when the raw-name landing
-    rewrote both joins (a `join(" ")` over `String`s cannot carry a name, so the
-    list is now built as bytes) and a review asked what the rewrite was holding
-    itself to.
+  - An AMBIGUOUS long-option abbreviation lists a different SET of
+    possibilities for grep. `grep --c` is `'--context' '--color' '--colour'
+    '--count'` in GNU against `'--context' '--count'` here, because
+    `--color`/`--colour` are among the options td-txt does not implement, so
+    they are not candidates to be ambiguous WITH. Same wording, same status, and
+    the COUNT of possibilities is what differs; closing it needs those options
+    built, not anything about the table. Predates the branch; recorded when the
+    raw-name landing rewrote both joins (a `join(" ")` over `String`s cannot
+    carry a name, so the list is now built as bytes) and a review asked what the
+    rewrite was holding itself to.
+
+    The ORDER half of this was sed's and is closed: `sed --s` answered
+    `'--sandbox' '--separate' '--silent'`, td-txt's alphabetical table order,
+    where GNU walks `longopts[]` (sed.c:197) and answers `'--silent'
+    '--sandbox' '--separate'`. sed's table is that declaration now, arities
+    included. grep's stayed alphabetical because reordering it buys nothing
+    measurable, and that is a measurement rather than a guess. Sweeping 2,184
+    spellings -- every one- and two-character prefix, bare and with `=1` and
+    `=` -- there are 42 where GNU and td-txt BOTH report an ambiguity; 30 of
+    those differ, every one of them by the SET above, and NOT ONE by order
+    alone. (A further 18 are the same divergence seen from the side: with
+    fewer candidates a prefix that is ambiguous to GNU resolves here, or the
+    reverse, so only one of the two reports an ambiguity at all.) Reordering
+    changes which order a list is printed in and none of those lines is
+    wrong about its order.
 
   - `-V` is an option GNU sed still TAKES, with an argument, and td-txt refuses.
     GNU's getopt string carries it (the obsolete `--version` spelling) but its

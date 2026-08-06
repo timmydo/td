@@ -2335,7 +2335,10 @@ b
 ## status: 0
 ## stderr-json: ""
 
-#### an ambiguous long-option prefix is refused
+#### an ambiguous long-option prefix is refused, listing GNU's order
+# The possibilities are `getopt_long`'s walk of `longopts[]` (sed.c:197), NOT
+# the alphabetical order the names sort into -- so this case is what holds the
+# table to being a transcription of GNU's rather than a tidy list.
 ## argv: sed --s 2p
 ## stdin:
 a
@@ -2343,7 +2346,173 @@ b
 ## END
 ## stdout-json: ""
 ## status: 1
-## stderr-contains: ambiguous
+## stderr-contains: option '--s' is ambiguous; possibilities: '--silent' '--sandbox' '--separate'
+
+#### the ambiguity names the argv ELEMENT, value and all
+# `--f` and `--f=1` are the same ambiguity -- the `=` never gets as far as
+# mattering -- and glibc reports each as it was GIVEN. Naming the resolved part
+# would report an option the caller did not type.
+## argv: sed --f=1 -n 2p
+## stdin:
+a
+b
+## END
+## stdout-json: ""
+## status: 1
+## stderr-contains: option '--f=1' is ambiguous; possibilities: '--file' '--follow-symlinks'
+
+#### --binary is accepted and does nothing
+# GNU's `--binary` picks binary I/O, which exists only where a TEXT mode does;
+# on every platform td targets there is nothing behind it to model, so ignoring
+# it fails closed. `b` names no other option, so `--b` is that option too.
+## argv: sed --binary -n 2p
+## stdin:
+a
+b
+## END
+## stdout:
+b
+## END
+## status: 0
+## stderr-json: ""
+
+#### --b is the unambiguous prefix of it
+## argv: sed --b -n 2p
+## stdin:
+a
+b
+## END
+## stdout:
+b
+## END
+## status: 0
+## stderr-json: ""
+
+#### -b is its short spelling and does nothing either
+# GNU's SHORTOPTS is `"bsnrzuEe:f:l:i::V:"` (sed.c:191); `b` and `--binary` are
+# one option, so taking the long one alone would refuse `sed -b` while running
+# `sed --binary`.
+## argv: sed -b -n 2p
+## stdin:
+a
+b
+## END
+## stdout:
+b
+## END
+## status: 0
+## stderr-json: ""
+
+#### and it bundles like any other flag
+## argv: sed -nb 2p
+## stdin:
+a
+b
+## END
+## stdout:
+b
+## END
+## status: 0
+## stderr-json: ""
+
+#### an option that takes no value refuses one
+# The check is the TABLE's arity and not any one arm's: an arm that simply
+# dropped the inline value -- which every flag arm does -- would accept what GNU
+# calls an error.
+## argv: sed --binary=1 -n 2p
+## stdin:
+a
+b
+## END
+## stdout-json: ""
+## status: 1
+## stderr-contains: option '--binary' doesn't allow an argument
+
+#### and so does a flag that has been there all along
+## argv: sed --posix=1 -n 2p
+## stdin:
+a
+b
+## END
+## stdout-json: ""
+## status: 1
+## stderr-contains: option '--posix' doesn't allow an argument
+
+#### the refusal names the RESOLVED option, not the abbreviation
+## argv: sed --po=1 -n 2p
+## stdin:
+a
+b
+## END
+## stdout-json: ""
+## status: 1
+## stderr-contains: option '--posix' doesn't allow an argument
+
+#### an empty value is still a value
+## argv: sed --quiet= 2p
+## stdin:
+a
+b
+## END
+## stdout-json: ""
+## status: 1
+## stderr-contains: option '--quiet' doesn't allow an argument
+
+#### an option that DOES take one is untouched by that check
+## argv: sed -n --expression=2p
+## stdin:
+a
+b
+## END
+## stdout:
+b
+## END
+## status: 0
+## stderr-json: ""
+
+#### including the one whose value is OPTIONAL
+# `--in-place` is the only row transcribing GNU's arity `2` rather than `0` or
+# `1`, so it is the row where refusing a value would be a silent, whole-option
+# regression: without this the table entry could flip to "takes none" and every
+# other case would stay green.
+## argv: sed --in-place=.bak s/a/X/ f1
+## file f1:
+a
+b
+## END
+## stdout-json: ""
+## status: 0
+## file-after f1:
+X
+b
+## END
+## file-after f1.bak:
+a
+b
+## END
+
+#### the two REFUSED options are refused for arity first
+# `--debug` and `--follow-symlinks` are the options td-txt declines to model, so
+# the arity check running ahead of that refusal is what makes these match GNU
+# exactly rather than reporting td-txt's own wording.
+## argv: sed --debug=1 -n 2p
+## stdin:
+a
+b
+## END
+## stdout-json: ""
+## status: 1
+## stderr-contains: option '--debug' doesn't allow an argument
+
+#### likewise --follow-symlinks
+## argv: sed --follow-symlinks=1 -n 2p
+## stdin:
+a
+b
+## END
+## stdout-json: ""
+## status: 1
+## stderr-contains: option '--follow-symlinks' doesn't allow an argument
 
 #### 0,/re/ is open before line 1, so n cannot skip past its start
 ## argv: sed -n 'n;0,/2/p'

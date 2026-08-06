@@ -2700,45 +2700,63 @@ fn compile_script(
 /// Every long option sed knows, so an unambiguous PREFIX resolves the way GNU's
 /// `getopt_long` accepts one (`sed --quie`, `sed --expr=2d`). An exact name
 /// always wins over being a prefix of a longer one.
-const LONG_OPTIONS: &[&[u8]] = &[
-    b"debug",
-    b"expression",
-    b"file",
-    b"follow-symlinks",
-    b"help",
-    b"in-place",
-    b"line-length",
-    b"null-data",
-    b"posix",
-    b"quiet",
-    b"regexp-extended",
-    b"sandbox",
-    b"separate",
-    b"silent",
-    b"unbuffered",
-    b"version",
-    b"zero-terminated",
+///
+/// A transcription of GNU's `longopts[]` (sed.c:197), in ITS order rather than
+/// alphabetically: an ambiguous abbreviation lists its possibilities in the
+/// order `getopt_long` walks the table, so `--s` is `'--silent' '--sandbox'
+/// '--separate'` and sorting the names would report the same set in the wrong
+/// order. Resolution itself does not depend on it -- an exact name returns
+/// before any prefix is collected -- so this array's order is a DIAGNOSTIC, and
+/// that is the only reason it is not sorted.
+///
+/// The flag is whether the option accepts a VALUE at all, which is all
+/// `getopt_long` needs to refuse `--posix=1`. GNU's required/optional
+/// distinction is not repeated here because the dispatch below already carries
+/// it, and a second encoding of one fact is one that can drift from the first.
+const LONG_OPTIONS: &[(&[u8], bool)] = &[
+    (b"binary", false),
+    (b"regexp-extended", false),
+    (b"debug", false),
+    (b"expression", true),
+    (b"file", true),
+    (b"in-place", true),
+    (b"line-length", true),
+    (b"null-data", false),
+    (b"zero-terminated", false),
+    (b"quiet", false),
+    (b"posix", false),
+    (b"silent", false),
+    (b"sandbox", false),
+    (b"separate", false),
+    (b"unbuffered", false),
+    (b"version", false),
+    (b"help", false),
+    (b"follow-symlinks", false),
 ];
 
-/// `Ok(full name)`, or `Err(msg)` where an EMPTY msg means "no such option" and
-/// a non-empty one is GNU's ambiguity diagnostic.
-fn resolve_long(name: &[u8]) -> Result<&'static [u8], Vec<u8>> {
-    let mut hits: Vec<&'static [u8]> = Vec::new();
-    for cand in LONG_OPTIONS {
+/// `Ok((full name, takes a value))`, or `Err(msg)` where an EMPTY msg means "no
+/// such option" and a non-empty one is GNU's ambiguity diagnostic.
+///
+/// `arg` is the whole argv element and `name` the part of it between the `--`
+/// and any `=`. glibc names the ELEMENT in both diagnostics -- `--f` and `--f=1`
+/// are the same ambiguity and it reports each as given -- so resolving on one
+/// and reporting the other is the point of the two arguments.
+fn resolve_long(name: &[u8], arg: &[u8]) -> Result<(&'static [u8], bool), Vec<u8>> {
+    let mut hits: Vec<(&'static [u8], bool)> = Vec::new();
+    for (cand, takes_arg) in LONG_OPTIONS {
         if *cand == name {
-            return Ok(cand);
+            return Ok((cand, *takes_arg));
         }
         if cand.starts_with(name) {
-            hits.push(cand);
+            hits.push((cand, *takes_arg));
         }
     }
     match hits.as_slice() {
-        [one] => Ok(one),
+        [one] => Ok(*one),
         [] => Err(Vec::new()),
         many => {
-            let mut msg =
-                crate::util::name_in("option '--", name, "' is ambiguous; possibilities:");
-            for n in many {
+            let mut msg = crate::util::name_in("option '", arg, "' is ambiguous; possibilities:");
+            for (n, _) in many {
                 msg.extend_from_slice(b" '--");
                 msg.extend_from_slice(n);
                 msg.push(b'\'');
@@ -2812,8 +2830,8 @@ fn run(args: &[Vec<u8>]) -> Result<i32, Fatal> {
                 ),
                 None => (body, None),
             };
-            let name = match resolve_long(name) {
-                Ok(full) => full,
+            let (name, takes_arg) = match resolve_long(name, arg) {
+                Ok(found) => found,
                 Err(msg) => {
                     if msg.is_empty() {
                         // The whole argv element, as glibc's `getopt_long` prints
@@ -2828,24 +2846,21 @@ fn run(args: &[Vec<u8>]) -> Result<i32, Fatal> {
                     return Ok(1);
                 }
             };
+            // Before any arm sees it, since the check is the TABLE's and not the
+            // option's: `--posix=1` is refused for the reason `--version=x` is,
+            // and an arm that simply drops `inline` (every flag arm below does)
+            // would accept a value GNU calls an error. The name reported is the
+            // RESOLVED one, as glibc reports it, so `--po=1` names `--posix`.
+            if !takes_arg && inline.is_some() {
+                diag(&crate::util::name_in("option '--", name, "' doesn't allow an argument"));
+                eprintln!("{USAGE}");
+                return Ok(1);
+            }
             match name {
                 // Answered on stdout, exit 0, before any later option applies.
                 // The text is td-txt's own: a GNU banner would be a lie a caller
                 // could act on.
-                // Answered on stdout, exit 0, before any later option applies —
-                // but neither takes a value, so `--version=x` is the error GNU
-                // makes it. The text is td-txt's own: a GNU banner would be a lie
-                // a caller could act on.
                 b"help" | b"version" => {
-                    if inline.is_some() {
-                        diag(&crate::util::name_in(
-                            "option '--",
-                            name,
-                            "' doesn't allow an argument",
-                        ));
-                        eprintln!("{USAGE}");
-                        return Ok(1);
-                    }
                     let line = if name == b"help" {
                         USAGE.to_string()
                     } else {
@@ -2871,6 +2886,12 @@ fn run(args: &[Vec<u8>]) -> Result<i32, Fatal> {
                 // ORDERS a `--posix` `w /dev/stdout` against auto-print. See
                 // spec/README's `-u` gap.
                 b"unbuffered" => {}
+                // Accepted and ignored for a DIFFERENT reason: GNU's `--binary`
+                // chooses binary I/O, which exists only where a text mode does,
+                // so on every platform td targets it already does nothing. That
+                // is why ignoring it fails CLOSED where ignoring `--debug` would
+                // not -- there is no behaviour left unmodelled behind it.
+                b"binary" => {}
                 // Accepting these silently would fail OPEN: --debug must print an
                 // annotated program, and --follow-symlinks changes which file -i
                 // rewrites. Refusing is the honest answer until they are built.
@@ -2930,6 +2951,10 @@ fn run(args: &[Vec<u8>]) -> Result<i32, Fatal> {
                         script_given = true;
                     }
                 }
+                // Unreachable: `resolve_long` only ever returns a name from the
+                // table and every one of them has an arm above. The match is over
+                // `&[u8]`, so the compiler cannot see that and demands this;
+                // reaching it would mean a name was added to the table alone.
                 _ => {
                     diag(&crate::util::name_in("unrecognized option '", arg, "'"));
                     eprintln!("{USAGE}");
@@ -2960,6 +2985,11 @@ fn run(args: &[Vec<u8>]) -> Result<i32, Fatal> {
                 b's' => conf.separate = true,
                 b'z' => conf.null_data = true,
                 b'u' => {}
+                // `--binary`'s short spelling: GNU's SHORTOPTS is
+                // `"bsnrzuEe:f:l:i::V:"` (sed.c:191) and both reach the same arm.
+                // Ignored for the same reason, and taking one without the other
+                // would leave `sed -b` refused while `sed --binary` ran.
+                b'b' => {}
                 b'i' => {
                     // The backup suffix is ATTACHED, never a separate argument:
                     // `sed -i -e …` must not swallow `-e` as the suffix.

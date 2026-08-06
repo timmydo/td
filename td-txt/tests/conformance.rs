@@ -41,7 +41,7 @@ fn bin() -> PathBuf {
 /// missing vendored `.inp`/`.good`, or a typo'd annotation reds in-loop — without
 /// depending on the behavioral run below.
 /// Raise this with the corpus; it exists to catch a corpus that SHRANK.
-const CORPUS_FLOOR: usize = 2239;
+const CORPUS_FLOOR: usize = 2253;
 
 #[test]
 fn corpus_is_well_formed() -> Result<(), Box<dyn std::error::Error>> {
@@ -1072,11 +1072,11 @@ fn a_diagnostic_names_a_file_in_raw_bytes() -> Result<(), Box<dyn std::error::Er
 }
 
 /// Two more sites the same landing touched, held to td-txt's OWN bytes rather
-/// than to GNU's: both messages diverge from GNU in WORDING (spec/README), so
-/// GNU is not the oracle here and only the name and the shape are under test.
-/// Without these the label splice and the hand-rolled possibilities join --
-/// which replaced a `join(" ")` that could not carry bytes -- are defended by
-/// nothing.
+/// than to GNU's: each diverges from GNU somewhere the corpus cannot compare
+/// (spec/README), so GNU is not the whole oracle here and the name and the
+/// shape are what is under test. Without these the label splice and the
+/// hand-rolled possibilities join -- which replaced a `join(" ")` that could
+/// not carry bytes -- are defended by nothing.
 #[test]
 fn a_diverging_diagnostic_still_names_in_raw_bytes() -> Result<(), Box<dyn std::error::Error>> {
     use std::os::unix::ffi::OsStrExt;
@@ -1099,20 +1099,28 @@ fn a_diverging_diagnostic_still_names_in_raw_bytes() -> Result<(), Box<dyn std::
     );
     assert_eq!(out.status.code(), Some(4));
 
-    // The ambiguity list: GNU emits its own declaration order and a different
-    // set, so what is pinned here is that every possibility is present, spelled
-    // `'--name'`, and separated by ONE space -- the join this landing rewrote.
+    // The ambiguity list. GNU names itself by argv[0] and td-txt by the applet,
+    // so the LINE still diverges; everything after that prefix does not, which
+    // is what the corpus case pins. Here it is spelled with a raw byte in the
+    // VALUE, which is the only way one reaches this message -- the abbreviation
+    // itself has to prefix a real option name, and every one of those is ASCII.
+    // That covers both halves the raw-name landing rewrote: the name splice and
+    // the hand-rolled join, one space between possibilities each spelled
+    // `'--name'`, which replaced a `join(" ")` over `String`s that could not
+    // carry the byte.
     let amb = std::process::Command::new(bin())
-        .args(["sed", "--s", "p", "IN"])
+        .arg("sed")
+        .arg(std::ffi::OsStr::from_bytes(b"--s=\xff"))
+        .args(["p", "IN"])
         .current_dir(&dir.0)
         .output()?;
     // The usage line follows it, and its wording is a divergence of its own.
     let first = amb.stderr.split(|b| *b == b'\n').next().unwrap_or_default().to_vec();
     assert_eq!(
         first,
-        b"sed: option '--s' is ambiguous; possibilities: '--sandbox' '--separate' '--silent'"
+        b"sed: option '--s=\xff' is ambiguous; possibilities: '--silent' '--sandbox' '--separate'"
             .to_vec(),
-        "the possibilities join lost a separator or a quote"
+        "the ambiguous name lost its raw byte, or the join lost a separator or a quote"
     );
     assert_eq!(amb.status.code(), Some(1));
 
