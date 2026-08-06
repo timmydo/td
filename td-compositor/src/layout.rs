@@ -169,6 +169,35 @@ impl Node {
         }
     }
 
+    /// Put a leaf immediately before or after a NAMED one, in whatever
+    /// container that one sits in. This is the drop half of a drag, where the
+    /// destination is a window the pointer is over rather than a direction,
+    /// so there is no walk and no axis to match — the target's own container
+    /// is the answer by construction.
+    fn insert_beside(&mut self, target: SurfaceKey, key: SurfaceKey, before: bool) -> bool {
+        let Node::Split { children, .. } = self else {
+            return false;
+        };
+        let beside = children
+            .iter()
+            .position(|child| matches!(child, Node::Leaf(candidate) if *candidate == target));
+        if let Some(index) = beside {
+            let at = if before {
+                index
+            } else {
+                index.saturating_add(1)
+            };
+            children.insert(at, Node::Leaf(key));
+            return true;
+        }
+        let Some(index) = children.iter().position(|child| child.contains(target)) else {
+            return false;
+        };
+        children
+            .get_mut(index)
+            .is_some_and(|child| child.insert_beside(target, key, before))
+    }
+
     /// Move a leaf one step along `axis`, i3's way: the nearest ancestor that
     /// RUNS along that axis is the one that acts, and what it does depends on
     /// what is beside the leaf there. A neighbouring window swaps places with
@@ -432,6 +461,81 @@ impl Layout {
         self.workspaces
             .get(&self.active)
             .and_then(|workspace| workspace.focused)
+    }
+
+    /// The axis of the container a leaf sits DIRECTLY in, which is what says
+    /// whether "the half the pointer is in" should be measured top-to-bottom
+    /// or left-to-right. A lone window is in no container and answers None.
+    pub fn parent_axis(&self, key: SurfaceKey) -> Option<Axis> {
+        parent_axis(self.workspaces.get(&self.active)?.root.as_ref()?, key)
+    }
+
+    /// Drop a dragged window beside a target one — the pointer half of a
+    /// move, where the destination is a window rather than a direction.
+    ///
+    /// `before` is which side of the target it lands, read along the target's
+    /// own container: in a column that is above or below, which is what a
+    /// drop onto the top or bottom half of a tile means, and in a row it is
+    /// left or right. Answers whether the tree changed, so a caller can skip
+    /// the repaint a drop onto the dragged window itself does not owe.
+    pub fn drop_beside(&mut self, dragged: SurfaceKey, target: SurfaceKey, before: bool) -> bool {
+        if dragged == target {
+            return false;
+        }
+        let Some(workspace) = self.workspaces.get(&self.active) else {
+            return false;
+        };
+        if workspace.fullscreen.is_some() {
+            return false;
+        }
+        let Some(root) = workspace.root.as_ref() else {
+            return false;
+        };
+        if !root.contains(dragged) || !root.contains(target) {
+            return false;
+        }
+        let Some(root) = self.workspace_mut(self.active).root.take() else {
+            return false;
+        };
+        // Kept so the answer can be about what CHANGED rather than about the
+        // call having been made: dropping a window back exactly where it came
+        // from is the commonest gesture there is, and reporting it as a move
+        // costs a repaint and a round of configures for an identical screen.
+        // A layout tree is a handful of nodes, and this runs once per release.
+        let unchanged = root.clone();
+        // DETACHED rather than removed, which is the whole of this operation's
+        // correctness. A removal collapses the container the leaf came out of,
+        // and for a two-window column that container is the one the TARGET
+        // sits in — so `H[1, V[2, 3]]` dropping 2 beside 3 would collapse the
+        // column, land 3's neighbour in the row instead, and flatten it to
+        // `H[1, 2, 3]`. It also takes the container's presentation with it, so
+        // reordering a two-window stack would silently unstack it. Collapsing
+        // once at the END leaves the target's container standing.
+        let Some(mut rest) = detach(root, dragged) else {
+            // Unreachable — both keys were in the tree and they differ — but
+            // the root is already TAKEN here, so returning without putting one
+            // back would leave the workspace with no windows at all.
+            self.workspace_mut(self.active).root = Some(unchanged);
+            return false;
+        };
+        if !rest.insert_beside(target, dragged, before) {
+            // Unreachable: the target was in the tree above and detaching a
+            // DIFFERENT leaf cannot remove it. Kept so that no path can end
+            // with the dragged window in neither the tree nor anywhere else.
+            rest = Node::Split {
+                axis: Axis::Horizontal,
+                children: vec![rest, Node::Leaf(dragged)],
+                stacked: false,
+            };
+        }
+        let rebuilt = collapsed(rest);
+        if rebuilt.as_ref() == Some(&unchanged) {
+            self.workspace_mut(self.active).root = rebuilt;
+            return false;
+        }
+        self.workspace_mut(self.active).root = rebuilt;
+        self.workspace_mut(self.active).focus(dragged);
+        true
     }
 
     /// Point focus at a surface by IDENTITY rather than by direction, which
@@ -897,6 +1001,48 @@ struct Pass<'a> {
 
 fn valid_workspace(number: u8) -> bool {
     (INITIAL_WORKSPACE..=FINAL_WORKSPACE).contains(&number)
+}
+
+/// Take a leaf out WITHOUT collapsing what it leaves behind, so a container
+/// reduced to one child survives long enough for a drop to put the leaf back
+/// into it. `collapsed` tidies up afterwards.
+fn detach(node: Node, key: SurfaceKey) -> Option<Node> {
+    match node {
+        Node::Leaf(candidate) if candidate == key => None,
+        Node::Leaf(candidate) => Some(Node::Leaf(candidate)),
+        Node::Split {
+            axis,
+            children,
+            stacked,
+        } => {
+            let retained: Vec<Node> = children
+                .into_iter()
+                .filter_map(|child| detach(child, key))
+                .collect();
+            if retained.is_empty() {
+                return None;
+            }
+            Some(Node::Split {
+                axis,
+                children: retained,
+                stacked,
+            })
+        }
+    }
+}
+
+fn parent_axis(node: &Node, key: SurfaceKey) -> Option<Axis> {
+    let Node::Split { axis, children, .. } = node else {
+        return None;
+    };
+    if children
+        .iter()
+        .any(|child| matches!(child, Node::Leaf(candidate) if *candidate == key))
+    {
+        return Some(*axis);
+    }
+    let index = children.iter().position(|child| child.contains(key))?;
+    parent_axis(children.get(index)?, key)
 }
 
 fn remove_node(node: Node, key: SurfaceKey) -> Option<Node> {
@@ -1786,6 +1932,206 @@ mod tests {
             [34, 33, 33]
         );
         layout.check_invariants().unwrap();
+    }
+
+    #[test]
+    fn a_drop_puts_a_window_beside_the_one_it_was_dropped_on() {
+        // `H[1, V[2, 3]]`: 1 is dropped onto 3's TOP half, so it lands in the
+        // column above 3 — the arrangement the keyboard reaches only as a
+        // sequence, and the whole point of dropping on a window rather than
+        // stepping in a direction.
+        let mut layout = Layout::new();
+        layout.map(key(1));
+        layout.map(key(2));
+        layout.apply(Command::SetSplit(Axis::Vertical));
+        layout.map(key(3));
+
+        assert!(layout.drop_beside(key(1), key(3), true));
+        assert_eq!(
+            layout
+                .placements(100, 100, 0, 0)
+                .iter()
+                .map(|p| p.key.object)
+                .collect::<Vec<_>>(),
+            [2, 1, 3]
+        );
+        // The dropped window is the focused one: it is what was acted on.
+        assert_eq!(layout.focused(), Some(key(1)));
+        layout.check_invariants().unwrap();
+
+        // And the other half puts it below: 1 is above 3 now, so dropping it
+        // BELOW 3 has somewhere to go and the order changes again.
+        assert!(layout.drop_beside(key(1), key(3), false));
+        assert_eq!(
+            layout
+                .placements(100, 100, 0, 0)
+                .iter()
+                .map(|p| p.key.object)
+                .collect::<Vec<_>>(),
+            [2, 3, 1]
+        );
+        assert_eq!(layout.parent_axis(key(1)), Some(Axis::Vertical));
+
+        // Dropping it back exactly where it already is CHANGES nothing, and
+        // says so: the answer is about the arrangement, not about the call.
+        let settled = layout.placements(100, 100, 0, 0);
+        assert!(!layout.drop_beside(key(1), key(3), false));
+        assert_eq!(layout.placements(100, 100, 0, 0), settled);
+        layout.check_invariants().unwrap();
+    }
+
+    #[test]
+    fn a_drop_onto_the_last_other_window_rebuilds_the_container_it_shared() {
+        // Two windows in a ROW, and one dropped on the other. Removing the
+        // dragged one collapses the row, so the pair has to be rebuilt — on
+        // the axis they were arranged on, or a drag silently turns a row into
+        // a column without the operator asking for one.
+        // `before` is also whether this moves at all: 2 is already after 1,
+        // so dropping it after 1 is the no-op the contract reports as false.
+        for (before, order) in [(true, [2, 1]), (false, [1, 2])] {
+            let mut layout = Layout::new();
+            layout.map(key(1));
+            layout.map(key(2));
+            assert_eq!(layout.parent_axis(key(1)), Some(Axis::Horizontal));
+
+            assert_eq!(layout.drop_beside(key(2), key(1), before), before);
+            let placements = layout.placements(100, 100, 0, 0);
+            assert_eq!(
+                placements.iter().map(|p| p.key.object).collect::<Vec<_>>(),
+                order,
+                "{before}"
+            );
+            // Still a row, each half the width.
+            assert!(placements.iter().all(|p| p.rect.width == 50), "{before}");
+            layout.check_invariants().unwrap();
+        }
+    }
+
+    #[test]
+    fn a_drop_between_two_siblings_leaves_the_container_they_share_standing() {
+        // `H[1, V[2, 3]]` and 2 is dropped below 3 — both already in the same
+        // column, so only their ORDER should change. Taking 2 out with a
+        // collapsing removal would reduce the column to `Leaf(3)`, match 3 in
+        // the ROW instead, and flatten the whole thing to `H[1, 2, 3]`.
+        let mut layout = Layout::new();
+        layout.map(key(1));
+        layout.map(key(2));
+        layout.apply(Command::SetSplit(Axis::Vertical));
+        layout.map(key(3));
+
+        assert!(layout.drop_beside(key(2), key(3), false));
+        let placements = layout.placements(100, 100, 0, 0);
+        assert_eq!(
+            placements.iter().map(|p| p.key.object).collect::<Vec<_>>(),
+            [1, 3, 2]
+        );
+        // Still a window beside a column, not three across.
+        assert_eq!(
+            placements.iter().map(|p| p.rect.width).collect::<Vec<_>>(),
+            [50, 50, 50]
+        );
+        assert_eq!(layout.parent_axis(key(2)), Some(Axis::Vertical));
+        layout.check_invariants().unwrap();
+    }
+
+    #[test]
+    fn reordering_a_two_window_stack_by_dropping_keeps_it_stacked() {
+        // The pair's container is the one the target sits in, so a collapsing
+        // removal destroys it and its presentation with it — and the operator
+        // asked to reorder a stack, not to unstack one.
+        let mut layout = Layout::new();
+        layout.apply(Command::SetSplit(Axis::Vertical));
+        layout.map(key(1));
+        layout.map(key(2));
+        layout.apply(Command::ToggleStacked);
+        assert!(layout.placements(100, 300, 0, 20).iter().all(|p| p.stacked));
+
+        assert!(layout.drop_beside(key(2), key(1), true));
+        let placements = layout.placements(100, 300, 0, 20);
+        assert_eq!(
+            placements.iter().map(|p| p.key.object).collect::<Vec<_>>(),
+            [2, 1]
+        );
+        assert!(
+            placements.iter().all(|p| p.stacked),
+            "reordering a stack unstacked it"
+        );
+        assert_eq!(
+            placements.iter().map(|p| p.band.y).collect::<Vec<_>>(),
+            [0, 20]
+        );
+        layout.check_invariants().unwrap();
+    }
+
+    #[test]
+    fn a_drop_refuses_itself_a_stranger_and_a_fullscreen_workspace() {
+        let mut layout = Layout::new();
+        layout.map(key(1));
+        layout.map(key(2));
+        let before = layout.placements(100, 100, 0, 0);
+
+        // Onto itself: the pointer never left the window it picked up.
+        assert!(!layout.drop_beside(key(1), key(1), true));
+        // A window that does not exist at all.
+        assert!(!layout.drop_beside(key(1), key(9), true));
+        assert!(!layout.drop_beside(key(9), key(1), true));
+        assert_eq!(layout.placements(100, 100, 0, 0), before);
+
+        // And one that exists on ANOTHER workspace, which is on no screen the
+        // pointer can reach — mapped for real, since a key nobody mapped
+        // would be refused by the first check and prove nothing about this.
+        layout.apply(Command::SwitchWorkspace(2));
+        layout.map(key(3));
+        layout.apply(Command::SwitchWorkspace(1));
+        assert!(!layout.drop_beside(key(1), key(3), true));
+        assert!(!layout.drop_beside(key(3), key(1), true));
+        assert_eq!(layout.placements(100, 100, 0, 0), before);
+
+        // Under fullscreen, as every other rearranging command is refused.
+        layout.apply(Command::ToggleFullscreen);
+        assert!(!layout.drop_beside(key(2), key(1), true));
+        layout.apply(Command::ToggleFullscreen);
+        assert_eq!(layout.placements(100, 100, 0, 0), before);
+        layout.check_invariants().unwrap();
+    }
+
+    #[test]
+    fn a_drop_into_a_stack_joins_the_run_and_parent_axis_answers_per_container() {
+        let mut layout = Layout::new();
+        layout.map(key(1));
+        layout.map(key(2));
+        assert!(layout.focus_key(key(1)));
+        layout.apply(Command::SetSplit(Axis::Vertical));
+        layout.map(key(3));
+        layout.apply(Command::ToggleStacked);
+
+        // The axis is the container's own, not the workspace's: 2 sits in the
+        // row and 1 in the stacked column, so a drop measures a different
+        // half for each.
+        assert_eq!(layout.parent_axis(key(2)), Some(Axis::Horizontal));
+        assert_eq!(layout.parent_axis(key(1)), Some(Axis::Vertical));
+
+        assert!(layout.drop_beside(key(2), key(3), false));
+        let placements = layout.placements(100, 300, 0, 20);
+        assert_eq!(
+            placements.iter().map(|p| p.key.object).collect::<Vec<_>>(),
+            [1, 3, 2]
+        );
+        assert!(placements.iter().all(|p| p.stacked));
+        // The arrival is focused, so it is the leaf the stack shows.
+        assert_eq!(
+            placements.iter().map(|p| p.visible).collect::<Vec<_>>(),
+            [false, false, true]
+        );
+        layout.check_invariants().unwrap();
+    }
+
+    #[test]
+    fn a_lone_window_has_no_container_and_so_no_parent_axis() {
+        let mut layout = Layout::new();
+        layout.map(key(1));
+        assert_eq!(layout.parent_axis(key(1)), None);
+        assert_eq!(layout.parent_axis(key(2)), None);
     }
 
     #[test]

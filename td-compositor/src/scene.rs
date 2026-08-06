@@ -1,7 +1,7 @@
 use crate::bar::{self, BAR_HEIGHT};
 use crate::help::Help;
 use crate::launcher::{LaunchRequest, Launcher, LauncherAction};
-use crate::layout::{Command, Layout, Placement, Rect, ViewLayout};
+use crate::layout::{Axis, Command, Layout, Placement, Rect, ViewLayout};
 use crate::ui;
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -381,7 +381,7 @@ impl Scene {
         height.saturating_sub(BAR_HEIGHT)
     }
 
-    fn tiled_placements(&self, width: usize, height: usize) -> Vec<Placement> {
+    pub(crate) fn tiled_placements(&self, width: usize, height: usize) -> Vec<Placement> {
         let mut placements =
             self.layout
                 .placements(width, self.tiled_height(height), GAP, TITLE_HEIGHT);
@@ -426,6 +426,71 @@ impl Scene {
     pub fn pointer_target(&self, width: usize, height: usize) -> Option<SurfacePoint> {
         let placements = self.tiled_placements(width, height);
         self.pointer_target_from(&placements)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pointer_at(&self) -> (i32, i32) {
+        (self.pointer_x, self.pointer_y)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn layout(&self) -> &Layout {
+        &self.layout
+    }
+
+    pub fn drop_beside(&mut self, dragged: SurfaceKey, target: SurfaceKey, before: bool) -> bool {
+        self.layout.drop_beside(dragged, target, before)
+    }
+
+    /// The window whose TITLE BAND the pointer is over, which is the handle a
+    /// drag takes. A band reaches no client — the hit test above knows only
+    /// client areas — so this is a question only the compositor answers, and
+    /// the seam that makes a band draggable without a client ever seeing it.
+    pub fn band_at_pointer(&self, width: usize, height: usize) -> Option<SurfaceKey> {
+        let placements = self.tiled_placements(width, height);
+        let x = usize::try_from(self.pointer_x).ok()?;
+        let y = usize::try_from(self.pointer_y).ok()?;
+        let index = placements
+            .iter()
+            .position(|placement| contains(placement.band, x, y))?;
+        Some(placements.get(index)?.key)
+    }
+
+    /// Where a drop lands: the window under the pointer, and whether the
+    /// pointer is in the FIRST half of it. Measured along the target's own
+    /// container — top-to-bottom in a column, left-to-right in a row — since
+    /// that is the direction the two neighbours actually lie in.
+    ///
+    /// Within whichever rectangle the pointer is in rather than over the tile
+    /// as a whole, because in a stack a leaf's band and its client area are
+    /// far apart and a midpoint between them is in neither.
+    pub fn drop_target(&self, width: usize, height: usize) -> Option<(SurfaceKey, bool)> {
+        let placements = self.tiled_placements(width, height);
+        let x = usize::try_from(self.pointer_x).ok()?;
+        let y = usize::try_from(self.pointer_y).ok()?;
+        let index = placements.iter().position(|placement| {
+            contains(placement.band, x, y) || (placement.visible && contains(placement.rect, x, y))
+        })?;
+        let placement = placements.get(index)?;
+        let zone = if contains(placement.band, x, y) {
+            placement.band
+        } else {
+            placement.rect
+        };
+        let before = if placement.stacked {
+            // A stack runs its bands DOWN the container's top whatever axis
+            // the container itself has, so the neighbours a drop lands between
+            // are above and below even when the container is a row.
+            y < zone.y.saturating_add(zone.height / 2)
+        } else {
+            match self.layout.parent_axis(placement.key) {
+                Some(Axis::Horizontal) => x < zone.x.saturating_add(zone.width / 2),
+                // `None` is a lone window, which cannot be a drop target: the
+                // only thing that could be dropped on it is itself.
+                Some(Axis::Vertical) | None => y < zone.y.saturating_add(zone.height / 2),
+            }
+        };
+        Some((placement.key, before))
     }
 
     fn pointer_target_from(&self, placements: &[Placement]) -> Option<SurfacePoint> {
@@ -631,6 +696,13 @@ impl Scene {
         self.help.paint(frame, width, height, stride);
         draw_pointer(frame, width, height, stride, self.pointer_x, self.pointer_y);
     }
+}
+
+fn contains(rect: Rect, x: usize, y: usize) -> bool {
+    x >= rect.x
+        && y >= rect.y
+        && x < rect.x.saturating_add(rect.width)
+        && y < rect.y.saturating_add(rect.height)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1011,7 +1083,11 @@ mod tests {
         scene.unmap(key);
         assert_eq!(scene.title(key), Some("FIREFOX - A PAGE"));
         scene.commit(key, surface([1, 2, 3, 0], 8, 8)).unwrap();
-        assert_eq!(scene.title(key), Some("FIREFOX - A PAGE"), "remapped nameless");
+        assert_eq!(
+            scene.title(key),
+            Some("FIREFOX - A PAGE"),
+            "remapped nameless"
+        );
 
         // Gone with the surface, or a re-used key inherits a stale name.
         scene.remove(key);
@@ -1130,7 +1206,10 @@ mod tests {
         let mut scene = Scene::new();
         for object in 1..=3 {
             scene
-                .commit(SurfaceKey { client: 1, object }, surface([1, 2, 3, 0], 8, 8))
+                .commit(
+                    SurfaceKey { client: 1, object },
+                    surface([1, 2, 3, 0], 8, 8),
+                )
                 .unwrap();
         }
         scene.command(Command::SetSplit(crate::layout::Axis::Horizontal));
@@ -1206,7 +1285,10 @@ mod tests {
         let mut scene = Scene::new();
         for object in 1..=3u32 {
             scene
-                .commit(SurfaceKey { client: 1, object }, surface([1, 2, 3, 0], 8, 8))
+                .commit(
+                    SurfaceKey { client: 1, object },
+                    surface([1, 2, 3, 0], 8, 8),
+                )
                 .unwrap();
         }
         scene.command(Command::SetSplit(crate::layout::Axis::Vertical));
@@ -1285,6 +1367,183 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn a_drop_reads_its_half_along_the_targets_own_container() {
+        // A row of two and a column of two, so both axes are present in one
+        // arrangement: `H[1, V[2, 3]]`. 1's neighbours lie left-and-right, so
+        // its halves are left and right; 2's lie above and below.
+        let mut scene = Scene::new();
+        for object in 1..=2 {
+            scene
+                .commit(
+                    SurfaceKey { client: 1, object },
+                    surface([1, 1, 1, 0], 8, 8),
+                )
+                .unwrap();
+        }
+        scene.command(Command::SetSplit(crate::layout::Axis::Vertical));
+        scene
+            .commit(
+                SurfaceKey {
+                    client: 1,
+                    object: 3,
+                },
+                surface([1, 1, 1, 0], 8, 8),
+            )
+            .unwrap();
+        // Tall enough that the COLUMN's two tiles each keep a real client
+        // area. `least_output_height` reserves rows for one tile, and with two
+        // the client comes out shorter than its own band — which makes a tile
+        // and its band nearly the same rectangle, so a drop measured over the
+        // whole tile agrees with one measured over the band and the two stop
+        // being distinguishable. The same rot as the runtime test's, one
+        // commit later, so it is guarded here as well.
+        let (width, height) = (240, 600);
+        let placements = scene.tiled_placements(width, height);
+        assert!(
+            placements
+                .iter()
+                .all(|placement| placement.rect.height > placement.band.height),
+            "the output is too short to tell a tile from its band"
+        );
+        let at = |object: u32| {
+            let index = placements
+                .iter()
+                .position(|placement| placement.key.object == object)
+                .unwrap();
+            *placements.get(index).unwrap()
+        };
+
+        // 1 sits in the ROW, so its halves run left to right and its vertical
+        // midpoint decides nothing.
+        let row = at(1).rect;
+        for (x, y, before) in [
+            (row.x + 1, row.y + 1, true),
+            (row.x + row.width - 2, row.y + 1, false),
+            (row.x + 1, row.y + row.height - 2, true),
+        ] {
+            scene.pointer_x = i32::try_from(x).unwrap();
+            scene.pointer_y = i32::try_from(y).unwrap();
+            assert_eq!(
+                scene.drop_target(width, height),
+                Some((
+                    SurfaceKey {
+                        client: 1,
+                        object: 1
+                    },
+                    before
+                )),
+                "row at {x},{y}"
+            );
+        }
+
+        // 2 sits in the COLUMN, so its halves run top to bottom.
+        let column = at(2).rect;
+        for (x, y, before) in [
+            (column.x + 1, column.y + 1, true),
+            (column.x + 1, column.y + column.height - 2, false),
+            (column.x + column.width - 2, column.y + 1, true),
+        ] {
+            scene.pointer_x = i32::try_from(x).unwrap();
+            scene.pointer_y = i32::try_from(y).unwrap();
+            assert_eq!(
+                scene.drop_target(width, height),
+                Some((
+                    SurfaceKey {
+                        client: 1,
+                        object: 2
+                    },
+                    before
+                )),
+                "column at {x},{y}"
+            );
+        }
+
+        // A BAND is a drop zone too, and its own halves, so a stacked leaf
+        // whose client is nowhere near its band can still be dropped onto.
+        let band = at(2).band;
+        scene.pointer_x = i32::try_from(band.x + 1).unwrap();
+        scene.pointer_y = i32::try_from(band.y + 1).unwrap();
+        assert_eq!(
+            scene.drop_target(width, height),
+            Some((
+                SurfaceKey {
+                    client: 1,
+                    object: 2
+                },
+                true
+            ))
+        );
+        assert_eq!(
+            scene.band_at_pointer(width, height),
+            Some(SurfaceKey {
+                client: 1,
+                object: 2
+            })
+        );
+
+        // A stacked leaf's CONTENT area is a drop zone too, and only for the
+        // leaf that is shown: the others' rectangles cover the very same
+        // pixels, so without that guard a hidden one would claim them.
+        // (Set up below, where the stack exists.)
+
+        // A STACKED row: its bands run DOWN the container's top even though
+        // the container itself is horizontal, so the neighbours a drop lands
+        // between are above and below and the half must be read that way.
+        // Reading the container's own axis here would ask for a left-or-right
+        // gesture against a run that goes up and down.
+        scene.command(Command::Focus(crate::layout::Direction::Left));
+        scene.command(Command::ToggleStacked);
+        let stacked = scene.tiled_placements(width, height);
+        assert!(stacked.iter().all(|placement| placement.stacked));
+        let run = stacked.first().unwrap().band;
+        for (y, before) in [(run.y + 1, true), (run.y + run.height - 1, false)] {
+            scene.pointer_x = i32::try_from(run.x + run.width - 2).unwrap();
+            scene.pointer_y = i32::try_from(y).unwrap();
+            assert_eq!(
+                scene.drop_target(width, height).map(|(_, before)| before),
+                Some(before),
+                "stacked band at y={y}"
+            );
+        }
+
+        // The band and the CONTENT area of a stacked leaf are far apart, and
+        // the half is read within whichever the pointer is in — so a band's
+        // own top and bottom decide, and the content area's own do too rather
+        // than both answering from one rectangle spanning the pair.
+        // The shown leaf must NOT be the first, or a hit test that ignored
+        // visibility would match the hidden one at the same rectangle and
+        // agree with this anyway — the stack's leaves all share one content
+        // area, so `position` returning the first is the whole hazard.
+        scene.command(Command::Focus(crate::layout::Direction::Right));
+        let stacked = scene.tiled_placements(width, height);
+        let shown = stacked
+            .iter()
+            .position(|placement| placement.visible)
+            .unwrap();
+        assert!(shown > 0, "the shown leaf is first, so this proves nothing");
+        let content = stacked.get(shown).unwrap().rect;
+        assert!(content.height > 0);
+        for (y, before) in [
+            (content.y + 1, true),
+            (content.y + content.height - 2, false),
+        ] {
+            scene.pointer_x = i32::try_from(content.x + 2).unwrap();
+            scene.pointer_y = i32::try_from(y).unwrap();
+            assert_eq!(
+                scene.drop_target(width, height),
+                Some((stacked.get(shown).unwrap().key, before)),
+                "stacked content at y={y}"
+            );
+        }
+
+        // The desktop is neither: a release there is a cancelled drag.
+        scene.pointer_x = 0;
+        scene.pointer_y = i32::try_from(height - 1).unwrap();
+        assert_eq!(scene.drop_target(width, height), None);
+        assert_eq!(scene.band_at_pointer(width, height), None);
     }
 
     #[test]
@@ -1682,7 +1941,11 @@ mod tests {
                 },
             )
             .unwrap();
-        let view = scene.views(100, least_output_height(8)).first().copied().unwrap();
+        let view = scene
+            .views(100, least_output_height(8))
+            .first()
+            .copied()
+            .unwrap();
         let x = i32::try_from(view.rect.x.saturating_add(3)).unwrap();
         let y = i32::try_from(view.rect.y.saturating_add(4)).unwrap();
         scene.move_pointer(x, y, 100, least_output_height(8));
@@ -1698,7 +1961,10 @@ mod tests {
             Some(SurfacePoint { key, x: 23, y: 4 })
         );
         scene.unmap(key);
-        assert_eq!(scene.pointer_target_for(key, 100, least_output_height(8)), None);
+        assert_eq!(
+            scene.pointer_target_for(key, 100, least_output_height(8)),
+            None
+        );
     }
 
     #[test]
@@ -1709,7 +1975,11 @@ mod tests {
             object: 9,
         };
         scene.commit(key, surface([1, 2, 3, 0], 10, 8)).unwrap();
-        let view = scene.views(100, least_output_height(8)).first().copied().unwrap();
+        let view = scene
+            .views(100, least_output_height(8))
+            .first()
+            .copied()
+            .unwrap();
         let x = i32::try_from(view.rect.x.saturating_add(3)).unwrap();
         let y = i32::try_from(view.rect.y.saturating_add(4)).unwrap();
         scene.move_pointer(x, y, 100, least_output_height(8));

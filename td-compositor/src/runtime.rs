@@ -1,8 +1,8 @@
 use crate::framebuffer::Framebuffer;
+use crate::help::HelpAction;
 use crate::keyboard::{
     KeyInput, KeyboardSnapshot, KeyboardState, ModifierState, RoutedKeyboardEvent,
 };
-use crate::help::HelpAction;
 use crate::launcher::{LaunchRequest, LauncherAction};
 use crate::layout::{Command, ViewLayout};
 use crate::pointer::{
@@ -147,6 +147,10 @@ impl KeyboardSubscription {
     }
 }
 
+/// `BTN_LEFT`. The only button a drag answers to: the others are a client's
+/// to interpret, and a band has no client to hand them to.
+const POINTER_BUTTON_LEFT: u32 = 272;
+
 pub struct Runtime {
     scene: Scene,
     framebuffer: Framebuffer,
@@ -156,6 +160,10 @@ pub struct Runtime {
     pointer: PointerState,
     keyboard_subscribers: BTreeMap<u64, KeyboardSender>,
     pending_paint: bool,
+    /// The window a title-band press picked up, held until the button is
+    /// released. Nothing in the pointer model can carry it: a band reaches no
+    /// client, so no grab is established and no client is told any of this.
+    dragging: Option<SurfaceKey>,
 }
 
 impl Runtime {
@@ -169,6 +177,7 @@ impl Runtime {
             pointer: PointerState::default(),
             keyboard_subscribers: BTreeMap::new(),
             pending_paint: false,
+            dragging: None,
         }
     }
 
@@ -276,7 +285,18 @@ impl Runtime {
         self.scene.title(key).map(str::to_string)
     }
 
+    /// Forget a drag whose window has gone. Object ids are recycled per
+    /// client, so a stale one does not merely name nothing — it can come to
+    /// name a DIFFERENT window, and the release would move one the operator
+    /// never picked up.
+    fn forget_drag(&mut self, gone: impl Fn(SurfaceKey) -> bool) {
+        if self.dragging.is_some_and(&gone) {
+            self.dragging = None;
+        }
+    }
+
     pub fn remove(&mut self, key: SurfaceKey) -> Result<(), String> {
+        self.forget_drag(|dragged| dragged == key);
         let layout_changed = self.scene.remove(key);
         self.repaint()?;
         self.refresh_focus()?;
@@ -297,6 +317,7 @@ impl Runtime {
     }
 
     pub fn remove_client(&mut self, client: u64) -> Result<(), String> {
+        self.forget_drag(|dragged| dragged.client == client);
         let layout_changed = self.scene.remove_client(client);
         self.repaint()?;
         self.refresh_focus()?;
@@ -336,7 +357,20 @@ impl Runtime {
             }
             return Err(error);
         }
+        self.cancel_drag_under_overlay();
         Ok(request)
+    }
+
+    /// An overlay going up drops whatever a title band was holding. Cleared
+    /// HERE rather than only on the next pointer frame, because an overlay is
+    /// opened from the keyboard: press a band, raise the sheet and dismiss it
+    /// without moving the mouse, and no modal pointer frame ever happens — so
+    /// the release would perform a drop the operator could not see themselves
+    /// aiming at.
+    fn cancel_drag_under_overlay(&mut self) {
+        if self.scene.modal() {
+            self.dragging = None;
+        }
     }
 
     /// Take a new status line. Repaints only when the TEXT changed, so a
@@ -373,6 +407,7 @@ impl Runtime {
         if let Err(error) = self.refresh_focus() {
             return Err(self.restore_help(before, error));
         }
+        self.cancel_drag_under_overlay();
         Ok(self.scene.help_visible())
     }
 
@@ -444,6 +479,66 @@ impl Runtime {
         // above, so nothing is established and the overlay keeps focus.
         if let Some(clicked) = result.pressed_on {
             self.focus_surface(clicked)?;
+        }
+        self.drag(modal, buttons)?;
+        Ok(())
+    }
+
+    /// The title-band drag. A press on a band picks the window up and focuses
+    /// it; the release drops it beside whatever is under the pointer then.
+    ///
+    /// Entirely outside the pointer model, and it has to be: a band belongs to
+    /// no client, so a press on one establishes no grab and delivers nothing.
+    /// That is the same seam that makes a band's click reach no client, used
+    /// rather than worked around. A modal overlay owns every button while it
+    /// is up, so nothing is picked up under one — and anything already held is
+    /// dropped, since the operator can no longer see where it would land.
+    fn drag(&mut self, modal: bool, buttons: &[PointerButtonInput]) -> Result<(), String> {
+        if modal {
+            self.dragging = None;
+            return Ok(());
+        }
+        let (width, height) = (self.framebuffer.width, self.framebuffer.height);
+        for input in buttons {
+            if input.button != POINTER_BUTTON_LEFT {
+                continue;
+            }
+            match input.state {
+                PointerButtonState::Pressed => {
+                    // A client already holding an implicit grab owns every
+                    // button until it lets go, and this press was DELIVERED to
+                    // it — the pointer model routes a press made during a grab
+                    // to the grabbing surface and reports establishing nothing.
+                    // Picking a band up here would make one button both the
+                    // window's and the compositor's, and move focus during a
+                    // grab, which the click-to-focus path above refuses for
+                    // exactly this reason.
+                    if self.pointer.grab_surface().is_some() {
+                        continue;
+                    }
+                    self.dragging = self.scene.band_at_pointer(width, height);
+                    if let Some(key) = self.dragging {
+                        self.focus_surface(key)?;
+                    }
+                }
+                PointerButtonState::Released => {
+                    let Some(dragged) = self.dragging.take() else {
+                        continue;
+                    };
+                    // Off every tile — the desktop, the bar — is a cancelled
+                    // drag rather than a move to nowhere.
+                    let Some((target, before)) = self.scene.drop_target(width, height) else {
+                        continue;
+                    };
+                    if self.scene.drop_beside(dragged, target, before) {
+                        self.repaint()?;
+                        self.refresh_focus()?;
+                        if self.refresh_layout()? {
+                            self.publish_layout();
+                        }
+                    }
+                }
+            }
         }
         Ok(())
     }
@@ -1274,6 +1369,269 @@ mod tests {
     }
 
     #[test]
+    fn dragging_a_title_band_drops_the_window_beside_where_it_was_released() {
+        let path = std::env::temp_dir().join(format!(
+            "td-runtime-band-drag-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let cleanup = Cleanup(path);
+        // Tall enough that THREE tiles stacked in a column each keep a real
+        // client area: `least_output_height` reserves rows for one, and with
+        // three the band eats the whole tile and every client rect is empty —
+        // which a drop onto "the top half of a client" then silently answers
+        // from a band instead.
+        let height = 600;
+        let framebuffer = Framebuffer::test_file(&cleanup.0, 240, height, 240 * 4).unwrap();
+        let mut runtime = Runtime::new(framebuffer);
+        let keys: Vec<SurfaceKey> = (1..=3)
+            .map(|object| SurfaceKey { client: 1, object })
+            .collect();
+        runtime
+            .commit(*keys.first().unwrap(), surface([1, 2, 3, 0]))
+            .unwrap();
+        runtime
+            .commit(*keys.get(1).unwrap(), surface([4, 5, 6, 0]))
+            .unwrap();
+        runtime.command(Command::SetSplit(Axis::Vertical)).unwrap();
+        runtime
+            .commit(*keys.get(2).unwrap(), surface([7, 8, 9, 0]))
+            .unwrap();
+        // `H[1, V[2, 3]]`: a window beside a column of two.
+        let order = |runtime: &Runtime| {
+            runtime
+                .scene
+                .tiled_placements(240, height)
+                .iter()
+                .map(|placement| placement.key.object)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(order(&runtime), [1, 2, 3]);
+        // Guards the arrangement every drop below actually targets — a
+        // column of THREE — rather than the two-tall one it starts as.
+        let clients_are_real = |runtime: &Runtime| {
+            runtime
+                .scene
+                .tiled_placements(240, height)
+                .iter()
+                .all(|placement| placement.rect.height > 0)
+        };
+        assert!(
+            clients_are_real(&runtime),
+            "the output is too short for these tiles to have client areas"
+        );
+
+        let band = |runtime: &Runtime, object: u32| {
+            let placements = runtime.scene.tiled_placements(240, height);
+            let at = placements
+                .iter()
+                .position(|placement| placement.key.object == object)
+                .unwrap();
+            *placements.get(at).unwrap()
+        };
+        let press = |time| PointerButtonInput {
+            time,
+            button: 272,
+            state: PointerButtonState::Pressed,
+        };
+        let release = |time| PointerButtonInput {
+            time,
+            button: 272,
+            state: PointerButtonState::Released,
+        };
+        let goto = |runtime: &mut Runtime, x: usize, y: usize, buttons: &[PointerButtonInput]| {
+            let (at_x, at_y) = runtime.scene.pointer_at();
+            let (dx, dy) = (
+                i32::try_from(x).unwrap() - at_x,
+                i32::try_from(y).unwrap() - at_y,
+            );
+            runtime.pointer_frame(1, dx, dy, buttons).unwrap()
+        };
+
+        // Pick 1 up by its band and drop it on the TOP half of 3's client.
+        let handle = band(&runtime, 1).band;
+        goto(&mut runtime, handle.x + 2, handle.y + 2, &[press(2)]);
+        assert_eq!(runtime.keyboard_snapshot().focus, keys.first().copied());
+        // Captured AFTER the press: picking the window up focuses it, and
+        // focus publishes a layout of its own, so a snapshot from before it
+        // would be moved by the press rather than by the drop.
+        let published = runtime.layout_snapshot();
+        let target = band(&runtime, 3).rect;
+        goto(&mut runtime, target.x + 2, target.y + 2, &[release(3)]);
+        assert_eq!(order(&runtime), [2, 1, 3], "the drop did not land above 3");
+        assert!(clients_are_real(&runtime));
+        // A drop that rearranges the tree owes the CLIENTS a round of
+        // configures: a move nobody is told about is a move that did not
+        // happen as far as they are concerned. Compared against the snapshot
+        // taken before the drop, which is a different source from the tree.
+        assert_ne!(
+            runtime.layout_snapshot(),
+            published,
+            "the drop published no new layout"
+        );
+        runtime.scene.layout().check_invariants().unwrap();
+
+        // Bottom half of the same window puts it below instead.
+        let handle = band(&runtime, 1).band;
+        goto(&mut runtime, handle.x + 2, handle.y + 2, &[press(4)]);
+        let target = band(&runtime, 3).rect;
+        goto(
+            &mut runtime,
+            target.x + 2,
+            target.y + target.height - 2,
+            &[release(5)],
+        );
+        assert_eq!(order(&runtime), [2, 3, 1], "the drop did not land below 3");
+
+        // A release over the DESKTOP cancels rather than moving to nowhere.
+        let handle = band(&runtime, 1).band;
+        goto(&mut runtime, handle.x + 2, handle.y + 2, &[press(6)]);
+        goto(&mut runtime, 0, height - 1, &[release(7)]);
+        assert_eq!(order(&runtime), [2, 3, 1]);
+
+        // And a press on a CLIENT area picks nothing up, so the release that
+        // follows is not a drop: only the band is a handle.
+        let source = band(&runtime, 1).rect;
+        goto(&mut runtime, source.x + 2, source.y + 2, &[press(8)]);
+        let target = band(&runtime, 2).rect;
+        goto(&mut runtime, target.x + 2, target.y + 2, &[release(9)]);
+        assert_eq!(order(&runtime), [2, 3, 1], "a client press began a drag");
+
+        // An overlay going up mid-drag DROPS what was held: it covers the
+        // screen the operator was aiming at, so there is no longer anywhere
+        // they can be said to have meant.
+        let handle = band(&runtime, 1).band;
+        goto(&mut runtime, handle.x + 2, handle.y + 2, &[press(10)]);
+        assert!(runtime.help(HelpAction::Toggle).unwrap());
+        let target = band(&runtime, 2).rect;
+        goto(&mut runtime, target.x + 2, target.y + 2, &[release(11)]);
+        assert!(!runtime.help(HelpAction::Toggle).unwrap());
+        assert_eq!(order(&runtime), [2, 3, 1], "a drag survived an overlay");
+
+        // An overlay raised and DISMISSED from the keyboard, with the button
+        // still held and the mouse never moved: no modal pointer frame ever
+        // happens, so a guard that only ran on one would let this drop.
+        let handle = band(&runtime, 1).band;
+        goto(&mut runtime, handle.x + 2, handle.y + 2, &[press(14)]);
+        assert!(runtime.help(HelpAction::Toggle).unwrap());
+        assert!(!runtime.help(HelpAction::Toggle).unwrap());
+        let target = band(&runtime, 2).rect;
+        goto(&mut runtime, target.x + 2, target.y + 2, &[release(15)]);
+        assert_eq!(
+            order(&runtime),
+            [2, 3, 1],
+            "a drag outlived an overlay raised from the keyboard"
+        );
+
+        // A client already holding a grab owns every button. A RIGHT press on
+        // a client area establishes one; the LEFT press that follows is routed
+        // to that client, so picking a band up with it would make one button
+        // both the window's and the compositor's — and move focus mid-grab.
+        let right = |time, state| PointerButtonInput {
+            time,
+            button: 273,
+            state,
+        };
+        let held = band(&runtime, 2).rect;
+        goto(
+            &mut runtime,
+            held.x + 2,
+            held.y + 2,
+            &[right(18, PointerButtonState::Pressed)],
+        );
+        assert!(runtime.pointer.grab_surface().is_some(), "no grab was held");
+        let focused = runtime.keyboard_snapshot().focus;
+        let handle = band(&runtime, 1).band;
+        goto(&mut runtime, handle.x + 2, handle.y + 2, &[press(19)]);
+        assert_eq!(runtime.keyboard_snapshot().focus, focused, "focus moved");
+        let target = band(&runtime, 3).rect;
+        goto(&mut runtime, target.x + 2, target.y + 2, &[release(20)]);
+        assert_eq!(order(&runtime), [2, 3, 1], "a grabbed button began a drag");
+        goto(
+            &mut runtime,
+            target.x + 2,
+            target.y + 2,
+            &[right(21, PointerButtonState::Released)],
+        );
+
+        // A whole CLIENT going away is the second forget path and a second
+        // call site, so it is asserted rather than taken on trust. Its window
+        // joins as a fourth, is picked up, and the client is destroyed.
+        let guest = SurfaceKey {
+            client: 2,
+            object: 1,
+        };
+        runtime.commit(guest, surface([2, 2, 2, 0])).unwrap();
+        let handle = runtime
+            .scene
+            .tiled_placements(240, height)
+            .iter()
+            .position(|placement| placement.key == guest)
+            .and_then(|at| runtime.scene.tiled_placements(240, height).get(at).copied())
+            .unwrap()
+            .band;
+        goto(&mut runtime, handle.x + 2, handle.y + 2, &[press(24)]);
+        runtime.remove_client(2).unwrap();
+        // Reconnecting reuses the same key, which is the whole hazard: a
+        // forget that only made the drag name nothing would be invisible,
+        // since a drop of a window no longer in the tree is refused anyway.
+        runtime.commit(guest, surface([3, 3, 3, 0])).unwrap();
+        let survivors = order(&runtime);
+        let target = band(&runtime, 3).rect;
+        goto(&mut runtime, target.x + 2, target.y + 2, &[release(25)]);
+        assert_eq!(
+            order(&runtime),
+            survivors,
+            "a destroyed client's drag outlived it"
+        );
+        runtime.remove_client(2).unwrap();
+
+        // A window that GOES AWAY mid-drag takes the drag with it. Object ids
+        // are recycled per client, so a stale one can come to name a different
+        // window and the release would move one nobody picked up.
+        let handle = band(&runtime, 1).band;
+        goto(&mut runtime, handle.x + 2, handle.y + 2, &[press(22)]);
+        runtime.remove(*keys.first().unwrap()).unwrap();
+        runtime
+            .commit(*keys.first().unwrap(), surface([9, 9, 9, 0]))
+            .unwrap();
+        let reopened = order(&runtime);
+        let target = band(&runtime, 3).rect;
+        goto(&mut runtime, target.x + 2, target.y + 2, &[release(23)]);
+        assert_eq!(
+            order(&runtime),
+            reopened,
+            "a recycled id inherited a drag it never began"
+        );
+
+        // The LAUNCHER is the other overlay and a second call site, so it
+        // gets the same assertion rather than being taken on trust.
+        let handle = band(&runtime, 1).band;
+        goto(&mut runtime, handle.x + 2, handle.y + 2, &[press(16)]);
+        runtime.launcher(LauncherAction::Open).unwrap();
+        assert!(runtime.launcher_visible());
+        runtime.launcher(LauncherAction::Close).unwrap();
+        let target = band(&runtime, 2).rect;
+        goto(&mut runtime, target.x + 2, target.y + 2, &[release(17)]);
+        assert_eq!(
+            order(&runtime),
+            [2, 3, 1],
+            "a drag outlived the launcher opening over it"
+        );
+
+        // And nothing is picked up while one is up, so the release after it
+        // closes is not a drop either.
+        assert!(runtime.help(HelpAction::Toggle).unwrap());
+        let handle = band(&runtime, 1).band;
+        goto(&mut runtime, handle.x + 2, handle.y + 2, &[press(12)]);
+        assert!(!runtime.help(HelpAction::Toggle).unwrap());
+        let target = band(&runtime, 2).rect;
+        goto(&mut runtime, target.x + 2, target.y + 2, &[release(13)]);
+        assert_eq!(order(&runtime), [2, 3, 1], "an overlay let a drag begin");
+        runtime.scene.layout().check_invariants().unwrap();
+    }
+
+    #[test]
     fn a_press_focuses_the_surface_under_the_pointer() {
         let path = std::env::temp_dir().join(format!(
             "td-runtime-click-focus-{}-{}",
@@ -1566,7 +1924,6 @@ mod tests {
         runtime.fail_next_repaint();
         assert!(runtime.help(HelpAction::Close).is_err());
         assert!(runtime.help_visible());
-
     }
 
     #[test]
@@ -1577,9 +1934,13 @@ mod tests {
             SEQ.fetch_add(1, Ordering::Relaxed)
         ));
         let cleanup = Cleanup(path);
-        let framebuffer =
-            Framebuffer::test_file(&cleanup.0, 320, crate::scene::least_output_height(8), 320 * 4)
-                .unwrap();
+        let framebuffer = Framebuffer::test_file(
+            &cleanup.0,
+            320,
+            crate::scene::least_output_height(8),
+            320 * 4,
+        )
+        .unwrap();
         let mut runtime = Runtime::new(framebuffer);
         let key = SurfaceKey {
             client: 1,
@@ -1893,9 +2254,13 @@ mod tests {
             SEQ.fetch_add(1, Ordering::Relaxed)
         ));
         let cleanup = Cleanup(path);
-        let framebuffer =
-            Framebuffer::test_file(&cleanup.0, 120, crate::scene::least_output_height(8), 120 * 4)
-                .unwrap();
+        let framebuffer = Framebuffer::test_file(
+            &cleanup.0,
+            120,
+            crate::scene::least_output_height(8),
+            120 * 4,
+        )
+        .unwrap();
         let mut runtime = Runtime::new(framebuffer);
         let subscription = runtime
             .subscribe_input_with_activity(
@@ -1985,9 +2350,13 @@ mod tests {
             SEQ.fetch_add(1, Ordering::Relaxed)
         ));
         let cleanup = Cleanup(path);
-        let framebuffer =
-            Framebuffer::test_file(&cleanup.0, 120, crate::scene::least_output_height(8), 120 * 4)
-                .unwrap();
+        let framebuffer = Framebuffer::test_file(
+            &cleanup.0,
+            120,
+            crate::scene::least_output_height(8),
+            120 * 4,
+        )
+        .unwrap();
         let mut runtime = Runtime::new(framebuffer);
         let subscription = runtime
             .subscribe_input_with_activity(
@@ -2047,9 +2416,13 @@ mod tests {
             SEQ.fetch_add(1, Ordering::Relaxed)
         ));
         let cleanup = Cleanup(path);
-        let framebuffer =
-            Framebuffer::test_file(&cleanup.0, 120, crate::scene::least_output_height(8), 120 * 4)
-                .unwrap();
+        let framebuffer = Framebuffer::test_file(
+            &cleanup.0,
+            120,
+            crate::scene::least_output_height(8),
+            120 * 4,
+        )
+        .unwrap();
         let mut runtime = Runtime::new(framebuffer);
         let subscription = runtime
             .subscribe_input_with_activity(
@@ -2101,9 +2474,13 @@ mod tests {
             SEQ.fetch_add(1, Ordering::Relaxed)
         ));
         let cleanup = Cleanup(path);
-        let framebuffer =
-            Framebuffer::test_file(&cleanup.0, 120, crate::scene::least_output_height(8), 120 * 4)
-                .unwrap();
+        let framebuffer = Framebuffer::test_file(
+            &cleanup.0,
+            120,
+            crate::scene::least_output_height(8),
+            120 * 4,
+        )
+        .unwrap();
         let mut runtime = Runtime::new(framebuffer);
         let subscription = runtime
             .subscribe_input_with_activity(
@@ -2169,9 +2546,13 @@ mod tests {
             SEQ.fetch_add(1, Ordering::Relaxed)
         ));
         let cleanup = Cleanup(path);
-        let framebuffer =
-            Framebuffer::test_file(&cleanup.0, 120, crate::scene::least_output_height(8), 120 * 4)
-                .unwrap();
+        let framebuffer = Framebuffer::test_file(
+            &cleanup.0,
+            120,
+            crate::scene::least_output_height(8),
+            120 * 4,
+        )
+        .unwrap();
         let mut runtime = Runtime::new(framebuffer);
         let pointer_active = Arc::new(AtomicBool::new(false));
         let subscription = runtime

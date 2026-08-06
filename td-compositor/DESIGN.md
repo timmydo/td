@@ -604,6 +604,58 @@ without it the wrap would build a container with one child in it. Focus does
 not follow the geometry afterwards — the window that moved stays focused,
 since it is the one the operator was acting on.
 
+DRAGGING a window is the same move with the destination named by the pointer
+instead of by a direction. A press on a title BAND picks the window up and
+focuses it; the release drops it beside whatever is under the pointer then,
+on the side the pointer is in. Which side is read along the TARGET's own
+container — top or bottom in a column, left or right in a row — since that is
+the direction its neighbours actually lie in, and within whichever rectangle
+the pointer is in rather than over the tile as a whole, because a stacked
+leaf's band and its client area are far apart and a midpoint between them is
+in neither. A STACKED container is the exception that proves it: its bands
+run DOWN its top whatever its own axis is, so the neighbours lie above and
+below even in a row, and the half is read that way.
+
+The dragged window is DETACHED rather than removed, and that is the whole of
+this operation's correctness. A removal collapses the container the leaf came
+out of, and when the two are siblings that container is the one the TARGET
+sits in — so dropping one member of a two-window column onto the other would
+collapse the column, land in the row beside it, and flatten the arrangement;
+and a two-window stack reordered that way would silently unstack. Collapsing
+once at the END leaves the target's container standing.
+
+The whole drag lives outside the pointer protocol and has to: a band belongs
+to no client, so a press on one establishes no grab. That is the same seam
+that makes a click on a band reach no client, used rather than worked around,
+and it is why only the BTN_LEFT press, and only on a band, is a handle — a
+press on a client area is that client's.
+
+A client already holding an implicit grab is the exception, and it owns every
+button until it lets go. The pointer model routes a press made during a grab
+to the grabbing surface, so that press IS delivered wherever it lands: taking
+it as a handle would make one button both the window's and the compositor's,
+and would move focus mid-grab, which click-to-focus refuses for the same
+reason. Nothing is picked up while a grab is held.
+
+A drag is also forgotten when the window it names goes away — on a single
+toplevel's removal and on a whole client's. Object ids are recycled per
+client, so a stale one does not merely name nothing: it can come to name a
+DIFFERENT window, and the release would then move one nobody picked
+up. A release off every tile cancels rather
+than moving to nowhere, and an overlay going up drops what was held, since it
+covers the screen the operator was aiming at. That cancel happens where the
+overlay BECOMES visible rather than on the next modal pointer frame, because
+an overlay is opened from the keyboard: raising and dismissing one without
+moving the mouse would otherwise leave the drag standing.
+
+A drop reports whether the ARRANGEMENT changed rather than whether it was
+asked for, so putting a window back exactly where it came from — the
+commonest gesture there is — costs no repaint and no round of configures.
+
+There is no drag INDICATOR yet: nothing on screen follows the pointer or
+marks where a drop would land, so the gesture is currently blind between
+press and release.
+
 STACKING is the second arrangement a container can take, toggled by
 `Super+s`. Its leaves' bands run down its top, one after another, and ONE of
 them gets everything below the run; the rest are a band alone. The run is
