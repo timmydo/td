@@ -407,9 +407,19 @@ pub(crate) fn draw_text_clipped(
     let (clip_x, clip_y, clip_width, clip_height) = clip;
     let clip_right = clip_x.saturating_add(clip_width).min(width);
     let clip_bottom = clip_y.saturating_add(clip_height).min(height);
-    for (column, byte) in text.bytes().enumerate() {
+    // One glyph per CHARACTER, not per byte. Titles are client-supplied UTF-8
+    // and are bounded in characters, so walking bytes would spend a multi-byte
+    // scalar's worth of cells on it and push later text out of the clip.
+    for (column, character) in text.chars().enumerate() {
         let origin_x = x.saturating_add(column.saturating_mul(GLYPH_ADVANCE).saturating_mul(scale));
-        for (glyph_y, bits) in glyph(byte).into_iter().enumerate() {
+        // The origin only advances, so nothing after this can land either. A
+        // title is up to 256 characters against a band that holds ten, and
+        // without this every one of the rest is rasterized and discarded a
+        // pixel at a time, on every frame.
+        if origin_x >= clip_right {
+            break;
+        }
+        for (glyph_y, bits) in glyph_for(character).into_iter().enumerate() {
             for glyph_x in 0..GLYPH_WIDTH {
                 let shift = GLYPH_WIDTH.saturating_sub(1).saturating_sub(glyph_x);
                 if bits & (1u8 << shift) == 0 {
@@ -529,6 +539,14 @@ fn put_pixel(
     if let Some(pixel) = pixels.get_mut(offset..end) {
         pixel.copy_from_slice(&color);
     }
+}
+
+/// One cell for one character. A scalar past `u8` has no byte to look up and
+/// takes the missing box, which is the same answer the table gives for every
+/// byte it does not carry — so a font that grows a Latin-1 row serves it
+/// without a second rule here.
+fn glyph_for(character: char) -> [u8; GLYPH_HEIGHT] {
+    u8::try_from(character).map(glyph).unwrap_or(MISSING)
 }
 
 fn glyph(byte: u8) -> [u8; GLYPH_HEIGHT] {
@@ -789,6 +807,55 @@ mod tests {
         let mut keyboard = vec![0u8; first.len()];
         model.paint(&mut keyboard, 320, 200).unwrap();
         assert_ne!(keyboard, pointer);
+    }
+
+    /// A helper that renders one string into a fresh buffer, so two renders
+    /// can be compared byte for byte.
+    fn rendered(text: &str, width: usize, clip: (usize, usize, usize, usize)) -> Vec<u8> {
+        let height = GLYPH_HEIGHT * 2;
+        let stride = width * 4;
+        let mut pixels = vec![0u8; stride * height];
+        draw_text_clipped(
+            &mut pixels,
+            width,
+            height,
+            stride,
+            0,
+            0,
+            2,
+            text,
+            [9, 8, 7, 6],
+            clip,
+        );
+        pixels
+    }
+
+    #[test]
+    fn text_advances_by_character_and_stops_where_the_clip_does() {
+        let width = 64usize;
+        let all = (0, 0, width, GLYPH_HEIGHT * 2);
+
+        // One cell per CHARACTER. `é` is two bytes and has no glyph, so a
+        // byte-walking renderer spends TWO cells on it and pushes the `A` one
+        // cell right — which is what this compares against rather than
+        // merely asserting that something was drawn.
+        assert_eq!(rendered("\u{e9}A", width, all), rendered("@A", width, all));
+        assert_ne!(rendered("\u{e9}A", width, all), rendered("@@A", width, all));
+
+        // And the early-out is invisible: a string far longer than its clip
+        // paints exactly what the prefix that fits paints. The `break` itself
+        // is not otherwise falsifiable — it changes no pixel, only how many
+        // are computed and thrown away — so what is pinned is that it throws
+        // away nothing that would have shown.
+        // Exactly two cells wide, so the third character's ORIGIN is the
+        // first pixel past the clip and the break is on the boundary rather
+        // than one glyph inside it — at 25 the third glyph's leftmost column
+        // still lands, and "the prefix that fits" would be three characters.
+        let band = (0, 0, GLYPH_ADVANCE * 2 * 2, GLYPH_HEIGHT * 2);
+        assert_eq!(
+            rendered(&"AB".repeat(128), width, band),
+            rendered("AB", width, band)
+        );
     }
 
     #[test]

@@ -7,6 +7,8 @@ use crate::scene::{
     InputRegion, SharedInputRegion, Surface, SurfaceKey, MAX_INPUT_REGION_OPERATIONS, SHM_ARGB8888,
     SHM_XRGB8888,
 };
+#[cfg(test)]
+use crate::scene::{GAP, TITLE_HEIGHT};
 use crate::{socket, sys, wire, MAX_UI_DIMENSION, MAX_UI_FRAME_BYTES};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs::{self, File, OpenOptions, Permissions};
@@ -2526,7 +2528,13 @@ mod tests {
             TEST_SEQ.fetch_add(1, Ordering::Relaxed)
         );
         let framebuffer_path = std::env::temp_dir().join(format!("{stem}.fb"));
-        let framebuffer = Framebuffer::test_file(&framebuffer_path, 32, 32, 32 * 4).unwrap();
+        let framebuffer = Framebuffer::test_file(
+            &framebuffer_path,
+            32,
+            crate::scene::least_output_height(2),
+            32 * 4,
+        )
+        .unwrap();
         let runtime = Arc::new(Mutex::new(Runtime::new(framebuffer)));
         let focused = SurfaceKey {
             client: 12,
@@ -2856,7 +2864,13 @@ mod tests {
             TEST_SEQ.fetch_add(1, Ordering::Relaxed)
         );
         let framebuffer_path = std::env::temp_dir().join(format!("{stem}.fb"));
-        let framebuffer = Framebuffer::test_file(&framebuffer_path, 80, 80, 80 * 4).unwrap();
+        let framebuffer = Framebuffer::test_file(
+            &framebuffer_path,
+            80,
+            crate::scene::least_output_height(8),
+            80 * 4,
+        )
+        .unwrap();
         let runtime = Arc::new(Mutex::new(Runtime::new(framebuffer)));
         let (server, mut peer) = UnixStream::pair().unwrap();
         peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
@@ -3208,7 +3222,13 @@ mod tests {
             TEST_SEQ.fetch_add(1, Ordering::Relaxed)
         );
         let framebuffer_path = std::env::temp_dir().join(format!("{stem}.fb"));
-        let framebuffer = Framebuffer::test_file(&framebuffer_path, 80, 80, 80 * 4).unwrap();
+        let framebuffer = Framebuffer::test_file(
+            &framebuffer_path,
+            80,
+            crate::scene::least_output_height(8),
+            80 * 4,
+        )
+        .unwrap();
         let runtime = Arc::new(Mutex::new(Runtime::new(framebuffer)));
         let (server, mut peer) = UnixStream::pair().unwrap();
         peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
@@ -3594,7 +3614,13 @@ mod tests {
             TEST_SEQ.fetch_add(1, Ordering::Relaxed)
         );
         let framebuffer_path = std::env::temp_dir().join(format!("{stem}.fb"));
-        let framebuffer = Framebuffer::test_file(&framebuffer_path, 80, 80, 80 * 4).unwrap();
+        let framebuffer = Framebuffer::test_file(
+            &framebuffer_path,
+            80,
+            crate::scene::least_output_height(8),
+            80 * 4,
+        )
+        .unwrap();
         let mut runtime = Runtime::new(framebuffer);
         let pointer_active = Arc::new(AtomicBool::new(true));
         let subscription = runtime
@@ -4023,7 +4049,13 @@ mod tests {
         );
         let framebuffer_path = std::env::temp_dir().join(format!("{stem}.fb"));
         let pool_path = std::env::temp_dir().join(format!("{stem}.pool"));
-        let framebuffer = Framebuffer::test_file(&framebuffer_path, 64, 64, 64 * 4).unwrap();
+        let framebuffer = Framebuffer::test_file(
+            &framebuffer_path,
+            64,
+            crate::scene::least_output_height(2),
+            64 * 4,
+        )
+        .unwrap();
         let runtime = Arc::new(Mutex::new(Runtime::new(framebuffer)));
         runtime.lock().unwrap().repaint().unwrap();
         let (server, mut client) = UnixStream::pair().unwrap();
@@ -4307,7 +4339,7 @@ mod tests {
             size,
             crate::term_client::Size {
                 width: 592,
-                height: 352
+                height: 332
             }
         );
         assert_eq!(
@@ -4315,10 +4347,10 @@ mod tests {
                 client: 78,
                 object: 7,
             }),
-            Some((592, 352))
+            Some((592, 332))
         );
         assert_eq!(cells, crate::term_client::grid(size, &font).unwrap());
-        assert_eq!(cells, (22, 74));
+        assert_eq!(cells, (20, 74));
         assert_ne!(
             cells,
             crate::term_client::grid(crate::term_client::default_size(&font).unwrap(), &font)
@@ -4333,10 +4365,10 @@ mod tests {
         // more than a claim about arithmetic.
         let window = pty.window().unwrap();
         assert_eq!((window.rows, window.columns), cells);
-        assert_eq!((window.rows, window.columns), (22, 74));
+        assert_eq!((window.rows, window.columns), (20, 74));
         assert_eq!(
             crate::ready::marker(window.rows, window.columns),
-            "TD-TERM-READY rows=22 columns=74\n"
+            "TD-TERM-READY rows=20 columns=74\n"
         );
         // A frame that was released and presented is a frame that reached the
         // framebuffer. Compared against the DESKTOP BACKGROUND, which is what
@@ -4344,22 +4376,26 @@ mod tests {
         // zero would pass on the bare desktop and prove nothing. These are
         // MEMORY bytes, not an RGB literal: XRGB8888 is little-endian, so the
         // blue channel comes first, as `scene`'s own desktop test spells it.
-        // Counted INSIDE the tile only. Scanning the whole output would let
-        // the status bar's own 640x24 band — none of it the desktop colour —
-        // stand in for 15360 pixels the client never painted, which is about
-        // twenty-six terminal rows of slack in an assertion whose whole job
-        // is to prove the tile was covered.
+        // Counted INSIDE THE CLIENT'S OWN AREA only. Scanning the whole
+        // output would let the status bar's own 640x24 band — none of it the
+        // desktop colour — stand in for 15360 pixels the client never
+        // painted, which is about twenty-six terminal rows of slack in an
+        // assertion whose whole job is to prove the tile was covered; and
+        // scanning the whole TILE would now let the title band do the same
+        // for another 592x20 the compositor painted rather than the client.
         let painted = fs::read(&framebuffer_path).unwrap();
-        // The tile's own rectangle, derived from the size asserted above: one
-        // surface is centred in the tiling area, which begins below the bar.
-        let (tile_width, tile_height) = (592usize, 352usize);
-        let (output_width, output_height) = (640usize, 400usize);
-        let left = (output_width - tile_width) / 2;
-        let top = BAR_HEIGHT + (output_height - tile_height) / 2;
+        // The client's own rectangle, derived from the constants rather than
+        // from the tile being centred: the band makes it no longer symmetric
+        // about the tiling area, so the old halving would have quietly moved
+        // the window it scans off the client and onto the desktop below it.
+        let (client_width, client_height) = (592usize, 332usize);
+        let output_width = 640usize;
+        let left = (output_width - client_width) / 2;
+        let top = BAR_HEIGHT + GAP + TITLE_HEIGHT;
         let stride = output_width * 4;
         let mut foreign = 0usize;
-        for y in top..top + tile_height {
-            for x in left..left + tile_width {
+        for y in top..top + client_height {
+            for x in left..left + client_width {
                 let offset = y * stride + x * 4;
                 if painted.get(offset..offset + 4) != Some(&[0x30, 0x25, 0x20, 0][..]) {
                     foreign += 1;
@@ -4368,8 +4404,8 @@ mod tests {
         }
         assert_eq!(
             foreign,
-            tile_width * tile_height,
-            "the presented frame left desktop showing inside its own tile"
+            client_width * client_height,
+            "the presented frame left desktop showing inside its own client area"
         );
 
         drop(connection);
@@ -4402,7 +4438,7 @@ mod tests {
                 client: 77,
                 object: 7,
             }),
-            Some((592, 352))
+            Some((592, 332))
         );
 
         runtime
@@ -4421,13 +4457,13 @@ mod tests {
                 },
             )
             .unwrap();
-        connected.wait_for((284, 352), false, false).unwrap();
+        connected.wait_for((284, 332), false, false).unwrap();
         assert_eq!(
             runtime.lock().unwrap().surface_size(SurfaceKey {
                 client: 77,
                 object: 7,
             }),
-            Some((284, 352))
+            Some((284, 332))
         );
 
         runtime
@@ -4435,7 +4471,7 @@ mod tests {
             .unwrap()
             .command(Command::Focus(Direction::Left))
             .unwrap();
-        connected.wait_for((284, 352), true, false).unwrap();
+        connected.wait_for((284, 332), true, false).unwrap();
         runtime
             .lock()
             .unwrap()
@@ -4660,7 +4696,7 @@ mod tests {
         let mut received = Vec::new();
         let (primed_size, primed_serial, primed_activated) =
             receive_configure(&mut peer, &mut received, 9, 10);
-        assert_eq!(primed_size, (72, 32));
+        assert_eq!(primed_size, (72, 12));
         assert!(primed_activated);
         {
             let mut tracker = tracker.lock().unwrap();
@@ -4689,7 +4725,7 @@ mod tests {
             .dispatch(request(9, 4, ack).unwrap(), &mut VecDeque::new())
             .unwrap();
         let (size, serial, activated) = receive_configure(&mut peer, &mut received, 9, 10);
-        assert_eq!(size, (72, 32));
+        assert_eq!(size, (72, 12));
         assert!(activated);
         assert_ne!(serial, 0);
 
@@ -4853,7 +4889,8 @@ mod tests {
         let pixels = [0x21u8, 0x43, 0x65, 0];
         fs::write(&pool_path, pixels).unwrap();
         let framebuffer =
-            Framebuffer::test_file(&framebuffer_path, 8, 8 + BAR_HEIGHT, 32).unwrap();
+            Framebuffer::test_file(&framebuffer_path, 8, crate::scene::least_output_height(2), 32)
+                .unwrap();
         let (server, _peer) = UnixStream::pair().unwrap();
         let runtime = Arc::new(Mutex::new(Runtime::new(framebuffer)));
         let mut client = Client::new(2, server, runtime, test_keymap()).unwrap();
@@ -4981,7 +5018,13 @@ mod tests {
             TEST_SEQ.fetch_add(1, Ordering::Relaxed)
         );
         let framebuffer_path = std::env::temp_dir().join(format!("{stem}.fb"));
-        let framebuffer = Framebuffer::test_file(&framebuffer_path, 80, 80, 80 * 4).unwrap();
+        let framebuffer = Framebuffer::test_file(
+            &framebuffer_path,
+            80,
+            crate::scene::least_output_height(8),
+            80 * 4,
+        )
+        .unwrap();
         let runtime = Arc::new(Mutex::new(Runtime::new(framebuffer)));
         let (server, _peer) = UnixStream::pair().unwrap();
         let mut client = Client::new(2, server, Arc::clone(&runtime), test_keymap()).unwrap();
@@ -5183,7 +5226,13 @@ mod tests {
         let framebuffer_path = std::env::temp_dir().join(format!("{stem}.fb"));
         let pool_path = std::env::temp_dir().join(format!("{stem}.pool"));
         fs::write(&pool_path, [1, 2, 3, 0]).unwrap();
-        let framebuffer = Framebuffer::test_file(&framebuffer_path, 80, 80, 80 * 4).unwrap();
+        let framebuffer = Framebuffer::test_file(
+            &framebuffer_path,
+            80,
+            crate::scene::least_output_height(8),
+            80 * 4,
+        )
+        .unwrap();
         let runtime = Arc::new(Mutex::new(Runtime::new(framebuffer)));
         let focused = SurfaceKey {
             client: 2,

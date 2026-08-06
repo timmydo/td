@@ -250,9 +250,10 @@ fn selftest() -> Result<(), String> {
             format: scene::SHM_XRGB8888,
         },
     )?;
-    // Tall enough to have a tiling area beneath the status bar: the bar owns
-    // the top rows, so a frame the size of one is all bar and no tile.
-    let height = 4 + bar::BAR_HEIGHT;
+    // Tall enough to have a tiling area beneath the status bar AND a client
+    // area beneath the tile's title band: a frame the size of either is all
+    // decoration and no client, and this is the check that says so.
+    let height = scene::least_output_height(4);
     let mut frame = vec![0; 4 * height * 4];
     scene.render(&mut frame, 4, height, 4 * 4);
     if !frame.as_chunks::<4>().0.contains(&[1, 2, 3, 0]) {

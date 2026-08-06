@@ -249,11 +249,19 @@ impl Runtime {
         Ok(())
     }
 
-    /// Take a toplevel's title. No repaint yet — nothing draws a title until
-    /// the decoration lands, and a repaint per `set_title` would be one per
-    /// keystroke from any client that puts its progress in the title.
+    /// Take a toplevel's title, and repaint if the band showing it is on
+    /// screen. Both halves of that condition matter: an unchanged title is
+    /// what a client resending the same string every commit sends, and a
+    /// title on a surface with no pixels is the ordinary opening sequence —
+    /// set before the first buffer, drawn by the commit that maps it.
+    ///
+    /// Deferring instead would not do. `flush_paint` is driven from the input
+    /// loop, so a rename on an idle machine would sit owed and unpainted, and
+    /// the band would show the previous name with nothing on screen to say so.
     pub fn set_title(&mut self, key: SurfaceKey, title: String) -> Result<(), String> {
-        self.scene.set_title(key, title);
+        if self.scene.set_title(key, title) && self.scene.is_mapped(key) {
+            self.repaint()?;
+        }
         Ok(())
     }
 
@@ -1562,6 +1570,56 @@ mod tests {
     }
 
     #[test]
+    fn renaming_a_mapped_window_repaints_and_renaming_an_unmapped_one_does_not() {
+        let path = std::env::temp_dir().join(format!(
+            "td-runtime-rename-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let cleanup = Cleanup(path);
+        let framebuffer =
+            Framebuffer::test_file(&cleanup.0, 320, crate::scene::least_output_height(8), 320 * 4)
+                .unwrap();
+        let mut runtime = Runtime::new(framebuffer);
+        let key = SurfaceKey {
+            client: 1,
+            object: 1,
+        };
+
+        // Before the first buffer, which is where a client ordinarily sets its
+        // title. Nothing is on screen to repaint, and `fail_next_repaint` is
+        // what proves no paint was taken rather than that one was harmless.
+        runtime.fail_next_repaint();
+        runtime.set_title(key, "FIRST".to_string()).unwrap();
+        runtime.clear_repaint_failure();
+
+        runtime.commit(key, surface([1, 2, 3, 0])).unwrap();
+        let named = fs::read(&cleanup.0).unwrap();
+
+        // Renaming a MAPPED window paints, because its band is on screen and
+        // nothing else is going to come along and repaint it: `flush_paint`
+        // runs from the input loop, and an idle machine has no input.
+        runtime.set_title(key, "SECOND".to_string()).unwrap();
+        let renamed = fs::read(&cleanup.0).unwrap();
+        assert_ne!(renamed, named, "the new name never reached the screen");
+
+        // The same title again owes nothing — a client that resends its title
+        // on every commit is the case this is for.
+        runtime.fail_next_repaint();
+        runtime.set_title(key, "SECOND".to_string()).unwrap();
+        runtime.clear_repaint_failure();
+        assert_eq!(fs::read(&cleanup.0).unwrap(), renamed);
+
+        // And a failed paint surfaces rather than being swallowed, leaving the
+        // screen owed: the scene holds a name the screen has not shown.
+        runtime.fail_next_repaint();
+        assert!(runtime.set_title(key, "THIRD".to_string()).is_err());
+        assert!(runtime.paint_pending());
+        runtime.flush_paint().unwrap();
+        assert_ne!(fs::read(&cleanup.0).unwrap(), renamed);
+    }
+
+    #[test]
     fn a_status_line_repaints_only_when_its_text_changes() {
         let path = std::env::temp_dir().join(format!(
             "td-runtime-status-{}-{}",
@@ -1835,7 +1893,9 @@ mod tests {
             SEQ.fetch_add(1, Ordering::Relaxed)
         ));
         let cleanup = Cleanup(path);
-        let framebuffer = Framebuffer::test_file(&cleanup.0, 120, 80, 120 * 4).unwrap();
+        let framebuffer =
+            Framebuffer::test_file(&cleanup.0, 120, crate::scene::least_output_height(8), 120 * 4)
+                .unwrap();
         let mut runtime = Runtime::new(framebuffer);
         let subscription = runtime
             .subscribe_input_with_activity(
@@ -1925,7 +1985,9 @@ mod tests {
             SEQ.fetch_add(1, Ordering::Relaxed)
         ));
         let cleanup = Cleanup(path);
-        let framebuffer = Framebuffer::test_file(&cleanup.0, 120, 80, 120 * 4).unwrap();
+        let framebuffer =
+            Framebuffer::test_file(&cleanup.0, 120, crate::scene::least_output_height(8), 120 * 4)
+                .unwrap();
         let mut runtime = Runtime::new(framebuffer);
         let subscription = runtime
             .subscribe_input_with_activity(
@@ -1985,7 +2047,9 @@ mod tests {
             SEQ.fetch_add(1, Ordering::Relaxed)
         ));
         let cleanup = Cleanup(path);
-        let framebuffer = Framebuffer::test_file(&cleanup.0, 120, 80, 120 * 4).unwrap();
+        let framebuffer =
+            Framebuffer::test_file(&cleanup.0, 120, crate::scene::least_output_height(8), 120 * 4)
+                .unwrap();
         let mut runtime = Runtime::new(framebuffer);
         let subscription = runtime
             .subscribe_input_with_activity(
@@ -2037,7 +2101,9 @@ mod tests {
             SEQ.fetch_add(1, Ordering::Relaxed)
         ));
         let cleanup = Cleanup(path);
-        let framebuffer = Framebuffer::test_file(&cleanup.0, 120, 80, 120 * 4).unwrap();
+        let framebuffer =
+            Framebuffer::test_file(&cleanup.0, 120, crate::scene::least_output_height(8), 120 * 4)
+                .unwrap();
         let mut runtime = Runtime::new(framebuffer);
         let subscription = runtime
             .subscribe_input_with_activity(
@@ -2103,7 +2169,9 @@ mod tests {
             SEQ.fetch_add(1, Ordering::Relaxed)
         ));
         let cleanup = Cleanup(path);
-        let framebuffer = Framebuffer::test_file(&cleanup.0, 120, 80, 120 * 4).unwrap();
+        let framebuffer =
+            Framebuffer::test_file(&cleanup.0, 120, crate::scene::least_output_height(8), 120 * 4)
+                .unwrap();
         let mut runtime = Runtime::new(framebuffer);
         let pointer_active = Arc::new(AtomicBool::new(false));
         let subscription = runtime

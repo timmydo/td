@@ -44,6 +44,12 @@ pub struct Placement {
     pub key: SurfaceKey,
     pub rect: Rect,
     pub focused: bool,
+    /// Whether the tile carries a title band. False for the fullscreen
+    /// arrangement, which is the whole output or nothing: a window with a band
+    /// across the top of it is not fullscreen. The renderer needs the answer
+    /// per PLACEMENT rather than per workspace, since it is the rect it is
+    /// about to carve.
+    pub decorated: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -53,6 +59,12 @@ pub struct ViewLayout {
     pub visible: bool,
     pub activated: bool,
     pub fullscreen: bool,
+    /// As `Placement::decorated`, and deliberately NOT `!self.fullscreen`: the
+    /// rect is overridden for a fullscreen LEAF on any workspace, while the
+    /// field beside it is only set for the VISIBLE one. A client on a hidden
+    /// workspace would otherwise be sized for the whole output and carved for
+    /// a band it does not have.
+    pub decorated: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -362,8 +374,8 @@ impl Layout {
         for (number, workspace) in &self.workspaces {
             let workspace_visible = *number == self.active;
             for mut placement in tiled_placements(workspace, width, height, gap) {
-                let fullscreen = workspace.fullscreen == Some(placement.key);
-                if fullscreen {
+                let fullscreen_leaf = workspace.fullscreen == Some(placement.key);
+                if fullscreen_leaf {
                     placement.rect = Rect {
                         x: 0,
                         y: 0,
@@ -374,9 +386,11 @@ impl Layout {
                 views.push(ViewLayout {
                     key: placement.key,
                     rect: placement.rect,
-                    visible: workspace_visible && (workspace.fullscreen.is_none() || fullscreen),
+                    visible: workspace_visible
+                        && (workspace.fullscreen.is_none() || fullscreen_leaf),
                     activated: workspace_visible && placement.focused,
-                    fullscreen: workspace_visible && fullscreen,
+                    fullscreen: workspace_visible && fullscreen_leaf,
+                    decorated: !fullscreen_leaf,
                 });
             }
         }
@@ -518,6 +532,7 @@ fn visible_placements(
                 height,
             },
             focused: workspace.focused == Some(fullscreen),
+            decorated: false,
         }];
     }
     tiled_placements(workspace, width, height, gap)
@@ -582,6 +597,7 @@ fn place_node(
             key: *key,
             rect,
             focused: focused == Some(*key),
+            decorated: true,
         }),
         Node::Split { axis, children } => {
             let rects = split_rects(rect, *axis, children.len(), gap);
@@ -752,7 +768,8 @@ mod tests {
                         width: 50,
                         height: 100
                     },
-                    focused: false
+                    focused: false,
+                    decorated: true
                 },
                 Placement {
                     key: key(2),
@@ -762,7 +779,8 @@ mod tests {
                         width: 50,
                         height: 50
                     },
-                    focused: false
+                    focused: false,
+                    decorated: true
                 },
                 Placement {
                     key: key(3),
@@ -772,7 +790,8 @@ mod tests {
                         width: 50,
                         height: 50
                     },
-                    focused: true
+                    focused: true,
+                    decorated: true
                 }
             ]
         );
@@ -904,6 +923,7 @@ mod tests {
                     visible: true,
                     activated: true,
                     fullscreen: false,
+                    decorated: true,
                 },
                 ViewLayout {
                     key: key(2),
@@ -916,6 +936,7 @@ mod tests {
                     visible: false,
                     activated: false,
                     fullscreen: false,
+                    decorated: true,
                 },
             ]
         );
@@ -935,6 +956,7 @@ mod tests {
                     visible: false,
                     activated: false,
                     fullscreen: false,
+                    decorated: true,
                 },
                 ViewLayout {
                     key: key(2),
@@ -947,6 +969,7 @@ mod tests {
                     visible: true,
                     activated: true,
                     fullscreen: true,
+                    decorated: false,
                 },
             ]
         );
@@ -1026,7 +1049,10 @@ mod tests {
                     width: 80,
                     height: 60
                 },
-                focused: true
+                focused: true,
+                // The fullscreen arrangement carries no band: a window with
+                // one across the top of it is not fullscreen.
+                decorated: false
             }]
         );
         layout.apply(Command::Focus(Direction::Left));
@@ -1213,7 +1239,8 @@ mod tests {
                     width: 1,
                     height: 1
                 },
-                focused: true
+                focused: true,
+                decorated: true
             }]
         );
         layout.map(key(2));

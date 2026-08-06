@@ -506,9 +506,10 @@ in characters rather than bytes so truncation cannot split a UTF-8 sequence.
 An empty title is stored as NO title, so what draws one has a single absent
 case rather than two that look identical on screen. `set_app_id` is still read
 for wire validity and dropped; it is not what names a window, and storing both
-would make them indistinguishable downstream. Nothing draws a title yet, so
-nothing repaints on one — a client that puts its progress in its title would
-otherwise repaint the screen per keystroke.
+would make them indistinguishable downstream. Setting a title does not repaint
+by itself — a client that puts its progress or its filename in its title would
+otherwise repaint the whole screen per keystroke — so a renamed window shows
+its new name at the next repaint anything else asks for.
 
 A title's lifetime is its xdg_toplevel OBJECT's, not its mapped pixels'. It
 survives every unmap, because a null-buffer attach is both the transient unmap
@@ -518,11 +519,40 @@ toplevel is destroyed, when the wl_surface is, and with the client. An input
 region can be dropped with the pixels only because the client re-supplies one
 on every commit; nothing re-supplies a title.
 
-Decoration, clipboard, drag-and-drop, subsurfaces, popups, output
-reconfiguration, fractional scale, screen capture, data devices, pointer
-axes, and touch are not yet advertised. Unknown objects, malformed sizes,
-invalid object reuse, missing file descriptors, and unsupported requests
-disconnect only that client.
+Every DECORATED tile carries a title band across its top, 20 pixels tall,
+holding the retained title in 2x glyphs. A tile is therefore a band and the
+client's own area beneath it, and `client_rect` is the one place that says
+where the second is: the blit, the pointer hit test, and the layout published
+to clients all go through it, for the reason the status bar's offset has one
+place. Two of them disagreeing is a click landing somewhere other than where
+it looks. The band and the client PARTITION the tile — the band is derived
+first and the client is what is left — so a tile shorter than a band is all
+band and no client rather than the two overlapping. The BORDER still uses the
+whole tile, since a border around the client area alone would leave a window's
+own title bar outside its own frame.
+
+The band takes the focused or unfocused colour with the border, in its own
+pair rather than the border's, and its text is clipped to itself so an
+overlong title cannot reach a neighbour. A window with no title gets a bare
+band and no placeholder: the band is what says the window is there, and
+inventing a name for it would put a word on screen no client chose. A click
+anywhere in a band therefore reaches no client — the hit test knows only the
+client area — which is the seam a drag handle needs.
+
+FULLSCREEN is undecorated: a window with a band across the top of it is not
+fullscreen, so a fullscreen leaf's tile is all client. That is carried as a
+per-placement flag rather than inferred from the rect, since a tile that
+happens to fill the output is still a tile, and it is deliberately not
+`!fullscreen` on a view: the rect is overridden for a fullscreen leaf on any
+workspace while the fullscreen STATE is advertised only for the visible one,
+so a client on a hidden workspace would otherwise be sized for the whole
+output and carved for a band it does not have.
+
+Client-side decoration negotiation, clipboard, drag-and-drop, subsurfaces,
+popups, output reconfiguration, fractional scale, screen capture, data
+devices, pointer axes, and touch are not yet advertised. Unknown objects,
+malformed sizes, invalid object reuse, missing file descriptors, and
+unsupported requests disconnect only that client.
 
 The server advertises `wl_seat` version 7 as `td-seat0` with keyboard and
 pointer capabilities. Every `wl_keyboard` receives a dependency-free,
@@ -575,8 +605,8 @@ Keyboard objects may be released at their negotiated protocol version.
 advertised.
 
 Pointer focus is the visible surface pixel under the software cursor. Gaps,
-borders, clipped-away pixels, empty tile space, and pixels excluded by the
-surface's committed input region have no pointer focus. A region retains at
+borders, TITLE BANDS, clipped-away pixels, empty tile space, and pixels
+excluded by the surface's committed input region have no pointer focus. A region retains at
 most 256 nondegenerate add/subtract operations and one client can retain at
 most 4,096 operations across surface snapshots. Overflow and degenerate
 requests are bounded no-ops. `set_input_region` takes an immutable
