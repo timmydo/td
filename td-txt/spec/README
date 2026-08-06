@@ -1219,10 +1219,17 @@ td-txt-authored case files
     cell work at all, and consuming SOMETHING is right in kind where consuming
     nothing was an artifact. It is a descriptor another program owns, which is
     the shape of harm `w /dev/stdin` truncating it was. Reading one line
-    instead needs an UNBUFFERED read of fd 0, and there is none in safe Rust:
-    `std::io::Stdin` is a `BufReader`, so a line-at-a-time reader would still
-    take up to 8 KiB off the shared descriptor, and going under it wants a
-    descriptor adoption this crate has no `unsafe` for.
+    instead needs an UNBUFFERED read of fd 0, and this entry USED to say safe
+    Rust has none -- `std::io::Stdin` is a `BufReader`, so a line-at-a-time
+    reader still takes up to 8 KiB off the shared descriptor, and going under
+    it looked like a descriptor adoption this crate has no `unsafe` for. That
+    was wrong, and the entry below is what caught it:
+    `stdin().as_fd().try_clone_to_owned()` is safe std and yields an `OwnedFd`,
+    hence a `File` -- unbuffered, and sharing the file description, so it reads
+    and seeks the very offset fd 0 has. td-sh already relies on it
+    (`stdin_raw` in td-sh/src/process.rs). What stands between here and a
+    one-line read is therefore the streaming reader below, not a missing
+    primitive.
     Pre-existing in both halves, and what is LEFT of the class the special-file
     table closed (its cases are in sed-cli.test.txt): that table stopped `R
     /dev/stdin` reopening a NAME, which was a permanent hang on a fifo whose
@@ -1275,6 +1282,56 @@ td-txt-authored case files
     the separator threaded to the matcher as well as to the compiler, which is a
     landing of its own; a part-scoped `-z` alone is a REGRESSION, since the
     patterns it gets wrong are the ones `M` is most used with.
+
+  - STDIN is left where sed stopped READING in GNU and drained here, which is
+    the `R /dev/stdin` cell above generalised: same root cause, reached through
+    sed's own input reader rather than through a command, and ONE fix closes
+    both. `{ sed -n 1q; cat; } < four` hands `l2 l3 l4` to the `cat` there and
+    nothing here; `2q` leaves `l3 l4`, so it is exactly "after the last RECORD
+    consumed", and `Q` behaves as `q` does. It is what makes reading a header
+    with sed and handing the rest to another program work at all. Only an EARLY
+    EXIT shows it -- a script that runs to EOF ends at the same offset either
+    way -- and it is not a `-u` gap: it holds with and without the flag. An
+    operand NAMING A FILE agrees for a reason that is not about reading at all:
+    sed never touches stdin, so nothing moves. `-` is not one of those, being
+    stdin spelled out, and diverges exactly as the redirect does; `/dev/stdin`
+    as an operand does agree, since the table opens the stream and the reader
+    never gets it.
+
+    A PIPE does NOT agree, and an early draft of this entry said it did on the
+    strength of a three-line one. GNU reads a BUFFER, not a file: over a
+    220,000-byte pipe, `{ sed -n 1q; cat; } ` leaves 215,904 bytes there and 0
+    here, while at 4096 bytes or under both leave nothing because GNU's first
+    buffer already took it all -- 4104 bytes leaves exactly 8, which pins that
+    buffer at 4 KiB. So the divergence is over-READING and not
+    merely a missing seek, and the two halves want different fixes: read
+    incrementally, which serves every descriptor, and then give the unconsumed
+    tail back, which only a seekable one can take. GNU does BOTH, which a
+    10,000-byte first record shows: it over-reads a block and then leaves
+    precisely the bytes after record 1, so "after the last RECORD consumed" is
+    literal rather than an artifact of block size.
+
+    That second half is the trick td-sh uses for `sh < script`, with its
+    caveats (`stdin_raw` in td-sh/src/process.rs is the dup, line.rs the
+    seek-back, and UNSAFE.md's `poll(2)` section the write-up): a safe
+    `dup` of fd 0 -- `stdin().as_fd().try_clone_to_owned()`, which SHARES the
+    file description, so seeking the clone moves fd 0 -- then a seek back by
+    what was read and not consumed, counted in BYTES, which is what td-txt
+    holds anyway. Regular rather than merely seekable, since a descriptor can
+    answer a position query and still refuse the negative seek; that leaves a
+    block device out, which nothing on td's paths puts on sed's stdin.
+
+    Two things keep it a landing of its own. td-txt reads each operand WHOLE,
+    which is a CHOICE and not something `$` requires -- a one-line lookahead
+    answers `$` too, as the crate's own module note says, and reading whole
+    "keeps that honest and matches grep". So the same streaming reader the `R`
+    entry above wants is what narrows this, and the seek is the refinement on
+    top. And no CASE can show any of it, for a reason that is not about pipes:
+    the harness runs ONE child and captures its output, so nothing else ever
+    reads that descriptor and there is no second reader to be short-changed.
+    The test is therefore a Rust one that hands the child a real `File` on fd 0
+    and reads what is left -- which `td-txt/tests/conformance.rs`'s `-f -` seek
+    tests already do.
 
   - `-u` is accepted and IGNORED, which is content-neutral for one stream and
     stopped being so once two of them share a descriptor. GNU's `-u` flushes
