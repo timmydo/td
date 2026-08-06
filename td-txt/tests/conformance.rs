@@ -785,8 +785,8 @@ fn sed_script_stdin_seekability_is_a_stat_not_a_reopen()
 
 /// The `-f` script's NAME reaches the diagnostic RAW, end to end. `locus_at`'s
 /// own test builds the `Origin::File` by hand, so it pins the formatting and not
-/// the plumbing that fills it: a review turned `Origin::File(f.clone())` into
-/// `Origin::File(show(f).into_bytes())` and the whole suite stayed green while
+/// the plumbing that fills it: a review turned `Origin::File(f.clone())` into a
+/// lossy re-encoding of the same name and the whole suite stayed green while
 /// diverging from GNU. The case files cannot say it -- an annotation names its
 /// file as text -- but a test can, `OsStr::from_bytes` naming one fine.
 #[test]
@@ -809,5 +809,326 @@ fn a_f_script_named_in_non_utf8_is_reported_raw() -> Result<(), Box<dyn std::err
         "the -f name or the byte it quotes was not written raw"
     );
     assert_eq!(out.status.code(), Some(1));
+    Ok(())
+}
+
+/// Every diagnostic that NAMES something off argv writes its bytes, as GNU's
+/// `%s` does. A file name is not UTF-8 in general, and rendering one through
+/// `from_utf8_lossy` replaced each stray byte with U+FFFD -- so the message
+/// named a file the operator never passed, and a script grepping its own stderr
+/// for the name it used found nothing. The case files cannot say this, an
+/// annotation naming its file as text, so the shapes are driven from here;
+/// every expectation below is GNU sed 4.9 / grep 3.11's own bytes.
+#[test]
+fn a_diagnostic_names_a_file_in_raw_bytes() -> Result<(), Box<dyn std::error::Error>> {
+    use std::os::unix::ffi::OsStrExt;
+
+    struct Row {
+        applet: &'static str,
+        args: Vec<Vec<u8>>,
+        dirs: Vec<Vec<u8>>,
+        files: Vec<(Vec<u8>, Vec<u8>)>,
+        want: Vec<u8>,
+        status: i32,
+        /// The two option rows carry a usage line after the first, and its
+        /// wording is a divergence of its own (spec/README).
+        first_line_only: bool,
+    }
+
+    let bad = b"no\xffsuch".to_vec();
+    let badd = b"d\xffir".to_vec();
+    let mut wtarget = bad.clone();
+    wtarget.extend_from_slice(b"/x");
+    let mut wcmd = b"w ".to_vec();
+    wcmd.extend_from_slice(&wtarget);
+    let mut scmd = b"s/a/X/w ".to_vec();
+    scmd.extend_from_slice(&wtarget);
+    let mut rcmd = b"r ".to_vec();
+    rcmd.extend_from_slice(&badd);
+    let mut badbak = bad.clone();
+    badbak.extend_from_slice(b".bak");
+    let mut badbakx = badbak.clone();
+    badbakx.extend_from_slice(b"/x");
+    let mut longopt = b"--".to_vec();
+    longopt.extend_from_slice(&bad);
+    let mut ctxopt = b"--context=".to_vec();
+    ctxopt.extend_from_slice(&bad);
+    let mut fileopt = b"--file=".to_vec();
+    fileopt.extend_from_slice(&bad);
+
+    let row = |applet, args: Vec<Vec<u8>>, dirs: Vec<Vec<u8>>, files, want: &[u8], status| Row {
+        applet,
+        args,
+        dirs,
+        files,
+        want: want.to_vec(),
+        status,
+        first_line_only: false,
+    };
+    let mut rows = vec![
+        row(
+            "sed",
+            vec![b"p".to_vec(), bad.clone()],
+            vec![],
+            vec![],
+            b"sed: can't read no\xffsuch: No such file or directory",
+            2,
+        ),
+        row(
+            "sed",
+            vec![b"p".to_vec(), badd.clone()],
+            vec![badd.clone()],
+            vec![],
+            b"sed: read error on d\xffir: Is a directory",
+            4,
+        ),
+        row(
+            "sed",
+            vec![b"-i".to_vec(), b"p".to_vec(), bad.clone()],
+            vec![],
+            vec![],
+            b"sed: can't read no\xffsuch: No such file or directory",
+            2,
+        ),
+        row(
+            "sed",
+            vec![wcmd, b"IN".to_vec()],
+            vec![],
+            vec![(b"IN".to_vec(), b"a\n".to_vec())],
+            b"sed: couldn't open file no\xffsuch/x: No such file or directory",
+            4,
+        ),
+        row(
+            "sed",
+            vec![scmd, b"IN".to_vec()],
+            vec![],
+            vec![(b"IN".to_vec(), b"a\n".to_vec())],
+            b"sed: couldn't open file no\xffsuch/x: No such file or directory",
+            4,
+        ),
+        row(
+            "grep",
+            vec![b"x".to_vec(), bad.clone()],
+            vec![],
+            vec![],
+            b"grep: no\xffsuch: No such file or directory",
+            2,
+        ),
+        row(
+            "grep",
+            vec![b"x".to_vec(), badd.clone()],
+            vec![badd.clone()],
+            vec![],
+            b"grep: d\xffir: Is a directory",
+            2,
+        ),
+        row(
+            "grep",
+            vec![b"x".to_vec(), bad.clone()],
+            vec![],
+            vec![(bad.clone(), b"x\x00\n".to_vec())],
+            b"grep: no\xffsuch: binary file matches",
+            0,
+        ),
+        row(
+            "grep",
+            vec![b"-f".to_vec(), bad.clone(), b"IN".to_vec()],
+            vec![],
+            vec![(b"IN".to_vec(), b"a\n".to_vec())],
+            b"grep: no\xffsuch: No such file or directory",
+            2,
+        ),
+        row(
+            "grep",
+            vec![fileopt, b"IN".to_vec()],
+            vec![],
+            vec![(b"IN".to_vec(), b"a\n".to_vec())],
+            b"grep: no\xffsuch: No such file or directory",
+            2,
+        ),
+        row(
+            "grep",
+            vec![ctxopt, b"x".to_vec(), b"IN".to_vec()],
+            vec![],
+            vec![(b"IN".to_vec(), b"a\n".to_vec())],
+            b"grep: no\xffsuch: invalid context length argument",
+            2,
+        ),
+        // Four more sites, one row each: the same wording can be raised from
+        // more than one place, and a row only defends the site it reaches.
+        // `-s` reads its operands through a different arm than a lone one.
+        row(
+            "sed",
+            vec![b"-s".to_vec(), b"p".to_vec(), badd.clone()],
+            vec![badd.clone()],
+            vec![],
+            b"sed: read error on d\xffir: Is a directory",
+            4,
+        ),
+        // `r` names its file through `read_source`, a third such site.
+        row(
+            "sed",
+            vec![rcmd, b"IN".to_vec()],
+            vec![badd.clone()],
+            vec![(b"IN".to_vec(), b"a\n".to_vec())],
+            b"sed: read error on d\xffir: Is a directory",
+            4,
+        ),
+        // `-i` refuses before the read, so this is `couldn't edit` and not the
+        // `can't read` two rows above.
+        row(
+            "sed",
+            vec![b"-i".to_vec(), b"p".to_vec(), badd.clone()],
+            vec![badd.clone()],
+            vec![],
+            b"sed: couldn't edit d\xffir: not a regular file",
+            4,
+        ),
+        // The `-C`/`-A`/`-B` count, which is a different site from `--context=`.
+        row(
+            "grep",
+            vec![b"-C".to_vec(), bad.clone(), b"x".to_vec(), b"IN".to_vec()],
+            vec![],
+            vec![(b"IN".to_vec(), b"a\n".to_vec())],
+            b"grep: no\xffsuch: invalid context length argument",
+            2,
+        ),
+        // The BACKUP rename, reached by making the backup NAME a non-empty
+        // directory. The opening line of this landing advertises this message,
+        // so it should not be the one nothing reaches.
+        row(
+            "sed",
+            vec![b"-i.bak".to_vec(), b"s/a/b/".to_vec(), bad.clone()],
+            vec![badbak.clone()],
+            vec![(bad.clone(), b"a\n".to_vec()), (badbakx, b"z\n".to_vec())],
+            b"sed: cannot rename no\xffsuch: Is a directory",
+            4,
+        ),
+    ];
+    // The unrecognized-option pair, whose second line is the recorded usage gap.
+    for (applet, status) in [("sed", 1), ("grep", 2)] {
+        let mut args = vec![longopt.clone()];
+        if applet == "sed" {
+            args.push(b"p".to_vec());
+        } else {
+            args.push(b"x".to_vec());
+        }
+        args.push(b"IN".to_vec());
+        let mut want = applet.as_bytes().to_vec();
+        want.extend_from_slice(b": unrecognized option '--no\xffsuch'");
+        rows.push(Row {
+            applet,
+            args,
+            dirs: vec![],
+            files: vec![(b"IN".to_vec(), b"a\n".to_vec())],
+            want,
+            status,
+            first_line_only: true,
+        });
+    }
+
+    for (i, r) in rows.iter().enumerate() {
+        let dir = TempDir::new(&format!("rawname-{i}"))?;
+        for d in &r.dirs {
+            std::fs::create_dir_all(dir.0.join(std::ffi::OsStr::from_bytes(d)))?;
+        }
+        for (name, data) in &r.files {
+            std::fs::write(dir.0.join(std::ffi::OsStr::from_bytes(name)), data)?;
+        }
+        let mut cmd = std::process::Command::new(bin());
+        cmd.arg(r.applet);
+        for a in &r.args {
+            cmd.arg(std::ffi::OsStr::from_bytes(a));
+        }
+        let out = cmd.current_dir(&dir.0).output()?;
+        let (got, want) = if r.first_line_only {
+            let first = out.stderr.split(|b| *b == b'\n').next().unwrap_or_default().to_vec();
+            (first, r.want.clone())
+        } else {
+            let mut want = r.want.clone();
+            want.push(b'\n');
+            (out.stderr.clone(), want)
+        };
+        assert_eq!(
+            got,
+            want,
+            "row {i} ({} {:?}) did not name the file the way GNU does",
+            r.applet,
+            r.args.iter().map(|a| String::from_utf8_lossy(a).into_owned()).collect::<Vec<_>>()
+        );
+        assert_eq!(out.status.code(), Some(r.status), "row {i} status");
+    }
+    Ok(())
+}
+
+/// Two more sites the same landing touched, held to td-txt's OWN bytes rather
+/// than to GNU's: both messages diverge from GNU in WORDING (spec/README), so
+/// GNU is not the oracle here and only the name and the shape are under test.
+/// Without these the label splice and the hand-rolled possibilities join --
+/// which replaced a `join(" ")` that could not carry bytes -- are defended by
+/// nothing.
+#[test]
+fn a_diverging_diagnostic_still_names_in_raw_bytes() -> Result<(), Box<dyn std::error::Error>> {
+    use std::os::unix::ffi::OsStrExt;
+
+    let dir = TempDir::new("rawname-diverge")?;
+    std::fs::write(dir.0.join("IN"), b"a\n")?;
+
+    // A branch to a label nothing defines. GNU words this `can't find label for
+    // jump to', but writes the NAME the same way -- raw.
+    let out = std::process::Command::new(bin())
+        .arg("sed")
+        .arg(std::ffi::OsStr::from_bytes(b"b no\xffsuch"))
+        .arg("IN")
+        .current_dir(&dir.0)
+        .output()?;
+    assert_eq!(
+        out.stderr,
+        b"sed: can't operate on label `no\xffsuch'\n".to_vec(),
+        "the unresolved label was not named raw"
+    );
+    assert_eq!(out.status.code(), Some(4));
+
+    // The ambiguity list: GNU emits its own declaration order and a different
+    // set, so what is pinned here is that every possibility is present, spelled
+    // `'--name'`, and separated by ONE space -- the join this landing rewrote.
+    let amb = std::process::Command::new(bin())
+        .args(["sed", "--s", "p", "IN"])
+        .current_dir(&dir.0)
+        .output()?;
+    // The usage line follows it, and its wording is a divergence of its own.
+    let first = amb.stderr.split(|b| *b == b'\n').next().unwrap_or_default().to_vec();
+    assert_eq!(
+        first,
+        b"sed: option '--s' is ambiguous; possibilities: '--sandbox' '--separate' '--silent'"
+            .to_vec(),
+        "the possibilities join lost a separator or a quote"
+    );
+    assert_eq!(amb.status.code(), Some(1));
+
+    // The scratch file `-i` creates, reached with a directory this process may
+    // not write. GNU and td-txt spell the temp NAME differently (`sedXMHTSD`
+    // against `sed<pid>.tmp`) and that is not a contract, so what is pinned is
+    // the raw directory component in front of it.
+    use std::os::unix::fs::PermissionsExt;
+    let ro = TempDir::new("rawname-tmpfail")?;
+    let sub = ro.0.join(std::ffi::OsStr::from_bytes(b"d\xffir"));
+    std::fs::create_dir_all(&sub)?;
+    std::fs::write(sub.join("IN"), b"a\n")?;
+    std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o500))?;
+    let tmp = std::process::Command::new(bin())
+        .arg("sed")
+        .args(["-i", "s/a/b/"])
+        .arg(std::ffi::OsStr::from_bytes(b"d\xffir/IN"))
+        .current_dir(&ro.0)
+        .output()?;
+    // Put it back before `TempDir` tries to remove the tree.
+    std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o755))?;
+    assert!(
+        tmp.stderr.starts_with(b"sed: couldn't open temporary file d\xffir/sed"),
+        "the scratch file's directory was not named raw: {:?}",
+        String::from_utf8_lossy(&tmp.stderr)
+    );
+    assert_eq!(tmp.status.code(), Some(4));
     Ok(())
 }

@@ -1193,18 +1193,26 @@ td-txt-authored case files
     `read error on stdin` where td-txt names the file it really opened,
     `/dev/stdin`. Both exit 4. An OPERAND spelled `-` does say `stdin` now.
 
-  - A diagnostic that NAMES A FILE still renders the name through `show`, which
-    is `from_utf8_lossy`, so a non-UTF-8 one arrives as replacement characters:
-    `sed p $'no\377such'` is `can't read no\377such` in GNU and
-    `can't read no\357\277\275such` here; `grep x $'no\377such'` diverges the
-    same way in its own wording (`no\377such: No such file or directory`), as do
-    `couldn't write`, `cannot rename` and the rest -- some forty `show` sites
-    across the two applets.
-    GNU writes each through `%s`, raw. What is CLOSED is the byte a diagnostic
-    QUOTES and the `-f` SCRIPT's own name, which is why this is worded around
-    the residue rather than deleted: the plumbing those needed -- a `Fatal` that
-    carries bytes, a `%s` that stops at a NUL -- is in place, so closing the rest
-    is a sweep of call sites and not a second mechanism. Predates the branch.
+  - `grep` does not implement `-d ACTION` / `--directories=ACTION` at all, where
+    GNU takes `read`, `skip` and `recurse`. `grep -d skip x DIR` is exit 1 and
+    silent there and `invalid option -- 'd'` at exit 2 here, and
+    `--directories=recurse` is the spelling `-r` has. Refused rather than
+    silently ignored, which is this applet's rule for an option it does not
+    serve, so it is a missing FEATURE and not a wrong answer. Found by the
+    raw-name sweep, which passed a directory operand to every shape it had.
+
+  - An AMBIGUOUS long-option abbreviation lists its possibilities in a different
+    order, and for grep a different SET. `sed --s` is `'--silent' '--sandbox'
+    '--separate'` in GNU -- its `long_options[]` declaration order -- and
+    `'--sandbox' '--separate' '--silent'` here, which is td-txt's table order.
+    `grep --c` is `'--context' '--color' '--colour' '--count'` there against
+    `'--context' '--count'` here, because `--color`/`--colour` are among the
+    options td-txt does not implement, so they are not candidates to be
+    ambiguous WITH. Same wording, same status, and the count of possibilities is
+    what differs. Predates the branch; recorded when the raw-name landing
+    rewrote both joins (a `join(" ")` over `String`s cannot carry a name, so the
+    list is now built as bytes) and a review asked what the rewrite was holding
+    itself to.
 
   - `-V` is an option GNU sed still TAKES, with an argument, and td-txt refuses.
     GNU's getopt string carries it (the obsolete `--version` spelling) but its

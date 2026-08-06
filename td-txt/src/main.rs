@@ -52,9 +52,12 @@ const APPLETS: &[(&str, Applet)] = &[("grep", grep::main), ("sed", sed::main)];
 /// A plain loop rather than an iterator search: this file is embedded verbatim
 /// into the recipe, and the ladder guard scans step content for host-tool names
 /// that the search combinator happens to share.
-fn lookup(name: &str) -> Option<Applet> {
+/// BYTES rather than `&str`: argv[0] and the applet argument need not be UTF-8,
+/// and converting one to ask this question is what left the refusal below naming
+/// an applet the caller never passed.
+fn lookup(name: &[u8]) -> Option<Applet> {
     for (n, run) in APPLETS {
-        if *n == name {
+        if n.as_bytes() == name {
             return Some(*run);
         }
     }
@@ -85,11 +88,11 @@ fn main() -> ExitCode {
     // `std::env::args` PANICS on one that is not.
     let argv = util::args_bytes();
     let prog = argv.first().map(Vec::as_slice).unwrap_or(b"td-txt");
-    let self_name = String::from_utf8_lossy(basename(prog)).into_owned();
+    let self_name = basename(prog);
 
     // Invoked under an applet name (the /bin symlink): the applet gets the whole
     // argv, so its own argv[0] is that name.
-    if let Some(run) = lookup(&self_name) {
+    if let Some(run) = lookup(self_name) {
         return ExitCode::from(clamp(spawn(run, argv)));
     }
     // Invoked as td-txt: the applet is argv[1], and it gets argv[1..] — again
@@ -100,19 +103,18 @@ fn main() -> ExitCode {
         // failure is exit 2, the multicall's own usage status.
         Some(b"--list") => tell(&names().join("\n")),
         Some(b"--help" | b"-h") => tell(&usage()),
-        Some(name) => {
-            let applet = String::from_utf8_lossy(name).into_owned();
-            match lookup(&applet) {
-                Some(run) => {
-                    ExitCode::from(clamp(spawn(run, argv.get(1..).unwrap_or_default().to_vec())))
-                }
-                None => {
-                    eprintln!("td-txt: unknown applet `{applet}'");
-                    eprintln!("{}", usage());
-                    ExitCode::from(2)
-                }
+        Some(name) => match lookup(name) {
+            Some(run) => {
+                ExitCode::from(clamp(spawn(run, argv.get(1..).unwrap_or_default().to_vec())))
             }
-        }
+            None => {
+                use std::io::Write;
+                let msg = util::name_in("td-txt: unknown applet `", name, "'\n");
+                let _ = std::io::stderr().write_all(&msg);
+                eprintln!("{}", usage());
+                ExitCode::from(2)
+            }
+        },
         None => {
             eprintln!("{}", usage());
             ExitCode::from(2)
@@ -164,6 +166,40 @@ fn clamp(code: i32) -> u8 {
 mod tests {
     use super::*;
 
+    /// No shipped module may RE-ENCODE bytes, because every name in a diagnostic
+    /// comes from argv and need not be UTF-8. Deleting the `show` helper did not
+    /// put this out of reach -- `String::from_utf8_lossy` is one call away, and
+    /// two survived the sweep that removed it, one of them in `sed.rs`. The
+    /// compiler cannot say this, so the source does, as td-sh and td-util assert
+    /// their own confinement.
+    #[test]
+    fn no_shipped_module_re_encodes_a_name() {
+        // The binary's whole module tree. `lib.rs` is the corpus harness rather
+        // than an applet, and the annotations it parses ARE text.
+        // Assembled rather than spelled, so this file does not contain the
+        // marker it counts -- which it would, three times, and scan itself
+        // into a failure.
+        let marker = concat!("#[cfg", "(test)]");
+        for name in ["main.rs", "grep.rs", "regex.rs", "sed.rs", "util.rs"] {
+            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src").join(name);
+            let text = std::fs::read_to_string(&path).unwrap();
+            // Truncating at the marker strips the WHOLE test half only while
+            // there is exactly one, which is what makes this scan complete.
+            let modules = text.matches(marker).count();
+            assert_eq!(
+                modules, 1,
+                "{name} has {modules} test modules; truncating at the first would \
+                 leave the rest of the file unscanned"
+            );
+            let shipped = text.split(marker).next().unwrap_or("");
+            assert!(
+                !shipped.contains("from_utf8_lossy"),
+                "{name} re-encodes bytes outside its tests: a diagnostic built \
+                 that way names something the caller never passed"
+            );
+        }
+    }
+
     #[test]
     fn basename_dispatches_on_the_last_path_component() {
         assert_eq!(basename(b"/bin/grep"), b"grep");
@@ -174,9 +210,9 @@ mod tests {
     #[test]
     fn every_applet_name_resolves() {
         for name in names() {
-            assert!(lookup(name).is_some(), "{name} is listed but does not dispatch");
+            assert!(lookup(name.as_bytes()).is_some(), "{name} is listed but does not dispatch");
         }
-        assert!(lookup("awk").is_none());
+        assert!(lookup(b"awk").is_none());
     }
 
     /// The two names `system-x86-64`'s `TD_TXT_APPLETS` packs as `/bin` symlinks.

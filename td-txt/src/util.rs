@@ -29,20 +29,22 @@ pub fn path_from_bytes(bytes: &[u8]) -> PathBuf {
     PathBuf::from(os_from_bytes(bytes))
 }
 
-/// Lossy rendering for a diagnostic. Errors go to a terminal, not to a parser.
-pub fn show(bytes: &[u8]) -> String {
-    String::from_utf8_lossy(bytes).into_owned()
-}
-
-/// A diagnostic with one RAW byte spliced into it, which is what GNU's `sprintf`
-/// writes for `%c`. `format!` cannot: `char::from` widens the byte to a Unicode
-/// scalar and encodes it as UTF-8, so every byte from 0x80 up arrives as two.
-pub fn byte_in(before: &str, byte: u8, after: &str) -> Vec<u8> {
-    let mut out = Vec::with_capacity(before.len() + 1 + after.len());
+/// A diagnostic with RAW bytes spliced into it, which is what GNU's `%s` writes.
+/// A `String` cannot hold one: it is UTF-8 by construction, and a name need not
+/// be, so re-encoding one names a file the operator never passed.
+pub fn name_in(before: &str, name: &[u8], after: &str) -> Vec<u8> {
+    let mut out = Vec::with_capacity(before.len() + name.len() + after.len());
     out.extend_from_slice(before.as_bytes());
-    out.push(byte);
+    out.extend_from_slice(name);
     out.extend_from_slice(after.as_bytes());
     out
+}
+
+/// The same splice for one byte, which is GNU's `%c`. `format!` cannot do it:
+/// `char::from` widens the byte to a Unicode scalar and encodes it as UTF-8, so
+/// every byte from 0x80 up arrives as two.
+pub fn byte_in(before: &str, byte: u8, after: &str) -> Vec<u8> {
+    name_in(before, &[byte], after)
 }
 
 /// The prefix a C `%s` prints: the bytes before the first NUL. GNU builds each
@@ -120,10 +122,10 @@ impl Input {
     /// `sed p < a-directory` is `read error on stdin`. Answered from the OPEN input
     /// rather than by re-deciding what `-` meant, which is a second place to get it
     /// wrong.
-    pub fn error_name(&self, path: &[u8]) -> String {
+    pub fn error_name(&self, path: &[u8]) -> Vec<u8> {
         match self {
-            Self::Stdin => "stdin".to_string(),
-            Self::File(_) => show(path),
+            Self::Stdin => b"stdin".to_vec(),
+            Self::File(_) => path.to_vec(),
         }
     }
 
@@ -431,7 +433,7 @@ mod tests {
     #[test]
     fn a_read_error_names_the_standard_input_stream_stdin() {
         let stdin = Input::open(b"-", true).unwrap();
-        assert_eq!(stdin.error_name(b"-"), "stdin");
+        assert_eq!(stdin.error_name(b"-"), b"stdin".to_vec());
         // The refusal `-i` would give it, though `-i` opens `-` as a name and so
         // never routes the stream here.
         assert_eq!(stdin.in_place_refusal(), Some("not a regular file"));
@@ -448,7 +450,7 @@ mod tests {
         let name = dir.as_os_str().as_bytes();
         let mut opened = Input::open(name, true).expect("a directory opens");
         assert_eq!(opened.in_place_refusal(), Some("not a regular file"));
-        assert_eq!(opened.error_name(name), show(name));
+        assert_eq!(opened.error_name(name), name.to_vec());
         let err = opened.read_all().expect_err("and does not read").0;
         assert_eq!(errmsg(&err), "Is a directory");
 
@@ -509,6 +511,20 @@ mod tests {
     fn byte_in_splices_one_raw_byte() {
         assert_eq!(byte_in("a`", 0x80, "'"), b"a`\x80'".to_vec());
         assert_eq!(byte_in("", 0, ""), vec![0u8]);
+    }
+
+    /// `name_in` on its own: `byte_in` only ever hands it a ONE-byte name, and
+    /// the call sites also pass an empty prefix (`NAME: why`) and an empty
+    /// suffix (`... for NAME`).
+    #[test]
+    fn name_in_splices_a_raw_name_between_two_pieces() {
+        assert_eq!(name_in("a: ", b"n\xffm", " :b"), b"a: n\xffm :b".to_vec());
+        assert_eq!(name_in("", b"\xff\xfe", ": why"), b"\xff\xfe: why".to_vec());
+        assert_eq!(name_in("for ", b"\x80", ""), b"for \x80".to_vec());
+        // A lone continuation byte is the case a re-encoding would destroy, and
+        // it survives here as itself rather than as the three of U+FFFD.
+        assert_eq!(name_in("", b"\xc3", ""), vec![0xc3]);
+        assert_eq!(name_in("x", b"", "y"), b"xy".to_vec());
     }
 
     #[test]

@@ -25,7 +25,7 @@ use std::path::{Path, PathBuf};
 
 use crate::regex::{Captures, Options, Regex};
 use crate::util::{
-    errmsg, number, posixly_correct, print_line, records, show, Input, Out, VERSION,
+    errmsg, number, posixly_correct, print_line, records, Input, Out, VERSION,
 };
 
 const USAGE: &str =
@@ -832,13 +832,8 @@ impl ScriptParser<'_> {
             b"/dev/stdout" => WDest::Stdout,
             b"/dev/stderr" => WDest::Stderr,
             _ => WDest::File(
-                std::fs::File::create(crate::util::path_from_bytes(path)).map_err(|e| {
-                    Fatal::runtime(format!(
-                        "couldn't open file {}: {}",
-                        show(path),
-                        errmsg(&e)
-                    ))
-                })?,
+                std::fs::File::create(crate::util::path_from_bytes(path))
+                    .map_err(|e| Fatal::runtime_msg(cant_open(path, &e)))?,
             ),
         };
         self.wfiles.insert(path.to_vec(), WFile { dest, owed: false });
@@ -1608,7 +1603,7 @@ fn parse_commands(p: &mut ScriptParser) -> Result<Script, Fatal> {
 
 /// Turn every branch's label name into a command index. Done after the whole
 /// script is parsed because a branch may jump forward.
-fn resolve_labels(cmds: &mut [Cmd], labels: &BTreeMap<Vec<u8>, usize>) -> Result<(), String> {
+fn resolve_labels(cmds: &mut [Cmd], labels: &BTreeMap<Vec<u8>, usize>) -> Result<(), Vec<u8>> {
     for cmd in cmds.iter_mut() {
         let name = match &cmd.kind {
             Kind::Branch(Target::Name(n))
@@ -1621,7 +1616,7 @@ fn resolve_labels(cmds: &mut [Cmd], labels: &BTreeMap<Vec<u8>, usize>) -> Result
         } else {
             match labels.get(&name) {
                 Some(t) => Some(*t),
-                None => return Err(format!("can't operate on label `{}'", show(&name))),
+                None => return Err(crate::util::name_in("can't operate on label `", &name, "'")),
             }
         };
         cmd.kind = match &cmd.kind {
@@ -1730,7 +1725,11 @@ impl Stream {
                     Err((e, _)) => match opener {
                         Opener::Reader => {
                             let name = input.error_name(&self.name);
-                            eprintln!("sed: read error on {name}: {}", errmsg(&e));
+                            diag(&crate::util::name_in(
+                                "read error on ",
+                                &name,
+                                &format!(": {}", errmsg(&e)),
+                            ));
                             self.fatal = true;
                             return false;
                         }
@@ -1738,7 +1737,11 @@ impl Stream {
                     },
                 },
                 Err(e) => {
-                    eprintln!("sed: can't read {}: {}", show(&self.name), errmsg(&e));
+                    diag(&crate::util::name_in(
+                        "can't read ",
+                        &self.name,
+                        &format!(": {}", errmsg(&e)),
+                    ));
                     self.bad = true;
                 }
             }
@@ -1838,9 +1841,9 @@ impl<'a> Sink<'a> {
         }
     }
 
-    fn put(&mut self, bytes: &[u8]) -> Result<(), String> {
+    fn put(&mut self, bytes: &[u8]) -> Result<(), Vec<u8>> {
         match &mut self.dest {
-            Dest::Stdout(out) => out.write(bytes).map_err(|e| format!("write error: {}", errmsg(&e))),
+            Dest::Stdout(out) => out.write(bytes).map_err(|e| format!("write error: {}", errmsg(&e)).into_bytes()),
             Dest::Buffer(buf) => {
                 buf.extend_from_slice(bytes);
                 Ok(())
@@ -1849,7 +1852,7 @@ impl<'a> Sink<'a> {
     }
 
     /// Pay a separator the channel's previous line left owed, if any.
-    fn pay(&mut self, chan: Chan) -> Result<(), String> {
+    fn pay(&mut self, chan: Chan) -> Result<(), Vec<u8>> {
         if *self.debt(chan) {
             *self.debt(chan) = false;
             let sep = self.separator;
@@ -1859,7 +1862,7 @@ impl<'a> Sink<'a> {
     }
 
     /// Write, paying any separator the previous line left owed.
-    fn write(&mut self, bytes: &[u8]) -> Result<(), String> {
+    fn write(&mut self, bytes: &[u8]) -> Result<(), Vec<u8>> {
         self.pay(Chan::Main)?;
         self.put(bytes)
     }
@@ -1867,14 +1870,14 @@ impl<'a> Sink<'a> {
     /// Queued `a`/`r` text. GNU terminates it with a NEWLINE even under `-z`
     /// (the append queue dumps the text as parsed), where `i`/`c` follow the
     /// record separator.
-    fn write_text(&mut self, bytes: &[u8]) -> Result<(), String> {
+    fn write_text(&mut self, bytes: &[u8]) -> Result<(), Vec<u8>> {
         self.write(bytes)?;
         self.put(b"\n")
     }
 
     /// Write one line; an unterminated one owes its separator to the next write on
     /// the same channel.
-    fn write_line_on(&mut self, chan: Chan, bytes: &[u8], terminated: bool) -> Result<(), String> {
+    fn write_line_on(&mut self, chan: Chan, bytes: &[u8], terminated: bool) -> Result<(), Vec<u8>> {
         self.pay(chan)?;
         self.put(bytes)?;
         if terminated {
@@ -1885,7 +1888,7 @@ impl<'a> Sink<'a> {
         Ok(())
     }
 
-    fn write_line(&mut self, bytes: &[u8], terminated: bool) -> Result<(), String> {
+    fn write_line(&mut self, bytes: &[u8], terminated: bool) -> Result<(), Vec<u8>> {
         self.write_line_on(Chan::Main, bytes, terminated)
     }
 
@@ -1893,13 +1896,13 @@ impl<'a> Sink<'a> {
     /// leaves it owed forever, which is how a file with no final newline keeps that
     /// shape; `q` settles the debt instead — the MAIN channel's only, since GNU's
     /// `q` leaves an unterminated `w /dev/stdout` write bare.
-    fn settle(&mut self) -> Result<(), String> {
+    fn settle(&mut self) -> Result<(), Vec<u8>> {
         self.pay(Chan::Main)
     }
 
-    fn flush(&mut self) -> Result<(), String> {
+    fn flush(&mut self) -> Result<(), Vec<u8>> {
         match &mut self.dest {
-            Dest::Stdout(out) => out.flush().map_err(|e| format!("write error: {}", errmsg(&e))),
+            Dest::Stdout(out) => out.flush().map_err(|e| format!("write error: {}", errmsg(&e)).into_bytes()),
             Dest::Buffer(_) => Ok(()),
         }
     }
@@ -1931,17 +1934,17 @@ enum WDest {
 }
 
 impl WFile {
-    fn put(&mut self, bytes: &[u8]) -> Result<(), String> {
+    fn put(&mut self, bytes: &[u8]) -> Result<(), Vec<u8>> {
         use std::io::Write as _;
         let wrote = match &mut self.dest {
             WDest::File(f) => f.write_all(bytes),
             WDest::Stderr => std::io::stderr().write_all(bytes),
             WDest::Stdout => std::io::stdout().write_all(bytes),
         };
-        wrote.map_err(|e| format!("write error: {}", errmsg(&e)))
+        wrote.map_err(|e| format!("write error: {}", errmsg(&e)).into_bytes())
     }
 
-    fn write_line(&mut self, bytes: &[u8], terminated: bool, separator: u8) -> Result<(), String> {
+    fn write_line(&mut self, bytes: &[u8], terminated: bool, separator: u8) -> Result<(), Vec<u8>> {
         if self.owed {
             self.owed = false;
             self.put(&[separator])?;
@@ -2036,7 +2039,7 @@ fn kind_matches(
     pattern: &[u8],
     line_number: u64,
     stream: &mut Stream,
-) -> Result<(bool, Option<usize>), String> {
+) -> Result<(bool, Option<usize>), Vec<u8>> {
     match kind {
         AddrKind::Line(n) => Ok((line_number == *n, None)),
         AddrKind::Zero => Ok((false, None)),
@@ -2071,7 +2074,7 @@ impl Sed {
     /// missed — and only such a range is subject to the line-number end test on
     /// its own first line. A range started by a regex always selects at least
     /// that line.
-    fn addr_matches(&mut self, idx: usize, stream: &mut Stream) -> Result<bool, String> {
+    fn addr_matches(&mut self, idx: usize, stream: &mut Stream) -> Result<bool, Vec<u8>> {
         // The script is only read through raw pieces here so each borrow ends
         // before the range state (or `last_regex`) is written.
         let Some(cmd) = self.script.cmds.get(idx) else {
@@ -2135,7 +2138,7 @@ impl Sed {
         start: u64,
         a1_line: Option<u64>,
         stream: &mut Stream,
-    ) -> Result<(bool, bool), String> {
+    ) -> Result<(bool, bool), Vec<u8>> {
         let line = self.line_number;
         match self.script.cmds.get(idx).map(|c| &c.addr.a2) {
             Some(Some(Addr2::Kind(AddrKind::Line(n)))) => {
@@ -2180,7 +2183,7 @@ impl Sed {
         idx: usize,
         start: u64,
         stream: &mut Stream,
-    ) -> Result<(bool, bool), String> {
+    ) -> Result<(bool, bool), Vec<u8>> {
         let line = self.line_number;
         let kind = match self.script.cmds.get(idx).map(|c| &c.addr.a2) {
             // `start + N` WRAPS, as GNU's counter does: `1,+(2^64-1)` ends at
@@ -2213,7 +2216,7 @@ impl Sed {
         Ok((hit, true))
     }
 
-    fn match_a1(&mut self, idx: usize, stream: &mut Stream) -> Result<bool, String> {
+    fn match_a1(&mut self, idx: usize, stream: &mut Stream) -> Result<bool, Vec<u8>> {
         let kind = match self.script.cmds.get(idx).map(|c| &c.addr.a1) {
             Some(Some(k)) => k,
             _ => return Ok(false),
@@ -2516,6 +2519,10 @@ impl From<Vec<u8>> for Fatal {
 /// it and at the boundary that classifies it, so the two cannot drift apart.
 const NO_PREVIOUS_REGEX: &str = "no previous regular expression";
 
+/// What one `s///` reports: whether it substituted, whether the `p` flag asks
+/// for a print, and the file a `w` flag owes the pattern space to.
+type SubstOutcome = (bool, bool, Option<Vec<u8>>);
+
 impl Fatal {
     /// A failure the FILESYSTEM raised rather than the script — a `w` file that will
     /// not open, a write that fails. Exit 4, and no `-e expression #N' prefix: the
@@ -2525,8 +2532,14 @@ impl Fatal {
     /// errors `parse_script` raises, so every such `String` has to come through
     /// here or it lands in the wrong bucket wearing the wrong prefix.
     fn runtime(msg: String) -> Self {
-        let status = if msg == NO_PREVIOUS_REGEX { 1 } else { 4 };
-        Self { msg: msg.into_bytes(), status, locus: None }
+        Self::runtime_msg(msg.into_bytes())
+    }
+
+    /// `runtime` for a message that already carries raw bytes -- a file name GNU
+    /// writes through `%s`, which cannot survive a `String`.
+    fn runtime_msg(msg: Vec<u8>) -> Self {
+        let status = if msg == NO_PREVIOUS_REGEX.as_bytes() { 1 } else { 4 };
+        Self { msg, status, locus: None }
     }
 }
 
@@ -2544,13 +2557,8 @@ struct Conf {
 }
 
 /// `couldn't open file NAME: WHY` with the NAME raw, as GNU's `%s` writes it.
-/// Only a `-f` script reaches this; every other name a diagnostic carries is
-/// still `show`n -- see spec/README.
 fn cant_open(name: &[u8], e: &std::io::Error) -> Vec<u8> {
-    let mut msg = b"couldn't open file ".to_vec();
-    msg.extend_from_slice(name);
-    msg.extend_from_slice(format!(": {}", errmsg(e)).as_bytes());
-    msg
+    crate::util::name_in("couldn't open file ", name, &format!(": {}", errmsg(e)))
 }
 
 /// One diagnostic line, written as BYTES. `eprintln!` of a `String` cannot carry
@@ -2601,7 +2609,7 @@ fn compile_script(
     let mut script = parse_script(src, ere, null_data, parts, posix, sandbox)?;
     let labels = std::mem::take(&mut script.labels);
     resolve_labels(&mut script.cmds, &labels)
-        .map_err(|msg| Fatal { msg: msg.into_bytes(), status: 4, locus: None })?;
+        .map_err(|msg| Fatal { msg, status: 4, locus: None })?;
     Ok(script)
 }
 
@@ -2630,7 +2638,7 @@ const LONG_OPTIONS: &[&[u8]] = &[
 
 /// `Ok(full name)`, or `Err(msg)` where an EMPTY msg means "no such option" and
 /// a non-empty one is GNU's ambiguity diagnostic.
-fn resolve_long(name: &[u8]) -> Result<&'static [u8], String> {
+fn resolve_long(name: &[u8]) -> Result<&'static [u8], Vec<u8>> {
     let mut hits: Vec<&'static [u8]> = Vec::new();
     for cand in LONG_OPTIONS {
         if *cand == name {
@@ -2642,14 +2650,16 @@ fn resolve_long(name: &[u8]) -> Result<&'static [u8], String> {
     }
     match hits.as_slice() {
         [one] => Ok(one),
-        [] => Err(String::new()),
+        [] => Err(Vec::new()),
         many => {
-            let list: Vec<String> = many.iter().map(|n| format!("'--{}'", show(n))).collect();
-            Err(format!(
-                "option '--{}' is ambiguous; possibilities: {}",
-                show(name),
-                list.join(" ")
-            ))
+            let mut msg =
+                crate::util::name_in("option '--", name, "' is ambiguous; possibilities:");
+            for n in many {
+                msg.extend_from_slice(b" '--");
+                msg.extend_from_slice(n);
+                msg.push(b'\'');
+            }
+            Err(msg)
         }
     }
 }
@@ -2721,9 +2731,13 @@ fn run(args: &[Vec<u8>]) -> Result<i32, Fatal> {
                 Ok(full) => full,
                 Err(msg) => {
                     if msg.is_empty() {
-                        eprintln!("sed: unrecognized option '--{}'", show(name));
+                        // The whole argv element, as glibc's `getopt_long` prints
+                        // it: `name` stops at the `=`, so `--zz=1` would name
+                        // `--zz`, an option the caller never passed. grep splices
+                        // `arg` here for the same reason.
+                        diag(&crate::util::name_in("unrecognized option '", arg, "'"));
                     } else {
-                        eprintln!("sed: {msg}");
+                        diag(&msg);
                     }
                     eprintln!("{USAGE}");
                     return Ok(1);
@@ -2739,7 +2753,11 @@ fn run(args: &[Vec<u8>]) -> Result<i32, Fatal> {
                 // a caller could act on.
                 b"help" | b"version" => {
                     if inline.is_some() {
-                        eprintln!("sed: option '--{}' doesn't allow an argument", show(name));
+                        diag(&crate::util::name_in(
+                            "option '--",
+                            name,
+                            "' doesn't allow an argument",
+                        ));
                         eprintln!("{USAGE}");
                         return Ok(1);
                     }
@@ -2767,7 +2785,7 @@ fn run(args: &[Vec<u8>]) -> Result<i32, Fatal> {
                 // annotated program, and --follow-symlinks changes which file -i
                 // rewrites. Refusing is the honest answer until they are built.
                 b"debug" | b"follow-symlinks" => {
-                    eprintln!("sed: unsupported option -- '{}'", String::from_utf8_lossy(name));
+                    diag(&crate::util::name_in("unsupported option -- '", name, "'"));
                     eprintln!("{USAGE}");
                     return Ok(1);
                 }
@@ -2788,10 +2806,11 @@ fn run(args: &[Vec<u8>]) -> Result<i32, Fatal> {
                                 // expression #1, which is what the `Fatal` path would
                                 // have named.
                                 None => {
-                                    eprintln!(
-                                        "sed: option '--{}' requires an argument",
-                                        show(name)
-                                    );
+                                    diag(&crate::util::name_in(
+                                        "option '--",
+                                        name,
+                                        "' requires an argument",
+                                    ));
                                     eprintln!("{USAGE}");
                                     return Ok(1);
                                 }
@@ -2821,7 +2840,7 @@ fn run(args: &[Vec<u8>]) -> Result<i32, Fatal> {
                     }
                 }
                 _ => {
-                    eprintln!("sed: unrecognized option '{}'", show(arg));
+                    diag(&crate::util::name_in("unrecognized option '", arg, "'"));
                     eprintln!("{USAGE}");
                     return Ok(1);
                 }
@@ -3011,7 +3030,11 @@ fn compile_and_run(
             let mut input = match Input::open(path, conf.in_place.is_none()) {
                 Ok(input) => input,
                 Err(e) => {
-                    eprintln!("sed: can't read {}: {}", show(path), errmsg(&e));
+                    diag(&crate::util::name_in(
+                        "can't read ",
+                        path,
+                        &format!(": {}", errmsg(&e)),
+                    ));
                     status = 2;
                     continue;
                 }
@@ -3023,8 +3046,8 @@ fn compile_and_run(
             // whole run there, leaving every later operand unedited.
             if conf.in_place.is_some() {
                 if let Some(why) = input.in_place_refusal() {
-                    eprintln!("sed: couldn't edit {}: {why}", show(path));
-                    sink.flush().map_err(Fatal::runtime)?;
+                    diag(&crate::util::name_in("couldn't edit ", path, &format!(": {why}")));
+                    sink.flush().map_err(Fatal::runtime_msg)?;
                     return Ok(4);
                 }
             }
@@ -3037,8 +3060,12 @@ fn compile_and_run(
                 // unlinks its temp file and leaves the original alone.
                 Err((e, _)) => {
                     let name = input.error_name(path);
-                    eprintln!("sed: read error on {name}: {}", errmsg(&e));
-                    sink.flush().map_err(Fatal::runtime)?;
+                    diag(&crate::util::name_in(
+                        "read error on ",
+                        &name,
+                        &format!(": {}", errmsg(&e)),
+                    ));
+                    sink.flush().map_err(Fatal::runtime_msg)?;
                     return Ok(4);
                 }
             };
@@ -3062,14 +3089,14 @@ fn compile_and_run(
             let quit = match &conf.in_place {
                 Some(suffix) => {
                     let mut buf = Sink::buffer(separator);
-                    let quit = sed.run_stream(&mut stream, &mut buf).map_err(Fatal::runtime)?;
+                    let quit = sed.run_stream(&mut stream, &mut buf).map_err(Fatal::runtime_msg)?;
                     write_in_place(path, suffix, &buf.into_buffer())?;
                     quit
                 }
-                _ => sed.run_stream(&mut stream, &mut sink).map_err(Fatal::runtime)?,
+                _ => sed.run_stream(&mut stream, &mut sink).map_err(Fatal::runtime_msg)?,
             };
             if let Some(code) = quit {
-                sink.flush().map_err(Fatal::runtime)?;
+                sink.flush().map_err(Fatal::runtime_msg)?;
                 // A read failure that has ALREADY happened outranks the quit code,
                 // whatever it is: `sed -s -n Q7 /nosuch A` is 2 in GNU, not 7, while
                 // `sed -s -n Q7 A /nosuch` is 7 because the quit fires before the
@@ -3089,7 +3116,7 @@ fn compile_and_run(
         // already quit before, and reported them as SUCCESS.
         let mut stream = Stream::of_operands(inputs, separator);
         let mut sink = Sink::stdout(&mut out, separator);
-        let quit = sed.run_stream(&mut stream, &mut sink).map_err(Fatal::runtime)?;
+        let quit = sed.run_stream(&mut stream, &mut sink).map_err(Fatal::runtime_msg)?;
         // A read that failed outranks everything else, including a `bad` operand
         // opened earlier: GNU's reader panics there, so nothing after it happened.
         // The flush is for its ERROR — what was written survives either way, since
@@ -3179,13 +3206,17 @@ fn read_script(path: &[u8]) -> std::io::Result<(Vec<u8>, bool)> {
 ///
 /// An OPEN failure is not an error, which is what makes `r /nonexistent` silent; a
 /// READ failure IS one, exit 4, and a DIRECTORY is how you get one.
-fn read_source(path: &[u8]) -> Result<(Vec<u8>, bool), String> {
+fn read_source(path: &[u8]) -> Result<(Vec<u8>, bool), Vec<u8>> {
     let mut data = Vec::new();
     let Ok(mut file) = std::fs::File::open(crate::util::path_from_bytes(path)) else {
         return Ok((data, false));
     };
     if let Err(e) = file.read_to_end(&mut data) {
-        return Err(format!("read error on {}: {}", show(path), errmsg(&e)));
+        return Err(crate::util::name_in(
+            "read error on ",
+            path,
+            &format!(": {}", errmsg(&e)),
+        ));
     }
     // GNU aliases the literal `/dev/stdin` to its own stdin stream, which is not
     // among the streams it rewinds, however seekable that stream happens to be.
@@ -3306,16 +3337,16 @@ fn write_in_place(path: &[u8], suffix: &[u8], data: &[u8]) -> Result<(), Fatal> 
     // reset it to the create default.
     let mode = std::fs::metadata(&target).ok().map(|m| m.permissions());
 
-    let (temp, mut file) = create_temp(&dir, path).map_err(Fatal::runtime)?;
+    let (temp, mut file) = create_temp(&dir, path).map_err(Fatal::runtime_msg)?;
     let write = file
         .write_all(data)
         .and_then(|()| file.flush())
-        .map_err(|e| format!("couldn't write {}: {}", show(path), errmsg(&e)));
+        .map_err(|e| crate::util::name_in("couldn't write ", path, &format!(": {}", errmsg(&e))));
     drop(file);
     let finish = write.and_then(|()| {
         if let Some(mode) = mode {
             std::fs::set_permissions(&temp, mode)
-                .map_err(|e| format!("couldn't write {}: {}", show(path), errmsg(&e)))?;
+                .map_err(|e| crate::util::name_in("couldn't write ", path, &format!(": {}", errmsg(&e))))?;
         }
         let mut moved_aside = None;
         if !suffix.is_empty() {
@@ -3323,7 +3354,7 @@ fn write_in_place(path: &[u8], suffix: &[u8], data: &[u8]) -> Result<(), Fatal> 
             // the new content lands at the original name — GNU's order.
             let backup = backup_name(&target, suffix);
             std::fs::rename(&target, &backup)
-                .map_err(|e| format!("cannot rename {}: {}", show(path), errmsg(&e)))?;
+                .map_err(|e| crate::util::name_in("cannot rename ", path, &format!(": {}", errmsg(&e))))?;
             moved_aside = Some(backup);
         }
         std::fs::rename(&temp, &target).map_err(|e| {
@@ -3333,7 +3364,7 @@ fn write_in_place(path: &[u8], suffix: &[u8], data: &[u8]) -> Result<(), Fatal> 
             if let Some(backup) = moved_aside {
                 let _ = std::fs::rename(&backup, &target);
             }
-            format!("cannot rename {}: {}", show(path), errmsg(&e))
+            crate::util::name_in("cannot rename ", path, &format!(": {}", errmsg(&e)))
         })
     });
     if finish.is_err() {
@@ -3341,7 +3372,7 @@ fn write_in_place(path: &[u8], suffix: &[u8], data: &[u8]) -> Result<(), Fatal> 
         // asked to edit.
         let _ = std::fs::remove_file(&temp);
     }
-    finish.map_err(Fatal::runtime)
+    finish.map_err(Fatal::runtime_msg)
 }
 
 /// Create a fresh scratch file beside the target. Exclusive create, so an
@@ -3353,7 +3384,7 @@ fn write_in_place(path: &[u8], suffix: &[u8], data: &[u8]) -> Result<(), Fatal> 
 /// directory would otherwise be world-readable for the length of the write under
 /// a predictable name. Widening to the original mode afterwards is safe; starting
 /// wide is not.
-fn create_temp(dir: &Path, path: &[u8]) -> Result<(PathBuf, std::fs::File), String> {
+fn create_temp(dir: &Path, path: &[u8]) -> Result<(PathBuf, std::fs::File), Vec<u8>> {
     use std::os::unix::fs::OpenOptionsExt;
     let pid = std::process::id();
     for n in 0..u32::MAX {
@@ -3367,21 +3398,21 @@ fn create_temp(dir: &Path, path: &[u8]) -> Result<(PathBuf, std::fs::File), Stri
             Ok(f) => return Ok((candidate, f)),
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(e) => {
-                return Err(format!(
-                    "couldn't open temporary file {}: {}",
-                    show(&crate::util::path_bytes(&candidate)),
-                    errmsg(&e)
+                return Err(crate::util::name_in(
+                    "couldn't open temporary file ",
+                    &crate::util::path_bytes(&candidate),
+                    &format!(": {}", errmsg(&e)),
                 ))
             }
         }
     }
-    Err(format!("couldn't open temporary file for {}", show(path)))
+    Err(crate::util::name_in("couldn't open temporary file for ", path, ""))
 }
 
 impl Sed {
     /// Run every cycle of one input stream. `Ok(Some(code))` means `q`/`Q` asked
     /// to exit with that status.
-    fn run_stream(&mut self, stream: &mut Stream, sink: &mut Sink) -> Result<Option<i32>, String> {
+    fn run_stream(&mut self, stream: &mut Stream, sink: &mut Sink) -> Result<Option<i32>, Vec<u8>> {
         loop {
             let Some(line) = stream.next_line(Opener::Reader) else {
                 return Ok(self.quit);
@@ -3413,21 +3444,21 @@ impl Sed {
         }
     }
 
-    fn emit_pattern(&mut self, sink: &mut Sink) -> Result<(), String> {
+    fn emit_pattern(&mut self, sink: &mut Sink) -> Result<(), Vec<u8>> {
         let pattern = std::mem::take(&mut self.pattern);
         let res = self.emit(sink, &pattern, self.terminated);
         self.pattern = pattern;
         res
     }
 
-    fn emit(&self, sink: &mut Sink, bytes: &[u8], terminated: bool) -> Result<(), String> {
+    fn emit(&self, sink: &mut Sink, bytes: &[u8], terminated: bool) -> Result<(), Vec<u8>> {
         sink.write_line(bytes, terminated)
     }
 
     /// Take `R`'s next line from `path` and queue the bytes. GNU reads it when the
     /// command runs, not when the queue is flushed, so `R` over a directory fails
     /// BEFORE the cycle prints while `r` over one fails after.
-    fn queue_line(&mut self, path: &[u8]) -> Result<(), String> {
+    fn queue_line(&mut self, path: &[u8]) -> Result<(), Vec<u8>> {
         let separator = self.separator;
         let entry = match self.rfiles.get_mut(path) {
             Some(e) => e,
@@ -3456,7 +3487,7 @@ impl Sed {
         Ok(())
     }
 
-    fn flush_appends(&mut self, sink: &mut Sink) -> Result<(), String> {
+    fn flush_appends(&mut self, sink: &mut Sink) -> Result<(), Vec<u8>> {
         let appends = std::mem::take(&mut self.appends);
         for a in appends {
             match a {
@@ -3497,7 +3528,7 @@ impl Sed {
         bytes: &[u8],
         terminated: bool,
         sink: &mut Sink,
-    ) -> Result<(), String> {
+    ) -> Result<(), Vec<u8>> {
         // `/dev/stdout` must share the auto-print stream's sink, or a `w` and a `p`
         // in one script interleave wrongly. Under `-i` that sink is the replacement
         // buffer, and GNU still writes to the real standard output — so there it is
@@ -3510,14 +3541,14 @@ impl Sed {
         // never reached `open_wfile` — not a filesystem failure, and saying so
         // would send the reader to the one place that is working.
         let Some(w) = self.wfiles.get_mut(path) else {
-            return Err(format!("no output was opened for {}", show(path)));
+            return Err(crate::util::name_in("no output was opened for ", path, ""));
         };
         w.write_line(bytes, terminated, separator)
     }
 
     /// One pass over the script for the current pattern space.
     #[allow(clippy::too_many_lines)] // the command dispatch: one arm per sed command
-    fn run_cycle(&mut self, stream: &mut Stream, sink: &mut Sink) -> Result<Flow, String> {
+    fn run_cycle(&mut self, stream: &mut Stream, sink: &mut Sink) -> Result<Flow, Vec<u8>> {
         let mut pc = 0usize;
         while pc < self.script.cmds.len() {
             if !self.addr_matches(pc, stream)? {
@@ -3561,7 +3592,7 @@ impl Sed {
                 // `resolve_labels` rewrote every branch, so a name here is a bug
                 // in that pass rather than a script error.
                 Some(Kind::Branch(Target::Name(n)) | Kind::BranchIfSub(Target::Name(n)) | Kind::BranchIfNoSub(Target::Name(n))) => {
-                    return Err(format!("unresolved branch to `{}'", show(n)))
+                    return Err(crate::util::name_in("unresolved branch to `", n, "'"))
                 }
                 Some(Kind::Append(text)) => self.appends.push(Append::Text(text.clone())),
                 Some(Kind::Insert(text)) => {
@@ -3782,7 +3813,7 @@ impl Sed {
     }
 
     /// Apply the `s///` at `idx` to the pattern space.
-    fn substitute(&mut self, idx: usize) -> Result<(bool, bool, Option<Vec<u8>>), String> {
+    fn substitute(&mut self, idx: usize) -> Result<SubstOutcome, Vec<u8>> {
         let (global, print, occurrence, wfile, own_re) = {
             let Some(Cmd { kind: Kind::Subst(s), .. }) = self.script.cmds.get(idx) else {
                 return Ok((false, false, None));
@@ -3791,11 +3822,11 @@ impl Sed {
         };
         let re_idx = match own_re.or(self.last_regex) {
             Some(i) => i,
-            None => return Err(NO_PREVIOUS_REGEX.to_string()),
+            None => return Err(NO_PREVIOUS_REGEX.as_bytes().to_vec()),
         };
         self.last_regex = Some(re_idx);
         let Some(re) = self.script.regexes.get(re_idx) else {
-            return Err(NO_PREVIOUS_REGEX.to_string());
+            return Err(NO_PREVIOUS_REGEX.as_bytes().to_vec());
         };
         let Some(Cmd { kind: Kind::Subst(sub), .. }) = self.script.cmds.get(idx) else {
             return Ok((false, false, None));
@@ -3815,7 +3846,7 @@ impl Sed {
                 Ok(None) => break,
                 Err(e) => {
                     self.pattern = hay;
-                    return Err(e.msg);
+                    return Err(e.msg.into_bytes());
                 }
             };
             let (s, e) = (caps.start(), caps.end());

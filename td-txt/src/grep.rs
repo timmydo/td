@@ -11,8 +11,8 @@
 
 use crate::regex::{Filter, OnBudget, Options, Regex};
 use crate::util::{
-    byte_in, errmsg, number, path_bytes, posixly_correct, print_line, read_input, read_search,
-    records, show, walk, Diag, Out, VERSION,
+    byte_in, errmsg, name_in, number, path_bytes, posixly_correct, print_line, read_input,
+    read_search, records, walk, Diag, Out, VERSION,
 };
 
 /// How many significant digits `-NUM` takes before refusing the run. GNU's own
@@ -418,12 +418,12 @@ pub fn main(args: &[Vec<u8>]) -> i32 {
             let (name, arity) = match resolve_long(&name) {
                 Ok(pair) => pair,
                 Err(msg) if msg.is_empty() => {
-                    err(&format!("unrecognized option '{}'", show(arg)));
+                    errb(&name_in("unrecognized option '", arg, "'"));
                     eprintln!("{USAGE}");
                     return 2;
                 }
                 Err(msg) => {
-                    err(&msg);
+                    errb(&msg);
                     eprintln!("{USAGE}");
                     return 2;
                 }
@@ -432,7 +432,7 @@ pub fn main(args: &[Vec<u8>]) -> i32 {
             // argv element; a flag accepts neither.
             let value = match (arity, inline) {
                 (Arg::None, Some(_)) => {
-                    err(&format!("option '--{}' doesn't allow an argument", show(name)));
+                    errb(&name_in("option '--", name, "' doesn't allow an argument"));
                     eprintln!("{USAGE}");
                     return 2;
                 }
@@ -444,7 +444,7 @@ pub fn main(args: &[Vec<u8>]) -> i32 {
                         Some(v.clone())
                     }
                     None => {
-                        err(&format!("option '--{}' requires an argument", show(name)));
+                        errb(&name_in("option '--", name, "' requires an argument"));
                         eprintln!("{USAGE}");
                         return 2;
                     }
@@ -472,12 +472,12 @@ pub fn main(args: &[Vec<u8>]) -> i32 {
                 Ok(()) => continue,
                 // `resolve_long` already rejected an unknown name.
                 Err(LongErr::Unknown) => {
-                    err(&format!("unrecognized option '{}'", show(arg)));
+                    errb(&name_in("unrecognized option '", arg, "'"));
                     eprintln!("{USAGE}");
                     return 2;
                 }
                 Err(LongErr::Message(m)) => {
-                    err(&m);
+                    errb(&m);
                     return 2;
                 }
                 Err(LongErr::Handled) => return 2,
@@ -510,13 +510,13 @@ pub fn main(args: &[Vec<u8>]) -> i32 {
                         .take(NUM_DIGIT_CAP)
                         .copied()
                         .collect();
-                    err(&format!("{}...: invalid context length argument", show(&kept)));
+                    errb(&name_in("", &kept, "...: invalid context length argument"));
                     return 2;
                 }
                 // Under the cap a run of digits always reads -- the shared
                 // reader saturates rather than failing -- so this is a floor.
                 let Some(n) = parse_count(digits) else {
-                    err(&format!("{}: invalid context length argument", show(digits)));
+                    errb(&name_in("", digits, ": invalid context length argument"));
                     return 2;
                 };
                 conf.both = Some(n);
@@ -592,7 +592,7 @@ pub fn main(args: &[Vec<u8>]) -> i32 {
                             pattern_seen = true;
                         }
                         Err(e) => {
-                            err(&format!("{}: {}", show(&v), errmsg(&e)));
+                            errb(&name_in("", &v, &format!(": {}", errmsg(&e))));
                             return 2;
                         }
                     },
@@ -620,7 +620,7 @@ pub fn main(args: &[Vec<u8>]) -> i32 {
                         return 2;
                     };
                     let Some(n) = parse_count(&v) else {
-                        err(&format!("{}: invalid context length argument", show(&v)));
+                        errb(&name_in("", &v, ": invalid context length argument"));
                         return 2;
                     };
                     apply_count(&mut conf, opt, n);
@@ -722,7 +722,7 @@ pub fn main(args: &[Vec<u8>]) -> i32 {
                     }
                 };
                 if !conf.no_messages {
-                    err(&format!("{}: {}", show(&shown(path)), text));
+                    errb(&name_in("", &shown(path), &format!(": {text}")));
                 }
             }
         }
@@ -758,7 +758,7 @@ pub fn main(args: &[Vec<u8>]) -> i32 {
                 Ok(d) => d,
                 Err(f) => {
                     if !grep.conf.no_messages {
-                        err(&format!("{}: {}", show(display), errmsg(&f.err)));
+                        errb(&name_in("", display, &format!(": {}", errmsg(&f.err))));
                     }
                     status_error = true;
                     if !f.opened {
@@ -804,7 +804,7 @@ pub fn main(args: &[Vec<u8>]) -> i32 {
 
 enum LongErr {
     Unknown,
-    Message(String),
+    Message(Vec<u8>),
     /// Already reported by the handler; the caller only supplies the status.
     Handled,
 }
@@ -864,7 +864,7 @@ const LONG_OPTIONS: &[(&[u8], Arg)] = &[
     (b"word-regexp", Arg::None),
 ];
 
-fn resolve_long(name: &[u8]) -> Result<(&'static [u8], Arg), String> {
+fn resolve_long(name: &[u8]) -> Result<(&'static [u8], Arg), Vec<u8>> {
     let mut hits: Vec<(&'static [u8], Arg)> = Vec::new();
     for (cand, arity) in LONG_OPTIONS {
         if *cand == name {
@@ -876,14 +876,15 @@ fn resolve_long(name: &[u8]) -> Result<(&'static [u8], Arg), String> {
     }
     match hits.as_slice() {
         [one] => Ok(*one),
-        [] => Err(String::new()),
+        [] => Err(Vec::new()),
         many => {
-            let list: Vec<String> = many.iter().map(|(n, _)| format!("'--{}'", show(n))).collect();
-            Err(format!(
-                "option '--{}' is ambiguous; possibilities: {}",
-                show(name),
-                list.join(" ")
-            ))
+            let mut msg = name_in("option '--", name, "' is ambiguous; possibilities:");
+            for (n, _) in many {
+                msg.extend_from_slice(b" '--");
+                msg.extend_from_slice(n);
+                msg.push(b'\'');
+            }
+            Err(msg)
         }
     }
 }
@@ -899,11 +900,11 @@ fn parse_long(
     let need = |value: Option<&[u8]>| -> Result<Vec<u8>, LongErr> {
         value
             .map(<[u8]>::to_vec)
-            .ok_or_else(|| LongErr::Message(format!("option '--{}' requires an argument", show(name))))
+            .ok_or_else(|| LongErr::Message(name_in("option '--", name, "' requires an argument")))
     };
     let count = |value: Option<&[u8]>| -> Result<usize, LongErr> {
         let v = need(value)?;
-        parse_count(&v).ok_or_else(|| LongErr::Message(format!("{}: invalid context length argument", show(&v))))
+        parse_count(&v).ok_or_else(|| LongErr::Message(name_in("", &v, ": invalid context length argument")))
     };
     match name {
         b"extended-regexp" => {
@@ -949,14 +950,14 @@ fn parse_long(
         b"file" => {
             let path = need(value)?;
             let bytes = read_input(&path)
-                .map_err(|e| LongErr::Message(format!("{}: {}", show(&path), errmsg(&e))))?;
+                .map_err(|e| LongErr::Message(name_in("", &path, &format!(": {}", errmsg(&e)))))?;
             push_file(patterns, &bytes);
             *pattern_seen = true;
         }
         b"max-count" => {
             let v = need(value)?;
             conf.max_count = parse_max_count(&v)
-                .ok_or_else(|| LongErr::Message("invalid max count".to_string()))?;
+                .ok_or_else(|| LongErr::Message(b"invalid max count".to_vec()))?;
         }
         b"after-context" => conf.after = Some(count(value)?),
         b"before-context" => conf.before = Some(count(value)?),
@@ -1232,7 +1233,7 @@ fn search_file(
                 // GNU 3.11 reports a binary match on STDERR and keeps stdout
                 // clean, so a pipeline gets no stray bytes; `-a` opts out by
                 // clearing `binary` (everything is text). One notice per file.
-                err(&format!("{}: binary file matches", show(display)));
+                errb(&name_in("", display, ": binary file matches"));
                 // The notice goes to stderr, but GNU still counts the file as
                 // having produced output, so the NEXT file opens with `--`.
                 *printed_before = true;
@@ -1510,7 +1511,7 @@ mod tests {
     #[test]
     fn parse_num_refuses_what_is_not_a_plain_decimal() {
         for bad in [&b"++1"[..], b"+-1", b"- 1", b"0x10", b"1e2", b"1_0", b"+", b"-", b".", b" "] {
-            assert_eq!(parse_count(bad), None, "{}", show(bad));
+            assert_eq!(parse_count(bad), None, "{bad:?}");
         }
         // Leading zeros are decimal, not octal.
         assert_eq!(parse_count(b"010"), Some(10));
