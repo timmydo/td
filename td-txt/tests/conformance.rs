@@ -41,7 +41,7 @@ fn bin() -> PathBuf {
 /// missing vendored `.inp`/`.good`, or a typo'd annotation reds in-loop — without
 /// depending on the behavioral run below.
 /// Raise this with the corpus; it exists to catch a corpus that SHRANK.
-const CORPUS_FLOOR: usize = 2253;
+const CORPUS_FLOOR: usize = 2262;
 
 #[test]
 fn corpus_is_well_formed() -> Result<(), Box<dyn std::error::Error>> {
@@ -1365,6 +1365,32 @@ fn a_special_stream_refuses_by_direction_not_by_descriptor(
         std::fs::read(dir.0.join("DATA"))?,
         b"PRECIOUS\n".to_vec(),
         "the file behind standard input was opened as a path and truncated"
+    );
+
+    // The same refusal reached through a `v` rather than through the default
+    // level, which is what makes this more than a repeat: under POSIXLY_CORRECT
+    // the special-file table is withdrawn, so `w /dev/stdin` resolves as a PATH
+    // and TRUNCATES whatever is redirected onto fd 0 -- and a `v` takes the
+    // table back, which turns that into the refusal above. A corpus case can
+    // only see the refusal: the harness gives every child a pipe, so there is no
+    // file behind fd 0 to lose.
+    std::fs::write(dir.0.join("KEEP"), b"PRECIOUS\n")?;
+    let promoted = std::process::Command::new(bin())
+        .args(["sed", "-n", "-e", "v", "-e", "w /dev/stdin", "-e", "p", "IN"])
+        .env("POSIXLY_CORRECT", "1")
+        .stdin(std::process::Stdio::from(both_ways("KEEP")?))
+        .current_dir(&dir.0)
+        .output()?;
+    assert_eq!(
+        promoted.stderr,
+        b"sed: couldn't write 4 items to stdin: Bad file descriptor\n".to_vec(),
+        "a v did not take the special-file table back"
+    );
+    assert_eq!(promoted.status.code(), Some(4));
+    assert_eq!(
+        std::fs::read(dir.0.join("KEEP"))?,
+        b"PRECIOUS\n".to_vec(),
+        "the file behind standard input was truncated through a promoted w"
     );
     Ok(())
 }

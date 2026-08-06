@@ -1263,13 +1263,32 @@ td-txt-authored case files
 
   - The `v` COMMAND is an input to that same state, and not a flag at all: GNU's
     `case 'v'` sets `posixicity = POSIXLY_EXTENDED` (compile.c:1079) for the rest
-    of the compile, across later parts. So `POSIXLY_CORRECT=1 sed -n -e v -e p -e
-    'w /dev/stdout' h` aliases in GNU (`1 1 2 2 3 3`) and does not here
-    (`1 2 3 1 2 3`). Pre-existing and unchanged by the positional landing above,
-    which is why it is its own entry: that one made a flag's position matter,
-    while this wants a compile whose mode can be PROMOTED partway through by
-    something in the script. `--posix` masks it, since `v` is refused outright
-    under the flag, so only the POSIXLY_CORRECT half is reachable.
+    of the compile, across later parts. td-txt does that now, so
+    `POSIXLY_CORRECT=1 sed -n -e v -e p -e 'w /dev/stdout' h` aliases in both
+    (`1 1 2 2 3 3`) where it did not here before (`1 2 3 1 2 3`). It is not an OR
+    onto the part's flags: `v` ASSIGNS a level, and so does `--posix`, which
+    assigns GNU's third one -- so a `--posix` scanned after a `v` wins. In the
+    other order the question does not arise, `v` being refused outright under the
+    flag.
+
+    What is promoted is only the level the special-file table reads, because
+    that is the only thing td-txt gates on it. GNU gates FOUR more on the same
+    variable: an unmatched `)` is ordinary in one mode and an error in the other
+    (regexp.c:70/73), `invalid reference \N` on an `s` RHS is diagnosed only
+    under EXTENDED (regexp.c:122), `N` at end of input auto-prints only under
+    EXTENDED (execute.c:1478), and a regex's escape handling differs
+    (compile.c:1473). Every one of those is written `== POSIXLY_EXTENDED` or its
+    negation, so BASIC and CORRECT behave ALIKE in all four and `--posix` shows
+    each of them exactly as the variable does -- measured, since an earlier
+    draft of this entry claimed the opposite.
+
+    That is what makes them unreachable to promote here, and the reason is
+    td-txt's own shape rather than GNU's: all four are gated on td-txt's `posix`
+    FLAG and none of them reads `Mode::extended`, which is the only field a `v`
+    moves. So a `v` cannot reach them, and closing them is the POSIXLY_CORRECT
+    entry's work rather than this one's. (`Mode::extended` IS driven from the
+    variable -- `!conf.posix && !posixly`; what td-txt does not drive from it is
+    the `--posix` flag.)
 
   - `-z` LOOKS like a fourth member of that class and is a HYBRID, which is what
     an attempt to add it turned up. GNU reads the record separator when it

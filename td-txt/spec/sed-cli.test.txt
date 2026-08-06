@@ -8061,6 +8061,104 @@ a
 ## stderr-json: ""
 ## status: 0
 
+#### the v command PROMOTES that level, giving the table back
+# GNU's `case 'v'` assigns the one `posixicity` the whole compile shares
+# (compile.c:1079), so a `v` in an earlier `-e` reaches every later one -- and
+# what it assigns is EXTENDED, which is the level the special-file table needs.
+## argv: sed -n -e v -e p -e s/^/W/ -e 'w /dev/stdout' h
+## file-json h: "1\n2\n3\n"
+## env POSIXLY_CORRECT: 1
+## stdin-json: ""
+## stdout-json: "1\nW1\n2\nW2\n3\nW3\n"
+## stderr-json: ""
+## status: 0
+
+#### and only for what is compiled AFTER it
+## argv: sed -n -e p -e s/^/W/ -e 'w /dev/stdout' -e v h
+## file-json h: "1\n2\n3\n"
+## env POSIXLY_CORRECT: 1
+## stdin-json: ""
+## stdout-json: "W1\nW2\nW3\n1\n2\n3\n"
+## stderr-json: ""
+## status: 0
+
+#### within one part as much as across them
+## argv: sed -n -e 'v;p;s/^/W/;w /dev/stdout' h
+## file-json h: "1\n2\n3\n"
+## env POSIXLY_CORRECT: 1
+## stdin-json: ""
+## stdout-json: "1\nW1\n2\nW2\n3\nW3\n"
+## stderr-json: ""
+## status: 0
+
+#### a --posix scanned after it wins, being GNU's THIRD level
+# So this is not a flag that ORs in: `v` assigns EXTENDED and `--posix` assigns
+# BASIC, and the later assignment is the one the part is compiled under.
+## argv: sed -n -e v --posix -e p -e s/^/W/ -e 'w /dev/stdout' h
+## file-json h: "1\n2\n3\n"
+## env POSIXLY_CORRECT: 1
+## stdin-json: ""
+## stdout-json: "W1\nW2\nW3\n1\n2\n3\n"
+## stderr-json: ""
+## status: 0
+
+#### a v that REFUSES still refuses with later parts to compile
+# Not a promotion case: the refusal ends the compile, so whether the flag was
+# set before or after the version check cannot be observed either way. What is
+# pinned is that the later parts do not change the refusal.
+## argv: sed -n -e 'v 9.9' -e p -e s/^/W/ -e 'w /dev/stdout' h
+## file-json h: "1\n2\n3\n"
+## env POSIXLY_CORRECT: 1
+## stdin-json: ""
+## stdout-json: ""
+## stderr-contains: expected newer version of sed
+## status: 1
+
+#### an explicit version argument promotes as the bare form does
+## argv: sed -n -e 'v 4.2' -e p -e s/^/W/ -e 'w /dev/stdout' h
+## file-json h: "1\n2\n3\n"
+## env POSIXLY_CORRECT: 1
+## stdin-json: ""
+## stdout-json: "1\nW1\n2\nW2\n3\nW3\n"
+## stderr-json: ""
+## status: 0
+
+#### and a v takes it back, so w /dev/stdin is refused again
+# Extended, `/dev/stdin` is the write-only STREAM and the write is refused. What
+# a case CANNOT show is the other half: unpromoted, the name is opened as a PATH
+# and truncated, which over a redirect destroys the caller's file -- the harness
+# gives every child a pipe, so there is no file behind fd 0 here to lose. That
+# half is pinned in tests/conformance.rs.
+## argv: sed -n -e v -e 'w /dev/stdin' -e p IN
+## file-json IN: "LINE\n"
+## env POSIXLY_CORRECT: 1
+## stdin-json: ""
+## stdout-json: ""
+## stderr-contains: couldn't write 4 items to stdin
+## status: 4
+
+#### one NAME is two targets across a v, as it is across --posix
+# `get_openfile` searches the by-name list first and only then returns the
+# static special entry (compile.c:398-417), so the same path opened under two
+# levels is two outputs. This is the direct collision guard for that.
+## argv: sed -n -e 'p;w /dev/stdout' -e v -e 'p;w /dev/stdout' ab
+## file-json ab: "a\nb\n"
+## env POSIXLY_CORRECT: 1
+## stdin-json: ""
+## stdout-json: "a\nb\na\na\na\nb\nb\nb\n"
+## stderr-json: ""
+## status: 0
+
+#### a v delivered by -f promotes a later -e
+## argv: sed -n -f vf -e 'p;w /dev/stdout' ab
+## file-json vf: "v\n"
+## file-json ab: "a\nb\n"
+## env POSIXLY_CORRECT: 1
+## stdin-json: ""
+## stdout-json: "a\na\nb\nb\n"
+## stderr-json: ""
+## status: 0
+
 #### --posix withdraws line address 0 entirely
 # Both its uses are GNU's own -- the `0,/re/' range and `0r' -- so under the
 # flag address 0 has none left.

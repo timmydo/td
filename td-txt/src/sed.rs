@@ -199,6 +199,11 @@ struct ScriptParser<'a> {
     /// `cmd_start` points at a byte of the script, so every real command lands
     /// inside a part.
     fallback: Mode,
+    /// A `v` has been compiled, so everything after it is POSIXLY_EXTENDED. Not
+    /// per-part: GNU keeps ONE `posixicity` across the whole compile, so a `v` in
+    /// an earlier `-e` reaches every later one. Monotonic here because only
+    /// `--posix` can undo it, and that is answered from the part's own `Mode`.
+    v_promoted: bool,
     /// Set when a diagnostic points somewhere other than where the parse stopped:
     /// GNU SAVES the location of a `{` and reports an unmatched one there. `None`
     /// means "wherever the parser is", which is every other diagnostic.
@@ -216,7 +221,8 @@ struct ScriptParser<'a> {
 }
 
 impl ScriptParser<'_> {
-    /// The flags the part under `pos` was SCANNED with. GNU compiles each part
+    /// The flags the part under `pos` was SCANNED with, plus any promotion the
+    /// SCRIPT has made since (see the `v` fold at the end). GNU compiles each part
     /// inside the option loop, so this is a function of position rather than one
     /// value for the run: `sed -e 1~2p --posix` compiles that part before the
     /// flag exists. Parts are in increasing `end` order, so the first whose end
@@ -227,12 +233,20 @@ impl ScriptParser<'_> {
     /// host-tool guard tokenises what it writes, so that method's NAME alone
     /// reds the gate.
     fn mode(&self) -> Mode {
+        let mut mode = self.fallback;
         for p in &self.parts {
             if self.cmd_start < p.end {
-                return p.mode;
+                mode = p.mode;
+                break;
             }
         }
-        self.fallback
+        // A `v` already COMPILED promotes what follows it to GNU's
+        // POSIXLY_EXTENDED (compile.c:1079) -- across later parts, since GNU
+        // holds one `posixicity` for the whole compile. `--posix` is the other
+        // way: it sets POSIXLY_BASIC, so a part scanned under it wins over an
+        // earlier `v`, which is why this is not a bare OR.
+        mode.extended |= self.v_promoted && !mode.posix;
+        mode
     }
 
     fn posix(&self) -> bool {
@@ -245,6 +259,12 @@ impl ScriptParser<'_> {
     /// text is the one construct whose parse crosses a boundary -- so a
     /// continuation that starts in an extended part and dangles again inside a
     /// `--posix` one is refused there, by the flag the FIRST part never saw.
+    ///
+    /// Reads the part's `posix` DIRECTLY rather than through `mode()`, and may:
+    /// GNU's check is `posixicity == POSIXLY_BASIC` (compile.c:1369), `v`
+    /// assigns EXTENDED, and `v` is refused outright under the flag -- so no
+    /// compile can have a `v` move posixicity into or out of BASIC. An
+    /// `extended_at_end` written by copying this WOULD need the promotion.
     fn posix_at_end(&self) -> bool {
         for p in &self.parts {
             if self.pos <= p.end {
@@ -1415,6 +1435,7 @@ fn parse_script(
         cmd_start: 0,
         null_data,
         fallback,
+        v_promoted: false,
         saved: None,
         parts,
         regexes: Vec::new(),
@@ -1619,6 +1640,11 @@ fn parse_commands(p: &mut ScriptParser) -> Result<Script, Fatal> {
                 if version_is_newer(&p.parse_label()) {
                     return Err("expected newer version of sed".to_string().into());
                 }
+                // Everything COMPILED after this is POSIXLY_EXTENDED, later `-e`
+                // parts included: GNU's `case 'v'` assigns the one `posixicity`
+                // the whole compile shares (compile.c:1079). Set after the version
+                // check, since a `v` that refuses compiles nothing at all.
+                p.v_promoted = true;
                 // Never COMMITTED, which discards the ADDRESS with it: GNU counts a
                 // slot only after the switch its `continue` leaves through
                 // (compile.c:1081), so `sed --debug '//v;p'` shows a program of just
