@@ -464,6 +464,7 @@ impl Scan {
                 cond_continues: false,
                 cmd_position: true,
                 regex_word: false,
+                in_braces: false,
             },
             sealed: false,
         }
@@ -575,7 +576,9 @@ struct Mark {
 /// deeper; the depth cap is checked before any scanning so the mutual recursion
 /// `scan_dollar -> parse_param -> word_from_str_at` is bounded.
 fn word_from_str_at(text: &str, depth: u32) -> Syn<Word> {
-    lexer_over(text, depth)?.scan_word(false)
+    let mut lx = lexer_over(text, depth)?;
+    lx.in_braces = true;
+    lx.scan_word(false)
 }
 
 /// Scan a whole runtime string as if it were the body of a `"..."` -- dash's
@@ -598,7 +601,9 @@ pub fn word_from_str(text: &str) -> Syn<Word> {
 /// is special here and nowhere else. The PATTERN operators are not this --
 /// there a `'` quotes as usual, the asymmetry `var-sub-quote` grades.
 fn dq_word_from_str_at(text: &str, depth: u32) -> Syn<Word> {
-    lexer_over(text, depth)?.scan_dq_run(true, true)
+    let mut lx = lexer_over(text, depth)?;
+    lx.in_braces = true;
+    lx.scan_dq_run(true, true)
 }
 
 /// Scan the body of `$((...))`. POSIX expands it as if it were double-quoted,
@@ -633,6 +638,7 @@ fn lexer_over(text: &str, depth: u32) -> Syn<Lexer> {
         cond_continues: false,
         cmd_position: true,
         regex_word: false,
+        in_braces: false,
     })
 }
 
@@ -679,6 +685,9 @@ struct Lexer {
     /// side. bash needs a mode here too, and the corpus says so in as many
     /// words (`regex.test.sh`: "different lexer mode required").
     regex_word: bool,
+    /// This lexer is scanning the OPERAND of a `${...}`, so `}` is what ends
+    /// the expansion and a backslash before one is consumed rather than kept.
+    in_braces: bool,
 }
 
 impl Lexer {
@@ -1204,6 +1213,12 @@ impl Lexer {
                             self.sc.bump();
                             buf.push_quoted(esc);
                         }
+                        // ... and `}` when this run is inside a `${...}`, where
+                        // it is the brace that would END the expansion.
+                        Some('}') if self.in_braces => {
+                            self.sc.bump();
+                            buf.push_quoted('}');
+                        }
                         Some('\n') => {
                             self.sc.bump();
                         }
@@ -1294,7 +1309,7 @@ impl Lexer {
             }
             '{' => {
                 self.sc.bump();
-                let inner = self.scan_braced()?;
+                let inner = self.scan_braced(in_dq)?;
                 let param = parse_param(&inner, in_dq, self.depth)?;
                 buf.push_seg(Seg::Param(Box::new(param)));
             }
@@ -1354,7 +1369,66 @@ impl Lexer {
     }
 
     /// Text up to the `}` matching an already-consumed `${`.
-    fn scan_braced(&mut self) -> Syn<String> {
+    /// Whether the `${` just consumed carries a SUBSTITUTION operator
+    /// (`-`/`=`/`?`/`+`, with or without a colon) rather than a pattern one or
+    /// none. Read-only lookahead, because the quoting rule for the rest of the
+    /// body depends on it and the body is scanned before it is parsed: dash
+    /// honours a `'` inside `"${v#'}'}"` and not inside `"${v-'}'}"`.
+    ///
+    /// It mirrors `parse_param`'s own name/operator split rather than
+    /// approximating it -- the two disagreeing means a body scanned under the
+    /// wrong rule, which is not a diagnosable error but a different program.
+    fn braced_op_is_substitution(&self) -> bool {
+        let mut i = self.sc.pos;
+        // `${#x}` is a LENGTH and takes no word, while `${#}` and `${#-x}` are
+        // the parameter `#` itself: the prefix reading only holds when a bare
+        // name reaches the closing brace.
+        if self.sc.src.get(i) == Some(&'#') {
+            let mut j = i + 1;
+            match self.sc.src.get(j) {
+                Some(&c) if is_special_param(c) => j += 1,
+                _ => {
+                    while matches!(self.sc.src.get(j), Some(c) if c.is_ascii_alphanumeric() || *c == '_')
+                    {
+                        j += 1;
+                    }
+                }
+            }
+            if j > i + 1 && self.sc.src.get(j) == Some(&'}') {
+                return false;
+            }
+        }
+        match self.sc.src.get(i) {
+            Some(c) if c.is_ascii_digit() => {
+                while matches!(self.sc.src.get(i), Some(c) if c.is_ascii_digit()) {
+                    i += 1;
+                }
+            }
+            Some(&c) if is_special_param(c) => i += 1,
+            Some(c) if c.is_ascii_alphabetic() || *c == '_' => {
+                while matches!(self.sc.src.get(i), Some(c) if c.is_ascii_alphanumeric() || *c == '_')
+                {
+                    i += 1;
+                }
+            }
+            _ => return false,
+        }
+        if self.sc.src.get(i) == Some(&':') {
+            i += 1;
+        }
+        matches!(self.sc.src.get(i), Some('-' | '=' | '?' | '+'))
+    }
+
+    /// Raw source up to the `}` matching an already-consumed `${`.
+    ///
+    /// `in_dq` is whether the `${` itself sits inside double quotes, where a
+    /// `'` is an ordinary character: `"${u-'x}y'}"` ends at the FIRST `}` and
+    /// is `'xy'}` -- word `'x`, then literal outer text. A `"` still protects
+    /// one, and `$'...'` is not a construct there at all.
+    fn scan_braced(&mut self, in_dq: bool) -> Syn<String> {
+        // Only a SUBSTITUTION operator's body is double-quoted syntax; a
+        // pattern's quotes are real, and so still protect a `}`.
+        let quotes_off = in_dq && self.braced_op_is_substitution();
         let mut out = String::new();
         let mut depth = 1usize;
         loop {
@@ -1362,7 +1436,7 @@ impl Lexer {
                 return Err(format!("{INCOMPLETE}: unmatched `${{`"));
             };
             match c {
-                '{' => depth += 1,
+                '{' if !quotes_off => depth += 1,
                 '}' => {
                     depth -= 1;
                     if depth == 0 {
@@ -1376,10 +1450,49 @@ impl Lexer {
                     }
                     continue;
                 }
+                // With quotes demoted nothing else shields a `}` inside a
+                // nested construct, so each is copied WHOLE. dash pushes a
+                // fresh syntax for these, where a `'` quotes again -- which is
+                // what the recursive call reproduces.
+                '$' if quotes_off && self.sc.peek() == Some('(') => {
+                    self.sc.bump();
+                    out.push_str("$(");
+                    out.push_str(&self.scan_paren_body()?);
+                    out.push(')');
+                    continue;
+                }
+                '$' if quotes_off && self.sc.peek() == Some('{') => {
+                    self.sc.bump();
+                    out.push_str("${");
+                    out.push_str(&self.scan_braced(in_dq)?);
+                    out.push('}');
+                    continue;
+                }
+                // Copied verbatim rather than through `scan_backtick`, which
+                // DECODES its escapes: this text is lexed again later.
+                '`' if quotes_off => {
+                    out.push('`');
+                    loop {
+                        let Some(q) = self.sc.bump() else {
+                            return Err(format!("{INCOMPLETE}: unmatched `` ` ``"));
+                        };
+                        out.push(q);
+                        if q == '\\' {
+                            if let Some(n) = self.sc.bump() {
+                                out.push(n);
+                            }
+                            continue;
+                        }
+                        if q == '`' {
+                            break;
+                        }
+                    }
+                    continue;
+                }
                 // As in `scan_paren_body`: only a `$'...'` escapes its own
                 // closing quote, so `${v#$'a\''}` ends at the wrong one under a
                 // plain single quote's rule and the brace never closes.
-                '$' if self.sc.peek() == Some('\'') => {
+                '$' if !quotes_off && self.sc.peek() == Some('\'') => {
                     out.push('$');
                     out.push('\'');
                     self.sc.bump();
@@ -1400,6 +1513,9 @@ impl Lexer {
                     }
                     continue;
                 }
+                // Inside double quotes a `'` quotes nothing, so it neither
+                // opens a run nor protects a brace; it falls through below.
+                '\'' if quotes_off => {}
                 '\'' | '"' => {
                     out.push(c);
                     // Copy the quoted run verbatim so a `}` inside it is not
@@ -1582,6 +1698,7 @@ fn heredoc_body_word(body: &str) -> Syn<Word> {
         cond_continues: false,
         cmd_position: true,
         regex_word: false,
+        in_braces: false,
     };
     let mut buf = WordBuf::default();
     buf.open_quoted();

@@ -1277,7 +1277,6 @@ xfail var-ref.test.sh::var ref: 1, @, *
 xfail var-sub-quote.test.sh::# operator with single quoted arg (dash/ash and bash/mksh disagree, reported by Crestwave)
 xfail var-sub-quote.test.sh::$'' allowed within VarSub arguments
 xfail var-sub-quote.test.sh::/ operator with single quoted arg (causes syntax error in regex in OSH, reported by Crestwave)
-xfail var-sub-quote.test.sh::Right Brace as argument (similar to #702)
 xfail var-sub-quote.test.sh::Var substitution with \n in value
 xfail var-sub-quote.test.sh::single quotes work inside character classes
 xfail var-sub.test.sh::Braced block inside ${}

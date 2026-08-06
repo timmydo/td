@@ -1379,6 +1379,58 @@ mod tests {
         assert_eq!(fields(&mut sh, "\"${foo%'c d'}\""), vec!["a b "]);
     }
 
+    /// Inside double quotes a `'` quotes nothing, so it does not protect the
+    /// `}` that ENDS the expansion either -- `"${u-'x}y'}"` is the word `'x`
+    /// followed by the literal outer text `y'}`. A `"` still protects one, and
+    /// `$'...'` is not a construct there. The rule is the SUBSTITUTION
+    /// operators' alone: a pattern's quotes are real, which is why
+    /// `"${v#'}'}"` still strips a brace.
+    #[test]
+    fn a_quote_protects_a_brace_only_where_it_quotes() {
+        let mut sh = Shell::new_for_test();
+        assert_eq!(fields(&mut sh, "\"${u-it's}\""), vec!["it's"]);
+        assert_eq!(fields(&mut sh, "\"${u-'x}y'}\""), vec!["'xy'}"]);
+        assert_eq!(fields(&mut sh, "\"${u-$'a}b'}\""), vec!["$'ab'}"]);
+        // A `"` does protect it, and its backslash-brace is consumed because
+        // that brace is the expansion's, not the string's.
+        assert_eq!(fields(&mut sh, "\"${u-\"a}b\"}\""), vec!["a}b"]);
+        assert_eq!(fields(&mut sh, "${u-\"a\\}b\"}"), vec!["a}b"]);
+        // The pattern side is unchanged: those quotes quote.
+        let _ = sh.set_var("v", "}");
+        assert_eq!(fields(&mut sh, "\"${v#'}'}\""), vec![""]);
+        // Which means name and operator must be split exactly as the parser
+        // splits them: `${#x}` is a length, but `${#-x}` is the parameter `#`
+        // with a default, so its body IS double-quoted syntax.
+        sh.params = vec!["a".into(), "b".into()];
+        assert_eq!(fields(&mut sh, "\"${#-'}'}\""), vec!["2'}"]);
+        assert_eq!(fields(&mut sh, "\"${#v}\""), vec!["1"]);
+        // The whole operator roster, and the colon form, take the rule too.
+        let _ = sh.set_var("s", "x");
+        assert_eq!(fields(&mut sh, "\"${s+'x}y'}\""), vec!["'xy'}"]);
+        assert_eq!(fields(&mut sh, "\"${u='x}y'}\""), vec!["'xy'}"]);
+        assert_eq!(fields(&mut sh, "\"${z:-'x}y'}\""), vec!["'xy'}"]);
+    }
+
+    /// With `'` demoted, nothing shields a `}` inside a NESTED construct, so
+    /// each is copied whole and lexed on its own -- where a `'` quotes again.
+    /// A bare `{` stops nesting too, as it does in dash: only `${` opens a
+    /// level, so `"${u-'a{b'}c}"` ends at the brace after the quoted one.
+    #[test]
+    fn a_nested_construct_keeps_its_own_quoting() {
+        let mut sh = Shell::new_for_test();
+        let _ = sh.set_var("w", "}");
+        assert_eq!(
+            fields(&mut sh, "\"${u-$(printf '%s' 'a}b')}\""),
+            vec!["a}b"]
+        );
+        assert_eq!(fields(&mut sh, "\"${u-${w#'}'}}\""), vec![""]);
+        assert_eq!(fields(&mut sh, "\"${u-'a{b'}c}\""), vec!["'a{b'c}"]);
+        // A `"` run inside the word, which pins the quoted-outer spelling that
+        // the unquoted one below does not reach.
+        assert_eq!(fields(&mut sh, "\"${u-\"a\\}b\"}\""), vec!["a}b"]);
+        assert_eq!(fields(&mut sh, "${u-\"a\\}b\"}"), vec!["a}b"]);
+    }
+
     /// The `:-`/`:+` WORD inherits the outer splitting flag, as dash's
     /// `VSMINUS`/`VSPLUS` inherit `EXP_FULL` while `:=`/`:?` strip it. Without
     /// that, a nested `${undef:-${*:-SUB}}` answers the inner one as a
