@@ -4056,10 +4056,12 @@ sed: couldn't open file /nosuchdir/out: No such file or directory
 ## stderr-json: ""
 ## status: 0
 
-# GNU compiles each `-e` as it SCANS the options, so a flag that follows one is
-# not in effect for it -- `--sandbox` after a `w` does not refuse it, and the file
-# is written. td-txt joins the parts and compiles once, after every option is
-# known. Pre-existing, and a separate axis; see ../spec/README.
+# GNU compiles each `-e`/`-f` INSIDE its option scan, so a flag that follows one
+# is not in effect for it -- `--sandbox` after a `w` does not refuse it, and the
+# file is written. td-txt does the same: every part carries the flags it was
+# SCANNED with. THREE flags reach a compile and are therefore positional; this is
+# one, and `--posix` and `-E`/`-r` are cased together further down, beside `-z`,
+# which looks like a fourth and is a hybrid.
 
 #### a --sandbox that FOLLOWS the w it would refuse comes too late in GNU
 ## argv: sed -n -e 'w out' --sandbox
@@ -4077,6 +4079,150 @@ sed: couldn't open file /nosuchdir/out: No such file or directory
 ## file-after-json s.sed: "a\n"
 ## stderr-json: ""
 ## status: 0
+
+# --- The other two positional flags. A flag reaches a COMPILE if a command's
+# --- meaning depends on it: `--posix` withdraws extensions and `-E`/`-r` chooses
+# --- the regex grammar. `-n`, `-s` and `-i` are run-time and so order-independent
+# --- in both, and `-l` is read when `l` RUNS (see spec/README) -- the same
+# --- observation from the other side. `-z` is neither, and has its own block.
+
+#### --posix reaches only the parts scanned after it
+## argv: sed -n -e '1~2p' --posix h
+## file-json h: "a\nb\nc\n"
+## stdin-json: ""
+## stdout-json: "a\nc\n"
+## stderr-json: ""
+## status: 0
+
+#### and the same flag first refuses the same script
+## argv: sed -n --posix -e '1~2p' h
+## file-json h: "a\nb\nc\n"
+## stdin-json: ""
+## stdout-json: ""
+## stderr-json: "sed: -e expression #1, char 2: unknown command: `~'\n"
+## status: 1
+
+#### a bare script OPERAND is compiled after the scan, so it takes the flag
+## argv: sed -n '1~2p' --posix h
+## file-json h: "a\nb\nc\n"
+## stdin-json: ""
+## stdout-json: ""
+## stderr-json: "sed: -e expression #1, char 2: unknown command: `~'\n"
+## status: 1
+
+#### a -f script follows the same rule as an -e one
+## argv: sed -n -f s.sed --posix h
+## file-json h: "a\nb\nc\n"
+## file-json s.sed: "1~2p\n"
+## stdin-json: ""
+## stdout-json: "a\nc\n"
+## stderr-json: ""
+## status: 0
+
+#### and refuses when the flag precedes it, naming the FILE
+## argv: sed -n --posix -f s.sed h
+## file-json h: "a\nb\nc\n"
+## file-json s.sed: "1~2p\n"
+## stdin-json: ""
+## stdout-json: ""
+## stderr-json: "sed: file s.sed line 1: unknown command: `~'\n"
+## status: 1
+
+#### -E likewise: after the -e it would govern, the part is still a BRE
+## argv: sed -n -e 's/a+/X/p' -E r1
+## file-json r1: "aab\n"
+## stdin-json: ""
+## stdout-json: ""
+## stderr-json: ""
+## status: 0
+
+#### where the same flag first makes a+ a repetition
+## argv: sed -n -E -e 's/a+/X/p' r1
+## file-json r1: "aab\n"
+## stdin-json: ""
+## stdout-json: "Xb\n"
+## stderr-json: ""
+## status: 0
+
+#### -r is the sharper half, since a BRE has no group for the \1 to name
+## argv: sed -n -e 's/(a)/[\1]/p' -r r1
+## file-json r1: "aab\n"
+## stdin-json: ""
+## stdout-json: ""
+## stderr-json: "sed: -e expression #1, char 12: invalid reference \\1 on `s' command's RHS\n"
+## status: 1
+
+# `-z` is NOT in the class, and the attempt to put it there is what showed why.
+# GNU reads the record separator TWICE -- once compiling (`regexp.c:101`, which
+# is what `M` bakes in) and again in `match_regexp` -- and for a pattern that is
+# only `^` or `$` the RUN-time read is what anchors it. So the flag is a hybrid,
+# td-txt models the run-time half, and the compile half is an xfail below.
+
+#### the run-time half: a lone ^ under M anchors on the FINAL -z
+## argv: sed -e 's/^/>/Mg' -z
+## stdin-json: "a\nb\u0000"
+## stdout-json: ">a\nb\u0000"
+## stderr-json: ""
+## status: 0
+
+#### and a lone $ likewise
+## argv: sed -e 's/$/</Mg' -z
+## stdin-json: "a\nb\u0000"
+## stdout-json: "a\nb<\u0000"
+## stderr-json: ""
+## status: 0
+
+#### the compile half, which td-txt does not model: xfail with GNU's golden
+## argv: sed -n -e '/a$/Mp' -z z1
+## file-json z1: "a\nb\n"
+## stdin-json: ""
+## stdout-json: "a\nb\n"
+## stderr-json: ""
+## status: 0
+
+#### with the flag FIRST the two halves agree, so this one passes
+## argv: sed -n -z -e '/a$/Mp' z1
+## file-json z1: "a\nb\n"
+## stdin-json: ""
+## stdout-json: ""
+## stderr-json: ""
+## status: 0
+
+#### the flags are independent: --posix does not withdraw an earlier -E
+## argv: sed -n -E -e '#c' --posix -e 's/a+/Y/p' r1
+## file-json r1: "aab\n"
+## stdin-json: ""
+## stdout-json: "Yb\n"
+## stderr-json: ""
+## status: 0
+
+#### nor does a later -E reach back into the part before it
+## argv: sed -n -e 's/a+/Y/p' -E -e '#c' r1
+## file-json r1: "aab\n"
+## stdin-json: ""
+## stdout-json: ""
+## stderr-json: ""
+## status: 0
+
+# `a`/`i`/`c` TEXT is the one construct whose parse crosses a part boundary, and
+# it asks a different question from every other: GNU refuses a dangling one at
+# the end of EVERY part, under THAT part's posixicity (compile.c:1369), so the
+# flag that refuses it need not be the one the command STARTED under.
+
+#### a dangling a\ is refused at the end of EVERY part, under THAT part's flag
+## argv: sed -e 'a\' --posix -e 'x\' -e y
+## stdin-json: "a\n"
+## stdout-json: ""
+## stderr-json: "sed: -e expression #2, char 2: incomplete command\n"
+## status: 1
+
+#### without the flag the same continuation is carried across, as GNU carries it
+## argv: sed -e 'a\' -e 'x\' -e y
+## stdin-json: "a\n"
+## stdout-json: "a\nx\ny\n"
+## stderr-json: ""
+## status: 0
+
 
 
 # Long-line cases for the SPAN-consuming callers. Searching every end for POSIX
@@ -7633,6 +7779,51 @@ a
 ## stdout-json: "1\nW1\n2\nW2\n3\nW3\n"
 ## stderr-json: ""
 ## status: 0
+
+#### a --posix that FOLLOWS the w interleaves, since the table is read at compile
+# The flag is positional like the other three (see the block above `-E`), and the
+# table is read when the `w' COMPILES, so this part resolved under POSIXLY_EXTENDED
+# and aliases. What that pins beyond the ordering is that ONE `w' gets ONE answer:
+# re-asking the table at write time would consult the FINAL flags and separate the
+# streams, and the two halves of the same command would disagree.
+## argv: sed -n -e p -e s/^/W/ -e 'w /dev/stdout' --posix h
+## file-json h: "1\n2\n3\n"
+## stdin-json: ""
+## stdout-json: "1\nW1\n2\nW2\n3\nW3\n"
+## stderr-json: ""
+## status: 0
+
+# --- Resolving the table under the PART's posixicity means the answer has to
+# --- travel with the command. Re-asking at run time consults the FINAL flags and
+# --- can contradict the compile that admitted the command; and a target is not
+# --- its NAME, since GNU returns the special stream from a static entry OUTSIDE
+# --- the by-name list `get_openfile' dedups in (compile.c:398), so one path in
+# --- two modes is two targets. The `R' case HUNG before the second of these.
+
+#### an R whose part resolved the table keeps that answer at read time
+## argv: sed -n -e 'R /dev/stdout' --posix ab
+## file-json ab: "a\nb\n"
+## stdin-json: ""
+## stdout-json: ""
+## stderr-json: "sed: read error on stdout: Bad file descriptor\n"
+## status: 4
+
+#### two w targets of one NAME in different modes are two targets
+## argv: sed -n -e 'p;w /dev/stdout' --posix -e 'p;w /dev/stdout' ab
+## file-json ab: "a\nb\n"
+## stdin-json: ""
+## stdout-json: "a\nb\na\na\na\nb\nb\nb\n"
+## stderr-json: ""
+## status: 0
+
+#### and an s///w target is keyed the same way
+## argv: sed -n -e 's/a/A/w /dev/stdout' --posix -e 's/b/B/w /dev/stdout' ab
+## file-json ab: "a\nb\n"
+## stdin-json: ""
+## stdout-json: "B\nA\n"
+## stderr-json: ""
+## status: 0
+
 
 #### but that GROUPING is buffering, and -u takes it away in GNU
 # The two streams are separate under the flag either way; what orders them is

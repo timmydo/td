@@ -78,7 +78,7 @@ struct Subst {
     global: bool,
     print: bool,
     occurrence: u64,
-    wfile: Option<Vec<u8>>,
+    wfile: Option<FileTarget>,
 }
 
 /// One piece of an `s///` replacement.
@@ -138,11 +138,11 @@ enum Kind {
     ReadFile(Vec<u8>),
     /// `0r` — the same read, written where the command RUNS rather than queued.
     PrependFile(Vec<u8>),
-    ReadLine(Vec<u8>),
+    ReadLine(FileTarget),
     Subst(Subst),
     Transliterate(Box<[u8; 256]>),
-    Write(Vec<u8>),
-    WriteFirstLine(Vec<u8>),
+    Write(FileTarget),
+    WriteFirstLine(FileTarget),
     LineNumber,
     FileName,
     Zap,
@@ -163,7 +163,7 @@ struct Script {
     /// The `w` targets, ALREADY OPEN: GNU opens one while it parses the command
     /// that names it, so compiling a script is what creates and truncates them.
     /// Keyed by filename because GNU keeps one output per name, not per command.
-    wfiles: BTreeMap<Vec<u8>, WFile>,
+    wfiles: BTreeMap<FileTarget, WFile>,
 }
 
 /// GNU's tri-state. `Closed` is not `Inactive`: a range whose start address is a
@@ -184,22 +184,21 @@ enum RangeState {
 struct ScriptParser<'a> {
     src: &'a [u8],
     pos: usize,
-    ere: bool,
-    /// `--posix`. Reaches the regex compiler, which drops GNU's extensions under
-    /// it (see `Options::posix`), and `normalize_regex`, which stops decoding the
-    /// escape vocabulary inside a bracket expression.
-    posix: bool,
-    /// GNU's POSIXLY_EXTENDED, which is NOT the negation of `posix`: `--posix`
-    /// and `POSIXLY_CORRECT` are different switches here (see spec/README's gap
-    /// entry) and GNU's third level is what each of them leaves. Only the
-    /// special-file table reads it.
-    extended: bool,
-    /// `--sandbox`. Read at the `r`/`R`/`w`/`W` commands and the `s///w` flag, and
-    /// checked BEFORE the target is opened, because refusing the command is GNU's
-    /// answer whether or not the file could have been opened.
-    sandbox: bool,
-    /// `-z`. Only the `M` flag reads it: see `Options::reg_newline`.
+    /// Where the command being parsed STARTED, which is what picks its part and
+    /// so its compile flags. Not `pos`, which has already run to the command's
+    /// end by the time most of those flags are read.
+    cmd_start: usize,
+    /// `-z`, read by the `M` flag. NOT per-part, unlike the flags in `Mode`:
+    /// GNU reads the record separator at compile time AND again in
+    /// `match_regexp`, and for a pattern that is only `^` or `$` the RUN-time
+    /// read is what anchors it -- so a part-scoped answer is wrong for exactly
+    /// the patterns the option is most used with. See spec/README.
     null_data: bool,
+    /// What the lookup answers when there are no parts to look in, which is the
+    /// unit tests and nothing else: `run` always builds at least one, and
+    /// `cmd_start` points at a byte of the script, so every real command lands
+    /// inside a part.
+    fallback: Mode,
     /// Set when a diagnostic points somewhere other than where the parse stopped:
     /// GNU SAVES the location of a `{` and reports an unmatched one there. `None`
     /// means "wherever the parser is", which is every other diagnostic.
@@ -213,10 +212,60 @@ struct ScriptParser<'a> {
     /// it to (`sed -e 'a\' -e text`). See `parse_text` and `at_part_end`.
     parts: Vec<Part>,
     regexes: Vec<Regex>,
-    wfiles: BTreeMap<Vec<u8>, WFile>,
+    wfiles: BTreeMap<FileTarget, WFile>,
 }
 
 impl ScriptParser<'_> {
+    /// The flags the part under `pos` was SCANNED with. GNU compiles each part
+    /// inside the option loop, so this is a function of position rather than one
+    /// value for the run: `sed -e 1~2p --posix` compiles that part before the
+    /// flag exists. Parts are in increasing `end` order, so the first whose end
+    /// is past `pos` is the one holding it -- and the separator newline AT an end
+    /// belongs to the part after, which is where the next command starts.
+    /// A loop rather than the iterator search that reads better: this module is
+    /// embedded verbatim by `recipes/src/recipes/td-txt.rs`, and the ladder's
+    /// host-tool guard tokenises what it writes, so that method's NAME alone
+    /// reds the gate.
+    fn mode(&self) -> Mode {
+        for p in &self.parts {
+            if self.cmd_start < p.end {
+                return p.mode;
+            }
+        }
+        self.fallback
+    }
+
+    fn posix(&self) -> bool {
+        self.mode().posix
+    }
+
+    /// `--posix` as the part ENDING at `pos` had it, which is not the same
+    /// question `posix()` answers. GNU refuses a dangling `a`/`i`/`c` text at the
+    /// end of EVERY part under that part's own posixicity (compile.c:1369), and
+    /// text is the one construct whose parse crosses a boundary -- so a
+    /// continuation that starts in an extended part and dangles again inside a
+    /// `--posix` one is refused there, by the flag the FIRST part never saw.
+    fn posix_at_end(&self) -> bool {
+        for p in &self.parts {
+            if self.pos <= p.end {
+                return p.mode.posix;
+            }
+        }
+        self.fallback.posix
+    }
+
+    fn extended(&self) -> bool {
+        self.mode().extended
+    }
+
+    fn ere(&self) -> bool {
+        self.mode().ere
+    }
+
+    fn sandbox(&self) -> bool {
+        self.mode().sandbox
+    }
+
     fn peek(&self) -> Option<u8> {
         self.src.get(self.pos).copied()
     }
@@ -352,17 +401,17 @@ impl ScriptParser<'_> {
         // `M` is relative to the RECORD separator, which `N` can put inside the
         // pattern space: under `-z`, `N` joins with a NUL and GNU anchors there.
         let opts = Options {
-            ere: self.ere,
+            ere: self.ere(),
             icase,
             strict_repeats: true,
-            posix: self.posix,
+            posix: self.posix(),
             // sed has only glibc, which never satisfies a mid-branch `$`.
             glibc_engine: true,
             // sed lexes one regex at a time, and has no `-x`/`-w` to wrap it.
             lex_continues: false,
             reg_newline: multiline.then_some(separator_for(self.null_data)),
         };
-        let re = Regex::compile(&normalize_regex(raw, self.posix)?, opts)
+        let re = Regex::compile(&normalize_regex(raw, self.posix())?, opts)
             .map_err(|e| e.msg)?;
         self.regexes.push(re);
         Ok(Some(self.regexes.len() - 1))
@@ -381,7 +430,7 @@ impl ScriptParser<'_> {
         // `--posix`, where the letter is then met as a command instead.
         loop {
             self.skip_blank();
-            if self.posix {
+            if self.posix() {
                 break;
             }
             match self.peek() {
@@ -501,7 +550,7 @@ impl ScriptParser<'_> {
     /// upper-case GNU siblings go, so the combined arms below cannot be gated as
     /// a whole and this is asked BEFORE the dispatch instead.
     fn posix_drops_command(&self, c: u8) -> bool {
-        self.posix && matches!(c, b'v' | b'Q' | b'T' | b'z' | b'F' | b'W' | b'R' | b'e')
+        self.posix() && matches!(c, b'v' | b'Q' | b'T' | b'z' | b'F' | b'W' | b'R' | b'e')
     }
 
     /// The commands `--posix` gives at most ONE address, GNU otherwise taking a
@@ -510,7 +559,7 @@ impl ScriptParser<'_> {
     /// than from the standard. `q`/`Q` are restricted in both modes and check
     /// themselves; `c` is not in the list, a range being the whole point of it.
     fn posix_limits_addresses(&self, c: u8) -> bool {
-        self.posix && matches!(c, b'=' | b'a' | b'i' | b'l' | b'r')
+        self.posix() && matches!(c, b'=' | b'a' | b'i' | b'l' | b'r')
     }
 
     fn parse_addr_kind(&mut self) -> Result<Option<AddrKind>, String> {
@@ -547,7 +596,7 @@ impl ScriptParser<'_> {
             // number past 2^64 WRAPS like GNU's, so `+2^64` is `+0`. The
             // message names the first address because only a first address
             // reaches here -- `parse_addr` takes `+`/`~` after a comma itself.
-            Some(b'+' | b'~') if !self.posix => {
+            Some(b'+' | b'~') if !self.posix() => {
                 self.pos += 1;
                 self.skip_blank();
                 match self.parse_number().unwrap_or(0) {
@@ -557,7 +606,7 @@ impl ScriptParser<'_> {
             }
             Some(b) if b.is_ascii_digit() => {
                 let n = self.parse_number().unwrap_or(0);
-                if !self.posix {
+                if !self.posix() {
                     // GNU reads the step with `in_integer(in_nonblank())`, so
                     // blanks fall either side of the `~` and ABSENT digits are
                     // 0 rather than an error -- `2 ~ 2`, `1~ 2` and a bare `2~`
@@ -606,10 +655,10 @@ impl ScriptParser<'_> {
                 // Same `in_integer(in_nonblank())` as the step: blanks after the
                 // operator, and no digits at all reads as 0. `1,+p` is `+0`, a
                 // range ending on its own start line.
-                if !self.posix && self.eat(b'+') {
+                if !self.posix() && self.eat(b'+') {
                     self.skip_blank();
                     addr.a2 = Some(Addr2::Plus(self.parse_number().unwrap_or(0)));
-                } else if !self.posix && self.eat(b'~') {
+                } else if !self.posix() && self.eat(b'~') {
                     self.skip_blank();
                     addr.a2 = Some(Addr2::Multiple(self.parse_number().unwrap_or(0)));
                 } else {
@@ -651,7 +700,7 @@ impl ScriptParser<'_> {
         let ends_in_regex = matches!(addr.a2, Some(Addr2::Kind(AddrKind::Rx(_))));
         let prepends = addr.a2.is_none() && self.peek() == Some(b'r');
         if matches!(addr.a1, Some(AddrKind::Zero))
-            && (self.posix || !(ends_in_regex || prepends))
+            && (self.posix() || !(ends_in_regex || prepends))
         {
             // GNU has READ that command character before it judges the address,
             // so the refusal is reported past it: `0p` is `char 2`, `0 p` is
@@ -693,7 +742,7 @@ impl ScriptParser<'_> {
             // as is a script ending in the backslash, which otherwise appends
             // nothing. Asked BEFORE the newline is eaten, since eating it is what
             // makes the two parts look like one.
-            if self.posix && (self.at_part_end() || self.peek().is_none()) {
+            if self.posix_at_end() && (self.at_part_end() || self.peek().is_none()) {
                 return Err("incomplete command".to_string());
             }
             if !self.eat(b'\n') {
@@ -708,7 +757,7 @@ impl ScriptParser<'_> {
                 };
                 out.push(lead);
             }
-        } else if self.posix || self.peek().is_none() || self.at_part_end() {
+        } else if self.posix() || self.peek().is_none() || self.at_part_end() {
             // The one-line `a text` form is GNU's; `--posix` leaves only `a\`.
             // GNU has READ the byte that was not a backslash, so `--posix 'a t'`
             // is `char 3` -- but a part's closing newline is that part's end of
@@ -732,7 +781,7 @@ impl ScriptParser<'_> {
                 Some(b'\\') if self.at_part_end() => {
                     // Same rule as the command's own backslash: crossing into the
                     // next `-e` is GNU's, and `--posix` will not have it.
-                    if self.posix {
+                    if self.posix_at_end() {
                         return Err("incomplete command".to_string());
                     }
                     self.pos += 1;
@@ -740,7 +789,7 @@ impl ScriptParser<'_> {
                 }
                 Some(b'\\') => match self.bump() {
                     None => {
-                        if self.posix {
+                        if self.posix_at_end() {
                             return Err("incomplete command".to_string());
                         }
                         undecoded = true;
@@ -811,7 +860,7 @@ impl ScriptParser<'_> {
     /// the ban has nothing left to catch — but the DIAGNOSTIC differs under the
     /// flag, GNU naming sandbox mode where td-txt names the unsupported command.
     fn deny_in_sandbox(&self) -> Result<(), Fatal> {
-        if self.sandbox {
+        if self.sandbox() {
             return Err(Fatal {
                 msg: b"e/r/w commands disabled in sandbox mode".to_vec(),
                 status: 1,
@@ -829,11 +878,12 @@ impl ScriptParser<'_> {
     ///
     /// The three device names are not files and GNU creates nothing for them; they
     /// are registered here anyway so the write path never has to open anything.
-    fn open_wfile(&mut self, path: &[u8]) -> Result<(), Fatal> {
-        if self.wfiles.contains_key(path) {
+    fn open_wfile(&mut self, target: &FileTarget) -> Result<(), Fatal> {
+        if self.wfiles.contains_key(target) {
             return Ok(());
         }
-        let dest = match special(path, self.extended) {
+        let path = &target.path;
+        let dest = match target.special {
             Some(Special::Out) => WDest::Stdout,
             Some(Special::Err) => WDest::Stderr,
             // Opened as a stream nobody may write to, and not as a PATH: creating
@@ -844,7 +894,7 @@ impl ScriptParser<'_> {
                     .map_err(|e| Fatal::runtime_msg(cant_open(path, &e)))?,
             ),
         };
-        self.wfiles.insert(path.to_vec(), WFile { dest, owed: false });
+        self.wfiles.insert(target.clone(), WFile { dest, owed: false });
         Ok(())
     }
 
@@ -869,7 +919,7 @@ impl ScriptParser<'_> {
         // escape there outranks both an unknown flag and a bad PATTERN, and is
         // reported before the terminator the flag loop goes on to consume:
         // `s/a/\c\q/x` is `char 9` and `s/\(a/\c\q/` names the replacement.
-        let replacement = compile_replacement(&raw_repl, self.posix)?;
+        let replacement = compile_replacement(&raw_repl, self.posix())?;
         let mut global = false;
         let mut print = false;
         let mut icase = false;
@@ -943,18 +993,19 @@ impl ScriptParser<'_> {
                     }
                     print = true;
                 }
-                b'i' | b'I' if !self.posix => icase = true,
-                b'm' | b'M' if !self.posix => multiline = true,
+                b'i' | b'I' if !self.posix() => icase = true,
+                b'm' | b'M' if !self.posix() => multiline = true,
                 // Under `--posix` these are not flags at all, so the catch-all
                 // below answers with GNU's `unknown option to `s''.
-                b'e' if !self.posix => {
+                b'e' if !self.posix() => {
                     return Err("the `e' flag is not supported".to_string().into())
                 }
                 b'w' => {
                     self.deny_in_sandbox()?;
                     let name = self.parse_filename()?;
-                    self.open_wfile(&name)?;
-                    wfile = Some(name);
+                    let target = FileTarget::resolve(&name, self.extended());
+                    self.open_wfile(&target)?;
+                    wfile = Some(target);
                     break;
                 }
                 _ => return Err("unknown option to `s'".to_string().into()),
@@ -969,7 +1020,7 @@ impl ScriptParser<'_> {
         // refuses when the command carries its own address regex, so
         // `/\(a\)/s//\2/` is an error there and empty here. See spec/README.
         if let Some(groups) = re
-            .filter(|_| !self.posix)
+            .filter(|_| !self.posix())
             .and_then(|i| self.regexes.get(i))
             .map(Regex::group_count)
         {
@@ -1354,20 +1405,16 @@ fn separator_for(null_data: bool) -> u8 {
 /// does — exit 4, reported bare — and not only the way a bad script does.
 fn parse_script(
     src: &[u8],
-    ere: bool,
-    null_data: bool,
     parts: Vec<Part>,
-    mode: Posixicity,
-    sandbox: bool,
+    fallback: Mode,
+    null_data: bool,
 ) -> Result<Script, Fatal> {
     let mut p = ScriptParser {
         src,
         pos: 0,
-        ere,
-        posix: mode.posix,
-        extended: mode.extended,
-        sandbox,
+        cmd_start: 0,
         null_data,
+        fallback,
         saved: None,
         parts,
         regexes: Vec::new(),
@@ -1400,6 +1447,12 @@ fn parse_commands(p: &mut ScriptParser) -> Result<Script, Fatal> {
         if p.peek().is_none() {
             break;
         }
+        // Which part this command STARTS in is what decides its compile flags,
+        // and `pos` cannot answer that: by the time an `s///` has been read the
+        // parser stands at the command's end, which for the last command of a
+        // part is the boundary itself -- so the flags of the part AFTER it, or
+        // of a part that does not exist, would be the ones consulted.
+        p.cmd_start = p.pos;
         let mut addr = p.parse_addr()?;
         // A part's closing newline is that part's end of input, so an address
         // left dangling on it is GNU's `missing command` -- the same message
@@ -1485,7 +1538,7 @@ fn parse_commands(p: &mut ScriptParser) -> Result<Script, Fatal> {
                 p.skip_blank();
                 // The width argument is GNU's, and an unread digit is what makes
                 // `--posix 'l 5'` the `extra characters after command` GNU gives.
-                let w = match p.posix {
+                let w = match p.posix() {
                     true => None,
                     false => p.parse_number(),
                 };
@@ -1501,7 +1554,7 @@ fn parse_commands(p: &mut ScriptParser) -> Result<Script, Fatal> {
                 }
                 p.skip_blank();
                 // Likewise the exit code: `--posix 'q5'` leaves the `5` unread.
-                let n = match p.posix {
+                let n = match p.posix() {
                     true => None,
                     false => p.parse_number(),
                 };
@@ -1538,16 +1591,19 @@ fn parse_commands(p: &mut ScriptParser) -> Result<Script, Fatal> {
                         Kind::PrependFile(name)
                     }
                     b'r' => Kind::ReadFile(name),
-                    _ => Kind::ReadLine(name),
+                    // `r` is never aliased -- GNU reads its operand with a bare
+                    // `read_filename` -- so only `R` resolves against the table.
+                    _ => Kind::ReadLine(FileTarget::resolve(&name, p.extended())),
                 }
             }
             b'w' | b'W' => {
                 p.deny_in_sandbox()?;
                 let name = p.parse_filename()?;
-                p.open_wfile(&name)?;
+                let target = FileTarget::resolve(&name, p.extended());
+                p.open_wfile(&target)?;
                 match c {
-                    b'w' => Kind::Write(name),
-                    _ => Kind::WriteFirstLine(name),
+                    b'w' => Kind::Write(target),
+                    _ => Kind::WriteFirstLine(target),
                 }
             }
             b's' => Kind::Subst(p.parse_subst()?),
@@ -1987,9 +2043,6 @@ struct Sed {
     suppress: bool,
     separator: u8,
     posix: bool,
-    /// GNU's POSIXLY_EXTENDED — see `Conf::extended`. Only the special-file
-    /// table reads it.
-    extended: bool,
     /// The fallback width (`COLS`, then `-l`), read HERE rather than at compile
     /// time because GNU reads it when `l` runs: `sed -e l -l 12` folds at 12
     /// though the option came after.
@@ -2010,12 +2063,12 @@ struct Sed {
     quit: Option<i32>,
     /// Index in the regex table of the last regex applied — what `//` reuses.
     last_regex: Option<usize>,
-    wfiles: BTreeMap<Vec<u8>, WFile>,
+    wfiles: BTreeMap<FileTarget, WFile>,
     /// `R` reads ONE line per invocation, so the file is parsed once and the
     /// cursor kept; re-reading per line would be quadratic. Keyed by NAME, not
     /// per command: two `R f` commands share one cursor in GNU, and advance it
     /// twice in a cycle.
-    rfiles: BTreeMap<Vec<u8>, RFile>,
+    rfiles: BTreeMap<FileTarget, RFile>,
 }
 
 /// Does a single address match the current line? Free of `Sed` so the caller can
@@ -2436,6 +2489,9 @@ struct Part {
     /// Offset in `source` one past this part's last byte.
     end: usize,
     origin: Origin,
+    /// The compile flags in effect when this part was SCANNED, which is what GNU
+    /// compiles it under.
+    mode: Mode,
 }
 
 /// Where a diagnostic points, which is not always a place the parse reached.
@@ -2536,7 +2592,7 @@ const NO_PREVIOUS_REGEX: &str = "no previous regular expression";
 
 /// What one `s///` reports: whether it substituted, whether the `p` flag asks
 /// for a print, and the file a `w` flag owes the pattern space to.
-type SubstOutcome = (bool, bool, Option<Vec<u8>>);
+type SubstOutcome = (bool, bool, Option<FileTarget>);
 
 impl Fatal {
     /// A failure the FILESYSTEM raised rather than the script — a `w` file that will
@@ -2611,17 +2667,30 @@ pub fn main(args: &[Vec<u8>]) -> i32 {
     }
 }
 
+/// The compile flags as they stand at THIS point in the option scan. Called at
+/// every script part rather than once at the end, which is the whole of what
+/// makes a flag govern only what follows it.
+fn mode_of(conf: &Conf, posixly: bool) -> Mode {
+    Mode {
+        posix: conf.posix,
+        // GNU's third posixicity level is the one BOTH other switches leave, and
+        // it is deliberately not `!posix`: the variable and the flag differ
+        // elsewhere on purpose.
+        extended: !conf.posix && !posixly,
+        ere: conf.ere,
+        sandbox: conf.sandbox,
+    }
+}
+
 /// Parse a script and resolve its branches. Split from `parse_script` so the two
 /// failures keep their own exit statuses (see `Fatal`).
 fn compile_script(
     src: &[u8],
-    ere: bool,
-    sandbox: bool,
-    null_data: bool,
     parts: Vec<Part>,
-    mode: Posixicity,
+    fallback: Mode,
+    null_data: bool,
 ) -> Result<Script, Fatal> {
-    let mut script = parse_script(src, ere, null_data, parts, mode, sandbox)?;
+    let mut script = parse_script(src, parts, fallback, null_data)?;
     let labels = std::mem::take(&mut script.labels);
     resolve_labels(&mut script.cmds, &labels)
         .map_err(|msg| Fatal { msg, status: 4, locus: None })?;
@@ -2709,8 +2778,9 @@ fn run(args: &[Vec<u8>]) -> Result<i32, Fatal> {
             .unwrap_or(DEFAULT_LINE_WRAP),
     };
     // Each fragment with where it came from, so a compile error can name the
-    // `-e` NUMBER or the `-f` FILE the way GNU does.
-    let mut script_parts: Vec<(Option<Vec<u8>>, Vec<u8>)> = Vec::new();
+    // `-e` NUMBER or the `-f` FILE the way GNU does, and with the flags in effect
+    // when it was SCANNED, which is what GNU compiles it under.
+    let mut script_parts: Vec<(Option<Vec<u8>>, Vec<u8>, Mode)> = Vec::new();
     // Only the FIRST script part can carry `#n`, and a `-f` one carries it only
     // if its stream can seek. A literal or `-e` part always can.
     let mut hash_n_carries = true;
@@ -2853,9 +2923,9 @@ fn run(args: &[Vec<u8>]) -> Result<i32, Fatal> {
                             if script_parts.is_empty() {
                                 hash_n_carries = seekable;
                             }
-                            script_parts.push((Some(value), text));
+                            script_parts.push((Some(value), text, mode_of(&conf, posixly)));
                         } else {
-                            script_parts.push((None, value));
+                            script_parts.push((None, value, mode_of(&conf, posixly)));
                         }
                         script_given = true;
                     }
@@ -2908,7 +2978,7 @@ fn run(args: &[Vec<u8>]) -> Result<i32, Fatal> {
                     let Some(v) = value_of(&mut j, &mut i) else {
                         return Ok(missing_short_argument(b'e'));
                     };
-                    script_parts.push((None, v));
+                    script_parts.push((None, v, mode_of(&conf, posixly)));
                     script_given = true;
                 }
                 b'f' => {
@@ -2925,7 +2995,7 @@ fn run(args: &[Vec<u8>]) -> Result<i32, Fatal> {
                     if script_parts.is_empty() {
                         hash_n_carries = seekable;
                     }
-                    script_parts.push((Some(v), text));
+                    script_parts.push((Some(v), text, mode_of(&conf, posixly)));
                     script_given = true;
                 }
                 _ => {
@@ -2940,7 +3010,7 @@ fn run(args: &[Vec<u8>]) -> Result<i32, Fatal> {
     let mut operands = operands.into_iter();
     if !script_given {
         match operands.next() {
-            Some(s) => script_parts.push((None, s)),
+            Some(s) => script_parts.push((None, s, mode_of(&conf, posixly))),
             None => {
                 eprintln!("{USAGE}");
                 return Ok(1);
@@ -2952,7 +3022,7 @@ fn run(args: &[Vec<u8>]) -> Result<i32, Fatal> {
     let mut source: Vec<u8> = Vec::new();
     let mut parts: Vec<Part> = Vec::new();
     let mut expr_no = 0usize;
-    for (n, (name, body)) in script_parts.iter().enumerate() {
+    for (n, (name, body, mode)) in script_parts.iter().enumerate() {
         if n > 0 {
             source.push(b'\n');
         }
@@ -2964,7 +3034,7 @@ fn run(args: &[Vec<u8>]) -> Result<i32, Fatal> {
                 Origin::Expression(expr_no)
             }
         };
-        parts.push(Part { end: source.len(), origin });
+        parts.push(Part { end: source.len(), origin, mode: *mode });
     }
     // `#n` is POSIX's in-script spelling of -n, and the rule is about the first
     // two BYTES of the script, not the first line: `#nx` and `#n;p` suppress in
@@ -2981,10 +3051,10 @@ fn run(args: &[Vec<u8>]) -> Result<i32, Fatal> {
     // locus is taken here, while the parts are still in hand, and attached below
     // to whatever exit-1 failure comes back without one.
     let script_end = locus_at(&parts, &source, Spot::Saved(source.len()));
-    // Built now that every option has been seen. GNU's third posixicity level is
-    // the one BOTH other switches leave, and it is deliberately not `!posix`:
-    // the variable and the flag differ elsewhere on purpose.
-    let mode = Posixicity { posix: conf.posix, extended: !conf.posix && !posixly };
+    // The FINAL flags, which is what run time reads and what a bare script
+    // OPERAND was already given: GNU compiles that one after the scan, so unlike
+    // an `-e` it cannot be governed by a flag it precedes.
+    let mode = mode_of(&conf, posixly);
     let separator = separator_for(conf.null_data);
     compile_and_run(conf, mode, &source, parts, files, separator).map_err(|f| {
         match (f.status, &f.locus) {
@@ -2999,14 +3069,13 @@ fn run(args: &[Vec<u8>]) -> Result<i32, Fatal> {
 /// needs (see the caller) outlives every `?` in here.
 fn compile_and_run(
     conf: Conf,
-    mode: Posixicity,
+    mode: Mode,
     source: &[u8],
     parts: Vec<Part>,
     files: Vec<Vec<u8>>,
     separator: u8,
 ) -> Result<i32, Fatal> {
-    let mut script =
-        compile_script(source, conf.ere, conf.sandbox, conf.null_data, parts, mode)?;
+    let mut script = compile_script(source, parts, mode, conf.null_data)?;
     let seed = seed_ranges(&script.cmds);
     let wfiles = std::mem::take(&mut script.wfiles);
     let mut sed = Sed {
@@ -3015,7 +3084,6 @@ fn compile_and_run(
         suppress: conf.suppress,
         separator,
         posix: mode.posix,
-        extended: mode.extended,
         line_wrap: conf.line_wrap,
         pattern: Vec::new(),
         hold: Vec::new(),
@@ -3252,21 +3320,32 @@ impl ScriptFailure {
     }
 }
 
-/// GNU's posixicity as td-txt needs it: TWO questions rather than one flag, and
-/// deliberately not each other's negation. `posix` is `--posix`, which withdraws
-/// extensions; `extended` is GNU's POSIXLY_EXTENDED, which `--posix` and
-/// `POSIXLY_CORRECT` each leave and only the special-file table reads. Threaded
-/// as one value because two adjacent `bool`s of the same shape transpose
-/// silently, and built in exactly one place so no later caller can default it.
-#[derive(Clone, Copy)]
-struct Posixicity {
+/// Every flag a COMPILE reads, as one value. GNU compiles each `-e`/`-f` inside
+/// its own `getopt` loop, so each of these governs the parts scanned AFTER it and
+/// no earlier one; a bare script operand is compiled once the scan is over and
+/// takes the final values, as run time does. Threaded together because five
+/// adjacent `bool`s of the same shape transpose silently, and built in exactly
+/// one place so no later caller can default one.
+///
+/// `posix` and `extended` are deliberately not each other's negation: `posix` is
+/// `--posix`, which withdraws extensions, while `extended` is GNU's
+/// POSIXLY_EXTENDED, the level `--posix` and `POSIXLY_CORRECT` each leave, and
+/// only the special-file table reads it.
+#[derive(Clone, Copy, Debug)]
+struct Mode {
     posix: bool,
     extended: bool,
+    /// `-E`/`-r`.
+    ere: bool,
+    /// `--sandbox`. Read at `r`/`R`/`w`/`W` and the `s///w` flag, BEFORE the
+    /// target is opened, because refusing the command is GNU's answer whether or
+    /// not the file could have been opened.
+    sandbox: bool,
 }
 
 /// One of the three names GNU's `get_openfile` resolves to a STREAM the process
 /// already holds instead of a path it opens (compile.c:81).
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 enum Special {
     In,
     Out,
@@ -3301,6 +3380,36 @@ fn special(path: &[u8], extended: bool) -> Option<Special> {
         b"/dev/stdout" => Some(Special::Out),
         b"/dev/stderr" => Some(Special::Err),
         _ => None,
+    }
+}
+
+/// A `w`/`R` target as the COMPILE resolved it, which is what the command then
+/// carries. Not the name alone, for two reasons that are really one. The table is
+/// consulted under the posixicity of the PART naming the target, so re-asking it
+/// at run time — where only the final flags survive — can answer differently for
+/// the very command that asked. And two parts may name one path and mean
+/// different things: GNU returns the special stream from a STATIC entry that sits
+/// OUTSIDE the by-name list `get_openfile` dedups in (compile.c:398), so an
+/// extended `/dev/stdout` and a `--posix` one are two targets, and this is the
+/// key that keeps them apart.
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]
+struct FileTarget {
+    special: Option<Special>,
+    path: Vec<u8>,
+}
+
+impl FileTarget {
+    fn resolve(path: &[u8], extended: bool) -> Self {
+        Self { special: special(path, extended), path: path.to_vec() }
+    }
+
+    /// What a diagnostic calls it: the STREAM's registered name for a special
+    /// one, and the name the script spelled for everything else.
+    fn name(&self) -> &[u8] {
+        match self.special {
+            Some(s) => s.name().as_bytes(),
+            None => &self.path,
+        }
     }
 }
 
@@ -3341,12 +3450,12 @@ fn read_error(name: &[u8], e: &std::io::Error) -> Vec<u8> {
 /// `POSIXLY_CORRECT` and not through `--posix`, which withdraws `R` itself — so
 /// under the variable this opens the NAME again, hang and all, exactly as GNU
 /// does there.
-fn read_r_source(path: &[u8], extended: bool) -> Result<(Vec<u8>, bool), Vec<u8>> {
-    let Some(s) = special(path, extended) else {
-        return read_source(path);
+fn read_r_source(target: &FileTarget) -> Result<(Vec<u8>, bool), Vec<u8>> {
+    let Some(s) = target.special else {
+        return read_source(&target.path);
     };
     let Special::In = s else {
-        return Err(read_error(s.name().as_bytes(), &ebadf()));
+        return Err(read_error(target.name(), &ebadf()));
     };
     // The descriptor we were GIVEN, rather than the name opened a second time.
     // Where standard input is a fifo whose writer has gone, fd 0 is at end of file
@@ -3612,16 +3721,16 @@ impl Sed {
     /// Take `R`'s next line from `path` and queue the bytes. GNU reads it when the
     /// command runs, not when the queue is flushed, so `R` over a directory fails
     /// BEFORE the cycle prints while `r` over one fails after.
-    fn queue_line(&mut self, path: &[u8]) -> Result<(), Vec<u8>> {
+    fn queue_line(&mut self, target: &FileTarget) -> Result<(), Vec<u8>> {
         let separator = self.separator;
-        let entry = match self.rfiles.get_mut(path) {
+        let entry = match self.rfiles.get_mut(target) {
             Some(e) => e,
             None => {
                 // A missing file is not an error for `R`: cache it as exhausted so it
                 // is opened at most once.
-                let (data, rewindable) = read_r_source(path, self.extended)?;
+                let (data, rewindable) = read_r_source(target)?;
                 let lines = to_lines(&data, separator);
-                self.rfiles.entry(path.to_vec()).or_insert(RFile { lines, pos: 0, rewindable })
+                self.rfiles.entry(target.clone()).or_insert(RFile { lines, pos: 0, rewindable })
             }
         };
         let RFile { lines, pos, .. } = entry;
@@ -3678,7 +3787,7 @@ impl Sed {
 
     fn write_to_file(
         &mut self,
-        path: &[u8],
+        target: &FileTarget,
         bytes: &[u8],
         terminated: bool,
         sink: &mut Sink,
@@ -3687,15 +3796,20 @@ impl Sed {
         // in one script interleave wrongly. Under `-i` that sink is the replacement
         // buffer, and GNU still writes to the real standard output — so there it is
         // an ordinary target with a debt of its own, like every other one.
-        if matches!(special(path, self.extended), Some(Special::Out)) && !self.in_place {
+        //
+        // Asked of the target the COMPILE resolved rather than re-derived from the
+        // final flags: the table is read under the posixicity of the part naming
+        // it, so `-e 'w /dev/stdout' --posix` aliases and re-deriving here would
+        // decide the opposite, giving one `w` two answers.
+        if matches!(self.wfiles.get(target).map(|w| &w.dest), Some(WDest::Stdout)) && !self.in_place {
             return sink.write_line_on(Chan::WFile, bytes, terminated);
         }
         let separator = self.separator;
         // Every target was opened by the parser, so a miss is a command whose name
         // never reached `open_wfile` — not a filesystem failure, and saying so
         // would send the reader to the one place that is working.
-        let Some(w) = self.wfiles.get_mut(path) else {
-            return Err(crate::util::name_in("no output was opened for ", path, ""));
+        let Some(w) = self.wfiles.get_mut(target) else {
+            return Err(crate::util::name_in("no output was opened for ", &target.path, ""));
         };
         w.write_line(bytes, terminated, separator)
     }
@@ -3953,10 +4067,10 @@ impl Sed {
                             let (pattern, terminated) = (self.pattern.clone(), self.terminated);
                             self.emit(sink, &pattern, terminated)?;
                         }
-                        if let Some(path) = wfile {
+                        if let Some(target) = wfile {
                             let pattern = self.pattern.clone();
                             let terminated = self.terminated;
-                            self.write_to_file(&path, &pattern, terminated, sink)?;
+                            self.write_to_file(&target, &pattern, terminated, sink)?;
                         }
                     }
                 }
@@ -4054,8 +4168,15 @@ impl Sed {
 mod tests {
     use super::*;
 
-    /// What every test here compiles under: no `--posix`, no `POSIXLY_CORRECT`.
-    const EXTENDED: Posixicity = Posixicity { posix: false, extended: true };
+    /// What every test here compiles under: no `--posix`, no `POSIXLY_CORRECT`,
+    /// and none of the three compile flags a part can carry.
+    const EXTENDED: Mode =
+        Mode { posix: false, extended: true, ere: false, sandbox: false };
+
+    /// `EXTENDED` with the one flag a test varies.
+    fn mode_with(ere: bool) -> Mode {
+        Mode { ere, ..EXTENDED }
+    }
 
     /// Run a script over `input` and return what it wrote.
     fn sed(script: &str, input: &str, opts: &[&str]) -> Vec<u8> {
@@ -4063,7 +4184,7 @@ mod tests {
         let null_data = opts.contains(&"-z");
         let sep = separator_for(null_data);
         let mut script =
-            compile_script(script.as_bytes(), ere, false, null_data, Vec::new(), EXTENDED).unwrap();
+            compile_script(script.as_bytes(), Vec::new(), mode_with(ere), null_data).unwrap();
         let nranges = script.cmds.len();
         let seed = seed_ranges(&script.cmds);
         let wfiles = std::mem::take(&mut script.wfiles);
@@ -4073,7 +4194,6 @@ mod tests {
             suppress: opts.contains(&"-n"),
             separator: sep,
             posix: false,
-            extended: true,
             line_wrap: DEFAULT_LINE_WRAP,
             pattern: Vec::new(),
             hold: Vec::new(),
@@ -4402,7 +4522,7 @@ mod tests {
             (b"y/a\n/xy/", "unterminated `y' command"),
             (b"/a\nb/p", "unterminated address regex"),
         ] {
-            let err = compile_script(script, false, false, false, Vec::new(), EXTENDED).err();
+            let err = compile_script(script, Vec::new(), EXTENDED, false).err();
             assert_eq!(
                 err.map(|f| f.msg),
                 Some(msg.as_bytes().to_vec()),
@@ -4430,13 +4550,13 @@ mod tests {
         // closer overlapping it is missed and the parity shows.
         // An even name-length CLOSES, and is then rejected for its name.
         assert_eq!(
-            compile_script(b"s/[[....]]/X/", false, false, false, Vec::new(), EXTENDED)
+            compile_script(b"s/[[....]]/X/", Vec::new(), EXTENDED, false)
                 .err()
                 .map(|f| f.msg),
             Some(b"Invalid collation character".to_vec())
         );
         for script in [&b"s/[[...]]/X/"[..], b"s/[[.....]]/X/", b"s/[[:::]]/X/", b"s/[[===]]/X/"] {
-            let err = compile_script(script, false, false, false, Vec::new(), EXTENDED).err();
+            let err = compile_script(script, Vec::new(), EXTENDED, false).err();
             assert_eq!(
                 err.map(|f| f.msg),
                 Some(b"unterminated `s' command".to_vec()),
@@ -4447,7 +4567,7 @@ mod tests {
         // The closer must be the character that opened it, so these run off the
         // end of the script rather than closing a set.
         for script in [&b"s/[[:alpha:]/X/"[..], b"s/[[:alpha.]]/X/", b"s/[[:]]/X/"] {
-            let err = compile_script(script, false, false, false, Vec::new(), EXTENDED).err();
+            let err = compile_script(script, Vec::new(), EXTENDED, false).err();
             assert_eq!(
                 err.map(|f| f.msg),
                 Some(b"unterminated `s' command".to_vec()),
@@ -4461,10 +4581,10 @@ mod tests {
     /// exits 4, alone among pattern errors.
     #[test]
     fn the_bare_class_syntax_refusal_is_exit_4_where_other_pattern_errors_are_1() {
-        let f = compile_script(b"s@[:alpha:]@X@", false, false, false, Vec::new(), EXTENDED).err();
+        let f = compile_script(b"s@[:alpha:]@X@", Vec::new(), EXTENDED, false).err();
         assert_eq!(f.as_ref().map(|f| f.status), Some(4));
         assert_eq!(f.map(|f| f.msg), Some(crate::regex::CLASS_SYNTAX.as_bytes().to_vec()));
-        let f = compile_script(b"s@[[:a:]]@X@", false, false, false, Vec::new(), EXTENDED).err();
+        let f = compile_script(b"s@[[:a:]]@X@", Vec::new(), EXTENDED, false).err();
         assert_eq!(f.map(|f| f.status), Some(1));
     }
 
@@ -4473,11 +4593,11 @@ mod tests {
         // A bad script is status 1; an unresolvable branch is a RUNTIME error,
         // which GNU reports as 4.
         for bad in [&b"k"[..], b"s/a/b", b"{p"] {
-            let err = compile_script(bad, false, false, false, Vec::new(), EXTENDED).err().map(|f| f.status);
+            let err = compile_script(bad, Vec::new(), EXTENDED, false).err().map(|f| f.status);
             assert_eq!(err, Some(1), "{:?} must be a status-1 script error", bad);
         }
         assert_eq!(
-            compile_script(b"bnowhere", false, false, false, Vec::new(), EXTENDED).err().map(|f| f.status),
+            compile_script(b"bnowhere", Vec::new(), EXTENDED, false).err().map(|f| f.status),
             Some(4)
         );
     }
@@ -4492,10 +4612,10 @@ mod tests {
             let mut parts: Vec<Part> = ends
                 .iter()
                 .enumerate()
-                .map(|(i, e)| Part { end: *e, origin: Origin::Expression(i + 1) })
+                .map(|(i, e)| Part { end: *e, origin: Origin::Expression(i + 1), mode: EXTENDED })
                 .collect();
-            parts.push(Part { end: src.len(), origin: Origin::Expression(parts.len() + 1) });
-            compile_script(src, false, false, false, parts, EXTENDED).err().map(|f| f.status)
+            parts.push(Part { end: src.len(), origin: Origin::Expression(parts.len() + 1), mode: EXTENDED });
+            compile_script(src, parts, EXTENDED, false).err().map(|f| f.status)
         };
         // `sed a` and `sed -e a -e p`: nothing after the command in its own part.
         assert_eq!(compile(b"a", Vec::new()), Some(1));
@@ -4516,9 +4636,9 @@ mod tests {
         // `sed -e p -f s.sed -e d` with `s.sed` holding `q\nZ`.
         let src = b"p\nq\nZ\nd";
         let parts = vec![
-            Part { end: 1, origin: Origin::Expression(1) },
-            Part { end: 5, origin: Origin::File(b"s.sed".to_vec()) },
-            Part { end: 7, origin: Origin::Expression(2) },
+            Part { end: 1, origin: Origin::Expression(1), mode: EXTENDED },
+            Part { end: 5, origin: Origin::File(b"s.sed".to_vec()), mode: EXTENDED },
+            Part { end: 7, origin: Origin::Expression(2), mode: EXTENDED },
         ];
         let want = [
             "-e expression #1, char 0", // 0: `p'
@@ -4551,7 +4671,7 @@ mod tests {
         // The NAME goes out as GNU's `%s` writes it. No case can say so: a
         // corpus file's name is read as text, so a non-UTF-8 one cannot be
         // asked for -- and a name that IS UTF-8 renders alike either way.
-        let raw = vec![Part { end: 1, origin: Origin::File(b"h\xffi.sed".to_vec()) }];
+        let raw = vec![Part { end: 1, origin: Origin::File(b"h\xffi.sed".to_vec()), mode: EXTENDED }];
         assert_eq!(
             locus_at(&raw, b"Z", Spot::Read(0)).as_deref(),
             Some(&b"file h\xffi.sed line 1"[..])

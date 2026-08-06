@@ -974,17 +974,18 @@ td-txt-authored case files
   early draft said the flag never changes an answer here; a later one said
   every answer it does change is modelled. Both were the same mistake, which is
   reaching for a tidy summary of a flag that has no tidy summary. What is true
-  as measured: FIVE answer-changing rules are modelled (the entry below names
-  four, and `N` at end of input is the fifth -- `sed --posix N` on a one-line
-  file prints nothing where the default prints the line) and at least one is
-  NOT -- `--posix` stops GNU aliasing `/dev/stdout` to its own stdout and opens
-  it as an ordinary, separately buffered file, so
-  `sed --posix -n 'p;w /dev/stdout'` over three lines prints them grouped
-  `1 2 3 1 2 3` in GNU and interleaved `1 1 2 2 3 3` here. An xfail case
-  carries GNU's golden. An earlier draft said there could be no case because
-  the harness captures stdout -- but it captures it through a PIPE, which is
-  exactly the condition the divergence needs, so the rationale was wrong and
-  the case was writable all along. A reviewer read the harness and checked.
+  as measured: SIX answer-changing rules are modelled. The entry below names
+  four; `N` at end of input is the fifth (`sed --posix N` on a one-line file
+  prints nothing where the default prints the line); and the sixth is the one
+  this paragraph twice named as the exception. `--posix` stops GNU aliasing
+  `/dev/stdout` to its own stdout and opens it as an ordinary, separately
+  buffered file, so `sed --posix -n 'p;w /dev/stdout'` over three lines prints
+  them grouped `1 2 3 1 2 3` rather than interleaved -- which landed with the
+  special-file table, and whose case PASSES. So the paragraph has now been
+  caught out a THIRD time, by its own example rather than by a new one, and
+  the count above is deliberately a count of what the CORPUS asserts rather
+  than a claim about the flag. What remains under it is `-u`, which is a gap
+  of its own (below) and not a `--posix` rule at all.
 
   - `--posix`: its REGEX half is implemented, in both halves of what that
     means -- the GNU operator extensions the compiler drops (`\|`, `\+`, `\?`,
@@ -1230,16 +1231,50 @@ td-txt-authored case files
     opens. Fixing it is a streaming reader, as the `grep` entry below says of its
     own, plus somewhere to keep the handle across cycles and a `rewind` for `-s`.
 
-  - `--posix` AFTER the `-e` it would govern reaches it here and does not in
-    GNU, which compiles each `-e` inside its own getopt loop: `sed -n -e '1~2p'
-    --posix h` prints `a c` in GNU and is `unknown command: '~'` here, while the
-    same flag FIRST refuses in both. td-txt settles every option before it
-    compiles anything, so the flag is retroactive. Pre-existing and not specific
-    to any one rule -- it reaches every behaviour `--posix` changes, the
-    special-file table above included (`… -e 'w /dev/stdout' --posix` groups
-    here and interleaves in GNU). Recorded when a review found the table's cell
-    of it; closing it wants the compile split across the option scan, which is a
-    landing of its own and not a rule to add.
+  - A COMPILE-TIME flag is POSITIONAL, and used not to be here. GNU compiles each
+    `-e`/`-f` inside its own getopt loop, so such a flag governs the parts scanned
+    after it and no earlier one; td-txt settled every option first and applied
+    them all retroactively. THREE flags reach a compile: `--posix` withdraws
+    extensions (`sed -n -e '1~2p' --posix h` prints `a c`, where the same flag
+    FIRST refuses), `-E`/`-r` picks the regex grammar (`-e 's/a+/X/p' -E` matches
+    nothing, the part being a BRE, and `-r` is sharper still -- `-e
+    's/(a)/[\1]/p' -r` is `invalid reference \1`), and `--sandbox` refuses
+    `e`/`r`/`w` (`-e 'w out' --sandbox` writes the file). They are INDEPENDENT:
+    `--posix` does not withdraw an earlier `-E`, nor buy back an extension. A
+    bare script OPERAND is not in the class, since GNU compiles it once the scan
+    is over, so it takes the final values as run time does; `-n`/`-s`/`-i` are
+    run-time and order-independent in both, and `-l` is read when `l` RUNS
+    (above), which is this rule seen from the other side. Each part now carries
+    the flags it was SCANNED with, keyed on where a COMMAND starts rather than on
+    where the parser stands -- by the time an `s///` is read the parser is at the
+    command's end, which for a part's last command is the boundary, so `pos`
+    would consult the NEXT part's flags. The ONE construct whose parse crosses a
+    boundary is `a`/`i`/`c` text, and it asks a different question: GNU refuses a
+    dangling one at the end of EVERY part under THAT part's posixicity
+    (compile.c:1369), so `-e 'a\' --posix -e 'x\' -e 'y'` is `incomplete
+    command` even though the `a` began where the flag was not set.
+
+  - The `v` COMMAND is an input to that same state, and not a flag at all: GNU's
+    `case 'v'` sets `posixicity = POSIXLY_EXTENDED` (compile.c:1079) for the rest
+    of the compile, across later parts. So `POSIXLY_CORRECT=1 sed -n -e v -e p -e
+    'w /dev/stdout' h` aliases in GNU (`1 1 2 2 3 3`) and does not here
+    (`1 2 3 1 2 3`). Pre-existing and unchanged by the positional landing above,
+    which is why it is its own entry: that one made a flag's position matter,
+    while this wants a compile whose mode can be PROMOTED partway through by
+    something in the script. `--posix` masks it, since `v` is refused outright
+    under the flag, so only the POSIXLY_CORRECT half is reachable.
+
+  - `-z` LOOKS like a fourth member of that class and is a HYBRID, which is what
+    an attempt to add it turned up. GNU reads the record separator when it
+    compiles (`regexp.c:101`, which is what `M` bakes in) and AGAIN in
+    `match_regexp`, and for a pattern that is only `^` or `$` the run-time read
+    is what anchors it. td-txt models the run-time half -- `sed -e 's/^/>/Mg' -z`
+    over `a\nb\0` is `>a\nb\0` in both, where a part-scoped answer would give
+    `>a\n>b\0` -- and not the compile half: `sed -n -e '/a$/Mp' -z` prints in GNU
+    and not here, which is an xfail carrying GNU's golden. Modelling both wants
+    the separator threaded to the matcher as well as to the compiler, which is a
+    landing of its own; a part-scoped `-z` alone is a REGRESSION, since the
+    patterns it gets wrong are the ones `M` is most used with.
 
   - `-u` is accepted and IGNORED, which is content-neutral for one stream and
     stopped being so once two of them share a descriptor. GNU's `-u` flushes
