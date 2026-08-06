@@ -1368,3 +1368,179 @@ fn a_special_stream_refuses_by_direction_not_by_descriptor(
     );
     Ok(())
 }
+
+/// A seekable standard input is left positioned after the last record sed
+/// CONSUMED, not at end of file: POSIX's "shall not consume more input than it
+/// needs", and what makes `{ sed 1q; cat; } < f` — read a header, hand the rest
+/// to another program — the working idiom it is meant to be.
+///
+/// The corpus cannot say this. Its harness gives every child a PIPE, which is
+/// exactly the case where there is nothing to give back and both sed and GNU
+/// leave nothing, so the divergence is invisible there. This needs a REGULAR
+/// file on descriptor 0 and a second descriptor onto the same file DESCRIPTION
+/// to read what the child left behind — `try_clone` rather than a second
+/// `File::open`, which would be an independent offset that could not observe the
+/// child at all.
+#[test]
+fn sed_leaves_a_seekable_stdin_after_the_last_record_it_read(
+) -> Result<(), Box<dyn std::error::Error>> {
+    use std::io::Read;
+
+    let dir = TempDir::new("sed-stdin-offset")?;
+    std::fs::write(dir.0.join("four"), b"l1\nl2\nl3\nl4\n")?;
+    // A last record with no separator: the accounting must count the bytes of a
+    // record, not one separator per record, or this one is off by one.
+    std::fs::write(dir.0.join("unterm"), b"u1\nu2\nu3")?;
+    // `-z` makes the separator a NUL, so a row that counted `\n` would be wrong
+    // by one per record here and right everywhere else.
+    std::fs::write(dir.0.join("zrec"), b"z1\0z2\0z3\0")?;
+    std::fs::write(dir.0.join("zunterm"), b"z1\0z2\0z3")?;
+    // A named operand to pair stdin with, for the multi-operand rows.
+    std::fs::write(dir.0.join("one"), b"ONE\n")?;
+
+    let rest_after = |file: &str, args: &[&str]| -> Result<(Vec<u8>, Vec<u8>, Option<i32>), Box<dyn std::error::Error>> {
+        let given = std::fs::File::open(dir.0.join(file))?;
+        let mut mine = given.try_clone()?;
+        let out = std::process::Command::new(bin())
+            .arg("sed")
+            .args(args)
+            .current_dir(&dir.0)
+            .stdin(std::process::Stdio::from(given))
+            .output()?;
+        let mut rest = Vec::new();
+        mine.read_to_end(&mut rest)?;
+        Ok((out.stdout, rest, out.status.code()))
+    };
+
+    // Each row is GNU sed 4.9's own answer, taken by running it the same way.
+    let rows: &[(&str, &[&str], &[u8], &[u8])] = &[
+        ("four", &["-n", "1q"], b"", b"l2\nl3\nl4\n"),
+        ("four", &["-n", "3q"], b"", b"l4\n"),
+        ("four", &["-n", "2Q"], b"", b"l3\nl4\n"),
+        ("four", &["-n", "-e", "1{p;q}"], b"l1\n", b"l2\nl3\nl4\n"),
+        // `N` consumes two records for one cycle, so what is owed back is not a
+        // function of the cycle count.
+        ("four", &["-n", "-e", "N;q"], b"", b"l3\nl4\n"),
+        // `-s` reaches the input through a different construction of the same
+        // stream, and must account for it the same way.
+        ("four", &["-s", "-n", "1q"], b"", b"l2\nl3\nl4\n"),
+        ("unterm", &["-n", "2q"], b"", b"u3"),
+        // `-z`: the separator counted per record is the one in force, not `\n`.
+        ("zrec", &["-n", "-z", "1q"], b"", b"z2\0z3\0"),
+        ("zunterm", &["-n", "-z", "1q"], b"", b"z2\0z3"),
+        // The `$` LOOKAHEAD is the third code path that can set the count, and
+        // the only one where stdin is opened mid-cycle rather than by the reader:
+        // `$!` on the last line of `one` opens `-`, reads it whole, and the `q`
+        // then owes ALL of it back.
+        ("four", &["-n", "-e", "1{$!p}", "-e", "1q", "one", "-"], b"ONE\n", b"l1\nl2\nl3\nl4\n"),
+        // Multiple operands: only the OPEN one can owe anything, so which side
+        // stdin is on decides how much.
+        ("four", &["-n", "2q", "-", "one"], b"", b"l3\nl4\n"),
+        ("four", &["-n", "2q", "one", "-"], b"", b"l2\nl3\nl4\n"),
+        // Two dashes: the second open reads 0 bytes at end of file and must not
+        // overwrite what the first one is owed.
+        ("four", &["-n", "2q", "-", "-"], b"", b"l3\nl4\n"),
+        // The controls. A script that reads to the end leaves nothing, which is
+        // what says the rewind is not unconditional; and no `q` at all is the
+        // same.
+        ("four", &["-n", "$q"], b"", b""),
+        ("four", &["-n", "p"], b"l1\nl2\nl3\nl4\n", b""),
+    ];
+    for (file, args, want_out, want_rest) in rows {
+        let (stdout, rest, code) = rest_after(file, args)?;
+        assert_eq!(code, Some(0), "{args:?} over {file}");
+        assert_eq!(stdout, want_out.to_vec(), "{args:?} over {file}: stdout");
+        assert_eq!(
+            rest,
+            want_rest.to_vec(),
+            "{args:?} over {file}: what was left on descriptor 0"
+        );
+    }
+
+    // A PIPE has nothing to give back, and asking must not be an error: the
+    // give-back declines on anything but a regular file rather than failing.
+    // stderr is PIPED, or the assertion below would inspect an empty buffer and
+    // pass however loudly the child complained.
+    let mut child = std::process::Command::new(bin())
+        .args(["sed", "-n", "1q"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()?;
+    {
+        use std::io::Write;
+        let mut w = child.stdin.take().ok_or("the child was given no stdin pipe")?;
+        // Propagated: a write that never arrived would leave the child reading an
+        // empty stream, where the give-back has nothing to decline in the first
+        // place and the test would prove nothing.
+        w.write_all(b"p1\np2\np3\n")?;
+    }
+    let piped = child.wait_with_output()?;
+    assert_eq!(piped.status.code(), Some(0), "a pipe made the give-back fail");
+    assert_eq!(piped.stderr, b"".to_vec(), "{piped:?}");
+    Ok(())
+}
+
+/// The give-back survives a run that DIES: GNU leaves standard input after the
+/// records it consumed even when it exits 4, so `sed -e '1r .'` — which reads one
+/// record and then fails on a directory — must still hand the rest back. Held
+/// separately from the rows above because it is the one case where the run's
+/// result and the repositioning are both errors, and the run's is the one that
+/// must be reported.
+#[test]
+fn a_run_that_dies_still_gives_back_what_it_did_not_read(
+) -> Result<(), Box<dyn std::error::Error>> {
+    use std::io::Read;
+
+    let dir = TempDir::new("sed-stdin-offset-fatal")?;
+    std::fs::write(dir.0.join("four"), b"l1\nl2\nl3\nl4\n")?;
+    // Each row is GNU sed 4.9's own answer, all four parts of it. Both paths
+    // reach the input through their own construction of the stream, so both have
+    // to hold the run's result rather than propagate it; and the two exit codes
+    // are different failure KINDS, a read that died at 4 and a script that could
+    // not run at 1.
+    let rows: &[(&[&str], i32, &[u8], &[u8], &[u8])] = &[
+        (
+            &["sed", "-e", "1r ."],
+            4,
+            b"l1\n",
+            b"sed: read error on .: Is a directory\n",
+            b"l2\nl3\nl4\n",
+        ),
+        (
+            &["sed", "-s", "-e", "1r ."],
+            4,
+            b"l1\n",
+            b"sed: read error on .: Is a directory\n",
+            b"l2\nl3\nl4\n",
+        ),
+        (
+            &["sed", "-n", "2s//X/"],
+            1,
+            b"",
+            b"sed: -e expression #1, char 0: no previous regular expression\n",
+            b"l3\nl4\n",
+        ),
+    ];
+    for (args, status, want_out, want_err, want_rest) in rows {
+        let given = std::fs::File::open(dir.0.join("four"))?;
+        let mut mine = given.try_clone()?;
+        let out = std::process::Command::new(bin())
+            .args(*args)
+            .current_dir(&dir.0)
+            .stdin(std::process::Stdio::from(given))
+            .output()?;
+        let mut rest = Vec::new();
+        mine.read_to_end(&mut rest)?;
+
+        assert_eq!(out.status.code(), Some(*status), "{args:?}: {out:?}");
+        assert_eq!(out.stdout, want_out.to_vec(), "{args:?}: {out:?}");
+        assert_eq!(out.stderr, want_err.to_vec(), "{args:?}: {out:?}");
+        assert_eq!(
+            rest,
+            want_rest.to_vec(),
+            "{args:?}: a run that died left descriptor 0 at end of file"
+        );
+    }
+    Ok(())
+}

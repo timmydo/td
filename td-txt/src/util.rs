@@ -2,7 +2,8 @@
 //! buffered stdout that treats a closed pipe as "stop", not as a hard error.
 
 use std::ffi::OsString;
-use std::io::{IsTerminal, Read, Write};
+use std::io::{IsTerminal, Read, Seek, Write};
+use std::os::fd::AsFd;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
 
@@ -116,6 +117,13 @@ impl Input {
         None
     }
 
+    /// Whether the bytes came off descriptor 0, which decides whether a caller
+    /// that over-read may hand the surplus back. Asked of the OPEN input rather
+    /// than by re-deciding what `-` meant, as `error_name` is.
+    pub fn is_stdin(&self) -> bool {
+        matches!(self, Self::Stdin)
+    }
+
     /// How a READ failure names this input. GNU registers the standard input STREAM
     /// under the name `stdin` and reports read errors against that, where the same
     /// operand is `-` to `F` and to the `can't read` warning -- so
@@ -153,6 +161,47 @@ impl Input {
             Err(err) => Err((err, buf)),
         }
     }
+}
+
+/// Hand back to descriptor 0 what was read from it and never used, so the next
+/// reader of that file description starts where this applet stopped instead of at
+/// end of file. It is POSIX's "shall not consume more input than it needs", and
+/// what makes `{ sed 1q; cat; } < f` the usable idiom it is meant to be.
+///
+/// A REGULAR file only: a descriptor can answer a position query and still refuse
+/// a negative seek, and the other common stdin -- a pipe -- has nowhere to put
+/// what it was given back. Nothing is lost by declining, since not seeking is
+/// exactly the behaviour that stands today.
+///
+/// The seek is RELATIVE, so a process that SHARES this description and moves the
+/// offset first sends it somewhere else entirely. That is inherent to reading more
+/// than is needed and returning the rest, bash and GNU sed included.
+///
+/// The dup is what keeps this in safe code: `Stdin` exposes no seek, while an
+/// `OwnedFd` cloned from it shares the DESCRIPTION, so seeking the clone is what
+/// moves descriptor 0. Dropping the clone closes only the clone.
+pub fn give_back_stdin(unread: u64) -> std::io::Result<()> {
+    if unread == 0 {
+        return Ok(());
+    }
+    // A dup needs a free descriptor, and `w` targets are still open here, so this
+    // can fail with EMFILE on a run that otherwise SUCCEEDED. That is the process
+    // fd table being full and says nothing about descriptor 0 -- and failing the
+    // run would not recover the offset it could not reach -- so it DECLINES, as
+    // the non-regular case does. What stays fatal is the seek, which is the call
+    // that does say something about the descriptor.
+    let Ok(dup) = std::io::stdin().as_fd().try_clone_to_owned() else {
+        return Ok(());
+    };
+    let mut file = std::fs::File::from(dup);
+    if !file.metadata()?.is_file() {
+        return Ok(());
+    }
+    let back = i64::try_from(unread).map_err(|_| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "read past what a seek can undo")
+    })?;
+    file.seek(std::io::SeekFrom::Current(-back))?;
+    Ok(())
 }
 
 /// Read a whole input, or stdin for `-`, for a caller the two failures read alike

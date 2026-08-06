@@ -1729,6 +1729,11 @@ struct Stream {
     /// The diagnostic is printed where it happens, ahead of the buffered output,
     /// so it lands beside the other operand diagnostics as GNU's does.
     fatal: bool,
+    /// How many bytes the OPEN operand took from standard input, or `None` where
+    /// it is a named file. Only the open one can matter: `advance` reaches for the
+    /// next operand only once the current one is spent, so every earlier one was
+    /// consumed whole by construction.
+    stdin_read: Option<usize>,
 }
 
 /// Who is opening the next operand. It decides only what a READ failure means:
@@ -1744,8 +1749,10 @@ enum Opener {
 }
 
 impl Stream {
-    /// One operand's worth of already-read data, for the `-s`/`-i` path.
-    fn of(path: &[u8], data: &[u8], separator: u8) -> Self {
+    /// One operand's worth of already-read data, for the `-s`/`-i` path. That
+    /// caller does its own open, so it is the one that knows whether the bytes
+    /// came from standard input.
+    fn of(path: &[u8], data: &[u8], separator: u8, stdin_read: Option<usize>) -> Self {
         Self {
             pending: Vec::new().into_iter(),
             separator,
@@ -1754,6 +1761,7 @@ impl Stream {
             pos: 0,
             bad: false,
             fatal: false,
+            stdin_read,
         }
     }
 
@@ -1768,6 +1776,7 @@ impl Stream {
             pos: 0,
             bad: false,
             fatal: false,
+            stdin_read: None,
         }
     }
 
@@ -1786,6 +1795,7 @@ impl Stream {
             match Input::open(&self.name, true) {
                 Ok(mut input) => match input.read_all() {
                     Ok(data) => {
+                        self.stdin_read = input.is_stdin().then_some(data.len());
                         self.lines = to_lines(&data, self.separator);
                         self.pos = 0;
                     }
@@ -1818,6 +1828,24 @@ impl Stream {
     /// line came from. Those differ exactly when a `$` has looked ahead.
     fn current_name(&self) -> &[u8] {
         &self.name
+    }
+
+    /// Bytes taken from standard input and never handed out as a record, which is
+    /// what a `q` leaves behind. `records` partitions the buffer exactly -- every
+    /// byte is in some record or is the separator its `terminated` flag counts --
+    /// so subtracting what was delivered is the whole of what was over-read.
+    fn stdin_unconsumed(&self) -> Option<u64> {
+        let total = self.stdin_read?;
+        // `take` rather than a slice: `pos` never exceeds `lines.len()`, so a
+        // fallible slice would only add a `None` that means "accounting
+        // impossible" to a return whose `None` already means "no stdin".
+        let delivered: usize = self
+            .lines
+            .iter()
+            .take(self.pos)
+            .map(|l| l.text.len().saturating_add(usize::from(l.terminated)))
+            .sum();
+        Some((total as u64).saturating_sub(delivered as u64))
     }
 
     /// The next line, or `None` at end of input. WHO is asking decides what an
@@ -3189,7 +3217,8 @@ fn compile_and_run(
                     return Ok(4);
                 }
             };
-            let mut stream = to_stream(path, &data, separator);
+            let mut stream =
+                Stream::of(path, &data, separator, input.is_stdin().then_some(data.len()));
             // Line numbers, range state, the HOLD SPACE and every REWINDABLE `R`
             // read position restart per file under -s / -i. The output streams and
             // their owed separators do not: those belong to the whole run. GNU
@@ -3207,13 +3236,24 @@ fn compile_and_run(
                 }
             }
             let quit = match &conf.in_place {
+                // No give-back here, and none needed: `-i` opened this operand as
+                // a NAME (`dash_is_stdin` false above), so it cannot be standard
+                // input and nothing is ever owed back.
                 Some(suffix) => {
                     let mut buf = Sink::buffer(separator);
                     let quit = sed.run_stream(&mut stream, &mut buf).map_err(Fatal::runtime_msg)?;
                     write_in_place(path, suffix, &buf.into_buffer())?;
                     quit
                 }
-                _ => sed.run_stream(&mut stream, &mut sink).map_err(Fatal::runtime_msg)?,
+                // Held rather than propagated, for the reason the other path
+                // holds it: a run that DIES still owes back what it did not read.
+                _ => {
+                    let ran = sed.run_stream(&mut stream, &mut sink);
+                    let back = give_back(&stream);
+                    let quit = ran.map_err(Fatal::runtime_msg)?;
+                    back?;
+                    quit
+                }
             };
             if let Some(code) = quit {
                 sink.flush().map_err(Fatal::runtime_msg)?;
@@ -3236,7 +3276,16 @@ fn compile_and_run(
         // already quit before, and reported them as SUCCESS.
         let mut stream = Stream::of_operands(inputs, separator);
         let mut sink = Sink::stdout(&mut out, separator);
-        let quit = sed.run_stream(&mut stream, &mut sink).map_err(Fatal::runtime_msg)?;
+        // Held rather than propagated, because the give-back has to happen
+        // whatever the run did: GNU leaves the offset after the records it
+        // consumed even when it DIES, so `sed -e '1r .' < four` exits 4 having
+        // read one record and leaves the other three. The run's own error still
+        // outranks a failure to reposition -- that is the one that says what
+        // went wrong.
+        let ran = sed.run_stream(&mut stream, &mut sink);
+        let back = give_back(&stream);
+        let quit = ran.map_err(Fatal::runtime_msg)?;
+        back?;
         // A read that failed outranks everything else, including a `bad` operand
         // opened earlier: GNU's reader panics there, so nothing after it happened.
         // The flush is for its ERROR — what was written survives either way, since
@@ -3575,8 +3624,21 @@ fn to_lines(data: &[u8], separator: u8) -> Vec<Line> {
         .collect()
 }
 
-fn to_stream(path: &[u8], data: &[u8], separator: u8) -> Stream {
-    Stream::of(path, data, separator)
+/// Return what a `q` over-read from standard input, at the ONE point on each path
+/// where the run is over and the stream still knows how far it got -- ahead of
+/// every exit, so they cannot disagree about where descriptor 0 was left.
+///
+/// A failure here is fatal rather than swallowed, as every other runtime I/O
+/// failure in this applet is. It says the offset was NOT restored, which is
+/// otherwise invisible until some later program reads the wrong bytes; and with
+/// the nothing-to-return case answered before any syscall is made, what is left
+/// to fail is the descriptor itself.
+fn give_back(stream: &Stream) -> Result<(), Fatal> {
+    let Some(unread) = stream.stdin_unconsumed() else {
+        return Ok(());
+    };
+    crate::util::give_back_stdin(unread)
+        .map_err(|e| Fatal::runtime(format!("can't reposition stdin: {}", errmsg(&e))))
 }
 
 /// The backup name for `-i SUFFIX`: the suffix appended, or — GNU's other form —
@@ -4238,7 +4300,7 @@ mod tests {
             wfiles,
             rfiles: BTreeMap::new(),
             };
-        let mut stream = to_stream(b"-", input.as_bytes(), sep);
+        let mut stream = Stream::of(b"-", input.as_bytes(), sep, None);
         let mut sink = Sink::buffer(sep);
         sed.run_stream(&mut stream, &mut sink).unwrap();
         sink.into_buffer()
