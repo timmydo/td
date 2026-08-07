@@ -36,8 +36,12 @@
 
 use std::io::{IsTerminal, Read, Seek, Write};
 use std::os::fd::AsFd;
+use std::num::NonZeroUsize;
+use std::os::unix::fs::OpenOptionsExt;
+use std::path::{Path, PathBuf};
 
 use crate::complete;
+use crate::exec::Shell;
 use crate::term;
 
 /// What a read ended with.
@@ -55,6 +59,29 @@ pub enum Input {
 /// browsed to in it.
 pub struct Editor {
     history: Vec<String>,
+    /// How many lines are kept, in memory and in the file. `HISTFILESIZE`
+    /// names it; `HISTORY_MAX` is the ceiling and the default.
+    ///
+    /// NON-ZERO in the type, because `remember` drops the oldest line by index
+    /// when the list is full and `remove(0)` on an empty one is a panic in a
+    /// crate that aborts on those. `HISTFILESIZE` floors at one, so this is a
+    /// bound the type keeps rather than a bug being fixed.
+    max: NonZeroUsize,
+    /// Where the history outlives the session, and how many lines this session
+    /// believes are in that file. `None` when nothing is persisted, which is
+    /// every non-interactive shell and any one that cannot name a file.
+    hist: Option<HistoryFile>,
+}
+
+struct HistoryFile {
+    path: PathBuf,
+    /// Counted rather than measured: nothing but the trim threshold reads it,
+    /// and the only way to measure it is to read the file, which is the very
+    /// work the threshold exists to do rarely.
+    lines: usize,
+    /// Set when the file was found ending mid-line, so the next append writes
+    /// a newline first rather than gluing its command onto the fragment.
+    unterminated: bool,
 }
 
 /// The longest escape sequence the editor will read before giving up, so a
@@ -75,11 +102,58 @@ const DEFAULT_WIDTH: u16 = 80;
 
 /// How many lines of history to keep. dash keeps none, bash defaults to 500;
 /// this is a bounded middle that cannot grow a long-lived shell without limit.
+/// It is also the CEILING `HISTFILESIZE` is clamped to, as busybox clamps to
+/// its own `MAX_HISTORY` — 255 there, so a value between the two is honoured
+/// here and capped there.
 const HISTORY_MAX: usize = 500;
+
+/// How far the file may run past what is kept before it is rewritten. busybox's
+/// number (`max_history * 4`), and the reason is the same: trimming on every
+/// command would turn one append into a whole-file read and rewrite.
+const TRIM_FACTOR: usize = 4;
+
+/// `HISTORY_MAX` as the type the editor holds it in. `match` rather than
+/// `unwrap_or`, which is not const yet.
+const DEFAULT_MAX: NonZeroUsize = match NonZeroUsize::new(HISTORY_MAX) {
+    Some(n) => n,
+    None => NonZeroUsize::MIN,
+};
+
+/// The most of a history file that is ever read into memory. A megabyte is
+/// thousands of commands where hundreds are kept, so it never clips a real
+/// history — it is the bound on a `HISTFILE` that names something else.
+const HISTORY_READ_MAX: u64 = 1 << 20;
 
 impl Editor {
     pub fn new() -> Self {
-        Self { history: Vec::new() }
+        Self { history: Vec::new(), max: DEFAULT_MAX, hist: None }
+    }
+
+    /// Take the session's history file: load what is in it, and append every
+    /// line entered from here on.
+    ///
+    /// Resolved ONCE, as ash resolves it once at the top of an interactive
+    /// session (ash.c:14802) — assigning `HISTFILE` later does not move the
+    /// file, here or there. When nobody set it the default is written BACK
+    /// into the variable, so `echo $HISTFILE` names the file that is in use
+    /// rather than nothing.
+    pub fn open_history(&mut self, sh: &mut Shell) {
+        self.max = history_size(sh);
+        let Some(path) = history_path(sh) else {
+            return;
+        };
+        // A file that cannot be read is still the file to append to: it may be
+        // unreadable this instant and writable the next, and refusing to keep
+        // history because of one failed open would be the worse answer.
+        let loaded = read_history(&path, self.max.get());
+        if let Some(l) = &loaded {
+            self.history.clone_from(&l.kept);
+        }
+        self.hist = Some(HistoryFile {
+            path,
+            lines: loaded.as_ref().map_or(0, |l| l.total),
+            unterminated: loaded.is_some_and(|l| !l.terminated),
+        });
     }
 
     /// Read one line, editing it in place when stdin is a terminal that will
@@ -94,6 +168,23 @@ impl Editor {
     /// `comp` is what Tab may offer, passed in for the same reason `Keys` is:
     /// a test must be able to state the whole world.
     pub fn read(
+        &mut self,
+        prompt: &str,
+        interruptible: bool,
+        comp: &complete::Source<'_>,
+    ) -> Input {
+        let outcome = self.read_line(prompt, interruptible, comp);
+        // ONE place a line is remembered, so the cooked fallback keeps history
+        // too. It used to be inside the raw path, past three early returns, and
+        // a terminal that would not take `TCSETS` therefore had an operator
+        // typing commands that reached neither Ctrl-P nor the file.
+        if let Input::Line(text) = &outcome {
+            self.remember(text);
+        }
+        outcome
+    }
+
+    fn read_line(
         &mut self,
         prompt: &str,
         interruptible: bool,
@@ -142,23 +233,70 @@ impl Editor {
         // follows — a command's output, or the next prompt — starts on a
         // terminal in its own mode rather than in the editor's.
         drop(raw);
-        if let Input::Line(text) = &outcome {
+        if matches!(outcome, Input::Line(_)) {
             let _ = writeln!(out);
-            self.remember(text);
         }
         outcome
     }
 
-    /// Keep `text` in the history, as ash does: blank lines are not kept, and a
-    /// line identical to the previous one is not kept twice.
+    /// Keep `text` in the history: a line identical to the previous one is not
+    /// kept twice, as ash does, and a blank one is not kept at all. That second
+    /// rule is slightly wider than busybox's, which drops only a line of zero
+    /// length — a line of spaces is not a command, and keeping it would make it
+    /// the first thing Ctrl-P offers.
     fn remember(&mut self, text: &str) {
         if text.trim().is_empty() || self.history.last().map(String::as_str) == Some(text) {
             return;
         }
-        if self.history.len() >= HISTORY_MAX {
+        if self.history.len() >= self.max.get() {
             self.history.remove(0);
         }
         self.history.push(text.to_string());
+        self.append(text);
+    }
+
+    /// Append the line to the history file, if there is one.
+    ///
+    /// APPEND, per line, rather than rewriting the file when the shell exits:
+    /// two shells open at once then INTERLEAVE their lines instead of the one
+    /// that exits last discarding everything the other did. It is also what
+    /// survives a shell that is killed rather than exited. busybox's default
+    /// build does exactly this (lineedit.c:1608) and its `SAVE_ON_EXIT` option
+    /// is what gives both up.
+    fn append(&mut self, text: &str) {
+        let max = self.max.get();
+        let Some(h) = self.hist.as_mut() else {
+            return;
+        };
+        // ONE write of the line and its newline together: `O_APPEND` makes a
+        // single write atomic against a concurrent appender, and two writes
+        // would let another shell's line land between them.
+        let mut buf = String::with_capacity(text.len().saturating_add(2));
+        // A file left ending mid-line -- edited by hand, or cut short by a
+        // full disk -- gets that line ended first, or this command is glued
+        // onto the fragment and the pair reads back as one command nobody
+        // typed. Once, since everything after this writes its own newline.
+        if std::mem::take(&mut h.unterminated) {
+            buf.push('\n');
+        }
+        buf.push_str(text);
+        buf.push('\n');
+        // 0600 because a shell history is a record of what someone typed,
+        // passwords on argv included; busybox opens it with the same mode.
+        let opened =
+            std::fs::OpenOptions::new().append(true).create(true).mode(0o600).open(&h.path);
+        let Ok(mut f) = opened else {
+            return;
+        };
+        if f.write_all(buf.as_bytes()).is_err() {
+            return;
+        }
+        h.lines = h.lines.saturating_add(1);
+        if h.lines > max.saturating_mul(TRIM_FACTOR) {
+            if let Some(n) = rewrite_history(&h.path, max) {
+                h.lines = n;
+            }
+        }
     }
 
     fn edit<W: Write>(
@@ -364,6 +502,210 @@ impl Editor {
             None => draft.clone(),
         };
         *pos = buf.len();
+    }
+}
+
+/// What a history file held.
+struct Loaded {
+    /// The last `max` non-empty lines.
+    kept: Vec<String>,
+    /// How many non-empty lines there were altogether, which is what the trim
+    /// threshold is measured against.
+    total: usize,
+    /// Whether the last byte is a newline, an empty file counting as yes. A
+    /// file cut off mid-line would otherwise have the next append GLUE the new
+    /// command onto the fragment, and `betagamma` is a history entry naming a
+    /// command nobody typed.
+    terminated: bool,
+}
+
+/// Read the file, or `None` if it cannot be read — which is NOT the same as an
+/// absent one, and the difference is the whole of a trim's safety: a trim that
+/// read nothing would otherwise write nothing over a history that is merely
+/// unreadable this instant.
+///
+/// Lossy rather than refusing a file that is not UTF-8, which is the rule the
+/// rest of this shell already applies to input it did not write: a history
+/// carrying one undecodable byte should not cost the operator every other line
+/// in it. Empty lines are dropped, as busybox drops them on load.
+fn read_history(path: &Path, max: usize) -> Option<Loaded> {
+    let mut f = match std::fs::File::open(path) {
+        Ok(f) => f,
+        // Absent is an empty history, which is what a first session has.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Some(Loaded { kept: Vec::new(), total: 0, terminated: true });
+        }
+        Err(_) => return None,
+    };
+    // BOUNDED, and from the END. `HISTFILE` is a variable, so the file behind
+    // it need not be a history at all: `std::fs::read` on `/dev/zero` returns
+    // when the allocator gives up, which is a shell that dies at its first
+    // prompt because of an assignment. The window is the tail because the tail
+    // is what is kept; `take` is what bounds the device that has no end, since
+    // its length reads as zero and the seek does nothing.
+    let len = f.metadata().map(|m| m.len()).unwrap_or(0);
+    let clipped = len > HISTORY_READ_MAX;
+    if clipped {
+        let _ = f.seek(std::io::SeekFrom::End(-(HISTORY_READ_MAX as i64)));
+    }
+    let mut bytes = Vec::new();
+    if f.take(HISTORY_READ_MAX).read_to_end(&mut bytes).is_err() {
+        return None;
+    }
+    let terminated = bytes.last().is_none_or(|b| *b == b'\n');
+    let text = String::from_utf8_lossy(&bytes);
+    // The window opened mid-file, so its first line is whatever was left of
+    // the line the cut landed in -- half a command, which is not one.
+    let text = match clipped {
+        true => text.split_once('\n').map_or("", |(_, rest)| rest).to_string(),
+        false => text.into_owned(),
+    };
+    // COUNTED first and collected second, so only the lines actually kept are
+    // allocated and none of them is ever moved. Dropping the oldest as it went
+    // would shift the whole vector once per line past the cap, and a file at
+    // the trim threshold is four times the cap by construction -- so that is
+    // the size this function most often runs at, not the exception.
+    let total = text.lines().filter(|l| !l.is_empty()).count();
+    let kept = text
+        .lines()
+        .filter(|l| !l.is_empty())
+        .skip(total.saturating_sub(max))
+        .map(str::to_string)
+        .collect();
+    Some(Loaded { kept, total, terminated })
+}
+
+/// Rewrite the file with only the lines that are kept, and answer how many
+/// that was. `None` if nothing was rewritten, which leaves the caller's count
+/// alone and so retries on the next command rather than never again.
+///
+/// Through a temporary and a `rename`, so a concurrent reader sees the old file
+/// or the new one and never a half-written one. The temporary carries this
+/// process's pid, as busybox's does, so two shells trimming at the same moment
+/// do not write the same path. Unlike busybox, a failed rename takes the
+/// temporary with it rather than leaving it beside the history for good.
+fn rewrite_history(path: &Path, max: usize) -> Option<usize> {
+    // Re-READ rather than writing this session's own memory out: another shell
+    // may have appended lines this one has never seen, and they are history
+    // too. It is the same read busybox does before its rewrite.
+    //
+    // A file that cannot be READ is not one to rewrite. Without this a
+    // transient EACCES makes the read answer "empty" and the rewrite put that
+    // over the history -- a trim that erases it, and reports success.
+    let loaded = read_history(path, max)?;
+    let mut body = String::new();
+    for line in &loaded.kept {
+        body.push_str(line);
+        body.push('\n');
+    }
+    // Over what the path RESOLVES to. Appends follow a symlinked `HISTFILE`
+    // to its target; renaming over the link itself would replace the link
+    // with a regular file, and every later append would go there instead --
+    // the target silently stopping at the last line before the first trim.
+    // Putting the temporary beside the target is also what keeps the rename
+    // within one filesystem.
+    let target = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let mut name = target.as_os_str().to_os_string();
+    name.push(format!(".{}.new", std::process::id()));
+    let tmp = PathBuf::from(name);
+    // `create_new`, so the open FAILS rather than following something already
+    // at that name. The path is predictable -- a directory and a pid -- so
+    // anyone who can write to the history's directory could leave a symlink
+    // there, and `create(true).truncate(true)` would follow it and write the
+    // operator's history over whatever it points at. Nothing is removed on
+    // this arm: the file that is there is not ours.
+    let opened = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&tmp);
+    let Ok(mut f) = opened else {
+        return None;
+    };
+    // Flushed to the DEVICE before the rename rather than only to the kernel.
+    // The rename is atomic for the NAME and says nothing about the data behind
+    // it, so a crash just after can leave the history naming blocks that were
+    // never written -- an empty file where the whole history was. busybox's
+    // `fclose` does not do this either, and this is the one place the cost is
+    // affordable: a trim happens once every four times the kept size.
+    // The trim puts a NEW inode in place of the old one, so without this every
+    // trim would silently reset whatever mode the operator had set on their
+    // history to this function's idea of one. 0600 is the fallback and not the
+    // answer: the file that is there already has the mode it should keep.
+    if let Ok(m) = std::fs::metadata(&target) {
+        let _ = f.set_permissions(m.permissions());
+    }
+    if f.write_all(body.as_bytes()).is_err() || f.sync_data().is_err() {
+        let _ = std::fs::remove_file(&tmp);
+        return None;
+    }
+    drop(f);
+    if std::fs::rename(&tmp, &target).is_err() {
+        let _ = std::fs::remove_file(&tmp);
+        return None;
+    }
+    Some(loaded.kept.len())
+}
+
+/// `$HISTFILE`, or `$HOME/.ash_history` written back into the variable.
+///
+/// An EMPTY `HISTFILE` names no file and is not defaulted, which is how ash
+/// behaves for a different reason: it only defaults an UNSET one, then hands
+/// the empty string to `fopen`, which fails. Same outcome, without the failed
+/// open.
+/// A RELATIVE one is resolved against the shell's directory rather than the
+/// process's, for the reason completion resolves its own: `cd` moves `sh.cwd`
+/// and never `chdir`s, and a profile that cd's runs BEFORE this. The variable
+/// keeps what was written into it; only the file this session opens is
+/// absolute.
+fn history_path(sh: &mut Shell) -> Option<PathBuf> {
+    if let Some(f) = sh.get_var("HISTFILE") {
+        return (!f.is_empty()).then(|| sh.resolve(&f));
+    }
+    // An empty `HOME` names no history either, where busybox would join it to
+    // nothing and write `/.ash_history` — a file in the root of the
+    // filesystem, from a variable nobody set.
+    let home = sh.get_var("HOME").filter(|h| !h.is_empty())?;
+    let path = Path::new(&home).join(".ash_history");
+    // Only when the assignment can SUCCEED. A readonly `HISTFILE` refusing one
+    // is a diagnostic on stderr before the first prompt, about a default the
+    // operator never asked for, and the history it names is used either way.
+    if !sh.vars.get("HISTFILE").is_some_and(|v| v.readonly) {
+        let _ = sh.set_var("HISTFILE", &path.to_string_lossy());
+    }
+    Some(sh.resolve(&path.to_string_lossy()))
+}
+
+/// `$HISTFILESIZE`, on ash's exact rule (`size_from_HISTFILESIZE`,
+/// lineedit.c:1403): unset is the built-in maximum, anything above it is
+/// capped, and zero or below asks for ONE line rather than for none — so
+/// `HISTFILESIZE=0` does not turn history off.
+///
+/// Read with `atoi`'s tolerance, which is what ash uses: leading ASCII blanks
+/// and a sign, then digits up to the first character that is not one, so `50x`
+/// is fifty and `x` is zero. `parse` would reject both and make them one line.
+///
+/// One value does NOT match: where C's `atoi` overflows an `int`, glibc's
+/// wraps to a negative and busybox reads `HISTFILESIZE=4000000000` as one
+/// line. This saturates to the ceiling instead, which is the more defensible
+/// reading of a number that large and not worth reproducing signed overflow
+/// for.
+fn history_size(sh: &Shell) -> NonZeroUsize {
+    let Some(v) = sh.get_var("HISTFILESIZE") else {
+        return DEFAULT_MAX;
+    };
+    let s = v.trim_start_matches(|c: char| c.is_ascii_whitespace());
+    let (neg, digits) = match s.strip_prefix('-') {
+        Some(r) => (true, r),
+        None => (false, s.strip_prefix('+').unwrap_or(s)),
+    };
+    let mut n: usize = 0;
+    for c in digits.chars() {
+        let Some(d) = c.to_digit(10) else {
+            break;
+        };
+        n = n.saturating_mul(10).saturating_add(d as usize);
+    }
+    match (neg, NonZeroUsize::new(n)) {
+        (false, Some(n)) => n.min(DEFAULT_MAX),
+        // Zero or below asks for ONE line, not for none.
+        _ => NonZeroUsize::MIN,
     }
 }
 
@@ -1230,7 +1572,11 @@ mod tests {
     use super::*;
 
     fn hist(lines: &[&str]) -> Editor {
-        Editor { history: lines.iter().map(|s| (*s).to_string()).collect() }
+        Editor {
+            history: lines.iter().map(|s| (*s).to_string()).collect(),
+            max: DEFAULT_MAX,
+            hist: None,
+        }
     }
 
     fn facts(cwd: &str, home: &str, root: bool) -> PromptFacts {
@@ -1846,6 +2192,357 @@ mod tests {
         assert_eq!(submitted(&mut ed, b"abc\x02\x04\r"), "ab");
         // A closed stdin mid-line is end of input, not an empty line.
         assert!(matches!(typed(&mut ed, b"half", 80, true).0, Input::Eof));
+    }
+
+    fn hist_dir(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("td-sh-hist-{}-{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// A line entered is appended to the file as it is entered, and the next
+    /// session starts with it. Appending per line rather than rewriting at
+    /// exit is what lets two shells INTERLEAVE instead of the last one out
+    /// discarding the other's lines.
+    #[test]
+    fn the_history_outlives_the_session_and_two_shells_interleave() {
+        let dir = hist_dir("outlives");
+        let path = dir.join("h");
+        let mut sh = crate::exec::Shell::new_for_test();
+        sh.set_var("HISTFILE", &path.to_string_lossy()).unwrap();
+
+        let mut a = Editor::new();
+        a.open_history(&mut sh);
+        a.remember("one");
+        // Written as it was entered, not held until something closes.
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "one\n");
+
+        // A SECOND shell, opened while the first is still running.
+        let mut b = Editor::new();
+        b.open_history(&mut sh);
+        assert_eq!(b.history, ["one"]);
+        b.remember("two");
+        a.remember("three");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "one\ntwo\nthree\n");
+
+        // A third session sees all three, in the order they were typed.
+        let mut c = Editor::new();
+        c.open_history(&mut sh);
+        assert_eq!(c.history, ["one", "two", "three"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The file is trimmed LAZILY -- only once it runs `TRIM_FACTOR` times
+    /// past what is kept -- and the trim keeps the newest lines. Rewriting on
+    /// every command would turn one append into a whole-file read and write.
+    #[test]
+    fn the_file_is_trimmed_lazily_and_keeps_the_newest() {
+        let dir = hist_dir("trim");
+        let path = dir.join("h");
+        let mut sh = crate::exec::Shell::new_for_test();
+        sh.set_var("HISTFILE", &path.to_string_lossy()).unwrap();
+        sh.set_var("HISTFILESIZE", "4").unwrap();
+        let mut ed = Editor::new();
+        ed.open_history(&mut sh);
+        assert_eq!(ed.max.get(), 4);
+
+        // Up to the threshold the file only grows: 16 lines is 4 * 4, and the
+        // trim fires when the count goes PAST it.
+        for i in 0..16 {
+            ed.remember(&format!("line{i}"));
+        }
+        assert_eq!(std::fs::read_to_string(&path).unwrap().lines().count(), 16);
+        ed.remember("line16");
+        // Now rewritten to the last four, newest last.
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "line13\nline14\nline15\nline16\n");
+        // ...and the in-memory list agrees with the file.
+        assert_eq!(ed.history, ["line13", "line14", "line15", "line16"]);
+        // No temporary left beside it.
+        let left: Vec<_> = std::fs::read_dir(&dir).unwrap().flatten().map(|e| e.file_name()).collect();
+        assert_eq!(left.len(), 1, "a temporary was left behind: {left:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A trim writes what is in the FILE, not what this session remembers, so
+    /// a sibling shell's lines survive it.
+    #[test]
+    fn a_trim_keeps_a_sibling_shells_lines() {
+        let dir = hist_dir("sibling");
+        let path = dir.join("h");
+        let mut sh = crate::exec::Shell::new_for_test();
+        sh.set_var("HISTFILE", &path.to_string_lossy()).unwrap();
+        sh.set_var("HISTFILESIZE", "2").unwrap();
+        let mut a = Editor::new();
+        a.open_history(&mut sh);
+        for i in 0..8 {
+            a.remember(&format!("a{i}"));
+        }
+        // A sibling appends without this session knowing.
+        {
+            let mut f = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+            f.write_all(b"sibling\n").unwrap();
+        }
+        // ...and the next line takes the count past 2 * 4 and trims.
+        a.remember("a8");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "sibling\na8\n");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A trim writes through a name anyone who can write to the directory can
+    /// guess -- a pid -- so it must not FOLLOW what is already there. With a
+    /// symlink in the way the trim declines and the target is untouched;
+    /// `create(true).truncate(true)` would have written the operator's history
+    /// over it.
+    #[test]
+    fn a_trim_refuses_to_follow_a_symlink_at_its_temporary() {
+        let dir = hist_dir("symlink");
+        let path = dir.join("h");
+        let decoy = dir.join("decoy");
+        std::fs::write(&decoy, "PRECIOUS\n").unwrap();
+        let mut tmp = path.as_os_str().to_os_string();
+        tmp.push(format!(".{}.new", std::process::id()));
+        std::os::unix::fs::symlink(&decoy, PathBuf::from(&tmp)).unwrap();
+
+        let mut sh = crate::exec::Shell::new_for_test();
+        sh.set_var("HISTFILE", &path.to_string_lossy()).unwrap();
+        sh.set_var("HISTFILESIZE", "2").unwrap();
+        let mut ed = Editor::new();
+        ed.open_history(&mut sh);
+        for i in 0..10 {
+            ed.remember(&format!("x{i}"));
+        }
+        assert_eq!(std::fs::read_to_string(&decoy).unwrap(), "PRECIOUS\n", "the decoy was written");
+        // The trim declined, so the history is whole rather than truncated --
+        // and the symlink is still there, since it was never ours to remove.
+        assert_eq!(std::fs::read_to_string(&path).unwrap().lines().count(), 10);
+        assert!(std::fs::symlink_metadata(PathBuf::from(&tmp)).is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A trim renames over what the path RESOLVES to, so a symlinked
+    /// `HISTFILE` is still a symlink afterwards. Renaming over the link would
+    /// replace it with a regular file and leave the target at whatever line it
+    /// held when the first trim ran, with nothing saying so.
+    #[test]
+    fn a_trim_keeps_a_symlinked_history_a_symlink() {
+        let dir = hist_dir("symtarget");
+        let real = dir.join("real");
+        let link = dir.join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let mut sh = crate::exec::Shell::new_for_test();
+        sh.set_var("HISTFILE", &link.to_string_lossy()).unwrap();
+        sh.set_var("HISTFILESIZE", "2").unwrap();
+        let mut ed = Editor::new();
+        ed.open_history(&mut sh);
+        for i in 0..10 {
+            ed.remember(&format!("y{i}"));
+        }
+        assert!(std::fs::symlink_metadata(&link).unwrap().is_symlink(), "the link was replaced");
+        // The trim fired on `y8`, keeping two, and `y9` was appended after it:
+        // between trims the file is allowed to stand above the kept size,
+        // which is what makes trimming lazy.
+        assert_eq!(std::fs::read_to_string(&real).unwrap(), "y7\ny8\ny9\n");
+        // ...and appending after the trim still reaches the target.
+        ed.remember("after");
+        assert_eq!(std::fs::read_to_string(&real).unwrap(), "y7\ny8\ny9\nafter\n");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A `HISTFILE` naming something that is not a history cannot cost the
+    /// shell its first prompt: the read is bounded, and bounded from the END,
+    /// since the end is what is kept.
+    #[test]
+    fn the_load_is_bounded_and_reads_the_tail() {
+        let dir = hist_dir("bounded");
+        let path = dir.join("big");
+        // Past the window, so the read seeks: the last lines are the ones
+        // that come back, and the fragment the cut landed in does not.
+        let mut body = String::new();
+        let mut n = 0u32;
+        while body.len() < (HISTORY_READ_MAX as usize) + 4096 {
+            body.push_str(&format!("cmd{n}\n"));
+            n += 1;
+        }
+        std::fs::write(&path, &body).unwrap();
+        let kept = read_history(&path, 3).unwrap().kept;
+        assert_eq!(kept, [format!("cmd{}", n - 3), format!("cmd{}", n - 2), format!("cmd{}", n - 1)]);
+        // Every line that came back is whole -- the partial one at the window's
+        // edge was dropped rather than offered as a command.
+        let all = read_history(&path, 100_000).unwrap().kept;
+        assert!(all.iter().all(|l| l.starts_with("cmd")), "a fragment survived: {:?}", all.first());
+        // A file with no end at all returns rather than growing without bound.
+        if std::fs::metadata("/dev/zero").is_ok() {
+            let kept = read_history(Path::new("/dev/zero"), 5).unwrap().kept;
+            assert!(kept.len() <= 5);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A relative `HISTFILE` follows the SHELL's directory, not the process's
+    /// -- `cd` moves only the former, and a profile that cd's runs before the
+    /// history is opened.
+    #[test]
+    fn a_relative_history_file_follows_the_shell() {
+        let dir = hist_dir("relative");
+        let mut sh = crate::exec::Shell::new_for_test();
+        sh.cwd = dir.clone();
+        sh.set_var("HISTFILE", "kept-here").unwrap();
+        assert_eq!(history_path(&mut sh), Some(dir.join("kept-here")));
+        // The VARIABLE keeps what was written into it; only the file this
+        // session opens is absolute.
+        assert_eq!(sh.get_var("HISTFILE").as_deref(), Some("kept-here"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The file is created 0600 and KEEPS whatever mode it has across a trim,
+    /// which puts a new inode in place of the old one. Asserted as "nothing
+    /// for group or other" rather than as an exact number, since the mode a
+    /// create asks for is masked by the process umask.
+    #[test]
+    fn the_history_is_private_and_a_trim_does_not_reset_its_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = hist_dir("mode");
+        let path = dir.join("h");
+        let mut sh = crate::exec::Shell::new_for_test();
+        sh.set_var("HISTFILE", &path.to_string_lossy()).unwrap();
+        sh.set_var("HISTFILESIZE", "2").unwrap();
+        let mut ed = Editor::new();
+        ed.open_history(&mut sh);
+        ed.remember("secret");
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o077, 0, "a history readable by anyone else: {:o}", mode);
+        // A mode the operator chose survives the trim.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o400)).unwrap();
+        for i in 0..10 {
+            ed.remember(&format!("z{i}"));
+        }
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o400, "the trim reset the mode: {mode:o}");
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A file left ending mid-line gets that line ended before the next one is
+    /// appended. Without it the two GLUE, and the pair reads back as a single
+    /// history entry naming a command nobody typed.
+    #[test]
+    fn a_file_cut_off_mid_line_does_not_glue_the_next_command_on() {
+        let dir = hist_dir("glue");
+        let path = dir.join("h");
+        std::fs::write(&path, b"alpha\nbeta").unwrap();
+        let mut sh = crate::exec::Shell::new_for_test();
+        sh.set_var("HISTFILE", &path.to_string_lossy()).unwrap();
+        let mut ed = Editor::new();
+        ed.open_history(&mut sh);
+        ed.remember("gamma");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "alpha\nbeta\ngamma\n");
+        // Once, not before every line.
+        ed.remember("delta");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "alpha\nbeta\ngamma\ndelta\n");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A trim that cannot READ the file must not write over it. Reading
+    /// nothing and rewriting that is a trim that ERASES a history which was
+    /// merely unreadable for an instant, and reports success.
+    #[test]
+    fn a_trim_that_cannot_read_leaves_the_file_alone() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let dir = hist_dir("unreadable");
+        let path = dir.join("h");
+        std::fs::write(&path, "keep1\nkeep2\n").unwrap();
+        // Root can read anything, so there is no unreadable file to make.
+        if std::fs::metadata(&path).unwrap().uid() == 0 {
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        }
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        assert!(read_history(&path, 2).is_none(), "an unreadable file read as empty");
+        assert!(rewrite_history(&path, 2).is_none(), "an unreadable file was rewritten");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "keep1\nkeep2\n");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A readonly `HISTFILE` that nobody set still gets a working history: the
+    /// default is used and the assignment that would fail is not attempted.
+    #[test]
+    fn a_readonly_histfile_still_gets_a_history() {
+        let dir = hist_dir("readonly");
+        let mut sh = crate::exec::Shell::new_for_test();
+        sh.set_var("HOME", &dir.to_string_lossy()).unwrap();
+        sh.set_var("HISTFILE", "placeholder").unwrap();
+        // Readonly AND unset, which is what `readonly HISTFILE` in a profile
+        // leaves behind.
+        if let Some(v) = sh.vars.get_mut("HISTFILE") {
+            v.readonly = true;
+            v.value = None;
+        }
+        assert_eq!(history_path(&mut sh), Some(dir.join(".ash_history")));
+        assert_eq!(sh.get_var("HISTFILE"), None, "the readonly name was written to");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `HISTFILE` is resolved once and defaulted INTO the variable, and
+    /// `HISTFILESIZE` follows ash's clamp: capped above, one line below, and
+    /// `atoi`'s tolerance for what is not a number.
+    #[test]
+    fn the_history_variables_follow_ash() {
+        let dir = hist_dir("vars");
+        let mut sh = crate::exec::Shell::new_for_test();
+        sh.set_var("HOME", &dir.to_string_lossy()).unwrap();
+        // Unset: defaulted to $HOME/.ash_history and written back, so
+        // `echo $HISTFILE` names the file in use.
+        assert_eq!(history_path(&mut sh), Some(dir.join(".ash_history")));
+        assert_eq!(sh.get_var("HISTFILE").as_deref(), Some(&*dir.join(".ash_history").to_string_lossy()));
+        // Set-and-empty names no file, and is not defaulted over.
+        sh.set_var("HISTFILE", "").unwrap();
+        assert_eq!(history_path(&mut sh), None);
+
+        let mut s = crate::exec::Shell::new_for_test();
+        assert_eq!(history_size(&s).get(), HISTORY_MAX, "unset is the maximum");
+        s.set_var("HISTFILESIZE", "10").unwrap();
+        assert_eq!(history_size(&s).get(), 10);
+        s.set_var("HISTFILESIZE", "0").unwrap();
+        assert_eq!(history_size(&s).get(), 1, "zero asks for one line, not for none");
+        s.set_var("HISTFILESIZE", "-5").unwrap();
+        assert_eq!(history_size(&s).get(), 1);
+        s.set_var("HISTFILESIZE", "99999").unwrap();
+        assert_eq!(history_size(&s).get(), HISTORY_MAX, "capped at the built-in maximum");
+        s.set_var("HISTFILESIZE", "50x").unwrap();
+        assert_eq!(history_size(&s).get(), 50, "atoi stops at the first non-digit");
+        s.set_var("HISTFILESIZE", "x").unwrap();
+        assert_eq!(history_size(&s).get(), 1, "...and reads nothing as zero");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Loading keeps the LAST `max` lines, drops empty ones, and counts what
+    /// the whole file held -- the count being what the trim threshold is
+    /// measured against. A file that is not UTF-8 is read lossily rather than
+    /// costing the operator every line in it.
+    #[test]
+    fn loading_keeps_the_newest_lines_and_counts_the_rest() {
+        let dir = hist_dir("load");
+        let path = dir.join("h");
+        std::fs::write(&path, "a\n\nb\nc\n\nd\n").unwrap();
+        let l = read_history(&path, 2).unwrap();
+        assert_eq!(l.kept, ["c", "d"]);
+        assert_eq!(l.total, 4);
+        assert_eq!(read_history(&path, 99).unwrap().total, 4);
+        // Keeping none is what a cap of none means, not keeping everything.
+        assert!(read_history(&path, 0).unwrap().kept.is_empty());
+        // A missing file is an empty history; UNREADABLE is not the same
+        // answer, and a trim turns on the difference.
+        let l = read_history(&dir.join("nope"), 9).unwrap();
+        assert!(l.kept.is_empty() && l.total == 0);
+        // Undecodable bytes become U+FFFD; the other lines are still there.
+        std::fs::write(&path, b"ok\n\xff\xfe\nlast\n").unwrap();
+        let l = read_history(&path, 9).unwrap();
+        assert_eq!(l.total, 3);
+        assert_eq!(l.kept.first().map(String::as_str), Some("ok"));
+        assert_eq!(l.kept.last().map(String::as_str), Some("last"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

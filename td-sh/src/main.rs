@@ -400,6 +400,9 @@ fn stdin_script(sh: &mut Shell) -> i32 {
 /// front would put it on the screen twice.
 fn repl(sh: &mut Shell) -> i32 {
     let mut editor = line::Editor::new();
+    // Only an interactive session persists history, and only from here: a
+    // script's lines are not the operator's, and `sh -c` has none to keep.
+    editor.open_history(sh);
     // The session's line count. dash reads an interactive shell's input as one
     // stream, so `$LINENO` runs for the life of the session rather than
     // restarting at each prompt -- measured over a pty at 1, 2, 5, 7 for two
@@ -554,6 +557,26 @@ mod confinement {
 
     fn squeeze(text: &str) -> String {
         text.chars().filter(|c| !c.is_whitespace()).collect()
+    }
+
+    /// The REPL must open the session's history. Everything about `HISTFILE`
+    /// is tested against `Editor` directly, so deleting the one line that
+    /// reaches it leaves every one of those tests green and the feature gone
+    /// -- there is no unit test of `repl`, which wants a terminal.
+    ///
+    /// Over `code_only`, because the first version of this test passed against
+    /// a build with the call COMMENTED OUT: the needle matched the comment.
+    #[test]
+    fn the_repl_opens_the_history() {
+        let src = code_only(source("main.rs"));
+        let repl = src
+            .split_once(concat!("fn ", "repl(sh: &mut Shell)"))
+            .map_or("", |(_, rest)| rest)
+            .to_string();
+        assert!(
+            squeeze(&repl).contains(concat!("editor.", "open_history(sh)")),
+            "`repl` no longer opens the history file"
+        );
     }
 
     fn count(needle: &str) -> usize {
