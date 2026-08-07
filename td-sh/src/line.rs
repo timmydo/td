@@ -71,6 +71,11 @@ pub struct Editor {
     /// believes are in that file. `None` when nothing is persisted, which is
     /// every non-interactive shell and any one that cannot name a file.
     hist: Option<HistoryFile>,
+    /// What the kill keys took, for Ctrl-Y to put back. On the EDITOR rather
+    /// than on a line, because readline's outlives the line that filled it:
+    /// killing on one line and yanking on the next is what makes it a way to
+    /// move text between commands rather than only within one.
+    kill: String,
 }
 
 struct HistoryFile {
@@ -126,7 +131,7 @@ const HISTORY_READ_MAX: u64 = 1 << 20;
 
 impl Editor {
     pub fn new() -> Self {
-        Self { history: Vec::new(), max: DEFAULT_MAX, hist: None }
+        Self { history: Vec::new(), max: DEFAULT_MAX, hist: None, kill: String::new() }
     }
 
     /// Take the session's history file: load what is in it, and append every
@@ -299,6 +304,34 @@ impl Editor {
         }
     }
 
+    /// Take `text` into the kill buffer, and say whether anything was taken.
+    ///
+    /// `before` is whether the text came from BEFORE the cursor, which is what
+    /// decides the side an accumulating kill lands on: readline appends a
+    /// forward kill and prepends a backward one, so `^W ^W` yanks the two words
+    /// back in the order they were typed rather than reversed. `run` is whether
+    /// the previous keystroke was itself a kill; without it every kill would
+    /// stand alone and the buffer could only ever hold one.
+    ///
+    /// A kill that takes NOTHING leaves the buffer alone -- `^K` at the end of
+    /// a line must not throw away what is in it -- and `false` here is what
+    /// then ends the run, both measured against bash 5.2.
+    fn kill_text(&mut self, text: &str, before: bool, run: bool) -> bool {
+        if text.is_empty() {
+            return false;
+        }
+        if !run {
+            self.kill.clear();
+        }
+        // Index 0 is a character boundary in every string, so the prepend
+        // cannot be the panicking half of `insert_str`.
+        match before {
+            true => self.kill.insert_str(0, text),
+            false => self.kill.push_str(text),
+        }
+        true
+    }
+
     fn edit<W: Write>(
         &mut self,
         prompt: &str,
@@ -321,6 +354,11 @@ impl Editor {
         // Whether the LAST keystroke was a Tab, which is what makes the second
         // one a listing. Cleared by every other key, as ash's `lastWasTab` is.
         let mut last_tab = false;
+        // Whether the last keystroke was a kill that took something, which is
+        // what makes the next one ACCUMULATE rather than replace. Local to the
+        // line, unlike the buffer itself: bash starts a fresh run on a new
+        // line even though the buffer survives.
+        let mut last_kill = false;
 
         // Re-read on every keystroke rather than once: td-sh installs no
         // SIGWINCH handler, and `TIOCGWINSZ` is cheap next to a key press, so
@@ -333,6 +371,7 @@ impl Editor {
                 return Input::Eof;
             };
             let was_tab = std::mem::replace(&mut last_tab, false);
+            let was_kill = std::mem::replace(&mut last_kill, false);
             // The two bytes the DRIVER owns come from the terminal's own
             // settings, so `stty intr '^X'` moves them; the editing keys below
             // are the conventional readline bindings rather than the driver's.
@@ -373,17 +412,37 @@ impl Editor {
                 // Ctrl-B / Ctrl-F.
                 0x02 => pos = prev_boundary(&buf, pos),
                 0x06 => pos = next_boundary(&buf, pos),
-                // Ctrl-K / Ctrl-U: kill to end / to start.
-                0x0b => buf.truncate(pos),
+                // Ctrl-K / Ctrl-U: kill to end / to start. What they take goes
+                // to the kill buffer for Ctrl-Y, which is the difference
+                // between a mistyped line being lost and being moved. The
+                // `get` is the lint's form of the slice beside it and NOT a
+                // handled case: the `truncate`/`drain` on the next line rests
+                // on the same index, so both hold or neither does.
+                0x0b => {
+                    last_kill = self.kill_text(buf.get(pos..).unwrap_or_default(), false, was_kill);
+                    buf.truncate(pos);
+                }
                 0x15 => {
+                    last_kill = self.kill_text(buf.get(..pos).unwrap_or_default(), true, was_kill);
                     buf.drain(..pos);
                     pos = 0;
                 }
                 // Ctrl-W: kill the word before the cursor.
                 0x17 => {
                     let start = word_start(&buf, pos);
+                    last_kill =
+                        self.kill_text(buf.get(start..pos).unwrap_or_default(), true, was_kill);
                     buf.drain(start..pos);
                     pos = start;
+                }
+                // Ctrl-Y: put the kill buffer back at the cursor, which then
+                // sits AFTER it -- so a second Ctrl-Y inserts a second copy
+                // rather than overwriting the first. `pos` is a boundary and
+                // the buffer holds whole characters, so the insert cannot
+                // split one and the byte count lands on a boundary too.
+                0x19 => {
+                    buf.insert_str(pos, &self.kill);
+                    pos = pos.saturating_add(self.kill.len());
                 }
                 // Ctrl-L: clear the screen and redraw on the top line.
                 0x0c => {
@@ -1716,6 +1775,7 @@ mod tests {
             history: lines.iter().map(|s| (*s).to_string()).collect(),
             max: DEFAULT_MAX,
             hist: None,
+            kill: String::new(),
         }
     }
 
@@ -1913,6 +1973,161 @@ mod tests {
         ] {
             assert_eq!(word_start(line, pos), want, "{line:?} at {pos}");
         }
+    }
+
+    /// What a kill key takes, Ctrl-Y puts back -- and the cursor lands AFTER
+    /// it, so a second Ctrl-Y inserts a second copy rather than overwriting.
+    #[test]
+    fn a_kill_can_be_yanked_back() {
+        let mut ed = Editor::new();
+        assert_eq!(submitted(&mut ed, b"echo abc def\x17\x19\r"), "echo abc def");
+        // The `X` proves where the cursor was left.
+        assert_eq!(submitted(&mut ed, b"echo abc \x17\x19X\r"), "echo abc X");
+        assert_eq!(submitted(&mut ed, b"echo abc def\x17\x19\x19\r"), "echo abc defdef");
+        // Ctrl-Y with nothing killed is a no-op, not an empty insert that
+        // moves the cursor.
+        let mut ed = Editor::new();
+        assert_eq!(submitted(&mut ed, b"abc\x19X\r"), "abcX");
+    }
+
+    /// Consecutive kills ACCUMULATE, and on the side they were taken from --
+    /// so `^W ^W` yanks the two words back in the order they were typed rather
+    /// than reversed. Every case here is what bash 5.2 does with the same keys.
+    #[test]
+    fn consecutive_kills_accumulate_in_typing_order() {
+        let mut ed = Editor::new();
+        assert_eq!(submitted(&mut ed, b"echo abc def ghi\x17\x17\x19\r"), "echo abc def ghi");
+        assert_eq!(submitted(&mut ed, b"echo a b c d\x17\x17\x17\x19\r"), "echo a b c d");
+        // A FORWARD kill appends where a backward one prepends: Ctrl-K takes
+        // `abc def`, Ctrl-U then takes `echo ` from in front of it.
+        assert_eq!(
+            submitted(&mut ed, b"echo abc def\x01\x06\x06\x06\x06\x06\x0b\x15\x19\r"),
+            "echo abc def"
+        );
+        // The same pair the other way round, which is the only way a Ctrl-K
+        // is ever the SECOND kill of a run and so the only way its side
+        // shows: Ctrl-U leaves the rest of the line with the cursor at its
+        // start, and the Ctrl-K after it appends rather than prepending.
+        assert_eq!(
+            submitted(&mut ed, b"echo abc def\x01\x06\x06\x06\x06\x06\x15\x0b\x19\r"),
+            "echo abc def"
+        );
+    }
+
+    /// The run is only ever CONSECUTIVE kills: any other key ends it, and the
+    /// next kill starts the buffer over. A yank is one of those other keys,
+    /// and so is a history recall, which replaces the whole line.
+    #[test]
+    fn a_key_that_is_not_a_kill_ends_the_run() {
+        let mut ed = Editor::new();
+        // Ctrl-B Ctrl-F leaves the cursor exactly where it was, so what breaks
+        // the run is the KEY rather than the movement.
+        assert_eq!(submitted(&mut ed, b"echo abc def ghi\x17\x02\x06\x17\x19\r"), "echo abc def ");
+        // A yank between two kills likewise: the second Ctrl-W starts fresh,
+        // so the third accumulates onto it alone.
+        assert_eq!(submitted(&mut ed, b"echo abc def\x17\x19\x17\x17\x19\r"), "echo abc def");
+        // Ctrl-P: the recalled line's own Ctrl-W must not prepend to what was
+        // killed off the line it replaced.
+        let mut ed = Editor::new();
+        ed.remember("echo hello world");
+        assert_eq!(submitted(&mut ed, b"echo aa bb\x17\x10\x17\x19\r"), "echo hello world");
+    }
+
+    /// A kill that takes NOTHING keeps the buffer -- Ctrl-K at the end of a
+    /// line must not throw away what is in it -- but still ends the run.
+    #[test]
+    fn a_kill_that_takes_nothing_keeps_the_buffer_and_ends_the_run() {
+        let mut ed = Editor::new();
+        assert_eq!(submitted(&mut ed, b"echo abc\x01\x0b\x0b\x19\r"), "echo abc");
+        // The empty Ctrl-K sits between two kills: with the run ended, the
+        // second Ctrl-W replaces `def` rather than prepending to it.
+        let mut ed = Editor::new();
+        assert_eq!(submitted(&mut ed, b"echo abc def\x17\x0b\x17\x19\r"), "echo abc ");
+        // ...and with the run ALREADY closed, which is the case an operator
+        // reaches by killing, moving, and pressing Ctrl-K at the end of a
+        // line. Both branches keep the buffer, and only one of them was
+        // reachable from the two cases above.
+        let mut ed = Editor::new();
+        assert_eq!(submitted(&mut ed, b"echo aa bb\x17\x02\x06\x0b\x19\r"), "echo aa bb");
+    }
+
+    /// Every kill ends the run when it takes nothing, not only Ctrl-K. An
+    /// empty Ctrl-W or Ctrl-U is what the cursor at column 0 gives.
+    #[test]
+    fn an_empty_kill_of_any_kind_ends_the_run() {
+        // Ctrl-U leaves the cursor at column 0, so the key after it kills
+        // nothing; the Ctrl-K then starts the buffer over rather than
+        // appending `bb` to `echo aa `.
+        for empty in [b'\x17', b'\x15', b'\x7f', b'\x04'] {
+            let mut ed = Editor::new();
+            let mut keys = b"echo aa bb\x01\x06\x06\x06\x06\x06\x06\x06\x06\x15".to_vec();
+            keys.push(empty);
+            keys.extend_from_slice(b"\x0b\x19\r");
+            // Only Ctrl-D takes anything there: backspace at column 0 has
+            // nothing before the cursor either, and it ends the run all the
+            // same, which is the property.
+            let want = match empty {
+                b'\x04' => "b",
+                _ => "bb",
+            };
+            assert_eq!(submitted(&mut ed, &keys), want, "key {empty:#04x}");
+        }
+    }
+
+    /// Deleting a character is not killing it: neither key feeds the buffer,
+    /// and neither clears it.
+    #[test]
+    fn backspace_and_delete_forward_are_not_kills() {
+        let mut ed = Editor::new();
+        // Ctrl-K fills the buffer with `abc` and Ctrl-Y puts it back; the
+        // backspace then takes the `c` without the buffer noticing.
+        assert_eq!(submitted(&mut ed, b"abc\x01\x0b\x19\x7f\x19\r"), "ababc");
+        let mut ed = Editor::new();
+        // Same with delete-forward, which is Ctrl-D anywhere but an empty line.
+        assert_eq!(submitted(&mut ed, b"abc\x01\x0b\x19\x01\x04\x19\r"), "abcbc");
+    }
+
+    /// Both halves work at the CURSOR: Ctrl-W takes the word in front of it
+    /// rather than the rest of the line, and Ctrl-Y puts the buffer there
+    /// rather than at the end.
+    #[test]
+    fn the_kill_and_the_yank_act_at_the_cursor() {
+        let mut ed = Editor::new();
+        // Cursor between `def` and `ghi`: the Ctrl-W takes `def` alone, and
+        // Ctrl-E then puts the yank at the end so the two are told apart.
+        let mut keys = b"echo abc def ghi\x01".to_vec();
+        keys.extend(std::iter::repeat_n(b'\x06', 12));
+        keys.extend_from_slice(b"\x17\x05\x19\r");
+        assert_eq!(submitted(&mut ed, &keys), "echo abc  ghidef");
+        // A yank with text after the cursor lands where the cursor is.
+        let mut ed = Editor::new();
+        assert_eq!(submitted(&mut ed, b"echo aa bb\x17\r"), "echo aa ");
+        assert_eq!(submitted(&mut ed, b"echo XY\x01\x06\x06\x06\x06\x06\x19\r"), "echo bbXY");
+    }
+
+    /// The buffer outlives the LINE, which is what makes the kill keys a way
+    /// to move text between commands.
+    #[test]
+    fn the_kill_buffer_outlives_the_line() {
+        let mut ed = Editor::new();
+        assert_eq!(submitted(&mut ed, b"echo abc def\x17\r"), "echo abc ");
+        assert_eq!(submitted(&mut ed, b"echo one \x19\r"), "echo one def");
+        // The RUN does not, though nothing can tell: a fresh line's buffer is
+        // empty, so its first kill takes nothing and closes the run itself
+        // whatever it inherited. This pins only that the Ctrl-W replaces
+        // `def` rather than prepending `two` to it.
+        assert_eq!(submitted(&mut ed, b"echo one two\x17\x19\r"), "echo one two");
+    }
+
+    /// The buffer is text rather than bytes, so a kill that ends mid-character
+    /// is not representable and a yank cannot split one. The `X` is what pins
+    /// the cursor: it moves by BYTES, and a count of CHARACTERS would leave it
+    /// inside the `本` here rather than past the `x`.
+    #[test]
+    fn a_multibyte_kill_round_trips() {
+        let mut ed = Editor::new();
+        let keys = "echo 日本語 x\x17\x17\x19X\r".as_bytes();
+        assert_eq!(submitted(&mut ed, keys), "echo 日本語 xX");
     }
 
     /// A line that fits is drawn whole and unscrolled, with the cursor where the
