@@ -493,6 +493,28 @@ impl Editor {
                     Escape::Key(Key::Home) => pos = 0,
                     Escape::Key(Key::End) => pos = buf.len(),
                     Escape::Key(Key::Delete) => delete_forward(&mut buf, pos),
+                    // The META prefix: a terminal sends Alt-<key> as ESC and
+                    // then the key, so this is where readline's word bindings
+                    // live. Both cases, because readline answers to either.
+                    Escape::Literal(b'b' | b'B') => pos = word_back(&buf, pos),
+                    Escape::Literal(b'f' | b'F') => pos = word_forward(&buf, pos),
+                    Escape::Literal(b'd' | b'D') => {
+                        let end = word_forward(&buf, pos);
+                        last_kill =
+                            self.kill_text(buf.get(pos..end).unwrap_or_default(), false, was_kill);
+                        buf.drain(pos..end);
+                    }
+                    // Alt-Backspace, whichever byte the terminal sends for it.
+                    // Both had a meaning here before: a one-character delete.
+                    Escape::Literal(0x7f | 0x08) => {
+                        let start = word_back(&buf, pos);
+                        last_kill =
+                            self.kill_text(buf.get(start..pos).unwrap_or_default(), true, was_kill);
+                        buf.drain(start..pos);
+                        pos = start;
+                    }
+                    // Not a binding: the byte comes back as an ordinary key,
+                    // which is what makes ESC then Enter submit the line.
                     Escape::Literal(b) => pending = Some(b),
                     Escape::Unknown => {}
                 },
@@ -1095,6 +1117,51 @@ fn word_start(buf: &str, pos: usize) -> usize {
         let prev = prev_boundary(buf, at);
         match buf.get(prev..at).and_then(|s| s.chars().next()) {
             Some(c) if !c.is_whitespace() => at = prev,
+            _ => break,
+        }
+    }
+    at
+}
+
+/// Where the word at or after `pos` ends: the non-alphanumerics first, then the
+/// run of alphanumerics — readline's `forward-word`.
+///
+/// ALPHANUMERIC, which is deliberately not `word_start`'s blanks-only rule:
+/// `foo-bar` is one word to Ctrl-W and two to these, and both are shipped.
+/// Rust's classifier is not glibc's — see
+/// `the_word_characters_are_rusts_not_readlines`.
+fn word_forward(buf: &str, pos: usize) -> usize {
+    let mut at = pos;
+    while at < buf.len() {
+        match buf.get(at..).and_then(|s| s.chars().next()) {
+            Some(c) if !c.is_alphanumeric() => at = next_boundary(buf, at),
+            _ => break,
+        }
+    }
+    while at < buf.len() {
+        match buf.get(at..).and_then(|s| s.chars().next()) {
+            Some(c) if c.is_alphanumeric() => at = next_boundary(buf, at),
+            _ => break,
+        }
+    }
+    at
+}
+
+/// Where the word before `pos` begins, by the same rule backwards —
+/// readline's `backward-word`.
+fn word_back(buf: &str, pos: usize) -> usize {
+    let mut at = pos;
+    while at > 0 {
+        let prev = prev_boundary(buf, at);
+        match buf.get(prev..at).and_then(|s| s.chars().next()) {
+            Some(c) if !c.is_alphanumeric() => at = prev,
+            _ => break,
+        }
+    }
+    while at > 0 {
+        let prev = prev_boundary(buf, at);
+        match buf.get(prev..at).and_then(|s| s.chars().next()) {
+            Some(c) if c.is_alphanumeric() => at = prev,
             _ => break,
         }
     }
@@ -1975,6 +2042,157 @@ mod tests {
         }
     }
 
+    /// Alt-B / Alt-F walk ALPHANUMERIC words, which is not Ctrl-W's rule: the
+    /// non-word characters first, then the run of word characters.
+    #[test]
+    fn the_alt_words_are_alphanumeric_runs() {
+        for (line, pos, want) in [
+            ("echo foo bar", 0, 4),
+            ("echo foo bar", 4, 8),
+            // `-` is not alphanumeric, so `foo-bar` is TWO words here where
+            // `word_start` sees one.
+            ("echo foo-bar", 4, 8),
+            ("echo foo", 8, 8),
+            ("", 0, 0),
+            ("   ", 0, 3),
+            ("echo   foo", 4, 10),
+            // The leading skip is over NON-WORD characters, not over blanks:
+            // starting on punctuation has to cross it, or the walk cannot
+            // move at all from here.
+            ("echo -bar", 5, 9),
+            // `_` is not alphanumeric either, which is where this rule and
+            // most editors' idea of a word part company.
+            ("echo foo_bar", 4, 8),
+            // A CJK character is alphanumeric, so it is word text.
+            ("日本 x", 0, 6),
+        ] {
+            assert_eq!(word_forward(line, pos), want, "forward {line:?} at {pos}");
+        }
+        for (line, pos, want) in [
+            ("echo foo bar", 12, 9),
+            ("echo foo bar", 9, 5),
+            ("echo foo-bar", 12, 9),
+            ("echo foo", 0, 0),
+            ("echo foo bar   ", 15, 9),
+            ("", 0, 0),
+            ("echo f", 6, 5),
+            // Ending on punctuation, the mirror of the forward case above.
+            ("echo foo-", 9, 5),
+            ("echo foo_bar", 12, 9),
+            ("echo 日本 x", 12, 5),
+        ] {
+            assert_eq!(word_back(line, pos), want, "back {line:?} at {pos}");
+        }
+    }
+
+    /// Where this classifier and readline's PART COMPANY, recorded rather than
+    /// left to be discovered. `char::is_alphanumeric` is Alphabetic plus the
+    /// three Unicode number categories; glibc's `iswalnum` is a different set
+    /// and is not even locale-independent, so exact parity would need category
+    /// tables `std` does not expose and a dependency this crate will not take.
+    /// Every row was measured against bash 5.2 through a PTY.
+    #[test]
+    fn the_word_characters_are_rusts_not_readlines() {
+        // `A<c>B` walked back from the end: a word character makes the whole
+        // run one word, a separator stops the walk at the `B`.
+        let one_word = |c: char| {
+            let line = format!("A{c}B");
+            word_back(&line, line.len()) == 0
+        };
+        for c in ['a', 'α', '日', '1', 'Ⅷ'] {
+            assert!(one_word(c), "{c:?} should be word text");
+        }
+        for c in ['_', '-', ' ', '/', '.'] {
+            assert!(!one_word(c), "{c:?} should not be word text");
+        }
+        // Rust takes the `No` category and bash does not...
+        for c in ['²', '½', '①'] {
+            assert!(one_word(c), "{c:?} is word text here but not in bash");
+        }
+        // ...and refuses a nonspacing combining mark, which bash accepts. So
+        // DECOMPOSED text is where the two visibly differ: `é` written as
+        // `e` + U+0301 is two words here and one there.
+        assert!(!one_word('\u{301}'), "a combining mark is a separator here");
+    }
+
+    /// Alt-B and Alt-F, end to end. Every case here is what bash 5.2 does with
+    /// the same keys, and readline answers to either case of the letter.
+    #[test]
+    fn the_alt_keys_move_by_a_word() {
+        let mut ed = Editor::new();
+        assert_eq!(submitted(&mut ed, b"echo foo bar baz\x1bbX\r"), "echo foo bar Xbaz");
+        assert_eq!(submitted(&mut ed, b"echo foo bar baz\x1bb\x1bbX\r"), "echo foo Xbar baz");
+        assert_eq!(submitted(&mut ed, b"echo foo-bar\x1bbX\r"), "echo foo-Xbar");
+        // At either end the move is a no-op rather than an error.
+        assert_eq!(submitted(&mut ed, b"echo foo\x01\x1bbX\r"), "Xecho foo");
+        assert_eq!(submitted(&mut ed, b"echo foo\x1bfX\r"), "echo fooX");
+        assert_eq!(submitted(&mut ed, b"echo foo bar\x01\x1bfX\r"), "echoX foo bar");
+        assert_eq!(submitted(&mut ed, b"echo foo bar\x01\x1bf\x1bfX\r"), "echo fooX bar");
+        // Uppercase is the same binding -- for all three letters, since each
+        // is a separate arm and an unbound one types its byte instead.
+        assert_eq!(submitted(&mut ed, b"echo foo bar\x1bBX\r"), "echo foo Xbar");
+        assert_eq!(submitted(&mut ed, b"echo foo bar\x01\x1bFX\r"), "echoX foo bar");
+        let mut ed = Editor::new();
+        assert_eq!(submitted(&mut ed, b"echo aa bb\x01\x1bD\x05\x19\r"), " aa bbecho");
+        // The cursor moves by BYTES over characters that are not one byte.
+        assert_eq!(submitted(&mut ed, "echo 日本 x\x1bb\x1bbX\r".as_bytes()), "echo X日本 x");
+    }
+
+    /// Alt-Backspace and Ctrl-W take DIFFERENT words, which is the whole
+    /// reason both exist: one takes a path, the other its last segment.
+    #[test]
+    fn alt_backspace_and_ctrl_w_take_different_words() {
+        let mut ed = Editor::new();
+        assert_eq!(submitted(&mut ed, b"echo foo-bar\x1b\x7fX\r"), "echo foo-X");
+        assert_eq!(submitted(&mut ed, b"echo foo-bar\x17X\r"), "echo X");
+        // `ESC ^H` is the other spelling of the same key.
+        assert_eq!(submitted(&mut ed, b"echo foo-bar\x1b\x08X\r"), "echo foo-X");
+    }
+
+    /// The Alt- kills feed the SAME buffer as Ctrl-K/U/W and join the same
+    /// accumulation run, on the side each of them took from.
+    #[test]
+    fn the_alt_kills_feed_the_kill_buffer() {
+        let mut ed = Editor::new();
+        assert_eq!(submitted(&mut ed, b"echo foo-bar\x1b\x7f\x19\r"), "echo foo-bar");
+        // Alt-D is a FORWARD kill, so a second one appends: `aa` then ` bb`.
+        let mut ed = Editor::new();
+        let mut keys = b"echo aa bb cc\x01".to_vec();
+        keys.extend(std::iter::repeat_n(b'\x06', 5));
+        keys.extend_from_slice(b"\x1bd\x1bd\x05\x19\r");
+        assert_eq!(submitted(&mut ed, &keys), "echo  ccaa bb");
+        // ...and a Ctrl-W after one prepends to what it took, so the two
+        // kinds of kill share one run rather than one each.
+        let mut ed = Editor::new();
+        let mut keys = b"echo aa bb cc\x01".to_vec();
+        keys.extend(std::iter::repeat_n(b'\x06', 5));
+        keys.extend_from_slice(b"\x1bd\x17\x05\x19\r");
+        assert_eq!(submitted(&mut ed, &keys), " bb ccecho aa");
+        // An Alt-D with nothing in front of it keeps the buffer, as every
+        // other empty kill does.
+        let mut ed = Editor::new();
+        assert_eq!(submitted(&mut ed, b"echo aa bb\x17\x05\x1bd\x19\r"), "echo aa bb");
+        // Alt-Backspace is a BACKWARD kill, which only shows when it is the
+        // SECOND kill of a run -- the same blind spot Ctrl-K has, since a
+        // first kill lands the same way whichever side it is put on. Alt-D
+        // first, so the buffer it prepends to is not empty.
+        let mut ed = Editor::new();
+        let mut keys = b"echo aa bb\x01".to_vec();
+        keys.extend(std::iter::repeat_n(b'\x06', 5));
+        keys.extend_from_slice(b"\x1bd\x1b\x7f\x05\x19\r");
+        assert_eq!(submitted(&mut ed, &keys), " bbecho aa");
+    }
+
+    /// A meta byte that is NOT a binding still comes back as an ordinary key.
+    /// This is where td-sh diverges from readline deliberately: bash discards
+    /// it, and discarding it would take ESC-then-Enter with it.
+    #[test]
+    fn an_unbound_meta_byte_is_still_typed() {
+        let mut ed = Editor::new();
+        assert_eq!(submitted(&mut ed, b"echo hi\x1bzZ\r"), "echo hizZ");
+        assert_eq!(submitted(&mut ed, b"echo hi\x1b\r"), "echo hi");
+    }
+
     /// What a kill key takes, Ctrl-Y puts back -- and the cursor lands AFTER
     /// it, so a second Ctrl-Y inserts a second copy rather than overwriting.
     #[test]
@@ -2482,10 +2700,12 @@ mod tests {
         assert_eq!(submitted(&mut ed, b"ac\x1b[1;5DB\r"), "aBc");
         // An unknown sequence is swallowed rather than typed.
         assert_eq!(submitted(&mut ed, b"ab\x1b[15~\r"), "ab");
-        // ESC followed by a byte that starts no sequence: the byte comes back,
-        // so ESC-then-Enter submits rather than eating the Enter.
+        // ESC followed by a byte that starts no sequence and is no BINDING:
+        // the byte comes back, so ESC-then-Enter submits rather than eating
+        // the Enter. `z` rather than `b`, which is Alt-B -- see
+        // `an_unbound_meta_byte_is_still_typed`.
         assert_eq!(submitted(&mut ed, b"ab\x1b\r"), "ab");
-        assert_eq!(submitted(&mut ed, b"a\x1bb\r"), "ab");
+        assert_eq!(submitted(&mut ed, b"a\x1bz\r"), "az");
     }
 
     #[test]
