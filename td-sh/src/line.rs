@@ -389,6 +389,25 @@ impl Editor {
                 0x0c => {
                     let _ = write!(out, "\x1b[H\x1b[2J");
                 }
+                // Ctrl-R: reverse incremental search. The key that ENDED it
+                // comes back to be dispatched here, which is what makes Enter
+                // run what was found and Ctrl-A go to its start.
+                0x12 => {
+                    pending = self.reverse_search(
+                        prompt,
+                        keys,
+                        out,
+                        &mut buf,
+                        &mut pos,
+                        &mut browse,
+                        &mut draft,
+                        &mut width,
+                    );
+                    if pending.is_none() {
+                        return Input::Eof;
+                    }
+                    continue;
+                }
                 // Ctrl-P / Ctrl-N, and the arrows below arrive here too.
                 0x10 => self.browse(-1, &mut browse, &mut buf, &mut pos, &mut draft),
                 0x0e => self.browse(1, &mut browse, &mut buf, &mut pos, &mut draft),
@@ -472,6 +491,127 @@ impl Editor {
             width = (keys.width)().unwrap_or(width);
             draw(out, prompt, &buf, pos, width);
         }
+    }
+
+    /// Ctrl-R: readline's reverse incremental search, which busybox mimics
+    /// (`reverse_i_search`, lineedit.c:2325). The prompt becomes
+    /// `(reverse-i-search)'…': `, every printable key narrows the pattern, and
+    /// Ctrl-R again steps to the next OLDER match. The cursor lands on the
+    /// match inside the line rather than at either end of it.
+    ///
+    /// Returns the byte that ENDED the search, for the caller to dispatch as
+    /// an ordinary key — busybox's `goto again`, and the whole ergonomics of
+    /// the thing: Enter runs what was found, Ctrl-A goes to its start, Ctrl-C
+    /// abandons it, and none of that is written here. `None` is end of input.
+    #[allow(clippy::too_many_arguments)]
+    fn reverse_search<W: Write>(
+        &self,
+        prompt: &str,
+        keys: &mut Keys<'_>,
+        out: &mut W,
+        buf: &mut String,
+        pos: &mut usize,
+        browse: &mut usize,
+        draft: &mut String,
+        width: &mut u16,
+    ) -> Option<u8> {
+        let mut pattern = String::new();
+        let mut pending: Option<u8> = None;
+        loop {
+            *width = (keys.width)().unwrap_or(*width);
+            draw(out, &format!("(reverse-i-search)'{pattern}': "), buf, *pos, *width);
+            let Some(b) = pending.take().or_else(&mut *keys.next) else {
+                // Closed stdin. Put the real prompt back on the way out, so
+                // EVERY exit from the search leaves one -- otherwise the last
+                // thing on the screen is a search that is no longer running.
+                draw(out, prompt, buf, *pos, *width);
+                return None;
+            };
+            // What the pattern goes back to if this key finds nothing. A
+            // shortening key leaves it already shorter, and truncating to a
+            // length past the end does nothing, so one line covers both.
+            let restore = pattern.len();
+            let mut older = false;
+            // The two bytes the DRIVER owns are the caller's here too. With
+            // `ISIG` cleared the EDITOR is what implements them, so a search
+            // that took them as pattern text would be a hole in that
+            // emulation exactly where the operator had moved the key --
+            // `stty intr x`, and Ctrl-R makes `x` unable to interrupt.
+            if Some(b) == keys.intr || Some(b) == keys.eof {
+                draw(out, prompt, buf, *pos, *width);
+                return Some(b);
+            }
+            match b {
+                // Backspace, both spellings: a CHARACTER off the pattern.
+                0x7f | 0x08 => {
+                    pattern.pop();
+                }
+                0x12 => older = true,
+                // Every other control byte ends the search and belongs to the
+                // caller. The real prompt goes back FIRST: if the key is Enter
+                // the caller returns the line at once and never redraws, and
+                // the search prompt would be what stays above the output.
+                0x00..=0x1f => {
+                    draw(out, prompt, buf, *pos, *width);
+                    return Some(b);
+                }
+                _ => {
+                    let (typed, back) = character(&mut *keys.next, b);
+                    if let Some(c) = typed {
+                        pattern.push(c);
+                    }
+                    pending = back;
+                }
+            }
+            // From where the operator already is, INCLUSIVE — except after a
+            // Ctrl-R, which starts one older. That exception is what makes
+            // repeated Ctrl-R walk back through the matches instead of
+            // finding the same one every time.
+            let from = match older {
+                true => browse.checked_sub(1),
+                false => Some(*browse),
+            };
+            match from.and_then(|f| self.search_back(&pattern, f)) {
+                Some((h, at)) => {
+                    // Park the draft before leaving it, exactly as `browse`
+                    // does, or arrowing back down to it restores a stale one.
+                    if *browse == self.history.len() {
+                        draft.clone_from(buf);
+                    }
+                    if let Some(line) = self.history.get(h) {
+                        buf.clone_from(line);
+                    }
+                    *browse = h;
+                    *pos = at;
+                }
+                None => {
+                    // The key that found nothing is TAKEN BACK, so what is on
+                    // screen always matches something. Silence would leave the
+                    // operator unable to tell a rejected key from an ignored
+                    // one, which is what the bell is for.
+                    pattern.truncate(restore);
+                    let _ = out.write_all(b"\x07");
+                }
+            }
+        }
+    }
+
+    /// The newest history line at or before `from` containing `pattern`, and
+    /// where in it the match starts.
+    ///
+    /// `match_indices` rather than the obvious search method, whose bare name
+    /// is a token the ladder's host-tool guard refuses anywhere in these
+    /// sources.
+    fn search_back(&self, pattern: &str, from: usize) -> Option<(usize, usize)> {
+        for i in (0..=from).rev() {
+            let Some(line) = self.history.get(i) else {
+                continue;
+            };
+            if let Some((at, _)) = line.match_indices(pattern).next() {
+                return Some((i, at));
+            }
+        }
+        None
     }
 
     /// Step `delta` through the history, parking the line being typed at the
@@ -2543,6 +2683,194 @@ mod tests {
         assert_eq!(l.kept.first().map(String::as_str), Some("ok"));
         assert_eq!(l.kept.last().map(String::as_str), Some("last"));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The LAST search prompt in a drawn transcript. `drawn` accumulates every
+    /// redraw, so it holds every PREFIX of the pattern -- asserting that it
+    /// `contains` one says only that it was passed through on the way, which
+    /// is true whether or not the key that should have shortened it worked.
+    fn last_search(drawn: &str) -> String {
+        let mut pattern = String::new();
+        for (i, m) in drawn.match_indices("(reverse-i-search)'") {
+            let Some(rest) = drawn.get(i.saturating_add(m.len())..) else {
+                continue;
+            };
+            if let Some((p, _)) = rest.split_once("': ") {
+                pattern = p.to_string();
+            }
+        }
+        pattern
+    }
+
+    /// Ctrl-R searches backwards as it is typed, puts the cursor ON the match,
+    /// and steps to the next older one on another Ctrl-R.
+    #[test]
+    fn reverse_search_walks_back_through_the_matches() {
+        let mut ed = Editor::new();
+        for line in ["echo one", "grep alpha", "echo two", "ls -l"] {
+            ed.remember(line);
+        }
+        // `\x12` then `ec`: the newest line containing `ec` is `echo two`.
+        assert_eq!(submitted(&mut ed, b"\x12ec\r"), "echo two");
+        // A second Ctrl-R steps PAST it to the older `echo one`.
+        assert_eq!(submitted(&mut ed, b"\x12ec\x12\r"), "echo one");
+        // ...and a third finds nothing older, so it stays where it was.
+        assert_eq!(submitted(&mut ed, b"\x12ec\x12\x12\r"), "echo one");
+        // The search prompt is readline's, and the cursor sits on the match:
+        // `alpha` starts at column 5 of `grep alpha`, so with a two-character
+        // prompt the cursor is at column 7.
+        let (_, drawn) = typed(&mut ed, b"\x12alpha\r", 80, true);
+        assert!(drawn.contains("(reverse-i-search)'alpha': "), "{drawn:?}");
+        assert!(drawn.contains("$ grep alpha\x1b[K\r\x1b[7C"), "cursor not on the match: {drawn:?}");
+    }
+
+    /// Backspace widens the pattern again, and a key that would match nothing
+    /// is TAKEN BACK -- so what is on screen always matches something -- with
+    /// a bell, since otherwise a rejected key and an ignored one look alike.
+    #[test]
+    fn reverse_search_takes_back_a_key_that_matches_nothing() {
+        let mut ed = Editor::new();
+        ed.remember("echo hello");
+        ed.remember("ls -l");
+        // `echo hello` has no `x`, so the `x` is dropped and `ech` stands.
+        let (got, drawn) = typed(&mut ed, b"\x12echx\r", 80, true);
+        assert!(matches!(got, Input::Line(ref t) if t == "echo hello"), "{got:?}");
+        assert!(drawn.contains('\x07'), "no bell for a key that matched nothing");
+        assert_eq!(last_search(&drawn), "ech", "the failed key stuck");
+
+        // Backspace widens the pattern, and the proof is that a WIDER one
+        // reaches a different line: `echo t` is on `echo two`, and backing
+        // off the `t` to type `one` moves to `echo one`.
+        let mut ed = Editor::new();
+        ed.remember("echo one");
+        ed.remember("echo two");
+        assert_eq!(submitted(&mut ed, b"\x12echo t\x7fone\r"), "echo one");
+        // ...and `^H` is the same key, not a control byte that ends the
+        // search and then eats a character out of the recalled line.
+        assert_eq!(submitted(&mut ed, b"\x12echo t\x08one\r"), "echo one");
+        // The prompt ends where the pattern really is, not where it passed.
+        let (_, drawn) = typed(&mut ed, b"\x12echo t\x7f\r", 80, true);
+        assert_eq!(last_search(&drawn), "echo ");
+    }
+
+    /// The search starts from where the operator ALREADY IS, not from the
+    /// newest line -- the other half of the rule whose exception is Ctrl-R.
+    #[test]
+    fn reverse_search_starts_from_where_the_operator_is() {
+        let mut ed = Editor::new();
+        for line in ["echo one", "grep alpha", "echo two", "ls -l"] {
+            ed.remember(line);
+        }
+        // Three Ctrl-P's land on `grep alpha`, which is OLDER than `echo two`.
+        // Searching `ec` from there must reach `echo one` behind it; a search
+        // that restarted from the newest line would answer `echo two`.
+        assert_eq!(submitted(&mut ed, b"\x10\x10\x10\x12ec\r"), "echo one");
+    }
+
+    /// Within a line it is the FIRST occurrence, as busybox's `strstr` is --
+    /// which is what puts the cursor at the start of what was searched for.
+    #[test]
+    fn reverse_search_takes_the_first_match_in_the_line() {
+        let mut ed = Editor::new();
+        ed.remember("echo echo hi");
+        // Ctrl-L ends the search without moving the cursor, so the `X` lands
+        // where the match put it: at the FIRST `echo`, not the second.
+        assert_eq!(submitted(&mut ed, b"\x12echo\x0cX\r"), "Xecho echo hi");
+    }
+
+    /// A byte `character` read and did not want comes BACK, for the reason
+    /// `escape`'s does: a truncated multi-byte sequence must cost the
+    /// character, not the keystroke after it.
+    #[test]
+    fn a_pushed_back_byte_is_not_lost_by_the_search() {
+        let mut ed = Editor::new();
+        ed.remember("echo hello");
+        // `\xc3` starts a two-byte character; the `l` after it is not a
+        // continuation byte, so the character is dropped and the `l` is the
+        // next key -- leaving `hell`, not `hel`.
+        let (got, drawn) = typed(&mut ed, b"\x12hel\xc3l\r", 80, true);
+        assert!(matches!(got, Input::Line(ref t) if t == "echo hello"), "{got:?}");
+        assert_eq!(last_search(&drawn), "hell", "the pushed-back byte was lost");
+    }
+
+    /// The key that ends the search is DISPATCHED, not eaten: that is what
+    /// makes Enter run what was found and Ctrl-A go to its start.
+    #[test]
+    fn the_key_that_ends_a_reverse_search_is_dispatched() {
+        let mut ed = Editor::new();
+        ed.remember("echo hello");
+        // Ctrl-A leaves the search and moves to the start, so what is typed
+        // next lands there.
+        assert_eq!(submitted(&mut ed, b"\x12hello\x01X\r"), "Xecho hello");
+        // Ctrl-C abandons the line, as it does anywhere else.
+        assert!(matches!(typed(&mut ed, b"\x12hello\x03", 80, true).0, Input::Interrupted));
+        // An arrow key arrives as ESC and is re-dispatched whole, so it browses
+        // rather than typing `[A` into the line.
+        assert_eq!(submitted(&mut ed, b"\x12hello\x1b[A\r"), "echo hello");
+        // A search that found nothing leaves the line alone.
+        assert_eq!(submitted(&mut ed, b"draft\x12zz\r"), "draft");
+        // ...and the real prompt is back before the line is handed over.
+        let (_, drawn) = typed(&mut ed, b"\x12hello\r", 80, true);
+        assert!(drawn.ends_with("$ echo hello\x1b[K\r\x1b[7C"), "prompt not restored: {drawn:?}");
+    }
+
+    /// A multi-byte pattern is matched by CHARACTER and the cursor lands on a
+    /// character boundary: `pos` off a boundary is an abort inside
+    /// `String::insert`, and the search is the one place it comes from a
+    /// string offset rather than from the two boundary walkers.
+    #[test]
+    fn reverse_search_handles_multibyte_patterns() {
+        let mut ed = Editor::new();
+        ed.remember("echo 日本語");
+        ed.remember("ls");
+        // `本` is at byte 8 of `echo 日本語`; typing it must leave the cursor
+        // there and not inside the character before it.
+        assert_eq!(submitted(&mut ed, b"\x12\xe6\x9c\xac\r"), "echo 日本語");
+        let (_, drawn) = typed(&mut ed, b"\x12\xe6\x9c\xac\r", 80, true);
+        assert!(drawn.contains("(reverse-i-search)'本': "), "{drawn:?}");
+        // Ctrl-L ends the search without moving the cursor, and typing there
+        // then inserts ON the boundary rather than aborting inside `insert`.
+        // (Typing WITHOUT leaving would narrow the pattern instead: inside a
+        // search every printable key is pattern text.)
+        assert_eq!(submitted(&mut ed, b"\x12\xe6\x9c\xac\x0cX\r"), "echo 日X本語");
+        // Backspacing the pattern takes a whole CHARACTER, so it is empty
+        // again rather than half of one -- and an empty pattern matches at
+        // the start of the line it is already on.
+        assert_eq!(submitted(&mut ed, b"\x12\xe6\x9c\xac\x7f\x0cq\r"), "qecho 日本語");
+    }
+
+    /// A REBOUND interrupt or end-of-input byte ends the search too. With
+    /// `ISIG` cleared the editor is what implements those two, so taking them
+    /// as pattern text would be a hole in the emulation exactly where the
+    /// operator had moved the key.
+    #[test]
+    fn a_rebound_control_byte_still_ends_a_reverse_search() {
+        let mut ed = Editor::new();
+        ed.remember("echo hello");
+        // `stty intr x`: inside a search, `x` interrupts rather than being
+        // searched for -- and `\x03` is then an ordinary byte.
+        let mut src = b"\x12hellox".iter().copied();
+        let mut next = || src.next();
+        let mut w = || Some(80u16);
+        let mut k = Keys { next: &mut next, width: &mut w, intr: Some(b'x'), eof: Some(0x04) };
+        let mut out: Vec<u8> = Vec::new();
+        let c = |_: &str| Vec::new();
+        let e = |_: &str, _: &str| Vec::new();
+        let got = ed.edit("$ ", &mut k, &mut out, true, &complete::Source {
+            commands: &c,
+            entries: &e,
+        });
+        assert!(matches!(got, Input::Interrupted), "{got:?}");
+    }
+
+    /// Searching away from the line being typed parks it, so arrowing back
+    /// down to it returns the draft rather than a stale one.
+    #[test]
+    fn a_reverse_search_parks_the_draft() {
+        let mut ed = Editor::new();
+        ed.remember("echo hello");
+        // Type a draft, search away from it, then Down twice to come back.
+        assert_eq!(submitted(&mut ed, b"mydraft\x12hello\x0e\r"), "mydraft");
     }
 
     #[test]
