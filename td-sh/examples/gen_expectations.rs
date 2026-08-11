@@ -12,11 +12,12 @@
 //!
 //! It runs every case in <spec-dir> through the built td-sh under the SAME isolated
 //! `-c` harness the gate uses (`td_sh::run_case`), and buckets each case:
-//!   pass  -> unlisted, UNLESS its comment-stripped code reads the repo tree (see
+//!   skip  -> BEFORE running, if its comment-stripped code reads the repo tree (see
 //!            `reads_repo_tree`) or depends on shared `/tmp` state (see
-//!            `depends_on_shared_tmp`): a pass there is a probable false-green,
-//!            because the isolated cwd stages neither, so those are emitted as
-//!            `skip`.
+//!            `depends_on_shared_tmp`): the isolated cwd stages neither, so any
+//!            verdict is a probable false-green. Decided from the code alone, so
+//!            running it first would only leave the shared state behind.
+//!   pass  -> unlisted.
 //!   skip  -> cannot be evaluated faithfully here (times out per the typed
 //!            `CaseOutcome::timed_out`, or is repo-tree/fixture bound, or turns on
 //!            shared `/tmp` state the harness does not control).
@@ -68,13 +69,14 @@ const HEADER: &str = "\
 #           fails) reds the gate, and an unexpected PASS (XPASS) reds it so the
 #           entry is promoted. NOTE on honesty at this scale: many xfails are
 #           status-127 `command not found` failures, because the cleared-env `-c`
-#           harness exposes no external PATH beyond the shell itself and the two
-#           Oils helpers (`argv.py`, `printenv.py`). Those are real mismatches
-#           today, but MEASURE before mining the list, because `not found` is
-#           reported identically for two different things. Some of those names are
+#           harness exposes no external PATH beyond the shell itself and the
+#           `spec_helpers` applets (the Oils `argv.py`/`printenv.py`, and `cat`,
+#           `mkdir`, `touch`, `rm`). Those are real mismatches today, but MEASURE
+#           before mining the list, because `not found` is reported identically
+#           for two different things. Some of those names are
 #           BUILTINS td-sh does not have (`shopt`, `typeset`, `declare`,
 #           `compgen`) and are true shell gaps; the rest are EXTERNALS the harness
-#           withholds (`cat`, `touch`, `mkdir`, `grep`, `sed`, `wc`) and say
+#           still withholds (`grep`, `sed`, `wc`, `od`, `seq`) and say
 #           nothing about the shell. Both groups are large and neither dominates.
 #           No counts are given here on purpose: this file is regenerated wholesale,
 #           so a number in it would silently describe some earlier tree.
@@ -94,9 +96,9 @@ const HEADER: &str = "\
 #               `/tmp/`), the same path reached through `HOME=/tmp`, and a test of
 #               `/tmp`'s own MODE (`-k /tmp`). Sixteen cases `mkdir -p` or `touch`
 #               such a path and then depend on it -- `cd` there and print `pwd`, put
-#               it on `PATH`, make it `$HOME` -- or ask whether `/tmp` is sticky. The
-#               staging command is not on the harness PATH, so whether the path
-#               exists is a fact about the HOST, and so is the mode: five flip
+#               it on `PATH`, make it `$HOME` -- or ask whether `/tmp` is sticky.
+#               Whether the path exists is a fact about the HOST, and so is the
+#               mode: five flip
 #               verdict once an earlier run under a real shell has left the
 #               directories behind, and `-k for sticky bit` flips on any host whose
 #               `/tmp` is not sticky. Listing them either way would red the gate on
@@ -106,6 +108,10 @@ const HEADER: &str = "\
 #               rest would. Fifteen MOVE here; the sixteenth (`builtin-dirs::cd
 #               replaces the lowest entry`) was already skipped by (b), whose
 #               `spec/` token its `/tmp/oils-spec/` path contains.
+#               (b) and (c) are decided from the CODE and so are applied BEFORE the
+#               case is run at all. That was cosmetic while the staging commands
+#               were missing; with `mkdir` and `touch` staged, running one of these
+#               first would CREATE the shared path it is being skipped for.
 #               Bare `/tmp` is deliberately NOT a shape: ten cases need only that it
 #               EXIST, which is universal, and one names the relative `./tmp.sh`.
 #           These heuristics are conservative substring matches over the case code
@@ -227,6 +233,18 @@ fn probe_helper(
         // whole function exists to draw.
         ("printenv.py NOT_SET_HERE", "None\n"),
         ("FOO=bar printenv.py FOO NOT_SET_HERE", "bar\nNone\n"),
+        // The four staged externals, each asked something only it can answer.
+        // `cat` reads what the others made, so the four probes are ONE chain:
+        // a `mkdir` that silently did nothing, a `touch` that truncated instead
+        // of creating, or an `rm` that removed the wrong thing all show up here
+        // rather than as a hundred unexplained shell gaps.
+        ("mkdir -p d/e && touch d/e/f && echo yes > d/e/f && cat d/e/f", "yes\n"),
+        // `touch` must not TRUNCATE what it touches, which is the one way this
+        // applet can be wrong and still look like it worked.
+        ("echo keep > g && touch g && cat g", "keep\n"),
+        ("touch h && rm h && test -e h || echo gone", "gone\n"),
+        // `rm -f` is silent on a file that never existed, and still 0.
+        ("rm -f never-existed && echo ok", "ok\n"),
     ];
     // The probe list is written out rather than generated -- each applet needs
     // a question only IT can answer -- so it can drift from the roster it is
@@ -345,19 +363,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 continue;
             }
             let exec = executable_code(&case.code);
+            // Decided WITHOUT running: both arms below mapped these to `skip`
+            // whatever the outcome, so the verdict is unchanged -- but the run
+            // was not free. Once `mkdir` and `touch` were staged, a case naming
+            // `/tmp/spam` CREATED it on the build host on the way to being
+            // classified as a skip: shared state this harness neither owns nor
+            // cleans, left behind by the very run that decided to ignore it.
+            if reads_repo_tree(&exec) || depends_on_shared_tmp(&exec) {
+                skip.push(key);
+                continue;
+            }
             match run_case(&shell, &helpers, case, ASH_DASH_CHAIN) {
-                Ok(outcome) if outcome.passed => {
-                    // A pass that reads the tree, or that depended on a directory
-                    // the host happened to have, is a probable false-green.
-                    if reads_repo_tree(&exec) || depends_on_shared_tmp(&exec) {
-                        skip.push(key);
-                    }
-                }
+                Ok(outcome) if outcome.passed => {}
                 Ok(outcome) => {
-                    if outcome.timed_out
-                        || reads_repo_tree(&exec)
-                        || depends_on_shared_tmp(&exec)
-                    {
+                    if outcome.timed_out {
                         skip.push(key);
                     } else {
                         xfail.push(key);

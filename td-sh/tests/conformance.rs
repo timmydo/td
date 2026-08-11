@@ -15,18 +15,16 @@
 //!
 //! The `xfail` COUNT is not a backlog, and a large share of it is not about
 //! this shell at all: a case dies the same way on an external program the
-//! harness withholds (PATH holds only a link to the shell under test) as on a
-//! builtin td-sh does not have -- both are `not found`. The overlay header
-//! carries the standing note and the deferred externals rig; measure before
+//! harness withholds as on a builtin td-sh does not have -- both are `not
+//! found`. The overlay header carries the standing note; measure before
 //! mining the list, because the two causes are indistinguishable from the
-//! failure alone. The Oils `.py` helpers WERE a third that looked like both,
-//! and `argv.py`/`printenv.py` are now served by `src/bin/spec_helpers.rs`,
-//! which is why those cases grade.
+//! failure alone. That measurement HAS now been taken (688 of 1249 name a
+//! missing command), and `src/bin/spec_helpers.rs` serves four of those
+//! externals -- `cat`, `mkdir`, `touch`, `rm` -- alongside the Oils `.py`
+//! helpers, which is why those cases grade. `grep`/`sed`/`od` are withheld
+//! still: they need a pattern engine this helper cannot borrow.
 //!
-//! Two things that note does not say. The here-doc cases that die on `cat` are
-//! already byte-correct where `cat` exists -- `cat <<-EOF` with stripped tabs,
-//! `<<` mixed with `<<-`, a here-doc piped on its first line all match bash --
-//! so they wait on the rig, not on the shell. And `[[` is NOT out-of-model:
+//! One thing that note does not say: `[[` is NOT out-of-model --
 //! busybox ash provides it under `ASH_BASH_COMPAT`, which td's `defconfig`
 //! build enables, so those are real parity gaps rather than a bash-only feature
 //! to write off. Promote an entry when a gap actually closes -- `to-promote`
@@ -126,54 +124,304 @@ fn corpus_is_well_formed() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// The staged `argv.py` is a SYMLINK to this crate's build artifact, so a case
-/// that wrote through the PATH entry would truncate the real binary — outside
-/// its own throwaway workdir, and so for every later and every parallel case,
-/// which would then grade against a helper that prints nothing. The shell entry
-/// is not exposed the same way: it IS the executable the case is running, so the
-/// kernel answers a write to it with ETXTBSY, while the helper is only running
-/// for the instant it takes to print a line. Demonstrated, not assumed: through
-/// a symlink of the same shape, `: > $PATH/argv.py` takes the target to 0 bytes.
+/// Whether `code` NAMES the staged bin directory, which is one of the two ways
+/// a case can reach the build artifact the entries link to. Three spellings — a
+/// path under `$PATH`, a `cd` that makes it the cwd, and a command LOOKUP, which
+/// prints the staged path without the case ever naming `$PATH`.
 ///
-/// No case in the pinned corpus writes to it, and this is what keeps that a
+/// This is NOT the whole guard, and believing it was is what left a hole: the
+/// staged directory is a SIBLING of the case's cwd, so `..` names it too, and
+/// `: > ../bin/cat` passes every rule here. What covers that is `redirects_to`
+/// below, over every staged name rather than only the two Oils ones.
+///
+/// Quotes are stripped before any of it. `: > "$PATH"/cat` names the directory
+/// exactly as the bare spelling does, and matching only the bare one let
+/// ordinary shell quoting walk straight through.
+fn reaches_into_path(code: &str) -> bool {
+    let bare: String = code.chars().filter(|c| !matches!(c, '"' | '\'')).collect();
+    ["$PATH/", "${PATH}/"].iter().any(|p| bare.contains(p))
+        || bare.lines().any(|l| {
+            let l = l.trim_start();
+            l.starts_with("cd ") && l.contains("PATH")
+        })
+        || looks_up_a_staged_applet(&bare)
+}
+
+/// Verbs that WRITE through a name, shared with the bare-name check below.
+const MUTATORS: [&str; 7] = ["rm ", "mv ", "cp ", "ln ", "chmod ", "truncate ", "tee "];
+
+/// A command lookup naming a staged applet, in a position that WRITES through
+/// the answer. Under this harness `command -v cat` prints the entry in the
+/// staged directory, so `: > $(command -v cat)` reaches the build artifact
+/// without the case spelling `$PATH` at all.
+///
+/// Unlike the `$PATH` arm, this one has to ask what the answer is FOR: the
+/// corpus contains a bare `command -v cat` (builtin-meta, `command -v doesn't
+/// find executable dir`) that only prints it, and flagging that would red the
+/// import over a case touching nothing.
+fn looks_up_a_staged_applet(code: &str) -> bool {
+    code.lines().any(|line| {
+        let Some(at) = staged_lookup_at(line) else {
+            return false;
+        };
+        let before = line.get(..at).unwrap_or_default();
+        before.contains('>') || MUTATORS.iter().any(|verb| before.trim_start().starts_with(verb))
+    })
+}
+
+/// Where in `line` a lookup of a staged applet begins, if there is one.
+fn staged_lookup_at(line: &str) -> Option<usize> {
+    for verb in ["command -v ", "type -p ", "which "] {
+        for (at, _) in line.match_indices(verb) {
+            let after = line.get(at + verb.len()..).unwrap_or_default().trim_start();
+            let named = td_sh::SPEC_HELPERS.iter().any(|applet| {
+                // A boundary, so `which category` is not `which cat`.
+                after.strip_prefix(applet).is_some_and(|tail| {
+                    !tail.starts_with(|c: char| c.is_alphanumeric() || c == '_' || c == '-')
+                })
+            });
+            if named {
+                return Some(at);
+            }
+        }
+    }
+    None
+}
+
+/// The narrowing above is only sound if it still fires. Reading `$PATH` is not
+/// reaching into it — one corpus case does exactly that — and the two ways in
+/// are refused.
+#[test]
+fn reaching_into_the_staged_path_is_still_caught() {
+    for benign in [
+        "echo $PATH",
+        "PATH=/x:$PATH; echo hi",
+        // The real case that made the blanket check wrong.
+        "PATH=\"$PATH:.\"\na[",
+        "cd /tmp",
+    ] {
+        assert!(!reaches_into_path(benign), "false positive on {benign:?}");
+    }
+    for hostile in [
+        ": > $PATH/cat",
+        "rm ${PATH}/argv.py",
+        "cd $PATH\n: > cat",
+        "cd \"$PATH\"",
+        "  cd $PATH && echo x",
+        // Ordinary quoting, which the first form of this guard let through.
+        ": > \"$PATH\"/cat",
+        ": > \"$PATH/cat\"",
+        ": > '$PATH'/cat",
+        ": > \"${PATH}\"/cat",
+        // A lookup, which names the directory without spelling `$PATH`.
+        ": > $(command -v cat)",
+        ": > `which touch`",
+        ": > $(type -p argv.py)",
+    ] {
+        assert!(reaches_into_path(hostile), "missed {hostile:?}");
+    }
+}
+
+/// The lookup arm is the one that could over-match: every staged name is an
+/// ordinary word, and `which` in a case about something else must not red the
+/// import.
+#[test]
+fn a_lookup_is_only_a_reach_when_it_names_a_staged_applet() {
+    for benign in [
+        // The corpus's own uses: neither names a staged applet.
+        "echo $(which $SH)",
+        "which python2",
+        // A longer word that merely STARTS with one.
+        "command -v category",
+        "which removed-thing",
+        // Naming an applet without looking it up is just running it.
+        "cat file",
+        "type",
+        // The real corpus case: it PRINTS the path and writes nothing.
+        "PATH=\"_tmp:$PATH\"\ncommand -v cat\necho status=$?",
+    ] {
+        assert!(!reaches_into_path(benign), "false positive on {benign:?}");
+    }
+    // …but the same lookup feeding a write is the whole point of the arm.
+    for hostile in ["rm $(command -v cat)", "tee `which touch` < x"] {
+        assert!(reaches_into_path(hostile), "missed {hostile:?}");
+    }
+}
+
+/// The SIBLING route, which `reaches_into_path` cannot see and which the first
+/// form of this guard left open for every name but the two Oils ones. Each of
+/// these was demonstrated to take the staged artifact to 0 bytes through a
+/// symlink of the real shape.
+#[test]
+fn a_redirect_onto_a_staged_name_is_caught_however_it_is_spelled() {
+    for hostile in [
+        ": > ../bin/cat",
+        ": > $TMP/../bin/cat",
+        ": > \"../bin/cat\"",
+        ": >| ../bin/cat",
+        ": >> ../bin/argv.py",
+        ": > $PATH/cat",
+        ": > ${PATH%%:*}/cat",
+        // After a `cd` into the staged directory the target is a BARE name.
+        "cd $PATH\n: > cat",
+        "p=$PATH\n: > $p/cat",
+    ] {
+        let hit = td_sh::SPEC_HELPERS.iter().any(|a| redirects_to(hostile, a));
+        assert!(hit, "missed {hostile:?}");
+    }
+    for benign in [
+        // A longer word that merely ENDS with a staged name is not that name.
+        ": > catalog",
+        ": > mycat",
+        ": > format",
+        // Ordinary redirects the corpus is full of.
+        "echo x > out",
+        "cat f > $TMP/g",
+        "echo hi >&2",
+    ] {
+        let hit = td_sh::SPEC_HELPERS.iter().any(|a| redirects_to(benign, a));
+        assert!(!hit, "false positive on {benign:?}");
+    }
+}
+
+/// The dispatch itself: `argv[0]` picks the applet, and the STATUS and the
+/// DIAGNOSTIC reach the caller.
+///
+/// Every applet is tested as a pure function, which cannot see any of that —
+/// `exit(done.status)` replaced by `exit(0)`, and the stderr write dropped, both
+/// left the whole gate green. That is the commit's central claim ("an external
+/// is graded on its STATUS as much as its output") resting on nothing, so this
+/// runs the built binary through a symlink the way `run_case` does.
+#[test]
+fn the_binary_reports_its_applets_status_and_diagnostic(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let dir = std::env::temp_dir().join(format!("spec-helpers-dispatch-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir)?;
+    let run = |applet: &str, args: &[&str]| -> Result<_, Box<dyn std::error::Error>> {
+        let link = dir.join(applet);
+        let _ = std::fs::remove_file(&link);
+        std::os::unix::fs::symlink(spec_helpers_bin(), &link)?;
+        Ok(std::process::Command::new(&link).args(args).output()?)
+    };
+    // A missing operand: coreutils' own 1, with a diagnostic.
+    let out = run("cat", &["no-such-file-here"])?;
+    assert_eq!(out.status.code(), Some(1), "cat of a missing file");
+    assert!(!out.stderr.is_empty(), "no diagnostic reached stderr");
+    // An option nobody implemented: 2, so it cannot read as a shell result.
+    let out = run("touch", &["-d", "2017/12/31", "f"])?;
+    assert_eq!(out.status.code(), Some(2), "an unsupported option");
+    assert!(String::from_utf8_lossy(&out.stderr).contains("unsupported"));
+    // A name the multicall does not serve at all.
+    let out = run("nosuchapplet", &[])?;
+    assert_eq!(out.status.code(), Some(2), "an unknown applet");
+    // …and the success path still says 0 with nothing on stderr.
+    let out = run("argv.py", &["a", "b"])?;
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(out.stdout, b"['a', 'b']\n");
+    assert!(out.stderr.is_empty());
+    std::fs::remove_dir_all(&dir)?;
+    Ok(())
+}
+
+/// The mutating-verb half, which keys on a PATH for the same reason.
+#[test]
+fn a_mutating_verb_is_only_caught_when_it_names_a_path() {
+    for (line, applet) in [("cp x ../bin/cat", "cat"), ("mv $PATH/rm y", "rm")] {
+        assert!(names_a_path_to(line, applet), "missed {line:?}");
+    }
+    for (line, applet) in [
+        // The 41 ordinary uses this exists to let through.
+        ("rm -f myfile", "rm"),
+        ("rm dir/cmd", "rm"),
+        ("touch a b", "touch"),
+        // A path ending in a LONGER word, not the applet.
+        ("cp x ../bin/catalog", "cat"),
+    ] {
+        assert!(!names_a_path_to(line, applet), "false positive on {line:?}");
+    }
+}
+
+/// Whether any redirect in `code` TARGETS `name` — as a bare word (the cwd,
+/// after a `cd` into the staged directory) or as any path ending in `/name`,
+/// which is what `../bin/cat` is.
+///
+/// Quotes are stripped first, and `>|` is stepped over: without that its target
+/// reads as the empty token and the clobber form walks through. `>>` needs
+/// nothing, since the scan simply hits the second `>`.
+fn redirects_to(code: &str, name: &str) -> bool {
+    let bare: String = code.chars().filter(|c| !matches!(c, '"' | '\'')).collect();
+    let mut rest = bare.as_str();
+    while let Some(pos) = rest.find('>') {
+        let after = rest.get(pos + 1..).unwrap_or_default().trim_start();
+        let after = after.strip_prefix('|').unwrap_or(after).trim_start();
+        let end = after
+            .find(|c: char| c.is_whitespace() || matches!(c, ';' | '&' | '|' | ')'))
+            .unwrap_or(after.len());
+        let hit = after
+            .get(..end)
+            .and_then(|t| t.strip_suffix(name))
+            .is_some_and(|lead| lead.is_empty() || lead.ends_with('/'));
+        if hit {
+            return true;
+        }
+        rest = rest.get(pos + 1..).unwrap_or_default();
+    }
+    false
+}
+
+/// Whether `line` names `applet` as a PATH — some word ending in `/applet`.
+/// A BARE mention is an ordinary command (`rm f` is 41 corpus cases, which is
+/// what made the verb scan below unusable over the externals); a slash before
+/// the name is the only way one of these reaches the staged directory.
+fn names_a_path_to(line: &str, applet: &str) -> bool {
+    line.match_indices(applet).any(|(at, _)| {
+        let before = line.get(..at).unwrap_or_default();
+        let after = line.get(at + applet.len()..).unwrap_or_default();
+        before.ends_with('/')
+            && !after.starts_with(|c: char| c.is_alphanumeric() || matches!(c, '_' | '-' | '.'))
+    })
+}
+
+/// Every staged applet is a SYMLINK to this crate's build artifact, so a case
+/// that wrote through one would truncate the real binary — outside its own
+/// throwaway workdir, and so for every later and every parallel case, which
+/// would then grade against a helper that prints nothing. The shell entry is not
+/// exposed the same way: it IS the executable the case is running, so the kernel
+/// answers a write to it with ETXTBSY. The helpers get no such protection —
+/// each is running only for the instant it takes to answer — which is why this
+/// exists. Demonstrated, not assumed: through a symlink of the same shape,
+/// `: > $PATH/argv.py` and `: > ../bin/cat` each take the target to 0 bytes.
+///
+/// No case in the pinned corpus writes to one, and this is what keeps that a
 /// CHECKED property rather than a fact about today's import — a future corpus
 /// file that does reds here, at the import, instead of silently corrupting a
-/// regenerated overlay that the gate would then enforce. A guard, not a fix:
-/// what removes the exposure is staging a read-only copy, which costs the very
-/// per-case `fs::copy` whose write fd the shell-staging note above avoids.
+/// regenerated overlay the gate would then enforce. A guard, not a fix: what
+/// removes the exposure is staging a read-only copy, which costs the very
+/// per-case `fs::copy` whose write fd the shell-staging note in `lib.rs` avoids.
 #[test]
 fn no_case_writes_to_the_staged_helper() -> Result<(), Box<dyn std::error::Error>> {
-    // The redirect target is the word after `>`; `>>` simply hits the second.
-    fn redirects_to(code: &str, name: &str) -> bool {
-        let mut rest = code;
-        while let Some(pos) = rest.find('>') {
-            let after = rest.get(pos + 1..).unwrap_or("").trim_start();
-            let end = after
-                .find(|c: char| c.is_whitespace() || matches!(c, ';' | '&' | '|' | ')'))
-                .unwrap_or(after.len());
-            if after.get(..end).is_some_and(|t| t.ends_with(name)) {
-                return true;
-            }
-            rest = rest.get(pos + 1..).unwrap_or("");
-        }
-        false
-    }
-
     let spec_dir = spec_dir();
     let mut checked = 0usize;
     for path in td_sh::spec_paths(&spec_dir)? {
         let text = std::fs::read_to_string(&path)?;
         for case in parse_spec(&text).map_err(|e| format!("{}: {e}", path.display()))? {
             let code = &case.code;
+            // Naming the directory outright. A case that merely READS `$PATH`
+            // (twenty do, mostly putting it on the right of a `:` to build a
+            // longer one) is not touching anything.
             assert!(
-                !code.contains("$PATH/"),
-                "{} [case: {}]: writes into the staged PATH directory, which holds \
+                !reaches_into_path(code),
+                "{} [case: {}]: reaches into the staged PATH directory, which holds \
                  a symlink to this crate's build artifact",
                 path.display(),
                 case.name,
             );
-            // Every staged applet, not just the first: they are links to ONE
-            // binary, so truncating any of them breaks all of them.
+            // Every staged applet, not just the Oils two: they are links to ONE
+            // binary, so truncating any of them breaks all of them. Both checks
+            // below key on a PATH rather than a bare word, which is what lets
+            // them cover the externals -- measured over the corpus, each fires
+            // on zero cases, where a bare-name verb scan fires on 41.
             for applet in td_sh::SPEC_HELPERS {
                 assert!(
                     !redirects_to(code, applet),
@@ -182,14 +430,14 @@ fn no_case_writes_to_the_staged_helper() -> Result<(), Box<dyn std::error::Error
                     path.display(),
                     case.name,
                 );
-                for verb in ["rm ", "mv ", "cp ", "ln ", "chmod ", "truncate ", "tee "] {
+                for verb in MUTATORS {
                     let mutates = code
                         .lines()
-                        .any(|l| l.contains(verb) && l.contains(applet));
+                        .any(|l| l.contains(verb) && names_a_path_to(l, applet));
                     assert!(
                         !mutates,
-                        "{} [case: {}]: `{verb}` names `{applet}`, which is a symlink \
-                         to this crate's build artifact",
+                        "{} [case: {}]: `{verb}` names a path to `{applet}`, which is \
+                         a symlink to this crate's build artifact",
                         path.display(),
                         case.name,
                     );

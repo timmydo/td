@@ -60,11 +60,14 @@ const CASE_TIMEOUT: Duration = Duration::from_secs(10);
 /// unqualified default block.
 pub const ASH_DASH_CHAIN: &[&str] = &["ash", "dash"];
 
-/// The Oils helper names `run_case` stages, all served by the one `spec_helpers`
-/// multicall through `argv[0]`. Public because `gen_expectations` probes each
-/// one: a helper that is staged but does not ANSWER records its cases as shell
-/// gaps, which is the failure staging it exists to prevent.
-pub const SPEC_HELPERS: &[&str] = &["argv.py", "printenv.py"];
+/// The names `run_case` stages on the case's PATH — the two Oils Python helpers
+/// and the four externals the corpus reaches for most — all served by the one
+/// `spec_helpers` multicall through `argv[0]`. Public because `gen_expectations`
+/// probes each one: a helper that is staged but does not ANSWER records its
+/// cases as shell gaps, which is the failure staging it exists to prevent. It is
+/// also what the gate's staged-helper guard sweeps the corpus for, so a name
+/// added here is covered by both without further edits.
+pub const SPEC_HELPERS: &[&str] = &["argv.py", "printenv.py", "cat", "mkdir", "touch", "rm"];
 
 /// A parse error, anchored to a 1-based source line.
 #[derive(Debug)]
@@ -836,14 +839,17 @@ pub fn run_case(
     let entry = bindir.join(identity);
     std::os::unix::fs::symlink(&shell, &entry)?;
     // The corpus's own way of asking what a word EXPANDED to (`argv.py`, 333
-    // cases) and what reached the ENVIRONMENT (`printenv.py`, 42). Upstream
-    // ships both as Python scripts and td vendors neither, so `spec_helpers`
-    // answers under both names -- staged here, beside the shell, because PATH
-    // is this directory and nothing else. ONE binary under two links: it picks
-    // its applet from argv[0], which is the name the case used. Linked rather
-    // than copied for the reason the shell is. REQUIRED rather than optional:
-    // absent, those cases fail with a 127 that looks exactly like a shell gap,
-    // and the generated overlay would record them as such.
+    // cases) and what reached the ENVIRONMENT (`printenv.py`, 42), plus the
+    // four externals it reaches for most (`cat`, `mkdir`, `touch`, `rm`).
+    // Upstream ships the first two as Python scripts and td vendors neither,
+    // and the rest are coreutils, which this harness has no business putting on
+    // a case's PATH from the host -- so `spec_helpers` answers under all of
+    // them, staged here beside the shell because PATH is this directory and
+    // nothing else. ONE binary under every link: it picks its applet from
+    // argv[0], which is the name the case used. Linked rather than copied for
+    // the reason the shell is. REQUIRED rather than optional: absent, those
+    // cases fail with a 127 that looks exactly like a shell gap, and the
+    // generated overlay would record them as such.
     let helpers = std::fs::canonicalize(helpers)?;
     for applet in SPEC_HELPERS {
         std::os::unix::fs::symlink(&helpers, bindir.join(applet))?;

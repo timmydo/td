@@ -20,13 +20,14 @@
 #           fails) reds the gate, and an unexpected PASS (XPASS) reds it so the
 #           entry is promoted. NOTE on honesty at this scale: many xfails are
 #           status-127 `command not found` failures, because the cleared-env `-c`
-#           harness exposes no external PATH beyond the shell itself and the two
-#           Oils helpers (`argv.py`, `printenv.py`). Those are real mismatches
-#           today, but MEASURE before mining the list, because `not found` is
-#           reported identically for two different things. Some of those names are
+#           harness exposes no external PATH beyond the shell itself and the
+#           `spec_helpers` applets (the Oils `argv.py`/`printenv.py`, and `cat`,
+#           `mkdir`, `touch`, `rm`). Those are real mismatches today, but MEASURE
+#           before mining the list, because `not found` is reported identically
+#           for two different things. Some of those names are
 #           BUILTINS td-sh does not have (`shopt`, `typeset`, `declare`,
 #           `compgen`) and are true shell gaps; the rest are EXTERNALS the harness
-#           withholds (`cat`, `touch`, `mkdir`, `grep`, `sed`, `wc`) and say
+#           still withholds (`grep`, `sed`, `wc`, `od`, `seq`) and say
 #           nothing about the shell. Both groups are large and neither dominates.
 #           No counts are given here on purpose: this file is regenerated wholesale,
 #           so a number in it would silently describe some earlier tree.
@@ -46,9 +47,9 @@
 #               `/tmp/`), the same path reached through `HOME=/tmp`, and a test of
 #               `/tmp`'s own MODE (`-k /tmp`). Sixteen cases `mkdir -p` or `touch`
 #               such a path and then depend on it -- `cd` there and print `pwd`, put
-#               it on `PATH`, make it `$HOME` -- or ask whether `/tmp` is sticky. The
-#               staging command is not on the harness PATH, so whether the path
-#               exists is a fact about the HOST, and so is the mode: five flip
+#               it on `PATH`, make it `$HOME` -- or ask whether `/tmp` is sticky.
+#               Whether the path exists is a fact about the HOST, and so is the
+#               mode: five flip
 #               verdict once an earlier run under a real shell has left the
 #               directories behind, and `-k for sticky bit` flips on any host whose
 #               `/tmp` is not sticky. Listing them either way would red the gate on
@@ -58,6 +59,10 @@
 #               rest would. Fifteen MOVE here; the sixteenth (`builtin-dirs::cd
 #               replaces the lowest entry`) was already skipped by (b), whose
 #               `spec/` token its `/tmp/oils-spec/` path contains.
+#               (b) and (c) are decided from the CODE and so are applied BEFORE the
+#               case is run at all. That was cosmetic while the staging commands
+#               were missing; with `mkdir` and `touch` staged, running one of these
+#               first would CREATE the shared path it is being skipped for.
 #               Bare `/tmp` is deliberately NOT a shape: ten cases need only that it
 #               EXIST, which is universal, and one names the relative `./tmp.sh`.
 #           These heuristics are conservative substring matches over the case code
@@ -74,15 +79,11 @@
 # (see duplicate_conflicts).
 
 # ---- xfail: td-sh runs, wrong answer (known gaps) ----
-xfail alias.test.sh::Alias and command sub (bug regression)
 xfail alias.test.sh::Alias that is && || ;
 xfail alias.test.sh::Alias that is pipeline
 xfail alias.test.sh::Two aliases in pipeline
-xfail alias.test.sh::alias used in here doc
-xfail alias.test.sh::alias with redirects works
 xfail alias.test.sh::alias with word of multiple lines
 xfail alias.test.sh::alias without args lists all aliases
-xfail alias.test.sh::here doc inside alias
 xfail alias.test.sh::unalias -a
 xfail append.test.sh::Append array to array
 xfail append.test.sh::Append string to string
@@ -381,9 +382,6 @@ xfail ble-idioms.test.sh::recursive arith: two levels
 xfail blog-other1.test.sh::Blog Post Example
 xfail blog-other1.test.sh::Blog Post Example Fix
 xfail blog-other1.test.sh::Rewrite of Blog Post Example
-xfail blog-other1.test.sh::Simpler example
-xfail blog-other1.test.sh::` after here doc delimiter
-xfail blog-other1.test.sh::` on its own line
 xfail blog1.test.sh::${####}
 xfail blog1.test.sh::${###2}
 xfail blog1.test.sh::${###}
@@ -446,7 +444,6 @@ xfail brace-expansion.test.sh::} in expansion
 xfail bugs.test.sh::#2640 Hanging when reading from character devices
 xfail bugs.test.sh::file with NUL byte
 xfail bugs.test.sh::other builtins fail on writing to full disk
-xfail bugs.test.sh::subshell while running a script (regression)
 xfail builtin-bash.test.sh::bad help topic
 xfail builtin-bash.test.sh::help
 xfail builtin-bash.test.sh::mapfile -t bugs (ble.sh)
@@ -476,9 +473,6 @@ xfail builtin-cd.test.sh::Test the current directory after 'cd ..' involving sym
 xfail builtin-cd.test.sh::cd away from dir that was deleted
 xfail builtin-cd.test.sh::cd to relative path with -L and -P
 xfail builtin-cd.test.sh::cd to symlink with -L and -P
-xfail builtin-cd.test.sh::cd with 2 or more args - with strict_arg_parse
-xfail builtin-cd.test.sh::cd with 2 or more args is allowed (strict_arg_parse disabled)
-xfail builtin-cd.test.sh::cd with no arguments
 xfail builtin-cd.test.sh::chdir is a synonym for cd - busybox ash
 xfail builtin-cd.test.sh::pwd after cd ..
 xfail builtin-cd.test.sh::pwd in symlinked dir on shell initialization
@@ -544,15 +538,10 @@ xfail builtin-echo.test.sh::\0400 is one more than the highest octal byte
 xfail builtin-echo.test.sh::\0777 is out of range
 xfail builtin-echo.test.sh::\u6
 xfail builtin-echo.test.sh::\x
-xfail builtin-echo.test.sh::echo to redirected directory is an error
 xfail builtin-echo.test.sh::incomplete hex escape
 xfail builtin-echo.test.sh::incomplete octal escape
 xfail builtin-echo.test.sh::incomplete unicode escape
 xfail builtin-eval-source.test.sh::Eval in does tilde expansion
-xfail builtin-eval-source.test.sh::source doesn't crash when targeting a directory
-xfail builtin-eval-source.test.sh::source finds files in PATH before current dir
-xfail builtin-eval-source.test.sh::source looks in PATH for files
-xfail builtin-eval-source.test.sh::source works for files in subdirectory
 xfail builtin-fc.test.sh::fc -l [first] [last] where first and last are indexes
 xfail builtin-fc.test.sh::fc -l [first] [last] where first and last are offsets from current command
 xfail builtin-fc.test.sh::fc -l [first] [last] where first and last are reversed indexes
@@ -624,7 +613,6 @@ xfail builtin-process.test.sh::ulimit that is 64 bits
 xfail builtin-process.test.sh::ulimit with no flags is like -f
 xfail builtin-process.test.sh::write big file with ulimit
 xfail builtin-read.test.sh::read -r -d '' for NUL strings, e.g. find -print0
-xfail builtin-read.test.sh::read multiple lines with IFS=:
 xfail builtin-set.test.sh::'set' and 'eval' round trip
 xfail builtin-set.test.sh::can continue after unknown option
 xfail builtin-set.test.sh::set -o lists options
@@ -670,7 +658,6 @@ xfail builtin-trap-err.test.sh::trap can use original $LINENO
 xfail builtin-trap.test.sh::SIGINT and INT are aliases
 xfail builtin-trap.test.sh::exit codes for traps are isolated
 xfail builtin-trap.test.sh::trap 1 is equivalent to SIGHUP; HUP is equivalent to SIGHUP
-xfail builtin-trap.test.sh::trap EXIT with command sub / subshell / pipeline
 xfail builtin-trap.test.sh::trap with command.NoOp - check internal invariant
 xfail builtin-trap.test.sh::traps are cleared in subshell (started with &)
 xfail builtin-trap.test.sh::traps are not active inside subshells $() ()  trap | cat
@@ -725,7 +712,6 @@ xfail command-sub.test.sh::Command Sub trailing newline removed
 xfail command-sub.test.sh::Command Sub trailing whitespace not removed
 xfail command-sub.test.sh::Command sub with here doc
 xfail command-sub.test.sh::Double Quotes in Command Sub in Double Quotes
-xfail command-sub.test.sh::Escaped quote in [[ ]]
 xfail command-sub.test.sh::Here doc with pipeline
 xfail command-sub.test.sh::Making keyword out of command sub should NOT work
 xfail command-sub.test.sh::More levels of double quotes in backticks
@@ -739,7 +725,6 @@ xfail command_.test.sh::File with no shebang is executed
 xfail command_.test.sh::File with relative path and no shebang is executed
 xfail command_.test.sh::Name too long
 xfail command_.test.sh::Non-executable on $PATH
-xfail command_.test.sh::Permission denied
 xfail command_.test.sh::filling $PATH cache, then deleting command
 xfail command_.test.sh::filling $PATH cache, then insert the same command earlier in cache
 xfail command_.test.sh::hash -r doesn't allow additional args
@@ -769,7 +754,6 @@ xfail dparen.test.sh::negative number is true
 xfail dparen.test.sh::set associative array
 xfail empty-bodies.test.sh::Empty do/done
 xfail empty-bodies.test.sh::Empty then/fi
-xfail errexit-osh.test.sh::OLD: command sub in redirect in conditional
 xfail errexit-osh.test.sh::command sub with command_sub_errexit only
 xfail errexit-osh.test.sh::command sub with inherit_errexit and command_sub_errexit
 xfail errexit-osh.test.sh::command sub with inherit_errexit only
@@ -788,7 +772,6 @@ xfail errexit.test.sh::errexit aborts early on pipeline
 xfail errexit.test.sh::errexit and brace group { }
 xfail errexit.test.sh::errexit and time { }
 xfail errexit.test.sh::errexit with &&
-xfail errexit.test.sh::pipeline process respects errexit
 xfail errexit.test.sh::simple command that's an alias - redir failure checked
 xfail errexit.test.sh::while loop - redirect failure checked
 xfail exit-status.test.sh::Truncating 'return' status
@@ -854,15 +837,10 @@ xfail for-expr.test.sh::For loop with and without semicolon
 xfail for-expr.test.sh::Infinite loop with ((;;))
 xfail for-expr.test.sh::Integers near 31, 32, 62 bits
 xfail glob-bash.test.sh::dotglob (bash option that no_dash_glob is roughly consistent with)
-xfail glob.test.sh::Glob of negated unescaped [[] and []]
-xfail glob.test.sh::Glob of unescaped [[] and []]
-xfail glob.test.sh::Glob ordering respects LC_COLLATE (zsh respects this too)
 xfail glob.test.sh::Glob unicode char
-xfail glob.test.sh::\ in unquoted substitutions does not match a backslash
-xfail glob.test.sh::\ in unquoted substitutions escapes globchars
 xfail glob.test.sh::pattern starting with . does not return . and ..
-xfail globignore.test.sh::. and .. always filtered when GLOBIGNORE is set
 xfail globignore.test.sh::Extended glob expansion combined with GLOBIGNORE
+xfail globignore.test.sh::Ignore *
 xfail globignore.test.sh::Ignore *.o:*.h
 xfail globignore.test.sh::Ignore *.txt
 xfail globignore.test.sh::Ignore .:..
@@ -871,6 +849,7 @@ xfail globignore.test.sh::Ignore dirs dist/*:node_modules/*
 xfail globignore.test.sh::Ignore globs with char classes like [[:alnum:]]
 xfail globignore.test.sh::Ignore globs with char patterns like [!ab]
 xfail globignore.test.sh::Ignore single file src/__main__.py
+xfail globignore.test.sh::Quoting GLOBIGNORE
 xfail globignore.test.sh::When GLOBIGNORE is set, glob may become empty (nullglob too)
 xfail globignore.test.sh::When GLOBIGNORE is set, no_dash_glob isn't respected
 xfail globignore.test.sh::find files in subdirectory but not the ignored pattern
@@ -881,35 +860,15 @@ xfail globstar.test.sh::each occurrence of ** recurses through all depths
 xfail globstar.test.sh::globstar is off -> ** is treated like *
 xfail globstar.test.sh::in zsh, ***/ follows symlinked directories, while **/ does not
 xfail globstar.test.sh::within braces, globstar works when there is a comma
-xfail here-doc.test.sh::< redirect and here doc -- last one wins
-xfail here-doc.test.sh::Function def and execution with here doc
-xfail here-doc.test.sh::Here Doc in if condition
-xfail here-doc.test.sh::Here doc and < redirect -- last one wins
-xfail here-doc.test.sh::Here doc and backslash double quote
 xfail here-doc.test.sh::Here doc as command prefix
-xfail here-doc.test.sh::Here doc escapes
 xfail here-doc.test.sh::Here doc from another input file descriptor
-xfail here-doc.test.sh::Here doc in middle.  And redirects in the middle.
-xfail here-doc.test.sh::Here doc in while condition and here doc in body
-xfail here-doc.test.sh::Here doc in while condition and here doc in body on multiple lines
-xfail here-doc.test.sh::Here doc in while loop split up more
-xfail here-doc.test.sh::Here doc line continuation
 xfail here-doc.test.sh::Here doc with bad var delimiter
-xfail here-doc.test.sh::Here doc with multiline double quoted string
 xfail here-doc.test.sh::Here doc with pipe continued on last line
 xfail here-doc.test.sh::Here doc with pipe on first line
-xfail here-doc.test.sh::Here doc with quote expansion in terminator
-xfail here-doc.test.sh::Here doc with var sub, command sub, arith sub
 xfail here-doc.test.sh::Here doc within subshell with boolean
-xfail here-doc.test.sh::Here redirect with explicit descriptor
-xfail here-doc.test.sh::Mixing << and <<-
 xfail here-doc.test.sh::Multiple here docs in pipeline
 xfail here-doc.test.sh::Multiple here docs in pipeline on multiple lines
 xfail here-doc.test.sh::Multiple here docs with different descriptors
-xfail here-doc.test.sh::Nested here docs which are indented
-xfail here-doc.test.sh::Redirect after here doc
-xfail here-doc.test.sh::Two here docs -- first is ignored; second ones wins!
-xfail here-doc.test.sh::here doc stripping tabs
 xfail interactive-parse.test.sh::parse if
 xfail interactive.test.sh::'exit' in oshrc (regression)
 xfail interactive.test.sh::--rcfile with parse error - shell is executed anyway
@@ -1016,8 +975,6 @@ xfail pipeline.test.sh::Pipeline in eval
 xfail pipeline.test.sh::Redirect in Pipeline
 xfail pipeline.test.sh::While Loop ends pipeline
 xfail posix.test.sh::Command substitution in default
-xfail posix.test.sh::Multiple here docs on one line
-xfail posix.test.sh::cat here doc; echo; cat here doc
 xfail print-source-code.test.sh::non-{ } function bodies can be serialized (rare)
 xfail print-source-code.test.sh::typeset -f prints function source code
 xfail print-source-code.test.sh::typeset -f prints function source code - nested functions
@@ -1068,53 +1025,30 @@ xfail quote.test.sh::$'' octal escapes don't have leading 0
 xfail quote.test.sh::$'' octal escapes with fewer than 3 chars
 xfail quote.test.sh::$? split over multiple lines
 xfail quote.test.sh::YSH allows unquoted foo\ bar too
-xfail redir-order.test.sh::case word + redirect order
-xfail redir-order.test.sh::echo `cat OSCFLAGS` "world" > OSCFLAGS (from Alpine imap)
-xfail redir-order.test.sh::for word + redirect order
-xfail redir-order.test.sh::subshell + redirect order
-xfail redirect-command.test.sh::>$file touches a file
 xfail redirect-command.test.sh::Brace group redirect
-xfail redirect-command.test.sh::Leading redirect in a simple command
-xfail redirect-command.test.sh::Nested function stdout redirect
 xfail redirect-command.test.sh::Prefix redirect for loop -- not allowed
-xfail redirect-command.test.sh::Redirect function stdout
-xfail redirect-command.test.sh::Redirect in assignment
-xfail redirect-command.test.sh::Redirect in the middle of a simple command
 xfail redirect-command.test.sh::Redirect in the middle of two assignments
-xfail redirect-command.test.sh::redirect case
 xfail redirect-command.test.sh::redirect for loop
-xfail redirect-command.test.sh::redirect if
-xfail redirect-command.test.sh::redirect while
 xfail redirect-multi.test.sh::File redirect that globs to more than one file (bash and zsh only)
 xfail redirect-multi.test.sh::File redirect to $var with glob char
-xfail redirect-multi.test.sh::File redirects have word splitting too!
-xfail redirect-multi.test.sh::File redirects with glob args (bash and zsh only)
 xfail redirect-multi.test.sh::Redirect with brace expansion isn't allowed
 xfail redirect.test.sh::&> redirects stdout and stderr
-xfail redirect.test.sh::1>&- to close file descriptor
 xfail redirect.test.sh::1>&2- (Bash bug: fail to restore closed fd)
 xfail redirect.test.sh::1>&2- to move file descriptor
-xfail redirect.test.sh::3>&- << EOF (OSH regression: fail to restore fds)
 xfail redirect.test.sh::: 3>&3 (OSH regression)
 xfail redirect.test.sh::: 3>&3-
-xfail redirect.test.sh::: 9> fdleak (OSH regression)
 xfail redirect.test.sh::: >/dev/null 2> / (OSH regression: fail to pop fd frame)
-xfail redirect.test.sh::<> for read/write
 xfail redirect.test.sh::<> for read/write named pipes
 xfail redirect.test.sh::>| to clobber
 xfail redirect.test.sh::Descriptor redirect with filename
-xfail redirect.test.sh::Filename redirect with spaces
+xfail redirect.test.sh::Double digit fd (20> file)
 xfail redirect.test.sh::Nonexistent file
-xfail redirect.test.sh::Open file on descriptor 3 and write to it many times
-xfail redirect.test.sh::Open file on descriptor 4 and write to it many times
-xfail redirect.test.sh::Quoted filename redirect with spaces
 xfail redirect.test.sh::Redirect echo to stderr, and then redirect all of stdout somewhere.
 xfail redirect.test.sh::Redirect to empty string
 xfail redirect.test.sh::Redirect to file descriptor that's not open
 xfail redirect.test.sh::can't mention big file descriptor
 xfail redirect.test.sh::echo foo >&100 (OSH regression: does not fail with invalid fd 100)
 xfail redirect.test.sh::echo foo >&N where N is first unused fd
-xfail redirect.test.sh::xtrace not affected by redirects
 xfail regex.test.sh::BASH_REMATCH
 xfail regex.test.sh::Bug: Nix idiom with closing ) next to pattern
 xfail regex.test.sh::Escaped {
@@ -1137,10 +1071,8 @@ xfail sh-options-bash.test.sh::shopt -s progcomp hostcomplete are stubs (bash-co
 xfail sh-options.test.sh::$- and more options
 xfail sh-options.test.sh::$- with interactive shell
 xfail sh-options.test.sh::$- with pipefail
-xfail sh-options.test.sh::noclobber off
 xfail sh-options.test.sh::noclobber on
 xfail sh-options.test.sh::noclobber on <>
-xfail sh-options.test.sh::noclobber on >>
 xfail sh-options.test.sh::pipefail
 xfail sh-options.test.sh::set without args and assoc array variables (not in OSH)
 xfail sh-options.test.sh::set without args lists variables
@@ -1166,13 +1098,11 @@ xfail tilde.test.sh::tilde expansion of word after redirect
 xfail tilde.test.sh::x=${undef-~:~}
 xfail tilde.test.sh::~ expansion in readonly assignment
 xfail toysh-posix.test.sh::Can't parse extra }
-xfail toysh-posix.test.sh::Evaluation order of redirect and ${undef?error}
 xfail toysh-posix.test.sh::IFS
 xfail toysh-posix.test.sh::IFS - http://landley.net/notes.html#15-02-2020 (TODO: osh)
 xfail toysh-posix.test.sh::IFS 2 - copied into spec/word-split
 xfail toysh-posix.test.sh::IFS 4
 xfail toysh-posix.test.sh::Pipeline - http://landley.net/notes-2019.html#16-12-2019
-xfail toysh-posix.test.sh::dynamic glob - http://landley.net/notes.html#08-05-2020
 xfail toysh-posix.test.sh::no shebang
 xfail toysh.test.sh::Brace Expansion
 xfail toysh.test.sh::char class / extglob
