@@ -376,7 +376,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             match run_case(&shell, &helpers, case, ASH_DASH_CHAIN) {
                 Ok(outcome) if outcome.passed => {}
                 Ok(outcome) => {
-                    if outcome.timed_out {
+                    // Truncated joins timed-out rather than becoming an xfail:
+                    // both mean the case could not be EVALUATED here, which is
+                    // what `skip` records. An xfail would claim td-sh got a
+                    // wrong answer, and be re-run -- paying the cap -- forever.
+                    if outcome.timed_out || outcome.truncated {
                         skip.push(key);
                     } else {
                         xfail.push(key);

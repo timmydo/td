@@ -295,9 +295,22 @@ fn a_redirect_onto_a_staged_name_is_caught_however_it_is_spelled() {
 #[test]
 fn the_binary_reports_its_applets_status_and_diagnostic(
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let dir = std::env::temp_dir().join(format!("spec-helpers-dispatch-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir)?;
+    // A Drop guard, not a tidy-up at the end: every step below can return early
+    // on `?`, and a leaked directory of symlinks into `target/` outlives the run.
+    struct Scratch(PathBuf);
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    let path = std::env::temp_dir().join(format!("spec-helpers-dispatch-{}", std::process::id()));
+    // Only a directory this test could have left is cleared. Anything ELSE at
+    // that name is somebody else's, and `create_dir` then fails loudly —
+    // deleting it would be a worse answer to a predictable path than refusing.
+    let _ = std::fs::remove_dir_all(&path);
+    std::fs::create_dir(&path)?;
+    let scratch = Scratch(path);
+    let dir = &scratch.0;
     let run = |applet: &str, args: &[&str]| -> Result<_, Box<dyn std::error::Error>> {
         let link = dir.join(applet);
         let _ = std::fs::remove_file(&link);
@@ -320,7 +333,6 @@ fn the_binary_reports_its_applets_status_and_diagnostic(
     assert_eq!(out.status.code(), Some(0));
     assert_eq!(out.stdout, b"['a', 'b']\n");
     assert!(out.stderr.is_empty());
-    std::fs::remove_dir_all(&dir)?;
     Ok(())
 }
 
@@ -697,6 +709,46 @@ fn large_output_case_is_captured_without_deadlock() -> Result<(), Box<dyn std::e
         "large-output case took {:?} — a drain deadlock hitting CASE_TIMEOUT",
         start.elapsed(),
     );
+    Ok(())
+}
+
+/// The endless-output case, end to end, which is the hazard the cap exists for
+/// and which only became reachable when `cat` was staged. It must come back
+/// FAILED and say why, rather than growing the gate's heap for ten seconds and
+/// then grading whatever fit.
+///
+/// It must also be FAST. Hitting the cap closes the read end, so the producer
+/// dies of EPIPE instead of being waited out — a case that took the full
+/// `CASE_TIMEOUT` would mean the pipe was left open and an orphan left spinning
+/// against a reader that no longer wants it.
+#[test]
+fn an_endless_case_is_bounded_and_reported() -> Result<(), Box<dyn std::error::Error>> {
+    let shell = PathBuf::from(env!("CARGO_BIN_EXE_td-sh"));
+    let spec = "#### endless\ncat </dev/zero\n## status: 0\n";
+    let cases = parse_spec(spec)?;
+    let case = cases.first().ok_or("no case parsed")?;
+    let start = std::time::Instant::now();
+    let outcome = run_case(&shell, &spec_helpers_bin(), case, ASH_DASH_CHAIN)?;
+    let elapsed = start.elapsed();
+    assert!(!outcome.passed, "an endless case was graded as a pass");
+    let detail = outcome.detail.unwrap_or_default();
+    assert!(
+        detail.contains("truncated"),
+        "the truncation went unreported: {detail}"
+    );
+    assert!(
+        elapsed < std::time::Duration::from_secs(5),
+        "took {elapsed:?} — the producer was waited out, not closed on"
+    );
+    // STDERR is the other half of the decision, and it is a separate drain with
+    // a separate cap: reporting only on stdout's would grade a case that wrote
+    // megabytes to stderr on a prefix of them.
+    let spec = "#### endless stderr\ncat </dev/zero >&2\n## status: 0\n";
+    let cases = parse_spec(spec)?;
+    let case = cases.first().ok_or("no case parsed")?;
+    let outcome = run_case(&shell, &spec_helpers_bin(), case, ASH_DASH_CHAIN)?;
+    assert!(!outcome.passed, "an endless stderr case was graded as a pass");
+    assert!(outcome.truncated, "stderr's truncation was not reported");
     Ok(())
 }
 

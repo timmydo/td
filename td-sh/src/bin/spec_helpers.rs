@@ -563,12 +563,14 @@ mod tests {
     impl Dir {
         fn new(tag: &str) -> Self {
             let path = std::env::temp_dir().join(format!("spec-helpers-{tag}-{}", std::process::id()));
-            let _ = std::fs::remove_dir_all(&path);
-            let _ = std::fs::remove_file(&path);
-            // `create_dir` and it must SUCCEED: the name is predictable and in
+            // Only a directory this test could have left is cleared, and
+            // `create_dir` must then SUCCEED: the name is predictable and in
             // shared `/tmp`, so adopting whatever is already there -- a planted
             // symlink, or a leak from a reused pid -- is exactly what
-            // `CaseWorkdir` refuses on purpose three files away.
+            // `CaseWorkdir` refuses on purpose three files away. Nor is it
+            // DELETED: that would answer a predictable path by destroying
+            // somebody else's file, where failing here costs only this test.
+            let _ = std::fs::remove_dir_all(&path);
             std::fs::create_dir(&path).expect("a fresh scratch directory");
             Dir(path)
         }

@@ -55,6 +55,22 @@ use std::time::{Duration, Instant};
 /// is not re-run every gate).
 const CASE_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Per-case, per-stream cap on CAPTURED output. A case's own runtime is bounded
+/// by `CASE_TIMEOUT`, but its memory was not: the drain threads read to end, so
+/// a case that writes without stopping grows the gate's heap for the whole ten
+/// seconds. That was unreachable while the harness withheld every external and
+/// became reachable when `cat` was staged -- `cat </dev/zero` writes at memory
+/// speed, and nothing in `read_to_end` says stop.
+///
+/// The number is chosen from the corpus rather than guessed: across the 2701
+/// cases it runs, the largest stdout is 427 bytes and the largest stderr 661,
+/// and the harness's own synthetic large-output case is ~200 KiB. Eight
+/// mebibytes is forty times that case and four orders of magnitude past
+/// anything the corpus does, so it can only ever be hit by a case that has
+/// stopped making sense -- while bounding what one runaway costs a gate
+/// running cases in parallel.
+const CAPTURE_CAP: usize = 8 * 1024 * 1024;
+
 /// The default identity chain for td-sh: prefer busybox `ash`'s expected output
 /// (what we replace), then `dash` (the same NetBSD-ash POSIX lineage), then the
 /// unqualified default block.
@@ -137,6 +153,10 @@ pub struct CaseOutcome {
     pub passed: bool,
     pub detail: Option<String>, // human-readable mismatch when failed
     pub timed_out: bool,        // hit CASE_TIMEOUT (a typed signal, not parsed from `detail`)
+    /// Hit `CAPTURE_CAP`, so the case was never graded. Typed for `timed_out`'s
+    /// reason: the overlay generator routes on it, and "cannot be evaluated
+    /// faithfully here" is `skip`, not a wrong answer to be listed as `xfail`.
+    pub truncated: bool,
 }
 
 // ---- parsing -------------------------------------------------------------
@@ -678,6 +698,7 @@ fn evaluate(name: &str, expected: &Expected, status: i32, stdout: &[u8], stderr:
         passed,
         detail: if passed { None } else { Some(fails.join("; ")) },
         timed_out: false,
+        truncated: false,
     }
 }
 
@@ -690,29 +711,98 @@ fn evaluate(name: &str, expected: &Expected, status: i32, stdout: &[u8], stderr:
 /// loaded host's post-exit EOF is never mistaken for a stuck reader.
 const DRAIN_GRACE: Duration = Duration::from_secs(2);
 
-/// Read `stream` to EOF on its own thread, delivering the bytes once on a channel.
-/// A read error or a pipe that never reaches EOF yields no value (the caller treats
-/// a missing value as empty), so the caller never blocks on the read itself.
-fn drain_pipe<R: Read + Send + 'static>(stream: Option<R>) -> std::sync::mpsc::Receiver<Vec<u8>> {
+/// Read `stream` on its own thread, delivering `(bytes, truncated)` ONCE on a
+/// channel — so the caller never blocks on the read itself.
+///
+/// Delivery is at EOF, or at `CAPTURE_CAP`, whichever comes first. The cap
+/// case is the reason this reports early rather than only at the end: a pipe
+/// that never reaches EOF must still yield a verdict, or the caller's
+/// `DRAIN_GRACE` abandons it and the truncation goes unreported. A pipe that
+/// reaches neither still yields nothing, and the caller treats a missing value
+/// as empty.
+///
+/// `truncated` means the bytes are a PREFIX, from the cap or from a read error,
+/// and must not be graded as a complete capture.
+fn drain_pipe<R: Read + Send + 'static>(
+    stream: Option<R>,
+) -> std::sync::mpsc::Receiver<(Vec<u8>, bool)> {
     let (tx, rx) = std::sync::mpsc::channel();
     match stream {
         Some(mut s) => {
             std::thread::spawn(move || {
+                // Read in fixed chunks rather than `read_to_end`, and RETAIN
+                // only up to the cap while going on reading. Both halves are
+                // load-bearing: retaining bounds the memory one case can cost,
+                // and continuing to read is what keeps the no-deadlock property
+                // above -- a reader that stopped would fill the pipe and block
+                // the child until the case timeout, turning a bounded capture
+                // into a slow one.
                 let mut buf = Vec::new();
-                let _ = s.read_to_end(&mut buf); // bytes read before an error are retained
-                let _ = tx.send(buf);
+                let mut chunk = [0u8; 16 * 1024];
+                let mut failed = false;
+                loop {
+                    let n = match s.read(&mut chunk) {
+                        Ok(0) => break,
+                        Ok(n) => n,
+                        // What `read_to_end` did, and the reason it did it: a
+                        // signal can cut a read short, and that is not the end
+                        // of the stream.
+                        Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                        // Any other error and the bytes so far are a PREFIX.
+                        // They were kept and reported as a whole capture before,
+                        // which is the same silent half-answer the cap exists to
+                        // refuse.
+                        Err(_) => {
+                            failed = true;
+                            break;
+                        }
+                    };
+                    let room = CAPTURE_CAP.saturating_sub(buf.len());
+                    buf.extend_from_slice(chunk.get(..n.min(room)).unwrap_or_default());
+                    if n > room {
+                        // Over the cap: report AT ONCE and STOP.
+                        //
+                        // At once, because the case this exists for may never
+                        // reach EOF -- and a killed child whose orphan still
+                        // holds the pipe has its whole result abandoned by
+                        // `DRAIN_GRACE`, taking the truncation with it.
+                        //
+                        // Stop, because returning DROPS the read end. A reader
+                        // that stopped while holding the pipe open would block
+                        // the writer; one that closes it makes the next write
+                        // EPIPE, so a runaway producer dies instead of being
+                        // left to spin against a reader that no longer wants
+                        // it. Nothing here needs its remaining output: a
+                        // truncated capture is not graded.
+                        let _ = tx.send((buf, true));
+                        return;
+                    }
+                }
+                let _ = tx.send((buf, failed));
             });
         }
         None => {
-            let _ = tx.send(Vec::new());
+            let _ = tx.send((Vec::new(), false));
         }
     }
     rx
 }
 
-/// Wait for `child` up to `timeout` while draining its pipes, returning
-/// `(status_code_or_-1, timed_out, stdout, stderr)`. A killed child reports code
-/// `-1` (no exit code), which matches no expected status, so the case fails.
+/// What one case's child produced.
+struct Captured {
+    /// The exit code, or `-1` for a killed child (matching no expected status).
+    status: i32,
+    timed_out: bool,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+    /// Either stream reached `CAPTURE_CAP`, so what is here is a PREFIX and
+    /// must not be graded.
+    truncated: bool,
+}
+
+/// Wait for `child` up to `timeout` while draining its pipes. A killed child
+/// reports code `-1` (no exit code), which matches no expected status, so the
+/// case fails.
 ///
 /// Both pipes are drained on reader threads started BEFORE the wait, so a case
 /// whose output exceeds the pipe buffer (~64 KiB) keeps running instead of
@@ -720,7 +810,7 @@ fn drain_pipe<R: Read + Send + 'static>(stream: Option<R>) -> std::sync::mpsc::R
 /// collect is itself bounded by `DRAIN_GRACE`: a descendant that inherited the
 /// pipe and outlives the child cannot make this block forever — we abandon the
 /// reader and return what was captured. So this always returns in bounded time.
-fn wait_and_capture(mut child: Child, timeout: Duration) -> std::io::Result<(i32, bool, Vec<u8>, Vec<u8>)> {
+fn wait_and_capture(mut child: Child, timeout: Duration) -> std::io::Result<Captured> {
     let out_rx = drain_pipe(child.stdout.take());
     let err_rx = drain_pipe(child.stderr.take());
     let deadline = Instant::now() + timeout;
@@ -736,9 +826,15 @@ fn wait_and_capture(mut child: Child, timeout: Duration) -> std::io::Result<(i32
         }
         std::thread::sleep(Duration::from_millis(2));
     };
-    let out = out_rx.recv_timeout(DRAIN_GRACE).unwrap_or_default();
-    let err = err_rx.recv_timeout(DRAIN_GRACE).unwrap_or_default();
-    Ok((status.code().unwrap_or(-1), timed_out, out, err))
+    let (stdout, out_cut) = out_rx.recv_timeout(DRAIN_GRACE).unwrap_or_default();
+    let (stderr, err_cut) = err_rx.recv_timeout(DRAIN_GRACE).unwrap_or_default();
+    Ok(Captured {
+        status: status.code().unwrap_or(-1),
+        timed_out,
+        stdout,
+        stderr,
+        truncated: out_cut || err_cut,
+    })
 }
 
 /// A throwaway working directory for one case: a case that redirects to a file
@@ -872,8 +968,27 @@ pub fn run_case(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()?;
-    let (status, timed_out, stdout, stderr) = wait_and_capture(child, CASE_TIMEOUT)?;
-    let mut outcome = evaluate(&case.name, &expected, status, &stdout, &stderr);
+    let run = wait_and_capture(child, CASE_TIMEOUT)?;
+    // A capture that hit the cap is a PREFIX, and it is not graded AT ALL --
+    // not even to build a diagnostic. Grading it would pass a case whose golden
+    // happens to match the part that fit, and `evaluate`'s mismatch detail
+    // embeds the streams, so a case declaring an expected one would format
+    // eight mebibytes into a message (more, escaped) on the very path that
+    // exists to bound what a case can cost.
+    if run.truncated {
+        return Ok(CaseOutcome {
+            name: case.name.clone(),
+            passed: false,
+            detail: Some(format!(
+                "output exceeded the {} MiB capture cap and was truncated",
+                CAPTURE_CAP / (1024 * 1024)
+            )),
+            timed_out: run.timed_out,
+            truncated: true,
+        });
+    }
+    let (status, timed_out) = (run.status, run.timed_out);
+    let mut outcome = evaluate(&case.name, &expected, status, &run.stdout, &run.stderr);
     if timed_out {
         outcome.passed = false;
         outcome.timed_out = true;
@@ -1612,6 +1727,7 @@ dash-says
             passed,
             detail: if passed { None } else { Some("mismatch".into()) },
             timed_out: false,
+            truncated: false,
         }
     }
 
@@ -1735,5 +1851,97 @@ dash-says
         // A trailing blank line after `## code:` is tolerated, not treated as code.
         assert!(parse_spec("#### x\n## code: echo hi\n\n## status: 0\n").is_ok());
         Ok(())
+    }
+
+    /// A reader that yields `total` bytes and RECORDS how many were taken, so
+    /// the test can tell "retained" from "read".
+    struct Counted {
+        left: usize,
+        read: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl Read for Counted {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let n = self.left.min(buf.len());
+            self.left -= n;
+            self.read.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+            match buf.get_mut(..n) {
+                Some(slice) => slice.fill(b'x'),
+                None => return Ok(0),
+            }
+            Ok(n)
+        }
+    }
+
+    /// The capture is bounded, and a case that hits the bound is REPORTED
+    /// rather than graded on the part that fit.
+    #[test]
+    fn a_runaway_case_cannot_grow_the_capture_without_end() {
+        let read = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        // Well past the cap, not a chunk past it, so "stopped at the cap" is
+        // distinguishable from "read it all" at all.
+        let over = CAPTURE_CAP + 512 * 1024;
+        let rx = drain_pipe(Some(Counted { left: over, read: std::sync::Arc::clone(&read) }));
+        let (buf, overflowed) = rx.recv_timeout(Duration::from_secs(30)).expect("drain");
+        assert_eq!(buf.len(), CAPTURE_CAP, "retained more than the cap");
+        assert!(overflowed, "the overflow went unreported");
+        // …and it STOPPED there, which is what closes the pipe and kills the
+        // producer. Reading on would leave a thread spinning against an orphan
+        // for the life of the process. The count is settled rather than racing:
+        // the send is the drain's last act, so `recv` above happens after every
+        // read it will ever do.
+        let taken = read.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(taken < over, "kept reading past the cap: {taken} of {over}");
+        assert!(taken <= CAPTURE_CAP + 16 * 1024, "read {taken}, more than a chunk past the cap");
+    }
+
+    /// A reader that is INTERRUPTED once, then yields data, then fails. The
+    /// interruption must be retried (a signal cutting a read short is not the
+    /// end of a stream, which is why `read_to_end` retried it), and the failure
+    /// must be reported as a PREFIX rather than as a complete capture.
+    #[test]
+    fn an_interrupted_read_resumes_and_a_failed_one_is_a_prefix() {
+        struct Flaky(u8);
+        impl Read for Flaky {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                self.0 = self.0.saturating_add(1);
+                match self.0 {
+                    1 => Err(std::io::Error::from(std::io::ErrorKind::Interrupted)),
+                    2 => {
+                        let n = buf.len().min(3);
+                        match buf.get_mut(..n) {
+                            Some(slice) => slice.fill(b'z'),
+                            None => return Ok(0),
+                        }
+                        Ok(n)
+                    }
+                    _ => Err(std::io::Error::other("broken")),
+                }
+            }
+        }
+        let rx = drain_pipe(Some(Flaky(0)));
+        let (buf, truncated) = rx.recv_timeout(Duration::from_secs(30)).expect("drain");
+        // The bytes AFTER the interruption are here, so it resumed rather than
+        // treating the signal as end-of-stream.
+        assert_eq!(buf, b"zzz", "the interrupted read was taken for EOF");
+        // …and the error that followed is not a complete capture.
+        assert!(truncated, "a failed read was reported as a whole capture");
+    }
+
+    /// Ordinary output is untouched: every byte, and no overflow claimed.
+    #[test]
+    fn output_under_the_cap_is_captured_whole() {
+        let read = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let rx = drain_pipe(Some(Counted { left: 40_000, read: std::sync::Arc::clone(&read) }));
+        let (buf, overflowed) = rx.recv_timeout(Duration::from_secs(30)).expect("drain");
+        assert_eq!(buf.len(), 40_000);
+        assert!(!overflowed);
+        assert!(buf.iter().all(|b| *b == b'x'), "the bytes were not passed through");
+        // Exactly at the cap is NOT an overflow: the boundary is inclusive, or a
+        // legitimate case of exactly that size would be failed for nothing.
+        let rx = drain_pipe(Some(Counted { left: CAPTURE_CAP, read }));
+        let (buf, overflowed) = rx.recv_timeout(Duration::from_secs(30)).expect("drain");
+        assert_eq!(buf.len(), CAPTURE_CAP);
+        assert!(!overflowed, "the cap itself was called an overflow");
     }
 }
