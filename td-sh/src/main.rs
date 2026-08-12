@@ -19,7 +19,8 @@
 //! is the EIGHTH target-side unsafe exception UNSAFE.md records; the
 //! confinement tests below assert its roster against this crate's own source.
 //!
-//! Still deferred, and each a further reviewed amendment: job control, and
+//! Still deferred, and each a further reviewed amendment: the half of job
+//! control that needs a job to be a PROCESS (see below), and
 //! CATCHING a signal — `trap 'action' SIG` needs a handler, and a handler on
 //! x86-64 needs a hand-laid `SA_RESTORER` trampoline to return through, where
 //! the two code-free dispositions run no handler at all and so need none.
@@ -28,8 +29,9 @@
 //! `std::io::pipe` descriptors — no `unsafe`, which is why that was a
 //! refinement rather than a syscall question. Async lists (`&`) now stream too,
 //! on threads of the same shape, with a real `$!` and a `wait` that answers for
-//! them (`jobs.rs`). What is still deferred is job CONTROL — `jobs`/`fg`/`bg`,
-//! a jobspec, and the process group a signal would be aimed at.
+//! them (`jobs.rs`), plus `jobs` and the `%N` jobspecs that name one. What is
+//! still deferred is the part that needs a job to be a PROCESS: `fg`/`bg`, and
+//! the process group a signal would be aimed at.
 #![deny(unsafe_code)]
 
 mod arith;
