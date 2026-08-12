@@ -245,10 +245,18 @@ fn compare(
     tally: &mut Tally,
 ) -> Result<(), String> {
     let ours = run(helper, args, input)?;
-    // A refusal is the applet declining to guess: always a correct outcome, so
-    // it is counted rather than compared.
+    // A refusal here is a MISMATCH, not a licensed outcome. Every pattern the
+    // sweeps below draw from is inside the served subset -- the fixed tables by
+    // construction, the generated ones because `generated` composes in-subset
+    // atoms and at most one repeat each -- so nothing should refuse, and
+    // counting a refusal as success would let an applet that refused
+    // EVERYTHING report zero disagreements with nothing left to compare. The
+    // shapes that must refuse are checked by REFUSALS above, which asserts the
+    // opposite.
     if ours.status == 2 {
         tally.refused += 1;
+        tally.mismatched += 1;
+        println!("REFUSED (in-subset) args={args:?} input={input:?}");
         return Ok(());
     }
     let theirs = run(reference, args, input)?;

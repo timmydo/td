@@ -23,12 +23,13 @@
 #           harness exposes no external PATH beyond the shell itself and the
 #           `spec_helpers` applets (the Oils `argv.py`/`printenv.py`, and `cat`,
 #           `mkdir`, `touch`, `rm`, `wc`, `sleep`, `seq`, `chmod`, `grep`, `egrep`,
-#           `fgrep`). Those are real mismatches today, but MEASURE before mining the
-#           list, because `not found` is reported identically for two different
-#           things. Some of those names are BUILTINS td-sh does not have (`shopt`,
-#           `typeset`, `declare`, `compgen`) and are true shell gaps; the rest are
-#           EXTERNALS the harness still withholds (`sed`, `od`, `sort`, `tail`) and
-#           say nothing about the shell. Both groups are large, neither dominates.
+#           `fgrep`, `head`, `tail`, `tac`, `od`). Those are real mismatches today,
+#           but MEASURE before mining the list, because `not found` is reported
+#           identically for two different things. Some of those names are BUILTINS
+#           td-sh does not have (`shopt`, `typeset`, `declare`, `compgen`) and are
+#           true shell gaps; the rest are EXTERNALS the harness still withholds
+#           (`sed`, `sort`, `ls`, `tr`) and say nothing about the shell. Both
+#           groups are large, neither dominates.
 #           No counts are given here on purpose: this file is regenerated wholesale,
 #           so a number in it would silently describe some earlier tree.
 #   skip  = not run at all, because it cannot be evaluated faithfully here:
@@ -586,7 +587,6 @@ xfail builtin-misc.test.sh::Shifting too far
 xfail builtin-misc.test.sh::time pipeline
 xfail builtin-printf.test.sh::Invalid UTF-8
 xfail builtin-printf.test.sh::Too large
-xfail builtin-printf.test.sh::printf %b with truncated octal escapes
 xfail builtin-printf.test.sh::printf octal backslash escapes
 xfail builtin-printf.test.sh::unsigned / octal / hex big
 xfail builtin-process.test.sh::arg that would overflow 64 bits is detected
@@ -672,22 +672,15 @@ xfail builtin-type-bash.test.sh::type -t doesn't find non-executable (like comma
 xfail builtin-type-bash.test.sh::type prints function source code
 xfail builtin-type.test.sh::more special builtins
 xfail builtin-umask.test.sh::'umask 0002' sets the umask
-xfail builtin-umask.test.sh::'umask' without args prints the umask
 xfail builtin-umask.test.sh::set umask with symbolic mode: g-w,o-w
-xfail builtin-umask.test.sh::set umask with symbolic mode: u-rw  ...  u=,g+,o-  ...
 xfail builtin-umask.test.sh::symbolic syntax error: empty clause u-r,,u-r
-xfail builtin-umask.test.sh::symbolic syntax error: start with -
 xfail builtin-umask.test.sh::umask X perm
-xfail builtin-umask.test.sh::umask a is valid who
-xfail builtin-umask.test.sh::umask allow overwriting and duplicates
 xfail builtin-umask.test.sh::umask bare op
 xfail builtin-umask.test.sh::umask default who
 xfail builtin-umask.test.sh::umask permcopy
 xfail builtin-umask.test.sh::umask permcopy running value
 xfail builtin-umask.test.sh::umask s perm
-xfail builtin-umask.test.sh::umask sequential actions
 xfail builtin-umask.test.sh::umask t perm
-xfail builtin-umask.test.sh::umask with too many arguments (i.e. extra spaces)
 xfail builtin-umask.test.sh::usage: large octal number
 xfail case_.test.sh::Pattern ? matches 1 code point (many bytes), but not multiple code points
 xfail command-sub-ksh.test.sh::${ echo hi }  without semi-colon
@@ -696,7 +689,6 @@ xfail command-sub-ksh.test.sh::${|REPLY=hi}
 xfail command-sub-ksh.test.sh::for loop / case
 xfail command-sub.test.sh::Command Sub trailing newline removed
 xfail command-sub.test.sh::Command Sub trailing whitespace not removed
-xfail command-sub.test.sh::Command sub with here doc
 xfail command-sub.test.sh::Double Quotes in Command Sub in Double Quotes
 xfail command-sub.test.sh::Here doc with pipeline
 xfail command-sub.test.sh::Making keyword out of command sub should NOT work
@@ -842,11 +834,8 @@ xfail globstar.test.sh::each occurrence of ** recurses through all depths
 xfail globstar.test.sh::globstar is off -> ** is treated like *
 xfail globstar.test.sh::in zsh, ***/ follows symlinked directories, while **/ does not
 xfail globstar.test.sh::within braces, globstar works when there is a comma
-xfail here-doc.test.sh::Here doc as command prefix
 xfail here-doc.test.sh::Here doc from another input file descriptor
 xfail here-doc.test.sh::Here doc with bad var delimiter
-xfail here-doc.test.sh::Here doc with pipe continued on last line
-xfail here-doc.test.sh::Here doc with pipe on first line
 xfail here-doc.test.sh::Here doc within subshell with boolean
 xfail here-doc.test.sh::Multiple here docs in pipeline
 xfail here-doc.test.sh::Multiple here docs in pipeline on multiple lines
@@ -923,21 +912,14 @@ xfail nocasematch-match.test.sh::[[ equality matching
 xfail nocasematch-match.test.sh::[[ regex matching
 xfail nocasematch-match.test.sh::case matching
 xfail nul-bytes.test.sh::Compare \x00 byte versus \x01 byte - command sub
-xfail nul-bytes.test.sh::Compare \x00 byte versus \x01 byte - read -n
-xfail nul-bytes.test.sh::Compare \x00 byte versus \x01 byte - read builtin
 xfail nul-bytes.test.sh::Issue 2269 - Do NUL bytes match ? in ${a#?}
 xfail nul-bytes.test.sh::Issue 2269 Reduction
 xfail nul-bytes.test.sh::NUL bytes and IFS splitting
-xfail nul-bytes.test.sh::NUL bytes with echo $'\0' (OSH and zsh agree)
-xfail nul-bytes.test.sh::NUL bytes with echo -e
 xfail nul-bytes.test.sh::NUL bytes with test -f
 xfail nul-bytes.test.sh::Strip ops # ## % %% with NUL bytes
-xfail nul-bytes.test.sh::printf - NUL byte in value (OSH and zsh agree)
-xfail nul-bytes.test.sh::printf - \0 escape shows NUL byte
 xfail osh-bugs.test.sh::YSH $[expr_sub] in OSH should not do dynamic globbing
 xfail osh-bugs.test.sh::var x = $(echo bad; false) in OSH
 xfail osh-bugs.test.sh::var x = $(echo one; false; echo two) in OSH
-xfail paren-ambiguity.test.sh::(((grep example - 4+ instances in regtest/aports - #2337
 xfail parse-errors.test.sh::Bad var sub caught at parse time
 xfail parse-errors.test.sh::Long Token - 65535 bytes
 xfail parse-errors.test.sh::Token that's too long for Oils - 65536 bytes
@@ -945,8 +927,6 @@ xfail parse-errors.test.sh::do unexpected
 xfail parse-errors.test.sh::empty clause in [[
 xfail parse-errors.test.sh::{ is its own word, needs a space
 xfail parse-errors.test.sh::} is a parse error
-xfail pipeline.test.sh::Brace group in pipeline
-xfail pipeline.test.sh::For loop starts pipeline
 xfail pipeline.test.sh::Pipeline comments
 xfail pipeline.test.sh::Pipeline in eval
 xfail posix.test.sh::Command substitution in default
@@ -1001,10 +981,6 @@ xfail quote.test.sh::$'' octal escapes with fewer than 3 chars
 xfail quote.test.sh::$? split over multiple lines
 xfail quote.test.sh::YSH allows unquoted foo\ bar too
 xfail redirect-command.test.sh::Prefix redirect for loop -- not allowed
-xfail redirect-command.test.sh::Redirect in the middle of two assignments
-xfail redirect-multi.test.sh::File redirect that globs to more than one file (bash and zsh only)
-xfail redirect-multi.test.sh::File redirect to $var with glob char
-xfail redirect-multi.test.sh::Redirect with brace expansion isn't allowed
 xfail redirect.test.sh::&> redirects stdout and stderr
 xfail redirect.test.sh::1>&2- (Bash bug: fail to restore closed fd)
 xfail redirect.test.sh::1>&2- to move file descriptor
@@ -1045,7 +1021,6 @@ xfail sh-options.test.sh::noclobber on
 xfail sh-options.test.sh::noclobber on <>
 xfail sh-options.test.sh::pipefail
 xfail sh-options.test.sh::set without args lists variables
-xfail sh-usage.test.sh::--rcfile in non-interactive shell prints warnings
 xfail sh-usage.test.sh::LC_CTYPE=invalid
 xfail sh-usage.test.sh::Other flag parsers are not affected by - rule
 xfail sh-usage.test.sh::Set LC_ALL LC_CTYPE LC_COLLATE LANG - affects glob ?

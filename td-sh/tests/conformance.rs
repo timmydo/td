@@ -393,6 +393,63 @@ fn the_binary_reports_its_applets_status_and_diagnostic(
         assert_eq!(out.status.code(), expect, "{name}: {:?}", out.stderr);
         assert_eq!(String::from_utf8_lossy(&out.stdout), want, "{name} read `{pat}` wrongly");
     }
+    // The byte-slicing four. `head` and `tail` answer the SAME question about
+    // opposite ends of one stream, so a swapped pair is the mis-wiring their
+    // unit tests — which call each function directly — cannot see; `-n 1` over
+    // three lines tells them apart in one byte. `tac` is asked for a reversal
+    // no prefix or suffix of the input equals, and `od` for a rendering that is
+    // neither.
+    for (name, args, want) in [
+        ("head", &["-n", "1"][..], "1\n"),
+        ("tail", &["-n", "1"][..], "3\n"),
+        ("tac", &[][..], "3\n2\n1\n"),
+        ("od", &["-A", "n", "-t", "x1"][..], " 31 0a 32 0a 33 0a\n"),
+    ] {
+        let link = dir.join(name);
+        let _ = std::fs::remove_file(&link);
+        std::os::unix::fs::symlink(spec_helpers_bin(), &link)?;
+        let mut child = std::process::Command::new(&link)
+            .args(args)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()?;
+        if let Some(mut w) = child.stdin.take() {
+            std::io::Write::write_all(&mut w, b"1\n2\n3\n")?;
+        }
+        let out = child.wait_with_output()?;
+        assert_eq!(out.status.code(), Some(0), "{name}: {:?}", out.stderr);
+        assert_eq!(String::from_utf8_lossy(&out.stdout), want, "{name} answered wrongly");
+    }
+    // `head`'s multi-file banner needs OPERANDS, and it is the one output shape
+    // in these four that the corpus goldens carry verbatim.
+    std::fs::write(dir.join("hb1"), b"A\n")?;
+    std::fs::write(dir.join("hb2"), b"B\n")?;
+    let out = run(
+        "head",
+        &["--", &dir.join("hb1").to_string_lossy(), &dir.join("hb2").to_string_lossy()],
+    )?;
+    assert_eq!(out.status.code(), Some(0), "head of two files: {:?}", out.stderr);
+    let banner = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert!(banner.contains("<==\nA\n\n==> "), "no blank line between files: {banner:?}");
+    // …and `-` among them is bannered `standard input`, not `-`. Here rather
+    // than in a unit test for `wc -`'s reason: calling the function directly
+    // would inherit whatever stdin `cargo test` was handed and block on a
+    // terminal.
+    let link = dir.join("head");
+    let mut child = std::process::Command::new(&link)
+        .args(["--", "-", &dir.join("hb1").to_string_lossy()])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()?;
+    if let Some(mut w) = child.stdin.take() {
+        std::io::Write::write_all(&mut w, b"S\n")?;
+    }
+    let out = child.wait_with_output()?;
+    assert_eq!(out.status.code(), Some(0), "head - : {:?}", out.stderr);
+    let banner = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert!(banner.starts_with("==> standard input <==\nS\n\n==> "), "{banner:?}");
     // The other three applets whose dispatch arms nothing else here reaches.
     let out = run("seq", &["3"])?;
     assert_eq!((out.status.code(), out.stdout.as_slice()), (Some(0), b"1\n2\n3\n".as_slice()));

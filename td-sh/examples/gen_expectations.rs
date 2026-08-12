@@ -72,12 +72,13 @@ const HEADER: &str = "\
 #           harness exposes no external PATH beyond the shell itself and the
 #           `spec_helpers` applets (the Oils `argv.py`/`printenv.py`, and `cat`,
 #           `mkdir`, `touch`, `rm`, `wc`, `sleep`, `seq`, `chmod`, `grep`, `egrep`,
-#           `fgrep`). Those are real mismatches today, but MEASURE before mining the
-#           list, because `not found` is reported identically for two different
-#           things. Some of those names are BUILTINS td-sh does not have (`shopt`,
-#           `typeset`, `declare`, `compgen`) and are true shell gaps; the rest are
-#           EXTERNALS the harness still withholds (`sed`, `od`, `sort`, `tail`) and
-#           say nothing about the shell. Both groups are large, neither dominates.
+#           `fgrep`, `head`, `tail`, `tac`, `od`). Those are real mismatches today,
+#           but MEASURE before mining the list, because `not found` is reported
+#           identically for two different things. Some of those names are BUILTINS
+#           td-sh does not have (`shopt`, `typeset`, `declare`, `compgen`) and are
+#           true shell gaps; the rest are EXTERNALS the harness still withholds
+#           (`sed`, `sort`, `ls`, `tr`) and say nothing about the shell. Both
+#           groups are large, neither dominates.
 #           No counts are given here on purpose: this file is regenerated wholesale,
 #           so a number in it would silently describe some earlier tree.
 #   skip  = not run at all, because it cannot be evaluated faithfully here:
@@ -303,6 +304,18 @@ fn probe_helper(
         ("printf 'a+b\\n' | grep -o 'a+b'", "a+b\n"),
         // `fgrep` takes no pattern at all: `.` is a full stop, not any-byte.
         ("printf 'axc\\na.c\\n' | fgrep -o 'a.c'", "a.c\n"),
+        // `head` and `tail` take opposite ends of one stream, so each probe is
+        // the other's negative: a pair wired to the same applet fails one.
+        ("printf '1\\n2\\n3\\n' | head -n 1", "1\n"),
+        ("printf '1\\n2\\n3\\n' | tail -n 1", "3\n"),
+        // …and `tail -c 4` is 38 of `tail`'s 40 uses, every one a umask.
+        ("printf 'abcdef' | tail -c 4", "cdef"),
+        ("printf '1\\n2\\n3\\n' | tac", "3\n2\n1\n"),
+        // `od` is the only one of the four with a LAYOUT: the leading space, the
+        // two hex digits and the row are all things a golden compares, and
+        // `-A n` must suppress the trailing offset line as well as the margin.
+        ("printf 'hi' | od -A n -t x1", " 68 69\n"),
+        ("printf 'a\\n' | od -A n -c", "   a  \\n\n"),
     ];
     // The probe list is written out rather than generated -- each applet needs
     // a question only IT can answer -- so it can drift from the roster it is

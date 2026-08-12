@@ -1,9 +1,10 @@
 //! What the Oils spec corpus expects to find on its PATH, without Python and
 //! without coreutils. A MULTICALL, chosen by `argv[0]`, because that is how the
 //! corpus invokes every one of them -- bare, off the one-entry PATH `run_case`
-//! stages: the two Oils Python helpers (`argv.py`, `printenv.py`) and the
+//! stages: the two Oils Python helpers (`argv.py`, `printenv.py`), the
 //! externals the corpus reaches for most that need no pattern engine (`cat`,
-//! `mkdir`, `touch`, `rm`, `wc`, `sleep`, `seq`, `chmod`).
+//! `mkdir`, `touch`, `rm`, `wc`, `sleep`, `seq`, `chmod`, `head`, `tail`,
+//! `tac`, `od`), and the `grep` family, which needs one.
 //!
 //! The externals serve only the flags the corpus actually uses, counted rather
 //! than guessed, and REFUSE everything else loudly with status 2 -- a coreutils
@@ -847,6 +848,715 @@ fn chmod(args: &[std::ffi::OsString], root: Option<&std::path::Path>) -> Done {
     Done { out: Vec::new(), err, status }
 }
 
+/// A numeric option value: the rest of the option word (`-c4`), or the next
+/// argument (`-c 4`). On refusal it reports the WORD the value came from, so a
+/// message names what cannot be served rather than the option that took it.
+///
+/// DIGITS ONLY, which is not what `usize::from_str` accepts -- it takes a
+/// leading `+`. That matters for exactly ONE caller: `tail -c +3` is GNU's
+/// "from byte 3 ONWARD", the other end of the stream, so reading it as 3 would
+/// answer a question nobody asked in the shape of a correct answer.
+///
+/// For the others the guard OVER-REFUSES, deliberately and worth stating:
+/// GNU takes `head -c +3` and `grep -m +2` as plain counts (both measured
+/// against coreutils 9.1 and grep 3.11), and both come back status 2 here. No
+/// corpus case writes a `+` anywhere, and one guard that refuses the shape
+/// everywhere beats three call sites where only one of them is dangerous and
+/// nothing says which. An overflowing count is refused by the same guard, a
+/// parse that fails being the only honest reading of a number too big to act
+/// on.
+fn number<'a>(
+    args: &'a [std::ffi::OsString],
+    arg: &'a std::ffi::OsStr,
+    tail: &[u8],
+    i: &mut usize,
+) -> Result<usize, &'a std::ffi::OsStr> {
+    let (text, blamed): (&[u8], &std::ffi::OsStr) = match tail.is_empty() {
+        false => (tail, arg),
+        true => match args.get(*i) {
+            Some(next) => {
+                *i += 1;
+                (next.as_bytes(), next.as_os_str())
+            }
+            None => return Err(arg),
+        },
+    };
+    // An EMPTY value needs no check of its own: `all` over no bytes is true, so
+    // it falls through to a parse that fails. Testing for it as well killed no
+    // mutant, which is the only evidence that says a branch is doing nothing.
+    if !text.iter().all(u8::is_ascii_digit) {
+        return Err(blamed);
+    }
+    match std::str::from_utf8(text).ok().and_then(|t| t.parse::<usize>().ok()) {
+        Some(n) => Ok(n),
+        None => Err(blamed),
+    }
+}
+
+/// An operand as a reader, with `-` and no operand alike meaning stdin -- the
+/// rule `cat` and `wc` already follow, and POSIX's.
+fn open(name: &std::ffi::OsStr) -> std::io::Result<Box<dyn std::io::Read>> {
+    match name.as_bytes() {
+        b"-" => Ok(Box::new(std::io::stdin().lock())),
+        _ => std::fs::File::open(name).map(|f| Box::new(f) as Box<dyn std::io::Read>),
+    }
+}
+
+/// …and all of its bytes, for the applets whose answer needs the whole input.
+fn slurp(name: &std::ffi::OsStr) -> std::io::Result<Vec<u8>> {
+    let mut buf = Vec::new();
+    std::io::Read::read_to_end(&mut open(name)?, &mut buf)?;
+    Ok(buf)
+}
+
+/// How an operand is NAMED in output. GNU banners and reports stdin as
+/// `standard input` rather than as the `-` that asked for it.
+///
+/// BYTES, not a `String`: a path need not be UTF-8, and `head`'s banner is
+/// STDOUT -- a golden compares it, so a name run through `from_utf8_lossy` would
+/// reach it as replacement characters where GNU passes the bytes through.
+fn label(name: &std::ffi::OsStr) -> &[u8] {
+    match name.as_bytes() {
+        b"-" => b"standard input",
+        other => other,
+    }
+}
+
+/// What `head` and `tail` were asked for.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Amount {
+    Bytes(usize),
+    Lines(usize),
+}
+
+/// The `-c`/`-n` pair `head` and `tail` share, in GNU's four spellings each
+/// (`-c4`, `-c 4`, `--bytes=4`, `--bytes 4`), plus the operands.
+///
+/// No option at all is ten LINES, which is both programs' default. The obsolete
+/// `head -5` spelling is not served: `-5` reaches the short-flag loop as a flag
+/// named `5` and is refused there, which is the honest answer for a form nothing
+/// in the corpus uses and whose meaning differs between the two programs' own
+/// documentation.
+fn head_tail_args<'a>(
+    applet: &str,
+    args: &'a [std::ffi::OsString],
+) -> Result<(Amount, Vec<&'a std::ffi::OsStr>), Done> {
+    let mut amount = Amount::Lines(10);
+    let mut operands: Vec<&std::ffi::OsStr> = Vec::new();
+    let mut rest_are_operands = false;
+    let mut i = 0;
+    while let Some(arg) = args.get(i) {
+        i += 1;
+        let bytes = arg.as_bytes();
+        if rest_are_operands || bytes == b"-" || !bytes.starts_with(b"-") {
+            operands.push(arg.as_os_str());
+            continue;
+        }
+        if bytes == b"--" {
+            rest_are_operands = true;
+            continue;
+        }
+        if bytes.starts_with(b"--") {
+            // `--bytes=4` and `--bytes 4`. An EMPTY attached value is refused
+            // rather than falling through to the next argument, which would read
+            // `--bytes= 4 f` as a count of 4 over `f` -- grep's `--max-count=`
+            // argument, and the same fix.
+            let (name, attached) = match bytes.iter().position(|b| *b == b'=') {
+                Some(k) => (bytes.get(..k).unwrap_or_default(), bytes.get(k + 1..)),
+                None => (bytes, None),
+            };
+            let wrap: fn(usize) -> Amount = match name {
+                b"--bytes" => Amount::Bytes,
+                b"--lines" => Amount::Lines,
+                _ => return Err(unsupported(applet, arg)),
+            };
+            let tail = attached.unwrap_or_default();
+            if attached.is_some() && tail.is_empty() {
+                return Err(unsupported(applet, arg));
+            }
+            match number(args, arg, tail, &mut i) {
+                Ok(n) => amount = wrap(n),
+                Err(bad) => return Err(unsupported(applet, bad)),
+            }
+            continue;
+        }
+        let letters = bytes.get(1..).unwrap_or_default();
+        let mut j = 0;
+        while let Some(c) = letters.get(j) {
+            j += 1;
+            let wrap: fn(usize) -> Amount = match c {
+                b'c' => Amount::Bytes,
+                b'n' => Amount::Lines,
+                _ => return Err(unsupported(applet, arg)),
+            };
+            // Both take a value, so whatever follows in the word is it.
+            let tail = letters.get(j..).unwrap_or_default();
+            j = letters.len();
+            match number(args, arg, tail, &mut i) {
+                Ok(n) => amount = wrap(n),
+                Err(bad) => return Err(unsupported(applet, bad)),
+            }
+        }
+    }
+    Ok((amount, operands))
+}
+
+/// `head`'s read, which stops at what was ASKED FOR rather than at EOF.
+///
+/// That is `cat`'s argument again: the corpus has `cat </dev/zero` in it, and a
+/// `head -c 5` that read its input to a buffer first would never reach the fifth
+/// byte it was asked for.
+fn head_from<R: std::io::Read>(src: R, amount: Amount, out: &mut Vec<u8>) -> std::io::Result<()> {
+    let mut src = src;
+    match amount {
+        Amount::Bytes(n) => {
+            let mut limited = src.take(u64::try_from(n).unwrap_or(u64::MAX));
+            std::io::copy(&mut limited, out).map(|_| ())
+        }
+        // Zero lines reads NOTHING, which matters for the same reason: it must
+        // not block on a stream that has nothing to give.
+        Amount::Lines(0) => Ok(()),
+        Amount::Lines(n) => {
+            let mut chunk = [0u8; 16 * 1024];
+            let mut seen = 0usize;
+            loop {
+                match src.read(&mut chunk) {
+                    Ok(0) => return Ok(()),
+                    Ok(read) => {
+                        let data = chunk.get(..read).unwrap_or_default();
+                        // The newline BELONGS to the line it ends, so the cut is
+                        // after it -- and a chunk may hold the last line wanted
+                        // plus bytes past it, which are not ours to print.
+                        let mut stop = None;
+                        for (k, b) in data.iter().enumerate() {
+                            if *b == b'\n' {
+                                seen += 1;
+                                if seen == n {
+                                    stop = Some(k);
+                                    break;
+                                }
+                            }
+                        }
+                        match stop {
+                            Some(k) => {
+                                out.extend_from_slice(data.get(..=k).unwrap_or_default());
+                                return Ok(());
+                            }
+                            None => out.extend_from_slice(data),
+                        }
+                    }
+                    Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(e) => return Err(e),
+                }
+            }
+        }
+    }
+}
+
+/// `head [-c N|-n N] [FILE...]`. Fifteen corpus uses: six pass `-c`, five `-n`,
+/// and four are bare -- which is why the default ten lines is served rather than
+/// refused.
+///
+/// Four read FILES named on the command line rather than a pipe, and that is the
+/// one place these applets need GNU's `==> NAME <==` banner: `redirect-multi`'s
+/// goldens carry it verbatim. It is the only output shape among the four that
+/// comes from the operand LIST rather than from the input.
+///
+/// A file that cannot be opened is reported and the rest are still read, which
+/// is GNU's behaviour and what those cases depend on: they glob a name the shell
+/// may or may not have created, so half of them ask `head` about a file that is
+/// not there.
+fn head(args: &[std::ffi::OsString]) -> Done {
+    let (amount, files) = match head_tail_args("head", args) {
+        Ok(parsed) => parsed,
+        Err(refused) => return refused,
+    };
+    let sources: Vec<&std::ffi::OsStr> = match files.is_empty() {
+        true => vec![std::ffi::OsStr::new("-")],
+        false => files,
+    };
+    let banner = sources.len() > 1;
+    let mut out = Vec::new();
+    let mut err = Vec::new();
+    let mut status = 0;
+    let mut printed = 0usize;
+    for name in sources {
+        let src = match open(name) {
+            Ok(src) => src,
+            Err(e) => {
+                let what = String::from_utf8_lossy(label(name));
+                err.extend_from_slice(
+                    format!("head: cannot open '{what}' for reading: {e}\n").as_bytes(),
+                );
+                status = 1;
+                continue;
+            }
+        };
+        if banner {
+            // GNU's separator is `\n==> NAME <==\n` before every file but the
+            // first one PRINTED. Written that way round rather than as a blank
+            // line after each file, because those differ: `head -c 2 a b` ends
+            // `a`'s output mid-line and still gets exactly one newline before
+            // `b`'s banner. And it is the first PRINTED, not the first named --
+            // a file that failed to open consumes no separator.
+            if printed > 0 {
+                out.push(b'\n');
+            }
+            out.extend_from_slice(b"==> ");
+            out.extend_from_slice(label(name));
+            out.extend_from_slice(b" <==\n");
+        }
+        printed += 1;
+        if let Err(e) = head_from(src, amount, &mut out) {
+            let what = String::from_utf8_lossy(label(name));
+            err.extend_from_slice(format!("head: {what}: {e}\n").as_bytes());
+            status = 1;
+        }
+    }
+    Done { out, err, status }
+}
+
+/// `tail`'s read: a ROLLING window of what was asked for, never the stream.
+///
+/// The answer is at the END, so the input must be read to EOF -- but holding all
+/// of it would grow without bound on a device that never stops, which is the
+/// same objection `cat` streams for. What is kept is bounded by the count the
+/// caller named.
+fn tail_from<R: std::io::Read>(src: R, amount: Amount) -> std::io::Result<Vec<u8>> {
+    let mut src = src;
+    let mut chunk = [0u8; 16 * 1024];
+    match amount {
+        Amount::Bytes(n) => {
+            let mut keep: std::collections::VecDeque<u8> = std::collections::VecDeque::new();
+            loop {
+                match src.read(&mut chunk) {
+                    Ok(0) => return Ok(keep.into_iter().collect()),
+                    Ok(read) => {
+                        let data = chunk.get(..read).unwrap_or_default();
+                        // Only a chunk's last `n` bytes can outlive it.
+                        let from = data.len().saturating_sub(n);
+                        keep.extend(data.get(from..).unwrap_or_default());
+                        let over = keep.len().saturating_sub(n);
+                        keep.drain(..over);
+                    }
+                    Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(e) => return Err(e),
+                }
+            }
+        }
+        Amount::Lines(n) => {
+            let mut keep: std::collections::VecDeque<Vec<u8>> = std::collections::VecDeque::new();
+            let mut cur: Vec<u8> = Vec::new();
+            // A record ENDS at its newline, so an input not ending in one has a
+            // final record that keeps none -- and it still counts as a line,
+            // which is why `printf 'a\nb' | tail -n 1` is `b`.
+            let shift = |line: Vec<u8>, keep: &mut std::collections::VecDeque<Vec<u8>>| {
+                keep.push_back(line);
+                while keep.len() > n {
+                    keep.pop_front();
+                }
+            };
+            loop {
+                match src.read(&mut chunk) {
+                    Ok(0) => {
+                        if !cur.is_empty() {
+                            shift(cur, &mut keep);
+                        }
+                        let mut out = Vec::new();
+                        for line in &keep {
+                            out.extend_from_slice(line);
+                        }
+                        return Ok(out);
+                    }
+                    Ok(read) => {
+                        for b in chunk.get(..read).unwrap_or_default() {
+                            cur.push(*b);
+                            if *b == b'\n' {
+                                shift(std::mem::take(&mut cur), &mut keep);
+                            }
+                        }
+                    }
+                    Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(e) => return Err(e),
+                }
+            }
+        }
+    }
+}
+
+/// `tail [-c N|-n N] [FILE]`. Forty corpus uses, and 39 of them are a byte count
+/// on a pipe -- `tail -c 4` alone is 38, every one of them printing a umask. The
+/// fortieth is a `tail -n 2 $f` inside a process substitution.
+///
+/// A second operand would need `head`'s banner and no case asks for one, so it
+/// is refused rather than guessed at.
+fn tail(args: &[std::ffi::OsString]) -> Done {
+    let (amount, files) = match head_tail_args("tail", args) {
+        Ok(parsed) => parsed,
+        Err(refused) => return refused,
+    };
+    if files.len() > 1 {
+        return unsupported("tail", files.get(1).copied().unwrap_or_default());
+    }
+    // A count of zero answers without OPENING anything, so `tail -c 0 missing`
+    // is silent and 0 where `head -c 0 missing` reports and is 1. That asymmetry
+    // is GNU's, verified both ways round rather than assumed, and it is
+    // observable: it also means a zero count never blocks on a stdin nobody is
+    // going to write to.
+    if matches!(amount, Amount::Bytes(0) | Amount::Lines(0)) {
+        return Done::ok(Vec::new());
+    }
+    let name = files.first().copied().unwrap_or(std::ffi::OsStr::new("-"));
+    let read = open(name).and_then(|src| tail_from(src, amount));
+    match read {
+        Ok(out) => Done::ok(out),
+        Err(e) => Done {
+            out: Vec::new(),
+            err: format!("tail: cannot open '{}' for reading: {e}\n",
+                String::from_utf8_lossy(label(name))).into_bytes(),
+            status: 1,
+        },
+    }
+}
+
+/// `tac [FILE]`. Twelve uses, not one of them with an option: eleven read a
+/// pipeline or a here-doc and the twelfth names a file.
+///
+/// A record is its line INCLUDING the newline that ends it, so an input not
+/// ending in one has a last record carrying none: `printf 'a\nb' | tac` is
+/// `ba\n`, not `b\na`. That reads like a bug and is GNU's rule -- the records
+/// are reversed, not the lines-plus-separators.
+fn tac(args: &[std::ffi::OsString]) -> Done {
+    let (opts, files) = split_options(args);
+    if let Some(bad) = opts.first() {
+        return unsupported("tac", bad);
+    }
+    if files.len() > 1 {
+        // GNU reverses each file separately and prints them in ORDER, which is
+        // not what "reverse the input" would do to their concatenation. Nothing
+        // grades it, so it is refused rather than guessed at.
+        return unsupported("tac", files.get(1).copied().unwrap_or_default());
+    }
+    let name = files.first().copied().unwrap_or(std::ffi::OsStr::new("-"));
+    let data = match slurp(name) {
+        Ok(data) => data,
+        Err(e) => {
+            return Done {
+                out: Vec::new(),
+                err: format!("tac: failed to open '{}' for reading: {e}\n",
+                    String::from_utf8_lossy(label(name)))
+                    .into_bytes(),
+                status: 1,
+            }
+        }
+    };
+    let mut records: Vec<&[u8]> = Vec::new();
+    let mut start = 0;
+    for (k, b) in data.iter().enumerate() {
+        if *b == b'\n' {
+            records.push(data.get(start..=k).unwrap_or_default());
+            start = k + 1;
+        }
+    }
+    if let Some(rest) = data.get(start..).filter(|rest| !rest.is_empty()) {
+        records.push(rest);
+    }
+    let mut out = Vec::with_capacity(data.len());
+    for record in records.iter().rev() {
+        out.extend_from_slice(record);
+    }
+    Done::ok(out)
+}
+
+/// One `-t` spec: what a byte becomes on one of `od`'s output lines.
+#[derive(Clone, Copy, PartialEq)]
+enum OdType {
+    /// `-t c`, which `-c` is a synonym for: the character, a C escape, or three
+    /// octal digits.
+    Char,
+    /// `-t x1`: two hex digits.
+    Hex1,
+}
+
+impl OdType {
+    /// The column width this spec needs alone. When several are given every line
+    /// pads to the WIDEST, which is why this is a number rather than a format
+    /// string: under `od -t c -t x1` the hex line prints in four columns.
+    fn width(self) -> usize {
+        match self {
+            OdType::Char => 4,
+            OdType::Hex1 => 3,
+        }
+    }
+
+    /// Render one byte into a reused buffer, so a block costs no allocation per
+    /// byte.
+    fn render(self, byte: u8, cell: &mut String) {
+        use std::fmt::Write as _;
+        cell.clear();
+        let escape = match byte {
+            0x00 => Some("\\0"),
+            0x07 => Some("\\a"),
+            0x08 => Some("\\b"),
+            0x09 => Some("\\t"),
+            0x0a => Some("\\n"),
+            0x0b => Some("\\v"),
+            0x0c => Some("\\f"),
+            0x0d => Some("\\r"),
+            _ => None,
+        };
+        let written = match self {
+            OdType::Hex1 => write!(cell, "{byte:02x}"),
+            OdType::Char => match escape {
+                Some(text) => {
+                    cell.push_str(text);
+                    Ok(())
+                }
+                // A BACKSLASH is NOT doubled here. That looks like an oversight
+                // and is what GNU prints: `od -c` renders it as the one
+                // printable character it is, so `\` and `\\` are told apart by
+                // the column count alone.
+                None if (0x20..=0x7e).contains(&byte) => {
+                    cell.push(char::from(byte));
+                    Ok(())
+                }
+                None => write!(cell, "{byte:03o}"),
+            },
+        };
+        // Writing to a String cannot fail; keeping the result silences the lint
+        // without an `unwrap` this crate does not allow.
+        let _ = written;
+    }
+}
+
+/// `-A`: the radix the offset down the left margin is printed in, or none.
+#[derive(Clone, Copy, PartialEq)]
+enum OdAddr {
+    Oct,
+    Dec,
+    Hex,
+    None,
+}
+
+impl OdAddr {
+    /// GNU's minimum widths, which a longer offset simply grows past.
+    fn render(self, at: usize) -> Option<String> {
+        match self {
+            OdAddr::Oct => Some(format!("{at:07o}")),
+            OdAddr::Dec => Some(format!("{at:07}")),
+            OdAddr::Hex => Some(format!("{at:06x}")),
+            OdAddr::None => None,
+        }
+    }
+}
+
+/// Fill `buf` unless the stream ends first.
+///
+/// One `read` may return fewer bytes than asked for whatever is coming, and a
+/// short block is how `od` tells a partial FINAL block from a full one -- so a
+/// pipe delivering three bytes at a time would otherwise be formatted three to
+/// a line, which is a whole different output.
+/// The count comes back WITH any error rather than instead of it: a read that
+/// fails having already delivered part of a row would otherwise drop those bytes
+/// inside this function, which is the same loss one level down from the one
+/// `od` avoids by keeping its buffer.
+fn read_block<R: std::io::Read>(src: &mut R, buf: &mut [u8]) -> (usize, Option<std::io::Error>) {
+    let mut have = 0;
+    while have < buf.len() {
+        match src.read(buf.get_mut(have..).unwrap_or_default()) {
+            Ok(0) => break,
+            Ok(read) => have += read,
+            Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return (have, Some(e)),
+        }
+    }
+    (have, None)
+}
+
+/// `od [-A RADIX] [-t c|-t x1|-c] [FILE]`. All 30 corpus uses pass `-A n`: 13
+/// with `-t x1`, 9 with `-t c -t x1` and 8 with `-c`. The nine asking for BOTH
+/// are what makes the type list a LIST rather than one spec, and what makes the
+/// column width a maximum over it. (A 31st sits inside a `bash -c '…'` body, so
+/// it is a command of THAT shell rather than of this one and is not counted.)
+///
+/// Only those two specs are served. GNU's type string is an alphabet with sizes
+/// attached (`x2`, `u4`, `f8`, `a`, and several more), and every one of them has
+/// its own column width and byte order; a bare `od` means `-t o2`, two-byte
+/// octal words. Nothing in the corpus grades any of that, and a layout invented
+/// for it would be graded as the shell's output.
+fn od(args: &[std::ffi::OsString]) -> Done {
+    let mut addr = OdAddr::Oct;
+    let mut types: Vec<OdType> = Vec::new();
+    let mut operands: Vec<&std::ffi::OsStr> = Vec::new();
+    let mut rest_are_operands = false;
+    let mut i = 0;
+    while let Some(arg) = args.get(i) {
+        i += 1;
+        let bytes = arg.as_bytes();
+        if rest_are_operands || bytes == b"-" || !bytes.starts_with(b"-") {
+            operands.push(arg.as_os_str());
+            continue;
+        }
+        if bytes == b"--" {
+            rest_are_operands = true;
+            continue;
+        }
+        if bytes.starts_with(b"--") {
+            return unsupported("od", arg);
+        }
+        let letters = bytes.get(1..).unwrap_or_default();
+        let mut j = 0;
+        while let Some(c) = letters.get(j) {
+            j += 1;
+            match c {
+                b'c' => types.push(OdType::Char),
+                b'A' | b't' => {
+                    let tail = letters.get(j..).unwrap_or_default();
+                    j = letters.len();
+                    // Blame the word the bad value is IN: `od -t o2` refusing
+                    // `-t` would name the option rather than what it cannot do.
+                    let (value, blamed): (&[u8], &std::ffi::OsStr) = match tail.is_empty() {
+                        false => (tail, arg.as_os_str()),
+                        true => match args.get(i) {
+                            Some(next) => {
+                                i += 1;
+                                (next.as_bytes(), next.as_os_str())
+                            }
+                            None => return unsupported("od", arg),
+                        },
+                    };
+                    match (c, value) {
+                        (b'A', b"o") => addr = OdAddr::Oct,
+                        (b'A', b"d") => addr = OdAddr::Dec,
+                        (b'A', b"x") => addr = OdAddr::Hex,
+                        (b'A', b"n") => addr = OdAddr::None,
+                        (b't', b"c") => types.push(OdType::Char),
+                        (b't', b"x1") => types.push(OdType::Hex1),
+                        _ => return unsupported("od", blamed),
+                    }
+                }
+                _ => return unsupported("od", arg),
+            }
+        }
+    }
+    if types.is_empty() {
+        return Done {
+            out: Vec::new(),
+            err: b"spec_helpers: od: no type given; `-t c` and `-t x1` are the served ones\n"
+                .to_vec(),
+            status: 2,
+        };
+    }
+    if operands.len() > 1 {
+        // GNU reads several files as ONE stream, offsets and all. Nothing grades
+        // it, and a second operand here is far more likely a typo.
+        return unsupported("od", operands.get(1).copied().unwrap_or_default());
+    }
+    let name = operands.first().copied().unwrap_or(std::ffi::OsStr::new("-"));
+    let mut src = match open(name) {
+        Ok(src) => src,
+        Err(e) => {
+            return Done {
+                out: Vec::new(),
+                err: format!("od: {}: {e}\n", String::from_utf8_lossy(label(name))).into_bytes(),
+                status: 1,
+            }
+        }
+    };
+    // A read that fails part of the way through KEEPS what was already decoded,
+    // as GNU does: `od -A o -c somedir` opens fine, fails at its first read, and
+    // still prints the closing `0000000`. Discarding it would throw away the
+    // answer for every byte that DID arrive.
+    let mut out = Vec::new();
+    match od_over(&mut src, addr, &types, &mut out) {
+        Ok(()) => Done::ok(out),
+        Err(e) => Done {
+            out,
+            err: format!("od: {}: {e}\n", String::from_utf8_lossy(label(name))).into_bytes(),
+            status: 1,
+        },
+    }
+}
+
+/// `od`'s block loop, split out so the option parse above stays one screen.
+fn od_over<R: std::io::Read>(
+    src: &mut R,
+    addr: OdAddr,
+    types: &[OdType],
+    out: &mut Vec<u8>,
+) -> std::io::Result<()> {
+    // A row is 16 bytes wide and every spec's line pads to the widest column any
+    // of them needs.
+    let width = types.iter().map(|ty| ty.width()).max().unwrap_or(0);
+    let mut block = [0u8; 16];
+    let mut prev = [0u8; 16];
+    let mut prev_len: Option<usize> = None;
+    let mut starred = false;
+    let mut at = 0usize;
+    let mut cell = String::new();
+    // A failed read does not leave the loop early: GNU still closes the dump
+    // with the offset it reached, so the error is carried past the tail below
+    // rather than returned from the middle of it.
+    let mut failed;
+    loop {
+        let (read, err) = read_block(src, &mut block);
+        failed = err;
+        if read == 0 {
+            break;
+        }
+        let cur = block.get(..read).unwrap_or_default();
+        // GNU collapses a RUN of identical rows to a single `*`. Only the
+        // immediately preceding row is compared, so `A A B A` prints all but the
+        // second. A final PARTIAL row can never match a full one, which is why
+        // the length is part of what is remembered.
+        if prev_len == Some(read) && prev.get(..read) == Some(cur) {
+            if !starred {
+                out.extend_from_slice(b"*\n");
+                starred = true;
+            }
+        } else {
+            starred = false;
+            for (k, ty) in types.iter().enumerate() {
+                // Only a row's FIRST line carries the address; the rest are
+                // indented to the same column so the fields stay aligned under
+                // it.
+                if let Some(text) = addr.render(at) {
+                    match k {
+                        0 => out.extend_from_slice(text.as_bytes()),
+                        _ => out.resize(out.len().saturating_add(text.len()), b' '),
+                    }
+                }
+                for byte in cur {
+                    ty.render(*byte, &mut cell);
+                    out.resize(out.len().saturating_add(width.saturating_sub(cell.len())), b' ');
+                    out.extend_from_slice(cell.as_bytes());
+                }
+                out.push(b'\n');
+            }
+            prev = block;
+            prev_len = Some(read);
+        }
+        at += read;
+        // The row that arrived alongside the error is rendered first, and THEN
+        // the dump ends -- an `if/else` rather than the `continue` this loop
+        // used to take, so the collapsed-row arm reaches this too.
+        if failed.is_some() {
+            break;
+        }
+    }
+    // The closing line is the total length in the same radix -- and with `-A n`
+    // there is none, which is why an EMPTY input under `-A n` prints nothing at
+    // all where `od -t x1` prints `0000000`.
+    if let Some(text) = addr.render(at) {
+        out.extend_from_slice(text.as_bytes());
+        out.push(b'\n');
+    }
+    match failed {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
+}
+
 /// `grep [-q] [-o] [-i] [-v] [-E|-F] [-A NUM] [-m NUM] PATTERN [FILE]`.
 ///
 /// The option surface is counted like every other applet's, over 177
@@ -883,18 +1593,6 @@ fn grep(args: &[std::ffi::OsString], preset: Option<u8>) -> Done {
             rest_are_operands = true;
             continue;
         }
-        // A numeric option takes the rest of its word, or the next argument.
-        let number = |tail: &[u8], i: &mut usize| -> Option<usize> {
-            let text = match tail.is_empty() {
-                false => String::from_utf8_lossy(tail).into_owned(),
-                true => {
-                    let next = args.get(*i)?;
-                    *i += 1;
-                    String::from_utf8_lossy(next.as_bytes()).into_owned()
-                }
-            };
-            text.parse::<usize>().ok()
-        };
         if bytes.starts_with(b"--") {
             match bytes {
                 b"--only-matching" => only = true,
@@ -909,14 +1607,14 @@ fn grep(args: &[std::ffi::OsString], preset: Option<u8>) -> Done {
                 // would fall through to taking the next argument -- so
                 // `--max-count= 1 foo` would silently consume the `1` and grep
                 // for `foo` with a limit nobody wrote.
-                b"--max-count" => match number(b"", &mut i) {
-                    Some(n) => max = n,
-                    None => return unsupported("grep", arg),
+                b"--max-count" => match number(args, arg, b"", &mut i) {
+                    Ok(n) => max = n,
+                    Err(bad) => return unsupported("grep", bad),
                 },
                 _ => match bytes.strip_prefix(b"--max-count=") {
-                    Some(tail) if !tail.is_empty() => match number(tail, &mut i) {
-                        Some(n) => max = n,
-                        None => return unsupported("grep", arg),
+                    Some(tail) if !tail.is_empty() => match number(args, arg, tail, &mut i) {
+                        Ok(n) => max = n,
+                        Err(bad) => return unsupported("grep", bad),
                     },
                     _ => return unsupported("grep", arg),
                 },
@@ -937,13 +1635,13 @@ fn grep(args: &[std::ffi::OsString], preset: Option<u8>) -> Done {
                 b'A' | b'm' => {
                     let tail = letters.get(j..).unwrap_or_default();
                     j = letters.len();
-                    match number(tail, &mut i) {
-                        Some(n) if *c == b'A' => {
+                    match number(args, arg, tail, &mut i) {
+                        Ok(n) if *c == b'A' => {
                             after = n;
                             context = true;
                         }
-                        Some(n) => max = n,
-                        None => return unsupported("grep", arg),
+                        Ok(n) => max = n,
+                        Err(bad) => return unsupported("grep", bad),
                     }
                 }
                 _ => return unsupported("grep", arg),
@@ -974,20 +1672,13 @@ fn grep(args: &[std::ffi::OsString], preset: Option<u8>) -> Done {
         // Several files need GNU's `file:` prefixes, which nothing grades.
         return unsupported("grep", files.get(1).copied().unwrap_or_default());
     }
-    let src = match files.first() {
-        Some(name) if name.as_bytes() != b"-" => std::fs::read(name),
-        _ => {
-            let mut buf = Vec::new();
-            std::io::Read::read_to_end(&mut std::io::stdin().lock(), &mut buf).map(|_| buf)
-        }
-    };
-    let data = match src {
-        Ok(d) => d,
+    let name = files.first().copied().unwrap_or(std::ffi::OsStr::new("-"));
+    let data = match slurp(name) {
+        Ok(data) => data,
         Err(e) => {
-            let what = files.first().map(|f| std::path::Path::new(f).display().to_string());
             return Done {
                 out: Vec::new(),
-                err: format!("grep: {}: {e}\n", what.unwrap_or_else(|| "-".into())).into_bytes(),
+                err: format!("grep: {}: {e}\n", String::from_utf8_lossy(label(name))).into_bytes(),
                 status: 2,
             };
         }
@@ -1537,6 +2228,28 @@ fn match_here(
 /// real external is graded on its STATUS as much as its output, and reports its
 /// own errors -- so all three travel together and every applet stays a pure
 /// function of its arguments, testable without running the binary.
+///
+/// The cost is ORDERING, and it is worth naming: the two streams are written out
+/// in full one after the other, so an applet that fails PART of the way through
+/// -- `head missing good`, `rm a missing b` -- puts its diagnostic after all of
+/// its output where GNU interleaves them. Nothing here can observe that. The
+/// harness captures the two separately and grades them against separate golden
+/// blocks, and no corpus case merges them with `2>&1`. Preserving the order
+/// would mean writing as it goes, which is what stops an applet being a value.
+///
+/// The other cost is MEMORY, and it bounds where these applets may be pointed.
+/// An applet's whole output is held here before any of it is written, so an
+/// endless input is an allocation failure where GNU is merely an endless
+/// program: measured under a 512 MiB address-space limit, `head -n 2 </dev/zero`
+/// ABORTS here and runs flat forever there. `head -c` and `tail -c` are bounded
+/// by the count asked for, but `head -n`/`tail -n` on a stream with no newline
+/// in it are not, and `tac` and `od` cannot be -- they need the whole input by
+/// definition. `grep` has the same shape for the same reason. Nothing in the
+/// corpus points one of them at a device, and `cat` -- the one that IS pointed
+/// at `/dev/zero` -- takes a writer instead precisely so it streams. Closing it
+/// for the rest means writing as it goes, which is the same trade as the
+/// ordering above.
+#[derive(Debug)]
 struct Done {
     out: Vec<u8>,
     err: Vec<u8>,
@@ -1609,6 +2322,10 @@ fn main() {
         b"grep" => grep(&rest, None),
         b"egrep" => grep(&rest, Some(b'E')),
         b"fgrep" => grep(&rest, Some(b'F')),
+        b"head" => head(&rest),
+        b"tail" => tail(&rest),
+        b"tac" => tac(&rest),
+        b"od" => od(&rest),
         other => {
             // Named as something this does not serve: say so rather than print
             // a plausible answer, which would grade as a shell result.
@@ -2103,6 +2820,430 @@ mod tests {
         assert!(start.elapsed() < std::time::Duration::from_secs(1));
     }
 
+    /// A reader that hands over at most `step` bytes at a time, and reports an
+    /// error once it has given out `stop` of them.
+    ///
+    /// Both halves are load-bearing. A short read is what a PIPE does, and `od`
+    /// formats sixteen bytes to a row -- so a reader that answered in full would
+    /// leave the block-filling loop pinned by nothing. The error is how `head`'s
+    /// claim to stop at what it was ASKED for is checked: nothing observable
+    /// distinguishes an applet that read the whole stream from one that stopped,
+    /// unless reading past the point is made to fail.
+    struct Trickle<'a> {
+        data: &'a [u8],
+        at: usize,
+        step: usize,
+        stop: usize,
+    }
+
+    impl std::io::Read for Trickle<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if self.at >= self.stop {
+                return Err(std::io::Error::other("read past the limit"));
+            }
+            let want = buf.len().min(self.step).min(self.data.len() - self.at);
+            let from = self.data.get(self.at..self.at + want).unwrap_or_default();
+            buf.get_mut(..want).unwrap_or_default().copy_from_slice(from);
+            self.at += want;
+            Ok(want)
+        }
+    }
+
+    fn trickle(data: &[u8], step: usize) -> Trickle<'_> {
+        Trickle { data, at: 0, step, stop: usize::MAX }
+    }
+
+    /// `head` and `tail` answer the same question about opposite ends of one
+    /// stream, so every case here is checked twice over -- a swap would have to
+    /// be right about both ends at once.
+    #[test]
+    fn head_and_tail_take_opposite_ends_of_a_stream() {
+        let take = |amount, data: &[u8]| {
+            let mut out = Vec::new();
+            head_from(data, amount, &mut out).unwrap();
+            (out, tail_from(data, amount).unwrap())
+        };
+        let text = b"one\ntwo\nthree\n";
+        let (h, t) = take(Amount::Bytes(4), text);
+        assert_eq!((h.as_slice(), t.as_slice()), (b"one\n".as_slice(), b"ree\n".as_slice()));
+        let (h, t) = take(Amount::Lines(1), text);
+        assert_eq!((h.as_slice(), t.as_slice()), (b"one\n".as_slice(), b"three\n".as_slice()));
+        let (h, t) = take(Amount::Lines(2), text);
+        assert_eq!(h.as_slice(), b"one\ntwo\n".as_slice());
+        assert_eq!(t.as_slice(), b"two\nthree\n".as_slice());
+        // Asking for more than there is takes all of it rather than failing.
+        let (h, t) = take(Amount::Lines(99), text);
+        assert_eq!((h.as_slice(), t.as_slice()), (text.as_slice(), text.as_slice()));
+        let (h, t) = take(Amount::Bytes(99), text);
+        assert_eq!((h.as_slice(), t.as_slice()), (text.as_slice(), text.as_slice()));
+        // Zero of either is nothing, which is not the same as "no option given".
+        let (h, t) = take(Amount::Bytes(0), text);
+        assert!(h.is_empty() && t.is_empty());
+        let (h, t) = take(Amount::Lines(0), text);
+        assert!(h.is_empty() && t.is_empty());
+        // A record ENDS at its newline, so a final line carrying none is still a
+        // line -- and `tail` must not invent the newline it never saw.
+        let (h, t) = take(Amount::Lines(1), b"a\nb");
+        assert_eq!((h.as_slice(), t.as_slice()), (b"a\n".as_slice(), b"b".as_slice()));
+        let (h, t) = take(Amount::Lines(2), b"a\nb");
+        assert_eq!((h.as_slice(), t.as_slice()), (b"a\nb".as_slice(), b"a\nb".as_slice()));
+        // An empty stream is empty at both ends.
+        let (h, t) = take(Amount::Lines(3), b"");
+        assert!(h.is_empty() && t.is_empty());
+        // A line split across reads is one line, and a chunk holding the last
+        // line WANTED plus bytes past it must not print the rest.
+        let mut out = Vec::new();
+        head_from(trickle(b"one\ntwo\nthree\n", 3), Amount::Lines(2), &mut out).unwrap();
+        assert_eq!(out.as_slice(), b"one\ntwo\n".as_slice());
+        assert_eq!(tail_from(trickle(b"one\ntwo\nthree\n", 3), Amount::Lines(1)).unwrap(), b"three\n");
+        assert_eq!(tail_from(trickle(b"abcdefgh", 3), Amount::Bytes(3)).unwrap(), b"fgh");
+    }
+
+    /// `head` stops at what it was ASKED for rather than at end of input -- the
+    /// argument `cat` streams for, since the corpus has an endless device in it.
+    #[test]
+    fn head_stops_reading_at_what_it_was_asked_for() {
+        let endless = b"aaaa\nbbbb\ncccc\ndddd\n";
+        // Reading past the fifth byte is an error, so a `head -c 4` that got
+        // there would report one.
+        let mut out = Vec::new();
+        let src = Trickle { data: endless, at: 0, step: 2, stop: 5 };
+        head_from(src, Amount::Bytes(4), &mut out).unwrap();
+        assert_eq!(out.as_slice(), b"aaaa".as_slice());
+        // …and the same for a line count, which stops mid-chunk.
+        let mut out = Vec::new();
+        let src = Trickle { data: endless, at: 0, step: 5, stop: 10 };
+        head_from(src, Amount::Lines(1), &mut out).unwrap();
+        assert_eq!(out.as_slice(), b"aaaa\n".as_slice());
+        // Zero reads NOTHING, so it cannot block on a stream with nothing to
+        // give -- checked by making the very first read fail.
+        let mut out = Vec::new();
+        let src = Trickle { data: endless, at: 0, step: 4, stop: 0 };
+        head_from(src, Amount::Bytes(0), &mut out).unwrap();
+        assert!(out.is_empty());
+        // A real read error is still an error, or the two cases above would be
+        // satisfied by an applet that never read at all.
+        let mut out = Vec::new();
+        let src = Trickle { data: endless, at: 0, step: 4, stop: 8 };
+        assert!(head_from(src, Amount::Bytes(16), &mut out).is_err());
+    }
+
+    /// `tail` with a count of zero never OPENS its operand, where `head` with
+    /// one does -- a GNU asymmetry, verified both ways round against coreutils
+    /// 9.1 rather than assumed, and observable in the status.
+    #[test]
+    fn a_zero_count_stops_tail_before_it_opens_anything() {
+        let dir = Dir::new("tail-zero");
+        for zero in [os("-c"), os("-n")] {
+            let done = tail(&[zero.clone(), os("0"), dir.at("gone")]);
+            assert_eq!((done.status, done.err.is_empty()), (0, true), "{zero:?} opened the file");
+            assert!(done.out.is_empty());
+        }
+        // A NON-zero count on the same missing file does report, or the above
+        // would be satisfied by a `tail` that never reported anything.
+        let done = tail(&[os("-c"), os("1"), dir.at("gone")]);
+        assert_eq!(done.status, 1);
+        assert!(!done.err.is_empty(), "a failed open said nothing");
+        // …and `head` is the other half of the asymmetry.
+        let done = head(&[os("-c"), os("0"), dir.at("gone")]);
+        assert_eq!(done.status, 1, "head -c 0 did not open the file");
+        assert!(!done.err.is_empty());
+        // A second operand would need `head`'s banner and is refused.
+        std::fs::write(dir.0.join("f"), b"x\n").unwrap();
+        assert_eq!(tail(&[dir.at("f")]).status, 0);
+        assert_eq!(tail(&[dir.at("f"), dir.at("f")]).status, 2, "a second operand was served");
+    }
+
+    /// The option pair itself: four spellings each, and a refusal for everything
+    /// that is not a plain count.
+    #[test]
+    fn a_count_option_is_digits_and_nothing_else() {
+        let parse = |args: &[&str]| {
+            let owned: Vec<std::ffi::OsString> = args.iter().map(|a| os(a)).collect();
+            head_tail_args("head", &owned).map(|(amount, files)| {
+                (amount, files.iter().map(|f| f.to_string_lossy().into_owned()).collect::<Vec<_>>())
+            })
+        };
+        assert_eq!(parse(&[]).unwrap().0, Amount::Lines(10));
+        for spelling in [
+            vec!["-c", "4"],
+            vec!["-c4"],
+            vec!["--bytes", "4"],
+            vec!["--bytes=4"],
+        ] {
+            assert_eq!(parse(&spelling).unwrap().0, Amount::Bytes(4), "{spelling:?}");
+        }
+        for spelling in [vec!["-n", "2"], vec!["-n2"], vec!["--lines", "2"], vec!["--lines=2"]] {
+            assert_eq!(parse(&spelling).unwrap().0, Amount::Lines(2), "{spelling:?}");
+        }
+        // The LAST one given wins, as GNU's does.
+        assert_eq!(parse(&["-c", "4", "-n", "2"]).unwrap().0, Amount::Lines(2));
+        // Operands, including a file whose name begins with a dash once `--`
+        // has been seen, and `-` which is stdin rather than an option.
+        assert_eq!(parse(&["-n", "1", "f", "g"]).unwrap().1, vec!["f", "g"]);
+        assert_eq!(parse(&["--", "-n"]).unwrap().1, vec!["-n"]);
+        assert_eq!(parse(&["-"]).unwrap().1, vec!["-"]);
+        // `+3` is GNU's "from byte 3 onward", the OTHER end of the stream, and
+        // `usize::from_str` takes the `+` -- so this is the guard, not the
+        // parser, and it is the one refusal that would otherwise be silent.
+        for bad in [
+            vec!["-c", "+3"],
+            vec!["-n", "+3"],
+            vec!["-c", "-1"],
+            vec!["-c", "x"],
+            vec!["-c", ""],
+            vec!["-c"],
+            vec!["--bytes="],
+            vec!["--bytes", "1x"],
+            vec!["-5"],
+            vec!["-q"],
+            vec!["--verbose"],
+            vec!["-c", "99999999999999999999999999"],
+        ] {
+            let refused = parse(&bad).err().map(|done| done.status);
+            assert_eq!(refused, Some(2), "{bad:?} was not refused");
+        }
+        // `--bytes=` with a value word AFTER it. Without the empty-attached
+        // guard this reads as `--bytes 4` and greps a count nobody wrote --
+        // and it needs the following word to show that, since `--bytes=` alone
+        // is refused by running out of arguments whether the guard is there or
+        // not.
+        assert!(parse(&["--bytes=", "4"]).is_err(), "an empty attached value was taken");
+        // The refusal NAMES the value rather than the option that took it.
+        let done = parse(&["-c", "+3"]).err().unwrap();
+        assert!(String::from_utf8_lossy(&done.err).contains("+3"), "the refusal named the option");
+    }
+
+    /// `tac` reverses RECORDS, and a record carries the newline that ends it --
+    /// so an input not ending in one has a last record with none, and
+    /// `printf 'a\nb' | tac` is `ba\n`. That reads like a bug until the records
+    /// are written out, which is why it is pinned rather than described.
+    #[test]
+    fn tac_reverses_records_not_lines() {
+        let dir = Dir::new("tac");
+        let run = |body: &[u8]| {
+            std::fs::write(dir.0.join("f"), body).unwrap();
+            let done = tac(&[dir.at("f")]);
+            assert_eq!(done.status, 0);
+            done.out
+        };
+        assert_eq!(run(b"one\ntwo\nthree\n"), b"three\ntwo\none\n");
+        assert_eq!(run(b"a\nb"), b"ba\n");
+        assert_eq!(run(b"a"), b"a");
+        assert_eq!(run(b""), b"");
+        assert_eq!(run(b"\n"), b"\n");
+        // Blank lines are records too, so they keep their places from the end.
+        assert_eq!(run(b"a\n\nb\n"), b"b\n\na\n");
+        // A missing file is reported rather than read as empty.
+        let done = tac(&[dir.at("gone")]);
+        assert_eq!(done.status, 1);
+        assert!(!done.err.is_empty());
+        // No option is served, and a second operand needs GNU's per-file rule.
+        assert_eq!(tac(&[os("-r")]).status, 2);
+        assert_eq!(tac(&[dir.at("f"), dir.at("f")]).status, 2);
+    }
+
+    /// `head`'s banner, which is the one shape in these four that a corpus
+    /// golden carries verbatim.
+    #[test]
+    fn head_banners_several_files_and_survives_a_missing_one() {
+        let dir = Dir::new("head-banner");
+        std::fs::write(dir.0.join("a"), b"A1\nA2\n").unwrap();
+        std::fs::write(dir.0.join("b"), b"B1\n").unwrap();
+        let text = |done: &Done| String::from_utf8_lossy(&done.out).into_owned();
+        let name = |n: &str| dir.at(n).to_string_lossy().into_owned();
+        let (a, b) = (name("a"), name("b"));
+        // One file carries NO banner, which is what makes the banner a function
+        // of the operand count rather than of there being an operand at all.
+        let done = head(&[dir.at("a")]);
+        assert_eq!((done.status, text(&done).as_str()), (0, "A1\nA2\n"));
+        // Two carry one each, separated by a blank line -- written as a leading
+        // newline on the second, which is why `head -c 2` still gets exactly one
+        // even though its output ended mid-line.
+        let done = head(&[dir.at("a"), dir.at("b")]);
+        assert_eq!(text(&done), format!("==> {a} <==\nA1\nA2\n\n==> {b} <==\nB1\n"));
+        let done = head(&[os("-c"), os("2"), dir.at("a"), dir.at("b")]);
+        assert_eq!(text(&done), format!("==> {a} <==\nA1\n==> {b} <==\nB1"));
+        // A file that cannot be opened is reported, the others are still read,
+        // and it consumes NO separator -- so the first file PRINTED is the one
+        // with no blank line before it, not the first one named.
+        let done = head(&[dir.at("gone"), dir.at("a"), dir.at("b")]);
+        assert_eq!(done.status, 1);
+        assert!(!done.err.is_empty(), "a failed open said nothing");
+        assert_eq!(text(&done), format!("==> {a} <==\nA1\nA2\n\n==> {b} <==\nB1\n"));
+        // The banner is STDOUT, so the name reaches it as BYTES. A path need not
+        // be UTF-8, and passing one through `from_utf8_lossy` would print
+        // replacement characters where GNU prints what it was given.
+        use std::os::unix::ffi::OsStringExt;
+        let mut raw = dir.0.clone().into_os_string().into_vec();
+        raw.extend_from_slice(b"/\xff\xfename");
+        let odd = std::ffi::OsString::from_vec(raw.clone());
+        std::fs::write(std::path::Path::new(&odd), b"R\n").unwrap();
+        let done = head(&[odd, dir.at("b")]);
+        assert_eq!(done.status, 0, "{:?}", String::from_utf8_lossy(&done.err));
+        let banner: Vec<u8> = b"==> ".iter().copied().chain(raw).collect();
+        assert!(done.out.starts_with(&banner), "the name was not passed through");
+    }
+
+    /// `od`'s layout: the column width, the row, the address margin and the `*`
+    /// that stands in for a repeat. Every one of these is a byte a golden
+    /// compares, which is why they are pinned as literals.
+    #[test]
+    fn od_renders_the_layout_the_goldens_carry() {
+        let render = |data: &[u8], addr, types: &[OdType]| {
+            let mut out = Vec::new();
+            od_over(&mut &data[..], addr, types, &mut out).unwrap();
+            String::from_utf8_lossy(&out).into_owned()
+        };
+        let hex = &[OdType::Hex1][..];
+        let chars = &[OdType::Char][..];
+        assert_eq!(render(b"abc", OdAddr::None, hex), " 61 62 63\n");
+        assert_eq!(render(b"abc\n", OdAddr::None, chars), "   a   b   c  \\n\n");
+        // Sixteen bytes to a row, and the seventeenth starts another.
+        assert_eq!(
+            render(b"0123456789abcdefg", OdAddr::None, hex),
+            " 30 31 32 33 34 35 36 37 38 39 61 62 63 64 65 66\n 67\n"
+        );
+        // Every escape `-c` names, and the printable range around them. A
+        // BACKSLASH is not doubled, which looks like an oversight and is GNU's.
+        assert_eq!(
+            render(b"\x00\x07\x08\x09\x0a\x0b\x0c\x0d\\ ~\x7f\x80", OdAddr::None, chars),
+            "  \\0  \\a  \\b  \\t  \\n  \\v  \\f  \\r   \\       ~ 177 200\n"
+        );
+        // An octal byte is padded to THREE digits, which only a byte below 0o100
+        // can show -- and none of the escapes above is one.
+        assert_eq!(render(b"\x01\x1f\x02", OdAddr::None, chars), " 001 037 002\n");
+        // The address margin, in each radix, with the closing offset line.
+        assert_eq!(render(b"abc", OdAddr::Oct, hex), "0000000 61 62 63\n0000003\n");
+        assert_eq!(render(b"abc", OdAddr::Dec, hex), "0000000 61 62 63\n0000003\n");
+        assert_eq!(render(b"abc", OdAddr::Hex, hex), "000000 61 62 63\n000003\n");
+        // …and a length the radixes DISAGREE about, since below eight they all
+        // print the same digit and the decimal margin could be octal unnoticed.
+        let ten = b"0123456789";
+        assert_eq!(render(ten, OdAddr::Dec, hex).lines().last(), Some("0000010"));
+        assert_eq!(render(ten, OdAddr::Oct, hex).lines().last(), Some("0000012"));
+        assert_eq!(render(ten, OdAddr::Hex, hex).lines().last(), Some("00000a"));
+        // An empty input still has an offset -- and under `-A n`, where there is
+        // no offset line at all, it prints NOTHING.
+        assert_eq!(render(b"", OdAddr::Oct, hex), "0000000\n");
+        assert_eq!(render(b"", OdAddr::None, hex), "");
+        // Several specs are several LINES per row, in order, and every column
+        // widens to the widest of them -- so hex prints four wide beside `c`.
+        assert_eq!(
+            render(b"ab", OdAddr::None, &[OdType::Char, OdType::Hex1]),
+            "   a   b\n  61  62\n"
+        );
+        assert_eq!(
+            render(b"ab", OdAddr::None, &[OdType::Hex1, OdType::Char]),
+            "  61  62\n   a   b\n"
+        );
+        // …and only the FIRST line of a row carries the address; the rest are
+        // indented to the same column.
+        assert_eq!(
+            render(b"ab", OdAddr::Oct, &[OdType::Char, OdType::Hex1]),
+            "0000000   a   b\n         61  62\n0000002\n"
+        );
+    }
+
+    /// A run of identical rows collapses to one `*`, which is `od`'s only
+    /// stateful output and the one place a row's LENGTH is part of its identity.
+    #[test]
+    fn od_collapses_a_run_of_identical_rows() {
+        let render = |data: &[u8], addr| {
+            let mut out = Vec::new();
+            od_over(&mut &data[..], addr, &[OdType::Hex1], &mut out).unwrap();
+            String::from_utf8_lossy(&out).into_owned()
+        };
+        let row = " 61".repeat(16);
+        // Three identical rows and a partial fourth: the run is one `*`, and the
+        // partial row cannot join it because a short row is a different row.
+        assert_eq!(render(&[b'a'; 49], OdAddr::None), format!("{row}\n*\n 61\n"));
+        // Exactly two identical rows still ends at the `*` under `-A n`, where
+        // no closing offset follows it.
+        assert_eq!(render(&[b'a'; 32], OdAddr::None), format!("{row}\n*\n"));
+        assert_eq!(render(&[b'a'; 32], OdAddr::Oct), format!("0000000{row}\n*\n0000040\n"));
+        // Only the row BEFORE is compared, so an alternation repeats nothing.
+        let mut alternating = Vec::new();
+        alternating.extend_from_slice(&[b'a'; 16]);
+        alternating.extend_from_slice(&[b'b'; 16]);
+        alternating.extend_from_slice(&[b'a'; 16]);
+        assert_eq!(render(&alternating, OdAddr::None).matches('*').count(), 0);
+        // TWO runs get a star EACH: the state is per-run, and a version that
+        // never cleared it would print the first and swallow the second, which
+        // one run alone cannot tell apart.
+        let mut two_runs = Vec::new();
+        two_runs.extend_from_slice(&[b'a'; 32]);
+        two_runs.extend_from_slice(&[b'b'; 32]);
+        let out = render(&two_runs, OdAddr::None);
+        assert_eq!(out.matches('*').count(), 2, "the second run lost its star: {out:?}");
+        assert_eq!(out.lines().count(), 4, "{out:?}");
+        // A row arriving in pieces is still one row: a pipe hands over what it
+        // has, and a three-byte read must not become a three-byte row.
+        let data = [b'a'; 49];
+        let mut src = trickle(&data, 3);
+        let mut out = Vec::new();
+        od_over(&mut src, OdAddr::None, &[OdType::Hex1], &mut out).unwrap();
+        assert_eq!(String::from_utf8_lossy(&out), format!("{row}\n*\n 61\n"));
+    }
+
+    /// `od`'s option surface, and the type alphabet it refuses.
+    #[test]
+    fn od_refuses_every_type_it_cannot_lay_out() {
+        // A bare `od` is GNU's `-t o2`, a layout nothing grades.
+        assert_eq!(od(&[]).status, 2);
+        assert_eq!(od(&[os("-A"), os("n")]).status, 2);
+        for bad in [
+            vec!["-t", "x2"],
+            vec!["-t", "x"],
+            vec!["-t", "o2"],
+            vec!["-t", "u1"],
+            vec!["-t", "a"],
+            vec!["-t", "x1c"],
+            vec!["-t", "xC"],
+            vec!["-b"],
+            vec!["-x"],
+            vec!["-v"],
+            vec!["-N", "2"],
+            vec!["-A", "z"],
+            vec!["-A"],
+            vec!["--format=x1"],
+        ] {
+            let args: Vec<std::ffi::OsString> = bad.iter().map(|a| os(a)).collect();
+            assert_eq!(od(&args).status, 2, "{bad:?} was not refused");
+        }
+        // The refusal names the VALUE, not the option that took it: `-t o2`
+        // reporting `-t` would say nothing about what cannot be served.
+        let done = od(&[os("-t"), os("o2")]);
+        assert!(String::from_utf8_lossy(&done.err).contains("o2"), "the refusal named the option");
+    }
+
+    /// A read that fails part of the way through keeps what was already decoded,
+    /// and still closes the dump with the offset it reached. GNU does both:
+    /// `od -A o -c somedir` opens, fails at its first read, and prints
+    /// `0000000` -- so an `od` that discarded its buffer would differ in
+    /// STDOUT while agreeing about the status.
+    #[test]
+    fn od_keeps_what_it_decoded_when_a_read_fails() {
+        // A directory opens and then refuses to be read, which is the shape
+        // that turned this up; the applet is asked through its own entry point
+        // so the operand path is what runs.
+        let dir = Dir::new("od-error");
+        let done = od(&[os("-A"), os("o"), os("-c"), dir.0.clone().into_os_string()]);
+        assert_eq!(done.status, 1);
+        assert!(!done.err.is_empty(), "a failed read said nothing");
+        assert_eq!(String::from_utf8_lossy(&done.out), "0000000\n");
+        // …and bytes that DID arrive are kept, with the offset naming how far
+        // it got rather than how far it was asked to go.
+        let mut out = Vec::new();
+        let src = Trickle { data: b"abcdefghij", at: 0, step: 4, stop: 8 };
+        let mut src = src;
+        assert!(od_over(&mut src, OdAddr::Oct, &[OdType::Hex1], &mut out).is_err());
+        assert_eq!(
+            String::from_utf8_lossy(&out),
+            "0000000 61 62 63 64 65 66 67 68\n0000010\n"
+        );
+    }
+
     /// Does `pat` match `line`, and where? `None` for a pattern outside the
     /// subset, which is the applet's status 2.
     fn m(pat: &str, ere: bool, icase: bool, line: &str) -> Option<Option<(usize, usize)>> {
@@ -2481,6 +3622,16 @@ mod tests {
         assert_eq!(grep(&[arg("--max-count1"), arg("foo")], None).status, 2);
         let eaten = grep(&[arg("--max-count="), arg("1"), arg("foo")], None);
         assert_eq!(eaten.status, 2, "`--max-count=` consumed the next argument");
+        // A counted option is DIGITS here, which for `grep` is an OVER-refusal:
+        // GNU 3.11 takes `-m +2` as a plain 2 (measured). It is refused because
+        // one shared guard refuses `+` everywhere, and `tail -c +3` -- where the
+        // `+` means the other end of the stream -- is why that guard exists.
+        // Pinned so the divergence is a decision rather than a side effect.
+        for plus in [vec!["-m", "+2"], vec!["-A", "+1"], vec!["--max-count=+2"]] {
+            let mut args: Vec<std::ffi::OsString> = plus.iter().map(|a| arg(a)).collect();
+            args.push(arg("foo"));
+            assert_eq!(grep(&args, None).status, 2, "{plus:?} was taken");
+        }
         // The presets are the only difference between the three names: `+` is
         // a repeat to egrep, a literal to grep, and `.` is a full stop to fgrep.
         std::fs::write(&f, "a+b\naxb\n").unwrap();

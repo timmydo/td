@@ -77,7 +77,7 @@ const CAPTURE_CAP: usize = 8 * 1024 * 1024;
 pub const ASH_DASH_CHAIN: &[&str] = &["ash", "dash"];
 
 /// The names `run_case` stages on the case's PATH — the two Oils Python helpers
-/// and the eleven externals the corpus reaches for most — all served by the one
+/// and the fifteen externals the corpus reaches for most — all served by the one
 /// `spec_helpers` multicall through `argv[0]`. Public because `gen_expectations`
 /// probes each one: a helper that is staged but does not ANSWER records its
 /// cases as shell gaps, which is the failure staging it exists to prevent. It is
@@ -97,6 +97,10 @@ pub const SPEC_HELPERS: &[&str] = &[
     "grep",
     "egrep",
     "fgrep",
+    "head",
+    "tail",
+    "tac",
+    "od",
 ];
 
 /// A parse error, anchored to a 1-based source line.
