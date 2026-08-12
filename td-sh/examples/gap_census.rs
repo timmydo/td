@@ -1,0 +1,302 @@
+//! What do the corpus's REMAINING failures actually need?
+//!
+//! The overlay says how many cases fail; it does not say what would fix them,
+//! and that is the question every increment on this workstream starts with.
+//! Guessing it wrong is expensive in the direction that does not show up: the
+//! externals looked like the obvious seam right up until staging all nine
+//! remaining ones was measured at 13 cases between them, less than `sed` alone
+//! had just delivered.
+//!
+//! So this runs every case the overlay GRADES -- its skips are not run, both
+//! because their verdict here is a fact about the host and because running one
+//! creates the shared `/tmp` state it is skipped for -- and buckets the
+//! failures by what the failure looks like: the status td-sh returned where it
+//! differed, and where in the corpus the case lives. The ones that came back
+//! 127 are asked which name they wanted.
+//!
+//! It is a census, not a verdict, and its numbers are APPROXIMATE IN BOTH
+//! DIRECTIONS -- which is the part to keep hold of, because only one direction
+//! is obvious. Over: a case can want a missing name and be wrong about
+//! something else too, and where the name has to be guessed from the source,
+//! every command-position word of a failing case is counted rather than the one
+//! that was not found. Under: the guess only sees cases whose STATUS was 127
+//! and only words this scanner reads as a command, so a name can matter more
+//! than it ranks. `ls` sits at 2 here and staging it unblocks 6. What settles a
+//! number is staging the thing and re-running, as `sed`'s 14 was settled before
+//! a line of it was written.
+//!
+//! ```text
+//! cargo build --release --manifest-path td-sh/Cargo.toml --bins --examples
+//! ./td-sh/target/release/examples/gap_census \
+//!   td-sh/target/release/td-sh td-sh/target/release/spec_helpers td-sh/spec
+//! ```
+
+#![forbid(unsafe_code)]
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::PathBuf;
+use td_sh::{case_keys, parse_spec, run_case, spec_paths, ASH_DASH_CHAIN};
+
+/// The command a `not found` diagnostic NAMES, where the golden asserted stderr
+/// and so kept it.
+///
+/// Only some cases carry it -- a golden that asserts stdout alone leaves stderr
+/// out of `detail` -- but where it is there it is the exact answer the word
+/// scan below can only approximate, so it is preferred over that scan.
+fn named_by_stderr(detail: &str) -> Option<String> {
+    let at = detail.find("stderr:")?;
+    let rest = detail.get(at..)?;
+    let mark = rest.find("td-sh: ")?;
+    let tail = rest.get(mark + "td-sh: ".len()..)?;
+    let end = tail.find(": not found")?;
+    let name = tail.get(..end)?;
+    match name.is_empty() || name.contains(char::is_whitespace) {
+        true => None,
+        false => Some(name.to_string()),
+    }
+}
+
+/// The words a case uses in COMMAND position, approximately.
+///
+/// Approximately because doing it exactly means parsing the shell, which is the
+/// thing under test. A word is taken where a command can start: at the top of a
+/// line, or after one of the operators that ends the previous command. Only
+/// plain names are kept -- no assignment, no redirect, no expansion -- because
+/// the question this answers is which NAME a case wanted, and a name is what
+/// the shell would have looked up.
+fn command_words(code: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for line in code.lines() {
+        let line = line.trim();
+        if line.starts_with('#') {
+            continue;
+        }
+        for piece in line.split(['|', ';', '&']) {
+            let piece = piece.trim_start_matches(|c: char| c.is_whitespace() || c == '(');
+            // The command is the first word that is not an ASSIGNMENT: `IFS=x
+            // cmd` runs `cmd`. Skipping them has to happen on whole tokens,
+            // because a scan that stops at the `=` reads `IFS` as the command
+            // and never reaches `cmd` -- which is what this did, and why
+            // `PATH`, `HOME`, `IFS` and `PWD` were ranked as names the shell
+            // could not find.
+            let Some(token) = piece.split_whitespace().find(|t| !t.contains('=')) else {
+                continue;
+            };
+            let word: String = token
+                .chars()
+                .take_while(|c| {
+                    c.is_ascii_alphanumeric()
+                        || matches!(c, '_' | '-' | '.' | '/')
+                })
+                .collect();
+            // A bare `.` or `/` is a path fragment this scan cannot read as a
+            // name, not a command.
+            if word.is_empty() || word.chars().all(|c| c == '.' || c == '/') {
+                continue;
+            }
+            // Keywords are not names the shell looks up.
+            if matches!(word.as_str(), "if" | "then" | "else" | "elif" | "fi" | "for" | "while"
+                                     | "until" | "do" | "done" | "case" | "esac" | "in"
+                                     | "function" | "select" | "time" | "echo" | "true"
+                                     | "false" | "cd" | "set" | "unset" | "export" | "read"
+                                     | "shift" | "return" | "exit" | "eval" | "test") {
+                continue;
+            }
+            out.push(word);
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// The status td-sh returned, read back out of the mismatch text.
+///
+/// Out of the TEXT because that is all a `CaseOutcome` carries. `None` means
+/// the status MATCHED and only bytes differed; 127 is the `not found` status,
+/// which is why that bucket is the missing-name one.
+fn got_status(detail: &str) -> Option<i32> {
+    // ANCHORED, not searched: `evaluate` pushes the status line first, so it is
+    // at the start when it is there at all. Searching found the marker inside a
+    // quoted stdout too -- an expected output that happens to contain
+    // `status: expected 3, got 9` parsed as a status of 9.
+    let rest = match detail.starts_with("status: expected ") {
+        true => detail,
+        false => return None,
+    };
+    let got = rest.find(", got ")?;
+    let tail = rest.get(got + ", got ".len()..)?;
+    // A leading `-` is part of the number: the harness reports a
+    // signal-terminated shell as -1, and reading only digits made
+    // `got -1` look like no status difference at all.
+    let mut seen = String::new();
+    for (n, c) in tail.chars().enumerate() {
+        match c {
+            '-' if n == 0 => seen.push(c),
+            c if c.is_ascii_digit() => seen.push(c),
+            _ => break,
+        }
+    }
+    seen.parse().ok()
+}
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let mut args = std::env::args().skip(1);
+    let usage = "usage: gap_census <shell-binary> <spec-helpers-binary> <spec-dir>";
+    let shell = PathBuf::from(args.next().ok_or(usage)?);
+    let helpers = PathBuf::from(args.next().ok_or(usage)?);
+    let dir = PathBuf::from(args.next().ok_or(usage)?);
+    let shell = std::fs::canonicalize(&shell)?;
+    let helpers = std::fs::canonicalize(&helpers)?;
+
+    // The overlay's `skip` set, which this must NOT run. A skip is a case the
+    // overlay records as unevaluatable HERE -- it reads the Oils repo tree, or
+    // depends on a shared `/tmp` path, or measures syscalls -- and running one
+    // does two things this tool has no business doing. It grades a case whose
+    // verdict is a fact about the host, so 22 of them counted as passes and 76
+    // as failures, a fifth of the 127 bucket among them; and it CREATES the
+    // shared state, leaving `/tmp/spam`, `/tmp/mv` and friends behind on the
+    // build host. `gen_expectations` filters them before running for exactly
+    // that reason, and this reuses its recorded decision rather than
+    // re-deriving it.
+    let overlay = dir.join("expectations.txt");
+    let text = std::fs::read_to_string(&overlay)
+        .map_err(|e| format!("{}: {e}", overlay.display()))?;
+    let skipped: BTreeSet<String> = text
+        .lines()
+        .filter_map(|l| l.strip_prefix("skip "))
+        .map(|k| k.trim().to_string())
+        .collect();
+    if skipped.is_empty() {
+        return Err(format!("{} lists no skips; refusing to census without it \
+                            (it is the set this must not run)", overlay.display())
+            .into());
+    }
+
+    let mut per_file: BTreeMap<String, usize> = BTreeMap::new();
+    let mut wanted: BTreeMap<String, usize> = BTreeMap::new();
+    let mut named: BTreeMap<String, usize> = BTreeMap::new();
+    let mut buckets: BTreeMap<String, usize> = BTreeMap::new();
+    let mut failures: Vec<String> = Vec::new();
+    let mut ran = 0usize;
+    let mut passed = 0usize;
+
+    for path in &spec_paths(&dir)? {
+        let file = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default()
+            .to_string();
+        let text = std::fs::read_to_string(path)?;
+        // A file that will not parse, or a case that will not RUN, is not a
+        // gap in the shell -- it is this tool failing to look. Both were
+        // skipped silently, so a census over a broken tree printed a confident
+        // ranking of nothing at all and exited 0. They are counted and fatal
+        // now, for the reason `gen_expectations` aborts rather than emitting a
+        // partial overlay: a measurement nobody can tell is incomplete is
+        // worse than no measurement.
+        let cases = match parse_spec(&text) {
+            Ok(c) => c,
+            Err(e) => {
+                failures.push(format!("parse-error {file}: {e}"));
+                continue;
+            }
+        };
+        for (case, key) in cases.iter().zip(case_keys(&file, &cases)) {
+            if skipped.contains(&key) {
+                continue;
+            }
+            let outcome = match run_case(&shell, &helpers, case, ASH_DASH_CHAIN) {
+                Ok(o) => o,
+                Err(e) => {
+                    failures.push(format!("run-error {key}: {e}"));
+                    continue;
+                }
+            };
+            ran += 1;
+            if outcome.passed {
+                passed += 1;
+                continue;
+            }
+            *per_file.entry(file.clone()).or_default() += 1;
+            if outcome.timed_out || outcome.truncated {
+                *buckets.entry("not evaluated (timeout/cap)".into()).or_default() += 1;
+                continue;
+            }
+            let detail = outcome.detail.unwrap_or_default();
+            if got_status(&detail) == Some(127) {
+                // Where the golden asserted stderr, the diagnostic NAMES the
+                // command and there is nothing to approximate.
+                match named_by_stderr(&detail) {
+                    Some(name) => {
+                        *named.entry(name).or_default() += 1;
+                    }
+                    None => {
+                        for word in command_words(&case.code) {
+                            *wanted.entry(word).or_default() += 1;
+                        }
+                    }
+                }
+            }
+            let what = match got_status(&detail) {
+                // 127 is the `not found` status and the shell produces it for
+                // nothing else, so this bucket IS the missing-name one.
+                Some(127) => "a name that is not there (127)".to_string(),
+                // The shell's own error status: a syntax error, or a builtin
+                // refusing its arguments.
+                Some(2) => "the shell reported an error (2)".to_string(),
+                Some(n) => format!("a different status ({n})"),
+                None => "the right status, different bytes".to_string(),
+            };
+            *buckets.entry(what).or_default() += 1;
+        }
+    }
+
+    println!("{ran} cases run, {passed} pass, {} fail\n", ran - passed);
+    println!("BY WHAT THE FAILURE LOOKS LIKE");
+    let mut rows: Vec<(&String, &usize)> = buckets.iter().collect();
+    rows.sort_by_key(|(_, n)| std::cmp::Reverse(**n));
+    for (what, n) in rows {
+        println!("  {n:5}  {what}");
+    }
+    println!("\nWHERE THEY ARE, most-failing file first");
+    let mut files: Vec<(&String, &usize)> = per_file.iter().collect();
+    files.sort_by_key(|(name, n)| (std::cmp::Reverse(**n), (*name).clone()));
+    let shown = 25.min(files.len());
+    for (name, n) in files.iter().take(shown) {
+        println!("  {n:5}  {name}");
+    }
+    let tail: usize = files.iter().skip(shown).map(|(_, n)| **n).sum();
+    println!("  {tail:5}  ({} further files)", files.len().saturating_sub(shown));
+    println!("\nNAMES THE DIAGNOSTIC ITSELF GAVE (goldens that assert stderr)");
+    let mut exact: Vec<(&String, &usize)> = named.iter().collect();
+    exact.sort_by(|a, b| b.1.cmp(a.1).then(a.0.cmp(b.0)));
+    match exact.is_empty() {
+        true => println!("  (none)"),
+        false => {
+            for (name, n) in &exact {
+                println!("  {n:5}  {name}");
+            }
+        }
+    }
+    println!("\nAND THE REST, GUESSED FROM COMMAND-POSITION WORDS");
+    println!("  (a case counts for EVERY name it uses, so a staged helper like");
+    println!("   `mkdir` ranks here for co-occurring, not for being missing)");
+    let mut names: Vec<(&String, &usize)> = wanted.iter().collect();
+    names.sort_by(|a, b| b.1.cmp(a.1).then(a.0.cmp(b.0)));
+    for (name, n) in names.iter().take(30) {
+        println!("  {n:5}  {name}");
+    }
+    if !failures.is_empty() {
+        for line in failures.iter().take(20) {
+            eprintln!("{line}");
+        }
+        return Err(format!(
+            "{} case(s)/file(s) could not be measured; the census above is \
+             INCOMPLETE and its numbers are not a census of anything",
+            failures.len()
+        )
+        .into());
+    }
+    Ok(())
+}
