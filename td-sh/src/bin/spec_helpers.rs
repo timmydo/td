@@ -1816,6 +1816,463 @@ fn grep_over(
     }
 }
 
+/// One piece of an `s///` replacement.
+enum Repl {
+    /// Bytes to emit as they stand.
+    Lit(Vec<u8>),
+    /// `&` -- whatever the pattern matched.
+    Whole,
+}
+
+/// An `s/pat/repl/[g]`, which is the ONLY sed command served.
+struct Subst {
+    pat: Pattern,
+    repl: Vec<Repl>,
+    global: bool,
+}
+
+/// The delimiters an `s` may use. Anything EITHER SIDE gives meaning to is
+/// refused, because `\<delim>` has to become a LITERAL delimiter and for a
+/// metacharacter that is different text. On the pattern side that is any regex
+/// operator: with `.` as the delimiter, `s.a\.b.x.` would turn `\.` -- an
+/// escaped dot, matching only a dot -- into a bare `.`, matching anything. On
+/// the REPLACEMENT side it is `&`, the whole match: GNU reads `s&a&x\&y&` as a
+/// literal ampersand, and stripping the backslash as a delimiter escape would
+/// leave a bare `&` this expands. The corpus spells `/`, `:` and `;`.
+fn sed_delim_ok(d: u8) -> bool {
+    !d.is_ascii_alphanumeric()
+        && !matches!(d, b'\\' | b'\n' | b'&' | b'.' | b'*' | b'[' | b']' | b'^' | b'$' | b'+'
+                        | b'?' | b'(' | b')' | b'{' | b'}' | b'|')
+}
+
+/// GNU's `\xHH`: ONE or two hex digits, and a literal `x` where there are none.
+///
+/// Hand-rolled rather than `u8::from_str_radix`, which accepts a leading sign --
+/// so `\x+41` parsed as 0x04 and put a control byte where GNU puts the four
+/// characters `x+41`.
+fn sed_hex(src: &[u8], i: &mut usize) -> u8 {
+    let mut val = 0u8;
+    let mut taken = 0;
+    while taken < 2 {
+        let digit = match src.get(*i).copied() {
+            Some(c @ b'0'..=b'9') => c - b'0',
+            Some(c @ b'a'..=b'f') => c - b'a' + 10,
+            Some(c @ b'A'..=b'F') => c - b'A' + 10,
+            _ => break,
+        };
+        val = val.wrapping_mul(16).wrapping_add(digit);
+        *i += 1;
+        taken += 1;
+    }
+    match taken {
+        0 => b'x',
+        _ => val,
+    }
+}
+
+/// Read one `<delim>`-terminated field, resolving `\<delim>` to a literal
+/// delimiter and leaving every other escape for the caller. Returns the field
+/// and the index past the closing delimiter.
+fn sed_field(src: &[u8], from: usize, delim: u8) -> Option<(Vec<u8>, usize)> {
+    let mut out = Vec::new();
+    let mut i = from;
+    loop {
+        let b = *src.get(i)?;
+        if b == delim {
+            return Some((out, i + 1));
+        }
+        // A RAW newline does not end a field, it ends the COMMAND: GNU calls
+        // `s/a/x<newline>y/` an unterminated `s`. Taking it as content accepted
+        // a script mis-split across `-e`, which this joins with a newline --
+        // `-e 's/a/b' -e '/'` ran as `s/a/b\n/` and inserted one. The escaped
+        // spelling stays served, and GNU serves that too.
+        if b == b'\n' {
+            return None;
+        }
+        if b == b'\\' {
+            match src.get(i + 1) {
+                // Only the delimiter loses its backslash here. Everything else
+                // keeps it, because what a `\` means next is the pattern
+                // dialect's business or the replacement's, not this scan's.
+                Some(c) if *c == delim => out.push(delim),
+                Some(c) => {
+                    out.push(b'\\');
+                    out.push(*c);
+                }
+                None => return None,
+            }
+            i += 2;
+            continue;
+        }
+        out.push(b);
+        i += 1;
+    }
+}
+
+/// sed's CHARACTER escapes, resolved to the bytes they name before the pattern
+/// reaches a matcher that is grep's.
+///
+/// The two dialects disagree here and the disagreement is silent: `\t` is a TAB
+/// to sed and a stray-backslash `t` to grep, so the corpus's `s/[ \t]\+/ /g`
+/// squeezed runs of the LETTER `t` -- `"quoted" text` came back `"quo ed" ex `,
+/// a wrong answer with a right shape. `None` refuses the escapes GNU gives a
+/// meaning this cannot serve, rather than letting them fall through to the
+/// literal they are not: `\dNNN` and `\oNNN` are decimal and octal bytes, and
+/// `\cX` is a control character.
+fn sed_escapes(src: &[u8]) -> Option<Vec<u8>> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while let Some(b) = src.get(i) {
+        if *b != b'\\' {
+            out.push(*b);
+            i += 1;
+            continue;
+        }
+        let c = *src.get(i + 1)?;
+        i += 2;
+        match c {
+            b'n' => out.push(b'\n'),
+            b't' => out.push(b'\t'),
+            b'r' => out.push(b'\r'),
+            b'f' => out.push(0x0c),
+            b'v' => out.push(0x0b),
+            b'a' => out.push(0x07),
+            b'x' => out.push(sed_hex(src, &mut i)),
+            b'd' | b'o' | b'c' => return None,
+            // Everything else keeps its backslash: what it means is the
+            // matcher's business, and it refuses what it cannot serve.
+            other => {
+                out.push(b'\\');
+                out.push(other);
+            }
+        }
+    }
+    Some(out)
+}
+
+/// The replacement's own escapes. `\1`-`\9` are refused rather than read as the
+/// digit: they are BACKREFERENCES, so taking `\1` literally would put the digit
+/// in the output where sed puts a captured group -- a wrong answer that looks
+/// like a right one, which is the whole reason this rig refuses.
+fn sed_repl(src: &[u8]) -> Option<Vec<Repl>> {
+    let mut parts = Vec::new();
+    let mut lit = Vec::new();
+    let mut i = 0;
+    while let Some(b) = src.get(i) {
+        match b {
+            b'&' => {
+                if !lit.is_empty() {
+                    parts.push(Repl::Lit(std::mem::take(&mut lit)));
+                }
+                parts.push(Repl::Whole);
+                i += 1;
+            }
+            b'\\' => {
+                let c = *src.get(i + 1)?;
+                i += 2;
+                match c {
+                    b'0'..=b'9' => return None,
+                    // GNU's case-conversion escapes, which change the text that
+                    // comes out. Falling through to the literal below would put
+                    // a bare `U` where sed upper-cases what follows.
+                    b'L' | b'U' | b'l' | b'u' | b'E' => return None,
+                    // The SAME six character escapes the pattern side resolves.
+                    // `\a`/`\f`/`\v` fell through to the letter here while
+                    // `sed_escapes` resolved them, so `s/x/\v/` emitted a `v`.
+                    b'n' => lit.push(b'\n'),
+                    b't' => lit.push(b'\t'),
+                    b'r' => lit.push(b'\r'),
+                    b'f' => lit.push(0x0c),
+                    b'v' => lit.push(0x0b),
+                    b'a' => lit.push(0x07),
+                    b'x' => lit.push(sed_hex(src, &mut i)),
+                    b'd' | b'o' | b'c' => return None,
+                    // `\&` is a literal ampersand, `\\` a literal backslash,
+                    // and GNU takes every REMAINING `\c` as the character
+                    // itself -- which is what `s:$SH:\$SH:g` in the corpus
+                    // relies on.
+                    other => lit.push(other),
+                }
+            }
+            other => {
+                lit.push(*other);
+                i += 1;
+            }
+        }
+    }
+    if !lit.is_empty() {
+        parts.push(Repl::Lit(lit));
+    }
+    Some(parts)
+}
+
+/// Parse a whole sed SCRIPT into the substitutions it asks for.
+///
+/// `Err` names the offending text; everything but `s` is refused, addresses
+/// included. An address would be served wrong in the quiet direction -- reading
+/// `/x/s/a/b/` as an unconditional `s` edits lines the script excluded.
+fn sed_script(src: &[u8], ere: bool) -> Result<Vec<Subst>, Vec<u8>> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    loop {
+        while matches!(src.get(i), Some(b' ' | b'\t' | b'\n' | b';')) {
+            i += 1;
+        }
+        let Some(b) = src.get(i) else {
+            return Ok(out);
+        };
+        if *b != b's' {
+            return Err(src.get(i..).unwrap_or_default().to_vec());
+        }
+        let delim = *src.get(i + 1).ok_or_else(|| src.to_vec())?;
+        if !sed_delim_ok(delim) {
+            return Err(src.get(i..).unwrap_or_default().to_vec());
+        }
+        let blame = |at: usize| src.get(at..).unwrap_or_default().to_vec();
+        let (pat_src, next) = sed_field(src, i + 2, delim).ok_or_else(|| blame(i))?;
+        let (repl_src, next) = sed_field(src, next, delim).ok_or_else(|| blame(i))?;
+        // An EMPTY pattern is sed's "the last regex used", which this has no
+        // notion of -- and as a literal empty pattern it matches everywhere.
+        if pat_src.is_empty() || pat_src.len() > MAX_PATTERN {
+            return Err(blame(i));
+        }
+        let pat_src = sed_escapes(&pat_src).ok_or_else(|| blame(i))?;
+        let pat = Pattern::parse(&pat_src, ere, false).ok_or_else(|| blame(i))?;
+        let repl = sed_repl(&repl_src).ok_or_else(|| blame(i))?;
+        let mut global = false;
+        i = next;
+        while let Some(f) = src.get(i) {
+            match f {
+                // A SECOND `g` is GNU's "multiple `g' options to `s' command".
+                b'g' if !global => global = true,
+                // `p`, `i`, a count, `w file` -- each changes WHICH text comes
+                // out, so none can be ignored.
+                _ => break,
+            }
+            i += 1;
+        }
+        // Whitespace may FOLLOW a command but does not separate two of them:
+        // GNU rejects `s/a/b/ s/b/c/`, where reading the space as a separator
+        // silently ran both and printed `c`.
+        while matches!(src.get(i), Some(b' ' | b'\t')) {
+            i += 1;
+        }
+        match src.get(i) {
+            None | Some(b'\n' | b';') => {}
+            Some(_) => return Err(blame(i)),
+        }
+        out.push(Subst { pat, repl, global });
+    }
+}
+
+/// Apply the substitutions to one line, in order, as sed does.
+fn sed_line(line: &[u8], script: &[Subst], out: &mut Vec<u8>) {
+    let mut cur = line.to_vec();
+    let mut next = Vec::new();
+    for s in script {
+        next.clear();
+        let mut at = 0usize;
+        let mut done = false;
+        // Where the previous replacement ENDED, so an empty match there can be
+        // skipped: sed does not substitute an empty match abutting the last
+        // one, and without that `s/x*/-/g` over `text` gives `-t-e--t-` where
+        // GNU gives `-t-e-t-` -- the `x` replaced, then the empty string after
+        // it replaced again.
+        let mut last_end: Option<usize> = None;
+        while !done && at <= cur.len() {
+            let Some((from, to)) = s.pat.find_from(&cur, at) else {
+                break;
+            };
+            next.extend_from_slice(cur.get(at..from).unwrap_or_default());
+            if to == from && last_end == Some(from) {
+                if let Some(b) = cur.get(from) {
+                    next.push(*b);
+                }
+                at = from + 1;
+                continue;
+            }
+            for part in &s.repl {
+                match part {
+                    Repl::Lit(bytes) => next.extend_from_slice(bytes),
+                    Repl::Whole => next.extend_from_slice(cur.get(from..to).unwrap_or_default()),
+                }
+            }
+            last_end = Some(to);
+            // An empty match would otherwise never advance. Copying the byte it
+            // sat on and stepping past is what `s/x*/-/g` does to `abc`: a
+            // replacement before every byte AND one at the end.
+            at = match to > from {
+                true => to,
+                false => {
+                    if let Some(b) = cur.get(from) {
+                        next.push(*b);
+                    }
+                    from + 1
+                }
+            };
+            done = !s.global;
+        }
+        next.extend_from_slice(cur.get(at.min(cur.len())..).unwrap_or_default());
+        std::mem::swap(&mut cur, &mut next);
+    }
+    out.extend_from_slice(&cur);
+}
+
+/// `sed` -- the `s` command over stdin or files, and nothing else.
+///
+/// Serving one command is the whole design: `s///` is 32 of the corpus's 43 sed
+/// invocations and every one of the cases a working sed unblocks. `d`, `p`,
+/// addresses, `-n` and `-i` are refused, so a script that wanted them says so
+/// rather than printing text nobody asked for.
+fn sed(args: &[std::ffi::OsString]) -> Done {
+    let mut script_src: Vec<u8> = Vec::new();
+    let mut have_script = false;
+    let mut ere = false;
+    let mut operands: Vec<&std::ffi::OsStr> = Vec::new();
+    let mut rest_are_operands = false;
+    let mut i = 0;
+    while let Some(arg) = args.get(i) {
+        i += 1;
+        let bytes = arg.as_bytes();
+        if rest_are_operands || bytes == b"-" || !bytes.starts_with(b"-") {
+            // Bare words are all OPERANDS here; which one is the script is
+            // decided after the scan, because GNU's getopt PERMUTES: an `-e`
+            // anywhere on the line means no operand is the script, so
+            // `sed 's/a/X/g' -e 's/X/Y/'` reads the first word as a FILE.
+            operands.push(arg);
+            continue;
+        }
+        if bytes == b"--" {
+            rest_are_operands = true;
+            continue;
+        }
+        let mut take_script = |tail: &[u8], i: &mut usize| -> Result<(), ()> {
+            let text = match tail.is_empty() {
+                false => tail.to_vec(),
+                true => {
+                    let next = args.get(*i).ok_or(())?;
+                    *i += 1;
+                    next.as_bytes().to_vec()
+                }
+            };
+            if have_script {
+                script_src.push(b'\n');
+            }
+            script_src.extend_from_slice(&text);
+            have_script = true;
+            Ok(())
+        };
+        if bytes.starts_with(b"--") {
+            match bytes {
+                b"--regexp-extended" => ere = true,
+                b"--expression" => {
+                    if take_script(b"", &mut i).is_err() {
+                        return unsupported("sed", arg);
+                    }
+                }
+                _ => match bytes.strip_prefix(b"--expression=") {
+                    Some(tail) if !tail.is_empty() => {
+                        if take_script(tail, &mut i).is_err() {
+                            return unsupported("sed", arg);
+                        }
+                    }
+                    _ => return unsupported("sed", arg),
+                },
+            }
+            continue;
+        }
+        let letters = bytes.get(1..).unwrap_or_default();
+        let mut j = 0;
+        while let Some(c) = letters.get(j) {
+            j += 1;
+            match c {
+                b'E' | b'r' => ere = true,
+                b'e' => {
+                    let tail = letters.get(j..).unwrap_or_default();
+                    j = letters.len();
+                    if take_script(tail, &mut i).is_err() {
+                        return unsupported("sed", arg);
+                    }
+                }
+                _ => return unsupported("sed", arg),
+            }
+        }
+    }
+    // With no `-e`, the first operand IS the script. With one, every operand is
+    // a file.
+    if !have_script {
+        if operands.is_empty() {
+            return unsupported("sed", std::ffi::OsStr::from_bytes(b""));
+        }
+        script_src.extend_from_slice(operands.remove(0).as_bytes());
+    }
+    let script = match sed_script(&script_src, ere) {
+        Ok(s) => s,
+        Err(bad) => return unsupported("sed", std::ffi::OsStr::from_bytes(&bad)),
+    };
+    // Each operand is its own SOURCE rather than more bytes on one stream,
+    // because a file's end is a LINE's end: over an `f1` holding `a` with no
+    // newline, `sed s/^/>/ f1 f2` is `>a` and `>b`, not the `>ab` that
+    // concatenating them gives.
+    let mut sources: Vec<Vec<u8>> = Vec::new();
+    let mut err = Vec::new();
+    let mut status = 0;
+    if operands.is_empty() {
+        use std::io::Read as _;
+        let mut data = Vec::new();
+        if let Err(e) = std::io::stdin().lock().read_to_end(&mut data) {
+            return Done {
+                out: Vec::new(),
+                err: format!("sed: -: {e}\n").into_bytes(),
+                status: 2,
+            };
+        }
+        sources.push(data);
+    }
+    for name in &operands {
+        match slurp(name) {
+            Ok(bytes) => sources.push(bytes),
+            // An unreadable operand is diagnosed and the REST are still
+            // processed, as GNU does: returning here dropped the output of the
+            // files that read, so one bad name cost the whole run.
+            Err(e) => {
+                err.extend_from_slice(
+                    format!("sed: can't read {}: {e}\n",
+                            String::from_utf8_lossy(label(name)))
+                    .as_bytes(),
+                );
+                status = 2;
+            }
+        }
+    }
+    let mut out = Vec::new();
+    // Whether a line has been written that still owes its newline, and whether
+    // the source it came from ended with one -- tracked over the last NON-EMPTY
+    // source, so a trailing empty operand cannot drop a newline an earlier file
+    // ended with. A trailing newline ends its line rather than starting an
+    // empty one, and a last line without one comes out without one.
+    let mut owed = false;
+    let mut ended_nl = false;
+    for data in &sources {
+        if data.is_empty() {
+            continue;
+        }
+        ended_nl = data.ends_with(b"\n");
+        let body = data.strip_suffix(b"\n").unwrap_or(data);
+        for line in body.split(|b| *b == b'\n') {
+            if owed {
+                out.push(b'\n');
+            }
+            sed_line(line, &script, &mut out);
+            owed = true;
+        }
+    }
+    if owed && ended_nl {
+        out.push(b'\n');
+    }
+    Done { out, err, status }
+}
+
 /// The longest pattern this will parse. Matching costs one stack frame per
 /// term, and this crate builds `panic = "abort"`, so a stack overflow is an
 /// abort with no diagnostic rather than an error a caller can report: measured,
@@ -2438,6 +2895,7 @@ fn main() {
         b"tail" => tail(&rest),
         b"tac" => tac(&rest),
         b"od" => od(&rest),
+        b"sed" => sed(&rest),
         other => {
             // Named as something this does not serve: say so rather than print
             // a plausible answer, which would grade as a shell result.
@@ -3124,6 +3582,160 @@ mod tests {
         // The refusal NAMES the value rather than the option that took it.
         let done = parse(&["-c", "+3"]).err().unwrap();
         assert!(String::from_utf8_lossy(&done.err).contains("+3"), "the refusal named the option");
+    }
+
+    /// The `s` command over the shapes the corpus writes, and the ones GNU sed
+    /// answers differently from the grep dialect the matcher is shared with.
+    #[test]
+    fn sed_substitutes_as_gnu_does() {
+        let run = |args: &[&str], input: &[u8]| -> Done {
+            let argv: Vec<std::ffi::OsString> =
+                args.iter().map(std::ffi::OsString::from).collect();
+            // Through a FILE operand rather than stdin: the applet reads the
+            // real stdin otherwise, which a test harness owns.
+            let dir = Dir::new("sed");
+            let file = dir.at("in");
+            std::fs::write(&file, input).unwrap();
+            let mut with_file = argv.clone();
+            with_file.push(file);
+            sed(&with_file)
+        };
+        let out = |args: &[&str], input: &[u8]| -> String {
+            String::from_utf8_lossy(&run(args, input).out).into_owned()
+        };
+        assert_eq!(out(&["s/a/X/"], b"aa\n"), "Xa\n", "the first match only");
+        assert_eq!(out(&["s/a/X/g"], b"aa\n"), "XX\n");
+        assert_eq!(out(&["s/ \\+/ /g"], b"a  b   c\n"), "a b c\n");
+        // `\t` is a TAB to sed where the shared matcher's grep dialect reads a
+        // stray backslash and a `t` -- so this squeezed runs of the LETTER and
+        // came back `"quo ed" ex ` before `sed_escapes` existed.
+        assert_eq!(out(&["s/[ \\t]\\+/ /g"], b"\"quoted\" text\n"), "\"quoted\" text\n");
+        assert_eq!(out(&["s/[ \\t]\\+/ /g"], b"a\t\tb\n"), "a b\n");
+        // An empty match ABUTTING the previous one is not replaced, which is
+        // what keeps `s/x*/-/g` from putting two dashes where the `x` was.
+        assert_eq!(out(&["s/x*/-/g"], b"text\n"), "-t-e-t-\n");
+        assert_eq!(out(&["s/x*/-/g"], b"abc\n"), "-a-b-c-\n");
+        // `&` is the whole match, and `\&` the literal byte.
+        assert_eq!(out(&["s/b/[&]/g"], b"abc\n"), "a[b]c\n");
+        assert_eq!(out(&["s/b/\\&/g"], b"abc\n"), "a&c\n");
+        // The delimiter is whatever follows the `s`, and `\<delim>` inside is
+        // the literal one.
+        assert_eq!(out(&["s:a:X:g"], b"a:a\n"), "X:X\n");
+        assert_eq!(out(&["s/\\//|/g"], b"a/b\n"), "a|b\n");
+        // A last line without a newline keeps none; sed does not add one.
+        assert_eq!(out(&["s/a/X/"], b"a"), "X");
+        assert_eq!(out(&["s/a/X/"], b""), "");
+        // Several scripts run in order, whether joined by `;` or by `-e`.
+        assert_eq!(out(&["s/a/b/;s/b/c/"], b"a\n"), "c\n");
+        assert_eq!(out(&["-e", "s/a/b/", "-e", "s/b/c/"], b"a\n"), "c\n");
+        assert_eq!(out(&["--expression=s/a/Z/"], b"a\n"), "Z\n");
+        // `$` anchors each LINE, not the input, which is what `s/:$//' wants.
+        assert_eq!(out(&["s/:$//"], b"a:\nb:\n"), "a\nb\n");
+        // …and `-E` is the extended dialect, where `+` is an operator.
+        assert_eq!(out(&["-E", "s/a+/X/"], b"aaa\n"), "X\n");
+        assert_eq!(out(&["s/a+/X/"], b"a+\n"), "X\n", "a BRE reads `+` literally");
+
+        // Everything else is REFUSED rather than approximated: a command this
+        // does not serve would otherwise print text nobody asked for.
+        for script in ["d", "p", "/x/d", "1d", "y/a/b/", "q", "s/a/b/p", "s/a/b/2",
+                       "s/a/b/w f", "s/\\(a\\)/\\1/", "s/a/\\1/", "s/a/\\Ux/", "s//x/",
+                       "s.a.b.", "s/a", "s", "s/a\\|b/x/", "s/\\ba/x/"] {
+            let done = run(&[script], b"abc\n");
+            assert_eq!(done.status, 2, "served {script:?}");
+            assert!(!done.err.is_empty(), "refused {script:?} silently");
+        }
+        // A script is REQUIRED: with none there is nothing to do, and copying
+        // the input would be a plausible answer to a question nobody asked.
+        assert_eq!(sed(&[]).status, 2);
+
+        // The CHARACTER ESCAPES, each asked about the byte it names rather
+        // than about "some escape working": a mutant reading `\v` as the
+        // letter `v` passed the whole suite, and it is what GNU resolves in
+        // BOTH fields.
+        for (escape, byte) in [("\\n", b'\n'), ("\\t", b'\t'), ("\\r", b'\r'),
+                               ("\\f", 0x0c), ("\\v", 0x0b), ("\\a", 0x07)] {
+            assert_eq!(out(&[&format!("s/a/{escape}/")], b"a\n"),
+                       String::from_utf8_lossy(&[byte, b'\n']),
+                       "replacement {escape}");
+            // …and on the pattern side for all but `\n`, which no line can
+            // contain: sed matches a pattern space with its newline stripped,
+            // so `s/\n/X/` never fires, in GNU too.
+            if byte != b'\n' {
+                let subject = [byte, b'\n'];
+                assert_eq!(out(&[&format!("s/{escape}/X/")], &subject), "X\n",
+                           "pattern {escape}");
+            }
+        }
+        // `\xHH` takes ONE or two hex digits, and a bare `\x` is the letter --
+        // `u8::from_str_radix` accepted a leading sign, so `\x+41` became 0x04
+        // where GNU writes the four characters.
+        assert_eq!(out(&["s/a/\\x41/"], b"a\n"), "A\n");
+        assert_eq!(out(&["s/a/\\x/"], b"a\n"), "x\n");
+        assert_eq!(out(&["s/a/\\x+41/"], b"a\n"), "x+41\n");
+        assert_eq!(out(&["s/\\x41/Q/"], b"A\n"), "Q\n");
+        // …and the numeric/control escapes GNU gives a meaning this cannot
+        // serve are refused rather than read as their letter.
+        for script in ["s/a/\\d65/", "s/a/\\o101/", "s/a/\\cA/",
+                       "s/\\d65/X/", "s/\\o101/X/", "s/\\cA/X/"] {
+            assert_eq!(run(&[script], b"a\n").status, 2, "served {script:?}");
+        }
+        // Every spelling of the extended dialect is the same switch, and each
+        // needs its own assertion: a mutant inverting `--regexp-extended`
+        // alone survived.
+        for flag in ["-E", "-r", "--regexp-extended"] {
+            assert_eq!(out(&[flag, "s/a+/X/"], b"aaa\n"), "X\n", "{flag}");
+        }
+        // `-e` attached to its option, which is how `-e` is usually written
+        // when it is written at all.
+        assert_eq!(out(&["-es/a/X/"], b"a\n"), "X\n");
+        // A pattern past the parse limit is refused rather than taken: the
+        // matcher costs a stack frame per term and this crate aborts on
+        // overflow.
+        let huge = format!("s/{}/X/", "a".repeat(MAX_PATTERN + 1));
+        assert_eq!(run(&[&huge], b"a\n").status, 2, "an oversized pattern parsed");
+
+        // Whitespace FOLLOWS a command but does not separate two of them, and
+        // a flag cannot repeat -- both were silent, running scripts GNU
+        // rejects.
+        assert_eq!(out(&["s/a/b/ "], b"a\n"), "b\n", "trailing space is allowed");
+        for script in ["s/a/b/ s/b/c/", "s/a/b/gg", "s/a/x\ny/", "s/a\nb/x/",
+                       "s&a&x&", "s&a&x\\&y&"] {
+            assert_eq!(run(&[script], b"a\n").status, 2, "served {script:?}");
+        }
+
+        // A file's end is a LINE's end, so two operands are two sources: the
+        // first's unterminated last line does not run into the second. `--`
+        // and `-` are operand spellings, each asserted because each was a
+        // surviving mutant.
+        let dir = Dir::new("sed-files");
+        let f1 = dir.at("f1");
+        let f2 = dir.at("f2");
+        std::fs::write(&f1, b"a").unwrap();
+        std::fs::write(&f2, b"b\n").unwrap();
+        let two = sed(&["s/^/>/".into(), f1.clone(), f2.clone()]);
+        assert_eq!(String::from_utf8_lossy(&two.out), ">a\n>b\n", "the files ran together");
+        assert_eq!(two.status, 0);
+        let dashed = sed(&["s/^/>/".into(), "--".into(), f1.clone(), f2.clone()]);
+        assert_eq!(String::from_utf8_lossy(&dashed.out), ">a\n>b\n", "`--` was not an end");
+        // A last source without a trailing newline keeps none, and an empty
+        // one cannot drop the newline an earlier file ended with.
+        let empty = dir.at("empty");
+        std::fs::write(&empty, b"").unwrap();
+        let trailing = sed(&["s/^/>/".into(), f2.clone(), empty]);
+        assert_eq!(String::from_utf8_lossy(&trailing.out), ">b\n", "a trailing empty file");
+        let unterminated = sed(&["s/^/>/".into(), f2.clone(), f1.clone()]);
+        assert_eq!(String::from_utf8_lossy(&unterminated.out), ">b\n>a", "a newline was added");
+        // An unreadable operand is DIAGNOSED and the rest still run: bailing
+        // cost the output of every file that read.
+        let missing = dir.at("nope");
+        let partial = sed(&["s/^/>/".into(), f1.clone(), missing, f2.clone()]);
+        assert_eq!(String::from_utf8_lossy(&partial.out), ">a\n>b\n", "output was dropped");
+        assert_eq!(partial.status, 2);
+        assert!(!partial.err.is_empty(), "the bad operand was not named");
+        // With an `-e` anywhere, NO operand is the script: GNU's getopt
+        // permutes, so the bare word is a file it cannot read.
+        let permuted = sed(&["s/a/X/g".into(), "-e".into(), "s/X/Y/".into()]);
+        assert_eq!(permuted.status, 2, "the bare word was run as a script");
     }
 
     /// `tac` reverses RECORDS, and a record carries the newline that ends it --

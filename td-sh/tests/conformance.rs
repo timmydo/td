@@ -404,6 +404,9 @@ fn the_binary_reports_its_applets_status_and_diagnostic(
         ("tail", &["-n", "1"][..], "3\n"),
         ("tac", &[][..], "3\n2\n1\n"),
         ("od", &["-A", "n", "-t", "x1"][..], " 31 0a 32 0a 33 0a\n"),
+        // `sed` edits every line rather than selecting among them, so its
+        // answer is one no other applet here can produce.
+        ("sed", &["s/[0-9]/#/"][..], "#\n#\n#\n"),
     ] {
         let link = dir.join(name);
         let _ = std::fs::remove_file(&link);

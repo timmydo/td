@@ -101,6 +101,7 @@ pub const SPEC_HELPERS: &[&str] = &[
     "tail",
     "tac",
     "od",
+    "sed",
 ];
 
 /// A parse error, anchored to a 1-based source line.

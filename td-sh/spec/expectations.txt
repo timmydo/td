@@ -23,12 +23,12 @@
 #           harness exposes no external PATH beyond the shell itself and the
 #           `spec_helpers` applets (the Oils `argv.py`/`printenv.py`, and `cat`,
 #           `mkdir`, `touch`, `rm`, `wc`, `sleep`, `seq`, `chmod`, `grep`, `egrep`,
-#           `fgrep`, `head`, `tail`, `tac`, `od`). Those are real mismatches today,
+#           `fgrep`, `head`, `tail`, `tac`, `od`, `sed`). Those are real mismatches today,
 #           but MEASURE before mining the list, because `not found` is reported
 #           identically for two different things. Some of those names are BUILTINS
 #           td-sh does not have (`shopt`, `typeset`, `declare`, `compgen`) and are
 #           true shell gaps; the rest are EXTERNALS the harness still withholds
-#           (`sed`, `sort`, `ls`, `tr`) and say nothing about the shell. Both
+#           (`sort`, `ls`, `tr`) and say nothing about the shell. Both
 #           groups are large, neither dominates.
 #           No counts are given here on purpose: this file is regenerated wholesale,
 #           so a number in it would silently describe some earlier tree.
@@ -384,8 +384,6 @@ xfail ble-idioms.test.sh::recursive arith: short circuit ?:
 xfail ble-idioms.test.sh::recursive arith: side effects
 xfail ble-idioms.test.sh::recursive arith: two levels
 xfail blog-other1.test.sh::Blog Post Example
-xfail blog-other1.test.sh::Blog Post Example Fix
-xfail blog-other1.test.sh::Rewrite of Blog Post Example
 xfail blog1.test.sh::${#1#'###'}
 xfail blog2.test.sh::-a -a
 xfail blog2.test.sh::-a -a -a -a
@@ -527,15 +525,6 @@ xfail builtin-dirs.test.sh::dirs test of path alias `.`
 xfail builtin-dirs.test.sh::popd returns error on empty directory stack
 xfail builtin-dirs.test.sh::popd usage error
 xfail builtin-dirs.test.sh::pushd usage
-xfail builtin-echo.test.sh::\0 \1 \8
-xfail builtin-echo.test.sh::\0377 is the highest octal byte
-xfail builtin-echo.test.sh::\0400 is one more than the highest octal byte
-xfail builtin-echo.test.sh::\0777 is out of range
-xfail builtin-echo.test.sh::\u6
-xfail builtin-echo.test.sh::\x
-xfail builtin-echo.test.sh::incomplete hex escape
-xfail builtin-echo.test.sh::incomplete octal escape
-xfail builtin-echo.test.sh::incomplete unicode escape
 xfail builtin-eval-source.test.sh::Eval in does tilde expansion
 xfail builtin-fc.test.sh::fc -l [first] [last] where first and last are indexes
 xfail builtin-fc.test.sh::fc -l [first] [last] where first and last are offsets from current command
@@ -578,7 +567,6 @@ xfail builtin-kill.test.sh::kill -n 9 specifies the signal number
 xfail builtin-kill.test.sh::kill -s TERM specifies the signal name
 xfail builtin-kill.test.sh::kill multiple pids at once
 xfail builtin-kill.test.sh::kill pid and job at once
-xfail builtin-meta.test.sh::command -V
 xfail builtin-meta.test.sh::command -p (find hidden tool in default path)
 xfail builtin-meta.test.sh::command -p (override existing program)
 xfail builtin-meta.test.sh::command -v executable, builtin
@@ -977,7 +965,6 @@ xfail prompt.test.sh::sh -i
 xfail prompt.test.sh::special case for $
 xfail prompt.test.sh::username
 xfail quote.test.sh::$'' octal escapes don't have leading 0
-xfail quote.test.sh::$'' octal escapes with fewer than 3 chars
 xfail quote.test.sh::$? split over multiple lines
 xfail quote.test.sh::YSH allows unquoted foo\ bar too
 xfail redirect-command.test.sh::Prefix redirect for loop -- not allowed
@@ -1043,7 +1030,6 @@ xfail toysh-posix.test.sh::IFS
 xfail toysh-posix.test.sh::IFS - http://landley.net/notes.html#15-02-2020 (TODO: osh)
 xfail toysh-posix.test.sh::IFS 2 - copied into spec/word-split
 xfail toysh-posix.test.sh::IFS 4
-xfail toysh-posix.test.sh::Pipeline - http://landley.net/notes-2019.html#16-12-2019
 xfail toysh-posix.test.sh::no shebang
 xfail toysh.test.sh::Brace Expansion
 xfail toysh.test.sh::char class / extglob

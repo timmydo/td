@@ -72,12 +72,12 @@ const HEADER: &str = "\
 #           harness exposes no external PATH beyond the shell itself and the
 #           `spec_helpers` applets (the Oils `argv.py`/`printenv.py`, and `cat`,
 #           `mkdir`, `touch`, `rm`, `wc`, `sleep`, `seq`, `chmod`, `grep`, `egrep`,
-#           `fgrep`, `head`, `tail`, `tac`, `od`). Those are real mismatches today,
+#           `fgrep`, `head`, `tail`, `tac`, `od`, `sed`). Those are real mismatches today,
 #           but MEASURE before mining the list, because `not found` is reported
 #           identically for two different things. Some of those names are BUILTINS
 #           td-sh does not have (`shopt`, `typeset`, `declare`, `compgen`) and are
 #           true shell gaps; the rest are EXTERNALS the harness still withholds
-#           (`sed`, `sort`, `ls`, `tr`) and say nothing about the shell. Both
+#           (`sort`, `ls`, `tr`) and say nothing about the shell. Both
 #           groups are large, neither dominates.
 #           No counts are given here on purpose: this file is regenerated wholesale,
 #           so a number in it would silently describe some earlier tree.
@@ -316,6 +316,12 @@ fn probe_helper(
         // `-A n` must suppress the trailing offset line as well as the margin.
         ("printf 'hi' | od -A n -t x1", " 68 69\n"),
         ("printf 'a\\n' | od -A n -c", "   a  \\n\n"),
+        // `sed` serves ONE command, so the probe asks it the two things that
+        // separate a working `s` from a dispatch that echoes its input: a
+        // global replace, and the `\t` that is a TAB to sed where the shared
+        // matcher's grep dialect reads a stray `t`.
+        ("printf 'aXbXc\\n' | sed s/X/-/g", "a-b-c\n"),
+        ("printf 'a\\t\\tb\\n' | sed 's/[ \\t]\\+/ /g'", "a b\n"),
     ];
     // The probe list is written out rather than generated -- each applet needs
     // a question only IT can answer -- so it can drift from the roster it is
