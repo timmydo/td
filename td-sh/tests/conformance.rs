@@ -2753,11 +2753,6 @@ fn an_interrupt_is_not_confined_to_a_clone() -> Result<(), Box<dyn std::error::E
         format!("({dies}); echo AFTER"),
         format!("{dies} | :; echo AFTER"),
         format!("for i in 1 2; do {dies}; done; echo AFTER"),
-        // `&` too, though a real shell's background job would never have been
-        // signalled: this one is synchronous and in the foreground group, so
-        // the signal reaches it and confining it left `while :; do cmd & done`
-        // unkillable.
-        format!("{dies} & echo AFTER"),
     ] {
         let out = std::process::Command::new(&shell).args(["-c", &boundary]).output()?;
         assert_eq!(
@@ -2771,6 +2766,21 @@ fn an_interrupt_is_not_confined_to_a_clone() -> Result<(), Box<dyn std::error::E
             "`{boundary}` did not report POSIX's 128 + SIGINT"
         );
     }
+    // `&` is the one boundary that does NOT carry it out, and it is the only
+    // one where that is right: a background job dying of a signal is not the
+    // shell dying of one, which is what bash reports here too (`AFTER`, 0).
+    // While `&` ran the list SYNCHRONOUSLY the opposite was true, because the
+    // job was the shell's own foreground work -- confining the interrupt then
+    // left `while :; do cmd & done` unkillable, since the guard the job took
+    // covered the loop as well. A job is `concurrent` now and takes no guard,
+    // so the loop stays killable without the propagation --
+    // `a_shell_with_a_background_job_can_still_be_interrupted` is what holds
+    // that.
+    let out = std::process::Command::new(&shell)
+        .args(["-c", &format!("{dies} & echo AFTER")])
+        .output()?;
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "AFTER\n");
+    assert_eq!(out.status.code(), Some(0));
     // An interrupt is on its way OUT of the shell, so it leaves a dying
     // function's frame standing for the EXIT trap rather than popping it --
     // the same rule `exit` and a fatal error follow. Without that the trap
@@ -3179,6 +3189,190 @@ fn a_pipeline_can_still_be_interrupted() -> Result<(), Box<dyn std::error::Error
             }
         }
     }
+    Ok(())
+}
+
+/// A shell with a background job running can still be stopped from the keyboard.
+///
+/// The same argument as the pipeline above, and the same flag: a job is a THREAD
+/// of this process, so the interrupt guard it took while waiting on its own
+/// external command would cover the shell's foreground work too. `sleep 30 &`
+/// followed by a spin is that exactly — the job holds the guard for thirty
+/// seconds while the loop, which only a signal can stop, runs unprotected inside
+/// it. Marking a job `concurrent` is what keeps this killable, and this is the
+/// assertion that says so: with that one line removed the shell survived the
+/// interrupt 6 times out of 6, and with it the shell died 6 of 6.
+///
+/// It is the background half of what `a_pipeline_can_still_be_interrupted`
+/// pins, and it exists because `&` running its list synchronously used to make
+/// the question moot.
+#[test]
+fn a_shell_with_a_background_job_can_still_be_interrupted(
+) -> Result<(), Box<dyn std::error::Error>> {
+    use std::os::unix::process::CommandExt;
+    let shell = PathBuf::from(env!("CARGO_BIN_EXE_td-sh"));
+    // The job has to be one that really BLOCKS, or it exits at once, no guard is
+    // ever taken, and the shell dies for want of one — passing while measuring
+    // nothing. That is the `/bin/sleep` mistake this test's own history records,
+    // so `sleep` is checked to exist and to sleep before it is relied on.
+    let probe = std::time::Instant::now();
+    let slept = std::process::Command::new("/bin/sh").args(["-c", "sleep 0.4"]).status();
+    assert!(
+        matches!(&slept, Ok(s) if s.success()) && probe.elapsed().as_millis() >= 300,
+        "`sleep` does not exist or does not sleep ({slept:?}) - this test needs a job \
+         that blocks long enough to hold the guard, and has none"
+    );
+    // Nothing here ends on its own: the job outlasts the test by far and the
+    // loop is builtins only, so the signal is the only way out.
+    let program = "sleep 30 & while :; do :; done";
+    let mut child = std::process::Command::new(&shell)
+        .args(["-c", program])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        // Its own group, so the signal arrives the way a terminal's would.
+        .process_group(0)
+        .spawn()?;
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    // Asserted, not discarded: a `kill` that never ran would leave the shell
+    // running and this test blaming it for ignoring a signal nobody sent.
+    let signalled = std::process::Command::new("/bin/sh")
+        .args(["-c", &format!("kill -INT -{}", child.id())])
+        .status();
+    assert!(
+        matches!(&signalled, Ok(s) if s.success()),
+        "could not signal the process group ({signalled:?}) - nothing was measured"
+    );
+    let start = std::time::Instant::now();
+    loop {
+        match child.try_wait()? {
+            Some(status) => {
+                assert!(status.code() != Some(0), "reported success after being interrupted");
+                return Ok(());
+            }
+            None if start.elapsed() > std::time::Duration::from_secs(5) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!(
+                    "`{program}` ignored the interrupt - a background job's guard \
+                     covered the shell, and the operator has no way to stop it"
+                );
+            }
+            None => std::thread::sleep(std::time::Duration::from_millis(20)),
+        }
+    }
+}
+
+/// A loop that starts jobs faster than it waits for them must not take the
+/// process out.
+///
+/// A finished thread still holds its stack mappings until something JOINS it, so
+/// a table that only ever grew ran the process out of `vm.max_map_count` after a
+/// few tens of thousands of iterations. The failure is not the graceful one at
+/// the spawn site: `clone(2)` succeeds and the new thread panics inside std's
+/// own bootstrap setting up its guard page, and this crate aborts on a panic —
+/// so `while :; do cmd & done`, the shape the interrupt work above is all about,
+/// died of SIGABRT in about a second. Reaping the ones already finished is what
+/// bounds it; measured aborting at 40000 before and clean after.
+#[test]
+fn a_loop_of_jobs_does_not_exhaust_the_process() -> Result<(), Box<dyn std::error::Error>> {
+    let shell = PathBuf::from(env!("CARGO_BIN_EXE_td-sh"));
+    let out = std::process::Command::new(&shell)
+        .args(["-c", "i=0; while [ $i -lt 40000 ]; do true & i=$((i+1)); done; echo ok"])
+        .output()?;
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "ok\n");
+    // Not merely non-zero: an abort has no code at all, and saying which it was
+    // is the difference between "the shell reported an error" and "the shell
+    // died". `stderr` carries the panic when it is the latter.
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "40000 background jobs did not survive: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    Ok(())
+}
+
+/// `exec` is the one exit a join cannot follow, so it has to join first.
+///
+/// `execve` replaces the image and every job thread stops mid-instruction, which
+/// would make "a shell outlives the jobs it started" quietly false for exactly
+/// one path — and silently, since what is lost is output nobody sees go missing.
+/// Driven through the real binary rather than the in-process harness: with a
+/// captured stdout `exec` runs the command in place instead of replacing
+/// anything, so the harness never reaches the code this is about.
+#[test]
+fn exec_does_not_abandon_a_running_job() -> Result<(), Box<dyn std::error::Error>> {
+    let shell = PathBuf::from(env!("CARGO_BIN_EXE_td-sh"));
+    let out = std::process::Command::new(&shell)
+        .args([
+            "-c",
+            "{ i=0; while [ $i -lt 30000 ]; do i=$((i+1)); done; echo late; } & \
+             exec /bin/sh -c 'echo replaced'",
+        ])
+        .output()?;
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "late\nreplaced\n");
+    Ok(())
+}
+
+/// A job blocked on a descriptor only the SHELL still holds must not deadlock
+/// the join that ends the shell.
+///
+/// Dropping the job table joins every job, so the order the shell's own fields
+/// go in is load-bearing: with the table released first, the shell sat holding
+/// its whole descriptor table while it waited, and `cat fifo & exec 3>fifo`
+/// never came back — the job waiting for an EOF only the shell could give, the
+/// shell waiting for the job. Unbounded, so not the documented "a job costs the
+/// shell its own exit time" trade.
+#[test]
+fn a_job_waiting_on_the_shells_own_descriptor_does_not_hang() -> Result<(), Box<dyn std::error::Error>>
+{
+    let shell = PathBuf::from(env!("CARGO_BIN_EXE_td-sh"));
+    let dir = std::env::temp_dir().join(format!("td-sh-jobfifo-{}", std::process::id()));
+    std::fs::create_dir_all(&dir)?;
+    let fifo = dir.join("f");
+    let path = fifo.to_string_lossy().into_owned();
+    // std cannot make a FIFO, and this test is nothing without one: a probe
+    // that quietly failed would leave `cat` reporting "not found" at once and
+    // the deadlock untested.
+    let made = std::process::Command::new("/bin/sh")
+        .args(["-c", &format!("mkfifo {}", shell_quote(&path))])
+        .status();
+    assert!(
+        matches!(&made, Ok(s) if s.success()) && fifo.exists(),
+        "could not create a FIFO at {path} ({made:?}) - this test needs one"
+    );
+    let q = shell_quote(&path);
+    // Both shapes, because two different mechanisms answer them: the shell's own
+    // is the ORDER of its fields (`fds` before `jobs`, so the table goes first),
+    // and a subshell's is `Subshell::drop` releasing before it joins. Each was
+    // measured hanging for good with its own fix removed and the other in place.
+    for program in [
+        format!("cat {q} & exec 3>{q}; echo done"),
+        format!("( cat {q} & exec 3>{q} ); echo after"),
+    ] {
+        let mut child = std::process::Command::new(&shell)
+            .args(["-c", &program])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()?;
+        let start = std::time::Instant::now();
+        let outcome = loop {
+            match child.try_wait()? {
+                Some(status) => break Some(status),
+                None if start.elapsed() > std::time::Duration::from_secs(10) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    break None;
+                }
+                None => std::thread::sleep(std::time::Duration::from_millis(20)),
+            }
+        };
+        if outcome.is_none() {
+            let _ = std::fs::remove_dir_all(&dir);
+            panic!("`{program}` never exited: the shell's own fd 3 held the job open");
+        }
+    }
+    let _ = std::fs::remove_dir_all(&dir);
     Ok(())
 }
 

@@ -366,17 +366,8 @@ xfail assign.test.sh::local a=loc $var c=loc
 xfail assign.test.sh::redirect after assignment builtin (eval redirects after evaluating arguments)
 xfail assign.test.sh::redirect after command sub (like case above but without assignment builtin)
 xfail assign.test.sh::static assignment doesn't split
-xfail background.test.sh::Background process and then a singleton pipeline
-xfail background.test.sh::Start background pipeline, wait $pid
 xfail background.test.sh::Start background pipeline, wait %job_spec
-xfail background.test.sh::Wait on background process PID
-xfail background.test.sh::Wait on multiple specific IDs returns last status
 xfail background.test.sh::jobs -p prints one line per job
-xfail background.test.sh::wait -n with nothing to wait for
-xfail background.test.sh::wait for N parallel jobs and check failure
-xfail background.test.sh::wait with invalid PID
-xfail background.test.sh::wait with invalid arg
-xfail background.test.sh::wait with jobspec syntax %nonexistent
 xfail ble-idioms.test.sh::Issue #1069 [56] BUG: declare -p unset does not print any error message
 xfail ble-idioms.test.sh::recursive arith: one level
 xfail ble-idioms.test.sh::recursive arith: short circuit &&, ||
@@ -729,7 +720,6 @@ xfail errexit-osh.test.sh::local and inherit_errexit / command_sub_errexit
 xfail errexit-osh.test.sh::local: middle command fails and keeps going
 xfail errexit-osh.test.sh::strict_errexit prevents errexit from being disabled in function
 xfail errexit.test.sh::More && ||
-xfail errexit.test.sh::background processes respect errexit
 xfail errexit.test.sh::bash atoms [[ (( - redir failure checked
 xfail errexit.test.sh::brace group - redir failure checked
 xfail errexit.test.sh::errexit and brace group { }

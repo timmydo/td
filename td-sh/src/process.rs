@@ -90,6 +90,20 @@ impl Fds {
     fn set(&mut self, fd: u32, target: Fd) {
         self.map.insert(fd, target);
     }
+
+    /// Give fd 0 `/dev/null`, which POSIX 2.9.3 requires of an asynchronous
+    /// list. Exposed as this one operation rather than by widening `set`, since
+    /// a background job is the only thing outside this module that rewires a
+    /// descriptor it was handed.
+    pub(crate) fn detach_stdin(&mut self) {
+        self.set(0, Fd::Null);
+    }
+
+    /// Let go of every descriptor this shell holds, which is what a shell about
+    /// to JOIN its jobs has to do first -- see the `jobs` field's note.
+    pub(crate) fn release(&mut self) {
+        self.map.clear();
+    }
 }
 
 impl Default for Fds {
@@ -536,7 +550,7 @@ pub fn run_pipeline(sh: &mut Shell, cmds: &[Stage]) -> R<()> {
         .iter()
         .map(|_| {
             let mut stage = fork_shell(sh);
-            stage.in_pipeline = true;
+            stage.concurrent = true;
             stage
         })
         .collect();
@@ -711,9 +725,10 @@ pub fn run_subshell(sh: &mut Shell, body: &List, redirs: &[Redir]) -> R<()> {
 /// only busy.
 ///
 /// Today nothing reaches a second `hold`, and saying otherwise would be the
-/// second wrong claim about this mechanism. `hold` returns early for a pipeline
-/// stage BEFORE touching the count, `fork_shell` carries `in_pipeline` into
-/// every nested shell of one, and the sole non-test caller is `exec_external`,
+/// second wrong claim about this mechanism. `hold` returns early for any
+/// CONCURRENT shell BEFORE touching the count — a pipeline stage or a background
+/// job — `fork_shell` carries `concurrent` into every nested shell of one, and
+/// the sole non-test caller is `exec_external`,
 /// between whose `hold` and drop no shell code runs. So the depth is 0 or 1 and
 /// the saved-answer branch is unreachable outside tests. It is kept because the
 /// property it enforces is what a SECOND caller would need and cannot be seen to
@@ -859,7 +874,7 @@ impl InterruptibleChild {
         // handler to record the signal with (the `SA_RESTORER` amendment) or
         // stages in processes of their own; neither is bought here, and pretending
         // otherwise costs the operator their only escape.
-        if sh.in_pipeline {
+        if sh.concurrent {
             return Self { held: false };
         }
         let Ok(mut guard) = GUARD.lock() else {
@@ -1032,6 +1047,16 @@ pub struct Subshell {
 /// because `drop` runs before the fields do, so `mask` is still standing.
 impl Drop for Subshell {
     fn drop(&mut self) {
+        // The clone's own jobs are joined FIRST, and its descriptors released
+        // before that, both for reasons the field order gives the top-level
+        // shell: a job blocked on a descriptor only this clone holds would never
+        // finish, and a job still running must not have the dispositions pulled
+        // out from under it below. `( trap '' INT; cmd & )` is the case --
+        // POSIX has an async list started by a shell that ignores INT go on
+        // ignoring it, and restoring first both breaks that and races the
+        // save/restore a job's own spawn does under `GUARD`.
+        self.shell.fds.release();
+        self.shell.jobs.wait_all();
         // A clone that never set a mask has none to put back, and putting one
         // back anyway is how a stage came to undo a sibling's. `drop` runs
         // before the fields do, so the scope is still standing to be told.
@@ -1109,7 +1134,9 @@ pub fn fork_shell(sh: &Shell) -> Subshell {
         errexit_suppressed: sh.errexit_suppressed,
         interactive: false,
         // Carried, so a subshell inside a stage is still inside the pipeline.
-        in_pipeline: sh.in_pipeline,
+        concurrent: sh.concurrent,
+        // Fresh, never cloned: see the field's note.
+        jobs: crate::jobs::Jobs::new(),
         // Inherited: a `$(...)` inside $PS4 runs in one of these, and it must
         // still know it is inside PS4 or the guard buys nothing.
         in_ps4: sh.in_ps4,
@@ -1168,6 +1195,12 @@ pub fn capture_stdout(sh: &mut Shell, code: &str, line: u32) -> R<String> {
         Err(_) => child.status,
     };
     let status = exec::run_exit_trap(&mut child, status);
+    // BEFORE the buffer is read, because dropping the clone is what joins the
+    // background jobs it started and they write into that same buffer:
+    // `x=$( { sleep .1; echo hi; } & )` is `hi` in bash, whose substitution reads
+    // the pipe until the JOB closes its inherited end too. Reading first would
+    // capture whatever had happened to arrive.
+    drop(child);
     // Command substitution updates $? of the enclosing shell.
     sh.set_status(status);
     read_capture(sh, &buf)
@@ -1213,6 +1246,16 @@ pub fn exec_replace(sh: &mut Shell, argv: &[String]) -> R<()> {
         sh.traps.clear();
         exec_external(sh, argv, None)?;
         return Err(Sig::Exit(sh.status));
+    }
+
+    // `exec` is the one exit a join cannot follow: `execve` replaces the image,
+    // so every job thread stops mid-instruction and whatever it had left to
+    // write is gone. Joined here rather than lost, which is what "a shell
+    // outlives the jobs it started" says everywhere else -- and the cost is the
+    // same one that invariant carries, a shell that does not hand over while a
+    // job runs.
+    if sh.jobs.any_running() {
+        sh.jobs.wait_all();
     }
 
     let mut cmd = Command::new(&resolved);
@@ -1519,6 +1562,10 @@ pub fn run_capturing(src: &str) -> (i32, String, String) {
     sh.fds.set(1, Fd::WriteBuf(out.clone()));
     sh.fds.set(2, Fd::WriteBuf(err.clone()));
     let status = exec::run_program(&mut sh, src);
+    // Dropped before the buffers are read, as `main` drops the shell before it
+    // returns: that is what joins the background jobs, and their output goes
+    // into these same buffers.
+    drop(sh);
     let out_s = out
         .lock()
         .map(|v| String::from_utf8_lossy(&v).into_owned())
@@ -1539,6 +1586,7 @@ pub fn run_capturing_bytes(src: &str) -> (i32, Vec<u8>) {
     let mut sh = Shell::new_for_test();
     sh.fds.set(1, Fd::WriteBuf(out.clone()));
     let status = exec::run_program(&mut sh, src);
+    drop(sh);
     let bytes = out.lock().map(|v| v.clone()).unwrap_or_default();
     (status, bytes)
 }
@@ -1565,10 +1613,12 @@ pub fn run_capturing_interactive_units(units: &[&str]) -> (i32, String, String) 
             Err(_) => sh.set_status(2),
         }
     }
+    let status = sh.status;
+    drop(sh);
     let text = |b: &Arc<Mutex<Vec<u8>>>| {
         b.lock().map(|v| String::from_utf8_lossy(&v).into_owned()).unwrap_or_default()
     };
-    (sh.status, text(&out), text(&err))
+    (status, text(&out), text(&err))
 }
 
 

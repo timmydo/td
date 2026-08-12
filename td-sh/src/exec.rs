@@ -190,6 +190,18 @@ pub struct Shell {
     /// by. Only `cd` moves it.
     pub logical_cwd: PathBuf,
     pub fds: Fds,
+    /// The background jobs this shell started. Not carried into a clone: a
+    /// subshell cannot wait for its parent's, and a `JoinHandle` belongs to one
+    /// shell.
+    ///
+    /// Declared AFTER `fds` deliberately. Fields drop in declaration order, and
+    /// dropping this one JOINS every job -- so with the table first the shell
+    /// still held its whole descriptor table while it waited, and a job blocked
+    /// for EOF on a descriptor only the parent had open never finished:
+    /// `cat fifo & exec 3>fifo` hung for good where bash exits at once. Letting
+    /// `fds` go first closes the parent's copies; a job that still needs one
+    /// holds its own `Arc` of the same `File`, so nothing a job is using shuts.
+    pub jobs: crate::jobs::Jobs,
     /// ash's `localvar_stack` depth. `local` is an error at zero and nowhere else,
     /// so this is the whole of "am I somewhere a `local` may be declared".
     pub localvar_depth: u32,
@@ -222,10 +234,14 @@ pub struct Shell {
     /// it propagates into compounds nested inside the condition.
     pub errexit_suppressed: u32,
     pub interactive: bool,
-    /// This shell IS a pipeline stage (or something inside one), which is what
-    /// decides that the interrupt guard is not available to it. Carried into
-    /// clones: a subshell inside a stage is still inside the pipeline.
-    pub in_pipeline: bool,
+    /// This shell runs on a thread of its own beside its siblings — a pipeline
+    /// stage or a background job, or something nested in one. It is what decides
+    /// that the two PROCESS-global mechanisms are not this shell's to touch: the
+    /// interrupt guard is not taken, and `trap ''` is recorded rather than
+    /// installed. Both are one cell shared with whatever else is running, so a
+    /// concurrent shell that set either would be setting a sibling's. Carried
+    /// into clones: a subshell inside one is still concurrent with the rest.
+    pub concurrent: bool,
     /// dash's `inps4`: set while $PS4 is being expanded, so a command
     /// substitution inside it cannot trace itself into infinite regress.
     pub in_ps4: bool,
@@ -429,7 +445,8 @@ impl Shell {
             cmdsubst_count: 0,
             errexit_suppressed: 0,
             interactive: false,
-            in_pipeline: false,
+            concurrent: false,
+            jobs: crate::jobs::Jobs::new(),
             in_ps4: false,
             getopts_optind: 1,
             getopts_off: -1,
@@ -554,7 +571,8 @@ impl Shell {
             cmdsubst_count: 0,
             errexit_suppressed: 0,
             interactive: false,
-            in_pipeline: false,
+            concurrent: false,
+            jobs: crate::jobs::Jobs::new(),
             in_ps4: false,
             getopts_optind: 1,
             getopts_off: -1,
@@ -980,33 +998,35 @@ pub fn run_source(sh: &mut Shell, src: &str, what: &str) -> R<()> {
 pub fn run_list(sh: &mut Shell, list: &List) -> R<()> {
     for (and_or, sep) in &list.items {
         if *sep == Sep::Bg {
-            // No job control yet: run the async list in an ISOLATED subshell so its
-            // variable/cwd/option changes cannot leak, then continue immediately
-            // with $?=0. True background execution, a real $! and a functional
-            // `wait` are deferred (see the crate-root note); $! is a placeholder.
-            let mut child = process::fork_shell(sh);
-            let status = match run_and_or(&mut child, and_or) {
-                Ok(()) => child.status,
-                Err(Sig::Exit(code) | Sig::Abort(code)) => code,
-                // ...but an interrupt comes out, exactly as it does from the
-                // other clone boundaries. A real shell would put a background
-                // job OUTSIDE the foreground group, where the terminal's Ctrl-C
-                // never reaches it -- but this `&` is synchronous, so the child
-                // IS in the foreground group and the signal DID reach it.
-                // Confining it on the strength of what `&` is supposed to mean
-                // left `while :; do sleep 1 & done` unkillable from the
-                // keyboard: the interrupt arrived, killed the child, and was
-                // discarded. That is the loop nothing can stop that
-                // `Sig::Interrupt` exists to prevent. It goes back to being
-                // confined when `&` is a process of its own.
-                Err(Sig::Interrupt(code)) => {
-                    return process::leave_clone(sh, child, code);
+            // An ISOLATED subshell, so the job's variable/cwd/option changes
+            // cannot leak back, running on a THREAD of its own -- `jobs.rs` has
+            // why it is a thread and what that costs.
+            match crate::jobs::spawn(process::fork_shell(sh), and_or) {
+                // A job that could not START is the shell failing, not the job
+                // reporting -- said out loud rather than left as a silent 0,
+                // since `&` otherwise reports success for a list that never ran.
+                // `$!` is left alone: it still names whatever job it named, and
+                // moving it to an id nothing is running under would make the
+                // `wait` that follows answer for the wrong job.
+                Err(e) => {
+                    let _ = write_stderr(sh, &format!("td-sh: cannot start job: {e}"));
+                    sh.set_status(1);
                 }
-                Err(_) => child.status,
-            };
-            let _ = run_exit_trap(&mut child, status);
-            sh.last_bg = Some(std::process::id());
-            sh.set_status(0);
+                // The job is already RUNNING, so an exhausted id table is not a
+                // reason to pretend it is not: it is joined at the end like any
+                // other and only `$!`/`wait` cannot name it. Left where it was
+                // rather than unset, for the reason above.
+                Ok(handle) => match sh.jobs.record(handle) {
+                    Some(id) => {
+                        sh.last_bg = Some(id);
+                        sh.set_status(0);
+                    }
+                    None => {
+                        let _ = write_stderr(sh, "td-sh: too many jobs to name this one");
+                        sh.set_status(0);
+                    }
+                },
+            }
         } else {
             run_and_or(sh, and_or)?;
         }
@@ -1024,7 +1044,7 @@ fn run_condition(sh: &mut Shell, list: &List) -> R<()> {
     result
 }
 
-fn run_and_or(sh: &mut Shell, and_or: &AndOr) -> R<()> {
+pub(crate) fn run_and_or(sh: &mut Shell, and_or: &AndOr) -> R<()> {
     let n_rest = and_or.rest.len();
     // Operand 0 is the structurally-last only when there is no `&&`/`||` tail.
     run_operand(sh, &and_or.first, n_rest == 0)?;

@@ -26,8 +26,10 @@
 //! `trap '' SIG` is therefore already real, and reaches the children a script
 //! starts, as POSIX requires. Pipeline stages now STREAM, on threads joined by
 //! `std::io::pipe` descriptors — no `unsafe`, which is why that was a
-//! refinement rather than a syscall question. Async lists (`&`) are still
-//! synchronous, which is the remaining one of that pair.
+//! refinement rather than a syscall question. Async lists (`&`) now stream too,
+//! on threads of the same shape, with a real `$!` and a `wait` that answers for
+//! them (`jobs.rs`). What is still deferred is job CONTROL — `jobs`/`fg`/`bg`,
+//! a jobspec, and the process group a signal would be aimed at.
 #![deny(unsafe_code)]
 
 mod arith;
@@ -36,6 +38,7 @@ mod builtin;
 mod complete;
 mod exec;
 mod expand;
+mod jobs;
 mod lexer;
 mod line;
 mod parser;
@@ -535,6 +538,7 @@ mod confinement {
         ("complete.rs", include_str!("complete.rs")),
         ("exec.rs", include_str!("exec.rs")),
         ("expand.rs", include_str!("expand.rs")),
+        ("jobs.rs", include_str!("jobs.rs")),
         ("lexer.rs", include_str!("lexer.rs")),
         ("line.rs", include_str!("line.rs")),
         ("parser.rs", include_str!("parser.rs")),

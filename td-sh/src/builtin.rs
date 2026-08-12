@@ -157,7 +157,7 @@ pub fn run(sh: &mut Shell, bi: Builtin, argv: &[String]) -> R<()> {
         Builtin::Dot => dot(sh, argv),
         Builtin::Command => command(sh, argv),
         Builtin::Type => type_of(sh, argv),
-        Builtin::Wait => ok(sh),
+        Builtin::Wait => wait(sh, argv),
         Builtin::Alias => alias(sh, argv),
         Builtin::Unalias => unalias(sh, argv),
         Builtin::Exec => exec_cmd(sh, argv),
@@ -168,6 +168,70 @@ pub fn run(sh: &mut Shell, bi: Builtin, argv: &[String]) -> R<()> {
 fn ok(sh: &mut Shell) -> R<()> {
     sh.set_status(0);
     Ok(())
+}
+
+/// `wait [id...]` -- collect background jobs.
+///
+/// With no operands every job is collected and the status is 0 however they
+/// ended, which is POSIX and is what the corpus's own "status is lost" comment
+/// means. With operands each is collected in the order WRITTEN and the status is
+/// the LAST one's, so `wait $a $b $c` answers for `$c` even when it finished
+/// first.
+///
+/// What is refused is as much of the builtin as what is served, because every
+/// refusal here is a shape whose answer this shell cannot know. `-n` (collect
+/// whichever job finishes next) is bash's and needs a wait that is not per-id;
+/// a `%jobspec` needs the job TABLE `jobs`/`fg`/`bg` would print and this shell
+/// does not keep. Both are what dash reports for them -- 2, a usage error --
+/// rather than an approximation graded as an answer.
+fn wait(sh: &mut Shell, argv: &[String]) -> R<()> {
+    let operands = match argv.get(1..) {
+        None => &[][..],
+        Some(rest) => rest,
+    };
+    if operands.is_empty() {
+        sh.jobs.wait_all();
+        return status(sh, 0);
+    }
+    // `--` ends the options, as the Utility Syntax Guidelines require and as
+    // dash's own `nextopt` gives every builtin. Only in the leading position:
+    // after it a `--` is an operand like any other, and so is not a number.
+    let operands = match operands.first() {
+        Some(first) if first == "--" => operands.get(1..).unwrap_or(&[]),
+        _ => operands,
+    };
+    if operands.is_empty() {
+        sh.jobs.wait_all();
+        return status(sh, 0);
+    }
+    let mut last = 0;
+    for operand in operands {
+        if let Some(flag) = operand.strip_prefix('-') {
+            err_line(sh, &format!("wait: Illegal option -{flag}"));
+            return status(sh, 2);
+        }
+        if operand.starts_with('%') {
+            err_line(sh, &format!("wait: {operand}: no such job"));
+            return status(sh, 2);
+        }
+        // A pid is DIGITS, so this is not `str::parse` -- that accepts a leading
+        // `+`/`-` and `wait -5` has already been read as an option above, which
+        // would leave `wait +5` the one spelling that got through as a number.
+        if operand.is_empty() || !operand.bytes().all(|b| b.is_ascii_digit()) {
+            err_line(sh, &format!("wait: Illegal number: {operand}"));
+            return status(sh, 2);
+        }
+        // Not one of this shell's jobs -- including one already collected, which
+        // bash also reports as 127. An id too large for `u32` cannot be one
+        // either, and takes the same answer rather than a different diagnostic.
+        //
+        // It does NOT end the loop: POSIX makes the status that of the LAST
+        // operand, so the ones after an unknown id are still waited for. bash
+        // agrees -- `wait <unknown> $p` reports `$p`'s status and `wait $p
+        // <unknown>` reports 127 -- where returning here waited for neither.
+        last = operand.parse::<u32>().ok().and_then(|id| sh.jobs.wait_id(id)).unwrap_or(127);
+    }
+    status(sh, last)
 }
 
 fn status(sh: &mut Shell, code: i32) -> R<()> {
@@ -2473,7 +2537,7 @@ fn apply_disposition(sh: &mut Shell, signo: u8, want: crate::sys::Disposition) -
     // this writes. What a stage gives up is protecting ITSELF from the signal,
     // which is already the case: a pipeline is not covered by the interrupt guard
     // either, for the same reason.
-    if sh.in_pipeline {
+    if sh.concurrent {
         return true;
     }
     let prev = match crate::sys::signal_set(signo, want) {

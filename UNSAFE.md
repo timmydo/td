@@ -444,6 +444,14 @@ isolation needs the mask applied per stage at each file creation, or
 stages in processes of their own; neither is here, and the record above
 is only sound for the read.
 
+A BACKGROUND JOB is in that same paragraph and reaches further, because
+it outlives the statement that started it rather than a pipeline.
+`umask 077; { umask 022; sleep .05; } & umask 027; wait; umask` prints
+0027 under bash and 0077 here: the job restores the mask it captured
+when it was cloned, over the one the parent chose while it ran. Same
+mechanism, same absent fix — a mask is per-PROCESS and these are threads
+of one — and the same answer, which is a job in a process of its own.
+
 A stage that sets NONE is a different matter and is closed. Every clone
 captured the mask and put it back when it ended, which is invisible while
 subshells run one at a time and is a stage reaching into a SIBLING's
@@ -657,6 +665,25 @@ paragraph needs — somewhere to RECORD a signal, or stages in processes
 of their own — since what the exemption gives up is the shell's own
 protection for exactly as long as a pipeline runs.
 
+A BACKGROUND JOB is exempt for the same reason and by the same flag,
+which is named `concurrent` rather than `in_pipeline` because a job and
+a stage are the same kind of thing to every mechanism that cares: both
+are threads of one process, so neither may take a guard that covers its
+siblings or install a disposition they share. Exempting the job is what
+keeps `while :; do cmd & done` killable — while `&` was synchronous the
+job took the guard and covered the LOOP, which is why the `&` arm used
+to carry a job's interrupt back out to end the shell. That propagation
+is gone with the reason for it: a background job dying of a signal is
+not the shell dying of one, which is what bash reports too.
+
+The exemption is measured rather than argued, on the shape that isolates
+it: `sleep 30 & while :; do :; done`, where the job holds a guard for
+thirty seconds while a loop only a signal can stop runs inside it. Under
+a group SIGINT the shell died 6 times out of 6 with the job marked
+`concurrent` and survived 6 of 6 with that one line removed —
+`a_shell_with_a_background_job_can_still_be_interrupted` is the
+assertion, the background half of the pipeline's.
+
 Both of them, because Ctrl-\ reaches the shell exactly
 as Ctrl-C does and a shell that survived one and died on the other would
 be a coin toss from the keyboard. The ignore is taken AFTER the child
@@ -695,6 +722,16 @@ own. Real job control, with the child in that group and the terminal
 handed to it, closes it properly and is the better answer, and is still
 deferred: it needs `setpgid(2)` and a `TIOCSPGRP` ioctl, which is an
 amendment here rather than a use of what the surface already has.
+
+A BACKGROUND JOB now runs while that guard is held, which nothing did
+before `&` became asynchronous, and it is recorded rather than measured:
+an interactive `cmd &` puts an external command on a terminal whose
+`ICANON`, `ECHO` and `ISIG` the editor has cleared for the line being
+typed, and the editor's restore-what-was-there writes back over whatever
+mode that command set. Neither half is reachable from a script, and the
+guard's lifetime is one line, so this is smaller than it sounds; the fix
+is the same one the umask and the ids want, a job in a process of its
+own.
 
 Clearing `ISIG` also removes the operator's last in-band escape if the
 restore never runs, which is worth stating because `Drop` is not a
@@ -818,16 +855,29 @@ without it the block takes lines the script's own `read` is owed, which
 paths over one script and holding each to the same expected output
 rather than to the other. It is issued before `read_line_block`
 returns, so the descriptor is ahead only between that read and that
-seek. NOTHING td-sh itself starts can observe that window: `&` is
-synchronous here, and a pipeline's stages are threads joined before the
-list returns, so no command of this shell's runs while the parser is
-reading. What could is a process OUTSIDE it holding the same file
-description — a daemonising child, or a sibling of whoever set up the
-redirect. For one of those the cost is worse than seeing a transient
-offset: the rewind is RELATIVE, so a sharer that moves the position
-inside the window sends it to the wrong absolute place and the reader
-does not recover. That is inherent to reading more than a byte and
-giving the rest back, bash included.
+seek. NOTHING td-sh itself starts can observe that window: a pipeline's
+stages are threads joined before the list returns, and a BACKGROUND JOB
+— which since `&` became asynchronous really does run while the parser
+reads — is given `/dev/null` for stdin, as POSIX 2.9.3 requires of an
+asynchronous list wherever job control is disabled. What could is a
+process OUTSIDE the shell holding the same file description: a
+daemonising child, or a sibling of whoever set up the redirect. For one
+of those the cost is worse than seeing a transient offset: the rewind is
+RELATIVE, so a sharer that moves the position inside the window sends it
+to the wrong absolute place and the reader does not recover. That is
+inherent to reading more than a byte and giving the rest back, bash
+included.
+
+The job's `/dev/null` is worth recording as the FIX rather than as a
+detail, because the alternative was nearly written down here as
+impossible. Before it, a 40-line `sh < script` opening with `{ read a;
+read b; } &` lost three lines and left the parser resuming MID-LINE,
+running `line8` as a command. Neither candidate repair to this reader
+helps: a byte at a time while a job is live still interleaves, the job's
+own `read` being bytewise too, and seeking absolutely rather than
+relatively races the same way, the position query being a second
+syscall. Both were tried and measured still broken. The descriptor was
+the bug, not the read.
 
 Deliberately NOT done: bash's further trick of deferring the rewind
 until it is about to run something that reads stdin. That buys the rest
