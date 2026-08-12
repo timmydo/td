@@ -1840,7 +1840,7 @@ enum Atom {
     Class(Box<[bool; 256]>),
 }
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy)]
 enum Rep {
     One,
     Star,
@@ -1852,10 +1852,18 @@ enum Rep {
 ///
 /// Measured before it was written, over 177 grep-family invocations: 127 have a
 /// literal pattern and the other 50 reach for `^`, `$`, `[...]` (with negation
-/// and ranges), `.`, `*` and ERE's `+`. That is the whole surface here.
+/// and ranges), `.`, `*` and ERE's `+`. Named classes (`[[:space:]]` and the
+/// eleven others), GNU's `\s`/`\S`/`\w`/`\W` shorthands for two of them, and
+/// GNU's BRE repeats `\+`/`\?` joined that surface for the corpus's SED
+/// scripts, where `s/ \+/ /g` alone is eleven of the forty-eight `s///`
+/// patterns the corpus writes.
 ///
-/// Everything else -- alternation, groups, backreferences, interval `{n,m}`,
-/// named classes like `[:alpha:]` -- is REFUSED at parse time rather than
+/// What the three have in common is that each names a SET, which is what a term
+/// already holds -- so they are a wider vocabulary for this engine rather than a
+/// change to it. That is also the line the remaining refusals sit on: `\b`,
+/// `\B`, `\<`, `\>` and the buffer anchors are ZERO-WIDTH, and alternation,
+/// groups, backreferences and the interval `{n,m}` need structure a flat term
+/// list has no room for. All of them are REFUSED at parse time rather than
 /// approximated, and the refusal is the applet's status 2. This matters more
 /// here than in any other applet: a matcher that silently mishandled a
 /// construct would report a WRONG match, and the case would be graded on it as
@@ -1927,31 +1935,37 @@ impl Pattern {
                 }
                 b'\\' => {
                     // An escape makes the next byte a literal -- but only where
-                    // GNU agrees. `\b`, `\w` and friends are OPERATORS to it
-                    // (word boundary, word character), and `\1` is a
-                    // backreference, so literalising them is a wrong match in
-                    // both directions: `\bfoo\b` matched `bfoob` and missed
-                    // `foo bar`. Refused by an ALLOW-list, since the escapes
-                    // GNU gives meaning to are open-ended and the ones it does
-                    // not are the punctuation this already handles. `\C` stays
-                    // a literal `C` -- GNU warns "stray \" and reads it the
-                    // same way, and the corpus spells `\C-o\C-s\C-h` eight
-                    // times.
+                    // GNU agrees. It gives meaning to `\s`/`\w` and their
+                    // complements, to `\b`/`\B` and the word- and
+                    // buffer-anchors, and to `\1`-`\9`; for EVERY OTHER letter
+                    // it warns "stray \" and reads the literal, which is what
+                    // this does -- the corpus spells `\C-o\C-s\C-h` eight
+                    // times. The four that name a SET are served, since a set
+                    // is what this engine already matches: they are
+                    // `[[:space:]]` and `[[:alnum:]_]` written short. The rest
+                    // are refused rather than literalised, both because
+                    // literalising is a wrong match in either direction --
+                    // `\bfoo\b` matched `bfoob` and missed `foo bar` -- and
+                    // because a zero-width assertion or a backreference is not
+                    // a byte the term list can hold, so serving one needs the
+                    // engine rather than the parser.
                     let next = *src.get(i + 1)?;
-                    // Named one by one rather than by a class, because the two
-                    // groups do not line up with anything simpler. GNU gives
-                    // meaning to the word-boundary and word/space classes, to
-                    // `\1`-`\9` as backreferences, and to word- and
-                    // buffer-start/end -- and warns "stray \" for EVERY OTHER
-                    // letter, reading it as the literal, which is what this
-                    // does. `\C` is in the second group, and the corpus spells
-                    // `\C-o\C-s\C-h` eight times.
-                    if matches!(next, b'b' | b'B' | b'w' | b'W' | b's' | b'S')
+                    if let Some(set) = escape_class(next) {
+                        i += 2;
+                        terms.push(Term { atom: Atom::Class(set), rep: repeat(src, &mut i, ere)? });
+                        continue;
+                    }
+                    if matches!(next, b'b' | b'B')
                         || matches!(next, b'<' | b'>' | b'`' | b'\'')
                         || next.is_ascii_digit() && next != b'0'
                     {
                         return None;
                     }
+                    // In a BRE `\+` and `\?` are GNU's repeat operators, read
+                    // where a repeat is read; reaching them HERE means there is
+                    // no atom to repeat. GNU warns "stray \" and takes the
+                    // literal, which is a pattern for something nobody asked to
+                    // match, so it is refused as the ERE spelling already is.
                     if !ere && matches!(next, b'+' | b'?' | b'(' | b')' | b'{' | b'}' | b'|') {
                         return None;
                     }
@@ -1972,35 +1986,7 @@ impl Pattern {
                     Atom::Lit(other)
                 }
             };
-            // A repeat binds to the atom just read.
-            let rep = match src.get(i) {
-                Some(b'*') => {
-                    i += 1;
-                    Rep::Star
-                }
-                Some(b'+') if ere => {
-                    i += 1;
-                    Rep::Plus
-                }
-                Some(b'?') if ere => {
-                    i += 1;
-                    Rep::Opt
-                }
-                _ => Rep::One,
-            };
-            // A repeat OF a repeat is refused rather than read as the literal
-            // the second operator would otherwise become: `a**+` would parse as
-            // `a*` then one-or-more literal asterisks, which is a well-formed
-            // pattern for something nobody asked to match. GNU rejects it.
-            let doubled = match src.get(i) {
-                Some(b'*') => true,
-                Some(b'+' | b'?') => ere,
-                _ => false,
-            };
-            if rep != Rep::One && doubled {
-                return None;
-            }
-            terms.push(Term { atom: fold(atom, icase), rep });
+            terms.push(Term { atom: fold(atom, icase), rep: repeat(src, &mut i, ere)? });
         }
         Some(Pattern { terms, start, end })
     }
@@ -2064,25 +2050,108 @@ fn fold(atom: Atom, icase: bool) -> Atom {
     }
 }
 
-/// `[...]` starting at `at`. Returns the resolved set and the index past the
-/// closing bracket. `]` first is a literal and `-` first or last is a literal,
-/// both as POSIX says; a named class is refused rather than guessed at.
 /// Does a `:` at `at` open a `[:name:]` that closes before the class does?
-/// Only then is the single-bracket typo unambiguous, and all three parts are
-/// load-bearing -- GNU refuses `[:x:]` and accepts every near miss as the
-/// ordinary set of the bytes it is spelled with. The NAME must be one or more
-/// alphanumerics (`[::]` is the class `{:}`, and `[:a1:]` IS diagnosed even
-/// though no class is called `a1`), it must be followed by `:` (`[:a-b:]` is a
-/// range and a colon), and that colon must close the class (`[:ab:c]` is four
-/// ordinary members).
+///
+/// Only then is the single-bracket typo unambiguous, and each part is
+/// load-bearing. The NAME is one or more bytes that are not `-`, since a `-`
+/// makes GNU read a RANGE instead and diagnose nothing (`[:-:]` and `[:a-b:]`
+/// are served, `[:a-:]` is its "Invalid range end" rather than this); it must
+/// be followed by `:` and that colon must close the class, so `[:ab:c]` is four
+/// ordinary members. Not by CLASS of byte: GNU diagnoses `[:/:]` and `[: :]` as
+/// readily as `[:a1:]`, and requiring alphanumerics served those silently.
 fn ends_named_class(src: &[u8], at: usize) -> bool {
     let mut j = at + 1;
-    while src.get(j).is_some_and(|c| c.is_ascii_alphanumeric()) {
+    while src.get(j).is_some_and(|c| !matches!(c, b':' | b']' | b'-')) {
         j += 1;
     }
     j > at + 1 && src.get(j) == Some(&b':') && src.get(j + 1) == Some(&b']')
 }
 
+/// The repeat that binds to the atom just read, consuming its operator.
+///
+/// `None` refuses a repeat OF a repeat rather than reading the second operator
+/// as the literal it would otherwise become: `a**+` would parse as `a*` followed
+/// by one-or-more literal asterisks, a well-formed pattern for something nobody
+/// asked to match. GNU accepts it; this is a deliberately narrower subset, and
+/// the narrow side is the safe one.
+///
+/// A BRE spells the two GNU extensions `\+` and `\?`, so the operator is two
+/// bytes there and one in an extended expression.
+fn repeat(src: &[u8], i: &mut usize, ere: bool) -> Option<Rep> {
+    let take = |at: usize| -> Option<(Rep, usize)> {
+        Some(match (src.get(at), src.get(at + 1)) {
+            (Some(b'*'), _) => (Rep::Star, 1),
+            (Some(b'+'), _) if ere => (Rep::Plus, 1),
+            (Some(b'?'), _) if ere => (Rep::Opt, 1),
+            (Some(b'\\'), Some(b'+')) if !ere => (Rep::Plus, 2),
+            (Some(b'\\'), Some(b'?')) if !ere => (Rep::Opt, 2),
+            _ => return None,
+        })
+    };
+    let Some((rep, width)) = take(*i) else {
+        return Some(Rep::One);
+    };
+    *i += width;
+    match take(*i) {
+        Some(_) => None,
+        None => Some(rep),
+    }
+}
+
+/// The character set an escape names, or `None` if it names none.
+///
+/// `\s` and `\w` are GNU's shorthands for `[[:space:]]` and `[[:alnum:]_]`, and
+/// the capitals are their complements. They are served because a SET is what the
+/// term list already holds; `\b` and friends are not, being zero-width.
+fn escape_class(after: u8) -> Option<Box<[bool; 256]>> {
+    let (name, negated) = match after {
+        b's' => (&b"space"[..], false),
+        b'S' => (&b"space"[..], true),
+        b'w' => (&b"alnum"[..], false),
+        b'W' => (&b"alnum"[..], true),
+        _ => return None,
+    };
+    let member = named_class(name)?;
+    let mut set = Box::new([false; 256]);
+    for c in 0..=255u8 {
+        // `\w` is alnum PLUS the underscore, which no POSIX class names.
+        let inside = member(c) || (matches!(after, b'w' | b'W') && c == b'_');
+        if let Some(slot) = set.get_mut(usize::from(c)) {
+            *slot = inside != negated;
+        }
+    }
+    Some(set)
+}
+
+/// The POSIX class named between `[:` and `:]`, as a membership test.
+///
+/// C-locale definitions, which is what the corpus and GNU agree on here. Two are
+/// spelled out rather than taken from `std`: `space` because Rust's
+/// `is_ascii_whitespace` OMITS the vertical tab that C's `isspace` includes --
+/// `wc`'s trap, in another disguise -- and `print` because `is_ascii_graphic`
+/// excludes the space that `print` is `graph` plus.
+fn named_class(name: &[u8]) -> Option<fn(u8) -> bool> {
+    Some(match name {
+        b"alpha" => |b: u8| b.is_ascii_alphabetic(),
+        b"digit" => |b: u8| b.is_ascii_digit(),
+        b"alnum" => |b: u8| b.is_ascii_alphanumeric(),
+        b"upper" => |b: u8| b.is_ascii_uppercase(),
+        b"lower" => |b: u8| b.is_ascii_lowercase(),
+        b"xdigit" => |b: u8| b.is_ascii_hexdigit(),
+        b"punct" => |b: u8| b.is_ascii_punctuation(),
+        b"graph" => |b: u8| b.is_ascii_graphic(),
+        b"cntrl" => |b: u8| b.is_ascii_control(),
+        b"blank" => |b: u8| b == b' ' || b == b'\t',
+        b"space" => |b: u8| b.is_ascii_whitespace() || b == 0x0b,
+        b"print" => |b: u8| b.is_ascii_graphic() || b == b' ',
+        _ => return None,
+    })
+}
+
+/// `[...]` starting at `at`. Returns the resolved set and the index past the
+/// closing bracket. `]` first is a literal and `-` first or last is a literal,
+/// both as POSIX says; a `[:name:]` inside FOLDS into the set, and every
+/// spelling GNU diagnoses rather than reads is refused instead of guessed at.
 fn parse_class(src: &[u8], at: usize, icase: bool) -> Option<(Box<[bool; 256]>, usize)> {
     let mut i = at + 1;
     let mut neg = false;
@@ -2098,10 +2167,44 @@ fn parse_class(src: &[u8], at: usize, icase: bool) -> Option<(Box<[bool; 256]>, 
             i += 1;
             break;
         }
-        // `[[:alpha:]]` and the equivalence/collating forms. Refused, not read
-        // as the punctuation they are made of, which is what a plain parse
-        // would silently do.
-        if b == b'[' && matches!(src.get(i + 1), Some(b':' | b'.' | b'=')) {
+        // `[[:alpha:]]`. Several may share one bracket (`[[:space:][:digit:]]`)
+        // and each may sit beside ordinary members, so this folds into the set
+        // rather than replacing it.
+        if b == b'[' && src.get(i + 1) == Some(&b':') {
+            let name_at = i + 2;
+            let mut j = name_at;
+            while src.get(j).is_some_and(|c| c.is_ascii_alphanumeric()) {
+                j += 1;
+            }
+            // GNU diagnoses an unknown name rather than reading it, and an
+            // unterminated `[:` is its "Unmatched [, [^, [:, [., or [=".
+            if src.get(j) != Some(&b':') || src.get(j + 1) != Some(&b']') {
+                return None;
+            }
+            let member = named_class(src.get(name_at..j)?)?;
+            for c in 0..=255u8 {
+                if member(c) {
+                    if let Some(slot) = set.get_mut(usize::from(c)) {
+                        *slot = true;
+                    }
+                }
+            }
+            first = false;
+            i = j + 2;
+            // A class cannot START a range: GNU calls `[[:digit:]-a]` an
+            // invalid range end, and taking it as the set plus `-` and `a` is a
+            // class that matches MORE than was asked for and says nothing. A
+            // `-` immediately before the `]` is an ordinary member, which is
+            // why the byte after it is what decides.
+            if src.get(i) == Some(&b'-') && src.get(i + 1).is_some_and(|c| *c != b']') {
+                return None;
+            }
+            continue;
+        }
+        // The equivalence and collating forms, which are still refused: they
+        // depend on a locale's collation table, so reading them as the
+        // punctuation they are made of would be a set nobody asked for.
+        if b == b'[' && matches!(src.get(i + 1), Some(b'.' | b'=')) {
             return None;
         }
         // …and the SINGLE-bracket typo `[:alpha:]`, which is the spelling that
@@ -2115,6 +2218,15 @@ fn parse_class(src: &[u8], at: usize, icase: bool) -> Option<(Box<[bool; 256]>, 
         // A range, unless the `-` is last.
         if src.get(i + 1) == Some(&b'-') && src.get(i + 2).is_some_and(|c| *c != b']') {
             let hi = *src.get(i + 2)?;
+            // …and a named class cannot END one either, which is the mirror of
+            // the guard below and needs its own test because it never reaches
+            // the `[:` scanner: the range takes the `[` as its endpoint, and
+            // what is left reads as the ordinary letters the class is spelled
+            // with. A `[` that does NOT open one is an ordinary byte, so
+            // `[A-[]` stays served.
+            if hi == b'[' && matches!(src.get(i + 3), Some(b':' | b'.' | b'=')) {
+                return None;
+            }
             if hi < b {
                 return None;
             }
@@ -3325,6 +3437,89 @@ mod tests {
         assert_eq!(hit("a?b", "a?b"), Some((0, 3)));
     }
 
+    /// The three constructs a SET can express, which is why they are served
+    /// where the zero-width ones beside them are not. Every expectation here was
+    /// taken from GNU grep 3.11 rather than from the POSIX text, since the two
+    /// disagree about the vertical tab.
+    #[test]
+    fn a_named_class_is_the_set_gnu_gives_it() {
+        let hit = |pat: &str, line: &str| m(pat, false, false, line).flatten();
+        let ere = |pat: &str, line: &str| m(pat, true, false, line).flatten();
+        // `\s`/`\w` and their complements, which are `[[:space:]]` and
+        // `[[:alnum:]_]` written short.
+        assert_eq!(hit("\\s", "ab c"), Some((2, 3)));
+        assert_eq!(hit("\\s", "abc"), None);
+        assert_eq!(hit("\\S", "  x"), Some((2, 3)));
+        // …and `\S` against the byte that separates `space` from its nearest
+        // neighbour, as each named class is: two spaces satisfy `[^[:blank:]]`
+        // just as well, so the assertion above alone does not say which set it
+        // is complementing.
+        assert_eq!(hit("\\S", "\x0bx"), Some((1, 2)));
+        assert_eq!(hit("\\s", "x\x0b"), Some((1, 2)));
+        assert_eq!(hit("\\w", "!?_"), Some((2, 3)));
+        assert_eq!(hit("\\W", "ab_9!"), Some((4, 5)));
+        assert_eq!(ere("\\w+", "  ab_9!"), Some((2, 6)));
+        // The vertical tab is whitespace to C and NOT to Rust's
+        // `is_ascii_whitespace`, which is `wc`'s trap in another disguise.
+        assert_eq!(hit("\\s", "a\x0bb"), Some((1, 2)));
+        assert_eq!(hit("[[:space:]]", "a\x0bb"), Some((1, 2)));
+        // Each class is asked about a byte that separates it from its NEAREST
+        // neighbour, since the pairs below differ by exactly one kind of byte:
+        // `alpha` excludes the digit `alnum` takes, and `upper`/`lower` are the
+        // halves of it -- so a table with either pair confused answers these
+        // differently and every other assertion here the same.
+        assert_eq!(hit("[[:alpha:]]", "77a"), Some((2, 3)));
+        assert_eq!(hit("[[:alpha:]]", "7"), None);
+        assert_eq!(hit("[[:alnum:]]", "!7"), Some((1, 2)));
+        assert_eq!(hit("[[:upper:]]", "aaZ"), Some((2, 3)));
+        assert_eq!(hit("[[:upper:]]", "ab"), None);
+        assert_eq!(hit("[[:lower:]]", "ABc"), Some((2, 3)));
+        assert_eq!(hit("[[:lower:]]", "AB"), None);
+        // The bracketed spelling, beside ordinary members and other classes --
+        // a class FOLDS into the set rather than replacing it.
+        assert_eq!(hit("[[:digit:]]", "ab7"), Some((2, 3)));
+        assert_eq!(hit("[[:digit:]x]", "abx"), Some((2, 3)));
+        assert_eq!(hit("[x[:digit:]]", "ab7"), Some((2, 3)));
+        // BOTH classes in a shared bracket, asked one at a time: a haystack
+        // holding only whitespace would never reach the second.
+        assert_eq!(hit("[[:space:][:digit:]]", "ab 7"), Some((2, 3)));
+        assert_eq!(hit("[[:space:][:digit:]]", "ab7"), Some((2, 3)));
+        assert_eq!(hit("[[:space:][:digit:]]", "ab"), None);
+        assert_eq!(hit("[^[:space:]]", "  q"), Some((2, 3)));
+        // `print` is `graph` plus the space, and `cntrl` is neither.
+        assert_eq!(hit("[[:print:]]", "\x01 "), Some((1, 2)));
+        assert_eq!(hit("[[:graph:]]", "\x01 x"), Some((2, 3)));
+        assert_eq!(hit("[[:cntrl:]]", "ab\x01"), Some((2, 3)));
+        // DEL is a control character too, and it is the one a `< 0x20` test
+        // would miss -- the whole high end of the class.
+        assert_eq!(hit("[[:cntrl:]]", "ab\x7f"), Some((2, 3)));
+        assert_eq!(hit("[[:punct:]]", "ab_"), Some((2, 3)));
+        // …and the underscore is punctuation but NOT alnum, which is the one
+        // byte separating `[[:alnum:]]` from the `\w` composed out of it.
+        assert_eq!(hit("[[:alnum:]]", "_"), None);
+        assert_eq!(hit("[[:blank:]]", "a\nb\t"), Some((3, 4)));
+        // `xdigit` is `digit` plus two letter ranges, so a digit alone cannot
+        // tell the two apart.
+        assert_eq!(hit("[[:xdigit:]]", "ghz w"), None);
+        assert_eq!(hit("[[:xdigit:]]", "ghF"), Some((2, 3)));
+        assert_eq!(hit("[[:xdigit:]]", "zc"), Some((1, 2)));
+        // A BRE spells GNU's two repeat extensions with a backslash, which is
+        // the corpus's single most common sed script (`s/ \+/ /g`).
+        assert_eq!(hit("a\\+", "baaa"), Some((1, 4)));
+        assert_eq!(hit(" \\+", "a   b"), Some((1, 4)));
+        assert_eq!(hit("ax\\?b", "ab"), Some((0, 2)));
+        assert_eq!(hit("ax\\?b", "axb"), Some((0, 3)));
+        assert_eq!(hit("ax\\?b", "axxb"), None);
+        assert_eq!(hit("[ \\t]\\+", "a  b"), Some((1, 3)));
+        // …and they stay LITERAL in an extended expression, where the
+        // unescaped spelling is the operator. BOTH of them: the `\+` half was
+        // pinned and the `\?` half was not, so dropping the dialect guard from
+        // one arm of `repeat` passed the whole suite.
+        assert_eq!(ere("a\\+", "ba+"), Some((1, 3)));
+        assert_eq!(ere("ax\\?b", "ax?b"), Some((0, 4)));
+        assert_eq!(ere("ax\\?b", "ab"), None);
+    }
+
     /// `-i` folds the pattern where the haystack is folded, and a NEGATED class
     /// is the one place the two can be composed the wrong way round: the fold
     /// belongs before the negation, or the complement is widened instead of the
@@ -3367,17 +3562,82 @@ mod tests {
         }
         // A BRE spells those with backslashes, and they are refused there too
         // rather than read as the literals an unescaped parse would make them.
+        // `\+` and `\?` are in the list because with nothing before them there
+        // is no atom to repeat -- GNU warns "stray \" and takes the literal.
         for pat in ["\\|", "\\(ab\\)", "\\+", "\\?", "\\{2\\}"] {
             bad(pat, false);
         }
-        // Named classes, which a plain parse would silently read as the
-        // punctuation they are spelled with. BOTH spellings: the SINGLE-bracket
-        // typo is the one that turns up, and as a plain class it means
-        // `{:,a,l,p,h}` -- a set that matches, so nothing downstream can tell.
-        bad("[[:alpha:]]", false);
-        bad("[[:digit:]]x", false);
+        // The zero-width assertions and the backreference, which are not a
+        // SET and so cannot be a term: serving them needs the engine.
+        for pat in ["\\bfoo", "foo\\B", "\\<a", "a\\>", "\\`a", "a\\'", "\\1"] {
+            bad(pat, false);
+        }
+        // The equivalence and collating forms, which depend on a locale's
+        // collation table -- reading them as the punctuation they are spelled
+        // with would be a set nobody asked for.
         bad("[[=a=]]", false);
         bad("[[.a.]]", false);
+        // A named class must be SPELLED right to be one: an unknown name is
+        // GNU's "Invalid character class name" and an unterminated `[:` its
+        // "Unmatched [", so neither degenerates into the ordinary set of its
+        // letters.
+        bad("[[:foo:]]", false);
+        bad("[[:space]]", false);
+        bad("[[:", false);
+        bad("[[:space:]", false);
+        bad("[[:space]x]", false);
+        bad("[[:alpha]z]", true);
+        // The terminator check is two conditions, and each needs the spelling
+        // that isolates it -- the ones above are refused whichever half is
+        // present, so they show neither doing work. Both failures have the same
+        // shape: the class of `space` ALONE, with the byte that should have
+        // been diagnosed silently dropped, where GNU reports "Unmatched [".
+        // `[[:space:x]` is the missing `]`: a scan testing only for the closing
+        // colon walks past the `x`.
+        bad("[[:space:x]", false);
+        bad("[[:digit:x]y]", false);
+        // …and `[[:space-]]` is the missing `:`: a scan testing only for the
+        // `]` is happy, because the name stops at a `-` that is followed by
+        // one.
+        bad("[[:space-]]", false);
+        bad("[[:space.]]", false);
+        bad("[[:digit-]]", true);
+        // A named class cannot START a range. GNU calls `[[:digit:]-a]` an
+        // invalid range end, and reading it as the set plus `-` and `a` is a
+        // class that matches MORE than was asked for -- the same argument
+        // `[a-b-c]` is refused on, arriving from the other side.
+        bad("[[:digit:]-a]", false);
+        bad("[[:alpha:]-9]", false);
+        bad("[[:digit:]-[:alpha:]]", false);
+        bad("[[:digit:]-a]", true);
+        // …nor END one, which is the MIRROR case and never reaches the `[:`
+        // scanner at all: the range takes the `[` as its endpoint and what is
+        // left reads as the ordinary letters the class is spelled with, so
+        // `[ -[:digit:]]` silently became the range space-to-`[` plus `:digt`.
+        bad("[ -[:digit:]]", false);
+        bad("[a-[:alpha:]]", false);
+        bad("[ -[:digit:]]", true);
+        // The equivalence and collating forms are refused as range ends too,
+        // and `[a-[.x.]]` is the one spelling here GNU ACCEPTS. Over-refusing
+        // is deliberate and follows from refusing them outright above: there is
+        // no collating symbol for a range to end at.
+        bad("[a-[=x=]]", false);
+        bad("[a-[.x.]]", false);
+        // …but a `-` immediately before the `]` is an ordinary member, so the
+        // byte AFTER the dash is what decides, and these stay served. So does a
+        // `[` that opens no class: it is an ordinary byte, and `[A-[]` is the
+        // range it looks like.
+        for pat in ["[[:digit:]-]", "[-[:digit:]]", "[a[:digit:]-]", "[[:digit:]a]",
+                    "[A-[]", "[!-[]", "[ -[]"] {
+            assert!(Pattern::parse(pat.as_bytes(), false, false).is_some(), "refused {pat:?}");
+        }
+        let bracket = Pattern::parse(b"[A-[]", false, false);
+        assert_eq!(bracket.and_then(|p| p.find_from(b"zQ", 0)), Some((1, 2)), "not the range");
+        let dash = Pattern::parse(b"[[:digit:]-]", false, false);
+        assert_eq!(dash.and_then(|p| p.find_from(b"a-b", 0)), Some((1, 2)), "not the plain dash");
+        // …and the SINGLE-bracket typo stays refused, which is the spelling that
+        // actually turns up. As a plain class it means `{:,a,l,p,h}` -- a set
+        // that matches, so nothing downstream can tell it went wrong.
         bad("[:alpha:]", false);
         bad("[:digit:]", true);
         bad("x[:space:]y", false);
@@ -3386,19 +3646,30 @@ mod tests {
         // `[a:alpha:]` as the ordinary set `{a,:,l,p,h}` and refuses only
         // `[:alpha:]`, so the position is the whole distinction.
         // Each of these is a NEAR MISS that GNU reads as the ordinary set of
-        // the bytes it is spelled with, and every one of the three conditions
-        // the scan tests separates one of them from the typo above: an empty
-        // name (`[::]`), a name that is not all letters (`[:a-b:]`), a `:` that
-        // does not close the class (`[:ab:c]`), and a colon that is not first.
+        // the bytes it is spelled with, and every one of the conditions the
+        // scan tests separates one of them from the typo above: an empty name
+        // (`[::]`), a `-` that makes GNU read a RANGE and diagnose nothing
+        // (`[:-:]`, `[:a-b:]`), a `:` that does not close the class
+        // (`[:ab:c]`), and a colon that is not first.
         for pat in ["[:]", "[a:b]", "[:a]", "[a-z:]", "[a:alpha:]", "[x:digit:]", "[ab:]",
-                    "[::]", "[:a-b:]", "[:ab:c]", "[:a-]", "[:ab]"] {
+                    "[::]", "[:a-b:]", "[:ab:c]", "[:a-]", "[:ab]", "[:-:]", "[:-a:]",
+                    "[:a:x]", "[x:a:]", "[:::]"] {
             assert!(Pattern::parse(pat.as_bytes(), false, false).is_some(), "refused {pat:?}");
         }
         // …and the name need not be a REAL class name for the diagnosis to
-        // fire: GNU refuses `[:x:]` and `[:a1:]` too, so the shape is what is
-        // being recognised, not the vocabulary.
+        // fire, nor even alphanumeric: GNU refuses `[:/:]` and `[: :]` as
+        // readily as `[:x:]`, so the shape is what is recognised. Requiring
+        // letters served the punctuation spellings SILENTLY, which is the one
+        // direction that cannot be noticed downstream.
         bad("[:x:]", false);
         bad("[:a1:]", false);
+        bad("[:/:]", false);
+        bad("[: :]", false);
+        bad("[:_:]", false);
+        bad("[:+:]", false);
+        bad("[:a_b:]", false);
+        bad("[^:/:]", false);
+        bad("[:/:]", true);
         let named = Pattern::parse(b"[a:alpha:]", false, false);
         assert_eq!(named.and_then(|p| p.find_from(b"qla", 0)), Some((1, 2)), "not the plain set");
         let colons = Pattern::parse(b"[::]", false, false);
@@ -3418,8 +3689,11 @@ mod tests {
         bad("^*x", true);
         // GNU escapes are OPERATORS, not literals: `\b` is a word boundary and
         // `\1` a backreference, so literalising them matched `bfoob` for
-        // `\bfoo\b` and missed `foo bar`.
-        for pat in ["\\bfoo\\b", "\\B", "\\w", "\\W", "\\s", "\\S", "\\<foo", "foo\\>", "\\1"] {
+        // `\bfoo\b` and missed `foo bar`. These are the ones that remain
+        // refused, being ZERO-WIDTH or a backreference rather than a set --
+        // `\s` and `\w` moved to the served side, which is the whole line this
+        // list draws.
+        for pat in ["\\bfoo\\b", "\\B", "\\<foo", "foo\\>", "\\`a", "a\\'", "\\1"] {
             bad(pat, false);
             bad(pat, true);
         }

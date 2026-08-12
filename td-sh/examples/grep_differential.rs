@@ -21,9 +21,11 @@
 //! approximated one would report a wrong match and the spec case would be
 //! graded on it.
 //!
-//! A status-2 answer in the sweep is not a mismatch. It is the applet declining
-//! to guess, which is always a correct outcome; it is counted and reported so a
-//! subset that quietly shrank is visible.
+//! A status-2 answer in the SWEEP is a mismatch, not a licensed outcome. Every
+//! pattern the sweeps draw from is inside the served subset, so nothing there
+//! should refuse -- and counting a refusal as success would let a matcher that
+//! refused EVERYTHING report zero disagreements with nothing left to compare.
+//! The shapes that must refuse are REFUSALS, which asserts the opposite.
 
 #![forbid(unsafe_code)]
 
@@ -35,6 +37,21 @@ const PATTERNS: &[&str] = &[
     "foo", "^foo", "foo$", "^$", ".", "a.c", "a*", "aa*", "^a*$", "[0-9]", "[0-9][0-9]", "[^/]",
     "[a-z]", "[A-Z]", "[abc]", "[]]", "[-a]", "[a-]", "z=", "^z", "=$", "x", "^", "$", "b*", ".*",
     "aab", "^aaa$", "[0-9]*", "a[0-9]b", "^[a-z]*$", "\\.", "\\*", "\\C-o", "[a-z0-9]*",
+    // The sets `\s`/`\w` name, and the bracketed classes they are short for.
+    // Both dialects spell these the same way, which is why they are here rather
+    // than in either dialect-only table.
+    "\\s", "\\S", "\\w", "\\W", "[[:space:]]", "[[:alpha:]]", "[[:digit:]]", "[[:alnum:]_]",
+    "[^[:space:]]", "[[:space:][:digit:]]", "[[:upper:]]", "[[:punct:]]", "[[:xdigit:]]",
+    "[[:blank:]]", "[[:print:]]", "[[:graph:]]", "[[:cntrl:]]", "[[:lower:]]", "[x[:digit:]]",
+    "[[:digit:]x]", "^[[:space:]]*$",
+    // …and the near misses of the range rule above, where the `-` really is an
+    // ordinary member because a `]` follows it.
+    "[[:digit:]-]", "[-[:digit:]]", "[a[:digit:]-]",
+    // The typo's own near misses, which GNU READS rather than diagnoses: an
+    // empty name, and the two where a `-` makes it a range instead. They are
+    // the other side of the refusals below, and the boundary is only pinned by
+    // sweeping both.
+    "[::]", "[:-:]", "[:a-b:]", "[:ab:c]", "[x:a:]", "[:a:x]",
 ];
 
 /// …and the ones only an extended expression can express.
@@ -42,7 +59,12 @@ const ERE_ONLY: &[&str] = &["[0-9]+", "a+", "[a-z]+b", "^[0-9]+$", "a?b", "aa?",
 
 /// A BRE reads these as literals where an ERE reads operators, so they belong
 /// to the basic dialect alone.
-const BRE_ONLY: &[&str] = &["a+b", "a?b", "*x", "a{2}", "a|b", "(ab)"];
+const BRE_ONLY: &[&str] = &[
+    "a+b", "a?b", "*x", "a{2}", "a|b", "(ab)",
+    // GNU's two BRE repeat extensions, which an extended expression spells
+    // without the backslash -- `s/ \+/ /g` is the corpus's commonest sed script.
+    "a\\+", " \\+", "x\\?", "[ \\t]\\+", "[0-9]\\+", "^a\\+$", "[[:space:]]\\+",
+];
 
 const INPUTS: &[&str] = &[
     "foo\nbar\nfoobar\n",
@@ -59,6 +81,14 @@ const INPUTS: &[&str] = &[
     "aaaa\n",
     "C-o\nC-s\n",
     "a\nb\nc\na\nb\na\n",
+    // For the classes: the whitespace run `s/ \+/ /g` collapses, a vertical tab
+    // (whitespace to C and not to Rust), the punctuation/underscore boundary
+    // `\w` draws, and control bytes `[[:cntrl:]]` picks out.
+    "a   b\t\tc\n   \n",
+    "a\x0bb\n",
+    "ab_9!\n__\n",
+    "x\x01y\x7f\n",
+    "MiXeD Case 42\n",
 ];
 
 /// Option sets. `-o` crossed with `-A` is here because it was NOT: selection
@@ -96,26 +126,61 @@ const REFUSALS: &[(&str, &str)] = &[
     ("", "\\+"),
     ("", "\\?"),
     ("", "\\{2\\}"),
+    // A repeat OF a repeat, which GNU accepts and this deliberately does not.
+    // The BRE spellings are the ones the two-byte operator makes possible, and
+    // they were the claim in the message with nothing pinning it.
+    ("", "a\\+\\+"),
+    ("", "a\\+*"),
+    ("", "a*\\+"),
+    ("", "x\\?\\?"),
+    ("-E", "a++"),
     // GNU escapes: operators, not literals. `\bfoo\b` matched `bfoob` and
     // missed `foo bar` while these were read as the letters they contain.
     ("", "\\bfoo\\b"),
     ("-E", "\\bfoo\\b"),
     ("", "\\B"),
-    ("", "\\w"),
-    ("", "\\W"),
-    ("", "\\s"),
-    ("", "\\S"),
     ("", "\\<foo"),
     ("", "foo\\>"),
     ("", "\\1"),
     ("-E", "\\1"),
-    // Named classes -- BOTH spellings. The single-bracket typo is the one that
-    // turns up, and as a plain class it silently means `{:,a,l,p,h}`.
-    ("", "[[:alpha:]]"),
+    // The single-bracket typo, which is the spelling that turns up: as a plain
+    // class it silently means `{:,a,l,p,h}`. The BRACKETED form is served now,
+    // so only the typo and the malformed spellings remain here.
     ("", "[:alpha:]"),
     ("-E", "[:digit:]"),
+    // GNU diagnoses the typo by SHAPE, not by whether the name could be a class
+    // -- `[:/:]` and `[: :]` as readily as `[:alpha:]`. Requiring the name to be
+    // alphanumeric served these silently, which is the failure this whole entry
+    // is about.
+    ("", "[:/:]"),
+    ("", "[: :]"),
+    ("", "[:_:]"),
+    ("", "[:a1:]"),
+    ("", "[^:/:]"),
+    ("", "[[:foo:]]"),
+    ("", "[[:space]]"),
+    ("", "[[:space:]"),
+    ("-E", "[[:foo:]]"),
+    // A named class cannot START a range: GNU's "Invalid range end". Reading it
+    // as the set plus `-` plus the endpoint is a class that matches MORE than
+    // was asked for -- found by two reviewers at once, and by neither sweep.
+    ("", "[[:digit:]-a]"),
+    ("-E", "[[:digit:]-a]"),
+    ("", "[[:alpha:]-9]"),
+    ("", "[[:digit:]-[:alpha:]]"),
+    // …nor END one, which is the same error from the other side and reaches the
+    // parser by a different route: the range takes the `[` as its endpoint, so
+    // what is left reads as the ordinary letters the class is spelled with.
+    ("", "[ -[:digit:]]"),
+    ("-E", "[ -[:digit:]]"),
+    ("", "[a-[:alpha:]]"),
     ("", "[[=a=]]"),
     ("", "[[.a.]]"),
+    // A collating symbol as a range end is the one spelling here GNU ACCEPTS.
+    // Refusing it is deliberate and follows from the two entries above: this
+    // matcher serves no collating symbol at all, so there is nothing for a
+    // range to end at.
+    ("", "[a-[.x.]]"),
     // Malformed classes.
     ("", "[abc"),
     ("", "a["),
@@ -146,6 +211,13 @@ struct Ran {
 fn run(bin: &str, args: &[String], input: &str) -> Result<Ran, String> {
     use std::os::unix::process::CommandExt;
     let mut child = Command::new(bin)
+        // The C locale, PINNED rather than inherited. A range is collation
+        // order to GNU and byte order here, so under this machine's
+        // `en_US.utf8` the two agree only where the alphabet happens to be
+        // contiguous -- `[!-[]` matches `A` under C and does not under
+        // en_US.utf8, and every class could differ the same way. Inheriting it
+        // would make the comparison a fact about whoever ran it.
+        .env("LC_ALL", "C")
         // The helper is a MULTICALL: it chooses its applet from `argv[0]`, so
         // invoking it by its own path would reach the "no applet" arm and
         // report 2 for everything -- which this harness would then count as
@@ -192,14 +264,23 @@ impl Rng {
     }
 }
 
+/// The last four COMPOSE a named class with something else inside one bracket,
+/// which is the folding path rather than the class one: a bracket holding only
+/// `[[:digit:]]` is served by a parser that read the class and stopped, and
+/// says nothing about one that has to go on reading after it.
 const ATOMS: &[&str] =
     &["a", "b", "z", "1", "7", "=", "/", ".", "[0-9]", "[a-z]", "[^/]", "[abc]", "[^abc]", "x",
-      "\\.", "-", ":"];
+      "\\.", "-", ":", "\\s", "\\w", "\\S", "\\W", "[[:digit:]]", "[[:alpha:]]",
+      "[^[:space:]]", "[[:punct:]]", "[[:digit:]abc]", "[x[:alpha:]]",
+      "[[:digit:][:punct:]]", "[^[:upper:]0-9]"];
 
 fn generated(rng: &mut Rng, ere: bool) -> String {
+    // A BRE spells the two GNU repeats with a backslash, and they are the ones
+    // whose operator is TWO bytes -- so a generator without them never asks
+    // what the second byte does.
     let reps: &[&str] = match ere {
         true => &["", "", "", "*", "+", "?"],
-        false => &["", "", "", "*"],
+        false => &["", "", "", "*", "\\+", "\\?"],
     };
     let mut pat = String::new();
     for _ in 0..=rng.below(4) {
@@ -219,7 +300,11 @@ fn generated(rng: &mut Rng, ere: bool) -> String {
 }
 
 fn generated_input(rng: &mut Rng) -> String {
-    let alphabet: &[u8] = b"abz017=/x:- ";
+    // `A` so `upper` and the complements are asked about something, and the
+    // VERTICAL TAB because that is where `space` diverges: C's `isspace`
+    // counts it and Rust's `is_ascii_whitespace` does not, so a haystack
+    // without one agrees with the wrong definition.
+    let alphabet: &[u8] = b"abz017=/x:- A\t\x0b";
     let mut out = String::new();
     for _ in 0..rng.below(6) {
         for _ in 0..rng.below(9) {

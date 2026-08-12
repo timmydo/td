@@ -155,6 +155,14 @@ struct Ran {
 fn run(bin: &str, applet: &str, args: &[String], input: &[u8]) -> Result<Ran, String> {
     use std::os::unix::process::CommandExt;
     let mut child = Command::new(bin)
+        // The C locale, PINNED rather than inherited -- but for a WEAKER reason
+        // than the grep differential's, and the difference is worth not
+        // blurring: these applets hold no patterns, so nothing here turns on
+        // collation, and no output compared above is known to vary by locale.
+        // It is pinned so the reference is not a fact about whoever ran it, and
+        // because `od`'s numeric layout is the kind of thing a locale is
+        // entitled to change even where this one does not.
+        .env("LC_ALL", "C")
         // The helper is a MULTICALL and picks its applet from `argv[0]`, so
         // invoking it by its own path would reach the "no applet" arm and
         // report 2 for everything -- which this harness would then count as a
