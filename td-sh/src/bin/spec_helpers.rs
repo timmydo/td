@@ -1,9 +1,9 @@
 //! What the Oils spec corpus expects to find on its PATH, without Python and
 //! without coreutils. A MULTICALL, chosen by `argv[0]`, because that is how the
 //! corpus invokes every one of them -- bare, off the one-entry PATH `run_case`
-//! stages: the two Oils Python helpers (`argv.py`, `printenv.py`) and the four
+//! stages: the two Oils Python helpers (`argv.py`, `printenv.py`) and the
 //! externals the corpus reaches for most that need no pattern engine (`cat`,
-//! `mkdir`, `touch`, `rm`).
+//! `mkdir`, `touch`, `rm`, `wc`, `sleep`, `seq`, `chmod`).
 //!
 //! The externals serve only the flags the corpus actually uses, counted rather
 //! than guessed, and REFUSE everything else loudly with status 2 -- a coreutils
@@ -469,6 +469,384 @@ fn rm(args: &[std::ffi::OsString], root: Option<&std::path::Path>) -> Done {
     Done { out: Vec::new(), err, status }
 }
 
+/// The three counts `wc` reports, tallied as the bytes arrive rather than over a
+/// buffer: the input may be a device, and counting is the one thing here that
+/// must read all of it.
+#[derive(Default)]
+struct Counts {
+    lines: u64,
+    words: u64,
+    bytes: u64,
+    in_word: bool,
+}
+
+impl Counts {
+    fn take(&mut self, chunk: &[u8]) {
+        self.bytes = self.bytes.saturating_add(chunk.len() as u64);
+        for b in chunk {
+            if *b == b'\n' {
+                self.lines = self.lines.saturating_add(1);
+            }
+            // A word ENDS at whitespace, so it is counted where it begins --
+            // which is what makes a word split across two chunks one word.
+            // Rust's `is_ascii_whitespace` is NOT C's `isspace`: it omits the
+            // vertical tab, which GNU wc splits on, so that one is spelled out.
+            match b.is_ascii_whitespace() || *b == 0x0b {
+                true => self.in_word = false,
+                false => {
+                    if !self.in_word {
+                        self.words = self.words.saturating_add(1);
+                    }
+                    self.in_word = true;
+                }
+            }
+        }
+    }
+
+    fn tally<R: std::io::Read>(mut src: R) -> std::io::Result<Self> {
+        let mut counts = Counts::default();
+        let mut chunk = [0u8; 16 * 1024];
+        loop {
+            match src.read(&mut chunk) {
+                Ok(0) => return Ok(counts),
+                Ok(n) => counts.take(chunk.get(..n).unwrap_or_default()),
+                Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(e),
+            }
+        }
+    }
+}
+
+/// `wc [-l] [-w] [-c|--bytes]`. 35 of its uses pass `-l`, 13 ask for bytes (as
+/// `--bytes` or `-c`), one `-w`, and the rest are bare -- which is all three
+/// counts in the order lines, words, bytes.
+///
+/// The FORMAT is what a golden actually compares, and this DIVERGES from GNU in
+/// a way worth stating exactly. GNU pads to a column whenever more than one
+/// count is selected: to the width of the input's size for a regular file, and
+/// to 7 otherwise -- so `printf 'a bb\nccc\n' | wc` gives `      2       3
+///       9` where a redirect of the same bytes gives `2 3 9`. One count is
+/// never padded. This always emits single spaces, which agrees with GNU for
+/// every one-field use and for a small regular file, and differs for a bare
+/// `wc` on a pipe. No corpus case grades that shape: the only two bare uses are
+/// an alias invoked as `WC -l` (one field) and a `wc FILE` in a case that reads
+/// the repo tree and is statically skipped. Padding it properly needs the size
+/// of stdin, so it waits for a case that wants it.
+///
+/// One named file appends the name; several would need GNU's column-and-`total`
+/// layout and are refused rather than guessed at.
+/// The single corpus case passing two files (`builtin-process`, `ulimit --all`)
+/// opens with `case $SH in bash|dash|mksh|zsh) exit ;; esac`, so under the
+/// ash/dash chain it exits before reaching the `wc` -- nothing grades that
+/// format, and guessing GNU's column rule would be inventing an answer.
+fn wc(args: &[std::ffi::OsString]) -> Done {
+    let (opts, files) = split_options(args);
+    let (mut lines, mut words, mut bytes) = (false, false, false);
+    for opt in &opts {
+        // A LONG option is one word, not a cluster of letters: `--bytes` is not
+        // `-b -y -t -e -s`.
+        match opt.as_bytes() {
+            b"--lines" => lines = true,
+            b"--words" => words = true,
+            b"--bytes" | b"--chars" => bytes = true,
+            other if other.starts_with(b"--") => return unsupported("wc", opt),
+            _ => {
+                for flag in flags(opt) {
+                    match flag {
+                        b'l' => lines = true,
+                        b'w' => words = true,
+                        b'c' | b'm' => bytes = true,
+                        _ => return unsupported("wc", opt),
+                    }
+                }
+            }
+        }
+    }
+    // No selection is all three, in this order.
+    if !(lines || words || bytes) {
+        (lines, words, bytes) = (true, true, true);
+    }
+    if files.len() > 1 {
+        return unsupported("wc", files.get(1).copied().unwrap_or_default());
+    }
+    // No operand is stdin, and `-` names it too -- the same rule `cat` follows,
+    // and POSIX's.
+    let counted = match files.first() {
+        Some(name) if name.as_bytes() != b"-" => std::fs::File::open(name).and_then(Counts::tally),
+        _ => Counts::tally(std::io::stdin().lock()),
+    };
+    let counts = match counted {
+        Ok(c) => c,
+        Err(e) => {
+            let what = files.first().map(|f| std::path::Path::new(f).display().to_string());
+            let what = what.unwrap_or_else(|| "-".to_string());
+            return Done {
+                out: Vec::new(),
+                err: format!("wc: {what}: {e}\n").into_bytes(),
+                status: 1,
+            };
+        }
+    };
+    let mut fields: Vec<String> = Vec::new();
+    for (wanted, n) in [(lines, counts.lines), (words, counts.words), (bytes, counts.bytes)] {
+        if wanted {
+            fields.push(n.to_string());
+        }
+    }
+    let mut line = fields.join(" ");
+    if let Some(name) = files.first() {
+        line.push(' ');
+        line.push_str(&String::from_utf8_lossy(name.as_bytes()));
+    }
+    line.push('\n');
+    Done::ok(line.into_bytes())
+}
+
+/// `sleep`. Every one of its 69 uses is a bare duration and 66 are fractional
+/// (`0.1`, `0.01`), which is why this parses seconds as a float rather than the
+/// integer POSIX requires -- the corpus is written for GNU's.
+fn sleep(args: &[std::ffi::OsString]) -> Done {
+    let (opts, operands) = split_options(args);
+    if let Some(bad) = opts.first() {
+        return unsupported("sleep", bad);
+    }
+    let mut total = std::time::Duration::ZERO;
+    if operands.is_empty() {
+        return Done {
+            out: Vec::new(),
+            err: b"sleep: missing operand\n".to_vec(),
+            status: 1,
+        };
+    }
+    for operand in &operands {
+        let text = String::from_utf8_lossy(operand.as_bytes()).into_owned();
+        // A suffix (`1s`, `2m`) is GNU's and nothing in the corpus uses one, so
+        // it is refused rather than silently read as its leading number.
+        // `try_from_secs_f64` is the ONLY range check: it already rejects a
+        // negative, a NaN and an infinity, so a guard in front of it would be
+        // an arm nothing reaches. The test asserts all three through here.
+        let refused = text
+            .parse::<f64>()
+            .ok()
+            .and_then(|secs| std::time::Duration::try_from_secs_f64(secs).ok());
+        match refused {
+            Some(d) => total = total.saturating_add(d),
+            None => return unsupported("sleep", operand),
+        }
+    }
+    std::thread::sleep(total);
+    Done::ok(Vec::new())
+}
+
+/// `seq LAST`, `seq FIRST LAST`, `seq FIRST INCREMENT LAST` — one integer per
+/// line. The corpus uses only the first two forms; the third is the same loop
+/// and refusing it would be arbitrary.
+fn seq(args: &[std::ffi::OsString]) -> Done {
+    let (opts, operands) = split_options(args);
+    if let Some(bad) = opts.first() {
+        return unsupported("seq", bad);
+    }
+    let mut nums = Vec::new();
+    for operand in &operands {
+        match String::from_utf8_lossy(operand.as_bytes()).parse::<i64>() {
+            Ok(n) => nums.push(n),
+            // Floats are GNU's and nothing here uses one; refusing beats
+            // truncating to an integer nobody asked for.
+            Err(_) => return unsupported("seq", operand),
+        }
+    }
+    let (first, incr, last) = match nums.as_slice() {
+        [last] => (1, 1, *last),
+        [first, last] => (*first, 1, *last),
+        [first, incr, last] => (*first, *incr, *last),
+        // Named apart, because a diagnostic is read by whoever is debugging a
+        // case and "missing" for four operands sends them the wrong way.
+        [] => {
+            return Done {
+                out: Vec::new(),
+                err: b"seq: missing operand\n".to_vec(),
+                status: 1,
+            }
+        }
+        _ => {
+            return Done {
+                out: Vec::new(),
+                err: b"seq: extra operand\n".to_vec(),
+                status: 1,
+            }
+        }
+    };
+    if incr == 0 {
+        return Done {
+            out: Vec::new(),
+            err: b"seq: increment must not be zero\n".to_vec(),
+            status: 1,
+        };
+    }
+    let mut out = Vec::new();
+    let mut n = first;
+    // An empty range prints NOTHING and succeeds, which `seq 0` relies on.
+    while (incr > 0 && n <= last) || (incr < 0 && n >= last) {
+        out.extend_from_slice(format!("{n}\n").as_bytes());
+        match n.checked_add(incr) {
+            Some(next) => n = next,
+            None => break,
+        }
+    }
+    Done::ok(out)
+}
+
+/// A `chmod` mode: octal, or one symbolic clause.
+///
+/// Parsing is SEPARATE from applying because whether a mode parses does not
+/// depend on the file: one parse answers for every operand, and the apply that
+/// follows cannot fail. Checking inside the per-file loop instead leaves an arm
+/// no input reaches, which is an arm no test can pin.
+enum ModeChange {
+    Octal(u32),
+    /// `op` is one of `+-=`, which is how `parse` finds the clause at all.
+    Symbolic { op: u8, mask: u32, perms: u32 },
+}
+
+impl ModeChange {
+    /// Only the shapes the corpus uses are served -- 34 `+x`, one `-w`, one
+    /// `-r` -- plus octal, which is the same arithmetic. A `who` prefix is
+    /// honoured where given; without one the change applies to all three, which
+    /// is what `chmod +x` means to every case here. GNU excludes the umask for a
+    /// bare `+`, and this deliberately does not: a test that chmods a file wants
+    /// it executable, not executable-unless-the-umask-said-otherwise, and the
+    /// corpus never sets one first.
+    fn parse(mode: &str) -> Option<Self> {
+        // Digits FIRST: `from_str_radix` accepts a leading sign, so it would
+        // read `+7` as a number and never reach the symbolic parse below.
+        if !mode.is_empty() && mode.bytes().all(|b| b.is_ascii_digit()) {
+            return u32::from_str_radix(mode, 8)
+                .ok()
+                .map(|octal| Self::Octal(octal & 0o7777));
+        }
+        let at = mode.find(['+', '-', '='])?;
+        let (who, rest) = (mode.get(..at)?, mode.get(at..)?);
+        // Each `who` carries its SPECIAL bit as well as its rwx triple, which
+        // is what makes `u+s` setuid and `g+s` setgid from one perm letter.
+        let mut mask = 0u32;
+        for w in who.bytes() {
+            mask |= match w {
+                b'u' => 0o4700,
+                b'g' => 0o2070,
+                b'o' => 0o1007,
+                b'a' => 0o7777,
+                _ => return None,
+            };
+        }
+        if mask == 0 {
+            mask = 0o7777;
+        }
+        let op = rest.bytes().next()?;
+        let mut perms = 0u32;
+        for p in rest.get(1..)?.bytes() {
+            perms |= match p {
+                b'r' => 0o444,
+                b'w' => 0o222,
+                b'x' => 0o111,
+                // Both set-id bits; the `who` mask above is what picks one.
+                b's' => 0o6000,
+                b't' => 0o1000,
+                _ => return None,
+            };
+        }
+        Some(Self::Symbolic { op, mask, perms })
+    }
+
+    /// The new permission bits for a file currently at `current`.
+    fn apply(&self, current: u32) -> u32 {
+        let (op, mask, perms) = match *self {
+            Self::Octal(bits) => return bits,
+            Self::Symbolic { op, mask, perms } => (op, mask, perms),
+        };
+        let bits = perms & mask;
+        match op {
+            b'+' => current | bits,
+            b'-' => current & !bits,
+            // `parse` finds the clause BY this byte, so `=` is the only other.
+            _ => (current & !mask) | bits,
+        }
+    }
+}
+
+/// `chmod MODE FILE...`.
+///
+/// The mode is argv[1] POSITIONALLY and is NOT put through `split_options`: two
+/// of its corpus uses are `chmod -w` and `chmod -r`, which that would read as
+/// option words and refuse. Every other applet here can split first; this one
+/// cannot, and that is the whole reason it parses its own arguments.
+///
+/// Operands are confined exactly as `rm`'s are, and for a sharper reason than
+/// tidiness: the staged applets are SIBLINGS of the case workdir, so `chmod 000
+/// ../bin/cat` would leave every later case in the run unable to execute any of
+/// them. Same shape as the `rm -rf $TMP/x` argument -- the shell under test is
+/// the thing that gets a path wrong -- but a mode change needs no `-r` to do it.
+fn chmod(args: &[std::ffi::OsString], root: Option<&std::path::Path>) -> Done {
+    // A leading `--` is still honoured, since POSIX spells a mode that looks
+    // like an option that way: `chmod -- -w f`. It is the ONE option word this
+    // reads, and it is stepped over rather than parsed.
+    let args = match args.first().map(|a| a.as_bytes() == b"--") {
+        Some(true) => args.get(1..).unwrap_or_default(),
+        _ => args,
+    };
+    let Some(mode) = args.first() else {
+        return Done {
+            out: Vec::new(),
+            err: b"chmod: missing operand\n".to_vec(),
+            status: 1,
+        };
+    };
+    let mode_text = String::from_utf8_lossy(mode.as_bytes()).into_owned();
+    let files = args.get(1..).unwrap_or_default();
+    if files.is_empty() {
+        return Done {
+            out: Vec::new(),
+            err: b"chmod: missing file operand\n".to_vec(),
+            status: 1,
+        };
+    }
+    // The MODE is parsed once, before any file is touched, and a bad one is
+    // REFUSED rather than reported as a filesystem error. It is not one: a
+    // status 1 here reads as the operation having failed, which grades as the
+    // shell doing something wrong instead of this rig lacking a mode.
+    let Some(change) = ModeChange::parse(&mode_text) else {
+        return unsupported("chmod", mode);
+    };
+    let mut err = Vec::new();
+    let mut status = 0;
+    for file in files {
+        let path = std::path::Path::new(file);
+        if !root.is_some_and(|r| inside(r, path)) {
+            err.extend_from_slice(
+                format!(
+                    "spec_helpers: chmod: refusing to change mode outside the case workdir: {}\n",
+                    path.display()
+                )
+                .as_bytes(),
+            );
+            status = status.max(2);
+            continue;
+        }
+        // Read, change, write: a symbolic clause is relative to what is there.
+        // `metadata` FOLLOWS a symlink, as GNU chmod does without `-h`, and the
+        // mask keeps `st_mode`'s file-type bits out of the permissions word.
+        let changed = std::fs::metadata(path).and_then(|meta| {
+            use std::os::unix::fs::PermissionsExt;
+            let bits = change.apply(meta.permissions().mode() & 0o7777);
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(bits))
+        });
+        if let Err(e) = changed {
+            err.extend_from_slice(format!("chmod: {}: {e}\n", path.display()).as_bytes());
+            status = status.max(1);
+        }
+    }
+    Done { out: Vec::new(), err, status }
+}
+
 /// What an applet produced. The two Oils helpers only ever needed stdout, but a
 /// real external is graded on its STATUS as much as its output, and reports its
 /// own errors -- so all three travel together and every applet stays a pure
@@ -537,6 +915,10 @@ fn main() {
         b"mkdir" => mkdir(&rest),
         b"touch" => touch(&rest),
         b"rm" => rm(&rest, workspace().as_deref()),
+        b"wc" => wc(&rest),
+        b"sleep" => sleep(&rest),
+        b"seq" => seq(&rest),
+        b"chmod" => chmod(&rest, workspace().as_deref()),
         other => {
             // Named as something this does not serve: say so rather than print
             // a plausible answer, which would grade as a shell result.
@@ -871,6 +1253,299 @@ mod tests {
         assert_eq!(finish(&mut BrokenFlush, &failed), 1);
         // An intact writer is the applet's own status, untouched.
         assert_eq!(finish(&mut Vec::new(), &Done::ok(b"out".to_vec())), 0);
+    }
+
+    /// The three counts, and the FORMAT, which is what a golden compares: a
+    /// stream carries no name, one named file does.
+    #[test]
+    fn wc_counts_and_formats_as_the_goldens_expect() {
+        let dir = Dir::new("wc");
+        std::fs::write(dir.0.join("f"), b"a bb\nccc\n").unwrap();
+        let out = |d: Done| String::from_utf8_lossy(&d.out).into_owned();
+        // Bare is lines, words, bytes IN THAT ORDER.
+        assert_eq!(out(wc(&[dir.at("f")])), format!("2 3 9 {}\n", dir.0.join("f").display()));
+        assert_eq!(out(wc(&[os("-l"), dir.at("f")])), format!("2 {}\n", dir.0.join("f").display()));
+        assert_eq!(out(wc(&[os("-w"), dir.at("f")])), format!("3 {}\n", dir.0.join("f").display()));
+        // `-c` and `--bytes` are the same question, and a long option is ONE
+        // word rather than a cluster of letters.
+        assert_eq!(out(wc(&[os("-c"), dir.at("f")])), format!("9 {}\n", dir.0.join("f").display()));
+        assert_eq!(
+            out(wc(&[os("--bytes"), dir.at("f")])),
+            format!("9 {}\n", dir.0.join("f").display())
+        );
+        // Selected counts keep the same order regardless of flag order.
+        assert_eq!(
+            out(wc(&[os("-c"), os("-l"), dir.at("f")])),
+            format!("2 9 {}\n", dir.0.join("f").display())
+        );
+        // `-m`/`--chars` count CHARACTERS to GNU and bytes here, which is the
+        // same answer for the ASCII the corpus counts and a divergence for
+        // anything else. Pinned so it is a decision rather than an accident.
+        assert_eq!(out(wc(&[os("-m"), dir.at("f")])), format!("9 {}\n", dir.0.join("f").display()));
+        assert_eq!(
+            out(wc(&[os("--chars"), dir.at("f")])),
+            format!("9 {}\n", dir.0.join("f").display())
+        );
+        // Two operands would need GNU's column format, which nothing grades.
+        assert_eq!(wc(&[dir.at("f"), dir.at("f")]).status, 2);
+        assert_eq!(wc(&[os("--total"), dir.at("f")]).status, 2);
+        // A missing file is 1 and a diagnostic, never a count.
+        let done = wc(&[dir.at("nope")]);
+        assert_eq!(done.status, 1);
+        assert!(!done.err.is_empty());
+        // `-` is stdin rather than a file of that name, and is exercised in
+        // `conformance.rs` instead: reading stdin from a unit test would
+        // inherit whatever `cargo test` was given, and block on a terminal.
+    }
+
+    /// A word split across two reads is ONE word. The counter carries state
+    /// between chunks for this, and a 16 KiB input is where it would show.
+    #[test]
+    fn a_word_spanning_two_reads_is_counted_once() {
+        let mut counts = Counts::default();
+        counts.take(b"one tw");
+        counts.take(b"o three\n");
+        assert_eq!((counts.lines, counts.words, counts.bytes), (1, 3, 14));
+        // Leading and trailing whitespace start no word, and a line without a
+        // newline is not a line -- both as GNU counts them.
+        let mut counts = Counts::default();
+        counts.take(b"  a  b  ");
+        assert_eq!((counts.lines, counts.words, counts.bytes), (0, 2, 8));
+        // C's `isspace` splits on the vertical tab and Rust's
+        // `is_ascii_whitespace` does not, so GNU would read `a\x0bb` as two
+        // words where the stock predicate reads one.
+        let mut counts = Counts::default();
+        counts.take(b"a\x0bb\x0cc\td\re\nf g");
+        assert_eq!((counts.lines, counts.words, counts.bytes), (1, 7, 13));
+    }
+
+    /// `tally` must RETRY an interrupted read and propagate any other error.
+    /// A signal arriving mid-count is not a short file, and treating `read`'s
+    /// EINTR as end-of-input would give a count that is quietly too small.
+    #[test]
+    fn a_tally_retries_an_interrupted_read() {
+        /// Yields a chunk, an EINTR, another chunk, then whatever `last` says.
+        struct Flaky {
+            step: usize,
+            last: Option<std::io::ErrorKind>,
+        }
+        impl std::io::Read for Flaky {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                self.step += 1;
+                let bytes: &[u8] = match self.step {
+                    1 => b"one tw",
+                    2 => return Err(std::io::Error::from(std::io::ErrorKind::Interrupted)),
+                    3 => b"o three\n",
+                    _ => match self.last {
+                        Some(kind) => return Err(std::io::Error::from(kind)),
+                        None => b"",
+                    },
+                };
+                let room = buf.get_mut(..bytes.len()).ok_or(std::io::ErrorKind::Other)?;
+                room.copy_from_slice(bytes);
+                Ok(bytes.len())
+            }
+        }
+        let counts = Counts::tally(Flaky { step: 0, last: None }).unwrap();
+        assert_eq!((counts.lines, counts.words, counts.bytes), (1, 3, 14));
+        // The interrupt is retried; anything else is reported rather than read
+        // as an end of file, which would print a count for a failed read.
+        let err = Counts::tally(Flaky { step: 0, last: Some(std::io::ErrorKind::PermissionDenied) });
+        assert_eq!(err.map(|c| c.bytes).map_err(|e| e.kind()), Err(std::io::ErrorKind::PermissionDenied));
+    }
+
+    #[test]
+    fn seq_counts_from_one_or_from_where_it_is_told() {
+        let out = |d: Done| String::from_utf8_lossy(&d.out).into_owned();
+        assert_eq!(out(seq(&[os("3")])), "1\n2\n3\n");
+        assert_eq!(out(seq(&[os("2"), os("4")])), "2\n3\n4\n");
+        assert_eq!(out(seq(&[os("1"), os("2"), os("5")])), "1\n3\n5\n");
+        // An empty range prints nothing and SUCCEEDS, which `seq 0` relies on.
+        assert_eq!(out(seq(&[os("0")])), "");
+        assert_eq!(seq(&[os("0")]).status, 0);
+        assert_eq!(out(seq(&[os("3"), os("1")])), "");
+        // Counting down needs the step to say so.
+        assert_eq!(out(seq(&[os("3"), os("-1"), os("1")])), "3\n2\n1\n");
+        // A zero step is an endless loop, not a sequence.
+        assert_eq!(seq(&[os("1"), os("0"), os("5")]).status, 1);
+        // Too FEW and too many are both errors, and say which: a diagnostic is
+        // read by whoever is debugging a case.
+        let done = seq(&[]);
+        assert_eq!(done.status, 1);
+        assert!(String::from_utf8_lossy(&done.err).contains("missing"));
+        let done = seq(&[os("1"), os("2"), os("3"), os("4")]);
+        assert_eq!(done.status, 1);
+        assert!(String::from_utf8_lossy(&done.err).contains("extra"));
+        // A float is GNU's; refusing beats truncating to something nobody asked
+        // for.
+        assert_eq!(seq(&[os("1.5")]).status, 2);
+    }
+
+    /// `sleep` must take a FRACTION -- every corpus use is one -- and an
+    /// integer-only parse would sleep zero and look like it had worked.
+    #[test]
+    fn sleep_takes_a_fraction_and_refuses_a_suffix() {
+        let start = std::time::Instant::now();
+        assert_eq!(sleep(&[os("0.05")]).status, 0);
+        assert!(start.elapsed() >= std::time::Duration::from_millis(45), "did not sleep");
+        assert!(start.elapsed() < std::time::Duration::from_secs(5), "slept far too long");
+        // A suffix is GNU's, and reading `1s` as its leading number would sleep
+        // a second where the case asked for something else entirely.
+        assert_eq!(sleep(&[os("1s")]).status, 2);
+        assert_eq!(sleep(&[os("nan")]).status, 2);
+        assert_eq!(sleep(&[]).status, 1);
+        // A negative duration has to arrive PAST `--` to be a duration at all --
+        // bare, `-1` is an option word and is refused as one, which is a
+        // different arm and would leave this one pinned by nothing.
+        assert_eq!(sleep(&[os("-1")]).status, 2, "not refused as an option");
+        assert_eq!(sleep(&[os("--"), os("-1")]).status, 2, "a negative duration was taken");
+        // The two remaining shapes `try_from_secs_f64` is the sole check for.
+        assert_eq!(sleep(&[os("inf")]).status, 2);
+        assert_eq!(sleep(&[os("--"), os("-inf")]).status, 2);
+        // Operands SUM, as GNU's does. Taking only the first would sleep 0.01s
+        // here, which is inside the tolerance of every timing assertion above.
+        let start = std::time::Instant::now();
+        assert_eq!(sleep(&[os("0.01"), os("0.05")]).status, 0);
+        assert!(start.elapsed() >= std::time::Duration::from_millis(55), "operands did not sum");
+        // One bad operand refuses the whole call rather than sleeping the rest.
+        let start = std::time::Instant::now();
+        assert_eq!(sleep(&[os("0.01"), os("1s")]).status, 2);
+        assert!(start.elapsed() < std::time::Duration::from_secs(1));
+    }
+
+    /// Parse-then-apply in one step, which is how every assertion below reads
+    /// the mode arithmetic. The applet itself parses ONCE and applies per file.
+    fn chmod_bits(mode: &str, current: u32) -> Option<u32> {
+        ModeChange::parse(mode).map(|change| change.apply(current))
+    }
+
+    /// The mode arithmetic, which is the whole of `chmod`.
+    #[test]
+    fn chmod_modes_are_relative_to_what_is_there() {
+        // The corpus's three: `+x`, `-w`, `-r`.
+        assert_eq!(chmod_bits("+x", 0o644), Some(0o755));
+        assert_eq!(chmod_bits("-w", 0o644), Some(0o444));
+        assert_eq!(chmod_bits("-r", 0o644), Some(0o200));
+        // A `who` applies the change to that class alone.
+        assert_eq!(chmod_bits("u+x", 0o644), Some(0o744));
+        assert_eq!(chmod_bits("go-r", 0o644), Some(0o600));
+        // `=` REPLACES its class rather than adding to it.
+        assert_eq!(chmod_bits("u=r", 0o777), Some(0o477));
+        // Octal is absolute.
+        assert_eq!(chmod_bits("755", 0o600), Some(0o755));
+        assert_eq!(chmod_bits("0644", 0o777), Some(0o644));
+        // The set-id and sticky bits: one perm letter, and the `who` is what
+        // decides WHICH of the two `s` means.
+        assert_eq!(chmod_bits("u+s", 0o644), Some(0o4644));
+        assert_eq!(chmod_bits("g+s", 0o644), Some(0o2644));
+        assert_eq!(chmod_bits("+s", 0o644), Some(0o6644));
+        assert_eq!(chmod_bits("+t", 0o644), Some(0o1644));
+        assert_eq!(chmod_bits("u-s", 0o4644), Some(0o644));
+        // Anything else is refused rather than guessed.
+        assert_eq!(chmod_bits("+X", 0o644), None);
+        assert_eq!(chmod_bits("q+x", 0o644), None);
+        assert_eq!(chmod_bits("rwx", 0o644), None);
+        assert_eq!(chmod_bits("", 0o644), None);
+        // Octal that is not octal, and one that will not fit.
+        assert_eq!(chmod_bits("8", 0o644), None);
+        assert_eq!(chmod_bits("99999999999", 0o644), None);
+        // Digits-first, pinned directly: `from_str_radix` takes a leading sign,
+        // so parsing octal before this check reads `+7` as the number seven.
+        assert_eq!(chmod_bits("+7", 0o644), None);
+        assert_eq!(chmod_bits("-7", 0o644), None);
+    }
+
+    #[test]
+    fn chmod_applies_the_mode_and_reads_its_own_argv() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = Dir::new("chmod");
+        let f = dir.0.join("f");
+        std::fs::write(&f, b"x").unwrap();
+        std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let root = Some(dir.0.as_path());
+        let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(chmod(&[os("+x"), f.clone().into_os_string()], root).status, 0);
+        assert_eq!(mode(&f), 0o755);
+        // `-w` is a MODE, not an option word. Splitting options first would
+        // refuse it, which is why this applet parses its own arguments.
+        assert_eq!(chmod(&[os("-w"), f.clone().into_os_string()], root).status, 0);
+        assert_eq!(mode(&f), 0o555);
+        // Several operands, each read from its OWN current mode: one parse
+        // applied to two files that start differently must land differently.
+        let g = dir.0.join("g");
+        std::fs::write(&g, b"x").unwrap();
+        std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::fs::set_permissions(&g, std::fs::Permissions::from_mode(0o640)).unwrap();
+        let both = [os("+x"), f.clone().into_os_string(), g.clone().into_os_string()];
+        assert_eq!(chmod(&both, root).status, 0);
+        assert_eq!((mode(&f), mode(&g)), (0o711, 0o751));
+        // A symlink is FOLLOWED, as GNU chmod is without `-h`: the mode lands
+        // on the target, and `symlink_metadata` here would read the link's own
+        // 0o777 and write that to the file instead.
+        let link = dir.0.join("l");
+        std::os::unix::fs::symlink(&g, &link).unwrap();
+        std::fs::set_permissions(&g, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(chmod(&[os("g+r"), link.into_os_string()], root).status, 0);
+        assert_eq!(mode(&g), 0o640, "the mode did not follow to the target");
+        // A missing file reports rather than passing quietly.
+        let done = chmod(&[os("+x"), dir.at("nope")], root);
+        assert_eq!(done.status, 1);
+        assert!(!done.err.is_empty());
+        // A mode this does not serve is REFUSED (2), not reported as a
+        // filesystem failure (1) — which would grade as the shell's fault. It
+        // is decided before any file is touched, so a missing file cannot mask
+        // it either.
+        let done = chmod(&[os("+X"), f.clone().into_os_string()], root);
+        assert_eq!(done.status, 2, "an unsupported mode came back as an error");
+        assert!(String::from_utf8_lossy(&done.err).contains("unsupported"));
+        assert_eq!(chmod(&[os("+X"), dir.at("nope")], root).status, 2);
+        assert_eq!(chmod(&[], root).status, 1);
+        assert_eq!(chmod(&[os("+x")], root).status, 1);
+        // POSIX's way of spelling a mode that looks like an option. Reading
+        // `--` AS the mode would fail with "unsupported mode".
+        std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(chmod(&[os("--"), os("-w"), f.clone().into_os_string()], root).status, 0);
+        assert_eq!(mode(&f), 0o444);
+    }
+
+    /// `chmod`'s confinement. The staged applets are SIBLINGS of the case
+    /// workdir, so an unconfined `chmod 000 ../bin/cat` would leave every later
+    /// case in the run unable to run any of them -- a failure that would look
+    /// like the shell losing its PATH.
+    #[test]
+    fn chmod_refuses_to_leave_the_case_workdir() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = Dir::new("chmod-escape");
+        let root = Some(dir.0.as_path());
+        let out = Dir::new("chmod-escape-outside");
+        let victim = out.0.join("cat");
+        std::fs::write(&victim, b"x").unwrap();
+        std::fs::set_permissions(&victim, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let name = out.0.file_name().unwrap_or_default().to_string_lossy().into_owned();
+        std::fs::create_dir_all(dir.0.join("sub")).unwrap();
+        for escape in [
+            victim.clone().into_os_string(),
+            dir.0.join(format!("../{name}/cat")).into_os_string(),
+            dir.0.join(format!("sub/../../{name}/cat")).into_os_string(),
+            std::ffi::OsString::from("/"),
+            dir.0.join("..").into_os_string(),
+        ] {
+            let done = chmod(&[os("000"), escape.clone()], root);
+            assert_eq!(done.status, 2, "not refused: {escape:?}");
+            assert!(
+                String::from_utf8_lossy(&done.err).contains("refusing"),
+                "silent refusal for {escape:?}"
+            );
+        }
+        let left = std::fs::metadata(&victim).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(left, 0o755, "a mode was changed outside the workdir");
+        // With no root known at all, nothing is changed: the applet fails shut.
+        assert_eq!(chmod(&[os("000"), victim.clone().into_os_string()], None).status, 2);
+        // And the confinement does not cost the ordinary case.
+        let ok = dir.0.join("f");
+        std::fs::write(&ok, b"x").unwrap();
+        assert_eq!(chmod(&[os("600"), ok.clone().into_os_string()], root).status, 0);
+        assert_eq!(std::fs::metadata(&ok).unwrap().permissions().mode() & 0o7777, 0o600);
     }
 
     /// All three states the goldens distinguish, including the two a shell can

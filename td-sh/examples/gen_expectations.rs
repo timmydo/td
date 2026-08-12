@@ -13,14 +13,14 @@
 //! It runs every case in <spec-dir> through the built td-sh under the SAME isolated
 //! `-c` harness the gate uses (`td_sh::run_case`), and buckets each case:
 //!   skip  -> BEFORE running, if its comment-stripped code reads the repo tree (see
-//!            `reads_repo_tree`) or depends on shared `/tmp` state (see
-//!            `depends_on_shared_tmp`): the isolated cwd stages neither, so any
+//!            `reads_repo_tree`), depends on shared `/tmp` state (see
+//!            `depends_on_shared_tmp`), or measures the shell's syscalls (see
+//!            `measures_syscalls`): the isolated cwd stages none of them, so any
 //!            verdict is a probable false-green. Decided from the code alone, so
 //!            running it first would only leave the shared state behind.
+//!   skip  -> AFTER running, if it timed out or hit the capture cap (the typed
+//!            `CaseOutcome::timed_out`/`truncated`): it cannot be evaluated here.
 //!   pass  -> unlisted.
-//!   skip  -> cannot be evaluated faithfully here (times out per the typed
-//!            `CaseOutcome::timed_out`, or is repo-tree/fixture bound, or turns on
-//!            shared `/tmp` state the harness does not control).
 //!   xfail -> any other genuine wrong-answer failure (includes status-127
 //!            missing-external failures under the cleared-env harness).
 //! Keys are occurrence-qualified via `td_sh::case_keys`, so a description repeated
@@ -71,12 +71,12 @@ const HEADER: &str = "\
 #           status-127 `command not found` failures, because the cleared-env `-c`
 #           harness exposes no external PATH beyond the shell itself and the
 #           `spec_helpers` applets (the Oils `argv.py`/`printenv.py`, and `cat`,
-#           `mkdir`, `touch`, `rm`). Those are real mismatches today, but MEASURE
-#           before mining the list, because `not found` is reported identically
-#           for two different things. Some of those names are
-#           BUILTINS td-sh does not have (`shopt`, `typeset`, `declare`,
+#           `mkdir`, `touch`, `rm`, `wc`, `sleep`, `seq`, `chmod`). Those are real
+#           mismatches today, but MEASURE before mining the list, because `not
+#           found` is reported identically for two different things. Some of those
+#           names are BUILTINS td-sh does not have (`shopt`, `typeset`, `declare`,
 #           `compgen`) and are true shell gaps; the rest are EXTERNALS the harness
-#           still withholds (`grep`, `sed`, `wc`, `od`, `seq`) and say
+#           still withholds (`grep`, `sed`, `od`, `sort`, `tail`) and say
 #           nothing about the shell. Both groups are large and neither dominates.
 #           No counts are given here on purpose: this file is regenerated wholesale,
 #           so a number in it would silently describe some earlier tree.
@@ -108,12 +108,20 @@ const HEADER: &str = "\
 #               rest would. Fifteen MOVE here; the sixteenth (`builtin-dirs::cd
 #               replaces the lowest entry`) was already skipped by (b), whose
 #               `spec/` token its `/tmp/oils-spec/` path contains.
-#               (b) and (c) are decided from the CODE and so are applied BEFORE the
-#               case is run at all. That was cosmetic while the staging commands
-#               were missing; with `mkdir` and `touch` staged, running one of these
-#               first would CREATE the shared path it is being skipped for.
 #               Bare `/tmp` is deliberately NOT a shape: ten cases need only that it
 #               EXIST, which is universal, and one names the relative `./tmp.sh`.
+#           (d) it measures the shell's SYSCALLS, detected by `measures_syscalls`
+#               (the code mentions `strace`). One live case: its golden counts the
+#               `getcwd()`s OSH makes, which is an implementation detail no other
+#               shell can be held to even with `strace` staged. Withheld, it is a
+#               FALSE PASS rather than a failure -- `wc -l err.txt` counts the single
+#               line `td-sh: strace: not found`, and the golden is `1 err.txt`. That
+#               kind of pass turns on the wording of a diagnostic, so it would red as
+#               a REGRESSION in a `cd` test the day the wording changed.
+#               (b), (c) and (d) are decided from the CODE and so are applied BEFORE
+#               the case is run at all. That was cosmetic while the staging commands
+#               were missing; with `mkdir` and `touch` staged, running one of these
+#               first would CREATE the shared path it is being skipped for.
 #           These heuristics are conservative substring matches over the case code
 #           with FULL-LINE comments stripped, so a token mentioned only in prose does
 #           not force a skip. KNOWN over-match (safe direction): a token inside an
@@ -175,6 +183,19 @@ fn depends_on_shared_tmp(code: &str) -> bool {
     code.contains("/tmp/") || code.contains("HOME=/tmp") || code.contains("-k /tmp")
 }
 
+// Measures the shell's SYSCALLS, which this harness can never reproduce: the
+// golden counts the getcwd()s OSH makes, so even a staged `strace` would grade
+// an implementation detail rather than any behaviour POSIX describes. Withheld,
+// the case degenerates into a false pass instead -- `wc -l err.txt` counts the
+// one line `td-sh: strace: not found`, which is the golden `1 err.txt` by
+// coincidence. One live use, and the four others are inside comments this sees
+// stripped. Matched on the dependency rather than the verdict, as the two above
+// are: a pass that turns on the wording of a diagnostic would red as a
+// regression the day that wording changes, in a test about `cd`.
+fn measures_syscalls(code: &str) -> bool {
+    code.contains("strace")
+}
+
 /// Identities this shell CANNOT be staged as. Each probe is a real case run
 /// through `run_case`, so it exercises the same staging the corpus run does; a
 /// probe whose spec does not actually resolve to the identity it names would
@@ -233,7 +254,7 @@ fn probe_helper(
         // whole function exists to draw.
         ("printenv.py NOT_SET_HERE", "None\n"),
         ("FOO=bar printenv.py FOO NOT_SET_HERE", "bar\nNone\n"),
-        // The four staged externals, each asked something only it can answer.
+        // The staged externals, each asked something only it can answer.
         // `cat` reads what the others made, so the four probes are ONE chain:
         // a `mkdir` that silently did nothing, a `touch` that truncated instead
         // of creating, or an `rm` that removed the wrong thing all show up here
@@ -245,6 +266,31 @@ fn probe_helper(
         ("touch h && rm h && test -e h || echo gone", "gone\n"),
         // `rm -f` is silent on a file that never existed, and still 0.
         ("rm -f never-existed && echo ok", "ok\n"),
+        // `seq` feeds `wc`, so each checks the other: a `seq` off by one line
+        // and a `wc -l` off by one are the same failure here, and the third
+        // probe pins which by asking for the text itself.
+        ("seq 3 | wc -l", "3\n"),
+        ("seq 2 4 | cat", "2\n3\n4\n"),
+        // Bare `wc` is all three counts in one order, and a stream carries NO
+        // filename -- the format a golden compares. Read through a REDIRECT
+        // rather than a pipe: GNU pads multi-count output to a width it takes
+        // from the input's size, and for a stream it cannot stat that width is
+        // 7. This applet never pads, which agrees with GNU on a small regular
+        // file and not on a pipe, so the probe asks the shape they share.
+        ("printf 'a bb\\nccc\\n' > wcin && wc < wcin", "2 3 9\n"),
+        ("printf 'xy' | wc --bytes", "2\n"),
+        // `chmod` is observable only through the mode it leaves, and `test -x`
+        // is how every corpus case that chmods asks.
+        ("touch m && chmod +x m && test -x m && echo yes", "yes\n"),
+        // Each probe gets its own workdir, so a probe whose file is created
+        // in an earlier one grades nothing: `test -w m` on an ABSENT `m`
+        // fails exactly as it does on a read-only one. The `;` is the other
+        // half — after `&&` a chmod that did nothing would skip the echo
+        // and print nothing rather than the wrong word.
+        ("touch m && chmod -w m; test -w m && echo writable || echo ro", "ro\n"),
+        // `sleep` must take a FRACTION: every use in the corpus is one, and an
+        // integer-only parse would sleep zero and look like it worked.
+        ("sleep 0.01 && echo slept", "slept\n"),
     ];
     // The probe list is written out rather than generated -- each applet needs
     // a question only IT can answer -- so it can drift from the roster it is
@@ -369,7 +415,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // `/tmp/spam` CREATED it on the build host on the way to being
             // classified as a skip: shared state this harness neither owns nor
             // cleans, left behind by the very run that decided to ignore it.
-            if reads_repo_tree(&exec) || depends_on_shared_tmp(&exec) {
+            if reads_repo_tree(&exec) || depends_on_shared_tmp(&exec) || measures_syscalls(&exec) {
                 skip.push(key);
                 continue;
             }

@@ -77,13 +77,24 @@ const CAPTURE_CAP: usize = 8 * 1024 * 1024;
 pub const ASH_DASH_CHAIN: &[&str] = &["ash", "dash"];
 
 /// The names `run_case` stages on the case's PATH — the two Oils Python helpers
-/// and the four externals the corpus reaches for most — all served by the one
+/// and the eight externals the corpus reaches for most — all served by the one
 /// `spec_helpers` multicall through `argv[0]`. Public because `gen_expectations`
 /// probes each one: a helper that is staged but does not ANSWER records its
 /// cases as shell gaps, which is the failure staging it exists to prevent. It is
 /// also what the gate's staged-helper guard sweeps the corpus for, so a name
 /// added here is covered by both without further edits.
-pub const SPEC_HELPERS: &[&str] = &["argv.py", "printenv.py", "cat", "mkdir", "touch", "rm"];
+pub const SPEC_HELPERS: &[&str] = &[
+    "argv.py",
+    "printenv.py",
+    "cat",
+    "mkdir",
+    "touch",
+    "rm",
+    "wc",
+    "sleep",
+    "seq",
+    "chmod",
+];
 
 /// A parse error, anchored to a 1-based source line.
 #[derive(Debug)]
@@ -936,7 +947,8 @@ pub fn run_case(
     std::os::unix::fs::symlink(&shell, &entry)?;
     // The corpus's own way of asking what a word EXPANDED to (`argv.py`, 333
     // cases) and what reached the ENVIRONMENT (`printenv.py`, 42), plus the
-    // four externals it reaches for most (`cat`, `mkdir`, `touch`, `rm`).
+    // externals it reaches for most (`cat`, `mkdir`, `touch`, `rm`, `wc`,
+    // `sleep`, `seq`, `chmod`).
     // Upstream ships the first two as Python scripts and td vendors neither,
     // and the rest are coreutils, which this harness has no business putting on
     // a case's PATH from the host -- so `spec_helpers` answers under all of

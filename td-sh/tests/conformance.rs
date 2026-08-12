@@ -19,8 +19,9 @@
 //! found`. The overlay header carries the standing note; measure before
 //! mining the list, because the two causes are indistinguishable from the
 //! failure alone. That measurement HAS now been taken (688 of 1249 name a
-//! missing command), and `src/bin/spec_helpers.rs` serves four of those
-//! externals -- `cat`, `mkdir`, `touch`, `rm` -- alongside the Oils `.py`
+//! missing command), and `src/bin/spec_helpers.rs` serves eight of those
+//! externals -- `cat`, `mkdir`, `touch`, `rm`, `wc`, `sleep`, `seq`, `chmod`
+//! -- alongside the Oils `.py`
 //! helpers, which is why those cases grade. `grep`/`sed`/`od` are withheld
 //! still: they need a pattern engine this helper cannot borrow.
 //!
@@ -333,6 +334,74 @@ fn the_binary_reports_its_applets_status_and_diagnostic(
     assert_eq!(out.status.code(), Some(0));
     assert_eq!(out.stdout, b"['a', 'b']\n");
     assert!(out.stderr.is_empty());
+    // `wc -` reads STDIN rather than a file of that name, and still prints the
+    // operand as GNU does. Here rather than in a unit test, which would inherit
+    // whatever stdin `cargo test` was handed and block on a terminal.
+    let link = dir.join("wc");
+    std::os::unix::fs::symlink(spec_helpers_bin(), &link)?;
+    let mut child = std::process::Command::new(&link)
+        .args(["-l", "-"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()?;
+    if let Some(mut w) = child.stdin.take() {
+        std::io::Write::write_all(&mut w, b"a\nb\n")?;
+    }
+    let out = child.wait_with_output()?;
+    assert_eq!(out.status.code(), Some(0), "wc - failed: {:?}", out.stderr);
+    assert_eq!(out.stdout, b"2 -\n");
+    // Every applet above is reached through its own dispatch arm. `sleep`'s is
+    // pinned here rather than by its unit test, which calls the function
+    // directly: an arm wired to the wrong applet — or to nothing — would leave
+    // that test green while `sleep 0.05` in a case returned at once.
+    let start = std::time::Instant::now();
+    let out = run("sleep", &["0.05"])?;
+    assert_eq!(out.status.code(), Some(0), "sleep: {:?}", out.stderr);
+    assert!(out.stdout.is_empty() && out.stderr.is_empty());
+    assert!(start.elapsed() >= std::time::Duration::from_millis(45), "sleep did not sleep");
+    // The other three applets whose dispatch arms nothing else here reaches.
+    let out = run("seq", &["3"])?;
+    assert_eq!((out.status.code(), out.stdout.as_slice()), (Some(0), b"1\n2\n3\n".as_slice()));
+    let out = run("mkdir", &[&dir.join("d").to_string_lossy()])?;
+    assert_eq!(out.status.code(), Some(0), "mkdir: {:?}", out.stderr);
+    assert!(dir.join("d").is_dir());
+    // `chmod` and `rm` are the two confined applets, and their root comes from
+    // the ENVIRONMENT rather than an argument — which is the half a unit test
+    // calling the function with an explicit root cannot reach. `$TMP` is set
+    // here rather than inherited, so the workspace is a known directory and
+    // the verdict does not turn on whatever `cargo test` was run with.
+    let victim = dir.join("victim");
+    std::fs::write(&victim, b"x")?;
+    std::fs::create_dir_all(dir.join("case/tmp"))?;
+    let confined = |applet: &str, args: &[&str]| -> Result<_, Box<dyn std::error::Error>> {
+        let link = dir.join(applet);
+        let _ = std::fs::remove_file(&link);
+        std::os::unix::fs::symlink(spec_helpers_bin(), &link)?;
+        Ok(std::process::Command::new(&link)
+            .args(args)
+            .env("TMP", dir.join("case/tmp"))
+            .output()?)
+    };
+    for applet in ["chmod", "rm"] {
+        let args: &[&str] = match applet {
+            "chmod" => &["000"],
+            _ => &["-rf"],
+        };
+        let mut argv = args.to_vec();
+        let target = victim.to_string_lossy().into_owned();
+        argv.push(&target);
+        let out = confined(applet, &argv)?;
+        assert_eq!(out.status.code(), Some(2), "{applet} outside a workdir was allowed");
+        assert!(String::from_utf8_lossy(&out.stderr).contains("refusing"), "{applet} was quiet");
+    }
+    assert!(std::fs::read(&victim).is_ok(), "the file outside the workdir did not survive");
+    // …and the same applet still serves a file INSIDE that workspace, so the
+    // refusal above is the confinement and not the applet failing outright.
+    let ok = dir.join("case/f");
+    std::fs::write(&ok, b"x")?;
+    let out = confined("chmod", &["600", &ok.to_string_lossy()])?;
+    assert_eq!(out.status.code(), Some(0), "chmod inside the workdir: {:?}", out.stderr);
     Ok(())
 }
 

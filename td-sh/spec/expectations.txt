@@ -22,12 +22,12 @@
 #           status-127 `command not found` failures, because the cleared-env `-c`
 #           harness exposes no external PATH beyond the shell itself and the
 #           `spec_helpers` applets (the Oils `argv.py`/`printenv.py`, and `cat`,
-#           `mkdir`, `touch`, `rm`). Those are real mismatches today, but MEASURE
-#           before mining the list, because `not found` is reported identically
-#           for two different things. Some of those names are
-#           BUILTINS td-sh does not have (`shopt`, `typeset`, `declare`,
+#           `mkdir`, `touch`, `rm`, `wc`, `sleep`, `seq`, `chmod`). Those are real
+#           mismatches today, but MEASURE before mining the list, because `not
+#           found` is reported identically for two different things. Some of those
+#           names are BUILTINS td-sh does not have (`shopt`, `typeset`, `declare`,
 #           `compgen`) and are true shell gaps; the rest are EXTERNALS the harness
-#           still withholds (`grep`, `sed`, `wc`, `od`, `seq`) and say
+#           still withholds (`grep`, `sed`, `od`, `sort`, `tail`) and say
 #           nothing about the shell. Both groups are large and neither dominates.
 #           No counts are given here on purpose: this file is regenerated wholesale,
 #           so a number in it would silently describe some earlier tree.
@@ -59,12 +59,20 @@
 #               rest would. Fifteen MOVE here; the sixteenth (`builtin-dirs::cd
 #               replaces the lowest entry`) was already skipped by (b), whose
 #               `spec/` token its `/tmp/oils-spec/` path contains.
-#               (b) and (c) are decided from the CODE and so are applied BEFORE the
-#               case is run at all. That was cosmetic while the staging commands
-#               were missing; with `mkdir` and `touch` staged, running one of these
-#               first would CREATE the shared path it is being skipped for.
 #               Bare `/tmp` is deliberately NOT a shape: ten cases need only that it
 #               EXIST, which is universal, and one names the relative `./tmp.sh`.
+#           (d) it measures the shell's SYSCALLS, detected by `measures_syscalls`
+#               (the code mentions `strace`). One live case: its golden counts the
+#               `getcwd()`s OSH makes, which is an implementation detail no other
+#               shell can be held to even with `strace` staged. Withheld, it is a
+#               FALSE PASS rather than a failure -- `wc -l err.txt` counts the single
+#               line `td-sh: strace: not found`, and the golden is `1 err.txt`. That
+#               kind of pass turns on the wording of a diagnostic, so it would red as
+#               a REGRESSION in a `cd` test the day the wording changed.
+#               (b), (c) and (d) are decided from the CODE and so are applied BEFORE
+#               the case is run at all. That was cosmetic while the staging commands
+#               were missing; with `mkdir` and `touch` staged, running one of these
+#               first would CREATE the shared path it is being skipped for.
 #           These heuristics are conservative substring matches over the case code
 #           with FULL-LINE comments stripped, so a token mentioned only in prose does
 #           not force a skip. KNOWN over-match (safe direction): a token inside an
@@ -79,9 +87,6 @@
 # (see duplicate_conflicts).
 
 # ---- xfail: td-sh runs, wrong answer (known gaps) ----
-xfail alias.test.sh::Alias that is && || ;
-xfail alias.test.sh::Alias that is pipeline
-xfail alias.test.sh::Two aliases in pipeline
 xfail alias.test.sh::alias with word of multiple lines
 xfail alias.test.sh::alias without args lists all aliases
 xfail alias.test.sh::unalias -a
@@ -361,13 +366,11 @@ xfail assign.test.sh::redirect after assignment builtin (eval redirects after ev
 xfail assign.test.sh::redirect after command sub (like case above but without assignment builtin)
 xfail assign.test.sh::static assignment doesn't split
 xfail background.test.sh::Background process and then a singleton pipeline
-xfail background.test.sh::No stderr spew when shell is not interactive
 xfail background.test.sh::Start background pipeline, wait $pid
 xfail background.test.sh::Start background pipeline, wait %job_spec
 xfail background.test.sh::Wait on background process PID
 xfail background.test.sh::Wait on multiple specific IDs returns last status
 xfail background.test.sh::jobs -p prints one line per job
-xfail background.test.sh::jobs prints one line per job
 xfail background.test.sh::wait -n with nothing to wait for
 xfail background.test.sh::wait for N parallel jobs and check failure
 xfail background.test.sh::wait with invalid PID
@@ -382,11 +385,6 @@ xfail ble-idioms.test.sh::recursive arith: two levels
 xfail blog-other1.test.sh::Blog Post Example
 xfail blog-other1.test.sh::Blog Post Example Fix
 xfail blog-other1.test.sh::Rewrite of Blog Post Example
-xfail blog1.test.sh::${####}
-xfail blog1.test.sh::${###2}
-xfail blog1.test.sh::${###}
-xfail blog1.test.sh::${##2}
-xfail blog1.test.sh::${##}
 xfail blog1.test.sh::${#1#'###'}
 xfail blog2.test.sh::-a -a
 xfail blog2.test.sh::-a -a -a -a
@@ -462,13 +460,9 @@ xfail builtin-bracket.test.sh::-ef
 xfail builtin-bracket.test.sh::-h and -L test for symlink
 xfail builtin-bracket.test.sh::-ot and -nt
 xfail builtin-bracket.test.sh::-r
-xfail builtin-bracket.test.sh::-u for setuid, -g too
-xfail builtin-bracket.test.sh::-w
-xfail builtin-bracket.test.sh::-x
 xfail builtin-bracket.test.sh::operator/operand ambiguity with -a
 xfail builtin-cd.test.sh::$OLDPWD
 xfail builtin-cd.test.sh::Change directory in non-shell parent process (make or Python)
-xfail builtin-cd.test.sh::Survey of getcwd() syscall
 xfail builtin-cd.test.sh::Test the current directory after 'cd ..' involving symlinks
 xfail builtin-cd.test.sh::cd away from dir that was deleted
 xfail builtin-cd.test.sh::cd to relative path with -L and -P
@@ -589,8 +583,6 @@ xfail builtin-meta.test.sh::command -V
 xfail builtin-meta.test.sh::command -p (find hidden tool in default path)
 xfail builtin-meta.test.sh::command -p (override existing program)
 xfail builtin-meta.test.sh::command -v executable, builtin
-xfail builtin-meta.test.sh::command command seq 3
-xfail builtin-meta.test.sh::command skips function lookup
 xfail builtin-misc.test.sh::Print shell strings with weird chars: set and printf %q and ${x@Q}
 xfail builtin-misc.test.sh::Shifting too far
 xfail builtin-misc.test.sh::time pipeline
@@ -658,7 +650,6 @@ xfail builtin-trap-err.test.sh::trap can use original $LINENO
 xfail builtin-trap.test.sh::SIGINT and INT are aliases
 xfail builtin-trap.test.sh::exit codes for traps are isolated
 xfail builtin-trap.test.sh::trap 1 is equivalent to SIGHUP; HUP is equivalent to SIGHUP
-xfail builtin-trap.test.sh::trap with command.NoOp - check internal invariant
 xfail builtin-trap.test.sh::traps are cleared in subshell (started with &)
 xfail builtin-trap.test.sh::traps are not active inside subshells $() ()  trap | cat
 xfail builtin-type-bash.test.sh::type -P builtin -> not a file
@@ -703,7 +694,6 @@ xfail builtin-umask.test.sh::umask t perm
 xfail builtin-umask.test.sh::umask with too many arguments (i.e. extra spaces)
 xfail builtin-umask.test.sh::usage: large octal number
 xfail case_.test.sh::Pattern ? matches 1 code point (many bytes), but not multiple code points
-xfail case_.test.sh::matching every byte against itself
 xfail command-sub-ksh.test.sh::${ echo hi }  without semi-colon
 xfail command-sub-ksh.test.sh::${ echo hi;}
 xfail command-sub-ksh.test.sh::${|REPLY=hi}
@@ -899,10 +889,8 @@ xfail let.test.sh::let
 xfail let.test.sh::let with ()
 xfail loop.test.sh::break in condition of loop
 xfail loop.test.sh::break in condition of nested loop
-xfail loop.test.sh::break/continue within eval
 xfail loop.test.sh::continue in subshell
 xfail loop.test.sh::continue in subshell aborts with errexit
-xfail loop.test.sh::while in pipe with subshell
 xfail nameref.test.sh::-n attribute before it has a value
 xfail nameref.test.sh::-n attribute on array is hard error, not a warning
 xfail nameref.test.sh::@ in nameref isn't supported, unlike in ${!ref}
@@ -966,14 +954,10 @@ xfail parse-errors.test.sh::empty clause in [[
 xfail parse-errors.test.sh::{ is its own word, needs a space
 xfail parse-errors.test.sh::} is a parse error
 xfail pipeline.test.sh::Brace group in pipeline
-xfail pipeline.test.sh::Evaluation of argv[0] in pipeline occurs in child
 xfail pipeline.test.sh::Exit code is last status
 xfail pipeline.test.sh::For loop starts pipeline
-xfail pipeline.test.sh::Nested pipelines
 xfail pipeline.test.sh::Pipeline comments
 xfail pipeline.test.sh::Pipeline in eval
-xfail pipeline.test.sh::Redirect in Pipeline
-xfail pipeline.test.sh::While Loop ends pipeline
 xfail posix.test.sh::Command substitution in default
 xfail print-source-code.test.sh::non-{ } function bodies can be serialized (rare)
 xfail print-source-code.test.sh::typeset -f prints function source code
@@ -1025,10 +1009,8 @@ xfail quote.test.sh::$'' octal escapes don't have leading 0
 xfail quote.test.sh::$'' octal escapes with fewer than 3 chars
 xfail quote.test.sh::$? split over multiple lines
 xfail quote.test.sh::YSH allows unquoted foo\ bar too
-xfail redirect-command.test.sh::Brace group redirect
 xfail redirect-command.test.sh::Prefix redirect for loop -- not allowed
 xfail redirect-command.test.sh::Redirect in the middle of two assignments
-xfail redirect-command.test.sh::redirect for loop
 xfail redirect-multi.test.sh::File redirect that globs to more than one file (bash and zsh only)
 xfail redirect-multi.test.sh::File redirect to $var with glob char
 xfail redirect-multi.test.sh::Redirect with brace expansion isn't allowed
@@ -1043,7 +1025,6 @@ xfail redirect.test.sh::>| to clobber
 xfail redirect.test.sh::Descriptor redirect with filename
 xfail redirect.test.sh::Double digit fd (20> file)
 xfail redirect.test.sh::Nonexistent file
-xfail redirect.test.sh::Redirect echo to stderr, and then redirect all of stdout somewhere.
 xfail redirect.test.sh::Redirect to empty string
 xfail redirect.test.sh::Redirect to file descriptor that's not open
 xfail redirect.test.sh::can't mention big file descriptor
@@ -1076,7 +1057,6 @@ xfail sh-options.test.sh::noclobber on <>
 xfail sh-options.test.sh::pipefail
 xfail sh-options.test.sh::set without args and assoc array variables (not in OSH)
 xfail sh-options.test.sh::set without args lists variables
-xfail sh-options.test.sh::shopt with no flags prints options
 xfail sh-usage.test.sh::--rcfile in non-interactive shell prints warnings
 xfail sh-usage.test.sh::LC_CTYPE=invalid
 xfail sh-usage.test.sh::Other flag parsers are not affected by - rule
@@ -1094,7 +1074,6 @@ xfail subshell.test.sh::Subshell with redirects
 xfail tilde.test.sh::${x//~/~root}
 xfail tilde.test.sh::temp assignment x=~ env
 xfail tilde.test.sh::tilde expansion an assignment keyword
-xfail tilde.test.sh::tilde expansion of word after redirect
 xfail tilde.test.sh::x=${undef-~:~}
 xfail tilde.test.sh::~ expansion in readonly assignment
 xfail toysh-posix.test.sh::Can't parse extra }
@@ -1263,6 +1242,7 @@ skip builtin-bracket.test.sh::test -b -c -S (block, character, socket)
 skip builtin-bracket.test.sh::test -p named pipe
 skip builtin-cd.test.sh::'unset PWD; pwd' before any cd (tickles a rare corner case)
 skip builtin-cd.test.sh::CDPATH is respected
+skip builtin-cd.test.sh::Survey of getcwd() syscall
 skip builtin-cd.test.sh::What happens when inherited $PWD and current dir disagree?
 skip builtin-cd.test.sh::lie about PWD; pwd before any cd
 skip builtin-cd.test.sh::remove pwd dir
