@@ -847,6 +847,692 @@ fn chmod(args: &[std::ffi::OsString], root: Option<&std::path::Path>) -> Done {
     Done { out: Vec::new(), err, status }
 }
 
+/// `grep [-q] [-o] [-i] [-v] [-E|-F] [-A NUM] [-m NUM] PATTERN [FILE]`.
+///
+/// The option surface is counted like every other applet's, over 177
+/// grep-family invocations: `-q` 30, `-o` 25, `-E` 12, `-oF` 12, `-i` 5, `-A1`
+/// 2, `-v` 1, and one each of `--only-matching` and `--max-count`. Anything
+/// else is refused.
+///
+/// `egrep` and `fgrep` are the same applet under another name, which is what
+/// they are in coreutils too -- they only preset `-E` and `-F`.
+///
+/// Input is read to EOF before any of it is matched, unlike `wc` and `cat`,
+/// which stream because their input may be a device. `-A` is why: a context
+/// window needs the lines around a match, not just the match. The cost is that
+/// `-q` does not exit at the first hit the way a real grep does, so an ENDLESS
+/// producer would hang here where GNU's would close the pipe and stop it. No
+/// corpus case pipes one in -- and the case timeout bounds it if one ever does.
+fn grep(args: &[std::ffi::OsString], preset: Option<u8>) -> Done {
+    let (mut quiet, mut only, mut icase, mut invert) = (false, false, false, false);
+    let (mut ere, mut fixed) = (preset == Some(b'E'), preset == Some(b'F'));
+    // `context` is whether one was ASKED FOR, which is not the same as its
+    // being non-zero: GNU separates groups under `-A 0` too.
+    let (mut after, mut context, mut max) = (0usize, false, usize::MAX);
+    let mut operands: Vec<&std::ffi::OsStr> = Vec::new();
+    let mut rest_are_operands = false;
+    let mut i = 0;
+    while let Some(arg) = args.get(i) {
+        i += 1;
+        let bytes = arg.as_bytes();
+        if rest_are_operands || bytes == b"-" || !bytes.starts_with(b"-") {
+            operands.push(arg);
+            continue;
+        }
+        if bytes == b"--" {
+            rest_are_operands = true;
+            continue;
+        }
+        // A numeric option takes the rest of its word, or the next argument.
+        let number = |tail: &[u8], i: &mut usize| -> Option<usize> {
+            let text = match tail.is_empty() {
+                false => String::from_utf8_lossy(tail).into_owned(),
+                true => {
+                    let next = args.get(*i)?;
+                    *i += 1;
+                    String::from_utf8_lossy(next.as_bytes()).into_owned()
+                }
+            };
+            text.parse::<usize>().ok()
+        };
+        if bytes.starts_with(b"--") {
+            match bytes {
+                b"--only-matching" => only = true,
+                b"--invert-match" => invert = true,
+                b"--quiet" | b"--silent" => quiet = true,
+                b"--ignore-case" => icase = true,
+                b"--extended-regexp" => ere = true,
+                b"--fixed-strings" => fixed = true,
+                // `--max-count N` or `--max-count=N` and nothing else: a bare
+                // prefix match would read `--max-count1` as `-m 1`, which GNU
+                // calls an unrecognized option, and an EMPTY attached value
+                // would fall through to taking the next argument -- so
+                // `--max-count= 1 foo` would silently consume the `1` and grep
+                // for `foo` with a limit nobody wrote.
+                b"--max-count" => match number(b"", &mut i) {
+                    Some(n) => max = n,
+                    None => return unsupported("grep", arg),
+                },
+                _ => match bytes.strip_prefix(b"--max-count=") {
+                    Some(tail) if !tail.is_empty() => match number(tail, &mut i) {
+                        Some(n) => max = n,
+                        None => return unsupported("grep", arg),
+                    },
+                    _ => return unsupported("grep", arg),
+                },
+            }
+            continue;
+        }
+        let letters = bytes.get(1..).unwrap_or_default();
+        let mut j = 0;
+        while let Some(c) = letters.get(j) {
+            j += 1;
+            match c {
+                b'q' => quiet = true,
+                b'o' => only = true,
+                b'i' => icase = true,
+                b'v' => invert = true,
+                b'E' => ere = true,
+                b'F' => fixed = true,
+                b'A' | b'm' => {
+                    let tail = letters.get(j..).unwrap_or_default();
+                    j = letters.len();
+                    match number(tail, &mut i) {
+                        Some(n) if *c == b'A' => {
+                            after = n;
+                            context = true;
+                        }
+                        Some(n) => max = n,
+                        None => return unsupported("grep", arg),
+                    }
+                }
+                _ => return unsupported("grep", arg),
+            }
+        }
+    }
+    let Some(pattern) = operands.first() else {
+        return Done {
+            out: Vec::new(),
+            err: b"grep: missing pattern\n".to_vec(),
+            status: 2,
+        };
+    };
+    // GNU refuses two matchers rather than letting one win: `grep -E -F 'a.b'`
+    // is "conflicting matchers specified", status 2. Silently preferring
+    // `fixed` -- which is what testing it first did -- turns a caller's mistake
+    // into a different, well-formed search. The presets count, so `fgrep -E`
+    // and `egrep -F` are refused too.
+    if ere && fixed {
+        return Done {
+            out: Vec::new(),
+            err: b"spec_helpers: grep: conflicting matchers specified\n".to_vec(),
+            status: 2,
+        };
+    }
+    let files = operands.get(1..).unwrap_or_default();
+    if files.len() > 1 {
+        // Several files need GNU's `file:` prefixes, which nothing grades.
+        return unsupported("grep", files.get(1).copied().unwrap_or_default());
+    }
+    let src = match files.first() {
+        Some(name) if name.as_bytes() != b"-" => std::fs::read(name),
+        _ => {
+            let mut buf = Vec::new();
+            std::io::Read::read_to_end(&mut std::io::stdin().lock(), &mut buf).map(|_| buf)
+        }
+    };
+    let data = match src {
+        Ok(d) => d,
+        Err(e) => {
+            let what = files.first().map(|f| std::path::Path::new(f).display().to_string());
+            return Done {
+                out: Vec::new(),
+                err: format!("grep: {}: {e}\n", what.unwrap_or_else(|| "-".into())).into_bytes(),
+                status: 2,
+            };
+        }
+    };
+    let built = match fixed {
+        true => Pattern::literal(pattern.as_bytes(), icase),
+        false => Pattern::parse(pattern.as_bytes(), ere, icase),
+    };
+    // The refusal this applet exists to be honest about: an approximated match
+    // would be graded as the shell's output.
+    let Some(pat) = built else {
+        return unsupported("grep", pattern);
+    };
+    grep_over(&data, &pat, icase, quiet, only, invert, after, context, max)
+}
+
+/// The line loop, split out so the option parse above stays one screen.
+#[allow(clippy::too_many_arguments)]
+fn grep_over(
+    data: &[u8],
+    pat: &Pattern,
+    icase: bool,
+    quiet: bool,
+    only: bool,
+    invert: bool,
+    after: usize,
+    context: bool,
+    max: usize,
+) -> Done {
+    // A trailing newline ends the last line rather than starting an empty one.
+    let body = data.strip_suffix(b"\n").unwrap_or(data);
+    let lines: Vec<&[u8]> = match data.is_empty() {
+        true => Vec::new(),
+        false => body.split(|b| *b == b'\n').collect(),
+    };
+    let mut out = Vec::new();
+    let mut hits = 0usize;
+    // Which lines to print, so `-A`'s overlapping windows merge instead of
+    // repeating a line, and a gap between them can be marked as GNU marks it.
+    let mut wanted = vec![false; lines.len()];
+    // One buffer for the whole run rather than one per line: `-i` folds the
+    // haystack, and the fold is the only per-line allocation there would be.
+    let mut folded: Vec<u8> = Vec::new();
+    for (n, line) in lines.iter().enumerate() {
+        if hits >= max {
+            break;
+        }
+        let hay = match icase {
+            true => {
+                folded.clear();
+                folded.extend(line.iter().map(u8::to_ascii_lowercase));
+                folded.as_slice()
+            }
+            false => line,
+        };
+        if pat.find_from(hay, 0).is_some() == invert {
+            continue;
+        }
+        hits += 1;
+        if quiet {
+            return Done { out: Vec::new(), err: Vec::new(), status: 0 };
+        }
+        // The window is CLAMPED to the last line: `n..=n + after` with `after`
+        // near `usize::MAX` iterates past the end of `wanted` for as long as
+        // the machine will let it, which is a hang rather than a wrong answer
+        // -- `grep -A18446744073709551615 x` never returned.
+        let far = n.saturating_add(after).min(lines.len().saturating_sub(1));
+        for slot in n..=far {
+            if let Some(w) = wanted.get_mut(slot) {
+                *w = true;
+            }
+        }
+    }
+    // `-o` goes through the SAME wanted-set rather than printing as it scans.
+    // Selection and printing are separate questions: `-A` selects a line's
+    // neighbours, and `-o` then prints whatever matches on each selected line,
+    // separators and all. Printing inside the scan skipped both, so
+    // `grep -o -A1 a` lost the `--` and a context line's own matches.
+    let mut last: Option<usize> = None;
+    for (n, line) in lines.iter().enumerate() {
+        if !wanted.get(n).copied().unwrap_or(false) {
+            continue;
+        }
+        // GNU separates non-adjacent CONTEXT groups with `--`. Without a
+        // context option there are no groups to separate, and plain
+        // non-adjacent matching lines print with nothing between them.
+        if context && last.is_some_and(|p| n > p + 1) {
+            out.extend_from_slice(b"--\n");
+        }
+        last = Some(n);
+        if !only {
+            out.extend_from_slice(line);
+            out.push(b'\n');
+            continue;
+        }
+        // Every non-overlapping match on the line, each on its own line -- and
+        // an empty match advances by one, or this would not terminate. The
+        // bytes PRINTED come from the original line, not the folded haystack:
+        // `-i` decides what matches, never what is shown. ASCII folding is
+        // length-preserving, so the offsets carry over.
+        let hay = match icase {
+            true => {
+                folded.clear();
+                folded.extend(line.iter().map(u8::to_ascii_lowercase));
+                folded.as_slice()
+            }
+            false => line,
+        };
+        let mut at = 0;
+        while at <= hay.len() {
+            let Some((from, to)) = pat.find_from(hay, at) else {
+                break;
+            };
+            if to > from {
+                out.extend_from_slice(line.get(from..to).unwrap_or_default());
+                out.push(b'\n');
+            }
+            at = match to > from {
+                true => to,
+                false => from + 1,
+            };
+        }
+    }
+    Done {
+        // `-q` returned above on its first hit, and with no hit there is
+        // nothing here to suppress -- so this is not guarded a second time.
+        out,
+        err: Vec::new(),
+        // 0 when something matched, 1 when nothing did -- which is what every
+        // `grep -q` in the corpus is actually testing.
+        status: match hits > 0 {
+            true => 0,
+            false => 1,
+        },
+    }
+}
+
+/// The longest pattern this will parse. Matching costs one stack frame per
+/// term, and this crate builds `panic = "abort"`, so a stack overflow is an
+/// abort with no diagnostic rather than an error a caller can report: measured,
+/// a 120 KiB pattern overflowed. The corpus's longest is 66 bytes.
+const MAX_PATTERN: usize = 4096;
+
+/// One position of a pattern: what to match, and how many times.
+#[derive(Clone)]
+struct Term {
+    atom: Atom,
+    rep: Rep,
+}
+
+#[derive(Clone)]
+enum Atom {
+    /// `.` -- any byte. A newline cannot occur, since matching is per line.
+    Any,
+    Lit(u8),
+    /// `[...]`, resolved at parse time into the 256 answers it can be asked.
+    /// A set rather than the source ranges so `-i` folds ONCE, here, instead of
+    /// at every byte of every line.
+    Class(Box<[bool; 256]>),
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Rep {
+    One,
+    Star,
+    Plus,
+    Opt,
+}
+
+/// The subset of POSIX patterns the corpus actually uses.
+///
+/// Measured before it was written, over 177 grep-family invocations: 127 have a
+/// literal pattern and the other 50 reach for `^`, `$`, `[...]` (with negation
+/// and ranges), `.`, `*` and ERE's `+`. That is the whole surface here.
+///
+/// Everything else -- alternation, groups, backreferences, interval `{n,m}`,
+/// named classes like `[:alpha:]` -- is REFUSED at parse time rather than
+/// approximated, and the refusal is the applet's status 2. This matters more
+/// here than in any other applet: a matcher that silently mishandled a
+/// construct would report a WRONG match, and the case would be graded on it as
+/// though the shell had produced that output. A refusal leaves the case xfail
+/// and says which pattern it could not read.
+struct Pattern {
+    terms: Vec<Term>,
+    /// A leading `^`: the match may only begin at the start of the line.
+    start: bool,
+    /// A trailing `$`: it may only END at the end of it.
+    end: bool,
+}
+
+impl Atom {
+    fn matches(&self, b: u8) -> bool {
+        match self {
+            Atom::Any => true,
+            Atom::Lit(want) => *want == b,
+            Atom::Class(set) => set.get(usize::from(b)).copied().unwrap_or(false),
+        }
+    }
+}
+
+impl Pattern {
+    /// `None` for any construct outside the subset above -- see the type's doc.
+    ///
+    /// `ere` selects which characters are OPERATORS: `+?(){}|` are literals in a
+    /// basic expression and operators in an extended one, which is the whole
+    /// difference `-E` makes to the shapes the corpus uses.
+    fn parse(src: &[u8], ere: bool, icase: bool) -> Option<Self> {
+        // One frame per term is what matching costs, so a pattern longer than
+        // anything the corpus writes is refused rather than allowed to recurse
+        // the stack away -- a `panic = "abort"` crate cannot catch that.
+        if src.len() > MAX_PATTERN {
+            return None;
+        }
+        let mut terms: Vec<Term> = Vec::new();
+        let (mut start, mut end) = (false, false);
+        let mut i = 0;
+        // `^` is an anchor where it leads. Elsewhere it is an ordinary
+        // character in a BRE -- and in an ERE it is an anchor THERE TOO, which
+        // is a construct this does not serve, so under `-E` it is refused
+        // rather than read as the literal a BRE would make it.
+        if src.first() == Some(&b'^') {
+            start = true;
+            i = 1;
+        }
+        while i < src.len() {
+            let b = *src.get(i)?;
+            // A trailing `$` is the end anchor; one in the middle is a literal
+            // to a BRE and an anchor to an ERE, refused for the same reason.
+            if b == b'$' && i + 1 == src.len() {
+                end = true;
+                i += 1;
+                continue;
+            }
+            if ere && matches!(b, b'^' | b'$') {
+                return None;
+            }
+            let atom = match b {
+                b'.' => {
+                    i += 1;
+                    Atom::Any
+                }
+                b'[' => {
+                    let (set, next) = parse_class(src, i, icase)?;
+                    i = next;
+                    Atom::Class(set)
+                }
+                b'\\' => {
+                    // An escape makes the next byte a literal -- but only where
+                    // GNU agrees. `\b`, `\w` and friends are OPERATORS to it
+                    // (word boundary, word character), and `\1` is a
+                    // backreference, so literalising them is a wrong match in
+                    // both directions: `\bfoo\b` matched `bfoob` and missed
+                    // `foo bar`. Refused by an ALLOW-list, since the escapes
+                    // GNU gives meaning to are open-ended and the ones it does
+                    // not are the punctuation this already handles. `\C` stays
+                    // a literal `C` -- GNU warns "stray \" and reads it the
+                    // same way, and the corpus spells `\C-o\C-s\C-h` eight
+                    // times.
+                    let next = *src.get(i + 1)?;
+                    // Named one by one rather than by a class, because the two
+                    // groups do not line up with anything simpler. GNU gives
+                    // meaning to the word-boundary and word/space classes, to
+                    // `\1`-`\9` as backreferences, and to word- and
+                    // buffer-start/end -- and warns "stray \" for EVERY OTHER
+                    // letter, reading it as the literal, which is what this
+                    // does. `\C` is in the second group, and the corpus spells
+                    // `\C-o\C-s\C-h` eight times.
+                    if matches!(next, b'b' | b'B' | b'w' | b'W' | b's' | b'S')
+                        || matches!(next, b'<' | b'>' | b'`' | b'\'')
+                        || next.is_ascii_digit() && next != b'0'
+                    {
+                        return None;
+                    }
+                    if !ere && matches!(next, b'+' | b'?' | b'(' | b')' | b'{' | b'}' | b'|') {
+                        return None;
+                    }
+                    i += 2;
+                    Atom::Lit(next)
+                }
+                // Nothing to repeat: a literal asterisk to a BRE, and to an ERE
+                // a repeat of the empty expression -- which GNU warns about and
+                // matches, and this refuses rather than guesses at.
+                b'*' if terms.is_empty() && !ere => {
+                    i += 1;
+                    Atom::Lit(b'*')
+                }
+                b'*' if terms.is_empty() => return None,
+                b'(' | b')' | b'{' | b'}' | b'|' | b'+' | b'?' if ere => return None,
+                other => {
+                    i += 1;
+                    Atom::Lit(other)
+                }
+            };
+            // A repeat binds to the atom just read.
+            let rep = match src.get(i) {
+                Some(b'*') => {
+                    i += 1;
+                    Rep::Star
+                }
+                Some(b'+') if ere => {
+                    i += 1;
+                    Rep::Plus
+                }
+                Some(b'?') if ere => {
+                    i += 1;
+                    Rep::Opt
+                }
+                _ => Rep::One,
+            };
+            // A repeat OF a repeat is refused rather than read as the literal
+            // the second operator would otherwise become: `a**+` would parse as
+            // `a*` then one-or-more literal asterisks, which is a well-formed
+            // pattern for something nobody asked to match. GNU rejects it.
+            let doubled = match src.get(i) {
+                Some(b'*') => true,
+                Some(b'+' | b'?') => ere,
+                _ => false,
+            };
+            if rep != Rep::One && doubled {
+                return None;
+            }
+            terms.push(Term { atom: fold(atom, icase), rep });
+        }
+        Some(Pattern { terms, start, end })
+    }
+
+    /// A LITERAL pattern, for `-F`, where no byte is an operator. Bounded like
+    /// `parse`, and for the same reason rather than by analogy: a 120 KiB `-F`
+    /// pattern against a line that matches it recursed one frame per byte and
+    /// aborted with a stack overflow, where `parse` would have refused it.
+    fn literal(src: &[u8], icase: bool) -> Option<Self> {
+        if src.len() > MAX_PATTERN {
+            return None;
+        }
+        let terms = src
+            .iter()
+            .map(|b| Term { atom: fold(Atom::Lit(*b), icase), rep: Rep::One })
+            .collect();
+        Some(Pattern { terms, start: false, end: false })
+    }
+
+    /// The leftmost match in `hay` at or after `from`, as a byte range.
+    ///
+    /// `hay` is the WHOLE line and `from` an offset into it, rather than the
+    /// caller passing a slice: `^` anchors to the start of the LINE, and a
+    /// slice would re-anchor it at each step, so `grep -o '^z'` on `zz` would
+    /// print two matches where GNU prints one. `hay` is already case-folded
+    /// when `-i` is in force, so no comparison below has to know about it.
+    fn find_from(&self, hay: &[u8], from: usize) -> Option<(usize, usize)> {
+        let last = match self.start {
+            true => 0,
+            false => hay.len(),
+        };
+        // A (term, position) pair that has already FAILED fails again, so
+        // recording it turns the backtracker from exponential into O(terms x
+        // bytes). Without it `a*a*a*…b` over a run of `a`s explores every way
+        // of splitting the run: 20 such terms against 30 bytes ran for over ten
+        // seconds, entirely inside the subset this serves, so no refusal could
+        // have caught it. One table for the whole line, since a failure at
+        // (term, pos) does not depend on where the attempt started.
+        let width = hay.len() + 1;
+        let mut failed = vec![false; width.saturating_mul(self.terms.len() + 1)];
+        for at in from..=last {
+            if let Some(to) = match_here(&self.terms, 0, hay, at, self.end, &mut failed, width) {
+                return Some((at, to));
+            }
+        }
+        None
+    }
+}
+
+/// Case folding happens ONCE, when the pattern is built: the haystack is folded
+/// per line and the needle here, so no comparison has to know about `-i`.
+///
+/// A CLASS is deliberately not folded here -- `parse_class` does it, before it
+/// applies the `^` negation. Folding after the negation instead widens the
+/// complement rather than the set it was taken of, so `-i '[^abc]'` came to
+/// match `a`.
+fn fold(atom: Atom, icase: bool) -> Atom {
+    match (icase, atom) {
+        (true, Atom::Lit(b)) => Atom::Lit(b.to_ascii_lowercase()),
+        (_, other) => other,
+    }
+}
+
+/// `[...]` starting at `at`. Returns the resolved set and the index past the
+/// closing bracket. `]` first is a literal and `-` first or last is a literal,
+/// both as POSIX says; a named class is refused rather than guessed at.
+/// Does a `:` at `at` open a `[:name:]` that closes before the class does?
+/// Only then is the single-bracket typo unambiguous, and all three parts are
+/// load-bearing -- GNU refuses `[:x:]` and accepts every near miss as the
+/// ordinary set of the bytes it is spelled with. The NAME must be one or more
+/// alphanumerics (`[::]` is the class `{:}`, and `[:a1:]` IS diagnosed even
+/// though no class is called `a1`), it must be followed by `:` (`[:a-b:]` is a
+/// range and a colon), and that colon must close the class (`[:ab:c]` is four
+/// ordinary members).
+fn ends_named_class(src: &[u8], at: usize) -> bool {
+    let mut j = at + 1;
+    while src.get(j).is_some_and(|c| c.is_ascii_alphanumeric()) {
+        j += 1;
+    }
+    j > at + 1 && src.get(j) == Some(&b':') && src.get(j + 1) == Some(&b']')
+}
+
+fn parse_class(src: &[u8], at: usize, icase: bool) -> Option<(Box<[bool; 256]>, usize)> {
+    let mut i = at + 1;
+    let mut neg = false;
+    if src.get(i) == Some(&b'^') {
+        neg = true;
+        i += 1;
+    }
+    let mut set = Box::new([false; 256]);
+    let mut first = true;
+    loop {
+        let b = *src.get(i)?;
+        if b == b']' && !first {
+            i += 1;
+            break;
+        }
+        // `[[:alpha:]]` and the equivalence/collating forms. Refused, not read
+        // as the punctuation they are made of, which is what a plain parse
+        // would silently do.
+        if b == b'[' && matches!(src.get(i + 1), Some(b':' | b'.' | b'=')) {
+            return None;
+        }
+        // …and the SINGLE-bracket typo `[:alpha:]`, which is the spelling that
+        // actually turns up. GNU diagnoses it by name rather than reading it,
+        // because as a plain class it silently means `{:,a,l,p,h}` -- a set
+        // that matches, so nothing downstream can tell it went wrong.
+        if first && b == b':' && ends_named_class(src, i) {
+            return None;
+        }
+        first = false;
+        // A range, unless the `-` is last.
+        if src.get(i + 1) == Some(&b'-') && src.get(i + 2).is_some_and(|c| *c != b']') {
+            let hi = *src.get(i + 2)?;
+            if hi < b {
+                return None;
+            }
+            // `[a-b-c]`: the byte after a range may not open another with the
+            // `-` it would have to borrow. GNU calls that an invalid range end;
+            // reading it as the literal `-` plus `c` is a class that matches
+            // more than was asked for.
+            if src.get(i + 3) == Some(&b'-') && src.get(i + 4).is_some_and(|c| *c != b']') {
+                return None;
+            }
+            for c in b..=hi {
+                if let Some(slot) = set.get_mut(usize::from(c)) {
+                    *slot = true;
+                }
+            }
+            i += 3;
+            continue;
+        }
+        if let Some(slot) = set.get_mut(usize::from(b)) {
+            *slot = true;
+        }
+        i += 1;
+    }
+    if icase {
+        for b in b'A'..=b'Z' {
+            if set.get(usize::from(b)).copied().unwrap_or(false) {
+                if let Some(slot) = set.get_mut(usize::from(b.to_ascii_lowercase())) {
+                    *slot = true;
+                }
+            }
+        }
+    }
+    if neg {
+        for slot in set.iter_mut() {
+            *slot = !*slot;
+        }
+    }
+    Some((set, i))
+}
+
+/// Match `terms` against `hay` from `pos`, returning where the match ENDS.
+///
+/// Greedy with backtracking: a repeat takes as much as it can and gives bytes
+/// back only when what follows cannot match. Without alternation that is the
+/// longest match at this position for every shape the subset can express, which
+/// is what `-o` prints. `anchored_end` is checked where the terms run out
+/// rather than beforehand, so a `$` makes the repeats give back until the match
+/// reaches the end of the line -- `[0-9]*$` on `a12` matches the empty string
+/// at 3, not the `12` a pre-check would have rejected outright.
+fn match_here(
+    terms: &[Term],
+    ti: usize,
+    hay: &[u8],
+    pos: usize,
+    anchored_end: bool,
+    failed: &mut [bool],
+    width: usize,
+) -> Option<usize> {
+    let slot = ti.checked_mul(width).and_then(|base| base.checked_add(pos));
+    if slot.and_then(|s| failed.get(s)).copied().unwrap_or(false) {
+        return None;
+    }
+    let give_up = |failed: &mut [bool]| {
+        if let Some(cell) = slot.and_then(|s| failed.get_mut(s)) {
+            *cell = true;
+        }
+        None
+    };
+    let Some(term) = terms.get(ti) else {
+        return match !anchored_end || pos == hay.len() {
+            true => Some(pos),
+            false => give_up(failed),
+        };
+    };
+    let (min, greedy) = match term.rep {
+        Rep::One => (1usize, false),
+        Rep::Opt => (0, false),
+        Rep::Star => (0, true),
+        Rep::Plus => (1, true),
+    };
+    // How many times the atom could match from here, capped at one where the
+    // term is not a repeat.
+    let mut most = 0usize;
+    while let Some(b) = hay.get(pos + most) {
+        if !term.atom.matches(*b) {
+            break;
+        }
+        most += 1;
+        if !greedy && most == 1 {
+            break;
+        }
+    }
+    let mut take = most;
+    loop {
+        if take < min {
+            return give_up(failed);
+        }
+        if let Some(end) =
+            match_here(terms, ti + 1, hay, pos + take, anchored_end, failed, width)
+        {
+            return Some(end);
+        }
+        if take == 0 {
+            return give_up(failed);
+        }
+        take -= 1;
+    }
+}
+
 /// What an applet produced. The two Oils helpers only ever needed stdout, but a
 /// real external is graded on its STATUS as much as its output, and reports its
 /// own errors -- so all three travel together and every applet stays a pure
@@ -919,6 +1605,10 @@ fn main() {
         b"sleep" => sleep(&rest),
         b"seq" => seq(&rest),
         b"chmod" => chmod(&rest, workspace().as_deref()),
+        // Three names, one applet: `egrep`/`fgrep` are `grep -E`/`grep -F`.
+        b"grep" => grep(&rest, None),
+        b"egrep" => grep(&rest, Some(b'E')),
+        b"fgrep" => grep(&rest, Some(b'F')),
         other => {
             // Named as something this does not serve: say so rather than print
             // a plausible answer, which would grade as a shell result.
@@ -1411,6 +2101,397 @@ mod tests {
         let start = std::time::Instant::now();
         assert_eq!(sleep(&[os("0.01"), os("1s")]).status, 2);
         assert!(start.elapsed() < std::time::Duration::from_secs(1));
+    }
+
+    /// Does `pat` match `line`, and where? `None` for a pattern outside the
+    /// subset, which is the applet's status 2.
+    fn m(pat: &str, ere: bool, icase: bool, line: &str) -> Option<Option<(usize, usize)>> {
+        let p = Pattern::parse(pat.as_bytes(), ere, icase)?;
+        let hay = match icase {
+            true => line.to_ascii_lowercase(),
+            false => line.to_string(),
+        };
+        Some(p.find_from(hay.as_bytes(), 0))
+    }
+
+    /// The matcher's whole surface, since a wrong match here is graded as the
+    /// shell's output rather than as this rig being wrong.
+    #[test]
+    fn the_pattern_subset_matches_what_posix_says_it_does() {
+        let hit = |pat: &str, line: &str| m(pat, false, false, line).flatten();
+        // Literals, and a match that is not at the start.
+        assert_eq!(hit("foo", "foo"), Some((0, 3)));
+        assert_eq!(hit("foo", "a foo b"), Some((2, 5)));
+        assert_eq!(hit("foo", "bar"), None);
+        // Anchors. `^`/`$` are anchors only at the ends; elsewhere literal.
+        assert_eq!(hit("^foo", "foobar"), Some((0, 3)));
+        assert_eq!(hit("^foo", "xfoobar"), None);
+        assert_eq!(hit("foo$", "barfoo"), Some((3, 6)));
+        assert_eq!(hit("foo$", "barfoox"), None);
+        assert_eq!(hit("^$", ""), Some((0, 0)));
+        assert_eq!(hit("^$", "x"), None);
+        // …in a BRE. These three are asserted in the BASIC dialect on purpose,
+        // and their ERE counterparts are refusals rather than matches, in
+        // `a_pattern_outside_the_subset_is_refused_rather_than_approximated`:
+        // asserting only this half is what let the code generalise the BRE rule
+        // to a dialect where GNU makes both of them anchors.
+        assert_eq!(hit("a^b", "a^b"), Some((0, 3)));
+        assert_eq!(hit("a$b", "a$b"), Some((0, 3)));
+        // `.` is any byte, `*` is zero-or-more of the atom before it.
+        assert_eq!(hit("a.c", "abc"), Some((0, 3)));
+        assert_eq!(hit("a.c", "ac"), None);
+        assert_eq!(hit("ab*c", "ac"), Some((0, 2)));
+        assert_eq!(hit("ab*c", "abbbc"), Some((0, 5)));
+        // A leading `*` has nothing to repeat and is a literal asterisk.
+        assert_eq!(hit("*x", "*x"), Some((0, 2)));
+        // Classes: ranges, negation, `]` first and `-` last as literals.
+        assert_eq!(hit("[0-9]", "ab7"), Some((2, 3)));
+        assert_eq!(hit("[0-9]", "abc"), None);
+        assert_eq!(hit("[^/]", "/x"), Some((1, 2)));
+        assert_eq!(hit("[]]", "a]"), Some((1, 2)));
+        assert_eq!(hit("[a-]", "-"), Some((0, 1)));
+        assert_eq!(hit("[-a]", "-"), Some((0, 1)));
+        // An escape makes the next byte a literal.
+        assert_eq!(hit("a\\.c", "a.c"), Some((0, 3)));
+        assert_eq!(hit("a\\.c", "abc"), None);
+        // Greedy, and it gives bytes back when what follows cannot match --
+        // which is the only way `a*ab` matches `aaab` at all.
+        assert_eq!(hit("a*ab", "aaab"), Some((0, 4)));
+        assert_eq!(hit("a*", "aaa"), Some((0, 3)));
+        // `$` makes the repeat give back until the match reaches the end,
+        // rather than being rejected for having taken too much.
+        assert_eq!(hit("[0-9]*$", "a12"), Some((1, 3)));
+        assert_eq!(hit("b*$", "ab"), Some((1, 2)));
+        // ERE adds `+` and `?`; in a BRE both are ordinary characters.
+        let ere = |pat: &str, line: &str| m(pat, true, false, line).flatten();
+        assert_eq!(ere("[0-9]+", "a123b"), Some((1, 4)));
+        assert_eq!(ere("ab?c", "ac"), Some((0, 2)));
+        assert_eq!(ere("ab?c", "abc"), Some((0, 3)));
+        // `?` is at most ONE. Without this, `?` behaving as `*` passes both
+        // assertions above, since neither offers it a second `b` to take.
+        assert_eq!(ere("ab?c", "abbc"), None);
+        assert_eq!(ere("a+", "b"), None);
+        // Greedy backtracking must not be exponential: a run of repeats over a
+        // run of bytes explored every split, and 20 of them over 30 bytes ran
+        // for over ten seconds -- entirely inside the served subset, so no
+        // refusal could have caught it.
+        let pathological = "a*".repeat(20) + "b";
+        let hay = "a".repeat(30);
+        let started = std::time::Instant::now();
+        assert_eq!(ere(&pathological, &hay), None);
+        assert!(started.elapsed() < std::time::Duration::from_secs(2), "matching blew up");
+        assert_eq!(hit("a+b", "a+b"), Some((0, 3)));
+        assert_eq!(hit("a?b", "a?b"), Some((0, 3)));
+    }
+
+    /// `-i` folds the pattern where the haystack is folded, and a NEGATED class
+    /// is the one place the two can be composed the wrong way round: the fold
+    /// belongs before the negation, or the complement is widened instead of the
+    /// set it was taken of and `[^abc]` comes to match `a`.
+    #[test]
+    fn ignoring_case_does_not_widen_a_negated_class() {
+        let i = |pat: &str, line: &str| m(pat, false, true, line).flatten();
+        assert_eq!(i("foo", "FOO"), Some((0, 3)));
+        assert_eq!(i("FOO", "foo"), Some((0, 3)));
+        assert_eq!(i("[a-z]", "Q"), Some((0, 1)));
+        assert_eq!(i("[A-Z]", "q"), Some((0, 1)));
+        // The regression: `a` is excluded whichever case it arrives in.
+        assert_eq!(i("[^abc]", "a"), None);
+        assert_eq!(i("[^abc]", "A"), None);
+        assert_eq!(i("[^abc]", "z"), Some((0, 1)));
+        assert_eq!(i("[^ABC]", "a"), None);
+        assert_eq!(m("^[^abc]+z+$", true, true, "=a:aazz").flatten(), None);
+    }
+
+    /// Everything outside the subset is REFUSED. This is the applet's whole
+    /// safety argument: an approximated match would be graded as the shell's
+    /// output, where a refusal leaves the case xfail and names the pattern.
+    #[test]
+    fn a_pattern_outside_the_subset_is_refused_rather_than_approximated() {
+        let bad = |pat: &str, ere: bool| {
+            assert!(
+                Pattern::parse(pat.as_bytes(), ere, false).is_none(),
+                "accepted {pat:?} (ere={ere})"
+            );
+        };
+        // ERE's grouping, alternation and intervals.
+        for pat in ["a|b", "(ab)", "a{2}", "a{2,3}", "a)", "}"] {
+            bad(pat, true);
+        }
+        // A repeat where an ATOM belongs -- nothing precedes it to repeat.
+        // These reach the atom arm rather than the repeat one, which is why
+        // `+` and `?` have to be refused in BOTH places under `-E`.
+        for pat in ["+a", "?a", "+", "?"] {
+            bad(pat, true);
+        }
+        // A BRE spells those with backslashes, and they are refused there too
+        // rather than read as the literals an unescaped parse would make them.
+        for pat in ["\\|", "\\(ab\\)", "\\+", "\\?", "\\{2\\}"] {
+            bad(pat, false);
+        }
+        // Named classes, which a plain parse would silently read as the
+        // punctuation they are spelled with. BOTH spellings: the SINGLE-bracket
+        // typo is the one that turns up, and as a plain class it means
+        // `{:,a,l,p,h}` -- a set that matches, so nothing downstream can tell.
+        bad("[[:alpha:]]", false);
+        bad("[[:digit:]]x", false);
+        bad("[[=a=]]", false);
+        bad("[[.a.]]", false);
+        bad("[:alpha:]", false);
+        bad("[:digit:]", true);
+        bad("x[:space:]y", false);
+        // …but a class that merely CONTAINS a colon is not a named class, and
+        // the typo is only a typo where the colon comes FIRST. GNU reads
+        // `[a:alpha:]` as the ordinary set `{a,:,l,p,h}` and refuses only
+        // `[:alpha:]`, so the position is the whole distinction.
+        // Each of these is a NEAR MISS that GNU reads as the ordinary set of
+        // the bytes it is spelled with, and every one of the three conditions
+        // the scan tests separates one of them from the typo above: an empty
+        // name (`[::]`), a name that is not all letters (`[:a-b:]`), a `:` that
+        // does not close the class (`[:ab:c]`), and a colon that is not first.
+        for pat in ["[:]", "[a:b]", "[:a]", "[a-z:]", "[a:alpha:]", "[x:digit:]", "[ab:]",
+                    "[::]", "[:a-b:]", "[:ab:c]", "[:a-]", "[:ab]"] {
+            assert!(Pattern::parse(pat.as_bytes(), false, false).is_some(), "refused {pat:?}");
+        }
+        // …and the name need not be a REAL class name for the diagnosis to
+        // fire: GNU refuses `[:x:]` and `[:a1:]` too, so the shape is what is
+        // being recognised, not the vocabulary.
+        bad("[:x:]", false);
+        bad("[:a1:]", false);
+        let named = Pattern::parse(b"[a:alpha:]", false, false);
+        assert_eq!(named.and_then(|p| p.find_from(b"qla", 0)), Some((1, 2)), "not the plain set");
+        let colons = Pattern::parse(b"[::]", false, false);
+        assert_eq!(colons.and_then(|p| p.find_from(b"x:y", 0)), Some((1, 2)), "`[::]` is a colon");
+        // A range whose end opens another range: GNU calls it an invalid range
+        // end, and reading it as a literal `-` widens the class silently.
+        bad("[a-b-c]", false);
+        // ERE makes `^` and `$` anchors ANYWHERE, where a BRE makes them
+        // literals away from the ends. Serving neither, this refuses under
+        // `-E` rather than matching the literal a BRE would.
+        for pat in ["a$b", "a^b", "^^ab", "$$", "a$b$", "^a^"] {
+            bad(pat, true);
+        }
+        // A leading `*` is a literal to a BRE and a repeat of nothing to an
+        // ERE, which GNU warns about and matches.
+        bad("*x", true);
+        bad("^*x", true);
+        // GNU escapes are OPERATORS, not literals: `\b` is a word boundary and
+        // `\1` a backreference, so literalising them matched `bfoob` for
+        // `\bfoo\b` and missed `foo bar`.
+        for pat in ["\\bfoo\\b", "\\B", "\\w", "\\W", "\\s", "\\S", "\\<foo", "foo\\>", "\\1"] {
+            bad(pat, false);
+            bad(pat, true);
+        }
+        // …while an escape GNU calls a "stray backslash" stays the literal it
+        // reads it as. The corpus spells `\C-o\C-s\C-h` eight times.
+        for pat in ["\\C-o\\C-s\\C-h", "\\.", "\\*", "\\[", "\\-", "\\$", "\\^", "\\\\"] {
+            assert!(Pattern::parse(pat.as_bytes(), false, false).is_some(), "refused {pat:?}");
+        }
+        // Malformed: unterminated, reversed range, trailing backslash.
+        bad("[abc", false);
+        bad("a[", false);
+        bad("[z-a]", false);
+        bad("\\", false);
+        // A repeat OF a repeat, which would otherwise read the second operator
+        // as a literal and match something nobody asked for.
+        bad("a**", false);
+        bad("a**+", true);
+        bad("a+*", true);
+        bad("a?+", true);
+        // …and the shapes just inside the line still parse.
+        for (pat, ere) in [("a+b", false), ("a{2}", false), ("[0-9]+", true), ("a*", false)] {
+            assert!(Pattern::parse(pat.as_bytes(), ere, false).is_some(), "refused {pat:?}");
+        }
+    }
+
+    /// `-F` takes no pattern at all: every byte is itself.
+    #[test]
+    fn a_fixed_pattern_has_no_operators() {
+        let lit = |pat: &str, line: &str| {
+            Pattern::literal(pat.as_bytes(), false)?.find_from(line.as_bytes(), 0)
+        };
+        assert_eq!(lit("a.c", "a.c"), Some((0, 3)));
+        assert_eq!(lit("a.c", "abc"), None);
+        assert_eq!(lit("^foo", "^foo"), Some((0, 4)));
+        assert_eq!(lit("^foo", "foo"), None);
+        assert_eq!(lit("[0-9]", "x[0-9]"), Some((1, 6)));
+        assert_eq!(lit("a*", "aaa"), None);
+        // Bounded like `parse`: one stack frame per byte is matched, and this
+        // crate aborts on overflow rather than reporting it. A 120 KiB `-F`
+        // pattern against a line that matches it DID overflow.
+        let huge = "x".repeat(MAX_PATTERN + 1);
+        assert!(Pattern::literal(huge.as_bytes(), false).is_none());
+        assert!(Pattern::literal("x".repeat(MAX_PATTERN).as_bytes(), false).is_some());
+        assert!(Pattern::parse(huge.as_bytes(), false, false).is_none());
+    }
+
+    /// The applet around the matcher: status, `-q`, `-v`, `-o`, `-m`, and the
+    /// operands. `-o`'s anchor case is a regression -- searching a SLICE of the
+    /// line re-anchors `^` at every step, so `grep -o '^z'` printed one match
+    /// per leading `z` instead of one per line.
+    #[test]
+    fn grep_reports_its_status_and_prints_what_was_asked_for() {
+        let run = |args: &[&std::ffi::OsStr], data: &str| {
+            let owned: Vec<std::ffi::OsString> =
+                args.iter().map(|a| (*a).to_os_string()).collect();
+            let pat_args = owned;
+            let dir = Dir::new("grep");
+            let f = dir.0.join("in");
+            std::fs::write(&f, data).unwrap();
+            let mut argv = pat_args;
+            argv.push(f.into_os_string());
+            let done = grep(&argv, None);
+            (done.status, String::from_utf8_lossy(&done.out).into_owned())
+        };
+        // Status is the point: 0 when something matched, 1 when nothing did.
+        assert_eq!(run(&[os("foo").as_os_str()], "foo\nbar\n"), (0, "foo\n".into()));
+        assert_eq!(run(&[os("nope").as_os_str()], "foo\n"), (1, String::new()));
+        // `-q` prints nothing and still answers.
+        assert_eq!(run(&[os("-q").as_os_str(), os("foo").as_os_str()], "foo\n"), (0, String::new()));
+        assert_eq!(run(&[os("-q").as_os_str(), os("no").as_os_str()], "foo\n"), (1, String::new()));
+        // Non-adjacent matching lines print with NOTHING between them: the
+        // `--` separator belongs to context groups, and emitting it without a
+        // context option was a divergence from GNU.
+        assert_eq!(
+            run(&[os("foo").as_os_str()], "foo\nbar\nfoobar\n"),
+            (0, "foo\nfoobar\n".into())
+        );
+        // …and WITH one it appears, including at `-A 0`, which asks for a
+        // context of no extra lines rather than for no context.
+        assert_eq!(
+            run(&[os("-A").as_os_str(), os("0").as_os_str(), os("foo").as_os_str()],
+                "foo\nbar\nfoobar\n"),
+            (0, "foo\n--\nfoobar\n".into())
+        );
+        assert_eq!(
+            run(&[os("-A1").as_os_str(), os("foo").as_os_str()], "foo\nbar\nbaz\n"),
+            (0, "foo\nbar\n".into())
+        );
+        // `-v` inverts the selection, not the status.
+        assert_eq!(run(&[os("-v").as_os_str(), os("foo").as_os_str()], "foo\nbar\n"), (0, "bar\n".into()));
+        assert_eq!(run(&[os("-v").as_os_str(), os("x").as_os_str()], "x\n"), (1, String::new()));
+        // `-o` prints each match, and an anchored pattern can match only once.
+        assert_eq!(run(&[os("-o").as_os_str(), os("o").as_os_str()], "foo\n"), (0, "o\no\n".into()));
+        assert_eq!(run(&[os("-o").as_os_str(), os("^z").as_os_str()], "zz=2\n"), (0, "z\n".into()));
+        assert_eq!(
+            run(&[os("-o").as_os_str(), os("-i").as_os_str(), os("o").as_os_str()], "FOO\n"),
+            (0, "O\nO\n".into()),
+        );
+        // A pattern that can match NOTHING is why the `-o` loop advances past
+        // an empty match rather than to its end: `a*` matches the empty string
+        // at every position, so a loop that trusted the match to move forward
+        // would never terminate. GNU prints only the non-empty ones.
+        assert_eq!(run(&[os("-o").as_os_str(), os("a*").as_os_str()], "b\nab\n"), (0, "a\n".into()));
+        assert_eq!(run(&[os("-o").as_os_str(), os("x*").as_os_str()], "b\n"), (0, String::new()));
+        // `-o` and a CONTEXT option compose, which they did not while `-o`
+        // printed as it scanned: selection and printing are separate questions,
+        // so `-A` selects a line's neighbours and `-o` then prints whatever
+        // matches on each SELECTED line, separators included. This lost both.
+        assert_eq!(
+            run(&[os("-o").as_os_str(), os("-A1").as_os_str(), os("a").as_os_str()],
+                "a\nb\nc\na\n"),
+            (0, "a\n--\na\n".into())
+        );
+        // A context line that matches is printed even though `-v` did not
+        // select it -- `-o` prints the line's matches, not the selection.
+        assert_eq!(
+            run(&[os("-o").as_os_str(), os("-A1").as_os_str(), os("-v").as_os_str(),
+                  os("a").as_os_str()],
+                "aX\nbb\ncc\naY\n"),
+            (0, "a\n".into())
+        );
+        // A context window is CLAMPED to the last line. Unclamped, `-A` with a
+        // huge count iterated to `usize::MAX` and never returned.
+        let huge = format!("-A{}", usize::MAX);
+        let started = std::time::Instant::now();
+        assert_eq!(run(&[os(&huge).as_os_str(), os("x").as_os_str()], "x\n"), (0, "x\n".into()));
+        assert!(started.elapsed() < std::time::Duration::from_secs(5), "the context window hung");
+        // `-m` stops after that many matching lines.
+        assert_eq!(
+            run(&[os("-m").as_os_str(), os("1").as_os_str(), os("a").as_os_str()], "a\na\na\n"),
+            (0, "a\n".into())
+        );
+        // A file with no trailing newline still has a last line.
+        assert_eq!(run(&[os("bar").as_os_str()], "foo\nbar"), (0, "bar\n".into()));
+        // Empty input matches nothing rather than matching an empty line.
+        assert_eq!(run(&[os("^$").as_os_str()], ""), (1, String::new()));
+    }
+
+    /// The refusals and errors the applet answers with, all status 2 so none
+    /// can read as a grep that simply found nothing.
+    #[test]
+    fn grep_refuses_loudly_rather_than_guessing() {
+        let dir = Dir::new("grep-refuse");
+        let f = dir.0.join("in");
+        std::fs::write(&f, "foo\n").unwrap();
+        let arg = |s: &str| os(s);
+        // An option nobody implemented.
+        assert_eq!(grep(&[arg("-c"), arg("foo"), f.clone().into_os_string()], None).status, 2);
+        assert_eq!(grep(&[arg("--colour"), arg("foo")], None).status, 2);
+        // A pattern outside the subset, which is the important one.
+        let done = grep(&[arg("-E"), arg("a|b"), f.clone().into_os_string()], None);
+        assert_eq!(done.status, 2, "an unsupported pattern was matched anyway");
+        assert!(String::from_utf8_lossy(&done.err).contains("unsupported"));
+        // No pattern at all, and a file that is not there.
+        assert_eq!(grep(&[], None).status, 2);
+        assert_eq!(grep(&[arg("foo"), dir.at("nope")], None).status, 2);
+        // Several files would need GNU's `file:` prefixes, which nothing grades.
+        let two = [arg("foo"), f.clone().into_os_string(), f.clone().into_os_string()];
+        assert_eq!(grep(&two, None).status, 2);
+        // `--` ends the options, so a pattern that looks like one still works.
+        let done = grep(&[arg("--"), arg("-v"), f.clone().into_os_string()], None);
+        assert_eq!(done.status, 1, "`-v` after `--` was read as an option");
+        // Two matchers are a REFUSAL, not a race between two booleans. Testing
+        // `fixed` first made `-F` win silently whichever order they arrived in,
+        // and a preset counts as one of the two.
+        for argv in [
+            vec![arg("-E"), arg("-F"), arg("a.b")],
+            vec![arg("-F"), arg("-E"), arg("a.b")],
+            vec![arg("-EF"), arg("a.b")],
+        ] {
+            let done = grep(&argv, None);
+            assert_eq!(done.status, 2, "conflicting matchers were resolved silently");
+            assert!(String::from_utf8_lossy(&done.err).contains("conflicting"));
+        }
+        assert_eq!(grep(&[arg("-F"), arg("a.b")], Some(b'E')).status, 2, "egrep -F");
+        assert_eq!(grep(&[arg("-E"), arg("a.b")], Some(b'F')).status, 2, "fgrep -E");
+        // The long-option table, which nothing else reaches: each arm sets a
+        // DIFFERENT flag, so a table wired to the wrong one would otherwise be
+        // invisible. Asked against an input where each answers distinctly.
+        std::fs::write(&f, "foo\nbar\nfoo\n").unwrap();
+        let long = |a: &str, b: &str| {
+            let d = grep(&[arg(a), arg(b), f.clone().into_os_string()], None);
+            (d.status, String::from_utf8_lossy(&d.out).into_owned())
+        };
+        assert_eq!(long("--only-matching", "o"), (0, "o\no\no\no\n".into()));
+        assert_eq!(long("--invert-match", "foo"), (0, "bar\n".into()));
+        assert_eq!(long("--quiet", "foo"), (0, String::new()));
+        assert_eq!(long("--silent", "nope"), (1, String::new()));
+        assert_eq!(long("--ignore-case", "FOO"), (0, "foo\nfoo\n".into()));
+        assert_eq!(long("--extended-regexp", "o+"), (0, "foo\nfoo\n".into()));
+        assert_eq!(long("--fixed-strings", "o+"), (1, String::new()));
+        assert_eq!(long("--max-count=1", "foo"), (0, "foo\n".into()));
+        assert_eq!(
+            grep(&[arg("--max-count"), arg("1"), arg("foo"), f.clone().into_os_string()], None)
+                .status,
+            0
+        );
+        // …and the two spellings GNU refuses: a prefix that is not the option,
+        // and an EMPTY attached value, which silently took the next argument.
+        assert_eq!(grep(&[arg("--max-count1"), arg("foo")], None).status, 2);
+        let eaten = grep(&[arg("--max-count="), arg("1"), arg("foo")], None);
+        assert_eq!(eaten.status, 2, "`--max-count=` consumed the next argument");
+        // The presets are the only difference between the three names: `+` is
+        // a repeat to egrep, a literal to grep, and `.` is a full stop to fgrep.
+        std::fs::write(&f, "a+b\naxb\n").unwrap();
+        let out = |p: Option<u8>, pat: &str| {
+            let d = grep(&[arg("-o"), arg(pat), f.clone().into_os_string()], p);
+            String::from_utf8_lossy(&d.out).into_owned()
+        };
+        assert_eq!(out(None, "a+b"), "a+b\n");
+        assert_eq!(out(Some(b'E'), "ax+b"), "axb\n");
+        assert_eq!(out(Some(b'F'), "a+b"), "a+b\n");
+        assert_eq!(out(Some(b'F'), "a.b"), "");
     }
 
     /// Parse-then-apply in one step, which is how every assertion below reads

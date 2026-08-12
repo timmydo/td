@@ -71,13 +71,13 @@ const HEADER: &str = "\
 #           status-127 `command not found` failures, because the cleared-env `-c`
 #           harness exposes no external PATH beyond the shell itself and the
 #           `spec_helpers` applets (the Oils `argv.py`/`printenv.py`, and `cat`,
-#           `mkdir`, `touch`, `rm`, `wc`, `sleep`, `seq`, `chmod`). Those are real
-#           mismatches today, but MEASURE before mining the list, because `not
-#           found` is reported identically for two different things. Some of those
-#           names are BUILTINS td-sh does not have (`shopt`, `typeset`, `declare`,
-#           `compgen`) and are true shell gaps; the rest are EXTERNALS the harness
-#           still withholds (`grep`, `sed`, `od`, `sort`, `tail`) and say
-#           nothing about the shell. Both groups are large and neither dominates.
+#           `mkdir`, `touch`, `rm`, `wc`, `sleep`, `seq`, `chmod`, `grep`, `egrep`,
+#           `fgrep`). Those are real mismatches today, but MEASURE before mining the
+#           list, because `not found` is reported identically for two different
+#           things. Some of those names are BUILTINS td-sh does not have (`shopt`,
+#           `typeset`, `declare`, `compgen`) and are true shell gaps; the rest are
+#           EXTERNALS the harness still withholds (`sed`, `od`, `sort`, `tail`) and
+#           say nothing about the shell. Both groups are large, neither dominates.
 #           No counts are given here on purpose: this file is regenerated wholesale,
 #           so a number in it would silently describe some earlier tree.
 #   skip  = not run at all, because it cannot be evaluated faithfully here:
@@ -291,6 +291,18 @@ fn probe_helper(
         // `sleep` must take a FRACTION: every use in the corpus is one, and an
         // integer-only parse would sleep zero and look like it worked.
         ("sleep 0.01 && echo slept", "slept\n"),
+        // `grep` is graded on its STATUS more often than its output -- 30 of
+        // its uses are `-q` -- so the probe asks both, and asks the negative
+        // too: a matcher that said yes to everything would pass the first half.
+        ("printf 'foo\\nbar\\n' | grep foo", "foo\n"),
+        ("printf 'foo\\n' | grep -q nope; echo $?", "1\n"),
+        // The two dialects differ on ONE thing the corpus depends on: `+` is a
+        // repeat to `egrep` and a literal to `grep`. A probe that asked only
+        // the first would pass with both wired to the same parser.
+        ("printf 'a12b\\n' | egrep -o '[0-9]+'", "12\n"),
+        ("printf 'a+b\\n' | grep -o 'a+b'", "a+b\n"),
+        // `fgrep` takes no pattern at all: `.` is a full stop, not any-byte.
+        ("printf 'axc\\na.c\\n' | fgrep -o 'a.c'", "a.c\n"),
     ];
     // The probe list is written out rather than generated -- each applet needs
     // a question only IT can answer -- so it can drift from the roster it is

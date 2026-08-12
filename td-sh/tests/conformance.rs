@@ -360,6 +360,39 @@ fn the_binary_reports_its_applets_status_and_diagnostic(
     assert_eq!(out.status.code(), Some(0), "sleep: {:?}", out.stderr);
     assert!(out.stdout.is_empty() && out.stderr.is_empty());
     assert!(start.elapsed() >= std::time::Duration::from_millis(45), "sleep did not sleep");
+    // The grep family is THREE dispatch arms onto one applet, differing only
+    // in the preset each passes. Wired to the same preset — or to each other —
+    // the unit tests would still pass, since they call `grep` directly with
+    // the preset as an argument. `+` is what separates them: a repeat to
+    // `egrep`, a literal to `grep`, and to `fgrep` so is `.`.
+    // `fgrep` is asked with `a.b` rather than `a+b`, because `+` is a literal
+    // to a BASIC expression too — so `a+b` cannot tell `-F` from no preset at
+    // all, and the arm could be wired to either and still look right.
+    for (name, pat, want) in [
+        ("grep", "a+b", "a+b\n"),
+        ("egrep", "ax+b", "axb\n"),
+        ("fgrep", "a.b", ""),
+    ] {
+        let link = dir.join(name);
+        let _ = std::fs::remove_file(&link);
+        std::os::unix::fs::symlink(spec_helpers_bin(), &link)?;
+        let mut child = std::process::Command::new(&link)
+            .args(["-o", pat])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()?;
+        if let Some(mut w) = child.stdin.take() {
+            std::io::Write::write_all(&mut w, b"a+b\naxb\n")?;
+        }
+        let out = child.wait_with_output()?;
+        let expect = match want.is_empty() {
+            true => Some(1),
+            false => Some(0),
+        };
+        assert_eq!(out.status.code(), expect, "{name}: {:?}", out.stderr);
+        assert_eq!(String::from_utf8_lossy(&out.stdout), want, "{name} read `{pat}` wrongly");
+    }
     // The other three applets whose dispatch arms nothing else here reaches.
     let out = run("seq", &["3"])?;
     assert_eq!((out.status.code(), out.stdout.as_slice()), (Some(0), b"1\n2\n3\n".as_slice()));
