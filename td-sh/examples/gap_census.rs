@@ -38,10 +38,26 @@
 //! `conformance.rs`'s `umask_is_ashs_including_the_symbolic_form` holds values
 //! measured on busybox 1.37.0 that contradict it clause by clause.
 //!
-//! So the ranking is SPLIT by the identity each case is graded as. Failures
-//! graded as ash are gaps in the shell td-sh models. Failures graded as dash
-//! are candidates: reachable where the shells agree, and a trap where they do
-//! not. Before taking a dash-graded cluster, find out what ash does -- the
+//! So the ranking is SPLIT, on two axes. First by the identity each case is
+//! graded as; then by whether every field that DIFFERED came from a block of
+//! that identity's own, rather than from the unqualified one. Only the first is
+//! a recorded answer from the shell. The unqualified block is osh's ideal, and
+//! a shell the file compared saying nothing about it does not mean it agrees --
+//! `effective_chain` in `lib.rs` argues that at length, and this corpus refutes
+//! the stronger reading outright.
+//!
+//! Per FIELD because that is how the golden resolves: a case can carry an ash
+//! `stderr` block, take its stdout from the default, and fail on the stdout,
+//! which is a failure against the ideal however the case as a whole is
+//! designated. Asking per case instead put six of those in the wrong column.
+//!
+//! That second axis is not a technicality. `builtin-trap-err.test.sh` leads the
+//! ash column at 17, and 14 of those are the ideal: the whole bash ERR trap,
+//! held against a shell with no block in that file to say it has one. The 36
+//! cases across the corpus where ash's OWN block is the golden of every field
+//! that differed are the ones nothing needs to be assumed about.
+//!
+//! Before taking a cluster from any other bucket, find out what ash does -- the
 //! corpus sometimes records it in a neighbouring file, and this crate's own
 //! busybox-measured tests are the other place to look.
 //!
@@ -56,13 +72,25 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use td_sh::{
-    case_keys, designates, graded_identity, parse_spec, run_case, spec_paths, ASH_DASH_CHAIN,
+    annotates_field, case_keys, designates, graded_identity, parse_spec, run_case,
+    spec_paths, ASH_DASH_CHAIN,
 };
 
-/// The bucket for a case whose file ran neither chain shell, so its golden is
-/// the unqualified block -- osh's ideal, which is bash-shaped and mostly out of
-/// scope for this shell.
+/// The identity half of a bucket key for a case designating neither chain
+/// shell, whose golden is therefore always the unqualified block -- osh's
+/// ideal, which is bash-shaped and mostly out of scope for this shell.
 const NEITHER: &str = "neither";
+
+/// How a bucket key reads. The two halves are the two axes: which identity the
+/// golden is resolved for, and whether every field that DIFFERED came from that
+/// identity's own block rather than the unqualified one.
+fn label((id, own): (&str, bool)) -> String {
+    let from = match own {
+        true => "its own block",
+        false => "the ideal",
+    };
+    format!("{id} ({from})")
+}
 
 /// The command a `not found` diagnostic NAMES, where the golden asserted stderr
 /// and so kept it.
@@ -203,8 +231,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Split by the identity each case is GRADED as, which is the one thing the
     // ranking below cannot say and the one that decides whether a cluster is
     // reachable at all. See the note at the head of this file.
-    let mut per_file_by_id: BTreeMap<&str, BTreeMap<String, usize>> = BTreeMap::new();
-    let mut by_identity: BTreeMap<&str, usize> = BTreeMap::new();
+    // Keyed by (identity, its-own-block) so the ORDER below is the tuple's and
+    // no label has to be parsed back out of a string.
+    let mut per_file_by_id: BTreeMap<(&str, bool), BTreeMap<String, usize>> = BTreeMap::new();
+    let mut by_identity: BTreeMap<(&str, bool), usize> = BTreeMap::new();
     let mut wanted: BTreeMap<String, usize> = BTreeMap::new();
     let mut named: BTreeMap<String, usize> = BTreeMap::new();
     let mut buckets: BTreeMap<String, usize> = BTreeMap::new();
@@ -249,15 +279,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 passed += 1;
                 continue;
             }
-            // Three-way, not two: `graded_identity` falls back to the chain
-            // head, so a file that ran NEITHER shell also reports "ash", and
-            // that one is the bash/osh ideal rather than anything about ash.
+            // Three identities, not two: `graded_identity` falls back to the
+            // chain head, so a case designating NEITHER shell also reports
+            // "ash". And each is split again by where the golden came from,
+            // because being graded as ash is not the same as ash having said
+            // anything -- `effective_chain` spells out why silence is not
+            // agreement, and 14 of `builtin-trap-err`'s 17 are the bash ERR
+            // trap held against a shell with no block in that file.
             let id = match graded_identity(case, ASH_DASH_CHAIN) {
                 Some(id) if designates(case, id) => id,
                 _ => NEITHER,
             };
-            *by_identity.entry(id).or_default() += 1;
-            *per_file_by_id.entry(id).or_default().entry(file.clone()).or_default() += 1;
+            // Per FIELD, because that is how the golden resolves and how a
+            // mismatch is reported: a case carrying an ash `stderr` block and
+            // failing on its stdout is measured against the ideal, whatever the
+            // case as a whole designates. Every differing field has to be the
+            // shell's own for the failure to be one.
+            let own = id != NEITHER
+                && !outcome.mismatched.is_empty()
+                && outcome.mismatched.iter().all(|f| annotates_field(case, id, *f));
+            *by_identity.entry((id, own)).or_default() += 1;
+            *per_file_by_id.entry((id, own)).or_default().entry(file.clone()).or_default() += 1;
             if outcome.timed_out || outcome.truncated {
                 *buckets.entry("not evaluated (timeout/cap)".into()).or_default() += 1;
                 continue;
@@ -299,25 +341,36 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("  {n:5}  {what}");
     }
     println!("\nWHICH SHELL THE GOLDEN CAME FROM");
-    // "designates", not "ran": a case designates a shell by its file's header OR
-    // by carrying an annotation block for it, and 31 (file, id) pairs in this
-    // corpus do it the second way. For those the file never ran the shell, so a
-    // field with no block of its own still falls to the ideal -- the same trap
-    // one level down.
-    println!("  ash      designates ash, so this is a gap in the shell td-sh models");
+    // Two axes, and the second is the one that stops this being read as a
+    // to-do list. "designates", not "ran": a case designates a shell by its
+    // file's header OR by carrying a block for it, and 31 (file, id) pairs here
+    // do it the second way. Then `its own block` versus `the ideal`: only the
+    // first is a recorded answer FROM that shell. The ideal is osh's, and
+    // silence from a shell the file compared says nothing about whether it
+    // agrees -- `effective_chain` in lib.rs is where that is argued.
+    println!("  ash      designates ash. `its own block' means every field that");
+    println!("           DIFFERED resolved to a block of ash's own, so it is a");
+    println!("           recorded gap; `the ideal' is only what ash was measured");
+    println!("           against, and silence is not agreement");
     println!("  dash     designates dash and NOT ash, so the chain fell through --");
-    println!("           reachable where the shells agree, a trap where they do not");
-    println!("  {NEITHER}  designates neither, so the golden is the bash/osh ideal");
-    let mut ids: Vec<(&&str, &usize)> = by_identity.iter().collect();
+    println!("           reachable where the shells agree, a trap where they do");
+    println!("           not, and split the same two ways");
+    println!("  {NEITHER}  designates neither, so the golden is always the ideal");
+    let mut ids: Vec<(&(&str, bool), &usize)> = by_identity.iter().collect();
     ids.sort_by_key(|(_, n)| std::cmp::Reverse(**n));
-    for (id, n) in ids {
-        println!("  {n:5}  graded as {id}");
+    for (key, n) in ids {
+        println!("  {n:5}  graded as {}", label(*key));
     }
-    for id in ASH_DASH_CHAIN.iter().chain(std::iter::once(&NEITHER)) {
-        let Some(files) = per_file_by_id.get(id) else {
-            continue;
-        };
-        println!("\nWHERE THEY ARE, graded as {id}, most-failing file first");
+    // ash before dash before neither, and each shell's own block before the
+    // ideal -- the order the tuple key already has.
+    let mut order: Vec<(&(&str, bool), &BTreeMap<String, usize>)> =
+        per_file_by_id.iter().collect();
+    order.sort_by_key(|((id, own), _)| {
+        let head = ASH_DASH_CHAIN.iter().position(|c| c == id).unwrap_or(ASH_DASH_CHAIN.len());
+        (head, !*own, *id)
+    });
+    for (key, files) in order {
+        println!("\nWHERE THEY ARE, graded as {}, most-failing file first", label(*key));
         let mut files: Vec<(&String, &usize)> = files.iter().collect();
         files.sort_by(|a, b| b.1.cmp(a.1).then(a.0.cmp(b.0)));
         let shown = 15.min(files.len());

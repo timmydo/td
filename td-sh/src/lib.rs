@@ -176,6 +176,10 @@ pub struct CaseOutcome {
     /// reason: the overlay generator routes on it, and "cannot be evaluated
     /// faithfully here" is `skip`, not a wrong answer to be listed as `xfail`.
     pub truncated: bool,
+    /// Which fields differed. Typed rather than read back out of `detail`, whose
+    /// stdout/stderr entries embed the streams themselves -- an expected output
+    /// containing `stderr: expected` would otherwise be counted as one.
+    pub mismatched: Vec<Field>,
 }
 
 // ---- parsing -------------------------------------------------------------
@@ -440,8 +444,11 @@ pub fn parse_spec(input: &str) -> Result<Vec<SpecCase>, SpecError> {
 
 // ---- golden resolution ---------------------------------------------------
 
-#[derive(Clone, Copy)]
-enum Field {
+/// Public because a mismatch is reported per field and the golden is RESOLVED
+/// per field, so the only honest way to ask where a failure's golden came from
+/// is to ask about the fields that actually differed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Field {
     Status,
     Stdout,
     Stderr,
@@ -506,8 +513,29 @@ fn names_identity(token: &str, id: &str) -> bool {
 /// that designates ash and for one that designates neither chain shell -- and
 /// those two are opposite verdicts about whether a failure is worth fixing.
 pub fn designates(case: &SpecCase, id: &str) -> bool {
-    case.compare_shells.iter().any(|t| names_identity(t, id))
-        || case.annotations.iter().any(|a| a.shells.iter().any(|s| s == id))
+    case.compare_shells.iter().any(|t| names_identity(t, id)) || annotates(case, id)
+}
+
+/// Whether the case carries an annotation block NAMING `id` -- the half of
+/// `designates` that is about the case rather than its file.
+///
+/// Per-CASE, so it cannot answer where a FAILURE's golden came from -- a case
+/// annotating only `status` for `id` answers true here while its stdout still
+/// comes from the default. `annotates_field` is what a claim about a failure
+/// has to be built on, and is the one the census uses.
+fn annotates(case: &SpecCase, id: &str) -> bool {
+    case.annotations.iter().any(|a| a.shells.iter().any(|s| s == id))
+}
+
+/// `annotates`, narrowed to one field -- which is the resolution `pick` actually
+/// performs, so this is the version a claim about a FAILURE has to be built on.
+/// A case can carry an ash `stderr` block and take its stdout from the default,
+/// and then fail on the stdout: per-case, that reads as ash's own answer; per
+/// field, it is the ideal, which is what it is.
+pub fn annotates_field(case: &SpecCase, id: &str, field: Field) -> bool {
+    case.annotations
+        .iter()
+        .any(|a| key_in_field(&a.key, field) && a.shells.iter().any(|s| s == id))
 }
 
 /// `chain`, truncated after the first identity the case actually designates.
@@ -695,8 +723,10 @@ pub fn resolve(case: &SpecCase, chain: &[&str]) -> Result<Expected, SpecError> {
 /// Compare a shell's observed result against the resolved expectation.
 fn evaluate(name: &str, expected: &Expected, status: i32, stdout: &[u8], stderr: &[u8]) -> CaseOutcome {
     let mut fails: Vec<String> = Vec::new();
+    let mut mismatched: Vec<Field> = Vec::new();
     if status != expected.status {
         fails.push(format!("status: expected {}, got {}", expected.status, status));
+        mismatched.push(Field::Status);
     }
     if let Some(exp) = &expected.stdout {
         if exp.as_bytes() != stdout {
@@ -705,6 +735,7 @@ fn evaluate(name: &str, expected: &Expected, status: i32, stdout: &[u8], stderr:
                 exp,
                 String::from_utf8_lossy(stdout)
             ));
+            mismatched.push(Field::Stdout);
         }
     }
     if let Some(exp) = &expected.stderr {
@@ -714,6 +745,7 @@ fn evaluate(name: &str, expected: &Expected, status: i32, stdout: &[u8], stderr:
                 exp,
                 String::from_utf8_lossy(stderr)
             ));
+            mismatched.push(Field::Stderr);
         }
     }
     let passed = fails.is_empty();
@@ -723,6 +755,7 @@ fn evaluate(name: &str, expected: &Expected, status: i32, stdout: &[u8], stderr:
         detail: if passed { None } else { Some(fails.join("; ")) },
         timed_out: false,
         truncated: false,
+        mismatched,
     }
 }
 
@@ -1010,6 +1043,7 @@ pub fn run_case(
             )),
             timed_out: run.timed_out,
             truncated: true,
+            mismatched: Vec::new(),
         });
     }
     let (status, timed_out) = (run.status, run.timed_out);
@@ -1525,10 +1559,10 @@ false
 
     #[test]
     fn a_dash_override_does_not_outrank_a_file_that_compared_ash() -> Result<(), SpecError> {
-        // SAMPLE's `## compare_shells:` lists ash, so Oils RAN ash here and wrote
-        // no block for it -- which is evidence that the default block is ash's own
-        // answer. The `## OK dash` block records where dash left it, not where we
-        // should be, so it must not be inherited.
+        // SAMPLE's `## compare_shells:` lists ash, so the default block is the
+        // golden ash is HELD TO -- not evidence that ash produced it, which is
+        // the inference `effective_chain` above refuses. The `## OK dash` block
+        // records where dash left it, so it must not be inherited either way.
         let cases = parse_spec(SAMPLE)?;
         let c = cases.get(2).ok_or_else(|| SpecError::new(0, "missing case"))?;
         assert_eq!(resolve(c, ASH_DASH_CHAIN)?.stdout.as_deref(), Some("default-ideal\n"));
@@ -1627,6 +1661,29 @@ dash-says
         let annotated = one("## compare_shells: bash\n\n#### c\ntrue\n## OK dash status: 3\n")?;
         assert!(designates(&annotated, "dash"));
         assert_eq!(graded_identity(&annotated, ASH_DASH_CHAIN), Some("dash"));
+        // And being GRADED as a shell is not that shell having said anything:
+        // `ran_ash` is graded as ash off its header alone, so its golden is the
+        // unqualified block -- osh's ideal, which nothing promises ash matches.
+        // That is the difference between a recorded gap and a case ash was
+        // merely measured against, and only `annotates` can tell them apart.
+        assert!(!annotates(&ran_ash, "ash"));
+        // Against a case that HAS an annotation, just not one naming ash:
+        // `ran_ash` carries none at all, so on its own it cannot tell a block
+        // naming ash from any block whatever.
+        let other = one("## compare_shells: bash ash\n\n#### c\ntrue\n## OK mksh status: 3\n")?;
+        assert!(!annotates(&other, "ash") && designates(&other, "ash"));
+        // And per CASE is not per FIELD, which is the distinction a claim about
+        // a FAILURE turns on: this one carries an ash `stderr` block and takes
+        // its stdout from the default, so a stdout mismatch here is measured
+        // against the ideal however the case as a whole designates.
+        let split = one(
+            "## compare_shells: bash ash\n\n#### c\ntrue\n## STDOUT:\nx\n## END\n\
+             ## OK ash STDERR:\ny\n## END\n",
+        )?;
+        assert!(annotates(&split, "ash"));
+        assert!(annotates_field(&split, "ash", Field::Stderr));
+        assert!(!annotates_field(&split, "ash", Field::Stdout));
+        assert!(!annotates_field(&split, "ash", Field::Status));
         Ok(())
     }
 
@@ -1777,6 +1834,29 @@ dash-says
     }
 
     #[test]
+    fn evaluate_records_which_fields_differed() {
+        // The census resolves a failure's golden per field, so it needs to know
+        // which ones differed -- and reading that back out of `detail` is what
+        // this list exists to avoid, since a stdout entry embeds the stream and
+        // an expected output containing `stderr: expected` would count as one.
+        let all = Expected {
+            status: 0,
+            stdout: Some("out\n".into()),
+            stderr: Some("err\n".into()),
+        };
+        let out = evaluate("c", &all, 3, b"nope\n", b"err\n");
+        assert_eq!(out.mismatched, vec![Field::Status, Field::Stdout]);
+        let out = evaluate("c", &all, 0, b"out\n", b"nope\n");
+        assert_eq!(out.mismatched, vec![Field::Stderr]);
+        let out = evaluate("c", &all, 0, b"out\n", b"err\n");
+        assert!(out.passed && out.mismatched.is_empty());
+        // A field the case does not assert cannot differ, however wrong it is.
+        let only_status = Expected { status: 0, stdout: None, stderr: None };
+        let out = evaluate("c", &only_status, 0, b"anything\n", b"anything\n");
+        assert!(out.passed && out.mismatched.is_empty());
+    }
+
+    #[test]
     fn evaluate_passes_when_output_matches() {
         let expected = Expected { status: 0, stdout: Some("hi\n".into()), stderr: None };
         let out = evaluate("x", &expected, 0, b"hi\n", b"");
@@ -1791,6 +1871,7 @@ dash-says
             detail: if passed { None } else { Some("mismatch".into()) },
             timed_out: false,
             truncated: false,
+            mismatched: Vec::new(),
         }
     }
 
