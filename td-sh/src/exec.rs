@@ -1193,7 +1193,7 @@ pub fn run_command(sh: &mut Shell, cmd: &Cmd) -> R<()> {
 /// the Rust runtime ignores SIGPIPE before `main`, so it ends the way a caller
 /// observes: 128 + SIGPIPE, as `Sig::Exit` so a pipeline stage is confined
 /// exactly as a forked producer's death would be.
-fn epipe_pending(sh: &Shell) -> R<()> {
+pub(crate) fn epipe_pending(sh: &Shell) -> R<()> {
     if sh.stderr_epipe.load(Ordering::Relaxed) {
         return Err(Sig::Exit(141));
     }
@@ -2947,6 +2947,113 @@ mod tests {
         // anyway satisfies all of them. This one would print.
         let (_status, out, _) = run("( echo RAN ) </no/such/td-e; echo st=$?");
         assert_eq!(out, "st=2\n");
+    }
+
+    #[test]
+    fn a_backgrounded_compounds_failed_redirection_is_fatal_too() {
+        // The OTHER node that reaches ash's forked-child redirect path: `&` wraps
+        // its operand in an `NREDIR` only when it is not one already, so a bare
+        // compound carrying redirections keeps them and is retyped to `NBACKGND`,
+        // which `evalsubshell` runs. Every compound spelling, plus the brace group
+        // that is transparent because it carries no redirections of its own.
+        for src in [
+            "{ :; } </no/such/td-e",
+            "if true; then :; fi </no/such/td-e",
+            "while false; do :; done </no/such/td-e",
+            "until true; do :; done </no/such/td-e",
+            "for i in a; do :; done </no/such/td-e",
+            "case x in x) :;; esac </no/such/td-e",
+            "{ { :; } </no/such/td-e; }",
+            "{ { { :; } </no/such/td-e; }; }",
+        ] {
+            let (_status, out, _) = run(&format!("{src} & wait $!; echo st=$?"));
+            assert_eq!(out, "st=2\n", "src: {src}");
+        }
+        // The controls, which are what make it the NODE's rule. The first six have
+        // a node of their own, so `&` wraps them and the redirection stays
+        // `redirectsafe` -- `[[ ]]` among them, since busybox ash serves it from
+        // `test` in an ordinary `NCMD`. The last three are the transparency
+        // boundary: two items inside is an `NSEMI`, an outer group carrying its
+        // OWN redirection is itself the node that gets retyped so the inner
+        // failure is ordinary, and an inner item that is already `&` is not the
+        // single sequential one this sees through.
+        for (src, want) in [
+            ("true </no/such/td-e", "st=1\n"),
+            ("f() { :; }; f </no/such/td-e", "st=1\n"),
+            ("( { :; } </no/such/td-e )", "st=1\n"),
+            ("{ :; } </no/such/td-e && true", "st=1\n"),
+            ("{ true </no/such/td-e; }", "st=1\n"),
+            ("true | { :; } </no/such/td-e", "st=1\n"),
+            ("[[ -n x ]] </no/such/td-e", "st=1\n"),
+            ("! { :; } </no/such/td-e", "st=0\n"),
+            ("{ { :; } </no/such/td-e; echo X; }", "X\nst=0\n"),
+            ("{ { :; } </no/such/td-e; } >/dev/null", "st=1\n"),
+            ("{ { :; } </no/such/td-e & }", "st=0\n"),
+        ] {
+            let (_status, out, _) = run(&format!("{src} & wait $!; echo st=$?"));
+            assert_eq!(out, want, "src: {src}");
+        }
+        // The same group written over lines. `Sep` has only `Seq` and `Bg`, so a
+        // newline is already `Seq` and this holds -- pinned because the
+        // transparency test matches that variant by name, and a third one would
+        // make every multi-line script take the ordinary path in silence.
+        let (_status, out, _) = run("{\n{ :; } </no/such/td-e\n} & wait $!; echo st=$?");
+        assert_eq!(out, "st=2\n");
+        // And the compound still RUNS when its redirections are fine, which none
+        // of the above would notice: the shape is detected by taking the
+        // redirections OFF the command, so a bug there loses the body or its
+        // output rather than a status.
+        let path = std::env::temp_dir().join(format!("td-sh-bgredir-{}", std::process::id()));
+        let (_status, out, _) = run(&format!(
+            "{{ echo INSIDE; }} >'{p}' & wait $!; echo st=$?; read x <'{p}'; echo got=$x",
+            p = path.display()
+        ));
+        assert_eq!(out, "st=0\ngot=INSIDE\n");
+        let _ = std::fs::remove_file(&path);
+        let (_status, out, _) = run("{ exit 7; } >/dev/null & wait $!; echo st=$?");
+        assert_eq!(out, "st=7\n");
+    }
+
+    #[test]
+    fn a_backgrounded_compounds_redirections_wait_for_the_guards_around_them() {
+        // This arm reaches the redirections before `run_pipeline` and
+        // `run_command` do, so it owes what they do around one. `-n` first:
+        // applying a redirection IS running, and an output target would be
+        // created or truncated by a shell asked only to parse.
+        let unmade = std::env::temp_dir().join(format!("td-sh-noexec-{}", std::process::id()));
+        let _ = std::fs::remove_file(&unmade);
+        let (_status, _out, err) =
+            run(&format!("set -n; {{ :; }} >'{}' &", unmade.display()));
+        assert!(!unmade.exists(), "-n created the target");
+        assert_eq!(err, "");
+        // And the line, which the redirections expand under: the target names
+        // the compound's OWN line, as it does in every other position. Written
+        // on line 3 below, and the bug this pins reported the script's first.
+        let dir = std::env::temp_dir().join(format!("td-sh-bgline-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let Ok(()) = std::fs::create_dir_all(&dir) else {
+            panic!("fixture dir");
+        };
+        let (_status, out, _) = run(&format!(
+            ":\n:\n{{ :; }} >\"{}/f$LINENO\" & wait $!\nfor f in '{}'/*; do echo made=${{f##*/}}; done",
+            dir.display(),
+            dir.display()
+        ));
+        assert_eq!(out, "made=f3\n");
+        let _ = std::fs::remove_dir_all(&dir);
+        // And through a transparent brace it is the INNER node's line -- the one
+        // ash retypes -- not the group's. Measured: this writes `f3` under ash,
+        // where the outer `{` is on line 2.
+        let Ok(()) = std::fs::create_dir_all(&dir) else {
+            panic!("fixture dir");
+        };
+        let (_status, out, _) = run(&format!(
+            ":\n{{\n{{ :; }} >\"{}/f$LINENO\"\n}} & wait $!\nfor f in '{}'/*; do echo made=${{f##*/}}; done",
+            dir.display(),
+            dir.display()
+        ));
+        assert_eq!(out, "made=f3\n");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

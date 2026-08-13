@@ -69,7 +69,7 @@
 
 use crate::ast::AndOr;
 use crate::exec::{self, Sig};
-use crate::process::Subshell;
+use crate::process::{self, Subshell};
 use std::thread::JoinHandle;
 
 /// First job id. Above Linux's `PID_MAX_LIMIT` (4194304) so an id can never be
@@ -749,7 +749,10 @@ pub fn spawn(mut child: Subshell, and_or: &AndOr) -> Result<JoinHandle<i32>, Str
     // error path.
     std::thread::Builder::new()
         .spawn(move || {
-            let status = match exec::run_and_or(&mut child, &and_or) {
+            // NOT `run_and_or`: `&`'s operand is a node ash treats specially when
+            // it is a bare compound carrying redirections. See
+            // `process::run_background_operand`.
+            let status = match process::run_background_operand(&mut child, &and_or) {
                 Ok(()) => child.status,
                 // `Return` is here beside them because a job IS the end of a
                 // shell environment: `f() { return 7 & }` has nowhere left to

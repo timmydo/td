@@ -29,7 +29,7 @@ use std::os::unix::process::ExitStatusExt;
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 
-use crate::ast::{List, Redir, RedirKind, Stage};
+use crate::ast::{AndOr, Cmd, List, Redir, RedirKind, Sep, Stage};
 use crate::exec::{self, Shell, Sig, R};
 
 /// One entry in the shell's descriptor table. Everything shareable is behind an
@@ -320,14 +320,12 @@ const REDIR_ERROR: i32 = 1;
 /// uses `redirectsafe`, so a failure there is a fatal shell error the child dies
 /// of rather than a status it reports, and `ash_msg_and_raise_error` exits 2.
 ///
-/// Two node types reach that path and td-sh serves ONE. A subshell does, and is
-/// what this constant is used for. So does a bare compound that is `&`'s direct
-/// operand: ash's `&` wraps its operand in an `NREDIR` only if it is not one
-/// already, so `{ :; } <missing &` keeps its redirect list and is RETYPED to
-/// `NBACKGND`, which `evalsubshell` also runs. td-sh reports 1 there and ash 2 —
-/// measured across the six compound spellings, against five controls that do get
-/// wrapped and so stay 1 (a simple command, a function call, a subshell, an
-/// and-or, and a redirect written on the inner command).
+/// Two node types reach that path and both are served. A subshell is one, from
+/// `run_subshell`. The other is a bare compound that is `&`'s direct operand:
+/// ash's `&` wraps its operand in an `NREDIR` only if it is not one already, so
+/// `{ :; } <missing &` keeps its redirect list and is RETYPED to `NBACKGND`,
+/// which `evalsubshell` also runs — see `run_background_operand`. Anything with
+/// a node of its own is wrapped and keeps `REDIR_ERROR`.
 const FORKED_REDIR_ERROR: i32 = 2;
 
 /// What `open("")` reports, which is the one target the shell has to answer for
@@ -772,6 +770,123 @@ pub fn run_subshell(sh: &mut Shell, body: &List, redirs: &[Redir]) -> R<()> {
     let status = exec::run_exit_trap(&mut child, status);
     sh.set_status(status);
     Ok(())
+}
+
+/// Run `&`'s operand, which is not always the same as running the list. ash wraps
+/// that operand in an `NREDIR` only when it is not one already, so a bare compound
+/// carrying its OWN redirections keeps them and is merely retyped to `NBACKGND` —
+/// a node `evalsubshell` runs, applying those redirections in the forked child
+/// with the plain `redirect`. A failure is therefore the fatal one, and reports
+/// what a subshell's does; the same compound backgrounded through anything with a
+/// node of its own — a simple command, a pipeline, an and-or, a subshell — is
+/// wrapped and keeps `REDIR_ERROR`.
+///
+/// The caller is already the job's own shell, so the redirections are applied to
+/// it and never restored, as a subshell's are to its clone.
+///
+/// A DIVERGENCE rides on that, the same one `run_subshell` carries: ash calls
+/// `expredir` in the PARENT, before it forks, so the target words expand there.
+/// `unset x; { :; } >${x:=/dev/null} &` leaves `x` set under ash and unset here,
+/// and `{ :; } <${nope?} &` ends the whole shell there. It is specific to this
+/// node — `( : ) <${nope?} &` and `true <${nope?} &` both agree, because `&`
+/// wraps those and the `NBACKGND` it makes carries no redirections at all.
+/// This arm reaches the redirections before `run_pipeline` and `run_command`
+/// would, so it owes the three things they do around one: `-n` must not run,
+/// the command's own line must be published before anything expands under it,
+/// and a diagnostic that met a broken stderr must still end the shell.
+pub fn run_background_operand(sh: &mut Shell, and_or: &AndOr) -> R<()> {
+    // Applying a redirection IS running — an output target would be created or
+    // truncated — so `-n` takes the ordinary route rather than a second copy of
+    // the policy that lives in `run_command`.
+    if sh.opts.noexec {
+        return exec::run_and_or(sh, and_or);
+    }
+    let Some((cmd, redirs, line)) = bare_redirected_compound(and_or) else {
+        return exec::run_and_or(sh, and_or);
+    };
+    // Before the redirections, which expand under it: `{ :; } >"f$LINENO" &`
+    // names the compound's own line, as it does in every other position.
+    sh.set_lineno(line);
+    match apply_redirs(sh, &redirs)? {
+        RedirOutcome::Applied(_saved) => exec::run_command(sh, &cmd),
+        RedirOutcome::Failed => {
+            sh.set_status(FORKED_REDIR_ERROR);
+            // `run_command`'s tail, which the failure skips past.
+            exec::epipe_pending(sh)
+        }
+    }
+}
+
+/// `&`'s operand as ash's parser leaves it: `Some` only for the one shape it does
+/// not wrap, a single un-negated one-stage pipeline whose command is a compound
+/// carrying redirections. The compound comes back with them REMOVED, since the
+/// caller applies them itself — a clone of one command node, on the path that
+/// starts a thread anyway. The line comes back with it because the caller
+/// publishes it, and it is the node ash retypes: the INNERMOST one, when a
+/// transparent brace group was seen through to get here.
+fn bare_redirected_compound(and_or: &AndOr) -> Option<(Cmd, Vec<Redir>, u32)> {
+    let mut current = and_or;
+    let stage = loop {
+        if !current.rest.is_empty() || current.first.bang {
+            return None;
+        }
+        let [stage] = current.first.cmds.as_slice() else {
+            return None;
+        };
+        match &stage.cmd {
+            // A brace group with no redirections of ITS OWN is not a node at all
+            // — ash's `parse_command` returns the list for `{ list; }` and wraps
+            // nothing — so `&` sees straight through it to what is inside. Only a
+            // single sequential item: two would be an `NSEMI`, which does get
+            // wrapped. Iterative because the nesting is the script's to choose.
+            Cmd::Group { body, redirs } if redirs.is_empty() => {
+                match body.items.as_slice() {
+                    [(inner, Sep::Seq)] => current = inner,
+                    _ => return None,
+                }
+            }
+            _ => break stage,
+        }
+    };
+    if !is_own_redirected_compound(&stage.cmd) {
+        return None;
+    }
+    let mut cmd = stage.cmd.clone();
+    let redirs = match &mut cmd {
+        Cmd::Group { redirs, .. }
+        | Cmd::If { redirs, .. }
+        | Cmd::For { redirs, .. }
+        | Cmd::Loop { redirs, .. }
+        | Cmd::Case { redirs, .. } => std::mem::take(redirs),
+        // Unreachable past the check above, which is the exhaustive one. The
+        // roster being stated twice is what makes either statement of it safe
+        // alone: each refuses what the other would admit, so widening it takes
+        // an edit to both.
+        _ => return None,
+    };
+    Some((cmd, redirs, stage.line))
+}
+
+/// Whether a command is a compound carrying redirections of its own, decided on a
+/// BORROW: EVERY background job reaches the test above, and only some are the
+/// shape, so a declined operand must not pay for a deep copy of its whole command
+/// tree. Measured at 60 spawns of a 270 KB body, cloning first cost `( big ) &`
+/// half as much again.
+///
+/// This is the exhaustive match, so a new `Cmd` variant is a compile error until
+/// someone says which side of ash's rule it falls on.
+fn is_own_redirected_compound(cmd: &Cmd) -> bool {
+    match cmd {
+        Cmd::Group { redirs, .. }
+        | Cmd::If { redirs, .. }
+        | Cmd::For { redirs, .. }
+        | Cmd::Loop { redirs, .. }
+        | Cmd::Case { redirs, .. } => !redirs.is_empty(),
+        // `Simple`/`Cond` are `NCMD` and `Subshell` is `NSUBSHELL`; each has a node
+        // of its own, so `&` wraps it. A subshell still reports the fatal status,
+        // but through `run_subshell` rather than here.
+        Cmd::Simple { .. } | Cmd::Cond { .. } | Cmd::Subshell { .. } | Cmd::FuncDef { .. } => false,
+    }
 }
 
 /// The shell's own SIGINT and SIGQUIT, ignored while a foreground child runs and
