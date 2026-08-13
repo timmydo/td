@@ -3117,17 +3117,299 @@ mod tests {
     }
 
     #[test]
+    fn a_dup_target_that_is_not_a_descriptor_names_a_file() {
+        // busybox ash's `BASH_REDIR_OUTPUT`, which td's defconfig enables for the
+        // same reason `[[` is available: `>&word` whose word is not a descriptor
+        // is bash's `&>` -- the word names a FILE and BOTH streams go to it.
+        let dir = std::env::temp_dir().join(format!("td-sh-redirout-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let Ok(()) = std::fs::create_dir_all(&dir) else {
+            panic!("fixture dir");
+        };
+        let d = dir.display();
+        let both = "sh_o() { echo O; echo E >&2; }; ";
+        let back = |f: &str| format!("while read l; do echo got=$l; done <'{d}/{f}'");
+        // The gate is the DESTINATION descriptor, not the direction: `1<&f` does
+        // exactly what `1>&f` does, which is why this lives in `dup_target` and
+        // not in the `>&` arm. Measured on busybox 1.37.0 ash.
+        for (n, op) in [("a", ">&"), ("b", "1>&"), ("c", "1<&")] {
+            let (_s, out, _e) = run(&format!("{both}sh_o {op}'{d}/{n}'; {}", back(n)));
+            assert_eq!(out, "got=O\ngot=E\n", "op: {op}");
+        }
+        // Stderr is RESTORED afterwards, which the captures above cannot see:
+        // it is the second descriptor this installs, so it is the one a missing
+        // save entry would leave pointing at the file for the rest of the script.
+        let (_s, _o, err) = run(&format!(
+            "{both}sh_o >&'{d}/r'; echo AFTER >&2; {}",
+            back("r")
+        ));
+        assert_eq!(err, "AFTER\n");
+        // Every other descriptor keeps the ambiguous-target error, and the two
+        // spellings that ARE descriptors keep dupping and closing.
+        for op in ["0>&", "2>&", "9>&", "<&"] {
+            let (_s, _o, err) = run(&format!("{both}sh_o {op}'{d}/z'"));
+            assert!(err.contains("ambiguous redirect"), "op: {op}, err: {err:?}");
+        }
+        let (_s, _o, err) = run("echo hi >&2");
+        assert_eq!(err, "hi\n");
+        let (_s, out, _e) = run("echo hi >&-; echo st=$?");
+        assert_eq!(out, "st=1\n");
+        // It TRUNCATES, which is what the noclobber argument below rests on.
+        // Every other path here is fresh, so an `append(true)` would satisfy all
+        // of them and leave the shell appending where ash truncates.
+        let over = dir.join("over");
+        let Ok(()) = std::fs::write(&over, b"STALESTALE") else {
+            panic!("fixture");
+        };
+        let (_s, _o, _e) = run(&format!("{both}sh_o >&'{}'", over.display()));
+        assert_eq!(std::fs::read(&over).ok(), Some(b"O\nE\n".to_vec()));
+        // Opened WRITE-only, as ash opens it: asking for read as well fails
+        // `EACCES` on a target the operator can only write, and every other
+        // path here uses a readable file that would not notice.
+        use std::os::unix::fs::PermissionsExt;
+        let wo = dir.join("wo");
+        let Ok(()) = std::fs::write(&wo, b"") else {
+            panic!("fixture");
+        };
+        let mode = std::fs::Permissions::from_mode(0o222);
+        let Ok(()) = std::fs::set_permissions(&wo, mode) else {
+            panic!("fixture");
+        };
+        let (_s, out, err) = run(&format!("{both}sh_o >&'{}'; echo st=$?", wo.display()));
+        assert_eq!(out, "st=0\n", "err: {err:?}");
+        // It truncates, so `set -C` guards it as it guards `>` -- without which
+        // the one redirection that writes TWO streams was the one that ignored
+        // noclobber, and this assertion failed against a destroyed file.
+        let kept = dir.join("kept");
+        let Ok(()) = std::fs::write(&kept, b"KEEP") else {
+            panic!("fixture");
+        };
+        let (_s, _o, err) = run(&format!("{both}set -C; sh_o >&'{}'", kept.display()));
+        assert!(err.contains("cannot overwrite"), "err: {err:?}");
+        assert_eq!(std::fs::read(&kept).ok(), Some(b"KEEP".to_vec()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The two decisions in the `set -C` check that `>` and `>&word` share.
+    #[test]
+    fn noclobber_refuses_an_existing_regular_file_and_only_that() {
+        let dir = std::env::temp_dir().join(format!("td-sh-noclob-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let Ok(()) = std::fs::create_dir_all(&dir) else {
+            panic!("fixture dir");
+        };
+        let d = dir.display();
+        // REGULAR, not merely existing: ash's `openredirect` falls to a plain
+        // `O_WRONLY` for a target that exists and is not a regular file
+        // (ash.c:5560), so `set -C` guards no device. Measured on busybox
+        // 1.37.0 ash, which writes all three of these happily.
+        //
+        // `/dev/zero` earns its place over `/dev/null`, which the two before it
+        // are: `open_file` answers that ONE name without opening anything, so a
+        // `/dev/null` target never reaches the non-regular arm's open or the
+        // re-check after it, and inverting that check's sense passed the whole
+        // suite. This is the only case that evaluates it.
+        for op in [">", ">&"] {
+            for dev in ["/dev/null", "/dev/zero"] {
+                let (_s, out, err) = run(&format!("set -C; echo x {op}{dev}; echo st=$?"));
+                assert_eq!(out, "st=0\n", "op: {op}{dev}, err: {err:?}");
+            }
+        }
+        // A directory is refused by the OPEN that follows, not by the check --
+        // which is why the message is the open's rather than "cannot overwrite".
+        let adir = dir.join("adir");
+        let Ok(()) = std::fs::create_dir_all(&adir) else {
+            panic!("fixture dir");
+        };
+        let ad = adir.display();
+        for op in [">", ">&"] {
+            let (_s, out, err) = run(&format!("set -C; echo x {op}'{ad}'; echo st=$?"));
+            assert_eq!(out, "st=1\n", "op: {op}, err: {err:?}");
+            assert!(!err.contains("cannot overwrite"), "op: {op}, err: {err:?}");
+        }
+        // `>|` is the override, and the ONLY one: `set -C` must not reach it.
+        let over = dir.join("bar");
+        let Ok(()) = std::fs::write(&over, b"KEEP") else {
+            panic!("fixture");
+        };
+        let ov = over.display();
+        let (_s, out, err) = run(&format!("set -C; echo x >|'{ov}'; echo st=$?"));
+        assert_eq!(out, "st=0\n", "err: {err:?}");
+        assert_eq!(std::fs::read(&over).ok(), Some(b"x\n".to_vec()));
+        // The check consults the SHELL's cwd and not the process's. With the two
+        // disagreeing, the check would look at one path while the open truncates
+        // another -- so the file `set -C` exists to protect is destroyed, which
+        // is the assertion below rather than a status.
+        for (n, op) in [("kr", ">"), ("kd", ">&")] {
+            let kept = dir.join(n);
+            let Ok(()) = std::fs::write(&kept, b"KEEP") else {
+                panic!("fixture");
+            };
+            let (_s, out, err) = run(&format!("cd '{d}'; set -C; echo x {op}{n}; echo st=$?"));
+            assert_eq!(out, "st=1\n", "op: {op}, err: {err:?}");
+            // The NAME is asserted, not just the refusal: this test exists for
+            // which path the check consulted, and a message naming another one
+            // would otherwise pass.
+            let want = format!("{n}: cannot overwrite existing file\n");
+            assert_eq!(err, want, "op: {op}");
+            let after = std::fs::read(&kept).ok();
+            assert_eq!(after, Some(b"KEEP".to_vec()), "op: {op}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Why the `set -C` check and the create are ONE operation.
+    #[test]
+    fn noclobber_does_not_create_through_a_dangling_symlink() {
+        // Looking first and creating after followed the link: the stat that
+        // guards `>` sees nothing there, so `ln -s missing lnk; set -C;
+        // echo x >lnk` created `missing` -- data written somewhere the operator
+        // did not name, by the option whose whole job is not to. ash creates
+        // with `O_CREAT|O_EXCL`, which the kernel refuses to follow a symlink
+        // for, so there is no window between the two.
+        let dir = std::env::temp_dir().join(format!("td-sh-dangle-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let Ok(()) = std::fs::create_dir_all(&dir) else {
+            panic!("fixture dir");
+        };
+        for (n, op) in [("la", ">"), ("lb", ">&")] {
+            let link = dir.join(n);
+            let missing = dir.join(format!("{n}-missing"));
+            let Ok(()) = std::os::unix::fs::symlink(&missing, &link) else {
+                panic!("fixture");
+            };
+            let (_s, out, err) = run(&format!(
+                "set -C; echo x {op}'{}'; echo st=$?",
+                link.display()
+            ));
+            assert_eq!(out, "st=1\n", "op: {op}, err: {err:?}");
+            assert!(!missing.exists(), "op {op} created through the link");
+        }
+        // Without the option the link IS followed, which is ordinary symlink
+        // behaviour and not something `set -C` should be read as changing.
+        let link = dir.join("open");
+        let missing = dir.join("open-missing");
+        let Ok(()) = std::os::unix::fs::symlink(&missing, &link) else {
+            panic!("fixture");
+        };
+        let (_s, out, _e) = run(&format!("echo x >'{}'; echo st=$?", link.display()));
+        assert_eq!(out, "st=0\n");
+        assert_eq!(std::fs::read(&missing).ok(), Some(b"x\n".to_vec()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `>&-` closes only spelled BARE -- the one place this shell has to care
+    /// how a redirection target was written rather than what it expands to.
+    #[test]
+    fn only_a_bare_dash_closes_a_descriptor() {
+        // ash recognises the lone `-` in the PARSER, on the unexpanded word
+        // (`LONE_DASH`, ash.c:12012), so a word that needs expanding never
+        // reaches that test: `>&'-'` and `>&$v` are ordinary non-digit targets,
+        // which on fd 1 name a FILE called `-`. Measured on busybox 1.37.0 ash.
+        let dir = std::env::temp_dir().join(format!("td-sh-baredash-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let both = "sh_o() { echo O; echo E >&2; }; ";
+        for (n, spell) in [("q", "$v"), ("r", "'-'"), ("s", "\"-\""), ("t", "\\-")] {
+            let sub = dir.join(n);
+            let Ok(()) = std::fs::create_dir_all(&sub) else {
+                panic!("fixture dir");
+            };
+            let (_s, _o, err) = run(&format!(
+                "{both}cd '{}'; v=-; sh_o >&{spell}",
+                sub.display()
+            ));
+            let wrote = std::fs::read(sub.join("-")).ok();
+            assert_eq!(wrote, Some(b"O\nE\n".to_vec()), "{spell}, err: {err:?}");
+        }
+        // Bare, and it closes: nothing is named, and the write to the closed
+        // descriptor is what fails rather than the redirection.
+        let sub = dir.join("bare");
+        let Ok(()) = std::fs::create_dir_all(&sub) else {
+            panic!("fixture dir");
+        };
+        let (_s, out, _e) = run(&format!("cd '{}'; echo O >&-; echo st=$?", sub.display()));
+        assert_eq!(out, "st=1\n");
+        assert!(!sub.join("-").exists(), "a bare dash named a file");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The boundary between the two arms above, which is not where the shorter
+    /// rule "digits are a descriptor, anything else is a file" puts it.
+    #[test]
+    fn a_digit_string_is_a_descriptor_however_long_it_is() {
+        // ash classifies on ALL-DIGITS first (`isdigit_str`, ash.c:560) and only
+        // then asks what the digits mean, so a digit string is never a filename:
+        // one too large to BE a descriptor is `raise_error_syntax("bad fd
+        // number")` (ash.c:12026) and fatal. Without the split the file arm above
+        // swallows the overflow and CREATES `99999999999` -- the wrong outcome in
+        // the worst direction, since it succeeds.
+        let dir = std::env::temp_dir().join(format!("td-sh-badfd-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let Ok(()) = std::fs::create_dir_all(&dir) else {
+            panic!("fixture dir");
+        };
+        let d = dir.display();
+        // Every descriptor and both directions: the digit test precedes the fd-1
+        // file arm, so none of these reaches it.
+        for op in [">&", "1>&", "2>&", "<&", "0<&"] {
+            let (s, out, err) = run(&format!("cd '{d}'; echo A {op}99999999999; echo AFTER"));
+            assert_eq!(s, 2, "op: {op}, err: {err:?}");
+            assert_eq!(out, "", "op {op} ran what followed a fatal error");
+        }
+        // The empty string is all-digits by that predicate too, so it takes the
+        // same arm rather than being an `open("")`.
+        let (s, out, _e) = run(&format!("cd '{d}'; v=; echo A >&$v; echo AFTER"));
+        assert_eq!((s, out.as_str()), (2, ""));
+        // None of the seven created anything -- the assertion the file arm's
+        // absence of a length check would fail.
+        let made = std::fs::read_dir(&dir).ok().map(|it| it.count());
+        assert_eq!(made, Some(0), "an overflowing target created a file");
+        // The boundary itself is `INT_MAX`, ash's `bb_strtou` into an `int`
+        // refusing a negative result (ash.c:12017) -- not the width of the type
+        // td-sh happens to parse into. Below it the dup merely FAILS, which is
+        // recoverable and lets the script carry on.
+        // Both run inside the fixture dir like the rest: a regression that made
+        // a digit string name a file would otherwise create it in the SOURCE
+        // tree, where the next `git add -A` sweeps it up.
+        let (s, out, _e) = run(&format!("cd '{d}'; echo A >&2147483647; echo AFTER"));
+        assert_eq!((s, out.as_str()), (0, "AFTER\n"));
+        let (s, out, _e) = run(&format!("cd '{d}'; echo A >&2147483648; echo AFTER"));
+        assert_eq!((s, out.as_str()), (2, ""));
+        // A leading zero is still digits, so it is still a descriptor: ten of
+        // them naming fd 1 is a self-dup, not a file called `0000000001`.
+        let (s, out, _e) = run(&format!("cd '{d}'; echo A >&0000000001"));
+        assert_eq!((s, out.as_str()), (0, "A\n"));
+        // Fatal is `Sig::Abort` and not `Sig::Exit`: on a pty ash returns to the
+        // prompt and runs the next line, where `Exit` would end the session.
+        // Every assertion above is a SCRIPT, where the two are indistinguishable.
+        let units = ["echo A >&99999999999", "echo NEXT"];
+        let (_s, out, _e) = crate::process::run_capturing_interactive_units(&units);
+        assert_eq!(out, "NEXT\n");
+        let made = std::fs::read_dir(&dir).ok().map(|it| it.count());
+        assert_eq!(made, Some(0), "a leading-zero descriptor named a file");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn a_target_that_is_not_a_descriptor_number_is_recoverable() {
-        // dash raises this one a step earlier than the failure above -- `fixredir`
-        // from `expredir`, outside the `redirectsafe` that makes the other
-        // recoverable -- and so ends the shell on it. td-sh does not, because the
-        // only corpus case that compares ash AND has a non-numeric `>&` target
-        // (`redirect-multi`'s glob one) expects the shell to skip the command and
-        // carry on. Pinned so that following dash here is a decision rather than
-        // an oversight.
-        let (status, out, err) = run("echo one 1>&/nope/x; echo survived");
+        // ash raises this one a step earlier than the failure above -- from
+        // `expredir`, outside the `redirectsafe` that makes the other
+        // recoverable -- and so ends the shell on it, with status 2. td-sh does
+        // not, which is a deliberate pre-existing divergence and NOT something
+        // the corpus witnesses: `redirect-multi`'s glob target is on fd 1, so it
+        // takes the `BASH_REDIR_OUTPUT` file arm and never reaches here. This
+        // test is the only thing pinning it, which is why it says so.
+        //
+        // On fd 2, where a non-descriptor target stays ambiguous rather than
+        // naming a file -- fd 1 is `dup_target`'s `BASH_REDIR_OUTPUT` case.
+        let (status, out, err) = run("echo one 2>&/nope/x; echo survived");
         assert_eq!((status, out.as_str()), (0, "survived\n"));
         assert!(err.contains("ambiguous redirect"), "err: {err:?}");
+        // And on fd 1 the target IS a file, so the failure is the open's -- still
+        // recoverable, which is the property this test is about.
+        let (status, out, err) = run("echo one 1>&/nope/x; echo survived");
+        assert_eq!((status, out.as_str()), (0, "survived\n"));
+        assert!(err.contains("No such file"), "err: {err:?}");
     }
 
     #[test]

@@ -332,6 +332,22 @@ const FORKED_REDIR_ERROR: i32 = 2;
 /// itself. See `open_file`.
 const ENOENT: i32 = 2;
 
+/// The two descriptors `>&word` writes, named because the rule turns on WHICH
+/// one is redirected rather than on the direction. See `dup_target`.
+const STDOUT: u32 = 1;
+const STDERR: u32 = 2;
+
+/// The largest descriptor number a `>&n` target may name. ash parses the digits
+/// with `bb_strtou` into an `int` and refuses a negative result (ash.c:12017), so
+/// the boundary is `INT_MAX` and not the width of whatever td-sh parses into --
+/// measured: `>&2147483647` is a dup that fails, `>&2147483648` is fatal.
+const MAX_FD: u32 = i32::MAX as u32;
+
+/// ash's `raise_error_syntax("bad fd number")` (ash.c:12026): a digit string that
+/// cannot be a descriptor. Fatal, so it is `Sig::Abort` rather than a status --
+/// the same 2 as the two above, for a third unrelated reason.
+const BAD_FD_NUMBER: i32 = 2;
+
 /// The result of applying one command's redirections.
 pub enum RedirOutcome {
     /// All redirections applied; here is what to restore afterward.
@@ -360,6 +376,22 @@ pub fn apply_redirs(sh: &mut Shell, redirs: &[Redir]) -> R<RedirOutcome> {
             }
             // Nothing to install and so nothing to restore.
             Ok(Ok(Opened::Unchanged)) => {}
+            // `>&word`: both streams go to the same open file, so they share one
+            // offset and interleave rather than overwrite. Saved as two entries so
+            // `restore_redirs` puts both back, in reverse, exactly as two separate
+            // redirections would. Both descriptors are NAMED rather than taken
+            // from `fd` — `dup_target` returns this only for `STDOUT`, and naming
+            // them is what keeps the arm meaning one thing if that ever changes,
+            // where using `fd` would silently pair some other descriptor with
+            // stderr.
+            Ok(Ok(Opened::ToBoth(target))) => {
+                let prev_out = sh.fds.map.get(&STDOUT).cloned();
+                let prev_err = sh.fds.map.get(&STDERR).cloned();
+                sh.fds.set(STDOUT, target.clone());
+                saved.entries.push((STDOUT, prev_out));
+                sh.fds.set(STDERR, target);
+                saved.entries.push((STDERR, prev_err));
+            }
             Ok(Err(())) => {
                 // A recoverable open/dup failure: roll back this command's earlier
                 // redirections, set the failure status, and report "skip".
@@ -409,6 +441,9 @@ enum Opened {
     /// `: 3>&3` printing nothing and printing what follows it, since fd 3 is
     /// usually closed and duping a closed descriptor is an error.
     Unchanged,
+    /// `>&word`: the target is a FILE, and BOTH stdout and stderr go to it. See
+    /// `dup_target` for whose rule that is and which descriptors it holds for.
+    ToBoth(Fd),
 }
 
 /// Open one redirection's target descriptor. An error in *expanding* the target
@@ -425,7 +460,13 @@ fn open_redir(sh: &mut Shell, r: &Redir) -> R<Result<Opened, ()>> {
         }
         RedirKind::DupIn | RedirKind::DupOut => {
             let target = exec::redir_target(sh, r)?;
-            Ok(dup_target(sh, default_fd(r), &target))
+            // `>&-` closes only spelled BARE. ash tests the lone dash in the
+            // PARSER, on the unexpanded word (`LONE_DASH`, ash.c:12012), and a
+            // word needing expansion never reaches that test -- so `>&'-'` and
+            // `>&$dash` are ordinary non-digit targets, a file on fd 1 and an
+            // error anywhere else. `plain` is that same "one unquoted literal".
+            let closes = r.word.plain() == Some("-");
+            dup_target(sh, default_fd(r), &target, closes)
         }
         // Each of the four file kinds expands its target exactly ONCE and hands
         // the text on. `set -C` used to expand for its own check and leave
@@ -437,10 +478,8 @@ fn open_redir(sh: &mut Shell, r: &Redir) -> R<Result<Opened, ()>> {
         }
         RedirKind::Out | RedirKind::Clobber => {
             let name = exec::redir_target(sh, r)?;
-            // `set -C`: refuse to truncate an existing regular file.
-            if matches!(r.kind, RedirKind::Out) && sh.opts.noclobber && sh.resolve(&name).is_file() {
-                let _ = exec::write_stderr(sh, &format!("{name}: cannot overwrite existing file"));
-                return Ok(Err(()));
+            if matches!(r.kind, RedirKind::Out) && sh.opts.noclobber {
+                return Ok(noclobber_open(sh, &name));
             }
             let mut opts = OpenOptions::new();
             opts.write(true).create(true).truncate(true);
@@ -461,34 +500,101 @@ fn open_redir(sh: &mut Shell, r: &Redir) -> R<Result<Opened, ()>> {
     }
 }
 
-/// `>&2`, `<&0`, `>&-` (close), for the redirection whose own descriptor is
-/// `dest`. A numeric target dups that descriptor; `-` closes.
-/// Returns `Err(())` (message already printed) for a recoverable bad/ambiguous target.
-fn dup_target(sh: &mut Shell, dest: u32, target: &str) -> Result<Opened, ()> {
-    if target == "-" {
-        return Ok(Opened::To(Fd::Closed));
+/// The refusal `set -C` exists for, worded once because two arms report it.
+fn noclobber_refuse(sh: &mut Shell, name: &str) -> Result<Opened, ()> {
+    let _ = exec::write_stderr(sh, &format!("{name}: cannot overwrite existing file"));
+    Err(())
+}
+
+/// `set -C` for the two redirections that truncate -- `>` and the `>&word` that
+/// writes both streams -- as ONE operation rather than a look followed by a
+/// create. Looking first follows a dangling symlink: `ln -s missing lnk;
+/// set -C; echo x >lnk` created `missing`, where the `O_EXCL` below refuses the
+/// link, and it races a target swapped between the two. ash.c:5554.
+fn noclobber_open(sh: &mut Shell, name: &str) -> Result<Opened, ()> {
+    let mut opts = OpenOptions::new();
+    opts.write(true);
+    match std::fs::metadata(sh.resolve(name)) {
+        // A regular file is exactly what the option protects.
+        Ok(m) if m.is_file() => noclobber_refuse(sh, name),
+        // There and NOT regular: opened without creating or truncating, then
+        // re-checked, since the name may have become a regular file in between
+        // -- and that is the file being protected.
+        Ok(_) => match open_file(sh, name, &opts)? {
+            Opened::To(Fd::File(f)) if f.metadata().is_ok_and(|m| m.is_file()) => {
+                noclobber_refuse(sh, name)
+            }
+            opened => Ok(opened),
+        },
+        // Nothing there when we looked, so create it and let `O_EXCL` refuse if
+        // that stopped being true. It refuses a SYMLINK too, which is the
+        // dangling-link case: the kernel will not follow one under `O_EXCL`.
+        Err(_) => open_file(sh, name, opts.create_new(true)),
     }
-    // Digits only. `u32::from_str` also accepts a leading `+`, which no shell
-    // does, and the self-dup below turns that from a wrong descriptor into a
-    // SILENT one: `3>&+3` reads as `3>&3` and succeeds on a closed fd 3.
-    let numeric = match target.bytes().all(|b| b.is_ascii_digit()) {
-        true => target.parse::<u32>().ok(),
-        false => None,
-    };
-    match numeric {
-        Some(n) if n == dest => Ok(Opened::Unchanged),
-        Some(n) => match sh.fds.get(n) {
-            Some(fd) => Ok(Opened::To(fd.clone())),
+}
+
+/// `>&word` installs the same open file on BOTH descriptors.
+fn to_both(opened: Opened) -> Opened {
+    match opened {
+        Opened::To(fd) => Opened::ToBoth(fd),
+        // `open_file` returns only `To`, so this arm is unreachable; passed
+        // through rather than asserted, since the crate does not panic.
+        other => other,
+    }
+}
+
+/// `>&2`, `<&0`, `>&-` (close), for the redirection whose own descriptor is
+/// `dest`. A numeric target dups that descriptor; a BARE `-` closes, which is
+/// `closes` -- the caller decides it from the unexpanded word.
+/// Returns `Ok(Err(()))` (message already printed) for a recoverable bad or
+/// ambiguous target, and `Err(Sig::Abort)` for the one spelling that is fatal.
+fn dup_target(sh: &mut Shell, dest: u32, target: &str, closes: bool) -> R<Result<Opened, ()>> {
+    if closes {
+        return Ok(Ok(Opened::To(Fd::Closed)));
+    }
+    // ash classifies on ALL-DIGITS FIRST (`isdigit_str`, ash.c:560) and only then
+    // asks what the digits mean, so a digit string is a descriptor spelling
+    // whatever its length: one too large to BE a descriptor is fatal rather than
+    // a filename, and the empty string satisfies that predicate too and takes the
+    // same arm. Digits also exclude the leading `+` that `u32::from_str` accepts,
+    // which the self-dup below would turn from a wrong descriptor into a SILENT
+    // one: `3>&+3` would read as `3>&3` and succeed on a closed fd 3.
+    if target.bytes().all(|b| b.is_ascii_digit()) {
+        let Some(n) = target.parse::<u32>().ok().filter(|n| *n <= MAX_FD) else {
+            let _ = exec::write_stderr(sh, "syntax error: bad fd number");
+            return Err(Sig::Abort(BAD_FD_NUMBER));
+        };
+        if n == dest {
+            return Ok(Ok(Opened::Unchanged));
+        }
+        return match sh.fds.get(n) {
+            Some(fd) => Ok(Ok(Opened::To(fd.clone()))),
             None => {
                 let _ = exec::write_stderr(sh, &format!("{n}: bad file descriptor"));
-                Err(())
+                Ok(Err(()))
             }
-        },
-        None => {
-            let _ = exec::write_stderr(sh, &format!("{target}: ambiguous redirect"));
-            Err(())
-        }
+        };
     }
+    // Not a descriptor. On fd 1 that is not an error but busybox ash's
+    // `BASH_REDIR_OUTPUT`, which td's defconfig enables for the same reason
+    // `[[` is available: the word names a FILE, and both stdout and stderr
+    // are pointed at it -- bash's `&>` under another spelling. The gate is
+    // the DESTINATION and not the direction, measured: `1<&f` does exactly
+    // what `1>&f` does, while `0<&f`, `<&f` and `2>&f` are all errors.
+    if dest == STDOUT {
+        // It truncates, so `set -C` guards it as it guards `>`. There is no
+        // `>|` spelling of this operator to override with, so the check is
+        // unconditional -- and without it the one redirection that writes
+        // TWO streams was the one that ignored noclobber.
+        if sh.opts.noclobber {
+            return Ok(noclobber_open(sh, target).map(to_both));
+        }
+        let mut opts = OpenOptions::new();
+        opts.write(true).create(true).truncate(true);
+        return Ok(open_file(sh, target, &opts).map(to_both));
+    }
+    let _ = exec::write_stderr(sh, &format!("{target}: ambiguous redirect"));
+    Ok(Err(()))
 }
 
 fn open_file(sh: &mut Shell, name: &str, opts: &OpenOptions) -> Result<Opened, ()> {
