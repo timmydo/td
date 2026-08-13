@@ -52,7 +52,8 @@ pub enum Builtin {
 pub const NAMES: &[&str] = &[
     ":", "[", ".", "alias", "break", "cd", "command", "continue", "echo", "eval", "exec", "exit",
     "export", "false", "getopts", "jobs", "local", "printf", "pwd", "read", "readonly", "return", "set",
-    "shift", "test", "times", "trap", "true", "type", "umask", "unalias", "unset", "wait",
+    "shift", "source", "test", "times", "trap", "true", "type", "umask", "unalias", "unset",
+    "wait",
 ];
 
 pub fn lookup(name: &str) -> Option<Builtin> {
@@ -78,7 +79,10 @@ pub fn lookup(name: &str) -> Option<Builtin> {
         "eval" => Builtin::Eval,
         "cd" => Builtin::Cd,
         "pwd" => Builtin::Pwd,
-        "." => Builtin::Dot,
+        // ash gives both spellings one implementation (`dotcmd`, ash.c:10181
+        // and 10244); the word they were called by survives in argv[0] and is
+        // all that differs in what they print.
+        "." | "source" => Builtin::Dot,
         "times" => Builtin::Times,
         "command" => Builtin::Command,
         "wait" => Builtin::Wait,
@@ -128,18 +132,20 @@ pub fn is_ash_special(bi: Builtin) -> bool {
 
 /// Whether this command WORD is in ash's `spclbltin` set: the POSIX list above,
 /// plus `local`, ash's own addition -- which is what keeps a top-level `local` an
-/// error rather than a frame that authorises itself, plus `source`. That one is
-/// named here rather than looked up because td-sh does not implement it, so it
-/// resolves to no `Builtin`; it is ash's own addition too, under
-/// `ENABLE_ASH_BASH_COMPAT`, which td's busybox has on.
+/// error rather than a frame that authorises itself.
 ///
-/// One bit in ash (`name[0] & 1`, ash.c:8205) with three consequences here, which
-/// is why it is one predicate: it blocks the local-var frame `evalcommand`
-/// pushes, it makes a redirection failure FATAL rather than a skipped command,
-/// and it is what `type` reports as "special" -- that last only for the words
-/// td-sh implements, since `type` asks this only after a successful lookup.
+/// A plain lookup with nothing named by hand: every word ash marks special
+/// resolves to a `Builtin` here, `times` and `source` last. A hand-named arm
+/// would be a second source of truth able to keep a word special after its
+/// `is_special` entry went, which is why there is none.
+///
+/// One bit in ash (`name[0] & 1`, ash.c:8205), of whose three consequences this
+/// answers two: it blocks the local-var frame `evalcommand` pushes, and it is
+/// what `type` reports as "special". The third -- a redirection failure being
+/// FATAL rather than a skipped command -- is decided on the `Builtin` itself,
+/// which every special word now has.
 pub fn is_ash_special_word(word: &str) -> bool {
-    lookup(word).is_some_and(is_ash_special) || word == "source"
+    lookup(word).is_some_and(is_ash_special)
 }
 
 pub fn run(sh: &mut Shell, bi: Builtin, argv: &[String]) -> R<()> {
@@ -3332,15 +3338,18 @@ fn times(sh: &mut Shell) -> R<()> {
 }
 
 fn dot(sh: &mut Shell, argv: &[String]) -> R<()> {
+    // ash prints the spelling it was CALLED by -- `source: can't open` against
+    // `.: can't open` -- so the word comes from argv rather than a literal.
+    let word = argv.first().map_or(".", String::as_str);
     let Some(name) = argv.get(1) else {
         // Not fatal in either shell: busybox ash returns 2 outright ("bash
         // compat" in its own words) and dash returns 0 without a word. Only a
         // file it cannot LOCATE raises.
-        err_line(sh, ".: filename argument required");
+        err_line(sh, &format!("{word}: filename argument required"));
         return status(sh, 2);
     };
     let Some(path) = dot_path(sh, name) else {
-        return special_usage_error(sh, &format!(".: {name}: not found"));
+        return special_usage_error(sh, &format!("{word}: {name}: not found"));
     };
     // Only a failure to OPEN raises. A read that then fails -- a directory, most
     // often -- reaches dash's input layer as EOF, so it sources nothing and
@@ -3352,7 +3361,7 @@ fn dot(sh: &mut Shell, argv: &[String]) -> R<()> {
             t
         }
         Err(e) => {
-            return special_usage_error(sh, &format!(".: {name}: {e}"));
+            return special_usage_error(sh, &format!("{word}: {name}: {e}"));
         }
     };
     let what = format!("{name}: ");
@@ -4722,6 +4731,60 @@ mod tests {
         assert_eq!((status, out.as_str()), (2, ""));
         assert!(err.contains("not found"), "{err:?}");
         std::fs::remove_dir_all(base.to_string()).unwrap();
+    }
+
+    /// `source` is `.` under another name, as it is in ash -- which gives both
+    /// spellings one implementation. The two must agree on everything a caller
+    /// can see EXCEPT the word inside the diagnostic, which names the spelling
+    /// it was called by; a hardcoded `.` there is invisible until someone reads
+    /// an error about a command they did not run.
+    #[test]
+    fn source_is_dot_under_another_name() {
+        let dir = std::env::temp_dir().join(format!("td-sh-src-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("s.sh"), "echo sourced\n").unwrap();
+        // Quoted: a TMPDIR with a space in it would otherwise split into two
+        // words and every case below would be testing a failed `cd`.
+        let d = dir.display();
+        for w in [".", "source"] {
+            // Runs the file, and by PATH for a name with no slash.
+            let (st, out, _) = run_capturing(&format!("cd '{d}'; {w} ./s.sh"));
+            assert_eq!((st, out.as_str()), (0, "sourced\n"), "{w}");
+            let (st, out, _) = run_capturing(&format!("cd '{d}'; PATH=.; {w} s.sh"));
+            assert_eq!((st, out.as_str()), (0, "sourced\n"), "PATH {w}");
+            // Both are special, so a file that cannot be sourced is FATAL: the
+            // `echo` does not run and the shell exits 2 -- except for the last,
+            // where ash returns 2 without ending the script.
+            //
+            // All THREE of `dot`'s messages name the spelling rather than the
+            // implementation, and they are reached by three different failures:
+            // an open that fails, a PATH search that finds nothing, and no
+            // operand at all. A literal `.` left in any one of them is a
+            // diagnostic about a command the caller never ran, and two of the
+            // three are unreachable from the case that is easiest to write.
+            //
+            // The third asks for `$?` rather than a marker word because it is
+            // the one that does NOT end the script, so its status is the
+            // builtin's own -- and an `echo` that merely RAN would report 0
+            // whatever the builtin returned.
+            for (src, want) in [
+                (format!("cd '{d}'; {w} ./nope.sh; echo reached"), (2, "")),
+                (format!("cd '{d}'; PATH=.; {w} nope; echo reached"), (2, "")),
+                (format!("{w}; echo st=$?"), (0, "st=2\n")),
+            ] {
+                let (st, out, err) = run_capturing(&src);
+                assert_eq!((st, out.as_str()), want, "{src}");
+                assert!(err.starts_with(&format!("{w}: ")), "{src}: {err:?}");
+            }
+            // Which `type` agrees with, reading the same predicate -- now a
+            // plain lookup, with no word named by hand anywhere.
+            let (_s, out, _e) = run_capturing(&format!("type {w}"));
+            assert_eq!(out, format!("{w} is a special shell builtin\n"));
+            let (_s, out, _e) = run_capturing(&format!("command -v {w}"));
+            assert_eq!(out, format!("{w}\n"));
+            assert!(super::is_ash_special_word(w), "{w}");
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

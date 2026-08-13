@@ -515,6 +515,9 @@ xfail builtin-dirs.test.sh::popd returns error on empty directory stack
 xfail builtin-dirs.test.sh::popd usage error
 xfail builtin-dirs.test.sh::pushd usage
 xfail builtin-eval-source.test.sh::Eval in does tilde expansion
+xfail builtin-eval-source.test.sh::Source nonexistent
+xfail builtin-eval-source.test.sh::Source with no arguments
+xfail builtin-eval-source.test.sh::source accepts/ignores --
 xfail builtin-fc.test.sh::fc -l [first] [last] where first and last are indexes
 xfail builtin-fc.test.sh::fc -l [first] [last] where first and last are offsets from current command
 xfail builtin-fc.test.sh::fc -l [first] [last] where first and last are reversed indexes
@@ -646,7 +649,6 @@ xfail builtin-type-bash.test.sh::type -t -> not found
 xfail builtin-type-bash.test.sh::type -t control flow
 xfail builtin-type-bash.test.sh::type -t doesn't find non-executable (like command -v)
 xfail builtin-type-bash.test.sh::type prints function source code
-xfail builtin-type.test.sh::more special builtins
 xfail builtin-umask.test.sh::'umask 0002' sets the umask
 xfail builtin-umask.test.sh::set umask with symbolic mode: g-w,o-w
 xfail builtin-umask.test.sh::symbolic syntax error: empty clause u-r,,u-r

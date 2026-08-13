@@ -1681,17 +1681,6 @@ fn dispatch_simple(
     // trap to see. `?` here is that second case, and it is correct that it skips
     // the rollback below: nothing was assigned yet.
     let result = match process::apply_redirs(sh, redirs)? {
-        // Except on a word ash marks special, where it is fatal as it is for the
-        // two branches above. Only `source` and `times` can reach this: every
-        // other special word resolves to a `Builtin` and never gets here, which
-        // is exactly why the test is on the WORD.
-        process::RedirOutcome::Failed
-            if argv
-                .first()
-                .is_some_and(|w| builtin::is_ash_special_word(w)) =>
-        {
-            return Err(Sig::Abort(sh.status));
-        }
         // A failed redirection skips the command without exiting the shell.
         process::RedirOutcome::Failed => Ok(()),
         process::RedirOutcome::Applied(saved) => {
@@ -3558,9 +3547,11 @@ mod tests {
         // failure end the shell instead of skipping the command. The whole set is
         // swept rather than the two words that were wrong, because the point is
         // the PREDICATE: `source` and `times` were recoverable only because they
-        // are the two ash marks special that td-sh does not implement, so they
-        // resolve to no `Builtin` and reached the external path, where the test
-        // could not be made on a `Builtin` at all.
+        // were the two ash marks special that td-sh did not implement, so they
+        // resolved to no `Builtin` and took the external path. Both resolve now,
+        // which is what retired the word-level arm that used to serve them --
+        // reaching that path means `lookup` said None, so no word ash marks
+        // special can get there again.
         for w in [
             ".", ":", "break", "continue", "eval", "exec", "exit", "export", "local", "readonly",
             "return", "set", "shift", "source", "times", "trap", "unset",
@@ -3590,14 +3581,13 @@ mod tests {
         assert_eq!(out, "read is a shell builtin\n");
         let (_s, out, _e) = run("type unset");
         assert_eq!(out, "unset is a special shell builtin\n");
-        // `source` is the one word still named by hand, and only because td-sh
-        // does not implement it. The moment it resolves, that arm becomes a
-        // second source of truth able to hide a missing `is_special` entry, so
-        // it has to go in the same landing -- which this makes fail rather than
-        // leaving it to be noticed. `times` was the other, until it was
-        // implemented and this fired.
-        assert!(crate::builtin::lookup("source").is_none());
+        // Both words resolve now, so `is_ash_special_word` is a plain lookup
+        // with nothing named by hand -- which is the point of it. A hand-named
+        // arm is a second source of truth able to hide a missing `is_special`
+        // entry, so this holds the predicate to the one it has.
+        assert!(crate::builtin::lookup("source").is_some());
         assert!(crate::builtin::lookup("times").is_some());
+        assert!(!crate::builtin::is_ash_special_word("notabuiltin"));
         // The guard must not over-fire. A FUNCTION of that name is dispatched
         // before it, and `command` resolves to a builtin that never carries the
         // redirections here -- both recoverable in ash, measured.
@@ -3979,9 +3969,10 @@ mod tests {
         let (code, out, err) = run("eval() { exit 7; }; trap 'local Q=1; echo FRAME' EXIT; eval");
         assert_eq!((code, out.as_str()), (7, "FRAME\n"), "{err}");
         assert_eq!(run("export() { local Q=1; echo ok; }; export").1, "ok\n");
-        // `source` and `times` are special to ash but unimplemented here, so without
-        // naming them they would reach the external path and be framed. A function
-        // of the same name still is, by the rule just above.
+        // `source` and `times` were the two words special by NAME alone, back
+        // when neither resolved to a `Builtin`; both resolve now and are framed
+        // -- or not -- by the same rule as the other fifteen. A function of the
+        // same name still is, by the rule just above.
         for w in ["times", "source"] {
             let (_, out, err) = run(&format!(
                 "trap 'local Q=1; echo FRAME' EXIT; A=${{u:?e}} {w}"
