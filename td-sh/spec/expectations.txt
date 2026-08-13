@@ -952,9 +952,6 @@ xfail quote.test.sh::$? split over multiple lines
 xfail quote.test.sh::YSH allows unquoted foo\ bar too
 xfail redirect-command.test.sh::Prefix redirect for loop -- not allowed
 xfail redirect.test.sh::&> redirects stdout and stderr
-xfail redirect.test.sh::1>&2- (Bash bug: fail to restore closed fd)
-xfail redirect.test.sh::1>&2- to move file descriptor
-xfail redirect.test.sh::: 3>&3-
 xfail redirect.test.sh::: >/dev/null 2> / (OSH regression: fail to pop fd frame)
 xfail redirect.test.sh::<> for read/write named pipes
 xfail redirect.test.sh::>| to clobber

@@ -3095,8 +3095,8 @@ mod tests {
         // reject -- and the self-dup above turns that from a wrong descriptor into
         // a silent one, since `3>&+3` then reads as `3>&3` and succeeds on a fd 3
         // that is closed.
-        let (_status, out, err) = run("echo BAD 3>&+3; echo after");
-        assert_eq!(out, "after\n");
+        let (status, out, err) = run("echo BAD 3>&+3; echo after");
+        assert_eq!((status, out.as_str()), (2, ""));
         assert!(err.contains("ambiguous redirect"), "err: {err:?}");
         // A leading ZERO is still a number, as it is in all three.
         let (_status, out, _) = run("echo Z >&01");
@@ -3145,10 +3145,15 @@ mod tests {
         ));
         assert_eq!(err, "AFTER\n");
         // Every other descriptor keeps the ambiguous-target error, and the two
-        // spellings that ARE descriptors keep dupping and closing.
-        for op in ["0>&", "2>&", "9>&", "<&"] {
-            let (_s, _o, err) = run(&format!("{both}sh_o {op}'{d}/z'"));
+        // spellings that ARE descriptors keep dupping and closing. The STATUS is
+        // asserted beside the message because the message alone does not pin the
+        // rule: ash raises this from `expredir`, so it is fatal on every
+        // destination but 1, and a version that printed the same line and let the
+        // script carry on would satisfy a message-only check.
+        for op in ["0>&", "2>&", "9>&", "<&", "0<&", "3<&"] {
+            let (s, _o, err) = run(&format!("{both}sh_o {op}'{d}/z'"));
             assert!(err.contains("ambiguous redirect"), "op: {op}, err: {err:?}");
+            assert_eq!(s, 2, "op: {op}");
         }
         let (_s, _o, err) = run("echo hi >&2");
         assert_eq!(err, "hi\n");
@@ -3391,25 +3396,47 @@ mod tests {
     }
 
     #[test]
-    fn a_target_that_is_not_a_descriptor_number_is_recoverable() {
-        // ash raises this one a step earlier than the failure above -- from
-        // `expredir`, outside the `redirectsafe` that makes the other
-        // recoverable -- and so ends the shell on it, with status 2. td-sh does
-        // not, which is a deliberate pre-existing divergence and NOT something
-        // the corpus witnesses: `redirect-multi`'s glob target is on fd 1, so it
-        // takes the `BASH_REDIR_OUTPUT` file arm and never reaches here. This
-        // test is the only thing pinning it, which is why it says so.
+    fn a_target_that_is_not_a_descriptor_number_is_fatal() {
+        // ash raises this one a step earlier than the failure below -- from
+        // `expredir`, OUTSIDE the `redirectsafe` that makes the other
+        // recoverable -- and so ends the shell on it with status 2. The two
+        // sit either side of that boundary, which is the whole point of
+        // testing them together.
         //
         // On fd 2, where a non-descriptor target stays ambiguous rather than
         // naming a file -- fd 1 is `dup_target`'s `BASH_REDIR_OUTPUT` case.
         let (status, out, err) = run("echo one 2>&/nope/x; echo survived");
-        assert_eq!((status, out.as_str()), (0, "survived\n"));
+        assert_eq!((status, out.as_str()), (2, ""));
         assert!(err.contains("ambiguous redirect"), "err: {err:?}");
-        // And on fd 1 the target IS a file, so the failure is the open's -- still
-        // recoverable, which is the property this test is about.
+        // And on fd 1 the target IS a file, so the failure is the OPEN's, which
+        // ash applies through `redirectsafe`: recoverable, and the command that
+        // follows still runs.
         let (status, out, err) = run("echo one 1>&/nope/x; echo survived");
         assert_eq!((status, out.as_str()), (0, "survived\n"));
         assert!(err.contains("No such file"), "err: {err:?}");
+        // Fatal is `Sig::Abort`, so an interactive shell returns to its prompt
+        // rather than ending -- the same distinction the `bad fd number` arm
+        // makes, and one no script can observe.
+        let units = ["echo one 2>&/nope/x", "echo NEXT"];
+        let (_s, out, _e) = crate::process::run_capturing_interactive_units(&units);
+        assert_eq!(out, "NEXT\n");
+        // The EARLIER redirections of the same command are rolled back before the
+        // abort unwinds, which only became observable when this arm stopped being
+        // recoverable: an interactive shell survives the abort, so a descriptor
+        // left installed is one every LATER line writes down. Here the `2>f` must
+        // not still be in force when the next unit writes to stderr.
+        let dir = std::env::temp_dir().join(format!("td-sh-fatalback-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let Ok(()) = std::fs::create_dir_all(&dir) else {
+            panic!("fixture dir");
+        };
+        let first = format!("echo A 2>'{}/log' 4>&/nope/x", dir.display());
+        let units = [first.as_str(), "echo LEAKTEST >&2"];
+        let (_s, _o, err) = crate::process::run_capturing_interactive_units(&units);
+        assert!(err.contains("LEAKTEST"), "err: {err:?}");
+        let logged = std::fs::read_to_string(dir.join("log")).unwrap_or_default();
+        assert!(!logged.contains("LEAKTEST"), "logged: {logged:?}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

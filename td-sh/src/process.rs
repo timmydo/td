@@ -315,10 +315,18 @@ impl Saved {
 /// rather than an `sh_error`'s own.
 const REDIR_ERROR: i32 = 1;
 
-/// What a redirection reports when ash applies it in a FORKED CHILD, which is
+/// What ash's `ash_msg_and_raise_error` exits with, for the redirection failures
+/// it treats as FATAL rather than as a status a command reports.
+///
+/// Two unrelated rules reach it. One is `expredir`'s "redir error": a `>&word`
+/// target that is not a descriptor, on a descriptor that is not 1 (ash.c:9667).
+/// It runs BEFORE `redirectsafe`, which is what makes it fatal rather than the
+/// recoverable kind.
+///
+/// The other is a redirection ash applies in a FORKED CHILD, which is
 /// `evalsubshell`'s doing: it uses the plain `redirect` where everything else
 /// uses `redirectsafe`, so a failure there is a fatal shell error the child dies
-/// of rather than a status it reports, and `ash_msg_and_raise_error` exits 2.
+/// of rather than a status it reports.
 ///
 /// Two node types reach that path and both are served. A subshell is one, from
 /// `run_subshell`. The other is a bare compound that is `&`'s direct operand:
@@ -326,7 +334,7 @@ const REDIR_ERROR: i32 = 1;
 /// `{ :; } <missing &` keeps its redirect list and is RETYPED to `NBACKGND`,
 /// which `evalsubshell` also runs — see `run_background_operand`. Anything with
 /// a node of its own is wrapped and keeps `REDIR_ERROR`.
-const FORKED_REDIR_ERROR: i32 = 2;
+const FATAL_REDIR_ERROR: i32 = 2;
 
 /// What `open("")` reports, which is the one target the shell has to answer for
 /// itself. See `open_file`.
@@ -546,8 +554,10 @@ fn to_both(opened: Opened) -> Opened {
 /// `>&2`, `<&0`, `>&-` (close), for the redirection whose own descriptor is
 /// `dest`. A numeric target dups that descriptor; a BARE `-` closes, which is
 /// `closes` -- the caller decides it from the unexpanded word.
-/// Returns `Ok(Err(()))` (message already printed) for a recoverable bad or
-/// ambiguous target, and `Err(Sig::Abort)` for the one spelling that is fatal.
+/// Returns `Ok(Err(()))` (message already printed) for the one recoverable
+/// failure, a descriptor target that is not open, and `Err(Sig::Abort)` for the
+/// two that ash raises from `expredir`: digits that cannot be a descriptor, and
+/// a non-digit target anywhere but fd 1.
 fn dup_target(sh: &mut Shell, dest: u32, target: &str, closes: bool) -> R<Result<Opened, ()>> {
     if closes {
         return Ok(Ok(Opened::To(Fd::Closed)));
@@ -593,8 +603,11 @@ fn dup_target(sh: &mut Shell, dest: u32, target: &str, closes: bool) -> R<Result
         opts.write(true).create(true).truncate(true);
         return Ok(open_file(sh, target, &opts).map(to_both));
     }
+    // Not a descriptor and not on fd 1, so there is nothing it can name: ash
+    // raises this from `expredir`, before `redirectsafe` and before any
+    // redirection is applied, so it is fatal rather than a status.
     let _ = exec::write_stderr(sh, &format!("{target}: ambiguous redirect"));
-    Ok(Err(()))
+    Err(Sig::Abort(FATAL_REDIR_ERROR))
 }
 
 fn open_file(sh: &mut Shell, name: &str, opts: &OpenOptions) -> Result<Opened, ()> {
@@ -858,17 +871,20 @@ pub fn run_subshell(sh: &mut Shell, body: &List, redirs: &[Redir]) -> R<()> {
         },
         // A failed redirection skips the subshell body, and reports the fatal
         // status the child would have died of rather than the 1 `apply_redirs`
-        // left — see `FORKED_REDIR_ERROR`. It also trips `set -e` where a brace
+        // left — see `FATAL_REDIR_ERROR`. It also trips `set -e` where a brace
         // group's does not: ash's parser leaves a subshell's redirections on the
         // `NSUBSHELL` node instead of wrapping it in an `NREDIR`, and `NSUBSHELL`
         // reaches `checkexit`.
-        Ok(RedirOutcome::Failed) => FORKED_REDIR_ERROR,
-        // A fatal expansion error in a target word (`>${x:?}`) is confined to the
-        // subshell here. That is a DIVERGENCE, not the rule: ash expands a
-        // subshell's redirect targets in `evalsubshell` BEFORE it forks, so
-        // `( : ) >${nope:?}` ends the whole shell there and carries on here.
-        // Left as it is rather than fixed in passing — it is the parent's
-        // control flow, not a status.
+        Ok(RedirOutcome::Failed) => FATAL_REDIR_ERROR,
+        // Anything FATAL in a target word is confined to the subshell here, and
+        // that is a DIVERGENCE rather than the rule: ash calls `expredir` in
+        // `evalsubshell` BEFORE it forks, so it ends the whole shell where this
+        // ends a clone. Two rules reach this arm — an expansion error
+        // (`( : ) >${nope:?}`) and, since the ambiguous target became fatal, a
+        // classification one (`( : ) 2>&/nope/x`); both print and carry on here
+        // where ash exits 2. Left as it is rather than fixed in passing: hoisting
+        // the classification into the parent is the two-phase split, not a line.
+        // bash and zsh side with td-sh on both, so ash is alone in the shape.
         Err(Sig::Exit(code) | Sig::Abort(code)) => code,
         Err(Sig::Interrupt(code)) => return leave_clone(sh, child, code),
         Err(_) => child.status,
@@ -893,7 +909,9 @@ pub fn run_subshell(sh: &mut Shell, body: &List, redirs: &[Redir]) -> R<()> {
 /// A DIVERGENCE rides on that, the same one `run_subshell` carries: ash calls
 /// `expredir` in the PARENT, before it forks, so the target words expand there.
 /// `unset x; { :; } >${x:=/dev/null} &` leaves `x` set under ash and unset here,
-/// and `{ :; } <${nope?} &` ends the whole shell there. It is specific to this
+/// `{ :; } <${nope?} &` ends the whole shell there, and so does
+/// `{ :; } 2>&/nope/x &` since the ambiguous target became fatal — the same
+/// classification half `run_subshell` names. It is specific to this
 /// node — `( : ) <${nope?} &` and `true <${nope?} &` both agree, because `&`
 /// wraps those and the `NBACKGND` it makes carries no redirections at all.
 /// This arm reaches the redirections before `run_pipeline` and `run_command`
@@ -916,7 +934,7 @@ pub fn run_background_operand(sh: &mut Shell, and_or: &AndOr) -> R<()> {
     match apply_redirs(sh, &redirs)? {
         RedirOutcome::Applied(_saved) => exec::run_command(sh, &cmd),
         RedirOutcome::Failed => {
-            sh.set_status(FORKED_REDIR_ERROR);
+            sh.set_status(FATAL_REDIR_ERROR);
             // `run_command`'s tail, which the failure skips past.
             exec::epipe_pending(sh)
         }
