@@ -3341,7 +3341,26 @@ fn dot(sh: &mut Shell, argv: &[String]) -> R<()> {
     // ash prints the spelling it was CALLED by -- `source: can't open` against
     // `.: can't open` -- so the word comes from argv rather than a literal.
     let word = argv.first().map_or(".", String::as_str);
-    let Some(name) = argv.get(1) else {
+    // ash runs an option loop here despite accepting NO option, so the only
+    // things it can do are end on `--` and refuse everything else. Refusing is
+    // FATAL, `.` being special. A lone `-` is not an option but a FILENAME
+    // (`. - ` reports `-: not found`), and the refusal names the first LETTER
+    // rather than the word, so `. -abc f` is `illegal option -a`. One word is
+    // examined rather than a loop of them because the first non-`--` option
+    // word never returns.
+    let mut rest = argv.get(1..).unwrap_or(&[]);
+    match rest.first().map(String::as_str) {
+        Some("--") => rest = rest.get(1..).unwrap_or(&[]),
+        // A lone `-` needs no guard of its own: stripping the dash leaves
+        // nothing to name, which is the same answer a word with no dash gets.
+        Some(w) => {
+            if let Some(bad) = w.strip_prefix('-').and_then(|o| o.chars().next()) {
+                return special_usage_error(sh, &format!("{word}: illegal option -{bad}"));
+            }
+        }
+        None => {}
+    }
+    let Some(name) = rest.first() else {
         // Not fatal in either shell: busybox ash returns 2 outright ("bash
         // compat" in its own words) and dash returns 0 without a word. Only a
         // file it cannot LOCATE raises.
@@ -3365,8 +3384,43 @@ fn dot(sh: &mut Shell, argv: &[String]) -> R<()> {
         }
     };
     let what = format!("{name}: ");
-    // A `return` in a sourced file returns from the `.`, not the process.
-    match exec::run_source(sh, &text, &what) {
+    // OPERANDS become the file's positional parameters, and only then: given
+    // none, ash saves nothing and the file both SEES and KEEPS the caller's, so
+    // a `set --` inside one leaks out. Given any, the frame is restored
+    // afterwards and that same `set --` is undone. The difference is observable
+    // either way round, which is why the save is conditional rather than
+    // unconditional-with-an-empty-vector.
+    let args = rest.get(1..).unwrap_or(&[]);
+    // The getopts cursor travels WITH the parameters: ash's frame is one struct
+    // (`struct shparam`, ash.c:2057) carrying `optind` and `optoff` beside the
+    // list, and `dotcmd` copies the whole of it. It is not RESET for the file --
+    // unlike a function call, `.` leaves the caller's cursor in place, so the
+    // file continues the caller's scan. What the save is for is a `set --`
+    // inside the file, which resets that cursor: without it the caller re-reads
+    // the option it had already consumed.
+    let saved = (!args.is_empty()).then(|| {
+        (
+            std::mem::replace(&mut sh.params, args.to_vec()),
+            sh.getopts_optind,
+            sh.getopts_off,
+        )
+    });
+    // A `return` in a sourced file returns from the `.`, not the process -- and
+    // is how such a file usually ends, so the frame has to come back on that
+    // path as much as on the ordinary one. Not `?` for the same reason.
+    let ran = exec::run_source(sh, &text, &what);
+    // But NOT on a terminating unwind. ash restores after `cmdloop` RETURNS, so
+    // an `exit` inside the file longjmps straight past it and the EXIT trap runs
+    // with the FILE's operands still in place. Measured: `. ./f a b` where `f`
+    // exits leaves the trap seeing `a b` where this shell showed the caller's.
+    if let Some((params, optind, off)) = saved {
+        if !matches!(&ran, Err(sig) if exec::terminating(sig)) {
+            sh.params = params;
+            sh.getopts_optind = optind;
+            sh.getopts_off = off;
+        }
+    }
+    match ran {
         Err(Sig::Return(code)) => status(sh, code),
         other => other,
     }
@@ -4785,6 +4839,144 @@ mod tests {
             assert!(super::is_ash_special_word(w), "{w}");
         }
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// `.`'s operands are the sourced file's positional parameters, and its
+    /// leading `-` words are options it accepts none of. Both spellings, since
+    /// they are one command.
+    #[test]
+    fn dot_takes_option_words_and_gives_the_file_its_operands() {
+        let dir = std::env::temp_dir().join(format!("td-sh-dotargs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("s.sh"), "echo \"in:[$1][$2] n=$#\"\n").unwrap();
+        std::fs::write(dir.join("r.sh"), "echo \"in:[$1] n=$#\"; return 3\n").unwrap();
+        std::fs::write(dir.join("set.sh"), "set -- SRC\n").unwrap();
+        std::fs::write(dir.join("opt.sh"), "getopts ab i; echo \"inner:[$i][$OPTIND]\"\n").unwrap();
+        std::fs::write(dir.join("exit.sh"), "exit 0\n").unwrap();
+        let d = dir.display();
+        for w in [".", "source"] {
+            let sh = |src: &str| run_capturing(&format!("cd '{d}'; {src}"));
+
+            // `--` ends the options and does NOT eat the operands.
+            let (st, out, _e) = sh(&format!("{w} -- ./s.sh"));
+            assert_eq!((st, out.as_str()), (0, "in:[][] n=0\n"), "{w}");
+            let (_s, out, _e) = sh(&format!("{w} -- ./s.sh a b"));
+            assert_eq!(out, "in:[a][b] n=2\n", "{w}");
+            // Any other option is FATAL, `.` being special, and names the first
+            // LETTER rather than the word -- so the refusal is over letters.
+            // Compared WHOLE, not by `contains`: `illegal option -abc` contains
+            // `illegal option -a`, so the loose form cannot tell the letter
+            // from the word it came out of.
+            for (src, letter) in [("-f ./s.sh", "-f"), ("-abc ./s.sh", "-a")] {
+                let (st, out, err) = sh(&format!("{w} {src}; echo AFTER"));
+                assert_eq!((st, out.as_str()), (2, ""), "{w} {src}");
+                assert_eq!(err.trim_end(), format!("{w}: illegal option {letter}"), "{w} {src}");
+            }
+            // A lone `-` is not an option at all but a FILENAME, and so is a
+            // second `--` once the first has ended them.
+            for name in ["-", "--"] {
+                let (st, _o, err) = sh(&format!("{w} -- {name}; echo AFTER"));
+                assert_eq!(st, 2, "{w} {name}");
+                assert!(err.contains(&format!("{name}: not found")), "{err:?}");
+            }
+            let (st, _o, err) = sh(&format!("{w} -; echo AFTER"));
+            assert_eq!(st, 2, "{w} -");
+            assert!(err.contains("-: not found"), "{err:?}");
+            // A `--`-PREFIXED word is not `--`, and the letter it names is the
+            // second dash: `. --x` is `illegal option --`, not `-x` and not the
+            // end of the options. Ending them on any `--`-prefixed word, or
+            // trimming the dashes before naming one, both pass every case above.
+            for src in ["--x ./s.sh", "---", "--x"] {
+                let (st, _o, err) = sh(&format!("{w} {src}; echo AFTER"));
+                assert_eq!(st, 2, "{w} {src}");
+                assert_eq!(err.trim_end(), format!("{w}: illegal option --"), "{w} {src}");
+            }
+            // `--` with NO operand after it is the no-operand case, not an
+            // option error: status 2 and the script CARRIES ON. That is the one
+            // shape here where the difference is fatal against recoverable.
+            for src in ["--", ""] {
+                let (st, out, _e) = sh(&format!("{w} {src}; echo \"AFTER st=$?\""));
+                assert_eq!((st, out.as_str()), (0, "AFTER st=2\n"), "{w} [{src}]");
+            }
+
+            // Operands become the file's parameters and the caller's come back.
+            let (_s, out, _e) =
+                sh(&format!("set -- keep me; {w} ./s.sh a b; echo \"after:[$1][$2] n=$#\""));
+            assert_eq!(out, "in:[a][b] n=2\nafter:[keep][me] n=2\n", "{w}");
+            // Fewer operands than the caller had, and none at all where the
+            // caller had some -- `$#` has to follow, not just `$1`.
+            let (_s, out, _e) =
+                sh(&format!("set -- keep me; {w} ./s.sh solo; echo \"after:[$1] n=$#\""));
+            assert_eq!(out, "in:[solo][] n=1\nafter:[keep] n=2\n", "{w}");
+            let (_s, out, _e) = sh(&format!("{w} ./s.sh a b; echo \"after:[$1] n=$#\""));
+            assert_eq!(out, "in:[a][b] n=2\nafter:[] n=0\n", "{w}");
+            // With NO operands the file sees the caller's frame and KEEPS it:
+            // nothing was saved, so the file's own `set --` leaks out. With
+            // operands the same `set --` is undone. That pair is what makes the
+            // save conditional rather than unconditional over an empty vector.
+            let (_s, out, _e) =
+                sh(&format!("set -- keep me; {w} ./s.sh; echo \"after:[$1] n=$#\""));
+            assert_eq!(out, "in:[keep][me] n=2\nafter:[keep] n=2\n", "{w}");
+            let (_s, out, _e) =
+                sh(&format!("set -- keep me; {w} ./set.sh; echo \"after:[$1] n=$#\""));
+            assert_eq!(out, "after:[SRC] n=1\n", "{w}");
+            let (_s, out, _e) =
+                sh(&format!("set -- keep me; {w} ./set.sh a; echo \"after:[$1] n=$#\""));
+            assert_eq!(out, "after:[keep] n=2\n", "{w}");
+            // An EMPTY operand is still an operand: ash decides on the argument
+            // being THERE (`args_need_save = argv[0]`, a pointer) and not on
+            // what it holds, so `. f ""` saves the frame and `$1` is empty.
+            let (_s, out, _e) =
+                sh(&format!("set -- keep me; {w} ./set.sh ''; echo \"after:[$1] n=$#\""));
+            assert_eq!(out, "after:[keep] n=2\n", "{w} empty operand");
+            let (_s, out, _e) = sh(&format!("{w} ./s.sh ''"));
+            assert_eq!(out, "in:[][] n=1\n", "{w} empty operand is $1");
+            // A `return` is how such a file usually ends, so the frame has to
+            // come back on that path too.
+            let (_s, out, _e) = sh(&format!(
+                "set -- keep me; {w} ./r.sh a b; echo \"st=$? after:[$1] n=$#\""
+            ));
+            assert_eq!(out, "in:[a] n=2\nst=3 after:[keep] n=2\n", "{w}");
+            // Inside a function it is the FUNCTION's frame that comes back.
+            let (_s, out, _e) = sh(&format!(
+                "f() {{ {w} ./s.sh a b; echo \"fn:[$1] n=$#\"; }}; set -- top; f X Y"
+            ));
+            assert_eq!(out, "in:[a][b] n=2\nfn:[X] n=2\n", "{w}");
+            // The getopts CURSOR is part of that frame. A `set --` inside the
+            // file resets it, and without the save the caller re-reads the
+            // option it had already consumed -- `o=a` twice instead of `a`
+            // then `b`. The file is not given a fresh cursor, though: it
+            // continues the caller's scan, which `set.sh` not touching
+            // `OPTIND` would hide, so the two halves need separate cases.
+            let (_s, out, _e) = sh(&format!(
+                "set -- -a -b; getopts ab o; {w} ./set.sh ARG; getopts ab o; echo \"o=$o i=$OPTIND\""
+            ));
+            assert_eq!(out, "o=b i=3\n", "{w}");
+            let (_s, out, _e) = sh(&format!(
+                "set -- -a -b; getopts ab o; {w} ./opt.sh -b; echo \"i=$OPTIND\""
+            ));
+            assert_eq!(out, "inner:[?][2]\ni=2\n", "{w}");
+            // ...and with no operands nothing is saved, so the file's own
+            // scan is what the caller is left holding.
+            let (_s, out, _e) = sh(&format!(
+                "set -- -a -b; getopts ab o; {w} ./opt.sh; echo \"i=$OPTIND\""
+            ));
+            assert_eq!(out, "inner:[b][3]\ni=3\n", "{w}");
+            // A TERMINATING unwind skips the restore, because ash's runs after
+            // its `cmdloop` returns and an `exit` never gets there: the EXIT
+            // trap sees the FILE's operands, not the caller's. The ordinary
+            // path is the control -- there the trap sees the caller's.
+            let (_s, out, _e) = sh(&format!(
+                "trap 'echo \"trap:[$1] n=$#\"' EXIT; set -- keep; {w} ./exit.sh a b"
+            ));
+            assert_eq!(out, "trap:[a] n=2\n", "{w}");
+            let (_s, out, _e) = sh(&format!(
+                "trap 'echo \"trap:[$1] n=$#\"' EXIT; set -- keep; {w} ./s.sh a b; exit 0"
+            ));
+            assert_eq!(out, "in:[a][b] n=2\ntrap:[keep] n=1\n", "{w}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
