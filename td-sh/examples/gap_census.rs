@@ -25,6 +25,26 @@
 //! number is staging the thing and re-running, as `sed`'s 14 was settled before
 //! a line of it was written.
 //!
+//! A ranking is also not a list of things WORTH fixing, which is the trap this
+//! tool was quiet about long enough to cost two increments. A file that names
+//! no ash golden -- most of them -- is graded on dash's, because the chain falls
+//! through; where the two shells disagree, matching that golden means breaking
+//! ash, and ash is the one td-sh follows. It has happened twice with a whole
+//! cluster at the top of the ranking. `redirect.test.sh` wants status 2 for a
+//! failed redirection and dash agrees, but `toysh-posix` records
+//! `OK ash status: 1` beside `OK dash status: 2` for the same failure. Taking
+//! it promoted 12 cases and broke 5, and every one of the 5 was ash-graded.
+//! `builtin-umask.test.sh` wants dash's symbolic parser, and
+//! `conformance.rs`'s `umask_is_ashs_including_the_symbolic_form` holds values
+//! measured on busybox 1.37.0 that contradict it clause by clause.
+//!
+//! So the ranking is SPLIT by the identity each case is graded as. Failures
+//! graded as ash are gaps in the shell td-sh models. Failures graded as dash
+//! are candidates: reachable where the shells agree, and a trap where they do
+//! not. Before taking a dash-graded cluster, find out what ash does -- the
+//! corpus sometimes records it in a neighbouring file, and this crate's own
+//! busybox-measured tests are the other place to look.
+//!
 //! ```text
 //! cargo build --release --manifest-path td-sh/Cargo.toml --bins --examples
 //! ./td-sh/target/release/examples/gap_census \
@@ -35,7 +55,14 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
-use td_sh::{case_keys, parse_spec, run_case, spec_paths, ASH_DASH_CHAIN};
+use td_sh::{
+    case_keys, designates, graded_identity, parse_spec, run_case, spec_paths, ASH_DASH_CHAIN,
+};
+
+/// The bucket for a case whose file ran neither chain shell, so its golden is
+/// the unqualified block -- osh's ideal, which is bash-shaped and mostly out of
+/// scope for this shell.
+const NEITHER: &str = "neither";
 
 /// The command a `not found` diagnostic NAMES, where the golden asserted stderr
 /// and so kept it.
@@ -173,7 +200,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .into());
     }
 
-    let mut per_file: BTreeMap<String, usize> = BTreeMap::new();
+    // Split by the identity each case is GRADED as, which is the one thing the
+    // ranking below cannot say and the one that decides whether a cluster is
+    // reachable at all. See the note at the head of this file.
+    let mut per_file_by_id: BTreeMap<&str, BTreeMap<String, usize>> = BTreeMap::new();
+    let mut by_identity: BTreeMap<&str, usize> = BTreeMap::new();
     let mut wanted: BTreeMap<String, usize> = BTreeMap::new();
     let mut named: BTreeMap<String, usize> = BTreeMap::new();
     let mut buckets: BTreeMap<String, usize> = BTreeMap::new();
@@ -218,7 +249,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 passed += 1;
                 continue;
             }
-            *per_file.entry(file.clone()).or_default() += 1;
+            // Three-way, not two: `graded_identity` falls back to the chain
+            // head, so a file that ran NEITHER shell also reports "ash", and
+            // that one is the bash/osh ideal rather than anything about ash.
+            let id = match graded_identity(case, ASH_DASH_CHAIN) {
+                Some(id) if designates(case, id) => id,
+                _ => NEITHER,
+            };
+            *by_identity.entry(id).or_default() += 1;
+            *per_file_by_id.entry(id).or_default().entry(file.clone()).or_default() += 1;
             if outcome.timed_out || outcome.truncated {
                 *buckets.entry("not evaluated (timeout/cap)".into()).or_default() += 1;
                 continue;
@@ -259,15 +298,37 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     for (what, n) in rows {
         println!("  {n:5}  {what}");
     }
-    println!("\nWHERE THEY ARE, most-failing file first");
-    let mut files: Vec<(&String, &usize)> = per_file.iter().collect();
-    files.sort_by_key(|(name, n)| (std::cmp::Reverse(**n), (*name).clone()));
-    let shown = 25.min(files.len());
-    for (name, n) in files.iter().take(shown) {
-        println!("  {n:5}  {name}");
+    println!("\nWHICH SHELL THE GOLDEN CAME FROM");
+    // "designates", not "ran": a case designates a shell by its file's header OR
+    // by carrying an annotation block for it, and 31 (file, id) pairs in this
+    // corpus do it the second way. For those the file never ran the shell, so a
+    // field with no block of its own still falls to the ideal -- the same trap
+    // one level down.
+    println!("  ash      designates ash, so this is a gap in the shell td-sh models");
+    println!("  dash     designates dash and NOT ash, so the chain fell through --");
+    println!("           reachable where the shells agree, a trap where they do not");
+    println!("  {NEITHER}  designates neither, so the golden is the bash/osh ideal");
+    let mut ids: Vec<(&&str, &usize)> = by_identity.iter().collect();
+    ids.sort_by_key(|(_, n)| std::cmp::Reverse(**n));
+    for (id, n) in ids {
+        println!("  {n:5}  graded as {id}");
     }
-    let tail: usize = files.iter().skip(shown).map(|(_, n)| **n).sum();
-    println!("  {tail:5}  ({} further files)", files.len().saturating_sub(shown));
+    for id in ASH_DASH_CHAIN.iter().chain(std::iter::once(&NEITHER)) {
+        let Some(files) = per_file_by_id.get(id) else {
+            continue;
+        };
+        println!("\nWHERE THEY ARE, graded as {id}, most-failing file first");
+        let mut files: Vec<(&String, &usize)> = files.iter().collect();
+        files.sort_by(|a, b| b.1.cmp(a.1).then(a.0.cmp(b.0)));
+        let shown = 15.min(files.len());
+        for (name, n) in files.iter().take(shown) {
+            println!("  {n:5}  {name}");
+        }
+        if let Some(rest) = files.len().checked_sub(shown).filter(|r| *r > 0) {
+            let tail: usize = files.iter().skip(shown).map(|(_, n)| **n).sum();
+            println!("  {tail:5}  ({rest} further files)");
+        }
+    }
     println!("\nNAMES THE DIAGNOSTIC ITSELF GAVE (goldens that assert stderr)");
     let mut exact: Vec<(&String, &usize)> = named.iter().collect();
     exact.sort_by(|a, b| b.1.cmp(a.1).then(a.0.cmp(b.0)));

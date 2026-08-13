@@ -500,7 +500,12 @@ fn names_identity(token: &str, id: &str) -> bool {
 /// predicate because the chain bound and the graded identity must agree about
 /// what "the file ran this shell" means -- reading it two ways is what let a
 /// case be graded on a hybrid of two shells' goldens.
-fn designates(case: &SpecCase, id: &str) -> bool {
+///
+/// Public because `graded_identity` alone cannot answer the question a census
+/// asks. It falls back to the chain HEAD, so "ash" comes back both for a case
+/// that designates ash and for one that designates neither chain shell -- and
+/// those two are opposite verdicts about whether a failure is worth fixing.
+pub fn designates(case: &SpecCase, id: &str) -> bool {
     case.compare_shells.iter().any(|t| names_identity(t, id))
         || case.annotations.iter().any(|a| a.shells.iter().any(|s| s == id))
 }
@@ -1584,6 +1589,44 @@ dash-says
         let cases = parse_spec(spec)?;
         let c = cases.first().ok_or_else(|| SpecError::new(0, "missing case"))?;
         assert_eq!(resolve(c, ASH_DASH_CHAIN)?.stdout.as_deref(), Some("dash-says\n"));
+        Ok(())
+    }
+
+    #[test]
+    fn designating_nothing_is_not_the_same_as_designating_the_chain_head()
+    -> Result<(), SpecError> {
+        // `graded_identity` answers "ash" for a file that RAN ash and for one
+        // that ran neither chain shell, because it falls back to the head. Those
+        // are opposite verdicts about a failing case -- a gap in the shell td-sh
+        // models, versus the bash/osh ideal it does not serve -- so a census that
+        // asked only `graded_identity` reported 900 ash-graded failures where
+        // 119 are.
+        let one = |spec: &str| -> Result<SpecCase, SpecError> {
+            parse_spec(spec)?
+                .into_iter()
+                .next()
+                .ok_or_else(|| SpecError::new(0, "missing case"))
+        };
+        let ran_ash = one("## compare_shells: bash ash\n\n#### c\ntrue\n")?;
+        let ran_neither = one("## compare_shells: bash mksh\n\n#### c\ntrue\n")?;
+        for c in [&ran_ash, &ran_neither] {
+            assert_eq!(graded_identity(c, ASH_DASH_CHAIN), Some("ash"));
+        }
+        assert!(designates(&ran_ash, "ash"));
+        assert!(!designates(&ran_neither, "ash"));
+        // A file that ran dash but not ash grades as dash by fall-through, which
+        // is the third case and the one that has twice looked reachable and was
+        // not.
+        let ran_dash = one("## compare_shells: bash dash\n\n#### c\ntrue\n")?;
+        assert_eq!(graded_identity(&ran_dash, ASH_DASH_CHAIN), Some("dash"));
+        assert!(designates(&ran_dash, "dash"));
+        // An annotation designates as much as the header does. Pinned on a
+        // NON-HEAD identity, because on the head it cannot fail: `graded_identity`
+        // would answer "ash" from the fallback whether or not the annotation
+        // counted, so an ash block here would assert nothing.
+        let annotated = one("## compare_shells: bash\n\n#### c\ntrue\n## OK dash status: 3\n")?;
+        assert!(designates(&annotated, "dash"));
+        assert_eq!(graded_identity(&annotated, ASH_DASH_CHAIN), Some("dash"));
         Ok(())
     }
 
