@@ -2667,11 +2667,10 @@ mod tests {
         }
         // The subshell is the one a reader expects to see above: ash's parser
         // leaves its redirections on the `NSUBSHELL` rather than wrapping it, so
-        // it is checked. Loose on the status ON PURPOSE, and not to be tightened
-        // to 1: ash reports 2 here, which is a divergence of its own.
+        // it is checked. 2 and not 1 because the status is the fatal one its
+        // child dies of -- `SUBSHELL_REDIR_ERROR`, pinned in `process.rs`.
         let (status, out, _) = run("set -e; ( : ) </no/such/td-e; echo unreached");
-        assert_ne!(status, 0);
-        assert_eq!(out, "");
+        assert_eq!((status, out.as_str()), (2, ""));
     }
 
     #[test]
@@ -2903,6 +2902,51 @@ mod tests {
         // way the value reaches a caller that never runs `echo $?`.
         let (status, out, _) = run("set -e; echo x >/nonexistent/td-sh-nope/f; echo unreached");
         assert_eq!((status, out.as_str()), (1, ""));
+    }
+
+    #[test]
+    fn a_subshells_failed_redirection_reports_the_fatal_two() {
+        // The exception to the 1 above, and the ONLY one: ash applies a subshell's
+        // redirections in the forked child with the plain `redirect`, so the child
+        // dies of a fatal shell error rather than reporting a redirection's. Every
+        // spelling of a subshell answers 2 -- including as a pipeline STAGE, where
+        // the surrounding compound would answer 1 -- and the function form, which
+        // is a subshell body rather than the brace one beside it.
+        for src in [
+            "( : ) </no/such/td-e",
+            "( ( : ) </no/such/td-e )",
+            "{ ( : ) </no/such/td-e; }",
+            "x=$( ( : ) </no/such/td-e )",
+            "true | ( : ) </no/such/td-e",
+            "f() ( : ) </no/such/td-e; f",
+            "( : ) </no/such/td-e & wait $!",
+        ] {
+            let (_status, out, err) = run(&format!("{src}; echo st=$?"));
+            assert_eq!(out, "st=2\n", "src: {src}");
+            // The status is the child dying, so the diagnostic must still be the
+            // redirection's -- a fatal path that reported 2 and said nothing
+            // would be indistinguishable from one that failed for another reason.
+            assert!(err.contains("No such file"), "src: {src}, err: {err:?}");
+        }
+        // The contrast, at the same three shapes: everything that is NOT a
+        // subshell goes through the equivalent of `redirectsafe` and answers 1.
+        for src in [
+            "{ :; } </no/such/td-e",
+            "true | { :; } </no/such/td-e",
+            "f() { :; } </no/such/td-e; f",
+        ] {
+            let (_status, out, _) = run(&format!("{src}; echo st=$?"));
+            assert_eq!(out, "st=1\n", "src: {src}");
+        }
+        // A body that fails on its own still reports ITS status, so the 2 is the
+        // redirection's answer and not every subshell failure's.
+        let (_status, out, _) = run("( exit 7 ); echo st=$?");
+        assert_eq!(out, "st=7\n");
+        // The body must be SKIPPED, which every case above is blind to: each has
+        // a silent `:` for a body, so a subshell that ran it and then reported 2
+        // anyway satisfies all of them. This one would print.
+        let (_status, out, _) = run("( echo RAN ) </no/such/td-e; echo st=$?");
+        assert_eq!(out, "st=2\n");
     }
 
     #[test]

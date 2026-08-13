@@ -315,6 +315,21 @@ impl Saved {
 /// rather than an `sh_error`'s own.
 const REDIR_ERROR: i32 = 1;
 
+/// What a redirection reports when ash applies it in a FORKED CHILD, which is
+/// `evalsubshell`'s doing: it uses the plain `redirect` where everything else
+/// uses `redirectsafe`, so a failure there is a fatal shell error the child dies
+/// of rather than a status it reports, and `ash_msg_and_raise_error` exits 2.
+///
+/// Two node types reach that path and td-sh serves ONE. A subshell does, and is
+/// what this constant is used for. So does a bare compound that is `&`'s direct
+/// operand: ash's `&` wraps its operand in an `NREDIR` only if it is not one
+/// already, so `{ :; } <missing &` keeps its redirect list and is RETYPED to
+/// `NBACKGND`, which `evalsubshell` also runs. td-sh reports 1 there and ash 2 —
+/// measured across the six compound spellings, against five controls that do get
+/// wrapped and so stay 1 (a simple command, a function call, a subshell, an
+/// and-or, and a redirect written on the inner command).
+const FORKED_REDIR_ERROR: i32 = 2;
+
 /// What `open("")` reports, which is the one target the shell has to answer for
 /// itself. See `open_file`.
 const ENOENT: i32 = 2;
@@ -737,13 +752,19 @@ pub fn run_subshell(sh: &mut Shell, body: &List, redirs: &[Redir]) -> R<()> {
             // break/continue/return that escape a subshell are confined to it.
             Err(_) => child.status,
         },
-        // A failed redirection skips the subshell body; `$?` is already 1. Unlike
-        // a brace group's, it DOES trip `set -e`: ash's parser leaves a subshell's
-        // redirections on the `NSUBSHELL` node instead of wrapping it in an
-        // `NREDIR`, and `NSUBSHELL` is one of the three that reach `checkexit`.
-        Ok(RedirOutcome::Failed) => child.status,
-        // A fatal expansion error in a target word (`>${x:?}`) exits the SUBSHELL,
-        // not the parent — confine it here rather than propagating.
+        // A failed redirection skips the subshell body, and reports the fatal
+        // status the child would have died of rather than the 1 `apply_redirs`
+        // left — see `FORKED_REDIR_ERROR`. It also trips `set -e` where a brace
+        // group's does not: ash's parser leaves a subshell's redirections on the
+        // `NSUBSHELL` node instead of wrapping it in an `NREDIR`, and `NSUBSHELL`
+        // reaches `checkexit`.
+        Ok(RedirOutcome::Failed) => FORKED_REDIR_ERROR,
+        // A fatal expansion error in a target word (`>${x:?}`) is confined to the
+        // subshell here. That is a DIVERGENCE, not the rule: ash expands a
+        // subshell's redirect targets in `evalsubshell` BEFORE it forks, so
+        // `( : ) >${nope:?}` ends the whole shell there and carries on here.
+        // Left as it is rather than fixed in passing — it is the parent's
+        // control flow, not a status.
         Err(Sig::Exit(code) | Sig::Abort(code)) => code,
         Err(Sig::Interrupt(code)) => return leave_clone(sh, child, code),
         Err(_) => child.status,
