@@ -301,15 +301,33 @@ impl Saved {
     }
 }
 
+/// What `$?` becomes when a redirection cannot be opened or duped, and one of the
+/// few places the two shells td-sh grades against give different answers to the
+/// same question. dash's `redirectsafe` returns `setjmp(jmploc.loc) * 2` and
+/// `evalcommand` assigns that to `exitstatus`; busybox ash carries the same
+/// function with the doubling dropped, so it returns 1. td-sh is ash's
+/// replacement and its chain is ash-first, so 1 is the answer here — and the
+/// corpus records both sides rather than leaving it to be inferred, `toysh-posix`'s
+/// "Failed redirect in assignment" naming `OK dash status: 2` beside
+/// `OK ash status: 1`.
+///
+/// A special builtin then makes it fatal, POSIX's rule, but with this status
+/// rather than an `sh_error`'s own.
+const REDIR_ERROR: i32 = 1;
+
+/// What `open("")` reports, which is the one target the shell has to answer for
+/// itself. See `open_file`.
+const ENOENT: i32 = 2;
+
 /// The result of applying one command's redirections.
 pub enum RedirOutcome {
     /// All redirections applied; here is what to restore afterward.
     Applied(Saved),
     /// A redirection failed to open/dup a target (message already printed, `$?`
-    /// set to 1). The command must NOT run. POSIX makes this fatal only for a
-    /// special built-in; for every other command the caller skips it and keeps the
-    /// shell alive. (Contrast an *expansion* error in a target — `>${x:?}` — which
-    /// is always fatal and propagates as `Err(Sig)`.)
+    /// set to `REDIR_ERROR`). The command must NOT run. POSIX makes this fatal
+    /// only for a special built-in; for every other command the caller skips it
+    /// and keeps the shell alive. (Contrast an *expansion* error in a target —
+    /// `>${x:?}` — which is always fatal and propagates as `Err(Sig)`.)
     Failed,
 }
 
@@ -323,15 +341,17 @@ pub fn apply_redirs(sh: &mut Shell, redirs: &[Redir]) -> R<RedirOutcome> {
         let fd = default_fd(r);
         let prev = sh.fds.map.get(&fd).cloned();
         match open_redir(sh, r) {
-            Ok(Ok(target)) => {
+            Ok(Ok(Opened::To(target))) => {
                 sh.fds.set(fd, target);
                 saved.entries.push((fd, prev));
             }
+            // Nothing to install and so nothing to restore.
+            Ok(Ok(Opened::Unchanged)) => {}
             Ok(Err(())) => {
                 // A recoverable open/dup failure: roll back this command's earlier
                 // redirections, set the failure status, and report "skip".
                 restore_redirs(sh, saved);
-                sh.set_status(1);
+                sh.set_status(REDIR_ERROR);
                 return Ok(RedirOutcome::Failed);
             }
             Err(sig) => {
@@ -368,81 +388,116 @@ fn default_fd(r: &Redir) -> u32 {
     }
 }
 
+/// What a redirection installs on its descriptor.
+enum Opened {
+    To(Fd),
+    /// `n>&n`: dash's `redirect` skips a dup of a descriptor onto itself, so the
+    /// fd is left exactly as it was — which is the whole difference between
+    /// `: 3>&3` printing nothing and printing what follows it, since fd 3 is
+    /// usually closed and duping a closed descriptor is an error.
+    Unchanged,
+}
+
 /// Open one redirection's target descriptor. An error in *expanding* the target
 /// word (`>${x:?}`, `set -u`) is fatal and propagates as `Err(Sig)`. A failure to
 /// open/dup the resulting target is recoverable: the message is printed and
 /// `Ok(Err(()))` is returned so `apply_redirs` can turn it into a skipped command.
-fn open_redir(sh: &mut Shell, r: &Redir) -> R<Result<Fd, ()>> {
+fn open_redir(sh: &mut Shell, r: &Redir) -> R<Result<Opened, ()>> {
     match &r.kind {
         RedirKind::Here(body) => {
             let text = exec::here_body(sh, body)?;
-            Ok(Ok(Fd::ReadBuf(Arc::new(Mutex::new(Cursor::new(
-                text.into_bytes(),
+            Ok(Ok(Opened::To(Fd::ReadBuf(Arc::new(Mutex::new(
+                Cursor::new(text.into_bytes()),
             ))))))
         }
         RedirKind::DupIn | RedirKind::DupOut => {
             let target = exec::redir_target(sh, r)?;
-            Ok(dup_target(sh, &target))
+            Ok(dup_target(sh, default_fd(r), &target))
         }
-        RedirKind::In => open_file(sh, r, OpenOptions::new().read(true)),
+        // Each of the four file kinds expands its target exactly ONCE and hands
+        // the text on. `set -C` used to expand for its own check and leave
+        // `open_file` to expand again, so a command substitution in the target ran
+        // twice -- `set -C; echo hi > "$(date >&2; echo f)"` logged two dates.
+        RedirKind::In => {
+            let name = exec::redir_target(sh, r)?;
+            Ok(open_file(sh, &name, OpenOptions::new().read(true)))
+        }
         RedirKind::Out | RedirKind::Clobber => {
-            if matches!(r.kind, RedirKind::Out) && sh.opts.noclobber {
-                // `set -C`: refuse to truncate an existing regular file.
-                let path = exec::redir_target(sh, r)?;
-                if sh.resolve(&path).is_file() {
-                    let _ = exec::write_stderr(sh, &format!("{path}: cannot overwrite existing file"));
-                    return Ok(Err(()));
-                }
+            let name = exec::redir_target(sh, r)?;
+            // `set -C`: refuse to truncate an existing regular file.
+            if matches!(r.kind, RedirKind::Out) && sh.opts.noclobber && sh.resolve(&name).is_file() {
+                let _ = exec::write_stderr(sh, &format!("{name}: cannot overwrite existing file"));
+                return Ok(Err(()));
             }
-            open_file(
-                sh,
-                r,
-                OpenOptions::new().write(true).create(true).truncate(true),
-            )
+            let mut opts = OpenOptions::new();
+            opts.write(true).create(true).truncate(true);
+            Ok(open_file(sh, &name, &opts))
         }
-        RedirKind::Append => open_file(
-            sh,
-            r,
-            OpenOptions::new().write(true).create(true).append(true),
-        ),
+        RedirKind::Append => {
+            let name = exec::redir_target(sh, r)?;
+            let mut opts = OpenOptions::new();
+            opts.write(true).create(true).append(true);
+            Ok(open_file(sh, &name, &opts))
+        }
         RedirKind::ReadWrite => {
-            open_file(sh, r, OpenOptions::new().read(true).write(true).create(true))
+            let name = exec::redir_target(sh, r)?;
+            let mut opts = OpenOptions::new();
+            opts.read(true).write(true).create(true);
+            Ok(open_file(sh, &name, &opts))
         }
     }
 }
 
-/// `>&2`, `<&0`, `>&-` (close). A numeric target dups that descriptor; `-` closes.
+/// `>&2`, `<&0`, `>&-` (close), for the redirection whose own descriptor is
+/// `dest`. A numeric target dups that descriptor; `-` closes.
 /// Returns `Err(())` (message already printed) for a recoverable bad/ambiguous target.
-fn dup_target(sh: &mut Shell, target: &str) -> Result<Fd, ()> {
+fn dup_target(sh: &mut Shell, dest: u32, target: &str) -> Result<Opened, ()> {
     if target == "-" {
-        return Ok(Fd::Closed);
+        return Ok(Opened::To(Fd::Closed));
     }
-    match target.parse::<u32>() {
-        Ok(n) => match sh.fds.get(n) {
-            Some(fd) => Ok(fd.clone()),
+    // Digits only. `u32::from_str` also accepts a leading `+`, which no shell
+    // does, and the self-dup below turns that from a wrong descriptor into a
+    // SILENT one: `3>&+3` reads as `3>&3` and succeeds on a closed fd 3.
+    let numeric = match target.bytes().all(|b| b.is_ascii_digit()) {
+        true => target.parse::<u32>().ok(),
+        false => None,
+    };
+    match numeric {
+        Some(n) if n == dest => Ok(Opened::Unchanged),
+        Some(n) => match sh.fds.get(n) {
+            Some(fd) => Ok(Opened::To(fd.clone())),
             None => {
                 let _ = exec::write_stderr(sh, &format!("{n}: bad file descriptor"));
                 Err(())
             }
         },
-        Err(_) => {
+        None => {
             let _ = exec::write_stderr(sh, &format!("{target}: ambiguous redirect"));
             Err(())
         }
     }
 }
 
-fn open_file(sh: &mut Shell, r: &Redir, opts: &OpenOptions) -> R<Result<Fd, ()>> {
-    let name = exec::redir_target(sh, r)?;
+fn open_file(sh: &mut Shell, name: &str, opts: &OpenOptions) -> Result<Opened, ()> {
     if name == "/dev/null" {
-        return Ok(Ok(Fd::Null));
+        return Ok(Opened::To(Fd::Null));
     }
-    let path = sh.resolve(&name);
+    // `>"$empty"` is ENOENT to the kernel, but `resolve` joins a relative target
+    // onto the cwd and joining "" yields the cwd ITSELF -- so this opened the
+    // current directory and succeeded, and `<"$empty"` then handed a directory's
+    // descriptor to the command instead of skipping it. Refused by name rather
+    // than left to the open, since the open is what gets it wrong.
+    if name.is_empty() {
+        let e = std::io::Error::from_raw_os_error(ENOENT);
+        let _ = exec::write_stderr(sh, &format!("{name}: {e}"));
+        return Err(());
+    }
+    let path = sh.resolve(name);
     match opts.open(&path) {
-        Ok(f) => Ok(Ok(Fd::File(Arc::new(f)))),
+        Ok(f) => Ok(Opened::To(Fd::File(Arc::new(f)))),
         Err(e) => {
             let _ = exec::write_stderr(sh, &format!("{name}: {e}"));
-            Ok(Err(()))
+            Err(())
         }
     }
 }

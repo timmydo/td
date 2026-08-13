@@ -2740,6 +2740,108 @@ mod tests {
     }
 
     #[test]
+    fn a_failed_redirection_reports_ashs_one_and_not_dashs_two() {
+        // The two shells td-sh grades against disagree here -- dash's
+        // `redirectsafe` doubles its `setjmp` return and ash's does not -- so this
+        // pins the ash-first answer against the plausible other one rather than
+        // against nothing. Asserted on all three ways a redirection fails: a target
+        // that will not open, a descriptor that is not open, and `set -C` refusing
+        // to truncate.
+        let kept = std::env::temp_dir().join(format!("td-sh-noclobber-{}", std::process::id()));
+        // Unwrapped: `set -C` only refuses a file that EXISTS, so a setup that
+        // quietly failed would leave the case asserting nothing about noclobber.
+        std::fs::write(&kept, b"").expect("noclobber fixture");
+        let noclobber = format!("set -C; echo x >'{}'; echo st=$?", kept.display());
+        for src in [
+            "echo x >/nonexistent/td-sh-nope/f; echo st=$?",
+            "echo x >&7; echo st=$?",
+            noclobber.as_str(),
+        ] {
+            let (_status, out, _) = run(src);
+            assert_eq!(out, "st=1\n", "src: {src}");
+        }
+        let _ = std::fs::remove_file(&kept);
+        // And it is the status the shell EXITS with under `-e`, which is the only
+        // way the value reaches a caller that never runs `echo $?`.
+        let (status, out, _) = run("set -e; echo x >/nonexistent/td-sh-nope/f; echo unreached");
+        assert_eq!((status, out.as_str()), (1, ""));
+    }
+
+    #[test]
+    fn an_empty_redirection_target_does_not_open_the_current_directory() {
+        // The tell is the command RUNNING, not the diagnostic: joining "" onto the
+        // cwd yields the cwd, which opens for reading, so this printed `RAN` with a
+        // directory on fd 0. The write direction failed either way and only ever
+        // said the wrong thing about why.
+        let (_status, out, err) = run("e=; echo RAN <\"$e\"; echo after");
+        assert_eq!(out, "after\n");
+        assert!(err.contains("No such file"), "err: {err:?}");
+        let (_status, _out, err) = run("e=; echo x >\"$e\"");
+        assert!(err.contains("No such file"), "err: {err:?}");
+        // A target that really IS a directory keeps its own answer.
+        let (_status, _out, err) = run("echo x >/");
+        assert!(err.contains("Is a directory"), "err: {err:?}");
+    }
+
+    #[test]
+    fn a_descriptor_duped_onto_itself_is_left_alone() {
+        // `n>&n` is skipped rather than performed, so it neither fails on a closed
+        // descriptor nor disturbs an open one. Serving it as a dup breaks the
+        // first; serving it as a CLOSE breaks only the THIRD, because a command's
+        // redirections are unwound afterwards and `exec`'s are not -- which is
+        // measured, not assumed: mutating `Unchanged` to a close fails at the
+        // `exec` line with the other two green. The middle one discriminates
+        // nothing on its own and is here to say what the skip must not disturb.
+        let (status, out, _) = run(": 3>&3; echo hello");
+        assert_eq!((status, out.as_str()), (0, "hello\n"));
+        let (_status, out, _) = run("exec 3>&1; : 3>&3; echo via3 >&3");
+        assert_eq!(out, "via3\n");
+        let (_status, out, _) = run("exec 3>&1; exec 3>&3; echo still3 >&3");
+        assert_eq!(out, "still3\n");
+    }
+
+    #[test]
+    fn a_descriptor_target_is_digits_only() {
+        // `u32::from_str` also takes a leading `+`, which bash, dash and zsh all
+        // reject -- and the self-dup above turns that from a wrong descriptor into
+        // a silent one, since `3>&+3` then reads as `3>&3` and succeeds on a fd 3
+        // that is closed.
+        let (_status, out, err) = run("echo BAD 3>&+3; echo after");
+        assert_eq!(out, "after\n");
+        assert!(err.contains("ambiguous redirect"), "err: {err:?}");
+        // A leading ZERO is still a number, as it is in all three.
+        let (_status, out, _) = run("echo Z >&01");
+        assert_eq!(out, "Z\n");
+    }
+
+    #[test]
+    fn a_redirect_target_is_expanded_once() {
+        // `set -C` checked the file with an expansion of its own and left
+        // `open_file` to expand a second time, so a command substitution in the
+        // target RAN TWICE -- side effects and all, on the one option whose whole
+        // job is to not touch the file.
+        let (_status, _out, err) = run("set -C; echo hi >\"$(echo /dev/null; echo TWICE >&2)\"");
+        assert_eq!(err.matches("TWICE").count(), 1, "err: {err:?}");
+        // The unguarded path was always single, and stays that way.
+        let (_status, _out, err) = run("echo hi >\"$(echo /dev/null; echo ONCE >&2)\"");
+        assert_eq!(err.matches("ONCE").count(), 1, "err: {err:?}");
+    }
+
+    #[test]
+    fn a_target_that_is_not_a_descriptor_number_is_recoverable() {
+        // dash raises this one a step earlier than the failure above -- `fixredir`
+        // from `expredir`, outside the `redirectsafe` that makes the other
+        // recoverable -- and so ends the shell on it. td-sh does not, because the
+        // only corpus case that compares ash AND has a non-numeric `>&` target
+        // (`redirect-multi`'s glob one) expects the shell to skip the command and
+        // carry on. Pinned so that following dash here is a decision rather than
+        // an oversight.
+        let (status, out, err) = run("echo one 1>&/nope/x; echo survived");
+        assert_eq!((status, out.as_str()), (0, "survived\n"));
+        assert!(err.contains("ambiguous redirect"), "err: {err:?}");
+    }
+
+    #[test]
     fn errexit_exemption_covers_a_compound_operand() {
         // A function on the non-final side of `||` is exempt from errexit for its
         // WHOLE body: an inner `false` must not exit before `echo survived` runs.
