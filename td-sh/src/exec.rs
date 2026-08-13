@@ -4093,10 +4093,12 @@ mod tests {
         lines.sort_unstable();
         assert_eq!(lines, ["2", "x"], "{out:?}");
         assert_eq!(run("echo 2&; echo x").0, 2);
-        // And `&<` is not this operator either: only `>` glues to the `&`.
+        // And `&<` is not this operator either: only `>` glues to the `&`. That
+        // `&` backgrounds `echo hi`, so `wait` is what orders the two lines --
+        // without it they race and the assertion is a coin toss.
         std::fs::write(&f, "PRE\n").unwrap();
-        let (_s, out, err) = run(&format!("echo hi &<'{d}'; echo done"));
-        assert_eq!(out, "done\nhi\n");
+        let (_s, out, err) = run(&format!("echo hi &<'{d}'; wait; echo done"));
+        assert_eq!(out, "hi\ndone\n");
         assert_eq!(read(&f), "PRE\n", "{err}");
 
         // ash refuses these three where bash takes the first; the grammar gives
