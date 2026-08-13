@@ -34,6 +34,7 @@ pub enum Builtin {
     Cd,
     Pwd,
     Dot,
+    Times,
     Command,
     Wait,
     Alias,
@@ -51,7 +52,7 @@ pub enum Builtin {
 pub const NAMES: &[&str] = &[
     ":", "[", ".", "alias", "break", "cd", "command", "continue", "echo", "eval", "exec", "exit",
     "export", "false", "getopts", "jobs", "local", "printf", "pwd", "read", "readonly", "return", "set",
-    "shift", "test", "trap", "true", "type", "umask", "unalias", "unset", "wait",
+    "shift", "test", "times", "trap", "true", "type", "umask", "unalias", "unset", "wait",
 ];
 
 pub fn lookup(name: &str) -> Option<Builtin> {
@@ -78,6 +79,7 @@ pub fn lookup(name: &str) -> Option<Builtin> {
         "cd" => Builtin::Cd,
         "pwd" => Builtin::Pwd,
         "." => Builtin::Dot,
+        "times" => Builtin::Times,
         "command" => Builtin::Command,
         "wait" => Builtin::Wait,
         "jobs" => Builtin::Jobs,
@@ -109,6 +111,7 @@ pub fn is_special(bi: Builtin) -> bool {
             | Builtin::Return
             | Builtin::Set
             | Builtin::Shift
+            | Builtin::Times
             | Builtin::Trap
             | Builtin::Unset
     )
@@ -125,11 +128,10 @@ pub fn is_ash_special(bi: Builtin) -> bool {
 
 /// Whether this command WORD is in ash's `spclbltin` set: the POSIX list above,
 /// plus `local`, ash's own addition -- which is what keeps a top-level `local` an
-/// error rather than a frame that authorises itself -- plus `source` and `times`.
-/// Those two are named here rather than looked up because td-sh implements
-/// NEITHER, so they resolve to no `Builtin`; `times` is POSIX's own special
-/// builtin and only `source` is ash's (under `ENABLE_ASH_BASH_COMPAT`, which td's
-/// busybox has on).
+/// error rather than a frame that authorises itself, plus `source`. That one is
+/// named here rather than looked up because td-sh does not implement it, so it
+/// resolves to no `Builtin`; it is ash's own addition too, under
+/// `ENABLE_ASH_BASH_COMPAT`, which td's busybox has on.
 ///
 /// One bit in ash (`name[0] & 1`, ash.c:8205) with three consequences here, which
 /// is why it is one predicate: it blocks the local-var frame `evalcommand`
@@ -137,7 +139,7 @@ pub fn is_ash_special(bi: Builtin) -> bool {
 /// and it is what `type` reports as "special" -- that last only for the words
 /// td-sh implements, since `type` asks this only after a successful lookup.
 pub fn is_ash_special_word(word: &str) -> bool {
-    lookup(word).is_some_and(is_ash_special) || matches!(word, "source" | "times")
+    lookup(word).is_some_and(is_ash_special) || word == "source"
 }
 
 pub fn run(sh: &mut Shell, bi: Builtin, argv: &[String]) -> R<()> {
@@ -164,6 +166,7 @@ pub fn run(sh: &mut Shell, bi: Builtin, argv: &[String]) -> R<()> {
         Builtin::Cd => cd(sh, argv),
         Builtin::Pwd => pwd(sh, argv),
         Builtin::Dot => dot(sh, argv),
+        Builtin::Times => times(sh),
         Builtin::Command => command(sh, argv),
         Builtin::Type => type_of(sh, argv),
         Builtin::Wait => wait(sh, argv),
@@ -3251,6 +3254,83 @@ fn dot_path(sh: &Shell, name: &str) -> Option<std::path::PathBuf> {
     None
 }
 
+/// The kernel reports `/proc/<pid>/stat`'s clock fields in USER_HZ, an ABI
+/// constant decoupled from `CONFIG_HZ` so the file does not change meaning with
+/// the machine's tick rate. It is per-ARCHITECTURE, not universal: 100 on every
+/// one td targets, 1024 on alpha and ia64. Reading it without a libc means
+/// `AT_CLKTCK` out of `/proc/self/auxv`, which is where a port would get it.
+const USER_HZ: u64 = 100;
+
+/// `utime stime cutime cstime` out of `/proc/self/stat`, in ticks.
+///
+/// Split after the LAST `)` rather than on whitespace: field 2 is the executable's
+/// name, which the kernel copies verbatim, so a binary renamed `my )sh` puts both
+/// a space and a paren inside it and counting fields from the start of the line
+/// then reads four wrong numbers. The kernel guarantees the last `)` closes it.
+fn cpu_ticks(stat: &str) -> Option<[u64; 4]> {
+    let after = stat.rsplit_once(')')?.1;
+    let mut fields = after.split_whitespace();
+    // The first token after the name is `state`, field 3, so `utime` (14) is
+    // eleven further on and the other three follow it directly.
+    let utime = fields.nth(11)?.parse().ok()?;
+    let stime = fields.next()?.parse().ok()?;
+    let cutime = fields.next()?.parse().ok()?;
+    let cstime = fields.next()?.parse().ok()?;
+    Some([utime, stime, cutime, cstime])
+}
+
+/// ash's `times` format: minutes and seconds to three places, the shell's own
+/// user and system time then its reaped children's -- which is what `cutime`
+/// and `cstime` already count, so `/proc` answers this without `times(2)`.
+/// `hz` is a parameter rather than the constant so the SCALING is a tested
+/// function: at 100 every way of writing it agrees, which is the one value the
+/// gate can see.
+fn format_ticks(t: u64, hz: u64) -> String {
+    let secs = t / hz;
+    // Multiply before dividing: `1000 / hz` is 0 for any hz above 1000 and lossy
+    // below it, so the scale has to be applied to the remainder itself.
+    let frac = t % hz * 1000 / hz;
+    format!("{}m{}.{:03}s", secs / 60, secs % 60, frac)
+}
+
+/// The two lines, as a function of the four numbers, so their ORDER is testable.
+/// On an idle machine every one of them is 0, so a swapped pair -- children's
+/// time reported as the shell's, or system as user -- is a well-formed answer
+/// that agrees with the right one everywhere the gate can see.
+fn times_text(ticks: [u64; 4]) -> String {
+    let [ut, st, cut, cst] = ticks;
+    let line = |a: u64, b: u64| {
+        format!("{} {}\n", format_ticks(a, USER_HZ), format_ticks(b, USER_HZ))
+    };
+    line(ut, st) + &line(cut, cst)
+}
+
+/// What to do when the numbers are not there, which in ash cannot happen: it
+/// reads `times(2)`, and this reads a mount. Report the failure rather than four
+/// zeros, since a zero is an ANSWER and a script cannot tell it from a measured
+/// one -- but do NOT be fatal about it, though `times` is a special builtin. A
+/// script ending outright because a diagnostics builtin could not read `/proc` is
+/// out of all proportion to what it asked for, and ash's own `times` never ends
+/// one. Split from `times` because the gate has a `/proc`, so this is the only
+/// way the arm can be reached.
+fn times_out(sh: &mut Shell, ticks: Option<[u64; 4]>) -> R<()> {
+    let Some(ticks) = ticks else {
+        err_line(sh, "times: cannot read /proc/self/stat");
+        return status(sh, 1);
+    };
+    // `out` sets `$?`; do not overwrite it.
+    out(sh, times_text(ticks).as_bytes())
+}
+
+fn times(sh: &mut Shell) -> R<()> {
+    // Bytes, not `read_to_string`: field 2 is the executable's own name copied
+    // verbatim, so a binary renamed with a stray 0xFF makes the whole file
+    // invalid UTF-8 -- and the numbers this wants are pure ASCII either way.
+    let stat = std::fs::read("/proc/self/stat").ok();
+    let stat = stat.as_deref().map(String::from_utf8_lossy);
+    times_out(sh, stat.as_deref().and_then(cpu_ticks))
+}
+
 fn dot(sh: &mut Shell, argv: &[String]) -> R<()> {
     let Some(name) = argv.get(1) else {
         // Not fatal in either shell: busybox ash returns 2 outright ("bash
@@ -3793,6 +3873,120 @@ impl TestParser<'_> {
 #[cfg(test)]
 mod tests {
     use crate::process::{run_capturing, run_capturing_bytes};
+
+    /// `/proc/<pid>/stat`'s clock fields, which `times` reads. The offsets are
+    /// pinned against a real line because getting them wrong is not a crash: it
+    /// reports some OTHER field as a time, and the machine that is idle enough
+    /// to print zeros everywhere agrees with the right answer.
+    #[test]
+    fn the_cpu_fields_are_the_ones_times_reports() {
+        // A real line, with utime/stime/cutime/cstime set to distinguishable
+        // values (fields 14-17).
+        let stat = "42 (td-sh) S 1 42 42 0 -1 4194304 982 0 0 0 \
+                    11 22 33 44 20 0 1 0 12345 0 0";
+        assert_eq!(super::cpu_ticks(stat), Some([11, 22, 33, 44]));
+        // Field 2 is the executable name and may contain SPACES and even a
+        // `)`, so the split is after the LAST one. Counting fields from the
+        // start of the line reads four wrong numbers here and no error.
+        let odd = "42 (od d) ick) S 1 42 42 0 -1 4194304 982 0 0 0 \
+                   11 22 33 44 20 0 1 0 12345 0 0";
+        assert_eq!(super::cpu_ticks(odd), Some([11, 22, 33, 44]));
+        // A truncated line is None rather than a partial answer.
+        assert_eq!(super::cpu_ticks("42 (td-sh) S 1 2 3"), None);
+        assert_eq!(super::cpu_ticks("no parens here"), None);
+        // USER_HZ is 100, so a tick is 10ms, and the format is ash's.
+        let hz = super::USER_HZ;
+        assert_eq!(super::format_ticks(0, hz), "0m0.000s");
+        assert_eq!(super::format_ticks(1, hz), "0m0.010s");
+        assert_eq!(super::format_ticks(100, hz), "0m1.000s");
+        assert_eq!(super::format_ticks(6035, hz), "1m0.350s");
+        assert_eq!(super::format_ticks(6000, hz), "1m0.000s");
+        // The scale, at the tick rate that tells the two spellings apart. Every
+        // arch td targets is 100; alpha and ia64 are 1024, where dividing 1000
+        // by the rate FIRST is 0 and the fraction vanishes.
+        assert_eq!(super::format_ticks(512, 1024), "0m0.500s");
+        assert_eq!(super::format_ticks(1024, 1024), "0m1.000s");
+        // The ORDER of the four, which nothing observable pins on an idle
+        // machine: the shell's own user and system first, then its reaped
+        // children's. Swap either pair and every live check still agrees,
+        // because all four are 0 wherever the gate runs.
+        assert_eq!(
+            super::times_text([11, 22, 33, 44]),
+            "0m0.110s 0m0.220s\n0m0.330s 0m0.440s\n"
+        );
+    }
+
+    /// `times` prints two lines of two fields; the live values are checked by
+    /// hand against ash under load, since a gate machine's are all zero.
+    #[test]
+    fn times_prints_two_lines_of_two() {
+        let (status, out, err) = run_capturing("times");
+        assert_eq!((status, err.as_str()), (0, ""));
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines.len(), 2, "out: {out:?}");
+        for l in lines {
+            let fields: Vec<&str> = l.split_whitespace().collect();
+            assert_eq!(fields.len(), 2, "line: {l:?}");
+            for f in fields {
+                assert!(
+                    f.ends_with('s') && f.contains('m') && f.contains('.'),
+                    "field: {f:?}"
+                );
+            }
+        }
+    }
+
+    /// Parse one of `times`'s own fields back into ticks, so a test can compare
+    /// two of them.
+    fn ticks_of(field: &str) -> u64 {
+        let (m, rest) = field.split_once('m').unwrap();
+        let (s, frac) = rest.trim_end_matches('s').split_once('.').unwrap();
+        let secs: u64 = m.parse::<u64>().unwrap() * 60 + s.parse::<u64>().unwrap();
+        secs * super::USER_HZ + frac.parse::<u64>().unwrap() * super::USER_HZ / 1000
+    }
+
+    /// WHOSE cpu time `times` reports. `/proc/self/stat` is the whole process's;
+    /// `/proc/thread-self/stat` is the calling thread's, and both exist, both
+    /// parse, and both print a plausible answer. The difference only shows where
+    /// td-sh differs from a forking shell: a pipeline stage is a THREAD here, so
+    /// reading the thread's own file would report a stage's work as nobody's.
+    /// That is what `times` is for, and ash -- which forks -- gets it right by
+    /// construction.
+    #[test]
+    fn a_pipeline_stages_cpu_time_is_the_shells_cpu_time() {
+        // ~300ms of stage work, against a 10ms tick. The main thread spends
+        // microseconds spawning and joining, so a thread-self read moves by 0.
+        let (st, out, err) = run_capturing(
+            "times\n\
+             i=0; while [ $i -lt 60000 ]; do i=$((i+1)); done | :\n\
+             times",
+        );
+        assert_eq!((st, err.as_str()), (0, ""));
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines.len(), 4, "out: {out:?}");
+        let user = |l: &str| ticks_of(l.split_whitespace().next().unwrap());
+        let (before, after) = (user(lines[0]), user(lines[2]));
+        assert!(
+            after >= before + 10,
+            "a stage burned ~30 ticks and `times` saw {}: {out:?}",
+            after - before
+        );
+    }
+
+    /// `times` is a special builtin, but a missing `/proc` is not a usage error
+    /// and must not end the script: ash reads `times(2)` and cannot fail at all,
+    /// so a shell that dies here is one no ash script is written for. The gate
+    /// has a `/proc`, so the arm is reachable only through `times_out`.
+    #[test]
+    fn times_without_proc_reports_and_carries_on() {
+        let mut sh = crate::exec::Shell::new_for_test();
+        assert!(super::times_out(&mut sh, None).is_ok());
+        assert_eq!(sh.status, 1);
+        // And a write failure reaches `$?` rather than being overwritten by a
+        // hardcoded success -- `times >&-` is 1 in ash and was 0 here.
+        let (st, out, _) = run_capturing("times >&-; echo st=$?");
+        assert_eq!((st, out.as_str()), (0, "st=1\n"));
+    }
 
     /// A name `lookup` answers to but `NAMES` omits is a builtin Tab never
     /// offers, and one in `NAMES` alone is a candidate that does not run.

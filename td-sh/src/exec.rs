@@ -3590,13 +3590,14 @@ mod tests {
         assert_eq!(out, "read is a shell builtin\n");
         let (_s, out, _e) = run("type unset");
         assert_eq!(out, "unset is a special shell builtin\n");
-        // The two hand-named words are named only because td-sh implements
-        // NEITHER. If either ever resolves to a `Builtin`, the arm becomes a
-        // second source of truth that would mask a missing `is_special` entry,
-        // so it has to go in the same landing -- which this makes fail rather
-        // than leaving it to be noticed.
+        // `source` is the one word still named by hand, and only because td-sh
+        // does not implement it. The moment it resolves, that arm becomes a
+        // second source of truth able to hide a missing `is_special` entry, so
+        // it has to go in the same landing -- which this makes fail rather than
+        // leaving it to be noticed. `times` was the other, until it was
+        // implemented and this fired.
         assert!(crate::builtin::lookup("source").is_none());
-        assert!(crate::builtin::lookup("times").is_none());
+        assert!(crate::builtin::lookup("times").is_some());
         // The guard must not over-fire. A FUNCTION of that name is dispatched
         // before it, and `command` resolves to a builtin that never carries the
         // redirections here -- both recoverable in ash, measured.

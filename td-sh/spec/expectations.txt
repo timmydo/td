@@ -586,7 +586,6 @@ xfail builtin-set.test.sh::set -o lists options
 xfail builtin-special.test.sh::Prefix binding for exec is a special case (versus e.g. readonly)
 xfail builtin-special.test.sh::Special builtins can't be redefined as shell functions (set -o posix)
 xfail builtin-special.test.sh::Which shells allow special builtins to be redefined?
-xfail builtin-times.test.sh::times shows two formatted lines
 xfail builtin-trap-bash.test.sh::Compare trap DEBUG vs. trap ERR
 xfail builtin-trap-bash.test.sh::One 'echo' in first pipeline part - why does bash behave differently from case above?
 xfail builtin-trap-bash.test.sh::but trap DEBUG respects errexit
