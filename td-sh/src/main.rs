@@ -128,7 +128,11 @@ fn run(args: &[String]) -> Result<i32, String> {
                         if name == "interactive" {
                             sh.interactive = on;
                         } else if !builtin::apply_named_option(&mut sh, name, on) {
-                            return Err(format!("Illegal option {sign}o {name}"));
+                            // Not a typo: `ash_msg` sets no status and `procargs`
+                            // unwinds on the non-zero return (ash.c:14595).
+                            let _ =
+                                writeln!(std::io::stderr(), "td-sh: illegal option {sign}o {name}");
+                            return Ok(0);
                         }
                         consumed += 1;
                     }
@@ -142,10 +146,11 @@ fn run(args: &[String]) -> Result<i32, String> {
                 // cannot cancel one `argv[0]` already declared.
                 'l' => login = true,
                 // Every other letter comes from the one table `set` reads, so the
-                // command line cannot drift from it.
+                // command line cannot drift from it -- including how it is
+                // refused: `setoption` raises, so this one is fatal at 2.
                 other => {
                     if !builtin::apply_option_letter(&mut sh, other, on) {
-                        return Err(format!("Illegal option {sign}{other}"));
+                        return Err(format!("illegal option {sign}{other}"));
                     }
                 }
             }

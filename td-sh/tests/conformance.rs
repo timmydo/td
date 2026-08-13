@@ -914,6 +914,38 @@ fn an_endless_case_is_bounded_and_reported() -> Result<(), Box<dyn std::error::E
     Ok(())
 }
 
+/// The INVOCATION's own option refusal, which is `set`'s: ash runs one
+/// `options()` (ash.c:11452) from both, so the two spellings split there the
+/// same way -- a letter raises with 2, a bad `-o NAME` reports through
+/// `ash_msg`, which sets no status, and startup unwinds on it at 0. Only the
+/// binary reaches this; `run_capturing` starts after it.
+#[test]
+fn the_command_lines_own_option_refusal_splits_the_way_sets_does()
+-> Result<(), Box<dyn std::error::Error>> {
+    let shell = PathBuf::from(env!("CARGO_BIN_EXE_td-sh"));
+    // The command never runs in EITHER case -- what differs is the status.
+    let args: [(&[&str], &str, i32); 4] = [
+        (&["-z", "-c", "echo ALIVE"], "td-sh: illegal option -z\n", 2),
+        (&["+z", "-c", "echo ALIVE"], "td-sh: illegal option +z\n", 2),
+        (&["-o", "bogus", "-c", "echo ALIVE"], "td-sh: illegal option -o bogus\n", 0),
+        (&["+o", "bogus", "-c", "echo ALIVE"], "td-sh: illegal option +o bogus\n", 0),
+    ];
+    for (args, err, code) in args {
+        let out = std::process::Command::new(&shell).args(args).output()?;
+        assert_eq!(String::from_utf8_lossy(&out.stderr), err, "{args:?}");
+        assert_eq!(out.stdout, b"", "{args:?}");
+        assert_eq!(out.status.code(), Some(code), "{args:?}");
+    }
+    // The prefix here is not the one the builtins dropped: it is ash's `arg0`
+    // field, which at option-parse time is the whole prefix (`commandname` is
+    // still NULL, so no name and no line follow it).
+    let out = std::process::Command::new(&shell)
+        .args(["-o", "nounset", "-c", "echo ok"])
+        .output()?;
+    assert_eq!((out.stdout, out.status.code()), (b"ok\n".to_vec(), Some(0)));
+    Ok(())
+}
+
 /// The script OPERAND is opened before the shell exists, so its failure is the
 /// one diagnostic the in-process harness cannot reach -- and it was still
 /// printing `io::Error`'s Display after every other site had stopped. ash words

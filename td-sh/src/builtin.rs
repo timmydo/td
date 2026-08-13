@@ -211,20 +211,22 @@ fn jobs(sh: &mut Shell, argv: &[String]) -> R<()> {
     let mut ids_only = false;
     let mut rest = argv.iter().skip(1);
     for arg in rest.by_ref() {
-        match arg.as_str() {
-            "-p" => ids_only = true,
-            // Ends the options, as it does for `wait` and for every utility the
-            // Syntax Guidelines cover.
-            "--" => break,
-            // An OPERAND, not an option, and told apart so the diagnostic names
-            // what was actually wrong: `jobs %1` is a jobspec this shell does
-            // not select by, which is a different mistake from `jobs -l`.
-            other if !other.starts_with('-') => {
-                err_line(sh, &format!("jobs: {other}: selecting a job is not supported"));
-                return status(sh, 2);
-            }
-            other => {
-                err_line(sh, &format!("jobs: Illegal option {other}"));
+        // `nextopt`'s asymmetry: `--` ends the options and is consumed, a lone
+        // `-` ends them and is NOT, so it reaches the operand arm below.
+        let Some(letters) = arg.strip_prefix('-').filter(|f| !f.is_empty()) else {
+            // Named as an operand so the diagnostic says which mistake it was:
+            // `jobs %1` is a jobspec, not a bad option.
+            err_line(sh, &format!("jobs: {arg}: selecting a job is not supported"));
+            return status(sh, 2);
+        };
+        if letters == "-" {
+            break; // the arg was `--`
+        }
+        for c in letters.chars() {
+            if c == 'p' {
+                ids_only = true;
+            } else {
+                err_line(sh, &format!("jobs: illegal option -{c}"));
                 return status(sh, 2);
             }
         }
@@ -274,23 +276,29 @@ fn wait(sh: &mut Shell, argv: &[String]) -> R<()> {
         sh.jobs.wait_all();
         return status(sh, 0);
     }
-    // `--` ends the options, as the Utility Syntax Guidelines require and as
-    // dash's own `nextopt` gives every builtin. Only in the leading position:
-    // after it a `--` is an operand like any other, and so is not a number.
-    let operands = match operands.first() {
-        Some(first) if first == "--" => operands.get(1..).unwrap_or(&[]),
-        _ => operands,
-    };
+    // `nextopt` reads options from the FRONT only, so a word past the first
+    // non-option is an operand however it is spelled: `wait -- -5` is a bad
+    // NUMBER. A lone `-` ends them without being consumed, as it does above.
+    let mut operands = operands;
+    if let Some(letters) = operands
+        .first()
+        .and_then(|w| w.strip_prefix('-'))
+        .filter(|f| !f.is_empty())
+    {
+        // Anything but `--`, and this builtin serves no option at all.
+        if letters != "-" {
+            let c = letters.chars().next().unwrap_or('-');
+            err_line(sh, &format!("wait: illegal option -{c}"));
+            return status(sh, 2);
+        }
+        operands = operands.get(1..).unwrap_or(&[]);
+    }
     if operands.is_empty() {
         sh.jobs.wait_all();
         return status(sh, 0);
     }
     let mut last = 0;
     for operand in operands {
-        if let Some(flag) = operand.strip_prefix('-') {
-            err_line(sh, &format!("wait: Illegal option -{flag}"));
-            return status(sh, 2);
-        }
         // A `%…` jobspec resolves to an id, and only then joins -- so `wait %1`
         // and `wait $!` take exactly the same path and cannot disagree about
         // what a job's status was. A spelling this shell cannot resolve is the
@@ -305,8 +313,8 @@ fn wait(sh: &mut Shell, argv: &[String]) -> R<()> {
             continue;
         }
         // A pid is DIGITS, so this is not `str::parse` -- that accepts a leading
-        // `+`/`-` and `wait -5` has already been read as an option above, which
-        // would leave `wait +5` the one spelling that got through as a number.
+        // `+`/`-`, which would make `wait +5` a number and, past a `--`, `wait
+        // -5` one too.
         if operand.is_empty() || !operand.bytes().all(|b| b.is_ascii_digit()) {
             err_line(sh, &format!("wait: Illegal number: {operand}"));
             return status(sh, 2);
@@ -1537,16 +1545,15 @@ fn set(sh: &mut Shell, argv: &[String]) -> R<()> {
                 // stays the no-op it was rather than becoming an error.
                 if let Some(name) = argv.get(i + 1 + names) {
                     if !apply_named_option(sh, name, sign) {
-                        err_line(sh, &format!("td-sh: set: Illegal option {flag}o {name}"));
-                        return status(sh, 2);
+                        err_line(sh, &format!("set: illegal option {flag}o {name}"));
+                        return status(sh, 1);
                     }
                     names += 1;
                 }
                 continue;
             }
             if !apply_option_letter(sh, c, sign) {
-                err_line(sh, &format!("td-sh: set: Illegal option {flag}{c}"));
-                return status(sh, 2);
+                return special_usage_error(sh, &format!("set: illegal option {flag}{c}"));
             }
         }
         i += 1 + names;
@@ -1662,7 +1669,7 @@ fn unset(sh: &mut Shell, argv: &[String]) -> R<()> {
         for c in flags.chars() {
             match c {
                 'f' | 'v' => mode = Some(c),
-                _ => return special_usage_error(sh, &format!("td-sh: unset: Illegal option -{c}")),
+                _ => return special_usage_error(sh, &format!("unset: illegal option -{c}")),
             }
         }
     }
@@ -1731,7 +1738,7 @@ fn export(sh: &mut Shell, argv: &[String], readonly: bool) -> R<()> {
                 }
             }
             if let Some(c) = bad {
-                return special_usage_error(sh, &format!("td-sh: {cmd}: Illegal option -{c}"));
+                return special_usage_error(sh, &format!("{cmd}: illegal option -{c}"));
             }
             continue;
         }
@@ -1951,7 +1958,7 @@ fn getopts(sh: &mut Shell, argv: &[String]) -> R<()> {
             if silent {
                 sh.set_var("OPTARG", &c.to_string())?;
             } else {
-                err_line(sh, &format!("getopts: Illegal option -{c}"));
+                err_line(sh, &format!("Illegal option -{c}"));
                 sh.unset_var("OPTARG");
             }
             letter = '?';
@@ -1973,7 +1980,9 @@ fn getopts(sh: &mut Shell, argv: &[String]) -> R<()> {
                 sh.set_var("OPTARG", &c.to_string())?;
                 letter = ':';
             } else {
-                err_line(sh, &format!("getopts: No arg for -{c} option"));
+                // Bare and capitalised for the same reason its neighbour is:
+                // `fprintf` to stderr (ash.c:11736), not a shell diagnostic.
+                err_line(sh, &format!("No arg for -{c} option"));
                 sh.unset_var("OPTARG");
                 letter = '?';
             }
@@ -2066,7 +2075,9 @@ fn read(sh: &mut Shell, argv: &[String]) -> R<()> {
                             Some(next.clone())
                         }
                         None => {
-                            err_line(sh, &format!("read: No arg for -{} option", c as char));
+                            // `nextopt`'s second message, and lowercase like its
+                            // first (ash.c:2045).
+                            err_line(sh, &format!("read: no arg for -{} option", c as char));
                             return status(sh, 2);
                         }
                     }
@@ -2085,7 +2096,7 @@ fn read(sh: &mut Shell, argv: &[String]) -> R<()> {
                 b'n' => opt_n = value,
                 b'd' => opt_d = value,
                 _ => {
-                    err_line(sh, &format!("read: Illegal option -{}", c as char));
+                    err_line(sh, &format!("read: illegal option -{}", c as char));
                     return status(sh, 2);
                 }
             }
@@ -2633,7 +2644,9 @@ fn apply_disposition(sh: &mut Shell, signo: u8, want: crate::sys::Disposition) -
     let prev = match crate::sys::signal_set(signo, want) {
         Ok(prev) => prev,
         Err(e) => {
-            err_line(sh, &format!("td-sh: {e}"));
+            // `trap` is this function's only caller, so it names it as every
+            // other diagnostic out of that builtin now does.
+            err_line(sh, &format!("trap: {e}"));
             return false;
         }
     };
@@ -2672,7 +2685,7 @@ fn trap(sh: &mut Shell, argv: &[String]) -> R<()> {
             ops = ops.get(1..).unwrap_or_default();
         } else if !rest.is_empty() {
             let c = rest.chars().next().unwrap_or('-');
-            return special_usage_error(sh, &format!("td-sh: trap: Illegal option -{c}"));
+            return special_usage_error(sh, &format!("trap: illegal option -{c}"));
         }
     }
     let Some(first) = ops.first() else {
@@ -2695,7 +2708,7 @@ fn trap(sh: &mut Shell, argv: &[String]) -> R<()> {
     let mut code = 0;
     for name in conditions {
         let Some(signo) = decode_signal(name) else {
-            err_line(sh, &format!("td-sh: trap: {name}: invalid signal specification"));
+            err_line(sh, &format!("trap: {name}: invalid signal specification"));
             code = 1;
             continue;
         };
@@ -2819,16 +2832,21 @@ fn unalias(sh: &mut Shell, argv: &[String]) -> R<()> {
         // A bare `-`, or no leading `-` at all, is already an operand.
         None | Some("") => {}
         Some("-") => i += 1,
-        Some(flags) => {
-            for bad in flags.chars() {
-                if bad != 'a' {
-                    err_line(sh, &format!("unalias: Illegal option -{bad}"));
-                    return status(sh, 2);
-                }
+        // `unaliascmd` RETURNS inside its first `nextopt` iteration, so an `a`
+        // ends the scan and the rest of the cluster is never read: `unalias
+        // -aZ` clears and succeeds where `-Za` refuses.
+        Some(flags) => match flags.chars().next() {
+            Some('a') => {
+                sh.aliases.clear();
+                return status(sh, 0);
             }
-            sh.aliases.clear();
-            return status(sh, 0);
-        }
+            Some(bad) => {
+                err_line(sh, &format!("unalias: illegal option -{bad}"));
+                return status(sh, 2);
+            }
+            // Unreachable: an empty `flags` is the arm above.
+            None => {}
+        },
     }
     let mut ret = 0;
     for name in argv.iter().skip(i) {
@@ -2957,7 +2975,7 @@ fn cd(sh: &mut Shell, argv: &[String]) -> R<()> {
     let (physical, i) = match cd_opts(argv) {
         Ok(v) => v,
         Err(c) => {
-            err_line(sh, &format!("cd: Illegal option -{c}"));
+            err_line(sh, &format!("cd: illegal option -{c}"));
             return status(sh, 2);
         }
     };
@@ -3235,7 +3253,7 @@ fn pwd(sh: &mut Shell, argv: &[String]) -> R<()> {
     let physical = match cd_opts(argv) {
         Ok((p, _)) => p,
         Err(c) => {
-            err_line(sh, &format!("pwd: Illegal option -{c}"));
+            err_line(sh, &format!("pwd: illegal option -{c}"));
             return status(sh, 2);
         }
     };
@@ -3604,7 +3622,7 @@ fn command(sh: &mut Shell, argv: &[String]) -> R<()> {
                 }
             }
             if let Some(c) = bad {
-                err_line(sh, &format!("td-sh: command: Illegal option -{c}"));
+                err_line(sh, &format!("command: illegal option -{c}"));
                 return status(sh, 2);
             }
         }
@@ -4499,7 +4517,7 @@ mod tests {
         // `pipefail` and is told nothing runs WITHOUT it.
         for src in ["set -q", "set -o pipefail", "set +o pipefail"] {
             let (_, _, err) = run_capturing(src);
-            assert!(err.contains("Illegal option"), "{src}: {err:?}");
+            assert!(err.contains("illegal option"), "{src}: {err:?}");
         }
         // Options dash HAS are accepted, whether or not td-sh acts on them, and a
         // bare `-o` is not an option name.
@@ -4509,15 +4527,115 @@ mod tests {
         }
     }
 
+    /// The whole roster, WHOLE: ash carries the builtin's name in its diagnostic
+    /// PREFIX (`p.sh: cd: line 1: …`, ash.c:1417) and td-sh prints that middle
+    /// field alone, so a site that regains a `td-sh: ` or loses its name is a
+    /// mismatch `contains` cannot see -- nor can it see the capital.
     #[test]
-    fn set_and_shift_errors_do_not_end_the_script() {
-        // Deliberate: busybox ash does NOT apply POSIX 2.8.1 to a bad `set` option
-        // or a `shift` that overruns the parameters (`shiftcmd` just `return 1`s),
-        // and builtin-special.test.sh pins that for both (`## N-I …ash`). Keep them
-        // non-fatal even though dash aborts. A non-NUMERIC operand is a different
-        // case and IS fatal in both -- see the test below.
-        let (_, out, _) = run_capturing("set -q; echo reached");
-        assert_eq!(out, "reached\n");
+    fn every_option_refusal_is_worded_and_graded_the_way_ashs_is() {
+        // A FATAL refusal reaches no `echo`, so the two output columns are what
+        // says which of the two kinds it was.
+        for (src, err, out, code) in [
+            ("jobs -Z", "jobs: illegal option -Z\n", "after=2\n", 0),
+            ("wait -Z", "wait: illegal option -Z\n", "after=2\n", 0),
+            ("read -Z", "read: illegal option -Z\n", "after=2\n", 0),
+            ("unalias -Z", "unalias: illegal option -Z\n", "after=2\n", 0),
+            ("cd -Z", "cd: illegal option -Z\n", "after=2\n", 0),
+            ("umask -Z", "umask: illegal option -Z\n", "after=2\n", 0),
+            ("pwd -Z", "pwd: illegal option -Z\n", "after=2\n", 0),
+            ("command -x true", "command: illegal option -x\n", "after=2\n", 0),
+            ("set -o bogus", "set: illegal option -o bogus\n", "after=1\n", 0),
+            ("set +o bogus", "set: illegal option +o bogus\n", "after=1\n", 0),
+            ("set -q", "set: illegal option -q\n", "", 2),
+            ("unset -z", "unset: illegal option -z\n", "", 2),
+            ("export -q", "export: illegal option -q\n", "", 2),
+            ("readonly -q", "readonly: illegal option -q\n", "", 2),
+            ("trap -Z", "trap: illegal option -Z\n", "", 2),
+            (". -Z", ".: illegal option -Z\n", "", 2),
+            ("source -Z", "source: illegal option -Z\n", "", 2),
+            // A CLUSTER is read letter by letter, so the refusal names the one
+            // it stopped on rather than the word that carried it -- which is
+            // only visible when a VALID letter precedes the bad one.
+            ("cd -Zq", "cd: illegal option -Z\n", "after=2\n", 0),
+            ("jobs -xy", "jobs: illegal option -x\n", "after=2\n", 0),
+            ("jobs -pZ", "jobs: illegal option -Z\n", "after=2\n", 0),
+            ("wait -xy", "wait: illegal option -x\n", "after=2\n", 0),
+            // The one ash spells with a capital, and the one that carries no
+            // name: a bare `fprintf` (ash.c:11714), not `nextopt`'s.
+            ("set -- -Z; getopts a: o", "Illegal option -Z\n", "after=0\n", 0),
+        ] {
+            let (status, o, e) = run_capturing(&format!("{src}; echo after=$?"));
+            assert_eq!((status, o.as_str(), e.as_str()), (code, out, err), "{src}");
+        }
+    }
+
+    /// The other message each of those two functions carries, which splits the
+    /// same way and had been copied the same way round: `nextopt`'s is lowercase
+    /// with a name (ash.c:2045), `getopts`'s is a bare capitalised `fprintf`
+    /// (11736). And what is NOT an option: a lone `-` ends them without being
+    /// consumed, so it reaches the operand path, as does anything past a `--`.
+    #[test]
+    fn a_missing_option_argument_and_a_non_option_are_ashs_too() {
+        for (src, err, out, code) in [
+            ("read -p", "read: no arg for -p option\n", "after=2\n", 0),
+            ("read -u", "read: no arg for -u option\n", "after=2\n", 0),
+            ("set -- -a; getopts a: o", "No arg for -a option\n", "after=0\n", 0),
+            ("wait -", "wait: Illegal number: -\n", "after=2\n", 0),
+            ("wait -- -5", "wait: Illegal number: -5\n", "after=2\n", 0),
+            // `999` is a number, so the scan has STOPPED by `-Z`; `wait x -Z`
+            // would fail on `x` first and pin nothing.
+            ("wait 999 -Z", "wait: Illegal number: -Z\n", "after=2\n", 0),
+            // Still td-sh's word for an operand rather than ash's `no such
+            // job`; what this pins is that `-` reaches that path at all.
+            ("jobs -", "jobs: -: selecting a job is not supported\n", "after=2\n", 0),
+            // `unaliascmd` returns on the `a` without reading the rest, so the
+            // cluster's ORDER decides -- the one builtin where it does.
+            ("alias q=x; unalias -Za", "unalias: illegal option -Z\n", "after=2\n", 0),
+        ] {
+            let (status, o, e) = run_capturing(&format!("{src}; echo after=$?"));
+            assert_eq!((status, o.as_str(), e.as_str()), (code, out, err), "{src}");
+        }
+        // `--` still ends them, a repeated valid letter is still accepted, and
+        // a silent `getopts` still reports no message.
+        for src in ["wait --", "jobs --", "jobs -pp", "set -- -a; getopts :a: o"] {
+            let (status, _o, e) = run_capturing(&format!("{src}; echo after=$?"));
+            assert_eq!((status, e.as_str()), (0, ""), "{src}");
+        }
+        // The other side of `unalias`'s early return: a bad letter AFTER the
+        // `a` is never read, so this clears and succeeds.
+        let (_s, out, e) = run_capturing("alias q=x; unalias -aZ; alias; echo after=$?");
+        assert_eq!((out.as_str(), e.as_str()), ("after=0\n", ""));
+    }
+
+    /// `trap`'s two refusals now agree with each other: the option one is
+    /// `nextopt`'s and the condition one is `ash_msg`'s, and neither names the
+    /// shell.
+    #[test]
+    fn traps_two_refusals_are_worded_alike() {
+        for src in ["trap - -Z", "trap '' -Z"] {
+            let (status, _o, e) = run_capturing(&format!("{src}; echo after=$?"));
+            assert_eq!((status, e.as_str()), (0, "trap: -Z: invalid signal specification\n"));
+        }
+        let (_s, out, _e) = run_capturing("trap a BOGUS; echo after=$?");
+        assert_eq!(out, "after=1\n");
+    }
+
+    #[test]
+    fn a_bad_set_option_ends_the_script_only_in_its_letter_form() {
+        // `-o NAME` is `ash_msg` (ash.c:11420), a message and 1; a LETTER is
+        // `ash_msg_and_raise_error` (11445). `$?` is read DIRECTLY -- the
+        // `|| true` the corpus case wraps it in would mask the 1 that is the
+        // point (`builtin-special.test.sh`, whose `## N-I …ash` records ash
+        // carrying on, runs the `-o` form).
+        let (status, out, _) = run_capturing("set -q; echo reached");
+        assert_eq!((status, out.as_str()), (2, ""));
+        let (_, out, _) = run_capturing("set -o invalid_; echo reached=$?");
+        assert_eq!(out, "reached=1\n");
+        // Fatal even mixed in with valid letters, and even reached through
+        // `||`, which is what "fails whole script" means.
+        let (status, out, _) = run_capturing("set -eq || true; echo reached");
+        assert_eq!((status, out.as_str()), (2, ""));
+        // `shift` overrunning stays non-fatal -- `shiftcmd`'s bare `return 1`.
         let (_, out, _) = run_capturing("set -- a; shift 3; echo reached");
         assert_eq!(out, "reached\n");
     }
@@ -4714,7 +4832,7 @@ mod tests {
         assert_eq!(out, "/\n");
         let (status, _, err) = run_capturing("cd -q /");
         assert_eq!(status, 2);
-        assert!(err.contains("Illegal option"), "{err:?}");
+        assert!(err.contains("illegal option"), "{err:?}");
     }
 
     #[test]
@@ -5014,19 +5132,21 @@ mod tests {
 
     #[test]
     fn an_unknown_option_to_export_or_readonly_is_fatal() {
-        // bash's `export -n` is not dash's, and on a special builtin an unknown
-        // option ends the script.
-        for src in [
-            "export -n undef; echo reached",
-            "readonly -q x; echo reached",
+        // On a special builtin an unknown option ends the script. `-n` is the
+        // one row here that is not really unknown: ash takes it unconditionally
+        // (`nextopt("np")`, ash.c:14137) and td-sh has not got it, so that row
+        // pins a gap rather than a refusal.
+        for (src, err) in [
+            ("export -n undef; echo reached", "export: illegal option -n\n"),
+            ("readonly -q x; echo reached", "readonly: illegal option -q\n"),
             // ash reads the WHOLE cluster, so a bad letter after a good one is
-            // still fatal. dash calls nextopt once and would list and exit 0.
-            "export -px; echo reached",
-            "readonly -pq; echo reached",
+            // still fatal -- and names the letter it stopped on, not the word.
+            // dash calls nextopt once and would list and exit 0.
+            ("export -px; echo reached", "export: illegal option -x\n"),
+            ("readonly -pq; echo reached", "readonly: illegal option -q\n"),
         ] {
-            let (status, out, err) = run_capturing(src);
-            assert_eq!((status, out.as_str()), (2, ""), "{src}");
-            assert!(err.contains("Illegal option"), "{src}: {err:?}");
+            let (status, out, e) = run_capturing(src);
+            assert_eq!((status, out.as_str(), e.as_str()), (2, "", err), "{src}");
         }
         // `-p` and `--` stay options, and everything after `--` is a name.
         let (status, out, _) = run_capturing("export -p; readonly -- a=1; echo \"[$a]\"");
@@ -5309,7 +5429,7 @@ mod tests {
         // shell survives it, unlike `export -x`.
         let (status, out, err) = run_capturing("command -x export n=1; echo \"after=$?\"");
         assert_eq!((status, out.as_str()), (0, "after=2\n"), "{err}");
-        assert!(err.contains("Illegal option -x"), "{err:?}");
+        assert_eq!(err, "command: illegal option -x\n");
         // A name that resolves to nothing is 127, not 1: `command -v` reports what
         // `describe_command` returns.
         assert_eq!(run_capturing("command -v td_sh_no_such_thing").0, 127);
@@ -5582,10 +5702,12 @@ mod tests {
         // message, and still return 0 so the caller's loop sees them.
         let (_, out, err) = run_capturing("set -- -Z; getopts 'a:' o; echo \"$? $o\"");
         assert_eq!(out, "0 ?\n");
-        assert!(err.contains("Illegal option -Z"), "err: {err:?}");
+        // A bare `fprintf` (ash.c:11714), not `nextopt`'s shell diagnostic:
+        // hence the capital, and no name.
+        assert_eq!(err, "Illegal option -Z\n");
         let (_, out, err) = run_capturing("set -- -a; getopts 'a:' o; echo \"$? $o\"");
         assert_eq!(out, "0 ?\n");
-        assert!(err.contains("No arg for -a"), "err: {err:?}");
+        assert_eq!(err, "No arg for -a option\n");
         // A leading `:` selects silent mode: the letter comes back in OPTARG, and a
         // missing argument reports `:` instead of `?`.
         assert_eq!(run_capturing("set -- -Z; getopts ':a:' o; echo \"$o $OPTARG\"").1, "? Z\n");
@@ -5652,7 +5774,7 @@ mod tests {
         for bad in ["-N 1", "-q", "-zz"] {
             let (status, _, err) = run_capturing(&format!("echo hi | {{ read {bad} v; }}"));
             assert_eq!(status, 2, "read {bad}");
-            assert!(err.contains("Illegal option"), "read {bad} err: {err:?}");
+            assert!(err.contains("illegal option"), "read {bad} err: {err:?}");
         }
     }
 
@@ -5957,8 +6079,7 @@ mod tests {
             "127\n"
         );
         let (status, _, err) = run_capturing("unalias -z");
-        assert_eq!(status, 2);
-        assert!(err.contains("Illegal option -z"), "err: {err:?}");
+        assert_eq!((status, err.as_str()), (2, "unalias: illegal option -z\n"));
     }
 
     #[test]
