@@ -1629,7 +1629,7 @@ fn run_simple(
     let framed = argv.first().is_some_and(|w| {
         // Resolved the way `dispatch_simple` resolves it below: a function shadowing
         // a special builtin's NAME is still a function, and ash gives it a frame.
-        sh.funcs.contains_key(w) || !builtin::blocks_localvar_frame(w)
+        sh.funcs.contains_key(w) || !builtin::is_ash_special_word(w)
     });
     if framed {
         sh.localvar_depth = sh.localvar_depth.saturating_add(1);
@@ -1681,6 +1681,17 @@ fn dispatch_simple(
     // trap to see. `?` here is that second case, and it is correct that it skips
     // the rollback below: nothing was assigned yet.
     let result = match process::apply_redirs(sh, redirs)? {
+        // Except on a word ash marks special, where it is fatal as it is for the
+        // two branches above. Only `source` and `times` can reach this: every
+        // other special word resolves to a `Builtin` and never gets here, which
+        // is exactly why the test is on the WORD.
+        process::RedirOutcome::Failed
+            if argv
+                .first()
+                .is_some_and(|w| builtin::is_ash_special_word(w)) =>
+        {
+            return Err(Sig::Abort(sh.status));
+        }
         // A failed redirection skips the command without exiting the shell.
         process::RedirOutcome::Failed => Ok(()),
         process::RedirOutcome::Applied(saved) => {
@@ -3539,6 +3550,80 @@ mod tests {
         assert!(logged.contains("nope"), "logged: {logged:?}");
         assert!(!logged.contains("LEAKTEST"), "logged: {logged:?}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_redirection_failure_is_fatal_on_every_ash_special_word() {
+        // ash's `spclbltin` bit (`name[0] & 1`, ash.c:8205) makes a redirection
+        // failure end the shell instead of skipping the command. The whole set is
+        // swept rather than the two words that were wrong, because the point is
+        // the PREDICATE: `source` and `times` were recoverable only because they
+        // are the two ash marks special that td-sh does not implement, so they
+        // resolve to no `Builtin` and reached the external path, where the test
+        // could not be made on a `Builtin` at all.
+        for w in [
+            ".", ":", "break", "continue", "eval", "exec", "exit", "export", "local", "readonly",
+            "return", "set", "shift", "source", "times", "trap", "unset",
+        ] {
+            let (status, out, _e) = run(&format!("{w} 4>&9; echo AFTER"));
+            assert_eq!((status, out.as_str()), (1, ""), "special: {w}");
+            // With an ARGUMENT too, since the word-level test is on the command
+            // NAME: reading the last word instead of the first passes every
+            // one-word case above and then decides `ls times` by `times`.
+            let (status, out, _e) = run(&format!("{w} x 4>&9; echo AFTER"));
+            assert_eq!((status, out.as_str()), (1, ""), "special with arg: {w}");
+        }
+        // And a REGULAR builtin still skips the command and carries on.
+        for w in ["true", "echo", "read", "pwd", "cd"] {
+            let (status, out, _e) = run(&format!("{w} 4>&9; echo AFTER"));
+            assert_eq!((status, out.as_str()), (0, "AFTER\n"), "regular: {w}");
+        }
+        // A special word as an ARGUMENT decides nothing -- the mirror of the
+        // case above, and the half that a last-word test gets backwards.
+        let (status, out, _e) = run("echo times 4>&9; echo AFTER");
+        assert_eq!((status, out.as_str()), (0, "AFTER\n"));
+        // Those five resolve to a `Builtin`, so they are decided by
+        // `is_ash_special` and never reach the word-level guard. `type` is what
+        // reads the predicate for them, so it is what pins it: adding one of
+        // them to the hand-named arm passes every case above.
+        let (_s, out, _e) = run("type read");
+        assert_eq!(out, "read is a shell builtin\n");
+        let (_s, out, _e) = run("type unset");
+        assert_eq!(out, "unset is a special shell builtin\n");
+        // The two hand-named words are named only because td-sh implements
+        // NEITHER. If either ever resolves to a `Builtin`, the arm becomes a
+        // second source of truth that would mask a missing `is_special` entry,
+        // so it has to go in the same landing -- which this makes fail rather
+        // than leaving it to be noticed.
+        assert!(crate::builtin::lookup("source").is_none());
+        assert!(crate::builtin::lookup("times").is_none());
+        // The guard must not over-fire. A FUNCTION of that name is dispatched
+        // before it, and `command` resolves to a builtin that never carries the
+        // redirections here -- both recoverable in ash, measured.
+        for src in [
+            "times() { echo FN; }; times 4>&9; echo AFTER",
+            "command times 4>&9; echo AFTER",
+        ] {
+            let (status, out, _e) = run(src);
+            assert_eq!((status, out.as_str()), (0, "AFTER\n"), "src: {src}");
+        }
+        // The abort is confined by a clone, which is what `Sig::Abort` is and
+        // `Sig::Interrupt` is not: each of these reports the failure and the
+        // shell carries on, in ash and here.
+        for src in [
+            "(times 4>&9); echo AFTER",
+            "x=$(times 4>&9); echo AFTER",
+            "times 4>&9 | cat; echo AFTER",
+        ] {
+            let (status, out, _e) = run(src);
+            assert_eq!((status, out.as_str()), (0, "AFTER\n"), "src: {src}");
+        }
+        // And it returns to a PROMPT rather than ending the shell, which is the
+        // one thing separating `Sig::Abort` from `Sig::Exit` and which no script
+        // can observe.
+        let units = ["times 4>&9", "echo NEXT"];
+        let (_s, out, _e) = crate::process::run_capturing_interactive_units(&units);
+        assert_eq!(out, "NEXT\n");
     }
 
     #[test]

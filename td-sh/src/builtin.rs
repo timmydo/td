@@ -123,13 +123,20 @@ pub fn is_ash_special(bi: Builtin) -> bool {
     is_special(bi) || matches!(bi, Builtin::Local)
 }
 
-/// Whether this command WORD blocks the local-var frame `evalcommand` pushes.
-/// ash's `spclbltin` set: the POSIX list above, plus `local` itself -- which is
-/// what keeps a top-level `local` an error rather than a frame that authorises
-/// itself -- plus `source` and `times`, which ash also makes special and td-sh does
-/// not implement, so without naming them here they reach the external path and are
-/// framed. Taken by word, not by `Builtin`, so those two can be named at all.
-pub fn blocks_localvar_frame(word: &str) -> bool {
+/// Whether this command WORD is in ash's `spclbltin` set: the POSIX list above,
+/// plus `local`, ash's own addition -- which is what keeps a top-level `local` an
+/// error rather than a frame that authorises itself -- plus `source` and `times`.
+/// Those two are named here rather than looked up because td-sh implements
+/// NEITHER, so they resolve to no `Builtin`; `times` is POSIX's own special
+/// builtin and only `source` is ash's (under `ENABLE_ASH_BASH_COMPAT`, which td's
+/// busybox has on).
+///
+/// One bit in ash (`name[0] & 1`, ash.c:8205) with three consequences here, which
+/// is why it is one predicate: it blocks the local-var frame `evalcommand`
+/// pushes, it makes a redirection failure FATAL rather than a skipped command,
+/// and it is what `type` reports as "special" -- that last only for the words
+/// td-sh implements, since `type` asks this only after a successful lookup.
+pub fn is_ash_special_word(word: &str) -> bool {
     lookup(word).is_some_and(is_ash_special) || matches!(word, "source" | "times")
 }
 
@@ -3329,9 +3336,7 @@ fn describe_one(sh: &Shell, name: &str, verbose: bool, path: Option<&str>) -> (S
         text.push_str(if verbose { " is a function" } else { name });
     } else if lookup(name).is_some() {
         if verbose {
-            // ash's `IS_BUILTIN_SPECIAL` set is exactly the set that blocks the
-            // local-var frame, `local` included.
-            text.push_str(if blocks_localvar_frame(name) {
+            text.push_str(if is_ash_special_word(name) {
                 " is a special shell builtin"
             } else {
                 " is a shell builtin"
