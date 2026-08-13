@@ -3693,6 +3693,126 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// `&>file` sends BOTH streams to one file, and is one token only when the
+    /// `>` is glued to the `&`. The two halves are what make it worth a test:
+    /// spaced, the same characters are a background job plus a redirect, and
+    /// getting that wrong turns `f &>/dev/null` -- the idiom this exists for --
+    /// into a job whose output still reaches the terminal.
+    #[test]
+    fn ampersand_greater_sends_both_streams_to_one_file() {
+        let dir = std::env::temp_dir().join(format!("td-sh-ampgt-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let Ok(()) = std::fs::create_dir_all(&dir) else {
+            panic!("fixture dir");
+        };
+        let f = dir.join("f");
+        let g = dir.join("g");
+        let (d, e) = (f.display(), g.display());
+        let both = "{ echo O; echo E >&2; }";
+        let read = |p: &std::path::Path| std::fs::read_to_string(p).unwrap_or_default();
+
+        // Both streams, and nothing left on either of the shell's own.
+        let (_s, out, err) = run(&format!("{both} &>'{d}'"));
+        assert_eq!((out.as_str(), err.as_str()), ("", ""));
+        assert_eq!(read(&f), "O\nE\n");
+        // ONE open file on two descriptors, so they share an offset and
+        // interleave -- two opens would have the second overwrite the first.
+        let (_s, _o, _e) = run(&format!("{{ printf AAAA; printf BBBB >&2; }} &>'{d}'"));
+        assert_eq!(read(&f), "AAAABBBB");
+
+        // The fd prefix decides whether stderr follows, exactly as it does in
+        // ash: only on 1. `2&>f` is a plain `2>f` -- NOT the error `2>&f` is,
+        // because the two spellings reach ash's NTO2 by different routes and
+        // only `>&`'s carries the fd check.
+        let (_s, out, err) = run(&format!("{both} 2&>'{d}'"));
+        assert_eq!((out.as_str(), err.as_str()), ("O\n", ""));
+        assert_eq!(read(&f), "E\n");
+        let (_s, out, err) = run(&format!("{both} 3&>'{d}'"));
+        assert_eq!((out.as_str(), err.as_str()), ("O\n", "E\n"));
+        assert_eq!(read(&f), "");
+        // fd 0 as well as 3, because 1 is a BOUNDARY: `dest <= STDOUT` reads
+        // exactly like `dest == STDOUT` on every descriptor above it.
+        let (_s, out, err) = run(&format!("{both} 0&>'{d}'"));
+        assert_eq!((out.as_str(), err.as_str()), ("O\n", "E\n"));
+        assert_eq!(read(&f), "");
+        // It TRUNCATES on every descriptor, so `set -C` refuses it on every
+        // descriptor -- status 1, not fatal, and the file left as it was. The
+        // non-1 branch needs its own case: it is a different `Plan`, and the
+        // only corpus case that covered `&>` under `set -C` is xfailed here.
+        // The refused open SKIPS the command whichever descriptor it was for,
+        // so nothing is written on any of them and the status is 1 rather
+        // than fatal.
+        for w in ["&>", "1&>", "2&>", "3&>"] {
+            std::fs::write(&f, "PRE\n").unwrap();
+            let (_s, out, err) =
+                run(&format!("set -C; {both} {w}'{d}'; echo st=$?"));
+            assert_eq!(out, "st=1\n", "{w}");
+            assert!(!err.is_empty(), "{w}");
+            assert_eq!(read(&f), "PRE\n", "{w}");
+        }
+        let _ = std::fs::remove_file(&f);
+        // The `>&` spelling on fd 2 stays fatal, which is the divergence.
+        let (status, _o, err) = run(&format!("{both} 2>&'{d}'; echo AFTER"));
+        assert_eq!(status, 2);
+        assert!(!err.is_empty());
+
+        // Two INDEPENDENT descriptors, not a linked pair: a later `>` moves
+        // stdout alone and leaves stderr on the file.
+        let (_s, _o, _e) = run(&format!("{both} &>'{d}' >'{e}'"));
+        assert_eq!((read(&f).as_str(), read(&g).as_str()), ("E\n", "O\n"));
+
+        // Glued only. Spaced, these are a background job and a redirect on an
+        // empty command, which is what td-sh did with every `&>` before this.
+        for src in ["echo hi & >'{}'", "echo hi &  >'{}'"] {
+            let (_s, out, _e) = run(&src.replace("{}", &d.to_string()));
+            assert_eq!(out, "hi\n", "{src}");
+            assert_eq!(read(&f), "");
+        }
+        // And a digit is the fd only when the WHOLE pair is glued to it. Both
+        // halves matter: spaced off, `2` is an argument and `&>` is still the
+        // operator; glued to a lone `&`, it is an argument again and the `&` is
+        // a background job -- so peeking one character past the `&` is what
+        // tells the fd prefix from the job.
+        let (_s, out, _e) = run(&format!("echo 2 &>'{d}'"));
+        assert_eq!(out, "");
+        assert_eq!(read(&f), "2\n");
+        let _ = std::fs::remove_file(&f);
+        // A space is not the only thing that can follow that bare `&`, and
+        // pinning only the spaced case leaves `peek_at(1) != Some(' ')` alive.
+        // Each of these is a digit glued to a `&` that is NOT the operator.
+        let (_s, out, _e) = run(&format!("echo 2& >'{d}'"));
+        assert_eq!(out, "2\n");
+        assert_eq!(read(&f), "");
+        assert_eq!(run("echo 2&&echo x").1, "2\nx\n");
+        let (_s, out, _e) = run("echo 2&\necho x");
+        let mut lines: Vec<&str> = out.lines().collect();
+        lines.sort_unstable();
+        assert_eq!(lines, ["2", "x"], "{out:?}");
+        assert_eq!(run("echo 2&; echo x").0, 2);
+        // And `&<` is not this operator either: only `>` glues to the `&`.
+        std::fs::write(&f, "PRE\n").unwrap();
+        let (_s, out, err) = run(&format!("echo hi &<'{d}'; echo done"));
+        assert_eq!(out, "done\nhi\n");
+        assert_eq!(read(&f), "PRE\n", "{err}");
+
+        // ash refuses these three where bash takes the first; the grammar gives
+        // it for free, since nothing but a word may follow the operator.
+        for src in ["echo hi &>>x", "echo hi &>&1", "echo hi &>|x"] {
+            let (status, out, err) = run(&format!("{src}; echo AFTER"));
+            assert_eq!((status, out.as_str()), (2, ""), "{src}");
+            assert!(err.contains("syntax error"), "{src}: {err:?}");
+        }
+        // Inert inside quotes and expansions -- ash gates its lexer hunk on
+        // `varnest == 0`, and `&` being a metacharacter is td-sh's equivalent.
+        assert_eq!(run("echo \"${x:-a&>b}\"").1, "a&>b\n");
+        assert_eq!(run("echo 'a&>b'").1, "a&>b\n");
+        // The operator SPELLS itself in a diagnostic. Nothing else reads that
+        // string, so a transposed `>&` there is invisible to every case above.
+        let (_s, _o, err) = run("for i in &>; do :; done");
+        assert!(err.contains("`&>`"), "{err:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn each_file_operator_opens_the_way_it_says() {
         // `>>` must not truncate and `<>` must not either; both were moved

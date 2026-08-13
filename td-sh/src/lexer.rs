@@ -26,6 +26,9 @@ pub enum Op {
     GreatAnd,
     LessGreat,
     Clobber,
+    /// `&>` — both streams to one file. One token only when the `>` is GLUED to
+    /// the `&`; spaced, it stays the background operator plus a redirect.
+    AmpGreat,
     /// `<<` / `<<-`; the payload indexes `Lexed::heredocs`.
     DLess(usize),
 }
@@ -41,6 +44,7 @@ impl Op {
                 | Op::GreatAnd
                 | Op::LessGreat
                 | Op::Clobber
+                | Op::AmpGreat
                 | Op::DLess(_)
         )
     }
@@ -62,6 +66,7 @@ impl Op {
             Op::GreatAnd => ">&",
             Op::LessGreat => "<>",
             Op::Clobber => ">|",
+            Op::AmpGreat => "&>",
             Op::DLess(_) => "<<",
         }
     }
@@ -852,10 +857,20 @@ impl Lexer {
                 return Ok(Tok::Word(word));
             }
             // `2>file`: digits glued to a redirection operator name the fd.
+            // `&` counts only with a `>` glued to IT, since that pair is one
+            // operator -- ash's `isdigit_str(out)` test, whose `c` may be the
+            // flagged `&>` (ash.c:12707). `2&` alone is still a word and a
+            // background operator, which is why the second character is peeked
+            // rather than assumed.
             if let Some(text) = word.plain() {
+                let starts_redirect = match self.sc.peek() {
+                    Some('<') | Some('>') => true,
+                    Some('&') => self.sc.peek_at(1) == Some('>'),
+                    _ => false,
+                };
                 if !text.is_empty()
                     && text.chars().all(|c| c.is_ascii_digit())
-                    && matches!(self.sc.peek(), Some('<') | Some('>'))
+                    && starts_redirect
                 {
                     if let Ok(n) = text.parse::<u32>() {
                         return Ok(Tok::IoNumber(n));
@@ -945,6 +960,8 @@ impl Lexer {
             '&' => {
                 if self.sc.eat('&') {
                     Op::AndIf
+                } else if self.sc.eat('>') {
+                    Op::AmpGreat
                 } else {
                     Op::Amp
                 }

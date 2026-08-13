@@ -512,6 +512,22 @@ fn plan_redirs<'a>(sh: &mut Shell, redirs: &'a [Redir]) -> R<Vec<(u32, Plan<'a>)
                 let closes = r.word.plain() == Some("-");
                 classify_dup(sh, dest, target, closes)?
             }
+            // `&>file` is NOT `>&file`, and the difference is the fd. ash
+            // lexes `&>` straight to NTO2 (ash.c:12815) and reapplies the digit
+            // prefix, so `2&>f` is NTO2 on fd 2; `>&file` is NTOFD promoted to
+            // NTO2 at `expredir`, and it is that promotion that raises for a
+            // prefix other than 1 (ash.c:9663). Whether stderr follows is then
+            // the DESTINATION's question at redirect time (ash.c:5893), so on
+            // any other fd this is an ordinary truncating write -- measured:
+            // `2&>out` puts stderr alone in the file where `2>&out` is fatal.
+            RedirKind::OutBoth => {
+                let target = exec::redir_target(sh, r)?;
+                if dest == STDOUT {
+                    Plan::BothFile(target)
+                } else {
+                    Plan::Write(target)
+                }
+            }
             RedirKind::In => Plan::Read(exec::redir_target(sh, r)?),
             RedirKind::Out => Plan::Write(exec::redir_target(sh, r)?),
             RedirKind::Clobber => Plan::Clobber(exec::redir_target(sh, r)?),

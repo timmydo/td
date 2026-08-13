@@ -1184,6 +1184,7 @@ impl Units {
             Op::Clobber => RedirKind::Clobber,
             Op::LessAnd => RedirKind::DupIn,
             Op::GreatAnd => RedirKind::DupOut,
+            Op::AmpGreat => RedirKind::OutBoth,
             other => return Err(format!("syntax error near `{}`", other.text())),
         };
         let word = self.take_word()?;

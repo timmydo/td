@@ -118,6 +118,9 @@ pub enum RedirKind {
     DupIn,
     /// `>&`
     DupOut,
+    /// `&>` — the target is a FILE, and on fd 1 stderr follows stdout to it.
+    /// NOT a spelling of `>&`: see `plan_redirs`.
+    OutBoth,
     /// `<<` / `<<-`; the body is already tab-stripped and, when the delimiter
     /// was unquoted, lexed for expansions.
     Here(Word),

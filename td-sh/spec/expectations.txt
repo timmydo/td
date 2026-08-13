@@ -964,6 +964,7 @@ xfail redirect.test.sh::Redirect to file descriptor that's not open
 xfail redirect.test.sh::can't mention big file descriptor
 xfail redirect.test.sh::echo foo >&100 (OSH regression: does not fail with invalid fd 100)
 xfail redirect.test.sh::echo foo >&N where N is first unused fd
+xfail redirect.test.sh::noclobber can still write to non-regular files like /dev/null
 xfail regex.test.sh::BASH_REMATCH
 xfail regex.test.sh::Bug: Nix idiom with closing ) next to pattern
 xfail regex.test.sh::Escaped {
