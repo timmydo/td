@@ -549,12 +549,18 @@ fn open_planned(sh: &mut Shell, plan: &Plan) -> R<Result<Opened, ()>> {
         }
         Plan::Close => Ok(Ok(Opened::To(Fd::Closed))),
         Plan::Same => Ok(Ok(Opened::Unchanged)),
+        // A descriptor CLOSED by `>&-` is not a descriptor. It stays in the table
+        // as `Fd::Closed` rather than leaving it -- a child needs to tell closed
+        // from absent -- so the two have to be refused together HERE, or `3>&-
+        // 2>&3` dups the marker and the command runs on a descriptor ash calls
+        // bad. Recoverable, not fatal: ash's is `dup2_or_raise` at `redirect`
+        // time, inside the `redirectsafe` that catches it.
         Plan::From(n) => match sh.fds.get(*n) {
-            Some(fd) => Ok(Ok(Opened::To(fd.clone()))),
-            None => {
+            Some(Fd::Closed) | None => {
                 let _ = exec::write_stderr(sh, &format!("{n}: bad file descriptor"));
                 Ok(Err(()))
             }
+            Some(fd) => Ok(Ok(Opened::To(fd.clone()))),
         },
         Plan::BothFile(name) => Ok(truncating_open(sh, name, sh.opts.noclobber).map(to_both)),
     }

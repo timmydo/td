@@ -3542,6 +3542,82 @@ mod tests {
     }
 
     #[test]
+    fn a_closed_descriptor_is_not_a_descriptor() {
+        // ash makes a descriptor CLOSED by `>&-` and one never opened the same
+        // thing: every dup FROM either is `dup2(n,m): Bad file descriptor` and
+        // skips the command. Here the closed one stays in the table as
+        // `Fd::Closed` -- a child has to tell closed from absent -- so without
+        // refusing it beside `None` the marker gets duped and the command runs.
+        // Measured against busybox 1.37.0 ash, every shape below.
+        for src in [
+            "echo CMD 3>&- 4>&3; echo AFTER",
+            "exec 3>&1; exec 3>&-; echo CMD 4>&3; echo AFTER",
+            // The read direction is the same rule; `<&` and `>&` differ only in
+            // which descriptor is the default, never in what a target may be.
+            "exec 3>&1; exec 3>&-; echo CMD 0<&3; echo AFTER",
+            // Never opened, which was already refused -- kept so the fix cannot
+            // be read as being about `Closed` alone.
+            "echo CMD 4>&3; echo AFTER",
+        ] {
+            let (_s, out, err) = run(src);
+            assert_eq!(out, "AFTER\n", "src: {src}");
+            // The NUMBER is part of the diagnostic: every case here names a
+            // different descriptor as its destination, so a message that dropped
+            // it would read the same for all of them.
+            assert!(err.contains("3: bad file descriptor"), "src: {src}, {err:?}");
+        }
+        // And the neighbours that must NOT become errors. Closing is idempotent
+        // and may name a descriptor that was never open; a self-dup is skipped
+        // without a lookup, so it does not care either way; and a descriptor
+        // reopened after closing is ordinary again.
+        for src in [
+            "echo CMD 4>&-; echo AFTER",
+            "exec 3>&1; exec 3>&-; echo CMD 3>&3; echo AFTER",
+            "echo CMD 3>&3; echo AFTER",
+            "exec 3>&1; exec 3>&-; exec 3>&1; echo CMD >&3; echo AFTER",
+            // Duping FROM an INHERITED descriptor, which is the over-refusal
+            // this arm invites most: `Some(Fd::Inherit(0)) | Some(Fd::Closed) |
+            // None` is already the right pattern elsewhere in the file, where
+            // fd 0 really is a bad target -- for a WRITE. As a dup SOURCE it is
+            // an ordinary open descriptor, and the other cases here never reach
+            // one, since the test harness gives fd 1 and 2 buffers instead.
+            "echo CMD 3<&0; echo AFTER",
+            "echo CMD 2>&0; echo AFTER",
+        ] {
+            let (_s, out, err) = run(src);
+            assert_eq!(out, "CMD\nAFTER\n", "src: {src}");
+            assert_eq!(err, "", "src: {src}");
+        }
+        // Closing a descriptor that is ALREADY closed is not an error either.
+        // There is no command to see run here -- an `exec` carrying only
+        // redirections runs none -- so what shows it is `AFTER` arriving with
+        // stderr empty: the second close neither reported nor ended the shell.
+        let (_s, out, err) = run("exec 3>&1; exec 3>&-; exec 3>&-; echo AFTER");
+        assert_eq!((out.as_str(), err.as_str()), ("AFTER\n", ""));
+        // `/dev/null` is a TARGET, not an absence: it lives in the table as
+        // `Fd::Null` right beside `Fd::Closed`, and duping from it must still
+        // work. Refusing the two together passes every case above.
+        let (_s, out, err) = run("exec 3>/dev/null; echo CMD 4>&3; echo AFTER");
+        assert_eq!((out.as_str(), err.as_str()), ("CMD\nAFTER\n", ""));
+        // And a file-backed descriptor duped onto stdout carries the write to
+        // the file, which is the ordinary case the refusal must not reach.
+        let dir = std::env::temp_dir().join(format!("td-sh-dupfile-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let Ok(()) = std::fs::create_dir_all(&dir) else {
+            panic!("fixture dir");
+        };
+        let out_path = dir.join("out");
+        let (_s, out, _e) = run(&format!(
+            "exec 3>'{}'; echo CMD 1>&3; echo AFTER",
+            out_path.display()
+        ));
+        assert_eq!(out, "AFTER\n");
+        let wrote = std::fs::read_to_string(&out_path).unwrap_or_default();
+        assert_eq!(wrote, "CMD\n");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn each_file_operator_opens_the_way_it_says() {
         // `>>` must not truncate and `<>` must not either; both were moved
         // verbatim into `Plan` arms, where a stray `truncate(true)` reads like
