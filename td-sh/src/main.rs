@@ -191,7 +191,8 @@ fn run(args: &[String]) -> Result<i32, String> {
         // reading happens after, so a script that is a fifo or `/dev/stdin`
         // blocks where the writer is waiting rather than before `/etc/profile`
         // has run.
-        let file = std::fs::File::open(path).map_err(|e| format!("{path}: {e}"))?;
+        let file = std::fs::File::open(path)
+            .map_err(|e| format!("can't open '{path}': {}", exec::strerror(&e)))?;
         sh.arg0 = path.clone();
         sh.params = args.iter().skip(i + 1).cloned().collect();
         Start::Script(file, path.clone())
@@ -225,7 +226,8 @@ fn run(args: &[String]) -> Result<i32, String> {
         Start::Command(cmd) => Ok(run_program(&mut sh, &cmd)),
         Start::Script(mut file, path) => {
             let mut src = String::new();
-            file.read_to_string(&mut src).map_err(|e| format!("{path}: {e}"))?;
+            file.read_to_string(&mut src)
+                .map_err(|e| format!("{path}: {}", exec::strerror(&e)))?;
             Ok(run_program(&mut sh, &src))
         }
         Start::Repl => {

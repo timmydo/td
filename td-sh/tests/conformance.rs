@@ -914,6 +914,56 @@ fn an_endless_case_is_bounded_and_reported() -> Result<(), Box<dyn std::error::E
     Ok(())
 }
 
+/// The script OPERAND is opened before the shell exists, so its failure is the
+/// one diagnostic the in-process harness cannot reach -- and it was still
+/// printing `io::Error`'s Display after every other site had stopped. ash words
+/// it through the same `setinputfile` the `.` builtin uses (ash.c:11257), so it
+/// takes that quoted form too.
+#[test]
+fn a_missing_script_operand_is_reported_the_way_ash_reports_it()
+-> Result<(), Box<dyn std::error::Error>> {
+    let shell = PathBuf::from(env!("CARGO_BIN_EXE_td-sh"));
+    let dir = std::env::temp_dir().join(format!("td-sh-cliopen-{}", std::process::id()));
+    std::fs::create_dir_all(&dir)?;
+    let missing = dir.join("nope-script");
+    let out = std::process::Command::new(&shell).arg(&missing).output()?;
+    let err = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert_eq!(
+        err,
+        format!("td-sh: can't open '{}': No such file or directory\n", missing.display())
+    );
+    assert_eq!(out.status.code(), Some(2));
+    let _ = std::fs::remove_dir_all(&dir);
+    Ok(())
+}
+
+/// The spawn path with REAL stdio, and `exec`'s own, which the in-process
+/// harness cannot reach: it buffers stdout, so both fall back to the piped
+/// spawn. Both errnos come back from `Command`, not from `resolve_program`.
+#[test]
+fn a_spawn_failure_with_real_stdio_gives_the_systems_reason()
+-> Result<(), Box<dyn std::error::Error>> {
+    use std::os::unix::fs::PermissionsExt;
+    let shell = PathBuf::from(env!("CARGO_BIN_EXE_td-sh"));
+    let dir = std::env::temp_dir().join(format!("td-sh-spawnreal-{}", std::process::id()));
+    std::fs::create_dir_all(&dir)?;
+    let f = dir.join("noexec");
+    std::fs::write(&f, b"x")?;
+    // A slash in the name, so the execute bit is the KERNEL's to object to.
+    std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o644))?;
+    let p = f.display();
+    for (src, want) in [
+        (format!("{p}"), format!("td-sh: {p}: Permission denied\n")),
+        (format!("exec {p}"), format!("td-sh: exec: {p}: Permission denied\n")),
+    ] {
+        let out = std::process::Command::new(&shell).arg("-c").arg(&src).output()?;
+        assert_eq!(String::from_utf8_lossy(&out.stderr), want, "src: {src}");
+        assert_eq!(out.status.code(), Some(126), "src: {src}");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+    Ok(())
+}
+
 /// A function's prefix assignment is EXPORTED for the duration of the call, as an
 /// external command's environment would be. Only a real child can observe that,
 /// and the in-process unit-test harness captures stdout in a buffer no child can

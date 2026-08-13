@@ -2988,14 +2988,24 @@ fn cd(sh: &mut Shell, argv: &[String]) -> R<()> {
     // path resolves against, so it is always the canonical one. `cd` is a REGULAR
     // builtin, so dash's sh_error here is caught and becomes a status rather than
     // ending the script -- but the status is 2, not 1.
-    let Ok(phys) = target.canonicalize() else {
-        err_line(sh, &format!("cd: can't cd to {dest}"));
-        return status(sh, 2);
+    // `perror`, not `errmsg` (ash.c:2976): always the system's word, `cd`
+    // having no per-site substitute the way a redirection does.
+    let phys = match target.canonicalize() {
+        Ok(p) if p.is_dir() => p,
+        // Reached only when the name RESOLVES and is not a directory, which is
+        // the one `cd` failure no syscall reports: the shell's cwd is a variable
+        // rather than the process's, so there is no `chdir` to take the errno
+        // from. ENOTDIR is what one would have answered.
+        Ok(_) => {
+            let e = std::io::Error::from_raw_os_error(exec::ENOTDIR);
+            err_line(sh, &format!("cd: can't cd to {dest}: {}", exec::strerror(&e)));
+            return status(sh, 2);
+        }
+        Err(e) => {
+            err_line(sh, &format!("cd: can't cd to {dest}: {}", exec::strerror(&e)));
+            return status(sh, 2);
+        }
     };
-    if !phys.is_dir() {
-        err_line(sh, &format!("cd: can't cd to {dest}"));
-        return status(sh, 2);
-    }
     // With `-P` dash passes no logical path to setpwd, which then takes the
     // physical one; otherwise the name walked to is kept.
     let new = if physical { phys.clone() } else { target };
@@ -3245,16 +3255,21 @@ fn pwd(sh: &mut Shell, argv: &[String]) -> R<()> {
 /// where only a REGULAR file counts. Unlike a command lookup there is no implicit
 /// fallback to the current directory (dash reaches cwd only through an empty or
 /// `.` PATH element) and executability is not required.
-fn dot_path(sh: &Shell, name: &str) -> Option<std::path::PathBuf> {
+/// The path to OPEN, and the name to REPORT when opening it fails. They differ
+/// once PATH resolves the file: ash's `find_dot_file` hands `setinputfile` the
+/// concatenation it found rather than the operand (ash.c:13664).
+fn dot_path(sh: &Shell, name: &str) -> Option<(std::path::PathBuf, String)> {
     if name.contains('/') {
-        return Some(sh.resolve(name));
+        return Some((sh.resolve(name), name.to_string()));
     }
     let path = sh.get_var("PATH").unwrap_or_default();
     for dir in path.split(':') {
-        let dir = if dir.is_empty() { "." } else { dir };
-        let candidate = sh.resolve(dir).join(name);
+        // An empty entry is the cwd and contributes NO prefix, so the name is
+        // reported bare -- `padvance`'s handling, checked against ash.
+        let found = if dir.is_empty() { name.to_string() } else { format!("{dir}/{name}") };
+        let candidate = sh.resolve(&found);
         if candidate.is_file() {
-            return Some(candidate);
+            return Some((candidate, found));
         }
     }
     None
@@ -3367,7 +3382,7 @@ fn dot(sh: &mut Shell, argv: &[String]) -> R<()> {
         err_line(sh, &format!("{word}: filename argument required"));
         return status(sh, 2);
     };
-    let Some(path) = dot_path(sh, name) else {
+    let Some((path, found)) = dot_path(sh, name) else {
         return special_usage_error(sh, &format!("{word}: {name}: not found"));
     };
     // Only a failure to OPEN raises. A read that then fails -- a directory, most
@@ -3379,8 +3394,11 @@ fn dot(sh: &mut Shell, argv: &[String]) -> R<()> {
             let _ = std::io::Read::read_to_string(&mut f, &mut t);
             t
         }
+        // ash quotes the name here and nowhere else (`can't open '%s'`,
+        // ash.c:11257), and reports through `perror` as `cd` does.
         Err(e) => {
-            return special_usage_error(sh, &format!("{word}: {name}: {e}"));
+            let why = exec::strerror(&e);
+            return special_usage_error(sh, &format!("{word}: can't open '{found}': {why}"));
         }
     };
     let what = format!("{name}: ");

@@ -1723,7 +1723,7 @@ static STDIN_REWINDABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
 pub fn read_script_line() -> ScriptLine {
     let handle = match crate::process::stdin_raw() {
         Ok(handle) => handle,
-        Err(e) => return ScriptLine::Failed(e.to_string()),
+        Err(e) => return ScriptLine::Failed(crate::exec::strerror(&e)),
     };
     let seekable = *STDIN_REWINDABLE.get_or_init(|| {
         // A REGULAR FILE, and one that answers a position query. Answering is
@@ -1769,7 +1769,7 @@ fn read_line_bytewise(handle: &std::fs::File) -> Result<Vec<u8>, String> {
             // more. Unreachable while td-sh installs no handler, and reachable
             // the moment `trap 'action'` is served, which UNSAFE.md §8 defers.
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(e) => return Err(e.to_string()),
+            Err(e) => return Err(crate::exec::strerror(&e)),
             Ok(0) => return Ok(bytes),
             Ok(_) => {
                 // Unreachable from a conforming `Read`, and an ERROR rather
@@ -1802,7 +1802,7 @@ fn read_line_block(handle: &std::fs::File) -> Result<Vec<u8>, String> {
     loop {
         let n = match src.read(&mut buf) {
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(e) => return Err(e.to_string()),
+            Err(e) => return Err(crate::exec::strerror(&e)),
             // End of input: nothing was over-read, so there is nothing to give
             // back and the descriptor already sits where it should.
             Ok(0) => return Ok(bytes),
@@ -1826,7 +1826,8 @@ fn read_line_block(handle: &std::fs::File) -> Result<Vec<u8>, String> {
         let over = n.saturating_sub(nl.saturating_add(1));
         if over > 0 {
             let back = i64::try_from(over).map_err(|e| e.to_string())?;
-            src.seek(std::io::SeekFrom::Current(-back)).map_err(|e| e.to_string())?;
+            src.seek(std::io::SeekFrom::Current(-back))
+                .map_err(|e| crate::exec::strerror(&e))?;
         }
         return Ok(bytes);
     }

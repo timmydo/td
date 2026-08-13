@@ -2076,6 +2076,25 @@ pub fn redir_target(sh: &mut Shell, r: &Redir) -> R<String> {
     expand::expand_single(sh, &r.word)
 }
 
+/// The errnos td-sh names itself, the failure being one it DECIDED rather than
+/// one a syscall reported. Linux numbering, as every other constant here is.
+pub const ENOENT: i32 = 2;
+pub const EEXIST: i32 = 17;
+pub const ENOTDIR: i32 = 20;
+
+/// What a shell prints for an errno: the system's own text, without the
+/// ` (os error N)` `io::Error`'s Display appends and no shell prints.
+///
+/// Removed as the exact suffix rather than searched for, so a message std did
+/// not compose is never truncated at a marker it happens to contain; one with
+/// no errno has no suffix and passes through whole.
+pub fn strerror(e: &std::io::Error) -> String {
+    let text = e.to_string();
+    let Some(n) = e.raw_os_error() else { return text };
+    let suffix = format!(" (os error {n})");
+    text.strip_suffix(&suffix).unwrap_or(&text).to_owned()
+}
+
 /// Write `msg` plus a newline to the shell's current stderr.
 pub fn write_stderr(sh: &Shell, msg: &str) -> std::io::Result<()> {
     note_epipe(sh, process::write_fd(sh, 2, format!("{msg}\n").as_bytes()))
@@ -2926,7 +2945,7 @@ mod tests {
             // The status is the child dying, so the diagnostic must still be the
             // redirection's -- a fatal path that reported 2 and said nothing
             // would be indistinguishable from one that failed for another reason.
-            assert!(err.contains("No such file"), "src: {src}, err: {err:?}");
+            assert_eq!(err, "can't open /no/such/td-e: no such file\n", "src: {src}");
         }
         // The contrast, at the same three shapes: everything that is NOT a
         // subshell goes through the equivalent of `redirectsafe` and answers 1.
@@ -3056,6 +3075,183 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// `io::Error`'s Display is `{strerror} (os error {N})`. The tail is Rust's
+    /// and no shell prints it; the head is the system's and every shell does.
+    #[test]
+    fn an_errno_renders_as_the_system_words_it_and_no_further() {
+        for n in [super::ENOENT, super::EEXIST, super::ENOTDIR, 13, 21] {
+            let e = std::io::Error::from_raw_os_error(n);
+            let text = super::strerror(&e);
+            assert!(!text.contains("os error"), "{n}: {text}");
+            // And the strip takes the suffix ONLY -- putting it back has to
+            // reconstruct Display exactly, or the message itself was truncated.
+            assert_eq!(format!("{text} (os error {n})"), e.to_string(), "{n}");
+        }
+        // No errno, so nothing to strip: the message passes through whole.
+        let custom = std::io::Error::other("poisoned stdin");
+        assert_eq!(super::strerror(&custom), "poisoned stdin");
+        // Even one that CONTAINS the marker, which pins the order rather than
+        // the strip: the errno is asked first, so a message Rust did not
+        // compose is never searched. Exact-suffix against marker-search is not
+        // distinguishable below that -- an errno's Display always ends with its
+        // own suffix -- so this is as close as a test gets to it.
+        let odd = std::io::Error::other("can't open (os error 2) x");
+        assert_eq!(super::strerror(&odd), "can't open (os error 2) x");
+    }
+
+    /// Asserted over the diagnostics rather than over the helper. It is a
+    /// table, not a sweep: a site absent from it is a site nothing checks.
+    #[test]
+    fn no_diagnostic_carries_rusts_os_error_number() {
+        let dir = std::env::temp_dir().join(format!("td-sh-oserr-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let _ = std::fs::write(dir.join("f"), b"x");
+        let d = dir.display();
+        for src in [
+            format!(": < {d}/nope"),
+            format!(": > {d}/no/such/dir/x"),
+            format!(": >> {d}/no/such/dir/x"),
+            format!(": <> {d}/no/such/dir/x"),
+            format!(": >| {d}/no/such/dir/x"),
+            format!(": > {d}"),
+            format!(": < {d}/f/under"),
+            format!("set -C; : > {d}/f"),
+            "e=; : < $e".to_string(),
+            "e=; : > $e".to_string(),
+            format!("cd {d}/nope"),
+            format!("cd {d}/f"),
+            format!(". {d}/nope.sh"),
+            format!("source {d}/nope.sh"),
+            format!("echo x >&{d}/no/such/dir/x"),
+        ] {
+            let (_status, _out, err) = run(&src);
+            assert!(!err.is_empty(), "src: {src}");
+            assert!(!err.contains("os error"), "src: {src}, err: {err:?}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `.` names the file it OPENED, not the operand -- they differ only when
+    /// PATH resolved it, so an operand with a slash in it cannot show this.
+    /// The entries are RELATIVE for a second reason: ash reports the
+    /// concatenation as WRITTEN, so an absolute one could not tell the name it
+    /// reports from the path it opened.
+    #[test]
+    fn dot_names_the_file_path_resolved_not_the_operand() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("td-sh-dotpath-{}", std::process::id()));
+        let sub = dir.join("pdir");
+        let _ = std::fs::create_dir_all(&sub);
+        let target = sub.join("target.sh");
+        let _ = std::fs::write(&target, b"echo sourced\n");
+        // Unreadable, so the OPEN fails and the name is what gets reported.
+        let _ = std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o000));
+        for (dir_word, want) in [
+            ("PATH=pdir", "pdir/target.sh"),
+            ("PATH=./pdir", "./pdir/target.sh"),
+        ] {
+            let (_s, _o, err) = run(&format!("cd {}; {dir_word}; . target.sh", dir.display()));
+            assert_eq!(err, format!(".: can't open '{want}': Permission denied\n"));
+        }
+        // An empty entry is the cwd and contributes NO prefix.
+        let (_s, _o, err) = run(&format!("cd {}; PATH=; . target.sh", sub.display()));
+        assert_eq!(err, ".: can't open 'target.sh': Permission denied\n");
+        let _ = std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o644));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The one errno on the command path that is NOT `resolve_program`'s: it
+    /// comes back from `Command::spawn`, so the pre-check this commit defers
+    /// does not cover it and it needs its own rendering.
+    #[test]
+    fn a_command_that_cannot_be_spawned_gives_the_systems_reason() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("td-sh-spawnfail-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let f = dir.join("noexec");
+        let _ = std::fs::write(&f, b"x");
+        // A slash in the name, so `resolve_program` hands it over without
+        // asking about the execute bit and the KERNEL is what refuses.
+        let _ = std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o644));
+        // This harness buffers stdout, so the spawn takes the piped path; the
+        // one with real stdio, and `exec`'s own, are asked of the built binary
+        // in `tests/conformance.rs`.
+        let p = f.display();
+        let (status, _o, err) = run(&format!("{p}"));
+        assert_eq!(err, format!("td-sh: {p}: Permission denied\n"));
+        assert_eq!(status, 126);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Only `<` reaches ash's `eopen`; `>`, `>>`, `<>`, `>|` and the `>&word`
+    /// that writes both streams all reach `ecreate`. That is one choice made
+    /// six times, so it is pinned as a table -- the same ENOENT, told apart
+    /// only by which spelling asked.
+    #[test]
+    fn every_redirect_spelling_takes_the_word_ash_gives_it() {
+        let dir = std::env::temp_dir().join(format!("td-sh-spelling-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let p = format!("{}/no/such/dir/x", dir.display());
+        for op in ["<", ">", ">>", "<>", ">|"] {
+            let (_s, _o, err) = run(&format!(": {op} {p}"));
+            let want = if op == "<" {
+                format!("can't open {p}: no such file\n")
+            } else {
+                format!("can't create {p}: nonexistent directory\n")
+            };
+            assert_eq!(err, want, "op: {op}");
+        }
+        // `>&word` on fd 1 is a create too, and the one whose spelling gives no
+        // hint of it -- it looks like a dup. `&>word` and a NONNUMERIC `1<&word`
+        // reach the same place, so all three are asked.
+        for src in [format!("echo x >&{p}"), format!("echo x &>{p}"), format!("echo x 1<&{p}")] {
+            let (_s, _o, err) = run(&src);
+            assert_eq!(err, format!("can't create {p}: nonexistent directory\n"), "src: {src}");
+        }
+        // `set -C` opens through `noclobber_open` instead, whose OWN two open
+        // arms carry the word -- and neither is reached by the loop above,
+        // since it runs with the option off. The target that does not exist
+        // takes the `create_new` arm; a directory takes the re-check arm.
+        let adir = dir.join("d");
+        let _ = std::fs::create_dir_all(&adir);
+        let ad = adir.display();
+        for (src, want) in [
+            (format!("set -C; : > {p}"), format!("can't create {p}: nonexistent directory\n")),
+            (format!("set -C; echo x >&{p}"), format!("can't create {p}: nonexistent directory\n")),
+            (format!("set -C; : > {ad}"), format!("can't create {ad}: Is a directory\n")),
+            (format!("set -C; echo x >&{ad}"), format!("can't create {ad}: Is a directory\n")),
+        ] {
+            let (_s, _o, err) = run(&src);
+            assert_eq!(err, want, "src: {src}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `cd` and `.` report through ash's `perror` rather than its `errmsg`, so
+    /// they take the system's word for ENOENT where a redirection substitutes.
+    #[test]
+    fn cd_and_dot_give_the_reason_the_system_gives() {
+        let dir = std::env::temp_dir().join(format!("td-sh-whyfail-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let _ = std::fs::write(dir.join("f"), b"x");
+        let d = dir.display();
+        // Missing, and NOT `no such file`: that word is the redirection's.
+        let (_s, _o, err) = run(&format!("cd {d}/nope"));
+        assert_eq!(err, format!("cd: can't cd to {d}/nope: No such file or directory\n"));
+        // Resolves and is not a directory -- the arm no syscall answers, since
+        // this shell's cwd is a variable and there is no `chdir` to fail.
+        let (_s, _o, err) = run(&format!("cd {d}/f"));
+        assert_eq!(err, format!("cd: can't cd to {d}/f: Not a directory\n"));
+        // `.` quotes the name, which nothing else in the shell does, and both
+        // spellings of the word name themselves.
+        for word in ["source", "."] {
+            let (_s, _o, err) = run(&format!("{word} {d}/nope.sh"));
+            let want = format!("{word}: can't open '{d}/nope.sh': No such file or directory\n");
+            assert_eq!(err, want);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn an_empty_redirection_target_does_not_open_the_current_directory() {
         // The tell is the command RUNNING, not the diagnostic: joining "" onto the
@@ -3064,12 +3260,15 @@ mod tests {
         // said the wrong thing about why.
         let (_status, out, err) = run("e=; echo RAN <\"$e\"; echo after");
         assert_eq!(out, "after\n");
-        assert!(err.contains("No such file"), "err: {err:?}");
+        // Whole messages, because this target is exactly where the read and
+        // create wordings differ: one ENOENT, two answers.
+        assert_eq!(err, "can't open : no such file\n");
         let (_status, _out, err) = run("e=; echo x >\"$e\"");
-        assert!(err.contains("No such file"), "err: {err:?}");
-        // A target that really IS a directory keeps its own answer.
+        assert_eq!(err, "can't create : nonexistent directory\n");
+        // A target that really IS a directory keeps the SYSTEM's answer, which
+        // is the half of `errmsg` that does not substitute.
         let (_status, _out, err) = run("echo x >/");
-        assert!(err.contains("Is a directory"), "err: {err:?}");
+        assert_eq!(err, "can't create /: Is a directory\n");
     }
 
     #[test]
@@ -3269,7 +3468,7 @@ mod tests {
             panic!("fixture");
         };
         let (_s, _o, err) = run(&format!("{both}set -C; sh_o >&'{}'", kept.display()));
-        assert!(err.contains("cannot overwrite"), "err: {err:?}");
+        assert_eq!(err, format!("can't create {}: File exists\n", kept.display()));
         assert_eq!(std::fs::read(&kept).ok(), Some(b"KEEP".to_vec()));
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -3309,7 +3508,7 @@ mod tests {
         for op in [">", ">&"] {
             let (_s, out, err) = run(&format!("set -C; echo x {op}'{ad}'; echo st=$?"));
             assert_eq!(out, "st=1\n", "op: {op}, err: {err:?}");
-            assert!(!err.contains("cannot overwrite"), "op: {op}, err: {err:?}");
+            assert!(!err.contains("File exists"), "op: {op}, err: {err:?}");
         }
         // `>|` is the override, and the ONLY one: `set -C` must not reach it.
         let over = dir.join("bar");
@@ -3334,7 +3533,7 @@ mod tests {
             // The NAME is asserted, not just the refusal: this test exists for
             // which path the check consulted, and a message naming another one
             // would otherwise pass.
-            let want = format!("{n}: cannot overwrite existing file\n");
+            let want = format!("can't create {n}: File exists\n");
             assert_eq!(err, want, "op: {op}");
             let after = std::fs::read(&kept).ok();
             assert_eq!(after, Some(b"KEEP".to_vec()), "op: {op}");
@@ -3492,7 +3691,7 @@ mod tests {
         // follows still runs.
         let (status, out, err) = run("echo one 1>&/nope/x; echo survived");
         assert_eq!((status, out.as_str()), (0, "survived\n"));
-        assert!(err.contains("No such file"), "err: {err:?}");
+        assert!(err.contains("nonexistent directory"), "err: {err:?}");
         // Fatal is `Sig::Abort`, so an interactive shell returns to its prompt
         // rather than ending -- the same distinction the `bad fd number` arm
         // makes, and one no script can observe.

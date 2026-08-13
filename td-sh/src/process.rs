@@ -30,7 +30,7 @@ use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 
 use crate::ast::{AndOr, Cmd, List, Redir, RedirKind, Sep, Stage, Word};
-use crate::exec::{self, Shell, Sig, R};
+use crate::exec::{self, Shell, Sig, EEXIST, ENOENT, ENOTDIR, R};
 
 /// One entry in the shell's descriptor table. Everything shareable is behind an
 /// `Arc` so a subshell or pipeline stage inherits the same open file (and its
@@ -336,9 +336,40 @@ const REDIR_ERROR: i32 = 1;
 /// a node of its own is wrapped and keeps `REDIR_ERROR`.
 const FATAL_REDIR_ERROR: i32 = 2;
 
-/// What `open("")` reports, which is the one target the shell has to answer for
-/// itself. See `open_file`.
-const ENOENT: i32 = 2;
+/// Which of ash's two open-failure labels a redirection reaches: `<` alone
+/// takes `eopen`, every other spelling `ecreate` (ash.c:5535-5592). It carries
+/// the verb AND the word, so the two cannot drift apart.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum OpenKind {
+    Read,
+    Create,
+}
+
+impl OpenKind {
+    fn verb(self) -> &'static str {
+        match self {
+            Self::Read => "can't open",
+            Self::Create => "can't create",
+        }
+    }
+
+    /// The word `errmsg` (ash.c:1513) substitutes for ENOENT and ENOTDIR. It
+    /// is per-site because a create fails that way only when a DIRECTORY on the
+    /// path is missing, which is not what the same errno means for a read.
+    fn word(self) -> &'static str {
+        match self {
+            Self::Read => "no such file",
+            Self::Create => "nonexistent directory",
+        }
+    }
+
+    fn errmsg(self, e: &std::io::Error) -> String {
+        match e.raw_os_error() {
+            Some(ENOENT | ENOTDIR) => self.word().to_owned(),
+            _ => exec::strerror(e),
+        }
+    }
+}
 
 /// The two descriptors `>&word` writes, named because the rule turns on WHICH
 /// one is redirected rather than on the direction. See `classify_dup`.
@@ -550,18 +581,18 @@ fn open_planned(sh: &mut Shell, plan: &Plan) -> R<Result<Opened, ()>> {
                 Cursor::new(text.into_bytes()),
             ))))))
         }
-        Plan::Read(name) => Ok(open_file(sh, name, OpenOptions::new().read(true))),
+        Plan::Read(name) => Ok(open_file(sh, name, OpenOptions::new().read(true), OpenKind::Read)),
         Plan::Write(name) => Ok(truncating_open(sh, name, sh.opts.noclobber)),
         Plan::Clobber(name) => Ok(truncating_open(sh, name, false)),
         Plan::Append(name) => {
             let mut opts = OpenOptions::new();
             opts.write(true).create(true).append(true);
-            Ok(open_file(sh, name, &opts))
+            Ok(open_file(sh, name, &opts, OpenKind::Create))
         }
         Plan::ReadWrite(name) => {
             let mut opts = OpenOptions::new();
             opts.read(true).write(true).create(true);
-            Ok(open_file(sh, name, &opts))
+            Ok(open_file(sh, name, &opts, OpenKind::Create))
         }
         Plan::Close => Ok(Ok(Opened::To(Fd::Closed))),
         Plan::Same => Ok(Ok(Opened::Unchanged)),
@@ -592,13 +623,16 @@ fn truncating_open(sh: &mut Shell, name: &str, guarded: bool) -> Result<Opened, 
     }
     let mut opts = OpenOptions::new();
     opts.write(true).create(true).truncate(true);
-    open_file(sh, name, &opts)
+    open_file(sh, name, &opts, OpenKind::Create)
 }
 
 /// The refusal `set -C` exists for, worded once because two arms report it.
+/// ash reaches it by assigning `errno = EEXIST` and jumping to `ecreate`
+/// (ash.c:5570, and 5566 for the re-check), so the message falls out of the
+/// errno rather than being a string of its own.
 fn noclobber_refuse(sh: &mut Shell, name: &str) -> Result<Opened, ()> {
-    let _ = exec::write_stderr(sh, &format!("{name}: cannot overwrite existing file"));
-    Err(())
+    let e = std::io::Error::from_raw_os_error(EEXIST);
+    open_failed(sh, name, OpenKind::Create, &e)
 }
 
 /// `set -C` for the two redirections that truncate -- `>` and the `>&word` that
@@ -615,7 +649,7 @@ fn noclobber_open(sh: &mut Shell, name: &str) -> Result<Opened, ()> {
         // There and NOT regular: opened without creating or truncating, then
         // re-checked, since the name may have become a regular file in between
         // -- and that is the file being protected.
-        Ok(_) => match open_file(sh, name, &opts)? {
+        Ok(_) => match open_file(sh, name, &opts, OpenKind::Create)? {
             Opened::To(Fd::File(f)) if f.metadata().is_ok_and(|m| m.is_file()) => {
                 noclobber_refuse(sh, name)
             }
@@ -624,7 +658,7 @@ fn noclobber_open(sh: &mut Shell, name: &str) -> Result<Opened, ()> {
         // Nothing there when we looked, so create it and let `O_EXCL` refuse if
         // that stopped being true. It refuses a SYMLINK too, which is the
         // dangling-link case: the kernel will not follow one under `O_EXCL`.
-        Err(_) => open_file(sh, name, opts.create_new(true)),
+        Err(_) => open_file(sh, name, opts.create_new(true), OpenKind::Create),
     }
 }
 
@@ -680,7 +714,30 @@ fn classify_dup(sh: &mut Shell, dest: u32, target: String, closes: bool) -> R<Pl
     Err(Sig::Abort(FATAL_REDIR_ERROR))
 }
 
-fn open_file(sh: &mut Shell, name: &str, opts: &OpenOptions) -> Result<Opened, ()> {
+/// The one place a failed redirection is reported, so the verb and the word are
+/// chosen from `kind` rather than at each call site.
+fn open_failed(
+    sh: &mut Shell,
+    name: &str,
+    kind: OpenKind,
+    e: &std::io::Error,
+) -> Result<Opened, ()> {
+    let _ = exec::write_stderr(sh, &open_error(name, kind, e));
+    Err(())
+}
+
+/// `can't open ./x: no such file` -- ash's `"can't open %s: %s"`, which is not
+/// the subject-first shape every other diagnostic in this module has.
+fn open_error(name: &str, kind: OpenKind, e: &std::io::Error) -> String {
+    format!("{} {name}: {}", kind.verb(), kind.errmsg(e))
+}
+
+fn open_file(
+    sh: &mut Shell,
+    name: &str,
+    opts: &OpenOptions,
+    kind: OpenKind,
+) -> Result<Opened, ()> {
     if name == "/dev/null" {
         return Ok(Opened::To(Fd::Null));
     }
@@ -690,17 +747,12 @@ fn open_file(sh: &mut Shell, name: &str, opts: &OpenOptions) -> Result<Opened, (
     // descriptor to the command instead of skipping it. Refused by name rather
     // than left to the open, since the open is what gets it wrong.
     if name.is_empty() {
-        let e = std::io::Error::from_raw_os_error(ENOENT);
-        let _ = exec::write_stderr(sh, &format!("{name}: {e}"));
-        return Err(());
+        return open_failed(sh, name, kind, &std::io::Error::from_raw_os_error(ENOENT));
     }
     let path = sh.resolve(name);
     match opts.open(&path) {
         Ok(f) => Ok(Opened::To(Fd::File(Arc::new(f)))),
-        Err(e) => {
-            let _ = exec::write_stderr(sh, &format!("{name}: {e}"));
-            Err(())
-        }
+        Err(e) => open_failed(sh, name, kind, &e),
     }
 }
 
@@ -818,7 +870,10 @@ pub fn run_pipeline(sh: &mut Shell, cmds: &[Stage]) -> R<()> {
     for i in 0..stages.len().saturating_sub(1) {
         let (r, w) = match std::io::pipe() {
             Ok(ends) => ends,
-            Err(e) => return Err(sh.fatal(&format!("cannot create pipe: {e}"), 1)),
+            Err(e) => {
+                let why = exec::strerror(&e);
+                return Err(sh.fatal(&format!("cannot create pipe: {why}"), 1));
+            }
         };
         if let Some(stage) = stages.get_mut(i) {
             stage.fds.set(1, Fd::File(Arc::new(File::from(OwnedFd::from(w)))));
@@ -875,7 +930,7 @@ pub fn run_pipeline(sh: &mut Shell, cmds: &[Stage]) -> R<()> {
                 // EOF, which is indistinguishable from a producer with nothing
                 // to say, so the pipeline would otherwise report SUCCESS for a
                 // command that never happened.
-                Err(e) => Err(StageError::Unstarted(e.to_string())),
+                Err(e) => Err(StageError::Unstarted(exec::strerror(&e))),
                 Ok(handle) => handle.join().unwrap_or(Err(StageError::Interrupted(128))),
             })
             .collect()
@@ -1663,7 +1718,8 @@ pub fn exec_replace(sh: &mut Shell, argv: &[String]) -> R<()> {
 
     // Safe: `CommandExt::exec` returns the error rather than trapping it.
     let e = cmd.exec();
-    let _ = exec::write_stderr(sh, &format!("td-sh: exec: {program}: {e}"));
+    let why = exec::strerror(&e);
+    let _ = exec::write_stderr(sh, &format!("td-sh: exec: {program}: {why}"));
     failed_exec(sh, 126)
 }
 
@@ -1750,7 +1806,8 @@ pub fn exec_external(sh: &mut Shell, argv: &[String], path: Option<&str>) -> R<(
     let mut child = match spawn_uninherited(sh, &mut cmd) {
         Ok(c) => c,
         Err(e) => {
-            let _ = exec::write_stderr(sh, &format!("td-sh: {program}: {e}"));
+            let why = exec::strerror(&e);
+            let _ = exec::write_stderr(sh, &format!("td-sh: {program}: {why}"));
             sh.set_status(126);
             return Ok(());
         }
@@ -1848,7 +1905,8 @@ pub fn exec_external(sh: &mut Shell, argv: &[String], path: Option<&str>) -> R<(
             Ok(())
         }
         Err(e) => {
-            let _ = exec::write_stderr(sh, &format!("td-sh: {program}: {e}"));
+            let why = exec::strerror(&e);
+            let _ = exec::write_stderr(sh, &format!("td-sh: {program}: {why}"));
             sh.set_status(126);
             Ok(())
         }
@@ -2022,5 +2080,54 @@ mod thread_state {
         assert_send::<crate::exec::Shell>();
         assert_send::<super::Subshell>();
         assert_send::<super::Fds>();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{exec, OpenKind, EEXIST, ENOENT, ENOTDIR};
+
+    /// Neither errno is arbitrary: ENOENT is the missing name and ENOTDIR the
+    /// name under a non-directory, and ash answers both with one word because
+    /// to a script they are the same mistake.
+    #[test]
+    fn the_two_errnos_ash_names_take_the_callers_word_and_the_rest_the_systems() {
+        for kind in [OpenKind::Read, OpenKind::Create] {
+            for n in [ENOENT, ENOTDIR] {
+                let e = std::io::Error::from_raw_os_error(n);
+                assert_eq!(kind.errmsg(&e), kind.word(), "{kind:?} {n}");
+            }
+            // EACCES, EISDIR and the EEXIST `set -C` refuses with -- so the
+            // other arm is not a hypothetical one.
+            for n in [EEXIST, 13, 21] {
+                let e = std::io::Error::from_raw_os_error(n);
+                assert_eq!(kind.errmsg(&e), exec::strerror(&e), "{kind:?} {n}");
+                assert_ne!(kind.errmsg(&e), kind.word(), "{kind:?} {n}");
+            }
+        }
+        // ONE errno, two answers. This is why `errmsg` takes a word rather than
+        // deriving the whole message from the number.
+        let e = std::io::Error::from_raw_os_error(ENOENT);
+        assert_ne!(OpenKind::Read.errmsg(&e), OpenKind::Create.errmsg(&e));
+    }
+
+    /// The verb follows the same split as the word, and the punctuation between
+    /// the two is ash's rather than this module's usual `subject: reason`.
+    #[test]
+    fn a_failed_open_is_worded_the_way_ash_words_it() {
+        let missing = std::io::Error::from_raw_os_error(ENOENT);
+        assert_eq!(
+            super::open_error("./x", OpenKind::Read, &missing),
+            "can't open ./x: no such file"
+        );
+        assert_eq!(
+            super::open_error("./x", OpenKind::Create, &missing),
+            "can't create ./x: nonexistent directory"
+        );
+        let denied = std::io::Error::from_raw_os_error(13);
+        assert_eq!(
+            super::open_error("./x", OpenKind::Read, &denied),
+            "can't open ./x: Permission denied"
+        );
     }
 }
