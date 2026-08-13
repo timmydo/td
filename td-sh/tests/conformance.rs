@@ -52,11 +52,12 @@
 // `forbid` is the spelling a later `#[allow(unsafe_code)]` cannot override.
 #![forbid(unsafe_code)]
 
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 
 use td_sh::{
     graded_identity, parse_spec, resolve, run_case, run_dir_classified, summarize,
-    Disposition, Expectations, ASH_DASH_CHAIN,
+    CaseWorkdir, Disposition, Expectations, ASH_DASH_CHAIN,
 };
 
 fn spec_dir() -> PathBuf {
@@ -911,6 +912,99 @@ fn an_endless_case_is_bounded_and_reported() -> Result<(), Box<dyn std::error::E
     let outcome = run_case(&shell, &spec_helpers_bin(), case, ASH_DASH_CHAIN)?;
     assert!(!outcome.passed, "an endless stderr case was graded as a pass");
     assert!(outcome.truncated, "stderr's truncation was not reported");
+    Ok(())
+}
+
+/// A case sees the shell IDENTITY as `$0`, not the entry's absolute path. The
+/// corpus itself only reaches this through `spec-harness-bug.test.sh`'s `echo
+/// $0 | grep -o sh`, which counts `sh` in whatever directory the gate was built
+/// in -- so it is pinned here, where the answer cannot depend on that.
+#[test]
+fn a_case_sees_the_shell_identity_as_its_argv0() -> Result<(), Box<dyn std::error::Error>> {
+    let shell = PathBuf::from(env!("CARGO_BIN_EXE_td-sh"));
+    // `ash`, not `sh`: the identity is the one the case is GRADED against, so
+    // it is also what `$SH` holds and what a nested `$SH -c` would report.
+    let spec = "#### argv0\necho \"[$0]\"\n## STDOUT:\n[ash]\n## END\n";
+    let cases = parse_spec(spec)?;
+    let case = cases.first().ok_or("no case parsed")?;
+    let outcome = run_case(&shell, &spec_helpers_bin(), case, ASH_DASH_CHAIN)?;
+    assert!(outcome.passed, "argv0 case failed: {:?}", outcome.detail);
+    // And the nested call agrees, which is the sentence the harness comment
+    // makes and the reason argv[0] is spelled rather than left to the path.
+    let spec = "#### nested argv0\necho \"[$0]\"; $SH -c 'echo \"[$0]\"'\n\
+        ## STDOUT:\n[ash]\n[ash]\n## END\n";
+    let cases = parse_spec(spec)?;
+    let case = cases.first().ok_or("no case parsed")?;
+    let outcome = run_case(&shell, &spec_helpers_bin(), case, ASH_DASH_CHAIN)?;
+    assert!(outcome.passed, "nested argv0 case failed: {:?}", outcome.detail);
+    Ok(())
+}
+
+/// `argv[0]` is the WORD, in both directions: what this shell reports as its
+/// own `$0`, and what it hands a child. Only the binary shows either -- the
+/// in-process harness spawns nothing and has no `argv[0]` of its own -- and
+/// td-sh is both parent and child because it is the only argv-reporting
+/// program the gate may assume exists.
+#[test]
+fn argv0_is_the_word_the_shell_was_given_not_the_path_it_resolved()
+-> Result<(), Box<dyn std::error::Error>> {
+    let shell = PathBuf::from(env!("CARGO_BIN_EXE_td-sh"));
+    // Exclusively created and dropped with the test, so a planted symlink at a
+    // predictable name cannot redirect the link written just below.
+    let work = CaseWorkdir::new()?;
+    let bin = work.path().join("bin");
+    std::fs::create_dir(&bin)?;
+    let link = bin.join("mysh");
+    std::os::unix::fs::symlink(&shell, &link)?;
+
+    // Its OWN `$0`: the name it was reached by, verbatim.
+    let out = std::process::Command::new(&link).args(["-c", "echo $0"]).output()?;
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        format!("{}\n", link.display())
+    );
+    // `-c NAME` and a script operand still win over it.
+    let out = std::process::Command::new(&link)
+        .args(["-c", "echo $0", "NAME"])
+        .output()?;
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "NAME\n");
+    let script_file = work.path().join("s.sh");
+    std::fs::write(&script_file, "echo $0\n")?;
+    let out = std::process::Command::new(&link).arg(&script_file).output()?;
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        format!("{}\n", script_file.display())
+    );
+
+    // The leading `-` a login shell is announced by, which a resolved path can
+    // never carry: this is the guard a profile opens with.
+    let out = std::process::Command::new(&link)
+        .arg0("-sh")
+        .args(["-c", "case $0 in -*) echo LOGIN;; *) echo NOT;; esac"])
+        .output()?;
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "LOGIN\n");
+
+    // Every generated script QUOTES the directory: `$TMPDIR` may hold a space
+    // or a glob character, and an unquoted `cd` would fail somewhere else in a
+    // way that says nothing about argv[0].
+    let dir = bin.display();
+    // What it hands a CHILD found on PATH: `mysh`, the word, where the resolved
+    // path was going out before -- a name the caller never wrote.
+    let script = format!("PATH='{dir}'\nmysh -c 'echo $0'\n");
+    let out = std::process::Command::new(&shell).arg("-c").arg(&script).output()?;
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "mysh\n");
+
+    // A slash-bearing word goes through as WRITTEN rather than canonicalised,
+    // so a relative spelling stays relative.
+    let script = format!("cd '{dir}'\n./mysh -c 'echo $0'\n");
+    let out = std::process::Command::new(&shell).arg("-c").arg(&script).output()?;
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "./mysh\n");
+
+    // `exec` is a SECOND call site -- `CommandExt::exec` rather than `spawn` --
+    // which the plain-command case above does not reach.
+    let script = format!("PATH='{dir}'\nexec mysh -c 'echo $0'\n");
+    let out = std::process::Command::new(&shell).arg("-c").arg(&script).output()?;
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "mysh\n");
     Ok(())
 }
 

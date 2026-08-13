@@ -82,6 +82,11 @@ fn run(args: &[String]) -> Result<i32, String> {
     // or during the window a sibling's spawn opens, would read that ignore as
     // the answer and keep it. Every clone inherits what this records.
     builtin::prime_signal_entries(&mut sh);
+    // `$0` is the name this shell was INVOKED by (`arg0 = xargv[0]`,
+    // ash.c:14589); a script operand or `-c NAME` replaces it below.
+    if let Some(a) = args.first() {
+        sh.arg0 = a.clone();
+    }
     let mut i = 1usize;
     let mut minus_c = false;
     // A LOGIN shell, by the convention every shell since the Bourne one has used:

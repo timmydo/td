@@ -44,6 +44,7 @@
 
 use std::collections::BTreeSet;
 use std::io::Read;
+use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -899,10 +900,15 @@ fn wait_and_capture(mut child: Child, timeout: Duration) -> std::io::Result<Capt
 /// Each case runs in its own temp dir, removed on drop (best-effort). Named by
 /// pid + a per-process counter so parallel gate processes and successive cases
 /// never collide.
-struct CaseWorkdir(std::path::PathBuf);
+pub struct CaseWorkdir(std::path::PathBuf);
 
 impl CaseWorkdir {
-    fn new() -> std::io::Result<Self> {
+    /// The directory, which exists until this is dropped.
+    pub fn path(&self) -> &Path {
+        &self.0
+    }
+
+    pub fn new() -> std::io::Result<Self> {
         use std::os::unix::fs::DirBuilderExt;
         static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         // Absolute, because the child's cwd MOVES into this dir: a relative
@@ -1014,7 +1020,11 @@ pub fn run_case(
     // which then answers `-c: applet not found` and grades as a wrecked shell,
     // while the nested call through this entry works. Identical overlay for a
     // single-purpose shell; the difference is only that consistency.
+    // argv[0] is the bare IDENTITY, so that holds of argv[0] and not only of
+    // the program -- and a case reading `$0` sees a name rather than this
+    // directory's throwaway path.
     let child = Command::new(&entry)
+        .arg0(identity)
         .arg("-c")
         .arg(&case.code)
         .env_clear()

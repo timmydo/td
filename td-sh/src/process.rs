@@ -1708,6 +1708,7 @@ pub fn exec_replace(sh: &mut Shell, argv: &[String]) -> R<()> {
     }
 
     let mut cmd = Command::new(&resolved);
+    cmd.arg0(program);
     cmd.args(argv.iter().skip(1));
     cmd.env_clear();
     for (k, v) in sh.exported_env() {
@@ -1754,6 +1755,8 @@ pub fn exec_external(
     path: Option<&str>,
     label: &str,
 ) -> R<()> {
+    use std::os::unix::process::CommandExt;
+
     let Some(program) = argv.first() else {
         sh.set_status(0);
         return Ok(());
@@ -1769,6 +1772,9 @@ pub fn exec_external(
     };
 
     let mut cmd = Command::new(&resolved);
+    // argv[0] is the WORD, not the path the search resolved to (ash.c:8354);
+    // `Command`'s default is the program path.
+    cmd.arg0(program);
     cmd.args(argv.iter().skip(1));
     cmd.env_clear();
     for (k, v) in sh.exported_env() {
