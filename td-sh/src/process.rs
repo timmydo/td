@@ -30,7 +30,9 @@ use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 
 use crate::ast::{AndOr, Cmd, List, Redir, RedirKind, Sep, Stage, Word};
-use crate::exec::{self, Shell, Sig, EEXIST, ENOENT, ENOTDIR, R};
+use crate::exec::{
+    self, Shell, Sig, EACCES, EEXIST, ELOOP, ENAMETOOLONG, ENOENT, ENOTDIR, R,
+};
 
 /// One entry in the shell's descriptor table. Everything shareable is behind an
 /// `Arc` so a subshell or pipeline stage inherits the same open file (and its
@@ -1671,9 +1673,13 @@ pub fn exec_replace(sh: &mut Shell, argv: &[String]) -> R<()> {
     let Some(program) = argv.first() else {
         return Ok(());
     };
-    let Some(resolved) = resolve_program(sh, program, None) else {
-        let _ = exec::write_stderr(sh, &format!("td-sh: exec: {program}: not found"));
-        return failed_exec(sh, 127);
+    let resolved = match resolve_program(sh, program, None) {
+        Ok(p) => p,
+        Err(seen) => {
+            let (why, code) = seen.as_exec();
+            let _ = exec::write_stderr(sh, &format!("td-sh: exec: {program}: {why}"));
+            return failed_exec(sh, code);
+        }
     };
     // Replacing the process is only safe from the real shell with real stdio. An
     // in-process clone (subshell, `&`, command substitution) would take the whole
@@ -1687,7 +1693,7 @@ pub fn exec_replace(sh: &mut Shell, argv: &[String]) -> R<()> {
         // emulation has to drop it too -- otherwise this shell runs an EXIT trap
         // the exec'd program could never have run.
         sh.traps.clear();
-        exec_external(sh, argv, None)?;
+        exec_external(sh, argv, None, "exec: ")?;
         return Err(Sig::Exit(sh.status));
     }
 
@@ -1718,9 +1724,9 @@ pub fn exec_replace(sh: &mut Shell, argv: &[String]) -> R<()> {
 
     // Safe: `CommandExt::exec` returns the error rather than trapping it.
     let e = cmd.exec();
-    let why = exec::strerror(&e);
+    let (why, code) = exec_failure(&e);
     let _ = exec::write_stderr(sh, &format!("td-sh: exec: {program}: {why}"));
-    failed_exec(sh, 126)
+    failed_exec(sh, code)
 }
 
 /// A failed `exec` ends the shell, interactive or not: dash and busybox-ash both
@@ -1742,16 +1748,22 @@ fn failed_exec(sh: &mut Shell, code: i32) -> R<()> {
 /// Without this an external consumer would read the shell's real inherited stdin
 /// (blocking the shell forever on a live terminal) and `x=$(external)` would lose
 /// the command's output.
-pub fn exec_external(sh: &mut Shell, argv: &[String], path: Option<&str>) -> R<()> {
+pub fn exec_external(
+    sh: &mut Shell,
+    argv: &[String],
+    path: Option<&str>,
+    label: &str,
+) -> R<()> {
     let Some(program) = argv.first() else {
         sh.set_status(0);
         return Ok(());
     };
     let resolved = match resolve_program(sh, program, path) {
-        Some(p) => p,
-        None => {
-            let _ = exec::write_stderr(sh, &format!("td-sh: {program}: not found"));
-            sh.set_status(127);
+        Ok(p) => p,
+        Err(seen) => {
+            let (why, code) = seen.as_command();
+            let _ = exec::write_stderr(sh, &format!("td-sh: {label}{program}: {why}"));
+            sh.set_status(code);
             return Ok(());
         }
     };
@@ -1806,9 +1818,9 @@ pub fn exec_external(sh: &mut Shell, argv: &[String], path: Option<&str>) -> R<(
     let mut child = match spawn_uninherited(sh, &mut cmd) {
         Ok(c) => c,
         Err(e) => {
-            let why = exec::strerror(&e);
-            let _ = exec::write_stderr(sh, &format!("td-sh: {program}: {why}"));
-            sh.set_status(126);
+            let (why, code) = exec_failure(&e);
+            let _ = exec::write_stderr(sh, &format!("td-sh: {label}{program}: {why}"));
+            sh.set_status(code);
             return Ok(());
         }
     };
@@ -1905,9 +1917,9 @@ pub fn exec_external(sh: &mut Shell, argv: &[String], path: Option<&str>) -> R<(
             Ok(())
         }
         Err(e) => {
-            let why = exec::strerror(&e);
-            let _ = exec::write_stderr(sh, &format!("td-sh: {program}: {why}"));
-            sh.set_status(126);
+            let (why, code) = exec_failure(&e);
+            let _ = exec::write_stderr(sh, &format!("td-sh: {label}{program}: {why}"));
+            sh.set_status(code);
             Ok(())
         }
     }
@@ -1966,10 +1978,12 @@ pub fn resolve_program(
     sh: &Shell,
     program: &str,
     path: Option<&str>,
-) -> Option<std::path::PathBuf> {
+) -> Result<std::path::PathBuf, Unresolved> {
+    // A name with a slash is neither searched NOR pre-checked: ash execve's it
+    // and reports what came back (ash.c:8337-8349), so a DIRECTORY is the kernel's
+    // EACCES rather than the ENOENT an `is_file()` test would have inferred.
     if program.contains('/') {
-        let p = sh.resolve(program);
-        return if p.is_file() { Some(p) } else { None };
+        return Ok(sh.resolve(program));
     }
     let owned;
     let path = match path {
@@ -1979,23 +1993,93 @@ pub fn resolve_program(
             &owned
         }
     };
+    let mut seen = Unresolved::new();
     for dir in path.split(':') {
         let dir = if dir.is_empty() { "." } else { dir };
         let candidate = sh.resolve(dir).join(program);
         // Skip a non-executable match and keep searching, so a data file earlier in
         // PATH does not shadow a real executable later in it.
-        if is_executable(&candidate) {
-            return Some(candidate);
+        match candidate.metadata() {
+            Ok(m) if is_executable(&m) => return Ok(candidate),
+            other => seen.saw(other.as_ref()),
         }
     }
-    None
+    Err(seen)
 }
 
-fn is_executable(p: &std::path::Path) -> bool {
+/// What a PATH walk that found nothing to run has to report, which is ash's
+/// `e` plus the one bit `e` cannot carry.
+#[derive(Clone, Copy, Debug)]
+pub struct Unresolved {
+    errno: i32,
+    /// Whether a REGULAR file was passed over, which is `find_command`
+    /// succeeding: it applies no execute test (ash.c:13925-13951), so an
+    /// unrunnable file is a lookup that worked and an exec that did not.
+    regular: bool,
+}
+
+impl Unresolved {
+    fn new() -> Self {
+        Self { errno: ENOENT, regular: false }
+    }
+
+    fn saw(&mut self, meta: Result<&std::fs::Metadata, &std::io::Error>) {
+        match meta {
+            Ok(m) => {
+                self.regular |= m.is_file();
+                self.record(EACCES);
+            }
+            Err(e) => self.record(e.raw_os_error().unwrap_or(ENOENT)),
+        }
+    }
+
+    /// ash overwrites its remembered errno with ANY that is not "nothing
+    /// there" (ash.c:13921-13922), so a later symlink loop replaces an earlier
+    /// EACCES rather than the first answer winning.
+    fn record(&mut self, errno: i32) {
+        if errno != ENOENT && errno != ENOTDIR {
+            self.errno = errno;
+        }
+    }
+
+    fn error(self) -> std::io::Error {
+        std::io::Error::from_raw_os_error(self.errno)
+    }
+
+    /// For a plain command, where ash runs `find_command` FIRST: a walk that
+    /// passed no regular file is that function failing, which is 127 whatever
+    /// errno it remembered.
+    fn as_command(self) -> (String, i32) {
+        let (why, code) = exec_failure(&self.error());
+        (why, if self.regular { code } else { 127 })
+    }
+
+    /// For `exec`, where `execcmd` calls `shellexec` directly (ash.c:10098):
+    /// no lookup ran, so there is none to have failed and the errno decides.
+    fn as_exec(self) -> (String, i32) {
+        exec_failure(&self.error())
+    }
+}
+
+/// ash maps an exec failure to a word and a status together, and the two forks
+/// are DIFFERENT sets: `errmsg` substitutes `not found` for ENOENT and ENOTDIR
+/// (ash.c:1513-1518), while the status is 127 for those plus ELOOP and
+/// ENAMETOOLONG (ash.c:8365-8379). A symlink loop separates them.
+fn exec_failure(e: &std::io::Error) -> (String, i32) {
+    let word = match e.raw_os_error() {
+        Some(ENOENT | ENOTDIR) => "not found".to_owned(),
+        _ => exec::strerror(e),
+    };
+    let code = match e.raw_os_error() {
+        Some(ENOENT | ENOTDIR | ELOOP | ENAMETOOLONG) => 127,
+        _ => 126,
+    };
+    (word, code)
+}
+
+fn is_executable(m: &std::fs::Metadata) -> bool {
     use std::os::unix::fs::PermissionsExt;
-    p.metadata()
-        .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
-        .unwrap_or(false)
+    m.is_file() && m.permissions().mode() & 0o111 != 0
 }
 
 /// Parse and run a program with stdout and stderr captured to buffers — the
@@ -2111,7 +2195,89 @@ mod tests {
         assert_ne!(OpenKind::Read.errmsg(&e), OpenKind::Create.errmsg(&e));
     }
 
-    /// The verb follows the same split as the word, and the punctuation between
+    /// The two forks ash applies to an exec failure are DIFFERENT sets, and a
+    /// symlink loop is the case that shows it: the system's words, and 127.
+    #[test]
+    fn an_exec_failure_forks_its_word_and_its_status_separately() {
+        use super::{EACCES, ELOOP, ENAMETOOLONG, ENOENT, ENOTDIR};
+        let f = |n: i32| super::exec_failure(&std::io::Error::from_raw_os_error(n));
+        // `errmsg`'s pair: the caller's word, and 127.
+        for n in [ENOENT, ENOTDIR] {
+            assert_eq!(f(n), ("not found".to_owned(), 127), "{n}");
+        }
+        // 127 as well, but with the SYSTEM's word -- neither fork alone
+        // predicts these, which is why they are two matches and not one.
+        for n in [ELOOP, ENAMETOOLONG] {
+            let (word, code) = f(n);
+            assert_ne!(word, "not found", "{n}");
+            assert_eq!(code, 127, "{n}");
+        }
+        // Everything else: the system's word, and 126.
+        for n in [EACCES, 21] {
+            let (word, code) = f(n);
+            assert_eq!(word, exec::strerror(&std::io::Error::from_raw_os_error(n)));
+            assert_eq!(code, 126, "{n}");
+        }
+    }
+
+    /// A PATH walk carries ash's `e` plus one bit `e` cannot hold, and the two
+    /// callers read them differently -- which IS the seam rather than an
+    /// accident of this type's shape. Driven through the REAL `saw` over real
+    /// metadata, since every interesting input is a thing the kernel says.
+    #[test]
+    fn a_path_walk_answers_a_plain_command_and_exec_differently() {
+        use super::Unresolved;
+        let root = std::env::temp_dir().join(format!("td-sh-walk-{}", std::process::id()));
+        let adir = root.join("adir");
+        let _ = std::fs::create_dir_all(&adir);
+        let afile = root.join("afile");
+        let _ = std::fs::write(&afile, b"x");
+        let loop_ = root.join("loopy");
+        let _ = std::os::unix::fs::symlink("loopy", &loop_);
+        let gone = root.join("gone");
+        let under = afile.join("under"); // a path UNDER a file: ENOTDIR
+        let walk = |steps: &[&std::path::Path]| {
+            let mut u = Unresolved::new();
+            for step in steps {
+                u.saw(std::fs::metadata(step).as_ref());
+            }
+            u
+        };
+        // Nothing there at all: ash's initial ENOENT, and both callers agree.
+        // ENOENT and ENOTDIR are precisely the two ash refuses to record.
+        let none = walk(&[&gone, &under]);
+        assert_eq!(none.as_command(), ("not found".to_owned(), 127));
+        assert_eq!(none.as_exec(), ("not found".to_owned(), 127));
+        // A DIRECTORY is where the two callers part: no regular file, so ash's
+        // `find_command` failed and a plain command is 127 -- but `exec` never
+        // ran one, so it is the errno's own 126.
+        let dir = walk(&[&adir]);
+        assert_eq!(dir.as_command(), ("Permission denied".to_owned(), 127));
+        assert_eq!(dir.as_exec(), ("Permission denied".to_owned(), 126));
+        // An unrunnable regular file: the lookup SUCCEEDED, so both are 126.
+        let file = walk(&[&afile]);
+        assert_eq!(file.as_command(), ("Permission denied".to_owned(), 126));
+        assert_eq!(file.as_exec(), ("Permission denied".to_owned(), 126));
+        // A later errno REPLACES an earlier one, so the loop wins and takes
+        // 127 with it; in the other order the file's EACCES is what remains.
+        let then_loop = walk(&[&afile, &loop_]);
+        assert_eq!(then_loop.as_command().1, 127);
+        assert_ne!(then_loop.as_command().0, "not found");
+        assert_eq!(
+            walk(&[&loop_, &afile]).as_command(),
+            ("Permission denied".to_owned(), 126)
+        );
+        // A miss never erases what an earlier candidate established.
+        for miss in [&gone, &under] {
+            assert_eq!(
+                walk(&[&afile, miss]).as_command(),
+                ("Permission denied".to_owned(), 126)
+            );
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The verb follows the same split as the word    /// The verb follows the same split as the word, and the punctuation between
     /// the two is ash's rather than this module's usual `subject: reason`.
     #[test]
     fn a_failed_open_is_worded_the_way_ash_words_it() {

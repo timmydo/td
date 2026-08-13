@@ -1693,7 +1693,7 @@ fn dispatch_simple(
                     sh.set_var(&a.name, &value)?;
                     sh.export(&a.name);
                 }
-                process::exec_external(sh, argv, None)
+                process::exec_external(sh, argv, None, "")
             })();
             process::restore_redirs(sh, saved);
             r
@@ -2079,8 +2079,11 @@ pub fn redir_target(sh: &mut Shell, r: &Redir) -> R<String> {
 /// The errnos td-sh names itself, the failure being one it DECIDED rather than
 /// one a syscall reported. Linux numbering, as every other constant here is.
 pub const ENOENT: i32 = 2;
+pub const EACCES: i32 = 13;
 pub const EEXIST: i32 = 17;
 pub const ENOTDIR: i32 = 20;
+pub const ENAMETOOLONG: i32 = 36;
+pub const ELOOP: i32 = 40;
 
 /// What a shell prints for an errno: the system's own text, without the
 /// ` (os error N)` `io::Error`'s Display appends and no shell prints.
@@ -3160,9 +3163,111 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// The one errno on the command path that is NOT `resolve_program`'s: it
-    /// comes back from `Command::spawn`, so the pre-check this commit defers
-    /// does not cover it and it needs its own rendering.
+    /// The pairs are ash's, measured. A command that cannot be run reports
+    /// the system's reason, and a status that turns on WHICH of ash's two
+    /// functions failed rather than on the errno.
+    #[test]
+    fn a_command_that_cannot_be_run_says_why_and_answers_ashs_status() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("td-sh-execwhy-{}", std::process::id()));
+        let a = dir.join("a");
+        let _ = std::fs::create_dir_all(a.join("dirtool"));
+        let _ = std::fs::write(a.join("only"), b"data");
+        let _ = std::fs::set_permissions(a.join("only"), std::fs::Permissions::from_mode(0o644));
+        let _ = std::fs::write(a.join("tool"), b"x");
+        let _ = std::fs::set_permissions(a.join("tool"), std::fs::Permissions::from_mode(0o644));
+        let _ = std::os::unix::fs::symlink("loopy", dir.join("loopy"));
+        let d = dir.display();
+        let ad = a.display();
+        for (src, want, code) in [
+            // A slash name is handed to the kernel, so a DIRECTORY is EACCES.
+            (format!("{ad}"), "Permission denied", 126),
+            (format!("{d}/loopy"), "Too many levels of symbolic links", 127),
+            (format!("{d}/nope"), "not found", 127),
+            // A PATH walk: a regular file it cannot run is 126, a directory 127
+            // -- same message, and the status is the only tell.
+            (format!("PATH={ad}; only"), "Permission denied", 126),
+            (format!("PATH={ad}; dirtool"), "Permission denied", 127),
+            (format!("PATH={ad}; zzznope"), "not found", 127),
+            // A later entry that does not EXIST must not erase what an earlier
+            // one established -- ash only ever overwrites `e` with a more
+            // specific errno, never back to "nothing there".
+            (format!("PATH={ad}:{d}/no/such; only"), "Permission denied", 126),
+            (format!("PATH={d}/no/such:{ad}; only"), "Permission denied", 126),
+            (format!("PATH={ad}:{d}/no/such; dirtool"), "Permission denied", 127),
+        ] {
+            let (status, _o, err) = run(&src);
+            let name = src.rsplit(' ').next().unwrap_or(&src);
+            assert_eq!(err, format!("td-sh: {name}: {want}\n"), "src: {src}");
+            assert_eq!(status, code, "src: {src}");
+        }
+        // A walk that stat'd nothing runnable still carries WHY.
+        let lp = dir.join("lp");
+        let _ = std::fs::create_dir_all(&lp);
+        let _ = std::os::unix::fs::symlink("tool", lp.join("tool"));
+        let noread = dir.join("noread");
+        let _ = std::fs::create_dir_all(&noread);
+        let _ = std::fs::write(noread.join("tool"), b"x");
+        let _ = std::fs::set_permissions(&noread, std::fs::Permissions::from_mode(0o000));
+        let ddir = dir.join("dd");
+        let _ = std::fs::create_dir_all(ddir.join("tool"));
+        let dd = ddir.display();
+        let lpd = lp.display();
+        let nrd = noread.display();
+        for (src, want, code) in [
+            (format!("PATH={lpd}; tool"), "Too many levels of symbolic links", 127),
+            (format!("PATH={nrd}; tool"), "Permission denied", 127),
+            // A later errno REPLACES an earlier one, so the loop decides both
+            // the word and the status here -- 127, not the file's 126.
+            (format!("PATH={ad}:{lpd}; tool"), "Too many levels of symbolic links", 127),
+            // A regular file makes ash's lookup SUCCEED, and a later directory
+            // cannot un-succeed it: 126 in both orders.
+            (format!("PATH={ad}:{dd}; tool"), "Permission denied", 126),
+            (format!("PATH={dd}:{ad}; tool"), "Permission denied", 126),
+        ] {
+            let (status, _o, err) = run(&src);
+            assert_eq!(err, format!("td-sh: tool: {want}\n"), "src: {src}");
+            assert_eq!(status, code, "src: {src}");
+        }
+        // `exec` reads the SAME walk differently: it runs no lookup, so a
+        // directory is the errno's own 126 where a plain command is 127.
+        let (status, _o, err) = run(&format!("PATH={ad}; exec dirtool"));
+        assert_eq!(err, "td-sh: exec: dirtool: Permission denied\n");
+        assert_eq!(status, 126);
+        let (status, _o, _e) = run(&format!("PATH={ad}; exec zzznope"));
+        assert_eq!(status, 127);
+        // A shell that cannot BECOME the command runs it instead, and must
+        // still speak as `exec` -- a subshell, a stage, a substitution. The
+        // slash name is the one that reaches that path, since a PATH name
+        // fails the lookup before it.
+        let gone = dir.join("gone");
+        let g = gone.display();
+        for src in [
+            format!("(exec {g})"),
+            format!("exec {g} | true"),
+            format!("echo $(exec {g})"),
+        ] {
+            let (_s, _o, err) = run(&src);
+            assert_eq!(err, format!("td-sh: exec: {g}: not found\n"), "src: {src}");
+        }
+        let _ = std::fs::set_permissions(&noread, std::fs::Permissions::from_mode(0o755));
+        // And a non-executable match must still not shadow a real one later.
+        // The rows above pin that the walk keeps RECORDING past one; this pins
+        // that it would still SELECT a later program, which needs one to run.
+        if std::path::Path::new("/bin/sh").exists() {
+            let b = dir.join("b");
+            let _ = std::fs::create_dir_all(&b);
+            let _ = std::fs::write(b.join("only"), b"#!/bin/sh\necho REAL\n");
+            let _ =
+                std::fs::set_permissions(b.join("only"), std::fs::Permissions::from_mode(0o755));
+            let (status, out, err) = run(&format!("PATH={ad}:{}; only", b.display()));
+            assert_eq!((status, out.as_str()), (0, "REAL\n"), "err: {err}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The errno a lookup never sees: it comes back from `Command::spawn`
+    /// after `resolve_program` has already answered.
     #[test]
     fn a_command_that_cannot_be_spawned_gives_the_systems_reason() {
         use std::os::unix::fs::PermissionsExt;

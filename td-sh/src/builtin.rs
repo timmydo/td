@@ -3655,7 +3655,7 @@ fn command(sh: &mut Shell, argv: &[String]) -> R<()> {
         sh.locals = saved;
         return result;
     }
-    crate::process::exec_external(sh, &rest, path)
+    crate::process::exec_external(sh, &rest, path, "")
 }
 
 // ---- test / [ ------------------------------------------------------------
