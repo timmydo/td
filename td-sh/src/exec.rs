@@ -3073,6 +3073,85 @@ mod tests {
     }
 
     #[test]
+    fn the_whole_redirect_list_is_settled_before_anything_opens() {
+        // ash's `expredir` walks the WHOLE list and only then lets `redirect`
+        // open anything (ash.c:9621 vs 5831), so a target that cannot be
+        // classified stops the command before an EARLIER redirection has
+        // truncated its file or moved the descriptor the diagnostic goes to.
+        // All three assertions below are one fact seen from three sides.
+        let dir = std::env::temp_dir().join(format!("td-sh-twophase-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let Ok(()) = std::fs::create_dir_all(&dir) else {
+            panic!("fixture dir");
+        };
+        let victim = dir.join("victim");
+        let keep = || {
+            let Ok(()) = std::fs::write(&victim, b"KEEP") else {
+                panic!("fixture");
+            };
+        };
+        let v = victim.display();
+        // The file of an earlier redirection is not truncated.
+        keep();
+        let (status, _o, _e) = run(&format!(": >'{v}' 2>&/nope/x"));
+        assert_eq!(status, 2);
+        let left = std::fs::read_to_string(&victim).unwrap_or_default();
+        assert_eq!(left, "KEEP");
+        // The OTHER fatal spelling takes the same phase. `bad fd number` is
+        // pinned elsewhere for its status, but every case there is its
+        // command's only redirection, so none of them can tell which phase
+        // raised it -- and deferring just this one to phase 2 leaves the whole
+        // suite green while `victim` starts being truncated.
+        keep();
+        let (status, _o, _e) = run(&format!(": >'{v}' 4>&99999999999"));
+        assert_eq!(status, 2);
+        let left = std::fs::read_to_string(&victim).unwrap_or_default();
+        assert_eq!(left, "KEEP");
+        // The diagnostic does not go through a redirection the same command
+        // applied: with stderr duped onto stdout it must NOT reach stdout, and
+        // with stderr sent to /dev/null it must still be reported.
+        let (status, out, _e) = run("echo one 2>&1 3>&/nope/x");
+        assert_eq!((status, out.as_str()), (2, ""));
+        let (status, _o, err) = run("echo one 2>/dev/null 3>&/nope/x");
+        assert_eq!(status, 2);
+        assert!(err.contains("ambiguous redirect"), "err: {err:?}");
+        // What must NOT move: a failed DUP and a failed OPEN are `redirect`-time
+        // in ash, so they happen after the earlier redirection has taken and the
+        // file really is truncated. Measured against busybox 1.37.0 ash, which
+        // empties `victim` in both.
+        for tail in ["2>&7", "2</nope/x"] {
+            keep();
+            let (status, _o, _e) = run(&format!(": >'{v}' {tail}"));
+            assert_eq!(status, 1, "tail: {tail}");
+            let left = std::fs::read_to_string(&victim).unwrap_or_default();
+            assert_eq!(left, "", "tail: {tail}");
+        }
+        // A here-document body is the one thing `expredir` does NOT hoist -- it
+        // has no `NHERE` arm, so the body expands at `openhere` time, among the
+        // opens. `>victim` therefore truncates BEFORE the body reads it, and the
+        // substitution inside it sees an empty file rather than `KEEP`. Builtins
+        // only, since the unit harness has no external commands.
+        keep();
+        let (_s, out, _e) = run(&format!(
+            "read got >'{v}' <<EOF\n$(read a <'{v}'; echo \"$a\")\nEOF\necho \"got=[$got]\""
+        ));
+        assert_eq!(out, "got=[]\n");
+        // And it expands ONCE. Phase 1 leaving the body alone is what makes that
+        // true: expanding it there as well would run a substitution inside it
+        // twice, which nothing above would show, since phase 2's second answer is
+        // the one installed.
+        let tick = dir.join("tick");
+        let (_s, out, _e) = run(&format!(
+            "read got <<EOF\n$(echo mark >>'{}'; echo body)\nEOF\necho \"got=[$got]\"",
+            tick.display()
+        ));
+        assert_eq!(out, "got=[body]\n");
+        let marks = std::fs::read_to_string(&tick).unwrap_or_default();
+        assert_eq!(marks, "mark\n");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn a_descriptor_duped_onto_itself_is_left_alone() {
         // `n>&n` is skipped rather than performed, so it neither fails on a closed
         // descriptor nor disturbs an open one. Serving it as a dup breaks the
@@ -3130,7 +3209,7 @@ mod tests {
         let both = "sh_o() { echo O; echo E >&2; }; ";
         let back = |f: &str| format!("while read l; do echo got=$l; done <'{d}/{f}'");
         // The gate is the DESTINATION descriptor, not the direction: `1<&f` does
-        // exactly what `1>&f` does, which is why this lives in `dup_target` and
+        // exactly what `1>&f` does, which is why this lives in `classify_dup` and
         // not in the `>&` arm. Measured on busybox 1.37.0 ash.
         for (n, op) in [("a", ">&"), ("b", "1>&"), ("c", "1<&")] {
             let (_s, out, _e) = run(&format!("{both}sh_o {op}'{d}/{n}'; {}", back(n)));
@@ -3404,7 +3483,7 @@ mod tests {
         // testing them together.
         //
         // On fd 2, where a non-descriptor target stays ambiguous rather than
-        // naming a file -- fd 1 is `dup_target`'s `BASH_REDIR_OUTPUT` case.
+        // naming a file -- fd 1 is `classify_dup`'s `BASH_REDIR_OUTPUT` case.
         let (status, out, err) = run("echo one 2>&/nope/x; echo survived");
         assert_eq!((status, out.as_str()), (2, ""));
         assert!(err.contains("ambiguous redirect"), "err: {err:?}");
@@ -3420,22 +3499,75 @@ mod tests {
         let units = ["echo one 2>&/nope/x", "echo NEXT"];
         let (_s, out, _e) = crate::process::run_capturing_interactive_units(&units);
         assert_eq!(out, "NEXT\n");
-        // The EARLIER redirections of the same command are rolled back before the
-        // abort unwinds, which only became observable when this arm stopped being
-        // recoverable: an interactive shell survives the abort, so a descriptor
-        // left installed is one every LATER line writes down. Here the `2>f` must
-        // not still be in force when the next unit writes to stderr.
-        let dir = std::env::temp_dir().join(format!("td-sh-fatalback-{}", std::process::id()));
+    }
+
+    #[test]
+    fn a_failed_redirection_rolls_back_the_ones_before_it() {
+        // Both arms of `apply_redirs`: a redirection that fails leaves the fd
+        // table exactly as it found it, or the command's EARLIER redirections
+        // outlive the command. Each case checks the log was really written to
+        // (the first diagnostic lands in it, since `2>log` had already taken)
+        // before checking the later marker is absent -- otherwise a `log` that
+        // was never created passes both halves saying nothing.
+        let dir = std::env::temp_dir().join(format!("td-sh-rollback-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let Ok(()) = std::fs::create_dir_all(&dir) else {
             panic!("fixture dir");
         };
-        let first = format!("echo A 2>'{}/log' 4>&/nope/x", dir.display());
+        let log = dir.join("log");
+        let read_log = || std::fs::read_to_string(&log).unwrap_or_default();
+        // RECOVERABLE: a dup of a descriptor that is not open. The shell carries
+        // on, so a leaked fd 2 shows up on the very next command.
+        let (_s, _o, err) = run(&format!(
+            "echo one 2>'{}' 3>&7; echo AFTER >&2",
+            log.display()
+        ));
+        assert!(err.contains("AFTER"), "err: {err:?}");
+        let logged = read_log();
+        assert!(logged.contains("bad file descriptor"), "logged: {logged:?}");
+        assert!(!logged.contains("AFTER"), "logged: {logged:?}");
+        // FATAL: a here-document body, which is the only fatal error phase 2
+        // still raises -- a bad target word is settled before the `2>log` beside
+        // it opens, so using one would make this case vacuous. Interactive,
+        // since only there does the shell survive an abort to show the leak.
+        let _ = std::fs::remove_file(&log);
+        let first = format!("cat 2>'{}' <<EOF\n${{nope:?}}\nEOF\n", log.display());
         let units = [first.as_str(), "echo LEAKTEST >&2"];
         let (_s, _o, err) = crate::process::run_capturing_interactive_units(&units);
         assert!(err.contains("LEAKTEST"), "err: {err:?}");
-        let logged = std::fs::read_to_string(dir.join("log")).unwrap_or_default();
+        let logged = read_log();
+        assert!(logged.contains("nope"), "logged: {logged:?}");
         assert!(!logged.contains("LEAKTEST"), "logged: {logged:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn each_file_operator_opens_the_way_it_says() {
+        // `>>` must not truncate and `<>` must not either; both were moved
+        // verbatim into `Plan` arms, where a stray `truncate(true)` reads like
+        // its neighbours and destroys the file instead of extending it.
+        let dir = std::env::temp_dir().join(format!("td-sh-openmode-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let Ok(()) = std::fs::create_dir_all(&dir) else {
+            panic!("fixture dir");
+        };
+        let f = dir.join("f");
+        let d = f.display();
+        let (_s, out, _e) = run(&format!(
+            "echo A >'{d}'; echo B >>'{d}'; while read l; do echo got=$l; done <'{d}'"
+        ));
+        assert_eq!(out, "got=A\ngot=B\n");
+        // `<>` opens for read AND write without truncating, so what was there
+        // survives a command that writes nothing.
+        let (_s, out, _e) = run(&format!(
+            "echo A >'{d}'; : <>'{d}'; while read l; do echo got=$l; done <'{d}'"
+        ));
+        assert_eq!(out, "got=A\n");
+        // And `>` still truncates, which is what the other two are NOT.
+        let (_s, out, _e) = run(&format!(
+            "echo A >'{d}'; : >'{d}'; while read l; do echo got=$l; done <'{d}'"
+        ));
+        assert_eq!(out, "");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

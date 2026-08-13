@@ -29,7 +29,7 @@ use std::os::unix::process::ExitStatusExt;
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 
-use crate::ast::{AndOr, Cmd, List, Redir, RedirKind, Sep, Stage};
+use crate::ast::{AndOr, Cmd, List, Redir, RedirKind, Sep, Stage, Word};
 use crate::exec::{self, Shell, Sig, R};
 
 /// One entry in the shell's descriptor table. Everything shareable is behind an
@@ -341,7 +341,7 @@ const FATAL_REDIR_ERROR: i32 = 2;
 const ENOENT: i32 = 2;
 
 /// The two descriptors `>&word` writes, named because the rule turns on WHICH
-/// one is redirected rather than on the direction. See `dup_target`.
+/// one is redirected rather than on the direction. See `classify_dup`.
 const STDOUT: u32 = 1;
 const STDERR: u32 = 2;
 
@@ -371,13 +371,18 @@ pub enum RedirOutcome {
 /// Apply a command's redirections to the descriptor table, returning what to
 /// restore. Order matters: `2>&1 1>file` differs from `1>file 2>&1`.
 pub fn apply_redirs(sh: &mut Shell, redirs: &[Redir]) -> R<RedirOutcome> {
+    // Phase 1 for the WHOLE list before phase 2 opens anything, which is what
+    // makes `: >victim 2>&/nope/x` leave `victim` alone and what puts the
+    // diagnostic on the stderr the command started with. Nothing is saved yet, so
+    // a fatal error needs no rollback.
+    let plans = plan_redirs(sh, redirs)?;
     let mut saved = Saved {
         entries: Vec::with_capacity(redirs.len()),
     };
-    for r in redirs {
-        let fd = default_fd(r);
+    for (fd, plan) in &plans {
+        let fd = *fd;
         let prev = sh.fds.map.get(&fd).cloned();
-        match open_redir(sh, r) {
+        match open_planned(sh, plan) {
             Ok(Ok(Opened::To(target))) => {
                 sh.fds.set(fd, target);
                 saved.entries.push((fd, prev));
@@ -388,7 +393,7 @@ pub fn apply_redirs(sh: &mut Shell, redirs: &[Redir]) -> R<RedirOutcome> {
             // offset and interleave rather than overwrite. Saved as two entries so
             // `restore_redirs` puts both back, in reverse, exactly as two separate
             // redirections would. Both descriptors are NAMED rather than taken
-            // from `fd` — `dup_target` returns this only for `STDOUT`, and naming
+            // from `fd` — `classify_dup` decides it only for `STDOUT`, and naming
             // them is what keeps the arm meaning one thing if that ever changes,
             // where using `fd` would silently pair some other descriptor with
             // stderr.
@@ -408,9 +413,11 @@ pub fn apply_redirs(sh: &mut Shell, redirs: &[Redir]) -> R<RedirOutcome> {
                 return Ok(RedirOutcome::Failed);
             }
             Err(sig) => {
-                // A fatal expansion error in a later target word (`>${x:?}`) still
-                // rolls back the redirections already applied so the fd table is not
-                // left corrupted before the error unwinds.
+                // Since phase 1 settles the target words, the only fatal error left
+                // here is a HERE-DOCUMENT body's (`<<EOF` containing `${x:?}`),
+                // which ash also leaves at `openhere` time. It still rolls back the
+                // redirections already applied so the fd table is not left
+                // corrupted before the error unwinds.
                 restore_redirs(sh, saved);
                 return Err(sig);
             }
@@ -450,62 +457,120 @@ enum Opened {
     /// usually closed and duping a closed descriptor is an error.
     Unchanged,
     /// `>&word`: the target is a FILE, and BOTH stdout and stderr go to it. See
-    /// `dup_target` for whose rule that is and which descriptors it holds for.
+    /// `classify_dup` for whose rule that is and which descriptors it holds for.
     ToBoth(Fd),
 }
 
-/// Open one redirection's target descriptor. An error in *expanding* the target
-/// word (`>${x:?}`, `set -u`) is fatal and propagates as `Err(Sig)`. A failure to
-/// open/dup the resulting target is recoverable: the message is printed and
-/// `Ok(Err(()))` is returned so `apply_redirs` can turn it into a skipped command.
-fn open_redir(sh: &mut Shell, r: &Redir) -> R<Result<Opened, ()>> {
-    match &r.kind {
-        RedirKind::Here(body) => {
+/// One redirection with everything decided that can be decided before any
+/// descriptor moves — ash's `expredir` product (ash.c:9621), which settles the
+/// WHOLE list and only then lets `redirect` open anything.
+///
+/// A here-document is deliberately not part of it: `expredir`'s switch has no
+/// `NHERE`/`NXHERE` arm, so the body expands at `openhere` time and keeps its
+/// place among the opens.
+enum Plan<'a> {
+    Here(&'a Word),
+    Read(String),
+    /// `>`, which `set -C` protects -- as it does `BothFile`, the other kind
+    /// that truncates.
+    Write(String),
+    /// `>|`, the spelling that overrides it.
+    Clobber(String),
+    Append(String),
+    ReadWrite(String),
+    /// `>&-`
+    Close,
+    /// `n>&n`
+    Same,
+    /// `>&n`. Whether `n` is OPEN is not asked here: a failed dup is
+    /// `redirect`-time in ash, which is why `: >victim 2>&7` truncates there too.
+    From(u32),
+    /// `>&word` on fd 1: the target is a FILE and both streams go to it.
+    BothFile(String),
+}
+
+/// Phase 1. Expands every target that HAS one exactly once, in list order, and
+/// classifies the dup ones — so a fatal error is raised before the first open
+/// rather than after some of them, and its diagnostic goes to the stderr the
+/// command started with rather than through a redirection the same command
+/// already applied. Each plan carries the descriptor it is for, so phase 2 pairs
+/// them structurally rather than by position.
+fn plan_redirs<'a>(sh: &mut Shell, redirs: &'a [Redir]) -> R<Vec<(u32, Plan<'a>)>> {
+    let mut plans = Vec::with_capacity(redirs.len());
+    for r in redirs {
+        let dest = default_fd(r);
+        let plan = match &r.kind {
+            RedirKind::Here(body) => Plan::Here(body),
+            RedirKind::DupIn | RedirKind::DupOut => {
+                let target = exec::redir_target(sh, r)?;
+                // `>&-` closes only spelled BARE. ash tests the lone dash in the
+                // PARSER, on the unexpanded word (`LONE_DASH`, ash.c:12012), and
+                // a word needing expansion never reaches that test -- so `>&'-'`
+                // and `>&$dash` are ordinary non-digit targets, a file on fd 1
+                // and an error anywhere else. `plain` is that same "one unquoted
+                // literal".
+                let closes = r.word.plain() == Some("-");
+                classify_dup(sh, dest, target, closes)?
+            }
+            RedirKind::In => Plan::Read(exec::redir_target(sh, r)?),
+            RedirKind::Out => Plan::Write(exec::redir_target(sh, r)?),
+            RedirKind::Clobber => Plan::Clobber(exec::redir_target(sh, r)?),
+            RedirKind::Append => Plan::Append(exec::redir_target(sh, r)?),
+            RedirKind::ReadWrite => Plan::ReadWrite(exec::redir_target(sh, r)?),
+        };
+        plans.push((dest, plan));
+    }
+    Ok(plans)
+}
+
+/// Phase 2. Opens what phase 1 decided. A failure here is recoverable: the
+/// message is printed and `Ok(Err(()))` is returned so `apply_redirs` can turn it
+/// into a skipped command.
+fn open_planned(sh: &mut Shell, plan: &Plan) -> R<Result<Opened, ()>> {
+    match plan {
+        Plan::Here(body) => {
             let text = exec::here_body(sh, body)?;
             Ok(Ok(Opened::To(Fd::ReadBuf(Arc::new(Mutex::new(
                 Cursor::new(text.into_bytes()),
             ))))))
         }
-        RedirKind::DupIn | RedirKind::DupOut => {
-            let target = exec::redir_target(sh, r)?;
-            // `>&-` closes only spelled BARE. ash tests the lone dash in the
-            // PARSER, on the unexpanded word (`LONE_DASH`, ash.c:12012), and a
-            // word needing expansion never reaches that test -- so `>&'-'` and
-            // `>&$dash` are ordinary non-digit targets, a file on fd 1 and an
-            // error anywhere else. `plain` is that same "one unquoted literal".
-            let closes = r.word.plain() == Some("-");
-            dup_target(sh, default_fd(r), &target, closes)
-        }
-        // Each of the four file kinds expands its target exactly ONCE and hands
-        // the text on. `set -C` used to expand for its own check and leave
-        // `open_file` to expand again, so a command substitution in the target ran
-        // twice -- `set -C; echo hi > "$(date >&2; echo f)"` logged two dates.
-        RedirKind::In => {
-            let name = exec::redir_target(sh, r)?;
-            Ok(open_file(sh, &name, OpenOptions::new().read(true)))
-        }
-        RedirKind::Out | RedirKind::Clobber => {
-            let name = exec::redir_target(sh, r)?;
-            if matches!(r.kind, RedirKind::Out) && sh.opts.noclobber {
-                return Ok(noclobber_open(sh, &name));
-            }
-            let mut opts = OpenOptions::new();
-            opts.write(true).create(true).truncate(true);
-            Ok(open_file(sh, &name, &opts))
-        }
-        RedirKind::Append => {
-            let name = exec::redir_target(sh, r)?;
+        Plan::Read(name) => Ok(open_file(sh, name, OpenOptions::new().read(true))),
+        Plan::Write(name) => Ok(truncating_open(sh, name, sh.opts.noclobber)),
+        Plan::Clobber(name) => Ok(truncating_open(sh, name, false)),
+        Plan::Append(name) => {
             let mut opts = OpenOptions::new();
             opts.write(true).create(true).append(true);
-            Ok(open_file(sh, &name, &opts))
+            Ok(open_file(sh, name, &opts))
         }
-        RedirKind::ReadWrite => {
-            let name = exec::redir_target(sh, r)?;
+        Plan::ReadWrite(name) => {
             let mut opts = OpenOptions::new();
             opts.read(true).write(true).create(true);
-            Ok(open_file(sh, &name, &opts))
+            Ok(open_file(sh, name, &opts))
         }
+        Plan::Close => Ok(Ok(Opened::To(Fd::Closed))),
+        Plan::Same => Ok(Ok(Opened::Unchanged)),
+        Plan::From(n) => match sh.fds.get(*n) {
+            Some(fd) => Ok(Ok(Opened::To(fd.clone()))),
+            None => {
+                let _ = exec::write_stderr(sh, &format!("{n}: bad file descriptor"));
+                Ok(Err(()))
+            }
+        },
+        Plan::BothFile(name) => Ok(truncating_open(sh, name, sh.opts.noclobber).map(to_both)),
     }
+}
+
+/// The one open that TRUNCATES, which three plans want and only `>|` wants
+/// unguarded. Written once so `set -C` is an argument rather than an `if` each
+/// of them has to remember: `>` and the `>&word` that writes both streams pass
+/// the option, `>|` passes false because overriding it is what that spelling is.
+fn truncating_open(sh: &mut Shell, name: &str, guarded: bool) -> Result<Opened, ()> {
+    if guarded {
+        return noclobber_open(sh, name);
+    }
+    let mut opts = OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    open_file(sh, name, &opts)
 }
 
 /// The refusal `set -C` exists for, worded once because two arms report it.
@@ -553,14 +618,11 @@ fn to_both(opened: Opened) -> Opened {
 
 /// `>&2`, `<&0`, `>&-` (close), for the redirection whose own descriptor is
 /// `dest`. A numeric target dups that descriptor; a BARE `-` closes, which is
-/// `closes` -- the caller decides it from the unexpanded word.
-/// Returns `Ok(Err(()))` (message already printed) for the one recoverable
-/// failure, a descriptor target that is not open, and `Err(Sig::Abort)` for the
-/// two that ash raises from `expredir`: digits that cannot be a descriptor, and
-/// a non-digit target anywhere but fd 1.
-fn dup_target(sh: &mut Shell, dest: u32, target: &str, closes: bool) -> R<Result<Opened, ()>> {
+/// `closes` -- the caller decides it from the unexpanded word. Both fatal
+/// spellings are raised HERE, in phase 1, which is where ash raises them.
+fn classify_dup(sh: &mut Shell, dest: u32, target: String, closes: bool) -> R<Plan<'static>> {
     if closes {
-        return Ok(Ok(Opened::To(Fd::Closed)));
+        return Ok(Plan::Close);
     }
     // ash classifies on ALL-DIGITS FIRST (`isdigit_str`, ash.c:560) and only then
     // asks what the digits mean, so a digit string is a descriptor spelling
@@ -574,16 +636,7 @@ fn dup_target(sh: &mut Shell, dest: u32, target: &str, closes: bool) -> R<Result
             let _ = exec::write_stderr(sh, "syntax error: bad fd number");
             return Err(Sig::Abort(BAD_FD_NUMBER));
         };
-        if n == dest {
-            return Ok(Ok(Opened::Unchanged));
-        }
-        return match sh.fds.get(n) {
-            Some(fd) => Ok(Ok(Opened::To(fd.clone()))),
-            None => {
-                let _ = exec::write_stderr(sh, &format!("{n}: bad file descriptor"));
-                Ok(Err(()))
-            }
-        };
+        return Ok(if n == dest { Plan::Same } else { Plan::From(n) });
     }
     // Not a descriptor. On fd 1 that is not an error but busybox ash's
     // `BASH_REDIR_OUTPUT`, which td's defconfig enables for the same reason
@@ -591,17 +644,12 @@ fn dup_target(sh: &mut Shell, dest: u32, target: &str, closes: bool) -> R<Result
     // are pointed at it -- bash's `&>` under another spelling. The gate is
     // the DESTINATION and not the direction, measured: `1<&f` does exactly
     // what `1>&f` does, while `0<&f`, `<&f` and `2>&f` are all errors.
+    //
+    // It truncates, so `set -C` guards it as it guards `>` -- in `open_planned`,
+    // since that is an open. There is no `>|` spelling of this operator to
+    // override with, so the check there is unconditional.
     if dest == STDOUT {
-        // It truncates, so `set -C` guards it as it guards `>`. There is no
-        // `>|` spelling of this operator to override with, so the check is
-        // unconditional -- and without it the one redirection that writes
-        // TWO streams was the one that ignored noclobber.
-        if sh.opts.noclobber {
-            return Ok(noclobber_open(sh, target).map(to_both));
-        }
-        let mut opts = OpenOptions::new();
-        opts.write(true).create(true).truncate(true);
-        return Ok(open_file(sh, target, &opts).map(to_both));
+        return Ok(Plan::BothFile(target));
     }
     // Not a descriptor and not on fd 1, so there is nothing it can name: ash
     // raises this from `expredir`, before `redirectsafe` and before any
