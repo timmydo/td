@@ -1065,8 +1065,9 @@ pub(crate) fn run_and_or(sh: &mut Shell, and_or: &AndOr) -> R<()> {
 /// that is not the structurally-last, and any `!`-negated pipeline. The exemption
 /// must cover the WHOLE (possibly compound/function) operand — a failing command
 /// nested inside an exempt operand must not exit the shell — so it is a
-/// suppression scope, not a post-hoc check. Only the final, non-negated operand,
-/// once run, is subject to `errexit`.
+/// suppression scope, not a post-hoc check. The final, non-negated operand is
+/// then subject to `errexit` only where its node is one ash tests: see
+/// `checks_errexit`.
 fn run_operand(sh: &mut Shell, pipe: &Pipeline, is_last: bool) -> R<()> {
     let exempt = !is_last || pipe.bang;
     if exempt {
@@ -1077,10 +1078,56 @@ fn run_operand(sh: &mut Shell, pipe: &Pipeline, is_last: bool) -> R<()> {
         sh.errexit_suppressed = sh.errexit_suppressed.saturating_sub(1);
     }
     result?;
-    if !exempt {
+    if !exempt && checks_errexit(pipe) {
         maybe_errexit(sh)?;
     }
     Ok(())
+}
+
+/// Whether this node's own status is tested against `errexit` -- ash's
+/// `checkexit`, which `evaltree` reaches from `NCMD`, `NPIPE` and
+/// `NSUBSHELL`/`NBACKGND` and from nowhere else. Every compound leaves it 0 and
+/// so never exits the shell on its own status: `NIF`, `NFOR`, `NWHILE`, `NCASE`,
+/// the `NREDIR` that wraps a compound carrying redirections, `NNOT` and `NDEFUN`.
+///
+/// That looks like it would defeat `set -e` inside every compound and does not,
+/// because a body's own commands are checked as they run: `if :; then false; fi`
+/// exits at the `false`, and the `if` never gets to report anything. It decides
+/// only the case where a body ends in a command that was NOT checked -- a
+/// compound's failed redirection, an `!`, or a non-final `&&`/`||` operand --
+/// and there the enclosing compound must not re-test a status the rule has
+/// already passed over.
+///
+/// A subshell is the exception among compounds and it is the PARSER's doing:
+/// `parse_command` wraps a redirected compound in an `NREDIR` unless it is
+/// already an `NSUBSHELL`, whose redirections stay on the node itself -- so
+/// `{ :; } <missing` is exempt and `( : ) <missing` exits. `NBACKGND` is checked
+/// too but never arrives here: `run_list` dispatches `&` to `jobs::spawn`.
+///
+/// `NNOT` is `run_operand`'s to answer, along with every non-final `&&`/`||`
+/// operand, before it asks. The match below is deliberately exhaustive: a new
+/// `Cmd` variant is a compile error until someone says which side it falls on.
+fn checks_errexit(pipe: &Pipeline) -> bool {
+    // Two or more stages is `NPIPE` whatever they are. Zero is unparseable --
+    // `parse_pipeline` seeds `cmds` with one stage -- and would report 0, which
+    // `maybe_errexit` passes over anyway.
+    let [stage] = pipe.cmds.as_slice() else {
+        return true;
+    };
+    match &stage.cmd {
+        Cmd::Simple { .. } | Cmd::Subshell { .. } => true,
+        // busybox ash parses `[[` into an ordinary command word list and serves
+        // it from the `test` builtin, so it is an `NCMD` like any other.
+        Cmd::Cond { .. } => true,
+        Cmd::Group { .. }
+        | Cmd::If { .. }
+        | Cmd::For { .. }
+        | Cmd::Loop { .. }
+        | Cmd::Case { .. } => false,
+        // `NDEFUN`, which reports 0 always -- so this answer is unobservable and
+        // is ash's only for being ash's.
+        Cmd::FuncDef { .. } => false,
+    }
 }
 
 fn maybe_errexit(sh: &mut Shell) -> R<()> {
@@ -1994,6 +2041,8 @@ where
     let saved = match process::apply_redirs(sh, redirs)? {
         process::RedirOutcome::Applied(s) => s,
         // A failed redirection skips the compound command; `$?` is already 1.
+        // Whether that trips `set -e` is not decided here but by the NODE the
+        // status is reported from -- see `checks_errexit`.
         process::RedirOutcome::Failed => return Ok(()),
     };
     let result = body(sh);
@@ -2582,6 +2631,95 @@ mod tests {
         let (status, out, _) = run("set -e; false; echo unreached");
         assert_eq!(out, "");
         assert_eq!(status, 1);
+    }
+
+    #[test]
+    fn a_compound_redirection_failure_is_exempt_from_errexit() {
+        // ash wraps a compound carrying redirections in an `NREDIR`, which leaves
+        // `checkexit` at 0, so the 1 it reports is never tested against `set -e`.
+        for src in [
+            "{ :; } </no/such/td-e",
+            "while :; do break; done </no/such/td-e",
+            "for x in a; do :; done </no/such/td-e",
+            "if :; then :; fi </no/such/td-e",
+            "case x in x) :;; esac </no/such/td-e",
+        ] {
+            let (status, out, _) = run(&format!("set -e; {src}; echo st=$?; echo alive"));
+            assert_eq!((status, out.as_str()), (0, "st=1\nalive\n"), "src: {src}");
+        }
+        // The contrast that makes it a rule about the NODE rather than about
+        // redirections: each reports the same 1 from a node ash checks, and so
+        // exits. The function call and `[[ ]]` are `NCMD`s, the latter because
+        // busybox ash serves `[[` from `test`; the last two are the exemption
+        // losing to the `NPIPE` around it, which is checked whatever its stages
+        // are. `true` rather than `:` deliberately: POSIX makes a failed
+        // redirection on a SPECIAL builtin fatal outright, so `:` would leave
+        // here whether or not `errexit` looked at it.
+        for src in [
+            "true </no/such/td-e",
+            "[[ x = x ]] </no/such/td-e",
+            "f() { { :; } </no/such/td-e; }; f",
+            "true | false",
+            "true | { :; } </no/such/td-e",
+        ] {
+            let (status, out, _) = run(&format!("set -e; {src}; echo unreached"));
+            assert_eq!((status, out.as_str()), (1, ""), "src: {src}");
+        }
+        // The subshell is the one a reader expects to see above: ash's parser
+        // leaves its redirections on the `NSUBSHELL` rather than wrapping it, so
+        // it is checked. Loose on the status ON PURPOSE, and not to be tightened
+        // to 1: ash reports 2 here, which is a divergence of its own.
+        let (status, out, _) = run("set -e; ( : ) </no/such/td-e; echo unreached");
+        assert_ne!(status, 0);
+        assert_eq!(out, "");
+    }
+
+    #[test]
+    fn the_exemption_survives_an_enclosing_compound() {
+        // The exemption belongs to every node on the way out, not to the innermost
+        // one: an enclosing compound reports the very same status, and re-testing
+        // it there would exit the shell for a failure the rule just passed over.
+        for src in [
+            "{ { :; } </no/such/td-e; }",
+            "if :; then { :; } </no/such/td-e; fi",
+            "for x in a; do { :; } </no/such/td-e; done",
+            "case x in x) { :; } </no/such/td-e ;; esac",
+            "{ if :; then { :; } </no/such/td-e; fi; }",
+        ] {
+            let (status, out, _) = run(&format!("set -e; {src}; echo st=$?; echo alive"));
+            assert_eq!((status, out.as_str()), (0, "st=1\nalive\n"), "src: {src}");
+        }
+    }
+
+    #[test]
+    fn a_compound_does_not_retest_a_status_errexit_passed_over() {
+        // The same rule reached through the OTHER two nodes that report a nonzero
+        // status nothing checked -- `!` (`NNOT`) and a non-final `&&`/`||` operand
+        // -- which is what makes it the node's property rather than a redirection's.
+        for src in [
+            "if :; then ! true; fi",
+            "for x in a; do ! true; done",
+            "{ false && true; }",
+            "if :; then false && true; fi",
+        ] {
+            let (status, out, _) = run(&format!("set -e; {src}; echo st=$?; echo alive"));
+            assert_eq!((status, out.as_str()), (0, "st=1\nalive\n"), "src: {src}");
+        }
+    }
+
+    #[test]
+    fn the_redirection_exemption_does_not_reach_the_next_command() {
+        // The exemption is the node's, so the next command is judged on its own:
+        // were it a property of the shell instead, `set -e` would silently stop
+        // working for the rest of the script.
+        let (status, out, _) = run("set -e; { :; } </no/such/td-e; false; echo unreached");
+        assert_eq!((status, out.as_str()), (1, ""));
+        // `|| false` and not `|| true; false`: the exempt compound's own operand
+        // is the one that must not carry anything forward, and only this shape
+        // asks it. With a command in between, that operand takes the exemption
+        // and the assertion holds whether or not the next one would have.
+        let (status, out, _) = run("set -e; { :; } </no/such/td-e || false; echo unreached");
+        assert_eq!((status, out.as_str()), (1, ""));
     }
 
     #[test]

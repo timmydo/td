@@ -719,11 +719,7 @@ xfail errexit-osh.test.sh::local: middle command fails and keeps going
 xfail errexit-osh.test.sh::strict_errexit prevents errexit from being disabled in function
 xfail errexit.test.sh::More && ||
 xfail errexit.test.sh::bash atoms [[ (( - redir failure checked
-xfail errexit.test.sh::brace group - redir failure checked
-xfail errexit.test.sh::errexit and brace group { }
 xfail errexit.test.sh::errexit and time { }
-xfail errexit.test.sh::simple command that's an alias - redir failure checked
-xfail errexit.test.sh::while loop - redirect failure checked
 xfail exit-status.test.sh::Truncating 'return' status
 xfail exit-status.test.sh::func subshell OverflowError https://github.com/oilshell/oil/issues/996
 xfail exit-status.test.sh::subshell OverflowError https://github.com/oilshell/oil/issues/996

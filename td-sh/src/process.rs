@@ -737,7 +737,10 @@ pub fn run_subshell(sh: &mut Shell, body: &List, redirs: &[Redir]) -> R<()> {
             // break/continue/return that escape a subshell are confined to it.
             Err(_) => child.status,
         },
-        // A failed redirection skips the subshell body; `$?` is already 1.
+        // A failed redirection skips the subshell body; `$?` is already 1. Unlike
+        // a brace group's, it DOES trip `set -e`: ash's parser leaves a subshell's
+        // redirections on the `NSUBSHELL` node instead of wrapping it in an
+        // `NREDIR`, and `NSUBSHELL` is one of the three that reach `checkexit`.
         Ok(RedirOutcome::Failed) => child.status,
         // A fatal expansion error in a target word (`>${x:?}`) exits the SUBSHELL,
         // not the parent — confine it here rather than propagating.
