@@ -231,7 +231,7 @@ impl Runtime {
     #[cfg(test)]
     pub fn commit(&mut self, key: SurfaceKey, surface: Surface) -> Result<(), String> {
         let layout_changed = self.scene.commit(key, surface)?;
-        self.finish_commit(layout_changed)
+        self.settle(layout_changed)
     }
 
     pub fn commit_with_input_region(
@@ -242,16 +242,32 @@ impl Runtime {
     ) -> Result<(), String> {
         let layout_changed = self.scene.commit(key, surface)?;
         self.scene.set_input_region(key, input_region);
-        self.finish_commit(layout_changed)
+        self.settle(layout_changed)
     }
 
-    fn finish_commit(&mut self, layout_changed: bool) -> Result<(), String> {
-        self.repaint()?;
-        self.refresh_focus()?;
-        if layout_changed && self.refresh_layout()? {
+    /// Settle the screen, the input aim and the clients for a change already
+    /// made to the scene. `layout_changed` false skips rebuilding the
+    /// published map, which the commit path takes on every client frame.
+    ///
+    /// Every step runs whatever the one before it did: only the paint is
+    /// owed anywhere, so a step skipped here is lost outright. Failures are
+    /// reported together rather than first-wins, as the overlay rollback
+    /// paths report theirs.
+    fn settle(&mut self, layout_changed: bool) -> Result<(), String> {
+        let mut failures = Vec::new();
+        if let Err(error) = self.repaint() {
+            failures.push(error);
+        }
+        if let Err(error) = self.refresh_focus() {
+            failures.push(error);
+        }
+        if layout_changed && self.refresh_layout() {
             self.publish_layout();
         }
-        Ok(())
+        if failures.is_empty() {
+            return Ok(());
+        }
+        Err(failures.join("; "))
     }
 
     pub fn set_input_region(
@@ -305,34 +321,19 @@ impl Runtime {
     pub fn remove(&mut self, key: SurfaceKey) -> Result<(), String> {
         self.forget_drag(|dragged| dragged == key);
         let layout_changed = self.scene.remove(key);
-        self.repaint()?;
-        self.refresh_focus()?;
-        if layout_changed && self.refresh_layout()? {
-            self.publish_layout();
-        }
-        Ok(())
+        self.settle(layout_changed)
     }
 
     pub fn unmap(&mut self, key: SurfaceKey) -> Result<(), String> {
         self.forget_drag(|dragged| dragged == key);
         let layout_changed = self.scene.unmap(key);
-        self.repaint()?;
-        self.refresh_focus()?;
-        if layout_changed && self.refresh_layout()? {
-            self.publish_layout();
-        }
-        Ok(())
+        self.settle(layout_changed)
     }
 
     pub fn remove_client(&mut self, client: u64) -> Result<(), String> {
         self.forget_drag(|dragged| dragged.client == client);
         let layout_changed = self.scene.remove_client(client);
-        self.repaint()?;
-        self.refresh_focus()?;
-        if layout_changed && self.refresh_layout()? {
-            self.publish_layout();
-        }
-        Ok(())
+        self.settle(layout_changed)
     }
 
     pub fn command(&mut self, command: Command) -> Result<(), String> {
@@ -341,18 +342,19 @@ impl Runtime {
         // wrong, so make it the immediate repair for pixels the compositor did
         // not write and its shadow copy therefore cannot see.
         self.framebuffer.resend();
-        self.repaint()?;
-        self.refresh_focus()?;
-        if self.refresh_layout()? {
-            self.publish_layout();
-        }
-        Ok(())
+        self.settle(true)
     }
 
     pub fn launcher(&mut self, action: LauncherAction) -> Result<Option<LaunchRequest>, String> {
         let checkpoint = self.scene.launcher_checkpoint();
         let request = self.scene.launcher(action);
-        let restored = self.cancel_drag_under_overlay();
+        // Published BEFORE the paint that can fail. The arrangement a drag
+        // was put back to is the clients' business and nothing below owes it
+        // to them; the rollback restores only the overlay, which no tiling
+        // geometry reads, so it cannot invalidate this.
+        if self.cancel_drag_under_overlay() && self.refresh_layout() {
+            self.publish_layout();
+        }
         if let Err(error) = self.repaint() {
             self.scene.restore_launcher(checkpoint);
             return Err(error);
@@ -365,9 +367,6 @@ impl Runtime {
                 ));
             }
             return Err(error);
-        }
-        if restored && self.refresh_layout()? {
-            self.publish_layout();
         }
         Ok(request)
     }
@@ -396,18 +395,7 @@ impl Runtime {
     fn cancel_drag(&mut self) -> Result<(), String> {
         self.dragging = None;
         if self.scene.clear_preview() {
-            self.settle_layout()?;
-        }
-        Ok(())
-    }
-
-    /// Repaint, re-aim the keyboard and republish, for a change to the
-    /// arrangement on screen.
-    fn settle_layout(&mut self) -> Result<(), String> {
-        self.repaint()?;
-        self.refresh_focus()?;
-        if self.refresh_layout()? {
-            self.publish_layout();
+            self.settle(true)?;
         }
         Ok(())
     }
@@ -440,15 +428,14 @@ impl Runtime {
         if self.scene.set_help(action.target(before)) == before {
             return Ok(before);
         }
-        let restored = self.cancel_drag_under_overlay();
+        if self.cancel_drag_under_overlay() && self.refresh_layout() {
+            self.publish_layout();
+        }
         if let Err(error) = self.repaint() {
             return Err(self.restore_help(before, error));
         }
         if let Err(error) = self.refresh_focus() {
             return Err(self.restore_help(before, error));
-        }
-        if restored && self.refresh_layout()? {
-            self.publish_layout();
         }
         Ok(self.scene.help_visible())
     }
@@ -615,24 +602,25 @@ impl Runtime {
                     // computing one anyway would commit an answer the
                     // operator never saw — which is exactly a release that
                     // follows a window mapping the preview away.
-                    if moved && self.scene.preview_drop(dragged, width, height) {
-                        self.settle_layout()?;
-                    }
-                    // Nothing is decided here. The drop went into the picture
-                    // the moment the pointer reached it, so the release only
-                    // KEEPS that picture — and off every tile, or still on
-                    // the band it came from, there is no picture to keep and
-                    // the drag simply ends. Promoting it owes neither a paint
-                    // nor a round of configures: the screen and the map
-                    // published to clients have both been reading the preview
-                    // since it went up.
+                    let settled = if moved && self.scene.preview_drop(dragged, width, height) {
+                        self.settle(true)
+                    } else {
+                        Ok(())
+                    };
+                    // Nothing is decided here: the drop went into the picture
+                    // when the pointer reached it, so the release only KEEPS
+                    // it, owing neither a paint nor a round of configures.
+                    // Run whatever the settle did — the drag is already taken,
+                    // so skipping it would strand the picture with nothing
+                    // able to commit or clear it.
                     self.scene.commit_preview();
+                    settled?;
                 }
             }
         }
         if let Some(dragged) = self.dragging.as_ref().map(|drag| drag.key) {
             if self.scene.preview_drop(dragged, width, height) {
-                self.settle_layout()?;
+                self.settle(true)?;
             }
         }
         Ok(())
@@ -645,12 +633,7 @@ impl Runtime {
         // No `framebuffer.resend()` here, unlike a tiling command: that one is
         // the repair gesture for pixels the compositor did not write, and a
         // click is not reached for when the screen looks wrong.
-        self.repaint()?;
-        self.refresh_focus()?;
-        if self.refresh_layout()? {
-            self.publish_layout();
-        }
-        Ok(())
+        self.settle(true)
     }
 
     pub fn key(&mut self, input: KeyInput) -> Result<(), String> {
@@ -788,7 +771,10 @@ impl Runtime {
         }
     }
 
-    fn refresh_layout(&mut self) -> Result<bool, String> {
+    /// Infallible, and typed so: an overlay publishes before its own paint, so
+    /// a `?` here would return with the overlay changed, unpainted and NOT
+    /// rolled back — the hazard folding it into the paint exists to avoid.
+    fn refresh_layout(&mut self) -> bool {
         let next: BTreeMap<SurfaceKey, ViewLayout> = self
             .scene
             .views(self.framebuffer.width, self.framebuffer.height)
@@ -796,10 +782,10 @@ impl Runtime {
             .map(|view| (view.key, view))
             .collect();
         if self.layout.as_ref() == &next {
-            return Ok(false);
+            return false;
         }
         self.layout = Arc::new(next);
-        Ok(true)
+        true
     }
 
     fn publish_layout(&mut self) {
@@ -2406,6 +2392,496 @@ mod tests {
         runtime.scene.layout().check_invariants().unwrap();
         events_stop.stop();
         runtime.unsubscribe_keyboard(1);
+    }
+
+    #[test]
+    fn a_failed_paint_owes_the_screen_but_never_the_clients_their_geometry() {
+        // The screen is the one thing a failed paint owes: `pending_paint`
+        // holds that debt and a later flush pays it. NOTHING owes the clients
+        // their configures, so a settle that gave up at the paint lost them
+        // outright — every client would go on drawing at the size it was last
+        // told, which the compositor clips into a rectangle of the wrong
+        // shape. EVERY caller is driven, not a representative one: they share
+        // `settle` today and the claim is about each of them, so a site that
+        // stopped routing through it would be caught here rather than by
+        // whichever of them a single case happened to use.
+        let path = std::env::temp_dir().join(format!(
+            "td-runtime-failed-paint-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let cleanup = Cleanup(path);
+        let height = 600;
+        let framebuffer = Framebuffer::test_file(&cleanup.0, 240, height, 240 * 4).unwrap();
+        let mut runtime = Runtime::new(framebuffer);
+        let key = |client, object| SurfaceKey { client, object };
+        for object in 1..=3 {
+            runtime
+                .commit(key(1, object), surface([1, 2, 3, 0]))
+                .unwrap();
+        }
+        // A second client, so the `remove_client` case below leaves a survivor
+        // to be owed anything at all.
+        runtime.commit(key(2, 1), surface([4, 5, 6, 0])).unwrap();
+        let subscription = runtime.subscribe(1).unwrap();
+        let (woken, stop) = subscription.split();
+
+        // The map changing proves the rebuild ran; only a WAKE proves anyone
+        // was told to go and read it, which is the half that reaches a client.
+        // The baseline is taken INSIDE the macro, after whatever set the case
+        // up, so nothing that ran between two cases can satisfy it.
+        macro_rules! under_failed_paint {
+            ($what:expr, $op:expr) => {{
+                while woken.try_recv().is_ok() {}
+                let before = runtime.layout_snapshot();
+                runtime.fail_next_repaint();
+                let outcome: Result<(), String> = $op;
+                assert!(
+                    outcome.is_err(),
+                    "{}: the paint was supposed to fail",
+                    $what
+                );
+                assert!(
+                    runtime.paint_pending(),
+                    "{}: the screen was not owed",
+                    $what
+                );
+                assert_ne!(
+                    runtime.layout_snapshot(),
+                    before,
+                    "{}: a failed paint cost the clients their configures",
+                    $what
+                );
+                assert!(
+                    woken.try_recv().is_ok(),
+                    "{}: the clients were never woken to read the new geometry",
+                    $what
+                );
+                // The screen still gets there, one flush later.
+                runtime.clear_repaint_failure();
+                runtime.flush_paint().unwrap();
+                assert!(
+                    !runtime.paint_pending(),
+                    "{}: the screen stayed owed",
+                    $what
+                );
+            }};
+        }
+        let at = |runtime: &Runtime, client, object| {
+            let placements = runtime.scene.tiled_placements(240, height);
+            let index = placements
+                .iter()
+                .position(|placement| placement.key == key(client, object))
+                .unwrap();
+            *placements.get(index).unwrap()
+        };
+        let goto = |runtime: &mut Runtime, x: usize, y: usize, buttons: &[PointerButtonInput]| {
+            let (at_x, at_y) = runtime.scene.pointer_at();
+            let (dx, dy) = (
+                i32::try_from(x).unwrap() - at_x,
+                i32::try_from(y).unwrap() - at_y,
+            );
+            runtime.pointer_frame(1, dx, dy, buttons)
+        };
+        let press = |time| PointerButtonInput {
+            time,
+            button: 272,
+            state: PointerButtonState::Pressed,
+        };
+        let release = |time| PointerButtonInput {
+            time,
+            button: 272,
+            state: PointerButtonState::Released,
+        };
+
+        // A new window mapping, which is the path taken on EVERY client frame.
+        // Both entry points, since they settle separately: the one clients
+        // really arrive through, and the shorthand the tests above use.
+        under_failed_paint!(
+            "commit_with_input_region",
+            runtime.commit_with_input_region(key(1, 4), surface([7, 8, 9, 0]), None)
+        );
+        under_failed_paint!("commit", runtime.commit(key(1, 5), surface([9, 9, 9, 0])));
+        // A tiling command. `Move` rather than `SetSplit`, which only arms the
+        // next split and so moves no tile at all.
+        under_failed_paint!("command", runtime.command(Command::Move(Direction::Down)));
+        // Click to focus, which republishes the activation every client reads.
+        // A press on a client AREA, so it establishes a grab and takes focus
+        // without the title band picking the window up — and on a window that
+        // is not focused ALREADY, or `focus_key` answers false and settles
+        // nothing.
+        let focused = runtime.scene.focused();
+        let mut elsewhere = None;
+        for object in 1..=4 {
+            if Some(key(1, object)) != focused {
+                elsewhere = Some(at(&runtime, 1, object).rect);
+                break;
+            }
+        }
+        let elsewhere = elsewhere.unwrap();
+        // Near the tile's ORIGIN, not its centre: a tile is often taller than
+        // the 100x100 buffer in it, and a press off the buffer routes to no
+        // surface, establishes no grab and so focuses nothing.
+        under_failed_paint!(
+            "focus_surface",
+            goto(&mut runtime, elsewhere.x + 4, elsewhere.y + 4, &[press(2)])
+        );
+        // Let the button go, so the grab that press established does not ride
+        // into the cases below.
+        goto(&mut runtime, 0, 0, &[release(3)]).unwrap();
+        // A surface unmapping, and one being destroyed outright.
+        under_failed_paint!("unmap", runtime.unmap(key(1, 4)));
+        under_failed_paint!("remove", runtime.remove(key(1, 3)));
+        // A whole client leaving, which is the path a crash takes: the
+        // survivors are owed their new size whatever the screen did.
+        under_failed_paint!("remove_client", runtime.remove_client(1));
+
+        stop.stop();
+        runtime.unsubscribe(1);
+    }
+
+    #[test]
+    fn a_failed_paint_keeps_the_clients_in_step_with_a_drag() {
+        // The drag's own three settles: the motion that puts a picture up, the
+        // release that keeps it, and the Alt release that takes it away again.
+        // Each publishes what the screen is showing, so a failed paint must not
+        // cost it — the clients would then be configured for an arrangement
+        // nobody is looking at, in one direction or the other.
+        let path = std::env::temp_dir().join(format!(
+            "td-runtime-failed-drag-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let cleanup = Cleanup(path);
+        let height = 600;
+        let framebuffer = Framebuffer::test_file(&cleanup.0, 240, height, 240 * 4).unwrap();
+        let mut runtime = Runtime::new(framebuffer);
+        let keys: Vec<SurfaceKey> = (1..=3)
+            .map(|object| SurfaceKey { client: 1, object })
+            .collect();
+        runtime
+            .commit(*keys.first().unwrap(), surface([1, 2, 3, 0]))
+            .unwrap();
+        runtime
+            .commit(*keys.get(1).unwrap(), surface([4, 5, 6, 0]))
+            .unwrap();
+        runtime.command(Command::SetSplit(Axis::Vertical)).unwrap();
+        runtime
+            .commit(*keys.get(2).unwrap(), surface([7, 8, 9, 0]))
+            .unwrap();
+        let at = |runtime: &Runtime, object: u32| {
+            let placements = runtime.scene.tiled_placements(240, height);
+            let index = placements
+                .iter()
+                .position(|placement| placement.key.object == object)
+                .unwrap();
+            *placements.get(index).unwrap()
+        };
+        let goto = |runtime: &mut Runtime, x: usize, y: usize, buttons: &[PointerButtonInput]| {
+            let (at_x, at_y) = runtime.scene.pointer_at();
+            let (dx, dy) = (
+                i32::try_from(x).unwrap() - at_x,
+                i32::try_from(y).unwrap() - at_y,
+            );
+            runtime.pointer_frame(1, dx, dy, buttons)
+        };
+        let press = |time| PointerButtonInput {
+            time,
+            button: 272,
+            state: PointerButtonState::Pressed,
+        };
+        let release = |time| PointerButtonInput {
+            time,
+            button: 272,
+            state: PointerButtonState::Released,
+        };
+        let alt = |runtime: &mut Runtime, down: bool| {
+            runtime.modifiers(ModifierState {
+                depressed: if down { TEST_MOD_ALT } else { 0 },
+                ..ModifierState::default()
+            })
+        };
+        // The GEOMETRY alone: picking a window up focuses it, so the activation
+        // flag legitimately differs across a gesture.
+        let published = |runtime: &Runtime| {
+            runtime
+                .layout_snapshot()
+                .values()
+                .map(|view| (view.key, view.rect))
+                .collect::<Vec<_>>()
+        };
+
+        // The MOTION's settle: pick 1 up by its band and move onto 3 in a frame
+        // of its own, so the picture goes up with no release to promote it.
+        let handle = at(&runtime, 1).band;
+        goto(&mut runtime, handle.x + 2, handle.y + 2, &[press(2)]).unwrap();
+        let settled = published(&runtime);
+        let target = at(&runtime, 3).rect;
+        runtime.fail_next_repaint();
+        assert!(
+            goto(
+                &mut runtime,
+                target.x + 2,
+                target.y + target.height - 2,
+                &[]
+            )
+            .is_err(),
+            "the paint was supposed to fail"
+        );
+        let previewed = published(&runtime);
+        assert_ne!(
+            previewed, settled,
+            "a failed paint left the clients on the arrangement the drag had left"
+        );
+        runtime.clear_repaint_failure();
+        runtime.flush_paint().unwrap();
+
+        // The RELEASE's settle. Its frame must carry a motion that lands
+        // SOMEWHERE ELSE — a pointer moving inside one half re-derives the same
+        // drop, which is deliberately no repaint and so no settle to fail.
+        runtime.fail_next_repaint();
+        assert!(
+            goto(&mut runtime, target.x + 2, target.y + 2, &[release(3)]).is_err(),
+            "the paint was supposed to fail"
+        );
+        let dropped = published(&runtime);
+        assert_ne!(
+            dropped, previewed,
+            "a failed paint cost the drop its own configures"
+        );
+        assert!(!runtime.scene.clear_preview(), "the drop was stranded");
+        runtime.clear_repaint_failure();
+        runtime.flush_paint().unwrap();
+
+        // And `cancel_drag`, which is the Alt gesture's revert: the picture
+        // comes down and the clients are owed the arrangement underneath it.
+        alt(&mut runtime, true).unwrap();
+        let before = published(&runtime);
+        let body = at(&runtime, 2).rect;
+        goto(
+            &mut runtime,
+            body.x + body.width / 2,
+            body.y + body.height / 2,
+            &[press(4)],
+        )
+        .unwrap();
+        let away = at(&runtime, 1).rect;
+        goto(&mut runtime, away.x + 2, away.y + away.height - 2, &[]).unwrap();
+        assert_ne!(
+            published(&runtime),
+            before,
+            "the Alt drag previewed nothing"
+        );
+        runtime.fail_next_repaint();
+        assert!(alt(&mut runtime, false).is_err(), "the paint was to fail");
+        assert_eq!(
+            published(&runtime),
+            before,
+            "a failed paint left the clients on a reverted preview"
+        );
+        runtime.clear_repaint_failure();
+        runtime.flush_paint().unwrap();
+        runtime.scene.layout().check_invariants().unwrap();
+    }
+
+    #[test]
+    fn a_failed_paint_does_not_strand_a_drop_that_was_already_drawn() {
+        // The release takes the drag before it settles, so a settle that gave
+        // up on a failed paint left the picture standing with nothing able to
+        // commit or clear it — the screen and the clients holding an
+        // arrangement the layout never took, and no drag left to promote it.
+        let path = std::env::temp_dir().join(format!(
+            "td-runtime-failed-drop-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let cleanup = Cleanup(path);
+        let height = 600;
+        let framebuffer = Framebuffer::test_file(&cleanup.0, 240, height, 240 * 4).unwrap();
+        let mut runtime = Runtime::new(framebuffer);
+        let keys: Vec<SurfaceKey> = (1..=3)
+            .map(|object| SurfaceKey { client: 1, object })
+            .collect();
+        runtime
+            .commit(*keys.first().unwrap(), surface([1, 2, 3, 0]))
+            .unwrap();
+        runtime
+            .commit(*keys.get(1).unwrap(), surface([4, 5, 6, 0]))
+            .unwrap();
+        runtime.command(Command::SetSplit(Axis::Vertical)).unwrap();
+        runtime
+            .commit(*keys.get(2).unwrap(), surface([7, 8, 9, 0]))
+            .unwrap();
+        let order = |runtime: &Runtime| {
+            runtime
+                .scene
+                .tiled_placements(240, height)
+                .iter()
+                .map(|placement| placement.key.object)
+                .collect::<Vec<_>>()
+        };
+        let at = |runtime: &Runtime, object: u32| {
+            let placements = runtime.scene.tiled_placements(240, height);
+            let index = placements
+                .iter()
+                .position(|placement| placement.key.object == object)
+                .unwrap();
+            *placements.get(index).unwrap()
+        };
+        let goto = |runtime: &mut Runtime, x: usize, y: usize, buttons: &[PointerButtonInput]| {
+            let (at_x, at_y) = runtime.scene.pointer_at();
+            let (dx, dy) = (
+                i32::try_from(x).unwrap() - at_x,
+                i32::try_from(y).unwrap() - at_y,
+            );
+            runtime.pointer_frame(1, dx, dy, buttons)
+        };
+        assert_eq!(order(&runtime), [1, 2, 3]);
+
+        // Pick 1 up and release it over 3 with the motion in the SAME frame,
+        // which is what makes the release re-derive the picture and settle.
+        let handle = at(&runtime, 1).band;
+        goto(
+            &mut runtime,
+            handle.x + 2,
+            handle.y + 2,
+            &[PointerButtonInput {
+                time: 2,
+                button: 272,
+                state: PointerButtonState::Pressed,
+            }],
+        )
+        .unwrap();
+        let target = at(&runtime, 3).rect;
+        runtime.fail_next_repaint();
+        let dropped = goto(
+            &mut runtime,
+            target.x + 2,
+            target.y + target.height - 2,
+            &[PointerButtonInput {
+                time: 3,
+                button: 272,
+                state: PointerButtonState::Released,
+            }],
+        );
+        assert!(dropped.is_err(), "the paint was supposed to fail");
+
+        // The drop is the LAYOUT's now, not a picture over it: nothing is left
+        // to clear, and the arrangement is what the operator was shown.
+        assert!(
+            !runtime.scene.clear_preview(),
+            "the drop was stranded as a preview"
+        );
+        assert_eq!(order(&runtime), [2, 3, 1], "the drop was lost");
+        assert!(runtime.dragging.is_none());
+        runtime.scene.layout().check_invariants().unwrap();
+        runtime.clear_repaint_failure();
+        runtime.flush_paint().unwrap();
+    }
+
+    #[test]
+    fn an_overlay_publishes_the_drag_it_cancelled_even_when_its_paint_fails() {
+        // The overlay's own rollback restores the overlay and nothing else, so
+        // the arrangement a cancelled drag was put back to is published BEFORE
+        // the paint that can fail. Published after it, a failed paint would
+        // leave every client configured for a preview the screen no longer
+        // shows and the layout never took.
+        let path = std::env::temp_dir().join(format!(
+            "td-runtime-overlay-cancel-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let cleanup = Cleanup(path);
+        let height = 600;
+        let framebuffer = Framebuffer::test_file(&cleanup.0, 240, height, 240 * 4).unwrap();
+        let mut runtime = Runtime::new(framebuffer);
+        let keys: Vec<SurfaceKey> = (1..=3)
+            .map(|object| SurfaceKey { client: 1, object })
+            .collect();
+        runtime
+            .commit(*keys.first().unwrap(), surface([1, 2, 3, 0]))
+            .unwrap();
+        runtime
+            .commit(*keys.get(1).unwrap(), surface([4, 5, 6, 0]))
+            .unwrap();
+        runtime.command(Command::SetSplit(Axis::Vertical)).unwrap();
+        runtime
+            .commit(*keys.get(2).unwrap(), surface([7, 8, 9, 0]))
+            .unwrap();
+        let at = |runtime: &Runtime, object: u32| {
+            let placements = runtime.scene.tiled_placements(240, height);
+            let index = placements
+                .iter()
+                .position(|placement| placement.key.object == object)
+                .unwrap();
+            *placements.get(index).unwrap()
+        };
+        let goto = |runtime: &mut Runtime, x: usize, y: usize, buttons: &[PointerButtonInput]| {
+            let (at_x, at_y) = runtime.scene.pointer_at();
+            let (dx, dy) = (
+                i32::try_from(x).unwrap() - at_x,
+                i32::try_from(y).unwrap() - at_y,
+            );
+            runtime.pointer_frame(1, dx, dy, buttons).unwrap()
+        };
+        // The GEOMETRY the clients were configured for, which is what a
+        // configure carries. Not the whole view: picking a window up focuses
+        // it, so the activation flag legitimately differs across the gesture.
+        let published = |runtime: &Runtime| {
+            runtime
+                .layout_snapshot()
+                .values()
+                .map(|view| (view.key, view.rect))
+                .collect::<Vec<_>>()
+        };
+
+        // Both overlays are the same call site twice over, so both are driven.
+        for overlay in 0..2 {
+            let settled = published(&runtime);
+            let handle = at(&runtime, 1).band;
+            goto(
+                &mut runtime,
+                handle.x + 2,
+                handle.y + 2,
+                &[PointerButtonInput {
+                    time: 2,
+                    button: 272,
+                    state: PointerButtonState::Pressed,
+                }],
+            );
+            let target = at(&runtime, 3).rect;
+            goto(&mut runtime, target.x + 2, target.y + 2, &[]);
+            assert_ne!(published(&runtime), settled, "the drag previewed nothing");
+
+            // The overlay goes up, drops the drag — and its paint fails.
+            runtime.fail_next_repaint();
+            if overlay == 0 {
+                assert!(runtime.help(HelpAction::Toggle).is_err());
+            } else {
+                assert!(runtime.launcher(LauncherAction::Open).is_err());
+            }
+            assert_eq!(
+                published(&runtime),
+                settled,
+                "a failed overlay paint left the clients on the cancelled preview"
+            );
+            runtime.clear_repaint_failure();
+            runtime.flush_paint().unwrap();
+
+            // Let the button go and put the screen back for the next round.
+            goto(
+                &mut runtime,
+                target.x + 2,
+                target.y + 2,
+                &[PointerButtonInput {
+                    time: 3,
+                    button: 272,
+                    state: PointerButtonState::Released,
+                }],
+            );
+            assert_eq!(published(&runtime), settled);
+            runtime.scene.layout().check_invariants().unwrap();
+        }
     }
 
     #[test]

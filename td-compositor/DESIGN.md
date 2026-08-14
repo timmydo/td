@@ -336,6 +336,22 @@ with damage tracking, a one-pixel pointer step at 1920x1080 writes 14 rows
 instead of an 8 MiB image. Both were prerequisites for real GPU hardware, and
 neither is a substitute for it: acceleration would make a redundant full-screen
 frame cheaper without making it unnecessary.
+
+The SCREEN is the only thing that debt covers, which is why settling a change
+runs every step whatever the one before it did and reports the failures
+together. Nothing owes the clients their configures: a settle that gave up at
+a failed paint lost them outright, and every client would go on drawing at the
+size it was last told, which the compositor clips into a rectangle of the wrong
+shape — a window visibly the wrong size with nothing in the log and no further
+event coming to correct it. Publishing cannot itself fail, so running it after
+a failure costs nothing and risks nothing. The same reasoning orders an
+overlay's cancelled drag BEFORE the paint that may fail, and promotes a drop
+the release has already taken out of the drag's hands: a picture left standing
+with nothing able to commit or clear it is the same loss seen from the scene's
+side. The paint debt is a weaker backstop here than elsewhere, which is part of
+why none of this may lean on it: an error out of a device's `apply` ends that
+reader thread, so the flush that would have paid the debt is gone with it and
+another device or the next client frame pays it instead.
 The shared logical-seat boundary spans a key decision through its runtime
 adapter delivery, so evdev inputs remain ordered behind that lock; partial
 pointer records return before acquiring either lock. Each adapter operation
