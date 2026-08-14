@@ -1495,11 +1495,9 @@ fn shift(sh: &mut Shell, argv: &[String]) -> R<()> {
         },
         None => 1,
     };
-    // NOT fatal, unlike the bad-operand case above: busybox ash just `return 1`s
-    // when the count overruns the parameters, and builtin-special.test.sh pins
-    // ash's behaviour (`## N-I …ash`) over dash's abort.
+    // Silent, and not fatal either: ash's overrun is a bare `return 1`
+    // (ash.c:11540), reached BEFORE the cursor reset below.
     if n > sh.params.len() {
-        err_line(sh, "shift: shift count out of range");
         return status(sh, 1);
     }
     sh.params.drain(0..n);
@@ -4311,6 +4309,69 @@ mod tests {
     #[test]
     fn shift_drops_leading_params() {
         assert_eq!(run_capturing("set -- a b c d; shift 2; echo $# $1").1, "2 c\n");
+    }
+
+    #[test]
+    fn shifting_past_the_end_fails_silently() {
+        // ash's `shiftcmd` returns 1 without a word when the count overruns
+        // (ash.c:11540); only the OPERAND is an error, through `number()`.
+        for (src, n) in [
+            ("set -- a b; shift 99", "2"),
+            ("set -- a b; shift 3", "2"),
+            ("set --; shift", "0"),
+            ("set --; shift 1", "0"),
+        ] {
+            let (_, out, err) = run_capturing(&format!("{src}; echo \"rc=$? n=$#\""));
+            assert_eq!(out, format!("rc=1 n={n}\n"), "{src}");
+            assert_eq!(err, "", "{src}");
+        }
+        // The rest of the line still runs: a status, not a raise.
+        assert_eq!(run_capturing("set -- a; shift 9; echo SAME").1, "SAME\n");
+        // A count that fits is silent and succeeds, 0 included.
+        for (src, want) in [
+            ("set -- a b; shift 2", "rc=0 n=0\n"),
+            ("set -- a b; shift 0", "rc=0 n=2\n"),
+            ("set --; shift 0", "rc=0 n=0\n"),
+            ("set -- a b; shift 1 2", "rc=0 n=1\n"),
+        ] {
+            let (_, out, err) = run_capturing(&format!("{src}; echo \"rc=$? n=$#\""));
+            assert_eq!(out, want, "{src}");
+            assert_eq!(err, "", "{src}");
+        }
+        // An OVERRUN stays silent however far past the end it is, INT_MAX
+        // included: the branch is about `$#`, not about the magnitude.
+        let (_, out, err) = run_capturing("set -- a b; shift 2147483647; echo \"rc=$? n=$#\"");
+        assert_eq!(out, "rc=1 n=2\n");
+        assert_eq!(err, "");
+        // The OPERAND still raises -- `number()`'s is_number guard -- which is
+        // what makes the silence above a choice rather than a missing check.
+        // Fatal with it, `shift` being special, so the status is half the claim.
+        for bad in ["oops", "-1", "+1", "' 2'", "1x"] {
+            let (status, out, err) =
+                run_capturing(&format!("set -- a b; shift {bad}; echo SAME"));
+            assert_eq!((status, out.as_str()), (2, ""), "shift {bad}");
+            assert!(err.contains("Illegal number"), "shift {bad}: {err:?}");
+        }
+        // Past INT_MAX td-sh diverges deliberately: ash's `number()` is `atoi`,
+        // so 2^31 SEGFAULTS busybox 1.37.0 (exit 139) and 99999999999999999999
+        // leaves `$#` at 3 over two parameters.
+        for bad in ["2147483648", "4294967296", "99999999999999999999"] {
+            let (status, out, err) =
+                run_capturing(&format!("set -- a b; shift {bad}; echo SAME"));
+            assert_eq!((status, out.as_str()), (2, ""), "shift {bad}");
+            assert!(err.contains("Illegal number"), "shift {bad}: {err:?}");
+        }
+        // ash resets the getopts cursor only AFTER that early return, so a
+        // FAILED shift leaves it where it was and a successful one restarts it.
+        for (src, want) in [
+            ("set -- -a -b; getopts ab o; shift 99; getopts ab p", "ab 3\n"),
+            ("set -- -a -b -c; getopts abc o; shift 1; getopts abc p", "ab 2\n"),
+            ("set -- -a -b; getopts ab o; shift 0; getopts ab p", "aa 2\n"),
+        ] {
+            let (_, out, err) = run_capturing(&format!("{src}; echo \"$o$p $OPTIND\""));
+            assert_eq!(out, want, "{src}");
+            assert_eq!(err, "", "{src}");
+        }
     }
 
     #[test]
