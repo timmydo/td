@@ -1155,52 +1155,122 @@ fn a_functions_temp_binding_is_exported_to_a_child() -> Result<(), Box<dyn std::
 /// child is the shell running ITSELF, the one external a target-side gate can
 /// count on, and it reports the mask with builtins alone.
 ///
-/// SIGPIPE (bit 0x1000) is set in EVERY line below, whatever the parent asked
-/// for, and that is this guarantee's one documented exception: Rust's runtime
-/// ignores SIGPIPE before `main`, `std::process::Command` undoes that in each
-/// child it spawns, and neither is reachable from safe code — so `trap '' PIPE`
-/// cannot reach a child, and a td-sh child could not tell an inherited ignore
-/// from the one its own runtime just installed. Asserted here as a constant so
-/// the exception is pinned rather than discovered.
+/// SIGPIPE (bit 0x1000) is this guarantee's one documented exception: Rust's
+/// runtime ignores SIGPIPE before `main`, `std::process::Command` undoes that in
+/// each child it spawns, and neither is reachable from safe code — so `trap ''
+/// PIPE` cannot reach a child, and a td-sh child could not tell an inherited
+/// ignore from the one its own runtime just installed.
+///
+/// The floor a row is measured against is therefore not a constant: whatever ran
+/// this test is in the child's mask too, so an absolute assertion fails under an
+/// init that ignores SIGHUP — the child reports 0x1003 — for a reason that is
+/// nothing to do with the shell. It is not FREE either, and pinning it to
+/// exactly `own | pipe` is what keeps the "and NOTHING else" an absolute
+/// assertion used to carry: a shell that leaked an ignore of its own would
+/// otherwise be absorbed into the baseline instead of breaking it.
 #[test]
 fn an_ignore_trap_is_inherited_by_a_child() -> Result<(), Box<dyn std::error::Error>> {
     let shell = PathBuf::from(env!("CARGO_BIN_EXE_td-sh"));
     let child = "\"$TD_SH_BIN\" -c 'while read l; do case \"$l\" in SigIgn:*) echo \"$l\";; \
                  esac; done < /proc/self/status'";
-    // SIGINT is bit 1 and SIGPIPE bit 12, both counted from signal 1.
-    let int = 1u64 << 1;
+    // Bits are counted from signal 1, so SIGPIPE (13) is bit 12.
     let pipe = 1u64 << 12;
-    for (body, want) in [
-        (format!("trap '' INT; {child}"), int | pipe),
-        (format!("{child}"), pipe),
-        // A subshell's ignore is handed back before the next command runs, so the
-        // child started AFTER it must not inherit one.
-        (format!("( trap '' INT ); {child}"), pipe),
-        // ... and one the subshell cleared is handed back the other way.
-        (format!("trap '' INT; ( trap - INT ); {child}"), int | pipe),
-        // A catcher cannot be installed, so it leaves the default behind.
-        (format!("trap 'echo x' INT; {child}"), pipe),
-        // The pair that pins `fork_shell` CARRYING `sig_may_set`, and the only
-        // pair that can: from outside, a subshell that cleared an inherited
-        // ignore is indistinguishable from one that declined to touch it —
-        // both leave the parent ignoring INT. The difference is visible only to
-        // the subshell's OWN children. Without the carried cache the subshell
-        // would re-query, find the ignore its parent installed, mistake it for
-        // one inherited from outside the process, and decline; then the first
-        // line below would report an ignore rather than none.
-        (format!("trap '' INT; ( trap - INT; {child} )"), pipe),
-        (format!("trap '' INT; ( trap - INT ); {child}"), int | pipe),
-    ] {
+    let to_mask = |hex: &str, from: &str| -> Result<u64, Box<dyn std::error::Error>> {
+        Ok(u64::from_str_radix(hex.trim(), 16)
+            .map_err(|e| format!("{from}: unreadable mask {hex:?}: {e}"))?)
+    };
+    // Two parsers on purpose: `/proc/self/status` is a document to SEARCH, while
+    // the probe prints one line and nothing else. Extra output THERE is the shell
+    // doing something no row asked for -- `trap 'echo x'` running its action
+    // eagerly, say -- so it must fail rather than be skipped past.
+    let own_mask = |text: &str| -> Result<u64, Box<dyn std::error::Error>> {
+        let hex = text
+            .lines()
+            .find_map(|l| l.strip_prefix("SigIgn:"))
+            .ok_or("the test's own: no SigIgn: line in /proc/self/status")?;
+        to_mask(hex, "the test's own")
+    };
+    let mask = |body: &str| -> Result<u64, Box<dyn std::error::Error>> {
         let out = std::process::Command::new(&shell)
             .arg("-c")
-            .arg(&body)
+            .arg(body)
             .env("TD_SH_BIN", &shell)
             .output()?;
+        // Reported rather than discarded: a shell that died leaves no mask, and
+        // "unreadable mask" would name the symptom instead of the reason.
+        if !out.status.success() {
+            return Err(format!(
+                "{body}: shell failed with {}: {}",
+                out.status,
+                String::from_utf8_lossy(&out.stderr)
+            )
+            .into());
+        }
         let text = String::from_utf8_lossy(&out.stdout);
-        let hex = text.trim().trim_start_matches("SigIgn:").trim();
-        let seen = u64::from_str_radix(hex, 16)
-            .map_err(|e| format!("{body}: unreadable mask {text:?}: {e}"))?;
-        assert_eq!(seen, want, "{body}: child inherited {seen:#x}, wanted {want:#x}");
+        // Exactly one line: a blank one is extra output too, so only the final
+        // newline comes off and any other is a failure.
+        let line = text.strip_suffix('\n').unwrap_or(&text);
+        let hex = line
+            .strip_prefix("SigIgn:")
+            .filter(|_| !line.contains('\n'))
+            .ok_or_else(|| format!("{body}: unexpected probe output {text:?}"))?;
+        to_mask(hex, body)
+    };
+    // `execve` carries THIS process's ignores into the child and `Command` resets
+    // only SIGPIPE, so the floor is knowable exactly rather than merely tolerated.
+    let own = own_mask(&std::fs::read_to_string("/proc/self/status")?)?;
+    let base = mask(child)?;
+    assert_eq!(
+        base, own | pipe,
+        "a fresh shell ignores more than it inherited: {base:#x} from {own:#x}"
+    );
+    // EVERY signal the baseline leaves free, not a preferred one: a spawn
+    // force-derives the two the interrupt guard moves, so INT and QUIT cannot see
+    // a subshell that failed to hand a disposition back, where the other three
+    // can. Running all of them is what makes the set independent of whatever the
+    // environment happens to ignore -- and POSIX 2.9.3 hands an asynchronous list
+    // `SIG_IGN` for INT and QUIT, so `… &` from ash really does remove two.
+    let free: Vec<(&str, u64)> = [
+        ("INT", 1u64 << 1),
+        ("QUIT", 1 << 2),
+        ("USR1", 1 << 9),
+        ("USR2", 1 << 11),
+        ("TERM", 1 << 14),
+    ]
+    .into_iter()
+    .filter(|&(_, bit)| base & bit == 0)
+    .collect();
+    if free.is_empty() {
+        return Err("every candidate signal is already ignored".into());
+    }
+    for (sig, bit) in free {
+        for (body, extra) in [
+            (format!("trap '' {sig}; {child}"), bit),
+            // A subshell's trap table is its OWN, so the child started after it is
+            // derived from a table with no ignore in it. For a signal outside the
+            // guard's pair this also catches the KERNEL disposition not being handed
+            // back, which for INT and QUIT a spawn normalises away first.
+            (format!("( trap '' {sig} ); {child}"), 0),
+            // A catcher cannot be installed, so it leaves the default behind.
+            (format!("trap 'echo x' {sig}; {child}"), 0),
+            // The pair that pins `fork_shell` CARRYING `sig_may_set`, and the only
+            // pair that can: from outside, a subshell that cleared an inherited
+            // ignore is indistinguishable from one that declined to touch it —
+            // both leave the parent ignoring it. The difference is visible only to
+            // the subshell's OWN children. Without the carried cache the subshell
+            // would re-query, find the ignore its parent installed, mistake it for
+            // one inherited from outside the process, and decline; then the first
+            // line below would report an ignore rather than none.
+            (format!("trap '' {sig}; ( trap - {sig}; {child} )"), 0),
+            (format!("trap '' {sig}; ( trap - {sig} ); {child}"), bit),
+        ] {
+            // The filter above already guarantees this for `extra` of `bit` or 0; it
+            // is here so a row added with some OTHER signal's bit cannot be absorbed.
+            assert_eq!(base & extra, 0, "{body}: the baseline already ignores {extra:#x}");
+            let want = base | extra;
+            let seen = mask(&body)?;
+            assert_eq!(seen, want, "{body}: child inherited {seen:#x}, wanted {want:#x}");
+        }
     }
     Ok(())
 }
