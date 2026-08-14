@@ -1896,11 +1896,50 @@ fn undo_binding(sh: &mut Shell, entry: Local) {
         }
         Local::Var(name, None) => {
             sh.unset_hook(&name);
-            sh.vars.remove(&name);
+            // ash's restore is `unsetvar` = `setvar(s, NULL, 0)` (ash.c:2525),
+            // whose `setvareq` ORs `VEXPORT` in under `set -a` (ash.c:2417).
+            // A name ash SEEDS is restored instead, so it never reaches that.
+            if sh.opts.allexport && !ash_seeds_entry(&name) {
+                sh.vars.insert(
+                    name,
+                    Var {
+                        value: None,
+                        exported: true,
+                        readonly: false,
+                        localised: false,
+                        dynamic: None,
+                    },
+                );
+            } else {
+                sh.vars.remove(&name);
+            }
         }
         Local::Opts(opts) => sh.opts = opts,
         Local::Depth(was) => sh.localvar_depth = was,
     }
+}
+
+/// Names ash's `varinit_data` (ash.c:2154-2181) keeps a permanent vartab entry
+/// for, as THIS build configures it. `mklocal`'s `findvar` never fails for one
+/// (ash.c:10011), so its pop restores that entry rather than unsetting it.
+fn ash_seeds_entry(name: &str) -> bool {
+    matches!(
+        name,
+        "IFS"
+            | "MAIL"
+            | "MAILPATH"
+            | "PATH"
+            | "PS1"
+            | "PS2"
+            | "PS4"
+            | "OPTIND"
+            | "LINENO"
+            | "FUNCNAME"
+            | "RANDOM"
+            | "EPOCHSECONDS"
+            | "EPOCHREALTIME"
+            | "HISTFILE"
+    )
 }
 
 /// Undo a frame's `local`s, newest first -- a function's on return, or the

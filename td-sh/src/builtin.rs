@@ -5309,6 +5309,90 @@ mod tests {
         assert!(!out.contains("export A") && !out.contains("export B"), "{out:?}");
     }
 
+    /// A frame's binding for a name that did not exist is undone by UNSETTING
+    /// it, and ash's `unsetvar` is `setvar(s, NULL, 0)` (ash.c:2525) -- so
+    /// under `set -a` the entry outlives the frame, marked for export.
+    #[test]
+    fn a_frame_that_ends_under_allexport_leaves_its_fresh_names_exported() {
+        // All four reach the one arm: two `local` forms and two TEMPORARY
+        // assignments, which a test written around `local` alone would miss.
+        for src in [
+            "set -a; f() { local TDL; }; f",
+            "set -a; f() { local TDL=1; }; f",
+            "set -a; TDL=1 true",
+            "set -a; g() { :; }; TDL=1 g",
+        ] {
+            let (_, out, _) = run_capturing(&format!("{src}; export -p"));
+            assert!(out.contains("export TDL"), "{src}: {out:?}");
+            // Marked for export, still WITHOUT a value: `-a` does not make the
+            // pop a no-op, it only changes what the pop leaves behind.
+            let (_, out, _) = run_capturing(&format!("{src}; echo \"[${{TDL-UNSET}}]\""));
+            assert_eq!(out, "[UNSET]\n", "{src}");
+        }
+        // Without `set -a` the name goes entirely, which is the whole contrast.
+        for src in ["f() { local TDL; }; f", "TDL=1 true"] {
+            let (_, out, _) = run_capturing(&format!("{src}; export -p"));
+            assert!(!out.contains("export TDL"), "{src}: {out:?}");
+        }
+        // A name the frame SHADOWED is restored, not replaced by the above.
+        let (_, out, _) = run_capturing("X=o; set -a; f() { local X; }; f; echo \"[$X]\"");
+        assert_eq!(out, "[o]\n");
+        // What survives is a GLOBAL. Were it still marked local, `unset` would
+        // clear the value and KEEP the entry, so the name would outlive that
+        // too -- visible only once `set -a` is off, since with it on
+        // `unset_var` delegates to `unset_value` anyway.
+        for src in ["set -a; f() { local TDL; }; f", "set -a; TDL=1 true"] {
+            let (_, out, _) = run_capturing(&format!("{src}; set +a; unset TDL; export -p"));
+            assert!(!out.contains("export TDL"), "{src}: {out:?}");
+        }
+    }
+
+    /// The other half: a name ash SEEDS is not a fresh one. `mklocal`'s
+    /// `findvar` finds it (ash.c:10011), so the pop restores that entry rather
+    /// than reaching the `unsetvar` `set -a` would re-export.
+    #[test]
+    fn a_name_ash_seeds_is_not_a_fresh_name_when_the_frame_ends() {
+        // EVERY name on the roster, so dropping one is caught. The `unset`
+        // leads because td-sh seeds some of them and the arm needs the name
+        // absent; for the rest it does nothing.
+        for name in [
+            "IFS",
+            "MAIL",
+            "MAILPATH",
+            "PATH",
+            "PS1",
+            "PS2",
+            "PS4",
+            "OPTIND",
+            "LINENO",
+            "FUNCNAME",
+            "RANDOM",
+            "EPOCHSECONDS",
+            "EPOCHREALTIME",
+            "HISTFILE",
+        ] {
+            for src in [
+                format!("unset {name}; set -a; f() {{ local {name}; }}; f"),
+                format!("unset {name}; set -a; {name}=1 true"),
+            ] {
+                let (_, out, _) = run_capturing(&format!("{src}; export -p"));
+                assert!(!out.contains(&format!("export {name}")), "{src}: {out:?}");
+            }
+        }
+        // The flag would outlive `set +a`, so a survivor here reaches a CHILD's
+        // environment and not just the listing.
+        let (_, out, _) = run_capturing("set -a; f() { local MAIL; }; f; set +a; MAIL=x; export -p");
+        assert!(!out.contains("export MAIL"), "{out:?}");
+        // A name ash does NOT seed still gets the survivor -- `LC_ALL` is in
+        // `varinit_data` but under an `#if` this build has off, which is why
+        // the roster was measured rather than read.
+        for name in ["LC_ALL", "LC_CTYPE", "HOME", "TDZ"] {
+            let src = format!("unset {name}; set -a; f() {{ local {name}; }}; f; export -p");
+            let (_, out, _) = run_capturing(&src);
+            assert!(out.contains(&format!("export {name}")), "{src}: {out:?}");
+        }
+    }
+
     /// `readonly NAME` on a name that does not exist yet creates its entry
     /// through `setvar` (ash.c:14164), which ORs `VEXPORT` in under `set -a`
     /// (ash.c:2417) -- so the declaration marks it for export as well.
