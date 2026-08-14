@@ -2,7 +2,11 @@
 //!
 //! POSIX `grep` plus the GNU options td's own scripts and the busybox applet it
 //! replaces actually use. Everything is byte-oriented (C locale, see `regex`);
-//! inputs are read whole, so a pattern never straddles a read boundary.
+//! inputs are STREAMED a buffer at a time, so an operand costs a buffer rather
+//! than its own size -- except under `-B N`, which retains N whole records by
+//! definition -- and an endless one can still be answered. A record that spans
+//! a buffer is assembled whole before it is matched, so a pattern never
+//! straddles a read boundary.
 //!
 //! Deliberate omissions: no `-P` (PCRE — a second regex engine), no `--color`,
 //! no `--include`/`--exclude` globs, and no `-b` byte offsets. Each is a
@@ -12,7 +16,7 @@
 use crate::regex::{Filter, OnBudget, Options, Regex};
 use crate::util::{
     byte_in, errmsg, name_in, number, path_bytes, posixly_correct, print_line, read_input,
-    read_search, records, walk, Diag, Out, VERSION,
+    open_search, records, walk, Diag, Input, Out, Records, VERSION,
 };
 
 /// How many significant digits `-NUM` takes before refusing the run. GNU's own
@@ -776,33 +780,46 @@ pub fn main(args: &[Vec<u8>]) -> i32 {
             true => b"(standard input)",
             false => path,
         };
-        let data = if settled {
-            Vec::new()
-        } else {
-            match read_search(path, *from_walk, grep.conf.dirs == Dirs::Skip) {
-                Ok(Some(d)) => d,
-                // `-d skip` passes over a directory WITHOUT A WORD: no
-                // diagnostic and no effect on the status, which is what
-                // distinguishes it from the `read` default whose message is a
-                // read failure. The OPEN still happened, so one that failed was
-                // reported above rather than swallowed.
-                Ok(None) => continue,
-                Err(f) => {
-                    if !grep.conf.no_messages {
-                        errb(&name_in("", display, &format!(": {}", errmsg(&f.err))));
-                    }
-                    status_error = true;
-                    if !f.opened {
-                        continue;
-                    }
-                    // Opened and unreadable: GNU has processed the file, and found
-                    // in it whatever the read managed to return -- nothing, for a
-                    // directory, which is what makes `-c` print its zero.
-                    f.partial
+        // Nothing to look for: GNU never OPENS these, and `search_file`'s own
+        // settled branch would print nothing for a case that got this far
+        // (`-L` clears `settled` here precisely so its name still gets said).
+        if settled {
+            continue;
+        }
+        let input = match open_search(path, *from_walk, grep.conf.dirs == Dirs::Skip) {
+            Ok(Some(input)) => input,
+            // `-d skip` passes over a directory WITHOUT A WORD: no diagnostic
+            // and no effect on the status, which is what distinguishes it from
+            // the `read` default whose message is a read failure. The OPEN
+            // still happened, so one that failed is reported below rather than
+            // swallowed.
+            Ok(None) => continue,
+            Err(f) => {
+                if !grep.conf.no_messages {
+                    errb(&name_in("", display, &format!(": {}", errmsg(&f))));
                 }
+                status_error = true;
+                continue;
             }
         };
-        match search_file(&grep, &mut out, display, &data, show_name, &mut printed_groups) {
+        // A READ that fails part way is reported inside, because with a
+        // streaming reader it can happen after output has already gone out --
+        // a directory under `-d read` being the reachable case, which is what
+        // makes `-c` print its zero.
+        let sep = if grep.conf.null_data { 0u8 } else { b'\n' };
+        let mut rec = Records::new(input, sep);
+        let mut read_failed = false;
+        let hit = search_file(
+            &grep,
+            &mut out,
+            display,
+            &mut rec,
+            show_name,
+            &mut printed_groups,
+            &mut read_failed,
+        );
+        status_error |= read_failed;
+        match hit {
             Ok(hit) => any_match |= hit,
             Err(msg) => {
                 err(&msg);
@@ -1284,17 +1301,83 @@ fn write_spans(
     Ok(())
 }
 
+/// The `-B` window: the last `cap` records, kept because a match cannot be known
+/// until the lines BEFORE it have already gone past. Slots are reused rather than
+/// reallocated per line, and a search without `-B` builds none at all.
+struct Before {
+    cap: usize,
+    slots: Vec<(Vec<u8>, bool, u64)>,
+    /// Where the next push lands, once the ring is full.
+    head: usize,
+}
+
+impl Before {
+    /// Slots are added as lines arrive rather than reserved up front: `-B` takes
+    /// a count with no upper bound (`-B 99999999999999` is answered, not
+    /// refused), and reserving that many would abort before the first line was
+    /// read. The ring can never need more slots than the file has lines.
+    fn new(cap: usize) -> Self {
+        Self { cap, slots: Vec::new(), head: 0 }
+    }
+
+    /// `Err` is an allocation that failed. `-B N` retains N whole records, so
+    /// this is the one place a search's memory is driven by an OPTION rather
+    /// than by a buffer, and it has to fail the way a read does -- a diagnosed
+    /// `out of memory` and exit 2, not the abort a bare `Vec::push` gives.
+    fn push(&mut self, line: &[u8], term: bool, no: u64) -> Result<(), ()> {
+        if self.cap == 0 {
+            return Ok(());
+        }
+        if self.slots.len() < self.cap {
+            let mut text = Vec::new();
+            text.try_reserve(line.len()).map_err(|_| ())?;
+            text.extend_from_slice(line);
+            self.slots.try_reserve(1).map_err(|_| ())?;
+            self.slots.push((text, term, no));
+            return Ok(());
+        }
+        if let Some(slot) = self.slots.get_mut(self.head) {
+            slot.0.clear();
+            slot.0.try_reserve(line.len()).map_err(|_| ())?;
+            slot.0.extend_from_slice(line);
+            slot.1 = term;
+            slot.2 = no;
+        }
+        self.head = self.head.saturating_add(1) % self.cap;
+        Ok(())
+    }
+
+    /// The retained lines from `first` onward, oldest first, which is the order
+    /// they print in. Where to start is ARITHMETIC rather than a scan: the ring
+    /// holds a contiguous run ending at the line before the current one, so a
+    /// `-B 1000000` window is not walked a million times to print three lines.
+    fn iter_from(&self, first: u64, oldest: u64) -> impl Iterator<Item = &(Vec<u8>, bool, u64)> {
+        let n = self.slots.len();
+        let base = if n < self.cap { 0 } else { self.head };
+        let skip = usize::try_from(first.saturating_sub(oldest)).unwrap_or(usize::MAX).min(n);
+        (skip..n).filter_map(move |i| self.slots.get(base.saturating_add(i) % n.max(1)))
+    }
+
+    /// The line number of the oldest record retained, given the current one.
+    fn oldest(&self, lineno: u64) -> u64 {
+        lineno.saturating_sub(self.slots.len() as u64)
+    }
+}
+
 fn search_file(
     grep: &Grep,
     out: &mut Out,
     // The NAME to print, already resolved: only an operand spells stdin `-`, so
     // the caller is the one that knows whether this came from the walk.
     display: &[u8],
-    data: &[u8],
+    rec: &mut Records<Input>,
     show_name: bool,
     // Whether an earlier FILE already printed a context group. `printed_upto`
     // resets per file, so without this the `--` at a file boundary is lost.
     printed_before: &mut bool,
+    // Set when the read failed PART WAY: the caller owns the exit status, and a
+    // file that produced output before failing still counts as having matched.
+    read_failed: &mut bool,
 ) -> Result<bool, String> {
     let sep = if grep.conf.null_data { 0u8 } else { b'\n' };
     // A binary file's MATCHING LINES are replaced by a notice — so `-o`, which
@@ -1304,17 +1387,28 @@ fn search_file(
         || grep.conf.files_with
         || grep.conf.files_without
         || grep.conf.quiet;
-    let binary = !grep.conf.text && !counts_only && data.contains(&0) && sep != 0;
-    let lines = records(data, sep);
     let mut count: u64 = 0;
-    // How far the output reaches, 1-based: the last line printed OR covered by
-    // context. `-o` drops context lines but not the range they cover.
-    let mut covered: usize = 0;
+    // How far the output reaches, as a LINE NUMBER: the last line printed OR
+    // covered by context, 0 for none. `-o` drops context lines but not the range
+    // they cover. A number rather than the index it was, since streaming means
+    // there is no longer a slice to index into.
+    let mut covered: u64 = 0;
     let mut pending_after: usize = 0;
     let mut any = false;
 
     let io = |r: std::io::Result<()>| -> Result<(), String> { r.map_err(|e| format!("write error: {}", errmsg(&e))) };
     if grep.settled() {
+        // Nothing can match, but the operand was OPENED, and only a READ
+        // discovers that it cannot be read -- `grep -L -m 0 a DIR f` reports
+        // `Is a directory` and exits 2 in GNU. One record is enough: the
+        // failure is the first fill's. The whole-file reader this replaced got
+        // this for free by reading before it ever reached here.
+        if let Err(e) = rec.next() {
+            if !grep.conf.no_messages {
+                errb(&name_in("", display, &format!(": {}", errmsg(&e))));
+            }
+            *read_failed = true;
+        }
         if grep.conf.files_without && !grep.conf.quiet {
             io(out.write(display))?;
             io(out.write(&[if grep.conf.null_name { 0 } else { b'\n' }]))?;
@@ -1322,9 +1416,35 @@ fn search_file(
         return Ok(false);
     }
     let mut limit_reached = false;
+    let before_cap = grep.conf.before_lines();
+    // The window is only ever READ by the context block, which every
+    // counts-only mode skips -- so `-c -B 5` keeps nothing rather than copying
+    // a record per line it will never print.
+    let keep_window = before_cap > 0 && !counts_only;
+    let mut window = Before::new(before_cap);
+    let mut lineno: u64 = 0;
 
-    for (idx, (line, _)) in lines.iter().enumerate() {
-        let lineno = (idx + 1) as u64;
+    loop {
+        match rec.next() {
+            Ok(true) => {}
+            Ok(false) => break,
+            // Opened and unreadable. GNU reports it and keeps whatever it had
+            // already printed, so the read failure ends this file rather than
+            // discarding its output.
+            Err(e) => {
+                if !grep.conf.no_messages {
+                    errb(&name_in("", display, &format!(": {}", errmsg(&e))));
+                }
+                *read_failed = true;
+                break;
+            }
+        }
+        lineno = lineno.saturating_add(1);
+        let line = rec.line();
+        // The binary verdict is asked HERE rather than once per file: it is the
+        // buffer this record arrived in that decides, and a NUL in a later
+        // buffer must not unprint a match already emitted from an earlier one.
+        let binary = !grep.conf.text && !counts_only && rec.binary() && sep != 0;
         // Past the -m limit only the trailing context of the last match is still
         // owed, so stop selecting but keep draining `pending_after`.
         let selected = !limit_reached && grep.selects(line)?;
@@ -1348,27 +1468,35 @@ fn search_file(
             }
             if !grep.conf.count {
                 // Trailing context of the previous group, then leading context.
-                let start = idx.saturating_sub(grep.conf.before_lines());
+                // The window holds the last `before_cap` records, so the range
+                // wanted here is always inside it.
+                let first_ctx = lineno.saturating_sub(before_cap as u64).max(1);
                 if grep.conf.has_context() {
                     let gap = match covered {
                         0 => *printed_before,
-                        upto => start > upto,
+                        upto => first_ctx > upto.saturating_add(1),
                     };
                     if gap {
                         io(out.write(b"--\n"))?;
                     }
                     *printed_before = true;
-                    let ctx_start = start.max(covered);
-                    for (k, (ctx, ctx_term)) in lines.iter().enumerate().take(idx).skip(ctx_start) {
+                    let ctx_start = first_ctx.max(covered.saturating_add(1));
+                    // The window holds lines strictly older than this one, so
+                    // `ctx_start` alone bounds the run -- there is no upper end
+                    // to test for.
+                    for (ctx, ctx_term, no) in window.iter_from(ctx_start, window.oldest(lineno)) {
                         if grep.conf.only {
                             if grep.conf.prints_context_spans() {
-                                write_spans(grep, out, display, show_name, (k + 1) as u64, b'-', ctx)?;
+                                write_spans(grep, out, display, show_name, *no, b'-', ctx)?;
                             }
                             continue;
                         }
-                        io(prefix(out, grep, display, show_name, Some((k + 1) as u64), b'-'))?;
+                        io(prefix(out, grep, display, show_name, Some(*no), b'-'))?;
                         io(out.write(ctx))?;
-                        if *ctx_term || k + 1 < lines.len() {
+                        // Only the LAST record can lack a separator, so this is
+                        // the same test the whole-file form spelled as "or there
+                        // is a line after it".
+                        if *ctx_term {
                             io(out.write(&[sep]))?;
                         }
                     }
@@ -1384,7 +1512,7 @@ fn search_file(
                     // input line that carried no newline of its own.
                     io(out.write(&[sep]))?;
                 }
-                covered = idx + 1;
+                covered = lineno;
                 pending_after = grep.conf.after_lines();
             }
             if grep.conf.max_count.is_some_and(|m| count >= m) {
@@ -1406,10 +1534,17 @@ fn search_file(
                 io(out.write(line))?;
                 io(out.write(&[sep]))?;
             }
-            covered = idx + 1;
+            covered = lineno;
             pending_after -= 1;
         }
         if out.is_broken() {
+            break;
+        }
+        if keep_window && window.push(rec.line(), rec.terminated(), lineno).is_err() {
+            if !grep.conf.no_messages {
+                errb(&name_in("", display, ": out of memory"));
+            }
+            *read_failed = true;
             break;
         }
     }

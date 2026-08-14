@@ -247,9 +247,12 @@ a
 # among them), so the count is accepted -- and GNU then walks its before-count
 # down in a loop whose cost is linear in the NUMBER, so it does not return
 # (still running after 20s), which is why this golden is td-txt's own and not
-# captured from it. td-txt indexes input it has already read, so the count costs
-# nothing and the answer is the one GNU is computing: every line, the context
-# covering the file. One more digit is the refusal two cases up in grep-cli.
+# captured from it. td-txt's before-window is a ring that GROWS as lines arrive
+# and is indexed arithmetically, so the count costs what the FILE holds rather
+# than what the NUMBER says, and the answer is the one GNU is computing: every
+# line, the context covering the file. Reserving the count up front is what an
+# earlier draft of the streaming reader did, and it aborted here before reading
+# a line. One more digit is the refusal two cases up in grep-cli.
 ## argv: grep -00000111111111111111111111 -n a h
 ## file h:
 a

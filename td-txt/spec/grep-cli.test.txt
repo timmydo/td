@@ -1386,6 +1386,41 @@ a
 ## status: 1
 ## stderr-contains: ambiguous argument '' for '--directories'
 
+#### a settled pattern set still REPORTS an operand it cannot read
+# `-m 0` settles the search -- nothing can match -- and GNU then never opens the
+# operands. `-L` is the exception: it prints every name, so it must still open
+# and READ each one, and only the read discovers a directory. Streaming made
+# this a live question, because the search no longer reads before it decides
+# there is nothing to look for.
+## argv: grep -L -m 0 a d f
+## file d/x:
+a
+## END
+## file f:
+a
+## END
+## stdout:
+d
+f
+## END
+## status: 2
+## stderr-contains: Is a directory
+
+#### and the same through -f rather than -m
+## argv: grep -L -f /dev/null d f
+## file d/x:
+a
+## END
+## file f:
+a
+## END
+## stdout:
+d
+f
+## END
+## status: 2
+## stderr-contains: Is a directory
+
 #### -d skip does not skip STDIN, even with a directory named `-` alongside
 # `-` names stdin, not a path, so the skip decision must not stat it: with a
 # directory of that name in the working directory, statting the operand skips a

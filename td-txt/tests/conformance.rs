@@ -41,7 +41,7 @@ fn bin() -> PathBuf {
 /// missing vendored `.inp`/`.good`, or a typo'd annotation reds in-loop — without
 /// depending on the behavioral run below.
 /// Raise this with the corpus; it exists to catch a corpus that SHRANK.
-const CORPUS_FLOOR: usize = 2271;
+const CORPUS_FLOOR: usize = 2273;
 
 #[test]
 fn corpus_is_well_formed() -> Result<(), Box<dyn std::error::Error>> {
@@ -1148,6 +1148,166 @@ fn a_diverging_diagnostic_still_names_in_raw_bytes() -> Result<(), Box<dyn std::
         String::from_utf8_lossy(&tmp.stderr)
     );
     assert_eq!(tmp.status.code(), Some(4));
+    Ok(())
+}
+
+/// grep STREAMS: it reports a match without waiting for end of input. The
+/// corpus cannot ask for this — a case supplies stdin as bytes and the harness
+/// closes it, and "did not wait" is exactly a question about a stream that has
+/// not ended.
+///
+/// The write end is held OPEN for the whole assertion, so a grep that read to
+/// EOF before searching would still be blocked when the deadline passes. Before
+/// this landed that is what happened, which is the same defect as
+/// `grep -q a /dev/urandom` never returning.
+#[test]
+fn grep_answers_from_a_stream_that_has_not_ended() -> Result<(), Box<dyn std::error::Error>> {
+    use std::io::Write;
+    for args in [&["-q", "hit"][..], &["-m", "1", "hit"], &["-l", "hit"]] {
+        let mut child = std::process::Command::new(bin())
+            .arg("grep")
+            .args(args)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .spawn()?;
+        let mut sink = child.stdin.take().ok_or("no stdin pipe")?;
+        sink.write_all(b"hit\n")?;
+        sink.flush()?;
+        // `sink` stays alive: the pipe is still open and no EOF is coming.
+        let mut waited = 0;
+        let code = loop {
+            if let Some(st) = child.try_wait()? {
+                break st.code();
+            }
+            if waited >= 10_000 {
+                let _ = child.kill();
+                return Err(format!("grep {args:?} never answered while the pipe stayed open").into());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            waited += 20;
+        };
+        assert_eq!(code, Some(0), "grep {args:?} answered, but not with a match");
+        drop(sink);
+        let _ = child.wait();
+    }
+    Ok(())
+}
+
+/// The binary verdict follows the STREAM: a NUL makes every match from the
+/// buffer it was found in onward one notice, and matches already printed stay
+/// printed. Needs an operand bigger than a buffer, which no corpus case is.
+///
+/// What is asserted is the RULE, not the arithmetic. GNU grows its read buffer
+/// to hold the longest line, so exactly which matches fall on which side of the
+/// flip moves with the data; these two cases are far enough apart (a match in
+/// the first buffer, a NUL 150 KiB later) that no buffer size in the plausible
+/// range puts them together.
+#[test]
+fn a_late_nul_does_not_unprint_an_early_match() -> Result<(), Box<dyn std::error::Error>> {
+    let dir = TempDir::new("stream-binary")?;
+    let mut buf = vec![b'p'; 300_000];
+    for i in (0..buf.len()).step_by(80) {
+        if let Some(b) = buf.get_mut(i) {
+            *b = b'\n';
+        }
+    }
+    let put = |buf: &mut Vec<u8>, at: usize, s: &[u8]| {
+        for (i, b) in s.iter().enumerate() {
+            if let Some(slot) = buf.get_mut(at + i) {
+                *slot = *b;
+            }
+        }
+    };
+    put(&mut buf, 100, b"\nmatchme\n");
+    put(&mut buf, 250_000, b"\n\x00\n");
+    std::fs::write(dir.0.join("mixed"), &buf)?;
+    let out = std::process::Command::new(bin())
+        .arg("grep")
+        .args(["matchme", "mixed"])
+        .current_dir(&dir.0)
+        .output()?;
+    assert_eq!(
+        out.stdout,
+        b"matchme\n".to_vec(),
+        "the early match was swallowed by a NUL 150 KiB after it"
+    );
+    assert_eq!(out.status.code(), Some(0));
+
+    // The same file with the NUL FIRST is binary throughout, notice and all.
+    let mut early = buf.clone();
+    put(&mut early, 50, b"\n\x00\n");
+    std::fs::write(dir.0.join("early"), &early)?;
+    let out = std::process::Command::new(bin())
+        .arg("grep")
+        .args(["matchme", "early"])
+        .current_dir(&dir.0)
+        .output()?;
+    assert_eq!(out.stdout, Vec::new(), "a NUL before the match still printed the line");
+    assert_eq!(out.stderr, b"grep: early: binary file matches\n".to_vec());
+
+    // STICKY: a NUL in one buffer keeps the file binary even where the buffer
+    // holding the match has none of its own. Verified against GNU 3.11, which
+    // reports the notice here rather than the line. Without this the flag could
+    // be cleared by the next clean buffer and every other assertion in this
+    // file would still pass.
+    let mut late = vec![b'p'; 400_000];
+    for i in (0..late.len()).step_by(80) {
+        if let Some(b) = late.get_mut(i) {
+            *b = b'\n';
+        }
+    }
+    put(&mut late, 100_000, b"\n\x00\n");
+    put(&mut late, 250_000, b"\nmatchme\n");
+    std::fs::write(dir.0.join("sticky"), &late)?;
+    let out = std::process::Command::new(bin())
+        .arg("grep")
+        .args(["matchme", "sticky"])
+        .current_dir(&dir.0)
+        .output()?;
+    assert_eq!(
+        out.stdout,
+        Vec::new(),
+        "a NUL-free later buffer made the file text again and printed the line"
+    );
+    assert_eq!(out.stderr, b"grep: sticky: binary file matches\n".to_vec());
+    Ok(())
+}
+
+/// `-B` context spanning a buffer boundary. The window is a ring of copies now
+/// rather than a slice of the whole file, so a match just past a boundary must
+/// still print the lines that preceded it from the buffer BEFORE — the one case
+/// where the streaming rewrite could silently drop output.
+#[test]
+fn before_context_survives_a_buffer_boundary() -> Result<(), Box<dyn std::error::Error>> {
+    let dir = TempDir::new("stream-ctx")?;
+    // Lines of a fixed width so the boundary lands mid-file at a known line.
+    let width = 100;
+    let per_buf = (96 << 10) / width;
+    let mut text = Vec::new();
+    let hit = per_buf + 3;
+    for n in 1..=(per_buf + 10) {
+        let body = if n == hit { b'h' } else { b'.' };
+        text.extend_from_slice(&vec![body; width - 1]);
+        text.push(b'\n');
+    }
+    std::fs::write(dir.0.join("wide"), &text)?;
+    let out = std::process::Command::new(bin())
+        .arg("grep")
+        .args(["-n", "-B", "3", &"h".repeat(width - 1), "wide"])
+        .current_dir(&dir.0)
+        .output()?;
+    let got = String::from_utf8_lossy(&out.stdout);
+    let nums: Vec<&str> = got.lines().filter_map(|l| l.split(['-', ':']).next()).collect();
+    assert_eq!(
+        nums,
+        vec![
+            (hit - 3).to_string(),
+            (hit - 2).to_string(),
+            (hit - 1).to_string(),
+            hit.to_string()
+        ],
+        "the -B window lost lines across the buffer boundary: {got:?}"
+    );
     Ok(())
 }
 

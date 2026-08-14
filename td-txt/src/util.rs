@@ -1,5 +1,6 @@
-//! Shared plumbing for the applets: byte-oriented argv, whole-file input, and a
-//! buffered stdout that treats a closed pipe as "stop", not as a hard error.
+//! Shared plumbing for the applets: byte-oriented argv, input both whole (sed)
+//! and streamed a record at a time (grep's `Records`), and a buffered stdout
+//! that treats a closed pipe as "stop", not as a hard error.
 
 use std::ffi::OsString;
 use std::io::{IsTerminal, Read, Seek, Write};
@@ -135,12 +136,6 @@ impl Input {
         Ok(Self::File(std::fs::File::open(path_from_bytes(path))?))
     }
 
-    /// Why `-i` may not rewrite this, if it may not -- GNU's two refusals, in GNU's
-    /// ORDER, since a terminal is also not a regular file and the first test is what
-    /// names it. Asked of the OPEN descriptor rather than of the name, so the answer
-    /// cannot be about a different file than the one that will be read. Stdin cannot
-    /// arrive here (`-i` opens `-` as the ordinary name it is) and is refused as the
-    /// non-file it would be.
     /// Whether the OPEN descriptor is a directory. Stdin is never one for this
     /// purpose even when it genuinely is: GNU exempts it by DESCRIPTOR, so
     /// `grep -d skip x - < somedir` reports `(standard input): Is a directory`
@@ -153,6 +148,12 @@ impl Input {
         }
     }
 
+    /// Why `-i` may not rewrite this, if it may not -- GNU's two refusals, in GNU's
+    /// ORDER, since a terminal is also not a regular file and the first test is what
+    /// names it. Asked of the OPEN descriptor rather than of the name, so the answer
+    /// cannot be about a different file than the one that will be read. Stdin cannot
+    /// arrive here (`-i` opens `-` as the ordinary name it is) and is refused as the
+    /// non-file it would be.
     pub fn in_place_refusal(&self) -> Option<&'static str> {
         let Self::File(file) = self else {
             return Some("not a regular file");
@@ -254,24 +255,12 @@ pub fn give_back_stdin(unread: u64) -> std::io::Result<()> {
 }
 
 /// Read a whole input, or stdin for `-`, for a caller the two failures read alike
-/// to. Applets read whole inputs: both grep and sed need arbitrary lookahead
-/// within a file, and the largest thing td's image greps is a source tree.
+/// to. SED's readers and grep's `-f` pattern files, which need the whole text at
+/// once; grep's own operands stream through `Records` and no longer come this
+/// way.
 pub fn read_input(path: &[u8]) -> std::io::Result<Vec<u8>> {
     let mut input = Input::open(path, true)?;
     input.read_all().map_err(|(err, _)| err)
-}
-
-/// A read that failed, and whether the OPEN is what failed. GNU counts a file it
-/// opened and could not READ as one it processed and found nothing in -- a
-/// directory operand is the reachable case, so `grep -c a d` prints its `0` --
-/// while a name it could not open at all was never processed.
-pub struct ReadFail {
-    pub err: std::io::Error,
-    pub opened: bool,
-    /// What the read DID return before failing. A read can append bytes and then
-    /// fail, and those bytes were still read: discarding them would report a file
-    /// as empty that had matches in it.
-    pub partial: Vec<u8>,
 }
 
 /// `read_input` for the SEARCH: it reports where the failure fell, and a name the
@@ -284,19 +273,192 @@ pub struct ReadFail {
 /// name. A directory the process may not open is therefore still reported, and
 /// still exit 2; deciding from the name instead swallows that error silently.
 /// `Ok(None)` is the skip.
-pub fn read_search(
+pub fn open_search(
     path: &[u8],
     from_walk: bool,
     skip_dirs: bool,
-) -> Result<Option<Vec<u8>>, ReadFail> {
-    let mut input = match Input::open(path, !from_walk) {
-        Ok(input) => input,
-        Err(err) => return Err(ReadFail { err, opened: false, partial: Vec::new() }),
-    };
+) -> Result<Option<Input>, std::io::Error> {
+    let input = Input::open(path, !from_walk)?;
     if skip_dirs && input.is_dir() {
         return Ok(None);
     }
-    input.read_all().map(Some).map_err(|(err, partial)| ReadFail { err, opened: true, partial })
+    Ok(Some(input))
+}
+
+impl std::io::Read for Input {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            Self::Stdin => std::io::stdin().lock().read(buf),
+            Self::File(file) => file.read(buf),
+        }
+    }
+}
+
+/// grep's input one record at a time, so a search never holds the whole file.
+/// This is what lets `grep -q a /dev/urandom` return at the first match instead
+/// of reading forever, and what stops a large operand costing its own size in
+/// memory. `-B N` is the exception and is not this type's: the caller retains N
+/// whole records to print them as context.
+///
+/// The read buffer is FIXED. A record longer than it spills into `spill` and
+/// grows there, which is why an input with no separator at all (`/dev/zero`) is
+/// still unsearchable by anything line-based, GNU included -- one unbounded
+/// record has to be held whole to be matched against.
+///
+/// `binary` is set by the FILL rather than by the record, because that is where
+/// grep's binary test lives: a NUL anywhere in a buffer makes every match from
+/// that buffer onward the notice, and matches already emitted stay emitted. It
+/// is STICKY, as GNU's is -- a later NUL-free buffer does not make a file text
+/// again. Which side of the flip a given match falls on depends on where the
+/// buffer boundaries land, and that is NOT a promise: GNU GROWS its buffer to
+/// hold the longest line, so its own boundary moves with the data (measured:
+/// with 80-byte lines a match at 200000 is suppressed by a NUL at 250000, and
+/// with 100000-byte lines the same pair is not). td-txt reproduces the RULE and
+/// declines to reproduce the arithmetic.
+pub struct Records<R> {
+    src: R,
+    buf: Vec<u8>,
+    /// Valid bytes of `buf`.
+    len: usize,
+    /// Next unscanned byte of `buf`.
+    pos: usize,
+    /// A record that spans fills is assembled here; one that does not is handed
+    /// out as a slice of `buf`, so the common case copies nothing.
+    spill: Vec<u8>,
+    spilled: bool,
+    start: usize,
+    end: usize,
+    terminated: bool,
+    sep: u8,
+    eof: bool,
+    binary: bool,
+    /// A read failure deferred until the bytes read before it were handed over.
+    pending: Option<std::io::Error>,
+}
+
+impl<R: std::io::Read> Records<R> {
+    /// 96 KiB because that is GNU's own initial buffer, so on a REGULAR file --
+    /// where a `read` fills what it is given -- the boundaries agree with GNU's
+    /// for as long as GNU has not had to grow. Nothing depends on the number.
+    pub const BUF: usize = 96 << 10;
+
+    pub fn new(src: R, sep: u8) -> Self {
+        Self {
+            src,
+            buf: vec![0; Self::BUF],
+            len: 0,
+            pos: 0,
+            spill: Vec::new(),
+            spilled: false,
+            start: 0,
+            end: 0,
+            terminated: false,
+            sep,
+            eof: false,
+            binary: false,
+            pending: None,
+        }
+    }
+
+    pub fn binary(&self) -> bool {
+        self.binary
+    }
+
+    pub fn line(&self) -> &[u8] {
+        match self.spilled {
+            true => &self.spill,
+            false => self.buf.get(self.start..self.end).unwrap_or_default(),
+        }
+    }
+
+    pub fn terminated(&self) -> bool {
+        self.terminated
+    }
+
+    /// ONE `read` per fill, which is `fillbuf`'s shape: looping until the buffer
+    /// was full would make a pipe wait for 96 KiB before the first match could
+    /// be reported.
+    fn fill(&mut self) -> std::io::Result<()> {
+        self.len = 0;
+        self.pos = 0;
+        // `Interrupted` is not a read failure, it is a signal that arrived
+        // mid-call; `read_to_end` retried it and so must this, or a `SIGWINCH`
+        // during a long search becomes `grep: f: Interrupted system call`.
+        let n = loop {
+            match self.src.read(&mut self.buf) {
+                Ok(n) => break n,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(e),
+            }
+        };
+        if n == 0 {
+            self.eof = true;
+            return Ok(());
+        }
+        self.len = n;
+        if self.buf.get(..n).is_some_and(|s| s.contains(&0)) {
+            self.binary = true;
+        }
+        Ok(())
+    }
+
+    /// Advance to the next record. `false` is end of input.
+    pub fn next(&mut self) -> std::io::Result<bool> {
+        self.spill.clear();
+        self.spilled = false;
+        self.terminated = false;
+        // A failure held back from the previous call so the bytes read BEFORE it
+        // could be searched first. Reported now, once, and not again.
+        if let Some(err) = self.pending.take() {
+            return Err(err);
+        }
+        loop {
+            let hay = self.buf.get(self.pos..self.len).unwrap_or_default();
+            if let Some(rel) = hay.iter().position(|b| *b == self.sep) {
+                let (s, e) = (self.pos, self.pos.saturating_add(rel));
+                self.pos = e.saturating_add(1);
+                self.terminated = true;
+                if self.spilled {
+                    let seg = self.buf.get(s..e).unwrap_or_default();
+                    self.spill.try_reserve(seg.len()).map_err(|_| oom())?;
+                    self.spill.extend_from_slice(seg);
+                } else {
+                    (self.start, self.end) = (s, e);
+                }
+                return Ok(true);
+            }
+            // No separator in what is held: carry the remainder and refill. The
+            // carry is what makes a record able to cross a buffer at all.
+            if self.pos < self.len {
+                let seg = self.buf.get(self.pos..self.len).unwrap_or_default();
+                self.spill.try_reserve(seg.len()).map_err(|_| oom())?;
+                self.spill.extend_from_slice(seg);
+                self.spilled = true;
+                self.pos = self.len;
+            }
+            if self.eof {
+                // A final record carrying no separator of its own.
+                return Ok(self.spilled && !self.spill.is_empty());
+            }
+            if let Err(e) = self.fill() {
+                // Bytes were read, and THEN the next read failed. Those bytes
+                // are a record GNU searches -- the whole-file reader this
+                // replaced kept them as `ReadFail::partial` for the same reason
+                // -- so hand them over and report the failure on the next call.
+                if self.spilled && !self.spill.is_empty() {
+                    self.pending = Some(e);
+                    return Ok(true);
+                }
+                return Err(e);
+            }
+        }
+    }
+}
+
+/// What `read_to_end` reports when an allocation fails, so an operand too big to
+/// hold is a diagnosed `out of memory` and the applet carries on to the next.
+fn oom() -> std::io::Error {
+    std::io::Error::from(std::io::ErrorKind::OutOfMemory)
 }
 
 /// Write one line to stdout, treating a CLOSED READER as "done" rather than as a
@@ -642,5 +804,82 @@ mod tests {
     fn number_renders_decimal() {
         assert_eq!(number(0), b"0".to_vec());
         assert_eq!(number(1207), b"1207".to_vec());
+    }
+
+    /// A reader that hands back scripted results, so the failure paths a real
+    /// descriptor will not produce on demand can still be driven.
+    struct Scripted(Vec<std::io::Result<&'static [u8]>>);
+
+    impl std::io::Read for Scripted {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if self.0.is_empty() {
+                return Ok(0);
+            }
+            match self.0.remove(0) {
+                Ok(bytes) => {
+                    let n = bytes.len().min(buf.len());
+                    buf.get_mut(..n).unwrap_or_default().copy_from_slice(&bytes[..n]);
+                    Ok(n)
+                }
+                Err(e) => Err(e),
+            }
+        }
+    }
+
+    fn err(kind: std::io::ErrorKind) -> std::io::Result<&'static [u8]> {
+        Err(std::io::Error::from(kind))
+    }
+
+    #[test]
+    fn a_read_failure_does_not_swallow_the_bytes_read_before_it() {
+        // "match" arrives with no separator, and THEN the read fails. Those
+        // bytes are a record; the failure is owed too, but after them.
+        let src = Scripted(vec![Ok(b"match"), err(std::io::ErrorKind::Other)]);
+        let mut rec = Records::new(src, b'\n');
+        assert!(rec.next().unwrap(), "the partial record was dropped");
+        assert_eq!(rec.line(), b"match");
+        assert!(!rec.terminated());
+        assert!(rec.next().is_err(), "the deferred failure was never reported");
+    }
+
+    #[test]
+    fn a_failure_with_nothing_buffered_is_reported_at_once() {
+        let src = Scripted(vec![err(std::io::ErrorKind::PermissionDenied)]);
+        let mut rec = Records::new(src, b'\n');
+        assert!(rec.next().is_err());
+    }
+
+    #[test]
+    fn an_interrupted_read_is_retried_rather_than_reported() {
+        let src = Scripted(vec![err(std::io::ErrorKind::Interrupted), Ok(b"a\nb\n")]);
+        let mut rec = Records::new(src, b'\n');
+        assert!(rec.next().unwrap());
+        assert_eq!(rec.line(), b"a");
+        assert!(rec.next().unwrap());
+        assert_eq!(rec.line(), b"b");
+        assert!(!rec.next().unwrap());
+    }
+
+    #[test]
+    fn a_record_spanning_reads_is_assembled_whole() {
+        let src = Scripted(vec![Ok(b"ab"), Ok(b"cd"), Ok(b"ef\ntail\n")]);
+        let mut rec = Records::new(src, b'\n');
+        assert!(rec.next().unwrap());
+        assert_eq!(rec.line(), b"abcdef");
+        assert!(rec.terminated());
+        assert!(rec.next().unwrap());
+        assert_eq!(rec.line(), b"tail");
+    }
+
+    #[test]
+    fn the_binary_flag_is_set_by_the_fill_and_stays_set() {
+        let src = Scripted(vec![Ok(b"a\n"), Ok(b"\x00\n"), Ok(b"b\n")]);
+        let mut rec = Records::new(src, b'\n');
+        assert!(rec.next().unwrap());
+        assert!(!rec.binary(), "a NUL-free first buffer reported binary");
+        assert!(rec.next().unwrap());
+        assert!(rec.binary(), "the buffer holding the NUL did not report binary");
+        assert!(rec.next().unwrap());
+        assert!(rec.binary(), "a later NUL-free buffer cleared the verdict");
     }
 }
