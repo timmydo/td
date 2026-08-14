@@ -2858,13 +2858,68 @@ fn unalias(sh: &mut Shell, argv: &[String]) -> R<()> {
     status(sh, ret)
 }
 
-/// `exec [command [arg …]]`. With no command this is only a carrier for its
-/// redirections, which the caller leaves in force instead of restoring; with one
-/// it REPLACES this shell, so it returns only when the command cannot be run.
+/// `exec [-a NAME] [--] [command [arg …]]`. With no command this is only a
+/// carrier for its redirections, which the caller leaves in force instead of
+/// restoring; with one it REPLACES this shell, so it returns only when the
+/// command cannot be run.
 fn exec_cmd(sh: &mut Shell, argv: &[String]) -> R<()> {
-    match argv.get(1..) {
+    let (i, arg0) = match exec_options(argv) {
+        Ok(parsed) => parsed,
+        Err(msg) => return special_usage_error(sh, &msg),
+    };
+    match argv.get(i..) {
         None | Some([]) => ok(sh),
-        Some(words) => process::exec_replace(sh, words),
+        Some(words) => process::exec_replace(sh, words, arg0),
+    }
+}
+
+/// `exec`'s `nextopt("a:")` scan (ash.c:10073): the index of the first COMMAND
+/// word, and `-a`'s argv[0] override. `-a` eats the rest of its word, so there
+/// is no cluster to walk.
+fn exec_options(argv: &[String]) -> Result<(usize, Option<&str>), String> {
+    let mut arg0: Option<&str> = None;
+    let mut i = 1usize;
+    while let Some(letters) = argv
+        .get(i)
+        .and_then(|w| w.strip_prefix('-'))
+        .filter(|f| !f.is_empty())
+    {
+        i += 1;
+        if letters == "-" {
+            break; // the word was `--`
+        }
+        let mut cs = letters.chars();
+        match cs.next() {
+            Some('a') => {}
+            Some(bad) => return Err(format!("exec: illegal option -{bad}")),
+            // Unreachable: the filter above rejects an empty `letters`.
+            None => break,
+        }
+        // Attached (`-aNAME`) or the next word, which `nextopt` takes RAW --
+        // so `exec -a -- cmd` names the replacement `--`.
+        let attached = cs.as_str();
+        if attached.is_empty() {
+            let Some(next) = argv.get(i) else {
+                return Err("exec: no arg for -a option".to_owned());
+            };
+            arg0 = Some(next);
+            i += 1;
+        } else {
+            arg0 = Some(attached);
+        }
+    }
+    Ok((i, arg0))
+}
+
+/// Whether this `exec` is the bare form whose redirections STAY in force: it is
+/// COMMAND words that decide, not argv length -- `exec -- 3>&1` has two words
+/// and none of them a command.
+pub fn exec_keeps_redirections(argv: &[String]) -> bool {
+    match exec_options(argv) {
+        Ok((i, _)) => matches!(argv.get(i..), None | Some([])),
+        // A refusal took no command word either, so it unwinds like any other
+        // failed builtin.
+        Err(_) => false,
     }
 }
 
@@ -3673,7 +3728,7 @@ fn command(sh: &mut Shell, argv: &[String]) -> R<()> {
         sh.locals = saved;
         return result;
     }
-    crate::process::exec_external(sh, &rest, path, "")
+    crate::process::exec_external(sh, &rest, path, "", None)
 }
 
 // ---- test / [ ------------------------------------------------------------
@@ -4553,13 +4608,19 @@ mod tests {
             ("trap -Z", "trap: illegal option -Z\n", "", 2),
             (". -Z", ".: illegal option -Z\n", "", 2),
             ("source -Z", "source: illegal option -Z\n", "", 2),
+            ("exec -Z", "exec: illegal option -Z\n", "", 2),
+            // The option scan runs BEFORE the no-command check, so a bad one is
+            // fatal even where `exec` would otherwise have done nothing.
+            ("exec -aX -Z", "exec: illegal option -Z\n", "", 2),
             // A CLUSTER is read letter by letter, so the refusal names the one
-            // it stopped on rather than the word that carried it -- which is
-            // only visible when a VALID letter precedes the bad one.
+            // it stopped on rather than the word that carried it -- whichever
+            // position in the word the bad letter is in.
             ("cd -Zq", "cd: illegal option -Z\n", "after=2\n", 0),
             ("jobs -xy", "jobs: illegal option -x\n", "after=2\n", 0),
             ("jobs -pZ", "jobs: illegal option -Z\n", "after=2\n", 0),
             ("wait -xy", "wait: illegal option -x\n", "after=2\n", 0),
+            // `exec` can only ever show the bad-first one: `a` eats its word.
+            ("exec -Za", "exec: illegal option -Z\n", "", 2),
             // The one ash spells with a capital, and the one that carries no
             // name: a bare `fprintf` (ash.c:11714), not `nextopt`'s.
             ("set -- -Z; getopts a: o", "Illegal option -Z\n", "after=0\n", 0),
@@ -4579,6 +4640,8 @@ mod tests {
         for (src, err, out, code) in [
             ("read -p", "read: no arg for -p option\n", "after=2\n", 0),
             ("read -u", "read: no arg for -u option\n", "after=2\n", 0),
+            // `exec`'s is `nextopt`'s too, and fatal because `exec` is special.
+            ("exec -a", "exec: no arg for -a option\n", "", 2),
             ("set -- -a; getopts a: o", "No arg for -a option\n", "after=0\n", 0),
             ("wait -", "wait: Illegal number: -\n", "after=2\n", 0),
             ("wait -- -5", "wait: Illegal number: -5\n", "after=2\n", 0),
@@ -6777,6 +6840,12 @@ mod tests {
         );
         // Bare `exec` is a no-op that succeeds.
         assert_eq!(run_capturing("exec; echo status=$?").1, "status=0\n");
+        // "Bare" is about COMMAND WORDS, not argv length: each of these has
+        // options and no command, so the descriptor has to survive.
+        for opts in ["--", "-a NAME", "-aNAME", "-a NAME --"] {
+            let (st, out, err) = run_capturing(&format!("exec {opts} 3>&1\necho hi 1>&3"));
+            assert_eq!((st, out.as_str(), err.as_str()), (0, "hi\n", ""), "exec {opts}");
+        }
     }
 
     #[test]
@@ -6785,6 +6854,29 @@ mod tests {
         let (status, out, err) = run_capturing("exec no_such_cmd_xyz\necho NOTREACHED");
         assert_eq!((status, out.as_str()), (127, ""));
         assert!(err.contains("not found"), "err: {err:?}");
+    }
+
+    /// What `nextopt` treats as an option and what it hands through. The `-a`
+    /// VALUE landing on argv[0] needs a real spawn and is pinned in
+    /// `tests/conformance.rs`; this is the parsing either side of it.
+    #[test]
+    fn exec_takes_dash_a_and_a_double_dash_and_refuses_the_rest() {
+        // `--` is consumed; a lone `-` and a `+` word are not options at all.
+        // Reaching `not found` is the proof each got PAST the scan.
+        for src in ["exec -- no_such_cmd_xyz", "exec -", "exec +Z"] {
+            let (status, _o, err) = run_capturing(&format!("{src}\necho NOTREACHED"));
+            assert_eq!(status, 127, "{src}");
+            assert!(err.contains("not found"), "{src}: {err:?}");
+        }
+        // `-a` eats the next word RAW, so `--` is a NAME here and not a
+        // terminator -- and with no command left, `exec` does nothing at 0.
+        let (status, out, err) = run_capturing("exec -a -- ; echo after=$?");
+        assert_eq!((status, out.as_str(), err.as_str()), (0, "after=0\n", ""));
+        // Attached and separate spellings both consume, leaving no command.
+        for src in ["exec -a renamed", "exec -arenamed", "exec -a x -a y"] {
+            let (status, out, err) = run_capturing(&format!("{src}; echo after=$?"));
+            assert_eq!((status, out.as_str(), err.as_str()), (0, "after=0\n", ""), "{src}");
+        }
     }
 
     #[test]

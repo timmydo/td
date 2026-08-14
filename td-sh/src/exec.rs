@@ -1693,7 +1693,7 @@ fn dispatch_simple(
                     sh.set_var(&a.name, &value)?;
                     sh.export(&a.name);
                 }
-                process::exec_external(sh, argv, None, "")
+                process::exec_external(sh, argv, None, "", None)
             })();
             process::restore_redirs(sh, saved);
             r
@@ -1745,7 +1745,7 @@ fn run_builtin(
         // stay in force for the rest of the shell instead of being unwound here.
         // With a command word they belong to the replacement process, so a FAILED
         // `exec` (which only returns in an interactive shell) must still unwind.
-        if matches!(bi, builtin::Builtin::Exec) && argv.len() == 1 {
+        if matches!(bi, builtin::Builtin::Exec) && builtin::exec_keeps_redirections(argv) {
             return result;
         }
         process::restore_redirs(sh, saved);

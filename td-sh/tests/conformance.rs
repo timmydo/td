@@ -1005,6 +1005,43 @@ fn argv0_is_the_word_the_shell_was_given_not_the_path_it_resolved()
     let script = format!("PATH='{dir}'\nexec mysh -c 'echo $0'\n");
     let out = std::process::Command::new(&shell).arg("-c").arg(&script).output()?;
     assert_eq!(String::from_utf8_lossy(&out.stdout), "mysh\n");
+
+    // `exec -a NAME` is the one thing that overrides the word, in both
+    // spellings. The LAST `-a` wins.
+    for form in ["-a renamed", "-arenamed", "-a first -a renamed"] {
+        let script = format!("PATH='{dir}'\nexec {form} mysh -c 'echo $0'\n");
+        let out = std::process::Command::new(&shell).arg("-c").arg(&script).output()?;
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "renamed\n", "{form}");
+    }
+    // The OTHER call site: a subshell cannot replace the process, so it falls
+    // back to the ordinary spawn, which has its own `arg0`.
+    let script = format!("PATH='{dir}'\n(exec -a renamed mysh -c 'echo $0')\n");
+    let out = std::process::Command::new(&shell).arg("-c").arg(&script).output()?;
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "renamed\n");
+
+    // `-a` takes the next word RAW, so `--` is a NAME and not a terminator.
+    // Spelled absolutely: a bare name would meet ash's search divergence below
+    // and so could not be measured against it.
+    let script = format!("exec -a -- '{}' -c 'echo $0'\n", shell.display());
+    let out = std::process::Command::new(&shell).arg("-c").arg(&script).output()?;
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "--\n");
+
+    // It renames WITHOUT redirecting the search, unlike ash (ash.c:8354). The
+    // two names must be DIFFERENT PROGRAMS or the assertion is vacuous.
+    use std::os::unix::fs::PermissionsExt;
+    let decoy = bin.join("decoy");
+    std::fs::write(&decoy, format!("#!{}\necho I-AM-DECOY\n", shell.display()))?;
+    std::fs::set_permissions(&decoy, std::fs::Permissions::from_mode(0o755))?;
+    // A decoy that cannot EXECUTE would leave the rows below passing whatever
+    // the shell did, which is the vacuity they exist to escape.
+    let out = std::process::Command::new(&decoy).output()?;
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "I-AM-DECOY\n");
+    for form in ["exec -a decoy mysh", "(exec -a decoy mysh"] {
+        let close = if form.starts_with('(') { ")" } else { "" };
+        let script = format!("PATH='{dir}'\n{form} -c 'echo $0 ran'{close}\n");
+        let out = std::process::Command::new(&shell).arg("-c").arg(&script).output()?;
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "decoy ran\n", "{form}");
+    }
     Ok(())
 }
 

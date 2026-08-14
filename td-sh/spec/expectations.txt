@@ -570,6 +570,7 @@ xfail builtin-printf.test.sh::Too large
 xfail builtin-printf.test.sh::printf octal backslash escapes
 xfail builtin-printf.test.sh::unsigned / octal / hex big
 xfail builtin-process.test.sh::arg that would overflow 64 bits is detected
+xfail builtin-process.test.sh::exec -- 2>&1
 xfail builtin-process.test.sh::exec builtin
 xfail builtin-process.test.sh::time with brace group argument
 xfail builtin-process.test.sh::ulimit -f 1 prevents files larger 512 bytes

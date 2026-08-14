@@ -1667,7 +1667,9 @@ fn read_capture(sh: &mut Shell, buf: &Arc<Mutex<Vec<u8>>>) -> R<String> {
 /// in-process buffers (a pipeline stage or command substitution): those bytes have
 /// no kernel descriptor to hand over, so the command is run normally and the shell
 /// exits with its status, which is what the caller would have observed anyway.
-pub fn exec_replace(sh: &mut Shell, argv: &[String]) -> R<()> {
+/// `arg0` is `exec -a NAME`'s override. It names the replacement without
+/// changing which program is FOUND, deliberately unlike ash (ash.c:8354).
+pub fn exec_replace(sh: &mut Shell, argv: &[String], arg0: Option<&str>) -> R<()> {
     use std::os::unix::process::CommandExt;
 
     let Some(program) = argv.first() else {
@@ -1693,7 +1695,7 @@ pub fn exec_replace(sh: &mut Shell, argv: &[String]) -> R<()> {
         // emulation has to drop it too -- otherwise this shell runs an EXIT trap
         // the exec'd program could never have run.
         sh.traps.clear();
-        exec_external(sh, argv, None, "exec: ")?;
+        exec_external(sh, argv, None, "exec: ", arg0)?;
         return Err(Sig::Exit(sh.status));
     }
 
@@ -1708,7 +1710,7 @@ pub fn exec_replace(sh: &mut Shell, argv: &[String]) -> R<()> {
     }
 
     let mut cmd = Command::new(&resolved);
-    cmd.arg0(program);
+    cmd.arg0(arg0.unwrap_or(program));
     cmd.args(argv.iter().skip(1));
     cmd.env_clear();
     for (k, v) in sh.exported_env() {
@@ -1754,6 +1756,7 @@ pub fn exec_external(
     argv: &[String],
     path: Option<&str>,
     label: &str,
+    arg0: Option<&str>,
 ) -> R<()> {
     use std::os::unix::process::CommandExt;
 
@@ -1773,8 +1776,8 @@ pub fn exec_external(
 
     let mut cmd = Command::new(&resolved);
     // argv[0] is the WORD, not the path the search resolved to (ash.c:8354);
-    // `Command`'s default is the program path.
-    cmd.arg0(program);
+    // `Command`'s default is the program path. `exec -a` overrides the word.
+    cmd.arg0(arg0.unwrap_or(program));
     cmd.args(argv.iter().skip(1));
     cmd.env_clear();
     for (k, v) in sh.exported_env() {
