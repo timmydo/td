@@ -41,7 +41,7 @@ fn bin() -> PathBuf {
 /// missing vendored `.inp`/`.good`, or a typo'd annotation reds in-loop — without
 /// depending on the behavioral run below.
 /// Raise this with the corpus; it exists to catch a corpus that SHRANK.
-const CORPUS_FLOOR: usize = 2273;
+const CORPUS_FLOOR: usize = 2275;
 
 #[test]
 fn corpus_is_well_formed() -> Result<(), Box<dyn std::error::Error>> {
@@ -1297,6 +1297,60 @@ fn sed_answers_from_a_stream_that_has_not_ended() -> Result<(), Box<dyn std::err
         drop(sink);
         let _ = child.wait();
     }
+    Ok(())
+}
+
+/// An `R` source bigger than one read block, which the corpus cannot hold: its
+/// files are written inline, and this one has to span several 4 KiB reads and put
+/// a RECORD across a boundary. Both halves are pinned — that the lines arrive in
+/// order and whole, and that `-s` rewinds the reader rather than only a cursor,
+/// which a reader that kept its buffer would fail by handing back records from
+/// before the seek.
+#[test]
+fn an_r_source_crosses_read_blocks_and_still_rewinds()
+-> Result<(), Box<dyn std::error::Error>> {
+    let dir = TempDir::new("r-blocks")?;
+    // Line 900 is 9 KiB long, so it spans blocks however they fall.
+    let mut source = Vec::new();
+    for i in 0..1200u32 {
+        if i == 900 {
+            source.extend(std::iter::repeat_n(b'L', 9000));
+            source.push(b'\n');
+            continue;
+        }
+        source.extend_from_slice(format!("{i:07}\n").as_bytes());
+    }
+    std::fs::write(dir.0.join("SRC"), &source)?;
+    let lines: Vec<&[u8]> = source.split(|b| *b == b'\n').collect();
+
+    // One operand of 1000 lines: `R` hands over one source line per cycle, so the
+    // 1000th comes from well past the first block and past the long record.
+    let operand: Vec<u8> = (0..1000u32).flat_map(|i| format!("o{i}\n").into_bytes()).collect();
+    std::fs::write(dir.0.join("IN"), &operand)?;
+
+    let out = std::process::Command::new(bin())
+        .arg("sed")
+        .args(["-n", "-e", "R SRC", "-e", "p", "IN"])
+        .current_dir(&dir.0)
+        .output()?;
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    let got: Vec<&[u8]> = out.stdout.split(|b| *b == b'\n').collect();
+    // Interleaved: operand line, source line, operand line, source line ...
+    for i in 0..1000usize {
+        assert_eq!(got.get(i * 2), Some(&format!("o{i}").into_bytes().as_slice()));
+        assert_eq!(got.get(i * 2 + 1), lines.get(i), "source line {i} came back wrong");
+    }
+
+    // `-s` restarts a seekable source per operand, so the second file gets line 0
+    // again. Two one-line operands make that the whole of the output.
+    std::fs::write(dir.0.join("P"), b"p\n")?;
+    std::fs::write(dir.0.join("Q"), b"q\n")?;
+    let out = std::process::Command::new(bin())
+        .arg("sed")
+        .args(["-s", "-n", "-e", "R SRC", "-e", "p", "P", "Q"])
+        .current_dir(&dir.0)
+        .output()?;
+    assert_eq!(out.stdout, b"p\n0000000\nq\n0000000\n".to_vec());
     Ok(())
 }
 

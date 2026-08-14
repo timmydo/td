@@ -15,8 +15,9 @@
 //! and that record is not counted as delivered until it is handed out, which is
 //! what keeps the give-back to descriptor 0 honest. `-s` and `-i` open each
 //! operand themselves, to decide whether it may be rewritten, and stream it
-//! through that same reader. SCRIPTS (`-f`) and `R` sources are still read
-//! whole and are separate readers; see spec/README.
+//! through that same reader, and so does a NAMED `R` source. SCRIPTS (`-f`) are
+//! still read whole, as is `R /dev/stdin` -- the one source that shares its
+//! descriptor with the operand reader; see spec/README.
 //!
 //! Every compiled regex in a script lives in one table, and an address or `s///`
 //! holds an index into it. That is what makes the empty regex (`//`, `s//x/`)
@@ -3342,9 +3343,7 @@ fn compile_and_run(
             sed.ranges = seed_ranges(&sed.script.cmds);
             sed.hold.clear();
             for rfile in sed.rfiles.values_mut() {
-                if rfile.rewindable {
-                    rfile.pos = 0;
-                }
+                rfile.rewind();
             }
             let quit = match &conf.in_place {
                 // No give-back here, and none needed: `-i` opened this operand as
@@ -3435,14 +3434,77 @@ fn compile_and_run(
     Ok(status)
 }
 
-/// One `R` source: the lines, the cursor, and whether the per-operand reset may
-/// REWIND it. GNU rewinds with `rewind(3)`, which fails silently on a stream that
-/// cannot seek, so a pipe or fifo keeps its place across an `-s` boundary while a
-/// regular file restarts.
+/// One `R` source and whether the per-operand reset may REWIND it. GNU rewinds
+/// with `rewind(3)`, which fails silently on a stream that cannot seek, so a pipe
+/// or fifo keeps its place across an `-s` boundary while a regular file restarts.
 struct RFile {
-    lines: Vec<Line>,
-    pos: usize,
+    src: RSource,
     rewindable: bool,
+}
+
+/// Where an `R` source's lines come from. GNU takes them with `ck_getdelim` off a
+/// buffered stream, so a named source is read a BLOCK at a time here: `R` over an
+/// endless file has to hand a line to every cycle rather than never returning.
+enum RSource {
+    Stream(Records<std::fs::File>),
+    /// The standard-input special, still read WHOLE. It is the one source that
+    /// shares its descriptor with the operand reader, and two readers giving back
+    /// their own over-read cannot both be right about a RELATIVE seek; see
+    /// spec/README.
+    Whole { lines: Vec<Line>, pos: usize },
+    /// Opened and spent, or never opened at all -- `R` over a missing file is
+    /// silent, and is cached this way so the name is opened at most once.
+    Spent,
+}
+
+impl RFile {
+    /// The next line, or `None` once the source is spent. A read failure is the
+    /// run's, exit 4, and a streaming source meets it where the reader REACHES it
+    /// rather than at the first `R`.
+    fn next(&mut self, name: &[u8]) -> Result<Option<Line>, Vec<u8>> {
+        match &mut self.src {
+            RSource::Stream(rec) => match rec.next() {
+                Ok(true) => {
+                    Ok(Some(Line { text: rec.line().to_vec(), terminated: rec.terminated() }))
+                }
+                Ok(false) => Ok(None),
+                Err(e) => Err(read_error(name, &e)),
+            },
+            RSource::Whole { lines, pos } => match lines.get(*pos) {
+                Some(line) => {
+                    *pos += 1;
+                    Ok(Some(Line { text: line.text.clone(), terminated: line.terminated }))
+                }
+                None => Ok(None),
+            },
+            RSource::Spent => Ok(None),
+        }
+    }
+
+    /// Start the source again, for the per-operand reset under `-s`. `rewind(3)`
+    /// does TWO things and only one of them needs a seekable stream: it seeks to
+    /// the start, and it clears end of file EVEN WHEN THE SEEK FAILS. So a source
+    /// that ended because its last writer went away is read again if a new one
+    /// has appeared, while one that simply has no more bytes reads 0 and gives
+    /// nothing, exactly as before.
+    fn rewind(&mut self) {
+        match &mut self.src {
+            RSource::Stream(rec) => {
+                match self.rewindable
+                    && rec.source_mut().seek(std::io::SeekFrom::Start(0)).is_ok()
+                {
+                    true => rec.restart(),
+                    false => rec.forget_eof(),
+                }
+            }
+            RSource::Whole { pos, .. } => {
+                if self.rewindable {
+                    *pos = 0;
+                }
+            }
+            RSource::Spent => {}
+        }
+    }
 }
 
 /// Read a `-f` script, and say whether `#n` may come from it. GNU's test for a file
@@ -3653,9 +3715,9 @@ fn read_error(name: &[u8], e: &std::io::Error) -> Vec<u8> {
 /// `POSIXLY_CORRECT` and not through `--posix`, which withdraws `R` itself — so
 /// under the variable this opens the NAME again, hang and all, exactly as GNU
 /// does there.
-fn read_r_source(target: &FileTarget) -> Result<(Vec<u8>, bool), Vec<u8>> {
+fn open_r_source(target: &FileTarget, separator: u8) -> Result<RFile, Vec<u8>> {
     let Some(s) = target.special else {
-        return read_source(&target.path);
+        return Ok(open_source(&target.path, separator));
     };
     let Special::In = s else {
         return Err(read_error(target.name(), &ebadf()));
@@ -3667,27 +3729,50 @@ fn read_r_source(target: &FileTarget) -> Result<(Vec<u8>, bool), Vec<u8>> {
     match std::io::stdin().lock().read_to_end(&mut data) {
         // Never rewindable: GNU does not `rewind` a special stream under `-s`,
         // however seekable the descriptor behind it happens to be.
-        Ok(_) => Ok((data, false)),
+        Ok(_) => Ok(RFile {
+            src: RSource::Whole { lines: to_lines(&data, separator), pos: 0 },
+            rewindable: false,
+        }),
         Err(e) => Err(read_error(s.name().as_bytes(), &e)),
     }
 }
 
-/// Read a file named by `r`/`R`. Unlike an operand or `-f`, `-` is NOT stdin here:
-/// GNU opens the name literally, so `R -` reads a file called `-` and reads nothing
-/// when there is none (`w -` already wrote one). The bool is whether the source can
-/// be rewound — `rewind(3)`'s own test, applied to the handle just read.
+/// Open a file named by `R`, to be read a BLOCK at a time. Unlike an operand or
+/// `-f`, `-` is NOT stdin here: GNU opens the name literally, so `R -` reads a file
+/// called `-` and reads nothing when there is none (`w -` already wrote one).
+///
+/// An OPEN failure is not an error, which is what makes `R /nonexistent` silent; a
+/// READ failure IS one, exit 4, and a DIRECTORY is how you get one -- on the FIRST
+/// read now rather than at the open, which is where a directory fails anyway.
+/// Rewindability is `rewind(3)`'s own test, asked of the handle before it is read
+/// rather than after: a seek to 0 succeeds or fails on what the descriptor IS.
+fn open_source(path: &[u8], separator: u8) -> RFile {
+    let Ok(mut file) = std::fs::File::open(crate::util::path_from_bytes(path)) else {
+        return RFile { src: RSource::Spent, rewindable: false };
+    };
+    let rewindable = file.seek(std::io::SeekFrom::Start(0)).is_ok();
+    let src = RSource::Stream(Records::with_buffer(file, separator, Stream::BLOCK));
+    RFile { src, rewindable }
+}
+
+/// Read a file named by `r`, which dumps the WHOLE of it. GNU dumps the whole of
+/// it too but STREAMS while doing so, through a fixed buffer, so it needs no
+/// memory for the size of the source where this needs all of it -- `r` over a
+/// 600 MB file under a 700 MB address-space limit succeeds there and is `out of
+/// memory` here, and over `/dev/zero` GNU writes bytes for ever where this writes
+/// none. Neither returns, so only the memory differs; spec/README carries it.
 ///
 /// An OPEN failure is not an error, which is what makes `r /nonexistent` silent; a
 /// READ failure IS one, exit 4, and a DIRECTORY is how you get one.
-fn read_source(path: &[u8]) -> Result<(Vec<u8>, bool), Vec<u8>> {
+fn read_source(path: &[u8]) -> Result<Vec<u8>, Vec<u8>> {
     let mut data = Vec::new();
     let Ok(mut file) = std::fs::File::open(crate::util::path_from_bytes(path)) else {
-        return Ok((data, false));
+        return Ok(data);
     };
     if let Err(e) = file.read_to_end(&mut data) {
         return Err(read_error(path, &e));
     }
-    Ok((data, file.seek(std::io::SeekFrom::Start(0)).is_ok()))
+    Ok(data)
 }
 
 /// Is `want` newer than the GNU sed level td-txt implements? GNU's `v` runs glibc's
@@ -3949,26 +4034,21 @@ impl Sed {
         let entry = match self.rfiles.get_mut(target) {
             Some(e) => e,
             None => {
-                // A missing file is not an error for `R`: cache it as exhausted so it
-                // is opened at most once.
-                let (data, rewindable) = read_r_source(target)?;
-                let lines = to_lines(&data, separator);
-                self.rfiles.entry(target.clone()).or_insert(RFile { lines, pos: 0, rewindable })
+                let opened = open_r_source(target, separator)?;
+                self.rfiles.entry(target.clone()).or_insert(opened)
             }
         };
-        let RFile { lines, pos, .. } = entry;
-        let Some(line) = lines.get(*pos) else {
+        let Some(line) = entry.next(target.name())? else {
             return Ok(());
         };
         // `R` writes the line as it found it and owes NOTHING of its own: over a
         // source with no final newline, `sed -n -e '1R f' -e '2p'` runs the two
         // together in GNU. It still PAYS a debt the pattern space left, which the
         // ordinary write does.
-        let mut bytes = line.text.clone();
+        let mut bytes = line.text;
         if line.terminated {
             bytes.push(separator);
         }
-        *pos += 1;
         self.appends.push(Append::Line(bytes));
         Ok(())
     }
@@ -3998,7 +4078,7 @@ impl Sed {
                     // `printf x | sed 'r /nonexistent'` still ends with one -- and so
                     // does `r` over a directory, which then fails with exit 4.
                     sink.write(&[])?;
-                    let (data, _) = read_source(&path)?;
+                    let data = read_source(&path)?;
                     sink.write(&data)?;
                 }
                 // `R` resolved its line when the command RAN — see `queue_line`.
@@ -4233,7 +4313,7 @@ impl Sed {
                     // `put`, not `write`: GNU's immediate read goes straight at the
                     // output and does NOT pay an owed separator, so an unterminated
                     // previous line still owes one AFTER the prepended bytes.
-                    let (data, _) = read_source(path)?;
+                    let data = read_source(path)?;
                     sink.put(&data)?;
                 }
                 Some(Kind::ReadLine(path)) => {

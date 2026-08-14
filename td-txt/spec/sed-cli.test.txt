@@ -3758,6 +3758,24 @@ sed: couldn't open file /nosuchdir/out: No such file or directory
 ## stderr-json: ""
 ## status: 0
 
+#### an R source is read a line at a time, so an ENDLESS one still answers
+## argv: sed -z -n -e 'R /dev/zero' -e p f1
+## file-json f1: "a\nb\nc\n"
+## stdin-json: ""
+## stdout-json: "a\nb\nc\n\u0000\u0000"
+## stderr-json: ""
+## status: 0
+
+#### -s rewinds an R source that the previous file EXHAUSTED
+## argv: sed -s -e 'R rf' f1 f2
+## file-json f1: "a\nb\n"
+## file-json f2: "c\nd\n"
+## file-json rf: "R1\n"
+## stdin-json: ""
+## stdout-json: "a\nR1\nb\nc\nR1\nd\n"
+## stderr-json: ""
+## status: 0
+
 #### -s keeps the emptied hold space's terminator, so one separator is owed
 ## argv: sed -s -n -e x;G;p f1 f2
 ## file-json f1: "a"

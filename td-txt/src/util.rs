@@ -397,6 +397,33 @@ impl<R: std::io::Read> Records<R> {
         &mut self.src
     }
 
+    /// Forget end of input alone, leaving the buffer and the position where they
+    /// are. `rewind(3)` does this to a stream whose seek FAILED -- verified
+    /// against glibc, `feof` goes 1 to 0 on a drained pipe while the seek reports
+    /// ESPIPE -- so a source that ended because its last writer went away is read
+    /// again if a new one appears.
+    pub fn forget_eof(&mut self) {
+        self.eof = false;
+    }
+
+    /// Read again from wherever the SOURCE now is, forgetting the buffer, the
+    /// record and end of input. sed's `-s` rewinds an `R` source this way, having
+    /// seeked the handle back itself: a reader that kept its buffer would hand out
+    /// records from before the seek.
+    pub fn restart(&mut self) {
+        self.len = 0;
+        self.pos = 0;
+        self.spill.clear();
+        self.spilled = false;
+        self.start = 0;
+        self.end = 0;
+        self.terminated = false;
+        self.eof = false;
+        self.pending = None;
+        self.binary = false;
+        self.consumed = 0;
+    }
+
     pub fn line(&self) -> &[u8] {
         match self.spilled {
             true => &self.spill,
@@ -931,6 +958,27 @@ mod tests {
         assert!(rec.terminated());
         assert!(rec.next().unwrap());
         assert_eq!(rec.line(), b"tail");
+    }
+
+    /// End of input is a LATCH until something clears it, and `rewind(3)` clears
+    /// it whether or not the seek took. sed's `-s` needs both halves: `restart`
+    /// for a source it seeked, and this for one it could not — a fifo whose last
+    /// writer went away and whose next may not have yet.
+    #[test]
+    fn end_of_input_is_forgotten_without_disturbing_the_position() {
+        // The empty read is end of input; the bytes after it are a new writer.
+        let src = Scripted(vec![Ok(b"a\nb\n"), Ok(b""), Ok(b"c\n")]);
+        let mut rec = Records::with_buffer(src, b'\n', 64);
+        assert!(rec.next().unwrap());
+        assert_eq!(rec.line(), b"a");
+        assert!(rec.next().unwrap());
+        assert_eq!(rec.line(), b"b");
+        assert!(!rec.next().unwrap(), "the empty read should be end of input");
+        // Latched: without clearing it, nothing later is ever read.
+        assert!(!rec.next().unwrap());
+        rec.forget_eof();
+        assert!(rec.next().unwrap(), "a cleared end of input should read again");
+        assert_eq!(rec.line(), b"c");
     }
 
     /// What a `q` leaves behind is this: one record out costs ONE BLOCK off the
