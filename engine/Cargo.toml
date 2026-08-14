@@ -2,7 +2,7 @@
 name = "td-engine"
 version = "0.1.0"
 edition = "2021"
-description = "Shared std-only engine library for td-builder and td-recipe-eval — the hand-rolled JSON value/parser/canonical writer and SHA-256 both bins depend on (zero external crates)"
+description = "Shared std-only library for td's own programs — the hand-rolled JSON value/parser/canonical writer and SHA-256 the engine bins depend on, plus the primitives target-side programs #[path]-include instead of depending on a crate (zero external crates)"
 license = "GPL-3.0-or-later"
 
 [lib]
