@@ -1304,7 +1304,9 @@ td-txt-authored case files
     patterns it gets wrong are the ones `M` is most used with.
 
   - STDIN is left where sed stopped READING, which used to be drained here and
-    now holds for a REGULAR FILE and not for a pipe. `{ sed -n 1q; cat; } <
+    now holds for a REGULAR FILE and for a PIPE alike -- by two different
+    mechanisms, a seek back and a read that never took the bytes in the first
+    place, both described below. `{ sed -n 1q; cat; } <
     four` hands `l2 l3 l4` to the `cat` in both now; `2q` leaves `l3 l4`, so it
     is exactly "after the last RECORD consumed", and `Q` behaves as `q` does. It
     is what makes reading a header with sed and handing the rest to another
@@ -1329,20 +1331,48 @@ td-txt-authored case files
     td's paths puts one on sed's stdin, and widening the test to `!is_dir() &&
     seekable` is a change with its own cases rather than a wording fix.
 
-    A PIPE still does NOT agree, and cannot be made to by a seek. GNU reads a
-    BUFFER, not a file: over a 220,000-byte pipe, `{ sed -n 1q; cat; }` leaves
-    215,904 bytes there and 0 here, while at 4096 bytes or under both leave
-    nothing because GNU's first buffer already took it all -- 4104 bytes leaves
-    exactly 8, which pins that buffer at 4 KiB. So that half of the divergence
-    is over-READING rather than a missing seek, and it wants the other fix:
-    read incrementally, which serves every descriptor and which a seek cannot
-    substitute for, since a pipe has nowhere to put what it is given back. GNU
-    does BOTH, which a 10,000-byte first record shows: it over-reads a block and
-    then leaves precisely the bytes after record 1, so "after the last RECORD
-    consumed" is literal rather than an artifact of block size. td-txt reads
-    each operand WHOLE, which is a CHOICE and not something `$` requires -- a
-    one-line lookahead answers `$` too, as the crate's own module note says, and
-    reading whole "keeps that honest and matches grep".
+    There is exactly ONE such dup, and that is load-bearing rather than tidy.
+    The reader holds one for the whole run (it is how the block size reaches
+    the kernel, below), so a give-back that made a SECOND one had a failure the
+    single-dup version does not: with `RLIMIT_NOFILE` at 4, the second dup fails,
+    the seek is skipped, and `sed -n 1q` leaves a regular stdin at 4096 instead
+    of 8 -- measured, against GNU's 8. So the seek goes through the descriptor
+    the reader already holds. And when THAT dup is the one that fails, the
+    fallback reads stdin through `std::io::Stdin` instead, whose 8 KiB buffer
+    takes more off the descriptor than the reader counts: there is no honest
+    number to seek by, so no give-back is attempted at all, which is what
+    happened before any of this existed.
+
+    A PIPE now agrees, and it took the other fix rather than a seek: sed reads
+    each operand a BLOCK at a time (`Stream::BLOCK`, 4 KiB), so what a `q`
+    does not consume simply stays in the pipe, where a seek has nowhere to put
+    it. Measured against GNU 4.9 with `sed 1q`: 4104 bytes in leaves exactly 8,
+    8192 leaves 4096, and 20000 leaves 15904 -- td-txt matching on every one,
+    where the whole-file reader left 0 in all three. `-s` and `-i` open each
+    operand themselves rather than through the operand list, and they read
+    through the same reader, so they leave the same 15904 and `sed -s 1q
+    /dev/urandom` returns as the plain form does.
+
+    The BLOCK SIZE is what makes those numbers agree, and it is deliberately not
+    a promise. 4 KiB is GNU's, so the leftovers line up; a different size would
+    leave a different amount and be equally correct. Same answer grep's landing
+    reached for its 96 KiB, and for the same reason -- the RULE is reproduced,
+    the arithmetic is not owed.
+
+    One trap is worth recording because it cost a measurement. Reading fd 0
+    through `std::io::Stdin` does NOT give the block size to the kernel: that
+    type is a `BufReader` with an 8 KiB buffer, so a 4 KiB request takes 8 KiB
+    off the descriptor and `sed 1q` over 20000 bytes left 11808 instead of
+    15904 -- exactly one block too few. Stdin is therefore read through a
+    DUPLICATED raw descriptor (`util::stdin_unbuffered`), which shares the file
+    description so the position still moves, and what a pipe keeps is td-txt's
+    own decision rather than std's.
+
+    That GNU does BOTH -- over-read a block AND leave precisely the bytes after
+    record 1 on a seekable descriptor -- is what a 10,000-byte first record
+    shows, so "after the last RECORD consumed" is literal rather than an
+    artifact of block size. td-txt now does both too: the seek half was already
+    landed, and this is the read half.
 
     `R /dev/stdin` is NOT closed by this and is a separate reader: an earlier
     draft of this entry said one fix would close both, and that was wrong.
@@ -1373,6 +1403,16 @@ td-txt-authored case files
     which is why the trade was taken; the two it costs are pinned as an xfail
     with GNU's golden. Closing it wants a real `-u`, which is a flush policy for
     every output rather than anything about this table.
+
+    `-u` has a READ half too, and the incremental reader narrowed the gap
+    without closing it: GNU under `-u` reads one RECORD at a time, so it leaves
+    even more of a pipe behind than its 4 KiB block does. Measured with a second
+    reader on the pipe, GNU `sed -u 1q` against GNU `sed 1q`: 4104 fed leaves
+    4096 rather than 8, 8192 leaves 8184 rather than 4096, and 20000 leaves
+    19992 rather than 15904. td-txt takes its block whatever the flag says, so
+    it now matches GNU's UNFLAGGED numbers everywhere and GNU's `-u` numbers
+    nowhere -- where before it left 0 in every cell of both. A real `-u` is one
+    landing for both halves: read a record at a time, flush after every line.
 
   - An AMBIGUOUS long-option abbreviation lists a different SET of
     possibilities for grep. `grep --c` is `'--context' '--color' '--colour'

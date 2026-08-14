@@ -213,6 +213,21 @@ impl Input {
     }
 }
 
+/// Descriptor 0 as an UNBUFFERED reader, sharing the file description so reads
+/// through it move fd 0 itself.
+///
+/// `std::io::Stdin` is a `BufReader` with an 8 KiB buffer, and a read SMALLER
+/// than that takes the whole 8 KiB off the descriptor -- so a reader asking for
+/// 4 KiB blocks would leave a pipe positioned by std's buffer size rather than by
+/// the block size it chose, and what a `q` leaves behind would not be its own
+/// decision. `None` if the descriptor cannot be duplicated, which leaves the
+/// caller to fall back rather than fail: EMFILE here must not turn a working run
+/// into an error.
+pub fn stdin_unbuffered() -> Option<std::fs::File> {
+    let dup = std::io::stdin().as_fd().try_clone_to_owned().ok()?;
+    Some(std::fs::File::from(dup))
+}
+
 /// Hand back to descriptor 0 what was read from it and never used, so the next
 /// reader of that file description starts where this applet stopped instead of at
 /// end of file. It is POSIX's "shall not consume more input than it needs", and
@@ -227,30 +242,24 @@ impl Input {
 /// offset first sends it somewhere else entirely. That is inherent to reading more
 /// than is needed and returning the rest, bash and GNU sed included.
 ///
-/// The dup is what keeps this in safe code: `Stdin` exposes no seek, while an
+/// A dup is what keeps this in safe code: `Stdin` exposes no seek, while an
 /// `OwnedFd` cloned from it shares the DESCRIPTION, so seeking the clone is what
-/// moves descriptor 0. Dropping the clone closes only the clone.
-pub fn give_back_stdin(unread: u64) -> std::io::Result<()> {
+/// moves descriptor 0. It is the CALLER's dup rather than one made here, and that
+/// is the whole of `fd0`: a reader that already holds one has no business making a
+/// second, which under descriptor pressure is a dup that fails on a run that
+/// otherwise succeeded — leaving the position a whole block further on than it
+/// should be, with nothing saying so.
+pub fn give_back_stdin(fd0: &mut std::fs::File, unread: u64) -> std::io::Result<()> {
     if unread == 0 {
         return Ok(());
     }
-    // A dup needs a free descriptor, and `w` targets are still open here, so this
-    // can fail with EMFILE on a run that otherwise SUCCEEDED. That is the process
-    // fd table being full and says nothing about descriptor 0 -- and failing the
-    // run would not recover the offset it could not reach -- so it DECLINES, as
-    // the non-regular case does. What stays fatal is the seek, which is the call
-    // that does say something about the descriptor.
-    let Ok(dup) = std::io::stdin().as_fd().try_clone_to_owned() else {
-        return Ok(());
-    };
-    let mut file = std::fs::File::from(dup);
-    if !file.metadata()?.is_file() {
+    if !fd0.metadata()?.is_file() {
         return Ok(());
     }
     let back = i64::try_from(unread).map_err(|_| {
         std::io::Error::new(std::io::ErrorKind::InvalidInput, "read past what a seek can undo")
     })?;
-    file.seek(std::io::SeekFrom::Current(-back))?;
+    fd0.seek(std::io::SeekFrom::Current(-back))?;
     Ok(())
 }
 
@@ -334,6 +343,7 @@ pub struct Records<R> {
     binary: bool,
     /// A read failure deferred until the bytes read before it were handed over.
     pending: Option<std::io::Error>,
+    consumed: u64,
 }
 
 impl<R: std::io::Read> Records<R> {
@@ -343,9 +353,17 @@ impl<R: std::io::Read> Records<R> {
     pub const BUF: usize = 96 << 10;
 
     pub fn new(src: R, sep: u8) -> Self {
+        Self::with_buffer(src, sep, Self::BUF)
+    }
+
+    /// The buffer size is the CALLER's, because it is the caller that has a
+    /// reason: grep takes GNU's 96 KiB so its binary-verdict boundaries line up,
+    /// sed takes GNU's 4 KiB so what it leaves in a pipe does. Neither number is
+    /// a promise -- see spec/README.
+    pub fn with_buffer(src: R, sep: u8, cap: usize) -> Self {
         Self {
             src,
-            buf: vec![0; Self::BUF],
+            buf: vec![0; cap.max(1)],
             len: 0,
             pos: 0,
             spill: Vec::new(),
@@ -357,11 +375,26 @@ impl<R: std::io::Read> Records<R> {
             eof: false,
             binary: false,
             pending: None,
+            consumed: 0,
         }
     }
 
     pub fn binary(&self) -> bool {
         self.binary
+    }
+
+    /// Bytes taken from the SOURCE so far, which is not what the caller has been
+    /// handed: a fill reads a block, and the records in it are handed out one at
+    /// a time. sed needs both numbers to give descriptor 0 back what it read and
+    /// never used.
+    pub fn consumed(&self) -> u64 {
+        self.consumed
+    }
+
+    /// The source itself. sed hands descriptor 0 back its over-read by SEEKING the
+    /// reader's own duplicate of it, which is here.
+    pub fn source_mut(&mut self) -> &mut R {
+        &mut self.src
     }
 
     pub fn line(&self) -> &[u8] {
@@ -396,6 +429,7 @@ impl<R: std::io::Read> Records<R> {
             return Ok(());
         }
         self.len = n;
+        self.consumed = self.consumed.saturating_add(n as u64);
         if self.buf.get(..n).is_some_and(|s| s.contains(&0)) {
             self.binary = true;
         }
@@ -735,6 +769,34 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// The give-back moves the descriptor it was HANDED. It used to duplicate
+    /// descriptor 0 itself, which is a second dup on top of the one the reader
+    /// already holds: under descriptor pressure that one fails, the seek is
+    /// silently skipped, and the next reader starts a whole block late. Handing
+    /// the descriptor in is what removes the failure, so what is pinned here is
+    /// that an unrelated one really is what moves.
+    #[test]
+    fn the_give_back_seeks_the_descriptor_it_was_handed() {
+        let dir = std::env::temp_dir().join(format!("td-txt-giveback-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("f");
+        std::fs::write(&path, vec![b'x'; 100]).unwrap();
+
+        let mut file = std::fs::File::open(&path).unwrap();
+        let mut buf = [0u8; 40];
+        file.read_exact(&mut buf).unwrap();
+        assert_eq!(file.stream_position().unwrap(), 40);
+        give_back_stdin(&mut file, 10).unwrap();
+        assert_eq!(file.stream_position().unwrap(), 30);
+
+        // Nothing to hand back is answered before any syscall, so a descriptor
+        // that could not take a seek is still not an error.
+        give_back_stdin(&mut file, 0).unwrap();
+        assert_eq!(file.stream_position().unwrap(), 30);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn records_keeps_a_final_unterminated_line() {
         let r = records(b"a\nb\nc", b'\n');
@@ -867,6 +929,44 @@ mod tests {
         assert!(rec.next().unwrap());
         assert_eq!(rec.line(), b"abcdef");
         assert!(rec.terminated());
+        assert!(rec.next().unwrap());
+        assert_eq!(rec.line(), b"tail");
+    }
+
+    /// What a `q` leaves behind is this: one record out costs ONE BLOCK off the
+    /// source, not the whole of it. sed's 4 KiB is chosen so that number matches
+    /// GNU's, and the arithmetic is only meaningful if the reader really stops
+    /// at a block.
+    #[test]
+    fn a_record_costs_one_block_of_the_source_and_no_more() {
+        let data: Vec<u8> = (0..2500u32).flat_map(|i| format!("{i:07}\n").into_bytes()).collect();
+        assert!(data.len() > 8192, "the source must span several blocks");
+        let mut rec = Records::with_buffer(std::io::Cursor::new(data.clone()), b'\n', 4096);
+        assert!(rec.next().unwrap());
+        assert_eq!(rec.line(), b"0000000");
+        assert_eq!(rec.consumed(), 4096, "one record took more than one block");
+        // Records already in the buffer cost nothing further.
+        for _ in 0..100 {
+            assert!(rec.next().unwrap());
+        }
+        assert_eq!(rec.consumed(), 4096);
+        // Reading past the block is what pulls the next one.
+        while rec.consumed() == 4096 {
+            assert!(rec.next().unwrap());
+        }
+        assert_eq!(rec.consumed(), 8192);
+    }
+
+    /// A record LONGER than the block still arrives whole, which is what stops a
+    /// small block from turning into a correctness bug.
+    #[test]
+    fn a_record_longer_than_the_block_is_still_assembled_whole() {
+        let mut data = vec![b'x'; 10_000];
+        data.push(b'\n');
+        data.extend_from_slice(b"tail\n");
+        let mut rec = Records::with_buffer(std::io::Cursor::new(data), b'\n', 4096);
+        assert!(rec.next().unwrap());
+        assert_eq!(rec.line().len(), 10_000);
         assert!(rec.next().unwrap());
         assert_eq!(rec.line(), b"tail");
     }

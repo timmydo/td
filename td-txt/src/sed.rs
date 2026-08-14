@@ -9,9 +9,14 @@
 //! static binary with no shell dependency, and a sed that can spawn `/bin/sh`
 //! would put one back. It is a diagnosed error, not a silent no-op.
 //!
-//! Inputs are read whole. `$` (last line) must be known before the last line is
-//! processed, which a streaming reader can only answer with a lookahead buffer;
-//! reading whole files keeps that honest and matches `grep`.
+//! Operands are read a BLOCK at a time, as `grep` reads its own. `$` (last line)
+//! must be known before the last line is processed, which a streaming reader can
+//! only answer by having LOOKED -- so `Stream` holds exactly one record ahead,
+//! and that record is not counted as delivered until it is handed out, which is
+//! what keeps the give-back to descriptor 0 honest. `-s` and `-i` open each
+//! operand themselves, to decide whether it may be rewritten, and stream it
+//! through that same reader. SCRIPTS (`-f`) and `R` sources are still read
+//! whole and are separate readers; see spec/README.
 //!
 //! Every compiled regex in a script lives in one table, and an address or `s///`
 //! holds an index into it. That is what makes the empty regex (`//`, `s//x/`)
@@ -25,7 +30,7 @@ use std::path::{Path, PathBuf};
 
 use crate::regex::{Captures, Options, Regex};
 use crate::util::{
-    errmsg, number, posixly_correct, print_line, records, Input, Out, VERSION,
+    errmsg, number, posixly_correct, print_line, records, Input, Out, Records, VERSION,
 };
 
 const USAGE: &str =
@@ -1746,8 +1751,24 @@ struct Stream {
     /// The file currently OPEN: `F` names it. The `$` lookahead below can open
     /// the NEXT one mid-cycle, which is exactly when `F` starts naming that.
     name: Vec<u8>,
-    lines: Vec<Line>,
-    pos: usize,
+    /// The OPEN operand, read a BLOCK at a time rather than whole. `None` before
+    /// the first open and once one is spent.
+    src: Option<Records<Src>>,
+    /// How a READ failure names the open operand, captured at open because the
+    /// `Input` itself is inside the reader by the time one can happen.
+    err_name: Vec<u8>,
+    /// Whether the open operand is descriptor 0 AND is being read through the raw
+    /// duplicate of it -- which is exactly when the over-read can be counted, and
+    /// so the only case that may be handed back. See `source_of`.
+    owed_stdin: bool,
+    /// Bytes of the open operand already handed to the evaluator. With the
+    /// reader's `consumed()` this is the whole of the give-back accounting.
+    delivered: u64,
+    /// One record read AHEAD. `$` cannot be answered without having looked, and
+    /// the record that answered it is the next one the cycle gets -- so it is
+    /// held here rather than re-read, and it is NOT counted as delivered until
+    /// it is handed out.
+    ahead: Option<Line>,
     /// A read failure already suffered. It outranks a quit code, and because
     /// operands open lazily it can only describe a file the run actually reached.
     bad: bool,
@@ -1755,11 +1776,46 @@ struct Stream {
     /// The diagnostic is printed where it happens, ahead of the buffered output,
     /// so it lands beside the other operand diagnostics as GNU's does.
     fatal: bool,
-    /// How many bytes the OPEN operand took from standard input, or `None` where
-    /// it is a named file. Only the open one can matter: `advance` reaches for the
-    /// next operand only once the current one is spent, so every earlier one was
-    /// consumed whole by construction.
-    stdin_read: Option<usize>,
+}
+
+/// What a `Stream` reads from: an operand, opened either by the stream itself or
+/// by the `-s`/`-i` caller that has to decide whether the file may be rewritten.
+enum Src {
+    Open(Input),
+    /// Descriptor 0, UNBUFFERED. `Input::Stdin` reads through `std::io::Stdin`,
+    /// which is a `BufReader`: a 4 KiB request takes 8 KiB off the descriptor, so
+    /// what a `q` leaves in a pipe would be std's buffer size rather than
+    /// `BLOCK`. Measured before this existed -- `sed 1q` over 20000 bytes left
+    /// 11808 where GNU leaves 15904, one whole block too few.
+    Raw(std::fs::File),
+}
+
+impl std::io::Read for Src {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            Self::Open(input) => input.read(buf),
+            Self::Raw(file) => file.read(buf),
+        }
+    }
+}
+
+/// The reader for an opened operand, and whether what it takes off descriptor 0
+/// can be HANDED BACK. Stdin goes through a raw duplicate so `BLOCK` is what
+/// reaches the kernel; a duplication that fails falls back to the buffered path
+/// rather than failing the run — EMFILE must not turn a working run into an error
+/// — and the give-back goes with it, because `std::io::Stdin` takes 8 KiB off the
+/// descriptor for a 4 KiB request. Seeking back by what the reader counted would
+/// then land a block short, and the next reader would SKIP that block: not
+/// repositioning at all is the honest answer, and it is what happened before any
+/// of this existed.
+fn source_of(input: Input) -> (Src, bool) {
+    if !input.is_stdin() {
+        return (Src::Open(input), false);
+    }
+    match crate::util::stdin_unbuffered() {
+        Some(file) => (Src::Raw(file), true),
+        None => (Src::Open(input), false),
+    }
 }
 
 /// Who is opening the next operand. It decides only what a READ failure means:
@@ -1775,19 +1831,23 @@ enum Opener {
 }
 
 impl Stream {
-    /// One operand's worth of already-read data, for the `-s`/`-i` path. That
-    /// caller does its own open, so it is the one that knows whether the bytes
-    /// came from standard input.
-    fn of(path: &[u8], data: &[u8], separator: u8, stdin_read: Option<usize>) -> Self {
+    /// One operand the `-s`/`-i` caller has already OPENED -- that path opens each
+    /// file itself to decide whether it may be rewritten -- and streams from here
+    /// exactly as the single-stream path streams its own.
+    fn over(path: &[u8], input: Input, separator: u8) -> Self {
+        let err_name = input.error_name(path);
+        let (src, owed_stdin) = source_of(input);
         Self {
             pending: Vec::new().into_iter(),
             separator,
             name: path.to_vec(),
-            lines: to_lines(data, separator),
-            pos: 0,
+            src: Some(Records::with_buffer(src, separator, Self::BLOCK)),
+            err_name,
+            owed_stdin,
+            delivered: 0,
+            ahead: None,
             bad: false,
             fatal: false,
-            stdin_read,
         }
     }
 
@@ -1798,45 +1858,83 @@ impl Stream {
             pending: paths.into_iter(),
             separator,
             name: b"-".to_vec(),
-            lines: Vec::new(),
-            pos: 0,
+            src: None,
+            err_name: b"-".to_vec(),
+            owed_stdin: false,
+            delivered: 0,
+            ahead: None,
             bad: false,
             fatal: false,
-            stdin_read: None,
         }
     }
 
-    /// Open operands until one HAS A LINE, reporting each that cannot be OPENED and
-    /// stepping over each that is empty — GNU's `last_file_with_data_p`, which is
-    /// also how its `$` test answers. `false` once nothing is left, and once a read
-    /// failed under the reader, which ends the run.
-    fn advance(&mut self, opener: Opener) -> bool {
-        while self.pos >= self.lines.len() {
-            let Some(path) = self.pending.next() else {
-                return false;
-            };
+    /// GNU sed's read block, and what it buys is what a `q` LEAVES BEHIND: GNU
+    /// reads one block and the rest of a pipe stays readable by the next process,
+    /// where a whole-file reader consumed all of it. Measured on GNU 4.9 with
+    /// `sed 1q`: 8192 bytes in leaves exactly 4096, and 20000 leaves 15904.
+    /// Agreeing with GNU on that number FOLLOWS from the size rather than being a
+    /// contract td-txt owes -- the same answer grep's landing reached for its
+    /// 96 KiB.
+    const BLOCK: usize = 4096;
+
+    /// The next record, opening operands until one HAS A LINE -- reporting each
+    /// that cannot be OPENED and stepping over each that is empty, which is GNU's
+    /// `last_file_with_data_p` and also how its `$` test answers. `None` once
+    /// nothing is left, and once a read failed under the reader.
+    ///
+    /// This does NOT count what it returns as delivered; `next_line` does, because
+    /// a record pulled to answer `$` has been read and not yet used.
+    fn pull(&mut self, opener: Opener) -> Option<Line> {
+        loop {
+            if let Some(src) = self.src.as_mut() {
+                match src.next() {
+                    Ok(true) => {
+                        return Some(Line {
+                            text: src.line().to_vec(),
+                            terminated: src.terminated(),
+                        })
+                    }
+                    Ok(false) => self.src = None,
+                    // The bytes a failed read DID deliver are handed over first --
+                    // the reader defers the failure for exactly that -- so by here
+                    // there is nothing left of this operand but the error. GNU
+                    // panics at it rather than processing further.
+                    Err(e) => {
+                        self.src = None;
+                        // A LOOKAHEAD is silent only about an operand that has
+                        // given nothing: to a peek, one that cannot be read at all
+                        // is indistinguishable from an empty one, which is what
+                        // GNU's `getc` sees and why `sed -n '$p' A DIR` is exit 0
+                        // there and here. An operand that already handed over
+                        // records and THEN failed is a torn read, not an empty
+                        // file, and the run has processed a prefix of something it
+                        // cannot finish -- so it is reported wherever it is met.
+                        // Under `-i` that distinction is the operand: a buffer
+                        // built from the records before a failure, written back,
+                        // TRUNCATES the file the failure interrupted.
+                        let torn = self.delivered > 0;
+                        if torn || matches!(opener, Opener::Reader) {
+                            diag(&read_error(&self.err_name, &e));
+                            self.fatal = true;
+                            return None;
+                        }
+                    }
+                }
+            }
+            let path = self.pending.next()?;
             // GNU sets the name before it tries to open, so a failed operand is
             // what `F` would report until the next open replaces it.
             self.name = path;
             match Input::open(&self.name, true) {
-                Ok(mut input) => match input.read_all() {
-                    Ok(data) => {
-                        self.stdin_read = input.is_stdin().then_some(data.len());
-                        self.lines = to_lines(&data, self.separator);
-                        self.pos = 0;
-                    }
-                    // The bytes a failed read DID deliver are dropped: GNU panics
-                    // at the failure rather than processing them, and the reachable
-                    // case — a DIRECTORY — delivers none, failing at the first read.
-                    Err((e, _)) => match opener {
-                        Opener::Reader => {
-                            diag(&read_error(&input.error_name(&self.name), &e));
-                            self.fatal = true;
-                            return false;
-                        }
-                        Opener::Lookahead => {}
-                    },
-                },
+                Ok(input) => {
+                    self.err_name = input.error_name(&self.name);
+                    // Per operand, as the whole-file reader's accounting was: it
+                    // replaced its line vector on every open.
+                    self.delivered = 0;
+                    let (src, owed_stdin) = source_of(input);
+                    self.owed_stdin = owed_stdin;
+                    self.src = Some(Records::with_buffer(src, self.separator, Self::BLOCK));
+                }
                 Err(e) => {
                     diag(&crate::util::name_in(
                         "can't read ",
@@ -1847,7 +1945,6 @@ impl Stream {
                 }
             }
         }
-        true
     }
 
     /// The file `F` names: the one most recently OPENED, not the one the current
@@ -1861,17 +1958,12 @@ impl Stream {
     /// byte is in some record or is the separator its `terminated` flag counts --
     /// so subtracting what was delivered is the whole of what was over-read.
     fn stdin_unconsumed(&self) -> Option<u64> {
-        let total = self.stdin_read?;
-        // `take` rather than a slice: `pos` never exceeds `lines.len()`, so a
-        // fallible slice would only add a `None` that means "accounting
-        // impossible" to a return whose `None` already means "no stdin".
-        let delivered: usize = self
-            .lines
-            .iter()
-            .take(self.pos)
-            .map(|l| l.text.len().saturating_add(usize::from(l.terminated)))
-            .sum();
-        Some((total as u64).saturating_sub(delivered as u64))
+        if !self.owed_stdin {
+            return None;
+        }
+        // A spent source owes nothing: it is spent because a read returned end of
+        // input, so everything it took has been handed out.
+        Some(self.src.as_ref()?.consumed().saturating_sub(self.delivered))
     }
 
     /// The next line, or `None` at end of input. WHO is asking decides what an
@@ -1879,13 +1971,17 @@ impl Stream {
     /// and `n`/`N` reach input through GNU's `test_eof` first, so a read failure
     /// there is the peek's silent end-of-file rather than the reader's panic.
     fn next_line(&mut self, opener: Opener) -> Option<Line> {
-        if !self.advance(opener) {
-            return None;
-        }
-        let line = self.lines.get(self.pos)?;
-        let out = Line { text: line.text.clone(), terminated: line.terminated };
-        self.pos += 1;
-        Some(out)
+        let line = match self.ahead.take() {
+            Some(line) => line,
+            None => self.pull(opener)?,
+        };
+        // Counted HERE and not in `pull`, so a record read to answer `$` and never
+        // used is still owed back to descriptor 0.
+        self.delivered = self
+            .delivered
+            .saturating_add(line.text.len() as u64)
+            .saturating_add(u64::from(line.terminated));
+        Some(line)
     }
 
     /// No further input line, so the line just read was `$`. Takes `&mut` because
@@ -1893,7 +1989,10 @@ impl Stream {
     /// unreadable operand gets reported, so only where GNU asks may this — a `$`
     /// the evaluator reaches, and the `test_eof` inside `n` and `N`.
     fn at_last(&mut self) -> bool {
-        !self.advance(Opener::Lookahead)
+        if self.ahead.is_none() {
+            self.ahead = self.pull(Opener::Lookahead);
+        }
+        self.ahead.is_none()
     }
 }
 
@@ -3206,7 +3305,7 @@ fn compile_and_run(
             // Under `-i` an operand names the file to REWRITE, so `-` is an
             // ordinary name here rather than stdin — there is no rewriting a
             // pipe. GNU reports it as the missing file it is.
-            let mut input = match Input::open(path, conf.in_place.is_none()) {
+            let input = match Input::open(path, conf.in_place.is_none()) {
                 Ok(input) => input,
                 Err(e) => {
                     diag(&crate::util::name_in(
@@ -3230,21 +3329,7 @@ fn compile_and_run(
                     return Ok(4);
                 }
             }
-            let data = match input.read_all() {
-                Ok(data) => data,
-                // A file that opened and would not read ends the run at 4, as it
-                // does on the other path. Its partial bytes are dropped for the
-                // reason `advance` drops them, and under `-i` keeping them would
-                // rewrite the operand TRUNCATED where GNU's own failure path
-                // unlinks its temp file and leaves the original alone.
-                Err((e, _)) => {
-                    diag(&read_error(&input.error_name(path), &e));
-                    sink.flush().map_err(Fatal::runtime_msg)?;
-                    return Ok(4);
-                }
-            };
-            let mut stream =
-                Stream::of(path, &data, separator, input.is_stdin().then_some(data.len()));
+            let mut stream = Stream::over(path, input, separator);
             // Line numbers, range state, the HOLD SPACE and every REWINDABLE `R`
             // read position restart per file under -s / -i. The output streams and
             // their owed separators do not: those belong to the whole run. GNU
@@ -3268,19 +3353,32 @@ fn compile_and_run(
                 Some(suffix) => {
                     let mut buf = Sink::buffer(separator);
                     let quit = sed.run_stream(&mut stream, &mut buf).map_err(Fatal::runtime_msg)?;
-                    write_in_place(path, suffix, &buf.into_buffer())?;
+                    // A read that failed part way leaves a buffer holding only what
+                    // came BEFORE it, and writing that would rewrite the operand
+                    // truncated — where GNU's own failure path unlinks its temp
+                    // file and leaves the original alone.
+                    if !stream.fatal {
+                        write_in_place(path, suffix, &buf.into_buffer())?;
+                    }
                     quit
                 }
                 // Held rather than propagated, for the reason the other path
                 // holds it: a run that DIES still owes back what it did not read.
                 _ => {
                     let ran = sed.run_stream(&mut stream, &mut sink);
-                    let back = give_back(&stream);
+                    let back = give_back(&mut stream);
                     let quit = ran.map_err(Fatal::runtime_msg)?;
                     back?;
                     quit
                 }
             };
+            // A read that failed ends the run at 4 here as it does on the other
+            // path, and outranks the operands not yet reached: GNU's reader panics,
+            // so nothing after it happens.
+            if stream.fatal {
+                sink.flush().map_err(Fatal::runtime_msg)?;
+                return Ok(4);
+            }
             if let Some(code) = quit {
                 sink.flush().map_err(Fatal::runtime_msg)?;
                 // A read failure that has ALREADY happened outranks the quit code,
@@ -3309,7 +3407,7 @@ fn compile_and_run(
         // outranks a failure to reposition -- that is the one that says what
         // went wrong.
         let ran = sed.run_stream(&mut stream, &mut sink);
-        let back = give_back(&stream);
+        let back = give_back(&mut stream);
         let quit = ran.map_err(Fatal::runtime_msg)?;
         back?;
         // A read that failed outranks everything else, including a `bad` operand
@@ -3659,11 +3757,18 @@ fn to_lines(data: &[u8], separator: u8) -> Vec<Line> {
 /// otherwise invisible until some later program reads the wrong bytes; and with
 /// the nothing-to-return case answered before any syscall is made, what is left
 /// to fail is the descriptor itself.
-fn give_back(stream: &Stream) -> Result<(), Fatal> {
+fn give_back(stream: &mut Stream) -> Result<(), Fatal> {
     let Some(unread) = stream.stdin_unconsumed() else {
         return Ok(());
     };
-    crate::util::give_back_stdin(unread)
+    // Through the reader's OWN duplicate of descriptor 0: it shares the file
+    // description, so seeking it moves fd 0, and there is no second dup to fail
+    // under descriptor pressure. `owed_stdin` is exactly the case where that
+    // duplicate exists, which is why the `else` here cannot happen.
+    let Some(Src::Raw(fd0)) = stream.src.as_mut().map(|src| src.source_mut()) else {
+        return Ok(());
+    };
+    crate::util::give_back_stdin(fd0, unread)
         .map_err(|e| Fatal::runtime(format!("can't reposition stdin: {}", errmsg(&e))))
 }
 
@@ -4296,6 +4401,22 @@ mod tests {
         Mode { ere, ..EXTENDED }
     }
 
+    /// A `Stream` over bytes. `Stream` reads a DESCRIPTOR now, so the bytes go
+    /// through a pipe rather than an in-memory arm of `Src`: a test-only variant
+    /// would be a second test-gated item in this file, and the confinement scan
+    /// strips the test half by truncating at the first one.
+    fn stream_over(data: &[u8], separator: u8) -> Stream {
+        // The whole input has to FIT, since nothing drains the pipe until the
+        // stream does; every caller here passes a literal, so this is a guard
+        // against a future one rather than a limit anybody meets.
+        assert!(data.len() < 60_000, "test input too large for one pipe");
+        let (reader, mut writer) = std::io::pipe().unwrap();
+        writer.write_all(data).unwrap();
+        drop(writer);
+        let file = std::fs::File::from(std::os::fd::OwnedFd::from(reader));
+        Stream::over(b"-", Input::File(file), separator)
+    }
+
     /// Run a script over `input` and return what it wrote.
     fn sed(script: &str, input: &str, opts: &[&str]) -> Vec<u8> {
         let ere = opts.contains(&"-E") || opts.contains(&"-r");
@@ -4326,7 +4447,7 @@ mod tests {
             wfiles,
             rfiles: BTreeMap::new(),
             };
-        let mut stream = Stream::of(b"-", input.as_bytes(), sep, None);
+        let mut stream = stream_over(input.as_bytes(), sep);
         let mut sink = Sink::buffer(sep);
         sed.run_stream(&mut stream, &mut sink).unwrap();
         sink.into_buffer()

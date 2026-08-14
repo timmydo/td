@@ -1193,6 +1193,113 @@ fn grep_answers_from_a_stream_that_has_not_ended() -> Result<(), Box<dyn std::er
     Ok(())
 }
 
+/// What a `q` LEAVES IN A PIPE, which is the whole point of reading a block at a
+/// time rather than a file at a time. A seek cannot serve this — a pipe has
+/// nowhere to put back what it was given — so the only fix is not over-reading,
+/// and the only way to observe it is a SECOND reader on the same pipe.
+///
+/// The corpus cannot ask for this: it runs one child and closes its stdin. Here
+/// the pipe's read end is duplicated, one copy going to sed and one staying
+/// behind, so what sed did not take is still readable afterwards. Measured
+/// against GNU sed 4.9, which leaves the same 15904 bytes.
+///
+/// The feeder is a THREAD that keeps writing while this one drains, which is
+/// what makes the test independent of how big a pipe the kernel gave us: a
+/// producer that had to fit the whole feed before anybody read would block for
+/// ever on a one-page pipe, which is what a user over `pipe-user-pages-soft`
+/// gets. It hands over after the first BLOCK so sed's one read cannot see a
+/// short buffer — the assertion below is about exactly which bytes are left.
+#[test]
+fn sed_leaves_the_rest_of_a_pipe_for_the_next_reader()
+-> Result<(), Box<dyn std::error::Error>> {
+    use std::io::{Read, Write};
+    // 2500 lines of 8 bytes = 20000, several blocks, so the leftover is exact.
+    let feed: Vec<u8> = (0..2500u32).flat_map(|i| format!("{i:07}\n").into_bytes()).collect();
+    // `-s` opens its operands on a path of its own, so it is asked separately.
+    for args in [&["1q"][..], &["-s", "1q"][..]] {
+        let (reader, writer) = std::io::pipe()?;
+        let mut mine = reader.try_clone()?;
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let sending = feed.clone();
+        let feeder = std::thread::spawn(move || -> std::io::Result<()> {
+            let mut writer = writer;
+            let (head, tail) = sending.split_at(4096.min(sending.len()));
+            writer.write_all(head)?;
+            let _ = tx.send(());
+            writer.write_all(tail)
+        });
+        rx.recv()?;
+
+        let out = std::process::Command::new(bin())
+            .arg("sed")
+            .args(args)
+            .stdin(std::process::Stdio::from(reader))
+            .output()?;
+        assert_eq!(out.stdout, b"0000000\n".to_vec());
+
+        let mut rest = Vec::new();
+        mine.read_to_end(&mut rest)?;
+        feeder.join().map_err(|_| "feeder panicked")??;
+        assert_eq!(
+            rest.len(),
+            feed.len() - 4096,
+            "sed {args:?} took {} bytes off the pipe, not one 4 KiB block",
+            feed.len() - rest.len()
+        );
+        // And what is left starts exactly where the block ended, not at a record
+        // boundary -- GNU leaves a partial line here too.
+        assert_eq!(rest.get(..8), feed.get(4096..4104));
+    }
+    Ok(())
+}
+
+/// sed answers from a stream that has not ended, for the same reason grep does
+/// and pinned the same way: the write end stays OPEN for the whole assertion, so
+/// a sed that read to EOF before its first cycle would still be blocked when the
+/// deadline passes. Before the incremental reader landed, that is what happened —
+/// `sed 1q /dev/urandom` never returned.
+///
+/// `-s` is here because it is a SECOND reader over the same operands: the path
+/// that restarts line numbers per file opens each one itself, and it read them
+/// whole for one commit longer than this one — `sed -s 1q /dev/urandom` hung
+/// where the plain form already returned.
+#[test]
+fn sed_answers_from_a_stream_that_has_not_ended() -> Result<(), Box<dyn std::error::Error>> {
+    use std::io::Write;
+    for (script, sep) in [("1q", false), ("1{p;q}", false), ("$!{1q}", false), ("1q", true)] {
+        let mut args = vec!["-n"];
+        if sep {
+            args.push("-s");
+        }
+        args.extend(["-e", script]);
+        let mut child = std::process::Command::new(bin())
+            .arg("sed")
+            .args(&args)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .spawn()?;
+        let mut sink = child.stdin.take().ok_or("no stdin pipe")?;
+        sink.write_all(b"one\ntwo\n")?;
+        sink.flush()?;
+        let mut waited = 0;
+        loop {
+            if child.try_wait()?.is_some() {
+                break;
+            }
+            if waited >= 10_000 {
+                let _ = child.kill();
+                return Err(format!("sed {args:?} {script:?} never answered on an open pipe").into());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            waited += 20;
+        }
+        drop(sink);
+        let _ = child.wait();
+    }
+    Ok(())
+}
+
 /// The binary verdict follows the STREAM: a NUL makes every match from the
 /// buffer it was found in onward one notice, and matches already printed stay
 /// printed. Needs an operand bigger than a buffer, which no corpus case is.
